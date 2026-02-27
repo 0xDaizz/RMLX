@@ -1,0 +1,5 @@
+.cache/
+_tmp_*
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
