@@ -3,6 +3,7 @@
 pub mod array;
 pub mod dtype;
 pub mod kernels;
+pub mod ops;
 
 /// Path to the AOT-compiled Metal shader library.
 /// Set by build.rs at compile time.
