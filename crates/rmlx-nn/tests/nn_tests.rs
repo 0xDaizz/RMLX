@@ -292,3 +292,398 @@ fn test_linear_forward_with_bias_batch2() {
         vals[3]
     );
 }
+
+// ===== NEW TESTS: Embedding forward =====
+
+#[test]
+fn test_embedding_forward() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    // vocab_size=4, embed_dim=3
+    // Weight: [[1,2,3], [4,5,6], [7,8,9], [10,11,12]]
+    let weight = Array::from_slice(
+        dev,
+        &[
+            1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+        ],
+        vec![4, 3],
+    );
+    let emb = Embedding::from_array(
+        EmbeddingConfig {
+            vocab_size: 4,
+            embed_dim: 3,
+        },
+        weight,
+    );
+    // Lookup tokens [0, 2, 3]
+    let output = emb
+        .forward(&[0, 2, 3], &registry, &queue)
+        .expect("forward failed");
+    assert_eq!(output.shape(), &[3, 3]);
+    let vals: Vec<f32> = unsafe { output.to_vec() };
+    // Token 0: [1, 2, 3]
+    assert!((vals[0] - 1.0).abs() < 1e-3);
+    assert!((vals[1] - 2.0).abs() < 1e-3);
+    assert!((vals[2] - 3.0).abs() < 1e-3);
+    // Token 2: [7, 8, 9]
+    assert!((vals[3] - 7.0).abs() < 1e-3);
+    assert!((vals[4] - 8.0).abs() < 1e-3);
+    assert!((vals[5] - 9.0).abs() < 1e-3);
+    // Token 3: [10, 11, 12]
+    assert!((vals[6] - 10.0).abs() < 1e-3);
+    assert!((vals[7] - 11.0).abs() < 1e-3);
+    assert!((vals[8] - 12.0).abs() < 1e-3);
+}
+
+#[test]
+fn test_embedding_no_weights_errors() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let emb = Embedding::new(EmbeddingConfig {
+        vocab_size: 100,
+        embed_dim: 8,
+    });
+    assert!(!emb.has_weights());
+    let result = emb.forward(&[0, 1], &registry, &queue);
+    assert!(result.is_err());
+}
+
+// ===== NEW TESTS: Attention forward =====
+
+fn make_identity_linear(dev: &metal::Device, size: usize) -> Linear {
+    // Create an identity-like weight matrix [size, size]
+    let mut data = vec![0.0f32; size * size];
+    for i in 0..size {
+        data[i * size + i] = 1.0;
+    }
+    let weight = Array::from_slice(dev, &data, vec![size, size]);
+    Linear::from_arrays(
+        LinearConfig {
+            in_features: size,
+            out_features: size,
+            has_bias: false,
+        },
+        weight,
+        None,
+    )
+}
+
+#[test]
+fn test_attention_forward_identity() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+
+    // Tiny attention: 2 heads, 1 kv_head (GQA), head_dim=4 => hidden_size=8
+    let num_heads = 2;
+    let num_kv_heads = 2;
+    let head_dim = 4;
+    let hidden_size = num_heads * head_dim; // 8
+
+    let config = AttentionConfig {
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        max_seq_len: 16,
+        rope_theta: 10000.0,
+    };
+
+    // Use identity projections so we can verify the flow
+    let q_proj = make_identity_linear(dev, hidden_size);
+    let k_proj = make_identity_linear(dev, hidden_size);
+    let v_proj = make_identity_linear(dev, hidden_size);
+    let o_proj = make_identity_linear(dev, hidden_size);
+
+    let attn = Attention::from_layers(config, q_proj, k_proj, v_proj, o_proj);
+
+    // Input: [2, 8] — 2 tokens, 8-dim hidden
+    let input = Array::from_slice(
+        dev,
+        &[
+            1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
+        ],
+        vec![2, 8],
+    );
+
+    // No RoPE, no mask for simplicity
+    let output = attn
+        .forward(&input, None, None, None, &registry, &queue)
+        .expect("attention forward failed");
+    assert_eq!(output.shape(), &[2, 8]);
+
+    // Just verify it produces a valid output (not NaN/zero everywhere)
+    let vals: Vec<f32> = unsafe { output.to_vec() };
+    let sum: f32 = vals.iter().sum();
+    assert!(
+        sum.is_finite(),
+        "attention output contains non-finite values"
+    );
+    assert!(sum.abs() > 1e-6, "attention output is all zeros");
+}
+
+// ===== NEW TESTS: MoE forward =====
+
+#[test]
+fn test_moe_forward() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+
+    let hidden_dim = 4;
+    let intermediate_dim = 4;
+    let num_experts = 2;
+    let top_k = 1;
+
+    // Gate: [num_experts, hidden_dim] — routes tokens to experts
+    let gate_weight = Array::from_slice(
+        dev,
+        &[
+            1.0f32, 0.0, 0.0, 0.0, // expert 0 gate
+            0.0, 0.0, 0.0, 1.0, // expert 1 gate
+        ],
+        vec![num_experts, hidden_dim],
+    );
+    let gate = Linear::from_arrays(
+        LinearConfig {
+            in_features: hidden_dim,
+            out_features: num_experts,
+            has_bias: false,
+        },
+        gate_weight,
+        None,
+    );
+
+    // Expert 0: identity-like (gate=identity, up=identity, down=identity)
+    let expert0 = Expert {
+        gate_proj: make_identity_linear(dev, hidden_dim),
+        up_proj: make_identity_linear(dev, hidden_dim),
+        down_proj: make_identity_linear(dev, hidden_dim),
+    };
+
+    // Expert 1: identity-like too
+    let expert1 = Expert {
+        gate_proj: make_identity_linear(dev, hidden_dim),
+        up_proj: make_identity_linear(dev, hidden_dim),
+        down_proj: make_identity_linear(dev, hidden_dim),
+    };
+
+    let moe = MoeLayer::from_layers(
+        MoeConfig {
+            num_experts,
+            num_experts_per_token: top_k,
+            hidden_dim,
+            intermediate_dim,
+        },
+        gate,
+        vec![expert0, expert1],
+    );
+
+    // Input: [2, 4]
+    let input = Array::from_slice(
+        dev,
+        &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+        vec![2, 4],
+    );
+    let output = moe
+        .forward(&input, &registry, &queue)
+        .expect("moe forward failed");
+    assert_eq!(output.shape(), &[2, 4]);
+
+    let vals: Vec<f32> = unsafe { output.to_vec() };
+    let sum: f32 = vals.iter().sum();
+    assert!(sum.is_finite(), "MoE output contains non-finite values");
+    assert!(sum.abs() > 1e-6, "MoE output is all zeros");
+}
+
+#[test]
+fn test_moe_no_weights_errors() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    let moe = MoeLayer::new(MoeConfig {
+        num_experts: 2,
+        num_experts_per_token: 1,
+        hidden_dim: 4,
+        intermediate_dim: 8,
+    });
+    let input = Array::from_slice(dev, &[1.0f32, 2.0, 3.0, 4.0], vec![1, 4]);
+    let result = moe.forward(&input, &registry, &queue);
+    assert!(result.is_err());
+}
+
+// ===== NEW TESTS: TransformerBlock forward =====
+
+#[test]
+fn test_transformer_block_forward() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+
+    // Tiny transformer block: hidden_size=8, 2 heads, head_dim=4
+    let hidden_size = 8;
+    let num_heads = 2;
+    let head_dim = 4;
+    let attn_config = AttentionConfig {
+        num_heads,
+        num_kv_heads: num_heads,
+        head_dim,
+        max_seq_len: 16,
+        rope_theta: 10000.0,
+    };
+    let attention = Attention::from_layers(
+        attn_config,
+        make_identity_linear(dev, hidden_size),
+        make_identity_linear(dev, hidden_size),
+        make_identity_linear(dev, hidden_size),
+        make_identity_linear(dev, hidden_size),
+    );
+
+    let ffn = FeedForward::Dense {
+        gate_proj: make_identity_linear(dev, hidden_size),
+        up_proj: make_identity_linear(dev, hidden_size),
+        down_proj: make_identity_linear(dev, hidden_size),
+    };
+
+    // RMS norm weights (all ones)
+    let norm1_weight = Array::ones(dev, &[hidden_size]);
+    let norm2_weight = Array::ones(dev, &[hidden_size]);
+
+    let block = TransformerBlock::from_parts(0, attention, ffn, norm1_weight, norm2_weight, 1e-5);
+
+    // Input: [2, 8]
+    let input = Array::from_slice(
+        dev,
+        &[
+            1.0f32, 0.5, 0.3, 0.1, 0.2, 0.4, 0.6, 0.8, 0.8, 0.6, 0.4, 0.2, 0.1, 0.3, 0.5, 0.7,
+        ],
+        vec![2, 8],
+    );
+
+    let output = block
+        .forward(&input, None, None, None, &registry, &queue)
+        .expect("transformer block forward failed");
+    assert_eq!(output.shape(), &[2, 8]);
+
+    let vals: Vec<f32> = unsafe { output.to_vec() };
+    let sum: f32 = vals.iter().sum();
+    assert!(sum.is_finite(), "block output contains non-finite values");
+}
+
+// ===== NEW TESTS: TransformerModel forward (end-to-end) =====
+
+#[test]
+fn test_transformer_model_forward() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+
+    // Tiny model: vocab=8, hidden=8, 2 heads, head_dim=4, 1 layer
+    let vocab_size = 8;
+    let hidden_size = 8;
+    let num_heads = 2;
+    let head_dim = 4;
+
+    // Embedding: [8, 8] — each token maps to a unique 8-dim vector
+    let mut emb_data = vec![0.0f32; vocab_size * hidden_size];
+    for i in 0..vocab_size {
+        for j in 0..hidden_size {
+            emb_data[i * hidden_size + j] = (i as f32 + 1.0) * 0.1 + j as f32 * 0.01;
+        }
+    }
+    let emb_weight = Array::from_slice(dev, &emb_data, vec![vocab_size, hidden_size]);
+    let embedding = Embedding::from_array(
+        EmbeddingConfig {
+            vocab_size,
+            embed_dim: hidden_size,
+        },
+        emb_weight,
+    );
+
+    // One transformer block
+    let attn_config = AttentionConfig {
+        num_heads,
+        num_kv_heads: num_heads,
+        head_dim,
+        max_seq_len: 16,
+        rope_theta: 10000.0,
+    };
+    let attention = Attention::from_layers(
+        attn_config,
+        make_identity_linear(dev, hidden_size),
+        make_identity_linear(dev, hidden_size),
+        make_identity_linear(dev, hidden_size),
+        make_identity_linear(dev, hidden_size),
+    );
+    let ffn = FeedForward::Dense {
+        gate_proj: make_identity_linear(dev, hidden_size),
+        up_proj: make_identity_linear(dev, hidden_size),
+        down_proj: make_identity_linear(dev, hidden_size),
+    };
+    let norm1 = Array::ones(dev, &[hidden_size]);
+    let norm2 = Array::ones(dev, &[hidden_size]);
+    let block = TransformerBlock::from_parts(0, attention, ffn, norm1, norm2, 1e-5);
+
+    // Final norm weight
+    let final_norm = Array::ones(dev, &[hidden_size]);
+
+    // LM head: [vocab_size, hidden_size]
+    let mut lm_head_data = vec![0.0f32; vocab_size * hidden_size];
+    for i in 0..vocab_size {
+        lm_head_data[i * hidden_size + i % hidden_size] = 1.0;
+    }
+    let lm_head_weight = Array::from_slice(dev, &lm_head_data, vec![vocab_size, hidden_size]);
+    let lm_head = Linear::from_arrays(
+        LinearConfig {
+            in_features: hidden_size,
+            out_features: vocab_size,
+            has_bias: false,
+        },
+        lm_head_weight,
+        None,
+    );
+
+    let config = TransformerConfig {
+        hidden_size,
+        num_heads,
+        num_kv_heads: num_heads,
+        head_dim,
+        num_layers: 1,
+        vocab_size,
+        max_seq_len: 16,
+        rope_theta: 10000.0,
+        rms_norm_eps: 1e-5,
+        ff_type: FeedForwardType::Dense {
+            intermediate_dim: hidden_size,
+        },
+    };
+
+    let model = TransformerModel::from_parts(config, embedding, vec![block], final_norm, lm_head);
+
+    // Forward pass with 3 tokens
+    let token_ids = [0u32, 1, 2];
+    let logits = model
+        .forward(&token_ids, None, None, None, &registry, &queue)
+        .expect("model forward failed");
+
+    // Expected output shape: [3, 8] (3 tokens, 8 vocab logits each)
+    assert_eq!(logits.shape(), &[3, vocab_size]);
+
+    let vals: Vec<f32> = unsafe { logits.to_vec() };
+    let sum: f32 = vals.iter().sum();
+    assert!(sum.is_finite(), "model output contains non-finite values");
+}

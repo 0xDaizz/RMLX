@@ -129,23 +129,23 @@ pub enum BinaryOp {
 }
 
 impl BinaryOp {
-    fn kernel_name(&self, dtype: DType) -> &'static str {
+    fn kernel_name(&self, dtype: DType) -> Result<&'static str, KernelError> {
         match (self, dtype) {
-            (BinaryOp::Add, DType::Float32) => "add_f32",
-            (BinaryOp::Mul, DType::Float32) => "mul_f32",
-            (BinaryOp::Sub, DType::Float32) => "sub_f32",
-            (BinaryOp::Div, DType::Float32) => "div_f32",
-            (BinaryOp::Add, DType::Float16) => "add_f16",
-            (BinaryOp::Mul, DType::Float16) => "mul_f16",
-            (BinaryOp::Sub, DType::Float16) => "sub_f16",
-            (BinaryOp::Div, DType::Float16) => "div_f16",
-            (BinaryOp::Add, DType::Bfloat16) => "add_bf16",
-            (BinaryOp::Mul, DType::Bfloat16) => "mul_bf16",
-            (BinaryOp::Sub, DType::Bfloat16) => "sub_bf16",
-            (BinaryOp::Div, DType::Bfloat16) => "div_bf16",
-            (_, DType::Q4_0 | DType::Q4_1 | DType::Q8_0) => {
-                unimplemented!("binary ops not supported for quantized types")
-            }
+            (BinaryOp::Add, DType::Float32) => Ok("add_f32"),
+            (BinaryOp::Mul, DType::Float32) => Ok("mul_f32"),
+            (BinaryOp::Sub, DType::Float32) => Ok("sub_f32"),
+            (BinaryOp::Div, DType::Float32) => Ok("div_f32"),
+            (BinaryOp::Add, DType::Float16) => Ok("add_f16"),
+            (BinaryOp::Mul, DType::Float16) => Ok("mul_f16"),
+            (BinaryOp::Sub, DType::Float16) => Ok("sub_f16"),
+            (BinaryOp::Div, DType::Float16) => Ok("div_f16"),
+            (BinaryOp::Add, DType::Bfloat16) => Ok("add_bf16"),
+            (BinaryOp::Mul, DType::Bfloat16) => Ok("mul_bf16"),
+            (BinaryOp::Sub, DType::Bfloat16) => Ok("sub_bf16"),
+            (BinaryOp::Div, DType::Bfloat16) => Ok("div_bf16"),
+            (_, DType::Q4_0 | DType::Q4_1 | DType::Q8_0) => Err(KernelError::InvalidShape(
+                "binary ops not supported for quantized types; dequantize first".into(),
+            )),
         }
     }
 }
@@ -183,7 +183,7 @@ pub fn binary_op_with_mode(
     let b_contig = super::make_contiguous(b, registry, queue)?;
     let b = b_contig.as_ref().unwrap_or(b);
 
-    let kernel_name = op.kernel_name(a.dtype());
+    let kernel_name = op.kernel_name(a.dtype())?;
     let pipeline = registry.get_pipeline(kernel_name, a.dtype())?;
     let numel = a.numel();
 

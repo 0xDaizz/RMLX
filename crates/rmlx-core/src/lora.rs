@@ -1,5 +1,8 @@
 //! LoRA (Low-Rank Adaptation) for parameter-efficient fine-tuning.
 
+use crate::array::Array;
+use crate::kernels::{KernelError, KernelRegistry};
+
 /// Configuration for LoRA adapters.
 #[derive(Debug, Clone)]
 pub struct LoraConfig {
@@ -139,6 +142,59 @@ impl LoraLayer {
         }
 
         output
+    }
+
+    /// GPU-accelerated forward pass using Metal matmul.
+    ///
+    /// `base_output`: [batch_size, out_features] on GPU
+    /// `input`: [batch_size, in_features] on GPU
+    /// Returns: base_output + scaling * input @ A^T @ B^T as a GPU Array.
+    ///
+    /// A is stored as (rank, in_features), so A^T is (in_features, rank).
+    /// B is stored as (out_features, rank), so B^T is (rank, out_features).
+    pub fn forward_gpu(
+        &self,
+        base_output: &Array,
+        input: &Array,
+        registry: &KernelRegistry,
+        queue: &metal::CommandQueue,
+    ) -> Result<Array, KernelError> {
+        let dev = registry.device().raw();
+        let batch_size = input.shape()[0];
+        assert_eq!(input.shape()[1], self.in_features);
+        assert_eq!(base_output.shape(), &[batch_size, self.out_features]);
+
+        // Upload A^T as (in_features, rank) from row-major A (rank, in_features)
+        let mut a_t = vec![0.0f32; self.in_features * self.rank];
+        for r in 0..self.rank {
+            for i in 0..self.in_features {
+                a_t[i * self.rank + r] = self.lora_a[r * self.in_features + i];
+            }
+        }
+        let a_t_arr = Array::from_slice(dev, &a_t, vec![self.in_features, self.rank]);
+
+        // Upload B^T as (rank, out_features) from row-major B (out_features, rank)
+        let mut b_t = vec![0.0f32; self.rank * self.out_features];
+        for o in 0..self.out_features {
+            for r in 0..self.rank {
+                b_t[r * self.out_features + o] = self.lora_b[o * self.rank + r];
+            }
+        }
+        let b_t_arr = Array::from_slice(dev, &b_t, vec![self.rank, self.out_features]);
+
+        // h = input @ A^T — (batch, in) @ (in, rank) -> (batch, rank)
+        let h = crate::ops::matmul::matmul(registry, input, &a_t_arr, queue)?;
+
+        // delta = h @ B^T — (batch, rank) @ (rank, out) -> (batch, out)
+        let delta = crate::ops::matmul::matmul(registry, &h, &b_t_arr, queue)?;
+
+        // scale delta and add to base_output
+        let scale_data = vec![self.scaling as f32; batch_size * self.out_features];
+        let scale_arr = Array::from_slice(dev, &scale_data, vec![batch_size, self.out_features]);
+        let scaled = crate::ops::binary::mul(registry, &delta, &scale_arr, queue)?;
+        let result = crate::ops::binary::add(registry, base_output, &scaled, queue)?;
+
+        Ok(result)
     }
 
     /// Total number of trainable parameters.

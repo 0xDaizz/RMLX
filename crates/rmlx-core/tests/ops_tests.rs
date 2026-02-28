@@ -628,3 +628,293 @@ fn test_reduce_sum_medium_array() {
         expected
     );
 }
+
+// ─── RP0-5: rms_norm large axis_size tests ───
+
+#[test]
+fn test_rms_norm_large_sizes() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+
+    for &axis_size in &[64, 512, 1024, 2048, 4096, 8192] {
+        let input_data: Vec<f32> = (0..axis_size).map(|i| (i as f32 + 1.0) * 0.01).collect();
+        let weight_data: Vec<f32> = vec![1.0; axis_size];
+        let input = Array::from_slice(dev, &input_data, vec![1, axis_size]);
+        let weight = Array::from_slice(dev, &weight_data, vec![axis_size]);
+
+        let result = ops::rms_norm::rms_norm(&registry, &input, &weight, 1e-5, &queue)
+            .unwrap_or_else(|e| panic!("rms_norm failed for axis_size={axis_size}: {e}"));
+        let vals: Vec<f32> = unsafe { result.to_vec() };
+
+        // Compute expected RMS
+        let sum_sq: f32 = input_data.iter().map(|x| x * x).sum();
+        let rms = (sum_sq / axis_size as f32 + 1e-5).sqrt();
+        let inv_rms = 1.0 / rms;
+
+        // Check a few values
+        for &idx in &[0, axis_size / 2, axis_size - 1] {
+            let expected = input_data[idx] * inv_rms;
+            let got = vals[idx];
+            assert!(
+                (got - expected).abs() < 1e-3,
+                "rms_norm[{idx}] axis_size={axis_size}: got {got}, expected {expected}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_rms_norm_multi_row_large() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    let axis_size = 4096;
+    let rows = 4;
+    let input_data: Vec<f32> = (0..rows * axis_size)
+        .map(|i| ((i % axis_size) as f32 + 1.0) * 0.001)
+        .collect();
+    let weight_data: Vec<f32> = vec![1.0; axis_size];
+    let input = Array::from_slice(dev, &input_data, vec![rows, axis_size]);
+    let weight = Array::from_slice(dev, &weight_data, vec![axis_size]);
+
+    let result = ops::rms_norm::rms_norm(&registry, &input, &weight, 1e-5, &queue)
+        .expect("multi-row rms_norm failed");
+    let vals: Vec<f32> = unsafe { result.to_vec() };
+
+    // Each row should have its own normalization
+    for r in 0..rows {
+        let row_data = &input_data[r * axis_size..(r + 1) * axis_size];
+        let sum_sq: f32 = row_data.iter().map(|x| x * x).sum();
+        let inv_rms = 1.0 / (sum_sq / axis_size as f32 + 1e-5).sqrt();
+        let got = vals[r * axis_size];
+        let expected = row_data[0] * inv_rms;
+        assert!(
+            (got - expected).abs() < 1e-3,
+            "row {r} rms_norm[0]: got {got}, expected {expected}"
+        );
+    }
+}
+
+// ─── RP0-6: binary quantized returns proper error ───
+
+#[test]
+fn test_binary_quantized_returns_error() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    // Create Q8_0 arrays (32 elements = 1 block = 34 bytes)
+    let a = Array::zeros(dev, &[32], DType::Q8_0);
+    let b = Array::zeros(dev, &[32], DType::Q8_0);
+    let result = ops::binary::binary_op(&registry, &a, &b, ops::binary::BinaryOp::Add, &queue);
+    assert!(
+        result.is_err(),
+        "binary op on quantized types should return error, not panic"
+    );
+}
+
+// ─── RP1-1: matmul GEMV auto-dispatch ───
+
+#[test]
+fn test_matmul_m1_n1_uses_gemv_path() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    // [1,3] @ [3,1] = dot product
+    let a = Array::from_slice(dev, &[1.0f32, 2.0, 3.0], vec![1, 3]);
+    let b = Array::from_slice(dev, &[4.0f32, 5.0, 6.0], vec![3, 1]);
+    let c = ops::matmul::matmul(&registry, &a, &b, &queue).expect("matmul M=1,N=1 failed");
+    let vals: Vec<f32> = unsafe { c.to_vec() };
+    // 1*4 + 2*5 + 3*6 = 32
+    assert!(
+        (vals[0] - 32.0).abs() < 1e-3,
+        "matmul M=1,N=1: got {}, expected 32.0",
+        vals[0]
+    );
+    assert_eq!(c.shape(), &[1, 1]);
+}
+
+#[test]
+fn test_matmul_m1_same_as_gemm() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    // [1,4] @ [4,3] — this uses GEMM path since N>1
+    let a = Array::from_slice(dev, &[1.0f32, 2.0, 3.0, 4.0], vec![1, 4]);
+    let b = Array::from_slice(
+        dev,
+        &[
+            1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0,
+        ],
+        vec![4, 3],
+    );
+    let c = ops::matmul::matmul(&registry, &a, &b, &queue).expect("matmul M=1 failed");
+    let vals: Vec<f32> = unsafe { c.to_vec() };
+    // [1,2,3,4] @ [[1,0,0],[0,1,0],[0,0,1],[1,1,1]] = [1+4, 2+4, 3+4] = [5,6,7]
+    assert!((vals[0] - 5.0).abs() < 1e-3, "C[0,0]={}", vals[0]);
+    assert!((vals[1] - 6.0).abs() < 1e-3, "C[0,1]={}", vals[1]);
+    assert!((vals[2] - 7.0).abs() < 1e-3, "C[0,2]={}", vals[2]);
+}
+
+// ─── RP1-2: VJP backward tests ───
+
+#[test]
+fn test_vjp_softmax_backward() {
+    use rmlx_core::vjp::*;
+    // 1 row, 4 cols
+    let input = vec![1.0f32, 2.0, 3.0, 4.0];
+    // Compute softmax
+    let max_val = input.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let exps: Vec<f32> = input.iter().map(|x| (x - max_val).exp()).collect();
+    let sum_exp: f32 = exps.iter().sum();
+    let output: Vec<f32> = exps.iter().map(|e| e / sum_exp).collect();
+
+    let grad_fn = SoftmaxGrad {
+        output: output.clone(),
+        rows: 1,
+        cols: 4,
+    };
+    let grad_out = vec![1.0f32, 0.0, 0.0, 0.0]; // gradient w.r.t. first output
+    let grads = grad_fn.backward(&grad_out);
+    assert_eq!(grads.len(), 1);
+    assert_eq!(grads[0].len(), 4);
+    // grad_input[0] = output[0] * (1 - output[0])
+    let expected_0 = output[0] * (1.0 - output[0]);
+    assert!(
+        (grads[0][0] - expected_0).abs() < 1e-5,
+        "softmax grad[0]: got {}, expected {}",
+        grads[0][0],
+        expected_0
+    );
+    // grad_input[1] = output[1] * (0 - output[0])
+    let expected_1 = output[1] * (0.0 - output[0]);
+    assert!(
+        (grads[0][1] - expected_1).abs() < 1e-5,
+        "softmax grad[1]: got {}, expected {}",
+        grads[0][1],
+        expected_1
+    );
+}
+
+#[test]
+fn test_vjp_rms_norm_backward() {
+    use rmlx_core::vjp::*;
+    let input = vec![1.0f32, 2.0, 3.0, 4.0];
+    let weight = vec![1.0f32, 1.0, 1.0, 1.0];
+    let eps = 1e-5f32;
+    let axis_size = 4;
+
+    let grad_fn = RmsNormGrad {
+        input: input.clone(),
+        weight: weight.clone(),
+        rows: 1,
+        axis_size,
+        eps,
+    };
+
+    // Compare with numerical gradient
+    let rms_norm_fn = |x: &[f32]| -> Vec<f32> {
+        let sum_sq: f32 = x.iter().map(|v| v * v).sum();
+        let inv_rms = 1.0 / (sum_sq / x.len() as f32 + eps).sqrt();
+        x.iter()
+            .zip(&weight)
+            .map(|(v, w)| v * inv_rms * w)
+            .collect()
+    };
+
+    let jacobian = numerical_gradient(rms_norm_fn, &input, 1e-3);
+    let grad_out = vec![1.0f32, 0.0, 0.0, 0.0];
+    let analytic = grad_fn.backward(&grad_out);
+
+    // Compare: analytic grad should match sum of jacobian columns weighted by grad_out
+    for i in 0..4 {
+        let numerical: f32 = (0..4).map(|j| jacobian[i][j] * grad_out[j]).sum();
+        assert!(
+            (analytic[0][i] - numerical).abs() < 1e-3,
+            "rms_norm grad[{i}]: analytic={}, numerical={}",
+            analytic[0][i],
+            numerical
+        );
+    }
+}
+
+// ─── RP1-3: LoRA tests ───
+
+#[test]
+fn test_lora_forward_shape() {
+    use rmlx_core::lora::{LoraConfig, LoraLayer};
+    let config = LoraConfig::new(4, 8.0);
+    let layer = LoraLayer::new(16, 8, &config);
+    let input = vec![1.0f32; 2 * 16]; // batch=2, in=16
+    let base_output = vec![0.0f32; 2 * 8]; // batch=2, out=8
+    let output = layer.forward(&base_output, &input, 2);
+    assert_eq!(
+        output.len(),
+        2 * 8,
+        "output shape should be batch*out_features"
+    );
+}
+
+#[test]
+fn test_lora_zero_init_identity() {
+    use rmlx_core::lora::{LoraConfig, LoraLayer};
+    // B is zero-initialized, so LoRA contribution should be zero initially
+    let config = LoraConfig::new(4, 8.0);
+    let layer = LoraLayer::new(16, 8, &config);
+    let input = vec![1.0f32; 16];
+    let base_output = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+    let output = layer.forward(&base_output, &input, 1);
+    // Since B=0, output should equal base_output
+    for (i, (&got, &expected)) in output.iter().zip(base_output.iter()).enumerate() {
+        assert!(
+            (got - expected).abs() < 1e-6,
+            "lora zero init [{i}]: got {got}, expected {expected}"
+        );
+    }
+}
+
+#[test]
+fn test_lora_gpu_forward() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    use rmlx_core::lora::LoraLayer;
+    let dev = registry.device().raw();
+
+    // Small LoRA: in=4, out=3, rank=2, alpha=4
+    let lora_a = vec![1.0f32, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0]; // (2, 4)
+    let lora_b = vec![1.0f32, 0.0, 0.0, 1.0, 1.0, 1.0]; // (3, 2)
+    let layer = LoraLayer::with_weights(4, 3, 2, 4.0, lora_a, lora_b);
+
+    let input_data = vec![1.0f32, 2.0, 3.0, 4.0]; // batch=1
+    let base_data = vec![0.0f32, 0.0, 0.0]; // batch=1
+
+    // CPU forward
+    let cpu_out = layer.forward(&base_data, &input_data, 1);
+
+    // GPU forward
+    let input_arr = Array::from_slice(dev, &input_data, vec![1, 4]);
+    let base_arr = Array::from_slice(dev, &base_data, vec![1, 3]);
+    let gpu_out = layer
+        .forward_gpu(&base_arr, &input_arr, &registry, &queue)
+        .expect("GPU LoRA failed");
+    let gpu_vals: Vec<f32> = unsafe { gpu_out.to_vec() };
+
+    for (i, (&cpu, &gpu)) in cpu_out.iter().zip(gpu_vals.iter()).enumerate() {
+        assert!(
+            (cpu - gpu).abs() < 1e-3,
+            "LoRA CPU vs GPU [{i}]: cpu={cpu}, gpu={gpu}"
+        );
+    }
+}

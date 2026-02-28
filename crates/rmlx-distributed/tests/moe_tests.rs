@@ -63,7 +63,7 @@ fn test_moe_dispatch_basic() {
         .unwrap();
     assert_eq!(result.expert_counts.len(), 8);
     assert_eq!(result.local_expert_range, (0, 4)); // rank 0 owns experts 0-3
-    assert_eq!(exchange.metrics().tokens_dispatched, 4);
+    assert_eq!(exchange.metrics().snapshot().total_tokens_routed, 4);
     assert!(!result.routed_data.is_empty());
 }
 
@@ -86,7 +86,7 @@ fn test_moe_dispatch_overflow() {
         .unwrap();
     // capacity = ceil(8 * 1 / 4 * 1.0) = 2
     assert!(result.overflow_count > 0, "should have overflow");
-    assert!(exchange.metrics().overflow_ratio() > 0.0);
+    assert!(exchange.metrics().snapshot().overflow_events > 0);
 }
 
 #[test]
@@ -112,12 +112,15 @@ fn test_moe_combine_cpu() {
 
 #[test]
 fn test_moe_metrics() {
-    let mut m = rmlx_distributed::moe_exchange::MoeMetrics::default();
-    m.record_dispatch(100, 5, MoeBackend::Metal);
-    assert_eq!(m.tokens_dispatched, 100);
-    assert_eq!(m.overflow_count, 5);
-    assert!((m.overflow_ratio() - 0.05).abs() < 1e-6);
-    assert_eq!(m.metal_dispatches, 1);
+    let m = rmlx_distributed::metrics::MoeMetrics::default();
+    m.record_dispatch(100);
+    m.record_metal_dispatch();
+    m.record_overflow();
+    let snap = m.snapshot();
+    assert_eq!(snap.total_tokens_routed, 100);
+    assert_eq!(snap.dispatch_count, 1);
+    assert_eq!(snap.overflow_events, 1);
+    assert_eq!(snap.metal_dispatches, 1);
 }
 
 #[test]
@@ -226,7 +229,7 @@ fn test_moe_dispatch_rdma_routing() {
         .dispatch(250, &indices, &weights, &token_data)
         .unwrap();
     assert_eq!(result.backend, MoeBackend::Rdma);
-    assert_eq!(exchange.metrics().rdma_dispatches, 1);
+    assert_eq!(exchange.metrics().snapshot().rdma_dispatches, 1);
     assert!(!result.routed_data.is_empty());
 }
 
