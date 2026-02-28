@@ -36,6 +36,8 @@ pub enum RdmaError {
     CqPoll(String),
     /// Connection setup failed
     ConnectionFailed(String),
+    /// CQ poll timed out waiting for completion
+    Timeout(String),
     /// Feature not available (RDMA hardware missing)
     Unavailable(String),
 }
@@ -54,6 +56,7 @@ impl fmt::Display for RdmaError {
             Self::PostFailed(e) => write!(f, "work request post failed: {e}"),
             Self::CqPoll(e) => write!(f, "completion queue poll error: {e}"),
             Self::ConnectionFailed(e) => write!(f, "connection failed: {e}"),
+            Self::Timeout(e) => write!(f, "CQ poll timeout: {e}"),
             Self::Unavailable(e) => write!(f, "RDMA unavailable: {e}"),
         }
     }

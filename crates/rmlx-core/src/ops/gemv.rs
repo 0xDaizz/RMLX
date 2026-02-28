@@ -69,6 +69,11 @@ pub fn gemv(
         "inner dimensions must match"
     );
 
+    let mat_contig = super::make_contiguous(mat, registry, queue)?;
+    let mat = mat_contig.as_ref().unwrap_or(mat);
+    let vec_contig = super::make_contiguous(vec, registry, queue)?;
+    let vec = vec_contig.as_ref().unwrap_or(vec);
+
     let kernel_name = match mat.dtype() {
         DType::Float32 => "gemv_f32",
         _ => {

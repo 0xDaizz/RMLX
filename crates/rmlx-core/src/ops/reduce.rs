@@ -76,7 +76,7 @@ kernel void reduce_max_f32(
 // Argmax reduction
 kernel void reduce_argmax_f32(
     device const float* input [[buffer(0)]],
-    device uint* output [[buffer(1)]],
+    device float* output [[buffer(1)]],
     constant uint& size [[buffer(2)]],
     uint tid [[thread_position_in_threadgroup]],
     uint tgsize [[threads_per_threadgroup]])
@@ -108,7 +108,8 @@ kernel void reduce_argmax_f32(
     }
 
     if (tid == 0) {
-        output[0] = shared_idxs[0];
+        // Cast uint index to float so output buffer matches DType::Float32
+        output[0] = (float)shared_idxs[0];
     }
 }
 
@@ -171,6 +172,26 @@ pub fn reduce_all(
     op: ReduceOp,
     queue: &metal::CommandQueue,
 ) -> Result<Array, KernelError> {
+    reduce_all_with_mode(registry, input, op, queue, super::ExecMode::Sync)
+}
+
+/// Reduce all elements with explicit execution mode.
+pub fn reduce_all_with_mode(
+    registry: &KernelRegistry,
+    input: &Array,
+    op: ReduceOp,
+    queue: &metal::CommandQueue,
+    mode: super::ExecMode,
+) -> Result<Array, KernelError> {
+    if input.numel() == 0 {
+        return Err(KernelError::InvalidShape(
+            "cannot reduce empty array".into(),
+        ));
+    }
+
+    let input_contig = super::make_contiguous(input, registry, queue)?;
+    let input = input_contig.as_ref().unwrap_or(input);
+
     let (kernel_name, out_dtype) = match (op, input.dtype()) {
         (ReduceOp::Sum, DType::Float32) => ("reduce_sum_f32", DType::Float32),
         (ReduceOp::Max, DType::Float32) => ("reduce_max_f32", DType::Float32),
@@ -206,8 +227,7 @@ pub fn reduce_all(
     let tg_size = std::cmp::min(1024, pipeline.max_total_threads_per_threadgroup());
     encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(tg_size, 1, 1));
     encoder.end_encoding();
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
+    super::commit_with_mode(command_buffer, mode);
 
     Ok(out)
 }
@@ -220,6 +240,13 @@ pub fn reduce_row(
     queue: &metal::CommandQueue,
 ) -> Result<Array, KernelError> {
     assert_eq!(input.ndim(), 2, "reduce_row requires 2D array");
+    if input.numel() == 0 {
+        return Err(KernelError::InvalidShape(
+            "cannot reduce empty array".into(),
+        ));
+    }
+    let input_contig = super::make_contiguous(input, registry, queue)?;
+    let input = input_contig.as_ref().unwrap_or(input);
     let rows = input.shape()[0];
     let cols = input.shape()[1] as u32;
 

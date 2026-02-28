@@ -50,6 +50,11 @@ pub fn matmul(
     assert_eq!(a.shape()[1], b.shape()[0], "inner dimensions must match");
     assert_eq!(a.dtype(), b.dtype(), "dtypes must match");
 
+    let a_contig = super::make_contiguous(a, registry, queue)?;
+    let a = a_contig.as_ref().unwrap_or(a);
+    let b_contig = super::make_contiguous(b, registry, queue)?;
+    let b = b_contig.as_ref().unwrap_or(b);
+
     let m = a.shape()[0];
     let k = a.shape()[1];
     let n = b.shape()[1];

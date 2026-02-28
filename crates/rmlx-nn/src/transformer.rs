@@ -18,6 +18,36 @@ pub struct TransformerConfig {
     pub ff_type: FeedForwardType,
 }
 
+impl TransformerConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.hidden_size == 0 {
+            return Err("hidden_size must be > 0".into());
+        }
+        if self.num_heads == 0 {
+            return Err("num_heads must be > 0".into());
+        }
+        if self.num_kv_heads == 0 {
+            return Err("num_kv_heads must be > 0".into());
+        }
+        if self.num_kv_heads > self.num_heads {
+            return Err("num_kv_heads > num_heads".into());
+        }
+        if self.num_heads % self.num_kv_heads != 0 {
+            return Err("num_heads must be divisible by num_kv_heads".into());
+        }
+        if self.head_dim == 0 {
+            return Err("head_dim must be > 0".into());
+        }
+        if self.num_layers == 0 {
+            return Err("num_layers must be > 0".into());
+        }
+        if self.vocab_size == 0 {
+            return Err("vocab_size must be > 0".into());
+        }
+        Ok(())
+    }
+}
+
 pub struct TransformerBlock {
     layer_idx: usize,
     config: TransformerConfig,
