@@ -3,9 +3,11 @@
 pub mod buffer;
 pub mod command;
 pub mod device;
+pub mod event;
 pub mod library;
 pub mod pipeline;
 pub mod queue;
+pub mod stream;
 
 // Re-export metal crate for downstream users
 pub use metal;
