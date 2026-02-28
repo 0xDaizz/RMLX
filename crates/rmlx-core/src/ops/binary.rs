@@ -81,6 +81,42 @@ kernel void div_f16(
 {
     out[id] = a[id] / b[id];
 }
+
+kernel void add_bf16(
+    device const bfloat* a [[buffer(0)]],
+    device const bfloat* b [[buffer(1)]],
+    device bfloat* out [[buffer(2)]],
+    uint id [[thread_position_in_grid]])
+{
+    out[id] = a[id] + b[id];
+}
+
+kernel void mul_bf16(
+    device const bfloat* a [[buffer(0)]],
+    device const bfloat* b [[buffer(1)]],
+    device bfloat* out [[buffer(2)]],
+    uint id [[thread_position_in_grid]])
+{
+    out[id] = a[id] * b[id];
+}
+
+kernel void sub_bf16(
+    device const bfloat* a [[buffer(0)]],
+    device const bfloat* b [[buffer(1)]],
+    device bfloat* out [[buffer(2)]],
+    uint id [[thread_position_in_grid]])
+{
+    out[id] = a[id] - b[id];
+}
+
+kernel void div_bf16(
+    device const bfloat* a [[buffer(0)]],
+    device const bfloat* b [[buffer(1)]],
+    device bfloat* out [[buffer(2)]],
+    uint id [[thread_position_in_grid]])
+{
+    out[id] = a[id] / b[id];
+}
 "#;
 
 /// Binary operation type.
@@ -103,9 +139,10 @@ impl BinaryOp {
             (BinaryOp::Mul, DType::Float16) => "mul_f16",
             (BinaryOp::Sub, DType::Float16) => "sub_f16",
             (BinaryOp::Div, DType::Float16) => "div_f16",
-            (_, DType::Bfloat16) => {
-                unimplemented!("bf16 binary ops not yet supported")
-            }
+            (BinaryOp::Add, DType::Bfloat16) => "add_bf16",
+            (BinaryOp::Mul, DType::Bfloat16) => "mul_bf16",
+            (BinaryOp::Sub, DType::Bfloat16) => "sub_bf16",
+            (BinaryOp::Div, DType::Bfloat16) => "div_bf16",
             (_, DType::Q4_0 | DType::Q4_1 | DType::Q8_0) => {
                 unimplemented!("binary ops not supported for quantized types")
             }

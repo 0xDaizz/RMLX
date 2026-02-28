@@ -101,8 +101,26 @@ pub fn quantized_matmul(
         .block_size()
         .expect("quantized_matmul requires a quantized dtype");
     if in_features % block_sz != 0 {
-        return Err(KernelError::NotFound(format!(
+        return Err(KernelError::InvalidShape(format!(
             "in_features ({in_features}) must be a multiple of block_size ({block_sz})"
+        )));
+    }
+
+    // Validate input vector size
+    if vec.numel() != in_features {
+        return Err(KernelError::InvalidShape(format!(
+            "vec.numel() ({}) != in_features ({in_features})",
+            vec.numel()
+        )));
+    }
+
+    // Validate weights buffer size matches expected packed size
+    let expected_weight_bytes = weights.dtype().numel_to_bytes(out_features * in_features);
+    let actual_weight_bytes = weights.metal_buffer().length() as usize;
+    if actual_weight_bytes < expected_weight_bytes {
+        return Err(KernelError::InvalidShape(format!(
+            "weights buffer too small: {} bytes < expected {} bytes for [{out_features}, {in_features}] {:?}",
+            actual_weight_bytes, expected_weight_bytes, weights.dtype()
         )));
     }
 
@@ -111,8 +129,8 @@ pub fn quantized_matmul(
 
     let dev = registry.device().raw();
     let opts = metal::MTLResourceOptions::StorageModeShared;
-    let out_f = out_features as u32;
-    let in_f = in_features as u32;
+    let out_f = super::checked_u32(out_features, "out_features")?;
+    let in_f = super::checked_u32(in_features, "in_features")?;
     let of_buf = dev.new_buffer_with_data(&out_f as *const u32 as *const _, 4, opts);
     let if_buf = dev.new_buffer_with_data(&in_f as *const u32 as *const _, 4, opts);
 

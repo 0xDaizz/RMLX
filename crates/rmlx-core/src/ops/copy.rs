@@ -32,6 +32,14 @@ kernel void copy_f16(
     dst[id] = src[id];
 }
 
+kernel void copy_bf16(
+    device const bfloat* src [[buffer(0)]],
+    device bfloat* dst [[buffer(1)]],
+    uint id [[thread_position_in_grid]])
+{
+    dst[id] = src[id];
+}
+
 // === Stride-aware (general) copy ===
 // Buffers:
 //   0: src data pointer
@@ -88,6 +96,28 @@ kernel void copy_strided_f16(
     }
     dst[id] = src[src_offset];
 }
+
+kernel void copy_strided_bf16(
+    device const bfloat* src [[buffer(0)]],
+    device bfloat* dst [[buffer(1)]],
+    constant const uint* shape [[buffer(2)]],
+    constant const uint* src_strides [[buffer(3)]],
+    constant const uint& ndim [[buffer(4)]],
+    uint id [[thread_position_in_grid]])
+{
+    uint src_offset = 0;
+    uint remaining = id;
+    for (uint d = 0; d < ndim; d++) {
+        uint out_stride = 1;
+        for (uint k = d + 1; k < ndim; k++) {
+            out_stride *= shape[k];
+        }
+        uint coord = remaining / out_stride;
+        remaining = remaining % out_stride;
+        src_offset += coord * src_strides[d];
+    }
+    dst[id] = src[src_offset];
+}
 "#;
 
 /// Register copy kernels with the registry via JIT.
@@ -122,11 +152,8 @@ pub fn copy_with_mode(
         (DType::Float32, true) => "copy_strided_f32",
         (DType::Float16, false) => "copy_f16",
         (DType::Float16, true) => "copy_strided_f16",
-        (DType::Bfloat16, _) => {
-            return Err(KernelError::NotFound(
-                "copy not supported for bf16 (different memory layout from f16)".to_string(),
-            ))
-        }
+        (DType::Bfloat16, false) => "copy_bf16",
+        (DType::Bfloat16, true) => "copy_strided_bf16",
         (DType::Q4_0 | DType::Q4_1 | DType::Q8_0, _) => {
             return Err(KernelError::NotFound(
                 "copy not supported for quantized types".to_string(),
@@ -151,8 +178,18 @@ pub fn copy_with_mode(
         let device = registry.device().raw();
         let ndim = src.ndim();
 
-        let shape_data: Vec<u32> = src.shape().iter().map(|&s| s as u32).collect();
-        let stride_data: Vec<u32> = src.strides().iter().map(|&s| s as u32).collect();
+        let shape_data: Vec<u32> = src
+            .shape()
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| super::checked_u32(s, &format!("shape[{i}]")))
+            .collect::<Result<Vec<u32>, _>>()?;
+        let stride_data: Vec<u32> = src
+            .strides()
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| super::checked_u32(s, &format!("stride[{i}]")))
+            .collect::<Result<Vec<u32>, _>>()?;
 
         let shape_buf = device.new_buffer_with_data(
             shape_data.as_ptr() as *const _,
@@ -164,7 +201,7 @@ pub fn copy_with_mode(
             (ndim * std::mem::size_of::<u32>()) as u64,
             metal::MTLResourceOptions::StorageModeShared,
         );
-        let ndim_val = ndim as u32;
+        let ndim_val = super::checked_u32(ndim, "ndim")?;
         let ndim_buf = device.new_buffer_with_data(
             &ndim_val as *const u32 as *const _,
             std::mem::size_of::<u32>() as u64,

@@ -92,7 +92,7 @@ pub fn softmax(
 
     let pipeline = registry.get_pipeline(kernel_name, input.dtype())?;
     let rows = input.shape()[0];
-    let cols = input.shape()[1] as u32;
+    let cols = super::checked_u32(input.shape()[1], "cols")?;
 
     let out = Array::zeros(registry.device().raw(), input.shape(), input.dtype());
 

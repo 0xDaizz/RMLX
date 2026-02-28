@@ -197,6 +197,67 @@ fn test_exec_mode_variants() {
     assert_eq!(format!("{:?}", async_), "Async");
 }
 
+// ─── CommandBufferHandle tests ───
+
+#[test]
+fn test_command_buffer_handle_immediate_complete() {
+    use rmlx_core::ops::CommandBufferHandle;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    // Simulate an already-completed handle
+    let completed = Arc::new(AtomicBool::new(true));
+    let handle = CommandBufferHandle::new_from_flag(Arc::clone(&completed));
+    assert!(handle.is_complete());
+    handle.wait(); // should return immediately
+    assert!(handle.wait_timeout(Duration::from_millis(1)));
+}
+
+#[test]
+fn test_command_buffer_handle_async_completion() {
+    use rmlx_core::ops::CommandBufferHandle;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let completed = Arc::new(AtomicBool::new(false));
+    let handle = CommandBufferHandle::new_from_flag(Arc::clone(&completed));
+    assert!(!handle.is_complete());
+
+    // Timeout should fail since not yet complete
+    assert!(!handle.wait_timeout(Duration::from_millis(10)));
+
+    // Complete it from another thread
+    let flag = Arc::clone(&completed);
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(20));
+        flag.store(true, Ordering::Release);
+    });
+
+    // wait() should eventually return
+    handle.wait();
+    assert!(handle.is_complete());
+}
+
+#[test]
+fn test_command_buffer_handle_clone() {
+    use rmlx_core::ops::CommandBufferHandle;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let completed = Arc::new(AtomicBool::new(false));
+    let handle1 = CommandBufferHandle::new_from_flag(Arc::clone(&completed));
+    let handle2 = handle1.clone();
+
+    assert!(!handle1.is_complete());
+    assert!(!handle2.is_complete());
+
+    completed.store(true, Ordering::Release);
+    assert!(handle1.is_complete());
+    assert!(handle2.is_complete());
+}
+
 // ─── Shutdown tests ───
 
 #[test]

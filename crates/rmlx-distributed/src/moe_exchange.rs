@@ -6,6 +6,57 @@
 use crate::group::{ensure_materialized, DistributedError, Group};
 use crate::moe_policy::{MoeBackend, MoePolicy};
 
+/// Metal shader source for the gather/scatter routing kernel.
+///
+/// For each token, reads expert_index from `indices`, checks if the expert is
+/// in the local range [local_start, local_end), and if so copies the token to
+/// the output at the expert's offset. Uses atomic counters per expert to track
+/// write positions.
+const METAL_ROUTE_KERNEL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct RouteParams {
+    uint batch_size;
+    uint top_k;
+    uint token_stride;        // bytes per token
+    uint local_start;
+    uint local_end;
+    uint capacity_per_expert;
+    uint local_expert_count;
+};
+
+kernel void moe_gather_scatter(
+    device const uchar*      token_data      [[buffer(0)]],
+    device const uint*        expert_indices  [[buffer(1)]],
+    device uchar*             output          [[buffer(2)]],
+    device atomic_uint*       cursors         [[buffer(3)]],
+    constant RouteParams&     params          [[buffer(4)]],
+    uint                      tid             [[thread_position_in_grid]])
+{
+    uint batch_size = params.batch_size;
+    uint top_k = params.top_k;
+    uint total = batch_size * top_k;
+    if (tid >= total) return;
+
+    uint batch_idx = tid / top_k;
+    uint expert = expert_indices[tid];
+
+    if (expert < params.local_start || expert >= params.local_end) return;
+
+    uint local_expert = expert - params.local_start;
+    uint cursor = atomic_fetch_add_explicit(&cursors[local_expert], 1, memory_order_relaxed);
+    if (cursor >= params.capacity_per_expert) return;
+
+    uint src_offset = batch_idx * params.token_stride;
+    uint dst_offset = (local_expert * params.capacity_per_expert + cursor) * params.token_stride;
+
+    for (uint i = 0; i < params.token_stride; i++) {
+        output[dst_offset + i] = token_data[src_offset + i];
+    }
+}
+"#;
+
 /// Overflow tracking metrics for MoE dispatch.
 #[derive(Debug, Clone, Default)]
 pub struct MoeMetrics {
@@ -227,12 +278,12 @@ impl MoeDispatchExchange {
         Ok(output)
     }
 
-    /// Metal routing: GPU-accelerated local routing.
+    /// Metal routing: GPU-accelerated local gather/scatter.
     ///
-    /// Uses the same gather/scatter logic as CPU but is intended to be dispatched
-    /// via a Metal compute kernel for parallel execution. Currently delegates to
-    /// the CPU path as a functional fallback — the Metal kernel dispatch will be
-    /// wired once rmlx-metal's compute pipeline is integrated.
+    /// Compiles and dispatches a Metal compute kernel that performs the same
+    /// token-to-expert routing as the CPU path, but in parallel on the GPU.
+    /// Falls back to the CPU path if the Metal device is not available or
+    /// if shader compilation fails.
     fn route_metal(
         &self,
         token_data: &[u8],
@@ -241,24 +292,160 @@ impl MoeDispatchExchange {
         local_start: usize,
         local_end: usize,
     ) -> Result<Vec<u8>, DistributedError> {
-        // Metal path: in production this will encode a gather/scatter compute
-        // command buffer. For now, functionally equivalent to the CPU path.
-        // The Metal shared-memory buffers will be wired when rmlx-metal provides
-        // the encoder/command-buffer API.
-        self.route_cpu(
-            token_data,
-            expert_indices,
-            expert_counts,
-            local_start,
-            local_end,
-        )
+        // Try to acquire Metal device; fall back to CPU if unavailable
+        let device = match metal::Device::system_default() {
+            Some(d) => d,
+            None => {
+                return self.route_cpu(
+                    token_data,
+                    expert_indices,
+                    expert_counts,
+                    local_start,
+                    local_end,
+                );
+            }
+        };
+
+        let batch_size = expert_indices.len() / self.config.top_k;
+        if batch_size == 0 {
+            return Ok(Vec::new());
+        }
+        let token_stride = token_data.len() / batch_size;
+        let num_experts = self.config.num_experts;
+        let capacity_per_expert = (batch_size as f32 * self.config.top_k as f32
+            / num_experts as f32
+            * self.config.capacity_factor)
+            .ceil() as usize;
+        let local_expert_count = local_end - local_start;
+        let output_size = local_expert_count * capacity_per_expert * token_stride;
+
+        // Compile shader — fall back to CPU on failure
+        let options = metal::CompileOptions::new();
+        let library = match device.new_library_with_source(METAL_ROUTE_KERNEL, &options) {
+            Ok(lib) => lib,
+            Err(_) => {
+                return self.route_cpu(
+                    token_data,
+                    expert_indices,
+                    expert_counts,
+                    local_start,
+                    local_end,
+                );
+            }
+        };
+        let function = match library.get_function("moe_gather_scatter", None) {
+            Ok(f) => f,
+            Err(_) => {
+                return self.route_cpu(
+                    token_data,
+                    expert_indices,
+                    expert_counts,
+                    local_start,
+                    local_end,
+                );
+            }
+        };
+        let pipeline = match device.new_compute_pipeline_state_with_function(&function) {
+            Ok(p) => p,
+            Err(_) => {
+                return self.route_cpu(
+                    token_data,
+                    expert_indices,
+                    expert_counts,
+                    local_start,
+                    local_end,
+                );
+            }
+        };
+
+        // Create buffers
+        let shared = metal::MTLResourceOptions::StorageModeShared;
+        let token_buf = device.new_buffer_with_data(
+            token_data.as_ptr() as *const std::ffi::c_void,
+            token_data.len() as u64,
+            shared,
+        );
+        let indices_buf = device.new_buffer_with_data(
+            expert_indices.as_ptr() as *const std::ffi::c_void,
+            (expert_indices.len() * 4) as u64,
+            shared,
+        );
+        let output_buf = device.new_buffer(output_size.max(1) as u64, shared);
+        // Zero-initialized cursor buffer (one u32 per local expert)
+        let cursor_data = vec![0u32; local_expert_count];
+        let cursor_buf = device.new_buffer_with_data(
+            cursor_data.as_ptr() as *const std::ffi::c_void,
+            (local_expert_count * 4).max(4) as u64,
+            shared,
+        );
+
+        // Params struct matching the Metal struct layout
+        #[repr(C)]
+        struct RouteParams {
+            batch_size: u32,
+            top_k: u32,
+            token_stride: u32,
+            local_start: u32,
+            local_end: u32,
+            capacity_per_expert: u32,
+            local_expert_count: u32,
+        }
+        let params = RouteParams {
+            batch_size: batch_size as u32,
+            top_k: self.config.top_k as u32,
+            token_stride: token_stride as u32,
+            local_start: local_start as u32,
+            local_end: local_end as u32,
+            capacity_per_expert: capacity_per_expert as u32,
+            local_expert_count: local_expert_count as u32,
+        };
+        let params_buf = device.new_buffer_with_data(
+            &params as *const RouteParams as *const std::ffi::c_void,
+            std::mem::size_of::<RouteParams>() as u64,
+            shared,
+        );
+
+        // Encode and dispatch
+        let queue = device.new_command_queue();
+        let cmd_buf = queue.new_command_buffer();
+        let encoder = cmd_buf.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(&token_buf), 0);
+        encoder.set_buffer(1, Some(&indices_buf), 0);
+        encoder.set_buffer(2, Some(&output_buf), 0);
+        encoder.set_buffer(3, Some(&cursor_buf), 0);
+        encoder.set_buffer(4, Some(&params_buf), 0);
+
+        let total_threads = (batch_size * self.config.top_k) as u64;
+        let max_tg = pipeline.max_total_threads_per_threadgroup();
+        let tg_size = total_threads.min(max_tg);
+
+        encoder.dispatch_threads(
+            metal::MTLSize::new(total_threads, 1, 1),
+            metal::MTLSize::new(tg_size, 1, 1),
+        );
+        encoder.end_encoding();
+        cmd_buf.commit();
+        cmd_buf.wait_until_completed();
+
+        // Read output
+        if output_size == 0 {
+            return Ok(Vec::new());
+        }
+        let output_ptr = output_buf.contents() as *const u8;
+        let output = unsafe { std::slice::from_raw_parts(output_ptr, output_size) };
+
+        let _ = expert_counts;
+
+        Ok(output.to_vec())
     }
 
     /// RDMA routing: inter-node transfer for remote experts.
     ///
     /// Tokens destined for local experts are gathered in-place (same as CPU path).
-    /// Tokens destined for remote experts are collected per-peer-rank and would be
-    /// sent via `Group.send()` / `Group.recv()` in a real multi-node setup.
+    /// Tokens destined for remote experts are collected per-peer-rank and sent
+    /// via `Group.send()`. Tokens from remote peers are received via `Group.recv()`
+    /// and merged into the local output.
     ///
     /// Calls `ensure_materialized()` before any RDMA transfer to ensure buffers
     /// contain valid data.
@@ -293,6 +480,7 @@ impl MoeDispatchExchange {
 
         // --- Remote expert buffers: one Vec per peer rank ---
         let world_size = self.config.group.size();
+        let local_rank = self.config.group.local_rank() as usize;
         let mut remote_buffers: Vec<Vec<u8>> = vec![Vec::new(); world_size];
 
         for batch_idx in 0..batch_size {
@@ -331,16 +519,62 @@ impl MoeDispatchExchange {
             }
         }
 
-        // In a real multi-node setup, remote_buffers would be sent via:
-        //   for (rank, buf) in remote_buffers.iter().enumerate() {
-        //       if rank != local_rank { self.config.group.send(rank, buf); }
-        //   }
-        // And received tokens from peers would be appended to local_output.
-        // For now, remote buffers are computed but not transmitted — the
-        // Group transport layer will be wired in the RDMA integration phase.
+        // Send remote buffers to their destination ranks
+        for (rank, buf) in remote_buffers.iter().enumerate() {
+            if rank == local_rank || buf.is_empty() {
+                continue;
+            }
+            self.config
+                .group
+                .send(buf, rank as u32)
+                .map_err(|e| DistributedError::Transport(format!("send to rank {rank}: {e}")))?;
+        }
+
+        // Receive tokens from each peer that has local experts on this rank.
+        // Each peer sends us their tokens destined for our local experts.
+        // We don't know the exact size a priori, so we use a fixed receive
+        // size based on capacity. In a real system this would be preceded by
+        // a size-exchange step or use known-size protocols.
+        let max_recv_per_peer = local_expert_count * capacity_per_expert * token_stride;
+        for &peer_rank in self.config.group.peers().iter() {
+            if max_recv_per_peer == 0 {
+                break;
+            }
+            let received = self
+                .config
+                .group
+                .recv(peer_rank, max_recv_per_peer)
+                .map_err(|e| {
+                    DistributedError::Transport(format!("recv from rank {peer_rank}: {e}"))
+                })?;
+
+            // Merge received tokens into local_output: append after locally-routed tokens
+            // by scanning for empty slots in each expert's capacity region.
+            let mut offset = 0;
+            while offset + token_stride <= received.len() {
+                // Find the next local expert with remaining capacity
+                let mut placed = false;
+                for (le, cursor) in local_cursors.iter_mut().enumerate() {
+                    if *cursor < capacity_per_expert {
+                        let dst_start = (le * capacity_per_expert + *cursor) * token_stride;
+                        let dst_end = dst_start + token_stride;
+                        if dst_end <= local_output.len() {
+                            local_output[dst_start..dst_end]
+                                .copy_from_slice(&received[offset..offset + token_stride]);
+                            *cursor += 1;
+                            placed = true;
+                            break;
+                        }
+                    }
+                }
+                if !placed {
+                    break; // All experts at capacity
+                }
+                offset += token_stride;
+            }
+        }
 
         let _ = expert_counts;
-        let _ = &remote_buffers;
 
         Ok(local_output)
     }

@@ -80,9 +80,9 @@ pub fn matmul(
 
     let dev = registry.device().raw();
     let opts = metal::MTLResourceOptions::StorageModeShared;
-    let m_u32 = m as u32;
-    let n_u32 = n as u32;
-    let k_u32 = k as u32;
+    let m_u32 = super::checked_u32(m, "M")?;
+    let n_u32 = super::checked_u32(n, "N")?;
+    let k_u32 = super::checked_u32(k, "K")?;
     let m_buf = dev.new_buffer_with_data(&m_u32 as *const u32 as *const _, 4, opts);
     let n_buf = dev.new_buffer_with_data(&n_u32 as *const u32 as *const _, 4, opts);
     let k_buf = dev.new_buffer_with_data(&k_u32 as *const u32 as *const _, 4, opts);

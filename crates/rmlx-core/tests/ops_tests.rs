@@ -227,7 +227,106 @@ fn test_rope_identity() {
     }
 }
 
-// --- Negative tests ---
+// --- Quantized buffer size test ---
+
+#[test]
+fn test_zeros_q8_0_buffer_size() {
+    let device = match GpuDevice::system_default() {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("skipping: no Metal device");
+            return;
+        }
+    };
+    // Q8_0: 32 elements = 1 block = 34 bytes (2 bytes scale + 32 bytes data)
+    let arr = Array::zeros(device.raw(), &[32], DType::Q8_0);
+    assert_eq!(
+        arr.byte_size(),
+        34,
+        "Q8_0 32 elements should be 34 bytes, not 32"
+    );
+    assert_eq!(
+        arr.metal_buffer().length(),
+        34,
+        "Metal buffer should be 34 bytes"
+    );
+
+    // Q4_0: 32 elements = 1 block = 18 bytes
+    let arr4 = Array::zeros(device.raw(), &[32], DType::Q4_0);
+    assert_eq!(arr4.byte_size(), 18, "Q4_0 32 elements should be 18 bytes");
+}
+
+// --- Quantized matmul validation tests ---
+
+#[test]
+fn test_quantized_matmul_vec_size_mismatch() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    let in_features: usize = 64;
+    let out_features: usize = 32;
+    // Create correctly sized Q8_0 weights buffer
+    let weight_bytes = DType::Q8_0.numel_to_bytes(out_features * in_features);
+    let weights = Array::new(
+        dev.new_buffer(
+            weight_bytes as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        ),
+        vec![out_features * in_features],
+        vec![1],
+        DType::Q8_0,
+        0,
+    );
+    // Create vec with WRONG size (32 instead of 64)
+    let wrong_vec = Array::from_slice(dev, &vec![0.0f32; 32], vec![32]);
+    let result = ops::quantized::quantized_matmul(
+        &registry,
+        &weights,
+        &wrong_vec,
+        out_features,
+        in_features,
+        &queue,
+    );
+    assert!(result.is_err(), "should fail when vec size != in_features");
+}
+
+#[test]
+fn test_quantized_matmul_weights_buffer_too_small() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    let in_features: usize = 64;
+    let out_features: usize = 32;
+    // Create UNDERSIZED weights buffer (only enough for half the rows)
+    let small_bytes = DType::Q8_0.numel_to_bytes((out_features / 2) * in_features);
+    let weights = Array::new(
+        dev.new_buffer(
+            small_bytes as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        ),
+        vec![(out_features / 2) * in_features],
+        vec![1],
+        DType::Q8_0,
+        0,
+    );
+    let input_vec = Array::from_slice(dev, &vec![0.0f32; in_features], vec![in_features]);
+    let result = ops::quantized::quantized_matmul(
+        &registry,
+        &weights,
+        &input_vec,
+        out_features,
+        in_features,
+        &queue,
+    );
+    assert!(
+        result.is_err(),
+        "should fail when weights buffer is too small"
+    );
+}
 
 // ─── GEMM tests ───
 
@@ -313,4 +412,219 @@ fn test_missing_kernel_error() {
     let empty_reg = KernelRegistry::new(device);
     let result = empty_reg.get_pipeline("nonexistent_kernel", DType::Float32);
     assert!(result.is_err(), "should fail for missing kernel");
+}
+
+// --- bf16 binary ops tests ---
+
+#[test]
+fn test_add_bf16() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    // bf16 values as raw u16 (IEEE bf16): 1.0=0x3F80, 2.0=0x4000, 3.0=0x4040, 4.0=0x4080
+    let a_data: Vec<u16> = vec![0x3F80, 0x4000, 0x4040, 0x4080];
+    let b_data: Vec<u16> = vec![0x3F80, 0x3F80, 0x3F80, 0x3F80]; // all 1.0
+    let a_buf = dev.new_buffer_with_data(
+        a_data.as_ptr() as *const std::ffi::c_void,
+        (a_data.len() * 2) as u64,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+    let b_buf = dev.new_buffer_with_data(
+        b_data.as_ptr() as *const std::ffi::c_void,
+        (b_data.len() * 2) as u64,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+    let a = Array::new(a_buf, vec![4], vec![1], DType::Bfloat16, 0);
+    let b = Array::new(b_buf, vec![4], vec![1], DType::Bfloat16, 0);
+    let c = ops::binary::add(&registry, &a, &b, &queue).expect("bf16 add failed");
+    assert_eq!(c.dtype(), DType::Bfloat16);
+    assert_eq!(c.shape(), &[4]);
+    // Read raw bf16 output
+    let out_ptr = c.metal_buffer().contents() as *const u16;
+    let out_raw: Vec<u16> = unsafe { std::slice::from_raw_parts(out_ptr, 4).to_vec() };
+    // 1+1=2.0=0x4000, 2+1=3.0=0x4040, 3+1=4.0=0x4080, 4+1=5.0=0x40A0
+    assert_eq!(out_raw[0], 0x4000, "1.0+1.0 should be 2.0 (bf16 0x4000)");
+    assert_eq!(out_raw[1], 0x4040, "2.0+1.0 should be 3.0 (bf16 0x4040)");
+    assert_eq!(out_raw[2], 0x4080, "3.0+1.0 should be 4.0 (bf16 0x4080)");
+    assert_eq!(out_raw[3], 0x40A0, "4.0+1.0 should be 5.0 (bf16 0x40A0)");
+}
+
+#[test]
+fn test_mul_bf16() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    // 2.0=0x4000, 3.0=0x4040
+    let a_data: Vec<u16> = vec![0x4000, 0x4040]; // [2.0, 3.0]
+    let b_data: Vec<u16> = vec![0x4000, 0x4000]; // [2.0, 2.0]
+    let a_buf = dev.new_buffer_with_data(
+        a_data.as_ptr() as *const std::ffi::c_void,
+        (a_data.len() * 2) as u64,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+    let b_buf = dev.new_buffer_with_data(
+        b_data.as_ptr() as *const std::ffi::c_void,
+        (b_data.len() * 2) as u64,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+    let a = Array::new(a_buf, vec![2], vec![1], DType::Bfloat16, 0);
+    let b = Array::new(b_buf, vec![2], vec![1], DType::Bfloat16, 0);
+    let c = ops::binary::mul(&registry, &a, &b, &queue).expect("bf16 mul failed");
+    let out_ptr = c.metal_buffer().contents() as *const u16;
+    let out_raw: Vec<u16> = unsafe { std::slice::from_raw_parts(out_ptr, 2).to_vec() };
+    // 2*2=4.0=0x4080, 3*2=6.0=0x40C0
+    assert_eq!(out_raw[0], 0x4080, "2.0*2.0 should be 4.0");
+    assert_eq!(out_raw[1], 0x40C0, "3.0*2.0 should be 6.0");
+}
+
+#[test]
+fn test_sub_bf16() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    // 4.0=0x4080, 2.0=0x4000
+    let a_data: Vec<u16> = vec![0x4080, 0x4040]; // [4.0, 3.0]
+    let b_data: Vec<u16> = vec![0x3F80, 0x3F80]; // [1.0, 1.0]
+    let a_buf = dev.new_buffer_with_data(
+        a_data.as_ptr() as *const std::ffi::c_void,
+        (a_data.len() * 2) as u64,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+    let b_buf = dev.new_buffer_with_data(
+        b_data.as_ptr() as *const std::ffi::c_void,
+        (b_data.len() * 2) as u64,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+    let a = Array::new(a_buf, vec![2], vec![1], DType::Bfloat16, 0);
+    let b = Array::new(b_buf, vec![2], vec![1], DType::Bfloat16, 0);
+    let c = ops::binary::sub(&registry, &a, &b, &queue).expect("bf16 sub failed");
+    let out_ptr = c.metal_buffer().contents() as *const u16;
+    let out_raw: Vec<u16> = unsafe { std::slice::from_raw_parts(out_ptr, 2).to_vec() };
+    // 4-1=3.0=0x4040, 3-1=2.0=0x4000
+    assert_eq!(out_raw[0], 0x4040, "4.0-1.0 should be 3.0");
+    assert_eq!(out_raw[1], 0x4000, "3.0-1.0 should be 2.0");
+}
+
+#[test]
+fn test_div_bf16() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    // 6.0=0x40C0, 4.0=0x4080
+    let a_data: Vec<u16> = vec![0x40C0, 0x4080]; // [6.0, 4.0]
+    let b_data: Vec<u16> = vec![0x4000, 0x4000]; // [2.0, 2.0]
+    let a_buf = dev.new_buffer_with_data(
+        a_data.as_ptr() as *const std::ffi::c_void,
+        (a_data.len() * 2) as u64,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+    let b_buf = dev.new_buffer_with_data(
+        b_data.as_ptr() as *const std::ffi::c_void,
+        (b_data.len() * 2) as u64,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+    let a = Array::new(a_buf, vec![2], vec![1], DType::Bfloat16, 0);
+    let b = Array::new(b_buf, vec![2], vec![1], DType::Bfloat16, 0);
+    let c = ops::binary::div(&registry, &a, &b, &queue).expect("bf16 div failed");
+    let out_ptr = c.metal_buffer().contents() as *const u16;
+    let out_raw: Vec<u16> = unsafe { std::slice::from_raw_parts(out_ptr, 2).to_vec() };
+    // 6/2=3.0=0x4040, 4/2=2.0=0x4000
+    assert_eq!(out_raw[0], 0x4040, "6.0/2.0 should be 3.0");
+    assert_eq!(out_raw[1], 0x4000, "4.0/2.0 should be 2.0");
+}
+
+// --- bf16 copy test ---
+
+#[test]
+fn test_copy_bf16() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    let data: Vec<u16> = vec![0x3F80, 0x4000, 0x4040, 0x4080]; // [1.0, 2.0, 3.0, 4.0]
+    let buf = dev.new_buffer_with_data(
+        data.as_ptr() as *const std::ffi::c_void,
+        (data.len() * 2) as u64,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+    let src = Array::new(buf, vec![4], vec![1], DType::Bfloat16, 0);
+    let dst = ops::copy::copy(&registry, &src, &queue).expect("bf16 copy failed");
+    assert_eq!(dst.dtype(), DType::Bfloat16);
+    let out_ptr = dst.metal_buffer().contents() as *const u16;
+    let out_raw: Vec<u16> = unsafe { std::slice::from_raw_parts(out_ptr, 4).to_vec() };
+    assert_eq!(out_raw, data, "bf16 copy should be exact");
+}
+
+// --- Two-pass reduce tests ---
+
+#[test]
+fn test_reduce_sum_large_array() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    // 1M elements, all 1.0 => sum = 1_000_000
+    let n = 1_000_000;
+    let data: Vec<f32> = vec![1.0; n];
+    let input = Array::from_slice(registry.device().raw(), &data, vec![n]);
+    let result = ops::reduce::sum(&registry, &input, &queue).expect("large sum failed");
+    let vals: Vec<f32> = unsafe { result.to_vec() };
+    let expected = n as f32;
+    assert!(
+        (vals[0] - expected).abs() / expected < 1e-3,
+        "large sum: got {} expected {}",
+        vals[0],
+        expected
+    );
+}
+
+#[test]
+fn test_reduce_max_large_array() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    // 1M elements: [0, 1, 2, ..., 999999]
+    let n = 1_000_000;
+    let data: Vec<f32> = (0..n).map(|i| i as f32).collect();
+    let input = Array::from_slice(registry.device().raw(), &data, vec![n]);
+    let result = ops::reduce::max(&registry, &input, &queue).expect("large max failed");
+    let vals: Vec<f32> = unsafe { result.to_vec() };
+    let expected = (n - 1) as f32;
+    assert_eq!(
+        vals[0], expected,
+        "large max: got {} expected {}",
+        vals[0], expected
+    );
+}
+
+#[test]
+fn test_reduce_sum_medium_array() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    // 10K elements => triggers two-pass, sum should be accurate
+    let n = 10_000;
+    let data: Vec<f32> = (1..=n as u32).map(|i| i as f32).collect();
+    let input = Array::from_slice(registry.device().raw(), &data, vec![n]);
+    let result = ops::reduce::sum(&registry, &input, &queue).expect("medium sum failed");
+    let vals: Vec<f32> = unsafe { result.to_vec() };
+    // Sum of 1..=10000 = 10000 * 10001 / 2 = 50_005_000
+    let expected = 50_005_000.0f32;
+    assert!(
+        (vals[0] - expected).abs() / expected < 1e-3,
+        "medium sum: got {} expected {}",
+        vals[0],
+        expected
+    );
 }

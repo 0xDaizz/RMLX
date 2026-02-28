@@ -256,8 +256,10 @@ dependencies = [
 name = "rmlx-distributed"
 version = "0.1.0"
 dependencies = [
+ "metal",
  "rmlx-alloc",
  "rmlx-core",
+ "rmlx-metal",
  "rmlx-rdma",
 ]
 
@@ -275,7 +277,9 @@ dependencies = [
 name = "rmlx-nn"
 version = "0.1.0"
 dependencies = [
+ "metal",
  "rmlx-core",
+ "rmlx-metal",
 ]
 
 [[package]]

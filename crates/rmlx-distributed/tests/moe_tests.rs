@@ -499,3 +499,74 @@ fn test_collective_all_to_all_accepts_valid() {
     let result = g.all_to_all(&data).unwrap();
     assert_eq!(result, data);
 }
+
+// ─── MoeCombineExchange edge case tests ───
+
+#[test]
+fn test_moe_combine_cpu_empty_expert_output() {
+    let group = Group::world(1, 0);
+    let combine = MoeCombineExchange::new(group);
+    // Expert 0 has output but expert 1 is empty
+    let expert0_out = vec![1.0f32, 2.0, 3.0];
+    let expert_outputs: Vec<Vec<f32>> = vec![expert0_out, vec![]];
+    let weights = vec![0.5f32, 0.8]; // token 0 -> expert 0, token 1 -> expert 1
+    let indices = vec![0u32, 1];
+    // 2 tokens, top_k=1, hidden_dim=3
+    // token 1 -> expert 1 which is empty, so nothing is added
+    let result = combine.combine_cpu(&expert_outputs, &weights, &indices, 2, 1, 3);
+    // token 0: 0.5 * [1,2,3] = [0.5, 1.0, 1.5]
+    assert!((result[0] - 0.5).abs() < 1e-5);
+    assert!((result[1] - 1.0).abs() < 1e-5);
+    assert!((result[2] - 1.5).abs() < 1e-5);
+    // token 1: expert 1 has empty output, exp_base + hidden_dim > expert_out.len()
+    // so nothing is added → stays 0.0
+    assert!((result[3] - 0.0).abs() < 1e-5);
+    assert!((result[4] - 0.0).abs() < 1e-5);
+    assert!((result[5] - 0.0).abs() < 1e-5);
+}
+
+#[test]
+fn test_moe_combine_cpu_zero_weights() {
+    let group = Group::world(1, 0);
+    let combine = MoeCombineExchange::new(group);
+    let expert0_out = vec![10.0f32, 20.0, 30.0];
+    let expert_outputs = vec![expert0_out];
+    let weights = vec![0.0f32]; // zero weight
+    let indices = vec![0u32];
+    let result = combine.combine_cpu(&expert_outputs, &weights, &indices, 1, 1, 3);
+    // 0.0 * [10, 20, 30] = [0, 0, 0]
+    assert!((result[0] - 0.0).abs() < 1e-5);
+    assert!((result[1] - 0.0).abs() < 1e-5);
+    assert!((result[2] - 0.0).abs() < 1e-5);
+}
+
+#[test]
+fn test_moe_combine_cpu_top2() {
+    let group = Group::world(1, 0);
+    let combine = MoeCombineExchange::new(group);
+    // 1 token, top_k=2, hidden_dim=2, 2 experts
+    let expert0_out = vec![1.0f32, 2.0]; // expert 0 output for token 0
+    let expert1_out = vec![10.0f32, 20.0]; // expert 1 output for token 0
+    let expert_outputs = vec![expert0_out, expert1_out];
+    let weights = vec![0.6f32, 0.4]; // token 0 -> expert 0 w=0.6, expert 1 w=0.4
+    let indices = vec![0u32, 1];
+    let result = combine.combine_cpu(&expert_outputs, &weights, &indices, 1, 2, 2);
+    // token 0: 0.6 * [1, 2] + 0.4 * [10, 20] = [0.6+4.0, 1.2+8.0] = [4.6, 9.2]
+    assert!((result[0] - 4.6).abs() < 1e-5, "got {}", result[0]);
+    assert!((result[1] - 9.2).abs() < 1e-5, "got {}", result[1]);
+}
+
+#[test]
+fn test_moe_combine_cpu_out_of_range_expert() {
+    let group = Group::world(1, 0);
+    let combine = MoeCombineExchange::new(group);
+    // Only 1 expert available, but index refers to expert 5 (out of range)
+    let expert0_out = vec![1.0f32, 2.0];
+    let expert_outputs = vec![expert0_out];
+    let weights = vec![1.0f32];
+    let indices = vec![5u32]; // out of range
+    let result = combine.combine_cpu(&expert_outputs, &weights, &indices, 1, 1, 2);
+    // Expert index 5 >= expert_outputs.len() (1), so nothing added
+    assert!((result[0] - 0.0).abs() < 1e-5);
+    assert!((result[1] - 0.0).abs() < 1e-5);
+}

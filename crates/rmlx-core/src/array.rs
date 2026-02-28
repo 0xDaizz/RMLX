@@ -66,7 +66,7 @@ impl Array {
     /// Create a zero-filled array.
     pub fn zeros(device: &metal::Device, shape: &[usize], dtype: DType) -> Self {
         let numel: usize = shape.iter().product();
-        let byte_size = (numel * dtype.size_of()) as u64;
+        let byte_size = dtype.numel_to_bytes(numel) as u64;
         let buffer = device.new_buffer(byte_size, MTLResourceOptions::StorageModeShared);
 
         // StorageModeShared buffers are zero-initialized by the OS on Apple Silicon.
@@ -143,7 +143,7 @@ impl Array {
 
     /// Total data size in bytes.
     pub fn byte_size(&self) -> usize {
-        self.numel() * self.dtype.size_of()
+        self.dtype.numel_to_bytes(self.numel())
     }
 
     /// Whether the array is stored contiguously in memory.

@@ -1,8 +1,11 @@
 #!/bin/bash
 # vendor_mlx_shaders.sh — Idempotent MLX shader vendoring script
-# Usage: ./scripts/vendor_mlx_shaders.sh [--dry-run] [--mlx-dir /path/to/mlx]
+# Usage: ./scripts/vendor_mlx_shaders.sh [--dry-run] [--mlx-dir /path/to/mlx] [--force]
 # Copies Metal shaders from a local mlx checkout, fixes include paths,
 # and verifies SHA256 against vendor_manifest.toml.
+#
+# By default runs in strict mode: SHA mismatches are errors and cause exit 1.
+# Use --force to downgrade SHA mismatches to warnings and continue.
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -13,10 +16,13 @@ MLX_DIR="${MLX_DIR:-$HOME/mlx}"
 MLX_KERNELS="$MLX_DIR/mlx/backend/metal/kernels"
 
 DRY_RUN=false
+STRICT=true
 for arg in "$@"; do
     case "$arg" in
         --dry-run)  DRY_RUN=true ;;
         --mlx-dir=*) MLX_DIR="${arg#--mlx-dir=}"; MLX_KERNELS="$MLX_DIR/mlx/backend/metal/kernels" ;;
+        --force)    STRICT=false ;;
+        --strict)   STRICT=true ;;
     esac
 done
 
@@ -28,6 +34,7 @@ echo "=== MLX Shader Vendoring ==="
 echo "Source:      $MLX_KERNELS"
 echo "Destination: $DEST_DIR"
 echo "Manifest:    $MANIFEST"
+echo "Strict mode: $STRICT"
 
 if [[ ! -d "$MLX_KERNELS" ]]; then
     echo "ERROR: MLX kernel directory not found at $MLX_KERNELS"
@@ -78,9 +85,11 @@ while IFS= read -r line; do
         # Verify SHA256
         actual_sha=$(shasum -a 256 "$dst_file" | cut -d' ' -f1)
         if [[ "$expected_sha" != "PLACEHOLDER" ]] && [[ -n "$expected_sha" ]] && [[ "$actual_sha" != "$expected_sha" ]]; then
-            echo "  WARN: SHA mismatch for $dest_rel (expected=$expected_sha actual=$actual_sha)"
+            echo "  ERROR: SHA mismatch for $dest_rel (expected=$expected_sha actual=$actual_sha)"
+            ERRORS=$((ERRORS + 1))
+        else
+            echo "  OK: $dest_rel ($actual_sha)"
         fi
-        echo "  OK: $dest_rel ($actual_sha)"
     fi
     VENDORED=$((VENDORED + 1))
 done < <(
@@ -95,8 +104,12 @@ echo ""
 echo "Vendored $VENDORED files ($ERRORS errors)"
 
 if [[ $ERRORS -gt 0 ]]; then
-    echo "ERROR: Some files could not be vendored"
-    exit 1
+    if $STRICT; then
+        echo "ERROR: $ERRORS integrity errors detected (strict mode). Use --force to override."
+        exit 1
+    else
+        echo "WARN: $ERRORS integrity errors detected but --force was specified, continuing."
+    fi
 fi
 
 echo "Done."
