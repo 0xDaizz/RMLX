@@ -15,18 +15,18 @@ fn test_pipeline_stages() {
 
     assert_eq!(pipeline.stage(0), PipelineStage::WaitingForInput);
 
-    pipeline.begin_compute(0);
+    pipeline.begin_compute(0).unwrap();
     assert_eq!(pipeline.stage(0), PipelineStage::Computing);
 
-    pipeline.begin_transfer(0);
+    pipeline.begin_transfer(0).unwrap();
     assert_eq!(pipeline.stage(0), PipelineStage::Transferring);
 
-    pipeline.complete(0);
+    pipeline.complete(0).unwrap();
     assert_eq!(pipeline.stage(0), PipelineStage::Complete);
 
     assert!(!pipeline.all_complete());
-    pipeline.complete(1);
-    pipeline.complete(2);
+    pipeline.complete(1).unwrap();
+    pipeline.complete(2).unwrap();
     assert!(pipeline.all_complete());
 }
 
@@ -36,8 +36,8 @@ fn test_pipeline_reset() {
         num_layers: 2,
         ..Default::default()
     });
-    pipeline.complete(0);
-    pipeline.complete(1);
+    pipeline.complete(0).unwrap();
+    pipeline.complete(1).unwrap();
     assert!(pipeline.all_complete());
 
     pipeline.reset();
@@ -83,11 +83,11 @@ fn test_pipeline_begin_compute_no_event_marks_gpu_on_transfer() {
         num_layers: 1,
         ..Default::default()
     });
-    pipeline.begin_compute(0);
+    pipeline.begin_compute(0).unwrap();
     let ticket = pipeline.ticket(0).unwrap();
     assert!(!ticket.is_gpu_complete());
 
-    pipeline.begin_transfer(0);
+    pipeline.begin_transfer(0).unwrap();
     // Without gpu_event, begin_transfer manually marks gpu complete
     let ticket = pipeline.ticket(0).unwrap();
     assert!(ticket.is_gpu_complete());
@@ -99,11 +99,11 @@ fn test_pipeline_complete_with_rdma() {
         num_layers: 2,
         ..Default::default()
     });
-    pipeline.begin_compute(0);
-    pipeline.begin_transfer(0);
+    pipeline.begin_compute(0).unwrap();
+    pipeline.begin_transfer(0).unwrap();
 
     // complete_with_rdma(false) does not mark rdma complete
-    pipeline.complete_with_rdma(0, false);
+    pipeline.complete_with_rdma(0, false).unwrap();
     let ticket = pipeline.ticket(0).unwrap();
     assert!(ticket.is_gpu_complete());
     assert!(!ticket.is_rdma_complete());
@@ -119,7 +119,7 @@ fn test_pipeline_wait_layer_complete() {
         num_layers: 1,
         ..Default::default()
     });
-    pipeline.begin_compute(0);
+    pipeline.begin_compute(0).unwrap();
 
     // Grab a clone of the ticket before marking complete
     let ticket_clone = pipeline.ticket(0).unwrap().clone();
@@ -152,7 +152,7 @@ fn test_pipeline_wait_layer_timeout() {
         num_layers: 1,
         ..Default::default()
     });
-    pipeline.begin_compute(0);
+    pipeline.begin_compute(0).unwrap();
     // Neither gpu nor rdma completed — should timeout
     let result = pipeline.wait_layer_complete(0, Duration::from_millis(50));
     assert!(result.is_err());

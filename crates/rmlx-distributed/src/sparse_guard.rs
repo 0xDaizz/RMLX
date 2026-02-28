@@ -71,6 +71,11 @@ impl SparseGuard {
         self.overflow_ema
     }
 
+    /// Set the evaluation window size (number of steps between evaluations).
+    pub fn set_window_size(&mut self, size: usize) {
+        self.window_size = size;
+    }
+
     /// Evaluate at the end of a window and return the recommended action.
     pub fn evaluate(&mut self) -> GuardAction {
         if self.step_count < self.window_size {

@@ -14,10 +14,29 @@ pub enum Operation {
     Custom(String),
 }
 
+/// Errors that can occur during VJP backward pass.
+#[derive(Debug, Clone)]
+pub enum VjpError {
+    /// The operation does not have a backward implementation.
+    UnsupportedBackward(String),
+}
+
+impl std::fmt::Display for VjpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VjpError::UnsupportedBackward(op) => {
+                write!(f, "backward not implemented for {op}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for VjpError {}
+
 /// Trait for computing backward gradients.
 pub trait GradFn {
     /// Given the gradient of the output, return gradients for each input.
-    fn backward(&self, grad_output: &[f32]) -> Vec<Vec<f32>>;
+    fn backward(&self, grad_output: &[f32]) -> Result<Vec<Vec<f32>>, VjpError>;
 }
 
 /// A recorded node on the tape.
@@ -77,7 +96,7 @@ impl Tape {
     }
 
     /// Run backward pass from the given output, returning gradients for all values.
-    pub fn backward(&self, output: &TapedValue) -> Vec<Vec<f32>> {
+    pub fn backward(&self, output: &TapedValue) -> Result<Vec<Vec<f32>>, VjpError> {
         let n = self.values.len();
         let mut grads: Vec<Vec<f32>> = self.values.iter().map(|v| vec![0.0; v.len()]).collect();
 
@@ -93,7 +112,7 @@ impl Tape {
             let grad_output = grads[val_idx].clone();
             debug_assert_eq!(grad_output.len(), entry.output_len);
 
-            let input_grads = entry.grad_fn.backward(&grad_output);
+            let input_grads = entry.grad_fn.backward(&grad_output)?;
             debug_assert_eq!(input_grads.len(), entry.input_indices.len());
 
             for (j, &inp_idx) in entry.input_indices.iter().enumerate() {
@@ -103,7 +122,7 @@ impl Tape {
             }
         }
 
-        grads
+        Ok(grads)
     }
 }
 
@@ -127,8 +146,8 @@ pub struct AddGrad {
 }
 
 impl GradFn for AddGrad {
-    fn backward(&self, grad_output: &[f32]) -> Vec<Vec<f32>> {
-        vec![grad_output.to_vec(), grad_output.to_vec()]
+    fn backward(&self, grad_output: &[f32]) -> Result<Vec<Vec<f32>>, VjpError> {
+        Ok(vec![grad_output.to_vec(), grad_output.to_vec()])
     }
 }
 
@@ -139,7 +158,7 @@ pub struct MulGrad {
 }
 
 impl GradFn for MulGrad {
-    fn backward(&self, grad_output: &[f32]) -> Vec<Vec<f32>> {
+    fn backward(&self, grad_output: &[f32]) -> Result<Vec<Vec<f32>>, VjpError> {
         let grad_lhs: Vec<f32> = grad_output
             .iter()
             .zip(&self.rhs)
@@ -150,7 +169,7 @@ impl GradFn for MulGrad {
             .zip(&self.lhs)
             .map(|(g, l)| g * l)
             .collect();
-        vec![grad_lhs, grad_rhs]
+        Ok(vec![grad_lhs, grad_rhs])
     }
 }
 
@@ -166,7 +185,7 @@ pub struct MatMulGrad {
 }
 
 impl GradFn for MatMulGrad {
-    fn backward(&self, grad_output: &[f32]) -> Vec<Vec<f32>> {
+    fn backward(&self, grad_output: &[f32]) -> Result<Vec<Vec<f32>>, VjpError> {
         let (m, k, n) = (self.m, self.k, self.n);
         // dA = grad_output @ B^T — (m,n) @ (n,k) -> (m,k)
         let mut grad_a = vec![0.0f32; m * k];
@@ -190,7 +209,7 @@ impl GradFn for MatMulGrad {
                 grad_b[i * n + j] = sum;
             }
         }
-        vec![grad_a, grad_b]
+        Ok(vec![grad_a, grad_b])
     }
 }
 
@@ -205,7 +224,7 @@ pub struct SoftmaxGrad {
 }
 
 impl GradFn for SoftmaxGrad {
-    fn backward(&self, grad_output: &[f32]) -> Vec<Vec<f32>> {
+    fn backward(&self, grad_output: &[f32]) -> Result<Vec<Vec<f32>>, VjpError> {
         let (rows, cols) = (self.rows, self.cols);
         let mut grad_input = vec![0.0f32; rows * cols];
         for r in 0..rows {
@@ -220,7 +239,7 @@ impl GradFn for SoftmaxGrad {
                 grad_input[base + c] = self.output[base + c] * (grad_output[base + c] - dot);
             }
         }
-        vec![grad_input]
+        Ok(vec![grad_input])
     }
 }
 
@@ -238,7 +257,7 @@ pub struct RmsNormGrad {
 }
 
 impl GradFn for RmsNormGrad {
-    fn backward(&self, grad_output: &[f32]) -> Vec<Vec<f32>> {
+    fn backward(&self, grad_output: &[f32]) -> Result<Vec<Vec<f32>>, VjpError> {
         let (rows, d) = (self.rows, self.axis_size);
         let mut grad_input = vec![0.0f32; rows * d];
 
@@ -282,7 +301,7 @@ impl GradFn for RmsNormGrad {
                 grad_weight[i] += grad_output[base + i] * self.input[base + i] * normalizer;
             }
         }
-        vec![grad_input, grad_weight]
+        Ok(vec![grad_input, grad_weight])
     }
 }
 
@@ -293,10 +312,10 @@ pub struct ReduceSumGrad {
 }
 
 impl GradFn for ReduceSumGrad {
-    fn backward(&self, grad_output: &[f32]) -> Vec<Vec<f32>> {
+    fn backward(&self, grad_output: &[f32]) -> Result<Vec<Vec<f32>>, VjpError> {
         // grad_output is scalar [1], broadcast to full input shape
         let g = grad_output[0];
-        vec![vec![g; self.input_len]]
+        Ok(vec![vec![g; self.input_len]])
     }
 }
 
@@ -307,7 +326,7 @@ pub struct ReduceMaxGrad {
 }
 
 impl GradFn for ReduceMaxGrad {
-    fn backward(&self, grad_output: &[f32]) -> Vec<Vec<f32>> {
+    fn backward(&self, grad_output: &[f32]) -> Result<Vec<Vec<f32>>, VjpError> {
         let g = grad_output[0];
         // Find argmax
         let mut max_val = f32::NEG_INFINITY;
@@ -320,23 +339,20 @@ impl GradFn for ReduceMaxGrad {
         }
         let mut grad = vec![0.0f32; self.input.len()];
         grad[max_idx] = g;
-        vec![grad]
+        Ok(vec![grad])
     }
 }
 
 /// Placeholder gradient for operations without backward implementation.
-/// Returns a proper error via panic with a descriptive message.
+/// Returns `Err(VjpError::UnsupportedBackward)` instead of panicking.
 pub struct PlaceholderGrad {
     pub op_name: String,
     pub input_lens: Vec<usize>,
 }
 
 impl GradFn for PlaceholderGrad {
-    fn backward(&self, _grad_output: &[f32]) -> Vec<Vec<f32>> {
-        panic!(
-            "backward not implemented for {} — this operation does not support autodiff yet",
-            self.op_name
-        );
+    fn backward(&self, _grad_output: &[f32]) -> Result<Vec<Vec<f32>>, VjpError> {
+        Err(VjpError::UnsupportedBackward(self.op_name.clone()))
     }
 }
 

@@ -226,6 +226,96 @@ pub fn copy_with_mode(
     Ok(out)
 }
 
+/// Copy array contents asynchronously, returning a `LaunchResult`.
+///
+/// The output `Array` is only accessible after the GPU completes via
+/// `LaunchResult::into_array()`.
+pub fn copy_async(
+    registry: &KernelRegistry,
+    src: &Array,
+    queue: &metal::CommandQueue,
+) -> Result<super::LaunchResult, KernelError> {
+    let is_strided = !src.is_contiguous();
+
+    let kernel_name = match (src.dtype(), is_strided) {
+        (DType::Float32, false) => "copy_f32",
+        (DType::Float32, true) => "copy_strided_f32",
+        (DType::Float16, false) => "copy_f16",
+        (DType::Float16, true) => "copy_strided_f16",
+        (DType::Bfloat16, false) => "copy_bf16",
+        (DType::Bfloat16, true) => "copy_strided_bf16",
+        (DType::Q4_0 | DType::Q4_1 | DType::Q8_0, _) => {
+            return Err(KernelError::NotFound(
+                "copy not supported for quantized types".to_string(),
+            ))
+        }
+    };
+
+    let pipeline = registry.get_pipeline(kernel_name, src.dtype())?;
+    let numel = src.numel();
+
+    let out = Array::zeros(registry.device().raw(), src.shape(), src.dtype());
+
+    let command_buffer = queue.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(src.metal_buffer()), src.offset() as u64);
+    encoder.set_buffer(1, Some(out.metal_buffer()), out.offset() as u64);
+
+    if is_strided {
+        let device = registry.device().raw();
+        let ndim = src.ndim();
+
+        let shape_data: Vec<u32> = src
+            .shape()
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| super::checked_u32(s, &format!("shape[{i}]")))
+            .collect::<Result<Vec<u32>, _>>()?;
+        let stride_data: Vec<u32> = src
+            .strides()
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| super::checked_u32(s, &format!("stride[{i}]")))
+            .collect::<Result<Vec<u32>, _>>()?;
+
+        let shape_buf = device.new_buffer_with_data(
+            shape_data.as_ptr() as *const _,
+            (ndim * std::mem::size_of::<u32>()) as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        let stride_buf = device.new_buffer_with_data(
+            stride_data.as_ptr() as *const _,
+            (ndim * std::mem::size_of::<u32>()) as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        let ndim_val = super::checked_u32(ndim, "ndim")?;
+        let ndim_buf = device.new_buffer_with_data(
+            &ndim_val as *const u32 as *const _,
+            std::mem::size_of::<u32>() as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+
+        encoder.set_buffer(2, Some(&shape_buf), 0);
+        encoder.set_buffer(3, Some(&stride_buf), 0);
+        encoder.set_buffer(4, Some(&ndim_buf), 0);
+    }
+
+    let grid_size = MTLSize::new(numel as u64, 1, 1);
+    let threadgroup_size = MTLSize::new(
+        std::cmp::min(pipeline.max_total_threads_per_threadgroup(), numel as u64),
+        1,
+        1,
+    );
+    encoder.dispatch_threads(grid_size, threadgroup_size);
+    encoder.end_encoding();
+
+    let handle = super::commit_with_mode(command_buffer, super::ExecMode::Async)
+        .expect("async mode always returns a handle");
+
+    Ok(super::LaunchResult::new(out, handle))
+}
+
 #[cfg(test)]
 mod tests {
     // GPU tests require Metal device — run on macOS with `cargo test -p rmlx-core`.

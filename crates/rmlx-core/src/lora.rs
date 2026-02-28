@@ -24,13 +24,15 @@ impl Default for LoraConfig {
 }
 
 impl LoraConfig {
-    pub fn new(rank: usize, alpha: f64) -> Self {
-        assert!(rank > 0, "LoRA rank must be > 0");
-        Self {
+    pub fn new(rank: usize, alpha: f64) -> Result<Self, KernelError> {
+        if rank == 0 {
+            return Err(KernelError::InvalidShape("LoRA rank must be > 0".into()));
+        }
+        Ok(Self {
             rank,
             alpha,
             ..Default::default()
-        }
+        })
     }
 
     pub fn scaling(&self) -> f64 {
@@ -95,26 +97,55 @@ impl LoraLayer {
         alpha: f64,
         lora_a: Vec<f32>,
         lora_b: Vec<f32>,
-    ) -> Self {
-        assert_eq!(lora_a.len(), rank * in_features);
-        assert_eq!(lora_b.len(), out_features * rank);
-        Self {
+    ) -> Result<Self, KernelError> {
+        if lora_a.len() != rank * in_features {
+            return Err(KernelError::InvalidShape(format!(
+                "lora_a length {} != rank*in_features {}",
+                lora_a.len(),
+                rank * in_features
+            )));
+        }
+        if lora_b.len() != out_features * rank {
+            return Err(KernelError::InvalidShape(format!(
+                "lora_b length {} != out_features*rank {}",
+                lora_b.len(),
+                out_features * rank
+            )));
+        }
+        Ok(Self {
             in_features,
             out_features,
             rank,
             scaling: alpha / rank as f64,
             lora_a,
             lora_b,
-        }
+        })
     }
 
     /// Forward pass: computes the LoRA delta.
     /// `base_output` is the output from the frozen base layer.
     /// `input` is the layer input: (batch_size, in_features).
     /// Returns: base_output + scaling * input @ A^T @ B^T
-    pub fn forward(&self, base_output: &[f32], input: &[f32], batch_size: usize) -> Vec<f32> {
-        assert_eq!(input.len(), batch_size * self.in_features);
-        assert_eq!(base_output.len(), batch_size * self.out_features);
+    pub fn forward(
+        &self,
+        base_output: &[f32],
+        input: &[f32],
+        batch_size: usize,
+    ) -> Result<Vec<f32>, KernelError> {
+        if input.len() != batch_size * self.in_features {
+            return Err(KernelError::InvalidShape(format!(
+                "input length {} != batch_size*in_features {}",
+                input.len(),
+                batch_size * self.in_features
+            )));
+        }
+        if base_output.len() != batch_size * self.out_features {
+            return Err(KernelError::InvalidShape(format!(
+                "base_output length {} != batch_size*out_features {}",
+                base_output.len(),
+                batch_size * self.out_features
+            )));
+        }
 
         // Step 1: h = input @ A^T — (batch, in) @ (in, rank) -> (batch, rank)
         let mut h = vec![0.0f32; batch_size * self.rank];
@@ -141,7 +172,7 @@ impl LoraLayer {
             }
         }
 
-        output
+        Ok(output)
     }
 
     /// GPU-accelerated forward pass using Metal matmul.
@@ -161,8 +192,21 @@ impl LoraLayer {
     ) -> Result<Array, KernelError> {
         let dev = registry.device().raw();
         let batch_size = input.shape()[0];
-        assert_eq!(input.shape()[1], self.in_features);
-        assert_eq!(base_output.shape(), &[batch_size, self.out_features]);
+        if input.shape()[1] != self.in_features {
+            return Err(KernelError::InvalidShape(format!(
+                "input shape[1]={} != in_features={}",
+                input.shape()[1],
+                self.in_features
+            )));
+        }
+        if base_output.shape() != [batch_size, self.out_features] {
+            return Err(KernelError::InvalidShape(format!(
+                "base_output shape {:?} != [{}, {}]",
+                base_output.shape(),
+                batch_size,
+                self.out_features
+            )));
+        }
 
         // Upload A^T as (in_features, rank) from row-major A (rank, in_features)
         let mut a_t = vec![0.0f32; self.in_features * self.rank];
@@ -272,9 +316,19 @@ impl LoraTrainer {
 
     /// Compute cross-entropy loss.
     /// `logits`: (batch_size, vocab_size), `targets`: (batch_size,) indices.
-    pub fn compute_loss(logits: &[f32], targets: &[usize], vocab_size: usize) -> f32 {
+    pub fn compute_loss(
+        logits: &[f32],
+        targets: &[usize],
+        vocab_size: usize,
+    ) -> Result<f32, KernelError> {
         let batch_size = targets.len();
-        assert_eq!(logits.len(), batch_size * vocab_size);
+        if logits.len() != batch_size * vocab_size {
+            return Err(KernelError::InvalidShape(format!(
+                "logits length {} != batch_size*vocab_size {}",
+                logits.len(),
+                batch_size * vocab_size
+            )));
+        }
 
         let mut total_loss = 0.0f32;
         for b in 0..batch_size {
@@ -285,14 +339,24 @@ impl LoraTrainer {
             let target_logit = row[targets[b]];
             total_loss += log_sum_exp - target_logit;
         }
-        total_loss / batch_size as f32
+        Ok(total_loss / batch_size as f32)
     }
 
     /// Compute gradient of cross-entropy loss w.r.t. logits.
     /// Returns: d(loss)/d(logits), shape (batch_size, vocab_size).
-    pub fn compute_loss_grad(logits: &[f32], targets: &[usize], vocab_size: usize) -> Vec<f32> {
+    pub fn compute_loss_grad(
+        logits: &[f32],
+        targets: &[usize],
+        vocab_size: usize,
+    ) -> Result<Vec<f32>, KernelError> {
         let batch_size = targets.len();
-        assert_eq!(logits.len(), batch_size * vocab_size);
+        if logits.len() != batch_size * vocab_size {
+            return Err(KernelError::InvalidShape(format!(
+                "logits length {} != batch_size*vocab_size {}",
+                logits.len(),
+                batch_size * vocab_size
+            )));
+        }
 
         let mut grad = vec![0.0f32; logits.len()];
         let inv_batch = 1.0 / batch_size as f32;
@@ -310,7 +374,7 @@ impl LoraTrainer {
                 grad[b * vocab_size + v] = (softmax_v - target_indicator) * inv_batch;
             }
         }
-        grad
+        Ok(grad)
     }
 
     /// Perform one training step on a LoRA layer using SGD.
@@ -326,16 +390,16 @@ impl LoraTrainer {
         input: &[f32],
         base_output: &[f32],
         targets: &[usize],
-    ) -> f32 {
+    ) -> Result<f32, KernelError> {
         let batch_size = targets.len();
         let out_features = layer.out_features;
 
         // Forward
-        let logits = layer.forward(base_output, input, batch_size);
-        let loss = Self::compute_loss(&logits, targets, out_features);
+        let logits = layer.forward(base_output, input, batch_size)?;
+        let loss = Self::compute_loss(&logits, targets, out_features)?;
 
         // Backward: gradient of loss w.r.t. logits
-        let d_logits = Self::compute_loss_grad(&logits, targets, out_features);
+        let d_logits = Self::compute_loss_grad(&logits, targets, out_features)?;
 
         // Backward through LoRA: output = base + scale * input @ A^T @ B^T
         // d_output = d_logits (same shape)
@@ -400,6 +464,6 @@ impl LoraTrainer {
             *w -= lr * g;
         }
 
-        loss
+        Ok(loss)
     }
 }

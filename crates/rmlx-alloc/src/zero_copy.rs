@@ -208,7 +208,10 @@ impl ZeroCopyBuffer {
             // SAFETY: ptr is valid for aligned_size bytes, just allocated.
             // Zero-fill for safety.
             std::ptr::write_bytes(ptr as *mut u8, 0, aligned_size);
-            NonNull::new(ptr as *mut u8).expect("posix_memalign returned null despite success")
+            match NonNull::new(ptr as *mut u8) {
+                Some(nn) => nn,
+                None => return Err(AllocError::PosixMemalign(-1)),
+            }
         };
 
         // Step 2: Metal NoCopy buffer (StorageModeShared)

@@ -15,7 +15,7 @@ pub fn new_buffer_with_data<T>(device: &metal::Device, data: &[T]) -> MTLBuffer 
 /// Create a zero-copy buffer wrapping externally allocated memory.
 ///
 /// # Safety
-/// - `ptr` must be page-aligned (4096 bytes on Apple Silicon).
+/// - `ptr` must be page-aligned (16384 bytes on Apple Silicon).
 /// - `ptr` must remain valid for the entire lifetime of the returned buffer.
 /// - `size` must not exceed the allocation behind `ptr`.
 /// - The caller is responsible for freeing the memory *after* the buffer is dropped.

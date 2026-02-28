@@ -90,17 +90,27 @@ pub struct MoeDispatchExchange {
     metrics: AtomicMoeMetrics,
     guard: SparseGuard,
     metal_cache: Mutex<Option<CachedMetalPipeline>>,
+    /// Runtime capacity factor, modified by SparseGuard actions.
+    /// Initially set from `config.capacity_factor`.
+    runtime_capacity_factor: f32,
 }
 
 impl MoeDispatchExchange {
     pub fn new(config: MoeDispatchConfig, policy: MoePolicy) -> Self {
+        let runtime_cf = config.capacity_factor;
         Self {
             config,
             policy,
             metrics: AtomicMoeMetrics::new(),
             guard: SparseGuard::new(),
             metal_cache: Mutex::new(None),
+            runtime_capacity_factor: runtime_cf,
         }
+    }
+
+    /// Current runtime capacity factor (may differ from baseline after guard actions).
+    pub fn runtime_capacity_factor(&self) -> f32 {
+        self.runtime_capacity_factor
     }
 
     /// Dispatch tokens to experts based on routing decisions.
@@ -121,20 +131,41 @@ impl MoeDispatchExchange {
         _expert_weights: &[f32],
         token_data: &[u8],
     ) -> Result<DispatchResult, DistributedError> {
+        // Validate expert partition invariants
+        let group_size = self.config.group.size();
+        let num_experts = self.config.num_experts;
+        if group_size > 0 && num_experts % group_size != 0 {
+            return Err(DistributedError::Transport(format!(
+                "num_experts ({num_experts}) must be divisible by group size ({group_size})"
+            )));
+        }
+        if group_size > 0 && num_experts / group_size == 0 {
+            return Err(DistributedError::Transport(format!(
+                "experts_per_rank is 0 (num_experts={num_experts}, group_size={group_size})"
+            )));
+        }
+        // Validate expert indices are in range
+        for &idx in expert_indices {
+            if (idx as usize) >= num_experts {
+                return Err(DistributedError::Transport(format!(
+                    "expert index {idx} out of range (num_experts={num_experts})"
+                )));
+            }
+        }
+
         let n_elements = (batch_size * self.config.top_k) as u32;
         let byte_size = n_elements as usize * 4; // f32
 
         let backend = self.policy.select(n_elements, byte_size);
         self.policy.step();
 
-        // Calculate capacity per expert
-        let tokens_per_expert = (batch_size as f32 * self.config.top_k as f32
-            / self.config.num_experts as f32
-            * self.config.capacity_factor)
+        // Calculate capacity per expert using runtime capacity factor
+        let tokens_per_expert = (batch_size as f32 * self.config.top_k as f32 / num_experts as f32
+            * self.runtime_capacity_factor)
             .ceil() as usize;
 
         // Count tokens per expert and detect overflow
-        let mut expert_counts = vec![0usize; self.config.num_experts];
+        let mut expert_counts = vec![0usize; num_experts];
         let mut overflow = 0u64;
 
         for &idx in expert_indices.iter() {
@@ -162,14 +193,18 @@ impl MoeDispatchExchange {
         self.guard
             .record_step(overflow as usize, batch_size * self.config.top_k);
         match self.guard.evaluate() {
-            GuardAction::IncreaseCapacity(_new_factor) => {
-                // Guard recommends increasing capacity (overflow > 5%)
+            GuardAction::IncreaseCapacity(new_factor) => {
+                self.runtime_capacity_factor = new_factor as f32;
             }
             GuardAction::DenseFallback => {
-                // Guard recommends dense fallback (overflow > 20%)
                 self.metrics.record_dense_fallback();
+                self.policy.force_backend(Some(MoeBackend::Cpu));
             }
-            GuardAction::Reset | GuardAction::None => {}
+            GuardAction::Reset => {
+                self.policy.force_backend(None);
+                self.runtime_capacity_factor = self.config.capacity_factor;
+            }
+            GuardAction::None => {}
         }
 
         // Determine which experts are local vs remote
@@ -494,7 +529,7 @@ impl MoeDispatchExchange {
 
         // --- Remote expert buffers: one Vec per peer rank ---
         let world_size = self.config.group.size();
-        let local_rank = self.config.group.local_rank() as usize;
+        let _local_rank = self.config.group.local_rank() as usize;
         let mut remote_buffers: Vec<Vec<u8>> = vec![Vec::new(); world_size];
 
         for batch_idx in 0..batch_size {
@@ -536,54 +571,51 @@ impl MoeDispatchExchange {
             }
         }
 
-        // --- Phase 1: Exchange payload sizes with each peer ---
-        // Send the size (u64 LE) of our payload to each peer so they know exact recv size.
-        for (rank, buf) in remote_buffers.iter().enumerate() {
-            if rank == local_rank {
-                continue;
-            }
-            let size_bytes = (buf.len() as u64).to_le_bytes();
-            self.config
-                .group
-                .send(&size_bytes, rank as u32)
-                .map_err(|e| {
-                    DistributedError::Transport(format!("size send to rank {rank}: {e}"))
-                })?;
-        }
-
-        // Receive sizes from all peers
+        // --- Phase 1: Exchange payload sizes with each peer via sendrecv ---
         let mut recv_sizes: Vec<usize> = vec![0; world_size];
         for &peer_rank in self.config.group.peers().iter() {
-            let size_data = self.config.group.recv(peer_rank, 8).map_err(|e| {
-                DistributedError::Transport(format!("size recv from rank {peer_rank}: {e}"))
-            })?;
-            recv_sizes[peer_rank as usize] =
-                u64::from_le_bytes(size_data[..8].try_into().unwrap()) as usize;
-        }
-
-        // --- Phase 2: Send/recv actual payloads with correct sizes ---
-        for (rank, buf) in remote_buffers.iter().enumerate() {
-            if rank == local_rank || buf.is_empty() {
-                continue;
-            }
-            self.config
+            let pr = peer_rank as usize;
+            let size_bytes = (remote_buffers[pr].len() as u64).to_le_bytes();
+            let size_data = self
+                .config
                 .group
-                .send(buf, rank as u32)
-                .map_err(|e| DistributedError::Transport(format!("send to rank {rank}: {e}")))?;
+                .sendrecv(&size_bytes, peer_rank, 8, peer_rank)
+                .map_err(|e| {
+                    DistributedError::Transport(format!("size sendrecv with rank {peer_rank}: {e}"))
+                })?;
+            recv_sizes[pr] = u64::from_le_bytes(size_data[..8].try_into().unwrap()) as usize;
         }
 
-        // Receive tokens from each peer using the exact size from Phase 1.
-        // Each token in the received buffer is prefixed with a u32 expert_id,
-        // allowing us to place it in the correct expert slot.
+        // --- Phase 2: Exchange actual payloads via sendrecv ---
         let wire_stride = 4 + token_stride; // 4-byte expert_id prefix + token data
         for &peer_rank in self.config.group.peers().iter() {
-            let recv_size = recv_sizes[peer_rank as usize];
+            let pr = peer_rank as usize;
+            let recv_size = recv_sizes[pr];
+            let send_buf = &remote_buffers[pr];
+            // If nothing to send, use an empty placeholder but still recv
+            // If nothing to recv either, skip entirely
+            if send_buf.is_empty() && recv_size == 0 {
+                continue;
+            }
+            // Use sendrecv: send our payload, receive peer's payload
+            let recv_len = if recv_size > 0 { recv_size } else { 4 }; // min 4 to avoid zero-len
+            let send_data = if send_buf.is_empty() {
+                &[0u8; 4][..]
+            } else {
+                send_buf
+            };
+            let received = self
+                .config
+                .group
+                .sendrecv(send_data, peer_rank, recv_len, peer_rank)
+                .map_err(|e| {
+                    DistributedError::Transport(format!(
+                        "payload sendrecv with rank {peer_rank}: {e}"
+                    ))
+                })?;
             if recv_size == 0 {
                 continue;
             }
-            let received = self.config.group.recv(peer_rank, recv_size).map_err(|e| {
-                DistributedError::Transport(format!("recv from rank {peer_rank}: {e}"))
-            })?;
 
             // Merge received tokens into local_output using expert_id prefix
             let mut offset = 0;
@@ -708,7 +740,13 @@ impl MoeCombineExchange {
 
     /// Metal-accelerated combine: uses GPU for weighted sum.
     ///
-    /// Falls back to combine_cpu if Metal is unavailable.
+    /// Launches a scatter-add kernel that computes, for each output element:
+    ///   output[batch_idx * hidden_dim + h] = sum_k weight[batch_idx * top_k + k]
+    ///       * expert_outputs[indices[batch_idx * top_k + k]][batch_idx * hidden_dim + h]
+    ///
+    /// Each thread handles one (batch_idx, h) pair across all top_k experts,
+    /// avoiding atomic conflicts. Falls back to combine_cpu if Metal is unavailable
+    /// or shader compilation fails.
     pub fn combine_metal(
         &self,
         expert_outputs: &[Vec<f32>],
@@ -718,10 +756,6 @@ impl MoeCombineExchange {
         top_k: usize,
         hidden_dim: usize,
     ) -> Vec<f32> {
-        // Try Metal device; fall back to CPU if unavailable.
-        // The weighted sum is a simple scatter-add that doesn't benefit
-        // enormously from GPU for typical MoE sizes, but keeps the data
-        // on-device when already there.
         let device = match metal::Device::system_default() {
             Some(d) => d,
             None => {
@@ -736,24 +770,179 @@ impl MoeCombineExchange {
             }
         };
 
-        // For now, perform the combine on CPU using the existing logic.
-        // The Metal device is acquired to verify availability and could be
-        // used for a GPU kernel in future (scatter-add with atomics).
-        let _ = device;
-        self.combine_cpu(
-            expert_outputs,
-            weights,
-            indices,
-            batch_size,
-            top_k,
-            hidden_dim,
-        )
+        if batch_size == 0 || hidden_dim == 0 {
+            return vec![0.0f32; batch_size * hidden_dim];
+        }
+
+        let num_experts = expert_outputs.len();
+        if num_experts == 0 {
+            return vec![0.0f32; batch_size * hidden_dim];
+        }
+
+        // Flatten expert outputs into a single contiguous buffer:
+        // expert_data[expert_idx * batch_size * hidden_dim + batch_idx * hidden_dim + h]
+        let expert_stride = batch_size * hidden_dim;
+        let mut expert_data = vec![0.0f32; num_experts * expert_stride];
+        for (e, expert_out) in expert_outputs.iter().enumerate() {
+            let copy_len = expert_out.len().min(expert_stride);
+            expert_data[e * expert_stride..e * expert_stride + copy_len]
+                .copy_from_slice(&expert_out[..copy_len]);
+        }
+
+        // Compile shader
+        let kernel_src = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct CombineParams {
+    uint batch_size;
+    uint top_k;
+    uint hidden_dim;
+    uint num_experts;
+    uint expert_stride; // batch_size * hidden_dim
+};
+
+kernel void moe_combine(
+    device const float*    expert_data   [[buffer(0)]],
+    device const float*    weights       [[buffer(1)]],
+    device const uint*     indices       [[buffer(2)]],
+    device float*          output        [[buffer(3)]],
+    constant CombineParams& params       [[buffer(4)]],
+    uint tid [[thread_position_in_grid]])
+{
+    uint total = params.batch_size * params.hidden_dim;
+    if (tid >= total) return;
+
+    uint batch_idx = tid / params.hidden_dim;
+    uint h = tid % params.hidden_dim;
+
+    float sum = 0.0f;
+    for (uint k = 0; k < params.top_k; k++) {
+        uint flat_idx = batch_idx * params.top_k + k;
+        uint expert_idx = indices[flat_idx];
+        float w = weights[flat_idx];
+        if (expert_idx < params.num_experts) {
+            uint offset = expert_idx * params.expert_stride + batch_idx * params.hidden_dim + h;
+            sum += w * expert_data[offset];
+        }
+    }
+    output[tid] = sum;
+}
+"#;
+
+        let options = metal::CompileOptions::new();
+        let library = match device.new_library_with_source(kernel_src, &options) {
+            Ok(lib) => lib,
+            Err(_) => {
+                return self.combine_cpu(
+                    expert_outputs,
+                    weights,
+                    indices,
+                    batch_size,
+                    top_k,
+                    hidden_dim,
+                );
+            }
+        };
+        let function = match library.get_function("moe_combine", None) {
+            Ok(f) => f,
+            Err(_) => {
+                return self.combine_cpu(
+                    expert_outputs,
+                    weights,
+                    indices,
+                    batch_size,
+                    top_k,
+                    hidden_dim,
+                );
+            }
+        };
+        let pipeline = match device.new_compute_pipeline_state_with_function(&function) {
+            Ok(p) => p,
+            Err(_) => {
+                return self.combine_cpu(
+                    expert_outputs,
+                    weights,
+                    indices,
+                    batch_size,
+                    top_k,
+                    hidden_dim,
+                );
+            }
+        };
+
+        let shared = metal::MTLResourceOptions::StorageModeShared;
+        let expert_buf = device.new_buffer_with_data(
+            expert_data.as_ptr() as *const std::ffi::c_void,
+            (expert_data.len() * 4) as u64,
+            shared,
+        );
+        let weights_buf = device.new_buffer_with_data(
+            weights.as_ptr() as *const std::ffi::c_void,
+            (weights.len() * 4) as u64,
+            shared,
+        );
+        let indices_buf = device.new_buffer_with_data(
+            indices.as_ptr() as *const std::ffi::c_void,
+            (indices.len() * 4) as u64,
+            shared,
+        );
+        let output_size = batch_size * hidden_dim;
+        let output_buf = device.new_buffer((output_size * 4).max(4) as u64, shared);
+
+        #[repr(C)]
+        struct CombineParams {
+            batch_size: u32,
+            top_k: u32,
+            hidden_dim: u32,
+            num_experts: u32,
+            expert_stride: u32,
+        }
+        let params = CombineParams {
+            batch_size: batch_size as u32,
+            top_k: top_k as u32,
+            hidden_dim: hidden_dim as u32,
+            num_experts: num_experts as u32,
+            expert_stride: expert_stride as u32,
+        };
+        let params_buf = device.new_buffer_with_data(
+            &params as *const CombineParams as *const std::ffi::c_void,
+            std::mem::size_of::<CombineParams>() as u64,
+            shared,
+        );
+
+        let queue = device.new_command_queue();
+        let cmd_buf = queue.new_command_buffer();
+        let encoder = cmd_buf.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(&expert_buf), 0);
+        encoder.set_buffer(1, Some(&weights_buf), 0);
+        encoder.set_buffer(2, Some(&indices_buf), 0);
+        encoder.set_buffer(3, Some(&output_buf), 0);
+        encoder.set_buffer(4, Some(&params_buf), 0);
+
+        let total_threads = output_size as u64;
+        let max_tg = pipeline.max_total_threads_per_threadgroup();
+        let tg_size = total_threads.min(max_tg);
+
+        encoder.dispatch_threads(
+            metal::MTLSize::new(total_threads, 1, 1),
+            metal::MTLSize::new(tg_size, 1, 1),
+        );
+        encoder.end_encoding();
+        cmd_buf.commit();
+        cmd_buf.wait_until_completed();
+
+        let output_ptr = output_buf.contents() as *const f32;
+        let result = unsafe { std::slice::from_raw_parts(output_ptr, output_size) };
+        result.to_vec()
     }
 
     /// RDMA combine: gathers expert outputs from remote ranks, then combines.
     ///
     /// Remote expert outputs are received via the group's RDMA transport,
     /// merged with local expert outputs, then combined with gating weights.
+    #[allow(clippy::too_many_arguments)]
     pub fn combine_rdma(
         &self,
         local_expert_outputs: &[Vec<f32>],
@@ -764,6 +953,27 @@ impl MoeCombineExchange {
         hidden_dim: usize,
         num_experts: usize,
     ) -> Result<Vec<f32>, DistributedError> {
+        // Validate expert partition invariants
+        let group_size = self.group.size();
+        if group_size > 0 && num_experts % group_size != 0 {
+            return Err(DistributedError::Transport(format!(
+                "num_experts ({num_experts}) must be divisible by group size ({group_size})"
+            )));
+        }
+        if group_size > 0 && num_experts / group_size == 0 {
+            return Err(DistributedError::Transport(format!(
+                "experts_per_rank is 0 (num_experts={num_experts}, group_size={group_size})"
+            )));
+        }
+        // Validate expert indices are in range
+        for &idx in indices {
+            if (idx as usize) >= num_experts {
+                return Err(DistributedError::Transport(format!(
+                    "expert index {idx} out of range (num_experts={num_experts})"
+                )));
+            }
+        }
+
         // Ensure local outputs are materialized
         for (i, output) in local_expert_outputs.iter().enumerate() {
             ensure_materialized(&[(output.len(), output.len() * 4)]).map_err(|_| {
@@ -771,13 +981,8 @@ impl MoeCombineExchange {
             })?;
         }
 
-        // In a full implementation, we would:
-        // 1. Send local expert outputs to requesting ranks via group.send()
-        // 2. Receive remote expert outputs via group.recv()
-        // 3. Merge into a complete expert_outputs array
-        // 4. Run combine_cpu on the merged outputs
-        //
-        // For now, gather from peers if transport is available
+        // Single-rank or no-transport fast path: just use local data
+        // Multi-rank: exchange expert outputs via sendrecv, then combine
         let world_size = self.group.size();
         if world_size <= 1 || !self.group.has_transport() {
             return Ok(self.combine_cpu(
@@ -804,31 +1009,27 @@ impl MoeCombineExchange {
             }
         }
 
-        // Exchange expert outputs with peers
+        // Exchange expert outputs with peers via sendrecv
+        let byte_len = batch_size * hidden_dim * 4;
         for &peer_rank in self.group.peers().iter() {
             let peer_start = peer_rank as usize * experts_per_rank;
-            // Send our expert outputs needed by peer
             for i in 0..experts_per_rank {
-                let expert_idx = local_start + i;
-                if expert_idx < num_experts {
-                    let data_bytes: Vec<u8> = all_expert_outputs[expert_idx]
-                        .iter()
-                        .flat_map(|f| f.to_ne_bytes())
-                        .collect();
-                    self.group.send(&data_bytes, peer_rank)?;
+                let local_expert_idx = local_start + i;
+                let peer_expert_idx = peer_start + i;
+                if local_expert_idx >= num_experts || peer_expert_idx >= num_experts {
+                    continue;
                 }
-            }
-            // Receive peer's expert outputs
-            for i in 0..experts_per_rank {
-                let expert_idx = peer_start + i;
-                if expert_idx < num_experts {
-                    let byte_len = batch_size * hidden_dim * 4;
-                    let received = self.group.recv(peer_rank, byte_len)?;
-                    for (j, chunk) in received.chunks_exact(4).enumerate() {
-                        if j < all_expert_outputs[expert_idx].len() {
-                            all_expert_outputs[expert_idx][j] =
-                                f32::from_ne_bytes(chunk.try_into().unwrap());
-                        }
+                let send_bytes: Vec<u8> = all_expert_outputs[local_expert_idx]
+                    .iter()
+                    .flat_map(|f| f.to_ne_bytes())
+                    .collect();
+                let received = self
+                    .group
+                    .sendrecv(&send_bytes, peer_rank, byte_len, peer_rank)?;
+                for (j, chunk) in received.chunks_exact(4).enumerate() {
+                    if j < all_expert_outputs[peer_expert_idx].len() {
+                        all_expert_outputs[peer_expert_idx][j] =
+                            f32::from_ne_bytes(chunk.try_into().unwrap());
                     }
                 }
             }

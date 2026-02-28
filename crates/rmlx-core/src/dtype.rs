@@ -73,7 +73,7 @@ impl DType {
     /// Panics if `numel` is not a multiple of `block_size()` for quantized types.
     pub fn numel_to_bytes(&self, numel: usize) -> usize {
         if let (Some(bs), Some(pbs)) = (self.block_size(), self.packed_block_size()) {
-            assert!(
+            debug_assert!(
                 numel % bs == 0,
                 "numel ({numel}) must be a multiple of block_size ({bs}) for {self}"
             );

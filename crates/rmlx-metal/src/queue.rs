@@ -6,8 +6,8 @@ use crate::device::GpuDevice;
 
 /// Thin wrapper around a Metal command queue.
 ///
-/// In Phase 0 this is a simple holder. The full `StreamManager` with
-/// multi-queue scheduling is planned for Phase 3.
+/// For single-queue usage. See [`crate::stream::StreamManager`] for
+/// dual-queue (compute + transfer) scheduling with inter-queue sync.
 pub struct GpuQueue {
     queue: CommandQueue,
 }

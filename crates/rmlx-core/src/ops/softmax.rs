@@ -75,7 +75,12 @@ pub fn softmax(
     input: &Array,
     queue: &metal::CommandQueue,
 ) -> Result<Array, KernelError> {
-    assert_eq!(input.ndim(), 2, "softmax requires 2D input");
+    if input.ndim() != 2 {
+        return Err(KernelError::InvalidShape(format!(
+            "softmax requires 2D input, got {}D",
+            input.ndim()
+        )));
+    }
 
     let input_contig = super::make_contiguous(input, registry, queue)?;
     let input = input_contig.as_ref().unwrap_or(input);

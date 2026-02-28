@@ -27,6 +27,7 @@ pub enum AllocError {
     MetalBufferCreate,
     OutOfMemory { requested: usize, available: usize },
     PoolExhausted,
+    MutexPoisoned,
 }
 
 impl fmt::Display for AllocError {
@@ -44,6 +45,7 @@ impl fmt::Display for AllocError {
                 )
             }
             Self::PoolExhausted => write!(f, "buffer pool exhausted"),
+            Self::MutexPoisoned => write!(f, "allocator mutex poisoned"),
         }
     }
 }

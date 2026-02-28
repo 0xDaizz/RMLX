@@ -175,8 +175,20 @@ pub fn binary_op_with_mode(
     queue: &metal::CommandQueue,
     mode: super::ExecMode,
 ) -> Result<Array, KernelError> {
-    assert_eq!(a.shape(), b.shape(), "binary op requires matching shapes");
-    assert_eq!(a.dtype(), b.dtype(), "binary op requires matching dtypes");
+    if a.shape() != b.shape() {
+        return Err(KernelError::InvalidShape(format!(
+            "binary op requires matching shapes: {:?} vs {:?}",
+            a.shape(),
+            b.shape()
+        )));
+    }
+    if a.dtype() != b.dtype() {
+        return Err(KernelError::InvalidShape(format!(
+            "binary op requires matching dtypes: {:?} vs {:?}",
+            a.dtype(),
+            b.dtype()
+        )));
+    }
 
     let a_contig = super::make_contiguous(a, registry, queue)?;
     let a = a_contig.as_ref().unwrap_or(a);
@@ -207,6 +219,65 @@ pub fn binary_op_with_mode(
     super::commit_with_mode(command_buffer, mode);
 
     Ok(out)
+}
+
+/// Execute a binary operation asynchronously, returning a `LaunchResult`.
+///
+/// The output `Array` is only accessible after the GPU completes via
+/// `LaunchResult::into_array()`.
+pub fn binary_op_async(
+    registry: &KernelRegistry,
+    a: &Array,
+    b: &Array,
+    op: BinaryOp,
+    queue: &metal::CommandQueue,
+) -> Result<super::LaunchResult, KernelError> {
+    if a.shape() != b.shape() {
+        return Err(KernelError::InvalidShape(format!(
+            "binary op requires matching shapes: {:?} vs {:?}",
+            a.shape(),
+            b.shape()
+        )));
+    }
+    if a.dtype() != b.dtype() {
+        return Err(KernelError::InvalidShape(format!(
+            "binary op requires matching dtypes: {:?} vs {:?}",
+            a.dtype(),
+            b.dtype()
+        )));
+    }
+
+    let a_contig = super::make_contiguous(a, registry, queue)?;
+    let a = a_contig.as_ref().unwrap_or(a);
+    let b_contig = super::make_contiguous(b, registry, queue)?;
+    let b = b_contig.as_ref().unwrap_or(b);
+
+    let kernel_name = op.kernel_name(a.dtype())?;
+    let pipeline = registry.get_pipeline(kernel_name, a.dtype())?;
+    let numel = a.numel();
+
+    let out = Array::zeros(registry.device().raw(), a.shape(), a.dtype());
+
+    let command_buffer = queue.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(a.metal_buffer()), a.offset() as u64);
+    encoder.set_buffer(1, Some(b.metal_buffer()), b.offset() as u64);
+    encoder.set_buffer(2, Some(out.metal_buffer()), out.offset() as u64);
+
+    let grid_size = MTLSize::new(numel as u64, 1, 1);
+    let threadgroup_size = MTLSize::new(
+        std::cmp::min(pipeline.max_total_threads_per_threadgroup(), numel as u64),
+        1,
+        1,
+    );
+    encoder.dispatch_threads(grid_size, threadgroup_size);
+    encoder.end_encoding();
+
+    let handle = super::commit_with_mode(command_buffer, super::ExecMode::Async)
+        .expect("async mode always returns a handle");
+
+    Ok(super::LaunchResult::new(out, handle))
 }
 
 /// Convenience functions.

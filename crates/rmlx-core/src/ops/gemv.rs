@@ -61,13 +61,25 @@ pub fn gemv(
     vec: &Array,
     queue: &metal::CommandQueue,
 ) -> Result<Array, KernelError> {
-    assert_eq!(mat.ndim(), 2, "gemv requires 2D matrix");
-    assert_eq!(vec.ndim(), 1, "gemv requires 1D vector");
-    assert_eq!(
-        mat.shape()[1],
-        vec.shape()[0],
-        "inner dimensions must match"
-    );
+    if mat.ndim() != 2 {
+        return Err(KernelError::InvalidShape(format!(
+            "gemv requires 2D matrix, got {}D",
+            mat.ndim()
+        )));
+    }
+    if vec.ndim() != 1 {
+        return Err(KernelError::InvalidShape(format!(
+            "gemv requires 1D vector, got {}D",
+            vec.ndim()
+        )));
+    }
+    if mat.shape()[1] != vec.shape()[0] {
+        return Err(KernelError::InvalidShape(format!(
+            "inner dimensions must match: {} vs {}",
+            mat.shape()[1],
+            vec.shape()[0]
+        )));
+    }
 
     let mat_contig = super::make_contiguous(mat, registry, queue)?;
     let mat = mat_contig.as_ref().unwrap_or(mat);

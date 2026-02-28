@@ -392,11 +392,9 @@ fn test_matmul_shape_mismatch() {
     };
     let a = Array::from_slice(registry.device().raw(), &[1.0f32, 2.0], vec![1, 2]);
     let b = Array::from_slice(registry.device().raw(), &[1.0f32, 2.0, 3.0], vec![1, 3]);
-    // This should panic due to inner dimension mismatch
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        ops::matmul::matmul(&registry, &a, &b, &queue)
-    }));
-    assert!(result.is_err(), "matmul should panic on shape mismatch");
+    // This should return Err due to inner dimension mismatch
+    let result = ops::matmul::matmul(&registry, &a, &b, &queue);
+    assert!(result.is_err(), "matmul should error on shape mismatch");
 }
 
 #[test]
@@ -766,6 +764,70 @@ fn test_matmul_m1_same_as_gemm() {
     assert!((vals[2] - 7.0).abs() < 1e-3, "C[0,2]={}", vals[2]);
 }
 
+#[test]
+fn test_matmul_m1_large_n_uses_gemv() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    // Decode hot path: [1,K] @ [K,N] with N=128
+    let k = 64;
+    let n = 128;
+    let a_data: Vec<f32> = (0..k).map(|i| (i as f32) * 0.01).collect();
+    // Identity-like B: each column j has B[j,j]=1.0 for j<K, rest 0
+    // Simpler: use known values
+    let mut b_data = vec![0.0f32; k * n];
+    for j in 0..k.min(n) {
+        b_data[j * n + j] = 1.0;
+    }
+    let a = Array::from_slice(dev, &a_data, vec![1, k]);
+    let b = Array::from_slice(dev, &b_data, vec![k, n]);
+    let c = ops::matmul::matmul(&registry, &a, &b, &queue).expect("matmul M=1,N=128 failed");
+    let vals: Vec<f32> = unsafe { c.to_vec() };
+    assert_eq!(c.shape(), &[1, n]);
+    // First K columns should equal a_data, rest should be 0
+    for j in 0..k {
+        assert!(
+            (vals[j] - a_data[j]).abs() < 1e-4,
+            "C[0,{}]={}, expected {}",
+            j,
+            vals[j],
+            a_data[j]
+        );
+    }
+    for j in k..n {
+        assert!(vals[j].abs() < 1e-4, "C[0,{}]={}, expected 0.0", j, vals[j]);
+    }
+}
+
+#[test]
+fn test_matmul_n1_uses_gemv() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    // [M,K] @ [K,1] -> [M,1]
+    let a = Array::from_slice(dev, &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]);
+    let b = Array::from_slice(dev, &[1.0f32, 0.0, 1.0], vec![3, 1]);
+    let c = ops::matmul::matmul(&registry, &a, &b, &queue).expect("matmul N=1 failed");
+    let vals: Vec<f32> = unsafe { c.to_vec() };
+    assert_eq!(c.shape(), &[2, 1]);
+    // row 0: 1*1 + 2*0 + 3*1 = 4
+    // row 1: 4*1 + 5*0 + 6*1 = 10
+    assert!(
+        (vals[0] - 4.0).abs() < 1e-4,
+        "C[0,0]={}, expected 4.0",
+        vals[0]
+    );
+    assert!(
+        (vals[1] - 10.0).abs() < 1e-4,
+        "C[1,0]={}, expected 10.0",
+        vals[1]
+    );
+}
+
 // ─── RP1-2: VJP backward tests ───
 
 #[test]
@@ -785,7 +847,7 @@ fn test_vjp_softmax_backward() {
         cols: 4,
     };
     let grad_out = vec![1.0f32, 0.0, 0.0, 0.0]; // gradient w.r.t. first output
-    let grads = grad_fn.backward(&grad_out);
+    let grads = grad_fn.backward(&grad_out).expect("backward failed");
     assert_eq!(grads.len(), 1);
     assert_eq!(grads[0].len(), 4);
     // grad_input[0] = output[0] * (1 - output[0])
@@ -834,7 +896,7 @@ fn test_vjp_rms_norm_backward() {
 
     let jacobian = numerical_gradient(rms_norm_fn, &input, 1e-3);
     let grad_out = vec![1.0f32, 0.0, 0.0, 0.0];
-    let analytic = grad_fn.backward(&grad_out);
+    let analytic = grad_fn.backward(&grad_out).expect("backward failed");
 
     // Compare: analytic grad should match sum of jacobian columns weighted by grad_out
     for i in 0..4 {
@@ -853,11 +915,13 @@ fn test_vjp_rms_norm_backward() {
 #[test]
 fn test_lora_forward_shape() {
     use rmlx_core::lora::{LoraConfig, LoraLayer};
-    let config = LoraConfig::new(4, 8.0);
+    let config = LoraConfig::new(4, 8.0).expect("LoraConfig::new failed");
     let layer = LoraLayer::new(16, 8, &config);
     let input = vec![1.0f32; 2 * 16]; // batch=2, in=16
     let base_output = vec![0.0f32; 2 * 8]; // batch=2, out=8
-    let output = layer.forward(&base_output, &input, 2);
+    let output = layer
+        .forward(&base_output, &input, 2)
+        .expect("forward failed");
     assert_eq!(
         output.len(),
         2 * 8,
@@ -869,11 +933,13 @@ fn test_lora_forward_shape() {
 fn test_lora_zero_init_identity() {
     use rmlx_core::lora::{LoraConfig, LoraLayer};
     // B is zero-initialized, so LoRA contribution should be zero initially
-    let config = LoraConfig::new(4, 8.0);
+    let config = LoraConfig::new(4, 8.0).expect("LoraConfig::new failed");
     let layer = LoraLayer::new(16, 8, &config);
     let input = vec![1.0f32; 16];
     let base_output = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
-    let output = layer.forward(&base_output, &input, 1);
+    let output = layer
+        .forward(&base_output, &input, 1)
+        .expect("forward failed");
     // Since B=0, output should equal base_output
     for (i, (&got, &expected)) in output.iter().zip(base_output.iter()).enumerate() {
         assert!(
@@ -895,13 +961,15 @@ fn test_lora_gpu_forward() {
     // Small LoRA: in=4, out=3, rank=2, alpha=4
     let lora_a = vec![1.0f32, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0]; // (2, 4)
     let lora_b = vec![1.0f32, 0.0, 0.0, 1.0, 1.0, 1.0]; // (3, 2)
-    let layer = LoraLayer::with_weights(4, 3, 2, 4.0, lora_a, lora_b);
+    let layer = LoraLayer::with_weights(4, 3, 2, 4.0, lora_a, lora_b).expect("with_weights failed");
 
     let input_data = vec![1.0f32, 2.0, 3.0, 4.0]; // batch=1
     let base_data = vec![0.0f32, 0.0, 0.0]; // batch=1
 
     // CPU forward
-    let cpu_out = layer.forward(&base_data, &input_data, 1);
+    let cpu_out = layer
+        .forward(&base_data, &input_data, 1)
+        .expect("forward failed");
 
     // GPU forward
     let input_arr = Array::from_slice(dev, &input_data, vec![1, 4]);
@@ -917,4 +985,214 @@ fn test_lora_gpu_forward() {
             "LoRA CPU vs GPU [{i}]: cpu={cpu}, gpu={gpu}"
         );
     }
+}
+
+// ===== LaunchResult tests =====
+
+#[test]
+fn test_launch_result_binary_async() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    let a = Array::from_slice(dev, &[1.0f32, 2.0, 3.0, 4.0], vec![4]);
+    let b = Array::from_slice(dev, &[10.0f32, 20.0, 30.0, 40.0], vec![4]);
+
+    let launch =
+        ops::binary::binary_op_async(&registry, &a, &b, ops::binary::BinaryOp::Add, &queue)
+            .expect("binary_op_async failed");
+
+    // Output should not be accessed until into_array()
+    let output = launch.into_array();
+    let vals: Vec<f32> = unsafe { output.to_vec() };
+    assert_eq!(vals, vec![11.0, 22.0, 33.0, 44.0]);
+}
+
+#[test]
+fn test_launch_result_copy_async() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    let data = vec![5.0f32, 6.0, 7.0, 8.0];
+    let src = Array::from_slice(dev, &data, vec![4]);
+
+    let launch = ops::copy::copy_async(&registry, &src, &queue).expect("copy_async failed");
+
+    let output = launch.into_array();
+    let vals: Vec<f32> = unsafe { output.to_vec() };
+    assert_eq!(vals, data);
+}
+
+#[test]
+fn test_launch_result_reduce_async() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    let data = vec![1.0f32, 2.0, 3.0, 4.0];
+    let arr = Array::from_slice(dev, &data, vec![4]);
+
+    let launch = ops::reduce::reduce_all_async(&registry, &arr, ops::reduce::ReduceOp::Sum, &queue)
+        .expect("reduce_all_async failed");
+
+    let output = launch.into_array();
+    let vals: Vec<f32> = unsafe { output.to_vec() };
+    assert!(
+        (vals[0] - 10.0).abs() < 1e-3,
+        "sum should be 10.0, got {}",
+        vals[0]
+    );
+}
+
+#[test]
+fn test_launch_result_is_complete() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    let a = Array::from_slice(dev, &[1.0f32; 4], vec![4]);
+    let b = Array::from_slice(dev, &[2.0f32; 4], vec![4]);
+
+    let launch =
+        ops::binary::binary_op_async(&registry, &a, &b, ops::binary::BinaryOp::Mul, &queue)
+            .expect("binary_op_async failed");
+
+    // After into_array (which waits), is_complete should have been true
+    let output = launch.into_array();
+    let vals: Vec<f32> = unsafe { output.to_vec() };
+    assert_eq!(vals, vec![2.0, 2.0, 2.0, 2.0]);
+}
+
+#[test]
+fn test_launch_result_into_array_timeout_success() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    let a = Array::from_slice(dev, &[3.0f32, 4.0], vec![2]);
+    let b = Array::from_slice(dev, &[1.0f32, 1.0], vec![2]);
+
+    let launch =
+        ops::binary::binary_op_async(&registry, &a, &b, ops::binary::BinaryOp::Sub, &queue)
+            .expect("binary_op_async failed");
+
+    // Give generous timeout — GPU should finish well within
+    let result = launch.into_array_timeout(std::time::Duration::from_secs(5));
+    assert!(result.is_ok(), "should complete within timeout");
+    let output = result.unwrap();
+    let vals: Vec<f32> = unsafe { output.to_vec() };
+    assert_eq!(vals, vec![2.0, 3.0]);
+}
+
+// --- SiLU tests ---
+
+/// CPU reference: silu(x) = x / (1 + exp(-x))
+fn silu_ref(x: f32) -> f32 {
+    x / (1.0 + (-x).exp())
+}
+
+#[test]
+fn test_silu_f32_accuracy() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    let input_data: Vec<f32> = vec![-5.0, -2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0, 5.0, 10.0];
+    let expected: Vec<f32> = input_data.iter().map(|&x| silu_ref(x)).collect();
+
+    let input = Array::from_slice(dev, &input_data, vec![input_data.len()]);
+    let output = ops::silu::silu(&registry, &input, &queue).expect("silu f32 failed");
+    let result: Vec<f32> = unsafe { output.to_vec() };
+
+    assert_eq!(result.len(), expected.len());
+    for (i, (&got, &exp)) in result.iter().zip(expected.iter()).enumerate() {
+        let abs_err = (got - exp).abs();
+        let rtol = 1e-5;
+        let atol = 1e-6;
+        assert!(
+            abs_err <= atol + rtol * exp.abs(),
+            "silu f32 mismatch at [{}]: got={}, expected={}, err={}",
+            i,
+            got,
+            exp,
+            abs_err
+        );
+    }
+}
+
+#[test]
+fn test_silu_f32_large_input() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    // Test with larger array to exercise threadgroup dispatch
+    let n = 1024;
+    let input_data: Vec<f32> = (0..n).map(|i| (i as f32 - 512.0) * 0.01).collect();
+    let expected: Vec<f32> = input_data.iter().map(|&x| silu_ref(x)).collect();
+
+    let input = Array::from_slice(dev, &input_data, vec![n]);
+    let output = ops::silu::silu(&registry, &input, &queue).expect("silu f32 large failed");
+    let result: Vec<f32> = unsafe { output.to_vec() };
+
+    assert_eq!(result.len(), expected.len());
+    for (i, (&got, &exp)) in result.iter().zip(expected.iter()).enumerate() {
+        let abs_err = (got - exp).abs();
+        let rtol = 1e-5;
+        let atol = 1e-6;
+        assert!(
+            abs_err <= atol + rtol * exp.abs(),
+            "silu f32 large mismatch at [{}]: input={}, got={}, expected={}, err={}",
+            i,
+            input_data[i],
+            got,
+            exp,
+            abs_err
+        );
+    }
+}
+
+#[test]
+fn test_silu_zero_and_symmetry() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    // silu(0) = 0 exactly
+    let input = Array::from_slice(dev, &[0.0f32], vec![1]);
+    let output = ops::silu::silu(&registry, &input, &queue).expect("silu failed");
+    let result: Vec<f32> = unsafe { output.to_vec() };
+    assert!(
+        result[0].abs() < 1e-7,
+        "silu(0) should be 0, got {}",
+        result[0]
+    );
+
+    // silu(-x) != -silu(x) in general (not antisymmetric), but check known property:
+    // silu(x) = x * sigmoid(x), and sigmoid(0)=0.5, so silu(0)=0
+    // silu(large_positive) ≈ x, silu(large_negative) ≈ 0
+    let input2 = Array::from_slice(dev, &[20.0f32, -20.0f32], vec![2]);
+    let output2 = ops::silu::silu(&registry, &input2, &queue).expect("silu failed");
+    let result2: Vec<f32> = unsafe { output2.to_vec() };
+    // silu(20) ≈ 20.0
+    assert!(
+        (result2[0] - 20.0).abs() < 1e-4,
+        "silu(20) should be ~20, got {}",
+        result2[0]
+    );
+    // silu(-20) ≈ 0.0
+    assert!(
+        result2[1].abs() < 1e-4,
+        "silu(-20) should be ~0, got {}",
+        result2[1]
+    );
 }

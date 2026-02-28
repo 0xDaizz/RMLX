@@ -28,36 +28,55 @@ pub struct TransformerConfig {
 }
 
 impl TransformerConfig {
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), KernelError> {
         if self.hidden_size == 0 {
-            return Err("hidden_size must be > 0".into());
+            return Err(KernelError::InvalidShape(
+                "TransformerConfig: hidden_size must be > 0".into(),
+            ));
         }
         if self.num_heads == 0 {
-            return Err("num_heads must be > 0".into());
+            return Err(KernelError::InvalidShape(
+                "TransformerConfig: num_heads must be > 0".into(),
+            ));
         }
         if self.num_kv_heads == 0 {
-            return Err("num_kv_heads must be > 0".into());
+            return Err(KernelError::InvalidShape(
+                "TransformerConfig: num_kv_heads must be > 0".into(),
+            ));
         }
         if self.num_kv_heads > self.num_heads {
-            return Err("num_kv_heads > num_heads".into());
+            return Err(KernelError::InvalidShape(format!(
+                "TransformerConfig: num_kv_heads ({}) > num_heads ({})",
+                self.num_kv_heads, self.num_heads
+            )));
         }
         if self.num_heads % self.num_kv_heads != 0 {
-            return Err("num_heads must be divisible by num_kv_heads".into());
+            return Err(KernelError::InvalidShape(format!(
+                "TransformerConfig: num_heads ({}) must be divisible by num_kv_heads ({})",
+                self.num_heads, self.num_kv_heads
+            )));
         }
         if self.head_dim == 0 {
-            return Err("head_dim must be > 0".into());
+            return Err(KernelError::InvalidShape(
+                "TransformerConfig: head_dim must be > 0".into(),
+            ));
         }
         if self.num_layers == 0 {
-            return Err("num_layers must be > 0".into());
+            return Err(KernelError::InvalidShape(
+                "TransformerConfig: num_layers must be > 0".into(),
+            ));
         }
         if self.vocab_size == 0 {
-            return Err("vocab_size must be > 0".into());
+            return Err(KernelError::InvalidShape(
+                "TransformerConfig: vocab_size must be > 0".into(),
+            ));
         }
         Ok(())
     }
 }
 
 /// Feed-forward network: either dense (SwiGLU) or MoE.
+#[allow(clippy::large_enum_variant)]
 pub enum FeedForward {
     /// SwiGLU FFN: gate_proj, up_proj, down_proj
     Dense {
@@ -86,11 +105,11 @@ impl FeedForward {
                 up_proj,
                 down_proj,
             } => {
-                // SwiGLU: down(gate(x) * up(x))
-                // (silu omitted here; proper silu kernel to be added to rmlx-core)
+                // SwiGLU: down(silu(gate(x)) * up(x))
                 let gate_out = gate_proj.forward(x, registry, queue)?;
                 let up_out = up_proj.forward(x, registry, queue)?;
-                let hidden = ops::binary::mul(registry, &gate_out, &up_out, queue)?;
+                let gate_activated = ops::silu::silu(registry, &gate_out, queue)?;
+                let hidden = ops::binary::mul(registry, &gate_activated, &up_out, queue)?;
                 down_proj.forward(&hidden, registry, queue)
             }
             FeedForward::MoE(moe) => moe.forward(x, registry, queue),
@@ -109,7 +128,8 @@ pub struct TransformerBlock {
 
 impl TransformerBlock {
     /// Config-only constructor (no weights).
-    pub fn new(layer_idx: usize, config: TransformerConfig) -> Self {
+    pub fn new(layer_idx: usize, config: TransformerConfig) -> Result<Self, KernelError> {
+        config.validate()?;
         let hidden_size = config.hidden_size;
         let rms_norm_eps = config.rms_norm_eps;
         let attn_config = crate::attention::AttentionConfig {
@@ -120,9 +140,9 @@ impl TransformerBlock {
             rope_theta: config.rope_theta,
         };
         // Create a dummy device-less norm weight — will be replaced by from_parts
-        Self {
+        Ok(Self {
             layer_idx,
-            attention: Attention::new(attn_config),
+            attention: Attention::new(attn_config)?,
             ffn: FeedForward::Dense {
                 gate_proj: Linear::new(crate::linear::LinearConfig {
                     in_features: hidden_size,
@@ -143,7 +163,7 @@ impl TransformerBlock {
             norm1_weight: None,
             norm2_weight: None,
             rms_norm_eps,
-        }
+        })
     }
 
     /// Create a transformer block with pre-loaded weights.
@@ -228,16 +248,17 @@ pub struct TransformerModel {
 
 impl TransformerModel {
     /// Config-only constructor (no weights loaded).
-    pub fn new(config: TransformerConfig) -> Self {
+    pub fn new(config: TransformerConfig) -> Result<Self, KernelError> {
+        config.validate()?;
         let num_layers = config.num_layers;
-        Self {
+        Ok(Self {
             config,
             embedding: None,
             layers: Vec::new(),
             final_norm_weight: None,
             lm_head: None,
             num_layers,
-        }
+        })
     }
 
     /// Create a model with all components pre-loaded.
@@ -247,16 +268,17 @@ impl TransformerModel {
         layers: Vec<TransformerBlock>,
         final_norm_weight: Array,
         lm_head: Linear,
-    ) -> Self {
+    ) -> Result<Self, KernelError> {
+        config.validate()?;
         let num_layers = layers.len();
-        Self {
+        Ok(Self {
             config,
             embedding: Some(embedding),
             layers,
             final_norm_weight: Some(final_norm_weight),
             lm_head: Some(lm_head),
             num_layers,
-        }
+        })
     }
 
     /// Forward pass: token IDs -> logits.

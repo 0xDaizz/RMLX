@@ -47,7 +47,11 @@ impl MetalAllocator {
         }
 
         // Try cache first
-        let cached = self.cache.lock().unwrap().acquire(size);
+        let cached = self
+            .cache
+            .lock()
+            .map_err(|_| AllocError::MutexPoisoned)?
+            .acquire(size);
         if let Some(buf) = cached {
             self.stats.record_cache_hit();
             self.stats.record_alloc(buf.length() as usize);
@@ -67,7 +71,10 @@ impl MetalAllocator {
     pub fn free(&self, buffer: rmlx_metal::metal::Buffer) {
         let size = buffer.length() as usize;
         self.stats.record_free(size);
-        self.cache.lock().unwrap().release(buffer);
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.release(buffer);
+        }
+        // If mutex is poisoned, the buffer is simply dropped (freed).
     }
 
     /// Get allocation statistics.
@@ -77,6 +84,8 @@ impl MetalAllocator {
 
     /// Clear the buffer cache, freeing all cached buffers.
     pub fn clear_cache(&self) {
-        self.cache.lock().unwrap().clear();
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.clear();
+        }
     }
 }

@@ -33,19 +33,21 @@ impl PipelineCache {
         name: &str,
         library: &Library,
     ) -> Result<&ComputePipelineState, MetalError> {
-        if !self.cache.contains_key(name) {
-            let function = library
-                .get_function(name, None)
-                .map_err(|_| MetalError::KernelNotFound(name.to_string()))?;
+        use std::collections::hash_map::Entry;
+        match self.cache.entry(name.to_string()) {
+            Entry::Occupied(e) => Ok(e.into_mut()),
+            Entry::Vacant(e) => {
+                let function = library
+                    .get_function(name, None)
+                    .map_err(|_| MetalError::KernelNotFound(name.to_string()))?;
 
-            let pipeline = self
-                .device
-                .new_compute_pipeline_state_with_function(&function)
-                .map_err(|e| MetalError::PipelineCreate(e.to_string()))?;
+                let pipeline = self
+                    .device
+                    .new_compute_pipeline_state_with_function(&function)
+                    .map_err(|err| MetalError::PipelineCreate(err.to_string()))?;
 
-            self.cache.insert(name.to_string(), pipeline);
+                Ok(e.insert(pipeline))
+            }
         }
-
-        Ok(self.cache.get(name).expect("just inserted"))
     }
 }

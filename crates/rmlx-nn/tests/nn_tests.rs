@@ -39,7 +39,8 @@ fn test_attention_gqa() {
         head_dim: 128,
         max_seq_len: 4096,
         rope_theta: 500000.0,
-    });
+    })
+    .expect("Attention::new failed");
     assert!(attn.is_gqa());
     assert_eq!(attn.hidden_size(), 4096);
 }
@@ -51,7 +52,8 @@ fn test_moe_layer() {
         num_experts_per_token: 2,
         hidden_dim: 4096,
         intermediate_dim: 14336,
-    });
+    })
+    .expect("MoeLayer::new failed");
     assert_eq!(moe.num_experts(), 8);
     assert_eq!(moe.top_k(), 2);
 }
@@ -98,7 +100,7 @@ fn test_mixtral_moe() {
 #[test]
 fn test_transformer_model() {
     let cfg = llama::llama_7b();
-    let model = TransformerModel::new(cfg);
+    let model = TransformerModel::new(cfg).expect("TransformerModel::new failed");
     assert_eq!(model.num_layers(), 32);
     assert_eq!(model.config().hidden_size, 4096);
 }
@@ -140,7 +142,8 @@ fn test_linear_from_arrays() {
         },
         weight,
         None,
-    );
+    )
+    .expect("from_arrays failed");
     assert!(linear.has_weights());
     assert!(linear.bias().is_none());
     assert_eq!(linear.in_features(), 3);
@@ -165,7 +168,8 @@ fn test_linear_forward_no_bias() {
         },
         weight,
         None,
-    );
+    )
+    .expect("from_arrays failed");
     // Input: [1, 3] = [[5, 6, 7]]
     let input = Array::from_slice(dev, &[5.0f32, 6.0, 7.0], vec![1, 3]);
     let output = linear
@@ -222,7 +226,8 @@ fn test_linear_forward_with_bias_batch1() {
         },
         weight,
         Some(bias),
-    );
+    )
+    .expect("from_arrays failed");
     // Input: [1, 3] = [[5, 6, 7]]
     let input = Array::from_slice(dev, &[5.0f32, 6.0, 7.0], vec![1, 3]);
     let output = linear
@@ -261,7 +266,8 @@ fn test_linear_forward_with_bias_batch2() {
         },
         weight,
         Some(bias),
-    );
+    )
+    .expect("from_arrays failed");
     // Input: [2, 3] = [[5, 6, 7], [1, 2, 3]]
     let input = Array::from_slice(dev, &[5.0f32, 6.0, 7.0, 1.0, 2.0, 3.0], vec![2, 3]);
     let output = linear
@@ -317,7 +323,8 @@ fn test_embedding_forward() {
             embed_dim: 3,
         },
         weight,
-    );
+    )
+    .expect("from_array failed");
     // Lookup tokens [0, 2, 3]
     let output = emb
         .forward(&[0, 2, 3], &registry, &queue)
@@ -371,6 +378,7 @@ fn make_identity_linear(dev: &metal::Device, size: usize) -> Linear {
         weight,
         None,
     )
+    .expect("identity linear from_arrays failed")
 }
 
 #[test]
@@ -401,7 +409,8 @@ fn test_attention_forward_identity() {
     let v_proj = make_identity_linear(dev, hidden_size);
     let o_proj = make_identity_linear(dev, hidden_size);
 
-    let attn = Attention::from_layers(config, q_proj, k_proj, v_proj, o_proj);
+    let attn = Attention::from_layers(config, q_proj, k_proj, v_proj, o_proj)
+        .expect("Attention::from_layers failed");
 
     // Input: [2, 8] — 2 tokens, 8-dim hidden
     let input = Array::from_slice(
@@ -460,7 +469,8 @@ fn test_moe_forward() {
         },
         gate_weight,
         None,
-    );
+    )
+    .expect("gate from_arrays failed");
 
     // Expert 0: identity-like (gate=identity, up=identity, down=identity)
     let expert0 = Expert {
@@ -485,7 +495,8 @@ fn test_moe_forward() {
         },
         gate,
         vec![expert0, expert1],
-    );
+    )
+    .expect("from_layers failed");
 
     // Input: [2, 4]
     let input = Array::from_slice(
@@ -516,7 +527,8 @@ fn test_moe_no_weights_errors() {
         num_experts_per_token: 1,
         hidden_dim: 4,
         intermediate_dim: 8,
-    });
+    })
+    .expect("MoeLayer::new failed");
     let input = Array::from_slice(dev, &[1.0f32, 2.0, 3.0, 4.0], vec![1, 4]);
     let result = moe.forward(&input, &registry, &queue);
     assert!(result.is_err());
@@ -549,7 +561,8 @@ fn test_transformer_block_forward() {
         make_identity_linear(dev, hidden_size),
         make_identity_linear(dev, hidden_size),
         make_identity_linear(dev, hidden_size),
-    );
+    )
+    .expect("Attention::from_layers failed");
 
     let ffn = FeedForward::Dense {
         gate_proj: make_identity_linear(dev, hidden_size),
@@ -612,7 +625,8 @@ fn test_transformer_model_forward() {
             embed_dim: hidden_size,
         },
         emb_weight,
-    );
+    )
+    .expect("embedding from_array failed");
 
     // One transformer block
     let attn_config = AttentionConfig {
@@ -628,7 +642,8 @@ fn test_transformer_model_forward() {
         make_identity_linear(dev, hidden_size),
         make_identity_linear(dev, hidden_size),
         make_identity_linear(dev, hidden_size),
-    );
+    )
+    .expect("Attention::from_layers failed");
     let ffn = FeedForward::Dense {
         gate_proj: make_identity_linear(dev, hidden_size),
         up_proj: make_identity_linear(dev, hidden_size),
@@ -655,7 +670,8 @@ fn test_transformer_model_forward() {
         },
         lm_head_weight,
         None,
-    );
+    )
+    .expect("lm_head from_arrays failed");
 
     let config = TransformerConfig {
         hidden_size,
@@ -672,7 +688,8 @@ fn test_transformer_model_forward() {
         },
     };
 
-    let model = TransformerModel::from_parts(config, embedding, vec![block], final_norm, lm_head);
+    let model = TransformerModel::from_parts(config, embedding, vec![block], final_norm, lm_head)
+        .expect("TransformerModel::from_parts failed");
 
     // Forward pass with 3 tokens
     let token_ids = [0u32, 1, 2];
@@ -686,4 +703,202 @@ fn test_transformer_model_forward() {
     let vals: Vec<f32> = unsafe { logits.to_vec() };
     let sum: f32 = vals.iter().sum();
     assert!(sum.is_finite(), "model output contains non-finite values");
+}
+
+// ===== Config validate negative tests =====
+
+#[test]
+fn test_attention_config_zero_num_heads() {
+    let result = Attention::new(AttentionConfig {
+        num_heads: 0,
+        num_kv_heads: 1,
+        head_dim: 64,
+        max_seq_len: 2048,
+        rope_theta: 10000.0,
+    });
+    assert!(result.is_err(), "num_heads=0 should fail");
+}
+
+#[test]
+fn test_attention_config_zero_head_dim() {
+    let result = Attention::new(AttentionConfig {
+        num_heads: 8,
+        num_kv_heads: 8,
+        head_dim: 0,
+        max_seq_len: 2048,
+        rope_theta: 10000.0,
+    });
+    assert!(result.is_err(), "head_dim=0 should fail");
+}
+
+#[test]
+fn test_attention_config_zero_kv_heads() {
+    let result = Attention::new(AttentionConfig {
+        num_heads: 8,
+        num_kv_heads: 0,
+        head_dim: 64,
+        max_seq_len: 2048,
+        rope_theta: 10000.0,
+    });
+    assert!(result.is_err(), "num_kv_heads=0 should fail");
+}
+
+#[test]
+fn test_attention_config_heads_not_divisible_by_kv() {
+    let result = Attention::new(AttentionConfig {
+        num_heads: 7,
+        num_kv_heads: 3,
+        head_dim: 64,
+        max_seq_len: 2048,
+        rope_theta: 10000.0,
+    });
+    assert!(result.is_err(), "num_heads % num_kv_heads != 0 should fail");
+}
+
+#[test]
+fn test_moe_config_zero_experts() {
+    let result = MoeLayer::new(MoeConfig {
+        num_experts: 0,
+        num_experts_per_token: 1,
+        hidden_dim: 256,
+        intermediate_dim: 512,
+    });
+    assert!(result.is_err(), "num_experts=0 should fail");
+}
+
+#[test]
+fn test_moe_config_zero_experts_per_token() {
+    let result = MoeLayer::new(MoeConfig {
+        num_experts: 8,
+        num_experts_per_token: 0,
+        hidden_dim: 256,
+        intermediate_dim: 512,
+    });
+    assert!(result.is_err(), "num_experts_per_token=0 should fail");
+}
+
+#[test]
+fn test_moe_config_top_k_exceeds_experts() {
+    let result = MoeLayer::new(MoeConfig {
+        num_experts: 4,
+        num_experts_per_token: 5,
+        hidden_dim: 256,
+        intermediate_dim: 512,
+    });
+    assert!(
+        result.is_err(),
+        "num_experts_per_token > num_experts should fail"
+    );
+}
+
+#[test]
+fn test_moe_config_zero_hidden_dim() {
+    let result = MoeLayer::new(MoeConfig {
+        num_experts: 8,
+        num_experts_per_token: 2,
+        hidden_dim: 0,
+        intermediate_dim: 512,
+    });
+    assert!(result.is_err(), "hidden_dim=0 should fail");
+}
+
+#[test]
+fn test_transformer_config_zero_num_layers() {
+    let result = TransformerModel::new(TransformerConfig {
+        hidden_size: 256,
+        num_heads: 4,
+        num_kv_heads: 4,
+        head_dim: 64,
+        num_layers: 0,
+        vocab_size: 1000,
+        max_seq_len: 2048,
+        rope_theta: 10000.0,
+        rms_norm_eps: 1e-5,
+        ff_type: FeedForwardType::Dense {
+            intermediate_dim: 512,
+        },
+    });
+    assert!(result.is_err(), "num_layers=0 should fail");
+}
+
+#[test]
+fn test_transformer_config_zero_hidden_size() {
+    let result = TransformerModel::new(TransformerConfig {
+        hidden_size: 0,
+        num_heads: 4,
+        num_kv_heads: 4,
+        head_dim: 64,
+        num_layers: 1,
+        vocab_size: 1000,
+        max_seq_len: 2048,
+        rope_theta: 10000.0,
+        rms_norm_eps: 1e-5,
+        ff_type: FeedForwardType::Dense {
+            intermediate_dim: 512,
+        },
+    });
+    assert!(result.is_err(), "hidden_size=0 should fail");
+}
+
+#[test]
+fn test_transformer_config_zero_vocab_size() {
+    let result = TransformerModel::new(TransformerConfig {
+        hidden_size: 256,
+        num_heads: 4,
+        num_kv_heads: 4,
+        head_dim: 64,
+        num_layers: 1,
+        vocab_size: 0,
+        max_seq_len: 2048,
+        rope_theta: 10000.0,
+        rms_norm_eps: 1e-5,
+        ff_type: FeedForwardType::Dense {
+            intermediate_dim: 512,
+        },
+    });
+    assert!(result.is_err(), "vocab_size=0 should fail");
+}
+
+#[test]
+fn test_transformer_config_kv_heads_exceeds_heads() {
+    let result = TransformerModel::new(TransformerConfig {
+        hidden_size: 256,
+        num_heads: 4,
+        num_kv_heads: 8,
+        head_dim: 64,
+        num_layers: 1,
+        vocab_size: 1000,
+        max_seq_len: 2048,
+        rope_theta: 10000.0,
+        rms_norm_eps: 1e-5,
+        ff_type: FeedForwardType::Dense {
+            intermediate_dim: 512,
+        },
+    });
+    assert!(result.is_err(), "num_kv_heads > num_heads should fail");
+}
+
+#[test]
+fn test_transformer_block_new_validates_config() {
+    let result = TransformerBlock::new(
+        0,
+        TransformerConfig {
+            hidden_size: 256,
+            num_heads: 4,
+            num_kv_heads: 4,
+            head_dim: 0,
+            num_layers: 1,
+            vocab_size: 1000,
+            max_seq_len: 2048,
+            rope_theta: 10000.0,
+            rms_norm_eps: 1e-5,
+            ff_type: FeedForwardType::Dense {
+                intermediate_dim: 512,
+            },
+        },
+    );
+    assert!(
+        result.is_err(),
+        "head_dim=0 in TransformerBlock::new should fail"
+    );
 }

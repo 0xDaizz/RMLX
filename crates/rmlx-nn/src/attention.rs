@@ -15,21 +15,27 @@ pub struct AttentionConfig {
 }
 
 impl AttentionConfig {
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), KernelError> {
         if self.num_heads == 0 {
-            return Err("num_heads must be > 0".into());
-        }
-        if self.num_kv_heads == 0 {
-            return Err("num_kv_heads must be > 0".into());
-        }
-        if self.num_kv_heads > self.num_heads {
-            return Err("num_kv_heads > num_heads".into());
-        }
-        if self.num_heads % self.num_kv_heads != 0 {
-            return Err("num_heads must be divisible by num_kv_heads".into());
+            return Err(KernelError::InvalidShape(
+                "AttentionConfig: num_heads must be > 0".into(),
+            ));
         }
         if self.head_dim == 0 {
-            return Err("head_dim must be > 0".into());
+            return Err(KernelError::InvalidShape(
+                "AttentionConfig: head_dim must be > 0".into(),
+            ));
+        }
+        if self.num_kv_heads == 0 {
+            return Err(KernelError::InvalidShape(
+                "AttentionConfig: num_kv_heads must be > 0".into(),
+            ));
+        }
+        if self.num_heads % self.num_kv_heads != 0 {
+            return Err(KernelError::InvalidShape(format!(
+                "AttentionConfig: num_heads ({}) must be divisible by num_kv_heads ({})",
+                self.num_heads, self.num_kv_heads
+            )));
         }
         Ok(())
     }
@@ -45,10 +51,11 @@ pub struct Attention {
 
 impl Attention {
     /// Config-only constructor (weights loaded later).
-    pub fn new(config: AttentionConfig) -> Self {
+    pub fn new(config: AttentionConfig) -> Result<Self, KernelError> {
+        config.validate()?;
         let hidden_size = config.num_heads * config.head_dim;
         let kv_size = config.num_kv_heads * config.head_dim;
-        Self {
+        Ok(Self {
             q_proj: Linear::new(LinearConfig {
                 in_features: hidden_size,
                 out_features: hidden_size,
@@ -70,7 +77,7 @@ impl Attention {
                 has_bias: false,
             }),
             config,
-        }
+        })
     }
 
     /// Create attention with pre-loaded projection layers.
@@ -80,14 +87,15 @@ impl Attention {
         k_proj: Linear,
         v_proj: Linear,
         o_proj: Linear,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, KernelError> {
+        config.validate()?;
+        Ok(Self {
             config,
             q_proj,
             k_proj,
             v_proj,
             o_proj,
-        }
+        })
     }
 
     /// Forward pass for multi-head attention.
@@ -213,9 +221,8 @@ impl Attention {
             Array::from_slice(dev, &vec![scale; seq_len * seq_len], vec![seq_len, seq_len]);
 
         let mut attn_outputs: Vec<Array> = Vec::with_capacity(num_heads);
-        for h in 0..num_heads {
+        for (h, q_h) in q_heads.iter().enumerate() {
             let kv_idx = h / repeats;
-            let q_h = &q_heads[h];
             let k_h = &k_heads[kv_idx];
             let v_h = &v_heads[kv_idx];
 

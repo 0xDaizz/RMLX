@@ -43,7 +43,7 @@ impl Array {
     pub fn from_slice<T: HasDType>(device: &metal::Device, data: &[T], shape: Vec<usize>) -> Self {
         let dtype = T::DTYPE;
         let numel: usize = shape.iter().product();
-        assert_eq!(
+        debug_assert_eq!(
             data.len(),
             numel,
             "data length ({}) does not match shape product ({})",
@@ -125,7 +125,7 @@ impl Array {
     /// # Safety
     /// The caller must ensure no GPU writes are in-flight to this buffer.
     pub unsafe fn to_vec<T: HasDType + Clone>(&self) -> Vec<T> {
-        assert_eq!(
+        debug_assert_eq!(
             T::DTYPE,
             self.dtype,
             "type mismatch: requested {:?} but array is {:?}",
@@ -186,24 +186,28 @@ impl Array {
 
     /// Create a view with a new shape (same buffer, zero-copy).
     /// The array must be contiguous and the total element count must match.
-    pub fn reshape(&self, new_shape: Vec<usize>) -> Self {
+    pub fn reshape(&self, new_shape: Vec<usize>) -> Result<Self, crate::kernels::KernelError> {
         let new_numel: usize = new_shape.iter().product();
-        assert_eq!(
-            self.numel(),
-            new_numel,
-            "reshape: element count mismatch ({} vs {})",
-            self.numel(),
-            new_numel
-        );
-        assert!(self.is_contiguous(), "reshape requires a contiguous array");
+        if self.numel() != new_numel {
+            return Err(crate::kernels::KernelError::InvalidShape(format!(
+                "reshape: element count mismatch ({} vs {})",
+                self.numel(),
+                new_numel
+            )));
+        }
+        if !self.is_contiguous() {
+            return Err(crate::kernels::KernelError::InvalidShape(
+                "reshape requires a contiguous array".into(),
+            ));
+        }
         let new_strides = compute_contiguous_strides(&new_shape);
-        Self {
+        Ok(Self {
             buffer: self.buffer.clone(),
             shape: new_shape,
             strides: new_strides,
             dtype: self.dtype,
             offset: self.offset,
-        }
+        })
     }
 
     /// Create a view with custom strides and offset (same buffer, zero-copy).
