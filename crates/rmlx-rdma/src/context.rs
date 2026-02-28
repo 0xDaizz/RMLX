@@ -11,6 +11,7 @@ pub struct RdmaContext {
     ctx: *mut IbvContext,
     device_name: String,
     lib: &'static IbverbsLib,
+    probe: Option<RdmaDeviceProbe>,
 }
 
 impl RdmaContext {
@@ -45,11 +46,39 @@ impl RdmaContext {
                 return Err(RdmaError::DeviceOpen(device_name));
             }
 
-            Ok(Self {
+            let mut rdma_ctx = Self {
                 ctx,
                 device_name,
                 lib,
-            })
+                probe: None,
+            };
+
+            // Probe device capabilities and store results
+            match RdmaDeviceProbe::probe(&rdma_ctx) {
+                Ok(p) => {
+                    eprintln!(
+                        "[rmlx-rdma] device '{}' probed: gid_index={}, max_mr_size={}, \
+                         max_qp_wr={}, max_cq_depth={}, mtu={}, max_msg_sz={}, gid_tbl_len={}",
+                        rdma_ctx.device_name,
+                        p.gid_index,
+                        p.max_mr_size,
+                        p.max_qp_wr,
+                        p.max_cq_depth,
+                        p.mtu,
+                        p.max_msg_sz,
+                        p.gid_tbl_len,
+                    );
+                    rdma_ctx.probe = Some(p);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[rmlx-rdma] device '{}' probe failed, using defaults: {e}",
+                        rdma_ctx.device_name,
+                    );
+                }
+            }
+
+            Ok(rdma_ctx)
         }
     }
 
@@ -66,6 +95,11 @@ impl RdmaContext {
     /// Reference to the loaded ibverbs library.
     pub(crate) fn lib(&self) -> &'static IbverbsLib {
         self.lib
+    }
+
+    /// Probed device capabilities, if available.
+    pub fn probe(&self) -> Option<&RdmaDeviceProbe> {
+        self.probe.as_ref()
     }
 
     /// Allocate a protection domain on this context.

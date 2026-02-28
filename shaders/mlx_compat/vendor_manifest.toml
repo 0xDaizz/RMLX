@@ -3,111 +3,131 @@
 
 [upstream]
 repo = "ml-explore/mlx"
-commit = "PLACEHOLDER"
+commit = "994a4ac24f8b82cbd24f11911ff2daef1deb4a15"
 license = "MIT"
 updated_at = "2026-02-28"
 
 [[files]]
 source_path = "mlx/backend/metal/kernels/bf16.h"
 dest_path = "bf16.h"
-sha256 = "PLACEHOLDER"
+sha256 = "abd87446a310b77ac530ef52a324feae5cb285d03ec9613e3a88ebb71410fdcb"
 
 [[files]]
 source_path = "mlx/backend/metal/kernels/bf16_math.h"
 dest_path = "bf16_math.h"
-sha256 = "PLACEHOLDER"
+sha256 = "1f374f8380f756eb89acf6a847741cb8fecbe642945e159fb6208d804cc06496"
 
 [[files]]
 source_path = "mlx/backend/metal/kernels/complex.h"
 dest_path = "complex.h"
-sha256 = "PLACEHOLDER"
+sha256 = "aa3d29a2a0bb31fc0071493e3ac917387f96ba059d10a8f371a0b6a41a216dd3"
 
 [[files]]
 source_path = "mlx/backend/metal/kernels/defines.h"
 dest_path = "defines.h"
-sha256 = "PLACEHOLDER"
+sha256 = "a2930dbd644c69c4b66a511a094034217f3c03f48e29a1613f601532150f9163"
 
 [[files]]
 source_path = "mlx/backend/metal/kernels/utils.h"
 dest_path = "utils.h"
-sha256 = "PLACEHOLDER"
+sha256 = "4e13fa2c3705c9f1f087794b5ab99fc2495f887661a21e283ebea2a0450dce2f"
+
+[[files]]
+source_path = "mlx/backend/metal/kernels/logging.h"
+dest_path = "logging.h"
+sha256 = "fae44781743dbc5eb727e505b090e8445adff5626c1179bcb193b6fe7bedac8f"
 
 [[files]]
 source_path = "mlx/backend/metal/kernels/copy.h"
 dest_path = "copy.h"
-sha256 = "PLACEHOLDER"
+sha256 = "faafc09afc5e190252f3544c966b333b503c30404be3836444abf645f615b1c8"
 
 [[files]]
 source_path = "mlx/backend/metal/kernels/binary.h"
 dest_path = "binary.h"
-sha256 = "PLACEHOLDER"
+sha256 = "9a367967a48907ac6792be685bab4cc062f3ad916cccacb441c627d87a4b7898"
 
 [[files]]
 source_path = "mlx/backend/metal/kernels/binary_ops.h"
 dest_path = "binary_ops.h"
-sha256 = "PLACEHOLDER"
+sha256 = "a3dd96bde609b3e91f1635f61c8a7477e0a111dc3c0beefefe0561d70629f91b"
 
 [[files]]
 source_path = "mlx/backend/metal/kernels/reduce_utils.h"
 dest_path = "reduce_utils.h"
-sha256 = "PLACEHOLDER"
+sha256 = "30c501dd0dc694aaa88eb1f8a0ae44708d63ed6388fdc0c6f62b3bdf6aa838ff"
+
+[[files]]
+source_path = "mlx/backend/metal/kernels/reduce.h"
+dest_path = "reduce.h"
+sha256 = "a779285825e449bf14099ea9eff807eabd4d6dad20a07b88d128f4943e12b95f"
 
 [[files]]
 source_path = "mlx/backend/metal/kernels/atomic.h"
 dest_path = "atomic.h"
-sha256 = "PLACEHOLDER"
+sha256 = "8f8ffb25e235ae730d5ae5ccd38fe48a1172b9bc3ccd0bdba2789e8d4c20bddf"
 
 [[files]]
 source_path = "mlx/backend/metal/kernels/reduction/ops.h"
 dest_path = "reduction/ops.h"
-sha256 = "PLACEHOLDER"
+sha256 = "f131776a2c8d61865b511639aa549fe116ed8775a9772cede3e769134d454795"
 
 [[files]]
 source_path = "mlx/backend/metal/kernels/reduction/reduce_all.h"
 dest_path = "reduction/reduce_all.h"
-sha256 = "PLACEHOLDER"
+sha256 = "9408c7fdb822c1358388eeb3e94d7e927507ec7adef2437d1ae3026846be5c28"
 
 [[files]]
 source_path = "mlx/backend/metal/kernels/reduction/reduce_col.h"
 dest_path = "reduction/reduce_col.h"
-sha256 = "PLACEHOLDER"
+sha256 = "62dde467e6d7121dc88c550ec31ead495caf3699525d9ca55f967a3a9e2fb30f"
 
 [[files]]
 source_path = "mlx/backend/metal/kernels/reduction/reduce_row.h"
 dest_path = "reduction/reduce_row.h"
-sha256 = "PLACEHOLDER"
+sha256 = "77cc7ac618640e02bc52a36b52955f959e121341f91b3b50544ce2e400312f37"
+
+[[files]]
+source_path = "mlx/backend/metal/kernels/reduction/reduce_init.h"
+dest_path = "reduction/reduce_init.h"
+sha256 = "c5ef9c65886f9aba64a5df03607cf175950fd99237ca068bd6fcaec72d63d519"
 
 [[files]]
 source_path = "mlx/backend/metal/kernels/softmax.h"
 dest_path = "softmax.h"
-sha256 = "PLACEHOLDER"
+sha256 = "cb233fe42a7358f5f658c9a1ef52cd2ee9dd3786ddfad01793a976d58f4d4051"
 
 [[files]]
 source_path = "mlx/backend/metal/kernels/rms_norm.metal"
 dest_path = "rms_norm.metal"
-sha256 = "PLACEHOLDER"
+sha256 = "864bada3c1843299caf4a4af0fe968794b794114d1e5adbfea9ac64eac29d838"
 
 [[files]]
 source_path = "mlx/backend/metal/kernels/rope.metal"
 dest_path = "rope.metal"
-sha256 = "PLACEHOLDER"
+sha256 = "bf8f4c46cdd1375c530ab87743cf3e39d8a1df3a6c24c353dd5e039e5d8baba0"
 
 [[files]]
 source_path = "mlx/backend/metal/kernels/gemv.metal"
 dest_path = "gemv.metal"
-sha256 = "PLACEHOLDER"
+sha256 = "4eb18cd80eb8b5f0a113779705682f3d7a2660035c148dabe06619ee36c44a33"
 
 [[files]]
 source_path = "mlx/backend/metal/kernels/gemv_masked.metal"
 dest_path = "gemv_masked.metal"
-sha256 = "PLACEHOLDER"
+sha256 = "2be73f10c5dcd6b32c644e0606f66a458f7f48f3d24fc6bf581ae43f361c09b6"
+
+[[files]]
+source_path = "mlx/backend/metal/kernels/gemv_masked.h"
+dest_path = "gemv_masked.h"
+sha256 = "320f11e643edf3c11b8aa0c168d886ea98878669682cbbfbdf1e073eda7ddd70"
 
 [[files]]
 source_path = "mlx/backend/metal/kernels/steel/utils.h"
 dest_path = "steel/utils.h"
-sha256 = "PLACEHOLDER"
+sha256 = "d4c36298145d1c5617a94f07dbfabf6ac932afe2fd7ea0c9291f1fb385c5404a"
 
 [[files]]
 source_path = "mlx/backend/metal/kernels/steel/defines.h"
 dest_path = "steel/defines.h"
-sha256 = "PLACEHOLDER"
+sha256 = "b03cea6a7d5cfe814e6838d8536e2aacdcafd2744cb408e954fda336ce21759a"

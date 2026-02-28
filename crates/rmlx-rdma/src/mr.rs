@@ -6,8 +6,8 @@ use crate::context::ProtectionDomain;
 use crate::ffi::{access_flags, IbvMr, IbverbsLib};
 use crate::RdmaError;
 
-/// TB5 maximum MR size (16 MB hardware limit).
-const MAX_MR_SIZE: usize = 16 * 1024 * 1024;
+/// Default TB5 maximum MR size (16 MB hardware limit, used when probe is unavailable).
+pub const DEFAULT_MAX_MR_SIZE: usize = 16 * 1024 * 1024;
 
 /// RDMA memory region — wraps ibv_mr.
 /// Deregisters the MR on drop.
@@ -27,9 +27,23 @@ impl MemoryRegion {
         ptr: *mut c_void,
         size: usize,
     ) -> Result<Self, RdmaError> {
-        if size > MAX_MR_SIZE {
+        Self::register_with_limit(pd, ptr, size, DEFAULT_MAX_MR_SIZE)
+    }
+
+    /// Register a memory region with a specific max_mr_size limit.
+    ///
+    /// # Safety
+    /// - `ptr` must be valid for `size` bytes
+    /// - The memory must remain valid until this MR is dropped
+    pub unsafe fn register_with_limit(
+        pd: &ProtectionDomain,
+        ptr: *mut c_void,
+        size: usize,
+        max_mr_size: usize,
+    ) -> Result<Self, RdmaError> {
+        if size > max_mr_size {
             return Err(RdmaError::MrReg(format!(
-                "size {size} exceeds TB5 max_mr_size ({MAX_MR_SIZE})"
+                "size {size} exceeds max_mr_size ({max_mr_size})"
             )));
         }
         let flags = access_flags::LOCAL_WRITE | access_flags::REMOTE_WRITE;

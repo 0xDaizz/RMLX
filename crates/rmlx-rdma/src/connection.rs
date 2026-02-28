@@ -189,7 +189,7 @@ impl RdmaConnection {
         let cq = CompletionQueue::new(&ctx)?;
 
         // 2. Create UC Queue Pair
-        let mut qp = QueuePair::create_uc(&pd, &cq)?;
+        let mut qp = QueuePair::create_uc(&pd, &cq, &ctx)?;
         qp.query_local_info(&ctx, config.rank)?;
 
         // 3. Exchange QP info via TCP
@@ -213,6 +213,9 @@ impl RdmaConnection {
 
     /// Register a memory region for RDMA operations.
     ///
+    /// Uses probed `max_mr_size` from the device if available, otherwise
+    /// falls back to `DEFAULT_MAX_MR_SIZE`.
+    ///
     /// # Safety
     /// `ptr` must be valid for `size` bytes and must remain valid until the
     /// returned `MemoryRegion` is dropped.
@@ -221,8 +224,13 @@ impl RdmaConnection {
         ptr: *mut c_void,
         size: usize,
     ) -> Result<MemoryRegion, RdmaError> {
+        let max_mr_size = self
+            .ctx
+            .probe()
+            .map(|p| p.max_mr_size)
+            .unwrap_or(crate::mr::DEFAULT_MAX_MR_SIZE);
         // SAFETY: Caller guarantees ptr is valid for size bytes.
-        MemoryRegion::register(&self._pd, ptr, size)
+        MemoryRegion::register_with_limit(&self._pd, ptr, size, max_mr_size)
     }
 
     /// Post a send operation (IBV_WR_SEND).

@@ -1,17 +1,7 @@
-// Copyright (c) 2023 ml-explore. MIT License.
-// Vendored from ml-explore/mlx — Steel GEMM library
-// STUB: Replace with vendored content from ml-explore/mlx
+// Copyright © 2024 Apple Inc.
 
-#ifndef MLX_STEEL_DEFINES_H
-#define MLX_STEEL_DEFINES_H
+#pragma once
 
-// Stub: Steel GEMM compile-time constants and macros
-// Full implementation requires vendoring from ml-explore/mlx
-
-#define STEEL_TGROUPM 32
-#define STEEL_TGROUPN 32
-#define STEEL_BM 32
-#define STEEL_BN 32
-#define STEEL_BK 16
-
-#endif // MLX_STEEL_DEFINES_H
+#define STEEL_CONST static constant constexpr const
+#define STEEL_PRAGMA_UNROLL _Pragma("clang loop unroll(full)")
+#define STEEL_PRAGMA_NO_UNROLL _Pragma("clang loop unroll(disable)")

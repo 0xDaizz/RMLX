@@ -102,6 +102,80 @@ impl Group {
     pub fn contains(&self, rank: u32) -> bool {
         self.ranks.contains(&rank)
     }
+
+    // ─── Collective operations ───
+    // All collectives call ensure_materialized() at entry.
+    // In debug builds, unmaterialized data causes a panic.
+    // In release builds, a DistributedError::NotMaterialized is returned.
+
+    /// All-reduce: sum (or other reduction) across all ranks.
+    pub fn allreduce(&self, data: &[u8]) -> Result<Vec<u8>, DistributedError> {
+        Self::check_materialized("allreduce", data)?;
+        // Stub: in single-process mode, the result is the input unchanged.
+        Ok(data.to_vec())
+    }
+
+    /// All-gather: gather data from all ranks into every rank.
+    pub fn allgather(&self, data: &[u8]) -> Result<Vec<u8>, DistributedError> {
+        Self::check_materialized("allgather", data)?;
+        // Stub: single-process returns just the local data repeated.
+        Ok(data.to_vec())
+    }
+
+    /// Broadcast: root rank sends data to all other ranks.
+    pub fn broadcast(&self, data: &[u8], _root: u32) -> Result<Vec<u8>, DistributedError> {
+        Self::check_materialized("broadcast", data)?;
+        Ok(data.to_vec())
+    }
+
+    /// Send data to a specific peer rank.
+    pub fn send(&self, data: &[u8], _dst_rank: u32) -> Result<(), DistributedError> {
+        Self::check_materialized("send", data)?;
+        // Stub: no-op in single-process mode.
+        Ok(())
+    }
+
+    /// Receive data from a specific peer rank.
+    pub fn recv(&self, _src_rank: u32, len: usize) -> Result<Vec<u8>, DistributedError> {
+        if len == 0 {
+            return Err(DistributedError::NotMaterialized(
+                "recv: requested zero-length buffer".to_string(),
+            ));
+        }
+        // Stub: return zeroed buffer of the expected length.
+        Ok(vec![0u8; len])
+    }
+
+    /// All-to-all: each rank sends a distinct chunk to every other rank.
+    pub fn all_to_all(&self, data: &[u8]) -> Result<Vec<u8>, DistributedError> {
+        Self::check_materialized("all_to_all", data)?;
+        Ok(data.to_vec())
+    }
+
+    /// Internal helper: validate data is materialized before a collective.
+    ///
+    /// In debug builds (`#[cfg(debug_assertions)]`), unmaterialized data
+    /// causes a panic for fast failure during development.
+    /// In release builds, returns `DistributedError::NotMaterialized`.
+    fn check_materialized(op_name: &str, data: &[u8]) -> Result<(), DistributedError> {
+        let shapes = [(data.len(), data.len())];
+        let result = ensure_materialized(&shapes);
+        if let Err(e) = result {
+            #[cfg(debug_assertions)]
+            {
+                panic!(
+                    "{op_name}: data not materialized — {e}. \
+                     All buffers must contain valid data before collective operations."
+                );
+            }
+            #[cfg(not(debug_assertions))]
+            {
+                let _ = op_name;
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl fmt::Display for Group {

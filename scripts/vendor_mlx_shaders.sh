@@ -1,53 +1,102 @@
 #!/bin/bash
 # vendor_mlx_shaders.sh — Idempotent MLX shader vendoring script
-# Usage: ./scripts/vendor_mlx_shaders.sh [--dry-run]
-# Downloads and verifies MLX Metal shaders from ml-explore/mlx
+# Usage: ./scripts/vendor_mlx_shaders.sh [--dry-run] [--mlx-dir /path/to/mlx]
+# Copies Metal shaders from a local mlx checkout, fixes include paths,
+# and verifies SHA256 against vendor_manifest.toml.
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 DEST_DIR="$ROOT_DIR/shaders/mlx_compat"
 MANIFEST="$DEST_DIR/vendor_manifest.toml"
+MLX_DIR="${MLX_DIR:-$HOME/mlx}"
+MLX_KERNELS="$MLX_DIR/mlx/backend/metal/kernels"
 
 DRY_RUN=false
-if [[ "${1:-}" == "--dry-run" ]]; then
-    DRY_RUN=true
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run)  DRY_RUN=true ;;
+        --mlx-dir=*) MLX_DIR="${arg#--mlx-dir=}"; MLX_KERNELS="$MLX_DIR/mlx/backend/metal/kernels" ;;
+    esac
+done
+
+if $DRY_RUN; then
     echo "[DRY-RUN] No files will be modified"
 fi
 
 echo "=== MLX Shader Vendoring ==="
+echo "Source:      $MLX_KERNELS"
 echo "Destination: $DEST_DIR"
-echo "Manifest: $MANIFEST"
+echo "Manifest:    $MANIFEST"
+
+if [[ ! -d "$MLX_KERNELS" ]]; then
+    echo "ERROR: MLX kernel directory not found at $MLX_KERNELS"
+    echo "Set MLX_DIR or pass --mlx-dir=/path/to/mlx"
+    exit 1
+fi
 
 if [[ ! -f "$MANIFEST" ]]; then
     echo "ERROR: vendor_manifest.toml not found at $MANIFEST"
     exit 1
 fi
 
-# In production: clone/download from upstream, verify hashes, copy files
-# For now: verify existing stub files match manifest structure
-
+# Get upstream commit SHA
+UPSTREAM_SHA=$(cd "$MLX_DIR" && git rev-parse HEAD)
+echo "Upstream commit: $UPSTREAM_SHA"
 echo ""
-echo "Checking manifest entries..."
 
-MISSING=0
-while IFS= read -r dest; do
-    dest=$(echo "$dest" | tr -d '"' | xargs)
-    if [[ -z "$dest" ]]; then continue; fi
-    if [[ ! -f "$DEST_DIR/$dest" ]]; then
-        echo "  MISSING: $dest"
-        MISSING=$((MISSING + 1))
-    else
-        echo "  OK: $dest"
+fix_includes() {
+    # Rewrite MLX-style includes to local relative includes
+    sed 's|#include "mlx/backend/metal/kernels/|#include "|g' "$1"
+}
+
+# Parse manifest for dest_path entries
+ERRORS=0
+VENDORED=0
+
+while IFS= read -r line; do
+    # Extract source_path and dest_path from manifest
+    source_rel=$(echo "$line" | cut -d'|' -f1)
+    dest_rel=$(echo "$line" | cut -d'|' -f2)
+    expected_sha=$(echo "$line" | cut -d'|' -f3)
+
+    src_file="$MLX_KERNELS/${source_rel#mlx/backend/metal/kernels/}"
+    dst_file="$DEST_DIR/$dest_rel"
+
+    if [[ ! -f "$src_file" ]]; then
+        echo "  MISSING upstream: $src_file"
+        ERRORS=$((ERRORS + 1))
+        continue
     fi
-done < <(grep '^dest_path' "$MANIFEST" | cut -d'=' -f2)
+
+    if $DRY_RUN; then
+        echo "  [DRY-RUN] Would vendor: $dest_rel"
+    else
+        mkdir -p "$(dirname "$dst_file")"
+        fix_includes "$src_file" > "$dst_file"
+
+        # Verify SHA256
+        actual_sha=$(shasum -a 256 "$dst_file" | cut -d' ' -f1)
+        if [[ "$expected_sha" != "PLACEHOLDER" ]] && [[ -n "$expected_sha" ]] && [[ "$actual_sha" != "$expected_sha" ]]; then
+            echo "  WARN: SHA mismatch for $dest_rel (expected=$expected_sha actual=$actual_sha)"
+        fi
+        echo "  OK: $dest_rel ($actual_sha)"
+    fi
+    VENDORED=$((VENDORED + 1))
+done < <(
+    # Parse manifest: extract source_path, dest_path, sha256 triples
+    paste -d'|' \
+        <(grep '^source_path' "$MANIFEST" | cut -d'"' -f2) \
+        <(grep '^dest_path' "$MANIFEST" | cut -d'"' -f2) \
+        <(grep '^sha256' "$MANIFEST" | cut -d'"' -f2)
+)
 
 echo ""
-if [[ $MISSING -gt 0 ]]; then
-    echo "WARNING: $MISSING files listed in manifest are missing"
+echo "Vendored $VENDORED files ($ERRORS errors)"
+
+if [[ $ERRORS -gt 0 ]]; then
+    echo "ERROR: Some files could not be vendored"
     exit 1
-else
-    echo "All manifest entries present."
 fi
 
-echo "Vendoring complete (stub mode — replace with actual upstream fetch)"
+echo "Done."

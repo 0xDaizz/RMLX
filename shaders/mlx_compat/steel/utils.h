@@ -1,13 +1,42 @@
-// Copyright (c) 2023 ml-explore. MIT License.
-// Vendored from ml-explore/mlx — Steel GEMM library
-// STUB: Replace with vendored content from ml-explore/mlx
+// Copyright © 2024 Apple Inc.
 
-#ifndef MLX_STEEL_UTILS_H
-#define MLX_STEEL_UTILS_H
+#pragma once
 
-#include "../defines.h"
+#include <metal_stdlib>
 
-// Stub: Steel GEMM utility types and functions
-// Full implementation requires vendoring from ml-explore/mlx
+METAL_FUNC ulong2 elem_to_loc_broadcast(
+    uint elem,
+    constant const int* shape,
+    constant const int64_t* a_strides,
+    constant const int64_t* b_strides,
+    int ndim) {
+  ulong loc_a{0};
+  ulong loc_b{0};
+  for (int i = ndim - 1; i >= 0 && elem > 0; --i) {
+    int pos_in_dim = (elem % shape[i]);
+    elem /= shape[i];
+    loc_a += pos_in_dim * a_strides[i];
+    loc_b += pos_in_dim * b_strides[i];
+  }
+  return ulong2(loc_a, loc_b);
+}
 
-#endif // MLX_STEEL_UTILS_H
+METAL_FUNC ulong3 elem_to_loc_broadcast(
+    uint elem,
+    constant const int* shape,
+    constant const int64_t* a_strides,
+    constant const int64_t* b_strides,
+    constant const int64_t* c_strides,
+    int ndim) {
+  ulong loc_a{0};
+  ulong loc_b{0};
+  ulong loc_c{0};
+  for (int i = ndim - 1; i >= 0 && elem > 0; --i) {
+    int pos_in_dim = (elem % shape[i]);
+    elem /= shape[i];
+    loc_a += pos_in_dim * a_strides[i];
+    loc_b += pos_in_dim * b_strides[i];
+    loc_c += pos_in_dim * c_strides[i];
+  }
+  return ulong3(loc_a, loc_b, loc_c);
+}

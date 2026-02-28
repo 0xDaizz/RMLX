@@ -1,6 +1,7 @@
 //! rmlx-alloc — GPU memory allocator for RMLX
 
 pub mod allocator;
+pub mod buffer_pool;
 pub mod cache;
 pub mod leak_detector;
 pub mod stats;

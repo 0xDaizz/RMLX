@@ -11,12 +11,12 @@ use crate::context::{ProtectionDomain, RdmaContext};
 use crate::ffi::*;
 use crate::RdmaError;
 
-/// TB5-specific constants
+/// TB5-specific default constants (used as fallback when probe is unavailable)
 pub const IB_PORT: u8 = 1;
-pub const GID_INDEX: c_int = 1;
-pub const CQ_DEPTH: c_int = 8192;
-pub const MAX_SEND_WR: u32 = 8192;
-pub const MAX_RECV_WR: u32 = 8192;
+pub const DEFAULT_GID_INDEX: c_int = 1;
+pub const DEFAULT_CQ_DEPTH: c_int = 8192;
+pub const DEFAULT_MAX_SEND_WR: u32 = 8192;
+pub const DEFAULT_MAX_RECV_WR: u32 = 8192;
 pub const MAX_SEND_SGE: u32 = 1;
 pub const MAX_RECV_SGE: u32 = 1;
 
@@ -31,12 +31,19 @@ pub struct CompletionQueue {
 
 impl CompletionQueue {
     /// Create a new completion queue on the given RDMA context.
+    ///
+    /// Uses probed `max_cq_depth` from the device if available, otherwise
+    /// falls back to `DEFAULT_CQ_DEPTH`.
     pub fn new(ctx: &RdmaContext) -> Result<Self, RdmaError> {
         let lib = ctx.lib();
+        let cq_depth = ctx
+            .probe()
+            .map(|p| p.max_cq_depth as c_int)
+            .unwrap_or(DEFAULT_CQ_DEPTH);
         // SAFETY: ctx.raw() is a valid ibv_context pointer obtained from ibv_open_device.
         // We pass null for the completion channel and user context since we poll manually.
         let cq =
-            unsafe { (lib.create_cq)(ctx.raw(), CQ_DEPTH, ptr::null_mut(), ptr::null_mut(), 0) };
+            unsafe { (lib.create_cq)(ctx.raw(), cq_depth, ptr::null_mut(), ptr::null_mut(), 0) };
         if cq.is_null() {
             return Err(RdmaError::CqCreate);
         }
@@ -88,12 +95,30 @@ pub struct QueuePair {
     qp: *mut IbvQp,
     lib: &'static IbverbsLib,
     local_info: QpInfo,
+    gid_index: c_int,
+    mtu: u32,
 }
 
 impl QueuePair {
     /// Create a UC Queue Pair in RESET state.
-    pub fn create_uc(pd: &ProtectionDomain, cq: &CompletionQueue) -> Result<Self, RdmaError> {
+    ///
+    /// Uses probed `max_qp_wr` from the device if available, otherwise
+    /// falls back to `DEFAULT_MAX_SEND_WR` / `DEFAULT_MAX_RECV_WR`.
+    pub fn create_uc(
+        pd: &ProtectionDomain,
+        cq: &CompletionQueue,
+        ctx: &RdmaContext,
+    ) -> Result<Self, RdmaError> {
         let lib = pd.lib();
+
+        let max_send_wr = ctx
+            .probe()
+            .map(|p| p.max_qp_wr)
+            .unwrap_or(DEFAULT_MAX_SEND_WR);
+        let max_recv_wr = ctx
+            .probe()
+            .map(|p| p.max_qp_wr)
+            .unwrap_or(DEFAULT_MAX_RECV_WR);
 
         // SAFETY: We zero-initialize the struct and fill in all required fields.
         let mut init_attr: IbvQpInitAttr = unsafe { std::mem::zeroed() };
@@ -101,8 +126,8 @@ impl QueuePair {
         init_attr.recv_cq = cq.raw();
         init_attr.qp_type = qp_type::UC;
         init_attr.sq_sig_all = 1;
-        init_attr.cap.max_send_wr = MAX_SEND_WR;
-        init_attr.cap.max_recv_wr = MAX_RECV_WR;
+        init_attr.cap.max_send_wr = max_send_wr;
+        init_attr.cap.max_recv_wr = max_recv_wr;
         init_attr.cap.max_send_sge = MAX_SEND_SGE;
         init_attr.cap.max_recv_sge = MAX_RECV_SGE;
 
@@ -115,6 +140,12 @@ impl QueuePair {
         // SAFETY: qp is a valid ibv_qp pointer with accessible qp_num field.
         let qpn = unsafe { (*qp).qp_num };
 
+        let gid_index = ctx
+            .probe()
+            .map(|p| p.gid_index as c_int)
+            .unwrap_or(DEFAULT_GID_INDEX);
+        let mtu = ctx.probe().map(|p| p.mtu).unwrap_or(mtu::MTU_1024);
+
         Ok(Self {
             qp,
             lib,
@@ -124,6 +155,8 @@ impl QueuePair {
                 psn: 0,         // filled by query_local_info
                 gid: [0u8; 16], // filled by query_local_info
             },
+            gid_index,
+            mtu,
         })
     }
 
@@ -131,8 +164,13 @@ impl QueuePair {
     ///
     /// Must be called before exchanging QP info with the remote peer.
     /// PSN is computed as `rank * 1000 + 42` per TB5 convention.
+    /// Uses probed GID index if available, otherwise falls back to `DEFAULT_GID_INDEX`.
     pub fn query_local_info(&mut self, ctx: &RdmaContext, rank: u32) -> Result<(), RdmaError> {
         let lib = self.lib;
+        let gid_index = ctx
+            .probe()
+            .map(|p| p.gid_index as c_int)
+            .unwrap_or(DEFAULT_GID_INDEX);
 
         // Query port for LID
         // SAFETY: ctx.raw() is valid, port_attr is zero-initialized and passed by mutable ref.
@@ -142,10 +180,10 @@ impl QueuePair {
             return Err(RdmaError::QpModify(format!("ibv_query_port failed: {ret}")));
         }
 
-        // Query GID at index 1 (RoCE on TB5 uses GID index 1, not 0)
+        // Query GID at probed index (RoCE on TB5 typically uses GID index 1, not 0)
         // SAFETY: ctx.raw() is valid, gid is zero-initialized.
         let mut gid: IbvGid = unsafe { std::mem::zeroed() };
-        let ret = unsafe { (lib.query_gid)(ctx.raw(), IB_PORT, GID_INDEX, &mut gid) };
+        let ret = unsafe { (lib.query_gid)(ctx.raw(), IB_PORT, gid_index, &mut gid) };
         if ret != 0 {
             return Err(RdmaError::QpModify(format!("ibv_query_gid failed: {ret}")));
         }
@@ -201,7 +239,7 @@ impl QueuePair {
         // SAFETY: attr is zero-initialized, all required fields for RTR are set.
         let mut attr: IbvQpAttr = unsafe { std::mem::zeroed() };
         attr.qp_state = qp_state::RTR;
-        attr.path_mtu = mtu::MTU_1024;
+        attr.path_mtu = self.mtu;
         attr.dest_qp_num = remote.qpn;
         attr.rq_psn = remote.psn;
 
@@ -218,7 +256,7 @@ impl QueuePair {
             gid.raw = remote.gid;
             gid
         };
-        attr.ah_attr.grh.sgid_index = GID_INDEX as u8;
+        attr.ah_attr.grh.sgid_index = self.gid_index as u8;
         attr.ah_attr.grh.hop_limit = 1;
         attr.ah_attr.grh.traffic_class = 0;
 

@@ -1,40 +1,16 @@
-// Copyright (c) 2023 ml-explore. MIT License.
-// Vendored from ml-explore/mlx
-// STUB: Replace with vendored content from ml-explore/mlx
+// Copyright © 2023 Apple Inc.
 
-#ifndef MLX_BF16_H
-#define MLX_BF16_H
+#pragma once
 
-struct _MLX_BFloat16;
+#include <metal_stdlib>
 
-template <typename T>
-static constexpr bool can_convert_to_bfloat16 =
-    !is_same_v<T, _MLX_BFloat16> && is_convertible_v<T, float>;
+using namespace metal;
 
-template <typename T>
-static constexpr bool can_convert_from_bfloat16 =
-    !is_same_v<T, _MLX_BFloat16> && is_convertible_v<float, T>;
+typedef bfloat bfloat16_t;
+inline uint16_t bfloat16_to_uint16(const bfloat16_t x) {
+  return as_type<uint16_t>(x);
+}
 
-struct _MLX_BFloat16 {
-  ushort bits_;
-
-  _MLX_BFloat16() thread = default;
-  _MLX_BFloat16() threadgroup = default;
-  _MLX_BFloat16() device = default;
-  _MLX_BFloat16() constant = default;
-
-  constexpr _MLX_BFloat16(float v, int) thread : bits_(as_type<ushort2>(v).y) {}
-
-  explicit _MLX_BFloat16(float v) thread : bits_(as_type<ushort2>(v).y) {}
-
-  operator float() const thread { return as_type<float>(ushort2(0, bits_)); }
-  operator float() const threadgroup {
-    return as_type<float>(ushort2(0, bits_));
-  }
-  operator float() const device { return as_type<float>(ushort2(0, bits_)); }
-  operator float() const constant { return as_type<float>(ushort2(0, bits_)); }
-};
-
-typedef _MLX_BFloat16 bfloat16_t;
-
-#endif // MLX_BF16_H
+inline bfloat16_t uint16_to_bfloat16(const uint16_t x) {
+  return as_type<bfloat16_t>(x);
+}
