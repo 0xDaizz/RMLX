@@ -7,6 +7,7 @@ pub mod event;
 pub mod library;
 pub mod pipeline;
 pub mod queue;
+pub mod self_check;
 pub mod stream;
 
 // Re-export metal crate for downstream users

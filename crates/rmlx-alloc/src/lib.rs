@@ -2,6 +2,7 @@
 
 pub mod allocator;
 pub mod cache;
+pub mod leak_detector;
 pub mod stats;
 pub mod zero_copy;
 

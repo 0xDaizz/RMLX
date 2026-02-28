@@ -7,6 +7,7 @@ pub mod ffi;
 pub mod mr;
 pub mod multi_port;
 pub mod qp;
+pub mod rdma_metrics;
 
 use std::fmt;
 
