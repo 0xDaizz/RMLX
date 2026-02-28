@@ -1,0 +1,225 @@
+use std::ptr::NonNull;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use rmlx_metal::device::GpuDevice;
+use rmlx_metal::metal::Buffer as MetalBuffer;
+
+use crate::AllocError;
+
+/// Zero-copy buffer: page-aligned memory shared between CPU and Metal GPU.
+///
+/// Uses posix_memalign for allocation and Metal newBufferWithBytesNoCopy
+/// to create a GPU-visible view without any data copy.
+pub struct ZeroCopyBuffer {
+    raw_ptr: NonNull<u8>,
+    metal_buffer: MetalBuffer,
+    in_flight: Arc<()>,
+    size: usize,
+    _alignment: usize,
+}
+
+// SAFETY: The underlying buffer is StorageModeShared and the raw pointer
+// is owned by this struct. GPU access is synchronized via in-flight tokens.
+unsafe impl Send for ZeroCopyBuffer {}
+unsafe impl Sync for ZeroCopyBuffer {}
+
+impl ZeroCopyBuffer {
+    /// Allocate a zero-copy buffer of at least `size` bytes.
+    /// The actual allocation is page-aligned (typically 16KB on Apple Silicon).
+    pub fn new(device: &GpuDevice, size: usize) -> Result<Self, AllocError> {
+        let alignment = page_size();
+        let aligned_size = align_up(size, alignment);
+
+        // Step 1: Page-aligned allocation
+        let raw_ptr = unsafe {
+            // SAFETY: posix_memalign is called with valid alignment (power-of-2, >= sizeof(void*))
+            // and size. The resulting pointer is non-null on success.
+            let mut ptr: *mut libc::c_void = std::ptr::null_mut();
+            let ret = libc::posix_memalign(&mut ptr, alignment, aligned_size);
+            if ret != 0 {
+                return Err(AllocError::PosixMemalign(ret));
+            }
+            // SAFETY: ptr is valid for aligned_size bytes, just allocated.
+            // Zero-fill for safety.
+            std::ptr::write_bytes(ptr as *mut u8, 0, aligned_size);
+            NonNull::new(ptr as *mut u8).expect("posix_memalign returned null despite success")
+        };
+
+        // Step 2: Metal NoCopy buffer (StorageModeShared)
+        let metal_buffer = unsafe {
+            // SAFETY: raw_ptr is page-aligned, valid for aligned_size bytes,
+            // and will outlive the buffer (we own it and free in Drop).
+            rmlx_metal::buffer::new_buffer_no_copy(
+                device.raw(),
+                raw_ptr.as_ptr() as *mut std::ffi::c_void,
+                aligned_size as u64,
+            )
+        };
+
+        Ok(Self {
+            raw_ptr,
+            metal_buffer,
+            in_flight: Arc::new(()),
+            size: aligned_size,
+            _alignment: alignment,
+        })
+    }
+
+    /// The underlying Metal buffer (for GPU operations).
+    #[inline]
+    pub fn metal_buffer(&self) -> &MetalBuffer {
+        &self.metal_buffer
+    }
+
+    /// Raw pointer to the buffer contents.
+    #[inline]
+    pub fn as_ptr(&self) -> *const u8 {
+        self.raw_ptr.as_ptr()
+    }
+
+    /// Mutable raw pointer to the buffer contents.
+    #[inline]
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.raw_ptr.as_ptr()
+    }
+
+    /// Buffer size in bytes (page-aligned).
+    #[inline]
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// Acquire an in-flight token. The buffer cannot be freed while
+    /// any token is held. Use this before submitting GPU work or RDMA operations.
+    pub fn acquire_in_flight(&self) -> InFlightToken {
+        InFlightToken {
+            _guard: Arc::clone(&self.in_flight),
+        }
+    }
+
+    /// Acquire a completion fence for GPU/RDMA work tracking.
+    pub fn acquire_fence(&self, op_tag: &'static str) -> CompletionFence {
+        CompletionFence {
+            token: std::mem::ManuallyDrop::new(self.acquire_in_flight()),
+            op_tag,
+            verified: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Number of in-flight references (includes self).
+    /// Returns 1 when no external references are held.
+    pub fn in_flight_count(&self) -> usize {
+        Arc::strong_count(&self.in_flight)
+    }
+}
+
+impl Drop for ZeroCopyBuffer {
+    fn drop(&mut self) {
+        // Wait for all in-flight tokens to be released
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Arc::strong_count(&self.in_flight) > 1 {
+            if Instant::now() >= deadline {
+                let remaining = Arc::strong_count(&self.in_flight) - 1;
+                eprintln!(
+                    "[rmlx-alloc] CRITICAL: buffer {:p} drop timeout -- {} in-flight refs remaining. \
+                     Leaking memory to prevent use-after-free.",
+                    self.raw_ptr.as_ptr(), remaining
+                );
+                // Leak everything to prevent use-after-free.
+                // Replace raw_ptr with dangling so we skip the free below;
+                // the old pointer value is intentionally leaked.
+                let _ = std::mem::replace(&mut self.raw_ptr, NonNull::dangling());
+                return;
+            }
+            std::thread::yield_now();
+        }
+        // All in-flight work complete -- safe to free
+        // metal_buffer drop is automatic (NoCopy buffer doesn't free the memory)
+        // SAFETY: raw_ptr was allocated by posix_memalign and all GPU/RDMA
+        // work using this buffer has completed.
+        unsafe { libc::free(self.raw_ptr.as_ptr() as *mut libc::c_void) };
+    }
+}
+
+/// In-flight reference token. Prevents buffer deallocation while held.
+pub struct InFlightToken {
+    _guard: Arc<()>,
+}
+
+/// Completion fence -- ties buffer lifetime to hardware completion events.
+pub struct CompletionFence {
+    token: std::mem::ManuallyDrop<InFlightToken>,
+    op_tag: &'static str,
+    verified: Arc<AtomicBool>,
+}
+
+impl CompletionFence {
+    /// Tag identifying which operation holds this fence.
+    pub fn op_tag(&self) -> &'static str {
+        self.op_tag
+    }
+
+    /// Release after hardware completion verification.
+    /// Called by GpuCompletionHandler or CQ poller after confirming
+    /// the GPU/RDMA operation has actually completed.
+    pub fn release_after_verification(mut self) {
+        self.verified.store(true, Ordering::Release);
+        // SAFETY: We only call ManuallyDrop::drop once, right here,
+        // after verifying hardware completion.
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.token) };
+    }
+}
+
+impl Drop for CompletionFence {
+    fn drop(&mut self) {
+        if !self.verified.load(Ordering::Acquire) {
+            // Token is ManuallyDrop — not dropping it intentionally.
+            // The Arc<()> ref count stays elevated, preventing ZeroCopyBuffer::drop
+            // from freeing memory while GPU/RDMA work may still be in flight.
+            eprintln!(
+                "[rmlx-alloc] WARNING: CompletionFence for '{}' dropped without verification. \
+                 Leaking in-flight token to prevent use-after-free.",
+                self.op_tag
+            );
+        }
+        // If verified is true, token was already dropped in release_after_verification.
+        // If verified is false, we intentionally skip dropping the ManuallyDrop token.
+    }
+}
+
+/// Handles Metal command buffer completion -> fence release.
+pub struct GpuCompletionHandler {
+    fence: Option<CompletionFence>,
+}
+
+impl GpuCompletionHandler {
+    pub fn new(fence: CompletionFence) -> Self {
+        Self { fence: Some(fence) }
+    }
+
+    /// Called from Metal's completedHandler callback.
+    pub fn on_completed(&mut self) {
+        if let Some(fence) = self.fence.take() {
+            fence.release_after_verification();
+        }
+    }
+}
+
+/// Get the system page size (usually 16KB on Apple Silicon).
+pub(crate) fn page_size() -> usize {
+    // SAFETY: sysconf(_SC_PAGESIZE) is always safe to call.
+    let ps = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if ps > 0 {
+        ps as usize
+    } else {
+        16384
+    }
+}
+
+/// Round up `n` to the next multiple of `align`. `align` must be a power of 2.
+pub(crate) fn align_up(n: usize, align: usize) -> usize {
+    debug_assert!(align.is_power_of_two());
+    (n + align - 1) & !(align - 1)
+}

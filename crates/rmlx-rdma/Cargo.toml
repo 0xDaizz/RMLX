@@ -12,3 +12,4 @@ rdma = []
 [dependencies]
 rmlx-alloc = { path = "../rmlx-alloc" }
 libc = { workspace = true }
+libloading = { workspace = true }
