@@ -247,6 +247,15 @@ impl RdmaConnection {
         length: u32,
         wr_id: u64,
     ) -> Result<(), RdmaError> {
+        if (offset as u64) + (length as u64) > mr.length() as u64 {
+            return Err(RdmaError::InvalidArgument(format!(
+                "SGE out of bounds: offset({}) + length({}) > mr.length({})",
+                offset,
+                length,
+                mr.length()
+            )));
+        }
+
         let mut sge = IbvSge {
             addr: (mr.addr() as u64) + offset as u64,
             length,
@@ -273,6 +282,15 @@ impl RdmaConnection {
         length: u32,
         wr_id: u64,
     ) -> Result<(), RdmaError> {
+        if (offset as u64) + (length as u64) > mr.length() as u64 {
+            return Err(RdmaError::InvalidArgument(format!(
+                "SGE out of bounds: offset({}) + length({}) > mr.length({})",
+                offset,
+                length,
+                mr.length()
+            )));
+        }
+
         let mut sge = IbvSge {
             addr: (mr.addr() as u64) + offset as u64,
             length,
@@ -319,19 +337,24 @@ impl RdmaConnection {
         // Check backlog first for any previously stashed completions
         {
             let mut backlog = self.completion_backlog.borrow_mut();
+            let mut backlog_error: Option<RdmaError> = None;
             remaining.retain(|&wr_id| {
                 if let Some(pos) = backlog.iter().position(|wc| wc.wr_id == wr_id) {
                     let wc = backlog.swap_remove(pos);
                     if wc.status != wc_status::SUCCESS {
-                        // We'll catch this below after the loop — for now, keep it simple
-                        // and treat backlog hits as "found".
-                        return false; // remove from remaining
+                        backlog_error = Some(RdmaError::CqPoll(format!(
+                            "backlog: wr_id {} failed with status {}",
+                            wr_id, wc.status
+                        )));
                     }
-                    false // matched, remove from remaining
+                    false // found, remove from remaining
                 } else {
                     true // keep in remaining
                 }
             });
+            if let Some(err) = backlog_error {
+                return Err(err);
+            }
         }
 
         while !remaining.is_empty() {
@@ -441,3 +464,7 @@ impl RdmaConnection {
         self.ctx.device_name()
     }
 }
+
+// SAFETY: All inner types (RdmaContext, ProtectionDomain, CompletionQueue, QueuePair)
+// already implement Send. The RefCell<Vec<IbvWc>> is Send when IbvWc is Send (it is Copy).
+unsafe impl Send for RdmaConnection {}

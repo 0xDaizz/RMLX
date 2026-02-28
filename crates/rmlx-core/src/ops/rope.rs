@@ -89,6 +89,40 @@ pub fn rope(
     let seq_len = super::checked_u32(input.shape()[0], "seq_len")?;
     let head_dim = super::checked_u32(input.shape()[1], "head_dim")?;
 
+    // Validate freq table dimensions
+    let freq_rows_needed = seq_len as usize + offset as usize;
+    if cos_freqs.shape()[0] < freq_rows_needed {
+        return Err(KernelError::InvalidShape(format!(
+            "cos_freqs rows ({}) < seq_len ({}) + offset ({})",
+            cos_freqs.shape()[0],
+            seq_len,
+            offset
+        )));
+    }
+    if sin_freqs.shape()[0] < freq_rows_needed {
+        return Err(KernelError::InvalidShape(format!(
+            "sin_freqs rows ({}) < seq_len ({}) + offset ({})",
+            sin_freqs.shape()[0],
+            seq_len,
+            offset
+        )));
+    }
+    let half_dim = (head_dim / 2) as usize;
+    if cos_freqs.shape()[1] != half_dim {
+        return Err(KernelError::InvalidShape(format!(
+            "cos_freqs cols ({}) != head_dim/2 ({})",
+            cos_freqs.shape()[1],
+            half_dim
+        )));
+    }
+    if sin_freqs.shape()[1] != half_dim {
+        return Err(KernelError::InvalidShape(format!(
+            "sin_freqs cols ({}) != head_dim/2 ({})",
+            sin_freqs.shape()[1],
+            half_dim
+        )));
+    }
+
     let out = Array::zeros(registry.device().raw(), input.shape(), input.dtype());
 
     // Create constant buffers

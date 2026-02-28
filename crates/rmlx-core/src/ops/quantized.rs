@@ -95,6 +95,14 @@ pub fn quantized_matmul(
         }
     };
 
+    // Validate input vector dtype
+    if vec.dtype() != DType::Float32 {
+        return Err(KernelError::InvalidShape(format!(
+            "quantized_matmul requires Float32 input vec, got {:?}",
+            vec.dtype()
+        )));
+    }
+
     // Validate that in_features is block-aligned for the quantized dtype
     let block_sz = weights
         .dtype()
@@ -114,13 +122,26 @@ pub fn quantized_matmul(
         )));
     }
 
-    // Validate weights buffer size matches expected packed size
+    // Validate weights buffer size accounting for offset
     let expected_weight_bytes = weights.dtype().numel_to_bytes(out_features * in_features);
-    let actual_weight_bytes = weights.metal_buffer().length() as usize;
-    if actual_weight_bytes < expected_weight_bytes {
+    let available_bytes = weights.metal_buffer().length() as usize - weights.offset();
+    if available_bytes < expected_weight_bytes {
         return Err(KernelError::InvalidShape(format!(
-            "weights buffer too small: {} bytes < expected {} bytes for [{out_features}, {in_features}] {:?}",
-            actual_weight_bytes, expected_weight_bytes, weights.dtype()
+            "weights buffer too small: {} available bytes (buffer {} - offset {}) < expected {} bytes for [{out_features}, {in_features}] {:?}",
+            available_bytes, weights.metal_buffer().length(), weights.offset(), expected_weight_bytes, weights.dtype()
+        )));
+    }
+
+    // Validate vec buffer has enough space at its offset
+    let vec_needed = in_features * DType::Float32.size_of();
+    let vec_available = vec.metal_buffer().length() as usize - vec.offset();
+    if vec_available < vec_needed {
+        return Err(KernelError::InvalidShape(format!(
+            "vec buffer too small: {} available bytes (buffer {} - offset {}) < expected {} bytes",
+            vec_available,
+            vec.metal_buffer().length(),
+            vec.offset(),
+            vec_needed
         )));
     }
 

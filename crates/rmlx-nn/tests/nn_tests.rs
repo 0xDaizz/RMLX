@@ -203,3 +203,92 @@ fn test_linear_forward_no_weights_errors() {
     let result = linear.forward(&input, &registry, &queue);
     assert!(result.is_err(), "should fail when weights not loaded");
 }
+
+#[test]
+fn test_linear_forward_with_bias_batch1() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    // Weight: [2, 3] = [[1, 0, 0], [0, 1, 0]] — selects first 2 dims
+    let weight = Array::from_slice(dev, &[1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0], vec![2, 3]);
+    let bias = Array::from_slice(dev, &[10.0f32, 20.0], vec![2]);
+    let linear = Linear::from_arrays(
+        LinearConfig {
+            in_features: 3,
+            out_features: 2,
+            has_bias: true,
+        },
+        weight,
+        Some(bias),
+    );
+    // Input: [1, 3] = [[5, 6, 7]]
+    let input = Array::from_slice(dev, &[5.0f32, 6.0, 7.0], vec![1, 3]);
+    let output = linear
+        .forward(&input, &registry, &queue)
+        .expect("forward failed");
+    assert_eq!(output.shape(), &[1, 2]);
+    let vals: Vec<f32> = unsafe { output.to_vec() };
+    // output = [5, 6] + [10, 20] = [15, 26]
+    assert!(
+        (vals[0] - 15.0).abs() < 1e-3,
+        "bias batch1[0] = {} expected 15.0",
+        vals[0]
+    );
+    assert!(
+        (vals[1] - 26.0).abs() < 1e-3,
+        "bias batch1[1] = {} expected 26.0",
+        vals[1]
+    );
+}
+
+#[test]
+fn test_linear_forward_with_bias_batch2() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    // Weight: [2, 3] = [[1, 0, 0], [0, 1, 0]]
+    let weight = Array::from_slice(dev, &[1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0], vec![2, 3]);
+    let bias = Array::from_slice(dev, &[10.0f32, 20.0], vec![2]);
+    let linear = Linear::from_arrays(
+        LinearConfig {
+            in_features: 3,
+            out_features: 2,
+            has_bias: true,
+        },
+        weight,
+        Some(bias),
+    );
+    // Input: [2, 3] = [[5, 6, 7], [1, 2, 3]]
+    let input = Array::from_slice(dev, &[5.0f32, 6.0, 7.0, 1.0, 2.0, 3.0], vec![2, 3]);
+    let output = linear
+        .forward(&input, &registry, &queue)
+        .expect("forward failed");
+    assert_eq!(output.shape(), &[2, 2]);
+    let vals: Vec<f32> = unsafe { output.to_vec() };
+    // Row 0: [5, 6] + [10, 20] = [15, 26]
+    assert!(
+        (vals[0] - 15.0).abs() < 1e-3,
+        "bias batch2[0,0] = {} expected 15.0",
+        vals[0]
+    );
+    assert!(
+        (vals[1] - 26.0).abs() < 1e-3,
+        "bias batch2[0,1] = {} expected 26.0",
+        vals[1]
+    );
+    // Row 1: [1, 2] + [10, 20] = [11, 22]
+    assert!(
+        (vals[2] - 11.0).abs() < 1e-3,
+        "bias batch2[1,0] = {} expected 11.0",
+        vals[2]
+    );
+    assert!(
+        (vals[3] - 22.0).abs() < 1e-3,
+        "bias batch2[1,1] = {} expected 22.0",
+        vals[3]
+    );
+}

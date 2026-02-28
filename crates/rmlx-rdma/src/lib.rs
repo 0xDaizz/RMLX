@@ -40,6 +40,8 @@ pub enum RdmaError {
     Timeout(String),
     /// Feature not available (RDMA hardware missing)
     Unavailable(String),
+    /// Invalid argument (e.g. SGE out of bounds)
+    InvalidArgument(String),
 }
 
 impl fmt::Display for RdmaError {
@@ -58,6 +60,7 @@ impl fmt::Display for RdmaError {
             Self::ConnectionFailed(e) => write!(f, "connection failed: {e}"),
             Self::Timeout(e) => write!(f, "CQ poll timeout: {e}"),
             Self::Unavailable(e) => write!(f, "RDMA unavailable: {e}"),
+            Self::InvalidArgument(e) => write!(f, "invalid argument: {e}"),
         }
     }
 }
