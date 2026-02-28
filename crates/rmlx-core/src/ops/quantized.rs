@@ -6,9 +6,6 @@ use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
 
-/// Quantization group size (matches MLX convention).
-pub const GROUP_SIZE: usize = 32;
-
 /// Quantized block for Q4_0: 32 elements -> 18 bytes (2 bytes scale + 16 bytes data)
 #[repr(C)]
 pub struct BlockQ4_0 {
@@ -97,6 +94,17 @@ pub fn quantized_matmul(
             )))
         }
     };
+
+    // Validate that in_features is block-aligned for the quantized dtype
+    let block_sz = weights
+        .dtype()
+        .block_size()
+        .expect("quantized_matmul requires a quantized dtype");
+    if in_features % block_sz != 0 {
+        return Err(KernelError::NotFound(format!(
+            "in_features ({in_features}) must be a multiple of block_size ({block_sz})"
+        )));
+    }
 
     let pipeline = registry.get_pipeline(kernel_name, weights.dtype())?;
     let out = Array::zeros(registry.device().raw(), &[out_features], DType::Float32);

@@ -1,12 +1,15 @@
 //! Integration tests for rmlx-alloc
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use rmlx_alloc::allocator::MetalAllocator;
+use rmlx_alloc::buffer_pool::BufferPool;
 use rmlx_alloc::cache::BufferCache;
 use rmlx_alloc::stats::AllocStats;
-use rmlx_alloc::zero_copy::ZeroCopyBuffer;
+use rmlx_alloc::zero_copy::{CompletionTicket, ZeroCopyBuffer};
 use rmlx_metal::device::GpuDevice;
+use rmlx_metal::event::GpuEvent;
 
 /// Helper: acquire the system default Metal device or skip.
 fn require_gpu() -> Option<Arc<GpuDevice>> {
@@ -168,4 +171,160 @@ fn test_allocator_block_limit() {
     );
 
     allocator.free(buf);
+}
+
+// --- CompletionTicket + GpuEvent integration tests ---
+
+#[test]
+fn test_completion_ticket_basic_lifecycle() {
+    let ticket = CompletionTicket::new();
+
+    // Initially not complete
+    assert!(!ticket.is_safe_to_free());
+    assert!(!ticket.is_gpu_complete());
+    assert!(!ticket.is_rdma_complete());
+
+    // Mark GPU complete
+    ticket.mark_gpu_complete();
+    assert!(ticket.is_gpu_complete());
+    assert!(!ticket.is_safe_to_free()); // RDMA still pending
+
+    // Mark RDMA complete
+    ticket.mark_rdma_complete();
+    assert!(ticket.is_rdma_complete());
+    assert!(ticket.is_safe_to_free()); // Both done
+}
+
+#[test]
+fn test_completion_ticket_wait_all_complete() {
+    let ticket = CompletionTicket::new();
+
+    // Complete both before waiting
+    ticket.mark_gpu_complete();
+    ticket.mark_rdma_complete();
+
+    let result = ticket.wait_all_complete(Duration::from_millis(100));
+    assert!(result.is_ok());
+}
+
+#[test]
+fn test_completion_ticket_wait_timeout() {
+    let ticket = CompletionTicket::new();
+    // Neither completed -> should timeout
+    let result = ticket.wait_all_complete(Duration::from_millis(10));
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_completion_ticket_with_gpu_event() {
+    let device = match GpuDevice::system_default() {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("skipping test: no Metal device");
+            return;
+        }
+    };
+
+    let event = Arc::new(GpuEvent::new(device.raw()));
+    let mut ticket = CompletionTicket::new();
+    assert!(!ticket.has_gpu_event());
+
+    let signal_value = ticket.with_gpu_event(Arc::clone(&event));
+    assert!(ticket.has_gpu_event());
+    assert!(signal_value > 0);
+
+    // Not complete yet (event hasn't been signaled)
+    assert!(!ticket.is_safe_to_free());
+
+    // Mark gpu_complete via atomic flag (fallback path)
+    ticket.mark_gpu_complete();
+    assert!(ticket.is_gpu_complete());
+
+    // Still need RDMA
+    assert!(!ticket.is_safe_to_free());
+
+    ticket.mark_rdma_complete();
+    assert!(ticket.is_safe_to_free());
+}
+
+#[test]
+fn test_completion_ticket_clone_shared_state() {
+    let ticket = CompletionTicket::new();
+    let ticket2 = ticket.clone();
+
+    // Marking via one clone should be visible from the other
+    ticket.mark_gpu_complete();
+    assert!(ticket2.is_gpu_complete());
+
+    ticket2.mark_rdma_complete();
+    assert!(ticket.is_rdma_complete());
+    assert!(ticket.is_safe_to_free());
+}
+
+// --- BufferPool tests ---
+
+#[test]
+fn test_buffer_pool_basic() {
+    let device = match GpuDevice::system_default() {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("skipping test: no Metal device");
+            return;
+        }
+    };
+
+    let mut pool = BufferPool::new(4096, 4);
+    assert_eq!(pool.free_count(), 0);
+    assert_eq!(pool.pending_count(), 0);
+
+    // Acquire from empty pool -> allocates new buffer
+    let buf = pool.acquire(&device).expect("acquire");
+    assert!(buf.size() >= 4096);
+
+    // Release back to pool (no ticket -> safe to free -> goes to free list)
+    pool.release(buf);
+    assert_eq!(pool.free_count(), 1);
+
+    // Re-acquire should get the pooled buffer
+    let buf2 = pool.acquire(&device).expect("acquire2");
+    assert!(buf2.size() >= 4096);
+    assert_eq!(pool.free_count(), 0);
+
+    pool.release(buf2);
+}
+
+#[test]
+fn test_buffer_pool_pending_drain() {
+    let device = match GpuDevice::system_default() {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("skipping test: no Metal device");
+            return;
+        }
+    };
+
+    let mut pool = BufferPool::new(4096, 4);
+
+    // Allocate and attach an incomplete ticket
+    let mut buf = pool.acquire(&device).expect("acquire");
+    let ticket = CompletionTicket::new();
+    buf.set_ticket(ticket.clone());
+
+    // Release with incomplete ticket -> goes to pending
+    pool.release(buf);
+    assert_eq!(pool.free_count(), 0);
+    assert_eq!(pool.pending_count(), 1);
+
+    // Acquire triggers drain, but pending buffer is still not complete
+    let buf2 = pool.acquire(&device).expect("acquire2");
+    assert_eq!(pool.pending_count(), 1); // still pending
+
+    // Now complete the ticket
+    ticket.mark_gpu_complete();
+    ticket.mark_rdma_complete();
+
+    // Release buf2 and re-acquire -> drain should move completed to free
+    pool.release(buf2);
+    let _buf3 = pool.acquire(&device).expect("acquire3");
+    assert_eq!(pool.pending_count(), 0); // drained
 }

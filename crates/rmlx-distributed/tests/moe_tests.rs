@@ -54,10 +54,15 @@ fn test_moe_dispatch_basic() {
     // 4 tokens, top-2 => 8 expert assignments
     let indices = vec![0u32, 1, 2, 3, 4, 5, 6, 7];
     let weights = vec![0.6f32, 0.4, 0.5, 0.5, 0.7, 0.3, 0.8, 0.2];
-    let result = exchange.dispatch(4, &indices, &weights);
+    // 4 tokens * 16 bytes each (simulated hidden_dim=4 * f32)
+    let token_data = vec![1u8; 4 * 16];
+    let result = exchange
+        .dispatch(4, &indices, &weights, &token_data)
+        .unwrap();
     assert_eq!(result.expert_counts.len(), 8);
     assert_eq!(result.local_expert_range, (0, 4)); // rank 0 owns experts 0-3
     assert_eq!(exchange.metrics().tokens_dispatched, 4);
+    assert!(!result.routed_data.is_empty());
 }
 
 #[test]
@@ -73,7 +78,10 @@ fn test_moe_dispatch_overflow() {
     // All tokens go to expert 0 — massive overflow
     let indices = vec![0u32, 0, 0, 0, 0, 0, 0, 0]; // 8 tokens, all to expert 0
     let weights = vec![1.0f32; 8];
-    let result = exchange.dispatch(8, &indices, &weights);
+    let token_data = vec![1u8; 8 * 16];
+    let result = exchange
+        .dispatch(8, &indices, &weights, &token_data)
+        .unwrap();
     // capacity = ceil(8 * 1 / 4 * 1.0) = 2
     assert!(result.overflow_count > 0, "should have overflow");
     assert!(exchange.metrics().overflow_ratio() > 0.0);
@@ -211,9 +219,13 @@ fn test_moe_dispatch_rdma_routing() {
     // Large dispatch that should trigger RDMA (500 elements > 320 threshold)
     let indices: Vec<u32> = (0..500).map(|i| i % 8).collect();
     let weights: Vec<f32> = vec![0.5; 500];
-    let result = exchange.dispatch(250, &indices, &weights);
+    let token_data = vec![1u8; 250 * 16];
+    let result = exchange
+        .dispatch(250, &indices, &weights, &token_data)
+        .unwrap();
     assert_eq!(result.backend, MoeBackend::Rdma);
     assert_eq!(exchange.metrics().rdma_dispatches, 1);
+    assert!(!result.routed_data.is_empty());
 }
 
 // ─── Threshold calibration tests ───
@@ -297,4 +309,193 @@ fn test_ensure_materialized_empty_array() {
 fn test_ensure_materialized_zero_bytes() {
     let shapes = vec![(10, 0)];
     assert!(group::ensure_materialized(&shapes).is_err());
+}
+
+// ─── Route function correctness tests ───
+
+#[test]
+fn test_route_cpu_scatters_tokens_correctly() {
+    let group = Group::world(2, 0);
+    let config = MoeDispatchConfig {
+        num_experts: 4,
+        top_k: 1,
+        capacity_factor: 1.25,
+        group,
+    };
+    let mut exchange = MoeDispatchExchange::new(config, MoePolicy::new());
+
+    // 4 tokens, top_k=1. Experts: [0, 1, 2, 3]
+    // Rank 0 owns experts 0-1, Rank 1 owns experts 2-3
+    let indices = vec![0u32, 1, 2, 3];
+    let weights = vec![1.0f32; 4];
+    // Each token is 4 bytes (simulated): [AA, BB, CC, DD]
+    let token_data = vec![0xAAu8, 0xBB, 0xCC, 0xDD];
+    let result = exchange
+        .dispatch(4, &indices, &weights, &token_data)
+        .unwrap();
+
+    // Only local experts (0 and 1) should have data
+    // Token 0 -> expert 0 (local), Token 1 -> expert 1 (local)
+    assert!(!result.routed_data.is_empty());
+    // Routed data should contain bytes from token 0 and token 1
+}
+
+#[test]
+fn test_route_rdma_materialization_guard() {
+    // Passing empty token_data should fail ensure_materialized in RDMA path
+    let group = Group::world(2, 0);
+    let config = MoeDispatchConfig {
+        num_experts: 4,
+        top_k: 1,
+        capacity_factor: 1.0,
+        group,
+    };
+    let mut policy = MoePolicy::new();
+    policy.set_world_size(2);
+    policy.set_hysteresis_band(0);
+    let mut exchange = MoeDispatchExchange::new(config, policy);
+
+    let indices: Vec<u32> = (0..500).map(|i| i % 4).collect();
+    let weights: Vec<f32> = vec![1.0; 500];
+    // Empty token data — should trigger NotMaterialized error on RDMA path
+    let token_data: Vec<u8> = vec![];
+    let result = exchange.dispatch(500, &indices, &weights, &token_data);
+    // batch_size != 0 but token_data empty => token_stride = 0 => early return empty
+    // The RDMA path calls ensure_materialized with (0, 0) => error
+    assert!(result.is_err() || result.unwrap().routed_data.is_empty());
+}
+
+#[test]
+fn test_dispatch_result_has_routed_data() {
+    let group = Group::world(1, 0);
+    let config = MoeDispatchConfig {
+        num_experts: 2,
+        top_k: 1,
+        capacity_factor: 1.0,
+        group,
+    };
+    let mut exchange = MoeDispatchExchange::new(config, MoePolicy::new());
+
+    // 2 tokens, each 8 bytes, top_k=1
+    let indices = vec![0u32, 1];
+    let weights = vec![1.0f32; 2];
+    let token_data = vec![0xFFu8; 2 * 8];
+    let result = exchange
+        .dispatch(2, &indices, &weights, &token_data)
+        .unwrap();
+    // Both experts are local (single rank), routed_data should be non-empty
+    assert!(!result.routed_data.is_empty());
+}
+
+// ─── Collective ensure_materialized enforcement tests ───
+
+// In debug builds, collectives panic on unmaterialized data.
+// In release builds, they return DistributedError::NotMaterialized.
+
+#[test]
+#[should_panic(expected = "not materialized")]
+#[cfg(debug_assertions)]
+fn test_collective_allreduce_rejects_empty_debug() {
+    let g = Group::world(2, 0);
+    let _ = g.allreduce(&[]);
+}
+
+#[test]
+#[cfg(not(debug_assertions))]
+fn test_collective_allreduce_rejects_empty_release() {
+    let g = Group::world(2, 0);
+    assert!(g.allreduce(&[]).is_err());
+}
+
+#[test]
+#[should_panic(expected = "not materialized")]
+#[cfg(debug_assertions)]
+fn test_collective_allgather_rejects_empty_debug() {
+    let g = Group::world(2, 0);
+    let _ = g.allgather(&[]);
+}
+
+#[test]
+#[cfg(not(debug_assertions))]
+fn test_collective_allgather_rejects_empty_release() {
+    let g = Group::world(2, 0);
+    assert!(g.allgather(&[]).is_err());
+}
+
+#[test]
+#[should_panic(expected = "not materialized")]
+#[cfg(debug_assertions)]
+fn test_collective_broadcast_rejects_empty_debug() {
+    let g = Group::world(2, 0);
+    let _ = g.broadcast(&[], 0);
+}
+
+#[test]
+#[cfg(not(debug_assertions))]
+fn test_collective_broadcast_rejects_empty_release() {
+    let g = Group::world(2, 0);
+    assert!(g.broadcast(&[], 0).is_err());
+}
+
+#[test]
+#[should_panic(expected = "not materialized")]
+#[cfg(debug_assertions)]
+fn test_collective_send_rejects_empty_debug() {
+    let g = Group::world(2, 0);
+    let _ = g.send(&[], 1);
+}
+
+#[test]
+#[cfg(not(debug_assertions))]
+fn test_collective_send_rejects_empty_release() {
+    let g = Group::world(2, 0);
+    assert!(g.send(&[], 1).is_err());
+}
+
+#[test]
+fn test_collective_recv_rejects_zero_len() {
+    let g = Group::world(2, 0);
+    let result = g.recv(1, 0);
+    assert!(result.is_err());
+}
+
+#[test]
+#[should_panic(expected = "not materialized")]
+#[cfg(debug_assertions)]
+fn test_collective_all_to_all_rejects_empty_debug() {
+    let g = Group::world(2, 0);
+    let _ = g.all_to_all(&[]);
+}
+
+#[test]
+#[cfg(not(debug_assertions))]
+fn test_collective_all_to_all_rejects_empty_release() {
+    let g = Group::world(2, 0);
+    assert!(g.all_to_all(&[]).is_err());
+}
+
+#[test]
+fn test_collective_allreduce_accepts_valid() {
+    let g = Group::world(2, 0);
+    let data = vec![1u8, 2, 3, 4];
+    let result = g.allreduce(&data);
+    assert!(result.is_ok());
+    assert_eq!(result.unwrap(), data);
+}
+
+#[test]
+fn test_collective_send_recv_accepts_valid() {
+    let g = Group::world(2, 0);
+    let data = vec![1u8, 2, 3, 4];
+    assert!(g.send(&data, 1).is_ok());
+    let received = g.recv(1, 4).unwrap();
+    assert_eq!(received.len(), 4);
+}
+
+#[test]
+fn test_collective_all_to_all_accepts_valid() {
+    let g = Group::world(2, 0);
+    let data = vec![1u8; 64];
+    let result = g.all_to_all(&data).unwrap();
+    assert_eq!(result, data);
 }

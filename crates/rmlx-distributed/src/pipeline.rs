@@ -5,6 +5,8 @@
 
 use std::time::{Duration, Instant};
 
+use rmlx_alloc::zero_copy::CompletionTicket;
+
 /// Pipeline stage for tracking layer execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PipelineStage {
@@ -84,30 +86,56 @@ impl Default for PipelineConfig {
 pub struct LayerPipeline {
     config: PipelineConfig,
     stages: Vec<PipelineStage>,
+    tickets: Vec<Option<CompletionTicket>>,
 }
 
 impl LayerPipeline {
     pub fn new(config: PipelineConfig) -> Self {
         let stages = vec![PipelineStage::WaitingForInput; config.num_layers];
-        Self { config, stages }
+        let tickets = vec![None; config.num_layers];
+        Self {
+            config,
+            stages,
+            tickets,
+        }
     }
 
-    /// Mark a layer as computing.
+    /// Mark a layer as computing and attach a completion ticket.
+    ///
+    /// The ticket tracks both GPU compute and RDMA transfer completion
+    /// for this layer's output buffer.
     pub fn begin_compute(&mut self, layer: usize) {
         assert!(layer < self.config.num_layers);
         self.stages[layer] = PipelineStage::Computing;
+        self.tickets[layer] = Some(CompletionTicket::new());
     }
 
     /// Mark a layer as transferring.
+    ///
+    /// GPU compute for this layer's output should have already completed.
+    /// Marks the ticket's GPU phase as complete.
     pub fn begin_transfer(&mut self, layer: usize) {
         assert!(layer < self.config.num_layers);
         self.stages[layer] = PipelineStage::Transferring;
+        if let Some(ref ticket) = self.tickets[layer] {
+            ticket.mark_gpu_complete();
+        }
     }
 
     /// Mark a layer as complete.
+    ///
+    /// RDMA transfer has completed. Marks the ticket's RDMA phase as complete.
     pub fn complete(&mut self, layer: usize) {
         assert!(layer < self.config.num_layers);
         self.stages[layer] = PipelineStage::Complete;
+        if let Some(ref ticket) = self.tickets[layer] {
+            ticket.mark_rdma_complete();
+        }
+    }
+
+    /// Get the completion ticket for a layer, if one has been created.
+    pub fn ticket(&self, layer: usize) -> Option<&CompletionTicket> {
+        self.tickets[layer].as_ref()
     }
 
     /// Get current stage for a layer.
@@ -130,10 +158,13 @@ impl LayerPipeline {
         self.stages.iter().all(|s| *s == PipelineStage::Complete)
     }
 
-    /// Reset all stages to WaitingForInput.
+    /// Reset all stages to WaitingForInput and clear tickets.
     pub fn reset(&mut self) {
         for stage in &mut self.stages {
             *stage = PipelineStage::WaitingForInput;
+        }
+        for ticket in &mut self.tickets {
+            *ticket = None;
         }
     }
 

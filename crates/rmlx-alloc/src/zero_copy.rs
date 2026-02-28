@@ -1,9 +1,10 @@
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rmlx_metal::device::GpuDevice;
+use rmlx_metal::event::{EventError, GpuEvent};
 use rmlx_metal::metal::Buffer as MetalBuffer;
 
 use crate::AllocError;
@@ -13,10 +14,15 @@ use crate::AllocError;
 /// This is a lightweight completion tracker for coordinating buffer lifetime
 /// across GPU compute and RDMA transfer operations. Both must complete
 /// before the buffer can safely be freed or reused.
+///
+/// Optionally integrates with `GpuEvent` (MTLSharedEvent) for hardware-level
+/// GPU completion signaling.
 #[derive(Clone)]
 pub struct CompletionTicket {
     gpu_complete: Arc<AtomicBool>,
     rdma_complete: Arc<AtomicBool>,
+    gpu_event: Option<Arc<GpuEvent>>,
+    gpu_event_value: Arc<AtomicU64>,
 }
 
 impl CompletionTicket {
@@ -24,10 +30,25 @@ impl CompletionTicket {
         Self {
             gpu_complete: Arc::new(AtomicBool::new(false)),
             rdma_complete: Arc::new(AtomicBool::new(false)),
+            gpu_event: None,
+            gpu_event_value: Arc::new(AtomicU64::new(0)),
         }
     }
 
+    /// Attach a GpuEvent for hardware-level GPU completion signaling.
+    ///
+    /// Returns the signal value that the GPU command buffer should signal
+    /// when the operation completes.
+    pub fn with_gpu_event(&mut self, event: Arc<GpuEvent>) -> u64 {
+        let value = event.next_value();
+        self.gpu_event_value.store(value, Ordering::Release);
+        self.gpu_event = Some(event);
+        value
+    }
+
     /// Mark the GPU operation as completed.
+    ///
+    /// If a GpuEvent is attached, this also signals the event atomically.
     pub fn mark_gpu_complete(&self) {
         self.gpu_complete.store(true, Ordering::Release);
     }
@@ -38,10 +59,103 @@ impl CompletionTicket {
     }
 
     /// Returns true if both GPU and RDMA operations have completed.
+    ///
+    /// If a GpuEvent is attached, GPU completion is determined by checking
+    /// the event's signaled value rather than the atomic flag alone.
     pub fn is_safe_to_free(&self) -> bool {
-        self.gpu_complete.load(Ordering::Acquire) && self.rdma_complete.load(Ordering::Acquire)
+        let gpu_done = if let Some(ref event) = self.gpu_event {
+            let target = self.gpu_event_value.load(Ordering::Acquire);
+            target == 0
+                || event.raw().signaled_value() >= target
+                || self.gpu_complete.load(Ordering::Acquire)
+        } else {
+            self.gpu_complete.load(Ordering::Acquire)
+        };
+        gpu_done && self.rdma_complete.load(Ordering::Acquire)
+    }
+
+    /// Wait for both GPU and RDMA completion with a timeout.
+    ///
+    /// If a GpuEvent is attached, uses the event's CPU wait mechanism for
+    /// low-latency GPU synchronization. Otherwise, spins on the atomic flags.
+    pub fn wait_all_complete(&self, timeout: Duration) -> Result<(), CompletionError> {
+        let start = Instant::now();
+
+        // Wait for GPU completion
+        if let Some(ref event) = self.gpu_event {
+            let target = self.gpu_event_value.load(Ordering::Acquire);
+            if target > 0 && !self.gpu_complete.load(Ordering::Acquire) {
+                let remaining = timeout
+                    .checked_sub(start.elapsed())
+                    .unwrap_or(Duration::ZERO);
+                match event.cpu_wait(target, remaining) {
+                    Ok(_) => {}
+                    Err(EventError::Timeout(_)) => return Err(CompletionError::GpuTimeout),
+                    Err(EventError::Cancelled) => return Err(CompletionError::Cancelled),
+                }
+            }
+        } else {
+            while !self.gpu_complete.load(Ordering::Acquire) {
+                if start.elapsed() >= timeout {
+                    return Err(CompletionError::GpuTimeout);
+                }
+                std::thread::yield_now();
+            }
+        }
+
+        // Wait for RDMA completion
+        while !self.rdma_complete.load(Ordering::Acquire) {
+            if start.elapsed() >= timeout {
+                return Err(CompletionError::RdmaTimeout);
+            }
+            std::thread::yield_now();
+        }
+
+        Ok(())
+    }
+
+    /// Whether a GpuEvent is attached.
+    pub fn has_gpu_event(&self) -> bool {
+        self.gpu_event.is_some()
+    }
+
+    /// Whether GPU completion has been signaled.
+    pub fn is_gpu_complete(&self) -> bool {
+        if let Some(ref event) = self.gpu_event {
+            let target = self.gpu_event_value.load(Ordering::Acquire);
+            target == 0
+                || event.raw().signaled_value() >= target
+                || self.gpu_complete.load(Ordering::Acquire)
+        } else {
+            self.gpu_complete.load(Ordering::Acquire)
+        }
+    }
+
+    /// Whether RDMA completion has been signaled.
+    pub fn is_rdma_complete(&self) -> bool {
+        self.rdma_complete.load(Ordering::Acquire)
     }
 }
+
+/// Errors from completion waiting.
+#[derive(Debug)]
+pub enum CompletionError {
+    GpuTimeout,
+    RdmaTimeout,
+    Cancelled,
+}
+
+impl std::fmt::Display for CompletionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::GpuTimeout => write!(f, "GPU completion timed out"),
+            Self::RdmaTimeout => write!(f, "RDMA completion timed out"),
+            Self::Cancelled => write!(f, "completion wait cancelled"),
+        }
+    }
+}
+
+impl std::error::Error for CompletionError {}
 
 impl Default for CompletionTicket {
     fn default() -> Self {

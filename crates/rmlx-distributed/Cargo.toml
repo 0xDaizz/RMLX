@@ -6,5 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+rmlx-alloc = { path = "../rmlx-alloc" }
 rmlx-core = { path = "../rmlx-core" }
 rmlx-rdma = { path = "../rmlx-rdma" }
