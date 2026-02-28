@@ -5,6 +5,7 @@ pub mod context;
 pub mod exchange;
 pub mod ffi;
 pub mod mr;
+pub mod multi_port;
 pub mod qp;
 
 use std::fmt;
