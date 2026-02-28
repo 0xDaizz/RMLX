@@ -4,7 +4,7 @@
 
 `rmlx-metal`은 Apple Metal GPU API에 대한 안전하고 편리한 Rust 래퍼 계층입니다. Metal 디바이스, 커맨드 큐, 버퍼, 컴퓨트 파이프라인, 셰이더 라이브러리를 추상화하여 GPU 연산을 간결하게 수행할 수 있도록 합니다.
 
-`metal-rs` 0.31 크레이트를 기반으로 하며, MLX의 Metal 추상화 구조를 참고하여 Rust 관용적 API로 재설계하였습니다. 현재 RMLX 프로젝트에서 가장 먼저 완전 구현된 크레이트입니다(Phase 0 완료).
+`metal-rs` 0.31 크레이트를 기반으로 하며, MLX의 Metal 추상화 구조를 참고하여 Rust 관용적 API로 재설계하였습니다. Phase 0에서 기본 래퍼가 완성되었고, 이후 이벤트 동기화(`event.rs`), 셀프 체크(`self_check.rs`), 듀얼 큐 스트림 매니저(`stream.rs`)가 추가되었습니다.
 
 ---
 
@@ -18,7 +18,10 @@ graph TD
     A --> E[buffer.rs]
     A --> F[pipeline.rs]
     A --> G[library.rs]
-    A --> H[lib.rs — MetalError]
+    A --> H[event.rs — GpuEvent]
+    A --> I[self_check.rs — SelfCheckResult]
+    A --> J[stream.rs — StreamManager]
+    A --> K[lib.rs — MetalError]
 ```
 
 ### `device.rs` — `GpuDevice`
@@ -101,8 +104,6 @@ impl GpuQueue {
     }
 }
 ```
-
-> **참고:** Phase 0에서는 단일 큐 래퍼로 구현되어 있습니다. Phase 3에서 듀얼 큐 `StreamManager`로 확장될 예정입니다.
 
 ---
 
@@ -243,6 +244,159 @@ pub fn compile_source(device: &metal::Device, source: &str) -> Result<Library, M
 
 ---
 
+### `event.rs` — `GpuEvent` (CPU-GPU 동기화)
+
+`MTLSharedEvent`를 래핑하여 CPU-GPU 간 저지연 동기화를 제공합니다. CPU 대기 시 **spin→yield→sleep 에스컬레이션 전략**을 사용하여 지연 시간과 CPU 소비 사이의 균형을 유지합니다.
+
+```rust
+pub struct GpuEvent {
+    event: SharedEvent,         // MTLSharedEvent
+    counter: AtomicU64,         // 모노토닉 시그널 카운터
+    cancelled: AtomicBool,      // 대기 취소 플래그
+}
+```
+
+| 메서드 | 설명 |
+|--------|------|
+| `new(device)` | 지정된 디바이스에 새 `MTLSharedEvent`를 생성합니다 |
+| `next_value()` | 카운터를 원자적으로 증가시키고 다음 시그널 값을 반환합니다 |
+| `current_value()` | 현재 카운터 값을 반환합니다 |
+| `signal_from_command_buffer(cb, value)` | 커맨드 버퍼에 이벤트 시그널을 인코딩합니다 |
+| `wait_from_command_buffer(cb, value)` | 커맨드 버퍼에 이벤트 대기를 인코딩합니다 |
+| `cpu_wait(value, deadline)` | CPU에서 이벤트가 지정된 값에 도달할 때까지 대기합니다 |
+| `cancel()` | 대기 중인 `cpu_wait`를 취소합니다 |
+| `reset_cancel()` | 취소 플래그를 리셋합니다 |
+| `raw()` | 내부 `SharedEvent` 참조를 반환합니다 |
+
+**CPU 대기 에스컬레이션 전략:**
+
+```
+0~10μs   → spin_loop (busywait, 최저 지연)
+10~100μs → yield_now (OS 스케줄러에 양보)
+100μs+   → sleep(50μs) (CPU 절약)
+```
+
+```rust
+pub fn cpu_wait(&self, value: u64, deadline: Duration) -> Result<Duration, EventError> {
+    let start = Instant::now();
+    let spin_threshold = Duration::from_micros(10);
+    let yield_threshold = Duration::from_micros(100);
+
+    loop {
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(EventError::Cancelled);
+        }
+        let current = self.event.signaled_value();
+        if current >= value {
+            return Ok(start.elapsed());
+        }
+        let elapsed = start.elapsed();
+        if elapsed >= deadline {
+            return Err(EventError::Timeout(elapsed));
+        }
+        // 에스컬레이션 전략
+        if elapsed < spin_threshold {
+            std::hint::spin_loop();
+        } else if elapsed < yield_threshold {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(Duration::from_micros(50));
+        }
+    }
+}
+```
+
+**에러 타입:**
+
+```rust
+pub enum EventError {
+    Timeout(Duration),  // 데드라인 초과
+    Cancelled,          // cancel()로 취소됨
+}
+```
+
+---
+
+### `self_check.rs` — Metal 셀프 체크
+
+Metal GPU 환경의 시작 시 진단을 수행합니다. Metal 가용성, 메모리 제한, GPU 정보를 검사하여 문제(`issues`)와 경고(`warnings`)를 수집합니다.
+
+```rust
+#[derive(Debug, Clone)]
+pub struct SelfCheckResult {
+    pub metal_available: bool,
+    pub metal_version: String,
+    pub gpu_family: String,
+    pub max_buffer_length: u64,
+    pub max_threadgroup_memory: u64,
+    pub shared_memory_size: u64,      // recommended_max_working_set_size
+    pub issues: Vec<String>,          // 치명적 문제
+    pub warnings: Vec<String>,        // 경고
+}
+
+impl SelfCheckResult {
+    /// 이슈 없이 통과했는지 확인합니다.
+    pub fn is_ok(&self) -> bool {
+        self.issues.is_empty()
+    }
+}
+```
+
+| 함수 | 설명 |
+|------|------|
+| `run_self_check()` | 전체 Metal 셀프 체크를 실행하고 결과를 반환합니다 |
+| `check_metal_support()` | Metal 디바이스 획득 가능 여부를 확인합니다 |
+| `check_memory_limits()` | `max_buffer_length`와 `max_threadgroup_memory`를 조회합니다 |
+
+**검사 항목:**
+- Metal 디바이스 사용 가능 여부 (불가능 시 `issues`에 추가)
+- 최대 버퍼 크기 조회 (0이면 `warnings`에 추가)
+- GPU 이름, recommended working set size 조회
+
+---
+
+### `stream.rs` — `StreamManager` (듀얼 큐 관리)
+
+두 개의 독립적인 Metal 커맨드 큐를 관리합니다:
+- **Compute queue**: GPU 커널 디스패치 (matmul, softmax 등)
+- **Transfer queue**: DMA/복사 작업 및 RDMA 조율
+
+큐 간 동기화는 내부 `GpuEvent`를 통해 수행됩니다.
+
+```rust
+pub struct StreamManager {
+    compute_queue: CommandQueue,
+    transfer_queue: CommandQueue,
+    sync_event: GpuEvent,
+}
+```
+
+| 메서드 | 설명 |
+|--------|------|
+| `new(device)` | compute + transfer 듀얼 큐와 동기화 이벤트를 생성합니다 |
+| `compute_queue()` | compute 큐 참조를 반환합니다 |
+| `transfer_queue()` | transfer 큐 참조를 반환합니다 |
+| `compute_command_buffer()` | compute 큐에서 커맨드 버퍼를 생성합니다 |
+| `transfer_command_buffer()` | transfer 큐에서 커맨드 버퍼를 생성합니다 |
+| `sync_transfer_after_compute(compute_cb, transfer_cb)` | compute 완료 후 transfer가 실행되도록 의존성을 삽입합니다 |
+| `sync_compute_after_transfer(transfer_cb, compute_cb)` | transfer 완료 후 compute가 실행되도록 의존성을 삽입합니다 |
+| `sync_event()` | 동기화 이벤트 참조를 반환합니다 |
+
+**큐 간 동기화 흐름:**
+
+```mermaid
+sequenceDiagram
+    participant Compute Queue
+    participant SharedEvent
+    participant Transfer Queue
+
+    Compute Queue->>SharedEvent: signal(value)
+    Transfer Queue->>SharedEvent: wait(value)
+    Note over Transfer Queue: compute 완료 후 실행
+```
+
+---
+
 ## 에러 처리
 
 `MetalError` enum으로 모든 Metal 작업의 에러를 통합 관리합니다.
@@ -298,7 +452,7 @@ fn main() {
     let buffer_a = device.new_buffer_with_data(&[1.0f32, 2.0, 3.0, 4.0]);
     let buffer_b = device.new_buffer_with_data(&[5.0f32, 6.0, 7.0, 8.0]);
     let buffer_out = device.new_buffer(
-        16, // 4 floats × 4 bytes
+        16, // 4 floats x 4 bytes
         rmlx_metal::metal::MTLResourceOptions::StorageModeShared,
     );
 
@@ -392,30 +546,7 @@ Phase 3에서 다음 모듈이 추가될 예정입니다.
 
 | 모듈 | 설명 | Phase |
 |------|------|-------|
-| `event.rs` | `MTLSharedEvent` 래퍼 — cross-queue 동기화를 위한 이벤트 시그널링 | Phase 3 |
-| `fence.rs` | `MTLFence` + fast-fence (shared buffer spin) — 저지연 동기화 | Phase 3 |
-| `StreamManager` | 듀얼 큐(compute + transfer) 스케줄링, `DeviceStream` 관리, auto-commit 정책 | Phase 3 |
 | `resident.rs` | `ResidencySet` 관리 — Metal 3 리소스 상주 관리 | Phase 3 |
-
-**계획된 `StreamManager` 구조:**
-
-```rust
-// 계획됨 (Phase 3)
-pub struct StreamManager {
-    compute_queue: CommandQueue,    // 주 연산 큐
-    transfer_queue: CommandQueue,   // RDMA 동기화/데이터 준비 큐
-    streams: HashMap<StreamId, DeviceStream>,
-}
-
-pub struct DeviceStream {
-    queue: CommandQueue,
-    current_buffer: Option<CommandBuffer>,
-    buffer_ops: u32,
-    buffer_size_bytes: usize,
-    encoder: Option<ActiveEncoder>,
-    fence_map: DashMap<BufferId, Arc<FenceState>>,
-}
-```
 
 ---
 

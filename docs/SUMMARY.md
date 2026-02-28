@@ -14,6 +14,7 @@
 - [rmlx-core](crates/rmlx-core.md)
 - [rmlx-distributed](crates/rmlx-distributed.md)
 - [rmlx-nn](crates/rmlx-nn.md)
+- [rmlx-python](crates/rmlx-python.md)
 
 ## Getting Started
 - [Prerequisites](getting-started/prerequisites.md)
