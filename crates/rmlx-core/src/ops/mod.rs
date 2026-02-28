@@ -3,6 +3,9 @@
 pub mod binary;
 pub mod copy;
 pub mod gemv;
+pub mod indexing;
+pub mod matmul;
+pub mod quantized;
 pub mod reduce;
 pub mod rms_norm;
 pub mod rope;
@@ -19,5 +22,8 @@ pub fn register_all(registry: &KernelRegistry) -> Result<(), KernelError> {
     softmax::register(registry)?;
     rope::register(registry)?;
     gemv::register(registry)?;
+    matmul::register(registry)?;
+    quantized::register(registry)?;
+    indexing::register(registry)?;
     Ok(())
 }

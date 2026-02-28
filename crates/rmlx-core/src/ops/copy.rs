@@ -42,6 +42,11 @@ pub fn copy(
         DType::Float32 => "copy_f32",
         DType::Float16 => "copy_f16",
         DType::Bfloat16 => "copy_f16", // bf16 uses same copy logic as f16
+        DType::Q4_0 | DType::Q4_1 | DType::Q8_0 => {
+            return Err(KernelError::NotFound(
+                "copy not supported for quantized types".to_string(),
+            ))
+        }
     };
 
     let pipeline = registry.get_pipeline(kernel_name, src.dtype())?;
