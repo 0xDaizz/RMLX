@@ -10,6 +10,8 @@ pub enum DistributedError {
     NotMaterialized(String),
     /// RDMA transport error (wraps rmlx_rdma::RdmaError description).
     Transport(String),
+    /// Wire protocol or data format error (e.g., byte slice conversion failure).
+    Protocol(String),
 }
 
 impl fmt::Display for DistributedError {
@@ -17,6 +19,7 @@ impl fmt::Display for DistributedError {
         match self {
             Self::NotMaterialized(msg) => write!(f, "not materialized: {msg}"),
             Self::Transport(msg) => write!(f, "transport error: {msg}"),
+            Self::Protocol(msg) => write!(f, "protocol error: {msg}"),
         }
     }
 }
@@ -244,6 +247,7 @@ impl Group {
     /// Multi-rank groups without transport return an error.
     pub fn broadcast(&self, data: &[u8], root: u32) -> Result<Vec<u8>, DistributedError> {
         Self::check_materialized("broadcast", data)?;
+        self.validate_rank("broadcast(root)", root)?;
         if self.ranks.len() <= 1 {
             return Ok(data.to_vec());
         }
@@ -267,6 +271,7 @@ impl Group {
     /// Multi-rank groups without transport return an error.
     pub fn send(&self, data: &[u8], dst_rank: u32) -> Result<(), DistributedError> {
         Self::check_materialized("send", data)?;
+        self.validate_rank("send", dst_rank)?;
         if self.ranks.len() <= 1 {
             return Ok(());
         }
@@ -285,6 +290,7 @@ impl Group {
                 "recv: requested zero-length buffer".to_string(),
             ));
         }
+        self.validate_rank("recv", src_rank)?;
         if self.ranks.len() <= 1 {
             return Ok(vec![0u8; len]);
         }
@@ -311,6 +317,8 @@ impl Group {
                 "sendrecv: requested zero-length recv buffer".to_string(),
             ));
         }
+        self.validate_rank("sendrecv(dst)", dst_rank)?;
+        self.validate_rank("sendrecv(src)", src_rank)?;
         if self.ranks.len() <= 1 {
             return Ok(vec![0u8; recv_len]);
         }
@@ -384,6 +392,17 @@ impl Group {
         ensure_materialized(&shapes)
     }
 
+    /// Validate that a rank is within the group.
+    fn validate_rank(&self, op_name: &str, rank: u32) -> Result<(), DistributedError> {
+        if rank >= self.world_size || !self.ranks.contains(&rank) {
+            return Err(DistributedError::Transport(format!(
+                "{op_name}: rank {rank} not in group (world_size={}, ranks={:?})",
+                self.world_size, self.ranks
+            )));
+        }
+        Ok(())
+    }
+
     /// Require a transport for multi-rank operations.
     ///
     /// Returns an error if this is a multi-rank group but no transport is attached.
@@ -436,6 +455,14 @@ fn ring_allreduce(
     let n = ranks.len();
     if n <= 1 {
         return Ok(data.to_vec());
+    }
+
+    // allreduce operates on f32 elements — data must be 4-byte aligned
+    if data.len() % 4 != 0 {
+        return Err(DistributedError::Protocol(format!(
+            "allreduce: data length ({}) must be a multiple of 4 (f32 element size)",
+            data.len()
+        )));
     }
 
     // Find our index in the sorted rank list

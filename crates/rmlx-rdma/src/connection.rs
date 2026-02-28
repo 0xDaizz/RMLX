@@ -5,6 +5,7 @@
 
 use std::cell::RefCell;
 use std::ffi::c_void;
+use std::marker::PhantomData;
 use std::time::{Duration, Instant};
 
 use crate::context::{ProtectionDomain, RdmaContext};
@@ -13,6 +14,29 @@ use crate::ffi::*;
 use crate::mr::MemoryRegion;
 use crate::qp::{CompletionQueue, QueuePair};
 use crate::RdmaError;
+
+/// The kind of RDMA work request that was posted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostedOpKind {
+    Send,
+    Recv,
+}
+
+/// A posted RDMA operation that borrows a `MemoryRegion`.
+///
+/// The lifetime `'a` ties this operation to the `MemoryRegion` it references,
+/// ensuring at compile time that the MR cannot be dropped while the operation
+/// is still outstanding. Call `RdmaConnection::wait_posted` to wait for
+/// completion before the borrow is released.
+#[derive(Debug)]
+pub struct PostedOp<'a> {
+    /// The work request ID assigned to this operation.
+    pub wr_id: u64,
+    /// Whether this is a send or receive operation.
+    pub kind: PostedOpKind,
+    /// Ties the lifetime of this operation to the MemoryRegion.
+    _mr: PhantomData<&'a MemoryRegion>,
+}
 
 /// Configuration for an RDMA connection.
 pub struct RdmaConfig {
@@ -26,6 +50,16 @@ pub struct RdmaConfig {
     pub exchange_port: u16,
     /// TCP port for barrier sync
     pub sync_port: u16,
+    /// CQ poll timeout in milliseconds (default: 5000)
+    pub cq_timeout_ms: u64,
+    /// Timeout in seconds for server accept() calls (default: 60)
+    pub accept_timeout_secs: u64,
+    /// Number of retries for TCP I/O operations (default: 3)
+    pub io_max_retries: u32,
+    /// Delay between I/O retries in milliseconds (default: 1000)
+    pub io_retry_delay_ms: u64,
+    /// TCP connect timeout in milliseconds (default: 5000)
+    pub connect_timeout_ms: u64,
 }
 
 impl Default for RdmaConfig {
@@ -36,12 +70,14 @@ impl Default for RdmaConfig {
             peer_host: String::new(),
             exchange_port: exchange::TCP_EXCHANGE_PORT,
             sync_port: exchange::TCP_SYNC_PORT,
+            cq_timeout_ms: 5000,
+            accept_timeout_secs: 60,
+            io_max_retries: 3,
+            io_retry_delay_ms: 1000,
+            connect_timeout_ms: 5000,
         }
     }
 }
-
-/// Default CQ poll timeout in milliseconds.
-const DEFAULT_CQ_TIMEOUT_MS: u64 = 5000;
 
 /// Tracks work request completions by wr_id with timeout support.
 ///
@@ -196,10 +232,21 @@ impl RdmaConnection {
         qp.query_local_info(&ctx, config.rank)?;
 
         // 3. Exchange QP info via TCP
+        let exchange_cfg = exchange::ExchangeConfig {
+            accept_timeout_secs: config.accept_timeout_secs,
+            io_max_retries: config.io_max_retries,
+            io_retry_delay_ms: config.io_retry_delay_ms,
+            connect_timeout_ms: config.connect_timeout_ms,
+        };
         let remote_info = if config.rank == 0 {
-            exchange::exchange_server(qp.local_info(), config.exchange_port)?
+            exchange::exchange_server(qp.local_info(), config.exchange_port, &exchange_cfg)?
         } else {
-            exchange::exchange_client(qp.local_info(), &config.peer_host, config.exchange_port)?
+            exchange::exchange_client(
+                qp.local_info(),
+                &config.peer_host,
+                config.exchange_port,
+                &exchange_cfg,
+            )?
         };
 
         // 4. Connect QP (RESET → INIT → RTR → RTS)
@@ -240,13 +287,16 @@ impl RdmaConnection {
     }
 
     /// Post a send operation (IBV_WR_SEND).
-    pub fn post_send(
+    ///
+    /// Returns a `PostedOp` that borrows the `MemoryRegion`, preventing the MR
+    /// from being dropped until the operation completes via `wait_posted`.
+    pub fn post_send<'a>(
         &self,
-        mr: &MemoryRegion,
+        mr: &'a MemoryRegion,
         offset: usize,
         length: u32,
         wr_id: u64,
-    ) -> Result<(), RdmaError> {
+    ) -> Result<PostedOp<'a>, RdmaError> {
         if (offset as u64) + (length as u64) > mr.length() as u64 {
             return Err(RdmaError::InvalidArgument(format!(
                 "SGE out of bounds: offset({}) + length({}) > mr.length({})",
@@ -271,17 +321,25 @@ impl RdmaConnection {
         wr.opcode = wr_opcode::SEND;
         wr.send_flags = send_flags::SIGNALED;
 
-        self.qp.post_send(&mut wr)
+        self.qp.post_send(&mut wr)?;
+        Ok(PostedOp {
+            wr_id,
+            kind: PostedOpKind::Send,
+            _mr: PhantomData,
+        })
     }
 
     /// Post a receive operation.
-    pub fn post_recv(
+    ///
+    /// Returns a `PostedOp` that borrows the `MemoryRegion`, preventing the MR
+    /// from being dropped until the operation completes via `wait_posted`.
+    pub fn post_recv<'a>(
         &self,
-        mr: &MemoryRegion,
+        mr: &'a MemoryRegion,
         offset: usize,
         length: u32,
         wr_id: u64,
-    ) -> Result<(), RdmaError> {
+    ) -> Result<PostedOp<'a>, RdmaError> {
         if (offset as u64) + (length as u64) > mr.length() as u64 {
             return Err(RdmaError::InvalidArgument(format!(
                 "SGE out of bounds: offset({}) + length({}) > mr.length({})",
@@ -304,7 +362,12 @@ impl RdmaConnection {
             num_sge: 1,
         };
 
-        self.qp.post_recv(&mut wr)
+        self.qp.post_recv(&mut wr)?;
+        Ok(PostedOp {
+            wr_id,
+            kind: PostedOpKind::Recv,
+            _mr: PhantomData,
+        })
     }
 
     /// Poll for completions. Returns completed work request count.
@@ -317,7 +380,17 @@ impl RdmaConnection {
     /// Polls the CQ until all expected wr_ids are matched. Unexpected completions
     /// are stashed in a backlog buffer for later retrieval.
     pub fn wait_completions(&self, expected_wr_ids: &[u64]) -> Result<(), RdmaError> {
-        self.wait_completions_with_timeout(expected_wr_ids, DEFAULT_CQ_TIMEOUT_MS)
+        self.wait_completions_with_timeout(expected_wr_ids, self.config.cq_timeout_ms)
+    }
+
+    /// Wait for posted operations to complete, using the default CQ timeout.
+    ///
+    /// Consumes the `PostedOp` handles, releasing the MR borrow once all
+    /// operations have completed. This is the preferred API over raw
+    /// `wait_completions` as it provides compile-time lifetime safety.
+    pub fn wait_posted(&self, ops: &[PostedOp<'_>]) -> Result<(), RdmaError> {
+        let wr_ids: Vec<u64> = ops.iter().map(|op| op.wr_id).collect();
+        self.wait_completions(&wr_ids)
     }
 
     /// Wait for specific completions identified by `wr_id`, with explicit timeout.
@@ -427,22 +500,25 @@ impl RdmaConnection {
 
             if self.config.rank == 0 {
                 // Rank 0: recv then send
-                self.post_recv(&mr, 0, WARMUP_SIZE as u32, recv_wr_id)?;
+                let recv_op = self.post_recv(&mr, 0, WARMUP_SIZE as u32, recv_wr_id)?;
                 // Barrier: signal rank 1 that recv is posted
-                exchange::tcp_barrier_server(self.config.sync_port)?;
-                self.wait_completions(&[recv_wr_id])?;
+                exchange::tcp_barrier_server(
+                    self.config.sync_port,
+                    self.config.accept_timeout_secs,
+                )?;
+                self.wait_posted(&[recv_op])?;
 
-                self.post_send(&mr, 0, WARMUP_SIZE as u32, send_wr_id)?;
-                self.wait_completions(&[send_wr_id])?;
+                let send_op = self.post_send(&mr, 0, WARMUP_SIZE as u32, send_wr_id)?;
+                self.wait_posted(&[send_op])?;
             } else {
                 // Rank 1: send then recv
-                self.post_recv(&mr, 0, WARMUP_SIZE as u32, recv_wr_id)?;
+                let recv_op = self.post_recv(&mr, 0, WARMUP_SIZE as u32, recv_wr_id)?;
                 // Barrier: wait for rank 0's recv to be posted
                 exchange::tcp_barrier_client(&self.config.peer_host, self.config.sync_port)?;
 
-                self.post_send(&mr, 0, WARMUP_SIZE as u32, send_wr_id)?;
-                self.wait_completions(&[send_wr_id])?;
-                self.wait_completions(&[recv_wr_id])?;
+                let send_op = self.post_send(&mr, 0, WARMUP_SIZE as u32, send_wr_id)?;
+                self.wait_posted(&[send_op])?;
+                self.wait_posted(&[recv_op])?;
             }
         }
 

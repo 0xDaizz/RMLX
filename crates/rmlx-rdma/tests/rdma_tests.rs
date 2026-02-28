@@ -12,7 +12,12 @@ fn test_rdma_availability_check() {
 }
 
 #[test]
+#[ignore = "requires RDMA hardware; run with RMLX_TEST_RDMA=1"]
 fn test_rdma_context_open() {
+    if std::env::var("RMLX_TEST_RDMA").is_err() {
+        eprintln!("skipping: set RMLX_TEST_RDMA=1 to enable");
+        return;
+    }
     if !is_available() {
         eprintln!("skipping test: RDMA not available (no librdma.dylib)");
         return;
@@ -38,7 +43,12 @@ fn test_rdma_context_open() {
 }
 
 #[test]
+#[ignore = "requires RDMA hardware; run with RMLX_TEST_RDMA=1"]
 fn test_device_probe_runs_on_open() {
+    if std::env::var("RMLX_TEST_RDMA").is_err() {
+        eprintln!("skipping: set RMLX_TEST_RDMA=1 to enable");
+        return;
+    }
     if !is_available() {
         eprintln!("skipping test: RDMA not available");
         return;
@@ -325,11 +335,11 @@ fn test_exchange_server_timeout_no_peer() {
     };
 
     let start = Instant::now();
-    // Run with a short effective timeout — we can't control ACCEPT_TIMEOUT_SECS
-    // from outside, but the function should eventually timeout (60s).
+    // Run with default ExchangeConfig timeout (60s).
     // For a fast test, we spawn a thread and check it returns an error.
+    let cfg = rmlx_rdma::exchange::ExchangeConfig::default();
     let handle =
-        std::thread::spawn(move || rmlx_rdma::exchange::exchange_server(&local_info, port));
+        std::thread::spawn(move || rmlx_rdma::exchange::exchange_server(&local_info, port, &cfg));
 
     // Give it a moment to bind, then do NOT connect.
     std::thread::sleep(std::time::Duration::from_millis(200));
@@ -365,14 +375,17 @@ fn test_exchange_qp_info_roundtrip() {
     let server_local = server_info.clone();
     let client_local = client_info.clone();
 
-    let server_handle =
-        thread::spawn(move || rmlx_rdma::exchange::exchange_server(&server_local, port));
+    let server_cfg = rmlx_rdma::exchange::ExchangeConfig::default();
+    let server_handle = thread::spawn(move || {
+        rmlx_rdma::exchange::exchange_server(&server_local, port, &server_cfg)
+    });
 
     // Give server time to bind
     thread::sleep(std::time::Duration::from_millis(100));
 
+    let client_cfg = rmlx_rdma::exchange::ExchangeConfig::default();
     let client_handle = thread::spawn(move || {
-        rmlx_rdma::exchange::exchange_client(&client_local, "127.0.0.1", port)
+        rmlx_rdma::exchange::exchange_client(&client_local, "127.0.0.1", port, &client_cfg)
     });
 
     let server_got = server_handle.join().unwrap().expect("server exchange");
@@ -480,10 +493,15 @@ fn test_ibv_device_attr_layout_sanity() {
 }
 
 #[test]
+#[ignore = "requires RDMA hardware; run with RMLX_TEST_RDMA=1"]
 fn test_probe_uses_query_device_when_available() {
     // When RDMA hardware is present, verify that probe provides
     // device-level values (max_mr_size should come from ibv_query_device,
     // which typically returns much larger values than port max_msg_sz).
+    if std::env::var("RMLX_TEST_RDMA").is_err() {
+        eprintln!("skipping: set RMLX_TEST_RDMA=1 to enable");
+        return;
+    }
     if !is_available() {
         eprintln!("skipping test: RDMA not available");
         return;
@@ -518,4 +536,70 @@ fn test_probe_uses_query_device_when_available() {
             eprintln!("skipping: {e}");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// PR-03: RdmaConfig timeout/retry defaults
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_rdma_config_default_timeout_fields() {
+    let cfg = rmlx_rdma::RdmaConfig::default();
+    assert_eq!(cfg.cq_timeout_ms, 5000);
+    assert_eq!(cfg.accept_timeout_secs, 60);
+    assert_eq!(cfg.io_max_retries, 3);
+    assert_eq!(cfg.io_retry_delay_ms, 1000);
+    assert_eq!(cfg.connect_timeout_ms, 5000);
+}
+
+#[test]
+fn test_rdma_config_custom_timeout_fields() {
+    let cfg = rmlx_rdma::RdmaConfig {
+        rank: 1,
+        world_size: 4,
+        peer_host: "10.0.0.1".to_string(),
+        exchange_port: 9000,
+        sync_port: 9001,
+        cq_timeout_ms: 10000,
+        accept_timeout_secs: 120,
+        io_max_retries: 5,
+        io_retry_delay_ms: 2000,
+        connect_timeout_ms: 8000,
+    };
+    assert_eq!(cfg.cq_timeout_ms, 10000);
+    assert_eq!(cfg.accept_timeout_secs, 120);
+    assert_eq!(cfg.io_max_retries, 5);
+    assert_eq!(cfg.io_retry_delay_ms, 2000);
+    assert_eq!(cfg.connect_timeout_ms, 8000);
+}
+
+// ---------------------------------------------------------------------------
+// PR-01: PostedOp lifetime safety
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_posted_op_kind_values() {
+    use rmlx_rdma::PostedOpKind;
+    assert_eq!(PostedOpKind::Send, PostedOpKind::Send);
+    assert_eq!(PostedOpKind::Recv, PostedOpKind::Recv);
+    assert_ne!(PostedOpKind::Send, PostedOpKind::Recv);
+}
+
+#[test]
+fn test_posted_op_kind_debug() {
+    use rmlx_rdma::PostedOpKind;
+    let send_str = format!("{:?}", PostedOpKind::Send);
+    let recv_str = format!("{:?}", PostedOpKind::Recv);
+    assert!(send_str.contains("Send"), "expected Send: {send_str}");
+    assert!(recv_str.contains("Recv"), "expected Recv: {recv_str}");
+}
+
+#[test]
+fn test_posted_op_kind_copy_clone() {
+    use rmlx_rdma::PostedOpKind;
+    let a = PostedOpKind::Send;
+    let b = a; // Copy
+    let c = a.clone(); // Clone
+    assert_eq!(a, b);
+    assert_eq!(a, c);
 }

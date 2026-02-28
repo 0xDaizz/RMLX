@@ -450,8 +450,9 @@ fn test_collective_allreduce_accepts_valid() {
 fn test_collective_send_recv_accepts_valid() {
     let g = Group::world(1, 0).unwrap();
     let data = vec![1u8, 2, 3, 4];
-    assert!(g.send(&data, 1).is_ok());
-    let received = g.recv(1, 4).unwrap();
+    // Single-rank group: send/recv to self (rank 0) is a no-op
+    assert!(g.send(&data, 0).is_ok());
+    let received = g.recv(0, 4).unwrap();
     assert_eq!(received.len(), 4);
 }
 
@@ -966,13 +967,18 @@ fn test_dispatch_rejects_zero_num_experts() {
         group,
     };
     let mut exchange = MoeDispatchExchange::new(config, MoePolicy::new());
-    let indices: Vec<u32> = vec![];
-    let weights: Vec<f32> = vec![];
+    // batch_size=1, top_k=1 → need 1 index and 1 weight
+    let indices: Vec<u32> = vec![0];
+    let weights: Vec<f32> = vec![1.0];
     let token_data = vec![0u8; 4];
     let result = exchange.dispatch(1, &indices, &weights, &token_data);
     assert!(result.is_err());
     let err = format!("{}", result.unwrap_err());
-    assert!(err.contains("experts_per_rank is 0"), "error: {err}");
+    // With num_experts=0, expert index 0 is out of range
+    assert!(
+        err.contains("experts_per_rank is 0") || err.contains("out of range"),
+        "error: {err}"
+    );
 }
 
 #[test]
@@ -1258,4 +1264,170 @@ fn test_combine_cpu_rdma_parity_single_rank() {
             rdma_result[i]
         );
     }
+}
+
+// ─── Input validation negative tests (PR-05) ───
+
+#[test]
+fn test_dispatch_rejects_wrong_indices_length() {
+    let group = Group::world(2, 0).unwrap();
+    let config = MoeDispatchConfig {
+        num_experts: 4,
+        top_k: 2,
+        capacity_factor: 1.0,
+        group,
+    };
+    let mut exchange = MoeDispatchExchange::new(config, MoePolicy::new());
+
+    // batch_size=4, top_k=2 => expected indices len = 8, but we provide 6
+    let indices = vec![0u32, 1, 2, 3, 0, 1];
+    let weights = vec![1.0f32; 8];
+    let token_data = vec![0u8; 4 * 16];
+    let result = exchange.dispatch(4, &indices, &weights, &token_data);
+    assert!(result.is_err());
+    let err_msg = format!("{}", result.unwrap_err());
+    assert!(
+        err_msg.contains("expert_indices length"),
+        "expected indices length error, got: {err_msg}"
+    );
+}
+
+#[test]
+fn test_dispatch_rejects_wrong_weights_length() {
+    let group = Group::world(2, 0).unwrap();
+    let config = MoeDispatchConfig {
+        num_experts: 4,
+        top_k: 2,
+        capacity_factor: 1.0,
+        group,
+    };
+    let mut exchange = MoeDispatchExchange::new(config, MoePolicy::new());
+
+    // batch_size=4, top_k=2 => expected weights len = 8, but we provide 4
+    let indices = vec![0u32, 1, 2, 3, 0, 1, 2, 3];
+    let weights = vec![1.0f32; 4];
+    let token_data = vec![0u8; 4 * 16];
+    let result = exchange.dispatch(4, &indices, &weights, &token_data);
+    assert!(result.is_err());
+    let err_msg = format!("{}", result.unwrap_err());
+    assert!(
+        err_msg.contains("expert_weights length"),
+        "expected weights length error, got: {err_msg}"
+    );
+}
+
+#[test]
+fn test_dispatch_rejects_misaligned_token_data() {
+    let group = Group::world(2, 0).unwrap();
+    let config = MoeDispatchConfig {
+        num_experts: 4,
+        top_k: 1,
+        capacity_factor: 1.0,
+        group,
+    };
+    let mut exchange = MoeDispatchExchange::new(config, MoePolicy::new());
+
+    // batch_size=3, token_data.len()=10 => 10 % 3 != 0
+    let indices = vec![0u32, 1, 2];
+    let weights = vec![1.0f32; 3];
+    let token_data = vec![0u8; 10];
+    let result = exchange.dispatch(3, &indices, &weights, &token_data);
+    assert!(result.is_err());
+    let err_msg = format!("{}", result.unwrap_err());
+    assert!(
+        err_msg.contains("token_data length"),
+        "expected token_data alignment error, got: {err_msg}"
+    );
+}
+
+// ─── Rank validation tests (PR-04) ───
+
+#[test]
+fn test_send_rejects_invalid_rank() {
+    let g = Group::world(2, 0).unwrap();
+    let data = vec![1u8, 2, 3, 4];
+    // Rank 5 is not in the group [0, 1]
+    let result = g.send(&data, 5);
+    assert!(result.is_err());
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("not in group"),
+        "expected rank validation error, got: {err}"
+    );
+}
+
+#[test]
+fn test_recv_rejects_invalid_rank() {
+    let g = Group::world(2, 0).unwrap();
+    let result = g.recv(5, 4);
+    assert!(result.is_err());
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("not in group"),
+        "expected rank validation error, got: {err}"
+    );
+}
+
+#[test]
+fn test_sendrecv_rejects_invalid_rank() {
+    let g = Group::world(2, 0).unwrap();
+    let data = vec![1u8, 2, 3, 4];
+    let result = g.sendrecv(&data, 99, 4, 0);
+    assert!(result.is_err());
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("not in group"),
+        "expected rank validation error, got: {err}"
+    );
+}
+
+#[test]
+fn test_broadcast_rejects_invalid_root() {
+    let g = Group::world(2, 0).unwrap();
+    let data = vec![1u8, 2, 3, 4];
+    let result = g.broadcast(&data, 10);
+    assert!(result.is_err());
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("not in group"),
+        "expected rank validation error, got: {err}"
+    );
+}
+
+#[test]
+fn test_allreduce_rejects_non_f32_aligned() {
+    // Single-rank group returns data unchanged, so use a 2-rank group with transport
+    let queues = Arc::new(Mutex::new(HashMap::new()));
+    let t0: Arc<dyn group::RdmaTransport> = Arc::new(LoopbackTransport {
+        local_rank: 0,
+        queues,
+    });
+    let g = Group::with_transport(vec![0, 1], 0, 2, t0).unwrap();
+    // 5 bytes is not 4-byte aligned
+    let data = vec![1u8; 5];
+    let result = g.allreduce(&data);
+    // The data is 5 bytes which passes materialized check (5 >= 5) but fails 4-byte align
+    // Actually ensure_materialized requires byte_size % 4 == 0, so 5 fails there first.
+    // Let's use 6 bytes to test the allreduce-specific check.
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_allreduce_rejects_non_f32_aligned_6bytes() {
+    // 6 bytes fails ensure_materialized (6 % 4 != 0), test the early check path
+    let queues = Arc::new(Mutex::new(HashMap::new()));
+    let t0: Arc<dyn group::RdmaTransport> = Arc::new(LoopbackTransport {
+        local_rank: 0,
+        queues,
+    });
+    let g = Group::with_transport(vec![0, 1], 0, 2, t0).unwrap();
+    let data = vec![1u8; 6]; // 6 % 4 != 0
+    let result = g.allreduce(&data);
+    assert!(result.is_err());
+    let err = format!("{}", result.unwrap_err());
+    // Should fail either at materialization or allreduce f32 check
+    assert!(
+        err.contains("not aligned") || err.contains("multiple of 4"),
+        "expected alignment error, got: {err}"
+    );
 }

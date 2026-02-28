@@ -128,9 +128,35 @@ impl MoeDispatchExchange {
         &mut self,
         batch_size: usize,
         expert_indices: &[u32],
-        _expert_weights: &[f32],
+        expert_weights: &[f32],
         token_data: &[u8],
     ) -> Result<DispatchResult, DistributedError> {
+        // Validate input dimensions
+        let expected_flat = batch_size * self.config.top_k;
+        if expert_indices.len() != expected_flat {
+            return Err(DistributedError::Protocol(format!(
+                "expert_indices length ({}) != batch_size ({}) * top_k ({})",
+                expert_indices.len(),
+                batch_size,
+                self.config.top_k,
+            )));
+        }
+        if expert_weights.len() != expected_flat {
+            return Err(DistributedError::Protocol(format!(
+                "expert_weights length ({}) != batch_size ({}) * top_k ({})",
+                expert_weights.len(),
+                batch_size,
+                self.config.top_k,
+            )));
+        }
+        if batch_size > 0 && token_data.len() % batch_size != 0 {
+            return Err(DistributedError::Protocol(format!(
+                "token_data length ({}) not divisible by batch_size ({})",
+                token_data.len(),
+                batch_size,
+            )));
+        }
+
         // Validate expert partition invariants
         let group_size = self.config.group.size();
         let num_experts = self.config.num_experts;
@@ -337,7 +363,10 @@ impl MoeDispatchExchange {
         }
 
         // Get or create cached pipeline
-        let mut cache_guard = self.metal_cache.lock().unwrap();
+        let mut cache_guard = self
+            .metal_cache
+            .lock()
+            .map_err(|_| DistributedError::Protocol("metal cache mutex poisoned".into()))?;
         if cache_guard.is_none() {
             let device = match metal::Device::system_default() {
                 Some(d) => d,
@@ -399,7 +428,9 @@ impl MoeDispatchExchange {
                 queue,
             });
         }
-        let cached = cache_guard.as_ref().unwrap();
+        let cached = cache_guard
+            .as_ref()
+            .ok_or_else(|| DistributedError::Protocol("metal cache not initialized".into()))?;
 
         let token_stride = token_data.len() / batch_size;
         let num_experts = self.config.num_experts;
@@ -583,7 +614,11 @@ impl MoeDispatchExchange {
                 .map_err(|e| {
                     DistributedError::Transport(format!("size sendrecv with rank {peer_rank}: {e}"))
                 })?;
-            recv_sizes[pr] = u64::from_le_bytes(size_data[..8].try_into().unwrap()) as usize;
+            recv_sizes[pr] = u64::from_le_bytes(size_data[..8].try_into().map_err(|_| {
+                DistributedError::Protocol(format!(
+                    "invalid size payload from rank {peer_rank}: expected 8 bytes"
+                ))
+            })?) as usize;
         }
 
         // --- Phase 2: Exchange actual payloads via sendrecv ---
@@ -621,7 +656,11 @@ impl MoeDispatchExchange {
             let mut offset = 0;
             while offset + wire_stride <= received.len() {
                 let expert_id =
-                    u32::from_le_bytes(received[offset..offset + 4].try_into().unwrap()) as usize;
+                    u32::from_le_bytes(received[offset..offset + 4].try_into().map_err(|_| {
+                        DistributedError::Protocol(format!(
+                            "invalid expert_id bytes at offset {offset}"
+                        ))
+                    })?) as usize;
                 if expert_id >= local_start && expert_id < local_end {
                     let local_expert_idx = expert_id - local_start;
                     let cursor = local_cursors[local_expert_idx];
@@ -1029,7 +1068,11 @@ kernel void moe_combine(
                 for (j, chunk) in received.chunks_exact(4).enumerate() {
                     if j < all_expert_outputs[peer_expert_idx].len() {
                         all_expert_outputs[peer_expert_idx][j] =
-                            f32::from_ne_bytes(chunk.try_into().unwrap());
+                            f32::from_ne_bytes(chunk.try_into().map_err(|_| {
+                                DistributedError::Protocol(format!(
+                                    "invalid f32 bytes at chunk {j} from peer {peer_rank}"
+                                ))
+                            })?);
                     }
                 }
             }

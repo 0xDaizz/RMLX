@@ -61,6 +61,11 @@ pub fn silu(
                 "silu not supported for quantized types; dequantize first".into(),
             ))
         }
+        DType::UInt32 => {
+            return Err(KernelError::InvalidShape(
+                "silu not supported for UInt32; cast to float first".into(),
+            ))
+        }
     };
 
     let pipeline = registry.get_pipeline(kernel_name, input.dtype())?;

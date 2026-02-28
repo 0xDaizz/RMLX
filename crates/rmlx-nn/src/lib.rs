@@ -11,5 +11,5 @@ pub mod transformer;
 pub use attention::{Attention, AttentionConfig};
 pub use embedding::{Embedding, EmbeddingConfig};
 pub use linear::{Linear, LinearConfig};
-pub use moe::{MoeConfig, MoeLayer};
+pub use moe::{MoeConfig, MoeForwardMetrics, MoeLayer};
 pub use transformer::{FeedForwardType, TransformerBlock, TransformerConfig, TransformerModel};

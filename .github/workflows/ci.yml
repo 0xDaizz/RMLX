@@ -44,3 +44,5 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+        # Note: RDMA hardware tests are #[ignore] by default.
+        # To run them on hardware nodes: RMLX_TEST_RDMA=1 cargo test -- --ignored

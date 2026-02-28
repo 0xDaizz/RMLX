@@ -1,10 +1,52 @@
 //! Mixture of Experts layer with top-k gating.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use rmlx_core::array::Array;
 use rmlx_core::kernels::{KernelError, KernelRegistry};
 use rmlx_core::ops;
 
 use crate::linear::Linear;
+
+/// Lightweight forward-pass metrics for MoE routing.
+///
+/// Records dispatch counts and tokens routed during `MoeLayer::forward()`.
+/// Uses atomic counters so the struct can be shared behind `Arc` if needed.
+pub struct MoeForwardMetrics {
+    /// Total number of forward() calls.
+    pub forward_count: AtomicU64,
+    /// Total tokens routed across all forward() calls.
+    pub total_tokens_routed: AtomicU64,
+}
+
+impl MoeForwardMetrics {
+    pub fn new() -> Self {
+        Self {
+            forward_count: AtomicU64::new(0),
+            total_tokens_routed: AtomicU64::new(0),
+        }
+    }
+
+    pub fn record_forward(&self, tokens: u64) {
+        self.forward_count.fetch_add(1, Ordering::Relaxed);
+        self.total_tokens_routed
+            .fetch_add(tokens, Ordering::Relaxed);
+    }
+
+    pub fn forward_count(&self) -> u64 {
+        self.forward_count.load(Ordering::Relaxed)
+    }
+
+    pub fn total_tokens_routed(&self) -> u64 {
+        self.total_tokens_routed.load(Ordering::Relaxed)
+    }
+}
+
+impl Default for MoeForwardMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 pub struct MoeConfig {
     pub num_experts: usize,
@@ -67,6 +109,7 @@ pub struct MoeLayer {
     config: MoeConfig,
     gate: Option<Linear>,
     experts: Vec<Expert>,
+    metrics: MoeForwardMetrics,
 }
 
 impl MoeLayer {
@@ -77,6 +120,7 @@ impl MoeLayer {
             config,
             gate: None,
             experts: Vec::new(),
+            metrics: MoeForwardMetrics::new(),
         })
     }
 
@@ -98,6 +142,7 @@ impl MoeLayer {
             config,
             gate: Some(gate),
             experts,
+            metrics: MoeForwardMetrics::new(),
         })
     }
 
@@ -132,6 +177,9 @@ impl MoeLayer {
         let dev = registry.device().raw();
         let elem_size = x.dtype().size_of();
 
+        // Record metrics
+        self.metrics.record_forward(seq_len as u64);
+
         // Gate logits: [seq_len, num_experts]
         let gate_logits = gate.forward(x, registry, queue)?;
 
@@ -143,6 +191,9 @@ impl MoeLayer {
 
         // For each token, find top-k expert indices and weights
         let output = Array::zeros(dev, &[seq_len, hidden_dim], x.dtype());
+
+        // Collect per-token expert outputs, then batch-copy into the result
+        let mut tok_outputs: Vec<Option<Array>> = Vec::with_capacity(seq_len);
 
         for tok in 0..seq_len {
             let row_start = tok * num_experts;
@@ -187,18 +238,27 @@ impl MoeLayer {
                 });
             }
 
-            // Copy accumulated output into the result row
-            if let Some(ref out_tok) = tok_output {
+            tok_outputs.push(tok_output);
+        }
+
+        // Batch-copy all token outputs into the result in a single command buffer
+        let copy_kernel = match x.dtype() {
+            rmlx_core::dtype::DType::Float32 => "copy_f32",
+            rmlx_core::dtype::DType::Float16 => "copy_f16",
+            rmlx_core::dtype::DType::Bfloat16 => "copy_bf16",
+            other => {
+                return Err(KernelError::InvalidShape(format!(
+                    "MoE forward: unsupported dtype {:?} for copy kernel",
+                    other
+                )));
+            }
+        };
+        let pipeline = registry.get_pipeline(copy_kernel, x.dtype())?;
+        let cb = queue.new_command_buffer();
+        for (tok, tok_out) in tok_outputs.iter().enumerate() {
+            if let Some(ref out_tok) = tok_out {
                 let dst_offset = tok * hidden_dim * elem_size;
                 let dst_view = output.view(vec![1, hidden_dim], vec![hidden_dim, 1], dst_offset);
-                let copy_kernel = match x.dtype() {
-                    rmlx_core::dtype::DType::Float32 => "copy_f32",
-                    rmlx_core::dtype::DType::Float16 => "copy_f16",
-                    rmlx_core::dtype::DType::Bfloat16 => "copy_bf16",
-                    _ => unreachable!(),
-                };
-                let pipeline = registry.get_pipeline(copy_kernel, x.dtype())?;
-                let cb = queue.new_command_buffer();
                 let enc = cb.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(&pipeline);
                 enc.set_buffer(0, Some(out_tok.metal_buffer()), out_tok.offset() as u64);
@@ -214,10 +274,10 @@ impl MoeLayer {
                 );
                 enc.dispatch_threads(grid, tg);
                 enc.end_encoding();
-                cb.commit();
-                cb.wait_until_completed();
             }
         }
+        cb.commit();
+        cb.wait_until_completed();
 
         Ok(output)
     }
@@ -232,5 +292,10 @@ impl MoeLayer {
 
     pub fn hidden_dim(&self) -> usize {
         self.config.hidden_dim
+    }
+
+    /// Access forward-pass metrics.
+    pub fn metrics(&self) -> &MoeForwardMetrics {
+        &self.metrics
     }
 }
