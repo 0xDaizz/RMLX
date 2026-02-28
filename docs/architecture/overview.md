@@ -1,6 +1,6 @@
 # 아키텍처 개요
 
-RMLX는 5개의 레이어로 구성된 계층형 아키텍처입니다. 각 레이어는 명확한 책임 경계를 가지며, Cargo 크레이트 단위로 분리되어 있습니다.
+RMLX는 5개의 레이어로 구성된 계층형 아키텍처이며, 전 Phase(0~7C)가 완료되어 완전히 구현된 상태입니다. 각 레이어는 명확한 책임 경계를 가지며, Cargo 크레이트 단위로 분리되어 있습니다. Phase 7에서 추가된 VJP autodiff, LoRA fine-tuning, 프로덕션 하드닝(structured logging, metrics, precision guard, graceful shutdown), 그리고 PyO3 Python 바인딩(rmlx-python)이 포함됩니다.
 
 ---
 
@@ -141,16 +141,21 @@ Thunderbolt 5 RDMA를 통한 노드 간 통신을 담당합니다.
 ## 크레이트 의존성 그래프
 
 ```
-                    rmlx-nn
+               rmlx-python (PyO3)
                       │
-                      ▼
-rmlx-distributed ← rmlx-core
-      │               │    │
-      │               ▼    ▼
-      │          rmlx-metal  rmlx-alloc
-      │                        │
-      ▼                        ▼
-  rmlx-rdma ───────────── rmlx-alloc (이중 등록용)
+              ┌───────┼───────┐
+              ▼       ▼       ▼
+          rmlx-nn  rmlx-distributed
+              │       │       │
+              └───┬───┘       │
+                  ▼           │
+              rmlx-core       │
+               │    │         │
+               ▼    ▼         ▼
+          rmlx-metal  rmlx-alloc
+                        │
+                        ▼
+                    rmlx-rdma
 ```
 
 정확한 의존 관계를 정리하면 다음과 같습니다.
@@ -163,6 +168,7 @@ rmlx-distributed ← rmlx-core
 | `rmlx-core` | `rmlx-metal`, `rmlx-alloc` |
 | `rmlx-distributed` | `rmlx-core`, `rmlx-rdma` |
 | `rmlx-nn` | `rmlx-core` |
+| `rmlx-python` | `rmlx-core`, `rmlx-nn`, `rmlx-distributed` (PyO3 0.28) |
 
 **의존성 원칙**: 하위 레이어(rmlx-metal, rmlx-alloc)는 상위 레이어(rmlx-core, rmlx-nn)에 대해 무지합니다. 모든 의존성은 단방향이며 순환 의존은 허용되지 않습니다.
 
