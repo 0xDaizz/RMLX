@@ -103,6 +103,9 @@ impl BinaryOp {
             (BinaryOp::Mul, DType::Float16 | DType::Bfloat16) => "mul_f16",
             (BinaryOp::Sub, DType::Float16 | DType::Bfloat16) => "sub_f16",
             (BinaryOp::Div, DType::Float16 | DType::Bfloat16) => "div_f16",
+            (_, DType::Q4_0 | DType::Q4_1 | DType::Q8_0) => {
+                unimplemented!("binary ops not supported for quantized types")
+            }
         }
     }
 }

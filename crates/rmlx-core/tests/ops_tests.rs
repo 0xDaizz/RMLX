@@ -229,6 +229,77 @@ fn test_rope_identity() {
 
 // --- Negative tests ---
 
+// ─── GEMM tests ───
+
+#[test]
+fn test_matmul_f32() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    // A: 2x3, B: 3x2 -> C: 2x2
+    // A = [[1,2,3],[4,5,6]], B = [[1,0],[0,1],[1,1]]
+    // C = [[1+0+3, 0+2+3], [4+0+6, 0+5+6]] = [[4,5],[10,11]]
+    let a = Array::from_slice(
+        registry.device().raw(),
+        &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0],
+        vec![2, 3],
+    );
+    let b = Array::from_slice(
+        registry.device().raw(),
+        &[1.0f32, 0.0, 0.0, 1.0, 1.0, 1.0],
+        vec![3, 2],
+    );
+    let c = ops::matmul::matmul(&registry, &a, &b, &queue).expect("matmul failed");
+    let vals: Vec<f32> = unsafe { c.to_vec() };
+    assert!((vals[0] - 4.0).abs() < 1e-3, "C[0,0] = {}", vals[0]);
+    assert!((vals[1] - 5.0).abs() < 1e-3, "C[0,1] = {}", vals[1]);
+    assert!((vals[2] - 10.0).abs() < 1e-3, "C[1,0] = {}", vals[2]);
+    assert!((vals[3] - 11.0).abs() < 1e-3, "C[1,1] = {}", vals[3]);
+}
+
+#[test]
+fn test_matmul_square() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    // Identity * anything = anything
+    let eye = Array::from_slice(
+        registry.device().raw(),
+        &[1.0f32, 0.0, 0.0, 1.0],
+        vec![2, 2],
+    );
+    let m = Array::from_slice(
+        registry.device().raw(),
+        &[5.0f32, 6.0, 7.0, 8.0],
+        vec![2, 2],
+    );
+    let result = ops::matmul::matmul(&registry, &eye, &m, &queue).expect("matmul failed");
+    let vals: Vec<f32> = unsafe { result.to_vec() };
+    assert!((vals[0] - 5.0).abs() < 1e-3);
+    assert!((vals[1] - 6.0).abs() < 1e-3);
+    assert!((vals[2] - 7.0).abs() < 1e-3);
+    assert!((vals[3] - 8.0).abs() < 1e-3);
+}
+
+// ─── Negative tests ───
+
+#[test]
+fn test_matmul_shape_mismatch() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let a = Array::from_slice(registry.device().raw(), &[1.0f32, 2.0], vec![1, 2]);
+    let b = Array::from_slice(registry.device().raw(), &[1.0f32, 2.0, 3.0], vec![1, 3]);
+    // This should panic due to inner dimension mismatch
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ops::matmul::matmul(&registry, &a, &b, &queue)
+    }));
+    assert!(result.is_err(), "matmul should panic on shape mismatch");
+}
+
 #[test]
 fn test_missing_kernel_error() {
     let device = match GpuDevice::system_default() {
