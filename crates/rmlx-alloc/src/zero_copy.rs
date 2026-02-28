@@ -20,9 +20,17 @@ pub struct ZeroCopyBuffer {
     _alignment: usize,
 }
 
-// SAFETY: The underlying buffer is StorageModeShared and the raw pointer
-// is owned by this struct. GPU access is synchronized via in-flight tokens.
+// SAFETY: ZeroCopyBuffer can be sent between threads because:
+// 1. The raw_ptr is heap-allocated (posix_memalign) and owned solely by this struct.
+// 2. The Metal buffer is StorageModeShared (CPU+GPU coherent on Apple Silicon UMA).
+// 3. The in_flight Arc<()> is itself Send+Sync.
 unsafe impl Send for ZeroCopyBuffer {}
+
+// SAFETY: ZeroCopyBuffer can be shared between threads because:
+// 1. Immutable access (&self) only exposes the raw pointer value and Metal buffer reference.
+// 2. Mutable pointer access (as_mut_ptr) requires &mut self, enforcing exclusive access.
+// 3. In-flight tracking (Arc<()>) is thread-safe (atomic ref count).
+// 4. Metal GPU operations are synchronized externally via command buffer completion handlers.
 unsafe impl Sync for ZeroCopyBuffer {}
 
 impl ZeroCopyBuffer {

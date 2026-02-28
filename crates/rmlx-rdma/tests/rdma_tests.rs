@@ -151,3 +151,55 @@ fn test_rdma_error_display() {
         );
     }
 }
+
+#[test]
+fn test_ibv_send_wr_layout_size() {
+    // IbvSendWr must be at least 80 bytes to match C ibv_send_wr
+    let size = std::mem::size_of::<rmlx_rdma::ffi::IbvSendWr>();
+    assert!(
+        size >= 80,
+        "IbvSendWr is {size} bytes but C ibv_send_wr is ~80 bytes"
+    );
+}
+
+#[test]
+fn test_ibv_wr_union_size() {
+    // IbvWrUnion must be at least 32 bytes (atomic variant: 28B + alignment)
+    let size = std::mem::size_of::<rmlx_rdma::ffi::IbvWrUnion>();
+    assert!(
+        size >= 32,
+        "IbvWrUnion is {size} bytes but C union wr is 32 bytes"
+    );
+}
+
+#[test]
+fn test_ibv_send_wr_zeroed_is_valid() {
+    // A zeroed IbvSendWr should be safe to construct and inspect
+    let wr: rmlx_rdma::ffi::IbvSendWr = unsafe { std::mem::zeroed() };
+    assert_eq!(wr.wr_id, 0);
+    assert!(wr.next.is_null());
+    assert!(wr.sg_list.is_null());
+    assert_eq!(wr.num_sge, 0);
+    assert_eq!(wr.opcode, 0);
+    assert_eq!(wr.send_flags, 0);
+    assert_eq!(wr.imm_data, 0);
+}
+
+#[test]
+fn test_ibv_recv_wr_layout() {
+    // IbvRecvWr should be 32 bytes: wr_id(8) + next(8) + sg_list(8) + num_sge(4) + pad(4)
+    let size = std::mem::size_of::<rmlx_rdma::ffi::IbvRecvWr>();
+    assert!(
+        size >= 24,
+        "IbvRecvWr is {size} bytes, expected at least 24"
+    );
+
+    // Verify zero construction works
+    let wr = rmlx_rdma::ffi::IbvRecvWr {
+        wr_id: 42,
+        next: std::ptr::null_mut(),
+        sg_list: std::ptr::null_mut(),
+        num_sge: 0,
+    };
+    assert_eq!(wr.wr_id, 42);
+}

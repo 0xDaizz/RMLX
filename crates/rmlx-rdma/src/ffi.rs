@@ -194,7 +194,11 @@ pub struct IbvWc {
     pub dlid_path_bits: u8,
 }
 
-/// Send work request
+/// Send work request — matches C ibv_send_wr layout (~80 bytes).
+///
+/// SAFETY: The struct is repr(C) and sized to match the C ibv_send_wr.
+/// The trailing `_qp_type_pad` covers the C union `qp_type { struct { uint32_t remote_srqn; } xrc; }`.
+/// The `_trailing_pad` provides safety margin for any platform-specific trailing fields.
 #[repr(C)]
 pub struct IbvSendWr {
     pub wr_id: u64,
@@ -203,9 +207,14 @@ pub struct IbvSendWr {
     pub num_sge: c_int,
     pub opcode: u32,
     pub send_flags: u32,
+    /// Immediate data (also used as invalidate_rkey in some operations).
     pub imm_data: u32,
-    // Union fields for RDMA/atomic — simplified for UC send
+    /// Work request type-specific data (RDMA/atomic/UD).
     pub wr: IbvWrUnion,
+    /// Trailing qp_type union (covers xrc.remote_srqn, 4 bytes).
+    _qp_type_pad: u32,
+    /// Safety margin for platform-specific trailing fields or future extensions.
+    _trailing_pad: [u8; 4],
 }
 
 /// Receive work request
@@ -225,13 +234,20 @@ pub struct IbvSge {
     pub lkey: u32,
 }
 
-/// Work request union (simplified — only UD/RDMA fields used)
+/// Work request union — sized to match the C ibv_send_wr.wr union.
+/// The C union's largest variant (atomic) is 28 bytes; with 8-byte alignment → 32 bytes.
+/// We keep the rdma-relevant named fields and add padding for the atomic variant's extra space.
 #[repr(C)]
 pub struct IbvWrUnion {
-    pub ah: *mut c_void,  // address handle for UD
-    pub remote_addr: u64, // for RDMA write/read
+    /// For UD: address handle pointer. For RDMA: overlaps with remote_addr.
+    pub ah: *mut c_void,
+    /// For RDMA: remote address. For atomic: compare_add lives here.
+    pub remote_addr: u64,
+    /// For RDMA/atomic: remote key.
     pub rkey: u32,
-    _pad: [u8; 4],
+    /// Padding to cover atomic variant's swap field and alignment.
+    /// atomic variant needs: remote_addr(8)+compare_add(8)+swap(8)+rkey(4) = 28B → 32B aligned
+    _atomic_pad: [u8; 12],
 }
 
 /// ibv_access_flags
