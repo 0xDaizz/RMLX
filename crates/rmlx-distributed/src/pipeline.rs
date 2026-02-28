@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 use rmlx_alloc::zero_copy::{CompletionError, CompletionTicket};
 use rmlx_metal::event::GpuEvent;
 
+use crate::group::DistributedError;
+
 /// Pipeline stage for tracking layer execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PipelineStage {
@@ -106,23 +108,38 @@ impl LayerPipeline {
     ///
     /// The ticket tracks both GPU compute and RDMA transfer completion
     /// for this layer's output buffer.
-    pub fn begin_compute(&mut self, layer: usize) {
-        assert!(layer < self.config.num_layers);
+    pub fn begin_compute(&mut self, layer: usize) -> Result<(), DistributedError> {
+        if layer >= self.config.num_layers {
+            return Err(DistributedError::Transport(format!(
+                "layer index {layer} out of range (num_layers={})",
+                self.config.num_layers
+            )));
+        }
         self.stages[layer] = PipelineStage::Computing;
         self.tickets[layer] = Some(CompletionTicket::new());
+        Ok(())
     }
 
     /// Mark a layer as computing with a GpuEvent for hardware-level completion tracking.
     ///
     /// Returns the signal value that should be encoded into the command buffer
     /// so the event fires on GPU completion.
-    pub fn begin_compute_with_event(&mut self, layer: usize, event: Arc<GpuEvent>) -> u64 {
-        assert!(layer < self.config.num_layers);
+    pub fn begin_compute_with_event(
+        &mut self,
+        layer: usize,
+        event: Arc<GpuEvent>,
+    ) -> Result<u64, DistributedError> {
+        if layer >= self.config.num_layers {
+            return Err(DistributedError::Transport(format!(
+                "layer index {layer} out of range (num_layers={})",
+                self.config.num_layers
+            )));
+        }
         self.stages[layer] = PipelineStage::Computing;
         let mut ticket = CompletionTicket::new();
         let signal_val = ticket.with_gpu_event(event);
         self.tickets[layer] = Some(ticket);
-        signal_val
+        Ok(signal_val)
     }
 
     /// Mark a layer as transferring.
@@ -130,33 +147,49 @@ impl LayerPipeline {
     /// GPU compute for this layer's output should have already completed.
     /// If no GpuEvent is attached to the ticket, manually marks the GPU phase
     /// as complete. Event-based tickets auto-detect via the shared event.
-    pub fn begin_transfer(&mut self, layer: usize) {
-        assert!(layer < self.config.num_layers);
+    pub fn begin_transfer(&mut self, layer: usize) -> Result<(), DistributedError> {
+        if layer >= self.config.num_layers {
+            return Err(DistributedError::Transport(format!(
+                "layer index {layer} out of range (num_layers={})",
+                self.config.num_layers
+            )));
+        }
         self.stages[layer] = PipelineStage::Transferring;
         if let Some(ref ticket) = self.tickets[layer] {
             if !ticket.has_gpu_event() {
                 ticket.mark_gpu_complete();
             }
         }
+        Ok(())
     }
 
     /// Mark a layer as complete, optionally signaling RDMA completion.
     ///
     /// If `rdma_complete` is true, marks the ticket's RDMA phase as complete.
     /// Pass false if RDMA completion will be signaled externally.
-    pub fn complete(&mut self, layer: usize) {
-        self.complete_with_rdma(layer, true);
+    pub fn complete(&mut self, layer: usize) -> Result<(), DistributedError> {
+        self.complete_with_rdma(layer, true)
     }
 
     /// Mark a layer as complete with explicit RDMA completion control.
-    pub fn complete_with_rdma(&mut self, layer: usize, rdma_complete: bool) {
-        assert!(layer < self.config.num_layers);
+    pub fn complete_with_rdma(
+        &mut self,
+        layer: usize,
+        rdma_complete: bool,
+    ) -> Result<(), DistributedError> {
+        if layer >= self.config.num_layers {
+            return Err(DistributedError::Transport(format!(
+                "layer index {layer} out of range (num_layers={})",
+                self.config.num_layers
+            )));
+        }
         self.stages[layer] = PipelineStage::Complete;
         if rdma_complete {
             if let Some(ref ticket) = self.tickets[layer] {
                 ticket.mark_rdma_complete();
             }
         }
+        Ok(())
     }
 
     /// Wait for a layer's GPU and RDMA operations to fully complete.
@@ -165,7 +198,9 @@ impl LayerPipeline {
         layer: usize,
         timeout: Duration,
     ) -> Result<(), CompletionError> {
-        assert!(layer < self.config.num_layers);
+        if layer >= self.config.num_layers {
+            return Err(CompletionError::GpuTimeout);
+        }
         match &self.tickets[layer] {
             Some(ticket) => ticket.wait_all_complete(timeout),
             None => Ok(()),
@@ -212,7 +247,7 @@ impl LayerPipeline {
     /// When a Metal device is available, uses two real MTLCommandQueues:
     /// - Queue 0: compute work
     /// - Queue 1: transfer/copy work
-    /// This measures actual GPU-level overlap rather than CPU thread parallelism.
+    ///   This measures actual GPU-level overlap rather than CPU thread parallelism.
     ///
     /// Falls back to CPU thread parallelism if no Metal device is available.
     pub fn measure_overlap(

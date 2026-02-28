@@ -20,7 +20,7 @@ fn test_tape_record_backward() {
     };
     let out = tape.record(&[&x, &x2], output_val, Operation::Mul, Box::new(grad_fn));
 
-    let grads = tape.backward(&out);
+    let grads = tape.backward(&out).expect("backward failed");
     // df/dx = rhs * grad_out + lhs * grad_out = 3*1 + 3*1 = 6?
     // Actually: x and x2 are separate leaves. grad for x = rhs = 3.0, grad for x2 = lhs = 3.0
     // But conceptually f(x) = x*x, so we want 2x = 6.
@@ -49,7 +49,7 @@ fn test_vjp_add() {
     let grad_fn = AddGrad { len: 2 };
     let out = tape.record(&[&a, &b], output, Operation::Add, Box::new(grad_fn));
 
-    let grads = tape.backward(&out);
+    let grads = tape.backward(&out).expect("backward failed");
     // df/da = [1, 1], df/db = [1, 1]
     assert_eq!(grads[0], vec![1.0, 1.0]);
     assert_eq!(grads[1], vec![1.0, 1.0]);
@@ -70,7 +70,7 @@ fn test_vjp_mul() {
     };
     let out = tape.record(&[&a, &b], output, Operation::Mul, Box::new(grad_fn));
 
-    let grads = tape.backward(&out);
+    let grads = tape.backward(&out).expect("backward failed");
     // df/da = b = [4, 5], df/db = a = [2, 3]
     assert_eq!(grads[0], vec![4.0, 5.0]);
     assert_eq!(grads[1], vec![2.0, 3.0]);
@@ -134,7 +134,7 @@ fn test_vjp_matmul() {
         Box::new(grad_fn),
     );
 
-    let grads = tape.backward(&out);
+    let grads = tape.backward(&out).expect("backward failed");
     // With grad_output = [[1,1],[1,1]]
     // dA = grad @ B^T = [[1,1],[1,1]] @ [[1,0,1],[0,1,1]] = [[1,1,2],[1,1,2]]
     assert_eq!(grads[0].len(), 6);
@@ -143,6 +143,45 @@ fn test_vjp_matmul() {
     assert!((grads[0][2] - 2.0).abs() < 1e-5); // dA[0,2]
                                                // dB = A^T @ grad = [[1,4],[2,5],[3,6]]^T ... = [[5,5],[7,7],[9,9]]
     assert_eq!(grads[1].len(), 6);
+}
+
+#[test]
+fn test_placeholder_grad_returns_error() {
+    use rmlx_core::vjp::{GradFn, PlaceholderGrad, VjpError};
+    let grad = PlaceholderGrad {
+        op_name: "rope".to_string(),
+        input_lens: vec![4],
+    };
+    let result = grad.backward(&[1.0, 0.0, 0.0, 0.0]);
+    assert!(result.is_err(), "PlaceholderGrad should return Err");
+    match result.unwrap_err() {
+        VjpError::UnsupportedBackward(op) => {
+            assert_eq!(op, "rope");
+        }
+    }
+}
+
+#[test]
+fn test_tape_backward_with_placeholder_returns_error() {
+    use rmlx_core::vjp::{Operation, PlaceholderGrad};
+    let mut tape = Tape::new();
+    let a = tape.leaf(vec![1.0f32, 2.0]);
+    let output = vec![1.0f32, 2.0];
+    let grad = PlaceholderGrad {
+        op_name: "custom_op".to_string(),
+        input_lens: vec![2],
+    };
+    let out = tape.record(
+        &[&a],
+        output,
+        Operation::Custom("custom_op".into()),
+        Box::new(grad),
+    );
+    let result = tape.backward(&out);
+    assert!(
+        result.is_err(),
+        "backward through PlaceholderGrad should fail"
+    );
 }
 
 // ─── LoRA tests ───
@@ -159,7 +198,7 @@ fn test_lora_config_defaults() {
 
 #[test]
 fn test_lora_layer_shape() {
-    let config = LoraConfig::new(4, 16.0);
+    let config = LoraConfig::new(4, 16.0).expect("LoraConfig::new failed");
     let layer = LoraLayer::new(8, 16, &config);
     assert_eq!(layer.in_features, 8);
     assert_eq!(layer.out_features, 16);
@@ -172,13 +211,15 @@ fn test_lora_layer_shape() {
 #[test]
 fn test_lora_forward_zero_init() {
     // B is zero-initialized, so LoRA contribution should be zero
-    let config = LoraConfig::new(4, 16.0);
+    let config = LoraConfig::new(4, 16.0).expect("LoraConfig::new failed");
     let layer = LoraLayer::new(8, 16, &config);
 
     let input = vec![1.0f32; 8]; // batch=1, in=8
     let base_output = vec![5.0f32; 16]; // batch=1, out=16
 
-    let output = layer.forward(&base_output, &input, 1);
+    let output = layer
+        .forward(&base_output, &input, 1)
+        .expect("forward failed");
     // Should equal base_output since B=0
     for (i, (&got, &expected)) in output.iter().zip(base_output.iter()).enumerate() {
         assert!(
@@ -190,13 +231,13 @@ fn test_lora_forward_zero_init() {
 
 #[test]
 fn test_lora_scaling() {
-    let config = LoraConfig::new(8, 16.0);
+    let config = LoraConfig::new(8, 16.0).expect("new failed");
     assert!((config.scaling() - 2.0).abs() < 1e-10);
 
-    let config2 = LoraConfig::new(4, 8.0);
+    let config2 = LoraConfig::new(4, 8.0).expect("new failed");
     assert!((config2.scaling() - 2.0).abs() < 1e-10);
 
-    let config3 = LoraConfig::new(16, 16.0);
+    let config3 = LoraConfig::new(16, 16.0).expect("new failed");
     assert!((config3.scaling() - 1.0).abs() < 1e-10);
 }
 
@@ -212,7 +253,8 @@ fn test_lora_train_step_loss_decreases() {
     let lora_a = vec![0.1f32; rank * in_features];
     let lora_b = vec![0.1f32; out_features * rank];
 
-    let mut layer = LoraLayer::with_weights(in_features, out_features, rank, alpha, lora_a, lora_b);
+    let mut layer = LoraLayer::with_weights(in_features, out_features, rank, alpha, lora_a, lora_b)
+        .expect("with_weights failed");
 
     let input = vec![1.0f32, 0.5, -0.5, 0.2];
     let base_output = vec![0.0f32; out_features]; // zero base
@@ -225,19 +267,27 @@ fn test_lora_train_step_loss_decreases() {
     });
 
     // Compute loss before
-    let logits_before = layer.forward(&base_output, &input, 1);
-    let loss_before = LoraTrainer::compute_loss(&logits_before, &targets, out_features);
+    let logits_before = layer
+        .forward(&base_output, &input, 1)
+        .expect("forward failed");
+    let loss_before =
+        LoraTrainer::compute_loss(&logits_before, &targets, out_features).expect("loss failed");
 
     // One training step
-    let step_loss = trainer.train_step(&mut layer, &input, &base_output, &targets);
+    let step_loss = trainer
+        .train_step(&mut layer, &input, &base_output, &targets)
+        .expect("train_step failed");
     assert!(
         (step_loss - loss_before).abs() < 1e-5,
         "step_loss should equal loss_before"
     );
 
     // Compute loss after
-    let logits_after = layer.forward(&base_output, &input, 1);
-    let loss_after = LoraTrainer::compute_loss(&logits_after, &targets, out_features);
+    let logits_after = layer
+        .forward(&base_output, &input, 1)
+        .expect("forward failed");
+    let loss_after =
+        LoraTrainer::compute_loss(&logits_after, &targets, out_features).expect("loss failed");
 
     assert!(
         loss_after < loss_before,

@@ -149,6 +149,51 @@ pub struct IbvQpAttr {
     pub rate_limit: u32,
 }
 
+/// Device attributes (from ibv_query_device)
+#[repr(C)]
+pub struct IbvDeviceAttr {
+    pub fw_ver: [c_char; 64],
+    pub node_guid: u64,
+    pub sys_image_guid: u64,
+    pub max_mr_size: u64,
+    pub page_size_cap: u64,
+    pub vendor_id: u32,
+    pub vendor_part_id: u32,
+    pub hw_ver: u32,
+    pub max_qp: c_int,
+    pub max_qp_wr: c_int,
+    pub device_cap_flags: u32,
+    pub max_sge: c_int,
+    pub max_sge_rd: c_int,
+    pub max_cq: c_int,
+    pub max_cqe: c_int,
+    pub max_mr: c_int,
+    pub max_pd: c_int,
+    pub max_qp_rd_atom: c_int,
+    pub max_ee_rd_atom: c_int,
+    pub max_res_rd_atom: c_int,
+    pub max_qp_init_rd_atom: c_int,
+    pub max_ee_init_rd_atom: c_int,
+    pub atomic_cap: c_int,
+    pub max_ee: c_int,
+    pub max_rdd: c_int,
+    pub max_mw: c_int,
+    pub max_raw_ipv6_qp: c_int,
+    pub max_raw_ethy_qp: c_int,
+    pub max_mcast_grp: c_int,
+    pub max_mcast_qp_attach: c_int,
+    pub max_total_mcast_qp_attach: c_int,
+    pub max_ah: c_int,
+    pub max_fmr: c_int,
+    pub max_map_per_fmr: c_int,
+    pub max_srq: c_int,
+    pub max_srq_wr: c_int,
+    pub max_srq_sge: c_int,
+    pub max_pkeys: u16,
+    pub local_ca_ack_delay: u8,
+    pub phys_port_cnt: u8,
+}
+
 /// Port attributes
 #[repr(C)]
 pub struct IbvPortAttr {
@@ -364,7 +409,8 @@ pub struct IbverbsLib {
     pub create_qp: unsafe extern "C" fn(*mut IbvPd, *mut IbvQpInitAttr) -> *mut IbvQp,
     pub destroy_qp: unsafe extern "C" fn(*mut IbvQp) -> c_int,
     pub modify_qp: unsafe extern "C" fn(*mut IbvQp, *mut IbvQpAttr, c_int) -> c_int,
-    // Port/GID queries
+    // Device/Port/GID queries
+    pub query_device: unsafe extern "C" fn(*mut IbvContext, *mut IbvDeviceAttr) -> c_int,
     pub query_port: unsafe extern "C" fn(*mut IbvContext, u8, *mut IbvPortAttr) -> c_int,
     pub query_gid: unsafe extern "C" fn(*mut IbvContext, u8, c_int, *mut IbvGid) -> c_int,
     // Post operations
@@ -420,6 +466,7 @@ impl IbverbsLib {
             type FnCreateQp = unsafe extern "C" fn(*mut IbvPd, *mut IbvQpInitAttr) -> *mut IbvQp;
             type FnDestroyQp = unsafe extern "C" fn(*mut IbvQp) -> c_int;
             type FnModifyQp = unsafe extern "C" fn(*mut IbvQp, *mut IbvQpAttr, c_int) -> c_int;
+            type FnQueryDevice = unsafe extern "C" fn(*mut IbvContext, *mut IbvDeviceAttr) -> c_int;
             type FnQueryPort = unsafe extern "C" fn(*mut IbvContext, u8, *mut IbvPortAttr) -> c_int;
             type FnQueryGid =
                 unsafe extern "C" fn(*mut IbvContext, u8, c_int, *mut IbvGid) -> c_int;
@@ -444,6 +491,7 @@ impl IbverbsLib {
                 create_qp: load_sym!(lib, "ibv_create_qp", FnCreateQp),
                 destroy_qp: load_sym!(lib, "ibv_destroy_qp", FnDestroyQp),
                 modify_qp: load_sym!(lib, "ibv_modify_qp", FnModifyQp),
+                query_device: load_sym!(lib, "ibv_query_device", FnQueryDevice),
                 query_port: load_sym!(lib, "ibv_query_port", FnQueryPort),
                 query_gid: load_sym!(lib, "ibv_query_gid", FnQueryGid),
                 post_send: load_sym!(lib, "ibv_post_send", FnPostSend),

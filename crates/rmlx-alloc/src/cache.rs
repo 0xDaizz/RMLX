@@ -41,9 +41,10 @@ impl BufferCache {
             .range(key..)
             .find_map(|(k, d)| if !d.is_empty() { Some(*k) } else { None });
         if let Some(k) = next_key {
-            let buf = self.bins.get_mut(&k).unwrap().pop_front().unwrap();
-            self.cache_size.fetch_sub(k, Ordering::Relaxed);
-            return Some(buf);
+            if let Some(buf) = self.bins.get_mut(&k).and_then(|d| d.pop_front()) {
+                self.cache_size.fetch_sub(k, Ordering::Relaxed);
+                return Some(buf);
+            }
         }
         None
     }

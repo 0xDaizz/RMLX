@@ -1,13 +1,14 @@
 use rmlx_distributed::group::{self, DistributedError, Group, RdmaTransport};
 use rmlx_distributed::moe_exchange::{MoeCombineExchange, MoeDispatchConfig, MoeDispatchExchange};
 use rmlx_distributed::moe_policy::{MoeBackend, MoePolicy, ThresholdCalibration};
+use rmlx_distributed::sparse_guard::SparseGuard;
 use rmlx_distributed::warmup::WarmupState;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 #[test]
 fn test_group_world() {
-    let g = Group::world(4, 1);
+    let g = Group::world(4, 1).unwrap();
     assert_eq!(g.size(), 4);
     assert_eq!(g.local_rank(), 1);
     assert_eq!(g.peers(), vec![0, 2, 3]);
@@ -45,7 +46,7 @@ fn test_moe_policy_cooldown() {
 
 #[test]
 fn test_moe_dispatch_basic() {
-    let group = Group::world(2, 0);
+    let group = Group::world(2, 0).unwrap();
     let config = MoeDispatchConfig {
         num_experts: 8,
         top_k: 2,
@@ -69,7 +70,7 @@ fn test_moe_dispatch_basic() {
 
 #[test]
 fn test_moe_dispatch_overflow() {
-    let group = Group::world(2, 0);
+    let group = Group::world(2, 0).unwrap();
     let config = MoeDispatchConfig {
         num_experts: 4,
         top_k: 1,
@@ -91,7 +92,7 @@ fn test_moe_dispatch_overflow() {
 
 #[test]
 fn test_moe_combine_cpu() {
-    let group = Group::world(1, 0);
+    let group = Group::world(1, 0).unwrap();
     let combine = MoeCombineExchange::new(group);
     // 2 experts, 2 tokens, top_k=1, hidden_dim=3
     let expert0_out = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]; // 2 tokens * 3 dims
@@ -146,7 +147,7 @@ fn test_warmup_state() {
 
 #[test]
 fn test_group_display() {
-    let g = Group::world(2, 0);
+    let g = Group::world(2, 0).unwrap();
     let s = format!("{g}");
     assert!(s.contains("rank=0"));
     assert!(s.contains("size=2"));
@@ -208,7 +209,8 @@ fn test_moe_policy_hysteresis() {
 
 #[test]
 fn test_moe_dispatch_rdma_routing() {
-    let group = Group::world(2, 0);
+    let (t0, _t1) = LoopbackTransport::new_pair();
+    let group = Group::with_transport(vec![0, 1], 0, 2, t0).unwrap();
     let config = MoeDispatchConfig {
         num_experts: 8,
         top_k: 2,
@@ -320,7 +322,7 @@ fn test_ensure_materialized_zero_bytes() {
 
 #[test]
 fn test_route_cpu_scatters_tokens_correctly() {
-    let group = Group::world(2, 0);
+    let group = Group::world(2, 0).unwrap();
     let config = MoeDispatchConfig {
         num_experts: 4,
         top_k: 1,
@@ -348,7 +350,8 @@ fn test_route_cpu_scatters_tokens_correctly() {
 #[test]
 fn test_route_rdma_materialization_guard() {
     // Passing empty token_data should fail ensure_materialized in RDMA path
-    let group = Group::world(2, 0);
+    let (t0, _t1) = LoopbackTransport::new_pair();
+    let group = Group::with_transport(vec![0, 1], 0, 2, t0).unwrap();
     let config = MoeDispatchConfig {
         num_experts: 4,
         top_k: 1,
@@ -372,7 +375,7 @@ fn test_route_rdma_materialization_guard() {
 
 #[test]
 fn test_dispatch_result_has_routed_data() {
-    let group = Group::world(1, 0);
+    let group = Group::world(1, 0).unwrap();
     let config = MoeDispatchConfig {
         num_experts: 2,
         top_k: 1,
@@ -398,90 +401,45 @@ fn test_dispatch_result_has_routed_data() {
 // In release builds, they return DistributedError::NotMaterialized.
 
 #[test]
-#[should_panic(expected = "not materialized")]
-#[cfg(debug_assertions)]
-fn test_collective_allreduce_rejects_empty_debug() {
-    let g = Group::world(2, 0);
-    let _ = g.allreduce(&[]);
-}
-
-#[test]
-#[cfg(not(debug_assertions))]
-fn test_collective_allreduce_rejects_empty_release() {
-    let g = Group::world(2, 0);
+fn test_collective_allreduce_rejects_empty() {
+    let g = Group::world(2, 0).unwrap();
     assert!(g.allreduce(&[]).is_err());
 }
 
 #[test]
-#[should_panic(expected = "not materialized")]
-#[cfg(debug_assertions)]
-fn test_collective_allgather_rejects_empty_debug() {
-    let g = Group::world(2, 0);
-    let _ = g.allgather(&[]);
-}
-
-#[test]
-#[cfg(not(debug_assertions))]
-fn test_collective_allgather_rejects_empty_release() {
-    let g = Group::world(2, 0);
+fn test_collective_allgather_rejects_empty() {
+    let g = Group::world(2, 0).unwrap();
     assert!(g.allgather(&[]).is_err());
 }
 
 #[test]
-#[should_panic(expected = "not materialized")]
-#[cfg(debug_assertions)]
-fn test_collective_broadcast_rejects_empty_debug() {
-    let g = Group::world(2, 0);
-    let _ = g.broadcast(&[], 0);
-}
-
-#[test]
-#[cfg(not(debug_assertions))]
-fn test_collective_broadcast_rejects_empty_release() {
-    let g = Group::world(2, 0);
+fn test_collective_broadcast_rejects_empty() {
+    let g = Group::world(2, 0).unwrap();
     assert!(g.broadcast(&[], 0).is_err());
 }
 
 #[test]
-#[should_panic(expected = "not materialized")]
-#[cfg(debug_assertions)]
-fn test_collective_send_rejects_empty_debug() {
-    let g = Group::world(2, 0);
-    let _ = g.send(&[], 1);
-}
-
-#[test]
-#[cfg(not(debug_assertions))]
-fn test_collective_send_rejects_empty_release() {
-    let g = Group::world(2, 0);
+fn test_collective_send_rejects_empty() {
+    let g = Group::world(2, 0).unwrap();
     assert!(g.send(&[], 1).is_err());
 }
 
 #[test]
 fn test_collective_recv_rejects_zero_len() {
-    let g = Group::world(2, 0);
+    let g = Group::world(2, 0).unwrap();
     let result = g.recv(1, 0);
     assert!(result.is_err());
 }
 
 #[test]
-#[should_panic(expected = "not materialized")]
-#[cfg(debug_assertions)]
-fn test_collective_all_to_all_rejects_empty_debug() {
-    let g = Group::world(2, 0);
-    let _ = g.all_to_all(&[]);
-}
-
-#[test]
-#[cfg(not(debug_assertions))]
-fn test_collective_all_to_all_rejects_empty_release() {
-    let g = Group::world(2, 0);
+fn test_collective_all_to_all_rejects_empty() {
+    let g = Group::world(2, 0).unwrap();
     assert!(g.all_to_all(&[]).is_err());
 }
 
 #[test]
 fn test_collective_allreduce_accepts_valid() {
-    let g = Group::world(2, 0);
+    let g = Group::world(1, 0).unwrap();
     let data = vec![1u8, 2, 3, 4];
     let result = g.allreduce(&data);
     assert!(result.is_ok());
@@ -490,7 +448,7 @@ fn test_collective_allreduce_accepts_valid() {
 
 #[test]
 fn test_collective_send_recv_accepts_valid() {
-    let g = Group::world(2, 0);
+    let g = Group::world(1, 0).unwrap();
     let data = vec![1u8, 2, 3, 4];
     assert!(g.send(&data, 1).is_ok());
     let received = g.recv(1, 4).unwrap();
@@ -499,17 +457,123 @@ fn test_collective_send_recv_accepts_valid() {
 
 #[test]
 fn test_collective_all_to_all_accepts_valid() {
-    let g = Group::world(2, 0);
+    let g = Group::world(1, 0).unwrap();
     let data = vec![1u8; 64];
     let result = g.all_to_all(&data).unwrap();
     assert_eq!(result, data);
+}
+
+// ─── Fail-open removal: multi-rank without transport must error ───
+
+#[test]
+fn test_multirank_no_transport_allreduce_errors() {
+    let g = Group::world(2, 0).unwrap();
+    let data = vec![1u8, 2, 3, 4];
+    let result = g.allreduce(&data);
+    assert!(result.is_err());
+    let err = format!("{}", result.unwrap_err());
+    assert!(err.contains("requires transport"), "error: {err}");
+}
+
+#[test]
+fn test_multirank_no_transport_send_errors() {
+    let g = Group::world(2, 0).unwrap();
+    let data = vec![1u8, 2, 3, 4];
+    let result = g.send(&data, 1);
+    assert!(result.is_err());
+    let err = format!("{}", result.unwrap_err());
+    assert!(err.contains("requires transport"), "error: {err}");
+}
+
+#[test]
+fn test_multirank_no_transport_barrier_errors() {
+    let g = Group::world(3, 0).unwrap();
+    let result = g.barrier();
+    assert!(result.is_err());
+    let err = format!("{}", result.unwrap_err());
+    assert!(err.contains("requires transport"), "error: {err}");
+}
+
+#[test]
+fn test_all_to_all_rejects_indivisible_length() {
+    // Use a 3-rank group: 8 bytes % 3 != 0, but 8 is 4-byte aligned (passes materialization)
+    let queues = Arc::new(Mutex::new(HashMap::new()));
+    let t0: Arc<dyn RdmaTransport> = Arc::new(LoopbackTransport {
+        local_rank: 0,
+        queues,
+    });
+    let g = Group::with_transport(vec![0, 1, 2], 0, 3, t0).unwrap();
+    let data = vec![1u8; 8]; // 8 bytes, 4-aligned, but 8 % 3 != 0
+    let result = g.all_to_all(&data);
+    assert!(result.is_err());
+    let err = format!("{}", result.unwrap_err());
+    assert!(err.contains("divisible"), "error: {err}");
+}
+
+// ─── Barrier tests ───
+
+#[test]
+fn test_barrier_single_rank() {
+    let g = Group::world(1, 0).unwrap();
+    assert!(g.barrier().is_ok());
+}
+
+#[test]
+fn test_barrier_3_rank_with_loopback() {
+    // 3-rank barrier using loopback transport.
+    // Each rank sends a token right and receives from left, for 2 rounds.
+    let queues = Arc::new(Mutex::new(HashMap::new()));
+    let transports: Vec<Arc<dyn RdmaTransport>> = (0..3)
+        .map(|rank| {
+            Arc::new(LoopbackTransport {
+                local_rank: rank,
+                queues: queues.clone(),
+            }) as Arc<dyn RdmaTransport>
+        })
+        .collect();
+
+    // Run barriers from each rank sequentially (loopback doesn't need real concurrency)
+    for rank in 0..3u32 {
+        let g = Group::with_transport(vec![0, 1, 2], rank, 3, transports[rank as usize].clone())
+            .unwrap();
+        let result = g.barrier();
+        assert!(
+            result.is_ok(),
+            "barrier failed for rank {rank}: {:?}",
+            result
+        );
+    }
+}
+
+#[test]
+fn test_barrier_4_rank_with_loopback() {
+    let queues = Arc::new(Mutex::new(HashMap::new()));
+    let transports: Vec<Arc<dyn RdmaTransport>> = (0..4)
+        .map(|rank| {
+            Arc::new(LoopbackTransport {
+                local_rank: rank,
+                queues: queues.clone(),
+            }) as Arc<dyn RdmaTransport>
+        })
+        .collect();
+
+    for rank in 0..4u32 {
+        let g = Group::with_transport(vec![0, 1, 2, 3], rank, 4, transports[rank as usize].clone())
+            .unwrap();
+        let result = g.barrier();
+        assert!(
+            result.is_ok(),
+            "barrier failed for rank {rank}: {:?}",
+            result
+        );
+    }
 }
 
 // ─── MoeCombineExchange edge case tests ───
 
 #[test]
 fn test_moe_combine_cpu_empty_expert_output() {
-    let group = Group::world(1, 0);
+    let group = Group::world(1, 0).unwrap();
     let combine = MoeCombineExchange::new(group);
     // Expert 0 has output but expert 1 is empty
     let expert0_out = vec![1.0f32, 2.0, 3.0];
@@ -532,7 +596,7 @@ fn test_moe_combine_cpu_empty_expert_output() {
 
 #[test]
 fn test_moe_combine_cpu_zero_weights() {
-    let group = Group::world(1, 0);
+    let group = Group::world(1, 0).unwrap();
     let combine = MoeCombineExchange::new(group);
     let expert0_out = vec![10.0f32, 20.0, 30.0];
     let expert_outputs = vec![expert0_out];
@@ -547,7 +611,7 @@ fn test_moe_combine_cpu_zero_weights() {
 
 #[test]
 fn test_moe_combine_cpu_top2() {
-    let group = Group::world(1, 0);
+    let group = Group::world(1, 0).unwrap();
     let combine = MoeCombineExchange::new(group);
     // 1 token, top_k=2, hidden_dim=2, 2 experts
     let expert0_out = vec![1.0f32, 2.0]; // expert 0 output for token 0
@@ -563,7 +627,7 @@ fn test_moe_combine_cpu_top2() {
 
 #[test]
 fn test_moe_combine_cpu_out_of_range_expert() {
-    let group = Group::world(1, 0);
+    let group = Group::world(1, 0).unwrap();
     let combine = MoeCombineExchange::new(group);
     // Only 1 expert available, but index refers to expert 5 (out of range)
     let expert0_out = vec![1.0f32, 2.0];
@@ -625,6 +689,17 @@ impl RdmaTransport for LoopbackTransport {
             Ok(vec![0u8; len])
         }
     }
+
+    fn sendrecv(
+        &self,
+        send_data: &[u8],
+        dst_rank: u32,
+        recv_len: usize,
+        src_rank: u32,
+    ) -> Result<Vec<u8>, DistributedError> {
+        self.send(send_data, dst_rank)?;
+        self.recv(src_rank, recv_len)
+    }
 }
 
 // ─── Size exchange roundtrip test ───
@@ -635,7 +710,7 @@ fn test_rdma_size_exchange_roundtrip() {
     // We run dispatch on rank 0 and verify that size headers are sent.
     let (t0, _t1) = LoopbackTransport::new_pair();
 
-    let group = Group::with_transport(vec![0, 1], 0, 2, t0.clone());
+    let group = Group::with_transport(vec![0, 1], 0, 2, t0.clone()).unwrap();
     let config = MoeDispatchConfig {
         num_experts: 8,
         top_k: 1,
@@ -689,7 +764,7 @@ fn test_rdma_expert_id_preserved_in_merge() {
 
     // --- Rank 0 side: dispatch tokens destined for rank 1's experts ---
     {
-        let group0 = Group::with_transport(vec![0, 1], 0, 2, t0.clone());
+        let group0 = Group::with_transport(vec![0, 1], 0, 2, t0.clone()).unwrap();
         let config0 = MoeDispatchConfig {
             num_experts: 8,
             top_k: 1,
@@ -719,7 +794,7 @@ fn test_rdma_expert_id_preserved_in_merge() {
 
     // --- Rank 1 side: dispatch with all-local tokens to trigger RDMA recv ---
     {
-        let group1 = Group::with_transport(vec![0, 1], 1, 2, t1.clone());
+        let group1 = Group::with_transport(vec![0, 1], 1, 2, t1.clone()).unwrap();
         let config1 = MoeDispatchConfig {
             num_experts: 8,
             top_k: 1,
@@ -792,7 +867,7 @@ fn test_rdma_wire_format_expert_id_prefix() {
     // Verify the payload wire format: [expert_id: u32 LE | token_data...]
     let (t0, _t1) = LoopbackTransport::new_pair();
 
-    let group = Group::with_transport(vec![0, 1], 0, 2, t0.clone());
+    let group = Group::with_transport(vec![0, 1], 0, 2, t0.clone()).unwrap();
     let config = MoeDispatchConfig {
         num_experts: 8,
         top_k: 1,
@@ -829,7 +904,7 @@ fn test_rdma_size_exchange_zero_payload() {
     // Size header to rank 1 should be 0.
     let (t0, _t1) = LoopbackTransport::new_pair();
 
-    let group = Group::with_transport(vec![0, 1], 0, 2, t0.clone());
+    let group = Group::with_transport(vec![0, 1], 0, 2, t0.clone()).unwrap();
     let config = MoeDispatchConfig {
         num_experts: 8,
         top_k: 1,
@@ -856,4 +931,331 @@ fn test_rdma_size_exchange_zero_payload() {
     let size_header = &messages[0];
     let payload_size = u64::from_le_bytes(size_header[..8].try_into().unwrap());
     assert_eq!(payload_size, 0, "no remote tokens, size should be 0");
+}
+
+// ─── Expert partition invariant tests ───
+
+#[test]
+fn test_dispatch_rejects_indivisible_experts() {
+    // num_experts=7, world_size=3 → 7 % 3 != 0 → Err
+    let group = Group::world(3, 0).unwrap();
+    let config = MoeDispatchConfig {
+        num_experts: 7,
+        top_k: 1,
+        capacity_factor: 1.0,
+        group,
+    };
+    let mut exchange = MoeDispatchExchange::new(config, MoePolicy::new());
+    let indices = vec![0u32; 4];
+    let weights = vec![1.0f32; 4];
+    let token_data = vec![0u8; 4 * 4];
+    let result = exchange.dispatch(4, &indices, &weights, &token_data);
+    assert!(result.is_err());
+    let err = format!("{}", result.unwrap_err());
+    assert!(err.contains("divisible"), "error: {err}");
+}
+
+#[test]
+fn test_dispatch_rejects_zero_num_experts() {
+    // num_experts=0, world_size=1 → experts_per_rank=0 → Err
+    let group = Group::world(1, 0).unwrap();
+    let config = MoeDispatchConfig {
+        num_experts: 0,
+        top_k: 1,
+        capacity_factor: 1.0,
+        group,
+    };
+    let mut exchange = MoeDispatchExchange::new(config, MoePolicy::new());
+    let indices: Vec<u32> = vec![];
+    let weights: Vec<f32> = vec![];
+    let token_data = vec![0u8; 4];
+    let result = exchange.dispatch(1, &indices, &weights, &token_data);
+    assert!(result.is_err());
+    let err = format!("{}", result.unwrap_err());
+    assert!(err.contains("experts_per_rank is 0"), "error: {err}");
+}
+
+#[test]
+fn test_dispatch_rejects_out_of_range_expert_index() {
+    let group = Group::world(1, 0).unwrap();
+    let config = MoeDispatchConfig {
+        num_experts: 4,
+        top_k: 1,
+        capacity_factor: 1.0,
+        group,
+    };
+    let mut exchange = MoeDispatchExchange::new(config, MoePolicy::new());
+    // expert index 10 is out of range (num_experts=4)
+    let indices = vec![0u32, 1, 10, 3];
+    let weights = vec![1.0f32; 4];
+    let token_data = vec![0u8; 4 * 4];
+    let result = exchange.dispatch(4, &indices, &weights, &token_data);
+    assert!(result.is_err());
+    let err = format!("{}", result.unwrap_err());
+    assert!(err.contains("out of range"), "error: {err}");
+}
+
+#[test]
+fn test_combine_rdma_rejects_indivisible_experts() {
+    let group = Group::world(3, 0).unwrap();
+    let combine = MoeCombineExchange::new(group);
+    let expert_outputs = vec![vec![1.0f32; 4]; 2];
+    let weights = vec![1.0f32; 2];
+    let indices = vec![0u32, 1];
+    // num_experts=7, group_size=3 → 7 % 3 != 0
+    let result = combine.combine_rdma(&expert_outputs, &weights, &indices, 2, 1, 2, 7);
+    assert!(result.is_err());
+    let err = format!("{}", result.unwrap_err());
+    assert!(err.contains("divisible"), "error: {err}");
+}
+
+#[test]
+fn test_combine_rdma_rejects_out_of_range_expert() {
+    let group = Group::world(1, 0).unwrap();
+    let combine = MoeCombineExchange::new(group);
+    let expert_outputs = vec![vec![1.0f32; 4]; 2];
+    let weights = vec![1.0f32; 2];
+    let indices = vec![0u32, 5]; // expert 5 >= num_experts=2
+    let result = combine.combine_rdma(&expert_outputs, &weights, &indices, 2, 1, 2, 2);
+    assert!(result.is_err());
+    let err = format!("{}", result.unwrap_err());
+    assert!(err.contains("out of range"), "error: {err}");
+}
+
+// ─── SparseGuard action wiring tests ───
+
+/// Helper: create a MoeDispatchExchange with window_size=1 guard for fast triggering.
+fn make_exchange_with_guard(window_size: usize) -> MoeDispatchExchange {
+    let group = Group::world(1, 0).unwrap();
+    let config = MoeDispatchConfig {
+        num_experts: 4,
+        top_k: 1,
+        capacity_factor: 1.0,
+        group,
+    };
+    let mut exchange = MoeDispatchExchange::new(config, MoePolicy::new());
+    // Replace the guard with a small window so evaluate() fires quickly.
+    *exchange.guard_mut() = {
+        let mut g = SparseGuard::new();
+        g.set_window_size(window_size);
+        g
+    };
+    exchange
+}
+
+#[test]
+fn test_guard_action_increase_capacity() {
+    let mut exchange = make_exchange_with_guard(1);
+
+    // Baseline capacity factor should be 1.0
+    assert!((exchange.runtime_capacity_factor() - 1.0).abs() < 1e-5);
+
+    // Dispatch with moderate overflow (>5% but <20%): all 4 tokens to expert 0
+    // capacity_per_expert = ceil(4 * 1 / 4 * 1.0) = 1, so 3 overflow out of 4 = 75%
+    // After window_size=1 step, EMA = 0.1 * 0.75 = 0.075 > 0.05 → IncreaseCapacity
+    let indices = vec![0u32, 0, 0, 0];
+    let weights = vec![1.0f32; 4];
+    let token_data = vec![1u8; 4 * 4];
+    let _ = exchange
+        .dispatch(4, &indices, &weights, &token_data)
+        .unwrap();
+
+    // After the dispatch, the guard should have increased the runtime capacity factor
+    assert!(
+        exchange.runtime_capacity_factor() > 1.0,
+        "capacity factor should have increased: got {}",
+        exchange.runtime_capacity_factor()
+    );
+}
+
+#[test]
+fn test_guard_action_dense_fallback() {
+    let mut exchange = make_exchange_with_guard(1);
+
+    // Pump overflow EMA above 0.20 threshold for DenseFallback.
+    // We need multiple evaluate() cycles with sustained high overflow.
+    // With alpha=0.1, 4 tokens all to expert 0, 4 experts, cf starts at 1.0:
+    // Step 1: cf=1.0, tpe=1, overflow=3/4=75%, EMA=0.075 → IncreaseCapacity(1.25)
+    // Step 2: cf=1.25, tpe=2, overflow=2/4=50%, EMA=0.1175 → IncreaseCapacity
+    // Step 3: cf~1.56, tpe=2, overflow=50%, EMA=0.15575 → IncreaseCapacity
+    // Step 4: cf~1.95, tpe=2, overflow=50%, EMA=0.19018 → IncreaseCapacity
+    // Step 5: cf=2.0, tpe=2, overflow=50%, EMA=0.22116 → DenseFallback!
+    let indices = vec![0u32, 0, 0, 0];
+    let weights = vec![1.0f32; 4];
+    let token_data = vec![1u8; 4 * 4];
+
+    for _ in 0..5 {
+        let _ = exchange
+            .dispatch(4, &indices, &weights, &token_data)
+            .unwrap();
+    }
+
+    // After 3 dispatches with heavy overflow, DenseFallback should have triggered.
+    // The policy should now be forced to CPU (via force_backend override).
+    // Verify that select() returns CPU regardless of element count.
+    assert_eq!(
+        exchange.policy().select(1000, 100000),
+        MoeBackend::Cpu,
+        "policy should be forced to CPU after dense fallback"
+    );
+    assert!(
+        exchange.guard().is_dense_fallback(),
+        "guard should be in dense fallback state"
+    );
+}
+
+#[test]
+fn test_guard_action_reset_after_recovery() {
+    let mut exchange = make_exchange_with_guard(1);
+
+    // First: trigger DenseFallback (same as dense_fallback test — 5 rounds needed)
+    let heavy_indices = vec![0u32, 0, 0, 0];
+    let weights = vec![1.0f32; 4];
+    let token_data = vec![1u8; 4 * 4];
+
+    for _ in 0..5 {
+        let _ = exchange
+            .dispatch(4, &heavy_indices, &weights, &token_data)
+            .unwrap();
+    }
+    assert!(exchange.guard().is_dense_fallback());
+
+    // Now dispatch with zero overflow to recover.
+    // With ratio=0: EMA decays toward 0. Need EMA <= 0.05 for Reset.
+    // EMA starts ~0.22. Each step: EMA = 0.1 * 0 + 0.9 * EMA = 0.9 * EMA
+    // After k steps: EMA ≈ 0.22 * 0.9^k. Need 0.22 * 0.9^k <= 0.05 → k >= 15
+    // Use 20 steps for safety margin.
+    let spread_indices = vec![0u32, 1, 2, 3];
+    for _ in 0..20 {
+        let _ = exchange
+            .dispatch(4, &spread_indices, &weights, &token_data)
+            .unwrap();
+    }
+
+    // Guard should have reset: no longer in dense fallback
+    assert!(
+        !exchange.guard().is_dense_fallback(),
+        "guard should have reset after recovery"
+    );
+    // Runtime capacity factor should be restored to baseline (1.0)
+    assert!(
+        (exchange.runtime_capacity_factor() - 1.0).abs() < 1e-5,
+        "capacity factor should be restored to baseline: got {}",
+        exchange.runtime_capacity_factor()
+    );
+    // After enough additional dispatches to drain cooldown, the policy should
+    // resume normal threshold-based selection (not forced CPU).
+    for _ in 0..33 {
+        let _ = exchange
+            .dispatch(4, &spread_indices, &weights, &token_data)
+            .unwrap();
+    }
+    assert_ne!(
+        exchange.policy().select(1000, 100000),
+        MoeBackend::Cpu,
+        "policy force_backend should be cleared after reset"
+    );
+}
+
+// ─── Combine CPU/Metal parity tests ───
+
+#[test]
+fn test_combine_cpu_metal_parity() {
+    let group = Group::world(1, 0).unwrap();
+    let combine = MoeCombineExchange::new(group);
+
+    // 3 tokens, top_k=2, hidden_dim=4, 4 experts
+    let batch_size = 3;
+    let top_k = 2;
+    let hidden_dim = 4;
+
+    let expert0 = vec![
+        1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+    ];
+    let expert1 = vec![0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5, 9.5, 10.5, 11.5];
+    let expert2 = vec![
+        10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 0.1, 0.2, 0.3, 0.4,
+    ];
+    let expert3 = vec![0.0; 12];
+    let expert_outputs = vec![expert0, expert1, expert2, expert3];
+
+    // token 0 → experts 0, 2; token 1 → experts 1, 3; token 2 → experts 0, 1
+    let indices = vec![0u32, 2, 1, 3, 0, 1];
+    let weights = vec![0.6f32, 0.4, 0.7, 0.3, 0.5, 0.5];
+
+    let cpu_result = combine.combine_cpu(
+        &expert_outputs,
+        &weights,
+        &indices,
+        batch_size,
+        top_k,
+        hidden_dim,
+    );
+    let metal_result = combine.combine_metal(
+        &expert_outputs,
+        &weights,
+        &indices,
+        batch_size,
+        top_k,
+        hidden_dim,
+    );
+
+    assert_eq!(cpu_result.len(), metal_result.len());
+    for i in 0..cpu_result.len() {
+        assert!(
+            (cpu_result[i] - metal_result[i]).abs() < 1e-4,
+            "mismatch at index {i}: cpu={}, metal={}",
+            cpu_result[i],
+            metal_result[i]
+        );
+    }
+}
+
+#[test]
+fn test_combine_cpu_rdma_parity_single_rank() {
+    // Single-rank RDMA combine should produce same results as CPU combine
+    let group = Group::world(1, 0).unwrap();
+    let combine = MoeCombineExchange::new(group);
+
+    let batch_size = 2;
+    let top_k = 2;
+    let hidden_dim = 3;
+    let num_experts = 2;
+
+    let expert0 = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let expert1 = vec![10.0f32, 20.0, 30.0, 40.0, 50.0, 60.0];
+    let expert_outputs = vec![expert0.clone(), expert1.clone()];
+
+    let indices = vec![0u32, 1, 1, 0];
+    let weights = vec![0.6f32, 0.4, 0.3, 0.7];
+
+    let cpu_result = combine.combine_cpu(
+        &expert_outputs,
+        &weights,
+        &indices,
+        batch_size,
+        top_k,
+        hidden_dim,
+    );
+    let rdma_result = combine
+        .combine_rdma(
+            &expert_outputs,
+            &weights,
+            &indices,
+            batch_size,
+            top_k,
+            hidden_dim,
+            num_experts,
+        )
+        .unwrap();
+
+    assert_eq!(cpu_result.len(), rdma_result.len());
+    for i in 0..cpu_result.len() {
+        assert!(
+            (cpu_result[i] - rdma_result[i]).abs() < 1e-4,
+            "mismatch at index {i}: cpu={}, rdma={}",
+            cpu_result[i],
+            rdma_result[i]
+        );
+    }
 }

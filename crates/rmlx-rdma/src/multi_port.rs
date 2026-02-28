@@ -117,6 +117,57 @@ impl StripeEngine {
         }
     }
 
+    /// Split a data buffer into chunk slices according to a stripe plan.
+    ///
+    /// Returns `(primary_slices, secondary_slices)` where each slice borrows
+    /// from the original `data` buffer at the offsets/lengths defined by the plan.
+    pub fn split_by_plan<'a>(
+        &self,
+        data: &'a [u8],
+        plan: &StripePlan,
+    ) -> (Vec<&'a [u8]>, Vec<&'a [u8]>) {
+        let primary: Vec<&'a [u8]> = plan
+            .primary_chunks
+            .iter()
+            .map(|c| &data[c.offset..c.offset + c.length])
+            .collect();
+        let secondary: Vec<&'a [u8]> = plan
+            .secondary_chunks
+            .iter()
+            .map(|c| &data[c.offset..c.offset + c.length])
+            .collect();
+        (primary, secondary)
+    }
+
+    /// Reassemble chunk data back into a contiguous buffer using the stripe plan.
+    ///
+    /// `primary` and `secondary` are the received chunk payloads (one Vec<u8> per chunk).
+    /// The plan's sequence numbers determine the correct ordering in the output.
+    pub fn reassemble_from_chunks(
+        &self,
+        primary: &[Vec<u8>],
+        secondary: &[Vec<u8>],
+        plan: &StripePlan,
+    ) -> Vec<u8> {
+        let mut output = vec![0u8; plan.total_bytes];
+
+        for (chunk_data, assignment) in primary.iter().zip(plan.primary_chunks.iter()) {
+            let end = std::cmp::min(assignment.offset + chunk_data.len(), plan.total_bytes);
+            let copy_len = end - assignment.offset;
+            output[assignment.offset..assignment.offset + copy_len]
+                .copy_from_slice(&chunk_data[..copy_len]);
+        }
+
+        for (chunk_data, assignment) in secondary.iter().zip(plan.secondary_chunks.iter()) {
+            let end = std::cmp::min(assignment.offset + chunk_data.len(), plan.total_bytes);
+            let copy_len = end - assignment.offset;
+            output[assignment.offset..assignment.offset + copy_len]
+                .copy_from_slice(&chunk_data[..copy_len]);
+        }
+
+        output
+    }
+
     /// Config reference.
     pub fn config(&self) -> &DualPortConfig {
         &self.config

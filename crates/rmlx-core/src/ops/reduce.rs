@@ -363,7 +363,7 @@ fn reduce_all_two_pass(
 
     // Number of threadgroups for pass 1: enough to cover all elements with good occupancy.
     // Must be power of 2 because pass 2 uses tree reduction over the partial results.
-    let raw_tg_count = ((numel as u64 + tg_size - 1) / tg_size).min(256);
+    let raw_tg_count = (numel as u64).div_ceil(tg_size).min(256);
     let num_threadgroups = raw_tg_count.next_power_of_two().min(256) as u32;
 
     // Allocate intermediate buffer for partial results
@@ -374,8 +374,7 @@ fn reduce_all_two_pass(
     );
 
     // Each threadgroup handles a contiguous chunk
-    let chunk_size =
-        ((numel as u64 + num_threadgroups as u64 - 1) / num_threadgroups as u64) as u32;
+    let chunk_size = (numel as u64).div_ceil(num_threadgroups as u64) as u32;
 
     let size_buf = registry.device().raw().new_buffer_with_data(
         &numel_u32 as *const u32 as *const std::ffi::c_void,
@@ -440,7 +439,12 @@ pub fn reduce_row(
     op: ReduceOp,
     queue: &metal::CommandQueue,
 ) -> Result<Array, KernelError> {
-    assert_eq!(input.ndim(), 2, "reduce_row requires 2D array");
+    if input.ndim() != 2 {
+        return Err(KernelError::InvalidShape(format!(
+            "reduce_row requires 2D array, got {}D",
+            input.ndim()
+        )));
+    }
     if input.numel() == 0 {
         return Err(KernelError::InvalidShape(
             "cannot reduce empty array".into(),
@@ -485,6 +489,70 @@ pub fn reduce_row(
     command_buffer.wait_until_completed();
 
     Ok(out)
+}
+
+/// Reduce all elements asynchronously, returning a `LaunchResult`.
+///
+/// The output `Array` is only accessible after the GPU completes via
+/// `LaunchResult::into_array()`.
+pub fn reduce_all_async(
+    registry: &KernelRegistry,
+    input: &Array,
+    op: ReduceOp,
+    queue: &metal::CommandQueue,
+) -> Result<super::LaunchResult, KernelError> {
+    if input.numel() == 0 {
+        return Err(KernelError::InvalidShape(
+            "cannot reduce empty array".into(),
+        ));
+    }
+
+    let input_contig = super::make_contiguous(input, registry, queue)?;
+    let input = input_contig.as_ref().unwrap_or(input);
+    let numel = input.numel();
+
+    // ArgMax always uses single-pass (needs index tracking)
+    // For async reduce, we need a single command buffer approach.
+    // Use single-pass for simplicity (covers most async use cases).
+    let (kernel_name, out_dtype) = match (op, input.dtype()) {
+        (ReduceOp::Sum, DType::Float32) => ("reduce_sum_f32", DType::Float32),
+        (ReduceOp::Max, DType::Float32) => ("reduce_max_f32", DType::Float32),
+        (ReduceOp::ArgMax, DType::Float32) => ("reduce_argmax_f32", DType::Float32),
+        _ => {
+            return Err(KernelError::NotFound(format!(
+                "reduce {:?} not supported for {:?}",
+                op,
+                input.dtype()
+            )))
+        }
+    };
+
+    let pipeline = registry.get_pipeline(kernel_name, input.dtype())?;
+    let numel_u32 = super::checked_u32(numel, "numel")?;
+
+    let out = Array::zeros(registry.device().raw(), &[1], out_dtype);
+
+    let size_buf = registry.device().raw().new_buffer_with_data(
+        &numel_u32 as *const u32 as *const std::ffi::c_void,
+        4,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+
+    let command_buffer = queue.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
+    encoder.set_buffer(1, Some(out.metal_buffer()), 0);
+    encoder.set_buffer(2, Some(&size_buf), 0);
+
+    let tg_size = std::cmp::min(1024, pipeline.max_total_threads_per_threadgroup());
+    encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(tg_size, 1, 1));
+    encoder.end_encoding();
+
+    let handle = super::commit_with_mode(command_buffer, super::ExecMode::Async)
+        .expect("async mode always returns a handle");
+
+    Ok(super::LaunchResult::new(out, handle))
 }
 
 /// Convenience: sum all elements.

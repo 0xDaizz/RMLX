@@ -26,18 +26,31 @@ impl Embedding {
     /// Create an embedding layer with a pre-loaded weight table.
     ///
     /// `weight` shape: [vocab_size, embed_dim]
-    pub fn from_array(config: EmbeddingConfig, weight: Array) -> Self {
-        assert_eq!(
-            weight.ndim(),
-            2,
-            "weight must be 2D [vocab_size, embed_dim]"
-        );
-        assert_eq!(weight.shape()[0], config.vocab_size);
-        assert_eq!(weight.shape()[1], config.embed_dim);
-        Self {
+    pub fn from_array(config: EmbeddingConfig, weight: Array) -> Result<Self, KernelError> {
+        if weight.ndim() != 2 {
+            return Err(KernelError::InvalidShape(format!(
+                "weight must be 2D [vocab_size, embed_dim], got {}D",
+                weight.ndim()
+            )));
+        }
+        if weight.shape()[0] != config.vocab_size {
+            return Err(KernelError::InvalidShape(format!(
+                "weight shape[0]={} != vocab_size={}",
+                weight.shape()[0],
+                config.vocab_size
+            )));
+        }
+        if weight.shape()[1] != config.embed_dim {
+            return Err(KernelError::InvalidShape(format!(
+                "weight shape[1]={} != embed_dim={}",
+                weight.shape()[1],
+                config.embed_dim
+            )));
+        }
+        Ok(Self {
             config,
             weight: Some(weight),
-        }
+        })
     }
 
     /// Forward pass: gather rows from the weight table by token IDs.
@@ -96,14 +109,14 @@ impl Embedding {
         );
 
         // Flatten weight to 1D for gather
-        let weight_flat = weight.reshape(vec![self.config.vocab_size * embed_dim]);
+        let weight_flat = weight.reshape(vec![self.config.vocab_size * embed_dim])?;
 
         // Gather: output[i] = weight_flat[indices[i]]
         let gathered =
             rmlx_core::ops::indexing::gather(registry, &weight_flat, &indices_arr, queue)?;
 
         // Reshape to [seq_len, embed_dim]
-        Ok(gathered.reshape(vec![seq_len, embed_dim]))
+        gathered.reshape(vec![seq_len, embed_dim])
     }
 
     pub fn vocab_size(&self) -> usize {

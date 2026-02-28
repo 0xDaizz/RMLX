@@ -61,12 +61,18 @@ pub fn rope(
     scale: f32,
     queue: &metal::CommandQueue,
 ) -> Result<Array, KernelError> {
-    assert_eq!(
-        input.ndim(),
-        2,
-        "rope requires 2D input [seq_len, head_dim]"
-    );
-    assert_eq!(input.shape()[1] % 2, 0, "head_dim must be even");
+    if input.ndim() != 2 {
+        return Err(KernelError::InvalidShape(format!(
+            "rope requires 2D input [seq_len, head_dim], got {}D",
+            input.ndim()
+        )));
+    }
+    if input.shape()[1] % 2 != 0 {
+        return Err(KernelError::InvalidShape(format!(
+            "head_dim must be even, got {}",
+            input.shape()[1]
+        )));
+    }
 
     let input_contig = super::make_contiguous(input, registry, queue)?;
     let input = input_contig.as_ref().unwrap_or(input);

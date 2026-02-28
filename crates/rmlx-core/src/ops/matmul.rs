@@ -45,10 +45,32 @@ pub fn matmul(
     b: &Array,
     queue: &metal::CommandQueue,
 ) -> Result<Array, KernelError> {
-    assert_eq!(a.ndim(), 2, "matmul requires 2D arrays");
-    assert_eq!(b.ndim(), 2, "matmul requires 2D arrays");
-    assert_eq!(a.shape()[1], b.shape()[0], "inner dimensions must match");
-    assert_eq!(a.dtype(), b.dtype(), "dtypes must match");
+    if a.ndim() != 2 {
+        return Err(KernelError::InvalidShape(format!(
+            "matmul requires 2D arrays, a is {}D",
+            a.ndim()
+        )));
+    }
+    if b.ndim() != 2 {
+        return Err(KernelError::InvalidShape(format!(
+            "matmul requires 2D arrays, b is {}D",
+            b.ndim()
+        )));
+    }
+    if a.shape()[1] != b.shape()[0] {
+        return Err(KernelError::InvalidShape(format!(
+            "inner dimensions must match: {} vs {}",
+            a.shape()[1],
+            b.shape()[0]
+        )));
+    }
+    if a.dtype() != b.dtype() {
+        return Err(KernelError::InvalidShape(format!(
+            "dtypes must match: {:?} vs {:?}",
+            a.dtype(),
+            b.dtype()
+        )));
+    }
 
     let a_contig = super::make_contiguous(a, registry, queue)?;
     let a = a_contig.as_ref().unwrap_or(a);
@@ -59,11 +81,35 @@ pub fn matmul(
     let k = a.shape()[1];
     let n = b.shape()[1];
 
-    // Auto dispatch: use GEMV for M=1 (single-token decode pattern)
+    // Auto dispatch: use GEMV for M=1 or N=1 (single-token decode hot path).
     // GEMV computes mat[M,K] @ vec[K] -> [M].
-    // For [1,K] @ [K,N]: when N=1, b can be squeezed to 1D [K] and we use
-    // GEMV directly with mat=a[1,K], vec=b[K] -> [1], reshaped to [1,1].
-    if m == 1 && n == 1 {
+
+    // Case 1: M=1 — [1,K] @ [K,N]
+    // Transpose to: B^T[N,K] @ a_vec[K] -> [N], reshaped to [1,N].
+    if m == 1 {
+        let a_vec = Array::new(
+            a.metal_buffer().to_owned(),
+            vec![k],
+            vec![1],
+            a.dtype(),
+            a.offset(),
+        );
+        // B^T: view B[K,N] as [N,K] by swapping strides (column-major read)
+        let b_t = b.view(vec![n, k], vec![1, n], b.offset());
+        let b_t = super::copy::copy(registry, &b_t, queue)?;
+        let result = super::gemv::gemv(registry, &b_t, &a_vec, queue)?;
+        return Ok(Array::new(
+            result.metal_buffer().to_owned(),
+            vec![1, n],
+            vec![n, 1],
+            result.dtype(),
+            result.offset(),
+        ));
+    }
+
+    // Case 2: N=1 — [M,K] @ [K,1]
+    // Squeeze b to 1D [K], GEMV: A[M,K] @ b[K] -> [M], reshaped to [M,1].
+    if n == 1 {
         let b_vec = Array::new(
             b.metal_buffer().to_owned(),
             vec![k],
@@ -74,7 +120,7 @@ pub fn matmul(
         let result = super::gemv::gemv(registry, a, &b_vec, queue)?;
         return Ok(Array::new(
             result.metal_buffer().to_owned(),
-            vec![1, 1],
+            vec![m, 1],
             vec![1, 1],
             result.dtype(),
             result.offset(),

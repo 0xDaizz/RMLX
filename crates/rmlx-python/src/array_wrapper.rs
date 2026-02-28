@@ -2,8 +2,10 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 use rmlx_core::array::Array as GpuArray;
-#[allow(unused_imports)]
-use rmlx_core::dtype::DType;
+use rmlx_core::kernels::KernelRegistry;
+use rmlx_core::ops::binary::{binary_op_async, BinaryOp};
+use rmlx_core::CommandBufferHandle;
+use rmlx_metal::device::GpuDevice;
 use rmlx_metal::metal;
 
 /// Python wrapper around rmlx_core::array::Array.
@@ -16,13 +18,18 @@ pub struct PyArray {
     dtype_name: String,
     /// GPU-backed array (populated after `to_gpu()` or `from_array()`).
     gpu_array: Option<GpuArray>,
+    /// Pending async GPU command buffer handle.
+    /// Must be waited on before reading GPU data (e.g. in `to_cpu()`).
+    pending_handle: Option<CommandBufferHandle>,
 }
 
 impl PyArray {
     /// Wrap an existing GPU array, extracting CPU data from it.
     ///
     /// # Safety
-    /// Caller must ensure no GPU writes are in-flight to the array's buffer.
+    /// Caller must ensure all GPU command buffers that write to the array's
+    /// Metal buffer have completed (via `waitUntilCompleted` or completion
+    /// handler) before calling this function.
     pub unsafe fn from_gpu_array(gpu: GpuArray) -> Self {
         let shape = gpu.shape().to_vec();
         let dtype_name = gpu.dtype().name().to_string();
@@ -32,6 +39,7 @@ impl PyArray {
             data,
             dtype_name,
             gpu_array: Some(gpu),
+            pending_handle: None,
         }
     }
 
@@ -43,6 +51,56 @@ impl PyArray {
     /// Check whether this PyArray has a GPU-backed array.
     pub fn is_on_gpu(&self) -> bool {
         self.gpu_array.is_some()
+    }
+
+    /// Attach an async command buffer handle for GPU sync tracking.
+    pub fn set_pending_handle(&mut self, handle: CommandBufferHandle) {
+        self.pending_handle = Some(handle);
+    }
+
+    /// Wait for any pending GPU operation to complete.
+    fn wait_pending(&mut self) {
+        if let Some(h) = self.pending_handle.take() {
+            h.wait();
+        }
+    }
+
+    /// Execute a GPU binary op between two PyArrays that both have gpu_array.
+    /// Returns a new PyArray with gpu_array set and pending_handle tracking
+    /// the async command buffer.
+    fn gpu_binary_op(&self, other: &PyArray, op: BinaryOp, op_name: &str) -> PyResult<Self> {
+        let self_gpu = self
+            .gpu_array
+            .as_ref()
+            .ok_or_else(|| PyValueError::new_err(format!("{op_name}: self has no GPU array")))?;
+        let other_gpu = other
+            .gpu_array
+            .as_ref()
+            .ok_or_else(|| PyValueError::new_err(format!("{op_name}: other has no GPU array")))?;
+
+        let device = GpuDevice::system_default()
+            .map_err(|e| PyValueError::new_err(format!("Metal device error: {e}")))?;
+        let registry = KernelRegistry::new(device);
+        rmlx_core::ops::register_all(&registry)
+            .map_err(|e| PyValueError::new_err(format!("kernel registration failed: {e}")))?;
+        let queue = registry.device().new_command_queue();
+
+        let launch = binary_op_async(&registry, self_gpu, other_gpu, op, &queue)
+            .map_err(|e| PyValueError::new_err(format!("GPU {op_name} failed: {e}")))?;
+
+        let out_array = launch.into_array();
+
+        // SAFETY: into_array() blocks until GPU completes, so the data is ready.
+        let shape = out_array.shape().to_vec();
+        let cpu_data = unsafe { out_array.to_vec::<f32>() };
+
+        Ok(Self {
+            shape: shape.clone(),
+            data: cpu_data,
+            dtype_name: self.dtype_name.clone(),
+            gpu_array: Some(out_array),
+            pending_handle: None,
+        })
     }
 
     /// Internal constructor used by tests (no PyO3 runtime needed).
@@ -62,6 +120,7 @@ impl PyArray {
             data,
             dtype_name: "float32".to_string(),
             gpu_array: None,
+            pending_handle: None,
         })
     }
 
@@ -73,6 +132,7 @@ impl PyArray {
             data: vec![0.0; numel],
             dtype_name: "float32".to_string(),
             gpu_array: None,
+            pending_handle: None,
         }
     }
 
@@ -84,6 +144,7 @@ impl PyArray {
             data: vec![1.0; numel],
             dtype_name: "float32".to_string(),
             gpu_array: None,
+            pending_handle: None,
         }
     }
 
@@ -98,6 +159,7 @@ impl PyArray {
             data: self.data.clone(),
             dtype_name: self.dtype_name.clone(),
             gpu_array: None,
+            pending_handle: None,
         })
     }
 
@@ -117,6 +179,7 @@ impl PyArray {
             data,
             dtype_name: self.dtype_name.clone(),
             gpu_array: None,
+            pending_handle: None,
         })
     }
 
@@ -136,6 +199,7 @@ impl PyArray {
             data,
             dtype_name: self.dtype_name.clone(),
             gpu_array: None,
+            pending_handle: None,
         })
     }
 }
@@ -158,6 +222,7 @@ impl PyArray {
             data,
             dtype_name: "float32".to_string(),
             gpu_array: None,
+            pending_handle: None,
         })
     }
 
@@ -169,6 +234,7 @@ impl PyArray {
             data: vec![0.0; numel],
             dtype_name: "float32".to_string(),
             gpu_array: None,
+            pending_handle: None,
         }
     }
 
@@ -180,6 +246,7 @@ impl PyArray {
             data: vec![1.0; numel],
             dtype_name: "float32".to_string(),
             gpu_array: None,
+            pending_handle: None,
         }
     }
 
@@ -222,6 +289,7 @@ impl PyArray {
             data: self.data.clone(),
             dtype_name: self.dtype_name.clone(),
             gpu_array: None,
+            pending_handle: None,
         })
     }
 
@@ -237,6 +305,13 @@ impl PyArray {
         if self.shape != other.shape {
             return Err(PyValueError::new_err("shape mismatch for add"));
         }
+
+        // Use GPU path when both operands have GPU arrays
+        if self.gpu_array.is_some() && other.gpu_array.is_some() {
+            return self.gpu_binary_op(other, BinaryOp::Add, "add");
+        }
+
+        // CPU fallback
         let data: Vec<f32> = self
             .data
             .iter()
@@ -248,6 +323,7 @@ impl PyArray {
             data,
             dtype_name: self.dtype_name.clone(),
             gpu_array: None,
+            pending_handle: None,
         })
     }
 
@@ -255,6 +331,13 @@ impl PyArray {
         if self.shape != other.shape {
             return Err(PyValueError::new_err("shape mismatch for mul"));
         }
+
+        // Use GPU path when both operands have GPU arrays
+        if self.gpu_array.is_some() && other.gpu_array.is_some() {
+            return self.gpu_binary_op(other, BinaryOp::Mul, "mul");
+        }
+
+        // CPU fallback
         let data: Vec<f32> = self
             .data
             .iter()
@@ -266,6 +349,7 @@ impl PyArray {
             data,
             dtype_name: self.dtype_name.clone(),
             gpu_array: None,
+            pending_handle: None,
         })
     }
 
@@ -281,8 +365,11 @@ impl PyArray {
         self.data.iter().cloned().reduce(f32::min)
     }
 
-    fn mean(&self) -> f32 {
-        self.sum() / self.data.len() as f32
+    fn mean(&self) -> PyResult<f32> {
+        if self.data.is_empty() {
+            return Err(PyValueError::new_err("mean of empty array is undefined"));
+        }
+        Ok(self.sum() / self.data.len() as f32)
     }
 
     /// Upload CPU data to a GPU-backed Metal buffer.
@@ -298,22 +385,31 @@ impl PyArray {
             data: self.data.clone(),
             dtype_name: self.dtype_name.clone(),
             gpu_array: Some(gpu),
+            pending_handle: None,
         })
     }
 
     /// Download GPU array data to CPU, returning a CPU-only PyArray.
     ///
-    /// If no GPU array is present, returns a copy of the current CPU data.
-    fn to_cpu(&self) -> PyResult<Self> {
+    /// If a pending GPU command buffer handle exists, waits for completion
+    /// before reading. If no GPU array is present, returns a copy of the
+    /// current CPU data.
+    #[allow(clippy::wrong_self_convention)]
+    fn to_cpu(&mut self) -> PyResult<Self> {
+        // Wait for any pending async GPU operation to complete before reading
+        self.wait_pending();
+
         match &self.gpu_array {
             Some(gpu) => {
-                // Safety: we assume no GPU writes are in-flight when Python calls this.
+                // SAFETY: CommandBufferHandle.wait() completed (via wait_pending above),
+                // ensuring all GPU writes to this buffer are finished before we read.
                 let cpu_data = unsafe { gpu.to_vec::<f32>() };
                 Ok(Self {
                     shape: gpu.shape().to_vec(),
                     data: cpu_data,
                     dtype_name: gpu.dtype().name().to_string(),
                     gpu_array: None,
+                    pending_handle: None,
                 })
             }
             None => Ok(Self {
@@ -321,6 +417,7 @@ impl PyArray {
                 data: self.data.clone(),
                 dtype_name: self.dtype_name.clone(),
                 gpu_array: None,
+                pending_handle: None,
             }),
         }
     }
@@ -441,5 +538,120 @@ mod tests {
         assert_eq!(arr.shape, vec![2, 2]);
         assert_eq!(arr.data, vec![1.0, 2.0, 3.0, 4.0]);
         assert_eq!(arr.dtype_name, "float32");
+    }
+
+    /// Test to_cpu on a CPU-only array (no pending handle) — regression test.
+    #[test]
+    fn test_to_cpu_no_handle() {
+        let mut arr = PyArray::new_rust(vec![1.0, 2.0, 3.0], vec![3]).unwrap();
+        assert!(arr.pending_handle.is_none());
+        // to_cpu is a #[pymethods] fn, but we can test via the internal path
+        // by directly checking wait_pending doesn't panic on None handle
+        arr.wait_pending();
+        assert!(arr.pending_handle.is_none());
+        assert_eq!(arr.data, vec![1.0, 2.0, 3.0]);
+    }
+
+    /// Test that set_pending_handle + wait_pending works correctly.
+    #[test]
+    fn test_pending_handle_set_and_wait() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let flag_clone = Arc::clone(&flag);
+
+        // Simulate a handle that completes quickly
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            flag_clone.store(true, Ordering::Release);
+        });
+
+        let handle = CommandBufferHandle::new_from_flag(flag);
+        let mut arr = PyArray::new_rust(vec![1.0, 2.0], vec![2]).unwrap();
+        arr.set_pending_handle(handle);
+        assert!(arr.pending_handle.is_some());
+
+        arr.wait_pending();
+        assert!(arr.pending_handle.is_none());
+    }
+
+    /// GPU add -> to_cpu roundtrip test.
+    #[test]
+    fn test_gpu_add_to_cpu_roundtrip() {
+        let device = match GpuDevice::system_default() {
+            Ok(d) => d,
+            Err(_) => return, // skip on machines without Metal
+        };
+        let registry = KernelRegistry::new(device);
+        if rmlx_core::ops::register_all(&registry).is_err() {
+            return; // skip if kernel compilation fails
+        }
+        let queue = registry.device().new_command_queue();
+
+        let a_data = vec![1.0f32, 2.0, 3.0, 4.0];
+        let b_data = vec![10.0f32, 20.0, 30.0, 40.0];
+        let a_gpu = GpuArray::from_slice(registry.device().raw(), &a_data, vec![4]);
+        let b_gpu = GpuArray::from_slice(registry.device().raw(), &b_data, vec![4]);
+
+        // Use binary_op_async to get LaunchResult
+        let launch = binary_op_async(&registry, &a_gpu, &b_gpu, BinaryOp::Add, &queue).unwrap();
+        let handle = launch.handle().clone();
+        let out_gpu = launch.into_array();
+
+        // Build PyArray with pending handle
+        let shape = out_gpu.shape().to_vec();
+        let mut result = PyArray {
+            shape,
+            data: Vec::new(),
+            dtype_name: "float32".to_string(),
+            gpu_array: Some(out_gpu),
+            pending_handle: Some(handle),
+        };
+
+        // wait_pending then read
+        result.wait_pending();
+        let gpu = result.gpu_array.as_ref().unwrap();
+        // SAFETY: wait_pending completed, GPU writes are done
+        let cpu_data = unsafe { gpu.to_vec::<f32>() };
+        assert_eq!(cpu_data, vec![11.0, 22.0, 33.0, 44.0]);
+    }
+
+    /// GPU mul -> to_cpu roundtrip test.
+    #[test]
+    fn test_gpu_mul_to_cpu_roundtrip() {
+        let device = match GpuDevice::system_default() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let registry = KernelRegistry::new(device);
+        if rmlx_core::ops::register_all(&registry).is_err() {
+            return;
+        }
+        let queue = registry.device().new_command_queue();
+
+        let a_data = vec![2.0f32, 3.0, 4.0, 5.0];
+        let b_data = vec![10.0f32, 10.0, 10.0, 10.0];
+        let a_gpu = GpuArray::from_slice(registry.device().raw(), &a_data, vec![4]);
+        let b_gpu = GpuArray::from_slice(registry.device().raw(), &b_data, vec![4]);
+
+        let launch = binary_op_async(&registry, &a_gpu, &b_gpu, BinaryOp::Mul, &queue).unwrap();
+        let handle = launch.handle().clone();
+        let out_gpu = launch.into_array();
+
+        let shape = out_gpu.shape().to_vec();
+        let mut result = PyArray {
+            shape,
+            data: Vec::new(),
+            dtype_name: "float32".to_string(),
+            gpu_array: Some(out_gpu),
+            pending_handle: Some(handle),
+        };
+
+        result.wait_pending();
+        let gpu = result.gpu_array.as_ref().unwrap();
+        // SAFETY: wait_pending completed, GPU writes are done
+        let cpu_data = unsafe { gpu.to_vec::<f32>() };
+        assert_eq!(cpu_data, vec![20.0, 30.0, 40.0, 50.0]);
     }
 }

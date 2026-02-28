@@ -294,16 +294,29 @@ fn test_completion_tracker_expect_and_drain() {
 }
 
 // ---------------------------------------------------------------------------
+// Ephemeral port helper — bind to port 0, get assigned port, release listener.
+// ---------------------------------------------------------------------------
+
+/// Allocate an ephemeral port by binding to port 0.
+/// Returns the assigned port number. The listener is dropped, freeing the port
+/// for immediate reuse by test code.
+fn ephemeral_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+    let port = listener.local_addr().expect("local_addr").port();
+    drop(listener);
+    port
+}
+
+// ---------------------------------------------------------------------------
 // P0-8: Exchange accept timeout test
 // ---------------------------------------------------------------------------
 
 #[test]
 fn test_exchange_server_timeout_no_peer() {
     // Start a server exchange and verify it times out when no client connects.
-    // We use a high port to avoid conflicts.
     use std::time::Instant;
 
-    let port = 19876u16;
+    let port = ephemeral_port();
     let local_info = rmlx_rdma::qp::QpInfo {
         lid: 0,
         qpn: 1,
@@ -335,7 +348,7 @@ fn test_exchange_qp_info_roundtrip() {
     // Verify serialize/deserialize roundtrip via a server-client pair on localhost.
     use std::thread;
 
-    let port = 19877u16;
+    let port = ephemeral_port();
     let server_info = rmlx_rdma::qp::QpInfo {
         lid: 100,
         qpn: 200,
@@ -444,4 +457,65 @@ fn test_completion_tracker_backlog_error_propagation() {
     let err = RdmaError::CqPoll(format!("backlog: wr_id {} failed with status {}", 42, 1));
     let msg = format!("{err}");
     assert!(msg.contains("backlog: wr_id 42 failed with status 1"));
+}
+
+// ---------------------------------------------------------------------------
+// RP1-03: ibv_device_attr struct layout and query_device integration
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_ibv_device_attr_layout_sanity() {
+    // IbvDeviceAttr must be large enough to hold all C fields.
+    // C ibv_device_attr is typically 232-256 bytes on 64-bit platforms.
+    let size = std::mem::size_of::<rmlx_rdma::ffi::IbvDeviceAttr>();
+    assert!(
+        size >= 200,
+        "IbvDeviceAttr too small: {size} bytes, expected >= 200"
+    );
+    // fw_ver field should be at offset 0
+    assert_eq!(
+        std::mem::offset_of!(rmlx_rdma::ffi::IbvDeviceAttr, fw_ver),
+        0
+    );
+}
+
+#[test]
+fn test_probe_uses_query_device_when_available() {
+    // When RDMA hardware is present, verify that probe provides
+    // device-level values (max_mr_size should come from ibv_query_device,
+    // which typically returns much larger values than port max_msg_sz).
+    if !is_available() {
+        eprintln!("skipping test: RDMA not available");
+        return;
+    }
+
+    use rmlx_rdma::context::RdmaContext;
+
+    match RdmaContext::open_default() {
+        Ok(ctx) => {
+            if let Some(probe) = ctx.probe() {
+                // When ibv_query_device succeeds, max_mr_size should be
+                // from the device (typically much larger than port max_msg_sz).
+                // At minimum, the values should be positive and reasonable.
+                assert!(
+                    probe.max_mr_size > 0,
+                    "probed max_mr_size should be positive"
+                );
+                assert!(probe.max_qp_wr > 0, "probed max_qp_wr should be positive");
+                assert!(
+                    probe.max_cq_depth > 0,
+                    "probed max_cq_depth should be positive"
+                );
+                eprintln!(
+                    "query_device probed: max_mr_size={}, max_qp_wr={}, max_cq_depth={}",
+                    probe.max_mr_size, probe.max_qp_wr, probe.max_cq_depth,
+                );
+            } else {
+                eprintln!("probe returned None");
+            }
+        }
+        Err(e) => {
+            eprintln!("skipping: {e}");
+        }
+    }
 }

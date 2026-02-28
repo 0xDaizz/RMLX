@@ -2,7 +2,7 @@
 
 use std::ffi::CStr;
 
-use crate::ffi::{IbvContext, IbvPd, IbvPortAttr, IbverbsLib};
+use crate::ffi::{IbvContext, IbvDeviceAttr, IbvPd, IbvPortAttr, IbverbsLib};
 use crate::RdmaError;
 
 /// RDMA device context — wraps ibv_context.
@@ -205,10 +205,39 @@ impl RdmaDeviceProbe {
     }
 
     /// Probe a specific port on the device.
+    ///
+    /// Queries both `ibv_query_device` (for device-level caps like max_mr_size,
+    /// max_qp_wr, max_cqe) and `ibv_query_port` (for port-level caps like MTU,
+    /// max_msg_sz, GID table). Falls back to hardcoded TB5 defaults on failure.
     pub fn probe_port(ctx: &RdmaContext, port: u8) -> Result<Self, RdmaError> {
         let lib = ctx.lib();
 
-        // Query port attributes
+        // --- Device-level attributes (ibv_query_device) ---
+        // SAFETY: ctx.raw() is a valid ibv_context pointer, dev_attr is zero-initialized.
+        let mut dev_attr: IbvDeviceAttr = unsafe { std::mem::zeroed() };
+        let dev_query_ok = unsafe { (lib.query_device)(ctx.raw(), &mut dev_attr) } == 0;
+
+        let (max_mr_size, max_qp_wr, max_cq_depth) = if dev_query_ok {
+            let probed_mr = dev_attr.max_mr_size as usize;
+            let probed_qp_wr = dev_attr.max_qp_wr as u32;
+            let probed_cqe = dev_attr.max_cqe as u32;
+            eprintln!(
+                "[rmlx-rdma] using probed device values: max_mr_size={probed_mr}, \
+                 max_qp_wr={probed_qp_wr}, max_cqe={probed_cqe}"
+            );
+            (probed_mr, probed_qp_wr, probed_cqe)
+        } else {
+            const FALLBACK_MR: usize = 16 * 1024 * 1024;
+            const FALLBACK_QP_WR: u32 = 4095;
+            const FALLBACK_CQ: u32 = 8192;
+            eprintln!(
+                "[rmlx-rdma] WARN: ibv_query_device failed, using hardcoded fallback: \
+                 max_mr_size={FALLBACK_MR}, max_qp_wr={FALLBACK_QP_WR}, max_cq_depth={FALLBACK_CQ}"
+            );
+            (FALLBACK_MR, FALLBACK_QP_WR, FALLBACK_CQ)
+        };
+
+        // --- Port-level attributes (ibv_query_port) ---
         // SAFETY: ctx.raw() is a valid ibv_context pointer, port_attr is zero-initialized.
         let mut port_attr: IbvPortAttr = unsafe { std::mem::zeroed() };
         let ret = unsafe { (lib.query_port)(ctx.raw(), port, &mut port_attr) };
@@ -218,20 +247,20 @@ impl RdmaDeviceProbe {
             )));
         }
 
+        eprintln!(
+            "[rmlx-rdma] using probed port values: active_mtu={}, max_msg_sz={}, gid_tbl_len={}",
+            port_attr.active_mtu, port_attr.max_msg_sz, port_attr.gid_tbl_len
+        );
+
         // Determine GID index: probe from index 1 downward.
         // TB5 RoCE uses GID index 1; if that fails, fall back to 0.
         let gid_index = Self::probe_gid_index(ctx, port, port_attr.gid_tbl_len as u32)?;
 
-        // max_qp_wr is not directly in port_attr but typically capped by the device.
-        // We use the port max_msg_sz and CQ-related values from port_attr.
-        // For max_qp_wr, use a safe default based on known TB5 limits (4095).
-        // A proper implementation would call ibv_query_device, but that requires
-        // adding the FFI binding. For now, use the port-level information we have.
         Ok(Self {
             gid_index,
-            max_mr_size: port_attr.max_msg_sz as usize,
-            max_qp_wr: 4095, // TB5 known limit; ibv_query_device would give exact value
-            max_cq_depth: 8192, // Safe default for TB5
+            max_mr_size,
+            max_qp_wr,
+            max_cq_depth,
             mtu: port_attr.active_mtu,
             max_msg_sz: port_attr.max_msg_sz,
             gid_tbl_len: port_attr.gid_tbl_len as u32,

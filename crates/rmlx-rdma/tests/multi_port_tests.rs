@@ -161,3 +161,112 @@ fn test_chunk_ordering() {
     all_seqs.sort();
     assert_eq!(all_seqs, (0..8).collect::<Vec<u32>>());
 }
+
+// ---------------------------------------------------------------------------
+// RP1-01: split_by_plan / reassemble_from_chunks roundtrip
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_split_reassemble_roundtrip_dual_port() {
+    let p1 = PortConfig {
+        port_num: 1,
+        gid_index: 1,
+        interface: "en5".into(),
+        address: "10.254.0.5".into(),
+    };
+    let p2 = PortConfig {
+        port_num: 2,
+        gid_index: 1,
+        interface: "en6".into(),
+        address: "10.254.0.7".into(),
+    };
+    let engine = StripeEngine::new(DualPortConfig::dual(p1, p2, 4));
+
+    // Create test data: 16KB of sequential bytes
+    let data: Vec<u8> = (0..16384u32).map(|i| (i % 256) as u8).collect();
+    let plan = engine.plan(data.len(), 1024);
+
+    // Split
+    let (primary_slices, secondary_slices) = engine.split_by_plan(&data, &plan);
+    assert_eq!(primary_slices.len(), plan.primary_chunks.len());
+    assert_eq!(secondary_slices.len(), plan.secondary_chunks.len());
+
+    // Convert slices to owned Vec<u8> (simulating network transfer)
+    let primary_owned: Vec<Vec<u8>> = primary_slices.iter().map(|s| s.to_vec()).collect();
+    let secondary_owned: Vec<Vec<u8>> = secondary_slices.iter().map(|s| s.to_vec()).collect();
+
+    // Reassemble
+    let reassembled = engine.reassemble_from_chunks(&primary_owned, &secondary_owned, &plan);
+
+    // Verify roundtrip preserves data
+    assert_eq!(reassembled.len(), data.len());
+    assert_eq!(
+        reassembled, data,
+        "split → reassemble roundtrip must preserve data"
+    );
+}
+
+#[test]
+fn test_split_reassemble_roundtrip_single_port() {
+    let port = PortConfig {
+        port_num: 1,
+        gid_index: 1,
+        interface: "en5".into(),
+        address: "10.254.0.5".into(),
+    };
+    let engine = StripeEngine::new(DualPortConfig::single(port));
+
+    // Create test data: 4KB
+    let data: Vec<u8> = (0..4096u32).map(|i| (i % 256) as u8).collect();
+    let plan = engine.plan(data.len(), 1024);
+
+    // Single port: all chunks on primary, none on secondary
+    assert!(plan.secondary_chunks.is_empty());
+
+    let (primary_slices, secondary_slices) = engine.split_by_plan(&data, &plan);
+    assert_eq!(primary_slices.len(), 4);
+    assert!(secondary_slices.is_empty());
+
+    let primary_owned: Vec<Vec<u8>> = primary_slices.iter().map(|s| s.to_vec()).collect();
+    let reassembled = engine.reassemble_from_chunks(&primary_owned, &[], &plan);
+
+    assert_eq!(
+        reassembled, data,
+        "single-port split → reassemble must preserve data"
+    );
+}
+
+#[test]
+fn test_split_reassemble_uneven_chunks() {
+    // Test with data size not evenly divisible by chunk_size
+    let p1 = PortConfig {
+        port_num: 1,
+        gid_index: 1,
+        interface: "en5".into(),
+        address: "10.254.0.5".into(),
+    };
+    let p2 = PortConfig {
+        port_num: 2,
+        gid_index: 1,
+        interface: "en6".into(),
+        address: "10.254.0.7".into(),
+    };
+    let engine = StripeEngine::new(DualPortConfig::dual(p1, p2, 2));
+
+    // 5000 bytes / 1024 = 5 chunks (last chunk is 904 bytes)
+    let data: Vec<u8> = (0..5000u32).map(|i| ((i * 7 + 13) % 256) as u8).collect();
+    let plan = engine.plan(data.len(), 1024);
+
+    let total_chunks = plan.primary_chunks.len() + plan.secondary_chunks.len();
+    assert_eq!(total_chunks, 5);
+
+    let (primary_slices, secondary_slices) = engine.split_by_plan(&data, &plan);
+    let primary_owned: Vec<Vec<u8>> = primary_slices.iter().map(|s| s.to_vec()).collect();
+    let secondary_owned: Vec<Vec<u8>> = secondary_slices.iter().map(|s| s.to_vec()).collect();
+
+    let reassembled = engine.reassemble_from_chunks(&primary_owned, &secondary_owned, &plan);
+    assert_eq!(
+        reassembled, data,
+        "uneven chunk roundtrip must preserve data"
+    );
+}

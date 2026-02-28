@@ -9,6 +9,7 @@ pub mod quantized;
 pub mod reduce;
 pub mod rms_norm;
 pub mod rope;
+pub mod silu;
 pub mod softmax;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,6 +50,7 @@ pub fn register_all(registry: &KernelRegistry) -> Result<(), KernelError> {
     matmul::register(registry)?;
     quantized::register(registry)?;
     indexing::register(registry)?;
+    silu::register(registry)?;
     Ok(())
 }
 
@@ -130,6 +132,63 @@ pub fn commit_with_mode(
             });
             Some(CommandBufferHandle { completed })
         }
+    }
+}
+
+/// Result of an async kernel launch.
+///
+/// Wraps the output `Array` (private) together with a `CommandBufferHandle`.
+/// The only way to access the output is via `into_array()`, which blocks
+/// until the GPU command buffer completes. This prevents reading
+/// incomplete GPU results at compile time.
+pub struct LaunchResult {
+    output: Array,
+    handle: CommandBufferHandle,
+}
+
+impl std::fmt::Debug for LaunchResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LaunchResult")
+            .field("complete", &self.handle.is_complete())
+            .field("output_shape", &self.output.shape())
+            .finish()
+    }
+}
+
+impl LaunchResult {
+    /// Create a new `LaunchResult` from an output array and a completion handle.
+    pub fn new(output: Array, handle: CommandBufferHandle) -> Self {
+        Self { output, handle }
+    }
+
+    /// Check whether the GPU work has completed without blocking.
+    pub fn is_complete(&self) -> bool {
+        self.handle.is_complete()
+    }
+
+    /// Block until the GPU finishes, then return the output array.
+    ///
+    /// This is the **only** way to obtain the underlying `Array`.
+    pub fn into_array(self) -> Array {
+        self.handle.wait();
+        self.output
+    }
+
+    /// Block until the GPU finishes or the timeout expires.
+    ///
+    /// Returns `Ok(Array)` on completion, `Err(self)` on timeout so the
+    /// caller can retry or drop.
+    pub fn into_array_timeout(self, timeout: Duration) -> Result<Array, Self> {
+        if self.handle.wait_timeout(timeout) {
+            Ok(self.output)
+        } else {
+            Err(self)
+        }
+    }
+
+    /// Access the completion handle (e.g. for polling).
+    pub fn handle(&self) -> &CommandBufferHandle {
+        &self.handle
     }
 }
 

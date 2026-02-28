@@ -13,6 +13,33 @@ pub struct MoeConfig {
     pub intermediate_dim: usize,
 }
 
+impl MoeConfig {
+    pub fn validate(&self) -> Result<(), KernelError> {
+        if self.num_experts == 0 {
+            return Err(KernelError::InvalidShape(
+                "MoeConfig: num_experts must be > 0".into(),
+            ));
+        }
+        if self.num_experts_per_token == 0 {
+            return Err(KernelError::InvalidShape(
+                "MoeConfig: num_experts_per_token must be > 0".into(),
+            ));
+        }
+        if self.num_experts_per_token > self.num_experts {
+            return Err(KernelError::InvalidShape(format!(
+                "MoeConfig: num_experts_per_token ({}) > num_experts ({})",
+                self.num_experts_per_token, self.num_experts
+            )));
+        }
+        if self.hidden_dim == 0 {
+            return Err(KernelError::InvalidShape(
+                "MoeConfig: hidden_dim must be > 0".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// A single expert FFN (SwiGLU: gate * up then down projection).
 pub struct Expert {
     pub gate_proj: Linear,
@@ -30,13 +57,8 @@ impl Expert {
         // SwiGLU: down(silu(gate(x)) * up(x))
         let gate_out = self.gate_proj.forward(x, registry, queue)?;
         let up_out = self.up_proj.forward(x, registry, queue)?;
-
-        // silu(gate_out) = gate_out * sigmoid(gate_out)
-        // Approximate with: gate_out * (gate_out / (1 + |gate_out|)) — we use mul for now
-        // For simplicity: just use gate * up (without silu activation in the kernel layer)
-        // The actual silu would need a custom kernel; for now do element-wise mul as the
-        // gating mechanism. A proper SiLU kernel can be added to rmlx-core later.
-        let hidden = ops::binary::mul(registry, &gate_out, &up_out, queue)?;
+        let gate_activated = ops::silu::silu(registry, &gate_out, queue)?;
+        let hidden = ops::binary::mul(registry, &gate_activated, &up_out, queue)?;
         self.down_proj.forward(&hidden, registry, queue)
     }
 }
@@ -49,22 +71,34 @@ pub struct MoeLayer {
 
 impl MoeLayer {
     /// Config-only constructor.
-    pub fn new(config: MoeConfig) -> Self {
-        Self {
+    pub fn new(config: MoeConfig) -> Result<Self, KernelError> {
+        config.validate()?;
+        Ok(Self {
             config,
             gate: None,
             experts: Vec::new(),
-        }
+        })
     }
 
     /// Create MoE layer with pre-loaded gate and experts.
-    pub fn from_layers(config: MoeConfig, gate: Linear, experts: Vec<Expert>) -> Self {
-        assert_eq!(experts.len(), config.num_experts);
-        Self {
+    pub fn from_layers(
+        config: MoeConfig,
+        gate: Linear,
+        experts: Vec<Expert>,
+    ) -> Result<Self, KernelError> {
+        config.validate()?;
+        if experts.len() != config.num_experts {
+            return Err(KernelError::InvalidShape(format!(
+                "experts count {} != config.num_experts {}",
+                experts.len(),
+                config.num_experts
+            )));
+        }
+        Ok(Self {
             config,
             gate: Some(gate),
             experts,
-        }
+        })
     }
 
     /// Forward pass for MoE.

@@ -18,10 +18,10 @@ pub use kernels::{KernelError, KernelRegistry};
 pub use logging::{LogEntry, LogLevel};
 pub use lora::{LoraConfig, LoraLayer, LoraModel, LoraTrainer, TrainConfig};
 pub use metrics::{MetricsSnapshot, RuntimeMetrics};
-pub use ops::{CommandBufferHandle, ExecMode};
+pub use ops::{CommandBufferHandle, ExecMode, LaunchResult};
 pub use precision_guard::{GuardAction, PrecisionGuard, PrecisionResult};
 pub use shutdown::{ShutdownHandle, ShutdownSignal};
-pub use vjp::{AddGrad, GradFn, MatMulGrad, MulGrad, Operation, Tape, TapedValue};
+pub use vjp::{AddGrad, GradFn, MatMulGrad, MulGrad, Operation, Tape, TapedValue, VjpError};
 
 /// Path to the AOT-compiled Metal shader library.
 /// Set by build.rs at compile time.

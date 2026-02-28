@@ -36,23 +36,51 @@ impl Linear {
     ///
     /// `weight` shape: [out_features, in_features]
     /// `bias` shape: [out_features] (if present)
-    pub fn from_arrays(config: LinearConfig, weight: Array, bias: Option<Array>) -> Self {
-        assert_eq!(
-            weight.ndim(),
-            2,
-            "weight must be 2D [out_features, in_features]"
-        );
-        assert_eq!(weight.shape()[0], config.out_features);
-        assert_eq!(weight.shape()[1], config.in_features);
-        if let Some(ref b) = bias {
-            assert_eq!(b.ndim(), 1, "bias must be 1D [out_features]");
-            assert_eq!(b.shape()[0], config.out_features);
+    pub fn from_arrays(
+        config: LinearConfig,
+        weight: Array,
+        bias: Option<Array>,
+    ) -> Result<Self, KernelError> {
+        if weight.ndim() != 2 {
+            return Err(KernelError::InvalidShape(format!(
+                "weight must be 2D [out_features, in_features], got {}D",
+                weight.ndim()
+            )));
         }
-        Self {
+        if weight.shape()[0] != config.out_features {
+            return Err(KernelError::InvalidShape(format!(
+                "weight shape[0]={} != out_features={}",
+                weight.shape()[0],
+                config.out_features
+            )));
+        }
+        if weight.shape()[1] != config.in_features {
+            return Err(KernelError::InvalidShape(format!(
+                "weight shape[1]={} != in_features={}",
+                weight.shape()[1],
+                config.in_features
+            )));
+        }
+        if let Some(ref b) = bias {
+            if b.ndim() != 1 {
+                return Err(KernelError::InvalidShape(format!(
+                    "bias must be 1D [out_features], got {}D",
+                    b.ndim()
+                )));
+            }
+            if b.shape()[0] != config.out_features {
+                return Err(KernelError::InvalidShape(format!(
+                    "bias shape[0]={} != out_features={}",
+                    b.shape()[0],
+                    config.out_features
+                )));
+            }
+        }
+        Ok(Self {
             config,
             weight: Some(weight),
             bias,
-        }
+        })
     }
 
     /// Forward pass: output = input @ weight^T + bias
@@ -72,22 +100,25 @@ impl Linear {
 
         // Ensure input is 2D
         let input_2d = if input.ndim() == 1 {
-            input.reshape(vec![1, input.shape()[0]])
+            input.reshape(vec![1, input.shape()[0]])?
+        } else if input.ndim() == 2 {
+            input.reshape(vec![input.shape()[0], input.shape()[1]])?
         } else {
-            assert_eq!(input.ndim(), 2, "input must be 1D or 2D");
-            input.reshape(vec![input.shape()[0], input.shape()[1]])
+            return Err(KernelError::InvalidShape(format!(
+                "input must be 1D or 2D, got {}D",
+                input.ndim()
+            )));
         };
 
-        assert_eq!(
-            input_2d.shape()[1],
-            self.config.in_features,
-            "input features mismatch: {} vs {}",
-            input_2d.shape()[1],
-            self.config.in_features
-        );
+        if input_2d.shape()[1] != self.config.in_features {
+            return Err(KernelError::InvalidShape(format!(
+                "input features mismatch: {} vs {}",
+                input_2d.shape()[1],
+                self.config.in_features
+            )));
+        }
 
-        // Transpose weight: [out, in] -> [in, out]
-        // For now, use a view with swapped strides
+        // Transpose weight: [out, in] -> [in, out] via stride swap (zero-copy)
         let w_t = weight.view(
             vec![self.config.in_features, self.config.out_features],
             vec![1, self.config.in_features],

@@ -82,9 +82,25 @@ pub fn rms_norm(
     eps: f32,
     queue: &metal::CommandQueue,
 ) -> Result<Array, KernelError> {
-    assert_eq!(input.ndim(), 2, "rms_norm requires 2D input");
-    assert_eq!(weight.ndim(), 1, "rms_norm requires 1D weight");
-    assert_eq!(input.shape()[1], weight.shape()[0], "axis size mismatch");
+    if input.ndim() != 2 {
+        return Err(KernelError::InvalidShape(format!(
+            "rms_norm requires 2D input, got {}D",
+            input.ndim()
+        )));
+    }
+    if weight.ndim() != 1 {
+        return Err(KernelError::InvalidShape(format!(
+            "rms_norm requires 1D weight, got {}D",
+            weight.ndim()
+        )));
+    }
+    if input.shape()[1] != weight.shape()[0] {
+        return Err(KernelError::InvalidShape(format!(
+            "axis size mismatch: input[1]={} vs weight[0]={}",
+            input.shape()[1],
+            weight.shape()[0]
+        )));
+    }
 
     let input_contig = super::make_contiguous(input, registry, queue)?;
     let input = input_contig.as_ref().unwrap_or(input);
