@@ -90,7 +90,7 @@ pub fn rms_norm(
 
     let pipeline = registry.get_pipeline(kernel_name, input.dtype())?;
     let rows = input.shape()[0];
-    let axis_size = input.shape()[1] as u32;
+    let axis_size = super::checked_u32(input.shape()[1], "axis_size")?;
 
     let out = Array::zeros(registry.device().raw(), input.shape(), input.dtype());
 

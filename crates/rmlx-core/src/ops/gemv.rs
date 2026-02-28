@@ -85,8 +85,8 @@ pub fn gemv(
     };
 
     let pipeline = registry.get_pipeline(kernel_name, mat.dtype())?;
-    let m = mat.shape()[0] as u32;
-    let k = mat.shape()[1] as u32;
+    let m = super::checked_u32(mat.shape()[0], "M")?;
+    let k = super::checked_u32(mat.shape()[1], "K")?;
 
     let out = Array::zeros(registry.device().raw(), &[m as usize], mat.dtype());
 

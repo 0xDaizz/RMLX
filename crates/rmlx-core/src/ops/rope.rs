@@ -86,8 +86,8 @@ pub fn rope(
     };
 
     let pipeline = registry.get_pipeline(kernel_name, input.dtype())?;
-    let seq_len = input.shape()[0] as u32;
-    let head_dim = input.shape()[1] as u32;
+    let seq_len = super::checked_u32(input.shape()[0], "seq_len")?;
+    let head_dim = super::checked_u32(input.shape()[1], "head_dim")?;
 
     let out = Array::zeros(registry.device().raw(), input.shape(), input.dtype());
 

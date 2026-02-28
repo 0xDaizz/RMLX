@@ -1,6 +1,7 @@
 //! Tests for layer pipeline.
 
 use rmlx_distributed::pipeline::*;
+use std::thread;
 use std::time::Duration;
 
 #[test]
@@ -74,4 +75,85 @@ fn test_pipeline_overlap_measurement() {
         "overlap_gain = {:.2}, serial={:?}, pipeline={:?}",
         stats.overlap_gain, stats.serial_time, stats.pipeline_time
     );
+}
+
+#[test]
+fn test_pipeline_begin_compute_no_event_marks_gpu_on_transfer() {
+    let mut pipeline = LayerPipeline::new(PipelineConfig {
+        num_layers: 1,
+        ..Default::default()
+    });
+    pipeline.begin_compute(0);
+    let ticket = pipeline.ticket(0).unwrap();
+    assert!(!ticket.is_gpu_complete());
+
+    pipeline.begin_transfer(0);
+    // Without gpu_event, begin_transfer manually marks gpu complete
+    let ticket = pipeline.ticket(0).unwrap();
+    assert!(ticket.is_gpu_complete());
+}
+
+#[test]
+fn test_pipeline_complete_with_rdma() {
+    let mut pipeline = LayerPipeline::new(PipelineConfig {
+        num_layers: 2,
+        ..Default::default()
+    });
+    pipeline.begin_compute(0);
+    pipeline.begin_transfer(0);
+
+    // complete_with_rdma(false) does not mark rdma complete
+    pipeline.complete_with_rdma(0, false);
+    let ticket = pipeline.ticket(0).unwrap();
+    assert!(ticket.is_gpu_complete());
+    assert!(!ticket.is_rdma_complete());
+
+    // Manually mark rdma complete
+    ticket.mark_rdma_complete();
+    assert!(ticket.is_rdma_complete());
+}
+
+#[test]
+fn test_pipeline_wait_layer_complete() {
+    let mut pipeline = LayerPipeline::new(PipelineConfig {
+        num_layers: 1,
+        ..Default::default()
+    });
+    pipeline.begin_compute(0);
+
+    // Grab a clone of the ticket before marking complete
+    let ticket_clone = pipeline.ticket(0).unwrap().clone();
+
+    // Spawn thread to mark both phases complete after a short delay
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(20));
+        ticket_clone.mark_gpu_complete();
+        ticket_clone.mark_rdma_complete();
+    });
+
+    let result = pipeline.wait_layer_complete(0, Duration::from_secs(2));
+    assert!(result.is_ok());
+}
+
+#[test]
+fn test_pipeline_wait_layer_no_ticket() {
+    let pipeline = LayerPipeline::new(PipelineConfig {
+        num_layers: 1,
+        ..Default::default()
+    });
+    // No ticket created, should return Ok immediately
+    let result = pipeline.wait_layer_complete(0, Duration::from_secs(1));
+    assert!(result.is_ok());
+}
+
+#[test]
+fn test_pipeline_wait_layer_timeout() {
+    let mut pipeline = LayerPipeline::new(PipelineConfig {
+        num_layers: 1,
+        ..Default::default()
+    });
+    pipeline.begin_compute(0);
+    // Neither gpu nor rdma completed — should timeout
+    let result = pipeline.wait_layer_complete(0, Duration::from_millis(50));
+    assert!(result.is_err());
 }

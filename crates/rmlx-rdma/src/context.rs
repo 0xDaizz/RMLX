@@ -68,11 +68,32 @@ impl RdmaContext {
                         p.max_msg_sz,
                         p.gid_tbl_len,
                     );
+                    // Log INFO when probed values differ significantly from defaults
+                    if p.gid_index != 1 {
+                        eprintln!(
+                            "[rmlx-rdma] INFO: probed gid_index={} differs from default (1)",
+                            p.gid_index,
+                        );
+                    }
+                    if p.max_qp_wr != 4095 {
+                        eprintln!(
+                            "[rmlx-rdma] INFO: probed max_qp_wr={} differs from default (4095)",
+                            p.max_qp_wr,
+                        );
+                    }
+                    if p.max_cq_depth != 8192 {
+                        eprintln!(
+                            "[rmlx-rdma] INFO: probed max_cq_depth={} differs from default (8192)",
+                            p.max_cq_depth,
+                        );
+                    }
                     rdma_ctx.probe = Some(p);
                 }
                 Err(e) => {
                     eprintln!(
-                        "[rmlx-rdma] device '{}' probe failed, using defaults: {e}",
+                        "[rmlx-rdma] WARN: device '{}' probe failed: {e}. \
+                         Falling back to defaults: GID_INDEX=1, MAX_SEND_WR=8192, \
+                         MAX_RECV_WR=8192, CQ_DEPTH=8192, MTU=MTU_1024, MAX_MR_SIZE=16MB",
                         rdma_ctx.device_name,
                     );
                 }

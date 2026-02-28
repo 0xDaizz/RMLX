@@ -1,3 +1,7 @@
+use rmlx_core::array::Array;
+use rmlx_core::kernels::KernelRegistry;
+use rmlx_core::ops;
+use rmlx_metal::device::GpuDevice;
 use rmlx_nn::attention::*;
 use rmlx_nn::embedding::*;
 use rmlx_nn::linear::*;
@@ -109,4 +113,93 @@ fn test_weight_shape_validation() {
     });
     assert_eq!(l.in_features(), 0);
     assert!(l.has_bias());
+}
+
+fn setup() -> Option<(KernelRegistry, metal::CommandQueue)> {
+    let device = GpuDevice::system_default().ok()?;
+    let queue = device.raw().new_command_queue();
+    let registry = KernelRegistry::new(device);
+    ops::register_all(&registry).ok()?;
+    Some((registry, queue))
+}
+
+#[test]
+fn test_linear_from_arrays() {
+    let Some((registry, _queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    // 2x3 weight matrix
+    let weight = Array::from_slice(dev, &[1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0], vec![2, 3]);
+    let linear = Linear::from_arrays(
+        LinearConfig {
+            in_features: 3,
+            out_features: 2,
+            has_bias: false,
+        },
+        weight,
+        None,
+    );
+    assert!(linear.has_weights());
+    assert!(linear.bias().is_none());
+    assert_eq!(linear.in_features(), 3);
+    assert_eq!(linear.out_features(), 2);
+}
+
+#[test]
+fn test_linear_forward_no_bias() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    // Weight: [2, 3] = [[1, 0, 0], [0, 1, 0]]
+    // This selects the first 2 dimensions of input
+    let weight = Array::from_slice(dev, &[1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0], vec![2, 3]);
+    let linear = Linear::from_arrays(
+        LinearConfig {
+            in_features: 3,
+            out_features: 2,
+            has_bias: false,
+        },
+        weight,
+        None,
+    );
+    // Input: [1, 3] = [[5, 6, 7]]
+    let input = Array::from_slice(dev, &[5.0f32, 6.0, 7.0], vec![1, 3]);
+    let output = linear
+        .forward(&input, &registry, &queue)
+        .expect("forward failed");
+    assert_eq!(output.shape(), &[1, 2]);
+    let vals: Vec<f32> = unsafe { output.to_vec() };
+    // output = input @ W^T = [5, 6, 7] @ [[1, 0], [0, 1], [0, 0]] = [5, 6]
+    assert!(
+        (vals[0] - 5.0).abs() < 1e-3,
+        "forward[0] = {} expected 5.0",
+        vals[0]
+    );
+    assert!(
+        (vals[1] - 6.0).abs() < 1e-3,
+        "forward[1] = {} expected 6.0",
+        vals[1]
+    );
+}
+
+#[test]
+fn test_linear_forward_no_weights_errors() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    let linear = Linear::new(LinearConfig {
+        in_features: 3,
+        out_features: 2,
+        has_bias: false,
+    });
+    assert!(!linear.has_weights());
+    let input = Array::from_slice(dev, &[1.0f32, 2.0, 3.0], vec![1, 3]);
+    let result = linear.forward(&input, &registry, &queue);
+    assert!(result.is_err(), "should fail when weights not loaded");
 }
