@@ -1,0 +1,113 @@
+# MLX Shader Vendoring Manifest
+# Tracks upstream sources for vendored Metal shaders from ml-explore/mlx
+
+[upstream]
+repo = "ml-explore/mlx"
+commit = "PLACEHOLDER"
+license = "MIT"
+updated_at = "2026-02-28"
+
+[[files]]
+source_path = "mlx/backend/metal/kernels/bf16.h"
+dest_path = "bf16.h"
+sha256 = "PLACEHOLDER"
+
+[[files]]
+source_path = "mlx/backend/metal/kernels/bf16_math.h"
+dest_path = "bf16_math.h"
+sha256 = "PLACEHOLDER"
+
+[[files]]
+source_path = "mlx/backend/metal/kernels/complex.h"
+dest_path = "complex.h"
+sha256 = "PLACEHOLDER"
+
+[[files]]
+source_path = "mlx/backend/metal/kernels/defines.h"
+dest_path = "defines.h"
+sha256 = "PLACEHOLDER"
+
+[[files]]
+source_path = "mlx/backend/metal/kernels/utils.h"
+dest_path = "utils.h"
+sha256 = "PLACEHOLDER"
+
+[[files]]
+source_path = "mlx/backend/metal/kernels/copy.h"
+dest_path = "copy.h"
+sha256 = "PLACEHOLDER"
+
+[[files]]
+source_path = "mlx/backend/metal/kernels/binary.h"
+dest_path = "binary.h"
+sha256 = "PLACEHOLDER"
+
+[[files]]
+source_path = "mlx/backend/metal/kernels/binary_ops.h"
+dest_path = "binary_ops.h"
+sha256 = "PLACEHOLDER"
+
+[[files]]
+source_path = "mlx/backend/metal/kernels/reduce_utils.h"
+dest_path = "reduce_utils.h"
+sha256 = "PLACEHOLDER"
+
+[[files]]
+source_path = "mlx/backend/metal/kernels/atomic.h"
+dest_path = "atomic.h"
+sha256 = "PLACEHOLDER"
+
+[[files]]
+source_path = "mlx/backend/metal/kernels/reduction/ops.h"
+dest_path = "reduction/ops.h"
+sha256 = "PLACEHOLDER"
+
+[[files]]
+source_path = "mlx/backend/metal/kernels/reduction/reduce_all.h"
+dest_path = "reduction/reduce_all.h"
+sha256 = "PLACEHOLDER"
+
+[[files]]
+source_path = "mlx/backend/metal/kernels/reduction/reduce_col.h"
+dest_path = "reduction/reduce_col.h"
+sha256 = "PLACEHOLDER"
+
+[[files]]
+source_path = "mlx/backend/metal/kernels/reduction/reduce_row.h"
+dest_path = "reduction/reduce_row.h"
+sha256 = "PLACEHOLDER"
+
+[[files]]
+source_path = "mlx/backend/metal/kernels/softmax.h"
+dest_path = "softmax.h"
+sha256 = "PLACEHOLDER"
+
+[[files]]
+source_path = "mlx/backend/metal/kernels/rms_norm.metal"
+dest_path = "rms_norm.metal"
+sha256 = "PLACEHOLDER"
+
+[[files]]
+source_path = "mlx/backend/metal/kernels/rope.metal"
+dest_path = "rope.metal"
+sha256 = "PLACEHOLDER"
+
+[[files]]
+source_path = "mlx/backend/metal/kernels/gemv.metal"
+dest_path = "gemv.metal"
+sha256 = "PLACEHOLDER"
+
+[[files]]
+source_path = "mlx/backend/metal/kernels/gemv_masked.metal"
+dest_path = "gemv_masked.metal"
+sha256 = "PLACEHOLDER"
+
+[[files]]
+source_path = "mlx/backend/metal/kernels/steel/utils.h"
+dest_path = "steel/utils.h"
+sha256 = "PLACEHOLDER"
+
+[[files]]
+source_path = "mlx/backend/metal/kernels/steel/defines.h"
+dest_path = "steel/defines.h"
+sha256 = "PLACEHOLDER"
