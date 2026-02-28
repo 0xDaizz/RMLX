@@ -6,4 +6,5 @@ pub mod moe_exchange;
 pub mod moe_policy;
 pub mod pipeline;
 pub mod sparse_guard;
+pub mod transport;
 pub mod warmup;

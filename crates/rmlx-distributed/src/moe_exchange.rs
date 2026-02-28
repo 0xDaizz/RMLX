@@ -510,8 +510,11 @@ impl MoeDispatchExchange {
                     }
                 } else {
                     // Remote expert — buffer for the owning rank
+                    // Prepend expert_id (u32 LE) so receiver can place in correct slot
                     let target_rank = expert / experts_per_rank;
                     if target_rank < world_size {
+                        let expert_id_bytes = (expert as u32).to_le_bytes();
+                        remote_buffers[target_rank].extend_from_slice(&expert_id_bytes);
                         remote_buffers[target_rank]
                             .extend_from_slice(&token_data[src_start..src_end]);
                     }
@@ -519,7 +522,32 @@ impl MoeDispatchExchange {
             }
         }
 
-        // Send remote buffers to their destination ranks
+        // --- Phase 1: Exchange payload sizes with each peer ---
+        // Send the size (u64 LE) of our payload to each peer so they know exact recv size.
+        for (rank, buf) in remote_buffers.iter().enumerate() {
+            if rank == local_rank {
+                continue;
+            }
+            let size_bytes = (buf.len() as u64).to_le_bytes();
+            self.config
+                .group
+                .send(&size_bytes, rank as u32)
+                .map_err(|e| {
+                    DistributedError::Transport(format!("size send to rank {rank}: {e}"))
+                })?;
+        }
+
+        // Receive sizes from all peers
+        let mut recv_sizes: Vec<usize> = vec![0; world_size];
+        for &peer_rank in self.config.group.peers().iter() {
+            let size_data = self.config.group.recv(peer_rank, 8).map_err(|e| {
+                DistributedError::Transport(format!("size recv from rank {peer_rank}: {e}"))
+            })?;
+            recv_sizes[peer_rank as usize] =
+                u64::from_le_bytes(size_data[..8].try_into().unwrap()) as usize;
+        }
+
+        // --- Phase 2: Send/recv actual payloads with correct sizes ---
         for (rank, buf) in remote_buffers.iter().enumerate() {
             if rank == local_rank || buf.is_empty() {
                 continue;
@@ -530,47 +558,39 @@ impl MoeDispatchExchange {
                 .map_err(|e| DistributedError::Transport(format!("send to rank {rank}: {e}")))?;
         }
 
-        // Receive tokens from each peer that has local experts on this rank.
-        // Each peer sends us their tokens destined for our local experts.
-        // We don't know the exact size a priori, so we use a fixed receive
-        // size based on capacity. In a real system this would be preceded by
-        // a size-exchange step or use known-size protocols.
-        let max_recv_per_peer = local_expert_count * capacity_per_expert * token_stride;
+        // Receive tokens from each peer using the exact size from Phase 1.
+        // Each token in the received buffer is prefixed with a u32 expert_id,
+        // allowing us to place it in the correct expert slot.
+        let wire_stride = 4 + token_stride; // 4-byte expert_id prefix + token data
         for &peer_rank in self.config.group.peers().iter() {
-            if max_recv_per_peer == 0 {
-                break;
+            let recv_size = recv_sizes[peer_rank as usize];
+            if recv_size == 0 {
+                continue;
             }
-            let received = self
-                .config
-                .group
-                .recv(peer_rank, max_recv_per_peer)
-                .map_err(|e| {
-                    DistributedError::Transport(format!("recv from rank {peer_rank}: {e}"))
-                })?;
+            let received = self.config.group.recv(peer_rank, recv_size).map_err(|e| {
+                DistributedError::Transport(format!("recv from rank {peer_rank}: {e}"))
+            })?;
 
-            // Merge received tokens into local_output: append after locally-routed tokens
-            // by scanning for empty slots in each expert's capacity region.
+            // Merge received tokens into local_output using expert_id prefix
             let mut offset = 0;
-            while offset + token_stride <= received.len() {
-                // Find the next local expert with remaining capacity
-                let mut placed = false;
-                for (le, cursor) in local_cursors.iter_mut().enumerate() {
-                    if *cursor < capacity_per_expert {
-                        let dst_start = (le * capacity_per_expert + *cursor) * token_stride;
+            while offset + wire_stride <= received.len() {
+                let expert_id =
+                    u32::from_le_bytes(received[offset..offset + 4].try_into().unwrap()) as usize;
+                if expert_id >= local_start && expert_id < local_end {
+                    let local_expert_idx = expert_id - local_start;
+                    let cursor = local_cursors[local_expert_idx];
+                    if cursor < capacity_per_expert {
+                        let dst_start =
+                            (local_expert_idx * capacity_per_expert + cursor) * token_stride;
                         let dst_end = dst_start + token_stride;
                         if dst_end <= local_output.len() {
                             local_output[dst_start..dst_end]
-                                .copy_from_slice(&received[offset..offset + token_stride]);
-                            *cursor += 1;
-                            placed = true;
-                            break;
+                                .copy_from_slice(&received[offset + 4..offset + 4 + token_stride]);
+                            local_cursors[local_expert_idx] += 1;
                         }
                     }
                 }
-                if !placed {
-                    break; // All experts at capacity
-                }
-                offset += token_stride;
+                offset += wire_stride;
             }
         }
 

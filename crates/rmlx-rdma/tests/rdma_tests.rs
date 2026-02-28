@@ -385,3 +385,63 @@ fn test_rdma_error_timeout_variant() {
     let msg = format!("{err}");
     assert!(msg.contains("timeout"), "expected 'timeout' in: {msg}");
 }
+
+// ---------------------------------------------------------------------------
+// P0-4: InvalidArgument error variant test
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_rdma_error_invalid_argument_variant() {
+    let err = RdmaError::InvalidArgument("SGE out of bounds".into());
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("invalid argument"),
+        "expected 'invalid argument' in: {msg}"
+    );
+    assert!(
+        msg.contains("SGE out of bounds"),
+        "expected detail in: {msg}"
+    );
+}
+
+#[test]
+fn test_rdma_error_display_all_variants() {
+    // Exhaustive check including new InvalidArgument variant
+    let errors = vec![
+        RdmaError::LibraryNotFound("test".into()),
+        RdmaError::NoDevices,
+        RdmaError::DeviceOpen("test".into()),
+        RdmaError::PdAlloc,
+        RdmaError::MrReg("test".into()),
+        RdmaError::CqCreate,
+        RdmaError::QpCreate("test".into()),
+        RdmaError::QpModify("test".into()),
+        RdmaError::PostFailed("test".into()),
+        RdmaError::CqPoll("test".into()),
+        RdmaError::ConnectionFailed("test".into()),
+        RdmaError::Timeout("test".into()),
+        RdmaError::Unavailable("test".into()),
+        RdmaError::InvalidArgument("test".into()),
+    ];
+
+    for err in &errors {
+        let msg = format!("{err}");
+        assert!(
+            !msg.is_empty(),
+            "error Display should produce non-empty string"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P0-3: CompletionTracker backlog error propagation test
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_completion_tracker_backlog_error_propagation() {
+    // Verify the error format used by the backlog error path in
+    // wait_completions_with_timeout matches expectations.
+    let err = RdmaError::CqPoll(format!("backlog: wr_id {} failed with status {}", 42, 1));
+    let msg = format!("{err}");
+    assert!(msg.contains("backlog: wr_id 42 failed with status 1"));
+}

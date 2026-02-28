@@ -1,7 +1,9 @@
-use rmlx_distributed::group::{self, Group};
+use rmlx_distributed::group::{self, DistributedError, Group, RdmaTransport};
 use rmlx_distributed::moe_exchange::{MoeCombineExchange, MoeDispatchConfig, MoeDispatchExchange};
 use rmlx_distributed::moe_policy::{MoeBackend, MoePolicy, ThresholdCalibration};
 use rmlx_distributed::warmup::WarmupState;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 #[test]
 fn test_group_world() {
@@ -569,4 +571,286 @@ fn test_moe_combine_cpu_out_of_range_expert() {
     // Expert index 5 >= expert_outputs.len() (1), so nothing added
     assert!((result[0] - 0.0).abs() < 1e-5);
     assert!((result[1] - 0.0).abs() < 1e-5);
+}
+
+// ─── Loopback RDMA transport for testing size exchange + expert-ID protocol ───
+
+/// A loopback transport that records sent messages and replays them on recv.
+/// Simulates a 2-rank world where rank 0 and rank 1 communicate.
+/// Messages sent to a rank are queued; recv pops from that queue.
+struct LoopbackTransport {
+    local_rank: u32,
+    /// Keyed by (src_rank, dst_rank), stores queued messages.
+    queues: Arc<Mutex<HashMap<(u32, u32), Vec<Vec<u8>>>>>,
+}
+
+impl LoopbackTransport {
+    fn new_pair() -> (Arc<Self>, Arc<Self>) {
+        let queues = Arc::new(Mutex::new(HashMap::new()));
+        let t0 = Arc::new(Self {
+            local_rank: 0,
+            queues: queues.clone(),
+        });
+        let t1 = Arc::new(Self {
+            local_rank: 1,
+            queues,
+        });
+        (t0, t1)
+    }
+}
+
+impl RdmaTransport for LoopbackTransport {
+    fn send(&self, data: &[u8], dst_rank: u32) -> Result<(), DistributedError> {
+        let mut q = self.queues.lock().unwrap();
+        q.entry((self.local_rank, dst_rank))
+            .or_default()
+            .push(data.to_vec());
+        Ok(())
+    }
+
+    fn recv(&self, src_rank: u32, len: usize) -> Result<Vec<u8>, DistributedError> {
+        let mut q = self.queues.lock().unwrap();
+        let queue = q.entry((src_rank, self.local_rank)).or_default();
+        if let Some(msg) = queue.first().cloned() {
+            queue.remove(0);
+            // Return exactly `len` bytes: truncate or zero-pad
+            let mut buf = msg;
+            buf.resize(len, 0);
+            Ok(buf)
+        } else {
+            // No message queued — return zeros (simulates empty recv)
+            Ok(vec![0u8; len])
+        }
+    }
+}
+
+// ─── Size exchange roundtrip test ───
+
+#[test]
+fn test_rdma_size_exchange_roundtrip() {
+    // Two ranks. Rank 0 sends tokens for experts 4-7 (rank 1).
+    // We run dispatch on rank 0 and verify that size headers are sent.
+    let (t0, _t1) = LoopbackTransport::new_pair();
+
+    let group = Group::with_transport(vec![0, 1], 0, 2, t0.clone());
+    let config = MoeDispatchConfig {
+        num_experts: 8,
+        top_k: 1,
+        capacity_factor: 2.0,
+        group,
+    };
+    // Use low thresholds so small batches still trigger RDMA path
+    let mut policy = MoePolicy::with_thresholds(0, 1, 0);
+    policy.set_world_size(2);
+    policy.set_hysteresis_band(0);
+    let mut exchange = MoeDispatchExchange::new(config, policy);
+
+    // 4 tokens: experts [4, 5, 6, 7] — all remote for rank 0
+    let indices = vec![4u32, 5, 6, 7];
+    let weights = vec![1.0f32; 4];
+    let token_data = vec![0xABu8; 4 * 16]; // 4 tokens, 16 bytes each
+
+    let result = exchange.dispatch(4, &indices, &weights, &token_data);
+    assert!(result.is_ok());
+    assert_eq!(result.unwrap().backend, MoeBackend::Rdma);
+
+    // Verify the transport queues: rank 0 should have sent to rank 1:
+    // 1) A size header (8 bytes)
+    // 2) The actual payload
+    let q = t0.queues.lock().unwrap();
+    let messages = q.get(&(0, 1)).unwrap();
+    assert_eq!(messages.len(), 2, "should have size header + payload");
+
+    // First message is the size header (u64 LE)
+    let size_header = &messages[0];
+    assert_eq!(size_header.len(), 8);
+    let payload_size = u64::from_le_bytes(size_header[..8].try_into().unwrap()) as usize;
+
+    // Second message is the payload
+    let payload = &messages[1];
+    assert_eq!(payload.len(), payload_size);
+
+    // Each token on wire = 4 (expert_id) + 16 (token_data) = 20 bytes, 4 tokens = 80
+    let wire_stride = 4 + 16;
+    assert_eq!(payload_size, 4 * wire_stride);
+}
+
+// ─── Expert-ID preservation through send/recv/merge cycle ───
+
+#[test]
+fn test_rdma_expert_id_preserved_in_merge() {
+    // Simulate rank 1 receiving tokens from rank 0 for its local experts (4-7).
+    // Rank 0 sends tokens tagged with expert_id=4 and expert_id=6.
+    // Rank 1 should place them in the correct expert slots, not first-fit.
+    let (t0, t1) = LoopbackTransport::new_pair();
+
+    // --- Rank 0 side: dispatch tokens destined for rank 1's experts ---
+    {
+        let group0 = Group::with_transport(vec![0, 1], 0, 2, t0.clone());
+        let config0 = MoeDispatchConfig {
+            num_experts: 8,
+            top_k: 1,
+            capacity_factor: 2.0,
+            group: group0,
+        };
+        let mut policy0 = MoePolicy::with_thresholds(0, 1, 0);
+        policy0.set_world_size(2);
+        policy0.set_hysteresis_band(0);
+        let mut exchange0 = MoeDispatchExchange::new(config0, policy0);
+
+        // 2 tokens: expert 4 and expert 6 (both on rank 1)
+        let indices = vec![4u32, 6];
+        let weights = vec![1.0f32; 2];
+        // Token 0: [0x11; 8], Token 1: [0x22; 8]
+        let mut token_data = vec![0x11u8; 8];
+        token_data.extend_from_slice(&[0x22u8; 8]);
+
+        let result = exchange0.dispatch(2, &indices, &weights, &token_data);
+        assert!(result.is_ok());
+    }
+
+    // Now the loopback queues have: (0,1) -> [size_header, payload]
+    // Manually transfer them to (0,1) readable by rank 1.
+    // The LoopbackTransport already stores them keyed by (src=0, dst=1),
+    // and rank 1's recv reads from (src=0, dst=1). So they're ready.
+
+    // --- Rank 1 side: dispatch with all-local tokens to trigger RDMA recv ---
+    {
+        let group1 = Group::with_transport(vec![0, 1], 1, 2, t1.clone());
+        let config1 = MoeDispatchConfig {
+            num_experts: 8,
+            top_k: 1,
+            capacity_factor: 2.0,
+            group: group1,
+        };
+        let mut policy1 = MoePolicy::with_thresholds(0, 1, 0);
+        policy1.set_world_size(2);
+        policy1.set_hysteresis_band(0);
+        let mut exchange1 = MoeDispatchExchange::new(config1, policy1);
+
+        // Rank 1's local experts are 4-7. Send 2 tokens to local experts 5 and 7.
+        // This also triggers the RDMA recv path for peer rank 0.
+        let indices = vec![5u32, 7];
+        let weights = vec![1.0f32; 2];
+        // Token 0: [0x33; 8], Token 1: [0x44; 8]
+        let mut token_data = vec![0x33u8; 8];
+        token_data.extend_from_slice(&[0x44u8; 8]);
+
+        let result = exchange1.dispatch(2, &indices, &weights, &token_data);
+        assert!(result.is_ok());
+        let dispatch_result = result.unwrap();
+        assert_eq!(dispatch_result.backend, MoeBackend::Rdma);
+
+        // Rank 1 owns experts 4-7 (local_expert_count=4).
+        // capacity_per_expert = ceil(2 * 1 / 8 * 2.0) = ceil(0.5) = 1
+        let token_stride = 8;
+        let capacity_per_expert = 1; // ceil(2/8 * 2.0) = 1
+        let routed = &dispatch_result.routed_data;
+
+        // Expert 4 (local_idx=0): should have the token from rank 0 tagged expert_id=4 -> [0x11; 8]
+        let expert4_start = 0 * capacity_per_expert * token_stride;
+        let expert4_data = &routed[expert4_start..expert4_start + token_stride];
+        assert_eq!(
+            expert4_data, &[0x11u8; 8],
+            "expert 4 should have rank 0's token [0x11]"
+        );
+
+        // Expert 5 (local_idx=1): should have rank 1's local token -> [0x33; 8]
+        let expert5_start = 1 * capacity_per_expert * token_stride;
+        let expert5_data = &routed[expert5_start..expert5_start + token_stride];
+        assert_eq!(
+            expert5_data, &[0x33u8; 8],
+            "expert 5 should have rank 1's local token [0x33]"
+        );
+
+        // Expert 6 (local_idx=2): should have the token from rank 0 tagged expert_id=6 -> [0x22; 8]
+        let expert6_start = 2 * capacity_per_expert * token_stride;
+        let expert6_data = &routed[expert6_start..expert6_start + token_stride];
+        assert_eq!(
+            expert6_data, &[0x22u8; 8],
+            "expert 6 should have rank 0's token [0x22]"
+        );
+
+        // Expert 7 (local_idx=3): should have rank 1's local token -> [0x44; 8]
+        let expert7_start = 3 * capacity_per_expert * token_stride;
+        let expert7_data = &routed[expert7_start..expert7_start + token_stride];
+        assert_eq!(
+            expert7_data, &[0x44u8; 8],
+            "expert 7 should have rank 1's local token [0x44]"
+        );
+    }
+}
+
+// ─── Verify wire format: expert_id prefix is correctly encoded ───
+
+#[test]
+fn test_rdma_wire_format_expert_id_prefix() {
+    // Rank 0 dispatches a single token to expert 5 (on rank 1).
+    // Verify the payload wire format: [expert_id: u32 LE | token_data...]
+    let (t0, _t1) = LoopbackTransport::new_pair();
+
+    let group = Group::with_transport(vec![0, 1], 0, 2, t0.clone());
+    let config = MoeDispatchConfig {
+        num_experts: 8,
+        top_k: 1,
+        capacity_factor: 2.0,
+        group,
+    };
+    let mut policy = MoePolicy::with_thresholds(0, 0, 0);
+    policy.set_world_size(2);
+    policy.set_hysteresis_band(0);
+    let mut exchange = MoeDispatchExchange::new(config, policy);
+
+    let indices = vec![5u32]; // expert 5, on rank 1
+    let weights = vec![1.0f32];
+    let token_data = vec![0xDE, 0xAD, 0xBE, 0xEF]; // 1 token, 4 bytes
+
+    let _ = exchange.dispatch(1, &indices, &weights, &token_data);
+
+    let q = t0.queues.lock().unwrap();
+    let messages = q.get(&(0, 1)).unwrap();
+    let payload = &messages[1]; // second message is the payload
+
+    // Wire format: [05, 00, 00, 00, DE, AD, BE, EF]
+    assert_eq!(payload.len(), 4 + 4); // expert_id (4) + token (4)
+    let expert_id = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+    assert_eq!(expert_id, 5);
+    assert_eq!(&payload[4..8], &[0xDE, 0xAD, 0xBE, 0xEF]);
+}
+
+// ─── Size exchange with zero-payload peer ───
+
+#[test]
+fn test_rdma_size_exchange_zero_payload() {
+    // Rank 0 sends all tokens to local experts (0-3), nothing to rank 1.
+    // Size header to rank 1 should be 0.
+    let (t0, _t1) = LoopbackTransport::new_pair();
+
+    let group = Group::with_transport(vec![0, 1], 0, 2, t0.clone());
+    let config = MoeDispatchConfig {
+        num_experts: 8,
+        top_k: 1,
+        capacity_factor: 2.0,
+        group,
+    };
+    let mut policy = MoePolicy::with_thresholds(0, 1, 0);
+    policy.set_world_size(2);
+    policy.set_hysteresis_band(0);
+    let mut exchange = MoeDispatchExchange::new(config, policy);
+
+    // All tokens go to local experts (0, 1, 2, 3)
+    let indices = vec![0u32, 1, 2, 3];
+    let weights = vec![1.0f32; 4];
+    let token_data = vec![0xFFu8; 4 * 8];
+
+    let _ = exchange.dispatch(4, &indices, &weights, &token_data);
+
+    let q = t0.queues.lock().unwrap();
+    let messages = q.get(&(0, 1)).unwrap();
+
+    // Only a size header should be sent (payload is empty, so no payload message)
+    assert_eq!(messages.len(), 1, "only size header, no payload");
+    let size_header = &messages[0];
+    let payload_size = u64::from_le_bytes(size_header[..8].try_into().unwrap());
+    assert_eq!(payload_size, 0, "no remote tokens, size should be 0");
 }

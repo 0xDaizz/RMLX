@@ -37,6 +37,8 @@ pub struct MoePolicy {
     cooldown_remaining: AtomicU32,
     /// Step counter for hysteresis tracking.
     step_count: AtomicU32,
+    /// Force a specific backend (overrides all threshold logic). Used for testing.
+    forced_backend: Option<MoeBackend>,
 }
 
 impl MoePolicy {
@@ -52,6 +54,7 @@ impl MoePolicy {
             current_backend: MoeBackend::Metal,
             cooldown_remaining: AtomicU32::new(0),
             step_count: AtomicU32::new(0),
+            forced_backend: None,
         }
     }
 
@@ -80,6 +83,12 @@ impl MoePolicy {
         self.hysteresis_band = band;
     }
 
+    /// Force a specific backend, bypassing all threshold logic.
+    /// Pass `None` to clear the override and resume normal selection.
+    pub fn force_backend(&mut self, backend: Option<MoeBackend>) {
+        self.forced_backend = backend;
+    }
+
     /// Select dispatch backend for a given element count and byte size.
     ///
     /// 3-zone logic:
@@ -90,6 +99,11 @@ impl MoePolicy {
     /// Hysteresis: when switching away from the current backend, the threshold
     /// is adjusted by ±hysteresis_band to prevent oscillation at zone boundaries.
     pub fn select(&self, n_elements: u32, byte_size: usize) -> MoeBackend {
+        // If a backend is forced, return it unconditionally
+        if let Some(forced) = self.forced_backend {
+            return forced;
+        }
+
         // During cooldown, maintain current backend
         let remaining = self.cooldown_remaining.load(Ordering::Relaxed);
         if remaining > 0 {
