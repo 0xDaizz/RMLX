@@ -65,6 +65,19 @@ pub fn rms_norm(
     assert_eq!(weight.ndim(), 1, "rms_norm requires 1D weight");
     assert_eq!(input.shape()[1], weight.shape()[0], "axis size mismatch");
 
+    let input_contig = super::make_contiguous(input, registry, queue)?;
+    let input = input_contig.as_ref().unwrap_or(input);
+    let weight_contig = super::make_contiguous(weight, registry, queue)?;
+    let weight = weight_contig.as_ref().unwrap_or(weight);
+
+    let axis_size = input.shape()[1];
+    if axis_size > 1024 {
+        return Err(KernelError::InvalidShape(format!(
+            "rms_norm axis_size {} exceeds max threadgroup size 1024",
+            axis_size
+        )));
+    }
+
     let kernel_name = match input.dtype() {
         DType::Float32 => "rms_norm_f32",
         _ => {

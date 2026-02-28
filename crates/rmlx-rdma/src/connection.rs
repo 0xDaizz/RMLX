@@ -4,6 +4,7 @@
 //! and warmup protocol for all peers.
 
 use std::ffi::c_void;
+use std::time::{Duration, Instant};
 
 use crate::context::{ProtectionDomain, RdmaContext};
 use crate::exchange;
@@ -35,6 +36,128 @@ impl Default for RdmaConfig {
             exchange_port: exchange::TCP_EXCHANGE_PORT,
             sync_port: exchange::TCP_SYNC_PORT,
         }
+    }
+}
+
+/// Default CQ poll timeout in milliseconds.
+const DEFAULT_CQ_TIMEOUT_MS: u64 = 5000;
+
+/// Tracks work request completions by wr_id with timeout support.
+///
+/// Maintains a backlog of completions that arrived but were not yet claimed,
+/// allowing out-of-order wr_id matching.
+pub struct CompletionTracker {
+    expected: Vec<u64>,
+    completed: Vec<u64>,
+    backlog: Vec<IbvWc>,
+}
+
+impl CompletionTracker {
+    pub fn new() -> Self {
+        Self {
+            expected: Vec::new(),
+            completed: Vec::new(),
+            backlog: Vec::new(),
+        }
+    }
+
+    /// Register an expected wr_id for tracking.
+    pub fn expect(&mut self, wr_id: u64) {
+        self.expected.push(wr_id);
+    }
+
+    /// Wait for a specific wr_id completion from the CQ, with timeout.
+    ///
+    /// Checks the backlog first, then polls the CQ until the matching
+    /// completion arrives or the timeout expires.
+    pub fn wait_for(
+        &mut self,
+        wr_id: u64,
+        cq: &CompletionQueue,
+        timeout_ms: u64,
+    ) -> Result<IbvWc, RdmaError> {
+        // Check backlog first
+        if let Some(pos) = self.backlog.iter().position(|wc| wc.wr_id == wr_id) {
+            let wc = self.backlog.swap_remove(pos);
+            if wc.status != wc_status::SUCCESS {
+                return Err(RdmaError::CqPoll(format!(
+                    "wc status={} for wr_id={wr_id}",
+                    wc.status
+                )));
+            }
+            self.completed.push(wr_id);
+            return Ok(wc);
+        }
+
+        // Poll CQ with timeout
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let mut wc_buf: [IbvWc; 16] = core::array::from_fn(|_| unsafe { std::mem::zeroed() });
+
+        loop {
+            let count = cq.poll(&mut wc_buf)?;
+            for wc in &wc_buf[..count] {
+                if wc.wr_id == wr_id {
+                    if wc.status != wc_status::SUCCESS {
+                        return Err(RdmaError::CqPoll(format!(
+                            "wc status={} for wr_id={wr_id}",
+                            wc.status
+                        )));
+                    }
+                    self.completed.push(wr_id);
+                    return Ok(*wc);
+                }
+                // Not our target — stash in backlog
+                self.backlog.push(*wc);
+            }
+            if Instant::now() >= deadline {
+                return Err(RdmaError::Timeout(format!(
+                    "wr_id={wr_id} not completed within {timeout_ms}ms"
+                )));
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    /// Drain all expected wr_ids, returning once all are completed or timeout.
+    pub fn wait_all(
+        &mut self,
+        cq: &CompletionQueue,
+        timeout_ms: u64,
+    ) -> Result<Vec<IbvWc>, RdmaError> {
+        let expected: Vec<u64> = self.expected.drain(..).collect();
+        let mut results = Vec::with_capacity(expected.len());
+        for wr_id in expected {
+            results.push(self.wait_for(wr_id, cq, timeout_ms)?);
+        }
+        Ok(results)
+    }
+}
+
+impl Default for CompletionTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Poll CQ with a timeout. Returns all completions polled before the deadline.
+///
+/// Spins on poll_cq until at least one completion is available or the
+/// timeout expires.
+pub fn poll_with_timeout(cq: &CompletionQueue, timeout_ms: u64) -> Result<Vec<IbvWc>, RdmaError> {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    let mut wc_buf: [IbvWc; 16] = core::array::from_fn(|_| unsafe { std::mem::zeroed() });
+
+    loop {
+        let count = cq.poll(&mut wc_buf)?;
+        if count > 0 {
+            return Ok(wc_buf[..count].to_vec());
+        }
+        if Instant::now() >= deadline {
+            return Err(RdmaError::Timeout(format!(
+                "no completions within {timeout_ms}ms"
+            )));
+        }
+        std::thread::yield_now();
     }
 }
 
@@ -162,6 +285,19 @@ impl RdmaConnection {
     /// Spins on poll_cq until `n` successful completions are received.
     /// Returns an error immediately if any completion has a non-success status.
     pub fn wait_completions(&self, n: usize) -> Result<(), RdmaError> {
+        self.wait_completions_with_timeout(n, DEFAULT_CQ_TIMEOUT_MS)
+    }
+
+    /// Wait for exactly `n` completions with an explicit timeout.
+    ///
+    /// Returns `RdmaError::Timeout` if `n` completions are not received
+    /// within `timeout_ms` milliseconds.
+    pub fn wait_completions_with_timeout(
+        &self,
+        n: usize,
+        timeout_ms: u64,
+    ) -> Result<(), RdmaError> {
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         let mut completed = 0usize;
         // SAFETY: IbvWc is a plain C struct safe to zero-initialize.
         let mut wc: [IbvWc; 16] = core::array::from_fn(|_| unsafe { std::mem::zeroed() });
@@ -177,8 +313,26 @@ impl RdmaConnection {
                 }
             }
             completed += count;
+            if completed < n && Instant::now() >= deadline {
+                return Err(RdmaError::Timeout(format!(
+                    "only {completed}/{n} completions within {timeout_ms}ms"
+                )));
+            }
+            if completed < n {
+                std::thread::yield_now();
+            }
         }
         Ok(())
+    }
+
+    /// Create a new CompletionTracker for fine-grained wr_id-based matching.
+    pub fn new_tracker(&self) -> CompletionTracker {
+        CompletionTracker::new()
+    }
+
+    /// Access the completion queue (for use with CompletionTracker).
+    pub fn cq(&self) -> &CompletionQueue {
+        &self.cq
     }
 
     /// Run warmup: exchange 10 rounds of small dummy messages.

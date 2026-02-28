@@ -8,6 +8,27 @@ pub struct AttentionConfig {
     pub rope_theta: f32,
 }
 
+impl AttentionConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.num_heads == 0 {
+            return Err("num_heads must be > 0".into());
+        }
+        if self.num_kv_heads == 0 {
+            return Err("num_kv_heads must be > 0".into());
+        }
+        if self.num_kv_heads > self.num_heads {
+            return Err("num_kv_heads > num_heads".into());
+        }
+        if self.num_heads % self.num_kv_heads != 0 {
+            return Err("num_heads must be divisible by num_kv_heads".into());
+        }
+        if self.head_dim == 0 {
+            return Err("head_dim must be > 0".into());
+        }
+        Ok(())
+    }
+}
+
 pub struct Attention {
     config: AttentionConfig,
 }

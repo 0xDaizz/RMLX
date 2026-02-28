@@ -8,6 +8,47 @@ use rmlx_metal::metal::Buffer as MetalBuffer;
 
 use crate::AllocError;
 
+/// Tracks whether a buffer is still in-flight (GPU or RDMA operation pending).
+///
+/// This is a lightweight completion tracker for coordinating buffer lifetime
+/// across GPU compute and RDMA transfer operations. Both must complete
+/// before the buffer can safely be freed or reused.
+#[derive(Clone)]
+pub struct CompletionTicket {
+    gpu_complete: Arc<AtomicBool>,
+    rdma_complete: Arc<AtomicBool>,
+}
+
+impl CompletionTicket {
+    pub fn new() -> Self {
+        Self {
+            gpu_complete: Arc::new(AtomicBool::new(false)),
+            rdma_complete: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Mark the GPU operation as completed.
+    pub fn mark_gpu_complete(&self) {
+        self.gpu_complete.store(true, Ordering::Release);
+    }
+
+    /// Mark the RDMA operation as completed.
+    pub fn mark_rdma_complete(&self) {
+        self.rdma_complete.store(true, Ordering::Release);
+    }
+
+    /// Returns true if both GPU and RDMA operations have completed.
+    pub fn is_safe_to_free(&self) -> bool {
+        self.gpu_complete.load(Ordering::Acquire) && self.rdma_complete.load(Ordering::Acquire)
+    }
+}
+
+impl Default for CompletionTicket {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Zero-copy buffer: page-aligned memory shared between CPU and Metal GPU.
 ///
 /// Uses posix_memalign for allocation and Metal newBufferWithBytesNoCopy
@@ -18,6 +59,7 @@ pub struct ZeroCopyBuffer {
     in_flight: Arc<()>,
     size: usize,
     _alignment: usize,
+    ticket: Option<CompletionTicket>,
 }
 
 // SAFETY: ZeroCopyBuffer can be sent between threads because:
@@ -72,6 +114,7 @@ impl ZeroCopyBuffer {
             in_flight: Arc::new(()),
             size: aligned_size,
             _alignment: alignment,
+            ticket: None,
         })
     }
 
@@ -97,6 +140,25 @@ impl ZeroCopyBuffer {
     #[inline]
     pub fn size(&self) -> usize {
         self.size
+    }
+
+    /// Attach a completion ticket for GPU/RDMA lifecycle tracking.
+    pub fn set_ticket(&mut self, ticket: CompletionTicket) {
+        self.ticket = Some(ticket);
+    }
+
+    /// Get a reference to the current completion ticket, if any.
+    pub fn ticket(&self) -> Option<&CompletionTicket> {
+        self.ticket.as_ref()
+    }
+
+    /// Returns true if safe to free (no in-flight operations tracked by ticket).
+    /// If no ticket is attached, returns true (untracked = safe).
+    pub fn is_safe_to_free(&self) -> bool {
+        match &self.ticket {
+            Some(t) => t.is_safe_to_free(),
+            None => true,
+        }
     }
 
     /// Acquire an in-flight token. The buffer cannot be freed while
@@ -125,6 +187,27 @@ impl ZeroCopyBuffer {
 
 impl Drop for ZeroCopyBuffer {
     fn drop(&mut self) {
+        // Check completion ticket if present
+        if let Some(ref ticket) = self.ticket {
+            if !ticket.is_safe_to_free() {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !ticket.is_safe_to_free() {
+                    if Instant::now() >= deadline {
+                        eprintln!(
+                            "[rmlx-alloc] CRITICAL: buffer {:p} drop timeout -- \
+                             completion ticket not resolved (gpu={}, rdma={}). \
+                             Leaking memory to prevent use-after-free.",
+                            self.raw_ptr.as_ptr(),
+                            ticket.gpu_complete.load(Ordering::Acquire),
+                            ticket.rdma_complete.load(Ordering::Acquire),
+                        );
+                        let _ = std::mem::replace(&mut self.raw_ptr, NonNull::dangling());
+                        return;
+                    }
+                    std::thread::yield_now();
+                }
+            }
+        }
         // Wait for all in-flight tokens to be released
         let deadline = Instant::now() + Duration::from_secs(5);
         while Arc::strong_count(&self.in_flight) > 1 {

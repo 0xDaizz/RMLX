@@ -58,7 +58,7 @@ kernel void softmax_f32(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Phase 3: Normalize
-    float inv_total = 1.0 / total;
+    float inv_total = (total > 0.0) ? (1.0 / total) : 0.0;
     for (uint i = tid; i < cols; i += tgsize) {
         output[base + i] *= inv_total;
     }
@@ -76,6 +76,9 @@ pub fn softmax(
     queue: &metal::CommandQueue,
 ) -> Result<Array, KernelError> {
     assert_eq!(input.ndim(), 2, "softmax requires 2D input");
+
+    let input_contig = super::make_contiguous(input, registry, queue)?;
+    let input = input_contig.as_ref().unwrap_or(input);
 
     let kernel_name = match input.dtype() {
         DType::Float32 => "softmax_f32",

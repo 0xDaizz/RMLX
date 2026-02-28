@@ -116,6 +116,43 @@ impl PrecisionGuard {
     pub fn should_fallback(&self) -> bool {
         self.consecutive_drift_windows >= 2
     }
+
+    /// Check logits and return an actionable guard decision.
+    ///
+    /// Unlike `check_logits` which only detects, this method returns a
+    /// `GuardAction` that the caller must act on:
+    /// - `Reject`: immediately discard the result (NaN/Inf detected)
+    /// - `Fallback`: promote to higher precision (bf16→f32)
+    /// - `Warn`: log a warning but continue
+    /// - `None`: all clear
+    pub fn check_and_act(&mut self, logits: &[f32]) -> GuardAction {
+        let result = self.check_logits(logits);
+        match result {
+            PrecisionResult::HasNaN(_) | PrecisionResult::HasInf(_) => GuardAction::Reject,
+            PrecisionResult::EntropyDrift(drift) if drift > 0.30 => {
+                // check_logits already updated consecutive_drift_windows via record_entropy
+                if self.consecutive_drift_windows >= 2 {
+                    GuardAction::Fallback
+                } else {
+                    GuardAction::Warn
+                }
+            }
+            _ => GuardAction::None,
+        }
+    }
+}
+
+/// Action to take based on precision guard evaluation.
+#[derive(Debug, PartialEq)]
+pub enum GuardAction {
+    /// No issues detected.
+    None,
+    /// Entropy drift detected but not yet critical. Log and continue.
+    Warn,
+    /// Critical drift: promote precision (bf16→f32).
+    Fallback,
+    /// NaN or Inf detected: reject the output immediately.
+    Reject,
 }
 
 /// Compute Shannon entropy from logits via softmax.

@@ -18,6 +18,8 @@ pub enum KernelError {
     CompilationFailed(String),
     /// Pipeline creation failed.
     PipelineFailed(String),
+    /// Invalid shape for the operation.
+    InvalidShape(String),
 }
 
 impl std::fmt::Display for KernelError {
@@ -26,6 +28,7 @@ impl std::fmt::Display for KernelError {
             KernelError::NotFound(name) => write!(f, "kernel not found: {name}"),
             KernelError::CompilationFailed(e) => write!(f, "shader compilation failed: {e}"),
             KernelError::PipelineFailed(e) => write!(f, "pipeline creation failed: {e}"),
+            KernelError::InvalidShape(e) => write!(f, "invalid shape: {e}"),
         }
     }
 }

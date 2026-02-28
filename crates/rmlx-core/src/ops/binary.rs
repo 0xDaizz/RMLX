@@ -99,10 +99,13 @@ impl BinaryOp {
             (BinaryOp::Mul, DType::Float32) => "mul_f32",
             (BinaryOp::Sub, DType::Float32) => "sub_f32",
             (BinaryOp::Div, DType::Float32) => "div_f32",
-            (BinaryOp::Add, DType::Float16 | DType::Bfloat16) => "add_f16",
-            (BinaryOp::Mul, DType::Float16 | DType::Bfloat16) => "mul_f16",
-            (BinaryOp::Sub, DType::Float16 | DType::Bfloat16) => "sub_f16",
-            (BinaryOp::Div, DType::Float16 | DType::Bfloat16) => "div_f16",
+            (BinaryOp::Add, DType::Float16) => "add_f16",
+            (BinaryOp::Mul, DType::Float16) => "mul_f16",
+            (BinaryOp::Sub, DType::Float16) => "sub_f16",
+            (BinaryOp::Div, DType::Float16) => "div_f16",
+            (_, DType::Bfloat16) => {
+                unimplemented!("bf16 binary ops not yet supported")
+            }
             (_, DType::Q4_0 | DType::Q4_1 | DType::Q8_0) => {
                 unimplemented!("binary ops not supported for quantized types")
             }
@@ -123,8 +126,25 @@ pub fn binary_op(
     op: BinaryOp,
     queue: &metal::CommandQueue,
 ) -> Result<Array, KernelError> {
+    binary_op_with_mode(registry, a, b, op, queue, super::ExecMode::Sync)
+}
+
+/// Execute a binary operation element-wise with explicit execution mode.
+pub fn binary_op_with_mode(
+    registry: &KernelRegistry,
+    a: &Array,
+    b: &Array,
+    op: BinaryOp,
+    queue: &metal::CommandQueue,
+    mode: super::ExecMode,
+) -> Result<Array, KernelError> {
     assert_eq!(a.shape(), b.shape(), "binary op requires matching shapes");
     assert_eq!(a.dtype(), b.dtype(), "binary op requires matching dtypes");
+
+    let a_contig = super::make_contiguous(a, registry, queue)?;
+    let a = a_contig.as_ref().unwrap_or(a);
+    let b_contig = super::make_contiguous(b, registry, queue)?;
+    let b = b_contig.as_ref().unwrap_or(b);
 
     let kernel_name = op.kernel_name(a.dtype());
     let pipeline = registry.get_pipeline(kernel_name, a.dtype())?;
@@ -147,8 +167,7 @@ pub fn binary_op(
     );
     encoder.dispatch_threads(grid_size, threadgroup_size);
     encoder.end_encoding();
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
+    super::commit_with_mode(command_buffer, mode);
 
     Ok(out)
 }

@@ -22,6 +22,7 @@ impl Default for LoraConfig {
 
 impl LoraConfig {
     pub fn new(rank: usize, alpha: f64) -> Self {
+        assert!(rank > 0, "LoRA rank must be > 0");
         Self {
             rank,
             alpha,

@@ -38,10 +38,24 @@ pub fn copy(
     src: &Array,
     queue: &metal::CommandQueue,
 ) -> Result<Array, KernelError> {
+    copy_with_mode(registry, src, queue, super::ExecMode::Sync)
+}
+
+/// Copy array contents to a new array with explicit execution mode.
+pub fn copy_with_mode(
+    registry: &KernelRegistry,
+    src: &Array,
+    queue: &metal::CommandQueue,
+    mode: super::ExecMode,
+) -> Result<Array, KernelError> {
     let kernel_name = match src.dtype() {
         DType::Float32 => "copy_f32",
         DType::Float16 => "copy_f16",
-        DType::Bfloat16 => "copy_f16", // bf16 uses same copy logic as f16
+        DType::Bfloat16 => {
+            return Err(KernelError::NotFound(
+                "copy not supported for bf16 (different memory layout from f16)".to_string(),
+            ))
+        }
         DType::Q4_0 | DType::Q4_1 | DType::Q8_0 => {
             return Err(KernelError::NotFound(
                 "copy not supported for quantized types".to_string(),
@@ -69,8 +83,7 @@ pub fn copy(
     );
     encoder.dispatch_threads(grid_size, threadgroup_size);
     encoder.end_encoding();
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
+    super::commit_with_mode(command_buffer, mode);
 
     Ok(out)
 }

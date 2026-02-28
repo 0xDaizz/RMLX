@@ -2,6 +2,40 @@
 
 use std::fmt;
 
+/// Error type for distributed operations.
+#[derive(Debug)]
+pub enum DistributedError {
+    /// Arrays must be materialized (data resident in GPU buffer) before collective ops.
+    NotMaterialized(String),
+}
+
+impl fmt::Display for DistributedError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotMaterialized(msg) => write!(f, "not materialized: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for DistributedError {}
+
+/// Verify all arrays are materialized before a collective operation.
+///
+/// "Materialized" means the array's backing buffer has actual data (non-zero length,
+/// valid GPU buffer). This must be called before any allreduce, allgather, or
+/// broadcast to prevent sending uninitialized memory over RDMA.
+pub fn ensure_materialized(shapes: &[(usize, usize)]) -> Result<(), DistributedError> {
+    for (i, &(numel, byte_size)) in shapes.iter().enumerate() {
+        if numel == 0 || byte_size == 0 {
+            return Err(DistributedError::NotMaterialized(format!(
+                "array at index {i} has zero elements or zero bytes — \
+                 all arrays must be materialized before collective operations"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// A communication group identifying a set of ranks.
 #[derive(Debug, Clone)]
 pub struct Group {

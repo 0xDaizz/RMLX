@@ -178,6 +178,7 @@ pub struct IbvPortAttr {
 
 /// Work completion
 #[repr(C)]
+#[derive(Copy, Clone)]
 pub struct IbvWc {
     pub wr_id: u64,
     pub status: u32, // ibv_wc_status
@@ -196,7 +197,19 @@ pub struct IbvWc {
 
 /// Send work request — matches C ibv_send_wr layout (~80 bytes).
 ///
-/// SAFETY: The struct is repr(C) and sized to match the C ibv_send_wr.
+/// # ABI Contract
+/// This struct must match the C `ibv_send_wr` layout from libibverbs exactly:
+/// - `wr_id` at offset 0 (u64)
+/// - `next` pointer at offset 8
+/// - `sg_list` pointer at offset 16
+/// - `num_sge` (c_int) at offset 24
+/// - `opcode` (u32) at offset 28
+/// - `send_flags` (u32) at offset 32
+/// - `imm_data` (u32) at offset 36 (4 bytes padding follows on 64-bit)
+/// - `wr` union at offset 40 (32 bytes)
+/// - `qp_type` union at offset 72 (4 bytes)
+/// - Total size >= 80 bytes
+///
 /// The trailing `_qp_type_pad` covers the C union `qp_type { struct { uint32_t remote_srqn; } xrc; }`.
 /// The `_trailing_pad` provides safety margin for any platform-specific trailing fields.
 #[repr(C)]
@@ -440,3 +453,30 @@ impl IbverbsLib {
         }
     }
 }
+
+// ─── Compile-time ABI assertions ───
+// These ensure our repr(C) structs match the libibverbs C ABI.
+// If any assertion fails, the struct layout has diverged from the C definition.
+
+const _: () = {
+    // IbvSendWr: C ibv_send_wr is at least 80 bytes on 64-bit platforms.
+    assert!(std::mem::size_of::<IbvSendWr>() >= 80);
+    // IbvRecvWr: wr_id(8) + next(8) + sg_list(8) + num_sge(4) + padding(4) = 32, but
+    // the C struct may be 40 bytes depending on alignment. Must be at least 28 usable.
+    assert!(std::mem::size_of::<IbvRecvWr>() >= 28);
+    // IbvSge: addr(8) + length(4) + lkey(4) = exactly 16 bytes (no padding).
+    assert!(std::mem::size_of::<IbvSge>() == 16);
+    // IbvWc: must be at least 48 bytes to cover all C fields.
+    assert!(std::mem::size_of::<IbvWc>() >= 48);
+};
+
+// Verify critical field offsets match C ABI (wr_id must always be at offset 0).
+const _: () = {
+    assert!(std::mem::offset_of!(IbvSendWr, wr_id) == 0);
+    assert!(std::mem::offset_of!(IbvRecvWr, wr_id) == 0);
+    assert!(std::mem::offset_of!(IbvWc, wr_id) == 0);
+    // IbvSge layout: addr at 0, length at 8, lkey at 12
+    assert!(std::mem::offset_of!(IbvSge, addr) == 0);
+    assert!(std::mem::offset_of!(IbvSge, length) == 8);
+    assert!(std::mem::offset_of!(IbvSge, lkey) == 12);
+};

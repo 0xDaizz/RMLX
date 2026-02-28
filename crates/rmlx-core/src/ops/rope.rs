@@ -68,6 +68,13 @@ pub fn rope(
     );
     assert_eq!(input.shape()[1] % 2, 0, "head_dim must be even");
 
+    let input_contig = super::make_contiguous(input, registry, queue)?;
+    let input = input_contig.as_ref().unwrap_or(input);
+    let cos_contig = super::make_contiguous(cos_freqs, registry, queue)?;
+    let cos_freqs = cos_contig.as_ref().unwrap_or(cos_freqs);
+    let sin_contig = super::make_contiguous(sin_freqs, registry, queue)?;
+    let sin_freqs = sin_contig.as_ref().unwrap_or(sin_freqs);
+
     let kernel_name = match input.dtype() {
         DType::Float32 => "rope_f32",
         _ => {
