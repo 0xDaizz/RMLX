@@ -1,5 +1,9 @@
 //! rmlx-core — Compute engine for RMLX
 
+pub mod array;
+pub mod dtype;
+pub mod kernels;
+
 /// Path to the AOT-compiled Metal shader library.
 /// Set by build.rs at compile time.
 /// Empty string if Metal compiler was not available during build.
