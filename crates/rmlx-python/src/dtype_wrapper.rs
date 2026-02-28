@@ -31,6 +31,13 @@ impl PyDType {
     }
 
     #[staticmethod]
+    fn uint32() -> Self {
+        Self {
+            inner: DType::UInt32,
+        }
+    }
+
+    #[staticmethod]
     fn q4_0() -> Self {
         Self { inner: DType::Q4_0 }
     }

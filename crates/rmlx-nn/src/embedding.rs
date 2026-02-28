@@ -98,13 +98,13 @@ impl Embedding {
             byte_size,
             MTLResourceOptions::StorageModeShared,
         );
-        // Wrap in Array with Float32 dtype — the gather shader reads as uint* so the
-        // dtype is irrelevant; we just need the correct buffer, shape, and element count.
+        // Wrap in Array with UInt32 dtype — the gather shader reads as uint* and
+        // UInt32 correctly describes the index data type.
         let indices_arr = Array::new(
             idx_buffer,
             vec![seq_len * embed_dim],
             vec![1],
-            DType::Float32, // placeholder dtype — gather reads buffer(1) as uint*
+            DType::UInt32,
             0,
         );
 

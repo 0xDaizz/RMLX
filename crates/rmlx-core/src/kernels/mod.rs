@@ -20,6 +20,8 @@ pub enum KernelError {
     PipelineFailed(String),
     /// Invalid shape for the operation.
     InvalidShape(String),
+    /// Internal error (e.g., mutex poisoned).
+    Internal(String),
 }
 
 impl std::fmt::Display for KernelError {
@@ -29,6 +31,7 @@ impl std::fmt::Display for KernelError {
             KernelError::CompilationFailed(e) => write!(f, "shader compilation failed: {e}"),
             KernelError::PipelineFailed(e) => write!(f, "pipeline creation failed: {e}"),
             KernelError::InvalidShape(e) => write!(f, "invalid shape: {e}"),
+            KernelError::Internal(e) => write!(f, "internal error: {e}"),
         }
     }
 }
@@ -90,7 +93,10 @@ impl KernelRegistry {
 
         // 1. Check pipeline cache
         {
-            let cache = self.pipelines.lock().unwrap();
+            let cache = self
+                .pipelines
+                .lock()
+                .map_err(|_| KernelError::Internal("pipeline cache mutex poisoned".into()))?;
             if let Some(pipeline) = cache.get(&key) {
                 return Ok(pipeline.clone());
             }
@@ -106,7 +112,10 @@ impl KernelRegistry {
         let function = match function {
             Some(f) => f,
             None => {
-                let jit = self.jit_cache.lock().unwrap();
+                let jit = self
+                    .jit_cache
+                    .lock()
+                    .map_err(|_| KernelError::Internal("JIT cache mutex poisoned".into()))?;
                 let jit_fn = jit
                     .values()
                     .find_map(|lib| lib.get_function(kernel_name, None).ok());
@@ -130,7 +139,10 @@ impl KernelRegistry {
 
         // 5. Cache it
         {
-            let mut cache = self.pipelines.lock().unwrap();
+            let mut cache = self
+                .pipelines
+                .lock()
+                .map_err(|_| KernelError::Internal("pipeline cache mutex poisoned".into()))?;
             cache.insert(key, pipeline.clone());
         }
 
@@ -146,7 +158,10 @@ impl KernelRegistry {
             .new_library_with_source(source, &options)
             .map_err(|e| KernelError::CompilationFailed(format!("{name}: {e}")))?;
 
-        let mut cache = self.jit_cache.lock().unwrap();
+        let mut cache = self
+            .jit_cache
+            .lock()
+            .map_err(|_| KernelError::Internal("JIT cache mutex poisoned".into()))?;
         cache.insert(name.to_string(), lib);
         Ok(())
     }
@@ -162,12 +177,20 @@ impl KernelRegistry {
     }
 
     /// Number of cached pipeline states.
-    pub fn cached_pipeline_count(&self) -> usize {
-        self.pipelines.lock().unwrap().len()
+    pub fn cached_pipeline_count(&self) -> Result<usize, KernelError> {
+        let cache = self
+            .pipelines
+            .lock()
+            .map_err(|_| KernelError::Internal("pipeline cache mutex poisoned".into()))?;
+        Ok(cache.len())
     }
 
     /// Number of JIT-compiled libraries.
-    pub fn jit_library_count(&self) -> usize {
-        self.jit_cache.lock().unwrap().len()
+    pub fn jit_library_count(&self) -> Result<usize, KernelError> {
+        let cache = self
+            .jit_cache
+            .lock()
+            .map_err(|_| KernelError::Internal("JIT cache mutex poisoned".into()))?;
+        Ok(cache.len())
     }
 }

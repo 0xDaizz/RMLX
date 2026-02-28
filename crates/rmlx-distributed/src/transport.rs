@@ -115,12 +115,13 @@ impl RdmaTransport for RdmaConnectionTransport {
                 })?
         };
 
-        conn.post_send(&mr, 0, data.len() as u32, wr_id)
+        let op = conn
+            .post_send(&mr, 0, data.len() as u32, wr_id)
             .map_err(|e| {
                 self.metrics.record_send_error();
                 rdma_to_distributed(e)
             })?;
-        conn.wait_completions(&[wr_id]).map_err(|e| {
+        conn.wait_posted(&[op]).map_err(|e| {
             self.metrics.record_send_error();
             rdma_to_distributed(e)
         })?;
@@ -146,11 +147,11 @@ impl RdmaTransport for RdmaConnectionTransport {
                 })?
         };
 
-        conn.post_recv(&mr, 0, len as u32, wr_id).map_err(|e| {
+        let op = conn.post_recv(&mr, 0, len as u32, wr_id).map_err(|e| {
             self.metrics.record_recv_error();
             rdma_to_distributed(e)
         })?;
-        conn.wait_completions(&[wr_id]).map_err(|e| {
+        conn.wait_posted(&[op]).map_err(|e| {
             self.metrics.record_recv_error();
             rdma_to_distributed(e)
         })?;
@@ -166,10 +167,132 @@ impl RdmaTransport for RdmaConnectionTransport {
         recv_len: usize,
         src_rank: u32,
     ) -> Result<Vec<u8>, DistributedError> {
-        // Post the send first, then recv, then wait for both completions.
-        // This avoids deadlock in pairwise exchange patterns.
-        self.send(send_data, dst_rank)?;
-        self.recv(src_rank, recv_len)
+        // UC mode requires recv to be posted before the matching send arrives,
+        // otherwise data is silently dropped. Pattern: post_recv → post_send → wait(both).
+        //
+        // When dst_rank == src_rank, use the same connection lock for both ops
+        // to avoid deadlock (lock ordering).
+        if dst_rank == src_rank {
+            let conn = self.connections[dst_rank as usize]
+                .lock()
+                .map_err(|e| DistributedError::Transport(format!("lock poisoned: {e}")))?;
+
+            // Prepare recv buffer and MR
+            let mut recv_buf = vec![0u8; recv_len];
+            let recv_wr_id = self.next_wr_id(src_rank, WR_ID_RECV_BIT);
+            let recv_mr = unsafe {
+                conn.register_mr(recv_buf.as_mut_ptr() as *mut c_void, recv_len)
+                    .map_err(|e| {
+                        self.metrics.record_recv_error();
+                        rdma_to_distributed(e)
+                    })?
+            };
+
+            // Post recv FIRST (UC mode: must be ready before remote send)
+            let recv_op = conn
+                .post_recv(&recv_mr, 0, recv_len as u32, recv_wr_id)
+                .map_err(|e| {
+                    self.metrics.record_recv_error();
+                    rdma_to_distributed(e)
+                })?;
+
+            // Prepare send MR
+            let send_wr_id = self.next_wr_id(dst_rank, WR_ID_SEND_BIT);
+            let send_mr = unsafe {
+                conn.register_mr(send_data.as_ptr() as *mut c_void, send_data.len())
+                    .map_err(|e| {
+                        self.metrics.record_send_error();
+                        rdma_to_distributed(e)
+                    })?
+            };
+
+            // Post send
+            let send_op = conn
+                .post_send(&send_mr, 0, send_data.len() as u32, send_wr_id)
+                .map_err(|e| {
+                    self.metrics.record_send_error();
+                    rdma_to_distributed(e)
+                })?;
+
+            // Wait for both completions
+            conn.wait_posted(&[recv_op, send_op]).map_err(|e| {
+                self.metrics.record_send_error();
+                self.metrics.record_recv_error();
+                rdma_to_distributed(e)
+            })?;
+
+            self.metrics.record_send(send_data.len() as u64);
+            self.metrics.record_recv(recv_len as u64);
+            Ok(recv_buf)
+        } else {
+            // Different peers: lock in rank order to avoid deadlock
+            let (first_rank, second_rank) = if dst_rank < src_rank {
+                (dst_rank, src_rank)
+            } else {
+                (src_rank, dst_rank)
+            };
+            let first_conn = self.connections[first_rank as usize]
+                .lock()
+                .map_err(|e| DistributedError::Transport(format!("lock poisoned: {e}")))?;
+            let second_conn = self.connections[second_rank as usize]
+                .lock()
+                .map_err(|e| DistributedError::Transport(format!("lock poisoned: {e}")))?;
+
+            let (dst_conn, src_conn) = if dst_rank < src_rank {
+                (&*first_conn, &*second_conn)
+            } else {
+                (&*second_conn, &*first_conn)
+            };
+
+            // Post recv FIRST on src connection
+            let mut recv_buf = vec![0u8; recv_len];
+            let recv_wr_id = self.next_wr_id(src_rank, WR_ID_RECV_BIT);
+            let recv_mr = unsafe {
+                src_conn
+                    .register_mr(recv_buf.as_mut_ptr() as *mut c_void, recv_len)
+                    .map_err(|e| {
+                        self.metrics.record_recv_error();
+                        rdma_to_distributed(e)
+                    })?
+            };
+            let recv_op = src_conn
+                .post_recv(&recv_mr, 0, recv_len as u32, recv_wr_id)
+                .map_err(|e| {
+                    self.metrics.record_recv_error();
+                    rdma_to_distributed(e)
+                })?;
+
+            // Post send on dst connection
+            let send_wr_id = self.next_wr_id(dst_rank, WR_ID_SEND_BIT);
+            let send_mr = unsafe {
+                dst_conn
+                    .register_mr(send_data.as_ptr() as *mut c_void, send_data.len())
+                    .map_err(|e| {
+                        self.metrics.record_send_error();
+                        rdma_to_distributed(e)
+                    })?
+            };
+            let send_op = dst_conn
+                .post_send(&send_mr, 0, send_data.len() as u32, send_wr_id)
+                .map_err(|e| {
+                    self.metrics.record_send_error();
+                    rdma_to_distributed(e)
+                })?;
+
+            // Wait for both completions on their respective connections
+            src_conn.wait_posted(&[recv_op]).map_err(|e| {
+                self.metrics.record_recv_error();
+                rdma_to_distributed(e)
+            })?;
+            dst_conn.wait_posted(&[send_op]).map_err(|e| {
+                self.metrics.record_send_error();
+                rdma_to_distributed(e)
+            })?;
+
+            self.metrics.record_send(send_data.len() as u64);
+            self.metrics.record_recv(recv_len as u64);
+            Ok(recv_buf)
+        }
     }
 }
 

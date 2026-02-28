@@ -10,8 +10,9 @@ pub mod qp;
 pub mod rdma_metrics;
 
 // ── Re-exports of core types ──
-pub use connection::{CompletionTracker, RdmaConfig, RdmaConnection};
+pub use connection::{CompletionTracker, PostedOp, PostedOpKind, RdmaConfig, RdmaConnection};
 pub use context::{ProtectionDomain, RdmaContext, RdmaDeviceProbe};
+pub use exchange::ExchangeConfig;
 pub use mr::MemoryRegion;
 pub use multi_port::{
     DualPortConfig, PortConfig, PortFailover, PortState, StripeEngine, StripePlan, Topology,

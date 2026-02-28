@@ -250,10 +250,24 @@ impl Attention {
         }
 
         // Concatenate heads: [seq_len, num_heads * head_dim]
+        // Batched: all head*row copies dispatched in a single command buffer.
         let hidden_size = num_heads * head_dim;
         let concat = Array::zeros(dev, &[seq_len, hidden_size], q.dtype());
+
+        let copy_kernel = match q.dtype() {
+            rmlx_core::dtype::DType::Float32 => "copy_f32",
+            rmlx_core::dtype::DType::Float16 => "copy_f16",
+            rmlx_core::dtype::DType::Bfloat16 => "copy_bf16",
+            _ => {
+                return Err(KernelError::InvalidShape(format!(
+                    "attention concat: unsupported dtype {:?}",
+                    q.dtype()
+                )));
+            }
+        };
+        let pipeline = registry.get_pipeline(copy_kernel, q.dtype())?;
+        let cb = queue.new_command_buffer();
         for (h, head_out) in attn_outputs.iter().enumerate() {
-            // Copy head_out into the correct column slice of concat
             for row in 0..seq_len {
                 let src_offset = head_out.offset() + row * head_dim * elem_size;
                 let dst_offset = row * hidden_size * elem_size + h * head_dim * elem_size;
@@ -261,14 +275,6 @@ impl Attention {
                 let src_view = head_out.view(vec![head_dim], vec![1], src_offset);
                 let dst_view = concat.view(vec![head_dim], vec![1], dst_offset);
 
-                let copy_kernel = match q.dtype() {
-                    rmlx_core::dtype::DType::Float32 => "copy_f32",
-                    rmlx_core::dtype::DType::Float16 => "copy_f16",
-                    rmlx_core::dtype::DType::Bfloat16 => "copy_bf16",
-                    _ => unreachable!(),
-                };
-                let pipeline = registry.get_pipeline(copy_kernel, q.dtype())?;
-                let cb = queue.new_command_buffer();
                 let enc = cb.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(&pipeline);
                 enc.set_buffer(0, Some(src_view.metal_buffer()), src_view.offset() as u64);
@@ -284,10 +290,10 @@ impl Attention {
                 );
                 enc.dispatch_threads(grid, tg);
                 enc.end_encoding();
-                cb.commit();
-                cb.wait_until_completed();
             }
         }
+        cb.commit();
+        cb.wait_until_completed();
 
         // Output projection: [seq_len, hidden_size] -> [seq_len, hidden_size]
         self.o_proj.forward(&concat, registry, queue)

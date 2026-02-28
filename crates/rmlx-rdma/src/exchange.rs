@@ -18,12 +18,29 @@ pub const TCP_EXCHANGE_PORT: u16 = 18515;
 /// Default port for barrier sync
 pub const TCP_SYNC_PORT: u16 = 18516;
 
-/// Timeout in seconds for server accept() calls.
-const ACCEPT_TIMEOUT_SECS: u64 = 60;
-/// Number of retries for TCP reconnect operations.
-const IO_MAX_RETRIES: usize = 3;
-/// Delay between IO retries in milliseconds.
-const IO_RETRY_DELAY_MS: u64 = 1000;
+/// Configuration for TCP exchange timeout/retry behavior.
+#[derive(Debug, Clone)]
+pub struct ExchangeConfig {
+    /// Timeout in seconds for server accept() calls (default: 60).
+    pub accept_timeout_secs: u64,
+    /// Number of retries for TCP reconnect operations (default: 3).
+    pub io_max_retries: u32,
+    /// Delay between IO retries in milliseconds (default: 1000).
+    pub io_retry_delay_ms: u64,
+    /// TCP connect timeout in milliseconds (default: 5000).
+    pub connect_timeout_ms: u64,
+}
+
+impl Default for ExchangeConfig {
+    fn default() -> Self {
+        Self {
+            accept_timeout_secs: 60,
+            io_max_retries: 3,
+            io_retry_delay_ms: 1000,
+            connect_timeout_ms: 5000,
+        }
+    }
+}
 
 /// Serialized QPInfo wire size: lid(2) + qpn(4) + psn(4) + gid(16) = 26 bytes.
 /// Fixed size avoids padding/alignment issues across platforms.
@@ -54,26 +71,31 @@ fn deserialize_qp_info(buf: &[u8; QP_INFO_WIRE_SIZE]) -> QpInfo {
 /// Listens on `port`, accepts one connection with a timeout, exchanges QPInfo.
 /// Server protocol: recv remote QPInfo first, then send local QPInfo.
 /// On I/O error, drops the stream and re-accepts a new connection before retrying.
-pub fn exchange_server(local: &QpInfo, port: u16) -> Result<QpInfo, RdmaError> {
+pub fn exchange_server(
+    local: &QpInfo,
+    port: u16,
+    cfg: &ExchangeConfig,
+) -> Result<QpInfo, RdmaError> {
     let addr: SocketAddr = ([0, 0, 0, 0], port).into();
     let listener = TcpListener::bind(addr)
         .map_err(|e| RdmaError::ConnectionFailed(format!("bind port {port}: {e}")))?;
 
+    let max_retries = cfg.io_max_retries as usize;
     let mut last_err = None;
 
-    for attempt in 0..IO_MAX_RETRIES {
+    for attempt in 0..max_retries {
         // Accept with timeout
-        let mut stream = match accept_with_timeout(&listener, ACCEPT_TIMEOUT_SECS) {
+        let mut stream = match accept_with_timeout(&listener, cfg.accept_timeout_secs) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!(
                     "[rmlx-rdma] WARN: server accept attempt {}/{} failed: {e}",
                     attempt + 1,
-                    IO_MAX_RETRIES,
+                    max_retries,
                 );
                 last_err = Some(e);
-                if attempt + 1 < IO_MAX_RETRIES {
-                    std::thread::sleep(Duration::from_millis(IO_RETRY_DELAY_MS));
+                if attempt + 1 < max_retries {
+                    std::thread::sleep(Duration::from_millis(cfg.io_retry_delay_ms));
                 }
                 continue;
             }
@@ -96,14 +118,14 @@ pub fn exchange_server(local: &QpInfo, port: u16) -> Result<QpInfo, RdmaError> {
                     "[rmlx-rdma] WARN: server exchange with {peer} attempt {}/{} failed: {e}. \
                      Dropping stream and re-accepting.",
                     attempt + 1,
-                    IO_MAX_RETRIES,
+                    max_retries,
                 );
                 last_err = Some(RdmaError::ConnectionFailed(format!(
                     "exchange with {peer}: {e}"
                 )));
                 // stream is dropped here, freeing the corrupted connection
-                if attempt + 1 < IO_MAX_RETRIES {
-                    std::thread::sleep(Duration::from_millis(IO_RETRY_DELAY_MS));
+                if attempt + 1 < max_retries {
+                    std::thread::sleep(Duration::from_millis(cfg.io_retry_delay_ms));
                 }
             }
         }
@@ -131,23 +153,29 @@ fn server_exchange_on_stream(stream: &mut TcpStream, local: &QpInfo) -> Result<Q
 /// Connects to `host:port`, exchanges QPInfo.
 /// Client protocol: send local QPInfo first, then recv remote QPInfo.
 /// On I/O error, drops the stream and reconnects before retrying.
-pub fn exchange_client(local: &QpInfo, host: &str, port: u16) -> Result<QpInfo, RdmaError> {
+pub fn exchange_client(
+    local: &QpInfo,
+    host: &str,
+    port: u16,
+    cfg: &ExchangeConfig,
+) -> Result<QpInfo, RdmaError> {
     let addr = format!("{host}:{port}");
+    let max_retries = cfg.io_max_retries as usize;
     let mut last_err = None;
 
-    for attempt in 0..IO_MAX_RETRIES {
+    for attempt in 0..max_retries {
         // Connect (with sub-retries for the TCP handshake)
-        let mut stream = match connect_with_retries(&addr) {
+        let mut stream = match connect_with_retries(&addr, cfg.connect_timeout_ms) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!(
                     "[rmlx-rdma] WARN: client connect attempt {}/{} to {addr} failed: {e}",
                     attempt + 1,
-                    IO_MAX_RETRIES,
+                    max_retries,
                 );
                 last_err = Some(e);
-                if attempt + 1 < IO_MAX_RETRIES {
-                    std::thread::sleep(Duration::from_millis(IO_RETRY_DELAY_MS));
+                if attempt + 1 < max_retries {
+                    std::thread::sleep(Duration::from_millis(cfg.io_retry_delay_ms));
                 }
                 continue;
             }
@@ -165,14 +193,14 @@ pub fn exchange_client(local: &QpInfo, host: &str, port: u16) -> Result<QpInfo, 
                     "[rmlx-rdma] WARN: client exchange with {addr} attempt {}/{} failed: {e}. \
                      Dropping stream and reconnecting.",
                     attempt + 1,
-                    IO_MAX_RETRIES,
+                    max_retries,
                 );
                 last_err = Some(RdmaError::ConnectionFailed(format!(
                     "exchange with {addr}: {e}"
                 )));
                 // stream is dropped here, freeing the corrupted connection
-                if attempt + 1 < IO_MAX_RETRIES {
-                    std::thread::sleep(Duration::from_millis(IO_RETRY_DELAY_MS));
+                if attempt + 1 < max_retries {
+                    std::thread::sleep(Duration::from_millis(cfg.io_retry_delay_ms));
                 }
             }
         }
@@ -198,10 +226,16 @@ fn client_exchange_on_stream(stream: &mut TcpStream, local: &QpInfo) -> Result<Q
 }
 
 /// Connect to `addr` with up to 30 sub-retries (500ms apart).
-fn connect_with_retries(addr: &str) -> Result<TcpStream, RdmaError> {
+///
+/// Uses `TcpStream::connect_timeout` with the configured timeout per attempt.
+fn connect_with_retries(addr: &str, connect_timeout_ms: u64) -> Result<TcpStream, RdmaError> {
+    let sock_addr: SocketAddr = addr
+        .parse()
+        .map_err(|e| RdmaError::ConnectionFailed(format!("invalid address {addr}: {e}")))?;
+    let timeout = Duration::from_millis(connect_timeout_ms);
     let mut last_err = None;
     for sub_attempt in 0..30 {
-        match TcpStream::connect(addr) {
+        match TcpStream::connect_timeout(&sock_addr, timeout) {
             Ok(s) => return Ok(s),
             Err(e) => {
                 last_err = Some(e);
@@ -223,13 +257,13 @@ fn connect_with_retries(addr: &str) -> Result<TcpStream, RdmaError> {
 ///
 /// Both ranks wait for each other:
 /// Rank 0: listen + accept + recv 1 byte + send 1 byte.
-/// Accept times out after `ACCEPT_TIMEOUT_SECS`.
-pub fn tcp_barrier_server(port: u16) -> Result<(), RdmaError> {
+/// Accept times out after `accept_timeout_secs`.
+pub fn tcp_barrier_server(port: u16, accept_timeout_secs: u64) -> Result<(), RdmaError> {
     let addr: SocketAddr = ([0, 0, 0, 0], port).into();
     let listener = TcpListener::bind(addr)
         .map_err(|e| RdmaError::ConnectionFailed(format!("barrier bind port {port}: {e}")))?;
 
-    let mut stream = accept_with_timeout(&listener, ACCEPT_TIMEOUT_SECS)?;
+    let mut stream = accept_with_timeout(&listener, accept_timeout_secs)?;
 
     let mut buf = [0u8; 1];
     stream
@@ -388,7 +422,8 @@ mod tests {
         });
 
         // Client side: exchange_client should reconnect after first failure
-        let result = exchange_client(&client_info, "127.0.0.1", port);
+        let cfg = ExchangeConfig::default();
+        let result = exchange_client(&client_info, "127.0.0.1", port, &cfg);
         assert!(
             result.is_ok(),
             "exchange_client should succeed: {:?}",
@@ -408,13 +443,15 @@ mod tests {
 
     #[test]
     fn test_exchange_fails_after_all_retries_exhausted() {
+        let cfg = ExchangeConfig::default();
         // Server that always sends partial data and closes
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
 
+        let max_retries = cfg.io_max_retries;
         let server_thread = thread::spawn(move || {
-            // Accept IO_MAX_RETRIES connections, all sending partial data
-            for _ in 0..IO_MAX_RETRIES {
+            // Accept io_max_retries connections, all sending partial data
+            for _ in 0..max_retries {
                 if let Ok((mut stream, _)) = listener.accept() {
                     stream.write_all(&[0u8; 3]).ok();
                     drop(stream);
@@ -428,8 +465,53 @@ mod tests {
             psn: 3,
             gid: [0; 16],
         };
-        let result = exchange_client(&client_info, "127.0.0.1", port);
+        let result = exchange_client(&client_info, "127.0.0.1", port, &cfg);
         assert!(result.is_err(), "should fail after all retries exhausted");
+
+        server_thread.join().ok();
+    }
+
+    #[test]
+    fn test_exchange_config_default_values() {
+        let cfg = ExchangeConfig::default();
+        assert_eq!(cfg.accept_timeout_secs, 60);
+        assert_eq!(cfg.io_max_retries, 3);
+        assert_eq!(cfg.io_retry_delay_ms, 1000);
+        assert_eq!(cfg.connect_timeout_ms, 5000);
+    }
+
+    #[test]
+    fn test_exchange_with_custom_config() {
+        // Use custom config with 1 retry so the client fails fast
+        let cfg = ExchangeConfig {
+            accept_timeout_secs: 2,
+            io_max_retries: 1,
+            io_retry_delay_ms: 100,
+            connect_timeout_ms: 1000,
+        };
+
+        // Server that sends partial data and closes — with only 1 retry, should fail
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+
+        let server_thread = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                stream.write_all(&[0u8; 3]).ok();
+                drop(stream);
+            }
+        });
+
+        let client_info = QpInfo {
+            lid: 1,
+            qpn: 2,
+            psn: 3,
+            gid: [0; 16],
+        };
+        let result = exchange_client(&client_info, "127.0.0.1", port, &cfg);
+        assert!(
+            result.is_err(),
+            "should fail with custom config (1 retry only)"
+        );
 
         server_thread.join().ok();
     }

@@ -72,39 +72,34 @@ impl WarmupState {
     ///
     /// `rdma_warmup_fn`: called to run RDMA warmup (e.g., `|| conn.warmup()`)
     /// `jit_warmup_fn`: called to pre-compile JIT shaders (e.g., `|| registry.warmup()`)
-    pub fn run_warmup<R, J>(&mut self, config: &WarmupConfig, rdma_warmup_fn: R, jit_warmup_fn: J)
+    ///
+    /// Returns the `WarmupResult` on success. Returns an error if either
+    /// warmup phase fails, with partial timing in the error message.
+    pub fn run_warmup<R, J>(
+        &mut self,
+        config: &WarmupConfig,
+        rdma_warmup_fn: R,
+        jit_warmup_fn: J,
+    ) -> Result<WarmupResult, String>
     where
         R: FnOnce() -> Result<(), String>,
         J: FnOnce() -> Result<(), String>,
     {
         let total_start = Instant::now();
-        let mut rdma_dur = Duration::ZERO;
-        let mut jit_dur = Duration::ZERO;
 
         // RDMA warmup
         let rdma_start = Instant::now();
-        match rdma_warmup_fn() {
-            Ok(()) => {
-                self.rdma_warmed = true;
-                rdma_dur = rdma_start.elapsed();
-            }
-            Err(e) => {
-                eprintln!("[warmup] RDMA warmup failed: {e}");
-            }
-        }
+        rdma_warmup_fn().map_err(|e| format!("RDMA warmup failed: {e}"))?;
+        self.rdma_warmed = true;
+        let rdma_dur = rdma_start.elapsed();
 
         // JIT shader pre-compilation
+        let mut jit_dur = Duration::ZERO;
         if config.jit_precompile {
             let jit_start = Instant::now();
-            match jit_warmup_fn() {
-                Ok(()) => {
-                    self.jit_warmed = true;
-                    jit_dur = jit_start.elapsed();
-                }
-                Err(e) => {
-                    eprintln!("[warmup] JIT warmup failed: {e}");
-                }
-            }
+            jit_warmup_fn().map_err(|e| format!("JIT warmup failed: {e}"))?;
+            self.jit_warmed = true;
+            jit_dur = jit_start.elapsed();
         }
 
         let result = WarmupResult {
@@ -112,7 +107,8 @@ impl WarmupState {
             jit_warmup: jit_dur,
             total: total_start.elapsed(),
         };
-        self.last_result = Some(result);
+        self.last_result = Some(result.clone());
+        Ok(result)
     }
 }
 

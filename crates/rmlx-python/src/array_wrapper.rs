@@ -1,4 +1,6 @@
-use pyo3::exceptions::PyValueError;
+use std::sync::OnceLock;
+
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
 use rmlx_core::array::Array as GpuArray;
@@ -7,6 +9,40 @@ use rmlx_core::ops::binary::{binary_op_async, BinaryOp};
 use rmlx_core::CommandBufferHandle;
 use rmlx_metal::device::GpuDevice;
 use rmlx_metal::metal;
+
+/// Global GPU context shared across all Python operations.
+///
+/// Holds the Metal device, kernel registry (with compiled pipelines),
+/// and a command queue. Initialized once on first use via `OnceLock`.
+struct GpuContext {
+    registry: KernelRegistry,
+    queue: metal::CommandQueue,
+}
+
+static GPU_CONTEXT: OnceLock<Result<GpuContext, String>> = OnceLock::new();
+
+/// Get or initialize the global GPU context.
+///
+/// On first call, creates a Metal device, registers all built-in kernels,
+/// and creates a command queue. Subsequent calls return the cached context.
+/// If initialization failed, the error is cached and returned on every call.
+fn get_gpu_context() -> Result<&'static GpuContext, PyErr> {
+    let result = GPU_CONTEXT.get_or_init(|| {
+        let device = match GpuDevice::system_default() {
+            Ok(d) => d,
+            Err(e) => return Err(format!("Metal device init failed: {e}")),
+        };
+        let registry = KernelRegistry::new(device);
+        if let Err(e) = rmlx_core::ops::register_all(&registry) {
+            return Err(format!("kernel registration failed: {e}"));
+        }
+        let queue = registry.device().new_command_queue();
+        Ok(GpuContext { registry, queue })
+    });
+    result
+        .as_ref()
+        .map_err(|e| PyRuntimeError::new_err(e.clone()))
+}
 
 /// Python wrapper around rmlx_core::array::Array.
 /// Provides creation, shape inspection, and data extraction.
@@ -68,6 +104,8 @@ impl PyArray {
     /// Execute a GPU binary op between two PyArrays that both have gpu_array.
     /// Returns a new PyArray with gpu_array set and pending_handle tracking
     /// the async command buffer.
+    ///
+    /// Uses the global `GpuContext` to avoid per-call device/registry/queue creation.
     fn gpu_binary_op(&self, other: &PyArray, op: BinaryOp, op_name: &str) -> PyResult<Self> {
         let self_gpu = self
             .gpu_array
@@ -78,14 +116,9 @@ impl PyArray {
             .as_ref()
             .ok_or_else(|| PyValueError::new_err(format!("{op_name}: other has no GPU array")))?;
 
-        let device = GpuDevice::system_default()
-            .map_err(|e| PyValueError::new_err(format!("Metal device error: {e}")))?;
-        let registry = KernelRegistry::new(device);
-        rmlx_core::ops::register_all(&registry)
-            .map_err(|e| PyValueError::new_err(format!("kernel registration failed: {e}")))?;
-        let queue = registry.device().new_command_queue();
+        let ctx = get_gpu_context()?;
 
-        let launch = binary_op_async(&registry, self_gpu, other_gpu, op, &queue)
+        let launch = binary_op_async(&ctx.registry, self_gpu, other_gpu, op, &ctx.queue)
             .map_err(|e| PyValueError::new_err(format!("GPU {op_name} failed: {e}")))?;
 
         let out_array = launch.into_array();
@@ -375,11 +408,10 @@ impl PyArray {
     /// Upload CPU data to a GPU-backed Metal buffer.
     ///
     /// Returns a new PyArray with both CPU data and GPU buffer populated.
-    /// The Metal device is obtained from the system default.
+    /// Uses the global GPU context for the Metal device.
     fn to_gpu(&self) -> PyResult<Self> {
-        let device = metal::Device::system_default()
-            .ok_or_else(|| PyValueError::new_err("no Metal GPU device available"))?;
-        let gpu = GpuArray::from_slice(&device, &self.data, self.shape.clone());
+        let ctx = get_gpu_context()?;
+        let gpu = GpuArray::from_slice(ctx.registry.device().raw(), &self.data, self.shape.clone());
         Ok(Self {
             shape: self.shape.clone(),
             data: self.data.clone(),
@@ -653,5 +685,99 @@ mod tests {
         // SAFETY: wait_pending completed, GPU writes are done
         let cpu_data = unsafe { gpu.to_vec::<f32>() };
         assert_eq!(cpu_data, vec![20.0, 30.0, 40.0, 50.0]);
+    }
+
+    /// Verify the global GPU_CONTEXT OnceLock is initialized once and
+    /// subsequent accesses return the same `Ok(GpuContext)`.
+    #[test]
+    fn test_gpu_context_singleton() {
+        // Access the raw OnceLock to avoid PyErr construction (no Python runtime in tests).
+        let result1 = GPU_CONTEXT.get_or_init(|| {
+            let device = match GpuDevice::system_default() {
+                Ok(d) => d,
+                Err(e) => return Err(format!("Metal device init failed: {e}")),
+            };
+            let registry = KernelRegistry::new(device);
+            if let Err(e) = rmlx_core::ops::register_all(&registry) {
+                return Err(format!("kernel registration failed: {e}"));
+            }
+            let queue = registry.device().new_command_queue();
+            Ok(GpuContext { registry, queue })
+        });
+        let ctx1 = match result1 {
+            Ok(c) => c,
+            Err(_) => return, // skip on machines without Metal
+        };
+
+        // Second call must return the same pointer
+        let result2 = GPU_CONTEXT.get().unwrap();
+        let ctx2 = result2.as_ref().unwrap();
+        assert!(std::ptr::eq(ctx1, ctx2));
+    }
+
+    /// Verify the global context provides a working device/registry/queue
+    /// that can execute binary ops — the same path `gpu_binary_op` uses.
+    #[test]
+    fn test_global_context_binary_op() {
+        let result = GPU_CONTEXT.get_or_init(|| {
+            let device = match GpuDevice::system_default() {
+                Ok(d) => d,
+                Err(e) => return Err(format!("{e}")),
+            };
+            let registry = KernelRegistry::new(device);
+            if let Err(e) = rmlx_core::ops::register_all(&registry) {
+                return Err(format!("{e}"));
+            }
+            let queue = registry.device().new_command_queue();
+            Ok(GpuContext { registry, queue })
+        });
+        let ctx = match result {
+            Ok(c) => c,
+            Err(_) => return, // skip on machines without Metal
+        };
+
+        let a_data = vec![1.0f32, 2.0, 3.0, 4.0];
+        let b_data = vec![10.0f32, 20.0, 30.0, 40.0];
+        let a_gpu = GpuArray::from_slice(ctx.registry.device().raw(), &a_data, vec![4]);
+        let b_gpu = GpuArray::from_slice(ctx.registry.device().raw(), &b_data, vec![4]);
+
+        let launch =
+            binary_op_async(&ctx.registry, &a_gpu, &b_gpu, BinaryOp::Add, &ctx.queue).unwrap();
+        let out_array = launch.into_array();
+
+        let shape = out_array.shape().to_vec();
+        // SAFETY: into_array() blocks until GPU completes.
+        let cpu_data = unsafe { out_array.to_vec::<f32>() };
+        assert_eq!(shape, vec![4]);
+        assert_eq!(cpu_data, vec![11.0, 22.0, 33.0, 44.0]);
+    }
+
+    /// Verify that GpuArray::from_slice works with the global context device,
+    /// matching the path used by `to_gpu()`.
+    #[test]
+    fn test_to_gpu_uses_global_device() {
+        let result = GPU_CONTEXT.get_or_init(|| {
+            let device = match GpuDevice::system_default() {
+                Ok(d) => d,
+                Err(e) => return Err(format!("{e}")),
+            };
+            let registry = KernelRegistry::new(device);
+            if let Err(e) = rmlx_core::ops::register_all(&registry) {
+                return Err(format!("{e}"));
+            }
+            let queue = registry.device().new_command_queue();
+            Ok(GpuContext { registry, queue })
+        });
+        let ctx = match result {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+
+        let data = vec![1.0f32, 2.0, 3.0];
+        let gpu = GpuArray::from_slice(ctx.registry.device().raw(), &data, vec![3]);
+        assert_eq!(gpu.shape(), &[3]);
+        // SAFETY: no async operations pending.
+        let roundtrip = unsafe { gpu.to_vec::<f32>() };
+        assert_eq!(roundtrip, vec![1.0, 2.0, 3.0]);
     }
 }

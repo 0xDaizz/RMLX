@@ -146,6 +146,9 @@ impl BinaryOp {
             (_, DType::Q4_0 | DType::Q4_1 | DType::Q8_0) => Err(KernelError::InvalidShape(
                 "binary ops not supported for quantized types; dequantize first".into(),
             )),
+            (_, DType::UInt32) => Err(KernelError::InvalidShape(
+                "binary ops not supported for UInt32; cast to float first".into(),
+            )),
         }
     }
 }

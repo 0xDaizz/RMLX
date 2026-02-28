@@ -128,36 +128,35 @@ impl Linear {
         // matmul: [batch, in] @ [in, out] -> [batch, out]
         let mut output = ops::matmul::matmul(registry, &input_2d, &w_t, queue)?;
 
-        // Add bias to each row
+        // Add bias: broadcast bias [out_f] across each row of [batch, out_f].
+        // Fused: expand bias to [batch, out_f] then single add, avoiding per-row dispatch.
         if let Some(ref bias) = self.bias {
             let batch = output.shape()[0];
             let out_f = self.config.out_features;
             let elem_size = output.dtype().size_of();
-            let mut rows: Vec<Array> = Vec::with_capacity(batch);
+
+            // Build a [batch, out_f] bias tile by repeating the 1D bias for each row
+            // in a single command buffer dispatch.
+            let bias_tiled = Array::zeros(registry.device().raw(), &[batch, out_f], output.dtype());
+            let copy_kernel = match output.dtype() {
+                rmlx_core::dtype::DType::Float32 => "copy_f32",
+                rmlx_core::dtype::DType::Float16 => "copy_f16",
+                rmlx_core::dtype::DType::Bfloat16 => "copy_bf16",
+                _ => {
+                    return Err(KernelError::InvalidShape(format!(
+                        "linear bias: unsupported dtype {:?}",
+                        output.dtype()
+                    )));
+                }
+            };
+            let pipeline = registry.get_pipeline(copy_kernel, output.dtype())?;
+            let cb = queue.new_command_buffer();
             for row in 0..batch {
-                let row_offset = output.offset() + row * out_f * elem_size;
-                let row_view = output.view(vec![out_f], vec![1], row_offset);
-                let added = ops::binary::add(registry, &row_view, bias, queue)?;
-                rows.push(added);
-            }
-            // Build final output by copying rows into a single contiguous buffer
-            let final_out = Array::zeros(registry.device().raw(), &[batch, out_f], output.dtype());
-            for (row, src) in rows.iter().enumerate() {
                 let dst_offset = row * out_f * elem_size;
-                let dst_view = final_out.view(vec![out_f], vec![1], dst_offset);
-                // Use copy kernel to write src into dst_view's region
-                // Since both are contiguous 1D with same shape, we dispatch a flat copy
-                let cb = queue.new_command_buffer();
+                let dst_view = bias_tiled.view(vec![out_f], vec![1], dst_offset);
                 let enc = cb.new_compute_command_encoder();
-                let copy_kernel = match output.dtype() {
-                    rmlx_core::dtype::DType::Float32 => "copy_f32",
-                    rmlx_core::dtype::DType::Float16 => "copy_f16",
-                    rmlx_core::dtype::DType::Bfloat16 => "copy_bf16",
-                    _ => unreachable!("linear output cannot be quantized"),
-                };
-                let pipeline = registry.get_pipeline(copy_kernel, output.dtype())?;
                 enc.set_compute_pipeline_state(&pipeline);
-                enc.set_buffer(0, Some(src.metal_buffer()), src.offset() as u64);
+                enc.set_buffer(0, Some(bias.metal_buffer()), bias.offset() as u64);
                 enc.set_buffer(1, Some(dst_view.metal_buffer()), dst_view.offset() as u64);
                 let grid = metal::MTLSize::new(out_f as u64, 1, 1);
                 let tg = metal::MTLSize::new(
@@ -167,10 +166,12 @@ impl Linear {
                 );
                 enc.dispatch_threads(grid, tg);
                 enc.end_encoding();
-                cb.commit();
-                cb.wait_until_completed();
             }
-            output = final_out;
+            cb.commit();
+            cb.wait_until_completed();
+
+            // Single fused add: [batch, out_f] + [batch, out_f]
+            output = ops::binary::add(registry, &output, &bias_tiled, queue)?;
         }
 
         Ok(output)

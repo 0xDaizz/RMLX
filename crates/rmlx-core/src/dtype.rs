@@ -8,6 +8,8 @@ pub enum DType {
     Float32,
     Float16,
     Bfloat16,
+    /// Unsigned 32-bit integer (for index arrays, token IDs, etc.)
+    UInt32,
     /// 4-bit quantization, group size 32, with f16 scale
     Q4_0,
     /// 4-bit quantization, group size 32, with f16 scale and f16 min
@@ -26,6 +28,7 @@ impl DType {
             DType::Float32 => 4,
             DType::Float16 => 2,
             DType::Bfloat16 => 2,
+            DType::UInt32 => 4,
             DType::Q4_0 => 1, // ~0.5625 bytes/element (18 bytes per 32 elements)
             DType::Q4_1 => 1, // ~0.625 bytes/element (20 bytes per 32 elements)
             DType::Q8_0 => 1, // ~1.0625 bytes/element (34 bytes per 32 elements)
@@ -89,6 +92,7 @@ impl DType {
             DType::Float32 => "float32",
             DType::Float16 => "float16",
             DType::Bfloat16 => "bfloat16",
+            DType::UInt32 => "uint32",
             DType::Q4_0 => "q4_0",
             DType::Q4_1 => "q4_1",
             DType::Q8_0 => "q8_0",
@@ -199,5 +203,26 @@ mod tests {
     #[should_panic(expected = "must be a multiple of block_size")]
     fn test_numel_to_bytes_non_aligned_panics() {
         DType::Q4_0.numel_to_bytes(33);
+    }
+
+    #[test]
+    fn test_uint32_properties() {
+        assert_eq!(DType::UInt32.size_of(), 4);
+        assert_eq!(DType::UInt32.name(), "uint32");
+        assert_eq!(format!("{}", DType::UInt32), "uint32");
+        assert!(!DType::UInt32.is_quantized());
+        assert_eq!(DType::UInt32.packed_block_size(), None);
+        assert_eq!(DType::UInt32.block_size(), None);
+        assert_eq!(DType::UInt32.numel_to_bytes(100), 400);
+    }
+
+    #[test]
+    fn test_uint32_distinct_from_float32() {
+        assert_ne!(DType::UInt32, DType::Float32);
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(DType::UInt32);
+        set.insert(DType::Float32);
+        assert_eq!(set.len(), 2);
     }
 }

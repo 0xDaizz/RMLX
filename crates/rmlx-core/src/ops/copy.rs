@@ -159,6 +159,8 @@ pub fn copy_with_mode(
                 "copy not supported for quantized types".to_string(),
             ))
         }
+        (DType::UInt32, false) => "copy_f32", // same layout as f32 (4 bytes)
+        (DType::UInt32, true) => "copy_strided_f32",
     };
 
     let pipeline = registry.get_pipeline(kernel_name, src.dtype())?;
@@ -249,6 +251,8 @@ pub fn copy_async(
                 "copy not supported for quantized types".to_string(),
             ))
         }
+        (DType::UInt32, false) => "copy_f32", // same layout as f32 (4 bytes)
+        (DType::UInt32, true) => "copy_strided_f32",
     };
 
     let pipeline = registry.get_pipeline(kernel_name, src.dtype())?;
