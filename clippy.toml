@@ -1,0 +1,2 @@
+# Clippy configuration for RMLX
+msrv = "1.80"

@@ -3,3 +3,5 @@ _tmp_*
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+/target
+*.metallib
