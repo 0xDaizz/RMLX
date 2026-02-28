@@ -1,9 +1,11 @@
 //! Concrete RDMA transport implementation backed by `rmlx_rdma::RdmaConnection`.
 
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use rmlx_rdma::connection::RdmaConnection;
+use rmlx_rdma::multi_port::StripeEngine;
+use rmlx_rdma::rdma_metrics::RdmaMetrics;
 use rmlx_rdma::RdmaError;
 
 use crate::group::{DistributedError, RdmaTransport};
@@ -20,6 +22,8 @@ use crate::group::{DistributedError, RdmaTransport};
 pub struct RdmaConnectionTransport {
     connections: Vec<Mutex<RdmaConnection>>,
     local_rank: u32,
+    metrics: Arc<RdmaMetrics>,
+    stripe_engine: Option<StripeEngine>,
 }
 
 impl RdmaConnectionTransport {
@@ -32,7 +36,25 @@ impl RdmaConnectionTransport {
         Self {
             connections: connections.into_iter().map(Mutex::new).collect(),
             local_rank,
+            metrics: Arc::new(RdmaMetrics::new()),
+            stripe_engine: None,
         }
+    }
+
+    /// Attach a StripeEngine for dual-port TB5 striping.
+    ///
+    /// When set, large sends will be split across dual ports for increased
+    /// bandwidth using the stripe plan.
+    pub fn with_stripe_engine(mut self, engine: StripeEngine) -> Self {
+        self.stripe_engine = Some(engine);
+        self
+    }
+
+    /// Whether dual-port striping is configured.
+    pub fn has_striping(&self) -> bool {
+        self.stripe_engine
+            .as_ref()
+            .map_or(false, |e| e.config().has_dual())
     }
 
     /// This node's rank.
@@ -43,6 +65,11 @@ impl RdmaConnectionTransport {
     /// Number of connections (== world size).
     pub fn world_size(&self) -> usize {
         self.connections.len()
+    }
+
+    /// Get metrics reference.
+    pub fn metrics(&self) -> &RdmaMetrics {
+        &self.metrics
     }
 }
 
@@ -61,14 +88,23 @@ impl RdmaTransport for RdmaConnectionTransport {
         // SAFETY: data slice is valid for its length and lives until we complete the send.
         let mr = unsafe {
             conn.register_mr(data.as_ptr() as *mut c_void, data.len())
-                .map_err(rdma_to_distributed)?
+                .map_err(|e| {
+                    self.metrics.record_send_error();
+                    rdma_to_distributed(e)
+                })?
         };
 
         conn.post_send(&mr, 0, data.len() as u32, wr_id)
-            .map_err(rdma_to_distributed)?;
-        conn.wait_completions(&[wr_id])
-            .map_err(rdma_to_distributed)?;
+            .map_err(|e| {
+                self.metrics.record_send_error();
+                rdma_to_distributed(e)
+            })?;
+        conn.wait_completions(&[wr_id]).map_err(|e| {
+            self.metrics.record_send_error();
+            rdma_to_distributed(e)
+        })?;
 
+        self.metrics.record_send(data.len() as u64);
         Ok(())
     }
 
@@ -83,14 +119,22 @@ impl RdmaTransport for RdmaConnectionTransport {
         // SAFETY: buf is valid for len bytes and lives until we complete the recv.
         let mr = unsafe {
             conn.register_mr(buf.as_mut_ptr() as *mut c_void, len)
-                .map_err(rdma_to_distributed)?
+                .map_err(|e| {
+                    self.metrics.record_recv_error();
+                    rdma_to_distributed(e)
+                })?
         };
 
-        conn.post_recv(&mr, 0, len as u32, wr_id)
-            .map_err(rdma_to_distributed)?;
-        conn.wait_completions(&[wr_id])
-            .map_err(rdma_to_distributed)?;
+        conn.post_recv(&mr, 0, len as u32, wr_id).map_err(|e| {
+            self.metrics.record_recv_error();
+            rdma_to_distributed(e)
+        })?;
+        conn.wait_completions(&[wr_id]).map_err(|e| {
+            self.metrics.record_recv_error();
+            rdma_to_distributed(e)
+        })?;
 
+        self.metrics.record_recv(len as u64);
         Ok(buf)
     }
 }

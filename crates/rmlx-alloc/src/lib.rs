@@ -7,6 +7,17 @@ pub mod leak_detector;
 pub mod stats;
 pub mod zero_copy;
 
+// ── Re-exports of core types ──
+pub use allocator::MetalAllocator;
+pub use buffer_pool::BufferPool;
+pub use cache::BufferCache;
+pub use leak_detector::{LeakDetector, LeakReport};
+pub use stats::AllocStats;
+pub use zero_copy::{
+    CompletionError, CompletionFence, CompletionTicket, GpuCompletionHandler, InFlightToken,
+    ZeroCopyBuffer,
+};
+
 use std::fmt;
 
 /// Errors from allocation operations

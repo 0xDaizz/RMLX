@@ -1,6 +1,6 @@
 //! Warmup protocol for RDMA connections and Metal JIT compilation.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Warmup result tracking.
 #[derive(Debug, Clone)]
@@ -66,6 +66,53 @@ impl WarmupState {
     /// Last warmup result.
     pub fn last_result(&self) -> Option<&WarmupResult> {
         self.last_result.as_ref()
+    }
+
+    /// Run full warmup: RDMA ping-pong + JIT shader pre-compilation.
+    ///
+    /// `rdma_warmup_fn`: called to run RDMA warmup (e.g., `|| conn.warmup()`)
+    /// `jit_warmup_fn`: called to pre-compile JIT shaders (e.g., `|| registry.warmup()`)
+    pub fn run_warmup<R, J>(&mut self, config: &WarmupConfig, rdma_warmup_fn: R, jit_warmup_fn: J)
+    where
+        R: FnOnce() -> Result<(), String>,
+        J: FnOnce() -> Result<(), String>,
+    {
+        let total_start = Instant::now();
+        let mut rdma_dur = Duration::ZERO;
+        let mut jit_dur = Duration::ZERO;
+
+        // RDMA warmup
+        let rdma_start = Instant::now();
+        match rdma_warmup_fn() {
+            Ok(()) => {
+                self.rdma_warmed = true;
+                rdma_dur = rdma_start.elapsed();
+            }
+            Err(e) => {
+                eprintln!("[warmup] RDMA warmup failed: {e}");
+            }
+        }
+
+        // JIT shader pre-compilation
+        if config.jit_precompile {
+            let jit_start = Instant::now();
+            match jit_warmup_fn() {
+                Ok(()) => {
+                    self.jit_warmed = true;
+                    jit_dur = jit_start.elapsed();
+                }
+                Err(e) => {
+                    eprintln!("[warmup] JIT warmup failed: {e}");
+                }
+            }
+        }
+
+        let result = WarmupResult {
+            rdma_warmup: rdma_dur,
+            jit_warmup: jit_dur,
+            total: total_start.elapsed(),
+        };
+        self.last_result = Some(result);
     }
 }
 

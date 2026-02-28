@@ -194,6 +194,152 @@ impl GradFn for MatMulGrad {
     }
 }
 
+/// Gradient for row-wise softmax.
+/// output = softmax(input), shape (rows, cols).
+/// grad_input = output * (grad_output - sum(grad_output * output, axis=-1, keepdim))
+pub struct SoftmaxGrad {
+    /// Softmax output values (rows * cols).
+    pub output: Vec<f32>,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+impl GradFn for SoftmaxGrad {
+    fn backward(&self, grad_output: &[f32]) -> Vec<Vec<f32>> {
+        let (rows, cols) = (self.rows, self.cols);
+        let mut grad_input = vec![0.0f32; rows * cols];
+        for r in 0..rows {
+            let base = r * cols;
+            // dot = sum(grad_output[row] * output[row])
+            let mut dot = 0.0f32;
+            for c in 0..cols {
+                dot += grad_output[base + c] * self.output[base + c];
+            }
+            // grad_input[i] = output[i] * (grad_output[i] - dot)
+            for c in 0..cols {
+                grad_input[base + c] = self.output[base + c] * (grad_output[base + c] - dot);
+            }
+        }
+        vec![grad_input]
+    }
+}
+
+/// Gradient for RMS normalization.
+/// y = x * rsqrt(mean(x^2) + eps) * weight
+/// Computed via chain rule matching MLX's vjp_rms kernel.
+pub struct RmsNormGrad {
+    /// Input values (rows * axis_size).
+    pub input: Vec<f32>,
+    /// Weight values (axis_size).
+    pub weight: Vec<f32>,
+    pub rows: usize,
+    pub axis_size: usize,
+    pub eps: f32,
+}
+
+impl GradFn for RmsNormGrad {
+    fn backward(&self, grad_output: &[f32]) -> Vec<Vec<f32>> {
+        let (rows, d) = (self.rows, self.axis_size);
+        let mut grad_input = vec![0.0f32; rows * d];
+
+        for r in 0..rows {
+            let base = r * d;
+            // sum of x^2
+            let mut sum_x2 = 0.0f32;
+            for i in 0..d {
+                let x = self.input[base + i];
+                sum_x2 += x * x;
+            }
+            let normalizer = 1.0 / (sum_x2 / d as f32 + self.eps).sqrt();
+            let normalizer3 = normalizer * normalizer * normalizer;
+
+            // sum(g * w * x) for this row
+            let mut sum_gwx = 0.0f32;
+            for i in 0..d {
+                sum_gwx += grad_output[base + i] * self.weight[i] * self.input[base + i];
+            }
+            let mean_gwx = sum_gwx / d as f32;
+
+            // grad_x[i] = g[i] * w[i] * normalizer - x[i] * mean_gwx * normalizer^3
+            for i in 0..d {
+                grad_input[base + i] = grad_output[base + i] * self.weight[i] * normalizer
+                    - self.input[base + i] * mean_gwx * normalizer3;
+            }
+        }
+        // Two inputs: input and weight. Return grads for both to
+        // satisfy tape invariant (one gradient per recorded input).
+        // Weight gradient: d(loss)/d(w[i]) = sum_rows(g[r,i] * x[r,i] * normalizer[r])
+        let mut grad_weight = vec![0.0f32; d];
+        for r in 0..rows {
+            let base = r * d;
+            let mut sum_x2 = 0.0f32;
+            for i in 0..d {
+                let x = self.input[base + i];
+                sum_x2 += x * x;
+            }
+            let normalizer = 1.0 / (sum_x2 / d as f32 + self.eps).sqrt();
+            for i in 0..d {
+                grad_weight[i] += grad_output[base + i] * self.input[base + i] * normalizer;
+            }
+        }
+        vec![grad_input, grad_weight]
+    }
+}
+
+/// Gradient for reduce-sum: broadcast grad to input shape.
+pub struct ReduceSumGrad {
+    /// Number of elements in the original input.
+    pub input_len: usize,
+}
+
+impl GradFn for ReduceSumGrad {
+    fn backward(&self, grad_output: &[f32]) -> Vec<Vec<f32>> {
+        // grad_output is scalar [1], broadcast to full input shape
+        let g = grad_output[0];
+        vec![vec![g; self.input_len]]
+    }
+}
+
+/// Gradient for reduce-max: grad at argmax position, zero elsewhere.
+pub struct ReduceMaxGrad {
+    /// Original input values.
+    pub input: Vec<f32>,
+}
+
+impl GradFn for ReduceMaxGrad {
+    fn backward(&self, grad_output: &[f32]) -> Vec<Vec<f32>> {
+        let g = grad_output[0];
+        // Find argmax
+        let mut max_val = f32::NEG_INFINITY;
+        let mut max_idx = 0;
+        for (i, &v) in self.input.iter().enumerate() {
+            if v > max_val {
+                max_val = v;
+                max_idx = i;
+            }
+        }
+        let mut grad = vec![0.0f32; self.input.len()];
+        grad[max_idx] = g;
+        vec![grad]
+    }
+}
+
+/// Placeholder gradient for operations without backward implementation.
+/// Returns a proper error via panic with a descriptive message.
+pub struct PlaceholderGrad {
+    pub op_name: String,
+    pub input_lens: Vec<usize>,
+}
+
+impl GradFn for PlaceholderGrad {
+    fn backward(&self, _grad_output: &[f32]) -> Vec<Vec<f32>> {
+        panic!(
+            "backward not implemented for {} — this operation does not support autodiff yet",
+            self.op_name
+        );
+    }
+}
+
 /// Numerical gradient approximation for testing VJP correctness.
 /// `f` maps an input vector to an output vector.
 /// Returns the Jacobian approximation at `x` using central differences.

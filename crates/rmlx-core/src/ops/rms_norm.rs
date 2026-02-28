@@ -7,8 +7,11 @@ use metal::MTLSize;
 
 pub const RMS_NORM_SHADER_SOURCE: &str = r#"
 #include <metal_stdlib>
+#include <metal_simdgroup>
 using namespace metal;
 
+// RMS norm using simdgroup reductions — supports arbitrary axis_size.
+// Only needs 32 floats of shared memory (one per simdgroup).
 kernel void rms_norm_f32(
     device const float* input [[buffer(0)]],
     device const float* weight [[buffer(1)]],
@@ -17,29 +20,47 @@ kernel void rms_norm_f32(
     constant float& eps [[buffer(4)]],
     uint row [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]],
-    uint tgsize [[threads_per_threadgroup]])
+    uint tgsize [[threads_per_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]])
 {
-    threadgroup float shared_sum[1024];
+    constexpr int SIMD_SIZE = 32;
+    threadgroup float local_sums[SIMD_SIZE];
+    threadgroup float local_inv_rms[1];
 
-    // Compute sum of squares for this row
-    float sum_sq = 0.0;
+    // Accumulate sum of squares across strided elements
+    float acc = 0.0;
     uint base = row * axis_size;
     for (uint i = tid; i < axis_size; i += tgsize) {
         float val = input[base + i];
-        sum_sq += val * val;
+        acc += val * val;
     }
-    shared_sum[tid] = sum_sq;
 
+    // Simdgroup reduction
+    acc = simd_sum(acc);
+
+    // Initialize shared memory
+    if (simd_group_id == 0) {
+        local_sums[simd_lane_id] = 0;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint stride = tgsize / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            shared_sum[tid] += shared_sum[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Write per-simdgroup partial sums
+    if (simd_lane_id == 0) {
+        local_sums[simd_group_id] = acc;
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float rms = rsqrt(shared_sum[0] / float(axis_size) + eps);
+    // Final reduction across simdgroups
+    if (simd_group_id == 0) {
+        acc = simd_sum(local_sums[simd_lane_id]);
+        if (simd_lane_id == 0) {
+            local_inv_rms[0] = metal::precise::rsqrt(acc / float(axis_size) + eps);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float rms = local_inv_rms[0];
 
     // Apply normalization and weight
     for (uint i = tid; i < axis_size; i += tgsize) {
@@ -69,14 +90,6 @@ pub fn rms_norm(
     let input = input_contig.as_ref().unwrap_or(input);
     let weight_contig = super::make_contiguous(weight, registry, queue)?;
     let weight = weight_contig.as_ref().unwrap_or(weight);
-
-    let axis_size = input.shape()[1];
-    if axis_size > 1024 {
-        return Err(KernelError::InvalidShape(format!(
-            "rms_norm axis_size {} exceeds max threadgroup size 1024",
-            axis_size
-        )));
-    }
 
     let kernel_name = match input.dtype() {
         DType::Float32 => "rms_norm_f32",

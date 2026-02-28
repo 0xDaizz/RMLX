@@ -59,10 +59,26 @@ pub fn matmul(
     let k = a.shape()[1];
     let n = b.shape()[1];
 
-    // Auto dispatch: use GEMV for vector-matrix cases
-    if m == 1 {
-        // A is a row vector — reshape and use GEMV with transposed B
-        // For now, fall through to GEMM
+    // Auto dispatch: use GEMV for M=1 (single-token decode pattern)
+    // GEMV computes mat[M,K] @ vec[K] -> [M].
+    // For [1,K] @ [K,N]: when N=1, b can be squeezed to 1D [K] and we use
+    // GEMV directly with mat=a[1,K], vec=b[K] -> [1], reshaped to [1,1].
+    if m == 1 && n == 1 {
+        let b_vec = Array::new(
+            b.metal_buffer().to_owned(),
+            vec![k],
+            vec![1],
+            b.dtype(),
+            b.offset(),
+        );
+        let result = super::gemv::gemv(registry, a, &b_vec, queue)?;
+        return Ok(Array::new(
+            result.metal_buffer().to_owned(),
+            vec![1, 1],
+            vec![1, 1],
+            result.dtype(),
+            result.offset(),
+        ));
     }
 
     let kernel_name = match a.dtype() {

@@ -4,6 +4,8 @@ use metal::Buffer as MTLBuffer;
 use metal::MTLResourceOptions;
 use rmlx_metal::metal;
 
+use rmlx_alloc::MetalAllocator;
+
 use crate::dtype::{DType, HasDType};
 
 /// An N-dimensional array stored in a Metal GPU buffer.
@@ -78,6 +80,37 @@ impl Array {
             dtype,
             offset: 0,
         }
+    }
+
+    /// Create a zero-filled array using a `MetalAllocator` buffer pool.
+    ///
+    /// Reuses cached buffers when possible, avoiding fresh allocations.
+    /// Falls back to a new allocation if the cache has no buffer of
+    /// suitable size.
+    pub fn zeros_pooled(
+        allocator: &MetalAllocator,
+        shape: &[usize],
+        dtype: DType,
+    ) -> Result<Self, rmlx_alloc::AllocError> {
+        let numel: usize = shape.iter().product();
+        let byte_size = dtype.numel_to_bytes(numel);
+        let buffer = allocator.alloc(byte_size)?;
+
+        // Zero the buffer contents (cached buffers may contain stale data).
+        // SAFETY: SharedMode buffer contents() is CPU-accessible and valid
+        // for buffer.length() bytes.
+        unsafe {
+            std::ptr::write_bytes(buffer.contents() as *mut u8, 0, byte_size);
+        }
+
+        let strides = compute_contiguous_strides(shape);
+        Ok(Self {
+            buffer,
+            shape: shape.to_vec(),
+            strides,
+            dtype,
+            offset: 0,
+        })
     }
 
     /// Create an array filled with ones (f32 only).
