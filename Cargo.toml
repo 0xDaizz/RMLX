@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rmlx-metal",
+    "crates/rmlx-alloc",
+    "crates/rmlx-rdma",
+    "crates/rmlx-core",
+    "crates/rmlx-distributed",
+    "crates/rmlx-nn",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+metal = "0.31"
+objc = "0.2"
+block = "0.1"
+libc = "0.2"

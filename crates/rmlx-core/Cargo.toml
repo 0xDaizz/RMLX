@@ -1,0 +1,10 @@
+[package]
+name = "rmlx-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rmlx-metal = { path = "../rmlx-metal" }
+rmlx-alloc = { path = "../rmlx-alloc" }
