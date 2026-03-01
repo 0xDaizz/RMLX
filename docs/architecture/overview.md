@@ -1,6 +1,6 @@
 # Architecture Overview
 
-RMLX is a layered architecture composed of five layers. All Phases (0 through 7C) have been completed and the system is fully implemented. Each layer has clear responsibility boundaries and is separated into individual Cargo crates. Phase 7 additions include VJP autodiff, LoRA fine-tuning, production hardening (structured logging, metrics, precision guard, graceful shutdown), and PyO3 Python bindings (rmlx-python).
+RMLX is a layered architecture composed of five layers. All Phases (0 through 7B) have been completed and the system is fully implemented. Each layer has clear responsibility boundaries and is separated into individual Cargo crates. Phase 7 additions include VJP autodiff, LoRA fine-tuning, and production hardening (structured logging, metrics, precision guard, graceful shutdown).
 
 ---
 
@@ -141,10 +141,6 @@ Handles inter-node communication via Thunderbolt 5 RDMA.
 ## Crate Dependency Graph
 
 ```
-               rmlx-python (PyO3)
-                      │
-              ┌───────┼───────┐
-              ▼       ▼       ▼
           rmlx-nn  rmlx-distributed
               │       │       │
               └───┬───┘       │
@@ -168,7 +164,6 @@ The exact dependency relationships are as follows:
 | `rmlx-core` | `rmlx-metal`, `rmlx-alloc` |
 | `rmlx-distributed` | `rmlx-core`, `rmlx-rdma` |
 | `rmlx-nn` | `rmlx-core` |
-| `rmlx-python` | `rmlx-core`, `rmlx-nn`, `rmlx-distributed` (PyO3 0.28) |
 
 **Dependency principle**: Lower layers (rmlx-metal, rmlx-alloc) are unaware of upper layers (rmlx-core, rmlx-nn). All dependencies are unidirectional, and circular dependencies are not allowed.
 

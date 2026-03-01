@@ -36,17 +36,10 @@ Near-parity with single-node 32ms/step
 | GPU | metal-rs 0.31 (Apple Metal API) |
 | RDMA | ibverbs FFI (Thunderbolt 5 UC QP) |
 | Hardware | Apple Silicon UMA (M3/M4 Ultra, 80-core GPU, 512GB) |
-| Python | PyO3 0.28 + maturin |
 
 ## Architecture
 
 ```
-                        ┌──────────────────────┐
-                        │    rmlx-python       │  PyO3 bindings
-                        │    (pip install rmlx) │
-                        └──────────┬───────────┘
-                   ┌───────────────┼───────────────┐
-                   ▼               ▼               ▼
            ┌──────────────┐ ┌─────────────┐ ┌─────────────────┐
            │   rmlx-nn    │ │  rmlx-core  │ │ rmlx-distributed│
            │  Transformer │ │  Op registry│ │  EP / MoE /     │
@@ -101,15 +94,14 @@ cargo clippy --workspace -- -D warnings
 ## Project Structure
 
 ```
-rmlx/                           # 7 crates, 365 tests
+rmlx/                           # 6 crates, 365 tests
 ├── crates/
 │   ├── rmlx-metal/             # Metal GPU abstraction (metal-rs 0.31)
 │   ├── rmlx-alloc/             # Zero-copy memory allocator
 │   ├── rmlx-rdma/              # RDMA communication (ibverbs FFI)
 │   ├── rmlx-core/              # Compute engine (ops, graph, autodiff)
 │   ├── rmlx-distributed/       # Distributed primitives (EP, MoE)
-│   ├── rmlx-nn/                # Neural network layers (Transformer, MoE)
-│   └── rmlx-python/            # PyO3 Python bindings
+│   └── rmlx-nn/                # Neural network layers (Transformer, MoE)
 ├── shaders/                    # Metal shader sources
 ├── tests/                      # Integration tests
 ├── benches/                    # Criterion benchmarks
@@ -122,11 +114,11 @@ This repository contains the **framework only**. The model serving layer (`rmlx-
 
 | Metric | Value |
 |--------|-------|
-| Crates | 7 |
+| Crates | 6 |
 | Tests | 365 |
 | Metal kernels | 10 (matmul, softmax, rms_norm, rope, gemv, quantized, binary, reduce, copy, indexing) |
 | Model architectures | 4 (LLaMA, Qwen, DeepSeek-V3, Mixtral) |
-| Implementation phases | 7 (all complete) |
+| Implementation phases | 6 (all complete) |
 
 ## Documentation
 
