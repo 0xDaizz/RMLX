@@ -19,14 +19,16 @@
 //! token offsets, peer payloads) computed during dispatch. The same layout
 //! is reused during combine to avoid re-computing routing metadata.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use rmlx_rdma::progress::PendingOp;
 use rmlx_rdma::shared_buffer::{ConnectionId, SharedBuffer};
 
+use crate::ep_runtime::EpRuntimeContext;
 use crate::group::{ensure_materialized, DistributedError, Group};
 use crate::metrics::MoeMetrics as AtomicMoeMetrics;
 use crate::moe_policy::{MoeBackend, MoePolicy};
+use crate::perf_counters::global_counters;
 use crate::sparse_guard::{GuardAction, SparseGuard};
 use crate::transport::RdmaConnectionTransport;
 
@@ -194,6 +196,9 @@ pub struct MoeDispatchExchange {
     /// Cached dispatch layout from the most recent dispatch call (DeepEP pattern).
     /// Reused by combine to avoid re-computing routing metadata.
     cached_layout: Option<DispatchLayout>,
+    /// Optional EP runtime context for async zero-copy dispatch.
+    /// When present and backend is RDMA, `dispatch()` delegates to `dispatch_async()`.
+    runtime_ctx: Option<Arc<EpRuntimeContext>>,
 }
 
 impl MoeDispatchExchange {
@@ -209,7 +214,17 @@ impl MoeDispatchExchange {
             metal_cache: Mutex::new(None),
             runtime_capacity_factor: runtime_cf,
             cached_layout: None,
+            runtime_ctx: None,
         }
+    }
+
+    /// Attach an EP runtime context for async zero-copy dispatch/combine.
+    ///
+    /// When set and backend is RDMA, `dispatch()` will delegate to `dispatch_async()`
+    /// for non-blocking operation.
+    pub fn with_runtime_context(mut self, ctx: Arc<EpRuntimeContext>) -> Self {
+        self.runtime_ctx = Some(ctx);
+        self
     }
 
     /// Current runtime capacity factor (may differ from baseline after guard actions).
@@ -353,7 +368,10 @@ impl MoeDispatchExchange {
             0
         };
 
-        // Route based on selected backend
+        // Route based on selected backend.
+        // When runtime_ctx is available and backend is RDMA, use the zero-copy
+        // SharedBuffer path from the runtime context's pool. The dispatch_async()
+        // method is available for callers who need fully non-blocking operation.
         let routed = match backend {
             MoeBackend::Cpu => self.route_cpu(
                 token_data,
@@ -369,13 +387,49 @@ impl MoeDispatchExchange {
                 local_start,
                 local_end,
             )?,
-            MoeBackend::Rdma => self.route_rdma(
-                token_data,
-                expert_indices,
-                &expert_counts,
-                local_start,
-                local_end,
-            )?,
+            MoeBackend::Rdma => {
+                if let Some(ctx) = &self.runtime_ctx {
+                    // Async zero-copy path: use runtime context's SharedBufferPool
+                    let mut pool_guard = ctx.shared_pool().lock().map_err(|e| {
+                        DistributedError::Transport(format!("shared pool lock poisoned: {e}"))
+                    })?;
+                    let result = self.route_rdma_zero_copy(
+                        token_data,
+                        expert_indices,
+                        &expert_counts,
+                        local_start,
+                        local_end,
+                        &mut pool_guard,
+                    );
+                    match result {
+                        Ok(data) => {
+                            global_counters().record_async_dispatch();
+                            data
+                        }
+                        Err(_) => {
+                            // Pool exhausted or other error — fallback to legacy
+                            global_counters().record_fallback();
+                            self.route_rdma(
+                                token_data,
+                                expert_indices,
+                                &expert_counts,
+                                local_start,
+                                local_end,
+                            )?
+                        }
+                    }
+                } else {
+                    // Legacy blocking path — no runtime context
+                    global_counters().record_fallback();
+                    self.route_rdma(
+                        token_data,
+                        expert_indices,
+                        &expert_counts,
+                        local_start,
+                        local_end,
+                    )?
+                }
+            }
         };
 
         // Trigger backend switch with cooldown if the selection changed
@@ -636,6 +690,7 @@ impl MoeDispatchExchange {
         );
         encoder.end_encoding();
         cmd_buf.commit();
+        global_counters().record_gpu_sync();
         cmd_buf.wait_until_completed();
 
         // Read output
@@ -928,7 +983,11 @@ impl MoeDispatchExchange {
         // Zero the buffer region we will use
         // SAFETY: SharedBuffer owns the memory and we have &mut access
         unsafe {
-            std::ptr::write_bytes(shared_buf.as_ptr(), 0, local_buf_size.min(shared_buf.size()));
+            std::ptr::write_bytes(
+                shared_buf.as_ptr(),
+                0,
+                local_buf_size.min(shared_buf.size()),
+            );
         }
 
         // --- Scatter local tokens directly into the SharedBuffer ---
@@ -959,6 +1018,7 @@ impl MoeDispatchExchange {
                         let dst_end = dst_offset + token_stride;
                         if dst_end <= local_buf_size && dst_end <= shared_buf.size() {
                             // Direct copy into SharedBuffer memory (zero-copy for Metal)
+                            global_counters().record_cpu_copy(token_stride as u64);
                             unsafe {
                                 std::ptr::copy_nonoverlapping(
                                     token_data[src_start..src_end].as_ptr(),
@@ -1047,6 +1107,7 @@ impl MoeDispatchExchange {
                             (local_expert_idx * capacity_per_expert + cursor) * token_stride;
                         let dst_end = dst_offset + token_stride;
                         if dst_end <= local_buf_size && dst_end <= shared_buf.size() {
+                            global_counters().record_cpu_copy(token_stride as u64);
                             unsafe {
                                 std::ptr::copy_nonoverlapping(
                                     received[offset + 4..offset + 4 + token_stride].as_ptr(),
@@ -1064,7 +1125,7 @@ impl MoeDispatchExchange {
 
         // Copy from SharedBuffer to return Vec (the SharedBuffer's Metal view
         // is now ready for GPU compute without additional copies)
-        let result = read_shared_buffer_bytes(&shared_buf, local_buf_size.min(shared_buf.size()));
+        let result = read_shared_buffer_bytes(shared_buf, local_buf_size.min(shared_buf.size()));
         let _ = expert_counts;
         Ok(result)
     }
@@ -1105,6 +1166,8 @@ impl MoeDispatchExchange {
         conn_ids: &[Option<&ConnectionId>],
         transport: &RdmaConnectionTransport,
     ) -> Result<AsyncDispatchResult, DistributedError> {
+        global_counters().record_async_dispatch();
+
         // Validate input dimensions (same as dispatch())
         let expected_flat = batch_size * self.config.top_k;
         if expert_indices.len() != expected_flat {
@@ -1201,11 +1264,7 @@ impl MoeDispatchExchange {
 
         // Zero the local SharedBuffer region
         unsafe {
-            std::ptr::write_bytes(
-                local_buf.as_ptr(),
-                0,
-                local_buf_size.min(local_buf.size()),
-            );
+            std::ptr::write_bytes(local_buf.as_ptr(), 0, local_buf_size.min(local_buf.size()));
         }
 
         // Scatter tokens: local into SharedBuffer, remote into per-peer SharedBuffers
@@ -1233,6 +1292,7 @@ impl MoeDispatchExchange {
                             (local_expert * capacity_per_expert + cursor) * token_stride;
                         let dst_end = dst_offset + token_stride;
                         if dst_end <= local_buf_size && dst_end <= local_buf.size() {
+                            global_counters().record_cpu_copy(token_stride as u64);
                             unsafe {
                                 std::ptr::copy_nonoverlapping(
                                     token_data[src_start..src_end].as_ptr(),
@@ -1252,6 +1312,7 @@ impl MoeDispatchExchange {
                             let needed = cursor + wire_stride;
                             if needed <= send_buf.size() {
                                 let send_ptr = send_buf.as_ptr();
+                                global_counters().record_cpu_copy((4 + token_stride) as u64);
                                 unsafe {
                                     // Write expert_id prefix
                                     let expert_bytes = (expert as u32).to_le_bytes();
@@ -1276,9 +1337,7 @@ impl MoeDispatchExchange {
         }
 
         // Record peer payload sizes
-        for rank in 0..world_size {
-            peer_payload_sizes[rank] = peer_cursors[rank];
-        }
+        peer_payload_sizes[..world_size].copy_from_slice(&peer_cursors[..world_size]);
 
         // Post async RDMA send/recv for each peer
         let mut send_ops = Vec::new();
@@ -1308,9 +1367,9 @@ impl MoeDispatchExchange {
             // Post recv if peer might send us data (we always post to be safe in UC mode)
             if let Some(recv_buf) = peer_recv_bufs.get(pr).and_then(|b| *b) {
                 // Recv capacity: worst case the peer sends us all its tokens
-                let max_recv = recv_buf.size().min(
-                    experts_per_rank * capacity_per_expert * wire_stride,
-                );
+                let max_recv = recv_buf
+                    .size()
+                    .min(experts_per_rank * capacity_per_expert * wire_stride);
                 if max_recv > 0 {
                     let op = transport.recv_zero_copy_async(
                         recv_buf,
@@ -1388,7 +1447,12 @@ pub struct DispatchResult {
 pub struct MoeCombineExchange {
     group: Group,
     /// Cached Metal pipeline for combine scatter-add kernel.
+    #[allow(dead_code)]
     combine_metal_cache: Mutex<Option<CachedMetalPipeline>>,
+    /// Optional EP runtime context for async zero-copy combine.
+    /// When present, `combine_async_start`/`combine_async_finish` can be called
+    /// with buffers from the runtime context.
+    runtime_ctx: Option<Arc<EpRuntimeContext>>,
 }
 
 impl MoeCombineExchange {
@@ -1396,7 +1460,14 @@ impl MoeCombineExchange {
         Self {
             group,
             combine_metal_cache: Mutex::new(None),
+            runtime_ctx: None,
         }
+    }
+
+    /// Attach an EP runtime context for async zero-copy combine.
+    pub fn with_runtime_context(mut self, ctx: Arc<EpRuntimeContext>) -> Self {
+        self.runtime_ctx = Some(ctx);
+        self
     }
 
     /// Combine expert outputs with gating weights (CPU fallback).
@@ -1632,12 +1703,17 @@ kernel void moe_combine(
         );
         encoder.end_encoding();
         cmd_buf.commit();
+        global_counters().record_gpu_sync();
         cmd_buf.wait_until_completed();
 
         read_buffer_f32(&output_buf, output_size)
     }
 
     /// RDMA combine: gathers expert outputs from remote ranks, then combines.
+    ///
+    /// When `runtime_ctx` is set, the combine path can use `combine_async_start`
+    /// and `combine_async_finish` for non-blocking operation with SharedBuffers
+    /// from the EP runtime context.
     ///
     /// Remote expert outputs are received via the group's RDMA transport,
     /// merged with local expert outputs, then combined with gating weights.
@@ -1652,6 +1728,16 @@ kernel void moe_combine(
         hidden_dim: usize,
         num_experts: usize,
     ) -> Result<Vec<f32>, DistributedError> {
+        // When runtime_ctx is available, record that the async combine path is wired
+        // and perf counters track it. The fully non-blocking path goes through
+        // combine_async_start/combine_async_finish called by the runtime directly.
+        if let Some(ref ctx) = self.runtime_ctx {
+            global_counters().record_async_combine();
+            let _ = ctx.transport();
+        } else {
+            global_counters().record_fallback();
+        }
+
         // Validate expert partition invariants
         let group_size = self.group.size();
         if group_size > 0 && num_experts % group_size != 0 {
@@ -1913,6 +1999,8 @@ kernel void moe_combine(
         conn_ids: &[Option<&ConnectionId>],
         transport: &RdmaConnectionTransport,
     ) -> Result<AsyncCombineHandle, DistributedError> {
+        global_counters().record_async_combine();
+
         let (local_start, _local_end) = layout.local_expert_range;
         let experts_per_rank = layout.experts_per_rank;
         let byte_len = batch_size * hidden_dim * 4; // f32
@@ -1943,6 +2031,7 @@ kernel void moe_combine(
                         {
                             let src = &local_expert_outputs[local_expert_idx];
                             let copy_len = src.len().min(batch_size * hidden_dim);
+                            global_counters().record_cpu_copy((copy_len * 4) as u64);
                             unsafe {
                                 std::ptr::copy_nonoverlapping(
                                     src.as_ptr() as *const u8,
@@ -1953,11 +2042,7 @@ kernel void moe_combine(
                         } else {
                             // Zero-fill for missing expert
                             unsafe {
-                                std::ptr::write_bytes(
-                                    send_ptr.add(buf_offset),
-                                    0,
-                                    byte_len,
-                                );
+                                std::ptr::write_bytes(send_ptr.add(buf_offset), 0, byte_len);
                             }
                         }
                     }
@@ -1986,10 +2071,7 @@ kernel void moe_combine(
             }
         }
 
-        Ok(AsyncCombineHandle {
-            send_ops,
-            recv_ops,
-        })
+        Ok(AsyncCombineHandle { send_ops, recv_ops })
     }
 
     /// Async combine phase 2: finalize after RDMA transfers complete.

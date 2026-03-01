@@ -649,6 +649,7 @@ fn test_moe_combine_cpu_out_of_range_expert() {
 struct LoopbackTransport {
     local_rank: u32,
     /// Keyed by (src_rank, dst_rank), stores queued messages.
+    #[allow(clippy::type_complexity)]
     queues: Arc<Mutex<HashMap<(u32, u32), Vec<Vec<u8>>>>>,
 }
 
@@ -827,6 +828,7 @@ fn test_rdma_expert_id_preserved_in_merge() {
         let routed = &dispatch_result.routed_data;
 
         // Expert 4 (local_idx=0): should have the token from rank 0 tagged expert_id=4 -> [0x11; 8]
+        #[allow(clippy::erasing_op)]
         let expert4_start = 0 * capacity_per_expert * token_stride;
         let expert4_data = &routed[expert4_start..expert4_start + token_stride];
         assert_eq!(
@@ -835,6 +837,7 @@ fn test_rdma_expert_id_preserved_in_merge() {
         );
 
         // Expert 5 (local_idx=1): should have rank 1's local token -> [0x33; 8]
+        #[allow(clippy::identity_op)]
         let expert5_start = 1 * capacity_per_expert * token_stride;
         let expert5_data = &routed[expert5_start..expert5_start + token_stride];
         assert_eq!(

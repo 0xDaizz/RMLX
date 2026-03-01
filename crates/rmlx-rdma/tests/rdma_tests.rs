@@ -599,7 +599,8 @@ fn test_posted_op_kind_copy_clone() {
     use rmlx_rdma::PostedOpKind;
     let a = PostedOpKind::Send;
     let b = a; // Copy
-    let c = a.clone(); // Clone
+    #[allow(clippy::clone_on_copy)]
+    let c = a.clone(); // Clone (intentional: testing Clone trait impl)
     assert_eq!(a, b);
     assert_eq!(a, c);
 }

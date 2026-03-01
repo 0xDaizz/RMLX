@@ -327,13 +327,9 @@ impl RdmaConnection {
     ///
     /// The returned `RegisteredSend` borrows `data` for lifetime `'a`,
     /// ensuring the MR cannot outlive the data it was registered from.
-    pub fn register_send_slice<'a>(
-        &self,
-        data: &'a [u8],
-    ) -> Result<RegisteredSend<'a>, RdmaError> {
+    pub fn register_send_slice<'a>(&self, data: &'a [u8]) -> Result<RegisteredSend<'a>, RdmaError> {
         // SAFETY: data is a valid &[u8]; lifetime 'a outlives RegisteredSend<'a>.
-        let mr =
-            unsafe { self.register_mr(data.as_ptr() as *mut c_void, data.len())? };
+        let mr = unsafe { self.register_mr(data.as_ptr() as *mut c_void, data.len())? };
         Ok(RegisteredSend {
             mr,
             _lt: PhantomData,
@@ -349,9 +345,7 @@ impl RdmaConnection {
         data: &'a mut [u8],
     ) -> Result<RegisteredRecv<'a>, RdmaError> {
         // SAFETY: data is a valid &mut [u8]; lifetime 'a outlives RegisteredRecv<'a>.
-        let mr = unsafe {
-            self.register_mr(data.as_mut_ptr() as *mut c_void, data.len())?
-        };
+        let mr = unsafe { self.register_mr(data.as_mut_ptr() as *mut c_void, data.len())? };
         Ok(RegisteredRecv {
             mr,
             _lt: PhantomData,

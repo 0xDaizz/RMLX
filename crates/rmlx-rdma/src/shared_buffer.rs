@@ -54,11 +54,7 @@ impl SharedBuffer {
     /// The Metal device reference must remain valid for the lifetime of
     /// the Metal buffer created here. In practice, the device is held by
     /// the caller for the entire session.
-    pub fn new(
-        device: &metal::Device,
-        size: usize,
-        slot_index: u8,
-    ) -> Result<Self, AllocError> {
+    pub fn new(device: &metal::Device, size: usize, slot_index: u8) -> Result<Self, AllocError> {
         let alignment: usize = 16384; // Apple Silicon page size
         let aligned_size = align_up(size, alignment);
 
@@ -106,9 +102,8 @@ impl SharedBuffer {
     ) -> Result<(), RdmaError> {
         // SAFETY: raw_ptr is valid for self.size bytes and will outlive
         // the MemoryRegion (we deregister in deregister() or Drop).
-        let mr = unsafe {
-            MemoryRegion::register(pd, self.raw_ptr.as_ptr() as *mut c_void, self.size)?
-        };
+        let mr =
+            unsafe { MemoryRegion::register(pd, self.raw_ptr.as_ptr() as *mut c_void, self.size)? };
         self.rdma_registrations.insert(conn_id, mr);
         Ok(())
     }
@@ -187,10 +182,7 @@ impl SharedBufferPool {
     ///
     /// The Metal device reference must remain valid for the lifetime of
     /// all Metal buffers created in this pool.
-    pub fn new(
-        device: &metal::Device,
-        tier_sizes: &[usize],
-    ) -> Result<Self, AllocError> {
+    pub fn new(device: &metal::Device, tier_sizes: &[usize]) -> Result<Self, AllocError> {
         let mut tiers = Vec::with_capacity(tier_sizes.len());
         for (tier_idx, &size) in tier_sizes.iter().enumerate() {
             let mut buffers = Vec::with_capacity(PIPELINE);

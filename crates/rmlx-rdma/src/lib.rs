@@ -27,9 +27,11 @@ pub use exchange_tag::{ExchangeTag, WrIdFields};
 pub use gpu_doorbell::{DescriptorProxy, DescriptorRing, ProxyConfig, RdmaDescriptor, RdmaOp};
 pub use mr::MemoryRegion;
 pub use mr_pool::{MrHandle, MrPool};
-pub use progress::{Completion, OpError, PendingOp, ProgressConfig, ProgressEngine, ProgressMode};
 pub use multi_port::{
     DualPortConfig, PortConfig, PortFailover, PortState, StripeEngine, StripePlan, Topology,
+};
+pub use progress::{
+    Completion, OpError, OwnedPendingOp, PendingOp, ProgressConfig, ProgressEngine, ProgressMode,
 };
 pub use qp::{CompletionQueue, QpInfo, QueuePair};
 pub use rdma_metrics::{RdmaMetrics, RdmaMetricsSnapshot};
