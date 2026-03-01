@@ -90,6 +90,13 @@ impl GpuEvent {
         self.cancelled.store(false, Ordering::Release);
     }
 
+    /// Reset the event counter and signaled value to 0.
+    /// Call this when reusing the event for a new pipeline iteration.
+    pub fn reset(&self) {
+        self.counter.store(0, Ordering::SeqCst);
+        self.event.set_signaled_value(0);
+    }
+
     /// Raw shared event reference.
     pub fn raw(&self) -> &SharedEvent {
         &self.event

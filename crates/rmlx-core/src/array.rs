@@ -233,7 +233,12 @@ impl Array {
     /// Create an Array from raw bytes, allocating a new Metal buffer.
     ///
     /// `bytes.len()` must equal the exact buffer size for the given shape and dtype.
-    pub fn from_bytes(device: &metal::Device, bytes: &[u8], shape: Vec<usize>, dtype: DType) -> Self {
+    pub fn from_bytes(
+        device: &metal::Device,
+        bytes: &[u8],
+        shape: Vec<usize>,
+        dtype: DType,
+    ) -> Self {
         let numel: usize = shape.iter().product();
         let expected = dtype.numel_to_bytes(numel);
         assert_eq!(
@@ -246,8 +251,11 @@ impl Array {
             dtype
         );
         let ptr = bytes.as_ptr() as *const std::ffi::c_void;
-        let buffer =
-            device.new_buffer_with_data(ptr, bytes.len() as u64, MTLResourceOptions::StorageModeShared);
+        let buffer = device.new_buffer_with_data(
+            ptr,
+            bytes.len() as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
         let strides = compute_contiguous_strides(&shape);
         Self {
             buffer,
@@ -266,7 +274,12 @@ impl Array {
     /// # Panics
     /// Panics if the array is not 2D or if the column range is out of bounds.
     pub fn slice_columns(&self, start: usize, end: usize) -> Self {
-        assert_eq!(self.ndim(), 2, "slice_columns requires a 2D array, got {}D", self.ndim());
+        assert_eq!(
+            self.ndim(),
+            2,
+            "slice_columns requires a 2D array, got {}D",
+            self.ndim()
+        );
         let cols = self.shape[1];
         assert!(
             start < end && end <= cols,

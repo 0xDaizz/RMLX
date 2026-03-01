@@ -8,7 +8,7 @@
 
 /// Identifies the purpose of an RDMA exchange operation.
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ExchangeTag {
     Data = 0,
     Warmup = 1,
@@ -147,7 +147,7 @@ mod tests {
     #[test]
     fn seq_truncated_to_40_bits() {
         // Bits above 40 should be masked off
-        let over_seq: u64 = 0x1_00_0000_0001; // bit 40 set + bit 0
+        let over_seq: u64 = 0x0100_0000_0001; // bit 40 set + bit 0
         let wr_id = encode_wr_id(over_seq, ExchangeTag::Data, 0, 0);
         let fields = decode_wr_id(wr_id);
         assert_eq!(fields.seq, 1); // only lower 40 bits kept
@@ -158,10 +158,22 @@ mod tests {
         assert_eq!(ExchangeTag::from_u8(0), Some(ExchangeTag::Data));
         assert_eq!(ExchangeTag::from_u8(1), Some(ExchangeTag::Warmup));
         assert_eq!(ExchangeTag::from_u8(2), Some(ExchangeTag::Barrier));
-        assert_eq!(ExchangeTag::from_u8(100), Some(ExchangeTag::MoeDispatchCount));
-        assert_eq!(ExchangeTag::from_u8(101), Some(ExchangeTag::MoeDispatchPayload));
-        assert_eq!(ExchangeTag::from_u8(102), Some(ExchangeTag::MoeCombineOutput));
-        assert_eq!(ExchangeTag::from_u8(103), Some(ExchangeTag::MoeCombineWeights));
+        assert_eq!(
+            ExchangeTag::from_u8(100),
+            Some(ExchangeTag::MoeDispatchCount)
+        );
+        assert_eq!(
+            ExchangeTag::from_u8(101),
+            Some(ExchangeTag::MoeDispatchPayload)
+        );
+        assert_eq!(
+            ExchangeTag::from_u8(102),
+            Some(ExchangeTag::MoeCombineOutput)
+        );
+        assert_eq!(
+            ExchangeTag::from_u8(103),
+            Some(ExchangeTag::MoeCombineWeights)
+        );
     }
 
     #[test]

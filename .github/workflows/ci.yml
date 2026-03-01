@@ -32,7 +32,7 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
-- uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: actions/cache@v4
@@ -43,14 +43,14 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
-      - run: cargo clippy --workspace --exclude rmlx-python --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets -- -D warnings
 
   build:
     name: build
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
-- uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
       - uses: actions/cache@v4
         with:
           path: |
@@ -59,7 +59,7 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
-      - run: cargo build --workspace --exclude rmlx-python
+      - run: cargo build --workspace
 
   unit-tests:
     name: unit tests
@@ -67,7 +67,7 @@ jobs:
     needs: build
     steps:
       - uses: actions/checkout@v4
-- uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
       - uses: actions/cache@v4
         with:
           path: |
@@ -76,7 +76,7 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
-      - run: cargo test --workspace --exclude rmlx-python
+      - run: cargo test --workspace
 
   wiring-proof:
     name: wiring proof
@@ -84,7 +84,7 @@ jobs:
     needs: build
     steps:
       - uses: actions/checkout@v4
-- uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
       - uses: actions/cache@v4
         with:
           path: |
@@ -122,7 +122,7 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-- uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
       - uses: actions/cache@v4
         with:
           path: |
@@ -149,6 +149,4 @@ jobs:
   # - Overlap ratio measurement (real GPU+RDMA)
   #
   # These are validated manually by maintainer review.
-  # Branch protection requires 1 approving review to
-  # ensure HW-dependent criteria are checked.
   # ──────────────────────────────────────────────

@@ -80,7 +80,14 @@ const _: () = {
 
 impl RdmaDescriptor {
     /// Create a new descriptor. Reserved bytes are zeroed.
-    pub fn new(op: RdmaOp, peer_id: u8, tag: ExchangeTag, buf_slot: u8, offset: u32, length: u32) -> Self {
+    pub fn new(
+        op: RdmaOp,
+        peer_id: u8,
+        tag: ExchangeTag,
+        buf_slot: u8,
+        offset: u32,
+        length: u32,
+    ) -> Self {
         Self {
             op: op as u8,
             peer_id,
@@ -313,7 +320,10 @@ impl DescriptorProxy {
                 while !shutdown_clone.load(Ordering::Acquire) {
                     // Wait for GPU to signal new descriptors
                     let next_expected = (ring.head.wrapping_add(1)) as u64;
-                    match ring.submit_event.cpu_wait(next_expected, config.poll_timeout) {
+                    match ring
+                        .submit_event
+                        .cpu_wait(next_expected, config.poll_timeout)
+                    {
                         Ok(_) => {}
                         Err(_) => {
                             // Timeout — check shutdown and retry

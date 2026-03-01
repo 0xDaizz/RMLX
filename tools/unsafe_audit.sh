@@ -42,18 +42,7 @@ else
     FAIL=$((FAIL + 1))
 fi
 
-# Check 2: rmlx-python unsafe count
-PY_ALLOWLIST=0
-py_count=$(count_unsafe_non_test "crates/rmlx-python")
-if [ "$py_count" -le "$PY_ALLOWLIST" ]; then
-    echo "PASS: rmlx-python unsafe blocks: $py_count (allowlist: $PY_ALLOWLIST)"
-    PASS=$((PASS + 1))
-else
-    echo "FAIL: rmlx-python unsafe blocks: $py_count (allowlist: $PY_ALLOWLIST)"
-    FAIL=$((FAIL + 1))
-fi
-
-# Check 3: no mem::forget in non-test code (excluding comments)
+# Check 2: no mem::forget in non-test code (excluding comments)
 # grep output format is "file:line:content", so filter comments after the last colon
 forget_count=$(grep -rn "mem::forget" --include='*.rs' crates/ \
     | grep -v '/tests/' \
@@ -71,7 +60,7 @@ else
     FAIL=$((FAIL + 1))
 fi
 
-# Check 4: no lock().unwrap() in progress.rs non-test code
+# Check 3: no lock().unwrap() in progress.rs non-test code
 if [ -f "crates/rmlx-rdma/src/progress.rs" ]; then
     lock_unwrap=$(awk '
         /^#\[cfg\(test\)\]/ { skip=1; depth=0; next }

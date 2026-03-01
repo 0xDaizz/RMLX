@@ -17,12 +17,12 @@ use crate::RdmaError;
 pub const PIPELINE: usize = 2;
 
 const TIER_SIZES: [usize; 6] = [
-    4 * 1024,           // 4KB
-    64 * 1024,          // 64KB
-    256 * 1024,         // 256KB
-    1 * 1024 * 1024,    // 1MB
-    4 * 1024 * 1024,    // 4MB
-    16 * 1024 * 1024,   // 16MB
+    4 * 1024,         // 4KB
+    64 * 1024,        // 64KB
+    256 * 1024,       // 256KB
+    1024 * 1024,      // 1MB
+    4 * 1024 * 1024,  // 4MB
+    16 * 1024 * 1024, // 16MB
 ];
 
 /// Inner data for a pre-registered memory slot, shared via `Arc`.
@@ -69,7 +69,7 @@ pub struct MrHandle {
 impl MrHandle {
     /// Access the underlying MemoryRegion for RDMA operations.
     pub fn mr(&self) -> &MemoryRegion {
-        &*self.slot.mr
+        &self.slot.mr
     }
 
     /// lkey for SGE construction.

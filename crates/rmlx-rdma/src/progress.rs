@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use crate::exchange_tag::{try_decode_wr_id, WrIdFields};
 use crate::ffi::{wc_status, wc_status_str, IbvWc};
+use crate::mr::MemoryRegion;
 use crate::qp::CompletionQueue;
 
 // ─── Op states (AtomicU8) ───
@@ -112,20 +113,25 @@ impl PendingOp {
     }
 
     /// Blocking wait with timeout.
-    pub fn wait(self, timeout: Duration) -> Result<Completion, WaitError> {
+    ///
+    /// Takes `&self` so the caller retains ownership. This is critical for
+    /// `OwnedPendingOp`: on timeout the MR must stay alive because the WR
+    /// is still in flight.
+    pub fn wait(&self, timeout: Duration) -> Result<Completion, WaitError> {
         // Fast path: already done
         if let Some(r) = self.try_poll() {
             return r.map_err(WaitError::OpFailed);
         }
 
         // Slow path: condvar wait
+        // The notify mutex guards only () — poison recovery is safe here.
         let (lock, cvar) = &self.slot.notify;
-        let guard = lock.lock().unwrap();
+        let guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let _guard = cvar
             .wait_timeout_while(guard, timeout, |_| {
                 self.slot.state.load(Ordering::Acquire) == OP_PENDING
             })
-            .unwrap();
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         match self.try_poll() {
             Some(r) => r.map_err(WaitError::OpFailed),
@@ -136,6 +142,60 @@ impl PendingOp {
     /// The wr_id this operation is tracking.
     pub fn wr_id(&self) -> u64 {
         self.wr_id
+    }
+}
+
+// ─── OwnedPendingOp: RAII wrapper that ties MR lifetime to op lifetime ───
+
+/// A pending RDMA operation that owns its `MemoryRegion`.
+///
+/// This ensures the MR stays registered for the duration of the async RDMA
+/// operation and is automatically deregistered when the op completes or is
+/// dropped. Replaces the old `mem::forget(mr)` pattern.
+pub struct OwnedPendingOp {
+    pending: PendingOp,
+    /// Held alive for the duration of the RDMA op; deregistered on drop.
+    _mr: MemoryRegion,
+}
+
+impl OwnedPendingOp {
+    /// Create a new `OwnedPendingOp` that ties the MR lifetime to the op.
+    pub fn new(pending: PendingOp, mr: MemoryRegion) -> Self {
+        Self { pending, _mr: mr }
+    }
+
+    /// Non-blocking poll. Returns `Some` if the operation has completed.
+    pub fn try_poll(&self) -> Option<Result<Completion, OpError>> {
+        self.pending.try_poll()
+    }
+
+    /// Returns true if the operation is still pending.
+    pub fn is_pending(&self) -> bool {
+        self.pending.is_pending()
+    }
+
+    /// Blocking wait with timeout. The MR stays alive regardless of outcome.
+    /// Drop `self` after the operation completes to deregister the MR.
+    pub fn wait(&self, timeout: Duration) -> Result<Completion, WaitError> {
+        self.pending.wait(timeout)
+    }
+
+    /// The wr_id this operation is tracking.
+    pub fn wr_id(&self) -> u64 {
+        self.pending.wr_id()
+    }
+
+    /// Decompose into the inner `PendingOp`, releasing the MR.
+    ///
+    /// # Panics
+    /// Panics if the operation is still pending. Wait for completion before calling this.
+    pub fn into_pending(self) -> PendingOp {
+        assert!(
+            !self.pending.is_pending(),
+            "cannot release MR: RDMA operation still pending (wr_id={})",
+            self.pending.wr_id()
+        );
+        self.pending
     }
 }
 
@@ -171,6 +231,10 @@ impl Default for ProgressConfig {
 /// Thread-safe: the pending map is protected by a Mutex, but the lock is
 /// only held briefly to insert/remove entries — never during CQ polling
 /// or busy-waiting.
+///
+/// If a mutex becomes poisoned (due to a panic in a thread holding the
+/// lock), the engine recovers by accepting the poisoned guard. The
+/// `healthy` flag is set to `false` to indicate degraded state.
 pub struct ProgressEngine {
     /// Map from wr_id to the shared completion slot.
     pending: Arc<Mutex<HashMap<u64, Arc<OpSlot>>>>,
@@ -178,6 +242,21 @@ pub struct ProgressEngine {
     shutdown: Arc<AtomicBool>,
     /// Background thread join handle.
     bg_handle: Option<std::thread::JoinHandle<()>>,
+    /// `false` after any mutex-poison event has been observed.
+    healthy: Arc<AtomicBool>,
+}
+
+/// Lock a mutex with poison recovery. If the mutex is poisoned, the
+/// `healthy` flag is set to `false` and the inner guard is returned.
+fn lock_or_recover<'a, T>(
+    mutex: &'a Mutex<T>,
+    healthy: &AtomicBool,
+) -> std::sync::MutexGuard<'a, T> {
+    mutex.lock().unwrap_or_else(|poisoned| {
+        healthy.store(false, Ordering::Release);
+        eprintln!("[rmlx-rdma] progress: mutex poisoned — recovering");
+        poisoned.into_inner()
+    })
 }
 
 impl ProgressEngine {
@@ -187,7 +266,19 @@ impl ProgressEngine {
             pending: Arc::new(Mutex::new(HashMap::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
             bg_handle: None,
+            healthy: Arc::new(AtomicBool::new(true)),
         }
+    }
+
+    /// Returns `true` if no mutex-poison event has been observed.
+    pub fn is_healthy(&self) -> bool {
+        self.healthy.load(Ordering::Acquire)
+    }
+
+    /// Cancel a pending operation, removing it from the tracking map.
+    /// Use this when an operation was registered but the WR was never actually posted.
+    pub fn cancel_op(&self, wr_id: u64) {
+        lock_or_recover(&self.pending, &self.healthy).remove(&wr_id);
     }
 
     /// Register a wr_id for completion tracking.
@@ -200,10 +291,7 @@ impl ProgressEngine {
             result: OnceLock::new(),
             notify: (Mutex::new(()), Condvar::new()),
         });
-        self.pending
-            .lock()
-            .unwrap()
-            .insert(wr_id, Arc::clone(&slot));
+        lock_or_recover(&self.pending, &self.healthy).insert(wr_id, Arc::clone(&slot));
         PendingOp { slot, wr_id }
     }
 
@@ -233,7 +321,7 @@ impl ProgressEngine {
         }
 
         // Resolve completions — lock held only for HashMap lookups
-        let mut pending = self.pending.lock().unwrap();
+        let mut pending = lock_or_recover(&self.pending, &self.healthy);
         for wc in &wc_buf[..count] {
             if let Some(slot) = pending.remove(&wc.wr_id) {
                 Self::resolve_slot(&slot, wc);
@@ -265,6 +353,7 @@ impl ProgressEngine {
 
         let pending = Arc::clone(&self.pending);
         let shutdown = Arc::clone(&self.shutdown);
+        let healthy = Arc::clone(&self.healthy);
         self.shutdown.store(false, Ordering::Release);
 
         let handle = std::thread::Builder::new()
@@ -292,7 +381,7 @@ impl ProgressEngine {
                         continue;
                     }
 
-                    let mut map = pending.lock().unwrap();
+                    let mut map = lock_or_recover(&pending, &healthy);
                     for wc in &wc_buf[..count] {
                         if let Some(slot) = map.remove(&wc.wr_id) {
                             Self::resolve_slot(&slot, wc);
@@ -321,7 +410,7 @@ impl ProgressEngine {
 
     /// Number of operations currently pending completion.
     pub fn pending_count(&self) -> usize {
-        self.pending.lock().unwrap().len()
+        lock_or_recover(&self.pending, &self.healthy).len()
     }
 
     /// Resolve a single operation slot from a work completion.
@@ -350,8 +439,9 @@ impl ProgressEngine {
         slot.state.store(new_state, Ordering::Release);
 
         // Wake any thread blocked in PendingOp::wait()
+        // The notify mutex guards only () — poison recovery is safe here.
         let (lock, cvar) = &slot.notify;
-        let _guard = lock.lock().unwrap();
+        let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         cvar.notify_all();
     }
 }
@@ -496,5 +586,39 @@ mod tests {
         assert!(op1.is_pending());
         assert!(!op2.is_pending());
         assert!(op3.is_pending());
+    }
+
+    #[test]
+    fn poison_recovery_after_panic() {
+        let engine = Arc::new(ProgressEngine::new());
+        assert!(engine.is_healthy());
+
+        // Register an op before the panic
+        let _op_before = engine.register_op(100);
+        assert_eq!(engine.pending_count(), 1);
+
+        // Poison the pending mutex by panicking while holding the lock
+        let engine2 = Arc::clone(&engine);
+        let handle = std::thread::spawn(move || {
+            let _guard = engine2.pending.lock().unwrap();
+            panic!("intentional panic to poison mutex");
+        });
+        // The thread panicked — join returns Err
+        assert!(handle.join().is_err());
+
+        // The mutex is now poisoned. Health flag is still true because
+        // lock_or_recover hasn't been called yet after the poison event.
+        assert!(engine.is_healthy());
+
+        // register_op should still work (poison recovery triggers here)
+        let op = engine.register_op(200);
+        assert!(op.is_pending());
+
+        // Now is_healthy() returns false — the poison was detected
+        assert!(!engine.is_healthy());
+
+        // Subsequent operations still work
+        assert_eq!(engine.pending_count(), 2);
+        assert!(!engine.is_healthy());
     }
 }

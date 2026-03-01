@@ -14,7 +14,7 @@
 - [rmlx-core](crates/rmlx-core.md) | [한국어](crates/rmlx-core_ko.md)
 - [rmlx-distributed](crates/rmlx-distributed.md) | [한국어](crates/rmlx-distributed_ko.md)
 - [rmlx-nn](crates/rmlx-nn.md) | [한국어](crates/rmlx-nn_ko.md)
-- [rmlx-python](crates/rmlx-python.md) | [한국어](crates/rmlx-python_ko.md)
+
 
 ## Getting Started
 - [Prerequisites](getting-started/prerequisites.md) | [한국어](getting-started/prerequisites_ko.md)
