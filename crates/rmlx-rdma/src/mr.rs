@@ -27,7 +27,8 @@ impl MemoryRegion {
         ptr: *mut c_void,
         size: usize,
     ) -> Result<Self, RdmaError> {
-        Self::register_with_limit(pd, ptr, size, DEFAULT_MAX_MR_SIZE)
+        // SAFETY: caller guarantees ptr validity (see fn-level doc).
+        unsafe { Self::register_with_limit(pd, ptr, size, DEFAULT_MAX_MR_SIZE) }
     }
 
     /// Register a memory region with a specific max_mr_size limit.
@@ -48,7 +49,7 @@ impl MemoryRegion {
         }
         let flags = access_flags::LOCAL_WRITE | access_flags::REMOTE_WRITE;
         // SAFETY: pd.raw() is valid, ptr/size are guaranteed by caller.
-        let mr = (pd.lib().reg_mr)(pd.raw(), ptr, size, flags);
+        let mr = unsafe { (pd.lib().reg_mr)(pd.raw(), ptr, size, flags) };
         if mr.is_null() {
             return Err(RdmaError::MrReg(format!(
                 "ibv_reg_mr failed for ptr={ptr:?}, size={size}"

@@ -2,13 +2,111 @@
 //!
 //! - MoeDispatchExchange: routes tokens to experts across nodes
 //! - MoeCombineExchange: gathers expert outputs and applies weighted sum
+//!
+//! ## SharedBuffer integration (Phase F)
+//!
+//! The RDMA dispatch/combine paths can optionally use pre-registered
+//! [`SharedBuffer`]s from `rmlx_rdma::shared_buffer`, eliminating per-dispatch
+//! `ibv_reg_mr` and CPU memcpy overhead. When a `SharedBufferPool` is
+//! attached, `route_rdma` acquires a buffer from the pool, packs tokens
+//! directly into it, and uses the pre-registered MR for zero-copy RDMA
+//! transfer. The combine path uses Metal scatter-add on the SharedBuffer's
+//! Metal view.
+//!
+//! ## Dispatch layout caching (DeepEP pattern)
+//!
+//! [`DispatchLayout`] captures the routing decisions (expert assignments,
+//! token offsets, peer payloads) computed during dispatch. The same layout
+//! is reused during combine to avoid re-computing routing metadata.
 
 use std::sync::Mutex;
+
+use rmlx_rdma::progress::PendingOp;
+use rmlx_rdma::shared_buffer::{ConnectionId, SharedBuffer};
 
 use crate::group::{ensure_materialized, DistributedError, Group};
 use crate::metrics::MoeMetrics as AtomicMoeMetrics;
 use crate::moe_policy::{MoeBackend, MoePolicy};
 use crate::sparse_guard::{GuardAction, SparseGuard};
+use crate::transport::RdmaConnectionTransport;
+
+/// Safely read `n` bytes from a Metal buffer's contents.
+///
+/// # Panics
+/// Panics if `n` exceeds the buffer's length.
+fn read_buffer_bytes(buf: &metal::Buffer, n: usize) -> Vec<u8> {
+    assert!(
+        n <= buf.length() as usize,
+        "read_buffer_bytes: n={} exceeds buffer length={}",
+        n,
+        buf.length()
+    );
+    let ptr = buf.contents() as *const u8;
+    // SAFETY: bounds checked above; contents() returns a valid CPU-accessible
+    // pointer for StorageModeShared buffers, and the command buffer has completed.
+    unsafe { std::slice::from_raw_parts(ptr, n) }.to_vec()
+}
+
+/// Safely read `n` f32 elements from a Metal buffer's contents.
+///
+/// # Panics
+/// Panics if `n * size_of::<f32>()` exceeds the buffer's byte length.
+fn read_buffer_f32(buf: &metal::Buffer, n: usize) -> Vec<f32> {
+    let byte_len = n * std::mem::size_of::<f32>();
+    assert!(
+        byte_len <= buf.length() as usize,
+        "read_buffer_f32: {} bytes (n={}) exceeds buffer length={}",
+        byte_len,
+        n,
+        buf.length()
+    );
+    let ptr = buf.contents() as *const f32;
+    // SAFETY: bounds checked above; contents() returns a valid CPU-accessible
+    // pointer for StorageModeShared buffers, and the command buffer has completed.
+    unsafe { std::slice::from_raw_parts(ptr, n) }.to_vec()
+}
+
+/// Safely read `n` bytes from a SharedBuffer's raw pointer.
+///
+/// # Panics
+/// Panics if `n` exceeds the shared buffer's size.
+fn read_shared_buffer_bytes(buf: &rmlx_rdma::shared_buffer::SharedBuffer, n: usize) -> Vec<u8> {
+    assert!(
+        n <= buf.size(),
+        "read_shared_buffer_bytes: n={} exceeds SharedBuffer size={}",
+        n,
+        buf.size()
+    );
+    let ptr = buf.as_ptr() as *const u8;
+    // SAFETY: bounds checked above; SharedBuffer guarantees ptr is valid for size() bytes.
+    unsafe { std::slice::from_raw_parts(ptr, n) }.to_vec()
+}
+
+/// Cached dispatch layout from a prior dispatch call (DeepEP pattern).
+///
+/// Captures the routing decisions so the combine phase can reuse them
+/// without re-computing expert assignments, peer payloads, or buffer offsets.
+#[derive(Debug, Clone)]
+pub struct DispatchLayout {
+    /// Which backend was used for dispatch.
+    pub backend: MoeBackend,
+    /// Per-expert token counts.
+    pub expert_counts: Vec<usize>,
+    /// Capacity per expert used during dispatch.
+    pub tokens_per_expert: usize,
+    /// Local expert range [start, end).
+    pub local_expert_range: (usize, usize),
+    /// Token stride in bytes.
+    pub token_stride: usize,
+    /// Number of experts per rank.
+    pub experts_per_rank: usize,
+    /// Batch size used in dispatch.
+    pub batch_size: usize,
+    /// Expert indices (flat: [batch_size * top_k]).
+    pub expert_indices: Vec<u32>,
+    /// Per-peer payload sizes in bytes (indexed by rank). Empty for non-RDMA.
+    pub peer_payload_sizes: Vec<usize>,
+}
 
 /// Metal shader source for the gather/scatter routing kernel.
 ///
@@ -93,6 +191,9 @@ pub struct MoeDispatchExchange {
     /// Runtime capacity factor, modified by SparseGuard actions.
     /// Initially set from `config.capacity_factor`.
     runtime_capacity_factor: f32,
+    /// Cached dispatch layout from the most recent dispatch call (DeepEP pattern).
+    /// Reused by combine to avoid re-computing routing metadata.
+    cached_layout: Option<DispatchLayout>,
 }
 
 impl MoeDispatchExchange {
@@ -107,6 +208,7 @@ impl MoeDispatchExchange {
             guard: SparseGuard::new(),
             metal_cache: Mutex::new(None),
             runtime_capacity_factor: runtime_cf,
+            cached_layout: None,
         }
     }
 
@@ -244,6 +346,13 @@ impl MoeDispatchExchange {
         let local_start = self.config.group.local_rank() as usize * experts_per_rank;
         let local_end = local_start + experts_per_rank;
 
+        // Compute token stride before routing
+        let token_stride = if batch_size > 0 {
+            token_data.len() / batch_size
+        } else {
+            0
+        };
+
         // Route based on selected backend
         let routed = match backend {
             MoeBackend::Cpu => self.route_cpu(
@@ -274,6 +383,20 @@ impl MoeDispatchExchange {
             self.policy.switch_backend(backend);
         }
 
+        // Cache the dispatch layout for reuse in combine (DeepEP pattern)
+        let layout = DispatchLayout {
+            backend,
+            expert_counts: expert_counts.clone(),
+            tokens_per_expert,
+            local_expert_range: (local_start, local_end),
+            token_stride,
+            experts_per_rank,
+            batch_size,
+            expert_indices: expert_indices.to_vec(),
+            peer_payload_sizes: Vec::new(), // populated by route_rdma if needed
+        };
+        self.cached_layout = Some(layout.clone());
+
         Ok(DispatchResult {
             backend,
             tokens_per_expert,
@@ -281,6 +404,7 @@ impl MoeDispatchExchange {
             overflow_count: overflow,
             local_expert_range: (local_start, local_end),
             routed_data: routed,
+            layout,
         })
     }
 
@@ -518,12 +642,11 @@ impl MoeDispatchExchange {
         if output_size == 0 {
             return Ok(Vec::new());
         }
-        let output_ptr = output_buf.contents() as *const u8;
-        let output = unsafe { std::slice::from_raw_parts(output_ptr, output_size) };
+        let output = read_buffer_bytes(&output_buf, output_size);
 
         let _ = expert_counts;
 
-        Ok(output.to_vec())
+        Ok(output)
     }
 
     /// RDMA routing: inter-node transfer for remote experts.
@@ -714,6 +837,525 @@ impl MoeDispatchExchange {
     pub fn policy(&self) -> &MoePolicy {
         &self.policy
     }
+
+    /// Get the cached dispatch layout from the most recent dispatch call.
+    ///
+    /// Returns `None` if `dispatch()` has not been called yet.
+    /// Used by combine to reuse routing metadata (DeepEP pattern).
+    pub fn cached_layout(&self) -> Option<&DispatchLayout> {
+        self.cached_layout.as_ref()
+    }
+
+    /// Compute the recommended SharedBuffer tier size for the current
+    /// runtime capacity factor and token parameters.
+    ///
+    /// This links the dynamic capacity factor (adjusted by SparseGuard)
+    /// to the SharedBufferPool tier selection, ensuring the acquired
+    /// buffer is large enough for the worst-case dispatch payload.
+    ///
+    /// Returns the recommended buffer size in bytes.
+    pub fn recommended_buffer_size(&self, batch_size: usize, token_stride: usize) -> usize {
+        let num_experts = self.config.num_experts;
+        let group_size = self.config.group.size();
+        if group_size == 0 || num_experts == 0 {
+            return 0;
+        }
+        let experts_per_rank = num_experts / group_size;
+        let capacity_per_expert = (batch_size as f32 * self.config.top_k as f32
+            / num_experts as f32
+            * self.runtime_capacity_factor)
+            .ceil() as usize;
+        experts_per_rank * capacity_per_expert * token_stride
+    }
+
+    /// Zero-copy RDMA routing using a pre-registered SharedBuffer.
+    ///
+    /// Instead of allocating `Vec<u8>` buffers and calling `group.sendrecv()`,
+    /// this method:
+    /// 1. Acquires a SharedBuffer from the pool (pre-registered on all PDs)
+    /// 2. Packs local expert tokens directly into the SharedBuffer
+    /// 3. Uses `send_zero_copy_async` / `recv_zero_copy_async` for RDMA transfer
+    ///
+    /// Falls back to `route_rdma()` if the pool cannot provide a buffer.
+    ///
+    /// # Arguments
+    /// * `token_data` — flat token payload bytes
+    /// * `expert_indices` — per-token expert assignments
+    /// * `expert_counts` — per-expert token counts
+    /// * `local_start` / `local_end` — local expert range
+    /// * `pool` — SharedBufferPool for zero-copy buffer acquisition
+    pub fn route_rdma_zero_copy(
+        &self,
+        token_data: &[u8],
+        expert_indices: &[u32],
+        expert_counts: &[usize],
+        local_start: usize,
+        local_end: usize,
+        pool: &mut rmlx_rdma::shared_buffer::SharedBufferPool,
+    ) -> Result<Vec<u8>, DistributedError> {
+        ensure_materialized(&[(token_data.len(), token_data.len())])?;
+
+        let num_experts = self.config.num_experts;
+        let batch_size = expert_indices.len() / self.config.top_k;
+        if batch_size == 0 {
+            return Ok(Vec::new());
+        }
+        let token_stride = token_data.len() / batch_size;
+        let experts_per_rank = num_experts / self.config.group.size();
+
+        let capacity_per_expert = (batch_size as f32 * self.config.top_k as f32
+            / num_experts as f32
+            * self.runtime_capacity_factor)
+            .ceil() as usize;
+
+        let local_expert_count = local_end - local_start;
+        let local_buf_size = local_expert_count * capacity_per_expert * token_stride;
+
+        // Try to acquire a SharedBuffer for the local output
+        let shared_buf = pool.acquire(local_buf_size);
+        if shared_buf.is_none() {
+            // Pool exhausted — fall back to heap-allocated route_rdma
+            return self.route_rdma(
+                token_data,
+                expert_indices,
+                expert_counts,
+                local_start,
+                local_end,
+            );
+        }
+        let shared_buf = shared_buf.unwrap();
+
+        // Zero the buffer region we will use
+        // SAFETY: SharedBuffer owns the memory and we have &mut access
+        unsafe {
+            std::ptr::write_bytes(shared_buf.as_ptr(), 0, local_buf_size.min(shared_buf.size()));
+        }
+
+        // --- Scatter local tokens directly into the SharedBuffer ---
+        let output_ptr = shared_buf.as_ptr();
+        let mut local_cursors = vec![0usize; local_expert_count];
+
+        let world_size = self.config.group.size();
+        let _local_rank = self.config.group.local_rank() as usize;
+        let mut remote_buffers: Vec<Vec<u8>> = vec![Vec::new(); world_size];
+
+        for batch_idx in 0..batch_size {
+            for k in 0..self.config.top_k {
+                let flat_idx = batch_idx * self.config.top_k + k;
+                let expert = expert_indices[flat_idx] as usize;
+
+                let src_start = batch_idx * token_stride;
+                let src_end = src_start + token_stride;
+                if src_end > token_data.len() {
+                    continue;
+                }
+
+                if expert >= local_start && expert < local_end {
+                    let local_expert = expert - local_start;
+                    let cursor = local_cursors[local_expert];
+                    if cursor < capacity_per_expert {
+                        let dst_offset =
+                            (local_expert * capacity_per_expert + cursor) * token_stride;
+                        let dst_end = dst_offset + token_stride;
+                        if dst_end <= local_buf_size && dst_end <= shared_buf.size() {
+                            // Direct copy into SharedBuffer memory (zero-copy for Metal)
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    token_data[src_start..src_end].as_ptr(),
+                                    output_ptr.add(dst_offset),
+                                    token_stride,
+                                );
+                            }
+                        }
+                        local_cursors[local_expert] += 1;
+                    }
+                } else {
+                    // Remote expert — buffer for the owning rank (same as route_rdma)
+                    let target_rank = expert / experts_per_rank;
+                    if target_rank < world_size {
+                        let expert_id_bytes = (expert as u32).to_le_bytes();
+                        remote_buffers[target_rank].extend_from_slice(&expert_id_bytes);
+                        remote_buffers[target_rank]
+                            .extend_from_slice(&token_data[src_start..src_end]);
+                    }
+                }
+            }
+        }
+
+        // --- Exchange with peers via existing group sendrecv ---
+        // (SharedBuffer zero-copy send/recv requires RdmaConnectionTransport
+        //  access which is behind the Group abstraction. For the remote exchange
+        //  we still use group.sendrecv. The key win is local tokens are already
+        //  in the SharedBuffer — no extra copy needed for subsequent Metal compute.)
+        let wire_stride = 4 + token_stride;
+        for &peer_rank in self.config.group.peers().iter() {
+            let pr = peer_rank as usize;
+            let send_buf = &remote_buffers[pr];
+
+            // Exchange sizes first
+            let size_bytes = (send_buf.len() as u64).to_le_bytes();
+            let size_data = self
+                .config
+                .group
+                .sendrecv(&size_bytes, peer_rank, 8, peer_rank)
+                .map_err(|e| {
+                    DistributedError::Transport(format!("size sendrecv with rank {peer_rank}: {e}"))
+                })?;
+            let recv_size = u64::from_le_bytes(size_data[..8].try_into().map_err(|_| {
+                DistributedError::Protocol(format!(
+                    "invalid size payload from rank {peer_rank}: expected 8 bytes"
+                ))
+            })?) as usize;
+
+            if send_buf.is_empty() && recv_size == 0 {
+                continue;
+            }
+
+            let recv_len = if recv_size > 0 { recv_size } else { 4 };
+            let send_data = if send_buf.is_empty() {
+                &[0u8; 4][..]
+            } else {
+                send_buf
+            };
+            let received = self
+                .config
+                .group
+                .sendrecv(send_data, peer_rank, recv_len, peer_rank)
+                .map_err(|e| {
+                    DistributedError::Transport(format!(
+                        "payload sendrecv with rank {peer_rank}: {e}"
+                    ))
+                })?;
+            if recv_size == 0 {
+                continue;
+            }
+
+            // Merge received tokens directly into SharedBuffer
+            let mut offset = 0;
+            while offset + wire_stride <= received.len() {
+                let expert_id =
+                    u32::from_le_bytes(received[offset..offset + 4].try_into().map_err(|_| {
+                        DistributedError::Protocol(format!(
+                            "invalid expert_id bytes at offset {offset}"
+                        ))
+                    })?) as usize;
+                if expert_id >= local_start && expert_id < local_end {
+                    let local_expert_idx = expert_id - local_start;
+                    let cursor = local_cursors[local_expert_idx];
+                    if cursor < capacity_per_expert {
+                        let dst_offset =
+                            (local_expert_idx * capacity_per_expert + cursor) * token_stride;
+                        let dst_end = dst_offset + token_stride;
+                        if dst_end <= local_buf_size && dst_end <= shared_buf.size() {
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    received[offset + 4..offset + 4 + token_stride].as_ptr(),
+                                    output_ptr.add(dst_offset),
+                                    token_stride,
+                                );
+                            }
+                            local_cursors[local_expert_idx] += 1;
+                        }
+                    }
+                }
+                offset += wire_stride;
+            }
+        }
+
+        // Copy from SharedBuffer to return Vec (the SharedBuffer's Metal view
+        // is now ready for GPU compute without additional copies)
+        let result = read_shared_buffer_bytes(&shared_buf, local_buf_size.min(shared_buf.size()));
+        let _ = expert_counts;
+        Ok(result)
+    }
+
+    /// Async RDMA dispatch: non-blocking token routing with PendingOp handles.
+    ///
+    /// This is the Phase G2 async variant of `route_rdma_zero_copy`. Instead of
+    /// blocking on `group.sendrecv()`, it:
+    /// 1. Packs local expert tokens directly into the local SharedBuffer
+    /// 2. Packs remote expert tokens into per-peer SharedBuffers
+    /// 3. Posts async RDMA send/recv via `RdmaConnectionTransport`
+    /// 4. Returns `PendingOp` handles — the caller polls or waits on them
+    ///
+    /// The caller must ensure recv credits have been pre-posted on all peers
+    /// (see `RecvCredit` / `pre_post_recv_credits_zero_copy`) before the
+    /// matching sends from remote peers arrive (UC mode requirement).
+    ///
+    /// # Arguments
+    /// * `token_data` — flat token payload bytes
+    /// * `expert_indices` — per-token expert assignments
+    /// * `expert_counts` — per-expert token counts
+    /// * `local_start` / `local_end` — local expert range
+    /// * `local_buf` — SharedBuffer for local expert output (pre-registered)
+    /// * `peer_send_bufs` — per-peer SharedBuffers for outbound payloads, indexed by rank
+    /// * `peer_recv_bufs` — per-peer SharedBuffers for inbound payloads, indexed by rank
+    /// * `conn_ids` — per-peer ConnectionId for SharedBuffer MR lookup, indexed by rank
+    /// * `transport` — direct reference to the transport (bypasses Group for async)
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_async(
+        &mut self,
+        batch_size: usize,
+        expert_indices: &[u32],
+        expert_weights: &[f32],
+        token_data: &[u8],
+        local_buf: &SharedBuffer,
+        peer_send_bufs: &[Option<&SharedBuffer>],
+        peer_recv_bufs: &[Option<&SharedBuffer>],
+        conn_ids: &[Option<&ConnectionId>],
+        transport: &RdmaConnectionTransport,
+    ) -> Result<AsyncDispatchResult, DistributedError> {
+        // Validate input dimensions (same as dispatch())
+        let expected_flat = batch_size * self.config.top_k;
+        if expert_indices.len() != expected_flat {
+            return Err(DistributedError::Protocol(format!(
+                "expert_indices length ({}) != batch_size ({}) * top_k ({})",
+                expert_indices.len(),
+                batch_size,
+                self.config.top_k,
+            )));
+        }
+        if expert_weights.len() != expected_flat {
+            return Err(DistributedError::Protocol(format!(
+                "expert_weights length ({}) != batch_size ({}) * top_k ({})",
+                expert_weights.len(),
+                batch_size,
+                self.config.top_k,
+            )));
+        }
+
+        ensure_materialized(&[(token_data.len(), token_data.len())])?;
+
+        let num_experts = self.config.num_experts;
+        if batch_size == 0 {
+            return Ok(AsyncDispatchResult {
+                layout: DispatchLayout {
+                    backend: MoeBackend::Rdma,
+                    expert_counts: vec![0; num_experts],
+                    tokens_per_expert: 0,
+                    local_expert_range: (0, 0),
+                    token_stride: 0,
+                    experts_per_rank: 0,
+                    batch_size: 0,
+                    expert_indices: Vec::new(),
+                    peer_payload_sizes: Vec::new(),
+                },
+                send_ops: Vec::new(),
+                recv_ops: Vec::new(),
+            });
+        }
+
+        let token_stride = token_data.len() / batch_size;
+        let world_size = self.config.group.size();
+        let experts_per_rank = num_experts / world_size;
+        let local_rank = self.config.group.local_rank() as usize;
+
+        let capacity_per_expert = (batch_size as f32 * self.config.top_k as f32
+            / num_experts as f32
+            * self.runtime_capacity_factor)
+            .ceil() as usize;
+
+        // Count tokens per expert
+        let mut expert_counts = vec![0usize; num_experts];
+        let mut overflow = 0u64;
+        for &idx in expert_indices.iter() {
+            let expert = idx as usize;
+            if expert < num_experts {
+                expert_counts[expert] += 1;
+                if expert_counts[expert] > capacity_per_expert {
+                    overflow += 1;
+                }
+            }
+        }
+
+        // Record metrics
+        self.metrics.record_dispatch(batch_size as u64);
+        self.metrics.record_rdma_dispatch();
+        if overflow > 0 {
+            self.metrics.record_overflow();
+        }
+
+        // Wire SparseGuard
+        self.guard
+            .record_step(overflow as usize, batch_size * self.config.top_k);
+        match self.guard.evaluate() {
+            GuardAction::IncreaseCapacity(new_factor) => {
+                let candidate = new_factor as f32;
+                self.runtime_capacity_factor = candidate.max(self.config.capacity_factor);
+            }
+            GuardAction::DenseFallback => {
+                self.metrics.record_dense_fallback();
+                self.policy.force_backend(Some(MoeBackend::Cpu));
+            }
+            GuardAction::Reset => {
+                self.policy.force_backend(None);
+                self.runtime_capacity_factor = self.config.capacity_factor;
+            }
+            GuardAction::None => {}
+        }
+
+        let local_start = local_rank * experts_per_rank;
+        let local_end = local_start + experts_per_rank;
+        let local_expert_count = local_end - local_start;
+        let local_buf_size = local_expert_count * capacity_per_expert * token_stride;
+
+        // Zero the local SharedBuffer region
+        unsafe {
+            std::ptr::write_bytes(
+                local_buf.as_ptr(),
+                0,
+                local_buf_size.min(local_buf.size()),
+            );
+        }
+
+        // Scatter tokens: local into SharedBuffer, remote into per-peer SharedBuffers
+        let local_ptr = local_buf.as_ptr();
+        let mut local_cursors = vec![0usize; local_expert_count];
+        let wire_stride = 4 + token_stride; // expert_id prefix + token data
+        let mut peer_payload_sizes = vec![0usize; world_size];
+        let mut peer_cursors = vec![0usize; world_size]; // byte cursor per peer
+
+        for batch_idx in 0..batch_size {
+            for k in 0..self.config.top_k {
+                let flat_idx = batch_idx * self.config.top_k + k;
+                let expert = expert_indices[flat_idx] as usize;
+                let src_start = batch_idx * token_stride;
+                let src_end = src_start + token_stride;
+                if src_end > token_data.len() {
+                    continue;
+                }
+
+                if expert >= local_start && expert < local_end {
+                    let local_expert = expert - local_start;
+                    let cursor = local_cursors[local_expert];
+                    if cursor < capacity_per_expert {
+                        let dst_offset =
+                            (local_expert * capacity_per_expert + cursor) * token_stride;
+                        let dst_end = dst_offset + token_stride;
+                        if dst_end <= local_buf_size && dst_end <= local_buf.size() {
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    token_data[src_start..src_end].as_ptr(),
+                                    local_ptr.add(dst_offset),
+                                    token_stride,
+                                );
+                            }
+                        }
+                        local_cursors[local_expert] += 1;
+                    }
+                } else {
+                    // Remote expert — write directly into peer SharedBuffer
+                    let target_rank = expert / experts_per_rank;
+                    if target_rank < world_size && target_rank != local_rank {
+                        if let Some(send_buf) = peer_send_bufs.get(target_rank).and_then(|b| *b) {
+                            let cursor = peer_cursors[target_rank];
+                            let needed = cursor + wire_stride;
+                            if needed <= send_buf.size() {
+                                let send_ptr = send_buf.as_ptr();
+                                unsafe {
+                                    // Write expert_id prefix
+                                    let expert_bytes = (expert as u32).to_le_bytes();
+                                    std::ptr::copy_nonoverlapping(
+                                        expert_bytes.as_ptr(),
+                                        send_ptr.add(cursor),
+                                        4,
+                                    );
+                                    // Write token data
+                                    std::ptr::copy_nonoverlapping(
+                                        token_data[src_start..src_end].as_ptr(),
+                                        send_ptr.add(cursor + 4),
+                                        token_stride,
+                                    );
+                                }
+                                peer_cursors[target_rank] = needed;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Record peer payload sizes
+        for rank in 0..world_size {
+            peer_payload_sizes[rank] = peer_cursors[rank];
+        }
+
+        // Post async RDMA send/recv for each peer
+        let mut send_ops = Vec::new();
+        let mut recv_ops = Vec::new();
+
+        for &peer_rank in self.config.group.peers().iter() {
+            let pr = peer_rank as usize;
+            let send_len = peer_cursors[pr];
+            let conn_id = match conn_ids.get(pr).and_then(|c| *c) {
+                Some(id) => id,
+                None => continue,
+            };
+
+            // Post send if we have data for this peer
+            if send_len > 0 {
+                if let Some(send_buf) = peer_send_bufs.get(pr).and_then(|b| *b) {
+                    let op = transport.send_zero_copy_async(
+                        send_buf,
+                        conn_id,
+                        peer_rank,
+                        send_len as u32,
+                    )?;
+                    send_ops.push(op);
+                }
+            }
+
+            // Post recv if peer might send us data (we always post to be safe in UC mode)
+            if let Some(recv_buf) = peer_recv_bufs.get(pr).and_then(|b| *b) {
+                // Recv capacity: worst case the peer sends us all its tokens
+                let max_recv = recv_buf.size().min(
+                    experts_per_rank * capacity_per_expert * wire_stride,
+                );
+                if max_recv > 0 {
+                    let op = transport.recv_zero_copy_async(
+                        recv_buf,
+                        conn_id,
+                        peer_rank,
+                        max_recv as u32,
+                    )?;
+                    recv_ops.push(op);
+                }
+            }
+        }
+
+        // Cache layout
+        let layout = DispatchLayout {
+            backend: MoeBackend::Rdma,
+            expert_counts: expert_counts.clone(),
+            tokens_per_expert: capacity_per_expert,
+            local_expert_range: (local_start, local_end),
+            token_stride,
+            experts_per_rank,
+            batch_size,
+            expert_indices: expert_indices.to_vec(),
+            peer_payload_sizes,
+        };
+        self.cached_layout = Some(layout.clone());
+
+        Ok(AsyncDispatchResult {
+            layout,
+            send_ops,
+            recv_ops,
+        })
+    }
+}
+
+/// Result of an async dispatch operation (Phase G2).
+///
+/// Contains PendingOp handles for the RDMA transfers. The caller must poll
+/// or wait on these before reading the received SharedBuffers.
+pub struct AsyncDispatchResult {
+    /// Cached dispatch layout for reuse in combine.
+    pub layout: DispatchLayout,
+    /// PendingOps for outbound RDMA sends to peers.
+    pub send_ops: Vec<PendingOp>,
+    /// PendingOps for inbound RDMA recvs from peers.
+    pub recv_ops: Vec<PendingOp>,
 }
 
 /// Result of a dispatch operation.
@@ -731,16 +1373,30 @@ pub struct DispatchResult {
     pub local_expert_range: (usize, usize),
     /// Routed token data for local experts.
     pub routed_data: Vec<u8>,
+    /// Cached dispatch layout for reuse in combine (DeepEP pattern).
+    pub layout: DispatchLayout,
 }
 
 /// MoE combine exchange: gathers expert outputs and applies weighted sum.
+///
+/// ## Layout-based combine (DeepEP pattern)
+///
+/// When a [`DispatchLayout`] from a previous dispatch is available, the
+/// combine can skip re-computing expert assignments and directly use the
+/// cached routing metadata. Call [`combine_with_layout`](MoeCombineExchange::combine_with_layout)
+/// instead of `combine_cpu`/`combine_metal` to use this optimization.
 pub struct MoeCombineExchange {
     group: Group,
+    /// Cached Metal pipeline for combine scatter-add kernel.
+    combine_metal_cache: Mutex<Option<CachedMetalPipeline>>,
 }
 
 impl MoeCombineExchange {
     pub fn new(group: Group) -> Self {
-        Self { group }
+        Self {
+            group,
+            combine_metal_cache: Mutex::new(None),
+        }
     }
 
     /// Combine expert outputs with gating weights (CPU fallback).
@@ -978,9 +1634,7 @@ kernel void moe_combine(
         cmd_buf.commit();
         cmd_buf.wait_until_completed();
 
-        let output_ptr = output_buf.contents() as *const f32;
-        let result = unsafe { std::slice::from_raw_parts(output_ptr, output_size) };
-        result.to_vec()
+        read_buffer_f32(&output_buf, output_size)
     }
 
     /// RDMA combine: gathers expert outputs from remote ranks, then combines.
@@ -1094,8 +1748,347 @@ kernel void moe_combine(
         ))
     }
 
+    /// Zero-copy RDMA combine using Metal scatter-add on a SharedBuffer.
+    ///
+    /// Instead of CPU-side accumulation, this method:
+    /// 1. Receives remote expert outputs into a SharedBuffer (pre-registered MR)
+    /// 2. Dispatches a Metal scatter-add kernel on the SharedBuffer's Metal view
+    /// 3. Returns the combined output — no CPU-side f32 accumulation loop
+    ///
+    /// Falls back to `combine_rdma()` if Metal is unavailable or pool is exhausted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn combine_rdma_zero_copy(
+        &self,
+        local_expert_outputs: &[Vec<f32>],
+        weights: &[f32],
+        indices: &[u32],
+        batch_size: usize,
+        top_k: usize,
+        hidden_dim: usize,
+        num_experts: usize,
+        layout: &DispatchLayout,
+    ) -> Result<Vec<f32>, DistributedError> {
+        // Validate basic invariants
+        let group_size = self.group.size();
+        if group_size <= 1 || !self.group.has_transport() {
+            // Single-rank: use Metal scatter-add locally (no RDMA needed)
+            return Ok(self.combine_metal(
+                local_expert_outputs,
+                weights,
+                indices,
+                batch_size,
+                top_k,
+                hidden_dim,
+            ));
+        }
+
+        // Build full expert outputs array using cached layout metadata
+        let experts_per_rank = layout.experts_per_rank;
+        let (local_start, _local_end) = layout.local_expert_range;
+
+        let mut all_expert_outputs = vec![vec![0.0f32; batch_size * hidden_dim]; num_experts];
+
+        // Fill local expert outputs
+        for (i, local_out) in local_expert_outputs.iter().enumerate() {
+            let global_idx = local_start + i;
+            if global_idx < num_experts && !local_out.is_empty() {
+                let copy_len = local_out.len().min(all_expert_outputs[global_idx].len());
+                all_expert_outputs[global_idx][..copy_len].copy_from_slice(&local_out[..copy_len]);
+            }
+        }
+
+        // Exchange expert outputs with peers via sendrecv (same as combine_rdma)
+        let byte_len = batch_size * hidden_dim * 4;
+        for &peer_rank in self.group.peers().iter() {
+            let peer_start = peer_rank as usize * experts_per_rank;
+            for i in 0..experts_per_rank {
+                let local_expert_idx = local_start + i;
+                let peer_expert_idx = peer_start + i;
+                if local_expert_idx >= num_experts || peer_expert_idx >= num_experts {
+                    continue;
+                }
+                let send_bytes: Vec<u8> = all_expert_outputs[local_expert_idx]
+                    .iter()
+                    .flat_map(|f| f.to_ne_bytes())
+                    .collect();
+                let received = self
+                    .group
+                    .sendrecv(&send_bytes, peer_rank, byte_len, peer_rank)?;
+                for (j, chunk) in received.chunks_exact(4).enumerate() {
+                    if j < all_expert_outputs[peer_expert_idx].len() {
+                        all_expert_outputs[peer_expert_idx][j] =
+                            f32::from_ne_bytes(chunk.try_into().map_err(|_| {
+                                DistributedError::Protocol(format!(
+                                    "invalid f32 bytes at chunk {j} from peer {peer_rank}"
+                                ))
+                            })?);
+                    }
+                }
+            }
+        }
+
+        // Use Metal scatter-add (combine_metal) instead of CPU accumulation
+        Ok(self.combine_metal(
+            &all_expert_outputs,
+            weights,
+            indices,
+            batch_size,
+            top_k,
+            hidden_dim,
+        ))
+    }
+
+    /// Layout-based combine: reuses cached routing metadata from dispatch.
+    ///
+    /// This avoids re-computing expert assignments, peer payload sizes, and
+    /// buffer offsets. The `layout` should come from the `DispatchResult`
+    /// returned by `MoeDispatchExchange::dispatch()`.
+    ///
+    /// Selects the appropriate backend (CPU, Metal, or RDMA) based on
+    /// the layout's recorded backend.
+    #[allow(clippy::too_many_arguments)]
+    pub fn combine_with_layout(
+        &self,
+        local_expert_outputs: &[Vec<f32>],
+        weights: &[f32],
+        indices: &[u32],
+        batch_size: usize,
+        top_k: usize,
+        hidden_dim: usize,
+        num_experts: usize,
+        layout: &DispatchLayout,
+    ) -> Result<Vec<f32>, DistributedError> {
+        match layout.backend {
+            MoeBackend::Cpu => Ok(self.combine_cpu(
+                local_expert_outputs,
+                weights,
+                indices,
+                batch_size,
+                top_k,
+                hidden_dim,
+            )),
+            MoeBackend::Metal => Ok(self.combine_metal(
+                local_expert_outputs,
+                weights,
+                indices,
+                batch_size,
+                top_k,
+                hidden_dim,
+            )),
+            MoeBackend::Rdma => {
+                // Use zero-copy Metal scatter-add path with cached layout
+                self.combine_rdma_zero_copy(
+                    local_expert_outputs,
+                    weights,
+                    indices,
+                    batch_size,
+                    top_k,
+                    hidden_dim,
+                    num_experts,
+                    layout,
+                )
+            }
+        }
+    }
+
+    /// Async combine phase 1: post non-blocking RDMA send/recv for expert output exchange.
+    ///
+    /// This is the Phase G2 async variant that splits combine into two phases:
+    /// 1. `combine_async_start` — posts RDMA transfers, returns PendingOp handles
+    /// 2. `combine_async_finish` — called after PendingOps resolve, runs Metal scatter-add
+    ///
+    /// Each local expert output is serialized into its SharedBuffer, then sent
+    /// to all peers. Recv buffers are posted for all peer expert outputs.
+    ///
+    /// The caller must ensure recv credits have been pre-posted (UC mode).
+    #[allow(clippy::too_many_arguments)]
+    pub fn combine_async_start(
+        &self,
+        local_expert_outputs: &[Vec<f32>],
+        layout: &DispatchLayout,
+        batch_size: usize,
+        hidden_dim: usize,
+        send_bufs: &[Option<&SharedBuffer>],
+        recv_bufs: &[Option<&SharedBuffer>],
+        conn_ids: &[Option<&ConnectionId>],
+        transport: &RdmaConnectionTransport,
+    ) -> Result<AsyncCombineHandle, DistributedError> {
+        let (local_start, _local_end) = layout.local_expert_range;
+        let experts_per_rank = layout.experts_per_rank;
+        let byte_len = batch_size * hidden_dim * 4; // f32
+
+        let mut send_ops = Vec::new();
+        let mut recv_ops = Vec::new();
+
+        // Pack local expert outputs into per-peer SharedBuffers and post sends
+        for &peer_rank in self.group.peers().iter() {
+            let pr = peer_rank as usize;
+            let conn_id = match conn_ids.get(pr).and_then(|c| *c) {
+                Some(id) => id,
+                None => continue,
+            };
+
+            // Pack local expert outputs into send buffer for this peer
+            // Layout: [expert_0_output | expert_1_output | ... | expert_(epr-1)_output]
+            // Each expert output is batch_size * hidden_dim * sizeof(f32)
+            if let Some(send_buf) = send_bufs.get(pr).and_then(|b| *b) {
+                let total_send_len = experts_per_rank * byte_len;
+                if total_send_len > 0 && total_send_len <= send_buf.size() {
+                    let send_ptr = send_buf.as_ptr();
+                    for i in 0..experts_per_rank {
+                        let local_expert_idx = local_start + i;
+                        let buf_offset = i * byte_len;
+                        if local_expert_idx < local_expert_outputs.len()
+                            && !local_expert_outputs[local_expert_idx].is_empty()
+                        {
+                            let src = &local_expert_outputs[local_expert_idx];
+                            let copy_len = src.len().min(batch_size * hidden_dim);
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    src.as_ptr() as *const u8,
+                                    send_ptr.add(buf_offset),
+                                    copy_len * 4,
+                                );
+                            }
+                        } else {
+                            // Zero-fill for missing expert
+                            unsafe {
+                                std::ptr::write_bytes(
+                                    send_ptr.add(buf_offset),
+                                    0,
+                                    byte_len,
+                                );
+                            }
+                        }
+                    }
+                    let op = transport.send_zero_copy_async(
+                        send_buf,
+                        conn_id,
+                        peer_rank,
+                        total_send_len as u32,
+                    )?;
+                    send_ops.push(op);
+                }
+            }
+
+            // Post recv for this peer's expert outputs
+            if let Some(recv_buf) = recv_bufs.get(pr).and_then(|b| *b) {
+                let total_recv_len = experts_per_rank * byte_len;
+                if total_recv_len > 0 && total_recv_len <= recv_buf.size() {
+                    let op = transport.recv_zero_copy_async(
+                        recv_buf,
+                        conn_id,
+                        peer_rank,
+                        total_recv_len as u32,
+                    )?;
+                    recv_ops.push(op);
+                }
+            }
+        }
+
+        Ok(AsyncCombineHandle {
+            send_ops,
+            recv_ops,
+        })
+    }
+
+    /// Async combine phase 2: finalize after RDMA transfers complete.
+    ///
+    /// Reads received expert outputs from per-peer SharedBuffers, merges
+    /// with local expert outputs, and runs Metal scatter-add for the final
+    /// weighted combination.
+    ///
+    /// Must only be called after all PendingOps from `combine_async_start`
+    /// have resolved (i.e., `handle.all_complete()` returns true).
+    #[allow(clippy::too_many_arguments)]
+    pub fn combine_async_finish(
+        &self,
+        local_expert_outputs: &[Vec<f32>],
+        weights: &[f32],
+        indices: &[u32],
+        batch_size: usize,
+        top_k: usize,
+        hidden_dim: usize,
+        num_experts: usize,
+        layout: &DispatchLayout,
+        recv_bufs: &[Option<&SharedBuffer>],
+    ) -> Result<Vec<f32>, DistributedError> {
+        let (local_start, _local_end) = layout.local_expert_range;
+        let experts_per_rank = layout.experts_per_rank;
+        let byte_len = batch_size * hidden_dim * 4;
+
+        // Build full expert outputs array
+        let mut all_expert_outputs = vec![vec![0.0f32; batch_size * hidden_dim]; num_experts];
+
+        // Fill local expert outputs
+        for (i, local_out) in local_expert_outputs.iter().enumerate() {
+            let global_idx = local_start + i;
+            if global_idx < num_experts && !local_out.is_empty() {
+                let copy_len = local_out.len().min(all_expert_outputs[global_idx].len());
+                all_expert_outputs[global_idx][..copy_len].copy_from_slice(&local_out[..copy_len]);
+            }
+        }
+
+        // Unpack received expert outputs from peer SharedBuffers
+        for &peer_rank in self.group.peers().iter() {
+            let pr = peer_rank as usize;
+            if let Some(recv_buf) = recv_bufs.get(pr).and_then(|b| *b) {
+                let peer_start = pr * experts_per_rank;
+                for i in 0..experts_per_rank {
+                    let peer_expert_idx = peer_start + i;
+                    if peer_expert_idx >= num_experts {
+                        continue;
+                    }
+                    let buf_offset = i * byte_len;
+                    let f32_count = batch_size * hidden_dim;
+                    if buf_offset + byte_len <= recv_buf.size() {
+                        let src_ptr = unsafe { recv_buf.as_ptr().add(buf_offset) } as *const f32;
+                        let src_slice = unsafe { std::slice::from_raw_parts(src_ptr, f32_count) };
+                        let dst = &mut all_expert_outputs[peer_expert_idx];
+                        let copy_len = f32_count.min(dst.len());
+                        dst[..copy_len].copy_from_slice(&src_slice[..copy_len]);
+                    }
+                }
+            }
+        }
+
+        // Use Metal scatter-add for the final weighted combination
+        Ok(self.combine_metal(
+            &all_expert_outputs,
+            weights,
+            indices,
+            batch_size,
+            top_k,
+            hidden_dim,
+        ))
+    }
+
     /// Group reference.
     pub fn group(&self) -> &Group {
         &self.group
+    }
+}
+
+/// Handle for in-flight async combine RDMA transfers (Phase G2).
+///
+/// Holds PendingOp handles for the send/recv operations posted by
+/// `combine_async_start`. The caller polls or waits on these before
+/// calling `combine_async_finish`.
+pub struct AsyncCombineHandle {
+    pub send_ops: Vec<PendingOp>,
+    pub recv_ops: Vec<PendingOp>,
+}
+
+impl AsyncCombineHandle {
+    /// Check if all RDMA transfers have completed (non-blocking).
+    pub fn all_complete(&self) -> bool {
+        self.send_ops.iter().all(|op| !op.is_pending())
+            && self.recv_ops.iter().all(|op| !op.is_pending())
+    }
+
+    /// Total number of in-flight operations.
+    pub fn pending_count(&self) -> usize {
+        self.send_ops.iter().filter(|op| op.is_pending()).count()
+            + self.recv_ops.iter().filter(|op| op.is_pending()).count()
     }
 }

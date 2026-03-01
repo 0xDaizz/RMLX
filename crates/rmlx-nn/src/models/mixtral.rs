@@ -20,6 +20,7 @@ pub fn mixtral_8x7b() -> TransformerConfig {
                 num_experts_per_token: 2,
                 hidden_dim: 4096,
                 intermediate_dim: 14336,
+                capacity_factor: 1.0,
             },
         },
     }

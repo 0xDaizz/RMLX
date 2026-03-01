@@ -11,5 +11,7 @@ rdma = []
 
 [dependencies]
 rmlx-alloc = { path = "../rmlx-alloc" }
+rmlx-metal = { path = "../rmlx-metal" }
+metal = { workspace = true }
 libc = { workspace = true }
 libloading = { workspace = true }

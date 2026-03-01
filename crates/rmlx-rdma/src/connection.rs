@@ -12,7 +12,9 @@ use crate::context::{ProtectionDomain, RdmaContext};
 use crate::exchange;
 use crate::ffi::*;
 use crate::mr::MemoryRegion;
+use crate::mr_pool::{MrHandle, MrPool};
 use crate::qp::{CompletionQueue, QueuePair};
+use crate::shared_buffer::{ConnectionId, SharedBuffer};
 use crate::RdmaError;
 
 /// The kind of RDMA work request that was posted.
@@ -198,18 +200,52 @@ pub fn poll_with_timeout(cq: &CompletionQueue, timeout_ms: u64) -> Result<Vec<Ib
     }
 }
 
+/// Safe wrapper for a send-side memory registration.
+///
+/// Lifetime-tied to the source data slice: the MR cannot outlive the data
+/// it was registered from.
+pub struct RegisteredSend<'a> {
+    mr: MemoryRegion,
+    _lt: PhantomData<&'a [u8]>,
+}
+
+impl<'a> RegisteredSend<'a> {
+    /// Access the underlying `MemoryRegion`.
+    pub fn mr(&self) -> &MemoryRegion {
+        &self.mr
+    }
+}
+
+/// Safe wrapper for a recv-side memory registration.
+///
+/// Lifetime-tied to the mutable buffer: the MR cannot outlive the buffer
+/// it was registered from.
+pub struct RegisteredRecv<'a> {
+    mr: MemoryRegion,
+    _lt: PhantomData<&'a mut [u8]>,
+}
+
+impl<'a> RegisteredRecv<'a> {
+    /// Access the underlying `MemoryRegion`.
+    pub fn mr(&self) -> &MemoryRegion {
+        &self.mr
+    }
+}
+
 /// An established RDMA connection to a peer.
 ///
 /// Wraps the full RDMA stack: context, protection domain, completion queue,
 /// and queue pair. Individual components handle their own cleanup via Drop.
 pub struct RdmaConnection {
     ctx: RdmaContext,
-    _pd: ProtectionDomain,
+    pd: ProtectionDomain,
     cq: CompletionQueue,
     qp: QueuePair,
     config: RdmaConfig,
     /// Backlog of CQ completions with unexpected wr_ids, for later retrieval.
     completion_backlog: RefCell<Vec<IbvWc>>,
+    /// Pre-registered MR pool (lazily initialized via `init_mr_pool`).
+    mr_pool: Option<MrPool>,
 }
 
 impl RdmaConnection {
@@ -254,11 +290,12 @@ impl RdmaConnection {
 
         Ok(Self {
             ctx,
-            _pd: pd,
+            pd,
             cq,
             qp,
             config,
             completion_backlog: RefCell::new(Vec::new()),
+            mr_pool: None,
         })
     }
 
@@ -283,7 +320,42 @@ impl RdmaConnection {
             crate::mr::DEFAULT_MAX_MR_SIZE
         });
         // SAFETY: Caller guarantees ptr is valid for size bytes.
-        MemoryRegion::register_with_limit(&self._pd, ptr, size, max_mr_size)
+        unsafe { MemoryRegion::register_with_limit(&self.pd, ptr, size, max_mr_size) }
+    }
+
+    /// Safe MR registration for a send data slice.
+    ///
+    /// The returned `RegisteredSend` borrows `data` for lifetime `'a`,
+    /// ensuring the MR cannot outlive the data it was registered from.
+    pub fn register_send_slice<'a>(
+        &self,
+        data: &'a [u8],
+    ) -> Result<RegisteredSend<'a>, RdmaError> {
+        // SAFETY: data is a valid &[u8]; lifetime 'a outlives RegisteredSend<'a>.
+        let mr =
+            unsafe { self.register_mr(data.as_ptr() as *mut c_void, data.len())? };
+        Ok(RegisteredSend {
+            mr,
+            _lt: PhantomData,
+        })
+    }
+
+    /// Safe MR registration for a recv buffer.
+    ///
+    /// The returned `RegisteredRecv` borrows `data` for lifetime `'a`,
+    /// ensuring the MR cannot outlive the buffer it was registered from.
+    pub fn register_recv_slice<'a>(
+        &self,
+        data: &'a mut [u8],
+    ) -> Result<RegisteredRecv<'a>, RdmaError> {
+        // SAFETY: data is a valid &mut [u8]; lifetime 'a outlives RegisteredRecv<'a>.
+        let mr = unsafe {
+            self.register_mr(data.as_mut_ptr() as *mut c_void, data.len())?
+        };
+        Ok(RegisteredRecv {
+            mr,
+            _lt: PhantomData,
+        })
     }
 
     /// Post a send operation (IBV_WR_SEND).
@@ -488,7 +560,7 @@ impl RdmaConnection {
         // the duration of this function, outliving the MemoryRegion.
         let mr = unsafe {
             MemoryRegion::register(
-                &self._pd,
+                &self.pd,
                 warmup_buf.as_mut_ptr() as *mut c_void,
                 WARMUP_SIZE,
             )?
@@ -545,6 +617,68 @@ impl RdmaConnection {
     /// Device name (e.g., TB5 RDMA device identifier).
     pub fn device_name(&self) -> &str {
         self.ctx.device_name()
+    }
+
+    /// Access the protection domain.
+    pub fn pd(&self) -> &ProtectionDomain {
+        &self.pd
+    }
+
+    /// Initialize the pre-registered MR pool.
+    pub fn init_mr_pool(&mut self) -> Result<(), RdmaError> {
+        let pool = MrPool::new(&self.pd)?;
+        self.mr_pool = Some(pool);
+        Ok(())
+    }
+
+    /// Acquire a pre-registered MR from the pool.
+    ///
+    /// Returns `None` if the pool is not initialized or all slots of the
+    /// appropriate tier are in use.
+    pub fn acquire_mr(&self, size: usize) -> Option<MrHandle> {
+        self.mr_pool.as_ref()?.acquire(size)
+    }
+
+    /// Post a send using a SharedBuffer's pre-registered MR.
+    ///
+    /// Looks up the RDMA memory region registered for `conn_id` on the
+    /// given SharedBuffer and delegates to `post_send`.
+    pub fn post_send_shared<'a>(
+        &self,
+        buf: &'a SharedBuffer,
+        conn_id: &ConnectionId,
+        offset: usize,
+        length: u32,
+        wr_id: u64,
+    ) -> Result<PostedOp<'a>, RdmaError> {
+        let mr = buf.rdma_mr(conn_id).ok_or_else(|| {
+            RdmaError::InvalidArgument(format!(
+                "no MR registered for conn_id {:?} on SharedBuffer",
+                conn_id
+            ))
+        })?;
+        self.post_send(mr, offset, length, wr_id)
+    }
+
+    /// Post a recv using a SharedBuffer's pre-registered MR.
+    ///
+    /// Looks up the RDMA memory region registered for `conn_id` on the
+    /// given SharedBuffer and delegates to `post_recv`.
+    pub fn post_recv_shared<'a>(
+        &self,
+        buf: &'a SharedBuffer,
+        conn_id: &ConnectionId,
+        offset: usize,
+        length: u32,
+        wr_id: u64,
+    ) -> Result<PostedOp<'a>, RdmaError> {
+        let mr = buf.rdma_mr(conn_id).ok_or_else(|| {
+            RdmaError::InvalidArgument(format!(
+                "no MR registered for conn_id {:?} on SharedBuffer",
+                conn_id
+            ))
+        })?;
+        self.post_recv(mr, offset, length, wr_id)
     }
 }
 

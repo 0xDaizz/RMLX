@@ -7,7 +7,11 @@ license.workspace = true
 
 [dependencies]
 rmlx-core = { path = "../rmlx-core" }
+rmlx-distributed = { path = "../rmlx-distributed", optional = true }
 metal = { workspace = true }
+
+[features]
+distributed = ["rmlx-distributed"]
 
 [dev-dependencies]
 rmlx-metal = { path = "../rmlx-metal" }

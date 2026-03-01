@@ -38,5 +38,6 @@ pub unsafe fn read_buffer<T>(buffer: &MTLBuffer, count: usize) -> &[T] {
     // and count * size_of::<T>() <= buffer.length(). contents() returns a valid
     // pointer for StorageModeShared buffers on Apple Silicon UMA.
     let ptr = buffer.contents() as *const T;
-    std::slice::from_raw_parts(ptr, count)
+    // SAFETY: caller guarantees bounds and GPU completion (see fn-level doc).
+    unsafe { std::slice::from_raw_parts(ptr, count) }
 }

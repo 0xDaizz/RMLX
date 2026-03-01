@@ -1,5 +1,7 @@
 //! rmlx-metal — Metal GPU abstraction layer for RMLX
 
+#![deny(unsafe_op_in_unsafe_fn)]
+
 pub mod buffer;
 pub mod command;
 pub mod device;

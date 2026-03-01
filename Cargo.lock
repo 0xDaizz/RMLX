@@ -260,6 +260,7 @@ dependencies = [
  "rmlx-alloc",
  "rmlx-core",
  "rmlx-metal",
+ "rmlx-nn",
  "rmlx-rdma",
 ]
 
@@ -279,6 +280,7 @@ version = "0.1.0"
 dependencies = [
  "metal",
  "rmlx-core",
+ "rmlx-distributed",
  "rmlx-metal",
 ]
 
@@ -298,7 +300,9 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "libloading",
+ "metal",
  "rmlx-alloc",
+ "rmlx-metal",
 ]
 
 [[package]]

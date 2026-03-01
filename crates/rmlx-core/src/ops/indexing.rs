@@ -67,7 +67,7 @@ pub fn gather(
             indices.dtype()
         )));
     }
-    let idx_vec: Vec<u32> = unsafe { indices.to_vec() };
+    let idx_vec: Vec<u32> = indices.to_vec_checked();
     for (i, &idx) in idx_vec.iter().enumerate() {
         if idx >= src_size {
             return Err(KernelError::InvalidShape(format!(
