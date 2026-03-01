@@ -4,7 +4,7 @@
 
 `rmlx-nn` is a crate that implements neural network layers for LLM inference. It builds core Transformer architecture components (Linear, Embedding, Attention, TransformerBlock, MoE) on top of `rmlx-core` compute kernels, and includes built-in model configurations for LLaMA, Qwen, DeepSeek-V3, and Mixtral.
 
-> **Status:** Linear, Embedding, Attention, TransformerBlock, MoE, and 4 model configurations (LLaMA 7B/3-8B, Qwen2 7B, DeepSeek-V3, Mixtral 8x7B) are implemented.
+> **Status:** Linear, Embedding, Attention (with KV cache), TransformerBlock, MoE, Parallel (TP), and 4 model configurations (LLaMA 7B/3-8B, Qwen2 7B, DeepSeek-V3, Mixtral 8x7B) are implemented.
 
 ---
 
@@ -12,12 +12,13 @@
 
 ```
 rmlx-nn/src/
-├── lib.rs           # Module declarations
+├── lib.rs           # Module declarations + re-exports
 ├── linear.rs        # Linear (FC) layer
 ├── embedding.rs     # Token embedding
-├── attention.rs     # Multi-Head / GQA Attention
+├── attention.rs     # Multi-Head / GQA Attention + KV cache
 ├── transformer.rs   # Transformer block + model
 ├── moe.rs           # Mixture of Experts layer
+├── parallel.rs      # Tensor-parallel layers (feature = "distributed")
 └── models/
     ├── mod.rs        # Model module declarations
     ├── llama.rs      # LLaMA 7B, LLaMA 3 8B
@@ -78,7 +79,7 @@ pub struct Embedding {
 
 ## attention.rs — Multi-Head Attention
 
-Multi-Head / Grouped Query Attention with KV cache support.
+Multi-Head / Grouped Query Attention with KV cache support for incremental decoding.
 
 ```rust
 pub struct AttentionConfig {
@@ -97,17 +98,37 @@ pub struct Attention {
 | Method | Description |
 |--------|-------------|
 | `Attention::new(config)` | Creates from config |
+| `forward(x, cache)` | Forward pass; `cache: Option<&mut LayerKvCache>` |
 | `num_heads()` | Number of Q heads |
 | `num_kv_heads()` | Number of KV heads |
 | `head_dim()` | Head dimension |
 | `hidden_size()` | `num_heads * head_dim` |
 | `is_gqa()` | Whether GQA is used (`num_kv_heads < num_heads`) |
 
+When `cache` is `Some`, new K/V tensors are appended to the cache and the full cached K/V is used for attention computation. When `cache` is `None`, behavior is unchanged (backward compatible).
+
 | Attention variant | Condition | Representative model |
 |-------------------|-----------|---------------------|
 | MHA | `num_kv_heads == num_heads` | LLaMA 7B |
 | GQA | `num_kv_heads < num_heads` | LLaMA 3, Qwen2, Mixtral |
 | MLA | `num_kv_heads == 1` | DeepSeek-V3 |
+
+### LayerKvCache
+
+Per-layer KV cache for incremental decoding. Stores cached K/V per KV head so that previously computed key-value pairs are reused across decoding steps.
+
+```rust
+pub struct LayerKvCache {
+    pub keys: Vec<Array>,      // per kv_head cached K: [cached_seq, head_dim]
+    pub values: Vec<Array>,    // per kv_head cached V: [cached_seq, head_dim]
+    pub seq_len: usize,
+}
+```
+
+| Method | Description |
+|--------|-------------|
+| `LayerKvCache::new(num_kv_heads)` | Creates an empty cache for `num_kv_heads` heads |
+| `append(new_keys, new_values, new_tokens)` | Appends new K/V and advances `seq_len` by `new_tokens` |
 
 ---
 
@@ -151,6 +172,7 @@ pub struct TransformerBlock {
 | Method | Description |
 |--------|-------------|
 | `TransformerBlock::new(layer_idx, config)` | Creates with layer index and config |
+| `forward(x, cache)` | Forward pass; `cache: Option<&mut LayerKvCache>` — passed through to `Attention` |
 | `layer_idx()` | Layer index |
 | `hidden_size()` | Hidden dimension |
 
@@ -166,6 +188,7 @@ pub struct TransformerModel {
 | Method | Description |
 |--------|-------------|
 | `TransformerModel::new(config)` | Creates a model |
+| `forward(x, cache)` | Forward pass; `cache: Option<&mut Vec<LayerKvCache>>` (per-layer cache vector, length validated against `num_layers`) |
 | `num_layers()` | Number of layers |
 | `config()` | Config reference |
 
@@ -191,9 +214,22 @@ pub struct MoeLayer {
 | Method | Description |
 |--------|-------------|
 | `MoeLayer::new(config)` | Creates from config |
+| `forward(x, metrics)` | Forward pass; records per-expert routing into `metrics` |
 | `num_experts()` | Number of experts |
 | `top_k()` | Number of active experts per token |
 | `hidden_dim()` | Hidden dimension |
+
+### MoeForwardMetrics
+
+Metrics collected during MoE forward passes, including per-expert token routing counts.
+
+| Field / Method | Description |
+|----------------|-------------|
+| `expert_tokens: Vec<AtomicU64>` | Per-expert routed token counter |
+| `num_experts: usize` | Number of experts tracked |
+| `MoeForwardMetrics::with_experts(num_experts)` | Creates metrics pre-allocated for `num_experts` |
+| `record_expert_token(expert_idx)` | Atomically increments the counter for `expert_idx` |
+| `expert_tokens_snapshot() -> Vec<u64>` | Returns a point-in-time snapshot of all expert token counts |
 
 ---
 
@@ -245,10 +281,11 @@ Provides 4 LLM model configurations as `TransformerConfig`.
 graph BT
     subgraph "rmlx-nn"
         TB[TransformerBlock]
-        ATT[Attention]
+        ATT[Attention + LayerKvCache]
         MOE[MoE Layer]
         EMB[Embedding]
         LIN[Linear]
+        PAR["parallel.rs (ColumnParallel / RowParallel)"]
     end
 
     subgraph "rmlx-nn/models"
@@ -273,6 +310,7 @@ graph BT
     MOE --> MATMUL
     LIN --> MATMUL
     LIN --> GEMV
+    PAR --> LIN
     TB --> RMSNORM
     EMB --> MATMUL
 
@@ -286,9 +324,35 @@ graph BT
 
 ---
 
+## Re-exports (lib.rs)
+
+```rust
+pub use attention::LayerKvCache;
+pub use transformer::FeedForward;
+```
+
+---
+
+## parallel.rs — Tensor-Parallel Layers
+
+> Conditionally compiled with the `"distributed"` feature.
+
+Megatron-LM style tensor-parallel linear layers for distributed inference.
+
+| Struct | Description |
+|--------|-------------|
+| `ColumnParallelLinear` | Splits the output dimension across TP ranks (each rank holds a column shard) |
+| `RowParallelLinear` | Splits the input dimension across TP ranks (each rank holds a row shard) |
+
+---
+
 ## Dependencies
 
 ```toml
 [dependencies]
 rmlx-core = { path = "../rmlx-core" }
+
+[dependencies.rmlx-distributed]
+path = "../rmlx-distributed"
+optional = true   # enables "distributed" feature → parallel.rs
 ```

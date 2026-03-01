@@ -2,7 +2,7 @@
 
 > **A Rust-based Metal GPU inference engine optimized for Apple Silicon**
 >
-> Status: All Phases complete (123 tests, 0 failures) | License: MIT OR Apache-2.0 | Rust 1.80+ | macOS (Apple Silicon)
+> Status: All Phases complete (339 tests, 0 failures) | License: MIT OR Apache-2.0 | Rust 1.80+ | macOS (Apple Silicon)
 
 ---
 

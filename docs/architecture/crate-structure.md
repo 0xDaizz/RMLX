@@ -110,6 +110,7 @@ rmlx/
 │           ├── attention.rs      # Multi-head/GQA attention
 │           ├── transformer.rs    # Transformer block
 │           ├── moe.rs            # MoE gate + expert routing
+│           ├── parallel.rs       # Megatron-LM TP (Column/RowParallel)
 │           └── models/
 │               ├── mod.rs
 │               ├── llama.rs      # LLaMA architecture
@@ -170,7 +171,7 @@ rmlx/
 | **Purpose** | Provides a safe Rust abstraction over the Apple Metal API. Wraps MTLDevice, MTLCommandQueue, MTLBuffer, MTLSharedEvent, and more, built on `metal-rs` 0.31. |
 | **Key modules** | `device.rs` (device + architecture detection), `queue.rs` (dual queue management), `command.rs` (CommandBuffer/Encoder), `event.rs` (MTLSharedEvent wrapper), `pipeline.rs` (PSO cache), `self_check.rs` (startup diagnostics) |
 | **Dependencies** | metal-rs 0.31, objc2, block2 |
-| **Status** | Complete — GpuDevice, StreamManager, DeviceStream, GpuEvent, SharedEvent sync, dual queue pipeline, startup diagnostics fully implemented |
+| **Status** | Complete — GpuDevice, StreamManager, DeviceStream, GpuEvent, SharedEvent sync, dual queue pipeline, startup diagnostics, top-level re-exports (GpuDevice, GpuEvent) fully implemented |
 
 ---
 
@@ -201,7 +202,7 @@ rmlx/
 | Item | Details |
 |------|---------|
 | **Purpose** | The core engine that integrates the computation graph, Op registry, and kernel dispatch. Defines the N-dim array type and dtype system, and supports eager-first execution with selective tracing compilation. |
-| **Key modules** | `dtype.rs` (f32, f16, bf16, quantized), `array.rs` (N-dim array), `ops/` (7 kernel types: matmul, softmax, etc.), `kernels/` (AOT/JIT kernel management), `graph.rs` (computation graph), `scheduler.rs` (per-stream scheduler), `vjp.rs` (VJP autodiff), `lora.rs` (LoRA fine-tuning), `logging.rs` (structured logging), `metrics.rs` (metrics collection), `precision_guard.rs` (precision guard), `shutdown.rs` (graceful shutdown) |
+| **Key modules** | `dtype.rs` (f32, f16, bf16, quantized), `array.rs` (N-dim array), `ops/` (7 kernel types: matmul, softmax, etc.), `kernels/` (AOT/JIT kernel management), `graph.rs` (computation graph), `scheduler.rs` (per-stream scheduler), `vjp.rs` (VJP autodiff), `lora.rs` (LoRA fine-tuning), `prelude.rs` (convenience re-exports), `logging.rs` (structured logging), `metrics.rs` (metrics collection), `precision_guard.rs` (precision guard), `shutdown.rs` (graceful shutdown) |
 | **Dependencies** | `rmlx-metal`, `rmlx-alloc` |
 | **Status** | Complete — Array type, 7 Metal kernel dispatches, VJP autodiff, LoRA, production hardening fully implemented |
 
@@ -223,9 +224,9 @@ rmlx/
 | Item | Details |
 |------|---------|
 | **Purpose** | Provides neural network layers for Transformer-based LLM architectures. Includes high-level modules such as Linear, Attention, and MoE, as well as model architectures for LLaMA, Qwen, DeepSeek-V3, and others. |
-| **Key modules** | `linear.rs` (quantized Linear), `attention.rs` (Multi-head/GQA), `transformer.rs` (Transformer block), `moe.rs` (gate + routing), `models/` (llama.rs, qwen.rs, deepseek.rs, mixtral.rs) |
+| **Key modules** | `linear.rs` (quantized Linear), `attention.rs` (Multi-head/GQA), `transformer.rs` (Transformer block), `moe.rs` (gate + routing), `parallel.rs` (ColumnParallel/RowParallel), `models/` (llama.rs, qwen.rs, deepseek.rs, mixtral.rs) |
 | **Dependencies** | `rmlx-core` |
-| **Status** | Complete — Transformer block, Linear/Attention/MoE layers, LLaMA/Qwen/DeepSeek-V3/Mixtral model architectures fully implemented |
+| **Status** | Complete — Transformer block, Linear/Attention/MoE layers, KV cache, parallel linear layers, LLaMA/Qwen/DeepSeek-V3/Mixtral model architectures fully implemented |
 
 ---
 

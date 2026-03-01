@@ -1,6 +1,6 @@
 # Implementation Roadmap — All Phases Complete
 
-The 7-phase implementation roadmap for the rmlx project. All phases have been completed.
+The 8-phase implementation roadmap for the rmlx project. All phases have been completed.
 
 ---
 
@@ -21,6 +21,7 @@ The 7-phase implementation roadmap for the rmlx project. All phases have been co
 | 6 | Multi-Port | Dual TB5 multi-port striping, multi-node topology | Phase 4 | Complete |
 | 7A | Production Hardening | Hardening, observability | Phase 5 | Complete |
 | 7B | VJP Autodiff | VJP autodiff + LoRA fine-tuning | Phase 7A | Complete |
+| 8 | KV Cache + API Surface | KV cache, parallel linear, API ergonomics | Phase 7B | Complete |
 
 ---
 
@@ -41,6 +42,7 @@ The 7-phase implementation roadmap for the rmlx project. All phases have been co
 | Phase 6: Dual TB5 multi-port striping + multi-node topology | 8c8b25f | + distributed tests | Complete |
 | Phase 7A: Production hardening / observability | 0fa70bb | 98 tests | Complete |
 | Phase 7B: VJP autodiff + LoRA fine-tuning | 025ed8f | 108 tests | Complete |
+| Phase 8: KV Cache + API Surface | squash merge | 339 tests | Complete |
 
 ---
 
@@ -57,6 +59,7 @@ graph LR
     P5B["Phase 5B<br/>Model Serving<br/>Complete"]
     P6["Phase 6<br/>Multi-Port<br/>Complete"]
     P7["Phase 7<br/>Production<br/>Complete"]
+    P8["Phase 8<br/>KV Cache + API<br/>Complete"]
 
     P0 --> P1
     P0 --> P2
@@ -67,6 +70,7 @@ graph LR
     P5A --> P5B
     P4 --> P6
     P5B --> P7
+    P7 --> P8
 
     style P0 fill:#22c55e,color:#fff
     style P1 fill:#22c55e,color:#fff
@@ -77,6 +81,7 @@ graph LR
     style P5B fill:#22c55e,color:#fff
     style P6 fill:#22c55e,color:#fff
     style P7 fill:#22c55e,color:#fff
+    style P8 fill:#22c55e,color:#fff
 ```
 
 ---
@@ -356,6 +361,34 @@ Build a VJP framework and LoRA fine-tuning foundation for training support.
 
 - [x] VJP gradient accuracy for basic operations (matmul, softmax)
 - [x] LoRA fine-tuning functional verification
+
+---
+
+## Phase 8: KV Cache + API Surface — Complete (squash merged to main)
+
+### Goal
+
+Add incremental decoding support via KV cache in rmlx-nn and improve API ergonomics across the framework.
+
+### Key Deliverables
+
+- `rmlx-nn`: `LayerKvCache` struct for incremental KV caching in attention
+- `rmlx-nn`: Cache-aware `forward()` in Attention, TransformerBlock, TransformerModel
+- `rmlx-nn`: Per-expert MoE routing metrics (`MoeForwardMetrics.expert_tokens`)
+- `rmlx-nn`: Megatron-LM parallel linear layers (`parallel.rs`: ColumnParallelLinear, RowParallelLinear)
+- `rmlx-distributed`: Per-expert histogram in `MoeMetrics`
+- `rmlx-metal`: Top-level re-exports (`GpuDevice`, `GpuEvent`, `Architecture`)
+- `rmlx-core`: `prelude` module (Array, DType, KernelError, KernelRegistry)
+- `rmlx-nn`: Re-exports (`LayerKvCache`, `FeedForward`)
+
+### Definition of Done (DoD)
+
+- [x] `cargo fmt --all --check` -- diff 0
+- [x] `cargo clippy --workspace -- -D warnings` -- 0 warnings
+- [x] `cargo test --workspace` -- 339 tests passing, 0 failures
+- [x] KV cache: decode step processes only the last token (O(n^2) → O(n))
+- [x] Backward compatible: cache=None preserves existing behavior
+- [x] Codex review: 0 Critical/High issues
 
 ---
 
