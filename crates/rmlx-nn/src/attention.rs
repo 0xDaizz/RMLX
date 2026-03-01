@@ -67,12 +67,10 @@ impl LayerKvCache {
         } else {
             // Concatenate along seq dimension: [old_seq, hd] + [new_seq, hd] -> [total_seq, hd]
             for (i, new_k) in new_keys.into_iter().enumerate() {
-                self.keys[i] =
-                    concat_seq_dim(registry, &self.keys[i], &new_k, queue)?;
+                self.keys[i] = concat_seq_dim(registry, &self.keys[i], &new_k, queue)?;
             }
             for (i, new_v) in new_values.into_iter().enumerate() {
-                self.values[i] =
-                    concat_seq_dim(registry, &self.values[i], &new_v, queue)?;
+                self.values[i] = concat_seq_dim(registry, &self.values[i], &new_v, queue)?;
             }
         }
         self.seq_len += new_tokens;
@@ -270,6 +268,7 @@ impl Attention {
     /// internally, relying on the caller to provide correctly positioned tables.
     ///
     /// Returns: [seq_len, hidden_size]
+    #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
         x: &Array,
@@ -389,12 +388,16 @@ impl Attention {
             Some(ref mut c) => {
                 c.append(k_heads, v_heads, seq_len, registry, queue)?;
                 // Create views into cache arrays (cheap: shares underlying Metal buffers)
-                let kf: Vec<Array> = c.keys.iter().map(|a| {
-                    a.view(a.shape().to_vec(), a.strides().to_vec(), a.offset())
-                }).collect();
-                let vf: Vec<Array> = c.values.iter().map(|a| {
-                    a.view(a.shape().to_vec(), a.strides().to_vec(), a.offset())
-                }).collect();
+                let kf: Vec<Array> = c
+                    .keys
+                    .iter()
+                    .map(|a| a.view(a.shape().to_vec(), a.strides().to_vec(), a.offset()))
+                    .collect();
+                let vf: Vec<Array> = c
+                    .values
+                    .iter()
+                    .map(|a| a.view(a.shape().to_vec(), a.strides().to_vec(), a.offset()))
+                    .collect();
                 (kf, vf, c.seq_len)
             }
             None => (k_heads, v_heads, seq_len),
@@ -403,8 +406,11 @@ impl Attention {
         // Scaled dot-product attention per query head
         // For GQA: each kv head is shared by `repeats` query heads.
         let scale = 1.0 / (head_dim as f32).sqrt();
-        let scale_arr =
-            Array::from_slice(dev, &vec![scale; seq_len * total_seq], vec![seq_len, total_seq]);
+        let scale_arr = Array::from_slice(
+            dev,
+            &vec![scale; seq_len * total_seq],
+            vec![seq_len, total_seq],
+        );
 
         let mut attn_outputs: Vec<Array> = Vec::with_capacity(num_heads);
         for (h, q_h) in q_heads.iter().enumerate() {

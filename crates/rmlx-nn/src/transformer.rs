@@ -192,6 +192,7 @@ impl TransformerBlock {
     /// `mask`: causal attention mask
     /// `cache`: optional per-layer KV cache for incremental decoding
     /// Returns: [seq_len, hidden_size]
+    #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
         x: &Array,
@@ -289,6 +290,7 @@ impl TransformerModel {
     /// `cache`: optional per-layer KV caches for incremental decoding.
     ///          Must have exactly `num_layers` entries if provided.
     /// Returns: [seq_len, vocab_size] logits
+    #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
         token_ids: &[u32],
@@ -317,7 +319,8 @@ impl TransformerModel {
             if c.len() != self.layers.len() {
                 return Err(KernelError::InvalidShape(format!(
                     "TransformerModel: cache has {} entries but model has {} layers",
-                    c.len(), self.layers.len()
+                    c.len(),
+                    self.layers.len()
                 )));
             }
         }
