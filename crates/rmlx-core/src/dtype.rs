@@ -109,6 +109,10 @@ impl HasDType for f32 {
     const DTYPE: DType = DType::Float32;
 }
 
+impl HasDType for u32 {
+    const DTYPE: DType = DType::UInt32;
+}
+
 impl fmt::Display for DType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.name())

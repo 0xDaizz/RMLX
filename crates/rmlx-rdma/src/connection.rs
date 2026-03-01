@@ -505,6 +505,7 @@ impl RdmaConnection {
                 exchange::tcp_barrier_server(
                     self.config.sync_port,
                     self.config.accept_timeout_secs,
+                    10,
                 )?;
                 self.wait_posted(&[recv_op])?;
 
@@ -514,7 +515,13 @@ impl RdmaConnection {
                 // Rank 1: send then recv
                 let recv_op = self.post_recv(&mr, 0, WARMUP_SIZE as u32, recv_wr_id)?;
                 // Barrier: wait for rank 0's recv to be posted
-                exchange::tcp_barrier_client(&self.config.peer_host, self.config.sync_port)?;
+                exchange::tcp_barrier_client(
+                    &self.config.peer_host,
+                    self.config.sync_port,
+                    10,
+                    30,
+                    100,
+                )?;
 
                 let send_op = self.post_send(&mr, 0, WARMUP_SIZE as u32, send_wr_id)?;
                 self.wait_posted(&[send_op])?;

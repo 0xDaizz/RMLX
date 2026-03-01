@@ -1,8 +1,6 @@
 //! Token embedding: lookup table for discrete tokens.
 
-use metal::MTLResourceOptions;
 use rmlx_core::array::Array;
-use rmlx_core::dtype::DType;
 use rmlx_core::kernels::{KernelError, KernelRegistry};
 
 pub struct EmbeddingConfig {
@@ -84,29 +82,22 @@ impl Embedding {
 
         // Build flat index array: for each token, generate embed_dim consecutive indices
         // index[i * embed_dim + j] = token_ids[i] * embed_dim + j
+        // Use u64 arithmetic to avoid overflow for large vocab_size * embed_dim products.
         let mut flat_indices: Vec<u32> = Vec::with_capacity(seq_len * embed_dim);
         for &tid in token_ids {
             for j in 0..embed_dim {
-                flat_indices.push(tid * embed_dim as u32 + j as u32);
+                let flat_idx = (tid as u64) * (embed_dim as u64) + (j as u64);
+                if flat_idx > u32::MAX as u64 {
+                    return Err(KernelError::InvalidShape(format!(
+                        "embedding flat index overflow: tid={tid}, embed_dim={embed_dim}"
+                    )));
+                }
+                flat_indices.push(flat_idx as u32);
             }
         }
 
-        // Create a raw Metal buffer for u32 indices (u32 doesn't impl HasDType)
-        let byte_size = (flat_indices.len() * std::mem::size_of::<u32>()) as u64;
-        let idx_buffer = dev.new_buffer_with_data(
-            flat_indices.as_ptr() as *const std::ffi::c_void,
-            byte_size,
-            MTLResourceOptions::StorageModeShared,
-        );
-        // Wrap in Array with UInt32 dtype — the gather shader reads as uint* and
-        // UInt32 correctly describes the index data type.
-        let indices_arr = Array::new(
-            idx_buffer,
-            vec![seq_len * embed_dim],
-            vec![1],
-            DType::UInt32,
-            0,
-        );
+        // Now that u32 implements HasDType, we can use Array::from_slice directly.
+        let indices_arr = Array::from_slice(dev, &flat_indices, vec![seq_len * embed_dim]);
 
         // Flatten weight to 1D for gather
         let weight_flat = weight.reshape(vec![self.config.vocab_size * embed_dim])?;

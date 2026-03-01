@@ -257,13 +257,26 @@ fn connect_with_retries(addr: &str, connect_timeout_ms: u64) -> Result<TcpStream
 ///
 /// Both ranks wait for each other:
 /// Rank 0: listen + accept + recv 1 byte + send 1 byte.
-/// Accept times out after `accept_timeout_secs`.
-pub fn tcp_barrier_server(port: u16, accept_timeout_secs: u64) -> Result<(), RdmaError> {
+/// Accept times out after `accept_timeout_secs`. Read/write operations
+/// time out after `io_timeout_secs` to prevent indefinite blocking if the
+/// peer hangs after connecting.
+pub fn tcp_barrier_server(
+    port: u16,
+    accept_timeout_secs: u64,
+    io_timeout_secs: u64,
+) -> Result<(), RdmaError> {
     let addr: SocketAddr = ([0, 0, 0, 0], port).into();
     let listener = TcpListener::bind(addr)
         .map_err(|e| RdmaError::ConnectionFailed(format!("barrier bind port {port}: {e}")))?;
 
     let mut stream = accept_with_timeout(&listener, accept_timeout_secs)?;
+
+    stream
+        .set_read_timeout(Some(Duration::from_secs(io_timeout_secs)))
+        .map_err(|e| RdmaError::ConnectionFailed(format!("barrier set_read_timeout: {e}")))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(io_timeout_secs)))
+        .map_err(|e| RdmaError::ConnectionFailed(format!("barrier set_write_timeout: {e}")))?;
 
     let mut buf = [0u8; 1];
     stream
@@ -280,24 +293,31 @@ pub fn tcp_barrier_server(port: u16, accept_timeout_secs: u64) -> Result<(), Rdm
 ///
 /// Both ranks wait for each other:
 /// Rank 1+: connect + send 1 byte + recv 1 byte.
-/// Retries connection up to 30 times with 100ms intervals.
-pub fn tcp_barrier_client(host: &str, port: u16) -> Result<(), RdmaError> {
+/// Retries connection up to `connect_retries` times with `retry_delay_ms`
+/// intervals. Read/write operations time out after `io_timeout_secs`.
+pub fn tcp_barrier_client(
+    host: &str,
+    port: u16,
+    io_timeout_secs: u64,
+    connect_retries: u32,
+    retry_delay_ms: u64,
+) -> Result<(), RdmaError> {
     let addr = format!("{host}:{port}");
 
     let mut stream = None;
-    for attempt in 0..30 {
+    for attempt in 0..connect_retries {
         match TcpStream::connect(&addr) {
             Ok(s) => {
                 stream = Some(s);
                 break;
             }
             Err(e) => {
-                if attempt == 29 {
+                if attempt + 1 == connect_retries {
                     return Err(RdmaError::ConnectionFailed(format!(
-                        "barrier connect to {addr} after 30 attempts: {e}"
+                        "barrier connect to {addr} after {connect_retries} attempts: {e}"
                     )));
                 }
-                std::thread::sleep(Duration::from_millis(100));
+                std::thread::sleep(Duration::from_millis(retry_delay_ms));
             }
         }
     }
@@ -306,6 +326,13 @@ pub fn tcp_barrier_client(host: &str, port: u16) -> Result<(), RdmaError> {
             "barrier connect to {addr}: no stream after retry loop"
         ))
     })?;
+
+    stream
+        .set_read_timeout(Some(Duration::from_secs(io_timeout_secs)))
+        .map_err(|e| RdmaError::ConnectionFailed(format!("barrier set_read_timeout: {e}")))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(io_timeout_secs)))
+        .map_err(|e| RdmaError::ConnectionFailed(format!("barrier set_write_timeout: {e}")))?;
 
     stream
         .write_all(&[1u8])

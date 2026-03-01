@@ -8,13 +8,18 @@ pub const INDEXING_SHADER_SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
-// Gather: output[i] = src[indices[i]]
+// Gather: output[i] = src[indices[i]] with bounds check
 kernel void gather_f32(
     device const float* src [[buffer(0)]],
     device const uint* indices [[buffer(1)]],
     device float* output [[buffer(2)]],
+    device const uint& src_size [[buffer(3)]],
     uint id [[thread_position_in_grid]])
 {
+    if (indices[id] >= src_size) {
+        output[id] = 0.0;
+        return;
+    }
     output[id] = src[indices[id]];
 }
 
@@ -34,6 +39,9 @@ pub fn register(registry: &KernelRegistry) -> Result<(), KernelError> {
 }
 
 /// Gather elements from src at given indices.
+///
+/// Includes host-side pre-validation and GPU-side bounds checking.
+/// Out-of-bounds indices produce 0.0 on the GPU side as a safety net.
 pub fn gather(
     registry: &KernelRegistry,
     src: &Array,
@@ -50,9 +58,35 @@ pub fn gather(
         }
     };
 
+    let src_size = src.numel() as u32;
+
+    // Host-side pre-validation: read indices and check bounds
+    if indices.dtype() != DType::UInt32 {
+        return Err(KernelError::InvalidShape(format!(
+            "gather: indices must be UInt32, got {:?}",
+            indices.dtype()
+        )));
+    }
+    let idx_vec: Vec<u32> = unsafe { indices.to_vec() };
+    for (i, &idx) in idx_vec.iter().enumerate() {
+        if idx >= src_size {
+            return Err(KernelError::InvalidShape(format!(
+                "gather: index[{i}] = {idx} out of bounds for src of size {src_size}"
+            )));
+        }
+    }
+
     let pipeline = registry.get_pipeline(kernel_name, src.dtype())?;
     let numel = indices.numel();
     let out = Array::zeros(registry.device().raw(), indices.shape(), src.dtype());
+
+    // Pass src_size as a Metal buffer for GPU-side bounds check
+    let dev = registry.device().raw();
+    let src_size_buf = dev.new_buffer_with_data(
+        &src_size as *const u32 as *const std::ffi::c_void,
+        4,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
 
     let cb = queue.new_command_buffer();
     let enc = cb.new_compute_command_encoder();
@@ -60,6 +94,7 @@ pub fn gather(
     enc.set_buffer(0, Some(src.metal_buffer()), src.offset() as u64);
     enc.set_buffer(1, Some(indices.metal_buffer()), indices.offset() as u64);
     enc.set_buffer(2, Some(out.metal_buffer()), 0);
+    enc.set_buffer(3, Some(&src_size_buf), 0);
 
     let grid = metal::MTLSize::new(numel as u64, 1, 1);
     let tg = metal::MTLSize::new(
