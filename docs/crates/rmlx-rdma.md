@@ -1,14 +1,14 @@
-# rmlx-rdma — RDMA 통신 계층
+# rmlx-rdma — RDMA Communication Layer
 
-## 개요
+## Overview
 
-`rmlx-rdma`는 Thunderbolt 5 RDMA (ibverbs) 기반 노드 간 통신 계층입니다. Apple Silicon Mac 간에 TB5 인터페이스를 통해 고속 데이터 전송을 수행합니다. `librdma.dylib`를 `dlopen`으로 동적 로딩하여 macOS TB5 RDMA 드라이버와 연동하며, UC (Unreliable Connected) 모드의 QP를 사용합니다.
+`rmlx-rdma` is the inter-node communication layer based on Thunderbolt 5 RDMA (ibverbs). It performs high-speed data transfer between Apple Silicon Macs via the TB5 interface. It dynamically loads `librdma.dylib` via `dlopen` to interface with the macOS TB5 RDMA driver and uses UC (Unreliable Connected) mode QPs.
 
-> **상태:** Phase 1 구현 완료. FFI 바인딩, 컨텍스트/PD/CQ 관리, UC QP 생명주기, MR 등록, TCP 기반 QP 교환, 연결 관리, warmup 프로토콜, 듀얼 포트 스트라이핑, 전송 메트릭 모두 구현되었습니다.
+> **Status:** Phase 1 implementation complete. FFI bindings, context/PD/CQ management, UC QP lifecycle, MR registration, TCP-based QP exchange, connection management, warmup protocol, dual port striping, and transfer metrics are all implemented.
 
 ---
 
-## 모듈 구조
+## Module Structure
 
 ```mermaid
 graph TD
@@ -16,20 +16,20 @@ graph TD
     A --> C[context.rs — RdmaContext / ProtectionDomain]
     A --> D[qp.rs — QueuePair / CompletionQueue]
     A --> E[mr.rs — MemoryRegion]
-    A --> F[exchange.rs — TCP QP 교환]
+    A --> F[exchange.rs — TCP QP exchange]
     A --> G[connection.rs — RdmaConnection]
     A --> H[multi_port.rs — StripeEngine / PortFailover]
     A --> I[rdma_metrics.rs — RdmaMetrics]
 ```
 
-### `ffi.rs` — ibverbs 동적 FFI 바인딩
+### `ffi.rs` — ibverbs Dynamic FFI Bindings
 
-`libloading`을 사용하여 `librdma.dylib`를 런타임에 동적 로딩합니다. `OnceLock`으로 캐시하여 한 번만 로드합니다. `bindgen` 대신 수동으로 `repr(C)` 구조체를 정의합니다.
+Uses `libloading` to dynamically load `librdma.dylib` at runtime. Cached via `OnceLock` so it is loaded only once. Defines `repr(C)` structs manually instead of using `bindgen`.
 
 ```rust
 pub struct IbverbsLib {
     _lib: Library,
-    // 총 18개 함수 포인터
+    // 18 function pointers total
     pub get_device_list: ...,
     pub free_device_list: ...,
     pub get_device_name: ...,
@@ -52,27 +52,27 @@ pub struct IbverbsLib {
 }
 ```
 
-**주요 FFI 타입:**
+**Key FFI types:**
 
-| 타입 | 설명 |
-|------|------|
-| `IbvContext`, `IbvPd`, `IbvCq`, `IbvDevice` | 불투명(opaque) ibverbs 핸들 |
-| `IbvQp` | QP 구조체 (`qp_num` 필드 접근 가능, `_opaque` 패딩) |
-| `IbvMr` | 메모리 리전 (`lkey`, `rkey`, `addr`, `length` 접근 가능) |
-| `IbvGid` | GID union (`raw: [u8; 16]` 또는 `global: subnet_prefix + interface_id`) |
-| `IbvSendWr` / `IbvRecvWr` | 송수신 작업 요청 |
-| `IbvSge` | Scatter/Gather 엔트리 (`addr`, `length`, `lkey`) |
-| `IbvWc` | 작업 완료 (`status`, `wr_id`, `byte_len`) |
-| `IbvQpAttr` / `IbvQpInitAttr` / `IbvAhAttr` | QP 및 주소 핸들 속성 |
-| `IbvPortAttr` | 포트 속성 |
+| Type | Description |
+|------|-------------|
+| `IbvContext`, `IbvPd`, `IbvCq`, `IbvDevice` | Opaque ibverbs handles |
+| `IbvQp` | QP struct (`qp_num` field accessible, `_opaque` padding) |
+| `IbvMr` | Memory region (`lkey`, `rkey`, `addr`, `length` accessible) |
+| `IbvGid` | GID union (`raw: [u8; 16]` or `global: subnet_prefix + interface_id`) |
+| `IbvSendWr` / `IbvRecvWr` | Send/receive work requests |
+| `IbvSge` | Scatter/Gather entry (`addr`, `length`, `lkey`) |
+| `IbvWc` | Work completion (`status`, `wr_id`, `byte_len`) |
+| `IbvQpAttr` / `IbvQpInitAttr` / `IbvAhAttr` | QP and address handle attributes |
+| `IbvPortAttr` | Port attributes |
 
-**상수 모듈:** `access_flags`, `wc_status`, `wr_opcode`, `send_flags`, `qp_state`, `qp_type`, `mtu`, `qp_attr_mask`
+**Constant modules:** `access_flags`, `wc_status`, `wr_opcode`, `send_flags`, `qp_state`, `qp_type`, `mtu`, `qp_attr_mask`
 
 ---
 
 ### `context.rs` — `RdmaContext`, `ProtectionDomain`
 
-RDMA 디바이스 컨텍스트와 보호 도메인을 관리합니다. 모두 `Drop`에서 자원을 정리합니다. `Send`가 수동 구현되어 있습니다.
+Manages the RDMA device context and protection domain. Both clean up resources in `Drop`. `Send` is manually implemented.
 
 ```rust
 pub struct RdmaContext {
@@ -87,25 +87,25 @@ pub struct ProtectionDomain {
 }
 ```
 
-| 메서드 | 설명 |
-|--------|------|
-| `RdmaContext::open_default()` | 첫 번째 사용 가능한 RDMA 디바이스를 열고 컨텍스트를 반환합니다 |
-| `RdmaContext::device_name()` | 디바이스 이름을 반환합니다 |
-| `RdmaContext::alloc_pd()` | 보호 도메인을 할당합니다 |
+| Method | Description |
+|--------|-------------|
+| `RdmaContext::open_default()` | Opens the first available RDMA device and returns the context |
+| `RdmaContext::device_name()` | Returns the device name |
+| `RdmaContext::alloc_pd()` | Allocates a protection domain |
 
 ---
 
 ### `qp.rs` — `CompletionQueue`, `QueuePair`
 
-UC (Unreliable Connected) Queue Pair와 Completion Queue를 관리합니다. 모두 `Drop`에서 자원을 정리하며 `Send`가 수동 구현되어 있습니다.
+Manages UC (Unreliable Connected) Queue Pairs and Completion Queues. Both clean up resources in `Drop` with `Send` manually implemented.
 
-> **중요:** Thunderbolt 5 RDMA는 RC (Reliable Connection)를 지원하지 않으므로 UC를 사용합니다.
+> **Important:** Thunderbolt 5 RDMA does not support RC (Reliable Connection), so UC is used.
 
-**TB5 상수:**
+**TB5 constants:**
 
 ```rust
 pub const IB_PORT: u8 = 1;
-pub const GID_INDEX: c_int = 1;       // TB5에서는 GID 인덱스 1 사용 (0이 아님!)
+pub const GID_INDEX: c_int = 1;       // TB5 uses GID index 1 (not 0!)
 pub const CQ_DEPTH: c_int = 8192;
 pub const MAX_SEND_WR: u32 = 8192;
 pub const MAX_RECV_WR: u32 = 8192;
@@ -115,10 +115,10 @@ pub const MAX_RECV_SGE: u32 = 1;
 
 **CompletionQueue:**
 
-| 메서드 | 설명 |
-|--------|------|
-| `new(ctx)` | `CQ_DEPTH`(8192) 크기의 완료 큐를 생성합니다 |
-| `poll(wc)` | 완료를 폴링합니다 (반환값 0 = 아직 없음) |
+| Method | Description |
+|--------|-------------|
+| `new(ctx)` | Creates a completion queue with `CQ_DEPTH` (8192) entries |
+| `poll(wc)` | Polls for completions (returns 0 if none yet) |
 
 **QueuePair:**
 
@@ -131,16 +131,16 @@ pub struct QpInfo {
 }
 ```
 
-| 메서드 | 설명 |
-|--------|------|
-| `create_uc(pd, cq)` | UC QP를 RESET 상태로 생성합니다 (`sq_sig_all=1`) |
-| `query_local_info(ctx, rank)` | 포트 속성과 GID를 조회합니다 (PSN = `rank * 1000 + 42`) |
-| `local_info()` | TCP 교환을 위한 로컬 QP 정보를 반환합니다 |
-| `connect(remote)` | RESET → INIT → RTR → RTS 전체 상태 전이를 수행합니다 |
-| `post_send(wr)` | 전송 작업 요청을 포스팅합니다 |
-| `post_recv(wr)` | 수신 작업 요청을 포스팅합니다 |
+| Method | Description |
+|--------|-------------|
+| `create_uc(pd, cq)` | Creates a UC QP in RESET state (`sq_sig_all=1`) |
+| `query_local_info(ctx, rank)` | Queries port attributes and GID (PSN = `rank * 1000 + 42`) |
+| `local_info()` | Returns local QP info for TCP exchange |
+| `connect(remote)` | Performs the full state transition: RESET -> INIT -> RTR -> RTS |
+| `post_send(wr)` | Posts a send work request |
+| `post_recv(wr)` | Posts a receive work request |
 
-**QP 상태 전이:**
+**QP state transitions:**
 
 ```mermaid
 stateDiagram-v2
@@ -148,20 +148,20 @@ stateDiagram-v2
     RESET --> INIT: port, pkey, access flags
     INIT --> RTR: path_mtu=1024, remote QPN/PSN/GID
     RTR --> RTS: local PSN
-    RTS --> [*]: 통신 가능
+    RTS --> [*]: Ready to communicate
 ```
 
-| 속성 | RC (미지원) | UC (사용) |
-|------|------------|-----------|
-| NACK 지원 | O | X |
-| 재전송 | 자동 | 없음 |
-| 패킷 유실 | 자동 복구 | 상위 계층에서 처리 |
+| Attribute | RC (not supported) | UC (used) |
+|-----------|-------------------|-----------|
+| NACK support | Yes | No |
+| Retransmission | Automatic | None |
+| Packet loss | Auto-recovery | Handled by upper layer |
 
 ---
 
 ### `mr.rs` — `MemoryRegion`
 
-`ibv_reg_mr`을 통한 메모리 등록을 관리합니다. `LOCAL_WRITE | REMOTE_WRITE` 접근 권한으로 등록합니다. `Drop`에서 `ibv_dereg_mr`를 호출합니다.
+Manages memory registration via `ibv_reg_mr`. Registers with `LOCAL_WRITE | REMOTE_WRITE` access permissions. Calls `ibv_dereg_mr` in `Drop`.
 
 ```rust
 pub struct MemoryRegion {
@@ -170,37 +170,37 @@ pub struct MemoryRegion {
 }
 ```
 
-| 메서드 | 설명 |
-|--------|------|
-| `register(pd, ptr, size)` | 메모리 리전을 등록합니다 (`unsafe` — ptr 유효성은 호출자 책임) |
-| `lkey()` | 로컬 키를 반환합니다 |
-| `rkey()` | 원격 키를 반환합니다 (UC 모드에서는 일반적으로 0) |
-| `addr()` | 등록된 주소를 반환합니다 |
-| `length()` | 등록된 길이를 반환합니다 |
+| Method | Description |
+|--------|-------------|
+| `register(pd, ptr, size)` | Registers a memory region (`unsafe` — ptr validity is the caller's responsibility) |
+| `lkey()` | Returns the local key |
+| `rkey()` | Returns the remote key (typically 0 in UC mode) |
+| `addr()` | Returns the registered address |
+| `length()` | Returns the registered length |
 
 ---
 
-### `exchange.rs` — TCP 기반 QP 교환
+### `exchange.rs` — TCP-Based QP Exchange
 
-TCP를 통해 QP 정보를 교환하고 배리어 동기화를 수행합니다. vllm-mlx PoC의 프로토콜과 일치합니다.
+Exchanges QP information and performs barrier synchronization over TCP. Matches the protocol from the vllm-mlx PoC.
 
-**포트 상수:**
+**Port constants:**
 
 ```rust
-pub const TCP_EXCHANGE_PORT: u16 = 18515;  // QP 정보 교환용
-pub const TCP_SYNC_PORT: u16 = 18516;      // 배리어 동기화용
+pub const TCP_EXCHANGE_PORT: u16 = 18515;  // QP info exchange
+pub const TCP_SYNC_PORT: u16 = 18516;      // Barrier synchronization
 ```
 
-**와이어 포맷:** `lid(2) + qpn(4) + psn(4) + gid(16)` = 고정 26바이트, little-endian
+**Wire format:** `lid(2) + qpn(4) + psn(4) + gid(16)` = fixed 26 bytes, little-endian
 
-| 함수 | 설명 |
-|------|------|
-| `exchange_server(local, port)` | Rank 0: listen → accept → recv → send |
-| `exchange_client(local, host, port)` | Rank 1+: connect → send → recv (30회 재시도, 500ms 간격) |
-| `tcp_barrier_server(port)` | Rank 0: 1바이트 배리어 동기화 (listen → recv → send) |
-| `tcp_barrier_client(host, port)` | Rank 1+: 1바이트 배리어 동기화 (connect → send → recv, 30회 재시도, 100ms 간격) |
+| Function | Description |
+|----------|-------------|
+| `exchange_server(local, port)` | Rank 0: listen -> accept -> recv -> send |
+| `exchange_client(local, host, port)` | Rank 1+: connect -> send -> recv (30 retries, 500ms interval) |
+| `tcp_barrier_server(port)` | Rank 0: 1-byte barrier sync (listen -> recv -> send) |
+| `tcp_barrier_client(host, port)` | Rank 1+: 1-byte barrier sync (connect -> send -> recv, 30 retries, 100ms interval) |
 
-**교환 프로토콜:**
+**Exchange protocol:**
 
 ```mermaid
 sequenceDiagram
@@ -217,7 +217,7 @@ sequenceDiagram
 
 ### `connection.rs` — `RdmaConnection`
 
-RDMA 연결의 전체 생명주기를 관리하는 상위 수준 인터페이스입니다. 디바이스 오픈부터 warmup까지 원스톱으로 처리합니다.
+A high-level interface that manages the full lifecycle of an RDMA connection. Handles everything from device open to warmup as a one-stop operation.
 
 ```rust
 pub struct RdmaConfig {
@@ -237,19 +237,19 @@ pub struct RdmaConnection {
 }
 ```
 
-| 메서드 | 설명 |
-|--------|------|
-| `establish(config)` | 디바이스 오픈 → PD/CQ 할당 → UC QP 생성 → TCP 교환 → 연결 |
-| `register_mr(ptr, size)` | 메모리 리전을 등록합니다 (`unsafe`) |
-| `post_send(mr, offset, length, wr_id)` | `IBV_WR_SEND` + `SIGNALED`를 포스팅합니다 |
-| `post_recv(mr, offset, length, wr_id)` | 수신 작업을 포스팅합니다 |
-| `poll_cq(wc)` | 완료를 폴링합니다 |
-| `wait_completions(n)` | `n`개의 성공 완료를 스핀 대기합니다 (비성공 상태 시 즉시 에러) |
-| `warmup()` | 10라운드 x 4바이트 더미 메시지 교환으로 경로를 워밍업합니다 |
-| `rank()` / `world_size()` | 노드 정보를 반환합니다 |
-| `device_name()` | RDMA 디바이스 이름을 반환합니다 |
+| Method | Description |
+|--------|-------------|
+| `establish(config)` | Device open -> PD/CQ allocation -> UC QP creation -> TCP exchange -> connect |
+| `register_mr(ptr, size)` | Registers a memory region (`unsafe`) |
+| `post_send(mr, offset, length, wr_id)` | Posts `IBV_WR_SEND` + `SIGNALED` |
+| `post_recv(mr, offset, length, wr_id)` | Posts a receive work request |
+| `poll_cq(wc)` | Polls for completions |
+| `wait_completions(n)` | Spin-waits for `n` successful completions (immediate error on non-success status) |
+| `warmup()` | Warms up the path with 10 rounds x 4-byte dummy message exchanges |
+| `rank()` / `world_size()` | Returns node information |
+| `device_name()` | Returns the RDMA device name |
 
-**연결 수립 흐름:**
+**Connection establishment flow:**
 
 ```mermaid
 sequenceDiagram
@@ -269,15 +269,15 @@ sequenceDiagram
     RdmaConnection->>Remote: 10 rounds x 4B with TCP barrier sync
 ```
 
-**Warmup 프로토콜:**
-- Rank 0: post_recv → tcp_barrier_server → wait_recv → post_send → wait_send
-- Rank 1: post_recv → tcp_barrier_client → post_send → wait_send → wait_recv
+**Warmup protocol:**
+- Rank 0: post_recv -> tcp_barrier_server -> wait_recv -> post_send -> wait_send
+- Rank 1: post_recv -> tcp_barrier_client -> post_send -> wait_send -> wait_recv
 
 ---
 
 ### `rdma_metrics.rs` — `RdmaMetrics`
 
-`AtomicU64` 기반의 lock-free RDMA 전송 성능 카운터입니다. 모든 카운터는 `Ordering::Relaxed`로 접근하여 성능 오버헤드를 최소화합니다.
+`AtomicU64`-based lock-free RDMA transfer performance counters. All counters use `Ordering::Relaxed` for minimal performance overhead.
 
 ```rust
 pub struct RdmaMetrics {
@@ -292,16 +292,16 @@ pub struct RdmaMetrics {
 }
 ```
 
-| 메서드 | 설명 |
-|--------|------|
-| `new()` | 모든 카운터를 0으로 초기화합니다 |
-| `record_send(bytes)` | 성공적인 전송을 기록합니다 (count +1, bytes 누적) |
-| `record_recv(bytes)` | 성공적인 수신을 기록합니다 (count +1, bytes 누적) |
-| `record_send_error()` | 전송 에러를 기록합니다 |
-| `record_recv_error()` | 수신 에러를 기록합니다 |
-| `record_cq_poll()` | CQ 폴링을 기록합니다 |
-| `record_connection_reset()` | 연결 리셋을 기록합니다 |
-| `snapshot()` | 모든 카운터의 `RdmaMetricsSnapshot`을 반환합니다 |
+| Method | Description |
+|--------|-------------|
+| `new()` | Initializes all counters to 0 |
+| `record_send(bytes)` | Records a successful send (count +1, bytes accumulated) |
+| `record_recv(bytes)` | Records a successful receive (count +1, bytes accumulated) |
+| `record_send_error()` | Records a send error |
+| `record_recv_error()` | Records a receive error |
+| `record_cq_poll()` | Records a CQ poll |
+| `record_connection_reset()` | Records a connection reset |
+| `snapshot()` | Returns an `RdmaMetricsSnapshot` of all counters |
 
 ```rust
 #[derive(Debug, Clone)]
@@ -317,38 +317,38 @@ pub struct RdmaMetricsSnapshot {
 }
 ```
 
-> `Default` 트레이트가 구현되어 있으므로 `RdmaMetrics::default()`로도 생성할 수 있습니다.
+> The `Default` trait is implemented, so `RdmaMetrics::default()` can also be used for creation.
 
 ---
 
-### `multi_port.rs` — 듀얼 TB5 포트 스트라이핑 및 페일오버
+### `multi_port.rs` — Dual TB5 Port Striping and Failover
 
-2개의 Thunderbolt 5 포트를 병렬로 사용하여 대역폭을 확장합니다. 포트 설정, 라운드 로빈 청크 분배, 토폴로지 관리, 페일오버를 포함합니다.
+Uses two Thunderbolt 5 ports in parallel to expand bandwidth. Includes port configuration, round-robin chunk distribution, topology management, and failover.
 
-**포트 구성:**
+**Port configuration:**
 
 ```rust
 pub struct PortConfig {
-    pub port_num: u8,        // 1-based (IB 컨벤션)
+    pub port_num: u8,        // 1-based (IB convention)
     pub gid_index: i32,
-    pub interface: String,   // 예: "en5", "en6"
-    pub address: String,     // IP 주소
+    pub interface: String,   // e.g., "en5", "en6"
+    pub address: String,     // IP address
 }
 
 pub struct DualPortConfig {
     pub primary: PortConfig,
     pub secondary: Option<PortConfig>,
-    pub stripe_threshold: usize,    // 스트라이핑 활성화 최소 청크 수 (기본: 8)
+    pub stripe_threshold: usize,    // minimum chunks to enable striping (default: 8)
 }
 ```
 
-| 메서드 | 설명 |
-|--------|------|
-| `DualPortConfig::single(port)` | 단일 포트 구성 (threshold=8) |
-| `DualPortConfig::dual(primary, secondary, threshold)` | 듀얼 포트 구성 |
-| `DualPortConfig::has_dual()` | secondary 포트 존재 여부를 반환합니다 |
+| Method | Description |
+|--------|-------------|
+| `DualPortConfig::single(port)` | Single port configuration (threshold=8) |
+| `DualPortConfig::dual(primary, secondary, threshold)` | Dual port configuration |
+| `DualPortConfig::has_dual()` | Returns whether a secondary port exists |
 
-**스트라이핑 엔진:**
+**Stripe engine:**
 
 ```rust
 pub struct StripeEngine { config: DualPortConfig }
@@ -358,35 +358,35 @@ pub struct StripePlan {
     pub total_bytes: usize,
 }
 pub struct ChunkAssignment {
-    pub offset: usize,    // 소스 버퍼 내 바이트 오프셋
-    pub length: usize,    // 바이트 길이
-    pub seq: u32,         // 수신 측 재조립용 시퀀스 번호
+    pub offset: usize,    // byte offset within source buffer
+    pub length: usize,    // byte length
+    pub seq: u32,         // sequence number for receiver-side reassembly
 }
 ```
 
-| 메서드 | 설명 |
-|--------|------|
-| `StripeEngine::new(config)` | 스트라이핑 엔진을 생성합니다 |
-| `StripeEngine::plan(total_bytes, chunk_size)` | 데이터를 포트별 청크로 분할하는 계획을 생성합니다 |
+| Method | Description |
+|--------|-------------|
+| `StripeEngine::new(config)` | Creates a stripe engine |
+| `StripeEngine::plan(total_bytes, chunk_size)` | Creates a plan dividing data into per-port chunks |
 
-**스트라이핑 규칙:** 청크 수 >= `stripe_threshold`이고 secondary 포트가 있으면 짝수 청크는 primary, 홀수 청크는 secondary에 할당합니다. 임계값 미만이면 모든 청크를 primary에 할당합니다.
+**Striping rules:** When chunk count >= `stripe_threshold` and a secondary port exists, even-numbered chunks go to primary and odd-numbered chunks go to secondary. Below the threshold, all chunks go to primary.
 
-**토폴로지:**
+**Topology:**
 
 ```rust
 pub enum Topology {
-    Ring,                           // 링 (노드당 최대 2 연결)
-    Mesh,                           // 풀 메시 (all-to-all)
-    Hybrid { group_size: usize },   // 그룹 내 메시 + 그룹 간 링
+    Ring,                           // Ring (max 2 connections per node)
+    Mesh,                           // Full mesh (all-to-all)
+    Hybrid { group_size: usize },   // Mesh within groups + ring between groups
 }
 ```
 
-| 메서드 | 설명 |
-|--------|------|
-| `connections_per_node(world_size)` | 노드당 연결 수를 계산합니다 |
-| `peers(rank, world_size)` | 주어진 rank의 피어 목록을 반환합니다 |
+| Method | Description |
+|--------|-------------|
+| `connections_per_node(world_size)` | Computes connections per node |
+| `peers(rank, world_size)` | Returns the peer list for a given rank |
 
-**포트 페일오버:**
+**Port failover:**
 
 ```rust
 pub enum PortState { Active, Failed, Recovering }
@@ -397,42 +397,42 @@ pub struct PortFailover {
 }
 ```
 
-| 메서드 | 설명 |
-|--------|------|
-| `new()` | 양쪽 포트 모두 `Active`로 초기화합니다 |
-| `mark_failed(is_primary)` | 포트를 `Failed`로 표시합니다 |
-| `mark_recovering(is_primary)` | 포트를 `Recovering`으로 표시합니다 |
-| `mark_active(is_primary)` | 포트를 `Active`로 복구합니다 |
-| `is_dual_active()` | 두 포트 모두 Active인지 확인합니다 |
-| `has_active_port()` | 활성 포트가 하나라도 있는지 확인합니다 |
+| Method | Description |
+|--------|-------------|
+| `new()` | Initializes both ports as `Active` |
+| `mark_failed(is_primary)` | Marks a port as `Failed` |
+| `mark_recovering(is_primary)` | Marks a port as `Recovering` |
+| `mark_active(is_primary)` | Restores a port to `Active` |
+| `is_dual_active()` | Checks whether both ports are Active |
+| `has_active_port()` | Checks whether at least one port is active |
 
 ---
 
-## 에러 처리
+## Error Handling
 
 ```rust
 #[derive(Debug)]
 pub enum RdmaError {
-    LibraryNotFound(String),       // librdma.dylib 로드 실패
-    NoDevices,                     // RDMA 디바이스 없음
-    DeviceOpen(String),            // 디바이스 열기 실패
-    PdAlloc,                       // PD 할당 실패
-    MrReg(String),                 // MR 등록 실패
-    CqCreate,                      // CQ 생성 실패
-    QpCreate(String),              // QP 생성 실패
-    QpModify(String),              // QP 상태 전이 실패
-    PostFailed(String),            // WR 포스팅 실패
-    CqPoll(String),                // CQ 폴 에러
-    ConnectionFailed(String),      // 연결 설정 실패
-    Unavailable(String),           // RDMA 하드웨어 없음
+    LibraryNotFound(String),       // librdma.dylib load failed
+    NoDevices,                     // No RDMA devices found
+    DeviceOpen(String),            // Device open failed
+    PdAlloc,                       // PD allocation failed
+    MrReg(String),                 // MR registration failed
+    CqCreate,                      // CQ creation failed
+    QpCreate(String),              // QP creation failed
+    QpModify(String),              // QP state transition failed
+    PostFailed(String),            // WR posting failed
+    CqPoll(String),                // CQ poll error
+    ConnectionFailed(String),      // Connection setup failed
+    Unavailable(String),           // No RDMA hardware available
 }
 ```
 
-**가용성 체크:** `rmlx_rdma::is_available()`로 `librdma.dylib` 로드 가능 여부를 확인할 수 있습니다.
+**Availability check:** `rmlx_rdma::is_available()` can be used to check whether `librdma.dylib` can be loaded.
 
 ---
 
-## 의존성
+## Dependencies
 
 ```toml
 [dependencies]

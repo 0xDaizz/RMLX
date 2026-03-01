@@ -1,97 +1,97 @@
-# rmlx-distributed — 분산 프리미티브
+# rmlx-distributed — Distributed Primitives
 
-## 개요
+## Overview
 
-`rmlx-distributed`는 분산 추론을 위한 통신 그룹, MoE (Mixture of Experts) 디스패치/결합 교환, 3-zone 백엔드 정책, compute↔RDMA 파이프라인 오버랩, 오버플로우 감시(SparseGuard), 워밍업 프로토콜, MoE 메트릭을 제공하는 크레이트입니다.
+`rmlx-distributed` is a crate providing communication groups, MoE (Mixture of Experts) dispatch/combine exchange, 3-zone backend policy, compute-RDMA pipeline overlap, overflow monitoring (SparseGuard), warmup protocol, and MoE metrics for distributed inference.
 
-> **상태:** 모든 모듈이 구현되어 있습니다. group, moe_exchange, moe_policy, pipeline, sparse_guard, warmup, metrics.
+> **Status:** All modules are implemented: group, moe_exchange, moe_policy, pipeline, sparse_guard, warmup, metrics.
 
 ---
 
-## 모듈 구조
+## Module Structure
 
 ```
 rmlx-distributed/src/
-├── lib.rs           # 모듈 선언
-├── group.rs         # 분산 통신 그룹
-├── moe_exchange.rs  # MoE 디스패치/결합 교환
-├── moe_policy.rs    # 3-zone 백엔드 정책
-├── pipeline.rs      # compute↔RDMA 파이프라인 오버랩
-├── sparse_guard.rs  # Expert 오버플로우 감시
-├── warmup.rs        # RDMA + JIT 사전 워밍업
-└── metrics.rs       # 원자적 MoE 메트릭
+├── lib.rs           # Module declarations
+├── group.rs         # Distributed communication group
+├── moe_exchange.rs  # MoE dispatch/combine exchange
+├── moe_policy.rs    # 3-zone backend policy
+├── pipeline.rs      # Compute-RDMA pipeline overlap
+├── sparse_guard.rs  # Expert overflow monitoring
+├── warmup.rs        # RDMA + JIT pre-warmup
+└── metrics.rs       # Atomic MoE metrics
 ```
 
 ---
 
-## group.rs — 분산 통신 그룹
+## group.rs — Distributed Communication Group
 
-통신 그룹을 추상화하여 rank 식별과 피어 관리를 제공합니다.
+Abstracts communication groups, providing rank identification and peer management.
 
 ```rust
 pub struct Group {
-    ranks: Vec<u32>,      // 정렬된 고유 rank 목록
-    local_rank: u32,      // 현재 노드 rank
-    world_size: u32,      // 전체 노드 수
+    ranks: Vec<u32>,      // sorted unique rank list
+    local_rank: u32,      // current node rank
+    world_size: u32,      // total number of nodes
 }
 ```
 
-| 메서드 | 설명 |
-|--------|------|
-| `Group::new(ranks, local_rank, world_size)` | rank 목록에서 그룹 생성 (자동 정렬/중복 제거) |
-| `Group::world(world_size, local_rank)` | 전체 rank [0, world_size) 그룹 |
-| `ranks()` | 그룹 내 rank 목록 |
-| `local_rank()` | 현재 노드 rank |
-| `size()` | 그룹 내 rank 수 |
-| `world_size()` | 전체 월드 크기 |
-| `peers()` | 자신을 제외한 피어 rank 목록 |
-| `contains(rank)` | rank가 그룹에 속하는지 확인 |
+| Method | Description |
+|--------|-------------|
+| `Group::new(ranks, local_rank, world_size)` | Creates a group from a rank list (auto-sorted/deduplicated) |
+| `Group::world(world_size, local_rank)` | Full rank [0, world_size) group |
+| `ranks()` | Rank list within the group |
+| `local_rank()` | Current node rank |
+| `size()` | Number of ranks in the group |
+| `world_size()` | Total world size |
+| `peers()` | Peer rank list excluding self |
+| `contains(rank)` | Checks whether a rank belongs to the group |
 
 ---
 
-## moe_exchange.rs — MoE 디스패치/결합 교환
+## moe_exchange.rs — MoE Dispatch/Combine Exchange
 
 ### MoeDispatchExchange
 
-토큰을 expert에 라우팅하는 디스패치 교환입니다.
+Dispatch exchange that routes tokens to experts.
 
 ```rust
 pub struct MoeDispatchConfig {
     pub num_experts: usize,
     pub top_k: usize,
-    pub capacity_factor: f32,   // 1.0 = 정확, >1.0 = 오버프로비저닝
+    pub capacity_factor: f32,   // 1.0 = exact, >1.0 = overprovisioning
     pub group: Group,
 }
 
 pub struct MoeDispatchExchange {
     config: MoeDispatchConfig,
     policy: MoePolicy,
-    metrics: MoeMetrics,        // moe_exchange 내부 메트릭
+    metrics: MoeMetrics,        // internal metrics for moe_exchange
 }
 ```
 
-| 메서드 | 설명 |
-|--------|------|
-| `new(config, policy)` | 디스패치 교환 생성 |
-| `dispatch(batch_size, expert_indices, expert_weights)` | 토큰 디스패치 → `DispatchResult` |
-| `metrics()` | 내부 메트릭 조회 |
-| `policy()` / `policy_mut()` | 정책 참조/변경 |
+| Method | Description |
+|--------|-------------|
+| `new(config, policy)` | Creates a dispatch exchange |
+| `dispatch(batch_size, expert_indices, expert_weights)` | Dispatches tokens -> `DispatchResult` |
+| `metrics()` | Queries internal metrics |
+| `policy()` / `policy_mut()` | Gets/modifies the policy reference |
 
 ### DispatchResult
 
 ```rust
 pub struct DispatchResult {
     pub backend: MoeBackend,
-    pub tokens_per_expert: usize,         // Expert당 최대 토큰 수 (capacity)
-    pub expert_counts: Vec<usize>,        // Expert별 실제 토큰 수
-    pub overflow_count: u64,              // 오버플로우 토큰 수
-    pub local_expert_range: (usize, usize),  // 로컬 expert 인덱스 범위 [start, end)
+    pub tokens_per_expert: usize,         // max tokens per expert (capacity)
+    pub expert_counts: Vec<usize>,        // actual tokens per expert
+    pub overflow_count: u64,              // overflow token count
+    pub local_expert_range: (usize, usize),  // local expert index range [start, end)
 }
 ```
 
 ### MoeCombineExchange
 
-Expert 출력을 원래 토큰 순서로 결합합니다.
+Combines expert outputs back into original token order.
 
 ```rust
 pub struct MoeCombineExchange {
@@ -99,12 +99,12 @@ pub struct MoeCombineExchange {
 }
 ```
 
-| 메서드 | 설명 |
-|--------|------|
-| `combine_cpu(expert_outputs, weights, indices, batch_size, top_k, hidden_dim)` | CPU 폴백 결합 |
-| `group()` | 그룹 참조 |
+| Method | Description |
+|--------|-------------|
+| `combine_cpu(expert_outputs, weights, indices, batch_size, top_k, hidden_dim)` | CPU fallback combine |
+| `group()` | Group reference |
 
-### MoeMetrics (moe_exchange 내부)
+### MoeMetrics (moe_exchange internal)
 
 ```rust
 #[derive(Debug, Clone, Default)]
@@ -119,9 +119,9 @@ pub struct MoeMetrics {
 
 ---
 
-## moe_policy.rs — 3-zone 백엔드 정책
+## moe_policy.rs — 3-Zone Backend Policy
 
-데이터 크기에 따라 CPU/Metal/RDMA 백엔드를 자동 선택합니다. 쿨다운으로 진동을 방지합니다.
+Automatically selects CPU/Metal/RDMA backends based on data size. Uses cooldown to prevent oscillation.
 
 ### MoeBackend
 
@@ -137,40 +137,40 @@ pub enum MoeBackend {
 
 ```rust
 pub struct MoePolicy {
-    cpu_max: u32,                         // 기본값: 64
-    gpu_min: u32,                         // 기본값: 320
-    byte_threshold: usize,               // 기본값: 4096 (4KB)
-    cooldown_steps: u32,                 // 기본값: 32
+    cpu_max: u32,                         // default: 64
+    gpu_min: u32,                         // default: 320
+    byte_threshold: usize,               // default: 4096 (4KB)
+    cooldown_steps: u32,                 // default: 32
     current_backend: MoeBackend,
     cooldown_remaining: AtomicU32,
     step_count: AtomicU32,
 }
 ```
 
-**선택 로직:**
+**Selection logic:**
 
 ```
-N <= cpu_max       → Cpu
-N >= gpu_min       → Metal
+N <= cpu_max       -> Cpu
+N >= gpu_min       -> Metal
 cpu_max < N < gpu_min:
-  byte_size < byte_threshold → Cpu
-  byte_size >= byte_threshold → Metal
-쿨다운 중 → 현재 백엔드 유지
+  byte_size < byte_threshold -> Cpu
+  byte_size >= byte_threshold -> Metal
+During cooldown -> maintain current backend
 ```
 
-| 메서드 | 설명 |
-|--------|------|
-| `MoePolicy::new()` | 기본 임계값으로 생성 |
-| `with_thresholds(cpu_max, gpu_min, byte_threshold)` | 커스텀 임계값 |
-| `select(n_elements, byte_size)` | 백엔드 선택 |
-| `switch_backend(new_backend)` | 백엔드 전환 (쿨다운 활성화) |
-| `step()` | 스텝 카운터 증가 |
+| Method | Description |
+|--------|-------------|
+| `MoePolicy::new()` | Creates with default thresholds |
+| `with_thresholds(cpu_max, gpu_min, byte_threshold)` | Custom thresholds |
+| `select(n_elements, byte_size)` | Selects a backend |
+| `switch_backend(new_backend)` | Switches backend (activates cooldown) |
+| `step()` | Increments step counter |
 
 ---
 
-## pipeline.rs — Compute↔RDMA 파이프라인
+## pipeline.rs — Compute-RDMA Pipeline
 
-레이어 단위의 compute↔RDMA 파이프라인 오버랩을 관리합니다.
+Manages layer-level compute-RDMA pipeline overlap.
 
 ### PipelineStage
 
@@ -188,8 +188,8 @@ pub enum PipelineStage {
 ```rust
 pub struct PipelineConfig {
     pub num_layers: usize,
-    pub enable_overlap: bool,        // 기본값: true
-    pub sync_timeout: Duration,      // 기본값: 5초
+    pub enable_overlap: bool,        // default: true
+    pub sync_timeout: Duration,      // default: 5 seconds
 }
 ```
 
@@ -202,16 +202,16 @@ pub struct LayerPipeline {
 }
 ```
 
-| 메서드 | 설명 |
-|--------|------|
-| `new(config)` | 파이프라인 생성 (모든 레이어 WaitingForInput) |
-| `begin_compute(layer)` | 레이어 컴퓨트 시작 표시 |
-| `begin_transfer(layer)` | 레이어 전송 시작 표시 |
-| `complete(layer)` | 레이어 완료 표시 |
-| `stage(layer)` | 레이어 현재 단계 조회 |
-| `all_complete()` | 모든 레이어 완료 여부 |
-| `reset()` | 모든 단계 WaitingForInput으로 초기화 |
-| `measure_overlap(compute_fn, transfer_fn)` | 직렬 vs 파이프라인 실행 시간 측정 |
+| Method | Description |
+|--------|-------------|
+| `new(config)` | Creates a pipeline (all layers WaitingForInput) |
+| `begin_compute(layer)` | Marks a layer's compute as started |
+| `begin_transfer(layer)` | Marks a layer's transfer as started |
+| `complete(layer)` | Marks a layer as complete |
+| `stage(layer)` | Queries a layer's current stage |
+| `all_complete()` | Whether all layers are complete |
+| `reset()` | Resets all stages to WaitingForInput |
+| `measure_overlap(compute_fn, transfer_fn)` | Measures serial vs. pipeline execution time |
 
 ### PipelineStats
 
@@ -228,18 +228,18 @@ pub struct PipelineStats {
 
 ---
 
-## sparse_guard.rs — Expert 오버플로우 감시
+## sparse_guard.rs — Expert Overflow Monitoring
 
-오버플로우 비율을 EMA로 추적하고, 용량 증가 또는 Dense 폴백을 권고합니다.
+Tracks overflow ratio via EMA and recommends capacity increases or dense fallback.
 
 ### GuardAction
 
 ```rust
 pub enum GuardAction {
     None,
-    IncreaseCapacity(f64),   // 용량 증가 팩터
-    DenseFallback,           // Dense 연산 폴백
-    Reset,                   // 정상 복귀
+    IncreaseCapacity(f64),   // Capacity increase factor
+    DenseFallback,           // Dense computation fallback
+    Reset,                   // Return to normal
 }
 ```
 
@@ -247,44 +247,44 @@ pub enum GuardAction {
 
 ```rust
 pub struct SparseGuard {
-    overflow_ema: f64,         // EMA 값
-    ema_alpha: f64,            // 기본값: 0.1
-    capacity_factor: f64,      // 기본값: 1.0
+    overflow_ema: f64,         // EMA value
+    ema_alpha: f64,            // default: 0.1
+    capacity_factor: f64,      // default: 1.0
     dense_fallback: bool,
-    window_size: usize,        // 기본값: 100
+    window_size: usize,        // default: 100
     step_count: usize,
     overflow_count_window: usize,
     total_count_window: usize,
 }
 ```
 
-| 메서드 | 설명 |
-|--------|------|
-| `record_step(overflow_count, total_count)` | 스텝 기록 |
-| `evaluate()` | 윈도우 종료 시 EMA 갱신 → `GuardAction` 반환 |
+| Method | Description |
+|--------|-------------|
+| `record_step(overflow_count, total_count)` | Records a step |
+| `evaluate()` | Updates EMA at window end -> returns `GuardAction` |
 | `should_increase_capacity()` | EMA > 0.05 |
 | `should_dense_fallback()` | EMA > 0.20 |
-| `capacity_factor()` | 현재 용량 팩터 |
-| `is_dense_fallback()` | Dense 폴백 활성 여부 |
-| `overflow_ema()` | 현재 EMA 값 |
+| `capacity_factor()` | Current capacity factor |
+| `is_dense_fallback()` | Whether dense fallback is active |
+| `overflow_ema()` | Current EMA value |
 
-**정책:**
-- EMA > 0.05 → 용량 1.25배 증가 (최대 2.0)
-- EMA > 0.20 → Dense 폴백 전환
-- Dense 중 EMA <= 0.05 → 정상 복귀 (Reset)
+**Policy:**
+- EMA > 0.05 -> Increase capacity by 1.25x (max 2.0)
+- EMA > 0.20 -> Switch to dense fallback
+- During dense, EMA <= 0.05 -> Return to normal (Reset)
 
 ---
 
-## warmup.rs — RDMA + JIT 사전 워밍업
+## warmup.rs — RDMA + JIT Pre-Warmup
 
-추론 시작 전에 RDMA 연결 워밍업과 Metal JIT 커널 컴파일을 수행합니다.
+Performs RDMA connection warmup and Metal JIT kernel compilation before inference begins.
 
 ### WarmupConfig
 
 ```rust
 pub struct WarmupConfig {
-    pub rdma_rounds: usize,      // 기본값: 10
-    pub jit_precompile: bool,    // 기본값: true
+    pub rdma_rounds: usize,      // default: 10
+    pub jit_precompile: bool,    // default: true
 }
 ```
 
@@ -298,13 +298,13 @@ pub struct WarmupState {
 }
 ```
 
-| 메서드 | 설명 |
-|--------|------|
-| `set_rdma_warmed()` | RDMA 워밍업 완료 표시 |
-| `set_jit_warmed()` | JIT 워밍업 완료 표시 |
-| `is_ready()` | 둘 다 완료 여부 |
-| `set_result(result)` | 워밍업 결과 저장 |
-| `last_result()` | 마지막 워밍업 결과 |
+| Method | Description |
+|--------|-------------|
+| `set_rdma_warmed()` | Marks RDMA warmup as complete |
+| `set_jit_warmed()` | Marks JIT warmup as complete |
+| `is_ready()` | Whether both are complete |
+| `set_result(result)` | Stores the warmup result |
+| `last_result()` | Last warmup result |
 
 ### WarmupResult
 
@@ -318,11 +318,11 @@ pub struct WarmupResult {
 
 ---
 
-## metrics.rs — 원자적 MoE 메트릭
+## metrics.rs — Atomic MoE Metrics
 
-`AtomicU64` 기반의 lock-free MoE 운영 카운터입니다.
+`AtomicU64`-based lock-free MoE operational counters.
 
-### MoeMetrics (metrics 모듈)
+### MoeMetrics (metrics module)
 
 ```rust
 pub struct MoeMetrics {
@@ -338,17 +338,17 @@ pub struct MoeMetrics {
 }
 ```
 
-| 메서드 | 설명 |
-|--------|------|
-| `record_dispatch(tokens)` | 디스패치 횟수 + 토큰 수 기록 |
-| `record_combine()` | 결합 횟수 기록 |
-| `record_cpu_dispatch()` | CPU 디스패치 기록 |
-| `record_metal_dispatch()` | Metal 디스패치 기록 |
-| `record_rdma_dispatch()` | RDMA 디스패치 기록 |
-| `record_overflow()` | 오버플로우 이벤트 기록 |
-| `record_zone_switch()` | Zone 전환 기록 |
-| `record_dense_fallback()` | Dense 폴백 기록 |
-| `snapshot()` | 시점 스냅샷 → `MoeMetricsSnapshot` |
+| Method | Description |
+|--------|-------------|
+| `record_dispatch(tokens)` | Records dispatch count + token count |
+| `record_combine()` | Records combine count |
+| `record_cpu_dispatch()` | Records a CPU dispatch |
+| `record_metal_dispatch()` | Records a Metal dispatch |
+| `record_rdma_dispatch()` | Records an RDMA dispatch |
+| `record_overflow()` | Records an overflow event |
+| `record_zone_switch()` | Records a zone switch |
+| `record_dense_fallback()` | Records a dense fallback |
+| `snapshot()` | Point-in-time snapshot -> `MoeMetricsSnapshot` |
 
 ### MoeMetricsSnapshot
 
@@ -369,7 +369,7 @@ pub struct MoeMetricsSnapshot {
 
 ---
 
-## 의존성
+## Dependencies
 
 ```mermaid
 graph BT

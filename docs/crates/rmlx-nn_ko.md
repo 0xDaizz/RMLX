@@ -1,25 +1,25 @@
-# rmlx-nn — Neural Network Layers
+# rmlx-nn — 신경망 레이어
 
-## Overview
+## 개요
 
-`rmlx-nn` is a crate that implements neural network layers for LLM inference. It builds core Transformer architecture components (Linear, Embedding, Attention, TransformerBlock, MoE) on top of `rmlx-core` compute kernels, and includes built-in model configurations for LLaMA, Qwen, DeepSeek-V3, and Mixtral.
+`rmlx-nn`은 LLM 추론을 위한 신경망 레이어를 구현하는 크레이트입니다. Transformer 아키텍처의 핵심 구성 요소(Linear, Embedding, Attention, TransformerBlock, MoE)를 `rmlx-core`의 연산 커널 위에 구성하며, LLaMA, Qwen, DeepSeek-V3, Mixtral 모델 설정을 내장하고 있습니다.
 
-> **Status:** Linear, Embedding, Attention, TransformerBlock, MoE, and 4 model configurations (LLaMA 7B/3-8B, Qwen2 7B, DeepSeek-V3, Mixtral 8x7B) are implemented.
+> **상태:** Linear, Embedding, Attention, TransformerBlock, MoE, 그리고 4종 모델 설정(LLaMA 7B/3-8B, Qwen2 7B, DeepSeek-V3, Mixtral 8x7B)이 구현되어 있습니다.
 
 ---
 
-## Module Structure
+## 모듈 구조
 
 ```
 rmlx-nn/src/
-├── lib.rs           # Module declarations
-├── linear.rs        # Linear (FC) layer
-├── embedding.rs     # Token embedding
+├── lib.rs           # 모듈 선언
+├── linear.rs        # 선형 (FC) 레이어
+├── embedding.rs     # 토큰 임베딩
 ├── attention.rs     # Multi-Head / GQA Attention
-├── transformer.rs   # Transformer block + model
-├── moe.rs           # Mixture of Experts layer
+├── transformer.rs   # Transformer 블록 + 모델
+├── moe.rs           # Mixture of Experts 레이어
 └── models/
-    ├── mod.rs        # Model module declarations
+    ├── mod.rs        # 모델 모듈 선언
     ├── llama.rs      # LLaMA 7B, LLaMA 3 8B
     ├── qwen.rs       # Qwen2 7B
     ├── deepseek.rs   # DeepSeek-V3
@@ -28,9 +28,9 @@ rmlx-nn/src/
 
 ---
 
-## linear.rs — Linear Layer
+## linear.rs — 선형 레이어
 
-A linear (fully-connected) layer performing `y = x @ W^T + bias`.
+`y = x @ W^T + bias` 연산을 수행하는 선형(fully-connected) 레이어입니다.
 
 ```rust
 pub struct LinearConfig {
@@ -44,18 +44,18 @@ pub struct Linear {
 }
 ```
 
-| Method | Description |
-|--------|-------------|
-| `Linear::new(config)` | Creates a layer from config |
-| `in_features()` | Input dimension |
-| `out_features()` | Output dimension |
-| `has_bias()` | Whether bias is used |
+| 메서드 | 설명 |
+|--------|------|
+| `Linear::new(config)` | 설정으로 레이어 생성 |
+| `in_features()` | 입력 차원 |
+| `out_features()` | 출력 차원 |
+| `has_bias()` | 바이어스 사용 여부 |
 
 ---
 
-## embedding.rs — Token Embedding
+## embedding.rs — 토큰 임베딩
 
-A lookup table that converts token IDs to embedding vectors.
+토큰 ID를 임베딩 벡터로 변환하는 lookup 테이블입니다.
 
 ```rust
 pub struct EmbeddingConfig {
@@ -68,17 +68,17 @@ pub struct Embedding {
 }
 ```
 
-| Method | Description |
-|--------|-------------|
-| `Embedding::new(config)` | Creates from config |
-| `vocab_size()` | Vocabulary size |
-| `embed_dim()` | Embedding dimension |
+| 메서드 | 설명 |
+|--------|------|
+| `Embedding::new(config)` | 설정으로 생성 |
+| `vocab_size()` | 어휘 크기 |
+| `embed_dim()` | 임베딩 차원 |
 
 ---
 
 ## attention.rs — Multi-Head Attention
 
-Multi-Head / Grouped Query Attention with KV cache support.
+KV 캐시를 지원하는 Multi-Head / Grouped Query Attention입니다.
 
 ```rust
 pub struct AttentionConfig {
@@ -94,24 +94,24 @@ pub struct Attention {
 }
 ```
 
-| Method | Description |
-|--------|-------------|
-| `Attention::new(config)` | Creates from config |
-| `num_heads()` | Number of Q heads |
-| `num_kv_heads()` | Number of KV heads |
-| `head_dim()` | Head dimension |
+| 메서드 | 설명 |
+|--------|------|
+| `Attention::new(config)` | 설정으로 생성 |
+| `num_heads()` | Q 헤드 수 |
+| `num_kv_heads()` | KV 헤드 수 |
+| `head_dim()` | 헤드 차원 |
 | `hidden_size()` | `num_heads * head_dim` |
-| `is_gqa()` | Whether GQA is used (`num_kv_heads < num_heads`) |
+| `is_gqa()` | GQA 여부 (`num_kv_heads < num_heads`) |
 
-| Attention variant | Condition | Representative model |
-|-------------------|-----------|---------------------|
+| Attention 변형 | 조건 | 대표 모델 |
+|---------------|------|-----------|
 | MHA | `num_kv_heads == num_heads` | LLaMA 7B |
 | GQA | `num_kv_heads < num_heads` | LLaMA 3, Qwen2, Mixtral |
 | MLA | `num_kv_heads == 1` | DeepSeek-V3 |
 
 ---
 
-## transformer.rs — Transformer Block + Model
+## transformer.rs — Transformer 블록 + 모델
 
 ### FeedForwardType
 
@@ -148,11 +148,11 @@ pub struct TransformerBlock {
 }
 ```
 
-| Method | Description |
-|--------|-------------|
-| `TransformerBlock::new(layer_idx, config)` | Creates with layer index and config |
-| `layer_idx()` | Layer index |
-| `hidden_size()` | Hidden dimension |
+| 메서드 | 설명 |
+|--------|------|
+| `TransformerBlock::new(layer_idx, config)` | 레이어 인덱스와 설정으로 생성 |
+| `layer_idx()` | 레이어 인덱스 |
+| `hidden_size()` | 은닉 차원 |
 
 ### TransformerModel
 
@@ -163,17 +163,17 @@ pub struct TransformerModel {
 }
 ```
 
-| Method | Description |
-|--------|-------------|
-| `TransformerModel::new(config)` | Creates a model |
-| `num_layers()` | Number of layers |
-| `config()` | Config reference |
+| 메서드 | 설명 |
+|--------|------|
+| `TransformerModel::new(config)` | 모델 생성 |
+| `num_layers()` | 레이어 수 |
+| `config()` | 설정 참조 |
 
 ---
 
 ## moe.rs — Mixture of Experts
 
-An MoE layer using top-k gating.
+Top-k 게이팅을 사용하는 MoE 레이어입니다.
 
 ```rust
 pub struct MoeConfig {
@@ -188,23 +188,23 @@ pub struct MoeLayer {
 }
 ```
 
-| Method | Description |
-|--------|-------------|
-| `MoeLayer::new(config)` | Creates from config |
-| `num_experts()` | Number of experts |
-| `top_k()` | Number of active experts per token |
-| `hidden_dim()` | Hidden dimension |
+| 메서드 | 설명 |
+|--------|------|
+| `MoeLayer::new(config)` | 설정으로 생성 |
+| `num_experts()` | 전문가 수 |
+| `top_k()` | 토큰당 활성 전문가 수 |
+| `hidden_dim()` | 은닉 차원 |
 
 ---
 
-## models/ — Model Architecture Definitions
+## models/ — 모델 아키텍처 정의
 
-Provides 4 LLM model configurations as `TransformerConfig`.
+4종의 LLM 모델 설정을 `TransformerConfig`로 제공합니다.
 
 ### LLaMA (`models/llama.rs`)
 
-| Function | hidden | heads | kv_heads | layers | vocab | max_seq | ff_type |
-|----------|--------|-------|----------|--------|-------|---------|---------|
+| 함수 | hidden | heads | kv_heads | layers | vocab | max_seq | ff_type |
+|------|--------|-------|----------|--------|-------|---------|---------|
 | `llama_7b()` | 4096 | 32 | 32 (MHA) | 32 | 32000 | 4096 | Dense(11008) |
 | `llama_3_8b()` | 4096 | 32 | 8 (GQA) | 32 | 128256 | 8192 | Dense(14336) |
 
@@ -213,16 +213,16 @@ Provides 4 LLM model configurations as `TransformerConfig`.
 
 ### Qwen2 (`models/qwen.rs`)
 
-| Function | hidden | heads | kv_heads | layers | vocab | max_seq | ff_type |
-|----------|--------|-------|----------|--------|-------|---------|---------|
+| 함수 | hidden | heads | kv_heads | layers | vocab | max_seq | ff_type |
+|------|--------|-------|----------|--------|-------|---------|---------|
 | `qwen2_7b()` | 3584 | 28 | 4 (GQA) | 28 | 152064 | 32768 | Dense(18944) |
 
 - rope_theta=1000000, rms_norm_eps=1e-6
 
 ### DeepSeek-V3 (`models/deepseek.rs`)
 
-| Function | hidden | heads | kv_heads | layers | vocab | max_seq | ff_type |
-|----------|--------|-------|----------|--------|-------|---------|---------|
+| 함수 | hidden | heads | kv_heads | layers | vocab | max_seq | ff_type |
+|------|--------|-------|----------|--------|-------|---------|---------|
 | `deepseek_v3()` | 7168 | 128 | 1 (MLA) | 61 | 129280 | 16384 | MoE(256 experts, top-8) |
 
 - MoE: num_experts=256, num_experts_per_token=8, intermediate_dim=2048
@@ -230,8 +230,8 @@ Provides 4 LLM model configurations as `TransformerConfig`.
 
 ### Mixtral (`models/mixtral.rs`)
 
-| Function | hidden | heads | kv_heads | layers | vocab | max_seq | ff_type |
-|----------|--------|-------|----------|--------|-------|---------|---------|
+| 함수 | hidden | heads | kv_heads | layers | vocab | max_seq | ff_type |
+|------|--------|-------|----------|--------|-------|---------|---------|
 | `mixtral_8x7b()` | 4096 | 32 | 8 (GQA) | 32 | 32000 | 32768 | MoE(8 experts, top-2) |
 
 - MoE: num_experts=8, num_experts_per_token=2, intermediate_dim=14336
@@ -239,7 +239,7 @@ Provides 4 LLM model configurations as `TransformerConfig`.
 
 ---
 
-## Architecture Diagram
+## 아키텍처 다이어그램
 
 ```mermaid
 graph BT
@@ -286,7 +286,7 @@ graph BT
 
 ---
 
-## Dependencies
+## 의존성
 
 ```toml
 [dependencies]

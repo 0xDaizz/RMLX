@@ -1,136 +1,136 @@
-# 빌드 및 실행
+# Building and Running
 
-rmlx 프로젝트를 클론하고, 빌드하고, 테스트하는 방법을 안내합니다.
+This guide covers cloning, building, and testing the rmlx project.
 
 ---
 
-## 빠른 시작
+## Quick Start
 
 ```bash
-# 1. 리포지토리 클론
+# 1. Clone the repository
 git clone https://github.com/user/rmlx.git
 cd rmlx
 
-# 2. 전체 워크스페이스 빌드
+# 2. Build the entire workspace
 cargo build --workspace
 
-# 3. 테스트 실행
+# 3. Run tests
 cargo test --workspace
 
-# 4. 포맷 및 린트 확인
+# 4. Check formatting and linting
 cargo fmt --all --check
 cargo clippy --workspace -- -D warnings
 ```
 
-> **참고**: 처음 빌드 시 의존성 다운로드와 컴파일에 수 분이 소요될 수 있습니다.
+> **Note**: The first build may take several minutes to download and compile dependencies.
 
 ---
 
-## 워크스페이스 구조
+## Workspace Structure
 
-rmlx는 Cargo workspace로 구성되어 있으며, 다음 크레이트들을 포함합니다.
+rmlx is organized as a Cargo workspace containing the following crates:
 
 ```
 rmlx/
-├── Cargo.toml              # 워크스페이스 루트
+├── Cargo.toml              # workspace root
 ├── crates/
-│   ├── rmlx-metal/         # Metal GPU 추상화
-│   ├── rmlx-alloc/         # Zero-copy 메모리 할당
-│   ├── rmlx-rdma/          # RDMA 통신 (Thunderbolt 5)
-│   ├── rmlx-core/          # Array 타입, 커널 레지스트리
-│   ├── rmlx-distributed/   # 분산 추론 (EP, 파이프라인)
-│   └── rmlx-nn/            # 신경망 레이어 (Transformer 등)
+│   ├── rmlx-metal/         # Metal GPU abstractions
+│   ├── rmlx-alloc/         # Zero-copy memory allocation
+│   ├── rmlx-rdma/          # RDMA communication (Thunderbolt 5)
+│   ├── rmlx-core/          # Array type, kernel registry
+│   ├── rmlx-distributed/   # Distributed inference (EP, pipeline)
+│   └── rmlx-nn/            # Neural network layers (Transformer, etc.)
 ```
 
 ---
 
-## 빌드 시스템 상세
+## Build System Details
 
-### Metal 셰이더 AOT 컴파일
+### Metal Shader AOT Compilation
 
-`rmlx-core` 크레이트의 `build.rs`는 빌드 과정에서 Metal 셰이더를 사전 컴파일합니다.
+The `rmlx-core` crate's `build.rs` pre-compiles Metal shaders during the build process.
 
-**컴파일 파이프라인**:
+**Compilation pipeline**:
 
 ```
-kernels/*.metal  →  xcrun metal -c  →  *.air  →  xcrun metallib  →  rmlx_kernels.metallib
+kernels/*.metal  ->  xcrun metal -c  ->  *.air  ->  xcrun metallib  ->  rmlx_kernels.metallib
 ```
 
-1. `kernels/` 디렉토리의 모든 `.metal` 파일을 탐색합니다
-2. 각 파일을 `xcrun -sdk macosx metal -c`로 중간 표현(`.air`)으로 컴파일합니다
-3. 모든 `.air` 파일을 `xcrun -sdk macosx metallib`로 링크하여 단일 `.metallib` 파일을 생성합니다
-4. `RMLX_METALLIB_PATH` 환경 변수에 생성된 `.metallib` 경로를 설정합니다
+1. Discovers all `.metal` files in the `kernels/` directory
+2. Compiles each file to an intermediate representation (`.air`) using `xcrun -sdk macosx metal -c`
+3. Links all `.air` files into a single `.metallib` file using `xcrun -sdk macosx metallib`
+4. Sets the `RMLX_METALLIB_PATH` environment variable to the generated `.metallib` path
 
-### Xcode가 없는 경우
+### Without Xcode
 
-Xcode가 설치되어 있지 않으면 `build.rs`가 다음과 같이 동작합니다.
+If Xcode is not installed, `build.rs` behaves as follows:
 
 ```
 cargo:warning=Metal compiler not found (requires Xcode, not just Command Line Tools).
                Skipping shader AOT compilation. GPU kernels will not be available at runtime.
 ```
 
-- AOT 컴파일을 건너뛰고 **경고만 출력**합니다 (빌드 실패가 아닙니다)
-- `RMLX_METALLIB_PATH`가 빈 문자열로 설정됩니다
-- **테스트 코드는 JIT 컴파일(`compile_source`)을 사용**하므로 Xcode 없이도 정상 실행됩니다
+- Skips AOT compilation and **only prints a warning** (this is not a build failure)
+- `RMLX_METALLIB_PATH` is set to an empty string
+- **Test code uses JIT compilation (`compile_source`)**, so it runs normally without Xcode
 
-> **핵심**: Xcode 미설치 시에도 빌드와 테스트는 정상적으로 진행됩니다.
-> 프로덕션 환경에서 최적 성능을 위해서는 AOT 컴파일된 `.metallib`를 사용하는 것을 권장합니다.
+> **Key point**: Builds and tests proceed normally even without Xcode.
+> For optimal performance in production, using AOT-compiled `.metallib` files is recommended.
 
-### AOT metallib 경로 수동 지정
+### Manually Specifying the AOT metallib Path
 
-사전 컴파일된 `.metallib` 파일이 별도로 있는 경우, 환경 변수로 직접 경로를 지정할 수 있습니다.
+If you have a pre-compiled `.metallib` file available separately, you can specify its path directly via an environment variable:
 
 ```bash
-# 환경 변수로 AOT metallib 경로 전달
+# Pass the AOT metallib path via environment variable
 RMLX_METALLIB_PATH=/path/to/rmlx_kernels.metallib cargo build --workspace
 ```
 
 ---
 
-## 개별 크레이트 빌드
+## Building Individual Crates
 
-특정 크레이트만 빌드하거나 테스트하려면 `-p` 플래그를 사용합니다.
+To build or test a specific crate, use the `-p` flag:
 
 ```bash
-# rmlx-metal 크레이트만 빌드
+# Build only the rmlx-metal crate
 cargo build -p rmlx-metal
 
-# rmlx-metal 테스트만 실행
+# Run only rmlx-metal tests
 cargo test -p rmlx-metal
 
-# rmlx-core 크레이트만 빌드
+# Build only the rmlx-core crate
 cargo build -p rmlx-core
 
-# 특정 테스트만 실행
+# Run a specific test
 cargo test -p rmlx-metal -- test_basic_metal_compute
 ```
 
 ---
 
-## 개발 워크플로
+## Development Workflow
 
-### 자동 빌드 (cargo-watch)
+### Auto-Build (cargo-watch)
 
-파일 변경 시 자동으로 빌드와 테스트를 수행합니다.
+Automatically build and test on file changes:
 
 ```bash
-# 파일 변경 시 자동 체크 (컴파일 에러 확인)
+# Auto-check on file changes (check for compile errors)
 cargo watch -x check
 
-# 파일 변경 시 자동 테스트
+# Auto-test on file changes
 cargo watch -x 'test --workspace'
 
-# 특정 크레이트만 감시
+# Watch a specific crate only
 cargo watch -x 'test -p rmlx-metal'
 ```
 
-### CI와 동일한 검증
+### CI-Equivalent Verification
 
-Pull Request를 생성하기 전에, CI에서 실행되는 것과 동일한 검증을 로컬에서 수행할 수 있습니다.
+Before creating a pull request, you can run the same verification locally that CI performs:
 
 ```bash
-# 전체 CI 검증 순서
+# Full CI verification sequence
 cargo build --workspace \
   && cargo fmt --all --check \
   && cargo clippy --workspace -- -D warnings \
@@ -139,37 +139,37 @@ cargo build --workspace \
 
 ---
 
-## 문제 해결
+## Troubleshooting
 
 ### `xcrun: error: unable to find utility "metal"`
 
-**원인**: Xcode가 설치되어 있지 않거나, Command Line Tools만 설치된 경우입니다.
+**Cause**: Xcode is not installed, or only Command Line Tools are installed.
 
-**해결 방법**:
-- App Store에서 Xcode를 설치합니다
-- 또는 AOT 컴파일 없이 JIT 모드로 사용합니다 (빌드 경고를 무시해도 됩니다)
+**Solution**:
+- Install Xcode from the App Store
+- Or use JIT mode without AOT compilation (build warnings can be safely ignored)
 
 ### `error: no Metal device available`
 
-**원인**: Metal을 지원하지 않는 환경(VM, Intel Mac, CI 러너 등)에서 실행한 경우입니다.
+**Cause**: Running in an environment that does not support Metal (VM, Intel Mac, CI runner, etc.).
 
-**해결 방법**:
-- Apple Silicon Mac에서 실행하세요
-- Metal 관련 테스트는 디바이스가 없으면 자동으로 skip됩니다
+**Solution**:
+- Run on an Apple Silicon Mac
+- Metal-related tests are automatically skipped when no device is available
 
-### 빌드 시 `kernels/` 디렉토리 관련 에러
+### Build Error Related to `kernels/` Directory
 
-**원인**: `rmlx-core/kernels/` 디렉토리가 비어있거나 존재하지 않는 경우입니다.
+**Cause**: The `rmlx-core/kernels/` directory is empty or does not exist.
 
-**해결 방법**:
+**Solution**:
 ```bash
-# kernels 디렉토리 확인
+# Check the kernels directory
 ls crates/rmlx-core/kernels/
 
-# 디렉토리가 없는 경우 (Phase 2에서 추가 예정)
+# If the directory does not exist (will be added in Phase 2)
 mkdir -p crates/rmlx-core/kernels
 ```
 
 ---
 
-다음 단계: [첫 번째 Metal 커널 실행하기](first-kernel.md)
+Next step: [Running Your First Metal Kernel](first-kernel.md)

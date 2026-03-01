@@ -1,25 +1,25 @@
-# rmlx-python — Python 바인딩
+# rmlx-python — Python Bindings
 
-## 개요
+## Overview
 
-`rmlx-python`은 PyO3 0.28 기반의 Python 바인딩으로, `import rmlx`로 Python에서 RMLX의 Array 및 DType을 사용할 수 있게 합니다. maturin으로 빌드하며, Python 3.9+를 지원합니다.
+`rmlx-python` is a PyO3 0.28-based Python binding that enables using RMLX's Array and DType from Python via `import rmlx`. It is built with maturin and supports Python 3.9+.
 
-> **상태:** PyDType (3종 float 타입), PyArray (생성, 산술, 리덕션, reshape)가 구현되어 있습니다.
+> **Status:** PyDType (3 float types) and PyArray (creation, arithmetic, reductions, reshape) are implemented.
 
 ---
 
-## 모듈 구조
+## Module Structure
 
 ```
 rmlx-python/
 ├── Cargo.toml          # cdylib, PyO3 0.28, maturin
 └── src/
-    ├── lib.rs           # PyO3 모듈 선언 (rmlx)
-    ├── dtype_wrapper.rs # PyDType 클래스
-    └── array_wrapper.rs # PyArray 클래스
+    ├── lib.rs           # PyO3 module declaration (rmlx)
+    ├── dtype_wrapper.rs # PyDType class
+    └── array_wrapper.rs # PyArray class
 ```
 
-### Cargo.toml 핵심 설정
+### Cargo.toml Key Configuration
 
 ```toml
 [lib]
@@ -35,7 +35,7 @@ pyo3 = { version = "0.28", features = ["extension-module"] }
 
 ---
 
-## 모듈 진입점 (`lib.rs`)
+## Module Entry Point (`lib.rs`)
 
 ```rust
 #[pyfunction]
@@ -54,16 +54,16 @@ mod rmlx {
 }
 ```
 
-Python에서 노출되는 이름:
-- `rmlx.Array` → `PyArray`
-- `rmlx.DType` → `PyDType`
-- `rmlx.version()` → 패키지 버전 문자열
+Names exposed to Python:
+- `rmlx.Array` -> `PyArray`
+- `rmlx.DType` -> `PyDType`
+- `rmlx.version()` -> package version string
 
 ---
 
-## PyDType 클래스 (`dtype_wrapper.rs`)
+## PyDType Class (`dtype_wrapper.rs`)
 
-`rmlx_core::dtype::DType`을 래핑하는 불변(frozen) Python 클래스입니다.
+A frozen Python class wrapping `rmlx_core::dtype::DType`.
 
 ```rust
 #[pyclass(name = "DType", frozen, skip_from_py_object)]
@@ -72,92 +72,92 @@ pub struct PyDType {
 }
 ```
 
-### Static 생성 메서드
+### Static Creation Methods
 
-| Python | 내부 DType |
-|--------|-----------|
+| Python | Internal DType |
+|--------|---------------|
 | `DType.float32()` | `DType::Float32` |
 | `DType.float16()` | `DType::Float16` |
 | `DType.bfloat16()` | `DType::Bfloat16` |
 
-### 인스턴스 메서드
+### Instance Methods
 
-| 메서드 | 반환 | 설명 |
-|--------|------|------|
-| `name()` | `str` | 타입 이름 (예: `"float32"`) |
-| `size()` | `int` | 요소 크기 (바이트) |
-| `__repr__()` | `str` | `"DType.float32"` 형식 |
-| `__str__()` | `str` | `"float32"` 형식 |
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `name()` | `str` | Type name (e.g., `"float32"`) |
+| `size()` | `int` | Element size in bytes |
+| `__repr__()` | `str` | `"DType.float32"` format |
+| `__str__()` | `str` | `"float32"` format |
 
 ---
 
-## PyArray 클래스 (`array_wrapper.rs`)
+## PyArray Class (`array_wrapper.rs`)
 
-f32 데이터를 가진 N차원 배열입니다. shape 검증, 산술 연산, 리덕션을 지원합니다.
+An N-dimensional array holding f32 data. Supports shape validation, arithmetic operations, and reductions.
 
 ```rust
 #[pyclass(name = "Array")]
 pub struct PyArray {
     shape: Vec<usize>,
     data: Vec<f32>,
-    dtype_name: String,   // 현재 "float32" 고정
+    dtype_name: String,   // currently fixed to "float32"
 }
 ```
 
-### 생성자
+### Constructors
 
-| Python | 설명 |
-|--------|------|
-| `Array(data, shape)` | 데이터와 형상으로 생성 (길이 불일치 시 ValueError) |
-| `Array.zeros(shape)` | 0으로 초기화 |
-| `Array.ones(shape)` | 1.0으로 초기화 |
-| `Array.from_list(data, shape)` | `Array(data, shape)`와 동일 |
+| Python | Description |
+|--------|-------------|
+| `Array(data, shape)` | Creates from data and shape (ValueError on length mismatch) |
+| `Array.zeros(shape)` | Initializes with zeros |
+| `Array.ones(shape)` | Initializes with 1.0 |
+| `Array.from_list(data, shape)` | Same as `Array(data, shape)` |
 
-### 속성 (Properties)
+### Properties
 
-| 속성 | 타입 | 설명 |
-|------|------|------|
-| `shape` | `list[int]` | 배열 형상 |
-| `ndim` | `int` | 차원 수 |
-| `size` | `int` | 총 요소 수 |
-| `dtype` | `str` | 데이터 타입 이름 |
+| Property | Type | Description |
+|----------|------|-------------|
+| `shape` | `list[int]` | Array shape |
+| `ndim` | `int` | Number of dimensions |
+| `size` | `int` | Total number of elements |
+| `dtype` | `str` | Data type name |
 
-### 연산 메서드
+### Operation Methods
 
-| 메서드 | 설명 |
-|--------|------|
-| `reshape(new_shape)` | 새 형상으로 재배치 (총 요소 수 일치 필수) |
-| `tolist()` | `list[float]`로 데이터 추출 |
-| `__add__(other)` | 원소별 덧셈 (shape 일치 필수) |
-| `__mul__(other)` | 원소별 곱셈 (shape 일치 필수) |
-| `__len__()` | 총 요소 수 |
-| `__repr__()` | `"Array(shape=[2, 3], dtype=float32)"` 형식 |
+| Method | Description |
+|--------|-------------|
+| `reshape(new_shape)` | Reshapes to new shape (total element count must match) |
+| `tolist()` | Extracts data as `list[float]` |
+| `__add__(other)` | Element-wise addition (shapes must match) |
+| `__mul__(other)` | Element-wise multiplication (shapes must match) |
+| `__len__()` | Total number of elements |
+| `__repr__()` | `"Array(shape=[2, 3], dtype=float32)"` format |
 
-### 리덕션
+### Reductions
 
-| 메서드 | 반환 | 설명 |
-|--------|------|------|
-| `sum()` | `float` | 전체 합 |
-| `max()` | `float` or `None` | 최댓값 |
-| `min()` | `float` or `None` | 최솟값 |
-| `mean()` | `float` | 평균 |
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `sum()` | `float` | Total sum |
+| `max()` | `float` or `None` | Maximum value |
+| `min()` | `float` or `None` | Minimum value |
+| `mean()` | `float` | Mean |
 
 ---
 
-## 빌드 및 설치
+## Build and Installation
 
-### maturin으로 빌드
+### Building with maturin
 
 ```bash
-# 개발 빌드 (현재 venv에 설치)
+# Development build (installs into current venv)
 cd crates/rmlx-python
 maturin develop --release
 
-# 휠 빌드
+# Wheel build
 maturin build --release
 ```
 
-### 요구사항
+### Requirements
 
 - Python 3.9+
 - Rust stable
@@ -165,12 +165,12 @@ maturin build --release
 
 ---
 
-## Python 사용 예시
+## Python Usage Example
 
 ```python
 import rmlx
 
-# 버전 확인
+# Check version
 print(rmlx.version())
 
 # DType
@@ -178,7 +178,7 @@ dt = rmlx.DType.float32()
 print(dt.name())   # "float32"
 print(dt.size())   # 4
 
-# Array 생성
+# Array creation
 a = rmlx.Array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], [2, 3])
 print(a.shape)     # [2, 3]
 print(a.ndim)      # 2
@@ -189,12 +189,12 @@ print(a.dtype)     # "float32"
 z = rmlx.Array.zeros([3, 4])
 o = rmlx.Array.ones([2, 2])
 
-# 산술 연산
+# Arithmetic operations
 b = rmlx.Array([6.0, 5.0, 4.0, 3.0, 2.0, 1.0], [2, 3])
-c = a + b          # 원소별 덧셈
-d = a * b          # 원소별 곱셈
+c = a + b          # element-wise addition
+d = a * b          # element-wise multiplication
 
-# 리덕션
+# Reductions
 print(a.sum())     # 21.0
 print(a.max())     # 6.0
 print(a.min())     # 1.0
@@ -204,13 +204,13 @@ print(a.mean())    # 3.5
 r = a.reshape([3, 2])
 print(r.shape)     # [3, 2]
 
-# 데이터 추출
+# Data extraction
 data = a.tolist()  # [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
 ```
 
 ---
 
-## 의존성
+## Dependencies
 
 ```toml
 [dependencies]
