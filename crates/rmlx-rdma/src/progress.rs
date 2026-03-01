@@ -113,7 +113,11 @@ impl PendingOp {
     }
 
     /// Blocking wait with timeout.
-    pub fn wait(self, timeout: Duration) -> Result<Completion, WaitError> {
+    ///
+    /// Takes `&self` so the caller retains ownership. This is critical for
+    /// `OwnedPendingOp`: on timeout the MR must stay alive because the WR
+    /// is still in flight.
+    pub fn wait(&self, timeout: Duration) -> Result<Completion, WaitError> {
         // Fast path: already done
         if let Some(r) = self.try_poll() {
             return r.map_err(WaitError::OpFailed);
@@ -170,8 +174,9 @@ impl OwnedPendingOp {
         self.pending.is_pending()
     }
 
-    /// Blocking wait with timeout. Consumes self, deregistering the MR on return.
-    pub fn wait(self, timeout: Duration) -> Result<Completion, WaitError> {
+    /// Blocking wait with timeout. The MR stays alive regardless of outcome.
+    /// Drop `self` after the operation completes to deregister the MR.
+    pub fn wait(&self, timeout: Duration) -> Result<Completion, WaitError> {
         self.pending.wait(timeout)
     }
 
@@ -180,8 +185,16 @@ impl OwnedPendingOp {
         self.pending.wr_id()
     }
 
-    /// Decompose into the inner `PendingOp`, discarding the MR (deregisters it).
+    /// Decompose into the inner `PendingOp`, releasing the MR.
+    ///
+    /// # Panics
+    /// Panics if the operation is still pending. Wait for completion before calling this.
     pub fn into_pending(self) -> PendingOp {
+        assert!(
+            !self.pending.is_pending(),
+            "cannot release MR: RDMA operation still pending (wr_id={})",
+            self.pending.wr_id()
+        );
         self.pending
     }
 }

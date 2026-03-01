@@ -90,9 +90,8 @@ impl EpRuntimeContext {
                 let result = transport.dispatch_descriptor(desc, wr_id, &buffers);
                 match result {
                     Ok(()) => {
-                        counters
-                            .rdma_ops_posted
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // rdma_ops_posted is already incremented inside dispatch_descriptor
+                        // via record_rdma_transfer(). No additional increment needed here.
                     }
                     Err(e) => {
                         eprintln!("[ep-runtime] dispatch_descriptor error: {e}");
