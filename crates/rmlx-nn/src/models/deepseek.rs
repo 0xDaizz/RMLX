@@ -20,6 +20,7 @@ pub fn deepseek_v3() -> TransformerConfig {
                 num_experts_per_token: 8,
                 hidden_dim: 7168,
                 intermediate_dim: 2048,
+                capacity_factor: 1.25,
             },
         },
     }

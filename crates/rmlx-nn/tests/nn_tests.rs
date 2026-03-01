@@ -52,6 +52,7 @@ fn test_moe_layer() {
         num_experts_per_token: 2,
         hidden_dim: 4096,
         intermediate_dim: 14336,
+        capacity_factor: 1.0,
     })
     .expect("MoeLayer::new failed");
     assert_eq!(moe.num_experts(), 8);
@@ -176,7 +177,7 @@ fn test_linear_forward_no_bias() {
         .forward(&input, &registry, &queue)
         .expect("forward failed");
     assert_eq!(output.shape(), &[1, 2]);
-    let vals: Vec<f32> = unsafe { output.to_vec() };
+    let vals: Vec<f32> = output.to_vec_checked();
     // output = input @ W^T = [5, 6, 7] @ [[1, 0], [0, 1], [0, 0]] = [5, 6]
     assert!(
         (vals[0] - 5.0).abs() < 1e-3,
@@ -234,7 +235,7 @@ fn test_linear_forward_with_bias_batch1() {
         .forward(&input, &registry, &queue)
         .expect("forward failed");
     assert_eq!(output.shape(), &[1, 2]);
-    let vals: Vec<f32> = unsafe { output.to_vec() };
+    let vals: Vec<f32> = output.to_vec_checked();
     // output = [5, 6] + [10, 20] = [15, 26]
     assert!(
         (vals[0] - 15.0).abs() < 1e-3,
@@ -274,7 +275,7 @@ fn test_linear_forward_with_bias_batch2() {
         .forward(&input, &registry, &queue)
         .expect("forward failed");
     assert_eq!(output.shape(), &[2, 2]);
-    let vals: Vec<f32> = unsafe { output.to_vec() };
+    let vals: Vec<f32> = output.to_vec_checked();
     // Row 0: [5, 6] + [10, 20] = [15, 26]
     assert!(
         (vals[0] - 15.0).abs() < 1e-3,
@@ -330,7 +331,7 @@ fn test_embedding_forward() {
         .forward(&[0, 2, 3], &registry, &queue)
         .expect("forward failed");
     assert_eq!(output.shape(), &[3, 3]);
-    let vals: Vec<f32> = unsafe { output.to_vec() };
+    let vals: Vec<f32> = output.to_vec_checked();
     // Token 0: [1, 2, 3]
     assert!((vals[0] - 1.0).abs() < 1e-3);
     assert!((vals[1] - 2.0).abs() < 1e-3);
@@ -428,7 +429,7 @@ fn test_attention_forward_identity() {
     assert_eq!(output.shape(), &[2, 8]);
 
     // Just verify it produces a valid output (not NaN/zero everywhere)
-    let vals: Vec<f32> = unsafe { output.to_vec() };
+    let vals: Vec<f32> = output.to_vec_checked();
     let sum: f32 = vals.iter().sum();
     assert!(
         sum.is_finite(),
@@ -492,6 +493,7 @@ fn test_moe_forward() {
             num_experts_per_token: top_k,
             hidden_dim,
             intermediate_dim,
+            capacity_factor: 1.0,
         },
         gate,
         vec![expert0, expert1],
@@ -509,7 +511,7 @@ fn test_moe_forward() {
         .expect("moe forward failed");
     assert_eq!(output.shape(), &[2, 4]);
 
-    let vals: Vec<f32> = unsafe { output.to_vec() };
+    let vals: Vec<f32> = output.to_vec_checked();
     let sum: f32 = vals.iter().sum();
     assert!(sum.is_finite(), "MoE output contains non-finite values");
     assert!(sum.abs() > 1e-6, "MoE output is all zeros");
@@ -527,6 +529,7 @@ fn test_moe_no_weights_errors() {
         num_experts_per_token: 1,
         hidden_dim: 4,
         intermediate_dim: 8,
+        capacity_factor: 1.0,
     })
     .expect("MoeLayer::new failed");
     let input = Array::from_slice(dev, &[1.0f32, 2.0, 3.0, 4.0], vec![1, 4]);
@@ -590,7 +593,7 @@ fn test_transformer_block_forward() {
         .expect("transformer block forward failed");
     assert_eq!(output.shape(), &[2, 8]);
 
-    let vals: Vec<f32> = unsafe { output.to_vec() };
+    let vals: Vec<f32> = output.to_vec_checked();
     let sum: f32 = vals.iter().sum();
     assert!(sum.is_finite(), "block output contains non-finite values");
 }
@@ -700,7 +703,7 @@ fn test_transformer_model_forward() {
     // Expected output shape: [3, 8] (3 tokens, 8 vocab logits each)
     assert_eq!(logits.shape(), &[3, vocab_size]);
 
-    let vals: Vec<f32> = unsafe { logits.to_vec() };
+    let vals: Vec<f32> = logits.to_vec_checked();
     let sum: f32 = vals.iter().sum();
     assert!(sum.is_finite(), "model output contains non-finite values");
 }
@@ -762,6 +765,7 @@ fn test_moe_config_zero_experts() {
         num_experts_per_token: 1,
         hidden_dim: 256,
         intermediate_dim: 512,
+        capacity_factor: 1.0,
     });
     assert!(result.is_err(), "num_experts=0 should fail");
 }
@@ -773,6 +777,7 @@ fn test_moe_config_zero_experts_per_token() {
         num_experts_per_token: 0,
         hidden_dim: 256,
         intermediate_dim: 512,
+        capacity_factor: 1.0,
     });
     assert!(result.is_err(), "num_experts_per_token=0 should fail");
 }
@@ -784,6 +789,7 @@ fn test_moe_config_top_k_exceeds_experts() {
         num_experts_per_token: 5,
         hidden_dim: 256,
         intermediate_dim: 512,
+        capacity_factor: 1.0,
     });
     assert!(
         result.is_err(),
@@ -798,6 +804,7 @@ fn test_moe_config_zero_hidden_dim() {
         num_experts_per_token: 2,
         hidden_dim: 0,
         intermediate_dim: 512,
+        capacity_factor: 1.0,
     });
     assert!(result.is_err(), "hidden_dim=0 should fail");
 }

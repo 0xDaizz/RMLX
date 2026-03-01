@@ -5,8 +5,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rmlx_rdma::connection::RdmaConnection;
+use rmlx_rdma::exchange_tag::{encode_wr_id, try_decode_wr_id, ExchangeTag};
+use rmlx_rdma::gpu_doorbell::{RdmaDescriptor, RdmaOp};
 use rmlx_rdma::multi_port::StripeEngine;
+use rmlx_rdma::progress::{PendingOp, ProgressEngine};
 use rmlx_rdma::rdma_metrics::RdmaMetrics;
+use rmlx_rdma::shared_buffer::{ConnectionId, SharedBuffer};
 use rmlx_rdma::RdmaError;
 
 use crate::group::{DistributedError, RdmaTransport};
@@ -20,16 +24,24 @@ use crate::group::{DistributedError, RdmaTransport};
 ///
 /// `connections[i]` is the connection to peer rank `i`.
 /// The slot at `connections[local_rank]` is unused (no self-connection).
-/// Per-peer wr_id encoding: `(seq << 1) | send_recv_bit`.
-/// Bit 0 = 0 for send, 1 for recv.
-const WR_ID_SEND_BIT: u64 = 0;
-const WR_ID_RECV_BIT: u64 = 1;
-
+///
+/// wr_id encoding uses `encode_wr_id(seq, tag, buf_slot, peer_id)` from
+/// `rmlx_rdma::exchange_tag` — a structured 64-bit layout with:
+/// - [63..24] seq (40 bits), [23..16] tag (8 bits),
+/// - [15..8] buf_slot (8 bits), [7..0] peer_id (8 bits).
 pub struct RdmaConnectionTransport {
     connections: Vec<Mutex<RdmaConnection>>,
     local_rank: u32,
     metrics: Arc<RdmaMetrics>,
     stripe_engine: Option<StripeEngine>,
+    /// Optional secondary connections for dual-port TB5 striping.
+    /// When present, secondary stripe chunks are sent/received via these connections.
+    /// `secondary_connections[i]` is the secondary connection to peer rank `i`.
+    secondary_connections: Option<Vec<Mutex<RdmaConnection>>>,
+    /// Optional progress engine for async (non-blocking) send/recv.
+    /// When present, `send_async`/`recv_async` register ops with the engine
+    /// and return `PendingOp` handles instead of blocking on completion.
+    progress_engine: Option<Arc<ProgressEngine>>,
     /// Per-peer monotonic sequence counter for unique wr_id generation.
     /// `wr_id_seqs[peer_rank]` generates sequence numbers for that peer.
     wr_id_seqs: Vec<AtomicU64>,
@@ -49,6 +61,8 @@ impl RdmaConnectionTransport {
             local_rank,
             metrics: Arc::new(RdmaMetrics::new()),
             stripe_engine: None,
+            secondary_connections: None,
+            progress_engine: None,
             wr_id_seqs,
         }
     }
@@ -62,11 +76,41 @@ impl RdmaConnectionTransport {
         self
     }
 
+    /// Attach secondary connections for dual-port TB5 striping.
+    ///
+    /// When set along with a StripeEngine, secondary stripe chunks are
+    /// routed through these connections for true dual-port bandwidth.
+    /// `secondary` must have the same length as the primary connections.
+    pub fn with_secondary_connections(mut self, secondary: Vec<RdmaConnection>) -> Self {
+        self.secondary_connections = Some(secondary.into_iter().map(Mutex::new).collect());
+        self
+    }
+
     /// Whether dual-port striping is configured.
     pub fn has_striping(&self) -> bool {
         self.stripe_engine
             .as_ref()
             .is_some_and(|e| e.config().has_dual())
+    }
+
+    /// Whether secondary connections are available for true dual-port I/O.
+    pub fn has_secondary(&self) -> bool {
+        self.secondary_connections.is_some()
+    }
+
+    /// Attach a ProgressEngine for async (non-blocking) send/recv.
+    ///
+    /// When set, `send_async`/`recv_async` methods become available,
+    /// returning `PendingOp` handles that can be polled or waited on
+    /// without blocking the caller.
+    pub fn with_progress_engine(mut self, engine: Arc<ProgressEngine>) -> Self {
+        self.progress_engine = Some(engine);
+        self
+    }
+
+    /// Whether a progress engine is attached for async operations.
+    pub fn has_progress_engine(&self) -> bool {
+        self.progress_engine.is_some()
     }
 
     /// This node's rank.
@@ -92,11 +136,12 @@ const STRIPE_CHUNK_SIZE: usize = 64 * 1024;
 const STRIPE_BYTE_THRESHOLD: usize = 256 * 1024;
 
 impl RdmaConnectionTransport {
-    /// Generate a unique wr_id for a peer.
-    /// Encoding: `(seq << 1) | send_recv_bit`
-    fn next_wr_id(&self, peer_rank: u32, send_recv_bit: u64) -> u64 {
+    /// Generate a unique wr_id for a peer using the structured encoding.
+    ///
+    /// Layout: `encode_wr_id(seq, tag, buf_slot, peer_id)` — see `exchange_tag`.
+    fn next_wr_id(&self, peer_rank: u32, tag: ExchangeTag, buf_slot: u8) -> u64 {
         let seq = self.wr_id_seqs[peer_rank as usize].fetch_add(1, Ordering::Relaxed);
-        (seq << 1) | send_recv_bit
+        encode_wr_id(seq, tag, buf_slot, peer_rank as u8)
     }
 
     /// Check whether striping should be used for the given data size.
@@ -108,12 +153,11 @@ impl RdmaConnectionTransport {
                 .is_some_and(|e| e.config().has_dual())
     }
 
-    /// Send data using stripe engine chunking over the primary connection.
+    /// Send data using stripe engine chunking.
     ///
-    /// Splits data into chunks per the stripe plan and sends each chunk
-    /// as a separate RDMA send. Primary and secondary chunks are both sent
-    /// via the primary connection (single connection per peer). When secondary
-    /// connections are added, secondary chunks can be routed to the secondary port.
+    /// Splits data into chunks per the stripe plan. Primary chunks are sent
+    /// via the primary connection. Secondary chunks are routed to the secondary
+    /// connection when available, otherwise they also go through the primary.
     fn send_striped(
         &self,
         data: &[u8],
@@ -128,26 +172,51 @@ impl RdmaConnectionTransport {
         let plan = engine.plan(data.len(), STRIPE_CHUNK_SIZE);
         let (primary_slices, secondary_slices) = engine.split_by_plan(data, &plan);
 
-        // Send all chunks (primary then secondary) via the primary connection.
-        // Each chunk is a separate RDMA send for better pipeline utilization.
-        for chunk in primary_slices.iter().chain(secondary_slices.iter()) {
-            let wr_id = self.next_wr_id(dst_rank, WR_ID_SEND_BIT);
-            let mr = unsafe {
-                conn.register_mr(chunk.as_ptr() as *mut c_void, chunk.len())
-                    .map_err(|e| {
-                        self.metrics.record_send_error();
-                        rdma_to_distributed(e)
-                    })?
-            };
+        // Send primary chunks via primary connection
+        for chunk in primary_slices.iter() {
+            let wr_id = self.next_wr_id(dst_rank, ExchangeTag::Data, 0);
+            let reg = conn.register_send_slice(chunk).map_err(|e| {
+                self.metrics.record_send_error();
+                rdma_to_distributed_enhanced(e, wr_id)
+            })?;
             let op = conn
-                .post_send(&mr, 0, chunk.len() as u32, wr_id)
+                .post_send(reg.mr(), 0, chunk.len() as u32, wr_id)
                 .map_err(|e| {
                     self.metrics.record_send_error();
-                    rdma_to_distributed(e)
+                    rdma_to_distributed_enhanced(e, wr_id)
                 })?;
             conn.wait_posted(&[op]).map_err(|e| {
                 self.metrics.record_send_error();
-                rdma_to_distributed(e)
+                rdma_to_distributed_enhanced(e, wr_id)
+            })?;
+        }
+
+        // Send secondary chunks: use secondary connection if available, else primary
+        let sec_conn_guard;
+        let sec_conn: &RdmaConnection = if let Some(ref sec_conns) = self.secondary_connections {
+            sec_conn_guard = sec_conns[dst_rank as usize]
+                .lock()
+                .map_err(|e| DistributedError::Transport(format!("secondary lock poisoned: {e}")))?;
+            &sec_conn_guard
+        } else {
+            conn
+        };
+
+        for chunk in secondary_slices.iter() {
+            let wr_id = self.next_wr_id(dst_rank, ExchangeTag::Data, 1);
+            let reg = sec_conn.register_send_slice(chunk).map_err(|e| {
+                self.metrics.record_send_error();
+                rdma_to_distributed_enhanced(e, wr_id)
+            })?;
+            let op = sec_conn
+                .post_send(reg.mr(), 0, chunk.len() as u32, wr_id)
+                .map_err(|e| {
+                    self.metrics.record_send_error();
+                    rdma_to_distributed_enhanced(e, wr_id)
+                })?;
+            sec_conn.wait_posted(&[op]).map_err(|e| {
+                self.metrics.record_send_error();
+                rdma_to_distributed_enhanced(e, wr_id)
             })?;
         }
 
@@ -155,10 +224,11 @@ impl RdmaConnectionTransport {
         Ok(())
     }
 
-    /// Receive data using stripe engine chunking over the primary connection.
+    /// Receive data using stripe engine chunking.
     ///
-    /// Receives chunks matching the stripe plan, then reassembles into the
-    /// original byte order.
+    /// Primary chunks are received on the primary connection. Secondary chunks
+    /// are received on the secondary connection when available, otherwise on
+    /// the primary. Reassembles into original byte order.
     fn recv_striped(
         &self,
         src_rank: u32,
@@ -171,25 +241,20 @@ impl RdmaConnectionTransport {
             .ok_or_else(|| DistributedError::Transport("stripe_engine not set".into()))?;
 
         let plan = engine.plan(len, STRIPE_CHUNK_SIZE);
+        let primary_count = plan.primary_chunks.len();
+        let secondary_count = plan.secondary_chunks.len();
 
         // UC mode: post ALL recvs upfront before any sends arrive, to prevent
         // silent data drops when a send completes before matching recv is posted.
-        //
-        // Phase 1: Allocate ALL buffers and register ALL MRs
-        // Phase 2: Post ALL recvs (now mrs Vec is immutable)
-        // Phase 3: Wait for ALL completions
-        let all_chunks: Vec<_> = plan
-            .primary_chunks
-            .iter()
-            .chain(plan.secondary_chunks.iter())
-            .collect();
 
-        let mut bufs: Vec<Vec<u8>> = Vec::with_capacity(all_chunks.len());
-        let mut mrs = Vec::with_capacity(all_chunks.len());
+        // --- Primary chunks: allocate, register, post on primary connection ---
+        let mut primary_bufs: Vec<Vec<u8>> = Vec::with_capacity(primary_count);
+        let mut primary_mrs = Vec::with_capacity(primary_count);
 
-        // Phase 1: allocate buffers + register MRs
-        for chunk_assign in &all_chunks {
+        for chunk_assign in &plan.primary_chunks {
             let mut buf = vec![0u8; chunk_assign.length];
+            // SAFETY: buf is heap-allocated; moving the Vec does not invalidate its
+            // heap pointer. The MR is dropped before the buffer (see drop order below).
             let mr = unsafe {
                 conn.register_mr(buf.as_mut_ptr() as *mut c_void, chunk_assign.length)
                     .map_err(|e| {
@@ -197,46 +262,597 @@ impl RdmaConnectionTransport {
                         rdma_to_distributed(e)
                     })?
             };
-            mrs.push(mr);
-            bufs.push(buf);
+            primary_mrs.push(mr);
+            primary_bufs.push(buf);
         }
 
-        // Phase 2: post ALL recvs (mrs is now immutable)
-        let mut posted_ops = Vec::with_capacity(all_chunks.len());
-        for (i, chunk_assign) in all_chunks.iter().enumerate() {
-            let wr_id = self.next_wr_id(src_rank, WR_ID_RECV_BIT);
+        let mut primary_ops = Vec::with_capacity(primary_count);
+        for (i, chunk_assign) in plan.primary_chunks.iter().enumerate() {
+            let wr_id = self.next_wr_id(src_rank, ExchangeTag::Data, 0);
             let op = conn
-                .post_recv(&mrs[i], 0, chunk_assign.length as u32, wr_id)
+                .post_recv(&primary_mrs[i], 0, chunk_assign.length as u32, wr_id)
                 .map_err(|e| {
                     self.metrics.record_recv_error();
-                    rdma_to_distributed(e)
+                    rdma_to_distributed_enhanced(e, wr_id)
                 })?;
-            posted_ops.push(op);
+            primary_ops.push(op);
         }
 
-        // Phase 3: wait for ALL posted recvs at once
-        conn.wait_posted(&posted_ops).map_err(|e| {
+        // --- Secondary chunks: use secondary connection if available ---
+        let sec_conn_guard;
+        let sec_conn: &RdmaConnection = if let Some(ref sec_conns) = self.secondary_connections {
+            sec_conn_guard = sec_conns[src_rank as usize]
+                .lock()
+                .map_err(|e| DistributedError::Transport(format!("secondary lock poisoned: {e}")))?;
+            &sec_conn_guard
+        } else {
+            conn
+        };
+
+        let mut secondary_bufs: Vec<Vec<u8>> = Vec::with_capacity(secondary_count);
+        let mut secondary_mrs = Vec::with_capacity(secondary_count);
+
+        for chunk_assign in &plan.secondary_chunks {
+            let mut buf = vec![0u8; chunk_assign.length];
+            // SAFETY: buf is heap-allocated; moving the Vec does not invalidate its
+            // heap pointer. The MR is dropped before the buffer (see drop order below).
+            let mr = unsafe {
+                sec_conn
+                    .register_mr(buf.as_mut_ptr() as *mut c_void, chunk_assign.length)
+                    .map_err(|e| {
+                        self.metrics.record_recv_error();
+                        rdma_to_distributed(e)
+                    })?
+            };
+            secondary_mrs.push(mr);
+            secondary_bufs.push(buf);
+        }
+
+        let mut secondary_ops = Vec::with_capacity(secondary_count);
+        for (i, chunk_assign) in plan.secondary_chunks.iter().enumerate() {
+            let wr_id = self.next_wr_id(src_rank, ExchangeTag::Data, 1);
+            let op = sec_conn
+                .post_recv(&secondary_mrs[i], 0, chunk_assign.length as u32, wr_id)
+                .map_err(|e| {
+                    self.metrics.record_recv_error();
+                    rdma_to_distributed_enhanced(e, wr_id)
+                })?;
+            secondary_ops.push(op);
+        }
+
+        // Wait for all posted recvs on their respective connections
+        conn.wait_posted(&primary_ops).map_err(|e| {
             self.metrics.record_recv_error();
             rdma_to_distributed(e)
         })?;
+        if self.secondary_connections.is_some() && !secondary_ops.is_empty() {
+            sec_conn.wait_posted(&secondary_ops).map_err(|e| {
+                self.metrics.record_recv_error();
+                rdma_to_distributed(e)
+            })?;
+        }
 
         // Drop ops and MRs now that all recvs completed
-        drop(posted_ops);
-        drop(mrs);
+        drop(primary_ops);
+        drop(primary_mrs);
+        drop(secondary_ops);
+        drop(secondary_mrs);
 
-        // Split received buffers back into primary/secondary for reassembly
-        let primary_count = plan.primary_chunks.len();
-        let primary_chunks: Vec<Vec<u8>> = bufs.drain(..primary_count).collect();
-        let secondary_chunks: Vec<Vec<u8>> = bufs;
-
-        let result = engine.reassemble_from_chunks(&primary_chunks, &secondary_chunks, &plan);
+        let result =
+            engine.reassemble_from_chunks(&primary_bufs, &secondary_bufs, &plan);
         self.metrics.record_recv(len as u64);
         Ok(result)
     }
 }
 
+// ─── Async (non-blocking) send/recv using ProgressEngine ───
+
+impl RdmaConnectionTransport {
+    /// Non-blocking send: posts the send and returns a `PendingOp` immediately.
+    ///
+    /// The caller must ensure the data buffer remains valid until the `PendingOp`
+    /// resolves. Requires a progress engine to be attached.
+    ///
+    /// # Safety
+    /// `data` must remain valid and unmodified until the returned `PendingOp` completes.
+    pub unsafe fn send_async(
+        &self,
+        data: &[u8],
+        dst_rank: u32,
+    ) -> Result<PendingOp, DistributedError> {
+        let engine = self.progress_engine.as_ref().ok_or_else(|| {
+            DistributedError::Transport("send_async: no progress engine attached".into())
+        })?;
+
+        let conn = self.connections[dst_rank as usize]
+            .lock()
+            .map_err(|e| DistributedError::Transport(format!("lock poisoned: {e}")))?;
+
+        let wr_id = self.next_wr_id(dst_rank, ExchangeTag::Data, 0);
+        let pending = engine.register_op(wr_id);
+
+        // SAFETY: data pointer is valid for data.len() bytes (caller guarantees
+        // `data` outlives the RDMA operation — see fn-level safety doc).
+        let mr = unsafe {
+            conn.register_mr(data.as_ptr() as *mut c_void, data.len())
+        }
+        .map_err(|e| {
+            self.metrics.record_send_error();
+            rdma_to_distributed_enhanced(e, wr_id)
+        })?;
+
+        // Post send — the MR must remain registered until completion.
+        // The caller is responsible for keeping `data` alive.
+        // We intentionally leak the MR here; in a full zero-copy pipeline,
+        // MR pool handles would manage the lifetime.
+        let _op = conn
+            .post_send(&mr, 0, data.len() as u32, wr_id)
+            .map_err(|e| {
+                self.metrics.record_send_error();
+                rdma_to_distributed_enhanced(e, wr_id)
+            })?;
+
+        // Prevent MR deregistration — caller manages lifetime.
+        std::mem::forget(mr);
+
+        self.metrics.record_send(data.len() as u64);
+        Ok(pending)
+    }
+
+    /// Non-blocking recv: posts the recv and returns a `PendingOp` immediately.
+    ///
+    /// The caller must provide a pre-allocated buffer. Requires a progress
+    /// engine to be attached.
+    ///
+    /// # Safety
+    /// `buf` must remain valid and unmodified until the returned `PendingOp` completes.
+    pub unsafe fn recv_async(
+        &self,
+        buf: &mut [u8],
+        src_rank: u32,
+    ) -> Result<PendingOp, DistributedError> {
+        let engine = self.progress_engine.as_ref().ok_or_else(|| {
+            DistributedError::Transport("recv_async: no progress engine attached".into())
+        })?;
+
+        let conn = self.connections[src_rank as usize]
+            .lock()
+            .map_err(|e| DistributedError::Transport(format!("lock poisoned: {e}")))?;
+
+        let wr_id = self.next_wr_id(src_rank, ExchangeTag::Data, 0);
+        let pending = engine.register_op(wr_id);
+
+        // SAFETY: buf pointer is valid for buf.len() bytes (caller guarantees
+        // `buf` outlives the RDMA operation — see fn-level safety doc).
+        let mr = unsafe {
+            conn.register_mr(buf.as_mut_ptr() as *mut c_void, buf.len())
+        }
+        .map_err(|e| {
+            self.metrics.record_recv_error();
+            rdma_to_distributed_enhanced(e, wr_id)
+        })?;
+
+        let _op = conn
+            .post_recv(&mr, 0, buf.len() as u32, wr_id)
+            .map_err(|e| {
+                self.metrics.record_recv_error();
+                rdma_to_distributed_enhanced(e, wr_id)
+            })?;
+
+        // Prevent MR deregistration — caller manages lifetime.
+        std::mem::forget(mr);
+
+        self.metrics.record_recv(buf.len() as u64);
+        Ok(pending)
+    }
+}
+
+// ─── UC recv-credit pre-posting for tag-based isolation ───
+
+/// A pre-posted recv credit: an allocated buffer + its PendingOp handle.
+///
+/// In UC mode, recvs must be posted before matching sends arrive.
+/// `RecvCredit` represents a single pre-posted recv slot that will capture
+/// an incoming message tagged with a specific `ExchangeTag`.
+pub struct RecvCredit {
+    /// The PendingOp handle returned by the ProgressEngine.
+    pub pending: PendingOp,
+    /// The buffer that will be written into by the RDMA recv.
+    /// Remains valid until the PendingOp completes.
+    pub buffer: Vec<u8>,
+    /// The tag this credit was posted for.
+    pub tag: ExchangeTag,
+    /// Source rank.
+    pub src_rank: u32,
+}
+
+impl RdmaConnectionTransport {
+    /// Pre-post a window of recv credits for a specific tag and peer.
+    ///
+    /// UC mode silently drops data if a recv is not posted before the
+    /// matching send arrives. This method pre-posts `count` recv buffers
+    /// of `buf_size` bytes each, all tagged with `tag`, so incoming sends
+    /// are guaranteed to find a matching recv.
+    ///
+    /// Returns a Vec of `RecvCredit` handles. Each credit's `PendingOp`
+    /// will resolve when data arrives. The caller must keep the credits
+    /// alive until they are consumed (the buffer memory is owned by the credit).
+    ///
+    /// Requires a progress engine to be attached.
+    ///
+    /// # Safety
+    /// The returned `RecvCredit`s own their buffers. The buffers are registered
+    /// as RDMA MRs using `std::mem::forget` to prevent deregistration — the
+    /// caller must ensure credits are consumed or dropped before the connection
+    /// is torn down.
+    pub unsafe fn pre_post_recv_credits(
+        &self,
+        src_rank: u32,
+        tag: ExchangeTag,
+        buf_size: usize,
+        count: usize,
+    ) -> Result<Vec<RecvCredit>, DistributedError> {
+        let engine = self.progress_engine.as_ref().ok_or_else(|| {
+            DistributedError::Transport(
+                "pre_post_recv_credits: no progress engine attached".into(),
+            )
+        })?;
+
+        let conn = self.connections[src_rank as usize]
+            .lock()
+            .map_err(|e| DistributedError::Transport(format!("lock poisoned: {e}")))?;
+
+        let mut credits = Vec::with_capacity(count);
+
+        for slot in 0..count {
+            let mut buffer = vec![0u8; buf_size];
+            let wr_id = self.next_wr_id(src_rank, tag, slot as u8);
+            let pending = engine.register_op(wr_id);
+
+            // SAFETY: buffer pointer is valid for buf_size bytes. The buffer is
+            // moved into RecvCredit which keeps it alive for the RDMA operation.
+            let mr = unsafe {
+                conn.register_mr(buffer.as_mut_ptr() as *mut c_void, buf_size)
+            }
+            .map_err(|e| {
+                self.metrics.record_recv_error();
+                rdma_to_distributed_enhanced(e, wr_id)
+            })?;
+
+            let _op = conn
+                .post_recv(&mr, 0, buf_size as u32, wr_id)
+                .map_err(|e| {
+                    self.metrics.record_recv_error();
+                    rdma_to_distributed_enhanced(e, wr_id)
+                })?;
+
+            // Prevent MR deregistration — buffer lifetime is managed by RecvCredit.
+            std::mem::forget(mr);
+
+            credits.push(RecvCredit {
+                pending,
+                buffer,
+                tag,
+                src_rank,
+            });
+        }
+
+        Ok(credits)
+    }
+
+    /// Pre-post recv credits on a SharedBuffer's pre-registered MR.
+    ///
+    /// Like `pre_post_recv_credits`, but uses the SharedBuffer's already-registered
+    /// MR instead of allocating new buffers. Each credit claims a `buf_size` slice
+    /// starting at `offset + slot * buf_size` within the SharedBuffer.
+    ///
+    /// This is the zero-copy variant: received data lands directly in GPU-visible memory.
+    pub fn pre_post_recv_credits_zero_copy(
+        &self,
+        src_rank: u32,
+        tag: ExchangeTag,
+        buf: &SharedBuffer,
+        conn_id: &ConnectionId,
+        offset: usize,
+        buf_size: usize,
+        count: usize,
+    ) -> Result<Vec<PendingOp>, DistributedError> {
+        let engine = self.progress_engine.as_ref().ok_or_else(|| {
+            DistributedError::Transport(
+                "pre_post_recv_credits_zero_copy: no progress engine attached".into(),
+            )
+        })?;
+
+        let conn = self.connections[src_rank as usize]
+            .lock()
+            .map_err(|e| DistributedError::Transport(format!("lock poisoned: {e}")))?;
+
+        let mr = buf.rdma_mr(conn_id).ok_or_else(|| {
+            DistributedError::Transport(format!(
+                "SharedBuffer not registered on connection {:?}",
+                conn_id
+            ))
+        })?;
+
+        let mut ops = Vec::with_capacity(count);
+
+        for slot in 0..count {
+            let slot_offset = offset + slot * buf_size;
+            if slot_offset + buf_size > buf.size() {
+                return Err(DistributedError::Transport(format!(
+                    "recv credit slot {} exceeds SharedBuffer size (offset={}, buf_size={}, total={})",
+                    slot, slot_offset, buf_size, buf.size()
+                )));
+            }
+
+            let wr_id = self.next_wr_id(src_rank, tag, buf.slot_index());
+            let pending = engine.register_op(wr_id);
+
+            let _op = conn
+                .post_recv(mr, slot_offset, buf_size as u32, wr_id)
+                .map_err(|e| {
+                    self.metrics.record_recv_error();
+                    rdma_to_distributed_enhanced(e, wr_id)
+                })?;
+
+            ops.push(pending);
+        }
+
+        Ok(ops)
+    }
+}
+
+// ─── GPU-proxy integration for descriptor ring dispatch ───
+
+impl RdmaConnectionTransport {
+    /// Dispatch a single GPU-written descriptor by posting the corresponding
+    /// ibv_post_send/recv on the appropriate connection.
+    ///
+    /// `buffers` maps buf_slot index to (SharedBuffer, ConnectionId) pairs.
+    /// The method looks up the pre-registered MR from the SharedBuffer and
+    /// posts the send/recv on the peer's connection.
+    ///
+    /// This is meant to be called from a DescriptorProxy handler running on
+    /// the same thread that owns the SharedBuffers (since SharedBuffer is
+    /// Send but not Sync).
+    pub fn dispatch_descriptor(
+        &self,
+        desc: &RdmaDescriptor,
+        wr_id: u64,
+        buffers: &[(SharedBuffer, ConnectionId)],
+    ) -> Result<(), DistributedError> {
+        let peer_id = desc.peer_id as u32;
+        let buf_slot = desc.buf_slot as usize;
+
+        if buf_slot >= buffers.len() {
+            return Err(DistributedError::Transport(format!(
+                "descriptor buf_slot {} out of range (have {})",
+                buf_slot,
+                buffers.len()
+            )));
+        }
+
+        let (ref buf, ref conn_id) = buffers[buf_slot];
+        let mr = buf.rdma_mr(conn_id).ok_or_else(|| {
+            DistributedError::Transport(format!(
+                "no MR for buf_slot={} conn_id={:?}",
+                buf_slot, conn_id
+            ))
+        })?;
+
+        let conn = self.connections[peer_id as usize]
+            .lock()
+            .map_err(|e| {
+                DistributedError::Transport(format!("lock poisoned peer={peer_id}: {e}"))
+            })?;
+
+        // Register with progress engine if available
+        if let Some(ref engine) = self.progress_engine {
+            let _pending = engine.register_op(wr_id);
+        }
+
+        match desc.rdma_op() {
+            Some(RdmaOp::Send) => {
+                let _op = conn
+                    .post_send(mr, desc.offset as usize, desc.length, wr_id)
+                    .map_err(|e| rdma_to_distributed_enhanced(e, wr_id))?;
+            }
+            Some(RdmaOp::Recv) => {
+                let _op = conn
+                    .post_recv(mr, desc.offset as usize, desc.length, wr_id)
+                    .map_err(|e| rdma_to_distributed_enhanced(e, wr_id))?;
+            }
+            None => {
+                return Err(DistributedError::Transport(format!(
+                    "invalid op byte {}",
+                    desc.op
+                )));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+// ─── Zero-copy send/recv using SharedBuffer pre-registered MRs ───
+
+impl RdmaConnectionTransport {
+    /// Zero-copy send: uses the SharedBuffer's pre-registered RDMA MR directly.
+    ///
+    /// No memcpy, no ibv_reg_mr — the data is sent directly from the
+    /// SharedBuffer's memory, which is already registered on this connection's PD.
+    ///
+    /// Requires:
+    /// - `buf.rdma_mr(&conn_id)` returns a valid MR (buffer must be registered
+    ///   on this connection's protection domain)
+    /// - Data must already be written into `buf` (e.g., by a Metal compute kernel
+    ///   writing to `buf.metal_buffer()`)
+    pub fn send_zero_copy(
+        &self,
+        buf: &SharedBuffer,
+        conn_id: &ConnectionId,
+        dst_rank: u32,
+        len: u32,
+    ) -> Result<(), DistributedError> {
+        let conn = self.connections[dst_rank as usize]
+            .lock()
+            .map_err(|e| DistributedError::Transport(format!("lock poisoned: {e}")))?;
+
+        let mr = buf.rdma_mr(conn_id).ok_or_else(|| {
+            DistributedError::Transport(format!(
+                "SharedBuffer not registered on connection {:?}",
+                conn_id
+            ))
+        })?;
+
+        let wr_id = self.next_wr_id(dst_rank, ExchangeTag::Data, buf.slot_index());
+        let op = conn
+            .post_send(mr, 0, len, wr_id)
+            .map_err(|e| {
+                self.metrics.record_send_error();
+                rdma_to_distributed_enhanced(e, wr_id)
+            })?;
+        conn.wait_posted(&[op]).map_err(|e| {
+            self.metrics.record_send_error();
+            rdma_to_distributed_enhanced(e, wr_id)
+        })?;
+
+        self.metrics.record_send(len as u64);
+        Ok(())
+    }
+
+    /// Zero-copy recv: posts a recv using the SharedBuffer's pre-registered MR.
+    ///
+    /// The received data lands directly in the SharedBuffer's memory, which
+    /// is simultaneously accessible as a Metal GPU buffer — no memcpy needed
+    /// for subsequent GPU compute.
+    pub fn recv_zero_copy(
+        &self,
+        buf: &SharedBuffer,
+        conn_id: &ConnectionId,
+        src_rank: u32,
+        len: u32,
+    ) -> Result<(), DistributedError> {
+        let conn = self.connections[src_rank as usize]
+            .lock()
+            .map_err(|e| DistributedError::Transport(format!("lock poisoned: {e}")))?;
+
+        let mr = buf.rdma_mr(conn_id).ok_or_else(|| {
+            DistributedError::Transport(format!(
+                "SharedBuffer not registered on connection {:?}",
+                conn_id
+            ))
+        })?;
+
+        let wr_id = self.next_wr_id(src_rank, ExchangeTag::Data, buf.slot_index());
+        let op = conn
+            .post_recv(mr, 0, len, wr_id)
+            .map_err(|e| {
+                self.metrics.record_recv_error();
+                rdma_to_distributed_enhanced(e, wr_id)
+            })?;
+        conn.wait_posted(&[op]).map_err(|e| {
+            self.metrics.record_recv_error();
+            rdma_to_distributed_enhanced(e, wr_id)
+        })?;
+
+        self.metrics.record_recv(len as u64);
+        Ok(())
+    }
+
+    /// Zero-copy async send: posts the send using SharedBuffer's pre-registered MR
+    /// and returns a `PendingOp` immediately without blocking.
+    ///
+    /// This is the ideal data path: 0 memcpy + 0 ibv_reg_mr + non-blocking.
+    pub fn send_zero_copy_async(
+        &self,
+        buf: &SharedBuffer,
+        conn_id: &ConnectionId,
+        dst_rank: u32,
+        len: u32,
+    ) -> Result<PendingOp, DistributedError> {
+        let engine = self.progress_engine.as_ref().ok_or_else(|| {
+            DistributedError::Transport("send_zero_copy_async: no progress engine attached".into())
+        })?;
+
+        let conn = self.connections[dst_rank as usize]
+            .lock()
+            .map_err(|e| DistributedError::Transport(format!("lock poisoned: {e}")))?;
+
+        let mr = buf.rdma_mr(conn_id).ok_or_else(|| {
+            DistributedError::Transport(format!(
+                "SharedBuffer not registered on connection {:?}",
+                conn_id
+            ))
+        })?;
+
+        let wr_id = self.next_wr_id(dst_rank, ExchangeTag::Data, buf.slot_index());
+        let pending = engine.register_op(wr_id);
+
+        let _op = conn
+            .post_send(mr, 0, len, wr_id)
+            .map_err(|e| {
+                self.metrics.record_send_error();
+                rdma_to_distributed_enhanced(e, wr_id)
+            })?;
+
+        self.metrics.record_send(len as u64);
+        Ok(pending)
+    }
+
+    /// Zero-copy async recv: posts the recv using SharedBuffer's pre-registered MR
+    /// and returns a `PendingOp` immediately without blocking.
+    pub fn recv_zero_copy_async(
+        &self,
+        buf: &SharedBuffer,
+        conn_id: &ConnectionId,
+        src_rank: u32,
+        len: u32,
+    ) -> Result<PendingOp, DistributedError> {
+        let engine = self.progress_engine.as_ref().ok_or_else(|| {
+            DistributedError::Transport("recv_zero_copy_async: no progress engine attached".into())
+        })?;
+
+        let conn = self.connections[src_rank as usize]
+            .lock()
+            .map_err(|e| DistributedError::Transport(format!("lock poisoned: {e}")))?;
+
+        let mr = buf.rdma_mr(conn_id).ok_or_else(|| {
+            DistributedError::Transport(format!(
+                "SharedBuffer not registered on connection {:?}",
+                conn_id
+            ))
+        })?;
+
+        let wr_id = self.next_wr_id(src_rank, ExchangeTag::Data, buf.slot_index());
+        let pending = engine.register_op(wr_id);
+
+        let _op = conn
+            .post_recv(mr, 0, len, wr_id)
+            .map_err(|e| {
+                self.metrics.record_recv_error();
+                rdma_to_distributed_enhanced(e, wr_id)
+            })?;
+
+        self.metrics.record_recv(len as u64);
+        Ok(pending)
+    }
+}
+
 fn rdma_to_distributed(e: RdmaError) -> DistributedError {
     DistributedError::Transport(e.to_string())
+}
+
+/// Enhanced error conversion that decodes wr_id fields for richer diagnostics.
+fn rdma_to_distributed_enhanced(e: RdmaError, wr_id: u64) -> DistributedError {
+    let detail = match try_decode_wr_id(wr_id) {
+        Some(fields) => format!(
+            "{} [wr_id: seq={}, tag={:?}, slot={}, peer={}]",
+            e, fields.seq, fields.tag, fields.buf_slot, fields.peer_id
+        ),
+        None => format!("{} [wr_id: 0x{:016x} (decode failed)]", e, wr_id),
+    };
+    DistributedError::Transport(detail)
 }
 
 impl RdmaTransport for RdmaConnectionTransport {
@@ -250,27 +866,22 @@ impl RdmaTransport for RdmaConnectionTransport {
             return self.send_striped(data, dst_rank, &conn);
         }
 
-        let wr_id = self.next_wr_id(dst_rank, WR_ID_SEND_BIT);
+        let wr_id = self.next_wr_id(dst_rank, ExchangeTag::Data, 0);
 
-        // Register the data buffer as an MR for sending.
-        // SAFETY: data slice is valid for its length and lives until we complete the send.
-        let mr = unsafe {
-            conn.register_mr(data.as_ptr() as *mut c_void, data.len())
-                .map_err(|e| {
-                    self.metrics.record_send_error();
-                    rdma_to_distributed(e)
-                })?
-        };
+        let reg = conn.register_send_slice(data).map_err(|e| {
+            self.metrics.record_send_error();
+            rdma_to_distributed_enhanced(e, wr_id)
+        })?;
 
         let op = conn
-            .post_send(&mr, 0, data.len() as u32, wr_id)
+            .post_send(reg.mr(), 0, data.len() as u32, wr_id)
             .map_err(|e| {
                 self.metrics.record_send_error();
-                rdma_to_distributed(e)
+                rdma_to_distributed_enhanced(e, wr_id)
             })?;
         conn.wait_posted(&[op]).map_err(|e| {
             self.metrics.record_send_error();
-            rdma_to_distributed(e)
+            rdma_to_distributed_enhanced(e, wr_id)
         })?;
 
         self.metrics.record_send(data.len() as u64);
@@ -287,26 +898,24 @@ impl RdmaTransport for RdmaConnectionTransport {
             return self.recv_striped(src_rank, len, &conn);
         }
 
-        let wr_id = self.next_wr_id(src_rank, WR_ID_RECV_BIT);
+        let wr_id = self.next_wr_id(src_rank, ExchangeTag::Data, 0);
 
         let mut buf = vec![0u8; len];
 
-        // SAFETY: buf is valid for len bytes and lives until we complete the recv.
-        let mr = unsafe {
-            conn.register_mr(buf.as_mut_ptr() as *mut c_void, len)
-                .map_err(|e| {
-                    self.metrics.record_recv_error();
-                    rdma_to_distributed(e)
-                })?
-        };
-
-        let op = conn.post_recv(&mr, 0, len as u32, wr_id).map_err(|e| {
+        let reg = conn.register_recv_slice(&mut buf).map_err(|e| {
             self.metrics.record_recv_error();
-            rdma_to_distributed(e)
+            rdma_to_distributed_enhanced(e, wr_id)
         })?;
+
+        let op = conn
+            .post_recv(reg.mr(), 0, len as u32, wr_id)
+            .map_err(|e| {
+                self.metrics.record_recv_error();
+                rdma_to_distributed_enhanced(e, wr_id)
+            })?;
         conn.wait_posted(&[op]).map_err(|e| {
             self.metrics.record_recv_error();
-            rdma_to_distributed(e)
+            rdma_to_distributed_enhanced(e, wr_id)
         })?;
 
         self.metrics.record_recv(len as u64);
@@ -332,39 +941,33 @@ impl RdmaTransport for RdmaConnectionTransport {
 
             // Prepare recv buffer and MR
             let mut recv_buf = vec![0u8; recv_len];
-            let recv_wr_id = self.next_wr_id(src_rank, WR_ID_RECV_BIT);
-            let recv_mr = unsafe {
-                conn.register_mr(recv_buf.as_mut_ptr() as *mut c_void, recv_len)
-                    .map_err(|e| {
-                        self.metrics.record_recv_error();
-                        rdma_to_distributed(e)
-                    })?
-            };
+            let recv_wr_id = self.next_wr_id(src_rank, ExchangeTag::Data, 0);
+            let recv_reg = conn.register_recv_slice(&mut recv_buf).map_err(|e| {
+                self.metrics.record_recv_error();
+                rdma_to_distributed_enhanced(e, recv_wr_id)
+            })?;
 
             // Post recv FIRST (UC mode: must be ready before remote send)
             let recv_op = conn
-                .post_recv(&recv_mr, 0, recv_len as u32, recv_wr_id)
+                .post_recv(recv_reg.mr(), 0, recv_len as u32, recv_wr_id)
                 .map_err(|e| {
                     self.metrics.record_recv_error();
-                    rdma_to_distributed(e)
+                    rdma_to_distributed_enhanced(e, recv_wr_id)
                 })?;
 
             // Prepare send MR
-            let send_wr_id = self.next_wr_id(dst_rank, WR_ID_SEND_BIT);
-            let send_mr = unsafe {
-                conn.register_mr(send_data.as_ptr() as *mut c_void, send_data.len())
-                    .map_err(|e| {
-                        self.metrics.record_send_error();
-                        rdma_to_distributed(e)
-                    })?
-            };
+            let send_wr_id = self.next_wr_id(dst_rank, ExchangeTag::Data, 0);
+            let send_reg = conn.register_send_slice(send_data).map_err(|e| {
+                self.metrics.record_send_error();
+                rdma_to_distributed_enhanced(e, send_wr_id)
+            })?;
 
             // Post send
             let send_op = conn
-                .post_send(&send_mr, 0, send_data.len() as u32, send_wr_id)
+                .post_send(send_reg.mr(), 0, send_data.len() as u32, send_wr_id)
                 .map_err(|e| {
                     self.metrics.record_send_error();
-                    rdma_to_distributed(e)
+                    rdma_to_distributed_enhanced(e, send_wr_id)
                 })?;
 
             // Wait for both completions
@@ -373,6 +976,10 @@ impl RdmaTransport for RdmaConnectionTransport {
                 self.metrics.record_recv_error();
                 rdma_to_distributed(e)
             })?;
+
+            // Drop registrations before moving recv_buf
+            drop(recv_reg);
+            drop(send_reg);
 
             self.metrics.record_send(send_data.len() as u64);
             self.metrics.record_recv(recv_len as u64);
@@ -399,48 +1006,45 @@ impl RdmaTransport for RdmaConnectionTransport {
 
             // Post recv FIRST on src connection
             let mut recv_buf = vec![0u8; recv_len];
-            let recv_wr_id = self.next_wr_id(src_rank, WR_ID_RECV_BIT);
-            let recv_mr = unsafe {
-                src_conn
-                    .register_mr(recv_buf.as_mut_ptr() as *mut c_void, recv_len)
-                    .map_err(|e| {
-                        self.metrics.record_recv_error();
-                        rdma_to_distributed(e)
-                    })?
-            };
+            let recv_wr_id = self.next_wr_id(src_rank, ExchangeTag::Data, 0);
+            let recv_reg =
+                src_conn.register_recv_slice(&mut recv_buf).map_err(|e| {
+                    self.metrics.record_recv_error();
+                    rdma_to_distributed_enhanced(e, recv_wr_id)
+                })?;
             let recv_op = src_conn
-                .post_recv(&recv_mr, 0, recv_len as u32, recv_wr_id)
+                .post_recv(recv_reg.mr(), 0, recv_len as u32, recv_wr_id)
                 .map_err(|e| {
                     self.metrics.record_recv_error();
-                    rdma_to_distributed(e)
+                    rdma_to_distributed_enhanced(e, recv_wr_id)
                 })?;
 
             // Post send on dst connection
-            let send_wr_id = self.next_wr_id(dst_rank, WR_ID_SEND_BIT);
-            let send_mr = unsafe {
-                dst_conn
-                    .register_mr(send_data.as_ptr() as *mut c_void, send_data.len())
-                    .map_err(|e| {
-                        self.metrics.record_send_error();
-                        rdma_to_distributed(e)
-                    })?
-            };
+            let send_wr_id = self.next_wr_id(dst_rank, ExchangeTag::Data, 0);
+            let send_reg = dst_conn.register_send_slice(send_data).map_err(|e| {
+                self.metrics.record_send_error();
+                rdma_to_distributed_enhanced(e, send_wr_id)
+            })?;
             let send_op = dst_conn
-                .post_send(&send_mr, 0, send_data.len() as u32, send_wr_id)
+                .post_send(send_reg.mr(), 0, send_data.len() as u32, send_wr_id)
                 .map_err(|e| {
                     self.metrics.record_send_error();
-                    rdma_to_distributed(e)
+                    rdma_to_distributed_enhanced(e, send_wr_id)
                 })?;
 
             // Wait for both completions on their respective connections
             src_conn.wait_posted(&[recv_op]).map_err(|e| {
                 self.metrics.record_recv_error();
-                rdma_to_distributed(e)
+                rdma_to_distributed_enhanced(e, recv_wr_id)
             })?;
             dst_conn.wait_posted(&[send_op]).map_err(|e| {
                 self.metrics.record_send_error();
-                rdma_to_distributed(e)
+                rdma_to_distributed_enhanced(e, send_wr_id)
             })?;
+
+            // Drop registrations before moving recv_buf
+            drop(recv_reg);
+            drop(send_reg);
 
             self.metrics.record_send(send_data.len() as u64);
             self.metrics.record_recv(recv_len as u64);
@@ -523,40 +1127,45 @@ mod tests {
     }
 
     #[test]
-    fn test_wr_id_encoding() {
-        // Verify wr_id = (seq << 1) | send_recv_bit
-        // send bit = 0, recv bit = 1
-        let send_id_0 = (0u64 << 1) | super::WR_ID_SEND_BIT;
-        assert_eq!(send_id_0, 0);
-        assert_eq!(send_id_0 & 1, 0); // send
+    fn test_wr_id_encoding_new() {
+        use rmlx_rdma::exchange_tag::{decode_wr_id, encode_wr_id, ExchangeTag};
 
-        let recv_id_0 = (0u64 << 1) | super::WR_ID_RECV_BIT;
-        assert_eq!(recv_id_0, 1);
-        assert_eq!(recv_id_0 & 1, 1); // recv
+        // Verify encode_wr_id roundtrips correctly
+        let wr_id = encode_wr_id(42, ExchangeTag::Data, 0, 7);
+        let fields = decode_wr_id(wr_id);
+        assert_eq!(fields.seq, 42);
+        assert_eq!(fields.tag, ExchangeTag::Data);
+        assert_eq!(fields.buf_slot, 0);
+        assert_eq!(fields.peer_id, 7);
 
-        let send_id_1 = (1u64 << 1) | super::WR_ID_SEND_BIT;
-        assert_eq!(send_id_1, 2);
-        assert_eq!(send_id_1 >> 1, 1); // seq=1
-        assert_eq!(send_id_1 & 1, 0); // send
+        // Verify different tags encode distinctly
+        let warmup_id = encode_wr_id(0, ExchangeTag::Warmup, 1, 0);
+        let warmup_fields = decode_wr_id(warmup_id);
+        assert_eq!(warmup_fields.tag, ExchangeTag::Warmup);
+        assert_eq!(warmup_fields.buf_slot, 1);
 
-        let recv_id_5 = (5u64 << 1) | super::WR_ID_RECV_BIT;
-        assert_eq!(recv_id_5, 11);
-        assert_eq!(recv_id_5 >> 1, 5); // seq=5
-        assert_eq!(recv_id_5 & 1, 1); // recv
+        // Verify buf_slot 0 vs 1 (primary vs secondary) are distinct
+        let primary = encode_wr_id(10, ExchangeTag::Data, 0, 5);
+        let secondary = encode_wr_id(10, ExchangeTag::Data, 1, 5);
+        assert_ne!(primary, secondary);
     }
 
     #[test]
-    fn test_wr_id_uniqueness() {
-        // Verify that successive calls to mock send/recv produce unique wr_ids
-        // (not directly testable via the mock, but the encoding guarantees uniqueness)
+    fn test_wr_id_uniqueness_new() {
+        use rmlx_rdma::exchange_tag::{encode_wr_id, ExchangeTag};
+
+        // Verify that different seq values produce unique wr_ids for same tag/slot/peer
         let mut ids = std::collections::HashSet::new();
         for seq in 0..100u64 {
-            let send_id = (seq << 1) | super::WR_ID_SEND_BIT;
-            let recv_id = (seq << 1) | super::WR_ID_RECV_BIT;
-            assert!(ids.insert(send_id), "duplicate send wr_id at seq={seq}");
-            assert!(ids.insert(recv_id), "duplicate recv wr_id at seq={seq}");
+            let data_id = encode_wr_id(seq, ExchangeTag::Data, 0, 1);
+            assert!(ids.insert(data_id), "duplicate wr_id at seq={seq}");
         }
-        assert_eq!(ids.len(), 200);
+        assert_eq!(ids.len(), 100);
+
+        // Different peers with same seq are also unique
+        let peer0 = encode_wr_id(0, ExchangeTag::Data, 0, 0);
+        let peer1 = encode_wr_id(0, ExchangeTag::Data, 0, 1);
+        assert_ne!(peer0, peer1);
     }
 
     #[test]

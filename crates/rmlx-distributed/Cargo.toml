@@ -11,3 +11,6 @@ rmlx-core = { path = "../rmlx-core" }
 rmlx-metal = { path = "../rmlx-metal" }
 rmlx-rdma = { path = "../rmlx-rdma" }
 metal = { workspace = true }
+
+[dev-dependencies]
+rmlx-nn = { path = "../rmlx-nn" }

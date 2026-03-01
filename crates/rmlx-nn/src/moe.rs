@@ -53,6 +53,10 @@ pub struct MoeConfig {
     pub num_experts_per_token: usize,
     pub hidden_dim: usize,
     pub intermediate_dim: usize,
+    /// Expert capacity factor for dispatch (1.0 = exact, >1.0 = overprovisioned).
+    /// Links to SharedBufferPool tier selection in distributed mode.
+    /// Default: 1.0
+    pub capacity_factor: f32,
 }
 
 impl MoeConfig {
@@ -187,7 +191,7 @@ impl MoeLayer {
         let gate_probs = ops::softmax::softmax(registry, &gate_logits, queue)?;
 
         // Read gate probs to CPU for top-k selection (small enough for CPU routing)
-        let probs_vec: Vec<f32> = unsafe { gate_probs.to_vec() };
+        let probs_vec: Vec<f32> = gate_probs.to_vec_checked();
 
         // For each token, find top-k expert indices and weights
         let output = Array::zeros(dev, &[seq_len, hidden_dim], x.dtype());
@@ -297,6 +301,11 @@ impl MoeLayer {
 
     pub fn hidden_dim(&self) -> usize {
         self.config.hidden_dim
+    }
+
+    /// Expert capacity factor.
+    pub fn capacity_factor(&self) -> f32 {
+        self.config.capacity_factor
     }
 
     /// Access forward-pass metrics.

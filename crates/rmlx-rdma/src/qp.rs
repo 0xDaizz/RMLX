@@ -81,7 +81,9 @@ impl Drop for CompletionQueue {
 }
 
 // SAFETY: CQ handle is an opaque pointer safe to share across threads.
+// ibv_poll_cq is thread-safe per libibverbs documentation.
 unsafe impl Send for CompletionQueue {}
+unsafe impl Sync for CompletionQueue {}
 
 /// Queue Pair info needed for TCP exchange between peers.
 #[derive(Clone)]

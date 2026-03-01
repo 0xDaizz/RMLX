@@ -1,6 +1,8 @@
 //! PyO3 Python bindings for RMLX.
 //! Provides `import rmlx` with Array, DType, and kernel operations.
 
+#![deny(unsafe_op_in_unsafe_fn)]
+
 use pyo3::prelude::*;
 
 mod array_wrapper;

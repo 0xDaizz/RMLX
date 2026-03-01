@@ -120,12 +120,15 @@ impl Array {
         Self::from_slice(device, &data, shape.to_vec())
     }
 
-    /// Read the buffer contents as a typed Vec.
+    /// Read the buffer contents as a typed Vec (bounds-checked).
     ///
-    /// # Safety
-    /// The caller must ensure no GPU writes are in-flight to this buffer.
-    pub unsafe fn to_vec<T: HasDType + Clone>(&self) -> Vec<T> {
-        debug_assert_eq!(
+    /// Asserts that `offset + numel * size_of::<T>()` fits within the buffer,
+    /// then copies data out. Prefer this over `to_vec_unchecked` in upper layers.
+    ///
+    /// Note: callers should ensure all GPU command buffers writing to this
+    /// buffer have completed before reading, otherwise values may be stale.
+    pub fn to_vec_checked<T: HasDType + Clone>(&self) -> Vec<T> {
+        assert_eq!(
             T::DTYPE,
             self.dtype,
             "type mismatch: requested {:?} but array is {:?}",
@@ -133,10 +136,39 @@ impl Array {
             self.dtype
         );
         let numel: usize = self.shape.iter().product();
+        let byte_size = numel * std::mem::size_of::<T>();
+        assert!(
+            self.offset + byte_size <= self.buffer.length() as usize,
+            "to_vec_checked: offset({}) + data({}) exceeds buffer({})",
+            self.offset,
+            byte_size,
+            self.buffer.length()
+        );
         let base = self.buffer.contents() as *const u8;
-        let ptr = base.add(self.offset) as *const T;
-        let slice = std::slice::from_raw_parts(ptr, numel);
-        slice.to_vec()
+        // SAFETY: bounds checked above; contents() returns valid CPU-accessible
+        // pointer for StorageModeShared buffers.
+        unsafe {
+            let ptr = base.add(self.offset) as *const T;
+            std::slice::from_raw_parts(ptr, numel).to_vec()
+        }
+    }
+
+    /// Read the buffer contents as a typed Vec (unchecked).
+    ///
+    /// # Safety
+    /// The caller must ensure:
+    /// - No GPU writes are in-flight to this buffer
+    /// - `T::DTYPE` matches `self.dtype`
+    /// - `offset + numel * size_of::<T>()` fits within the buffer
+    pub unsafe fn to_vec_unchecked<T: HasDType + Clone>(&self) -> Vec<T> {
+        let numel: usize = self.shape.iter().product();
+        let base = self.buffer.contents() as *const u8;
+        // SAFETY: caller guarantees bounds and GPU completion (see fn-level doc).
+        unsafe {
+            let ptr = base.add(self.offset) as *const T;
+            let slice = std::slice::from_raw_parts(ptr, numel);
+            slice.to_vec()
+        }
     }
 
     /// Reference to the underlying Metal buffer.
@@ -177,6 +209,81 @@ impl Array {
     /// Total data size in bytes.
     pub fn byte_size(&self) -> usize {
         self.dtype.numel_to_bytes(self.numel())
+    }
+
+    /// Returns the raw bytes of this array's buffer (from offset, for numel * dtype bytes).
+    ///
+    /// Note: callers should ensure all GPU command buffers writing to this
+    /// buffer have completed before reading, otherwise values may be stale.
+    pub fn to_bytes(&self) -> &[u8] {
+        let len = self.byte_size();
+        assert!(
+            self.offset + len <= self.buffer.length() as usize,
+            "to_bytes: offset({}) + len({}) exceeds buffer({})",
+            self.offset,
+            len,
+            self.buffer.length()
+        );
+        let base = self.buffer.contents() as *const u8;
+        // SAFETY: bounds checked above; contents() returns valid CPU-accessible
+        // pointer for StorageModeShared buffers.
+        unsafe { std::slice::from_raw_parts(base.add(self.offset), len) }
+    }
+
+    /// Create an Array from raw bytes, allocating a new Metal buffer.
+    ///
+    /// `bytes.len()` must equal the exact buffer size for the given shape and dtype.
+    pub fn from_bytes(device: &metal::Device, bytes: &[u8], shape: Vec<usize>, dtype: DType) -> Self {
+        let numel: usize = shape.iter().product();
+        let expected = dtype.numel_to_bytes(numel);
+        assert_eq!(
+            bytes.len(),
+            expected,
+            "from_bytes: bytes length ({}) does not match expected ({}) for shape {:?} dtype {:?}",
+            bytes.len(),
+            expected,
+            shape,
+            dtype
+        );
+        let ptr = bytes.as_ptr() as *const std::ffi::c_void;
+        let buffer =
+            device.new_buffer_with_data(ptr, bytes.len() as u64, MTLResourceOptions::StorageModeShared);
+        let strides = compute_contiguous_strides(&shape);
+        Self {
+            buffer,
+            shape,
+            strides,
+            dtype,
+            offset: 0,
+        }
+    }
+
+    /// Slice columns [start..end) for tensor parallelism sharding.
+    ///
+    /// For a 2D array `[rows, cols]`, returns a view of `[rows, end - start]`
+    /// sharing the same underlying buffer with adjusted offset and shape.
+    ///
+    /// # Panics
+    /// Panics if the array is not 2D or if the column range is out of bounds.
+    pub fn slice_columns(&self, start: usize, end: usize) -> Self {
+        assert_eq!(self.ndim(), 2, "slice_columns requires a 2D array, got {}D", self.ndim());
+        let cols = self.shape[1];
+        assert!(
+            start < end && end <= cols,
+            "slice_columns: invalid range [{}..{}) for {} columns",
+            start,
+            end,
+            cols
+        );
+        let elem_bytes = self.dtype.size_of();
+        let new_offset = self.offset + start * elem_bytes;
+        Self {
+            buffer: self.buffer.clone(),
+            shape: vec![self.shape[0], end - start],
+            strides: self.strides.clone(),
+            dtype: self.dtype,
+            offset: new_offset,
+        }
     }
 
     /// Whether the array is stored contiguously in memory.

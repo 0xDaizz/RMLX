@@ -62,14 +62,13 @@ pub struct PyArray {
 impl PyArray {
     /// Wrap an existing GPU array, extracting CPU data from it.
     ///
-    /// # Safety
-    /// Caller must ensure all GPU command buffers that write to the array's
+    /// Callers should ensure all GPU command buffers that write to the array's
     /// Metal buffer have completed (via `waitUntilCompleted` or completion
-    /// handler) before calling this function.
-    pub unsafe fn from_gpu_array(gpu: GpuArray) -> Self {
+    /// handler) before calling this function, otherwise values may be stale.
+    pub fn from_gpu_array(gpu: GpuArray) -> Self {
         let shape = gpu.shape().to_vec();
         let dtype_name = gpu.dtype().name().to_string();
-        let data: Vec<f32> = gpu.to_vec::<f32>();
+        let data: Vec<f32> = gpu.to_vec_checked();
         Self {
             shape,
             data,
@@ -125,7 +124,7 @@ impl PyArray {
 
         // SAFETY: into_array() blocks until GPU completes, so the data is ready.
         let shape = out_array.shape().to_vec();
-        let cpu_data = unsafe { out_array.to_vec::<f32>() };
+        let cpu_data = out_array.to_vec_checked::<f32>();
 
         Ok(Self {
             shape: shape.clone(),
@@ -435,7 +434,7 @@ impl PyArray {
             Some(gpu) => {
                 // SAFETY: CommandBufferHandle.wait() completed (via wait_pending above),
                 // ensuring all GPU writes to this buffer are finished before we read.
-                let cpu_data = unsafe { gpu.to_vec::<f32>() };
+                let cpu_data = gpu.to_vec_checked::<f32>();
                 Ok(Self {
                     shape: gpu.shape().to_vec(),
                     data: cpu_data,
@@ -565,7 +564,7 @@ mod tests {
         };
         let data = vec![1.0f32, 2.0, 3.0, 4.0];
         let gpu = GpuArray::from_slice(&device, &data, vec![2, 2]);
-        let arr = unsafe { PyArray::from_gpu_array(gpu) };
+        let arr = PyArray::from_gpu_array(gpu);
         assert!(arr.is_on_gpu());
         assert_eq!(arr.shape, vec![2, 2]);
         assert_eq!(arr.data, vec![1.0, 2.0, 3.0, 4.0]);
@@ -645,7 +644,7 @@ mod tests {
         result.wait_pending();
         let gpu = result.gpu_array.as_ref().unwrap();
         // SAFETY: wait_pending completed, GPU writes are done
-        let cpu_data = unsafe { gpu.to_vec::<f32>() };
+        let cpu_data = gpu.to_vec_checked::<f32>();
         assert_eq!(cpu_data, vec![11.0, 22.0, 33.0, 44.0]);
     }
 
@@ -683,7 +682,7 @@ mod tests {
         result.wait_pending();
         let gpu = result.gpu_array.as_ref().unwrap();
         // SAFETY: wait_pending completed, GPU writes are done
-        let cpu_data = unsafe { gpu.to_vec::<f32>() };
+        let cpu_data = gpu.to_vec_checked::<f32>();
         assert_eq!(cpu_data, vec![20.0, 30.0, 40.0, 50.0]);
     }
 
@@ -747,7 +746,7 @@ mod tests {
 
         let shape = out_array.shape().to_vec();
         // SAFETY: into_array() blocks until GPU completes.
-        let cpu_data = unsafe { out_array.to_vec::<f32>() };
+        let cpu_data = out_array.to_vec_checked::<f32>();
         assert_eq!(shape, vec![4]);
         assert_eq!(cpu_data, vec![11.0, 22.0, 33.0, 44.0]);
     }
@@ -777,7 +776,7 @@ mod tests {
         let gpu = GpuArray::from_slice(ctx.registry.device().raw(), &data, vec![3]);
         assert_eq!(gpu.shape(), &[3]);
         // SAFETY: no async operations pending.
-        let roundtrip = unsafe { gpu.to_vec::<f32>() };
+        let roundtrip = gpu.to_vec_checked::<f32>();
         assert_eq!(roundtrip, vec![1.0, 2.0, 3.0]);
     }
 }

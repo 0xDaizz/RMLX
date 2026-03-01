@@ -1,5 +1,7 @@
 //! rmlx-alloc — GPU memory allocator for RMLX
 
+#![deny(unsafe_op_in_unsafe_fn)]
+
 pub mod allocator;
 pub mod buffer_pool;
 pub mod cache;

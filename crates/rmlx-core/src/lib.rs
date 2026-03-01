@@ -1,5 +1,7 @@
 //! rmlx-core — Compute engine for RMLX
 
+#![deny(unsafe_op_in_unsafe_fn)]
+
 pub mod array;
 pub mod dtype;
 pub mod kernels;

@@ -319,6 +319,55 @@ pub mod access_flags {
 /// ibv_wc_status
 pub mod wc_status {
     pub const SUCCESS: u32 = 0;
+    pub const LOC_LEN_ERR: u32 = 1;
+    pub const LOC_QP_OP_ERR: u32 = 2;
+    pub const LOC_EEC_OP_ERR: u32 = 3;
+    pub const LOC_PROT_ERR: u32 = 4;
+    pub const WR_FLUSH_ERR: u32 = 5;
+    pub const MW_BIND_ERR: u32 = 6;
+    pub const BAD_RESP_ERR: u32 = 7;
+    pub const LOC_ACCESS_ERR: u32 = 8;
+    pub const REM_INV_REQ_ERR: u32 = 9;
+    pub const REM_ACCESS_ERR: u32 = 10;
+    pub const REM_OP_ERR: u32 = 11;
+    pub const RETRY_EXC_ERR: u32 = 12;
+    pub const RNR_RETRY_EXC_ERR: u32 = 13;
+    pub const LOC_RDD_VIOL_ERR: u32 = 14;
+    pub const REM_INV_RD_REQ_ERR: u32 = 15;
+    pub const REM_ABORT_ERR: u32 = 16;
+    pub const INV_EECN_ERR: u32 = 17;
+    pub const INV_EEC_STATE_ERR: u32 = 18;
+    pub const FATAL_ERR: u32 = 19;
+    pub const RESP_TIMEOUT_ERR: u32 = 20;
+    pub const GENERAL_ERR: u32 = 21;
+}
+
+pub fn wc_status_str(status: u32) -> &'static str {
+    match status {
+        wc_status::SUCCESS => "SUCCESS",
+        wc_status::LOC_LEN_ERR => "LOC_LEN_ERR",
+        wc_status::LOC_QP_OP_ERR => "LOC_QP_OP_ERR",
+        wc_status::LOC_EEC_OP_ERR => "LOC_EEC_OP_ERR",
+        wc_status::LOC_PROT_ERR => "LOC_PROT_ERR",
+        wc_status::WR_FLUSH_ERR => "WR_FLUSH_ERR",
+        wc_status::MW_BIND_ERR => "MW_BIND_ERR",
+        wc_status::BAD_RESP_ERR => "BAD_RESP_ERR",
+        wc_status::LOC_ACCESS_ERR => "LOC_ACCESS_ERR",
+        wc_status::REM_INV_REQ_ERR => "REM_INV_REQ_ERR",
+        wc_status::REM_ACCESS_ERR => "REM_ACCESS_ERR",
+        wc_status::REM_OP_ERR => "REM_OP_ERR",
+        wc_status::RETRY_EXC_ERR => "RETRY_EXC_ERR",
+        wc_status::RNR_RETRY_EXC_ERR => "RNR_RETRY_EXC_ERR",
+        wc_status::LOC_RDD_VIOL_ERR => "LOC_RDD_VIOL_ERR",
+        wc_status::REM_INV_RD_REQ_ERR => "REM_INV_RD_REQ_ERR",
+        wc_status::REM_ABORT_ERR => "REM_ABORT_ERR",
+        wc_status::INV_EECN_ERR => "INV_EECN_ERR",
+        wc_status::INV_EEC_STATE_ERR => "INV_EEC_STATE_ERR",
+        wc_status::FATAL_ERR => "FATAL_ERR",
+        wc_status::RESP_TIMEOUT_ERR => "RESP_TIMEOUT_ERR",
+        wc_status::GENERAL_ERR => "GENERAL_ERR",
+        _ => "UNKNOWN",
+    }
 }
 
 /// ibv_wr_opcode

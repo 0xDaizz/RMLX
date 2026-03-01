@@ -1,19 +1,33 @@
 //! rmlx-rdma — RDMA communication layer for RMLX (Thunderbolt 5)
 
+#![deny(unsafe_op_in_unsafe_fn)]
+
 pub mod connection;
 pub mod context;
 pub mod exchange;
+pub mod exchange_tag;
 pub mod ffi;
+pub mod gpu_doorbell;
 pub mod mr;
+pub mod mr_pool;
 pub mod multi_port;
+pub mod progress;
 pub mod qp;
 pub mod rdma_metrics;
+pub mod shared_buffer;
 
 // ── Re-exports of core types ──
-pub use connection::{CompletionTracker, PostedOp, PostedOpKind, RdmaConfig, RdmaConnection};
+pub use connection::{
+    CompletionTracker, PostedOp, PostedOpKind, RdmaConfig, RdmaConnection, RegisteredRecv,
+    RegisteredSend,
+};
 pub use context::{ProtectionDomain, RdmaContext, RdmaDeviceProbe};
 pub use exchange::ExchangeConfig;
+pub use exchange_tag::{ExchangeTag, WrIdFields};
+pub use gpu_doorbell::{DescriptorProxy, DescriptorRing, ProxyConfig, RdmaDescriptor, RdmaOp};
 pub use mr::MemoryRegion;
+pub use mr_pool::{MrHandle, MrPool};
+pub use progress::{Completion, OpError, PendingOp, ProgressConfig, ProgressEngine, ProgressMode};
 pub use multi_port::{
     DualPortConfig, PortConfig, PortFailover, PortState, StripeEngine, StripePlan, Topology,
 };
