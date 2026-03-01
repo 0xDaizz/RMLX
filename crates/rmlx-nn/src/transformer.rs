@@ -4,7 +4,7 @@ use rmlx_core::array::Array;
 use rmlx_core::kernels::{KernelError, KernelRegistry};
 use rmlx_core::ops;
 
-use crate::attention::Attention;
+use crate::attention::{Attention, LayerKvCache};
 use crate::embedding::Embedding;
 use crate::linear::Linear;
 use crate::moe::MoeLayer;
@@ -190,13 +190,16 @@ impl TransformerBlock {
     /// `x`: [seq_len, hidden_size]
     /// `cos_freqs`, `sin_freqs`: RoPE frequency tables
     /// `mask`: causal attention mask
+    /// `cache`: optional per-layer KV cache for incremental decoding
     /// Returns: [seq_len, hidden_size]
+    #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
         x: &Array,
         cos_freqs: Option<&Array>,
         sin_freqs: Option<&Array>,
         mask: Option<&Array>,
+        cache: Option<&mut LayerKvCache>,
         registry: &KernelRegistry,
         queue: &metal::CommandQueue,
     ) -> Result<Array, KernelError> {
@@ -213,7 +216,7 @@ impl TransformerBlock {
         // Attention
         let attn_out = self
             .attention
-            .forward(&normed, cos_freqs, sin_freqs, mask, registry, queue)?;
+            .forward(&normed, cos_freqs, sin_freqs, mask, cache, registry, queue)?;
 
         // Residual connection: x + attn_out
         let h = ops::binary::add(registry, x, &attn_out, queue)?;
@@ -284,13 +287,17 @@ impl TransformerModel {
     /// Forward pass: token IDs -> logits.
     ///
     /// `token_ids`: input token indices
+    /// `cache`: optional per-layer KV caches for incremental decoding.
+    ///          Must have exactly `num_layers` entries if provided.
     /// Returns: [seq_len, vocab_size] logits
+    #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
         token_ids: &[u32],
         cos_freqs: Option<&Array>,
         sin_freqs: Option<&Array>,
         mask: Option<&Array>,
+        mut cache: Option<&mut Vec<LayerKvCache>>,
         registry: &KernelRegistry,
         queue: &metal::CommandQueue,
     ) -> Result<Array, KernelError> {
@@ -307,9 +314,21 @@ impl TransformerModel {
         // Embedding lookup
         let mut x = embedding.forward(token_ids, registry, queue)?;
 
+        // Validate cache vector length matches number of layers
+        if let Some(ref c) = cache {
+            if c.len() != self.layers.len() {
+                return Err(KernelError::InvalidShape(format!(
+                    "TransformerModel: cache has {} entries but model has {} layers",
+                    c.len(),
+                    self.layers.len()
+                )));
+            }
+        }
+
         // Transformer layers
-        for layer in &self.layers {
-            x = layer.forward(&x, cos_freqs, sin_freqs, mask, registry, queue)?;
+        for (i, layer) in self.layers.iter().enumerate() {
+            let layer_cache = cache.as_mut().map(|c| &mut c[i]);
+            x = layer.forward(&x, cos_freqs, sin_freqs, mask, layer_cache, registry, queue)?;
         }
 
         // Final norm

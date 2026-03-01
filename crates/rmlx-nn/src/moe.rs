@@ -17,13 +17,30 @@ pub struct MoeForwardMetrics {
     pub forward_count: AtomicU64,
     /// Total tokens routed across all forward() calls.
     pub total_tokens_routed: AtomicU64,
+    /// Per-expert token count.
+    pub expert_tokens: Vec<AtomicU64>,
+    /// Number of experts tracked (0 = no per-expert tracking).
+    pub num_experts: usize,
 }
 
 impl MoeForwardMetrics {
+    /// Create metrics without per-expert tracking.
     pub fn new() -> Self {
         Self {
             forward_count: AtomicU64::new(0),
             total_tokens_routed: AtomicU64::new(0),
+            expert_tokens: Vec::new(),
+            num_experts: 0,
+        }
+    }
+
+    /// Create metrics with per-expert token counters.
+    pub fn with_experts(num_experts: usize) -> Self {
+        Self {
+            forward_count: AtomicU64::new(0),
+            total_tokens_routed: AtomicU64::new(0),
+            expert_tokens: (0..num_experts).map(|_| AtomicU64::new(0)).collect(),
+            num_experts,
         }
     }
 
@@ -31,6 +48,21 @@ impl MoeForwardMetrics {
         self.forward_count.fetch_add(1, Ordering::Relaxed);
         self.total_tokens_routed
             .fetch_add(tokens, Ordering::Relaxed);
+    }
+
+    /// Record a token routed to a specific expert.
+    pub fn record_expert_token(&self, expert_idx: usize) {
+        if expert_idx < self.num_experts {
+            self.expert_tokens[expert_idx].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Snapshot of per-expert token counts.
+    pub fn expert_tokens_snapshot(&self) -> Vec<u64> {
+        self.expert_tokens
+            .iter()
+            .map(|a| a.load(Ordering::Relaxed))
+            .collect()
     }
 
     pub fn forward_count(&self) -> u64 {
@@ -120,11 +152,12 @@ impl MoeLayer {
     /// Config-only constructor.
     pub fn new(config: MoeConfig) -> Result<Self, KernelError> {
         config.validate()?;
+        let metrics = MoeForwardMetrics::with_experts(config.num_experts);
         Ok(Self {
             config,
             gate: None,
             experts: Vec::new(),
-            metrics: MoeForwardMetrics::new(),
+            metrics,
         })
     }
 
@@ -142,11 +175,12 @@ impl MoeLayer {
                 config.num_experts
             )));
         }
+        let metrics = MoeForwardMetrics::with_experts(config.num_experts);
         Ok(Self {
             config,
             gate: Some(gate),
             experts,
-            metrics: MoeForwardMetrics::new(),
+            metrics,
         })
     }
 
@@ -215,6 +249,11 @@ impl MoeLayer {
             } else {
                 0.0
             };
+
+            // Record per-expert token routing
+            for (expert_idx, _raw_weight) in &top_entries {
+                self.metrics.record_expert_token(*expert_idx);
+            }
 
             // Extract token input: [1, hidden_dim]
             let tok_offset = x.offset() + tok * hidden_dim * elem_size;

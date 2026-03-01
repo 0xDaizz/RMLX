@@ -422,9 +422,9 @@ fn test_attention_forward_identity() {
         vec![2, 8],
     );
 
-    // No RoPE, no mask for simplicity
+    // No RoPE, no mask, no cache for simplicity
     let output = attn
-        .forward(&input, None, None, None, &registry, &queue)
+        .forward(&input, None, None, None, None, &registry, &queue)
         .expect("attention forward failed");
     assert_eq!(output.shape(), &[2, 8]);
 
@@ -589,7 +589,7 @@ fn test_transformer_block_forward() {
     );
 
     let output = block
-        .forward(&input, None, None, None, &registry, &queue)
+        .forward(&input, None, None, None, None, &registry, &queue)
         .expect("transformer block forward failed");
     assert_eq!(output.shape(), &[2, 8]);
 
@@ -697,7 +697,7 @@ fn test_transformer_model_forward() {
     // Forward pass with 3 tokens
     let token_ids = [0u32, 1, 2];
     let logits = model
-        .forward(&token_ids, None, None, None, &registry, &queue)
+        .forward(&token_ids, None, None, None, None, &registry, &queue)
         .expect("model forward failed");
 
     // Expected output shape: [3, 8] (3 tokens, 8 vocab logits each)
