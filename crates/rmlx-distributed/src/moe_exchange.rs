@@ -406,16 +406,10 @@ impl MoeDispatchExchange {
                             global_counters().record_async_dispatch();
                             data
                         }
-                        Err(_) => {
-                            // Pool exhausted or other error — fallback to legacy
-                            global_counters().record_fallback();
-                            self.route_rdma(
-                                token_data,
-                                expert_indices,
-                                &expert_counts,
-                                local_start,
-                                local_end,
-                            )?
+                        Err(e) => {
+                            // Transport/protocol errors from mid-exchange must not be retried.
+                            // Pool exhaustion is already handled inside route_rdma_zero_copy.
+                            return Err(e);
                         }
                     }
                 } else {

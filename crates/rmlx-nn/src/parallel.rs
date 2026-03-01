@@ -253,8 +253,8 @@ impl ColumnParallelLinear {
 
         let shard_out = self.weight.shape()[0]; // out_features / world_size
 
-        // Read input (contiguous) and weight (may be a view, but column shards are contiguous)
-        let a: Vec<f32> = input.to_vec_checked();
+        // Read input and weight (both may be non-contiguous views)
+        let a: Vec<f32> = read_f32_strided(input);
         let b = read_f32_strided(&self.weight);
 
         // Local matmul: [batch, k] @ [shard_out, k]^T → [batch, shard_out]
@@ -270,6 +270,13 @@ impl ColumnParallelLinear {
         // Allgather across ranks → rank-major: [rank0_all_rows][rank1_all_rows]...
         // We need batch-major: [row0_rank0_shard ++ row0_rank1_shard ++ ...][row1_...]
         let gathered = group.allgather(&local_bytes)?;
+        assert_eq!(
+            self.world_size as usize,
+            group.size(),
+            "TP world_size ({}) does not match group size ({})",
+            self.world_size,
+            group.size()
+        );
 
         let world = self.world_size as usize;
         let shard_bytes = shard_out * 4; // bytes per rank per row
