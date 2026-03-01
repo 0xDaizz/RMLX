@@ -85,12 +85,153 @@ impl RdmaConnectionTransport {
     }
 }
 
+/// Default chunk size for stripe splitting (64KB).
+const STRIPE_CHUNK_SIZE: usize = 64 * 1024;
+
+/// Minimum data size to activate striping (256KB).
+const STRIPE_BYTE_THRESHOLD: usize = 256 * 1024;
+
 impl RdmaConnectionTransport {
     /// Generate a unique wr_id for a peer.
     /// Encoding: `(seq << 1) | send_recv_bit`
     fn next_wr_id(&self, peer_rank: u32, send_recv_bit: u64) -> u64 {
         let seq = self.wr_id_seqs[peer_rank as usize].fetch_add(1, Ordering::Relaxed);
         (seq << 1) | send_recv_bit
+    }
+
+    /// Check whether striping should be used for the given data size.
+    fn should_stripe(&self, data_len: usize) -> bool {
+        data_len >= STRIPE_BYTE_THRESHOLD
+            && self
+                .stripe_engine
+                .as_ref()
+                .is_some_and(|e| e.config().has_dual())
+    }
+
+    /// Send data using stripe engine chunking over the primary connection.
+    ///
+    /// Splits data into chunks per the stripe plan and sends each chunk
+    /// as a separate RDMA send. Primary and secondary chunks are both sent
+    /// via the primary connection (single connection per peer). When secondary
+    /// connections are added, secondary chunks can be routed to the secondary port.
+    fn send_striped(
+        &self,
+        data: &[u8],
+        dst_rank: u32,
+        conn: &RdmaConnection,
+    ) -> Result<(), DistributedError> {
+        let engine = self
+            .stripe_engine
+            .as_ref()
+            .ok_or_else(|| DistributedError::Transport("stripe_engine not set".into()))?;
+
+        let plan = engine.plan(data.len(), STRIPE_CHUNK_SIZE);
+        let (primary_slices, secondary_slices) = engine.split_by_plan(data, &plan);
+
+        // Send all chunks (primary then secondary) via the primary connection.
+        // Each chunk is a separate RDMA send for better pipeline utilization.
+        for chunk in primary_slices.iter().chain(secondary_slices.iter()) {
+            let wr_id = self.next_wr_id(dst_rank, WR_ID_SEND_BIT);
+            let mr = unsafe {
+                conn.register_mr(chunk.as_ptr() as *mut c_void, chunk.len())
+                    .map_err(|e| {
+                        self.metrics.record_send_error();
+                        rdma_to_distributed(e)
+                    })?
+            };
+            let op = conn
+                .post_send(&mr, 0, chunk.len() as u32, wr_id)
+                .map_err(|e| {
+                    self.metrics.record_send_error();
+                    rdma_to_distributed(e)
+                })?;
+            conn.wait_posted(&[op]).map_err(|e| {
+                self.metrics.record_send_error();
+                rdma_to_distributed(e)
+            })?;
+        }
+
+        self.metrics.record_send(data.len() as u64);
+        Ok(())
+    }
+
+    /// Receive data using stripe engine chunking over the primary connection.
+    ///
+    /// Receives chunks matching the stripe plan, then reassembles into the
+    /// original byte order.
+    fn recv_striped(
+        &self,
+        src_rank: u32,
+        len: usize,
+        conn: &RdmaConnection,
+    ) -> Result<Vec<u8>, DistributedError> {
+        let engine = self
+            .stripe_engine
+            .as_ref()
+            .ok_or_else(|| DistributedError::Transport("stripe_engine not set".into()))?;
+
+        let plan = engine.plan(len, STRIPE_CHUNK_SIZE);
+
+        // UC mode: post ALL recvs upfront before any sends arrive, to prevent
+        // silent data drops when a send completes before matching recv is posted.
+        //
+        // Phase 1: Allocate ALL buffers and register ALL MRs
+        // Phase 2: Post ALL recvs (now mrs Vec is immutable)
+        // Phase 3: Wait for ALL completions
+        let all_chunks: Vec<_> = plan
+            .primary_chunks
+            .iter()
+            .chain(plan.secondary_chunks.iter())
+            .collect();
+
+        let mut bufs: Vec<Vec<u8>> = Vec::with_capacity(all_chunks.len());
+        let mut mrs = Vec::with_capacity(all_chunks.len());
+
+        // Phase 1: allocate buffers + register MRs
+        for chunk_assign in &all_chunks {
+            let mut buf = vec![0u8; chunk_assign.length];
+            let mr = unsafe {
+                conn.register_mr(buf.as_mut_ptr() as *mut c_void, chunk_assign.length)
+                    .map_err(|e| {
+                        self.metrics.record_recv_error();
+                        rdma_to_distributed(e)
+                    })?
+            };
+            mrs.push(mr);
+            bufs.push(buf);
+        }
+
+        // Phase 2: post ALL recvs (mrs is now immutable)
+        let mut posted_ops = Vec::with_capacity(all_chunks.len());
+        for (i, chunk_assign) in all_chunks.iter().enumerate() {
+            let wr_id = self.next_wr_id(src_rank, WR_ID_RECV_BIT);
+            let op = conn
+                .post_recv(&mrs[i], 0, chunk_assign.length as u32, wr_id)
+                .map_err(|e| {
+                    self.metrics.record_recv_error();
+                    rdma_to_distributed(e)
+                })?;
+            posted_ops.push(op);
+        }
+
+        // Phase 3: wait for ALL posted recvs at once
+        conn.wait_posted(&posted_ops).map_err(|e| {
+            self.metrics.record_recv_error();
+            rdma_to_distributed(e)
+        })?;
+
+        // Drop ops and MRs now that all recvs completed
+        drop(posted_ops);
+        drop(mrs);
+
+        // Split received buffers back into primary/secondary for reassembly
+        let primary_count = plan.primary_chunks.len();
+        let primary_chunks: Vec<Vec<u8>> = bufs.drain(..primary_count).collect();
+        let secondary_chunks: Vec<Vec<u8>> = bufs;
+
+        let result = engine.reassemble_from_chunks(&primary_chunks, &secondary_chunks, &plan);
+        self.metrics.record_recv(len as u64);
+        Ok(result)
     }
 }
 
@@ -103,6 +244,12 @@ impl RdmaTransport for RdmaConnectionTransport {
         let conn = self.connections[dst_rank as usize]
             .lock()
             .map_err(|e| DistributedError::Transport(format!("lock poisoned: {e}")))?;
+
+        // Use striped send for large payloads when stripe engine is configured
+        if self.should_stripe(data.len()) {
+            return self.send_striped(data, dst_rank, &conn);
+        }
+
         let wr_id = self.next_wr_id(dst_rank, WR_ID_SEND_BIT);
 
         // Register the data buffer as an MR for sending.
@@ -134,6 +281,12 @@ impl RdmaTransport for RdmaConnectionTransport {
         let conn = self.connections[src_rank as usize]
             .lock()
             .map_err(|e| DistributedError::Transport(format!("lock poisoned: {e}")))?;
+
+        // Use striped recv for large payloads when stripe engine is configured
+        if self.should_stripe(len) {
+            return self.recv_striped(src_rank, len, &conn);
+        }
+
         let wr_id = self.next_wr_id(src_rank, WR_ID_RECV_BIT);
 
         let mut buf = vec![0u8; len];
@@ -421,5 +574,52 @@ mod tests {
 
         let received = group.recv(1, 4).unwrap();
         assert_eq!(received, data);
+    }
+
+    #[test]
+    fn test_stripe_constants() {
+        assert_eq!(super::STRIPE_CHUNK_SIZE, 64 * 1024);
+        assert_eq!(super::STRIPE_BYTE_THRESHOLD, 256 * 1024);
+        assert!(
+            super::STRIPE_BYTE_THRESHOLD >= super::STRIPE_CHUNK_SIZE,
+            "threshold should be >= chunk size"
+        );
+    }
+
+    #[test]
+    fn test_stripe_engine_plan_integration() {
+        use rmlx_rdma::multi_port::{DualPortConfig, PortConfig, StripeEngine};
+
+        let primary = PortConfig {
+            port_num: 1,
+            gid_index: 1,
+            interface: "en5".to_string(),
+            address: "10.254.0.5".to_string(),
+        };
+        let secondary = PortConfig {
+            port_num: 2,
+            gid_index: 1,
+            interface: "en6".to_string(),
+            address: "10.254.0.6".to_string(),
+        };
+        let config = DualPortConfig::dual(primary, secondary, 4);
+        let engine = StripeEngine::new(config);
+
+        // Plan with 512KB of data, 64KB chunks = 8 chunks
+        let plan = engine.plan(512 * 1024, super::STRIPE_CHUNK_SIZE);
+        assert_eq!(plan.primary_chunks.len(), 4); // even indices: 0,2,4,6
+        assert_eq!(plan.secondary_chunks.len(), 4); // odd indices: 1,3,5,7
+        assert_eq!(plan.total_bytes, 512 * 1024);
+
+        // Test split and reassemble roundtrip
+        let data: Vec<u8> = (0..512 * 1024).map(|i| (i % 256) as u8).collect();
+        let (primary_slices, secondary_slices) = engine.split_by_plan(&data, &plan);
+        assert_eq!(primary_slices.len(), 4);
+        assert_eq!(secondary_slices.len(), 4);
+
+        let primary_owned: Vec<Vec<u8>> = primary_slices.iter().map(|s| s.to_vec()).collect();
+        let secondary_owned: Vec<Vec<u8>> = secondary_slices.iter().map(|s| s.to_vec()).collect();
+        let reassembled = engine.reassemble_from_chunks(&primary_owned, &secondary_owned, &plan);
+        assert_eq!(reassembled, data);
     }
 }

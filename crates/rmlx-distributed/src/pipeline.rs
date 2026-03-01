@@ -287,8 +287,13 @@ impl LayerPipeline {
                     let _ = transfer_queue;
                     transfer_fn();
                 });
-                h1.join().unwrap();
-                h2.join().unwrap();
+                // Scoped thread join: propagate panic if thread panicked
+                if let Err(e) = h1.join() {
+                    std::panic::resume_unwind(e);
+                }
+                if let Err(e) = h2.join() {
+                    std::panic::resume_unwind(e);
+                }
             });
             sync_start = Instant::now();
         } else {
@@ -296,8 +301,12 @@ impl LayerPipeline {
             std::thread::scope(|s| {
                 let h1 = s.spawn(&compute_fn);
                 let h2 = s.spawn(&transfer_fn);
-                h1.join().unwrap();
-                h2.join().unwrap();
+                if let Err(e) = h1.join() {
+                    std::panic::resume_unwind(e);
+                }
+                if let Err(e) = h2.join() {
+                    std::panic::resume_unwind(e);
+                }
             });
             sync_start = Instant::now();
         }

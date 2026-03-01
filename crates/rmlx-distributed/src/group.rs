@@ -481,14 +481,14 @@ fn ring_allreduce(
     buf.resize(chunk_size * n, 0);
 
     // Phase 1: reduce-scatter (N-1 rounds)
+    // Use sendrecv to avoid deadlock: send chunk to right, recv chunk from left.
     for round in 0..(n - 1) {
         let send_chunk_idx = (my_idx + n - round) % n;
         let recv_chunk_idx = (my_idx + n - round - 1) % n;
         let send_start = send_chunk_idx * chunk_size;
         let send_end = send_start + chunk_size;
 
-        transport.send(&buf[send_start..send_end], right)?;
-        let received = transport.recv(left, chunk_size)?;
+        let received = transport.sendrecv(&buf[send_start..send_end], right, chunk_size, left)?;
 
         // Accumulate: interpret as f32 and sum
         let recv_start = recv_chunk_idx * chunk_size;
@@ -496,14 +496,14 @@ fn ring_allreduce(
     }
 
     // Phase 2: allgather (N-1 rounds)
+    // Use sendrecv to avoid deadlock: send chunk to right, recv chunk from left.
     for round in 0..(n - 1) {
         let send_chunk_idx = (my_idx + 1 + n - round) % n;
         let recv_chunk_idx = (my_idx + n - round) % n;
         let send_start = send_chunk_idx * chunk_size;
         let send_end = send_start + chunk_size;
 
-        transport.send(&buf[send_start..send_end], right)?;
-        let received = transport.recv(left, chunk_size)?;
+        let received = transport.sendrecv(&buf[send_start..send_end], right, chunk_size, left)?;
 
         let recv_start = recv_chunk_idx * chunk_size;
         buf[recv_start..recv_start + chunk_size].copy_from_slice(&received);
@@ -540,14 +540,18 @@ fn ring_allgather(
     result[my_idx * chunk_size..(my_idx + 1) * chunk_size].copy_from_slice(data);
 
     // N-1 rounds: each round, send the chunk we just received to right,
-    // receive a new chunk from left.
+    // receive a new chunk from left. Use sendrecv to avoid deadlock.
     for round in 0..(n - 1) {
         let send_chunk_idx = (my_idx + n - round) % n;
         let recv_chunk_idx = (my_idx + n - round - 1) % n;
         let send_start = send_chunk_idx * chunk_size;
 
-        transport.send(&result[send_start..send_start + chunk_size], right)?;
-        let received = transport.recv(left, chunk_size)?;
+        let received = transport.sendrecv(
+            &result[send_start..send_start + chunk_size],
+            right,
+            chunk_size,
+            left,
+        )?;
 
         let recv_start = recv_chunk_idx * chunk_size;
         result[recv_start..recv_start + chunk_size].copy_from_slice(&received);

@@ -234,7 +234,12 @@ impl MoeLayer {
                     first = false;
                     scaled
                 } else {
-                    ops::binary::add(registry, tok_output.as_ref().unwrap(), &scaled, queue)?
+                    let prev = tok_output.as_ref().ok_or_else(|| {
+                        KernelError::InvalidShape(
+                            "MoE: tok_output unexpectedly None in accumulation loop".into(),
+                        )
+                    })?;
+                    ops::binary::add(registry, prev, &scaled, queue)?
                 });
             }
 

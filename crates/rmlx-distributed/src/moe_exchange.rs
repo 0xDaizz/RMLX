@@ -96,7 +96,9 @@ pub struct MoeDispatchExchange {
 }
 
 impl MoeDispatchExchange {
-    pub fn new(config: MoeDispatchConfig, policy: MoePolicy) -> Self {
+    pub fn new(config: MoeDispatchConfig, mut policy: MoePolicy) -> Self {
+        // Auto-set policy world_size from group so RDMA zone activates correctly
+        policy.set_world_size(config.group.size() as u32);
         let runtime_cf = config.capacity_factor;
         Self {
             config,
@@ -220,7 +222,11 @@ impl MoeDispatchExchange {
             .record_step(overflow as usize, batch_size * self.config.top_k);
         match self.guard.evaluate() {
             GuardAction::IncreaseCapacity(new_factor) => {
-                self.runtime_capacity_factor = new_factor as f32;
+                // Ensure monotonicity: never decrease below configured baseline.
+                // SparseGuard starts at 1.0 internally, so if config.capacity_factor > 1.0,
+                // the guard's suggested factor could be lower than baseline.
+                let candidate = new_factor as f32;
+                self.runtime_capacity_factor = candidate.max(self.config.capacity_factor);
             }
             GuardAction::DenseFallback => {
                 self.metrics.record_dense_fallback();
@@ -298,10 +304,10 @@ impl MoeDispatchExchange {
         }
         let token_stride = token_data.len() / batch_size;
 
-        // Compute capacity per expert
+        // Compute capacity per expert using runtime capacity factor
         let capacity_per_expert = (batch_size as f32 * self.config.top_k as f32
             / num_experts as f32
-            * self.config.capacity_factor)
+            * self.runtime_capacity_factor)
             .ceil() as usize;
 
         // Allocate output: local experts * capacity * token_stride
@@ -436,7 +442,7 @@ impl MoeDispatchExchange {
         let num_experts = self.config.num_experts;
         let capacity_per_expert = (batch_size as f32 * self.config.top_k as f32
             / num_experts as f32
-            * self.config.capacity_factor)
+            * self.runtime_capacity_factor)
             .ceil() as usize;
         let local_expert_count = local_end - local_start;
         let output_size = local_expert_count * capacity_per_expert * token_stride;
@@ -550,7 +556,7 @@ impl MoeDispatchExchange {
 
         let capacity_per_expert = (batch_size as f32 * self.config.top_k as f32
             / num_experts as f32
-            * self.config.capacity_factor)
+            * self.runtime_capacity_factor)
             .ceil() as usize;
 
         // --- Local expert gather (same as CPU path) ---
