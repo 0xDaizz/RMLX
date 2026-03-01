@@ -5,44 +5,150 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch: {}
 
-env:
-  CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"
+# Cancel in-progress runs for the same branch/PR
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
 
 jobs:
-  check:
-    name: Build & Test
-    runs-on: macos-14  # Apple Silicon runner (M1)
+  # ──────────────────────────────────────────────
+  # Required status checks (GitHub Actions)
+  # ──────────────────────────────────────────────
+
+  rustfmt:
+    name: rustfmt
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: rustfmt
+      - run: cargo fmt --all --check
 
-      - name: Cache cargo registry & build
-        uses: actions/cache@v4
+  clippy:
+    name: clippy
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          restore-keys: ${{ runner.os }}-cargo-
+      - run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Check formatting
-        run: cargo fmt --all --check
+  build:
+    name: build
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - run: cargo build --workspace
 
-      - name: Clippy
-        run: cargo clippy --workspace -- -D warnings
+  unit-tests:
+    name: unit tests
+    runs-on: macos-14
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - run: cargo test --workspace
 
-      - name: Build
-        run: cargo build --workspace
+  wiring-proof:
+    name: wiring proof
+    runs-on: macos-14
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - name: Runtime wiring checks
+        run: |
+          chmod +x tools/check_runtime_wiring.sh
+          bash tools/check_runtime_wiring.sh
+      - name: Wiring-proof tests (verify_*)
+        run: cargo test -p rmlx-distributed -- verify_
 
-      - name: Test
-        run: cargo test --workspace
-        # Note: RDMA hardware tests are #[ignore] by default.
-        # To run them on hardware nodes: RMLX_TEST_RDMA=1 cargo test -- --ignored
+  unsafe-audit:
+    name: unsafe audit
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run unsafe audit
+        run: |
+          chmod +x tools/unsafe_audit.sh
+          bash tools/unsafe_audit.sh
+
+  # ──────────────────────────────────────────────
+  # Informational — non-blocking, report-only
+  # ──────────────────────────────────────────────
+
+  perf-report:
+    name: perf report (informational)
+    runs-on: macos-14
+    needs: build
+    if: github.event_name == 'pull_request'
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - name: Run perf snapshot tests
+        run: cargo test -p rmlx-distributed -- verify_ 2>&1 | tee perf-report.txt || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: perf-report-${{ github.sha }}
+          path: perf-report.txt
+          retention-days: 30
+
+  # ──────────────────────────────────────────────
+  # HW-dependent checks (NOT in GitHub Actions):
+  #
+  # - RDMA 2-node tests (TB5 hardware)
+  # - Perf regression benchmarks (stable HW baseline)
+  # - Deadlock stress tests (1000-loop, real transport)
+  # - Overlap ratio measurement (real GPU+RDMA)
+  #
+  # These are validated manually by maintainer review.
+  # Branch protection requires 1 approving review to
+  # ensure HW-dependent criteria are checked.
+  # ──────────────────────────────────────────────
