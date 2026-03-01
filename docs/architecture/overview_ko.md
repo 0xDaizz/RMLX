@@ -1,14 +1,14 @@
-# Architecture Overview
+# 아키텍처 개요
 
-RMLX is a layered architecture composed of five layers. All Phases (0 through 7C) have been completed and the system is fully implemented. Each layer has clear responsibility boundaries and is separated into individual Cargo crates. Phase 7 additions include VJP autodiff, LoRA fine-tuning, production hardening (structured logging, metrics, precision guard, graceful shutdown), and PyO3 Python bindings (rmlx-python).
+RMLX는 5개의 레이어로 구성된 계층형 아키텍처이며, 전 Phase(0~7C)가 완료되어 완전히 구현된 상태입니다. 각 레이어는 명확한 책임 경계를 가지며, Cargo 크레이트 단위로 분리되어 있습니다. Phase 7에서 추가된 VJP autodiff, LoRA fine-tuning, 프로덕션 하드닝(structured logging, metrics, precision guard, graceful shutdown), 그리고 PyO3 Python 바인딩(rmlx-python)이 포함됩니다.
 
 ---
 
-## Full Layer Diagram
+## 전체 레이어 다이어그램
 
 ```
 ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐
-  ~/rmlx-lm/ (separate repository — references rmlx as a Cargo dependency)
+  ~/rmlx-lm/ (별도 리포지토리 — rmlx를 Cargo dependency로 참조)
 │ ┌─────────────┐  ┌──────────────┐  ┌──────────────┐  ┌───────────────────┐ │
   │  Model Zoo   │  │  Scheduler   │  │  KV Cache    │  │ PP/TP/EP         │
 │ │ (safetensors)│  │ (continuous  │  │  Manager     │  │ Orchestrator     │ │
@@ -19,8 +19,8 @@ RMLX is a layered architecture composed of five layers. All Phases (0 through 7C
          │  rmlx-nn         │  rmlx-distributed                   │
 ┌────────┼─────────────────┼─────────────────┼───────────────────┼───────────┐
 │        ▼                 ▼                 ▼                   ▼           │
-│  ~/rmlx/ (this repository — framework only)                               │
-│                        rmlx-core (compute engine)                          │
+│  ~/rmlx/ (이 리포지토리 — 프레임워크 전용)                                  │
+│                        rmlx-core (연산 엔진)                                │
 │  ┌──────────────────────────────────────────────────────────────────────┐   │
 │  │                      Compute Graph / Op Registry                     │   │
 │  │  matmul · softmax · rms_norm · rope · quantized_matmul · moe_gate   │   │
@@ -49,7 +49,7 @@ RMLX is a layered architecture composed of five layers. All Phases (0 through 7C
           │                                           │
 ┌─────────┼───────────────────────────────────────────┼───────────────────────┐
 │         ▼                                           ▼                       │
-│                      rmlx-rdma (communication layer)                        │
+│                      rmlx-rdma (통신 레이어)                                 │
 │  ┌─────────────────┐  ┌─────────────────┐  ┌────────────────────────────┐   │
 │  │ ibverbs FFI     │  │ Connection      │  │ EP Collective              │   │
 │  │ (UC QP,         │  │ Manager         │  │ (all-to-all, ring          │   │
@@ -60,85 +60,85 @@ RMLX is a layered architecture composed of five layers. All Phases (0 through 7C
           │
           ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│  Hardware: M3 Ultra (80-core GPU, 512GB UMA) x 2, TB5 RDMA (16MB max_mr)  │
+│  Hardware: M3 Ultra (80-core GPU, 512GB UMA) × 2, TB5 RDMA (16MB max_mr)  │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Layer Details
+## 레이어별 상세 설명
 
-### 1. Application Layer — rmlx-lm (Separate Repository)
+### 1. Application Layer — rmlx-lm (별도 리포지토리)
 
-Handles application logic required for model serving. References the RMLX framework as a Cargo dependency.
+모델 서빙에 필요한 애플리케이션 로직을 담당합니다. RMLX 프레임워크를 Cargo dependency로 참조합니다.
 
-| Component | Role |
-|-----------|------|
-| **Model Zoo** | Loading model weights in safetensors format and quantization decoding |
-| **Scheduler** | Request scheduling based on continuous batching |
-| **KV Cache Manager** | Paged KV cache management (dynamic allocation/deallocation) |
-| **PP/TP/EP Orchestrator** | Pipeline/Tensor/Expert Parallelism orchestration |
+| 컴포넌트 | 역할 |
+|----------|------|
+| **Model Zoo** | safetensors 형식의 모델 가중치 로딩 및 양자화 디코딩 |
+| **Scheduler** | Continuous batching 기반 요청 스케줄링 |
+| **KV Cache Manager** | Paged KV 캐시 관리 (동적 할당/해제) |
+| **PP/TP/EP Orchestrator** | Pipeline/Tensor/Expert Parallelism 오케스트레이션 |
 
-**Rationale for separation**: The framework (`rmlx`) and the application (`rmlx-lm`) have different release cycles, dependencies, and testing strategies. `rmlx` can be reused by other applications (training, benchmark tools, etc.).
+**분리 근거**: 프레임워크(`rmlx`)와 애플리케이션(`rmlx-lm`)은 릴리즈 주기, 의존성, 테스트 전략이 다릅니다. `rmlx`는 다른 애플리케이션(학습, 벤치마크 도구 등)에서도 재사용할 수 있습니다.
 
 ---
 
 ### 2. Compute Engine — rmlx-core
 
-The core engine responsible for computation graphs and kernel dispatch.
+연산 그래프와 커널 디스패치를 담당하는 핵심 엔진입니다.
 
-| Component | Role |
-|-----------|------|
-| **Op Registry** | Registers operations such as matmul, softmax, rms_norm, rope, quantized_matmul, moe_gate |
-| **Compute Graph** | Selective tracing-based computation graph (eager-first, tracing during prefill) |
-| **Kernel Dispatch** | Maps ops to Metal kernels and executes them, selecting optimal kernels based on dtype/shape |
+| 컴포넌트 | 역할 |
+|----------|------|
+| **Op Registry** | matmul, softmax, rms_norm, rope, quantized_matmul, moe_gate 등 연산 등록 |
+| **Compute Graph** | 선택적 tracing 기반 연산 그래프 (eager-first, prefill 시 tracing) |
+| **Kernel Dispatch** | Op → Metal 커널 매핑 및 실행, dtype/shape 기반 최적 커널 선택 |
 
-rmlx-core depends on rmlx-metal and rmlx-alloc, and provides computation APIs to upper layers (rmlx-nn, rmlx-distributed).
+rmlx-core는 rmlx-metal과 rmlx-alloc에 의존하며, 상위 레이어(rmlx-nn, rmlx-distributed)에 연산 API를 제공합니다.
 
 ---
 
 ### 3. Metal Pipeline Layer
 
-Manages the Metal GPU execution pipeline. The rmlx-metal crate implements this layer.
+Metal GPU 실행 파이프라인을 관리합니다. rmlx-metal 크레이트가 이 레이어를 구현합니다.
 
-| Component | Role |
-|-----------|------|
-| **Kernel Manager** | `.metallib` AOT loading and source string JIT compilation, ComputePipelineState caching |
-| **CommandEncoder** | CommandBuffer/Encoder lifetime management, barrier/fence insertion, concurrent dispatch context |
-| **Pipeline Scheduler** | Dual `MTLCommandQueue` management — separates compute and transfer queues for GPU-level overlap |
+| 컴포넌트 | 역할 |
+|----------|------|
+| **Kernel Manager** | `.metallib` AOT 로드 및 소스 문자열 JIT 컴파일, ComputePipelineState 캐싱 |
+| **CommandEncoder** | CommandBuffer/Encoder 수명 관리, barrier/fence 삽입, concurrent dispatch context |
+| **Pipeline Scheduler** | 듀얼 `MTLCommandQueue` 관리 — compute 큐와 transfer 큐를 분리하여 GPU 레벨 오버랩 |
 
-The dual queue architecture was validated in PoC Phase 3.6. It maximizes pipeline efficiency by executing compute operations and RDMA data transfer preparation simultaneously.
+듀얼 큐 아키텍처는 PoC Phase 3.6에서 검증되었습니다. Compute 연산과 RDMA 데이터 전송 준비를 동시에 실행하여 파이프라인 효율을 극대화합니다.
 
 ---
 
 ### 4. Sync & Memory Layer
 
-Handles synchronization and memory management. rmlx-metal (events) and rmlx-alloc (allocator, buffer pool) implement this layer.
+동기화와 메모리 관리를 담당합니다. rmlx-metal(이벤트)과 rmlx-alloc(할당자, 버퍼 풀)이 이 레이어를 구현합니다.
 
-| Component | Role |
-|-----------|------|
-| **SharedEvent Manager** | Non-blocking synchronization via `MTLSharedEvent` signal/wait (263.9 us, 1.61x improvement over `waitUntilCompleted`) |
-| **Zero-Copy Allocator** | `posix_memalign` -> `newBufferWithBytesNoCopy` — creates a Metal view on the same physical memory for copy-free GPU access |
-| **Buffer Pool** | Pre-allocates dual Metal + `ibv_mr` registered buffers, eliminating runtime registration overhead with size-binned caching |
+| 컴포넌트 | 역할 |
+|----------|------|
+| **SharedEvent Manager** | `MTLSharedEvent` signal/wait 기반 비블로킹 동기화 (263.9μs, `waitUntilCompleted` 대비 1.61x 개선) |
+| **Zero-Copy Allocator** | `posix_memalign` → `newBufferWithBytesNoCopy` — 동일 물리 메모리에 Metal 뷰를 생성하여 복사 없는 GPU 접근 |
+| **Buffer Pool** | Metal + `ibv_mr` 이중 등록 버퍼를 사전 할당, 런타임 등록 오버헤드 제거, size-binned 캐싱 |
 
-The zero-copy path is limited to the RDMA communication hot path. Copies during one-time initialization such as model weight loading are not optimization targets.
+Zero-copy 경로는 RDMA 통신 hot path에 한정됩니다. 모델 가중치 로딩 등 1회성 초기화에서의 복사는 최적화 대상이 아닙니다.
 
 ---
 
 ### 5. Communication Layer — rmlx-rdma
 
-Handles inter-node communication via Thunderbolt 5 RDMA.
+Thunderbolt 5 RDMA를 통한 노드 간 통신을 담당합니다.
 
-| Component | Role |
-|-----------|------|
-| **ibverbs FFI** | ibverbs C library FFI bindings, UC QP creation/management, CQ polling |
-| **Connection Manager** | Peer management via `hosts.json`, GID exchange, connection establishment and warmup |
-| **EP Collective** | Distributed communication primitives: all-to-all, ring allreduce, send/recv |
-| **Multi-port Striping** | Striping for dual TB5 port bandwidth utilization |
+| 컴포넌트 | 역할 |
+|----------|------|
+| **ibverbs FFI** | ibverbs C 라이브러리 FFI 바인딩, UC QP 생성/관리, CQ polling |
+| **Connection Manager** | `hosts.json` 기반 피어 관리, GID 교환, 연결 수립 및 warmup |
+| **EP Collective** | all-to-all, ring allreduce, send/recv 등 분산 통신 프리미티브 |
+| **Multi-port Striping** | 듀얼 TB5 포트 대역폭 활용을 위한 스트라이핑 |
 
 ---
 
-## Crate Dependency Graph
+## 크레이트 의존성 그래프
 
 ```
                rmlx-python (PyO3)
@@ -158,11 +158,11 @@ Handles inter-node communication via Thunderbolt 5 RDMA.
                     rmlx-rdma
 ```
 
-The exact dependency relationships are as follows:
+정확한 의존 관계를 정리하면 다음과 같습니다.
 
-| Crate | Dependencies |
-|-------|-------------|
-| `rmlx-metal` | (external: metal-rs 0.31, objc2, block2) |
+| 크레이트 | 의존하는 크레이트 |
+|----------|-------------------|
+| `rmlx-metal` | (외부: metal-rs 0.31, objc2, block2) |
 | `rmlx-alloc` | `rmlx-metal`, libc |
 | `rmlx-rdma` | `rmlx-alloc`, libc (ibverbs FFI) |
 | `rmlx-core` | `rmlx-metal`, `rmlx-alloc` |
@@ -170,16 +170,16 @@ The exact dependency relationships are as follows:
 | `rmlx-nn` | `rmlx-core` |
 | `rmlx-python` | `rmlx-core`, `rmlx-nn`, `rmlx-distributed` (PyO3 0.28) |
 
-**Dependency principle**: Lower layers (rmlx-metal, rmlx-alloc) are unaware of upper layers (rmlx-core, rmlx-nn). All dependencies are unidirectional, and circular dependencies are not allowed.
+**의존성 원칙**: 하위 레이어(rmlx-metal, rmlx-alloc)는 상위 레이어(rmlx-core, rmlx-nn)에 대해 무지합니다. 모든 의존성은 단방향이며 순환 의존은 허용되지 않습니다.
 
 ---
 
-## Hardware Target
+## 하드웨어 타겟
 
-| Item | Specification |
-|------|-------------|
+| 항목 | 사양 |
+|------|------|
 | GPU | Apple M3 Ultra, 80-core GPU |
-| Memory | 512GB Unified Memory Architecture (UMA) |
-| Nodes | 2 (Mac Studio) |
-| Interconnect | Thunderbolt 5 RDMA (16MB max_mr) |
-| RDMA mode | UC QP (Unreliable Connection) — RC not supported on TB5 |
+| 메모리 | 512GB Unified Memory Architecture (UMA) |
+| 노드 수 | 2대 (Mac Studio) |
+| 인터커넥트 | Thunderbolt 5 RDMA (16MB max_mr) |
+| RDMA 방식 | UC QP (Unreliable Connection) — TB5에서 RC 미지원 |

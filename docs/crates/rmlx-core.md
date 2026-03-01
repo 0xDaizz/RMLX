@@ -1,47 +1,47 @@
-# rmlx-core — 연산 엔진
+# rmlx-core — Compute Engine
 
-## 개요
+## Overview
 
-`rmlx-core`는 Metal GPU 연산 엔진으로, 데이터 타입, N차원 배열, 커널 레지스트리, GPU 연산 커널, 자동 미분, LoRA 파인튜닝, 런타임 메트릭, 구조화된 로깅, 수치 안정성 감시, 그레이스풀 셧다운 등을 제공합니다.
+`rmlx-core` is the Metal GPU compute engine, providing data types, N-dimensional arrays, a kernel registry, GPU compute kernels, automatic differentiation, LoRA fine-tuning, runtime metrics, structured logging, numerical stability monitoring, and graceful shutdown.
 
-> **상태:** DType, Array, KernelRegistry, 10종의 연산 커널, VJP 자동 미분, LoRA, 로깅, 메트릭, PrecisionGuard, ShutdownSignal이 모두 구현되어 있습니다.
+> **Status:** DType, Array, KernelRegistry, 10 compute kernels, VJP autodiff, LoRA, logging, metrics, PrecisionGuard, and ShutdownSignal are all implemented.
 
 ---
 
-## 모듈 구조
+## Module Structure
 
 ```
 rmlx-core/src/
-├── lib.rs              # 모듈 선언 + METALLIB_PATH 상수
-├── dtype.rs            # DType 열거형
-├── array.rs            # N차원 Metal 버퍼 배열
+├── lib.rs              # Module declarations + METALLIB_PATH constant
+├── dtype.rs            # DType enum
+├── array.rs            # N-dimensional Metal buffer array
 ├── kernels/
-│   └── mod.rs          # KernelRegistry (AOT → JIT → PipelineCache)
+│   └── mod.rs          # KernelRegistry (AOT -> JIT -> PipelineCache)
 ├── ops/
-│   ├── mod.rs          # 10종 커널 등록 (register_all)
-│   ├── copy.rs         # 버퍼 복사
+│   ├── mod.rs          # 10 kernel registration (register_all)
+│   ├── copy.rs         # Buffer copy
 │   ├── binary.rs       # add, mul, sub, div
 │   ├── reduce.rs       # sum, max, argmax, row_sum
 │   ├── softmax.rs      # softmax
-│   ├── rms_norm.rs     # RMS 정규화
+│   ├── rms_norm.rs     # RMS normalization
 │   ├── rope.rs         # Rotary Position Embedding
-│   ├── gemv.rs         # 행렬-벡터 곱
-│   ├── matmul.rs       # 행렬 곱셈 (GEMM)
-│   ├── quantized.rs    # 양자화 행렬 곱 (Q4_0, Q4_1, Q8_0)
+│   ├── gemv.rs         # Matrix-vector product
+│   ├── matmul.rs       # Matrix multiplication (GEMM)
+│   ├── quantized.rs    # Quantized matrix multiply (Q4_0, Q4_1, Q8_0)
 │   └── indexing.rs     # gather, scatter
-├── vjp.rs              # 테이프 기반 역전파 자동 미분
-├── lora.rs             # LoRA 파인튜닝
-├── logging.rs          # 구조화된 로깅
-├── metrics.rs          # 원자적 런타임 메트릭
-├── precision_guard.rs  # NaN/Inf/엔트로피 드리프트 감시
-└── shutdown.rs         # 그레이스풀 셧다운 시그널
+├── vjp.rs              # Tape-based reverse-mode autodiff
+├── lora.rs             # LoRA fine-tuning
+├── logging.rs          # Structured logging
+├── metrics.rs          # Atomic runtime metrics
+├── precision_guard.rs  # NaN/Inf/entropy drift monitoring
+└── shutdown.rs         # Graceful shutdown signal
 ```
 
 ---
 
-## DType — 데이터 타입 (`dtype.rs`)
+## DType — Data Types (`dtype.rs`)
 
-LLM 추론에 사용되는 데이터 타입을 정의합니다.
+Defines the data types used for LLM inference.
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -49,28 +49,28 @@ pub enum DType {
     Float32,
     Float16,
     Bfloat16,
-    Q4_0,   // 4-bit 양자화, group size 32, f16 scale
-    Q4_1,   // 4-bit 양자화, group size 32, f16 scale + f16 min
-    Q8_0,   // 8-bit 양자화, group size 32, f16 scale
+    Q4_0,   // 4-bit quantized, group size 32, f16 scale
+    Q4_1,   // 4-bit quantized, group size 32, f16 scale + f16 min
+    Q8_0,   // 8-bit quantized, group size 32, f16 scale
 }
 ```
 
-| 타입 | `size_of()` | `name()` | 설명 |
-|------|-------------|----------|------|
-| `Float32` | 4 | `"float32"` | 기본 부동소수점 |
-| `Float16` | 2 | `"float16"` | 메모리 절약 추론 |
-| `Bfloat16` | 2 | `"bfloat16"` | 학습/추론 (뇌 부동소수점) |
+| Type | `size_of()` | `name()` | Description |
+|------|-------------|----------|-------------|
+| `Float32` | 4 | `"float32"` | Default floating point |
+| `Float16` | 2 | `"float16"` | Memory-efficient inference |
+| `Bfloat16` | 2 | `"bfloat16"` | Training/inference (brain floating point) |
 | `Q4_0` | 1 | `"q4_0"` | ~0.5625 bytes/element (18B per 32 elements) |
 | `Q4_1` | 1 | `"q4_1"` | ~0.625 bytes/element (20B per 32 elements) |
 | `Q8_0` | 1 | `"q8_0"` | ~1.0625 bytes/element (34B per 32 elements) |
 
-**`HasDType` 트레이트:** Rust 타입을 `DType`으로 매핑합니다. 현재 `f32 → DType::Float32`이 구현되어 있습니다.
+**`HasDType` trait:** Maps Rust types to `DType`. Currently `f32 -> DType::Float32` is implemented.
 
 ---
 
-## Array — N차원 배열 (`array.rs`)
+## Array — N-Dimensional Array (`array.rs`)
 
-Metal `Buffer`를 소유하는 N차원 배열입니다. Apple Silicon UMA에서 `StorageModeShared`(CPU + GPU 공유 접근)를 사용합니다.
+An N-dimensional array that owns a Metal `Buffer`. Uses `StorageModeShared` (CPU + GPU shared access) on Apple Silicon UMA.
 
 ```rust
 pub struct Array {
@@ -78,52 +78,52 @@ pub struct Array {
     shape: Vec<usize>,
     strides: Vec<usize>,
     dtype: DType,
-    offset: usize,       // 바이트 오프셋
+    offset: usize,       // byte offset
 }
 ```
 
-### 생성 메서드
+### Creation Methods
 
-| 메서드 | 설명 |
-|--------|------|
-| `Array::new(buffer, shape, strides, dtype, offset)` | 기존 Metal 버퍼를 래핑 |
-| `Array::from_slice::<T>(device, data, shape)` | 타입 슬라이스에서 새 버퍼 할당 |
-| `Array::zeros(device, shape, dtype)` | 0으로 초기화된 배열 생성 |
-| `Array::ones(device, shape)` | 1.0으로 초기화 (f32 전용) |
+| Method | Description |
+|--------|-------------|
+| `Array::new(buffer, shape, strides, dtype, offset)` | Wraps an existing Metal buffer |
+| `Array::from_slice::<T>(device, data, shape)` | Allocates a new buffer from a typed slice |
+| `Array::zeros(device, shape, dtype)` | Creates a zero-initialized array |
+| `Array::ones(device, shape)` | Creates a 1.0-initialized array (f32 only) |
 
-### 접근자
+### Accessors
 
-| 메서드 | 반환 타입 | 설명 |
-|--------|-----------|------|
-| `shape()` | `&[usize]` | 배열 형상 |
-| `strides()` | `&[usize]` | 스트라이드 (요소 단위) |
-| `dtype()` | `DType` | 데이터 타입 |
-| `ndim()` | `usize` | 차원 수 |
-| `numel()` | `usize` | 총 요소 수 |
-| `byte_size()` | `usize` | 총 바이트 크기 |
-| `offset()` | `usize` | 버퍼 내 바이트 오프셋 |
-| `metal_buffer()` | `&MTLBuffer` | Metal 버퍼 참조 |
-| `is_contiguous()` | `bool` | 연속 저장 여부 |
+| Method | Return type | Description |
+|--------|-------------|-------------|
+| `shape()` | `&[usize]` | Array shape |
+| `strides()` | `&[usize]` | Strides (element-wise) |
+| `dtype()` | `DType` | Data type |
+| `ndim()` | `usize` | Number of dimensions |
+| `numel()` | `usize` | Total number of elements |
+| `byte_size()` | `usize` | Total byte size |
+| `offset()` | `usize` | Byte offset within the buffer |
+| `metal_buffer()` | `&MTLBuffer` | Metal buffer reference |
+| `is_contiguous()` | `bool` | Whether storage is contiguous |
 
-### 뷰 연산
+### View Operations
 
-| 메서드 | 설명 |
-|--------|------|
-| `reshape(new_shape)` | 동일 버퍼에서 새 형상 뷰 (zero-copy, 연속 배열 필수) |
-| `view(shape, strides, offset)` | 커스텀 스트라이드/오프셋 뷰 (zero-copy) |
+| Method | Description |
+|--------|-------------|
+| `reshape(new_shape)` | New shape view on the same buffer (zero-copy, contiguous array required) |
+| `view(shape, strides, offset)` | Custom stride/offset view (zero-copy) |
 
-### 데이터 추출
+### Data Extraction
 
 ```rust
-// Safety: GPU 쓰기가 완료된 후 호출해야 함
+// Safety: must be called after GPU writes have completed
 unsafe fn to_vec<T: HasDType + Clone>(&self) -> Vec<T>
 ```
 
 ---
 
-## ops/ — 연산 커널
+## ops/ — Compute Kernels
 
-10종의 Metal GPU 커널을 `KernelRegistry`에 등록합니다. `register_all()`로 일괄 등록합니다.
+Registers 10 Metal GPU kernels with the `KernelRegistry`. Bulk registration via `register_all()`.
 
 ```rust
 pub fn register_all(registry: &KernelRegistry) -> Result<(), KernelError> {
@@ -141,24 +141,24 @@ pub fn register_all(registry: &KernelRegistry) -> Result<(), KernelError> {
 }
 ```
 
-| 모듈 | 연산 | 설명 |
-|------|------|------|
-| `copy` | Copy | 버퍼 간 데이터 복사 |
-| `binary` | Add, Mul, Sub, Div | 원소별 사칙연산 |
-| `reduce` | Sum, Max, Argmax, Row_sum | 리덕션 연산 |
-| `softmax` | Softmax | Attention 스코어 정규화 |
-| `rms_norm` | RMS Normalization | LLaMA 스타일 정규화 |
+| Module | Operation | Description |
+|--------|-----------|-------------|
+| `copy` | Copy | Buffer-to-buffer data copy |
+| `binary` | Add, Mul, Sub, Div | Element-wise arithmetic |
+| `reduce` | Sum, Max, Argmax, Row_sum | Reduction operations |
+| `softmax` | Softmax | Attention score normalization |
+| `rms_norm` | RMS Normalization | LLaMA-style normalization |
 | `rope` | RoPE | Rotary Position Embedding |
-| `gemv` | GEMV | 행렬-벡터 곱 |
-| `matmul` | GEMM | 범용 행렬 곱셈 |
-| `quantized` | QMM | Q4_0/Q4_1/Q8_0 양자화 행렬 곱 |
-| `indexing` | Gather, Scatter | 인덱싱 연산 |
+| `gemv` | GEMV | Matrix-vector product |
+| `matmul` | GEMM | General matrix multiplication |
+| `quantized` | QMM | Q4_0/Q4_1/Q8_0 quantized matrix multiply |
+| `indexing` | Gather, Scatter | Indexing operations |
 
 ---
 
-## KernelRegistry — 커널 레지스트리 (`kernels/mod.rs`)
+## KernelRegistry — Kernel Registry (`kernels/mod.rs`)
 
-AOT `.metallib` → JIT 컴파일 → 파이프라인 캐시의 3단계 폴백을 지원하는 커널 레지스트리입니다.
+A kernel registry supporting 3-level fallback: AOT `.metallib` -> JIT compilation -> pipeline cache.
 
 ```rust
 pub struct KernelRegistry {
@@ -169,14 +169,14 @@ pub struct KernelRegistry {
 }
 ```
 
-### 조회 순서
+### Lookup Order
 
 ```mermaid
 flowchart LR
     A["get_pipeline(name, dtype)"] --> B{Pipeline Cache?}
     B -->|Hit| C[Return cached pipeline]
     B -->|Miss| D{AOT metallib?}
-    D -->|Hit| E[Create pipeline → cache]
+    D -->|Hit| E[Create pipeline -> cache]
     D -->|Miss| F{JIT cache?}
     F -->|Hit| E
     F -->|Miss| G[KernelError::NotFound]
@@ -194,30 +194,30 @@ pub struct PipelineKey {
 
 ### `KernelError`
 
-| 변형 | 설명 |
-|------|------|
-| `NotFound(String)` | 커널을 찾을 수 없음 |
-| `CompilationFailed(String)` | 셰이더 컴파일 실패 |
-| `PipelineFailed(String)` | 파이프라인 생성 실패 |
+| Variant | Description |
+|---------|-------------|
+| `NotFound(String)` | Kernel not found |
+| `CompilationFailed(String)` | Shader compilation failed |
+| `PipelineFailed(String)` | Pipeline creation failed |
 
-### 주요 메서드
+### Key Methods
 
-| 메서드 | 설명 |
-|--------|------|
-| `new(device)` | AOT metallib 자동 로드 시도 |
-| `get_pipeline(name, dtype)` | 파이프라인 조회 (캐시 → AOT → JIT) |
-| `register_jit_source(name, source)` | MSL 소스 문자열 JIT 컴파일 후 캐시 |
-| `has_aot()` | AOT 라이브러리 로드 여부 |
-| `cached_pipeline_count()` | 캐시된 파이프라인 수 |
-| `jit_library_count()` | JIT 라이브러리 수 |
+| Method | Description |
+|--------|-------------|
+| `new(device)` | Automatically attempts to load AOT metallib |
+| `get_pipeline(name, dtype)` | Pipeline lookup (cache -> AOT -> JIT) |
+| `register_jit_source(name, source)` | JIT-compiles an MSL source string and caches it |
+| `has_aot()` | Whether the AOT library is loaded |
+| `cached_pipeline_count()` | Number of cached pipelines |
+| `jit_library_count()` | Number of JIT libraries |
 
 ---
 
-## vjp.rs — 테이프 기반 역전파 자동 미분
+## vjp.rs — Tape-Based Reverse-Mode Autodiff
 
-역전파(reverse-mode) 자동 미분 프레임워크입니다. 연산을 테이프에 기록한 후 역순으로 그래디언트를 전파합니다.
+A reverse-mode automatic differentiation framework. Records operations on a tape, then propagates gradients in reverse order.
 
-### Operation 열거형
+### Operation Enum
 
 ```rust
 pub enum Operation {
@@ -233,7 +233,7 @@ pub enum Operation {
 }
 ```
 
-### GradFn 트레이트
+### GradFn Trait
 
 ```rust
 pub trait GradFn {
@@ -241,7 +241,7 @@ pub trait GradFn {
 }
 ```
 
-출력 그래디언트를 받아 각 입력에 대한 그래디언트를 반환합니다.
+Receives the output gradient and returns gradients for each input.
 
 ### Tape & TapedValue
 
@@ -256,54 +256,54 @@ pub struct TapedValue {
 }
 ```
 
-| 메서드 | 설명 |
-|--------|------|
-| `Tape::new()` | 빈 테이프 생성 |
-| `tape.leaf(value)` | 리프 값(입력) 등록, `TapedValue` 반환 |
-| `tape.record(inputs, output, op, grad_fn)` | 연산 기록 |
-| `tape.backward(output)` | 역전파 실행, 모든 값에 대한 그래디언트 반환 |
+| Method | Description |
+|--------|-------------|
+| `Tape::new()` | Creates an empty tape |
+| `tape.leaf(value)` | Registers a leaf value (input), returns `TapedValue` |
+| `tape.record(inputs, output, op, grad_fn)` | Records an operation |
+| `tape.backward(output)` | Executes backpropagation, returns gradients for all values |
 
-### 내장 그래디언트 함수
+### Built-in Gradient Functions
 
-| 구조체 | 연산 | 수학적 역전파 |
-|--------|------|---------------|
-| `AddGrad { len }` | 원소별 덧셈 | grad가 양쪽에 그대로 전파 |
-| `MulGrad { lhs, rhs }` | 원소별 곱셈 | product rule: `grad * rhs`, `grad * lhs` |
-| `MatMulGrad { a, b, m, k, n }` | 행렬 곱 C=A@B | `dA = dC @ B^T`, `dB = A^T @ dC` |
+| Struct | Operation | Mathematical backprop |
+|--------|-----------|----------------------|
+| `AddGrad { len }` | Element-wise addition | Gradient propagated unchanged to both sides |
+| `MulGrad { lhs, rhs }` | Element-wise multiplication | Product rule: `grad * rhs`, `grad * lhs` |
+| `MatMulGrad { a, b, m, k, n }` | Matrix multiply C=A@B | `dA = dC @ B^T`, `dB = A^T @ dC` |
 
-### 수치 그래디언트 (테스트용)
+### Numerical Gradient (for testing)
 
 ```rust
 pub fn numerical_gradient<F>(f: F, x: &[f32], eps: f32) -> Vec<Vec<f32>>
 ```
 
-중앙 차분법(central differences)으로 야코비안을 근사하여 VJP 정확성을 검증할 때 사용합니다.
+Approximates the Jacobian via central differences for verifying VJP correctness.
 
 ---
 
-## lora.rs — LoRA 파인튜닝
+## lora.rs — LoRA Fine-Tuning
 
-Low-Rank Adaptation을 통한 파라미터 효율적 파인튜닝을 지원합니다.
+Supports parameter-efficient fine-tuning via Low-Rank Adaptation.
 
 ### LoraConfig
 
 ```rust
 pub struct LoraConfig {
-    pub rank: usize,            // 기본값: 8
-    pub alpha: f64,             // 기본값: 16.0
-    pub dropout: f64,           // 기본값: 0.0
-    pub target_modules: Vec<String>,  // 기본값: ["q_proj", "v_proj"]
+    pub rank: usize,            // default: 8
+    pub alpha: f64,             // default: 16.0
+    pub dropout: f64,           // default: 0.0
+    pub target_modules: Vec<String>,  // default: ["q_proj", "v_proj"]
 }
 ```
 
-| 메서드 | 설명 |
-|--------|------|
-| `LoraConfig::new(rank, alpha)` | 지정 rank/alpha, 나머지 기본값 |
-| `scaling()` | `alpha / rank` 계산 |
+| Method | Description |
+|--------|-------------|
+| `LoraConfig::new(rank, alpha)` | Specified rank/alpha, defaults for the rest |
+| `scaling()` | Computes `alpha / rank` |
 
 ### LoraLayer
 
-베이스 선형 레이어 `W: (out, in)`에 저랭크 분해 `delta_W = scaling * B @ A`를 추가합니다.
+Adds a low-rank decomposition `delta_W = scaling * B @ A` to a base linear layer `W: (out, in)`.
 
 ```rust
 pub struct LoraLayer {
@@ -316,12 +316,12 @@ pub struct LoraLayer {
 }
 ```
 
-| 메서드 | 설명 |
-|--------|------|
-| `new(in_features, out_features, config)` | A는 Kaiming 초기화, B는 0 초기화 |
-| `with_weights(...)` | 명시적 A/B 행렬로 생성 (테스트용) |
+| Method | Description |
+|--------|-------------|
+| `new(in_features, out_features, config)` | A initialized with Kaiming, B initialized to zeros |
+| `with_weights(...)` | Creates with explicit A/B matrices (for testing) |
 | `forward(base_output, input, batch_size)` | `base + scaling * input @ A^T @ B^T` |
-| `num_params()` | 학습 가능 파라미터 수 |
+| `num_params()` | Number of trainable parameters |
 
 ### LoraModel
 
@@ -332,19 +332,19 @@ pub struct LoraModel {
 }
 ```
 
-| 메서드 | 설명 |
-|--------|------|
-| `add_adapter(name, in_features, out_features)` | 이름으로 LoRA 어댑터 추가 |
-| `get_layer(name)` / `get_layer_mut(name)` | 이름으로 레이어 조회 |
-| `total_params()` | 전체 학습 가능 파라미터 합산 |
+| Method | Description |
+|--------|-------------|
+| `add_adapter(name, in_features, out_features)` | Adds a LoRA adapter by name |
+| `get_layer(name)` / `get_layer_mut(name)` | Looks up a layer by name |
+| `total_params()` | Total trainable parameters across all adapters |
 
 ### TrainConfig & LoraTrainer
 
 ```rust
 pub struct TrainConfig {
-    pub learning_rate: f64,   // 기본값: 1e-4
-    pub num_epochs: usize,    // 기본값: 1
-    pub batch_size: usize,    // 기본값: 1
+    pub learning_rate: f64,   // default: 1e-4
+    pub num_epochs: usize,    // default: 1
+    pub batch_size: usize,    // default: 1
 }
 
 pub struct LoraTrainer {
@@ -352,17 +352,17 @@ pub struct LoraTrainer {
 }
 ```
 
-| 메서드 | 설명 |
-|--------|------|
-| `compute_loss(logits, targets, vocab_size)` | 교차 엔트로피 손실 (numerically stable) |
-| `compute_loss_grad(logits, targets, vocab_size)` | 손실의 logits에 대한 그래디언트 |
-| `train_step(layer, input, base_output, targets)` | 순전파 → 역전파 → SGD 갱신, 손실 반환 |
+| Method | Description |
+|--------|-------------|
+| `compute_loss(logits, targets, vocab_size)` | Cross-entropy loss (numerically stable) |
+| `compute_loss_grad(logits, targets, vocab_size)` | Gradient of the loss with respect to logits |
+| `train_step(layer, input, base_output, targets)` | Forward -> backward -> SGD update, returns loss |
 
 ---
 
-## logging.rs — 구조화된 로깅
+## logging.rs — Structured Logging
 
-전역 로그 레벨 필터와 JSON/텍스트 출력을 지원하는 경량 로깅 시스템입니다.
+A lightweight logging system supporting global log level filtering and JSON/text output.
 
 ### LogLevel
 
@@ -371,13 +371,13 @@ pub struct LoraTrainer {
 pub enum LogLevel {
     Error = 0,
     Warn  = 1,
-    Info  = 2,   // 기본값
+    Info  = 2,   // default
     Debug = 3,
     Trace = 4,
 }
 ```
 
-전역 레벨은 `AtomicU8`로 관리됩니다.
+The global level is managed via `AtomicU8`.
 
 ### LogEntry
 
@@ -391,28 +391,28 @@ pub struct LogEntry {
 }
 ```
 
-| 메서드 | 설명 |
-|--------|------|
-| `LogEntry::new(level, target, message)` | 현재 타임스탬프로 엔트리 생성 |
-| `.field(key, value)` | 키-값 필드 추가 (빌더 패턴) |
-| `.format_json()` | JSON 문자열 출력 |
-| `.format_text()` | `[ts] LEVEL target: message k=v` 형식 출력 |
+| Method | Description |
+|--------|-------------|
+| `LogEntry::new(level, target, message)` | Creates an entry with the current timestamp |
+| `.field(key, value)` | Adds a key-value field (builder pattern) |
+| `.format_json()` | Outputs as a JSON string |
+| `.format_text()` | Outputs as `[ts] LEVEL target: message k=v` format |
 
-### 전역 함수
+### Global Functions
 
-| 함수 | 설명 |
-|------|------|
-| `set_level(level)` | 전역 로그 레벨 설정 |
-| `current_level()` | 현재 레벨 조회 |
-| `is_enabled(level)` | 해당 레벨이 활성화되었는지 확인 |
-| `log(level, target, message)` | stderr에 텍스트 형식으로 출력 |
-| `log_with_fields(level, target, message, fields)` | 키-값 필드와 함께 출력 |
+| Function | Description |
+|----------|-------------|
+| `set_level(level)` | Sets the global log level |
+| `current_level()` | Queries the current level |
+| `is_enabled(level)` | Checks whether the given level is enabled |
+| `log(level, target, message)` | Outputs in text format to stderr |
+| `log_with_fields(level, target, message, fields)` | Outputs with key-value fields |
 
 ---
 
-## metrics.rs — 런타임 메트릭
+## metrics.rs — Runtime Metrics
 
-`AtomicU64` 기반의 lock-free 런타임 성능 카운터입니다.
+`AtomicU64`-based lock-free runtime performance counters.
 
 ### RuntimeMetrics
 
@@ -428,14 +428,14 @@ pub struct RuntimeMetrics {
 }
 ```
 
-| 메서드 | 설명 |
-|--------|------|
-| `record_kernel_dispatch(duration_us)` | 커널 디스패치 기록 (횟수 + 시간) |
-| `record_buffer_alloc(bytes)` | 버퍼 할당 기록 |
-| `record_buffer_free(bytes)` | 버퍼 해제 기록 |
-| `record_cache_hit()` | 캐시 히트 기록 |
-| `record_cache_miss()` | 캐시 미스 기록 |
-| `snapshot()` | 모든 카운터의 시점 스냅샷 반환 |
+| Method | Description |
+|--------|-------------|
+| `record_kernel_dispatch(duration_us)` | Records a kernel dispatch (count + time) |
+| `record_buffer_alloc(bytes)` | Records a buffer allocation |
+| `record_buffer_free(bytes)` | Records a buffer deallocation |
+| `record_cache_hit()` | Records a cache hit |
+| `record_cache_miss()` | Records a cache miss |
+| `snapshot()` | Returns a point-in-time snapshot of all counters |
 
 ### MetricsSnapshot
 
@@ -454,18 +454,18 @@ pub struct MetricsSnapshot {
 
 ---
 
-## precision_guard.rs — 수치 안전성 감시
+## precision_guard.rs — Numerical Stability Monitoring
 
-logits의 NaN, Inf, 엔트로피 드리프트를 실시간으로 감시합니다.
+Monitors NaN, Inf, and entropy drift in logits in real time.
 
 ### PrecisionResult
 
 ```rust
 pub enum PrecisionResult {
     Ok,
-    HasNaN(usize),         // NaN 개수
-    HasInf(usize),         // Inf 개수
-    EntropyDrift(f64),     // 상대 드리프트 비율
+    HasNaN(usize),         // NaN count
+    HasInf(usize),         // Inf count
+    EntropyDrift(f64),     // Relative drift ratio
 }
 ```
 
@@ -482,24 +482,24 @@ pub struct PrecisionGuard {
 }
 ```
 
-| 메서드 | 설명 |
-|--------|------|
-| `new(window_size)` | 윈도우 크기 지정하여 생성 |
-| `check_logits(logits)` | NaN/Inf 검사 + 엔트로피 계산 → `PrecisionResult` |
-| `record_entropy(entropy)` | 엔트로피 관측값 기록 |
-| `entropy_drift()` | 베이스라인 대비 상대 드리프트 (`Option<f64>`) |
-| `should_warn()` | 드리프트 > 0.15이면 `true` |
-| `should_fallback()` | 드리프트 > 0.30이 2개 윈도우 연속이면 `true` |
+| Method | Description |
+|--------|-------------|
+| `new(window_size)` | Creates with specified window size |
+| `check_logits(logits)` | NaN/Inf check + entropy calculation -> `PrecisionResult` |
+| `record_entropy(entropy)` | Records an entropy observation |
+| `entropy_drift()` | Relative drift from baseline (`Option<f64>`) |
+| `should_warn()` | Returns `true` if drift > 0.15 |
+| `should_fallback()` | Returns `true` if drift > 0.30 for 2 consecutive windows |
 
-**엔트로피 계산:** logits → softmax → Shannon 엔트로피 (`-sum(p * ln(p))`)
+**Entropy calculation:** logits -> softmax -> Shannon entropy (`-sum(p * ln(p))`)
 
-**베이스라인 설정:** 첫 번째 윈도우의 평균 엔트로피를 베이스라인으로 설정합니다.
+**Baseline setting:** The mean entropy of the first window is set as the baseline.
 
 ---
 
-## shutdown.rs — 그레이스풀 셧다운
+## shutdown.rs — Graceful Shutdown
 
-`Arc<AtomicBool>` 기반의 스레드 안전 셧다운 시그널입니다.
+An `Arc<AtomicBool>`-based thread-safe shutdown signal.
 
 ### ShutdownSignal
 
@@ -509,12 +509,12 @@ pub struct ShutdownSignal {
 }
 ```
 
-| 메서드 | 설명 |
-|--------|------|
-| `new()` | 새 시그널 생성 (초기값 `false`) |
-| `trigger()` | 셧다운 트리거 (`Release` ordering) |
-| `is_triggered()` | 셧다운 여부 확인 (`Acquire` ordering) |
-| `clone_handle()` | 읽기 전용 `ShutdownHandle` 생성 |
+| Method | Description |
+|--------|-------------|
+| `new()` | Creates a new signal (initial value `false`) |
+| `trigger()` | Triggers shutdown (`Release` ordering) |
+| `is_triggered()` | Checks shutdown status (`Acquire` ordering) |
+| `clone_handle()` | Creates a read-only `ShutdownHandle` |
 
 ### ShutdownHandle
 
@@ -524,29 +524,29 @@ pub struct ShutdownHandle {
 }
 ```
 
-| 메서드 | 설명 |
-|--------|------|
-| `is_shutdown()` | 셧다운 여부 확인 (`Acquire` ordering) |
+| Method | Description |
+|--------|-------------|
+| `is_shutdown()` | Checks shutdown status (`Acquire` ordering) |
 
-**사용 패턴:** 메인 스레드에서 `ShutdownSignal`을 보유하고, 워커 스레드들에게 `ShutdownHandle`을 배포합니다.
-
----
-
-## 빌드 시스템
-
-`build.rs`가 `kernels/` 디렉토리의 `.metal` 파일을 `xcrun`으로 AOT 컴파일합니다.
-
-| 단계 | 도구 | 입력 | 출력 |
-|------|------|------|------|
-| 1. 컴파일 | `xcrun metal -c` | `*.metal` | `*.air` |
-| 2. 링킹 | `xcrun metallib` | `*.air` | `rmlx_kernels.metallib` |
-| 3. 노출 | `cargo:rustc-env` | `.metallib` 경로 | `RMLX_METALLIB_PATH` |
-
-**Graceful Fallback:** Xcode가 설치되어 있지 않으면 경고 출력 후 `RMLX_METALLIB_PATH`를 빈 문자열로 설정합니다. 런타임에 JIT 컴파일로 폴백합니다.
+**Usage pattern:** The main thread holds the `ShutdownSignal` and distributes `ShutdownHandle`s to worker threads.
 
 ---
 
-## 의존성
+## Build System
+
+`build.rs` AOT-compiles `.metal` files from the `kernels/` directory using `xcrun`.
+
+| Step | Tool | Input | Output |
+|------|------|-------|--------|
+| 1. Compile | `xcrun metal -c` | `*.metal` | `*.air` |
+| 2. Link | `xcrun metallib` | `*.air` | `rmlx_kernels.metallib` |
+| 3. Expose | `cargo:rustc-env` | `.metallib` path | `RMLX_METALLIB_PATH` |
+
+**Graceful fallback:** If Xcode is not installed, a warning is printed and `RMLX_METALLIB_PATH` is set to an empty string. Falls back to JIT compilation at runtime.
+
+---
+
+## Dependencies
 
 ```toml
 [dependencies]

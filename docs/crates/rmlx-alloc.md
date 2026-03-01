@@ -1,14 +1,14 @@
-# rmlx-alloc — 메모리 할당자
+# rmlx-alloc — Memory Allocator
 
-## 개요
+## Overview
 
-`rmlx-alloc`은 GPU 메모리 할당 및 zero-copy 버퍼 관리를 담당하는 크레이트입니다. `posix_memalign`으로 할당한 페이지 정렬 메모리에 Metal `newBufferWithBytesNoCopy`를 등록하여, 단일 물리 메모리에 대해 CPU/GPU 동시 접근을 제공합니다. MLX의 MetalAllocator 패턴을 따르며, 크기별 비닝 캐시와 할당 통계 추적 기능을 포함합니다.
+`rmlx-alloc` is the crate responsible for GPU memory allocation and zero-copy buffer management. It registers page-aligned memory allocated via `posix_memalign` with Metal's `newBufferWithBytesNoCopy`, providing simultaneous CPU/GPU access to a single physical memory region. It follows the MLX MetalAllocator pattern and includes size-binned caching and allocation statistics tracking.
 
-> **상태:** Phase 1 구현 완료. `ZeroCopyBuffer`, `MetalAllocator`, `BufferCache`, `AllocStats`, `LeakDetector` 모두 구현되었습니다.
+> **Status:** Phase 1 implementation complete. `ZeroCopyBuffer`, `MetalAllocator`, `BufferCache`, `AllocStats`, and `LeakDetector` are all implemented.
 
 ---
 
-## 모듈 구조
+## Module Structure
 
 ```mermaid
 graph TD
@@ -25,47 +25,47 @@ graph TD
 
 ### `allocator.rs` — `MetalAllocator`
 
-MLX MetalAllocator 패턴을 따르는 Metal 버퍼 할당자입니다. 할당 시 캐시를 먼저 확인하고, 캐시 미스 시 디바이스에서 직접 할당합니다.
+A Metal buffer allocator following the MLX MetalAllocator pattern. Checks the cache first on allocation, falling back to direct device allocation on cache miss.
 
 ```rust
 pub struct MetalAllocator {
     device: Arc<GpuDevice>,
     cache: Mutex<BufferCache>,
     stats: AllocStats,
-    block_limit: usize,           // 최대 총 할당량 (0 = 무제한)
+    block_limit: usize,           // maximum total allocation (0 = unlimited)
 }
 ```
 
-| 메서드 | 설명 |
-|--------|------|
-| `new(device, max_cache_size)` | 새 할당자를 생성합니다 |
-| `set_block_limit(limit)` | 최대 총 할당 제한을 설정합니다 (0 = 무제한) |
-| `alloc(size)` | Metal 버퍼를 할당합니다 (캐시 우선, 디바이스 폴백) |
-| `free(buffer)` | 버퍼를 캐시에 반환하여 재사용합니다 |
-| `stats()` | 할당 통계 참조를 반환합니다 |
-| `clear_cache()` | 캐시를 비우고 모든 캐시된 버퍼를 해제합니다 |
+| Method | Description |
+|--------|-------------|
+| `new(device, max_cache_size)` | Creates a new allocator |
+| `set_block_limit(limit)` | Sets the maximum total allocation limit (0 = unlimited) |
+| `alloc(size)` | Allocates a Metal buffer (cache first, device fallback) |
+| `free(buffer)` | Returns a buffer to the cache for reuse |
+| `stats()` | Returns a reference to allocation statistics |
+| `clear_cache()` | Clears the cache and releases all cached buffers |
 
-**할당 흐름:**
-1. `block_limit` 확인 (초과 시 `OutOfMemory` 반환)
-2. `BufferCache::acquire(size)` 시도
-3. 캐시 히트 → 통계에 cache hit 기록 후 반환
-4. 캐시 미스 → `device.new_buffer()` 호출하여 새 버퍼 할당
+**Allocation flow:**
+1. Check `block_limit` (return `OutOfMemory` if exceeded)
+2. Attempt `BufferCache::acquire(size)`
+3. Cache hit -> record cache hit in stats and return
+4. Cache miss -> call `device.new_buffer()` to allocate a new buffer
 
 ---
 
 ### `zero_copy.rs` — `ZeroCopyBuffer`
 
-페이지 정렬 메모리를 CPU와 Metal GPU가 동시에 접근할 수 있는 zero-copy 버퍼입니다.
+A zero-copy buffer where page-aligned memory can be simultaneously accessed by the CPU and Metal GPU.
 
-**할당 흐름:**
+**Allocation flow:**
 
 ```mermaid
 flowchart LR
-    A[posix_memalign<br/>페이지 정렬 할당 + zero-fill] --> B[newBufferWithBytesNoCopy<br/>Metal GPU 매핑]
+    A[posix_memalign<br/>page-aligned allocation + zero-fill] --> B[newBufferWithBytesNoCopy<br/>Metal GPU mapping]
 ```
 
-1. **`posix_memalign`** — `sysconf(_SC_PAGESIZE)` (일반적으로 16KB on Apple Silicon) 단위로 페이지 정렬된 메모리를 할당하고 0으로 초기화합니다
-2. **`newBufferWithBytesNoCopy`** — 복사 없이 GPU에서 접근 가능한 Metal 버퍼를 생성합니다
+1. **`posix_memalign`** — Allocates page-aligned memory in `sysconf(_SC_PAGESIZE)` units (typically 16KB on Apple Silicon) and zero-fills it
+2. **`newBufferWithBytesNoCopy`** — Creates a Metal buffer accessible by the GPU without copying
 
 ```rust
 pub struct ZeroCopyBuffer {
@@ -77,72 +77,72 @@ pub struct ZeroCopyBuffer {
 }
 ```
 
-| 메서드 | 설명 |
-|--------|------|
-| `new(device, size)` | 페이지 정렬된 zero-copy 버퍼를 할당합니다 |
-| `metal_buffer()` | Metal 버퍼 참조를 반환합니다 |
-| `as_ptr()` | 읽기 전용 포인터를 반환합니다 |
-| `as_mut_ptr()` | 쓰기 가능 포인터를 반환합니다 (`&mut self` 필요) |
-| `size()` | 페이지 정렬된 버퍼 크기를 반환합니다 |
-| `acquire_in_flight()` | GPU/RDMA 작업 중 해제를 방지하는 `InFlightToken`을 획득합니다 |
-| `acquire_fence(op_tag)` | 하드웨어 완료 검증이 필요한 `CompletionFence`를 획득합니다 |
-| `in_flight_count()` | 현재 in-flight 참조 수를 반환합니다 (self 포함, 외부 참조 없으면 1) |
+| Method | Description |
+|--------|-------------|
+| `new(device, size)` | Allocates a page-aligned zero-copy buffer |
+| `metal_buffer()` | Returns a reference to the Metal buffer |
+| `as_ptr()` | Returns a read-only pointer |
+| `as_mut_ptr()` | Returns a writable pointer (requires `&mut self`) |
+| `size()` | Returns the page-aligned buffer size |
+| `acquire_in_flight()` | Acquires an `InFlightToken` to prevent deallocation during GPU/RDMA operations |
+| `acquire_fence(op_tag)` | Acquires a `CompletionFence` for hardware completion verification |
+| `in_flight_count()` | Returns the current in-flight reference count (including self; 1 if no external references) |
 
-`Send`와 `Sync`가 수동으로 구현되어 있습니다 (UMA 기반 Apple Silicon에서 Metal `StorageModeShared` 버퍼의 스레드 안전성 보장).
+`Send` and `Sync` are manually implemented (guaranteeing thread safety for Metal `StorageModeShared` buffers on UMA-based Apple Silicon).
 
-**안전한 해제 (Drop):**
+**Safe deallocation (Drop):**
 
-`ZeroCopyBuffer`의 `Drop` 구현은 모든 in-flight 토큰이 해제될 때까지 최대 5초간 `yield_now()` 루프로 대기합니다. 타임아웃 시 use-after-free를 방지하기 위해 메모리를 의도적으로 leak합니다.
+The `ZeroCopyBuffer` `Drop` implementation waits via a `yield_now()` loop for up to 5 seconds until all in-flight tokens are released. On timeout, it intentionally leaks the memory to prevent use-after-free.
 
 ---
 
-### In-Flight 추적: `InFlightToken`, `CompletionFence`, `GpuCompletionHandler`
+### In-Flight Tracking: `InFlightToken`, `CompletionFence`, `GpuCompletionHandler`
 
 ```rust
-/// Arc<()> 기반 참조 카운팅 — 버퍼 해제를 방지합니다
+/// Arc<()>-based reference counting — prevents buffer deallocation
 pub struct InFlightToken {
     _guard: Arc<()>,
 }
 
-/// ManuallyDrop 기반 — release_after_verification()으로만 해제 가능
+/// ManuallyDrop-based — can only be released via release_after_verification()
 pub struct CompletionFence {
     token: ManuallyDrop<InFlightToken>,
     op_tag: &'static str,
     verified: Arc<AtomicBool>,
 }
 
-/// Metal completedHandler 콜백에서 CompletionFence를 안전하게 해제
+/// Safely releases CompletionFence from Metal completedHandler callback
 pub struct GpuCompletionHandler {
     fence: Option<CompletionFence>,
 }
 ```
 
-**안전성 계약:**
-- `CompletionFence::release_after_verification()`은 GPU command buffer가 completed 상태이거나 CQ에서 `IBV_WC_SUCCESS`를 수신한 후에만 호출해야 합니다
-- 검증 없이 `CompletionFence`가 드롭되면 `InFlightToken`을 의도적으로 leak하여, `ZeroCopyBuffer::drop()`이 메모리를 해제하지 못하게 합니다 (use-after-free 방지)
-- `GpuCompletionHandler::on_completed()`를 통해 Metal 완료 콜백에서 안전하게 펜스를 해제합니다
+**Safety contract:**
+- `CompletionFence::release_after_verification()` must only be called after the GPU command buffer has completed or `IBV_WC_SUCCESS` has been received from the CQ
+- If a `CompletionFence` is dropped without verification, it intentionally leaks the `InFlightToken`, preventing `ZeroCopyBuffer::drop()` from freeing the memory (use-after-free prevention)
+- `GpuCompletionHandler::on_completed()` safely releases the fence from a Metal completion callback
 
 ---
 
 ### `cache.rs` — `BufferCache`
 
-MLX BufferCache 패턴을 따르는 크기별 비닝(size-binned) 버퍼 캐시입니다. `BTreeMap<usize, VecDeque<MetalBuffer>>`로 구현되어 있으며, 크기를 페이지 경계로 올림 정렬합니다.
+A size-binned buffer cache following the MLX BufferCache pattern. Implemented with `BTreeMap<usize, VecDeque<MetalBuffer>>`, rounding sizes up to page boundaries.
 
-| 메서드 | 설명 |
-|--------|------|
-| `new(max_cache_size)` | 최대 캐시 크기(바이트)로 새 캐시를 생성합니다 |
-| `acquire(size)` | 캐시에서 적합한 버퍼를 검색합니다 (정확 매칭 우선, 이후 다음 큰 빈) |
-| `release(buffer)` | 버퍼를 캐시에 반환합니다 (max 초과 시 가장 큰 빈부터 퇴거) |
-| `cache_size()` | 현재 캐시 사용량(바이트)을 반환합니다 |
-| `clear()` | 모든 캐시된 버퍼를 해제합니다 |
+| Method | Description |
+|--------|-------------|
+| `new(max_cache_size)` | Creates a new cache with the specified maximum cache size in bytes |
+| `acquire(size)` | Searches the cache for a suitable buffer (exact match first, then next larger bin) |
+| `release(buffer)` | Returns a buffer to the cache (evicts from the largest bin when max exceeded) |
+| `cache_size()` | Returns the current cache usage in bytes |
+| `clear()` | Releases all cached buffers |
 
-**퇴거 정책:** 캐시가 가득 차면 가장 큰 빈에서 먼저 퇴거하여 단일 퇴거로 최대한 많은 메모리를 확보합니다. `max_cache_size`를 초과하는 단일 버퍼는 캐시하지 않고 즉시 드롭합니다.
+**Eviction policy:** When the cache is full, eviction starts from the largest bin to reclaim as much memory as possible per eviction. Single buffers exceeding `max_cache_size` are dropped immediately without caching.
 
 ---
 
 ### `stats.rs` — `AllocStats`
 
-스레드 안전한 할당 통계 트래커입니다. 모든 카운터는 `AtomicUsize` 기반입니다.
+A thread-safe allocation statistics tracker. All counters are `AtomicUsize`-based.
 
 ```rust
 pub struct AllocStats {
@@ -155,21 +155,21 @@ pub struct AllocStats {
 }
 ```
 
-| 메서드 | 설명 |
-|--------|------|
-| `record_alloc(size)` | 할당을 기록합니다 (피크 갱신: `compare_exchange_weak` CAS 루프) |
-| `record_free(size)` | 해제를 기록합니다 |
-| `record_cache_hit()` / `record_cache_miss()` | 캐시 히트/미스를 기록합니다 |
-| `active()` | 현재 활성 바이트 수를 반환합니다 |
-| `peak()` | 피크 바이트 수를 반환합니다 |
-| `total_allocs()` / `total_frees()` | 총 할당/해제 횟수를 반환합니다 |
-| `cache_hits()` / `cache_misses()` | 캐시 히트/미스 횟수를 반환합니다 |
+| Method | Description |
+|--------|-------------|
+| `record_alloc(size)` | Records an allocation (peak update via `compare_exchange_weak` CAS loop) |
+| `record_free(size)` | Records a deallocation |
+| `record_cache_hit()` / `record_cache_miss()` | Records a cache hit/miss |
+| `active()` | Returns current active bytes |
+| `peak()` | Returns peak bytes |
+| `total_allocs()` / `total_frees()` | Returns total allocation/deallocation counts |
+| `cache_hits()` / `cache_misses()` | Returns cache hit/miss counts |
 
 ---
 
 ### `leak_detector.rs` — `LeakDetector`
 
-`AtomicU64` 기반의 lock-free 할당/해제 카운터로 메모리 누수를 감지합니다. 할당 바이트의 high-water-mark를 CAS 루프로 추적합니다.
+An `AtomicU64`-based lock-free allocation/deallocation counter for memory leak detection. Tracks the high-water mark of allocated bytes via a CAS loop.
 
 ```rust
 pub struct LeakDetector {
@@ -181,17 +181,17 @@ pub struct LeakDetector {
 }
 ```
 
-| 메서드 | 설명 |
-|--------|------|
-| `new()` | 모든 카운터가 0인 새 `LeakDetector`를 생성합니다 |
-| `record_alloc(bytes)` | 할당을 기록합니다 (count +1, bytes 누적, high-water-mark CAS 갱신) |
-| `record_free(bytes)` | 해제를 기록합니다 (count +1, bytes 누적) |
-| `outstanding_allocs()` | 미해제 할당 횟수를 반환합니다 (`alloc_count - free_count`) |
-| `outstanding_bytes()` | 미해제 바이트 수를 반환합니다 (`alloc_bytes - free_bytes`) |
-| `has_potential_leak()` | 휴리스틱 누수 판단: 미해제 할당 > 0 **그리고** 미해제 바이트 > 1 MiB |
-| `report()` | 전체 상태의 `LeakReport` 스냅샷을 반환합니다 |
+| Method | Description |
+|--------|-------------|
+| `new()` | Creates a new `LeakDetector` with all counters at 0 |
+| `record_alloc(bytes)` | Records an allocation (count +1, bytes accumulated, high-water-mark CAS update) |
+| `record_free(bytes)` | Records a deallocation (count +1, bytes accumulated) |
+| `outstanding_allocs()` | Returns the number of unreleased allocations (`alloc_count - free_count`) |
+| `outstanding_bytes()` | Returns the number of unreleased bytes (`alloc_bytes - free_bytes`) |
+| `has_potential_leak()` | Heuristic leak detection: outstanding allocs > 0 **and** outstanding bytes > 1 MiB |
+| `report()` | Returns a `LeakReport` snapshot of the full state |
 
-**`LeakReport` 스냅샷:**
+**`LeakReport` snapshot:**
 
 ```rust
 #[derive(Debug, Clone)]
@@ -205,30 +205,30 @@ pub struct LeakReport {
 }
 ```
 
-**High-Water-Mark 갱신:** `record_alloc()` 호출 시 현재 미해제 바이트(`alloc_bytes - free_bytes`)를 계산하고, 기존 high-water-mark보다 크면 `compare_exchange_weak` CAS 루프로 원자적으로 갱신합니다.
+**High-water mark update:** On each `record_alloc()` call, the current outstanding bytes (`alloc_bytes - free_bytes`) are computed. If greater than the existing high-water mark, it is atomically updated via a `compare_exchange_weak` CAS loop.
 
-> `Default` 트레이트가 구현되어 있으므로 `LeakDetector::default()`로도 생성할 수 있습니다.
+> The `Default` trait is implemented, so `LeakDetector::default()` can also be used for creation.
 
 ---
 
-## 에러 처리
+## Error Handling
 
 ```rust
 #[derive(Debug)]
 pub enum AllocError {
-    PosixMemalign(i32),         // posix_memalign 실패 (에러 코드)
-    MetalBufferCreate,          // Metal 버퍼 생성 실패
-    OutOfMemory {               // 메모리 부족
+    PosixMemalign(i32),         // posix_memalign failed (error code)
+    MetalBufferCreate,          // Metal buffer creation failed
+    OutOfMemory {               // Out of memory
         requested: usize,
         available: usize,
     },
-    PoolExhausted,              // 버퍼 풀 소진
+    PoolExhausted,              // Buffer pool exhausted
 }
 ```
 
 ---
 
-## 메모리 관리 흐름
+## Memory Management Flow
 
 ```mermaid
 sequenceDiagram
@@ -239,9 +239,9 @@ sequenceDiagram
 
     App->>MetalAllocator: alloc(size)
     MetalAllocator->>BufferCache: acquire(size)
-    alt 캐시 히트
+    alt Cache hit
         BufferCache-->>MetalAllocator: Some(buffer)
-    else 캐시 미스
+    else Cache miss
         MetalAllocator->>GpuDevice: new_buffer(size, Shared)
         GpuDevice-->>MetalAllocator: buffer
     end
@@ -252,7 +252,7 @@ sequenceDiagram
 
 ---
 
-## 의존성
+## Dependencies
 
 ```toml
 [dependencies]

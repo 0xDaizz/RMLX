@@ -1,7 +1,36 @@
+# Build
+/target
+*.metallib
+
+# Cache
 .cache/
 _tmp_*
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
-/target
-*.metallib
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Local config (may contain paths/credentials)
+.config/
+.env
+.env.*
+*.local
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Internal planning docs
+PLAN.md

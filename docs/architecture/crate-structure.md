@@ -1,62 +1,62 @@
-# 크레이트 구조
+# Crate Structure
 
-RMLX는 Cargo workspace로 구성된 7개의 크레이트와 부가 디렉토리로 이루어져 있습니다.
+RMLX consists of 7 crates organized as a Cargo workspace, along with supplementary directories.
 
 ---
 
-## 워크스페이스 전체 구조
+## Full Workspace Layout
 
 ```
 rmlx/
-├── Cargo.toml                    # workspace 루트
-├── PLAN.md                       # 구현 계획서
+├── Cargo.toml                    # workspace root
+├── PLAN.md                       # implementation plan
 ├── crates/
-│   ├── rmlx-metal/               # Metal GPU 추상화
+│   ├── rmlx-metal/               # Metal GPU abstractions
 │   │   ├── Cargo.toml            # deps: metal-rs 0.31, objc2, block2
 │   │   └── src/
 │   │       ├── lib.rs
-│   │       ├── device.rs         # MTLDevice 래퍼, 아키텍처 감지
-│   │       ├── queue.rs          # MTLCommandQueue 관리 (듀얼 큐 지원)
-│   │       ├── command.rs        # CommandBuffer/Encoder 추상화
-│   │       ├── buffer.rs         # MTLBuffer, zero-copy 생성
-│   │       ├── event.rs          # MTLSharedEvent 래퍼
+│   │       ├── device.rs         # MTLDevice wrapper, architecture detection
+│   │       ├── queue.rs          # MTLCommandQueue management (dual queue support)
+│   │       ├── command.rs        # CommandBuffer/Encoder abstraction
+│   │       ├── buffer.rs         # MTLBuffer, zero-copy creation
+│   │       ├── event.rs          # MTLSharedEvent wrapper
 │   │       ├── fence.rs          # MTLFence + fast-fence (shared buffer spin)
-│   │       ├── pipeline.rs       # ComputePipelineState 캐시
-│   │       ├── library.rs        # MTLLibrary 로드/JIT 컴파일
-│   │       ├── resident.rs       # ResidencySet 관리
-│   │       └── self_check.rs     # 시동 진단 (startup diagnostics)
+│   │       ├── pipeline.rs       # ComputePipelineState cache
+│   │       ├── library.rs        # MTLLibrary load/JIT compilation
+│   │       ├── resident.rs       # ResidencySet management
+│   │       └── self_check.rs     # Startup diagnostics
 │   │
-│   ├── rmlx-alloc/               # 메모리 할당자
+│   ├── rmlx-alloc/               # Memory allocator
 │   │   ├── Cargo.toml            # deps: rmlx-metal, libc
 │   │   └── src/
 │   │       ├── lib.rs
 │   │       ├── zero_copy.rs      # posix_memalign + newBufferWithBytesNoCopy
-│   │       ├── pool.rs           # 이중 등록 버퍼 풀 (Metal + ibv_mr)
-│   │       ├── cache.rs          # MLX-style size-binned 캐시
-│   │       ├── stats.rs          # 할당 통계, 피크 메모리 추적
-│   │       └── leak_detector.rs  # 메모리 누수 감지
+│   │       ├── pool.rs           # Dual-registered buffer pool (Metal + ibv_mr)
+│   │       ├── cache.rs          # MLX-style size-binned cache
+│   │       ├── stats.rs          # Allocation statistics, peak memory tracking
+│   │       └── leak_detector.rs  # Memory leak detection
 │   │
-│   ├── rmlx-rdma/                # RDMA 통신
+│   ├── rmlx-rdma/                # RDMA communication
 │   │   ├── Cargo.toml            # deps: rmlx-alloc, libc (ibverbs FFI)
 │   │   ├── src/
 │   │   │   ├── lib.rs
-│   │   │   ├── ffi.rs            # ibverbs C FFI 바인딩 (bindgen)
-│   │   │   ├── context.rs        # ibv_context, PD, CQ 관리
-│   │   │   ├── qp.rs             # UC QP 생성/관리, GID 처리
-│   │   │   ├── mr.rs             # ibv_reg_mr, 이중 등록 버퍼 관리
-│   │   │   ├── exchange.rs       # blocking_exchange (2-phase count→payload)
+│   │   │   ├── ffi.rs            # ibverbs C FFI bindings (bindgen)
+│   │   │   ├── context.rs        # ibv_context, PD, CQ management
+│   │   │   ├── qp.rs             # UC QP creation/management, GID handling
+│   │   │   ├── mr.rs             # ibv_reg_mr, dual-registered buffer management
+│   │   │   ├── exchange.rs       # blocking_exchange (2-phase count -> payload)
 │   │   │   ├── collective.rs     # all-to-all, ring allreduce
-│   │   │   ├── connection.rs     # hosts.json 파싱, 연결 수립, warmup
-│   │   │   ├── multi_port.rs     # 듀얼 TB5 포트 스트라이핑
-│   │   │   └── rdma_metrics.rs   # RDMA 메트릭 수집
-│   │   └── build.rs              # ibverbs 링크 설정
+│   │   │   ├── connection.rs     # hosts.json parsing, connection setup, warmup
+│   │   │   ├── multi_port.rs     # Dual TB5 port striping
+│   │   │   └── rdma_metrics.rs   # RDMA metrics collection
+│   │   └── build.rs              # ibverbs link configuration
 │   │
-│   ├── rmlx-core/                # 연산 엔진
+│   ├── rmlx-core/                # Compute engine
 │   │   ├── Cargo.toml            # deps: rmlx-metal, rmlx-alloc
 │   │   └── src/
 │   │       ├── lib.rs
-│   │       ├── dtype.rs          # 데이터 타입 (f32, f16, bf16, quantized)
-│   │       ├── array.rs          # N-dim array 타입 (Buffer 소유권)
+│   │       ├── dtype.rs          # Data types (f32, f16, bf16, quantized)
+│   │       ├── array.rs          # N-dim array type (Buffer ownership)
 │   │       ├── ops/
 │   │       │   ├── mod.rs
 │   │       │   ├── matmul.rs     # GEMM (metal-rs dispatch)
@@ -64,68 +64,68 @@ rmlx/
 │   │       │   ├── softmax.rs
 │   │       │   ├── rms_norm.rs
 │   │       │   ├── rope.rs
-│   │       │   ├── binary.rs     # element-wise 연산
+│   │       │   ├── binary.rs     # Element-wise operations
 │   │       │   ├── reduce.rs
 │   │       │   ├── copy.rs
 │   │       │   └── indexing.rs
 │   │       ├── kernels/
-│   │       │   ├── mod.rs        # 커널 레지스트리
-│   │       │   ├── loader.rs     # .metallib AOT 로드
-│   │       │   └── jit.rs        # 소스 문자열 JIT 컴파일
-│   │       ├── graph.rs          # 연산 그래프 (선택적 tracing)
-│   │       ├── scheduler.rs      # 스트림별 실행 스케줄러
+│   │       │   ├── mod.rs        # Kernel registry
+│   │       │   ├── loader.rs     # .metallib AOT loader
+│   │       │   └── jit.rs        # Source string JIT compilation
+│   │       ├── graph.rs          # Computation graph (selective tracing)
+│   │       ├── scheduler.rs      # Per-stream execution scheduler
 │   │       ├── vjp.rs            # VJP (Vector-Jacobian Product) autodiff
-│   │       ├── lora.rs           # LoRA fine-tuning 지원
+│   │       ├── lora.rs           # LoRA fine-tuning support
 │   │       ├── logging.rs        # Structured logging (tracing)
-│   │       ├── metrics.rs        # 메트릭 수집 (Prometheus 호환)
-│   │       ├── precision_guard.rs # 정밀도 가드 (dtype 안전성)
+│   │       ├── metrics.rs        # Metrics collection (Prometheus compatible)
+│   │       ├── precision_guard.rs # Precision guard (dtype safety)
 │   │       └── shutdown.rs       # Graceful shutdown
 │   │
-│   ├── rmlx-distributed/         # 분산 프리미티브
+│   ├── rmlx-distributed/         # Distributed primitives
 │   │   ├── Cargo.toml            # deps: rmlx-core, rmlx-rdma
 │   │   └── src/
 │   │       ├── lib.rs
-│   │       ├── group.rs          # 분산 그룹 추상화 (rank, world_size)
+│   │       ├── group.rs          # Distributed group abstraction (rank, world_size)
 │   │       ├── primitives.rs     # AllReduce, AllGather, Send, Recv, AllToAll
 │   │       ├── moe/
 │   │       │   ├── mod.rs
 │   │       │   ├── dispatch.rs   # MoeDispatchExchange (3-zone auto backend)
 │   │       │   ├── combine.rs    # MoeCombineExchange
-│   │       │   ├── policy.rs     # 3-zone 정책 (CPU/Metal/byte threshold)
-│   │       │   ├── kernels.rs    # MoE Metal 커널 7종 관리
-│   │       │   └── warmup.rs     # RDMA + Metal JIT 사전 워밍업
-│   │       ├── moe_exchange.rs   # MoE 데이터 교환 프리미티브
-│   │       ├── moe_policy.rs     # MoE 라우팅 정책
-│   │       ├── pipeline.rs       # layer-level compute↔RDMA 파이프라인
-│   │       ├── sparse_guard.rs   # 희소 디스패치 안전 가드
-│   │       ├── warmup.rs         # 분산 워밍업
-│   │       └── metrics.rs        # 분산 메트릭 수집
+│   │       │   ├── policy.rs     # 3-zone policy (CPU/Metal/byte threshold)
+│   │       │   ├── kernels.rs    # MoE Metal kernel management (7 kernels)
+│   │       │   └── warmup.rs     # RDMA + Metal JIT pre-warmup
+│   │       ├── moe_exchange.rs   # MoE data exchange primitives
+│   │       ├── moe_policy.rs     # MoE routing policy
+│   │       ├── pipeline.rs       # Layer-level compute <-> RDMA pipeline
+│   │       ├── sparse_guard.rs   # Sparse dispatch safety guard
+│   │       ├── warmup.rs         # Distributed warmup
+│   │       └── metrics.rs        # Distributed metrics collection
 │   │
-│   └── rmlx-nn/                  # 신경망 레이어
+│   └── rmlx-nn/                  # Neural network layers
 │       ├── Cargo.toml            # deps: rmlx-core
 │       └── src/
 │           ├── lib.rs
-│           ├── linear.rs         # Linear (quantized 지원)
+│           ├── linear.rs         # Linear (with quantization support)
 │           ├── embedding.rs
 │           ├── attention.rs      # Multi-head/GQA attention
 │           ├── transformer.rs    # Transformer block
-│           ├── moe.rs            # MoE gate + expert 라우팅
+│           ├── moe.rs            # MoE gate + expert routing
 │           └── models/
 │               ├── mod.rs
-│               ├── llama.rs      # LLaMA 아키텍처
+│               ├── llama.rs      # LLaMA architecture
 │               ├── qwen.rs       # Qwen/Qwen2.5
 │               ├── deepseek.rs   # DeepSeek-V3 (MoE)
 │               └── mixtral.rs    # Mixtral (MoE)
 │
-│   └── rmlx-python/              # PyO3 Python 바인딩
+│   └── rmlx-python/              # PyO3 Python bindings
 │       ├── Cargo.toml            # deps: rmlx-core, rmlx-nn, rmlx-distributed, pyo3 0.28
 │       └── src/
 │           ├── lib.rs            # declarative #[pymodule]
-│           ├── dtype.rs          # PyDType (Python dtype 래퍼)
-│           └── array.rs          # PyArray (Python N-dim array 래퍼)
+│           ├── dtype.rs          # PyDType (Python dtype wrapper)
+│           └── array.rs          # PyArray (Python N-dim array wrapper)
 │
-├── shaders/                      # Metal 셰이더 소스
-│   ├── mlx_compat/               # MLX에서 가져온 .metal 파일
+├── shaders/                      # Metal shader sources
+│   ├── mlx_compat/               # .metal files ported from MLX
 │   │   ├── gemv.metal
 │   │   ├── gemm.metal
 │   │   ├── quantized.metal
@@ -136,25 +136,25 @@ rmlx/
 │   │   ├── reduce.metal
 │   │   ├── copy.metal
 │   │   └── fence.metal
-│   ├── moe/                      # EP 전용 커널
+│   ├── moe/                      # EP-specific kernels
 │   │   ├── dispatch_local.metal
 │   │   ├── dispatch_scatter.metal
 │   │   ├── combine_gather.metal
 │   │   ├── combine_weighted_sum.metal
 │   │   ├── packet_gather.metal
 │   │   └── packet_scatter.metal
-│   └── custom/                   # RMLX 전용 커널
+│   └── custom/                   # RMLX-specific kernels
 │       ├── fused_attention.metal
 │       └── fused_moe_gate.metal
 │
-├── tests/                        # 통합 테스트
+├── tests/                        # Integration tests
 │   ├── metal_basic.rs
 │   ├── zero_copy.rs
 │   ├── rdma_exchange.rs
 │   ├── moe_dispatch.rs
 │   └── e2e_inference.rs
 │
-├── benches/                      # 벤치마크
+├── benches/                      # Benchmarks
 │   ├── matmul.rs
 │   ├── rdma_latency.rs
 │   ├── moe_step.rs
@@ -168,89 +168,89 @@ rmlx/
 
 ---
 
-## 크레이트별 상세 정보
+## Crate Details
 
-### rmlx-metal — Metal GPU 추상화
+### rmlx-metal — Metal GPU Abstraction
 
-| 항목 | 내용 |
-|------|------|
-| **목적** | Apple Metal API를 Rust로 안전하게 추상화합니다. `metal-rs` 0.31을 기반으로 MTLDevice, MTLCommandQueue, MTLBuffer, MTLSharedEvent 등을 래핑합니다. |
-| **핵심 모듈** | `device.rs` (디바이스 + 아키텍처 감지), `queue.rs` (듀얼 큐 관리), `command.rs` (CommandBuffer/Encoder), `event.rs` (MTLSharedEvent 래퍼), `pipeline.rs` (PSO 캐시), `self_check.rs` (시동 진단) |
-| **의존성** | metal-rs 0.31, objc2, block2 |
-| **현재 상태** | 완료 — GpuDevice, StreamManager, DeviceStream, GpuEvent, SharedEvent 동기화, 듀얼 큐 파이프라인, 시동 진단 전체 구현 |
-
----
-
-### rmlx-alloc — 메모리 할당자
-
-| 항목 | 내용 |
-|------|------|
-| **목적** | Zero-copy 메모리 할당 및 버퍼 풀 관리를 담당합니다. `posix_memalign` → `newBufferWithBytesNoCopy` 패턴으로 복사 없는 Metal 버퍼를 생성하고, RDMA `ibv_mr` 이중 등록을 지원합니다. |
-| **핵심 모듈** | `zero_copy.rs` (ZeroCopyBuffer, CompletionFence), `pool.rs` (이중 등록 버퍼 풀), `cache.rs` (size-binned 캐시), `stats.rs` (할당 통계), `leak_detector.rs` (메모리 누수 감지) |
-| **의존성** | `rmlx-metal`, libc |
-| **현재 상태** | 완료 — ZeroCopyBuffer, DualRegPool, MetalAllocator, size-binned 캐시, 누수 감지 전체 구현 |
+| Item | Details |
+|------|---------|
+| **Purpose** | Provides a safe Rust abstraction over the Apple Metal API. Wraps MTLDevice, MTLCommandQueue, MTLBuffer, MTLSharedEvent, and more, built on `metal-rs` 0.31. |
+| **Key modules** | `device.rs` (device + architecture detection), `queue.rs` (dual queue management), `command.rs` (CommandBuffer/Encoder), `event.rs` (MTLSharedEvent wrapper), `pipeline.rs` (PSO cache), `self_check.rs` (startup diagnostics) |
+| **Dependencies** | metal-rs 0.31, objc2, block2 |
+| **Status** | Complete — GpuDevice, StreamManager, DeviceStream, GpuEvent, SharedEvent sync, dual queue pipeline, startup diagnostics fully implemented |
 
 ---
 
-### rmlx-rdma — RDMA 통신
+### rmlx-alloc — Memory Allocator
 
-| 항목 | 내용 |
-|------|------|
-| **목적** | Thunderbolt 5 RDMA를 통한 노드 간 고성능 통신을 제공합니다. ibverbs C 라이브러리를 FFI로 바인딩하며, UC QP 기반 send/recv와 collective 연산을 지원합니다. |
-| **핵심 모듈** | `ffi.rs` (ibverbs 바인딩), `context.rs` (ibv_context/PD/CQ), `qp.rs` (UC QP), `mr.rs` (메모리 영역 등록), `collective.rs` (all-to-all, allreduce), `multi_port.rs` (포트 스트라이핑), `rdma_metrics.rs` (RDMA 메트릭) |
-| **의존성** | `rmlx-alloc`, libc (ibverbs FFI) |
-| **현재 상태** | 완료 — ibverbs FFI, UC QP, blocking_exchange, ConnectionManager, 듀얼 포트 스트라이핑, RDMA 메트릭 전체 구현 |
-
----
-
-### rmlx-core — 연산 엔진
-
-| 항목 | 내용 |
-|------|------|
-| **목적** | 연산 그래프, Op 레지스트리, 커널 디스패치를 통합 관리하는 핵심 엔진입니다. N-dim array 타입과 dtype 시스템을 정의하며, eager-first 실행과 선택적 tracing 컴파일을 지원합니다. |
-| **핵심 모듈** | `dtype.rs` (f32, f16, bf16, quantized), `array.rs` (N-dim array), `ops/` (matmul, softmax 등 7종 커널), `kernels/` (AOT/JIT 커널 관리), `graph.rs` (연산 그래프), `scheduler.rs` (스트림별 스케줄러), `vjp.rs` (VJP autodiff), `lora.rs` (LoRA fine-tuning), `logging.rs` (structured logging), `metrics.rs` (메트릭 수집), `precision_guard.rs` (정밀도 가드), `shutdown.rs` (graceful shutdown) |
-| **의존성** | `rmlx-metal`, `rmlx-alloc` |
-| **현재 상태** | 완료 — Array 타입, 7종 Metal 커널 디스패치, VJP autodiff, LoRA, 프로덕션 하드닝 전체 구현 |
+| Item | Details |
+|------|---------|
+| **Purpose** | Handles zero-copy memory allocation and buffer pool management. Creates copy-free Metal buffers using the `posix_memalign` -> `newBufferWithBytesNoCopy` pattern, with support for RDMA `ibv_mr` dual registration. |
+| **Key modules** | `zero_copy.rs` (ZeroCopyBuffer, CompletionFence), `pool.rs` (dual-registered buffer pool), `cache.rs` (size-binned cache), `stats.rs` (allocation statistics), `leak_detector.rs` (memory leak detection) |
+| **Dependencies** | `rmlx-metal`, libc |
+| **Status** | Complete — ZeroCopyBuffer, DualRegPool, MetalAllocator, size-binned cache, leak detection fully implemented |
 
 ---
 
-### rmlx-distributed — 분산 프리미티브
+### rmlx-rdma — RDMA Communication
 
-| 항목 | 내용 |
-|------|------|
-| **목적** | 분산 추론에 필요한 통신 프리미티브와 MoE Expert Parallelism을 구현합니다. layer-level 파이프라인을 통해 compute와 RDMA를 오버랩합니다. |
-| **핵심 모듈** | `group.rs` (rank/world_size 추상화), `primitives.rs` (AllReduce, AllGather 등), `moe/` (3-zone auto backend, MoE dispatch/combine), `moe_exchange.rs`, `moe_policy.rs`, `pipeline.rs` (compute-RDMA 오버랩), `sparse_guard.rs` (희소 디스패치 가드), `warmup.rs` (분산 워밍업), `metrics.rs` (분산 메트릭) |
-| **의존성** | `rmlx-core`, `rmlx-rdma` |
-| **현재 상태** | 완료 — EP dispatch/combine, 3-zone auto backend, compute-RDMA 파이프라인, MoE 교환, 분산 메트릭 전체 구현 |
-
----
-
-### rmlx-nn — 신경망 레이어
-
-| 항목 | 내용 |
-|------|------|
-| **목적** | Transformer 기반 LLM 아키텍처의 신경망 레이어를 제공합니다. Linear, Attention, MoE 등의 고수준 모듈과 LLaMA, Qwen, DeepSeek-V3 등 모델 아키텍처를 포함합니다. |
-| **핵심 모듈** | `linear.rs` (quantized Linear), `attention.rs` (Multi-head/GQA), `transformer.rs` (Transformer block), `moe.rs` (gate + routing), `models/` (llama.rs, qwen.rs, deepseek.rs, mixtral.rs) |
-| **의존성** | `rmlx-core` |
-| **현재 상태** | 완료 — Transformer 블록, Linear/Attention/MoE 레이어, LLaMA/Qwen/DeepSeek-V3/Mixtral 모델 아키텍처 전체 구현 |
+| Item | Details |
+|------|---------|
+| **Purpose** | Provides high-performance inter-node communication via Thunderbolt 5 RDMA. Binds the ibverbs C library via FFI and supports UC QP-based send/recv and collective operations. |
+| **Key modules** | `ffi.rs` (ibverbs bindings), `context.rs` (ibv_context/PD/CQ), `qp.rs` (UC QP), `mr.rs` (memory region registration), `collective.rs` (all-to-all, allreduce), `multi_port.rs` (port striping), `rdma_metrics.rs` (RDMA metrics) |
+| **Dependencies** | `rmlx-alloc`, libc (ibverbs FFI) |
+| **Status** | Complete — ibverbs FFI, UC QP, blocking_exchange, ConnectionManager, dual port striping, RDMA metrics fully implemented |
 
 ---
 
-### rmlx-python — PyO3 Python 바인딩
+### rmlx-core — Compute Engine
 
-| 항목 | 내용 |
-|------|------|
-| **목적** | PyO3 0.28 기반 Python 바인딩으로, `import rmlx` 형태로 Python에서 RMLX 프레임워크를 사용할 수 있도록 합니다. declarative `#[pymodule]` 방식으로 모듈을 정의하며, maturin을 통해 `pip install rmlx`로 배포합니다. |
-| **핵심 모듈** | `lib.rs` (declarative #[pymodule] 정의), `dtype.rs` (PyDType — Python dtype 래퍼), `array.rs` (PyArray — Python N-dim array 래퍼) |
-| **의존성** | `rmlx-core`, `rmlx-nn`, `rmlx-distributed`, PyO3 0.28 |
-| **현재 상태** | 완료 — PyDType, PyArray, declarative 모듈 바인딩 전체 구현 |
+| Item | Details |
+|------|---------|
+| **Purpose** | The core engine that integrates the computation graph, Op registry, and kernel dispatch. Defines the N-dim array type and dtype system, and supports eager-first execution with selective tracing compilation. |
+| **Key modules** | `dtype.rs` (f32, f16, bf16, quantized), `array.rs` (N-dim array), `ops/` (7 kernel types: matmul, softmax, etc.), `kernels/` (AOT/JIT kernel management), `graph.rs` (computation graph), `scheduler.rs` (per-stream scheduler), `vjp.rs` (VJP autodiff), `lora.rs` (LoRA fine-tuning), `logging.rs` (structured logging), `metrics.rs` (metrics collection), `precision_guard.rs` (precision guard), `shutdown.rs` (graceful shutdown) |
+| **Dependencies** | `rmlx-metal`, `rmlx-alloc` |
+| **Status** | Complete — Array type, 7 Metal kernel dispatches, VJP autodiff, LoRA, production hardening fully implemented |
 
 ---
 
-## 워크스페이스 설정
+### rmlx-distributed — Distributed Primitives
+
+| Item | Details |
+|------|---------|
+| **Purpose** | Implements communication primitives and MoE Expert Parallelism for distributed inference. Overlaps compute and RDMA through a layer-level pipeline. |
+| **Key modules** | `group.rs` (rank/world_size abstraction), `primitives.rs` (AllReduce, AllGather, etc.), `moe/` (3-zone auto backend, MoE dispatch/combine), `moe_exchange.rs`, `moe_policy.rs`, `pipeline.rs` (compute-RDMA overlap), `sparse_guard.rs` (sparse dispatch guard), `warmup.rs` (distributed warmup), `metrics.rs` (distributed metrics) |
+| **Dependencies** | `rmlx-core`, `rmlx-rdma` |
+| **Status** | Complete — EP dispatch/combine, 3-zone auto backend, compute-RDMA pipeline, MoE exchange, distributed metrics fully implemented |
+
+---
+
+### rmlx-nn — Neural Network Layers
+
+| Item | Details |
+|------|---------|
+| **Purpose** | Provides neural network layers for Transformer-based LLM architectures. Includes high-level modules such as Linear, Attention, and MoE, as well as model architectures for LLaMA, Qwen, DeepSeek-V3, and others. |
+| **Key modules** | `linear.rs` (quantized Linear), `attention.rs` (Multi-head/GQA), `transformer.rs` (Transformer block), `moe.rs` (gate + routing), `models/` (llama.rs, qwen.rs, deepseek.rs, mixtral.rs) |
+| **Dependencies** | `rmlx-core` |
+| **Status** | Complete — Transformer block, Linear/Attention/MoE layers, LLaMA/Qwen/DeepSeek-V3/Mixtral model architectures fully implemented |
+
+---
+
+### rmlx-python — PyO3 Python Bindings
+
+| Item | Details |
+|------|---------|
+| **Purpose** | PyO3 0.28-based Python bindings that allow using the RMLX framework from Python via `import rmlx`. Defines modules using the declarative `#[pymodule]` approach and distributes via `pip install rmlx` through maturin. |
+| **Key modules** | `lib.rs` (declarative #[pymodule] definition), `dtype.rs` (PyDType — Python dtype wrapper), `array.rs` (PyArray — Python N-dim array wrapper) |
+| **Dependencies** | `rmlx-core`, `rmlx-nn`, `rmlx-distributed`, PyO3 0.28 |
+| **Status** | Complete — PyDType, PyArray, declarative module bindings fully implemented |
+
+---
+
+## Workspace Configuration
 
 ```toml
-# Cargo.toml (workspace 루트)
+# Cargo.toml (workspace root)
 
 [workspace]
 resolver = "2"
@@ -277,28 +277,28 @@ block = "0.1"
 libc = "0.2"
 ```
 
-`workspace.dependencies`를 활용하여 크레이트 간 의존성 버전을 통일합니다. 각 크레이트의 `Cargo.toml`에서 `metal.workspace = true` 형태로 참조할 수 있습니다.
+`workspace.dependencies` is used to unify dependency versions across crates. Each crate's `Cargo.toml` can reference them using `metal.workspace = true`.
 
 ---
 
-## 부가 디렉토리
+## Supplementary Directories
 
 ### shaders/
 
-Metal 셰이더 소스 파일을 저장합니다. 3개 하위 디렉토리로 분류됩니다.
+Stores Metal shader source files, organized into 3 subdirectories:
 
-- **mlx_compat/**: MLX에서 가져온 호환 커널 (gemv, gemm, quantized, softmax 등)
-- **moe/**: Expert Parallelism 전용 커널 (dispatch, combine, packet 관련 6종)
-- **custom/**: RMLX 전용 최적화 커널 (fused_attention, fused_moe_gate)
+- **mlx_compat/**: Compatibility kernels ported from MLX (gemv, gemm, quantized, softmax, etc.)
+- **moe/**: Expert Parallelism-specific kernels (6 kernels for dispatch, combine, and packet operations)
+- **custom/**: RMLX-specific optimized kernels (fused_attention, fused_moe_gate)
 
 ### tests/
 
-통합 테스트입니다. 단위 테스트는 각 크레이트 내부에 위치합니다.
+Integration tests. Unit tests reside within each individual crate.
 
 ### benches/
 
-Criterion 기반 벤치마크입니다. matmul, RDMA latency, MoE step, e2e throughput을 측정합니다.
+Criterion-based benchmarks measuring matmul, RDMA latency, MoE step, and e2e throughput.
 
 ### examples/
 
-사용 예제입니다. 기본 compute, zero-copy 데모, 2-node EP 예제를 포함합니다.
+Usage examples including basic compute, zero-copy demo, and 2-node EP.
