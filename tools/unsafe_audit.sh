@@ -54,20 +54,20 @@ else
 fi
 
 # Check 3: no mem::forget in non-test code (excluding comments)
-forget_count=$(grep -r "mem::forget" --include='*.rs' crates/ \
-    | grep -v '_ko\.' \
+# grep output format is "file:line:content", so filter comments after the last colon
+forget_count=$(grep -rn "mem::forget" --include='*.rs' crates/ \
     | grep -v '/tests/' \
     | grep -v '#\[cfg(test)\]' \
-    | grep -v '^\s*//' \
-    | grep -v '^\s*///' \
-    | grep -v 'doc\b' \
+    | awk -F: '{ content = $0; sub(/^[^:]+:[^:]+:/, "", content); if (content !~ /^\s*\/\//) print }' \
     | grep -c 'mem::forget' || true)
 if [ "$forget_count" -eq 0 ]; then
     echo "PASS: No mem::forget in non-test code"
     PASS=$((PASS + 1))
 else
     echo "FAIL: Found $forget_count mem::forget in non-test code"
-    grep -rn "mem::forget" --include='*.rs' crates/ | grep -v '/tests/' | grep -v '^\s*//'
+    grep -rn "mem::forget" --include='*.rs' crates/ \
+        | grep -v '/tests/' \
+        | awk -F: '{ content = $0; sub(/^[^:]+:[^:]+:/, "", content); if (content !~ /^\s*\/\//) print }'
     FAIL=$((FAIL + 1))
 fi
 
