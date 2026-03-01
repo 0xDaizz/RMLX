@@ -445,6 +445,7 @@ impl LayerPipeline {
     }
 
     /// Reset all stages to WaitingForInput and clear tickets and transfer states.
+    /// Also resets event counters so stale signaled values don't pollute the next run.
     pub fn reset(&mut self) {
         for stage in &mut self.stages {
             *stage = PipelineStage::WaitingForInput;
@@ -454,6 +455,13 @@ impl LayerPipeline {
         }
         for state in &mut self.transfer_states {
             *state = None;
+        }
+        // Reset event counters for clean reuse
+        if let Some(ref event) = self.compute_event {
+            event.reset();
+        }
+        if let Some(ref event) = self.transfer_event {
+            event.reset();
         }
     }
 

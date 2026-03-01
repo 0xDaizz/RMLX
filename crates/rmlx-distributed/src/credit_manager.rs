@@ -8,18 +8,17 @@
 use std::collections::HashMap;
 
 use rmlx_rdma::exchange_tag::ExchangeTag;
-use rmlx_rdma::progress::PendingOp;
 
 use crate::group::DistributedError;
-use crate::transport::RdmaConnectionTransport;
+use crate::transport::{RdmaConnectionTransport, RecvCredit};
 
 /// Key for credit table: (peer_rank, tag).
 type CreditKey = (u32, ExchangeTag);
 
 /// A single pre-posted recv credit slot.
 struct CreditSlot {
-    /// The PendingOp handle tracking this recv's CQ completion.
-    pending: PendingOp,
+    /// The full RecvCredit — keeps buffer and MR alive until slot is consumed.
+    credit: RecvCredit,
     /// Whether this slot has been consumed (completion arrived).
     consumed: bool,
 }
@@ -84,7 +83,7 @@ impl CreditManager {
 
         for credit in new_credits {
             slots.push(CreditSlot {
-                pending: credit.pending,
+                credit,
                 consumed: false,
             });
         }
@@ -100,7 +99,7 @@ impl CreditManager {
         let key = (peer, tag);
         if let Some(slots) = self.credits.get_mut(&key) {
             for slot in slots.iter_mut() {
-                if !slot.consumed && !slot.pending.is_pending() {
+                if !slot.consumed && !slot.credit.pending.is_pending() {
                     slot.consumed = true;
                     return;
                 }

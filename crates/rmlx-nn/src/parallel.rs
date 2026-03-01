@@ -267,13 +267,28 @@ impl ColumnParallelLinear {
             add_bias_f32(&mut local_bytes, bias_data, batch, shard_out);
         }
 
-        // Allgather across ranks → [batch, out_features]
+        // Allgather across ranks → rank-major: [rank0_all_rows][rank1_all_rows]...
+        // We need batch-major: [row0_rank0_shard ++ row0_rank1_shard ++ ...][row1_...]
         let gathered = group.allgather(&local_bytes)?;
 
-        // Reconstruct Array from gathered bytes
+        let world = self.world_size as usize;
+        let shard_bytes = shard_out * 4; // bytes per rank per row
+        let row_bytes = self.out_features * 4; // bytes per output row
+
+        let mut interleaved = vec![0u8; batch * row_bytes];
+        for r in 0..batch {
+            for rank in 0..world {
+                let src_offset = rank * batch * shard_bytes + r * shard_bytes;
+                let dst_offset = r * row_bytes + rank * shard_bytes;
+                interleaved[dst_offset..dst_offset + shard_bytes]
+                    .copy_from_slice(&gathered[src_offset..src_offset + shard_bytes]);
+            }
+        }
+
+        // Reconstruct Array from interleaved bytes
         let result = array_from_raw_bytes(
             input.metal_buffer().device(),
-            &gathered,
+            &interleaved,
             vec![batch, self.out_features],
         );
         Ok(result)
@@ -374,8 +389,8 @@ impl RowParallelLinear {
         );
         let n = self.out_features;
 
-        // Read input and weight (weight may be non-contiguous from slice_columns)
-        let a: Vec<f32> = input.to_vec_checked();
+        // Read input (may be non-contiguous from slice_columns) and weight
+        let a: Vec<f32> = read_f32_strided(input);
         let b = read_f32_strided(&self.weight);
 
         // Local matmul: [batch, shard_in] @ [out, shard_in]^T → [batch, out]
@@ -795,5 +810,41 @@ mod tests {
             .map(|(a, b)| a + b)
             .collect();
         assert_eq!(summed, expected);
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn test_column_parallel_forward_multibatch_single_rank() {
+        use rmlx_distributed::group::Group;
+
+        let Some(device) = test_device() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+
+        // weight: [2, 3] = [[1,0,0],[0,1,0]]  (out=2, in=3)
+        let weight_data: Vec<f32> = vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+        let weight = Array::from_slice(&device, &weight_data, vec![2, 3]);
+
+        // Single rank, but batch=3 to exercise the interleaving path
+        let layer = ColumnParallelLinear::new(weight, None, 2, 3, 0, 1);
+
+        // input: [3, 3] — three batch rows
+        let input_data: Vec<f32> = vec![
+            1.0, 2.0, 3.0, // row 0
+            4.0, 5.0, 6.0, // row 1
+            7.0, 8.0, 9.0, // row 2
+        ];
+        let input = Array::from_slice(&device, &input_data, vec![3, 3]);
+
+        let group = Group::world(1, 0).unwrap();
+        let result = layer.forward_with_group(&input, &group).unwrap();
+
+        assert_eq!(result.shape(), &[3, 2]);
+        let vals: Vec<f32> = result.to_vec_checked();
+        // Row 0: [1,2,3] @ [1,0,0]^T=1, [1,2,3] @ [0,1,0]^T=2
+        // Row 1: [4,5,6] @ [1,0,0]^T=4, [4,5,6] @ [0,1,0]^T=5
+        // Row 2: [7,8,9] @ [1,0,0]^T=7, [7,8,9] @ [0,1,0]^T=8
+        assert_eq!(vals, vec![1.0, 2.0, 4.0, 5.0, 7.0, 8.0]);
     }
 }

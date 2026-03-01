@@ -262,6 +262,12 @@ impl ProgressEngine {
         self.healthy.load(Ordering::Acquire)
     }
 
+    /// Cancel a pending operation, removing it from the tracking map.
+    /// Use this when an operation was registered but the WR was never actually posted.
+    pub fn cancel_op(&self, wr_id: u64) {
+        lock_or_recover(&self.pending, &self.healthy).remove(&wr_id);
+    }
+
     /// Register a wr_id for completion tracking.
     ///
     /// Returns a `PendingOp` handle that will be resolved when the CQ

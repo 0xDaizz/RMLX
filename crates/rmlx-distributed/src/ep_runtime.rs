@@ -84,7 +84,7 @@ impl EpRuntimeContext {
 
         let handler = Box::new(
             move |desc: &rmlx_rdma::gpu_doorbell::RdmaDescriptor, wr_id: u64| -> bool {
-                // Register the op with the progress engine for CQ completion tracking.
+                // Register the op first (before dispatch) to avoid CQ race.
                 let _pending = progress.register_op(wr_id);
 
                 let result = transport.dispatch_descriptor(desc, wr_id, &buffers);
@@ -96,6 +96,8 @@ impl EpRuntimeContext {
                     }
                     Err(e) => {
                         eprintln!("[ep-runtime] dispatch_descriptor error: {e}");
+                        // Cancel the registered op since WR was never posted
+                        progress.cancel_op(wr_id);
                         counters
                             .rdma_ops_error
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
