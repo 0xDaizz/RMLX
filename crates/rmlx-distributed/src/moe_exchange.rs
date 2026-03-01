@@ -206,10 +206,11 @@ impl MoeDispatchExchange {
         // Auto-set policy world_size from group so RDMA zone activates correctly
         policy.set_world_size(config.group.size() as u32);
         let runtime_cf = config.capacity_factor;
+        let num_experts = config.num_experts;
         Self {
             config,
             policy,
-            metrics: AtomicMoeMetrics::new(),
+            metrics: AtomicMoeMetrics::with_experts(num_experts),
             guard: SparseGuard::new(),
             metal_cache: Mutex::new(None),
             runtime_capacity_factor: runtime_cf,
@@ -325,6 +326,7 @@ impl MoeDispatchExchange {
 
         // Record metrics using atomic counters
         self.metrics.record_dispatch(batch_size as u64);
+        self.metrics.record_expert_counts(&expert_counts);
         match backend {
             MoeBackend::Cpu => self.metrics.record_cpu_dispatch(),
             MoeBackend::Metal => self.metrics.record_metal_dispatch(),
@@ -1227,6 +1229,7 @@ impl MoeDispatchExchange {
 
         // Record metrics
         self.metrics.record_dispatch(batch_size as u64);
+        self.metrics.record_expert_counts(&expert_counts);
         self.metrics.record_rdma_dispatch();
         if overflow > 0 {
             self.metrics.record_overflow();

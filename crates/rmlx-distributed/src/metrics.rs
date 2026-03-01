@@ -13,6 +13,10 @@ pub struct MoeMetrics {
     pub zone_switches: AtomicU64,
     pub total_tokens_routed: AtomicU64,
     pub dense_fallback_count: AtomicU64,
+    /// Per-expert token histogram.
+    pub expert_histogram: Vec<AtomicU64>,
+    /// Number of experts tracked (0 = no per-expert tracking).
+    pub num_experts: usize,
 }
 
 impl MoeMetrics {
@@ -27,7 +31,17 @@ impl MoeMetrics {
             zone_switches: AtomicU64::new(0),
             total_tokens_routed: AtomicU64::new(0),
             dense_fallback_count: AtomicU64::new(0),
+            expert_histogram: Vec::new(),
+            num_experts: 0,
         }
+    }
+
+    /// Create metrics with per-expert histogram tracking.
+    pub fn with_experts(num_experts: usize) -> Self {
+        let mut m = Self::new();
+        m.expert_histogram = (0..num_experts).map(|_| AtomicU64::new(0)).collect();
+        m.num_experts = num_experts;
+        m
     }
 
     pub fn record_dispatch(&self, tokens: u64) {
@@ -64,6 +78,15 @@ impl MoeMetrics {
         self.dense_fallback_count.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record per-expert token counts from a dispatch.
+    pub fn record_expert_counts(&self, counts: &[usize]) {
+        for (i, &count) in counts.iter().enumerate() {
+            if i < self.num_experts {
+                self.expert_histogram[i].fetch_add(count as u64, Ordering::Relaxed);
+            }
+        }
+    }
+
     pub fn snapshot(&self) -> MoeMetricsSnapshot {
         MoeMetricsSnapshot {
             dispatch_count: self.dispatch_count.load(Ordering::Relaxed),
@@ -75,6 +98,11 @@ impl MoeMetrics {
             zone_switches: self.zone_switches.load(Ordering::Relaxed),
             total_tokens_routed: self.total_tokens_routed.load(Ordering::Relaxed),
             dense_fallback_count: self.dense_fallback_count.load(Ordering::Relaxed),
+            expert_histogram: self
+                .expert_histogram
+                .iter()
+                .map(|a| a.load(Ordering::Relaxed))
+                .collect(),
         }
     }
 }
@@ -97,4 +125,6 @@ pub struct MoeMetricsSnapshot {
     pub zone_switches: u64,
     pub total_tokens_routed: u64,
     pub dense_fallback_count: u64,
+    /// Per-expert token histogram.
+    pub expert_histogram: Vec<u64>,
 }

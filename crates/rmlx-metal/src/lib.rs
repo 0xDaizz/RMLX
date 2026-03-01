@@ -15,6 +15,11 @@ pub mod stream;
 // Re-export metal crate for downstream users
 pub use metal;
 
+// Re-export core types for convenience
+pub use device::{Architecture, GpuDevice};
+pub use event::GpuEvent;
+pub use stream::StreamManager;
+
 /// Errors from Metal operations
 #[derive(Debug)]
 pub enum MetalError {

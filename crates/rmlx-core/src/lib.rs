@@ -10,6 +10,7 @@ pub mod lora;
 pub mod metrics;
 pub mod ops;
 pub mod precision_guard;
+pub mod prelude;
 pub mod shutdown;
 pub mod vjp;
 
