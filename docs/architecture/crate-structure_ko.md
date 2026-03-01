@@ -1,6 +1,6 @@
 # 크레이트 구조
 
-RMLX는 Cargo workspace로 구성된 7개의 크레이트와 부가 디렉토리로 이루어져 있습니다.
+RMLX는 Cargo workspace로 구성된 6개의 크레이트와 부가 디렉토리로 이루어져 있습니다.
 
 ---
 
@@ -117,13 +117,6 @@ rmlx/
 │               ├── deepseek.rs   # DeepSeek-V3 (MoE)
 │               └── mixtral.rs    # Mixtral (MoE)
 │
-│   └── rmlx-python/              # PyO3 Python 바인딩
-│       ├── Cargo.toml            # deps: rmlx-core, rmlx-nn, rmlx-distributed, pyo3 0.28
-│       └── src/
-│           ├── lib.rs            # declarative #[pymodule]
-│           ├── dtype.rs          # PyDType (Python dtype 래퍼)
-│           └── array.rs          # PyArray (Python N-dim array 래퍼)
-│
 ├── shaders/                      # Metal 셰이더 소스
 │   ├── mlx_compat/               # MLX에서 가져온 .metal 파일
 │   │   ├── gemv.metal
@@ -236,17 +229,6 @@ rmlx/
 
 ---
 
-### rmlx-python — PyO3 Python 바인딩
-
-| 항목 | 내용 |
-|------|------|
-| **목적** | PyO3 0.28 기반 Python 바인딩으로, `import rmlx` 형태로 Python에서 RMLX 프레임워크를 사용할 수 있도록 합니다. declarative `#[pymodule]` 방식으로 모듈을 정의하며, maturin을 통해 `pip install rmlx`로 배포합니다. |
-| **핵심 모듈** | `lib.rs` (declarative #[pymodule] 정의), `dtype.rs` (PyDType — Python dtype 래퍼), `array.rs` (PyArray — Python N-dim array 래퍼) |
-| **의존성** | `rmlx-core`, `rmlx-nn`, `rmlx-distributed`, PyO3 0.28 |
-| **현재 상태** | 완료 — PyDType, PyArray, declarative 모듈 바인딩 전체 구현 |
-
----
-
 ## 워크스페이스 설정
 
 ```toml
@@ -261,7 +243,6 @@ members = [
     "crates/rmlx-core",
     "crates/rmlx-distributed",
     "crates/rmlx-nn",
-    "crates/rmlx-python",
 ]
 
 [workspace.package]

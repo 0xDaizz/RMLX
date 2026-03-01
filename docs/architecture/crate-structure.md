@@ -1,6 +1,6 @@
 # Crate Structure
 
-RMLX consists of 7 crates organized as a Cargo workspace, along with supplementary directories.
+RMLX consists of 6 crates organized as a Cargo workspace, along with supplementary directories.
 
 ---
 
@@ -117,13 +117,6 @@ rmlx/
 │               ├── deepseek.rs   # DeepSeek-V3 (MoE)
 │               └── mixtral.rs    # Mixtral (MoE)
 │
-│   └── rmlx-python/              # PyO3 Python bindings
-│       ├── Cargo.toml            # deps: rmlx-core, rmlx-nn, rmlx-distributed, pyo3 0.28
-│       └── src/
-│           ├── lib.rs            # declarative #[pymodule]
-│           ├── dtype.rs          # PyDType (Python dtype wrapper)
-│           └── array.rs          # PyArray (Python N-dim array wrapper)
-│
 ├── shaders/                      # Metal shader sources
 │   ├── mlx_compat/               # .metal files ported from MLX
 │   │   ├── gemv.metal
@@ -236,17 +229,6 @@ rmlx/
 
 ---
 
-### rmlx-python — PyO3 Python Bindings
-
-| Item | Details |
-|------|---------|
-| **Purpose** | PyO3 0.28-based Python bindings that allow using the RMLX framework from Python via `import rmlx`. Defines modules using the declarative `#[pymodule]` approach and distributes via `pip install rmlx` through maturin. |
-| **Key modules** | `lib.rs` (declarative #[pymodule] definition), `dtype.rs` (PyDType — Python dtype wrapper), `array.rs` (PyArray — Python N-dim array wrapper) |
-| **Dependencies** | `rmlx-core`, `rmlx-nn`, `rmlx-distributed`, PyO3 0.28 |
-| **Status** | Complete — PyDType, PyArray, declarative module bindings fully implemented |
-
----
-
 ## Workspace Configuration
 
 ```toml
@@ -261,7 +243,6 @@ members = [
     "crates/rmlx-core",
     "crates/rmlx-distributed",
     "crates/rmlx-nn",
-    "crates/rmlx-python",
 ]
 
 [workspace.package]

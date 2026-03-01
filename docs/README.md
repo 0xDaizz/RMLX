@@ -66,8 +66,7 @@ The ultimate goal is to connect two Mac Studio M3 Ultras via Thunderbolt 5 RDMA 
 | GPU | metal-rs 0.31 (Apple Metal API) |
 | RDMA | ibverbs FFI (Thunderbolt 5 UC QP) |
 | Hardware | Apple Silicon UMA (M3 Ultra, 80-core GPU, 512GB) |
-| Build | Cargo workspace (7 crates) |
-| Python bindings | PyO3 0.28 + maturin (rmlx-python) |
+| Build | Cargo workspace (6 crates) |
 
 ---
 
@@ -91,8 +90,7 @@ rmlx/
 │   ├── rmlx-rdma/           # RDMA communication (ibverbs)
 │   ├── rmlx-core/           # Compute engine (Op registry, VJP autodiff, LoRA)
 │   ├── rmlx-distributed/    # Distributed primitives (EP, AllReduce, MoE)
-│   ├── rmlx-nn/             # Neural network layers (Transformer, MoE)
-│   └── rmlx-python/         # PyO3 Python bindings
+│   └── rmlx-nn/             # Neural network layers (Transformer, MoE)
 ├── shaders/                 # Metal shader sources
 ├── tests/                   # Integration tests
 ├── benches/                 # Benchmarks

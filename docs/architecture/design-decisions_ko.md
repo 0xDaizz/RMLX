@@ -17,7 +17,7 @@ MLX는 C++로 작성되어 있지만, RMLX는 Rust를 선택했습니다.
 | **빌드 시스템** | CMake + Python setuptools + nanobind | Cargo workspace 단일 빌드 체인 |
 | **에러 처리** | C++ exception, Metal 에러 런타임 확인 | `Result<T, E>` 타입으로 명시적 에러 전파 |
 | **추상화 비용** | virtual dispatch 오버헤드 | trait object 또는 monomorphization 선택 가능 (zero-cost) |
-| **Python 바인딩** | nanobind (C++ → Python) | PyO3 (Rust → Python, maturin 빌드) |
+| **Python 바인딩** | nanobind (C++ → Python) | 불필요 (Rust 네이티브 프레임워크) |
 
 ### 핵심 판단
 

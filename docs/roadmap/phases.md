@@ -21,7 +21,6 @@ The 7-phase implementation roadmap for the rmlx project. All phases have been co
 | 6 | Multi-Port | Dual TB5 multi-port striping, multi-node topology | Phase 4 | Complete |
 | 7A | Production Hardening | Hardening, observability | Phase 5 | Complete |
 | 7B | VJP Autodiff | VJP autodiff + LoRA fine-tuning | Phase 7A | Complete |
-| 7C | PyO3 Bindings | Python bindings | Phase 7B | Complete |
 
 ---
 
@@ -42,7 +41,6 @@ The 7-phase implementation roadmap for the rmlx project. All phases have been co
 | Phase 6: Dual TB5 multi-port striping + multi-node topology | 8c8b25f | + distributed tests | Complete |
 | Phase 7A: Production hardening / observability | 0fa70bb | 98 tests | Complete |
 | Phase 7B: VJP autodiff + LoRA fine-tuning | 025ed8f | 108 tests | Complete |
-| Phase 7C: PyO3 Python bindings | f866056 | 123 tests | Complete |
 
 ---
 
@@ -358,23 +356,6 @@ Build a VJP framework and LoRA fine-tuning foundation for training support.
 
 - [x] VJP gradient accuracy for basic operations (matmul, softmax)
 - [x] LoRA fine-tuning functional verification
-
----
-
-## Phase 7C: PyO3 Python Bindings — Complete (`f866056`)
-
-### Goal
-
-Establish Python ecosystem compatibility through PyO3 bindings.
-
-### Key Deliverables
-
-- PyO3 Python bindings (`pip install rmlx`)
-
-### Definition of Done (DoD)
-
-- [x] PyO3 bindings: basic Array operations work after `import rmlx`
-- [x] maturin build: one-click `pip install rmlx` installation succeeds
 
 ---
 

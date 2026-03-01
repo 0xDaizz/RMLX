@@ -143,17 +143,14 @@ fn test_check_and_act_warn_on_drift() {
     }
     // Now feed very peaky logits to cause drift > 0.30
     // The first drift window triggers Warn (not yet 2 consecutive)
-    let mut saw_warn = false;
     for _ in 0..10 {
         let action = guard.check_and_act(&[100.0f32, 0.0, 0.0, 0.0]);
         if action == GuardAction::Warn {
-            saw_warn = true;
             break;
         }
     }
-    // May or may not hit warn depending on exact entropy values
-    // The important thing is we don't crash and get a valid action
-    assert!(saw_warn || !saw_warn, "check_and_act returns valid actions");
+    // May or may not hit warn depending on exact entropy values.
+    // The important thing is we don't crash and get a valid action.
 }
 
 #[test]

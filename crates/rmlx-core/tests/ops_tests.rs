@@ -280,7 +280,7 @@ fn test_quantized_matmul_vec_size_mismatch() {
         0,
     );
     // Create vec with WRONG size (32 instead of 64)
-    let wrong_vec = Array::from_slice(dev, &vec![0.0f32; 32], vec![32]);
+    let wrong_vec = Array::from_slice(dev, &[0.0f32; 32], vec![32]);
     let result = ops::quantized::quantized_matmul(
         &registry,
         &weights,
@@ -796,8 +796,8 @@ fn test_matmul_m1_large_n_uses_gemv() {
             a_data[j]
         );
     }
-    for j in k..n {
-        assert!(vals[j].abs() < 1e-4, "C[0,{}]={}, expected 0.0", j, vals[j]);
+    for (j, val) in vals.iter().enumerate().take(n).skip(k) {
+        assert!(val.abs() < 1e-4, "C[0,{}]={}, expected 0.0", j, val);
     }
 }
 
@@ -834,7 +834,7 @@ fn test_matmul_n1_uses_gemv() {
 fn test_vjp_softmax_backward() {
     use rmlx_core::vjp::*;
     // 1 row, 4 cols
-    let input = vec![1.0f32, 2.0, 3.0, 4.0];
+    let input = [1.0f32, 2.0, 3.0, 4.0];
     // Compute softmax
     let max_val = input.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let exps: Vec<f32> = input.iter().map(|x| (x - max_val).exp()).collect();
