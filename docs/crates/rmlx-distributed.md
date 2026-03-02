@@ -72,8 +72,9 @@ pub struct MoeDispatchExchange {
 
 | Method | Description |
 |--------|-------------|
-| `new(config, policy)` | Creates a dispatch exchange |
-| `dispatch(batch_size, expert_indices, expert_weights)` | Dispatches tokens -> `DispatchResult` |
+| `new(config, policy)` | Creates a dispatch exchange (initializes `MoeMetrics::with_experts(num_experts)`) |
+| `dispatch(batch_size, expert_indices, expert_weights)` | Dispatches tokens -> `DispatchResult`; records per-expert counts to metrics |
+| `dispatch_async(...)` | Async variant of `dispatch`; records per-expert counts to metrics |
 | `metrics()` | Queries internal metrics |
 | `policy()` / `policy_mut()` | Gets/modifies the policy reference |
 
@@ -335,11 +336,14 @@ pub struct MoeMetrics {
     pub zone_switches: AtomicU64,
     pub total_tokens_routed: AtomicU64,
     pub dense_fallback_count: AtomicU64,
+    pub expert_histogram: Vec<AtomicU64>, // per-expert accumulated token count
+    pub num_experts: usize,
 }
 ```
 
 | Method | Description |
 |--------|-------------|
+| `with_experts(num_experts)` | Creates metrics with `expert_histogram` initialized to `num_experts` entries |
 | `record_dispatch(tokens)` | Records dispatch count + token count |
 | `record_combine()` | Records combine count |
 | `record_cpu_dispatch()` | Records a CPU dispatch |
@@ -348,6 +352,7 @@ pub struct MoeMetrics {
 | `record_overflow()` | Records an overflow event |
 | `record_zone_switch()` | Records a zone switch |
 | `record_dense_fallback()` | Records a dense fallback |
+| `record_expert_counts(counts)` | Accumulates per-expert token counts into `expert_histogram` |
 | `snapshot()` | Point-in-time snapshot -> `MoeMetricsSnapshot` |
 
 ### MoeMetricsSnapshot
@@ -364,6 +369,7 @@ pub struct MoeMetricsSnapshot {
     pub zone_switches: u64,
     pub total_tokens_routed: u64,
     pub dense_fallback_count: u64,
+    pub expert_histogram: Vec<u64>,
 }
 ```
 

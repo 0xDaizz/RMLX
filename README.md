@@ -4,7 +4,7 @@
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
 [![Rust 1.80+](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/tests-365%20passing-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-339%20passing-brightgreen.svg)]()
 [![macOS Apple Silicon](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-lightgrey.svg)]()
 
 > 한국어 문서: [docs/README_ko.md](docs/README_ko.md)
@@ -43,9 +43,10 @@ Near-parity with single-node 32ms/step
            ┌──────────────┐ ┌─────────────┐ ┌─────────────────┐
            │   rmlx-nn    │ │  rmlx-core  │ │ rmlx-distributed│
            │  Transformer │ │  Op registry│ │  EP / MoE /     │
-           │  LLaMA/Qwen/ │ │  Array/DType│ │  AllReduce      │
-           │  DeepSeek/   │ │  VJP/LoRA   │ │  3-zone policy  │
-           │  Mixtral     │ │  10 kernels │ │  pipeline       │
+           │  KV cache    │ │  Array/DType│ │  AllReduce      │
+           │  LLaMA/Qwen/ │ │  VJP/LoRA   │ │  3-zone policy  │
+           │  DeepSeek/   │ │  10 kernels │ │  pipeline       │
+           │  Mixtral     │ │             │ │                 │
            └──────┬───────┘ └──────┬──────┘ └───────┬─────────┘
                   │                │                 │
                   └────────┬───────┘                 │
@@ -94,7 +95,7 @@ cargo clippy --workspace -- -D warnings
 ## Project Structure
 
 ```
-rmlx/                           # 6 crates, 365 tests
+rmlx/                           # 6 crates, 339 tests
 ├── crates/
 │   ├── rmlx-metal/             # Metal GPU abstraction (metal-rs 0.31)
 │   ├── rmlx-alloc/             # Zero-copy memory allocator
@@ -115,10 +116,10 @@ This repository contains the **framework only**. The model serving layer (`rmlx-
 | Metric | Value |
 |--------|-------|
 | Crates | 6 |
-| Tests | 365 |
+| Tests | 339 |
 | Metal kernels | 10 (matmul, softmax, rms_norm, rope, gemv, quantized, binary, reduce, copy, indexing) |
 | Model architectures | 4 (LLaMA, Qwen, DeepSeek-V3, Mixtral) |
-| Implementation phases | 6 (all complete) |
+| Implementation phases | 8 (all complete) |
 
 ## Documentation
 

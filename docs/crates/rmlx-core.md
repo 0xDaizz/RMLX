@@ -13,6 +13,7 @@
 ```
 rmlx-core/src/
 ├── lib.rs              # Module declarations + METALLIB_PATH constant
+├── prelude.rs          # Convenience re-exports (Array, DType, KernelError, KernelRegistry)
 ├── dtype.rs            # DType enum
 ├── array.rs            # N-dimensional Metal buffer array
 ├── kernels/
@@ -529,6 +530,23 @@ pub struct ShutdownHandle {
 | `is_shutdown()` | Checks shutdown status (`Acquire` ordering) |
 
 **Usage pattern:** The main thread holds the `ShutdownSignal` and distributes `ShutdownHandle`s to worker threads.
+
+---
+
+## prelude.rs — Convenience Re-exports
+
+A prelude module that provides commonly used types for ergonomic imports.
+
+```rust
+pub use crate::array::Array;
+pub use crate::dtype::{DType, HasDType};
+pub use crate::kernels::{KernelError, KernelRegistry};
+```
+
+**Usage:**
+```rust
+use rmlx_core::prelude::*;
+```
 
 ---
 
