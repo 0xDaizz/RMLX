@@ -2,7 +2,7 @@
 
 > **Apple Silicon에 최적화된 Rust 기반 Metal GPU 추론 엔진**
 >
-> 상태: 전 Phase 완료 (123 tests, 0 failures) | 라이선스: MIT OR Apache-2.0 | Rust 1.80+ | macOS (Apple Silicon)
+> 상태: 전 Phase 완료 (339 tests, 0 failures) | 라이선스: MIT OR Apache-2.0 | Rust 1.80+ | macOS (Apple Silicon)
 
 ---
 

@@ -24,6 +24,19 @@ graph TD
     A --> K[lib.rs — MetalError]
 ```
 
+### `lib.rs` — Top-Level Re-exports
+
+For ergonomic access, common types are re-exported at the crate root:
+
+```rust
+pub use device::{Architecture, GpuDevice};
+pub use event::GpuEvent;
+```
+
+This allows `use rmlx_metal::GpuDevice;` instead of `use rmlx_metal::device::GpuDevice;`.
+
+---
+
 ### `device.rs` — `GpuDevice`
 
 Provides Metal device acquisition, architecture detection, and buffer/queue factory methods.
