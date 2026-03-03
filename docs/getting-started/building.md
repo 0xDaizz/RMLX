@@ -8,7 +8,7 @@ This guide covers cloning, building, and testing the rmlx project.
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/user/rmlx.git
+git clone https://github.com/0xDaizz/RMLX.git
 cd rmlx
 
 # 2. Build the entire workspace

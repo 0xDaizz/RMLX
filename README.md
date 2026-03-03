@@ -2,7 +2,7 @@
 
 **Rust ML runtime for Apple Silicon -- zero-copy GPU inference with 16.15x CPU-minimal speedup**
 
-[![CI](https://github.com/user/rmlx/actions/workflows/ci.yml/badge.svg)](https://github.com/user/rmlx/actions/workflows/ci.yml)
+[![CI](https://github.com/0xDaizz/RMLX/actions/workflows/ci.yml/badge.svg)](https://github.com/0xDaizz/RMLX/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
 [![Rust 1.80+](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org/)
 [![Tests](https://img.shields.io/badge/tests-339%2B%20passing-brightgreen.svg)]()
@@ -24,8 +24,6 @@ RMLX reimplements the core Metal GPU compute pipeline of Apple's [MLX](https://g
 | ExecGraph CB batching | yes | no | CUDA Graphs |
 | Single Rust binary | yes | no | no |
 | Flash Attention | planned | yes | yes |
-| Paged KV Cache | planned | no | yes (vLLM) |
-| Speculative Decoding | planned | no | yes |
 
 ## 🎯 Benchmark Results
 
@@ -87,7 +85,7 @@ graph TD
 
 ```bash
 # Clone
-git clone https://github.com/user/rmlx.git
+git clone https://github.com/0xDaizz/RMLX.git
 cd rmlx
 
 # Build the entire workspace
@@ -120,8 +118,6 @@ rmlx/                           # 6 crates, 339+ tests
 └── examples/                   # Usage examples
 ```
 
-This repository contains the **framework only**. The serving layer (`rmlx-serve`) is in a [separate repository](https://github.com/rmlx-serve).
-
 ## 📊 Stats
 
 | Metric | Value |
@@ -135,10 +131,7 @@ This repository contains the **framework only**. The serving layer (`rmlx-serve`
 ## ⚠️ Current Limitations
 
 - **No Flash Attention** -- fused SDPA exists but not full Flash Attention 2
-- **No paged attention** -- static KV cache only, no dynamic cache management
-- **No speculative decoding**
-- **No continuous batching**
-- **Single-node only** -- RDMA framework exists but is not integrated into the serving path
+- **Single-node only** -- RDMA framework exists but multi-node inference is not yet integrated
 - **No Python API** -- Rust-only interface
 - **TB5 bandwidth** -- limited to 16 GB/s vs NVLink 600 GB/s
 
