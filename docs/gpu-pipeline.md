@@ -133,7 +133,29 @@ Down:  11008x4096 = 172MB
 
 **난이도**: 높음 (메모리 관리, 이벤트 카운터 관리 복잡)
 
-### 5. Dual-Queue Compute/Transfer Overlap (미구현)
+### 5. Metal Function Constants for Kernel Parameter Injection (미구현)
+
+**문제**: MSL 커널의 tile 크기, 스레드 수 등 상수가 Rust dispatch 코드와 MSL 소스 문자열에 이중으로 하드코딩됨. 예: SDPA 커널의 `n_threads = 256`과 Rust의 `THREADS_PER_TG = 128` 불일치로 절반의 work가 스킵되는 버그 발생 (Phase 9B-fix에서 수동 동기화로 수정).
+
+**아이디어**: Metal function constants (`[[function_constant(N)]]`)를 사용하여 pipeline 생성 시점에 Rust에서 MSL로 파라미터 주입. Rust 코드가 single source of truth가 되어 불일치 가능성 원천 제거.
+
+```metal
+// MSL side
+constant uint TILE_SIZE [[function_constant(0)]];
+constant uint THREADS_PER_TG [[function_constant(1)]];
+```
+
+```rust
+// Rust side — MTLFunctionConstantValues
+let constants = FunctionConstantValues::new();
+constants.set_constant_value(TILE_SIZE as *const _, MTLDataType::UInt, 0);
+constants.set_constant_value(THREADS_PER_TG as *const _, MTLDataType::UInt, 1);
+let func = library.new_function_with_name_constant_values("sdpa_kernel", &constants)?;
+```
+
+**참고**: Apple의 MLX 프레임워크가 이 패턴을 광범위하게 사용. 컴파일러가 상수를 인라인하므로 성능 저하 없음.
+
+### 6. Dual-Queue Compute/Transfer Overlap (미구현)
 
 **아이디어**: KV cache append를 별도 transfer queue에서 실행. Compute queue의 SDPA와 병렬로 cache 쓰기 가능.
 

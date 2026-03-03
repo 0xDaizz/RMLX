@@ -416,6 +416,7 @@ GPU Pipeline Phase는 실행을 재구조화하여 여러 연산을 소수의 co
 | 9C | Fused 커널 | RMSNorm+RoPE, SiLU+Mul 퓨전으로 디스패치 수 감소 | 계획됨 |
 | 9D | Pipeline Overlap v2 | CB 수준에서 compute/transfer 오버랩 | 계획됨 |
 | 9E | Indirect Command Buffers (ICB) | `MTLIndirectCommandBuffer`로 정적 shape 리플레이 | 계획됨 |
+| 9F | Metal Function Constants | `[[function_constant(N)]]`으로 Rust에서 MSL로 타일 크기, 스레드 수 주입 | 계획됨 |
 
 ### 벤치마크 결과 (Apple M3 Ultra, 512GB)
 
@@ -466,6 +467,7 @@ max_diff=6.44e-6  mean_diff=9.64e-7  (f32 정밀도)
 - [x] Weight 사전 캐싱: `prepare_weight_t()` 구현 완료
 - [ ] `test_fused_rmsnorm_rope` -- 퓨전 결과 == 순차 결과 (ulp < 2) *(Phase 9C)*
 - [ ] `test_icb_replay_deterministic` -- 리플레이 ICB 동일 출력 *(Phase 9E)*
+- [ ] `test_function_constants_inject` -- Rust에서 주입한 상수가 MSL 커널 동작과 일치, 하드코딩 중복 없음 *(Phase 9F)*
 
 ---
 

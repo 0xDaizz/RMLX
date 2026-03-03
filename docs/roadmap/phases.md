@@ -428,6 +428,7 @@ After:  5 command buffers/token (92% reduction), 16.15x speedup (93.8% latency r
 | 9C | Fused Kernels | RMSNorm+RoPE, SiLU+Mul fusions to reduce dispatch count | Planned |
 | 9D | Pipeline Overlap v2 | Overlap compute/transfer at the command-buffer level (not just queue level) | Planned |
 | 9E | Indirect Command Buffers (ICB) | Static-shape replay via `MTLIndirectCommandBuffer` | Planned |
+| 9F | Metal Function Constants | Inject tile sizes, thread counts from Rust into MSL via `[[function_constant(N)]]` | Planned |
 
 ### Benchmark Results (Apple M3 Ultra, 512GB)
 
@@ -516,6 +517,19 @@ Combine back-to-back operations into single Metal kernel dispatches to eliminate
 
 Extends Phase 3's dual-queue overlap to operate at the command-buffer granularity within `ExecGraph`. Allows transfer nodes to start as soon as their compute dependencies complete, without waiting for the entire compute batch.
 
+### Sub-Phase 9F: Metal Function Constants for Kernel Parameter Injection
+
+Use Metal function constants (`[[function_constant(N)]]`) to inject tile sizes, thread counts, and other dispatch parameters from Rust into MSL at pipeline creation time. This eliminates the class of bugs where constants are duplicated between Rust dispatch code and MSL kernel source strings.
+
+**Motivation:** In Phase 9B-fix, the SDPA MSL kernel had `n_threads = 256` hardcoded while the Rust dispatch code used `THREADS_PER_TG = 128`. This mismatch caused half the threadgroup work to be silently skipped. The fix was manual synchronization, but the root cause -- duplicated constants across Rust and MSL -- remains for other kernels.
+
+**Key deliverables:**
+
+- `MTLFunctionConstantValues` wrapper in `rmlx-metal` for type-safe constant injection
+- Convert SDPA, GEMM, RMSNorm, and RoPE kernels to use `[[function_constant(N)]]` instead of hardcoded values
+- Rust dispatch code becomes the single source of truth for tile sizes and thread counts
+- Reference: Apple's MLX framework uses this pattern extensively for the same reason
+
 ### Sub-Phase 9E: Indirect Command Buffers (ICB)
 
 For decode steps where tensor shapes are constant (batch=1, seq_len=1), pre-record the entire dispatch sequence into an `MTLIndirectCommandBuffer` and replay it on subsequent tokens with zero CPU encoding cost.
@@ -557,6 +571,7 @@ pub struct IcbCache {
 - [x] Weight pre-caching: `prepare_weight_t()` implemented
 - [ ] `test_fused_rmsnorm_rope` -- fused result == sequential result (ulp < 2) *(Phase 9C)*
 - [ ] `test_icb_replay_deterministic` -- replayed ICB produces identical output *(Phase 9E)*
+- [ ] `test_function_constants_inject` -- Rust-injected constants match MSL kernel behavior, no hardcoded duplicates *(Phase 9F)*
 - [ ] Codex review: event ordering correctness, ICB cache invalidation safety
 
 ---
