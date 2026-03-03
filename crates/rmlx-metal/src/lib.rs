@@ -16,8 +16,11 @@ pub mod stream;
 pub use metal;
 
 // Re-export core types for convenience
+pub use command::{BarrierTracker, CommandBufferManager, GpuError, GpuErrorStore};
 pub use device::{Architecture, GpuDevice};
 pub use event::GpuEvent;
+pub use pipeline::{FunctionConstant, PipelineCache};
+pub use queue::GpuQueue;
 pub use stream::StreamManager;
 
 /// Errors from Metal operations
