@@ -1,6 +1,6 @@
-# 🗺️ Implementation Roadmap — Phases 0-9B + S1-S5 Complete
+# 🗺️ Implementation Roadmap — Phases 0-9B + S1-S5 + Audit Remediation Complete
 
-The rmlx project implementation roadmap. All phases through 9B-opt and serving support phases S1-S5 are complete. Implementation phases: 9 + 5 serving support phases (all complete).
+The rmlx project implementation roadmap. All phases through 9B-opt and serving support phases S1-S5 are complete. A full-crate audit (Phases 0, 1, 2) has been completed with 76 remediation items resolved across all 6 crates. Test count: 534.
 
 ---
 
@@ -28,6 +28,7 @@ The rmlx project implementation roadmap. All phases through 9B-opt and serving s
 | S3 | Attention Upgrade | Flash Attention 2, QuantizedKV | Phase 9 | Complete |
 | S4 | Runtime Flexibility | Array-level collectives, Dynamic shapes | Phase 9 | Complete |
 | S5 | Multimodal Extension | Conv1d/Conv2d | Phase 9 | Complete |
+| Audit | Full-Crate Audit Remediation | 76 items across 6 crates (Phase 0+1+2) | S5 | Complete |
 
 ---
 
@@ -55,6 +56,9 @@ The rmlx project implementation roadmap. All phases through 9B-opt and serving s
 | Phase S3: Flash Attention 2 + QuantizedKV | -- | 390 tests | Complete |
 | Phase S4: Collective ops + Dynamic shapes | -- | 390 tests | Complete |
 | Phase S5: Conv1d/Conv2d | -- | 390 tests | Complete |
+| Audit Phase 0: MoE dispatch/combine (D1-D4) + alloc/Metal/GEMM (A1-A3, M1-M4, C1) | `07fad80`, `27f59af` | 460+ tests | Complete |
+| Audit Phase 1: NN MoE GPU routing + MoE policy + RDMA fixes + Metal/alloc perf | `6ee6e6c`, `014875e`, `d9c54c7` | 490+ tests | Complete |
+| Audit Phase 2: Core ops + NN layers + final codex review | `ea94e94`, `1c48b30`, `f9a3b0c` | 534 tests | Complete |
 
 ---
 
@@ -554,6 +558,33 @@ Add convolution primitives for multimodal model support.
 - [x] Conv1d/Conv2d Metal kernels with full parameter support
 - [x] Neural network layer wrappers (Conv1d, Conv2d)
 - [x] All 390+ tests passing
+
+---
+
+## Full-Crate Audit Remediation (Phase 0+1+2) -- Complete
+
+### Goal
+
+Comprehensive audit of all 6 crates with codex-assisted review. Fix all correctness, performance, and feature completeness issues identified.
+
+### Scope: 76 Items Across 6 Crates
+
+| Crate | Items | Key Fixes |
+|-------|-------|-----------|
+| **rmlx-distributed** | D1-D10 | Dispatch loop ordering, per-rank capacity, combine caching, byte threshold (4KB->2MB), hysteresis, cooldown semantics, shared expert, EP integration |
+| **rmlx-metal** | M1-M8 | Command pipeline safety, fence manager, library cache, MSL version detection, stream improvements, autorelease pool, capture manager, managed buffers |
+| **rmlx-alloc** | A1-A12 | Cache bounds fix, alignment improvements, residency management, small allocation fast-path, pool improvements, GC limit API, alloc stats |
+| **rmlx-core** | C1-C9 | Quantized GEMM fix, GatherMM, LayerNorm, unary ops, concat, select, SDPA bf16/backward, conv tiled, VJP GPU |
+| **rmlx-nn** | N1-N8 | MoE GPU routing, batched execution, GPU matmul, QuantizedLinear, MLA, sliding window attention, GGUF loader, 14 activations, LayerNorm layer |
+| **rmlx-rdma** | R1-R3 | Ring/allreduce/allgather collectives, connection manager, coordinator |
+
+### Definition of Done (DoD)
+
+- [x] `cargo fmt --all --check` -- diff 0
+- [x] `cargo clippy --all-targets` -- 0 warnings
+- [x] `cargo test --workspace` -- 534 tests passing, 0 failures
+- [x] All EP audit findings (D1-D7) resolved
+- [x] Codex review: 0 Critical/High issues remaining
 
 ---
 

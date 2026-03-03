@@ -4,7 +4,7 @@
 
 `rmlx-alloc` is the crate responsible for GPU memory allocation and zero-copy buffer management. It registers page-aligned memory allocated via `posix_memalign` with Metal's `newBufferWithBytesNoCopy`, providing simultaneous CPU/GPU access to a single physical memory region. It follows the MLX MetalAllocator pattern and includes size-binned caching and allocation statistics tracking.
 
-> **Status:** Phase 1 implementation complete. `ZeroCopyBuffer`, `MetalAllocator`, `BufferCache`, `AllocStats`, and `LeakDetector` are all implemented.
+> **Status:** Phase 1 implementation complete + Phase 0+1+2 audit remediation (items A1-A12). `ZeroCopyBuffer`, `MetalAllocator`, `BufferCache`, `AllocStats`, `LeakDetector`, `ResidencyManager`, and `SmallAllocator` are all implemented. Fixes include cache bounds, alignment improvements, residency management, small allocation fast-path, pool improvements, GC limit API, and alloc stats.
 
 ---
 

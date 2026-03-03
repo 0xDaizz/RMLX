@@ -4,7 +4,7 @@
 
 `rmlx-core` is the Metal GPU compute engine, providing data types, N-dimensional arrays, a kernel registry, GPU compute kernels, automatic differentiation, LoRA fine-tuning, runtime metrics, structured logging, numerical stability monitoring, and graceful shutdown.
 
-> **Status:** DType (with FP8), Array, KernelRegistry, 18 op modules (including SDPA/FA2, SiLU/SwiGLU, GELU, FP8 dequant/quant, Conv1d/Conv2d), GGUF format parser, AWQ/GPTQ dequant, VJP autodiff, LoRA, logging, metrics, PrecisionGuard, and ShutdownSignal are all implemented.
+> **Status:** DType (with FP8), Array, KernelRegistry, **25 op modules** (including SDPA/FA2 with bf16 + backward, SiLU/SwiGLU, GELU, FP8 dequant/quant, Conv1d/Conv2d, tiled conv, GatherMM, LayerNorm, unary ops, concat, select, VJP GPU), GGUF format parser, AWQ/GPTQ dequant, VJP autodiff, LoRA, logging, metrics, PrecisionGuard, and ShutdownSignal are all implemented. Phase 0+1+2 audit remediation complete (items C1-C9).
 
 ---
 
@@ -19,7 +19,7 @@ rmlx-core/src/
 ├── kernels/
 │   └── mod.rs          # KernelRegistry (AOT -> JIT -> PipelineCache)
 ├── ops/
-│   ├── mod.rs          # 18 kernel registration (register_all)
+│   ├── mod.rs          # 25 kernel registration (register_all)
 │   ├── copy.rs         # Buffer copy
 │   ├── binary.rs       # add, mul, sub, div
 │   ├── reduce.rs       # sum, max, argmax, row_sum
@@ -34,7 +34,15 @@ rmlx-core/src/
 │   ├── gelu.rs         # GELU activation (gelu_approx + gelu_fast)
 │   ├── fp8.rs          # FP8 dequant/quant (E4M3, E5M2)
 │   ├── conv.rs         # Conv1d/Conv2d convolution
-│   ├── sdpa.rs         # Flash Attention 2 (fused SDPA)
+│   ├── sdpa.rs         # Flash Attention 2 (fused SDPA, bf16 support)
+│   ├── sdpa_backward.rs # SDPA backward pass (VJP)
+│   ├── gather_mm.rs    # GatherMM (batched gather-matmul)
+│   ├── layer_norm.rs   # LayerNorm (with affine parameters)
+│   ├── unary.rs        # Unary ops (exp, log, sqrt, abs, neg, tanh, sigmoid, erf, etc.)
+│   ├── concat.rs       # Tensor concatenation along arbitrary axis
+│   ├── select.rs       # Index select operation
+│   ├── conv_tiled.rs   # Tiled convolution for large inputs
+│   ├── vjp_gpu.rs      # GPU-accelerated VJP backward pass
 ├── formats/
 │   ├── mod.rs          # Format parser module
 │   └── gguf.rs         # GGUF binary format parser (llama.cpp)
@@ -138,7 +146,7 @@ unsafe fn to_vec<T: HasDType + Clone>(&self) -> Vec<T>
 
 ## ops/ — Compute Kernels
 
-Registers 18 op modules with the `KernelRegistry`. Bulk registration via `register_all()`.
+Registers 25 op modules with the `KernelRegistry`. Bulk registration via `register_all()`.
 
 ```rust
 pub fn register_all(registry: &KernelRegistry) -> Result<(), KernelError> {
@@ -177,7 +185,15 @@ pub fn register_all(registry: &KernelRegistry) -> Result<(), KernelError> {
 | `gelu` | GELU, GELU_fast | GELU activation (tanh approx + sigmoid fast) |
 | `fp8` | FP8 dequant/quant | Float8E4M3/E5M2 dequantization and quantization |
 | `conv` | Conv1d, Conv2d | 1D and 2D convolution with padding/stride/dilation/groups |
-| `sdpa` | SDPA / FA2 | Flash Attention 2 (fused Scaled Dot-Product Attention) |
+| `sdpa` | SDPA / FA2 | Flash Attention 2 (fused Scaled Dot-Product Attention, bf16 support) |
+| `sdpa_backward` | SDPA backward | SDPA backward pass for VJP |
+| `gather_mm` | GatherMM | Batched gather-matmul for MoE expert routing |
+| `layer_norm` | LayerNorm | Layer normalization with affine (weight + bias) parameters |
+| `unary` | Unary ops | exp, log, sqrt, abs, neg, tanh, sigmoid, erf, ceil, floor, round, sign, reciprocal |
+| `concat` | Concat | Tensor concatenation along arbitrary axis |
+| `select` | Select | Index select (gather along a dimension) |
+| `conv_tiled` | Tiled Conv | Tiled convolution for large inputs |
+| `vjp_gpu` | VJP GPU | GPU-accelerated backward pass for VJP |
 
 ### silu.rs — SiLU Activation + Fused SwiGLU
 
