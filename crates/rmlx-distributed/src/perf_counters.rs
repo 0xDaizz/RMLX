@@ -24,6 +24,10 @@ pub struct PerfCounters {
     pub async_combine_count: AtomicU64,
     /// Fallback to legacy blocking path (should be 0 in steady state)
     pub fallback_count: AtomicU64,
+    /// D20: Cumulative dispatch latency in microseconds.
+    pub dispatch_total_us: AtomicU64,
+    /// D20: Cumulative combine latency in microseconds.
+    pub combine_total_us: AtomicU64,
 }
 
 impl PerfCounters {
@@ -38,6 +42,8 @@ impl PerfCounters {
             async_dispatch_count: AtomicU64::new(0),
             async_combine_count: AtomicU64::new(0),
             fallback_count: AtomicU64::new(0),
+            dispatch_total_us: AtomicU64::new(0),
+            combine_total_us: AtomicU64::new(0),
         }
     }
 
@@ -52,6 +58,8 @@ impl PerfCounters {
             async_dispatch_count: self.async_dispatch_count.load(Ordering::Relaxed),
             async_combine_count: self.async_combine_count.load(Ordering::Relaxed),
             fallback_count: self.fallback_count.load(Ordering::Relaxed),
+            dispatch_total_us: self.dispatch_total_us.load(Ordering::Relaxed),
+            combine_total_us: self.combine_total_us.load(Ordering::Relaxed),
         }
     }
 
@@ -65,6 +73,8 @@ impl PerfCounters {
         self.async_dispatch_count.store(0, Ordering::Relaxed);
         self.async_combine_count.store(0, Ordering::Relaxed);
         self.fallback_count.store(0, Ordering::Relaxed);
+        self.dispatch_total_us.store(0, Ordering::Relaxed);
+        self.combine_total_us.store(0, Ordering::Relaxed);
     }
 
     /// Increment cpu_copy_bytes counter.
@@ -103,6 +113,16 @@ impl PerfCounters {
     pub fn record_fallback(&self) {
         self.fallback_count.fetch_add(1, Ordering::Relaxed);
     }
+
+    /// D20: Record dispatch latency in microseconds.
+    pub fn record_dispatch_latency_us(&self, us: u64) {
+        self.dispatch_total_us.fetch_add(us, Ordering::Relaxed);
+    }
+
+    /// D20: Record combine latency in microseconds.
+    pub fn record_combine_latency_us(&self, us: u64) {
+        self.combine_total_us.fetch_add(us, Ordering::Relaxed);
+    }
 }
 
 impl Default for PerfCounters {
@@ -122,6 +142,10 @@ pub struct PerfSnapshot {
     pub async_dispatch_count: u64,
     pub async_combine_count: u64,
     pub fallback_count: u64,
+    /// D20: Cumulative dispatch latency in microseconds.
+    pub dispatch_total_us: u64,
+    /// D20: Cumulative combine latency in microseconds.
+    pub combine_total_us: u64,
 }
 
 impl PerfSnapshot {
@@ -183,6 +207,8 @@ impl fmt::Display for PerfSnapshot {
             self.fallback_count,
             Self::kpi_status(self.fallback_count, 0)
         )?;
+        writeln!(f, "  dispatch_total_us:    {:>10}", self.dispatch_total_us)?;
+        writeln!(f, "  combine_total_us:     {:>10}", self.combine_total_us)?;
         write!(f, "================================")
     }
 }
@@ -208,6 +234,8 @@ mod tests {
         c.record_async_dispatch();
         c.record_async_combine();
         c.record_fallback();
+        c.record_dispatch_latency_us(150);
+        c.record_combine_latency_us(200);
 
         let snap = c.snapshot();
         assert_eq!(snap.cpu_copy_bytes, 1024);
@@ -218,6 +246,8 @@ mod tests {
         assert_eq!(snap.async_dispatch_count, 1);
         assert_eq!(snap.async_combine_count, 1);
         assert_eq!(snap.fallback_count, 1);
+        assert_eq!(snap.dispatch_total_us, 150);
+        assert_eq!(snap.combine_total_us, 200);
     }
 
     #[test]
@@ -230,6 +260,8 @@ mod tests {
         c.record_async_dispatch();
         c.record_async_combine();
         c.record_fallback();
+        c.record_dispatch_latency_us(100);
+        c.record_combine_latency_us(200);
 
         c.reset();
         let snap = c.snapshot();
@@ -242,6 +274,8 @@ mod tests {
         assert_eq!(snap.async_dispatch_count, 0);
         assert_eq!(snap.async_combine_count, 0);
         assert_eq!(snap.fallback_count, 0);
+        assert_eq!(snap.dispatch_total_us, 0);
+        assert_eq!(snap.combine_total_us, 0);
     }
 
     #[test]

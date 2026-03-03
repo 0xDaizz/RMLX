@@ -42,6 +42,7 @@ kernel void gather_mm_f32(
     constant uint& M_per_batch   [[buffer(5)]],
     constant uint& N             [[buffer(6)]],
     constant uint& K             [[buffer(7)]],
+    constant uint& n_experts     [[buffer(8)]],
     uint3 group_id               [[threadgroup_position_in_grid]],
     uint  tid_in_group           [[thread_index_in_threadgroup]])
 {
@@ -52,6 +53,7 @@ kernel void gather_mm_f32(
     if (batch_idx >= batch) return;
 
     const uint expert_idx = indices[batch_idx];
+    if (expert_idx >= n_experts) return;
     const uint row_start  = group_id.y * BM;
     const uint col_start  = group_id.x * BN;
     const uint local_row  = tid_in_group / BN;
@@ -159,6 +161,7 @@ pub fn gather_mm(
     let batch = x.shape()[0];
     let m_per_batch = x.shape()[1];
     let k = x.shape()[2];
+    let n_experts = weights.shape()[0];
     let n = weights.shape()[2];
 
     if indices.shape()[0] != batch {
@@ -174,6 +177,18 @@ pub fn gather_mm(
             weights.shape()[1],
             k
         )));
+    }
+
+    // Rust-side validation: all expert indices must be in [0, n_experts)
+    if batch > 0 {
+        let idx_vec = indices.to_vec_checked::<u32>();
+        for (i, &idx) in idx_vec.iter().enumerate() {
+            if (idx as usize) >= n_experts {
+                return Err(KernelError::InvalidShape(format!(
+                    "gather_mm: index[{i}]={idx} out of range [0, {n_experts})"
+                )));
+            }
+        }
     }
 
     // Make inputs contiguous
@@ -200,6 +215,7 @@ pub fn gather_mm(
     let m_buf = make_u32_buf(dev, super::checked_u32(m_per_batch, "M_per_batch")?);
     let n_buf = make_u32_buf(dev, super::checked_u32(n, "N")?);
     let k_buf = make_u32_buf(dev, super::checked_u32(k, "K")?);
+    let ne_buf = make_u32_buf(dev, super::checked_u32(n_experts, "n_experts")?);
 
     let cb = queue.new_command_buffer();
     let enc = cb.new_compute_command_encoder();
@@ -212,6 +228,7 @@ pub fn gather_mm(
     enc.set_buffer(5, Some(&m_buf), 0);
     enc.set_buffer(6, Some(&n_buf), 0);
     enc.set_buffer(7, Some(&k_buf), 0);
+    enc.set_buffer(8, Some(&ne_buf), 0);
 
     const BM: usize = 32;
     const BN: usize = 32;
