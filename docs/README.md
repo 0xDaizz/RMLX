@@ -6,7 +6,7 @@
 
 ---
 
-## What is RMLX?
+## 🔍 What is RMLX?
 
 RMLX is a project that **reimplements the core Metal GPU inference pipeline of Apple's MLX framework in Rust**. The goal is to reach the theoretical performance ceiling for Expert Parallelism (EP) based distributed LLM inference on a Mac Studio M3 Ultra cluster.
 
@@ -14,7 +14,7 @@ It fundamentally addresses the structural bottlenecks identified in MLX's C++/Py
 
 ---
 
-## Why is RMLX Needed?
+## 💡 Why is RMLX Needed?
 
 MLX is an excellent framework, but it carries the following software overheads in distributed inference scenarios:
 
@@ -29,7 +29,7 @@ MLX is an excellent framework, but it carries the following software overheads i
 
 ---
 
-## Core Objective
+## 🎯 Core Objective
 
 ```
 2-node EP decode: 64ms/step -> 33ms/step (~30 tok/s)
@@ -43,7 +43,7 @@ The ultimate goal is to connect two Mac Studio M3 Ultras via Thunderbolt 5 RDMA 
 
 ---
 
-## Key Differentiators vs. MLX
+## ⚡ Key Differentiators vs. MLX
 
 1. **Zero-copy RDMA data path**
    `posix_memalign` -> `newBufferWithBytesNoCopy` -> `ibv_reg_mr` — three views share the same physical address, completely eliminating `memcpy` from the RDMA hot path.
@@ -66,7 +66,7 @@ The ultimate goal is to connect two Mac Studio M3 Ultras via Thunderbolt 5 RDMA 
 
 ---
 
-## Tech Stack
+## 🛠️ Tech Stack
 
 | Area | Technology |
 |------|-----------|
@@ -78,7 +78,7 @@ The ultimate goal is to connect two Mac Studio M3 Ultras via Thunderbolt 5 RDMA 
 
 ---
 
-## Next Steps
+## 📚 Next Steps
 
 - [Architecture Overview](architecture/overview.md) — Full system layer diagram and design philosophy
 - [Crate Structure](architecture/crate-structure.md) — Workspace layout and role of each crate
@@ -88,7 +88,7 @@ The ultimate goal is to connect two Mac Studio M3 Ultras via Thunderbolt 5 RDMA 
 
 ---
 
-## Project Structure
+## 📁 Project Structure
 
 This repository (`~/rmlx/`) is **framework-only**. The model serving layer (`rmlx-lm`) is managed in a [separate repository](https://github.com/rmlx-lm).
 

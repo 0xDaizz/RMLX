@@ -14,7 +14,7 @@
 
 RMLX reimplements the core Metal GPU inference pipeline of Apple's [MLX](https://github.com/ml-explore/mlx) framework **entirely in Rust**. The ExecGraph pipeline batches 65 command buffers down to 5 per transformer layer, achieving a **16.15x speedup** (110.4ms to 6.8ms) with full numerical parity (max\_diff=6.4e-6).
 
-## Why RMLX?
+## ✨ Why RMLX?
 
 | Feature | RMLX | MLX | CUDA |
 |---------|:----:|:---:|:----:|
@@ -27,7 +27,7 @@ RMLX reimplements the core Metal GPU inference pipeline of Apple's [MLX](https:/
 | Paged KV Cache | planned | no | yes (vLLM) |
 | Speculative Decoding | planned | no | yes |
 
-## Benchmark Results
+## 🎯 Benchmark Results
 
 Measured on Apple Silicon, single transformer layer, Phase 9B-opt complete:
 
@@ -38,7 +38,7 @@ Measured on Apple Silicon, single transformer layer, Phase 9B-opt complete:
 | CPU-GPU syncs | ~65 | ~1 | 98.5% reduction |
 | Numerical parity | -- | -- | max\_diff=6.4e-6 |
 
-## Feature Matrix
+## 🛠️ Feature Matrix
 
 ### Implemented
 
@@ -63,7 +63,7 @@ Measured on Apple Silicon, single transformer layer, Phase 9B-opt complete:
 - Advanced Quantization (AWQ, GPTQ)
 - Python API
 
-## Architecture
+## 🏗️ Architecture
 
 ```mermaid
 graph TD
@@ -83,7 +83,7 @@ graph TD
     METAL -.-> ALLOC
 ```
 
-## Quick Start
+## 🚀 Quick Start
 
 ```bash
 # Clone
@@ -103,7 +103,7 @@ cargo clippy --workspace -- -D warnings
 
 > Requires macOS 14+ on Apple Silicon. See [Prerequisites](docs/getting-started/prerequisites.md) for details.
 
-## Project Structure
+## 📁 Project Structure
 
 ```
 rmlx/                           # 6 crates, 339+ tests
@@ -122,7 +122,7 @@ rmlx/                           # 6 crates, 339+ tests
 
 This repository contains the **framework only**. The model serving layer (`rmlx-lm`) is in a [separate repository](https://github.com/rmlx-lm).
 
-## Stats
+## 📊 Stats
 
 | Metric | Value |
 |--------|-------|
@@ -132,7 +132,7 @@ This repository contains the **framework only**. The model serving layer (`rmlx-
 | Model architectures | 4 (LLaMA, Qwen, DeepSeek-V3, Mixtral) |
 | Implementation phases | 9 (Phase 0 -- 9B-opt complete) |
 
-## Current Limitations
+## ⚠️ Current Limitations
 
 - **No Flash Attention** -- fused SDPA exists but not full Flash Attention 2
 - **No paged attention** -- static KV cache only, no dynamic cache management
@@ -142,7 +142,7 @@ This repository contains the **framework only**. The model serving layer (`rmlx-
 - **No Python API** -- Rust-only interface
 - **TB5 bandwidth** -- limited to 16 GB/s vs NVLink 600 GB/s
 
-## Documentation
+## 📚 Documentation
 
 Full documentation: **[docs/README.md](docs/README.md)**
 
@@ -154,7 +154,7 @@ Full documentation: **[docs/README.md](docs/README.md)**
 - [GPU Pipeline & ExecGraph](docs/gpu-pipeline.md)
 - [RMLX vs MLX vs CUDA Comparison](docs/comparison.md)
 
-## License
+## 📄 License
 
 Licensed under either of:
 
