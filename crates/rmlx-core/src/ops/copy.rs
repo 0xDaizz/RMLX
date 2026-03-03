@@ -1084,6 +1084,7 @@ pub fn fill_f32(
 ///
 /// Copies `src` [seq_len, head_dim] into the appropriate columns of
 /// `dst` [seq_len, num_heads * head_dim] at head index `head_idx`.
+#[allow(clippy::too_many_arguments)]
 pub fn interleave_heads_into_cb(
     registry: &KernelRegistry,
     src: &Array,

@@ -57,7 +57,7 @@ inline float simdgroup_sum(float val) {
 //   6: scale  [float]   — 1/sqrt(D)
 //
 // Grid:  (ceil(N / Br), 1, 1)  threadgroups
-// Threads per threadgroup: 256
+// Threads per threadgroup: 128
 
 kernel void sdpa_f32(
     device const float* Q         [[buffer(0)]],
@@ -97,7 +97,7 @@ kernel void sdpa_f32(
     threadgroup float m_prev[Br];          // running max per row
     threadgroup float l_prev[Br];          // running sum(exp) per row
 
-    const uint n_threads = 256;
+    const uint n_threads = 128;
 
     // Initialise accumulators
     for (uint idx = tid; idx < Br * D; idx += n_threads) {
@@ -290,7 +290,7 @@ kernel void sdpa_f16(
     threadgroup float m_prev[Br];
     threadgroup float l_prev[Br];
 
-    const uint n_threads = 256;
+    const uint n_threads = 128;
 
     for (uint idx = tid; idx < Br * D; idx += n_threads) {
         O_acc[idx] = 0.0f;
