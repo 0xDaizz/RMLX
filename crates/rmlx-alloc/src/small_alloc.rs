@@ -138,10 +138,7 @@ impl SmallBufferPool {
 
     /// Number of currently free slots.
     pub fn free_count(&self) -> usize {
-        self.inner
-            .lock()
-            .map(|inner| inner.free_count)
-            .unwrap_or(0)
+        self.inner.lock().map(|inner| inner.free_count).unwrap_or(0)
     }
 
     /// Number of currently allocated slots.
