@@ -59,11 +59,6 @@ Measured on Apple Silicon, single transformer layer, Phase 9B-opt complete:
 - **Dual queue pipeline** -- separate compute and transfer command queues
 - **VJP / LoRA** -- autodiff and parameter-efficient fine-tuning primitives
 
-### Planned
-
-- Python API
-- Speculative Decoding
-
 ## 🏗️ Architecture
 
 ```mermaid
