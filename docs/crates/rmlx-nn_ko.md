@@ -4,7 +4,7 @@
 
 `rmlx-nn`은 GPU 가속 추론을 위한 신경망 레이어를 구현하는 크레이트입니다. Transformer 아키텍처의 핵심 구성 요소(Linear, Embedding, Attention, TransformerBlock, MoE)를 `rmlx-core`의 연산 커널 위에 구성하며, LLaMA, Qwen, DeepSeek-V3, Mixtral 모델 설정을 내장하고 있습니다.
 
-> **상태 (Phase 0-9B-opt):** Linear, Embedding, Attention (KV 캐시 포함), TransformerBlock, MoE, Parallel (TP), 그리고 4종 모델 설정(LLaMA 7B/3-8B, Qwen2 7B, DeepSeek-V3, Mixtral 8x7B)이 구현되어 있습니다. Phase 9에서 `forward_graph()`, `forward_into_cb()`, 가중치 사전 캐싱(`prepare_weight_t`)이 추가되어 ExecGraph CB 배칭을 지원합니다 (레이어당 65 CB -> 5 CB, 92.3% 감소, 16.15x 속도 향상).
+> **상태 (Phase 0-9B-opt + S1-S5):** Linear, Embedding, Attention (KV 캐시 포함), TransformerBlock, MoE, Parallel (TP), 4종 모델 설정(LLaMA 7B/3-8B, Qwen2 7B, DeepSeek-V3, Mixtral 8x7B), RotatingKvCache, BatchKvCache, QuantizedKvCache, QuantizedArray, Conv1d/Conv2d, DynamicExecContext가 구현되어 있습니다. Phase 9에서 `forward_graph()`, `forward_into_cb()`, 가중치 사전 캐싱(`prepare_weight_t`)이 추가되어 ExecGraph CB 배칭을 지원합니다 (레이어당 65 CB -> 5 CB, 92.3% 감소, 16.15x 속도 향상).
 
 ---
 
@@ -12,19 +12,23 @@
 
 ```
 rmlx-nn/src/
-├── lib.rs           # 모듈 선언 + 재내보내기
-├── linear.rs        # 선형 (FC) 레이어
-├── embedding.rs     # 토큰 임베딩
-├── attention.rs     # Multi-Head / GQA Attention + KV 캐시
-├── transformer.rs   # Transformer 블록 + 모델
-├── moe.rs           # Mixture of Experts 레이어
-├── parallel.rs      # 텐서 병렬 레이어 (feature = "distributed")
+├── lib.rs              # 모듈 선언 + 재내보내기
+├── linear.rs           # 선형 (FC) 레이어
+├── embedding.rs        # 토큰 임베딩
+├── attention.rs        # Multi-Head / GQA Attention + KV 캐시
+├── kv_cache.rs         # RotatingKvCache, BatchKvCache, QuantizedKvCache
+├── quantized_array.rs  # QuantizedArray (AWQ/GPTQ 양자화 가중치 래퍼)
+├── conv.rs             # Conv1d/Conv2d 레이어
+├── dynamic_exec.rs     # DynamicExecContext (동적 shape 실행 컨텍스트)
+├── transformer.rs      # Transformer 블록 + 모델
+├── moe.rs              # Mixture of Experts 레이어
+├── parallel.rs         # 텐서 병렬 레이어 (feature = "distributed")
 └── models/
-    ├── mod.rs        # 모델 모듈 선언
-    ├── llama.rs      # LLaMA 7B, LLaMA 3 8B
-    ├── qwen.rs       # Qwen2 7B
-    ├── deepseek.rs   # DeepSeek-V3
-    └── mixtral.rs    # Mixtral 8x7B
+    ├── mod.rs           # 모델 모듈 선언
+    ├── llama.rs         # LLaMA 7B, LLaMA 3 8B
+    ├── qwen.rs          # Qwen2 7B
+    ├── deepseek.rs      # DeepSeek-V3
+    └── mixtral.rs       # Mixtral 8x7B
 ```
 
 ---
@@ -199,6 +203,154 @@ pub struct LayerKvCache {
 | 메서드 | 설명 |
 |--------|------|
 | `append_into_cb(new_keys, new_values, new_tokens, registry, cb)` | 호출자의 CB에 추가 |
+
+---
+
+## kv_cache.rs -- KV 캐시 변형
+
+### RotatingKvCache
+
+고정 크기 순환 버퍼로 구현된 KV 캐시입니다. `max_seq_len`을 초과하면 가장 오래된 항목을 덮어씁니다. 스트리밍 추론에 적합합니다.
+
+```rust
+pub struct RotatingKvCache {
+    keys: Vec<Array>,       // kv_head별: [max_seq, head_dim]
+    values: Vec<Array>,     // kv_head별: [max_seq, head_dim]
+    seq_len: usize,
+    write_pos: usize,       // 순환 쓰기 위치
+    max_seq_len: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+}
+```
+
+| 메서드 | 설명 |
+|--------|------|
+| `RotatingKvCache::new(device, num_kv_heads, head_dim, max_seq_len, dtype)` | 사전 할당된 순환 캐시 생성 |
+| `append(new_keys, new_values, new_tokens, registry, queue)` | 새 K/V 추가 (가득 차면 순환 덮어쓰기) |
+| `cached_keys(head)` | 유효한 캐시된 키 뷰 |
+| `cached_values(head)` | 유효한 캐시된 값 뷰 |
+| `position_offset()` | 현재 시퀀스 위치 |
+
+### BatchKvCache
+
+배치 추론을 위한 KV 캐시입니다. 여러 시퀀스의 KV 캐시를 동시에 관리합니다.
+
+```rust
+pub struct BatchKvCache {
+    caches: Vec<LayerKvCache>,  // 시퀀스별 캐시
+    batch_size: usize,
+}
+```
+
+| 메서드 | 설명 |
+|--------|------|
+| `BatchKvCache::new(batch_size, num_kv_heads, head_dim, max_seq_len, device, dtype)` | 배치 크기만큼 캐시 생성 |
+| `get(seq_idx)` | 특정 시퀀스의 캐시 참조 |
+| `get_mut(seq_idx)` | 특정 시퀀스의 캐시 가변 참조 |
+| `batch_size()` | 배치 크기 |
+
+### QuantizedKvCache
+
+양자화된 K/V를 저장하여 메모리 사용량을 줄이는 KV 캐시입니다. FP8 또는 Q8_0으로 K/V를 양자화하여 캐시합니다.
+
+```rust
+pub struct QuantizedKvCache {
+    keys: Vec<Array>,       // 양자화된 K: FP8/Q8_0
+    values: Vec<Array>,     // 양자화된 V: FP8/Q8_0
+    scales: Vec<Array>,     // 역양자화 스케일
+    cache_dtype: DType,     // Float8E4M3 또는 Q8_0
+    seq_len: usize,
+    max_seq_len: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+}
+```
+
+| 메서드 | 설명 |
+|--------|------|
+| `QuantizedKvCache::new(device, num_kv_heads, head_dim, max_seq_len, cache_dtype)` | 양자화 캐시 생성 |
+| `append(new_keys, new_values, new_tokens, registry, queue)` | 새 K/V를 양자화하여 추가 |
+| `dequant_keys(head, registry, queue)` | 역양자화된 키 반환 |
+| `dequant_values(head, registry, queue)` | 역양자화된 값 반환 |
+| `memory_savings()` | Float16 대비 메모리 절감 비율 |
+
+---
+
+## quantized_array.rs -- QuantizedArray
+
+AWQ/GPTQ 양자화 가중치를 래핑하는 구조체입니다. 역양자화 메타데이터를 함께 저장합니다.
+
+```rust
+pub struct QuantizedArray {
+    data: Array,           // 양자화된 가중치 데이터
+    scales: Array,         // 그룹별 스케일
+    zeros: Option<Array>,  // 그룹별 제로포인트 (AWQ/GPTQ)
+    group_size: usize,     // 양자화 그룹 크기
+    bits: usize,           // 비트 수 (4 또는 8)
+}
+```
+
+| 메서드 | 설명 |
+|--------|------|
+| `QuantizedArray::from_awq(data, scales, zeros, group_size)` | AWQ 가중치로부터 생성 |
+| `QuantizedArray::from_gptq(data, scales, zeros, g_idx, bits)` | GPTQ 가중치로부터 생성 |
+| `dequantize(registry, queue)` | 전체 가중치를 Float16/Float32로 역양자화 |
+| `matmul(input, registry, queue)` | 양자화 상태에서 직접 행렬 곱 수행 |
+
+---
+
+## conv.rs -- Conv1d/Conv2d 레이어
+
+멀티모달 모델(Whisper 등)의 오디오/이미지 인코더에 사용되는 합성곱 레이어입니다.
+
+```rust
+pub struct Conv1dConfig {
+    pub in_channels: usize,
+    pub out_channels: usize,
+    pub kernel_size: usize,
+    pub stride: usize,
+    pub padding: usize,
+    pub has_bias: bool,
+}
+
+pub struct Conv2dConfig {
+    pub in_channels: usize,
+    pub out_channels: usize,
+    pub kernel_size: (usize, usize),
+    pub stride: (usize, usize),
+    pub padding: (usize, usize),
+    pub has_bias: bool,
+}
+```
+
+| 메서드 | 설명 |
+|--------|------|
+| `Conv1d::new(config)` | 1D 합성곱 레이어 생성 |
+| `Conv1d::forward(input, registry, queue)` | 1D 합성곱 순전파 |
+| `Conv2d::new(config)` | 2D 합성곱 레이어 생성 |
+| `Conv2d::forward(input, registry, queue)` | 2D 합성곱 순전파 |
+
+---
+
+## dynamic_exec.rs -- DynamicExecContext
+
+동적 shape를 가진 입력에 대해 ExecGraph를 효율적으로 재사용하는 실행 컨텍스트입니다. 입력 shape가 변경될 때 ExecGraph를 자동으로 재컴파일하거나 캐시된 그래프를 재사용합니다.
+
+```rust
+pub struct DynamicExecContext {
+    graph_cache: HashMap<ShapeKey, ExecGraph>,
+    max_cached_graphs: usize,
+    current_shape: Option<ShapeKey>,
+}
+```
+
+| 메서드 | 설명 |
+|--------|------|
+| `DynamicExecContext::new(max_cached_graphs)` | 캐시 크기 제한과 함께 생성 |
+| `get_or_build(shape, build_fn)` | shape에 맞는 캐시된 그래프 반환 또는 새로 빌드 |
+| `invalidate(shape)` | 특정 shape의 캐시된 그래프 무효화 |
+| `cached_count()` | 캐시된 그래프 수 |
 
 ---
 
@@ -467,6 +619,10 @@ graph BT
 
 ```rust
 pub use attention::{Attention, AttentionConfig, LayerKvCache};
+pub use kv_cache::{RotatingKvCache, BatchKvCache, QuantizedKvCache};
+pub use quantized_array::QuantizedArray;
+pub use conv::{Conv1d, Conv1dConfig, Conv2d, Conv2dConfig};
+pub use dynamic_exec::DynamicExecContext;
 pub use embedding::{Embedding, EmbeddingConfig};
 pub use linear::{Linear, LinearConfig};
 pub use moe::{MoeConfig, MoeForwardMetrics, MoeLayer};

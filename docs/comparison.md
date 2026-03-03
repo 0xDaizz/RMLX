@@ -19,13 +19,13 @@
 | **CB management** | ExecGraph: 65 CBs/layer -> 5 CBs/layer (92.3% reduction) | 1 CB per eval() batch | Stream-ordered, CUDA Graphs capture-replay |
 | **Sync mechanism** | MTLSharedEvent signal/wait (263.9us) | waitUntilCompleted (424.9us) | CUDA events / streams |
 | **RDMA** | Zero-copy: posix_memalign + NoCopy + ibv_reg_mr | std::copy to transfer buffer | GPUDirect RDMA / NVLink |
-| **Quantization** | Q4_0, Q4_1, Q8_0 | Q4_0, Q4_1, Q8_0, GGUF, AWQ, GPTQ | FP8, AWQ, GPTQ, INT4/INT8 |
-| **Flash Attention** | No (fused SDPA only) | No (fused SDPA) | FlashAttention-2/3 |
-| **KV cache** | Static per-layer cache | Static per-layer cache | PagedAttention (vLLM) |
+| **Quantization** | Q4_0, Q4_1, Q8_0, FP8, GGUF, AWQ, GPTQ | Q4_0, Q4_1, Q8_0, GGUF, AWQ, GPTQ | FP8, AWQ, GPTQ, INT4/INT8 |
+| **Flash Attention** | Flash Attention 2 (D≤256) | No (fused SDPA) | FlashAttention-2/3 |
+| **KV cache** | Static, Rotating, Batch, Quantized | Static per-layer cache | PagedAttention (vLLM) |
 | **Training** | LoRA fine-tuning only | Full training support | Full training + LoRA + QLoRA |
-| **Op modules** | 14 | ~50+ | Hundreds |
-| **Test suite** | 339+ tests | Extensive | Extensive |
-| **Phases complete** | 0-9B-opt | N/A (stable release) | N/A (stable release) |
+| **Op modules** | 18 | ~50+ | Hundreds |
+| **Test suite** | 390+ tests | Extensive | Extensive |
+| **Phases complete** | 0-9B-opt + S1-S5 | N/A (stable release) | N/A (stable release) |
 
 ---
 
@@ -140,11 +140,9 @@ RMLX's dual-registration technique (Metal buffer + RDMA MR on the same physical 
 
 This section is intentionally thorough. Honest assessment of limitations is more useful than marketing.
 
-### 4.1 No Flash Attention
+### 4.1 Flash Attention — Now Implemented
 
-RMLX implements fused SDPA (Scaled Dot-Product Attention) but not Flash Attention 2 with tiled K/V and online softmax. Flash Attention reduces memory usage from O(N^2) to O(N) for the attention matrix, which is critical for long-context inference.
-
-MLX also lacks full Flash Attention, but its fused SDPA implementation is more mature.
+RMLX now implements Flash Attention 2 with K/V outer loop, head_dim up to 256, a decode fast path for single-query tokens, and causal mask block skipping. This closes the attention efficiency gap with MLX's fused SDPA.
 
 ### 4.2 Smaller Ecosystem
 
@@ -160,12 +158,12 @@ The machine learning research community overwhelmingly uses Python. RMLX is Rust
 |--------|------|-----|
 | Q4_0 / Q4_1 | Yes | Yes |
 | Q8_0 | Yes | Yes |
-| GGUF | No | Yes |
-| AWQ | No | Yes |
-| GPTQ | No | Yes |
-| FP8 | No | Partial |
+| GGUF | Yes | Yes |
+| AWQ | Yes | Yes |
+| GPTQ | Yes | Yes |
+| FP8 | Yes (E4M3/E5M2) | Partial |
 
-MLX supports loading GGUF, AWQ, and GPTQ quantized models directly. RMLX supports only block-quantized Q4_0, Q4_1, and Q8_0.
+RMLX now supports loading GGUF files and dequantizing AWQ/GPTQ packed weights. FP8 (E4M3/E5M2) dtypes with dequant/quant kernels are also available. The quantization gap with MLX has been closed.
 
 ### 4.5 No Graph Optimization
 
@@ -181,9 +179,9 @@ MLX supports full training with automatic differentiation, optimizer states, and
 
 The gap between RMLX and the CUDA ecosystem is larger than the gap between RMLX and MLX. This is expected -- CUDA has had decades of investment.
 
-### 5.1 No Flash Attention
+### 5.1 Flash Attention Gap Narrowed
 
-FlashAttention-2 and FlashAttention-3 are standard in the CUDA ecosystem. They provide both memory efficiency (O(N) instead of O(N^2)) and computational efficiency (better SRAM utilization on NVIDIA hardware). RMLX's fused SDPA does not achieve comparable efficiency for long sequences.
+RMLX now implements Flash Attention 2 with online softmax and tiled K/V processing. However, NVIDIA's FlashAttention-3 leverages Tensor Core-specific optimizations (warp-level MMA instructions, asynchronous copy) that are not applicable to Apple Silicon. The CUDA implementation remains more optimized for its hardware.
 
 ### 5.2 Interconnect Bandwidth
 
@@ -273,15 +271,15 @@ NVIDIA Discrete:
 | Q4_0 (4-bit block, absmax) | Yes | Yes | Via llama.cpp |
 | Q4_1 (4-bit block, min+scale) | Yes | Yes | Via llama.cpp |
 | Q8_0 (8-bit block) | Yes | Yes | Via llama.cpp |
-| GGUF (llama.cpp format) | No | Yes | Yes (native llama.cpp) |
-| AWQ (activation-aware) | No | Yes | Yes (AutoAWQ) |
-| GPTQ (post-training) | No | Yes | Yes (AutoGPTQ) |
-| FP8 (E4M3/E5M2) | No | Partial | Yes (H100+, native) |
+| GGUF (llama.cpp format) | Yes | Yes | Yes (native llama.cpp) |
+| AWQ (activation-aware) | Yes | Yes | Yes (AutoAWQ) |
+| GPTQ (post-training) | Yes | Yes | Yes (AutoGPTQ) |
+| FP8 (E4M3/E5M2) | Yes | Partial | Yes (H100+, native) |
 | INT4 (NVIDIA) | No | No | Yes (TensorRT-LLM) |
 | INT8 (smooth quant) | No | Partial | Yes (TensorRT-LLM) |
 | W4A16 (weight 4-bit, act 16-bit) | Yes (Q4_0/Q4_1) | Yes | Yes |
 
-RMLX's quantization coverage is limited to the three block-quantization formats needed for basic inference. MLX and the CUDA ecosystem support significantly more formats, enabling better model quality at lower bit widths.
+RMLX now supports GGUF, AWQ, GPTQ, and FP8 formats in addition to the three basic block-quantization formats. The remaining gaps are NVIDIA-specific formats (INT4/INT8 via TensorRT-LLM).
 
 ---
 
@@ -293,23 +291,23 @@ RMLX maintains strict numerical parity between its baseline execution path and t
 |--------|-------|
 | max_diff (baseline vs ExecGraph) | 6.4e-6 |
 | Tolerance threshold | 1e-4 |
-| Test coverage | 339+ tests |
+| Test coverage | 390+ tests |
 | Verification method | Element-wise comparison across all ops |
 
 This ensures that the 16.15x performance improvement from ExecGraph introduces no meaningful numerical drift.
 
 ---
 
-## 10. Roadmap to Parity
+## 10. Completed Parity Items
 
-RMLX is actively working to close the gaps identified in Sections 4 and 5. The planned phases are:
+The following gaps identified in earlier versions have been closed:
 
 | Phase | Focus | Key Deliverables | Gap Addressed |
 |-------|-------|-----------------|---------------|
-| **Phase 10** | Attention Optimization | Flash Attention 2 with tiled K/V | Sections 4.1, 5.1 |
-| **Phase 11** | Advanced Quantization | GGUF loader, AWQ, GPTQ, FP8 support | Section 4.4, 8 |
+| **Phase S3a** | Attention Optimization | Flash Attention 2 (K/V outer loop, D≤256, decode fast path) | Sections 4.1 (closed) |
+| **Phase S2** | Advanced Quantization | GGUF loader, AWQ/GPTQ dequant, FP8 dtypes | Section 4.4 (closed) |
 
-These phases are not yet scheduled. The current focus (Phases 0-9B-opt) prioritizes the Metal GPU pipeline and ExecGraph optimization.
+Remaining gaps: Python API, speculative decoding, and NVIDIA-specific quantization formats (INT4/INT8).
 
 ---
 
