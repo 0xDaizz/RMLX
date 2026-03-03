@@ -740,9 +740,9 @@ impl Attention {
 
         // === CB1: Q/K/V projections (added to graph's current CB) ===
         let cb1 = graph.command_buffer();
-        let wq_t = self.q_proj.weight_transposed()?;
-        let wk_t = self.k_proj.weight_transposed()?;
-        let wv_t = self.v_proj.weight_transposed()?;
+        let wq_t = self.q_proj.weight_transposed_contiguous()?;
+        let wk_t = self.k_proj.weight_transposed_contiguous()?;
+        let wv_t = self.v_proj.weight_transposed_contiguous()?;
         let (q, k, v) = ops::fused::batched_qkv_proj_into(
             registry, normed_x, &wq_t, &wk_t, &wv_t, cb1,
         )?;
@@ -883,6 +883,19 @@ impl Attention {
         let t4 = graph.submit_batch();
 
         Ok((h, t4))
+    }
+
+    /// Pre-compute contiguous transposed weights for graph execution.
+    pub fn prepare_weights_for_graph(
+        &mut self,
+        registry: &KernelRegistry,
+        queue: &metal::CommandQueue,
+    ) -> Result<(), KernelError> {
+        self.q_proj.prepare_weight_t(registry, queue)?;
+        self.k_proj.prepare_weight_t(registry, queue)?;
+        self.v_proj.prepare_weight_t(registry, queue)?;
+        self.o_proj.prepare_weight_t(registry, queue)?;
+        Ok(())
     }
 
     pub fn num_heads(&self) -> usize {

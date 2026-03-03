@@ -24,6 +24,7 @@ pub struct Linear {
     config: LinearConfig,
     weight: Option<Array>,
     bias: Option<Array>,
+    weight_t_cached: Option<Array>,
 }
 
 impl Linear {
@@ -33,6 +34,7 @@ impl Linear {
             config,
             weight: None,
             bias: None,
+            weight_t_cached: None,
         }
     }
 
@@ -84,6 +86,7 @@ impl Linear {
             config,
             weight: Some(weight),
             bias,
+            weight_t_cached: None,
         })
     }
 
@@ -196,6 +199,41 @@ impl Linear {
         ))
     }
 
+    /// Return the contiguous transposed weight (cached if available, else creates view).
+    pub fn weight_transposed_contiguous(&self) -> Result<Array, KernelError> {
+        if let Some(ref cached) = self.weight_t_cached {
+            return Ok(cached.view(
+                cached.shape().to_vec(),
+                cached.strides().to_vec(),
+                cached.offset(),
+            ));
+        }
+        self.weight_transposed()
+    }
+
+    /// Pre-compute and cache the contiguous transposed weight for `forward_into_cb`.
+    ///
+    /// Call once after weight loading. Eliminates per-pass weight copies in the
+    /// ExecGraph path. Uses one command buffer internally.
+    pub fn prepare_weight_t(
+        &mut self,
+        registry: &KernelRegistry,
+        queue: &metal::CommandQueue,
+    ) -> Result<(), KernelError> {
+        let weight = self.weight.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape("Linear: weights not loaded".to_string())
+        })?;
+        let w_t = weight.view(
+            vec![self.config.in_features, self.config.out_features],
+            vec![1, self.config.in_features],
+            weight.offset(),
+        );
+        // Use the standard copy op (creates its own CB, blocks)
+        let w_t_contig = ops::copy::copy(registry, &w_t, queue)?;
+        self.weight_t_cached = Some(w_t_contig);
+        Ok(())
+    }
+
     /// Encode the linear forward pass into an existing command buffer.
     ///
     /// This does NOT commit or wait — the caller manages the CB lifecycle.
@@ -233,18 +271,21 @@ impl Linear {
             )));
         }
 
-        let w_t = weight.view(
-            vec![self.config.in_features, self.config.out_features],
-            vec![1, self.config.in_features],
-            weight.offset(),
-        );
-
-        // The transposed view is non-contiguous; the GEMM kernel needs row-major B.
-        // Copy to contiguous layout in the same command buffer.
-        let w_t = if w_t.is_contiguous() {
-            w_t
+        // Use pre-cached contiguous transposed weight if available
+        let w_t = if let Some(ref cached) = self.weight_t_cached {
+            cached.view(cached.shape().to_vec(), cached.strides().to_vec(), cached.offset())
         } else {
-            ops::copy::copy_into_cb(registry, &w_t, cb)?
+            // Fallback: create transposed view and copy to contiguous in-CB
+            let w_t_view = weight.view(
+                vec![self.config.in_features, self.config.out_features],
+                vec![1, self.config.in_features],
+                weight.offset(),
+            );
+            if w_t_view.is_contiguous() {
+                w_t_view
+            } else {
+                ops::copy::copy_into_cb(registry, &w_t_view, cb)?
+            }
         };
 
         // Ensure input is contiguous for GEMM

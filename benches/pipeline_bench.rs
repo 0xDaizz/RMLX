@@ -608,10 +608,13 @@ fn main() {
         HIDDEN_SIZE, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM
     );
 
-    let block = build_transformer_block(device);
+    let mut block = build_transformer_block(device);
 
     // --- Create input tensor ---
     let input = rand_array(device, &[SEQ_LEN, HIDDEN_SIZE], 42);
+
+    // Pre-compute contiguous transposed weights for graph path
+    block.prepare_weights_for_graph(&registry, &queue).expect("weight preparation");
 
     // --- GpuEvent for pipelined path ---
     let event = GpuEvent::new(device);

@@ -123,6 +123,23 @@ impl FeedForward {
         }
     }
 
+    /// Pre-compute contiguous transposed weights for graph execution.
+    pub fn prepare_weights_for_graph(
+        &mut self,
+        registry: &KernelRegistry,
+        queue: &metal::CommandQueue,
+    ) -> Result<(), KernelError> {
+        match self {
+            FeedForward::Dense { gate_proj, up_proj, down_proj } => {
+                gate_proj.prepare_weight_t(registry, queue)?;
+                up_proj.prepare_weight_t(registry, queue)?;
+                down_proj.prepare_weight_t(registry, queue)?;
+            }
+            FeedForward::MoE(_) => {} // MoE doesn't use graph path
+        }
+        Ok(())
+    }
+
     /// Graph-based FFN forward: encodes into 2 command buffers via ExecGraph.
     ///
     /// - CB5 (current): gate_proj + up_proj + fused_silu_mul
@@ -401,6 +418,16 @@ impl TransformerBlock {
         self.ffn.forward_graph(&normed2, &h, registry, graph, queue)
     }
 
+    /// Pre-compute contiguous transposed weights for graph execution.
+    pub fn prepare_weights_for_graph(
+        &mut self,
+        registry: &KernelRegistry,
+        queue: &metal::CommandQueue,
+    ) -> Result<(), KernelError> {
+        self.attention.prepare_weights_for_graph(registry, queue)?;
+        self.ffn.prepare_weights_for_graph(registry, queue)
+    }
+
     pub fn layer_idx(&self) -> usize {
         self.layer_idx
     }
@@ -625,6 +652,22 @@ impl TransformerModel {
         // Final norm + LM head (not worth graph-ifying, just 2 CBs)
         x = ops::rms_norm::rms_norm(registry, &x, final_norm, self.config.rms_norm_eps, queue)?;
         lm_head.forward(&x, registry, queue)
+    }
+
+    /// Pre-compute contiguous transposed weights for all layers.
+    /// Call once after model loading, before calling `forward_graph()`.
+    pub fn prepare_weights_for_graph(
+        &mut self,
+        registry: &KernelRegistry,
+        queue: &metal::CommandQueue,
+    ) -> Result<(), KernelError> {
+        for layer in &mut self.layers {
+            layer.prepare_weights_for_graph(registry, queue)?;
+        }
+        if let Some(ref mut lm_head) = self.lm_head {
+            lm_head.prepare_weight_t(registry, queue)?;
+        }
+        Ok(())
     }
 
     pub fn num_layers(&self) -> usize {
