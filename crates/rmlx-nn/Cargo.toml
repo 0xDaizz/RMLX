@@ -8,10 +8,13 @@ license.workspace = true
 [dependencies]
 rmlx-core = { path = "../rmlx-core" }
 rmlx-distributed = { path = "../rmlx-distributed", optional = true }
+rmlx-metal = { path = "../rmlx-metal" }
 metal = { workspace = true }
 
 [features]
 distributed = ["rmlx-distributed"]
 
-[dev-dependencies]
-rmlx-metal = { path = "../rmlx-metal" }
+[[bench]]
+name = "pipeline_bench"
+harness = false
+path = "../../benches/pipeline_bench.rs"

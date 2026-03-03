@@ -2,6 +2,7 @@
 
 pub mod binary;
 pub mod copy;
+pub mod fused;
 pub mod gemv;
 pub mod indexing;
 pub mod matmul;

@@ -22,6 +22,9 @@ graph TD
     A --> I[self_check.rs — SelfCheckResult]
     A --> J[stream.rs — StreamManager]
     A --> K[lib.rs — MetalError]
+    A --> L[batcher.rs — CommandBatcher]
+    A --> M[exec_graph.rs — ExecGraph]
+    A --> N[icb.rs — IcbBuilder / IcbReplay]
 ```
 
 ### `lib.rs` — Top-Level Re-exports
@@ -553,13 +556,156 @@ pub unsafe fn read_buffer<T>(buffer: &MTLBuffer, count: usize) -> &[T]
 
 ---
 
-## Future Plans
+### `batcher.rs` — `CommandBatcher` (GPU Pipeline Phase 9A)
 
-The following module is planned for Phase 3:
+Coalesces multiple compute dispatches into a single Metal command buffer, reducing per-dispatch CPU overhead. Instead of creating and committing one command buffer per kernel, the batcher accumulates dispatches and commits them as a batch.
+
+This is the foundational building block of the Phase 9 GPU Pipeline.
+
+```rust
+pub struct CommandBatcher {
+    queue: CommandQueue,
+    current_buffer: Option<CommandBuffer>,
+    dispatches_in_flight: usize,
+    max_dispatches_per_buffer: usize,  // default: 64
+    stats: BatcherStats,
+}
+```
+
+| Method | Description |
+|--------|-------------|
+| `new(queue, max_dispatches)` | Creates a new batcher on the given command queue |
+| `begin_batch()` | Starts a new batch (creates a fresh command buffer internally) |
+| `encode(pipeline, buffers, threads)` | Encodes a single compute dispatch into the current batch |
+| `commit_batch()` | Commits the accumulated command buffer to the GPU |
+| `flush()` | Commits the current batch if any dispatches are pending |
+| `stats()` | Returns the current `BatcherStats` snapshot |
+
+**`BatcherStats`:**
+
+```rust
+pub struct BatcherStats {
+    pub dispatches_in_batch: usize,
+    pub encode_duration: Duration,
+    pub batches_committed: u64,
+}
+```
+
+**Global counters** (atomic, lock-free):
+
+```rust
+pub static TOTAL_BATCHES: AtomicU64;
+pub static TOTAL_DISPATCHES: AtomicU64;
+pub static TOTAL_COMMIT_CALLS: AtomicU64;
+```
+
+These counters provide system-wide observability for tuning the `max_dispatches_per_buffer` threshold.
+
+**Example usage:**
+
+```rust
+let mut batcher = CommandBatcher::new(&queue, 32);
+
+batcher.begin_batch();
+for layer in 0..num_layers {
+    batcher.encode(&rmsnorm_pipeline, &norm_bufs, threads);
+    batcher.encode(&attention_pipeline, &attn_bufs, threads);
+    batcher.encode(&ffn_pipeline, &ffn_bufs, threads);
+}
+batcher.commit_batch();
+// 1 command buffer instead of num_layers * 3
+```
+
+---
+
+### `exec_graph.rs` — `ExecGraph` (GPU Pipeline Phase 9B)
+
+Represents a directed acyclic graph (DAG) of command buffer segments connected by `MTLSharedEvent` signal/wait edges. The CPU submits the entire graph in a single shot; the GPU self-sequences the execution order based on event dependencies.
+
+```rust
+pub struct ExecGraph {
+    nodes: Vec<GraphNode>,
+    edges: Vec<(EventToken, EventToken)>,
+    event_pool: Vec<GpuEvent>,
+}
+
+/// Opaque handle to a node in the execution graph.
+pub struct EventToken(usize);
+```
+
+| Method | Description |
+|--------|-------------|
+| `new()` | Creates an empty execution graph |
+| `add_node(encoder_fn)` | Adds a command buffer node and returns an `EventToken` |
+| `add_dependency(from, to)` | Adds an event edge: `to` waits until `from` signals completion |
+| `submit(device, queue)` | Submits the entire graph — encodes signal/wait pairs and commits all buffers |
+| `validate()` | Checks for cycles and returns an error if the graph is not a valid DAG |
+
+**Event-chained execution model:**
+
+Each node in the graph is assigned a `GpuEvent` and a signal value. When a node finishes on the GPU, it signals its event. Dependent nodes encode a `waitForEvent` at the start of their command buffer, so they only begin execution after all predecessors have completed.
+
+```mermaid
+graph LR
+    A["Node 0<br/>RMSNorm"] -->|signal/wait| B["Node 1<br/>Attention"]
+    A -->|signal/wait| C["Node 2<br/>Transfer"]
+    B -->|signal/wait| D["Node 3<br/>FFN"]
+    C -->|signal/wait| D
+```
+
+This allows the GPU to overlap independent nodes (e.g., Attention and Transfer above) without any CPU intervention.
+
+---
+
+### `icb.rs` — Indirect Command Buffers (GPU Pipeline Phase 9E)
+
+For decode steps where tensor shapes are constant (e.g., batch_size=1, seq_len=1), the entire dispatch sequence can be pre-recorded into an `MTLIndirectCommandBuffer` and replayed on subsequent tokens with zero CPU encoding cost.
+
+```rust
+pub struct IcbBuilder {
+    device: Device,
+    indirect_buffer: IndirectCommandBuffer,
+    command_count: usize,
+}
+
+pub struct IcbReplay {
+    indirect_buffer: IndirectCommandBuffer,
+    command_count: usize,
+}
+
+pub struct IcbCache {
+    cache: HashMap<(String, usize, usize), IcbReplay>,
+}
+```
+
+| Type | Method | Description |
+|------|--------|-------------|
+| `IcbBuilder` | `new(device, max_commands)` | Allocates an indirect command buffer with the given capacity |
+| `IcbBuilder` | `record_dispatch(pipeline, buffers, threads)` | Records a single dispatch command |
+| `IcbBuilder` | `finish()` | Finalizes the recording and returns an `IcbReplay` |
+| `IcbReplay` | `execute(cmd_buf)` | Replays the entire recorded sequence into the given command buffer |
+| `IcbReplay` | `command_count()` | Returns the number of recorded commands |
+| `IcbCache` | `new()` | Creates an empty cache |
+| `IcbCache` | `get_or_record(key, record_fn)` | Returns a cached `IcbReplay` or records a new one |
+| `IcbCache` | `invalidate(key)` | Removes a cached entry (e.g., when shapes change) |
+| `IcbCache` | `clear()` | Clears the entire cache |
+
+**Cache key:** `(model_id, batch_size, seq_len)` — whenever any component changes, the cached ICB is invalidated and re-recorded.
+
+**Replay flow:**
+
+```
+First token:  CPU encodes normally -> IcbBuilder records -> IcbReplay cached
+Second token: CPU calls IcbReplay::execute() -> GPU replays from ICB, zero encoding
+```
+
+---
+
+## Future Plans
 
 | Module | Description | Phase |
 |--------|-------------|-------|
-| `resident.rs` | `ResidencySet` management — Metal 3 resource residency management | Phase 3 |
+| `resident.rs` | `ResidencySet` management — Metal 3 resource residency management | Future |
 
 ---
 

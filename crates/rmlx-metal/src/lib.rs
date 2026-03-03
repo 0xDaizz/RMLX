@@ -2,10 +2,13 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod batcher;
 pub mod buffer;
 pub mod command;
 pub mod device;
 pub mod event;
+pub mod exec_graph;
+pub mod icb;
 pub mod library;
 pub mod pipeline;
 pub mod queue;
@@ -16,8 +19,10 @@ pub mod stream;
 pub use metal;
 
 // Re-export core types for convenience
+pub use batcher::CommandBatcher;
 pub use device::{Architecture, GpuDevice};
 pub use event::GpuEvent;
+pub use exec_graph::ExecGraph;
 pub use stream::StreamManager;
 
 /// Errors from Metal operations

@@ -1,6 +1,6 @@
-# Implementation Roadmap — All Phases Complete
+# Implementation Roadmap
 
-The 8-phase implementation roadmap for the rmlx project. All phases have been completed.
+The multi-phase implementation roadmap for the rmlx project. Phases 0-8 are complete; Phase 9 (GPU Pipeline) is in progress.
 
 ---
 
@@ -22,6 +22,7 @@ The 8-phase implementation roadmap for the rmlx project. All phases have been co
 | 7A | Production Hardening | Hardening, observability | Phase 5 | Complete |
 | 7B | VJP Autodiff | VJP autodiff + LoRA fine-tuning | Phase 7A | Complete |
 | 8 | KV Cache + API Surface | KV cache, parallel linear, API ergonomics | Phase 7B | Complete |
+| **9** | **GPU Pipeline** | **CommandBatcher, ExecGraph, fused kernels, ICB** | **Phase 8** | **In Progress** |
 
 ---
 
@@ -60,6 +61,7 @@ graph LR
     P6["Phase 6<br/>Multi-Port<br/>Complete"]
     P7["Phase 7<br/>Production<br/>Complete"]
     P8["Phase 8<br/>KV Cache + API<br/>Complete"]
+    P9["Phase 9<br/>GPU Pipeline<br/>In Progress"]
 
     P0 --> P1
     P0 --> P2
@@ -71,6 +73,7 @@ graph LR
     P4 --> P6
     P5B --> P7
     P7 --> P8
+    P8 --> P9
 
     style P0 fill:#22c55e,color:#fff
     style P1 fill:#22c55e,color:#fff
@@ -82,6 +85,7 @@ graph LR
     style P6 fill:#22c55e,color:#fff
     style P7 fill:#22c55e,color:#fff
     style P8 fill:#22c55e,color:#fff
+    style P9 fill:#f59e0b,color:#fff
 ```
 
 ---
@@ -389,6 +393,135 @@ Add incremental decoding support via KV cache in rmlx-nn and improve API ergonom
 - [x] KV cache: decode step processes only the last token (O(n^2) → O(n))
 - [x] Backward compatible: cache=None preserves existing behavior
 - [x] Codex review: 0 Critical/High issues
+
+---
+
+## Phase 9: GPU Pipeline — CPU-Minimal Execution Architecture (In Progress)
+
+> **Branch:** `feat/gpu-pipeline-cpu-minimal`
+> **Depends on:** Phase 8 (KV Cache + API Surface)
+
+### Motivation
+
+This phase addresses the **primary reason for the RMLX rewrite**. In MLX (and in RMLX Phases 0-8), each kernel dispatch creates its own command buffer, commits it, and returns control to the CPU. For a single decode step of a 60-layer model this produces approximately **30 command buffers per token**, with each one incurring CPU-side scheduling overhead.
+
+The GPU Pipeline phase restructures execution so that multiple operations are batched into a small number of command buffers and chained via GPU-side events, keeping the GPU saturated while the CPU does almost nothing on the hot path.
+
+**Key metric:**
+
+```
+Before: ~30 command buffers/token, CPU active on every dispatch
+After:  ~5-8 command buffers/token, 40-60% latency reduction
+```
+
+### Sub-Phases
+
+| Sub-Phase | Name | Description | Status |
+|:---------:|------|------------|:------:|
+| 9A | CommandBatcher | Coalesce N dispatches into 1 command buffer | In Progress |
+| 9B | ExecGraph | Event-chained DAG execution across command buffers | Planned |
+| 9C | Fused Kernels | RMSNorm+RoPE, SiLU+Mul fusions to reduce dispatch count | Planned |
+| 9D | Pipeline Overlap v2 | Overlap compute/transfer at the command-buffer level (not just queue level) | Planned |
+| 9E | Indirect Command Buffers (ICB) | Static-shape replay via `MTLIndirectCommandBuffer` | Planned |
+
+### Sub-Phase 9A: CommandBatcher
+
+Accumulates multiple compute dispatches into a single command buffer and commits them as a batch.
+
+**Key deliverables:**
+
+- `rmlx-metal/batcher.rs`: `CommandBatcher` struct with `begin_batch()` / `encode()` / `commit_batch()` lifecycle
+- `BatcherStats`: per-batch dispatch count, encode duration, commit count
+- Global atomic counters: `TOTAL_BATCHES`, `TOTAL_DISPATCHES`, `TOTAL_COMMIT_CALLS`
+- Integration with `StreamManager` dual-queue model
+
+```rust
+pub struct CommandBatcher {
+    queue: CommandQueue,
+    current_buffer: Option<CommandBuffer>,
+    dispatches_in_flight: usize,
+    max_dispatches_per_buffer: usize,  // default: 64
+    stats: BatcherStats,
+}
+```
+
+### Sub-Phase 9B: ExecGraph
+
+Represents a DAG of command buffer segments connected by `MTLSharedEvent` signal/wait edges. The CPU submits the entire graph in one shot; the GPU sequences itself.
+
+**Key deliverables:**
+
+- `rmlx-metal/exec_graph.rs`: `ExecGraph` struct and `EventToken` handle
+- `add_node()` / `add_dependency(from, to)` / `submit()` API
+- Event-chained execution: each node signals on completion, dependents wait on that signal
+- Cycle detection at graph construction time
+
+```rust
+pub struct ExecGraph {
+    nodes: Vec<GraphNode>,
+    edges: Vec<(EventToken, EventToken)>,
+    event_pool: Vec<GpuEvent>,
+}
+
+pub struct EventToken(usize);
+```
+
+### Sub-Phase 9C: Fused Kernels
+
+Combine back-to-back operations into single Metal kernel dispatches to eliminate intermediate buffer allocations and reduce dispatch count.
+
+**Target fusions:**
+
+| Fusion | Dispatches Saved | Notes |
+|--------|:----------------:|-------|
+| RMSNorm + RoPE | 2 -> 1 | Common in every transformer layer |
+| SiLU + element-wise Mul | 2 -> 1 | FFN gating pattern |
+| Softmax + Mask | 2 -> 1 | Attention score computation |
+
+### Sub-Phase 9D: Pipeline Overlap v2
+
+Extends Phase 3's dual-queue overlap to operate at the command-buffer granularity within `ExecGraph`. Allows transfer nodes to start as soon as their compute dependencies complete, without waiting for the entire compute batch.
+
+### Sub-Phase 9E: Indirect Command Buffers (ICB)
+
+For decode steps where tensor shapes are constant (batch=1, seq_len=1), pre-record the entire dispatch sequence into an `MTLIndirectCommandBuffer` and replay it on subsequent tokens with zero CPU encoding cost.
+
+**Key deliverables:**
+
+- `rmlx-metal/icb.rs`: `IcbBuilder` for recording dispatch sequences
+- `IcbReplay` for replaying a recorded ICB
+- `IcbCache` keyed by `(model_id, batch_size, seq_len)` for caching recorded ICBs
+- Automatic invalidation when shapes change
+
+```rust
+pub struct IcbBuilder {
+    device: Device,
+    indirect_buffer: IndirectCommandBuffer,
+    command_count: usize,
+}
+
+pub struct IcbReplay {
+    indirect_buffer: IndirectCommandBuffer,
+    command_count: usize,
+}
+
+pub struct IcbCache {
+    cache: HashMap<(String, usize, usize), IcbReplay>,
+}
+```
+
+### Definition of Done (DoD)
+
+- [ ] `cargo fmt --all --check` -- diff 0
+- [ ] `cargo clippy --workspace -- -D warnings` -- 0 warnings
+- [ ] `cargo test --workspace` -- all existing + new tests pass
+- [ ] `test_batcher_coalesce` -- N dispatches produce 1 command buffer
+- [ ] `test_exec_graph_diamond` -- diamond DAG executes in correct order
+- [ ] `test_fused_rmsnorm_rope` -- fused result == sequential result (ulp < 2)
+- [ ] `test_icb_replay_deterministic` -- replayed ICB produces identical output
+- [ ] Benchmark: command buffers per decode step <= 8
+- [ ] Benchmark: decode latency reduction >= 40% vs. Phase 8 baseline
+- [ ] Codex review: event ordering correctness, ICB cache invalidation safety
 
 ---
 
