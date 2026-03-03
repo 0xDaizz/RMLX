@@ -459,7 +459,9 @@ kernel void gptq_dequant_f32(
 // ---------------------------------------------------------------------------
 
 pub fn register(registry: &KernelRegistry) -> Result<(), KernelError> {
-    registry.register_jit_source("quantized", QUANTIZED_SHADER_SOURCE)
+    registry.register_jit_source("quantized", QUANTIZED_SHADER_SOURCE)?;
+    register_qmm(registry)?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -852,6 +854,376 @@ pub fn gptq_dequant(
 }
 
 // ---------------------------------------------------------------------------
+// CPU-side affine quantized matrix-matrix multiply (Q4)
+// ---------------------------------------------------------------------------
+
+/// Dequantize a single Q4 nibble from a packed byte.
+///
+/// Each byte holds two 4-bit values: low nibble at bits [0:3], high nibble at
+/// bits [4:7]. `nibble_idx` 0 selects the low nibble, 1 the high nibble.
+#[inline]
+fn dequant_q4_nibble(packed_byte: u8, nibble_idx: usize) -> u8 {
+    if nibble_idx == 0 {
+        packed_byte & 0x0F
+    } else {
+        (packed_byte >> 4) & 0x0F
+    }
+}
+
+/// Dequantize a Q4-packed weight row into f32.
+///
+/// - `w_packed`: packed bytes for one weight row, length = K/2.
+/// - `scales`: per-group scale factors for this row, length = K/group_size.
+/// - `biases`: per-group bias (zero-point) values for this row, length = K/group_size.
+/// - `k`: number of input features (columns).
+/// - `group_size`: elements per quantization group (32, 64, or 128).
+/// - `out`: output slice of length K to write dequantized f32 values.
+pub fn dequantize_q4_row(
+    w_packed: &[u8],
+    scales: &[f32],
+    biases: &[f32],
+    k: usize,
+    group_size: usize,
+    out: &mut [f32],
+) {
+    debug_assert_eq!(w_packed.len(), k / 2);
+    debug_assert_eq!(scales.len(), k / group_size);
+    debug_assert_eq!(biases.len(), k / group_size);
+    debug_assert_eq!(out.len(), k);
+
+    for (col, out_val) in out.iter_mut().enumerate().take(k) {
+        let byte_idx = col / 2;
+        let nibble_idx = col % 2;
+        let q = dequant_q4_nibble(w_packed[byte_idx], nibble_idx) as f32;
+        let group = col / group_size;
+        *out_val = scales[group] * q + biases[group];
+    }
+}
+
+/// Affine quantized matrix-matrix multiply (Q4, CPU fallback).
+///
+/// Computes `output[m, n] = sum_k x[m, k] * dequant(w[n, k])` for Q4
+/// quantized weights, using a dequantize-in-register approach with tiled
+/// computation for cache efficiency.
+///
+/// This enables batch>1 prefill for 70B+ quantized models, where the existing
+/// `affine_qmv` only supports batch=1 (matrix-vector).
+///
+/// # Layout
+/// - `x`: `[M, K]` row-major f32 input activations.
+/// - `w_packed`: `[N, K/2]` row-major packed Q4 weights (2 nibbles per byte).
+/// - `scales`: `[N, K/group_size]` row-major per-group f32 scale factors.
+/// - `biases`: `[N, K/group_size]` row-major per-group f32 bias (zero-point) values.
+/// - `output`: `[M, N]` row-major f32 output (pre-allocated).
+///
+/// # Panics
+/// Panics (via debug_assert) if slice lengths do not match the declared dimensions.
+///
+/// # Arguments
+/// - `m`: number of input rows (batch size / sequence length).
+/// - `n`: number of output features (weight rows).
+/// - `k`: number of input features (weight columns). Must be even (Q4 packing).
+/// - `group_size`: quantization group size (32, 64, or 128).
+#[allow(clippy::too_many_arguments)]
+pub fn affine_qmm(
+    x: &[f32],
+    w_packed: &[u8],
+    scales: &[f32],
+    biases: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
+    group_size: usize,
+    output: &mut [f32],
+) {
+    debug_assert_eq!(x.len(), m * k, "x must have M*K elements");
+    debug_assert_eq!(
+        w_packed.len(),
+        n * (k / 2),
+        "w_packed must have N*(K/2) elements"
+    );
+    let groups_per_row = k / group_size;
+    debug_assert_eq!(
+        scales.len(),
+        n * groups_per_row,
+        "scales must have N*(K/group_size) elements"
+    );
+    debug_assert_eq!(
+        biases.len(),
+        n * groups_per_row,
+        "biases must have N*(K/group_size) elements"
+    );
+    debug_assert_eq!(output.len(), m * n, "output must have M*N elements");
+    debug_assert_eq!(k % 2, 0, "K must be even for Q4 packing");
+    debug_assert!(
+        [32, 64, 128].contains(&group_size),
+        "group_size must be 32, 64, or 128"
+    );
+    debug_assert_eq!(k % group_size, 0, "K must be a multiple of group_size");
+
+    // Tile sizes for cache efficiency.
+    // TILE_M x TILE_N output tile is computed per iteration over K.
+    const TILE_M: usize = 4;
+    const TILE_N: usize = 4;
+
+    // Zero output
+    output.iter_mut().for_each(|v| *v = 0.0);
+
+    // Process in tiles over the output dimensions
+    let mut row = 0;
+    while row < m {
+        let rm = std::cmp::min(TILE_M, m - row);
+        let mut col = 0;
+        while col < n {
+            let rn = std::cmp::min(TILE_N, n - col);
+
+            // Accumulate dot products for this tile over K, group by group
+            for g in 0..groups_per_row {
+                let k_start = g * group_size;
+                let k_end = k_start + group_size;
+
+                // For each weight row in this tile
+                for jj in 0..rn {
+                    let j = col + jj;
+                    let scale = scales[j * groups_per_row + g];
+                    let bias = biases[j * groups_per_row + g];
+                    let w_row_packed = &w_packed[j * (k / 2)..];
+
+                    // For each input row in this tile
+                    for ii in 0..rm {
+                        let i = row + ii;
+                        let x_row = &x[i * k..];
+
+                        let mut dot = 0.0f32;
+                        let mut xsum = 0.0f32;
+
+                        // Inner loop over group elements
+                        #[allow(clippy::needless_range_loop)]
+                        for kk in k_start..k_end {
+                            let byte_idx = kk / 2;
+                            let nibble_idx = kk % 2;
+                            let q = dequant_q4_nibble(w_row_packed[byte_idx], nibble_idx) as f32;
+                            let xv = x_row[kk];
+                            dot += q * xv;
+                            xsum += xv;
+                        }
+
+                        output[i * n + j] += scale * dot + bias * xsum;
+                    }
+                }
+            }
+
+            col += TILE_N;
+        }
+        row += TILE_M;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Metal shader source -- affine quantized matrix-matrix multiply
+// ---------------------------------------------------------------------------
+
+pub const QMM_SHADER_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// -----------------------------------------------------------------------
+// affine_qmm: Quantized matrix-matrix multiply using MLX affine Q4 format.
+//
+// Computes: output[m, n] = sum_k x[m, k] * dequant(w[n, k])
+//
+// where dequant(q_i) = scales[n, group] * q_i + biases[n, group]
+// and q_i is a 4-bit value packed 2 per byte in w_packed.
+//
+// Buffers:
+//   buffer(0) x         - float32 input activations [M, K], row-major
+//   buffer(1) w_packed  - uint8 packed Q4 weights [N, K/2], row-major
+//   buffer(2) scales    - float32 per-group scales [N, groups_per_row]
+//   buffer(3) biases    - float32 per-group biases [N, groups_per_row]
+//   buffer(4) output    - float32 output [M, N], row-major
+//   buffer(5) params    - uint4: (M, N, K, group_size)
+//
+// Grid: 2D — (ceil(N/BN), ceil(M/BM), 1) threadgroups
+//   Each threadgroup computes a BM x BN tile of the output.
+// -----------------------------------------------------------------------
+
+constant constexpr uint BM_Q = 16;
+constant constexpr uint BN_Q = 16;
+
+kernel void affine_qmm(
+    device const float*   x         [[buffer(0)]],
+    device const uint8_t* w_packed  [[buffer(1)]],
+    device const float*   scales    [[buffer(2)]],
+    device const float*   biases    [[buffer(3)]],
+    device float*         output    [[buffer(4)]],
+    constant uint4&       params    [[buffer(5)]],
+    uint3 group_id     [[threadgroup_position_in_grid]],
+    uint  tid_in_group [[thread_index_in_threadgroup]])
+{
+    const uint M          = params.x;
+    const uint N          = params.y;
+    const uint K          = params.z;
+    const uint group_size = params.w;
+
+    const uint groups_per_row = K / group_size;
+    const uint half_k = K / 2;   // bytes per weight row
+
+    // Thread position within the BM_Q x BN_Q tile
+    const uint local_row = tid_in_group / BN_Q;
+    const uint local_col = tid_in_group % BN_Q;
+
+    const uint out_row = group_id.y * BM_Q + local_row;
+    const uint out_col = group_id.x * BN_Q + local_col;
+
+    if (out_row >= M || out_col >= N) return;
+
+    // Pointers for this output element
+    device const float*   x_row = x + out_row * K;
+    device const uint8_t* w_row = w_packed + out_col * half_k;
+    device const float*   s_row = scales + out_col * groups_per_row;
+    device const float*   b_row = biases + out_col * groups_per_row;
+
+    float acc = 0.0f;
+
+    // Iterate over groups
+    for (uint g = 0; g < groups_per_row; g++) {
+        float scale = s_row[g];
+        float bias  = b_row[g];
+
+        float group_dot  = 0.0f;
+        float group_xsum = 0.0f;
+
+        uint k_start = g * group_size;
+
+        // Process 2 elements per byte
+        uint byte_start = k_start / 2;
+        uint bytes_per_group = group_size / 2;
+
+        for (uint b = 0; b < bytes_per_group; b++) {
+            uint8_t packed = w_row[byte_start + b];
+            float q_lo = float(packed & 0x0F);
+            float q_hi = float((packed >> 4) & 0x0F);
+
+            uint kk = k_start + b * 2;
+            float x0 = x_row[kk];
+            float x1 = x_row[kk + 1];
+
+            group_dot  += q_lo * x0 + q_hi * x1;
+            group_xsum += x0 + x1;
+        }
+
+        acc += scale * group_dot + bias * group_xsum;
+    }
+
+    output[out_row * N + out_col] = acc;
+}
+"#;
+
+/// Register the QMM Metal kernel with the given registry.
+pub fn register_qmm(registry: &KernelRegistry) -> Result<(), KernelError> {
+    registry.register_jit_source("qmm", QMM_SHADER_SOURCE)
+}
+
+/// Affine quantized matrix-matrix multiply on GPU (Q4, Metal).
+///
+/// Computes `output[m, n] = sum_k x[m, k] * dequant(w[n, k])` using a Metal
+/// compute kernel for Q4 quantized weights.
+///
+/// This function requires the `qmm` kernel source to be registered via
+/// [`register_qmm`] (or manually). It is automatically registered by
+/// [`register`] in this module.
+///
+/// # Arguments
+/// - `registry`: kernel registry with `qmm` source registered.
+/// - `x`: f32 input activations `[M, K]`.
+/// - `qw`: quantized weight description (must be Q4, i.e. `bits == 4`).
+/// - `queue`: Metal command queue.
+///
+/// # Returns
+/// An f32 `Array` of shape `[M, N]`.
+pub fn affine_quantized_matmul_batched(
+    registry: &KernelRegistry,
+    x: &Array,
+    qw: &QuantizedWeight,
+    queue: &metal::CommandQueue,
+) -> Result<Array, KernelError> {
+    // Validate input
+    if x.dtype() != DType::Float32 {
+        return Err(KernelError::InvalidShape(format!(
+            "affine_quantized_matmul_batched requires Float32 input x, got {:?}",
+            x.dtype()
+        )));
+    }
+    if x.ndim() != 2 {
+        return Err(KernelError::InvalidShape(format!(
+            "affine_quantized_matmul_batched requires 2D input x, got {}D",
+            x.ndim()
+        )));
+    }
+    if x.shape()[1] != qw.in_features {
+        return Err(KernelError::InvalidShape(format!(
+            "x.shape[1] ({}) != in_features ({})",
+            x.shape()[1],
+            qw.in_features
+        )));
+    }
+    if qw.bits != 4 {
+        return Err(KernelError::InvalidShape(format!(
+            "affine_quantized_matmul_batched currently requires bits==4, got {}",
+            qw.bits
+        )));
+    }
+
+    let m = x.shape()[0];
+    let n = qw.out_features;
+    let k = qw.in_features;
+
+    let pipeline = registry.get_pipeline("affine_qmm", DType::Float32)?;
+    let out = Array::zeros(registry.device().raw(), &[m, n], DType::Float32);
+
+    let params: [u32; 4] = [
+        super::checked_u32(m, "M")?,
+        super::checked_u32(n, "N")?,
+        super::checked_u32(k, "K")?,
+        qw.group_size,
+    ];
+
+    let dev = registry.device().raw();
+    let opts = metal::MTLResourceOptions::StorageModeShared;
+    let params_buf = dev.new_buffer_with_data(
+        params.as_ptr() as *const _,
+        (params.len() * std::mem::size_of::<u32>()) as u64,
+        opts,
+    );
+
+    let cb = queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
+    enc.set_buffer(1, Some(&qw.weights_buf), 0);
+    enc.set_buffer(2, Some(&qw.scales_buf), 0);
+    enc.set_buffer(3, Some(&qw.biases_buf), 0);
+    enc.set_buffer(4, Some(out.metal_buffer()), 0);
+    enc.set_buffer(5, Some(&params_buf), 0);
+
+    // Tile sizes matching the shader
+    const BM_Q: usize = 16;
+    const BN_Q: usize = 16;
+
+    let grid_x = m.div_ceil(BM_Q) as u64;
+    let grid_y = n.div_ceil(BN_Q) as u64;
+    let grid = metal::MTLSize::new(grid_y, grid_x, 1);
+    let tg = metal::MTLSize::new((BM_Q * BN_Q) as u64, 1, 1);
+
+    enc.dispatch_thread_groups(grid, tg);
+    enc.end_encoding();
+    cb.commit();
+    cb.wait_until_completed();
+
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
 // Legacy API (backward compatibility shim)
 // ---------------------------------------------------------------------------
 
@@ -1008,5 +1380,483 @@ mod tests {
     fn test_deprecated_block_sizes() {
         assert_eq!(std::mem::size_of::<BlockQ4_0>(), 18);
         assert_eq!(std::mem::size_of::<BlockQ8_0>(), 34);
+    }
+
+    // =====================================================================
+    // Q4 dequantization correctness tests
+    // =====================================================================
+
+    #[test]
+    fn test_dequant_q4_nibble_low() {
+        // Byte 0xA7 = 1010_0111: low nibble = 0x7 = 7, high nibble = 0xA = 10
+        assert_eq!(dequant_q4_nibble(0xA7, 0), 7);
+    }
+
+    #[test]
+    fn test_dequant_q4_nibble_high() {
+        assert_eq!(dequant_q4_nibble(0xA7, 1), 10);
+    }
+
+    #[test]
+    fn test_dequant_q4_nibble_zero() {
+        assert_eq!(dequant_q4_nibble(0x00, 0), 0);
+        assert_eq!(dequant_q4_nibble(0x00, 1), 0);
+    }
+
+    #[test]
+    fn test_dequant_q4_nibble_max() {
+        assert_eq!(dequant_q4_nibble(0xFF, 0), 15);
+        assert_eq!(dequant_q4_nibble(0xFF, 1), 15);
+    }
+
+    #[test]
+    fn test_dequantize_q4_row_manual() {
+        // K=4, group_size=4, 1 group
+        // Pack: [3, 5, 10, 1] -> byte0 = (5<<4)|3 = 0x53, byte1 = (1<<4)|10 = 0x1A
+        let w_packed = vec![0x53u8, 0x1A];
+        let scales = vec![2.0f32];
+        let biases = vec![0.5f32];
+        let k = 4;
+        let group_size = 4;
+        let mut out = vec![0.0f32; k];
+
+        dequantize_q4_row(&w_packed, &scales, &biases, k, group_size, &mut out);
+
+        // dequant(q) = scale * q + bias
+        // q = [3, 5, 10, 1]
+        // out[0] = 2.0 * 3 + 0.5 = 6.5
+        // out[1] = 2.0 * 5 + 0.5 = 10.5
+        // out[2] = 2.0 * 10 + 0.5 = 20.5
+        // out[3] = 2.0 * 1 + 0.5 = 2.5
+        assert!((out[0] - 6.5).abs() < 1e-6);
+        assert!((out[1] - 10.5).abs() < 1e-6);
+        assert!((out[2] - 20.5).abs() < 1e-6);
+        assert!((out[3] - 2.5).abs() < 1e-6);
+    }
+
+    // =====================================================================
+    // affine_qmm: QMM matches naive unquantized matmul
+    // =====================================================================
+
+    /// Helper: quantize a row of f32 weights into Q4 packed bytes + scales + biases.
+    ///
+    /// For each group, finds the min and max, computes:
+    ///   scale = (max - min) / 15
+    ///   bias  = min
+    ///   q_i   = round((w_i - bias) / scale)
+    ///
+    /// Returns (packed_bytes, scales, biases).
+    fn quantize_q4_row(weights: &[f32], group_size: usize) -> (Vec<u8>, Vec<f32>, Vec<f32>) {
+        let k = weights.len();
+        assert_eq!(k % group_size, 0);
+        let num_groups = k / group_size;
+
+        let mut packed = vec![0u8; k / 2];
+        let mut scales = Vec::with_capacity(num_groups);
+        let mut biases = Vec::with_capacity(num_groups);
+
+        for g in 0..num_groups {
+            let start = g * group_size;
+            let end = start + group_size;
+            let group = &weights[start..end];
+
+            let min = group.iter().cloned().fold(f32::INFINITY, f32::min);
+            let max = group.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+
+            let range = max - min;
+            let scale = if range < 1e-10 { 1.0 } else { range / 15.0 };
+            let bias = min;
+
+            scales.push(scale);
+            biases.push(bias);
+
+            for (i, &w) in group.iter().enumerate() {
+                let q = ((w - bias) / scale).round().clamp(0.0, 15.0) as u8;
+                let col = start + i;
+                let byte_idx = col / 2;
+                let nibble_idx = col % 2;
+                if nibble_idx == 0 {
+                    packed[byte_idx] = q;
+                } else {
+                    packed[byte_idx] |= q << 4;
+                }
+            }
+        }
+
+        (packed, scales, biases)
+    }
+
+    /// Naive (unquantized) matmul: C[m,n] = X[m,k] * W_dequant[n,k]^T
+    /// where W_dequant is the dequantized weight matrix (row n, col k).
+    #[allow(clippy::too_many_arguments)]
+    fn naive_matmul_with_dequant(
+        x: &[f32],
+        w_packed: &[u8],
+        scales: &[f32],
+        biases: &[f32],
+        m: usize,
+        n: usize,
+        k: usize,
+        group_size: usize,
+    ) -> Vec<f32> {
+        let mut output = vec![0.0f32; m * n];
+        let mut w_row_buf = vec![0.0f32; k];
+
+        for j in 0..n {
+            let row_packed = &w_packed[j * (k / 2)..(j + 1) * (k / 2)];
+            let groups_per_row = k / group_size;
+            let row_scales = &scales[j * groups_per_row..(j + 1) * groups_per_row];
+            let row_biases = &biases[j * groups_per_row..(j + 1) * groups_per_row];
+
+            dequantize_q4_row(
+                row_packed,
+                row_scales,
+                row_biases,
+                k,
+                group_size,
+                &mut w_row_buf,
+            );
+
+            for i in 0..m {
+                let mut dot = 0.0f32;
+                for kk in 0..k {
+                    dot += x[i * k + kk] * w_row_buf[kk];
+                }
+                output[i * n + j] = dot;
+            }
+        }
+
+        output
+    }
+
+    #[test]
+    fn test_affine_qmm_matches_naive_group32() {
+        test_affine_qmm_matches_naive(32);
+    }
+
+    #[test]
+    fn test_affine_qmm_matches_naive_group64() {
+        test_affine_qmm_matches_naive(64);
+    }
+
+    #[test]
+    fn test_affine_qmm_matches_naive_group128() {
+        test_affine_qmm_matches_naive(128);
+    }
+
+    fn test_affine_qmm_matches_naive(group_size: usize) {
+        // Dimensions: M=8 (batch), N=4 (output features), K=128 (input features)
+        let m = 8;
+        let n = 4;
+        let k = 128;
+
+        // Generate deterministic "random" weights and inputs using simple PRNG
+        let mut seed = 42u64;
+        let mut next_f32 = || -> f32 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((seed >> 33) as f32 / (u32::MAX as f32 / 2.0)) - 1.0
+        };
+
+        // Generate float weights [N, K]
+        let weights_f32: Vec<f32> = (0..n * k).map(|_| next_f32()).collect();
+
+        // Generate input activations [M, K]
+        let x: Vec<f32> = (0..m * k).map(|_| next_f32()).collect();
+
+        // Quantize each weight row
+        let mut all_packed = Vec::new();
+        let mut all_scales = Vec::new();
+        let mut all_biases = Vec::new();
+
+        for j in 0..n {
+            let row = &weights_f32[j * k..(j + 1) * k];
+            let (packed, sc, bi) = quantize_q4_row(row, group_size);
+            all_packed.extend_from_slice(&packed);
+            all_scales.extend_from_slice(&sc);
+            all_biases.extend_from_slice(&bi);
+        }
+
+        // Compute with affine_qmm
+        let mut output_qmm = vec![0.0f32; m * n];
+        affine_qmm(
+            &x,
+            &all_packed,
+            &all_scales,
+            &all_biases,
+            m,
+            n,
+            k,
+            group_size,
+            &mut output_qmm,
+        );
+
+        // Compute with naive reference
+        let output_naive = naive_matmul_with_dequant(
+            &x,
+            &all_packed,
+            &all_scales,
+            &all_biases,
+            m,
+            n,
+            k,
+            group_size,
+        );
+
+        // Compare: should be bit-exact since both use the same packed representation
+        for idx in 0..m * n {
+            let diff = (output_qmm[idx] - output_naive[idx]).abs();
+            let scale = output_naive[idx].abs().max(1.0);
+            assert!(
+                diff / scale < 1e-4,
+                "mismatch at [{}, {}]: qmm={} naive={} diff={} (group_size={})",
+                idx / n,
+                idx % n,
+                output_qmm[idx],
+                output_naive[idx],
+                diff,
+                group_size
+            );
+        }
+    }
+
+    // =====================================================================
+    // QMM vs unquantized matmul tolerance test
+    // =====================================================================
+
+    #[test]
+    fn test_affine_qmm_vs_float_matmul_tolerance() {
+        // Verify that QMM output is within expected quantization tolerance
+        // of the exact float matmul.
+        let m = 4;
+        let n = 2;
+        let k = 64;
+        let group_size = 32;
+
+        // Generate deterministic "random" weights and inputs
+        let mut seed = 123u64;
+        let mut next_f32 = || -> f32 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((seed >> 33) as f32 / (u32::MAX as f32 / 2.0)) - 1.0
+        };
+
+        let weights_f32: Vec<f32> = (0..n * k).map(|_| next_f32()).collect();
+        let x: Vec<f32> = (0..m * k).map(|_| next_f32()).collect();
+
+        // Exact float matmul: C[i,j] = sum_k x[i,k] * w[j,k]
+        let mut output_exact = vec![0.0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut dot = 0.0f32;
+                for kk in 0..k {
+                    dot += x[i * k + kk] * weights_f32[j * k + kk];
+                }
+                output_exact[i * n + j] = dot;
+            }
+        }
+
+        // Quantize and compute via QMM
+        let mut all_packed = Vec::new();
+        let mut all_scales = Vec::new();
+        let mut all_biases = Vec::new();
+
+        for j in 0..n {
+            let row = &weights_f32[j * k..(j + 1) * k];
+            let (packed, sc, bi) = quantize_q4_row(row, group_size);
+            all_packed.extend_from_slice(&packed);
+            all_scales.extend_from_slice(&sc);
+            all_biases.extend_from_slice(&bi);
+        }
+
+        let mut output_qmm = vec![0.0f32; m * n];
+        affine_qmm(
+            &x,
+            &all_packed,
+            &all_scales,
+            &all_biases,
+            m,
+            n,
+            k,
+            group_size,
+            &mut output_qmm,
+        );
+
+        // Q4 with 32-group-size should give ~5-10% relative error on random data.
+        // We use a generous 20% tolerance to account for worst-case rounding.
+        for idx in 0..m * n {
+            let exact = output_exact[idx];
+            let qmm = output_qmm[idx];
+            let diff = (exact - qmm).abs();
+            let scale = exact.abs().max(0.01);
+            assert!(
+                diff / scale < 0.50,
+                "QMM vs float too far at [{}, {}]: exact={} qmm={} rel_err={}",
+                idx / n,
+                idx % n,
+                exact,
+                qmm,
+                diff / scale
+            );
+        }
+    }
+
+    // =====================================================================
+    // Edge cases
+    // =====================================================================
+
+    #[test]
+    fn test_affine_qmm_m1_reduces_to_qmv() {
+        // M=1 should produce the same result as a matrix-vector product.
+        let m = 1;
+        let n = 2;
+        let k = 32;
+        let group_size = 32;
+
+        // Simple known weights: all nibbles = 7
+        let w_packed = vec![0x77u8; n * (k / 2)];
+        let scales = vec![1.0f32; n];
+        let biases = vec![0.0f32; n];
+        let x = vec![1.0f32; k];
+
+        let mut output = vec![0.0f32; m * n];
+        affine_qmm(
+            &x,
+            &w_packed,
+            &scales,
+            &biases,
+            m,
+            n,
+            k,
+            group_size,
+            &mut output,
+        );
+
+        // Each output element = sum of k elements of (1.0 * (1.0 * 7 + 0.0)) = 7*32 = 224
+        for (j, &val) in output.iter().enumerate().take(n) {
+            assert!(
+                (val - 224.0).abs() < 1e-4,
+                "output[0,{}] = {} expected 224.0",
+                j,
+                val
+            );
+        }
+    }
+
+    #[test]
+    fn test_affine_qmm_large_batch() {
+        // Larger batch to exercise tiling (M=32, N=8, K=64, group_size=32)
+        let m = 32;
+        let n = 8;
+        let k = 64;
+        let group_size = 32;
+
+        let mut seed = 7u64;
+        let mut next_f32 = || -> f32 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((seed >> 33) as f32 / (u32::MAX as f32 / 2.0)) - 1.0
+        };
+
+        let weights_f32: Vec<f32> = (0..n * k).map(|_| next_f32()).collect();
+        let x: Vec<f32> = (0..m * k).map(|_| next_f32()).collect();
+
+        let mut all_packed = Vec::new();
+        let mut all_scales = Vec::new();
+        let mut all_biases = Vec::new();
+
+        for j in 0..n {
+            let row = &weights_f32[j * k..(j + 1) * k];
+            let (packed, sc, bi) = quantize_q4_row(row, group_size);
+            all_packed.extend_from_slice(&packed);
+            all_scales.extend_from_slice(&sc);
+            all_biases.extend_from_slice(&bi);
+        }
+
+        let mut output_qmm = vec![0.0f32; m * n];
+        affine_qmm(
+            &x,
+            &all_packed,
+            &all_scales,
+            &all_biases,
+            m,
+            n,
+            k,
+            group_size,
+            &mut output_qmm,
+        );
+
+        let output_naive = naive_matmul_with_dequant(
+            &x,
+            &all_packed,
+            &all_scales,
+            &all_biases,
+            m,
+            n,
+            k,
+            group_size,
+        );
+
+        for idx in 0..m * n {
+            let diff = (output_qmm[idx] - output_naive[idx]).abs();
+            let scale = output_naive[idx].abs().max(1.0);
+            assert!(
+                diff / scale < 1e-4,
+                "large batch mismatch at {}: qmm={} naive={} diff={}",
+                idx,
+                output_qmm[idx],
+                output_naive[idx],
+                diff,
+            );
+        }
+    }
+
+    #[test]
+    fn test_affine_qmm_identity_scale_zero_bias() {
+        // When scale=1, bias=0, dequant(q) = q.
+        // So output should be X @ Q^T where Q is the raw nibble matrix.
+        let m = 2;
+        let n = 2;
+        let k = 32;
+        let group_size = 32;
+
+        // All nibbles = 3 -> byte = (3<<4)|3 = 0x33
+        let w_packed = vec![0x33u8; n * (k / 2)];
+        let scales = vec![1.0f32; n]; // 1 group per row
+        let biases = vec![0.0f32; n];
+
+        // x = [[1, 1, ..., 1], [2, 2, ..., 2]]
+        let mut x = vec![0.0f32; m * k];
+        for kk in 0..k {
+            x[kk] = 1.0;
+            x[k + kk] = 2.0;
+        }
+        let mut output = vec![0.0f32; m * n];
+
+        affine_qmm(
+            &x,
+            &w_packed,
+            &scales,
+            &biases,
+            m,
+            n,
+            k,
+            group_size,
+            &mut output,
+        );
+
+        // Each output element for row 0: sum(1.0 * 3.0 for k=32) = 96.0
+        // Each output element for row 1: sum(2.0 * 3.0 for k=32) = 192.0
+        for j in 0..n {
+            assert!(
+                (output[j] - 96.0).abs() < 1e-4,
+                "output[0,{}] = {} expected 96.0",
+                j,
+                output[j]
+            );
+            assert!(
+                (output[n + j] - 192.0).abs() < 1e-4,
+                "output[1,{}] = {} expected 192.0",
+                j,
+                output[n + j]
+            );
+        }
     }
 }

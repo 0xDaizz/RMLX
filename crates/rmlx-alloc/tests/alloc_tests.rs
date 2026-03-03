@@ -156,7 +156,7 @@ fn test_allocator_block_limit() {
         None => return,
     };
 
-    let mut allocator = MetalAllocator::new(Arc::clone(&device), 1024 * 1024);
+    let allocator = MetalAllocator::new(Arc::clone(&device), 1024 * 1024);
     allocator.set_block_limit(16384);
 
     // First allocation should succeed
