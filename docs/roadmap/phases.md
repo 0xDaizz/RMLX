@@ -1,6 +1,6 @@
-# Implementation Roadmap — All Phases Complete
+# Implementation Roadmap — Phases 0-9B Complete
 
-The 8-phase implementation roadmap for the rmlx project. All phases have been completed.
+The rmlx project implementation roadmap. All phases have been completed through 9B-opt. Implementation phases: 9 (all complete through 9B-opt).
 
 ---
 
@@ -22,6 +22,8 @@ The 8-phase implementation roadmap for the rmlx project. All phases have been co
 | 7A | Production Hardening | Hardening, observability | Phase 5 | Complete |
 | 7B | VJP Autodiff | VJP autodiff + LoRA fine-tuning | Phase 7A | Complete |
 | 8 | KV Cache + API Surface | KV cache, parallel linear, API ergonomics | Phase 7B | Complete |
+| 9A | GPU Pipeline — ExecGraph | CommandBatcher, ExecGraph, ICB, `_into_cb()` pattern | Phase 8 | Complete |
+| 9B-opt | GPU Pipeline — Optimization | Weight pre-caching, contiguous transpose, 16.15x speedup | Phase 9A | Complete |
 
 ---
 
@@ -43,6 +45,8 @@ The 8-phase implementation roadmap for the rmlx project. All phases have been co
 | Phase 7A: Production hardening / observability | 0fa70bb | 98 tests | Complete |
 | Phase 7B: VJP autodiff + LoRA fine-tuning | 025ed8f | 108 tests | Complete |
 | Phase 8: KV Cache + API Surface | squash merge | 339 tests | Complete |
+| Phase 9A: GPU Pipeline — ExecGraph | Phase 9 merge commit | 339+ tests | Complete |
+| Phase 9B-opt: GPU Pipeline — Optimization | optimization merge | 339+ tests | Complete |
 
 ---
 
@@ -60,6 +64,7 @@ graph LR
     P6["Phase 6<br/>Multi-Port<br/>Complete"]
     P7["Phase 7<br/>Production<br/>Complete"]
     P8["Phase 8<br/>KV Cache + API<br/>Complete"]
+    P9["Phase 9<br/>GPU Pipeline<br/>Complete"]
 
     P0 --> P1
     P0 --> P2
@@ -71,6 +76,7 @@ graph LR
     P4 --> P6
     P5B --> P7
     P7 --> P8
+    P8 --> P9
 
     style P0 fill:#22c55e,color:#fff
     style P1 fill:#22c55e,color:#fff
@@ -82,6 +88,7 @@ graph LR
     style P6 fill:#22c55e,color:#fff
     style P7 fill:#22c55e,color:#fff
     style P8 fill:#22c55e,color:#fff
+    style P9 fill:#22c55e,color:#fff
 ```
 
 ---
@@ -389,6 +396,89 @@ Add incremental decoding support via KV cache in rmlx-nn and improve API ergonom
 - [x] KV cache: decode step processes only the last token (O(n^2) → O(n))
 - [x] Backward compatible: cache=None preserves existing behavior
 - [x] Codex review: 0 Critical/High issues
+
+---
+
+## Phase 9: GPU Pipeline — Complete
+
+### Phase 9A: ExecGraph + CommandBatcher
+
+#### Goal
+
+Eliminate per-op CPU overhead by batching multiple GPU operations into minimal command buffers using ExecGraph.
+
+#### Key Deliverables
+
+- `rmlx-metal`: `CommandBatcher` — batches encoder work into shared command buffers
+- `rmlx-metal`: `ExecGraph` — pre-built execution graph that replays deterministic op sequences
+- `rmlx-metal`: `IcbBuilder`/`IcbReplay`/`IcbCache` — Indirect Command Buffer support
+- `rmlx-core`: `_into_cb()` pattern for all 14 ops — encode into caller's command buffer
+- `rmlx-nn`: `forward_graph()` for Attention, TransformerBlock, TransformerModel
+- `rmlx-nn`: `forward_into_cb()` for Linear
+- Benchmark: 65 CBs/layer → 5 CBs/layer (92.3% reduction)
+
+### Phase 9B-opt: Weight Pre-caching + Optimization
+
+#### Goal
+
+Pre-cache contiguous transposed weight matrices to eliminate transpose overhead during inference.
+
+#### Key Deliverables
+
+- `rmlx-nn`: `prepare_weight_t()` / `weight_transposed_contiguous()` for Linear
+- `rmlx-nn`: `prepare_weights_for_graph()` for TransformerModel/Block/Attention/FeedForward
+- Benchmark: 110.4ms → 6.8ms per layer (16.15x speedup)
+- Numerical parity: max_diff=6.4e-6
+
+#### Definition of Done (DoD)
+
+- [x] 16.15x speedup (110.4ms → 6.8ms)
+- [x] 92.3% CB reduction (65 → 5)
+- [x] Numerical parity (max_diff=6.4e-6)
+- [x] All 339+ tests passing
+
+---
+
+## Phase 10: Flash Attention + Paged KV Cache — Planned
+
+### Goal
+
+Implement Flash Attention 2 with tiled K/V processing and paged attention for dynamic KV cache management.
+
+### Key Deliverables
+
+- Flash Attention 2 Metal kernel (tiled Q/K/V with online softmax)
+- Paged KV cache with block-level allocation/deallocation
+- Integration with ExecGraph pipeline
+
+---
+
+## Phase 11: Continuous Batching + Serving Optimization — Planned
+
+### Goal
+
+Add continuous batching for production serving and optimize the full inference pipeline.
+
+### Key Deliverables
+
+- Continuous batching scheduler (in-flight request management)
+- Speculative decoding (draft + verify pattern)
+- Request-level KV cache management
+
+---
+
+## Phase 12: Advanced Quantization + Model Support — Planned
+
+### Goal
+
+Expand quantization format support and add more model architectures.
+
+### Key Deliverables
+
+- GGUF format support
+- AWQ/GPTQ quantization
+- FP8 support
+- Additional model architectures
 
 ---
 

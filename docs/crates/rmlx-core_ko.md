@@ -4,7 +4,7 @@
 
 `rmlx-core`는 Metal GPU 연산 엔진으로, 데이터 타입, N차원 배열, 커널 레지스트리, GPU 연산 커널, 자동 미분, LoRA 파인튜닝, 런타임 메트릭, 구조화된 로깅, 수치 안정성 감시, 그레이스풀 셧다운 등을 제공합니다.
 
-> **상태:** DType, Array, KernelRegistry, 10종의 연산 커널, VJP 자동 미분, LoRA, 로깅, 메트릭, PrecisionGuard, ShutdownSignal이 모두 구현되어 있습니다.
+> **상태:** DType, Array, KernelRegistry, 14종의 op 모듈 (SDPA 및 SiLU/SwiGLU 포함), VJP 자동 미분, LoRA, 로깅, 메트릭, PrecisionGuard, ShutdownSignal이 모두 구현되어 있습니다.
 
 ---
 
@@ -18,7 +18,7 @@ rmlx-core/src/
 ├── kernels/
 │   └── mod.rs          # KernelRegistry (AOT → JIT → PipelineCache)
 ├── ops/
-│   ├── mod.rs          # 10종 커널 등록 (register_all)
+│   ├── mod.rs          # 14종 커널 등록 (register_all)
 │   ├── copy.rs         # 버퍼 복사
 │   ├── binary.rs       # add, mul, sub, div
 │   ├── reduce.rs       # sum, max, argmax, row_sum
@@ -28,7 +28,9 @@ rmlx-core/src/
 │   ├── gemv.rs         # 행렬-벡터 곱
 │   ├── matmul.rs       # 행렬 곱셈 (GEMM)
 │   ├── quantized.rs    # 양자화 행렬 곱 (Q4_0, Q4_1, Q8_0)
-│   └── indexing.rs     # gather, scatter
+│   ├── indexing.rs     # gather, scatter
+│   ├── silu.rs         # SiLU 활성화 + fused SwiGLU
+│   ├── sdpa.rs         # Fused Scaled Dot-Product Attention
 ├── vjp.rs              # 테이프 기반 역전파 자동 미분
 ├── lora.rs             # LoRA 파인튜닝
 ├── logging.rs          # 구조화된 로깅
@@ -123,7 +125,7 @@ unsafe fn to_vec<T: HasDType + Clone>(&self) -> Vec<T>
 
 ## ops/ — 연산 커널
 
-10종의 Metal GPU 커널을 `KernelRegistry`에 등록합니다. `register_all()`로 일괄 등록합니다.
+14종의 op 모듈을 `KernelRegistry`에 등록합니다. `register_all()`로 일괄 등록합니다.
 
 ```rust
 pub fn register_all(registry: &KernelRegistry) -> Result<(), KernelError> {
@@ -137,6 +139,8 @@ pub fn register_all(registry: &KernelRegistry) -> Result<(), KernelError> {
     matmul::register(registry)?;
     quantized::register(registry)?;
     indexing::register(registry)?;
+    silu::register(registry)?;
+    sdpa::register(registry)?;
     Ok(())
 }
 ```
@@ -153,6 +157,76 @@ pub fn register_all(registry: &KernelRegistry) -> Result<(), KernelError> {
 | `matmul` | GEMM | 범용 행렬 곱셈 |
 | `quantized` | QMM | Q4_0/Q4_1/Q8_0 양자화 행렬 곱 |
 | `indexing` | Gather, Scatter | 인덱싱 연산 |
+| `silu` | SiLU, SiLU+Gate (SwiGLU) | Sigmoid Linear Unit 활성화 + fused SwiGLU gate |
+| `sdpa` | SDPA | Fused Scaled Dot-Product Attention (Flash Attention 스타일) |
+
+### silu.rs — SiLU 활성화 + Fused SwiGLU
+
+SiLU 활성화 (`silu(x) = x * sigmoid(x)`)와 SwiGLU FFN을 위한 fused SiLU*gate를 제공합니다.
+
+| 함수 | 설명 |
+|------|------|
+| `silu(registry, input, queue)` | 원소별 SiLU 활성화 |
+| `silu_gate(registry, input, gate, queue)` | Fused `silu(input) * gate` (SwiGLU 패턴) |
+
+**벡터화:**
+- f32: 스레드당 2개 원소
+- f16/bf16: 수치적으로 안정적인 sigmoid를 사용하여 스레드당 4개 원소
+
+**지원 dtype:** Float32, Float16, Bfloat16
+
+### sdpa.rs — Fused Scaled Dot-Product Attention
+
+online softmax를 사용한 `softmax(Q @ K^T / sqrt(d) + mask) @ V` 단일 커널 연산입니다.
+전체 `[N, S]` 스코어 행렬을 디바이스 메모리에 구체화하는 것을 방지합니다.
+
+| 함수 | 설명 |
+|------|------|
+| `sdpa(registry, q, k, v, mask, scale, queue)` | 단일 헤드 fused SDPA: Q[N,D], K[S,D], V[S,D] -> O[N,D] |
+| `sdpa_batched(registry, q_heads, k_heads, v_heads, mask, scale, queue)` | GQA를 지원하는 멀티 헤드 배치 SDPA |
+
+**핵심 최적화:**
+- 중간 스코어 행렬 구체화 없음 -- 스코어는 threadgroup 공유 메모리에만 존재
+- K 블록 간 running max/normalizer를 사용한 online softmax
+- 어텐션 헤드당 단일 커맨드 버퍼
+- 타일링: Br=32 (쿼리 블록) x Bc=32 (키 블록)
+
+**제약 조건:**
+- head_dim <= 128 (fused 경로); 더 큰 차원은 unfused로 폴백
+- 지원 dtype: Float32, Float16
+
+### ExecMode, CommandBufferHandle, LaunchResult (`ops/mod.rs`)
+
+비동기 커널 디스패치 제어를 위한 타입들입니다.
+
+#### ExecMode
+
+| 변형 | 설명 |
+|------|------|
+| `Sync` | 즉시 커밋하고 대기 (기본값, 안전) |
+| `Async` | 대기 없이 커밋; 호출자가 동기화 관리 |
+
+#### CommandBufferHandle
+
+비동기 커맨드 버퍼 완료를 추적하기 위한 핸들입니다.
+
+| 메서드 | 설명 |
+|--------|------|
+| `is_complete()` | 비블로킹 완료 확인 |
+| `wait()` | GPU 작업 완료까지 블로킹 |
+| `wait_timeout(timeout)` | 타임아웃 블로킹; 완료 시 true 반환 |
+
+#### LaunchResult
+
+출력 `Array`를 `CommandBufferHandle`과 함께 래핑합니다. 출력에 접근하는 유일한 방법은
+`into_array()`로, GPU 완료까지 블로킹하여 불완전한 데이터 읽기를 방지합니다.
+
+| 메서드 | 설명 |
+|--------|------|
+| `is_complete()` | 비블로킹 완료 확인 |
+| `into_array()` | 완료까지 블로킹 후 출력 Array 반환 |
+| `into_array_timeout(timeout)` | 타임아웃 블로킹; `Ok(Array)` 또는 `Err(self)` 반환 |
+| `handle()` | 폴링을 위한 완료 핸들 접근 |
 
 ---
 

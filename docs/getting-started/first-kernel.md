@@ -295,3 +295,4 @@ For the full implementation plan, see the [Implementation Roadmap](../roadmap/ph
 - **Phase 2** adds 10 core LLM kernels including matmul, softmax, and RoPE
 - **Phase 3** implements MTLSharedEvent-based synchronization and the dual queue pipeline
 - **Phase 4** adds MoE kernels for Expert Parallelism
+- [GPU Pipeline](../gpu-pipeline.md) — Learn how ExecGraph batches operations for 16.15x speedup
