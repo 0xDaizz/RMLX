@@ -87,10 +87,14 @@ fn verify_feature_matrix_types() {
 }
 
 /// Verify that pipeline wait_layer_complete increments gpu_sync_calls counter.
+///
+/// NOTE: global_counters() is shared across all parallel tests, so another test
+/// may call reset() between our action and our snapshot. We use a retry loop to
+/// make this robust: if the snapshot shows 0 it means a parallel test reset
+/// raced us, so we re-run the operation.
 #[test]
 fn verify_pipeline_gpu_sync_counter() {
     let counters = global_counters();
-    counters.reset();
 
     let config = PipelineConfig {
         num_layers: 2,
@@ -99,15 +103,25 @@ fn verify_pipeline_gpu_sync_counter() {
     };
     let pipeline = LayerPipeline::new(config);
 
-    // wait_layer_complete on a layer with no ticket should still record gpu_sync
-    let _ = pipeline.wait_layer_complete(0, Duration::from_millis(100));
+    // Try up to 3 times to avoid flakes from parallel test resets
+    for attempt in 0..3 {
+        let before = counters.snapshot().gpu_sync_calls;
+        let _ = pipeline.wait_layer_complete(0, Duration::from_millis(100));
+        let after = counters.snapshot().gpu_sync_calls;
 
-    let snap = counters.snapshot();
-    assert!(
-        snap.gpu_sync_calls >= 1,
-        "wait_layer_complete must increment gpu_sync_calls, got {}",
-        snap.gpu_sync_calls
-    );
+        if after > before {
+            return; // success
+        }
+        // A parallel test likely called reset() — retry
+        if attempt == 2 {
+            assert!(
+                after > before,
+                "wait_layer_complete must increment gpu_sync_calls, before={} after={} (3 attempts)",
+                before,
+                after
+            );
+        }
+    }
 }
 
 /// Verify that async dispatch/combine counters are properly wired via direct recording.
