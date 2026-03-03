@@ -2,7 +2,7 @@
 
 > **A Rust-based Metal GPU ML framework optimized for Apple Silicon**
 >
-> Status: All Phases complete (0-9B-opt + S1-S5 + Audit Remediation) (534 tests, 0 failures) | License: MIT OR Apache-2.0 | Rust 1.80+ | macOS (Apple Silicon)
+> Status: All Phases complete (0-9B-opt + S1-S5 + Audit Remediation) (534 tests, 0 failures) | License: MIT | Rust 1.80+ | macOS (Apple Silicon)
 
 ---
 

@@ -254,7 +254,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.80"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 
 [workspace.dependencies]
 metal = "0.31"
