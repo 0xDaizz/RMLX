@@ -26,11 +26,11 @@ use rmlx_nn::{Attention, AttentionConfig, FeedForward, Linear, LinearConfig, Tra
 // Configuration
 // ---------------------------------------------------------------------------
 
-const HIDDEN_SIZE: usize = 2048;
+const HIDDEN_SIZE: usize = 4096;
 const NUM_HEADS: usize = 32;
 const NUM_KV_HEADS: usize = 8;
-const HEAD_DIM: usize = 64;
-const INTERMEDIATE_DIM: usize = 5504; // Llama-style 2.7x hidden
+const HEAD_DIM: usize = 128;
+const INTERMEDIATE_DIM: usize = 11008; // Llama-style 2.7x hidden
 const SEQ_LEN: usize = 1; // Single-token decode (latency-sensitive)
 const RMS_NORM_EPS: f32 = 1e-5;
 const ROPE_THETA: f32 = 10000.0;

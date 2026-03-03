@@ -17,9 +17,9 @@ use crate::kernels::{KernelError, KernelRegistry};
 use metal::MTLSize;
 
 // Tiling parameters — must match the Metal shader constants.
-const BR: usize = 32; // Query block rows
-const _BC: usize = 32; // Key/Value block columns (used in shader only)
-const THREADS_PER_TG: u64 = 256; // Threads per threadgroup
+const BR: usize = 16; // Query block rows
+const _BC: usize = 16; // Key/Value block columns (used in shader only)
+const THREADS_PER_TG: u64 = 128; // Threads per threadgroup
 
 /// Metal shader for fused SDPA.
 ///
@@ -31,8 +31,8 @@ pub const SDPA_SHADER_SOURCE: &str = r#"
 using namespace metal;
 
 // Tile sizes — keep in sync with Rust constants.
-constant constexpr uint Br = 32;
-constant constexpr uint Bc = 32;
+constant constexpr uint Br = 16;
+constant constexpr uint Bc = 16;
 constant constexpr uint SIMD_SIZE = 32;
 
 // ─── SIMD reduction helpers ─────────────────────────────────────────────────
