@@ -1,25 +1,14 @@
 # Architecture Overview
 
-RMLX is a layered architecture composed of five layers. All Phases (0 through 9B-opt) have been completed and the system is fully implemented. Each layer has clear responsibility boundaries and is separated into individual Cargo crates. Phase 7 additions include VJP autodiff, LoRA fine-tuning, and production hardening (structured logging, metrics, precision guard, graceful shutdown). Phase 9 additions include ExecGraph (5 CBs/layer, 92.3% reduction), CommandBatcher, Indirect Command Buffers, and weight pre-caching for 16.15x speedup.
+RMLX is a layered architecture composed of four layers. All Phases (0 through 9B-opt) have been completed and the system is fully implemented. Each layer has clear responsibility boundaries and is separated into individual Cargo crates. Phase 7 additions include VJP autodiff, LoRA fine-tuning, and production hardening (structured logging, metrics, precision guard, graceful shutdown). Phase 9 additions include ExecGraph (5 CBs/layer, 92.3% reduction), CommandBatcher, Indirect Command Buffers, and weight pre-caching for 16.15x speedup.
 
 ---
 
 ## Full Layer Diagram
 
 ```
-┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐
-  ~/rmlx-serve/ (separate repository — references rmlx as a Cargo dependency)
-│ ┌─────────────┐  ┌──────────────┐  ┌──────────────┐  ┌───────────────────┐ │
-  │  Model Zoo   │  │  Scheduler   │  │  KV Cache    │  │ PP/TP/EP         │
-│ │ (safetensors)│  │ (continuous  │  │  Manager     │  │ Orchestrator     │ │
-  │              │  │  batching)   │  │  (paged)     │  │                  │
-│ └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └────────┬─────────┘ │
- ─ ─ ─ ─┼─ ─ ─ ─ ─ ─ ─ ─ ┼─ ─ ─ ─ ─ ─ ─ ─┼─ ─ ─ ─ ─ ─ ─ ─ ─┼─ ─ ─ ─ ─ ┘
-         │  Cargo dep:      │  rmlx = {       │  path = "../rmlx" │
-         │  rmlx-nn         │  rmlx-distributed                   │
-┌────────┼─────────────────┼─────────────────┼───────────────────┼───────────┐
-│        ▼                 ▼                 ▼                   ▼           │
-│  ~/rmlx/ (this repository — framework only)                               │
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  ~/rmlx/ (this repository — ML framework)                                  │
 │                        rmlx-core (compute engine)                          │
 │  ┌──────────────────────────────────────────────────────────────────────┐   │
 │  │                      Compute Graph / Op Registry (14 op modules)     │   │
@@ -78,22 +67,7 @@ RMLX is a layered architecture composed of five layers. All Phases (0 through 9B
 
 ## Layer Details
 
-### 1. Application Layer — rmlx-serve (Separate Repository)
-
-Handles application logic required for model serving. References the RMLX framework as a Cargo dependency.
-
-| Component | Role |
-|-----------|------|
-| **Model Zoo** | Loading model weights in safetensors format and quantization decoding |
-| **Scheduler** | Request scheduling based on continuous batching |
-| **KV Cache Manager** | Paged KV cache management (dynamic allocation/deallocation) |
-| **PP/TP/EP Orchestrator** | Pipeline/Tensor/Expert Parallelism orchestration |
-
-**Rationale for separation**: The framework (`rmlx`) and the application (`rmlx-serve`) have different release cycles, dependencies, and testing strategies. `rmlx` can be reused by other applications (training, benchmark tools, etc.).
-
----
-
-### 2. Compute Engine — rmlx-core
+### 1. Compute Engine — rmlx-core
 
 The core engine responsible for computation graphs and kernel dispatch.
 
@@ -119,7 +93,7 @@ Reduces per-op CPU overhead by batching multiple GPU operations into minimal com
 
 ---
 
-### 3. Metal Pipeline Layer
+### 2. Metal Pipeline Layer
 
 Manages the Metal GPU execution pipeline. The rmlx-metal crate implements this layer.
 
@@ -133,7 +107,7 @@ The dual queue architecture was validated in PoC Phase 3.6. It maximizes pipelin
 
 ---
 
-### 4. Sync & Memory Layer
+### 3. Sync & Memory Layer
 
 Handles synchronization and memory management. rmlx-metal (events) and rmlx-alloc (allocator, buffer pool) implement this layer.
 
@@ -147,7 +121,7 @@ The zero-copy path is limited to the RDMA communication hot path. Copies during 
 
 ---
 
-### 5. Communication Layer — rmlx-rdma
+### 4. Communication Layer — rmlx-rdma
 
 Handles inter-node communication via Thunderbolt 5 RDMA.
 
