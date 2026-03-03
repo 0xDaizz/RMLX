@@ -27,8 +27,8 @@ using namespace metal;
 // Helpers
 // -----------------------------------------------------------------------
 
-constexpr uint SIMD_SIZE = 32;
-constexpr uint N_READS  = 4;
+constant constexpr uint SIMD_SIZE = 32;
+constant constexpr uint N_READS  = 4;
 
 // NaN-propagating min/max helpers
 static inline float nan_max(float a, float b) {

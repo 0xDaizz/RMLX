@@ -29,8 +29,8 @@ using namespace metal;
 // SIMD cross-simdgroup reduction helpers
 // ---------------------------------------------------------------------------
 
-constexpr uint SIMD_SIZE = 32;
-constexpr uint N_READS   = 4;
+constant constexpr uint SIMD_SIZE = 32;
+constant constexpr uint N_READS   = 4;
 
 // Reduce max across all simdgroups in the threadgroup.
 // After this call every thread has the same `max_val` and `normalizer`.
