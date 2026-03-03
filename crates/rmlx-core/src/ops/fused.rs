@@ -214,22 +214,38 @@ pub fn batched_qkv_proj_into(
 ) -> Result<(Array, Array, Array), KernelError> {
     // Ensure all inputs are contiguous for the GEMM kernel (assumes row-major layout).
     let input = if input.is_contiguous() {
-        input.view(input.shape().to_vec(), input.strides().to_vec(), input.offset())
+        input.view(
+            input.shape().to_vec(),
+            input.strides().to_vec(),
+            input.offset(),
+        )
     } else {
         super::copy::copy_into_cb(registry, input, cb)?
     };
     let wq_t = if wq_t.is_contiguous() {
-        wq_t.view(wq_t.shape().to_vec(), wq_t.strides().to_vec(), wq_t.offset())
+        wq_t.view(
+            wq_t.shape().to_vec(),
+            wq_t.strides().to_vec(),
+            wq_t.offset(),
+        )
     } else {
         super::copy::copy_into_cb(registry, wq_t, cb)?
     };
     let wk_t = if wk_t.is_contiguous() {
-        wk_t.view(wk_t.shape().to_vec(), wk_t.strides().to_vec(), wk_t.offset())
+        wk_t.view(
+            wk_t.shape().to_vec(),
+            wk_t.strides().to_vec(),
+            wk_t.offset(),
+        )
     } else {
         super::copy::copy_into_cb(registry, wk_t, cb)?
     };
     let wv_t = if wv_t.is_contiguous() {
-        wv_t.view(wv_t.shape().to_vec(), wv_t.strides().to_vec(), wv_t.offset())
+        wv_t.view(
+            wv_t.shape().to_vec(),
+            wv_t.strides().to_vec(),
+            wv_t.offset(),
+        )
     } else {
         super::copy::copy_into_cb(registry, wv_t, cb)?
     };

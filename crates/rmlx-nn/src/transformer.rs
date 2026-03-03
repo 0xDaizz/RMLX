@@ -130,7 +130,11 @@ impl FeedForward {
         queue: &metal::CommandQueue,
     ) -> Result<(), KernelError> {
         match self {
-            FeedForward::Dense { gate_proj, up_proj, down_proj } => {
+            FeedForward::Dense {
+                gate_proj,
+                up_proj,
+                down_proj,
+            } => {
                 gate_proj.prepare_weight_t(registry, queue)?;
                 up_proj.prepare_weight_t(registry, queue)?;
                 down_proj.prepare_weight_t(registry, queue)?;
@@ -167,8 +171,7 @@ impl FeedForward {
                 let cb5 = graph.command_buffer();
                 let gate_out = gate_proj.forward_into_cb(normed, registry, cb5)?;
                 let up_out = up_proj.forward_into_cb(normed, registry, cb5)?;
-                let hidden =
-                    ops::fused::fused_silu_mul_into_cb(registry, &gate_out, &up_out, cb5)?;
+                let hidden = ops::fused::fused_silu_mul_into_cb(registry, &gate_out, &up_out, cb5)?;
                 let t5 = graph.submit_batch();
 
                 // CB6: down_proj + residual
@@ -179,9 +182,9 @@ impl FeedForward {
             }
             FeedForward::MoE(moe) => {
                 // MoE: flush pending graph work, fall back to per-op dispatch
-                graph.sync().map_err(|e| {
-                    KernelError::InvalidShape(format!("MoE graph sync: {e}"))
-                })?;
+                graph
+                    .sync()
+                    .map_err(|e| KernelError::InvalidShape(format!("MoE graph sync: {e}")))?;
                 graph.reset();
                 let ffn_out = moe.forward(normed, registry, queue)?;
                 ops::binary::add(registry, residual, &ffn_out, queue)
@@ -641,7 +644,14 @@ impl TransformerModel {
         for (i, layer) in self.layers.iter().enumerate() {
             let layer_cache = cache.as_mut().map(|c| &mut c[i]);
             x = layer.forward_graph(
-                &x, cos_freqs, sin_freqs, mask, layer_cache, registry, &mut graph, queue,
+                &x,
+                cos_freqs,
+                sin_freqs,
+                mask,
+                layer_cache,
+                registry,
+                &mut graph,
+                queue,
             )?;
             // Sync and reset for next layer — this is the ONLY CPU wait per layer
             graph.sync_and_reset().map_err(|e| {

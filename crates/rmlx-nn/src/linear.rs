@@ -220,9 +220,10 @@ impl Linear {
         registry: &KernelRegistry,
         queue: &metal::CommandQueue,
     ) -> Result<(), KernelError> {
-        let weight = self.weight.as_ref().ok_or_else(|| {
-            KernelError::InvalidShape("Linear: weights not loaded".to_string())
-        })?;
+        let weight = self
+            .weight
+            .as_ref()
+            .ok_or_else(|| KernelError::InvalidShape("Linear: weights not loaded".to_string()))?;
         let w_t = weight.view(
             vec![self.config.in_features, self.config.out_features],
             vec![1, self.config.in_features],
@@ -273,7 +274,11 @@ impl Linear {
 
         // Use pre-cached contiguous transposed weight if available
         let w_t = if let Some(ref cached) = self.weight_t_cached {
-            cached.view(cached.shape().to_vec(), cached.strides().to_vec(), cached.offset())
+            cached.view(
+                cached.shape().to_vec(),
+                cached.strides().to_vec(),
+                cached.offset(),
+            )
         } else {
             // Fallback: create transposed view and copy to contiguous in-CB
             let w_t_view = weight.view(

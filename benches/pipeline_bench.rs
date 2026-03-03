@@ -379,11 +379,20 @@ fn print_cb_comparison(
     let base_op_cbs = avg_f(baseline_deltas, |d| d.op_cbs);
     let pipe_op_cbs = avg_f(pipelined_deltas, |d| d.op_cbs);
 
-    let graph_batches: f64 =
-        graph_stats.iter().map(|s| s.graph_batches as f64).sum::<f64>() / graph_stats.len() as f64;
-    let graph_encoders: f64 =
-        graph_stats.iter().map(|s| s.graph_encoders as f64).sum::<f64>() / graph_stats.len() as f64;
-    let graph_op_cbs = graph_stats.iter().map(|s| s.delta.op_cbs as f64).sum::<f64>()
+    let graph_batches: f64 = graph_stats
+        .iter()
+        .map(|s| s.graph_batches as f64)
+        .sum::<f64>()
+        / graph_stats.len() as f64;
+    let graph_encoders: f64 = graph_stats
+        .iter()
+        .map(|s| s.graph_encoders as f64)
+        .sum::<f64>()
+        / graph_stats.len() as f64;
+    let graph_op_cbs = graph_stats
+        .iter()
+        .map(|s| s.delta.op_cbs as f64)
+        .sum::<f64>()
         / graph_stats.len() as f64;
     // Total CBs for graph path = graph batches (submitted via ExecGraph) + any per-op CBs
     let graph_total = graph_batches + graph_op_cbs;
@@ -429,11 +438,8 @@ fn print_sync_comparison(
     graph_stats: &[GraphIterStats],
 ) {
     // Baseline: each op's CB has waitUntilCompleted, so syncs == op CBs
-    let avg_base_syncs: f64 = baseline_deltas
-        .iter()
-        .map(|d| d.op_cbs as f64)
-        .sum::<f64>()
-        / baseline_deltas.len() as f64;
+    let avg_base_syncs: f64 =
+        baseline_deltas.iter().map(|d| d.op_cbs as f64).sum::<f64>() / baseline_deltas.len() as f64;
     let avg_pipe_syncs: f64 = pipelined_deltas
         .iter()
         .map(|d| d.op_cbs as f64)
@@ -473,14 +479,13 @@ fn print_sync_comparison(
         "      {:>35}  {:>10.1}  ({:.0} graph batches, {:.0} encoders)",
         "ExecGraph (1 CPU sync)", avg_graph_syncs, avg_graph_batches, avg_graph_encoders
     );
-    println!("      {:>35}  {:>9.1}%", "Reduction (graph vs base)", reduction);
+    println!(
+        "      {:>35}  {:>9.1}%",
+        "Reduction (graph vs base)", reduction
+    );
 }
 
-fn print_latency_comparison(
-    baseline_stats: &Stats,
-    pipelined_stats: &Stats,
-    graph_stats: &Stats,
-) {
+fn print_latency_comparison(baseline_stats: &Stats, pipelined_stats: &Stats, graph_stats: &Stats) {
     let speedup_pipe = if pipelined_stats.mean > 0.0 {
         baseline_stats.mean / pipelined_stats.mean
     } else {
@@ -519,11 +524,7 @@ fn print_latency_comparison(
     );
 }
 
-fn print_statistical_summary(
-    baseline_stats: &Stats,
-    pipelined_stats: &Stats,
-    graph_stats: &Stats,
-) {
+fn print_statistical_summary(baseline_stats: &Stats, pipelined_stats: &Stats, graph_stats: &Stats) {
     println!();
     println!("  [4] Statistical Reliability");
     println!();
@@ -614,7 +615,9 @@ fn main() {
     let input = rand_array(device, &[SEQ_LEN, HIDDEN_SIZE], 42);
 
     // Pre-compute contiguous transposed weights for graph path
-    block.prepare_weights_for_graph(&registry, &queue).expect("weight preparation");
+    block
+        .prepare_weights_for_graph(&registry, &queue)
+        .expect("weight preparation");
 
     // --- GpuEvent for pipelined path ---
     let event = GpuEvent::new(device);
@@ -629,11 +632,11 @@ fn main() {
         let graph_event = GpuEvent::new(device);
         let mut graph = ExecGraph::new(&queue, &graph_event, 32);
         let graph_out = block
-            .forward_graph(&input, None, None, None, None, &registry, &mut graph, &queue)
+            .forward_graph(
+                &input, None, None, None, None, &registry, &mut graph, &queue,
+            )
             .expect("graph forward");
-        graph
-            .sync_and_reset()
-            .expect("parity graph sync");
+        graph.sync_and_reset().expect("parity graph sync");
 
         let base_data = baseline_out.to_vec_checked::<f32>();
         let graph_data = graph_out.to_vec_checked::<f32>();

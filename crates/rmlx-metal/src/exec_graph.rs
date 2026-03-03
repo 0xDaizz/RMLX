@@ -241,7 +241,7 @@ mod tests {
         let device = metal::Device::system_default().expect("Metal device required");
         let queue = device.new_command_queue();
         let event = GpuEvent::new(&device);
-        let mut graph = ExecGraph::new(&queue, &event, 32);
+        let graph = ExecGraph::new(&queue, &event, 32);
 
         assert_eq!(graph.total_batches(), 0);
         assert_eq!(graph.counter(), 0);

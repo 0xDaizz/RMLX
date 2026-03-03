@@ -6,7 +6,7 @@ use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::{KernelError, KernelRegistry};
 use rmlx_core::ops;
-use rmlx_metal::exec_graph::{ExecGraph, EventToken};
+use rmlx_metal::exec_graph::{EventToken, ExecGraph};
 
 use crate::linear::{Linear, LinearConfig};
 
@@ -743,9 +743,8 @@ impl Attention {
         let wq_t = self.q_proj.weight_transposed_contiguous()?;
         let wk_t = self.k_proj.weight_transposed_contiguous()?;
         let wv_t = self.v_proj.weight_transposed_contiguous()?;
-        let (q, k, v) = ops::fused::batched_qkv_proj_into(
-            registry, normed_x, &wq_t, &wk_t, &wv_t, cb1,
-        )?;
+        let (q, k, v) =
+            ops::fused::batched_qkv_proj_into(registry, normed_x, &wq_t, &wk_t, &wv_t, cb1)?;
         let t1 = graph.submit_batch();
 
         // RoPE offset from cache position
@@ -767,9 +766,14 @@ impl Attention {
         // Apply RoPE to Q (3D: [n_heads, seq, d])
         let q_roped = if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
             ops::rope::rope_ext_into_cb(
-                registry, &q_3d, cos, sin, rope_offset, 1.0,
-                true,  // traditional (match existing rope() behavior)
-                true,  // forward
+                registry,
+                &q_3d,
+                cos,
+                sin,
+                rope_offset,
+                1.0,
+                true, // traditional (match existing rope() behavior)
+                true, // forward
                 cb2,
             )?
         } else {
@@ -787,8 +791,15 @@ impl Attention {
         // Apply RoPE to K (3D)
         let k_roped = if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
             ops::rope::rope_ext_into_cb(
-                registry, &k_3d, cos, sin, rope_offset, 1.0,
-                true, true, cb2,
+                registry,
+                &k_3d,
+                cos,
+                sin,
+                rope_offset,
+                1.0,
+                true,
+                true,
+                cb2,
             )?
         } else {
             k_3d
@@ -856,7 +867,13 @@ impl Attention {
 
         let scale = 1.0 / (head_dim as f32).sqrt();
         let attn_outputs = ops::sdpa::sdpa_batched_into_cb(
-            registry, &q_head_views, &k_sdpa, &v_sdpa, mask, scale, cb3,
+            registry,
+            &q_head_views,
+            &k_sdpa,
+            &v_sdpa,
+            mask,
+            scale,
+            cb3,
         )?;
 
         let t3 = graph.submit_batch();

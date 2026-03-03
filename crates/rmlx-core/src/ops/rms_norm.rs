@@ -140,7 +140,7 @@ kernel void rms_norm_f32(
     }
 }
 
-// ─── Single-row variant (axis_size <= 4096, no loop overhead) ─────────────
+// ─── Single-row variant (small axis_size, 1 element per thread) ───────────
 kernel void rms_norm_single_f32(
     device const float* input   [[buffer(0)]],
     device const float* weight  [[buffer(1)]],
@@ -161,12 +161,11 @@ kernel void rms_norm_single_f32(
 
     size_t base = size_t(row) * size_t(axis_size);
 
-    // ── Phase 1: sum of squares (single pass, no outer loop) ──
+    // ── Phase 1: sum of squares (loop to cover axis_size > tgsize) ──
     float acc = 0.0;
-    uint i = tid;
-    if (i < axis_size) {
+    for (uint i = tid; i < axis_size; i += tgsize) {
         float v = input[base + i];
-        acc = v * v;
+        acc += v * v;
     }
 
     float rms = reduce_sum_of_squares(acc, axis_size, eps,
@@ -174,7 +173,7 @@ kernel void rms_norm_single_f32(
                                        local_sums, local_inv_rms);
 
     // ── Phase 2: normalise + optional weight ──
-    if (i < axis_size) {
+    for (uint i = tid; i < axis_size; i += tgsize) {
         float o = input[base + i] * rms;
         if (has_w) { o *= weight[i * w_stride]; }
         output[base + i] = o;
@@ -272,17 +271,16 @@ kernel void rms_norm_single_f16(
     size_t base = size_t(row) * size_t(axis_size);
 
     float acc = 0.0;
-    uint i = tid;
-    if (i < axis_size) {
+    for (uint i = tid; i < axis_size; i += tgsize) {
         float v = float(input[base + i]);
-        acc = v * v;
+        acc += v * v;
     }
 
     float rms = reduce_sum_of_squares(acc, axis_size, eps,
                                        simd_lane_id, simd_group_id,
                                        local_sums, local_inv_rms);
 
-    if (i < axis_size) {
+    for (uint i = tid; i < axis_size; i += tgsize) {
         float o = float(input[base + i]) * rms;
         if (has_w) { o *= float(weight[i * w_stride]); }
         output[base + i] = half(o);
@@ -380,17 +378,16 @@ kernel void rms_norm_single_bf16(
     size_t base = size_t(row) * size_t(axis_size);
 
     float acc = 0.0;
-    uint i = tid;
-    if (i < axis_size) {
+    for (uint i = tid; i < axis_size; i += tgsize) {
         float v = float(input[base + i]);
-        acc = v * v;
+        acc += v * v;
     }
 
     float rms = reduce_sum_of_squares(acc, axis_size, eps,
                                        simd_lane_id, simd_group_id,
                                        local_sums, local_inv_rms);
 
-    if (i < axis_size) {
+    for (uint i = tid; i < axis_size; i += tgsize) {
         float o = float(input[base + i]) * rms;
         if (has_w) { o *= float(weight[i * w_stride]); }
         output[base + i] = bfloat(o);
