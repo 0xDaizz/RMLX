@@ -553,6 +553,126 @@ pub fn sdpa(
     Ok(out)
 }
 
+/// Encode fused SDPA into an existing command buffer (no commit/wait).
+///
+/// **Caller must ensure Q, K, V are contiguous 2D `[tokens, head_dim]`.**
+/// Shapes must be pre-validated. head_dim <= 128.
+pub fn sdpa_into_cb(
+    registry: &KernelRegistry,
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    mask: Option<&Array>,
+    scale: f32,
+    cb: &metal::CommandBufferRef,
+) -> Result<Array, KernelError> {
+    let n = q.shape()[0]; // query tokens
+    let d = q.shape()[1]; // head dim
+    let s = k.shape()[0]; // key/value tokens
+
+    let kernel_name = match q.dtype() {
+        DType::Float32 => "sdpa_f32",
+        DType::Float16 => "sdpa_f16",
+        _ => {
+            return Err(KernelError::NotFound(format!(
+                "sdpa: unsupported dtype {:?}",
+                q.dtype()
+            )));
+        }
+    };
+
+    let pipeline = registry.get_pipeline(kernel_name, q.dtype())?;
+    let dev = registry.device().raw();
+
+    // Output array
+    let out = Array::zeros(dev, &[n, d], q.dtype());
+
+    // Params buffer: [N, S, D, has_mask]
+    let has_mask: u32 = if mask.is_some() { 1 } else { 0 };
+    let params: [u32; 4] = [n as u32, s as u32, d as u32, has_mask];
+    let params_buf = dev.new_buffer_with_data(
+        params.as_ptr() as *const std::ffi::c_void,
+        16,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+
+    // Scale buffer
+    let scale_buf = dev.new_buffer_with_data(
+        &scale as *const f32 as *const std::ffi::c_void,
+        4,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+
+    // Dummy mask buffer if no mask
+    let dummy_buf;
+    let mask_buf = if let Some(m) = mask {
+        m.metal_buffer()
+    } else {
+        dummy_buf = dev.new_buffer(4, metal::MTLResourceOptions::StorageModeShared);
+        &dummy_buf
+    };
+    let mask_offset = mask.map_or(0, |m| m.offset()) as u64;
+
+    let encoder = cb.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(q.metal_buffer()), q.offset() as u64);
+    encoder.set_buffer(1, Some(k.metal_buffer()), k.offset() as u64);
+    encoder.set_buffer(2, Some(v.metal_buffer()), v.offset() as u64);
+    encoder.set_buffer(3, Some(out.metal_buffer()), 0);
+    encoder.set_buffer(4, Some(mask_buf), mask_offset);
+    encoder.set_buffer(5, Some(&params_buf), 0);
+    encoder.set_buffer(6, Some(&scale_buf), 0);
+
+    let n_threadgroups = n.div_ceil(BR) as u64;
+    let tg_size = std::cmp::min(THREADS_PER_TG, pipeline.max_total_threads_per_threadgroup());
+
+    encoder.dispatch_thread_groups(
+        MTLSize::new(n_threadgroups, 1, 1),
+        MTLSize::new(tg_size, 1, 1),
+    );
+    encoder.end_encoding();
+
+    Ok(out)
+}
+
+/// Batched fused SDPA — encode all heads into an existing command buffer.
+///
+/// **Caller must ensure all head arrays are contiguous 2D.**
+pub fn sdpa_batched_into_cb(
+    registry: &KernelRegistry,
+    q_heads: &[Array],
+    k_heads: &[Array],
+    v_heads: &[Array],
+    mask: Option<&Array>,
+    scale: f32,
+    cb: &metal::CommandBufferRef,
+) -> Result<Vec<Array>, KernelError> {
+    let num_heads = q_heads.len();
+    let num_kv_heads = k_heads.len();
+    if num_kv_heads == 0 || num_heads % num_kv_heads != 0 {
+        return Err(KernelError::InvalidShape(format!(
+            "sdpa_batched_into_cb: num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
+        )));
+    }
+    let repeats = num_heads / num_kv_heads;
+
+    let mut outputs = Vec::with_capacity(num_heads);
+    for (h, q_h) in q_heads.iter().enumerate() {
+        let kv_idx = h / repeats;
+        let out = sdpa_into_cb(
+            registry,
+            q_h,
+            &k_heads[kv_idx],
+            &v_heads[kv_idx],
+            mask,
+            scale,
+            cb,
+        )?;
+        outputs.push(out);
+    }
+    Ok(outputs)
+}
+
 /// Batched fused SDPA — runs one fused kernel per head.
 ///
 /// This is the entry point for attention modules that have already split Q/K/V

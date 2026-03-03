@@ -139,6 +139,68 @@ pub fn fused_silu_mul(
     Ok(output)
 }
 
+/// Encode fused SwiGLU (silu(gate) * up) into an existing command buffer (no commit/wait).
+///
+/// **Caller must ensure gate_out and up_out are contiguous with matching shapes/dtypes.**
+pub fn fused_silu_mul_into_cb(
+    registry: &KernelRegistry,
+    gate_out: &Array,
+    up_out: &Array,
+    cb: &metal::CommandBufferRef,
+) -> Result<Array, KernelError> {
+    if gate_out.shape() != up_out.shape() {
+        return Err(KernelError::InvalidShape(format!(
+            "fused_silu_mul_into_cb: shape mismatch: {:?} vs {:?}",
+            gate_out.shape(),
+            up_out.shape()
+        )));
+    }
+    if gate_out.dtype() != up_out.dtype() {
+        return Err(KernelError::InvalidShape(format!(
+            "fused_silu_mul_into_cb: dtype mismatch: {:?} vs {:?}",
+            gate_out.dtype(),
+            up_out.dtype()
+        )));
+    }
+
+    let kernel_name = match gate_out.dtype() {
+        DType::Float32 => "silu_gate_f32",
+        DType::Float16 => "silu_gate_f16",
+        DType::Bfloat16 => "silu_gate_bf16",
+        other => {
+            return Err(KernelError::InvalidShape(format!(
+                "fused_silu_mul_into_cb: unsupported dtype {:?}",
+                other
+            )))
+        }
+    };
+
+    let pipeline = registry.get_pipeline(kernel_name, gate_out.dtype())?;
+    let numel = gate_out.numel();
+    let dev = registry.device().raw();
+    let output = Array::zeros(dev, gate_out.shape(), gate_out.dtype());
+    let numel_buf = make_u32_buf(dev, numel as u32);
+
+    let elems_per_thread: u64 = match gate_out.dtype() {
+        DType::Float32 => 2,
+        _ => 4,
+    };
+    let grid_threads = (numel as u64).div_ceil(elems_per_thread);
+
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_buffer(0, Some(gate_out.metal_buffer()), gate_out.offset() as u64);
+    enc.set_buffer(1, Some(up_out.metal_buffer()), up_out.offset() as u64);
+    enc.set_buffer(2, Some(output.metal_buffer()), output.offset() as u64);
+    enc.set_buffer(3, Some(&numel_buf), 0);
+
+    let tg = std::cmp::min(pipeline.max_total_threads_per_threadgroup(), grid_threads);
+    enc.dispatch_threads(MTLSize::new(grid_threads, 1, 1), MTLSize::new(tg, 1, 1));
+    enc.end_encoding();
+
+    Ok(output)
+}
+
 /// Batched Q/K/V projection using the CommandBatcher (no commit/wait).
 ///
 /// Same as `batched_qkv_proj` but encodes into a provided command buffer.

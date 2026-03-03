@@ -544,6 +544,84 @@ pub fn rope_ext(
 }
 
 // ---------------------------------------------------------------------------
+// Public API: precomputed-table variant – encode into caller's command buffer
+// ---------------------------------------------------------------------------
+
+/// Encode RoPE (precomputed cos/sin) into an existing command buffer (no commit/wait).
+///
+/// **Caller must ensure all inputs are contiguous** and shapes are valid.
+/// Input: [seq_len, head_dim] (2-D) or [batch*n_heads, seq_len, head_dim] (3-D).
+/// cos_freqs, sin_freqs: [max_seq_len, head_dim/2].
+#[allow(clippy::too_many_arguments)]
+pub fn rope_ext_into_cb(
+    registry: &KernelRegistry,
+    input: &Array,
+    cos_freqs: &Array,
+    sin_freqs: &Array,
+    offset: u32,
+    scale: f32,
+    traditional: bool,
+    forward: bool,
+    cb: &metal::CommandBufferRef,
+) -> Result<Array, KernelError> {
+    let (n_batch, seq_len, head_dim) = parse_input_shape(input)?;
+
+    if head_dim % 2 != 0 {
+        return Err(KernelError::InvalidShape(format!(
+            "head_dim must be even, got {}",
+            head_dim
+        )));
+    }
+
+    let half_dim = head_dim / 2;
+
+    // Kernel selection.
+    let kname = kernel_name_table(input.dtype())?;
+    let pipeline = registry.get_pipeline(kname, input.dtype())?;
+
+    let out = Array::zeros(registry.device().raw(), input.shape(), input.dtype());
+
+    // Constant buffers.
+    let dev = registry.device().raw();
+    let opts = metal::MTLResourceOptions::StorageModeShared;
+    let seq_u32 = super::checked_u32(seq_len, "seq_len")?;
+    let dim_u32 = super::checked_u32(head_dim, "head_dim")?;
+    let trad_u32: u32 = if traditional { 1 } else { 0 };
+    let fwd_u32: u32 = if forward { 1 } else { 0 };
+
+    let seq_buf = dev.new_buffer_with_data(&seq_u32 as *const u32 as *const _, 4, opts);
+    let dim_buf = dev.new_buffer_with_data(&dim_u32 as *const u32 as *const _, 4, opts);
+    let off_buf = dev.new_buffer_with_data(&offset as *const u32 as *const _, 4, opts);
+    let scl_buf = dev.new_buffer_with_data(&scale as *const f32 as *const _, 4, opts);
+    let trad_buf = dev.new_buffer_with_data(&trad_u32 as *const u32 as *const _, 4, opts);
+    let fwd_buf = dev.new_buffer_with_data(&fwd_u32 as *const u32 as *const _, 4, opts);
+
+    let encoder = cb.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
+    encoder.set_buffer(1, Some(cos_freqs.metal_buffer()), cos_freqs.offset() as u64);
+    encoder.set_buffer(2, Some(sin_freqs.metal_buffer()), sin_freqs.offset() as u64);
+    encoder.set_buffer(3, Some(out.metal_buffer()), 0);
+    encoder.set_buffer(4, Some(&seq_buf), 0);
+    encoder.set_buffer(5, Some(&dim_buf), 0);
+    encoder.set_buffer(6, Some(&off_buf), 0);
+    encoder.set_buffer(7, Some(&scl_buf), 0);
+    encoder.set_buffer(8, Some(&trad_buf), 0);
+    encoder.set_buffer(9, Some(&fwd_buf), 0);
+
+    let grid = MTLSize::new(half_dim as u64, seq_len as u64, n_batch as u64);
+    let tg = MTLSize::new(
+        std::cmp::min(64, half_dim as u64),
+        std::cmp::min(16, seq_len as u64),
+        1,
+    );
+    encoder.dispatch_threads(grid, tg);
+    encoder.end_encoding();
+
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
 // Public API: on-the-fly frequency variant
 // ---------------------------------------------------------------------------
 

@@ -6,6 +6,7 @@ use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::{KernelError, KernelRegistry};
 use rmlx_core::ops;
+use rmlx_metal::exec_graph::{ExecGraph, EventToken};
 
 use crate::linear::{Linear, LinearConfig};
 
@@ -213,6 +214,106 @@ impl LayerKvCache {
 
         cb.commit();
         cb.wait_until_completed();
+        Ok(())
+    }
+
+    /// Encode KV cache append into an existing command buffer (no commit/wait).
+    ///
+    /// Same O(1)-per-token append as `append_preallocated`, but encodes copy
+    /// dispatches into the provided command buffer instead of creating its own.
+    ///
+    /// **Caller must ensure new_keys/new_values are contiguous.**
+    pub fn append_into_cb(
+        &mut self,
+        new_keys: &[Array],
+        new_values: &[Array],
+        new_tokens: usize,
+        registry: &KernelRegistry,
+        cb: &metal::CommandBufferRef,
+    ) -> Result<(), KernelError> {
+        if new_keys.len() != self.num_kv_heads || new_values.len() != self.num_kv_heads {
+            return Err(KernelError::InvalidShape(format!(
+                "LayerKvCache::append_into_cb: expected {} kv heads, got keys={}, values={}",
+                self.num_kv_heads,
+                new_keys.len(),
+                new_values.len()
+            )));
+        }
+
+        if self.max_seq_len == 0 {
+            return Err(KernelError::InvalidShape(
+                "LayerKvCache::append_into_cb: only works for pre-allocated caches (max_seq_len > 0)".into(),
+            ));
+        }
+
+        if self.seq_len + new_tokens > self.max_seq_len {
+            return Err(KernelError::InvalidShape(format!(
+                "LayerKvCache::append_into_cb: overflow: {} cached + {} new > {} max",
+                self.seq_len, new_tokens, self.max_seq_len
+            )));
+        }
+
+        let elem_size = self.keys[0].dtype().size_of();
+        let copy_kernel = match self.keys[0].dtype() {
+            DType::Float32 => "copy_f32",
+            DType::Float16 => "copy_f16",
+            DType::Bfloat16 => "copy_bf16",
+            other => {
+                return Err(KernelError::InvalidShape(format!(
+                    "LayerKvCache::append_into_cb: unsupported dtype {:?}",
+                    other
+                )))
+            }
+        };
+        let pipeline = registry.get_pipeline(copy_kernel, self.keys[0].dtype())?;
+        let count = (new_tokens * self.head_dim) as u64;
+        if count == 0 {
+            return Ok(());
+        }
+
+        let dst_row_offset = self.seq_len * self.head_dim * elem_size;
+
+        for i in 0..self.num_kv_heads {
+            // Copy new keys into slot
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&pipeline);
+            enc.set_buffer(
+                0,
+                Some(new_keys[i].metal_buffer()),
+                new_keys[i].offset() as u64,
+            );
+            enc.set_buffer(
+                1,
+                Some(self.keys[i].metal_buffer()),
+                (self.keys[i].offset() + dst_row_offset) as u64,
+            );
+            let grid = metal::MTLSize::new(count, 1, 1);
+            let tg = metal::MTLSize::new(
+                std::cmp::min(pipeline.max_total_threads_per_threadgroup(), count),
+                1,
+                1,
+            );
+            enc.dispatch_threads(grid, tg);
+            enc.end_encoding();
+
+            // Copy new values into slot
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&pipeline);
+            enc.set_buffer(
+                0,
+                Some(new_values[i].metal_buffer()),
+                new_values[i].offset() as u64,
+            );
+            enc.set_buffer(
+                1,
+                Some(self.values[i].metal_buffer()),
+                (self.values[i].offset() + dst_row_offset) as u64,
+            );
+            enc.dispatch_threads(grid, tg);
+            enc.end_encoding();
+        }
+
+        self.seq_len += new_tokens;
         Ok(())
     }
 
@@ -603,6 +704,185 @@ impl Attention {
 
         // Output projection
         self.o_proj.forward(&concat, registry, queue)
+    }
+
+    /// Graph-based forward pass using ExecGraph for batched CB execution.
+    ///
+    /// Encodes attention as 4 batched command buffers:
+    /// - CB (current): Q/K/V projections (3 GEMM encoders) — caller may have already
+    ///   encoded norm1 into this same CB
+    /// - CB2: 3D copy + RoPE (Q,K) + V copy + cache append
+    /// - CB3: batched SDPA
+    /// - CB4: head interleave concat + O_proj + residual add
+    ///
+    /// `normed_x`: pre-normed input [seq_len, hidden_size] (contiguous)
+    /// `residual_x`: original input for skip connection [seq_len, hidden_size]
+    ///
+    /// Returns: (output [seq_len, hidden_size], last EventToken)
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_graph(
+        &self,
+        normed_x: &Array,
+        residual_x: &Array,
+        cos_freqs: Option<&Array>,
+        sin_freqs: Option<&Array>,
+        mask: Option<&Array>,
+        mut cache: Option<&mut LayerKvCache>,
+        registry: &KernelRegistry,
+        graph: &mut ExecGraph<'_, '_>,
+    ) -> Result<(Array, EventToken), KernelError> {
+        let seq_len = normed_x.shape()[0];
+        let num_heads = self.config.num_heads;
+        let num_kv_heads = self.config.num_kv_heads;
+        let head_dim = self.config.head_dim;
+        let elem_size = normed_x.dtype().size_of();
+        let dev = registry.device().raw();
+
+        // === CB1: Q/K/V projections (added to graph's current CB) ===
+        let cb1 = graph.command_buffer();
+        let wq_t = self.q_proj.weight_transposed()?;
+        let wk_t = self.k_proj.weight_transposed()?;
+        let wv_t = self.v_proj.weight_transposed()?;
+        let (q, k, v) = ops::fused::batched_qkv_proj_into(
+            registry, normed_x, &wq_t, &wk_t, &wv_t, cb1,
+        )?;
+        let t1 = graph.submit_batch();
+
+        // RoPE offset from cache position
+        let rope_offset = cache.as_ref().map_or(0u32, |c| c.seq_len as u32);
+
+        // === CB2: 3D reshape + contiguous copy + RoPE + V copy + cache append ===
+        graph.wait_for(t1);
+        let cb2 = graph.command_buffer();
+
+        // Reshape Q [seq, n_heads*d] → [n_heads, seq, d] (strided view)
+        // Strides: [d, n_heads*d, 1] — NOT contiguous, needs copy
+        let q_3d_view = q.view(
+            vec![num_heads, seq_len, head_dim],
+            vec![head_dim, num_heads * head_dim, 1],
+            q.offset(),
+        );
+        let q_3d = ops::copy::copy_into_cb(registry, &q_3d_view, cb2)?;
+
+        // Apply RoPE to Q (3D: [n_heads, seq, d])
+        let q_roped = if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
+            ops::rope::rope_ext_into_cb(
+                registry, &q_3d, cos, sin, rope_offset, 1.0,
+                true,  // traditional (match existing rope() behavior)
+                true,  // forward
+                cb2,
+            )?
+        } else {
+            q_3d
+        };
+
+        // Reshape K [seq, n_kv*d] → [n_kv, seq, d]
+        let k_3d_view = k.view(
+            vec![num_kv_heads, seq_len, head_dim],
+            vec![head_dim, num_kv_heads * head_dim, 1],
+            k.offset(),
+        );
+        let k_3d = ops::copy::copy_into_cb(registry, &k_3d_view, cb2)?;
+
+        // Apply RoPE to K (3D)
+        let k_roped = if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
+            ops::rope::rope_ext_into_cb(
+                registry, &k_3d, cos, sin, rope_offset, 1.0,
+                true, true, cb2,
+            )?
+        } else {
+            k_3d
+        };
+
+        // Reshape V [seq, n_kv*d] → [n_kv, seq, d] and copy to contiguous
+        let v_3d_view = v.view(
+            vec![num_kv_heads, seq_len, head_dim],
+            vec![head_dim, num_kv_heads * head_dim, 1],
+            v.offset(),
+        );
+        let v_3d = ops::copy::copy_into_cb(registry, &v_3d_view, cb2)?;
+
+        // Create per-head views for cache append and later SDPA
+        let k_heads_new: Vec<Array> = (0..num_kv_heads)
+            .map(|h| {
+                k_roped.view(
+                    vec![seq_len, head_dim],
+                    vec![head_dim, 1],
+                    k_roped.offset() + h * seq_len * head_dim * elem_size,
+                )
+            })
+            .collect();
+        let v_heads_new: Vec<Array> = (0..num_kv_heads)
+            .map(|h| {
+                v_3d.view(
+                    vec![seq_len, head_dim],
+                    vec![head_dim, 1],
+                    v_3d.offset() + h * seq_len * head_dim * elem_size,
+                )
+            })
+            .collect();
+
+        // Append to KV cache (encodes into CB2)
+        if let Some(ref mut c) = cache {
+            c.append_into_cb(&k_heads_new, &v_heads_new, seq_len, registry, cb2)?;
+        }
+
+        let t2 = graph.submit_batch();
+
+        // === CB3: SDPA ===
+        graph.wait_for(t2);
+        let cb3 = graph.command_buffer();
+
+        // Per-head Q views from q_roped [n_heads, seq, d] (contiguous per head)
+        let q_head_views: Vec<Array> = (0..num_heads)
+            .map(|h| {
+                q_roped.view(
+                    vec![seq_len, head_dim],
+                    vec![head_dim, 1],
+                    q_roped.offset() + h * seq_len * head_dim * elem_size,
+                )
+            })
+            .collect();
+
+        // K/V for SDPA: use cached (full history) if cache, else current step only
+        let (k_sdpa, v_sdpa) = match &cache {
+            Some(c) => {
+                let kf: Vec<Array> = (0..num_kv_heads).map(|h| c.cached_keys(h)).collect();
+                let vf: Vec<Array> = (0..num_kv_heads).map(|h| c.cached_values(h)).collect();
+                (kf, vf)
+            }
+            None => (k_heads_new, v_heads_new),
+        };
+
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let attn_outputs = ops::sdpa::sdpa_batched_into_cb(
+            registry, &q_head_views, &k_sdpa, &v_sdpa, mask, scale, cb3,
+        )?;
+
+        let t3 = graph.submit_batch();
+
+        // === CB4: head concat (interleave) + O_proj + residual ===
+        graph.wait_for(t3);
+        let cb4 = graph.command_buffer();
+
+        // Concatenate heads via interleave kernel
+        let hidden_size = num_heads * head_dim;
+        let concat = Array::zeros(dev, &[seq_len, hidden_size], normed_x.dtype());
+        for (h, head_out) in attn_outputs.iter().enumerate() {
+            ops::copy::interleave_heads_into_cb(
+                registry, head_out, &concat, seq_len, head_dim, num_heads, h, cb4,
+            )?;
+        }
+
+        // O projection
+        let attn_out = self.o_proj.forward_into_cb(&concat, registry, cb4)?;
+
+        // Residual: x + attn_out
+        let h = ops::binary::add_into_cb(registry, residual_x, &attn_out, cb4)?;
+
+        let t4 = graph.submit_batch();
+
+        Ok((h, t4))
     }
 
     pub fn num_heads(&self) -> usize {

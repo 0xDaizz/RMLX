@@ -550,3 +550,77 @@ pub fn rms_norm_opt(
 
     Ok(out)
 }
+
+/// Encode RMS normalization into an existing command buffer (no commit/wait).
+///
+/// **Caller must ensure `input` is contiguous and 2-D.**
+/// Weight contiguity is the caller's responsibility too.
+pub fn rms_norm_into_cb(
+    registry: &KernelRegistry,
+    input: &Array,
+    weight: Option<&Array>,
+    eps: f32,
+    cb: &metal::CommandBufferRef,
+) -> Result<Array, KernelError> {
+    if input.ndim() != 2 {
+        return Err(KernelError::InvalidShape(format!(
+            "rms_norm requires 2D input, got {}D",
+            input.ndim()
+        )));
+    }
+
+    let axis_size_usize = input.shape()[1];
+
+    let (has_w, w_stride): (u32, u32) = if let Some(w) = weight {
+        if w.ndim() != 1 {
+            return Err(KernelError::InvalidShape(format!(
+                "rms_norm requires 1D weight, got {}D",
+                w.ndim()
+            )));
+        }
+        if w.shape()[0] != axis_size_usize {
+            return Err(KernelError::InvalidShape(format!(
+                "axis size mismatch: input[1]={} vs weight[0]={}",
+                axis_size_usize,
+                w.shape()[0]
+            )));
+        }
+        let ws = w.strides()[0] as u32;
+        (1, ws)
+    } else {
+        (0, 1)
+    };
+
+    let kernel_name = rms_kernel_name(input.dtype(), axis_size_usize)?;
+    let pipeline = registry.get_pipeline(kernel_name, input.dtype())?;
+
+    let rows = input.shape()[0];
+    let axis_size = super::checked_u32(axis_size_usize, "axis_size")?;
+
+    let out = Array::zeros(registry.device().raw(), input.shape(), input.dtype());
+
+    let axis_buf = make_const_buf(registry.device().raw(), axis_size);
+    let eps_buf = make_const_buf(registry.device().raw(), eps);
+    let w_stride_buf = make_const_buf(registry.device().raw(), w_stride);
+    let has_w_buf = make_const_buf(registry.device().raw(), has_w);
+
+    let encoder = cb.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
+    if let Some(w) = weight {
+        encoder.set_buffer(1, Some(w.metal_buffer()), w.offset() as u64);
+    } else {
+        encoder.set_buffer(1, Some(input.metal_buffer()), 0);
+    }
+    encoder.set_buffer(2, Some(out.metal_buffer()), 0);
+    encoder.set_buffer(3, Some(&axis_buf), 0);
+    encoder.set_buffer(4, Some(&eps_buf), 0);
+    encoder.set_buffer(5, Some(&w_stride_buf), 0);
+    encoder.set_buffer(6, Some(&has_w_buf), 0);
+
+    let tg_size = std::cmp::min(1024, pipeline.max_total_threads_per_threadgroup());
+    encoder.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), MTLSize::new(tg_size, 1, 1));
+    encoder.end_encoding();
+
+    Ok(out)
+}

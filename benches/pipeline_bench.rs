@@ -3,9 +3,14 @@
 //! Measures the impact of command buffer batching and async execution
 //! on single-layer transformer forward pass performance.
 //!
+//! Three execution modes compared:
+//! - **Baseline**: per-op dispatch with `forward()` (~130 CBs per layer)
+//! - **Pipelined (legacy)**: `forward_pipelined()` with fused SwiGLU
+//! - **ExecGraph**: `forward_graph()` with 6-CB GPU-side event chaining
+//!
 //! Metrics tracked:
-//! - Command buffer count (baseline vs pipelined)
-//! - Sync point count (baseline vs pipelined)
+//! - Command buffer count (batcher-level + per-op level)
+//! - Sync point count
 //! - Per-token wall-clock latency
 //! - Statistical summary: mean, std, p50, p95, p99
 //!
@@ -20,6 +25,7 @@ use rmlx_core::ops;
 use rmlx_metal::batcher::{reset_counters, total_cbs_created, total_encoders_created};
 use rmlx_metal::device::GpuDevice;
 use rmlx_metal::event::GpuEvent;
+use rmlx_metal::exec_graph::{ExecGraph, ExecGraphStats};
 use rmlx_nn::{Attention, AttentionConfig, FeedForward, Linear, LinearConfig, TransformerBlock};
 
 // ---------------------------------------------------------------------------
@@ -120,21 +126,31 @@ impl std::fmt::Display for Stats {
 // ---------------------------------------------------------------------------
 
 struct CbSnapshot {
-    cbs: u64,
-    encoders: u64,
+    batcher_cbs: u64,
+    batcher_encoders: u64,
+    op_cbs: u64,
 }
 
 fn snapshot_counters() -> CbSnapshot {
     CbSnapshot {
-        cbs: total_cbs_created(),
-        encoders: total_encoders_created(),
+        batcher_cbs: total_cbs_created(),
+        batcher_encoders: total_encoders_created(),
+        op_cbs: ops::total_op_cbs(),
     }
 }
 
-fn delta_counters(before: &CbSnapshot) -> (u64, u64) {
-    let cbs = total_cbs_created() - before.cbs;
-    let encoders = total_encoders_created() - before.encoders;
-    (cbs, encoders)
+fn delta_counters(before: &CbSnapshot) -> CbDelta {
+    CbDelta {
+        batcher_cbs: total_cbs_created() - before.batcher_cbs,
+        batcher_encoders: total_encoders_created() - before.batcher_encoders,
+        op_cbs: ops::total_op_cbs() - before.op_cbs,
+    }
+}
+
+struct CbDelta {
+    batcher_cbs: u64,
+    batcher_encoders: u64,
+    op_cbs: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -223,12 +239,13 @@ fn bench_baseline(
     registry: &KernelRegistry,
     queue: &metal::CommandQueue,
     iters: usize,
-) -> (Vec<Duration>, Vec<(u64, u64)>) {
+) -> (Vec<Duration>, Vec<CbDelta>) {
     let mut latencies = Vec::with_capacity(iters);
-    let mut cb_counts = Vec::with_capacity(iters);
+    let mut cb_deltas = Vec::with_capacity(iters);
 
     for _ in 0..iters {
         reset_counters();
+        ops::reset_op_cbs();
         let snap = snapshot_counters();
 
         let start = Instant::now();
@@ -243,11 +260,11 @@ fn bench_baseline(
             .expect("baseline forward failed");
         let elapsed = start.elapsed();
 
-        let (cbs, encs) = delta_counters(&snap);
+        let delta = delta_counters(&snap);
         latencies.push(elapsed);
-        cb_counts.push((cbs, encs));
+        cb_deltas.push(delta);
     }
-    (latencies, cb_counts)
+    (latencies, cb_deltas)
 }
 
 fn bench_pipelined(
@@ -257,12 +274,13 @@ fn bench_pipelined(
     queue: &metal::CommandQueue,
     event: &GpuEvent,
     iters: usize,
-) -> (Vec<Duration>, Vec<(u64, u64)>) {
+) -> (Vec<Duration>, Vec<CbDelta>) {
     let mut latencies = Vec::with_capacity(iters);
-    let mut cb_counts = Vec::with_capacity(iters);
+    let mut cb_deltas = Vec::with_capacity(iters);
 
     for _ in 0..iters {
         reset_counters();
+        ops::reset_op_cbs();
         let snap = snapshot_counters();
 
         let start = Instant::now();
@@ -277,14 +295,66 @@ fn bench_pipelined(
             .expect("pipelined forward failed");
         let elapsed = start.elapsed();
 
-        let (cbs, encs) = delta_counters(&snap);
+        let delta = delta_counters(&snap);
         latencies.push(elapsed);
-        cb_counts.push((cbs, encs));
+        cb_deltas.push(delta);
 
         // Reset event for next iteration
         event.reset();
     }
-    (latencies, cb_counts)
+    (latencies, cb_deltas)
+}
+
+struct GraphIterStats {
+    delta: CbDelta,
+    graph_batches: usize,
+    graph_cbs: usize,
+    graph_encoders: usize,
+}
+
+fn bench_graph(
+    block: &TransformerBlock,
+    input: &Array,
+    registry: &KernelRegistry,
+    queue: &metal::CommandQueue,
+    iters: usize,
+) -> (Vec<Duration>, Vec<GraphIterStats>) {
+    let mut latencies = Vec::with_capacity(iters);
+    let mut iter_stats = Vec::with_capacity(iters);
+    let device = registry.device().raw();
+
+    for _ in 0..iters {
+        reset_counters();
+        ops::reset_op_cbs();
+        let snap = snapshot_counters();
+
+        let event = GpuEvent::new(device);
+        let mut graph = ExecGraph::new(queue, &event, 32);
+
+        let start = Instant::now();
+        let _out = block
+            .forward_graph(
+                input, None, // cos_freqs
+                None, // sin_freqs
+                None, // mask
+                None, // cache
+                registry, &mut graph, queue,
+            )
+            .expect("graph forward failed");
+        graph.sync_and_reset().expect("graph sync failed");
+        let elapsed = start.elapsed();
+
+        let gstats = ExecGraphStats::from_graph(&graph);
+        let delta = delta_counters(&snap);
+        latencies.push(elapsed);
+        iter_stats.push(GraphIterStats {
+            delta,
+            graph_batches: gstats.total_batches,
+            graph_cbs: gstats.total_cbs,
+            graph_encoders: gstats.total_encoders,
+        });
+    }
+    (latencies, iter_stats)
 }
 
 // ---------------------------------------------------------------------------
@@ -306,25 +376,32 @@ fn print_header() {
     print_separator(width);
 }
 
-fn print_cb_comparison(baseline_cbs: &[(u64, u64)], pipelined_cbs: &[(u64, u64)]) {
-    // Average CB and encoder counts
-    let avg = |data: &[(u64, u64)], idx: usize| -> f64 {
-        let sum: u64 = data.iter().map(|x| if idx == 0 { x.0 } else { x.1 }).sum();
-        sum as f64 / data.len() as f64
+fn print_cb_comparison(
+    baseline_deltas: &[CbDelta],
+    pipelined_deltas: &[CbDelta],
+    graph_stats: &[GraphIterStats],
+) {
+    let avg_f = |data: &[CbDelta], f: fn(&CbDelta) -> u64| -> f64 {
+        data.iter().map(|d| f(d) as f64).sum::<f64>() / data.len() as f64
     };
 
-    let base_cbs = avg(baseline_cbs, 0);
-    let base_encs = avg(baseline_cbs, 1);
-    let pipe_cbs = avg(pipelined_cbs, 0);
-    let pipe_encs = avg(pipelined_cbs, 1);
+    let base_op_cbs = avg_f(baseline_deltas, |d| d.op_cbs);
+    let base_encs = avg_f(baseline_deltas, |d| d.batcher_encoders);
+    let pipe_op_cbs = avg_f(pipelined_deltas, |d| d.op_cbs);
+    let pipe_encs = avg_f(pipelined_deltas, |d| d.batcher_encoders);
 
-    let cb_reduction = if base_cbs > 0.0 {
-        (1.0 - pipe_cbs / base_cbs) * 100.0
+    let graph_batches: f64 =
+        graph_stats.iter().map(|s| s.graph_batches as f64).sum::<f64>() / graph_stats.len() as f64;
+    let graph_op_cbs = graph_stats.iter().map(|s| s.delta.op_cbs as f64).sum::<f64>()
+        / graph_stats.len() as f64;
+
+    let cb_reduction_pipe = if base_op_cbs > 0.0 {
+        (1.0 - pipe_op_cbs / base_op_cbs) * 100.0
     } else {
         0.0
     };
-    let enc_reduction = if base_encs > 0.0 {
-        (1.0 - pipe_encs / base_encs) * 100.0
+    let cb_reduction_graph = if base_op_cbs > 0.0 {
+        (1.0 - (graph_batches + graph_op_cbs) / base_op_cbs) * 100.0
     } else {
         0.0
     };
@@ -332,86 +409,97 @@ fn print_cb_comparison(baseline_cbs: &[(u64, u64)], pipelined_cbs: &[(u64, u64)]
     println!();
     println!(
         "  [1] Command Buffer Count (per forward pass, averaged over {} iters)",
-        baseline_cbs.len()
+        baseline_deltas.len()
     );
     println!();
     println!(
-        "      {:>30}  {:>10}  {:>10}  {:>12}",
-        "", "CBs", "Encoders", "Enc/CB"
+        "      {:>35}  {:>10}  {:>12}  {:>12}",
+        "", "Op CBs", "Graph CBs", "Reduction"
     );
     println!(
-        "      {:>30}  {:>10.1}  {:>10.1}  {:>12.1}",
-        "Baseline (forward)",
-        base_cbs,
-        base_encs,
-        if base_cbs > 0.0 {
-            base_encs / base_cbs
-        } else {
-            0.0
-        }
+        "      {:>35}  {:>10.1}  {:>12}  {:>12}",
+        "Baseline (forward)", base_op_cbs, "-", "-"
     );
     println!(
-        "      {:>30}  {:>10.1}  {:>10.1}  {:>12.1}",
-        "Pipelined (forward_pipelined)",
-        pipe_cbs,
-        pipe_encs,
-        if pipe_cbs > 0.0 {
-            pipe_encs / pipe_cbs
-        } else {
-            0.0
-        }
+        "      {:>35}  {:>10.1}  {:>12}  {:>11.1}%",
+        "Pipelined (forward_pipelined)", pipe_op_cbs, "-", cb_reduction_pipe
     );
     println!(
-        "      {:>30}  {:>9.1}%  {:>9.1}%",
-        "Reduction", cb_reduction, enc_reduction
+        "      {:>35}  {:>10.1}  {:>12.1}  {:>11.1}%",
+        "ExecGraph (forward_graph)", graph_op_cbs, graph_batches, cb_reduction_graph
+    );
+    println!();
+    println!(
+        "      Batcher encoders:  Baseline={:.0}  Pipelined={:.0}",
+        base_encs, pipe_encs
     );
 }
 
-fn print_sync_comparison(baseline_cbs: &[(u64, u64)], pipelined_cbs: &[(u64, u64)]) {
-    // In the baseline path, each op creates and commits its own CB with
-    // waitUntilCompleted(), so the number of sync points == number of CBs.
-    // In the pipelined path, sync points are reduced (ideally 1 final sync).
-    let avg_base_syncs: f64 =
-        baseline_cbs.iter().map(|(cbs, _)| *cbs as f64).sum::<f64>() / baseline_cbs.len() as f64;
-    let avg_pipe_syncs: f64 = pipelined_cbs
+fn print_sync_comparison(
+    baseline_deltas: &[CbDelta],
+    pipelined_deltas: &[CbDelta],
+    graph_stats: &[GraphIterStats],
+) {
+    // Baseline: each op's CB has waitUntilCompleted, so syncs == op CBs
+    let avg_base_syncs: f64 = baseline_deltas
         .iter()
-        .map(|(cbs, _)| *cbs as f64)
+        .map(|d| d.op_cbs as f64)
         .sum::<f64>()
-        / pipelined_cbs.len() as f64;
+        / baseline_deltas.len() as f64;
+    let avg_pipe_syncs: f64 = pipelined_deltas
+        .iter()
+        .map(|d| d.op_cbs as f64)
+        .sum::<f64>()
+        / pipelined_deltas.len() as f64;
+    // ExecGraph: 1 CPU sync per layer (sync_and_reset)
+    let avg_graph_syncs: f64 = 1.0;
 
     let reduction = if avg_base_syncs > 0.0 {
-        (1.0 - avg_pipe_syncs / avg_base_syncs) * 100.0
+        (1.0 - avg_graph_syncs / avg_base_syncs) * 100.0
     } else {
         0.0
     };
 
     println!();
-    println!("  [2] Sync Point Count (CPU-GPU round-trips per forward pass)");
+    println!("  [2] CPU-GPU Sync Points (per forward pass)");
     println!();
     println!(
-        "      {:>30}  {:>10.1}",
+        "      {:>35}  {:>10.1}",
         "Baseline (per-op commit+wait)", avg_base_syncs
     );
     println!(
-        "      {:>30}  {:>10.1}",
+        "      {:>35}  {:>10.1}",
         "Pipelined (batched CBs)", avg_pipe_syncs
     );
-    println!("      {:>30}  {:>9.1}%", "Reduction", reduction);
+    println!(
+        "      {:>35}  {:>10.1}  (GPU-side event chaining)",
+        "ExecGraph", avg_graph_syncs
+    );
+    println!("      {:>35}  {:>9.1}%", "Reduction (graph vs base)", reduction);
 }
 
-fn print_latency_comparison(baseline_stats: &Stats, pipelined_stats: &Stats) {
-    let speedup_mean = if pipelined_stats.mean > 0.0 {
+fn print_latency_comparison(
+    baseline_stats: &Stats,
+    pipelined_stats: &Stats,
+    graph_stats: &Stats,
+) {
+    let speedup_pipe = if pipelined_stats.mean > 0.0 {
         baseline_stats.mean / pipelined_stats.mean
     } else {
         0.0
     };
-    let speedup_p50 = if pipelined_stats.p50 > 0.0 {
-        baseline_stats.p50 / pipelined_stats.p50
+    let speedup_graph = if graph_stats.mean > 0.0 {
+        baseline_stats.mean / graph_stats.mean
     } else {
         0.0
     };
-    let latency_reduction = if baseline_stats.mean > 0.0 {
+    let latency_reduction_pipe = if baseline_stats.mean > 0.0 {
         (1.0 - pipelined_stats.mean / baseline_stats.mean) * 100.0
+    } else {
+        0.0
+    };
+    let latency_reduction_graph = if baseline_stats.mean > 0.0 {
+        (1.0 - graph_stats.mean / baseline_stats.mean) * 100.0
     } else {
         0.0
     };
@@ -421,15 +509,23 @@ fn print_latency_comparison(baseline_stats: &Stats, pipelined_stats: &Stats) {
     println!();
     println!("      Baseline:   {}", baseline_stats);
     println!("      Pipelined:  {}", pipelined_stats);
+    println!("      ExecGraph:  {}", graph_stats);
     println!();
     println!(
-        "      Speedup (mean): {:.2}x    Latency reduction: {:.1}%",
-        speedup_mean, latency_reduction
+        "      Speedup vs baseline (mean):  Pipelined={:.2}x  ExecGraph={:.2}x",
+        speedup_pipe, speedup_graph
     );
-    println!("      Speedup (p50):  {:.2}x", speedup_p50);
+    println!(
+        "      Latency reduction (mean):    Pipelined={:.1}%   ExecGraph={:.1}%",
+        latency_reduction_pipe, latency_reduction_graph
+    );
 }
 
-fn print_statistical_summary(baseline_stats: &Stats, pipelined_stats: &Stats) {
+fn print_statistical_summary(
+    baseline_stats: &Stats,
+    pipelined_stats: &Stats,
+    graph_stats: &Stats,
+) {
     println!();
     println!("  [4] Statistical Reliability");
     println!();
@@ -455,6 +551,15 @@ fn print_statistical_summary(baseline_stats: &Stats, pipelined_stats: &Stats) {
         pipelined_stats.p95,
         pipelined_stats.p99
     );
+    println!(
+        "      {:>20}  {:>12.1}  {:>12.1}  {:>12.1}  {:>12.1}  {:>12.1}",
+        "ExecGraph",
+        graph_stats.mean,
+        graph_stats.std_dev,
+        graph_stats.p50,
+        graph_stats.p95,
+        graph_stats.p99
+    );
 
     // Coefficient of variation (lower is more stable)
     let cv_base = if baseline_stats.mean > 0.0 {
@@ -467,10 +572,15 @@ fn print_statistical_summary(baseline_stats: &Stats, pipelined_stats: &Stats) {
     } else {
         0.0
     };
+    let cv_graph = if graph_stats.mean > 0.0 {
+        graph_stats.std_dev / graph_stats.mean * 100.0
+    } else {
+        0.0
+    };
     println!();
     println!(
-        "      Coefficient of variation:  Baseline={:.1}%  Pipelined={:.1}%",
-        cv_base, cv_pipe
+        "      Coefficient of variation:  Baseline={:.1}%  Pipelined={:.1}%  ExecGraph={:.1}%",
+        cv_base, cv_pipe, cv_graph
     );
 }
 
@@ -513,24 +623,28 @@ fn main() {
 
     let _ = bench_baseline(&block, &input, &registry, &queue, WARMUP_ITERS);
     let _ = bench_pipelined(&block, &input, &registry, &queue, &event, WARMUP_ITERS);
+    let _ = bench_graph(&block, &input, &registry, &queue, WARMUP_ITERS);
 
     // --- Measurement phase ---
     println!("Benchmarking ({} iterations each)...", BENCH_ITERS);
 
-    let (baseline_latencies, baseline_cbs) =
+    let (baseline_latencies, baseline_deltas) =
         bench_baseline(&block, &input, &registry, &queue, BENCH_ITERS);
-    let (pipelined_latencies, pipelined_cbs) =
+    let (pipelined_latencies, pipelined_deltas) =
         bench_pipelined(&block, &input, &registry, &queue, &event, BENCH_ITERS);
+    let (graph_latencies, graph_iter_stats) =
+        bench_graph(&block, &input, &registry, &queue, BENCH_ITERS);
 
     let baseline_stats = Stats::from_durations(&baseline_latencies);
     let pipelined_stats = Stats::from_durations(&pipelined_latencies);
+    let graph_stats = Stats::from_durations(&graph_latencies);
 
     // --- Report ---
     print_header();
-    print_cb_comparison(&baseline_cbs, &pipelined_cbs);
-    print_sync_comparison(&baseline_cbs, &pipelined_cbs);
-    print_latency_comparison(&baseline_stats, &pipelined_stats);
-    print_statistical_summary(&baseline_stats, &pipelined_stats);
+    print_cb_comparison(&baseline_deltas, &pipelined_deltas, &graph_iter_stats);
+    print_sync_comparison(&baseline_deltas, &pipelined_deltas, &graph_iter_stats);
+    print_latency_comparison(&baseline_stats, &pipelined_stats, &graph_stats);
+    print_statistical_summary(&baseline_stats, &pipelined_stats, &graph_stats);
 
     println!();
     print_separator(120);
