@@ -5,6 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+## Enable Metal 3 residency set management (M3+ devices).
+## Stub implementation until the `metal` crate exposes MTLResidencySet bindings.
+metal3 = []
+
 [dependencies]
 rmlx-metal = { path = "../rmlx-metal" }
 libc = { workspace = true }
