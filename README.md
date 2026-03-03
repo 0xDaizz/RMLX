@@ -1,75 +1,86 @@
 # RMLX
 
-**Rust ML runtime for Apple Silicon UMA -- zero-copy distributed inference over TB5 RDMA**
+**Rust ML runtime for Apple Silicon -- zero-copy GPU inference with 16.15x CPU-minimal speedup**
 
+[![CI](https://github.com/user/rmlx/actions/workflows/ci.yml/badge.svg)](https://github.com/user/rmlx/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
 [![Rust 1.80+](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/tests-339%20passing-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-339%2B%20passing-brightgreen.svg)]()
 [![macOS Apple Silicon](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-lightgrey.svg)]()
 
 > 한국어 문서: [docs/README_ko.md](docs/README_ko.md)
 
 ---
 
-RMLX reimplements the core Metal GPU inference pipeline of Apple's [MLX](https://github.com/ml-explore/mlx) framework **entirely in Rust**. It targets the theoretical performance ceiling of distributed LLM inference with Expert Parallelism (EP) on a Mac Studio M3 Ultra cluster connected via Thunderbolt 5 RDMA.
+RMLX reimplements the core Metal GPU inference pipeline of Apple's [MLX](https://github.com/ml-explore/mlx) framework **entirely in Rust**. The ExecGraph pipeline batches 65 command buffers down to 5 per transformer layer, achieving a **16.15x speedup** (110.4ms to 6.8ms) with full numerical parity (max\_diff=6.4e-6).
 
-## Key Features
+## Why RMLX?
 
-- **Zero-copy RDMA data path** -- `posix_memalign` + `newBufferWithBytesNoCopy` + `ibv_reg_mr` share a single physical address across CPU, Metal GPU, and RDMA, eliminating all memcpy from the hot path
-- **MTLSharedEvent synchronization** -- Non-blocking signal/wait replaces `waitUntilCompleted`, achieving 1.61x sync latency improvement (263.9 us vs. 424.9 us)
-- **Dual queue pipeline** -- Separate compute and transfer `MTLCommandQueue`s overlap GPU kernels with RDMA transfers at the hardware level
-- **Eager-first execution** -- Eliminates lazy evaluation graph-build overhead for single-token decode; selective tracing applied for batch prefill
-- **Unified buffer pool** -- Pre-allocated Metal + ibv_mr dual-registered buffers remove runtime registration overhead
+| Feature | RMLX | MLX | CUDA |
+|---------|:----:|:---:|:----:|
+| Unified Memory (zero-copy) | yes | yes | no |
+| Zero-copy RDMA | yes | no | no |
+| MTLSharedEvent sync | yes | no | n/a |
+| ExecGraph CB batching | yes | no | CUDA Graphs |
+| Single Rust binary | yes | no | no |
+| Flash Attention | planned | yes | yes |
+| Paged KV Cache | planned | no | yes (vLLM) |
+| Speculative Decoding | planned | no | yes |
 
-## Performance Target
+## Benchmark Results
 
-```
-2-node EP decode: 64ms/step -> 33ms/step (~30 tok/s)
-Near-parity with single-node 32ms/step
-```
+Measured on Apple Silicon, single transformer layer, Phase 9B-opt complete:
 
-## Tech Stack
+| Metric | Baseline | ExecGraph | Improvement |
+|--------|----------|-----------|-------------|
+| Latency / layer | 110.4 ms | 6.8 ms | **16.15x** speedup |
+| Command buffers / layer | 65 | 5 | 92.3% reduction |
+| CPU-GPU syncs | ~65 | ~1 | 98.5% reduction |
+| Numerical parity | -- | -- | max\_diff=6.4e-6 |
 
-| Component | Technology |
-|-----------|-----------|
-| Language | Rust 1.80+ (edition 2021) |
-| GPU | metal-rs 0.31 (Apple Metal API) |
-| RDMA | ibverbs FFI (Thunderbolt 5 UC QP) |
-| Hardware | Apple Silicon UMA (M3/M4 Ultra, 80-core GPU, 512GB) |
+## Feature Matrix
+
+### Implemented
+
+- **14 op modules** -- matmul, softmax, rms\_norm, rope, gemv, quantized, binary, reduce, copy, indexing, sdpa, silu, swiglu, embedding
+- **ExecGraph pipeline** -- command buffer batching with 92.3% CB reduction
+- **SDPA (Scaled Dot-Product Attention)** -- fused kernel, not full Flash Attention 2
+- **SiLU / SwiGLU** -- fused activations
+- **KV cache** -- static pre-allocated cache
+- **4 model architectures** -- LLaMA, Qwen, DeepSeek-V3, Mixtral
+- **MTLSharedEvent** -- non-blocking GPU-CPU synchronization
+- **RDMA framework** -- ibverbs FFI, UC QP, multi-port Thunderbolt 5
+- **Zero-copy allocator** -- `posix_memalign` + `newBufferWithBytesNoCopy` + `ibv_reg_mr`
+- **Dual queue pipeline** -- separate compute and transfer command queues
+- **VJP / LoRA** -- autodiff and parameter-efficient fine-tuning primitives
+
+### Planned
+
+- Flash Attention 2
+- Paged KV Cache / dynamic cache management
+- Speculative Decoding
+- Continuous Batching
+- Advanced Quantization (AWQ, GPTQ)
+- Python API
 
 ## Architecture
 
-```
-           ┌──────────────┐ ┌─────────────┐ ┌─────────────────┐
-           │   rmlx-nn    │ │  rmlx-core  │ │ rmlx-distributed│
-           │  Transformer │ │  Op registry│ │  EP / MoE /     │
-           │  KV cache    │ │  Array/DType│ │  AllReduce      │
-           │  LLaMA/Qwen/ │ │  VJP/LoRA   │ │  3-zone policy  │
-           │  DeepSeek/   │ │  10 kernels │ │  pipeline       │
-           │  Mixtral     │ │             │ │                 │
-           └──────┬───────┘ └──────┬──────┘ └───────┬─────────┘
-                  │                │                 │
-                  └────────┬───────┘                 │
-                           ▼                         │
-                    ┌─────────────┐                  │
-                    │ rmlx-metal  │                  │
-                    │ Device/Queue│                  │
-                    │ SharedEvent │                  │
-                    │ Dual-queue  │                  │
-                    └──────┬──────┘                  │
-                           │                         │
-                    ┌──────┴──────┐                  │
-                    │ rmlx-alloc  │◄─────────────────┘
-                    │ ZeroCopy    │
-                    │ BufferPool  │
-                    └──────┬──────┘
-                           │
-                    ┌──────┴──────┐
-                    │  rmlx-rdma  │
-                    │ ibverbs FFI │
-                    │ UC QP / CQ  │
-                    │ Multi-port  │
-                    └─────────────┘
+```mermaid
+graph TD
+    NN["rmlx-nn<br/>Transformer, KV Cache<br/>LLaMA/Qwen/DeepSeek/Mixtral"]
+    CORE["rmlx-core<br/>14 Op Modules, Array/DType<br/>VJP/LoRA, ExecMode"]
+    DIST["rmlx-distributed<br/>EP / MoE / AllReduce<br/>3-zone policy"]
+    METAL["rmlx-metal<br/>Device/Queue/SharedEvent<br/>ExecGraph/CommandBatcher"]
+    ALLOC["rmlx-alloc<br/>ZeroCopy, BufferPool"]
+    RDMA["rmlx-rdma<br/>ibverbs FFI, UC QP<br/>Multi-port"]
+
+    NN --> CORE
+    CORE --> METAL
+    CORE --> ALLOC
+    DIST --> CORE
+    DIST --> RDMA
+    ALLOC --> RDMA
+    METAL -.-> ALLOC
 ```
 
 ## Quick Start
@@ -82,7 +93,7 @@ cd rmlx
 # Build the entire workspace
 cargo build --workspace
 
-# Run all tests
+# Run all tests (339+)
 cargo test --workspace
 
 # Format and lint check
@@ -95,12 +106,12 @@ cargo clippy --workspace -- -D warnings
 ## Project Structure
 
 ```
-rmlx/                           # 6 crates, 339 tests
+rmlx/                           # 6 crates, 339+ tests
 ├── crates/
-│   ├── rmlx-metal/             # Metal GPU abstraction (metal-rs 0.31)
+│   ├── rmlx-metal/             # Metal GPU abstraction (ExecGraph, CommandBatcher)
 │   ├── rmlx-alloc/             # Zero-copy memory allocator
 │   ├── rmlx-rdma/              # RDMA communication (ibverbs FFI)
-│   ├── rmlx-core/              # Compute engine (ops, graph, autodiff)
+│   ├── rmlx-core/              # Compute engine (14 op modules, graph, autodiff)
 │   ├── rmlx-distributed/       # Distributed primitives (EP, MoE)
 │   └── rmlx-nn/                # Neural network layers (Transformer, MoE)
 ├── shaders/                    # Metal shader sources
@@ -116,10 +127,20 @@ This repository contains the **framework only**. The model serving layer (`rmlx-
 | Metric | Value |
 |--------|-------|
 | Crates | 6 |
-| Tests | 339 |
-| Metal kernels | 10 (matmul, softmax, rms_norm, rope, gemv, quantized, binary, reduce, copy, indexing) |
+| Tests | 339+ |
+| Op modules | 14 |
 | Model architectures | 4 (LLaMA, Qwen, DeepSeek-V3, Mixtral) |
-| Implementation phases | 8 (all complete) |
+| Implementation phases | 9 (Phase 0 -- 9B-opt complete) |
+
+## Current Limitations
+
+- **No Flash Attention** -- fused SDPA exists but not full Flash Attention 2
+- **No paged attention** -- static KV cache only, no dynamic cache management
+- **No speculative decoding**
+- **No continuous batching**
+- **Single-node only** -- RDMA framework exists but is not integrated into the serving path
+- **No Python API** -- Rust-only interface
+- **TB5 bandwidth** -- limited to 16 GB/s vs NVLink 600 GB/s
 
 ## Documentation
 
@@ -130,6 +151,8 @@ Full documentation: **[docs/README.md](docs/README.md)**
 - [Design Decisions](docs/architecture/design-decisions.md)
 - [Getting Started](docs/getting-started/prerequisites.md)
 - [Implementation Roadmap](docs/roadmap/phases.md)
+- [GPU Pipeline & ExecGraph](docs/gpu-pipeline.md)
+- [RMLX vs MLX vs CUDA Comparison](docs/comparison.md)
 
 ## License
 

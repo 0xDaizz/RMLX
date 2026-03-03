@@ -2,7 +2,7 @@
 
 > **A Rust-based Metal GPU inference engine optimized for Apple Silicon**
 >
-> Status: All Phases complete (339 tests, 0 failures) | License: MIT OR Apache-2.0 | Rust 1.80+ | macOS (Apple Silicon)
+> Status: All Phases complete (0-9B-opt) (339+ tests, 0 failures) | License: MIT OR Apache-2.0 | Rust 1.80+ | macOS (Apple Silicon)
 
 ---
 
@@ -24,6 +24,7 @@ MLX is an excellent framework, but it carries the following software overheads i
 | **Sync inefficiency** | `waitUntilCompleted` blocking (424.9 us) | `MTLSharedEvent` spin-wait (263.9 us, 1.61x improvement) |
 | **Memory copies** | `std::copy`-based RDMA transfers | Zero-copy: dual Metal + RDMA registration on the same physical address |
 | **No pipeline** | Compute -> Transfer runs sequentially | Dual `MTLCommandQueue` for GPU-level overlap |
+| **CB overhead** | 65 CBs/layer, per-op CPU sync | ExecGraph: 5 CBs/layer (92.3% reduction, 16.15x speedup) |
 | **Lazy evaluation** | Graph build overhead even for single-token decode | Eager-first + selective tracing compilation |
 
 ---
@@ -33,6 +34,9 @@ MLX is an excellent framework, but it carries the following software overheads i
 ```
 2-node EP decode: 64ms/step -> 33ms/step (~30 tok/s)
 Achieve near-parity with single-node 32ms/step
+
+ExecGraph result: 110.4ms/layer -> 6.8ms/layer (16.15x speedup)
+92.3% CB reduction, 98.5% CPU-GPU sync reduction
 ```
 
 The ultimate goal is to connect two Mac Studio M3 Ultras via Thunderbolt 5 RDMA and achieve inference performance nearly identical to a single node.
@@ -56,6 +60,10 @@ The ultimate goal is to connect two Mac Studio M3 Ultras via Thunderbolt 5 RDMA 
 5. **Unified buffer pool**
    Pre-allocates dual Metal + RDMA registered buffers, eliminating runtime registration overhead.
 
+6. **ExecGraph CB batching**
+   Reduces 65 command buffers per transformer layer to 5 through deterministic operation
+   grouping, achieving 16.15x speedup (110.4ms → 6.8ms) with 92.3% CB reduction.
+
 ---
 
 ## Tech Stack
@@ -75,6 +83,8 @@ The ultimate goal is to connect two Mac Studio M3 Ultras via Thunderbolt 5 RDMA 
 - [Architecture Overview](architecture/overview.md) — Full system layer diagram and design philosophy
 - [Crate Structure](architecture/crate-structure.md) — Workspace layout and role of each crate
 - [Design Decisions](architecture/design-decisions.md) — Rationale behind key technical decisions
+- [GPU Pipeline](gpu-pipeline.md) — ExecGraph architecture and benchmark results
+- [RMLX vs MLX vs CUDA](comparison.md) — Honest architecture comparison
 
 ---
 
