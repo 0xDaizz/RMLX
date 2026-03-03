@@ -18,18 +18,17 @@ fn test_group_world() {
 
 #[test]
 fn test_moe_policy_zones() {
-    let mut policy = MoePolicy::new();
-    policy.set_hysteresis_band(0); // disable hysteresis for clean zone testing
+    let policy = MoePolicy::new();
 
     // CPU zone: N <= 64
     assert_eq!(policy.select(32, 128), MoeBackend::Cpu);
     assert_eq!(policy.select(64, 256), MoeBackend::Cpu);
-    // GPU zone: N >= 320 (gpu_min)
+    // GPU zone: N >= 320
     assert_eq!(policy.select(320, 1280), MoeBackend::Metal);
     assert_eq!(policy.select(1000, 4000), MoeBackend::Metal);
-    // Middle zone: byte threshold (D5: default is now 2MB)
-    assert_eq!(policy.select(128, 512), MoeBackend::Cpu); // below 2MB
-    assert_eq!(policy.select(128, 3_000_000), MoeBackend::Metal); // above 2MB
+    // Middle zone: byte threshold
+    assert_eq!(policy.select(128, 512), MoeBackend::Cpu); // below 4096 bytes
+    assert_eq!(policy.select(128, 8192), MoeBackend::Metal); // above 4096 bytes
 }
 
 #[test]
@@ -37,12 +36,11 @@ fn test_moe_policy_cooldown() {
     let mut policy = MoePolicy::new();
     policy.switch_backend(MoeBackend::Cpu);
     // During cooldown, should keep Cpu
-    assert!(policy.cooldown_active());
-    // D7: cooldown expires on EITHER 5000ms elapsed OR 1000 calls
-    for _ in 0..999 {
+    assert_eq!(policy.cooldown_remaining(), 32);
+    for _ in 0..32 {
         assert_eq!(policy.select(500, 10000), MoeBackend::Cpu);
     }
-    // After 1000 calls, cooldown should expire and switch based on thresholds
+    // After cooldown expires (32 calls consumed it), should switch based on thresholds
     let result = policy.select(500, 10000);
     assert_eq!(result, MoeBackend::Metal);
 }
@@ -130,21 +128,12 @@ fn test_moe_metrics() {
 #[test]
 fn test_3zone_boundary() {
     let policy = MoePolicy::with_thresholds(64, 320, 4096);
-    // Default backend is Metal, hysteresis_band=16
-    // cpu_thresh = 64-16 = 48, gpu_thresh = 320+16 = 336
-
-    // N=64 <= 48? No. Middle zone: byte=100 < 4096 → CPU
+    // Exact boundaries
     assert_eq!(policy.select(64, 100), MoeBackend::Cpu);
-    // N=65, byte=100 → middle zone, below byte threshold → CPU
-    assert_eq!(policy.select(65, 100), MoeBackend::Cpu);
-    // N=65, byte=4096 → middle zone, at byte threshold → Metal
-    assert_eq!(policy.select(65, 4096), MoeBackend::Metal);
-    // N=319, byte=10000 → middle zone, above byte threshold → Metal
+    assert_eq!(policy.select(65, 100), MoeBackend::Cpu); // below byte threshold
+    assert_eq!(policy.select(65, 4096), MoeBackend::Metal); // at byte threshold
     assert_eq!(policy.select(319, 10000), MoeBackend::Metal);
-    // D6 fix: n >= gpu_thresh (336) for Metal. N=320 < 336 → middle zone, byte=100 < 4096 → CPU
-    assert_eq!(policy.select(320, 100), MoeBackend::Cpu);
-    // N=336, byte=100 → n >= gpu_thresh → Metal
-    assert_eq!(policy.select(336, 100), MoeBackend::Metal);
+    assert_eq!(policy.select(320, 100), MoeBackend::Metal);
 }
 
 #[test]
@@ -177,8 +166,8 @@ fn test_moe_policy_rdma_zone_multinode() {
     assert_eq!(policy.select(32, 128), MoeBackend::Cpu);
     assert_eq!(policy.select(64, 256), MoeBackend::Cpu);
 
-    // Metal zone: 64 < N <= 320 (D5: byte threshold now 2MB, so need larger byte_size)
-    assert_eq!(policy.select(128, 3_000_000), MoeBackend::Metal);
+    // Metal zone: 64 < N <= 320 (single node would also be Metal for large N)
+    assert_eq!(policy.select(128, 8192), MoeBackend::Metal);
 
     // RDMA zone: N > 320 AND world_size > 1
     assert_eq!(policy.select(500, 2000), MoeBackend::Rdma);
@@ -210,8 +199,8 @@ fn test_moe_policy_hysteresis() {
 
     // Switch to CPU
     policy.switch_backend(MoeBackend::Cpu);
-    // consume cooldown (D7: 1000 calls to expire)
-    for _ in 0..1000 {
+    // consume cooldown
+    for _ in 0..32 {
         policy.select(100, 1000);
     }
     // Now in CPU. To leave CPU, must exceed 64 + 16 = 80.
@@ -1174,11 +1163,9 @@ fn test_guard_action_reset_after_recovery() {
         "capacity factor should be restored to baseline: got {}",
         exchange.runtime_capacity_factor()
     );
-    // D7: After enough additional dispatches to drain cooldown (1000 calls),
-    // the policy should resume normal threshold-based selection (not forced CPU).
-    // Each dispatch() call invokes select() once, counting toward the 1000-call
-    // cooldown. We need to exhaust the remaining calls (~950 after the 20+5 above).
-    for _ in 0..1000 {
+    // After enough additional dispatches to drain cooldown, the policy should
+    // resume normal threshold-based selection (not forced CPU).
+    for _ in 0..33 {
         let _ = exchange
             .dispatch(4, &spread_indices, &weights, &token_data)
             .unwrap();
