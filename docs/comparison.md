@@ -24,8 +24,15 @@
 | **Flash Attention** | Flash Attention 2 (D≤256) | No (fused SDPA) | FlashAttention-2/3 |
 | **KV cache** | Static, Rotating, Batch, Quantized | Static per-layer cache | PagedAttention (vLLM) |
 | **Training** | LoRA fine-tuning only | Full training support | Full training + LoRA + QLoRA |
-| **Op modules** | 18 | ~50+ | Hundreds |
-| **Test suite** | 390+ tests | Extensive | Extensive |
+| **Op modules** | 25 | ~50+ | Hundreds |
+| **NN activations** | 14 | ~10 | Dozens |
+| **GatherMM** | Yes | Yes | Yes |
+| **LayerNorm** | Yes | Yes | Yes |
+| **QuantizedLinear** | Yes | Yes | Yes |
+| **MLA** | Yes (DeepSeek-V3) | No | Partial |
+| **Sliding Window Attn** | Yes | Yes | Yes |
+| **GGUF model loading** | Yes | Yes | Yes |
+| **Test suite** | 534 tests | Extensive | Extensive |
 | **Phases complete** | 0-9B-opt + S1-S5 | N/A (stable release) | N/A (stable release) |
 
 ---
@@ -307,7 +314,7 @@ RMLX maintains strict numerical parity between its baseline execution path and t
 |--------|-------|
 | max_diff (baseline vs ExecGraph) | 6.4e-6 |
 | Tolerance threshold | 1e-4 |
-| Test coverage | 390+ tests |
+| Test coverage | 534 tests |
 | Verification method | Element-wise comparison across all ops |
 
 This ensures that the 16.15x performance improvement from ExecGraph introduces no meaningful numerical drift.
@@ -323,6 +330,8 @@ The following gaps identified in earlier versions have been closed:
 | **Phase S3a** | Attention Optimization | Flash Attention 2 (K/V outer loop, D≤256, decode fast path) | Sections 4.1 (closed) |
 | **Phase S2** | Advanced Quantization | GGUF loader, AWQ/GPTQ dequant, FP8 dtypes | Section 4.4 (closed) |
 
+The Phase 0+1+2 full-crate audit added 76 items including GatherMM, LayerNorm, unary ops, QuantizedLinear, MLA, sliding window attention, GGUF loading, 14 activation functions, ring/allreduce collectives, connection manager, and coordinator.
+
 Remaining gaps: Python API, speculative decoding, and NVIDIA-specific quantization formats (INT4/INT8).
 
 ---
@@ -335,4 +344,4 @@ RMLX is not a replacement for MLX or CUDA. It occupies a specific niche: **high-
 
 **Choose MLX when**: You need Python compatibility, a mature ecosystem, training support, or broad quantization format support.
 
-**Choose CUDA when**: You need maximum absolute performance, production serving at scale, Flash Attention, speculative decoding, or access to the largest ecosystem of tools and libraries.
+**Choose CUDA when**: You need maximum absolute performance, production serving at scale, speculative decoding, or access to the largest ecosystem of tools and libraries.

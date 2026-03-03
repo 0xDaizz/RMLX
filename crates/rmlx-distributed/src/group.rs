@@ -843,6 +843,7 @@ fn add_f32_inplace(dst: &mut [u8], src: &[u8]) {
     }
 }
 
+/// Element-wise f32 reduction with configurable op: dst[i] = op(dst[i], src[i]).
 fn reduce_f32_inplace(dst: &mut [u8], src: &[u8], op: ReduceOp) {
     let count = dst.len().min(src.len()) / 4;
     for i in 0..count {

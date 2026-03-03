@@ -283,11 +283,7 @@ pub fn concat(
 
     let out_numel: usize = out_shape.iter().product();
     if out_numel == 0 {
-        return Ok(Array::zeros(
-            registry.device().raw(),
-            &out_shape,
-            a.dtype(),
-        ));
+        return Ok(Array::zeros(registry.device().raw(), &out_shape, a.dtype()));
     }
 
     // Ensure contiguous
@@ -376,17 +372,22 @@ pub fn concat_many(
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_concat_axis0_1d() {
-        let device = metal::Device::system_default().unwrap();
-        let queue = device.new_command_queue();
-        let gpu_dev = rmlx_metal::device::GpuDevice::new(device.clone());
+    fn setup() -> (KernelRegistry, metal::CommandQueue) {
+        let gpu_dev = rmlx_metal::device::GpuDevice::system_default().unwrap();
+        let queue = gpu_dev.raw().new_command_queue();
         let registry = KernelRegistry::new(gpu_dev);
         register(&registry).unwrap();
         crate::ops::copy::register(&registry).unwrap();
+        (registry, queue)
+    }
 
-        let a = Array::from_slice(&device, &[1.0f32, 2.0, 3.0], vec![3]);
-        let b = Array::from_slice(&device, &[4.0f32, 5.0], vec![2]);
+    #[test]
+    fn test_concat_axis0_1d() {
+        let (registry, queue) = setup();
+        let device = registry.device().raw();
+
+        let a = Array::from_slice(device, &[1.0f32, 2.0, 3.0], vec![3]);
+        let b = Array::from_slice(device, &[4.0f32, 5.0], vec![2]);
 
         let out = concat(&registry, &a, &b, 0, &queue).unwrap();
         assert_eq!(out.shape(), &[5]);
@@ -396,17 +397,13 @@ mod tests {
 
     #[test]
     fn test_concat_axis1_2d() {
-        let device = metal::Device::system_default().unwrap();
-        let queue = device.new_command_queue();
-        let gpu_dev = rmlx_metal::device::GpuDevice::new(device.clone());
-        let registry = KernelRegistry::new(gpu_dev);
-        register(&registry).unwrap();
-        crate::ops::copy::register(&registry).unwrap();
+        let (registry, queue) = setup();
+        let device = registry.device().raw();
 
         // a: [[1,2],[3,4]] shape [2, 2]
-        let a = Array::from_slice(&device, &[1.0f32, 2.0, 3.0, 4.0], vec![2, 2]);
+        let a = Array::from_slice(device, &[1.0f32, 2.0, 3.0, 4.0], vec![2, 2]);
         // b: [[5],[6]] shape [2, 1]
-        let b = Array::from_slice(&device, &[5.0f32, 6.0], vec![2, 1]);
+        let b = Array::from_slice(device, &[5.0f32, 6.0], vec![2, 1]);
 
         let out = concat(&registry, &a, &b, 1, &queue).unwrap();
         assert_eq!(out.shape(), &[2, 3]);
@@ -416,15 +413,11 @@ mod tests {
 
     #[test]
     fn test_concat_shape_mismatch() {
-        let device = metal::Device::system_default().unwrap();
-        let queue = device.new_command_queue();
-        let gpu_dev = rmlx_metal::device::GpuDevice::new(device.clone());
-        let registry = KernelRegistry::new(gpu_dev);
-        register(&registry).unwrap();
-        crate::ops::copy::register(&registry).unwrap();
+        let (registry, queue) = setup();
+        let device = registry.device().raw();
 
-        let a = Array::from_slice(&device, &[1.0f32, 2.0], vec![2]);
-        let b = Array::from_slice(&device, &[3.0f32, 4.0, 5.0, 6.0], vec![2, 2]);
+        let a = Array::from_slice(device, &[1.0f32, 2.0], vec![2]);
+        let b = Array::from_slice(device, &[3.0f32, 4.0, 5.0, 6.0], vec![2, 2]);
 
         let result = concat(&registry, &a, &b, 0, &queue);
         assert!(result.is_err());

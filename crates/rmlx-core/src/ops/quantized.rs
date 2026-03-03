@@ -461,6 +461,7 @@ kernel void gptq_dequant_f32(
 pub fn register(registry: &KernelRegistry) -> Result<(), KernelError> {
     registry.register_jit_source("quantized", QUANTIZED_SHADER_SOURCE)?;
     register_qmm(registry)?;
+    register_gather_qmm(registry)?;
     Ok(())
 }
 
@@ -1214,6 +1215,238 @@ pub fn affine_quantized_matmul_batched(
     let grid_y = n.div_ceil(BN_Q) as u64;
     let grid = metal::MTLSize::new(grid_y, grid_x, 1);
     let tg = metal::MTLSize::new((BM_Q * BN_Q) as u64, 1, 1);
+
+    enc.dispatch_thread_groups(grid, tg);
+    enc.end_encoding();
+    cb.commit();
+    cb.wait_until_completed();
+
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// GatherQMM: Index-based quantized matmul for MoE
+// ---------------------------------------------------------------------------
+
+/// Metal shader for GatherQMM — combines GatherMM (C4) with Q4 dequantization.
+///
+/// Each batch element selects an expert's Q4 weight via an index tensor.
+/// Computes `output[b] = x[b] @ dequant(w_packed[indices[b]])`.
+///
+/// Layout:
+/// - x:         [batch, M_per_batch, K]   (f32 input activations)
+/// - w_packed:  [n_experts, N, K/2]       (Q4 packed expert weights)
+/// - scales:    [n_experts, N, groups_per_row] (f32)
+/// - biases:    [n_experts, N, groups_per_row] (f32)
+/// - indices:   [batch]                    (uint32 expert index per batch element)
+/// - output:    [batch, M_per_batch, N]    (f32)
+pub const GATHER_QMM_SHADER_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant constexpr uint BM_GQ = 16;
+constant constexpr uint BN_GQ = 16;
+
+// GatherQMM kernel: per-batch-element quantized matmul with expert selection.
+// Each thread computes one (m, n) output element for one batch.
+kernel void gather_qmm_f32(
+    device const float*   x         [[buffer(0)]],
+    device const uint8_t* w_packed  [[buffer(1)]],
+    device const float*   scales    [[buffer(2)]],
+    device const float*   biases    [[buffer(3)]],
+    device const uint*    indices   [[buffer(4)]],
+    device float*         output    [[buffer(5)]],
+    constant uint& batch_size       [[buffer(6)]],
+    constant uint& M_per_batch      [[buffer(7)]],
+    constant uint& N                [[buffer(8)]],
+    constant uint& K                [[buffer(9)]],
+    constant uint& group_size       [[buffer(10)]],
+    constant uint& n_experts        [[buffer(11)]],
+    uint3 group_id     [[threadgroup_position_in_grid]],
+    uint  tid_in_group [[thread_index_in_threadgroup]])
+{
+    const uint batch_idx = group_id.z;
+    if (batch_idx >= batch_size) return;
+
+    const uint expert_idx = indices[batch_idx];
+    if (expert_idx >= n_experts) return;
+    const uint groups_per_row = K / group_size;
+    const uint half_k = K / 2;
+
+    const uint local_row = tid_in_group / BN_GQ;
+    const uint local_col = tid_in_group % BN_GQ;
+
+    const uint out_m = group_id.y * BM_GQ + local_row;
+    const uint out_n = group_id.x * BN_GQ + local_col;
+
+    if (out_m >= M_per_batch || out_n >= N) return;
+
+    // Pointers for this batch element and expert
+    device const float*   x_row = x + batch_idx * M_per_batch * K + out_m * K;
+    device const uint8_t* w_row = w_packed + expert_idx * N * half_k + out_n * half_k;
+    device const float*   s_row = scales + expert_idx * N * groups_per_row + out_n * groups_per_row;
+    device const float*   b_row = biases + expert_idx * N * groups_per_row + out_n * groups_per_row;
+
+    float acc = 0.0f;
+
+    for (uint g = 0; g < groups_per_row; g++) {
+        float scale = s_row[g];
+        float bias  = b_row[g];
+
+        float group_dot  = 0.0f;
+        float group_xsum = 0.0f;
+
+        uint k_start = g * group_size;
+        uint byte_start = k_start / 2;
+        uint bytes_per_group = group_size / 2;
+
+        for (uint b = 0; b < bytes_per_group; b++) {
+            uint8_t packed = w_row[byte_start + b];
+            float q_lo = float(packed & 0x0F);
+            float q_hi = float((packed >> 4) & 0x0F);
+
+            uint kk = k_start + b * 2;
+            float x0 = x_row[kk];
+            float x1 = x_row[kk + 1];
+
+            group_dot  += q_lo * x0 + q_hi * x1;
+            group_xsum += x0 + x1;
+        }
+
+        acc += scale * group_dot + bias * group_xsum;
+    }
+
+    output[batch_idx * M_per_batch * N + out_m * N + out_n] = acc;
+}
+"#;
+
+/// Register the GatherQMM Metal kernel with the given registry.
+pub fn register_gather_qmm(registry: &KernelRegistry) -> Result<(), KernelError> {
+    registry.register_jit_source("gather_qmm", GATHER_QMM_SHADER_SOURCE)
+}
+
+/// Ceiling division helper for GatherQMM dispatch.
+fn gather_qmm_ceil_div(a: usize, b: usize) -> usize {
+    a.div_ceil(b)
+}
+
+/// Create a u32 Metal constant buffer (for GatherQMM).
+fn gather_qmm_u32_buf(device: &metal::DeviceRef, val: u32) -> metal::Buffer {
+    let opts = metal::MTLResourceOptions::StorageModeShared;
+    device.new_buffer_with_data(&val as *const u32 as *const _, 4, opts)
+}
+
+/// Index-based quantized matmul for MoE expert dispatch (GatherQMM).
+///
+/// Combines GatherMM (index-based expert selection) with Q4 dequantization.
+/// Each batch element selects an expert's Q4-packed weight matrix via `indices`,
+/// and computes the dequantized matmul in a single fused kernel.
+///
+/// # Arguments
+/// - `x`: f32 input activations `[batch, m_per_batch, k]`
+/// - `qw`: Q4 quantized expert weights (n_experts sets of weights)
+/// - `indices`: expert index per batch element `[batch]` (UInt32)
+/// - `n_experts`: number of expert weight sets
+/// - `m_per_batch`: rows per batch element
+/// - `n`: output columns per expert
+/// - `k`: inner dimension (input features)
+///
+/// # Returns
+/// f32 output `[batch, m_per_batch, n]`.
+#[allow(clippy::too_many_arguments)]
+pub fn gather_qmm(
+    registry: &KernelRegistry,
+    x: &Array,
+    w_packed_buf: &metal::Buffer,
+    scales_buf: &metal::Buffer,
+    biases_buf: &metal::Buffer,
+    indices: &Array,
+    batch: usize,
+    m_per_batch: usize,
+    n: usize,
+    k: usize,
+    n_experts: usize,
+    group_size: u32,
+    queue: &metal::CommandQueue,
+) -> Result<Array, KernelError> {
+    if x.dtype() != DType::Float32 {
+        return Err(KernelError::InvalidShape(format!(
+            "gather_qmm requires Float32 input x, got {:?}",
+            x.dtype()
+        )));
+    }
+    if indices.dtype() != DType::UInt32 {
+        return Err(KernelError::InvalidShape(format!(
+            "gather_qmm: indices must be UInt32, got {:?}",
+            indices.dtype()
+        )));
+    }
+    if indices.shape()[0] != batch {
+        return Err(KernelError::InvalidShape(format!(
+            "gather_qmm: indices length {} != batch {}",
+            indices.shape()[0],
+            batch
+        )));
+    }
+    if k % 2 != 0 {
+        return Err(KernelError::InvalidShape(format!(
+            "gather_qmm: K ({k}) must be even for Q4 packing"
+        )));
+    }
+    if k % (group_size as usize) != 0 {
+        return Err(KernelError::InvalidShape(format!(
+            "gather_qmm: K ({k}) must be a multiple of group_size ({group_size})"
+        )));
+    }
+
+    // Rust-side validation: all expert indices must be in [0, n_experts)
+    if batch > 0 {
+        let idx_vec = indices.to_vec_checked::<u32>();
+        for (i, &idx) in idx_vec.iter().enumerate() {
+            if (idx as usize) >= n_experts {
+                return Err(KernelError::InvalidShape(format!(
+                    "gather_qmm: index[{i}]={idx} out of range [0, {n_experts})"
+                )));
+            }
+        }
+    }
+
+    let pipeline = registry.get_pipeline("gather_qmm_f32", DType::Float32)?;
+    let dev = registry.device().raw();
+    let out = Array::zeros(dev, &[batch, m_per_batch, n], DType::Float32);
+
+    let batch_buf = gather_qmm_u32_buf(dev, super::checked_u32(batch, "batch")?);
+    let m_buf = gather_qmm_u32_buf(dev, super::checked_u32(m_per_batch, "M_per_batch")?);
+    let n_buf = gather_qmm_u32_buf(dev, super::checked_u32(n, "N")?);
+    let k_buf = gather_qmm_u32_buf(dev, super::checked_u32(k, "K")?);
+    let gs_buf = gather_qmm_u32_buf(dev, group_size);
+    let ne_buf = gather_qmm_u32_buf(dev, super::checked_u32(n_experts, "n_experts")?);
+
+    let cb = queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
+    enc.set_buffer(1, Some(w_packed_buf), 0);
+    enc.set_buffer(2, Some(scales_buf), 0);
+    enc.set_buffer(3, Some(biases_buf), 0);
+    enc.set_buffer(4, Some(indices.metal_buffer()), indices.offset() as u64);
+    enc.set_buffer(5, Some(out.metal_buffer()), 0);
+    enc.set_buffer(6, Some(&batch_buf), 0);
+    enc.set_buffer(7, Some(&m_buf), 0);
+    enc.set_buffer(8, Some(&n_buf), 0);
+    enc.set_buffer(9, Some(&k_buf), 0);
+    enc.set_buffer(10, Some(&gs_buf), 0);
+    enc.set_buffer(11, Some(&ne_buf), 0);
+
+    const BM_GQ: usize = 16;
+    const BN_GQ: usize = 16;
+
+    let grid = metal::MTLSize::new(
+        gather_qmm_ceil_div(n, BN_GQ) as u64,
+        gather_qmm_ceil_div(m_per_batch, BM_GQ) as u64,
+        batch as u64,
+    );
+    let tg = metal::MTLSize::new((BM_GQ * BN_GQ) as u64, 1, 1);
 
     enc.dispatch_thread_groups(grid, tg);
     enc.end_encoding();

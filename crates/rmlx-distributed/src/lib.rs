@@ -17,11 +17,11 @@ pub mod warmup;
 // ── Re-exports of core types ──
 pub use credit_manager::CreditManager;
 pub use ep_runtime::EpRuntimeContext;
-pub use group::{DistributedError, Group, RdmaTransport};
+pub use group::{DistributedError, Group, RdmaTransport, ReduceDtype, ReduceOp};
 pub use metrics::{MoeMetrics as MoeMetricsAtomic, MoeMetricsSnapshot};
 pub use moe_exchange::{
     AsyncCombineHandle, AsyncDispatchResult, DispatchLayout, DispatchResult, MoeCombineExchange,
-    MoeDispatchConfig, MoeDispatchExchange,
+    MoeDispatchConfig, MoeDispatchExchange, MoeDtype,
 };
 pub use moe_policy::{MoeBackend, MoePolicy, ThresholdCalibration};
 pub use perf_counters::{global_counters, PerfCounters, PerfSnapshot};

@@ -2,8 +2,11 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod collectives;
 pub mod connection;
+pub mod connection_manager;
 pub mod context;
+pub mod coordinator;
 pub mod exchange;
 pub mod exchange_tag;
 pub mod ffi;
@@ -17,11 +20,17 @@ pub mod rdma_metrics;
 pub mod shared_buffer;
 
 // ── Re-exports of core types ──
+pub use collectives::{
+    apply_reduce_op, chunk_boundaries, ring_allgather, ring_allreduce, ring_reduce_scatter,
+    ReduceOp,
+};
 pub use connection::{
     CompletionTracker, PostedOp, PostedOpKind, RdmaConfig, RdmaConnection, RegisteredRecv,
     RegisteredSend,
 };
+pub use connection_manager::ConnectionManager;
 pub use context::{ProtectionDomain, RdmaContext, RdmaDeviceProbe};
+pub use coordinator::{all_gather_bytes, all_gather_qp_info, barrier, CoordinatorConfig};
 pub use exchange::ExchangeConfig;
 pub use exchange_tag::{ExchangeTag, WrIdFields};
 pub use gpu_doorbell::{

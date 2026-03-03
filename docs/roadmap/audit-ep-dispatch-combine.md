@@ -2,84 +2,70 @@
 
 > Date: 2026-03-03
 > Scope: `rmlx-distributed` (RMLX) vs `~/mlx` on node1 (MLX)
-> Status: **Audit complete — fixes required**
+> Status: **All findings RESOLVED** (Phase 0+1+2 audit remediation, 2026-03-03)
 
 ---
 
 ## Summary
 
 The high-level 3-zone auto backend design (CPU ≤64, Metal ≥320, RDMA) matches MLX.
-However, dispatch loop ordering, per-rank capacity layout, and combine kernel caching
-have correctness and performance issues that must be addressed.
+All 6 findings from the original audit have been resolved in the Phase 0+1+2 full-crate
+audit remediation. Dispatch loop ordering, per-rank capacity layout, combine kernel
+caching, byte threshold, hysteresis, and cooldown semantics have all been fixed.
 
 ---
 
-## 1. Critical Discrepancies (Must Fix)
+## 1. Critical Discrepancies -- RESOLVED
 
-### 1.1 Dispatch Loop Ordering
+### 1.1 Dispatch Loop Ordering -- RESOLVED (commit `07fad80`, D1)
 
-| | RMLX | MLX |
-|---|------|-----|
-| Loop | `batch-outer, k-inner` | `k-outer, n-inner` |
-| File | `moe_exchange.rs:495-519` | `cpu/distributed.cpp:180-230` |
+| | RMLX (before) | RMLX (after) | MLX |
+|---|------|------|-----|
+| Loop | `batch-outer, k-inner` | `k-outer, n-inner` | `k-outer, n-inner` |
+| File | `moe_exchange.rs:495-519` | `moe_exchange.rs` (refactored) | `cpu/distributed.cpp:180-230` |
 
-MLX uses `k-outer` — top-1 selections (k=0) fill expert slots across all tokens first, then top-2 (k=1) fills remaining slots. This matches the DeepSeek/GShard convention where higher-priority expert assignments get slot priority.
+**Resolution**: Loop ordering changed to `k-outer, n-inner` to match DeepSeek/GShard convention.
 
-RMLX uses `batch-outer` — all k selections for each token are assigned before moving to the next token. Given the same input, this produces **different routing results** than MLX.
+### 1.2 Per-Rank Capacity Partitioning -- RESOLVED (commit `07fad80`, D2)
 
-**Fix**: Change loop to `k-outer, n-inner`.
+| | RMLX (before) | RMLX (after) | MLX |
+|---|------|------|-----|
+| Method | Global capacity per expert | Per-source-rank capacity partitioning | Per-source-rank capacity partitioning |
+| Layout | `[experts, capacity_per_expert, D]` flat | `[experts_per_device, world_size * capacity, D]` | `[experts_per_device, world_size * capacity, D]` |
 
-### 1.2 Per-Rank Capacity Partitioning
+**Resolution**: Dispatch layout changed to per-source-rank capacity partitioning.
 
-| | RMLX | MLX |
-|---|------|-----|
-| Method | Global capacity per expert | Per-source-rank capacity partitioning |
-| Layout | `[experts, capacity_per_expert, D]` flat | `[experts_per_device, world_size * capacity, D]` |
+### 1.3 Combine Metal Kernel Not Cached -- RESOLVED (commit `07fad80`, D3)
 
-MLX gives each source rank an independent `capacity` number of slots per expert. RMLX shares a global capacity, so in multi-node scenarios one rank's tokens can overwrite another rank's slots.
+| | RMLX (before) | RMLX (after) | MLX |
+|---|------|------|-----|
+| Caching | `combine_metal_cache` field exists but is **dead code** | `combine_metal_cache` fully wired up | `get_moe_kernel()` with built-in caching |
 
-**Fix**: Change dispatch layout to `[experts_per_device, world_size * capacity, D]`.
-
-### 1.3 Combine Metal Kernel Not Cached
-
-| | RMLX | MLX |
-|---|------|-----|
-| Caching | `combine_metal_cache` field exists but is **dead code** | `get_moe_kernel()` with built-in caching |
-| File | `moe_exchange.rs` `MoeCombineExchange::combine_metal()` | `metal/moe.cpp` |
-
-Every call creates a new Metal device, library, pipeline, and command queue. Severe performance bug.
-
-**Fix**: Wire up `combine_metal_cache` following the dispatch `metal_cache: Mutex<Option<CachedMetalPipeline>>` pattern.
+**Resolution**: `combine_metal_cache` wired up following the dispatch `metal_cache: Mutex<Option<CachedMetalPipeline>>` pattern. No more per-call Metal device/library/pipeline/queue creation.
 
 ---
 
-## 2. Medium Discrepancies (Should Fix)
+## 2. Medium Discrepancies -- RESOLVED
 
-### 2.1 Middle Zone Byte Threshold
+### 2.1 Middle Zone Byte Threshold -- RESOLVED (commit `014875e`, D5)
 
-| | RMLX | MLX |
-|---|------|-----|
-| Value | 4KB (`4_096`) | 2MB (`2_097_152`) |
-| File | `moe_policy.rs` default | `moe_policy.cpp` `MLX_MOE_EP_GPU_SWITCH_BYTES` |
+| | RMLX (before) | RMLX (after) | MLX |
+|---|------|------|-----|
+| Value | 4KB (`4_096`) | 2MB (`2_097_152`) | 2MB (`2_097_152`) |
 
-4KB is **4 orders of magnitude** lower. RMLX selects Metal unnecessarily for almost all middle-zone workloads.
+**Resolution**: Default byte threshold changed from 4KB to 2MB to match MLX.
 
-**Fix**: Change default to 2MB, or use `ThresholdCalibration` result.
+### 2.2 Hysteresis Path Gap -- RESOLVED (commit `014875e`, D6)
 
-### 2.2 Hysteresis Path Gap
+**Resolution**: `self.gpu_min` replaced with `gpu_thresh` (hysteresis-aware value) on the Metal-only path. Hysteresis is now consistently applied across all zone transitions.
 
-`moe_policy.rs:select()` line 145 uses raw `self.gpu_min` without hysteresis for the Metal-only path. Hysteresis is applied to CPU-to-Metal and Metal-to-RDMA transitions but not to the middle zone Metal decision.
+### 2.3 Cooldown Semantics -- RESOLVED (commit `014875e`, D7)
 
-**Fix**: Replace `self.gpu_min` with `gpu_thresh` on line 145.
+| | RMLX (before) | RMLX (after) | MLX |
+|---|------|------|-----|
+| Method | 32 steps (count-based only) | Dual: time-based (5000ms) OR count-based (1000 calls) | 5000ms OR 1000 calls (whichever first) |
 
-### 2.3 Cooldown Semantics Differ
-
-| | RMLX | MLX |
-|---|------|-----|
-| Method | 32 steps (count-based only) | 5000ms OR 1000 calls (whichever first) |
-| File | `moe_policy.rs` | `moe_policy.cpp` |
-
-MLX uses time-based OR call-count-based cooldown. RMLX uses step-count only.
+**Resolution**: Cooldown now uses dual time-based OR call-count-based semantics to match MLX.
 
 ---
 
@@ -141,19 +127,20 @@ MLX's AllToAll primitive supports vjp/jvp/vmap. RMLX does not (inference-only, l
 
 ---
 
-## 5. Fix Priority
+## 5. Fix Priority -- All P0/P1 RESOLVED
 
-| Priority | Item | Difficulty | Impact |
-|----------|------|------------|--------|
-| P0 | 1.1 Dispatch loop ordering | Medium | Correctness — numerical divergence from other frameworks |
-| P0 | 1.2 Per-rank capacity | Medium | Correctness — multi-node data collision |
-| P0 | 1.3 Combine kernel caching | Low | Performance — Metal reinitialization on every call |
-| P1 | 2.1 Byte threshold 4KB to 2MB | Low | Performance — unnecessary GPU kernel launches |
-| P1 | 2.2 Hysteresis path | Low | Correctness — intended behavior broken |
-| P2 | 3.1 Expand to 7 Metal kernels | High | Performance + functionality |
-| P2 | 3.2 Multi-dtype (f16/bf16) | Medium | Practical usability |
-| P2 | 3.3 Dual-source combine | Medium | Performance — eliminate O(N*D) copy |
-| P3 | 3.4 Packet format 16B alignment | Medium | RDMA efficiency |
+| Priority | Item | Difficulty | Impact | Status |
+|----------|------|------------|--------|--------|
+| P0 | 1.1 Dispatch loop ordering | Medium | Correctness | **RESOLVED** (D1) |
+| P0 | 1.2 Per-rank capacity | Medium | Correctness | **RESOLVED** (D2) |
+| P0 | 1.3 Combine kernel caching | Low | Performance | **RESOLVED** (D3) |
+| P1 | 2.1 Byte threshold 4KB to 2MB | Low | Performance | **RESOLVED** (D5) |
+| P1 | 2.2 Hysteresis path | Low | Correctness | **RESOLVED** (D6) |
+| P1 | 2.3 Cooldown semantics | Low | Correctness | **RESOLVED** (D7) |
+| P2 | 3.1 Expand to 7 Metal kernels | High | Performance + functionality | Existing (7 kernels already present) |
+| P2 | 3.2 Multi-dtype (f16/bf16) | Medium | Practical usability | Future work |
+| P2 | 3.3 Dual-source combine | Medium | Performance | Future work |
+| P3 | 3.4 Packet format 16B alignment | Medium | RDMA efficiency | Future work |
 
 ---
 
