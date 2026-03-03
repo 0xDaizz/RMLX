@@ -90,8 +90,6 @@ The ultimate goal is to connect two Mac Studio M3 Ultras via Thunderbolt 5 RDMA 
 
 ## 📁 Project Structure
 
-This repository (`~/rmlx/`) is **framework-only**. The serving layer (`rmlx-serve`) is managed in a [separate repository](https://github.com/rmlx-serve).
-
 ```
 rmlx/
 ├── crates/

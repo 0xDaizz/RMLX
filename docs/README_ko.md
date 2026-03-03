@@ -90,8 +90,6 @@ ExecGraph 결과: 110.4ms/layer → 6.8ms/layer (16.15x 속도 향상)
 
 ## 📁 프로젝트 구조
 
-이 리포지토리(`~/rmlx/`)는 **프레임워크 전용**입니다. 서빙 레이어(`rmlx-serve`)는 [별도 리포지토리](https://github.com/rmlx-serve)에서 관리됩니다.
-
 ```
 rmlx/
 ├── crates/
