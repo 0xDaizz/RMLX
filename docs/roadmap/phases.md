@@ -147,7 +147,7 @@ Convert PoC Phase 1-4 validation results into production-quality code. Implement
 
 ### Goal
 
-Build the core Metal kernel execution pipeline needed for LLM inference. Reuse MLX's Metal shaders to dispatch 10 kernel types from Rust.
+Build the core Metal kernel execution pipeline needed for efficient GPU computation. Reuse MLX's Metal shaders to dispatch 10 kernel types from Rust.
 
 ### Key Deliverables
 
@@ -252,7 +252,7 @@ Reimplement MLX EP optimizations in RMLX, achieving additional performance gains
 
 ### Goal
 
-Implement core neural network modules required for LLM inference in the rmlx-nn crate.
+Implement core neural network modules in the rmlx-nn crate.
 
 ### Key Deliverables
 
@@ -392,7 +392,74 @@ Add incremental decoding support via KV cache in rmlx-nn and improve API ergonom
 
 ---
 
-## CI Required Test Matrix
+## 🚀 Phase 9: GPU Pipeline — Complete
+
+### Phase 9A: ExecGraph + CommandBatcher
+
+#### Goal
+
+Eliminate per-op CPU overhead by batching multiple GPU operations into minimal command buffers using ExecGraph.
+
+#### Key Deliverables
+
+- `rmlx-metal`: `CommandBatcher` — batches encoder work into shared command buffers
+- `rmlx-metal`: `ExecGraph` — pre-built execution graph that replays deterministic op sequences
+- `rmlx-metal`: `IcbBuilder`/`IcbReplay`/`IcbCache` — Indirect Command Buffer support
+- `rmlx-core`: `_into_cb()` pattern for all 14 ops — encode into caller's command buffer
+- `rmlx-nn`: `forward_graph()` for Attention, TransformerBlock, TransformerModel
+- `rmlx-nn`: `forward_into_cb()` for Linear
+- Benchmark: 65 CBs/layer → 5 CBs/layer (92.3% reduction)
+
+### Phase 9B-opt: Weight Pre-caching + Optimization
+
+#### Goal
+
+Pre-cache contiguous transposed weight matrices to eliminate transpose overhead during inference.
+
+#### Key Deliverables
+
+- `rmlx-nn`: `prepare_weight_t()` / `weight_transposed_contiguous()` for Linear
+- `rmlx-nn`: `prepare_weights_for_graph()` for TransformerModel/Block/Attention/FeedForward
+- Benchmark: 110.4ms → 6.8ms per layer (16.15x speedup)
+- Numerical parity: max_diff=6.4e-6
+
+#### Definition of Done (DoD)
+
+- [x] 16.15x speedup (110.4ms → 6.8ms)
+- [x] 92.3% CB reduction (65 → 5)
+- [x] Numerical parity (max_diff=6.4e-6)
+- [x] All 339+ tests passing
+
+---
+
+## Phase 10: Flash Attention — Planned
+
+### Goal
+
+Implement Flash Attention 2 with tiled K/V processing for efficient attention computation.
+
+### Key Deliverables
+
+- Flash Attention 2 Metal kernel (tiled Q/K/V with online softmax)
+- Integration with ExecGraph pipeline
+
+---
+
+## Phase 11: Advanced Quantization — Planned
+
+### Goal
+
+Expand quantization format support for broader model compatibility.
+
+### Key Deliverables
+
+- GGUF format support
+- AWQ/GPTQ quantization
+- FP8 support
+
+---
+
+## 🧪 CI Required Test Matrix
 
 The CI pipeline applied across all phases:
 

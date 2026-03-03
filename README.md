@@ -11,7 +11,7 @@
 
 ---
 
-RMLX reimplements the core Metal GPU inference pipeline of Apple's [MLX](https://github.com/ml-explore/mlx) framework **entirely in Rust**. It targets the theoretical performance ceiling of distributed LLM inference with Expert Parallelism (EP) on a Mac Studio M3 Ultra cluster connected via Thunderbolt 5 RDMA.
+RMLX reimplements the core Metal GPU compute pipeline of Apple's [MLX](https://github.com/ml-explore/mlx) framework **entirely in Rust**. The ExecGraph pipeline batches 65 command buffers down to 5 per transformer layer, achieving a **16.15x speedup** (110.4ms to 6.8ms) with full numerical parity (max\_diff=6.4e-6).
 
 ## Key Features
 
@@ -23,9 +23,58 @@ RMLX reimplements the core Metal GPU inference pipeline of Apple's [MLX](https:/
 
 ## Performance Target
 
-```
-2-node EP decode: 64ms/step -> 33ms/step (~30 tok/s)
-Near-parity with single-node 32ms/step
+Measured on Apple Silicon, single transformer layer, Phase 9B-opt complete:
+
+| Metric | Baseline | ExecGraph | Improvement |
+|--------|----------|-----------|-------------|
+| Latency / layer | 110.4 ms | 6.8 ms | **16.15x** speedup |
+| Command buffers / layer | 65 | 5 | 92.3% reduction |
+| CPU-GPU syncs | ~65 | ~1 | 98.5% reduction |
+| Numerical parity | -- | -- | max\_diff=6.4e-6 |
+
+## 🛠️ Feature Matrix
+
+### Implemented
+
+- **14 op modules** -- matmul, softmax, rms\_norm, rope, gemv, quantized, binary, reduce, copy, indexing, sdpa, silu, swiglu, embedding
+- **ExecGraph pipeline** -- command buffer batching with 92.3% CB reduction
+- **SDPA (Scaled Dot-Product Attention)** -- fused kernel, not full Flash Attention 2
+- **SiLU / SwiGLU** -- fused activations
+- **KV cache** -- static pre-allocated cache
+- **4 model architectures** -- LLaMA, Qwen, DeepSeek-V3, Mixtral
+- **MTLSharedEvent** -- non-blocking GPU-CPU synchronization
+- **RDMA framework** -- ibverbs FFI, UC QP, multi-port Thunderbolt 5
+- **Zero-copy allocator** -- `posix_memalign` + `newBufferWithBytesNoCopy` + `ibv_reg_mr`
+- **Dual queue pipeline** -- separate compute and transfer command queues
+- **VJP / LoRA** -- autodiff and parameter-efficient fine-tuning primitives
+
+### Planned
+
+- Flash Attention 2
+- Paged KV Cache / dynamic cache management
+- Speculative Decoding
+- Continuous Batching
+- Advanced Quantization (AWQ, GPTQ)
+- Python API
+
+## 🏗️ Architecture
+
+```mermaid
+graph TD
+    NN["rmlx-nn<br/>Linear, Attention, MoE<br/>Transformer, KV Cache"]
+    CORE["rmlx-core<br/>14 Op Modules, Array/DType<br/>VJP/LoRA, ExecMode"]
+    DIST["rmlx-distributed<br/>EP / MoE / AllReduce<br/>3-zone policy"]
+    METAL["rmlx-metal<br/>Device/Queue/SharedEvent<br/>ExecGraph/CommandBatcher"]
+    ALLOC["rmlx-alloc<br/>ZeroCopy, BufferPool"]
+    RDMA["rmlx-rdma<br/>ibverbs FFI, UC QP<br/>Multi-port"]
+
+    NN --> CORE
+    CORE --> METAL
+    CORE --> ALLOC
+    DIST --> CORE
+    DIST --> RDMA
+    ALLOC --> RDMA
+    METAL -.-> ALLOC
 ```
 
 ## Tech Stack
@@ -109,7 +158,7 @@ rmlx/                           # 6 crates, 339 tests
 └── examples/                   # Usage examples
 ```
 
-This repository contains the **framework only**. The model serving layer (`rmlx-lm`) is in a [separate repository](https://github.com/rmlx-lm).
+This repository contains the **framework only**. The serving layer (`rmlx-serve`) is in a [separate repository](https://github.com/rmlx-serve).
 
 ## Stats
 

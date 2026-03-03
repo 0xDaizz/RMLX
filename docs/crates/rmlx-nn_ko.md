@@ -2,7 +2,7 @@
 
 ## 개요
 
-`rmlx-nn`은 LLM 추론을 위한 신경망 레이어를 구현하는 크레이트입니다. Transformer 아키텍처의 핵심 구성 요소(Linear, Embedding, Attention, TransformerBlock, MoE)를 `rmlx-core`의 연산 커널 위에 구성하며, LLaMA, Qwen, DeepSeek-V3, Mixtral 모델 설정을 내장하고 있습니다.
+`rmlx-nn`은 GPU 가속 추론을 위한 신경망 레이어를 구현하는 크레이트입니다. Transformer 아키텍처의 핵심 구성 요소(Linear, Embedding, Attention, TransformerBlock, MoE)를 `rmlx-core`의 연산 커널 위에 구성하며, LLaMA, Qwen, DeepSeek-V3, Mixtral 모델 설정을 내장하고 있습니다.
 
 > **상태:** Linear, Embedding, Attention, TransformerBlock, MoE, 그리고 4종 모델 설정(LLaMA 7B/3-8B, Qwen2 7B, DeepSeek-V3, Mixtral 8x7B)이 구현되어 있습니다.
 
@@ -199,7 +199,7 @@ pub struct MoeLayer {
 
 ## models/ — 모델 아키텍처 정의
 
-4종의 LLM 모델 설정을 `TransformerConfig`로 제공합니다.
+4종의 Transformer 모델 설정을 `TransformerConfig`로 제공합니다.
 
 ### LLaMA (`models/llama.rs`)
 

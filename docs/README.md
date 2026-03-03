@@ -1,6 +1,6 @@
-# RMLX — Rust Metal LLM Inference Engine
+# RMLX — Rust ML Framework for Apple Silicon
 
-> **A Rust-based Metal GPU inference engine optimized for Apple Silicon**
+> **A Rust-based Metal GPU ML framework optimized for Apple Silicon**
 >
 > Status: All Phases complete (339 tests, 0 failures) | License: MIT OR Apache-2.0 | Rust 1.80+ | macOS (Apple Silicon)
 
@@ -8,7 +8,7 @@
 
 ## What is RMLX?
 
-RMLX is a project that **reimplements the core Metal GPU inference pipeline of Apple's MLX framework in Rust**. The goal is to reach the theoretical performance ceiling for Expert Parallelism (EP) based distributed LLM inference on a Mac Studio M3 Ultra cluster.
+RMLX is a project that **reimplements the core Metal GPU inference pipeline of Apple's MLX framework in Rust**. The goal is to reach the theoretical performance ceiling for Expert Parallelism (EP) based distributed ML inference on a Mac Studio M3 Ultra cluster.
 
 It fundamentally addresses the structural bottlenecks identified in MLX's C++/Python architecture by leveraging Rust's language-level strengths.
 
@@ -80,7 +80,7 @@ The ultimate goal is to connect two Mac Studio M3 Ultras via Thunderbolt 5 RDMA 
 
 ## Project Structure
 
-This repository (`~/rmlx/`) is **framework-only**. The model serving layer (`rmlx-lm`) is managed in a [separate repository](https://github.com/rmlx-lm).
+This repository (`~/rmlx/`) is **framework-only**. The serving layer (`rmlx-serve`) is managed in a [separate repository](https://github.com/rmlx-serve).
 
 ```
 rmlx/

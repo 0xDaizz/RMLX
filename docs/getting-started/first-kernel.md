@@ -292,6 +292,6 @@ cargo test -p rmlx-metal -- test_basic_metal_compute --nocapture
 This tutorial covered the basics of rmlx's Metal compute pipeline.
 For the full implementation plan, see the [Implementation Roadmap](../roadmap/phases.md).
 
-- **Phase 2** adds 10 core LLM kernels including matmul, softmax, and RoPE
+- **Phase 2** adds 10 core GPU compute kernels including matmul, softmax, and RoPE
 - **Phase 3** implements MTLSharedEvent-based synchronization and the dual queue pipeline
 - **Phase 4** adds MoE kernels for Expert Parallelism

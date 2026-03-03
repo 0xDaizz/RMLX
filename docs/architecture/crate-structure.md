@@ -223,8 +223,8 @@ rmlx/
 
 | Item | Details |
 |------|---------|
-| **Purpose** | Provides neural network layers for Transformer-based LLM architectures. Includes high-level modules such as Linear, Attention, and MoE, as well as model architectures for LLaMA, Qwen, DeepSeek-V3, and others. |
-| **Key modules** | `linear.rs` (quantized Linear), `attention.rs` (Multi-head/GQA), `transformer.rs` (Transformer block), `moe.rs` (gate + routing), `parallel.rs` (ColumnParallel/RowParallel), `models/` (llama.rs, qwen.rs, deepseek.rs, mixtral.rs) |
+| **Purpose** | Provides neural network layers for Transformer-based architectures. Includes high-level modules such as Linear, Attention, and MoE, as well as model architectures for LLaMA, Qwen, DeepSeek-V3, and others. |
+| **Key modules** | `linear.rs` (quantized Linear, `prepare_weight_t()`), `attention.rs` (Multi-head/GQA), `transformer.rs` (Transformer block, `forward_graph()`, `forward_into_cb()`), `moe.rs` (gate + routing), `parallel.rs` (ColumnParallel/RowParallel), `models/` (llama.rs, qwen.rs, deepseek.rs, mixtral.rs) |
 | **Dependencies** | `rmlx-core` |
 | **Status** | Complete — Transformer block, Linear/Attention/MoE layers, KV cache, parallel linear layers, LLaMA/Qwen/DeepSeek-V3/Mixtral model architectures fully implemented |
 

@@ -41,7 +41,7 @@ rmlx-core/src/
 
 ## DType — 데이터 타입 (`dtype.rs`)
 
-LLM 추론에 사용되는 데이터 타입을 정의합니다.
+텐서 연산에 사용되는 데이터 타입을 정의합니다.
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
