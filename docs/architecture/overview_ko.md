@@ -11,7 +11,7 @@ RMLX는 4개의 레이어로 구성된 계층형 아키텍처이며, 전 Phase(0
 │  ~/rmlx/ (이 리포지토리 — ML 프레임워크)                                      │
 │                        rmlx-core (연산 엔진)                                │
 │  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │                      Compute Graph / Op Registry (18 op modules)     │   │
+│  │                      Compute Graph / Op Registry (25 op modules)     │   │
 │  │  matmul · softmax · rms_norm · rope · quantized_matmul · moe_gate   │   │
 │  │  sdpa(FA2) · silu · gelu · fp8 · conv · binary · reduce · copy    │   │
 │  │  indexing · formats/gguf · ...                                     │   │

@@ -2,7 +2,7 @@
 
 > **Apple Silicon에 최적화된 Rust 기반 Metal GPU ML 프레임워크**
 >
-> 상태: 전 Phase 완료 (0-9B-opt + S1-S5) (390+ tests, 0 failures) | 라이선스: MIT OR Apache-2.0 | Rust 1.80+ | macOS (Apple Silicon)
+> 상태: 전 Phase 완료 (0-9B-opt + S1-S5 + Audit Remediation) (534 tests, 0 failures) | 라이선스: MIT OR Apache-2.0 | Rust 1.80+ | macOS (Apple Silicon)
 
 ---
 
