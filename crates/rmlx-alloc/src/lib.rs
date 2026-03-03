@@ -6,6 +6,9 @@ pub mod allocator;
 pub mod buffer_pool;
 pub mod cache;
 pub mod leak_detector;
+#[cfg(feature = "metal3")]
+pub mod residency;
+pub mod small_alloc;
 pub mod stats;
 pub mod zero_copy;
 
@@ -14,6 +17,9 @@ pub use allocator::MetalAllocator;
 pub use buffer_pool::BufferPool;
 pub use cache::BufferCache;
 pub use leak_detector::{LeakDetector, LeakReport};
+#[cfg(feature = "metal3")]
+pub use residency::ResidencyManager;
+pub use small_alloc::{SmallAllocation, SmallBufferPool};
 pub use stats::AllocStats;
 pub use zero_copy::{
     CompletionError, CompletionFence, CompletionTicket, GpuCompletionHandler, InFlightToken,
