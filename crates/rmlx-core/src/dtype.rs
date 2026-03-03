@@ -10,6 +10,12 @@ pub enum DType {
     Bfloat16,
     /// Unsigned 32-bit integer (for index arrays, token IDs, etc.)
     UInt32,
+    /// FP8 E4M3 (1 sign / 4 exponent / 3 mantissa), range +/-448, stored as uint8.
+    /// Primary use: weights and activations in FP8 inference.
+    Float8E4M3,
+    /// FP8 E5M2 (1 sign / 5 exponent / 2 mantissa), range +/-57344, stored as uint8.
+    /// Primary use: gradients.
+    Float8E5M2,
     /// 4-bit quantization, group size 32, with f16 scale
     Q4_0,
     /// 4-bit quantization, group size 32, with f16 scale and f16 min
@@ -29,6 +35,8 @@ impl DType {
             DType::Float16 => 2,
             DType::Bfloat16 => 2,
             DType::UInt32 => 4,
+            DType::Float8E4M3 => 1,
+            DType::Float8E5M2 => 1,
             DType::Q4_0 => 1, // ~0.5625 bytes/element (18 bytes per 32 elements)
             DType::Q4_1 => 1, // ~0.625 bytes/element (20 bytes per 32 elements)
             DType::Q8_0 => 1, // ~1.0625 bytes/element (34 bytes per 32 elements)
@@ -93,6 +101,8 @@ impl DType {
             DType::Float16 => "float16",
             DType::Bfloat16 => "bfloat16",
             DType::UInt32 => "uint32",
+            DType::Float8E4M3 => "float8e4m3",
+            DType::Float8E5M2 => "float8e5m2",
             DType::Q4_0 => "q4_0",
             DType::Q4_1 => "q4_1",
             DType::Q8_0 => "q8_0",
@@ -218,6 +228,40 @@ mod tests {
         assert_eq!(DType::UInt32.packed_block_size(), None);
         assert_eq!(DType::UInt32.block_size(), None);
         assert_eq!(DType::UInt32.numel_to_bytes(100), 400);
+    }
+
+    #[test]
+    fn test_fp8_properties() {
+        // Float8E4M3
+        assert_eq!(DType::Float8E4M3.size_of(), 1);
+        assert_eq!(DType::Float8E4M3.name(), "float8e4m3");
+        assert_eq!(format!("{}", DType::Float8E4M3), "float8e4m3");
+        assert!(!DType::Float8E4M3.is_quantized());
+        assert_eq!(DType::Float8E4M3.packed_block_size(), None);
+        assert_eq!(DType::Float8E4M3.block_size(), None);
+        assert_eq!(DType::Float8E4M3.numel_to_bytes(100), 100);
+
+        // Float8E5M2
+        assert_eq!(DType::Float8E5M2.size_of(), 1);
+        assert_eq!(DType::Float8E5M2.name(), "float8e5m2");
+        assert_eq!(format!("{}", DType::Float8E5M2), "float8e5m2");
+        assert!(!DType::Float8E5M2.is_quantized());
+        assert_eq!(DType::Float8E5M2.packed_block_size(), None);
+        assert_eq!(DType::Float8E5M2.block_size(), None);
+        assert_eq!(DType::Float8E5M2.numel_to_bytes(100), 100);
+    }
+
+    #[test]
+    fn test_fp8_distinct_from_others() {
+        assert_ne!(DType::Float8E4M3, DType::Float8E5M2);
+        assert_ne!(DType::Float8E4M3, DType::Float16);
+        assert_ne!(DType::Float8E5M2, DType::Float16);
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(DType::Float8E4M3);
+        set.insert(DType::Float8E5M2);
+        set.insert(DType::Float16);
+        assert_eq!(set.len(), 3);
     }
 
     #[test]

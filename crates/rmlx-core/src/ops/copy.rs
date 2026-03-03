@@ -549,11 +549,19 @@ fn cast_kernel_name(src_dtype: DType, dst_dtype: DType) -> Result<&'static str, 
     }
 }
 
-/// Reject quantized types for copy operations.
+/// Reject quantized and FP8 types for copy operations.
+///
+/// FP8 types are stored as uint8 and have no dedicated copy kernels.
+/// Callers should dequantize FP8 to f16 first via `fp8::dequant_*`.
 fn reject_quantized(dtype: DType) -> Result<(), KernelError> {
     if dtype.is_quantized() {
         return Err(KernelError::NotFound(
             "copy not supported for quantized types".to_string(),
+        ));
+    }
+    if matches!(dtype, DType::Float8E4M3 | DType::Float8E5M2) {
+        return Err(KernelError::NotFound(
+            "copy not supported for FP8 types; dequantize to f16 first".to_string(),
         ));
     }
     Ok(())

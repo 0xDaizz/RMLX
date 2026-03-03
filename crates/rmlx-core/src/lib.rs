@@ -4,6 +4,7 @@
 
 pub mod array;
 pub mod dtype;
+pub mod formats;
 pub mod kernels;
 pub mod logging;
 pub mod lora;

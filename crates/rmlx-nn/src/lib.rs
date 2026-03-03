@@ -3,6 +3,8 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod attention;
+pub mod conv;
+pub mod dynamic;
 pub mod embedding;
 pub mod linear;
 pub mod models;
@@ -11,7 +13,12 @@ pub mod parallel;
 pub mod transformer;
 
 // ── Re-exports of core types ──
-pub use attention::{Attention, AttentionConfig, LayerKvCache};
+pub use attention::{
+    Attention, AttentionConfig, BatchKvCache, LayerKvCache, QuantizedArray, QuantizedKvCache,
+    RotatingKvCache,
+};
+pub use conv::{Conv1d, Conv1dConfig, Conv2d, Conv2dConfig};
+pub use dynamic::DynamicExecContext;
 pub use embedding::{Embedding, EmbeddingConfig};
 pub use linear::{Linear, LinearConfig};
 pub use moe::{MoeConfig, MoeForwardMetrics, MoeLayer};

@@ -33,6 +33,7 @@ pub struct Group {
     ranks: Vec<u32>,      // 정렬된 고유 rank 목록
     local_rank: u32,      // 현재 노드 rank
     world_size: u32,      // 전체 노드 수
+    transport: Option<Arc<dyn RdmaTransport>>,  // None = 단일 프로세스 스텁
 }
 ```
 
@@ -46,6 +47,17 @@ pub struct Group {
 | `world_size()` | 전체 월드 크기 |
 | `peers()` | 자신을 제외한 피어 rank 목록 |
 | `contains(rank)` | rank가 그룹에 속하는지 확인 |
+
+### Array 수준 집합 연산
+
+원시 `&[u8]` 대신 `rmlx_core::array::Array`에 대해 동작하는 편의 래퍼입니다. Apple Silicon UMA에서 Metal 버퍼 바이트를 추출하고(zero-copy), 바이트 수준 집합 연산을 수행한 뒤, 결과로부터 새 Array를 생성합니다.
+
+| 메서드 | 설명 |
+|--------|------|
+| `allreduce_sum(input, device)` | 전체 rank에 대한 all-reduce sum; 동일 shape/dtype의 Array 반환 |
+| `allgather_array(input, device)` | 전체 rank에 대한 all-gather; shape `[world_size * dim0, ...rest]`의 Array 반환 |
+
+단일 rank 그룹에서는 입력을 그대로 반환합니다 (항등 연산).
 
 ---
 
