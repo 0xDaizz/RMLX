@@ -3,9 +3,9 @@
 //! Manages QP creation, TCP-based QP info exchange, state transitions,
 //! and warmup protocol for all peers.
 
-use std::cell::RefCell;
 use std::ffi::c_void;
 use std::marker::PhantomData;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::context::{ProtectionDomain, RdmaContext};
@@ -243,7 +243,8 @@ pub struct RdmaConnection {
     qp: QueuePair,
     config: RdmaConfig,
     /// Backlog of CQ completions with unexpected wr_ids, for later retrieval.
-    completion_backlog: RefCell<Vec<IbvWc>>,
+    /// Protected by a Mutex for thread-safe access (IbvWc is Copy + Send).
+    completion_backlog: Mutex<Vec<IbvWc>>,
     /// Pre-registered MR pool (lazily initialized via `init_mr_pool`).
     mr_pool: Option<MrPool>,
 }
@@ -294,7 +295,7 @@ impl RdmaConnection {
             cq,
             qp,
             config,
-            completion_backlog: RefCell::new(Vec::new()),
+            completion_backlog: Mutex::new(Vec::new()),
             mr_pool: None,
         })
     }
@@ -475,7 +476,7 @@ impl RdmaConnection {
 
         // Check backlog first for any previously stashed completions
         {
-            let mut backlog = self.completion_backlog.borrow_mut();
+            let mut backlog = self.completion_backlog.lock().unwrap();
             let mut backlog_error: Option<RdmaError> = None;
             remaining.retain(|&wr_id| {
                 if let Some(pos) = backlog.iter().position(|wc| wc.wr_id == wr_id) {
@@ -509,7 +510,7 @@ impl RdmaConnection {
                     remaining.swap_remove(pos);
                 } else {
                     // Unexpected wr_id — stash in backlog
-                    self.completion_backlog.borrow_mut().push(*wc);
+                    self.completion_backlog.lock().unwrap().push(*wc);
                 }
             }
             if !remaining.is_empty() && Instant::now() >= deadline {
@@ -527,7 +528,7 @@ impl RdmaConnection {
 
     /// Drain any stashed backlog completions (wr_ids not matched by prior waits).
     pub fn drain_backlog(&self) -> Vec<IbvWc> {
-        self.completion_backlog.borrow_mut().drain(..).collect()
+        self.completion_backlog.lock().unwrap().drain(..).collect()
     }
 
     /// Create a new CompletionTracker for fine-grained wr_id-based matching.
@@ -677,5 +678,5 @@ impl RdmaConnection {
 }
 
 // SAFETY: All inner types (RdmaContext, ProtectionDomain, CompletionQueue, QueuePair)
-// already implement Send. The RefCell<Vec<IbvWc>> is Send when IbvWc is Send (it is Copy).
+// already implement Send. The Mutex<Vec<IbvWc>> is both Send and Sync when IbvWc is Send.
 unsafe impl Send for RdmaConnection {}

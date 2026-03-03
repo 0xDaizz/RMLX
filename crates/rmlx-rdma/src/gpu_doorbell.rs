@@ -291,14 +291,25 @@ pub struct DescriptorProxy {
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
+/// Result returned by a `DescriptorHandler` after processing a descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandlerResult {
+    /// CQ completion confirmed for this WR — proxy may signal the GPU.
+    CqConfirmed,
+    /// Handler requests the proxy to stop (e.g., fatal error).
+    Stop,
+}
+
 /// Callback invoked for each descriptor the proxy reads from the ring.
 ///
 /// The callback receives the descriptor and the wr_id assigned to it.
-/// It should post the actual ibv_post_send/recv and register the op
-/// with the ProgressEngine.
+/// It must post the actual ibv_post_send/recv **and** poll the CQ until
+/// the work request completes before returning `CqConfirmed`.
 ///
-/// Returns `true` to continue processing, `false` to stop the proxy.
-pub type DescriptorHandler = Box<dyn FnMut(&RdmaDescriptor, u64) -> bool + Send>;
+/// Returns `HandlerResult::CqConfirmed` when the CQ has confirmed
+/// completion for the WR, or `HandlerResult::Stop` to shut down the
+/// proxy.
+pub type DescriptorHandler = Box<dyn FnMut(&RdmaDescriptor, u64) -> HandlerResult + Send>;
 
 impl DescriptorProxy {
     /// Start the proxy thread.
@@ -333,22 +344,29 @@ impl DescriptorProxy {
 
                     // Read all available descriptors
                     ring.poll_submissions();
-                    let mut processed = 0u32;
-                    while processed < config.batch_size as u32 {
+                    let mut confirmed = 0u32;
+                    let mut batch = 0u32;
+                    while batch < config.batch_size as u32 {
                         let desc = match ring.pop_descriptor() {
                             Some(d) => d,
                             None => break,
                         };
                         let wr_id = ring.next_wr_id(&desc);
+                        batch += 1;
 
-                        if !handler(&desc, wr_id) {
-                            return; // handler requested stop
+                        match handler(&desc, wr_id) {
+                            HandlerResult::CqConfirmed => {
+                                confirmed += 1;
+                            }
+                            HandlerResult::Stop => {
+                                return; // handler requested stop
+                            }
                         }
-                        processed += 1;
                     }
 
-                    // Signal completion to GPU
-                    if processed > 0 {
+                    // Only signal completion to GPU after CQ has confirmed
+                    // all work requests in this batch actually completed.
+                    if confirmed > 0 {
                         ring.signal_completion(ring.tail() as u64);
                     }
                 }
