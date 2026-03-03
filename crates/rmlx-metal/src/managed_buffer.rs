@@ -20,8 +20,7 @@ pub trait BufferAllocator: Send + Sync {
     ///
     /// The allocator may return a cached buffer larger than `size`.
     /// Returns an error string on failure.
-    fn alloc(&self, size: usize, options: MTLResourceOptions)
-        -> Result<MTLBuffer, String>;
+    fn alloc(&self, size: usize, options: MTLResourceOptions) -> Result<MTLBuffer, String>;
 
     /// Return a buffer to the allocator's cache for reuse.
     ///
@@ -151,11 +150,7 @@ mod tests {
     }
 
     impl BufferAllocator for TestAllocator {
-        fn alloc(
-            &self,
-            size: usize,
-            options: MTLResourceOptions,
-        ) -> Result<MTLBuffer, String> {
+        fn alloc(&self, size: usize, options: MTLResourceOptions) -> Result<MTLBuffer, String> {
             self.alloc_count.fetch_add(1, Ordering::SeqCst);
             Ok(self.device.new_buffer(size as u64, options))
         }
@@ -207,11 +202,9 @@ mod tests {
         let device = metal::Device::system_default().unwrap();
         let allocator = Arc::new(TestAllocator::new(device));
 
-        let buf = ManagedBuffer::alloc_untracked(
-            Arc::clone(&allocator) as Arc<dyn BufferAllocator>,
-            256,
-        )
-        .unwrap();
+        let buf =
+            ManagedBuffer::alloc_untracked(Arc::clone(&allocator) as Arc<dyn BufferAllocator>, 256)
+                .unwrap();
         assert!(buf.length() >= 256);
         drop(buf);
         assert_eq!(allocator.free_count.load(Ordering::SeqCst), 1);
