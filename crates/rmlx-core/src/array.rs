@@ -536,11 +536,7 @@ impl Array {
     ///
     /// # Errors
     /// Returns an error if either dimension is out of range.
-    pub fn transpose(
-        &self,
-        dim0: usize,
-        dim1: usize,
-    ) -> Result<Self, crate::kernels::KernelError> {
+    pub fn transpose(&self, dim0: usize, dim1: usize) -> Result<Self, crate::kernels::KernelError> {
         let ndim = self.ndim();
         if dim0 >= ndim {
             return Err(crate::kernels::KernelError::InvalidShape(format!(

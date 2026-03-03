@@ -1098,10 +1098,7 @@ fn dispatch_split_k(
         let total = m * n;
         let tg_size = 256u64;
         let n_groups = ceil_div(total, tg_size as usize) as u64;
-        enc.dispatch_thread_groups(
-            MTLSize::new(n_groups, 1, 1),
-            MTLSize::new(tg_size, 1, 1),
-        );
+        enc.dispatch_thread_groups(MTLSize::new(n_groups, 1, 1), MTLSize::new(tg_size, 1, 1));
         enc.end_encoding();
     }
 

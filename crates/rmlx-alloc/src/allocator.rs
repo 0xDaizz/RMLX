@@ -97,10 +97,7 @@ impl MetalAllocator {
 
     /// Get the current cache limit.
     pub fn cache_limit(&self) -> usize {
-        self.cache
-            .lock()
-            .map(|c| c.max_cache_size())
-            .unwrap_or(0)
+        self.cache.lock().map(|c| c.max_cache_size()).unwrap_or(0)
     }
 
     /// Reset peak memory to current active memory (A12).

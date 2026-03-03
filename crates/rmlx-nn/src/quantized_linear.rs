@@ -178,11 +178,7 @@ impl QuantizedLinear {
 
         if batch == 1 {
             // Single vector: use QMV kernel (works for both Q4 and Q8)
-            let vec_1d = x_2d.view(
-                vec![self.in_features],
-                vec![1],
-                x_2d.offset(),
-            );
+            let vec_1d = x_2d.view(vec![self.in_features], vec![1], x_2d.offset());
             let out_1d = quantized::affine_quantized_matmul(registry, &qw, &vec_1d, queue)?;
             // Reshape to [1, out_features]
             out_1d.reshape(vec![1, self.out_features])
@@ -245,10 +241,7 @@ impl QuantizedLinear {
     }
 
     /// Build a `QuantizedWeight` by uploading CPU buffers to Metal.
-    fn make_quantized_weight(
-        &self,
-        dev: &metal::Device,
-    ) -> Result<QuantizedWeight, KernelError> {
+    fn make_quantized_weight(&self, dev: &metal::Device) -> Result<QuantizedWeight, KernelError> {
         let opts = metal::MTLResourceOptions::StorageModeShared;
 
         let weights_buf = dev.new_buffer_with_data(
@@ -326,7 +319,13 @@ mod tests {
         let biases = vec![0.0f32; out_f * groups_per_row];
 
         let ql = QuantizedLinear::new(
-            w_packed, scales, biases, in_f, out_f, group_size, QuantBits::Q4,
+            w_packed,
+            scales,
+            biases,
+            in_f,
+            out_f,
+            group_size,
+            QuantBits::Q4,
         );
         assert!(ql.is_ok());
         let ql = ql.unwrap();
@@ -347,7 +346,13 @@ mod tests {
         let biases = vec![0.0f32; out_f * groups_per_row];
 
         let ql = QuantizedLinear::new(
-            w_packed, scales, biases, in_f, out_f, group_size, QuantBits::Q8,
+            w_packed,
+            scales,
+            biases,
+            in_f,
+            out_f,
+            group_size,
+            QuantBits::Q8,
         );
         assert!(ql.is_ok());
         assert_eq!(ql.unwrap().bits(), QuantBits::Q8);
@@ -383,15 +388,7 @@ mod tests {
 
     #[test]
     fn test_quantized_linear_zero_features() {
-        let result = QuantizedLinear::new(
-            vec![],
-            vec![],
-            vec![],
-            0,
-            0,
-            32,
-            QuantBits::Q4,
-        );
+        let result = QuantizedLinear::new(vec![], vec![], vec![], 0, 0, 32, QuantBits::Q4);
         assert!(result.is_err());
     }
 
