@@ -62,9 +62,7 @@ impl<'q> CommandBufferManager<'q> {
     pub fn maybe_commit(&mut self, bytes: u64) {
         self.ops_batched += 1;
         self.bytes_dispatched += bytes;
-        if self.ops_batched >= MAX_OPS_PER_BATCH
-            || self.bytes_dispatched >= MAX_BYTES_PER_BATCH
-        {
+        if self.ops_batched >= MAX_OPS_PER_BATCH || self.bytes_dispatched >= MAX_BYTES_PER_BATCH {
             self.force_commit();
         }
     }
@@ -138,11 +136,7 @@ impl BarrierTracker {
     ///
     /// After the call, the tracker's state is updated so the *current*
     /// `outputs` become the "previous outputs" for the next dispatch.
-    pub fn needs_barrier(
-        &mut self,
-        inputs: &[&Buffer],
-        outputs: &[&Buffer],
-    ) -> bool {
+    pub fn needs_barrier(&mut self, inputs: &[&Buffer], outputs: &[&Buffer]) -> bool {
         let mut needs = false;
 
         // Check if any current input was written in the previous dispatch.
@@ -253,10 +247,7 @@ impl Default for GpuErrorStore {
 
 /// Register a completion handler on `cb` that checks the command buffer status
 /// after GPU execution and stores any error in `error_store`.
-fn register_completion_handler(
-    cb: &CommandBufferRef,
-    error_store: &std::sync::Arc<GpuErrorStore>,
-) {
+fn register_completion_handler(cb: &CommandBufferRef, error_store: &std::sync::Arc<GpuErrorStore>) {
     let store = std::sync::Arc::clone(error_store);
     let handler = block::ConcreteBlock::new(move |cmd_buf: &CommandBufferRef| {
         let status = cmd_buf.status();
@@ -325,14 +316,8 @@ pub fn encode_compute_1d_tracked(
     num_threads: u64,
     tracker: &mut BarrierTracker,
 ) {
-    let inputs: Vec<&Buffer> = input_indices
-        .iter()
-        .map(|&i| buffers[i].0)
-        .collect();
-    let outputs: Vec<&Buffer> = output_indices
-        .iter()
-        .map(|&i| buffers[i].0)
-        .collect();
+    let inputs: Vec<&Buffer> = input_indices.iter().map(|&i| buffers[i].0).collect();
+    let outputs: Vec<&Buffer> = output_indices.iter().map(|&i| buffers[i].0).collect();
 
     if tracker.needs_barrier(&inputs, &outputs) {
         // Insert a barrier by ending and creating a new encoder.

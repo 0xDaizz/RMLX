@@ -1508,7 +1508,14 @@ mod tests {
             let row_scales = &scales[j * groups_per_row..(j + 1) * groups_per_row];
             let row_biases = &biases[j * groups_per_row..(j + 1) * groups_per_row];
 
-            dequantize_q4_row(row_packed, row_scales, row_biases, k, group_size, &mut w_row_buf);
+            dequantize_q4_row(
+                row_packed,
+                row_scales,
+                row_biases,
+                k,
+                group_size,
+                &mut w_row_buf,
+            );
 
             for i in 0..m {
                 let mut dot = 0.0f32;
@@ -1584,8 +1591,16 @@ mod tests {
         );
 
         // Compute with naive reference
-        let output_naive =
-            naive_matmul_with_dequant(&x, &all_packed, &all_scales, &all_biases, m, n, k, group_size);
+        let output_naive = naive_matmul_with_dequant(
+            &x,
+            &all_packed,
+            &all_scales,
+            &all_biases,
+            m,
+            n,
+            k,
+            group_size,
+        );
 
         // Compare: should be bit-exact since both use the same packed representation
         for idx in 0..m * n {
@@ -1703,7 +1718,17 @@ mod tests {
         let x = vec![1.0f32; k];
 
         let mut output = vec![0.0f32; m * n];
-        affine_qmm(&x, &w_packed, &scales, &biases, m, n, k, group_size, &mut output);
+        affine_qmm(
+            &x,
+            &w_packed,
+            &scales,
+            &biases,
+            m,
+            n,
+            k,
+            group_size,
+            &mut output,
+        );
 
         // Each output element = sum of k elements of (1.0 * (1.0 * 7 + 0.0)) = 7*32 = 224
         for (j, &val) in output.iter().enumerate().take(n) {
@@ -1758,8 +1783,16 @@ mod tests {
             &mut output_qmm,
         );
 
-        let output_naive =
-            naive_matmul_with_dequant(&x, &all_packed, &all_scales, &all_biases, m, n, k, group_size);
+        let output_naive = naive_matmul_with_dequant(
+            &x,
+            &all_packed,
+            &all_scales,
+            &all_biases,
+            m,
+            n,
+            k,
+            group_size,
+        );
 
         for idx in 0..m * n {
             let diff = (output_qmm[idx] - output_naive[idx]).abs();
@@ -1797,7 +1830,17 @@ mod tests {
         }
         let mut output = vec![0.0f32; m * n];
 
-        affine_qmm(&x, &w_packed, &scales, &biases, m, n, k, group_size, &mut output);
+        affine_qmm(
+            &x,
+            &w_packed,
+            &scales,
+            &biases,
+            m,
+            n,
+            k,
+            group_size,
+            &mut output,
+        );
 
         // Each output element for row 0: sum(1.0 * 3.0 for k=32) = 96.0
         // Each output element for row 1: sum(2.0 * 3.0 for k=32) = 192.0

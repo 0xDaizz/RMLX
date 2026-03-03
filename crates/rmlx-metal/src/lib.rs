@@ -6,9 +6,7 @@ pub mod buffer;
 pub mod command;
 pub mod device;
 pub mod event;
-pub mod fence;
 pub mod library;
-pub mod managed_buffer;
 pub mod pipeline;
 pub mod queue;
 pub mod self_check;
@@ -21,11 +19,9 @@ pub use metal;
 pub use command::{BarrierTracker, CommandBufferManager, GpuError, GpuErrorStore};
 pub use device::{Architecture, GpuDevice};
 pub use event::GpuEvent;
-pub use fence::{FenceError, GpuFence};
-pub use managed_buffer::{BufferAllocator, ManagedBuffer};
 pub use pipeline::{FunctionConstant, PipelineCache};
 pub use queue::GpuQueue;
-pub use stream::{StreamManager, STREAM_COMPUTE, STREAM_COPY, STREAM_DEFAULT};
+pub use stream::StreamManager;
 
 /// Errors from Metal operations
 #[derive(Debug)]

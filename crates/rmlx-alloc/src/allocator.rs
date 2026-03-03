@@ -98,10 +98,7 @@ impl MetalAllocator {
         // before falling through to a device allocation.
         self.stats.record_cache_miss();
         if self.gc_limit > 0 {
-            let mut cache = self
-                .cache
-                .lock()
-                .map_err(|_| AllocError::MutexPoisoned)?;
+            let mut cache = self.cache.lock().map_err(|_| AllocError::MutexPoisoned)?;
             let pressure = self
                 .stats
                 .active()

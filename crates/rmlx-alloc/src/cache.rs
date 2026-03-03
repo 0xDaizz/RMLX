@@ -43,10 +43,10 @@ impl BufferCache {
         let max_key = std::cmp::min(key.saturating_mul(2), key.saturating_add(ps * 2));
 
         // Search within [key, max_key) for the smallest non-empty bin.
-        let found_key = self
-            .bins
-            .range(key..max_key)
-            .find_map(|(k, d)| if !d.is_empty() { Some(*k) } else { None });
+        let found_key =
+            self.bins
+                .range(key..max_key)
+                .find_map(|(k, d)| if !d.is_empty() { Some(*k) } else { None });
 
         if let Some(k) = found_key {
             if let Some(buf) = self.bins.get_mut(&k).and_then(|d| d.pop_front()) {
@@ -130,11 +130,7 @@ impl BufferCache {
 
     /// Remove the first LRU entry matching `(key, addr)`.
     fn lru_remove(&mut self, key: usize, addr: u64) {
-        if let Some(pos) = self
-            .lru
-            .iter()
-            .position(|(k, a)| *k == key && *a == addr)
-        {
+        if let Some(pos) = self.lru.iter().position(|(k, a)| *k == key && *a == addr) {
             self.lru.remove(pos);
         }
     }
