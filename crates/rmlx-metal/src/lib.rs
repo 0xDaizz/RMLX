@@ -1,6 +1,7 @@
 //! rmlx-metal — Metal GPU abstraction layer for RMLX
 
 #![deny(unsafe_op_in_unsafe_fn)]
+#![allow(unexpected_cfgs)] // objc crate uses deprecated cfg(feature = "cargo-clippy")
 
 // Required for objc::msg_send! macro in autorelease and capture modules.
 #[macro_use]
