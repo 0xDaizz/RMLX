@@ -295,3 +295,4 @@ cargo test -p rmlx-metal -- test_basic_metal_compute --nocapture
 - **Phase 2**에서 matmul, softmax, RoPE 등 10종의 GPU 연산 핵심 커널이 추가됩니다
 - **Phase 3**에서 MTLSharedEvent 기반 동기화와 듀얼 큐 파이프라인이 구현됩니다
 - **Phase 4**에서 Expert Parallelism을 위한 MoE 커널이 추가됩니다
+- [GPU Pipeline](../gpu-pipeline.md) — ExecGraph가 연산을 배칭하여 16.15x 속도 향상을 달성하는 방법

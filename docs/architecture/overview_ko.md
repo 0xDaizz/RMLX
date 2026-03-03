@@ -1,6 +1,6 @@
 # 아키텍처 개요
 
-RMLX는 5개의 레이어로 구성된 계층형 아키텍처이며, 전 Phase(0~7B)가 완료되어 완전히 구현된 상태입니다. 각 레이어는 명확한 책임 경계를 가지며, Cargo 크레이트 단위로 분리되어 있습니다. Phase 7에서 추가된 VJP autodiff, LoRA fine-tuning, 프로덕션 하드닝(structured logging, metrics, precision guard, graceful shutdown)이 포함됩니다.
+RMLX는 5개의 레이어로 구성된 계층형 아키텍처이며, 전 Phase(0~9B-opt)가 완료되어 완전히 구현된 상태입니다. 각 레이어는 명확한 책임 경계를 가지며, Cargo 크레이트 단위로 분리되어 있습니다. Phase 7에서 추가된 VJP autodiff, LoRA fine-tuning, 프로덕션 하드닝(structured logging, metrics, precision guard, graceful shutdown)이 포함됩니다. Phase 9에서는 ExecGraph (5 CBs/layer, 92.3% 감소), CommandBatcher, Indirect Command Buffer, 가중치 사전 캐싱이 추가되어 16.15x 속도 향상을 달성했습니다.
 
 ---
 
@@ -22,9 +22,19 @@ RMLX는 5개의 레이어로 구성된 계층형 아키텍처이며, 전 Phase(0
 │  ~/rmlx/ (이 리포지토리 — 프레임워크 전용)                                  │
 │                        rmlx-core (연산 엔진)                                │
 │  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │                      Compute Graph / Op Registry                     │   │
+│  │                      Compute Graph / Op Registry (14 op modules)     │   │
 │  │  matmul · softmax · rms_norm · rope · quantized_matmul · moe_gate   │   │
+│  │  sdpa · silu · binary · reduce · copy · indexing · ...              │   │
 │  └──────────────────────────────┬───────────────────────────────────────┘   │
+│                                 │                                          │
+│  ┌──────────────────────────────┼───────────────────────────────────────┐   │
+│  │                ExecGraph / CommandBatcher / ICB Layer                │   │
+│  │  ┌────────────┐  ┌──────────────────┐  ┌─────────────────────┐     │   │
+│  │  │ ExecGraph   │  │ CommandBatcher   │  │ IcbBuilder/         │     │   │
+│  │  │ (5 CBs/     │  │ (encoder         │  │  IcbReplay/         │     │   │
+│  │  │  layer)     │  │  grouping)       │  │  IcbCache           │     │   │
+│  │  └────────────┘  └──────────────────┘  └─────────────────────┘     │   │
+│  └──────────────────────────────┼───────────────────────────────────────┘   │
 │                                 │                                          │
 │  ┌──────────────────────────────┼───────────────────────────────────────┐   │
 │  │                        Metal Pipeline Layer                          │   │
@@ -89,11 +99,23 @@ RMLX는 5개의 레이어로 구성된 계층형 아키텍처이며, 전 Phase(0
 
 | 컴포넌트 | 역할 |
 |----------|------|
-| **Op Registry** | matmul, softmax, rms_norm, rope, quantized_matmul, moe_gate 등 연산 등록 |
+| **Op Registry** | matmul, softmax, rms_norm, rope, quantized_matmul, moe_gate, sdpa, silu 등 14개 op 모듈 등록 |
 | **Compute Graph** | 선택적 tracing 기반 연산 그래프 (eager-first, prefill 시 tracing) |
 | **Kernel Dispatch** | Op → Metal 커널 매핑 및 실행, dtype/shape 기반 최적 커널 선택 |
 
 rmlx-core는 rmlx-metal과 rmlx-alloc에 의존하며, 상위 레이어(rmlx-nn, rmlx-distributed)에 연산 API를 제공합니다.
+
+---
+
+### ExecGraph / CommandBatcher Layer
+
+다수의 GPU 연산을 최소한의 command buffer로 배칭하여 per-op CPU 오버헤드를 줄입니다.
+
+| 컴포넌트 | 역할 |
+|----------|------|
+| **ExecGraph** | 결정론적 op 시퀀스를 5개 CB/layer로 재생하는 사전 빌드 실행 그래프 (65개에서 92.3% 감소) |
+| **CommandBatcher** | 인코더 작업을 공유 command buffer로 그룹화하여 per-op CB 생성 제거 |
+| **ICB** | 사전 인코딩된 커맨드 시퀀스를 CPU 오버헤드 없이 재생하는 Indirect Command Buffer |
 
 ---
 

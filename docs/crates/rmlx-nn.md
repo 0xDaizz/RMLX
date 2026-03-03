@@ -4,7 +4,7 @@
 
 `rmlx-nn` is a crate that implements neural network layers for GPU-accelerated inference. It builds core Transformer architecture components (Linear, Embedding, Attention, TransformerBlock, MoE) on top of `rmlx-core` compute kernels, and includes built-in model configurations for LLaMA, Qwen, DeepSeek-V3, and Mixtral.
 
-> **Status:** Linear, Embedding, Attention (with KV cache), TransformerBlock, MoE, Parallel (TP), and 4 model configurations (LLaMA 7B/3-8B, Qwen2 7B, DeepSeek-V3, Mixtral 8x7B) are implemented.
+> **Status (Phase 0-9B-opt):** Linear, Embedding, Attention (with KV cache), TransformerBlock, MoE, Parallel (TP), and 4 model configurations (LLaMA 7B/3-8B, Qwen2 7B, DeepSeek-V3, Mixtral 8x7B) are implemented. Phase 9 adds `forward_graph()`, `forward_into_cb()`, and weight pre-caching (`prepare_weight_t`) for ExecGraph CB batching (65 CBs/layer -> 5 CBs/layer, 92.3% reduction, 16.15x speedup).
 
 ---
 
@@ -42,15 +42,45 @@ pub struct LinearConfig {
 
 pub struct Linear {
     config: LinearConfig,
+    weight: Option<Array>,
+    bias: Option<Array>,
 }
 ```
 
 | Method | Description |
 |--------|-------------|
-| `Linear::new(config)` | Creates a layer from config |
+| `Linear::new(config)` | Creates a config-only layer (weights loaded later) |
+| `from_arrays(config, weight, bias)` | Create with pre-loaded weight and optional bias |
+| `forward(input, registry, queue)` | Forward pass: `input @ W^T + bias` |
 | `in_features()` | Input dimension |
 | `out_features()` | Output dimension |
 | `has_bias()` | Whether bias is used |
+| `has_weights()` | Whether weights have been loaded |
+| `weight()` | Reference to weight array |
+| `bias()` | Reference to bias array |
+
+### Phase 9 Additions
+
+#### `forward_into_cb()`
+
+Encodes the linear forward pass into a caller-provided command buffer instead of
+creating a new one. This is the key pattern enabling ExecGraph's CB batching.
+
+| Method | Description |
+|--------|-------------|
+| `forward_into_cb(input, registry, cb)` | Encode `x @ W^T + bias` into the given CB |
+
+#### `prepare_weight_t()` / `weight_transposed_contiguous()`
+
+Pre-computes and caches the contiguous transposed weight matrix at model load time.
+
+| Method | Description |
+|--------|-------------|
+| `prepare_weight_t(registry, queue)` | Pre-compute `W^T` as a contiguous array and cache it |
+| `weight_transposed_contiguous()` | Returns the cached transposed weight (if prepared) |
+
+This trades ~2x weight memory for zero-cost transpose during inference, contributing
+to the 16.15x speedup.
 
 ---
 
@@ -92,13 +122,19 @@ pub struct AttentionConfig {
 
 pub struct Attention {
     config: AttentionConfig,
+    q_proj: Linear,
+    k_proj: Linear,
+    v_proj: Linear,
+    o_proj: Linear,
 }
 ```
 
 | Method | Description |
 |--------|-------------|
-| `Attention::new(config)` | Creates from config |
-| `forward(x, cache)` | Forward pass; `cache: Option<&mut LayerKvCache>` |
+| `Attention::new(config)` | Config-only constructor (weights loaded later) |
+| `from_layers(config, q_proj, k_proj, v_proj, o_proj)` | Create with pre-loaded projection layers |
+| `forward(x, cos_freqs, sin_freqs, mask, cache, registry, queue)` | Forward pass; `cos_freqs`/`sin_freqs` are optional RoPE frequency tables, `cache: Option<&mut LayerKvCache>` |
+| `config()` | Reference to `AttentionConfig` |
 | `num_heads()` | Number of Q heads |
 | `num_kv_heads()` | Number of KV heads |
 | `head_dim()` | Head dimension |
@@ -113,22 +149,57 @@ When `cache` is `Some`, new K/V tensors are appended to the cache and the full c
 | GQA | `num_kv_heads < num_heads` | LLaMA 3, Qwen2, Mixtral |
 | MLA | `num_kv_heads == 1` | DeepSeek-V3 |
 
+### Phase 9 Additions
+
+#### `forward_graph()`
+
+ExecGraph-compatible forward pass that encodes attention operations into the
+ExecGraph's command buffers.
+
+| Method | Description |
+|--------|-------------|
+| `forward_graph(x, cos_freqs, sin_freqs, mask, cache, registry, graph)` | ExecGraph-compatible forward |
+
+#### `batched_qkv_proj_into()`
+
+Batches Q, K, V projections into a single command buffer.
+
+| Method | Description |
+|--------|-------------|
+| `batched_qkv_proj_into(x, registry, cb)` | Encode all three projections into one CB |
+
 ### LayerKvCache
 
-Per-layer KV cache for incremental decoding. Stores cached K/V per KV head so that previously computed key-value pairs are reused across decoding steps.
+Per-layer KV cache for incremental decoding. Stores cached K/V per KV head so that previously computed key-value pairs are reused across decoding steps. Uses pre-allocated contiguous buffers with O(1) append (no full-history copy).
 
 ```rust
 pub struct LayerKvCache {
-    pub keys: Vec<Array>,      // per kv_head cached K: [cached_seq, head_dim]
-    pub values: Vec<Array>,    // per kv_head cached V: [cached_seq, head_dim]
+    pub keys: Vec<Array>,      // per kv_head: [max_seq, head_dim], pre-allocated
+    pub values: Vec<Array>,    // per kv_head: [max_seq, head_dim], pre-allocated
     pub seq_len: usize,
+    max_seq_len: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
 }
 ```
 
 | Method | Description |
 |--------|-------------|
-| `LayerKvCache::new(num_kv_heads)` | Creates an empty cache for `num_kv_heads` heads |
-| `append(new_keys, new_values, new_tokens)` | Appends new K/V and advances `seq_len` by `new_tokens` |
+| `LayerKvCache::new(num_kv_heads)` | Creates an empty cache (no pre-allocation, legacy compatible) |
+| `LayerKvCache::preallocated(device, num_kv_heads, head_dim, max_seq_len, dtype)` | Creates a pre-allocated cache with O(1) append |
+| `append(new_keys, new_values, new_tokens, registry, queue)` | Appends new K/V and advances `seq_len` by `new_tokens` |
+| `cached_keys(head)` | View of cached keys for head h: [seq_len, head_dim] |
+| `cached_values(head)` | View of cached values for head h: [seq_len, head_dim] |
+| `position_offset()` | Current cached sequence length (RoPE offset) |
+| `is_empty()` | Whether the cache has any tokens |
+
+#### `append_into_cb()`
+
+Appends new K/V into the cache using a caller-provided command buffer (ExecGraph compatible).
+
+| Method | Description |
+|--------|-------------|
+| `append_into_cb(new_keys, new_values, new_tokens, registry, cb)` | Append into caller's CB |
 
 ---
 
@@ -142,6 +213,26 @@ pub enum FeedForwardType {
     MoE { config: MoeConfig },
 }
 ```
+
+### FeedForward
+
+```rust
+/// Feed-forward network: either dense (SwiGLU) or MoE.
+pub enum FeedForward {
+    /// SwiGLU FFN: gate_proj, up_proj, down_proj
+    Dense {
+        gate_proj: Linear,
+        up_proj: Linear,
+        down_proj: Linear,
+    },
+    /// Mixture of Experts
+    MoE(MoeLayer),
+}
+```
+
+| Method | Description |
+|--------|-------------|
+| `forward(x, registry, queue)` | Forward pass: SwiGLU (`down(silu(gate(x)) * up(x))`) or MoE routing |
 
 ### TransformerConfig
 
@@ -165,32 +256,78 @@ pub struct TransformerConfig {
 ```rust
 pub struct TransformerBlock {
     layer_idx: usize,
-    config: TransformerConfig,
+    attention: Attention,
+    ffn: FeedForward,
+    norm1_weight: Option<Array>,
+    norm2_weight: Option<Array>,
+    rms_norm_eps: f32,
 }
 ```
 
 | Method | Description |
 |--------|-------------|
 | `TransformerBlock::new(layer_idx, config)` | Creates with layer index and config |
-| `forward(x, cache)` | Forward pass; `cache: Option<&mut LayerKvCache>` — passed through to `Attention` |
+| `from_parts(layer_idx, attention, ffn, norm1_weight, norm2_weight, rms_norm_eps)` | Create with pre-loaded components |
+| `forward(x, cos_freqs, sin_freqs, mask, cache, registry, queue)` | Forward pass: norm -> attn -> residual -> norm -> FFN -> residual |
 | `layer_idx()` | Layer index |
 | `hidden_size()` | Hidden dimension |
+
+#### Phase 9 Additions
+
+##### `forward_graph()`
+
+ExecGraph-compatible forward pass for the full transformer block (norm -> attn -> residual -> norm -> FFN -> residual).
+
+| Method | Description |
+|--------|-------------|
+| `forward_graph(x, cos_freqs, sin_freqs, mask, cache, registry, graph)` | ExecGraph-compatible forward |
+
+##### `prepare_weights_for_graph()`
+
+Pre-caches all weight transposes for ExecGraph execution.
+
+| Method | Description |
+|--------|-------------|
+| `prepare_weights_for_graph(registry, queue)` | Pre-cache all Linear weight transposes in this block |
 
 ### TransformerModel
 
 ```rust
 pub struct TransformerModel {
     config: TransformerConfig,
+    embedding: Option<Embedding>,
+    layers: Vec<TransformerBlock>,
+    final_norm_weight: Option<Array>,
+    lm_head: Option<Linear>,
     num_layers: usize,
 }
 ```
 
 | Method | Description |
 |--------|-------------|
-| `TransformerModel::new(config)` | Creates a model |
-| `forward(x, cache)` | Forward pass; `cache: Option<&mut Vec<LayerKvCache>>` (per-layer cache vector, length validated against `num_layers`) |
+| `TransformerModel::new(config)` | Creates a config-only model (no weights loaded) |
+| `from_parts(config, embedding, layers, final_norm_weight, lm_head)` | Create with all components pre-loaded |
+| `forward(token_ids, cos_freqs, sin_freqs, mask, cache, registry, queue)` | Forward pass: token IDs -> logits; `cache: Option<&mut Vec<LayerKvCache>>` (per-layer cache vector, length validated against `num_layers`) |
 | `num_layers()` | Number of layers |
 | `config()` | Config reference |
+
+#### Phase 9 Additions
+
+##### `forward_graph()`
+
+Full model forward pass using ExecGraph -- each layer uses 5 CBs instead of 65 (92.3% reduction).
+
+| Method | Description |
+|--------|-------------|
+| `forward_graph(token_ids, cos_freqs, sin_freqs, mask, cache, registry, graph)` | ExecGraph-compatible full model forward |
+
+##### `prepare_weights_for_graph()`
+
+Pre-caches all weight transposes across all layers.
+
+| Method | Description |
+|--------|-------------|
+| `prepare_weights_for_graph(registry, queue)` | Pre-cache weight transposes for all layers |
 
 ---
 
@@ -302,16 +439,20 @@ graph BT
         RMSNORM[rms_norm]
         BINARY[binary ops]
         GEMV[gemv]
+        SDPA[sdpa]
+        SILU[silu/SwiGLU]
     end
 
     ATT --> MATMUL
     ATT --> SOFTMAX
     ATT --> ROPE
+    ATT --> SDPA
     MOE --> MATMUL
     LIN --> MATMUL
     LIN --> GEMV
     PAR --> LIN
     TB --> RMSNORM
+    TB --> SILU
     EMB --> MATMUL
 
     LLAMA --> TB
@@ -327,8 +468,13 @@ graph BT
 ## Re-exports (lib.rs)
 
 ```rust
-pub use attention::LayerKvCache;
-pub use transformer::FeedForward;
+pub use attention::{Attention, AttentionConfig, LayerKvCache};
+pub use embedding::{Embedding, EmbeddingConfig};
+pub use linear::{Linear, LinearConfig};
+pub use moe::{MoeConfig, MoeForwardMetrics, MoeLayer};
+pub use transformer::{
+    FeedForward, FeedForwardType, TransformerBlock, TransformerConfig, TransformerModel,
+};
 ```
 
 ---

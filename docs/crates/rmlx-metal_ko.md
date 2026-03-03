@@ -22,7 +22,24 @@ graph TD
     A --> I[self_check.rs — SelfCheckResult]
     A --> J[stream.rs — StreamManager]
     A --> K[lib.rs — MetalError]
+    A --> L[batcher.rs — CommandBatcher]
+    A --> M[exec_graph.rs — ExecGraph]
+    A --> N[icb.rs — ICB Support]
 ```
+
+### `lib.rs` — 최상위 Re-exports
+
+편의를 위해 자주 사용되는 타입을 크레이트 루트에서 re-export합니다:
+
+```rust
+pub use device::{Architecture, GpuDevice};
+pub use event::GpuEvent;
+pub use stream::StreamManager;
+```
+
+`use rmlx_metal::device::GpuDevice;` 대신 `use rmlx_metal::GpuDevice;`로 사용할 수 있습니다.
+
+---
 
 ### `device.rs` — `GpuDevice`
 
@@ -397,6 +414,67 @@ sequenceDiagram
 
 ---
 
+### `batcher.rs` — `CommandBatcher`
+
+여러 GPU 인코더 연산을 공유 커맨드 버퍼에 그룹화하여, 연산별 CB 생성 오버헤드를 줄입니다.
+
+| 메서드 | 설명 |
+|--------|------|
+| `new(queue)` | 커맨드 큐에 바인딩된 새 batcher를 생성합니다 |
+| `begin_batch()` | 새 배치를 시작합니다 (새 CB 생성) |
+| `encoder()` | 현재 compute command encoder를 반환합니다 |
+| `end_batch()` | 배치를 완료하고 CB를 커밋합니다 |
+| `batch_count()` | 실행된 배치 수 |
+
+CommandBatcher는 ExecGraph의 92.3% CB 감소를 구현하는 핵심 메커니즘입니다.
+각 연산이 자체 커맨드 버퍼를 생성하는 대신, 여러 연산이 batcher의 encoder를 통해
+하나의 CB를 공유합니다.
+
+---
+
+### `exec_graph.rs` — `ExecGraph`
+
+결정론적 트랜스포머 레이어 연산 시퀀스를 최소한의 커맨드 버퍼로 재생하는
+사전 빌드된 실행 그래프입니다.
+
+| 타입 | 설명 |
+|------|------|
+| `ExecGraph` | 트랜스포머 레이어를 위한 사전 분석된 연산 시퀀스 |
+| `EventToken` | CB 간 의존성을 위한 동기화 토큰 |
+| `ExecGraphStats` | 실행 통계 (CB 수, encoder 수, 동기화 포인트) |
+
+| 메서드 | 설명 |
+|--------|------|
+| `new(queue, event)` | 큐와 동기화 이벤트에 바인딩된 그래프 생성 |
+| `execute(layer_ops)` | 5개 CB로 사전 빌드된 연산 시퀀스 실행 |
+| `stats()` | 실행 통계 반환 |
+
+**트랜스포머 레이어별 CB 레이아웃:**
+
+| CB | 연산 |
+|----|------|
+| CB1 | QKV 프로젝션 + RoPE |
+| CB2 | SDPA (fused attention) |
+| CB3 | 출력 프로젝션 + 잔차 |
+| CB4 | FFN (gate + up + SiLU + down) |
+| CB5 | 최종 잔차 + 정규화 |
+
+**성능**: 레이어당 65 CB -> 5 CB (92.3% 감소), 16.15x 속도 향상 달성.
+
+---
+
+### `icb.rs` — Indirect Command Buffers
+
+CPU 오버헤드 없이 커맨드를 재생하기 위한 Metal Indirect Command Buffer 지원입니다.
+
+| 타입 | 설명 |
+|------|------|
+| `IcbBuilder` | 기록된 커맨드로 indirect command buffer를 빌드합니다 |
+| `IcbReplay` | 이전에 빌드된 ICB를 재생합니다 |
+| `IcbCache` | forward pass 간 재사용을 위해 빌드된 ICB를 캐시합니다 |
+
+---
+
 ## 에러 처리
 
 `MetalError` enum으로 모든 Metal 작업의 에러를 통합 관리합니다.
@@ -542,11 +620,7 @@ pub unsafe fn read_buffer<T>(buffer: &MTLBuffer, count: usize) -> &[T]
 
 ## 향후 계획
 
-Phase 3에서 다음 모듈이 추가될 예정입니다.
-
-| 모듈 | 설명 | Phase |
-|------|------|-------|
-| `resident.rs` | `ResidencySet` 관리 — Metal 3 리소스 상주 관리 | Phase 3 |
+모든 모듈이 Phase 9B-opt까지 완전히 구현되었습니다.
 
 ---
 

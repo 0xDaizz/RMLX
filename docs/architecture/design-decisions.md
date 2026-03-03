@@ -199,3 +199,78 @@ Cross-queue synchronization is managed via `MTLSharedEvent`. The `HazardTracking
 ### Cautions
 
 When using `HazardTrackingModeUntracked`, all cross-queue buffer accesses must be synchronized with `MTLSharedEvent` or `MTLFence`. When adding new cross-queue access patterns, data integrity tests must always be included.
+
+---
+
+## 8. ExecGraph Architecture — Re-encode vs Capture-replay
+
+ExecGraph uses deterministic re-encoding rather than CUDA Graphs-style capture-replay.
+
+### Rationale
+
+CUDA Graphs captures a sequence of GPU operations and replays them with near-zero CPU overhead.
+Metal does not have an equivalent capture-replay mechanism. Instead, ExecGraph:
+
+1. Pre-analyzes the transformer layer's operation sequence
+2. Groups operations into 5 command buffers (down from 65)
+3. Re-encodes the same deterministic sequence each forward pass
+4. Uses MTLSharedEvent for inter-CB synchronization
+
+### Why 5 Command Buffers?
+
+| CB | Operations | Reason for boundary |
+|----|-----------|---------------------|
+| CB1 | QKV projection + RoPE | Shared input dependency |
+| CB2 | SDPA (fused attention) | Depends on CB1 output |
+| CB3 | Output projection + residual | Depends on CB2 |
+| CB4 | FFN (gate + up + SiLU + down) | Depends on CB3 |
+| CB5 | Final residual + norm | Depends on CB4 |
+
+Each boundary exists because subsequent operations depend on the previous CB's output.
+Within each CB, multiple operations share a single encoder.
+
+### Benchmark Evidence
+
+| Metric | Baseline | ExecGraph | Improvement |
+|--------|----------|-----------|-------------|
+| CBs/layer | 65 | 5 | 92.3% reduction |
+| Latency/layer | 110.4ms | 6.8ms | 16.15x speedup |
+| CPU-GPU syncs | ~65 | ~1 | 98.5% reduction |
+
+### Trade-offs vs CUDA Graphs
+
+| Aspect | ExecGraph | CUDA Graphs |
+|--------|-----------|-------------|
+| Mechanism | Re-encode each pass | Capture once, replay |
+| CPU overhead | Low (deterministic path) | Near-zero (replay) |
+| Shape flexibility | Can handle shape changes | Requires re-capture |
+| Implementation | Simpler (no capture state) | Complex capture semantics |
+
+---
+
+## 9. Weight Pre-caching — Memory vs Latency Tradeoff
+
+Pre-computed contiguous transposed weight matrices are cached at model load time.
+
+### Rationale
+
+Linear layers compute `x @ W^T`. The transpose `W^T` creates a non-contiguous view,
+requiring a contiguous copy before matmul dispatch. In the baseline, this copy happens
+every forward pass.
+
+### Solution
+
+`prepare_weight_t()` pre-computes and caches the contiguous transposed weight at model
+load time. This trades ~2x weight memory for zero-cost transpose during inference.
+
+### Memory Impact
+
+For a 7B parameter model with f16 weights:
+- Base weights: ~14 GB
+- Transposed cache: ~14 GB
+- Total: ~28 GB (fits in 512GB UMA with headroom)
+
+### Performance Impact
+
+Eliminates the per-layer transpose + copy overhead from the critical path.
+Combined with ExecGraph, this contributes to the 16.15x speedup.

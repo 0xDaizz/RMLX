@@ -1,10 +1,10 @@
-# Implementation Roadmap — All Phases Complete
+# 🗺️ Implementation Roadmap — Phases 0-9B Complete
 
-The 8-phase implementation roadmap for the rmlx project. All phases have been completed.
+The rmlx project implementation roadmap. All phases have been completed through 9B-opt. Implementation phases: 9 (all complete through 9B-opt).
 
 ---
 
-## Overview
+## 📋 Overview
 
 | Phase | Name | Key Content | Prerequisites | Status |
 |:-----:|------|------------|:------------:|:------:|
@@ -17,15 +17,16 @@ The 8-phase implementation roadmap for the rmlx project. All phases have been co
 | 3 | Pipeline Overlap | MTLSharedEvent, dual-queue pipeline | Phase 2 | Complete |
 | 4 | Expert Parallelism | EP dispatch/combine, 3-zone auto backend, sparse dispatch | Phase 1 + 3 | Complete |
 | 5A | NN Inference Core | LLaMA, Qwen, DeepSeek, Mixtral | Phase 4 | Complete |
-| 5B | Model Serving | rmlx-lm (separate repo ~/rmlx-lm) | Phase 5A | Complete |
 | 6 | Multi-Port | Dual TB5 multi-port striping, multi-node topology | Phase 4 | Complete |
-| 7A | Production Hardening | Hardening, observability | Phase 5 | Complete |
+| 7A | Production Hardening | Hardening, observability | Phase 5A | Complete |
 | 7B | VJP Autodiff | VJP autodiff + LoRA fine-tuning | Phase 7A | Complete |
 | 8 | KV Cache + API Surface | KV cache, parallel linear, API ergonomics | Phase 7B | Complete |
+| 9A | GPU Pipeline — ExecGraph | CommandBatcher, ExecGraph, ICB, `_into_cb()` pattern | Phase 8 | Complete |
+| 9B-opt | GPU Pipeline — Optimization | Weight pre-caching, contiguous transpose, 16.15x speedup | Phase 9A | Complete |
 
 ---
 
-## Phase Completion History
+## 📜 Phase Completion History
 
 | Phase | Commit | Tests | Status |
 |-------|--------|-------|--------|
@@ -38,15 +39,16 @@ The 8-phase implementation roadmap for the rmlx project. All phases have been co
 | Phase 3: SharedEvent sync + dual queue + layer pipeline | f9cadcf | 52 tests | Complete |
 | Phase 4: EP 3-Zone dispatch + MoE exchange | 6fb3296 | 62 tests | Complete |
 | Phase 5A: rmlx-nn inference core (LLaMA, Qwen, DeepSeek, Mixtral) | d126aaf | + nn tests | Complete |
-| Phase 5B: rmlx-lm serving engine (separate repo ~/rmlx-lm) | 98e50c1 | 75 tests | Complete |
 | Phase 6: Dual TB5 multi-port striping + multi-node topology | 8c8b25f | + distributed tests | Complete |
 | Phase 7A: Production hardening / observability | 0fa70bb | 98 tests | Complete |
 | Phase 7B: VJP autodiff + LoRA fine-tuning | 025ed8f | 108 tests | Complete |
 | Phase 8: KV Cache + API Surface | squash merge | 339 tests | Complete |
+| Phase 9A: GPU Pipeline — ExecGraph | Phase 9 merge commit | 339+ tests | Complete |
+| Phase 9B-opt: GPU Pipeline — Optimization | optimization merge | 339+ tests | Complete |
 
 ---
 
-## Phase Dependency Diagram
+## 🔀 Phase Dependency Diagram
 
 ```mermaid
 graph LR
@@ -56,10 +58,10 @@ graph LR
     P3["Phase 3<br/>Pipeline Overlap<br/>Complete"]
     P4["Phase 4<br/>Expert Parallelism<br/>Complete"]
     P5A["Phase 5A<br/>NN Inference Core<br/>Complete"]
-    P5B["Phase 5B<br/>Model Serving<br/>Complete"]
     P6["Phase 6<br/>Multi-Port<br/>Complete"]
     P7["Phase 7<br/>Production<br/>Complete"]
     P8["Phase 8<br/>KV Cache + API<br/>Complete"]
+    P9["Phase 9<br/>GPU Pipeline<br/>Complete"]
 
     P0 --> P1
     P0 --> P2
@@ -67,10 +69,10 @@ graph LR
     P1 --> P4
     P3 --> P4
     P4 --> P5A
-    P5A --> P5B
     P4 --> P6
-    P5B --> P7
+    P5A --> P7
     P7 --> P8
+    P8 --> P9
 
     style P0 fill:#22c55e,color:#fff
     style P1 fill:#22c55e,color:#fff
@@ -78,15 +80,15 @@ graph LR
     style P3 fill:#22c55e,color:#fff
     style P4 fill:#22c55e,color:#fff
     style P5A fill:#22c55e,color:#fff
-    style P5B fill:#22c55e,color:#fff
     style P6 fill:#22c55e,color:#fff
     style P7 fill:#22c55e,color:#fff
     style P8 fill:#22c55e,color:#fff
+    style P9 fill:#22c55e,color:#fff
 ```
 
 ---
 
-## Phase 0: Scaffolding — Complete (`7071c73`)
+## 🏗️ Phase 0: Scaffolding — Complete (`7071c73`)
 
 ### Goal
 
@@ -111,7 +113,7 @@ Establish the Cargo workspace structure, validate metal-rs basic operations, and
 
 ---
 
-## Phase 1: Zero-Copy + RDMA — Complete (`d541bb3`, hotfix `9cca9a9`)
+## 🔗 Phase 1: Zero-Copy + RDMA — Complete (`d541bb3`, hotfix `9cca9a9`)
 
 ### Goal
 
@@ -143,7 +145,7 @@ Convert PoC Phase 1-4 validation results into production-quality code. Implement
 
 ---
 
-## Phase 2: Metal Compute — Complete (2A: `3179bde`, `5ef6a07` / 2B: `e4d9c14`)
+## ⚡ Phase 2: Metal Compute — Complete (2A: `3179bde`, `5ef6a07` / 2B: `e4d9c14`)
 
 ### Goal
 
@@ -179,7 +181,7 @@ Build the core Metal kernel execution pipeline needed for efficient GPU computat
 
 ---
 
-## Phase 3: Pipeline Overlap — Complete (`f9cadcf`)
+## 🔄 Phase 3: Pipeline Overlap — Complete (`f9cadcf`)
 
 ### Goal
 
@@ -214,7 +216,7 @@ Pipelined:     60 x 20ms + 7ms   = 1,207ms  (25% improvement)
 
 ---
 
-## Phase 4: Expert Parallelism — Complete (`6fb3296`)
+## 🧠 Phase 4: Expert Parallelism — Complete (`6fb3296`)
 
 ### Goal
 
@@ -248,7 +250,7 @@ Reimplement MLX EP optimizations in RMLX, achieving additional performance gains
 
 ---
 
-## Phase 5A: NN Inference Core — Complete (`d126aaf`)
+## 🏛️ Phase 5A: NN Inference Core — Complete (`d126aaf`)
 
 ### Goal
 
@@ -269,38 +271,7 @@ Implement core neural network modules in the rmlx-nn crate.
 
 ---
 
-## Phase 5B: Model Serving — Complete (`98e50c1`, separate repo ~/rmlx-lm)
-
-### Goal
-
-Build a complete LLM inference serving engine. Implemented in a separate repository (`~/rmlx-lm/`) that references rmlx as a dependency.
-
-### Key Deliverables
-
-**rmlx-lm serving application** (`~/rmlx-lm/`):
-- safetensors model loader (quantized weight decoding)
-- KV cache management (paged attention)
-- Token sampler (temperature, top-p, top-k, repetition penalty)
-- Tokenizer integration (tokenizers-rs, HuggingFace compatible)
-- Continuous batching scheduler
-- HTTP server (OpenAI Chat Completions API compatible)
-- CLI interface (generate, serve, benchmark)
-
-### Definition of Done (DoD)
-
-- [x] `cargo fmt --all --check` -- diff 0 (both repositories)
-- [x] `cargo clippy --workspace -- -D warnings` -- 0 warnings (both)
-- [x] `test_e2e_single_token_generation` -- single-token generation accuracy
-- [x] `test_continuous_batching` -- concurrent multi-request handling
-- [x] `test_kv_cache_paged` -- cache allocation/deallocation stress
-- [x] `test_openai_api_compat` -- /v1/chat/completions response format
-- [x] `test_metrics_prometheus` -- /metrics endpoint parsing succeeds
-- [x] Benchmark: 2-node EP decode > 28 tok/s
-- [x] Codex review: serving stability, memory leaks
-
----
-
-## Phase 6: Multi-Port — Complete (`8c8b25f`)
+## 🌐 Phase 6: Multi-Port — Complete (`8c8b25f`)
 
 ### Goal
 
@@ -324,7 +295,7 @@ Expand bandwidth by utilizing multiple TB5 ports and support 3+ nodes. Achieve ~
 
 ---
 
-## Phase 7A: Production Hardening / Observability — Complete (`0fa70bb`)
+## 🛡️ Phase 7A: Production Hardening / Observability — Complete (`0fa70bb`)
 
 ### Goal
 
@@ -346,7 +317,7 @@ Ensure production stability and observability.
 
 ---
 
-## Phase 7B: VJP Autodiff + LoRA Fine-tuning — Complete (`025ed8f`)
+## 🎓 Phase 7B: VJP Autodiff + LoRA Fine-tuning — Complete (`025ed8f`)
 
 ### Goal
 
@@ -364,7 +335,7 @@ Build a VJP framework and LoRA fine-tuning foundation for training support.
 
 ---
 
-## Phase 8: KV Cache + API Surface — Complete (squash merged to main)
+## 📦 Phase 8: KV Cache + API Surface — Complete (squash merged to main)
 
 ### Goal
 
@@ -484,7 +455,7 @@ jobs:
 
 ---
 
-## Phase Common Completion Criteria
+## ✅ Phase Common Completion Criteria
 
 All phases must meet the following criteria:
 
