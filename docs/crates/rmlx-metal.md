@@ -618,9 +618,20 @@ pub unsafe fn read_buffer<T>(buffer: &MTLBuffer, count: usize) -> &[T]
 
 ---
 
-## Future Plans
+## Audit Remediation (M1-M8)
 
-All modules are fully implemented through Phase 9B-opt.
+The Phase 0+1+2 full-crate audit added the following to rmlx-metal:
+
+| Module | Description |
+|--------|-------------|
+| `fence.rs` | Fence manager for Metal synchronization primitives |
+| `library_cache.rs` | Library cache for avoiding redundant shader compilation |
+| `msl_version.rs` | MSL version detection for feature gating |
+| `autorelease.rs` | Autorelease pool management for Objective-C objects |
+| `capture.rs` | GPU capture manager for Metal debugging |
+| `managed_buffer.rs` | Managed buffer wrapper with lifecycle tracking |
+
+Additionally, command pipeline safety, stream improvements, and buffer cache optimizations were applied (items M1-M8).
 
 ---
 

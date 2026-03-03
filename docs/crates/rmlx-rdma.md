@@ -4,7 +4,7 @@
 
 `rmlx-rdma` is the inter-node communication layer based on Thunderbolt 5 RDMA (ibverbs). It performs high-speed data transfer between Apple Silicon Macs via the TB5 interface. It dynamically loads `librdma.dylib` via `dlopen` to interface with the macOS TB5 RDMA driver and uses UC (Unreliable Connected) mode QPs.
 
-> **Status:** Phase 1 implementation complete. FFI bindings, context/PD/CQ management, UC QP lifecycle, MR registration, TCP-based QP exchange, connection management, warmup protocol, dual port striping, and transfer metrics are all implemented.
+> **Status:** Phase 1 implementation complete + Phase 0+1+2 audit remediation (items R1-R3). FFI bindings, context/PD/CQ management, UC QP lifecycle, MR registration, TCP-based QP exchange, connection management, warmup protocol, dual port striping, transfer metrics, **ring/allreduce/allgather collectives**, **connection manager**, and **coordinator** are all implemented.
 
 ---
 

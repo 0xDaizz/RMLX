@@ -1,7 +1,9 @@
 //! GPU kernel operations for RMLX arrays.
 
 pub mod binary;
+pub mod concat;
 pub mod conv;
+pub mod conv_tiled;
 pub mod copy;
 pub mod fp8;
 pub mod gather_mm;
@@ -15,9 +17,12 @@ pub mod reduce;
 pub mod rms_norm;
 pub mod rope;
 pub mod sdpa;
+pub mod sdpa_backward;
+pub mod select;
 pub mod silu;
 pub mod softmax;
 pub mod unary;
+pub mod vjp_gpu;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -50,6 +55,7 @@ pub fn register_all(registry: &KernelRegistry) -> Result<(), KernelError> {
     copy::register(registry)?;
     binary::register(registry)?;
     conv::register(registry)?;
+    conv_tiled::register(registry)?;
     reduce::register(registry)?;
     rms_norm::register(registry)?;
     softmax::register(registry)?;
@@ -61,10 +67,14 @@ pub fn register_all(registry: &KernelRegistry) -> Result<(), KernelError> {
     silu::register(registry)?;
     gelu::register(registry)?;
     sdpa::register(registry)?;
+    sdpa_backward::register(registry)?;
     fp8::register(registry)?;
     unary::register(registry)?;
     layer_norm::register(registry)?;
     gather_mm::register(registry)?;
+    select::register(registry)?;
+    concat::register(registry)?;
+    vjp_gpu::register(registry)?;
     Ok(())
 }
 

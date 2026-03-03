@@ -158,49 +158,46 @@ mod tests {
         assert!(select_kernel_name(DType::UInt32).is_err());
     }
 
-    #[test]
-    fn test_select_dtype_validation() {
-        // This test verifies the validation logic without requiring a GPU device.
-        // We create dummy arrays and check that invalid dtype combinations are rejected.
-        let device = metal::Device::system_default().unwrap();
-        let queue = device.new_command_queue();
-
-        // Need registry for this test
-        let gpu_dev = rmlx_metal::device::GpuDevice::new(device.clone());
+    fn setup() -> (KernelRegistry, metal::CommandQueue) {
+        let gpu_dev = rmlx_metal::device::GpuDevice::system_default().unwrap();
+        let queue = gpu_dev.raw().new_command_queue();
         let registry = KernelRegistry::new(gpu_dev);
         register(&registry).unwrap();
         crate::ops::copy::register(&registry).unwrap();
+        (registry, queue)
+    }
+
+    #[test]
+    fn test_select_dtype_validation() {
+        let (registry, queue) = setup();
+        let device = registry.device().raw();
 
         // Mismatched a/b dtypes should fail
-        let cond = Array::zeros(&device, &[4], DType::UInt32);
-        let a = Array::zeros(&device, &[4], DType::Float32);
-        let b = Array::zeros(&device, &[4], DType::Float32);
+        let cond = Array::zeros(device, &[4], DType::UInt32);
+        let a = Array::zeros(device, &[4], DType::Float32);
+        let b = Array::zeros(device, &[4], DType::Float32);
 
         // Valid case should work
         let result = select(&registry, &cond, &a, &b, &queue);
         assert!(result.is_ok());
 
         // Wrong cond dtype
-        let bad_cond = Array::zeros(&device, &[4], DType::Float32);
+        let bad_cond = Array::zeros(device, &[4], DType::Float32);
         let result = select(&registry, &bad_cond, &a, &b, &queue);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_select_basic() {
-        let device = metal::Device::system_default().unwrap();
-        let queue = device.new_command_queue();
-        let gpu_dev = rmlx_metal::device::GpuDevice::new(device.clone());
-        let registry = KernelRegistry::new(gpu_dev);
-        register(&registry).unwrap();
-        crate::ops::copy::register(&registry).unwrap();
+        let (registry, queue) = setup();
+        let device = registry.device().raw();
 
         // cond = [1, 0, 1, 0]
-        let cond = Array::from_slice(&device, &[1u32, 0, 1, 0], vec![4]);
+        let cond = Array::from_slice(device, &[1u32, 0, 1, 0], vec![4]);
         // a = [10, 20, 30, 40]
-        let a = Array::from_slice(&device, &[10.0f32, 20.0, 30.0, 40.0], vec![4]);
+        let a = Array::from_slice(device, &[10.0f32, 20.0, 30.0, 40.0], vec![4]);
         // b = [100, 200, 300, 400]
-        let b = Array::from_slice(&device, &[100.0f32, 200.0, 300.0, 400.0], vec![4]);
+        let b = Array::from_slice(device, &[100.0f32, 200.0, 300.0, 400.0], vec![4]);
 
         let out = select(&registry, &cond, &a, &b, &queue).unwrap();
         let result = out.to_vec_checked::<f32>();

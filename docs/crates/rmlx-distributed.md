@@ -4,7 +4,7 @@
 
 `rmlx-distributed` is a crate providing communication groups, MoE (Mixture of Experts) dispatch/combine exchange, 3-zone backend policy, compute-RDMA pipeline overlap, overflow monitoring (SparseGuard), warmup protocol, and MoE metrics for distributed inference.
 
-> **Status:** All modules are implemented: group, moe_exchange, moe_policy, pipeline, sparse_guard, warmup, metrics.
+> **Status:** All modules are implemented: group, moe_exchange, moe_policy, pipeline, sparse_guard, warmup, metrics. Phase 0+1+2 audit remediation complete (items D1-D10): dispatch loop ordering fixed (k-outer), per-rank capacity partitioning, combine kernel caching, byte threshold (4KB->2MB), hysteresis path fix, dual cooldown semantics, shared expert support, EP integration improvements.
 
 ---
 

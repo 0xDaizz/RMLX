@@ -4,7 +4,7 @@
 
 `rmlx-nn` is a crate that implements neural network layers for GPU-accelerated inference. It builds core Transformer architecture components (Linear, Embedding, Attention, TransformerBlock, MoE) on top of `rmlx-core` compute kernels, and includes built-in model configurations for LLaMA, Qwen, DeepSeek-V3, and Mixtral.
 
-> **Status (Phase 0-9B-opt + S1-S5):** Linear, Embedding, Attention (with LayerKvCache, RotatingKvCache, BatchKvCache, QuantizedKvCache), TransformerBlock, MoE, Parallel (TP), Conv1d/Conv2d, DynamicExecContext, and 4 model configurations are implemented.
+> **Status (Phase 0-9B-opt + S1-S5 + Audit):** Linear, QuantizedLinear, Embedding, Attention (with LayerKvCache, RotatingKvCache, BatchKvCache, QuantizedKvCache), MLA (Multi-Latent Attention), Sliding Window Attention, TransformerBlock, MoE (with shared expert + EP integration + GPU routing), LayerNorm, 14 activation functions, Parallel (TP), Conv1d/Conv2d, DynamicExecContext, GGUF model loader, and 4 model configurations are implemented. Phase 0+1+2 audit remediation complete (items N1-N8).
 
 ---
 
@@ -12,21 +12,27 @@
 
 ```
 rmlx-nn/src/
-├── lib.rs           # Module declarations + re-exports
-├── linear.rs        # Linear (FC) layer
-├── embedding.rs     # Token embedding
-├── attention.rs     # Multi-Head / GQA Attention + KV cache
-├── transformer.rs   # Transformer block + model
-├── moe.rs           # Mixture of Experts layer
-├── conv.rs          # Conv1d/Conv2d layer wrappers
-├── dynamic.rs       # DynamicExecContext for variable shapes
-├── parallel.rs      # Tensor-parallel layers (feature = "distributed")
+├── lib.rs               # Module declarations + re-exports
+├── linear.rs            # Linear (FC) layer
+├── quantized_linear.rs  # QuantizedLinear (4-bit/8-bit with group quantization)
+├── embedding.rs         # Token embedding
+├── attention.rs         # Multi-Head / GQA Attention + KV cache
+├── mla.rs               # Multi-Latent Attention (DeepSeek-V3)
+├── sliding_window.rs    # Sliding Window Attention
+├── layer_norm.rs        # LayerNorm layer wrapper
+├── activations.rs       # 14 activation functions (SiLU, GELU, Mish, etc.)
+├── transformer.rs       # Transformer block + model
+├── moe.rs               # Mixture of Experts (shared expert, EP integration, GPU routing)
+├── conv.rs              # Conv1d/Conv2d layer wrappers
+├── dynamic.rs           # DynamicExecContext for variable shapes
+├── gguf_loader.rs       # End-to-end GGUF model loading
+├── parallel.rs          # Tensor-parallel layers (feature = "distributed")
 └── models/
-    ├── mod.rs        # Model module declarations
-    ├── llama.rs      # LLaMA 7B, LLaMA 3 8B
-    ├── qwen.rs       # Qwen2 7B
-    ├── deepseek.rs   # DeepSeek-V3
-    └── mixtral.rs    # Mixtral 8x7B
+    ├── mod.rs            # Model module declarations
+    ├── llama.rs          # LLaMA 7B, LLaMA 3 8B
+    ├── qwen.rs           # Qwen2 7B
+    ├── deepseek.rs       # DeepSeek-V3 (with MLA + shared expert)
+    └── mixtral.rs        # Mixtral 8x7B
 ```
 
 ---

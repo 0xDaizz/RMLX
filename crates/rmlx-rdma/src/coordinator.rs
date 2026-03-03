@@ -108,9 +108,9 @@ fn hub_all_gather(
     let listener = TcpListener::bind(addr).map_err(|e| {
         RdmaError::ConnectionFailed(format!("coordinator bind port {}: {e}", cfg.port))
     })?;
-    listener.set_nonblocking(true).map_err(|e| {
-        RdmaError::ConnectionFailed(format!("coordinator set_nonblocking: {e}"))
-    })?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| RdmaError::ConnectionFailed(format!("coordinator set_nonblocking: {e}")))?;
 
     let n_peers = (world_size - 1) as usize;
     let mut streams: Vec<(u32, TcpStream)> = Vec::with_capacity(n_peers);
@@ -124,9 +124,9 @@ fn hub_all_gather(
     while streams.len() < n_peers {
         match listener.accept() {
             Ok((stream, _)) => {
-                stream.set_nonblocking(false).map_err(|e| {
-                    RdmaError::ConnectionFailed(format!("set_blocking: {e}"))
-                })?;
+                stream
+                    .set_nonblocking(false)
+                    .map_err(|e| RdmaError::ConnectionFailed(format!("set_blocking: {e}")))?;
                 stream.set_read_timeout(Some(io_timeout)).ok();
                 stream.set_write_timeout(Some(io_timeout)).ok();
                 stream.set_nodelay(true).ok();
@@ -155,9 +155,9 @@ fn hub_all_gather(
     for (ref mut peer_rank, ref mut stream) in &mut streams {
         // Read 4 bytes for rank
         let mut rank_buf = [0u8; 4];
-        stream.read_exact(&mut rank_buf).map_err(|e| {
-            RdmaError::ConnectionFailed(format!("coordinator read rank: {e}"))
-        })?;
+        stream
+            .read_exact(&mut rank_buf)
+            .map_err(|e| RdmaError::ConnectionFailed(format!("coordinator read rank: {e}")))?;
         let r = u32::from_le_bytes(rank_buf);
         *peer_rank = r;
 
@@ -182,9 +182,7 @@ fn hub_all_gather(
         .enumerate()
         .map(|(i, opt)| {
             opt.ok_or_else(|| {
-                RdmaError::ConnectionFailed(format!(
-                    "coordinator: missing QpInfo for rank {i}"
-                ))
+                RdmaError::ConnectionFailed(format!("coordinator: missing QpInfo for rank {i}"))
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -194,9 +192,9 @@ fn hub_all_gather(
 
     // Send the full vector back to each peer
     for (_, ref mut stream) in &mut streams {
-        stream.write_all(&full_payload).map_err(|e| {
-            RdmaError::ConnectionFailed(format!("coordinator send gathered: {e}"))
-        })?;
+        stream
+            .write_all(&full_payload)
+            .map_err(|e| RdmaError::ConnectionFailed(format!("coordinator send gathered: {e}")))?;
         stream.flush().ok();
     }
 
@@ -211,7 +209,12 @@ fn spoke_all_gather(
     cfg: &CoordinatorConfig,
 ) -> Result<Vec<QpInfo>, RdmaError> {
     let addr = format!("{hub_host}:{}", cfg.port);
-    let mut stream = connect_with_retries(&addr, cfg.connect_timeout_ms, cfg.connect_retries, cfg.retry_delay_ms)?;
+    let mut stream = connect_with_retries(
+        &addr,
+        cfg.connect_timeout_ms,
+        cfg.connect_retries,
+        cfg.retry_delay_ms,
+    )?;
 
     let io_timeout = Duration::from_secs(cfg.io_timeout_secs);
     stream.set_read_timeout(Some(io_timeout)).ok();
@@ -219,22 +222,22 @@ fn spoke_all_gather(
     stream.set_nodelay(true).ok();
 
     // Send rank
-    stream.write_all(&rank.to_le_bytes()).map_err(|e| {
-        RdmaError::ConnectionFailed(format!("spoke rank {rank} send rank: {e}"))
-    })?;
+    stream
+        .write_all(&rank.to_le_bytes())
+        .map_err(|e| RdmaError::ConnectionFailed(format!("spoke rank {rank} send rank: {e}")))?;
 
     // Send QpInfo
     let info_buf = serialize_qp_info(local_info);
-    stream.write_all(&info_buf).map_err(|e| {
-        RdmaError::ConnectionFailed(format!("spoke rank {rank} send QpInfo: {e}"))
-    })?;
+    stream
+        .write_all(&info_buf)
+        .map_err(|e| RdmaError::ConnectionFailed(format!("spoke rank {rank} send QpInfo: {e}")))?;
     stream.flush().ok();
 
     // Read 4 bytes for the count of QpInfo entries
     let mut count_buf = [0u8; 4];
-    stream.read_exact(&mut count_buf).map_err(|e| {
-        RdmaError::ConnectionFailed(format!("spoke rank {rank} read count: {e}"))
-    })?;
+    stream
+        .read_exact(&mut count_buf)
+        .map_err(|e| RdmaError::ConnectionFailed(format!("spoke rank {rank} read count: {e}")))?;
     let count = u32::from_le_bytes(count_buf) as usize;
 
     // Read all QpInfo entries
@@ -242,9 +245,7 @@ fn spoke_all_gather(
     for i in 0..count {
         let mut buf = [0u8; QP_INFO_WIRE_SIZE];
         stream.read_exact(&mut buf).map_err(|e| {
-            RdmaError::ConnectionFailed(format!(
-                "spoke rank {rank} read QpInfo[{i}]: {e}"
-            ))
+            RdmaError::ConnectionFailed(format!("spoke rank {rank} read QpInfo[{i}]: {e}"))
         })?;
         result.push(deserialize_qp_info(&buf));
     }
@@ -296,9 +297,9 @@ fn hub_all_gather_bytes(
     let listener = TcpListener::bind(addr).map_err(|e| {
         RdmaError::ConnectionFailed(format!("coordinator bind port {}: {e}", cfg.port))
     })?;
-    listener.set_nonblocking(true).map_err(|e| {
-        RdmaError::ConnectionFailed(format!("coordinator set_nonblocking: {e}"))
-    })?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| RdmaError::ConnectionFailed(format!("coordinator set_nonblocking: {e}")))?;
 
     let n_peers = (world_size - 1) as usize;
     let mut streams: Vec<(u32, TcpStream)> = Vec::with_capacity(n_peers);
@@ -311,9 +312,9 @@ fn hub_all_gather_bytes(
     while streams.len() < n_peers {
         match listener.accept() {
             Ok((stream, _)) => {
-                stream.set_nonblocking(false).map_err(|e| {
-                    RdmaError::ConnectionFailed(format!("set_blocking: {e}"))
-                })?;
+                stream
+                    .set_nonblocking(false)
+                    .map_err(|e| RdmaError::ConnectionFailed(format!("set_blocking: {e}")))?;
                 stream.set_read_timeout(Some(io_timeout)).ok();
                 stream.set_write_timeout(Some(io_timeout)).ok();
                 stream.set_nodelay(true).ok();
@@ -341,9 +342,9 @@ fn hub_all_gather_bytes(
     for (ref mut peer_rank, ref mut stream) in &mut streams {
         // Read rank (4 bytes)
         let mut rank_buf = [0u8; 4];
-        stream.read_exact(&mut rank_buf).map_err(|e| {
-            RdmaError::ConnectionFailed(format!("coordinator read rank: {e}"))
-        })?;
+        stream
+            .read_exact(&mut rank_buf)
+            .map_err(|e| RdmaError::ConnectionFailed(format!("coordinator read rank: {e}")))?;
         let r = u32::from_le_bytes(rank_buf);
         *peer_rank = r;
 
@@ -398,7 +399,12 @@ fn spoke_all_gather_bytes(
     cfg: &CoordinatorConfig,
 ) -> Result<Vec<Vec<u8>>, RdmaError> {
     let addr = format!("{hub_host}:{}", cfg.port);
-    let mut stream = connect_with_retries(&addr, cfg.connect_timeout_ms, cfg.connect_retries, cfg.retry_delay_ms)?;
+    let mut stream = connect_with_retries(
+        &addr,
+        cfg.connect_timeout_ms,
+        cfg.connect_retries,
+        cfg.retry_delay_ms,
+    )?;
 
     let io_timeout = Duration::from_secs(cfg.io_timeout_secs);
     stream.set_read_timeout(Some(io_timeout)).ok();
@@ -406,25 +412,25 @@ fn spoke_all_gather_bytes(
     stream.set_nodelay(true).ok();
 
     // Send rank
-    stream.write_all(&rank.to_le_bytes()).map_err(|e| {
-        RdmaError::ConnectionFailed(format!("spoke rank {rank} send rank: {e}"))
-    })?;
+    stream
+        .write_all(&rank.to_le_bytes())
+        .map_err(|e| RdmaError::ConnectionFailed(format!("spoke rank {rank} send rank: {e}")))?;
 
     // Send data length + data
     let len = local_data.len() as u32;
-    stream.write_all(&len.to_le_bytes()).map_err(|e| {
-        RdmaError::ConnectionFailed(format!("spoke rank {rank} send len: {e}"))
-    })?;
-    stream.write_all(local_data).map_err(|e| {
-        RdmaError::ConnectionFailed(format!("spoke rank {rank} send data: {e}"))
-    })?;
+    stream
+        .write_all(&len.to_le_bytes())
+        .map_err(|e| RdmaError::ConnectionFailed(format!("spoke rank {rank} send len: {e}")))?;
+    stream
+        .write_all(local_data)
+        .map_err(|e| RdmaError::ConnectionFailed(format!("spoke rank {rank} send data: {e}")))?;
     stream.flush().ok();
 
     // Read count of entries
     let mut count_buf = [0u8; 4];
-    stream.read_exact(&mut count_buf).map_err(|e| {
-        RdmaError::ConnectionFailed(format!("spoke rank {rank} read count: {e}"))
-    })?;
+    stream
+        .read_exact(&mut count_buf)
+        .map_err(|e| RdmaError::ConnectionFailed(format!("spoke rank {rank} read count: {e}")))?;
     let count = u32::from_le_bytes(count_buf) as usize;
 
     // Read each entry: 4 bytes len + data
@@ -556,11 +562,7 @@ mod tests {
 
     #[test]
     fn test_serialize_gathered_bytes_roundtrip() {
-        let entries = vec![
-            vec![1u8, 2, 3],
-            vec![4, 5],
-            vec![6, 7, 8, 9],
-        ];
+        let entries = vec![vec![1u8, 2, 3], vec![4, 5], vec![6, 7, 8, 9]];
         let payload = serialize_gathered_bytes(&entries);
         // Verify: 4 (count) + (4+3) + (4+2) + (4+4) = 4 + 7 + 6 + 8 = 25
         assert_eq!(payload.len(), 25);
@@ -622,15 +624,11 @@ mod tests {
             port,
             ..cfg0.clone()
         };
-        let cfg_spoke = CoordinatorConfig {
-            port,
-            ..cfg0
-        };
+        let cfg_spoke = CoordinatorConfig { port, ..cfg0 };
 
         let info0_clone = info0.clone();
-        let hub_thread = thread::spawn(move || {
-            all_gather_qp_info(0, 2, &info0_clone, "", &cfg_clone)
-        });
+        let hub_thread =
+            thread::spawn(move || all_gather_qp_info(0, 2, &info0_clone, "", &cfg_clone));
 
         // Small delay to let hub bind
         std::thread::sleep(Duration::from_millis(50));
@@ -673,23 +671,17 @@ mod tests {
 
         let cfg0 = cfg.clone();
         let d0 = data0.clone();
-        let hub = thread::spawn(move || {
-            all_gather_bytes(0, 3, &d0, "", &cfg0)
-        });
+        let hub = thread::spawn(move || all_gather_bytes(0, 3, &d0, "", &cfg0));
 
         std::thread::sleep(Duration::from_millis(50));
 
         let cfg1 = cfg.clone();
         let d1 = data1.clone();
-        let spoke1 = thread::spawn(move || {
-            all_gather_bytes(1, 3, &d1, "127.0.0.1", &cfg1)
-        });
+        let spoke1 = thread::spawn(move || all_gather_bytes(1, 3, &d1, "127.0.0.1", &cfg1));
 
         let cfg2 = cfg;
         let d2 = data2.clone();
-        let spoke2 = thread::spawn(move || {
-            all_gather_bytes(2, 3, &d2, "127.0.0.1", &cfg2)
-        });
+        let spoke2 = thread::spawn(move || all_gather_bytes(2, 3, &d2, "127.0.0.1", &cfg2));
 
         let r0 = hub.join().unwrap().unwrap();
         let r1 = spoke1.join().unwrap().unwrap();

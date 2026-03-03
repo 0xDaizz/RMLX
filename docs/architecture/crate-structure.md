@@ -176,7 +176,7 @@ rmlx/
 | **Purpose** | Provides a safe Rust abstraction over the Apple Metal API. Wraps MTLDevice, MTLCommandQueue, MTLBuffer, MTLSharedEvent, and more, built on `metal-rs` 0.31. |
 | **Key modules** | `device.rs` (device + architecture detection), `queue.rs` (dual queue management), `command.rs` (CommandBuffer/Encoder), `event.rs` (MTLSharedEvent wrapper), `pipeline.rs` (PSO cache), `self_check.rs` (startup diagnostics), `batcher.rs` (CommandBatcher), `exec_graph.rs` (ExecGraph), `icb.rs` (Indirect Command Buffer) |
 | **Dependencies** | metal-rs 0.31, objc2, block2 |
-| **Status** | Complete — GpuDevice, StreamManager, DeviceStream, GpuEvent, SharedEvent sync, dual queue pipeline, startup diagnostics, top-level re-exports (GpuDevice, GpuEvent), ExecGraph (5 CBs/layer), CommandBatcher, ICB fully implemented |
+| **Status** | Complete — GpuDevice, StreamManager, DeviceStream, GpuEvent, SharedEvent sync, dual queue pipeline, startup diagnostics, top-level re-exports (GpuDevice, GpuEvent), ExecGraph (5 CBs/layer), CommandBatcher, ICB, fence manager, library cache, MSL version detection, autorelease pool, capture manager, managed buffers, Phase 0+1+2 audit remediation (M1-M8) fully implemented |
 
 ---
 
@@ -187,7 +187,7 @@ rmlx/
 | **Purpose** | Handles zero-copy memory allocation and buffer pool management. Creates copy-free Metal buffers using the `posix_memalign` -> `newBufferWithBytesNoCopy` pattern, with support for RDMA `ibv_mr` dual registration. |
 | **Key modules** | `zero_copy.rs` (ZeroCopyBuffer, CompletionFence), `pool.rs` (dual-registered buffer pool), `cache.rs` (size-binned cache), `stats.rs` (allocation statistics), `leak_detector.rs` (memory leak detection) |
 | **Dependencies** | `rmlx-metal`, libc |
-| **Status** | Complete — ZeroCopyBuffer, DualRegPool, MetalAllocator, size-binned cache, leak detection fully implemented |
+| **Status** | Complete — ZeroCopyBuffer, DualRegPool, MetalAllocator, size-binned cache, leak detection, residency management, small allocation fast-path, Phase 0+1+2 audit remediation (A1-A12) fully implemented |
 
 ---
 
@@ -198,7 +198,7 @@ rmlx/
 | **Purpose** | Provides high-performance inter-node communication via Thunderbolt 5 RDMA. Binds the ibverbs C library via FFI and supports UC QP-based send/recv and collective operations. |
 | **Key modules** | `ffi.rs` (ibverbs bindings), `context.rs` (ibv_context/PD/CQ), `qp.rs` (UC QP), `mr.rs` (memory region registration), `collective.rs` (all-to-all, allreduce), `multi_port.rs` (port striping), `rdma_metrics.rs` (RDMA metrics) |
 | **Dependencies** | `rmlx-alloc`, libc (ibverbs FFI) |
-| **Status** | Complete — ibverbs FFI, UC QP, blocking_exchange, ConnectionManager, dual port striping, RDMA metrics fully implemented |
+| **Status** | Complete — ibverbs FFI, UC QP, blocking_exchange, ConnectionManager, dual port striping, RDMA metrics, ring/allreduce/allgather collectives, connection manager, coordinator, Phase 0+1+2 audit remediation (R1-R3) fully implemented |
 
 ---
 
@@ -207,9 +207,9 @@ rmlx/
 | Item | Details |
 |------|---------|
 | **Purpose** | The core engine that integrates the computation graph, Op registry, and kernel dispatch. Defines the N-dim array type and dtype system, and supports eager-first execution with selective tracing compilation. |
-| **Key modules** | `dtype.rs` (f32, f16, bf16, quantized), `array.rs` (N-dim array), `ops/` (14 op modules: matmul, softmax, rms_norm, rope, quantized, binary, reduce, copy, indexing, sdpa, silu, etc.), `kernels/` (AOT/JIT kernel management), `graph.rs` (computation graph), `scheduler.rs` (per-stream scheduler), `vjp.rs` (VJP autodiff), `lora.rs` (LoRA fine-tuning), `prelude.rs` (convenience re-exports), `logging.rs` (structured logging), `metrics.rs` (metrics collection), `precision_guard.rs` (precision guard), `shutdown.rs` (graceful shutdown) |
+| **Key modules** | `dtype.rs` (f32, f16, bf16, quantized), `array.rs` (N-dim array), `ops/` (25 op modules: matmul, softmax, rms_norm, rope, quantized, binary, reduce, copy, indexing, sdpa, sdpa_backward, silu, gelu, fp8, conv, conv_tiled, gather_mm, layer_norm, unary, concat, select, vjp_gpu, etc.), `kernels/` (AOT/JIT kernel management), `graph.rs` (computation graph), `scheduler.rs` (per-stream scheduler), `vjp.rs` (VJP autodiff), `lora.rs` (LoRA fine-tuning), `prelude.rs` (convenience re-exports), `logging.rs` (structured logging), `metrics.rs` (metrics collection), `precision_guard.rs` (precision guard), `shutdown.rs` (graceful shutdown) |
 | **Dependencies** | `rmlx-metal`, `rmlx-alloc` |
-| **Status** | Complete — Array type, 14 op modules (including sdpa, silu), ExecMode, CommandBufferHandle, LaunchResult, VJP autodiff, LoRA, production hardening fully implemented |
+| **Status** | Complete — Array type, 25 op modules (including sdpa + backward, silu, gelu, gather_mm, layer_norm, unary, concat, select, conv_tiled, vjp_gpu), ExecMode, CommandBufferHandle, LaunchResult, VJP autodiff, LoRA, production hardening, Phase 0+1+2 audit remediation (C1-C9) fully implemented |
 
 ---
 
@@ -220,7 +220,7 @@ rmlx/
 | **Purpose** | Implements communication primitives and MoE Expert Parallelism for distributed inference. Overlaps compute and RDMA through a layer-level pipeline. |
 | **Key modules** | `group.rs` (rank/world_size abstraction), `primitives.rs` (AllReduce, AllGather, etc.), `moe/` (3-zone auto backend, MoE dispatch/combine), `moe_exchange.rs`, `moe_policy.rs`, `pipeline.rs` (compute-RDMA overlap), `sparse_guard.rs` (sparse dispatch guard), `warmup.rs` (distributed warmup), `metrics.rs` (distributed metrics) |
 | **Dependencies** | `rmlx-core`, `rmlx-rdma` |
-| **Status** | Complete — EP dispatch/combine, 3-zone auto backend, compute-RDMA pipeline, MoE exchange, distributed metrics fully implemented |
+| **Status** | Complete — EP dispatch/combine (loop ordering + capacity + caching fixed), 3-zone auto backend (threshold + hysteresis + cooldown fixed), compute-RDMA pipeline, MoE exchange, shared expert, EP integration, distributed metrics, Phase 0+1+2 audit remediation (D1-D10) fully implemented |
 
 ---
 
@@ -229,9 +229,9 @@ rmlx/
 | Item | Details |
 |------|---------|
 | **Purpose** | Provides neural network layers for Transformer-based architectures. Includes high-level modules such as Linear, Attention, and MoE, as well as model architectures for LLaMA, Qwen, DeepSeek-V3, and others. |
-| **Key modules** | `linear.rs` (quantized Linear, `prepare_weight_t()`), `attention.rs` (Multi-head/GQA), `transformer.rs` (Transformer block, `forward_graph()`, `forward_into_cb()`), `moe.rs` (gate + routing), `parallel.rs` (ColumnParallel/RowParallel), `models/` (llama.rs, qwen.rs, deepseek.rs, mixtral.rs) |
+| **Key modules** | `linear.rs` (Linear, `prepare_weight_t()`), `quantized_linear.rs` (QuantizedLinear), `attention.rs` (Multi-head/GQA), `mla.rs` (Multi-Latent Attention), `sliding_window.rs` (Sliding Window), `layer_norm.rs` (LayerNorm), `activations.rs` (14 activations), `transformer.rs` (Transformer block, `forward_graph()`, `forward_into_cb()`), `moe.rs` (gate + routing + shared expert + EP integration + GPU routing), `gguf_loader.rs` (GGUF model loading), `parallel.rs` (ColumnParallel/RowParallel), `models/` (llama.rs, qwen.rs, deepseek.rs, mixtral.rs) |
 | **Dependencies** | `rmlx-core` |
-| **Status** | Complete — Transformer block, Linear/Attention/MoE layers, KV cache, parallel linear layers, LLaMA/Qwen/DeepSeek-V3/Mixtral model architectures, ExecGraph-compatible `forward_graph()`, weight pre-caching fully implemented |
+| **Status** | Complete — Transformer block, Linear/QuantizedLinear/Attention/MLA/MoE layers, KV cache (static/rotating/batch/quantized), sliding window attention, LayerNorm, 14 activations, parallel linear layers, GGUF model loader, LLaMA/Qwen/DeepSeek-V3/Mixtral model architectures, ExecGraph-compatible `forward_graph()`, weight pre-caching, Phase 0+1+2 audit remediation (N1-N8) fully implemented |
 
 ---
 

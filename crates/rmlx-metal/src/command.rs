@@ -4,7 +4,10 @@
 //! single command buffer, and [`BarrierTracker`] for inserting memory barriers
 //! between dependent kernel dispatches.
 
-use metal::{Buffer, CommandBufferRef, ComputeCommandEncoderRef, ComputePipelineState, MTLSize};
+use metal::{
+    Buffer, CommandBuffer, CommandBufferRef, ComputeCommandEncoderRef, ComputePipelineState,
+    MTLSize,
+};
 use std::collections::HashSet;
 
 // ---------------------------------------------------------------------------
@@ -22,7 +25,9 @@ const MAX_BYTES_PER_BATCH: u64 = 16 * 1024 * 1024; // 16 MB
 /// is reached.
 pub struct CommandBufferManager<'q> {
     queue: &'q metal::CommandQueue,
-    current_cb: Option<&'q CommandBufferRef>,
+    /// Owned command buffer — retained via `to_owned()` to prevent the
+    /// autorelease pool from reclaiming it before we commit.
+    current_cb: Option<CommandBuffer>,
     ops_batched: usize,
     bytes_dispatched: u64,
     /// Track GPU errors reported via completion handlers.
@@ -42,12 +47,15 @@ impl<'q> CommandBufferManager<'q> {
     }
 
     /// Return the current command buffer, creating one if necessary.
+    ///
+    /// The command buffer is retained (owned) to prevent the autorelease pool
+    /// from reclaiming it before commit.
     pub fn get_or_create_buffer(&mut self) -> &CommandBufferRef {
         if self.current_cb.is_none() {
-            let cb = self.queue.new_command_buffer();
+            let cb = self.queue.new_command_buffer().to_owned();
             self.current_cb = Some(cb);
         }
-        self.current_cb.unwrap()
+        self.current_cb.as_ref().unwrap()
     }
 
     /// Create a compute command encoder on the current (or new) command buffer.
@@ -70,7 +78,7 @@ impl<'q> CommandBufferManager<'q> {
     /// Commit the current command buffer immediately (if one exists), register
     /// a completion handler (M4), and reset the batch counters.
     pub fn force_commit(&mut self) {
-        if let Some(cb) = self.current_cb.take() {
+        if let Some(ref cb) = self.current_cb.take() {
             register_completion_handler(cb, &self.error_store);
             cb.commit();
             self.ops_batched = 0;

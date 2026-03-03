@@ -124,8 +124,7 @@ impl ConnectionManager {
 
     /// Return the number of expected connections based on topology.
     pub fn expected_connection_count(&self) -> usize {
-        self.topology
-            .connections_per_node(self.world_size as usize)
+        self.topology.connections_per_node(self.world_size as usize)
     }
 
     /// Return true if all expected topology peers are connected.

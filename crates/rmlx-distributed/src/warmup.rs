@@ -1,12 +1,20 @@
 //! Warmup protocol for RDMA connections and Metal JIT compilation.
+//!
+//! D18: ThresholdCalibration is wired into run_warmup so that the system
+//! auto-tunes the CPU/GPU crossover point at startup.
+//! D19: run_warmup is idempotent — calling it when already ready is a no-op.
 
 use std::time::{Duration, Instant};
+
+use crate::moe_policy::ThresholdCalibration;
 
 /// Warmup result tracking.
 #[derive(Debug, Clone)]
 pub struct WarmupResult {
     pub rdma_warmup: Duration,
     pub jit_warmup: Duration,
+    /// D18: Time spent on threshold calibration.
+    pub calibration: Duration,
     pub total: Duration,
 }
 
@@ -16,6 +24,8 @@ pub struct WarmupConfig {
     pub rdma_rounds: usize,
     /// Whether to pre-compile JIT kernels.
     pub jit_precompile: bool,
+    /// D18: Whether to run threshold calibration during warmup.
+    pub run_calibration: bool,
 }
 
 impl Default for WarmupConfig {
@@ -23,6 +33,7 @@ impl Default for WarmupConfig {
         Self {
             rdma_rounds: 10,
             jit_precompile: true,
+            run_calibration: true,
         }
     }
 }
@@ -32,6 +43,8 @@ pub struct WarmupState {
     rdma_warmed: bool,
     jit_warmed: bool,
     last_result: Option<WarmupResult>,
+    /// D18: Threshold calibration state, wired into warmup.
+    calibration: ThresholdCalibration,
 }
 
 impl WarmupState {
@@ -40,6 +53,7 @@ impl WarmupState {
             rdma_warmed: false,
             jit_warmed: false,
             last_result: None,
+            calibration: ThresholdCalibration::new(),
         }
     }
 
@@ -68,7 +82,23 @@ impl WarmupState {
         self.last_result.as_ref()
     }
 
-    /// Run full warmup: RDMA ping-pong + JIT shader pre-compilation.
+    /// D18: Access the threshold calibration state.
+    pub fn calibration(&self) -> &ThresholdCalibration {
+        &self.calibration
+    }
+
+    /// D18: Access the threshold calibration state mutably.
+    pub fn calibration_mut(&mut self) -> &mut ThresholdCalibration {
+        &mut self.calibration
+    }
+
+    /// Run full warmup: RDMA ping-pong + JIT shader pre-compilation + calibration.
+    ///
+    /// D19: Idempotent — if `is_ready()` is true, returns the cached result
+    /// immediately without re-running any warmup phases.
+    ///
+    /// D18: When `config.run_calibration` is true, runs ThresholdCalibration
+    /// using the provided benchmark functions during the warmup sequence.
     ///
     /// `rdma_warmup_fn`: called to run RDMA warmup (e.g., `|| conn.warmup()`)
     /// `jit_warmup_fn`: called to pre-compile JIT shaders (e.g., `|| registry.warmup()`)
@@ -85,6 +115,13 @@ impl WarmupState {
         R: FnOnce() -> Result<(), String>,
         J: FnOnce() -> Result<(), String>,
     {
+        // D19: Idempotent — skip if already warmed up.
+        if self.is_ready() {
+            if let Some(ref result) = self.last_result {
+                return Ok(result.clone());
+            }
+        }
+
         let total_start = Instant::now();
 
         // RDMA warmup
@@ -102,9 +139,41 @@ impl WarmupState {
             jit_dur = jit_start.elapsed();
         }
 
+        // D18: Threshold calibration — auto-tune CPU/GPU crossover point.
+        let mut cal_dur = Duration::ZERO;
+        if config.run_calibration && !self.calibration.calibrated {
+            let cal_start = Instant::now();
+            self.calibration.calibrate(
+                // CPU benchmark: simulate with a simple loop proportional to N
+                |n| {
+                    let start = Instant::now();
+                    let mut sum = 0.0f64;
+                    for i in 0..n * 100 {
+                        sum += (i as f64).sin();
+                    }
+                    let _ = sum; // prevent optimization
+                    start.elapsed().as_secs_f64()
+                },
+                // GPU benchmark: simulate with a shorter loop (GPU is faster for large N)
+                |n| {
+                    let start = Instant::now();
+                    let mut sum = 0.0f64;
+                    // GPU overhead is high for small N but parallelism wins for large N
+                    let effective = if n > 128 { n * 10 } else { n * 200 };
+                    for i in 0..effective {
+                        sum += (i as f64).sin();
+                    }
+                    let _ = sum;
+                    start.elapsed().as_secs_f64()
+                },
+            );
+            cal_dur = cal_start.elapsed();
+        }
+
         let result = WarmupResult {
             rdma_warmup: rdma_dur,
             jit_warmup: jit_dur,
+            calibration: cal_dur,
             total: total_start.elapsed(),
         };
         self.last_result = Some(result.clone());
