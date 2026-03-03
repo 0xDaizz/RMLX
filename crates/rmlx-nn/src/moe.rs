@@ -417,11 +417,8 @@ impl MoeLayer {
             for (i, &(tok, weight)) in dispatch.iter().enumerate() {
                 // Extract this token's expert output: [1, hidden_dim]
                 let expert_tok_offset = expert_out.offset() + i * hidden_dim * elem_size;
-                let expert_tok_view = expert_out.view(
-                    vec![1, hidden_dim],
-                    vec![hidden_dim, 1],
-                    expert_tok_offset,
-                );
+                let expert_tok_view =
+                    expert_out.view(vec![1, hidden_dim], vec![hidden_dim, 1], expert_tok_offset);
 
                 // Scale by routing weight
                 let scale_data = vec![weight; hidden_dim];
@@ -430,8 +427,7 @@ impl MoeLayer {
 
                 // Read current output at this token position and add
                 let dst_offset = output.offset() + tok * hidden_dim * elem_size;
-                let dst_view =
-                    output.view(vec![1, hidden_dim], vec![hidden_dim, 1], dst_offset);
+                let dst_view = output.view(vec![1, hidden_dim], vec![hidden_dim, 1], dst_offset);
 
                 // Add scaled expert output to the accumulator at this position
                 let summed = ops::binary::add(registry, &dst_view, &scaled, queue)?;
@@ -502,7 +498,12 @@ impl MoeLayer {
         expert_indices: &[usize],
         seq_len: usize,
     ) -> f32 {
-        load_balance_loss(gate_logits, expert_indices, self.config.num_experts, seq_len)
+        load_balance_loss(
+            gate_logits,
+            expert_indices,
+            self.config.num_experts,
+            seq_len,
+        )
     }
 }
 
