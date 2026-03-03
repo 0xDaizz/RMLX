@@ -1,6 +1,6 @@
-# RMLX — Rust Metal LLM Inference Engine
+# RMLX — Apple Silicon용 Rust ML 프레임워크
 
-> **Apple Silicon에 최적화된 Rust 기반 Metal GPU 추론 엔진**
+> **Apple Silicon에 최적화된 Rust 기반 Metal GPU ML 프레임워크**
 >
 > 상태: 전 Phase 완료 (0-9B-opt) (339+ tests, 0 failures) | 라이선스: MIT OR Apache-2.0 | Rust 1.80+ | macOS (Apple Silicon)
 
@@ -8,7 +8,7 @@
 
 ## 🔍 RMLX란 무엇인가요?
 
-RMLX는 Apple MLX 프레임워크의 핵심 Metal GPU 추론 파이프라인을 **Rust로 재구현**하는 프로젝트입니다. Mac Studio M3 Ultra 클러스터에서 Expert Parallelism(EP) 기반 분산 LLM 추론의 이론적 성능 한계에 도달하는 것을 목표로 합니다.
+RMLX는 Apple MLX 프레임워크의 핵심 Metal GPU 추론 파이프라인을 **Rust로 재구현**하는 프로젝트입니다. Mac Studio M3 Ultra 클러스터에서 Expert Parallelism(EP) 기반 분산 ML 추론의 이론적 성능 한계에 도달하는 것을 목표로 합니다.
 
 MLX의 C++/Python 아키텍처에서 확인된 구조적 병목을 Rust의 언어적 강점으로 근본적으로 해결합니다.
 
@@ -90,7 +90,7 @@ ExecGraph 결과: 110.4ms/layer → 6.8ms/layer (16.15x 속도 향상)
 
 ## 📁 프로젝트 구조
 
-이 리포지토리(`~/rmlx/`)는 **프레임워크 전용**입니다. 모델 서빙 레이어(`rmlx-lm`)는 [별도 리포지토리](https://github.com/rmlx-lm)에서 관리됩니다.
+이 리포지토리(`~/rmlx/`)는 **프레임워크 전용**입니다. 서빙 레이어(`rmlx-serve`)는 [별도 리포지토리](https://github.com/rmlx-serve)에서 관리됩니다.
 
 ```
 rmlx/

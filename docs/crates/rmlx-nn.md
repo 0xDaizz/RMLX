@@ -2,7 +2,7 @@
 
 ## Overview
 
-`rmlx-nn` is a crate that implements neural network layers for LLM inference. It builds core Transformer architecture components (Linear, Embedding, Attention, TransformerBlock, MoE) on top of `rmlx-core` compute kernels, and includes built-in model configurations for LLaMA, Qwen, DeepSeek-V3, and Mixtral.
+`rmlx-nn` is a crate that implements neural network layers for GPU-accelerated inference. It builds core Transformer architecture components (Linear, Embedding, Attention, TransformerBlock, MoE) on top of `rmlx-core` compute kernels, and includes built-in model configurations for LLaMA, Qwen, DeepSeek-V3, and Mixtral.
 
 > **Status (Phase 0-9B-opt):** Linear, Embedding, Attention (with KV cache), TransformerBlock, MoE, Parallel (TP), and 4 model configurations (LLaMA 7B/3-8B, Qwen2 7B, DeepSeek-V3, Mixtral 8x7B) are implemented. Phase 9 adds `forward_graph()`, `forward_into_cb()`, and weight pre-caching (`prepare_weight_t`) for ExecGraph CB batching (65 CBs/layer -> 5 CBs/layer, 92.3% reduction, 16.15x speedup).
 
@@ -372,7 +372,7 @@ Metrics collected during MoE forward passes, including per-expert token routing 
 
 ## models/ — Model Architecture Definitions
 
-Provides 4 LLM model configurations as `TransformerConfig`.
+Provides 4 Transformer model configurations as `TransformerConfig`.
 
 ### LLaMA (`models/llama.rs`)
 
