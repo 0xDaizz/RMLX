@@ -20,6 +20,7 @@ RMLX reimplements the core Metal GPU inference pipeline of Apple's [MLX](https:/
 - **Dual queue pipeline** -- Separate compute and transfer `MTLCommandQueue`s overlap GPU kernels with RDMA transfers at the hardware level
 - **Eager-first execution** -- Eliminates lazy evaluation graph-build overhead for single-token decode; selective tracing applied for batch prefill
 - **Unified buffer pool** -- Pre-allocated Metal + ibv_mr dual-registered buffers remove runtime registration overhead
+- **CPU-minimal execution (GPU Pipeline)** -- The primary motivation for the RMLX rewrite. Coalesces dispatches via `CommandBatcher`, chains command buffers through `ExecGraph` event DAGs, and pre-caches transposed weights. Reduces command buffers from 65/layer to 5 (92% reduction) and achieves **16.15x speedup** (110.4ms to 6.8ms, 93.8% latency reduction) with numerical parity (max_diff=6.44e-6)
 
 ## Performance Target
 
@@ -119,7 +120,7 @@ This repository contains the **framework only**. The model serving layer (`rmlx-
 | Tests | 339 |
 | Metal kernels | 10 (matmul, softmax, rms_norm, rope, gemv, quantized, binary, reduce, copy, indexing) |
 | Model architectures | 4 (LLaMA, Qwen, DeepSeek-V3, Mixtral) |
-| Implementation phases | 8 (all complete) |
+| Implementation phases | 9 (Phase 0-8 complete, Phase 9 GPU Pipeline in progress) |
 
 ## Documentation
 
@@ -130,6 +131,7 @@ Full documentation: **[docs/README.md](docs/README.md)**
 - [Design Decisions](docs/architecture/design-decisions.md)
 - [Getting Started](docs/getting-started/prerequisites.md)
 - [Implementation Roadmap](docs/roadmap/phases.md)
+- [GPU Pipeline Architecture](docs/gpu-pipeline.md)
 
 ## License
 

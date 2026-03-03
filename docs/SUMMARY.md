@@ -23,3 +23,6 @@
 
 ## Roadmap
 - [Implementation Phases](roadmap/phases.md) | [한국어](roadmap/phases_ko.md)
+
+## GPU Pipeline
+- [GPU Pipeline Architecture: ExecGraph](gpu-pipeline.md)

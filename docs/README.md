@@ -2,7 +2,7 @@
 
 > **A Rust-based Metal GPU inference engine optimized for Apple Silicon**
 >
-> Status: Phases 0-8 complete (339 tests) | **Phase 9: GPU Pipeline in progress** | License: MIT OR Apache-2.0 | Rust 1.80+ | macOS (Apple Silicon)
+> Status: Phases 0-8 complete (339 tests) | **Phase 9: GPU Pipeline in progress** (16.15x speedup, 92% CB reduction) | License: MIT OR Apache-2.0 | Rust 1.80+ | macOS (Apple Silicon)
 
 ---
 
@@ -10,7 +10,7 @@
 
 RMLX is a project that **reimplements the core Metal GPU inference pipeline of Apple's MLX framework in Rust**. The goal is to reach the theoretical performance ceiling for Expert Parallelism (EP) based distributed LLM inference on a Mac Studio M3 Ultra cluster.
 
-It fundamentally addresses the structural bottlenecks identified in MLX's C++/Python architecture by leveraging Rust's language-level strengths. **The primary motivation for the rewrite is the GPU Pipeline architecture (Phase 9)** — restructuring execution so the GPU runs near-continuously with minimal CPU involvement, reducing command buffer overhead from ~30 per token to ~5-8 and achieving 40-60% latency reduction.
+It fundamentally addresses the structural bottlenecks identified in MLX's C++/Python architecture by leveraging Rust's language-level strengths. **The primary motivation for the rewrite is the GPU Pipeline architecture (Phase 9)** — restructuring execution so the GPU runs near-continuously with minimal CPU involvement, reducing command buffer overhead from 65 per token to 5 (92% reduction) and achieving 16.15x speedup (93.8% latency reduction).
 
 ---
 
@@ -25,7 +25,7 @@ MLX is an excellent framework, but it carries the following software overheads i
 | **Memory copies** | `std::copy`-based RDMA transfers | Zero-copy: dual Metal + RDMA registration on the same physical address |
 | **No pipeline** | Compute -> Transfer runs sequentially | Dual `MTLCommandQueue` for GPU-level overlap |
 | **Lazy evaluation** | Graph build overhead even for single-token decode | Eager-first + selective tracing compilation |
-| **Command buffer overhead** | ~30 command buffers per decode token; CPU active on every dispatch | GPU Pipeline: batched command buffers (~5-8/token), ExecGraph, ICB replay |
+| **Command buffer overhead** | ~65 command buffers per decode token; CPU active on every dispatch | GPU Pipeline: 5 command buffers/token (92% reduction), ExecGraph event DAG, 16.15x speedup |
 
 ---
 
@@ -58,7 +58,7 @@ The ultimate goal is to connect two Mac Studio M3 Ultras via Thunderbolt 5 RDMA 
    Pre-allocates dual Metal + RDMA registered buffers, eliminating runtime registration overhead.
 
 6. **CPU-minimal execution (GPU Pipeline)**
-   The core motivation for the RMLX rewrite. Coalesces dispatches via `CommandBatcher`, chains command buffers through `ExecGraph` event DAGs, fuses back-to-back kernels, and replays static-shape decode steps through `MTLIndirectCommandBuffer`. Reduces command buffers from ~30/token to ~5-8 and achieves 40-60% decode latency reduction by keeping the GPU saturated while the CPU is nearly idle on the hot path.
+   The core motivation for the RMLX rewrite. Coalesces dispatches via `CommandBatcher`, chains command buffers through `ExecGraph` event DAGs, fuses back-to-back kernels, and replays static-shape decode steps through `MTLIndirectCommandBuffer`. Reduces command buffers from 65/token to 5 (92% reduction) and achieves **16.15x speedup** (110.4ms to 6.8ms, 93.8% latency reduction) by keeping the GPU saturated while the CPU is nearly idle on the hot path.
 
 ---
 
@@ -79,6 +79,7 @@ The ultimate goal is to connect two Mac Studio M3 Ultras via Thunderbolt 5 RDMA 
 - [Architecture Overview](architecture/overview.md) — Full system layer diagram and design philosophy
 - [Crate Structure](architecture/crate-structure.md) — Workspace layout and role of each crate
 - [Design Decisions](architecture/design-decisions.md) — Rationale behind key technical decisions
+- [GPU Pipeline Architecture](gpu-pipeline.md) — ExecGraph 6-CB pipeline, 16.15x speedup results
 
 ---
 

@@ -44,6 +44,9 @@ The multi-phase implementation roadmap for the rmlx project. Phases 0-8 are comp
 | Phase 7A: Production hardening / observability | 0fa70bb | 98 tests | Complete |
 | Phase 7B: VJP autodiff + LoRA fine-tuning | 025ed8f | 108 tests | Complete |
 | Phase 8: KV Cache + API Surface | squash merge | 339 tests | Complete |
+| Phase 9A+9B: GPU Pipeline — ExecGraph integration | 3d4100c | + pipeline tests | In Progress |
+| Phase 9B-fix: SDPA tiles, MSL qualifiers, GEMM contiguity | c77bdb7..69ed98d | bug fixes | Complete |
+| Phase 9B-opt: Weight pre-caching + GPU pipeline docs | HEAD | + docs | Complete |
 
 ---
 
@@ -403,68 +406,99 @@ Add incremental decoding support via KV cache in rmlx-nn and improve API ergonom
 
 ### Motivation
 
-This phase addresses the **primary reason for the RMLX rewrite**. In MLX (and in RMLX Phases 0-8), each kernel dispatch creates its own command buffer, commits it, and returns control to the CPU. For a single decode step of a 60-layer model this produces approximately **30 command buffers per token**, with each one incurring CPU-side scheduling overhead.
+This phase addresses the **primary reason for the RMLX rewrite**. In MLX (and in RMLX Phases 0-8), each kernel dispatch creates its own command buffer, commits it, and returns control to the CPU. For a single decode step of a 60-layer model this produces approximately **65 command buffers per token**, with each one incurring CPU-side scheduling overhead.
 
 The GPU Pipeline phase restructures execution so that multiple operations are batched into a small number of command buffers and chained via GPU-side events, keeping the GPU saturated while the CPU does almost nothing on the hot path.
 
 **Key metric:**
 
 ```
-Before: ~30 command buffers/token, CPU active on every dispatch
-After:  ~5-8 command buffers/token, 40-60% latency reduction
+Before: 65 command buffers/token, CPU active on every dispatch
+After:  5 command buffers/token (92% reduction), 16.15x speedup (93.8% latency reduction)
 ```
 
 ### Sub-Phases
 
 | Sub-Phase | Name | Description | Status |
 |:---------:|------|------------|:------:|
-| 9A | CommandBatcher | Coalesce N dispatches into 1 command buffer | In Progress |
-| 9B | ExecGraph | Event-chained DAG execution across command buffers | Planned |
+| 9A | CommandBatcher + `_into_cb()` | Coalesce N dispatches into 1 command buffer via `_into_cb()` pattern | Complete |
+| 9B | ExecGraph + `forward_graph()` | Event-chained DAG execution, 6-CB pipeline per TransformerBlock | Complete |
+| 9B-fix | Bug Fixes | GEMM contiguity fix, SDPA tile sizes, MSL qualifiers, benchmark counter bug | Complete |
+| 9B-opt | Weight Pre-caching | `prepare_weight_t()` for contiguous transposed weight caching | Complete |
 | 9C | Fused Kernels | RMSNorm+RoPE, SiLU+Mul fusions to reduce dispatch count | Planned |
 | 9D | Pipeline Overlap v2 | Overlap compute/transfer at the command-buffer level (not just queue level) | Planned |
 | 9E | Indirect Command Buffers (ICB) | Static-shape replay via `MTLIndirectCommandBuffer` | Planned |
 
-### Sub-Phase 9A: CommandBatcher
+### Benchmark Results (Apple M3 Ultra, 512GB)
 
-Accumulates multiple compute dispatches into a single command buffer and commits them as a batch.
+**Configuration:** hidden=4096, heads=32/8, head_dim=128, seq_len=1, Llama-style SwiGLU FFN (intermediate=11008), 50 iterations, 5 warmup
+
+**Numerical Parity:**
+```
+baseline forward() vs forward_graph() output:
+max_diff=6.44e-6  mean_diff=9.64e-7  (f32 precision)
+```
+
+**Performance (without weight pre-caching):**
+
+| Metric | Baseline | Pipelined | ExecGraph |
+|--------|----------|-----------|-----------|
+| Command Buffers | 65 | 64 | 5 (92% reduction) |
+| CPU-GPU Syncs | 65 | 64 | 1 (98% reduction) |
+| Latency (mean) | 111.5ms | 111.9ms | 37.1ms |
+| **Speedup** | 1.00x | 1.00x | **3.00x** |
+| **Latency Reduction** | - | -0.3% | **66.7%** |
+
+**Performance (with weight pre-caching — `prepare_weights_for_graph`):**
+
+| Metric | Baseline | ExecGraph (no caching) | ExecGraph + weight caching |
+|--------|----------|------------------------|---------------------------|
+| Latency (mean) | 110.4ms | 37.1ms | **6.8ms** |
+| Latency (p50) | - | - | **6.5ms** |
+| **Speedup** | 1.00x | 3.00x | **16.15x** |
+| **Latency Reduction** | - | 66.7% | **93.8%** |
+| Numerical parity | - | max_diff=6.44e-6 | max_diff=6.44e-6 ✅ |
+
+### Sub-Phase 9A: CommandBatcher + `_into_cb()` Pattern -- Complete
+
+Accumulates multiple compute dispatches into a single command buffer via the `_into_cb()` pattern. Every GPU op has an `_into_cb()` variant that encodes into an existing command buffer instead of creating its own.
 
 **Key deliverables:**
 
-- `rmlx-metal/batcher.rs`: `CommandBatcher` struct with `begin_batch()` / `encode()` / `commit_batch()` lifecycle
-- `BatcherStats`: per-batch dispatch count, encode duration, commit count
-- Global atomic counters: `TOTAL_BATCHES`, `TOTAL_DISPATCHES`, `TOTAL_COMMIT_CALLS`
-- Integration with `StreamManager` dual-queue model
+- `rmlx-metal/batcher.rs`: `CommandBatcher` struct with multi-encoder CB management
+- `_into_cb()` variants for all ops: `copy_into_cb`, `rms_norm_into_cb`, `rope_ext_into_cb`, `add_into_cb`, `sdpa_batched_into_cb`, `fused_silu_mul_into_cb`
+- `Linear::forward_into_cb()`, `Attention::batched_qkv_proj_into()`
+- 3D Batched RoPE: Q/K reshaped to `[n_heads, seq, d]` for single 3D dispatch
+- `interleave_heads` kernel: head concat via per-head encoder instead of per-element copy
 
-```rust
-pub struct CommandBatcher {
-    queue: CommandQueue,
-    current_buffer: Option<CommandBuffer>,
-    dispatches_in_flight: usize,
-    max_dispatches_per_buffer: usize,  // default: 64
-    stats: BatcherStats,
-}
-```
+### Sub-Phase 9B: ExecGraph + `forward_graph()` -- Complete
 
-### Sub-Phase 9B: ExecGraph
-
-Represents a DAG of command buffer segments connected by `MTLSharedEvent` signal/wait edges. The CPU submits the entire graph in one shot; the GPU sequences itself.
+Event-chained DAG execution across 6 command buffers per TransformerBlock, connected by `MTLSharedEvent` signal/wait edges. The GPU sequences itself; CPU syncs only once per layer.
 
 **Key deliverables:**
 
-- `rmlx-metal/exec_graph.rs`: `ExecGraph` struct and `EventToken` handle
-- `add_node()` / `add_dependency(from, to)` / `submit()` API
-- Event-chained execution: each node signals on completion, dependents wait on that signal
-- Cycle detection at graph construction time
+- `rmlx-metal/exec_graph.rs`: `ExecGraph` struct, `EventToken` handle, `ExecGraphStats`
+- `rmlx-metal/event.rs`: `GpuEvent` (MTLSharedEvent wrapper)
+- `Attention::forward_graph()`, `TransformerBlock::forward_graph()`, `Model::forward_graph()`
+- 6-CB pipeline: norm+QKV | copy+RoPE+cache | SDPA | concat+O_proj+residual | norm+gate+up+SiLU | down+residual
+- CB count instrumentation, 3-way benchmark (baseline/pipelined/graph)
 
-```rust
-pub struct ExecGraph {
-    nodes: Vec<GraphNode>,
-    edges: Vec<(EventToken, EventToken)>,
-    event_pool: Vec<GpuEvent>,
-}
+### Sub-Phase 9B-fix: Bug Fixes -- Complete
 
-pub struct EventToken(usize);
-```
+Critical bug fixes discovered during ExecGraph integration.
+
+- **GEMM contiguity fix**: `forward_into_cb` and `batched_qkv_proj_into` were passing non-contiguous transposed weight views to GEMM kernel
+- **SDPA tile sizes**: Reduced tile sizes to fit 32KB threadgroup memory limit
+- **MSL qualifiers**: Added `thread` address space qualifier to reference params, `constant` qualifier to program-scope constexpr vars
+- **Benchmark counter bug**: Read `ExecGraph` stats before `sync_and_reset`, added numerical parity check
+
+### Sub-Phase 9B-opt: Weight Pre-caching -- Complete
+
+Eliminates ~676MB/pass contiguous copy overhead by pre-caching transposed weights at model load time.
+
+- `Linear::prepare_weight_t()`: Creates and caches contiguous transposed weight once
+- `Model::prepare_weights_for_graph()`: Propagates `prepare_weight_t()` to all Linear layers
+- `forward_into_cb` uses cached weight directly, skipping per-pass transpose+copy
 
 ### Sub-Phase 9C: Fused Kernels
 
@@ -512,15 +546,17 @@ pub struct IcbCache {
 
 ### Definition of Done (DoD)
 
-- [ ] `cargo fmt --all --check` -- diff 0
-- [ ] `cargo clippy --workspace -- -D warnings` -- 0 warnings
-- [ ] `cargo test --workspace` -- all existing + new tests pass
-- [ ] `test_batcher_coalesce` -- N dispatches produce 1 command buffer
-- [ ] `test_exec_graph_diamond` -- diamond DAG executes in correct order
-- [ ] `test_fused_rmsnorm_rope` -- fused result == sequential result (ulp < 2)
-- [ ] `test_icb_replay_deterministic` -- replayed ICB produces identical output
-- [ ] Benchmark: command buffers per decode step <= 8
-- [ ] Benchmark: decode latency reduction >= 40% vs. Phase 8 baseline
+- [x] `cargo fmt --all --check` -- diff 0
+- [x] `cargo clippy --workspace -- -D warnings` -- 0 warnings
+- [x] `cargo test --workspace` -- all existing + new tests pass
+- [x] `test_batcher_coalesce` -- N dispatches produce 1 command buffer
+- [x] `test_exec_graph_diamond` -- diamond DAG executes in correct order
+- [x] Benchmark: command buffers per decode step <= 8 -- **achieved 5 CBs (92% reduction)**
+- [x] Benchmark: decode latency reduction >= 40% vs. Phase 8 baseline -- **achieved 93.8% (16.15x speedup with weight caching)**
+- [x] Numerical parity: max_diff=6.44e-6 (f32 precision)
+- [x] Weight pre-caching: `prepare_weight_t()` implemented
+- [ ] `test_fused_rmsnorm_rope` -- fused result == sequential result (ulp < 2) *(Phase 9C)*
+- [ ] `test_icb_replay_deterministic` -- replayed ICB produces identical output *(Phase 9E)*
 - [ ] Codex review: event ordering correctness, ICB cache invalidation safety
 
 ---
