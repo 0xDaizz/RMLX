@@ -84,6 +84,28 @@ pub trait RdmaTransport: Send + Sync {
     ) -> Result<Vec<u8>, DistributedError>;
 }
 
+/// Reduction operation for allreduce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReduceOp {
+    /// Element-wise sum (default).
+    Sum,
+    /// Element-wise maximum.
+    Max,
+    /// Element-wise minimum.
+    Min,
+}
+
+/// Data type for reduction operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReduceDtype {
+    /// 32-bit float (default).
+    F32,
+    /// 16-bit float (IEEE 754 half-precision).
+    F16,
+    /// 16-bit bfloat.
+    Bf16,
+}
+
 /// A communication group identifying a set of ranks.
 #[derive(Clone)]
 pub struct Group {
@@ -201,6 +223,60 @@ impl Group {
         self.ranks.contains(&rank)
     }
 
+    /// Split this group into sub-groups based on color and key.
+    ///
+    /// All ranks with the same `color` end up in the same sub-group.
+    /// Within a sub-group, ranks are ordered by `key` (ties broken by rank).
+    ///
+    /// This mirrors MPI_Comm_split semantics. In single-process stub mode
+    /// (no transport), the returned group contains only the local rank.
+    /// With transport, the caller is responsible for ensuring all ranks in
+    /// the group call `split` with consistent color/key values.
+    pub fn split(&self, color: u32, key: u32) -> Result<Group, DistributedError> {
+        // In stub mode (no transport), we can only know about ourselves.
+        // Build a sub-group containing just the local rank.
+        if self.transport.is_none() {
+            return Group::new(vec![self.local_rank], self.local_rank, self.world_size);
+        }
+
+        // With transport, we need to exchange (color, key) with all peers
+        // to determine which ranks share the same color.
+        // Encode (color, key, rank) as 12 bytes and allgather.
+        let mut my_data = Vec::with_capacity(12);
+        my_data.extend_from_slice(&color.to_le_bytes());
+        my_data.extend_from_slice(&key.to_le_bytes());
+        my_data.extend_from_slice(&self.local_rank.to_le_bytes());
+
+        let transport = self.require_transport("split")?;
+        let gathered = ring_allgather(&my_data, &self.ranks, self.local_rank, transport)?;
+
+        // Parse all (color, key, rank) tuples
+        let mut entries: Vec<(u32, u32, u32)> = Vec::with_capacity(self.ranks.len());
+        for chunk in gathered.chunks_exact(12) {
+            let c = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            let k = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+            let r = u32::from_le_bytes([chunk[8], chunk[9], chunk[10], chunk[11]]);
+            entries.push((c, k, r));
+        }
+
+        // Filter to same color, sort by (key, rank)
+        let mut same_color: Vec<(u32, u32)> = entries
+            .iter()
+            .filter(|(c, _, _)| *c == color)
+            .map(|(_, k, r)| (*k, *r))
+            .collect();
+        same_color.sort();
+
+        let sub_ranks: Vec<u32> = same_color.iter().map(|(_, r)| *r).collect();
+
+        Group::with_transport(
+            sub_ranks,
+            self.local_rank,
+            self.world_size,
+            Arc::clone(transport),
+        )
+    }
+
     // ─── Collective operations ───
     // All collectives call ensure_materialized() at entry.
     // When transport is Some, real RDMA operations are used.
@@ -221,6 +297,27 @@ impl Group {
         }
         let transport = self.require_transport("allreduce")?;
         ring_allreduce(data, &self.ranks, self.local_rank, transport)
+    }
+
+    /// All-reduce with configurable reduction operation and dtype.
+    ///
+    /// Supports Sum, Max, and Min operations on f32, f16, and bf16 data.
+    /// For f16/bf16, accumulation is performed in f32 precision.
+    ///
+    /// Single-rank groups return input unchanged (identity).
+    /// Multi-rank groups without transport return an error.
+    pub fn allreduce_op(
+        &self,
+        data: &[u8],
+        op: ReduceOp,
+        dtype: ReduceDtype,
+    ) -> Result<Vec<u8>, DistributedError> {
+        Self::check_materialized("allreduce_op", data)?;
+        if self.ranks.len() <= 1 {
+            return Ok(data.to_vec());
+        }
+        let transport = self.require_transport("allreduce_op")?;
+        ring_allreduce_op(data, &self.ranks, self.local_rank, transport, op, dtype)
     }
 
     /// All-gather: gather data from all ranks into every rank.
@@ -428,6 +525,39 @@ impl Group {
             gathered_shape,
             input.dtype(),
         ))
+    }
+
+    /// Reduce-scatter: reduce data across all ranks, then scatter chunks.
+    ///
+    /// The input data is divided into N equal chunks (one per rank). Each
+    /// chunk is reduced (summed) across all ranks, and rank i receives chunk i.
+    /// The output has size `data.len() / group_size`.
+    ///
+    /// With transport: ring reduce-scatter — N-1 rounds of send/recv/accumulate.
+    ///
+    /// Data length must be divisible by group size and by 4 (f32 granularity).
+    /// Single-rank groups return input unchanged (identity).
+    /// Multi-rank groups without transport return an error.
+    pub fn reduce_scatter(&self, data: &[u8]) -> Result<Vec<u8>, DistributedError> {
+        Self::check_materialized("reduce_scatter", data)?;
+        let n = self.ranks.len();
+        if n <= 1 {
+            return Ok(data.to_vec());
+        }
+        if data.len() % n != 0 {
+            return Err(DistributedError::Protocol(format!(
+                "reduce_scatter: data length ({}) must be divisible by group size ({n})",
+                data.len()
+            )));
+        }
+        if data.len() % 4 != 0 {
+            return Err(DistributedError::Protocol(format!(
+                "reduce_scatter: data length ({}) must be a multiple of 4 (f32 element size)",
+                data.len()
+            )));
+        }
+        let transport = self.require_transport("reduce_scatter")?;
+        ring_reduce_scatter(data, &self.ranks, self.local_rank, transport)
     }
 
     /// Barrier: block until all ranks in the group have reached this point.
@@ -711,4 +841,269 @@ fn add_f32_inplace(dst: &mut [u8], src: &[u8]) {
         let sum = a + b;
         dst[offset..offset + 4].copy_from_slice(&sum.to_ne_bytes());
     }
+}
+
+fn reduce_f32_inplace(dst: &mut [u8], src: &[u8], op: ReduceOp) {
+    let count = dst.len().min(src.len()) / 4;
+    for i in 0..count {
+        let offset = i * 4;
+        let a = f32::from_ne_bytes([
+            dst[offset],
+            dst[offset + 1],
+            dst[offset + 2],
+            dst[offset + 3],
+        ]);
+        let b = f32::from_ne_bytes([
+            src[offset],
+            src[offset + 1],
+            src[offset + 2],
+            src[offset + 3],
+        ]);
+        let result = match op {
+            ReduceOp::Sum => a + b,
+            ReduceOp::Max => a.max(b),
+            ReduceOp::Min => a.min(b),
+        };
+        dst[offset..offset + 4].copy_from_slice(&result.to_ne_bytes());
+    }
+}
+
+/// Ring reduce-scatter: reduce and scatter data across all ranks.
+fn ring_reduce_scatter(
+    data: &[u8],
+    ranks: &[u32],
+    local_rank: u32,
+    transport: &Arc<dyn RdmaTransport>,
+) -> Result<Vec<u8>, DistributedError> {
+    let n = ranks.len();
+    if n <= 1 {
+        return Ok(data.to_vec());
+    }
+
+    let my_idx = ranks.iter().position(|&r| r == local_rank).ok_or_else(|| {
+        DistributedError::Transport(format!(
+            "local_rank {local_rank} not found in ranks {:?}",
+            ranks
+        ))
+    })?;
+    let right = ranks[(my_idx + 1) % n];
+    let left = ranks[(my_idx + n - 1) % n];
+
+    let chunk_size = data.len() / n;
+    let mut buf = data.to_vec();
+
+    for round in 0..(n - 1) {
+        let send_chunk_idx = (my_idx + n - round) % n;
+        let recv_chunk_idx = (my_idx + n - round - 1) % n;
+        let send_start = send_chunk_idx * chunk_size;
+        let send_end = send_start + chunk_size;
+
+        let received = transport.sendrecv(&buf[send_start..send_end], right, chunk_size, left)?;
+
+        let recv_start = recv_chunk_idx * chunk_size;
+        add_f32_inplace(&mut buf[recv_start..recv_start + chunk_size], &received);
+    }
+
+    let chunk_start = my_idx * chunk_size;
+    Ok(buf[chunk_start..chunk_start + chunk_size].to_vec())
+}
+
+/// Ring allreduce with configurable reduction operation and dtype.
+fn ring_allreduce_op(
+    data: &[u8],
+    ranks: &[u32],
+    local_rank: u32,
+    transport: &Arc<dyn RdmaTransport>,
+    op: ReduceOp,
+    dtype: ReduceDtype,
+) -> Result<Vec<u8>, DistributedError> {
+    let n = ranks.len();
+    if n <= 1 {
+        return Ok(data.to_vec());
+    }
+
+    match dtype {
+        ReduceDtype::F32 => {
+            if data.len() % 4 != 0 {
+                return Err(DistributedError::Protocol(format!(
+                    "allreduce_op(f32): data length ({}) must be a multiple of 4",
+                    data.len()
+                )));
+            }
+            ring_allreduce_op_f32(data, ranks, local_rank, transport, op)
+        }
+        ReduceDtype::F16 => {
+            if data.len() % 2 != 0 {
+                return Err(DistributedError::Protocol(format!(
+                    "allreduce_op(f16): data length ({}) must be a multiple of 2",
+                    data.len()
+                )));
+            }
+            let n_elems = data.len() / 2;
+            let mut f32_data = vec![0u8; n_elems * 4];
+            for i in 0..n_elems {
+                let bits = u16::from_ne_bytes([data[i * 2], data[i * 2 + 1]]);
+                let val = f16_to_f32(bits);
+                f32_data[i * 4..i * 4 + 4].copy_from_slice(&val.to_ne_bytes());
+            }
+            let result = ring_allreduce_op_f32(&f32_data, ranks, local_rank, transport, op)?;
+            let mut out = vec![0u8; n_elems * 2];
+            for i in 0..n_elems {
+                let val = f32::from_ne_bytes([
+                    result[i * 4],
+                    result[i * 4 + 1],
+                    result[i * 4 + 2],
+                    result[i * 4 + 3],
+                ]);
+                let bits = f32_to_f16(val);
+                out[i * 2..i * 2 + 2].copy_from_slice(&bits.to_ne_bytes());
+            }
+            Ok(out)
+        }
+        ReduceDtype::Bf16 => {
+            if data.len() % 2 != 0 {
+                return Err(DistributedError::Protocol(format!(
+                    "allreduce_op(bf16): data length ({}) must be a multiple of 2",
+                    data.len()
+                )));
+            }
+            let n_elems = data.len() / 2;
+            let mut f32_data = vec![0u8; n_elems * 4];
+            for i in 0..n_elems {
+                let bits = u16::from_ne_bytes([data[i * 2], data[i * 2 + 1]]);
+                let val = bf16_to_f32(bits);
+                f32_data[i * 4..i * 4 + 4].copy_from_slice(&val.to_ne_bytes());
+            }
+            let result = ring_allreduce_op_f32(&f32_data, ranks, local_rank, transport, op)?;
+            let mut out = vec![0u8; n_elems * 2];
+            for i in 0..n_elems {
+                let val = f32::from_ne_bytes([
+                    result[i * 4],
+                    result[i * 4 + 1],
+                    result[i * 4 + 2],
+                    result[i * 4 + 3],
+                ]);
+                let bits = f32_to_bf16(val);
+                out[i * 2..i * 2 + 2].copy_from_slice(&bits.to_ne_bytes());
+            }
+            Ok(out)
+        }
+    }
+}
+
+/// Ring allreduce on f32 data with configurable reduce op.
+fn ring_allreduce_op_f32(
+    data: &[u8],
+    ranks: &[u32],
+    local_rank: u32,
+    transport: &Arc<dyn RdmaTransport>,
+    op: ReduceOp,
+) -> Result<Vec<u8>, DistributedError> {
+    let n = ranks.len();
+    if n <= 1 {
+        return Ok(data.to_vec());
+    }
+
+    let my_idx = ranks.iter().position(|&r| r == local_rank).ok_or_else(|| {
+        DistributedError::Transport(format!(
+            "local_rank {local_rank} not found in ranks {:?}",
+            ranks
+        ))
+    })?;
+    let right = ranks[(my_idx + 1) % n];
+    let left = ranks[(my_idx + n - 1) % n];
+
+    let chunk_size = data.len().div_ceil(n);
+    let mut buf = data.to_vec();
+    buf.resize(chunk_size * n, 0);
+
+    for round in 0..(n - 1) {
+        let send_chunk_idx = (my_idx + n - round) % n;
+        let recv_chunk_idx = (my_idx + n - round - 1) % n;
+        let send_start = send_chunk_idx * chunk_size;
+        let send_end = send_start + chunk_size;
+
+        let received = transport.sendrecv(&buf[send_start..send_end], right, chunk_size, left)?;
+
+        let recv_start = recv_chunk_idx * chunk_size;
+        reduce_f32_inplace(&mut buf[recv_start..recv_start + chunk_size], &received, op);
+    }
+
+    for round in 0..(n - 1) {
+        let send_chunk_idx = (my_idx + 1 + n - round) % n;
+        let recv_chunk_idx = (my_idx + n - round) % n;
+        let send_start = send_chunk_idx * chunk_size;
+        let send_end = send_start + chunk_size;
+
+        let received = transport.sendrecv(&buf[send_start..send_end], right, chunk_size, left)?;
+
+        let recv_start = recv_chunk_idx * chunk_size;
+        buf[recv_start..recv_start + chunk_size].copy_from_slice(&received);
+    }
+
+    buf.truncate(data.len());
+    Ok(buf)
+}
+
+// ─── Half-precision conversion utilities ───
+
+/// Convert IEEE 754 half-precision (f16) bits to f32.
+fn f16_to_f32(bits: u16) -> f32 {
+    let sign = ((bits >> 15) & 1) as u32;
+    let exponent = ((bits >> 10) & 0x1F) as u32;
+    let mantissa = (bits & 0x3FF) as u32;
+
+    if exponent == 0 {
+        if mantissa == 0 {
+            f32::from_bits(sign << 31)
+        } else {
+            let mut m = mantissa;
+            let mut e = 0i32;
+            while (m & 0x400) == 0 {
+                m <<= 1;
+                e += 1;
+            }
+            let f32_exp = (127 - 15 - e) as u32;
+            let f32_mantissa = (m & 0x3FF) << 13;
+            f32::from_bits((sign << 31) | (f32_exp << 23) | f32_mantissa)
+        }
+    } else if exponent == 31 {
+        let f32_mantissa = mantissa << 13;
+        f32::from_bits((sign << 31) | (0xFF << 23) | f32_mantissa)
+    } else {
+        let f32_exp = (exponent as i32 - 15 + 127) as u32;
+        let f32_mantissa = mantissa << 13;
+        f32::from_bits((sign << 31) | (f32_exp << 23) | f32_mantissa)
+    }
+}
+
+/// Convert f32 to IEEE 754 half-precision (f16) bits.
+fn f32_to_f16(val: f32) -> u16 {
+    let bits = val.to_bits();
+    let sign = ((bits >> 31) & 1) as u16;
+    let exponent = ((bits >> 23) & 0xFF) as i32;
+    let mantissa = bits & 0x7F_FFFF;
+
+    if exponent == 0xFF {
+        let f16_mantissa = (mantissa >> 13) as u16;
+        (sign << 15) | (0x1F << 10) | f16_mantissa
+    } else if exponent > 127 + 15 {
+        (sign << 15) | (0x1F << 10)
+    } else if exponent < 127 - 14 {
+        sign << 15
+    } else {
+        let f16_exp = ((exponent - 127 + 15) as u16) & 0x1F;
+        let f16_mantissa = (mantissa >> 13) as u16;
+        (sign << 15) | (f16_exp << 10) | f16_mantissa
+    }
+}
+
+/// Convert bfloat16 bits to f32.
+fn bf16_to_f32(bits: u16) -> f32 {
+    f32::from_bits((bits as u32) << 16)
+}
+
+/// Convert f32 to bfloat16 bits (truncation).
+fn f32_to_bf16(val: f32) -> u16 {
+    (val.to_bits() >> 16) as u16
 }

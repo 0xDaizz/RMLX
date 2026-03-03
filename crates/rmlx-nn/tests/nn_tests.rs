@@ -7,6 +7,7 @@ use rmlx_nn::embedding::*;
 use rmlx_nn::linear::*;
 use rmlx_nn::models::*;
 use rmlx_nn::moe::*;
+use rmlx_nn::quantized_linear::*;
 use rmlx_nn::transformer::*;
 
 #[test]
@@ -908,4 +909,307 @@ fn test_transformer_block_new_validates_config() {
         result.is_err(),
         "head_dim=0 in TransformerBlock::new should fail"
     );
+}
+
+// ===== N4: QuantizedLinear tests =====
+
+#[test]
+fn test_quantized_linear_q4_construction() {
+    let in_f = 64;
+    let out_f = 32;
+    let group_size = 32;
+    let w_packed = vec![0x55u8; out_f * (in_f / 2)]; // 0x55 = nibbles (5, 5)
+    let groups_per_row = in_f / group_size;
+    let scales = vec![1.0f32; out_f * groups_per_row];
+    let biases = vec![0.0f32; out_f * groups_per_row];
+
+    let ql = QuantizedLinear::new(
+        w_packed.clone(),
+        scales,
+        biases,
+        in_f,
+        out_f,
+        group_size,
+        QuantBits::Q4,
+    )
+    .expect("QuantizedLinear Q4 construction failed");
+    assert_eq!(ql.in_features(), in_f);
+    assert_eq!(ql.out_features(), out_f);
+    assert_eq!(ql.group_size(), group_size);
+    assert_eq!(ql.bits(), QuantBits::Q4);
+    assert_eq!(ql.w_packed().len(), out_f * (in_f / 2));
+}
+
+#[test]
+fn test_quantized_linear_q8_construction() {
+    let in_f = 128;
+    let out_f = 64;
+    let group_size = 64;
+    let w_packed = vec![128u8; out_f * in_f];
+    let groups_per_row = in_f / group_size;
+    let scales = vec![0.5f32; out_f * groups_per_row];
+    let biases = vec![-64.0f32; out_f * groups_per_row];
+
+    let ql = QuantizedLinear::new(
+        w_packed,
+        scales,
+        biases,
+        in_f,
+        out_f,
+        group_size,
+        QuantBits::Q8,
+    )
+    .expect("QuantizedLinear Q8 construction failed");
+    assert_eq!(ql.bits(), QuantBits::Q8);
+}
+
+#[test]
+fn test_quantized_linear_bad_group_size() {
+    let result = QuantizedLinear::new(
+        vec![0u8; 16],
+        vec![1.0; 1],
+        vec![0.0; 1],
+        32,
+        1,
+        16, // not 32, 64, or 128
+        QuantBits::Q4,
+    );
+    assert!(result.is_err(), "group_size=16 should be rejected");
+}
+
+// ===== N6: Load balance loss tests =====
+
+#[test]
+fn test_load_balance_loss_uniform() {
+    // 4 experts, 4 tokens, each assigned to a different expert
+    // gate_logits: uniform probabilities (softmax output)
+    let num_experts = 4;
+    let seq_len = 4;
+    // Each token has equal probability across all experts
+    let gate_logits = vec![0.25f32; seq_len * num_experts];
+    let expert_indices = vec![0usize, 1, 2, 3]; // one per token
+
+    let loss = load_balance_loss(&gate_logits, &expert_indices, num_experts, seq_len);
+
+    // With perfectly balanced routing and uniform probabilities:
+    // f_e = 1/4 for each, P_e = 0.25 for each
+    // loss = 4 * sum(0.25 * 0.25) = 4 * 4 * 0.0625 = 1.0
+    assert!(
+        (loss - 1.0).abs() < 1e-5,
+        "uniform loss = {loss}, expected ~1.0"
+    );
+}
+
+#[test]
+fn test_load_balance_loss_imbalanced() {
+    // 4 experts, 4 tokens, all assigned to expert 0
+    let num_experts = 4;
+    let seq_len = 4;
+    let gate_logits = vec![0.25f32; seq_len * num_experts];
+    let expert_indices = vec![0usize, 0, 0, 0]; // all to expert 0
+
+    let loss = load_balance_loss(&gate_logits, &expert_indices, num_experts, seq_len);
+
+    // f_0 = 1.0, f_1,2,3 = 0.0, P_e = 0.25 for all
+    // loss = 4 * (1.0 * 0.25 + 0.0 * 0.25 + 0.0 * 0.25 + 0.0 * 0.25) = 4 * 0.25 = 1.0
+    // NOTE: In this case, loss equals 1.0 because gate probs are uniform.
+    // The loss is meaningful when gate probs correlate with routing decisions.
+    assert!(loss > 0.0, "imbalanced loss should be > 0");
+}
+
+#[test]
+fn test_load_balance_loss_correlated_imbalance() {
+    // 2 experts, 4 tokens, all assigned to expert 0
+    // gate probs: expert 0 gets high prob, expert 1 gets low prob
+    let num_experts = 2;
+    let seq_len = 4;
+    // Each token: [0.9, 0.1] for experts 0 and 1
+    let gate_logits = vec![0.9f32, 0.1, 0.9, 0.1, 0.9, 0.1, 0.9, 0.1];
+    let expert_indices = vec![0usize, 0, 0, 0]; // all to expert 0
+
+    let loss = load_balance_loss(&gate_logits, &expert_indices, num_experts, seq_len);
+
+    // f_0 = 1.0, f_1 = 0.0
+    // P_0 = 0.9, P_1 = 0.1
+    // loss = 2 * (1.0 * 0.9 + 0.0 * 0.1) = 2 * 0.9 = 1.8
+    assert!(
+        (loss - 1.8).abs() < 1e-5,
+        "correlated imbalanced loss = {loss}, expected 1.8"
+    );
+}
+
+#[test]
+fn test_load_balance_loss_empty() {
+    assert_eq!(load_balance_loss(&[], &[], 4, 0), 0.0);
+    assert_eq!(load_balance_loss(&[0.5; 8], &[0, 1], 0, 4), 0.0);
+}
+
+#[test]
+fn test_moe_layer_compute_load_balance_loss() {
+    let moe = MoeLayer::new(MoeConfig {
+        num_experts: 4,
+        num_experts_per_token: 1,
+        hidden_dim: 16,
+        intermediate_dim: 32,
+        capacity_factor: 1.0,
+    })
+    .expect("MoeLayer::new failed");
+
+    let gate_logits = vec![0.25f32; 8 * 4]; // 8 tokens, 4 experts
+    let expert_indices = vec![0usize, 1, 2, 3, 0, 1, 2, 3];
+    let loss = moe.compute_load_balance_loss(&gate_logits, &expert_indices, 8);
+    assert!(
+        (loss - 1.0).abs() < 1e-5,
+        "method loss = {loss}, expected ~1.0"
+    );
+}
+
+// ===== N7: Shared expert tests =====
+
+#[test]
+fn test_moe_with_shared_expert() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+
+    let hidden_dim = 4;
+    let intermediate_dim = 4;
+    let num_experts = 2;
+    let top_k = 1;
+
+    let gate_weight = Array::from_slice(
+        dev,
+        &[
+            1.0f32, 0.0, 0.0, 0.0, // expert 0 gate
+            0.0, 0.0, 0.0, 1.0, // expert 1 gate
+        ],
+        vec![num_experts, hidden_dim],
+    );
+    let gate = Linear::from_arrays(
+        LinearConfig {
+            in_features: hidden_dim,
+            out_features: num_experts,
+            has_bias: false,
+        },
+        gate_weight,
+        None,
+    )
+    .expect("gate from_arrays failed");
+
+    let expert0 = Expert {
+        gate_proj: make_identity_linear(dev, hidden_dim),
+        up_proj: make_identity_linear(dev, hidden_dim),
+        down_proj: make_identity_linear(dev, hidden_dim),
+    };
+    let expert1 = Expert {
+        gate_proj: make_identity_linear(dev, hidden_dim),
+        up_proj: make_identity_linear(dev, hidden_dim),
+        down_proj: make_identity_linear(dev, hidden_dim),
+    };
+
+    // Shared expert with identity projections
+    let shared = Expert {
+        gate_proj: make_identity_linear(dev, hidden_dim),
+        up_proj: make_identity_linear(dev, hidden_dim),
+        down_proj: make_identity_linear(dev, hidden_dim),
+    };
+
+    let moe = MoeLayer::from_layers(
+        MoeConfig {
+            num_experts,
+            num_experts_per_token: top_k,
+            hidden_dim,
+            intermediate_dim,
+            capacity_factor: 1.0,
+        },
+        gate,
+        vec![expert0, expert1],
+    )
+    .expect("from_layers failed")
+    .with_shared_expert(shared);
+
+    assert!(moe.has_shared_expert());
+
+    let input = Array::from_slice(
+        dev,
+        &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+        vec![2, 4],
+    );
+
+    // Forward should include shared expert output added to MoE output
+    let output = moe
+        .forward(&input, &registry, &queue)
+        .expect("moe forward with shared expert failed");
+    assert_eq!(output.shape(), &[2, 4]);
+
+    let vals: Vec<f32> = output.to_vec_checked();
+    let sum: f32 = vals.iter().sum();
+    assert!(
+        sum.is_finite(),
+        "shared expert output contains non-finite values"
+    );
+    // With shared expert, output should be larger than without it
+    // (since shared expert adds to the routed output)
+    assert!(
+        sum.abs() > 1e-6,
+        "shared expert output should not be all zeros"
+    );
+}
+
+#[test]
+fn test_moe_without_shared_expert_unchanged() {
+    let moe = MoeLayer::new(MoeConfig {
+        num_experts: 8,
+        num_experts_per_token: 2,
+        hidden_dim: 256,
+        intermediate_dim: 512,
+        capacity_factor: 1.0,
+    })
+    .expect("MoeLayer::new failed");
+
+    assert!(!moe.has_shared_expert());
+}
+
+// ===== N8: DeepSeek-V3 config tests =====
+
+#[test]
+fn test_deepseek_v3_max_seq_len() {
+    let cfg = deepseek::deepseek_v3();
+    assert_eq!(
+        cfg.max_seq_len, 163_840,
+        "DeepSeek-V3 max_seq_len should be 163840"
+    );
+}
+
+#[test]
+fn test_deepseek_v3_mla_kv_heads() {
+    let cfg = deepseek::deepseek_v3();
+    // MLA compresses KV into a shared latent space: effective kv_heads = 1
+    assert_eq!(cfg.num_kv_heads, 1, "MLA should use 1 effective KV head");
+    assert_eq!(cfg.num_heads, 128);
+}
+
+#[test]
+fn test_deepseek_v3_full_config() {
+    let full = deepseek::deepseek_v3_full();
+    assert_eq!(full.kv_lora_rank, 512);
+    assert_eq!(full.q_lora_rank, 1536);
+    assert_eq!(full.rope_head_dim, 64);
+    assert_eq!(full.v_head_dim, 128);
+    assert_eq!(full.shared_expert_intermediate_size, 2048);
+    assert_eq!(full.num_shared_experts, 1);
+    assert_eq!(full.first_k_dense_replace, 1);
+    assert_eq!(full.transformer.max_seq_len, 163_840);
+    assert_eq!(full.transformer.num_layers, 61);
+    assert_eq!(full.transformer.vocab_size, 129_280);
+
+    match &full.transformer.ff_type {
+        FeedForwardType::MoE { config } => {
+            assert_eq!(config.num_experts, 256);
+            assert_eq!(config.num_experts_per_token, 8);
+        }
+        _ => panic!("DeepSeek-V3 should use MoE"),
+    }
 }

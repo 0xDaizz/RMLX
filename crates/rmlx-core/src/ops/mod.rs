@@ -4,9 +4,11 @@ pub mod binary;
 pub mod conv;
 pub mod copy;
 pub mod fp8;
+pub mod gather_mm;
 pub mod gelu;
 pub mod gemv;
 pub mod indexing;
+pub mod layer_norm;
 pub mod matmul;
 pub mod quantized;
 pub mod reduce;
@@ -15,6 +17,7 @@ pub mod rope;
 pub mod sdpa;
 pub mod silu;
 pub mod softmax;
+pub mod unary;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -59,6 +62,9 @@ pub fn register_all(registry: &KernelRegistry) -> Result<(), KernelError> {
     gelu::register(registry)?;
     sdpa::register(registry)?;
     fp8::register(registry)?;
+    unary::register(registry)?;
+    layer_norm::register(registry)?;
+    gather_mm::register(registry)?;
     Ok(())
 }
 

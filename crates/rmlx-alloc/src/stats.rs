@@ -70,6 +70,15 @@ impl AllocStats {
     pub fn cache_misses(&self) -> usize {
         self.cache_misses.load(Ordering::Relaxed)
     }
+
+    /// Reset peak memory to the current active memory (A12).
+    ///
+    /// Useful for tracking peak memory within a specific phase of execution
+    /// without the watermark from earlier phases.
+    pub fn reset_peak(&self) {
+        let active = self.active_bytes.load(Ordering::Relaxed);
+        self.peak_bytes.store(active, Ordering::Relaxed);
+    }
 }
 
 impl Default for AllocStats {
