@@ -15,7 +15,7 @@ pub mod shutdown;
 pub mod vjp;
 
 // ── Re-exports of core types ──
-pub use array::Array;
+pub use array::{broadcast_shape, Array};
 pub use dtype::{DType, HasDType};
 pub use kernels::{KernelError, KernelRegistry};
 pub use logging::{LogEntry, LogLevel};

@@ -1,66 +1,524 @@
 //! Softmax: y_i = exp(x_i - max(x)) / sum(exp(x_j - max(x)))
+//!
+//! MLX-style online softmax with SIMD reductions.
+//!
+//! Two kernel variants:
+//! - `softmax_single_row_*`: small rows (axis_size <= N_READS * threadgroup_size).
+//!   Loads data once into registers, computes max+normalizer, writes normalized output.
+//! - `softmax_looped_*`: large rows. Online softmax: single pass computes running
+//!   max and normalizer with correction factor.
+//!
+//! SIMD reductions replace the old `threadgroup float shared_data[1024]` tree
+//! reduction with `simd_sum()`/`simd_max()` + small shared memory (one per simdgroup).
 
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
 use metal::MTLSize;
 
+/// N_READS: each thread processes 4 consecutive elements per iteration for
+/// better memory coalescing.
+const N_READS: usize = 4;
+
 pub const SOFTMAX_SHADER_SOURCE: &str = r#"
 #include <metal_stdlib>
+#include <metal_simdgroup>
 using namespace metal;
 
-// Row-wise softmax with numerically stable max subtraction
-kernel void softmax_f32(
-    device const float* input [[buffer(0)]],
-    device float* output [[buffer(1)]],
-    constant uint& cols [[buffer(2)]],
-    uint row [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint tgsize [[threads_per_threadgroup]])
+// ---------------------------------------------------------------------------
+// SIMD cross-simdgroup reduction helpers
+// ---------------------------------------------------------------------------
+
+constexpr uint SIMD_SIZE = 32;
+constexpr uint N_READS   = 4;
+
+// Reduce max across all simdgroups in the threadgroup.
+// After this call every thread has the same `max_val` and `normalizer`.
+inline void cross_simdgroup_reduce(
+    float& max_val,
+    float& normalizer,
+    threadgroup float* local_max,
+    threadgroup float* local_normalizer,
+    uint simd_lane_id,
+    uint simd_group_id)
 {
-    threadgroup float shared_data[1024];
-    uint base = row * cols;
+    // -- SIMD-level reduction (within one simdgroup) --
+    float simd_max_val   = simd_max(max_val);
+    normalizer          *= fast::exp(max_val - simd_max_val);
+    max_val              = simd_max_val;
+    float simd_norm      = simd_sum(normalizer);
 
-    // Phase 1: Find max
+    // -- Cross-simdgroup reduction via shared memory --
+    if (simd_group_id == 0) {
+        local_max[simd_lane_id]        = -INFINITY;
+        local_normalizer[simd_lane_id] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_lane_id == 0) {
+        local_max[simd_group_id]        = max_val;
+        local_normalizer[simd_group_id] = simd_norm;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // First simdgroup does the final reduction
+    if (simd_group_id == 0) {
+        float m = local_max[simd_lane_id];
+        float n = local_normalizer[simd_lane_id];
+        float final_max = simd_max(m);
+        n *= fast::exp(m - final_max);
+        float final_norm = simd_sum(n);
+        if (simd_lane_id == 0) {
+            local_max[0]        = final_max;
+            local_normalizer[0] = 1.0f / final_norm;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    max_val    = local_max[0];
+    normalizer = local_normalizer[0];  // this is actually 1/normalizer now
+}
+
+// ===========================================================================
+// softmax_single_row: small rows that fit in registers (axis_size <= N_READS * tgsize)
+// ===========================================================================
+
+// ---- float32 ----
+kernel void softmax_single_row_f32(
+    device const float* input  [[buffer(0)]],
+    device float*       output [[buffer(1)]],
+    constant uint&      axis_size [[buffer(2)]],
+    uint row          [[threadgroup_position_in_grid]],
+    uint tid          [[thread_position_in_threadgroup]],
+    uint tgsize       [[threads_per_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float local_max[SIMD_SIZE];
+    threadgroup float local_normalizer[SIMD_SIZE];
+
+    size_t base = size_t(row) * size_t(axis_size);
+
+    // Load N_READS elements per thread into registers
+    float vals[N_READS];
     float max_val = -INFINITY;
-    for (uint i = tid; i < cols; i += tgsize) {
-        max_val = max(max_val, input[base + i]);
-    }
-    shared_data[tid] = max_val;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = tgsize / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            shared_data[tid] = max(shared_data[tid], shared_data[tid + stride]);
+    for (uint r = 0; r < N_READS; r++) {
+        uint idx = tid + r * tgsize;
+        if (idx < axis_size) {
+            vals[r] = input[base + idx];
+            max_val = max(max_val, vals[r]);
+        } else {
+            vals[r] = -INFINITY;
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    float row_max = shared_data[0];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Phase 2: Compute exp(x - max) and sum
-    float sum_exp = 0.0;
-    for (uint i = tid; i < cols; i += tgsize) {
-        float val = exp(input[base + i] - row_max);
-        output[base + i] = val;
-        sum_exp += val;
-    }
-    shared_data[tid] = sum_exp;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Reduce max across threadgroup using cross-simdgroup reduction.
+    // We pass normalizer=0 since we haven't computed exp values yet;
+    // the reduction gives us the global max (normalizer result is unused).
+    float normalizer = 0.0f;
+    cross_simdgroup_reduce(max_val, normalizer, local_max, local_normalizer,
+                           simd_lane_id, simd_group_id);
+    float row_max = max_val;
 
-    for (uint stride = tgsize / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            shared_data[tid] += shared_data[tid + stride];
+    normalizer = 0.0f;
+    for (uint r = 0; r < N_READS; r++) {
+        uint idx = tid + r * tgsize;
+        if (idx < axis_size) {
+            vals[r] = fast::exp(vals[r] - row_max);
+            normalizer += vals[r];
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    float total = shared_data[0];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Phase 3: Normalize
-    float inv_total = (total > 0.0) ? (1.0 / total) : 0.0;
-    for (uint i = tid; i < cols; i += tgsize) {
-        output[base + i] *= inv_total;
+    // Reduce normalizer across threadgroup
+    float sum_simd = simd_sum(normalizer);
+    if (simd_group_id == 0) {
+        local_normalizer[simd_lane_id] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_lane_id == 0) {
+        local_normalizer[simd_group_id] = sum_simd;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group_id == 0) {
+        float n = local_normalizer[simd_lane_id];
+        float total = simd_sum(n);
+        if (simd_lane_id == 0) {
+            local_normalizer[0] = 1.0f / total;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_norm = local_normalizer[0];
+
+    // Write from registers -- no re-read from global memory
+    for (uint r = 0; r < N_READS; r++) {
+        uint idx = tid + r * tgsize;
+        if (idx < axis_size) {
+            output[base + idx] = vals[r] * inv_norm;
+        }
+    }
+}
+
+// ---- float16 (accumulate in float32) ----
+kernel void softmax_single_row_f16(
+    device const half* input  [[buffer(0)]],
+    device half*       output [[buffer(1)]],
+    constant uint&     axis_size [[buffer(2)]],
+    uint row          [[threadgroup_position_in_grid]],
+    uint tid          [[thread_position_in_threadgroup]],
+    uint tgsize       [[threads_per_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float local_max[SIMD_SIZE];
+    threadgroup float local_normalizer[SIMD_SIZE];
+
+    size_t base = size_t(row) * size_t(axis_size);
+
+    float vals[N_READS];
+    float max_val = -INFINITY;
+    for (uint r = 0; r < N_READS; r++) {
+        uint idx = tid + r * tgsize;
+        if (idx < axis_size) {
+            vals[r] = float(input[base + idx]);
+            max_val = max(max_val, vals[r]);
+        } else {
+            vals[r] = -INFINITY;
+        }
+    }
+
+    float normalizer = 0.0f;
+    float saved_max = max_val;
+    cross_simdgroup_reduce(max_val, normalizer, local_max, local_normalizer,
+                           simd_lane_id, simd_group_id);
+    float row_max = max_val;
+
+    normalizer = 0.0f;
+    for (uint r = 0; r < N_READS; r++) {
+        uint idx = tid + r * tgsize;
+        if (idx < axis_size) {
+            vals[r] = fast::exp(vals[r] - row_max);
+            normalizer += vals[r];
+        }
+    }
+
+    float sum_simd = simd_sum(normalizer);
+    if (simd_group_id == 0) { local_normalizer[simd_lane_id] = 0.0f; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_lane_id == 0) { local_normalizer[simd_group_id] = sum_simd; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group_id == 0) {
+        float n = local_normalizer[simd_lane_id];
+        float total = simd_sum(n);
+        if (simd_lane_id == 0) { local_normalizer[0] = 1.0f / total; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_norm = local_normalizer[0];
+
+    for (uint r = 0; r < N_READS; r++) {
+        uint idx = tid + r * tgsize;
+        if (idx < axis_size) {
+            output[base + idx] = half(vals[r] * inv_norm);
+        }
+    }
+}
+
+// ---- bfloat16 (accumulate in float32) ----
+kernel void softmax_single_row_bf16(
+    device const bfloat* input  [[buffer(0)]],
+    device bfloat*       output [[buffer(1)]],
+    constant uint&       axis_size [[buffer(2)]],
+    uint row          [[threadgroup_position_in_grid]],
+    uint tid          [[thread_position_in_threadgroup]],
+    uint tgsize       [[threads_per_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float local_max[SIMD_SIZE];
+    threadgroup float local_normalizer[SIMD_SIZE];
+
+    size_t base = size_t(row) * size_t(axis_size);
+
+    float vals[N_READS];
+    float max_val = -INFINITY;
+    for (uint r = 0; r < N_READS; r++) {
+        uint idx = tid + r * tgsize;
+        if (idx < axis_size) {
+            vals[r] = float(input[base + idx]);
+            max_val = max(max_val, vals[r]);
+        } else {
+            vals[r] = -INFINITY;
+        }
+    }
+
+    float normalizer = 0.0f;
+    float saved_max = max_val;
+    cross_simdgroup_reduce(max_val, normalizer, local_max, local_normalizer,
+                           simd_lane_id, simd_group_id);
+    float row_max = max_val;
+
+    normalizer = 0.0f;
+    for (uint r = 0; r < N_READS; r++) {
+        uint idx = tid + r * tgsize;
+        if (idx < axis_size) {
+            vals[r] = fast::exp(vals[r] - row_max);
+            normalizer += vals[r];
+        }
+    }
+
+    float sum_simd = simd_sum(normalizer);
+    if (simd_group_id == 0) { local_normalizer[simd_lane_id] = 0.0f; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_lane_id == 0) { local_normalizer[simd_group_id] = sum_simd; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group_id == 0) {
+        float n = local_normalizer[simd_lane_id];
+        float total = simd_sum(n);
+        if (simd_lane_id == 0) { local_normalizer[0] = 1.0f / total; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_norm = local_normalizer[0];
+
+    for (uint r = 0; r < N_READS; r++) {
+        uint idx = tid + r * tgsize;
+        if (idx < axis_size) {
+            output[base + idx] = bfloat(vals[r] * inv_norm);
+        }
+    }
+}
+
+// ===========================================================================
+// softmax_looped: large rows — online softmax (single pass for max+normalizer)
+// ===========================================================================
+
+// ---- float32 ----
+kernel void softmax_looped_f32(
+    device const float* input  [[buffer(0)]],
+    device float*       output [[buffer(1)]],
+    constant uint&      axis_size [[buffer(2)]],
+    uint row          [[threadgroup_position_in_grid]],
+    uint tid          [[thread_position_in_threadgroup]],
+    uint tgsize       [[threads_per_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float local_max[SIMD_SIZE];
+    threadgroup float local_normalizer[SIMD_SIZE];
+
+    size_t base = size_t(row) * size_t(axis_size);
+
+    // Online pass: compute running max and normalizer simultaneously
+    float max_val    = -INFINITY;
+    float normalizer = 0.0f;
+
+    for (uint i = tid; i < axis_size; i += tgsize) {
+        float val      = input[base + i];
+        float prev_max = max_val;
+        max_val        = max(max_val, val);
+        normalizer     = normalizer * fast::exp(prev_max - max_val)
+                       + fast::exp(val - max_val);
+    }
+
+    // Cross-threadgroup reduction
+    cross_simdgroup_reduce(max_val, normalizer, local_max, local_normalizer,
+                           simd_lane_id, simd_group_id);
+
+    float row_max  = max_val;
+    float inv_norm = normalizer;  // cross_simdgroup_reduce stores 1/sum
+
+    // Write pass
+    for (uint i = tid; i < axis_size; i += tgsize) {
+        output[base + i] = fast::exp(input[base + i] - row_max) * inv_norm;
+    }
+}
+
+// ---- float16 (accumulate in float32) ----
+kernel void softmax_looped_f16(
+    device const half* input  [[buffer(0)]],
+    device half*       output [[buffer(1)]],
+    constant uint&     axis_size [[buffer(2)]],
+    uint row          [[threadgroup_position_in_grid]],
+    uint tid          [[thread_position_in_threadgroup]],
+    uint tgsize       [[threads_per_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float local_max[SIMD_SIZE];
+    threadgroup float local_normalizer[SIMD_SIZE];
+
+    size_t base = size_t(row) * size_t(axis_size);
+
+    float max_val    = -INFINITY;
+    float normalizer = 0.0f;
+
+    for (uint i = tid; i < axis_size; i += tgsize) {
+        float val      = float(input[base + i]);
+        float prev_max = max_val;
+        max_val        = max(max_val, val);
+        normalizer     = normalizer * fast::exp(prev_max - max_val)
+                       + fast::exp(val - max_val);
+    }
+
+    cross_simdgroup_reduce(max_val, normalizer, local_max, local_normalizer,
+                           simd_lane_id, simd_group_id);
+
+    float row_max  = max_val;
+    float inv_norm = normalizer;
+
+    for (uint i = tid; i < axis_size; i += tgsize) {
+        output[base + i] = half(fast::exp(float(input[base + i]) - row_max) * inv_norm);
+    }
+}
+
+// ---- bfloat16 (accumulate in float32) ----
+kernel void softmax_looped_bf16(
+    device const bfloat* input  [[buffer(0)]],
+    device bfloat*       output [[buffer(1)]],
+    constant uint&       axis_size [[buffer(2)]],
+    uint row          [[threadgroup_position_in_grid]],
+    uint tid          [[thread_position_in_threadgroup]],
+    uint tgsize       [[threads_per_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float local_max[SIMD_SIZE];
+    threadgroup float local_normalizer[SIMD_SIZE];
+
+    size_t base = size_t(row) * size_t(axis_size);
+
+    float max_val    = -INFINITY;
+    float normalizer = 0.0f;
+
+    for (uint i = tid; i < axis_size; i += tgsize) {
+        float val      = float(input[base + i]);
+        float prev_max = max_val;
+        max_val        = max(max_val, val);
+        normalizer     = normalizer * fast::exp(prev_max - max_val)
+                       + fast::exp(val - max_val);
+    }
+
+    cross_simdgroup_reduce(max_val, normalizer, local_max, local_normalizer,
+                           simd_lane_id, simd_group_id);
+
+    float row_max  = max_val;
+    float inv_norm = normalizer;
+
+    for (uint i = tid; i < axis_size; i += tgsize) {
+        output[base + i] = bfloat(fast::exp(float(input[base + i]) - row_max) * inv_norm);
+    }
+}
+
+// ===========================================================================
+// Compatibility aliases: softmax_f32 maps to softmax_looped_f32.
+// This preserves backward compat for any code that looks up "softmax_f32".
+// ===========================================================================
+kernel void softmax_f32(
+    device const float* input  [[buffer(0)]],
+    device float*       output [[buffer(1)]],
+    constant uint&      axis_size [[buffer(2)]],
+    uint row          [[threadgroup_position_in_grid]],
+    uint tid          [[thread_position_in_threadgroup]],
+    uint tgsize       [[threads_per_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float local_max[SIMD_SIZE];
+    threadgroup float local_normalizer[SIMD_SIZE];
+
+    size_t base = size_t(row) * size_t(axis_size);
+
+    float max_val    = -INFINITY;
+    float normalizer = 0.0f;
+
+    for (uint i = tid; i < axis_size; i += tgsize) {
+        float val      = input[base + i];
+        float prev_max = max_val;
+        max_val        = max(max_val, val);
+        normalizer     = normalizer * fast::exp(prev_max - max_val)
+                       + fast::exp(val - max_val);
+    }
+
+    cross_simdgroup_reduce(max_val, normalizer, local_max, local_normalizer,
+                           simd_lane_id, simd_group_id);
+
+    float row_max  = max_val;
+    float inv_norm = normalizer;
+
+    for (uint i = tid; i < axis_size; i += tgsize) {
+        output[base + i] = fast::exp(input[base + i] - row_max) * inv_norm;
+    }
+}
+
+kernel void softmax_f16(
+    device const half* input  [[buffer(0)]],
+    device half*       output [[buffer(1)]],
+    constant uint&     axis_size [[buffer(2)]],
+    uint row          [[threadgroup_position_in_grid]],
+    uint tid          [[thread_position_in_threadgroup]],
+    uint tgsize       [[threads_per_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float local_max[SIMD_SIZE];
+    threadgroup float local_normalizer[SIMD_SIZE];
+
+    size_t base = size_t(row) * size_t(axis_size);
+
+    float max_val    = -INFINITY;
+    float normalizer = 0.0f;
+
+    for (uint i = tid; i < axis_size; i += tgsize) {
+        float val      = float(input[base + i]);
+        float prev_max = max_val;
+        max_val        = max(max_val, val);
+        normalizer     = normalizer * fast::exp(prev_max - max_val)
+                       + fast::exp(val - max_val);
+    }
+
+    cross_simdgroup_reduce(max_val, normalizer, local_max, local_normalizer,
+                           simd_lane_id, simd_group_id);
+
+    float row_max  = max_val;
+    float inv_norm = normalizer;
+
+    for (uint i = tid; i < axis_size; i += tgsize) {
+        output[base + i] = half(fast::exp(float(input[base + i]) - row_max) * inv_norm);
+    }
+}
+
+kernel void softmax_bf16(
+    device const bfloat* input  [[buffer(0)]],
+    device bfloat*       output [[buffer(1)]],
+    constant uint&       axis_size [[buffer(2)]],
+    uint row          [[threadgroup_position_in_grid]],
+    uint tid          [[thread_position_in_threadgroup]],
+    uint tgsize       [[threads_per_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float local_max[SIMD_SIZE];
+    threadgroup float local_normalizer[SIMD_SIZE];
+
+    size_t base = size_t(row) * size_t(axis_size);
+
+    float max_val    = -INFINITY;
+    float normalizer = 0.0f;
+
+    for (uint i = tid; i < axis_size; i += tgsize) {
+        float val      = float(input[base + i]);
+        float prev_max = max_val;
+        max_val        = max(max_val, val);
+        normalizer     = normalizer * fast::exp(prev_max - max_val)
+                       + fast::exp(val - max_val);
+    }
+
+    cross_simdgroup_reduce(max_val, normalizer, local_max, local_normalizer,
+                           simd_lane_id, simd_group_id);
+
+    float row_max  = max_val;
+    float inv_norm = normalizer;
+
+    for (uint i = tid; i < axis_size; i += tgsize) {
+        output[base + i] = bfloat(fast::exp(float(input[base + i]) - row_max) * inv_norm);
     }
 }
 "#;
@@ -69,24 +527,49 @@ pub fn register(registry: &KernelRegistry) -> Result<(), KernelError> {
     registry.register_jit_source("softmax", SOFTMAX_SHADER_SOURCE)
 }
 
-/// Apply row-wise softmax on a 2D array.
+/// Apply softmax over the last axis of an input array.
+///
+/// Supports arbitrary-dimensional input: all leading dimensions are flattened
+/// into batch rows, and softmax is applied along the last axis. For example,
+/// an input of shape `[2, 3, 4]` is treated as 6 rows of 4 elements each.
+///
+/// The output has the same shape as the input.
+///
+/// Supported dtypes: `Float32`, `Float16`, `Bfloat16`. The `f16`/`bf16`
+/// variants accumulate reductions in `f32` for numerical stability.
 pub fn softmax(
     registry: &KernelRegistry,
     input: &Array,
     queue: &metal::CommandQueue,
 ) -> Result<Array, KernelError> {
-    if input.ndim() != 2 {
-        return Err(KernelError::InvalidShape(format!(
-            "softmax requires 2D input, got {}D",
-            input.ndim()
-        )));
+    if input.ndim() == 0 {
+        return Err(KernelError::InvalidShape(
+            "softmax requires at least 1D input, got 0D".to_string(),
+        ));
     }
 
     let input_contig = super::make_contiguous(input, registry, queue)?;
     let input = input_contig.as_ref().unwrap_or(input);
 
-    let kernel_name = match input.dtype() {
-        DType::Float32 => "softmax_f32",
+    let shape = input.shape();
+    let axis_size = *shape.last().unwrap();
+    let num_rows: usize = shape.iter().rev().skip(1).product();
+    // For 1-D input there is exactly one row.
+    let num_rows = if num_rows == 0 { 1 } else { num_rows };
+
+    let axis_size_u32 = super::checked_u32(axis_size, "axis_size")?;
+
+    // Choose kernel variant based on dtype and row size.
+    let tg_size_hint: u64 = 1024; // will be clamped below
+    let use_single_row = axis_size <= N_READS * (tg_size_hint as usize);
+
+    let kernel_name = match (input.dtype(), use_single_row) {
+        (DType::Float32, true) => "softmax_single_row_f32",
+        (DType::Float32, false) => "softmax_looped_f32",
+        (DType::Float16, true) => "softmax_single_row_f16",
+        (DType::Float16, false) => "softmax_looped_f16",
+        (DType::Bfloat16, true) => "softmax_single_row_bf16",
+        (DType::Bfloat16, false) => "softmax_looped_bf16",
         _ => {
             return Err(KernelError::NotFound(format!(
                 "softmax not supported for {:?}",
@@ -96,13 +579,11 @@ pub fn softmax(
     };
 
     let pipeline = registry.get_pipeline(kernel_name, input.dtype())?;
-    let rows = input.shape()[0];
-    let cols = super::checked_u32(input.shape()[1], "cols")?;
 
-    let out = Array::zeros(registry.device().raw(), input.shape(), input.dtype());
+    let out = Array::zeros(registry.device().raw(), shape, input.dtype());
 
-    let cols_buf = registry.device().raw().new_buffer_with_data(
-        &cols as *const u32 as *const std::ffi::c_void,
+    let axis_buf = registry.device().raw().new_buffer_with_data(
+        &axis_size_u32 as *const u32 as *const std::ffi::c_void,
         4,
         metal::MTLResourceOptions::StorageModeShared,
     );
@@ -112,10 +593,16 @@ pub fn softmax(
     encoder.set_compute_pipeline_state(&pipeline);
     encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
     encoder.set_buffer(1, Some(out.metal_buffer()), 0);
-    encoder.set_buffer(2, Some(&cols_buf), 0);
+    encoder.set_buffer(2, Some(&axis_buf), 0);
 
-    let tg_size = std::cmp::min(1024, pipeline.max_total_threads_per_threadgroup());
-    encoder.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), MTLSize::new(tg_size, 1, 1));
+    let tg_size = std::cmp::min(
+        tg_size_hint,
+        pipeline.max_total_threads_per_threadgroup(),
+    );
+    encoder.dispatch_thread_groups(
+        MTLSize::new(num_rows as u64, 1, 1),
+        MTLSize::new(tg_size, 1, 1),
+    );
     encoder.end_encoding();
     command_buffer.commit();
     command_buffer.wait_until_completed();
