@@ -9,6 +9,7 @@ pub mod quantized;
 pub mod reduce;
 pub mod rms_norm;
 pub mod rope;
+pub mod sdpa;
 pub mod silu;
 pub mod softmax;
 
@@ -51,6 +52,7 @@ pub fn register_all(registry: &KernelRegistry) -> Result<(), KernelError> {
     quantized::register(registry)?;
     indexing::register(registry)?;
     silu::register(registry)?;
+    sdpa::register(registry)?;
     Ok(())
 }
 
