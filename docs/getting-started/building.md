@@ -139,6 +139,39 @@ cargo build --workspace \
 
 ---
 
+## Distributed 2-Node Validation (RDMA)
+
+For multi-node environments, run this minimal sequence from the control node:
+
+```bash
+# Generate hostfile and apply baseline host setup
+python3 scripts/rmlx_distributed_config.py \
+  --hosts node1,node2 \
+  --backend rdma \
+  --over thunderbolt \
+  --control-iface en0 \
+  --auto-setup \
+  --output rmlx-hosts.json \
+  --verbose
+
+# Verify RDMA device visibility
+python3 scripts/rmlx_launch.py \
+  --backend rdma \
+  --hostfile rmlx-hosts.json \
+  -- ibv_devices
+
+# Run RDMA crate tests on both nodes
+python3 scripts/rmlx_launch.py \
+  --backend rdma \
+  --hostfile rmlx-hosts.json \
+  -- cargo test -p rmlx-rdma -- --nocapture
+```
+
+If you only need hostfile generation, omit `--auto-setup`.
+For full setup requirements, see [Prerequisites](prerequisites.md).
+
+---
+
 ## Troubleshooting
 
 ### `xcrun: error: unable to find utility "metal"`

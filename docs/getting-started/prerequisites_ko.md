@@ -30,6 +30,38 @@ rmlx를 빌드하고 실행하기 위한 하드웨어 및 소프트웨어 요구
 > **참고**: Thunderbolt 5를 통한 RDMA 통신으로 노드 간 6.89 GB/s 이상의 대역폭을 달성합니다.
 > 듀얼 TB5 포트를 사용하면 12 GB/s 이상으로 확장할 수 있습니다 (Phase 6).
 
+### RDMA 셋업 (클러스터 검증)
+
+RMLX는 `mlx.distributed_config`, `mlx.launch`를 벤치마킹한
+분산 설정/실행 헬퍼 스크립트를 이 저장소에 포함합니다.
+
+```bash
+# 1) 호스트파일 생성 + 기본 호스트 셋업 (컨트롤 노드에서 실행)
+python3 scripts/rmlx_distributed_config.py \
+  --hosts node1,node2 \
+  --backend rdma \
+  --over thunderbolt \
+  --control-iface en0 \
+  --auto-setup \
+  --output rmlx-hosts.json \
+  --verbose
+
+# 2) 각 노드 RDMA 디바이스 가시성 검증
+python3 scripts/rmlx_launch.py \
+  --backend rdma \
+  --hostfile rmlx-hosts.json \
+  -- ibv_devices
+
+# 3) 양 노드에서 RDMA 크레이트 테스트 실행
+python3 scripts/rmlx_launch.py \
+  --backend rdma \
+  --hostfile rmlx-hosts.json \
+  -- cargo test -p rmlx-rdma -- --nocapture
+```
+
+> **참고**: `--auto-setup`은 각 노드의 SSH 환경에서 passwordless `sudo`가 필요합니다.
+> 호스트파일만 만들고 싶다면 `--auto-setup`을 빼고 실행하세요.
+
 ---
 
 ## 소프트웨어

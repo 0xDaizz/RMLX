@@ -139,6 +139,39 @@ cargo build --workspace \
 
 ---
 
+## 분산 2-노드 검증 (RDMA)
+
+다중 노드 환경에서는 컨트롤 노드에서 아래 최소 시퀀스를 실행하세요.
+
+```bash
+# 호스트파일 생성 + 기본 호스트 셋업 적용
+python3 scripts/rmlx_distributed_config.py \
+  --hosts node1,node2 \
+  --backend rdma \
+  --over thunderbolt \
+  --control-iface en0 \
+  --auto-setup \
+  --output rmlx-hosts.json \
+  --verbose
+
+# RDMA 디바이스 가시성 검증
+python3 scripts/rmlx_launch.py \
+  --backend rdma \
+  --hostfile rmlx-hosts.json \
+  -- ibv_devices
+
+# 양 노드에서 RDMA 크레이트 테스트 실행
+python3 scripts/rmlx_launch.py \
+  --backend rdma \
+  --hostfile rmlx-hosts.json \
+  -- cargo test -p rmlx-rdma -- --nocapture
+```
+
+호스트파일만 필요하면 `--auto-setup`을 빼고 실행하세요.
+전체 전제 조건은 [시스템 요구사항](prerequisites_ko.md)을 참고하세요.
+
+---
+
 ## 문제 해결
 
 ### `xcrun: error: unable to find utility "metal"`

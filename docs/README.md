@@ -2,7 +2,7 @@
 
 > **A Rust-based Metal GPU ML framework optimized for Apple Silicon**
 >
-> Status: All Phases complete (0-9B-opt + S1-S5 + Audit Remediation) (534 tests, 0 failures) | License: MIT | Rust 1.80+ | macOS (Apple Silicon)
+> Status: All Phases complete (0-9B-opt + S1-S5 + Audit Remediation) (543 tests, 0 failures) | License: MIT | Rust 1.80+ | macOS (Apple Silicon)
 
 ---
 
@@ -88,6 +88,33 @@ The ultimate goal is to connect two Mac Studio M3 Ultras via Thunderbolt 5 RDMA 
 - [Design Decisions](architecture/design-decisions.md) — Rationale behind key technical decisions
 - [GPU Pipeline](gpu-pipeline.md) — ExecGraph architecture and benchmark results
 - [RMLX vs MLX vs CUDA](comparison.md) — Honest architecture comparison
+
+---
+
+## 🔧 Distributed RDMA Runbook (2-node minimal)
+
+Use the built-in RMLX helpers (modeled after `mlx.distributed_config` and `mlx.launch`):
+
+```bash
+# 1) Generate hostfile + baseline setup
+python3 scripts/rmlx_distributed_config.py \
+  --hosts node1,node2 \
+  --backend rdma \
+  --over thunderbolt \
+  --control-iface en0 \
+  --auto-setup \
+  --output rmlx-hosts.json \
+  --verbose
+
+# 2) Validate RDMA visibility on each host
+python3 scripts/rmlx_launch.py \
+  --backend rdma \
+  --hostfile rmlx-hosts.json \
+  -- ibv_devices
+```
+
+For full prerequisites and caveats (SSH + passwordless sudo), see
+[Getting Started: Prerequisites](getting-started/prerequisites.md).
 
 ---
 

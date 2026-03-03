@@ -2,7 +2,7 @@
 
 > **Apple Silicon에 최적화된 Rust 기반 Metal GPU ML 프레임워크**
 >
-> 상태: 전 Phase 완료 (0-9B-opt + S1-S5 + Audit Remediation) (534 tests, 0 failures) | 라이선스: MIT | Rust 1.80+ | macOS (Apple Silicon)
+> 상태: 전 Phase 완료 (0-9B-opt + S1-S5 + Audit Remediation) (543 tests, 0 failures) | 라이선스: MIT | Rust 1.80+ | macOS (Apple Silicon)
 
 ---
 
@@ -88,6 +88,33 @@ ExecGraph 결과: 110.4ms/layer → 6.8ms/layer (16.15x 속도 향상)
 - [설계 결정](architecture/design-decisions.md) — 주요 기술 결정의 근거
 - [GPU Pipeline](gpu-pipeline.md) — ExecGraph 아키텍처와 벤치마크 결과
 - [RMLX vs MLX vs CUDA](comparison.md) — 솔직한 아키텍처 비교
+
+---
+
+## 🔧 분산 RDMA 런북 (2-node 최소)
+
+RMLX 내장 헬퍼(`mlx.distributed_config`, `mlx.launch` 벤치마킹)를 사용합니다.
+
+```bash
+# 1) 호스트파일 생성 + 기본 셋업
+python3 scripts/rmlx_distributed_config.py \
+  --hosts node1,node2 \
+  --backend rdma \
+  --over thunderbolt \
+  --control-iface en0 \
+  --auto-setup \
+  --output rmlx-hosts.json \
+  --verbose
+
+# 2) 각 노드 RDMA 디바이스 가시성 검증
+python3 scripts/rmlx_launch.py \
+  --backend rdma \
+  --hostfile rmlx-hosts.json \
+  -- ibv_devices
+```
+
+상세 전제 조건(SSH + passwordless sudo)은
+[시작하기: 시스템 요구사항](getting-started/prerequisites_ko.md)을 참고하세요.
 
 ---
 

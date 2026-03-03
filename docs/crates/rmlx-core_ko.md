@@ -355,7 +355,9 @@ pub struct PipelineKey {
 |--------|------|
 | `new(device)` | AOT metallib 자동 로드 시도 |
 | `get_pipeline(name, dtype)` | 파이프라인 조회 (캐시 → AOT → JIT) |
+| `get_pipeline_with_constants(name, dtype, constants)` | 상수 specialization 진입점입니다. 현재 `constants`가 비어있지 않으면 `todo!("TODO(C15)...")`로 fail-fast하여, 조용한 가짜 지원을 막습니다. C15 구현 전에는 `register_specialized_source(...)`를 사용하세요. |
 | `register_jit_source(name, source)` | MSL 소스 문자열 JIT 컴파일 후 캐시 |
+| `register_specialized_source(name, source)` | 함수 상수 변형을 소스 레벨 specialization으로 등록하는 현재 권장 우회 경로 |
 | `has_aot()` | AOT 라이브러리 로드 여부 |
 | `cached_pipeline_count()` | 캐시된 파이프라인 수 |
 | `jit_library_count()` | JIT 라이브러리 수 |

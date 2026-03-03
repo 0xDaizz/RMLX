@@ -30,11 +30,27 @@ pub struct ResidencyManager {
 }
 
 impl ResidencyManager {
+    /// Placeholder for Metal 3 residency-set backend wiring.
+    ///
+    /// The `metal3` feature indicates intent to use the real API, so we keep a
+    /// `todo!()` path to prevent silent no-op behavior under that feature.
+    #[cfg(feature = "metal3")]
+    #[inline(always)]
+    fn todo_metal3_backend() -> ! {
+        todo!(
+            "TODO(A6): Implement real MTLResidencySet backend in rmlx-alloc \
+             once metal-rs exposes the required bindings"
+        )
+    }
+
     /// Create a new residency manager.
     ///
     /// TODO(metal3): Accept `&metal::Device` and create an `MTLResidencySet`
     /// via `device.newResidencySet()` once bindings are available.
     pub fn new() -> Self {
+        #[cfg(feature = "metal3")]
+        Self::todo_metal3_backend();
+
         Self {
             buffer_count: 0,
             dirty: false,
@@ -46,6 +62,9 @@ impl ResidencyManager {
     /// TODO(metal3): Call `residency_set.addAllocation(buffer)` on the real
     /// Metal residency set.
     pub fn add_buffer(&mut self, _buffer: &rmlx_metal::metal::Buffer) {
+        #[cfg(feature = "metal3")]
+        Self::todo_metal3_backend();
+
         self.buffer_count += 1;
         self.dirty = true;
     }
@@ -55,6 +74,9 @@ impl ResidencyManager {
     /// TODO(metal3): Call `residency_set.removeAllocation(buffer)` on the
     /// real Metal residency set.
     pub fn remove_buffer(&mut self, _buffer: &rmlx_metal::metal::Buffer) {
+        #[cfg(feature = "metal3")]
+        Self::todo_metal3_backend();
+
         self.buffer_count = self.buffer_count.saturating_sub(1);
         self.dirty = true;
     }
@@ -64,6 +86,9 @@ impl ResidencyManager {
     /// TODO(metal3): Call `residency_set.commit()` to apply additions and
     /// removals to the GPU's residency table.
     pub fn commit(&mut self) {
+        #[cfg(feature = "metal3")]
+        Self::todo_metal3_backend();
+
         // Stub: no-op until MTLResidencySet bindings are available.
         self.dirty = false;
     }

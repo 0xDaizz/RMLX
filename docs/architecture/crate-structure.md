@@ -187,7 +187,7 @@ rmlx/
 | **Purpose** | Handles zero-copy memory allocation and buffer pool management. Creates copy-free Metal buffers using the `posix_memalign` -> `newBufferWithBytesNoCopy` pattern, with support for RDMA `ibv_mr` dual registration. |
 | **Key modules** | `zero_copy.rs` (ZeroCopyBuffer, CompletionFence), `pool.rs` (dual-registered buffer pool), `cache.rs` (size-binned cache), `stats.rs` (allocation statistics), `leak_detector.rs` (memory leak detection) |
 | **Dependencies** | `rmlx-metal`, libc |
-| **Status** | Complete — ZeroCopyBuffer, DualRegPool, MetalAllocator, size-binned cache, leak detection, residency management, small allocation fast-path, Phase 0+1+2 audit remediation (A1-A12) fully implemented |
+| **Status** | Complete — ZeroCopyBuffer, DualRegPool, MetalAllocator, size-binned cache, leak detection, small allocation fast-path, Phase 0+1+2 audit remediation (A1-A12) fully implemented. `ResidencyManager` API exists, but Metal `MTLResidencySet` backend is currently a documented stub pending `metal-rs` support. |
 
 ---
 

@@ -4,7 +4,7 @@
 
 `rmlx-alloc`은 GPU 메모리 할당 및 zero-copy 버퍼 관리를 담당하는 크레이트입니다. `posix_memalign`으로 할당한 페이지 정렬 메모리에 Metal `newBufferWithBytesNoCopy`를 등록하여, 단일 물리 메모리에 대해 CPU/GPU 동시 접근을 제공합니다. MLX의 MetalAllocator 패턴을 따르며, 크기별 비닝 캐시와 할당 통계 추적 기능을 포함합니다.
 
-> **상태:** Phase 1 구현 완료. `ZeroCopyBuffer`, `MetalAllocator`, `BufferCache`, `AllocStats`, `LeakDetector` 모두 구현되었습니다.
+> **상태:** Phase 1 구현 완료. `ZeroCopyBuffer`, `MetalAllocator`, `BufferCache`, `AllocStats`, `LeakDetector` 모두 구현되었습니다. `ResidencyManager` API는 존재하지만, Metal `MTLResidencySet` 백엔드는 `metal-rs` 바인딩 지원 전까지 문서화된 스텁입니다. `metal3` feature가 켜진 경우 현재 구현은 조용한 no-op 대신 `todo!("TODO(A6)...")`로 fail-fast 하도록 의도되어 있습니다.
 
 ---
 

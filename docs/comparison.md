@@ -32,7 +32,7 @@
 | **MLA** | Yes (DeepSeek-V3) | No | Partial |
 | **Sliding Window Attn** | Yes | Yes | Yes |
 | **GGUF model loading** | Yes | Yes | Yes |
-| **Test suite** | 534 tests | Extensive | Extensive |
+| **Test suite** | 543 tests | Extensive | Extensive |
 | **Phases complete** | 0-9B-opt + S1-S5 | N/A (stable release) | N/A (stable release) |
 
 ---
@@ -314,7 +314,7 @@ RMLX maintains strict numerical parity between its baseline execution path and t
 |--------|-------|
 | max_diff (baseline vs ExecGraph) | 6.4e-6 |
 | Tolerance threshold | 1e-4 |
-| Test coverage | 534 tests |
+| Test coverage | 543 tests |
 | Verification method | Element-wise comparison across all ops |
 
 This ensures that the 16.15x performance improvement from ExecGraph introduces no meaningful numerical drift.

@@ -85,6 +85,19 @@ pub struct KernelRegistry {
 }
 
 impl KernelRegistry {
+    /// Placeholder for C15 follow-up work.
+    ///
+    /// We keep this as a `todo!()` to make sure callers do not accidentally
+    /// assume constants are currently applied through Metal function-constant
+    /// APIs. Use `register_specialized_source` until this is implemented.
+    #[inline(always)]
+    fn todo_function_constant_specialization() -> ! {
+        todo!(
+            "TODO(C15): Apply function constants via Metal API \
+             (MTLFunctionConstantValues / specialized function descriptors)"
+        )
+    }
+
     /// Create a new registry. Tries to load AOT metallib from `METALLIB_PATH`.
     pub fn new(device: GpuDevice) -> Self {
         let metallib_path = crate::METALLIB_PATH;
@@ -181,12 +194,16 @@ impl KernelRegistry {
 
     /// Get or create a compute pipeline with function constant specialization.
     ///
-    /// Function constants allow specializing a single compiled kernel for different
-    /// types, layouts, or modes without recompilation. This is used for:
+    /// Function constants would allow specializing a single compiled kernel for
+    /// different types, layouts, or modes without recompilation. Intended uses:
     /// - `traditional` (bool) in RoPE
     /// - `forward` (bool) in RoPE
     /// - `has_w` (bool) in RMS norm
     /// - Type selection constants
+    ///
+    /// Current behavior: constants are only part of the pipeline cache key.
+    /// They are **not** passed to Metal API function-constant specialization.
+    /// For real specialization today, use `register_specialized_source`.
     pub fn get_pipeline_with_constants(
         &self,
         kernel_name: &str,
@@ -238,21 +255,15 @@ impl KernelRegistry {
             }
         };
 
-        // 3. Create pipeline with function constants.
+        // 3. Create pipeline.
         //
-        // metal-rs does not yet expose MTLFunctionConstantValues directly,
-        // so we use a source-level specialization approach: we generate a
-        // specialized kernel source with `constant constexpr` definitions
-        // matching the requested constant values, and compile it as a new
-        // JIT library. The key is cached so repeated calls with the same
-        // constants hit the pipeline cache.
-        //
-        // For the base function (no source-level specialization available),
-        // we fall back to the base pipeline without constants applied at the
-        // Metal API level. The constants are still used as the cache key so
-        // that callers who pass different constant values get correctly
-        // separated pipeline entries.
-        let _ = constants; // constants used as cache key; Metal API application pending
+        // NOTE: constants are not currently applied to Metal function constants.
+        // Fail fast for non-empty constants so this does not look silently
+        // supported. Real specialization is available via
+        // `register_specialized_source`.
+        if !constants.is_empty() {
+            Self::todo_function_constant_specialization();
+        }
         let pipeline = self
             .device
             .raw()
