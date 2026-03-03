@@ -108,9 +108,10 @@ impl PipelineCache {
         }
 
         // Slow path: write lock for cache miss.
-        let mut cache = self.cache.write().map_err(|_| {
-            MetalError::PipelineCreate("pipeline cache lock poisoned".to_string())
-        })?;
+        let mut cache = self
+            .cache
+            .write()
+            .map_err(|_| MetalError::PipelineCreate("pipeline cache lock poisoned".to_string()))?;
 
         // Double-check: another thread may have inserted while we waited.
         if let Some(pipeline) = cache.get(name) {
@@ -228,11 +229,7 @@ impl PipelineCache {
     /// Number of cached pipelines (plain + specialized).
     pub fn len(&self) -> usize {
         let plain = self.cache.read().map(|c| c.len()).unwrap_or(0);
-        let specialized = self
-            .specialized_cache
-            .read()
-            .map(|c| c.len())
-            .unwrap_or(0);
+        let specialized = self.specialized_cache.read().map(|c| c.len()).unwrap_or(0);
         plain + specialized
     }
 

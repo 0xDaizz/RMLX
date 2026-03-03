@@ -37,8 +37,7 @@ impl GpuQueue {
         let handler = block::ConcreteBlock::new(move |cmd_buf: &CommandBufferRef| {
             let status = cmd_buf.status();
             if status == metal::MTLCommandBufferStatus::Error {
-                let msg =
-                    format!("command buffer completed with error status: {status:?}");
+                let msg = format!("command buffer completed with error status: {status:?}");
                 store.push(GpuError {
                     status,
                     message: msg,
