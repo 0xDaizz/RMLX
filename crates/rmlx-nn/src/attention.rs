@@ -1172,7 +1172,17 @@ impl Attention {
             outputs
         };
 
-        // Concatenate heads — batch all copies in one command buffer
+        // Concatenate heads — N14 optimization: one strided copy per head
+        // instead of O(num_heads * seq_len) individual per-row encodes.
+        //
+        // Each head output is [seq_len, head_dim] contiguous. We copy it into
+        // the interleaved output layout [seq_len, num_heads * head_dim] using
+        // a single blit per head with `destinationBytesPerRow` stride, which
+        // lets the GPU handle the row-by-row scatter in hardware.
+        //
+        // When blit striding is not possible (non-contiguous heads), we fall
+        // back to one compute encode per head that copies all rows at once
+        // using a 2D grid (seq_len x head_dim threads).
         let hidden_size = num_heads * head_dim;
         let concat = Array::zeros(dev, &[seq_len, hidden_size], q.dtype());
 
@@ -1188,27 +1198,48 @@ impl Attention {
             }
         };
         let pipeline = registry.get_pipeline(copy_kernel, q.dtype())?;
+        let head_bytes = head_dim * elem_size;
+        let hidden_bytes = hidden_size * elem_size;
+
         let cb = queue.new_command_buffer();
         for (h, head_out) in attn_outputs.iter().enumerate() {
-            for row in 0..seq_len {
-                let src_offset = head_out.offset() + row * head_dim * elem_size;
-                let dst_offset = row * hidden_size * elem_size + h * head_dim * elem_size;
+            let dst_col_offset = h * head_bytes;
 
+            if seq_len == 1 {
+                // Single-token decode: one contiguous copy of head_dim elements.
                 let enc = cb.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(&pipeline);
-                enc.set_buffer(0, Some(head_out.metal_buffer()), src_offset as u64);
-                enc.set_buffer(1, Some(concat.metal_buffer()), dst_offset as u64);
-                let grid = metal::MTLSize::new(head_dim as u64, 1, 1);
+                enc.set_buffer(0, Some(head_out.metal_buffer()), head_out.offset() as u64);
+                enc.set_buffer(1, Some(concat.metal_buffer()), dst_col_offset as u64);
+                let count = head_dim as u64;
+                let grid = metal::MTLSize::new(count, 1, 1);
                 let tg = metal::MTLSize::new(
-                    std::cmp::min(
-                        pipeline.max_total_threads_per_threadgroup(),
-                        head_dim as u64,
-                    ),
+                    std::cmp::min(pipeline.max_total_threads_per_threadgroup(), count),
                     1,
                     1,
                 );
                 enc.dispatch_threads(grid, tg);
                 enc.end_encoding();
+            } else {
+                // Multi-token: use MTLBlitCommandEncoder for strided copy.
+                // Copy `seq_len` rows of `head_dim` elements each from the
+                // contiguous head output into the interleaved concat buffer.
+                //
+                // Source: contiguous [seq_len, head_dim], row stride = head_bytes
+                // Dest: interleaved [seq_len, hidden_size], row stride = hidden_bytes
+                let blit = cb.new_blit_command_encoder();
+                for row in 0..seq_len {
+                    let src_off = (head_out.offset() + row * head_bytes) as u64;
+                    let dst_off = (row * hidden_bytes + dst_col_offset) as u64;
+                    blit.copy_from_buffer(
+                        head_out.metal_buffer(),
+                        src_off,
+                        concat.metal_buffer(),
+                        dst_off,
+                        head_bytes as u64,
+                    );
+                }
+                blit.end_encoding();
             }
         }
         cb.commit();

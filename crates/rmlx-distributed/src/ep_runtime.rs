@@ -106,7 +106,7 @@ impl EpRuntimeContext {
                                 counters
                                     .rdma_ops_error
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                HandlerResult::CqConfirmed
+                                HandlerResult::Stop
                             }
                         }
                     }
@@ -117,8 +117,9 @@ impl EpRuntimeContext {
                         counters
                             .rdma_ops_error
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        // Still report as confirmed so the proxy advances the tail
-                        HandlerResult::CqConfirmed
+                        // Do NOT confirm completion — stop the proxy to prevent
+                        // the GPU from proceeding on a failed RDMA write.
+                        HandlerResult::Stop
                     }
                 }
             },
