@@ -1,6 +1,6 @@
 # Architecture Overview
 
-RMLX is a layered architecture composed of five layers. All Phases (0 through 7B) have been completed and the system is fully implemented. Each layer has clear responsibility boundaries and is separated into individual Cargo crates. Phase 7 additions include VJP autodiff, LoRA fine-tuning, and production hardening (structured logging, metrics, precision guard, graceful shutdown).
+RMLX is a layered architecture composed of five layers. All Phases (0 through 9B-opt) have been completed and the system is fully implemented. Each layer has clear responsibility boundaries and is separated into individual Cargo crates. Phase 7 additions include VJP autodiff, LoRA fine-tuning, and production hardening (structured logging, metrics, precision guard, graceful shutdown). Phase 9 additions include ExecGraph (5 CBs/layer, 92.3% reduction), CommandBatcher, Indirect Command Buffers, and weight pre-caching for 16.15x speedup.
 
 ---
 
@@ -22,9 +22,19 @@ RMLX is a layered architecture composed of five layers. All Phases (0 through 7B
 │  ~/rmlx/ (this repository — framework only)                               │
 │                        rmlx-core (compute engine)                          │
 │  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │                      Compute Graph / Op Registry                     │   │
+│  │                      Compute Graph / Op Registry (14 op modules)     │   │
 │  │  matmul · softmax · rms_norm · rope · quantized_matmul · moe_gate   │   │
+│  │  sdpa · silu · binary · reduce · copy · indexing · ...              │   │
 │  └──────────────────────────────┬───────────────────────────────────────┘   │
+│                                 │                                          │
+│  ┌──────────────────────────────┼───────────────────────────────────────┐   │
+│  │                ExecGraph / CommandBatcher / ICB Layer                │   │
+│  │  ┌────────────┐  ┌──────────────────┐  ┌─────────────────────┐     │   │
+│  │  │ ExecGraph   │  │ CommandBatcher   │  │ IcbBuilder/         │     │   │
+│  │  │ (5 CBs/     │  │ (encoder         │  │  IcbReplay/         │     │   │
+│  │  │  layer)     │  │  grouping)       │  │  IcbCache           │     │   │
+│  │  └────────────┘  └──────────────────┘  └─────────────────────┘     │   │
+│  └──────────────────────────────┼───────────────────────────────────────┘   │
 │                                 │                                          │
 │  ┌──────────────────────────────┼───────────────────────────────────────┐   │
 │  │                        Metal Pipeline Layer                          │   │
@@ -89,11 +99,23 @@ The core engine responsible for computation graphs and kernel dispatch.
 
 | Component | Role |
 |-----------|------|
-| **Op Registry** | Registers operations such as matmul, softmax, rms_norm, rope, quantized_matmul, moe_gate |
+| **Op Registry** | Registers 14 op modules including matmul, softmax, rms_norm, rope, quantized_matmul, moe_gate, sdpa, silu |
 | **Compute Graph** | Selective tracing-based computation graph (eager-first, tracing during prefill) |
 | **Kernel Dispatch** | Maps ops to Metal kernels and executes them, selecting optimal kernels based on dtype/shape |
 
 rmlx-core depends on rmlx-metal and rmlx-alloc, and provides computation APIs to upper layers (rmlx-nn, rmlx-distributed).
+
+---
+
+### ExecGraph / CommandBatcher Layer
+
+Reduces per-op CPU overhead by batching multiple GPU operations into minimal command buffers.
+
+| Component | Role |
+|-----------|------|
+| **ExecGraph** | Pre-built execution graph replaying deterministic op sequences with 5 CBs/layer (92.3% reduction from 65) |
+| **CommandBatcher** | Groups encoder work into shared command buffers, eliminating per-op CB creation |
+| **ICB** | Indirect Command Buffers for zero-CPU-overhead replay of pre-encoded command sequences |
 
 ---
 

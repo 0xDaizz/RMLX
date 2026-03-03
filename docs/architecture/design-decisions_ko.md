@@ -199,3 +199,78 @@ Cross-queue 동기화는 `MTLSharedEvent`로 관리합니다. `HazardTrackingMod
 ### 주의사항
 
 `HazardTrackingModeUntracked` 사용 시, 모든 cross-queue 버퍼 접근에 대해 반드시 `MTLSharedEvent` 또는 `MTLFence`로 동기화해야 합니다. 새로운 cross-queue 접근 패턴을 추가할 때는 반드시 데이터 정합성 테스트를 동반해야 합니다.
+
+---
+
+## 8. ExecGraph 아키텍처 — Re-encode vs Capture-replay
+
+ExecGraph는 CUDA Graphs 스타일의 capture-replay 대신 결정론적 re-encoding 방식을 사용합니다.
+
+### 근거
+
+CUDA Graphs는 GPU 연산 시퀀스를 캡처한 후 거의 제로에 가까운 CPU 오버헤드로 재생합니다.
+Metal에는 동등한 capture-replay 메커니즘이 없습니다. 대신 ExecGraph는:
+
+1. Transformer layer의 연산 시퀀스를 사전 분석합니다
+2. 연산을 5개 command buffer로 그룹화합니다 (기존 65개에서 감소)
+3. 매 forward pass마다 동일한 결정론적 시퀀스를 re-encode합니다
+4. CB 간 동기화에 MTLSharedEvent를 사용합니다
+
+### 왜 5개의 Command Buffer인가?
+
+| CB | 연산 | 경계 이유 |
+|----|------|-----------|
+| CB1 | QKV projection + RoPE | 공유 입력 의존성 |
+| CB2 | SDPA (fused attention) | CB1 출력에 의존 |
+| CB3 | Output projection + residual | CB2에 의존 |
+| CB4 | FFN (gate + up + SiLU + down) | CB3에 의존 |
+| CB5 | Final residual + norm | CB4에 의존 |
+
+각 경계는 후속 연산이 이전 CB의 출력에 의존하기 때문에 존재합니다.
+각 CB 내부에서는 여러 연산이 단일 encoder를 공유합니다.
+
+### 벤치마크 결과
+
+| 지표 | 베이스라인 | ExecGraph | 개선 |
+|------|-----------|-----------|------|
+| CB/layer | 65 | 5 | 92.3% 감소 |
+| 레이턴시/layer | 110.4ms | 6.8ms | 16.15x 속도 향상 |
+| CPU-GPU 동기화 | ~65 | ~1 | 98.5% 감소 |
+
+### CUDA Graphs와의 트레이드오프
+
+| 관점 | ExecGraph | CUDA Graphs |
+|------|-----------|-------------|
+| 메커니즘 | 매 pass re-encode | 1회 캡처 후 재생 |
+| CPU 오버헤드 | 낮음 (결정론적 경로) | 거의 제로 (재생) |
+| Shape 유연성 | shape 변경 대응 가능 | re-capture 필요 |
+| 구현 복잡도 | 단순 (capture 상태 없음) | 복잡한 capture 시맨틱 |
+
+---
+
+## 9. 가중치 사전 캐싱 — 메모리 vs 레이턴시 트레이드오프
+
+사전 계산된 contiguous 전치 가중치 행렬을 모델 로드 시점에 캐싱합니다.
+
+### 근거
+
+Linear layer는 `x @ W^T`를 계산합니다. 전치 `W^T`는 non-contiguous 뷰를 생성하며,
+matmul dispatch 전에 contiguous 복사가 필요합니다. 베이스라인에서는 이 복사가 매
+forward pass마다 발생합니다.
+
+### 해결 방법
+
+`prepare_weight_t()`가 모델 로드 시점에 contiguous 전치 가중치를 사전 계산하고 캐싱합니다.
+이는 추론 시 제로 비용 전치를 위해 ~2배의 가중치 메모리를 교환합니다.
+
+### 메모리 영향
+
+f16 가중치를 사용하는 7B 파라미터 모델 기준:
+- 기본 가중치: ~14 GB
+- 전치 캐시: ~14 GB
+- 합계: ~28 GB (512GB UMA에 여유롭게 적재 가능)
+
+### 성능 영향
+
+크리티컬 패스에서 per-layer 전치 + 복사 오버헤드를 완전히 제거합니다.
+ExecGraph와 결합하여 16.15x 속도 향상에 기여합니다.

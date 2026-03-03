@@ -4,7 +4,7 @@
 
 `rmlx-core` is the Metal GPU compute engine, providing data types, N-dimensional arrays, a kernel registry, GPU compute kernels, automatic differentiation, LoRA fine-tuning, runtime metrics, structured logging, numerical stability monitoring, and graceful shutdown.
 
-> **Status:** DType, Array, KernelRegistry, 10 compute kernels, VJP autodiff, LoRA, logging, metrics, PrecisionGuard, and ShutdownSignal are all implemented.
+> **Status:** DType, Array, KernelRegistry, 14 op modules (including SDPA and SiLU/SwiGLU), VJP autodiff, LoRA, logging, metrics, PrecisionGuard, and ShutdownSignal are all implemented.
 
 ---
 
@@ -19,7 +19,7 @@ rmlx-core/src/
 ├── kernels/
 │   └── mod.rs          # KernelRegistry (AOT -> JIT -> PipelineCache)
 ├── ops/
-│   ├── mod.rs          # 10 kernel registration (register_all)
+│   ├── mod.rs          # 14 kernel registration (register_all)
 │   ├── copy.rs         # Buffer copy
 │   ├── binary.rs       # add, mul, sub, div
 │   ├── reduce.rs       # sum, max, argmax, row_sum
@@ -29,7 +29,9 @@ rmlx-core/src/
 │   ├── gemv.rs         # Matrix-vector product
 │   ├── matmul.rs       # Matrix multiplication (GEMM)
 │   ├── quantized.rs    # Quantized matrix multiply (Q4_0, Q4_1, Q8_0)
-│   └── indexing.rs     # gather, scatter
+│   ├── indexing.rs     # gather, scatter
+│   ├── silu.rs         # SiLU activation + fused SwiGLU
+│   ├── sdpa.rs         # Fused Scaled Dot-Product Attention
 ├── vjp.rs              # Tape-based reverse-mode autodiff
 ├── lora.rs             # LoRA fine-tuning
 ├── logging.rs          # Structured logging
@@ -124,7 +126,7 @@ unsafe fn to_vec<T: HasDType + Clone>(&self) -> Vec<T>
 
 ## ops/ — Compute Kernels
 
-Registers 10 Metal GPU kernels with the `KernelRegistry`. Bulk registration via `register_all()`.
+Registers 14 op modules with the `KernelRegistry`. Bulk registration via `register_all()`.
 
 ```rust
 pub fn register_all(registry: &KernelRegistry) -> Result<(), KernelError> {
@@ -138,6 +140,8 @@ pub fn register_all(registry: &KernelRegistry) -> Result<(), KernelError> {
     matmul::register(registry)?;
     quantized::register(registry)?;
     indexing::register(registry)?;
+    silu::register(registry)?;
+    sdpa::register(registry)?;
     Ok(())
 }
 ```
@@ -154,6 +158,76 @@ pub fn register_all(registry: &KernelRegistry) -> Result<(), KernelError> {
 | `matmul` | GEMM | General matrix multiplication |
 | `quantized` | QMM | Q4_0/Q4_1/Q8_0 quantized matrix multiply |
 | `indexing` | Gather, Scatter | Indexing operations |
+| `silu` | SiLU, SiLU+Gate (SwiGLU) | Sigmoid Linear Unit activation + fused SwiGLU gate |
+| `sdpa` | SDPA | Fused Scaled Dot-Product Attention (Flash Attention style) |
+
+### silu.rs — SiLU Activation + Fused SwiGLU
+
+SiLU activation (`silu(x) = x * sigmoid(x)`) and fused SiLU*gate for SwiGLU FFN.
+
+| Function | Description |
+|----------|-------------|
+| `silu(registry, input, queue)` | Element-wise SiLU activation |
+| `silu_gate(registry, input, gate, queue)` | Fused `silu(input) * gate` (SwiGLU pattern) |
+
+**Vectorization:**
+- f32: 2 elements per thread
+- f16/bf16: 4 elements per thread with numerically stable sigmoid
+
+**Supported dtypes:** Float32, Float16, Bfloat16
+
+### sdpa.rs — Fused Scaled Dot-Product Attention
+
+Single-kernel computation of `softmax(Q @ K^T / sqrt(d) + mask) @ V` using online softmax.
+Avoids materializing the full `[N, S]` score matrix in device memory.
+
+| Function | Description |
+|----------|-------------|
+| `sdpa(registry, q, k, v, mask, scale, queue)` | Single-head fused SDPA: Q[N,D], K[S,D], V[S,D] -> O[N,D] |
+| `sdpa_batched(registry, q_heads, k_heads, v_heads, mask, scale, queue)` | Multi-head batched SDPA with GQA support |
+
+**Key optimizations:**
+- No intermediate score matrix materialization -- scores live in threadgroup shared memory only
+- Online softmax with running max/normalizer across K blocks
+- Single command buffer per attention head
+- Tiling: Br=32 (query block) x Bc=32 (key block)
+
+**Constraints:**
+- head_dim <= 128 (fused path); falls back to unfused for larger dims
+- Supported dtypes: Float32, Float16
+
+### ExecMode, CommandBufferHandle, LaunchResult (`ops/mod.rs`)
+
+Types for async kernel dispatch control.
+
+#### ExecMode
+
+| Variant | Description |
+|---------|-------------|
+| `Sync` | Commit and wait immediately (default, safe) |
+| `Async` | Commit without waiting; caller manages sync |
+
+#### CommandBufferHandle
+
+Handle for tracking async command buffer completion.
+
+| Method | Description |
+|--------|-------------|
+| `is_complete()` | Non-blocking completion check |
+| `wait()` | Block until GPU work completes |
+| `wait_timeout(timeout)` | Block with timeout; returns true if completed |
+
+#### LaunchResult
+
+Wraps an output `Array` with a `CommandBufferHandle`. The only way to access the output
+is via `into_array()`, which blocks until GPU completion -- preventing reads of incomplete data.
+
+| Method | Description |
+|--------|-------------|
+| `is_complete()` | Non-blocking completion check |
+| `into_array()` | Block until complete, return output Array |
+| `into_array_timeout(timeout)` | Block with timeout; returns `Ok(Array)` or `Err(self)` |
+| `handle()` | Access the completion handle for polling |
 
 ---
 

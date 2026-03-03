@@ -23,3 +23,9 @@
 
 ## Roadmap
 - [Implementation Phases](roadmap/phases.md) | [한국어](roadmap/phases_ko.md)
+
+## GPU Pipeline
+- [GPU Pipeline](gpu-pipeline.md) | [한국어](gpu-pipeline_ko.md)
+
+## Comparison
+- [RMLX vs MLX vs CUDA](comparison.md) | [한국어](comparison_ko.md)

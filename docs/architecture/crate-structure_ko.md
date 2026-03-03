@@ -24,7 +24,10 @@ rmlx/
 │   │       ├── pipeline.rs       # ComputePipelineState 캐시
 │   │       ├── library.rs        # MTLLibrary 로드/JIT 컴파일
 │   │       ├── resident.rs       # ResidencySet 관리
-│   │       └── self_check.rs     # 시동 진단 (startup diagnostics)
+│   │       ├── self_check.rs     # 시동 진단 (startup diagnostics)
+│   │       ├── batcher.rs       # CommandBatcher — CB 그룹화
+│   │       ├── exec_graph.rs    # ExecGraph — 결정론적 op 재생
+│   │       └── icb.rs           # Indirect Command Buffer 지원
 │   │
 │   ├── rmlx-alloc/               # 메모리 할당자
 │   │   ├── Cargo.toml            # deps: rmlx-metal, libc
@@ -67,7 +70,9 @@ rmlx/
 │   │       │   ├── binary.rs     # element-wise 연산
 │   │       │   ├── reduce.rs
 │   │       │   ├── copy.rs
-│   │       │   └── indexing.rs
+│   │       │   ├── indexing.rs
+│   │       │   ├── silu.rs         # SiLU activation + fused SwiGLU
+│   │       │   └── sdpa.rs         # Fused Scaled Dot-Product Attention
 │   │       ├── kernels/
 │   │       │   ├── mod.rs        # 커널 레지스트리
 │   │       │   ├── loader.rs     # .metallib AOT 로드
@@ -168,9 +173,9 @@ rmlx/
 | 항목 | 내용 |
 |------|------|
 | **목적** | Apple Metal API를 Rust로 안전하게 추상화합니다. `metal-rs` 0.31을 기반으로 MTLDevice, MTLCommandQueue, MTLBuffer, MTLSharedEvent 등을 래핑합니다. |
-| **핵심 모듈** | `device.rs` (디바이스 + 아키텍처 감지), `queue.rs` (듀얼 큐 관리), `command.rs` (CommandBuffer/Encoder), `event.rs` (MTLSharedEvent 래퍼), `pipeline.rs` (PSO 캐시), `self_check.rs` (시동 진단) |
+| **핵심 모듈** | `device.rs` (디바이스 + 아키텍처 감지), `queue.rs` (듀얼 큐 관리), `command.rs` (CommandBuffer/Encoder), `event.rs` (MTLSharedEvent 래퍼), `pipeline.rs` (PSO 캐시), `self_check.rs` (시동 진단), `batcher.rs` (CommandBatcher), `exec_graph.rs` (ExecGraph), `icb.rs` (Indirect Command Buffer) |
 | **의존성** | metal-rs 0.31, objc2, block2 |
-| **현재 상태** | 완료 — GpuDevice, StreamManager, DeviceStream, GpuEvent, SharedEvent 동기화, 듀얼 큐 파이프라인, 시동 진단 전체 구현 |
+| **현재 상태** | 완료 — GpuDevice, StreamManager, DeviceStream, GpuEvent, SharedEvent 동기화, 듀얼 큐 파이프라인, 시동 진단, ExecGraph (5 CBs/layer), CommandBatcher, ICB 전체 구현 |
 
 ---
 
@@ -201,9 +206,9 @@ rmlx/
 | 항목 | 내용 |
 |------|------|
 | **목적** | 연산 그래프, Op 레지스트리, 커널 디스패치를 통합 관리하는 핵심 엔진입니다. N-dim array 타입과 dtype 시스템을 정의하며, eager-first 실행과 선택적 tracing 컴파일을 지원합니다. |
-| **핵심 모듈** | `dtype.rs` (f32, f16, bf16, quantized), `array.rs` (N-dim array), `ops/` (matmul, softmax 등 7종 커널), `kernels/` (AOT/JIT 커널 관리), `graph.rs` (연산 그래프), `scheduler.rs` (스트림별 스케줄러), `vjp.rs` (VJP autodiff), `lora.rs` (LoRA fine-tuning), `logging.rs` (structured logging), `metrics.rs` (메트릭 수집), `precision_guard.rs` (정밀도 가드), `shutdown.rs` (graceful shutdown) |
+| **핵심 모듈** | `dtype.rs` (f32, f16, bf16, quantized), `array.rs` (N-dim array), `ops/` (matmul, softmax, rms_norm, rope, quantized, binary, reduce, copy, indexing, sdpa, silu 등 14개 op 모듈), `kernels/` (AOT/JIT 커널 관리), `graph.rs` (연산 그래프), `scheduler.rs` (스트림별 스케줄러), `vjp.rs` (VJP autodiff), `lora.rs` (LoRA fine-tuning), `logging.rs` (structured logging), `metrics.rs` (메트릭 수집), `precision_guard.rs` (정밀도 가드), `shutdown.rs` (graceful shutdown) |
 | **의존성** | `rmlx-metal`, `rmlx-alloc` |
-| **현재 상태** | 완료 — Array 타입, 7종 Metal 커널 디스패치, VJP autodiff, LoRA, 프로덕션 하드닝 전체 구현 |
+| **현재 상태** | 완료 — Array 타입, 14개 op 모듈(sdpa, silu 포함), ExecMode, CommandBufferHandle, LaunchResult, VJP autodiff, LoRA, 프로덕션 하드닝 전체 구현 |
 
 ---
 
@@ -223,9 +228,9 @@ rmlx/
 | 항목 | 내용 |
 |------|------|
 | **목적** | Transformer 기반 LLM 아키텍처의 신경망 레이어를 제공합니다. Linear, Attention, MoE 등의 고수준 모듈과 LLaMA, Qwen, DeepSeek-V3 등 모델 아키텍처를 포함합니다. |
-| **핵심 모듈** | `linear.rs` (quantized Linear), `attention.rs` (Multi-head/GQA), `transformer.rs` (Transformer block), `moe.rs` (gate + routing), `models/` (llama.rs, qwen.rs, deepseek.rs, mixtral.rs) |
+| **핵심 모듈** | `linear.rs` (quantized Linear, `prepare_weight_t()`), `attention.rs` (Multi-head/GQA), `transformer.rs` (Transformer block, `forward_graph()`, `forward_into_cb()`), `moe.rs` (gate + routing), `models/` (llama.rs, qwen.rs, deepseek.rs, mixtral.rs) |
 | **의존성** | `rmlx-core` |
-| **현재 상태** | 완료 — Transformer 블록, Linear/Attention/MoE 레이어, LLaMA/Qwen/DeepSeek-V3/Mixtral 모델 아키텍처 전체 구현 |
+| **현재 상태** | 완료 — Transformer 블록, Linear/Attention/MoE 레이어, LLaMA/Qwen/DeepSeek-V3/Mixtral 모델 아키텍처, ExecGraph 호환 `forward_graph()`, 가중치 사전 캐싱 전체 구현 |
 
 ---
 
