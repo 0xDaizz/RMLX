@@ -102,9 +102,7 @@ impl EpRuntimeContext {
                         match pending.wait(std::time::Duration::from_secs(5)) {
                             Ok(_completion) => HandlerResult::CqConfirmed,
                             Err(e) => {
-                                eprintln!(
-                                    "[ep-runtime] CQ wait failed for wr_id={wr_id}: {e:?}"
-                                );
+                                eprintln!("[ep-runtime] CQ wait failed for wr_id={wr_id}: {e:?}");
                                 counters
                                     .rdma_ops_error
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
