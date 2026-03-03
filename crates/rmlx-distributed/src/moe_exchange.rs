@@ -943,9 +943,8 @@ impl MoeDispatchExchange {
                     let cursor_idx = local_expert_idx * world_size + src_rank;
                     let cursor = local_cursors[cursor_idx];
                     if cursor < capacity_per_expert {
-                        let flat_slot = local_expert_idx * rank_cap
-                            + src_rank * capacity_per_expert
-                            + cursor;
+                        let flat_slot =
+                            local_expert_idx * rank_cap + src_rank * capacity_per_expert + cursor;
                         let dst_start = flat_slot * token_stride;
                         let dst_end = dst_start + token_stride;
                         if dst_end <= local_output.len() {
@@ -1219,9 +1218,8 @@ impl MoeDispatchExchange {
                     let cursor_idx = local_expert_idx * world_size + src_rank;
                     let cursor = local_cursors[cursor_idx];
                     if cursor < capacity_per_expert {
-                        let flat_slot = local_expert_idx * rank_cap
-                            + src_rank * capacity_per_expert
-                            + cursor;
+                        let flat_slot =
+                            local_expert_idx * rank_cap + src_rank * capacity_per_expert + cursor;
                         let dst_offset = flat_slot * token_stride;
                         let dst_end = dst_offset + token_stride;
                         if dst_end <= local_buf_size && dst_end <= shared_buf.size() {
@@ -1830,7 +1828,9 @@ kernel void moe_combine(
             shared,
         );
         let output_size = batch_size * hidden_dim;
-        let output_buf = cached.device.new_buffer((output_size * 4).max(4) as u64, shared);
+        let output_buf = cached
+            .device
+            .new_buffer((output_size * 4).max(4) as u64, shared);
 
         #[repr(C)]
         struct CombineParams {
@@ -2087,8 +2087,7 @@ kernel void moe_combine(
                 } else {
                     &[]
                 };
-                let send_bytes: Vec<u8> =
-                    send_slice.iter().flat_map(|f| f.to_ne_bytes()).collect();
+                let send_bytes: Vec<u8> = send_slice.iter().flat_map(|f| f.to_ne_bytes()).collect();
 
                 let recv_len = if segment_bytes > 0 { segment_bytes } else { 4 };
                 let received = self
@@ -2267,11 +2266,7 @@ kernel void moe_combine(
                             // Zero-fill for missing expert
                             // SAFETY: within SharedBuffer bounds (total_send_len checked).
                             unsafe {
-                                std::ptr::write_bytes(
-                                    send_ptr.add(buf_offset),
-                                    0,
-                                    segment_bytes,
-                                );
+                                std::ptr::write_bytes(send_ptr.add(buf_offset), 0, segment_bytes);
                             }
                         }
                     }
@@ -2357,8 +2352,7 @@ kernel void moe_combine(
                     if buf_offset + segment_bytes <= recv_buf.size() {
                         // SAFETY: bounds checked above; recv_buf is valid for size() bytes,
                         // and buf_offset + segment_bytes <= recv_buf.size().
-                        let src_ptr =
-                            unsafe { recv_buf.as_ptr().add(buf_offset) } as *const f32;
+                        let src_ptr = unsafe { recv_buf.as_ptr().add(buf_offset) } as *const f32;
                         let src_slice =
                             unsafe { std::slice::from_raw_parts(src_ptr, segment_elems) };
                         // Place at local_rank's segment offset in the peer expert's output
