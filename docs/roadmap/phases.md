@@ -1,6 +1,6 @@
-# 🗺️ Implementation Roadmap — Phases 0-9B Complete
+# 🗺️ Implementation Roadmap — Phases 0-9B + S1-S5 Complete
 
-The rmlx project implementation roadmap. All phases have been completed through 9B-opt. Implementation phases: 9 (all complete through 9B-opt).
+The rmlx project implementation roadmap. All phases through 9B-opt and serving support phases S1-S5 are complete. Implementation phases: 9 + 5 serving support phases (all complete).
 
 ---
 
@@ -23,6 +23,11 @@ The rmlx project implementation roadmap. All phases have been completed through 
 | 8 | KV Cache + API Surface | KV cache, parallel linear, API ergonomics | Phase 7B | Complete |
 | 9A | GPU Pipeline — ExecGraph | CommandBatcher, ExecGraph, ICB, `_into_cb()` pattern | Phase 8 | Complete |
 | 9B-opt | GPU Pipeline — Optimization | Weight pre-caching, contiguous transpose, 16.15x speedup | Phase 9A | Complete |
+| S1 | Serving Quick Wins | GELU, RotatingKV, BatchKV | Phase 9 | Complete |
+| S2 | DType + Quantization | FP8, GGUF, AWQ/GPTQ | Phase 9 | Complete |
+| S3 | Attention Upgrade | Flash Attention 2, QuantizedKV | Phase 9 | Complete |
+| S4 | Runtime Flexibility | Array-level collectives, Dynamic shapes | Phase 9 | Complete |
+| S5 | Multimodal Extension | Conv1d/Conv2d | Phase 9 | Complete |
 
 ---
 
@@ -45,6 +50,11 @@ The rmlx project implementation roadmap. All phases have been completed through 
 | Phase 8: KV Cache + API Surface | squash merge | 339 tests | Complete |
 | Phase 9A: GPU Pipeline — ExecGraph | Phase 9 merge commit | 339+ tests | Complete |
 | Phase 9B-opt: GPU Pipeline — Optimization | optimization merge | 339+ tests | Complete |
+| Phase S1: GELU + KV Cache variants | -- | 390 tests | Complete |
+| Phase S2: FP8/GGUF/AWQ/GPTQ | -- | 390 tests | Complete |
+| Phase S3: Flash Attention 2 + QuantizedKV | -- | 390 tests | Complete |
+| Phase S4: Collective ops + Dynamic shapes | -- | 390 tests | Complete |
+| Phase S5: Conv1d/Conv2d | -- | 390 tests | Complete |
 
 ---
 
@@ -74,6 +84,18 @@ graph LR
     P7 --> P8
     P8 --> P9
 
+    PS1["Phase S1<br/>Quick Wins<br/>Complete"]
+    PS2["Phase S2<br/>DType + Quant<br/>Complete"]
+    PS3["Phase S3<br/>Attention<br/>Complete"]
+    PS4["Phase S4<br/>Runtime<br/>Complete"]
+    PS5["Phase S5<br/>Multimodal<br/>Complete"]
+
+    P9 --> PS1
+    P9 --> PS2
+    P9 --> PS3
+    P9 --> PS4
+    P9 --> PS5
+
     style P0 fill:#22c55e,color:#fff
     style P1 fill:#22c55e,color:#fff
     style P2 fill:#22c55e,color:#fff
@@ -84,6 +106,11 @@ graph LR
     style P7 fill:#22c55e,color:#fff
     style P8 fill:#22c55e,color:#fff
     style P9 fill:#22c55e,color:#fff
+    style PS1 fill:#22c55e,color:#fff
+    style PS2 fill:#22c55e,color:#fff
+    style PS3 fill:#22c55e,color:#fff
+    style PS4 fill:#22c55e,color:#fff
+    style PS5 fill:#22c55e,color:#fff
 ```
 
 ---
@@ -403,20 +430,32 @@ Pre-cache contiguous transposed weight matrices to eliminate transpose overhead 
 
 ---
 
-## Phase 10: Flash Attention — Planned
+## Phase S3a: Flash Attention 2 — Complete (previously Phase 10)
 
 ### Goal
 
-Implement Flash Attention 2 with tiled K/V processing for efficient attention computation.
+Implement Flash Attention 2 with K/V outer loop for efficient attention computation.
 
 ### Key Deliverables
 
-- Flash Attention 2 Metal kernel (tiled Q/K/V with online softmax)
-- Integration with ExecGraph pipeline
+- Flash Attention 2 Metal kernel (K/V outer loop, Q inner loop)
+- head_dim support up to 256 (previously 128)
+- Decode fast path (T_q=1) with optimized single-query kernel
+- Causal mask block-skipping optimization
+- `is_causal` parameter for sdpa/sdpa_batched
+
+### Definition of Done (DoD)
+
+- [x] FA2 kernel with K/V outer loop structure
+- [x] D up to 256 supported
+- [x] Decode fast path for T_q=1
+- [x] Causal mask optimization (skip blocks above diagonal)
+- [x] Backward compatible API (is_causal=false default)
+- [x] All 390+ tests passing
 
 ---
 
-## Phase 11: Advanced Quantization — Planned
+## Phase S2: Advanced Quantization — Complete (previously Phase 11)
 
 ### Goal
 
@@ -424,9 +463,97 @@ Expand quantization format support for broader model compatibility.
 
 ### Key Deliverables
 
-- GGUF format support
-- AWQ/GPTQ quantization
-- FP8 support
+- FP8 DType (Float8E4M3, Float8E5M2) with dequant/quant Metal kernels
+- GGUF binary format parser (v2/v3) with GgmlType mapping
+- AWQ INT4 unpacking (packed uint32 → f32 dequantization)
+- GPTQ INT4 unpacking with g_idx (act_order) support
+
+### Definition of Done (DoD)
+
+- [x] FP8 dtypes added with all match arms updated
+- [x] GGUF parser with 11 unit tests
+- [x] AWQ/GPTQ dequant Metal kernels
+- [x] All 390+ tests passing
+
+---
+
+## Phase S1: Serving Quick Wins — Complete
+
+### Goal
+
+Add activation functions and KV cache variants needed by rmlx-serve.
+
+### Key Deliverables
+
+- GELU activation (gelu_approx + gelu_fast) with f32/f16/bf16 Metal kernels
+- RotatingKvCache: circular buffer with keep parameter for system prompt preservation
+- BatchKvCache: per-sequence batched cache with filter/extend/reset
+
+### Definition of Done (DoD)
+
+- [x] GELU Metal kernels (6 variants)
+- [x] RotatingKvCache with circular write and temporal order restoration
+- [x] BatchKvCache with per-sequence offset tracking
+- [x] All 390+ tests passing
+
+---
+
+## Phase S3b: QuantizedKVCache — Complete
+
+### Goal
+
+Reduce KV cache memory consumption via quantized storage.
+
+### Key Deliverables
+
+- QuantizedArray type (packed_uint32, scales, biases)
+- QuantizedKvCache with per-layer per-head quantized storage
+- CPU-side affine quantization helper
+
+### Definition of Done (DoD)
+
+- [x] Quantized KV cache with q4/q8 support
+- [x] Memory savings: q4 = 4x reduction over f16
+- [x] All 390+ tests passing
+
+---
+
+## Phase S4: Runtime Flexibility — Complete
+
+### Goal
+
+Add Array-level distributed primitives and dynamic shape support.
+
+### Key Deliverables
+
+- `allreduce_sum()` and `allgather_array()` on Group (Array-level wrappers)
+- DynamicExecContext: max-size pre-allocation with variable actual-size dispatch
+
+### Definition of Done (DoD)
+
+- [x] Array-level collective ops on Group
+- [x] DynamicExecContext with zero-copy view-based dispatch
+- [x] All 390+ tests passing
+
+---
+
+## Phase S5: Multimodal Extension — Complete
+
+### Goal
+
+Add convolution primitives for multimodal model support.
+
+### Key Deliverables
+
+- Conv1d Metal kernels (f32/f16/bf16) with padding, stride, dilation, groups
+- Conv2d Metal kernels (f32/f16/bf16) with 2D padding, stride, dilation, groups
+- Conv1d/Conv2d nn layer wrappers in rmlx-nn
+
+### Definition of Done (DoD)
+
+- [x] Conv1d/Conv2d Metal kernels with full parameter support
+- [x] Neural network layer wrappers (Conv1d, Conv2d)
+- [x] All 390+ tests passing
 
 ---
 

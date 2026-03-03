@@ -33,6 +33,7 @@ pub struct Group {
     ranks: Vec<u32>,      // sorted unique rank list
     local_rank: u32,      // current node rank
     world_size: u32,      // total number of nodes
+    transport: Option<Arc<dyn RdmaTransport>>,  // None = single-process stub
 }
 ```
 
@@ -46,6 +47,17 @@ pub struct Group {
 | `world_size()` | Total world size |
 | `peers()` | Peer rank list excluding self |
 | `contains(rank)` | Checks whether a rank belongs to the group |
+
+### Array-Level Collective Operations
+
+Convenience wrappers that operate on `rmlx_core::array::Array` instead of raw `&[u8]`. On Apple Silicon UMA, Metal buffer bytes are extracted (zero-copy), the byte-level collective is performed, and a new Array is constructed from the result.
+
+| Method | Description |
+|--------|-------------|
+| `allreduce_sum(input, device)` | All-reduce sum across ranks; returns Array with same shape/dtype |
+| `allgather_array(input, device)` | All-gather across ranks; returns Array with shape `[world_size * dim0, ...rest]` |
+
+Both methods return the input unchanged for single-rank groups (identity).
 
 ---
 

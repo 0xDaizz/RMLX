@@ -4,7 +4,7 @@
 
 `rmlx-core` is the Metal GPU compute engine, providing data types, N-dimensional arrays, a kernel registry, GPU compute kernels, automatic differentiation, LoRA fine-tuning, runtime metrics, structured logging, numerical stability monitoring, and graceful shutdown.
 
-> **Status:** DType, Array, KernelRegistry, 14 op modules (including SDPA and SiLU/SwiGLU), VJP autodiff, LoRA, logging, metrics, PrecisionGuard, and ShutdownSignal are all implemented.
+> **Status:** DType (with FP8), Array, KernelRegistry, 18 op modules (including SDPA/FA2, SiLU/SwiGLU, GELU, FP8 dequant/quant, Conv1d/Conv2d), GGUF format parser, AWQ/GPTQ dequant, VJP autodiff, LoRA, logging, metrics, PrecisionGuard, and ShutdownSignal are all implemented.
 
 ---
 
@@ -19,7 +19,7 @@ rmlx-core/src/
 ├── kernels/
 │   └── mod.rs          # KernelRegistry (AOT -> JIT -> PipelineCache)
 ├── ops/
-│   ├── mod.rs          # 14 kernel registration (register_all)
+│   ├── mod.rs          # 18 kernel registration (register_all)
 │   ├── copy.rs         # Buffer copy
 │   ├── binary.rs       # add, mul, sub, div
 │   ├── reduce.rs       # sum, max, argmax, row_sum
@@ -31,7 +31,13 @@ rmlx-core/src/
 │   ├── quantized.rs    # Quantized matrix multiply (Q4_0, Q4_1, Q8_0)
 │   ├── indexing.rs     # gather, scatter
 │   ├── silu.rs         # SiLU activation + fused SwiGLU
-│   ├── sdpa.rs         # Fused Scaled Dot-Product Attention
+│   ├── gelu.rs         # GELU activation (gelu_approx + gelu_fast)
+│   ├── fp8.rs          # FP8 dequant/quant (E4M3, E5M2)
+│   ├── conv.rs         # Conv1d/Conv2d convolution
+│   ├── sdpa.rs         # Flash Attention 2 (fused SDPA)
+├── formats/
+│   ├── mod.rs          # Format parser module
+│   └── gguf.rs         # GGUF binary format parser (llama.cpp)
 ├── vjp.rs              # Tape-based reverse-mode autodiff
 ├── lora.rs             # LoRA fine-tuning
 ├── logging.rs          # Structured logging
@@ -52,6 +58,9 @@ pub enum DType {
     Float32,
     Float16,
     Bfloat16,
+    UInt32,
+    Float8E4M3,   // FP8 E4M3 (1s/4e/3m), range ±448, stored as uint8
+    Float8E5M2,   // FP8 E5M2 (1s/5e/2m), range ±57344, stored as uint8
     Q4_0,   // 4-bit quantized, group size 32, f16 scale
     Q4_1,   // 4-bit quantized, group size 32, f16 scale + f16 min
     Q8_0,   // 8-bit quantized, group size 32, f16 scale
@@ -63,6 +72,9 @@ pub enum DType {
 | `Float32` | 4 | `"float32"` | Default floating point |
 | `Float16` | 2 | `"float16"` | Memory-efficient inference |
 | `Bfloat16` | 2 | `"bfloat16"` | Training/inference (brain floating point) |
+| `UInt32` | 4 | `"uint32"` | Index arrays, token IDs |
+| `Float8E4M3` | 1 | `"float8e4m3"` | FP8 weights/activations (E4M3 format) |
+| `Float8E5M2` | 1 | `"float8e5m2"` | FP8 gradients (E5M2 format) |
 | `Q4_0` | 1 | `"q4_0"` | ~0.5625 bytes/element (18B per 32 elements) |
 | `Q4_1` | 1 | `"q4_1"` | ~0.625 bytes/element (20B per 32 elements) |
 | `Q8_0` | 1 | `"q8_0"` | ~1.0625 bytes/element (34B per 32 elements) |
@@ -126,7 +138,7 @@ unsafe fn to_vec<T: HasDType + Clone>(&self) -> Vec<T>
 
 ## ops/ — Compute Kernels
 
-Registers 14 op modules with the `KernelRegistry`. Bulk registration via `register_all()`.
+Registers 18 op modules with the `KernelRegistry`. Bulk registration via `register_all()`.
 
 ```rust
 pub fn register_all(registry: &KernelRegistry) -> Result<(), KernelError> {
@@ -141,6 +153,9 @@ pub fn register_all(registry: &KernelRegistry) -> Result<(), KernelError> {
     quantized::register(registry)?;
     indexing::register(registry)?;
     silu::register(registry)?;
+    gelu::register(registry)?;
+    fp8::register(registry)?;
+    conv::register(registry)?;
     sdpa::register(registry)?;
     Ok(())
 }
@@ -156,10 +171,13 @@ pub fn register_all(registry: &KernelRegistry) -> Result<(), KernelError> {
 | `rope` | RoPE | Rotary Position Embedding |
 | `gemv` | GEMV | Matrix-vector product |
 | `matmul` | GEMM | General matrix multiplication |
-| `quantized` | QMM | Q4_0/Q4_1/Q8_0 quantized matrix multiply |
+| `quantized` | QMM, AWQ dequant, GPTQ dequant | Quantized matmul + AWQ/GPTQ INT4 unpacking |
 | `indexing` | Gather, Scatter | Indexing operations |
 | `silu` | SiLU, SiLU+Gate (SwiGLU) | Sigmoid Linear Unit activation + fused SwiGLU gate |
-| `sdpa` | SDPA | Fused Scaled Dot-Product Attention (Flash Attention style) |
+| `gelu` | GELU, GELU_fast | GELU activation (tanh approx + sigmoid fast) |
+| `fp8` | FP8 dequant/quant | Float8E4M3/E5M2 dequantization and quantization |
+| `conv` | Conv1d, Conv2d | 1D and 2D convolution with padding/stride/dilation/groups |
+| `sdpa` | SDPA / FA2 | Flash Attention 2 (fused Scaled Dot-Product Attention) |
 
 ### silu.rs — SiLU Activation + Fused SwiGLU
 
@@ -176,25 +194,79 @@ SiLU activation (`silu(x) = x * sigmoid(x)`) and fused SiLU*gate for SwiGLU FFN.
 
 **Supported dtypes:** Float32, Float16, Bfloat16
 
-### sdpa.rs — Fused Scaled Dot-Product Attention
+### gelu.rs — GELU Activation
 
-Single-kernel computation of `softmax(Q @ K^T / sqrt(d) + mask) @ V` using online softmax.
-Avoids materializing the full `[N, S]` score matrix in device memory.
+GELU activation in two variants:
+- `gelu_approx(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))` -- GPT-2, BERT, Gemma
+- `gelu_fast(x) = x * sigmoid(1.702 * x)` -- fast sigmoid approximation
 
 | Function | Description |
 |----------|-------------|
-| `sdpa(registry, q, k, v, mask, scale, queue)` | Single-head fused SDPA: Q[N,D], K[S,D], V[S,D] -> O[N,D] |
-| `sdpa_batched(registry, q_heads, k_heads, v_heads, mask, scale, queue)` | Multi-head batched SDPA with GQA support |
+| `gelu(registry, input, queue)` | GELU with tanh approximation (gelu_approx) |
+| `gelu_fast(registry, input, queue)` | GELU with sigmoid approximation (gelu_fast) |
+
+**Vectorization:**
+- f32: 2 elements per thread
+- f16/bf16: 4 elements per thread (f32 accumulation)
+
+**Supported dtypes:** Float32, Float16, Bfloat16
+
+### fp8.rs — FP8 Dequantization/Quantization
+
+FP8 format conversion kernels. Metal does not natively support FP8, so values are stored as uint8 and converted via dedicated kernels.
+
+| Function | Description |
+|----------|-------------|
+| `dequant_fp8e4m3_to_f16(registry, input, queue)` | E4M3 (uint8) -> Float16 |
+| `dequant_fp8e5m2_to_f16(registry, input, queue)` | E5M2 (uint8) -> Float16 |
+| `quant_f16_to_fp8e4m3(registry, input, scale, queue)` | Float16 -> E4M3 with per-tensor scale |
+| `quant_f16_to_fp8e5m2(registry, input, scale, queue)` | Float16 -> E5M2 with per-tensor scale |
+
+**Kernel design:** 4 elements per thread for all variants.
+
+### conv.rs — Convolution (Conv1d/Conv2d)
+
+GPU-accelerated 1D and 2D convolution using implicit GEMM (no im2col overhead).
+
+| Function | Description |
+|----------|-------------|
+| `conv1d(registry, input, weight, bias, stride, padding, dilation, groups, queue)` | 1D convolution: [B, C_in, W] -> [B, C_out, W_out] |
+| `conv2d(registry, input, weight, bias, stride, padding, dilation, groups, queue)` | 2D convolution: [B, C_in, H, W] -> [B, C_out, H_out, W_out] |
+
+**Features:** padding, stride, dilation, grouped convolution, optional bias.
+
+**Supported dtypes:** Float32, Float16, Bfloat16
+
+### sdpa.rs — Flash Attention 2 (Fused SDPA)
+
+Flash Attention 2 implementation with K/V outer loop for efficient attention computation.
+Single-kernel computation of `softmax(Q @ K^T / sqrt(d) + mask) @ V` using online softmax.
+
+| Function | Description |
+|----------|-------------|
+| `sdpa(registry, q, k, v, mask, scale, is_causal, queue)` | Single-head FA2: Q[N,D], K[S,D], V[S,D] -> O[N,D] |
+| `sdpa_batched(registry, q_heads, k_heads, v_heads, mask, scale, is_causal, queue)` | Multi-head batched FA2 with GQA support |
 
 **Key optimizations:**
-- No intermediate score matrix materialization -- scores live in threadgroup shared memory only
-- Online softmax with running max/normalizer across K blocks
-- Single command buffer per attention head
+- **Flash Attention 2**: K/V outer loop, Q inner loop for better GPU utilization
+- **Decode fast path**: Optimized single-query kernel when N=1 (T_q=1)
+- **Causal mask block-skipping**: Entire K/V blocks above the causal diagonal are skipped
+- No intermediate score matrix materialization
+- Online softmax with running max/normalizer
 - Tiling: Br=32 (query block) x Bc=32 (key block)
 
 **Constraints:**
-- head_dim <= 128 (fused path); falls back to unfused for larger dims
+- head_dim <= 256 (D<=128 uses shared memory tiles; D>128 uses split approach)
 - Supported dtypes: Float32, Float16
+
+### AWQ/GPTQ Dequantization (in quantized.rs)
+
+Converts AWQ/GPTQ packed INT4 weights to f32 for inference.
+
+| Function | Description |
+|----------|-------------|
+| `awq_dequant(registry, qweight, qzeros, scales, rows, cols, group_size, queue)` | AWQ INT4 -> f32 dequantization |
+| `gptq_dequant(registry, qweight, qzeros, scales, g_idx, in_features, out_features, group_size, queue)` | GPTQ INT4 -> f32 dequantization (with optional g_idx for act_order) |
 
 ### ExecMode, CommandBufferHandle, LaunchResult (`ops/mod.rs`)
 
@@ -621,6 +693,32 @@ pub use crate::kernels::{KernelError, KernelRegistry};
 ```rust
 use rmlx_core::prelude::*;
 ```
+
+---
+
+## formats/ — File Format Parsers
+
+### gguf.rs — GGUF Binary Format Parser
+
+Parses llama.cpp GGUF model files (v2 and v3).
+
+| Type | Description |
+|------|-------------|
+| `GgufFile` | Parsed GGUF file: version, metadata, tensor info, data offset |
+| `GgufTensorInfo` | Tensor name, shape (RMLX order), GgmlType, byte offset |
+| `GgufValue` | Metadata value (13 types: integers, floats, strings, arrays) |
+| `GgmlType` | GGML tensor types (F32, F16, BF16, Q4_0, Q4_1, Q8_0, K-quants, etc.) |
+
+| Function | Description |
+|----------|-------------|
+| `parse_gguf(reader)` | Parse GGUF header from any `Read + Seek` source |
+| `ggml_type_to_dtype(ggml_type)` | Map GgmlType to RMLX DType (None for unsupported) |
+
+**GGUF features:**
+- Magic validation (0x46475547)
+- Version 2 and 3 support
+- Custom alignment via `general.alignment` metadata
+- Shape reversal from GGUF order to RMLX row-major order
 
 ---
 

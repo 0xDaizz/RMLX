@@ -4,7 +4,7 @@
 
 `rmlx-core`는 Metal GPU 연산 엔진으로, 데이터 타입, N차원 배열, 커널 레지스트리, GPU 연산 커널, 자동 미분, LoRA 파인튜닝, 런타임 메트릭, 구조화된 로깅, 수치 안정성 감시, 그레이스풀 셧다운 등을 제공합니다.
 
-> **상태:** DType, Array, KernelRegistry, 14종의 op 모듈 (SDPA 및 SiLU/SwiGLU 포함), VJP 자동 미분, LoRA, 로깅, 메트릭, PrecisionGuard, ShutdownSignal이 모두 구현되어 있습니다.
+> **상태:** DType (FP8 포함), Array, KernelRegistry, 18종의 op 모듈 (SDPA/FA2, SiLU/SwiGLU, GELU, FP8 dequant/quant, Conv1d/Conv2d 포함), GGUF 포맷 파서, AWQ/GPTQ dequant, VJP 자동 미분, LoRA, 로깅, 메트릭, PrecisionGuard, ShutdownSignal이 모두 구현되어 있습니다.
 
 ---
 
@@ -13,12 +13,13 @@
 ```
 rmlx-core/src/
 ├── lib.rs              # 모듈 선언 + METALLIB_PATH 상수
+├── prelude.rs          # 편의 재내보내기 (Array, DType, KernelError, KernelRegistry)
 ├── dtype.rs            # DType 열거형
 ├── array.rs            # N차원 Metal 버퍼 배열
 ├── kernels/
 │   └── mod.rs          # KernelRegistry (AOT → JIT → PipelineCache)
 ├── ops/
-│   ├── mod.rs          # 14종 커널 등록 (register_all)
+│   ├── mod.rs          # 18종 커널 등록 (register_all)
 │   ├── copy.rs         # 버퍼 복사
 │   ├── binary.rs       # add, mul, sub, div
 │   ├── reduce.rs       # sum, max, argmax, row_sum
@@ -27,10 +28,16 @@ rmlx-core/src/
 │   ├── rope.rs         # Rotary Position Embedding
 │   ├── gemv.rs         # 행렬-벡터 곱
 │   ├── matmul.rs       # 행렬 곱셈 (GEMM)
-│   ├── quantized.rs    # 양자화 행렬 곱 (Q4_0, Q4_1, Q8_0)
+│   ├── quantized.rs    # 양자화 행렬 곱 (Q4_0, Q4_1, Q8_0, AWQ, GPTQ)
 │   ├── indexing.rs     # gather, scatter
 │   ├── silu.rs         # SiLU 활성화 + fused SwiGLU
-│   ├── sdpa.rs         # Fused Scaled Dot-Product Attention
+│   ├── gelu.rs         # GELU 활성화 (gelu_approx + gelu_fast)
+│   ├── fp8.rs          # FP8 dequant/quant (E4M3, E5M2)
+│   ├── conv.rs         # Conv1d/Conv2d 합성곱
+│   ├── sdpa.rs         # Flash Attention 2 (fused SDPA)
+├── formats/
+│   ├── mod.rs          # 포맷 파서 모듈
+│   └── gguf.rs         # GGUF 바이너리 포맷 파서 (llama.cpp)
 ├── vjp.rs              # 테이프 기반 역전파 자동 미분
 ├── lora.rs             # LoRA 파인튜닝
 ├── logging.rs          # 구조화된 로깅
@@ -51,6 +58,8 @@ pub enum DType {
     Float32,
     Float16,
     Bfloat16,
+    Float8E4M3,  // FP8 E4M3 (추론용)
+    Float8E5M2,  // FP8 E5M2 (학습 그래디언트용)
     Q4_0,   // 4-bit 양자화, group size 32, f16 scale
     Q4_1,   // 4-bit 양자화, group size 32, f16 scale + f16 min
     Q8_0,   // 8-bit 양자화, group size 32, f16 scale
@@ -62,6 +71,8 @@ pub enum DType {
 | `Float32` | 4 | `"float32"` | 기본 부동소수점 |
 | `Float16` | 2 | `"float16"` | 메모리 절약 추론 |
 | `Bfloat16` | 2 | `"bfloat16"` | 학습/추론 (뇌 부동소수점) |
+| `Float8E4M3` | 1 | `"float8_e4m3"` | FP8 추론 (4-bit 지수, 3-bit 가수) |
+| `Float8E5M2` | 1 | `"float8_e5m2"` | FP8 학습 그래디언트 (5-bit 지수, 2-bit 가수) |
 | `Q4_0` | 1 | `"q4_0"` | ~0.5625 bytes/element (18B per 32 elements) |
 | `Q4_1` | 1 | `"q4_1"` | ~0.625 bytes/element (20B per 32 elements) |
 | `Q8_0` | 1 | `"q8_0"` | ~1.0625 bytes/element (34B per 32 elements) |
@@ -125,7 +136,7 @@ unsafe fn to_vec<T: HasDType + Clone>(&self) -> Vec<T>
 
 ## ops/ — 연산 커널
 
-14종의 op 모듈을 `KernelRegistry`에 등록합니다. `register_all()`로 일괄 등록합니다.
+18종의 op 모듈을 `KernelRegistry`에 등록합니다. `register_all()`로 일괄 등록합니다.
 
 ```rust
 pub fn register_all(registry: &KernelRegistry) -> Result<(), KernelError> {
@@ -140,6 +151,9 @@ pub fn register_all(registry: &KernelRegistry) -> Result<(), KernelError> {
     quantized::register(registry)?;
     indexing::register(registry)?;
     silu::register(registry)?;
+    gelu::register(registry)?;
+    fp8::register(registry)?;
+    conv::register(registry)?;
     sdpa::register(registry)?;
     Ok(())
 }
@@ -155,10 +169,13 @@ pub fn register_all(registry: &KernelRegistry) -> Result<(), KernelError> {
 | `rope` | RoPE | Rotary Position Embedding |
 | `gemv` | GEMV | 행렬-벡터 곱 |
 | `matmul` | GEMM | 범용 행렬 곱셈 |
-| `quantized` | QMM | Q4_0/Q4_1/Q8_0 양자화 행렬 곱 |
+| `quantized` | QMM | Q4_0/Q4_1/Q8_0 양자화 행렬 곱 + AWQ/GPTQ dequant |
 | `indexing` | Gather, Scatter | 인덱싱 연산 |
 | `silu` | SiLU, SiLU+Gate (SwiGLU) | Sigmoid Linear Unit 활성화 + fused SwiGLU gate |
-| `sdpa` | SDPA | Fused Scaled Dot-Product Attention (Flash Attention 스타일) |
+| `gelu` | GELU | GELU 활성화 (gelu_approx + gelu_fast) |
+| `fp8` | FP8 Dequant/Quant | FP8 E4M3/E5M2 양자화/역양자화 |
+| `conv` | Conv1d, Conv2d | 1D/2D 합성곱 |
+| `sdpa` | SDPA (FA2) | Flash Attention 2 (fused SDPA, tiled K/V, online softmax) |
 
 ### silu.rs — SiLU 활성화 + Fused SwiGLU
 
@@ -175,25 +192,83 @@ SiLU 활성화 (`silu(x) = x * sigmoid(x)`)와 SwiGLU FFN을 위한 fused SiLU*g
 
 **지원 dtype:** Float32, Float16, Bfloat16
 
-### sdpa.rs — Fused Scaled Dot-Product Attention
+### gelu.rs -- GELU 활성화
 
-online softmax를 사용한 `softmax(Q @ K^T / sqrt(d) + mask) @ V` 단일 커널 연산입니다.
-전체 `[N, S]` 스코어 행렬을 디바이스 메모리에 구체화하는 것을 방지합니다.
+GELU (Gaussian Error Linear Unit) 활성화 함수입니다. `gelu(x) = x * Phi(x)` 근사를 제공합니다.
+
+| 함수 | 설명 |
+|------|------|
+| `gelu_approx(registry, input, queue)` | tanh 근사 GELU: `0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))` |
+| `gelu_fast(registry, input, queue)` | 빠른 sigmoid 근사 GELU: `x * sigmoid(1.702 * x)` |
+
+**지원 dtype:** Float32, Float16, Bfloat16
+
+### fp8.rs -- FP8 Dequant/Quant
+
+FP8 (8-bit 부동소수점) 양자화 및 역양자화를 제공합니다. E4M3 (추론용)과 E5M2 (학습 그래디언트용) 두 가지 변형을 지원합니다.
+
+| 함수 | 설명 |
+|------|------|
+| `fp8_dequant(registry, input, scale, dtype, queue)` | FP8 -> Float16/Float32 역양자화 |
+| `fp8_quant(registry, input, dtype, queue)` | Float16/Float32 -> FP8 양자화 |
+
+**지원 FP8 변형:**
+- `Float8E4M3`: 4-bit 지수, 3-bit 가수 (추론에 최적화, 더 넓은 범위)
+- `Float8E5M2`: 5-bit 지수, 2-bit 가수 (학습 그래디언트에 적합)
+
+### conv.rs -- Conv1d/Conv2d 합성곱
+
+1D 및 2D 합성곱 연산을 제공합니다. Whisper 등 멀티모달 모델의 오디오/이미지 인코더에 사용됩니다.
+
+| 함수 | 설명 |
+|------|------|
+| `conv1d(registry, input, weight, bias, stride, padding, queue)` | 1D 합성곱: input[B,C_in,L] * weight[C_out,C_in,K] -> output[B,C_out,L'] |
+| `conv2d(registry, input, weight, bias, stride, padding, queue)` | 2D 합성곱: input[B,C_in,H,W] * weight[C_out,C_in,kH,kW] -> output[B,C_out,H',W'] |
+
+**지원 dtype:** Float32, Float16
+
+### sdpa.rs — Flash Attention 2 (Fused SDPA)
+
+tiled K/V 처리와 online softmax를 사용한 Flash Attention 2 구현입니다.
+`softmax(Q @ K^T / sqrt(d) + mask) @ V`를 단일 커널로 연산합니다.
+전체 `[N, S]` 스코어 행렬을 디바이스 메모리에 구체화하는 것을 방지하여 메모리 사용량을 O(N^2)에서 O(N)으로 줄입니다.
 
 | 함수 | 설명 |
 |------|------|
 | `sdpa(registry, q, k, v, mask, scale, queue)` | 단일 헤드 fused SDPA: Q[N,D], K[S,D], V[S,D] -> O[N,D] |
 | `sdpa_batched(registry, q_heads, k_heads, v_heads, mask, scale, queue)` | GQA를 지원하는 멀티 헤드 배치 SDPA |
 
-**핵심 최적화:**
+**핵심 최적화 (Flash Attention 2):**
 - 중간 스코어 행렬 구체화 없음 -- 스코어는 threadgroup 공유 메모리에만 존재
 - K 블록 간 running max/normalizer를 사용한 online softmax
+- Tiled Q/K/V 처리로 메모리 효율성 O(N) 달성
 - 어텐션 헤드당 단일 커맨드 버퍼
 - 타일링: Br=32 (쿼리 블록) x Bc=32 (키 블록)
 
 **제약 조건:**
 - head_dim <= 128 (fused 경로); 더 큰 차원은 unfused로 폴백
 - 지원 dtype: Float32, Float16
+
+### formats/gguf.rs -- GGUF 바이너리 포맷 파서
+
+llama.cpp의 GGUF 바이너리 포맷을 파싱합니다. 모델 메타데이터와 텐서를 읽어 RMLX Array로 변환합니다.
+
+| 함수 / 구조체 | 설명 |
+|----------------|------|
+| `GgufFile::open(path)` | GGUF 파일 열기 및 헤더 파싱 |
+| `metadata()` | 모델 메타데이터 (아키텍처, 컨텍스트 길이 등) |
+| `tensor_info()` | 텐서 이름, shape, dtype, 오프셋 목록 |
+| `load_tensor(name, device)` | 텐서를 Array로 로드 |
+
+### quantized.rs -- AWQ/GPTQ 지원
+
+기존 블록 양자화(Q4_0, Q4_1, Q8_0)에 더해 AWQ와 GPTQ 역양자화를 지원합니다.
+
+| 함수 | 설명 |
+|------|------|
+| `quantized_matmul(registry, input, weight, dtype, queue)` | 양자화 행렬 곱 (Q4_0/Q4_1/Q8_0) |
+| `awq_dequant(registry, weight, scales, zeros, group_size, queue)` | AWQ 가중치 역양자화 |
+| `gptq_dequant(registry, weight, scales, zeros, g_idx, bits, queue)` | GPTQ 가중치 역양자화 |
 
 ### ExecMode, CommandBufferHandle, LaunchResult (`ops/mod.rs`)
 

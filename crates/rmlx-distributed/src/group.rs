@@ -350,6 +350,86 @@ impl Group {
         pairwise_all_to_all(data, &self.ranks, self.local_rank, transport)
     }
 
+    // ─── Array-level collective operations ───
+    // These wrap the byte-level collectives with Array semantics,
+    // leveraging Apple Silicon UMA for direct CPU access to Metal buffers.
+
+    /// Array-level all-reduce sum.
+    ///
+    /// On Apple Silicon UMA, Metal buffer contents are CPU-accessible,
+    /// so we extract bytes from the array, perform the ring allreduce,
+    /// and reconstruct the array.
+    ///
+    /// Single-rank groups return the input array unchanged.
+    pub fn allreduce_sum(
+        &self,
+        input: &rmlx_core::array::Array,
+        device: &metal::Device,
+    ) -> Result<rmlx_core::array::Array, DistributedError> {
+        if self.ranks.len() <= 1 {
+            // Identity: return a zero-copy view of the same buffer.
+            return Ok(input.view(
+                input.shape().to_vec(),
+                input.strides().to_vec(),
+                input.offset(),
+            ));
+        }
+
+        // Extract raw bytes from the Metal buffer (UMA: CPU-accessible).
+        let bytes = input.to_bytes();
+
+        // Perform the byte-level ring allreduce.
+        let result_bytes = self.allreduce(bytes)?;
+
+        // Reconstruct the array from the reduced bytes.
+        Ok(rmlx_core::array::Array::from_bytes(
+            device,
+            &result_bytes,
+            input.shape().to_vec(),
+            input.dtype(),
+        ))
+    }
+
+    /// Array-level all-gather.
+    ///
+    /// Gathers arrays from all ranks into a single concatenated array.
+    /// The gathering is along the first dimension (outermost).
+    ///
+    /// Single-rank groups return the input array unchanged.
+    pub fn allgather_array(
+        &self,
+        input: &rmlx_core::array::Array,
+        device: &metal::Device,
+    ) -> Result<rmlx_core::array::Array, DistributedError> {
+        if self.ranks.len() <= 1 {
+            // Identity: return a zero-copy view of the same buffer.
+            return Ok(input.view(
+                input.shape().to_vec(),
+                input.strides().to_vec(),
+                input.offset(),
+            ));
+        }
+
+        // Extract raw bytes from the Metal buffer (UMA: CPU-accessible).
+        let bytes = input.to_bytes();
+
+        // Perform the byte-level ring allgather.
+        let result_bytes = self.allgather(bytes)?;
+
+        // Build the gathered shape: [world_size * dim0, ...rest_dims].
+        let input_shape = input.shape();
+        let mut gathered_shape = input_shape.to_vec();
+        gathered_shape[0] *= self.ranks.len();
+
+        // Reconstruct the array from the gathered bytes.
+        Ok(rmlx_core::array::Array::from_bytes(
+            device,
+            &result_bytes,
+            gathered_shape,
+            input.dtype(),
+        ))
+    }
+
     /// Barrier: block until all ranks in the group have reached this point.
     ///
     /// Uses a ring-based sendrecv pattern: each rank sends a 1-byte token

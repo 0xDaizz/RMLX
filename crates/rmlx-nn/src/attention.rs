@@ -238,6 +238,616 @@ impl LayerKvCache {
     }
 }
 
+// ---------------------------------------------------------------------------
+// RotatingKvCache — circular buffer KV cache with optional keep region
+// ---------------------------------------------------------------------------
+
+/// Circular-buffer KV cache following mlx-lm's rotating cache design.
+///
+/// Tokens are written into a fixed-size ring buffer. When `keep > 0`, the
+/// first `keep` positions are pinned (e.g. for a system prompt) and the
+/// circular region spans `[keep .. max_size)`.
+///
+/// This avoids ever re-allocating or shifting the full history — only the
+/// write pointer advances.
+pub struct RotatingKvCache {
+    /// Pre-allocated K buffers per KV head: [max_size, head_dim]
+    keys: Vec<Array>,
+    /// Pre-allocated V buffers per KV head: [max_size, head_dim]
+    values: Vec<Array>,
+    /// Total tokens processed (monotonically increasing)
+    offset: usize,
+    /// Current circular write position
+    write_idx: usize,
+    /// Maximum buffer size (circular wrap point)
+    max_size: usize,
+    /// Number of tokens at the start to preserve (system prompt)
+    keep: usize,
+    /// Number of KV heads
+    num_kv_heads: usize,
+    /// Head dimension
+    head_dim: usize,
+}
+
+impl RotatingKvCache {
+    /// Create a new rotating KV cache with pre-allocated buffers.
+    ///
+    /// `max_size`: total ring-buffer capacity (including the `keep` region).
+    /// `keep`: number of initial positions that are never overwritten.
+    pub fn new(
+        device: &metal::Device,
+        num_kv_heads: usize,
+        head_dim: usize,
+        max_size: usize,
+        keep: usize,
+        dtype: DType,
+    ) -> Self {
+        assert!(keep < max_size, "keep must be < max_size");
+        let mut keys = Vec::with_capacity(num_kv_heads);
+        let mut values = Vec::with_capacity(num_kv_heads);
+        for _ in 0..num_kv_heads {
+            keys.push(Array::zeros(device, &[max_size, head_dim], dtype));
+            values.push(Array::zeros(device, &[max_size, head_dim], dtype));
+        }
+        Self {
+            keys,
+            values,
+            offset: 0,
+            write_idx: 0,
+            max_size,
+            keep,
+            num_kv_heads,
+            head_dim,
+        }
+    }
+
+    /// Total tokens processed so far (monotonically increasing).
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
+
+    /// Number of valid tokens currently in the buffer.
+    /// This is `min(offset, max_size)` — once the buffer is full, it stays full.
+    pub fn current_len(&self) -> usize {
+        std::cmp::min(self.offset, self.max_size)
+    }
+
+    /// Whether the cache has received any tokens yet.
+    pub fn is_empty(&self) -> bool {
+        self.offset == 0
+    }
+
+    /// Append new K/V tokens into the rotating buffer.
+    ///
+    /// **Single-token decode** (`new_tokens == 1`): writes at `write_idx`,
+    /// then advances `write_idx`. On wrap, skips past the `keep` region.
+    ///
+    /// **Multi-token prefill** (`new_tokens > 1`): if the write would cross
+    /// the wrap boundary, linearizes first via `_temporal_order`, then writes
+    /// contiguously and trims.
+    pub fn append(
+        &mut self,
+        new_keys: Vec<Array>,
+        new_values: Vec<Array>,
+        new_tokens: usize,
+        registry: &KernelRegistry,
+        queue: &metal::CommandQueue,
+    ) -> Result<(), KernelError> {
+        if new_keys.len() != self.num_kv_heads || new_values.len() != self.num_kv_heads {
+            return Err(KernelError::InvalidShape(format!(
+                "RotatingKvCache::append: expected {} kv heads, got keys={}, values={}",
+                self.num_kv_heads,
+                new_keys.len(),
+                new_values.len()
+            )));
+        }
+
+        if new_tokens == 0 {
+            return Ok(());
+        }
+
+        if new_tokens == 1 {
+            // Fast path: single-token decode — write at write_idx
+            self.copy_at_index(&new_keys, &new_values, self.write_idx, 1, registry, queue)?;
+            self.write_idx += 1;
+            if self.write_idx >= self.max_size {
+                self.write_idx = self.keep;
+            }
+        } else {
+            // Multi-token prefill path
+            let end = self.write_idx + new_tokens;
+            if end <= self.max_size {
+                // Fits without wrapping — write contiguously
+                self.copy_at_index(
+                    &new_keys,
+                    &new_values,
+                    self.write_idx,
+                    new_tokens,
+                    registry,
+                    queue,
+                )?;
+                self.write_idx = if end >= self.max_size { self.keep } else { end };
+            } else {
+                // Would wrap — linearize the buffer first, then concat + trim
+                self.linearize_and_append(new_keys, new_values, new_tokens, registry, queue)?;
+            }
+        }
+
+        self.offset += new_tokens;
+        Ok(())
+    }
+
+    /// Compute the temporal ordering indices for the ring buffer.
+    ///
+    /// Returns `(keep, ring_start, ring_end)` where the logical order is:
+    /// `[0..keep] + [write_idx..max_size] + [keep..write_idx]`
+    ///
+    /// `ring_start` is the oldest non-keep position (i.e. `write_idx`),
+    /// and `ring_end` is `write_idx` (the newest written positions wrap here).
+    fn _temporal_order(&self) -> (usize, usize, usize) {
+        // keep region: [0 .. keep] — always in order
+        // oldest ring region: [write_idx .. max_size]
+        // newest ring region: [keep .. write_idx]
+        (self.keep, self.write_idx, self.max_size)
+    }
+
+    /// Linearize the buffer (reorder to temporal order), append new data,
+    /// then trim back to `max_size`.
+    fn linearize_and_append(
+        &mut self,
+        new_keys: Vec<Array>,
+        new_values: Vec<Array>,
+        new_tokens: usize,
+        registry: &KernelRegistry,
+        queue: &metal::CommandQueue,
+    ) -> Result<(), KernelError> {
+        let (keep, ring_start, ring_end) = self._temporal_order();
+        let current_len = self.current_len();
+        let dev = registry.device().raw();
+        let dtype = self.keys[0].dtype();
+
+        for h in 0..self.num_kv_heads {
+            // Build linearized K
+            let linear_k = self.linearize_head(
+                &self.keys[h],
+                keep,
+                ring_start,
+                ring_end,
+                current_len,
+                registry,
+                queue,
+            )?;
+            // Concat with new tokens
+            let combined_k = concat_seq_dim(registry, &linear_k, &new_keys[h], queue)?;
+            // Trim to max_size (keep the most recent tokens)
+            let total = combined_k.shape()[0];
+            let trimmed_k = if total > self.max_size {
+                self.trim_to_max(&combined_k, total)
+            } else {
+                combined_k
+            };
+            // Write back into pre-allocated buffer
+            let new_buf = Array::zeros(dev, &[self.max_size, self.head_dim], dtype);
+            let filled = trimmed_k.shape()[0];
+            self.copy_into_buffer(&new_buf, &trimmed_k, 0, filled, registry, queue)?;
+            self.keys[h] = new_buf;
+
+            // Build linearized V
+            let linear_v = self.linearize_head(
+                &self.values[h],
+                keep,
+                ring_start,
+                ring_end,
+                current_len,
+                registry,
+                queue,
+            )?;
+            let combined_v = concat_seq_dim(registry, &linear_v, &new_values[h], queue)?;
+            let total = combined_v.shape()[0];
+            let trimmed_v = if total > self.max_size {
+                self.trim_to_max(&combined_v, total)
+            } else {
+                combined_v
+            };
+            let new_buf = Array::zeros(dev, &[self.max_size, self.head_dim], dtype);
+            let filled = trimmed_v.shape()[0];
+            self.copy_into_buffer(&new_buf, &trimmed_v, 0, filled, registry, queue)?;
+            self.values[h] = new_buf;
+        }
+
+        // After linearize+append+trim, buffer is in order — write_idx is at the filled point
+        let total_after = current_len + new_tokens;
+        if total_after >= self.max_size {
+            // Buffer is full after this operation; write_idx wraps to keep
+            self.write_idx = self.keep;
+        } else {
+            self.write_idx = total_after;
+        }
+
+        Ok(())
+    }
+
+    /// Reorder a single head buffer into temporal order.
+    #[allow(clippy::too_many_arguments)]
+    fn linearize_head(
+        &self,
+        buf: &Array,
+        keep: usize,
+        ring_start: usize,
+        ring_end: usize,
+        current_len: usize,
+        registry: &KernelRegistry,
+        queue: &metal::CommandQueue,
+    ) -> Result<Array, KernelError> {
+        let dev = registry.device().raw();
+        let dtype = buf.dtype();
+        let elem_size = dtype.size_of();
+
+        if current_len <= keep || ring_start == keep {
+            // No ring region occupied, or write pointer hasn't wrapped yet —
+            // the buffer is already in temporal order. Return a view of the valid portion.
+            let result = Array::zeros(dev, &[current_len, self.head_dim], dtype);
+            if current_len > 0 {
+                self.copy_into_buffer(&result, buf, 0, current_len, registry, queue)?;
+            }
+            return Ok(result);
+        }
+
+        // Temporal order: [0..keep] + [ring_start..ring_end] + [keep..ring_start]
+        let part1_len = keep;
+        let part2_len = ring_end - ring_start;
+        let part3_len = ring_start - keep;
+        let total = part1_len + part2_len + part3_len;
+        let result = Array::zeros(dev, &[total, self.head_dim], dtype);
+
+        let copy_kernel = match dtype {
+            DType::Float32 => "copy_f32",
+            DType::Float16 => "copy_f16",
+            DType::Bfloat16 => "copy_bf16",
+            other => {
+                return Err(KernelError::InvalidShape(format!(
+                    "RotatingKvCache: unsupported dtype {:?}",
+                    other
+                )));
+            }
+        };
+        let pipeline = registry.get_pipeline(copy_kernel, dtype)?;
+        let cb = queue.new_command_buffer();
+
+        // Part 1: keep region [0..keep]
+        if part1_len > 0 {
+            let count = (part1_len * self.head_dim) as u64;
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&pipeline);
+            enc.set_buffer(0, Some(buf.metal_buffer()), buf.offset() as u64);
+            enc.set_buffer(1, Some(result.metal_buffer()), result.offset() as u64);
+            let grid = metal::MTLSize::new(count, 1, 1);
+            let tg = metal::MTLSize::new(
+                std::cmp::min(pipeline.max_total_threads_per_threadgroup(), count),
+                1,
+                1,
+            );
+            enc.dispatch_threads(grid, tg);
+            enc.end_encoding();
+        }
+
+        // Part 2: oldest ring portion [ring_start..ring_end]
+        if part2_len > 0 {
+            let count = (part2_len * self.head_dim) as u64;
+            let src_off = (buf.offset() + ring_start * self.head_dim * elem_size) as u64;
+            let dst_off = (result.offset() + part1_len * self.head_dim * elem_size) as u64;
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&pipeline);
+            enc.set_buffer(0, Some(buf.metal_buffer()), src_off);
+            enc.set_buffer(1, Some(result.metal_buffer()), dst_off);
+            let grid = metal::MTLSize::new(count, 1, 1);
+            let tg = metal::MTLSize::new(
+                std::cmp::min(pipeline.max_total_threads_per_threadgroup(), count),
+                1,
+                1,
+            );
+            enc.dispatch_threads(grid, tg);
+            enc.end_encoding();
+        }
+
+        // Part 3: newest ring portion [keep..ring_start]
+        if part3_len > 0 {
+            let count = (part3_len * self.head_dim) as u64;
+            let src_off = (buf.offset() + keep * self.head_dim * elem_size) as u64;
+            let dst_off =
+                (result.offset() + (part1_len + part2_len) * self.head_dim * elem_size) as u64;
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&pipeline);
+            enc.set_buffer(0, Some(buf.metal_buffer()), src_off);
+            enc.set_buffer(1, Some(result.metal_buffer()), dst_off);
+            let grid = metal::MTLSize::new(count, 1, 1);
+            let tg = metal::MTLSize::new(
+                std::cmp::min(pipeline.max_total_threads_per_threadgroup(), count),
+                1,
+                1,
+            );
+            enc.dispatch_threads(grid, tg);
+            enc.end_encoding();
+        }
+
+        cb.commit();
+        cb.wait_until_completed();
+        Ok(result)
+    }
+
+    /// Return a view of the first `max_size` rows from `arr` whose total
+    /// length is `total` (trims the oldest non-keep tokens).
+    fn trim_to_max(&self, arr: &Array, total: usize) -> Array {
+        // Keep the *last* max_size tokens (most recent)
+        let skip = total - self.max_size;
+        let elem_size = arr.dtype().size_of();
+        let new_offset = arr.offset() + skip * self.head_dim * elem_size;
+        arr.view(
+            vec![self.max_size, self.head_dim],
+            arr.strides().to_vec(),
+            new_offset,
+        )
+    }
+
+    /// Copy `count` rows from `src` into `dst` starting at row `dst_row`.
+    fn copy_into_buffer(
+        &self,
+        dst: &Array,
+        src: &Array,
+        dst_row: usize,
+        count: usize,
+        registry: &KernelRegistry,
+        queue: &metal::CommandQueue,
+    ) -> Result<(), KernelError> {
+        if count == 0 {
+            return Ok(());
+        }
+        let elem_size = dst.dtype().size_of();
+        let copy_kernel = match dst.dtype() {
+            DType::Float32 => "copy_f32",
+            DType::Float16 => "copy_f16",
+            DType::Bfloat16 => "copy_bf16",
+            other => {
+                return Err(KernelError::InvalidShape(format!(
+                    "RotatingKvCache: unsupported dtype {:?}",
+                    other
+                )));
+            }
+        };
+        let pipeline = registry.get_pipeline(copy_kernel, dst.dtype())?;
+        let num_elems = (count * self.head_dim) as u64;
+        let cb = queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(src.metal_buffer()), src.offset() as u64);
+        enc.set_buffer(
+            1,
+            Some(dst.metal_buffer()),
+            (dst.offset() + dst_row * self.head_dim * elem_size) as u64,
+        );
+        let grid = metal::MTLSize::new(num_elems, 1, 1);
+        let tg = metal::MTLSize::new(
+            std::cmp::min(pipeline.max_total_threads_per_threadgroup(), num_elems),
+            1,
+            1,
+        );
+        enc.dispatch_threads(grid, tg);
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        Ok(())
+    }
+
+    /// Copy `new_tokens` rows from each head's new K/V into the buffer at `dst_row`.
+    fn copy_at_index(
+        &self,
+        new_keys: &[Array],
+        new_values: &[Array],
+        dst_row: usize,
+        new_tokens: usize,
+        registry: &KernelRegistry,
+        queue: &metal::CommandQueue,
+    ) -> Result<(), KernelError> {
+        let elem_size = self.keys[0].dtype().size_of();
+        let copy_kernel = match self.keys[0].dtype() {
+            DType::Float32 => "copy_f32",
+            DType::Float16 => "copy_f16",
+            DType::Bfloat16 => "copy_bf16",
+            other => {
+                return Err(KernelError::InvalidShape(format!(
+                    "RotatingKvCache: unsupported dtype {:?}",
+                    other
+                )));
+            }
+        };
+        let pipeline = registry.get_pipeline(copy_kernel, self.keys[0].dtype())?;
+        let count = (new_tokens * self.head_dim) as u64;
+        if count == 0 {
+            return Ok(());
+        }
+
+        let cb = queue.new_command_buffer();
+        let dst_byte_offset = dst_row * self.head_dim * elem_size;
+
+        for i in 0..self.num_kv_heads {
+            // Keys
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&pipeline);
+            enc.set_buffer(
+                0,
+                Some(new_keys[i].metal_buffer()),
+                new_keys[i].offset() as u64,
+            );
+            enc.set_buffer(
+                1,
+                Some(self.keys[i].metal_buffer()),
+                (self.keys[i].offset() + dst_byte_offset) as u64,
+            );
+            let grid = metal::MTLSize::new(count, 1, 1);
+            let tg = metal::MTLSize::new(
+                std::cmp::min(pipeline.max_total_threads_per_threadgroup(), count),
+                1,
+                1,
+            );
+            enc.dispatch_threads(grid, tg);
+            enc.end_encoding();
+
+            // Values
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&pipeline);
+            enc.set_buffer(
+                0,
+                Some(new_values[i].metal_buffer()),
+                new_values[i].offset() as u64,
+            );
+            enc.set_buffer(
+                1,
+                Some(self.values[i].metal_buffer()),
+                (self.values[i].offset() + dst_byte_offset) as u64,
+            );
+            enc.dispatch_threads(grid, tg);
+            enc.end_encoding();
+        }
+
+        cb.commit();
+        cb.wait_until_completed();
+        Ok(())
+    }
+
+    /// Get a view of cached keys for a specific KV head.
+    ///
+    /// Returns shape `[current_len, head_dim]`. Note: when the buffer has
+    /// wrapped, the returned view is in *physical* order (not temporal).
+    /// Callers that need temporal order should use RoPE position IDs that
+    /// account for the rotation.
+    pub fn cached_keys(&self, head: usize) -> Array {
+        let len = self.current_len();
+        let a = &self.keys[head];
+        a.view(vec![len, self.head_dim], a.strides().to_vec(), a.offset())
+    }
+
+    /// Get a view of cached values for a specific KV head.
+    ///
+    /// Returns shape `[current_len, head_dim]`.
+    pub fn cached_values(&self, head: usize) -> Array {
+        let len = self.current_len();
+        let a = &self.values[head];
+        a.view(vec![len, self.head_dim], a.strides().to_vec(), a.offset())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BatchKvCache — per-sequence caches for batched decoding
+// ---------------------------------------------------------------------------
+
+/// Batched KV cache that holds one `LayerKvCache` per sequence in a batch.
+///
+/// Useful for serving multiple independent sequences simultaneously with
+/// per-sequence offsets and the ability to filter / reorder the batch.
+pub struct BatchKvCache {
+    /// Per-sequence caches.
+    caches: Vec<LayerKvCache>,
+    /// Per-sequence token offset (total tokens processed).
+    offsets: Vec<usize>,
+    /// Number of sequences in the batch.
+    batch_size: usize,
+}
+
+impl BatchKvCache {
+    /// Create a new batch of pre-allocated KV caches.
+    pub fn new(
+        batch_size: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        dtype: DType,
+        device: &metal::Device,
+    ) -> Self {
+        let mut caches = Vec::with_capacity(batch_size);
+        let offsets = vec![0usize; batch_size];
+        for _ in 0..batch_size {
+            caches.push(LayerKvCache::preallocated(
+                device,
+                num_kv_heads,
+                head_dim,
+                max_seq_len,
+                dtype,
+            ));
+        }
+        Self {
+            caches,
+            offsets,
+            batch_size,
+        }
+    }
+
+    /// Number of sequences in the batch.
+    pub fn batch_size(&self) -> usize {
+        self.batch_size
+    }
+
+    /// Get an immutable reference to the cache for sequence `batch_idx`.
+    pub fn get(&self, batch_idx: usize) -> &LayerKvCache {
+        &self.caches[batch_idx]
+    }
+
+    /// Get a mutable reference to the cache for sequence `batch_idx`.
+    pub fn get_mut(&mut self, batch_idx: usize) -> &mut LayerKvCache {
+        &mut self.caches[batch_idx]
+    }
+
+    /// Reset a specific sequence's cache, re-allocating fresh buffers.
+    pub fn reset(
+        &mut self,
+        batch_idx: usize,
+        device: &metal::Device,
+        num_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        dtype: DType,
+    ) {
+        self.caches[batch_idx] =
+            LayerKvCache::preallocated(device, num_kv_heads, head_dim, max_seq_len, dtype);
+        self.offsets[batch_idx] = 0;
+    }
+
+    /// Keep only the sequences at the given `indices`, reordering accordingly.
+    ///
+    /// After this call, `batch_size` equals `indices.len()`.
+    pub fn filter(&mut self, indices: &[usize]) {
+        let new_caches: Vec<LayerKvCache> = indices
+            .iter()
+            .map(|&idx| {
+                // Move the cache out, replacing with an empty placeholder
+                let mut placeholder = LayerKvCache::new(self.caches[idx].num_kv_heads());
+                std::mem::swap(&mut placeholder, &mut self.caches[idx]);
+                placeholder
+            })
+            .collect();
+        let new_offsets: Vec<usize> = indices.iter().map(|&idx| self.offsets[idx]).collect();
+        self.batch_size = indices.len();
+        self.caches = new_caches;
+        self.offsets = new_offsets;
+    }
+
+    /// Append caches from another `BatchKvCache`, growing the batch.
+    pub fn extend(&mut self, mut other: BatchKvCache) {
+        self.caches.append(&mut other.caches);
+        self.offsets.append(&mut other.offsets);
+        self.batch_size += other.batch_size;
+    }
+
+    /// Per-sequence offsets (total tokens processed per sequence).
+    pub fn offsets(&self) -> &[usize] {
+        &self.offsets
+    }
+
+    /// Maximum offset across all sequences.
+    pub fn max_offset(&self) -> usize {
+        self.offsets.iter().copied().max().unwrap_or(0)
+    }
+}
+
 /// Concatenate two 2D arrays along dimension 0 (seq dimension).
 /// `a`: [seq_a, dim], `b`: [seq_b, dim] -> [seq_a + seq_b, dim]
 fn concat_seq_dim(
@@ -531,12 +1141,15 @@ impl Attention {
         // Scaled dot-product attention per query head
         let scale = 1.0 / (head_dim as f32).sqrt();
 
-        // Try fused SDPA path (Flash Attention style — no intermediate score matrix)
-        let attn_outputs = if head_dim <= 128 {
-            // Fused path: single kernel per head, Q@K^T + scale + mask + softmax + @V
-            ops::sdpa::sdpa_batched(registry, &q_heads, &k_final, &v_final, mask, scale, queue)?
+        // Try fused SDPA path (Flash Attention 2 — no intermediate score matrix)
+        let attn_outputs = if head_dim <= 256 {
+            // Fused FA2 path: single kernel per head, supports D up to 256
+            // Q@K^T + scale + mask + softmax + @V with online softmax
+            ops::sdpa::sdpa_batched(
+                registry, &q_heads, &k_final, &v_final, mask, scale, false, queue,
+            )?
         } else {
-            // Unfused fallback for very large head dims
+            // Unfused fallback for head dims > 256
             let mut outputs: Vec<Array> = Vec::with_capacity(num_heads);
             for (h, q_h) in q_heads.iter().enumerate() {
                 let kv_idx = h / repeats;
@@ -628,6 +1241,406 @@ impl Attention {
     pub fn config(&self) -> &AttentionConfig {
         &self.config
     }
+}
+
+// ---------------------------------------------------------------------------
+// QuantizedKvCache — memory-efficient KV cache using affine quantization
+// ---------------------------------------------------------------------------
+
+/// A quantized array stored as (packed_uint32, scales, biases) tuple.
+/// Uses the same MLX affine format as QuantizedWeight but for cache data.
+pub struct QuantizedArray {
+    /// Packed uint32 data — each uint32 holds `32 / bits` quantized values.
+    pub packed: Array,
+    /// Per-group scale factors (f32).
+    pub scales: Array,
+    /// Per-group bias terms (f32).
+    pub biases: Array,
+    /// Number of elements per quantization group.
+    pub group_size: u32,
+    /// Bit width of each quantized value (4 or 8).
+    pub bits: u32,
+}
+
+/// KV cache that stores keys and values in quantized format.
+///
+/// Each layer's KV heads are quantized to reduce memory consumption.
+/// On attention computation, quantized matmul is used directly without
+/// explicit dequantization.
+///
+/// Memory savings: 128 head_dim, 32 KV heads, 8192 seq ->
+///   f16: 128MB, q8: 64MB, q4: 32MB
+pub struct QuantizedKvCache {
+    /// Per-layer, per-head quantized key cache: `[num_layers][num_kv_heads]`
+    keys: Vec<Vec<QuantizedArray>>,
+    /// Per-layer, per-head quantized value cache: `[num_layers][num_kv_heads]`
+    values: Vec<Vec<QuantizedArray>>,
+    /// Per-layer unquantized key accumulator (f32): `[num_layers][num_kv_heads]`
+    /// Stores the full-precision concatenation so we can re-quantize after append.
+    keys_full: Vec<Vec<Vec<f32>>>,
+    /// Per-layer unquantized value accumulator (f32): `[num_layers][num_kv_heads]`
+    values_full: Vec<Vec<Vec<f32>>>,
+    /// Offset per layer (number of tokens cached).
+    offsets: Vec<usize>,
+    /// Number of KV heads.
+    num_kv_heads: usize,
+    /// Head dimension.
+    head_dim: usize,
+    /// Quantization group size (default 64).
+    group_size: u32,
+    /// Quantization bit width (4 or 8).
+    bits: u32,
+}
+
+impl QuantizedKvCache {
+    /// Create a new empty quantized KV cache.
+    pub fn new(
+        num_layers: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        group_size: u32,
+        bits: u32,
+    ) -> Self {
+        assert!(
+            bits == 4 || bits == 8,
+            "QuantizedKvCache: bits must be 4 or 8, got {bits}"
+        );
+        assert!(
+            group_size > 0 && (head_dim % group_size as usize == 0),
+            "QuantizedKvCache: head_dim ({head_dim}) must be divisible by group_size ({group_size})"
+        );
+
+        let mut keys = Vec::with_capacity(num_layers);
+        let mut values = Vec::with_capacity(num_layers);
+        let mut keys_full = Vec::with_capacity(num_layers);
+        let mut values_full = Vec::with_capacity(num_layers);
+        let offsets = vec![0usize; num_layers];
+        for _ in 0..num_layers {
+            keys.push(Vec::with_capacity(num_kv_heads));
+            values.push(Vec::with_capacity(num_kv_heads));
+            let mut kf = Vec::with_capacity(num_kv_heads);
+            let mut vf = Vec::with_capacity(num_kv_heads);
+            for _ in 0..num_kv_heads {
+                kf.push(Vec::new());
+                vf.push(Vec::new());
+            }
+            keys_full.push(kf);
+            values_full.push(vf);
+        }
+
+        Self {
+            keys,
+            values,
+            keys_full,
+            values_full,
+            offsets,
+            num_kv_heads,
+            head_dim,
+            group_size,
+            bits,
+        }
+    }
+
+    /// Number of cached tokens for a given layer.
+    pub fn offset(&self, layer: usize) -> usize {
+        self.offsets[layer]
+    }
+
+    /// Whether the cache is empty for a given layer.
+    pub fn is_empty(&self, layer: usize) -> bool {
+        self.offsets[layer] == 0
+    }
+
+    /// Append new K, V for a layer.
+    ///
+    /// The incoming keys/values are in f16/f32 format.
+    /// They get quantized using the affine format and appended to the cache.
+    ///
+    /// For simplicity: quantize the full (old + new) sequence each time.
+    /// This is acceptable because quantized caches are used for long sequences
+    /// where the quantization overhead is amortized.
+    pub fn append(
+        &mut self,
+        layer: usize,
+        new_keys: Vec<Array>,
+        new_values: Vec<Array>,
+        new_tokens: usize,
+        registry: &KernelRegistry,
+        _queue: &metal::CommandQueue,
+    ) -> Result<(), KernelError> {
+        if new_keys.len() != self.num_kv_heads || new_values.len() != self.num_kv_heads {
+            return Err(KernelError::InvalidShape(format!(
+                "QuantizedKvCache::append: expected {} kv heads, got keys={}, values={}",
+                self.num_kv_heads,
+                new_keys.len(),
+                new_values.len()
+            )));
+        }
+
+        let dev = registry.device().raw();
+
+        // Extend the full-precision accumulators with the new data, then re-quantize.
+        for h in 0..self.num_kv_heads {
+            // Read new key data as f32
+            let new_k_f32 = read_array_as_f32(&new_keys[h]);
+            self.keys_full[layer][h].extend_from_slice(&new_k_f32);
+
+            // Read new value data as f32
+            let new_v_f32 = read_array_as_f32(&new_values[h]);
+            self.values_full[layer][h].extend_from_slice(&new_v_f32);
+        }
+
+        self.offsets[layer] += new_tokens;
+        let total_seq = self.offsets[layer];
+
+        // Re-quantize all heads for this layer
+        let mut new_qk = Vec::with_capacity(self.num_kv_heads);
+        let mut new_qv = Vec::with_capacity(self.num_kv_heads);
+        for h in 0..self.num_kv_heads {
+            let k_arr = Array::from_slice(
+                dev,
+                &self.keys_full[layer][h],
+                vec![total_seq, self.head_dim],
+            );
+            new_qk.push(quantize_to_affine(&k_arr, self.group_size, self.bits, dev)?);
+
+            let v_arr = Array::from_slice(
+                dev,
+                &self.values_full[layer][h],
+                vec![total_seq, self.head_dim],
+            );
+            new_qv.push(quantize_to_affine(&v_arr, self.group_size, self.bits, dev)?);
+        }
+
+        self.keys[layer] = new_qk;
+        self.values[layer] = new_qv;
+
+        Ok(())
+    }
+
+    /// Get the quantized keys for a specific layer and head.
+    pub fn quantized_keys(&self, layer: usize, head: usize) -> &QuantizedArray {
+        &self.keys[layer][head]
+    }
+
+    /// Get the quantized values for a specific layer and head.
+    pub fn quantized_values(&self, layer: usize, head: usize) -> &QuantizedArray {
+        &self.values[layer][head]
+    }
+
+    /// Number of KV heads.
+    pub fn num_kv_heads(&self) -> usize {
+        self.num_kv_heads
+    }
+
+    /// Head dimension.
+    pub fn head_dim(&self) -> usize {
+        self.head_dim
+    }
+
+    /// Quantization bit width.
+    pub fn bits(&self) -> u32 {
+        self.bits
+    }
+
+    /// Quantization group size.
+    pub fn group_size(&self) -> u32 {
+        self.group_size
+    }
+}
+
+/// Read an Array's data as f32 values, handling f16 -> f32 conversion.
+///
+/// Supports Float32 (direct read) and Float16 (manual IEEE 754 conversion).
+fn read_array_as_f32(arr: &Array) -> Vec<f32> {
+    match arr.dtype() {
+        DType::Float32 => arr.to_vec_checked::<f32>(),
+        DType::Float16 => {
+            // Float16 is stored as 2 bytes per element. We read raw bytes
+            // and convert each u16 bit-pattern to f32 using IEEE 754 rules.
+            let bytes = arr.to_bytes();
+            let numel = arr.numel();
+            let mut result = Vec::with_capacity(numel);
+            for i in 0..numel {
+                let lo = bytes[i * 2] as u16;
+                let hi = bytes[i * 2 + 1] as u16;
+                let bits = lo | (hi << 8);
+                result.push(f16_to_f32(bits));
+            }
+            result
+        }
+        DType::Bfloat16 => {
+            // BFloat16: 1 sign, 8 exponent, 7 mantissa — same exponent as f32.
+            // Convert by shifting the 16-bit pattern left by 16.
+            let bytes = arr.to_bytes();
+            let numel = arr.numel();
+            let mut result = Vec::with_capacity(numel);
+            for i in 0..numel {
+                let lo = bytes[i * 2] as u16;
+                let hi = bytes[i * 2 + 1] as u16;
+                let bits = lo | (hi << 8);
+                result.push(bf16_to_f32(bits));
+            }
+            result
+        }
+        other => panic!(
+            "read_array_as_f32: unsupported dtype {:?}; expected Float32, Float16, or Bfloat16",
+            other
+        ),
+    }
+}
+
+/// Convert an IEEE 754 half-precision (f16) bit pattern to f32.
+fn f16_to_f32(h: u16) -> f32 {
+    let sign = ((h >> 15) & 1) as u32;
+    let exp = ((h >> 10) & 0x1F) as u32;
+    let mant = (h & 0x3FF) as u32;
+
+    if exp == 0 {
+        if mant == 0 {
+            // +/- zero
+            f32::from_bits(sign << 31)
+        } else {
+            // Subnormal f16 -> normalized f32
+            // value = (-1)^sign * 2^(-14) * (mant / 1024)
+            let val = (mant as f32) / 1024.0 * (2.0f32).powi(-14);
+            if sign == 1 {
+                -val
+            } else {
+                val
+            }
+        }
+    } else if exp == 31 {
+        // Inf or NaN
+        if mant == 0 {
+            f32::from_bits((sign << 31) | 0x7F800000)
+        } else {
+            // NaN: preserve some mantissa bits
+            f32::from_bits((sign << 31) | 0x7F800000 | (mant << 13))
+        }
+    } else {
+        // Normalized: rebias exponent from 15-bias to 127-bias
+        let f32_exp = exp + 127 - 15;
+        let f32_mant = mant << 13;
+        f32::from_bits((sign << 31) | (f32_exp << 23) | f32_mant)
+    }
+}
+
+/// Convert a BFloat16 bit pattern to f32.
+fn bf16_to_f32(b: u16) -> f32 {
+    f32::from_bits((b as u32) << 16)
+}
+
+/// Quantize a 2D array [seq_len, dim] into MLX affine format.
+///
+/// Computes per-group min/max, derives scale and bias, and packs
+/// values into uint32.
+///
+/// This is a CPU-side quantization for simplicity. GPU quantization kernel
+/// can be added later.
+fn quantize_to_affine(
+    input: &Array,
+    group_size: u32,
+    bits: u32,
+    device: &metal::Device,
+) -> Result<QuantizedArray, KernelError> {
+    let shape = input.shape();
+    if shape.len() != 2 {
+        return Err(KernelError::InvalidShape(format!(
+            "quantize_to_affine: expected 2D input, got {:?}",
+            shape
+        )));
+    }
+    let seq_len = shape[0];
+    let dim = shape[1];
+    let total_elems = seq_len * dim;
+    let gs = group_size as usize;
+
+    if total_elems == 0 {
+        // Empty input: return empty quantized arrays
+        return Ok(QuantizedArray {
+            packed: Array::from_slice(device, &[0u32; 0], vec![0]),
+            scales: Array::from_slice(device, &[0.0f32; 0], vec![0]),
+            biases: Array::from_slice(device, &[0.0f32; 0], vec![0]),
+            group_size,
+            bits,
+        });
+    }
+
+    // Pad total elements to be a multiple of group_size
+    let padded_elems = if total_elems % gs != 0 {
+        ((total_elems / gs) + 1) * gs
+    } else {
+        total_elems
+    };
+
+    // Read input as f32
+    let data = read_array_as_f32(input);
+
+    // Pad with zeros if necessary
+    let mut padded = data;
+    if padded.len() < padded_elems {
+        padded.resize(padded_elems, 0.0);
+    }
+
+    let num_groups = padded_elems / gs;
+    let max_q = ((1u32 << bits) - 1) as f32;
+    let elems_per_u32 = 32 / bits as usize;
+
+    let mut scales_vec = Vec::with_capacity(num_groups);
+    let mut biases_vec = Vec::with_capacity(num_groups);
+    let mut packed_vec = Vec::with_capacity(padded_elems / elems_per_u32);
+
+    for g in 0..num_groups {
+        let start = g * gs;
+        let end = start + gs;
+        let group = &padded[start..end];
+
+        // Find min and max
+        let mut min_val = f32::INFINITY;
+        let mut max_val = f32::NEG_INFINITY;
+        for &v in group {
+            if v < min_val {
+                min_val = v;
+            }
+            if v > max_val {
+                max_val = v;
+            }
+        }
+
+        let range = max_val - min_val;
+        let scale = if range == 0.0 { 1.0 } else { range / max_q };
+        let bias = min_val;
+
+        scales_vec.push(scale);
+        biases_vec.push(bias);
+
+        // Quantize and pack
+        // We accumulate `elems_per_u32` quantized values into each u32 word
+        let inv_scale = if range == 0.0 { 0.0 } else { 1.0 / scale };
+        for chunk_start in (0..gs).step_by(elems_per_u32) {
+            let mut word: u32 = 0;
+            for k in 0..elems_per_u32 {
+                let idx = chunk_start + k;
+                let val = if idx < gs { group[idx] } else { 0.0 };
+                let q = ((val - bias) * inv_scale).round().clamp(0.0, max_q) as u32;
+                word |= q << (k as u32 * bits);
+            }
+            packed_vec.push(word);
+        }
+    }
+
+    let packed = Array::from_slice(device, &packed_vec, vec![packed_vec.len()]);
+    let scales = Array::from_slice(device, &scales_vec, vec![num_groups]);
+    let biases = Array::from_slice(device, &biases_vec, vec![num_groups]);
+
+    Ok(QuantizedArray {
+        packed,
+        scales,
+        biases,
+        group_size,
+        bits,
+    })
 }
 
 /// Scale attention scores by a scalar factor.

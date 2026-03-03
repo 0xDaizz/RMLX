@@ -1,6 +1,6 @@
 # Architecture Overview
 
-RMLX is a layered architecture composed of four layers. All Phases (0 through 9B-opt) have been completed and the system is fully implemented. Each layer has clear responsibility boundaries and is separated into individual Cargo crates. Phase 7 additions include VJP autodiff, LoRA fine-tuning, and production hardening (structured logging, metrics, precision guard, graceful shutdown). Phase 9 additions include ExecGraph (5 CBs/layer, 92.3% reduction), CommandBatcher, Indirect Command Buffers, and weight pre-caching for 16.15x speedup.
+RMLX is a layered architecture composed of four layers. All Phases (0 through 9B-opt) have been completed and the system is fully implemented. Each layer has clear responsibility boundaries and is separated into individual Cargo crates. Phase 7 additions include VJP autodiff, LoRA fine-tuning, and production hardening (structured logging, metrics, precision guard, graceful shutdown). Phase 9 additions include ExecGraph (5 CBs/layer, 92.3% reduction), CommandBatcher, Indirect Command Buffers, and weight pre-caching for 16.15x speedup. Serving support phases (S1-S5) add Flash Attention 2, GELU, FP8/GGUF/AWQ/GPTQ, KV cache variants, Conv1d/Conv2d, and dynamic shapes.
 
 ---
 
@@ -11,9 +11,9 @@ RMLX is a layered architecture composed of four layers. All Phases (0 through 9B
 │  ~/rmlx/ (this repository — ML framework)                                  │
 │                        rmlx-core (compute engine)                          │
 │  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │                      Compute Graph / Op Registry (14 op modules)     │   │
+│  │                      Compute Graph / Op Registry (18 op modules)     │   │
 │  │  matmul · softmax · rms_norm · rope · quantized_matmul · moe_gate   │   │
-│  │  sdpa · silu · binary · reduce · copy · indexing · ...              │   │
+│  │  sdpa · silu · gelu · fp8 · conv · binary · reduce · copy · indexing · ...  │   │
 │  └──────────────────────────────┬───────────────────────────────────────┘   │
 │                                 │                                          │
 │  ┌──────────────────────────────┼───────────────────────────────────────┐   │
@@ -73,7 +73,7 @@ The core engine responsible for computation graphs and kernel dispatch.
 
 | Component | Role |
 |-----------|------|
-| **Op Registry** | Registers 14 op modules including matmul, softmax, rms_norm, rope, quantized_matmul, moe_gate, sdpa, silu |
+| **Op Registry** | Registers 18 op modules including matmul, softmax, rms_norm, rope, quantized_matmul, moe_gate, sdpa, silu, gelu, fp8, conv1d, conv2d |
 | **Compute Graph** | Selective tracing-based computation graph (eager-first, tracing during prefill) |
 | **Kernel Dispatch** | Maps ops to Metal kernels and executes them, selecting optimal kernels based on dtype/shape |
 

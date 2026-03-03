@@ -1,7 +1,10 @@
 //! GPU kernel operations for RMLX arrays.
 
 pub mod binary;
+pub mod conv;
 pub mod copy;
+pub mod fp8;
+pub mod gelu;
 pub mod gemv;
 pub mod indexing;
 pub mod matmul;
@@ -43,6 +46,7 @@ pub(crate) fn make_contiguous(
 pub fn register_all(registry: &KernelRegistry) -> Result<(), KernelError> {
     copy::register(registry)?;
     binary::register(registry)?;
+    conv::register(registry)?;
     reduce::register(registry)?;
     rms_norm::register(registry)?;
     softmax::register(registry)?;
@@ -52,7 +56,9 @@ pub fn register_all(registry: &KernelRegistry) -> Result<(), KernelError> {
     quantized::register(registry)?;
     indexing::register(registry)?;
     silu::register(registry)?;
+    gelu::register(registry)?;
     sdpa::register(registry)?;
+    fp8::register(registry)?;
     Ok(())
 }
 

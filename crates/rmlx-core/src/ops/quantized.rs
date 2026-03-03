@@ -364,6 +364,94 @@ kernel void affine_qmv_q4(
         }
     }
 }
+
+// -----------------------------------------------------------------------
+// AWQ dequantization: INT4 packed in uint32 (8 nibbles per uint32).
+//
+// AWQ packs along the output (column) dimension:
+//   qweight: [rows, cols/8] as uint32
+//   qzeros:  [num_groups, cols/8] as uint32
+//   scales:  [num_groups, cols] as float
+//
+// Dequant: w = (nibble(qweight, col%8) - nibble(qzeros, col%8)) * scales[group, col]
+// -----------------------------------------------------------------------
+kernel void awq_dequant_f32(
+    device const uint32_t* qweight    [[buffer(0)]],  // [rows, cols/8]
+    device const uint32_t* qzeros     [[buffer(1)]],  // [num_groups, cols/8]
+    device const float*    scales     [[buffer(2)]],  // [num_groups, cols]
+    device float*          output     [[buffer(3)]],  // [rows, cols] dequantized
+    constant uint4&        params     [[buffer(4)]],  // (rows, cols, group_size, num_groups)
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint row = gid.y;
+    uint col = gid.x;
+    uint rows = params.x;
+    uint cols = params.y;
+    uint group_size = params.z;
+
+    if (row >= rows || col >= cols) return;
+
+    uint group = row / group_size;
+    uint pack_idx = col / 8;
+    uint pack_off = col % 8;
+
+    uint qw = qweight[row * (cols / 8) + pack_idx];
+    uint nibble = (qw >> (pack_off * 4)) & 0xF;
+
+    uint qz = qzeros[group * (cols / 8) + pack_idx];
+    uint zero = (qz >> (pack_off * 4)) & 0xF;
+
+    float scale = scales[group * cols + col];
+    output[row * cols + col] = scale * (float(nibble) - float(zero));
+}
+
+// -----------------------------------------------------------------------
+// GPTQ dequantization: INT4 packed in uint32 (8 nibbles per uint32).
+//
+// GPTQ packs along the input (row) dimension:
+//   qweight: [in_features/8, out_features] as uint32
+//   qzeros:  [num_groups, out_features/8] as uint32
+//   scales:  [num_groups, out_features] as float
+//   g_idx:   [in_features] as int32 (optional group index permutation)
+//
+// Dequant: w = (nibble(qweight, row%8) - (nibble(qzeros, col%8) + 1)) * scales[group, col]
+// Note: GPTQ uses zero+1 offset compared to AWQ.
+// -----------------------------------------------------------------------
+kernel void gptq_dequant_f32(
+    device const uint32_t* qweight    [[buffer(0)]],  // [in_features/8, out_features]
+    device const uint32_t* qzeros     [[buffer(1)]],  // [num_groups, out_features/8]
+    device const float*    scales     [[buffer(2)]],  // [num_groups, out_features]
+    device const int32_t*  g_idx      [[buffer(3)]],  // [in_features] or dummy
+    device float*          output     [[buffer(4)]],  // [in_features, out_features]
+    constant uint4&        params     [[buffer(5)]],  // (in_features, out_features, group_size, has_g_idx)
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint row = gid.y;    // in_features dimension
+    uint col = gid.x;    // out_features dimension
+    uint in_features = params.x;
+    uint out_features = params.y;
+    uint group_size = params.z;
+    uint has_g_idx = params.w;
+
+    if (row >= in_features || col >= out_features) return;
+
+    // GPTQ packs along in_features: qweight[row/8, col]
+    uint pack_row = row / 8;
+    uint pack_off = row % 8;
+
+    uint qw = qweight[pack_row * out_features + col];
+    uint nibble = (qw >> (pack_off * 4)) & 0xF;
+
+    uint group = has_g_idx ? uint(g_idx[row]) : (row / group_size);
+
+    uint zero_pack_idx = col / 8;
+    uint zero_pack_off = col % 8;
+    uint qz = qzeros[group * (out_features / 8) + zero_pack_idx];
+    uint zero = ((qz >> (zero_pack_off * 4)) & 0xF) + 1;  // GPTQ zero+1 offset
+
+    float scale = scales[group * out_features + col];
+    output[row * out_features + col] = scale * (float(nibble) - float(zero));
+}
 "#;
 
 // ---------------------------------------------------------------------------
@@ -466,6 +554,296 @@ pub fn affine_quantized_matmul(
         metal::MTLSize::new(qw.out_features as u64, 1, 1),
         metal::MTLSize::new(tg, 1, 1),
     );
+    enc.end_encoding();
+    cb.commit();
+    cb.wait_until_completed();
+
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// AWQ dequantization
+// ---------------------------------------------------------------------------
+
+/// Dequantize AWQ-packed INT4 weights to f32.
+///
+/// AWQ packs 8 INT4 values per uint32 in the column dimension.
+/// This function produces a full f32 weight matrix.
+///
+/// # Arguments
+/// - `qweight`: packed uint32 weights `[rows, cols/8]` (stored as `Float32` dtype,
+///   since the raw Metal buffer contains packed uint32 data).
+/// - `qzeros`: packed uint32 zero points `[num_groups, cols/8]`.
+/// - `scales`: f32 scale factors `[num_groups, cols]`.
+/// - `rows`: number of input rows (in_features).
+/// - `cols`: number of output columns (out_features). Must be a multiple of 8.
+/// - `group_size`: quantization group size. `rows` must be a multiple of `group_size`.
+/// - `queue`: Metal command queue for dispatch.
+///
+/// # Returns
+/// A 2-D f32 `Array` of shape `[rows, cols]`.
+#[allow(clippy::too_many_arguments)]
+pub fn awq_dequant(
+    registry: &KernelRegistry,
+    qweight: &Array,
+    qzeros: &Array,
+    scales: &Array,
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+    queue: &metal::CommandQueue,
+) -> Result<Array, KernelError> {
+    // --- Validate dimensions ---
+    if cols % 8 != 0 {
+        return Err(KernelError::InvalidShape(format!(
+            "awq_dequant: cols ({cols}) must be a multiple of 8 (pack factor)"
+        )));
+    }
+    if group_size == 0 {
+        return Err(KernelError::InvalidShape(
+            "awq_dequant: group_size must be > 0".into(),
+        ));
+    }
+    if rows % group_size != 0 {
+        return Err(KernelError::InvalidShape(format!(
+            "awq_dequant: rows ({rows}) must be a multiple of group_size ({group_size})"
+        )));
+    }
+
+    let num_groups = rows / group_size;
+    let cols_packed = cols / 8;
+
+    // --- Validate buffer sizes ---
+    let expected_qweight_bytes = rows * cols_packed * 4; // uint32
+    let available_qweight = qweight.metal_buffer().length() as usize;
+    if available_qweight < expected_qweight_bytes {
+        return Err(KernelError::InvalidShape(format!(
+            "awq_dequant: qweight buffer too small: {available_qweight} bytes < expected {expected_qweight_bytes} bytes for [{rows}, {cols_packed}]"
+        )));
+    }
+
+    let expected_qzeros_bytes = num_groups * cols_packed * 4; // uint32
+    let available_qzeros = qzeros.metal_buffer().length() as usize;
+    if available_qzeros < expected_qzeros_bytes {
+        return Err(KernelError::InvalidShape(format!(
+            "awq_dequant: qzeros buffer too small: {available_qzeros} bytes < expected {expected_qzeros_bytes} bytes for [{num_groups}, {cols_packed}]"
+        )));
+    }
+
+    let expected_scales_bytes = num_groups * cols * 4; // float32
+    let available_scales = scales.metal_buffer().length() as usize;
+    if available_scales < expected_scales_bytes {
+        return Err(KernelError::InvalidShape(format!(
+            "awq_dequant: scales buffer too small: {available_scales} bytes < expected {expected_scales_bytes} bytes for [{num_groups}, {cols}]"
+        )));
+    }
+
+    // --- Build pipeline and output ---
+    let pipeline = registry.get_pipeline("awq_dequant_f32", DType::Float32)?;
+    let out = Array::zeros(registry.device().raw(), &[rows, cols], DType::Float32);
+
+    let params: [u32; 4] = [
+        super::checked_u32(rows, "rows")?,
+        super::checked_u32(cols, "cols")?,
+        super::checked_u32(group_size, "group_size")?,
+        super::checked_u32(num_groups, "num_groups")?,
+    ];
+
+    let dev = registry.device().raw();
+    let opts = metal::MTLResourceOptions::StorageModeShared;
+    let params_buf = dev.new_buffer_with_data(
+        params.as_ptr() as *const _,
+        (params.len() * std::mem::size_of::<u32>()) as u64,
+        opts,
+    );
+
+    let cb = queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_buffer(0, Some(qweight.metal_buffer()), qweight.offset() as u64);
+    enc.set_buffer(1, Some(qzeros.metal_buffer()), qzeros.offset() as u64);
+    enc.set_buffer(2, Some(scales.metal_buffer()), scales.offset() as u64);
+    enc.set_buffer(3, Some(out.metal_buffer()), 0);
+    enc.set_buffer(4, Some(&params_buf), 0);
+
+    // 2D grid: (cols, rows, 1) — each thread handles one output element.
+    let max_tg = pipeline.max_total_threads_per_threadgroup();
+    let tw = pipeline.thread_execution_width();
+    // Use a 2D threadgroup: (tw, max_tg / tw) up to grid bounds.
+    let tg_x = tw.min(cols as u64);
+    let tg_y = (max_tg / tg_x).max(1).min(rows as u64);
+
+    let grid = metal::MTLSize::new(cols as u64, rows as u64, 1);
+    let tg = metal::MTLSize::new(tg_x, tg_y, 1);
+    enc.dispatch_threads(grid, tg);
+    enc.end_encoding();
+    cb.commit();
+    cb.wait_until_completed();
+
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// GPTQ dequantization
+// ---------------------------------------------------------------------------
+
+/// Dequantize GPTQ-packed INT4 weights to f32.
+///
+/// GPTQ packs 8 INT4 values per uint32 in the row (in_features) dimension.
+/// Optional `g_idx` array permutes group assignments (for `act_order`).
+///
+/// # Arguments
+/// - `qweight`: packed uint32 weights `[in_features/8, out_features]`.
+/// - `qzeros`: packed uint32 zero points `[num_groups, out_features/8]`.
+/// - `scales`: f32 scale factors `[num_groups, out_features]`.
+/// - `g_idx`: optional group index permutation `[in_features]` (for act_order).
+///   When `None`, groups are computed as `row / group_size`.
+/// - `in_features`: number of input features. Must be a multiple of 8.
+/// - `out_features`: number of output features. Must be a multiple of 8.
+/// - `group_size`: quantization group size (used when `g_idx` is `None`).
+/// - `queue`: Metal command queue for dispatch.
+///
+/// # Returns
+/// A 2-D f32 `Array` of shape `[in_features, out_features]`.
+#[allow(clippy::too_many_arguments)]
+pub fn gptq_dequant(
+    registry: &KernelRegistry,
+    qweight: &Array,
+    qzeros: &Array,
+    scales: &Array,
+    g_idx: Option<&Array>,
+    in_features: usize,
+    out_features: usize,
+    group_size: usize,
+    queue: &metal::CommandQueue,
+) -> Result<Array, KernelError> {
+    // --- Validate dimensions ---
+    if in_features % 8 != 0 {
+        return Err(KernelError::InvalidShape(format!(
+            "gptq_dequant: in_features ({in_features}) must be a multiple of 8 (pack factor)"
+        )));
+    }
+    if out_features % 8 != 0 {
+        return Err(KernelError::InvalidShape(format!(
+            "gptq_dequant: out_features ({out_features}) must be a multiple of 8 (pack factor for qzeros)"
+        )));
+    }
+    if group_size == 0 {
+        return Err(KernelError::InvalidShape(
+            "gptq_dequant: group_size must be > 0".into(),
+        ));
+    }
+    if g_idx.is_none() && in_features % group_size != 0 {
+        return Err(KernelError::InvalidShape(format!(
+            "gptq_dequant: in_features ({in_features}) must be a multiple of group_size ({group_size}) when g_idx is not provided"
+        )));
+    }
+
+    let rows_packed = in_features / 8;
+    let cols_packed = out_features / 8;
+    let num_groups = if g_idx.is_some() {
+        // When g_idx is provided, infer num_groups from the scales buffer.
+        // scales shape is [num_groups, out_features], so total floats / out_features.
+        let scales_elems = scales.metal_buffer().length() as usize / 4;
+        scales_elems / out_features
+    } else {
+        in_features / group_size
+    };
+
+    // --- Validate buffer sizes ---
+    let expected_qweight_bytes = rows_packed * out_features * 4;
+    let available_qweight = qweight.metal_buffer().length() as usize;
+    if available_qweight < expected_qweight_bytes {
+        return Err(KernelError::InvalidShape(format!(
+            "gptq_dequant: qweight buffer too small: {available_qweight} bytes < expected {expected_qweight_bytes} bytes for [{rows_packed}, {out_features}]"
+        )));
+    }
+
+    let expected_qzeros_bytes = num_groups * cols_packed * 4;
+    let available_qzeros = qzeros.metal_buffer().length() as usize;
+    if available_qzeros < expected_qzeros_bytes {
+        return Err(KernelError::InvalidShape(format!(
+            "gptq_dequant: qzeros buffer too small: {available_qzeros} bytes < expected {expected_qzeros_bytes} bytes for [{num_groups}, {cols_packed}]"
+        )));
+    }
+
+    let expected_scales_bytes = num_groups * out_features * 4;
+    let available_scales = scales.metal_buffer().length() as usize;
+    if available_scales < expected_scales_bytes {
+        return Err(KernelError::InvalidShape(format!(
+            "gptq_dequant: scales buffer too small: {available_scales} bytes < expected {expected_scales_bytes} bytes for [{num_groups}, {out_features}]"
+        )));
+    }
+
+    if let Some(idx) = g_idx {
+        let expected_gidx_bytes = in_features * 4; // int32
+        let available_gidx = idx.metal_buffer().length() as usize;
+        if available_gidx < expected_gidx_bytes {
+            return Err(KernelError::InvalidShape(format!(
+                "gptq_dequant: g_idx buffer too small: {available_gidx} bytes < expected {expected_gidx_bytes} bytes for [{in_features}]"
+            )));
+        }
+    }
+
+    // --- Build pipeline and output ---
+    let pipeline = registry.get_pipeline("gptq_dequant_f32", DType::Float32)?;
+    let out = Array::zeros(
+        registry.device().raw(),
+        &[in_features, out_features],
+        DType::Float32,
+    );
+
+    let has_g_idx: u32 = if g_idx.is_some() { 1 } else { 0 };
+    let params: [u32; 4] = [
+        super::checked_u32(in_features, "in_features")?,
+        super::checked_u32(out_features, "out_features")?,
+        super::checked_u32(group_size, "group_size")?,
+        has_g_idx,
+    ];
+
+    let dev = registry.device().raw();
+    let opts = metal::MTLResourceOptions::StorageModeShared;
+    let params_buf = dev.new_buffer_with_data(
+        params.as_ptr() as *const _,
+        (params.len() * std::mem::size_of::<u32>()) as u64,
+        opts,
+    );
+
+    // For GPTQ without g_idx, create a dummy single-element buffer.
+    let dummy_buf;
+    let g_idx_buf = match g_idx {
+        Some(idx) => idx.metal_buffer(),
+        None => {
+            let dummy_val: [i32; 1] = [0];
+            dummy_buf = dev.new_buffer_with_data(
+                dummy_val.as_ptr() as *const _,
+                std::mem::size_of::<i32>() as u64,
+                opts,
+            );
+            &dummy_buf
+        }
+    };
+    let g_idx_offset: u64 = g_idx.map_or(0, |idx| idx.offset() as u64);
+
+    let cb = queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_buffer(0, Some(qweight.metal_buffer()), qweight.offset() as u64);
+    enc.set_buffer(1, Some(qzeros.metal_buffer()), qzeros.offset() as u64);
+    enc.set_buffer(2, Some(scales.metal_buffer()), scales.offset() as u64);
+    enc.set_buffer(3, Some(g_idx_buf), g_idx_offset);
+    enc.set_buffer(4, Some(out.metal_buffer()), 0);
+    enc.set_buffer(5, Some(&params_buf), 0);
+
+    // 2D grid: (out_features, in_features, 1) — each thread handles one output element.
+    let max_tg = pipeline.max_total_threads_per_threadgroup();
+    let tw = pipeline.thread_execution_width();
+    let tg_x = tw.min(out_features as u64);
+    let tg_y = (max_tg / tg_x).max(1).min(in_features as u64);
+
+    let grid = metal::MTLSize::new(out_features as u64, in_features as u64, 1);
+    let tg = metal::MTLSize::new(tg_x, tg_y, 1);
+    enc.dispatch_threads(grid, tg);
     enc.end_encoding();
     cb.commit();
     cb.wait_until_completed();
