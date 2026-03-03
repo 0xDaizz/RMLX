@@ -19,6 +19,7 @@
 | **CB 관리** | ExecGraph: 65 CBs/layer -> 5 CBs/layer (92.3% 감소) | eval() 배치당 1 CB | Stream 기반, CUDA Graphs capture-replay |
 | **동기화 메커니즘** | MTLSharedEvent signal/wait (263.9us) | waitUntilCompleted (424.9us) | CUDA events / streams |
 | **RDMA** | Zero-copy: posix_memalign + NoCopy + ibv_reg_mr | std::copy로 전송 버퍼에 복사 | GPUDirect RDMA / NVLink |
+| **Expert Parallelism** | 네이티브 EP (3-zone auto backend, 7 MoE 커널) | EP 미지원 | DeepSpeed-MoE, Tutel |
 | **양자화** | Q4_0, Q4_1, Q8_0, GGUF, AWQ, GPTQ, FP8 | Q4_0, Q4_1, Q8_0, GGUF, AWQ, GPTQ | FP8, AWQ, GPTQ, INT4/INT8 |
 | **Flash Attention** | Flash Attention 2 (fused SDPA, tiled K/V) | 미지원 (fused SDPA) | FlashAttention-2/3 |
 | **KV 캐시** | 정적/순환/배치/양자화 KV 캐시 | 정적 레이어별 캐시 | PagedAttention (vLLM) |
@@ -87,7 +88,22 @@ ExecGraph는 CPU의 역할을 얇은 제출 레이어로 축소합니다. 레이
 
 Python 인터프리터 오버헤드가 없습니다. 시작 시 동적 라이브러리 해석이 불필요합니다.
 
-### 2.6 소유권 안전성
+### 2.6 Expert Parallelism (EP)
+
+MLX에는 Expert Parallelism 지원이 없습니다. 사용자가 MoE dispatch/combine을 직접 구현해야 합니다. RMLX는 완전한 EP 스택을 일급(first-class) 기능으로 제공합니다:
+
+| 컴포넌트 | RMLX | MLX |
+|----------|------|-----|
+| MoE dispatch/combine | 3-zone 자동 백엔드 (CPU/Metal/RDMA) | 수동 구현 필요 |
+| MoE Metal 커널 | 7개 전용 GPU 커널 | 없음 |
+| 백엔드 선택 | 데이터 크기 기반 자동 선택 (쿨다운/히스테리시스) | 해당 없음 |
+| SparseGuard | 오버플로우 모니터링 + 용량 자동 조절 | 해당 없음 |
+| Compute-RDMA 오버랩 | 듀얼 커맨드 큐 파이프라인 | 해당 없음 |
+| Zero-copy EP 경로 | 동일 물리 주소에 ibv_mr + Metal 버퍼 | 해당 없음 |
+
+3-zone 정책이 최적 백엔드를 자동으로 선택합니다: 소규모 페이로드(N ≤ 64)에는 CPU, 중규모(N ≥ 320)에는 Metal GPU, 노드 간 통신에는 RDMA. Mixtral, DeepSeek-V3 같은 MoE 모델에서 수동 백엔드 튜닝이 필요 없습니다.
+
+### 2.7 소유권 안전성
 
 Rust의 소유권 시스템이 `unsafe` Metal/RDMA FFI 경계를 컴파일 타임에 격리합니다. 공개 API 표면은 전부 안전한 Rust입니다. 내부적으로 `posix_memalign`, `newBufferWithBytesNoCopy`, `ibv_post_send`에 대한 `unsafe` 블록은 `SAFETY` 주석과 함께 명시적으로 경계가 지정됩니다. 동시성 GPU/RDMA 코드 경로의 데이터 레이스는 `Send`/`Sync` 트레이트를 통해 컴파일 타임에 감지됩니다.
 
@@ -318,7 +334,7 @@ Flash Attention 2와 고급 양자화(GGUF, AWQ, GPTQ, FP8)가 구현되어, MLX
 
 RMLX는 MLX나 CUDA의 대체품이 아닙니다. 특정 니치를 차지합니다: **Apple Silicon을 위한 고성능 Metal GPU ML 프레임워크, Rust로 작성, Thunderbolt 5 RDMA 기반 분산 실행에 최적화**.
 
-**RMLX를 선택해야 할 때**: Apple Silicon 하드웨어에서 최대 GPU 성능이 필요할 때, Python 의존성 없는 단일 Rust 바이너리를 원할 때, 또는 Mac Studio 분산 추론 클러스터를 구축할 때.
+**RMLX를 선택해야 할 때**: Apple Silicon 하드웨어에서 최대 GPU 성능이 필요할 때, Mac Studio 클러스터에서 MoE 모델의 Expert Parallelism과 zero-copy RDMA가 필요할 때, Python 의존성 없는 단일 Rust 바이너리를 원할 때, 또는 분산 추론 클러스터를 구축할 때.
 
 **MLX를 선택해야 할 때**: Python 호환성, 성숙한 생태계, 학습 지원, 또는 광범위한 양자화 형식 지원이 필요할 때.
 

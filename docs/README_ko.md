@@ -64,6 +64,9 @@ ExecGraph 결과: 110.4ms/layer → 6.8ms/layer (16.15x 속도 향상)
    트랜스포머 레이어당 65개의 command buffer를 결정론적 연산 그룹화를 통해 5개로 줄여
    92.3% CB 감소와 함께 16.15x 속도 향상(110.4ms → 6.8ms)을 달성합니다.
 
+7. **Expert Parallelism (EP)**
+   MLX에는 없는 완전한 EP 스택을 제공합니다. 3-zone 자동 백엔드 정책(CPU/Metal/RDMA)이 데이터 크기에 따라 최적 경로를 자동 선택하고, 7개 전용 MoE Metal 커널, SparseGuard 오버플로우 모니터링, compute-RDMA 파이프라인 오버랩을 통해 Mixtral/DeepSeek-V3 같은 MoE 모델의 분산 추론을 지원합니다.
+
 ---
 
 ## 🛠️ 기술 스택

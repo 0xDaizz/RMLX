@@ -64,6 +64,9 @@ The ultimate goal is to connect two Mac Studio M3 Ultras via Thunderbolt 5 RDMA 
    Reduces 65 command buffers per transformer layer to 5 through deterministic operation
    grouping, achieving 16.15x speedup (110.4ms → 6.8ms) with 92.3% CB reduction.
 
+7. **Expert Parallelism (EP)**
+   MLX has no built-in EP support. RMLX provides a complete EP stack: 3-zone auto backend policy (CPU/Metal/RDMA) that selects the optimal path by data size, 7 dedicated MoE Metal kernels, SparseGuard overflow monitoring with capacity auto-tuning, and compute-RDMA pipeline overlap for distributed MoE inference on models like Mixtral and DeepSeek-V3.
+
 ---
 
 ## 🛠️ Tech Stack
