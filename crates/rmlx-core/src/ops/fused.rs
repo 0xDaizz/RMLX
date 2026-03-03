@@ -212,6 +212,28 @@ pub fn batched_qkv_proj_into(
     wv_t: &Array,
     cb: &metal::CommandBufferRef,
 ) -> Result<(Array, Array, Array), KernelError> {
+    // Ensure all inputs are contiguous for the GEMM kernel (assumes row-major layout).
+    let input = if input.is_contiguous() {
+        input.view(input.shape().to_vec(), input.strides().to_vec(), input.offset())
+    } else {
+        super::copy::copy_into_cb(registry, input, cb)?
+    };
+    let wq_t = if wq_t.is_contiguous() {
+        wq_t.view(wq_t.shape().to_vec(), wq_t.strides().to_vec(), wq_t.offset())
+    } else {
+        super::copy::copy_into_cb(registry, wq_t, cb)?
+    };
+    let wk_t = if wk_t.is_contiguous() {
+        wk_t.view(wk_t.shape().to_vec(), wk_t.strides().to_vec(), wk_t.offset())
+    } else {
+        super::copy::copy_into_cb(registry, wk_t, cb)?
+    };
+    let wv_t = if wv_t.is_contiguous() {
+        wv_t.view(wv_t.shape().to_vec(), wv_t.strides().to_vec(), wv_t.offset())
+    } else {
+        super::copy::copy_into_cb(registry, wv_t, cb)?
+    };
+
     let m = input.shape()[0] as u32;
     let k = input.shape()[1] as u32;
     let nq = wq_t.shape()[1] as u32;
@@ -226,9 +248,9 @@ pub fn batched_qkv_proj_into(
     let kernel_name = gemm_kernel_name(input.dtype())?;
     let pipeline = registry.get_pipeline(kernel_name, input.dtype())?;
 
-    encode_gemm(cb, &pipeline, input, wq_t, &q_out, m, nq, k, registry)?;
-    encode_gemm(cb, &pipeline, input, wk_t, &k_out, m, nk, k, registry)?;
-    encode_gemm(cb, &pipeline, input, wv_t, &v_out, m, nv, k, registry)?;
+    encode_gemm(cb, &pipeline, &input, &wq_t, &q_out, m, nq, k, registry)?;
+    encode_gemm(cb, &pipeline, &input, &wk_t, &k_out, m, nk, k, registry)?;
+    encode_gemm(cb, &pipeline, &input, &wv_t, &v_out, m, nv, k, registry)?;
 
     Ok((q_out, k_out, v_out))
 }

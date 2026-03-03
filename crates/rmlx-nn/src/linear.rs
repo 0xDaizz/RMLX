@@ -239,6 +239,21 @@ impl Linear {
             weight.offset(),
         );
 
+        // The transposed view is non-contiguous; the GEMM kernel needs row-major B.
+        // Copy to contiguous layout in the same command buffer.
+        let w_t = if w_t.is_contiguous() {
+            w_t
+        } else {
+            ops::copy::copy_into_cb(registry, &w_t, cb)?
+        };
+
+        // Ensure input is contiguous for GEMM
+        let input_2d = if input_2d.is_contiguous() {
+            input_2d
+        } else {
+            ops::copy::copy_into_cb(registry, &input_2d, cb)?
+        };
+
         // Encode GEMM into the provided CB
         let m = input_2d.shape()[0] as u32;
         let n = self.config.out_features as u32;
