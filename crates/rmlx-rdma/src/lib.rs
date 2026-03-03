@@ -24,7 +24,10 @@ pub use connection::{
 pub use context::{ProtectionDomain, RdmaContext, RdmaDeviceProbe};
 pub use exchange::ExchangeConfig;
 pub use exchange_tag::{ExchangeTag, WrIdFields};
-pub use gpu_doorbell::{DescriptorProxy, DescriptorRing, ProxyConfig, RdmaDescriptor, RdmaOp};
+pub use gpu_doorbell::{
+    DescriptorHandler, DescriptorProxy, DescriptorRing, HandlerResult, ProxyConfig, RdmaDescriptor,
+    RdmaOp,
+};
 pub use mr::MemoryRegion;
 pub use mr_pool::{MrHandle, MrPool};
 pub use multi_port::{
