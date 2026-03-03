@@ -185,19 +185,7 @@ The gap between RMLX and the CUDA ecosystem is larger than the gap between RMLX 
 
 FlashAttention-2 and FlashAttention-3 are standard in the CUDA ecosystem. They provide both memory efficiency (O(N) instead of O(N^2)) and computational efficiency (better SRAM utilization on NVIDIA hardware). RMLX's fused SDPA does not achieve comparable efficiency for long sequences.
 
-### 5.2 No Paged KV Cache
-
-vLLM's PagedAttention manages KV cache memory like virtual memory pages, enabling efficient memory sharing across requests and near-zero waste. RMLX uses static per-layer KV cache allocation.
-
-### 5.3 No Speculative Decoding
-
-Speculative decoding (Medusa, EAGLE, draft-model approaches) is standard in CUDA serving stacks. It can provide 2-3x throughput improvement for autoregressive generation. RMLX does not implement any form of speculative decoding.
-
-### 5.4 No Continuous Batching
-
-Production CUDA serving engines (vLLM, TensorRT-LLM, SGLang) use continuous batching to maximize GPU utilization by dynamically adding and removing requests from a batch. RMLX does not support this.
-
-### 5.5 Interconnect Bandwidth
+### 5.2 Interconnect Bandwidth
 
 | Interconnect | Per-Link Bandwidth | Typical Config | Total |
 |--------------|-------------------|----------------|-------|

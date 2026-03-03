@@ -55,9 +55,6 @@ Measured on Apple Silicon, single transformer layer, Phase 9B-opt complete:
 ### Planned
 
 - Flash Attention 2
-- Paged KV Cache / dynamic cache management
-- Speculative Decoding
-- Continuous Batching
 - Advanced Quantization (AWQ, GPTQ)
 - Python API
 
