@@ -194,10 +194,7 @@ fn dispatch_unary(
     let tg_size = std::cmp::min(256u64, pipeline.max_total_threads_per_threadgroup());
     let n_groups = (n_threads as u64).div_ceil(tg_size);
 
-    enc.dispatch_thread_groups(
-        MTLSize::new(n_groups, 1, 1),
-        MTLSize::new(tg_size, 1, 1),
-    );
+    enc.dispatch_thread_groups(MTLSize::new(n_groups, 1, 1), MTLSize::new(tg_size, 1, 1));
     enc.end_encoding();
     cb.commit();
     cb.wait_until_completed();

@@ -456,10 +456,7 @@ pub fn layer_norm(
     encoder.set_buffer(7, Some(&has_b_buf), 0);
 
     let tg_size = std::cmp::min(1024, pipeline.max_total_threads_per_threadgroup());
-    encoder.dispatch_thread_groups(
-        MTLSize::new(rows as u64, 1, 1),
-        MTLSize::new(tg_size, 1, 1),
-    );
+    encoder.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), MTLSize::new(tg_size, 1, 1));
     encoder.end_encoding();
     cb.commit();
     cb.wait_until_completed();

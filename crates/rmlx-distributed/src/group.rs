@@ -842,3 +842,268 @@ fn add_f32_inplace(dst: &mut [u8], src: &[u8]) {
         dst[offset..offset + 4].copy_from_slice(&sum.to_ne_bytes());
     }
 }
+
+fn reduce_f32_inplace(dst: &mut [u8], src: &[u8], op: ReduceOp) {
+    let count = dst.len().min(src.len()) / 4;
+    for i in 0..count {
+        let offset = i * 4;
+        let a = f32::from_ne_bytes([
+            dst[offset],
+            dst[offset + 1],
+            dst[offset + 2],
+            dst[offset + 3],
+        ]);
+        let b = f32::from_ne_bytes([
+            src[offset],
+            src[offset + 1],
+            src[offset + 2],
+            src[offset + 3],
+        ]);
+        let result = match op {
+            ReduceOp::Sum => a + b,
+            ReduceOp::Max => a.max(b),
+            ReduceOp::Min => a.min(b),
+        };
+        dst[offset..offset + 4].copy_from_slice(&result.to_ne_bytes());
+    }
+}
+
+/// Ring reduce-scatter: reduce and scatter data across all ranks.
+fn ring_reduce_scatter(
+    data: &[u8],
+    ranks: &[u32],
+    local_rank: u32,
+    transport: &Arc<dyn RdmaTransport>,
+) -> Result<Vec<u8>, DistributedError> {
+    let n = ranks.len();
+    if n <= 1 {
+        return Ok(data.to_vec());
+    }
+
+    let my_idx = ranks.iter().position(|&r| r == local_rank).ok_or_else(|| {
+        DistributedError::Transport(format!(
+            "local_rank {local_rank} not found in ranks {:?}",
+            ranks
+        ))
+    })?;
+    let right = ranks[(my_idx + 1) % n];
+    let left = ranks[(my_idx + n - 1) % n];
+
+    let chunk_size = data.len() / n;
+    let mut buf = data.to_vec();
+
+    for round in 0..(n - 1) {
+        let send_chunk_idx = (my_idx + n - round) % n;
+        let recv_chunk_idx = (my_idx + n - round - 1) % n;
+        let send_start = send_chunk_idx * chunk_size;
+        let send_end = send_start + chunk_size;
+
+        let received = transport.sendrecv(&buf[send_start..send_end], right, chunk_size, left)?;
+
+        let recv_start = recv_chunk_idx * chunk_size;
+        add_f32_inplace(&mut buf[recv_start..recv_start + chunk_size], &received);
+    }
+
+    let chunk_start = my_idx * chunk_size;
+    Ok(buf[chunk_start..chunk_start + chunk_size].to_vec())
+}
+
+/// Ring allreduce with configurable reduction operation and dtype.
+fn ring_allreduce_op(
+    data: &[u8],
+    ranks: &[u32],
+    local_rank: u32,
+    transport: &Arc<dyn RdmaTransport>,
+    op: ReduceOp,
+    dtype: ReduceDtype,
+) -> Result<Vec<u8>, DistributedError> {
+    let n = ranks.len();
+    if n <= 1 {
+        return Ok(data.to_vec());
+    }
+
+    match dtype {
+        ReduceDtype::F32 => {
+            if data.len() % 4 != 0 {
+                return Err(DistributedError::Protocol(format!(
+                    "allreduce_op(f32): data length ({}) must be a multiple of 4",
+                    data.len()
+                )));
+            }
+            ring_allreduce_op_f32(data, ranks, local_rank, transport, op)
+        }
+        ReduceDtype::F16 => {
+            if data.len() % 2 != 0 {
+                return Err(DistributedError::Protocol(format!(
+                    "allreduce_op(f16): data length ({}) must be a multiple of 2",
+                    data.len()
+                )));
+            }
+            let n_elems = data.len() / 2;
+            let mut f32_data = vec![0u8; n_elems * 4];
+            for i in 0..n_elems {
+                let bits = u16::from_ne_bytes([data[i * 2], data[i * 2 + 1]]);
+                let val = f16_to_f32(bits);
+                f32_data[i * 4..i * 4 + 4].copy_from_slice(&val.to_ne_bytes());
+            }
+            let result = ring_allreduce_op_f32(&f32_data, ranks, local_rank, transport, op)?;
+            let mut out = vec![0u8; n_elems * 2];
+            for i in 0..n_elems {
+                let val = f32::from_ne_bytes([
+                    result[i * 4],
+                    result[i * 4 + 1],
+                    result[i * 4 + 2],
+                    result[i * 4 + 3],
+                ]);
+                let bits = f32_to_f16(val);
+                out[i * 2..i * 2 + 2].copy_from_slice(&bits.to_ne_bytes());
+            }
+            Ok(out)
+        }
+        ReduceDtype::Bf16 => {
+            if data.len() % 2 != 0 {
+                return Err(DistributedError::Protocol(format!(
+                    "allreduce_op(bf16): data length ({}) must be a multiple of 2",
+                    data.len()
+                )));
+            }
+            let n_elems = data.len() / 2;
+            let mut f32_data = vec![0u8; n_elems * 4];
+            for i in 0..n_elems {
+                let bits = u16::from_ne_bytes([data[i * 2], data[i * 2 + 1]]);
+                let val = bf16_to_f32(bits);
+                f32_data[i * 4..i * 4 + 4].copy_from_slice(&val.to_ne_bytes());
+            }
+            let result = ring_allreduce_op_f32(&f32_data, ranks, local_rank, transport, op)?;
+            let mut out = vec![0u8; n_elems * 2];
+            for i in 0..n_elems {
+                let val = f32::from_ne_bytes([
+                    result[i * 4],
+                    result[i * 4 + 1],
+                    result[i * 4 + 2],
+                    result[i * 4 + 3],
+                ]);
+                let bits = f32_to_bf16(val);
+                out[i * 2..i * 2 + 2].copy_from_slice(&bits.to_ne_bytes());
+            }
+            Ok(out)
+        }
+    }
+}
+
+/// Ring allreduce on f32 data with configurable reduce op.
+fn ring_allreduce_op_f32(
+    data: &[u8],
+    ranks: &[u32],
+    local_rank: u32,
+    transport: &Arc<dyn RdmaTransport>,
+    op: ReduceOp,
+) -> Result<Vec<u8>, DistributedError> {
+    let n = ranks.len();
+    if n <= 1 {
+        return Ok(data.to_vec());
+    }
+
+    let my_idx = ranks.iter().position(|&r| r == local_rank).ok_or_else(|| {
+        DistributedError::Transport(format!(
+            "local_rank {local_rank} not found in ranks {:?}",
+            ranks
+        ))
+    })?;
+    let right = ranks[(my_idx + 1) % n];
+    let left = ranks[(my_idx + n - 1) % n];
+
+    let chunk_size = data.len().div_ceil(n);
+    let mut buf = data.to_vec();
+    buf.resize(chunk_size * n, 0);
+
+    for round in 0..(n - 1) {
+        let send_chunk_idx = (my_idx + n - round) % n;
+        let recv_chunk_idx = (my_idx + n - round - 1) % n;
+        let send_start = send_chunk_idx * chunk_size;
+        let send_end = send_start + chunk_size;
+
+        let received = transport.sendrecv(&buf[send_start..send_end], right, chunk_size, left)?;
+
+        let recv_start = recv_chunk_idx * chunk_size;
+        reduce_f32_inplace(&mut buf[recv_start..recv_start + chunk_size], &received, op);
+    }
+
+    for round in 0..(n - 1) {
+        let send_chunk_idx = (my_idx + 1 + n - round) % n;
+        let recv_chunk_idx = (my_idx + n - round) % n;
+        let send_start = send_chunk_idx * chunk_size;
+        let send_end = send_start + chunk_size;
+
+        let received = transport.sendrecv(&buf[send_start..send_end], right, chunk_size, left)?;
+
+        let recv_start = recv_chunk_idx * chunk_size;
+        buf[recv_start..recv_start + chunk_size].copy_from_slice(&received);
+    }
+
+    buf.truncate(data.len());
+    Ok(buf)
+}
+
+// ─── Half-precision conversion utilities ───
+
+/// Convert IEEE 754 half-precision (f16) bits to f32.
+fn f16_to_f32(bits: u16) -> f32 {
+    let sign = ((bits >> 15) & 1) as u32;
+    let exponent = ((bits >> 10) & 0x1F) as u32;
+    let mantissa = (bits & 0x3FF) as u32;
+
+    if exponent == 0 {
+        if mantissa == 0 {
+            f32::from_bits(sign << 31)
+        } else {
+            let mut m = mantissa;
+            let mut e = 0i32;
+            while (m & 0x400) == 0 {
+                m <<= 1;
+                e += 1;
+            }
+            let f32_exp = (127 - 15 - e) as u32;
+            let f32_mantissa = (m & 0x3FF) << 13;
+            f32::from_bits((sign << 31) | (f32_exp << 23) | f32_mantissa)
+        }
+    } else if exponent == 31 {
+        let f32_mantissa = mantissa << 13;
+        f32::from_bits((sign << 31) | (0xFF << 23) | f32_mantissa)
+    } else {
+        let f32_exp = (exponent as i32 - 15 + 127) as u32;
+        let f32_mantissa = mantissa << 13;
+        f32::from_bits((sign << 31) | (f32_exp << 23) | f32_mantissa)
+    }
+}
+
+/// Convert f32 to IEEE 754 half-precision (f16) bits.
+fn f32_to_f16(val: f32) -> u16 {
+    let bits = val.to_bits();
+    let sign = ((bits >> 31) & 1) as u16;
+    let exponent = ((bits >> 23) & 0xFF) as i32;
+    let mantissa = bits & 0x7F_FFFF;
+
+    if exponent == 0xFF {
+        let f16_mantissa = (mantissa >> 13) as u16;
+        (sign << 15) | (0x1F << 10) | f16_mantissa
+    } else if exponent > 127 + 15 {
+        (sign << 15) | (0x1F << 10)
+    } else if exponent < 127 - 14 {
+        sign << 15
+    } else {
+        let f16_exp = ((exponent - 127 + 15) as u16) & 0x1F;
+        let f16_mantissa = (mantissa >> 13) as u16;
+        (sign << 15) | (f16_exp << 10) | f16_mantissa
+    }
+}
+
+/// Convert bfloat16 bits to f32.
+fn bf16_to_f32(bits: u16) -> f32 {
+    f32::from_bits((bits as u32) << 16)
+}
+
+/// Convert f32 to bfloat16 bits (truncation).
+fn f32_to_bf16(val: f32) -> u16 {
+    (val.to_bits() >> 16) as u16
+}
