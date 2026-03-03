@@ -19,6 +19,7 @@ RMLX reimplements the core Metal GPU compute pipeline of Apple's [MLX](https://g
 | Feature | RMLX | MLX | CUDA |
 |---------|:----:|:---:|:----:|
 | Unified Memory (zero-copy) | yes | yes | no |
+| Expert Parallelism (EP) | yes (3-zone auto) | no | DeepSpeed-MoE |
 | Zero-copy RDMA | yes | no | no |
 | MTLSharedEvent sync | yes | no | n/a |
 | ExecGraph CB batching | yes | no | CUDA Graphs |
@@ -49,6 +50,7 @@ Measured on Apple Silicon, single transformer layer, Phase 9B-opt complete:
 - **GGUF format** -- binary parser for llama.cpp GGUF v2/v3 model files
 - **AWQ/GPTQ** -- INT4 packed weight dequantization to canonical format
 - **Conv1d/Conv2d** -- GPU-accelerated convolution with padding, stride, dilation, groups
+- **Expert Parallelism** -- EP dispatch/combine with 3-zone auto backend (CPU/Metal/RDMA), 7 MoE Metal kernels, SparseGuard overflow monitoring
 - **4 model architectures** -- LLaMA, Qwen, DeepSeek-V3, Mixtral
 - **Dynamic shapes** -- max-size pre-allocation with variable dispatch
 - **MTLSharedEvent** -- non-blocking GPU-CPU synchronization
@@ -56,11 +58,6 @@ Measured on Apple Silicon, single transformer layer, Phase 9B-opt complete:
 - **Zero-copy allocator** -- `posix_memalign` + `newBufferWithBytesNoCopy` + `ibv_reg_mr`
 - **Dual queue pipeline** -- separate compute and transfer command queues
 - **VJP / LoRA** -- autodiff and parameter-efficient fine-tuning primitives
-
-### Planned
-
-- Python API
-- Speculative Decoding
 
 ## 🏗️ Architecture
 

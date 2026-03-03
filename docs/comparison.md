@@ -19,6 +19,7 @@
 | **CB management** | ExecGraph: 65 CBs/layer -> 5 CBs/layer (92.3% reduction) | 1 CB per eval() batch | Stream-ordered, CUDA Graphs capture-replay |
 | **Sync mechanism** | MTLSharedEvent signal/wait (263.9us) | waitUntilCompleted (424.9us) | CUDA events / streams |
 | **RDMA** | Zero-copy: posix_memalign + NoCopy + ibv_reg_mr | std::copy to transfer buffer | GPUDirect RDMA / NVLink |
+| **Expert Parallelism** | Native EP (3-zone auto backend, 7 MoE kernels) | No EP support | DeepSpeed-MoE, Tutel |
 | **Quantization** | Q4_0, Q4_1, Q8_0, FP8, GGUF, AWQ, GPTQ | Q4_0, Q4_1, Q8_0, GGUF, AWQ, GPTQ | FP8, AWQ, GPTQ, INT4/INT8 |
 | **Flash Attention** | Flash Attention 2 (D≤256) | No (fused SDPA) | FlashAttention-2/3 |
 | **KV cache** | Static, Rotating, Batch, Quantized | Static per-layer cache | PagedAttention (vLLM) |
@@ -87,7 +88,22 @@ ExecGraph reduces the CPU's role to a thin submission layer. Per-layer CPU-GPU s
 
 No Python interpreter overhead. No dynamic library resolution at startup.
 
-### 2.6 Ownership Safety
+### 2.6 Expert Parallelism (EP)
+
+MLX has no built-in Expert Parallelism support. Users must implement MoE dispatch/combine manually. RMLX provides a complete EP stack as a first-class feature:
+
+| Component | RMLX | MLX |
+|-----------|------|-----|
+| MoE dispatch/combine | 3-zone auto backend (CPU/Metal/RDMA) | Manual implementation |
+| MoE Metal kernels | 7 dedicated GPU kernels | None |
+| Backend selection | Automatic by data size with cooldown/hysteresis | N/A |
+| SparseGuard | Overflow monitoring + capacity auto-tuning | N/A |
+| Compute-RDMA overlap | Pipeline with dual command queues | N/A |
+| Zero-copy EP path | ibv_mr + Metal buffer on same physical address | N/A |
+
+The 3-zone policy automatically selects the optimal backend: CPU for small payloads (N ≤ 64), Metal GPU for medium (N ≥ 320), and RDMA for inter-node communication. This eliminates the need for manual backend tuning in MoE models like Mixtral and DeepSeek-V3.
+
+### 2.7 Ownership Safety
 
 Rust's ownership system isolates `unsafe` Metal/RDMA FFI boundaries at compile time. The public API surface is entirely safe Rust. Internally, `unsafe` blocks for `posix_memalign`, `newBufferWithBytesNoCopy`, and `ibv_post_send` are explicitly bounded with `SAFETY` comments. Data races in concurrent GPU/RDMA code paths are caught at compile time via `Send`/`Sync` traits.
 
@@ -315,7 +331,7 @@ Remaining gaps: Python API, speculative decoding, and NVIDIA-specific quantizati
 
 RMLX is not a replacement for MLX or CUDA. It occupies a specific niche: **high-performance Metal GPU ML framework for Apple Silicon, written in Rust, optimized for distributed execution over Thunderbolt 5 RDMA**.
 
-**Choose RMLX when**: You need maximum GPU performance on Apple Silicon hardware, you want a single Rust binary with no Python dependency, or you are building a distributed inference cluster of Mac Studios.
+**Choose RMLX when**: You need maximum GPU performance on Apple Silicon hardware, you want Expert Parallelism with zero-copy RDMA for MoE models on Mac Studio clusters, you want a single Rust binary with no Python dependency, or you are building a distributed inference cluster.
 
 **Choose MLX when**: You need Python compatibility, a mature ecosystem, training support, or broad quantization format support.
 
