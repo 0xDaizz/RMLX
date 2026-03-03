@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rmlx_metal::metal::Buffer as MetalBuffer;
 
@@ -12,12 +11,16 @@ use crate::zero_copy::page_size;
 ///
 /// Eviction uses LRU order (oldest-first) to prevent stale small buffers
 /// from accumulating indefinitely.
+///
+/// The cache is always accessed behind a `Mutex`, so interior fields use
+/// plain `usize` rather than `AtomicUsize` (A9).
 pub struct BufferCache {
     bins: BTreeMap<usize, VecDeque<MetalBuffer>>,
     /// LRU list tracking insertion order: oldest at front, newest at back.
     /// Each entry is `(aligned_size, gpu_address)` identifying the buffer.
     lru: VecDeque<(usize, u64)>,
-    cache_size: AtomicUsize,
+    /// Total size of all cached buffers (plain usize, guarded by external Mutex).
+    cache_size: usize,
     max_cache_size: usize,
 }
 
@@ -26,7 +29,7 @@ impl BufferCache {
         Self {
             bins: BTreeMap::new(),
             lru: VecDeque::new(),
-            cache_size: AtomicUsize::new(0),
+            cache_size: 0,
             max_cache_size,
         }
     }
@@ -50,7 +53,7 @@ impl BufferCache {
 
         if let Some(k) = found_key {
             if let Some(buf) = self.bins.get_mut(&k).and_then(|d| d.pop_front()) {
-                self.cache_size.fetch_sub(k, Ordering::Relaxed);
+                self.cache_size = self.cache_size.saturating_sub(k);
                 // Remove this buffer from the LRU list by gpu_address.
                 let addr = buf.gpu_address();
                 self.lru_remove(k, addr);
@@ -77,11 +80,11 @@ impl BufferCache {
         }
 
         // Evict if cache is full
-        if self.cache_size.load(Ordering::Relaxed) + key > self.max_cache_size {
+        if self.cache_size + key > self.max_cache_size {
             self.evict(key);
         }
 
-        self.cache_size.fetch_add(key, Ordering::Relaxed);
+        self.cache_size += key;
         // Track in LRU (newest at back).
         let addr = buffer.gpu_address();
         self.lru.push_back((key, addr));
@@ -90,14 +93,28 @@ impl BufferCache {
 
     /// Current cache size in bytes.
     pub fn cache_size(&self) -> usize {
-        self.cache_size.load(Ordering::Relaxed)
+        self.cache_size
+    }
+
+    /// Maximum cache size in bytes.
+    pub fn max_cache_size(&self) -> usize {
+        self.max_cache_size
+    }
+
+    /// Set the maximum cache size (A12). Evicts if current size exceeds the new limit.
+    pub fn set_max_cache_size(&mut self, limit: usize) {
+        self.max_cache_size = limit;
+        if self.cache_size > limit {
+            let overshoot = self.cache_size - limit;
+            self.evict(overshoot);
+        }
     }
 
     /// Clear all cached buffers.
     pub fn clear(&mut self) {
         self.bins.clear();
         self.lru.clear();
-        self.cache_size.store(0, Ordering::Relaxed);
+        self.cache_size = 0;
     }
 
     /// Evict LRU (oldest-first) buffers until `needed` bytes are free.
@@ -106,7 +123,7 @@ impl BufferCache {
     /// stale small buffers are cleaned up rather than accumulating forever.
     pub(crate) fn evict(&mut self, needed: usize) {
         let target = self.max_cache_size.saturating_sub(needed);
-        while self.cache_size.load(Ordering::Relaxed) > target {
+        while self.cache_size > target {
             if let Some((key, addr)) = self.lru.pop_front() {
                 // Remove the corresponding entry from the bin.
                 let mut removed = false;
@@ -120,7 +137,7 @@ impl BufferCache {
                     }
                 }
                 if removed {
-                    self.cache_size.fetch_sub(key, Ordering::Relaxed);
+                    self.cache_size = self.cache_size.saturating_sub(key);
                 }
             } else {
                 break; // LRU list is empty.

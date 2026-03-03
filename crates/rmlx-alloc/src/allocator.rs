@@ -32,6 +32,9 @@ pub struct MetalAllocator {
     /// `active_memory + cache_size + request_size >= gc_limit`.
     /// Default: [`DEFAULT_GC_LIMIT`] (2 GiB).
     gc_limit: usize,
+    /// Hard memory limit (0 = unlimited). When set, `alloc()` returns
+    /// `OutOfMemory` if `active + requested > memory_limit` (A12).
+    memory_limit: AtomicUsize,
 }
 
 impl MetalAllocator {
@@ -49,6 +52,7 @@ impl MetalAllocator {
             stats: AllocStats::new(),
             block_limit: AtomicUsize::new(block_limit),
             gc_limit: DEFAULT_GC_LIMIT,
+            memory_limit: AtomicUsize::new(0),
         }
     }
 
@@ -71,9 +75,58 @@ impl MetalAllocator {
         self.gc_limit = limit;
     }
 
+    /// Set a hard memory limit (A12). When set (> 0), `alloc()` returns
+    /// `OutOfMemory` if `active_memory + requested > memory_limit`.
+    /// Set to 0 to disable.
+    pub fn set_memory_limit(&self, limit: usize) {
+        self.memory_limit.store(limit, Ordering::Relaxed);
+    }
+
+    /// Get the current memory limit (0 = unlimited).
+    pub fn memory_limit(&self) -> usize {
+        self.memory_limit.load(Ordering::Relaxed)
+    }
+
+    /// Set the maximum cache size (A12). Adjusts the underlying `BufferCache`
+    /// limit and evicts excess if necessary.
+    pub fn set_cache_limit(&self, limit: usize) {
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.set_max_cache_size(limit);
+        }
+    }
+
+    /// Get the current cache limit.
+    pub fn cache_limit(&self) -> usize {
+        self.cache.lock().map(|c| c.max_cache_size()).unwrap_or(0)
+    }
+
+    /// Reset peak memory to current active memory (A12).
+    pub fn reset_peak_memory(&self) {
+        self.stats.reset_peak();
+    }
+
     /// Allocate a Metal buffer of at least `size` bytes.
     /// Tries cache first, falls back to device allocation.
+    ///
+    /// Returns a zero-length sentinel buffer for zero-size requests (A10).
     pub fn alloc(&self, size: usize) -> Result<rmlx_metal::metal::Buffer, AllocError> {
+        // A10: Zero-size allocation returns a minimal sentinel buffer.
+        if size == 0 {
+            let buf = self
+                .device
+                .new_buffer(0, MTLResourceOptions::StorageModeShared);
+            return Ok(buf);
+        }
+
+        // Check hard memory limit (A12).
+        let mem_limit = self.memory_limit.load(Ordering::Relaxed);
+        if mem_limit > 0 && self.stats.active() + size > mem_limit {
+            return Err(AllocError::OutOfMemory {
+                requested: size,
+                available: mem_limit.saturating_sub(self.stats.active()),
+            });
+        }
+
         let limit = self.block_limit.load(Ordering::Relaxed);
         if limit > 0 && self.stats.active() + size > limit {
             return Err(AllocError::OutOfMemory {
@@ -115,7 +168,21 @@ impl MetalAllocator {
         let buf = self
             .device
             .new_buffer(size as u64, MTLResourceOptions::StorageModeShared);
-        self.stats.record_alloc(buf.length() as usize);
+        let alloc_size = buf.length() as usize;
+        self.stats.record_alloc(alloc_size);
+
+        // A11: Post-allocation cache trimming. If total memory (active + cache)
+        // exceeds the GC limit after a large allocation, trim the cache.
+        if self.gc_limit > 0 {
+            if let Ok(mut cache) = self.cache.lock() {
+                let total = self.stats.active().saturating_add(cache.cache_size());
+                if total > self.gc_limit {
+                    let overshoot = total - self.gc_limit;
+                    cache.evict(overshoot);
+                }
+            }
+        }
+
         Ok(buf)
     }
 
