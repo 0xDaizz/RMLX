@@ -12,7 +12,7 @@
 
 ---
 
-RMLX reimplements the core Metal GPU inference pipeline of Apple's [MLX](https://github.com/ml-explore/mlx) framework **entirely in Rust**. The ExecGraph pipeline batches 65 command buffers down to 5 per transformer layer, achieving a **16.15x speedup** (110.4ms to 6.8ms) with full numerical parity (max\_diff=6.4e-6).
+RMLX reimplements the core Metal GPU compute pipeline of Apple's [MLX](https://github.com/ml-explore/mlx) framework **entirely in Rust**. The ExecGraph pipeline batches 65 command buffers down to 5 per transformer layer, achieving a **16.15x speedup** (110.4ms to 6.8ms) with full numerical parity (max\_diff=6.4e-6).
 
 ## ✨ Why RMLX?
 
@@ -67,7 +67,7 @@ Measured on Apple Silicon, single transformer layer, Phase 9B-opt complete:
 
 ```mermaid
 graph TD
-    NN["rmlx-nn<br/>Transformer, KV Cache<br/>LLaMA/Qwen/DeepSeek/Mixtral"]
+    NN["rmlx-nn<br/>Linear, Attention, MoE<br/>Transformer, KV Cache"]
     CORE["rmlx-core<br/>14 Op Modules, Array/DType<br/>VJP/LoRA, ExecMode"]
     DIST["rmlx-distributed<br/>EP / MoE / AllReduce<br/>3-zone policy"]
     METAL["rmlx-metal<br/>Device/Queue/SharedEvent<br/>ExecGraph/CommandBatcher"]
@@ -120,7 +120,7 @@ rmlx/                           # 6 crates, 339+ tests
 └── examples/                   # Usage examples
 ```
 
-This repository contains the **framework only**. The model serving layer (`rmlx-lm`) is in a [separate repository](https://github.com/rmlx-lm).
+This repository contains the **framework only**. The serving layer (`rmlx-serve`) is in a [separate repository](https://github.com/rmlx-serve).
 
 ## 📊 Stats
 

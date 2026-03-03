@@ -8,7 +8,7 @@ RMLX는 5개의 레이어로 구성된 계층형 아키텍처이며, 전 Phase(0
 
 ```
 ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐
-  ~/rmlx-lm/ (별도 리포지토리 — rmlx를 Cargo dependency로 참조)
+  ~/rmlx-serve/ (별도 리포지토리 — rmlx를 Cargo dependency로 참조)
 │ ┌─────────────┐  ┌──────────────┐  ┌──────────────┐  ┌───────────────────┐ │
   │  Model Zoo   │  │  Scheduler   │  │  KV Cache    │  │ PP/TP/EP         │
 │ │ (safetensors)│  │ (continuous  │  │  Manager     │  │ Orchestrator     │ │
@@ -78,7 +78,7 @@ RMLX는 5개의 레이어로 구성된 계층형 아키텍처이며, 전 Phase(0
 
 ## 레이어별 상세 설명
 
-### 1. Application Layer — rmlx-lm (별도 리포지토리)
+### 1. Application Layer — rmlx-serve (별도 리포지토리)
 
 모델 서빙에 필요한 애플리케이션 로직을 담당합니다. RMLX 프레임워크를 Cargo dependency로 참조합니다.
 
@@ -89,7 +89,7 @@ RMLX는 5개의 레이어로 구성된 계층형 아키텍처이며, 전 Phase(0
 | **KV Cache Manager** | Paged KV 캐시 관리 (동적 할당/해제) |
 | **PP/TP/EP Orchestrator** | Pipeline/Tensor/Expert Parallelism 오케스트레이션 |
 
-**분리 근거**: 프레임워크(`rmlx`)와 애플리케이션(`rmlx-lm`)은 릴리즈 주기, 의존성, 테스트 전략이 다릅니다. `rmlx`는 다른 애플리케이션(학습, 벤치마크 도구 등)에서도 재사용할 수 있습니다.
+**분리 근거**: 프레임워크(`rmlx`)와 애플리케이션(`rmlx-serve`)은 릴리즈 주기, 의존성, 테스트 전략이 다릅니다. `rmlx`는 다른 애플리케이션(학습, 벤치마크 도구 등)에서도 재사용할 수 있습니다.
 
 ---
 

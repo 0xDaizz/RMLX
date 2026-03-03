@@ -318,9 +318,8 @@ RMLX is actively working to close the gaps identified in Sections 4 and 5. The p
 
 | Phase | Focus | Key Deliverables | Gap Addressed |
 |-------|-------|-----------------|---------------|
-| **Phase 10** | Attention Optimization | Flash Attention 2 with tiled K/V, Paged KV Cache | Sections 4.1, 5.1, 5.2 |
-| **Phase 11** | Serving Optimization | Continuous batching, speculative decoding, dynamic scheduling | Sections 5.3, 5.4 |
-| **Phase 12** | Advanced Quantization | GGUF loader, AWQ, GPTQ, FP8 support | Section 4.4, 8 |
+| **Phase 10** | Attention Optimization | Flash Attention 2 with tiled K/V | Sections 4.1, 5.1 |
+| **Phase 11** | Advanced Quantization | GGUF loader, AWQ, GPTQ, FP8 support | Section 4.4, 8 |
 
 These phases are not yet scheduled. The current focus (Phases 0-9B-opt) prioritizes the Metal GPU pipeline and ExecGraph optimization.
 
@@ -328,9 +327,9 @@ These phases are not yet scheduled. The current focus (Phases 0-9B-opt) prioriti
 
 ## Summary
 
-RMLX is not a replacement for MLX or CUDA. It occupies a specific niche: **high-performance Metal GPU inference on Apple Silicon, written in Rust, optimized for distributed execution over Thunderbolt 5 RDMA**.
+RMLX is not a replacement for MLX or CUDA. It occupies a specific niche: **high-performance Metal GPU ML framework for Apple Silicon, written in Rust, optimized for distributed execution over Thunderbolt 5 RDMA**.
 
-**Choose RMLX when**: You need maximum inference performance on Apple Silicon hardware, you want a single Rust binary with no Python dependency, or you are building a distributed inference cluster of Mac Studios.
+**Choose RMLX when**: You need maximum GPU performance on Apple Silicon hardware, you want a single Rust binary with no Python dependency, or you are building a distributed inference cluster of Mac Studios.
 
 **Choose MLX when**: You need Python compatibility, a mature ecosystem, training support, or broad quantization format support.
 

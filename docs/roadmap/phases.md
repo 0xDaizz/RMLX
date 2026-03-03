@@ -149,7 +149,7 @@ Convert PoC Phase 1-4 validation results into production-quality code. Implement
 
 ### Goal
 
-Build the core Metal kernel execution pipeline needed for LLM inference. Reuse MLX's Metal shaders to dispatch 10 kernel types from Rust.
+Build the core Metal kernel execution pipeline needed for efficient GPU computation. Reuse MLX's Metal shaders to dispatch 10 kernel types from Rust.
 
 ### Key Deliverables
 
@@ -254,7 +254,7 @@ Reimplement MLX EP optimizations in RMLX, achieving additional performance gains
 
 ### Goal
 
-Implement core neural network modules required for LLM inference in the rmlx-nn crate.
+Implement core neural network modules in the rmlx-nn crate.
 
 ### Key Deliverables
 
@@ -403,46 +403,30 @@ Pre-cache contiguous transposed weight matrices to eliminate transpose overhead 
 
 ---
 
-## Phase 10: Flash Attention + Paged KV Cache — Planned
+## Phase 10: Flash Attention — Planned
 
 ### Goal
 
-Implement Flash Attention 2 with tiled K/V processing and paged attention for dynamic KV cache management.
+Implement Flash Attention 2 with tiled K/V processing for efficient attention computation.
 
 ### Key Deliverables
 
 - Flash Attention 2 Metal kernel (tiled Q/K/V with online softmax)
-- Paged KV cache with block-level allocation/deallocation
 - Integration with ExecGraph pipeline
 
 ---
 
-## Phase 11: Continuous Batching + Serving Optimization — Planned
+## Phase 11: Advanced Quantization — Planned
 
 ### Goal
 
-Add continuous batching for production serving and optimize the full inference pipeline.
-
-### Key Deliverables
-
-- Continuous batching scheduler (in-flight request management)
-- Speculative decoding (draft + verify pattern)
-- Request-level KV cache management
-
----
-
-## Phase 12: Advanced Quantization + Model Support — Planned
-
-### Goal
-
-Expand quantization format support and add more model architectures.
+Expand quantization format support for broader model compatibility.
 
 ### Key Deliverables
 
 - GGUF format support
 - AWQ/GPTQ quantization
 - FP8 support
-- Additional model architectures
 
 ---
 

@@ -8,7 +8,7 @@ RMLX is a layered architecture composed of five layers. All Phases (0 through 9B
 
 ```
 ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐
-  ~/rmlx-lm/ (separate repository — references rmlx as a Cargo dependency)
+  ~/rmlx-serve/ (separate repository — references rmlx as a Cargo dependency)
 │ ┌─────────────┐  ┌──────────────┐  ┌──────────────┐  ┌───────────────────┐ │
   │  Model Zoo   │  │  Scheduler   │  │  KV Cache    │  │ PP/TP/EP         │
 │ │ (safetensors)│  │ (continuous  │  │  Manager     │  │ Orchestrator     │ │
@@ -78,7 +78,7 @@ RMLX is a layered architecture composed of five layers. All Phases (0 through 9B
 
 ## Layer Details
 
-### 1. Application Layer — rmlx-lm (Separate Repository)
+### 1. Application Layer — rmlx-serve (Separate Repository)
 
 Handles application logic required for model serving. References the RMLX framework as a Cargo dependency.
 
@@ -89,7 +89,7 @@ Handles application logic required for model serving. References the RMLX framew
 | **KV Cache Manager** | Paged KV cache management (dynamic allocation/deallocation) |
 | **PP/TP/EP Orchestrator** | Pipeline/Tensor/Expert Parallelism orchestration |
 
-**Rationale for separation**: The framework (`rmlx`) and the application (`rmlx-lm`) have different release cycles, dependencies, and testing strategies. `rmlx` can be reused by other applications (training, benchmark tools, etc.).
+**Rationale for separation**: The framework (`rmlx`) and the application (`rmlx-serve`) have different release cycles, dependencies, and testing strategies. `rmlx` can be reused by other applications (training, benchmark tools, etc.).
 
 ---
 

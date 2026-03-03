@@ -44,7 +44,7 @@ rmlx-core/src/
 
 ## DType — Data Types (`dtype.rs`)
 
-Defines the data types used for LLM inference.
+Defines the data types used for tensor computations.
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
