@@ -19,6 +19,7 @@ fn test_group_world() {
 #[test]
 fn test_moe_policy_zones() {
     let policy = MoePolicy::new();
+
     // CPU zone: N <= 64
     assert_eq!(policy.select(32, 128), MoeBackend::Cpu);
     assert_eq!(policy.select(64, 256), MoeBackend::Cpu);
@@ -823,38 +824,48 @@ fn test_rdma_expert_id_preserved_in_merge() {
 
         // Rank 1 owns experts 4-7 (local_expert_count=4).
         // capacity_per_expert = ceil(2 * 1 / 8 * 2.0) = ceil(0.5) = 1
+        // Per-rank capacity layout: [local_experts, world_size * capacity, D]
+        // world_size=2, rank_cap = 2 * 1 = 2
+        // flat_slot = local_expert * rank_cap + src_rank * capacity + pos
         let token_stride = 8;
         let capacity_per_expert = 1; // ceil(2/8 * 2.0) = 1
+        let world_size = 2;
+        let rank_cap = world_size * capacity_per_expert;
         let routed = &dispatch_result.routed_data;
 
-        // Expert 4 (local_idx=0): should have the token from rank 0 tagged expert_id=4 -> [0x11; 8]
-        #[allow(clippy::erasing_op)]
-        let expert4_start = 0 * capacity_per_expert * token_stride;
-        let expert4_data = &routed[expert4_start..expert4_start + token_stride];
+        // Per-rank capacity layout offsets:
+        //   flat_slot = local_expert * rank_cap + src_rank * capacity_per_expert + pos
+        //   byte_offset = flat_slot * token_stride
+
+        // Expert 4 (local_idx=0): token from rank 0 (src_rank=0)
+        // flat_slot = 0 -> byte 0
+        let expert4_data = &routed[0..token_stride];
         assert_eq!(
             expert4_data, &[0x11u8; 8],
             "expert 4 should have rank 0's token [0x11]"
         );
 
-        // Expert 5 (local_idx=1): should have rank 1's local token -> [0x33; 8]
-        #[allow(clippy::identity_op)]
-        let expert5_start = 1 * capacity_per_expert * token_stride;
+        // Expert 5 (local_idx=1): rank 1's local token (src_rank=1)
+        // flat_slot = 1*2 + 1*1 = 3 -> byte 24
+        let expert5_start = (rank_cap + capacity_per_expert) * token_stride;
         let expert5_data = &routed[expert5_start..expert5_start + token_stride];
         assert_eq!(
             expert5_data, &[0x33u8; 8],
             "expert 5 should have rank 1's local token [0x33]"
         );
 
-        // Expert 6 (local_idx=2): should have the token from rank 0 tagged expert_id=6 -> [0x22; 8]
-        let expert6_start = 2 * capacity_per_expert * token_stride;
+        // Expert 6 (local_idx=2): token from rank 0 (src_rank=0)
+        // flat_slot = 2*2 = 4 -> byte 32
+        let expert6_start = 2 * rank_cap * token_stride;
         let expert6_data = &routed[expert6_start..expert6_start + token_stride];
         assert_eq!(
             expert6_data, &[0x22u8; 8],
             "expert 6 should have rank 0's token [0x22]"
         );
 
-        // Expert 7 (local_idx=3): should have rank 1's local token -> [0x44; 8]
-        let expert7_start = 3 * capacity_per_expert * token_stride;
+        // Expert 7 (local_idx=3): rank 1's local token (src_rank=1)
+        // flat_slot = 3*2 + 1*1 = 7 -> byte 56
+        let expert7_start = (3 * rank_cap + capacity_per_expert) * token_stride;
         let expert7_data = &routed[expert7_start..expert7_start + token_stride];
         assert_eq!(
             expert7_data, &[0x44u8; 8],
