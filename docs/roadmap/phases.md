@@ -1,6 +1,6 @@
 # 🗺️ Implementation Roadmap — Phases 0-9B + S1-S5 + Audit Remediation Complete
 
-The rmlx project implementation roadmap. All phases through 9B-opt and serving support phases S1-S5 are complete. A full-crate audit (Phases 0, 1, 2) has been completed with 76 remediation items resolved across all 6 crates. Test count: 534.
+The rmlx project implementation roadmap. All phases through 9B-opt and serving support phases S1-S5 are complete. A full-crate audit (Phases 0, 1, 2) has been completed with 76 remediation items resolved across all 6 crates. Current test count: 543.
 
 ---
 
@@ -58,7 +58,7 @@ The rmlx project implementation roadmap. All phases through 9B-opt and serving s
 | Phase S5: Conv1d/Conv2d | -- | 390 tests | Complete |
 | Audit Phase 0: MoE dispatch/combine (D1-D4) + alloc/Metal/GEMM (A1-A3, M1-M4, C1) | `07fad80`, `27f59af` | 460+ tests | Complete |
 | Audit Phase 1: NN MoE GPU routing + MoE policy + RDMA fixes + Metal/alloc perf | `6ee6e6c`, `014875e`, `d9c54c7` | 490+ tests | Complete |
-| Audit Phase 2: Core ops + NN layers + final codex review | `ea94e94`, `1c48b30`, `f9a3b0c` | 534 tests | Complete |
+| Audit Phase 2: Core ops + NN layers + final codex review | `ea94e94`, `1c48b30`, `f9a3b0c` | 534 tests (at phase completion) | Complete |
 
 ---
 
@@ -582,7 +582,7 @@ Comprehensive audit of all 6 crates with codex-assisted review. Fix all correctn
 
 - [x] `cargo fmt --all --check` -- diff 0
 - [x] `cargo clippy --all-targets` -- 0 warnings
-- [x] `cargo test --workspace` -- 534 tests passing, 0 failures
+- [x] `cargo test --workspace` -- 534 tests passing at audit completion, 0 failures
 - [x] All EP audit findings (D1-D7) resolved
 - [x] Codex review: 0 Critical/High issues remaining
 

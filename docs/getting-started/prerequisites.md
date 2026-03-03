@@ -30,6 +30,38 @@ The following additional hardware is required for distributed inference (Expert 
 > **Note**: RDMA communication over Thunderbolt 5 achieves bandwidth of 6.89 GB/s or higher between nodes.
 > Using dual TB5 ports can scale to 12 GB/s or higher (Phase 6).
 
+### RDMA Setup (Cluster Validation)
+
+RMLX includes lightweight distributed setup/launch helpers modeled after
+`mlx.distributed_config` and `mlx.launch`.
+
+```bash
+# 1) Generate hostfile + baseline host setup (from control node)
+python3 scripts/rmlx_distributed_config.py \
+  --hosts node1,node2 \
+  --backend rdma \
+  --over thunderbolt \
+  --control-iface en0 \
+  --auto-setup \
+  --output rmlx-hosts.json \
+  --verbose
+
+# 2) Validate RDMA visibility on each host
+python3 scripts/rmlx_launch.py \
+  --backend rdma \
+  --hostfile rmlx-hosts.json \
+  -- ibv_devices
+
+# 3) Run RDMA crate tests on both hosts
+python3 scripts/rmlx_launch.py \
+  --backend rdma \
+  --hostfile rmlx-hosts.json \
+  -- cargo test -p rmlx-rdma -- --nocapture
+```
+
+> **Note**: `--auto-setup` requires passwordless `sudo` on each host (SSH mode).
+> If you only want hostfile generation, omit `--auto-setup`.
+
 ---
 
 ## Software

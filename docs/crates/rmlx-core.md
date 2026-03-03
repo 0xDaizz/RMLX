@@ -369,7 +369,9 @@ pub struct PipelineKey {
 |--------|-------------|
 | `new(device)` | Automatically attempts to load AOT metallib |
 | `get_pipeline(name, dtype)` | Pipeline lookup (cache -> AOT -> JIT) |
+| `get_pipeline_with_constants(name, dtype, constants)` | Constant specialization entrypoint. Currently fail-fasts with `todo!("TODO(C15)...")` when `constants` is non-empty, to avoid silent pseudo-support. Use `register_specialized_source(...)` until C15 is implemented. |
 | `register_jit_source(name, source)` | JIT-compiles an MSL source string and caches it |
+| `register_specialized_source(name, source)` | Registers source-level specialized kernels as the current practical workaround for function-constant variants |
 | `has_aot()` | Whether the AOT library is loaded |
 | `cached_pipeline_count()` | Number of cached pipelines |
 | `jit_library_count()` | Number of JIT libraries |

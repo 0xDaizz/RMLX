@@ -3,9 +3,9 @@
 **Rust ML runtime for Apple Silicon -- zero-copy GPU inference with 16.15x CPU-minimal speedup**
 
 [![CI](https://github.com/0xDaizz/RMLX/actions/workflows/ci.yml/badge.svg)](https://github.com/0xDaizz/RMLX/actions/workflows/ci.yml)
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust 1.80+](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/tests-534%20passing-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-543%20passing-brightgreen.svg)]()
 [![macOS Apple Silicon](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-lightgrey.svg)]()
 
 > 한국어 문서: [docs/README_ko.md](docs/README_ko.md)
@@ -112,7 +112,7 @@ cd rmlx
 # Build the entire workspace
 cargo build --workspace
 
-# Run all tests (534)
+# Run all tests (543)
 cargo test --workspace
 
 # Format and lint check
@@ -122,10 +122,17 @@ cargo clippy --workspace -- -D warnings
 
 > Requires macOS 14+ on Apple Silicon. See [Prerequisites](docs/getting-started/prerequisites.md) for details.
 
+Distributed 2-node RDMA runbook (minimal):
+
+```bash
+python3 scripts/rmlx_distributed_config.py --hosts node1,node2 --backend rdma --over thunderbolt --output rmlx-hosts.json --verbose
+python3 scripts/rmlx_launch.py --backend rdma --hostfile rmlx-hosts.json -- ibv_devices
+```
+
 ## 📁 Project Structure
 
 ```
-rmlx/                           # 6 crates, 534 tests
+rmlx/                           # 6 crates, 543 tests
 ├── crates/
 │   ├── rmlx-metal/             # Metal GPU abstraction (ExecGraph, CommandBatcher, Fence, Capture)
 │   ├── rmlx-alloc/             # Zero-copy memory allocator (Residency, SmallAlloc)
@@ -144,7 +151,7 @@ rmlx/                           # 6 crates, 534 tests
 | Metric | Value |
 |--------|-------|
 | Crates | 6 |
-| Tests | 534 |
+| Tests | 543 |
 | Op modules | 25 |
 | NN activations | 14 |
 | Model architectures | 4 (LLaMA, Qwen, DeepSeek-V3, Mixtral) |
@@ -153,7 +160,7 @@ rmlx/                           # 6 crates, 534 tests
 
 ## ⚠️ Current Limitations
 
-- **Single-node only** -- RDMA framework exists but multi-node inference is not yet integrated
+- **Distributed CI is manual** -- multi-node RDMA/perf/deadlock validation runs on dedicated hardware outside GitHub Actions
 - **No Python API** -- Rust-only interface
 - **TB5 bandwidth** -- limited to 16 GB/s vs NVLink 600 GB/s
 
@@ -171,9 +178,4 @@ Full documentation: **[docs/README.md](docs/README.md)**
 
 ## 📄 License
 
-Licensed under either of:
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
-- MIT license ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
-
-at your option.
+Licensed under the MIT license: [LICENSE](LICENSE) (<http://opensource.org/licenses/MIT>).

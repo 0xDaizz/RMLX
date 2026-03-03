@@ -1,7 +1,7 @@
 # Audit: EP Dispatch/Combine — RMLX vs MLX
 
 > Date: 2026-03-03
-> Scope: `rmlx-distributed` (RMLX) vs `~/mlx` on hwstudio1 (MLX)
+> Scope: `rmlx-distributed` (RMLX) vs `~/mlx` on a reference host (MLX)
 > Status: **All findings RESOLVED** (Phase 0+1+2 audit remediation, 2026-03-03)
 
 ---
@@ -144,7 +144,7 @@ MLX's AllToAll primitive supports vjp/jvp/vmap. RMLX does not (inference-only, l
 
 ---
 
-## 6. MLX Reference File Locations (hwstudio1)
+## 6. MLX Reference File Locations (reference host)
 
 | File | Role |
 |------|------|

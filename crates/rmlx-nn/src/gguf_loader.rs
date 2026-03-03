@@ -7,7 +7,7 @@
 //! # Workflow
 //!
 //! 1. Parse the GGUF header to get tensor metadata.
-//! 2. Memory-map the file for zero-copy tensor data access.
+//! 2. Seek/read tensor byte ranges from the GGUF data section.
 //! 3. Use [`GgufWeightMap`] to look up tensors by model-layer name.
 //! 4. Convert GGUF tensor data into RMLX `Array` objects on the Metal device.
 //!

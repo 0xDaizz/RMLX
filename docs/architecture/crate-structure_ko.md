@@ -186,7 +186,7 @@ rmlx/
 | **목적** | Zero-copy 메모리 할당 및 버퍼 풀 관리를 담당합니다. `posix_memalign` → `newBufferWithBytesNoCopy` 패턴으로 복사 없는 Metal 버퍼를 생성하고, RDMA `ibv_mr` 이중 등록을 지원합니다. |
 | **핵심 모듈** | `zero_copy.rs` (ZeroCopyBuffer, CompletionFence), `pool.rs` (이중 등록 버퍼 풀), `cache.rs` (size-binned 캐시), `stats.rs` (할당 통계), `leak_detector.rs` (메모리 누수 감지) |
 | **의존성** | `rmlx-metal`, libc |
-| **현재 상태** | 완료 — ZeroCopyBuffer, DualRegPool, MetalAllocator, size-binned 캐시, 누수 감지 전체 구현 |
+| **현재 상태** | 완료 — ZeroCopyBuffer, DualRegPool, MetalAllocator, size-binned 캐시, 누수 감지 전체 구현. `ResidencyManager` API는 제공되지만, Metal `MTLResidencySet` 백엔드는 `metal-rs` 지원 전까지 문서화된 스텁입니다. |
 
 ---
 
@@ -254,7 +254,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.80"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 
 [workspace.dependencies]
 metal = "0.31"
