@@ -47,7 +47,7 @@ fn test_basic_metal_compute() {
 
     // 3. Compile shader from source (JIT) and get pipeline
     let library = compile_source(device.raw(), VECTOR_ADD_SOURCE).expect("shader compilation");
-    let mut cache = PipelineCache::new(device.raw());
+    let cache = PipelineCache::new(device.raw());
     let pipeline = cache
         .get_or_create("vector_add_float", &library)
         .expect("pipeline creation");
@@ -56,7 +56,7 @@ fn test_basic_metal_compute() {
     let cmd_buf = queue.new_command_buffer();
     encode_compute_1d(
         cmd_buf,
-        pipeline,
+        &pipeline,
         &[(&buffer_a, 0), (&buffer_b, 0), (&buffer_out, 0)],
         4,
     );
