@@ -1,4 +1,6 @@
 //! Multi-head attention with RoPE and GQA support.
+//!
+//! KV cache uses pre-allocated buffers with O(1) append (no full-history copy).
 
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
@@ -7,26 +9,67 @@ use rmlx_core::ops;
 
 use crate::linear::{Linear, LinearConfig};
 
+// ---------------------------------------------------------------------------
+// KV Cache — pre-allocated, O(1) append
+// ---------------------------------------------------------------------------
+
 /// Per-layer KV cache for incremental decoding.
-/// Stores projected+RoPE'd K, V heads from previous steps.
+///
+/// Uses a pre-allocated contiguous buffer per KV head with step-based indexing.
+/// Appending new tokens writes only the new data — no full-history copy.
 pub struct LayerKvCache {
-    /// Cached K heads per kv_head: each [cached_seq, head_dim]
+    /// Cached K heads per kv_head: each [max_seq, head_dim], pre-allocated.
     pub keys: Vec<Array>,
-    /// Cached V heads per kv_head: each [cached_seq, head_dim]
+    /// Cached V heads per kv_head: each [max_seq, head_dim], pre-allocated.
     pub values: Vec<Array>,
-    /// Number of tokens currently cached
+    /// Number of tokens currently cached (position offset for next append).
     pub seq_len: usize,
-    /// Number of KV heads (for validation)
+    /// Maximum sequence length this cache was pre-allocated for.
+    max_seq_len: usize,
+    /// Number of KV heads (for validation).
     num_kv_heads: usize,
+    /// Head dimension.
+    head_dim: usize,
 }
 
 impl LayerKvCache {
+    /// Create a new **empty** cache (no pre-allocation).
+    /// Compatible with old code that did not pre-allocate.
     pub fn new(num_kv_heads: usize) -> Self {
         Self {
             keys: Vec::new(),
             values: Vec::new(),
             seq_len: 0,
+            max_seq_len: 0,
             num_kv_heads,
+            head_dim: 0,
+        }
+    }
+
+    /// Create a pre-allocated cache with room for `max_seq_len` tokens.
+    ///
+    /// Each KV head gets a single [max_seq_len, head_dim] buffer up-front.
+    /// Subsequent `append` calls write into the next slot(s) with no reallocation.
+    pub fn preallocated(
+        device: &metal::Device,
+        num_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        dtype: DType,
+    ) -> Self {
+        let mut keys = Vec::with_capacity(num_kv_heads);
+        let mut values = Vec::with_capacity(num_kv_heads);
+        for _ in 0..num_kv_heads {
+            keys.push(Array::zeros(device, &[max_seq_len, head_dim], dtype));
+            values.push(Array::zeros(device, &[max_seq_len, head_dim], dtype));
+        }
+        Self {
+            keys,
+            values,
+            seq_len: 0,
+            max_seq_len,
+            num_kv_heads,
+            head_dim,
         }
     }
 
@@ -40,9 +83,17 @@ impl LayerKvCache {
         self.num_kv_heads
     }
 
+    /// Current cached sequence length (also the RoPE position offset).
+    pub fn position_offset(&self) -> usize {
+        self.seq_len
+    }
+
     /// Append new K, V heads from the current step.
-    /// `new_keys` and `new_values` each have `num_kv_heads` elements,
-    /// each of shape [new_seq, head_dim].
+    ///
+    /// For pre-allocated caches, this copies only `new_tokens` rows into the
+    /// next available slots — O(new_tokens), not O(total_cached).
+    ///
+    /// For legacy (non-pre-allocated) caches, falls back to concat (as before).
     pub fn append(
         &mut self,
         new_keys: Vec<Array>,
@@ -60,12 +111,24 @@ impl LayerKvCache {
             )));
         }
 
-        if self.keys.is_empty() {
-            // First append — just store directly
+        if self.max_seq_len > 0 {
+            // Pre-allocated path: write into slot [seq_len .. seq_len + new_tokens]
+            if self.seq_len + new_tokens > self.max_seq_len {
+                return Err(KernelError::InvalidShape(format!(
+                    "LayerKvCache: overflow: {} cached + {} new > {} max",
+                    self.seq_len, new_tokens, self.max_seq_len
+                )));
+            }
+            self.append_preallocated(new_keys, new_values, new_tokens, registry, queue)?;
+        } else if self.keys.is_empty() {
+            // Legacy path, first append
             self.keys = new_keys;
             self.values = new_values;
+            if let Some(k) = self.keys.first() {
+                self.head_dim = k.shape()[1];
+            }
         } else {
-            // Concatenate along seq dimension: [old_seq, hd] + [new_seq, hd] -> [total_seq, hd]
+            // Legacy path, concat
             for (i, new_k) in new_keys.into_iter().enumerate() {
                 self.keys[i] = concat_seq_dim(registry, &self.keys[i], &new_k, queue)?;
             }
@@ -76,11 +139,107 @@ impl LayerKvCache {
         self.seq_len += new_tokens;
         Ok(())
     }
+
+    /// O(1)-per-token append into pre-allocated buffers.
+    fn append_preallocated(
+        &self,
+        new_keys: Vec<Array>,
+        new_values: Vec<Array>,
+        new_tokens: usize,
+        registry: &KernelRegistry,
+        queue: &metal::CommandQueue,
+    ) -> Result<(), KernelError> {
+        let elem_size = self.keys[0].dtype().size_of();
+        let copy_kernel = match self.keys[0].dtype() {
+            DType::Float32 => "copy_f32",
+            DType::Float16 => "copy_f16",
+            DType::Bfloat16 => "copy_bf16",
+            other => {
+                return Err(KernelError::InvalidShape(format!(
+                    "LayerKvCache: unsupported dtype {:?}",
+                    other
+                )))
+            }
+        };
+        let pipeline = registry.get_pipeline(copy_kernel, self.keys[0].dtype())?;
+        let count = (new_tokens * self.head_dim) as u64;
+        if count == 0 {
+            return Ok(());
+        }
+
+        // Single command buffer for all heads
+        let cb = queue.new_command_buffer();
+        let dst_row_offset = self.seq_len * self.head_dim * elem_size;
+
+        for i in 0..self.num_kv_heads {
+            // Copy new keys into slot
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&pipeline);
+            enc.set_buffer(
+                0,
+                Some(new_keys[i].metal_buffer()),
+                new_keys[i].offset() as u64,
+            );
+            enc.set_buffer(
+                1,
+                Some(self.keys[i].metal_buffer()),
+                (self.keys[i].offset() + dst_row_offset) as u64,
+            );
+            let grid = metal::MTLSize::new(count, 1, 1);
+            let tg = metal::MTLSize::new(
+                std::cmp::min(pipeline.max_total_threads_per_threadgroup(), count),
+                1,
+                1,
+            );
+            enc.dispatch_threads(grid, tg);
+            enc.end_encoding();
+
+            // Copy new values into slot
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&pipeline);
+            enc.set_buffer(
+                0,
+                Some(new_values[i].metal_buffer()),
+                new_values[i].offset() as u64,
+            );
+            enc.set_buffer(
+                1,
+                Some(self.values[i].metal_buffer()),
+                (self.values[i].offset() + dst_row_offset) as u64,
+            );
+            enc.dispatch_threads(grid, tg);
+            enc.end_encoding();
+        }
+
+        cb.commit();
+        cb.wait_until_completed();
+        Ok(())
+    }
+
+    /// Get a view of cached keys for head `h`, shape [seq_len, head_dim].
+    pub fn cached_keys(&self, head: usize) -> Array {
+        let a = &self.keys[head];
+        // Return a view of only the filled portion [0..seq_len, :]
+        a.view(
+            vec![self.seq_len, self.head_dim],
+            a.strides().to_vec(),
+            a.offset(),
+        )
+    }
+
+    /// Get a view of cached values for head `h`, shape [seq_len, head_dim].
+    pub fn cached_values(&self, head: usize) -> Array {
+        let a = &self.values[head];
+        a.view(
+            vec![self.seq_len, self.head_dim],
+            a.strides().to_vec(),
+            a.offset(),
+        )
+    }
 }
 
 /// Concatenate two 2D arrays along dimension 0 (seq dimension).
 /// `a`: [seq_a, dim], `b`: [seq_b, dim] -> [seq_a + seq_b, dim]
-/// Uses the copy kernel to assemble the result.
 fn concat_seq_dim(
     registry: &KernelRegistry,
     a: &Array,
@@ -158,6 +317,10 @@ fn concat_seq_dim(
 
     Ok(result)
 }
+
+// ---------------------------------------------------------------------------
+// Attention config and module
+// ---------------------------------------------------------------------------
 
 pub struct AttentionConfig {
     pub num_heads: usize,
@@ -253,19 +416,10 @@ impl Attention {
 
     /// Forward pass for multi-head attention.
     ///
-    /// `x`: [seq_len, hidden_size] (batch=1 assumed, tokens are rows)
-    /// `cos_freqs`: [max_seq, head_dim/2] for RoPE (optional)
-    /// `sin_freqs`: [max_seq, head_dim/2] for RoPE (optional)
-    /// `mask`: [seq_len, seq_len] additive causal mask (optional, -inf for masked positions)
-    /// `cache`: optional KV cache for incremental decoding. When provided,
-    ///   newly projected+RoPE'd K,V heads are appended to the cache and attention
-    ///   uses the full cached K,V. Pass `None` for stateless full-sequence inference.
-    ///
-    /// **RoPE contract**: When using `cache`, the caller MUST provide pre-sliced
-    /// `cos_freqs`/`sin_freqs` tables matching the current input positions.
-    /// For example, at decode step position 5, pass [1, half_dim] RoPE tables
-    /// containing only position 5's frequencies. The attention layer uses offset=0
-    /// internally, relying on the caller to provide correctly positioned tables.
+    /// `x`: [seq_len, hidden_size]
+    /// `cos_freqs`, `sin_freqs`: RoPE frequency tables (optional)
+    /// `mask`: additive causal mask (optional)
+    /// `cache`: optional pre-allocated KV cache for incremental decoding
     ///
     /// Returns: [seq_len, hidden_size]
     #[allow(clippy::too_many_arguments)]
@@ -285,16 +439,11 @@ impl Attention {
         let head_dim = self.config.head_dim;
         let repeats = num_heads / num_kv_heads;
 
-        // Project: Q, K, V
-        // x: [seq_len, hidden_size]
-        // Q: [seq_len, num_heads * head_dim]
-        // K: [seq_len, num_kv_heads * head_dim]
-        // V: [seq_len, num_kv_heads * head_dim]
+        // Project Q, K, V
         let q = self.q_proj.forward(x, registry, queue)?;
         let k = self.k_proj.forward(x, registry, queue)?;
         let v = self.v_proj.forward(x, registry, queue)?;
 
-        // Validate projected shapes before head slicing
         let expected_q_width = num_heads * head_dim;
         let expected_kv_width = num_kv_heads * head_dim;
         if q.shape() != [seq_len, expected_q_width] {
@@ -313,41 +462,31 @@ impl Attention {
                 expected_kv_width
             )));
         }
-        if v.shape() != [seq_len, expected_kv_width] {
-            return Err(KernelError::InvalidShape(format!(
-                "V projection shape {:?}, expected [{}, {}]",
-                v.shape(),
-                seq_len,
-                expected_kv_width
-            )));
-        }
 
-        // Apply RoPE per-head for Q and K.
-        // RoPE kernel expects [seq_len, head_dim], so we process each head slice.
         let dev = registry.device().raw();
         let elem_size = q.dtype().size_of();
 
-        // Build Q heads with RoPE: [num_heads, seq_len, head_dim]
+        // RoPE offset from cache position
+        let rope_offset = cache.as_ref().map_or(0u32, |c| c.seq_len as u32);
+
+        // Split into heads and apply RoPE
         let mut q_heads: Vec<Array> = Vec::with_capacity(num_heads);
         for h in 0..num_heads {
             let offset = q.offset() + h * head_dim * elem_size;
-            // View into the h-th head: shape [seq_len, head_dim], stride [num_heads*head_dim, 1]
             let q_head = q.view(
                 vec![seq_len, head_dim],
                 vec![num_heads * head_dim, 1],
                 offset,
             );
-            // Make contiguous for RoPE
             let q_head = ops::copy::copy(registry, &q_head, queue)?;
             let q_head = if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
-                ops::rope::rope(registry, &q_head, cos, sin, 0, 1.0, queue)?
+                ops::rope::rope(registry, &q_head, cos, sin, rope_offset, 1.0, queue)?
             } else {
                 q_head
             };
             q_heads.push(q_head);
         }
 
-        // Build K heads with RoPE: [num_kv_heads, seq_len, head_dim]
         let mut k_heads: Vec<Array> = Vec::with_capacity(num_kv_heads);
         for h in 0..num_kv_heads {
             let offset = k.offset() + h * head_dim * elem_size;
@@ -358,14 +497,13 @@ impl Attention {
             );
             let k_head = ops::copy::copy(registry, &k_head, queue)?;
             let k_head = if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
-                ops::rope::rope(registry, &k_head, cos, sin, 0, 1.0, queue)?
+                ops::rope::rope(registry, &k_head, cos, sin, rope_offset, 1.0, queue)?
             } else {
                 k_head
             };
             k_heads.push(k_head);
         }
 
-        // Build V heads: [num_kv_heads, seq_len, head_dim]
         let mut v_heads: Vec<Array> = Vec::with_capacity(num_kv_heads);
         for h in 0..num_kv_heads {
             let offset = v.offset() + h * head_dim * elem_size;
@@ -378,80 +516,57 @@ impl Attention {
             v_heads.push(v_head);
         }
 
-        // If cache is provided, append new K,V and use full cached K,V for attention.
-        // We move k_heads/v_heads into the cache; the cache then owns the full history.
-        // If no cache, use k_heads/v_heads directly.
-        //
-        // To satisfy Rust's move checker, we store the "effective" K,V heads in new
-        // Vecs that either borrow from the cache or own the original heads.
+        // Append to KV cache (O(1) with pre-allocated cache)
         let (k_final, v_final, total_seq) = match cache {
             Some(ref mut c) => {
                 c.append(k_heads, v_heads, seq_len, registry, queue)?;
-                // Create views into cache arrays (cheap: shares underlying Metal buffers)
-                let kf: Vec<Array> = c
-                    .keys
-                    .iter()
-                    .map(|a| a.view(a.shape().to_vec(), a.strides().to_vec(), a.offset()))
-                    .collect();
-                let vf: Vec<Array> = c
-                    .values
-                    .iter()
-                    .map(|a| a.view(a.shape().to_vec(), a.strides().to_vec(), a.offset()))
-                    .collect();
-                (kf, vf, c.seq_len)
+                let kf: Vec<Array> = (0..num_kv_heads).map(|h| c.cached_keys(h)).collect();
+                let vf: Vec<Array> = (0..num_kv_heads).map(|h| c.cached_values(h)).collect();
+                let ts = c.seq_len;
+                (kf, vf, ts)
             }
             None => (k_heads, v_heads, seq_len),
         };
 
         // Scaled dot-product attention per query head
-        // For GQA: each kv head is shared by `repeats` query heads.
         let scale = 1.0 / (head_dim as f32).sqrt();
-        let scale_arr = Array::from_slice(
-            dev,
-            &vec![scale; seq_len * total_seq],
-            vec![seq_len, total_seq],
-        );
 
-        let mut attn_outputs: Vec<Array> = Vec::with_capacity(num_heads);
-        for (h, q_h) in q_heads.iter().enumerate() {
-            let kv_idx = h / repeats;
-            let k_h = &k_final[kv_idx];
-            let v_h = &v_final[kv_idx];
+        // Try fused SDPA path (Flash Attention style — no intermediate score matrix)
+        let attn_outputs = if head_dim <= 128 {
+            // Fused path: single kernel per head, Q@K^T + scale + mask + softmax + @V
+            ops::sdpa::sdpa_batched(registry, &q_heads, &k_final, &v_final, mask, scale, queue)?
+        } else {
+            // Unfused fallback for very large head dims
+            let mut outputs: Vec<Array> = Vec::with_capacity(num_heads);
+            for (h, q_h) in q_heads.iter().enumerate() {
+                let kv_idx = h / repeats;
+                let k_h = &k_final[kv_idx];
+                let v_h = &v_final[kv_idx];
 
-            // Q @ K^T: [seq_len, head_dim] @ [head_dim, total_seq] -> [seq_len, total_seq]
-            let k_t = k_h.view(vec![head_dim, total_seq], vec![1, head_dim], k_h.offset());
-            let k_t = ops::copy::copy(registry, &k_t, queue)?;
-            let scores = ops::matmul::matmul(registry, q_h, &k_t, queue)?;
+                let k_t = k_h.view(vec![head_dim, total_seq], vec![1, head_dim], k_h.offset());
+                let k_t = ops::copy::copy(registry, &k_t, queue)?;
+                let scores = ops::matmul::matmul(registry, q_h, &k_t, queue)?;
+                let scores = scale_scores(&scores, scale, registry, queue)?;
+                let scores = if let Some(m) = mask {
+                    ops::binary::add(registry, &scores, m, queue)?
+                } else {
+                    scores
+                };
+                let attn_weights = ops::softmax::softmax(registry, &scores, queue)?;
+                let head_out = ops::matmul::matmul(registry, &attn_weights, v_h, queue)?;
+                outputs.push(head_out);
+            }
+            outputs
+        };
 
-            // Scale
-            let scores = ops::binary::mul(registry, &scores, &scale_arr, queue)?;
-
-            // Apply mask (additive: scores + mask where mask has -inf for masked positions)
-            // During decode with cache (seq_len=1), mask is typically None so the single
-            // query token attends to all cached positions.
-            let scores = if let Some(m) = mask {
-                ops::binary::add(registry, &scores, m, queue)?
-            } else {
-                scores
-            };
-
-            // Softmax
-            let attn_weights = ops::softmax::softmax(registry, &scores, queue)?;
-
-            // attn_weights @ V: [seq_len, total_seq] @ [total_seq, head_dim] -> [seq_len, head_dim]
-            let head_out = ops::matmul::matmul(registry, &attn_weights, v_h, queue)?;
-            attn_outputs.push(head_out);
-        }
-
-        // Concatenate heads: [seq_len, num_heads * head_dim]
-        // Batched: all head*row copies dispatched in a single command buffer.
+        // Concatenate heads — batch all copies in one command buffer
         let hidden_size = num_heads * head_dim;
         let concat = Array::zeros(dev, &[seq_len, hidden_size], q.dtype());
 
         let copy_kernel = match q.dtype() {
-            rmlx_core::dtype::DType::Float32 => "copy_f32",
-            rmlx_core::dtype::DType::Float16 => "copy_f16",
-            rmlx_core::dtype::DType::Bfloat16 => "copy_bf16",
+            DType::Float32 => "copy_f32",
+            DType::Float16 => "copy_f16",
+            DType::Bfloat16 => "copy_bf16",
             _ => {
                 return Err(KernelError::InvalidShape(format!(
                     "attention concat: unsupported dtype {:?}",
@@ -466,13 +581,10 @@ impl Attention {
                 let src_offset = head_out.offset() + row * head_dim * elem_size;
                 let dst_offset = row * hidden_size * elem_size + h * head_dim * elem_size;
 
-                let src_view = head_out.view(vec![head_dim], vec![1], src_offset);
-                let dst_view = concat.view(vec![head_dim], vec![1], dst_offset);
-
                 let enc = cb.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(&pipeline);
-                enc.set_buffer(0, Some(src_view.metal_buffer()), src_view.offset() as u64);
-                enc.set_buffer(1, Some(dst_view.metal_buffer()), dst_view.offset() as u64);
+                enc.set_buffer(0, Some(head_out.metal_buffer()), src_offset as u64);
+                enc.set_buffer(1, Some(concat.metal_buffer()), dst_offset as u64);
                 let grid = metal::MTLSize::new(head_dim as u64, 1, 1);
                 let tg = metal::MTLSize::new(
                     std::cmp::min(
@@ -489,7 +601,7 @@ impl Attention {
         cb.commit();
         cb.wait_until_completed();
 
-        // Output projection: [seq_len, hidden_size] -> [seq_len, hidden_size]
+        // Output projection
         self.o_proj.forward(&concat, registry, queue)
     }
 
@@ -515,5 +627,30 @@ impl Attention {
 
     pub fn config(&self) -> &AttentionConfig {
         &self.config
+    }
+}
+
+/// Scale attention scores by a scalar factor.
+///
+/// Tries broadcasting `scalar * matrix` first. If binary ops don't yet support
+/// broadcasting, falls back to a manual element-wise scale via a filled array.
+fn scale_scores(
+    scores: &Array,
+    scale: f32,
+    registry: &KernelRegistry,
+    queue: &metal::CommandQueue,
+) -> Result<Array, KernelError> {
+    let dev = registry.device().raw();
+    // Try scalar broadcast: create [1] scalar and rely on broadcasting
+    let scale_arr = Array::from_slice(dev, &[scale], vec![1]);
+    match ops::binary::mul(registry, scores, &scale_arr, queue) {
+        Ok(result) => Ok(result),
+        Err(_) => {
+            // Fallback: fill a full-sized array with the scale factor
+            let numel = scores.numel();
+            let data = vec![scale; numel];
+            let scale_full = Array::from_slice(dev, &data, scores.shape().to_vec());
+            ops::binary::mul(registry, scores, &scale_full, queue)
+        }
     }
 }
