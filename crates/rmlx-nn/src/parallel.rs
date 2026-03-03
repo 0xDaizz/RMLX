@@ -261,11 +261,9 @@ impl ColumnParallelLinear {
 
         // ── N3 fix: GPU matmul instead of cpu_matmul_f32 ──
         // Transpose weight: [shard_out, k] -> [k, shard_out] via stride swap (zero-copy)
-        let w_t = self.weight.view(
-            vec![k, shard_out],
-            vec![1, k],
-            self.weight.offset(),
-        );
+        let w_t = self
+            .weight
+            .view(vec![k, shard_out], vec![1, k], self.weight.offset());
 
         // GPU matmul: [batch, k] @ [k, shard_out] -> [batch, shard_out]
         let local_out_arr = ops::matmul::matmul(registry, input, &w_t, queue)
@@ -418,11 +416,9 @@ impl RowParallelLinear {
 
         // ── N3 fix: GPU matmul instead of cpu_matmul_f32 ──
         // Transpose weight: [out, shard_in] -> [shard_in, out] via stride swap (zero-copy)
-        let w_t = self.weight.view(
-            vec![shard_in, n],
-            vec![1, shard_in],
-            self.weight.offset(),
-        );
+        let w_t = self
+            .weight
+            .view(vec![shard_in, n], vec![1, shard_in], self.weight.offset());
 
         // GPU matmul: [batch, shard_in] @ [shard_in, out] -> [batch, out]
         let local_out_arr = ops::matmul::matmul(registry, input, &w_t, queue)
@@ -455,9 +451,7 @@ mod tests {
     }
 
     #[cfg(feature = "distributed")]
-    fn setup_registry_and_queue(
-        device: &metal::Device,
-    ) -> (KernelRegistry, metal::CommandQueue) {
+    fn setup_registry_and_queue(device: &metal::Device) -> (KernelRegistry, metal::CommandQueue) {
         let gpu = rmlx_metal::device::GpuDevice::system_default().expect("Metal device");
         let queue = device.new_command_queue();
         let registry = KernelRegistry::new(gpu);
