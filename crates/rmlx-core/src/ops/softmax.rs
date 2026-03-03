@@ -595,10 +595,7 @@ pub fn softmax(
     encoder.set_buffer(1, Some(out.metal_buffer()), 0);
     encoder.set_buffer(2, Some(&axis_buf), 0);
 
-    let tg_size = std::cmp::min(
-        tg_size_hint,
-        pipeline.max_total_threads_per_threadgroup(),
-    );
+    let tg_size = std::cmp::min(tg_size_hint, pipeline.max_total_threads_per_threadgroup());
     encoder.dispatch_thread_groups(
         MTLSize::new(num_rows as u64, 1, 1),
         MTLSize::new(tg_size, 1, 1),

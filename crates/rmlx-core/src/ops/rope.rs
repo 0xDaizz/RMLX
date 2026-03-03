@@ -409,23 +409,24 @@ fn parse_input_shape(input: &Array) -> Result<(usize, usize, usize), KernelError
 ///
 /// # Arguments
 ///
-/// * `input`       - `[seq_len, head_dim]` or `[batch*n_heads, seq_len, head_dim]`.
-///                   `head_dim` must be even.
-/// * `cos_freqs`   - `[max_seq_len, head_dim/2]` precomputed cosine values.
-/// * `sin_freqs`   - `[max_seq_len, head_dim/2]` precomputed sine values.
-/// * `offset`      - Position offset for incremental/KV-cache decoding.
-/// * `scale`       - Position scale factor (`theta = scale * (offset + pos) * inv_freq`).
-///                   When using precomputed tables the scale is already baked in;
-///                   pass `1.0` if your tables already incorporate scaling.
+/// * `input` - `[seq_len, head_dim]` or `[batch*n_heads, seq_len, head_dim]`.
+///   `head_dim` must be even.
+/// * `cos_freqs` - `[max_seq_len, head_dim/2]` precomputed cosine values.
+/// * `sin_freqs` - `[max_seq_len, head_dim/2]` precomputed sine values.
+/// * `offset` - Position offset for incremental/KV-cache decoding.
+/// * `scale` - Position scale factor (`theta = scale * (offset + pos) * inv_freq`).
+///   When using precomputed tables the scale is already baked in;
+///   pass `1.0` if your tables already incorporate scaling.
 /// * `traditional` - `true` for GPT-NeoX style (2k, 2k+1) pairing,
-///                   `false` for LLaMA/Mistral split-half (k, k+half_dim).
-/// * `forward`     - `true` for normal rotation, `false` for inverse/adjoint.
-/// * `queue`       - Metal command queue.
+///   `false` for LLaMA/Mistral split-half (k, k+half_dim).
+/// * `forward` - `true` for normal rotation, `false` for inverse/adjoint.
+/// * `queue` - Metal command queue.
 ///
 /// # Backward compatibility
 ///
 /// The original 4-parameter `rope()` function is still available below with
 /// the same signature (it delegates here with `traditional=true, forward=true`).
+#[allow(clippy::too_many_arguments)]
 pub fn rope_ext(
     registry: &KernelRegistry,
     input: &Array,
@@ -528,11 +529,7 @@ pub fn rope_ext(
     encoder.set_buffer(8, Some(&trad_buf), 0);
     encoder.set_buffer(9, Some(&fwd_buf), 0);
 
-    let grid = MTLSize::new(
-        half_dim as u64,
-        seq_len as u64,
-        n_batch as u64,
-    );
+    let grid = MTLSize::new(half_dim as u64, seq_len as u64, n_batch as u64);
     let tg = MTLSize::new(
         std::cmp::min(64, half_dim as u64),
         std::cmp::min(16, seq_len as u64),
@@ -567,6 +564,7 @@ pub fn rope_ext(
 /// * `traditional` - `true` for (2k, 2k+1), `false` for split-half.
 /// * `forward`     - `true` for forward, `false` for inverse/adjoint.
 /// * `queue`       - Metal command queue.
+#[allow(clippy::too_many_arguments)]
 pub fn rope_otf(
     registry: &KernelRegistry,
     input: &Array,
@@ -623,11 +621,7 @@ pub fn rope_otf(
     encoder.set_buffer(8, Some(&fwd_buf), 0);
 
     let half_dim = head_dim / 2;
-    let grid = MTLSize::new(
-        half_dim as u64,
-        seq_len as u64,
-        n_batch as u64,
-    );
+    let grid = MTLSize::new(half_dim as u64, seq_len as u64, n_batch as u64);
     let tg = MTLSize::new(
         std::cmp::min(64, half_dim as u64),
         std::cmp::min(16, seq_len as u64),
@@ -664,14 +658,8 @@ pub fn rope(
     queue: &metal::CommandQueue,
 ) -> Result<Array, KernelError> {
     rope_ext(
-        registry,
-        input,
-        cos_freqs,
-        sin_freqs,
-        offset,
-        scale,
-        true,  // traditional
-        true,  // forward
+        registry, input, cos_freqs, sin_freqs, offset, scale, true, // traditional
+        true, // forward
         queue,
     )
 }
@@ -712,8 +700,8 @@ pub fn precompute_freqs(
 
     for pos in 0..max_seq_len {
         let l = scale * (pos as f32);
-        for k in 0..half_dim {
-            let theta = l * inv_freq[k];
+        for (k, &freq) in inv_freq.iter().enumerate().take(half_dim) {
+            let theta = l * freq;
             let idx = pos * half_dim + k;
             cos_table[idx] = theta.cos();
             sin_table[idx] = theta.sin();

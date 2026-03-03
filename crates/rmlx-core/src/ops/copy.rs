@@ -585,7 +585,7 @@ fn u32_buffer(device: &metal::Device, val: u32) -> metal::Buffer {
 fn u32_slice_buffer(device: &metal::Device, data: &[u32]) -> metal::Buffer {
     device.new_buffer_with_data(
         data.as_ptr() as *const _,
-        (data.len() * std::mem::size_of::<u32>()) as u64,
+        std::mem::size_of_val(data) as u64,
         metal::MTLResourceOptions::StorageModeShared,
     )
 }
@@ -742,7 +742,7 @@ pub fn copy_with_mode(
     // Compute grid size: for contiguous, divide by WPT; for strided, 1 per element.
     let threads = if src.is_contiguous() {
         let w = wpt(src.dtype());
-        (numel as u64 + w - 1) / w
+        (numel as u64).div_ceil(w)
     } else {
         numel as u64
     };
@@ -793,7 +793,7 @@ pub fn copy_async(
 
     let threads = if src.is_contiguous() {
         let w = wpt(src.dtype());
-        (numel as u64 + w - 1) / w
+        (numel as u64).div_ceil(w)
     } else {
         numel as u64
     };

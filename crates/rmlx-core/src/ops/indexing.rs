@@ -398,8 +398,8 @@ pub fn gather(
     queue: &metal::CommandQueue,
 ) -> Result<Array, KernelError> {
     let kernel_name = match src.dtype() {
-        DType::Float32  => "gather_f32",
-        DType::Float16  => "gather_f16",
+        DType::Float32 => "gather_f32",
+        DType::Float16 => "gather_f16",
         DType::Bfloat16 => "gather_bf16",
         _ => {
             return Err(KernelError::NotFound(format!(
@@ -466,8 +466,8 @@ pub fn gather_signed(
     queue: &metal::CommandQueue,
 ) -> Result<Array, KernelError> {
     let kernel_name = match src.dtype() {
-        DType::Float32  => "gather_signed_f32",
-        DType::Float16  => "gather_signed_f16",
+        DType::Float32 => "gather_signed_f32",
+        DType::Float16 => "gather_signed_f16",
         DType::Bfloat16 => "gather_signed_bf16",
         _ => {
             return Err(KernelError::NotFound(format!(
@@ -569,7 +569,11 @@ pub fn gather_axis(
     out_shape[axis] = num_indices;
     let total = outer_size * num_indices * inner_size;
     if total == 0 {
-        return Ok(Array::zeros(registry.device().raw(), &out_shape, src.dtype()));
+        return Ok(Array::zeros(
+            registry.device().raw(),
+            &out_shape,
+            src.dtype(),
+        ));
     }
 
     let pipeline = registry.get_pipeline("gather_axis_f32", src.dtype())?;
@@ -591,7 +595,10 @@ pub fn gather_axis(
 
     let threads_per_outer = (num_indices * inner_size) as u64;
     let tg = metal::MTLSize::new(
-        std::cmp::min(pipeline.max_total_threads_per_threadgroup(), threads_per_outer),
+        std::cmp::min(
+            pipeline.max_total_threads_per_threadgroup(),
+            threads_per_outer,
+        ),
         1,
         1,
     );
@@ -668,19 +675,19 @@ pub fn scatter(
     let (kernel_name, out_dtype) = match (op, src.dtype()) {
         // Float32
         (ScatterOp::Overwrite, DType::Float32) => ("scatter_overwrite_f32", DType::Float32),
-        (ScatterOp::Add,       DType::Float32) => ("scatter_add_f32",       DType::Float32),
-        (ScatterOp::Max,       DType::Float32) => ("scatter_max_f32",       DType::Float32),
-        (ScatterOp::Min,       DType::Float32) => ("scatter_min_f32",       DType::Float32),
+        (ScatterOp::Add, DType::Float32) => ("scatter_add_f32", DType::Float32),
+        (ScatterOp::Max, DType::Float32) => ("scatter_max_f32", DType::Float32),
+        (ScatterOp::Min, DType::Float32) => ("scatter_min_f32", DType::Float32),
 
         // Float16 overwrite (native dtype)
         (ScatterOp::Overwrite, DType::Float16) => ("scatter_overwrite_f16", DType::Float16),
         // Float16 add (promote to f32)
-        (ScatterOp::Add,       DType::Float16) => ("scatter_add_f16",       DType::Float32),
+        (ScatterOp::Add, DType::Float16) => ("scatter_add_f16", DType::Float32),
 
         // Bfloat16 overwrite (native dtype)
         (ScatterOp::Overwrite, DType::Bfloat16) => ("scatter_overwrite_bf16", DType::Bfloat16),
         // Bfloat16 add (promote to f32)
-        (ScatterOp::Add,       DType::Bfloat16) => ("scatter_add_bf16",       DType::Float32),
+        (ScatterOp::Add, DType::Bfloat16) => ("scatter_add_bf16", DType::Float32),
 
         _ => {
             return Err(KernelError::NotFound(format!(
@@ -766,7 +773,7 @@ mod tests {
 
     /// Helper: set up device, queue, and kernel registry for tests.
     fn setup() -> (KernelRegistry, metal::CommandQueue) {
-        let device = rmlx_metal::device::GpuDevice::new().expect("Metal device");
+        let device = rmlx_metal::device::GpuDevice::system_default().expect("Metal device");
         let queue = device.raw().new_command_queue();
         let registry = KernelRegistry::new(device);
         register(&registry).expect("register indexing kernels");
@@ -801,11 +808,7 @@ mod tests {
         let dev = reg.device().raw();
         let src = Array::from_slice(dev, &[10.0f32, 20.0, 30.0, 40.0], vec![4]);
         // -1i32 as u32 bits, -2i32 as u32 bits
-        let indices: Vec<u32> = vec![
-            (-1i32) as u32,
-            (-2i32) as u32,
-            0u32,
-        ];
+        let indices: Vec<u32> = vec![(-1i32) as u32, (-2i32) as u32, 0u32];
         let idx = Array::from_slice(dev, &indices, vec![3]);
         let out = gather_signed(&reg, &src, &idx, &q).unwrap();
         let vals: Vec<f32> = out.to_vec_checked();

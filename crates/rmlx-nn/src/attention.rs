@@ -175,7 +175,11 @@ impl LayerKvCache {
             // Copy new keys into slot
             let enc = cb.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&pipeline);
-            enc.set_buffer(0, Some(new_keys[i].metal_buffer()), new_keys[i].offset() as u64);
+            enc.set_buffer(
+                0,
+                Some(new_keys[i].metal_buffer()),
+                new_keys[i].offset() as u64,
+            );
             enc.set_buffer(
                 1,
                 Some(self.keys[i].metal_buffer()),
@@ -193,7 +197,11 @@ impl LayerKvCache {
             // Copy new values into slot
             let enc = cb.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&pipeline);
-            enc.set_buffer(0, Some(new_values[i].metal_buffer()), new_values[i].offset() as u64);
+            enc.set_buffer(
+                0,
+                Some(new_values[i].metal_buffer()),
+                new_values[i].offset() as u64,
+            );
             enc.set_buffer(
                 1,
                 Some(self.values[i].metal_buffer()),
@@ -441,13 +449,17 @@ impl Attention {
         if q.shape() != [seq_len, expected_q_width] {
             return Err(KernelError::InvalidShape(format!(
                 "Q projection shape {:?}, expected [{}, {}]",
-                q.shape(), seq_len, expected_q_width
+                q.shape(),
+                seq_len,
+                expected_q_width
             )));
         }
         if k.shape() != [seq_len, expected_kv_width] {
             return Err(KernelError::InvalidShape(format!(
                 "K projection shape {:?}, expected [{}, {}]",
-                k.shape(), seq_len, expected_kv_width
+                k.shape(),
+                seq_len,
+                expected_kv_width
             )));
         }
 
@@ -522,9 +534,7 @@ impl Attention {
         // Try fused SDPA path (Flash Attention style — no intermediate score matrix)
         let attn_outputs = if head_dim <= 128 {
             // Fused path: single kernel per head, Q@K^T + scale + mask + softmax + @V
-            ops::sdpa::sdpa_batched(
-                registry, &q_heads, &k_final, &v_final, mask, scale, queue,
-            )?
+            ops::sdpa::sdpa_batched(registry, &q_heads, &k_final, &v_final, mask, scale, queue)?
         } else {
             // Unfused fallback for very large head dims
             let mut outputs: Vec<Array> = Vec::with_capacity(num_heads);

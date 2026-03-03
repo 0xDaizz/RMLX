@@ -52,8 +52,13 @@ impl Array {
         );
 
         let size = std::mem::size_of_val(data) as u64;
-        let ptr = data.as_ptr() as *const std::ffi::c_void;
-        let buffer = device.new_buffer_with_data(ptr, size, MTLResourceOptions::StorageModeShared);
+        // Metal returns null for zero-length buffers; allocate at least 1 byte.
+        let buffer = if size == 0 {
+            device.new_buffer(1, MTLResourceOptions::StorageModeShared)
+        } else {
+            let ptr = data.as_ptr() as *const std::ffi::c_void;
+            device.new_buffer_with_data(ptr, size, MTLResourceOptions::StorageModeShared)
+        };
 
         let strides = compute_contiguous_strides(&shape);
         Self {
@@ -72,7 +77,9 @@ impl Array {
     pub fn zeros(device: &metal::Device, shape: &[usize], dtype: DType) -> Self {
         let numel: usize = shape.iter().product();
         let byte_size = dtype.numel_to_bytes(numel) as u64;
-        let buffer = device.new_buffer(byte_size, MTLResourceOptions::StorageModeShared);
+        // Metal returns null for zero-length buffers; allocate at least 1 byte.
+        let alloc_size = byte_size.max(1);
+        let buffer = device.new_buffer(alloc_size, MTLResourceOptions::StorageModeShared);
 
         // Explicitly zero the buffer. While Apple Silicon may zero-initialize
         // StorageModeShared buffers in practice, this is not guaranteed by the
@@ -80,7 +87,7 @@ impl Array {
         // SAFETY: SharedMode buffer contents() is CPU-accessible and valid
         // for buffer.length() bytes.
         unsafe {
-            std::ptr::write_bytes(buffer.contents() as *mut u8, 0, byte_size as usize);
+            std::ptr::write_bytes(buffer.contents() as *mut u8, 0, alloc_size as usize);
         }
 
         let strides = compute_contiguous_strides(shape);
@@ -213,8 +220,8 @@ impl Array {
         for _ in 0..numel {
             // Compute the physical offset for the current multi-dim index.
             let mut physical_offset = self.offset;
-            for d in 0..ndim {
-                physical_offset += indices[d] * self.strides[d] * elem_size;
+            for (d, &idx) in indices.iter().enumerate().take(ndim) {
+                physical_offset += idx * self.strides[d] * elem_size;
             }
 
             // SAFETY: the caller (to_vec_checked or to_vec_unchecked) has
@@ -485,10 +492,7 @@ impl Array {
     ///
     /// # Errors
     /// Returns an error if `axis > ndim`.
-    pub fn unsqueeze(
-        &self,
-        axis: usize,
-    ) -> Result<Self, crate::kernels::KernelError> {
+    pub fn unsqueeze(&self, axis: usize) -> Result<Self, crate::kernels::KernelError> {
         if axis > self.ndim() {
             return Err(crate::kernels::KernelError::InvalidShape(format!(
                 "unsqueeze: axis {} out of range for {}D array (valid: 0..={})",
@@ -563,16 +567,8 @@ pub fn broadcast_shape(
 
     // Iterate from the trailing dimension backwards.
     for i in 0..max_ndim {
-        let da = if i < a.len() {
-            a[a.len() - 1 - i]
-        } else {
-            1
-        };
-        let db = if i < b.len() {
-            b[b.len() - 1 - i]
-        } else {
-            1
-        };
+        let da = if i < a.len() { a[a.len() - 1 - i] } else { 1 };
+        let db = if i < b.len() { b[b.len() - 1 - i] } else { 1 };
 
         if da == db {
             result.push(da);

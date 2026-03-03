@@ -248,13 +248,10 @@ pub fn silu(
     encoder.set_buffer(2, Some(&numel_buf), 0);
 
     // Grid = ceil(numel / elems_per_thread) threads
-    let grid_threads = (numel as u64 + elems_per_thread - 1) / elems_per_thread;
+    let grid_threads = (numel as u64).div_ceil(elems_per_thread);
     let grid_size = MTLSize::new(grid_threads, 1, 1);
     let threadgroup_size = MTLSize::new(
-        std::cmp::min(
-            pipeline.max_total_threads_per_threadgroup(),
-            grid_threads,
-        ),
+        std::cmp::min(pipeline.max_total_threads_per_threadgroup(), grid_threads),
         1,
         1,
     );
@@ -311,13 +308,10 @@ pub fn silu_gate(
     encoder.set_buffer(2, Some(out.metal_buffer()), out.offset() as u64);
     encoder.set_buffer(3, Some(&numel_buf), 0);
 
-    let grid_threads = (numel as u64 + elems_per_thread - 1) / elems_per_thread;
+    let grid_threads = (numel as u64).div_ceil(elems_per_thread);
     let grid_size = MTLSize::new(grid_threads, 1, 1);
     let threadgroup_size = MTLSize::new(
-        std::cmp::min(
-            pipeline.max_total_threads_per_threadgroup(),
-            grid_threads,
-        ),
+        std::cmp::min(pipeline.max_total_threads_per_threadgroup(), grid_threads),
         1,
         1,
     );

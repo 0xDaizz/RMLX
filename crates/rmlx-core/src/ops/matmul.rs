@@ -388,6 +388,7 @@ pub fn register(registry: &KernelRegistry) -> Result<(), KernelError> {
 // ---------------------------------------------------------------------------
 
 /// Ceiling division.
+#[allow(clippy::manual_div_ceil)]
 fn ceil_div(a: usize, b: usize) -> usize {
     (a + b - 1) / b
 }
@@ -507,11 +508,11 @@ pub fn matmul(
         m,
         n,
         k,
-        1,              // batch
-        m * k,          // batch_stride_a (unused for batch=1)
-        k * n,          // batch_stride_b
-        m * n,          // batch_stride_c
-        &[m, n],        // output shape
+        1,       // batch
+        m * k,   // batch_stride_a (unused for batch=1)
+        k * n,   // batch_stride_b
+        m * n,   // batch_stride_c
+        &[m, n], // output shape
     )
 }
 
@@ -601,6 +602,7 @@ pub fn batched_matmul(
 /// This is the shared implementation used by both `matmul` (2D) and
 /// `batched_matmul` (3D). The `output_shape` is the final shape of the
 /// output array (either [M, N] or [B, M, N]).
+#[allow(clippy::too_many_arguments)]
 fn dispatch_tiled_gemm(
     registry: &KernelRegistry,
     a: &Array,

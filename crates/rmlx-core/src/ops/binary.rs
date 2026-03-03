@@ -254,7 +254,10 @@ pub enum BinaryOp {
 impl BinaryOp {
     /// Whether this is a comparison op (output is UInt32).
     fn is_comparison(&self) -> bool {
-        matches!(self, BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge)
+        matches!(
+            self,
+            BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge
+        )
     }
 
     /// Base name without dtype suffix.
@@ -309,7 +312,11 @@ enum DispatchVariant {
 }
 
 /// Build the kernel function name for a given op, variant, and dtype.
-fn kernel_name_for(op: BinaryOp, variant: DispatchVariant, dtype: DType) -> Result<String, KernelError> {
+fn kernel_name_for(
+    op: BinaryOp,
+    variant: DispatchVariant,
+    dtype: DType,
+) -> Result<String, KernelError> {
     let base = op.base_name();
     let suffix = BinaryOp::dtype_suffix(dtype)?;
     let variant_tag = match variant {
@@ -364,17 +371,17 @@ fn broadcast_strides(input_shape: &[usize], out_shape: &[usize]) -> Vec<usize> {
     // Map input dims to the trailing dims of the output.
     // Leading dimensions where the input has no corresponding dim get stride 0.
     let offset = out_ndim - in_ndim;
-    for i in 0..out_ndim {
+    for (i, stride) in strides.iter_mut().enumerate().take(out_ndim) {
         if i < offset {
             // Input doesn't have this dimension -- implicitly size 1.
-            strides[i] = 0;
+            *stride = 0;
         } else {
             let in_idx = i - offset;
             if input_shape[in_idx] == 1 {
                 // Broadcast dimension: stride 0.
-                strides[i] = 0;
+                *stride = 0;
             } else {
-                strides[i] = in_contiguous[in_idx];
+                *stride = in_contiguous[in_idx];
             }
         }
     }
@@ -440,11 +447,19 @@ pub fn binary_op_with_mode(
     let out_numel: usize = out_shape.iter().product();
     // Handle empty tensors.
     if out_numel == 0 {
-        let out_dtype = if op.is_comparison() { DType::UInt32 } else { a.dtype() };
+        let out_dtype = if op.is_comparison() {
+            DType::UInt32
+        } else {
+            a.dtype()
+        };
         return Ok(Array::zeros(registry.device().raw(), &out_shape, out_dtype));
     }
 
-    let out_dtype = if op.is_comparison() { DType::UInt32 } else { a.dtype() };
+    let out_dtype = if op.is_comparison() {
+        DType::UInt32
+    } else {
+        a.dtype()
+    };
     let out = Array::zeros(registry.device().raw(), &out_shape, out_dtype);
 
     let command_buffer = queue.new_command_buffer();
@@ -480,7 +495,7 @@ pub fn binary_op_with_mode(
                 .map(|(i, &s)| super::checked_u32(s, &format!("b_strides[{i}]")))
                 .collect::<Result<Vec<u32>, _>>()?;
 
-            let buf_size = |v: &[u32]| (v.len() * std::mem::size_of::<u32>()) as u64;
+            let buf_size = |v: &[u32]| std::mem::size_of_val(v) as u64;
 
             let shape_buf = device.new_buffer_with_data(
                 shape_u32.as_ptr() as *const _,
@@ -516,7 +531,10 @@ pub fn binary_op_with_mode(
 
     let grid_size = MTLSize::new(out_numel as u64, 1, 1);
     let threadgroup_size = MTLSize::new(
-        std::cmp::min(pipeline.max_total_threads_per_threadgroup(), out_numel as u64),
+        std::cmp::min(
+            pipeline.max_total_threads_per_threadgroup(),
+            out_numel as u64,
+        ),
         1,
         1,
     );
@@ -562,7 +580,11 @@ pub fn binary_op_async(
 
     let out_numel: usize = out_shape.iter().product();
 
-    let out_dtype = if op.is_comparison() { DType::UInt32 } else { a.dtype() };
+    let out_dtype = if op.is_comparison() {
+        DType::UInt32
+    } else {
+        a.dtype()
+    };
     let out = Array::zeros(registry.device().raw(), &out_shape, out_dtype);
 
     let command_buffer = queue.new_command_buffer();
@@ -572,67 +594,67 @@ pub fn binary_op_async(
     encoder.set_buffer(1, Some(b.metal_buffer()), b.offset() as u64);
     encoder.set_buffer(2, Some(out.metal_buffer()), out.offset() as u64);
 
-    match variant {
-        DispatchVariant::General => {
-            let device = registry.device().raw();
-            let ndim = out_shape.len();
+    if matches!(variant, DispatchVariant::General) {
+        let device = registry.device().raw();
+        let ndim = out_shape.len();
 
-            let shape_u32: Vec<u32> = out_shape
-                .iter()
-                .enumerate()
-                .map(|(i, &s)| super::checked_u32(s, &format!("out_shape[{i}]")))
-                .collect::<Result<Vec<u32>, _>>()?;
+        let shape_u32: Vec<u32> = out_shape
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| super::checked_u32(s, &format!("out_shape[{i}]")))
+            .collect::<Result<Vec<u32>, _>>()?;
 
-            let a_bcast_strides = broadcast_strides(a.shape(), &out_shape);
-            let b_bcast_strides = broadcast_strides(b.shape(), &out_shape);
+        let a_bcast_strides = broadcast_strides(a.shape(), &out_shape);
+        let b_bcast_strides = broadcast_strides(b.shape(), &out_shape);
 
-            let a_strides_u32: Vec<u32> = a_bcast_strides
-                .iter()
-                .enumerate()
-                .map(|(i, &s)| super::checked_u32(s, &format!("a_strides[{i}]")))
-                .collect::<Result<Vec<u32>, _>>()?;
-            let b_strides_u32: Vec<u32> = b_bcast_strides
-                .iter()
-                .enumerate()
-                .map(|(i, &s)| super::checked_u32(s, &format!("b_strides[{i}]")))
-                .collect::<Result<Vec<u32>, _>>()?;
+        let a_strides_u32: Vec<u32> = a_bcast_strides
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| super::checked_u32(s, &format!("a_strides[{i}]")))
+            .collect::<Result<Vec<u32>, _>>()?;
+        let b_strides_u32: Vec<u32> = b_bcast_strides
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| super::checked_u32(s, &format!("b_strides[{i}]")))
+            .collect::<Result<Vec<u32>, _>>()?;
 
-            let buf_size = |v: &[u32]| (v.len() * std::mem::size_of::<u32>()) as u64;
+        let buf_size = |v: &[u32]| std::mem::size_of_val(v) as u64;
 
-            let shape_buf = device.new_buffer_with_data(
-                shape_u32.as_ptr() as *const _,
-                buf_size(&shape_u32),
-                metal::MTLResourceOptions::StorageModeShared,
-            );
-            let a_stride_buf = device.new_buffer_with_data(
-                a_strides_u32.as_ptr() as *const _,
-                buf_size(&a_strides_u32),
-                metal::MTLResourceOptions::StorageModeShared,
-            );
-            let b_stride_buf = device.new_buffer_with_data(
-                b_strides_u32.as_ptr() as *const _,
-                buf_size(&b_strides_u32),
-                metal::MTLResourceOptions::StorageModeShared,
-            );
-            let ndim_val = super::checked_u32(ndim, "ndim")?;
-            let ndim_buf = device.new_buffer_with_data(
-                &ndim_val as *const u32 as *const _,
-                std::mem::size_of::<u32>() as u64,
-                metal::MTLResourceOptions::StorageModeShared,
-            );
+        let shape_buf = device.new_buffer_with_data(
+            shape_u32.as_ptr() as *const _,
+            buf_size(&shape_u32),
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        let a_stride_buf = device.new_buffer_with_data(
+            a_strides_u32.as_ptr() as *const _,
+            buf_size(&a_strides_u32),
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        let b_stride_buf = device.new_buffer_with_data(
+            b_strides_u32.as_ptr() as *const _,
+            buf_size(&b_strides_u32),
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        let ndim_val = super::checked_u32(ndim, "ndim")?;
+        let ndim_buf = device.new_buffer_with_data(
+            &ndim_val as *const u32 as *const _,
+            std::mem::size_of::<u32>() as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
 
-            encoder.set_buffer(3, Some(&shape_buf), 0);
-            encoder.set_buffer(4, Some(&a_stride_buf), 0);
-            encoder.set_buffer(5, Some(&b_stride_buf), 0);
-            encoder.set_buffer(6, Some(&ndim_buf), 0);
-        }
-        _ => {}
+        encoder.set_buffer(3, Some(&shape_buf), 0);
+        encoder.set_buffer(4, Some(&a_stride_buf), 0);
+        encoder.set_buffer(5, Some(&b_stride_buf), 0);
+        encoder.set_buffer(6, Some(&ndim_buf), 0);
     }
 
     let grid_numel = if out_numel == 0 { 1 } else { out_numel };
     let grid_size = MTLSize::new(grid_numel as u64, 1, 1);
     let threadgroup_size = MTLSize::new(
-        std::cmp::min(pipeline.max_total_threads_per_threadgroup(), grid_numel as u64),
+        std::cmp::min(
+            pipeline.max_total_threads_per_threadgroup(),
+            grid_numel as u64,
+        ),
         1,
         1,
     );
@@ -804,27 +826,42 @@ mod tests {
 
     #[test]
     fn test_choose_variant_scalar_scalar() {
-        assert!(matches!(choose_variant(&[1], &[1]), DispatchVariant::ScalarScalar));
+        assert!(matches!(
+            choose_variant(&[1], &[1]),
+            DispatchVariant::ScalarScalar
+        ));
     }
 
     #[test]
     fn test_choose_variant_scalar_vector() {
-        assert!(matches!(choose_variant(&[1], &[4]), DispatchVariant::ScalarVector));
+        assert!(matches!(
+            choose_variant(&[1], &[4]),
+            DispatchVariant::ScalarVector
+        ));
     }
 
     #[test]
     fn test_choose_variant_vector_scalar() {
-        assert!(matches!(choose_variant(&[4], &[1]), DispatchVariant::VectorScalar));
+        assert!(matches!(
+            choose_variant(&[4], &[1]),
+            DispatchVariant::VectorScalar
+        ));
     }
 
     #[test]
     fn test_choose_variant_same_shape() {
-        assert!(matches!(choose_variant(&[3, 4], &[3, 4]), DispatchVariant::Flat));
+        assert!(matches!(
+            choose_variant(&[3, 4], &[3, 4]),
+            DispatchVariant::Flat
+        ));
     }
 
     #[test]
     fn test_choose_variant_broadcast() {
-        assert!(matches!(choose_variant(&[3, 1], &[1, 4]), DispatchVariant::General));
+        assert!(matches!(
+            choose_variant(&[3, 1], &[1, 4]),
+            DispatchVariant::General
+        ));
     }
 
     #[test]
@@ -835,25 +872,33 @@ mod tests {
 
     #[test]
     fn test_kernel_name_ss() {
-        let name = kernel_name_for(BinaryOp::Mul, DispatchVariant::ScalarScalar, DType::Float16).unwrap();
+        let name =
+            kernel_name_for(BinaryOp::Mul, DispatchVariant::ScalarScalar, DType::Float16).unwrap();
         assert_eq!(name, "mul_ss_f16");
     }
 
     #[test]
     fn test_kernel_name_sv() {
-        let name = kernel_name_for(BinaryOp::Sub, DispatchVariant::ScalarVector, DType::Bfloat16).unwrap();
+        let name = kernel_name_for(
+            BinaryOp::Sub,
+            DispatchVariant::ScalarVector,
+            DType::Bfloat16,
+        )
+        .unwrap();
         assert_eq!(name, "sub_sv_bf16");
     }
 
     #[test]
     fn test_kernel_name_vs() {
-        let name = kernel_name_for(BinaryOp::Div, DispatchVariant::VectorScalar, DType::Float32).unwrap();
+        let name =
+            kernel_name_for(BinaryOp::Div, DispatchVariant::VectorScalar, DType::Float32).unwrap();
         assert_eq!(name, "div_vs_f32");
     }
 
     #[test]
     fn test_kernel_name_general() {
-        let name = kernel_name_for(BinaryOp::Add, DispatchVariant::General, DType::Float32).unwrap();
+        let name =
+            kernel_name_for(BinaryOp::Add, DispatchVariant::General, DType::Float32).unwrap();
         assert_eq!(name, "add_g_f32");
     }
 

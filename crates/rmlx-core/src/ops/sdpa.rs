@@ -539,11 +539,8 @@ pub fn sdpa(
     encoder.set_buffer(5, Some(&params_buf), 0);
     encoder.set_buffer(6, Some(&scale_buf), 0);
 
-    let n_threadgroups = ((n + BR - 1) / BR) as u64;
-    let tg_size = std::cmp::min(
-        THREADS_PER_TG,
-        pipeline.max_total_threads_per_threadgroup(),
-    );
+    let n_threadgroups = n.div_ceil(BR) as u64;
+    let tg_size = std::cmp::min(THREADS_PER_TG, pipeline.max_total_threads_per_threadgroup());
 
     encoder.dispatch_thread_groups(
         MTLSize::new(n_threadgroups, 1, 1),
@@ -593,7 +590,15 @@ pub fn sdpa_batched(
     let mut outputs = Vec::with_capacity(num_heads);
     for (h, q_h) in q_heads.iter().enumerate() {
         let kv_idx = h / repeats;
-        let out = sdpa(registry, q_h, &k_heads[kv_idx], &v_heads[kv_idx], mask, scale, queue)?;
+        let out = sdpa(
+            registry,
+            q_h,
+            &k_heads[kv_idx],
+            &v_heads[kv_idx],
+            mask,
+            scale,
+            queue,
+        )?;
         outputs.push(out);
     }
     Ok(outputs)

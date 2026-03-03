@@ -105,7 +105,7 @@ impl QuantizedWeight {
 
         let total_elements = out_features * in_features;
         let elems_per_u32 = 32 / bits as usize;
-        let expected_weight_u32s = (total_elements + elems_per_u32 - 1) / elems_per_u32;
+        let expected_weight_u32s = total_elements.div_ceil(elems_per_u32);
         let expected_weight_bytes = expected_weight_u32s * 4;
         if (weights_buf.length() as usize) < expected_weight_bytes {
             return Err(KernelError::InvalidShape(format!(
@@ -156,7 +156,7 @@ impl QuantizedWeight {
     /// Number of packed uint32 values per row.
     pub fn packed_u32s_per_row(&self) -> usize {
         let elems_per_u32 = 32 / self.bits as usize;
-        (self.in_features + elems_per_u32 - 1) / elems_per_u32
+        self.in_features.div_ceil(elems_per_u32)
     }
 }
 
@@ -426,11 +426,7 @@ pub fn affine_quantized_matmul(
     // Use Float32 as the dtype key (the pipeline is not dtype-templated,
     // the kernel itself handles arbitrary bit widths internally).
     let pipeline = registry.get_pipeline(kernel_name, DType::Float32)?;
-    let out = Array::zeros(
-        registry.device().raw(),
-        &[qw.out_features],
-        DType::Float32,
-    );
+    let out = Array::zeros(registry.device().raw(), &[qw.out_features], DType::Float32);
 
     // Pack (out_features, in_features, group_size, bits) into a uint4.
     let params: [u32; 4] = [
@@ -615,19 +611,19 @@ mod tests {
         // 4-bit: 8 values per u32 -> 128 elements = 16 u32s
         let elems_per_u32 = 32 / 4;
         let in_features = 128usize;
-        assert_eq!((in_features + elems_per_u32 - 1) / elems_per_u32, 16);
+        assert_eq!(in_features.div_ceil(elems_per_u32), 16);
 
         // 2-bit: 16 values per u32 -> 128 elements = 8 u32s
         let elems_per_u32 = 32 / 2;
-        assert_eq!((in_features + elems_per_u32 - 1) / elems_per_u32, 8);
+        assert_eq!(in_features.div_ceil(elems_per_u32), 8);
 
         // 8-bit: 4 values per u32 -> 128 elements = 32 u32s
         let elems_per_u32 = 32 / 8;
-        assert_eq!((in_features + elems_per_u32 - 1) / elems_per_u32, 32);
+        assert_eq!(in_features.div_ceil(elems_per_u32), 32);
 
         // 3-bit: 10 values per u32 -> 128 elements = 13 u32s (ceil)
         let elems_per_u32 = 32 / 3; // 10
-        assert_eq!((in_features + elems_per_u32 - 1) / elems_per_u32, 13);
+        assert_eq!(in_features.div_ceil(elems_per_u32), 13);
     }
 
     #[test]

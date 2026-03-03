@@ -545,6 +545,7 @@ pub fn register(registry: &KernelRegistry) -> Result<(), KernelError> {
 // ---------------------------------------------------------------------------
 
 /// Compute ceil(a / b) for unsigned integers.
+#[allow(clippy::manual_div_ceil)]
 fn ceil_div(a: u64, b: u64) -> u64 {
     (a + b - 1) / b
 }
