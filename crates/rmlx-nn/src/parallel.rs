@@ -8,6 +8,10 @@
 use rmlx_core::array::Array;
 #[cfg(feature = "distributed")]
 use rmlx_core::dtype::DType;
+#[cfg(feature = "distributed")]
+use rmlx_core::kernels::KernelRegistry;
+#[cfg(feature = "distributed")]
+use rmlx_core::ops;
 
 #[cfg(feature = "distributed")]
 use rmlx_distributed::group::{DistributedError, Group};
@@ -235,13 +239,15 @@ impl ColumnParallelLinear {
     /// Forward pass with a communication group (requires `distributed` feature).
     ///
     /// Steps:
-    /// 1. Local matmul: output_local = input @ weight_shard^T  → [batch, out/world_size]
+    /// 1. GPU matmul: output_local = input @ weight_shard^T  → [batch, out/world_size]
     /// 2. Allgather: concatenate output_local from all ranks → [batch, out_features]
     #[cfg(feature = "distributed")]
     pub fn forward_with_group(
         &self,
         input: &Array,
         group: &Group,
+        registry: &KernelRegistry,
+        queue: &metal::CommandQueue,
     ) -> Result<Array, DistributedError> {
         assert_eq!(input.ndim(), 2, "input must be 2D [batch, in_features]");
         assert_eq!(input.dtype(), DType::Float32, "only f32 supported for now");
@@ -253,19 +259,31 @@ impl ColumnParallelLinear {
 
         let shard_out = self.weight.shape()[0]; // out_features / world_size
 
-        // Read input and weight (both may be non-contiguous views)
-        let a: Vec<f32> = read_f32_strided(input);
-        let b = read_f32_strided(&self.weight);
+        // ── N3 fix: GPU matmul instead of cpu_matmul_f32 ──
+        // Transpose weight: [shard_out, k] -> [k, shard_out] via stride swap (zero-copy)
+        let w_t = self.weight.view(
+            vec![k, shard_out],
+            vec![1, k],
+            self.weight.offset(),
+        );
 
-        // Local matmul: [batch, k] @ [shard_out, k]^T → [batch, shard_out]
-        let local_out = cpu_matmul_f32(&a, &b, batch, k, shard_out);
+        // GPU matmul: [batch, k] @ [k, shard_out] -> [batch, shard_out]
+        let local_out_arr = ops::matmul::matmul(registry, input, &w_t, queue)
+            .map_err(|e| DistributedError::Protocol(format!("GPU matmul failed: {e}")))?;
 
-        // Add local bias if present
-        let mut local_bytes: Vec<u8> = local_out.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        if let Some(ref bias) = self.bias {
-            let bias_data = bias.to_bytes();
-            add_bias_f32(&mut local_bytes, bias_data, batch, shard_out);
-        }
+        // Add local bias if present (GPU add with broadcast)
+        let local_out_arr = if let Some(ref bias) = self.bias {
+            // Broadcast bias [shard_out] to [batch, shard_out] via binary add
+            // Reshape bias to [1, shard_out] for broadcasting
+            let bias_2d = bias.view(vec![1, shard_out], vec![shard_out, 1], bias.offset());
+            ops::binary::add(registry, &local_out_arr, &bias_2d, queue)
+                .map_err(|e| DistributedError::Protocol(format!("GPU bias add failed: {e}")))?
+        } else {
+            local_out_arr
+        };
+
+        // Read result bytes for allgather
+        let local_bytes = local_out_arr.to_bytes().to_vec();
 
         // Allgather across ranks → rank-major: [rank0_all_rows][rank1_all_rows]...
         // We need batch-major: [row0_rank0_shard ++ row0_rank1_shard ++ ...][row1_...]
@@ -370,7 +388,7 @@ impl RowParallelLinear {
     /// Forward pass with a communication group (requires `distributed` feature).
     ///
     /// Steps:
-    /// 1. Local matmul: output_partial = sharded_input @ weight_shard^T → [batch, out]
+    /// 1. GPU matmul: output_partial = sharded_input @ weight_shard^T → [batch, out]
     /// 2. Allreduce sum: output = sum of output_partial across all ranks
     /// 3. Add bias (after allreduce, all ranks have same result)
     #[cfg(feature = "distributed")]
@@ -378,6 +396,8 @@ impl RowParallelLinear {
         &self,
         input: &Array,
         group: &Group,
+        registry: &KernelRegistry,
+        queue: &metal::CommandQueue,
     ) -> Result<Array, DistributedError> {
         assert_eq!(
             input.ndim(),
@@ -396,14 +416,19 @@ impl RowParallelLinear {
         );
         let n = self.out_features;
 
-        // Read input (may be non-contiguous from slice_columns) and weight
-        let a: Vec<f32> = read_f32_strided(input);
-        let b = read_f32_strided(&self.weight);
+        // ── N3 fix: GPU matmul instead of cpu_matmul_f32 ──
+        // Transpose weight: [out, shard_in] -> [shard_in, out] via stride swap (zero-copy)
+        let w_t = self.weight.view(
+            vec![shard_in, n],
+            vec![1, shard_in],
+            self.weight.offset(),
+        );
 
-        // Local matmul: [batch, shard_in] @ [out, shard_in]^T → [batch, out]
-        let local_out = cpu_matmul_f32(&a, &b, batch, shard_in, n);
+        // GPU matmul: [batch, shard_in] @ [shard_in, out] -> [batch, out]
+        let local_out_arr = ops::matmul::matmul(registry, input, &w_t, queue)
+            .map_err(|e| DistributedError::Protocol(format!("GPU matmul failed: {e}")))?;
 
-        let local_bytes: Vec<u8> = local_out.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let local_bytes = local_out_arr.to_bytes().to_vec();
 
         // Allreduce sum across ranks → [batch, out_features]
         let mut reduced = group.allreduce(&local_bytes)?;
@@ -427,6 +452,17 @@ mod tests {
 
     fn test_device() -> Option<metal::Device> {
         metal::Device::system_default()
+    }
+
+    #[cfg(feature = "distributed")]
+    fn setup_registry_and_queue(
+        device: &metal::Device,
+    ) -> (KernelRegistry, metal::CommandQueue) {
+        let gpu = rmlx_metal::device::GpuDevice::system_default().expect("Metal device");
+        let queue = device.new_command_queue();
+        let registry = KernelRegistry::new(gpu);
+        rmlx_core::ops::register_all(&registry).expect("register kernels");
+        (registry, queue)
     }
 
     #[test]
@@ -605,6 +641,8 @@ mod tests {
             eprintln!("skipping: no Metal device");
             return;
         };
+        let (registry, queue) = setup_registry_and_queue(&device);
+
         // weight: [2, 3] = [[1,0,0],[0,1,0]]  (identity-like, out=2, in=3)
         let weight_data: Vec<f32> = vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
         let weight = Array::from_slice(&device, &weight_data, vec![2, 3]);
@@ -617,7 +655,9 @@ mod tests {
         let input = Array::from_slice(&device, &input_data, vec![2, 3]);
 
         let group = Group::world(1, 0).unwrap();
-        let result = layer.forward_with_group(&input, &group).unwrap();
+        let result = layer
+            .forward_with_group(&input, &group, &registry, &queue)
+            .unwrap();
 
         assert_eq!(result.shape(), &[2, 2]);
         let vals: Vec<f32> = result.to_vec_checked();
@@ -635,6 +675,8 @@ mod tests {
             eprintln!("skipping: no Metal device");
             return;
         };
+        let (registry, queue) = setup_registry_and_queue(&device);
+
         // weight: [2, 2] = [[1,0],[0,1]] (identity)
         let weight_data: Vec<f32> = vec![1.0, 0.0, 0.0, 1.0];
         let weight = Array::from_slice(&device, &weight_data, vec![2, 2]);
@@ -650,7 +692,9 @@ mod tests {
         let input = Array::from_slice(&device, &input_data, vec![1, 2]);
 
         let group = Group::world(1, 0).unwrap();
-        let result = layer.forward_with_group(&input, &group).unwrap();
+        let result = layer
+            .forward_with_group(&input, &group, &registry, &queue)
+            .unwrap();
 
         assert_eq!(result.shape(), &[1, 2]);
         let vals: Vec<f32> = result.to_vec_checked();
@@ -667,6 +711,8 @@ mod tests {
             eprintln!("skipping: no Metal device");
             return;
         };
+        let (registry, queue) = setup_registry_and_queue(&device);
+
         // weight: [2, 3] = [[1,2,3],[4,5,6]]  (out=2, in=3)
         let weight_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         let weight = Array::from_slice(&device, &weight_data, vec![2, 3]);
@@ -679,7 +725,9 @@ mod tests {
         let input = Array::from_slice(&device, &input_data, vec![1, 3]);
 
         let group = Group::world(1, 0).unwrap();
-        let result = layer.forward_with_group(&input, &group).unwrap();
+        let result = layer
+            .forward_with_group(&input, &group, &registry, &queue)
+            .unwrap();
 
         assert_eq!(result.shape(), &[1, 2]);
         let vals: Vec<f32> = result.to_vec_checked();
@@ -696,6 +744,8 @@ mod tests {
             eprintln!("skipping: no Metal device");
             return;
         };
+        let (registry, queue) = setup_registry_and_queue(&device);
+
         // weight: [2, 2] = [[1,0],[0,1]] (identity)
         let weight_data: Vec<f32> = vec![1.0, 0.0, 0.0, 1.0];
         let weight = Array::from_slice(&device, &weight_data, vec![2, 2]);
@@ -711,7 +761,9 @@ mod tests {
         let input = Array::from_slice(&device, &input_data, vec![1, 2]);
 
         let group = Group::world(1, 0).unwrap();
-        let result = layer.forward_with_group(&input, &group).unwrap();
+        let result = layer
+            .forward_with_group(&input, &group, &registry, &queue)
+            .unwrap();
 
         assert_eq!(result.shape(), &[1, 2]);
         let vals: Vec<f32> = result.to_vec_checked();
@@ -729,6 +781,7 @@ mod tests {
             eprintln!("skipping: no Metal device");
             return;
         };
+        let (registry, queue) = setup_registry_and_queue(&device);
 
         // Full weight: [4, 2] = [[1,0],[0,1],[2,0],[0,2]]
         let full_w: Vec<f32> = vec![1.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 2.0];
@@ -744,14 +797,18 @@ mod tests {
         // Rank 0: shard rows [0..2] = [[1,0],[0,1]]
         let shard_0 = ColumnParallelLinear::shard_weight(&full_weight, 0, 2);
         let layer_0 = ColumnParallelLinear::new(shard_0, None, 2, 2, 0, 1);
-        let out_0 = layer_0.forward_with_group(&input, &group).unwrap();
+        let out_0 = layer_0
+            .forward_with_group(&input, &group, &registry, &queue)
+            .unwrap();
         let vals_0: Vec<f32> = out_0.to_vec_checked();
         assert_eq!(vals_0, vec![3.0, 5.0]); // [3,5] @ I = [3,5]
 
         // Rank 1: shard rows [2..4] = [[2,0],[0,2]]
         let shard_1 = ColumnParallelLinear::shard_weight(&full_weight, 1, 2);
         let layer_1 = ColumnParallelLinear::new(shard_1, None, 2, 2, 0, 1);
-        let out_1 = layer_1.forward_with_group(&input, &group).unwrap();
+        let out_1 = layer_1
+            .forward_with_group(&input, &group, &registry, &queue)
+            .unwrap();
         let vals_1: Vec<f32> = out_1.to_vec_checked();
         assert_eq!(vals_1, vec![6.0, 10.0]); // [3,5] @ 2I = [6,10]
 
@@ -774,6 +831,7 @@ mod tests {
             eprintln!("skipping: no Metal device");
             return;
         };
+        let (registry, queue) = setup_registry_and_queue(&device);
 
         // Full weight: [2, 4] = [[1,2,3,4],[5,6,7,8]]
         let full_w: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
@@ -795,7 +853,9 @@ mod tests {
 
         let input_0 = Array::from_slice(&device, &[1.0f32, 2.0], vec![1, 2]);
         let layer_0 = RowParallelLinear::new(shard_0, None, 2, 4, 0, 1);
-        let out_0 = layer_0.forward_with_group(&input_0, &group).unwrap();
+        let out_0 = layer_0
+            .forward_with_group(&input_0, &group, &registry, &queue)
+            .unwrap();
         let vals_0: Vec<f32> = out_0.to_vec_checked();
         assert_eq!(vals_0, vec![5.0, 17.0]); // [1,2]@[[1,2],[5,6]]^T
 
@@ -806,7 +866,9 @@ mod tests {
 
         let input_1 = Array::from_slice(&device, &[3.0f32, 4.0], vec![1, 2]);
         let layer_1 = RowParallelLinear::new(shard_1, None, 2, 4, 1, 1);
-        let out_1 = layer_1.forward_with_group(&input_1, &group).unwrap();
+        let out_1 = layer_1
+            .forward_with_group(&input_1, &group, &registry, &queue)
+            .unwrap();
         let vals_1: Vec<f32> = out_1.to_vec_checked();
         assert_eq!(vals_1, vec![25.0, 53.0]); // [3,4]@[[3,4],[7,8]]^T
 
@@ -828,6 +890,7 @@ mod tests {
             eprintln!("skipping: no Metal device");
             return;
         };
+        let (registry, queue) = setup_registry_and_queue(&device);
 
         // weight: [2, 3] = [[1,0,0],[0,1,0]]  (out=2, in=3)
         let weight_data: Vec<f32> = vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
@@ -845,7 +908,9 @@ mod tests {
         let input = Array::from_slice(&device, &input_data, vec![3, 3]);
 
         let group = Group::world(1, 0).unwrap();
-        let result = layer.forward_with_group(&input, &group).unwrap();
+        let result = layer
+            .forward_with_group(&input, &group, &registry, &queue)
+            .unwrap();
 
         assert_eq!(result.shape(), &[3, 2]);
         let vals: Vec<f32> = result.to_vec_checked();
