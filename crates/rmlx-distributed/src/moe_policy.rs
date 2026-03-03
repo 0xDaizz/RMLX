@@ -291,7 +291,6 @@ impl MoePolicy {
     pub fn set_gpu_min(&mut self, v: u32) {
         self.gpu_min = v;
     }
-
 }
 
 impl Default for MoePolicy {
