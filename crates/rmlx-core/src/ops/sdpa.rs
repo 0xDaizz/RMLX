@@ -748,8 +748,308 @@ kernel void sdpa_f16(
 }
 "#;
 
+// ---------------------------------------------------------------------------
+// bf16 SDPA shader — same FA2 algorithm, reads/writes bfloat, accumulates f32
+// (C8: SDPA missing bf16 support)
+// ---------------------------------------------------------------------------
+
+pub const SDPA_BF16_SHADER_SOURCE: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup>
+using namespace metal;
+
+constant constexpr uint Br = 32;
+constant constexpr uint Bc = 32;
+constant constexpr uint SIMD_SIZE = 32;
+
+inline float tg_reduce_max_bf16(float val, uint tid, uint lane_id, uint sg_id,
+                                 uint n_threads, threadgroup float* buf) {
+    float sg_val = simd_max(val);
+    if (lane_id == 0) buf[sg_id] = sg_val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float result;
+    if (sg_id == 0) {
+        float v = (lane_id < (n_threads / SIMD_SIZE)) ? buf[lane_id] : -INFINITY;
+        result = simd_max(v);
+    }
+    if (sg_id == 0 && lane_id == 0) buf[0] = result;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return buf[0];
+}
+
+inline float tg_reduce_sum_bf16(float val, uint tid, uint lane_id, uint sg_id,
+                                 uint n_threads, threadgroup float* buf) {
+    float sg_val = simd_sum(val);
+    if (lane_id == 0) buf[sg_id] = sg_val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float result;
+    if (sg_id == 0) {
+        float v = (lane_id < (n_threads / SIMD_SIZE)) ? buf[lane_id] : 0.0f;
+        result = simd_sum(v);
+    }
+    if (sg_id == 0 && lane_id == 0) buf[0] = result;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return buf[0];
+}
+
+// ─── sdpa_decode_bf16 ─────────────────────────────────────────────────────
+
+kernel void sdpa_decode_bf16(
+    device const bfloat* Q         [[buffer(0)]],
+    device const bfloat* K         [[buffer(1)]],
+    device const bfloat* V         [[buffer(2)]],
+    device       bfloat* O         [[buffer(3)]],
+    device const bfloat* mask      [[buffer(4)]],
+    constant     uint*   params    [[buffer(5)]],
+    constant     float&  scale     [[buffer(6)]],
+    uint  tid       [[thread_position_in_threadgroup]],
+    uint  lane_id   [[thread_index_in_simdgroup]],
+    uint  sg_id     [[simdgroup_index_in_threadgroup]])
+{
+    const uint S        = params[1];
+    const uint D        = params[2];
+    const uint has_mask = params[3];
+
+    const uint n_threads = 256;
+
+    threadgroup float reduce_buf[SIMD_SIZE];
+    threadgroup float O_shared[256];
+
+    for (uint d = tid; d < D; d += n_threads) {
+        O_shared[d] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float m_running = -INFINITY;
+    float l_running = 0.0f;
+
+    const uint n_kv_blocks = (S + Bc - 1) / Bc;
+
+    for (uint kb = 0; kb < n_kv_blocks; kb++) {
+        const uint kv_start = kb * Bc;
+        const uint kv_end   = min(kv_start + Bc, S);
+        const uint kv_count = kv_end - kv_start;
+
+        float score = -INFINITY;
+        if (tid < kv_count) {
+            float dot = 0.0f;
+            for (uint d = 0; d < D; d++) {
+                dot += float(Q[d]) * float(K[(kv_start + tid) * D + d]);
+            }
+            dot *= scale;
+            if (has_mask) {
+                dot += float(mask[kv_start + tid]);
+            }
+            score = dot;
+        }
+
+        float block_max = tg_reduce_max_bf16(score, tid, lane_id, sg_id,
+                                              n_threads, reduce_buf);
+        float m_new = max(m_running, block_max);
+        float correction = fast::exp(m_running - m_new);
+        float exp_score = (tid < kv_count) ? fast::exp(score - m_new) : 0.0f;
+        float block_sum = tg_reduce_sum_bf16(exp_score, tid, lane_id, sg_id,
+                                              n_threads, reduce_buf);
+        float l_new = l_running * correction + block_sum;
+
+        threadgroup float exp_scores_shared[Bc];
+        if (tid < Bc) {
+            exp_scores_shared[tid] = (tid < kv_count) ? exp_score : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint d = tid; d < D; d += n_threads) {
+            float o_val = O_shared[d] * correction;
+            float v_sum = 0.0f;
+            for (uint j = 0; j < kv_count; j++) {
+                v_sum += exp_scores_shared[j] * float(V[(kv_start + j) * D + d]);
+            }
+            O_shared[d] = o_val + v_sum;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        m_running = m_new;
+        l_running = l_new;
+    }
+
+    float inv_l = (l_running > 0.0f) ? (1.0f / l_running) : 0.0f;
+    for (uint d = tid; d < D; d += n_threads) {
+        O[d] = bfloat(O_shared[d] * inv_l);
+    }
+}
+
+// ─── sdpa_bf16 ────────────────────────────────────────────────────────────
+
+kernel void sdpa_bf16(
+    device const bfloat* Q         [[buffer(0)]],
+    device const bfloat* K         [[buffer(1)]],
+    device const bfloat* V         [[buffer(2)]],
+    device       bfloat* O         [[buffer(3)]],
+    device const bfloat* mask      [[buffer(4)]],
+    constant     uint*   params    [[buffer(5)]],
+    constant     float&  scale     [[buffer(6)]],
+    uint  tg_id     [[threadgroup_position_in_grid]],
+    uint  tid       [[thread_position_in_threadgroup]],
+    uint  lane_id   [[thread_index_in_simdgroup]],
+    uint  sg_id     [[simdgroup_index_in_threadgroup]])
+{
+    const uint N         = params[0];
+    const uint S         = params[1];
+    const uint D         = params[2];
+    const uint has_mask  = params[3];
+    const uint is_causal = params[4];
+
+    const uint q_start = tg_id * Br;
+    if (q_start >= N) return;
+    const uint q_end   = min(q_start + Br, N);
+    const uint q_count = q_end - q_start;
+
+    threadgroup float Q_tile[Br * 128];
+    threadgroup float S_tile[Br * Bc];
+    threadgroup float m_prev[Br];
+    threadgroup float l_prev[Br];
+    threadgroup float reduce_buf[SIMD_SIZE];
+    threadgroup float O_acc[Br * 128];
+    threadgroup float O_acc2[Br * 128];
+
+    const uint n_threads = 256;
+    const uint D_lo = min(D, 128u);
+    const uint D_hi = (D > 128u) ? (D - 128u) : 0u;
+
+    for (uint idx = tid; idx < Br * D_lo; idx += n_threads) {
+        O_acc[idx] = 0.0f;
+    }
+    for (uint idx = tid; idx < Br * D_hi; idx += n_threads) {
+        O_acc2[idx] = 0.0f;
+    }
+    for (uint idx = tid; idx < Br; idx += n_threads) {
+        m_prev[idx] = -INFINITY;
+        l_prev[idx] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Load Q as float
+    for (uint idx = tid; idx < q_count * D_lo; idx += n_threads) {
+        uint r = idx / D_lo;
+        uint d = idx % D_lo;
+        Q_tile[r * D_lo + d] = float(Q[(q_start + r) * D + d]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint n_kv_blocks = (S + Bc - 1) / Bc;
+    const uint max_kv_block = is_causal
+        ? min(n_kv_blocks, ((q_start + q_count - 1) / Bc) + 1)
+        : n_kv_blocks;
+
+    for (uint kb = 0; kb < max_kv_block; kb++) {
+        const uint kv_start = kb * Bc;
+        const uint kv_end   = min(kv_start + Bc, S);
+        const uint kv_count = kv_end - kv_start;
+
+        for (uint idx = tid; idx < q_count * kv_count; idx += n_threads) {
+            uint i = idx / kv_count;
+            uint j = idx % kv_count;
+            float dot = 0.0f;
+
+            for (uint d = 0; d < D_lo; d++) {
+                dot += Q_tile[i * D_lo + d] * float(K[(kv_start + j) * D + d]);
+            }
+            for (uint d = D_lo; d < D; d++) {
+                dot += float(Q[(q_start + i) * D + d]) * float(K[(kv_start + j) * D + d]);
+            }
+            dot *= scale;
+
+            if (has_mask) {
+                dot += float(mask[(q_start + i) * S + (kv_start + j)]);
+            }
+            if (is_causal) {
+                uint q_idx = q_start + i;
+                uint kv_idx = kv_start + j;
+                if (kv_idx > q_idx) {
+                    dot = -INFINITY;
+                }
+            }
+
+            S_tile[i * Bc + j] = dot;
+        }
+        for (uint idx = tid; idx < q_count * Bc; idx += n_threads) {
+            uint j = idx % Bc;
+            if (j >= kv_count) {
+                uint i = idx / Bc;
+                S_tile[i * Bc + j] = -INFINITY;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint i = 0; i < q_count; i++) {
+            float local_max = -INFINITY;
+            for (uint j = tid; j < kv_count; j += n_threads) {
+                local_max = max(local_max, S_tile[i * Bc + j]);
+            }
+            float m_new = tg_reduce_max_bf16(local_max, tid, lane_id, sg_id,
+                                              n_threads, reduce_buf);
+            m_new = max(m_prev[i], m_new);
+
+            float local_sum = 0.0f;
+            for (uint j = tid; j < kv_count; j += n_threads) {
+                float e = fast::exp(S_tile[i * Bc + j] - m_new);
+                S_tile[i * Bc + j] = e;
+                local_sum += e;
+            }
+            float sum_exp = tg_reduce_sum_bf16(local_sum, tid, lane_id, sg_id,
+                                                n_threads, reduce_buf);
+
+            float correction = fast::exp(m_prev[i] - m_new);
+            float l_new = l_prev[i] * correction + sum_exp;
+
+            for (uint d = tid; d < D_lo; d += n_threads) {
+                float o_val = O_acc[i * D_lo + d] * correction;
+                float v_sum = 0.0f;
+                for (uint j = 0; j < kv_count; j++) {
+                    v_sum += S_tile[i * Bc + j] * float(V[(kv_start + j) * D + d]);
+                }
+                O_acc[i * D_lo + d] = o_val + v_sum;
+            }
+            for (uint d = tid; d < D_hi; d += n_threads) {
+                float o_val = O_acc2[i * D_hi + d] * correction;
+                float v_sum = 0.0f;
+                for (uint j = 0; j < kv_count; j++) {
+                    v_sum += S_tile[i * Bc + j] * float(V[(kv_start + j) * D + (D_lo + d)]);
+                }
+                O_acc2[i * D_hi + d] = o_val + v_sum;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (tid == 0) {
+                m_prev[i] = m_new;
+                l_prev[i] = l_new;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    // Write output as bfloat
+    for (uint idx = tid; idx < q_count * D_lo; idx += n_threads) {
+        uint i = idx / D_lo;
+        uint d = idx % D_lo;
+        float l = l_prev[i];
+        float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
+        O[(q_start + i) * D + d] = bfloat(O_acc[idx] * inv_l);
+    }
+    for (uint idx = tid; idx < q_count * D_hi; idx += n_threads) {
+        uint i = idx / D_hi;
+        uint d = idx % D_hi;
+        float l = l_prev[i];
+        float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
+        O[(q_start + i) * D + (D_lo + d)] = bfloat(O_acc2[idx] * inv_l);
+    }
+}
+"#;
+
 pub fn register(registry: &KernelRegistry) -> Result<(), KernelError> {
-    registry.register_jit_source("sdpa", SDPA_SHADER_SOURCE)
+    registry.register_jit_source("sdpa", SDPA_SHADER_SOURCE)?;
+    registry.register_jit_source("sdpa_bf16", SDPA_BF16_SHADER_SOURCE)?;
+    Ok(())
 }
 
 /// Fused Scaled Dot-Product Attention — Flash Attention 2.
@@ -761,10 +1061,17 @@ pub fn register(registry: &KernelRegistry) -> Result<(), KernelError> {
 /// - `q`: Query matrix `[N, D]` (N = number of query tokens, D = head dimension)
 /// - `k`: Key matrix `[S, D]` (S = number of key/value tokens)
 /// - `v`: Value matrix `[S, D]`
-/// - `mask`: Optional additive mask `[N, S]` (e.g. causal mask with -inf)
+/// - `mask`: Optional additive mask tensor. Accepted shapes:
+///   - `[N, S]` — per-query-token mask (standard)
+///   - `[1, S]` — broadcast across query tokens (e.g. padding mask)
+///     The mask is added to attention scores before softmax:
+///     `scores = Q @ K^T / sqrt(D) + mask`
 /// - `scale`: Scale factor, typically `1.0 / sqrt(D)`
 /// - `is_causal`: If true, applies causal masking and enables block skipping
 ///   optimisation (K/V blocks entirely above the diagonal are skipped).
+///
+/// Supports f32, f16, and bf16 dtypes. For bf16, all intermediate computation
+/// uses f32 accumulation for numerical stability.
 ///
 /// # Returns
 /// Output matrix `[N, D]`.
@@ -806,14 +1113,59 @@ pub fn sdpa(
             "sdpa: head_dim {d} > 256 not supported by fused kernel"
         )));
     }
-    if let Some(m) = mask {
-        if m.shape() != [n, s] {
+
+    // Validate mask shape: accept [N, S] or broadcastable shapes like [1, S].
+    // The kernel expects [N, S], so if mask is [1, S] we broadcast it via copy.
+    let mask_expanded: Option<Array> = if let Some(m) = mask {
+        if m.ndim() != 2 {
             return Err(KernelError::InvalidShape(format!(
-                "sdpa: mask shape {:?}, expected [{n}, {s}]",
+                "sdpa: mask must be 2D, got {}D",
+                m.ndim()
+            )));
+        }
+        if m.shape()[1] != s {
+            return Err(KernelError::InvalidShape(format!(
+                "sdpa: mask columns {} != S={s}",
+                m.shape()[1]
+            )));
+        }
+        if m.shape()[0] == n {
+            // Exact match — no expansion needed
+            None
+        } else if m.shape()[0] == 1 && n > 1 {
+            // Broadcast [1, S] -> [N, S] by repeating the single row
+            let m_c = super::make_contiguous(m, registry, queue)?;
+            let m = m_c.as_ref().unwrap_or(m);
+            let dev = registry.device().raw();
+            let expanded = Array::zeros(dev, &[n, s], m.dtype());
+            let src = m.metal_buffer().contents() as *const u8;
+            let dst = expanded.metal_buffer().contents() as *mut u8;
+            let row_bytes = m.dtype().numel_to_bytes(s);
+            // SAFETY: SharedMode buffers are CPU-accessible; bounds checked by
+            // Array::zeros allocation and row_bytes computation.
+            unsafe {
+                let src_ptr = src.add(m.offset());
+                for row in 0..n {
+                    let dst_ptr = dst.add(row * row_bytes);
+                    std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, row_bytes);
+                }
+            }
+            Some(expanded)
+        } else {
+            return Err(KernelError::InvalidShape(format!(
+                "sdpa: mask shape {:?}, expected [{n}, {s}] or [1, {s}]",
                 m.shape()
             )));
         }
-    }
+    } else {
+        None
+    };
+    // Resolve the mask reference: use expanded if we created one, otherwise the original.
+    let mask_ref: Option<&Array> = match (&mask_expanded, mask) {
+        (Some(expanded), _) => Some(expanded),
+        (None, Some(m)) => Some(m),
+        _ => None,
+    };
 
     // Make inputs contiguous
     let q_c = super::make_contiguous(q, registry, queue)?;
@@ -831,6 +1183,8 @@ pub fn sdpa(
         (DType::Float32, false) => "sdpa_f32",
         (DType::Float16, true) => "sdpa_decode_f16",
         (DType::Float16, false) => "sdpa_f16",
+        (DType::Bfloat16, true) => "sdpa_decode_bf16",
+        (DType::Bfloat16, false) => "sdpa_bf16",
         _ => {
             return Err(KernelError::NotFound(format!(
                 "sdpa: unsupported dtype {:?}",
@@ -846,7 +1200,7 @@ pub fn sdpa(
     let out = Array::zeros(dev, &[n, d], q.dtype());
 
     // Params buffer: [N, S, D, has_mask, is_causal]
-    let has_mask: u32 = if mask.is_some() { 1 } else { 0 };
+    let has_mask: u32 = if mask_ref.is_some() { 1 } else { 0 };
     let is_causal_u32: u32 = if is_causal { 1 } else { 0 };
     let params: [u32; 5] = [n as u32, s as u32, d as u32, has_mask, is_causal_u32];
     let params_buf = dev.new_buffer_with_data(
@@ -864,13 +1218,13 @@ pub fn sdpa(
 
     // Dummy mask buffer if no mask
     let dummy_buf;
-    let mask_buf = if let Some(m) = mask {
+    let mask_buf = if let Some(m) = mask_ref {
         m.metal_buffer()
     } else {
         dummy_buf = dev.new_buffer(4, metal::MTLResourceOptions::StorageModeShared);
         &dummy_buf
     };
-    let mask_offset = mask.map_or(0, |m| m.offset()) as u64;
+    let mask_offset = mask_ref.map_or(0, |m| m.offset()) as u64;
 
     let cb = queue.new_command_buffer();
     let encoder = cb.new_compute_command_encoder();

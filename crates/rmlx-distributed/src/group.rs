@@ -84,6 +84,28 @@ pub trait RdmaTransport: Send + Sync {
     ) -> Result<Vec<u8>, DistributedError>;
 }
 
+/// Reduction operation for allreduce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReduceOp {
+    /// Element-wise sum (default).
+    Sum,
+    /// Element-wise maximum.
+    Max,
+    /// Element-wise minimum.
+    Min,
+}
+
+/// Data type for reduction operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReduceDtype {
+    /// 32-bit float (default).
+    F32,
+    /// 16-bit float (IEEE 754 half-precision).
+    F16,
+    /// 16-bit bfloat.
+    Bf16,
+}
+
 /// A communication group identifying a set of ranks.
 #[derive(Clone)]
 pub struct Group {
@@ -201,6 +223,60 @@ impl Group {
         self.ranks.contains(&rank)
     }
 
+    /// Split this group into sub-groups based on color and key.
+    ///
+    /// All ranks with the same `color` end up in the same sub-group.
+    /// Within a sub-group, ranks are ordered by `key` (ties broken by rank).
+    ///
+    /// This mirrors MPI_Comm_split semantics. In single-process stub mode
+    /// (no transport), the returned group contains only the local rank.
+    /// With transport, the caller is responsible for ensuring all ranks in
+    /// the group call `split` with consistent color/key values.
+    pub fn split(&self, color: u32, key: u32) -> Result<Group, DistributedError> {
+        // In stub mode (no transport), we can only know about ourselves.
+        // Build a sub-group containing just the local rank.
+        if self.transport.is_none() {
+            return Group::new(vec![self.local_rank], self.local_rank, self.world_size);
+        }
+
+        // With transport, we need to exchange (color, key) with all peers
+        // to determine which ranks share the same color.
+        // Encode (color, key, rank) as 12 bytes and allgather.
+        let mut my_data = Vec::with_capacity(12);
+        my_data.extend_from_slice(&color.to_le_bytes());
+        my_data.extend_from_slice(&key.to_le_bytes());
+        my_data.extend_from_slice(&self.local_rank.to_le_bytes());
+
+        let transport = self.require_transport("split")?;
+        let gathered = ring_allgather(&my_data, &self.ranks, self.local_rank, transport)?;
+
+        // Parse all (color, key, rank) tuples
+        let mut entries: Vec<(u32, u32, u32)> = Vec::with_capacity(self.ranks.len());
+        for chunk in gathered.chunks_exact(12) {
+            let c = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            let k = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+            let r = u32::from_le_bytes([chunk[8], chunk[9], chunk[10], chunk[11]]);
+            entries.push((c, k, r));
+        }
+
+        // Filter to same color, sort by (key, rank)
+        let mut same_color: Vec<(u32, u32)> = entries
+            .iter()
+            .filter(|(c, _, _)| *c == color)
+            .map(|(_, k, r)| (*k, *r))
+            .collect();
+        same_color.sort();
+
+        let sub_ranks: Vec<u32> = same_color.iter().map(|(_, r)| *r).collect();
+
+        Group::with_transport(
+            sub_ranks,
+            self.local_rank,
+            self.world_size,
+            Arc::clone(transport),
+        )
+    }
+
     // ─── Collective operations ───
     // All collectives call ensure_materialized() at entry.
     // When transport is Some, real RDMA operations are used.
@@ -221,6 +297,27 @@ impl Group {
         }
         let transport = self.require_transport("allreduce")?;
         ring_allreduce(data, &self.ranks, self.local_rank, transport)
+    }
+
+    /// All-reduce with configurable reduction operation and dtype.
+    ///
+    /// Supports Sum, Max, and Min operations on f32, f16, and bf16 data.
+    /// For f16/bf16, accumulation is performed in f32 precision.
+    ///
+    /// Single-rank groups return input unchanged (identity).
+    /// Multi-rank groups without transport return an error.
+    pub fn allreduce_op(
+        &self,
+        data: &[u8],
+        op: ReduceOp,
+        dtype: ReduceDtype,
+    ) -> Result<Vec<u8>, DistributedError> {
+        Self::check_materialized("allreduce_op", data)?;
+        if self.ranks.len() <= 1 {
+            return Ok(data.to_vec());
+        }
+        let transport = self.require_transport("allreduce_op")?;
+        ring_allreduce_op(data, &self.ranks, self.local_rank, transport, op, dtype)
     }
 
     /// All-gather: gather data from all ranks into every rank.
@@ -428,6 +525,39 @@ impl Group {
             gathered_shape,
             input.dtype(),
         ))
+    }
+
+    /// Reduce-scatter: reduce data across all ranks, then scatter chunks.
+    ///
+    /// The input data is divided into N equal chunks (one per rank). Each
+    /// chunk is reduced (summed) across all ranks, and rank i receives chunk i.
+    /// The output has size `data.len() / group_size`.
+    ///
+    /// With transport: ring reduce-scatter — N-1 rounds of send/recv/accumulate.
+    ///
+    /// Data length must be divisible by group size and by 4 (f32 granularity).
+    /// Single-rank groups return input unchanged (identity).
+    /// Multi-rank groups without transport return an error.
+    pub fn reduce_scatter(&self, data: &[u8]) -> Result<Vec<u8>, DistributedError> {
+        Self::check_materialized("reduce_scatter", data)?;
+        let n = self.ranks.len();
+        if n <= 1 {
+            return Ok(data.to_vec());
+        }
+        if data.len() % n != 0 {
+            return Err(DistributedError::Protocol(format!(
+                "reduce_scatter: data length ({}) must be divisible by group size ({n})",
+                data.len()
+            )));
+        }
+        if data.len() % 4 != 0 {
+            return Err(DistributedError::Protocol(format!(
+                "reduce_scatter: data length ({}) must be a multiple of 4 (f32 element size)",
+                data.len()
+            )));
+        }
+        let transport = self.require_transport("reduce_scatter")?;
+        ring_reduce_scatter(data, &self.ranks, self.local_rank, transport)
     }
 
     /// Barrier: block until all ranks in the group have reached this point.

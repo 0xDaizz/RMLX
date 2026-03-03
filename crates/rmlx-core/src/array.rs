@@ -527,6 +527,81 @@ impl Array {
             offset: self.offset,
         })
     }
+
+    /// Transpose (swap) two dimensions, returning a new zero-copy view.
+    ///
+    /// This swaps the shape and stride entries for `dim0` and `dim1`.
+    /// The resulting array shares the same underlying buffer but may be
+    /// non-contiguous.
+    ///
+    /// # Errors
+    /// Returns an error if either dimension is out of range.
+    pub fn transpose(
+        &self,
+        dim0: usize,
+        dim1: usize,
+    ) -> Result<Self, crate::kernels::KernelError> {
+        let ndim = self.ndim();
+        if dim0 >= ndim {
+            return Err(crate::kernels::KernelError::InvalidShape(format!(
+                "transpose: dim0={dim0} out of range for {ndim}D array"
+            )));
+        }
+        if dim1 >= ndim {
+            return Err(crate::kernels::KernelError::InvalidShape(format!(
+                "transpose: dim1={dim1} out of range for {ndim}D array"
+            )));
+        }
+        let mut new_shape = self.shape.clone();
+        let mut new_strides = self.strides.clone();
+        new_shape.swap(dim0, dim1);
+        new_strides.swap(dim0, dim1);
+        Ok(Self {
+            buffer: self.buffer.clone(),
+            shape: new_shape,
+            strides: new_strides,
+            dtype: self.dtype,
+            offset: self.offset,
+        })
+    }
+
+    /// Remove a specific dimension of size 1, returning a new zero-copy view.
+    ///
+    /// Unlike [`squeeze`](Array::squeeze) which removes all size-1 dimensions,
+    /// this targets a single dimension.
+    ///
+    /// # Errors
+    /// Returns an error if `dim >= ndim` or if `shape[dim] != 1`.
+    pub fn squeeze_dim(&self, dim: usize) -> Result<Self, crate::kernels::KernelError> {
+        let ndim = self.ndim();
+        if dim >= ndim {
+            return Err(crate::kernels::KernelError::InvalidShape(format!(
+                "squeeze_dim: dim={dim} out of range for {ndim}D array"
+            )));
+        }
+        if self.shape[dim] != 1 {
+            return Err(crate::kernels::KernelError::InvalidShape(format!(
+                "squeeze_dim: dimension {dim} has size {}, expected 1",
+                self.shape[dim]
+            )));
+        }
+        let mut new_shape = self.shape.clone();
+        let mut new_strides = self.strides.clone();
+        new_shape.remove(dim);
+        new_strides.remove(dim);
+        // If we removed the last dimension, keep at least a scalar shape.
+        if new_shape.is_empty() {
+            new_shape.push(1);
+            new_strides.push(1);
+        }
+        Ok(Self {
+            buffer: self.buffer.clone(),
+            shape: new_shape,
+            strides: new_strides,
+            dtype: self.dtype,
+            offset: self.offset,
+        })
+    }
 }
 
 /// Compute contiguous (row-major) strides for a given shape.
@@ -634,5 +709,151 @@ mod tests {
     fn test_broadcast_shape_scalars() {
         assert_eq!(broadcast_shape(&[], &[]).unwrap(), Vec::<usize>::new());
         assert_eq!(broadcast_shape(&[], &[5]).unwrap(), vec![5]);
+    }
+
+    // ── C6: View ops tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_transpose_2d() {
+        // Simulate a [3, 4] array with contiguous strides [4, 1]
+        let arr = Array {
+            buffer: metal::Device::system_default()
+                .unwrap()
+                .new_buffer(48, MTLResourceOptions::StorageModeShared),
+            shape: vec![3, 4],
+            strides: vec![4, 1],
+            dtype: DType::Float32,
+            offset: 0,
+        };
+        let t = arr.transpose(0, 1).unwrap();
+        assert_eq!(t.shape(), &[4, 3]);
+        assert_eq!(t.strides(), &[1, 4]);
+    }
+
+    #[test]
+    fn test_transpose_3d() {
+        let arr = Array {
+            buffer: metal::Device::system_default()
+                .unwrap()
+                .new_buffer(96, MTLResourceOptions::StorageModeShared),
+            shape: vec![2, 3, 4],
+            strides: vec![12, 4, 1],
+            dtype: DType::Float32,
+            offset: 0,
+        };
+        let t = arr.transpose(0, 2).unwrap();
+        assert_eq!(t.shape(), &[4, 3, 2]);
+        assert_eq!(t.strides(), &[1, 4, 12]);
+    }
+
+    #[test]
+    fn test_transpose_same_dim_is_noop() {
+        let arr = Array {
+            buffer: metal::Device::system_default()
+                .unwrap()
+                .new_buffer(48, MTLResourceOptions::StorageModeShared),
+            shape: vec![3, 4],
+            strides: vec![4, 1],
+            dtype: DType::Float32,
+            offset: 0,
+        };
+        let t = arr.transpose(1, 1).unwrap();
+        assert_eq!(t.shape(), arr.shape());
+        assert_eq!(t.strides(), arr.strides());
+    }
+
+    #[test]
+    fn test_transpose_out_of_range() {
+        let arr = Array {
+            buffer: metal::Device::system_default()
+                .unwrap()
+                .new_buffer(48, MTLResourceOptions::StorageModeShared),
+            shape: vec![3, 4],
+            strides: vec![4, 1],
+            dtype: DType::Float32,
+            offset: 0,
+        };
+        assert!(arr.transpose(0, 5).is_err());
+        assert!(arr.transpose(5, 0).is_err());
+    }
+
+    #[test]
+    fn test_squeeze_dim() {
+        let arr = Array {
+            buffer: metal::Device::system_default()
+                .unwrap()
+                .new_buffer(48, MTLResourceOptions::StorageModeShared),
+            shape: vec![1, 3, 4],
+            strides: vec![12, 4, 1],
+            dtype: DType::Float32,
+            offset: 0,
+        };
+        let s = arr.squeeze_dim(0).unwrap();
+        assert_eq!(s.shape(), &[3, 4]);
+        assert_eq!(s.strides(), &[4, 1]);
+    }
+
+    #[test]
+    fn test_squeeze_dim_middle() {
+        let arr = Array {
+            buffer: metal::Device::system_default()
+                .unwrap()
+                .new_buffer(48, MTLResourceOptions::StorageModeShared),
+            shape: vec![3, 1, 4],
+            strides: vec![4, 4, 1],
+            dtype: DType::Float32,
+            offset: 0,
+        };
+        let s = arr.squeeze_dim(1).unwrap();
+        assert_eq!(s.shape(), &[3, 4]);
+        assert_eq!(s.strides(), &[4, 1]);
+    }
+
+    #[test]
+    fn test_squeeze_dim_non_one_fails() {
+        let arr = Array {
+            buffer: metal::Device::system_default()
+                .unwrap()
+                .new_buffer(48, MTLResourceOptions::StorageModeShared),
+            shape: vec![3, 4],
+            strides: vec![4, 1],
+            dtype: DType::Float32,
+            offset: 0,
+        };
+        assert!(arr.squeeze_dim(0).is_err());
+    }
+
+    #[test]
+    fn test_view_ops_zero_copy() {
+        // All view operations should share the same buffer
+        let dev = metal::Device::system_default().unwrap();
+        let arr = Array::from_slice(&dev, &[1.0f32; 12], vec![3, 4]);
+
+        let reshaped = arr.reshape(vec![4, 3]).unwrap();
+        assert_eq!(
+            arr.metal_buffer().gpu_address(),
+            reshaped.metal_buffer().gpu_address()
+        );
+
+        let unsqueezed = arr.unsqueeze(0).unwrap();
+        assert_eq!(
+            arr.metal_buffer().gpu_address(),
+            unsqueezed.metal_buffer().gpu_address()
+        );
+        assert_eq!(unsqueezed.shape(), &[1, 3, 4]);
+
+        let squeezed = unsqueezed.squeeze_dim(0).unwrap();
+        assert_eq!(
+            arr.metal_buffer().gpu_address(),
+            squeezed.metal_buffer().gpu_address()
+        );
+        assert_eq!(squeezed.shape(), &[3, 4]);
+
+        let transposed = arr.transpose(0, 1).unwrap();
+        assert_eq!(
+            arr.metal_buffer().gpu_address(),
+            transposed.metal_buffer().gpu_address()
+        );
+        assert_eq!(transposed.shape(), &[4, 3]);
     }
 }
