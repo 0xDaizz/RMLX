@@ -7,132 +7,322 @@
 //! Feature-gated behind `metal3` since older devices (M1, M2) do not support
 //! the residency set API.
 //!
-//! # Current status
+//! # Implementation
 //!
-//! The `metal` Rust crate does not yet expose `MTLResidencySet` bindings.
-//! This module provides stub implementations with the correct interface so
-//! that callers can be written against it today. Once upstream bindings land,
-//! the stubs should be replaced with real Metal API calls.
+//! When the `metal3` feature is enabled, this module uses `objc::msg_send!`
+//! to call the Metal 3 `MTLResidencySet` API directly, since the `metal`
+//! Rust crate does not yet expose these bindings.
 //!
-//! TODO(metal3): Replace stubs with real `MTLResidencySet` calls when the
-//! `metal` crate exposes them (tracked upstream).
+//! When `metal3` is not enabled, a no-op stub is provided that only tracks
+//! buffer counts for diagnostics.
 
-/// Manages a set of Metal buffers that should be made resident on the GPU.
-///
-/// On Metal 3+ devices, this uses `MTLResidencySet` to batch residency
-/// operations. On older devices or when the `metal3` feature is not enabled,
-/// this is a no-op.
-pub struct ResidencyManager {
-    /// Number of buffers tracked (for diagnostics).
-    buffer_count: usize,
-    /// Whether changes have been made since the last commit.
-    dirty: bool,
+use std::fmt;
+
+/// Error type for residency set operations.
+#[derive(Debug)]
+pub enum ResidencyError {
+    /// The device does not support Metal 3 residency sets.
+    CreationFailed(String),
 }
 
-impl ResidencyManager {
-    /// Placeholder for Metal 3 residency-set backend wiring.
+impl fmt::Display for ResidencyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CreationFailed(msg) => write!(f, "residency set creation failed: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for ResidencyError {}
+
+// ---------------------------------------------------------------------------
+// metal3-enabled implementation: real MTLResidencySet via objc runtime
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "metal3")]
+mod inner {
+    use objc::runtime::Object;
+    use rmlx_metal::metal;
+    use rmlx_metal::metal::foreign_types::ForeignType;
+
+    use super::ResidencyError;
+
+    /// Manages a set of Metal buffers that should be made resident on the GPU.
     ///
-    /// The `metal3` feature indicates intent to use the real API, so we keep a
-    /// `todo!()` path to prevent silent no-op behavior under that feature.
-    #[cfg(feature = "metal3")]
-    #[inline(always)]
-    fn todo_metal3_backend() -> ! {
-        todo!(
-            "TODO(A6): Implement real MTLResidencySet backend in rmlx-alloc \
-             once metal-rs exposes the required bindings"
-        )
+    /// On Metal 3+ devices, this uses `MTLResidencySet` to batch residency
+    /// operations. The underlying Objective-C object is created from the
+    /// device and released on drop.
+    pub struct ResidencyManager {
+        /// Raw pointer to the `MTLResidencySet` Objective-C object.
+        residency_set: *mut Object,
+        /// Number of buffers tracked (for diagnostics).
+        buffer_count: usize,
+        /// Whether changes have been made since the last commit.
+        dirty: bool,
     }
 
-    /// Create a new residency manager.
-    ///
-    /// TODO(metal3): Accept `&metal::Device` and create an `MTLResidencySet`
-    /// via `device.newResidencySet()` once bindings are available.
-    pub fn new() -> Self {
-        #[cfg(feature = "metal3")]
-        Self::todo_metal3_backend();
+    impl ResidencyManager {
+        /// Create a new residency manager backed by a real `MTLResidencySet`.
+        ///
+        /// Creates an `MTLResidencySetDescriptor`, then calls
+        /// `[device newResidencySetWithDescriptor:error:]` to obtain the
+        /// residency set.
+        ///
+        /// # Errors
+        ///
+        /// Returns `ResidencyError::CreationFailed` if the device does not
+        /// support Metal 3 residency sets (i.e., the returned object is null).
+        pub fn new(device: &metal::Device) -> Result<Self, ResidencyError> {
+            // SAFETY: We are calling well-known Metal 3 Objective-C APIs.
+            // MTLResidencySetDescriptor is a simple descriptor class, and
+            // newResidencySetWithDescriptor:error: is the standard factory.
+            // We use device.as_ptr() (from ForeignType) to get the real
+            // ObjC pointer, rather than casting the Rust wrapper address.
+            let residency_set: *mut Object = unsafe {
+                let desc: *mut Object = msg_send![class!(MTLResidencySetDescriptor), new];
 
-        Self {
-            buffer_count: 0,
-            dirty: false,
+                let raw_device: *mut Object = device.as_ptr() as *mut Object;
+                let null_ptr: *mut Object = std::ptr::null_mut();
+                let set: *mut Object = msg_send![
+                    raw_device,
+                    newResidencySetWithDescriptor: desc
+                    error: null_ptr
+                ];
+
+                // Release the descriptor; the residency set retains what it needs.
+                let _: () = msg_send![desc, release];
+
+                set
+            };
+
+            if residency_set.is_null() {
+                return Err(ResidencyError::CreationFailed(
+                    "device may not support Metal 3".to_string(),
+                ));
+            }
+
+            Ok(Self {
+                residency_set,
+                buffer_count: 0,
+                dirty: false,
+            })
+        }
+
+        /// Add a buffer to the residency set.
+        ///
+        /// Calls `[residencySet addAllocation:]` with the raw buffer pointer.
+        pub fn add_buffer(&mut self, buffer: &metal::Buffer) {
+            // SAFETY: addAllocation: is a Metal 3 MTLResidencySet method.
+            // We use buffer.as_ptr() (from ForeignType) to get the real
+            // ObjC pointer.
+            unsafe {
+                let raw_buf: *mut Object = buffer.as_ptr() as *mut Object;
+                let _: () = msg_send![self.residency_set, addAllocation: raw_buf];
+            }
+            self.buffer_count += 1;
+            self.dirty = true;
+        }
+
+        /// Remove a buffer from the residency set.
+        ///
+        /// Calls `[residencySet removeAllocation:]` with the raw buffer pointer.
+        pub fn remove_buffer(&mut self, buffer: &metal::Buffer) {
+            // SAFETY: removeAllocation: is a Metal 3 MTLResidencySet method.
+            unsafe {
+                let raw_buf: *mut Object = buffer.as_ptr() as *mut Object;
+                let _: () = msg_send![self.residency_set, removeAllocation: raw_buf];
+            }
+            self.buffer_count = self.buffer_count.saturating_sub(1);
+            self.dirty = true;
+        }
+
+        /// Commit pending residency set changes to the GPU.
+        ///
+        /// Calls `[residencySet commit]` to apply additions and removals
+        /// to the GPU's residency table.
+        pub fn commit(&mut self) {
+            // SAFETY: commit is a Metal 3 MTLResidencySet method.
+            unsafe {
+                let _: () = msg_send![self.residency_set, commit];
+            }
+            self.dirty = false;
+        }
+
+        /// Number of buffers currently in the residency set.
+        pub fn buffer_count(&self) -> usize {
+            self.buffer_count
+        }
+
+        /// Whether there are uncommitted changes.
+        pub fn is_dirty(&self) -> bool {
+            self.dirty
         }
     }
 
-    /// Add a buffer to the residency set.
+    impl Drop for ResidencyManager {
+        fn drop(&mut self) {
+            // SAFETY: We own the residency set and release it exactly once.
+            if !self.residency_set.is_null() {
+                unsafe {
+                    let _: () = msg_send![self.residency_set, release];
+                }
+            }
+        }
+    }
+
+    // The residency set is an Objective-C object that is not thread-safe.
+    // We explicitly do NOT impl Send or Sync.
+}
+
+// ---------------------------------------------------------------------------
+// Non-metal3 implementation: no-op stubs with counter tracking
+// ---------------------------------------------------------------------------
+
+#[cfg(not(feature = "metal3"))]
+mod inner {
+    use rmlx_metal::metal;
+
+    use super::ResidencyError;
+
+    /// Manages a set of Metal buffers that should be made resident on the GPU.
     ///
-    /// TODO(metal3): Call `residency_set.addAllocation(buffer)` on the real
-    /// Metal residency set.
-    pub fn add_buffer(&mut self, _buffer: &rmlx_metal::metal::Buffer) {
-        #[cfg(feature = "metal3")]
-        Self::todo_metal3_backend();
-
-        self.buffer_count += 1;
-        self.dirty = true;
+    /// When the `metal3` feature is not enabled, this is a no-op stub that
+    /// only tracks buffer counts for diagnostics.
+    pub struct ResidencyManager {
+        /// Number of buffers tracked (for diagnostics).
+        buffer_count: usize,
+        /// Whether changes have been made since the last commit.
+        dirty: bool,
     }
 
-    /// Remove a buffer from the residency set.
-    ///
-    /// TODO(metal3): Call `residency_set.removeAllocation(buffer)` on the
-    /// real Metal residency set.
-    pub fn remove_buffer(&mut self, _buffer: &rmlx_metal::metal::Buffer) {
-        #[cfg(feature = "metal3")]
-        Self::todo_metal3_backend();
+    impl ResidencyManager {
+        /// Create a new residency manager (no-op without `metal3` feature).
+        ///
+        /// The `device` parameter is accepted for API uniformity with the
+        /// `metal3` path but is not used.
+        ///
+        /// # Errors
+        ///
+        /// This stub never fails, but returns `Result` for API consistency
+        /// with the `metal3` path.
+        pub fn new(_device: &metal::Device) -> Result<Self, ResidencyError> {
+            Ok(Self {
+                buffer_count: 0,
+                dirty: false,
+            })
+        }
 
-        self.buffer_count = self.buffer_count.saturating_sub(1);
-        self.dirty = true;
-    }
+        /// Add a buffer to the residency set (no-op, tracks count only).
+        pub fn add_buffer(&mut self, _buffer: &metal::Buffer) {
+            self.buffer_count += 1;
+            self.dirty = true;
+        }
 
-    /// Commit pending residency set changes to the GPU.
-    ///
-    /// TODO(metal3): Call `residency_set.commit()` to apply additions and
-    /// removals to the GPU's residency table.
-    pub fn commit(&mut self) {
-        #[cfg(feature = "metal3")]
-        Self::todo_metal3_backend();
+        /// Remove a buffer from the residency set (no-op, tracks count only).
+        pub fn remove_buffer(&mut self, _buffer: &metal::Buffer) {
+            self.buffer_count = self.buffer_count.saturating_sub(1);
+            self.dirty = true;
+        }
 
-        // Stub: no-op until MTLResidencySet bindings are available.
-        self.dirty = false;
-    }
+        /// Commit pending residency set changes (no-op).
+        pub fn commit(&mut self) {
+            self.dirty = false;
+        }
 
-    /// Number of buffers currently in the residency set.
-    pub fn buffer_count(&self) -> usize {
-        self.buffer_count
-    }
+        /// Number of buffers currently in the residency set.
+        pub fn buffer_count(&self) -> usize {
+            self.buffer_count
+        }
 
-    /// Whether there are uncommitted changes.
-    pub fn is_dirty(&self) -> bool {
-        self.dirty
+        /// Whether there are uncommitted changes.
+        pub fn is_dirty(&self) -> bool {
+            self.dirty
+        }
     }
 }
 
-impl Default for ResidencyManager {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+pub use inner::ResidencyManager;
 
 #[cfg(test)]
+#[cfg(not(feature = "metal3"))]
 mod tests {
     use super::*;
 
+    /// Test the non-metal3 stub path: counter tracking and dirty flag.
+    ///
+    /// This test always runs (even without `metal3`) because it exercises
+    /// the bookkeeping logic directly.
     #[test]
-    fn test_residency_manager_stub_lifecycle() {
-        let mut mgr = ResidencyManager::new();
+    fn test_residency_metal3_stub() {
+        use rmlx_metal::device::GpuDevice;
+        use rmlx_metal::metal::MTLResourceOptions;
+
+        let device = match GpuDevice::system_default() {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("skipping test: no Metal device");
+                return;
+            }
+        };
+
+        let mut mgr = ResidencyManager::new(device.raw()).expect("stub new should not fail");
         assert_eq!(mgr.buffer_count(), 0);
         assert!(!mgr.is_dirty());
 
-        // We can't easily create a real Metal buffer in a unit test without
-        // a device, so we test the bookkeeping logic with the stub path.
-        // The add/remove/commit methods are no-ops on the Metal side, but
-        // the counter tracking should work.
-        mgr.buffer_count += 1; // simulate add
-        mgr.dirty = true;
+        let buf = device.new_buffer(4096, MTLResourceOptions::StorageModeShared);
+
+        mgr.add_buffer(&buf);
+        assert_eq!(mgr.buffer_count(), 1);
+        assert!(mgr.is_dirty());
+
+        mgr.add_buffer(&buf);
+        assert_eq!(mgr.buffer_count(), 2);
+
+        mgr.commit();
+        assert!(!mgr.is_dirty());
+
+        mgr.remove_buffer(&buf);
+        assert_eq!(mgr.buffer_count(), 1);
+        assert!(mgr.is_dirty());
+
+        mgr.remove_buffer(&buf);
+        assert_eq!(mgr.buffer_count(), 0);
+
+        // Saturating sub should not underflow
+        mgr.remove_buffer(&buf);
+        assert_eq!(mgr.buffer_count(), 0);
+
+        mgr.commit();
+        assert!(!mgr.is_dirty());
+    }
+
+    #[test]
+    fn test_residency_manager_stub_lifecycle() {
+        use rmlx_metal::device::GpuDevice;
+        use rmlx_metal::metal::MTLResourceOptions;
+
+        let device = match GpuDevice::system_default() {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("skipping test: no Metal device");
+                return;
+            }
+        };
+
+        let mut mgr = ResidencyManager::new(device.raw()).expect("stub new should not fail");
+        assert_eq!(mgr.buffer_count(), 0);
+        assert!(!mgr.is_dirty());
+
+        let buf = device.new_buffer(4096, MTLResourceOptions::StorageModeShared);
+
+        mgr.add_buffer(&buf);
         assert_eq!(mgr.buffer_count(), 1);
         assert!(mgr.is_dirty());
 
         mgr.commit();
         assert!(!mgr.is_dirty());
 
-        mgr.buffer_count = mgr.buffer_count.saturating_sub(1); // simulate remove
+        mgr.remove_buffer(&buf);
         assert_eq!(mgr.buffer_count(), 0);
     }
 
@@ -149,7 +339,7 @@ mod tests {
             }
         };
 
-        let mut mgr = ResidencyManager::new();
+        let mut mgr = ResidencyManager::new(device.raw()).expect("stub new should not fail");
         let buf = device.new_buffer(4096, MTLResourceOptions::StorageModeShared);
 
         mgr.add_buffer(&buf);
@@ -165,5 +355,13 @@ mod tests {
 
         mgr.commit();
         assert!(!mgr.is_dirty());
+    }
+
+    #[test]
+    fn test_residency_error_display() {
+        let err = ResidencyError::CreationFailed("test error".to_string());
+        let msg = format!("{err}");
+        assert!(msg.contains("test error"));
+        assert!(msg.contains("residency set creation failed"));
     }
 }

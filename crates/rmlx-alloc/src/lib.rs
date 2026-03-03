@@ -1,12 +1,17 @@
 //! rmlx-alloc — GPU memory allocator for RMLX
 
 #![deny(unsafe_op_in_unsafe_fn)]
+#![allow(unexpected_cfgs)] // objc crate uses deprecated cfg(feature = "cargo-clippy")
+
+// Required for objc::msg_send! macro in residency module (metal3 feature).
+#[cfg(feature = "metal3")]
+#[macro_use]
+extern crate objc;
 
 pub mod allocator;
 pub mod buffer_pool;
 pub mod cache;
 pub mod leak_detector;
-#[cfg(feature = "metal3")]
 pub mod residency;
 pub mod small_alloc;
 pub mod stats;
@@ -17,8 +22,7 @@ pub use allocator::MetalAllocator;
 pub use buffer_pool::BufferPool;
 pub use cache::BufferCache;
 pub use leak_detector::{LeakDetector, LeakReport};
-#[cfg(feature = "metal3")]
-pub use residency::ResidencyManager;
+pub use residency::{ResidencyError, ResidencyManager};
 pub use small_alloc::{SmallAllocation, SmallBufferPool};
 pub use stats::AllocStats;
 pub use zero_copy::{

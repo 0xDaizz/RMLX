@@ -103,6 +103,112 @@ impl RdmaContext {
         }
     }
 
+    /// Open a specific RDMA device by name (e.g., "mlx5_0").
+    ///
+    /// Iterates through all available RDMA devices and opens the one whose
+    /// name matches `name`. Returns an error if no device with that name exists.
+    pub fn open_by_name(name: &str) -> Result<Self, RdmaError> {
+        let lib = IbverbsLib::load()?;
+
+        // SAFETY: ibv_get_device_list returns a null-terminated array.
+        // We check for null and num_devices > 0.
+        unsafe {
+            let mut num_devices: std::ffi::c_int = 0;
+            let dev_list = (lib.get_device_list)(&mut num_devices);
+            if dev_list.is_null() || num_devices == 0 {
+                if !dev_list.is_null() {
+                    (lib.free_device_list)(dev_list);
+                }
+                return Err(RdmaError::NoDevices);
+            }
+
+            // Iterate through the device list to find the named device.
+            let mut found_device = std::ptr::null_mut();
+            for i in 0..num_devices as isize {
+                let device = *dev_list.offset(i);
+                if device.is_null() {
+                    break;
+                }
+                let name_ptr = (lib.get_device_name)(device);
+                if !name_ptr.is_null() {
+                    let dev_name = CStr::from_ptr(name_ptr).to_string_lossy();
+                    if dev_name == name {
+                        found_device = device;
+                        break;
+                    }
+                }
+            }
+
+            if found_device.is_null() {
+                (lib.free_device_list)(dev_list);
+                return Err(RdmaError::DeviceOpen(format!("device '{name}' not found")));
+            }
+
+            let device_name = name.to_string();
+            let ctx = (lib.open_device)(found_device);
+            (lib.free_device_list)(dev_list);
+
+            if ctx.is_null() {
+                return Err(RdmaError::DeviceOpen(device_name));
+            }
+
+            let mut rdma_ctx = Self {
+                ctx,
+                device_name,
+                lib,
+                probe: None,
+            };
+
+            // Probe device capabilities and store results
+            match RdmaDeviceProbe::probe(&rdma_ctx) {
+                Ok(p) => {
+                    eprintln!(
+                        "[rmlx-rdma] device '{}' probed: gid_index={}, max_mr_size={}, \
+                         max_qp_wr={}, max_cq_depth={}, mtu={}, max_msg_sz={}, gid_tbl_len={}",
+                        rdma_ctx.device_name,
+                        p.gid_index,
+                        p.max_mr_size,
+                        p.max_qp_wr,
+                        p.max_cq_depth,
+                        p.mtu,
+                        p.max_msg_sz,
+                        p.gid_tbl_len,
+                    );
+                    // Log INFO when probed values differ significantly from defaults
+                    if p.gid_index != 1 {
+                        eprintln!(
+                            "[rmlx-rdma] INFO: probed gid_index={} differs from default (1)",
+                            p.gid_index,
+                        );
+                    }
+                    if p.max_qp_wr != 4095 {
+                        eprintln!(
+                            "[rmlx-rdma] INFO: probed max_qp_wr={} differs from default (4095)",
+                            p.max_qp_wr,
+                        );
+                    }
+                    if p.max_cq_depth != 8192 {
+                        eprintln!(
+                            "[rmlx-rdma] INFO: probed max_cq_depth={} differs from default (8192)",
+                            p.max_cq_depth,
+                        );
+                    }
+                    rdma_ctx.probe = Some(p);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[rmlx-rdma] WARN: device '{}' probe failed: {e}. \
+                         Falling back to defaults: GID_INDEX=1, MAX_SEND_WR=8192, \
+                         MAX_RECV_WR=8192, CQ_DEPTH=8192, MTU=MTU_1024, MAX_MR_SIZE=16MB",
+                        rdma_ctx.device_name,
+                    );
+                }
+            }
+
+            Ok(rdma_ctx)
+        }
+    }
+
     /// Device name (e.g., "mlx5_0" or TB5 device name).
     pub fn device_name(&self) -> &str {
         &self.device_name

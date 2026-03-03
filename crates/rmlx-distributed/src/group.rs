@@ -12,6 +12,10 @@ pub enum DistributedError {
     Transport(String),
     /// Wire protocol or data format error (e.g., byte slice conversion failure).
     Protocol(String),
+    /// Configuration error (missing env vars, invalid configuration values).
+    Config(String),
+    /// Backend unavailable (RDMA hardware not found, backend not available).
+    BackendUnavailable(String),
 }
 
 impl fmt::Display for DistributedError {
@@ -20,6 +24,8 @@ impl fmt::Display for DistributedError {
             Self::NotMaterialized(msg) => write!(f, "not materialized: {msg}"),
             Self::Transport(msg) => write!(f, "transport error: {msg}"),
             Self::Protocol(msg) => write!(f, "protocol error: {msg}"),
+            Self::Config(msg) => write!(f, "config error: {msg}"),
+            Self::BackendUnavailable(msg) => write!(f, "backend unavailable: {msg}"),
         }
     }
 }
