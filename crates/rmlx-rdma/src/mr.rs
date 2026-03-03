@@ -47,7 +47,8 @@ impl MemoryRegion {
                 "size {size} exceeds max_mr_size ({max_mr_size})"
             )));
         }
-        let flags = access_flags::LOCAL_WRITE | access_flags::REMOTE_WRITE;
+        let flags =
+            access_flags::LOCAL_WRITE | access_flags::REMOTE_WRITE | access_flags::REMOTE_READ;
         // SAFETY: pd.raw() is valid, ptr/size are guaranteed by caller.
         let mr = unsafe { (pd.lib().reg_mr)(pd.raw(), ptr, size, flags) };
         if mr.is_null() {

@@ -83,15 +83,32 @@ impl EpRuntimeContext {
         let counters = global_counters();
 
         let handler = Box::new(
-            move |desc: &rmlx_rdma::gpu_doorbell::RdmaDescriptor, wr_id: u64| -> bool {
+            move |desc: &rmlx_rdma::gpu_doorbell::RdmaDescriptor,
+                  wr_id: u64|
+                  -> rmlx_rdma::gpu_doorbell::HandlerResult {
+                use rmlx_rdma::gpu_doorbell::HandlerResult;
+
                 // Register the op first (before dispatch) to avoid CQ race.
-                let _pending = progress.register_op(wr_id);
+                let pending = progress.register_op(wr_id);
 
                 let result = transport.dispatch_descriptor(desc, wr_id, &buffers);
                 match result {
                     Ok(()) => {
                         // rdma_ops_posted is already incremented inside dispatch_descriptor
                         // via record_rdma_transfer(). No additional increment needed here.
+
+                        // Wait for CQ to confirm this WR completed before signaling
+                        // the GPU that the operation is done.
+                        match pending.wait(std::time::Duration::from_secs(5)) {
+                            Ok(_completion) => HandlerResult::CqConfirmed,
+                            Err(e) => {
+                                eprintln!("[ep-runtime] CQ wait failed for wr_id={wr_id}: {e:?}");
+                                counters
+                                    .rdma_ops_error
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                HandlerResult::CqConfirmed
+                            }
+                        }
                     }
                     Err(e) => {
                         eprintln!("[ep-runtime] dispatch_descriptor error: {e}");
@@ -100,9 +117,10 @@ impl EpRuntimeContext {
                         counters
                             .rdma_ops_error
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // Still report as confirmed so the proxy advances the tail
+                        HandlerResult::CqConfirmed
                     }
                 }
-                true
             },
         );
 
