@@ -13,6 +13,7 @@ pub mod perf_counters;
 pub mod pipeline;
 pub mod sparse_guard;
 pub mod transport;
+pub mod v3_protocol;
 pub mod warmup;
 
 // ── Re-exports of core types ──
@@ -32,4 +33,9 @@ pub use pipeline::{
 };
 pub use sparse_guard::{GuardAction, SparseGuard};
 pub use transport::{RdmaConnectionTransport, RecvCredit};
+pub use v3_protocol::{
+    blocking_exchange_v3, pack_combine_request_v3, pack_combine_response_v3, pack_dispatch_v3,
+    unpack_combine_request_v3, unpack_combine_response_v3, unpack_dispatch_v3, PacketMeta,
+    ProtocolError, V3CombineRequest, V3CombineResponse, V3DispatchPacket, V3ReceivedTokens,
+};
 pub use warmup::{WarmupConfig, WarmupResult, WarmupState};
