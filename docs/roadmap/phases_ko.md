@@ -35,6 +35,7 @@ rmlx 프로젝트의 구현 로드맵입니다. Phase 9B-opt 및 서빙 지원 P
 | EP-4 | Compute-Communication 오버랩 (TBO + SBO) | MoePipeline, GpuEvent 체인, 비행 중 CPU 대기 제로 | EP-2 + EP-3 | ✅ 완료 |
 | EP-5 | FP8 와이어 포맷 | 토큰별 E4M3 양자화, 융합 dequant-scatter, _into_cb 교환 경로 | EP-3 | ✅ 완료 |
 | EP-6 | ICB Sparse Expert 실행 + RDMA Slab 링 | Sparse ICB 실행 + 사전 등록 slab 링 zero-copy 전송 | EP-4 + EP-5 | ✅ 완료 |
+| EP-7 | ICB 전체 Metal Indirect Dispatch | SparseExpertPlan을 ExpertGroup GEMM 인코딩에 Metal ICB indirect dispatch로 연결; GPU 명령 수준에서 빈 expert 스킵 | EP-6 | 계획됨 |
 
 ---
 
