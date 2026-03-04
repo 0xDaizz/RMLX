@@ -414,7 +414,7 @@ kernel void sdpa_f32(
     threadgroup float O_acc[Br * 128];     // [Br, min(D,128)]
     threadgroup float O_acc2[Br * 128];    // [Br, D-128] for D>128 (max 128 cols)
 
-    const uint n_threads = 256;
+    const uint n_threads = 128;
     const uint D_lo = min(D, 128u);  // first chunk of D
     const uint D_hi = (D > 128u) ? (D - 128u) : 0u;  // second chunk (0 if D<=128)
 
@@ -612,7 +612,7 @@ kernel void sdpa_f16(
     threadgroup float O_acc[Br * 128];
     threadgroup float O_acc2[Br * 128];
 
-    const uint n_threads = 256;
+    const uint n_threads = 128;
     const uint D_lo = min(D, 128u);
     const uint D_hi = (D > 128u) ? (D - 128u) : 0u;
 
@@ -912,7 +912,7 @@ kernel void sdpa_bf16(
     threadgroup float O_acc[Br * 128];
     threadgroup float O_acc2[Br * 128];
 
-    const uint n_threads = 256;
+    const uint n_threads = 128;
     const uint D_lo = min(D, 128u);
     const uint D_hi = (D > 128u) ? (D - 128u) : 0u;
 
