@@ -19,7 +19,7 @@ RMLX reimplements the core Metal GPU compute pipeline of Apple's [MLX](https://g
 | Feature | RMLX | MLX | CUDA |
 |---------|:----:|:---:|:----:|
 | Unified Memory (zero-copy) | yes | yes | no |
-| Expert Parallelism (EP) | yes (3-zone auto) | no | DeepSpeed-MoE |
+| Expert Parallelism (EP) | yes (3-zone auto + EP-1~6 optimized) | no | DeepSpeed-MoE |
 | Zero-copy RDMA | yes | no | no |
 | MTLSharedEvent sync | yes | no | n/a |
 | ExecGraph CB batching | yes | no | CUDA Graphs |
@@ -47,7 +47,7 @@ Measured on Apple Silicon, single transformer layer, Phase 9B-opt complete:
 
 ### Implemented (76 audit items resolved)
 
-**Compute Ops (25 op modules)**
+**Compute Ops (27 op modules)**
 - **Core ops** -- matmul, softmax, rms\_norm, rope, gemv, quantized GEMM, binary, reduce, copy, indexing
 - **Attention** -- SDPA/Flash Attention 2 (D≤256, decode fast path, causal mask, bf16), SDPA backward
 - **Activations** -- SiLU, SwiGLU, GELU (approx + fast), unary ops (exp, log, sqrt, abs, neg, tanh, sigmoid, erf, ceil, floor, round, sign, reciprocal)
@@ -62,7 +62,7 @@ Measured on Apple Silicon, single transformer layer, Phase 9B-opt complete:
 - **Attention** -- Multi-Head, GQA, MLA (Multi-Latent Attention for DeepSeek-V3)
 - **Normalization** -- LayerNorm layer wrapper
 - **Activations** -- SiLU, GELU, SwiGLU, Mish, QuickGELU, ReLU, LeakyReLU, ELU, SELU, Swish, HardSwish, HardSigmoid, Softplus, Softsign (14 activations)
-- **MoE** -- Expert Parallelism with shared expert support, EP integration, GPU routing
+- **MoE** -- Expert Parallelism with shared expert support, EP integration, GPU routing, ExpertGroup (grouped GEMM), MoePipeline (TBO/SBO overlap)
 - **Sliding Window Attention** -- configurable window size for efficient long-context inference
 - **KV cache** -- static, rotating (circular buffer), batch (per-sequence), quantized (q4/q8 compressed)
 - **Convolution** -- Conv1d/Conv2d neural network layer wrappers
@@ -73,7 +73,7 @@ Measured on Apple Silicon, single transformer layer, Phase 9B-opt complete:
 - **FP8 support** -- Float8E4M3 / Float8E5M2 dtypes with dequant/quant kernels
 - **GGUF format** -- binary parser for llama.cpp GGUF v2/v3 model files
 - **4 model architectures** -- LLaMA, Qwen, DeepSeek-V3, Mixtral
-- **Expert Parallelism** -- EP dispatch/combine with 3-zone auto backend (CPU/Metal/RDMA), 7 MoE Metal kernels, SparseGuard overflow monitoring
+- **Expert Parallelism** -- EP dispatch/combine with 3-zone auto backend (CPU/Metal/RDMA), 7 MoE Metal kernels, SparseGuard overflow monitoring, 6-phase EP optimization (GPU top-k routing, grouped expert GEMM, v3 protocol, TBO/SBO overlap, FP8 wire, ICB sparse + slab ring)
 - **Dynamic shapes** -- max-size pre-allocation with variable dispatch
 - **MTLSharedEvent** -- non-blocking GPU-CPU synchronization
 - **Metal infrastructure** -- fence manager, library cache, MSL version detection, autorelease pool, capture manager, managed buffers
@@ -154,10 +154,10 @@ rmlx/                           # 7 crates, 543 tests
 |--------|-------|
 | Crates | 7 |
 | Tests | 543 |
-| Op modules | 25 |
+| Op modules | 27 |
 | NN activations | 14 |
 | Model architectures | 4 (LLaMA, Qwen, DeepSeek-V3, Mixtral) |
-| Implementation phases | 9 + S1-S5 (serving support) |
+| Implementation phases | 9 + S1-S5 + EP-1~EP-6 |
 | Audit items resolved | 76 (Phase 0 + 1 + 2 full-crate audit) |
 
 ## 📚 Documentation

@@ -19,12 +19,12 @@
 | **CB management** | ExecGraph: 65 CBs/layer -> 5 CBs/layer (92.3% reduction) | 1 CB per eval() batch | Stream-ordered, CUDA Graphs capture-replay |
 | **Sync mechanism** | MTLSharedEvent signal/wait (263.9us) | waitUntilCompleted (424.9us) | CUDA events / streams |
 | **RDMA** | Zero-copy: posix_memalign + NoCopy + ibv_reg_mr | std::copy to transfer buffer | GPUDirect RDMA / NVLink |
-| **Expert Parallelism** | Native EP (3-zone auto backend, 7 MoE kernels) | No EP support | DeepSpeed-MoE, Tutel |
+| **Expert Parallelism** | Native EP (3-zone auto backend, 7 MoE kernels, EP-1~EP-6 optimized path) | No EP support | DeepSpeed-MoE, Tutel |
 | **Quantization** | Q4_0, Q4_1, Q8_0, FP8, GGUF, AWQ, GPTQ | Q4_0, Q4_1, Q8_0, GGUF, AWQ, GPTQ | FP8, AWQ, GPTQ, INT4/INT8 |
 | **Flash Attention** | Flash Attention 2 (D≤256) | No (fused SDPA) | FlashAttention-2/3 |
 | **KV cache** | Static, Rotating, Batch, Quantized | Static per-layer cache | PagedAttention (vLLM) |
 | **Training** | LoRA fine-tuning only | Full training support | Full training + LoRA + QLoRA |
-| **Op modules** | 25 | ~50+ | Hundreds |
+| **Op modules** | 27 | ~50+ | Hundreds |
 | **NN activations** | 14 | ~10 | Dozens |
 | **GatherMM** | Yes | Yes | Yes |
 | **LayerNorm** | Yes | Yes | Yes |
@@ -103,12 +103,16 @@ MLX has no built-in Expert Parallelism support. Users must implement MoE dispatc
 |-----------|------|-----|
 | MoE dispatch/combine | 3-zone auto backend (CPU/Metal/RDMA) | Manual implementation |
 | MoE Metal kernels | 7 dedicated GPU kernels | None |
-| Backend selection | Automatic by data size with cooldown/hysteresis | N/A |
+| GPU routing (EP-1) | Fused softmax -> top-k -> normalize -> histogram -> prefix-scan | N/A |
+| Expert compute (EP-2) | Grouped expert GEMM + stacked weights (ExpertGroup + GatherMM f16/bf16) | N/A |
+| Wire protocol (EP-3) | Variable-length v3 protocol with packed PacketMeta + 16B alignment | N/A |
+| Overlap engine (EP-4) | TBO + SBO MoePipeline with GpuEvent chains | N/A |
+| FP8 exchange (EP-5) | Per-token E4M3 wire format + fused dequant-scatter | N/A |
+| Sparse launch transport (EP-6) | ICB sparse expert launch + RDMA slab ring | N/A |
 | SparseGuard | Overflow monitoring + capacity auto-tuning | N/A |
-| Compute-RDMA overlap | Pipeline with dual command queues | N/A |
 | Zero-copy EP path | ibv_mr + Metal buffer on same physical address | N/A |
 
-The 3-zone policy automatically selects the optimal backend: CPU for small payloads (N ≤ 64), Metal GPU for medium (N ≥ 320), and RDMA for inter-node communication. This eliminates the need for manual backend tuning in MoE models like Mixtral and DeepSeek-V3.
+The 3-zone policy selects CPU for small payloads (N ≤ 64), Metal GPU for medium (N ≥ 320), and RDMA for inter-node communication. EP-1 through EP-6 further eliminate routing/launch/protocol bottlenecks and reduce communication bytes under load imbalance.
 
 ### 2.7 Ownership Safety
 

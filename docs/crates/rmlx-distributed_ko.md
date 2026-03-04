@@ -4,7 +4,7 @@
 
 `rmlx-distributed`는 분산 추론을 위한 통신 그룹, MoE (Mixture of Experts) 디스패치/결합 교환, 3-zone 백엔드 정책, compute↔RDMA 파이프라인 오버랩, 오버플로우 감시(SparseGuard), 워밍업 프로토콜, MoE 메트릭을 제공하는 크레이트입니다.
 
-> **상태:** 모든 모듈이 구현되어 있습니다. group, moe_exchange, moe_policy, pipeline, sparse_guard, warmup, metrics.
+> **상태:** 모든 모듈이 구현되어 있습니다. group, moe_exchange, moe_policy, pipeline, sparse_guard, warmup, metrics, v3_protocol, fp8_exchange, slab_ring. Phase 0+1+2 감사 수정 완료 (항목 D1-D10): 디스패치 루프 순서 수정 (k-outer), 랭크별 용량 분배, combine 커널 캐싱, byte threshold (4KB->2MB), 히스테리시스 경로 수정, 이중 쿨다운 시맨틱, 공유 expert 지원, EP 통합 개선. EP-3/EP-5/EP-6 최적화 추가 완료.
 
 ---
 
@@ -17,10 +17,23 @@ rmlx-distributed/src/
 ├── moe_exchange.rs  # MoE 디스패치/결합 교환
 ├── moe_policy.rs    # 3-zone 백엔드 정책
 ├── pipeline.rs      # compute↔RDMA 파이프라인 오버랩
+├── v3_protocol.rs   # 가변 길이 EP v3 패킷 프로토콜 (EP-3)
+├── fp8_exchange.rs  # FP8 E4M3 와이어 교환 + 융합 dequant-scatter (EP-5)
+├── slab_ring.rs     # 사전 등록 RDMA slab 링 (zero-copy) (EP-6)
 ├── sparse_guard.rs  # Expert 오버플로우 감시
 ├── warmup.rs        # RDMA + JIT 사전 워밍업
 └── metrics.rs       # 원자적 MoE 메트릭
 ```
+
+---
+
+## EP 최적화 추가 모듈 (EP-3, EP-5, EP-6)
+
+| 모듈 | 주요 특징 |
+|------|-----------|
+| `v3_protocol.rs` | 가변 길이 2단계 교환 (count sendrecv + payload sendrecv), 패킹된 4바이트 `PacketMeta` 헤더, 16바이트 패킷 정렬 |
+| `fp8_exchange.rs` | 토큰별 FP8 E4M3 와이어 포맷, `_into_cb` 지원을 포함한 융합 `dequant_scatter_fp8e4m3` 디코드 경로 |
+| `slab_ring.rs` | `GpuEvent` 타임라인으로 동기화되는 zero-copy RDMA 프로듀서/컨슈머 흐름을 위한 사전 등록 `MTLBuffer` slab 링 |
 
 ---
 

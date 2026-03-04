@@ -2,9 +2,9 @@
 
 ## Overview
 
-`rmlx-distributed` is a crate providing communication groups, MoE (Mixture of Experts) dispatch/combine exchange, 3-zone backend policy, compute-RDMA pipeline overlap, overflow monitoring (SparseGuard), distributed initialization, warmup protocol, and MoE metrics for distributed inference.
+`rmlx-distributed` is a crate providing communication groups, MoE (Mixture of Experts) dispatch/combine exchange, 3-zone backend policy, compute-RDMA pipeline overlap, overflow monitoring (SparseGuard), variable-length EP packet protocol, FP8 exchange path, RDMA slab-ring transport, distributed initialization, warmup protocol, and MoE metrics for distributed inference.
 
-> **Status:** All modules are implemented: group, init, moe_exchange, moe_policy, pipeline, sparse_guard, warmup, metrics. Phase 0+1+2 audit remediation complete (items D1-D10): dispatch loop ordering fixed (k-outer), per-rank capacity partitioning, combine kernel caching, byte threshold (4KB->2MB), hysteresis path fix, dual cooldown semantics, shared expert support, EP integration improvements.
+> **Status:** All modules are implemented: group, init, moe_exchange, moe_policy, pipeline, sparse_guard, warmup, metrics, v3_protocol, fp8_exchange, slab_ring. Phase 0+1+2 audit remediation complete (items D1-D10): dispatch loop ordering fixed (k-outer), per-rank capacity partitioning, combine kernel caching, byte threshold (4KB->2MB), hysteresis path fix, dual cooldown semantics, shared expert support, EP integration improvements. EP-3/EP-5/EP-6 optimization additions complete.
 
 ---
 
@@ -17,11 +17,24 @@ rmlx-distributed/src/
 ├── moe_exchange.rs  # MoE dispatch/combine exchange
 ├── moe_policy.rs    # 3-zone backend policy
 ├── pipeline.rs      # Compute-RDMA pipeline overlap
+├── v3_protocol.rs   # Variable-length EP v3 packet protocol
+├── fp8_exchange.rs  # FP8 E4M3 wire exchange + fused dequant-scatter
+├── slab_ring.rs     # Pre-registered RDMA slab ring (zero-copy)
 ├── sparse_guard.rs  # Expert overflow monitoring
 ├── init.rs          # Distributed initialization (MLX-style)
 ├── warmup.rs        # RDMA + JIT warmup protocol
 └── metrics.rs       # Atomic MoE metrics
 ```
+
+---
+
+## EP Optimization Additions (EP-3, EP-5, EP-6)
+
+| Module | Highlights |
+|--------|------------|
+| `v3_protocol.rs` | Variable-length two-phase exchange (count sendrecv + payload sendrecv), packed 4-byte `PacketMeta` header, 16-byte packet alignment |
+| `fp8_exchange.rs` | Per-token FP8 E4M3 wire format, fused `dequant_scatter_fp8e4m3` decode path with `_into_cb` support |
+| `slab_ring.rs` | Pre-registered `MTLBuffer` slab ring for zero-copy RDMA producer/consumer flow synchronized via `GpuEvent` timeline |
 
 ---
 

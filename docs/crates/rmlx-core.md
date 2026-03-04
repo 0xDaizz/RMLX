@@ -4,7 +4,7 @@
 
 `rmlx-core` is the Metal GPU compute engine, providing data types, N-dimensional arrays, a kernel registry, GPU compute kernels, automatic differentiation, LoRA fine-tuning, runtime metrics, structured logging, numerical stability monitoring, and graceful shutdown.
 
-> **Status:** DType (with FP8), Array, KernelRegistry, **25 op modules** (including SDPA/FA2 with bf16 + backward, SiLU/SwiGLU, GELU, FP8 dequant/quant, Conv1d/Conv2d, tiled conv, GatherMM, LayerNorm, unary ops, concat, select, VJP GPU), GGUF format parser, AWQ/GPTQ dequant, VJP autodiff, LoRA, logging, metrics, PrecisionGuard, and ShutdownSignal are all implemented. Phase 0+1+2 audit remediation complete (items C1-C9).
+> **Status:** DType (with FP8), Array, KernelRegistry, **27 op modules** (including SDPA/FA2 with bf16 + backward, SiLU/SwiGLU, GELU, FP8 dequant/quant, Conv1d/Conv2d, tiled conv, GatherMM, LayerNorm, unary ops, concat, select, VJP GPU), GGUF format parser, AWQ/GPTQ dequant, VJP autodiff, LoRA, logging, metrics, PrecisionGuard, and ShutdownSignal are all implemented. Phase 0+1+2 audit remediation complete (items C1-C9).
 
 ---
 
@@ -19,11 +19,12 @@ rmlx-core/src/
 ├── kernels/
 │   └── mod.rs          # KernelRegistry (AOT -> JIT -> PipelineCache)
 ├── ops/
-│   ├── mod.rs          # 25 kernel registration (register_all)
+│   ├── mod.rs          # 27 kernel registration (register_all)
 │   ├── copy.rs         # Buffer copy
 │   ├── binary.rs       # add, mul, sub, div
 │   ├── reduce.rs       # sum, max, argmax, row_sum
 │   ├── softmax.rs      # softmax
+│   ├── topk_route.rs   # GPU-native MoE top-k routing (fused softmax/top-k/scan)
 │   ├── rms_norm.rs     # RMS normalization
 │   ├── rope.rs         # Rotary Position Embedding
 │   ├── gemv.rs         # Matrix-vector product
@@ -32,11 +33,11 @@ rmlx-core/src/
 │   ├── indexing.rs     # gather, scatter
 │   ├── silu.rs         # SiLU activation + fused SwiGLU
 │   ├── gelu.rs         # GELU activation (gelu_approx + gelu_fast)
-│   ├── fp8.rs          # FP8 dequant/quant (E4M3, E5M2)
+│   ├── fp8.rs          # FP8 dequant/quant + per-token E4M3 wire kernels
 │   ├── conv.rs         # Conv1d/Conv2d convolution
 │   ├── sdpa.rs         # Flash Attention 2 (fused SDPA, bf16 support)
 │   ├── sdpa_backward.rs # SDPA backward pass (VJP)
-│   ├── gather_mm.rs    # GatherMM (batched gather-matmul)
+│   ├── gather_mm.rs    # GatherMM (batched gather-matmul, f16/bf16, _into_cb)
 │   ├── layer_norm.rs   # LayerNorm (with affine parameters)
 │   ├── unary.rs        # Unary ops (exp, log, sqrt, abs, neg, tanh, sigmoid, erf, etc.)
 │   ├── concat.rs       # Tensor concatenation along arbitrary axis
@@ -146,7 +147,7 @@ unsafe fn to_vec<T: HasDType + Clone>(&self) -> Vec<T>
 
 ## ops/ — Compute Kernels
 
-Registers 25 op modules with the `KernelRegistry`. Bulk registration via `register_all()`.
+Registers 27 op modules with the `KernelRegistry`. Bulk registration via `register_all()`.
 
 ```rust
 pub fn register_all(registry: &KernelRegistry) -> Result<(), KernelError> {
@@ -175,6 +176,7 @@ pub fn register_all(registry: &KernelRegistry) -> Result<(), KernelError> {
 | `binary` | Add, Mul, Sub, Div | Element-wise arithmetic |
 | `reduce` | Sum, Max, Argmax, Row_sum | Reduction operations |
 | `softmax` | Softmax | Attention score normalization |
+| `topk_route` | MoE Top-K Route | Fused softmax -> top-k -> normalize -> histogram -> prefix-scan routing on GPU |
 | `rms_norm` | RMS Normalization | LLaMA-style normalization |
 | `rope` | RoPE | Rotary Position Embedding |
 | `gemv` | GEMV | Matrix-vector product |
@@ -183,11 +185,11 @@ pub fn register_all(registry: &KernelRegistry) -> Result<(), KernelError> {
 | `indexing` | Gather, Scatter | Indexing operations |
 | `silu` | SiLU, SiLU+Gate (SwiGLU) | Sigmoid Linear Unit activation + fused SwiGLU gate |
 | `gelu` | GELU, GELU_fast | GELU activation (tanh approx + sigmoid fast) |
-| `fp8` | FP8 dequant/quant | Float8E4M3/E5M2 dequantization and quantization |
+| `fp8` | FP8 dequant/quant | Float8E4M3/E5M2 conversion, per-token E4M3 scaling, fused dequant-scatter for EP payloads |
 | `conv` | Conv1d, Conv2d | 1D and 2D convolution with padding/stride/dilation/groups |
 | `sdpa` | SDPA / FA2 | Flash Attention 2 (fused Scaled Dot-Product Attention, bf16 support) |
 | `sdpa_backward` | SDPA backward | SDPA backward pass for VJP |
-| `gather_mm` | GatherMM | Batched gather-matmul for MoE expert routing |
+| `gather_mm` | GatherMM | Batched gather-matmul for MoE expert routing with f16/bf16 kernels (float accumulation) and _into_cb support |
 | `layer_norm` | LayerNorm | Layer normalization with affine (weight + bias) parameters |
 | `unary` | Unary ops | exp, log, sqrt, abs, neg, tanh, sigmoid, erf, ceil, floor, round, sign, reciprocal |
 | `concat` | Concat | Tensor concatenation along arbitrary axis |

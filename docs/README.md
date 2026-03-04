@@ -65,7 +65,7 @@ The ultimate goal is to connect two Mac Studio M3 Ultras via Thunderbolt 5 RDMA 
    grouping, achieving 17.4x speedup (~112ms → ~6.4ms) with 92.3% CB reduction.
 
 7. **Expert Parallelism (EP)**
-   MLX has no built-in EP support. RMLX provides a complete EP stack: 3-zone auto backend policy (CPU/Metal/RDMA) that selects the optimal path by data size, 7 dedicated MoE Metal kernels, SparseGuard overflow monitoring with capacity auto-tuning, and compute-RDMA pipeline overlap for distributed MoE inference on models like Mixtral and DeepSeek-V3.
+   MLX has no built-in EP support. RMLX provides a complete EP stack: 3-zone auto backend policy (CPU/Metal/RDMA) that selects the optimal path by data size, 7 dedicated MoE Metal kernels, SparseGuard overflow monitoring with capacity auto-tuning, and compute-RDMA pipeline overlap for distributed MoE inference on models like Mixtral and DeepSeek-V3. Six post-audit EP optimization phases (EP-1 through EP-6) further eliminate CPU sync points with GPU-native top-k routing, replace per-expert loops with grouped GEMM, reduce wire bytes via variable-length v3 protocol + FP8 quantization, and overlap compute/communication with TBO/SBO pipelines.
 
 ---
 
