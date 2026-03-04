@@ -1,6 +1,6 @@
 # Crate Structure
 
-RMLX consists of 6 crates organized as a Cargo workspace, along with supplementary directories.
+RMLX consists of 7 crates organized as a Cargo workspace, along with supplementary directories.
 
 ---
 
@@ -106,22 +106,27 @@ rmlx/
 │   │       ├── warmup.rs         # Distributed warmup
 │   │       └── metrics.rs        # Distributed metrics collection
 │   │
-│   └── rmlx-nn/                  # Neural network layers
-│       ├── Cargo.toml            # deps: rmlx-core
+│   ├── rmlx-nn/                  # Neural network layers
+│   │   ├── Cargo.toml            # deps: rmlx-core
+│   │   └── src/
+│   │       ├── lib.rs
+│   │       ├── linear.rs         # Linear (with quantization support)
+│   │       ├── embedding.rs
+│   │       ├── attention.rs      # Multi-head/GQA attention
+│   │       ├── transformer.rs    # Transformer block
+│   │       ├── moe.rs            # MoE gate + expert routing
+│   │       ├── parallel.rs       # Megatron-LM TP (Column/RowParallel)
+│   │       └── models/
+│   │           ├── mod.rs
+│   │           ├── llama.rs      # LLaMA architecture
+│   │           ├── qwen.rs       # Qwen/Qwen2.5
+│   │           ├── deepseek.rs   # DeepSeek-V3 (MoE)
+│   │           └── mixtral.rs    # Mixtral (MoE)
+│   │
+│   └── rmlx-cli/                 # Native CLI tooling
+│       ├── Cargo.toml            # deps: clap, serde, serde_json
 │       └── src/
-│           ├── lib.rs
-│           ├── linear.rs         # Linear (with quantization support)
-│           ├── embedding.rs
-│           ├── attention.rs      # Multi-head/GQA attention
-│           ├── transformer.rs    # Transformer block
-│           ├── moe.rs            # MoE gate + expert routing
-│           ├── parallel.rs       # Megatron-LM TP (Column/RowParallel)
-│           └── models/
-│               ├── mod.rs
-│               ├── llama.rs      # LLaMA architecture
-│               ├── qwen.rs       # Qwen/Qwen2.5
-│               ├── deepseek.rs   # DeepSeek-V3 (MoE)
-│               └── mixtral.rs    # Mixtral (MoE)
+│           └── main.rs           # rmlx config, rmlx launch subcommands
 │
 ├── shaders/                      # Metal shader sources
 │   ├── mlx_compat/               # .metal files ported from MLX
@@ -235,6 +240,17 @@ rmlx/
 
 ---
 
+### rmlx-cli — Native CLI Tooling
+
+| Item | Details |
+|------|---------|
+| **Purpose** | Provides the `rmlx` command-line interface for distributed cluster management. Implements `rmlx config` (hostfile generation and baseline setup) and `rmlx launch` (multi-node process orchestration), modeled after MLX's `mlx.distributed_config` and `mlx.launch`. |
+| **Key commands** | `rmlx config` (host discovery, RDMA backend setup, hostfile output), `rmlx launch` (SSH-based multi-node command dispatch) |
+| **Dependencies** | `rmlx-distributed`, `rmlx-rdma` |
+| **Status** | Initial implementation — config and launch subcommands functional |
+
+---
+
 ## Workspace Configuration
 
 ```toml
@@ -249,6 +265,7 @@ members = [
     "crates/rmlx-core",
     "crates/rmlx-distributed",
     "crates/rmlx-nn",
+    "crates/rmlx-cli",
 ]
 
 [workspace.package]

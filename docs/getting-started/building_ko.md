@@ -145,7 +145,7 @@ cargo build --workspace \
 
 ```bash
 # 호스트파일 생성 + 기본 호스트 셋업 적용
-python3 scripts/rmlx_distributed_config.py \
+rmlx config \
   --hosts node1,node2 \
   --backend rdma \
   --over thunderbolt \
@@ -155,13 +155,13 @@ python3 scripts/rmlx_distributed_config.py \
   --verbose
 
 # RDMA 디바이스 가시성 검증
-python3 scripts/rmlx_launch.py \
+rmlx launch \
   --backend rdma \
   --hostfile rmlx-hosts.json \
   -- ibv_devices
 
 # 양 노드에서 RDMA 크레이트 테스트 실행
-python3 scripts/rmlx_launch.py \
+rmlx launch \
   --backend rdma \
   --hostfile rmlx-hosts.json \
   -- cargo test -p rmlx-rdma -- --nocapture
