@@ -1329,9 +1329,16 @@ pub fn sdpa_into_cb(
     let d = q.shape()[1]; // head dim
     let s = k.shape()[0]; // key/value tokens
 
-    let kernel_name = match q.dtype() {
-        DType::Float32 => "sdpa_f32",
-        DType::Float16 => "sdpa_f16",
+    // Select kernel: decode fast path when N == 1, general kernel otherwise
+    let use_decode = n == 1;
+
+    let kernel_name = match (q.dtype(), use_decode) {
+        (DType::Float32, true) => "sdpa_decode_f32",
+        (DType::Float32, false) => "sdpa_f32",
+        (DType::Float16, true) => "sdpa_decode_f16",
+        (DType::Float16, false) => "sdpa_f16",
+        (DType::Bfloat16, true) => "sdpa_decode_bf16",
+        (DType::Bfloat16, false) => "sdpa_bf16",
         _ => {
             return Err(KernelError::NotFound(format!(
                 "sdpa: unsupported dtype {:?}",
@@ -1346,10 +1353,11 @@ pub fn sdpa_into_cb(
     let out = Array::zeros(dev, &[n, d], q.dtype());
 
     let has_mask: u32 = if mask.is_some() { 1 } else { 0 };
-    let params: [u32; 4] = [n as u32, s as u32, d as u32, has_mask];
+    let is_causal_u32: u32 = 0; // into_cb path does not support causal flag
+    let params: [u32; 5] = [n as u32, s as u32, d as u32, has_mask, is_causal_u32];
     let params_buf = dev.new_buffer_with_data(
         params.as_ptr() as *const std::ffi::c_void,
-        16,
+        20, // 5 * 4 bytes
         metal::MTLResourceOptions::StorageModeShared,
     );
 
@@ -1378,13 +1386,19 @@ pub fn sdpa_into_cb(
     encoder.set_buffer(5, Some(&params_buf), 0);
     encoder.set_buffer(6, Some(&scale_buf), 0);
 
-    let n_threadgroups = n.div_ceil(BR) as u64;
-    let tg_size = std::cmp::min(THREADS_PER_TG, pipeline.max_total_threads_per_threadgroup());
-
-    encoder.dispatch_thread_groups(
-        MTLSize::new(n_threadgroups, 1, 1),
-        MTLSize::new(tg_size, 1, 1),
-    );
+    if use_decode {
+        // Decode kernel: single threadgroup
+        let tg_size = std::cmp::min(DECODE_THREADS, pipeline.max_total_threads_per_threadgroup());
+        encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(tg_size, 1, 1));
+    } else {
+        // General kernel: one threadgroup per Q block
+        let n_threadgroups = n.div_ceil(BR) as u64;
+        let tg_size = std::cmp::min(THREADS_PER_TG, pipeline.max_total_threads_per_threadgroup());
+        encoder.dispatch_thread_groups(
+            MTLSize::new(n_threadgroups, 1, 1),
+            MTLSize::new(tg_size, 1, 1),
+        );
+    }
     encoder.end_encoding();
 
     Ok(out)

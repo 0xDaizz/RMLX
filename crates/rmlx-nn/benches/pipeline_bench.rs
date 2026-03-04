@@ -1,12 +1,12 @@
 //! GPU Pipeline Performance Benchmark
 //!
-//! Measures the impact of command buffer batching and async execution
-//! on single-layer transformer forward pass performance.
+//! Apples-to-apples comparison of single-layer transformer forward pass:
+//! - **Baseline**: `forward()` — per-op dispatch, each op commits+waits its own CB
+//! - **ExecGraph**: `forward_graph()` — same compute, batched into 6 CBs with
+//!   GPU-side event chaining (single CPU sync at the end)
 //!
-//! Two execution modes compared:
-//! - **Baseline**: per-op dispatch with `forward()` (~130 CBs per layer)
-//! - **ExecGraph**: attention via `forward_graph()` + FFN via `_into_cb()` with
-//!   GPU-side event chaining (6 CBs total)
+//! Both paths execute identical operations (norm, Q/K/V matmul, RoPE, SDPA,
+//! O_proj, residual, FFN). The only difference is dispatch strategy.
 //!
 //! Run with:
 //!   cargo bench -p rmlx-nn --bench pipeline_bench
@@ -187,70 +187,86 @@ fn main() {
     let queue = device.new_command_queue();
 
     println!(
-        "Building transformer block (hidden={}, heads={}/{}, head_dim={})...",
-        HIDDEN_SIZE, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM
+        "Config: hidden={}, heads={}/{}, head_dim={}, intermediate={}, seq_len={}",
+        HIDDEN_SIZE, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, INTERMEDIATE_DIM, SEQ_LEN
     );
-    let block = build_transformer_block(device);
+
+    let mut block = build_transformer_block(device);
     let input = rand_array(device, &[SEQ_LEN, HIDDEN_SIZE], 42);
 
-    // ---- Warmup ----
-    println!("Warming up ({} iterations)...", WARMUP_ITERS);
+    // ---- Warmup baseline ----
+    println!("\nWarming up baseline ({} iterations)...", WARMUP_ITERS);
     for _ in 0..WARMUP_ITERS {
         let _ = block.forward(&input, None, None, None, None, &registry, &queue);
     }
 
-    // ---- Benchmark baseline (per-op forward) ----
+    // ---- Benchmark baseline: forward() with per-op commit+wait ----
     println!("Benchmarking baseline ({} iterations)...", BENCH_ITERS);
     let mut baseline_latencies = Vec::with_capacity(BENCH_ITERS);
-    for _ in 0..BENCH_ITERS {
+    let mut baseline_cbs = 0u64;
+    for i in 0..BENCH_ITERS {
         reset_counters();
+        ops::reset_op_cbs();
         let start = Instant::now();
         let _ = block
             .forward(&input, None, None, None, None, &registry, &queue)
-            .expect("forward");
+            .expect("forward failed");
         baseline_latencies.push(start.elapsed());
+        if i == BENCH_ITERS - 1 {
+            baseline_cbs = ops::total_op_cbs();
+        }
     }
 
-    // ---- Benchmark ExecGraph (batched CB execution) ----
-    //
-    // Since TransformerBlock does not yet have forward_graph(), we measure
-    // ExecGraph overhead via a simple encode-submit-sync cycle that mirrors
-    // the graph-based forward pass pattern.
+    // ---- Prepare weights for ExecGraph path ----
+    println!("\nPreparing weights for ExecGraph (pre-transposing)...");
+    block
+        .prepare_weights_for_graph(&registry, &queue)
+        .expect("prepare_weights_for_graph failed");
+
+    // ---- Warmup ExecGraph ----
+    println!("Warming up ExecGraph ({} iterations)...", WARMUP_ITERS);
+    for _ in 0..WARMUP_ITERS {
+        let event = GpuEvent::new(device);
+        let mut graph = ExecGraph::new(&queue, &event, 32);
+        let _ = block.forward_graph(&input, None, None, None, None, &registry, &mut graph, &queue);
+        let _ = graph.sync_and_reset();
+    }
+
+    // ---- Benchmark ExecGraph: forward_graph() with batched CBs ----
     println!("Benchmarking ExecGraph ({} iterations)...", BENCH_ITERS);
     let mut graph_latencies = Vec::with_capacity(BENCH_ITERS);
-    for _ in 0..BENCH_ITERS {
+    let mut graph_total_batches = 0usize;
+    let mut graph_total_cbs = 0usize;
+    let mut graph_total_encoders = 0usize;
+    for i in 0..BENCH_ITERS {
         reset_counters();
         let event = GpuEvent::new(device);
         let mut graph = ExecGraph::new(&queue, &event, 32);
 
         let start = Instant::now();
-
-        // Batch 1: RMS norm (pre-attention)
-        let norm1_w = Array::ones(device, &[HIDDEN_SIZE]);
-        let cb1 = graph.command_buffer();
-        let normed =
-            ops::rms_norm::rms_norm_into_cb(&registry, &input, Some(&norm1_w), RMS_NORM_EPS, cb1)
-                .expect("rms_norm_into_cb");
-        let t1 = graph.submit_batch();
-
-        // Batch 2: Residual add placeholder (identity for benchmark)
-        graph.wait_for(t1);
-        let cb2 = graph.command_buffer();
-        let h = ops::binary::add_into_cb(&registry, &input, &normed, cb2).expect("add_into_cb");
-        let t2 = graph.submit_batch();
-
-        // Batch 3: RMS norm (pre-FFN)
-        graph.wait_for(t2);
-        let norm2_w = Array::ones(device, &[HIDDEN_SIZE]);
-        let cb3 = graph.command_buffer();
-        let _normed2 =
-            ops::rms_norm::rms_norm_into_cb(&registry, &h, Some(&norm2_w), RMS_NORM_EPS, cb3)
-                .expect("rms_norm_into_cb");
-        let _t3 = graph.submit_batch();
-
-        // Final sync: CPU blocks once
-        graph.sync_and_reset().expect("sync");
+        let _ = block
+            .forward_graph(&input, None, None, None, None, &registry, &mut graph, &queue)
+            .expect("forward_graph failed");
+        let _ = graph.sync_and_reset().expect("sync failed");
         graph_latencies.push(start.elapsed());
+
+        if i == BENCH_ITERS - 1 {
+            let stats = ExecGraphStats::from_graph(&graph);
+            graph_total_batches = stats.total_batches;
+            graph_total_cbs = stats.total_cbs;
+            graph_total_encoders = stats.total_encoders;
+            // Re-run once more to capture stats before reset
+            let event2 = GpuEvent::new(device);
+            let mut graph2 = ExecGraph::new(&queue, &event2, 32);
+            let _ = block.forward_graph(
+                &input, None, None, None, None, &registry, &mut graph2, &queue,
+            );
+            let stats2 = ExecGraphStats::from_graph(&graph2);
+            graph_total_batches = stats2.total_batches;
+            graph_total_cbs = stats2.total_cbs;
+            graph_total_encoders = stats2.total_encoders;
+            let _ = graph2.sync_and_reset();
+        }
     }
 
     // ---- Results ----
@@ -262,21 +278,28 @@ fn main() {
         0.0
     };
 
+    println!("\n========== Results ==========");
+    println!("Baseline (per-op forward):");
+    println!("  {}", baseline_stats);
+    println!("  Command buffers per forward: {}", baseline_cbs);
     println!();
-    println!("--- Results ---");
-    println!("Baseline:  {}", baseline_stats);
-    println!("ExecGraph: {}", graph_stats);
+    println!("ExecGraph (forward_graph):");
+    println!("  {}", graph_stats);
     println!(
-        "Speedup:   {:.2}x (ExecGraph / Baseline throughput ratio)",
-        speedup
+        "  Batches: {}, CBs: {}, Encoders: {}",
+        graph_total_batches, graph_total_cbs, graph_total_encoders
     );
-
-    // Print CB reduction stats from the last graph iteration
-    let event = GpuEvent::new(device);
-    let graph = ExecGraph::new(&queue, &event, 32);
-    let stats = ExecGraphStats::from_graph(&graph);
+    println!();
+    println!("Speedup:        {:.2}x", speedup);
     println!(
-        "ExecGraph stats (last iter): batches={}, cbs={}, encoders={}, enc/cb={:.1}",
-        stats.total_batches, stats.total_cbs, stats.total_encoders, stats.encoders_per_cb
+        "CB reduction:   {} -> {} ({:.1}% fewer)",
+        baseline_cbs,
+        graph_total_cbs,
+        if baseline_cbs > 0 {
+            (1.0 - graph_total_cbs as f64 / baseline_cbs as f64) * 100.0
+        } else {
+            0.0
+        }
     );
+    println!("=================================");
 }
