@@ -29,6 +29,12 @@ The rmlx project implementation roadmap. All phases through 9B-opt and serving s
 | S4 | Runtime Flexibility | Array-level collectives, Dynamic shapes | Phase 9 | Complete |
 | S5 | Multimodal Extension | Conv1d/Conv2d | Phase 9 | Complete |
 | Audit | Full-Crate Audit Remediation | 76 items across 6 crates (Phase 0+1+2) | S5 | Complete |
+| EP-1 | GPU-Native Top-K Routing | Fused routing kernel, GPU-resident expert indices/weights/counts/offsets | Audit | Complete |
+| EP-2 | Grouped Expert GEMM + Weight Stacking | ExpertGroup, stacked expert weights, batched GatherMM f16/bf16 | EP-1 | Complete |
+| EP-3 | Variable-Length v3 Protocol | Packed PacketMeta, count/payload two-phase exchange, 16B packet align | EP-1 | Complete |
+| EP-4 | Compute-Communication Overlap (TBO + SBO) | MoePipeline, GpuEvent chains, zero CPU waits in-flight | EP-2 + EP-3 | Complete |
+| EP-5 | FP8 Wire Format | Per-token E4M3 quantization, fused dequant-scatter, _into_cb exchange path | EP-3 | Complete |
+| EP-6 | ICB Sparse Expert Launch + RDMA Slab Ring | Sparse ICB execution + pre-registered slab ring zero-copy transfer | EP-4 + EP-5 | Complete |
 
 ---
 
@@ -59,6 +65,12 @@ The rmlx project implementation roadmap. All phases through 9B-opt and serving s
 | Audit Phase 0: MoE dispatch/combine (D1-D4) + alloc/Metal/GEMM (A1-A3, M1-M4, C1) | `07fad80`, `27f59af` | 460+ tests | Complete |
 | Audit Phase 1: NN MoE GPU routing + MoE policy + RDMA fixes + Metal/alloc perf | `6ee6e6c`, `014875e`, `d9c54c7` | 490+ tests | Complete |
 | Audit Phase 2: Core ops + NN layers + final codex review | `ea94e94`, `1c48b30`, `f9a3b0c` | 534 tests (at phase completion) | Complete |
+| EP-1: GPU-Native Top-K Routing (`topk_route.rs`) | main (merged) | 543+ tests | Complete |
+| EP-2: Grouped Expert GEMM + Weight Stacking (`expert_group.rs`, `gather_mm.rs`) | main (merged) | 543+ tests | Complete |
+| EP-3: Variable-Length v3 Protocol (`v3_protocol.rs`) | main (merged) | 543+ tests | Complete |
+| EP-4: Compute-Communication Overlap (TBO + SBO) (`moe_pipeline.rs`) | main (merged) | 543+ tests | Complete |
+| EP-5: FP8 Wire Format (`fp8.rs`, `fp8_exchange.rs`) | main (merged) | 543+ tests | Complete |
+| EP-6: ICB Sparse Expert Launch + RDMA Slab Ring (`icb_sparse.rs`, `slab_ring.rs`) | main (merged) | 543+ tests | Complete |
 
 ---
 
@@ -585,6 +597,23 @@ Comprehensive audit of all 6 crates with codex-assisted review. Fix all correctn
 - [x] `cargo test --workspace` -- 534 tests passing at audit completion, 0 failures
 - [x] All EP audit findings (D1-D7) resolved
 - [x] Codex review: 0 Critical/High issues remaining
+
+---
+
+## EP Optimization Phases (EP-1 ~ EP-6) -- Complete
+
+Post-audit EP optimization phases were merged into main to remove the remaining MoE bottlenecks and keep routing, exchange, and expert compute fully GPU-resident end-to-end.
+
+| Phase | Key Files | Core Changes | Status |
+|------|-----------|--------------|--------|
+| EP-1 | `crates/rmlx-core/src/ops/topk_route.rs` | Fused `moe_topk_route_f32`: softmax -> top-k -> normalize -> histogram -> prefix-scan in one Metal pass; removes GPU->CPU->GPU routing round-trip | Complete |
+| EP-2 | `crates/rmlx-nn/src/expert_group.rs`, `crates/rmlx-core/src/ops/gather_mm.rs` | `ExpertGroup` weight stacking + 3 batched GEMMs (Gate -> Up -> fused SwiGLU -> Down); GatherMM f16/bf16 kernels + `_into_cb` | Complete |
+| EP-3 | `crates/rmlx-distributed/src/v3_protocol.rs` | Variable-length token exchange with packed `PacketMeta`, two-phase count/payload sendrecv, 16B packet alignment | Complete |
+| EP-4 | `crates/rmlx-nn/src/moe_pipeline.rs` | TBO + SBO overlap orchestration via `GpuEvent` signal/wait chains; single terminal `GpuEvent::cpu_wait()` | Complete |
+| EP-5 | `crates/rmlx-core/src/ops/fp8.rs`, `crates/rmlx-distributed/src/fp8_exchange.rs` | Per-token FP8 E4M3 wire format, fused `dequant_scatter_fp8e4m3`, `_into_cb` pipelining variants | Complete |
+| EP-6 | `crates/rmlx-metal/src/icb_sparse.rs`, `crates/rmlx-distributed/src/slab_ring.rs` | Sparse expert ICB launch cache + pre-registered RDMA slab ring with `GpuEvent` timeline sync | Complete |
+
+Current op module count: 27. Current test count: 543+.
 
 ---
 

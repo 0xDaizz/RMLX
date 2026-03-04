@@ -19,12 +19,12 @@
 | **CB 관리** | ExecGraph: 65 CBs/layer -> 5 CBs/layer (92.3% 감소) | eval() 배치당 1 CB | Stream 기반, CUDA Graphs capture-replay |
 | **동기화 메커니즘** | MTLSharedEvent signal/wait (263.9us) | waitUntilCompleted (424.9us) | CUDA events / streams |
 | **RDMA** | Zero-copy: posix_memalign + NoCopy + ibv_reg_mr | std::copy로 전송 버퍼에 복사 | GPUDirect RDMA / NVLink |
-| **Expert Parallelism** | 네이티브 EP (3-zone auto backend, 7 MoE 커널) | EP 미지원 | DeepSpeed-MoE, Tutel |
+| **Expert Parallelism** | 네이티브 EP (3-zone auto backend, 7 MoE 커널, EP-1~EP-6 최적화 경로) | EP 미지원 | DeepSpeed-MoE, Tutel |
 | **양자화** | Q4_0, Q4_1, Q8_0, GGUF, AWQ, GPTQ, FP8 | Q4_0, Q4_1, Q8_0, GGUF, AWQ, GPTQ | FP8, AWQ, GPTQ, INT4/INT8 |
 | **Flash Attention** | Flash Attention 2 (fused SDPA, tiled K/V) | 미지원 (fused SDPA) | FlashAttention-2/3 |
 | **KV 캐시** | 정적/순환/배치/양자화 KV 캐시 | 정적 레이어별 캐시 | PagedAttention (vLLM) |
 | **학습** | LoRA 파인튜닝만 지원 | 전체 학습 지원 | 전체 학습 + LoRA + QLoRA |
-| **Op 모듈 수** | 25 | ~50+ | 수백 개 |
+| **Op 모듈 수** | 27 | ~50+ | 수백 개 |
 | **테스트 수** | 543 | 광범위 | 광범위 |
 | **완료된 Phase** | 0-9B-opt + S1-S5 | N/A (안정 릴리스) | N/A (안정 릴리스) |
 
@@ -96,12 +96,18 @@ MLX에는 Expert Parallelism 지원이 없습니다. 사용자가 MoE dispatch/c
 |----------|------|-----|
 | MoE dispatch/combine | 3-zone 자동 백엔드 (CPU/Metal/RDMA) | 수동 구현 필요 |
 | MoE Metal 커널 | 7개 전용 GPU 커널 | 없음 |
+| GPU 라우팅 (EP-1) | 융합 softmax -> top-k -> normalize -> histogram -> prefix-scan | 해당 없음 |
+| Expert 연산 (EP-2) | 그룹형 expert GEMM + 스태킹 가중치 (ExpertGroup + GatherMM f16/bf16) | 해당 없음 |
+| 와이어 프로토콜 (EP-3) | 패킹된 PacketMeta + 16B 정렬의 가변 길이 v3 프로토콜 | 해당 없음 |
+| 오버랩 엔진 (EP-4) | GpuEvent 체인을 통한 TBO + SBO MoePipeline | 해당 없음 |
+| FP8 교환 (EP-5) | 토큰별 E4M3 와이어 포맷 + 융합 dequant-scatter | 해당 없음 |
+| Sparse 실행 전송 (EP-6) | ICB sparse expert 실행 + RDMA slab 링 | 해당 없음 |
 | 백엔드 선택 | 데이터 크기 기반 자동 선택 (쿨다운/히스테리시스) | 해당 없음 |
 | SparseGuard | 오버플로우 모니터링 + 용량 자동 조절 | 해당 없음 |
 | Compute-RDMA 오버랩 | 듀얼 커맨드 큐 파이프라인 | 해당 없음 |
 | Zero-copy EP 경로 | 동일 물리 주소에 ibv_mr + Metal 버퍼 | 해당 없음 |
 
-3-zone 정책이 최적 백엔드를 자동으로 선택합니다: 소규모 페이로드(N ≤ 64)에는 CPU, 중규모(N ≥ 320)에는 Metal GPU, 노드 간 통신에는 RDMA. Mixtral, DeepSeek-V3 같은 MoE 모델에서 수동 백엔드 튜닝이 필요 없습니다.
+3-zone 정책이 최적 백엔드를 자동으로 선택합니다: 소규모 페이로드(N ≤ 64)에는 CPU, 중규모(N ≥ 320)에는 Metal GPU, 노드 간 통신에는 RDMA. Mixtral, DeepSeek-V3 같은 MoE 모델에서 수동 백엔드 튜닝이 필요 없습니다. EP-1~EP-6은 라우팅·실행·프로토콜 병목을 추가로 제거하고, 부하 불균형 상황에서의 통신 바이트를 줄입니다.
 
 ### 2.7 소유권 안전성
 

@@ -23,6 +23,7 @@
 
 ## 🗺️ Roadmap
 - [Implementation Phases](roadmap/phases.md) | [한국어](roadmap/phases_ko.md)
+- [EP Optimization Phases (EP-1 ~ EP-6)](roadmap/phases.md#ep-optimization-phases-ep-1--ep-6----complete)
 
 ## GPU Pipeline
 - [GPU Pipeline](gpu-pipeline.md) | [한국어](gpu-pipeline_ko.md)
