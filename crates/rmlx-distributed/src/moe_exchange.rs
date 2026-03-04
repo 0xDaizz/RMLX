@@ -25,12 +25,18 @@ use rmlx_rdma::progress::PendingOp;
 use rmlx_rdma::shared_buffer::{ConnectionId, SharedBuffer};
 
 use crate::ep_runtime::EpRuntimeContext;
+// FP8 exchange functions are available for callers that set config.enable_fp8.
+// They operate on Array types and require KernelRegistry, so the actual
+// quantize/dequantize calls happen at the MoeLayer level, not in route_rdma.
+use crate::fp8_exchange;
 use crate::group::{ensure_materialized, DistributedError, Group};
 use crate::metrics::MoeMetrics as AtomicMoeMetrics;
 use crate::moe_policy::{MoeBackend, MoePolicy};
 use crate::perf_counters::global_counters;
+use crate::slab_ring::SlabRing;
 use crate::sparse_guard::{GuardAction, SparseGuard};
 use crate::transport::RdmaConnectionTransport;
+use crate::v3_protocol;
 
 /// Safely read `n` bytes from a Metal buffer's contents.
 ///
@@ -618,6 +624,19 @@ impl MoeDtype {
 // MoeMetrics is now the atomic version from crate::metrics (re-exported as AtomicMoeMetrics).
 // This unifies the previously duplicated non-atomic and atomic implementations.
 
+/// Wire protocol version for RDMA dispatch/combine.
+///
+/// - `V2`: Fixed-size packets with 4-byte expert_id prefix (default, backward-compatible).
+/// - `V3`: Variable-length packets with packed metadata for bandwidth efficiency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WireProtocol {
+    /// Fixed-size v2 wire format (4-byte expert_id prefix + token data).
+    #[default]
+    V2,
+    /// Variable-length v3 wire format (packed metadata, eliminates wasted bandwidth).
+    V3,
+}
+
 /// MoE dispatch configuration.
 pub struct MoeDispatchConfig {
     /// Number of experts total.
@@ -628,6 +647,27 @@ pub struct MoeDispatchConfig {
     pub capacity_factor: f32,
     /// Group for inter-node communication.
     pub group: Group,
+    /// Wire protocol version for RDMA dispatch/combine. Default: V2.
+    pub wire_protocol: WireProtocol,
+    /// Enable FP8 quantization for RDMA token exchange. Default: false.
+    pub enable_fp8: bool,
+}
+
+impl MoeDispatchConfig {
+    /// Create a dispatch config with default protocol settings.
+    ///
+    /// Uses V2 wire protocol and FP8 disabled. Use struct update syntax
+    /// to override: `MoeDispatchConfig { wire_protocol: WireProtocol::V3, ..MoeDispatchConfig::new(...) }`
+    pub fn new(num_experts: usize, top_k: usize, capacity_factor: f32, group: Group) -> Self {
+        Self {
+            num_experts,
+            top_k,
+            capacity_factor,
+            group,
+            wire_protocol: WireProtocol::V2,
+            enable_fp8: false,
+        }
+    }
 }
 
 /// Cached Metal pipeline for route_metal to avoid per-dispatch JIT compilation.
@@ -653,6 +693,9 @@ pub struct MoeDispatchExchange {
     /// Optional EP runtime context for async zero-copy dispatch.
     /// When present and backend is RDMA, `dispatch()` delegates to `dispatch_async()`.
     runtime_ctx: Option<Arc<EpRuntimeContext>>,
+    /// Optional slab ring for zero-copy GPU→RDMA transfer (Phase 6b).
+    /// When present, GPU writes directly into slab's Metal buffer for RDMA send.
+    slab_ring: Option<Arc<SlabRing>>,
 }
 
 impl MoeDispatchExchange {
@@ -670,6 +713,7 @@ impl MoeDispatchExchange {
             runtime_capacity_factor: runtime_cf,
             cached_layout: None,
             runtime_ctx: None,
+            slab_ring: None,
         }
     }
 
@@ -679,6 +723,15 @@ impl MoeDispatchExchange {
     /// for non-blocking operation.
     pub fn with_runtime_context(mut self, ctx: Arc<EpRuntimeContext>) -> Self {
         self.runtime_ctx = Some(ctx);
+        self
+    }
+
+    /// Attach a slab ring for zero-copy GPU→RDMA transfer (Phase 6b).
+    ///
+    /// When set, RDMA dispatch writes GPU data directly into a slab's Metal
+    /// buffer, enabling zero-copy RDMA send without intermediate copies.
+    pub fn with_slab_ring(mut self, ring: Arc<SlabRing>) -> Self {
+        self.slab_ring = Some(ring);
         self
     }
 
@@ -911,6 +964,48 @@ impl MoeDispatchExchange {
             routed_data: route_out.data,
             layout,
         })
+    }
+
+    /// FP8-aware dispatch: quantizes tokens to FP8 before wire transfer.
+    ///
+    /// This is a convenience wrapper that:
+    /// 1. Calls `fp8_exchange::quantize_for_dispatch()` to quantize tokens
+    /// 2. Packs FP8 data + per-token scales into interleaved wire format
+    /// 3. Calls `dispatch()` with the FP8 byte payload
+    ///
+    /// The returned `DispatchResult.routed_data` contains FP8-encoded data.
+    /// Callers must use `fp8_exchange::unpack_from_wire()` + `dequantize_received()`
+    /// to recover Float16 tokens.
+    ///
+    /// Requires `config.enable_fp8 == true`.
+    pub fn dispatch_fp8(
+        &mut self,
+        batch_size: usize,
+        expert_indices: &[u32],
+        expert_weights: &[f32],
+        tokens: &rmlx_core::array::Array,
+        registry: &rmlx_core::kernels::KernelRegistry,
+        queue: &metal::CommandQueue,
+    ) -> Result<DispatchResult, DistributedError> {
+        if !self.config.enable_fp8 {
+            return Err(DistributedError::Protocol(
+                "dispatch_fp8 requires config.enable_fp8 = true".into(),
+            ));
+        }
+
+        let payload = fp8_exchange::quantize_for_dispatch(registry, tokens, queue)
+            .map_err(|e| DistributedError::Protocol(format!("FP8 quantize failed: {e}")))?;
+
+        // Validate batch_size matches quantized token count
+        if payload.num_tokens != batch_size {
+            return Err(DistributedError::Protocol(format!(
+                "dispatch_fp8: batch_size ({}) != quantized token count ({})",
+                batch_size, payload.num_tokens
+            )));
+        }
+
+        let wire_data = payload.pack_for_wire();
+        self.dispatch(batch_size, expert_indices, expert_weights, &wire_data)
     }
 
     /// CPU routing: local in-process token routing.
@@ -1259,7 +1354,44 @@ impl MoeDispatchExchange {
         let world_size = self.config.group.size();
         let local_rank = self.config.group.local_rank() as usize;
         let rank_cap = world_size * capacity_per_expert;
-        let mut local_output = vec![0u8; local_expert_count * rank_cap * token_stride];
+        let local_buf_size = local_expert_count * rank_cap * token_stride;
+
+        // Use slab ring buffer as pre-allocated memory if available and large enough.
+        // CPU-only path: no GPU command buffers involved, so we bypass the
+        // acquire/produce/consume/release lifecycle and access slab(0) directly.
+        let local_output_ptr = if let Some(ref ring) = self.slab_ring {
+            let slab = ring.slab(0);
+            if slab.size >= local_buf_size && local_buf_size > 0 {
+                let ptr = slab.metal_buffer.contents() as *mut u8;
+                // SAFETY: ptr is valid for slab.size bytes (StorageModeShared Metal buffer),
+                // and we checked slab.size >= local_buf_size above.
+                unsafe {
+                    std::ptr::write_bytes(ptr, 0, local_buf_size);
+                }
+                Some(ptr)
+            } else {
+                None // Slab too small -- fall back to heap
+            }
+        } else {
+            None
+        };
+
+        // Heap fallback
+        let mut local_output_vec = if local_output_ptr.is_none() {
+            vec![0u8; local_buf_size]
+        } else {
+            Vec::new() // placeholder, won't be used
+        };
+
+        // Get a mutable slice to work with (slab or heap)
+        // SAFETY: if local_output_ptr is Some, the pointer is valid for local_buf_size bytes
+        // (guaranteed by the slab.size >= local_buf_size check above).
+        let local_output: &mut [u8] = if let Some(ptr) = local_output_ptr {
+            unsafe { std::slice::from_raw_parts_mut(ptr, local_buf_size) }
+        } else {
+            &mut local_output_vec
+        };
+
         // Per-(expert, src_rank) cursors: cursors[local_expert * world_size + src_rank]
         let mut local_cursors = vec![0usize; local_expert_count * world_size];
 
@@ -1312,6 +1444,57 @@ impl MoeDispatchExchange {
             }
         }
 
+        // --- V3 protocol: repack remote buffers if configured ---
+        if self.config.wire_protocol == WireProtocol::V3 {
+            #[allow(clippy::needless_range_loop)]
+            for pr in 0..world_size {
+                if remote_buffers[pr].is_empty() {
+                    continue;
+                }
+                // Parse V2 format (4-byte expert_id + token_data) into v3 input tuples
+                let v2_stride = 4 + token_stride;
+                let mut tokens_for_v3: Vec<(u16, u16, Vec<u8>)> = Vec::new();
+                let buf = &remote_buffers[pr];
+                let mut off = 0;
+                // Receiver's local expert range for this peer rank
+                let receiver_local_start = pr * experts_per_rank;
+                while off + v2_stride <= buf.len() {
+                    let eid = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap_or([0; 4]));
+                    // Convert global expert ID to receiver-local expert ID
+                    let local_eid = {
+                        let raw = (eid as usize).saturating_sub(receiver_local_start);
+                        u16::try_from(raw).map_err(|_| {
+                            DistributedError::Protocol(format!(
+                                "V3 local_eid {} exceeds u16 range",
+                                raw
+                            ))
+                        })?
+                    };
+                    let position = {
+                        let pos_in_peer = tokens_for_v3.len();
+                        u16::try_from(pos_in_peer).map_err(|_| {
+                            DistributedError::Protocol(format!(
+                                "V3 position {} exceeds u16 range",
+                                pos_in_peer
+                            ))
+                        })?
+                    };
+                    tokens_for_v3.push((
+                        local_eid,
+                        position,
+                        buf[off + 4..off + v2_stride].to_vec(),
+                    ));
+                    off += v2_stride;
+                }
+                let refs: Vec<(u16, u16, &[u8])> = tokens_for_v3
+                    .iter()
+                    .map(|(e, p, d)| (*e, *p, d.as_slice()))
+                    .collect();
+                let packet = v3_protocol::pack_dispatch_v3(&refs, pr as u32);
+                remote_buffers[pr] = packet.wire_data;
+            }
+        }
+
         // --- Phase 1: Exchange payload sizes with each peer via sendrecv ---
         let mut recv_sizes: Vec<usize> = vec![0; world_size];
         for &peer_rank in self.config.group.peers().iter() {
@@ -1332,18 +1515,15 @@ impl MoeDispatchExchange {
         }
 
         // --- Phase 2: Exchange actual payloads via sendrecv ---
-        let wire_stride = 4 + token_stride; // 4-byte expert_id prefix + token data
+        let wire_stride = 4 + token_stride; // 4-byte expert_id prefix + token data (V2)
         for &peer_rank in self.config.group.peers().iter() {
             let pr = peer_rank as usize;
             let recv_size = recv_sizes[pr];
             let send_buf = &remote_buffers[pr];
-            // If nothing to send, use an empty placeholder but still recv
-            // If nothing to recv either, skip entirely
             if send_buf.is_empty() && recv_size == 0 {
                 continue;
             }
-            // Use sendrecv: send our payload, receive peer's payload
-            let recv_len = if recv_size > 0 { recv_size } else { 4 }; // min 4 to avoid zero-len
+            let recv_len = if recv_size > 0 { recv_size } else { 4 };
             let send_data = if send_buf.is_empty() {
                 &[0u8; 4][..]
             } else {
@@ -1362,41 +1542,84 @@ impl MoeDispatchExchange {
                 continue;
             }
 
-            // Merge received tokens into local_output using expert_id prefix
-            // Source rank for received tokens is the peer_rank
+            // --- Unpack received data based on wire protocol ---
             let src_rank = pr;
-            let mut offset = 0;
-            while offset + wire_stride <= received.len() {
-                let expert_id =
-                    u32::from_le_bytes(received[offset..offset + 4].try_into().map_err(|_| {
-                        DistributedError::Protocol(format!(
-                            "invalid expert_id bytes at offset {offset}"
-                        ))
-                    })?) as usize;
-                if expert_id >= local_start && expert_id < local_end {
+            if self.config.wire_protocol == WireProtocol::V3 {
+                // V3 unpack: variable-length packets grouped by expert
+                let unpacked =
+                    v3_protocol::unpack_dispatch_v3(&received, token_stride, local_expert_count)
+                        .map_err(|e| DistributedError::Protocol(format!("v3 unpack: {e}")))?;
+                for (local_expert_id, tokens) in unpacked.tokens_by_expert.iter().enumerate() {
+                    let expert_id = local_start + local_expert_id;
+                    if expert_id >= local_end {
+                        continue;
+                    }
                     let local_expert_idx = expert_id - local_start;
-                    let cursor_idx = local_expert_idx * world_size + src_rank;
-                    let cursor = local_cursors[cursor_idx];
-                    if cursor < capacity_per_expert {
-                        let flat_slot =
-                            local_expert_idx * rank_cap + src_rank * capacity_per_expert + cursor;
-                        let dst_start = flat_slot * token_stride;
-                        let dst_end = dst_start + token_stride;
-                        if dst_end <= local_output.len() {
-                            local_output[dst_start..dst_end]
-                                .copy_from_slice(&received[offset + 4..offset + 4 + token_stride]);
-                            local_cursors[cursor_idx] += 1;
+                    for (_, token_data_v3) in tokens {
+                        let cursor_idx = local_expert_idx * world_size + src_rank;
+                        let cursor = local_cursors[cursor_idx];
+                        if cursor < capacity_per_expert {
+                            let flat_slot = local_expert_idx * rank_cap
+                                + src_rank * capacity_per_expert
+                                + cursor;
+                            let dst_start = flat_slot * token_stride;
+                            let dst_end = dst_start + token_stride;
+                            if dst_end <= local_output.len() && token_data_v3.len() >= token_stride
+                            {
+                                local_output[dst_start..dst_end]
+                                    .copy_from_slice(&token_data_v3[..token_stride]);
+                                local_cursors[cursor_idx] += 1;
+                            }
                         }
                     }
                 }
-                offset += wire_stride;
+            } else {
+                // V2 unpack: fixed-size packets with expert_id prefix
+                let mut offset = 0;
+                while offset + wire_stride <= received.len() {
+                    let expert_id = u32::from_le_bytes(
+                        received[offset..offset + 4].try_into().map_err(|_| {
+                            DistributedError::Protocol(format!(
+                                "invalid expert_id bytes at offset {offset}"
+                            ))
+                        })?,
+                    ) as usize;
+                    if expert_id >= local_start && expert_id < local_end {
+                        let local_expert_idx = expert_id - local_start;
+                        let cursor_idx = local_expert_idx * world_size + src_rank;
+                        let cursor = local_cursors[cursor_idx];
+                        if cursor < capacity_per_expert {
+                            let flat_slot = local_expert_idx * rank_cap
+                                + src_rank * capacity_per_expert
+                                + cursor;
+                            let dst_start = flat_slot * token_stride;
+                            let dst_end = dst_start + token_stride;
+                            if dst_end <= local_output.len() {
+                                local_output[dst_start..dst_end].copy_from_slice(
+                                    &received[offset + 4..offset + 4 + token_stride],
+                                );
+                                local_cursors[cursor_idx] += 1;
+                            }
+                        }
+                    }
+                    offset += wire_stride;
+                }
             }
         }
 
         let _ = expert_counts;
 
+        // Copy result from whichever buffer was used
+        let result_data = if local_output_ptr.is_some() {
+            // Copy from slab to Vec for return (preserves current API).
+            // No ring state to restore -- slab(0) was used as plain memory.
+            local_output[..local_buf_size].to_vec()
+        } else {
+            local_output_vec
+        };
+
         Ok(RouteOutput {
-            data: local_output,
+            data: result_data,
             route_indices,
         })
     }
@@ -1613,6 +1836,57 @@ impl MoeDispatchExchange {
             }
         }
 
+        // --- V3 protocol: repack remote buffers if configured ---
+        if self.config.wire_protocol == WireProtocol::V3 {
+            #[allow(clippy::needless_range_loop)]
+            for pr in 0..world_size {
+                if remote_buffers[pr].is_empty() {
+                    continue;
+                }
+                // Parse V2 format (4-byte expert_id + token_data) into v3 input tuples
+                let v2_stride = 4 + token_stride;
+                let mut tokens_for_v3: Vec<(u16, u16, Vec<u8>)> = Vec::new();
+                let buf = &remote_buffers[pr];
+                let mut off = 0;
+                // Receiver's local expert range for this peer rank
+                let receiver_local_start = pr * experts_per_rank;
+                while off + v2_stride <= buf.len() {
+                    let eid = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap_or([0; 4]));
+                    // Convert global expert ID to receiver-local expert ID
+                    let local_eid = {
+                        let raw = (eid as usize).saturating_sub(receiver_local_start);
+                        u16::try_from(raw).map_err(|_| {
+                            DistributedError::Protocol(format!(
+                                "V3 local_eid {} exceeds u16 range",
+                                raw
+                            ))
+                        })?
+                    };
+                    let position = {
+                        let pos_in_peer = tokens_for_v3.len();
+                        u16::try_from(pos_in_peer).map_err(|_| {
+                            DistributedError::Protocol(format!(
+                                "V3 position {} exceeds u16 range",
+                                pos_in_peer
+                            ))
+                        })?
+                    };
+                    tokens_for_v3.push((
+                        local_eid,
+                        position,
+                        buf[off + 4..off + v2_stride].to_vec(),
+                    ));
+                    off += v2_stride;
+                }
+                let refs: Vec<(u16, u16, &[u8])> = tokens_for_v3
+                    .iter()
+                    .map(|(e, p, d)| (*e, *p, d.as_slice()))
+                    .collect();
+                let packet = v3_protocol::pack_dispatch_v3(&refs, pr as u32);
+                remote_buffers[pr] = packet.wire_data;
+            }
+        }
+
         // --- Exchange with peers via existing group sendrecv ---
         // (SharedBuffer zero-copy send/recv requires RdmaConnectionTransport
         //  access which is behind the Group abstraction. For the remote exchange
@@ -1661,40 +1935,83 @@ impl MoeDispatchExchange {
                 continue;
             }
 
+            // --- Unpack received data based on wire protocol ---
             // Merge received tokens directly into SharedBuffer
             // Source rank for received tokens is the peer rank
             let src_rank = pr;
-            let mut offset = 0;
-            while offset + wire_stride <= received.len() {
-                let expert_id =
-                    u32::from_le_bytes(received[offset..offset + 4].try_into().map_err(|_| {
-                        DistributedError::Protocol(format!(
-                            "invalid expert_id bytes at offset {offset}"
-                        ))
-                    })?) as usize;
-                if expert_id >= local_start && expert_id < local_end {
+            if self.config.wire_protocol == WireProtocol::V3 {
+                // V3 unpack: variable-length packets grouped by expert
+                let unpacked =
+                    v3_protocol::unpack_dispatch_v3(&received, token_stride, local_expert_count)
+                        .map_err(|e| DistributedError::Protocol(format!("v3 unpack: {e}")))?;
+                for (local_expert_id, tokens) in unpacked.tokens_by_expert.iter().enumerate() {
+                    let expert_id = local_start + local_expert_id;
+                    if expert_id >= local_end {
+                        continue;
+                    }
                     let local_expert_idx = expert_id - local_start;
-                    let cursor_idx = local_expert_idx * world_size + src_rank;
-                    let cursor = local_cursors[cursor_idx];
-                    if cursor < capacity_per_expert {
-                        let flat_slot =
-                            local_expert_idx * rank_cap + src_rank * capacity_per_expert + cursor;
-                        let dst_offset = flat_slot * token_stride;
-                        let dst_end = dst_offset + token_stride;
-                        if dst_end <= local_buf_size && dst_end <= shared_buf.size() {
-                            global_counters().record_cpu_copy(token_stride as u64);
-                            unsafe {
-                                std::ptr::copy_nonoverlapping(
-                                    received[offset + 4..offset + 4 + token_stride].as_ptr(),
-                                    output_ptr.add(dst_offset),
-                                    token_stride,
-                                );
+                    for (_, token_data_v3) in tokens {
+                        let cursor_idx = local_expert_idx * world_size + src_rank;
+                        let cursor = local_cursors[cursor_idx];
+                        if cursor < capacity_per_expert {
+                            let flat_slot = local_expert_idx * rank_cap
+                                + src_rank * capacity_per_expert
+                                + cursor;
+                            let dst_offset = flat_slot * token_stride;
+                            let dst_end = dst_offset + token_stride;
+                            if dst_end <= local_buf_size
+                                && dst_end <= shared_buf.size()
+                                && token_data_v3.len() >= token_stride
+                            {
+                                global_counters().record_cpu_copy(token_stride as u64);
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(
+                                        token_data_v3[..token_stride].as_ptr(),
+                                        output_ptr.add(dst_offset),
+                                        token_stride,
+                                    );
+                                }
+                                local_cursors[cursor_idx] += 1;
                             }
-                            local_cursors[cursor_idx] += 1;
                         }
                     }
                 }
-                offset += wire_stride;
+            } else {
+                // V2 unpack: fixed-size packets with expert_id prefix
+                let mut offset = 0;
+                while offset + wire_stride <= received.len() {
+                    let expert_id = u32::from_le_bytes(
+                        received[offset..offset + 4].try_into().map_err(|_| {
+                            DistributedError::Protocol(format!(
+                                "invalid expert_id bytes at offset {offset}"
+                            ))
+                        })?,
+                    ) as usize;
+                    if expert_id >= local_start && expert_id < local_end {
+                        let local_expert_idx = expert_id - local_start;
+                        let cursor_idx = local_expert_idx * world_size + src_rank;
+                        let cursor = local_cursors[cursor_idx];
+                        if cursor < capacity_per_expert {
+                            let flat_slot = local_expert_idx * rank_cap
+                                + src_rank * capacity_per_expert
+                                + cursor;
+                            let dst_offset = flat_slot * token_stride;
+                            let dst_end = dst_offset + token_stride;
+                            if dst_end <= local_buf_size && dst_end <= shared_buf.size() {
+                                global_counters().record_cpu_copy(token_stride as u64);
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(
+                                        received[offset + 4..offset + 4 + token_stride].as_ptr(),
+                                        output_ptr.add(dst_offset),
+                                        token_stride,
+                                    );
+                                }
+                                local_cursors[cursor_idx] += 1;
+                            }
+                        }
+                    }
+                    offset += wire_stride;
+                }
             }
         }
 
@@ -1925,6 +2242,82 @@ impl MoeDispatchExchange {
             }
         }
 
+        // --- V3 protocol: repack peer SharedBuffers if configured ---
+        if self.config.wire_protocol == WireProtocol::V3 {
+            #[allow(clippy::needless_range_loop)]
+            for pr in 0..world_size {
+                let payload_len = peer_cursors[pr];
+                if payload_len == 0 {
+                    continue;
+                }
+                let send_buf = match peer_send_bufs.get(pr).and_then(|b| *b) {
+                    Some(b) => b,
+                    None => continue,
+                };
+                // Read V2 data from SharedBuffer into a temporary Vec
+                let v2_data = unsafe {
+                    std::slice::from_raw_parts(send_buf.as_ptr() as *const u8, payload_len).to_vec()
+                };
+                // Parse V2 format (4-byte expert_id + token_data) into v3 input tuples
+                let v2_stride = 4 + token_stride;
+                let mut tokens_for_v3: Vec<(u16, u16, Vec<u8>)> = Vec::new();
+                let mut off = 0;
+                let receiver_local_start = pr * experts_per_rank;
+                while off + v2_stride <= v2_data.len() {
+                    let eid =
+                        u32::from_le_bytes(v2_data[off..off + 4].try_into().unwrap_or([0; 4]));
+                    let local_eid = {
+                        let raw = (eid as usize).saturating_sub(receiver_local_start);
+                        u16::try_from(raw).map_err(|_| {
+                            DistributedError::Protocol(format!(
+                                "V3 local_eid {} exceeds u16 range",
+                                raw
+                            ))
+                        })?
+                    };
+                    let position = {
+                        let pos_in_peer = tokens_for_v3.len();
+                        u16::try_from(pos_in_peer).map_err(|_| {
+                            DistributedError::Protocol(format!(
+                                "V3 position {} exceeds u16 range",
+                                pos_in_peer
+                            ))
+                        })?
+                    };
+                    tokens_for_v3.push((
+                        local_eid,
+                        position,
+                        v2_data[off + 4..off + v2_stride].to_vec(),
+                    ));
+                    off += v2_stride;
+                }
+                let refs: Vec<(u16, u16, &[u8])> = tokens_for_v3
+                    .iter()
+                    .map(|(e, p, d)| (*e, *p, d.as_slice()))
+                    .collect();
+                let packet = v3_protocol::pack_dispatch_v3(&refs, pr as u32);
+                // Write V3 packet back into SharedBuffer
+                let v3_len = packet.wire_data.len();
+                if v3_len <= send_buf.size() {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            packet.wire_data.as_ptr(),
+                            send_buf.as_ptr(),
+                            v3_len,
+                        );
+                    }
+                    peer_cursors[pr] = v3_len;
+                } else {
+                    return Err(DistributedError::Transport(format!(
+                        "V3 packet ({} bytes) exceeds SharedBuffer capacity ({} bytes) for peer {}",
+                        v3_len,
+                        send_buf.size(),
+                        pr
+                    )));
+                }
+            }
+        }
+
         // Record peer payload sizes
         peer_payload_sizes[..world_size].copy_from_slice(&peer_cursors[..world_size]);
 
@@ -1956,9 +2349,15 @@ impl MoeDispatchExchange {
             // Post recv if peer might send us data (we always post to be safe in UC mode)
             if let Some(recv_buf) = peer_recv_bufs.get(pr).and_then(|b| *b) {
                 // Recv capacity: worst case the peer sends us all its tokens
-                let max_recv = recv_buf
-                    .size()
-                    .min(experts_per_rank * capacity_per_expert * wire_stride);
+                let v2_max = experts_per_rank * capacity_per_expert * wire_stride;
+                let max_recv =
+                    recv_buf
+                        .size()
+                        .min(if self.config.wire_protocol == WireProtocol::V3 {
+                            4 + v2_max // V3 adds a 4-byte count header
+                        } else {
+                            v2_max
+                        });
                 if max_recv > 0 {
                     let op = transport.recv_zero_copy_async(
                         recv_buf,

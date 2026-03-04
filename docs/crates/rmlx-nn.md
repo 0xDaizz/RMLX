@@ -4,7 +4,7 @@
 
 `rmlx-nn` is a crate that implements neural network layers for GPU-accelerated inference. It builds core Transformer architecture components (Linear, Embedding, Attention, TransformerBlock, MoE) on top of `rmlx-core` compute kernels, and includes built-in model configurations for LLaMA, Qwen, DeepSeek-V3, and Mixtral.
 
-> **Status (Phase 0-9B-opt + S1-S5 + Audit):** Linear, QuantizedLinear, Embedding, Attention (with LayerKvCache, RotatingKvCache, BatchKvCache, QuantizedKvCache), MLA (Multi-Latent Attention), Sliding Window Attention, TransformerBlock, MoE (with shared expert + EP integration + GPU routing), `ExpertGroup` (stacked expert GEMM path), `MoePipeline` (TBO/SBO overlap), LayerNorm, 14 activation functions, Parallel (TP), Conv1d/Conv2d, DynamicExecContext, GGUF model loader, and 4 model configurations are implemented. Phase 0+1+2 audit remediation complete (items N1-N8).
+> **Status (Phase 0-9B-opt + S1-S5 + Audit + EP-2~EP-6):** Linear, QuantizedLinear, Embedding, Attention (with LayerKvCache, RotatingKvCache, BatchKvCache, QuantizedKvCache), MLA (Multi-Latent Attention), Sliding Window Attention, TransformerBlock, MoE (with shared expert + EP integration + GPU routing + `MoeStrategy` dispatch), `ExpertGroup` (stacked expert GEMM path), `MoePipeline` (TBO/SBO overlap), LayerNorm, 14 activation functions, Parallel (TP), Conv1d/Conv2d, DynamicExecContext, GGUF model loader, and 4 model configurations are implemented. Phase 0+1+2 audit remediation complete (items N1-N8). EP Phases 2-6 forward path integration complete: `MoeStrategy` enum (PerExpert/Grouped), builder API (`with_strategy`, `with_pipeline`, `with_sparse_plan`), grouped GEMM path, pipeline integration, ICB sparse dispatch placeholder, FP8/SlabRing wiring.
 
 ---
 
@@ -424,7 +424,22 @@ Pre-caches all weight transposes across all layers.
 
 ## moe.rs — Mixture of Experts
 
-An MoE layer using top-k gating.
+An MoE layer using top-k gating with strategy-based dispatch (EP-2~EP-6 forward path integration).
+
+### MoeStrategy
+
+```rust
+pub enum MoeStrategy {
+    PerExpert,  // default: per-expert sequential forward
+    Grouped,    // batched gather -> ExpertGroup GEMM -> batched scatter
+}
+```
+
+`MoeStrategy` controls how `forward()` dispatches expert computation:
+- **PerExpert** (default): calls `forward_per_expert()`, iterating over each active expert individually. Straightforward but O(E) kernel launches.
+- **Grouped**: calls `forward_grouped()`, which performs a batched gather to collect tokens by expert, runs a single `ExpertGroup` GEMM pass (Gate -> Up -> fused SwiGLU -> Down), then batched scatter back to original token order. Significantly reduces kernel launch overhead for large expert counts.
+
+### MoeConfig & MoeLayer
 
 ```rust
 pub struct MoeConfig {
@@ -436,20 +451,45 @@ pub struct MoeConfig {
 
 pub struct MoeLayer {
     config: MoeConfig,
+    strategy: MoeStrategy,
+    pipeline: Option<MoePipeline>,
+    sparse_plan: Option<SparsePlan>,
 }
 ```
 
 | Method | Description |
 |--------|-------------|
-| `MoeLayer::new(config)` | Creates from config |
-| `forward(x, metrics)` | Forward pass; records per-expert routing into `metrics` |
+| `MoeLayer::new(config)` | Creates from config (defaults to `PerExpert` strategy, no pipeline) |
+| `with_strategy(strategy)` | Builder: sets the dispatch strategy (`PerExpert` or `Grouped`) |
+| `with_pipeline(pipeline)` | Builder: attaches a `MoePipeline` for SBO/TBO compute-communication overlap |
+| `with_sparse_plan(plan)` | Builder: attaches a `SparsePlan` for ICB sparse dispatch (see below) |
+| `forward(x, metrics)` | Forward pass; dispatches via `strategy` (PerExpert -> `forward_per_expert`, Grouped -> `forward_grouped`); records per-expert routing into `metrics` |
+| `forward_per_expert(x, metrics)` | Per-expert sequential forward (original path) |
+| `forward_grouped(x, metrics)` | Grouped path: batched gather -> ExpertGroup GEMM -> batched scatter |
 | `num_experts()` | Number of experts |
 | `top_k()` | Number of active experts per token |
 | `hidden_dim()` | Hidden dimension |
+| `strategy()` | Current dispatch strategy |
+
+### Grouped Forward Path
+
+The `forward_grouped()` path executes three phases:
+
+1. **Batched Gather**: Collects tokens destined for each expert into contiguous expert-grouped buffers.
+2. **ExpertGroup GEMM**: Runs Gate -> Up -> fused SwiGLU -> Down as batched GEMMs on stacked expert weights `[E, D, intermediate_dim]`, replacing O(E) individual kernel launches with a single GPU pass.
+3. **Batched Scatter**: Distributes computed expert outputs back to their original token positions, applying gating weights.
+
+### Pipeline Integration (MoePipeline)
+
+When a `MoePipeline` is attached via `with_pipeline()`, the forward path uses SBO (Stage-Before-Output) or TBO (Token-Before-Output) overlap strategies to overlap compute and RDMA communication. The pipeline uses `GpuEvent` signal/wait chains with a single terminal CPU wait, achieving near-zero in-flight CPU blocking.
+
+### ICB Sparse Dispatch
+
+The `with_sparse_plan()` builder attaches a `SparsePlan` that enables ICB (Index-Compressed Batch) sparse dispatch. When routing sparsity exceeds 50% (i.e., more than half the expert slots are empty), the sparse path is auto-selected to skip empty expert computation entirely. This is a placeholder for future EP-7 optimization; the plan interface is wired but the kernel-level sparse dispatch is not yet implemented.
 
 ### MoeForwardMetrics
 
-Metrics collected during MoE forward passes, including per-expert token routing counts.
+Metrics collected during MoE forward passes, including per-expert token routing counts. Per-expert token tracking now works on all forward paths (PerExpert, Grouped, and pipelined).
 
 | Field / Method | Description |
 |----------------|-------------|
@@ -459,8 +499,11 @@ Metrics collected during MoE forward passes, including per-expert token routing 
 | `record_expert_token(expert_idx)` | Atomically increments the counter for `expert_idx` |
 | `expert_tokens_snapshot() -> Vec<u64>` | Returns a point-in-time snapshot of all expert token counts |
 
-`expert_group.rs` adds `ExpertGroup` weight stacking (`[E, D, intermediate_dim]`) and grouped expert GEMM (Gate -> Up -> fused SwiGLU -> Down) to replace O(E) per-expert launches.
-`moe_pipeline.rs` adds `MoePipeline` orchestration for TBO/SBO overlap using `GpuEvent` signal/wait chains with a single terminal CPU wait.
+### EP Optimization Modules
+
+**`expert_group.rs` (EP-2):** `ExpertGroup` pre-stacks expert weights into `[E, D, intermediate_dim]` tensors and executes grouped expert GEMM (Gate -> Up -> fused SwiGLU -> Down) via `GatherMM` (f16/bf16, `_into_cb` support), replacing O(E) per-expert launches with a single GPU pass.
+
+**`moe_pipeline.rs` (EP-4):** `MoePipeline` orchestrates TBO/SBO overlap using `GpuEvent` signal/wait chains with a single terminal CPU wait, achieving full compute-RDMA overlap with zero in-flight CPU waits.
 
 ---
 
