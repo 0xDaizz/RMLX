@@ -9,7 +9,7 @@ The rmlx GPU pipeline eliminates per-operation CPU overhead by batching multiple
 | Metric | Baseline | ExecGraph | Improvement |
 |--------|----------|-----------|-------------|
 | Command buffers / layer | 65 | 5 | 92.3% reduction |
-| Latency / layer | 110.4ms | 6.8ms | 16.15x speedup |
+| Latency / layer | ~112ms | ~6.4ms | 17.4x speedup |
 | CPU-GPU sync overhead | baseline | minimal | 98.5% reduction |
 | Numerical parity | -- | max_diff=6.4e-6 | exact match |
 
@@ -32,7 +32,7 @@ A single transformer layer in a LLaMA-style model executes approximately 65 indi
 ```
 Baseline: 65 CBs/layer x N layers
   [CB1: matmul_qkv] -> sync -> [CB2: rope_q] -> sync -> [CB3: rope_k] -> sync -> ...
-  Total: 110.4ms per layer
+  Total: ~112ms per layer
 ```
 
 ---
@@ -127,16 +127,16 @@ The 65 baseline command buffers per transformer layer are consolidated into 5:
 
 | CB | Operations | Description |
 |----|-----------|-------------|
-| CB1 | Q/K/V projection + RoPE | QKV linear projections and rotary position encoding |
-| CB2 | SDPA | Fused scaled dot-product attention |
-| CB3 | Output projection + residual | Attention output projection and residual connection |
-| CB4 | FFN (gate + up + SiLU + down) | Feed-forward network with gated activation |
-| CB5 | Final residual + norm | Final residual connection and RMS normalization |
+| CB1 | RMS norm + Q/K/V projections (fused) | Pre-attention normalization and QKV linear projections |
+| CB2 | Head split + RoPE + cache append | Multi-head reshaping, rotary position encoding, and KV cache update |
+| CB3 | SDPA + head concat + O_proj | Fused scaled dot-product attention, head concatenation, and output projection |
+| CB4 | Residual + pre-FFN norm | Attention residual connection and feed-forward normalization |
+| CB5 | Gate + up + silu_mul + down + residual | Entire FFN fused: gated activation, projections, and final residual |
 
 ```
 ExecGraph: 5 CBs/layer
-  [CB1: QKV+RoPE] -> [CB2: SDPA] -> [CB3: OProj+Res] -> [CB4: FFN] -> [CB5: Res+Norm]
-  Total: 6.8ms per layer
+  [CB1: Norm+QKV] -> [CB2: Split+RoPE+Cache] -> [CB3: SDPA+Concat+OProj] -> [CB4: Res+Norm] -> [CB5: FFN+Res]
+  Total: ~6.4ms per layer
 ```
 
 This represents a **92.3% reduction** in command buffer count (65 → 5) and a **98.5% reduction** in CPU-GPU synchronization points.
@@ -145,26 +145,26 @@ This represents a **92.3% reduction** in command buffer count (65 → 5) and a *
 
 ## Benchmark Results
 
-Benchmarks measured on a single transformer layer (LLaMA-style architecture):
+Benchmarks measured on a single transformer layer (LLaMA-style architecture, 4096 hidden, M3 Ultra):
 
 ### Baseline (per-op command buffers)
 
 - **Command buffers per layer:** 65
-- **Latency per layer:** 110.4ms
+- **Latency per layer:** ~112ms
 - **CPU-GPU syncs per layer:** 65
 
 ### ExecGraph (batched command buffers)
 
 - **Command buffers per layer:** 5
-- **Latency per layer:** 6.8ms
+- **Latency per layer:** ~6.4ms
 - **CPU-GPU syncs per layer:** 5
 
 ### Summary
 
 | Metric | Value |
 |--------|-------|
-| Speedup | **16.15x** |
-| Latency reduction | **93.8%** (110.4ms → 6.8ms) |
+| Speedup | **17.4x** |
+| Latency reduction | **94.3%** (~112ms → ~6.4ms) |
 | CB reduction | **92.3%** (65 → 5) |
 | CPU-GPU sync reduction | **98.5%** |
 | Tests passing | **543** |
@@ -190,7 +190,7 @@ model.prepare_weights_for_graph();
 // TransformerModel -> TransformerBlock -> Attention + FeedForward -> Linear
 ```
 
-This eliminates a significant portion of the per-layer overhead that remained after command buffer batching, contributing to the final 16.15x speedup.
+This eliminates a significant portion of the per-layer overhead that remained after command buffer batching, contributing to the final 17.4x speedup.
 
 ---
 

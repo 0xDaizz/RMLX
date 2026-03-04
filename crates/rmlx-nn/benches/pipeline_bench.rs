@@ -228,7 +228,9 @@ fn main() {
     for _ in 0..WARMUP_ITERS {
         let event = GpuEvent::new(device);
         let mut graph = ExecGraph::new(&queue, &event, 32);
-        let _ = block.forward_graph(&input, None, None, None, None, &registry, &mut graph, &queue);
+        let _ = block.forward_graph(
+            &input, None, None, None, None, &registry, &mut graph, &queue,
+        );
         let _ = graph.sync_and_reset();
     }
 
@@ -245,7 +247,9 @@ fn main() {
 
         let start = Instant::now();
         let _ = block
-            .forward_graph(&input, None, None, None, None, &registry, &mut graph, &queue)
+            .forward_graph(
+                &input, None, None, None, None, &registry, &mut graph, &queue,
+            )
             .expect("forward_graph failed");
         let _ = graph.sync_and_reset().expect("sync failed");
         graph_latencies.push(start.elapsed());
@@ -259,7 +263,14 @@ fn main() {
             let event2 = GpuEvent::new(device);
             let mut graph2 = ExecGraph::new(&queue, &event2, 32);
             let _ = block.forward_graph(
-                &input, None, None, None, None, &registry, &mut graph2, &queue,
+                &input,
+                None,
+                None,
+                None,
+                None,
+                &registry,
+                &mut graph2,
+                &queue,
             );
             let stats2 = ExecGraphStats::from_graph(&graph2);
             graph_total_batches = stats2.total_batches;

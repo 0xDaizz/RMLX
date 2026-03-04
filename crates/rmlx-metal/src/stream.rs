@@ -104,10 +104,9 @@ impl StreamManager {
     /// Returns an error if `stream_id` does not exist (use `get_or_create_stream`
     /// first or stick to the predefined IDs).
     pub fn command_buffer(&self, stream_id: u32) -> Result<CommandBuffer, MetalError> {
-        let state = self
-            .streams
-            .get(&stream_id)
-            .ok_or_else(|| MetalError::KernelNotFound(format!("stream {stream_id} does not exist")))?;
+        let state = self.streams.get(&stream_id).ok_or_else(|| {
+            MetalError::KernelNotFound(format!("stream {stream_id} does not exist"))
+        })?;
         Ok(state.queue.new_command_buffer().to_owned())
     }
 
@@ -116,11 +115,13 @@ impl StreamManager {
     /// The manager provides batching (M1) and completion-handler error checking (M4).
     ///
     /// Returns an error if `stream_id` does not exist.
-    pub fn create_buffer_manager(&self, stream_id: u32) -> Result<CommandBufferManager<'_>, MetalError> {
-        let state = self
-            .streams
-            .get(&stream_id)
-            .ok_or_else(|| MetalError::KernelNotFound(format!("stream {stream_id} does not exist")))?;
+    pub fn create_buffer_manager(
+        &self,
+        stream_id: u32,
+    ) -> Result<CommandBufferManager<'_>, MetalError> {
+        let state = self.streams.get(&stream_id).ok_or_else(|| {
+            MetalError::KernelNotFound(format!("stream {stream_id} does not exist"))
+        })?;
         Ok(CommandBufferManager::new(&state.queue))
     }
 

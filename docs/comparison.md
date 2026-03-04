@@ -61,9 +61,9 @@ MLX submits individual command buffers per operation. RMLX's ExecGraph pre-encod
 | CB reduction | -- | 92.3% |
 | CPU-GPU sync points per layer | ~65 | ~1 |
 | CPU-GPU sync reduction | -- | 98.5% |
-| Latency per layer | 110.4ms | 6.8ms |
-| **Speedup** | -- | **16.15x** |
-| Latency reduction | -- | 93.8% |
+| Latency per layer | ~112ms | ~6.4ms |
+| **Speedup** | -- | **17.4x** |
+| Latency reduction | -- | 94.3% |
 
 Numerical parity is maintained: max_diff = 6.4e-6 between baseline and ExecGraph outputs.
 
@@ -240,12 +240,12 @@ CUDA has decades of optimization across compilers (NVCC, Triton), libraries (cuB
 | **CB reduction** | 65 -> 5 per layer (92.3%) | Full coalescing into single graph |
 | **Sync model** | MTLSharedEvent (non-blocking) | CUDA events (stream-ordered) |
 | **Shape dynamism** | Re-encode handles shape changes naturally | Must re-capture or use CUDA Graph updates |
-| **Latency** | 6.8ms per layer | Sub-millisecond replay |
-| **Speedup over baseline** | 16.15x | Typically 2-5x (already from efficient baseline) |
+| **Latency** | ~6.4ms per layer | Sub-millisecond replay |
+| **Speedup over baseline** | 17.4x | Typically 2-5x (already from efficient baseline) |
 | **Implementation complexity** | Moderate (deterministic sequencing) | Low (capture API is straightforward) |
 | **Memory overhead** | Minimal (re-encode reuses buffers) | Graph storage (captured operations) |
 
-**Key insight**: ExecGraph's 16.15x speedup is relative to a per-op baseline that is more overhead-heavy than CUDA's default execution model. CUDA's baseline is already more efficient due to stream-ordered execution, so CUDA Graphs provides a smaller relative improvement from a stronger starting point.
+**Key insight**: ExecGraph's 17.4x speedup is relative to a per-op baseline that is more overhead-heavy than CUDA's default execution model. CUDA's baseline is already more efficient due to stream-ordered execution, so CUDA Graphs provides a smaller relative improvement from a stronger starting point.
 
 ---
 
@@ -317,7 +317,7 @@ RMLX maintains strict numerical parity between its baseline execution path and t
 | Test coverage | 543 tests |
 | Verification method | Element-wise comparison across all ops |
 
-This ensures that the 16.15x performance improvement from ExecGraph introduces no meaningful numerical drift.
+This ensures that the 17.4x performance improvement from ExecGraph introduces no meaningful numerical drift.
 
 ---
 

@@ -1448,7 +1448,15 @@ impl Attention {
             let q_head = ops::copy::copy_into_cb(registry, &q_head, cb2)?;
             let q_head = if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
                 ops::rope::rope_ext_into_cb(
-                    registry, &q_head, cos, sin, rope_offset, 1.0, false, true, cb2,
+                    registry,
+                    &q_head,
+                    cos,
+                    sin,
+                    rope_offset,
+                    1.0,
+                    false,
+                    true,
+                    cb2,
                 )?
             } else {
                 q_head
@@ -1468,7 +1476,15 @@ impl Attention {
             let k_head = ops::copy::copy_into_cb(registry, &k_head, cb2)?;
             let k_head = if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
                 ops::rope::rope_ext_into_cb(
-                    registry, &k_head, cos, sin, rope_offset, 1.0, false, true, cb2,
+                    registry,
+                    &k_head,
+                    cos,
+                    sin,
+                    rope_offset,
+                    1.0,
+                    false,
+                    true,
+                    cb2,
                 )?
             } else {
                 k_head
@@ -1507,13 +1523,7 @@ impl Attention {
         let cb3 = graph.command_buffer();
         let scale = 1.0 / (head_dim as f32).sqrt();
         let attn_outputs = ops::sdpa::sdpa_batched_into_cb(
-            registry,
-            &q_heads,
-            &k_final,
-            &v_final,
-            mask,
-            scale,
-            cb3,
+            registry, &q_heads, &k_final, &v_final, mask, scale, cb3,
         )?;
         let t3 = graph.submit_batch();
 
@@ -1608,9 +1618,8 @@ impl Attention {
 
         // ---- CB1: norm + Q/K/V projections (fused) ----
         let cb1 = graph.command_buffer();
-        let normed = ops::rms_norm::rms_norm_into_cb(
-            registry, x, Some(norm_weight), rms_norm_eps, cb1,
-        )?;
+        let normed =
+            ops::rms_norm::rms_norm_into_cb(registry, x, Some(norm_weight), rms_norm_eps, cb1)?;
         let q = self.q_proj.forward_into_cb(&normed, registry, cb1)?;
         let k = self.k_proj.forward_into_cb(&normed, registry, cb1)?;
         let v = self.v_proj.forward_into_cb(&normed, registry, cb1)?;
@@ -1635,7 +1644,15 @@ impl Attention {
             let q_head = ops::copy::copy_into_cb(registry, &q_head, cb2)?;
             let q_head = if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
                 ops::rope::rope_ext_into_cb(
-                    registry, &q_head, cos, sin, rope_offset, 1.0, false, true, cb2,
+                    registry,
+                    &q_head,
+                    cos,
+                    sin,
+                    rope_offset,
+                    1.0,
+                    false,
+                    true,
+                    cb2,
                 )?
             } else {
                 q_head
@@ -1654,7 +1671,15 @@ impl Attention {
             let k_head = ops::copy::copy_into_cb(registry, &k_head, cb2)?;
             let k_head = if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
                 ops::rope::rope_ext_into_cb(
-                    registry, &k_head, cos, sin, rope_offset, 1.0, false, true, cb2,
+                    registry,
+                    &k_head,
+                    cos,
+                    sin,
+                    rope_offset,
+                    1.0,
+                    false,
+                    true,
+                    cb2,
                 )?
             } else {
                 k_head
@@ -1723,7 +1748,8 @@ impl Attention {
                 let grid = metal::MTLSize::new(count, 1, 1);
                 let tg = metal::MTLSize::new(
                     std::cmp::min(pipeline.max_total_threads_per_threadgroup(), count),
-                    1, 1,
+                    1,
+                    1,
                 );
                 enc.dispatch_threads(grid, tg);
                 enc.end_encoding();
@@ -1734,8 +1760,10 @@ impl Attention {
                     let src_off = (head_out.offset() + row * head_bytes) as u64;
                     let dst_off = (row * hidden_bytes_stride + dst_col_offset) as u64;
                     blit.copy_from_buffer(
-                        head_out.metal_buffer(), src_off,
-                        concat.metal_buffer(), dst_off,
+                        head_out.metal_buffer(),
+                        src_off,
+                        concat.metal_buffer(),
+                        dst_off,
                         head_bytes as u64,
                     );
                 }

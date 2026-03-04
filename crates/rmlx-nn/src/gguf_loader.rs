@@ -144,9 +144,7 @@ impl GgufWeightMap {
                 .tensor_info
                 .get(name)
                 .map(|info| info.shape.clone())
-                .unwrap_or_else(|| {
-                    array.shape().iter().map(|&d| d as u64).collect()
-                });
+                .unwrap_or_else(|| array.shape().iter().map(|&d| d as u64).collect());
             return Err(GgufLoadError::ShapeMismatch {
                 tensor_name: name.to_string(),
                 expected: expected_shape.to_vec(),

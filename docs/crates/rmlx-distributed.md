@@ -2,9 +2,9 @@
 
 ## Overview
 
-`rmlx-distributed` is a crate providing communication groups, MoE (Mixture of Experts) dispatch/combine exchange, 3-zone backend policy, compute-RDMA pipeline overlap, overflow monitoring (SparseGuard), warmup protocol, and MoE metrics for distributed inference.
+`rmlx-distributed` is a crate providing communication groups, MoE (Mixture of Experts) dispatch/combine exchange, 3-zone backend policy, compute-RDMA pipeline overlap, overflow monitoring (SparseGuard), distributed initialization, warmup protocol, and MoE metrics for distributed inference.
 
-> **Status:** All modules are implemented: group, moe_exchange, moe_policy, pipeline, sparse_guard, warmup, metrics. Phase 0+1+2 audit remediation complete (items D1-D10): dispatch loop ordering fixed (k-outer), per-rank capacity partitioning, combine kernel caching, byte threshold (4KB->2MB), hysteresis path fix, dual cooldown semantics, shared expert support, EP integration improvements.
+> **Status:** All modules are implemented: group, init, moe_exchange, moe_policy, pipeline, sparse_guard, warmup, metrics. Phase 0+1+2 audit remediation complete (items D1-D10): dispatch loop ordering fixed (k-outer), per-rank capacity partitioning, combine kernel caching, byte threshold (4KB->2MB), hysteresis path fix, dual cooldown semantics, shared expert support, EP integration improvements.
 
 ---
 
@@ -18,7 +18,8 @@ rmlx-distributed/src/
 ├── moe_policy.rs    # 3-zone backend policy
 ├── pipeline.rs      # Compute-RDMA pipeline overlap
 ├── sparse_guard.rs  # Expert overflow monitoring
-├── warmup.rs        # RDMA + JIT pre-warmup
+├── init.rs          # Distributed initialization (MLX-style)
+├── warmup.rs        # RDMA + JIT warmup protocol
 └── metrics.rs       # Atomic MoE metrics
 ```
 
@@ -288,9 +289,69 @@ pub struct SparseGuard {
 
 ---
 
-## warmup.rs — RDMA + JIT Pre-Warmup
+## init.rs — Distributed Initialization (MLX-style)
 
-Performs RDMA connection warmup and Metal JIT kernel compilation before inference begins.
+Provides `init()` for automatic RDMA bootstrapping from environment variables, with graceful fallback to loopback (single-process) mode.
+
+### InitConfig
+
+```rust
+pub struct InitConfig {
+    pub strict: bool,                    // fail on error instead of fallback
+    pub backend: BackendHint,            // Auto / Rdma / Loopback
+    pub rank: Option<u32>,               // override rank (else from env)
+    pub world_size: Option<u32>,         // override world_size (else from env)
+    pub coordinator_addr: Option<String>,// coordinator address (else RMLX_COORDINATOR)
+    pub coordinator_port: Option<u16>,   // coordinator port (default 18520)
+    pub device_file: Option<String>,     // device file path (else RMLX_IBV_DEVICES)
+    pub topology: Option<String>,        // topology hint
+}
+```
+
+### BackendHint
+
+```rust
+pub enum BackendHint {
+    Auto,       // try RDMA first, fall back to loopback
+    Rdma,       // force RDMA (fail if unavailable)
+    Loopback,   // force loopback (single-process) mode
+}
+```
+
+### DistributedContext
+
+```rust
+pub struct DistributedContext {
+    pub group: Group,
+    pub rank: u32,
+    pub world_size: u32,
+    pub backend: BackendHint,
+    pub warmup: Option<WarmupResult>,
+}
+```
+
+| Function | Description |
+|----------|-------------|
+| `init(config)` | Initialize the distributed context; resolves config from `InitConfig` fields, falling back to environment variables |
+
+### Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `RMLX_RANK` / `RMLX_WORLD_SIZE` | Rank and world size |
+| `RMLX_BACKEND` | `"auto"`, `"rdma"`, or `"loopback"` |
+| `RMLX_COORDINATOR` | Coordinator address (rank 0's IP) |
+| `RMLX_COORDINATOR_PORT` | Coordinator port (default 18520) |
+| `RMLX_IBV_DEVICES` | Path to JSON device file |
+| `RMLX_TOPOLOGY` | `"ring"`, `"mesh"`, or `"hybrid"` |
+
+Also checks MPI/SLURM compat env vars (`OMPI_COMM_WORLD_RANK`, `PMI_RANK`, `SLURM_PROCID`, etc.) as fallback for rank/world_size.
+
+---
+
+## warmup.rs — RDMA + JIT Warmup Protocol
+
+Performs RDMA connection warmup and Metal JIT kernel compilation before inference begins. Called internally by `init()` after RDMA connection establishment.
 
 ### WarmupConfig
 
@@ -298,6 +359,7 @@ Performs RDMA connection warmup and Metal JIT kernel compilation before inferenc
 pub struct WarmupConfig {
     pub rdma_rounds: usize,      // default: 10
     pub jit_precompile: bool,    // default: true
+    pub run_calibration: bool,   // default: true
 }
 ```
 
@@ -308,6 +370,7 @@ pub struct WarmupState {
     rdma_warmed: bool,
     jit_warmed: bool,
     last_result: Option<WarmupResult>,
+    calibration: ThresholdCalibration,
 }
 ```
 
@@ -318,6 +381,7 @@ pub struct WarmupState {
 | `is_ready()` | Whether both are complete |
 | `set_result(result)` | Stores the warmup result |
 | `last_result()` | Last warmup result |
+| `run_warmup(config, rdma_fn, jit_fn)` | Run full warmup: RDMA + JIT + calibration (idempotent) |
 
 ### WarmupResult
 
@@ -325,6 +389,7 @@ pub struct WarmupState {
 pub struct WarmupResult {
     pub rdma_warmup: Duration,
     pub jit_warmup: Duration,
+    pub calibration: Duration,
     pub total: Duration,
 }
 ```

@@ -346,7 +346,11 @@ impl ProgressEngine {
     ///
     /// The CQ must be wrapped in an `Arc` so the background thread can own
     /// a reference. The thread runs until `shutdown()` is called.
-    pub fn start_background(&mut self, cq: Arc<CompletionQueue>, config: ProgressConfig) -> Result<(), crate::RdmaError> {
+    pub fn start_background(
+        &mut self,
+        cq: Arc<CompletionQueue>,
+        config: ProgressConfig,
+    ) -> Result<(), crate::RdmaError> {
         if self.bg_handle.is_some() {
             return Err(crate::RdmaError::InvalidArgument(
                 "background progress thread already running".into(),
@@ -397,7 +401,11 @@ impl ProgressEngine {
                     }
                 }
             })
-            .map_err(|e| crate::RdmaError::InvalidArgument(format!("failed to spawn CQ progress thread: {e}")))?;
+            .map_err(|e| {
+                crate::RdmaError::InvalidArgument(format!(
+                    "failed to spawn CQ progress thread: {e}"
+                ))
+            })?;
 
         self.bg_handle = Some(handle);
         Ok(())

@@ -170,8 +170,7 @@ impl FeedForward {
                 let cb5 = graph.command_buffer();
                 let gate_out = gate_proj.forward_into_cb(normed, registry, cb5)?;
                 let up_out = up_proj.forward_into_cb(normed, registry, cb5)?;
-                let hidden =
-                    ops::fused::fused_silu_mul_into_cb(registry, &gate_out, &up_out, cb5)?;
+                let hidden = ops::fused::fused_silu_mul_into_cb(registry, &gate_out, &up_out, cb5)?;
                 let t5 = graph.submit_batch();
 
                 // CB6: down_proj + residual
@@ -210,8 +209,7 @@ impl FeedForward {
                 let cb = graph.command_buffer();
                 let gate_out = gate_proj.forward_into_cb(normed, registry, cb)?;
                 let up_out = up_proj.forward_into_cb(normed, registry, cb)?;
-                let hidden =
-                    ops::fused::fused_silu_mul_into_cb(registry, &gate_out, &up_out, cb)?;
+                let hidden = ops::fused::fused_silu_mul_into_cb(registry, &gate_out, &up_out, cb)?;
                 let ffn_out = down_proj.forward_into_cb(&hidden, registry, cb)?;
                 ops::binary::add_into_cb(registry, residual, &ffn_out, cb)
             }
@@ -448,8 +446,15 @@ impl TransformerBlock {
         // ---- CB1: norm + Q/K/V projections ----
         // Fuse pre-attention norm into the projection CB to save a submit.
         let (attn_out, t_attn) = self.attention.forward_graph_fused(
-            x, norm1_w, self.rms_norm_eps,
-            cos_freqs, sin_freqs, mask, cache, registry, graph,
+            x,
+            norm1_w,
+            self.rms_norm_eps,
+            cos_freqs,
+            sin_freqs,
+            mask,
+            cache,
+            registry,
+            graph,
         )?;
 
         // ---- CB4 (from attention): concat + O_proj + residual + pre-FFN norm ----
@@ -457,18 +462,14 @@ impl TransformerBlock {
         graph.wait_for(t_attn);
         let cb4 = graph.command_buffer();
         let h = ops::binary::add_into_cb(registry, x, &attn_out, cb4)?;
-        let normed2 = ops::rms_norm::rms_norm_into_cb(
-            registry,
-            &h,
-            Some(norm2_w),
-            self.rms_norm_eps,
-            cb4,
-        )?;
+        let normed2 =
+            ops::rms_norm::rms_norm_into_cb(registry, &h, Some(norm2_w), self.rms_norm_eps, cb4)?;
         let t4 = graph.submit_batch();
         graph.wait_for(t4);
 
         // ---- CB5: entire FFN (gate + up + silu_mul + down + residual) ----
-        self.ffn.forward_graph_fused(&normed2, &h, registry, graph, queue)
+        self.ffn
+            .forward_graph_fused(&normed2, &h, registry, graph, queue)
     }
 }
 
@@ -636,7 +637,13 @@ impl TransformerModel {
         for (i, layer) in self.layers.iter().enumerate() {
             let layer_cache = cache.as_mut().map(|c| &mut c[i]);
             x = layer.forward_pipelined(
-                &x, cos_freqs, sin_freqs, mask, layer_cache, registry, queue,
+                &x,
+                cos_freqs,
+                sin_freqs,
+                mask,
+                layer_cache,
+                registry,
+                queue,
             )?;
         }
 
@@ -690,7 +697,14 @@ impl TransformerModel {
         for (i, layer) in self.layers.iter().enumerate() {
             let layer_cache = cache.as_mut().map(|c| &mut c[i]);
             x = layer.forward_graph(
-                &x, cos_freqs, sin_freqs, mask, layer_cache, registry, &mut graph, queue,
+                &x,
+                cos_freqs,
+                sin_freqs,
+                mask,
+                layer_cache,
+                registry,
+                &mut graph,
+                queue,
             )?;
             // Submit remaining work and wait between layers to ensure
             // the output is ready for the next layer's input

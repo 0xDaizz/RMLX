@@ -1,6 +1,6 @@
 # 아키텍처 개요
 
-RMLX는 4개의 레이어로 구성된 계층형 아키텍처이며, 전 Phase(0~9B-opt)가 완료되어 완전히 구현된 상태입니다. 각 레이어는 명확한 책임 경계를 가지며, Cargo 크레이트 단위로 분리되어 있습니다. Phase 7에서 추가된 VJP autodiff, LoRA fine-tuning, 프로덕션 하드닝(structured logging, metrics, precision guard, graceful shutdown)이 포함됩니다. Phase 9에서는 ExecGraph (5 CBs/layer, 92.3% 감소), CommandBatcher, Indirect Command Buffer, 가중치 사전 캐싱이 추가되어 16.15x 속도 향상을 달성했습니다.
+RMLX는 4개의 레이어로 구성된 계층형 아키텍처이며, 전 Phase(0~9B-opt)가 완료되어 완전히 구현된 상태입니다. 각 레이어는 명확한 책임 경계를 가지며, Cargo 크레이트 단위로 분리되어 있습니다. Phase 7에서 추가된 VJP autodiff, LoRA fine-tuning, 프로덕션 하드닝(structured logging, metrics, precision guard, graceful shutdown)이 포함됩니다. Phase 9에서는 ExecGraph (5 CBs/layer, 92.3% 감소), CommandBatcher, Indirect Command Buffer, 가중치 사전 캐싱이 추가되어 17.4x 속도 향상을 달성했습니다.
 
 ---
 

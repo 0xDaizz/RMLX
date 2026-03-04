@@ -32,11 +32,11 @@ pub use metal;
 // Re-export core types for convenience
 pub use autorelease::ScopedPool;
 pub use batcher::CommandBatcher;
-pub use exec_graph::ExecGraph;
 pub use capture::{CaptureDestination, CaptureScope};
 pub use command::{BarrierTracker, CommandBufferManager, GpuError, GpuErrorStore};
 pub use device::{Architecture, GpuDevice};
 pub use event::GpuEvent;
+pub use exec_graph::ExecGraph;
 pub use fence::{FenceError, GpuFence};
 pub use library_cache::LibraryCache;
 pub use managed_buffer::{BufferAllocator, ManagedBuffer};

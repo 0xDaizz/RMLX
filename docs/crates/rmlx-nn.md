@@ -88,7 +88,7 @@ Pre-computes and caches the contiguous transposed weight matrix at model load ti
 | `weight_transposed_contiguous()` | Returns the cached transposed weight (if prepared) |
 
 This trades ~2x weight memory for zero-cost transpose during inference, contributing
-to the 16.15x speedup.
+to the 17.4x speedup.
 
 ---
 

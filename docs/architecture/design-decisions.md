@@ -220,11 +220,11 @@ Metal does not have an equivalent capture-replay mechanism. Instead, ExecGraph:
 
 | CB | Operations | Reason for boundary |
 |----|-----------|---------------------|
-| CB1 | QKV projection + RoPE | Shared input dependency |
-| CB2 | SDPA (fused attention) | Depends on CB1 output |
-| CB3 | Output projection + residual | Depends on CB2 |
-| CB4 | FFN (gate + up + SiLU + down) | Depends on CB3 |
-| CB5 | Final residual + norm | Depends on CB4 |
+| CB1 | RMS norm + Q/K/V projections (fused) | Shared input dependency |
+| CB2 | Head split + RoPE + cache append | Depends on CB1 output |
+| CB3 | SDPA + head concat + O_proj | Depends on CB2 |
+| CB4 | Residual + pre-FFN norm | Depends on CB3 |
+| CB5 | Gate + up + silu_mul + down + residual | Depends on CB4 |
 
 Each boundary exists because subsequent operations depend on the previous CB's output.
 Within each CB, multiple operations share a single encoder.
@@ -234,7 +234,7 @@ Within each CB, multiple operations share a single encoder.
 | Metric | Baseline | ExecGraph | Improvement |
 |--------|----------|-----------|-------------|
 | CBs/layer | 65 | 5 | 92.3% reduction |
-| Latency/layer | 110.4ms | 6.8ms | 16.15x speedup |
+| Latency/layer | ~112ms | ~6.4ms | 17.4x speedup |
 | CPU-GPU syncs | ~65 | ~1 | 98.5% reduction |
 
 ### Trade-offs vs CUDA Graphs
@@ -273,4 +273,4 @@ For a 7B parameter model with f16 weights:
 ### Performance Impact
 
 Eliminates the per-layer transpose + copy overhead from the critical path.
-Combined with ExecGraph, this contributes to the 16.15x speedup.
+Combined with ExecGraph, this contributes to the 17.4x speedup.
