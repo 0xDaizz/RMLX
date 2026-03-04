@@ -14,6 +14,7 @@ pub mod linear;
 pub mod mla;
 pub mod models;
 pub mod moe;
+pub mod moe_pipeline;
 pub mod parallel;
 pub mod quantized_linear;
 pub mod sliding_window;
@@ -34,6 +35,7 @@ pub use layer_norm::{LayerNorm, LayerNormConfig};
 pub use linear::{Linear, LinearConfig};
 pub use mla::{Mla, MlaConfig, MlaKvCache};
 pub use moe::{load_balance_loss, Expert, MoeConfig, MoeForwardMetrics, MoeLayer};
+pub use moe_pipeline::{MoePipeline, MoePipelineConfig};
 pub use quantized_linear::{QuantBits, QuantizedLinear, QuantizedLinearConfig};
 pub use sliding_window::{SlidingWindowAttention, SlidingWindowAttentionConfig};
 pub use transformer::{
