@@ -255,10 +255,6 @@ fn main() {
         graph_latencies.push(start.elapsed());
 
         if i == BENCH_ITERS - 1 {
-            let stats = ExecGraphStats::from_graph(&graph);
-            graph_total_batches = stats.total_batches;
-            graph_total_cbs = stats.total_cbs;
-            graph_total_encoders = stats.total_encoders;
             // Re-run once more to capture stats before reset
             let event2 = GpuEvent::new(device);
             let mut graph2 = ExecGraph::new(&queue, &event2, 32);

@@ -399,7 +399,7 @@ kernel void rms_norm_single_bf16(
 "#;
 
 /// Threshold: axis_size <= this uses the simpler single-row kernel.
-const SINGLE_ROW_THRESHOLD: usize = 4096;
+const SINGLE_ROW_THRESHOLD: usize = 1024;
 
 pub fn register(registry: &KernelRegistry) -> Result<(), KernelError> {
     registry.register_jit_source("rms_norm", RMS_NORM_SHADER_SOURCE)
