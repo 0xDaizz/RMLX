@@ -191,6 +191,40 @@ impl FeedForward {
             }
         }
     }
+
+    /// Fused FFN: entire SwiGLU in 1 CB (gate + up + silu_mul + down + residual).
+    pub fn forward_graph_fused(
+        &self,
+        normed: &Array,
+        residual: &Array,
+        registry: &KernelRegistry,
+        graph: &mut ExecGraph<'_, '_>,
+        queue: &metal::CommandQueue,
+    ) -> Result<Array, KernelError> {
+        match self {
+            FeedForward::Dense {
+                gate_proj,
+                up_proj,
+                down_proj,
+            } => {
+                let cb = graph.command_buffer();
+                let gate_out = gate_proj.forward_into_cb(normed, registry, cb)?;
+                let up_out = up_proj.forward_into_cb(normed, registry, cb)?;
+                let hidden =
+                    ops::fused::fused_silu_mul_into_cb(registry, &gate_out, &up_out, cb)?;
+                let ffn_out = down_proj.forward_into_cb(&hidden, registry, cb)?;
+                ops::binary::add_into_cb(registry, residual, &ffn_out, cb)
+            }
+            FeedForward::MoE(moe) => {
+                graph
+                    .sync()
+                    .map_err(|e| KernelError::InvalidShape(format!("MoE graph sync: {e}")))?;
+                graph.reset();
+                let ffn_out = moe.forward(normed, registry, queue)?;
+                ops::binary::add(registry, residual, &ffn_out, queue)
+            }
+        }
+    }
 }
 
 pub struct TransformerBlock {
@@ -385,14 +419,13 @@ impl TransformerBlock {
         ops::binary::add(registry, &h, &ffn_out, queue)
     }
 
-    /// Full ExecGraph forward pass (6 CBs total: 4 attention + 2 FFN).
+    /// Full ExecGraph forward pass (5 CBs total).
     ///
-    /// CB1: RMS norm + Q/K/V projections
+    /// CB1: RMS norm + Q/K/V projections (fused)
     /// CB2: head split + RoPE + cache append
-    /// CB3: SDPA
-    /// CB4: head concat + O_proj + residual add
-    /// CB5: RMS norm + gate + up + fused silu*mul
-    /// CB6: down_proj + residual add
+    /// CB3: SDPA + head concat + O_proj
+    /// CB4: residual + pre-FFN norm
+    /// CB5: gate + up + silu_mul + down + residual (entire FFN)
     #[allow(clippy::too_many_arguments)]
     pub fn forward_graph(
         &self,
@@ -412,41 +445,30 @@ impl TransformerBlock {
             KernelError::InvalidShape("TransformerBlock: norm2_weight not loaded".into())
         })?;
 
-        // Pre-attention norm (encoded into the first CB of attention)
-        let cb_norm = graph.command_buffer();
-        let normed = ops::rms_norm::rms_norm_into_cb(
-            registry,
-            x,
-            Some(norm1_w),
-            self.rms_norm_eps,
-            cb_norm,
-        )?;
-        let t_norm = graph.submit_batch();
-        graph.wait_for(t_norm);
-
-        // Attention (4 CBs: projections, RoPE+cache, SDPA, concat+O_proj)
-        let (attn_out, t_attn) = self.attention.forward_graph(
-            &normed, cos_freqs, sin_freqs, mask, cache, registry, graph,
+        // ---- CB1: norm + Q/K/V projections ----
+        // Fuse pre-attention norm into the projection CB to save a submit.
+        let (attn_out, t_attn) = self.attention.forward_graph_fused(
+            x, norm1_w, self.rms_norm_eps,
+            cos_freqs, sin_freqs, mask, cache, registry, graph,
         )?;
 
-        // Residual add: x + attn_out
+        // ---- CB4 (from attention): concat + O_proj + residual + pre-FFN norm ----
+        // Fuse residual add + pre-FFN norm into attention's last CB.
         graph.wait_for(t_attn);
-        let cb_res1 = graph.command_buffer();
-        let h = ops::binary::add_into_cb(registry, x, &attn_out, cb_res1)?;
-
-        // Pre-FFN norm
+        let cb4 = graph.command_buffer();
+        let h = ops::binary::add_into_cb(registry, x, &attn_out, cb4)?;
         let normed2 = ops::rms_norm::rms_norm_into_cb(
             registry,
             &h,
             Some(norm2_w),
             self.rms_norm_eps,
-            cb_res1,
+            cb4,
         )?;
-        let t_res1 = graph.submit_batch();
-        graph.wait_for(t_res1);
+        let t4 = graph.submit_batch();
+        graph.wait_for(t4);
 
-        // FFN (2 CBs for dense, sync fallback for MoE)
-        self.ffn.forward_graph(&normed2, &h, registry, graph, queue)
+        // ---- CB5: entire FFN (gate + up + silu_mul + down + residual) ----
+        self.ffn.forward_graph_fused(&normed2, &h, registry, graph, queue)
     }
 }
 
