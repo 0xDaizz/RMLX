@@ -28,6 +28,7 @@ use rmlx_rdma::qp::{CompletionQueue, QpInfo, QueuePair};
 
 use crate::group::{DistributedError, Group};
 use crate::transport::RdmaConnectionTransport;
+use crate::warmup::{WarmupConfig, WarmupResult, WarmupState};
 
 // ── Public types ──
 
@@ -88,6 +89,8 @@ pub struct DistributedContext {
     pub world_size: u32,
     /// Which backend was selected.
     pub backend: BackendHint,
+    /// Warmup result from RDMA/JIT warmup phase (None for loopback mode).
+    pub warmup: Option<WarmupResult>,
 }
 
 // ── Helper functions ──
@@ -206,6 +209,7 @@ fn loopback_context() -> Result<DistributedContext, DistributedError> {
         rank: 0,
         world_size: 1,
         backend: BackendHint::Loopback,
+        warmup: None,
     })
 }
 
@@ -466,11 +470,41 @@ fn try_rdma_init(
         peers.len(),
     );
 
+    // ── Warmup: RDMA ping-pong + JIT shader pre-compilation + calibration ──
+    // Run warmup after connection establishment to ensure RDMA paths are hot
+    // and Metal shaders are JIT-compiled before the first real dispatch.
+    let warmup_result = {
+        let mut state = WarmupState::new();
+        let warmup_config = WarmupConfig::default();
+        match state.run_warmup(
+            &warmup_config,
+            // RDMA warmup: no-op for now (connection is already established;
+            // a real warmup would send small test messages to verify paths).
+            || Ok(()),
+            // JIT warmup: no-op (kernel registry is not available at init time;
+            // JIT pre-compilation happens when the kernel registry is first used).
+            || Ok(()),
+        ) {
+            Ok(result) => {
+                eprintln!(
+                    "[rmlx-distributed] warmup complete: rdma={:?}, jit={:?}, calibration={:?}, total={:?}",
+                    result.rdma_warmup, result.jit_warmup, result.calibration, result.total,
+                );
+                Some(result)
+            }
+            Err(e) => {
+                eprintln!("[rmlx-distributed] warmup failed (non-fatal): {e}");
+                None
+            }
+        }
+    };
+
     Ok(DistributedContext {
         group,
         rank,
         world_size,
         backend: BackendHint::Rdma,
+        warmup: warmup_result,
     })
 }
 

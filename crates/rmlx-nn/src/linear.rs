@@ -20,6 +20,8 @@ pub struct Linear {
     config: LinearConfig,
     weight: Option<Array>,
     bias: Option<Array>,
+    /// Pre-computed contiguous transposed weight for the ExecGraph path.
+    weight_t_cached: Option<Array>,
 }
 
 impl Linear {
@@ -29,6 +31,7 @@ impl Linear {
             config,
             weight: None,
             bias: None,
+            weight_t_cached: None,
         }
     }
 
@@ -80,6 +83,7 @@ impl Linear {
             config,
             weight: Some(weight),
             bias,
+            weight_t_cached: None,
         })
     }
 
@@ -203,4 +207,182 @@ impl Linear {
     pub fn bias(&self) -> Option<&Array> {
         self.bias.as_ref()
     }
+
+    // -------------------------------------------------------------------
+    // ExecGraph path — encode into existing command buffers
+    // -------------------------------------------------------------------
+
+    /// Return a (non-contiguous) transposed view of the weight matrix.
+    ///
+    /// Weight shape: `[out_features, in_features]` -> `[in_features, out_features]`
+    /// via stride swap (zero-copy).
+    pub fn weight_transposed(&self) -> Result<Array, KernelError> {
+        let weight = self
+            .weight
+            .as_ref()
+            .ok_or_else(|| KernelError::InvalidShape("Linear: weights not loaded".to_string()))?;
+        Ok(weight.view(
+            vec![self.config.in_features, self.config.out_features],
+            vec![1, self.config.in_features],
+            weight.offset(),
+        ))
+    }
+
+    /// Pre-compute and cache the contiguous transposed weight for `forward_into_cb`.
+    ///
+    /// Call once after weight loading. Eliminates per-pass weight copies in the
+    /// ExecGraph path.
+    pub fn prepare_weight_t(
+        &mut self,
+        registry: &KernelRegistry,
+        queue: &metal::CommandQueue,
+    ) -> Result<(), KernelError> {
+        let weight = self
+            .weight
+            .as_ref()
+            .ok_or_else(|| KernelError::InvalidShape("Linear: weights not loaded".to_string()))?;
+        let w_t = weight.view(
+            vec![self.config.in_features, self.config.out_features],
+            vec![1, self.config.in_features],
+            weight.offset(),
+        );
+        let w_t_contig = ops::copy::copy(registry, &w_t, queue)?;
+        self.weight_t_cached = Some(w_t_contig);
+        Ok(())
+    }
+
+    /// Return the contiguous transposed weight (cached if available, else creates view).
+    pub fn weight_transposed_contiguous(&self) -> Result<Array, KernelError> {
+        if let Some(ref cached) = self.weight_t_cached {
+            return Ok(cached.view(
+                cached.shape().to_vec(),
+                cached.strides().to_vec(),
+                cached.offset(),
+            ));
+        }
+        self.weight_transposed()
+    }
+
+    /// Encode the linear forward pass into an existing command buffer.
+    ///
+    /// This does NOT commit or wait — the caller manages the CB lifecycle.
+    /// Note: bias is not supported in the batched path.
+    pub fn forward_into_cb(
+        &self,
+        input: &Array,
+        registry: &KernelRegistry,
+        cb: &metal::CommandBufferRef,
+    ) -> Result<Array, KernelError> {
+        let weight = self
+            .weight
+            .as_ref()
+            .ok_or_else(|| KernelError::InvalidShape("Linear: weights not loaded".to_string()))?;
+
+        let input_2d = if input.ndim() == 1 {
+            input.reshape(vec![1, input.shape()[0]])?
+        } else if input.ndim() == 2 {
+            input.reshape(vec![input.shape()[0], input.shape()[1]])?
+        } else {
+            return Err(KernelError::InvalidShape(format!(
+                "input must be 1D or 2D, got {}D",
+                input.ndim()
+            )));
+        };
+
+        if input_2d.shape()[1] != self.config.in_features {
+            return Err(KernelError::InvalidShape(format!(
+                "input features mismatch: {} vs {}",
+                input_2d.shape()[1],
+                self.config.in_features
+            )));
+        }
+
+        // Use pre-cached contiguous transposed weight if available
+        let w_t = if let Some(ref cached) = self.weight_t_cached {
+            cached.view(
+                cached.shape().to_vec(),
+                cached.strides().to_vec(),
+                cached.offset(),
+            )
+        } else {
+            let w_t_view = weight.view(
+                vec![self.config.in_features, self.config.out_features],
+                vec![1, self.config.in_features],
+                weight.offset(),
+            );
+            if w_t_view.is_contiguous() {
+                w_t_view
+            } else {
+                ops::copy::copy_into_cb(registry, &w_t_view, cb)?
+            }
+        };
+
+        // Ensure input is contiguous for GEMM
+        let input_2d = if input_2d.is_contiguous() {
+            input_2d
+        } else {
+            ops::copy::copy_into_cb(registry, &input_2d, cb)?
+        };
+
+        // Encode GEMM into the provided CB
+        let m = input_2d.shape()[0] as u32;
+        let n = self.config.out_features as u32;
+        let k = self.config.in_features as u32;
+
+        let kernel_name = match input_2d.dtype() {
+            rmlx_core::dtype::DType::Float32 => "gemm_tiled_f32",
+            rmlx_core::dtype::DType::Float16 => "gemm_tiled_f16",
+            rmlx_core::dtype::DType::Bfloat16 => "gemm_tiled_bf16",
+            other => {
+                return Err(KernelError::InvalidShape(format!(
+                    "linear: unsupported dtype {:?}",
+                    other
+                )))
+            }
+        };
+
+        let pipeline = registry.get_pipeline(kernel_name, input_2d.dtype())?;
+        let dev = registry.device().raw();
+        let output = Array::zeros(dev, &[m as usize, n as usize], input_2d.dtype());
+
+        let m_buf = make_u32_buf(dev, m);
+        let n_buf = make_u32_buf(dev, n);
+        let k_buf = make_u32_buf(dev, k);
+        let bsa = make_u32_buf(dev, m * k);
+        let bsb = make_u32_buf(dev, k * n);
+        let bsc = make_u32_buf(dev, m * n);
+
+        const BM: u64 = 32;
+        const BN: u64 = 32;
+        let grid_x = (n as u64).div_ceil(BN);
+        let grid_y = (m as u64).div_ceil(BM);
+
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(input_2d.metal_buffer()), input_2d.offset() as u64);
+        enc.set_buffer(1, Some(w_t.metal_buffer()), w_t.offset() as u64);
+        enc.set_buffer(2, Some(output.metal_buffer()), output.offset() as u64);
+        enc.set_buffer(3, Some(&m_buf), 0);
+        enc.set_buffer(4, Some(&n_buf), 0);
+        enc.set_buffer(5, Some(&k_buf), 0);
+        enc.set_buffer(6, Some(&bsa), 0);
+        enc.set_buffer(7, Some(&bsb), 0);
+        enc.set_buffer(8, Some(&bsc), 0);
+
+        let grid = metal::MTLSize::new(grid_x, grid_y, 1);
+        let tg = metal::MTLSize::new(BM * BN, 1, 1);
+        enc.dispatch_thread_groups(grid, tg);
+        enc.end_encoding();
+
+        Ok(output)
+    }
+}
+
+/// Create a constant `u32` Metal buffer.
+fn make_u32_buf(device: &metal::DeviceRef, val: u32) -> metal::Buffer {
+    device.new_buffer_with_data(
+        &val as *const u32 as *const std::ffi::c_void,
+        4,
+        metal::MTLResourceOptions::StorageModeShared,
+    )
 }

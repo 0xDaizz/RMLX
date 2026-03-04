@@ -6,6 +6,7 @@ use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::{KernelError, KernelRegistry};
 use rmlx_core::ops;
+use rmlx_metal::exec_graph::{EventToken, ExecGraph};
 
 use crate::linear::{Linear, LinearConfig};
 
@@ -213,6 +214,108 @@ impl LayerKvCache {
 
         cb.commit();
         cb.wait_until_completed();
+        Ok(())
+    }
+
+    /// Append new K, V heads into the pre-allocated cache using an existing CB.
+    ///
+    /// Encodes copy dispatches for each KV head into `cb`, writing new tokens
+    /// into pre-allocated slots at `[seq_len..seq_len+new_tokens]`.
+    /// Does NOT commit or wait -- the caller manages the CB lifecycle.
+    ///
+    /// Only works for pre-allocated caches (`max_seq_len > 0`).
+    pub fn append_into_cb(
+        &mut self,
+        new_keys: Vec<Array>,
+        new_values: Vec<Array>,
+        new_tokens: usize,
+        registry: &KernelRegistry,
+        cb: &metal::CommandBufferRef,
+    ) -> Result<(), KernelError> {
+        if new_keys.len() != self.num_kv_heads || new_values.len() != self.num_kv_heads {
+            return Err(KernelError::InvalidShape(format!(
+                "LayerKvCache::append_into_cb: expected {} kv heads, got keys={}, values={}",
+                self.num_kv_heads,
+                new_keys.len(),
+                new_values.len()
+            )));
+        }
+
+        if self.max_seq_len == 0 {
+            return Err(KernelError::InvalidShape(
+                "LayerKvCache::append_into_cb requires pre-allocated cache".to_string(),
+            ));
+        }
+
+        if self.seq_len + new_tokens > self.max_seq_len {
+            return Err(KernelError::InvalidShape(format!(
+                "LayerKvCache::append_into_cb: overflow: {} cached + {} new > {} max",
+                self.seq_len, new_tokens, self.max_seq_len
+            )));
+        }
+
+        let elem_size = self.keys[0].dtype().size_of();
+        let copy_kernel = match self.keys[0].dtype() {
+            DType::Float32 => "copy_f32",
+            DType::Float16 => "copy_f16",
+            DType::Bfloat16 => "copy_bf16",
+            other => {
+                return Err(KernelError::InvalidShape(format!(
+                    "LayerKvCache: unsupported dtype {:?}",
+                    other
+                )))
+            }
+        };
+        let pipeline = registry.get_pipeline(copy_kernel, self.keys[0].dtype())?;
+        let count = (new_tokens * self.head_dim) as u64;
+        if count == 0 {
+            self.seq_len += new_tokens;
+            return Ok(());
+        }
+
+        let dst_row_offset = self.seq_len * self.head_dim * elem_size;
+
+        for i in 0..self.num_kv_heads {
+            // Copy new keys into slot
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&pipeline);
+            enc.set_buffer(
+                0,
+                Some(new_keys[i].metal_buffer()),
+                new_keys[i].offset() as u64,
+            );
+            enc.set_buffer(
+                1,
+                Some(self.keys[i].metal_buffer()),
+                (self.keys[i].offset() + dst_row_offset) as u64,
+            );
+            let grid = metal::MTLSize::new(count, 1, 1);
+            let tg = metal::MTLSize::new(
+                std::cmp::min(pipeline.max_total_threads_per_threadgroup(), count),
+                1,
+                1,
+            );
+            enc.dispatch_threads(grid, tg);
+            enc.end_encoding();
+
+            // Copy new values into slot
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&pipeline);
+            enc.set_buffer(
+                0,
+                Some(new_values[i].metal_buffer()),
+                new_values[i].offset() as u64,
+            );
+            enc.set_buffer(
+                1,
+                Some(self.values[i].metal_buffer()),
+                (self.values[i].offset() + dst_row_offset) as u64,
+            );
+            enc.dispatch_threads(grid, tg);
+            enc.end_encoding();
+        }
+
+        self.seq_len += new_tokens;
         Ok(())
     }
 
@@ -1272,6 +1375,407 @@ impl Attention {
     pub fn config(&self) -> &AttentionConfig {
         &self.config
     }
+
+    // -------------------------------------------------------------------
+    // ExecGraph path
+    // -------------------------------------------------------------------
+
+    /// Pre-cache transposed weights for all projection layers.
+    ///
+    /// Call once after weight loading. Eliminates per-pass weight copies
+    /// in the ExecGraph path.
+    pub fn prepare_weights_for_graph(
+        &mut self,
+        registry: &KernelRegistry,
+        queue: &metal::CommandQueue,
+    ) -> Result<(), KernelError> {
+        self.q_proj.prepare_weight_t(registry, queue)?;
+        self.k_proj.prepare_weight_t(registry, queue)?;
+        self.v_proj.prepare_weight_t(registry, queue)?;
+        self.o_proj.prepare_weight_t(registry, queue)?;
+        Ok(())
+    }
+
+    /// ExecGraph-based attention forward pass using 4 command buffers.
+    ///
+    /// Architecture:
+    /// - CB1 (current): Q/K/V projections
+    /// - CB2: head split + contiguous copy + RoPE + cache append
+    /// - CB3: SDPA
+    /// - CB4: head concat (interleave) + O_proj
+    ///
+    /// Returns `(output_array, EventToken)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_graph(
+        &self,
+        x: &Array,
+        cos_freqs: Option<&Array>,
+        sin_freqs: Option<&Array>,
+        mask: Option<&Array>,
+        mut cache: Option<&mut LayerKvCache>,
+        registry: &KernelRegistry,
+        graph: &mut ExecGraph<'_, '_>,
+    ) -> Result<(Array, EventToken), KernelError> {
+        let seq_len = x.shape()[0];
+        let num_heads = self.config.num_heads;
+        let num_kv_heads = self.config.num_kv_heads;
+        let head_dim = self.config.head_dim;
+
+        // ---- CB1: Q/K/V projections ----
+        let cb1 = graph.command_buffer();
+        let q = self.q_proj.forward_into_cb(x, registry, cb1)?;
+        let k = self.k_proj.forward_into_cb(x, registry, cb1)?;
+        let v = self.v_proj.forward_into_cb(x, registry, cb1)?;
+        let t1 = graph.submit_batch();
+
+        // ---- CB2: head split, contiguous copy, RoPE, cache append ----
+        graph.wait_for(t1);
+        let cb2 = graph.command_buffer();
+
+        let dev = registry.device().raw();
+        let elem_size = q.dtype().size_of();
+        let rope_offset = cache.as_ref().map_or(0u32, |c| c.seq_len as u32);
+
+        // Split Q into heads and apply RoPE
+        let mut q_heads: Vec<Array> = Vec::with_capacity(num_heads);
+        for h in 0..num_heads {
+            let offset = q.offset() + h * head_dim * elem_size;
+            let q_head = q.view(
+                vec![seq_len, head_dim],
+                vec![num_heads * head_dim, 1],
+                offset,
+            );
+            let q_head = ops::copy::copy_into_cb(registry, &q_head, cb2)?;
+            let q_head = if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
+                ops::rope::rope_ext_into_cb(
+                    registry,
+                    &q_head,
+                    cos,
+                    sin,
+                    rope_offset,
+                    1.0,
+                    false,
+                    true,
+                    cb2,
+                )?
+            } else {
+                q_head
+            };
+            q_heads.push(q_head);
+        }
+
+        // Split K into heads, copy contiguous, apply RoPE
+        let mut k_heads: Vec<Array> = Vec::with_capacity(num_kv_heads);
+        for h in 0..num_kv_heads {
+            let offset = k.offset() + h * head_dim * elem_size;
+            let k_head = k.view(
+                vec![seq_len, head_dim],
+                vec![num_kv_heads * head_dim, 1],
+                offset,
+            );
+            let k_head = ops::copy::copy_into_cb(registry, &k_head, cb2)?;
+            let k_head = if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
+                ops::rope::rope_ext_into_cb(
+                    registry,
+                    &k_head,
+                    cos,
+                    sin,
+                    rope_offset,
+                    1.0,
+                    false,
+                    true,
+                    cb2,
+                )?
+            } else {
+                k_head
+            };
+            k_heads.push(k_head);
+        }
+
+        // Split V into heads, copy contiguous
+        let mut v_heads: Vec<Array> = Vec::with_capacity(num_kv_heads);
+        for h in 0..num_kv_heads {
+            let offset = v.offset() + h * head_dim * elem_size;
+            let v_head = v.view(
+                vec![seq_len, head_dim],
+                vec![num_kv_heads * head_dim, 1],
+                offset,
+            );
+            let v_head = ops::copy::copy_into_cb(registry, &v_head, cb2)?;
+            v_heads.push(v_head);
+        }
+
+        // Cache append (into same CB)
+        let (k_final, v_final) = match cache {
+            Some(ref mut c) => {
+                c.append_into_cb(k_heads, v_heads, seq_len, registry, cb2)?;
+                let kf: Vec<Array> = (0..num_kv_heads).map(|h| c.cached_keys(h)).collect();
+                let vf: Vec<Array> = (0..num_kv_heads).map(|h| c.cached_values(h)).collect();
+                (kf, vf)
+            }
+            None => (k_heads, v_heads),
+        };
+
+        let t2 = graph.submit_batch();
+
+        // ---- CB3: SDPA ----
+        graph.wait_for(t2);
+        let cb3 = graph.command_buffer();
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let attn_outputs = ops::sdpa::sdpa_batched_into_cb(
+            registry, &q_heads, &k_final, &v_final, mask, scale, cb3,
+        )?;
+        let t3 = graph.submit_batch();
+
+        // ---- CB4: head concat + O_proj ----
+        graph.wait_for(t3);
+        let cb4 = graph.command_buffer();
+
+        let hidden_size = num_heads * head_dim;
+        let concat = Array::zeros(dev, &[seq_len, hidden_size], q.dtype());
+        let head_bytes = head_dim * elem_size;
+
+        let copy_kernel = match q.dtype() {
+            DType::Float32 => "copy_f32",
+            DType::Float16 => "copy_f16",
+            DType::Bfloat16 => "copy_bf16",
+            _ => {
+                return Err(KernelError::InvalidShape(format!(
+                    "attention concat: unsupported dtype {:?}",
+                    q.dtype()
+                )));
+            }
+        };
+        let pipeline = registry.get_pipeline(copy_kernel, q.dtype())?;
+
+        // Interleave head outputs into [seq_len, hidden_size]
+        for (h, head_out) in attn_outputs.iter().enumerate() {
+            let dst_col_offset = h * head_bytes;
+            if seq_len == 1 {
+                let enc = cb4.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&pipeline);
+                enc.set_buffer(0, Some(head_out.metal_buffer()), head_out.offset() as u64);
+                enc.set_buffer(1, Some(concat.metal_buffer()), dst_col_offset as u64);
+                let count = head_dim as u64;
+                let grid = metal::MTLSize::new(count, 1, 1);
+                let tg = metal::MTLSize::new(
+                    std::cmp::min(pipeline.max_total_threads_per_threadgroup(), count),
+                    1,
+                    1,
+                );
+                enc.dispatch_threads(grid, tg);
+                enc.end_encoding();
+            } else {
+                let hidden_bytes_stride = hidden_size * elem_size;
+                let blit = cb4.new_blit_command_encoder();
+                for row in 0..seq_len {
+                    let src_off = (head_out.offset() + row * head_bytes) as u64;
+                    let dst_off = (row * hidden_bytes_stride + dst_col_offset) as u64;
+                    blit.copy_from_buffer(
+                        head_out.metal_buffer(),
+                        src_off,
+                        concat.metal_buffer(),
+                        dst_off,
+                        head_bytes as u64,
+                    );
+                }
+                blit.end_encoding();
+            }
+        }
+
+        // O projection
+        let output = self.o_proj.forward_into_cb(&concat, registry, cb4)?;
+        let t4 = graph.submit_batch();
+
+        Ok((output, t4))
+    }
+
+    /// Fused ExecGraph attention: norm + projections in CB1 (3 CBs total).
+    ///
+    /// Architecture (saves 1 CB vs `forward_graph`):
+    /// - CB1: RMS norm + Q/K/V projections (fused)
+    /// - CB2: head split + RoPE + cache append
+    /// - CB3: SDPA + head concat + O_proj
+    ///
+    /// Returns `(output_array, EventToken)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_graph_fused(
+        &self,
+        x: &Array,
+        norm_weight: &Array,
+        rms_norm_eps: f32,
+        cos_freqs: Option<&Array>,
+        sin_freqs: Option<&Array>,
+        mask: Option<&Array>,
+        mut cache: Option<&mut LayerKvCache>,
+        registry: &KernelRegistry,
+        graph: &mut ExecGraph<'_, '_>,
+    ) -> Result<(Array, EventToken), KernelError> {
+        let seq_len = x.shape()[0];
+        let num_heads = self.config.num_heads;
+        let num_kv_heads = self.config.num_kv_heads;
+        let head_dim = self.config.head_dim;
+
+        // ---- CB1: norm + Q/K/V projections (fused) ----
+        let cb1 = graph.command_buffer();
+        let normed =
+            ops::rms_norm::rms_norm_into_cb(registry, x, Some(norm_weight), rms_norm_eps, cb1)?;
+        let q = self.q_proj.forward_into_cb(&normed, registry, cb1)?;
+        let k = self.k_proj.forward_into_cb(&normed, registry, cb1)?;
+        let v = self.v_proj.forward_into_cb(&normed, registry, cb1)?;
+        let t1 = graph.submit_batch();
+
+        // ---- CB2: head split + RoPE + cache append ----
+        graph.wait_for(t1);
+        let cb2 = graph.command_buffer();
+
+        let dev = registry.device().raw();
+        let elem_size = q.dtype().size_of();
+        let rope_offset = cache.as_ref().map_or(0u32, |c| c.seq_len as u32);
+
+        let mut q_heads: Vec<Array> = Vec::with_capacity(num_heads);
+        for h in 0..num_heads {
+            let offset = q.offset() + h * head_dim * elem_size;
+            let q_head = q.view(
+                vec![seq_len, head_dim],
+                vec![num_heads * head_dim, 1],
+                offset,
+            );
+            let q_head = ops::copy::copy_into_cb(registry, &q_head, cb2)?;
+            let q_head = if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
+                ops::rope::rope_ext_into_cb(
+                    registry,
+                    &q_head,
+                    cos,
+                    sin,
+                    rope_offset,
+                    1.0,
+                    false,
+                    true,
+                    cb2,
+                )?
+            } else {
+                q_head
+            };
+            q_heads.push(q_head);
+        }
+
+        let mut k_heads: Vec<Array> = Vec::with_capacity(num_kv_heads);
+        for h in 0..num_kv_heads {
+            let offset = k.offset() + h * head_dim * elem_size;
+            let k_head = k.view(
+                vec![seq_len, head_dim],
+                vec![num_kv_heads * head_dim, 1],
+                offset,
+            );
+            let k_head = ops::copy::copy_into_cb(registry, &k_head, cb2)?;
+            let k_head = if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
+                ops::rope::rope_ext_into_cb(
+                    registry,
+                    &k_head,
+                    cos,
+                    sin,
+                    rope_offset,
+                    1.0,
+                    false,
+                    true,
+                    cb2,
+                )?
+            } else {
+                k_head
+            };
+            k_heads.push(k_head);
+        }
+
+        let mut v_heads: Vec<Array> = Vec::with_capacity(num_kv_heads);
+        for h in 0..num_kv_heads {
+            let offset = v.offset() + h * head_dim * elem_size;
+            let v_head = v.view(
+                vec![seq_len, head_dim],
+                vec![num_kv_heads * head_dim, 1],
+                offset,
+            );
+            let v_head = ops::copy::copy_into_cb(registry, &v_head, cb2)?;
+            v_heads.push(v_head);
+        }
+
+        let (k_final, v_final) = match cache {
+            Some(ref mut c) => {
+                c.append_into_cb(k_heads, v_heads, seq_len, registry, cb2)?;
+                let kf: Vec<Array> = (0..num_kv_heads).map(|h| c.cached_keys(h)).collect();
+                let vf: Vec<Array> = (0..num_kv_heads).map(|h| c.cached_values(h)).collect();
+                (kf, vf)
+            }
+            None => (k_heads, v_heads),
+        };
+
+        let t2 = graph.submit_batch();
+
+        // ---- CB3: SDPA + head concat + O_proj ----
+        graph.wait_for(t2);
+        let cb3 = graph.command_buffer();
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let attn_outputs = ops::sdpa::sdpa_batched_into_cb(
+            registry, &q_heads, &k_final, &v_final, mask, scale, cb3,
+        )?;
+
+        // Head concat
+        let hidden_size = num_heads * head_dim;
+        let concat = Array::zeros(dev, &[seq_len, hidden_size], q.dtype());
+        let head_bytes = head_dim * elem_size;
+
+        let copy_kernel = match q.dtype() {
+            DType::Float32 => "copy_f32",
+            DType::Float16 => "copy_f16",
+            DType::Bfloat16 => "copy_bf16",
+            _ => {
+                return Err(KernelError::InvalidShape(format!(
+                    "attention concat: unsupported dtype {:?}",
+                    q.dtype()
+                )));
+            }
+        };
+        let pipeline = registry.get_pipeline(copy_kernel, q.dtype())?;
+
+        for (h, head_out) in attn_outputs.iter().enumerate() {
+            let dst_col_offset = h * head_bytes;
+            if seq_len == 1 {
+                let enc = cb3.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&pipeline);
+                enc.set_buffer(0, Some(head_out.metal_buffer()), head_out.offset() as u64);
+                enc.set_buffer(1, Some(concat.metal_buffer()), dst_col_offset as u64);
+                let count = head_dim as u64;
+                let grid = metal::MTLSize::new(count, 1, 1);
+                let tg = metal::MTLSize::new(
+                    std::cmp::min(pipeline.max_total_threads_per_threadgroup(), count),
+                    1,
+                    1,
+                );
+                enc.dispatch_threads(grid, tg);
+                enc.end_encoding();
+            } else {
+                let hidden_bytes_stride = hidden_size * elem_size;
+                let blit = cb3.new_blit_command_encoder();
+                for row in 0..seq_len {
+                    let src_off = (head_out.offset() + row * head_bytes) as u64;
+                    let dst_off = (row * hidden_bytes_stride + dst_col_offset) as u64;
+                    blit.copy_from_buffer(
+                        head_out.metal_buffer(),
+                        src_off,
+                        concat.metal_buffer(),
+                        dst_off,
+                        head_bytes as u64,
+                    );
+                }
+                blit.end_encoding();
+            }
+        }
+
+        let output = self.o_proj.forward_into_cb(&concat, registry, cb3)?;
+        let t3 = graph.submit_batch();
+
+        Ok((output, t3))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1413,11 +1917,11 @@ impl QuantizedKvCache {
         // Extend the full-precision accumulators with the new data, then re-quantize.
         for h in 0..self.num_kv_heads {
             // Read new key data as f32
-            let new_k_f32 = read_array_as_f32(&new_keys[h]);
+            let new_k_f32 = read_array_as_f32(&new_keys[h])?;
             self.keys_full[layer][h].extend_from_slice(&new_k_f32);
 
             // Read new value data as f32
-            let new_v_f32 = read_array_as_f32(&new_values[h]);
+            let new_v_f32 = read_array_as_f32(&new_values[h])?;
             self.values_full[layer][h].extend_from_slice(&new_v_f32);
         }
 
@@ -1480,12 +1984,13 @@ impl QuantizedKvCache {
     }
 }
 
-/// Read an Array's data as f32 values, handling f16 -> f32 conversion.
+/// Read an Array's data as f32 values, handling f16/bf16 -> f32 conversion.
 ///
-/// Supports Float32 (direct read) and Float16 (manual IEEE 754 conversion).
-fn read_array_as_f32(arr: &Array) -> Vec<f32> {
+/// Supports Float32 (direct read), Float16, and Bfloat16 (manual conversion).
+/// Returns an error for unsupported dtypes instead of panicking.
+fn read_array_as_f32(arr: &Array) -> Result<Vec<f32>, KernelError> {
     match arr.dtype() {
-        DType::Float32 => arr.to_vec_checked::<f32>(),
+        DType::Float32 => Ok(arr.to_vec_checked::<f32>()),
         DType::Float16 => {
             // Float16 is stored as 2 bytes per element. We read raw bytes
             // and convert each u16 bit-pattern to f32 using IEEE 754 rules.
@@ -1498,7 +2003,7 @@ fn read_array_as_f32(arr: &Array) -> Vec<f32> {
                 let bits = lo | (hi << 8);
                 result.push(f16_to_f32(bits));
             }
-            result
+            Ok(result)
         }
         DType::Bfloat16 => {
             // BFloat16: 1 sign, 8 exponent, 7 mantissa — same exponent as f32.
@@ -1512,12 +2017,12 @@ fn read_array_as_f32(arr: &Array) -> Vec<f32> {
                 let bits = lo | (hi << 8);
                 result.push(bf16_to_f32(bits));
             }
-            result
+            Ok(result)
         }
-        other => panic!(
+        other => Err(KernelError::NotFound(format!(
             "read_array_as_f32: unsupported dtype {:?}; expected Float32, Float16, or Bfloat16",
             other
-        ),
+        ))),
     }
 }
 
@@ -1606,7 +2111,7 @@ fn quantize_to_affine(
     };
 
     // Read input as f32
-    let data = read_array_as_f32(input);
+    let data = read_array_as_f32(input)?;
 
     // Pad with zeros if necessary
     let mut padded = data;

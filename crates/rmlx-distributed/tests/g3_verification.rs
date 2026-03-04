@@ -83,7 +83,7 @@ fn verify_feature_matrix_types() {
     // Phase A: ExchangeTag
     use rmlx_rdma::exchange_tag::{decode_wr_id, encode_wr_id, ExchangeTag};
     let wr_id = encode_wr_id(42, ExchangeTag::Data, 0, 1);
-    let fields = decode_wr_id(wr_id);
+    let fields = decode_wr_id(wr_id).unwrap();
     assert_eq!(fields.seq, 42);
 
     // Phase B: MrPool types exist

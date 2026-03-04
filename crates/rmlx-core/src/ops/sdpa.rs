@@ -24,9 +24,9 @@ use crate::kernels::{KernelError, KernelRegistry};
 use metal::MTLSize;
 
 // Tiling parameters — must match the Metal shader constants.
-const BR: usize = 32; // Query block rows
-const _BC: usize = 32; // Key/Value block columns (used in shader only)
-const THREADS_PER_TG: u64 = 256; // Threads per threadgroup
+const BR: usize = 16; // Query block rows
+const _BC: usize = 16; // Key/Value block columns (used in shader only)
+const THREADS_PER_TG: u64 = 128; // Threads per threadgroup
 const DECODE_THREADS: u64 = 256; // Threads for decode kernel
 
 /// Metal shader for fused SDPA — Flash Attention 2 implementation.
@@ -43,8 +43,8 @@ pub const SDPA_SHADER_SOURCE: &str = r#"
 using namespace metal;
 
 // Tile sizes — keep in sync with Rust constants.
-constant constexpr uint Br = 32;   // Query block rows
-constant constexpr uint Bc = 32;   // Key/Value block columns
+constant constexpr uint Br = 16;   // Query block rows
+constant constexpr uint Bc = 16;   // Key/Value block columns
 constant constexpr uint SIMD_SIZE = 32;
 
 // ─── Threadgroup-wide reduction helpers ────────────────────────────────────
@@ -414,7 +414,7 @@ kernel void sdpa_f32(
     threadgroup float O_acc[Br * 128];     // [Br, min(D,128)]
     threadgroup float O_acc2[Br * 128];    // [Br, D-128] for D>128 (max 128 cols)
 
-    const uint n_threads = 256;
+    const uint n_threads = 128;
     const uint D_lo = min(D, 128u);  // first chunk of D
     const uint D_hi = (D > 128u) ? (D - 128u) : 0u;  // second chunk (0 if D<=128)
 
@@ -612,7 +612,7 @@ kernel void sdpa_f16(
     threadgroup float O_acc[Br * 128];
     threadgroup float O_acc2[Br * 128];
 
-    const uint n_threads = 256;
+    const uint n_threads = 128;
     const uint D_lo = min(D, 128u);
     const uint D_hi = (D > 128u) ? (D - 128u) : 0u;
 
@@ -758,8 +758,8 @@ pub const SDPA_BF16_SHADER_SOURCE: &str = r#"
 #include <metal_simdgroup>
 using namespace metal;
 
-constant constexpr uint Br = 32;
-constant constexpr uint Bc = 32;
+constant constexpr uint Br = 16;
+constant constexpr uint Bc = 16;
 constant constexpr uint SIMD_SIZE = 32;
 
 inline float tg_reduce_max_bf16(float val, uint tid, uint lane_id, uint sg_id,
@@ -912,7 +912,7 @@ kernel void sdpa_bf16(
     threadgroup float O_acc[Br * 128];
     threadgroup float O_acc2[Br * 128];
 
-    const uint n_threads = 256;
+    const uint n_threads = 128;
     const uint D_lo = min(D, 128u);
     const uint D_hi = (D > 128u) ? (D - 128u) : 0u;
 
@@ -1305,6 +1305,135 @@ pub fn sdpa_batched(
             scale,
             is_causal,
             queue,
+        )?;
+        outputs.push(out);
+    }
+    Ok(outputs)
+}
+
+// ---------------------------------------------------------------------------
+// Into-CB variants (encode into existing command buffer, no commit/wait)
+// ---------------------------------------------------------------------------
+
+/// Encode SDPA into an existing command buffer (no commit/wait).
+pub fn sdpa_into_cb(
+    registry: &KernelRegistry,
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    mask: Option<&Array>,
+    scale: f32,
+    cb: &metal::CommandBufferRef,
+) -> Result<Array, KernelError> {
+    let n = q.shape()[0]; // query tokens
+    let d = q.shape()[1]; // head dim
+    let s = k.shape()[0]; // key/value tokens
+
+    // Select kernel: decode fast path when N == 1, general kernel otherwise
+    let use_decode = n == 1;
+
+    let kernel_name = match (q.dtype(), use_decode) {
+        (DType::Float32, true) => "sdpa_decode_f32",
+        (DType::Float32, false) => "sdpa_f32",
+        (DType::Float16, true) => "sdpa_decode_f16",
+        (DType::Float16, false) => "sdpa_f16",
+        (DType::Bfloat16, true) => "sdpa_decode_bf16",
+        (DType::Bfloat16, false) => "sdpa_bf16",
+        _ => {
+            return Err(KernelError::NotFound(format!(
+                "sdpa: unsupported dtype {:?}",
+                q.dtype()
+            )));
+        }
+    };
+
+    let pipeline = registry.get_pipeline(kernel_name, q.dtype())?;
+    let dev = registry.device().raw();
+
+    let out = Array::zeros(dev, &[n, d], q.dtype());
+
+    let has_mask: u32 = if mask.is_some() { 1 } else { 0 };
+    let is_causal_u32: u32 = 0; // into_cb path does not support causal flag
+    let params: [u32; 5] = [n as u32, s as u32, d as u32, has_mask, is_causal_u32];
+    let params_buf = dev.new_buffer_with_data(
+        params.as_ptr() as *const std::ffi::c_void,
+        20, // 5 * 4 bytes
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+
+    let scale_buf = dev.new_buffer_with_data(
+        &scale as *const f32 as *const std::ffi::c_void,
+        4,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+
+    let dummy_buf;
+    let mask_buf = if let Some(m) = mask {
+        m.metal_buffer()
+    } else {
+        dummy_buf = dev.new_buffer(4, metal::MTLResourceOptions::StorageModeShared);
+        &dummy_buf
+    };
+    let mask_offset = mask.map_or(0, |m| m.offset()) as u64;
+
+    let encoder = cb.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(q.metal_buffer()), q.offset() as u64);
+    encoder.set_buffer(1, Some(k.metal_buffer()), k.offset() as u64);
+    encoder.set_buffer(2, Some(v.metal_buffer()), v.offset() as u64);
+    encoder.set_buffer(3, Some(out.metal_buffer()), 0);
+    encoder.set_buffer(4, Some(mask_buf), mask_offset);
+    encoder.set_buffer(5, Some(&params_buf), 0);
+    encoder.set_buffer(6, Some(&scale_buf), 0);
+
+    if use_decode {
+        // Decode kernel: single threadgroup
+        let tg_size = std::cmp::min(DECODE_THREADS, pipeline.max_total_threads_per_threadgroup());
+        encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(tg_size, 1, 1));
+    } else {
+        // General kernel: one threadgroup per Q block
+        let n_threadgroups = n.div_ceil(BR) as u64;
+        let tg_size = std::cmp::min(THREADS_PER_TG, pipeline.max_total_threads_per_threadgroup());
+        encoder.dispatch_thread_groups(
+            MTLSize::new(n_threadgroups, 1, 1),
+            MTLSize::new(tg_size, 1, 1),
+        );
+    }
+    encoder.end_encoding();
+
+    Ok(out)
+}
+
+/// Encode batched SDPA (multi-head) into an existing command buffer (no commit/wait).
+pub fn sdpa_batched_into_cb(
+    registry: &KernelRegistry,
+    q_heads: &[Array],
+    k_heads: &[Array],
+    v_heads: &[Array],
+    mask: Option<&Array>,
+    scale: f32,
+    cb: &metal::CommandBufferRef,
+) -> Result<Vec<Array>, KernelError> {
+    let num_heads = q_heads.len();
+    let num_kv_heads = k_heads.len();
+    if num_kv_heads == 0 || num_heads % num_kv_heads != 0 {
+        return Err(KernelError::InvalidShape(format!(
+            "sdpa_batched_into_cb: num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
+        )));
+    }
+    let repeats = num_heads / num_kv_heads;
+
+    let mut outputs = Vec::with_capacity(num_heads);
+    for (h, q_h) in q_heads.iter().enumerate() {
+        let kv_idx = h / repeats;
+        let out = sdpa_into_cb(
+            registry,
+            q_h,
+            &k_heads[kv_idx],
+            &v_heads[kv_idx],
+            mask,
+            scale,
+            cb,
         )?;
         outputs.push(out);
     }

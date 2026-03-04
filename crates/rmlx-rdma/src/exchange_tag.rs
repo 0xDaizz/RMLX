@@ -62,22 +62,22 @@ pub fn encode_wr_id(seq: u64, tag: ExchangeTag, buf_slot: u8, peer_id: u8) -> u6
 
 /// Decode a 64-bit wr_id into its constituent fields.
 ///
-/// # Panics
-/// Panics if the tag byte does not correspond to a valid `ExchangeTag`.
-/// Use `try_decode_wr_id` for a non-panicking variant.
-pub fn decode_wr_id(wr_id: u64) -> WrIdFields {
+/// Returns an error if the tag byte does not correspond to a valid `ExchangeTag`.
+/// See also `try_decode_wr_id` for an `Option`-based variant.
+pub fn decode_wr_id(wr_id: u64) -> Result<WrIdFields, crate::RdmaError> {
     let seq = (wr_id >> SEQ_SHIFT) & 0xFF_FFFF_FFFF;
     let tag_raw = ((wr_id >> TAG_SHIFT) & BYTE_MASK) as u8;
     let buf_slot = ((wr_id >> SLOT_SHIFT) & BYTE_MASK) as u8;
     let peer_id = (wr_id & BYTE_MASK) as u8;
-    let tag = ExchangeTag::from_u8(tag_raw)
-        .unwrap_or_else(|| panic!("invalid ExchangeTag value: {tag_raw}"));
-    WrIdFields {
+    let tag = ExchangeTag::from_u8(tag_raw).ok_or_else(|| {
+        crate::RdmaError::InvalidArgument(format!("invalid ExchangeTag value: {tag_raw}"))
+    })?;
+    Ok(WrIdFields {
         seq,
         tag,
         buf_slot,
         peer_id,
-    }
+    })
 }
 
 /// Try to decode a 64-bit wr_id. Returns `None` if the tag byte is invalid.
@@ -102,7 +102,7 @@ mod tests {
     #[test]
     fn roundtrip_basic() {
         let wr_id = encode_wr_id(42, ExchangeTag::Data, 1, 7);
-        let fields = decode_wr_id(wr_id);
+        let fields = decode_wr_id(wr_id).unwrap();
         assert_eq!(fields.seq, 42);
         assert_eq!(fields.tag, ExchangeTag::Data);
         assert_eq!(fields.buf_slot, 1);
@@ -125,7 +125,7 @@ mod tests {
             let slot = (i as u8) % 4;
             let peer = 255 - i as u8;
             let wr_id = encode_wr_id(seq, tag, slot, peer);
-            let fields = decode_wr_id(wr_id);
+            let fields = decode_wr_id(wr_id).unwrap();
             assert_eq!(fields.seq, seq, "seq mismatch for tag {:?}", tag);
             assert_eq!(fields.tag, tag, "tag mismatch");
             assert_eq!(fields.buf_slot, slot, "buf_slot mismatch for tag {:?}", tag);
@@ -137,7 +137,7 @@ mod tests {
     fn roundtrip_max_seq() {
         let max_seq: u64 = 0xFF_FFFF_FFFF; // 40-bit max
         let wr_id = encode_wr_id(max_seq, ExchangeTag::MoeCombineWeights, 255, 255);
-        let fields = decode_wr_id(wr_id);
+        let fields = decode_wr_id(wr_id).unwrap();
         assert_eq!(fields.seq, max_seq);
         assert_eq!(fields.tag, ExchangeTag::MoeCombineWeights);
         assert_eq!(fields.buf_slot, 255);
@@ -149,7 +149,7 @@ mod tests {
         // Bits above 40 should be masked off
         let over_seq: u64 = 0x0100_0000_0001; // bit 40 set + bit 0
         let wr_id = encode_wr_id(over_seq, ExchangeTag::Data, 0, 0);
-        let fields = decode_wr_id(wr_id);
+        let fields = decode_wr_id(wr_id).unwrap();
         assert_eq!(fields.seq, 1); // only lower 40 bits kept
     }
 

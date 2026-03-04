@@ -138,11 +138,17 @@ impl GgufWeightMap {
     ) -> Result<&Array, GgufLoadError> {
         let array = self.get(name)?;
         if array.shape() != expected_shape {
-            let info = self.tensor_info.get(name).unwrap();
+            // tensor_info should always have an entry if tensors does, but
+            // fall back gracefully to avoid panicking on an internal invariant.
+            let found = self
+                .tensor_info
+                .get(name)
+                .map(|info| info.shape.clone())
+                .unwrap_or_else(|| array.shape().iter().map(|&d| d as u64).collect());
             return Err(GgufLoadError::ShapeMismatch {
                 tensor_name: name.to_string(),
                 expected: expected_shape.to_vec(),
-                found: info.shape.clone(),
+                found,
             });
         }
         Ok(array)

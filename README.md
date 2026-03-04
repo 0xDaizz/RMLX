@@ -1,6 +1,6 @@
 # RMLX
 
-**Rust ML runtime for Apple Silicon -- zero-copy GPU inference with 16.15x CPU-minimal speedup**
+**Rust ML runtime for Apple Silicon -- zero-copy GPU inference with 17.4x CPU-minimal speedup**
 
 [![CI](https://github.com/0xDaizz/RMLX/actions/workflows/ci.yml/badge.svg)](https://github.com/0xDaizz/RMLX/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -12,7 +12,7 @@
 
 ---
 
-RMLX reimplements the core Metal GPU compute pipeline of Apple's [MLX](https://github.com/ml-explore/mlx) framework **entirely in Rust**. The ExecGraph pipeline batches 65 command buffers down to 5 per transformer layer, achieving a **16.15x speedup** (110.4ms to 6.8ms) with full numerical parity (max\_diff=6.4e-6). A full-crate audit (Phases 0, 1, 2) has been completed with 76 remediation items resolved across all 6 crates.
+RMLX reimplements the core Metal GPU compute pipeline of Apple's [MLX](https://github.com/ml-explore/mlx) framework **entirely in Rust**. The ExecGraph pipeline batches 65 command buffers down to 5 per transformer layer, achieving a **17.4x speedup** (~112ms to ~6.4ms) with full numerical parity (max\_diff=6.4e-6). A full-crate audit (Phases 0, 1, 2) has been completed with 76 remediation items resolved across all 6 crates.
 
 ## ✨ Why RMLX?
 
@@ -38,7 +38,7 @@ Measured on Apple Silicon, single transformer layer, Phase 9B-opt complete:
 
 | Metric | Baseline | ExecGraph | Improvement |
 |--------|----------|-----------|-------------|
-| Latency / layer | 110.4 ms | 6.8 ms | **16.15x** speedup |
+| Latency / layer | ~112 ms | ~6.4 ms | **17.4x** speedup |
 | Command buffers / layer | 65 | 5 | 92.3% reduction |
 | CPU-GPU syncs | ~65 | ~1 | 98.5% reduction |
 | Numerical parity | -- | -- | max\_diff=6.4e-6 |

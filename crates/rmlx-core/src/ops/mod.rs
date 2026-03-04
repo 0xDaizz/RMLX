@@ -6,6 +6,7 @@ pub mod conv;
 pub mod conv_tiled;
 pub mod copy;
 pub mod fp8;
+pub mod fused;
 pub mod gather_mm;
 pub mod gelu;
 pub mod gemv;
@@ -24,12 +25,34 @@ pub mod softmax;
 pub mod unary;
 pub mod vjp_gpu;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::array::Array;
 use crate::kernels::{KernelError, KernelRegistry};
+
+// ---------------------------------------------------------------------------
+// Global CB count instrumentation
+// ---------------------------------------------------------------------------
+
+/// Global counter for command buffers committed by individual ops.
+static TOTAL_OP_CBS: AtomicU64 = AtomicU64::new(0);
+
+/// Returns the total number of op-level command buffers committed since last reset.
+pub fn total_op_cbs() -> u64 {
+    TOTAL_OP_CBS.load(Ordering::Relaxed)
+}
+
+/// Resets the op-level CB counter to zero.
+pub fn reset_op_cbs() {
+    TOTAL_OP_CBS.store(0, Ordering::Relaxed)
+}
+
+/// Increment the op-level CB counter by 1.
+pub(crate) fn increment_op_cbs() {
+    TOTAL_OP_CBS.fetch_add(1, Ordering::Relaxed);
+}
 
 /// Safely convert `usize` to `u32`, returning `KernelError::InvalidShape` on overflow.
 pub(crate) fn checked_u32(val: usize, name: &str) -> Result<u32, KernelError> {
@@ -139,6 +162,7 @@ pub fn commit_with_mode(
     mode: ExecMode,
 ) -> Option<CommandBufferHandle> {
     cb.commit();
+    increment_op_cbs();
     match mode {
         ExecMode::Sync => {
             cb.wait_until_completed();
