@@ -79,12 +79,15 @@ def _build_slots(hosts: List[str], repeat: int) -> List[Slot]:
     return slots
 
 
-def _remote_command(base_cmd: str, slot: Slot, backend: str, extra_env: Dict[str, str]) -> str:
+def _remote_command(
+    base_cmd: str, slot: Slot, backend: str, coordinator: str, extra_env: Dict[str, str]
+) -> str:
     env = {
         "RMLX_RANK": str(slot.rank),
         "RMLX_WORLD_SIZE": str(slot.world_size),
         "RMLX_LOCAL_SLOT": str(slot.local_slot),
         "RMLX_BACKEND": backend,
+        "RMLX_COORDINATOR": coordinator,
     }
     env.update(extra_env)
     exports = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
@@ -167,13 +170,14 @@ def main() -> int:
         return 2
 
     slots = _build_slots(hosts, args.repeat_hosts)
+    coordinator = hosts[0]
     outq: Queue[Tuple[Slot, str]] = Queue()
     procs: List[Tuple[Slot, subprocess.Popen[str]]] = []
     threads: List[threading.Thread] = []
 
     try:
         for slot in slots:
-            slot_cmd = _remote_command(base_cmd, slot, args.backend, extra_env)
+            slot_cmd = _remote_command(base_cmd, slot, args.backend, coordinator, extra_env)
             proc = _spawn_for_slot(slot, slot_cmd, args.ssh_user)
             procs.append((slot, proc))
             t = threading.Thread(target=_reader_thread, args=(slot, proc, outq), daemon=True)

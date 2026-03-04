@@ -7,9 +7,10 @@ license.workspace = true
 
 [features]
 ## Enable Metal 3 residency set management (M3+ devices).
-## Stub implementation until the `metal` crate exposes MTLResidencySet bindings.
-metal3 = []
+## Uses objc msg_send! to call MTLResidencySet APIs directly.
+metal3 = ["dep:objc"]
 
 [dependencies]
 rmlx-metal = { path = "../rmlx-metal" }
 libc = { workspace = true }
+objc = { workspace = true, optional = true }

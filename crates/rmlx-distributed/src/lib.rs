@@ -5,6 +5,7 @@
 pub mod credit_manager;
 pub mod ep_runtime;
 pub mod group;
+pub mod init;
 pub mod metrics;
 pub mod moe_exchange;
 pub mod moe_policy;
@@ -18,6 +19,7 @@ pub mod warmup;
 pub use credit_manager::CreditManager;
 pub use ep_runtime::EpRuntimeContext;
 pub use group::{DistributedError, Group, RdmaTransport, ReduceDtype, ReduceOp};
+pub use init::{init, BackendHint, DistributedContext, InitConfig};
 pub use metrics::{MoeMetrics as MoeMetricsAtomic, MoeMetricsSnapshot};
 pub use moe_exchange::{
     AsyncCombineHandle, AsyncDispatchResult, DispatchLayout, DispatchResult, MoeCombineExchange,

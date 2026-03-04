@@ -4,9 +4,10 @@
 //! Supports Metal function constants for type specialization.
 
 use std::collections::HashMap;
+use std::ffi::c_void;
 use std::sync::RwLock;
 
-use metal::CompileOptions;
+use metal::{CompileOptions, FunctionConstantValues, MTLDataType};
 
 use rmlx_metal::device::GpuDevice;
 
@@ -21,6 +22,8 @@ pub enum KernelError {
     CompilationFailed(String),
     /// Pipeline creation failed.
     PipelineFailed(String),
+    /// Function constant specialization failed (e.g., wrong constant index or type).
+    Specialization(String),
     /// Invalid shape for the operation.
     InvalidShape(String),
     /// Internal error (e.g., lock poisoned).
@@ -33,6 +36,9 @@ impl std::fmt::Display for KernelError {
             KernelError::NotFound(name) => write!(f, "kernel not found: {name}"),
             KernelError::CompilationFailed(e) => write!(f, "shader compilation failed: {e}"),
             KernelError::PipelineFailed(e) => write!(f, "pipeline creation failed: {e}"),
+            KernelError::Specialization(e) => {
+                write!(f, "function constant specialization failed: {e}")
+            }
             KernelError::InvalidShape(e) => write!(f, "invalid shape: {e}"),
             KernelError::Internal(e) => write!(f, "internal error: {e}"),
         }
@@ -85,19 +91,6 @@ pub struct KernelRegistry {
 }
 
 impl KernelRegistry {
-    /// Placeholder for C15 follow-up work.
-    ///
-    /// We keep this as a `todo!()` to make sure callers do not accidentally
-    /// assume constants are currently applied through Metal function-constant
-    /// APIs. Use `register_specialized_source` until this is implemented.
-    #[inline(always)]
-    fn todo_function_constant_specialization() -> ! {
-        todo!(
-            "TODO(C15): Apply function constants via Metal API \
-             (MTLFunctionConstantValues / specialized function descriptors)"
-        )
-    }
-
     /// Create a new registry. Tries to load AOT metallib from `METALLIB_PATH`.
     pub fn new(device: GpuDevice) -> Self {
         let metallib_path = crate::METALLIB_PATH;
@@ -192,18 +185,92 @@ impl KernelRegistry {
         Ok(pipeline)
     }
 
+    /// Look up a kernel function from AOT or JIT libraries, applying function
+    /// constants if provided.
+    ///
+    /// When `fcv` is `Some(...)`, this method distinguishes between:
+    /// - The kernel name not existing in any library -> `KernelError::NotFound`
+    /// - The kernel existing but constant specialization failing (wrong index,
+    ///   wrong type, etc.) -> `KernelError::Specialization` with the Metal error
+    ///
+    /// This avoids the bug where `.ok()` on `get_function` collapses real
+    /// specialization errors into a misleading "not found" message.
+    fn lookup_function_with_constants(
+        &self,
+        kernel_name: &str,
+        fcv: Option<FunctionConstantValues>,
+        dtype: DType,
+    ) -> Result<metal::Function, KernelError> {
+        // Helper: try to get a specialized function from a single library.
+        // Returns Ok(function) on success, Err(Some(metal_error)) if the
+        // function exists but specialization failed, or Err(None) if the
+        // function simply doesn't exist in this library.
+        let try_library = |lib: &metal::Library,
+                           fcv: Option<FunctionConstantValues>|
+         -> Result<metal::Function, Option<String>> {
+            match fcv {
+                None => lib.get_function(kernel_name, None).map_err(|_| None),
+                Some(constants) => {
+                    // First, check whether the function name exists at all
+                    // (plain lookup without constants — cheap, no NSError path).
+                    if lib.get_function(kernel_name, None).is_err() {
+                        return Err(None); // not in this library
+                    }
+                    // The function exists; now apply constants. Any error here
+                    // is a real specialization failure from Metal.
+                    lib.get_function(kernel_name, Some(constants)).map_err(Some)
+                }
+            }
+        };
+
+        // Try AOT library first.
+        if let Some(aot) = self.aot_lib.as_ref() {
+            match try_library(aot, fcv.clone()) {
+                Ok(f) => return Ok(f),
+                Err(Some(metal_err)) => {
+                    return Err(KernelError::Specialization(format!(
+                        "{kernel_name}: {metal_err}"
+                    )));
+                }
+                Err(None) => { /* not in AOT, try JIT */ }
+            }
+        }
+
+        // Try JIT cache.
+        let jit = self
+            .jit_cache
+            .read()
+            .map_err(|_| KernelError::Internal("JIT cache lock poisoned".into()))?;
+
+        for lib in jit.values() {
+            match try_library(lib, fcv.clone()) {
+                Ok(f) => return Ok(f),
+                Err(Some(metal_err)) => {
+                    return Err(KernelError::Specialization(format!(
+                        "{kernel_name}: {metal_err}"
+                    )));
+                }
+                Err(None) => continue,
+            }
+        }
+
+        Err(KernelError::NotFound(format!(
+            "{kernel_name} (dtype={dtype}): not in AOT or JIT cache"
+        )))
+    }
+
     /// Get or create a compute pipeline with function constant specialization.
     ///
-    /// Function constants would allow specializing a single compiled kernel for
+    /// Function constants allow specializing a single compiled kernel for
     /// different types, layouts, or modes without recompilation. Intended uses:
     /// - `traditional` (bool) in RoPE
     /// - `forward` (bool) in RoPE
     /// - `has_w` (bool) in RMS norm
     /// - Type selection constants
     ///
-    /// Current behavior: constants are only part of the pipeline cache key.
-    /// They are **not** passed to Metal API function-constant specialization.
-    /// For real specialization today, use `register_specialized_source`.
+    /// When `constants` is non-empty, builds `MTLFunctionConstantValues`, applies
+    /// them via `library.get_function(name, Some(fcv))`, and creates a specialized
+    /// pipeline. When empty, falls back to the plain function lookup.
     pub fn get_pipeline_with_constants(
         &self,
         kernel_name: &str,
@@ -227,50 +294,58 @@ impl KernelRegistry {
             }
         }
 
-        // 2. Find the function (AOT then JIT)
-        let function_name = kernel_name;
-        let base_function = self
-            .aot_lib
-            .as_ref()
-            .and_then(|lib| lib.get_function(function_name, None).ok());
-
-        let base_function = match base_function {
-            Some(f) => f,
-            None => {
-                let jit = self
-                    .jit_cache
-                    .read()
-                    .map_err(|_| KernelError::Internal("JIT cache lock poisoned".into()))?;
-                let jit_fn = jit
-                    .values()
-                    .find_map(|lib| lib.get_function(function_name, None).ok());
-                match jit_fn {
-                    Some(f) => f,
-                    None => {
-                        return Err(KernelError::NotFound(format!(
-                            "{kernel_name} (dtype={dtype}): not in AOT or JIT cache"
-                        )));
+        // 2. Build FunctionConstantValues if needed
+        let fcv = if constants.is_empty() {
+            None
+        } else {
+            let values = FunctionConstantValues::new();
+            for (index, constant) in constants {
+                match constant {
+                    FunctionConstantValue::Bool(v) => {
+                        let val: u8 = u8::from(*v);
+                        values.set_constant_value_at_index(
+                            &val as *const u8 as *const c_void,
+                            MTLDataType::Bool,
+                            *index as u64,
+                        );
+                    }
+                    FunctionConstantValue::U32(v) => {
+                        values.set_constant_value_at_index(
+                            v as *const u32 as *const c_void,
+                            MTLDataType::UInt,
+                            *index as u64,
+                        );
+                    }
+                    FunctionConstantValue::F32(v) => {
+                        values.set_constant_value_at_index(
+                            v as *const f32 as *const c_void,
+                            MTLDataType::Float,
+                            *index as u64,
+                        );
                     }
                 }
             }
+            Some(values)
         };
 
-        // 3. Create pipeline.
+        // 3. Find the function from library (AOT then JIT), applying constants.
         //
-        // NOTE: constants are not currently applied to Metal function constants.
-        // Fail fast for non-empty constants so this does not look silently
-        // supported. Real specialization is available via
-        // `register_specialized_source`.
-        if !constants.is_empty() {
-            Self::todo_function_constant_specialization();
-        }
+        // When function constants are provided, we must distinguish between
+        // "kernel not found" (name doesn't exist in the library) and
+        // "specialization failed" (name exists but constants are invalid).
+        // Metal's `newFunctionWithName:constantValues:error:` returns an
+        // NSError for both cases, so we probe with a plain lookup first to
+        // determine whether the function exists, then apply constants.
+        let function = self.lookup_function_with_constants(kernel_name, fcv, dtype)?;
+
+        // 4. Create pipeline from the (possibly specialized) function
         let pipeline = self
             .device
             .raw()
-            .new_compute_pipeline_state_with_function(&base_function)
+            .new_compute_pipeline_state_with_function(&function)
             .map_err(|e| KernelError::PipelineFailed(e.to_string()))?;
 
-        // 4. Cache it (write lock)
+        // 5. Cache it (write lock)
         {
             let mut cache = self
                 .pipelines
@@ -430,5 +505,191 @@ impl KernelRegistry {
             .map_err(|_| KernelError::Internal("pipeline cache lock poisoned".into()))?;
         cache.clear();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use metal::foreign_types::ForeignType;
+
+    /// A minimal Metal shader with a function constant.
+    ///
+    /// `constant bool IS_FORWARD [[function_constant(0)]];`
+    /// The kernel body branches on `IS_FORWARD` so the compiler can specialize.
+    const SHADER_WITH_CONSTANT: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant bool IS_FORWARD [[function_constant(0)]];
+
+kernel void test_fc_kernel(
+    device float* out [[buffer(0)]],
+    uint tid [[thread_position_in_grid]])
+{
+    out[tid] = IS_FORWARD ? 1.0f : -1.0f;
+}
+"#;
+
+    /// A plain shader without function constants (for plain-path tests).
+    const SHADER_PLAIN: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void test_plain_kernel(
+    device float* out [[buffer(0)]],
+    uint tid [[thread_position_in_grid]])
+{
+    out[tid] = 42.0f;
+}
+"#;
+
+    /// Helper: create a GpuDevice, returning None if Metal is unavailable.
+    fn try_gpu_device() -> Option<GpuDevice> {
+        GpuDevice::system_default().ok()
+    }
+
+    #[test]
+    fn test_function_constants_pipeline() {
+        let device = match try_gpu_device() {
+            Some(d) => d,
+            None => {
+                eprintln!("skipping test_function_constants_pipeline: no Metal device");
+                return;
+            }
+        };
+
+        let registry = KernelRegistry::new(device);
+
+        // Register a shader that uses function_constant(0).
+        registry
+            .register_jit_source("test_fc", SHADER_WITH_CONSTANT)
+            .expect("should compile shader with function constant");
+
+        // 1. Specialized with IS_FORWARD = true (index 0, bool).
+        let constants_true = vec![(0u32, FunctionConstantValue::Bool(true))];
+        let specialized_true = registry
+            .get_pipeline_with_constants("test_fc_kernel", DType::Float32, &constants_true)
+            .expect("specialized pipeline (true) should succeed");
+
+        // 2. Specialized with IS_FORWARD = false (index 0, bool).
+        let constants_false = vec![(0u32, FunctionConstantValue::Bool(false))];
+        let specialized_false = registry
+            .get_pipeline_with_constants("test_fc_kernel", DType::Float32, &constants_false)
+            .expect("specialized pipeline (false) should succeed");
+
+        // 3. The two specialized pipelines should be distinct objects.
+        //    (Different constant values -> different compiled functions.)
+        assert_ne!(
+            specialized_true.as_ptr(),
+            specialized_false.as_ptr(),
+            "pipelines with different constants should be distinct"
+        );
+
+        // 4. Hitting the cache: second lookup with same constants should return
+        //    the cached pipeline (same pointer).
+        let cached = registry
+            .get_pipeline_with_constants("test_fc_kernel", DType::Float32, &constants_true)
+            .expect("cached pipeline lookup should succeed");
+        assert_eq!(
+            specialized_true.as_ptr(),
+            cached.as_ptr(),
+            "second lookup should return cached pipeline"
+        );
+
+        // 5. Pipeline cache should contain 2 entries (two distinct specializations).
+        let count = registry
+            .cached_pipeline_count()
+            .expect("should read pipeline count");
+        assert_eq!(count, 2, "expected 2 cached pipelines");
+    }
+
+    #[test]
+    fn test_function_constants_empty_delegates_to_plain() {
+        let device = match try_gpu_device() {
+            Some(d) => d,
+            None => {
+                eprintln!(
+                    "skipping test_function_constants_empty_delegates_to_plain: no Metal device"
+                );
+                return;
+            }
+        };
+
+        let registry = KernelRegistry::new(device);
+        registry
+            .register_jit_source("test_plain", SHADER_PLAIN)
+            .expect("should compile plain shader");
+
+        // Empty constants should behave identically to get_pipeline.
+        let via_constants = registry
+            .get_pipeline_with_constants("test_plain_kernel", DType::Float32, &[])
+            .expect("empty-constants pipeline should succeed");
+
+        let via_plain = registry
+            .get_pipeline("test_plain_kernel", DType::Float32)
+            .expect("plain pipeline should succeed");
+
+        // Both should produce the same cached pipeline since the key is identical.
+        assert_eq!(
+            via_constants.as_ptr(),
+            via_plain.as_ptr(),
+            "empty constants should produce the same cached pipeline as plain"
+        );
+    }
+
+    #[test]
+    fn test_function_constants_not_found() {
+        let device = match try_gpu_device() {
+            Some(d) => d,
+            None => {
+                eprintln!("skipping test_function_constants_not_found: no Metal device");
+                return;
+            }
+        };
+
+        let registry = KernelRegistry::new(device);
+
+        // Lookup a kernel that does not exist -- should return NotFound.
+        let result = registry.get_pipeline_with_constants(
+            "nonexistent_kernel",
+            DType::Float32,
+            &[(0, FunctionConstantValue::Bool(true))],
+        );
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            KernelError::NotFound(msg) => {
+                assert!(
+                    msg.contains("nonexistent_kernel"),
+                    "error should mention kernel name: {msg}"
+                );
+            }
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_kernel_error_specialization() {
+        // 1. Create the error variant.
+        let err = KernelError::Specialization("test error".to_string());
+
+        // 2. Verify Display output contains expected substrings.
+        let display = format!("{err}");
+        assert!(
+            display.contains("specialization"),
+            "Display should contain 'specialization', got: {display}"
+        );
+        assert!(
+            display.contains("test error"),
+            "Display should contain 'test error', got: {display}"
+        );
+
+        // 3. Pattern-match the variant to confirm the inner message.
+        match err {
+            KernelError::Specialization(msg) => {
+                assert_eq!(msg, "test error");
+            }
+            other => panic!("expected Specialization, got {other:?}"),
+        }
     }
 }
