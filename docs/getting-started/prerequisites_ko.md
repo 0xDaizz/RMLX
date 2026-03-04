@@ -37,7 +37,7 @@ RMLX는 `mlx.distributed_config`, `mlx.launch`를 벤치마킹한
 
 ```bash
 # 1) 호스트파일 생성 + 기본 호스트 셋업 (컨트롤 노드에서 실행)
-python3 scripts/rmlx_distributed_config.py \
+rmlx config \
   --hosts node1,node2 \
   --backend rdma \
   --over thunderbolt \
@@ -47,13 +47,13 @@ python3 scripts/rmlx_distributed_config.py \
   --verbose
 
 # 2) 각 노드 RDMA 디바이스 가시성 검증
-python3 scripts/rmlx_launch.py \
+rmlx launch \
   --backend rdma \
   --hostfile rmlx-hosts.json \
   -- ibv_devices
 
 # 3) 양 노드에서 RDMA 크레이트 테스트 실행
-python3 scripts/rmlx_launch.py \
+rmlx launch \
   --backend rdma \
   --hostfile rmlx-hosts.json \
   -- cargo test -p rmlx-rdma -- --nocapture

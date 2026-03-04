@@ -1,0 +1,16 @@
+[package]
+name = "rmlx-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "CLI tooling for distributed RMLX launches and host configuration"
+
+[[bin]]
+name = "rmlx"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true

@@ -145,7 +145,7 @@ For multi-node environments, run this minimal sequence from the control node:
 
 ```bash
 # Generate hostfile and apply baseline host setup
-python3 scripts/rmlx_distributed_config.py \
+rmlx config \
   --hosts node1,node2 \
   --backend rdma \
   --over thunderbolt \
@@ -155,13 +155,13 @@ python3 scripts/rmlx_distributed_config.py \
   --verbose
 
 # Verify RDMA device visibility
-python3 scripts/rmlx_launch.py \
+rmlx launch \
   --backend rdma \
   --hostfile rmlx-hosts.json \
   -- ibv_devices
 
 # Run RDMA crate tests on both nodes
-python3 scripts/rmlx_launch.py \
+rmlx launch \
   --backend rdma \
   --hostfile rmlx-hosts.json \
   -- cargo test -p rmlx-rdma -- --nocapture

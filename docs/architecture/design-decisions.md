@@ -23,7 +23,7 @@ MLX is written in C++, but RMLX chose Rust.
 
 A GPU inference engine inevitably requires `unsafe` blocks (Metal FFI, RDMA FFI), but Rust's ownership system can **explicitly isolate** `unsafe` boundaries. Safe code (the `ZeroCopyBuffer` public API) and unsafe code (`posix_memalign`, `ibv_post_send` call sites) are distinguished at the type system level, maintaining the same performance as C++ while being safer.
 
-Additionally, the Cargo workspace manages dependencies, versions, and build settings for 6 crates through a single `Cargo.toml`. This is significantly less complex than a CMake + setuptools combination.
+Additionally, the Cargo workspace manages dependencies, versions, and build settings for 7 crates through a single `Cargo.toml`. This is significantly less complex than a CMake + setuptools combination.
 
 ---
 
