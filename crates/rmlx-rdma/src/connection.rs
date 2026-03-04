@@ -250,6 +250,38 @@ pub struct RdmaConnection {
 }
 
 impl RdmaConnection {
+    /// Construct an `RdmaConnection` from pre-built components.
+    ///
+    /// This bypasses the integrated TCP exchange used by [`establish`] and is
+    /// intended for initialization flows that perform QP info exchange through
+    /// a separate mechanism (e.g., coordinator-mediated `all_gather`).
+    ///
+    /// The caller is responsible for:
+    /// 1. Opening the RDMA device and allocating PD / CQ / QP
+    /// 2. Querying local QP info (`qp.query_local_info`)
+    /// 3. Exchanging QP info with the remote peer (via coordinator, etc.)
+    /// 4. Connecting the QP (`qp.connect(&remote_info)`)
+    ///
+    /// If the QP is intentionally left unconnected (e.g., a placeholder for the
+    /// self-rank slot), the caller may skip steps 3-4.
+    pub fn from_parts(
+        ctx: RdmaContext,
+        pd: ProtectionDomain,
+        cq: CompletionQueue,
+        qp: QueuePair,
+        config: RdmaConfig,
+    ) -> Self {
+        Self {
+            ctx,
+            pd,
+            cq,
+            qp,
+            config,
+            completion_backlog: Mutex::new(Vec::new()),
+            mr_pool: None,
+        }
+    }
+
     /// Open device, create QP, exchange info with peer, and connect.
     ///
     /// This is the main entry point for establishing an RDMA connection:

@@ -7,6 +7,7 @@ pub mod connection;
 pub mod connection_manager;
 pub mod context;
 pub mod coordinator;
+pub mod device_file;
 pub mod exchange;
 pub mod exchange_tag;
 pub mod ffi;
@@ -31,6 +32,7 @@ pub use connection::{
 pub use connection_manager::ConnectionManager;
 pub use context::{ProtectionDomain, RdmaContext, RdmaDeviceProbe};
 pub use coordinator::{all_gather_bytes, all_gather_qp_info, barrier, CoordinatorConfig};
+pub use device_file::DeviceMap;
 pub use exchange::ExchangeConfig;
 pub use exchange_tag::{ExchangeTag, WrIdFields};
 pub use gpu_doorbell::{
