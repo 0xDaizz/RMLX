@@ -4,7 +4,7 @@
 
 `rmlx-distributed` is a crate providing communication groups, MoE (Mixture of Experts) dispatch/combine exchange, 3-zone backend policy, compute-RDMA pipeline overlap, overflow monitoring (SparseGuard), variable-length EP packet protocol, FP8 exchange path, RDMA slab-ring transport, distributed initialization, warmup protocol, and MoE metrics for distributed inference.
 
-> **Status:** All modules are implemented: group, init, moe_exchange, moe_policy, pipeline, sparse_guard, warmup, metrics, v3_protocol, fp8_exchange, slab_ring. Phase 0+1+2 audit remediation complete (items D1-D10): dispatch loop ordering fixed (k-outer), per-rank capacity partitioning, combine kernel caching, byte threshold (4KB->2MB), hysteresis path fix, dual cooldown semantics, shared expert support, EP integration improvements. EP-3/EP-5/EP-6 optimization additions complete.
+> **Status:** All modules are implemented: group, init, moe_exchange, moe_policy, pipeline, sparse_guard, warmup, metrics, v3_protocol, fp8_exchange, slab_ring. Phase 0+1+2 audit remediation complete (items D1-D10): dispatch loop ordering fixed (k-outer), per-rank capacity partitioning, combine kernel caching, byte threshold (4KB->2MB), hysteresis path fix, dual cooldown semantics, shared expert support, EP integration improvements. EP-3/EP-5/EP-6 optimization additions complete. EP-2~EP-6 forward path integration: `MoeDispatchConfig::new()` constructor, `dispatch_fp8()` convenience method, `WireProtocol::V3` support in all dispatch paths, SlabRing integration in `route_rdma`, FP8 wire helpers (`pack_for_wire`, `unpack_from_wire`, `wire_token_stride`).
 
 ---
 
@@ -33,8 +33,20 @@ rmlx-distributed/src/
 | Module | Highlights |
 |--------|------------|
 | `v3_protocol.rs` | Variable-length two-phase exchange (count sendrecv + payload sendrecv), packed 4-byte `PacketMeta` header, 16-byte packet alignment |
-| `fp8_exchange.rs` | Per-token FP8 E4M3 wire format, fused `dequant_scatter_fp8e4m3` decode path with `_into_cb` support |
-| `slab_ring.rs` | Pre-registered `MTLBuffer` slab ring for zero-copy RDMA producer/consumer flow synchronized via `GpuEvent` timeline |
+| `fp8_exchange.rs` | Per-token FP8 E4M3 wire format, fused `dequant_scatter_fp8e4m3` decode path with `_into_cb` support, wire helpers (`pack_for_wire`, `unpack_from_wire`, `wire_token_stride`) |
+| `slab_ring.rs` | Pre-registered `MTLBuffer` slab ring for zero-copy RDMA producer/consumer flow synchronized via `GpuEvent` timeline; integrated into `route_rdma` for pre-allocated `local_output` buffers |
+
+### fp8_exchange Wire Helpers
+
+The following helper functions in `fp8_exchange.rs` support FP8 wire serialization for dispatch paths:
+
+| Function | Description |
+|----------|-------------|
+| `pack_for_wire(tokens, scales) -> Vec<u8>` | Packs FP8 E4M3 quantized tokens and their per-token scales into a contiguous wire-format byte buffer suitable for RDMA transfer |
+| `unpack_from_wire(wire_bytes, num_tokens, hidden_dim) -> (Vec<u8>, Vec<f32>)` | Unpacks a wire-format buffer back into separate FP8 token data and scale arrays |
+| `wire_token_stride(hidden_dim) -> usize` | Returns the per-token byte stride on the wire (FP8 data bytes + scale bytes), used for buffer pre-allocation and offset calculations |
+
+These helpers are used internally by `dispatch_fp8()` and the RDMA exchange paths when `enable_fp8 = true` in `MoeDispatchConfig`.
 
 ---
 
@@ -79,7 +91,7 @@ Both methods return the input unchanged for single-rank groups (identity).
 
 ### MoeDispatchExchange
 
-Dispatch exchange that routes tokens to experts.
+Dispatch exchange that routes tokens to experts. Supports `WireProtocol::V3` and FP8 exchange in all dispatch paths (EP-2~EP-6 forward path integration).
 
 ```rust
 pub struct MoeDispatchConfig {
@@ -87,6 +99,8 @@ pub struct MoeDispatchConfig {
     pub top_k: usize,
     pub capacity_factor: f32,   // 1.0 = exact, >1.0 = overprovisioning
     pub group: Group,
+    pub wire_protocol: WireProtocol, // V2 (default) or V3
+    pub enable_fp8: bool,            // FP8 quantization for RDMA exchange
 }
 
 pub struct MoeDispatchExchange {
@@ -96,13 +110,32 @@ pub struct MoeDispatchExchange {
 }
 ```
 
+#### MoeDispatchConfig::new()
+
+```rust
+impl MoeDispatchConfig {
+    pub fn new(num_experts: usize, top_k: usize, group: Group) -> Self;
+}
+```
+
+Convenience constructor with non-breaking defaults: `capacity_factor = 1.0`, `wire_protocol = WireProtocol::V2`, `enable_fp8 = false`. This is the recommended entry point for creating a dispatch config -- callers can then chain builder-style setters for optional fields.
+
 | Method | Description |
 |--------|-------------|
 | `new(config, policy)` | Creates a dispatch exchange (initializes `MoeMetrics::with_experts(num_experts)`) |
 | `dispatch(batch_size, expert_indices, expert_weights)` | Dispatches tokens -> `DispatchResult`; records per-expert counts to metrics |
 | `dispatch_async(...)` | Async variant of `dispatch`; records per-expert counts to metrics |
+| `dispatch_fp8(batch_size, expert_indices, expert_weights)` | FP8-aware dispatch convenience wrapper; automatically quantizes tokens to FP8 E4M3 before RDMA exchange when the config has `enable_fp8 = true`, otherwise falls back to standard `dispatch()` |
 | `metrics()` | Queries internal metrics |
 | `policy()` / `policy_mut()` | Gets/modifies the policy reference |
+
+#### WireProtocol::V3 Support
+
+All dispatch paths (`route_rdma`, `route_rdma_zero_copy`, `dispatch_async`) now support `WireProtocol::V3`. When `wire_protocol` is set to `V3`, the dispatch uses the two-phase variable-length exchange protocol from `v3_protocol.rs` (count sendrecv + payload sendrecv with packed `PacketMeta` headers and 16-byte alignment).
+
+#### SlabRing Integration in route_rdma
+
+The `route_rdma` path now integrates with `slab_ring.rs` for pre-allocated Metal buffer management. Instead of allocating a new `local_output` buffer per dispatch, the RDMA path acquires a slab from the `SlabRing` producer/consumer ring, performs the RDMA transfer into the pre-registered `MTLBuffer`, and releases it back after the combine phase. This eliminates per-dispatch allocation overhead and enables true zero-copy RDMA transfers synchronized via `GpuEvent` timeline.
 
 ### DispatchResult
 

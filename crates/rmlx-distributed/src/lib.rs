@@ -27,7 +27,7 @@ pub use init::{init, BackendHint, DistributedContext, InitConfig};
 pub use metrics::{MoeMetrics as MoeMetricsAtomic, MoeMetricsSnapshot};
 pub use moe_exchange::{
     AsyncCombineHandle, AsyncDispatchResult, DispatchLayout, DispatchResult, MoeCombineExchange,
-    MoeDispatchConfig, MoeDispatchExchange, MoeDtype,
+    MoeDispatchConfig, MoeDispatchExchange, MoeDtype, WireProtocol,
 };
 pub use moe_policy::{MoeBackend, MoePolicy, ThresholdCalibration};
 pub use perf_counters::{global_counters, PerfCounters, PerfSnapshot};
