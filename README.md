@@ -160,12 +160,6 @@ rmlx/                           # 7 crates, 543 tests
 | Implementation phases | 9 + S1-S5 (serving support) |
 | Audit items resolved | 76 (Phase 0 + 1 + 2 full-crate audit) |
 
-## ⚠️ Current Limitations
-
-- **Distributed CI is manual** -- multi-node RDMA/perf/deadlock validation runs on dedicated hardware outside GitHub Actions
-- **No Python API** -- Rust-only interface
-- **TB5 bandwidth** -- limited to 16 GB/s vs NVLink 600 GB/s
-
 ## 📚 Documentation
 
 Full documentation: **[docs/README.md](docs/README.md)**
