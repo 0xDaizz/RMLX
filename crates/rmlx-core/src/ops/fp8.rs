@@ -12,6 +12,18 @@
 //! uint8 data in the Metal buffer. The dequant functions produce `DType::Float16`
 //! output. The quant functions take `DType::Float16` input and produce FP8 output.
 //!
+//! ## Per-token scaling
+//!
+//! Per-token variants compute `scale[i] = max(abs(token[i,:])) / 448.0` per row,
+//! giving better precision than a single per-tensor scale. The 4-byte scale overhead
+//! per token is negligible compared to the bandwidth savings.
+//!
+//! ## `_into_cb` variants
+//!
+//! Functions suffixed with `_into_cb` encode GPU work into a caller-provided
+//! `CommandBufferRef` without committing. This enables batching multiple kernel
+//! dispatches into a single command buffer for reduced CPU overhead.
+//!
 //! ## Vectorisation
 //!
 //! Each thread processes 4 elements for better memory throughput.
@@ -250,11 +262,173 @@ kernel void quant_f16_to_fp8e5m2(
         output[j] = result;
     }
 }
+
+// ─── Per-token FP8 E4M3 quantization ────────────────────────────────────────
+//
+// For each token (row), compute scale = max(abs(row)) / 448.0, then quantize
+// with that scale. Scales are written to a separate buffer.
+//
+// 2D grid: tid.x = column, tid.y = token (row).
+
+kernel void quant_f16_to_fp8e4m3_per_token(
+    device const half*  input      [[buffer(0)]],  // [N, D]
+    device uchar*       output     [[buffer(1)]],  // [N, D] FP8
+    device float*       scales     [[buffer(2)]],  // [N] per-token scales
+    constant uint&      num_tokens [[buffer(3)]],
+    constant uint&      hidden_dim [[buffer(4)]],
+    uint2 tid [[thread_position_in_grid]])
+{
+    uint row = tid.y;
+    uint col = tid.x;
+    if (row >= num_tokens || col >= hidden_dim) return;
+
+    uint offset = row * hidden_dim;
+
+    // Step 1: Compute per-token max abs (only thread col==0 writes scale).
+    // Each thread finds max of its element; use atomic or let col==0 sweep.
+    // Simple approach: col==0 sweeps the entire row.
+    if (col == 0) {
+        float row_max = 0.0f;
+        for (uint d = 0; d < hidden_dim; d++) {
+            float v = abs(float(input[offset + d]));
+            row_max = max(row_max, v);
+        }
+        // Avoid division by zero: if row_max == 0, scale = 1.0
+        float scale = (row_max > 0.0f) ? (row_max / 448.0f) : 1.0f;
+        scales[row] = scale;
+    }
+
+    // Barrier: all threads in this row must see the scale.
+    threadgroup_barrier(mem_flags::mem_device);
+
+    float scale = scales[row];
+    float inv_scale = 1.0f / scale;
+
+    float val = float(input[offset + col]) * inv_scale;
+
+    // Handle NaN
+    if (isnan(val)) {
+        output[offset + col] = 0x7F;
+        return;
+    }
+
+    uint sign = val < 0.0f ? 1 : 0;
+    val = abs(val);
+    val = min(val, 448.0f);
+
+    uchar result;
+    if (val == 0.0f) {
+        result = 0;
+    } else {
+        int e = int(floor(log2(val)));
+        int biased_exp = e + 7;
+        if (biased_exp < 0) {
+            float subnormal_val = val * exp2(6.0f) * 8.0f;
+            uint mant = uint(subnormal_val + 0.5f);
+            mant = min(mant, 7u);
+            result = uchar(mant);
+        } else if (biased_exp > 14) {
+            result = uchar((14 << 3) | 7);
+        } else {
+            float frac = val * exp2(float(-e)) - 1.0f;
+            uint mant = uint(frac * 8.0f + 0.5f);
+            if (mant > 7) {
+                mant = 0;
+                biased_exp += 1;
+                if (biased_exp > 14) {
+                    result = uchar((14 << 3) | 7);
+                    result |= uchar(sign << 7);
+                    output[offset + col] = result;
+                    return;
+                }
+            }
+            result = uchar((uint(biased_exp) << 3) | mant);
+        }
+    }
+    result |= uchar(sign << 7);
+    output[offset + col] = result;
+}
+
+// ─── Per-token FP8 E4M3 dequantization ──────────────────────────────────────
+//
+// Dequantize FP8 E4M3 data back to f16 using per-token scale factors.
+//
+// 2D grid: tid.x = column, tid.y = token (row).
+
+kernel void dequant_fp8e4m3_per_token(
+    device const uchar* input      [[buffer(0)]],  // [N, D] FP8
+    device half*        output     [[buffer(1)]],  // [N, D] f16
+    device const float* scales     [[buffer(2)]],  // [N] per-token scales
+    constant uint&      num_tokens [[buffer(3)]],
+    constant uint&      hidden_dim [[buffer(4)]],
+    uint2 tid [[thread_position_in_grid]])
+{
+    uint row = tid.y;
+    uint col = tid.x;
+    if (row >= num_tokens || col >= hidden_dim) return;
+
+    uint offset = row * hidden_dim;
+    float scale = scales[row];
+
+    uchar bits = input[offset + col];
+    uint sign_bit = (bits >> 7) & 1;
+    uint exp  = (bits >> 3) & 0xF;
+    uint mant = bits & 0x7;
+
+    float val;
+    if (exp == 0 && mant == 0) {
+        val = 0.0f;
+    } else if (exp == 0) {
+        val = (mant / 8.0f) * exp2(-6.0f);
+    } else if (exp == 15 && mant == 7) {
+        val = NAN;
+    } else {
+        val = (1.0f + mant / 8.0f) * exp2(float(exp) - 7.0f);
+    }
+    if (sign_bit) val = -val;
+
+    // Re-apply scale to recover original magnitude
+    output[offset + col] = half(val * scale);
+}
 "#;
 
-/// Register FP8 kernels with the registry via JIT.
+/// Register FP8 kernels (including per-token variants) with the registry via JIT.
 pub fn register(registry: &KernelRegistry) -> Result<(), KernelError> {
     registry.register_jit_source("fp8", FP8_SHADER_SOURCE)
+}
+
+/// Validate that input is a 2D Float16 tensor and return (num_tokens, hidden_dim).
+fn validate_2d_f16(input: &Array, fn_name: &str) -> Result<(usize, usize), KernelError> {
+    if input.dtype() != DType::Float16 {
+        return Err(KernelError::InvalidShape(format!(
+            "{fn_name}: expected Float16 input, got {:?}",
+            input.dtype()
+        )));
+    }
+    if input.ndim() != 2 {
+        return Err(KernelError::InvalidShape(format!(
+            "{fn_name}: expected 2D input [N, D], got {}D",
+            input.ndim()
+        )));
+    }
+    Ok((input.shape()[0], input.shape()[1]))
+}
+
+/// Validate that input is a 2D FP8 E4M3 tensor and return (num_tokens, hidden_dim).
+fn validate_2d_fp8e4m3(input: &Array, fn_name: &str) -> Result<(usize, usize), KernelError> {
+    if input.dtype() != DType::Float8E4M3 {
+        return Err(KernelError::InvalidShape(format!(
+            "{fn_name}: expected Float8E4M3 input, got {:?}",
+            input.dtype()
+        )));
+    }
+    if input.ndim() != 2 {
+        return Err(KernelError::InvalidShape(format!(
+            "{fn_name}: expected 2D input [N, D], got {}D",
+            input.ndim()
+        )));
+    }
+    Ok((input.shape()[0], input.shape()[1]))
 }
 
 // ---------------------------------------------------------------------------
@@ -486,4 +660,186 @@ pub fn quant_f16_to_fp8e5m2(
     command_buffer.wait_until_completed();
 
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Per-token FP8 E4M3 quantization / dequantization
+// ---------------------------------------------------------------------------
+
+/// Encode per-token FP8 E4M3 quantization into a command buffer.
+///
+/// This is the core implementation shared by `quant_per_token_fp8e4m3` and
+/// `quant_per_token_fp8e4m3_into_cb`.
+fn encode_quant_per_token(
+    registry: &KernelRegistry,
+    input: &Array,
+    cb: &metal::CommandBufferRef,
+) -> Result<(Array, Array), KernelError> {
+    let (num_tokens, hidden_dim) = validate_2d_f16(input, "quant_per_token_fp8e4m3")?;
+
+    if !input.is_contiguous() {
+        return Err(KernelError::InvalidShape(
+            "quant_per_token_fp8e4m3: input must be contiguous".into(),
+        ));
+    }
+
+    let pipeline = registry.get_pipeline("quant_f16_to_fp8e4m3_per_token", DType::Float16)?;
+    let device = registry.device().raw();
+
+    let fp8_out = Array::zeros(device, input.shape(), DType::Float8E4M3);
+    let scales_out = Array::zeros(device, &[num_tokens], DType::Float32);
+    let tokens_buf = make_u32_buf(device, num_tokens as u32);
+    let dim_buf = make_u32_buf(device, hidden_dim as u32);
+
+    let encoder = cb.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
+    encoder.set_buffer(1, Some(fp8_out.metal_buffer()), fp8_out.offset() as u64);
+    encoder.set_buffer(
+        2,
+        Some(scales_out.metal_buffer()),
+        scales_out.offset() as u64,
+    );
+    encoder.set_buffer(3, Some(&tokens_buf), 0);
+    encoder.set_buffer(4, Some(&dim_buf), 0);
+
+    let grid_size = MTLSize::new(hidden_dim as u64, num_tokens as u64, 1);
+    let tg_w = std::cmp::min(
+        hidden_dim as u64,
+        pipeline.max_total_threads_per_threadgroup(),
+    );
+    let threadgroup_size = MTLSize::new(tg_w, 1, 1);
+    encoder.dispatch_threads(grid_size, threadgroup_size);
+    encoder.end_encoding();
+
+    Ok((fp8_out, scales_out))
+}
+
+/// Encode per-token FP8 E4M3 dequantization into a command buffer.
+///
+/// Core implementation shared by `dequant_per_token_fp8e4m3` and
+/// `dequant_per_token_fp8e4m3_into_cb`.
+fn encode_dequant_per_token(
+    registry: &KernelRegistry,
+    input: &Array,
+    scales: &Array,
+    cb: &metal::CommandBufferRef,
+) -> Result<Array, KernelError> {
+    let (num_tokens, hidden_dim) = validate_2d_fp8e4m3(input, "dequant_per_token_fp8e4m3")?;
+
+    if !input.is_contiguous() {
+        return Err(KernelError::InvalidShape(
+            "dequant_per_token_fp8e4m3: input must be contiguous".into(),
+        ));
+    }
+    if scales.dtype() != DType::Float32 {
+        return Err(KernelError::InvalidShape(format!(
+            "dequant_per_token_fp8e4m3: expected Float32 scales, got {:?}",
+            scales.dtype()
+        )));
+    }
+    if scales.ndim() != 1 || scales.shape()[0] != num_tokens {
+        return Err(KernelError::InvalidShape(format!(
+            "dequant_per_token_fp8e4m3: scales shape mismatch: expected [{}], got {:?}",
+            num_tokens,
+            scales.shape()
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("dequant_fp8e4m3_per_token", DType::Float8E4M3)?;
+    let device = registry.device().raw();
+
+    let out = Array::zeros(device, input.shape(), DType::Float16);
+    let tokens_buf = make_u32_buf(device, num_tokens as u32);
+    let dim_buf = make_u32_buf(device, hidden_dim as u32);
+
+    let encoder = cb.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
+    encoder.set_buffer(1, Some(out.metal_buffer()), out.offset() as u64);
+    encoder.set_buffer(2, Some(scales.metal_buffer()), scales.offset() as u64);
+    encoder.set_buffer(3, Some(&tokens_buf), 0);
+    encoder.set_buffer(4, Some(&dim_buf), 0);
+
+    let grid_size = MTLSize::new(hidden_dim as u64, num_tokens as u64, 1);
+    let tg_w = std::cmp::min(
+        hidden_dim as u64,
+        pipeline.max_total_threads_per_threadgroup(),
+    );
+    let threadgroup_size = MTLSize::new(tg_w, 1, 1);
+    encoder.dispatch_threads(grid_size, threadgroup_size);
+    encoder.end_encoding();
+
+    Ok(out)
+}
+
+/// Quantize Float16 to FP8 E4M3 with per-token scaling.
+///
+/// Each token row gets its own scale factor: `scale[i] = max(abs(token[i,:])) / 448.0`.
+/// The 4-byte scale per token is the overhead for the precision improvement.
+///
+/// - `input`: [N, D] Float16 tensor (must be contiguous).
+/// - Returns: `(fp8_output [N, D], scales [N])`.
+pub fn quant_per_token_fp8e4m3(
+    registry: &KernelRegistry,
+    input: &Array,
+    queue: &metal::CommandQueue,
+) -> Result<(Array, Array), KernelError> {
+    let command_buffer = queue.new_command_buffer();
+    let result = encode_quant_per_token(registry, input, command_buffer)?;
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    Ok(result)
+}
+
+/// Dequantize FP8 E4M3 to Float16 using per-token scales.
+///
+/// - `input`: [N, D] FP8 E4M3 tensor (must be contiguous).
+/// - `scales`: [N] per-token scale factors as Float32.
+/// - Returns: [N, D] Float16 tensor.
+pub fn dequant_per_token_fp8e4m3(
+    registry: &KernelRegistry,
+    input: &Array,
+    scales: &Array,
+    queue: &metal::CommandQueue,
+) -> Result<Array, KernelError> {
+    let command_buffer = queue.new_command_buffer();
+    let result = encode_dequant_per_token(registry, input, scales, command_buffer)?;
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    Ok(result)
+}
+
+/// Encode per-token FP8 E4M3 quantization into an existing command buffer.
+///
+/// Does not commit or wait. The caller is responsible for committing the
+/// command buffer after encoding all desired work.
+///
+/// - `input`: [N, D] Float16 tensor (must be contiguous).
+/// - `cb`: The command buffer to encode into.
+/// - Returns: `(fp8_output [N, D], scales [N])`.
+pub fn quant_per_token_fp8e4m3_into_cb(
+    registry: &KernelRegistry,
+    input: &Array,
+    cb: &metal::CommandBufferRef,
+) -> Result<(Array, Array), KernelError> {
+    encode_quant_per_token(registry, input, cb)
+}
+
+/// Encode per-token FP8 E4M3 dequantization into an existing command buffer.
+///
+/// Does not commit or wait. The caller is responsible for committing the
+/// command buffer after encoding all desired work.
+///
+/// - `input`: [N, D] FP8 E4M3 tensor (must be contiguous).
+/// - `scales`: [N] per-token scale factors as Float32.
+/// - `cb`: The command buffer to encode into.
+/// - Returns: [N, D] Float16 tensor.
+pub fn dequant_per_token_fp8e4m3_into_cb(
+    registry: &KernelRegistry,
+    input: &Array,
+    scales: &Array,
+    cb: &metal::CommandBufferRef,
+) -> Result<Array, KernelError> {
+    encode_dequant_per_token(registry, input, scales, cb)
 }
