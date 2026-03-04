@@ -4,7 +4,7 @@
 
 `rmlx-metal`은 Apple Metal GPU API에 대한 안전하고 편리한 Rust 래퍼 계층입니다. Metal 디바이스, 커맨드 큐, 버퍼, 컴퓨트 파이프라인, 셰이더 라이브러리를 추상화하여 GPU 연산을 간결하게 수행할 수 있도록 합니다.
 
-`metal-rs` 0.31 크레이트를 기반으로 하며, MLX의 Metal 추상화 구조를 참고하여 Rust 관용적 API로 재설계하였습니다. Phase 0에서 기본 래퍼가 완성되었고, 이후 이벤트 동기화(`event.rs`), 셀프 체크(`self_check.rs`), 듀얼 큐 스트림 매니저(`stream.rs`)가 추가되었습니다.
+`metal-rs` 0.31 크레이트를 기반으로 하며, MLX의 Metal 추상화 구조를 참고하여 Rust 관용적 API로 재설계하였습니다. Phase 0에서 기본 래퍼가 완성되었고, 이후 이벤트 동기화(`event.rs`), 셀프 체크(`self_check.rs`), 듀얼 큐 스트림 매니저(`stream.rs`)가 추가되었습니다. EP-6에서는 Indirect Command Buffer를 사용한 sparse expert 실행을 위해 `icb_sparse.rs`가 추가되었습니다.
 
 ---
 
@@ -25,6 +25,7 @@ graph TD
     A --> L[batcher.rs — CommandBatcher]
     A --> M[exec_graph.rs — ExecGraph]
     A --> N[icb.rs — ICB Support]
+    A --> O[icb_sparse.rs — Sparse Expert ICB]
 ```
 
 ### `lib.rs` — 최상위 Re-exports
@@ -472,6 +473,19 @@ CPU 오버헤드 없이 커맨드를 재생하기 위한 Metal Indirect Command 
 | `IcbBuilder` | 기록된 커맨드로 indirect command buffer를 빌드합니다 |
 | `IcbReplay` | 이전에 빌드된 ICB를 재생합니다 |
 | `IcbCache` | forward pass 간 재사용을 위해 빌드된 ICB를 캐시합니다 |
+
+---
+
+### `icb_sparse.rs` — Sparse Expert ICB (EP-6)
+
+EP-6에서 추가된 sparse expert 실행 전용 Indirect Command Buffer 지원입니다. 활성화된 expert 집합이 스텝마다 달라지는 MoE 추론에서 불필요한 expert 실행을 생략하는 sparse 실행 패턴을 ICB로 구현합니다.
+
+| 타입 | 설명 |
+|------|------|
+| `IcbSparseBuilder` | 활성 expert 마스크 기반 sparse ICB를 빌드합니다 |
+| `IcbSparseCache` | expert 집합별 사전 빌드된 sparse ICB를 캐시합니다 |
+
+**핵심 이점:** CPU에서 활성 expert를 선택하지 않고 GPU가 직접 sparse dispatch를 수행하여, EP-6의 zero-CPU-overhead sparse expert 실행을 가능하게 합니다.
 
 ---
 

@@ -4,7 +4,7 @@
 
 `rmlx-core`는 Metal GPU 연산 엔진으로, 데이터 타입, N차원 배열, 커널 레지스트리, GPU 연산 커널, 자동 미분, LoRA 파인튜닝, 런타임 메트릭, 구조화된 로깅, 수치 안정성 감시, 그레이스풀 셧다운 등을 제공합니다.
 
-> **상태:** DType (FP8 포함), Array, KernelRegistry, 18종의 op 모듈 (SDPA/FA2, SiLU/SwiGLU, GELU, FP8 dequant/quant, Conv1d/Conv2d 포함), GGUF 포맷 파서, AWQ/GPTQ dequant, VJP 자동 미분, LoRA, 로깅, 메트릭, PrecisionGuard, ShutdownSignal이 모두 구현되어 있습니다.
+> **상태:** DType (FP8 포함), Array, KernelRegistry, **27종의 op 모듈** (SDPA/FA2 bf16 + backward, SiLU/SwiGLU, GELU, FP8 dequant/quant + 토큰별 E4M3 와이어 커널, Conv1d/Conv2d, tiled conv, GatherMM, LayerNorm, 단항 연산, concat, select, VJP GPU 포함), GGUF 포맷 파서, AWQ/GPTQ dequant, VJP 자동 미분, LoRA, 로깅, 메트릭, PrecisionGuard, ShutdownSignal이 모두 구현되어 있습니다. Phase 0+1+2 감사 수정 완료 (항목 C1-C9).
 
 ---
 
@@ -19,11 +19,12 @@ rmlx-core/src/
 ├── kernels/
 │   └── mod.rs          # KernelRegistry (AOT → JIT → PipelineCache)
 ├── ops/
-│   ├── mod.rs          # 18종 커널 등록 (register_all)
+│   ├── mod.rs          # 27종 커널 등록 (register_all)
 │   ├── copy.rs         # 버퍼 복사
 │   ├── binary.rs       # add, mul, sub, div
 │   ├── reduce.rs       # sum, max, argmax, row_sum
 │   ├── softmax.rs      # softmax
+│   ├── topk_route.rs   # GPU-native MoE top-k 라우팅 (fused softmax/top-k/scan)
 │   ├── rms_norm.rs     # RMS 정규화
 │   ├── rope.rs         # Rotary Position Embedding
 │   ├── gemv.rs         # 행렬-벡터 곱
@@ -32,9 +33,10 @@ rmlx-core/src/
 │   ├── indexing.rs     # gather, scatter
 │   ├── silu.rs         # SiLU 활성화 + fused SwiGLU
 │   ├── gelu.rs         # GELU 활성화 (gelu_approx + gelu_fast)
-│   ├── fp8.rs          # FP8 dequant/quant (E4M3, E5M2)
+│   ├── fp8.rs          # FP8 dequant/quant + 토큰별 E4M3 와이어 커널
 │   ├── conv.rs         # Conv1d/Conv2d 합성곱
-│   ├── sdpa.rs         # Flash Attention 2 (fused SDPA)
+│   ├── sdpa.rs         # Flash Attention 2 (fused SDPA, bf16 지원)
+│   ├── gather_mm.rs    # GatherMM (배치 gather-matmul, f16/bf16, _into_cb)
 ├── formats/
 │   ├── mod.rs          # 포맷 파서 모듈
 │   └── gguf.rs         # GGUF 바이너리 포맷 파서 (llama.cpp)
@@ -136,7 +138,7 @@ unsafe fn to_vec<T: HasDType + Clone>(&self) -> Vec<T>
 
 ## ops/ — 연산 커널
 
-18종의 op 모듈을 `KernelRegistry`에 등록합니다. `register_all()`로 일괄 등록합니다.
+27종의 op 모듈을 `KernelRegistry`에 등록합니다. `register_all()`로 일괄 등록합니다.
 
 ```rust
 pub fn register_all(registry: &KernelRegistry) -> Result<(), KernelError> {
@@ -165,6 +167,7 @@ pub fn register_all(registry: &KernelRegistry) -> Result<(), KernelError> {
 | `binary` | Add, Mul, Sub, Div | 원소별 사칙연산 |
 | `reduce` | Sum, Max, Argmax, Row_sum | 리덕션 연산 |
 | `softmax` | Softmax | Attention 스코어 정규화 |
+| `topk_route` | TopKRoute | GPU-native MoE top-k 라우팅 (softmax -> top-k -> normalize -> histogram -> prefix-scan 융합) |
 | `rms_norm` | RMS Normalization | LLaMA 스타일 정규화 |
 | `rope` | RoPE | Rotary Position Embedding |
 | `gemv` | GEMV | 행렬-벡터 곱 |
@@ -173,9 +176,10 @@ pub fn register_all(registry: &KernelRegistry) -> Result<(), KernelError> {
 | `indexing` | Gather, Scatter | 인덱싱 연산 |
 | `silu` | SiLU, SiLU+Gate (SwiGLU) | Sigmoid Linear Unit 활성화 + fused SwiGLU gate |
 | `gelu` | GELU | GELU 활성화 (gelu_approx + gelu_fast) |
-| `fp8` | FP8 Dequant/Quant | FP8 E4M3/E5M2 양자화/역양자화 |
+| `fp8` | FP8 Dequant/Quant | FP8 E4M3/E5M2 양자화/역양자화 + 토큰별 E4M3 와이어 커널 |
 | `conv` | Conv1d, Conv2d | 1D/2D 합성곱 |
-| `sdpa` | SDPA (FA2) | Flash Attention 2 (fused SDPA, tiled K/V, online softmax) |
+| `sdpa` | SDPA (FA2) | Flash Attention 2 (fused SDPA, tiled K/V, online softmax, bf16 지원) |
+| `gather_mm` | GatherMM | 배치 gather-matmul (f16/bf16, `_into_cb` 지원) |
 
 ### silu.rs — SiLU 활성화 + Fused SwiGLU
 
@@ -203,9 +207,9 @@ GELU (Gaussian Error Linear Unit) 활성화 함수입니다. `gelu(x) = x * Phi(
 
 **지원 dtype:** Float32, Float16, Bfloat16
 
-### fp8.rs -- FP8 Dequant/Quant
+### fp8.rs -- FP8 Dequant/Quant + EP-5 와이어 커널
 
-FP8 (8-bit 부동소수점) 양자화 및 역양자화를 제공합니다. E4M3 (추론용)과 E5M2 (학습 그래디언트용) 두 가지 변형을 지원합니다.
+FP8 (8-bit 부동소수점) 양자화 및 역양자화를 제공합니다. E4M3 (추론용)과 E5M2 (학습 그래디언트용) 두 가지 변형을 지원합니다. EP-5에서 토큰별 E4M3 와이어 포맷과 융합 `dequant_scatter_fp8e4m3` 커널이 추가되었습니다.
 
 | 함수 | 설명 |
 |------|------|

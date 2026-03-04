@@ -211,9 +211,9 @@ rmlx/
 | 항목 | 내용 |
 |------|------|
 | **목적** | 연산 그래프, Op 레지스트리, 커널 디스패치를 통합 관리하는 핵심 엔진입니다. N-dim array 타입과 dtype 시스템을 정의하며, eager-first 실행과 선택적 tracing 컴파일을 지원합니다. |
-| **핵심 모듈** | `dtype.rs` (f32, f16, bf16, quantized), `array.rs` (N-dim array), `ops/` (matmul, softmax, rms_norm, rope, quantized, binary, reduce, copy, indexing, sdpa, silu 등 14개 op 모듈), `kernels/` (AOT/JIT 커널 관리), `graph.rs` (연산 그래프), `scheduler.rs` (스트림별 스케줄러), `vjp.rs` (VJP autodiff), `lora.rs` (LoRA fine-tuning), `logging.rs` (structured logging), `metrics.rs` (메트릭 수집), `precision_guard.rs` (정밀도 가드), `shutdown.rs` (graceful shutdown) |
+| **핵심 모듈** | `dtype.rs` (f32, f16, bf16, quantized), `array.rs` (N-dim array), `ops/` (matmul, softmax, rms_norm, rope, topk_route, quantized, binary, reduce, copy, indexing, sdpa, silu, gather_mm 등 27개 op 모듈), `kernels/` (AOT/JIT 커널 관리), `graph.rs` (연산 그래프), `scheduler.rs` (스트림별 스케줄러), `vjp.rs` (VJP autodiff), `lora.rs` (LoRA fine-tuning), `logging.rs` (structured logging), `metrics.rs` (메트릭 수집), `precision_guard.rs` (정밀도 가드), `shutdown.rs` (graceful shutdown) |
 | **의존성** | `rmlx-metal`, `rmlx-alloc` |
-| **현재 상태** | 완료 — Array 타입, 14개 op 모듈(sdpa, silu 포함), ExecMode, CommandBufferHandle, LaunchResult, VJP autodiff, LoRA, 프로덕션 하드닝 전체 구현 |
+| **현재 상태** | 완료 — Array 타입, 27개 op 모듈(sdpa, silu, topk_route, gather_mm 포함), ExecMode, CommandBufferHandle, LaunchResult, VJP autodiff, LoRA, 프로덕션 하드닝 전체 구현 |
 
 ---
 

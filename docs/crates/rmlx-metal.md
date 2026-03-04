@@ -4,7 +4,7 @@
 
 `rmlx-metal` is a safe and ergonomic Rust wrapper layer over the Apple Metal GPU API. It abstracts Metal devices, command queues, buffers, compute pipelines, and shader libraries to enable concise GPU computation.
 
-Built on the `metal-rs` 0.31 crate, it takes design cues from MLX's Metal abstraction structure and remodels them into idiomatic Rust APIs. The basic wrappers were completed in Phase 0, with event synchronization (`event.rs`), self-check (`self_check.rs`), and the dual queue stream manager (`stream.rs`) added subsequently.
+Built on the `metal-rs` 0.31 crate, it takes design cues from MLX's Metal abstraction structure and remodels them into idiomatic Rust APIs. The basic wrappers were completed in Phase 0, with event synchronization (`event.rs`), self-check (`self_check.rs`), and the dual queue stream manager (`stream.rs`) added subsequently. EP-6 adds `icb_sparse.rs` for sparse expert launch via indirect command buffers.
 
 ---
 
@@ -25,6 +25,7 @@ graph TD
     A --> L[batcher.rs — CommandBatcher]
     A --> M[exec_graph.rs — ExecGraph]
     A --> N[icb.rs — ICB Support]
+    A --> O[icb_sparse.rs — Sparse Expert ICB]
 ```
 
 ### `lib.rs` — Top-Level Re-exports
@@ -472,6 +473,20 @@ Metal Indirect Command Buffer support for zero-CPU-overhead command replay.
 | `IcbBuilder` | Builds an indirect command buffer from recorded commands |
 | `IcbReplay` | Replays a previously built ICB |
 | `IcbCache` | Caches built ICBs for reuse across forward passes |
+
+---
+
+### `icb_sparse.rs` — Sparse Expert ICB Launch
+
+EP-6 sparse expert launch support using `MTLIndirectCommandBuffer` to skip empty experts without CPU intervention.
+
+| Type | Description |
+|------|-------------|
+| `SparseExpertPlan` | Encoded sparse launch plan for active experts only |
+| `SparseExpertCache` | Caches sparse ICB plans keyed by expert activity pattern |
+| `SparseExpertKey` | Hash key for expert activity pattern lookup |
+
+Producer/consumer coordination is synchronized with `GpuEvent` timeline signal/wait semantics.
 
 ---
 

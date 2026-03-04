@@ -1,6 +1,6 @@
 # Architecture Overview
 
-RMLX is a layered architecture composed of four layers. All Phases (0 through 9B-opt + S1-S5 + Audit Remediation) have been completed and the system is fully implemented with 543 tests. Each layer has clear responsibility boundaries and is separated into individual Cargo crates. Phase 7 additions include VJP autodiff, LoRA fine-tuning, and production hardening (structured logging, metrics, precision guard, graceful shutdown). Phase 9 additions include ExecGraph (5 CBs/layer, 92.3% reduction), CommandBatcher, Indirect Command Buffers, and weight pre-caching for 17.4x speedup. Serving support phases (S1-S5) add Flash Attention 2, GELU, FP8/GGUF/AWQ/GPTQ, KV cache variants, Conv1d/Conv2d, and dynamic shapes. The full-crate audit remediation (76 items) adds GatherMM, LayerNorm, unary ops, QuantizedLinear, MLA, sliding window attention, GGUF loading, 14 activations, ring/allreduce collectives, connection manager, coordinator, fence manager, library cache, residency management, and more.
+RMLX is a layered architecture composed of four layers. All Phases (0 through 9B-opt + S1-S5 + Audit Remediation) and EP-1 through EP-6 have been completed and the system is fully implemented with 543+ tests. Each layer has clear responsibility boundaries and is separated into individual Cargo crates. Phase 7 additions include VJP autodiff, LoRA fine-tuning, and production hardening (structured logging, metrics, precision guard, graceful shutdown). Phase 9 additions include ExecGraph (5 CBs/layer, 92.3% reduction), CommandBatcher, Indirect Command Buffers, and weight pre-caching for 17.4x speedup. Serving support phases (S1-S5) add Flash Attention 2, GELU, FP8/GGUF/AWQ/GPTQ, KV cache variants, Conv1d/Conv2d, and dynamic shapes. The full-crate audit remediation (76 items) adds GatherMM, LayerNorm, unary ops, QuantizedLinear, MLA, sliding window attention, GGUF loading, 14 activations, ring/allreduce collectives, connection manager, coordinator, fence manager, library cache, residency management, and more. EP optimization adds GPU-native top-k routing, grouped expert GEMM, variable-length v3 exchange, TBO/SBO overlap, FP8 wire exchange, and sparse ICB + slab-ring execution.
 
 ---
 
@@ -11,7 +11,7 @@ RMLX is a layered architecture composed of four layers. All Phases (0 through 9B
 │  ~/rmlx/ (this repository — ML framework)                                  │
 │                        rmlx-core (compute engine)                          │
 │  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │                      Compute Graph / Op Registry (25 op modules)     │   │
+│  │                      Compute Graph / Op Registry (27 op modules)     │   │
 │  │  matmul · softmax · rms_norm · rope · quantized_matmul · moe_gate   │   │
 │  │  sdpa · silu · gelu · fp8 · conv · binary · reduce · copy · indexing · ...  │   │
 │  └──────────────────────────────┬───────────────────────────────────────┘   │
@@ -73,7 +73,7 @@ The core engine responsible for computation graphs and kernel dispatch.
 
 | Component | Role |
 |-----------|------|
-| **Op Registry** | Registers 25 op modules including matmul, softmax, rms_norm, rope, quantized_matmul, moe_gate, sdpa (+ backward), silu, gelu, fp8, conv1d, conv2d, gather_mm, layer_norm, unary, concat, select, conv_tiled, vjp_gpu |
+| **Op Registry** | Registers 27 op modules including matmul, softmax, rms_norm, rope, quantized_matmul, moe_gate, sdpa (+ backward), silu, gelu, fp8, conv1d, conv2d, gather_mm, layer_norm, unary, concat, select, conv_tiled, vjp_gpu |
 | **Compute Graph** | Selective tracing-based computation graph (eager-first, tracing during prefill) |
 | **Kernel Dispatch** | Maps ops to Metal kernels and executes them, selecting optimal kernels based on dtype/shape |
 
@@ -90,6 +90,20 @@ Reduces per-op CPU overhead by batching multiple GPU operations into minimal com
 | **ExecGraph** | Pre-built execution graph replaying deterministic op sequences with 5 CBs/layer (92.3% reduction from 65) |
 | **CommandBatcher** | Groups encoder work into shared command buffers, eliminating per-op CB creation |
 | **ICB** | Indirect Command Buffers for zero-CPU-overhead replay of pre-encoded command sequences |
+
+---
+
+### EP Optimization Layer (Post-Audit)
+
+Adds six EP phases that keep MoE routing/exchange/compute on-GPU and reduce communication overhead.
+
+| Component | Role |
+|-----------|------|
+| **TopKRoute (EP-1)** | Fused softmax -> top-k -> normalize -> histogram -> prefix-scan routing kernel |
+| **ExpertGroup + GatherMM (EP-2)** | Expert weight stacking + grouped batched GEMM path (Gate -> Up -> fused SwiGLU -> Down) |
+| **v3 Protocol + Slab Ring (EP-3/EP-6)** | Variable-length payload exchange + pre-registered zero-copy RDMA ring buffers |
+| **MoePipeline (EP-4)** | TBO/SBO compute-communication overlap with `GpuEvent` signal/wait chains |
+| **FP8 Exchange (EP-5)** | Per-token E4M3 wire quantization + fused dequant-scatter path |
 
 ---
 

@@ -65,7 +65,7 @@ ExecGraph 결과: ~112ms/layer → ~6.4ms/layer (17.4x 속도 향상)
    92.3% CB 감소와 함께 17.4x 속도 향상(~112ms → ~6.4ms)을 달성합니다.
 
 7. **Expert Parallelism (EP)**
-   MLX에는 없는 완전한 EP 스택을 제공합니다. 3-zone 자동 백엔드 정책(CPU/Metal/RDMA)이 데이터 크기에 따라 최적 경로를 자동 선택하고, 7개 전용 MoE Metal 커널, SparseGuard 오버플로우 모니터링, compute-RDMA 파이프라인 오버랩을 통해 Mixtral/DeepSeek-V3 같은 MoE 모델의 분산 추론을 지원합니다.
+   MLX에는 없는 완전한 EP 스택을 제공합니다. 3-zone 자동 백엔드 정책(CPU/Metal/RDMA)이 데이터 크기에 따라 최적 경로를 자동 선택하고, 7개 전용 MoE Metal 커널, SparseGuard 오버플로우 모니터링, compute-RDMA 파이프라인 오버랩을 통해 Mixtral/DeepSeek-V3 같은 MoE 모델의 분산 추론을 지원합니다. 감사 완료 후 EP-1~EP-6 최적화 단계를 통해 GPU-native top-k 라우팅(topk_route), 그룹형 expert GEMM(ExpertGroup + GatherMM), 가변 길이 v3 프로토콜, TBO/SBO 오버랩(MoePipeline), FP8 와이어 양자화(fp8_exchange), ICB sparse 실행 + slab 링 전송(icb_sparse + slab_ring)을 추가로 구현하였습니다.
 
 ---
 
