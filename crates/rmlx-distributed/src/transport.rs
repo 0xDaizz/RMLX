@@ -1142,7 +1142,7 @@ mod tests {
 
         // Verify encode_wr_id roundtrips correctly
         let wr_id = encode_wr_id(42, ExchangeTag::Data, 0, 7);
-        let fields = decode_wr_id(wr_id);
+        let fields = decode_wr_id(wr_id).unwrap();
         assert_eq!(fields.seq, 42);
         assert_eq!(fields.tag, ExchangeTag::Data);
         assert_eq!(fields.buf_slot, 0);
@@ -1150,7 +1150,7 @@ mod tests {
 
         // Verify different tags encode distinctly
         let warmup_id = encode_wr_id(0, ExchangeTag::Warmup, 1, 0);
-        let warmup_fields = decode_wr_id(warmup_id);
+        let warmup_fields = decode_wr_id(warmup_id).unwrap();
         assert_eq!(warmup_fields.tag, ExchangeTag::Warmup);
         assert_eq!(warmup_fields.buf_slot, 1);
 

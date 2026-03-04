@@ -266,6 +266,14 @@ pub fn conv2d_tiled(
             weight.ndim()
         )));
     }
+    // If tiled conv doesn't support f16/bf16, fall back to standard conv.
+    // The tiled kernel only has an f32 variant; gracefully redirect
+    // half-precision inputs to the non-tiled conv2d path which handles them.
+    if matches!(input.dtype(), DType::Float16 | DType::Bfloat16) {
+        return super::conv::conv2d(
+            registry, input, weight, bias, stride, padding, dilation, groups, queue,
+        );
+    }
     if input.dtype() != DType::Float32 {
         return Err(KernelError::InvalidShape(format!(
             "conv2d_tiled: currently supports f32 only, got {:?}",

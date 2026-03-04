@@ -187,15 +187,16 @@ impl OwnedPendingOp {
 
     /// Decompose into the inner `PendingOp`, releasing the MR.
     ///
-    /// # Panics
-    /// Panics if the operation is still pending. Wait for completion before calling this.
-    pub fn into_pending(self) -> PendingOp {
-        assert!(
-            !self.pending.is_pending(),
-            "cannot release MR: RDMA operation still pending (wr_id={})",
-            self.pending.wr_id()
-        );
-        self.pending
+    /// Returns an error if the operation is still pending. Wait for
+    /// completion before calling this.
+    pub fn into_pending(self) -> Result<PendingOp, crate::RdmaError> {
+        if self.pending.is_pending() {
+            return Err(crate::RdmaError::InvalidArgument(format!(
+                "cannot release MR: RDMA operation still pending (wr_id={})",
+                self.pending.wr_id()
+            )));
+        }
+        Ok(self.pending)
     }
 }
 
@@ -345,10 +346,11 @@ impl ProgressEngine {
     ///
     /// The CQ must be wrapped in an `Arc` so the background thread can own
     /// a reference. The thread runs until `shutdown()` is called.
-    pub fn start_background(&mut self, cq: Arc<CompletionQueue>, config: ProgressConfig) {
+    pub fn start_background(&mut self, cq: Arc<CompletionQueue>, config: ProgressConfig) -> Result<(), crate::RdmaError> {
         if self.bg_handle.is_some() {
-            eprintln!("[rmlx-rdma] progress: background thread already running");
-            return;
+            return Err(crate::RdmaError::InvalidArgument(
+                "background progress thread already running".into(),
+            ));
         }
 
         let pending = Arc::clone(&self.pending);
@@ -395,9 +397,10 @@ impl ProgressEngine {
                     }
                 }
             })
-            .expect("failed to spawn CQ progress thread");
+            .map_err(|e| crate::RdmaError::InvalidArgument(format!("failed to spawn CQ progress thread: {e}")))?;
 
         self.bg_handle = Some(handle);
+        Ok(())
     }
 
     /// Signal the background thread to stop and wait for it to exit.

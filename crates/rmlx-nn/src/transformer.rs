@@ -3,6 +3,8 @@
 use rmlx_core::array::Array;
 use rmlx_core::kernels::{KernelError, KernelRegistry};
 use rmlx_core::ops;
+use rmlx_metal::event::GpuEvent;
+use rmlx_metal::exec_graph::ExecGraph;
 
 use crate::attention::{Attention, LayerKvCache};
 use crate::embedding::Embedding;
@@ -113,6 +115,80 @@ impl FeedForward {
                 down_proj.forward(&hidden, registry, queue)
             }
             FeedForward::MoE(moe) => moe.forward(x, registry, queue),
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // ExecGraph path
+    // -------------------------------------------------------------------
+
+    /// Pre-cache transposed weights for all dense FFN projections.
+    ///
+    /// No-op for MoE layers (expert weights are not pre-transposed).
+    pub fn prepare_weights_for_graph(
+        &mut self,
+        registry: &KernelRegistry,
+        queue: &metal::CommandQueue,
+    ) -> Result<(), KernelError> {
+        match self {
+            FeedForward::Dense {
+                gate_proj,
+                up_proj,
+                down_proj,
+            } => {
+                gate_proj.prepare_weight_t(registry, queue)?;
+                up_proj.prepare_weight_t(registry, queue)?;
+                down_proj.prepare_weight_t(registry, queue)?;
+                Ok(())
+            }
+            FeedForward::MoE(_) => Ok(()),
+        }
+    }
+
+    /// ExecGraph-based FFN forward using 2 command buffers.
+    ///
+    /// For dense SwiGLU:
+    /// - CB5 (current): gate + up + fused silu*mul
+    /// - CB6: down_proj + residual add
+    ///
+    /// For MoE: falls back to sync path (graph sync + reset).
+    pub fn forward_graph(
+        &self,
+        normed: &Array,
+        residual: &Array,
+        registry: &KernelRegistry,
+        graph: &mut ExecGraph<'_, '_>,
+        queue: &metal::CommandQueue,
+    ) -> Result<Array, KernelError> {
+        match self {
+            FeedForward::Dense {
+                gate_proj,
+                up_proj,
+                down_proj,
+            } => {
+                // CB5 (current): gate + up + fused silu*mul
+                let cb5 = graph.command_buffer();
+                let gate_out = gate_proj.forward_into_cb(normed, registry, cb5)?;
+                let up_out = up_proj.forward_into_cb(normed, registry, cb5)?;
+                let hidden =
+                    ops::fused::fused_silu_mul_into_cb(registry, &gate_out, &up_out, cb5)?;
+                let t5 = graph.submit_batch();
+
+                // CB6: down_proj + residual
+                graph.wait_for(t5);
+                let cb6 = graph.command_buffer();
+                let ffn_out = down_proj.forward_into_cb(&hidden, registry, cb6)?;
+                ops::binary::add_into_cb(registry, residual, &ffn_out, cb6)
+            }
+            FeedForward::MoE(moe) => {
+                // MoE: sync, reset, run synchronously
+                graph
+                    .sync()
+                    .map_err(|e| KernelError::InvalidShape(format!("MoE graph sync: {e}")))?;
+                graph.reset();
+                let ffn_out = moe.forward(normed, registry, queue)?;
+                ops::binary::add(registry, residual, &ffn_out, queue)
+            }
         }
     }
 }
@@ -238,6 +314,140 @@ impl TransformerBlock {
     pub fn hidden_size(&self) -> Option<usize> {
         self.norm1_weight.as_ref().map(|w| w.shape()[0])
     }
+
+    // -------------------------------------------------------------------
+    // ExecGraph path
+    // -------------------------------------------------------------------
+
+    /// Pre-cache transposed weights for attention and FFN projections.
+    pub fn prepare_weights_for_graph(
+        &mut self,
+        registry: &KernelRegistry,
+        queue: &metal::CommandQueue,
+    ) -> Result<(), KernelError> {
+        self.attention.prepare_weights_for_graph(registry, queue)?;
+        self.ffn.prepare_weights_for_graph(registry, queue)?;
+        Ok(())
+    }
+
+    /// Pipelined forward pass using fused SwiGLU for the FFN.
+    ///
+    /// Same structure as `forward` but uses `ops::fused::fused_silu_mul`
+    /// instead of separate silu + mul.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_pipelined(
+        &self,
+        x: &Array,
+        cos_freqs: Option<&Array>,
+        sin_freqs: Option<&Array>,
+        mask: Option<&Array>,
+        cache: Option<&mut LayerKvCache>,
+        registry: &KernelRegistry,
+        queue: &metal::CommandQueue,
+    ) -> Result<Array, KernelError> {
+        let norm1_w = self.norm1_weight.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape("TransformerBlock: norm1_weight not loaded".into())
+        })?;
+        let norm2_w = self.norm2_weight.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape("TransformerBlock: norm2_weight not loaded".into())
+        })?;
+
+        // Pre-attention norm
+        let normed = ops::rms_norm::rms_norm(registry, x, norm1_w, self.rms_norm_eps, queue)?;
+
+        // Attention
+        let attn_out = self
+            .attention
+            .forward(&normed, cos_freqs, sin_freqs, mask, cache, registry, queue)?;
+
+        // Residual connection: x + attn_out
+        let h = ops::binary::add(registry, x, &attn_out, queue)?;
+
+        // Pre-FFN norm
+        let normed2 = ops::rms_norm::rms_norm(registry, &h, norm2_w, self.rms_norm_eps, queue)?;
+
+        // FFN with fused SwiGLU
+        let ffn_out = match &self.ffn {
+            FeedForward::Dense {
+                gate_proj,
+                up_proj,
+                down_proj,
+            } => {
+                let gate_out = gate_proj.forward(&normed2, registry, queue)?;
+                let up_out = up_proj.forward(&normed2, registry, queue)?;
+                let hidden = ops::fused::fused_silu_mul(registry, &gate_out, &up_out, queue)?;
+                down_proj.forward(&hidden, registry, queue)?
+            }
+            FeedForward::MoE(moe) => moe.forward(&normed2, registry, queue)?,
+        };
+
+        // Residual connection: h + ffn_out
+        ops::binary::add(registry, &h, &ffn_out, queue)
+    }
+
+    /// Full ExecGraph forward pass (6 CBs total: 4 attention + 2 FFN).
+    ///
+    /// CB1: RMS norm + Q/K/V projections
+    /// CB2: head split + RoPE + cache append
+    /// CB3: SDPA
+    /// CB4: head concat + O_proj + residual add
+    /// CB5: RMS norm + gate + up + fused silu*mul
+    /// CB6: down_proj + residual add
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_graph(
+        &self,
+        x: &Array,
+        cos_freqs: Option<&Array>,
+        sin_freqs: Option<&Array>,
+        mask: Option<&Array>,
+        cache: Option<&mut LayerKvCache>,
+        registry: &KernelRegistry,
+        graph: &mut ExecGraph<'_, '_>,
+        queue: &metal::CommandQueue,
+    ) -> Result<Array, KernelError> {
+        let norm1_w = self.norm1_weight.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape("TransformerBlock: norm1_weight not loaded".into())
+        })?;
+        let norm2_w = self.norm2_weight.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape("TransformerBlock: norm2_weight not loaded".into())
+        })?;
+
+        // Pre-attention norm (encoded into the first CB of attention)
+        let cb_norm = graph.command_buffer();
+        let normed = ops::rms_norm::rms_norm_into_cb(
+            registry,
+            x,
+            Some(norm1_w),
+            self.rms_norm_eps,
+            cb_norm,
+        )?;
+        let t_norm = graph.submit_batch();
+        graph.wait_for(t_norm);
+
+        // Attention (4 CBs: projections, RoPE+cache, SDPA, concat+O_proj)
+        let (attn_out, t_attn) = self.attention.forward_graph(
+            &normed, cos_freqs, sin_freqs, mask, cache, registry, graph,
+        )?;
+
+        // Residual add: x + attn_out
+        graph.wait_for(t_attn);
+        let cb_res1 = graph.command_buffer();
+        let h = ops::binary::add_into_cb(registry, x, &attn_out, cb_res1)?;
+
+        // Pre-FFN norm
+        let normed2 = ops::rms_norm::rms_norm_into_cb(
+            registry,
+            &h,
+            Some(norm2_w),
+            self.rms_norm_eps,
+            cb_res1,
+        )?;
+        let t_res1 = graph.submit_batch();
+        graph.wait_for(t_res1);
+
+        // FFN (2 CBs for dense, sync fallback for MoE)
+        self.ffn.forward_graph(&normed2, &h, registry, graph, queue)
+    }
 }
 
 pub struct TransformerModel {
@@ -344,5 +554,144 @@ impl TransformerModel {
 
     pub fn config(&self) -> &TransformerConfig {
         &self.config
+    }
+
+    // -------------------------------------------------------------------
+    // ExecGraph path
+    // -------------------------------------------------------------------
+
+    /// Pre-cache transposed weights for all layers and the LM head.
+    pub fn prepare_weights_for_graph(
+        &mut self,
+        registry: &KernelRegistry,
+        queue: &metal::CommandQueue,
+    ) -> Result<(), KernelError> {
+        for layer in &mut self.layers {
+            layer.prepare_weights_for_graph(registry, queue)?;
+        }
+        if let Some(ref mut lm) = self.lm_head {
+            lm.prepare_weight_t(registry, queue)?;
+        }
+        Ok(())
+    }
+
+    /// Pipelined model forward: uses fused SwiGLU within each block.
+    ///
+    /// Same as `forward` but each block uses `forward_pipelined`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_pipelined(
+        &self,
+        token_ids: &[u32],
+        cos_freqs: Option<&Array>,
+        sin_freqs: Option<&Array>,
+        mask: Option<&Array>,
+        mut cache: Option<&mut Vec<LayerKvCache>>,
+        registry: &KernelRegistry,
+        queue: &metal::CommandQueue,
+    ) -> Result<Array, KernelError> {
+        let embedding = self.embedding.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape("TransformerModel: embedding not loaded".into())
+        })?;
+        let final_norm = self.final_norm_weight.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape("TransformerModel: final_norm not loaded".into())
+        })?;
+        let lm_head = self.lm_head.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape("TransformerModel: lm_head not loaded".into())
+        })?;
+
+        let mut x = embedding.forward(token_ids, registry, queue)?;
+
+        if let Some(ref c) = cache {
+            if c.len() != self.layers.len() {
+                return Err(KernelError::InvalidShape(format!(
+                    "TransformerModel: cache has {} entries but model has {} layers",
+                    c.len(),
+                    self.layers.len()
+                )));
+            }
+        }
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            let layer_cache = cache.as_mut().map(|c| &mut c[i]);
+            x = layer.forward_pipelined(
+                &x, cos_freqs, sin_freqs, mask, layer_cache, registry, queue,
+            )?;
+        }
+
+        x = ops::rms_norm::rms_norm(registry, &x, final_norm, self.config.rms_norm_eps, queue)?;
+        lm_head.forward(&x, registry, queue)
+    }
+
+    /// Full ExecGraph model forward: token IDs -> logits.
+    ///
+    /// Creates an ExecGraph per forward pass, running each transformer block
+    /// through `forward_graph` (6 CBs per block), then a final norm + LM head.
+    /// The CPU blocks only once at the very end.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_graph(
+        &self,
+        token_ids: &[u32],
+        cos_freqs: Option<&Array>,
+        sin_freqs: Option<&Array>,
+        mask: Option<&Array>,
+        mut cache: Option<&mut Vec<LayerKvCache>>,
+        registry: &KernelRegistry,
+        queue: &metal::CommandQueue,
+        event: &GpuEvent,
+    ) -> Result<Array, KernelError> {
+        let embedding = self.embedding.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape("TransformerModel: embedding not loaded".into())
+        })?;
+        let final_norm = self.final_norm_weight.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape("TransformerModel: final_norm not loaded".into())
+        })?;
+        let lm_head = self.lm_head.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape("TransformerModel: lm_head not loaded".into())
+        })?;
+
+        // Embedding lookup (sync — typically fast)
+        let mut x = embedding.forward(token_ids, registry, queue)?;
+
+        if let Some(ref c) = cache {
+            if c.len() != self.layers.len() {
+                return Err(KernelError::InvalidShape(format!(
+                    "TransformerModel: cache has {} entries but model has {} layers",
+                    c.len(),
+                    self.layers.len()
+                )));
+            }
+        }
+
+        // Create graph for the full forward pass
+        let mut graph = ExecGraph::new(queue, event, 32);
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            let layer_cache = cache.as_mut().map(|c| &mut c[i]);
+            x = layer.forward_graph(
+                &x, cos_freqs, sin_freqs, mask, layer_cache, registry, &mut graph, queue,
+            )?;
+            // Submit remaining work and wait between layers to ensure
+            // the output is ready for the next layer's input
+            let t = graph.submit_batch();
+            graph.wait_for(t);
+        }
+
+        // Final norm + LM head (encode into graph)
+        let cb_final = graph.command_buffer();
+        x = ops::rms_norm::rms_norm_into_cb(
+            registry,
+            &x,
+            Some(final_norm),
+            self.config.rms_norm_eps,
+            cb_final,
+        )?;
+        x = lm_head.forward_into_cb(&x, registry, cb_final)?;
+
+        // Single CPU sync at the end
+        graph
+            .sync()
+            .map_err(|e| KernelError::InvalidShape(format!("TransformerModel graph sync: {e}")))?;
+
+        Ok(x)
     }
 }
