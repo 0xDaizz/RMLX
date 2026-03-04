@@ -23,7 +23,7 @@ MLX는 C++로 작성되어 있지만, RMLX는 Rust를 선택했습니다.
 
 GPU 인퍼런스 엔진은 `unsafe` 블록(Metal FFI, RDMA FFI)이 불가피하지만, Rust의 소유권 시스템은 `unsafe` 경계를 **명시적으로 격리**할 수 있습니다. 안전한 코드(`ZeroCopyBuffer` 외부 API)와 위험한 코드(`posix_memalign`, `ibv_post_send` 호출부)가 타입 시스템 레벨에서 구분되므로, C++보다 안전하면서도 동일한 성능을 유지할 수 있습니다.
 
-또한 Cargo workspace는 6개 크레이트의 의존성, 버전, 빌드 설정을 단일 `Cargo.toml`로 관리합니다. CMake + setuptools 조합 대비 빌드 복잡도가 현저히 낮습니다.
+또한 Cargo workspace는 7개 크레이트의 의존성, 버전, 빌드 설정을 단일 `Cargo.toml`로 관리합니다. CMake + setuptools 조합 대비 빌드 복잡도가 현저히 낮습니다.
 
 ---
 
