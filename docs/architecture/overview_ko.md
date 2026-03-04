@@ -1,6 +1,6 @@
 # 아키텍처 개요
 
-RMLX는 4개의 레이어로 구성된 계층형 아키텍처이며, 전 Phase(0~9B-opt)가 완료되어 완전히 구현된 상태입니다. 각 레이어는 명확한 책임 경계를 가지며, Cargo 크레이트 단위로 분리되어 있습니다. Phase 7에서 추가된 VJP autodiff, LoRA fine-tuning, 프로덕션 하드닝(structured logging, metrics, precision guard, graceful shutdown)이 포함됩니다. Phase 9에서는 ExecGraph (5 CBs/layer, 92.3% 감소), CommandBatcher, Indirect Command Buffer, 가중치 사전 캐싱이 추가되어 17.4x 속도 향상을 달성했습니다.
+RMLX는 4개의 레이어로 구성된 계층형 아키텍처이며, 전 Phase(0~9B-opt + S1-S5 + Audit Remediation + EP-1~EP-6)가 완료되어 543+ 테스트와 함께 완전히 구현된 상태입니다. 각 레이어는 명확한 책임 경계를 가지며, Cargo 크레이트 단위로 분리되어 있습니다. Phase 7에서 추가된 VJP autodiff, LoRA fine-tuning, 프로덕션 하드닝(structured logging, metrics, precision guard, graceful shutdown)이 포함됩니다. Phase 9에서는 ExecGraph (5 CBs/layer, 92.3% 감소), CommandBatcher, Indirect Command Buffer, 가중치 사전 캐싱이 추가되어 17.4x 속도 향상을 달성했습니다. 서빙 지원 Phase(S1-S5)에서 Flash Attention 2, GELU, FP8/GGUF/AWQ/GPTQ, KV 캐시 변형, Conv1d/Conv2d, 동적 shape가 추가되었습니다. 전 크레이트 감사 수정(76개 항목)과 EP 최적화(EP-1~EP-6)에서 GPU-native top-k 라우팅, 그룹형 expert GEMM, 가변 길이 v3 교환, TBO/SBO 오버랩, FP8 와이어 교환, sparse ICB + slab 링 실행이 추가되었습니다.
 
 ---
 
@@ -11,7 +11,7 @@ RMLX는 4개의 레이어로 구성된 계층형 아키텍처이며, 전 Phase(0
 │  ~/rmlx/ (이 리포지토리 — ML 프레임워크)                                      │
 │                        rmlx-core (연산 엔진)                                │
 │  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │                      Compute Graph / Op Registry (25 op modules)     │   │
+│  │                      Compute Graph / Op Registry (27 op modules)     │   │
 │  │  matmul · softmax · rms_norm · rope · quantized_matmul · moe_gate   │   │
 │  │  sdpa(FA2) · silu · gelu · fp8 · conv · binary · reduce · copy    │   │
 │  │  indexing · formats/gguf · ...                                     │   │
@@ -74,7 +74,7 @@ RMLX는 4개의 레이어로 구성된 계층형 아키텍처이며, 전 Phase(0
 
 | 컴포넌트 | 역할 |
 |----------|------|
-| **Op Registry** | matmul, softmax, rms_norm, rope, quantized_matmul(AWQ/GPTQ), moe_gate, sdpa(FA2), silu, gelu, fp8, conv 등 18개 op 모듈 등록 |
+| **Op Registry** | matmul, softmax, rms_norm, rope, topk_route, quantized_matmul(AWQ/GPTQ), moe_gate, sdpa(FA2), silu, gelu, fp8, conv, gather_mm 등 27개 op 모듈 등록 |
 | **Compute Graph** | 선택적 tracing 기반 연산 그래프 (eager-first, prefill 시 tracing) |
 | **Kernel Dispatch** | Op → Metal 커널 매핑 및 실행, dtype/shape 기반 최적 커널 선택 |
 
@@ -91,6 +91,20 @@ rmlx-core는 rmlx-metal과 rmlx-alloc에 의존하며, 상위 레이어(rmlx-nn,
 | **ExecGraph** | 결정론적 op 시퀀스를 5개 CB/layer로 재생하는 사전 빌드 실행 그래프 (65개에서 92.3% 감소) |
 | **CommandBatcher** | 인코더 작업을 공유 command buffer로 그룹화하여 per-op CB 생성 제거 |
 | **ICB** | 사전 인코딩된 커맨드 시퀀스를 CPU 오버헤드 없이 재생하는 Indirect Command Buffer |
+
+---
+
+### EP 최적화 레이어 (감사 후 추가)
+
+MoE 라우팅·교환·연산을 완전히 GPU 상주로 유지하고 통신 오버헤드를 줄이는 6개 EP 단계입니다.
+
+| 컴포넌트 | 역할 |
+|----------|------|
+| **TopKRoute (EP-1)** | 융합 softmax -> top-k -> normalize -> histogram -> prefix-scan 라우팅 커널 |
+| **ExpertGroup + GatherMM (EP-2)** | Expert 가중치 스태킹 + 그룹형 배치 GEMM 경로 (Gate -> Up -> fused SwiGLU -> Down) |
+| **v3 프로토콜 + Slab 링 (EP-3/EP-6)** | 가변 길이 페이로드 교환 + 사전 등록 zero-copy RDMA 링 버퍼 |
+| **MoePipeline (EP-4)** | `GpuEvent` signal/wait 체인을 통한 TBO/SBO compute-communication 오버랩 |
+| **FP8 교환 (EP-5)** | 토큰별 E4M3 와이어 양자화 + 융합 dequant-scatter 경로 |
 
 ---
 

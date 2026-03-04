@@ -4,7 +4,7 @@
 
 `rmlx-nn` is a crate that implements neural network layers for GPU-accelerated inference. It builds core Transformer architecture components (Linear, Embedding, Attention, TransformerBlock, MoE) on top of `rmlx-core` compute kernels, and includes built-in model configurations for LLaMA, Qwen, DeepSeek-V3, and Mixtral.
 
-> **Status (Phase 0-9B-opt + S1-S5 + Audit):** Linear, QuantizedLinear, Embedding, Attention (with LayerKvCache, RotatingKvCache, BatchKvCache, QuantizedKvCache), MLA (Multi-Latent Attention), Sliding Window Attention, TransformerBlock, MoE (with shared expert + EP integration + GPU routing), LayerNorm, 14 activation functions, Parallel (TP), Conv1d/Conv2d, DynamicExecContext, GGUF model loader, and 4 model configurations are implemented. Phase 0+1+2 audit remediation complete (items N1-N8).
+> **Status (Phase 0-9B-opt + S1-S5 + Audit):** Linear, QuantizedLinear, Embedding, Attention (with LayerKvCache, RotatingKvCache, BatchKvCache, QuantizedKvCache), MLA (Multi-Latent Attention), Sliding Window Attention, TransformerBlock, MoE (with shared expert + EP integration + GPU routing), `ExpertGroup` (stacked expert GEMM path), `MoePipeline` (TBO/SBO overlap), LayerNorm, 14 activation functions, Parallel (TP), Conv1d/Conv2d, DynamicExecContext, GGUF model loader, and 4 model configurations are implemented. Phase 0+1+2 audit remediation complete (items N1-N8).
 
 ---
 
@@ -23,6 +23,8 @@ rmlx-nn/src/
 ├── activations.rs       # 14 activation functions (SiLU, GELU, Mish, etc.)
 ├── transformer.rs       # Transformer block + model
 ├── moe.rs               # Mixture of Experts (shared expert, EP integration, GPU routing)
+├── expert_group.rs      # Grouped expert GEMM + stacked expert weights
+├── moe_pipeline.rs      # TBO/SBO compute-communication overlap orchestration
 ├── conv.rs              # Conv1d/Conv2d layer wrappers
 ├── dynamic.rs           # DynamicExecContext for variable shapes
 ├── gguf_loader.rs       # End-to-end GGUF model loading
@@ -456,6 +458,9 @@ Metrics collected during MoE forward passes, including per-expert token routing 
 | `MoeForwardMetrics::with_experts(num_experts)` | Creates metrics pre-allocated for `num_experts` |
 | `record_expert_token(expert_idx)` | Atomically increments the counter for `expert_idx` |
 | `expert_tokens_snapshot() -> Vec<u64>` | Returns a point-in-time snapshot of all expert token counts |
+
+`expert_group.rs` adds `ExpertGroup` weight stacking (`[E, D, intermediate_dim]`) and grouped expert GEMM (Gate -> Up -> fused SwiGLU -> Down) to replace O(E) per-expert launches.
+`moe_pipeline.rs` adds `MoePipeline` orchestration for TBO/SBO overlap using `GpuEvent` signal/wait chains with a single terminal CPU wait.
 
 ---
 
