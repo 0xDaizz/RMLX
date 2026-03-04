@@ -18,6 +18,7 @@ pub mod vjp;
 // ── Re-exports of core types ──
 pub use array::{broadcast_shape, Array};
 pub use dtype::{DType, HasDType};
+pub use rmlx_alloc::{AllocError, MetalAllocator};
 pub use kernels::{KernelError, KernelRegistry};
 pub use logging::{LogEntry, LogLevel};
 pub use lora::{LoraConfig, LoraLayer, LoraModel, LoraTrainer, TrainConfig};

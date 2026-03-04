@@ -775,6 +775,147 @@ pub fn ge(
 }
 
 // ---------------------------------------------------------------------------
+// Into-CB variants (encode into existing command buffer, no commit/wait)
+// ---------------------------------------------------------------------------
+
+/// Encode a binary op into an existing command buffer (no commit/wait).
+pub fn binary_op_into_cb(
+    registry: &KernelRegistry,
+    a: &Array,
+    b: &Array,
+    op: BinaryOp,
+    cb: &metal::CommandBufferRef,
+) -> Result<Array, KernelError> {
+    // Validate dtypes match.
+    if a.dtype() != b.dtype() {
+        return Err(KernelError::InvalidShape(format!(
+            "binary op requires matching dtypes: {:?} vs {:?}",
+            a.dtype(),
+            b.dtype()
+        )));
+    }
+
+    // Compute broadcast output shape.
+    let out_shape = broadcast_shape(a.shape(), b.shape())?;
+
+    let variant = choose_variant(a.shape(), b.shape());
+    let kernel_name = kernel_name_for(op, variant, a.dtype())?;
+    let pipeline = registry.get_pipeline(&kernel_name, a.dtype())?;
+
+    let out_numel: usize = out_shape.iter().product();
+    // Handle empty tensors.
+    if out_numel == 0 {
+        let out_dtype = if op.is_comparison() {
+            DType::UInt32
+        } else {
+            a.dtype()
+        };
+        return Ok(Array::zeros(registry.device().raw(), &out_shape, out_dtype));
+    }
+
+    let out_dtype = if op.is_comparison() {
+        DType::UInt32
+    } else {
+        a.dtype()
+    };
+    let out = Array::zeros(registry.device().raw(), &out_shape, out_dtype);
+
+    let encoder = cb.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(a.metal_buffer()), a.offset() as u64);
+    encoder.set_buffer(1, Some(b.metal_buffer()), b.offset() as u64);
+    encoder.set_buffer(2, Some(out.metal_buffer()), out.offset() as u64);
+
+    if matches!(variant, DispatchVariant::General) {
+        let device = registry.device().raw();
+        let ndim = out_shape.len();
+
+        let shape_u32: Vec<u32> = out_shape
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| super::checked_u32(s, &format!("out_shape[{i}]")))
+            .collect::<Result<Vec<u32>, _>>()?;
+
+        let a_bcast_strides = broadcast_strides(a.shape(), &out_shape);
+        let b_bcast_strides = broadcast_strides(b.shape(), &out_shape);
+
+        let a_strides_u32: Vec<u32> = a_bcast_strides
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| super::checked_u32(s, &format!("a_strides[{i}]")))
+            .collect::<Result<Vec<u32>, _>>()?;
+        let b_strides_u32: Vec<u32> = b_bcast_strides
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| super::checked_u32(s, &format!("b_strides[{i}]")))
+            .collect::<Result<Vec<u32>, _>>()?;
+
+        let buf_size = |v: &[u32]| std::mem::size_of_val(v) as u64;
+
+        let shape_buf = device.new_buffer_with_data(
+            shape_u32.as_ptr() as *const _,
+            buf_size(&shape_u32),
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        let a_stride_buf = device.new_buffer_with_data(
+            a_strides_u32.as_ptr() as *const _,
+            buf_size(&a_strides_u32),
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        let b_stride_buf = device.new_buffer_with_data(
+            b_strides_u32.as_ptr() as *const _,
+            buf_size(&b_strides_u32),
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        let ndim_val = super::checked_u32(ndim, "ndim")?;
+        let ndim_buf = device.new_buffer_with_data(
+            &ndim_val as *const u32 as *const _,
+            std::mem::size_of::<u32>() as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+
+        encoder.set_buffer(3, Some(&shape_buf), 0);
+        encoder.set_buffer(4, Some(&a_stride_buf), 0);
+        encoder.set_buffer(5, Some(&b_stride_buf), 0);
+        encoder.set_buffer(6, Some(&ndim_buf), 0);
+    }
+
+    let grid_size = MTLSize::new(out_numel as u64, 1, 1);
+    let threadgroup_size = MTLSize::new(
+        std::cmp::min(
+            pipeline.max_total_threads_per_threadgroup(),
+            out_numel as u64,
+        ),
+        1,
+        1,
+    );
+    encoder.dispatch_threads(grid_size, threadgroup_size);
+    encoder.end_encoding();
+
+    Ok(out)
+}
+
+/// Encode add into an existing command buffer (no commit/wait).
+pub fn add_into_cb(
+    registry: &KernelRegistry,
+    a: &Array,
+    b: &Array,
+    cb: &metal::CommandBufferRef,
+) -> Result<Array, KernelError> {
+    binary_op_into_cb(registry, a, b, BinaryOp::Add, cb)
+}
+
+/// Encode mul into an existing command buffer (no commit/wait).
+pub fn mul_into_cb(
+    registry: &KernelRegistry,
+    a: &Array,
+    b: &Array,
+    cb: &metal::CommandBufferRef,
+) -> Result<Array, KernelError> {
+    binary_op_into_cb(registry, a, b, BinaryOp::Mul, cb)
+}
+
+// ---------------------------------------------------------------------------
 // Unit tests (CPU-only, no Metal device required)
 // ---------------------------------------------------------------------------
 
