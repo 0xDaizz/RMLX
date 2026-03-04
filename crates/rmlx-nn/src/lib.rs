@@ -7,6 +7,7 @@ pub mod attention;
 pub mod conv;
 pub mod dynamic;
 pub mod embedding;
+pub mod expert_group;
 pub mod gguf_loader;
 pub mod layer_norm;
 pub mod linear;
@@ -27,6 +28,7 @@ pub use attention::{
 pub use conv::{Conv1d, Conv1dConfig, Conv2d, Conv2dConfig};
 pub use dynamic::DynamicExecContext;
 pub use embedding::{Embedding, EmbeddingConfig};
+pub use expert_group::ExpertGroup;
 pub use gguf_loader::{GgufLoadError, GgufWeightMap};
 pub use layer_norm::{LayerNorm, LayerNormConfig};
 pub use linear::{Linear, LinearConfig};
