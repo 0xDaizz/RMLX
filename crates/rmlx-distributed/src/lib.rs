@@ -4,6 +4,7 @@
 
 pub mod credit_manager;
 pub mod ep_runtime;
+pub mod fp8_exchange;
 pub mod group;
 pub mod init;
 pub mod metrics;
@@ -19,6 +20,7 @@ pub mod warmup;
 // ── Re-exports of core types ──
 pub use credit_manager::CreditManager;
 pub use ep_runtime::EpRuntimeContext;
+pub use fp8_exchange::Fp8DispatchPayload;
 pub use group::{DistributedError, Group, RdmaTransport, ReduceDtype, ReduceOp};
 pub use init::{init, BackendHint, DistributedContext, InitConfig};
 pub use metrics::{MoeMetrics as MoeMetricsAtomic, MoeMetricsSnapshot};
