@@ -37,7 +37,7 @@ RMLX includes lightweight distributed setup/launch helpers modeled after
 
 ```bash
 # 1) Generate hostfile + baseline host setup (from control node)
-python3 scripts/rmlx_distributed_config.py \
+rmlx config \
   --hosts node1,node2 \
   --backend rdma \
   --over thunderbolt \
@@ -47,13 +47,13 @@ python3 scripts/rmlx_distributed_config.py \
   --verbose
 
 # 2) Validate RDMA visibility on each host
-python3 scripts/rmlx_launch.py \
+rmlx launch \
   --backend rdma \
   --hostfile rmlx-hosts.json \
   -- ibv_devices
 
 # 3) Run RDMA crate tests on both hosts
-python3 scripts/rmlx_launch.py \
+rmlx launch \
   --backend rdma \
   --hostfile rmlx-hosts.json \
   -- cargo test -p rmlx-rdma -- --nocapture

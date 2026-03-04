@@ -1,6 +1,6 @@
 # 크레이트 구조
 
-RMLX는 Cargo workspace로 구성된 6개의 크레이트와 부가 디렉토리로 이루어져 있습니다.
+RMLX는 Cargo workspace로 구성된 7개의 크레이트와 부가 디렉토리로 이루어져 있습니다.
 
 ---
 
@@ -106,21 +106,26 @@ rmlx/
 │   │       ├── warmup.rs         # 분산 워밍업
 │   │       └── metrics.rs        # 분산 메트릭 수집
 │   │
-│   └── rmlx-nn/                  # 신경망 레이어
-│       ├── Cargo.toml            # deps: rmlx-core
+│   ├── rmlx-nn/                  # 신경망 레이어
+│   │   ├── Cargo.toml            # deps: rmlx-core
+│   │   └── src/
+│   │       ├── lib.rs
+│   │       ├── linear.rs         # Linear (quantized 지원)
+│   │       ├── embedding.rs
+│   │       ├── attention.rs      # Multi-head/GQA attention
+│   │       ├── transformer.rs    # Transformer block
+│   │       ├── moe.rs            # MoE gate + expert 라우팅
+│   │       └── models/
+│   │           ├── mod.rs
+│   │           ├── llama.rs      # LLaMA 아키텍처
+│   │           ├── qwen.rs       # Qwen/Qwen2.5
+│   │           ├── deepseek.rs   # DeepSeek-V3 (MoE)
+│   │           └── mixtral.rs    # Mixtral (MoE)
+│   │
+│   └── rmlx-cli/                 # 네이티브 CLI 도구
+│       ├── Cargo.toml            # deps: clap, serde, serde_json
 │       └── src/
-│           ├── lib.rs
-│           ├── linear.rs         # Linear (quantized 지원)
-│           ├── embedding.rs
-│           ├── attention.rs      # Multi-head/GQA attention
-│           ├── transformer.rs    # Transformer block
-│           ├── moe.rs            # MoE gate + expert 라우팅
-│           └── models/
-│               ├── mod.rs
-│               ├── llama.rs      # LLaMA 아키텍처
-│               ├── qwen.rs       # Qwen/Qwen2.5
-│               ├── deepseek.rs   # DeepSeek-V3 (MoE)
-│               └── mixtral.rs    # Mixtral (MoE)
+│           └── main.rs           # rmlx config, rmlx launch 서브커맨드
 │
 ├── shaders/                      # Metal 셰이더 소스
 │   ├── mlx_compat/               # MLX에서 가져온 .metal 파일
@@ -234,6 +239,17 @@ rmlx/
 
 ---
 
+### rmlx-cli — 네이티브 CLI 도구
+
+| 항목 | 내용 |
+|------|------|
+| **목적** | 분산 클러스터 관리를 위한 `rmlx` 명령줄 인터페이스를 제공합니다. MLX의 `mlx.distributed_config`와 `mlx.launch`를 모델로 한 `rmlx config`(호스트파일 생성 및 기본 설정)과 `rmlx launch`(멀티 노드 프로세스 오케스트레이션)를 구현합니다. |
+| **핵심 명령** | `rmlx config` (호스트 탐색, RDMA 백엔드 설정, 호스트파일 출력), `rmlx launch` (SSH 기반 멀티 노드 명령 전달) |
+| **의존성** | `rmlx-distributed`, `rmlx-rdma` |
+| **현재 상태** | 초기 구현 — config 및 launch 서브커맨드 동작 |
+
+---
+
 ## 워크스페이스 설정
 
 ```toml
@@ -248,6 +264,7 @@ members = [
     "crates/rmlx-core",
     "crates/rmlx-distributed",
     "crates/rmlx-nn",
+    "crates/rmlx-cli",
 ]
 
 [workspace.package]

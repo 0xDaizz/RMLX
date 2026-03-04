@@ -77,7 +77,7 @@ The ultimate goal is to connect two Mac Studio M3 Ultras via Thunderbolt 5 RDMA 
 | GPU | metal-rs 0.31 (Apple Metal API) |
 | RDMA | ibverbs FFI (Thunderbolt 5 UC QP) |
 | Hardware | Apple Silicon UMA (M3 Ultra, 80-core GPU, 512GB) |
-| Build | Cargo workspace (6 crates) |
+| Build | Cargo workspace (7 crates) |
 
 ---
 
@@ -97,7 +97,7 @@ Use the built-in RMLX helpers (modeled after `mlx.distributed_config` and `mlx.l
 
 ```bash
 # 1) Generate hostfile + baseline setup
-python3 scripts/rmlx_distributed_config.py \
+rmlx config \
   --hosts node1,node2 \
   --backend rdma \
   --over thunderbolt \
@@ -107,7 +107,7 @@ python3 scripts/rmlx_distributed_config.py \
   --verbose
 
 # 2) Validate RDMA visibility on each host
-python3 scripts/rmlx_launch.py \
+rmlx launch \
   --backend rdma \
   --hostfile rmlx-hosts.json \
   -- ibv_devices
@@ -128,7 +128,8 @@ rmlx/
 │   ├── rmlx-rdma/           # RDMA communication (ibverbs)
 │   ├── rmlx-core/           # Compute engine (Op registry, VJP autodiff, LoRA)
 │   ├── rmlx-distributed/    # Distributed primitives (EP, AllReduce, MoE)
-│   └── rmlx-nn/             # Neural network layers (Transformer, MoE)
+│   ├── rmlx-nn/             # Neural network layers (Transformer, MoE)
+│   └── rmlx-cli/            # Native CLI tooling (rmlx launch, rmlx config)
 ├── shaders/                 # Metal shader sources
 ├── tests/                   # Integration tests
 ├── benches/                 # Benchmarks

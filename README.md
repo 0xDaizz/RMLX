@@ -125,21 +125,23 @@ cargo clippy --workspace -- -D warnings
 Distributed 2-node RDMA runbook (minimal):
 
 ```bash
-python3 scripts/rmlx_distributed_config.py --hosts node1,node2 --backend rdma --over thunderbolt --output rmlx-hosts.json --verbose
-python3 scripts/rmlx_launch.py --backend rdma --hostfile rmlx-hosts.json -- ibv_devices
+# cargo install --path crates/rmlx-cli   (one-time)
+rmlx config --hosts node1,node2 --backend rdma --over thunderbolt --output rmlx-hosts.json --verbose
+rmlx launch --backend rdma --hostfile rmlx-hosts.json -- ibv_devices
 ```
 
 ## 📁 Project Structure
 
 ```
-rmlx/                           # 6 crates, 543 tests
+rmlx/                           # 7 crates, 543 tests
 ├── crates/
 │   ├── rmlx-metal/             # Metal GPU abstraction (ExecGraph, CommandBatcher, Fence, Capture)
 │   ├── rmlx-alloc/             # Zero-copy memory allocator (Residency, SmallAlloc)
 │   ├── rmlx-rdma/              # RDMA communication (ibverbs FFI, Coordinator, Collectives)
 │   ├── rmlx-core/              # Compute engine (25 op modules, formats, graph, autodiff)
 │   ├── rmlx-distributed/       # Distributed primitives (EP, MoE, Shared Expert)
-│   └── rmlx-nn/                # Neural network layers (Transformer, MoE, MLA, QuantizedLinear, GGUF)
+│   ├── rmlx-nn/                # Neural network layers (Transformer, MoE, MLA, QuantizedLinear, GGUF)
+│   └── rmlx-cli/               # Native CLI tooling (rmlx launch, rmlx config)
 ├── shaders/                    # Metal shader sources
 ├── tests/                      # Integration tests
 ├── benches/                    # Criterion benchmarks
@@ -150,7 +152,7 @@ rmlx/                           # 6 crates, 543 tests
 
 | Metric | Value |
 |--------|-------|
-| Crates | 6 |
+| Crates | 7 |
 | Tests | 543 |
 | Op modules | 25 |
 | NN activations | 14 |
