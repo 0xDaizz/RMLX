@@ -31,7 +31,7 @@ pub use gguf_loader::{GgufLoadError, GgufWeightMap};
 pub use layer_norm::{LayerNorm, LayerNormConfig};
 pub use linear::{Linear, LinearConfig};
 pub use mla::{Mla, MlaConfig, MlaKvCache};
-pub use moe::{load_balance_loss, MoeConfig, MoeForwardMetrics, MoeLayer};
+pub use moe::{load_balance_loss, Expert, MoeConfig, MoeForwardMetrics, MoeLayer};
 pub use quantized_linear::{QuantBits, QuantizedLinear, QuantizedLinearConfig};
 pub use sliding_window::{SlidingWindowAttention, SlidingWindowAttentionConfig};
 pub use transformer::{
