@@ -1,5 +1,7 @@
 use rmlx_distributed::group::{self, DistributedError, Group, RdmaTransport};
-use rmlx_distributed::moe_exchange::{MoeCombineExchange, MoeDispatchConfig, MoeDispatchExchange};
+use rmlx_distributed::moe_exchange::{
+    MoeCombineExchange, MoeDispatchConfig, MoeDispatchExchange, WireProtocol,
+};
 use rmlx_distributed::moe_policy::{MoeBackend, MoePolicy, ThresholdCalibration};
 use rmlx_distributed::sparse_guard::SparseGuard;
 use rmlx_distributed::warmup::WarmupState;
@@ -55,6 +57,8 @@ fn test_moe_dispatch_basic() {
         top_k: 2,
         capacity_factor: 1.25,
         group,
+        wire_protocol: WireProtocol::V2,
+        enable_fp8: false,
     };
     let mut exchange = MoeDispatchExchange::new(config, MoePolicy::new());
     // 4 tokens, top-2 => 8 expert assignments
@@ -79,6 +83,8 @@ fn test_moe_dispatch_overflow() {
         top_k: 1,
         capacity_factor: 1.0, // exact capacity
         group,
+        wire_protocol: WireProtocol::V2,
+        enable_fp8: false,
     };
     let mut exchange = MoeDispatchExchange::new(config, MoePolicy::new());
     // All tokens go to expert 0 — massive overflow
@@ -228,6 +234,8 @@ fn test_moe_dispatch_rdma_routing() {
         top_k: 2,
         capacity_factor: 1.25,
         group,
+        wire_protocol: WireProtocol::V2,
+        enable_fp8: false,
     };
     let mut policy = MoePolicy::new();
     policy.set_world_size(2);
@@ -340,6 +348,8 @@ fn test_route_cpu_scatters_tokens_correctly() {
         top_k: 1,
         capacity_factor: 1.25,
         group,
+        wire_protocol: WireProtocol::V2,
+        enable_fp8: false,
     };
     let mut exchange = MoeDispatchExchange::new(config, MoePolicy::new());
 
@@ -369,6 +379,8 @@ fn test_route_rdma_materialization_guard() {
         top_k: 1,
         capacity_factor: 1.0,
         group,
+        wire_protocol: WireProtocol::V2,
+        enable_fp8: false,
     };
     let mut policy = MoePolicy::new();
     policy.set_world_size(2);
@@ -393,6 +405,8 @@ fn test_dispatch_result_has_routed_data() {
         top_k: 1,
         capacity_factor: 1.0,
         group,
+        wire_protocol: WireProtocol::V2,
+        enable_fp8: false,
     };
     let mut exchange = MoeDispatchExchange::new(config, MoePolicy::new());
 
@@ -730,6 +744,8 @@ fn test_rdma_size_exchange_roundtrip() {
         top_k: 1,
         capacity_factor: 2.0,
         group,
+        wire_protocol: WireProtocol::V2,
+        enable_fp8: false,
     };
     // Use low thresholds so small batches still trigger RDMA path
     let mut policy = MoePolicy::with_thresholds(0, 1, 0);
@@ -784,6 +800,8 @@ fn test_rdma_expert_id_preserved_in_merge() {
             top_k: 1,
             capacity_factor: 2.0,
             group: group0,
+            wire_protocol: WireProtocol::V2,
+            enable_fp8: false,
         };
         let mut policy0 = MoePolicy::with_thresholds(0, 1, 0);
         policy0.set_world_size(2);
@@ -814,6 +832,8 @@ fn test_rdma_expert_id_preserved_in_merge() {
             top_k: 1,
             capacity_factor: 2.0,
             group: group1,
+            wire_protocol: WireProtocol::V2,
+            enable_fp8: false,
         };
         let mut policy1 = MoePolicy::with_thresholds(0, 1, 0);
         policy1.set_world_size(2);
@@ -899,6 +919,8 @@ fn test_rdma_wire_format_expert_id_prefix() {
         top_k: 1,
         capacity_factor: 2.0,
         group,
+        wire_protocol: WireProtocol::V2,
+        enable_fp8: false,
     };
     let mut policy = MoePolicy::with_thresholds(0, 0, 0);
     policy.set_world_size(2);
@@ -936,6 +958,8 @@ fn test_rdma_size_exchange_zero_payload() {
         top_k: 1,
         capacity_factor: 2.0,
         group,
+        wire_protocol: WireProtocol::V2,
+        enable_fp8: false,
     };
     let mut policy = MoePolicy::with_thresholds(0, 1, 0);
     policy.set_world_size(2);
@@ -970,6 +994,8 @@ fn test_dispatch_rejects_indivisible_experts() {
         top_k: 1,
         capacity_factor: 1.0,
         group,
+        wire_protocol: WireProtocol::V2,
+        enable_fp8: false,
     };
     let mut exchange = MoeDispatchExchange::new(config, MoePolicy::new());
     let indices = vec![0u32; 4];
@@ -990,6 +1016,8 @@ fn test_dispatch_rejects_zero_num_experts() {
         top_k: 1,
         capacity_factor: 1.0,
         group,
+        wire_protocol: WireProtocol::V2,
+        enable_fp8: false,
     };
     let mut exchange = MoeDispatchExchange::new(config, MoePolicy::new());
     // batch_size=1, top_k=1 → need 1 index and 1 weight
@@ -1014,6 +1042,8 @@ fn test_dispatch_rejects_out_of_range_expert_index() {
         top_k: 1,
         capacity_factor: 1.0,
         group,
+        wire_protocol: WireProtocol::V2,
+        enable_fp8: false,
     };
     let mut exchange = MoeDispatchExchange::new(config, MoePolicy::new());
     // expert index 10 is out of range (num_experts=4)
@@ -1063,6 +1093,8 @@ fn make_exchange_with_guard(window_size: usize) -> MoeDispatchExchange {
         top_k: 1,
         capacity_factor: 1.0,
         group,
+        wire_protocol: WireProtocol::V2,
+        enable_fp8: false,
     };
     let mut exchange = MoeDispatchExchange::new(config, MoePolicy::new());
     // Replace the guard with a small window so evaluate() fires quickly.
@@ -1303,6 +1335,8 @@ fn test_dispatch_rejects_wrong_indices_length() {
         top_k: 2,
         capacity_factor: 1.0,
         group,
+        wire_protocol: WireProtocol::V2,
+        enable_fp8: false,
     };
     let mut exchange = MoeDispatchExchange::new(config, MoePolicy::new());
 
@@ -1327,6 +1361,8 @@ fn test_dispatch_rejects_wrong_weights_length() {
         top_k: 2,
         capacity_factor: 1.0,
         group,
+        wire_protocol: WireProtocol::V2,
+        enable_fp8: false,
     };
     let mut exchange = MoeDispatchExchange::new(config, MoePolicy::new());
 
@@ -1351,6 +1387,8 @@ fn test_dispatch_rejects_misaligned_token_data() {
         top_k: 1,
         capacity_factor: 1.0,
         group,
+        wire_protocol: WireProtocol::V2,
+        enable_fp8: false,
     };
     let mut exchange = MoeDispatchExchange::new(config, MoePolicy::new());
 
@@ -1469,6 +1507,8 @@ fn test_capacity_factor_runtime_update_affects_routing() {
         top_k: 1,
         capacity_factor: 1.0,
         group,
+        wire_protocol: WireProtocol::V2,
+        enable_fp8: false,
     };
     let mut policy = MoePolicy::new();
     policy.force_backend(Some(MoeBackend::Cpu));
@@ -1517,6 +1557,8 @@ fn test_capacity_factor_runtime_update_affects_routing() {
         top_k: 1,
         capacity_factor: 1.0, // baseline
         group: group2,
+        wire_protocol: WireProtocol::V2,
+        enable_fp8: false,
     };
     let mut policy2 = MoePolicy::new();
     policy2.force_backend(Some(MoeBackend::Cpu));
@@ -1581,6 +1623,8 @@ fn test_route_cpu_uses_runtime_capacity_factor() {
         top_k: 1,
         capacity_factor: 1.0, // baseline
         group,
+        wire_protocol: WireProtocol::V2,
+        enable_fp8: false,
     };
     let mut policy = MoePolicy::new();
     policy.force_backend(Some(MoeBackend::Cpu));
@@ -1784,6 +1828,8 @@ fn test_auto_set_policy_world_size() {
         top_k: 2,
         capacity_factor: 1.0,
         group,
+        wire_protocol: WireProtocol::V2,
+        enable_fp8: false,
     };
     let policy = MoePolicy::new();
     assert_eq!(policy.world_size(), 1); // default before construction
@@ -1802,6 +1848,8 @@ fn test_auto_set_policy_world_size_single_rank() {
         top_k: 1,
         capacity_factor: 1.0,
         group,
+        wire_protocol: WireProtocol::V2,
+        enable_fp8: false,
     };
     let policy = MoePolicy::new();
     let exchange = MoeDispatchExchange::new(config, policy);

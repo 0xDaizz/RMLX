@@ -98,6 +98,11 @@ impl MoePipeline {
         self.num_batches
     }
 
+    /// Access the pipeline configuration.
+    pub fn config(&self) -> &MoePipelineConfig {
+        &self.config
+    }
+
     /// Whether SBO is enabled.
     pub fn sbo_enabled(&self) -> bool {
         self.config.enable_sbo

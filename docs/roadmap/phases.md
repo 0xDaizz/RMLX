@@ -35,6 +35,7 @@ The rmlx project implementation roadmap. All phases through 9B-opt and serving s
 | EP-4 | Compute-Communication Overlap (TBO + SBO) | MoePipeline, GpuEvent chains, zero CPU waits in-flight | EP-2 + EP-3 | Complete |
 | EP-5 | FP8 Wire Format | Per-token E4M3 quantization, fused dequant-scatter, _into_cb exchange path | EP-3 | Complete |
 | EP-6 | ICB Sparse Expert Launch + RDMA Slab Ring | Sparse ICB execution + pre-registered slab ring zero-copy transfer | EP-4 + EP-5 | Complete |
+| EP-7 | ICB Full Metal Indirect Dispatch | Wire SparseExpertPlan into ExpertGroup GEMM encoding via Metal ICB indirect dispatch; skip empty experts at GPU command level | EP-6 | Planned |
 
 ---
 
@@ -71,6 +72,7 @@ The rmlx project implementation roadmap. All phases through 9B-opt and serving s
 | EP-4: Compute-Communication Overlap (TBO + SBO) (`moe_pipeline.rs`) | main (merged) | 543+ tests | Complete |
 | EP-5: FP8 Wire Format (`fp8.rs`, `fp8_exchange.rs`) | main (merged) | 543+ tests | Complete |
 | EP-6: ICB Sparse Expert Launch + RDMA Slab Ring (`icb_sparse.rs`, `slab_ring.rs`) | main (merged) | 543+ tests | Complete |
+| EP-7: ICB Full Metal Indirect Dispatch | -- | -- | Planned |
 
 ---
 
@@ -614,6 +616,34 @@ Post-audit EP optimization phases were merged into main to remove the remaining 
 | EP-6 | `crates/rmlx-metal/src/icb_sparse.rs`, `crates/rmlx-distributed/src/slab_ring.rs` | Sparse expert ICB launch cache + pre-registered RDMA slab ring with `GpuEvent` timeline sync | Complete |
 
 Current op module count: 27. Current test count: 543+.
+
+---
+
+## EP-7: ICB Full Metal Indirect Dispatch -- Planned
+
+### Goal
+
+Wire `SparseExpertPlan` into `ExpertGroup::grouped_forward()` via Metal Indirect Command Buffers, so empty experts are skipped at the GPU command encoding level rather than only at the gather/scatter level.
+
+### Background
+
+EP-6 implemented `SparseExpertPlan` and `IcbReplay` infrastructure. The current `forward_sparse_icb()` in `moe.rs` skips empty experts at the gather/scatter level but still uses the same `grouped_forward()` call path as the non-sparse case. The ICB plan and capacity vector are built but unused (`let _ = sparse_plan; let _ = capacity;`).
+
+### Key Deliverables
+
+- `ExpertGroup::grouped_forward_icb()`: accepts `SparseExpertPlan` + per-expert capacity, encodes only active experts via Metal ICB indirect dispatch
+- `IcbReplay` integration: cache compiled ICB commands per sparsity pattern, replay without re-encoding
+- `forward_sparse_icb()` in `moe.rs`: call `grouped_forward_icb()` instead of `grouped_forward()`
+- Benchmark: measure GPU kernel dispatch overhead reduction for sparse workloads (>50% experts empty)
+
+### Prerequisites
+
+- EP-6 (SparseExpertPlan, IcbReplay infrastructure)
+- ExpertGroup internal refactoring to support ICB-encoded GEMM dispatch
+
+### Estimated Impact
+
+Low-to-moderate: saves ~tens of microseconds per forward when sparsity is high. Most beneficial for large expert counts (64+) with highly sparse routing patterns.
 
 ---
 

@@ -95,6 +95,62 @@ impl Fp8DispatchPayload {
         // scales: num_tokens * 4 bytes
         self.num_tokens * self.hidden_dim + self.num_tokens * 4
     }
+
+    /// Pack FP8 payload into interleaved wire format:
+    /// `[fp8_token0: D bytes][scale0: 4 bytes][fp8_token1: D bytes][scale1: 4 bytes]...`
+    ///
+    /// This interleaved format is compatible with `route_rdma`'s `token_stride = hidden_dim + 4`.
+    pub fn pack_for_wire(&self) -> Vec<u8> {
+        let stride = self.hidden_dim + 4; // D bytes FP8 + 4 bytes f32 scale
+        let mut wire = Vec::with_capacity(self.num_tokens * stride);
+        let fp8_bytes = self.fp8_data.to_bytes();
+        let scale_bytes = self.scales.to_bytes();
+        for i in 0..self.num_tokens {
+            let fp8_start = i * self.hidden_dim;
+            wire.extend_from_slice(&fp8_bytes[fp8_start..fp8_start + self.hidden_dim]);
+            let scale_start = i * 4;
+            wire.extend_from_slice(&scale_bytes[scale_start..scale_start + 4]);
+        }
+        wire
+    }
+}
+
+/// Unpack interleaved FP8 wire format back to separate `(fp8_bytes, scale_bytes)`.
+///
+/// Returns `(fp8_data_flat: Vec<u8>, scales_flat: Vec<u8>)` ready for
+/// `Array::from_bytes` reconstruction.
+///
+/// Returns an error if `wire_data` is too short for the expected
+/// `num_tokens * (hidden_dim + 4)` bytes.
+pub fn unpack_from_wire(
+    wire_data: &[u8],
+    num_tokens: usize,
+    hidden_dim: usize,
+) -> Result<(Vec<u8>, Vec<u8>), KernelError> {
+    let stride = hidden_dim + 4;
+    let expected_len = num_tokens * stride;
+    if wire_data.len() < expected_len {
+        return Err(KernelError::InvalidShape(format!(
+            "FP8 unpack: wire_data length {} < expected {} (tokens={}, stride={})",
+            wire_data.len(),
+            expected_len,
+            num_tokens,
+            stride
+        )));
+    }
+    let mut fp8_data = Vec::with_capacity(num_tokens * hidden_dim);
+    let mut scales = Vec::with_capacity(num_tokens * 4);
+    for i in 0..num_tokens {
+        let off = i * stride;
+        fp8_data.extend_from_slice(&wire_data[off..off + hidden_dim]);
+        scales.extend_from_slice(&wire_data[off + hidden_dim..off + stride]);
+    }
+    Ok((fp8_data, scales))
+}
+
+/// Returns the per-token wire stride when FP8 is enabled: `hidden_dim` (FP8 bytes) + 4 (f32 scale).
+pub fn wire_token_stride(hidden_dim: usize) -> usize {
+    hidden_dim + 4
 }
 
 // ---------------------------------------------------------------------------
@@ -375,5 +431,56 @@ mod tests {
         let (fp8, raw) = wire_bytes(0, 4096, DType::Float16);
         assert_eq!(fp8, 0);
         assert_eq!(raw, 0);
+    }
+
+    #[test]
+    fn test_wire_token_stride() {
+        assert_eq!(wire_token_stride(4096), 4100);
+        assert_eq!(wire_token_stride(8192), 8196);
+        assert_eq!(wire_token_stride(0), 4);
+    }
+
+    #[test]
+    fn test_unpack_from_wire_roundtrip() {
+        // Simulate interleaved wire format: 2 tokens, hidden_dim=4
+        let hidden_dim = 4;
+        let num_tokens = 2;
+        let stride = hidden_dim + 4;
+
+        // Build wire data manually:
+        // token0: fp8=[0x10, 0x20, 0x30, 0x40], scale=[1.0 as f32 LE bytes]
+        // token1: fp8=[0x50, 0x60, 0x70, 0x80], scale=[2.0 as f32 LE bytes]
+        let mut wire = Vec::with_capacity(num_tokens * stride);
+        wire.extend_from_slice(&[0x10, 0x20, 0x30, 0x40]);
+        wire.extend_from_slice(&1.0f32.to_le_bytes());
+        wire.extend_from_slice(&[0x50, 0x60, 0x70, 0x80]);
+        wire.extend_from_slice(&2.0f32.to_le_bytes());
+
+        let (fp8_data, scales) = unpack_from_wire(&wire, num_tokens, hidden_dim).unwrap();
+
+        assert_eq!(
+            fp8_data,
+            vec![0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80]
+        );
+        assert_eq!(scales.len(), 8); // 2 tokens * 4 bytes each
+
+        // Verify scale values
+        let s0 = f32::from_le_bytes(scales[0..4].try_into().unwrap());
+        let s1 = f32::from_le_bytes(scales[4..8].try_into().unwrap());
+        assert_eq!(s0, 1.0);
+        assert_eq!(s1, 2.0);
+    }
+
+    #[test]
+    fn test_unpack_from_wire_truncated_input() {
+        // Wire data too short for 2 tokens with hidden_dim=4 (expects 16 bytes)
+        let short_wire = vec![0u8; 10];
+        let result = unpack_from_wire(&short_wire, 2, 4);
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("wire_data length 10 < expected 16"),
+            "unexpected error: {err_msg}"
+        );
     }
 }

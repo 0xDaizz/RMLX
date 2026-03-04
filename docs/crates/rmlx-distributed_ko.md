@@ -4,7 +4,7 @@
 
 `rmlx-distributed`는 분산 추론을 위한 통신 그룹, MoE (Mixture of Experts) 디스패치/결합 교환, 3-zone 백엔드 정책, compute↔RDMA 파이프라인 오버랩, 오버플로우 감시(SparseGuard), 워밍업 프로토콜, MoE 메트릭을 제공하는 크레이트입니다.
 
-> **상태:** 모든 모듈이 구현되어 있습니다. group, moe_exchange, moe_policy, pipeline, sparse_guard, warmup, metrics, v3_protocol, fp8_exchange, slab_ring. Phase 0+1+2 감사 수정 완료 (항목 D1-D10): 디스패치 루프 순서 수정 (k-outer), 랭크별 용량 분배, combine 커널 캐싱, byte threshold (4KB->2MB), 히스테리시스 경로 수정, 이중 쿨다운 시맨틱, 공유 expert 지원, EP 통합 개선. EP-3/EP-5/EP-6 최적화 추가 완료.
+> **상태:** 모든 모듈이 구현되어 있습니다. group, moe_exchange, moe_policy, pipeline, sparse_guard, warmup, metrics, v3_protocol, fp8_exchange, slab_ring. Phase 0+1+2 감사 수정 완료 (항목 D1-D10): 디스패치 루프 순서 수정 (k-outer), 랭크별 용량 분배, combine 커널 캐싱, byte threshold (4KB->2MB), 히스테리시스 경로 수정, 이중 쿨다운 시맨틱, 공유 expert 지원, EP 통합 개선. EP-3/EP-5/EP-6 최적화 추가 완료. EP-2~EP-6 순방향 경로 통합: `MoeDispatchConfig::new()` 생성자, `dispatch_fp8()` 편의 메서드, 모든 디스패치 경로에서 `WireProtocol::V3` 지원, `route_rdma`에 SlabRing 통합, FP8 와이어 헬퍼 (`pack_for_wire`, `unpack_from_wire`, `wire_token_stride`).
 
 ---
 
@@ -32,8 +32,20 @@ rmlx-distributed/src/
 | 모듈 | 주요 특징 |
 |------|-----------|
 | `v3_protocol.rs` | 가변 길이 2단계 교환 (count sendrecv + payload sendrecv), 패킹된 4바이트 `PacketMeta` 헤더, 16바이트 패킷 정렬 |
-| `fp8_exchange.rs` | 토큰별 FP8 E4M3 와이어 포맷, `_into_cb` 지원을 포함한 융합 `dequant_scatter_fp8e4m3` 디코드 경로 |
-| `slab_ring.rs` | `GpuEvent` 타임라인으로 동기화되는 zero-copy RDMA 프로듀서/컨슈머 흐름을 위한 사전 등록 `MTLBuffer` slab 링 |
+| `fp8_exchange.rs` | 토큰별 FP8 E4M3 와이어 포맷, `_into_cb` 지원을 포함한 융합 `dequant_scatter_fp8e4m3` 디코드 경로, 와이어 헬퍼 (`pack_for_wire`, `unpack_from_wire`, `wire_token_stride`) |
+| `slab_ring.rs` | `GpuEvent` 타임라인으로 동기화되는 zero-copy RDMA 프로듀서/컨슈머 흐름을 위한 사전 등록 `MTLBuffer` slab 링; `route_rdma`에서 사전 할당된 `local_output` 버퍼에 통합 |
+
+### fp8_exchange 와이어 헬퍼
+
+`fp8_exchange.rs`의 다음 헬퍼 함수들은 디스패치 경로에서 FP8 와이어 직렬화를 지원합니다:
+
+| 함수 | 설명 |
+|------|------|
+| `pack_for_wire(tokens, scales) -> Vec<u8>` | FP8 E4M3 양자화된 토큰과 토큰별 스케일을 RDMA 전송에 적합한 연속 와이어 포맷 바이트 버퍼로 패킹 |
+| `unpack_from_wire(wire_bytes, num_tokens, hidden_dim) -> (Vec<u8>, Vec<f32>)` | 와이어 포맷 버퍼를 FP8 토큰 데이터와 스케일 배열로 분리하여 언패킹 |
+| `wire_token_stride(hidden_dim) -> usize` | 와이어상의 토큰별 바이트 스트라이드 반환 (FP8 데이터 바이트 + 스케일 바이트), 버퍼 사전 할당 및 오프셋 계산에 사용 |
+
+이 헬퍼들은 `MoeDispatchConfig`에서 `enable_fp8 = true`일 때 `dispatch_fp8()` 및 RDMA 교환 경로에서 내부적으로 사용됩니다.
 
 ---
 
@@ -78,7 +90,7 @@ pub struct Group {
 
 ### MoeDispatchExchange
 
-토큰을 expert에 라우팅하는 디스패치 교환입니다.
+토큰을 expert에 라우팅하는 디스패치 교환입니다. 모든 디스패치 경로에서 `WireProtocol::V3` 및 FP8 교환을 지원합니다 (EP-2~EP-6 순방향 경로 통합).
 
 ```rust
 pub struct MoeDispatchConfig {
@@ -86,6 +98,8 @@ pub struct MoeDispatchConfig {
     pub top_k: usize,
     pub capacity_factor: f32,   // 1.0 = 정확, >1.0 = 오버프로비저닝
     pub group: Group,
+    pub wire_protocol: WireProtocol, // V2 (기본값) 또는 V3
+    pub enable_fp8: bool,            // RDMA 교환을 위한 FP8 양자화
 }
 
 pub struct MoeDispatchExchange {
@@ -95,12 +109,32 @@ pub struct MoeDispatchExchange {
 }
 ```
 
+#### MoeDispatchConfig::new()
+
+```rust
+impl MoeDispatchConfig {
+    pub fn new(num_experts: usize, top_k: usize, group: Group) -> Self;
+}
+```
+
+비파괴 기본값을 사용하는 편의 생성자: `capacity_factor = 1.0`, `wire_protocol = WireProtocol::V2`, `enable_fp8 = false`. 디스패치 설정을 생성하는 권장 진입점이며, 선택적 필드는 빌더 스타일 setter를 체이닝하여 설정할 수 있습니다.
+
 | 메서드 | 설명 |
 |--------|------|
-| `new(config, policy)` | 디스패치 교환 생성 |
-| `dispatch(batch_size, expert_indices, expert_weights)` | 토큰 디스패치 → `DispatchResult` |
+| `new(config, policy)` | 디스패치 교환 생성 (`MoeMetrics::with_experts(num_experts)` 초기화) |
+| `dispatch(batch_size, expert_indices, expert_weights)` | 토큰 디스패치 → `DispatchResult`; 메트릭에 expert별 카운트 기록 |
+| `dispatch_async(...)` | `dispatch`의 비동기 변형; 메트릭에 expert별 카운트 기록 |
+| `dispatch_fp8(batch_size, expert_indices, expert_weights)` | FP8 인식 디스패치 편의 래퍼; 설정에서 `enable_fp8 = true`일 때 RDMA 교환 전 토큰을 FP8 E4M3로 자동 양자화, 그 외에는 표준 `dispatch()`로 폴백 |
 | `metrics()` | 내부 메트릭 조회 |
 | `policy()` / `policy_mut()` | 정책 참조/변경 |
+
+#### WireProtocol::V3 지원
+
+모든 디스패치 경로 (`route_rdma`, `route_rdma_zero_copy`, `dispatch_async`)가 이제 `WireProtocol::V3`를 지원합니다. `wire_protocol`이 `V3`로 설정되면, `v3_protocol.rs`의 2단계 가변 길이 교환 프로토콜(count sendrecv + payload sendrecv, 패킹된 `PacketMeta` 헤더와 16바이트 정렬)을 사용합니다.
+
+#### route_rdma에서의 SlabRing 통합
+
+`route_rdma` 경로는 이제 `slab_ring.rs`와 통합되어 사전 할당된 Metal 버퍼 관리를 수행합니다. 디스패치마다 새 `local_output` 버퍼를 할당하는 대신, RDMA 경로가 `SlabRing` 프로듀서/컨슈머 링에서 slab을 획득하고, 사전 등록된 `MTLBuffer`에 RDMA 전송을 수행한 뒤, combine 단계 후 반환합니다. 이를 통해 디스패치별 할당 오버헤드를 제거하고 `GpuEvent` 타임라인으로 동기화되는 진정한 zero-copy RDMA 전송을 가능하게 합니다.
 
 ### DispatchResult
 
