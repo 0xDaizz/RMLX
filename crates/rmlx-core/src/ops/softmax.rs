@@ -35,8 +35,8 @@ constant constexpr uint N_READS   = 4;
 // Reduce max across all simdgroups in the threadgroup.
 // After this call every thread has the same `max_val` and `normalizer`.
 inline void cross_simdgroup_reduce(
-    float& max_val,
-    float& normalizer,
+    thread float& max_val,
+    thread float& normalizer,
     threadgroup float* local_max,
     threadgroup float* local_normalizer,
     uint simd_lane_id,
@@ -187,7 +187,6 @@ kernel void softmax_single_row_f16(
     }
 
     float normalizer = 0.0f;
-    float saved_max = max_val;
     cross_simdgroup_reduce(max_val, normalizer, local_max, local_normalizer,
                            simd_lane_id, simd_group_id);
     float row_max = max_val;
@@ -251,7 +250,6 @@ kernel void softmax_single_row_bf16(
     }
 
     float normalizer = 0.0f;
-    float saved_max = max_val;
     cross_simdgroup_reduce(max_val, normalizer, local_max, local_normalizer,
                            simd_lane_id, simd_group_id);
     float row_max = max_val;
