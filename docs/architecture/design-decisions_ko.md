@@ -220,11 +220,11 @@ Metal에는 동등한 capture-replay 메커니즘이 없습니다. 대신 ExecGr
 
 | CB | 연산 | 경계 이유 |
 |----|------|-----------|
-| CB1 | QKV projection + RoPE | 공유 입력 의존성 |
-| CB2 | SDPA (fused attention) | CB1 출력에 의존 |
-| CB3 | Output projection + residual | CB2에 의존 |
-| CB4 | FFN (gate + up + SiLU + down) | CB3에 의존 |
-| CB5 | Final residual + norm | CB4에 의존 |
+| CB1 | RMS norm + Q/K/V projections (fused) | 공유 입력 의존성 |
+| CB2 | Head split + RoPE + cache append | CB1 출력에 의존 |
+| CB3 | SDPA + head concat + O_proj | CB2에 의존 |
+| CB4 | Residual + pre-FFN norm | CB3에 의존 |
+| CB5 | Gate + up + silu_mul + down + residual | CB4에 의존 |
 
 각 경계는 후속 연산이 이전 CB의 출력에 의존하기 때문에 존재합니다.
 각 CB 내부에서는 여러 연산이 단일 encoder를 공유합니다.
@@ -234,7 +234,7 @@ Metal에는 동등한 capture-replay 메커니즘이 없습니다. 대신 ExecGr
 | 지표 | 베이스라인 | ExecGraph | 개선 |
 |------|-----------|-----------|------|
 | CB/layer | 65 | 5 | 92.3% 감소 |
-| 레이턴시/layer | 110.4ms | 6.8ms | 16.15x 속도 향상 |
+| 레이턴시/layer | ~112ms | ~6.4ms | 17.4x 속도 향상 |
 | CPU-GPU 동기화 | ~65 | ~1 | 98.5% 감소 |
 
 ### CUDA Graphs와의 트레이드오프
@@ -273,4 +273,4 @@ f16 가중치를 사용하는 7B 파라미터 모델 기준:
 ### 성능 영향
 
 크리티컬 패스에서 per-layer 전치 + 복사 오버헤드를 완전히 제거합니다.
-ExecGraph와 결합하여 16.15x 속도 향상에 기여합니다.
+ExecGraph와 결합하여 17.4x 속도 향상에 기여합니다.

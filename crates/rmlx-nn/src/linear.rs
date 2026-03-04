@@ -217,9 +217,10 @@ impl Linear {
     /// Weight shape: `[out_features, in_features]` -> `[in_features, out_features]`
     /// via stride swap (zero-copy).
     pub fn weight_transposed(&self) -> Result<Array, KernelError> {
-        let weight = self.weight.as_ref().ok_or_else(|| {
-            KernelError::InvalidShape("Linear: weights not loaded".to_string())
-        })?;
+        let weight = self
+            .weight
+            .as_ref()
+            .ok_or_else(|| KernelError::InvalidShape("Linear: weights not loaded".to_string()))?;
         Ok(weight.view(
             vec![self.config.in_features, self.config.out_features],
             vec![1, self.config.in_features],
@@ -236,9 +237,10 @@ impl Linear {
         registry: &KernelRegistry,
         queue: &metal::CommandQueue,
     ) -> Result<(), KernelError> {
-        let weight = self.weight.as_ref().ok_or_else(|| {
-            KernelError::InvalidShape("Linear: weights not loaded".to_string())
-        })?;
+        let weight = self
+            .weight
+            .as_ref()
+            .ok_or_else(|| KernelError::InvalidShape("Linear: weights not loaded".to_string()))?;
         let w_t = weight.view(
             vec![self.config.in_features, self.config.out_features],
             vec![1, self.config.in_features],
