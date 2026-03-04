@@ -22,6 +22,7 @@ pub mod sdpa_backward;
 pub mod select;
 pub mod silu;
 pub mod softmax;
+pub mod topk_route;
 pub mod unary;
 pub mod vjp_gpu;
 
@@ -95,6 +96,7 @@ pub fn register_all(registry: &KernelRegistry) -> Result<(), KernelError> {
     unary::register(registry)?;
     layer_norm::register(registry)?;
     gather_mm::register(registry)?;
+    topk_route::register(registry)?;
     select::register(registry)?;
     concat::register(registry)?;
     vjp_gpu::register(registry)?;
