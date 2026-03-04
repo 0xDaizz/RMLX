@@ -28,8 +28,8 @@ using namespace metal;
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-constexpr uint SIMD_SIZE = 32;
-constexpr uint TM = 4;   // rows per threadgroup
+constant constexpr uint SIMD_SIZE = 32;
+constant constexpr uint TM = 4;   // rows per threadgroup
 
 // ---------------------------------------------------------------------------
 // gemv_f32:  y = A * x    (A: [M, K], x: [K], y: [M])
