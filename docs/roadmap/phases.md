@@ -22,7 +22,7 @@ The rmlx project implementation roadmap. All phases through 9B-opt and serving s
 | 7B | VJP Autodiff | VJP autodiff + LoRA fine-tuning | Phase 7A | Complete |
 | 8 | KV Cache + API Surface | KV cache, parallel linear, API ergonomics | Phase 7B | Complete |
 | 9A | GPU Pipeline — ExecGraph | CommandBatcher, ExecGraph, ICB, `_into_cb()` pattern | Phase 8 | Complete |
-| 9B-opt | GPU Pipeline — Optimization | Weight pre-caching, contiguous transpose, 16.15x speedup | Phase 9A | Complete |
+| 9B-opt | GPU Pipeline — Optimization | Weight pre-caching, contiguous transpose, 17.4x speedup | Phase 9A | Complete |
 | S1 | Serving Quick Wins | GELU, RotatingKV, BatchKV | Phase 9 | Complete |
 | S2 | DType + Quantization | FP8, GGUF, AWQ/GPTQ | Phase 9 | Complete |
 | S3 | Attention Upgrade | Flash Attention 2, QuantizedKV | Phase 9 | Complete |
@@ -422,12 +422,12 @@ Pre-cache contiguous transposed weight matrices to eliminate transpose overhead 
 
 - `rmlx-nn`: `prepare_weight_t()` / `weight_transposed_contiguous()` for Linear
 - `rmlx-nn`: `prepare_weights_for_graph()` for TransformerModel/Block/Attention/FeedForward
-- Benchmark: 110.4ms → 6.8ms per layer (16.15x speedup)
+- Benchmark: ~112ms → ~6.4ms per layer (17.4x speedup)
 - Numerical parity: max_diff=6.4e-6
 
 #### Definition of Done (DoD)
 
-- [x] 16.15x speedup (110.4ms → 6.8ms)
+- [x] 17.4x speedup (~112ms → ~6.4ms)
 - [x] 92.3% CB reduction (65 → 5)
 - [x] Numerical parity (max_diff=6.4e-6)
 - [x] All 339+ tests passing

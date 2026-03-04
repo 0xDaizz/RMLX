@@ -132,6 +132,14 @@ pub fn gather_mm(
     indices: &Array,
     queue: &metal::CommandQueue,
 ) -> Result<Array, KernelError> {
+    // If gather_mm doesn't support f16/bf16, fall back to standard matmul.
+    // The tiled gather_mm kernel only has an f32 variant; rather than
+    // silently producing incorrect results or panicking, route half-precision
+    // inputs through the general matmul path which handles type promotion.
+    if matches!(x.dtype(), DType::Float16 | DType::Bfloat16) {
+        return super::matmul::matmul(registry, x, weights, queue);
+    }
+
     // Validate shapes
     if x.ndim() != 3 {
         return Err(KernelError::InvalidShape(format!(

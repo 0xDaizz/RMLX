@@ -8,12 +8,15 @@
 extern crate objc;
 
 pub mod autorelease;
+pub mod batcher;
 pub mod buffer;
 pub mod capture;
 pub mod command;
 pub mod device;
 pub mod event;
+pub mod exec_graph;
 pub mod fence;
+pub mod icb;
 pub mod library;
 pub mod library_cache;
 pub mod managed_buffer;
@@ -28,10 +31,12 @@ pub use metal;
 
 // Re-export core types for convenience
 pub use autorelease::ScopedPool;
+pub use batcher::CommandBatcher;
 pub use capture::{CaptureDestination, CaptureScope};
 pub use command::{BarrierTracker, CommandBufferManager, GpuError, GpuErrorStore};
 pub use device::{Architecture, GpuDevice};
 pub use event::GpuEvent;
+pub use exec_graph::ExecGraph;
 pub use fence::{FenceError, GpuFence};
 pub use library_cache::LibraryCache;
 pub use managed_buffer::{BufferAllocator, ManagedBuffer};

@@ -1434,6 +1434,30 @@ impl MoeDispatchExchange {
         self.cached_layout.as_ref()
     }
 
+    /// Number of ranks in the communication group.
+    pub fn world_size(&self) -> usize {
+        self.config.group.size()
+    }
+
+    /// Compute the local expert index range `[start, end)` for this rank.
+    ///
+    /// Experts are evenly partitioned across ranks: rank `r` owns experts
+    /// `[r * experts_per_rank, (r+1) * experts_per_rank)`.
+    ///
+    /// Returns `(0, num_experts)` if `world_size <= 1` (all experts are local).
+    pub fn local_expert_range(&self) -> (usize, usize) {
+        let ws = self.config.group.size();
+        let num_experts = self.config.num_experts;
+        if ws <= 1 {
+            return (0, num_experts);
+        }
+        let experts_per_rank = num_experts / ws;
+        let local_rank = self.config.group.local_rank() as usize;
+        let start = local_rank * experts_per_rank;
+        let end = start + experts_per_rank;
+        (start, end)
+    }
+
     /// Compute the recommended SharedBuffer tier size for the current
     /// runtime capacity factor and token parameters.
     ///

@@ -16,6 +16,7 @@ use metal::{CommandBuffer, CommandQueue, Device};
 
 use crate::command::CommandBufferManager;
 use crate::fence::GpuFence;
+use crate::MetalError;
 
 /// Well-known stream IDs.
 pub const STREAM_DEFAULT: u32 = 0;
@@ -100,27 +101,28 @@ impl StreamManager {
 
     /// Create a command buffer on the given stream.
     ///
-    /// Panics if `stream_id` does not exist (use `get_or_create_stream` first
-    /// or stick to the predefined IDs).
-    pub fn command_buffer(&self, stream_id: u32) -> CommandBuffer {
-        let state = self
-            .streams
-            .get(&stream_id)
-            .unwrap_or_else(|| panic!("stream {stream_id} does not exist"));
-        state.queue.new_command_buffer().to_owned()
+    /// Returns an error if `stream_id` does not exist (use `get_or_create_stream`
+    /// first or stick to the predefined IDs).
+    pub fn command_buffer(&self, stream_id: u32) -> Result<CommandBuffer, MetalError> {
+        let state = self.streams.get(&stream_id).ok_or_else(|| {
+            MetalError::KernelNotFound(format!("stream {stream_id} does not exist"))
+        })?;
+        Ok(state.queue.new_command_buffer().to_owned())
     }
 
     /// Create a [`CommandBufferManager`] for the given stream.
     ///
     /// The manager provides batching (M1) and completion-handler error checking (M4).
     ///
-    /// Panics if `stream_id` does not exist.
-    pub fn create_buffer_manager(&self, stream_id: u32) -> CommandBufferManager<'_> {
-        let state = self
-            .streams
-            .get(&stream_id)
-            .unwrap_or_else(|| panic!("stream {stream_id} does not exist"));
-        CommandBufferManager::new(&state.queue)
+    /// Returns an error if `stream_id` does not exist.
+    pub fn create_buffer_manager(
+        &self,
+        stream_id: u32,
+    ) -> Result<CommandBufferManager<'_>, MetalError> {
+        let state = self.streams.get(&stream_id).ok_or_else(|| {
+            MetalError::KernelNotFound(format!("stream {stream_id} does not exist"))
+        })?;
+        Ok(CommandBufferManager::new(&state.queue))
     }
 
     /// Synchronize `dst_stream` after `src_stream`.
@@ -159,12 +161,12 @@ impl StreamManager {
     }
 
     /// Create a command buffer on the compute stream.
-    pub fn compute_command_buffer(&self) -> CommandBuffer {
+    pub fn compute_command_buffer(&self) -> Result<CommandBuffer, MetalError> {
         self.command_buffer(STREAM_COMPUTE)
     }
 
     /// Create a command buffer on the copy/transfer stream.
-    pub fn transfer_command_buffer(&self) -> CommandBuffer {
+    pub fn transfer_command_buffer(&self) -> Result<CommandBuffer, MetalError> {
         self.command_buffer(STREAM_COPY)
     }
 
@@ -239,10 +241,10 @@ mod tests {
         let device = metal::Device::system_default().unwrap();
         let mgr = StreamManager::new(&device);
 
-        // Should not panic.
-        let _cb = mgr.compute_command_buffer();
-        let _cb = mgr.transfer_command_buffer();
-        let _cb = mgr.command_buffer(STREAM_DEFAULT);
+        // Should not fail for predefined streams.
+        let _cb = mgr.compute_command_buffer().unwrap();
+        let _cb = mgr.transfer_command_buffer().unwrap();
+        let _cb = mgr.command_buffer(STREAM_DEFAULT).unwrap();
     }
 
     #[test]
@@ -250,14 +252,14 @@ mod tests {
         let device = metal::Device::system_default().unwrap();
         let mgr = StreamManager::new(&device);
 
-        let cb1 = mgr.compute_command_buffer();
-        let cb2 = mgr.transfer_command_buffer();
+        let cb1 = mgr.compute_command_buffer().unwrap();
+        let cb2 = mgr.transfer_command_buffer().unwrap();
 
         let v1 = mgr.synchronize(&cb1, &cb2);
         assert_eq!(v1, 1);
 
-        let cb3 = mgr.compute_command_buffer();
-        let cb4 = mgr.transfer_command_buffer();
+        let cb3 = mgr.compute_command_buffer().unwrap();
+        let cb4 = mgr.transfer_command_buffer().unwrap();
         let v2 = mgr.synchronize(&cb3, &cb4);
         assert_eq!(v2, 2);
     }
@@ -267,8 +269,8 @@ mod tests {
         let device = metal::Device::system_default().unwrap();
         let mgr = StreamManager::new(&device);
 
-        let compute_cb = mgr.compute_command_buffer();
-        let transfer_cb = mgr.transfer_command_buffer();
+        let compute_cb = mgr.compute_command_buffer().unwrap();
+        let transfer_cb = mgr.transfer_command_buffer().unwrap();
 
         let v = mgr.sync_transfer_after_compute(&compute_cb, &transfer_cb);
         assert!(v > 0);

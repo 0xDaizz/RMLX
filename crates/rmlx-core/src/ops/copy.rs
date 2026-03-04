@@ -478,6 +478,61 @@ kernel void copy_strided_bf16(
     }
     dst[id] = src[src_offset];
 }
+
+// ===================================================================
+// Interleave heads (copy one head into columns of concatenated output)
+// ===================================================================
+
+kernel void interleave_heads_f32(
+    device const float* src [[buffer(0)]],
+    device float* dst [[buffer(1)]],
+    constant uint& seq_len [[buffer(2)]],
+    constant uint& head_dim [[buffer(3)]],
+    constant uint& num_heads [[buffer(4)]],
+    constant uint& head_idx [[buffer(5)]],
+    uint id [[thread_position_in_grid]])
+{
+    uint row = id / head_dim;
+    uint col = id % head_dim;
+    if (row >= seq_len) return;
+    uint src_idx = row * head_dim + col;
+    uint dst_idx = row * (num_heads * head_dim) + head_idx * head_dim + col;
+    dst[dst_idx] = src[src_idx];
+}
+
+kernel void interleave_heads_f16(
+    device const half* src [[buffer(0)]],
+    device half* dst [[buffer(1)]],
+    constant uint& seq_len [[buffer(2)]],
+    constant uint& head_dim [[buffer(3)]],
+    constant uint& num_heads [[buffer(4)]],
+    constant uint& head_idx [[buffer(5)]],
+    uint id [[thread_position_in_grid]])
+{
+    uint row = id / head_dim;
+    uint col = id % head_dim;
+    if (row >= seq_len) return;
+    uint src_idx = row * head_dim + col;
+    uint dst_idx = row * (num_heads * head_dim) + head_idx * head_dim + col;
+    dst[dst_idx] = src[src_idx];
+}
+
+kernel void interleave_heads_bf16(
+    device const bfloat* src [[buffer(0)]],
+    device bfloat* dst [[buffer(1)]],
+    constant uint& seq_len [[buffer(2)]],
+    constant uint& head_dim [[buffer(3)]],
+    constant uint& num_heads [[buffer(4)]],
+    constant uint& head_idx [[buffer(5)]],
+    uint id [[thread_position_in_grid]])
+{
+    uint row = id / head_dim;
+    uint col = id % head_dim;
+    if (row >= seq_len) return;
+    uint src_idx = row * head_dim + col;
+    uint dst_idx = row * (num_heads * head_dim) + head_idx * head_dim + col;
+    dst[dst_idx] = src[src_idx];
+}
 "#;
 
 // ---------------------------------------------------------------------------
@@ -973,6 +1028,112 @@ pub fn fill_f32(
     queue: &metal::CommandQueue,
 ) -> Result<Array, KernelError> {
     fill(registry, shape, &value.to_ne_bytes(), DType::Float32, queue)
+}
+
+// ---------------------------------------------------------------------------
+// Into-CB variants (encode into existing command buffer, no commit/wait)
+// ---------------------------------------------------------------------------
+
+/// Encode a copy into an existing command buffer (no commit/wait).
+pub fn copy_into_cb(
+    registry: &KernelRegistry,
+    src: &Array,
+    cb: &metal::CommandBufferRef,
+) -> Result<Array, KernelError> {
+    reject_quantized(src.dtype())?;
+
+    let numel = src.numel();
+    let out = Array::zeros(registry.device().raw(), src.shape(), src.dtype());
+
+    let encoder = cb.new_compute_command_encoder();
+
+    let pipeline = if src.is_contiguous() {
+        let kname = vectorized_kernel_name(src.dtype());
+        let pipeline = registry.get_pipeline(kname, src.dtype())?;
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(src.metal_buffer()), src.offset() as u64);
+        encoder.set_buffer(1, Some(out.metal_buffer()), out.offset() as u64);
+        let size_val = super::checked_u32(numel, "numel")?;
+        let size_buf = u32_buffer(registry.device().raw(), size_val);
+        encoder.set_buffer(2, Some(&size_buf), 0);
+        pipeline
+    } else {
+        encode_strided(registry, src, encoder, &out)?
+    };
+
+    let threads = if src.is_contiguous() {
+        let w = wpt(src.dtype());
+        (numel as u64).div_ceil(w)
+    } else {
+        numel as u64
+    };
+
+    let grid_size = MTLSize::new(threads, 1, 1);
+    let threadgroup_size = MTLSize::new(
+        std::cmp::min(pipeline.max_total_threads_per_threadgroup(), threads),
+        1,
+        1,
+    );
+    encoder.dispatch_threads(grid_size, threadgroup_size);
+    encoder.end_encoding();
+
+    Ok(out)
+}
+
+/// Encode head interleaving into an existing command buffer (no commit/wait).
+///
+/// Copies one attention head's output [seq_len, head_dim] into the correct
+/// columns of the output [seq_len, num_heads * head_dim] for head concatenation.
+#[allow(clippy::too_many_arguments)]
+pub fn interleave_heads_into_cb(
+    registry: &KernelRegistry,
+    src: &Array,
+    dst: &Array,
+    seq_len: usize,
+    head_dim: usize,
+    num_heads: usize,
+    head_idx: usize,
+    cb: &metal::CommandBufferRef,
+) -> Result<(), KernelError> {
+    let kernel_name = match src.dtype() {
+        DType::Float32 => "interleave_heads_f32",
+        DType::Float16 => "interleave_heads_f16",
+        DType::Bfloat16 => "interleave_heads_bf16",
+        other => {
+            return Err(KernelError::NotFound(format!(
+                "interleave_heads not supported for {other}"
+            )))
+        }
+    };
+
+    let pipeline = registry.get_pipeline(kernel_name, src.dtype())?;
+    let device = registry.device().raw();
+
+    let seq_len_buf = u32_buffer(device, seq_len as u32);
+    let head_dim_buf = u32_buffer(device, head_dim as u32);
+    let num_heads_buf = u32_buffer(device, num_heads as u32);
+    let head_idx_buf = u32_buffer(device, head_idx as u32);
+
+    let encoder = cb.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(src.metal_buffer()), src.offset() as u64);
+    encoder.set_buffer(1, Some(dst.metal_buffer()), dst.offset() as u64);
+    encoder.set_buffer(2, Some(&seq_len_buf), 0);
+    encoder.set_buffer(3, Some(&head_dim_buf), 0);
+    encoder.set_buffer(4, Some(&num_heads_buf), 0);
+    encoder.set_buffer(5, Some(&head_idx_buf), 0);
+
+    let total_threads = (seq_len * head_dim) as u64;
+    let grid_size = MTLSize::new(total_threads, 1, 1);
+    let threadgroup_size = MTLSize::new(
+        std::cmp::min(pipeline.max_total_threads_per_threadgroup(), total_threads),
+        1,
+        1,
+    );
+    encoder.dispatch_threads(grid_size, threadgroup_size);
+    encoder.end_encoding();
+
+    Ok(())
 }
 
 #[cfg(test)]

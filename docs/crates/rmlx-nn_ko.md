@@ -4,7 +4,7 @@
 
 `rmlx-nn`은 GPU 가속 추론을 위한 신경망 레이어를 구현하는 크레이트입니다. Transformer 아키텍처의 핵심 구성 요소(Linear, Embedding, Attention, TransformerBlock, MoE)를 `rmlx-core`의 연산 커널 위에 구성하며, LLaMA, Qwen, DeepSeek-V3, Mixtral 모델 설정을 내장하고 있습니다.
 
-> **상태 (Phase 0-9B-opt + S1-S5):** Linear, Embedding, Attention (KV 캐시 포함), TransformerBlock, MoE, Parallel (TP), 4종 모델 설정(LLaMA 7B/3-8B, Qwen2 7B, DeepSeek-V3, Mixtral 8x7B), RotatingKvCache, BatchKvCache, QuantizedKvCache, QuantizedArray, Conv1d/Conv2d, DynamicExecContext가 구현되어 있습니다. Phase 9에서 `forward_graph()`, `forward_into_cb()`, 가중치 사전 캐싱(`prepare_weight_t`)이 추가되어 ExecGraph CB 배칭을 지원합니다 (레이어당 65 CB -> 5 CB, 92.3% 감소, 16.15x 속도 향상).
+> **상태 (Phase 0-9B-opt + S1-S5):** Linear, Embedding, Attention (KV 캐시 포함), TransformerBlock, MoE, Parallel (TP), 4종 모델 설정(LLaMA 7B/3-8B, Qwen2 7B, DeepSeek-V3, Mixtral 8x7B), RotatingKvCache, BatchKvCache, QuantizedKvCache, QuantizedArray, Conv1d/Conv2d, DynamicExecContext가 구현되어 있습니다. Phase 9에서 `forward_graph()`, `forward_into_cb()`, 가중치 사전 캐싱(`prepare_weight_t`)이 추가되어 ExecGraph CB 배칭을 지원합니다 (레이어당 65 CB -> 5 CB, 92.3% 감소, 17.4x 속도 향상).
 
 ---
 
@@ -84,7 +84,7 @@ pub struct Linear {
 | `weight_transposed_contiguous()` | 캐싱된 전치 가중치 반환 (사전 준비된 경우) |
 
 가중치 메모리를 약 2배 사용하는 대신 추론 시 전치 비용을 제거하여
-16.15x 속도 향상에 기여합니다.
+17.4x 속도 향상에 기여합니다.
 
 ---
 

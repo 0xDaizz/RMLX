@@ -150,8 +150,12 @@ pub fn ring_allreduce(
                 )
             };
 
-            let right = mgr.right_connection().unwrap();
-            let left = mgr.left_connection().unwrap();
+            let right = mgr.right_connection().ok_or_else(|| {
+                RdmaError::ConnectionFailed("ring_allreduce: right connection lost".into())
+            })?;
+            let left = mgr.left_connection().ok_or_else(|| {
+                RdmaError::ConnectionFailed("ring_allreduce: left connection lost".into())
+            })?;
 
             // Register MRs
             let recv_reg = left.register_recv_slice(recv_data)?;
@@ -212,8 +216,12 @@ pub fn ring_allreduce(
                 )
             };
 
-            let right = mgr.right_connection().unwrap();
-            let left = mgr.left_connection().unwrap();
+            let right = mgr.right_connection().ok_or_else(|| {
+                RdmaError::ConnectionFailed("ring_allreduce: right connection lost".into())
+            })?;
+            let left = mgr.left_connection().ok_or_else(|| {
+                RdmaError::ConnectionFailed("ring_allreduce: left connection lost".into())
+            })?;
 
             let recv_reg = left.register_recv_slice(recv_data)?;
             let send_reg = right.register_send_slice(send_data)?;
@@ -285,8 +293,12 @@ pub fn ring_allgather(
         let recv_idx = ((rank + world_size - step - 1) % world_size) as usize;
 
         if mgr.right_connection().is_some() && mgr.left_connection().is_some() {
-            let right = mgr.right_connection().unwrap();
-            let left = mgr.left_connection().unwrap();
+            let right = mgr.right_connection().ok_or_else(|| {
+                RdmaError::ConnectionFailed("ring_allgather: right connection lost".into())
+            })?;
+            let left = mgr.left_connection().ok_or_else(|| {
+                RdmaError::ConnectionFailed("ring_allgather: left connection lost".into())
+            })?;
 
             let send_data = &chunks[send_idx];
             let send_reg = right.register_send_slice(send_data)?;
@@ -365,8 +377,12 @@ pub fn ring_reduce_scatter(
                 )
             };
 
-            let right = mgr.right_connection().unwrap();
-            let left = mgr.left_connection().unwrap();
+            let right = mgr.right_connection().ok_or_else(|| {
+                RdmaError::ConnectionFailed("ring_reduce_scatter: right connection lost".into())
+            })?;
+            let left = mgr.left_connection().ok_or_else(|| {
+                RdmaError::ConnectionFailed("ring_reduce_scatter: left connection lost".into())
+            })?;
 
             let recv_reg = left.register_recv_slice(recv_data)?;
             let send_reg = right.register_send_slice(send_data)?;

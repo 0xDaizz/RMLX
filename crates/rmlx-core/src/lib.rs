@@ -24,6 +24,7 @@ pub use lora::{LoraConfig, LoraLayer, LoraModel, LoraTrainer, TrainConfig};
 pub use metrics::{MetricsSnapshot, RuntimeMetrics};
 pub use ops::{CommandBufferHandle, ExecMode, LaunchResult};
 pub use precision_guard::{GuardAction, PrecisionGuard, PrecisionResult};
+pub use rmlx_alloc::{AllocError, MetalAllocator};
 pub use shutdown::{ShutdownHandle, ShutdownSignal};
 pub use vjp::{AddGrad, GradFn, MatMulGrad, MulGrad, Operation, Tape, TapedValue, VjpError};
 

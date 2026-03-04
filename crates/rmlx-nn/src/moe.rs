@@ -11,11 +11,13 @@
 //! - Optional shared expert for DeepSeek-V3 style architectures (N7)
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::{KernelError, KernelRegistry};
 use rmlx_core::ops;
+use rmlx_core::MetalAllocator;
 
 #[cfg(feature = "distributed")]
 use rmlx_distributed::MoeDispatchExchange;
@@ -168,6 +170,10 @@ pub struct MoeLayer {
     /// that own specific experts, instead of being processed locally.
     #[cfg(feature = "distributed")]
     exchange: Option<MoeDispatchExchange>,
+    /// Optional buffer pool allocator for reusing Metal buffers.
+    /// When set, intermediate buffers (e.g., the output accumulator in forward())
+    /// are allocated through the pool, reducing allocation overhead.
+    allocator: Option<Arc<MetalAllocator>>,
 }
 
 impl MoeLayer {
@@ -183,6 +189,7 @@ impl MoeLayer {
             shared_expert: None,
             #[cfg(feature = "distributed")]
             exchange: None,
+            allocator: None,
         })
     }
 
@@ -209,6 +216,7 @@ impl MoeLayer {
             shared_expert: None,
             #[cfg(feature = "distributed")]
             exchange: None,
+            allocator: None,
         })
     }
 
@@ -230,6 +238,16 @@ impl MoeLayer {
     #[cfg(feature = "distributed")]
     pub fn with_exchange(mut self, exchange: MoeDispatchExchange) -> Self {
         self.exchange = Some(exchange);
+        self
+    }
+
+    /// Set a buffer pool allocator for reduced allocation overhead.
+    ///
+    /// When set, `forward()` allocates intermediate buffers (e.g., the output
+    /// accumulator and per-expert batch buffers) through the pool, reusing
+    /// cached Metal buffers instead of allocating fresh ones every call.
+    pub fn with_allocator(mut self, allocator: Arc<MetalAllocator>) -> Self {
+        self.allocator = Some(allocator);
         self
     }
 
@@ -271,6 +289,30 @@ impl MoeLayer {
         let num_experts = self.config.num_experts;
         let dev = registry.device().raw();
         let elem_size = x.dtype().size_of();
+
+        // ── N5: Determine local expert range for EP (expert parallelism) ──
+        // When an exchange is configured with world_size > 1, this rank only
+        // owns a subset of experts. Tokens routed to remote experts are skipped
+        // in the local forward pass (they would be handled by the full
+        // dispatch/combine exchange path at the caller level).
+        #[cfg(feature = "distributed")]
+        let local_expert_range: (usize, usize) = match self.exchange {
+            Some(ref ex) if ex.world_size() > 1 => ex.local_expert_range(),
+            _ => (0, num_experts),
+        };
+        #[cfg(not(feature = "distributed"))]
+        let local_expert_range: (usize, usize) = (0, num_experts);
+
+        // ── Allocator-aware zero-fill: reuse pooled buffers when available ──
+        let alloc_zeros = |shape: &[usize], dtype: DType| -> Array {
+            if let Some(ref alloc) = self.allocator {
+                // Try pooled allocation first; fall back to fresh allocation on error.
+                if let Ok(arr) = Array::zeros_pooled(alloc, shape, dtype) {
+                    return arr;
+                }
+            }
+            Array::zeros(dev, shape, dtype)
+        };
 
         // Record metrics
         self.metrics.record_forward(seq_len as u64);
@@ -339,10 +381,19 @@ impl MoeLayer {
         // we do at most num_experts batched forward passes.
 
         // Output accumulator: [seq_len, hidden_dim], zero-initialized
-        let output = Array::zeros(dev, &[seq_len, hidden_dim], x.dtype());
+        let output = alloc_zeros(&[seq_len, hidden_dim], x.dtype());
 
+        let (local_start, local_end) = local_expert_range;
         for (expert_idx, dispatch) in expert_dispatch.iter().enumerate() {
             if dispatch.is_empty() {
+                continue;
+            }
+
+            // ── N5: Skip non-local experts in EP mode ──
+            // When running with expert parallelism (world_size > 1), only
+            // process experts owned by this rank. Remote expert tokens are
+            // handled by the exchange dispatch/combine path.
+            if expert_idx < local_start || expert_idx >= local_end {
                 continue;
             }
 
@@ -358,7 +409,7 @@ impl MoeLayer {
                 ops::copy::copy(registry, &tok_view, queue)?
             } else {
                 // Multiple tokens: build contiguous batch using GPU copy
-                let batch_buf = Array::zeros(dev, &[batch_size, hidden_dim], x.dtype());
+                let batch_buf = alloc_zeros(&[batch_size, hidden_dim], x.dtype());
                 let copy_kernel = match x.dtype() {
                     DType::Float32 => "copy_f32",
                     DType::Float16 => "copy_f16",

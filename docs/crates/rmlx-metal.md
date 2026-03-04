@@ -453,13 +453,13 @@ with minimal command buffers.
 
 | CB | Operations |
 |----|-----------|
-| CB1 | QKV projection + RoPE |
-| CB2 | SDPA (fused attention) |
-| CB3 | Output projection + residual |
-| CB4 | FFN (gate + up + SiLU + down) |
-| CB5 | Final residual + norm |
+| CB1 | RMS norm + Q/K/V projections (fused) |
+| CB2 | Head split + RoPE + cache append |
+| CB3 | SDPA + head concat + O_proj |
+| CB4 | Residual + pre-FFN norm |
+| CB5 | Gate + up + silu_mul + down + residual |
 
-**Performance**: 65 CBs/layer -> 5 CBs/layer (92.3% reduction), achieving 16.15x speedup.
+**Performance**: 65 CBs/layer -> 5 CBs/layer (92.3% reduction), achieving 17.4x speedup.
 
 ---
 
