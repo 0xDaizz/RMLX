@@ -171,9 +171,10 @@ pub struct MoeLayer {
     #[cfg(feature = "distributed")]
     exchange: Option<MoeDispatchExchange>,
     /// Optional buffer pool allocator for reusing Metal buffers.
-    /// When set, intermediate buffers (e.g., the output accumulator in forward())
-    /// are allocated through the pool, reducing allocation overhead.
     allocator: Option<Arc<MetalAllocator>>,
+    /// Optional per-expert bias for adaptive routing (DeepSeek-style, aux-loss-free).
+    /// Shape: `[num_experts]`, Float32. Added to gate logits before softmax.
+    expert_bias: Option<Array>,
 }
 
 impl MoeLayer {
@@ -190,6 +191,7 @@ impl MoeLayer {
             #[cfg(feature = "distributed")]
             exchange: None,
             allocator: None,
+            expert_bias: None,
         })
     }
 
@@ -217,6 +219,7 @@ impl MoeLayer {
             #[cfg(feature = "distributed")]
             exchange: None,
             allocator: None,
+            expert_bias: None,
         })
     }
 
@@ -251,23 +254,77 @@ impl MoeLayer {
         self
     }
 
+    /// Set a per-expert bias for adaptive routing (DeepSeek-style, aux-loss-free).
+    ///
+    /// The bias is added to gate logits before softmax during GPU top-k routing.
+    /// Use `update_expert_bias()` after each forward pass to adaptively balance
+    /// expert utilization without auxiliary loss.
+    pub fn with_expert_bias(mut self, bias: Array) -> Self {
+        self.expert_bias = Some(bias);
+        self
+    }
+
+    /// Initialize zero expert bias on the given device.
+    pub fn init_expert_bias(&mut self, device: &metal::Device) {
+        let bias = Array::zeros(device, &[self.config.num_experts], DType::Float32);
+        self.expert_bias = Some(bias);
+    }
+
+    /// Update expert bias based on routing counts (DeepSeek-style adaptive bias).
+    ///
+    /// `bias[e] += lr * (mean_count - count[e])` — encourages underutilized experts
+    /// to receive more tokens. This runs entirely on the GPU via elementwise ops.
+    ///
+    /// Call this after `forward()` using the `expert_counts` from `TopkRouteResult`.
+    pub fn update_expert_bias(
+        &mut self,
+        expert_counts: &Array,
+        lr: f32,
+        registry: &KernelRegistry,
+        queue: &metal::CommandQueue,
+    ) -> Result<(), KernelError> {
+        let bias = match self.expert_bias.as_ref() {
+            Some(b) => b,
+            None => return Ok(()),
+        };
+
+        let dev = registry.device().raw();
+        let num_experts = self.config.num_experts;
+
+        // Compute mean_count on CPU (single scalar, cheap)
+        let counts: Vec<u32> = expert_counts.to_vec_checked();
+        let total: u32 = counts.iter().sum();
+        let mean_count = total as f32 / num_experts as f32;
+
+        // Build (mean_count - count[e]) * lr as a Float32 array
+        let delta: Vec<f32> = counts
+            .iter()
+            .map(|&c| lr * (mean_count - c as f32))
+            .collect();
+        let delta_arr = Array::from_slice(dev, &delta, vec![num_experts]);
+
+        // bias = bias + delta (GPU elementwise add)
+        let new_bias = ops::binary::add(registry, bias, &delta_arr, queue)?;
+        self.expert_bias = Some(new_bias);
+
+        Ok(())
+    }
+
     /// Whether a shared expert is configured.
     pub fn has_shared_expert(&self) -> bool {
         self.shared_expert.is_some()
     }
 
-    /// Forward pass for MoE with capacity-based batched dispatch.
+    /// Forward pass for MoE with GPU-native routing and batched expert dispatch.
     ///
     /// `x`: [seq_len, hidden_dim]
     /// Returns: [seq_len, hidden_dim]
     ///
-    /// Algorithm (batched, not per-token):
+    /// Algorithm:
     /// 1. Compute gate logits via gate projection
-    /// 2. CPU-side top-k selection using partial sort (O(n*k) not O(n*log n))
-    ///    TODO: Replace with GPU top-k kernel when Metal kernel JIT is available
-    ///    in rmlx-nn, eliminating the GPU->CPU sync entirely.
-    /// 3. Group tokens by assigned expert (dispatch buffers)
-    /// 4. Run one batched forward pass per expert (not per token)
+    /// 2. GPU top-k routing: softmax → top-k → normalize → histogram (zero CPU sync)
+    /// 3. Read routing results to CPU for expert dispatch
+    /// 4. Run one batched forward pass per expert
     /// 5. Scatter weighted results back to original token positions
     pub fn forward(
         &self,
@@ -291,10 +348,6 @@ impl MoeLayer {
         let elem_size = x.dtype().size_of();
 
         // ── N5: Determine local expert range for EP (expert parallelism) ──
-        // When an exchange is configured with world_size > 1, this rank only
-        // owns a subset of experts. Tokens routed to remote experts are skipped
-        // in the local forward pass (they would be handled by the full
-        // dispatch/combine exchange path at the caller level).
         #[cfg(feature = "distributed")]
         let local_expert_range: (usize, usize) = match self.exchange {
             Some(ref ex) if ex.world_size() > 1 => ex.local_expert_range(),
@@ -306,7 +359,6 @@ impl MoeLayer {
         // ── Allocator-aware zero-fill: reuse pooled buffers when available ──
         let alloc_zeros = |shape: &[usize], dtype: DType| -> Array {
             if let Some(ref alloc) = self.allocator {
-                // Try pooled allocation first; fall back to fresh allocation on error.
                 if let Ok(arr) = Array::zeros_pooled(alloc, shape, dtype) {
                     return arr;
                 }
@@ -320,66 +372,38 @@ impl MoeLayer {
         // Gate logits: [seq_len, num_experts]
         let gate_logits = gate.forward(x, registry, queue)?;
 
-        // Softmax over experts for each token: [seq_len, num_experts]
-        let gate_probs = ops::softmax::softmax(registry, &gate_logits, queue)?;
+        // ── GPU top-k routing: eliminates the GPU→CPU→GPU round-trip ──
+        // The GPU kernel computes: softmax → top-k → normalize → histogram → prefix scan
+        // in a single command buffer with zero CPU synchronization.
+        let route_result = ops::topk_route::gpu_topk_route(
+            registry,
+            &gate_logits,
+            top_k,
+            self.expert_bias.as_ref(),
+            queue,
+        )?;
 
-        // ── N1 fix: Optimized CPU top-k using partial sort ──
-        // Read gate probs to CPU. This is a single sync point (unavoidable
-        // without a GPU top-k kernel). We use partial sort (select top-k per
-        // row) instead of full sort to minimize CPU work.
-        // TODO: Implement GPU top-k kernel to eliminate this sync entirely.
-        let probs_vec: Vec<f32> = gate_probs.to_vec_checked();
+        // Read GPU routing results to CPU for expert dispatch.
+        // This is the minimal data transfer: just indices and weights, not the full
+        // softmax output. The actual token data stays on GPU throughout.
+        let indices_vec: Vec<u32> = route_result.expert_indices.to_vec_checked();
+        let weights_vec: Vec<f32> = route_result.expert_weights.to_vec_checked();
 
-        // Per-token routing: (expert_idx, normalized_weight) for each of top_k slots
-        // Also build dispatch buffers: which tokens go to which expert
+        // Build dispatch buffers: which tokens go to which expert
         // expert_dispatch[e] = Vec<(token_idx, normalized_weight)>
         let mut expert_dispatch: Vec<Vec<(usize, f32)>> = vec![Vec::new(); num_experts];
 
         for tok in 0..seq_len {
-            let row_start = tok * num_experts;
-            let row_probs = &probs_vec[row_start..row_start + num_experts];
-
-            // Partial sort: find top-k by selecting k largest (O(n*k) not O(n*log n))
-            let mut top_entries: Vec<(usize, f32)> = Vec::with_capacity(top_k);
-            let mut used = [false; 256]; // Max 256 experts; stack-allocated for speed
-            debug_assert!(
-                num_experts <= 256,
-                "num_experts ({num_experts}) exceeds static used-array size"
-            );
-
-            for _ in 0..top_k {
-                let mut best_idx = 0;
-                let mut best_val = f32::NEG_INFINITY;
-                for (j, &prob) in row_probs.iter().enumerate() {
-                    if !used[j] && prob > best_val {
-                        best_val = prob;
-                        best_idx = j;
-                    }
-                }
-                used[best_idx] = true;
-                top_entries.push((best_idx, best_val));
-            }
-
-            // Normalize top-k weights
-            let weight_sum: f32 = top_entries.iter().map(|(_, w)| w).sum();
-            let inv_sum = if weight_sum > 0.0 {
-                1.0 / weight_sum
-            } else {
-                0.0
-            };
-
-            // Record per-expert token routing and build dispatch buffers
-            for &(expert_idx, raw_weight) in &top_entries {
+            for k in 0..top_k {
+                let flat_idx = tok * top_k + k;
+                let expert_idx = indices_vec[flat_idx] as usize;
+                let weight = weights_vec[flat_idx];
                 self.metrics.record_expert_token(expert_idx);
-                let normalized_weight = raw_weight * inv_sum;
-                expert_dispatch[expert_idx].push((tok, normalized_weight));
+                expert_dispatch[expert_idx].push((tok, weight));
             }
         }
 
-        // ── N2 fix: Batched expert execution with dispatch buffers ──
-        // Instead of seq_len * top_k individual expert forward passes,
-        // we do at most num_experts batched forward passes.
-
+        // ── Batched expert execution with dispatch buffers ──
         // Output accumulator: [seq_len, hidden_dim], zero-initialized
         let output = alloc_zeros(&[seq_len, hidden_dim], x.dtype());
 
@@ -390,9 +414,6 @@ impl MoeLayer {
             }
 
             // ── N5: Skip non-local experts in EP mode ──
-            // When running with expert parallelism (world_size > 1), only
-            // process experts owned by this rank. Remote expert tokens are
-            // handled by the exchange dispatch/combine path.
             if expert_idx < local_start || expert_idx >= local_end {
                 continue;
             }
@@ -402,13 +423,11 @@ impl MoeLayer {
             // Gather token embeddings for this expert into a contiguous batch:
             // expert_input: [batch_size, hidden_dim]
             let expert_input = if batch_size == 1 {
-                // Single token: just create a view + copy
                 let tok = dispatch[0].0;
                 let tok_offset = x.offset() + tok * hidden_dim * elem_size;
                 let tok_view = x.view(vec![1, hidden_dim], vec![hidden_dim, 1], tok_offset);
                 ops::copy::copy(registry, &tok_view, queue)?
             } else {
-                // Multiple tokens: build contiguous batch using GPU copy
                 let batch_buf = alloc_zeros(&[batch_size, hidden_dim], x.dtype());
                 let copy_kernel = match x.dtype() {
                     DType::Float32 => "copy_f32",
@@ -466,24 +485,19 @@ impl MoeLayer {
             let pipeline = registry.get_pipeline(copy_kernel, x.dtype())?;
 
             for (i, &(tok, weight)) in dispatch.iter().enumerate() {
-                // Extract this token's expert output: [1, hidden_dim]
                 let expert_tok_offset = expert_out.offset() + i * hidden_dim * elem_size;
                 let expert_tok_view =
                     expert_out.view(vec![1, hidden_dim], vec![hidden_dim, 1], expert_tok_offset);
 
-                // Scale by routing weight
                 let scale_data = vec![weight; hidden_dim];
                 let scale_arr = Array::from_slice(dev, &scale_data, vec![1, hidden_dim]);
                 let scaled = ops::binary::mul(registry, &expert_tok_view, &scale_arr, queue)?;
 
-                // Read current output at this token position and add
                 let dst_offset = output.offset() + tok * hidden_dim * elem_size;
                 let dst_view = output.view(vec![1, hidden_dim], vec![hidden_dim, 1], dst_offset);
 
-                // Add scaled expert output to the accumulator at this position
                 let summed = ops::binary::add(registry, &dst_view, &scaled, queue)?;
 
-                // Copy the summed result back into the output buffer
                 let cb = queue.new_command_buffer();
                 let enc = cb.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(&pipeline);
@@ -506,8 +520,6 @@ impl MoeLayer {
         }
 
         // ── N7: Shared expert (DeepSeek-V3 pattern) ──
-        // If a shared expert is configured, run it on ALL tokens and add
-        // the result to the routed output.
         let output = if let Some(ref shared) = self.shared_expert {
             let shared_out = shared.forward(x, registry, queue)?;
             ops::binary::add(registry, &output, &shared_out, queue)?
