@@ -23,6 +23,7 @@ pub mod library_cache;
 pub mod managed_buffer;
 pub mod msl_version;
 pub mod pipeline;
+pub mod pipeline_cache;
 pub mod queue;
 pub mod self_check;
 pub mod stream;
@@ -35,15 +36,19 @@ pub use autorelease::ScopedPool;
 pub use batcher::CommandBatcher;
 pub use capture::{CaptureDestination, CaptureScope};
 pub use command::{BarrierTracker, CommandBufferManager, GpuError, GpuErrorStore};
-pub use device::{Architecture, GpuDevice};
+pub use device::{Architecture, ChipTuning, GpuDevice, DEFAULT_BUFFER_OPTIONS};
 pub use event::GpuEvent;
 pub use exec_graph::ExecGraph;
 pub use fence::{FenceError, GpuFence};
-pub use icb_sparse::{SparseExpertCache, SparseExpertConfig, SparseExpertKey, SparseExpertPlan};
+pub use icb_sparse::{
+    grouped_forward_icb, CachedSparsityPattern, IcbReplayCache, SparseDispatchResult,
+    SparseExpertCache, SparseExpertConfig, SparseExpertKey, SparseExpertPlan,
+};
 pub use library_cache::LibraryCache;
 pub use managed_buffer::{BufferAllocator, ManagedBuffer};
 pub use msl_version::{DeviceInfo, MslVersion};
 pub use pipeline::{FunctionConstant, PipelineCache};
+pub use pipeline_cache::DiskPipelineCache;
 pub use queue::GpuQueue;
 pub use stream::{StreamManager, STREAM_COMPUTE, STREAM_COPY, STREAM_DEFAULT};
 

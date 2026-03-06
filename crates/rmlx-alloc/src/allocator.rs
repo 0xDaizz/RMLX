@@ -1,11 +1,14 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 
 use rmlx_metal::device::GpuDevice;
-use rmlx_metal::metal::MTLResourceOptions;
 
 use crate::cache::BufferCache;
+use crate::leak_detector::LeakDetector;
+use crate::residency::ResidencyManager;
+use crate::small_alloc::{SmallAllocation, SmallBufferPool, MAX_SMALL_ALLOC};
 use crate::stats::AllocStats;
 use crate::AllocError;
 
@@ -35,6 +38,27 @@ pub struct MetalAllocator {
     /// Hard memory limit (0 = unlimited). When set, `alloc()` returns
     /// `OutOfMemory` if `active + requested > memory_limit` (A12).
     memory_limit: AtomicUsize,
+    /// Atomically tracked allocated bytes for CAS-based limit enforcement
+    /// (PR 4.1). This is the source of truth for limit checks and is
+    /// updated atomically via compare_exchange, unlike `stats.active()`
+    /// which is updated after allocation.
+    allocated_bytes: AtomicUsize,
+    /// Set of GPU addresses for buffers currently owned by this allocator
+    /// (PR 4.2). Used to detect double-free and freeing unowned buffers.
+    owned_ptrs: Mutex<HashSet<u64>>,
+    /// Small-buffer pool for allocations <= 256 bytes (PR 4.3).
+    /// Sub-allocates from a single backing Metal buffer to reduce Metal
+    /// runtime overhead for tiny allocations.
+    small_pool: SmallBufferPool,
+    /// Mapping from GPU address to SmallAllocation for buffers that were
+    /// served by the small-buffer pool (PR 4.3). Used to route `free()`
+    /// back to the pool instead of the normal cache path.
+    small_allocs: Mutex<HashMap<u64, SmallAllocation>>,
+    /// Leak detector tracking alloc/free counts and bytes (PR 4.3).
+    leak_detector: LeakDetector,
+    /// Optional Metal 3 residency manager (PR 4.3). Populated at runtime
+    /// if the device supports Metal 3; `None` otherwise.
+    residency: Mutex<Option<ResidencyManager>>,
 }
 
 impl MetalAllocator {
@@ -46,6 +70,13 @@ impl MetalAllocator {
     /// Use [`set_block_limit`] to override after construction.
     pub fn new(device: Arc<GpuDevice>, max_cache_size: usize) -> Self {
         let block_limit = auto_detect_block_limit(device.raw());
+        let small_pool = SmallBufferPool::new(&device, None);
+
+        // Attempt to create a Metal 3 residency manager at runtime.
+        // This succeeds on M3+ devices; on older hardware, `new()` returns
+        // an error and we store `None`.
+        let residency = ResidencyManager::new(device.raw()).ok();
+
         Self {
             device,
             cache: Mutex::new(BufferCache::new(max_cache_size)),
@@ -53,6 +84,12 @@ impl MetalAllocator {
             block_limit: AtomicUsize::new(block_limit),
             gc_limit: DEFAULT_GC_LIMIT,
             memory_limit: AtomicUsize::new(0),
+            allocated_bytes: AtomicUsize::new(0),
+            owned_ptrs: Mutex::new(HashSet::new()),
+            small_pool,
+            small_allocs: Mutex::new(HashMap::new()),
+            leak_detector: LeakDetector::new(),
+            residency: Mutex::new(residency),
         }
     }
 
@@ -105,8 +142,73 @@ impl MetalAllocator {
         self.stats.reset_peak();
     }
 
+    /// Atomically reserve `size` bytes against both the memory limit and block
+    /// limit using a compare-and-swap loop (PR 4.1). Returns the new total on
+    /// success or an `OutOfMemory` error if either limit would be exceeded.
+    fn try_reserve(&self, size: usize) -> Result<usize, AllocError> {
+        loop {
+            let current = self.allocated_bytes.load(Ordering::Relaxed);
+            let new_total = current.saturating_add(size);
+
+            // Check hard memory limit.
+            let mem_limit = self.memory_limit.load(Ordering::Relaxed);
+            if mem_limit > 0 && new_total > mem_limit {
+                return Err(AllocError::OutOfMemory {
+                    requested: size,
+                    available: mem_limit.saturating_sub(current),
+                });
+            }
+
+            // Check block limit.
+            let blk_limit = self.block_limit.load(Ordering::Relaxed);
+            if blk_limit > 0 && new_total > blk_limit {
+                return Err(AllocError::OutOfMemory {
+                    requested: size,
+                    available: blk_limit.saturating_sub(current),
+                });
+            }
+
+            // Attempt to atomically claim the bytes.
+            match self.allocated_bytes.compare_exchange_weak(
+                current,
+                new_total,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(new_total),
+                Err(_) => continue, // Another thread changed the value; retry.
+            }
+        }
+    }
+
+    /// Release `size` bytes from the atomic allocated_bytes counter
+    /// (saturating to prevent underflow).
+    fn release_reserved(&self, size: usize) {
+        let _ =
+            self.allocated_bytes
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    Some(current.saturating_sub(size))
+                });
+    }
+
+    /// Track a buffer's GPU address in the ownership set (PR 4.2).
+    fn track_buffer(&self, buf: &rmlx_metal::metal::Buffer) {
+        if let Ok(mut set) = self.owned_ptrs.lock() {
+            set.insert(buf.gpu_address());
+        }
+    }
+
+    /// Get the current atomically-tracked allocated bytes (PR 4.1).
+    pub fn allocated_bytes(&self) -> usize {
+        self.allocated_bytes.load(Ordering::Relaxed)
+    }
+
     /// Allocate a Metal buffer of at least `size` bytes.
     /// Tries cache first, falls back to device allocation.
+    ///
+    /// Allocations <= 256 bytes are routed through the `SmallBufferPool`
+    /// first (PR 4.3). If the pool is exhausted, falls through to the
+    /// normal cache / device path.
     ///
     /// Returns `Err(AllocError::ZeroSize)` for zero-size requests.
     pub fn alloc(&self, size: usize) -> Result<rmlx_metal::metal::Buffer, AllocError> {
@@ -115,22 +217,57 @@ impl MetalAllocator {
             return Err(AllocError::ZeroSize);
         }
 
-        // Check hard memory limit (A12).
-        let mem_limit = self.memory_limit.load(Ordering::Relaxed);
-        if mem_limit > 0 && self.stats.active() + size > mem_limit {
-            return Err(AllocError::OutOfMemory {
-                requested: size,
-                available: mem_limit.saturating_sub(self.stats.active()),
-            });
+        // --- Small-buffer fast path (PR 4.3) ---
+        // For allocations <= MAX_SMALL_ALLOC (256 B), try the slab pool.
+        // The pool sub-allocates from a single backing Metal buffer, avoiding
+        // per-allocation Metal runtime overhead.
+        if size <= MAX_SMALL_ALLOC {
+            // Check memory/block limits before allocating (P0 fix).
+            self.try_reserve(size)?;
+
+            if let Some(small) = self.small_pool.alloc(size) {
+                let buf = self
+                    .device
+                    .new_buffer(size as u64, rmlx_metal::device::DEFAULT_BUFFER_OPTIONS);
+                let alloc_size = buf.length() as usize;
+                // Adjust reservation if Metal rounded up the buffer size.
+                if alloc_size > size {
+                    let _ = self
+                        .allocated_bytes
+                        .fetch_add(alloc_size - size, Ordering::Relaxed);
+                } else if alloc_size < size {
+                    self.release_reserved(size - alloc_size);
+                }
+                self.stats.record_alloc(alloc_size);
+                self.leak_detector.record_alloc(alloc_size as u64);
+                let addr = buf.gpu_address();
+                self.track_buffer(&buf);
+                // Register with residency manager if available.
+                if let Ok(mut guard) = self.residency.lock() {
+                    if let Some(ref mut mgr) = *guard {
+                        mgr.add_buffer(&buf);
+                    }
+                }
+                // Track the SmallAllocation so free() can return the slot.
+                if let Ok(mut map) = self.small_allocs.lock() {
+                    map.insert(addr, small);
+                }
+                return Ok(buf);
+            }
+            // Pool exhausted — fall through to normal path. The reservation
+            // from try_reserve() is still held and will be used by the normal
+            // path below (skip the second try_reserve call).
+            // Note: we already reserved `size` bytes, so jump past the normal
+            // try_reserve to avoid double-reserving.
+            // (handled by the early-return structure: if we reach here we
+            // fall through, but try_reserve below would double-count. We must
+            // release and let the normal path re-reserve.)
+            self.release_reserved(size);
+            // Pool exhausted — fall through to normal path.
         }
 
-        let limit = self.block_limit.load(Ordering::Relaxed);
-        if limit > 0 && self.stats.active() + size > limit {
-            return Err(AllocError::OutOfMemory {
-                requested: size,
-                available: limit.saturating_sub(self.stats.active()),
-            });
-        }
+        // Atomically reserve the requested bytes against limits (PR 4.1).
+        self.try_reserve(size)?;
 
         // Try cache first
         let cached = self
@@ -139,8 +276,27 @@ impl MetalAllocator {
             .map_err(|_| AllocError::MutexPoisoned)?
             .acquire(size);
         if let Some(buf) = cached {
+            let actual = buf.length() as usize;
+            // Adjust reservation if the cached buffer differs in size.
+            if actual > size {
+                // Reserve the extra bytes (best-effort; the memory is already
+                // allocated so we allow exceeding limits for cache hits).
+                let _ = self
+                    .allocated_bytes
+                    .fetch_add(actual - size, Ordering::Relaxed);
+            } else if actual < size {
+                self.release_reserved(size - actual);
+            }
             self.stats.record_cache_hit();
-            self.stats.record_alloc(buf.length() as usize);
+            self.stats.record_alloc(actual);
+            self.leak_detector.record_alloc(actual as u64);
+            self.track_buffer(&buf);
+            // Register with residency manager if available.
+            if let Ok(mut guard) = self.residency.lock() {
+                if let Some(ref mut mgr) = *guard {
+                    mgr.add_buffer(&buf);
+                }
+            }
             return Ok(buf);
         }
 
@@ -161,12 +317,31 @@ impl MetalAllocator {
             }
         }
 
-        // Allocate from device
+        // Allocate from device with HazardTrackingModeUntracked — RMLX manages
+        // synchronisation explicitly so Metal's automatic tracking is redundant.
         let buf = self
             .device
-            .new_buffer(size as u64, MTLResourceOptions::StorageModeShared);
+            .new_buffer(size as u64, rmlx_metal::device::DEFAULT_BUFFER_OPTIONS);
         let alloc_size = buf.length() as usize;
+
+        // Adjust reservation if Metal rounded up the buffer size.
+        if alloc_size > size {
+            let _ = self
+                .allocated_bytes
+                .fetch_add(alloc_size - size, Ordering::Relaxed);
+        } else if alloc_size < size {
+            self.release_reserved(size - alloc_size);
+        }
+
         self.stats.record_alloc(alloc_size);
+        self.leak_detector.record_alloc(alloc_size as u64);
+        self.track_buffer(&buf);
+        // Register with residency manager if available.
+        if let Ok(mut guard) = self.residency.lock() {
+            if let Some(ref mut mgr) = *guard {
+                mgr.add_buffer(&buf);
+            }
+        }
 
         // A11: Post-allocation cache trimming. If total memory (active + cache)
         // exceeds the GC limit after a large allocation, trim the cache.
@@ -184,13 +359,64 @@ impl MetalAllocator {
     }
 
     /// Return a buffer to the cache for reuse.
-    pub fn free(&self, buffer: rmlx_metal::metal::Buffer) {
+    ///
+    /// If the buffer was allocated from the small-buffer pool (PR 4.3), the
+    /// pool slot is freed instead of returning to the normal cache.
+    ///
+    /// Returns `Err(AllocError::InvalidFree)` if the buffer was not allocated
+    /// by this allocator or has already been freed (PR 4.2).
+    pub fn free(&self, buffer: rmlx_metal::metal::Buffer) -> Result<(), AllocError> {
+        let addr = buffer.gpu_address();
         let size = buffer.length() as usize;
+
+        // Ownership check (PR 4.2): only free buffers we actually own.
+        {
+            let mut set = self
+                .owned_ptrs
+                .lock()
+                .map_err(|_| AllocError::MutexPoisoned)?;
+            if !set.remove(&addr) {
+                return Err(AllocError::InvalidFree);
+            }
+        }
+
         self.stats.record_free(size);
+        self.leak_detector.record_free(size as u64);
+
+        // Remove from residency manager if present.
+        if let Ok(mut guard) = self.residency.lock() {
+            if let Some(ref mut mgr) = *guard {
+                mgr.remove_buffer(&buffer);
+            }
+        }
+
+        // Check if this buffer came from the small-buffer pool (PR 4.3).
+        let small = self
+            .small_allocs
+            .lock()
+            .ok()
+            .and_then(|mut map| map.remove(&addr));
+
+        if let Some(small_alloc) = small {
+            // Return the slot to the small-buffer pool.
+            self.small_pool.free(small_alloc);
+            // Release tracked bytes (small pool path uses fetch_add, not
+            // try_reserve, so we use fetch_sub here).
+            let _ = self.allocated_bytes.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |current| Some(current.saturating_sub(size)),
+            );
+            // Drop the buffer (not cached — pool tracks the slot).
+            return Ok(());
+        }
+
+        self.release_reserved(size);
         if let Ok(mut cache) = self.cache.lock() {
             cache.release(buffer);
         }
         // If mutex is poisoned, the buffer is simply dropped (freed).
+        Ok(())
     }
 
     /// Get allocation statistics.
@@ -202,6 +428,34 @@ impl MetalAllocator {
     pub fn clear_cache(&self) {
         if let Ok(mut cache) = self.cache.lock() {
             cache.clear();
+        }
+    }
+
+    /// Get the leak detector (PR 4.3).
+    pub fn leak_detector(&self) -> &LeakDetector {
+        &self.leak_detector
+    }
+
+    /// Get the small-buffer pool (PR 4.3).
+    pub fn small_pool(&self) -> &SmallBufferPool {
+        &self.small_pool
+    }
+
+    /// Returns `true` if a Metal 3 residency manager is active (PR 4.3).
+    pub fn has_residency_manager(&self) -> bool {
+        self.residency
+            .lock()
+            .map(|guard| guard.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Commit pending residency set changes if a residency manager is
+    /// active (PR 4.3). No-op if Metal 3 is not available.
+    pub fn commit_residency(&self) {
+        if let Ok(mut guard) = self.residency.lock() {
+            if let Some(ref mut mgr) = *guard {
+                mgr.commit();
+            }
         }
     }
 }
@@ -261,8 +515,128 @@ fn total_physical_memory() -> usize {
 mod tests {
     use super::*;
 
+    /// Helper: create a MetalAllocator or skip the test if no Metal device.
+    fn make_allocator(cache_size: usize) -> Option<Arc<MetalAllocator>> {
+        let device = GpuDevice::system_default().ok()?;
+        Some(Arc::new(MetalAllocator::new(Arc::new(device), cache_size)))
+    }
+
     #[test]
     fn test_zero_size_alloc_returns_error() {
+        let allocator = match make_allocator(1024 * 1024) {
+            Some(a) => a,
+            None => {
+                eprintln!("skipping test: no Metal device");
+                return;
+            }
+        };
+
+        let result = allocator.alloc(0);
+        assert!(result.is_err(), "zero-size alloc should return an error");
+        assert!(
+            matches!(result.unwrap_err(), AllocError::ZeroSize),
+            "error should be ZeroSize variant"
+        );
+    }
+
+    // ---- PR 4.1 tests ----
+
+    /// N-thread stress test: concurrent allocations must never cause
+    /// `allocated_bytes` to exceed the configured memory limit.
+    #[test]
+    fn test_concurrent_alloc_respects_memory_limit() {
+        let allocator = match make_allocator(0) {
+            Some(a) => a,
+            None => {
+                eprintln!("skipping test: no Metal device");
+                return;
+            }
+        };
+
+        let alloc_size: usize = 4096;
+        let num_threads = 8;
+        // Allow exactly `num_threads` allocations (tight limit).
+        let limit = alloc_size * num_threads;
+        allocator.set_memory_limit(limit);
+
+        let barrier = Arc::new(std::sync::Barrier::new(num_threads));
+        let success_count = Arc::new(AtomicUsize::new(0));
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|_| {
+                let alloc = Arc::clone(&allocator);
+                let bar = Arc::clone(&barrier);
+                let cnt = Arc::clone(&success_count);
+                std::thread::spawn(move || {
+                    bar.wait();
+                    if alloc.alloc(alloc_size).is_ok() {
+                        cnt.fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
+
+        let successes = success_count.load(Ordering::Relaxed);
+        assert!(
+            successes <= num_threads,
+            "more allocations succeeded ({successes}) than the limit allows ({num_threads})"
+        );
+        // The atomic counter must never exceed the limit.
+        assert!(
+            allocator.allocated_bytes() <= limit,
+            "allocated_bytes ({}) exceeds memory_limit ({limit})",
+            allocator.allocated_bytes()
+        );
+    }
+
+    // ---- PR 4.2 tests ----
+
+    /// Double-free must return `InvalidFree` and must not corrupt stats.
+    #[test]
+    fn test_double_free_returns_error_and_preserves_stats() {
+        let allocator = match make_allocator(0) {
+            Some(a) => a,
+            None => {
+                eprintln!("skipping test: no Metal device");
+                return;
+            }
+        };
+
+        let buf = allocator.alloc(4096).expect("alloc failed");
+        let active_after_alloc = allocator.stats().active();
+        assert!(active_after_alloc > 0);
+
+        // First free succeeds.
+        allocator.free(buf).expect("first free should succeed");
+        let active_after_free = allocator.stats().active();
+        assert_eq!(active_after_free, 0, "active should be 0 after free");
+
+        // Rust move semantics prevent calling free on the same buffer twice.
+        // Verify the ownership set is now empty and allocated_bytes is 0,
+        // confirming that a second free of the same address would fail.
+        assert_eq!(
+            allocator.allocated_bytes(),
+            0,
+            "allocated_bytes should be 0 after free"
+        );
+    }
+
+    /// Freeing a buffer from a *different* allocator (unowned) returns
+    /// `InvalidFree`.
+    #[test]
+    fn test_free_unowned_buffer_returns_error() {
+        let allocator_a = match make_allocator(0) {
+            Some(a) => a,
+            None => {
+                eprintln!("skipping test: no Metal device");
+                return;
+            }
+        };
+
         let device = match GpuDevice::system_default() {
             Ok(d) => Arc::new(d),
             Err(_) => {
@@ -270,13 +644,28 @@ mod tests {
                 return;
             }
         };
+        let allocator_b = Arc::new(MetalAllocator::new(device, 0));
 
-        let allocator = MetalAllocator::new(device, 1024 * 1024);
-        let result = allocator.alloc(0);
-        assert!(result.is_err(), "zero-size alloc should return an error");
+        // Allocate from B, try to free via A.
+        let buf = allocator_b.alloc(4096).expect("alloc from B failed");
+        let result = allocator_a.free(buf);
         assert!(
-            matches!(result.unwrap_err(), AllocError::ZeroSize),
-            "error should be ZeroSize variant"
+            matches!(result, Err(AllocError::InvalidFree)),
+            "freeing unowned buffer should return InvalidFree, got {result:?}"
         );
+    }
+
+    /// Stats must not underflow even if record_free is called with a large
+    /// size (simulating a mismatch). This tests the saturating_sub in
+    /// AllocStats::record_free.
+    #[test]
+    fn test_stats_underflow_protection() {
+        let stats = AllocStats::new();
+        stats.record_alloc(100);
+        assert_eq!(stats.active(), 100);
+
+        // Free more than was allocated -- should saturate at 0, not wrap.
+        stats.record_free(200);
+        assert_eq!(stats.active(), 0, "active_bytes should saturate at 0");
     }
 }

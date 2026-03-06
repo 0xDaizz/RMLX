@@ -42,7 +42,13 @@ impl AllocStats {
 
     pub fn record_free(&self, size: usize) {
         self.total_frees.fetch_add(1, Ordering::Relaxed);
-        self.active_bytes.fetch_sub(size, Ordering::Relaxed);
+        // Use fetch_update + saturating_sub to prevent underflow on
+        // double-free or mismatched free (PR 4.2).
+        let _ = self
+            .active_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(size))
+            });
     }
 
     pub fn record_cache_hit(&self) {

@@ -398,11 +398,289 @@ kernel void rms_norm_single_bf16(
 }
 "#;
 
+/// Metal shader source for the fused RMSNorm + residual add kernel.
+///
+/// Computes `x = input[i] + residual[i]`, writes `x` back to `residual`
+/// (updated skip connection), then writes `RMSNorm(x, weight, eps)` to `output`.
+pub const RMS_NORM_RESIDUAL_ADD_SHADER_SOURCE: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup>
+using namespace metal;
+
+constant constexpr uint N_READS = 4;
+
+// ─── Shared reduction helper (same as rms_norm) ─────────────────────────
+inline float reduce_sum_of_squares_fused(
+    float acc,
+    uint axis_size,
+    float eps,
+    uint simd_lane_id,
+    uint simd_group_id,
+    threadgroup float* local_sums,
+    threadgroup float* local_inv_rms)
+{
+    constexpr int SIMD_SIZE = 32;
+
+    acc = simd_sum(acc);
+
+    if (simd_group_id == 0) {
+        local_sums[simd_lane_id] = 0;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_lane_id == 0) {
+        local_sums[simd_group_id] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_group_id == 0) {
+        acc = simd_sum(local_sums[simd_lane_id]);
+        if (simd_lane_id == 0) {
+            local_inv_rms[0] = metal::precise::rsqrt(acc / float(axis_size) + eps);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    return local_inv_rms[0];
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// f32 fused RMSNorm + residual add
+// ═══════════════════════════════════════════════════════════════════════════
+
+kernel void rms_norm_residual_add_f32(
+    device const float* input    [[buffer(0)]],
+    device       float* residual [[buffer(1)]],
+    device const float* weight   [[buffer(2)]],
+    device       float* output   [[buffer(3)]],
+    constant     uint&  axis_size [[buffer(4)]],
+    constant     float& eps      [[buffer(5)]],
+    constant     uint&  w_stride [[buffer(6)]],
+    constant     uint&  has_w    [[buffer(7)]],
+    uint row            [[threadgroup_position_in_grid]],
+    uint tid            [[thread_position_in_threadgroup]],
+    uint tgsize         [[threads_per_threadgroup]],
+    uint simd_lane_id   [[thread_index_in_simdgroup]],
+    uint simd_group_id  [[simdgroup_index_in_threadgroup]])
+{
+    constexpr int SIMD_SIZE = 32;
+    threadgroup float local_sums[SIMD_SIZE];
+    threadgroup float local_inv_rms[1];
+
+    size_t base = size_t(row) * size_t(axis_size);
+
+    // ── Phase 1: add residual + sum of squares ──
+    float acc = 0.0;
+    for (uint i = tid * N_READS; i < axis_size; i += tgsize * N_READS) {
+        if (i + 3 < axis_size) {
+            float x0 = input[base + i]     + residual[base + i];
+            float x1 = input[base + i + 1] + residual[base + i + 1];
+            float x2 = input[base + i + 2] + residual[base + i + 2];
+            float x3 = input[base + i + 3] + residual[base + i + 3];
+            residual[base + i]     = x0;
+            residual[base + i + 1] = x1;
+            residual[base + i + 2] = x2;
+            residual[base + i + 3] = x3;
+            acc += x0*x0 + x1*x1 + x2*x2 + x3*x3;
+        } else {
+            for (uint j = i; j < min(i + N_READS, axis_size); j++) {
+                float x = input[base + j] + residual[base + j];
+                residual[base + j] = x;
+                acc += x * x;
+            }
+        }
+    }
+
+    float rms = reduce_sum_of_squares_fused(acc, axis_size, eps,
+                                             simd_lane_id, simd_group_id,
+                                             local_sums, local_inv_rms);
+
+    // ── Phase 2: normalise + optional weight ──
+    for (uint i = tid * N_READS; i < axis_size; i += tgsize * N_READS) {
+        if (i + 3 < axis_size) {
+            float o0 = residual[base + i]     * rms;
+            float o1 = residual[base + i + 1] * rms;
+            float o2 = residual[base + i + 2] * rms;
+            float o3 = residual[base + i + 3] * rms;
+            if (has_w) {
+                o0 *= weight[i       * w_stride];
+                o1 *= weight[(i + 1) * w_stride];
+                o2 *= weight[(i + 2) * w_stride];
+                o3 *= weight[(i + 3) * w_stride];
+            }
+            output[base + i]     = o0;
+            output[base + i + 1] = o1;
+            output[base + i + 2] = o2;
+            output[base + i + 3] = o3;
+        } else {
+            for (uint j = i; j < min(i + N_READS, axis_size); j++) {
+                float o = residual[base + j] * rms;
+                if (has_w) { o *= weight[j * w_stride]; }
+                output[base + j] = o;
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// f16 fused RMSNorm + residual add
+// ═══════════════════════════════════════════════════════════════════════════
+
+kernel void rms_norm_residual_add_f16(
+    device const half*  input    [[buffer(0)]],
+    device       half*  residual [[buffer(1)]],
+    device const half*  weight   [[buffer(2)]],
+    device       half*  output   [[buffer(3)]],
+    constant     uint&  axis_size [[buffer(4)]],
+    constant     float& eps      [[buffer(5)]],
+    constant     uint&  w_stride [[buffer(6)]],
+    constant     uint&  has_w    [[buffer(7)]],
+    uint row            [[threadgroup_position_in_grid]],
+    uint tid            [[thread_position_in_threadgroup]],
+    uint tgsize         [[threads_per_threadgroup]],
+    uint simd_lane_id   [[thread_index_in_simdgroup]],
+    uint simd_group_id  [[simdgroup_index_in_threadgroup]])
+{
+    constexpr int SIMD_SIZE = 32;
+    threadgroup float local_sums[SIMD_SIZE];
+    threadgroup float local_inv_rms[1];
+
+    size_t base = size_t(row) * size_t(axis_size);
+
+    float acc = 0.0;
+    for (uint i = tid * N_READS; i < axis_size; i += tgsize * N_READS) {
+        if (i + 3 < axis_size) {
+            float x0 = float(input[base + i])     + float(residual[base + i]);
+            float x1 = float(input[base + i + 1]) + float(residual[base + i + 1]);
+            float x2 = float(input[base + i + 2]) + float(residual[base + i + 2]);
+            float x3 = float(input[base + i + 3]) + float(residual[base + i + 3]);
+            residual[base + i]     = half(x0);
+            residual[base + i + 1] = half(x1);
+            residual[base + i + 2] = half(x2);
+            residual[base + i + 3] = half(x3);
+            acc += x0*x0 + x1*x1 + x2*x2 + x3*x3;
+        } else {
+            for (uint j = i; j < min(i + N_READS, axis_size); j++) {
+                float x = float(input[base + j]) + float(residual[base + j]);
+                residual[base + j] = half(x);
+                acc += x * x;
+            }
+        }
+    }
+
+    float rms = reduce_sum_of_squares_fused(acc, axis_size, eps,
+                                             simd_lane_id, simd_group_id,
+                                             local_sums, local_inv_rms);
+
+    for (uint i = tid * N_READS; i < axis_size; i += tgsize * N_READS) {
+        if (i + 3 < axis_size) {
+            float o0 = float(residual[base + i])     * rms;
+            float o1 = float(residual[base + i + 1]) * rms;
+            float o2 = float(residual[base + i + 2]) * rms;
+            float o3 = float(residual[base + i + 3]) * rms;
+            if (has_w) {
+                o0 *= float(weight[i       * w_stride]);
+                o1 *= float(weight[(i + 1) * w_stride]);
+                o2 *= float(weight[(i + 2) * w_stride]);
+                o3 *= float(weight[(i + 3) * w_stride]);
+            }
+            output[base + i]     = half(o0);
+            output[base + i + 1] = half(o1);
+            output[base + i + 2] = half(o2);
+            output[base + i + 3] = half(o3);
+        } else {
+            for (uint j = i; j < min(i + N_READS, axis_size); j++) {
+                float o = float(residual[base + j]) * rms;
+                if (has_w) { o *= float(weight[j * w_stride]); }
+                output[base + j] = half(o);
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// bf16 fused RMSNorm + residual add
+// ═══════════════════════════════════════════════════════════════════════════
+
+kernel void rms_norm_residual_add_bf16(
+    device const bfloat* input    [[buffer(0)]],
+    device       bfloat* residual [[buffer(1)]],
+    device const bfloat* weight   [[buffer(2)]],
+    device       bfloat* output   [[buffer(3)]],
+    constant     uint&   axis_size [[buffer(4)]],
+    constant     float&  eps      [[buffer(5)]],
+    constant     uint&   w_stride [[buffer(6)]],
+    constant     uint&   has_w    [[buffer(7)]],
+    uint row            [[threadgroup_position_in_grid]],
+    uint tid            [[thread_position_in_threadgroup]],
+    uint tgsize         [[threads_per_threadgroup]],
+    uint simd_lane_id   [[thread_index_in_simdgroup]],
+    uint simd_group_id  [[simdgroup_index_in_threadgroup]])
+{
+    constexpr int SIMD_SIZE = 32;
+    threadgroup float local_sums[SIMD_SIZE];
+    threadgroup float local_inv_rms[1];
+
+    size_t base = size_t(row) * size_t(axis_size);
+
+    float acc = 0.0;
+    for (uint i = tid * N_READS; i < axis_size; i += tgsize * N_READS) {
+        if (i + 3 < axis_size) {
+            float x0 = float(input[base + i])     + float(residual[base + i]);
+            float x1 = float(input[base + i + 1]) + float(residual[base + i + 1]);
+            float x2 = float(input[base + i + 2]) + float(residual[base + i + 2]);
+            float x3 = float(input[base + i + 3]) + float(residual[base + i + 3]);
+            residual[base + i]     = bfloat(x0);
+            residual[base + i + 1] = bfloat(x1);
+            residual[base + i + 2] = bfloat(x2);
+            residual[base + i + 3] = bfloat(x3);
+            acc += x0*x0 + x1*x1 + x2*x2 + x3*x3;
+        } else {
+            for (uint j = i; j < min(i + N_READS, axis_size); j++) {
+                float x = float(input[base + j]) + float(residual[base + j]);
+                residual[base + j] = bfloat(x);
+                acc += x * x;
+            }
+        }
+    }
+
+    float rms = reduce_sum_of_squares_fused(acc, axis_size, eps,
+                                             simd_lane_id, simd_group_id,
+                                             local_sums, local_inv_rms);
+
+    for (uint i = tid * N_READS; i < axis_size; i += tgsize * N_READS) {
+        if (i + 3 < axis_size) {
+            float o0 = float(residual[base + i])     * rms;
+            float o1 = float(residual[base + i + 1]) * rms;
+            float o2 = float(residual[base + i + 2]) * rms;
+            float o3 = float(residual[base + i + 3]) * rms;
+            if (has_w) {
+                o0 *= float(weight[i       * w_stride]);
+                o1 *= float(weight[(i + 1) * w_stride]);
+                o2 *= float(weight[(i + 2) * w_stride]);
+                o3 *= float(weight[(i + 3) * w_stride]);
+            }
+            output[base + i]     = bfloat(o0);
+            output[base + i + 1] = bfloat(o1);
+            output[base + i + 2] = bfloat(o2);
+            output[base + i + 3] = bfloat(o3);
+        } else {
+            for (uint j = i; j < min(i + N_READS, axis_size); j++) {
+                float o = float(residual[base + j]) * rms;
+                if (has_w) { o *= float(weight[j * w_stride]); }
+                output[base + j] = bfloat(o);
+            }
+        }
+    }
+}
+"#;
+
 /// Threshold: axis_size <= this uses the simpler single-row kernel.
 const SINGLE_ROW_THRESHOLD: usize = 1024;
 
 pub fn register(registry: &KernelRegistry) -> Result<(), KernelError> {
-    registry.register_jit_source("rms_norm", RMS_NORM_SHADER_SOURCE)
+    registry.register_jit_source("rms_norm", RMS_NORM_SHADER_SOURCE)?;
+    registry.register_jit_source("rms_norm_residual_add", RMS_NORM_RESIDUAL_ADD_SHADER_SOURCE)
 }
 
 /// Return the kernel name for the given dtype and axis_size.
@@ -623,4 +901,131 @@ pub fn rms_norm_into_cb(
     encoder.end_encoding();
 
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Fused RMSNorm + residual add
+// ---------------------------------------------------------------------------
+
+/// Return the fused kernel name for the given dtype.
+fn rms_residual_add_kernel_name(dtype: DType) -> Result<&'static str, KernelError> {
+    match dtype {
+        DType::Float32 => Ok("rms_norm_residual_add_f32"),
+        DType::Float16 => Ok("rms_norm_residual_add_f16"),
+        DType::Bfloat16 => Ok("rms_norm_residual_add_bf16"),
+        _ => Err(KernelError::NotFound(format!(
+            "rms_norm_residual_add not supported for {:?}",
+            dtype
+        ))),
+    }
+}
+
+/// Fused RMSNorm + residual add:
+///   x = input + residual
+///   output = RMSNorm(x, weight, eps)
+///   residual (updated in-place) = x
+///
+/// Returns `(normalized_output, updated_residual)`.
+///
+/// - `input` shape: `[rows, axis_size]` (2-D).
+/// - `residual` shape: must match `input` exactly.
+/// - `weight` shape: `[axis_size]` (1-D).
+/// - `eps`: small constant for numerical stability.
+///
+/// The residual buffer is **mutated in-place** and returned as the second
+/// element of the tuple for convenience.
+pub fn rms_norm_residual_add(
+    registry: &KernelRegistry,
+    input: &Array,
+    residual: &Array,
+    weight: &Array,
+    eps: f32,
+    queue: &metal::CommandQueue,
+) -> Result<(Array, Array), KernelError> {
+    if input.ndim() != 2 {
+        return Err(KernelError::InvalidShape(format!(
+            "rms_norm_residual_add requires 2D input, got {}D",
+            input.ndim()
+        )));
+    }
+    if residual.shape() != input.shape() {
+        return Err(KernelError::InvalidShape(format!(
+            "residual shape {:?} does not match input shape {:?}",
+            residual.shape(),
+            input.shape()
+        )));
+    }
+    if weight.ndim() != 1 {
+        return Err(KernelError::InvalidShape(format!(
+            "rms_norm_residual_add requires 1D weight, got {}D",
+            weight.ndim()
+        )));
+    }
+    let axis_size_usize = input.shape()[1];
+    if weight.shape()[0] != axis_size_usize {
+        return Err(KernelError::InvalidShape(format!(
+            "axis size mismatch: input[1]={} vs weight[0]={}",
+            axis_size_usize,
+            weight.shape()[0]
+        )));
+    }
+    if input.dtype() != residual.dtype() || input.dtype() != weight.dtype() {
+        return Err(KernelError::InvalidShape(format!(
+            "dtype mismatch: input={:?}, residual={:?}, weight={:?}",
+            input.dtype(),
+            residual.dtype(),
+            weight.dtype()
+        )));
+    }
+
+    // Ensure contiguous layouts
+    let input_contig = super::make_contiguous(input, registry, queue)?;
+    let input = input_contig.as_ref().unwrap_or(input);
+
+    // We always need a writable copy of the residual because the kernel
+    // mutates it in-place (stores input + residual back).  `copy::copy`
+    // produces a fresh contiguous buffer regardless.
+    let residual_buf = super::copy::copy(registry, residual, queue)?;
+
+    let weight_contig = super::make_contiguous(weight, registry, queue)?;
+    let weight = weight_contig.as_ref().unwrap_or(weight);
+
+    let w_stride: u32 = weight.strides()[0] as u32;
+    let has_w: u32 = 1;
+
+    let kernel_name = rms_residual_add_kernel_name(input.dtype())?;
+    let pipeline = registry.get_pipeline(kernel_name, input.dtype())?;
+
+    let rows = input.shape()[0];
+    let axis_size = super::checked_u32(axis_size_usize, "axis_size")?;
+
+    let out = Array::zeros(registry.device().raw(), input.shape(), input.dtype());
+
+    let axis_buf = make_const_buf(registry.device().raw(), axis_size);
+    let eps_buf = make_const_buf(registry.device().raw(), eps);
+    let w_stride_buf = make_const_buf(registry.device().raw(), w_stride);
+    let has_w_buf = make_const_buf(registry.device().raw(), has_w);
+
+    let command_buffer = queue.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
+    encoder.set_buffer(
+        1,
+        Some(residual_buf.metal_buffer()),
+        residual_buf.offset() as u64,
+    );
+    encoder.set_buffer(2, Some(weight.metal_buffer()), weight.offset() as u64);
+    encoder.set_buffer(3, Some(out.metal_buffer()), 0);
+    encoder.set_buffer(4, Some(&axis_buf), 0);
+    encoder.set_buffer(5, Some(&eps_buf), 0);
+    encoder.set_buffer(6, Some(&w_stride_buf), 0);
+    encoder.set_buffer(7, Some(&has_w_buf), 0);
+
+    let tg_size = std::cmp::min(1024, pipeline.max_total_threads_per_threadgroup());
+    encoder.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), MTLSize::new(tg_size, 1, 1));
+    encoder.end_encoding();
+    super::commit_with_mode(command_buffer, super::ExecMode::Sync);
+
+    Ok((out, residual_buf))
 }

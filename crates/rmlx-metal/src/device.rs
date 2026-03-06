@@ -1,9 +1,108 @@
 //! Metal device abstraction
 
 use metal::Device as MTLDevice;
-use metal::{CommandQueue, MTLResourceOptions};
+use metal::{CommandBuffer, CommandQueue, MTLGPUFamily, MTLResourceOptions};
 
 use crate::MetalError;
+
+/// Default resource options for all RMLX buffer allocations.
+///
+/// Combines `StorageModeShared` (CPU+GPU visible on Apple Silicon UMA) with
+/// `HazardTrackingModeUntracked` so Metal skips automatic hazard tracking.
+/// RMLX manages synchronisation explicitly via command-buffer ordering,
+/// `MTLSharedEvent`, and `MTLFence`, making Metal's built-in tracking
+/// redundant overhead.
+pub const DEFAULT_BUFFER_OPTIONS: MTLResourceOptions = MTLResourceOptions::from_bits_truncate(
+    MTLResourceOptions::StorageModeShared.bits()
+        | MTLResourceOptions::HazardTrackingModeUntracked.bits(),
+);
+
+// ---------------------------------------------------------------------------
+// Chip-class tuning
+// ---------------------------------------------------------------------------
+
+/// Per-chip tuning parameters derived from the Metal GPU family.
+///
+/// Use [`ChipTuning::for_device`] to detect the current hardware and populate
+/// appropriate values.  Kernels and infrastructure code can then query these
+/// fields instead of hard-coding chip-specific constants.
+#[derive(Debug, Clone, Copy)]
+pub struct ChipTuning {
+    /// Maximum threadgroup memory in bytes (e.g. 32 768 on Apple Silicon).
+    pub max_threadgroup_memory: usize,
+    /// Maximum threads per threadgroup (typically 1024 on Apple Silicon).
+    pub max_threads_per_threadgroup: usize,
+    /// Preferred SIMD width (32 on all current Apple GPUs).
+    pub preferred_simd_width: usize,
+    /// Whether the device supports Metal 3+ unretained command-buffer
+    /// references (`newCommandBufferWithUnretainedReferences`), which avoids
+    /// the overhead of retaining every resource referenced by the CB.
+    pub supports_unretained_refs: bool,
+}
+
+impl ChipTuning {
+    /// Detect chip capabilities from a `metal::Device` and return tuned values.
+    ///
+    /// * M1 (Apple7): simd 32, TG mem 32 KB, no unretained refs
+    /// * M2 (Apple8) / M3 (Apple9) / M4+: simd 32, TG mem 32 KB, unretained refs (Metal 3+)
+    /// * Unknown: conservative defaults (simd 32, TG mem 16 KB, no unretained refs)
+    pub fn for_device(device: &metal::Device) -> Self {
+        let supports_metal3 = device.supports_family(MTLGPUFamily::Metal3);
+
+        // Apple Silicon always has 32-wide SIMD and 32 KB TG memory.
+        // For unknown/non-Apple devices we fall back to conservative values.
+        let is_apple = device.supports_family(MTLGPUFamily::Apple7)
+            || device.supports_family(MTLGPUFamily::Apple8)
+            || device.supports_family(MTLGPUFamily::Apple9);
+
+        if is_apple {
+            Self {
+                max_threadgroup_memory: 32 * 1024,
+                max_threads_per_threadgroup: 1024,
+                preferred_simd_width: 32,
+                supports_unretained_refs: supports_metal3,
+            }
+        } else {
+            // Conservative defaults for unknown hardware.
+            Self {
+                max_threadgroup_memory: 16 * 1024,
+                max_threads_per_threadgroup: 512,
+                preferred_simd_width: 32,
+                supports_unretained_refs: false,
+            }
+        }
+    }
+
+    /// Build a `ChipTuning` from a device-name string (for unit tests that
+    /// cannot instantiate a real `metal::Device`).
+    ///
+    /// This is intentionally conservative: it mirrors the name-based
+    /// `detect_architecture` heuristic and does *not* query the driver.
+    #[cfg(test)]
+    pub(crate) fn from_name(name: &str) -> Self {
+        let arch = detect_architecture(name);
+        match arch {
+            Architecture::Apple { generation } if generation >= 16 => Self {
+                max_threadgroup_memory: 32 * 1024,
+                max_threads_per_threadgroup: 1024,
+                preferred_simd_width: 32,
+                supports_unretained_refs: true, // M2+ => Metal 3
+            },
+            Architecture::Apple { .. } => Self {
+                max_threadgroup_memory: 32 * 1024,
+                max_threads_per_threadgroup: 1024,
+                preferred_simd_width: 32,
+                supports_unretained_refs: false, // M1 => Metal 2
+            },
+            Architecture::Unknown => Self {
+                max_threadgroup_memory: 16 * 1024,
+                max_threads_per_threadgroup: 512,
+                preferred_simd_width: 32,
+                supports_unretained_refs: false,
+            },
+        }
+    }
+}
 
 /// GPU architecture information derived from device name.
 #[derive(Debug, Clone, Copy)]
@@ -18,6 +117,7 @@ pub enum Architecture {
 pub struct GpuDevice {
     device: MTLDevice,
     arch: Architecture,
+    tuning: ChipTuning,
     max_buffer_length: u64,
     max_threadgroup_memory: u64,
 }
@@ -27,12 +127,14 @@ impl GpuDevice {
     pub fn system_default() -> Result<Self, MetalError> {
         let device = MTLDevice::system_default().ok_or(MetalError::NoDevice)?;
         let arch = detect_architecture(device.name());
+        let tuning = ChipTuning::for_device(&device);
         let max_buffer_length = device.max_buffer_length();
         let max_threadgroup_memory = device.max_threadgroup_memory_length();
 
         Ok(Self {
             device,
             arch,
+            tuning,
             max_buffer_length,
             max_threadgroup_memory,
         })
@@ -68,6 +170,31 @@ impl GpuDevice {
         self.max_threadgroup_memory
     }
 
+    /// Chip-class tuning parameters for the current device.
+    pub fn tuning(&self) -> &ChipTuning {
+        &self.tuning
+    }
+
+    /// Create a command buffer on `queue`, choosing the optimal path for
+    /// this chip class.
+    ///
+    /// When `ChipTuning::supports_unretained_refs` is true (Metal 3+ / M2+),
+    /// uses `new_command_buffer_with_unretained_references()` which avoids
+    /// the retain/release overhead for every resource referenced by the CB.
+    /// Otherwise falls back to the standard `new_command_buffer()`.
+    ///
+    /// The returned `CommandBuffer` is *owned* (`.to_owned()`) so it is not
+    /// reclaimed by the autorelease pool before the caller commits it.
+    pub fn create_command_buffer(&self, queue: &CommandQueue) -> CommandBuffer {
+        if self.tuning.supports_unretained_refs {
+            queue
+                .new_command_buffer_with_unretained_references()
+                .to_owned()
+        } else {
+            queue.new_command_buffer().to_owned()
+        }
+    }
+
     /// Create a new command queue on this device.
     pub fn new_command_queue(&self) -> CommandQueue {
         self.device.new_command_queue()
@@ -80,12 +207,13 @@ impl GpuDevice {
 
     /// Allocate a buffer and initialize it from a typed slice.
     ///
-    /// Uses `StorageModeShared` so the buffer is accessible to both CPU and GPU.
+    /// Uses [`DEFAULT_BUFFER_OPTIONS`] (`StorageModeShared | HazardTrackingModeUntracked`)
+    /// so the buffer is CPU+GPU visible and hazard tracking is managed by RMLX.
     pub fn new_buffer_with_data<T>(&self, data: &[T]) -> metal::Buffer {
         let size = std::mem::size_of_val(data) as u64;
         let ptr = data.as_ptr() as *const std::ffi::c_void;
         self.device
-            .new_buffer_with_data(ptr, size, MTLResourceOptions::StorageModeShared)
+            .new_buffer_with_data(ptr, size, DEFAULT_BUFFER_OPTIONS)
     }
 }
 
@@ -130,5 +258,150 @@ mod tests {
             detect_architecture("Intel HD 630"),
             Architecture::Unknown
         ));
+    }
+
+    // ----- ChipTuning name-based tests -----
+
+    #[test]
+    fn test_chip_tuning_m1() {
+        let t = ChipTuning::from_name("Apple M1");
+        assert_eq!(t.max_threadgroup_memory, 32 * 1024);
+        assert_eq!(t.max_threads_per_threadgroup, 1024);
+        assert_eq!(t.preferred_simd_width, 32);
+        assert!(!t.supports_unretained_refs, "M1 is Metal 2, no unretained");
+    }
+
+    #[test]
+    fn test_chip_tuning_m2() {
+        let t = ChipTuning::from_name("Apple M2 Max");
+        assert_eq!(t.max_threadgroup_memory, 32 * 1024);
+        assert_eq!(t.preferred_simd_width, 32);
+        assert!(t.supports_unretained_refs, "M2 is Metal 3+");
+    }
+
+    #[test]
+    fn test_chip_tuning_m3() {
+        let t = ChipTuning::from_name("Apple M3 Pro");
+        assert!(t.supports_unretained_refs, "M3 is Metal 3+");
+        assert_eq!(t.max_threads_per_threadgroup, 1024);
+    }
+
+    #[test]
+    fn test_chip_tuning_m4() {
+        let t = ChipTuning::from_name("Apple M4");
+        assert!(t.supports_unretained_refs, "M4 is Metal 3+");
+        assert_eq!(t.preferred_simd_width, 32);
+    }
+
+    #[test]
+    fn test_chip_tuning_unknown() {
+        let t = ChipTuning::from_name("Intel HD 630");
+        assert_eq!(t.max_threadgroup_memory, 16 * 1024);
+        assert_eq!(t.max_threads_per_threadgroup, 512);
+        assert!(!t.supports_unretained_refs);
+    }
+
+    // ----- Live device tests (run on real Metal hardware) -----
+
+    #[test]
+    fn test_chip_tuning_for_device_runs() {
+        let device = metal::Device::system_default().unwrap();
+        let tuning = ChipTuning::for_device(&device);
+        // On any Apple Silicon these should hold:
+        assert!(tuning.max_threadgroup_memory >= 16 * 1024);
+        assert!(tuning.max_threads_per_threadgroup >= 512);
+        assert_eq!(tuning.preferred_simd_width, 32);
+    }
+
+    #[test]
+    fn test_gpu_device_has_tuning() {
+        let gpu = GpuDevice::system_default().unwrap();
+        let t = gpu.tuning();
+        assert!(t.max_threadgroup_memory >= 16 * 1024);
+        assert_eq!(t.preferred_simd_width, 32);
+    }
+
+    #[test]
+    fn test_create_command_buffer_succeeds() {
+        let gpu = GpuDevice::system_default().unwrap();
+        let queue = gpu.new_command_queue();
+        let cb = gpu.create_command_buffer(&queue);
+        // Encode a no-op and commit to prove the CB is valid.
+        let enc = cb.new_compute_command_encoder();
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+    }
+
+    #[test]
+    fn test_create_command_buffer_both_paths() {
+        // Verify that both the unretained and retained paths produce valid CBs.
+        let device = metal::Device::system_default().unwrap();
+        let queue = device.new_command_queue();
+
+        // Retained path (standard)
+        let cb_retained = queue.new_command_buffer().to_owned();
+        let enc = cb_retained.new_compute_command_encoder();
+        enc.end_encoding();
+        cb_retained.commit();
+        cb_retained.wait_until_completed();
+
+        // Unretained path
+        let cb_unretained = queue
+            .new_command_buffer_with_unretained_references()
+            .to_owned();
+        let enc = cb_unretained.new_compute_command_encoder();
+        enc.end_encoding();
+        cb_unretained.commit();
+        cb_unretained.wait_until_completed();
+    }
+
+    #[test]
+    fn test_default_buffer_options_has_untracked() {
+        // Verify that DEFAULT_BUFFER_OPTIONS includes both StorageModeShared
+        // and HazardTrackingModeUntracked.
+        assert!(DEFAULT_BUFFER_OPTIONS.contains(MTLResourceOptions::StorageModeShared));
+        assert!(DEFAULT_BUFFER_OPTIONS.contains(MTLResourceOptions::HazardTrackingModeUntracked));
+    }
+
+    #[test]
+    fn test_new_buffer_with_data_untracked() {
+        let device = match GpuDevice::system_default() {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("skipping test: no Metal device");
+                return;
+            }
+        };
+
+        let data: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+        let buf = device.new_buffer_with_data(&data);
+        assert!(buf.length() >= 16); // 4 * f32
+
+        // Verify buffer contents are readable (StorageModeShared).
+        let ptr = buf.contents() as *const f32;
+        let slice = unsafe { std::slice::from_raw_parts(ptr, 4) };
+        assert_eq!(slice, &data);
+    }
+
+    #[test]
+    fn test_new_buffer_untracked_rw() {
+        let device = match GpuDevice::system_default() {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("skipping test: no Metal device");
+                return;
+            }
+        };
+
+        let buf = device.new_buffer(256, DEFAULT_BUFFER_OPTIONS);
+        assert!(buf.length() >= 256);
+        // Write and read back to confirm the buffer is functional.
+        let ptr = buf.contents() as *mut u8;
+        unsafe {
+            std::ptr::write_bytes(ptr, 0xAB, 256);
+            let slice = std::slice::from_raw_parts(ptr, 256);
+            assert!(slice.iter().all(|&b| b == 0xAB));
+        }
     }
 }
