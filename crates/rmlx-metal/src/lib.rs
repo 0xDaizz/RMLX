@@ -55,6 +55,7 @@ pub enum MetalError {
     PipelineCreate(String),
     LibraryLoad(String),
     KernelNotFound(String),
+    StreamNotFound(usize),
 }
 
 impl std::fmt::Display for MetalError {
@@ -65,6 +66,7 @@ impl std::fmt::Display for MetalError {
             Self::PipelineCreate(e) => write!(f, "pipeline creation error: {e}"),
             Self::LibraryLoad(e) => write!(f, "library load error: {e}"),
             Self::KernelNotFound(name) => write!(f, "kernel function not found: {name}"),
+            Self::StreamNotFound(id) => write!(f, "stream not found: {id}"),
         }
     }
 }

@@ -27,6 +27,8 @@ pub enum GgufError {
     InvalidValueType(u32),
     InvalidGgmlType(u32),
     InvalidString,
+    InvalidAlignment(u64),
+    OffsetOutOfBounds { tensor: String, offset: u64, data_len: u64 },
     Overflow(String),
 }
 
@@ -45,6 +47,10 @@ impl std::fmt::Display for GgufError {
             GgufError::InvalidValueType(t) => write!(f, "invalid GGUF value type: {t}"),
             GgufError::InvalidGgmlType(t) => write!(f, "invalid GGML type: {t}"),
             GgufError::InvalidString => write!(f, "invalid UTF-8 in GGUF string"),
+            GgufError::InvalidAlignment(a) => write!(f, "invalid GGUF alignment: {a}"),
+            GgufError::OffsetOutOfBounds { tensor, offset, data_len } => {
+                write!(f, "tensor \"{tensor}\" offset {offset} exceeds data length {data_len}")
+            }
             GgufError::Overflow(msg) => write!(f, "overflow: {msg}"),
         }
     }
@@ -366,6 +372,9 @@ pub fn parse_gguf<R: Read + Seek>(reader: &mut R) -> Result<GgufFile, GgufError>
         Some(GgufValue::Uint64(a)) => *a,
         _ => DEFAULT_ALIGNMENT,
     };
+    if alignment == 0 {
+        return Err(GgufError::InvalidAlignment(0));
+    }
 
     // 6. Tensor info entries
     let tensor_count = usize::try_from(tensor_count)
@@ -399,6 +408,40 @@ pub fn parse_gguf<R: Read + Seek>(reader: &mut R) -> Result<GgufFile, GgufError>
     // 7. Compute data_offset: current position aligned up to `alignment`.
     let pos = reader.stream_position()?;
     let data_offset = pos.div_ceil(alignment) * alignment;
+
+    // 8. Validate tensor offsets: each tensor must fit entirely within the data region.
+    //    We use the stream length to determine how much data is available.
+    let end = reader.seek(io::SeekFrom::End(0))?;
+    let data_len = end.saturating_sub(data_offset);
+    for t in &tensors {
+        // Compute number of elements from shape (product of dims, minimum 1 for scalars).
+        let n_elements: u64 = t.shape.iter().copied().map(|d| d as u64).product::<u64>().max(1);
+        let block_size = t.ggml_type.block_size() as u64;
+        let type_size = t.ggml_type.type_size() as u64;
+        // Number of blocks = ceil(n_elements / block_size)
+        let n_blocks = n_elements.div_ceil(block_size);
+        let tensor_byte_size = n_blocks.checked_mul(type_size).ok_or_else(|| {
+            GgufError::OffsetOutOfBounds {
+                tensor: t.name.clone(),
+                offset: t.offset,
+                data_len,
+            }
+        })?;
+        let end_offset = t.offset.checked_add(tensor_byte_size).ok_or_else(|| {
+            GgufError::OffsetOutOfBounds {
+                tensor: t.name.clone(),
+                offset: t.offset,
+                data_len,
+            }
+        })?;
+        if end_offset > data_len {
+            return Err(GgufError::OffsetOutOfBounds {
+                tensor: t.name.clone(),
+                offset: t.offset,
+                data_len,
+            });
+        }
+    }
 
     Ok(GgufFile {
         version,
@@ -543,6 +586,9 @@ mod tests {
             buf.push(0);
         }
 
+        // Append tensor data: 8 * 4 = 32 F32 elements = 128 bytes
+        buf.extend_from_slice(&vec![0u8; 32 * 4]);
+
         buf
     }
 
@@ -681,6 +727,60 @@ mod tests {
         let file = parse_gguf(&mut cursor).expect("parse should succeed");
 
         assert_eq!(file.data_offset % 64, 0);
+    }
+
+    #[test]
+    fn test_parse_alignment_zero_returns_error() {
+        let mut buf = Vec::new();
+
+        // Header
+        push_u32(&mut buf, GGUF_MAGIC);
+        push_u32(&mut buf, 3);
+        push_u64(&mut buf, 0); // no tensors
+        push_u64(&mut buf, 1); // 1 kv
+
+        // Metadata: "general.alignment" = Uint32(0)
+        push_string(&mut buf, "general.alignment");
+        push_u32(&mut buf, 4); // UINT32
+        push_u32(&mut buf, 0); // alignment = 0 → should error
+
+        let mut cursor = Cursor::new(&buf);
+        match parse_gguf(&mut cursor) {
+            Err(GgufError::InvalidAlignment(0)) => {} // expected
+            other => panic!("expected InvalidAlignment(0), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_tensor_offset_out_of_bounds() {
+        let mut buf = Vec::new();
+
+        // Header
+        push_u32(&mut buf, GGUF_MAGIC);
+        push_u32(&mut buf, 3);
+        push_u64(&mut buf, 1); // 1 tensor
+        push_u64(&mut buf, 0); // no kv
+
+        // Tensor info: "bad_tensor", 1 dim, [4], type F32, offset way past end
+        push_string(&mut buf, "bad_tensor");
+        push_u32(&mut buf, 1); // n_dimensions
+        push_u64(&mut buf, 4); // dim 0
+        push_u32(&mut buf, 0); // ggml_type = F32
+        push_u64(&mut buf, 999_999); // offset far beyond data
+
+        // Add a small amount of "data" (16 bytes) after alignment padding
+        while buf.len() % 32 != 0 {
+            buf.push(0);
+        }
+        buf.extend_from_slice(&[0u8; 16]); // 16 bytes of tensor data
+
+        let mut cursor = Cursor::new(&buf);
+        match parse_gguf(&mut cursor) {
+            Err(GgufError::OffsetOutOfBounds { tensor, .. }) => {
+                assert_eq!(tensor, "bad_tensor");
+            }
+            other => panic!("expected OffsetOutOfBounds, got {other:?}"),
+        }
     }
 
     #[test]

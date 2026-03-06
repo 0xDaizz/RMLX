@@ -1369,6 +1369,7 @@ pub fn gather_qmm(
     group_size: u32,
     queue: &metal::CommandQueue,
 ) -> Result<Array, KernelError> {
+    // --- dtype validation ---
     if x.dtype() != DType::Float32 {
         return Err(KernelError::InvalidShape(format!(
             "gather_qmm requires Float32 input x, got {:?}",
@@ -1381,6 +1382,29 @@ pub fn gather_qmm(
             indices.dtype()
         )));
     }
+
+    // --- dimension validation ---
+    if k == 0 || n == 0 || m_per_batch == 0 {
+        return Err(KernelError::InvalidShape(format!(
+            "gather_qmm: dimensions must be non-zero (k={k}, n={n}, m_per_batch={m_per_batch})"
+        )));
+    }
+    if n_experts == 0 {
+        return Err(KernelError::InvalidShape(
+            "gather_qmm: n_experts must be non-zero".to_string(),
+        ));
+    }
+
+    // --- x shape validation ---
+    let expected_x_elems = batch * m_per_batch * k;
+    if x.numel() != expected_x_elems {
+        return Err(KernelError::InvalidShape(format!(
+            "gather_qmm: x has {} elements but expected batch({batch}) * m_per_batch({m_per_batch}) * k({k}) = {expected_x_elems}",
+            x.numel()
+        )));
+    }
+
+    // --- indices shape validation ---
     if indices.shape()[0] != batch {
         return Err(KernelError::InvalidShape(format!(
             "gather_qmm: indices length {} != batch {}",
@@ -1388,6 +1412,15 @@ pub fn gather_qmm(
             batch
         )));
     }
+
+    // --- group_size validation ---
+    if group_size == 0 {
+        return Err(KernelError::InvalidShape(
+            "gather_qmm: group_size must be non-zero".into(),
+        ));
+    }
+
+    // --- K constraints for Q4 packing ---
     if k % 2 != 0 {
         return Err(KernelError::InvalidShape(format!(
             "gather_qmm: K ({k}) must be even for Q4 packing"
@@ -1399,7 +1432,37 @@ pub fn gather_qmm(
         )));
     }
 
-    // Rust-side validation: all expert indices must be in [0, n_experts)
+    // --- buffer size validation ---
+    let half_k = k / 2;
+    let groups_per_row = k / (group_size as usize);
+    let expected_w_bytes = n_experts * n * half_k;
+    if (w_packed_buf.length() as usize) < expected_w_bytes {
+        return Err(KernelError::InvalidShape(format!(
+            "gather_qmm: w_packed_buf too small: {} bytes < expected {} bytes \
+             (n_experts={n_experts}, N={n}, K/2={half_k})",
+            w_packed_buf.length(),
+            expected_w_bytes,
+        )));
+    }
+    let expected_scales_bytes = n_experts * n * groups_per_row * 4; // float32
+    if (scales_buf.length() as usize) < expected_scales_bytes {
+        return Err(KernelError::InvalidShape(format!(
+            "gather_qmm: scales_buf too small: {} bytes < expected {} bytes \
+             (n_experts={n_experts}, N={n}, groups_per_row={groups_per_row})",
+            scales_buf.length(),
+            expected_scales_bytes,
+        )));
+    }
+    if (biases_buf.length() as usize) < expected_scales_bytes {
+        return Err(KernelError::InvalidShape(format!(
+            "gather_qmm: biases_buf too small: {} bytes < expected {} bytes \
+             (n_experts={n_experts}, N={n}, groups_per_row={groups_per_row})",
+            biases_buf.length(),
+            expected_scales_bytes,
+        )));
+    }
+
+    // --- Rust-side validation: all expert indices must be in [0, n_experts) ---
     if batch > 0 {
         let idx_vec = indices.to_vec_checked::<u32>();
         for (i, &idx) in idx_vec.iter().enumerate() {
@@ -1514,7 +1577,8 @@ pub fn quantized_matmul(
     }
 
     // Validate weights buffer size accounting for offset
-    let expected_weight_bytes = weights.dtype().numel_to_bytes(out_features * in_features);
+    let expected_weight_bytes = weights.dtype().numel_to_bytes(out_features * in_features)
+        .map_err(|e| KernelError::InvalidShape(e.to_string()))?;
     let available_bytes = weights.metal_buffer().length() as usize - weights.offset();
     if available_bytes < expected_weight_bytes {
         return Err(KernelError::InvalidShape(format!(
@@ -2039,6 +2103,286 @@ mod tests {
                 diff,
             );
         }
+    }
+
+    // =====================================================================
+    // gather_qmm shape/buffer-size validation tests
+    // =====================================================================
+
+    /// Helper: set up Metal device, registry, queue, and valid gather_qmm inputs.
+    /// Returns (registry, x, w_packed_buf, scales_buf, biases_buf, indices, queue)
+    /// with valid dimensions: batch=2, m_per_batch=1, n=4, k=32, n_experts=2, group_size=32.
+    fn setup_gather_qmm_valid() -> (
+        KernelRegistry,
+        Array,
+        metal::Buffer,
+        metal::Buffer,
+        metal::Buffer,
+        Array,
+        metal::CommandQueue,
+    ) {
+        let gpu_dev = rmlx_metal::device::GpuDevice::system_default().unwrap();
+        let queue = gpu_dev.raw().new_command_queue();
+        let registry = KernelRegistry::new(gpu_dev);
+        register_gather_qmm(&registry).unwrap();
+
+        let dev = registry.device().raw();
+
+        let batch: usize = 2;
+        let m_per_batch: usize = 1;
+        let n: usize = 4;
+        let k: usize = 32;
+        let n_experts: usize = 2;
+        let group_size: usize = 32;
+
+        let x_data = vec![1.0f32; batch * m_per_batch * k];
+        let x = Array::from_slice(dev, &x_data, vec![batch, m_per_batch, k]);
+
+        let half_k = k / 2;
+        let groups_per_row = k / group_size;
+
+        // w_packed: n_experts * n * half_k bytes
+        let w_bytes = n_experts * n * half_k;
+        let w_data = vec![0x77u8; w_bytes];
+        let opts = metal::MTLResourceOptions::StorageModeShared;
+        let w_packed_buf = dev.new_buffer_with_data(
+            w_data.as_ptr() as *const _,
+            w_bytes as u64,
+            opts,
+        );
+
+        // scales & biases: n_experts * n * groups_per_row floats
+        let sb_elems = n_experts * n * groups_per_row;
+        let scales_data = vec![1.0f32; sb_elems];
+        let biases_data = vec![0.0f32; sb_elems];
+        let sb_bytes = sb_elems * 4;
+        let scales_buf = dev.new_buffer_with_data(
+            scales_data.as_ptr() as *const _,
+            sb_bytes as u64,
+            opts,
+        );
+        let biases_buf = dev.new_buffer_with_data(
+            biases_data.as_ptr() as *const _,
+            sb_bytes as u64,
+            opts,
+        );
+
+        let idx_data = vec![0u32, 1];
+        let indices = Array::from_slice(dev, &idx_data, vec![batch]);
+
+        (registry, x, w_packed_buf, scales_buf, biases_buf, indices, queue)
+    }
+
+    #[test]
+    fn test_gather_qmm_valid_inputs() {
+        let (registry, x, w_packed_buf, scales_buf, biases_buf, indices, queue) =
+            setup_gather_qmm_valid();
+        let result = gather_qmm(
+            &registry, &x, &w_packed_buf, &scales_buf, &biases_buf, &indices,
+            2, 1, 4, 32, 2, 32, &queue,
+        );
+        assert!(result.is_ok(), "valid gather_qmm should succeed: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_gather_qmm_zero_k() {
+        let (registry, _x, w_packed_buf, scales_buf, biases_buf, indices, queue) =
+            setup_gather_qmm_valid();
+        let dev = registry.device().raw();
+        let x = Array::from_slice(dev, &[0.0f32; 0], vec![2, 1, 0]);
+        let result = gather_qmm(
+            &registry, &x, &w_packed_buf, &scales_buf, &biases_buf, &indices,
+            2, 1, 4, 0, 2, 32, &queue,
+        );
+        assert!(result.is_err());
+        let msg = format!("{}", result.err().unwrap());
+        assert!(msg.contains("non-zero"), "expected non-zero error, got: {msg}");
+    }
+
+    #[test]
+    fn test_gather_qmm_zero_n() {
+        let (registry, x, w_packed_buf, scales_buf, biases_buf, indices, queue) =
+            setup_gather_qmm_valid();
+        let result = gather_qmm(
+            &registry, &x, &w_packed_buf, &scales_buf, &biases_buf, &indices,
+            2, 1, 0, 32, 2, 32, &queue,
+        );
+        assert!(result.is_err());
+        let msg = format!("{}", result.err().unwrap());
+        assert!(msg.contains("non-zero"), "expected non-zero error, got: {msg}");
+    }
+
+    #[test]
+    fn test_gather_qmm_zero_n_experts() {
+        let (registry, x, w_packed_buf, scales_buf, biases_buf, indices, queue) =
+            setup_gather_qmm_valid();
+        let result = gather_qmm(
+            &registry, &x, &w_packed_buf, &scales_buf, &biases_buf, &indices,
+            2, 1, 4, 32, 0, 32, &queue,
+        );
+        assert!(result.is_err());
+        let msg = format!("{}", result.err().unwrap());
+        assert!(msg.contains("n_experts"), "expected n_experts error, got: {msg}");
+    }
+
+    #[test]
+    fn test_gather_qmm_x_shape_mismatch() {
+        let (registry, _x, w_packed_buf, scales_buf, biases_buf, indices, queue) =
+            setup_gather_qmm_valid();
+        let dev = registry.device().raw();
+        // x has 10 elements but batch*m*k = 2*1*32 = 64
+        let x_bad = Array::from_slice(dev, &[1.0f32; 10], vec![10]);
+        let result = gather_qmm(
+            &registry, &x_bad, &w_packed_buf, &scales_buf, &biases_buf, &indices,
+            2, 1, 4, 32, 2, 32, &queue,
+        );
+        assert!(result.is_err());
+        let msg = format!("{}", result.err().unwrap());
+        assert!(msg.contains("elements"), "expected element count error, got: {msg}");
+    }
+
+    #[test]
+    fn test_gather_qmm_odd_k() {
+        let (registry, _x, w_packed_buf, scales_buf, biases_buf, _indices, queue) =
+            setup_gather_qmm_valid();
+        let dev = registry.device().raw();
+        let x = Array::from_slice(dev, &[1.0f32; 6], vec![2, 1, 3]);
+        let indices = Array::from_slice(dev, &[0u32, 1], vec![2]);
+        let result = gather_qmm(
+            &registry, &x, &w_packed_buf, &scales_buf, &biases_buf, &indices,
+            2, 1, 4, 3, 2, 1, &queue,
+        );
+        assert!(result.is_err());
+        let msg = format!("{}", result.err().unwrap());
+        assert!(msg.contains("even"), "expected even K error, got: {msg}");
+    }
+
+    #[test]
+    fn test_gather_qmm_k_not_multiple_of_group_size() {
+        let (registry, _x, w_packed_buf, scales_buf, biases_buf, _indices, queue) =
+            setup_gather_qmm_valid();
+        let dev = registry.device().raw();
+        // k=32, group_size=64 => 32 % 64 != 0
+        let x = Array::from_slice(dev, &[1.0f32; 64], vec![2, 1, 32]);
+        let indices = Array::from_slice(dev, &[0u32, 1], vec![2]);
+        let result = gather_qmm(
+            &registry, &x, &w_packed_buf, &scales_buf, &biases_buf, &indices,
+            2, 1, 4, 32, 2, 64, &queue,
+        );
+        assert!(result.is_err());
+        let msg = format!("{}", result.err().unwrap());
+        assert!(msg.contains("multiple of group_size"), "expected group_size error, got: {msg}");
+    }
+
+    #[test]
+    fn test_gather_qmm_w_packed_buf_too_small() {
+        let (registry, x, _w_packed_buf, scales_buf, biases_buf, indices, queue) =
+            setup_gather_qmm_valid();
+        let dev = registry.device().raw();
+        // Valid w_packed needs 2*4*16 = 128 bytes, provide only 10
+        let opts = metal::MTLResourceOptions::StorageModeShared;
+        let small_w = dev.new_buffer_with_data(
+            [0u8; 10].as_ptr() as *const _,
+            10,
+            opts,
+        );
+        let result = gather_qmm(
+            &registry, &x, &small_w, &scales_buf, &biases_buf, &indices,
+            2, 1, 4, 32, 2, 32, &queue,
+        );
+        assert!(result.is_err());
+        let msg = format!("{}", result.err().unwrap());
+        assert!(msg.contains("w_packed_buf too small"), "expected w_packed_buf error, got: {msg}");
+    }
+
+    #[test]
+    fn test_gather_qmm_scales_buf_too_small() {
+        let (registry, x, w_packed_buf, _scales_buf, biases_buf, indices, queue) =
+            setup_gather_qmm_valid();
+        let dev = registry.device().raw();
+        let opts = metal::MTLResourceOptions::StorageModeShared;
+        // Valid scales needs 2*4*1*4 = 32 bytes, provide only 4
+        let small_s = dev.new_buffer_with_data(
+            [0u8; 4].as_ptr() as *const _,
+            4,
+            opts,
+        );
+        let result = gather_qmm(
+            &registry, &x, &w_packed_buf, &small_s, &biases_buf, &indices,
+            2, 1, 4, 32, 2, 32, &queue,
+        );
+        assert!(result.is_err());
+        let msg = format!("{}", result.err().unwrap());
+        assert!(msg.contains("scales_buf too small"), "expected scales_buf error, got: {msg}");
+    }
+
+    #[test]
+    fn test_gather_qmm_biases_buf_too_small() {
+        let (registry, x, w_packed_buf, scales_buf, _biases_buf, indices, queue) =
+            setup_gather_qmm_valid();
+        let dev = registry.device().raw();
+        let opts = metal::MTLResourceOptions::StorageModeShared;
+        let small_b = dev.new_buffer_with_data(
+            [0u8; 4].as_ptr() as *const _,
+            4,
+            opts,
+        );
+        let result = gather_qmm(
+            &registry, &x, &w_packed_buf, &scales_buf, &small_b, &indices,
+            2, 1, 4, 32, 2, 32, &queue,
+        );
+        assert!(result.is_err());
+        let msg = format!("{}", result.err().unwrap());
+        assert!(msg.contains("biases_buf too small"), "expected biases_buf error, got: {msg}");
+    }
+
+    #[test]
+    fn test_gather_qmm_index_out_of_range() {
+        let (registry, x, w_packed_buf, scales_buf, biases_buf, _indices, queue) =
+            setup_gather_qmm_valid();
+        let dev = registry.device().raw();
+        // n_experts=2, but index=5 is out of range
+        let bad_indices = Array::from_slice(dev, &[0u32, 5], vec![2]);
+        let result = gather_qmm(
+            &registry, &x, &w_packed_buf, &scales_buf, &biases_buf, &bad_indices,
+            2, 1, 4, 32, 2, 32, &queue,
+        );
+        assert!(result.is_err());
+        let msg = format!("{}", result.err().unwrap());
+        assert!(msg.contains("out of range"), "expected out-of-range error, got: {msg}");
+    }
+
+    #[test]
+    fn test_gather_qmm_wrong_x_dtype() {
+        // This test doesn't need a full setup since dtype check is first
+        let (registry, _x, w_packed_buf, scales_buf, biases_buf, _indices, queue) =
+            setup_gather_qmm_valid();
+        let dev = registry.device().raw();
+        let x_u32 = Array::from_slice(dev, &[1u32; 64], vec![2, 1, 32]);
+        let indices = Array::from_slice(dev, &[0u32, 1], vec![2]);
+        let result = gather_qmm(
+            &registry, &x_u32, &w_packed_buf, &scales_buf, &biases_buf, &indices,
+            2, 1, 4, 32, 2, 32, &queue,
+        );
+        assert!(result.is_err());
+        let msg = format!("{}", result.err().unwrap());
+        assert!(msg.contains("Float32"), "expected dtype error, got: {msg}");
+    }
+
+    #[test]
+    fn test_gather_qmm_indices_length_mismatch() {
+        let (registry, x, w_packed_buf, scales_buf, biases_buf, _indices, queue) =
+            setup_gather_qmm_valid();
+        let dev = registry.device().raw();
+        // batch=2 but indices has 3 elements
+        let bad_indices = Array::from_slice(dev, &[0u32, 1, 0], vec![3]);
+        let result = gather_qmm(
+            &registry, &x, &w_packed_buf, &scales_buf, &biases_buf, &bad_indices,
+            2, 1, 4, 32, 2, 32, &queue,
+        );
+        assert!(result.is_err());
+        let msg = format!("{}", result.err().unwrap());
+        assert!(msg.contains("indices length"), "expected indices length error, got: {msg}");
     }
 
     #[test]

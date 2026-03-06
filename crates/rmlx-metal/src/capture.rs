@@ -53,20 +53,7 @@ impl CaptureScope {
         device: &metal::Device,
         destination: CaptureDestination,
     ) -> Result<Self, MetalError> {
-        // Use Objective-C runtime to access MTLCaptureManager.
-        // The `metal` crate (v0.31) does not expose CaptureManager bindings,
-        // so we use `objc` directly.
-        //
-        // SAFETY: These are well-known Metal framework APIs.
-        let started = unsafe { start_capture(device, &destination) };
-        if started {
-            Ok(Self { active: true })
-        } else {
-            Err(MetalError::PipelineCreate(format!(
-                "failed to start GPU capture ({destination:?}): \
-                 ensure METAL_CAPTURE_ENABLED=1 is set"
-            )))
-        }
+        start_capture(device, &destination).map(|()| Self { active: true })
     }
 
     /// End the capture explicitly.
@@ -75,9 +62,7 @@ impl CaptureScope {
     /// intent clearer and allows checking for errors.
     pub fn end(&mut self) {
         if self.active {
-            unsafe {
-                stop_capture();
-            }
+            stop_capture();
             self.active = false;
         }
     }
@@ -99,118 +84,47 @@ impl Drop for CaptureScope {
 /// Returns `true` if `MTLCaptureManager.sharedCaptureManager.supportsDestination`
 /// indicates at least one destination is available.
 pub fn is_capture_supported() -> bool {
-    unsafe { capture_supported_impl() }
+    let manager = metal::CaptureManager::shared();
+    manager.supports_destination(metal::MTLCaptureDestination::DeveloperTools)
 }
 
 // ---------------------------------------------------------------------------
-// Obj-C runtime helpers
+// Implementation helpers using the `metal` crate's safe(r) bindings
 // ---------------------------------------------------------------------------
 
-/// Start a Metal GPU capture via MTLCaptureManager.
+/// Start a Metal GPU capture via the `metal` crate's CaptureManager API.
 ///
-/// # Safety
-/// Calls Objective-C runtime APIs. Must be called on a thread with an
-/// autorelease pool (or within a `ScopedPool`).
-unsafe fn start_capture(device: &metal::Device, destination: &CaptureDestination) -> bool {
-    use objc::runtime::{Object, BOOL, YES};
+/// Uses `metal::CaptureManager`, `metal::CaptureDescriptor`, etc. instead of
+/// raw `objc` FFI calls, avoiding pointer-cast and C-string memory corruption
+/// bugs that existed in the previous implementation.
+fn start_capture(device: &metal::Device, destination: &CaptureDestination) -> Result<(), MetalError> {
+    let manager = metal::CaptureManager::shared();
 
-    let manager_cls = match objc::runtime::Class::get("MTLCaptureManager") {
-        Some(cls) => cls,
-        None => return false,
-    };
+    let descriptor = metal::CaptureDescriptor::new();
+    descriptor.set_capture_device(device);
 
-    let manager: *mut Object = objc::msg_send![manager_cls, sharedCaptureManager];
-    if manager.is_null() {
-        return false;
-    }
-
-    // Create MTLCaptureDescriptor
-    let desc_cls = match objc::runtime::Class::get("MTLCaptureDescriptor") {
-        Some(cls) => cls,
-        None => return false,
-    };
-    let desc: *mut Object = objc::msg_send![desc_cls, alloc];
-    let desc: *mut Object = objc::msg_send![desc, init];
-
-    // Set capture device
-    let raw_device = device as *const metal::Device as *const Object;
-    let _: () = objc::msg_send![desc, setCaptureObject: raw_device];
-
-    // Set destination
     match destination {
         CaptureDestination::DeveloperTools => {
-            // MTLCaptureDestinationDeveloperTools = 1
-            let _: () = objc::msg_send![desc, setDestination: 1i64];
+            descriptor.set_destination(metal::MTLCaptureDestination::DeveloperTools);
         }
         CaptureDestination::GpuTraceFile(path) => {
-            // MTLCaptureDestinationGPUTraceDocument = 2
-            let _: () = objc::msg_send![desc, setDestination: 2i64];
-
-            // Set output URL
-            let nsstring_cls = objc::runtime::Class::get("NSString").unwrap();
-            let path_bytes = path.as_bytes();
-            let ns_path: *mut Object = objc::msg_send![
-                nsstring_cls,
-                stringWithUTF8String: path_bytes.as_ptr()
-            ];
-            let nsurl_cls = objc::runtime::Class::get("NSURL").unwrap();
-            let url: *mut Object = objc::msg_send![
-                nsurl_cls,
-                fileURLWithPath: ns_path
-            ];
-            let _: () = objc::msg_send![desc, setOutputURL: url];
+            descriptor.set_destination(metal::MTLCaptureDestination::GpuTraceDocument);
+            descriptor.set_output_url(path);
         }
     }
 
-    // Start capture with descriptor
-    let mut error: *mut Object = std::ptr::null_mut();
-    let result: BOOL = objc::msg_send![
-        manager,
-        startCaptureWithDescriptor: desc
-        error: &mut error
-    ];
-
-    result == YES
+    manager.start_capture(&descriptor).map_err(|e| {
+        MetalError::PipelineCreate(format!(
+            "failed to start GPU capture ({destination:?}): {e}; \
+             ensure METAL_CAPTURE_ENABLED=1 is set"
+        ))
+    })
 }
 
 /// Stop the active Metal GPU capture.
-///
-/// # Safety
-/// Calls Objective-C runtime APIs.
-unsafe fn stop_capture() {
-    use objc::runtime::Object;
-
-    let manager_cls = match objc::runtime::Class::get("MTLCaptureManager") {
-        Some(cls) => cls,
-        None => return,
-    };
-
-    let manager: *mut Object = objc::msg_send![manager_cls, sharedCaptureManager];
-    if !manager.is_null() {
-        let _: () = objc::msg_send![manager, stopCapture];
-    }
-}
-
-/// Check if capture is supported.
-///
-/// # Safety
-/// Calls Objective-C runtime APIs.
-unsafe fn capture_supported_impl() -> bool {
-    use objc::runtime::Object;
-
-    let manager_cls = match objc::runtime::Class::get("MTLCaptureManager") {
-        Some(cls) => cls,
-        None => return false,
-    };
-
-    let manager: *mut Object = objc::msg_send![manager_cls, sharedCaptureManager];
-    if manager.is_null() {
-        return false;
-    }
-
-    // Check if developer tools destination is supported (destination = 1)
-    let supported: bool = objc::msg_send![manager, supportsDestination: 1i64];
-    supported
+fn stop_capture() {
+    let manager = metal::CaptureManager::shared();
+    manager.stop_capture();
 }
 
 #[cfg(test)]
@@ -230,5 +144,20 @@ mod tests {
     fn test_is_capture_supported() {
         // Just verify it does not panic. Result depends on environment.
         let _ = is_capture_supported();
+    }
+
+    #[test]
+    fn test_capture_scope_inactive_end_is_noop() {
+        // Verify that ending an already-inactive scope doesn't panic.
+        let mut scope = CaptureScope { active: false };
+        scope.end();
+        assert!(!scope.is_active());
+    }
+
+    #[test]
+    fn test_capture_scope_drop_inactive_is_safe() {
+        // Verify that dropping an inactive scope doesn't panic.
+        let scope = CaptureScope { active: false };
+        drop(scope);
     }
 }

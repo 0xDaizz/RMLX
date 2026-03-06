@@ -546,11 +546,23 @@ pub fn softmax(
         ));
     }
 
+    // Handle zero-element tensors: return empty output without GPU dispatch.
+    let total_numel: usize = input.shape().iter().product();
+    if total_numel == 0 {
+        return Ok(Array::zeros(
+            registry.device().raw(),
+            input.shape(),
+            input.dtype(),
+        ));
+    }
+
     let input_contig = super::make_contiguous(input, registry, queue)?;
     let input = input_contig.as_ref().unwrap_or(input);
 
     let shape = input.shape();
-    let axis_size = *shape.last().unwrap();
+    let axis_size = *shape.last().ok_or_else(|| {
+        KernelError::InvalidShape("softmax: empty shape (0D tensor)".to_string())
+    })?;
     let num_rows: usize = shape.iter().rev().skip(1).product();
     // For 1-D input there is exactly one row.
     let num_rows = if num_rows == 0 { 1 } else { num_rows };
@@ -603,4 +615,35 @@ pub fn softmax(
     command_buffer.wait_until_completed();
 
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_softmax_zero_rank_returns_error() {
+        let gpu_dev = rmlx_metal::device::GpuDevice::system_default().unwrap();
+        let device = gpu_dev.raw().clone();
+        let queue = device.new_command_queue();
+        let registry = KernelRegistry::new(gpu_dev);
+        super::register(&registry).expect("register softmax kernels");
+
+        // Create a 0D (scalar) array
+        let scalar = Array::zeros(&device, &[], DType::Float32);
+        assert_eq!(scalar.ndim(), 0);
+
+        let result = softmax(&registry, &scalar, &queue);
+        assert!(result.is_err(), "softmax on 0D tensor should return error");
+        match result {
+            Err(KernelError::InvalidShape(msg)) => {
+                assert!(
+                    msg.contains("0D"),
+                    "error should mention 0D: {msg}"
+                );
+            }
+            Err(other) => panic!("expected InvalidShape, got {other:?}"),
+            Ok(_) => unreachable!(),
+        }
+    }
 }

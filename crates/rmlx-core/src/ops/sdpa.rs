@@ -1086,6 +1086,16 @@ pub fn sdpa(
     is_causal: bool,
     queue: &metal::CommandQueue,
 ) -> Result<Array, KernelError> {
+    // Validate dtypes: Q, K, V must all share the same dtype
+    if q.dtype() != k.dtype() || q.dtype() != v.dtype() {
+        return Err(KernelError::InvalidShape(format!(
+            "sdpa: Q/K/V dtype mismatch: Q={:?}, K={:?}, V={:?}",
+            q.dtype(),
+            k.dtype(),
+            v.dtype()
+        )));
+    }
+
     // Validate shapes
     if q.ndim() != 2 || k.ndim() != 2 || v.ndim() != 2 {
         return Err(KernelError::InvalidShape(
@@ -1123,6 +1133,22 @@ pub fn sdpa(
                 m.ndim()
             )));
         }
+        // Mask dtype must be f32, f16, or bf16 (matching Q or float)
+        match m.dtype() {
+            DType::Float32 | DType::Float16 | DType::Bfloat16 => {}
+            _ => {
+                return Err(KernelError::InvalidShape(format!(
+                    "sdpa: mask dtype {:?} not supported, expected f32/f16/bf16",
+                    m.dtype()
+                )));
+            }
+        }
+        // Reject non-contiguous masks — the kernel reads mask data linearly
+        if !m.is_contiguous() {
+            return Err(KernelError::InvalidShape(
+                "sdpa: mask must be contiguous".into(),
+            ));
+        }
         if m.shape()[1] != s {
             return Err(KernelError::InvalidShape(format!(
                 "sdpa: mask columns {} != S={s}",
@@ -1140,7 +1166,7 @@ pub fn sdpa(
             let expanded = Array::zeros(dev, &[n, s], m.dtype());
             let src = m.metal_buffer().contents() as *const u8;
             let dst = expanded.metal_buffer().contents() as *mut u8;
-            let row_bytes = m.dtype().numel_to_bytes(s);
+            let row_bytes = m.dtype().numel_to_bytes(s).expect("numel must be block-aligned");
             // SAFETY: SharedMode buffers are CPU-accessible; bounds checked by
             // Array::zeros allocation and row_bytes computation.
             unsafe {
@@ -1325,9 +1351,80 @@ pub fn sdpa_into_cb(
     scale: f32,
     cb: &metal::CommandBufferRef,
 ) -> Result<Array, KernelError> {
+    // Validate dtypes: Q, K, V must all share the same dtype
+    if q.dtype() != k.dtype() || q.dtype() != v.dtype() {
+        return Err(KernelError::InvalidShape(format!(
+            "sdpa: Q/K/V dtype mismatch: Q={:?}, K={:?}, V={:?}",
+            q.dtype(),
+            k.dtype(),
+            v.dtype()
+        )));
+    }
+
+    // Validate shapes
+    if q.ndim() != 2 || k.ndim() != 2 || v.ndim() != 2 {
+        return Err(KernelError::InvalidShape(
+            "sdpa: Q, K, V must be 2D [tokens, head_dim]".into(),
+        ));
+    }
+
     let n = q.shape()[0]; // query tokens
     let d = q.shape()[1]; // head dim
     let s = k.shape()[0]; // key/value tokens
+
+    if k.shape()[1] != d {
+        return Err(KernelError::InvalidShape(format!(
+            "sdpa: K head_dim {} != Q head_dim {d}",
+            k.shape()[1]
+        )));
+    }
+    if v.shape() != [s, d] {
+        return Err(KernelError::InvalidShape(format!(
+            "sdpa: V shape {:?}, expected [{s}, {d}]",
+            v.shape()
+        )));
+    }
+    if d > 256 {
+        return Err(KernelError::InvalidShape(format!(
+            "sdpa: head_dim {d} > 256 not supported by fused kernel"
+        )));
+    }
+
+    // Validate mask if provided
+    if let Some(m) = mask {
+        if m.ndim() != 2 {
+            return Err(KernelError::InvalidShape(format!(
+                "sdpa: mask must be 2D, got {}D",
+                m.ndim()
+            )));
+        }
+        match m.dtype() {
+            DType::Float32 | DType::Float16 | DType::Bfloat16 => {}
+            _ => {
+                return Err(KernelError::InvalidShape(format!(
+                    "sdpa: mask dtype {:?} not supported, expected f32/f16/bf16",
+                    m.dtype()
+                )));
+            }
+        }
+        if !m.is_contiguous() {
+            return Err(KernelError::InvalidShape(
+                "sdpa: mask must be contiguous".into(),
+            ));
+        }
+        if m.shape()[1] != s {
+            return Err(KernelError::InvalidShape(format!(
+                "sdpa: mask columns {} != S={s}",
+                m.shape()[1]
+            )));
+        }
+        if m.shape()[0] != n && !(m.shape()[0] == 1 && n > 1) {
+            return Err(KernelError::InvalidShape(format!(
+                "sdpa: mask shape {:?}, expected [{n}, {s}] or [1, {s}]",
+                m.shape()
+            )));
+        }
+    }
 
     // Select kernel: decode fast path when N == 1, general kernel otherwise
     let use_decode = n == 1;
@@ -1438,4 +1535,97 @@ pub fn sdpa_batched_into_cb(
         outputs.push(out);
     }
     Ok(outputs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn setup() -> (KernelRegistry, metal::CommandQueue) {
+        let gpu_dev = rmlx_metal::device::GpuDevice::system_default().unwrap();
+        let queue = gpu_dev.raw().new_command_queue();
+        let registry = KernelRegistry::new(gpu_dev);
+        register(&registry).unwrap();
+        crate::ops::copy::register(&registry).unwrap();
+        (registry, queue)
+    }
+
+    #[test]
+    fn test_sdpa_dtype_mismatch_qk_returns_error() {
+        let (registry, queue) = setup();
+        let dev = registry.device().raw();
+
+        let q = Array::zeros(dev, &[4, 8], DType::Float32);
+        let k = Array::zeros(dev, &[6, 8], DType::Float16);
+        let v = Array::zeros(dev, &[6, 8], DType::Float32);
+
+        let result = sdpa(&registry, &q, &k, &v, None, 0.125, false, &queue);
+        let err = result.err().expect("expected error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("dtype mismatch"),
+            "expected dtype mismatch error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_sdpa_dtype_mismatch_qv_returns_error() {
+        let (registry, queue) = setup();
+        let dev = registry.device().raw();
+
+        let q = Array::zeros(dev, &[4, 8], DType::Float16);
+        let k = Array::zeros(dev, &[6, 8], DType::Float16);
+        let v = Array::zeros(dev, &[6, 8], DType::Float32);
+
+        let result = sdpa(&registry, &q, &k, &v, None, 0.125, false, &queue);
+        let err = result.err().expect("expected error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("dtype mismatch"),
+            "expected dtype mismatch error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_sdpa_non_contiguous_mask_returns_error() {
+        let (registry, queue) = setup();
+        let dev = registry.device().raw();
+
+        let q = Array::zeros(dev, &[4, 8], DType::Float32);
+        let k = Array::zeros(dev, &[6, 8], DType::Float32);
+        let v = Array::zeros(dev, &[6, 8], DType::Float32);
+
+        // Create a non-contiguous mask via view with stride [12, 2] over a [4,12] buffer.
+        let big_mask = Array::zeros(dev, &[4, 12], DType::Float32);
+        let nc_mask = big_mask.view(vec![4, 6], vec![12, 2], 0);
+        assert!(!nc_mask.is_contiguous(), "mask should be non-contiguous");
+
+        let result = sdpa(&registry, &q, &k, &v, Some(&nc_mask), 0.125, false, &queue);
+        let err = result.err().expect("expected error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("contiguous"),
+            "expected contiguous error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_sdpa_into_cb_dtype_mismatch_returns_error() {
+        let (registry, _queue) = setup();
+        let dev = registry.device().raw();
+
+        let q = Array::zeros(dev, &[4, 8], DType::Float32);
+        let k = Array::zeros(dev, &[6, 8], DType::Float16);
+        let v = Array::zeros(dev, &[6, 8], DType::Float32);
+
+        let queue = dev.new_command_queue();
+        let cb = queue.new_command_buffer();
+        let result = sdpa_into_cb(&registry, &q, &k, &v, None, 0.125, cb);
+        let err = result.err().expect("expected error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("dtype mismatch"),
+            "expected dtype mismatch error, got: {msg}"
+        );
+    }
 }

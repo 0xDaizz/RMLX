@@ -90,8 +90,24 @@ impl<'q> CommandBatcher<'q> {
     /// If no command buffer exists, one is created. If the previous encoder
     /// was not ended, it is ended automatically.
     ///
-    /// Returns the encoder reference. The caller must call `end_encoder()`
-    /// when done encoding, or it will be ended on the next `encoder()` call.
+    /// # Encoder lifecycle contract
+    ///
+    /// The caller **MUST** call [`end_encoding()`](metal::ComputeCommandEncoderRef::end_encoding)
+    /// on the returned encoder *before* calling [`end_encoder()`](Self::end_encoder).
+    /// After `end_encoder()` is called, the encoder reference must not be used again.
+    /// The typical pattern is:
+    ///
+    /// ```rust,ignore
+    /// let enc = batcher.encoder();
+    /// // ... set pipeline, buffers, dispatch ...
+    /// enc.end_encoding();      // Metal-level: finalize the encoder
+    /// batcher.end_encoder();   // Batcher-level: mark encoder as inactive
+    /// ```
+    ///
+    /// Calling `encoder()` again without first calling `end_encoder()` is
+    /// tolerated (the batcher resets its internal flag), but the caller is
+    /// still responsible for calling `end_encoding()` on the Metal encoder
+    /// to avoid Metal validation errors.
     pub fn encoder(&mut self) -> &metal::ComputeCommandEncoderRef {
         // End any active encoder first
         if self.encoder_active {
@@ -119,9 +135,20 @@ impl<'q> CommandBatcher<'q> {
     /// End the current compute command encoder.
     ///
     /// Must be called after each `encoder()` call before the next `encoder()`
-    /// or `flush()` call. The encoder ref returned by `encoder()` must not be
-    /// used after this call.
+    /// or `flush()` call. The caller **MUST** have already called
+    /// `end_encoding()` on the Metal encoder before calling this method.
+    /// The encoder ref returned by `encoder()` must not be used after this call.
+    ///
+    /// # Panics (debug builds)
+    ///
+    /// Panics if no encoder is currently active (i.e., `encoder()` was not
+    /// called, or `end_encoder()` was already called).
     pub fn end_encoder(&mut self) {
+        debug_assert!(
+            self.encoder_active,
+            "end_encoder() called without an active encoder — \
+             did you forget to call encoder() first?"
+        );
         self.encoder_active = false;
     }
 

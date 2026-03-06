@@ -21,9 +21,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use rmlx_rdma::progress::PendingOp;
 use rmlx_rdma::shared_buffer::{ConnectionId, SharedBuffer};
 
+use crate::transport::ZeroCopyPendingOp;
 use crate::ep_runtime::EpRuntimeContext;
 // FP8 exchange functions are available for callers that set config.enable_fp8.
 // They operate on Array types and require KernelRegistry, so the actual
@@ -40,54 +40,79 @@ use crate::v3_protocol;
 
 /// Safely read `n` bytes from a Metal buffer's contents.
 ///
-/// # Panics
-/// Panics if `n` exceeds the buffer's length.
-fn read_buffer_bytes(buf: &metal::Buffer, n: usize) -> Vec<u8> {
-    assert!(
-        n <= buf.length() as usize,
-        "read_buffer_bytes: n={} exceeds buffer length={}",
-        n,
-        buf.length()
-    );
+/// Returns an error if `n` exceeds the buffer's length or the buffer pointer
+/// is null.
+fn read_buffer_bytes(buf: &metal::Buffer, n: usize) -> Result<Vec<u8>, DistributedError> {
+    let buf_len = buf.length() as usize;
+    if n > buf_len {
+        return Err(DistributedError::Protocol(format!(
+            "read_buffer_bytes: n={} exceeds buffer length={}",
+            n, buf_len
+        )));
+    }
     let ptr = buf.contents() as *const u8;
+    if ptr.is_null() {
+        return Err(DistributedError::Protocol(
+            "read_buffer_bytes: buffer contents pointer is null".to_string(),
+        ));
+    }
     // SAFETY: bounds checked above; contents() returns a valid CPU-accessible
     // pointer for StorageModeShared buffers, and the command buffer has completed.
-    unsafe { std::slice::from_raw_parts(ptr, n) }.to_vec()
+    Ok(unsafe { std::slice::from_raw_parts(ptr, n) }.to_vec())
 }
 
 /// Safely read `n` f32 elements from a Metal buffer's contents.
 ///
-/// # Panics
-/// Panics if `n * size_of::<f32>()` exceeds the buffer's byte length.
-fn read_buffer_f32(buf: &metal::Buffer, n: usize) -> Vec<f32> {
-    let byte_len = n * std::mem::size_of::<f32>();
-    assert!(
-        byte_len <= buf.length() as usize,
-        "read_buffer_f32: {} bytes (n={}) exceeds buffer length={}",
-        byte_len,
-        n,
-        buf.length()
-    );
+/// Returns an error if `n * size_of::<f32>()` exceeds the buffer's byte length
+/// or the buffer pointer is null.
+fn read_buffer_f32(buf: &metal::Buffer, n: usize) -> Result<Vec<f32>, DistributedError> {
+    let byte_len = n.checked_mul(std::mem::size_of::<f32>()).ok_or_else(|| {
+        DistributedError::Protocol(format!(
+            "read_buffer_f32: overflow computing byte length for n={}",
+            n
+        ))
+    })?;
+    let buf_len = buf.length() as usize;
+    if byte_len > buf_len {
+        return Err(DistributedError::Protocol(format!(
+            "read_buffer_f32: {} bytes (n={}) exceeds buffer length={}",
+            byte_len, n, buf_len
+        )));
+    }
     let ptr = buf.contents() as *const f32;
+    if ptr.is_null() {
+        return Err(DistributedError::Protocol(
+            "read_buffer_f32: buffer contents pointer is null".to_string(),
+        ));
+    }
     // SAFETY: bounds checked above; contents() returns a valid CPU-accessible
     // pointer for StorageModeShared buffers, and the command buffer has completed.
-    unsafe { std::slice::from_raw_parts(ptr, n) }.to_vec()
+    Ok(unsafe { std::slice::from_raw_parts(ptr, n) }.to_vec())
 }
 
 /// Safely read `n` bytes from a SharedBuffer's raw pointer.
 ///
-/// # Panics
-/// Panics if `n` exceeds the shared buffer's size.
-fn read_shared_buffer_bytes(buf: &rmlx_rdma::shared_buffer::SharedBuffer, n: usize) -> Vec<u8> {
-    assert!(
-        n <= buf.size(),
-        "read_shared_buffer_bytes: n={} exceeds SharedBuffer size={}",
-        n,
-        buf.size()
-    );
+/// Returns an error if `n` exceeds the shared buffer's size or the pointer
+/// is null.
+fn read_shared_buffer_bytes(
+    buf: &rmlx_rdma::shared_buffer::SharedBuffer,
+    n: usize,
+) -> Result<Vec<u8>, DistributedError> {
+    let buf_size = buf.size();
+    if n > buf_size {
+        return Err(DistributedError::Protocol(format!(
+            "read_shared_buffer_bytes: n={} exceeds SharedBuffer size={}",
+            n, buf_size
+        )));
+    }
     let ptr = buf.as_ptr() as *const u8;
+    if ptr.is_null() {
+        return Err(DistributedError::Protocol(
+            "read_shared_buffer_bytes: SharedBuffer pointer is null".to_string(),
+        ));
+    }
     // SAFETY: bounds checked above; SharedBuffer guarantees ptr is valid for size() bytes.
-    unsafe { std::slice::from_raw_parts(ptr, n) }.to_vec()
+    Ok(unsafe { std::slice::from_raw_parts(ptr, n) }.to_vec())
 }
 
 /// Cached dispatch layout from a prior dispatch call (DeepEP pattern).
@@ -1280,7 +1305,7 @@ impl MoeDispatchExchange {
                 route_indices: Vec::new(),
             });
         }
-        let output = read_buffer_bytes(&output_buf, output_size);
+        let output = read_buffer_bytes(&output_buf, output_size)?;
 
         // Compute route_indices CPU-side (mirrors GPU kernel's k-outer, n-inner
         // atomic cursor logic — deterministic for sequential simulation)
@@ -2017,7 +2042,7 @@ impl MoeDispatchExchange {
 
         // Copy from SharedBuffer to return Vec (the SharedBuffer's Metal view
         // is now ready for GPU compute without additional copies)
-        let result = read_shared_buffer_bytes(shared_buf, local_buf_size.min(shared_buf.size()));
+        let result = read_shared_buffer_bytes(shared_buf, local_buf_size.min(shared_buf.size()))?;
         let _ = expert_counts;
         Ok(RouteOutput {
             data: result,
@@ -2056,8 +2081,8 @@ impl MoeDispatchExchange {
         expert_weights: &[f32],
         token_data: &[u8],
         local_buf: &SharedBuffer,
-        peer_send_bufs: &[Option<&SharedBuffer>],
-        peer_recv_bufs: &[Option<&SharedBuffer>],
+        peer_send_bufs: &[Option<Arc<SharedBuffer>>],
+        peer_recv_bufs: &[Option<Arc<SharedBuffer>>],
         conn_ids: &[Option<&ConnectionId>],
         transport: &RdmaConnectionTransport,
     ) -> Result<AsyncDispatchResult, DistributedError> {
@@ -2213,7 +2238,7 @@ impl MoeDispatchExchange {
                     // Remote expert — write directly into peer SharedBuffer (-1 in route_indices)
                     let target_rank = expert / experts_per_rank;
                     if target_rank < world_size && target_rank != local_rank {
-                        if let Some(send_buf) = peer_send_bufs.get(target_rank).and_then(|b| *b) {
+                        if let Some(send_buf) = peer_send_bufs.get(target_rank).and_then(|b| b.as_deref()) {
                             let cursor = peer_cursors[target_rank];
                             let needed = cursor + wire_stride;
                             if needed <= send_buf.size() {
@@ -2250,7 +2275,7 @@ impl MoeDispatchExchange {
                 if payload_len == 0 {
                     continue;
                 }
-                let send_buf = match peer_send_bufs.get(pr).and_then(|b| *b) {
+                let send_buf = match peer_send_bufs.get(pr).and_then(|b| b.as_deref()) {
                     Some(b) => b,
                     None => continue,
                 };
@@ -2335,7 +2360,7 @@ impl MoeDispatchExchange {
 
             // Post send if we have data for this peer
             if send_len > 0 {
-                if let Some(send_buf) = peer_send_bufs.get(pr).and_then(|b| *b) {
+                if let Some(send_buf) = peer_send_bufs.get(pr).and_then(|b| b.clone()) {
                     let op = transport.send_zero_copy_async(
                         send_buf,
                         conn_id,
@@ -2347,7 +2372,7 @@ impl MoeDispatchExchange {
             }
 
             // Post recv if peer might send us data (we always post to be safe in UC mode)
-            if let Some(recv_buf) = peer_recv_bufs.get(pr).and_then(|b| *b) {
+            if let Some(recv_buf) = peer_recv_bufs.get(pr).and_then(|b| b.clone()) {
                 // Recv capacity: worst case the peer sends us all its tokens
                 let v2_max = experts_per_rank * capacity_per_expert * wire_stride;
                 let max_recv =
@@ -2395,15 +2420,17 @@ impl MoeDispatchExchange {
 
 /// Result of an async dispatch operation (Phase G2).
 ///
-/// Contains PendingOp handles for the RDMA transfers. The caller must poll
-/// or wait on these before reading the received SharedBuffers.
+/// Contains `ZeroCopyPendingOp` handles for the RDMA transfers. Each handle
+/// holds an `Arc<SharedBuffer>` reference, preventing the buffer from being
+/// freed while the DMA operation is in flight. The caller must poll or wait
+/// on these before reading the received SharedBuffers.
 pub struct AsyncDispatchResult {
     /// Cached dispatch layout for reuse in combine.
     pub layout: DispatchLayout,
-    /// PendingOps for outbound RDMA sends to peers.
-    pub send_ops: Vec<PendingOp>,
-    /// PendingOps for inbound RDMA recvs from peers.
-    pub recv_ops: Vec<PendingOp>,
+    /// ZeroCopyPendingOps for outbound RDMA sends to peers.
+    pub send_ops: Vec<ZeroCopyPendingOp>,
+    /// ZeroCopyPendingOps for inbound RDMA recvs from peers.
+    pub recv_ops: Vec<ZeroCopyPendingOp>,
 }
 
 /// Result of a dispatch operation.
@@ -2515,14 +2542,14 @@ impl MoeCombineExchange {
         batch_size: usize,
         top_k: usize,
         hidden_dim: usize,
-    ) -> Vec<f32> {
+    ) -> Result<Vec<f32>, DistributedError> {
         if batch_size == 0 || hidden_dim == 0 {
-            return vec![0.0f32; batch_size * hidden_dim];
+            return Ok(vec![0.0f32; batch_size * hidden_dim]);
         }
 
         let num_experts = expert_outputs.len();
         if num_experts == 0 {
-            return vec![0.0f32; batch_size * hidden_dim];
+            return Ok(vec![0.0f32; batch_size * hidden_dim]);
         }
 
         // Combine shader source (cached in pipeline)
@@ -2570,14 +2597,14 @@ kernel void moe_combine(
         let mut cache_guard = match self.combine_metal_cache.lock() {
             Ok(g) => g,
             Err(_) => {
-                return self.combine_cpu(
+                return Ok(self.combine_cpu(
                     expert_outputs,
                     weights,
                     indices,
                     batch_size,
                     top_k,
                     hidden_dim,
-                );
+                ));
             }
         };
         if cache_guard.is_none() {
@@ -2585,14 +2612,14 @@ kernel void moe_combine(
                 Some(d) => d,
                 None => {
                     drop(cache_guard);
-                    return self.combine_cpu(
+                    return Ok(self.combine_cpu(
                         expert_outputs,
                         weights,
                         indices,
                         batch_size,
                         top_k,
                         hidden_dim,
-                    );
+                    ));
                 }
             };
             let options = metal::CompileOptions::new();
@@ -2600,42 +2627,42 @@ kernel void moe_combine(
                 Ok(lib) => lib,
                 Err(_) => {
                     drop(cache_guard);
-                    return self.combine_cpu(
+                    return Ok(self.combine_cpu(
                         expert_outputs,
                         weights,
                         indices,
                         batch_size,
                         top_k,
                         hidden_dim,
-                    );
+                    ));
                 }
             };
             let function = match library.get_function("moe_combine", None) {
                 Ok(f) => f,
                 Err(_) => {
                     drop(cache_guard);
-                    return self.combine_cpu(
+                    return Ok(self.combine_cpu(
                         expert_outputs,
                         weights,
                         indices,
                         batch_size,
                         top_k,
                         hidden_dim,
-                    );
+                    ));
                 }
             };
             let pipeline = match device.new_compute_pipeline_state_with_function(&function) {
                 Ok(p) => p,
                 Err(_) => {
                     drop(cache_guard);
-                    return self.combine_cpu(
+                    return Ok(self.combine_cpu(
                         expert_outputs,
                         weights,
                         indices,
                         batch_size,
                         top_k,
                         hidden_dim,
-                    );
+                    ));
                 }
             };
             let queue = device.new_command_queue();
@@ -2648,14 +2675,14 @@ kernel void moe_combine(
         let cached = match cache_guard.as_ref() {
             Some(c) => c,
             None => {
-                return self.combine_cpu(
+                return Ok(self.combine_cpu(
                     expert_outputs,
                     weights,
                     indices,
                     batch_size,
                     top_k,
                     hidden_dim,
-                );
+                ));
             }
         };
 
@@ -2888,14 +2915,14 @@ kernel void moe_combine(
         let group_size = self.group.size();
         if group_size <= 1 || !self.group.has_transport() {
             // Single-rank: use Metal scatter-add locally (no RDMA needed)
-            return Ok(self.combine_metal(
+            return self.combine_metal(
                 local_expert_outputs,
                 weights,
                 indices,
                 batch_size,
                 top_k,
                 hidden_dim,
-            ));
+            );
         }
 
         // D10: Per-rank selective combine — only exchange the segments of each
@@ -2972,14 +2999,14 @@ kernel void moe_combine(
         }
 
         // Use Metal scatter-add (combine_metal) instead of CPU accumulation
-        Ok(self.combine_metal(
+        self.combine_metal(
             &all_expert_outputs,
             weights,
             indices,
             batch_size,
             top_k,
             hidden_dim,
-        ))
+        )
     }
 
     /// Layout-based combine: reuses cached routing metadata from dispatch.
@@ -3031,14 +3058,14 @@ kernel void moe_combine(
                             top_k,
                             hidden_dim,
                         )),
-                        _ => Ok(self.combine_metal(
+                        _ => self.combine_metal(
                             local_expert_outputs,
                             weights,
                             indices,
                             batch_size,
                             top_k,
                             hidden_dim,
-                        )),
+                        ),
                     }
                 }
             }
@@ -3123,8 +3150,8 @@ kernel void moe_combine(
         layout: &DispatchLayout,
         _batch_size: usize,
         hidden_dim: usize,
-        send_bufs: &[Option<&SharedBuffer>],
-        recv_bufs: &[Option<&SharedBuffer>],
+        send_bufs: &[Option<Arc<SharedBuffer>>],
+        recv_bufs: &[Option<Arc<SharedBuffer>>],
         conn_ids: &[Option<&ConnectionId>],
         transport: &RdmaConnectionTransport,
     ) -> Result<AsyncCombineHandle, DistributedError> {
@@ -3150,7 +3177,7 @@ kernel void moe_combine(
             // Pack only the peer's segment from each local expert into send buffer
             // Layout: [expert_0_peer_segment | expert_1_peer_segment | ...]
             // Each segment is cap * hidden_dim * sizeof(f32)
-            if let Some(send_buf) = send_bufs.get(pr).and_then(|b| *b) {
+            if let Some(send_buf) = send_bufs.get(pr).and_then(|b| b.clone()) {
                 let total_send_len = experts_per_rank * segment_bytes;
                 if total_send_len > 0 && total_send_len <= send_buf.size() {
                     let send_ptr = send_buf.as_ptr();
@@ -3211,7 +3238,7 @@ kernel void moe_combine(
             }
 
             // Post recv for this peer's expert output segments
-            if let Some(recv_buf) = recv_bufs.get(pr).and_then(|b| *b) {
+            if let Some(recv_buf) = recv_bufs.get(pr).and_then(|b| b.clone()) {
                 let total_recv_len = experts_per_rank * segment_bytes;
                 if total_recv_len > 0 && total_recv_len <= recv_buf.size() {
                     let op = transport.recv_zero_copy_async(
@@ -3247,7 +3274,7 @@ kernel void moe_combine(
         hidden_dim: usize,
         num_experts: usize,
         layout: &DispatchLayout,
-        recv_bufs: &[Option<&SharedBuffer>],
+        recv_bufs: &[Option<Arc<SharedBuffer>>],
     ) -> Result<Vec<f32>, DistributedError> {
         let (local_start, _local_end) = layout.local_expert_range;
         let experts_per_rank = layout.experts_per_rank;
@@ -3271,7 +3298,7 @@ kernel void moe_combine(
         // D10: Unpack received per-rank segments from peer SharedBuffers
         for &peer_rank in self.group.peers().iter() {
             let pr = peer_rank as usize;
-            if let Some(recv_buf) = recv_bufs.get(pr).and_then(|b| *b) {
+            if let Some(recv_buf) = recv_bufs.get(pr).and_then(|b| b.as_deref()) {
                 let peer_start = pr * experts_per_rank;
                 for i in 0..experts_per_rank {
                     let peer_expert_idx = peer_start + i;
@@ -3299,14 +3326,14 @@ kernel void moe_combine(
         }
 
         // Use Metal scatter-add for the final weighted combination
-        Ok(self.combine_metal(
+        self.combine_metal(
             &all_expert_outputs,
             weights,
             indices,
             batch_size,
             top_k,
             hidden_dim,
-        ))
+        )
     }
 
     /// Group reference.
@@ -3317,12 +3344,13 @@ kernel void moe_combine(
 
 /// Handle for in-flight async combine RDMA transfers (Phase G2).
 ///
-/// Holds PendingOp handles for the send/recv operations posted by
-/// `combine_async_start`. The caller polls or waits on these before
-/// calling `combine_async_finish`.
+/// Holds `ZeroCopyPendingOp` handles for the send/recv operations posted by
+/// `combine_async_start`. Each handle keeps its `SharedBuffer` alive via
+/// `Arc` for the duration of the DMA. The caller polls or waits on these
+/// before calling `combine_async_finish`.
 pub struct AsyncCombineHandle {
-    pub send_ops: Vec<PendingOp>,
-    pub recv_ops: Vec<PendingOp>,
+    pub send_ops: Vec<ZeroCopyPendingOp>,
+    pub recv_ops: Vec<ZeroCopyPendingOp>,
 }
 
 impl AsyncCombineHandle {
@@ -3336,5 +3364,97 @@ impl AsyncCombineHandle {
     pub fn pending_count(&self) -> usize {
         self.send_ops.iter().filter(|op| op.is_pending()).count()
             + self.recv_ops.iter().filter(|op| op.is_pending()).count()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_buffer_bytes_oob_returns_error() {
+        let device = match metal::Device::system_default() {
+            Some(d) => d,
+            None => return, // skip on CI without Metal
+        };
+        let buf = device.new_buffer(
+            64,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        // Requesting more bytes than the buffer holds should return Err.
+        let result = read_buffer_bytes(&buf, 128);
+        assert!(result.is_err(), "expected error for OOB read");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("exceeds buffer length"), "error message: {msg}");
+    }
+
+    #[test]
+    fn read_buffer_bytes_exact_len_succeeds() {
+        let device = match metal::Device::system_default() {
+            Some(d) => d,
+            None => return,
+        };
+        let buf = device.new_buffer(
+            64,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        // Reading exactly the buffer length should succeed.
+        let result = read_buffer_bytes(&buf, 64);
+        assert!(result.is_ok(), "exact-length read should succeed");
+        assert_eq!(result.unwrap().len(), 64);
+    }
+
+    #[test]
+    fn read_buffer_f32_oob_returns_error() {
+        let device = match metal::Device::system_default() {
+            Some(d) => d,
+            None => return,
+        };
+        // 16 bytes = 4 f32 elements
+        let buf = device.new_buffer(
+            16,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        // Requesting 8 f32s (32 bytes) from a 16-byte buffer should fail.
+        let result = read_buffer_f32(&buf, 8);
+        assert!(result.is_err(), "expected error for OOB f32 read");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("exceeds buffer length"), "error message: {msg}");
+    }
+
+    #[test]
+    fn read_buffer_f32_exact_len_succeeds() {
+        let device = match metal::Device::system_default() {
+            Some(d) => d,
+            None => return,
+        };
+        // 16 bytes = 4 f32 elements
+        let buf = device.new_buffer(
+            16,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        let result = read_buffer_f32(&buf, 4);
+        assert!(result.is_ok(), "exact-length f32 read should succeed");
+        assert_eq!(result.unwrap().len(), 4);
+    }
+
+    #[test]
+    fn read_shared_buffer_bytes_oob_returns_error() {
+        let device = match metal::Device::system_default() {
+            Some(d) => d,
+            None => return,
+        };
+        let shared_buf = match SharedBuffer::new(&device, 64, 0) {
+            Ok(b) => b,
+            Err(_) => return, // skip if SharedBuffer allocation fails
+        };
+        // SharedBuffer page-aligns to 16384, so request more than that to trigger OOB.
+        let result = read_shared_buffer_bytes(&shared_buf, shared_buf.size() + 1);
+        assert!(result.is_err(), "expected error for OOB SharedBuffer read");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("exceeds SharedBuffer size"),
+            "error message: {msg}"
+        );
     }
 }

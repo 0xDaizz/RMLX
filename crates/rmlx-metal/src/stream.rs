@@ -27,8 +27,23 @@ pub const STREAM_COPY: u32 = 2;
 struct StreamState {
     queue: CommandQueue,
     /// Human-readable label for debugging / GPU profiler output.
+    /// Wired to [`CommandQueue::set_label`] so it appears in Metal GPU profiler traces.
+    /// The field itself is not read by Rust code but is kept for diagnostics.
     #[allow(dead_code)]
     label: String,
+}
+
+impl StreamState {
+    /// Create a new stream state, wiring the label to the Metal `CommandQueue`
+    /// so it shows up in GPU profiler / capture traces.
+    fn new(device: &Device, label: &str) -> Self {
+        let queue = device.new_command_queue();
+        queue.set_label(label);
+        Self {
+            queue,
+            label: label.to_string(),
+        }
+    }
 }
 
 /// Multi-stream manager supporting N named command queues with
@@ -48,27 +63,9 @@ impl StreamManager {
     pub fn new(device: &Device) -> Self {
         let mut streams = HashMap::new();
 
-        streams.insert(
-            STREAM_DEFAULT,
-            StreamState {
-                queue: device.new_command_queue(),
-                label: "default".to_string(),
-            },
-        );
-        streams.insert(
-            STREAM_COMPUTE,
-            StreamState {
-                queue: device.new_command_queue(),
-                label: "compute".to_string(),
-            },
-        );
-        streams.insert(
-            STREAM_COPY,
-            StreamState {
-                queue: device.new_command_queue(),
-                label: "copy".to_string(),
-            },
-        );
+        streams.insert(STREAM_DEFAULT, StreamState::new(device, "default"));
+        streams.insert(STREAM_COMPUTE, StreamState::new(device, "compute"));
+        streams.insert(STREAM_COPY, StreamState::new(device, "copy"));
 
         let sync_fence = GpuFence::new(device);
 
@@ -85,10 +82,10 @@ impl StreamManager {
     /// Otherwise, creates a new queue on the device and inserts it.
     pub fn get_or_create_stream(&mut self, id: u32) -> &CommandQueue {
         let device = &self.device;
-        let state = self.streams.entry(id).or_insert_with(|| StreamState {
-            queue: device.new_command_queue(),
-            label: format!("stream-{id}"),
-        });
+        let state = self
+            .streams
+            .entry(id)
+            .or_insert_with(|| StreamState::new(device, &format!("stream-{id}")));
         &state.queue
     }
 

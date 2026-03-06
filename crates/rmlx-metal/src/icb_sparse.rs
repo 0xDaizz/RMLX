@@ -190,14 +190,13 @@ impl SparseExpertPlan {
             };
 
             // SwiGLU: element-wise on [tokens, inter]
-            let swiglu_threads = max_cap * inter;
-            let swiglu_max_tg = swiglu_pipeline.max_total_threads_per_threadgroup();
-            let swiglu_tg = std::cmp::min(swiglu_max_tg, swiglu_threads);
+            // Use 2D grid so replay_with_count can scale width (tokens)
+            // independently of height (intermediate_dim).
             let swiglu_dispatch = CapturedDispatch {
                 pipeline: swiglu_pipeline.clone(),
                 buffers: vec![],
-                grid_size: MTLSize::new(swiglu_threads, 1, 1),
-                threadgroup_size: MTLSize::new(swiglu_tg, 1, 1),
+                grid_size: MTLSize::new(max_cap, inter, 1),
+                threadgroup_size: Self::compute_threadgroup(swiglu_pipeline, max_cap, inter),
             };
 
             // Down GEMM: [tokens, inter] x [inter, D] -> [tokens, D]
@@ -705,6 +704,76 @@ mod tests {
             &dispatch_offsets,
             cb,
         );
+    }
+
+    // ── SwiGLU 2D grid tests ─────────────────────────────────────────────
+
+    #[test]
+    fn swiglu_dispatch_uses_2d_grid() {
+        let device = metal::Device::system_default().expect("Metal device required");
+        let _queue = device.new_command_queue();
+
+        let (plan, _bufs) = build_test_plan(&device, 2, 64, 128);
+
+        // Access the SwiGLU dispatch for expert 0.
+        let group = plan.expert_dispatches[0].as_ref().unwrap();
+        let swiglu = &group.swiglu_dispatch;
+
+        // The grid must be 2D: width = max_capacity, height = intermediate_dim.
+        assert_eq!(
+            swiglu.grid_size.width, 16,
+            "SwiGLU grid width should be max_capacity (16)"
+        );
+        assert_eq!(
+            swiglu.grid_size.height, 128,
+            "SwiGLU grid height should be intermediate_dim (128)"
+        );
+        assert_eq!(swiglu.grid_size.depth, 1);
+    }
+
+    #[test]
+    fn swiglu_replay_preserves_intermediate_dim() {
+        let device = metal::Device::system_default().expect("Metal device required");
+        let queue = device.new_command_queue();
+
+        let intermediate_dim = 256usize;
+        let (plan, _bufs) = build_test_plan(&device, 4, 64, intermediate_dim);
+
+        // Replay with fewer tokens than max_capacity.
+        // The key check: SwiGLU grid height (intermediate_dim) must be preserved
+        // even when width (token_count) is scaled down.
+        let expert_counts = [3u32, 0, 0, 0];
+        let dispatch_offsets = [0u32, 3, 3, 3, 3];
+
+        let total_tokens = 3u64;
+        let hidden = 64u64;
+        let elem_size = 2u64;
+        let buf_size = total_tokens * hidden * elem_size;
+
+        let input_buf = device.new_buffer(buf_size, metal::MTLResourceOptions::StorageModeShared);
+        let output_buf = device.new_buffer(buf_size, metal::MTLResourceOptions::StorageModeShared);
+
+        let cb = queue.new_command_buffer();
+        let dispatched = plan.replay_sparse(
+            &expert_counts,
+            &input_buf,
+            &output_buf,
+            &dispatch_offsets,
+            cb,
+        );
+
+        assert_eq!(dispatched, 1);
+
+        // Verify the SwiGLU dispatch in the plan has the correct 2D grid shape.
+        let group = plan.expert_dispatches[0].as_ref().unwrap();
+        let swiglu = &group.swiglu_dispatch;
+        assert_eq!(
+            swiglu.grid_size.height, intermediate_dim as u64,
+            "SwiGLU grid height must equal intermediate_dim after replay"
+        );
+
+        cb.commit();
+        cb.wait_until_completed();
     }
 
     // ── Key equality / hashing tests ─────────────────────────────────────

@@ -1,16 +1,9 @@
 //! Optimized convolution with shared memory tiling.
 //!
-//! Implements im2col-based Conv2d that transforms the convolution into a GEMM,
-//! leveraging shared memory tiles for better GPU utilization. This is typically
-//! faster than the naive implicit GEMM approach in `conv.rs` for larger kernels
-//! and feature map sizes.
-//!
-//! The im2col approach:
-//! 1. Rearrange input patches into columns (im2col)
-//! 2. Perform standard GEMM: output = weight_matrix @ im2col_matrix
-//!
-//! This module provides a tiled im2col kernel that writes the rearranged data
-//! into a temporary buffer, then uses the existing matmul infrastructure.
+//! Provides a tiled Conv2d kernel that uses threadgroup shared memory for
+//! weight reuse, reducing global memory bandwidth for larger input channel
+//! counts and kernel sizes. Supports arbitrary kernel sizes (not just 3x3)
+//! via dynamically-allocated threadgroup memory.
 
 use crate::array::Array;
 use crate::dtype::DType;
@@ -21,82 +14,14 @@ use metal::MTLSize;
 // Metal shader source
 // ---------------------------------------------------------------------------
 
-/// Metal shader for im2col transform and tiled convolution.
+/// Metal shader for tiled convolution.
 ///
-/// The im2col kernel transforms input patches into a column matrix suitable
-/// for GEMM. Each thread handles one output spatial position for one input
-/// channel-kernel pair.
-///
-/// Also includes a tiled conv2d kernel that uses threadgroup shared memory
-/// to reduce global memory bandwidth by reusing loaded weight tiles.
+/// Uses threadgroup shared memory (dynamically sized) to tile weight loads,
+/// reducing global memory bandwidth by reusing loaded weight tiles.
+/// Supports arbitrary kernel sizes via host-side threadgroup memory allocation.
 pub const CONV_TILED_SHADER_SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
-
-// ============================================================================
-// im2col: Transform convolution patches into columns for GEMM
-// ============================================================================
-// Input:  [B, C_in, H, W]
-// Output: [B, C_in * kH * kW, H_out * W_out]  (im2col columns)
-//
-// Each thread writes one element of the output matrix.
-// Params: [B, C_in, H, W, kH, kW, H_out, W_out, stride_h, stride_w,
-//          pad_h, pad_w, dil_h, dil_w]
-
-kernel void im2col_f32(
-    device const float* input   [[buffer(0)]],
-    device float*       columns [[buffer(1)]],
-    constant uint*      params  [[buffer(2)]],
-    uint2 gid [[thread_position_in_grid]])
-{
-    // gid.x = output spatial index (h_out * W_out + w_out)
-    // gid.y = channel-kernel index (c_in * kH * kW + kh * kW + kw)
-    // batch handled via buffer(3)
-    uint spatial_idx = gid.x;
-    uint ck_idx      = gid.y;
-
-    uint B_       = params[0];
-    uint C_in     = params[1];
-    uint H        = params[2];
-    uint W        = params[3];
-    uint kH       = params[4];
-    uint kW       = params[5];
-    uint H_out    = params[6];
-    uint W_out    = params[7];
-    uint stride_h = params[8];
-    uint stride_w = params[9];
-    uint pad_h    = params[10];
-    uint pad_w    = params[11];
-    uint dil_h    = params[12];
-    uint dil_w    = params[13];
-
-    uint total_spatial = H_out * W_out;
-    uint total_ck = C_in * kH * kW;
-
-    if (spatial_idx >= total_spatial || ck_idx >= total_ck) return;
-
-    uint h_out = spatial_idx / W_out;
-    uint w_out = spatial_idx % W_out;
-
-    uint kw = ck_idx % kW;
-    uint tmp = ck_idx / kW;
-    uint kh = tmp % kH;
-    uint c_in = tmp / kH;
-
-    // Process all batches
-    for (uint b = 0; b < B_; b++) {
-        int h_in = int(h_out * stride_h + kh * dil_h) - int(pad_h);
-        int w_in = int(w_out * stride_w + kw * dil_w) - int(pad_w);
-
-        float val = 0.0f;
-        if (h_in >= 0 && uint(h_in) < H && w_in >= 0 && uint(w_in) < W) {
-            val = input[b * C_in * H * W + c_in * H * W + uint(h_in) * W + uint(w_in)];
-        }
-
-        // Output layout: [B, C_in*kH*kW, H_out*W_out]
-        columns[b * total_ck * total_spatial + ck_idx * total_spatial + spatial_idx] = val;
-    }
-}
 
 // ============================================================================
 // Tiled Conv2d: uses threadgroup shared memory for weight reuse
@@ -110,6 +35,9 @@ kernel void im2col_f32(
 // Output: [B, C_out, H_out, W_out]
 //
 // Grid: (W_out, C_out, B * H_out)
+//
+// Threadgroup memory is allocated dynamically on the host side with size
+// TILE_CI * kH * kW * sizeof(float), so any kernel size is supported.
 
 constant constexpr uint TILE_CI = 16;  // Tile over input channels
 
@@ -119,6 +47,7 @@ kernel void conv2d_tiled_f32(
     device const float* bias    [[buffer(2)]],
     device float*       output  [[buffer(3)]],
     constant uint*      params  [[buffer(4)]],
+    threadgroup float*  weight_tile [[threadgroup(0)]],
     uint3 gid [[thread_position_in_grid]],
     uint3 lid [[thread_position_in_threadgroup]],
     uint3 tg_size [[threads_per_threadgroup]])
@@ -153,9 +82,6 @@ kernel void conv2d_tiled_f32(
     uint group = c_out_idx / (C_out / groups);
     uint c_in_start = group * (C_in / groups);
     uint c_in_count = C_in / groups;
-
-    // Shared memory tile for a chunk of weight values
-    threadgroup float weight_tile[TILE_CI * 9];  // up to 3x3 kernel
 
     float sum = 0.0f;
     uint kernel_size = kH * kW;
@@ -386,6 +312,11 @@ pub fn conv2d_tiled(
     encoder.set_buffer(3, Some(out.metal_buffer()), out.offset() as u64);
     encoder.set_buffer(4, Some(&params_buf), 0);
 
+    // Allocate dynamic threadgroup memory for weight_tile: TILE_CI * kH * kW floats
+    let tile_ci: usize = 16; // must match TILE_CI in the shader
+    let tg_mem_bytes = (tile_ci * kh * kw * std::mem::size_of::<f32>()) as u64;
+    encoder.set_threadgroup_memory_length(0, tg_mem_bytes);
+
     // Grid: (W_out, C_out, B * H_out)
     let grid_size = MTLSize::new(w_out as u64, c_out as u64, (batch * h_out) as u64);
     let max_threads = pipeline.max_total_threads_per_threadgroup();
@@ -505,6 +436,96 @@ mod tests {
                 n,
                 t,
                 diff
+            );
+        }
+    }
+
+    /// Verify that conv2d_tiled works with a 5x5 kernel (would overflow
+    /// the old hardcoded `TILE_CI * 9` threadgroup allocation).
+    #[test]
+    fn test_conv2d_tiled_5x5_kernel() {
+        let (registry, queue) = setup();
+        let dev = registry.device().raw();
+
+        // Also register non-tiled conv for reference comparison
+        crate::ops::conv::register(&registry).unwrap();
+
+        // Input: [1, 2, 8, 8], Weight: [1, 2, 5, 5]
+        let input_data: Vec<f32> = (0..128).map(|i| i as f32 * 0.01).collect();
+        let weight_data: Vec<f32> = (0..50).map(|i| (i as f32 - 25.0) * 0.02).collect();
+
+        let input = Array::from_slice(dev, &input_data, vec![1, 2, 8, 8]);
+        let weight = Array::from_slice(dev, &weight_data, vec![1, 2, 5, 5]);
+
+        let out_naive = crate::ops::conv::conv2d(
+            &registry, &input, &weight, None,
+            (1, 1), (0, 0), (1, 1), 1, &queue,
+        )
+        .unwrap();
+
+        let out_tiled = conv2d_tiled(
+            &registry, &input, &weight, None,
+            (1, 1), (0, 0), (1, 1), 1, &queue,
+        )
+        .unwrap();
+
+        assert_eq!(out_naive.shape(), out_tiled.shape());
+        assert_eq!(out_tiled.shape(), &[1, 1, 4, 4]);
+
+        let naive_vec = out_naive.to_vec_checked::<f32>();
+        let tiled_vec = out_tiled.to_vec_checked::<f32>();
+
+        for (i, (n, t)) in naive_vec.iter().zip(tiled_vec.iter()).enumerate() {
+            let diff = (n - t).abs();
+            assert!(
+                diff < 1e-3,
+                "5x5 mismatch at index {}: naive={}, tiled={}, diff={}",
+                i, n, t, diff
+            );
+        }
+    }
+
+    /// Verify that conv2d_tiled works with a 7x7 kernel (would overflow
+    /// the old hardcoded `TILE_CI * 9` threadgroup allocation).
+    #[test]
+    fn test_conv2d_tiled_7x7_kernel() {
+        let (registry, queue) = setup();
+        let dev = registry.device().raw();
+
+        // Also register non-tiled conv for reference comparison
+        crate::ops::conv::register(&registry).unwrap();
+
+        // Input: [1, 1, 10, 10], Weight: [1, 1, 7, 7]
+        let input_data: Vec<f32> = (0..100).map(|i| i as f32 * 0.01).collect();
+        let weight_data: Vec<f32> = (0..49).map(|i| (i as f32 - 24.0) * 0.02).collect();
+
+        let input = Array::from_slice(dev, &input_data, vec![1, 1, 10, 10]);
+        let weight = Array::from_slice(dev, &weight_data, vec![1, 1, 7, 7]);
+
+        let out_naive = crate::ops::conv::conv2d(
+            &registry, &input, &weight, None,
+            (1, 1), (0, 0), (1, 1), 1, &queue,
+        )
+        .unwrap();
+
+        let out_tiled = conv2d_tiled(
+            &registry, &input, &weight, None,
+            (1, 1), (0, 0), (1, 1), 1, &queue,
+        )
+        .unwrap();
+
+        assert_eq!(out_naive.shape(), out_tiled.shape());
+        assert_eq!(out_tiled.shape(), &[1, 1, 4, 4]);
+
+        let naive_vec = out_naive.to_vec_checked::<f32>();
+        let tiled_vec = out_tiled.to_vec_checked::<f32>();
+
+        for (i, (n, t)) in naive_vec.iter().zip(tiled_vec.iter()).enumerate() {
+            let diff = (n - t).abs();
+            assert!(
+                diff < 1e-3,
+                "7x7 mismatch at index {}: naive={}, tiled={}, diff={}",
+                i, n, t, diff
             );
         }
     }

@@ -6,12 +6,16 @@ use rmlx_metal::metal;
 
 use rmlx_alloc::MetalAllocator;
 
+use std::fmt;
+
 use crate::dtype::{DType, HasDType};
 
 /// An N-dimensional array stored in a Metal GPU buffer.
 ///
 /// The buffer uses `StorageModeShared` (CPU + GPU accessible) on Apple Silicon UMA.
 /// Shape, strides, and dtype are tracked as metadata alongside the buffer.
+///
+/// `Debug` prints shape, strides, and dtype (not buffer contents).
 pub struct Array {
     buffer: MTLBuffer,
     shape: Vec<usize>,
@@ -19,6 +23,17 @@ pub struct Array {
     dtype: DType,
     /// Byte offset into the buffer where this array's data begins.
     offset: usize,
+}
+
+impl fmt::Debug for Array {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Array")
+            .field("shape", &self.shape)
+            .field("strides", &self.strides)
+            .field("dtype", &self.dtype)
+            .field("offset", &self.offset)
+            .finish()
+    }
 }
 
 impl Array {
@@ -76,7 +91,7 @@ impl Array {
     /// regardless of platform or Metal driver behavior.
     pub fn zeros(device: &metal::Device, shape: &[usize], dtype: DType) -> Self {
         let numel: usize = shape.iter().product();
-        let byte_size = dtype.numel_to_bytes(numel) as u64;
+        let byte_size = dtype.numel_to_bytes(numel).expect("numel must be block-aligned for quantized dtypes") as u64;
         // Metal returns null for zero-length buffers; allocate at least 1 byte.
         let alloc_size = byte_size.max(1);
         let buffer = device.new_buffer(alloc_size, MTLResourceOptions::StorageModeShared);
@@ -111,7 +126,7 @@ impl Array {
         dtype: DType,
     ) -> Result<Self, rmlx_alloc::AllocError> {
         let numel: usize = shape.iter().product();
-        let byte_size = dtype.numel_to_bytes(numel);
+        let byte_size = dtype.numel_to_bytes(numel).expect("numel must be block-aligned for quantized dtypes");
         let buffer = allocator.alloc(byte_size)?;
 
         // Zero the buffer contents (cached buffers may contain stale data).
@@ -281,7 +296,7 @@ impl Array {
 
     /// Total data size in bytes.
     pub fn byte_size(&self) -> usize {
-        self.dtype.numel_to_bytes(self.numel())
+        self.dtype.numel_to_bytes(self.numel()).expect("array numel must be block-aligned")
     }
 
     /// Returns the raw bytes of this array's buffer (from offset, for numel * dtype bytes).
@@ -313,7 +328,7 @@ impl Array {
         dtype: DType,
     ) -> Self {
         let numel: usize = shape.iter().product();
-        let expected = dtype.numel_to_bytes(numel);
+        let expected = dtype.numel_to_bytes(numel).expect("numel must be block-aligned for quantized dtypes");
         assert_eq!(
             bytes.len(),
             expected,

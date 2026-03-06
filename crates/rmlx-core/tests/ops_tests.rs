@@ -268,7 +268,7 @@ fn test_quantized_matmul_vec_size_mismatch() {
     let in_features: usize = 64;
     let out_features: usize = 32;
     // Create correctly sized Q8_0 weights buffer
-    let weight_bytes = DType::Q8_0.numel_to_bytes(out_features * in_features);
+    let weight_bytes = DType::Q8_0.numel_to_bytes(out_features * in_features).unwrap();
     let weights = Array::new(
         dev.new_buffer(
             weight_bytes as u64,
@@ -302,7 +302,7 @@ fn test_quantized_matmul_weights_buffer_too_small() {
     let in_features: usize = 64;
     let out_features: usize = 32;
     // Create UNDERSIZED weights buffer (only enough for half the rows)
-    let small_bytes = DType::Q8_0.numel_to_bytes((out_features / 2) * in_features);
+    let small_bytes = DType::Q8_0.numel_to_bytes((out_features / 2) * in_features).unwrap();
     let weights = Array::new(
         dev.new_buffer(
             small_bytes as u64,
@@ -1195,4 +1195,260 @@ fn test_silu_zero_and_symmetry() {
         "silu(-20) should be ~0, got {}",
         result2[1]
     );
+}
+
+// ─── PR 0.3: Empty/zero-dim tensor dispatch guard tests ───
+
+#[test]
+fn test_binary_add_empty_0x4() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    let a = Array::from_slice::<f32>(dev, &[], vec![0, 4]);
+    let b = Array::from_slice::<f32>(dev, &[], vec![0, 4]);
+    let c = ops::binary::add(&registry, &a, &b, &queue).expect("add [0,4] failed");
+    assert_eq!(c.shape(), &[0, 4]);
+    assert_eq!(c.numel(), 0);
+    let vals: Vec<f32> = c.to_vec_checked();
+    assert!(vals.is_empty());
+}
+
+#[test]
+fn test_binary_add_empty_3x0() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    let a = Array::from_slice::<f32>(dev, &[], vec![3, 0]);
+    let b = Array::from_slice::<f32>(dev, &[], vec![3, 0]);
+    let c = ops::binary::add(&registry, &a, &b, &queue).expect("add [3,0] failed");
+    assert_eq!(c.shape(), &[3, 0]);
+    assert_eq!(c.numel(), 0);
+}
+
+#[test]
+fn test_binary_eq_empty_0x4() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    let a = Array::from_slice::<f32>(dev, &[], vec![0, 4]);
+    let b = Array::from_slice::<f32>(dev, &[], vec![0, 4]);
+    let c = ops::binary::eq(&registry, &a, &b, &queue).expect("eq [0,4] failed");
+    assert_eq!(c.shape(), &[0, 4]);
+    assert_eq!(c.dtype(), DType::UInt32);
+    assert_eq!(c.numel(), 0);
+}
+
+#[test]
+fn test_binary_async_empty_0x4() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    let a = Array::from_slice::<f32>(dev, &[], vec![0, 4]);
+    let b = Array::from_slice::<f32>(dev, &[], vec![0, 4]);
+    let launch =
+        ops::binary::binary_op_async(&registry, &a, &b, ops::binary::BinaryOp::Add, &queue)
+            .expect("binary_op_async [0,4] failed");
+    assert!(
+        launch.is_complete(),
+        "empty async should be immediately complete"
+    );
+    let output = launch.into_array();
+    assert_eq!(output.shape(), &[0, 4]);
+    assert_eq!(output.numel(), 0);
+}
+
+#[test]
+fn test_softmax_empty_0x4() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    let input = Array::from_slice::<f32>(dev, &[], vec![0, 4]);
+    let output =
+        ops::softmax::softmax(&registry, &input, &queue).expect("softmax [0,4] failed");
+    assert_eq!(output.shape(), &[0, 4]);
+    assert_eq!(output.numel(), 0);
+}
+
+#[test]
+fn test_softmax_empty_3x0() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    let input = Array::from_slice::<f32>(dev, &[], vec![3, 0]);
+    let output =
+        ops::softmax::softmax(&registry, &input, &queue).expect("softmax [3,0] failed");
+    assert_eq!(output.shape(), &[3, 0]);
+    assert_eq!(output.numel(), 0);
+}
+
+// --- RoPE frequency validation tests ---
+
+#[test]
+fn test_rope_freq_wrong_ndim() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    // input: [1, 4] (seq=1, head_dim=4)
+    let input = Array::from_slice(dev, &[1.0f32, 2.0, 3.0, 4.0], vec![1, 4]);
+    // cos/sin as 1-D instead of required 2-D
+    let cos_f = Array::from_slice(dev, &[1.0f32, 1.0], vec![2]);
+    let sin_f = Array::from_slice(dev, &[0.0f32, 0.0], vec![2]);
+    let result = ops::rope::rope(&registry, &input, &cos_f, &sin_f, 0, 1.0, &queue);
+    assert!(result.is_err(), "1-D freq tensors should be rejected");
+    let msg = format!("{}", result.err().expect("expected Err"));
+    assert!(msg.contains("2-D"), "error should mention 2-D requirement: {msg}");
+}
+
+#[test]
+fn test_rope_freq_wrong_cols() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    // input: [1, 4] (seq=1, head_dim=4), so half_dim=2
+    let input = Array::from_slice(dev, &[1.0f32, 2.0, 3.0, 4.0], vec![1, 4]);
+    // cos/sin with wrong number of cols (3 instead of 2)
+    let cos_f = Array::from_slice(dev, &[1.0f32, 1.0, 1.0], vec![1, 3]);
+    let sin_f = Array::from_slice(dev, &[0.0f32, 0.0, 0.0], vec![1, 3]);
+    let result = ops::rope::rope(&registry, &input, &cos_f, &sin_f, 0, 1.0, &queue);
+    assert!(result.is_err(), "wrong freq cols should be rejected");
+    let msg = format!("{}", result.err().expect("expected Err"));
+    assert!(msg.contains("head_dim/2"), "error should mention head_dim/2: {msg}");
+}
+
+#[test]
+fn test_rope_freq_insufficient_rows() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    // input: [2, 4] (seq=2, head_dim=4), so need at least 2 rows in freq tables
+    let input = Array::from_slice(dev, &[1.0f32; 8], vec![2, 4]);
+    // cos/sin with only 1 row (need 2)
+    let cos_f = Array::from_slice(dev, &[1.0f32, 1.0], vec![1, 2]);
+    let sin_f = Array::from_slice(dev, &[0.0f32, 0.0], vec![1, 2]);
+    let result = ops::rope::rope(&registry, &input, &cos_f, &sin_f, 0, 1.0, &queue);
+    assert!(result.is_err(), "insufficient freq rows should be rejected");
+    let msg = format!("{}", result.err().expect("expected Err"));
+    assert!(msg.contains("rows"), "error should mention rows: {msg}");
+}
+
+#[test]
+fn test_rope_freq_insufficient_rows_with_offset() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    // input: [1, 4] (seq=1, head_dim=4), offset=2 => need 3 rows
+    let input = Array::from_slice(dev, &[1.0f32, 2.0, 3.0, 4.0], vec![1, 4]);
+    // cos/sin with only 2 rows (need 3)
+    let cos_f = Array::from_slice(dev, &[1.0f32, 1.0, 1.0, 1.0], vec![2, 2]);
+    let sin_f = Array::from_slice(dev, &[0.0f32, 0.0, 0.0, 0.0], vec![2, 2]);
+    let result = ops::rope::rope(&registry, &input, &cos_f, &sin_f, 2, 1.0, &queue);
+    assert!(result.is_err(), "insufficient freq rows with offset should be rejected");
+    let msg = format!("{}", result.err().expect("expected Err"));
+    assert!(msg.contains("offset"), "error should mention offset: {msg}");
+}
+
+#[test]
+fn test_rope_ext_into_cb_freq_validation() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    let input = Array::from_slice(dev, &[1.0f32, 2.0, 3.0, 4.0], vec![1, 4]);
+    // 1-D freq tensors should be rejected by rope_ext_into_cb too
+    let cos_f = Array::from_slice(dev, &[1.0f32, 1.0], vec![2]);
+    let sin_f = Array::from_slice(dev, &[0.0f32, 0.0], vec![2]);
+    let cb = queue.new_command_buffer();
+    let result = ops::rope::rope_ext_into_cb(
+        &registry, &input, &cos_f, &sin_f, 0, 1.0, true, true, cb,
+    );
+    assert!(result.is_err(), "rope_ext_into_cb should validate freq tensor dims");
+}
+
+// ─── PR 0.7: GEMV dtype validation tests ───
+
+#[test]
+fn test_gemv_dtype_mismatch_vec() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    // mat is f32 [2,3], vec is f16 [3] — dtype mismatch
+    let mat = Array::from_slice(dev, &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]);
+    let vec_f16 = Array::zeros(dev, &[3], DType::Float16);
+    let result = ops::gemv::gemv(&registry, &mat, &vec_f16, &queue);
+    assert!(result.is_err(), "gemv should reject mismatched dtypes");
+    let msg = format!("{}", result.err().expect("expected Err"));
+    assert!(msg.contains("dtype mismatch"), "error should mention dtype mismatch: {msg}");
+}
+
+#[test]
+fn test_gemv_bias_dtype_mismatch_vec() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    // mat is f32 [2,3], vec is f16 [3], bias is f32 [2]
+    let mat = Array::from_slice(dev, &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]);
+    let vec_f16 = Array::zeros(dev, &[3], DType::Float16);
+    let bias = Array::from_slice(dev, &[0.1f32, 0.2], vec![2]);
+    let result = ops::gemv::gemv_bias(&registry, &mat, &vec_f16, &bias, &queue);
+    assert!(result.is_err(), "gemv_bias should reject mismatched vec dtype");
+    let msg = format!("{}", result.err().expect("expected Err"));
+    assert!(msg.contains("dtype mismatch"), "error should mention dtype mismatch: {msg}");
+}
+
+#[test]
+fn test_gemv_bias_dtype_mismatch_bias() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    // mat is f32 [2,3], vec is f32 [3], bias is f16 [2]
+    let mat = Array::from_slice(dev, &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]);
+    let v = Array::from_slice(dev, &[1.0f32, 1.0, 1.0], vec![3]);
+    let bias_f16 = Array::zeros(dev, &[2], DType::Float16);
+    let result = ops::gemv::gemv_bias(&registry, &mat, &v, &bias_f16, &queue);
+    assert!(result.is_err(), "gemv_bias should reject mismatched bias dtype");
+    let msg = format!("{}", result.err().expect("expected Err"));
+    assert!(msg.contains("dtype mismatch"), "error should mention dtype mismatch: {msg}");
+}
+
+#[test]
+fn test_gemv_t_dtype_mismatch_vec() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    // mat is f32 [2,3], vec is f16 [2] — dtype mismatch
+    let mat = Array::from_slice(dev, &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]);
+    let vec_f16 = Array::zeros(dev, &[2], DType::Float16);
+    let result = ops::gemv::gemv_t(&registry, &mat, &vec_f16, &queue);
+    assert!(result.is_err(), "gemv_t should reject mismatched dtypes");
+    let msg = format!("{}", result.err().expect("expected Err"));
+    assert!(msg.contains("dtype mismatch"), "error should mention dtype mismatch: {msg}");
 }

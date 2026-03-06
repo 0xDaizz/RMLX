@@ -30,6 +30,29 @@ fn is_localhost(host: &str) -> bool {
     host == "localhost" || host == "127.0.0.1"
 }
 
+/// Validate that a host or user string is safe for use as an SSH argument.
+/// Rejects strings starting with `-` (option injection) and strings containing
+/// characters outside `[a-zA-Z0-9._@:-]`.
+pub fn validate_ssh_target(value: &str, field: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("{field} must not be empty"));
+    }
+    if value.starts_with('-') {
+        return Err(format!(
+            "{field} {value:?} starts with '-', which could inject SSH options"
+        ));
+    }
+    if !value
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b"._@:-".contains(&b))
+    {
+        return Err(format!(
+            "{field} {value:?} contains invalid characters (allowed: a-zA-Z0-9._@:-)"
+        ));
+    }
+    Ok(())
+}
+
 /// Run a command on a remote host (or locally if localhost) and wait for output.
 /// Enforces a per-command timeout matching Python's `subprocess.run(timeout=...)`.
 pub fn run_remote(
@@ -38,6 +61,11 @@ pub fn run_remote(
     user: Option<&str>,
     timeout_secs: u32,
 ) -> std::io::Result<Output> {
+    validate_ssh_target(host, "host").map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    if let Some(u) = user {
+        validate_ssh_target(u, "user").map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    }
+
     let mut child = if is_localhost(host) {
         Command::new("bash")
             .args(["-lc", cmd])
@@ -56,6 +84,7 @@ pub fn run_remote(
                 "BatchMode=yes",
                 "-o",
                 &format!("ConnectTimeout={timeout_secs}"),
+                "--",
                 &target,
                 &wrapped,
             ])
@@ -112,6 +141,11 @@ pub fn run_remote(
 
 /// Spawn a command on a remote host (or locally) with separately piped stdout and stderr.
 pub fn spawn_remote(host: &str, cmd: &str, user: Option<&str>) -> std::io::Result<Child> {
+    validate_ssh_target(host, "host").map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    if let Some(u) = user {
+        validate_ssh_target(u, "user").map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    }
+
     if is_localhost(host) {
         return Command::new("bash")
             .args(["-lc", cmd])
@@ -125,7 +159,7 @@ pub fn spawn_remote(host: &str, cmd: &str, user: Option<&str>) -> std::io::Resul
     };
     let wrapped = format!("bash -lc {}", shell_quote(cmd));
     Command::new("ssh")
-        .args(["-o", "BatchMode=yes", &target, &wrapped])
+        .args(["-o", "BatchMode=yes", "--", &target, &wrapped])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -161,5 +195,45 @@ mod tests {
     fn test_shell_quote_special() {
         assert_eq!(shell_quote("$(rm -rf /)"), "'$(rm -rf /)'");
         assert_eq!(shell_quote("a;b"), "'a;b'");
+    }
+
+    #[test]
+    fn test_validate_ssh_target_rejects_option_injection() {
+        assert!(validate_ssh_target("-oProxyCommand=evil", "host").is_err());
+        assert!(validate_ssh_target("-v", "host").is_err());
+        assert!(validate_ssh_target("--version", "user").is_err());
+    }
+
+    #[test]
+    fn test_validate_ssh_target_rejects_invalid_chars() {
+        assert!(validate_ssh_target("host;rm", "host").is_err());
+        assert!(validate_ssh_target("user$(id)", "user").is_err());
+        assert!(validate_ssh_target("host name", "host").is_err());
+        assert!(validate_ssh_target("", "host").is_err());
+    }
+
+    #[test]
+    fn test_validate_ssh_target_allows_valid() {
+        assert!(validate_ssh_target("my-host.example.com", "host").is_ok());
+        assert!(validate_ssh_target("192.168.1.1", "host").is_ok());
+        assert!(validate_ssh_target("user@host", "host").is_ok());
+        assert!(validate_ssh_target("node_01", "host").is_ok());
+        assert!(validate_ssh_target("user:name", "user").is_ok());
+    }
+
+    #[test]
+    fn test_run_remote_rejects_malicious_host() {
+        let result = run_remote("-oProxyCommand=evil", "echo hi", None, 5);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_spawn_remote_rejects_malicious_user() {
+        let result = spawn_remote("myhost", "echo hi", Some("-oProxyCommand=evil"));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 }
