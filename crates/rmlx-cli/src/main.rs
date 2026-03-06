@@ -4,6 +4,7 @@ mod config;
 mod hostfile;
 mod launch;
 mod ssh;
+mod topology;
 
 #[derive(Parser)]
 #[command(name = "rmlx", about = "RMLX distributed tooling")]

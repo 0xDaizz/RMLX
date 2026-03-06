@@ -27,6 +27,13 @@ pub mod topk_route;
 pub mod unary;
 pub mod vjp_gpu;
 
+// PR 5.3: Missing critical ops
+pub mod argreduce;
+pub mod random;
+pub mod scan;
+pub mod slice;
+pub mod sort;
+
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -102,6 +109,12 @@ pub fn register_all(registry: &KernelRegistry) -> Result<(), KernelError> {
     concat::register(registry)?;
     vjp_gpu::register(registry)?;
     flash_attention::register(registry)?;
+    // PR 5.3: Missing critical ops
+    slice::register(registry)?;
+    sort::register(registry)?;
+    scan::register(registry)?;
+    argreduce::register(registry)?;
+    random::register(registry)?;
     Ok(())
 }
 

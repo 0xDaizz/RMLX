@@ -33,6 +33,7 @@
 
 use rmlx_core::array::Array;
 use rmlx_core::kernels::{KernelError, KernelRegistry};
+use rmlx_core::ops;
 
 use crate::linear::{Linear, LinearConfig};
 
@@ -370,34 +371,280 @@ impl Mla {
         x: &Array,
         cos_freqs: Option<&Array>,
         sin_freqs: Option<&Array>,
-        cache: Option<&mut MlaKvCache>,
+        mut cache: Option<&mut MlaKvCache>,
         registry: &KernelRegistry,
         queue: &metal::CommandQueue,
     ) -> Result<Array, KernelError> {
         let seq_len = x.shape()[0];
+        let num_heads = self.config.num_heads;
+        let head_dim = self.config.head_dim;
+        let nope_dim = self.config.nope_head_dim();
+        let rope_dim = self.config.rope_head_dim;
+        let v_dim = self.config.v_head_dim;
+        let elem_size = x.dtype().size_of();
 
         // Step 1: Compress KV and compute decoupled RoPE key
         let c_kv = self.compress_kv(x, registry, queue)?;
-        let k_rope = self.compute_k_rope(x, registry, queue)?;
+        let k_rope_raw = self.compute_k_rope(x, registry, queue)?;
 
         // Step 2: Compute Q (compressed then expanded)
+        // q shape: [seq_len, num_heads * head_dim]
         let q = self.compute_q(x, registry, queue)?;
 
-        // Step 3: Expand KV from latent
-        let (k_nope, v) = self.expand_kv(&c_kv, registry, queue)?;
+        // Step 3: Apply RoPE to the rope portions of Q and K
+        // k_rope_raw is [seq_len, rope_dim] — shared across all heads (decoupled RoPE).
+        // Q rope portion: for each head h, extract q[seq, h*head_dim + nope_dim .. h*head_dim + head_dim]
+        let rope_offset = cache.as_ref().map_or(0u32, |c| c.seq_len as u32);
 
-        // Reference the cache and RoPE for future integration
-        let _ = (cos_freqs, sin_freqs, cache, seq_len);
-        let _ = (&q, &k_nope, &k_rope, &v);
+        let k_rope = if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
+            ops::rope::rope(registry, &k_rope_raw, cos, sin, rope_offset, 1.0, queue)?
+        } else {
+            ops::copy::copy(registry, &k_rope_raw, queue)?
+        };
 
-        // Placeholder: return through output projection.
-        // In production, this would:
-        // 1. Apply RoPE to q_rope and k_rope portions
-        // 2. Concatenate k_nope with rotated k_rope per head
-        // 3. Update cache with c_kv and k_rope (not full K/V)
-        // 4. Run SDPA on the assembled Q, K, V
-        // 5. Concatenate head outputs
-        self.o_proj.forward(x, registry, queue)
+        // Step 5: Update cache if provided
+        // We store c_kv and k_rope (post-RoPE) into the cache.
+        // On subsequent calls, we retrieve and expand from cache.
+        let (c_kv_full, k_rope_full, total_seq) = if let Some(ref mut ca) = cache {
+            // Copy new c_kv into cache at [seq_len_old .. seq_len_old + seq_len]
+            Self::copy_into_cache_buffer(
+                &ca.c_kv_cache,
+                &c_kv,
+                ca.seq_len,
+                seq_len,
+                ca.kv_lora_rank,
+                registry,
+                queue,
+            )?;
+            Self::copy_into_cache_buffer(
+                &ca.k_rope_cache,
+                &k_rope,
+                ca.seq_len,
+                seq_len,
+                ca.rope_head_dim,
+                registry,
+                queue,
+            )?;
+            ca.advance(seq_len)?;
+            let ts = ca.seq_len;
+            (ca.cached_c_kv(), ca.cached_k_rope(), ts)
+        } else {
+            (c_kv, k_rope, seq_len)
+        };
+
+        // Re-expand from full cached c_kv to get full-sequence k_nope and v
+        let (k_nope_full, v_full) = self.expand_kv(&c_kv_full, registry, queue)?;
+
+        // Step 6: Split into per-head tensors and assemble full K per head.
+        //
+        // For each head h:
+        //   q_h = q[:, h*head_dim .. (h+1)*head_dim]   -> [seq_len, head_dim]
+        //   k_nope_h = k_nope_full[:, h*nope_dim .. (h+1)*nope_dim] -> [total_seq, nope_dim]
+        //   v_h = v_full[:, h*v_dim .. (h+1)*v_dim]     -> [total_seq, v_dim]
+        //
+        // Then apply RoPE to the rope portion of q_h, and concat k_nope_h with k_rope_full.
+        //
+        // For SDPA: Q, K, V must all be [tokens, head_dim].
+        // MLA key: k_rope is shared across heads (decoupled), so K per head =
+        //   concat(k_nope_h, k_rope_full) along dim=1.
+        // This requires nope_dim + rope_dim == head_dim, which is guaranteed by config.
+
+        let dev = registry.device().raw();
+        let q_total_width = num_heads * head_dim;
+        let k_nope_total_width = num_heads * nope_dim;
+        let v_total_width = num_heads * v_dim;
+
+        let mut q_heads: Vec<Array> = Vec::with_capacity(num_heads);
+        let mut k_heads: Vec<Array> = Vec::with_capacity(num_heads);
+        let mut v_heads: Vec<Array> = Vec::with_capacity(num_heads);
+
+        for h in 0..num_heads {
+            // --- Q head: [seq_len, head_dim] ---
+            let q_offset = q.offset() + h * head_dim * elem_size;
+            let q_head_view = q.view(vec![seq_len, head_dim], vec![q_total_width, 1], q_offset);
+            let q_head = ops::copy::copy(registry, &q_head_view, queue)?;
+
+            // Apply RoPE to the rope portion of Q.
+            // Split q_head into [seq_len, nope_dim] and [seq_len, rope_dim],
+            // apply RoPE to rope portion, then concatenate back.
+            let q_head = if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
+                if rope_dim > 0 {
+                    // Extract nope portion: q_head[:, 0..nope_dim]
+                    let q_nope_view =
+                        q_head.view(vec![seq_len, nope_dim], vec![head_dim, 1], q_head.offset());
+                    let q_nope = ops::copy::copy(registry, &q_nope_view, queue)?;
+
+                    // Extract rope portion: q_head[:, nope_dim..head_dim]
+                    let q_rope_view = q_head.view(
+                        vec![seq_len, rope_dim],
+                        vec![head_dim, 1],
+                        q_head.offset() + nope_dim * elem_size,
+                    );
+                    let q_rope = ops::copy::copy(registry, &q_rope_view, queue)?;
+
+                    // Apply RoPE to rope portion
+                    let q_rope_rotated =
+                        ops::rope::rope(registry, &q_rope, cos, sin, rope_offset, 1.0, queue)?;
+
+                    // Concatenate nope + rotated_rope along axis=1
+                    ops::concat::concat(registry, &q_nope, &q_rope_rotated, 1, queue)?
+                } else {
+                    q_head
+                }
+            } else {
+                q_head
+            };
+            q_heads.push(q_head);
+
+            // --- K head: concat(k_nope_h, k_rope_full) -> [total_seq, head_dim] ---
+            let kn_offset = k_nope_full.offset() + h * nope_dim * elem_size;
+            let k_nope_h_view = k_nope_full.view(
+                vec![total_seq, nope_dim],
+                vec![k_nope_total_width, 1],
+                kn_offset,
+            );
+            let k_nope_h = ops::copy::copy(registry, &k_nope_h_view, queue)?;
+
+            // k_rope_full is [total_seq, rope_dim], shared across heads
+            let k_h = ops::concat::concat(registry, &k_nope_h, &k_rope_full, 1, queue)?;
+            k_heads.push(k_h);
+
+            // --- V head: [total_seq, v_dim] ---
+            let v_offset = v_full.offset() + h * v_dim * elem_size;
+            let v_h_view = v_full.view(vec![total_seq, v_dim], vec![v_total_width, 1], v_offset);
+            let v_h = ops::copy::copy(registry, &v_h_view, queue)?;
+            v_heads.push(v_h);
+        }
+
+        // Step 7: SDPA
+        // SDPA requires Q [N, D], K [S, D], V [S, D] where D matches across Q/K/V.
+        // In MLA with v_head_dim != head_dim, the SDPA kernel will reject the shape.
+        // TODO: Support v_head_dim != head_dim via a custom attention kernel.
+        if v_dim != head_dim {
+            return Err(KernelError::InvalidShape(format!(
+                "MLA forward: v_head_dim ({}) != head_dim ({}) is not yet supported by SDPA kernel",
+                v_dim, head_dim,
+            )));
+        }
+
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        // Use batched SDPA (all heads use same K rope, but we already assembled per-head K).
+        // k_heads and v_heads have 1 per query head (no GQA in MLA — all heads share same latent).
+        let attn_outputs = ops::sdpa::sdpa_batched(
+            registry, &q_heads, &k_heads, &v_heads, None, scale, false, queue,
+        )?;
+
+        // Step 8: Concatenate head outputs -> [seq_len, num_heads * v_dim]
+        let hidden_out = num_heads * v_dim;
+        let concat_out = Array::zeros(dev, &[seq_len, hidden_out], x.dtype());
+
+        let copy_kernel = match x.dtype() {
+            rmlx_core::dtype::DType::Float32 => "copy_f32",
+            rmlx_core::dtype::DType::Float16 => "copy_f16",
+            rmlx_core::dtype::DType::Bfloat16 => "copy_bf16",
+            other => {
+                return Err(KernelError::InvalidShape(format!(
+                    "MLA concat: unsupported dtype {:?}",
+                    other
+                )));
+            }
+        };
+        let pipeline = registry.get_pipeline(copy_kernel, x.dtype())?;
+        let head_bytes = v_dim * elem_size;
+        let hidden_bytes = hidden_out * elem_size;
+
+        let cb = queue.new_command_buffer();
+        for (h, head_out) in attn_outputs.iter().enumerate() {
+            let dst_col_offset = h * head_bytes;
+
+            if seq_len == 1 {
+                let enc = cb.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&pipeline);
+                enc.set_buffer(0, Some(head_out.metal_buffer()), head_out.offset() as u64);
+                enc.set_buffer(1, Some(concat_out.metal_buffer()), dst_col_offset as u64);
+                let count = v_dim as u64;
+                let grid = metal::MTLSize::new(count, 1, 1);
+                let tg = metal::MTLSize::new(
+                    std::cmp::min(pipeline.max_total_threads_per_threadgroup(), count),
+                    1,
+                    1,
+                );
+                enc.dispatch_threads(grid, tg);
+                enc.end_encoding();
+            } else {
+                let blit = cb.new_blit_command_encoder();
+                for row in 0..seq_len {
+                    let src_off = (head_out.offset() + row * head_bytes) as u64;
+                    let dst_off = (row * hidden_bytes + dst_col_offset) as u64;
+                    blit.copy_from_buffer(
+                        head_out.metal_buffer(),
+                        src_off,
+                        concat_out.metal_buffer(),
+                        dst_off,
+                        head_bytes as u64,
+                    );
+                }
+                blit.end_encoding();
+            }
+        }
+        cb.commit();
+        cb.wait_until_completed();
+
+        // Step 9: Output projection -> [seq_len, hidden_size]
+        self.o_proj.forward(&concat_out, registry, queue)
+    }
+
+    /// Copy `src` ([new_tokens, width]) into a pre-allocated cache buffer at row offset.
+    fn copy_into_cache_buffer(
+        cache_buf: &Array,
+        src: &Array,
+        row_offset: usize,
+        new_tokens: usize,
+        width: usize,
+        registry: &KernelRegistry,
+        queue: &metal::CommandQueue,
+    ) -> Result<(), KernelError> {
+        let elem_size = src.dtype().size_of();
+        let copy_kernel = match src.dtype() {
+            rmlx_core::dtype::DType::Float32 => "copy_f32",
+            rmlx_core::dtype::DType::Float16 => "copy_f16",
+            rmlx_core::dtype::DType::Bfloat16 => "copy_bf16",
+            other => {
+                return Err(KernelError::InvalidShape(format!(
+                    "MlaKvCache: unsupported dtype {:?}",
+                    other
+                )));
+            }
+        };
+        let pipeline = registry.get_pipeline(copy_kernel, src.dtype())?;
+        let count = (new_tokens * width) as u64;
+        if count == 0 {
+            return Ok(());
+        }
+
+        let dst_byte_offset = row_offset * width * elem_size;
+        let cb = queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(src.metal_buffer()), src.offset() as u64);
+        enc.set_buffer(
+            1,
+            Some(cache_buf.metal_buffer()),
+            (cache_buf.offset() + dst_byte_offset) as u64,
+        );
+        let grid = metal::MTLSize::new(count, 1, 1);
+        let tg = metal::MTLSize::new(
+            std::cmp::min(pipeline.max_total_threads_per_threadgroup(), count),
+            1,
+            1,
+        );
+        enc.dispatch_threads(grid, tg);
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        Ok(())
     }
 
     /// Number of attention heads.

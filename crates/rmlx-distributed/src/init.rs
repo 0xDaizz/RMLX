@@ -142,9 +142,10 @@ fn resolve_backend(config: &InitConfig) -> Result<BackendHint, DistributedError>
     match std::env::var("RMLX_BACKEND").ok().as_deref() {
         Some("rdma") | Some("RDMA") => Ok(BackendHint::Rdma),
         Some("loopback") | Some("LOOPBACK") => Ok(BackendHint::Loopback),
+        Some("tb5") | Some("TB5") | Some("tb4") | Some("TB4") | Some("tcp") | Some("TCP") => Ok(BackendHint::Auto),
         Some("auto") | Some("AUTO") | None => Ok(BackendHint::Auto),
         Some(other) => Err(DistributedError::Config(format!(
-            "unknown RMLX_BACKEND value {other:?}; expected \"rdma\", \"loopback\", or \"auto\""
+            "unknown RMLX_BACKEND value {other:?}; expected \"rdma\", \"loopback\", \"tb5\", \"tb4\", \"tcp\", or \"auto\""
         ))),
     }
 }

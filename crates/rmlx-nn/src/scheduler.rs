@@ -23,6 +23,11 @@ pub struct SchedulerConfig {
     pub eos_token_id: u32,
     /// Number of tokens per KV block (must match BlockManager's block_size).
     pub block_size: usize,
+    /// Maximum number of tokens to prefill in a single chunk.
+    /// Prompts longer than this are split across multiple scheduling iterations,
+    /// interleaving decode batches between chunks to maintain decode latency.
+    /// Default: 512.
+    pub max_prefill_chunk: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -51,17 +56,31 @@ pub struct SeqMeta {
     pub current_len: usize,
     /// Block table mapping logical blocks to physical BlockIds.
     pub block_table: Vec<BlockId>,
+    /// How many prompt tokens have been prefilled so far (chunked prefill progress).
+    /// 0 means not started; equals `prompt_len` when prefill is complete.
+    pub prefill_progress: usize,
+}
+
+impl SeqMeta {
+    /// Returns `true` if this sequence is mid-prefill (chunked prefill in progress
+    /// but not yet complete).
+    pub fn is_chunked_prefill(&self) -> bool {
+        self.prefill_progress > 0 && self.prefill_progress < self.prompt_len
+    }
 }
 
 /// Output of one scheduling iteration.
 #[derive(Debug, Clone)]
 pub struct SchedulerOutput {
-    /// New sequences that need a full prefill pass.
+    /// Sequences that need a prefill pass (may be a chunk of the full prompt).
     pub prefill_seqs: Vec<SeqMeta>,
     /// Existing sequences that need one decode step.
     pub decode_seqs: Vec<SeqMeta>,
     /// Sequence IDs that completed and were evicted this step.
     pub evicted_seq_ids: Vec<u64>,
+    /// If chunked prefill is active, the `(start, end)` token range within
+    /// the prompt that this batch covers. `None` for non-chunked prefills.
+    pub prefill_chunk_range: Option<(usize, usize)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -77,8 +96,10 @@ struct ActiveSequence {
     generated_len: usize,
     /// Maximum output tokens allowed.
     max_output_len: usize,
-    /// Whether this sequence has already been prefilled.
+    /// Whether this sequence has already been fully prefilled.
     prefilled: bool,
+    /// Number of prompt tokens prefilled so far (for chunked prefill).
+    prefill_progress: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -128,8 +149,12 @@ impl Scheduler {
     /// Run one scheduling iteration.
     ///
     /// 1. Identify and evict completed sequences (freeing their KV blocks).
-    /// 2. Admit new requests from the waiting queue if there is capacity.
+    /// 2. Continue any in-progress chunked prefills, or admit new requests.
     /// 3. Partition active sequences into prefill vs. decode.
+    ///
+    /// When a prompt is longer than `config.max_prefill_chunk`, the prefill is
+    /// split into chunks. Between chunks, decode batches are interleaved so
+    /// that decode latency is not starved by long prefills.
     ///
     /// `block_manager` is used to allocate blocks for newly admitted sequences
     /// and to free blocks for evicted sequences.
@@ -159,69 +184,116 @@ impl Scheduler {
             }
         }
 
-        // --- Step 2: Admit new requests ---
+        // --- Step 2a: Continue in-progress chunked prefills ---
         let mut prefill_seqs = Vec::new();
+        let mut prefill_chunk_range: Option<(usize, usize)> = None;
 
-        while self.active.len() < self.config.max_batch_size {
-            let Some(request) = self.waiting.pop_front() else {
-                break;
-            };
+        // Find any sequence that is mid-chunked-prefill.
+        let chunked_seq_id = self.active.iter().find_map(|(&id, seq)| {
+            if !seq.prefilled && seq.prefill_progress > 0 && seq.prefill_progress < seq.prompt_len {
+                Some(id)
+            } else {
+                None
+            }
+        });
 
-            // Calculate how many blocks the prompt needs.
-            let prompt_len = request.prompt_tokens.len();
-            let blocks_needed = blocks_for_tokens(prompt_len, self.config.block_size);
+        if let Some(seq_id) = chunked_seq_id {
+            let seq = self.active.get_mut(&seq_id).unwrap();
+            let start = seq.prefill_progress;
+            let remaining = seq.prompt_len - start;
+            let chunk_size = remaining.min(self.config.max_prefill_chunk);
+            let end = start + chunk_size;
 
-            if block_manager.num_free_blocks() < blocks_needed {
-                // Not enough blocks — put the request back and stop admitting.
-                self.waiting.push_front(request);
-                break;
+            seq.prefill_progress = end;
+            let is_final_chunk = end >= seq.prompt_len;
+            if is_final_chunk {
+                seq.prefilled = true;
             }
 
-            // Allocate blocks for this sequence.
-            for _ in 0..blocks_needed {
-                // unwrap is safe: we checked num_free_blocks above.
-                block_manager.append_block(request.seq_id).unwrap();
-            }
-
-            let block_table = block_manager.block_table(request.seq_id).to_vec();
-
+            let block_table = block_manager.block_table(seq_id).to_vec();
             prefill_seqs.push(SeqMeta {
-                seq_id: request.seq_id,
-                prompt_len,
+                seq_id,
+                prompt_len: seq.prompt_len,
                 current_len: 0,
                 block_table,
+                prefill_progress: end,
             });
+            prefill_chunk_range = Some((start, end));
+        }
 
-            self.active.insert(
-                request.seq_id,
-                ActiveSequence {
+        // --- Step 2b: Admit new requests if no chunked prefill is in progress ---
+        if prefill_seqs.is_empty() {
+            while self.active.len() < self.config.max_batch_size {
+                let Some(request) = self.waiting.pop_front() else {
+                    break;
+                };
+
+                // Calculate how many blocks the full prompt needs.
+                let prompt_len = request.prompt_tokens.len();
+                let blocks_needed = blocks_for_tokens(prompt_len, self.config.block_size);
+
+                if block_manager.num_free_blocks() < blocks_needed {
+                    // Not enough blocks — put the request back and stop admitting.
+                    self.waiting.push_front(request);
+                    break;
+                }
+
+                // Allocate blocks for this sequence.
+                for _ in 0..blocks_needed {
+                    // unwrap is safe: we checked num_free_blocks above.
+                    block_manager.append_block(request.seq_id).unwrap();
+                }
+
+                let block_table = block_manager.block_table(request.seq_id).to_vec();
+
+                // Determine if we need chunked prefill.
+                let needs_chunking = prompt_len > self.config.max_prefill_chunk;
+                let chunk_end = if needs_chunking {
+                    self.config.max_prefill_chunk
+                } else {
+                    prompt_len
+                };
+
+                let prefilled = !needs_chunking;
+
+                prefill_seqs.push(SeqMeta {
+                    seq_id: request.seq_id,
                     prompt_len,
-                    generated_len: 0,
-                    max_output_len: request.max_output_len,
-                    prefilled: false,
-                },
-            );
+                    current_len: 0,
+                    block_table,
+                    prefill_progress: chunk_end,
+                });
+
+                if needs_chunking {
+                    prefill_chunk_range = Some((0, chunk_end));
+                }
+
+                self.active.insert(
+                    request.seq_id,
+                    ActiveSequence {
+                        prompt_len,
+                        generated_len: 0,
+                        max_output_len: request.max_output_len,
+                        prefilled,
+                        prefill_progress: chunk_end,
+                    },
+                );
+            }
         }
 
         // --- Step 3: Build decode list from already-prefilled active sequences ---
         let mut decode_seqs = Vec::new();
 
         for (&seq_id, seq) in &self.active {
-            if seq.prefilled {
+            if seq.prefilled && !prefill_seqs.iter().any(|p| p.seq_id == seq_id) {
                 let block_table = block_manager.block_table(seq_id).to_vec();
                 decode_seqs.push(SeqMeta {
                     seq_id,
                     prompt_len: seq.prompt_len,
                     current_len: seq.generated_len,
                     block_table,
+                    prefill_progress: seq.prompt_len,
                 });
-            }
-        }
-
-        // Mark newly prefilled sequences so they enter decode on the next step.
-        for meta in &prefill_seqs {
-            if let Some(seq) = self.active.get_mut(&meta.seq_id) {
-                seq.prefilled = true;
             }
         }
 
@@ -229,6 +301,7 @@ impl Scheduler {
             prefill_seqs,
             decode_seqs,
             evicted_seq_ids,
+            prefill_chunk_range,
         }
     }
 
@@ -348,6 +421,7 @@ mod tests {
             max_batch_size: 4,
             eos_token_id: 2, // typical EOS
             block_size: 4,
+            max_prefill_chunk: 512, // large enough that existing tests don't trigger chunking
         }
     }
 
@@ -416,6 +490,7 @@ mod tests {
             max_batch_size: 2,
             eos_token_id: 2,
             block_size: 4,
+            max_prefill_chunk: 512,
         };
         let mut scheduler = Scheduler::new(config);
         let mut bm = test_block_manager(32);
@@ -508,6 +583,7 @@ mod tests {
             max_batch_size: 10,
             eos_token_id: 2,
             block_size: 4,
+            max_prefill_chunk: 512,
         };
         let mut scheduler = Scheduler::new(config);
         // Only 2 blocks available total.
@@ -534,6 +610,7 @@ mod tests {
             max_batch_size: 1,
             eos_token_id: 2,
             block_size: 4,
+            max_prefill_chunk: 512,
         };
         let mut scheduler = Scheduler::new(config);
         let mut bm = test_block_manager(8);
@@ -605,5 +682,136 @@ mod tests {
         // Generate token 5 -> needs a second block.
         scheduler.update_sequence(1, &mut bm).unwrap();
         assert_eq!(bm.block_table(1).len(), 2);
+    }
+
+    // ===== Chunked prefill tests =====
+
+    #[test]
+    fn test_chunked_prefill_splits_long_prompt() {
+        // prompt_len=2048, chunk=512 -> should take 4 scheduling iterations.
+        let config = SchedulerConfig {
+            max_batch_size: 4,
+            eos_token_id: 2,
+            block_size: 4,
+            max_prefill_chunk: 512,
+        };
+        let mut scheduler = Scheduler::new(config);
+        // Need enough blocks: 2048 tokens / 4 block_size = 512 blocks.
+        let mut bm = test_block_manager(1024);
+
+        scheduler.add_request(make_request(1, 2048, 10));
+
+        // Iteration 1: first chunk [0, 512)
+        let out1 = scheduler.schedule(&mut bm, &HashMap::new());
+        assert_eq!(out1.prefill_seqs.len(), 1);
+        assert_eq!(out1.prefill_seqs[0].seq_id, 1);
+        assert_eq!(out1.prefill_seqs[0].prefill_progress, 512);
+        assert!(out1.prefill_seqs[0].is_chunked_prefill());
+        assert_eq!(out1.prefill_chunk_range, Some((0, 512)));
+        assert_eq!(out1.decode_seqs.len(), 0);
+
+        // Iteration 2: second chunk [512, 1024)
+        let out2 = scheduler.schedule(&mut bm, &HashMap::new());
+        assert_eq!(out2.prefill_seqs.len(), 1);
+        assert_eq!(out2.prefill_seqs[0].prefill_progress, 1024);
+        assert!(out2.prefill_seqs[0].is_chunked_prefill());
+        assert_eq!(out2.prefill_chunk_range, Some((512, 1024)));
+
+        // Iteration 3: third chunk [1024, 1536)
+        let out3 = scheduler.schedule(&mut bm, &HashMap::new());
+        assert_eq!(out3.prefill_seqs.len(), 1);
+        assert_eq!(out3.prefill_seqs[0].prefill_progress, 1536);
+        assert!(out3.prefill_seqs[0].is_chunked_prefill());
+        assert_eq!(out3.prefill_chunk_range, Some((1024, 1536)));
+
+        // Iteration 4: final chunk [1536, 2048) — prefill completes
+        let out4 = scheduler.schedule(&mut bm, &HashMap::new());
+        assert_eq!(out4.prefill_seqs.len(), 1);
+        assert_eq!(out4.prefill_seqs[0].prefill_progress, 2048);
+        assert!(!out4.prefill_seqs[0].is_chunked_prefill()); // complete
+        assert_eq!(out4.prefill_chunk_range, Some((1536, 2048)));
+
+        // Iteration 5: now in decode mode
+        scheduler.update_sequence(1, &mut bm).unwrap();
+        let out5 = scheduler.schedule(&mut bm, &HashMap::new());
+        assert_eq!(out5.prefill_seqs.len(), 0);
+        assert_eq!(out5.decode_seqs.len(), 1);
+        assert!(out5.prefill_chunk_range.is_none());
+    }
+
+    #[test]
+    fn test_chunked_prefill_interleaves_decode() {
+        // 1 long prefill (prompt_len=1024, chunk=512) + 1 short decode request.
+        // Decode should run between prefill chunks.
+        let config = SchedulerConfig {
+            max_batch_size: 4,
+            eos_token_id: 2,
+            block_size: 4,
+            max_prefill_chunk: 512,
+        };
+        let mut scheduler = Scheduler::new(config);
+        let mut bm = test_block_manager(1024);
+
+        // Add and prefill a short sequence first so it enters decode.
+        scheduler.add_request(make_request(10, 8, 100));
+        let out_init = scheduler.schedule(&mut bm, &HashMap::new());
+        assert_eq!(out_init.prefill_seqs.len(), 1);
+        assert_eq!(out_init.prefill_seqs[0].seq_id, 10);
+        // Simulate one token so it enters decode mode.
+        scheduler.update_sequence(10, &mut bm).unwrap();
+
+        // Now add the long prefill request.
+        scheduler.add_request(make_request(20, 1024, 50));
+
+        // Iteration: admits seq 20 with first chunk [0, 512).
+        // seq 10 is already prefilled -> should appear in decode.
+        let out1 = scheduler.schedule(&mut bm, &HashMap::new());
+        assert_eq!(out1.prefill_seqs.len(), 1);
+        assert_eq!(out1.prefill_seqs[0].seq_id, 20);
+        assert_eq!(out1.prefill_chunk_range, Some((0, 512)));
+        // Decode batch should include seq 10.
+        assert_eq!(out1.decode_seqs.len(), 1);
+        assert_eq!(out1.decode_seqs[0].seq_id, 10);
+
+        // Simulate decode token for seq 10.
+        scheduler.update_sequence(10, &mut bm).unwrap();
+
+        // Iteration: continue chunk [512, 1024) for seq 20,
+        // seq 10 still in decode.
+        let out2 = scheduler.schedule(&mut bm, &HashMap::new());
+        assert_eq!(out2.prefill_seqs.len(), 1);
+        assert_eq!(out2.prefill_seqs[0].seq_id, 20);
+        assert_eq!(out2.prefill_chunk_range, Some((512, 1024)));
+        // Decode interleaved.
+        assert_eq!(out2.decode_seqs.len(), 1);
+        assert_eq!(out2.decode_seqs[0].seq_id, 10);
+    }
+
+    #[test]
+    fn test_short_prompt_not_chunked() {
+        // prompt_len=256, chunk=512 -> no chunking should occur.
+        let config = SchedulerConfig {
+            max_batch_size: 4,
+            eos_token_id: 2,
+            block_size: 4,
+            max_prefill_chunk: 512,
+        };
+        let mut scheduler = Scheduler::new(config);
+        let mut bm = test_block_manager(256);
+
+        scheduler.add_request(make_request(1, 256, 10));
+
+        let out = scheduler.schedule(&mut bm, &HashMap::new());
+        assert_eq!(out.prefill_seqs.len(), 1);
+        assert_eq!(out.prefill_seqs[0].seq_id, 1);
+        assert_eq!(out.prefill_seqs[0].prefill_progress, 256);
+        assert!(!out.prefill_seqs[0].is_chunked_prefill()); // complete in one go
+        assert!(out.prefill_chunk_range.is_none()); // not chunked
+
+        // Next iteration should be decode.
+        scheduler.update_sequence(1, &mut bm).unwrap();
+        let out2 = scheduler.schedule(&mut bm, &HashMap::new());
+        assert_eq!(out2.prefill_seqs.len(), 0);
+        assert_eq!(out2.decode_seqs.len(), 1);
     }
 }
