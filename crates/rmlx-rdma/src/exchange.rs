@@ -88,10 +88,12 @@ pub fn exchange_server(
         let mut stream = match accept_with_timeout(&listener, cfg.accept_timeout_secs) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!(
-                    "[rmlx-rdma] WARN: server accept attempt {}/{} failed: {e}",
-                    attempt + 1,
+                tracing::warn!(
+                    target: "rmlx_rdma",
+                    attempt = attempt + 1,
                     max_retries,
+                    %e,
+                    "server accept failed",
                 );
                 last_err = Some(e);
                 if attempt + 1 < max_retries {
@@ -114,11 +116,13 @@ pub fn exchange_server(
         match server_exchange_on_stream(&mut stream, local) {
             Ok(remote) => return Ok(remote),
             Err(e) => {
-                eprintln!(
-                    "[rmlx-rdma] WARN: server exchange with {peer} attempt {}/{} failed: {e}. \
-                     Dropping stream and re-accepting.",
-                    attempt + 1,
+                tracing::warn!(
+                    target: "rmlx_rdma",
+                    %peer,
+                    attempt = attempt + 1,
                     max_retries,
+                    %e,
+                    "server exchange failed, dropping stream and re-accepting",
                 );
                 last_err = Some(RdmaError::ConnectionFailed(format!(
                     "exchange with {peer}: {e}"
@@ -168,10 +172,13 @@ pub fn exchange_client(
         let mut stream = match connect_with_retries(&addr, cfg.connect_timeout_ms) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!(
-                    "[rmlx-rdma] WARN: client connect attempt {}/{} to {addr} failed: {e}",
-                    attempt + 1,
+                tracing::warn!(
+                    target: "rmlx_rdma",
+                    attempt = attempt + 1,
                     max_retries,
+                    %addr,
+                    %e,
+                    "client connect failed",
                 );
                 last_err = Some(e);
                 if attempt + 1 < max_retries {
@@ -189,11 +196,13 @@ pub fn exchange_client(
         match client_exchange_on_stream(&mut stream, local) {
             Ok(remote) => return Ok(remote),
             Err(e) => {
-                eprintln!(
-                    "[rmlx-rdma] WARN: client exchange with {addr} attempt {}/{} failed: {e}. \
-                     Dropping stream and reconnecting.",
-                    attempt + 1,
+                tracing::warn!(
+                    target: "rmlx_rdma",
+                    %addr,
+                    attempt = attempt + 1,
                     max_retries,
+                    %e,
+                    "client exchange failed, dropping stream and reconnecting",
                 );
                 last_err = Some(RdmaError::ConnectionFailed(format!(
                     "exchange with {addr}: {e}"

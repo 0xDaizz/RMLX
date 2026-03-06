@@ -56,45 +56,48 @@ impl RdmaContext {
             // Probe device capabilities and store results
             match RdmaDeviceProbe::probe(&rdma_ctx) {
                 Ok(p) => {
-                    eprintln!(
-                        "[rmlx-rdma] device '{}' probed: gid_index={}, max_mr_size={}, \
-                         max_qp_wr={}, max_cq_depth={}, mtu={}, max_msg_sz={}, gid_tbl_len={}",
-                        rdma_ctx.device_name,
-                        p.gid_index,
-                        p.max_mr_size,
-                        p.max_qp_wr,
-                        p.max_cq_depth,
-                        p.mtu,
-                        p.max_msg_sz,
-                        p.gid_tbl_len,
+                    tracing::info!(
+                        target: "rmlx_rdma",
+                        device = %rdma_ctx.device_name,
+                        gid_index = p.gid_index,
+                        max_mr_size = p.max_mr_size,
+                        max_qp_wr = p.max_qp_wr,
+                        max_cq_depth = p.max_cq_depth,
+                        mtu = p.mtu,
+                        max_msg_sz = p.max_msg_sz,
+                        gid_tbl_len = p.gid_tbl_len,
+                        "device probed",
                     );
                     // Log INFO when probed values differ significantly from defaults
                     if p.gid_index != 1 {
-                        eprintln!(
-                            "[rmlx-rdma] INFO: probed gid_index={} differs from default (1)",
-                            p.gid_index,
+                        tracing::info!(
+                            target: "rmlx_rdma",
+                            gid_index = p.gid_index,
+                            "probed gid_index differs from default (1)",
                         );
                     }
                     if p.max_qp_wr != 4095 {
-                        eprintln!(
-                            "[rmlx-rdma] INFO: probed max_qp_wr={} differs from default (4095)",
-                            p.max_qp_wr,
+                        tracing::info!(
+                            target: "rmlx_rdma",
+                            max_qp_wr = p.max_qp_wr,
+                            "probed max_qp_wr differs from default (4095)",
                         );
                     }
                     if p.max_cq_depth != 8192 {
-                        eprintln!(
-                            "[rmlx-rdma] INFO: probed max_cq_depth={} differs from default (8192)",
-                            p.max_cq_depth,
+                        tracing::info!(
+                            target: "rmlx_rdma",
+                            max_cq_depth = p.max_cq_depth,
+                            "probed max_cq_depth differs from default (8192)",
                         );
                     }
                     rdma_ctx.probe = Some(p);
                 }
                 Err(e) => {
-                    eprintln!(
-                        "[rmlx-rdma] WARN: device '{}' probe failed: {e}. \
-                         Falling back to defaults: GID_INDEX=1, MAX_SEND_WR=8192, \
-                         MAX_RECV_WR=8192, CQ_DEPTH=8192, MTU=MTU_1024, MAX_MR_SIZE=16MB",
-                        rdma_ctx.device_name,
+                    tracing::warn!(
+                        target: "rmlx_rdma",
+                        device = %rdma_ctx.device_name,
+                        %e,
+                        "device probe failed, falling back to defaults",
                     );
                 }
             }
@@ -162,45 +165,48 @@ impl RdmaContext {
             // Probe device capabilities and store results
             match RdmaDeviceProbe::probe(&rdma_ctx) {
                 Ok(p) => {
-                    eprintln!(
-                        "[rmlx-rdma] device '{}' probed: gid_index={}, max_mr_size={}, \
-                         max_qp_wr={}, max_cq_depth={}, mtu={}, max_msg_sz={}, gid_tbl_len={}",
-                        rdma_ctx.device_name,
-                        p.gid_index,
-                        p.max_mr_size,
-                        p.max_qp_wr,
-                        p.max_cq_depth,
-                        p.mtu,
-                        p.max_msg_sz,
-                        p.gid_tbl_len,
+                    tracing::info!(
+                        target: "rmlx_rdma",
+                        device = %rdma_ctx.device_name,
+                        gid_index = p.gid_index,
+                        max_mr_size = p.max_mr_size,
+                        max_qp_wr = p.max_qp_wr,
+                        max_cq_depth = p.max_cq_depth,
+                        mtu = p.mtu,
+                        max_msg_sz = p.max_msg_sz,
+                        gid_tbl_len = p.gid_tbl_len,
+                        "device probed",
                     );
                     // Log INFO when probed values differ significantly from defaults
                     if p.gid_index != 1 {
-                        eprintln!(
-                            "[rmlx-rdma] INFO: probed gid_index={} differs from default (1)",
-                            p.gid_index,
+                        tracing::info!(
+                            target: "rmlx_rdma",
+                            gid_index = p.gid_index,
+                            "probed gid_index differs from default (1)",
                         );
                     }
                     if p.max_qp_wr != 4095 {
-                        eprintln!(
-                            "[rmlx-rdma] INFO: probed max_qp_wr={} differs from default (4095)",
-                            p.max_qp_wr,
+                        tracing::info!(
+                            target: "rmlx_rdma",
+                            max_qp_wr = p.max_qp_wr,
+                            "probed max_qp_wr differs from default (4095)",
                         );
                     }
                     if p.max_cq_depth != 8192 {
-                        eprintln!(
-                            "[rmlx-rdma] INFO: probed max_cq_depth={} differs from default (8192)",
-                            p.max_cq_depth,
+                        tracing::info!(
+                            target: "rmlx_rdma",
+                            max_cq_depth = p.max_cq_depth,
+                            "probed max_cq_depth differs from default (8192)",
                         );
                     }
                     rdma_ctx.probe = Some(p);
                 }
                 Err(e) => {
-                    eprintln!(
-                        "[rmlx-rdma] WARN: device '{}' probe failed: {e}. \
-                         Falling back to defaults: GID_INDEX=1, MAX_SEND_WR=8192, \
-                         MAX_RECV_WR=8192, CQ_DEPTH=8192, MTU=MTU_1024, MAX_MR_SIZE=16MB",
-                        rdma_ctx.device_name,
+                    tracing::warn!(
+                        target: "rmlx_rdma",
+                        device = %rdma_ctx.device_name,
+                        %e,
+                        "device probe failed, falling back to defaults",
                     );
                 }
             }
@@ -327,18 +333,24 @@ impl RdmaDeviceProbe {
             let probed_mr = dev_attr.max_mr_size as usize;
             let probed_qp_wr = dev_attr.max_qp_wr as u32;
             let probed_cqe = dev_attr.max_cqe as u32;
-            eprintln!(
-                "[rmlx-rdma] using probed device values: max_mr_size={probed_mr}, \
-                 max_qp_wr={probed_qp_wr}, max_cqe={probed_cqe}"
+            tracing::info!(
+                target: "rmlx_rdma",
+                max_mr_size = probed_mr,
+                max_qp_wr = probed_qp_wr,
+                max_cqe = probed_cqe,
+                "using probed device values",
             );
             (probed_mr, probed_qp_wr, probed_cqe)
         } else {
             const FALLBACK_MR: usize = 16 * 1024 * 1024;
             const FALLBACK_QP_WR: u32 = 4095;
             const FALLBACK_CQ: u32 = 8192;
-            eprintln!(
-                "[rmlx-rdma] WARN: ibv_query_device failed, using hardcoded fallback: \
-                 max_mr_size={FALLBACK_MR}, max_qp_wr={FALLBACK_QP_WR}, max_cq_depth={FALLBACK_CQ}"
+            tracing::warn!(
+                target: "rmlx_rdma",
+                max_mr_size = FALLBACK_MR,
+                max_qp_wr = FALLBACK_QP_WR,
+                max_cq_depth = FALLBACK_CQ,
+                "ibv_query_device failed, using hardcoded fallback",
             );
             (FALLBACK_MR, FALLBACK_QP_WR, FALLBACK_CQ)
         };
@@ -353,9 +365,12 @@ impl RdmaDeviceProbe {
             )));
         }
 
-        eprintln!(
-            "[rmlx-rdma] using probed port values: active_mtu={}, max_msg_sz={}, gid_tbl_len={}",
-            port_attr.active_mtu, port_attr.max_msg_sz, port_attr.gid_tbl_len
+        tracing::info!(
+            target: "rmlx_rdma",
+            active_mtu = port_attr.active_mtu,
+            max_msg_sz = port_attr.max_msg_sz,
+            gid_tbl_len = port_attr.gid_tbl_len,
+            "using probed port values",
         );
 
         // Determine GID index: probe from index 1 downward.

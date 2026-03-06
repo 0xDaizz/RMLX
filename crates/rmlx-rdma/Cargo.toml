@@ -18,3 +18,4 @@ libc = { workspace = true }
 libloading = { workspace = true }
 crc32fast = { workspace = true }
 half = { workspace = true }
+tracing = { workspace = true }

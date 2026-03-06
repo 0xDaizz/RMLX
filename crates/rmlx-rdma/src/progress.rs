@@ -255,7 +255,7 @@ fn lock_or_recover<'a, T>(
 ) -> std::sync::MutexGuard<'a, T> {
     mutex.lock().unwrap_or_else(|poisoned| {
         healthy.store(false, Ordering::Release);
-        eprintln!("[rmlx-rdma] progress: mutex poisoned — recovering");
+        tracing::warn!(target: "rmlx_rdma", "progress: mutex poisoned — recovering");
         poisoned.into_inner()
     })
 }
@@ -312,7 +312,7 @@ impl ProgressEngine {
         let count = match cq.poll(&mut wc_buf) {
             Ok(n) => n,
             Err(e) => {
-                eprintln!("[rmlx-rdma] progress: CQ poll error: {e}");
+                tracing::error!(target: "rmlx_rdma", %e, "progress: CQ poll error");
                 return 0;
             }
         };
@@ -331,10 +331,11 @@ impl ProgressEngine {
                 // Completion for unregistered wr_id — log and discard.
                 // This can happen if the caller used the old CompletionTracker
                 // or wait_completions path for some operations.
-                eprintln!(
-                    "[rmlx-rdma] progress: unregistered wr_id={} status={}",
-                    wc.wr_id,
-                    wc_status_str(wc.status)
+                tracing::warn!(
+                    target: "rmlx_rdma",
+                    wr_id = wc.wr_id,
+                    status = %wc_status_str(wc.status),
+                    "progress: unregistered wr_id",
                 );
             }
         }
@@ -372,7 +373,7 @@ impl ProgressEngine {
                     let count = match cq.poll(&mut wc_buf) {
                         Ok(n) => n,
                         Err(e) => {
-                            eprintln!("[rmlx-rdma] progress bg: CQ poll error: {e}");
+                            tracing::error!(target: "rmlx_rdma", %e, "progress bg: CQ poll error");
                             if config.yield_on_empty {
                                 std::thread::yield_now();
                             }
@@ -392,10 +393,11 @@ impl ProgressEngine {
                         if let Some(slot) = map.remove(&wc.wr_id) {
                             Self::resolve_slot(&slot, wc);
                         } else {
-                            eprintln!(
-                                "[rmlx-rdma] progress bg: unregistered wr_id={} status={}",
-                                wc.wr_id,
-                                wc_status_str(wc.status)
+                            tracing::warn!(
+                                target: "rmlx_rdma",
+                                wr_id = wc.wr_id,
+                                status = %wc_status_str(wc.status),
+                                "progress bg: unregistered wr_id",
                             );
                         }
                     }
