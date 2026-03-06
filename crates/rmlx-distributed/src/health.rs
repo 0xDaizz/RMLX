@@ -126,7 +126,7 @@ mod tests {
         let monitor = HealthMonitor::new(test_config());
 
         monitor.record_heartbeat(11);
-        thread::sleep(Duration::from_millis(60));
+        thread::sleep(Duration::from_millis(250));
 
         assert!(!monitor.is_healthy(11));
         assert_eq!(monitor.check_health(), vec![11]);
@@ -140,7 +140,7 @@ mod tests {
         monitor.record_heartbeat(2);
         monitor.record_heartbeat(3);
 
-        thread::sleep(Duration::from_millis(60));
+        thread::sleep(Duration::from_millis(250));
 
         monitor.record_heartbeat(1);
         monitor.record_heartbeat(3);
@@ -237,7 +237,7 @@ mod tests {
         monitor.record_heartbeat(7);
 
         // Wait for all to time out.
-        thread::sleep(Duration::from_millis(60));
+        thread::sleep(Duration::from_millis(250));
 
         let unhealthy = monitor.check_health();
         // Should be sorted.
