@@ -40,8 +40,10 @@ impl CompletionQueue {
             .probe()
             .map(|p| p.max_cq_depth as c_int)
             .unwrap_or_else(|| {
-                eprintln!(
-                    "[rmlx-rdma] WARN: probe unavailable, using DEFAULT_CQ_DEPTH={DEFAULT_CQ_DEPTH}"
+                tracing::warn!(
+                    target: "rmlx_rdma",
+                    default = DEFAULT_CQ_DEPTH,
+                    "probe unavailable, using DEFAULT_CQ_DEPTH",
                 );
                 DEFAULT_CQ_DEPTH
             });
@@ -119,14 +121,18 @@ impl QueuePair {
         let lib = pd.lib();
 
         let max_send_wr = ctx.probe().map(|p| p.max_qp_wr).unwrap_or_else(|| {
-            eprintln!(
-                "[rmlx-rdma] WARN: probe unavailable, using DEFAULT_MAX_SEND_WR={DEFAULT_MAX_SEND_WR}"
+            tracing::warn!(
+                target: "rmlx_rdma",
+                default = DEFAULT_MAX_SEND_WR,
+                "probe unavailable, using DEFAULT_MAX_SEND_WR",
             );
             DEFAULT_MAX_SEND_WR
         });
         let max_recv_wr = ctx.probe().map(|p| p.max_qp_wr).unwrap_or_else(|| {
-            eprintln!(
-                "[rmlx-rdma] WARN: probe unavailable, using DEFAULT_MAX_RECV_WR={DEFAULT_MAX_RECV_WR}"
+            tracing::warn!(
+                target: "rmlx_rdma",
+                default = DEFAULT_MAX_RECV_WR,
+                "probe unavailable, using DEFAULT_MAX_RECV_WR",
             );
             DEFAULT_MAX_RECV_WR
         });
@@ -155,15 +161,18 @@ impl QueuePair {
             .probe()
             .map(|p| p.gid_index as c_int)
             .unwrap_or_else(|| {
-                eprintln!(
-                "[rmlx-rdma] WARN: probe unavailable, using DEFAULT_GID_INDEX={DEFAULT_GID_INDEX}"
-            );
+                tracing::warn!(
+                    target: "rmlx_rdma",
+                    default = DEFAULT_GID_INDEX,
+                    "probe unavailable, using DEFAULT_GID_INDEX",
+                );
                 DEFAULT_GID_INDEX
             });
         let mtu = ctx.probe().map(|p| p.mtu).unwrap_or_else(|| {
-            eprintln!(
-                "[rmlx-rdma] WARN: probe unavailable, using MTU_1024 ({})",
-                mtu::MTU_1024
+            tracing::warn!(
+                target: "rmlx_rdma",
+                default = mtu::MTU_1024,
+                "probe unavailable, using MTU_1024",
             );
             mtu::MTU_1024
         });
@@ -189,12 +198,17 @@ impl QueuePair {
     /// Uses probed GID index if available, otherwise falls back to `DEFAULT_GID_INDEX`.
     pub fn query_local_info(&mut self, ctx: &RdmaContext, rank: u32) -> Result<(), RdmaError> {
         let lib = self.lib;
-        let gid_index = ctx.probe().map(|p| p.gid_index as c_int).unwrap_or_else(|| {
-            eprintln!(
-                "[rmlx-rdma] WARN: probe unavailable for query_local_info, using DEFAULT_GID_INDEX={DEFAULT_GID_INDEX}"
-            );
-            DEFAULT_GID_INDEX
-        });
+        let gid_index = ctx
+            .probe()
+            .map(|p| p.gid_index as c_int)
+            .unwrap_or_else(|| {
+                tracing::warn!(
+                    target: "rmlx_rdma",
+                    default = DEFAULT_GID_INDEX,
+                    "probe unavailable for query_local_info, using DEFAULT_GID_INDEX",
+                );
+                DEFAULT_GID_INDEX
+            });
 
         // Query port for LID
         // SAFETY: ctx.raw() is valid, port_attr is zero-initialized and passed by mutable ref.

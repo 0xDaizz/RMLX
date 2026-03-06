@@ -146,11 +146,17 @@ fn json_escape_into(buf: &mut String, s: &str) {
     }
 }
 
-/// Log a message at the given level (prints to stderr if enabled).
+/// Log a message at the given level (emits via `tracing` if enabled).
 pub fn log(level: LogLevel, target: &str, message: &str) {
     if is_enabled(level) {
         let entry = LogEntry::new(level, target, message);
-        eprintln!("{}", entry.format_text());
+        match level {
+            LogLevel::Error => tracing::error!("{}", entry.format_text()),
+            LogLevel::Warn => tracing::warn!("{}", entry.format_text()),
+            LogLevel::Info => tracing::info!("{}", entry.format_text()),
+            LogLevel::Debug => tracing::debug!("{}", entry.format_text()),
+            LogLevel::Trace => tracing::trace!("{}", entry.format_text()),
+        }
     }
 }
 
@@ -161,6 +167,12 @@ pub fn log_with_fields(level: LogLevel, target: &str, message: &str, fields: &[(
         for (k, v) in fields {
             entry.fields.push(((*k).to_string(), (*v).to_string()));
         }
-        eprintln!("{}", entry.format_text());
+        match level {
+            LogLevel::Error => tracing::error!("{}", entry.format_text()),
+            LogLevel::Warn => tracing::warn!("{}", entry.format_text()),
+            LogLevel::Info => tracing::info!("{}", entry.format_text()),
+            LogLevel::Debug => tracing::debug!("{}", entry.format_text()),
+            LogLevel::Trace => tracing::trace!("{}", entry.format_text()),
+        }
     }
 }

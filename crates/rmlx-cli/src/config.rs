@@ -160,7 +160,7 @@ pub fn run(args: ConfigArgs) -> i32 {
         .collect();
 
     if hosts.is_empty() {
-        eprintln!("error: at least one host is required");
+        tracing::error!(target: "rmlx_cli", "at least one host is required");
         return 1;
     }
 
@@ -172,13 +172,13 @@ pub fn run(args: ConfigArgs) -> i32 {
             println!("[{host}] probing ssh");
         }
         if let Err(e) = verify_ssh(host, user, args.timeout) {
-            eprintln!("error: {e}");
+            tracing::error!(target: "rmlx_cli", %e, "SSH verification failed");
             return 1;
         }
 
         if args.auto_setup && args.over == "thunderbolt" {
             if let Err(e) = auto_setup_host(host, user, args.timeout, args.verbose) {
-                eprintln!("error: {e}");
+                tracing::error!(target: "rmlx_cli", %e, "auto-setup failed");
                 return 1;
             }
         }
@@ -189,7 +189,7 @@ pub fn run(args: ConfigArgs) -> i32 {
         let ip = match probe_control_ip(host, &args.control_iface, user, args.timeout) {
             Ok(ip) => ip,
             Err(e) => {
-                eprintln!("error: {e}");
+                tracing::error!(target: "rmlx_cli", %e, "failed to probe control IP");
                 return 1;
             }
         };
@@ -202,15 +202,17 @@ pub fn run(args: ConfigArgs) -> i32 {
             match probe_rdma_devices(host, user, args.timeout) {
                 Ok(devs) => {
                     if devs.is_empty() {
-                        eprintln!(
-                            "error: no RDMA devices found on {host}; use --no-verify-rdma to bypass"
+                        tracing::error!(
+                            target: "rmlx_cli",
+                            %host,
+                            "no RDMA devices found; use --no-verify-rdma to bypass",
                         );
                         return 1;
                     }
                     rdma_devs = devs;
                 }
                 Err(e) => {
-                    eprintln!("error: {e}");
+                    tracing::error!(target: "rmlx_cli", %e, "RDMA probe failed");
                     return 1;
                 }
             }
@@ -231,12 +233,13 @@ pub fn run(args: ConfigArgs) -> i32 {
             if !args.no_verify_rdma {
                 let needed = world - 1;
                 if info.rdma_devices.len() < needed {
-                    eprintln!(
-                        "error: {}: requires >= {} RDMA devices for full mesh, found {} ({:?})",
-                        info.ssh,
+                    tracing::error!(
+                        target: "rmlx_cli",
+                        host = %info.ssh,
                         needed,
-                        info.rdma_devices.len(),
-                        info.rdma_devices,
+                        found = info.rdma_devices.len(),
+                        devices = ?info.rdma_devices,
+                        "insufficient RDMA devices for full mesh",
                     );
                     return 1;
                 }
@@ -261,13 +264,13 @@ pub fn run(args: ConfigArgs) -> i32 {
     let json = match serde_json::to_string_pretty(&entries) {
         Ok(j) => j,
         Err(e) => {
-            eprintln!("error: failed to serialize hostfile: {e}");
+            tracing::error!(target: "rmlx_cli", %e, "failed to serialize hostfile");
             return 1;
         }
     };
 
     if let Err(e) = std::fs::write(&args.output, &json) {
-        eprintln!("error: failed to write {}: {e}", args.output);
+        tracing::error!(target: "rmlx_cli", path = %args.output, %e, "failed to write hostfile");
         return 1;
     }
 

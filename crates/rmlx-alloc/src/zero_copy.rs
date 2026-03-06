@@ -310,13 +310,12 @@ impl Drop for ZeroCopyBuffer {
                 let deadline = Instant::now() + Duration::from_secs(5);
                 while !ticket.is_safe_to_free() {
                     if Instant::now() >= deadline {
-                        eprintln!(
-                            "[rmlx-alloc] CRITICAL: buffer {:p} drop timeout -- \
-                             completion ticket not resolved (gpu={}, rdma={}). \
-                             Leaking memory to prevent use-after-free.",
-                            self.raw_ptr.as_ptr(),
-                            ticket.gpu_complete.load(Ordering::Acquire),
-                            ticket.rdma_complete.load(Ordering::Acquire),
+                        tracing::error!(
+                            target: "rmlx_alloc",
+                            ptr = ?self.raw_ptr.as_ptr(),
+                            gpu_complete = ticket.gpu_complete.load(Ordering::Acquire),
+                            rdma_complete = ticket.rdma_complete.load(Ordering::Acquire),
+                            "buffer drop timeout -- completion ticket not resolved. Leaking memory to prevent use-after-free.",
                         );
                         let _ = std::mem::replace(&mut self.raw_ptr, NonNull::dangling());
                         return;
@@ -330,10 +329,11 @@ impl Drop for ZeroCopyBuffer {
         while Arc::strong_count(&self.in_flight) > 1 {
             if Instant::now() >= deadline {
                 let remaining = Arc::strong_count(&self.in_flight) - 1;
-                eprintln!(
-                    "[rmlx-alloc] CRITICAL: buffer {:p} drop timeout -- {} in-flight refs remaining. \
-                     Leaking memory to prevent use-after-free.",
-                    self.raw_ptr.as_ptr(), remaining
+                tracing::error!(
+                    target: "rmlx_alloc",
+                    ptr = ?self.raw_ptr.as_ptr(),
+                    remaining,
+                    "buffer drop timeout -- in-flight refs remaining. Leaking memory to prevent use-after-free.",
                 );
                 // Leak everything to prevent use-after-free.
                 // Replace raw_ptr with dangling so we skip the free below;
@@ -386,10 +386,10 @@ impl Drop for CompletionFence {
             // Token is ManuallyDrop — not dropping it intentionally.
             // The Arc<()> ref count stays elevated, preventing ZeroCopyBuffer::drop
             // from freeing memory while GPU/RDMA work may still be in flight.
-            eprintln!(
-                "[rmlx-alloc] WARNING: CompletionFence for '{}' dropped without verification. \
-                 Leaking in-flight token to prevent use-after-free.",
-                self.op_tag
+            tracing::warn!(
+                target: "rmlx_alloc",
+                op_tag = self.op_tag,
+                "CompletionFence dropped without verification. Leaking in-flight token to prevent use-after-free.",
             );
         }
         // If verified is true, token was already dropped in release_after_verification.
