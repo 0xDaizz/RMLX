@@ -466,6 +466,7 @@ impl SlabRing {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     /// Helper: get the default Metal device, skip test if unavailable.
     fn require_device() -> metal::Device {
