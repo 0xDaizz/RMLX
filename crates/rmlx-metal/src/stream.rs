@@ -395,4 +395,66 @@ mod tests {
         assert_send_sync::<StreamManager>();
         assert_send_sync::<super::StreamSync>();
     }
+
+    #[test]
+    fn test_command_buffer_nonexistent_stream_fails() {
+        let device = metal::Device::system_default().unwrap();
+        let mgr = StreamManager::new(&device);
+
+        // Stream 999 was never created.
+        let result = mgr.command_buffer(999);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_queue_returns_none_for_missing_stream() {
+        let device = metal::Device::system_default().unwrap();
+        let mgr = StreamManager::new(&device);
+
+        assert!(mgr.queue(999).is_none());
+        assert!(mgr.queue(STREAM_COMPUTE).is_some());
+    }
+
+    #[test]
+    fn test_stream_constants() {
+        assert_eq!(STREAM_DEFAULT, 0);
+        assert_eq!(STREAM_COMPUTE, 1);
+        assert_eq!(STREAM_COPY, 2);
+    }
+
+    #[test]
+    fn test_create_buffer_manager_success() {
+        let device = metal::Device::system_default().unwrap();
+        let mgr = StreamManager::new(&device);
+
+        let _bm = mgr.create_buffer_manager(STREAM_COMPUTE).unwrap();
+        let _bm = mgr.create_buffer_manager(STREAM_COPY).unwrap();
+    }
+
+    #[test]
+    fn test_create_buffer_manager_nonexistent_stream() {
+        let device = metal::Device::system_default().unwrap();
+        let mgr = StreamManager::new(&device);
+
+        let result = mgr.create_buffer_manager(999);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sync_fence_accessible() {
+        let device = metal::Device::system_default().unwrap();
+        let mgr = StreamManager::new(&device);
+
+        let fence = mgr.sync_fence();
+        // Initial signaled value should be 0.
+        assert_eq!(fence.signaled_value(), 0);
+    }
+
+    #[test]
+    fn test_stream_sync_fence_accessor() {
+        let device = metal::Device::system_default().unwrap();
+        let sync = StreamSync::new(&device);
+        let fence = sync.fence();
+        assert_eq!(fence.signaled_value(), 0);
+    }
 }
