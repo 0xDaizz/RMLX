@@ -6,6 +6,7 @@ pub mod credit_manager;
 pub mod ep_runtime;
 pub mod fp8_exchange;
 pub mod group;
+pub mod health;
 pub mod init;
 pub mod metrics;
 pub mod moe_exchange;
@@ -28,6 +29,7 @@ pub use group::{
     AllreduceAlgorithm, DistributedError, Group, RdmaTransport, ReduceDtype, ReduceOp,
     TopologyRing, TREE_ALLREDUCE_THRESHOLD,
 };
+pub use health::{HealthMonitor, HeartbeatConfig, HeartbeatSender};
 pub use init::{init, BackendHint, DistributedContext, InitConfig};
 pub use metrics::{MoeMetrics as MoeMetricsAtomic, MoeMetricsSnapshot};
 pub use moe_exchange::{

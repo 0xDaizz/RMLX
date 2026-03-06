@@ -27,24 +27,48 @@ pub struct AcquiredBuffer {
     pub slot_index: u8,
     /// Completion ticket — marks the buffer as in-use while held.
     ticket: CompletionTicket,
+    /// Retains the pool so the underlying SharedBuffer allocation outlives this handle.
+    _pool: Arc<Mutex<SharedBufferPool>>,
+    /// Whether the caller actually wrote data into this buffer.
+    used: bool,
 }
 
-// SAFETY: AcquiredBuffer owns a raw pointer from a posix_memalign allocation
-// managed by SharedBuffer. The pointer is valid for `size` bytes and the
-// underlying SharedBuffer lifetime is managed by SharedBufferPool. The
-// CompletionTicket is Send+Sync.
+// SAFETY: AcquiredBuffer owns a raw pointer into SharedBuffer storage managed
+// by SharedBufferPool. The `_pool` Arc keeps that pool alive for the lifetime
+// of this handle, so the backing allocation outlives the raw pointer. The
+// pointer is valid for `size` bytes and CompletionTicket is Send+Sync.
 unsafe impl Send for AcquiredBuffer {}
 
 impl AcquiredBuffer {
+    fn mark_complete(&self) {
+        // Marking both flags makes `is_safe_to_free()` return true,
+        // which in turn makes `SharedBuffer::is_available()` return true.
+        self.ticket.mark_gpu_complete();
+        self.ticket.mark_rdma_complete();
+    }
+
+    /// Mark this buffer as having been written to by the caller.
+    pub fn mark_used(&mut self) {
+        self.used = true;
+    }
+
+    /// Whether this buffer has been marked as written to.
+    pub fn is_used(&self) -> bool {
+        self.used
+    }
+
     /// Release this buffer back to the pool by marking the ticket complete.
     ///
     /// After calling this, the underlying SharedBuffer will be eligible for
     /// re-acquisition on the next `pool.acquire()` call.
     pub fn release(self) {
-        // Marking both flags makes `is_safe_to_free()` return true,
-        // which in turn makes `SharedBuffer::is_available()` return true.
-        self.ticket.mark_gpu_complete();
-        self.ticket.mark_rdma_complete();
+        if !self.used {
+            eprintln!(
+                "[ep-runtime] releasing unused buffer slot={} size={}",
+                self.slot_index, self.size
+            );
+        }
+        self.mark_complete();
     }
 }
 
@@ -52,8 +76,7 @@ impl Drop for AcquiredBuffer {
     fn drop(&mut self) {
         // Auto-release on drop: mark the ticket complete so the buffer
         // returns to the pool.
-        self.ticket.mark_gpu_complete();
-        self.ticket.mark_rdma_complete();
+        self.mark_complete();
     }
 }
 
@@ -290,6 +313,8 @@ impl EpRuntimeContext {
                 size: send.size(),
                 slot_index: send.slot_index(),
                 ticket: send_ticket,
+                _pool: Arc::clone(&self.shared_pool),
+                used: false,
             });
 
             // Acquire recv buffer and attach a ticket to mark it in-use.
@@ -305,6 +330,8 @@ impl EpRuntimeContext {
                 size: recv.size(),
                 slot_index: recv.slot_index(),
                 ticket: recv_ticket,
+                _pool: Arc::clone(&self.shared_pool),
+                used: false,
             });
         }
 
@@ -448,5 +475,31 @@ mod tests {
         // All should be None since size is 0.
         assert!(send_bufs.iter().all(|b| b.is_none()));
         assert!(recv_bufs.iter().all(|b| b.is_none()));
+    }
+
+    #[test]
+    fn acquired_buffer_tracks_usage() {
+        let pool = match make_pool(&[4096]) {
+            Some(p) => p,
+            None => return,
+        };
+        let pool = Arc::new(Mutex::new(pool));
+        let device = metal::Device::system_default().unwrap();
+        let progress = Arc::new(rmlx_rdma::progress::ProgressEngine::new());
+        let transport = Arc::new(crate::transport::RdmaConnectionTransport::new(vec![], 0));
+
+        let ctx = EpRuntimeContext::new(transport, progress, pool, vec![], &device);
+
+        let (mut send_bufs, recv_bufs) = ctx
+            .acquire_send_recv_buffers(4096, 2, 0)
+            .expect("acquire should succeed");
+
+        let send = send_bufs[1].as_mut().expect("send buf should exist");
+        assert!(!send.is_used(), "buffer should start unused");
+        send.mark_used();
+        assert!(send.is_used(), "buffer should report used after mark_used");
+
+        drop(recv_bufs);
+        drop(send_bufs);
     }
 }

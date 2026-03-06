@@ -51,6 +51,11 @@ pub enum AllocError {
     /// Attempted to free a buffer not owned by this allocator (double-free or
     /// untracked pointer).
     InvalidFree,
+    /// Attempted to free a buffer not owned by this allocator, returning the
+    /// buffer to the caller.
+    InvalidFreeBuffer(rmlx_metal::metal::Buffer),
+    /// The buffer's Metal device does not match this allocator's device.
+    DeviceMismatch,
 }
 
 impl fmt::Display for AllocError {
@@ -72,6 +77,11 @@ impl fmt::Display for AllocError {
             Self::ZeroSize => write!(f, "zero-size allocation is not allowed"),
             Self::DType(msg) => write!(f, "dtype error: {msg}"),
             Self::InvalidFree => write!(f, "attempted to free an unowned or already-freed buffer"),
+            Self::InvalidFreeBuffer(_) => write!(
+                f,
+                "attempted to free an unowned or already-freed buffer (buffer returned)"
+            ),
+            Self::DeviceMismatch => write!(f, "buffer device does not match allocator device"),
         }
     }
 }
