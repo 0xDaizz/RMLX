@@ -582,6 +582,13 @@ pub fn gemv(
             vec.shape()[0]
         )));
     }
+    if vec.dtype() != mat.dtype() {
+        return Err(KernelError::InvalidShape(format!(
+            "gemv: dtype mismatch: mat={:?}, vec={:?}",
+            mat.dtype(),
+            vec.dtype()
+        )));
+    }
 
     let mat_contig = super::make_contiguous(mat, registry, queue)?;
     let mat = mat_contig.as_ref().unwrap_or(mat);
@@ -680,6 +687,20 @@ pub fn gemv_bias(
             mat.shape()[0]
         )));
     }
+    if vec.dtype() != mat.dtype() {
+        return Err(KernelError::InvalidShape(format!(
+            "gemv_bias: dtype mismatch: mat={:?}, vec={:?}",
+            mat.dtype(),
+            vec.dtype()
+        )));
+    }
+    if bias.dtype() != mat.dtype() {
+        return Err(KernelError::InvalidShape(format!(
+            "gemv_bias: dtype mismatch: mat={:?}, bias={:?}",
+            mat.dtype(),
+            bias.dtype()
+        )));
+    }
 
     let mat_contig = super::make_contiguous(mat, registry, queue)?;
     let mat = mat_contig.as_ref().unwrap_or(mat);
@@ -767,6 +788,13 @@ pub fn gemv_t(
             "gemv_t: vector length must match matrix rows: {} vs {}",
             vec.shape()[0],
             mat.shape()[0]
+        )));
+    }
+    if vec.dtype() != mat.dtype() {
+        return Err(KernelError::InvalidShape(format!(
+            "gemv_t: dtype mismatch: mat={:?}, vec={:?}",
+            mat.dtype(),
+            vec.dtype()
         )));
     }
 

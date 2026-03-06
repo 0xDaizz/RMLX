@@ -1256,14 +1256,16 @@ fn test_combine_cpu_metal_parity() {
         top_k,
         hidden_dim,
     );
-    let metal_result = combine.combine_metal(
-        &expert_outputs,
-        &weights,
-        &indices,
-        batch_size,
-        top_k,
-        hidden_dim,
-    );
+    let metal_result = combine
+        .combine_metal(
+            &expert_outputs,
+            &weights,
+            &indices,
+            batch_size,
+            top_k,
+            hidden_dim,
+        )
+        .expect("combine_metal should succeed");
 
     assert_eq!(cpu_result.len(), metal_result.len());
     for i in 0..cpu_result.len() {

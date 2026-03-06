@@ -744,6 +744,44 @@ pub fn rope_ext_into_cb(
 
     let half_dim = head_dim / 2;
 
+    // Validate frequency table dimensions (matches rope_ext validation).
+    let freq_rows_needed = (offset as usize) + seq_len;
+    if cos_freqs.ndim() != 2 || sin_freqs.ndim() != 2 {
+        return Err(KernelError::InvalidShape(
+            "cos_freqs and sin_freqs must be 2-D [max_seq_len, half_dim]".into(),
+        ));
+    }
+    if cos_freqs.shape()[0] < freq_rows_needed {
+        return Err(KernelError::InvalidShape(format!(
+            "cos_freqs rows ({}) < seq_len ({}) + offset ({})",
+            cos_freqs.shape()[0],
+            seq_len,
+            offset,
+        )));
+    }
+    if sin_freqs.shape()[0] < freq_rows_needed {
+        return Err(KernelError::InvalidShape(format!(
+            "sin_freqs rows ({}) < seq_len ({}) + offset ({})",
+            sin_freqs.shape()[0],
+            seq_len,
+            offset,
+        )));
+    }
+    if cos_freqs.shape()[1] != half_dim {
+        return Err(KernelError::InvalidShape(format!(
+            "cos_freqs cols ({}) != head_dim/2 ({})",
+            cos_freqs.shape()[1],
+            half_dim,
+        )));
+    }
+    if sin_freqs.shape()[1] != half_dim {
+        return Err(KernelError::InvalidShape(format!(
+            "sin_freqs cols ({}) != head_dim/2 ({})",
+            sin_freqs.shape()[1],
+            half_dim,
+        )));
+    }
+
     let kname = kernel_name_table(input.dtype())?;
     let pipeline = registry.get_pipeline(kname, input.dtype())?;
 

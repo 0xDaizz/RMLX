@@ -16,6 +16,80 @@ use rmlx_rdma::RdmaError;
 use crate::group::{DistributedError, RdmaTransport};
 use crate::perf_counters::global_counters;
 
+// ─── ZeroCopyPendingOp: ties SharedBuffer lifetime to RDMA op lifetime ───
+
+/// A pending RDMA operation that holds an `Arc<SharedBuffer>` to prevent
+/// the buffer from being dropped while a DMA operation is still in flight.
+///
+/// This is the zero-copy counterpart of `OwnedPendingOp`: instead of owning
+/// a freshly-registered `MemoryRegion`, it holds a shared reference to the
+/// `SharedBuffer` whose pre-registered MR is being used by the RDMA HW.
+///
+/// On `Drop`, if the operation is still pending, we block **indefinitely**
+/// until the RDMA NIC has finished accessing the buffer memory before the
+/// `Arc` reference is released. This prevents use-after-free when the last
+/// `Arc` holder drops the `SharedBuffer` while DMA is still in progress.
+/// A warning is emitted if the wait exceeds 5 seconds.
+pub struct ZeroCopyPendingOp {
+    pending: PendingOp,
+    /// Prevent the SharedBuffer from being freed while DMA is in flight.
+    _buf: Arc<SharedBuffer>,
+}
+
+impl ZeroCopyPendingOp {
+    /// Create a new `ZeroCopyPendingOp` that ties buffer lifetime to the op.
+    pub fn new(pending: PendingOp, buf: Arc<SharedBuffer>) -> Self {
+        Self { pending, _buf: buf }
+    }
+
+    /// Non-blocking poll. Returns `Some` if the operation has completed.
+    pub fn try_poll(
+        &self,
+    ) -> Option<Result<rmlx_rdma::progress::Completion, rmlx_rdma::progress::OpError>> {
+        self.pending.try_poll()
+    }
+
+    /// Returns true if the operation is still pending.
+    pub fn is_pending(&self) -> bool {
+        self.pending.is_pending()
+    }
+
+    /// Blocking wait with timeout. The buffer stays alive regardless of outcome.
+    pub fn wait(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<rmlx_rdma::progress::Completion, rmlx_rdma::progress::WaitError> {
+        self.pending.wait(timeout)
+    }
+
+    /// The wr_id this operation is tracking.
+    pub fn wr_id(&self) -> u64 {
+        self.pending.wr_id()
+    }
+
+    /// Access the inner `PendingOp` (e.g. for legacy code that needs it).
+    pub fn inner(&self) -> &PendingOp {
+        &self.pending
+    }
+}
+
+impl Drop for ZeroCopyPendingOp {
+    fn drop(&mut self) {
+        let start = std::time::Instant::now();
+        let mut warned = false;
+        while self.pending.is_pending() {
+            if !warned && start.elapsed() > std::time::Duration::from_secs(5) {
+                eprintln!(
+                    "WARNING: ZeroCopyPendingOp still pending after 5s, blocking until complete"
+                );
+                warned = true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // Now safe to drop Arc<SharedBuffer>
+    }
+}
+
 /// Concrete transport wrapping real `RdmaConnection`s (one per peer rank).
 ///
 /// Each connection is wrapped in a `Mutex` to satisfy the `Sync` requirement
@@ -545,17 +619,19 @@ impl RdmaConnectionTransport {
     /// starting at `offset + slot * buf_size` within the SharedBuffer.
     ///
     /// This is the zero-copy variant: received data lands directly in GPU-visible memory.
+    /// Each returned `ZeroCopyPendingOp` holds an `Arc<SharedBuffer>` reference,
+    /// preventing the buffer from being freed while DMA is in flight.
     #[allow(clippy::too_many_arguments)]
     pub fn pre_post_recv_credits_zero_copy(
         &self,
         src_rank: u32,
         tag: ExchangeTag,
-        buf: &SharedBuffer,
+        buf: Arc<SharedBuffer>,
         conn_id: &ConnectionId,
         offset: usize,
         buf_size: usize,
         count: usize,
-    ) -> Result<Vec<PendingOp>, DistributedError> {
+    ) -> Result<Vec<ZeroCopyPendingOp>, DistributedError> {
         let engine = self.progress_engine.as_ref().ok_or_else(|| {
             DistributedError::Transport(
                 "pre_post_recv_credits_zero_copy: no progress engine attached".into(),
@@ -595,7 +671,7 @@ impl RdmaConnectionTransport {
                     rdma_to_distributed_enhanced(e, wr_id)
                 })?;
 
-            ops.push(pending);
+            ops.push(ZeroCopyPendingOp::new(pending, Arc::clone(&buf)));
         }
 
         Ok(ops)
@@ -759,16 +835,19 @@ impl RdmaConnectionTransport {
     }
 
     /// Zero-copy async send: posts the send using SharedBuffer's pre-registered MR
-    /// and returns a `PendingOp` immediately without blocking.
+    /// and returns a `ZeroCopyPendingOp` immediately without blocking.
+    ///
+    /// The returned `ZeroCopyPendingOp` holds an `Arc<SharedBuffer>` reference,
+    /// preventing the buffer from being freed while the DMA is in flight.
     ///
     /// This is the ideal data path: 0 memcpy + 0 ibv_reg_mr + non-blocking.
     pub fn send_zero_copy_async(
         &self,
-        buf: &SharedBuffer,
+        buf: Arc<SharedBuffer>,
         conn_id: &ConnectionId,
         dst_rank: u32,
         len: u32,
-    ) -> Result<PendingOp, DistributedError> {
+    ) -> Result<ZeroCopyPendingOp, DistributedError> {
         let engine = self.progress_engine.as_ref().ok_or_else(|| {
             DistributedError::Transport("send_zero_copy_async: no progress engine attached".into())
         })?;
@@ -794,18 +873,21 @@ impl RdmaConnectionTransport {
         })?;
 
         self.metrics.record_send(len as u64);
-        Ok(pending)
+        Ok(ZeroCopyPendingOp::new(pending, buf))
     }
 
     /// Zero-copy async recv: posts the recv using SharedBuffer's pre-registered MR
-    /// and returns a `PendingOp` immediately without blocking.
+    /// and returns a `ZeroCopyPendingOp` immediately without blocking.
+    ///
+    /// The returned `ZeroCopyPendingOp` holds an `Arc<SharedBuffer>` reference,
+    /// preventing the buffer from being freed while the DMA is in flight.
     pub fn recv_zero_copy_async(
         &self,
-        buf: &SharedBuffer,
+        buf: Arc<SharedBuffer>,
         conn_id: &ConnectionId,
         src_rank: u32,
         len: u32,
-    ) -> Result<PendingOp, DistributedError> {
+    ) -> Result<ZeroCopyPendingOp, DistributedError> {
         let engine = self.progress_engine.as_ref().ok_or_else(|| {
             DistributedError::Transport("recv_zero_copy_async: no progress engine attached".into())
         })?;
@@ -831,7 +913,7 @@ impl RdmaConnectionTransport {
         })?;
 
         self.metrics.record_recv(len as u64);
-        Ok(pending)
+        Ok(ZeroCopyPendingOp::new(pending, buf))
     }
 }
 
@@ -1193,6 +1275,86 @@ mod tests {
 
         let received = group.recv(1, 4).unwrap();
         assert_eq!(received, data);
+    }
+
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn test_zero_copy_pending_op_keeps_buffer_alive() {
+        use rmlx_rdma::progress::ProgressEngine;
+        use rmlx_rdma::shared_buffer::SharedBuffer;
+
+        let device = match metal::Device::system_default() {
+            Some(d) => d,
+            None => return, // skip on headless CI without Metal
+        };
+        let buf = match SharedBuffer::new(&device, 4096, 0) {
+            Ok(b) => b,
+            Err(_) => return, // skip if alloc fails
+        };
+        let buf = Arc::new(buf);
+
+        // Create a pending op via the progress engine
+        let engine = ProgressEngine::new();
+        let pending = engine.register_op(42);
+        assert!(pending.is_pending());
+
+        // Create ZeroCopyPendingOp — this clones the Arc
+        let zc_op = super::ZeroCopyPendingOp::new(pending, Arc::clone(&buf));
+
+        // Drop our local Arc — the ZeroCopyPendingOp should keep the buffer alive
+        assert_eq!(Arc::strong_count(&buf), 2); // buf + zc_op._buf
+        drop(buf);
+
+        // The op is still pending and the buffer is alive inside zc_op
+        assert!(zc_op.is_pending());
+
+        // Verify we can still access the inner PendingOp
+        assert_eq!(zc_op.wr_id(), 42);
+        assert!(zc_op.try_poll().is_none()); // still pending
+
+        // Complete the op so the Drop impl doesn't block forever.
+        // The key correctness property: the buffer was NOT freed while DMA
+        // was in flight — the Drop impl now blocks indefinitely until complete.
+        engine.synthetic_complete(42);
+        assert!(!zc_op.is_pending());
+        drop(zc_op);
+    }
+
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn test_zero_copy_pending_op_completed_drops_immediately() {
+        use rmlx_rdma::progress::ProgressEngine;
+        use rmlx_rdma::shared_buffer::SharedBuffer;
+
+        let device = match metal::Device::system_default() {
+            Some(d) => d,
+            None => return,
+        };
+        let buf = match SharedBuffer::new(&device, 4096, 0) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        let buf = Arc::new(buf);
+
+        let engine = ProgressEngine::new();
+        let pending = engine.register_op(99);
+
+        let zc_op = super::ZeroCopyPendingOp::new(pending, Arc::clone(&buf));
+
+        assert!(zc_op.is_pending());
+        assert_eq!(zc_op.wr_id(), 99);
+
+        // Strong count: buf + zc_op
+        assert_eq!(Arc::strong_count(&buf), 2);
+
+        // Synthetically complete the op so Drop doesn't block forever.
+        engine.synthetic_complete(99);
+        assert!(!zc_op.is_pending());
+
+        // Drop zc_op — op is complete so Drop returns immediately.
+        // After drop, only `buf` remains.
+        drop(zc_op);
+        assert_eq!(Arc::strong_count(&buf), 1);
     }
 
     #[test]

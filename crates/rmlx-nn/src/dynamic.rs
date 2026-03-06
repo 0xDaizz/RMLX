@@ -97,5 +97,6 @@ impl DynamicExecContext {
             * self
                 .dtype
                 .numel_to_bytes(self.max_seq_len * self.hidden_dim)
+                .expect("numel must be block-aligned for quantized dtypes")
     }
 }

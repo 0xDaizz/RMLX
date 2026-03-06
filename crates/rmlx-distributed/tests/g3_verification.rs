@@ -12,16 +12,9 @@ use std::time::Duration;
 #[test]
 fn verify_zero_copy_kpi_counters() {
     let counters = global_counters();
-    counters.reset();
 
-    // Immediately after reset, hot-path counters should be 0.
-    // This test is inherently racy but acceptable: if another test bumps a
-    // counter between reset and snapshot, the values will be > 0, which is
-    // fine for a "zero-copy path" check (we only care that OUR code path
-    // doesn't add cpu copies or mr registrations).
+    // Verify counter fields are accessible (no reset — races with parallel tests).
     let snap = counters.snapshot();
-    // These are best-effort in parallel; the real invariant is tested in
-    // verify_zero_copy_kpi_async_path below.
     let _ = snap.cpu_copy_bytes;
     let _ = snap.mr_reg_calls;
     let _ = snap.gpu_sync_calls;
@@ -31,47 +24,61 @@ fn verify_zero_copy_kpi_counters() {
 fn verify_counter_recording() {
     let counters = global_counters();
 
-    let before_cpu = counters.snapshot().cpu_copy_bytes;
-    let before_mr = counters.snapshot().mr_reg_calls;
-    let before_gpu = counters.snapshot().gpu_sync_calls;
-    let before_rdma_bytes = counters.snapshot().rdma_bytes_transferred;
-    let before_rdma_ops = counters.snapshot().rdma_ops_posted;
+    // Retry up to 3 times to tolerate races with parallel tests that may
+    // call reset() on the global singleton.
+    for attempt in 0..3 {
+        let before_cpu = counters.snapshot().cpu_copy_bytes;
+        let before_mr = counters.snapshot().mr_reg_calls;
+        let before_gpu = counters.snapshot().gpu_sync_calls;
+        let before_rdma_bytes = counters.snapshot().rdma_bytes_transferred;
+        let before_rdma_ops = counters.snapshot().rdma_ops_posted;
 
-    counters.record_cpu_copy(1024);
-    counters.record_mr_reg();
-    counters.record_gpu_sync();
-    counters.record_rdma_transfer(4096);
+        counters.record_cpu_copy(1024);
+        counters.record_mr_reg();
+        counters.record_gpu_sync();
+        counters.record_rdma_transfer(4096);
 
-    let snap = counters.snapshot();
-    let cpu_delta = snap.cpu_copy_bytes.wrapping_sub(before_cpu);
-    let mr_delta = snap.mr_reg_calls.wrapping_sub(before_mr);
-    let gpu_delta = snap.gpu_sync_calls.wrapping_sub(before_gpu);
-    let rdma_bytes_delta = snap.rdma_bytes_transferred.wrapping_sub(before_rdma_bytes);
-    let rdma_ops_delta = snap.rdma_ops_posted.wrapping_sub(before_rdma_ops);
-    assert!(cpu_delta >= 1024, "cpu_copy_bytes delta={}", cpu_delta);
-    assert!(mr_delta >= 1, "mr_reg_calls delta={}", mr_delta);
-    assert!(gpu_delta >= 1, "gpu_sync_calls delta={}", gpu_delta);
-    assert!(
-        rdma_bytes_delta >= 4096,
-        "rdma_bytes_transferred delta={}",
-        rdma_bytes_delta
-    );
-    assert!(
-        rdma_ops_delta >= 1,
-        "rdma_ops_posted delta={}",
-        rdma_ops_delta
-    );
+        let snap = counters.snapshot();
+        let cpu_delta = snap.cpu_copy_bytes.wrapping_sub(before_cpu);
+        let mr_delta = snap.mr_reg_calls.wrapping_sub(before_mr);
+        let gpu_delta = snap.gpu_sync_calls.wrapping_sub(before_gpu);
+        let rdma_bytes_delta = snap.rdma_bytes_transferred.wrapping_sub(before_rdma_bytes);
+        let rdma_ops_delta = snap.rdma_ops_posted.wrapping_sub(before_rdma_ops);
+
+        if cpu_delta >= 1024
+            && mr_delta >= 1
+            && gpu_delta >= 1
+            && rdma_bytes_delta >= 4096
+            && rdma_ops_delta >= 1
+        {
+            return; // success
+        }
+        if attempt == 2 {
+            assert!(cpu_delta >= 1024, "cpu_copy_bytes delta={}", cpu_delta);
+            assert!(mr_delta >= 1, "mr_reg_calls delta={}", mr_delta);
+            assert!(gpu_delta >= 1, "gpu_sync_calls delta={}", gpu_delta);
+            assert!(
+                rdma_bytes_delta >= 4096,
+                "rdma_bytes_transferred delta={}",
+                rdma_bytes_delta
+            );
+            assert!(
+                rdma_ops_delta >= 1,
+                "rdma_ops_posted delta={}",
+                rdma_ops_delta
+            );
+        }
+    }
 }
 
 #[test]
 fn verify_counter_display() {
     let counters = global_counters();
-    counters.reset();
+    // No reset — races with parallel tests.
     let snap = counters.snapshot();
     let display = format!("{}", snap);
-    // After reset, PASS should appear (all counters zero = good for zero-copy KPI)
     assert!(
-        display.contains("PASS") || display.contains("cpu_copy_bytes"),
+        display.contains("PASS") || display.contains("FAIL") || display.contains("cpu_copy_bytes"),
         "display should contain counter info"
     );
 }

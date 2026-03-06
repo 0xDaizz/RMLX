@@ -108,14 +108,11 @@ impl MetalAllocator {
     /// Allocate a Metal buffer of at least `size` bytes.
     /// Tries cache first, falls back to device allocation.
     ///
-    /// Returns a zero-length sentinel buffer for zero-size requests (A10).
+    /// Returns `Err(AllocError::ZeroSize)` for zero-size requests.
     pub fn alloc(&self, size: usize) -> Result<rmlx_metal::metal::Buffer, AllocError> {
-        // A10: Zero-size allocation returns a minimal sentinel buffer.
+        // Reject zero-size allocations to prevent cache poisoning (A-P0-1).
         if size == 0 {
-            let buf = self
-                .device
-                .new_buffer(0, MTLResourceOptions::StorageModeShared);
-            return Ok(buf);
+            return Err(AllocError::ZeroSize);
         }
 
         // Check hard memory limit (A12).
@@ -257,5 +254,29 @@ fn total_physical_memory() -> usize {
         } else {
             0
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_zero_size_alloc_returns_error() {
+        let device = match GpuDevice::system_default() {
+            Ok(d) => Arc::new(d),
+            Err(_) => {
+                eprintln!("skipping test: no Metal device");
+                return;
+            }
+        };
+
+        let allocator = MetalAllocator::new(device, 1024 * 1024);
+        let result = allocator.alloc(0);
+        assert!(result.is_err(), "zero-size alloc should return an error");
+        assert!(
+            matches!(result.unwrap_err(), AllocError::ZeroSize),
+            "error should be ZeroSize variant"
+        );
     }
 }

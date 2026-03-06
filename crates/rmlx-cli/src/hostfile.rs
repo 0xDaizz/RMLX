@@ -1,3 +1,4 @@
+use crate::ssh::validate_ssh_target;
 use serde::{Deserialize, Serialize};
 
 /// A single entry in the RMLX hostfile JSON array.
@@ -19,6 +20,9 @@ pub fn load_hosts_from_file(path: &str) -> Result<Vec<String>, String> {
     if entries.is_empty() {
         return Err("hostfile has no hosts".into());
     }
+    for entry in &entries {
+        validate_ssh_target(&entry.ssh, "hostfile ssh field")?;
+    }
     Ok(entries.into_iter().map(|e| e.ssh).collect())
 }
 
@@ -31,6 +35,9 @@ pub fn parse_hosts_csv(csv: &str) -> Result<Vec<String>, String> {
         .collect();
     if hosts.is_empty() {
         return Err("no hosts parsed from --hosts".into());
+    }
+    for h in &hosts {
+        validate_ssh_target(h, "host")?;
     }
     Ok(hosts)
 }
@@ -83,5 +90,25 @@ mod tests {
     #[test]
     fn test_resolve_hosts_neither() {
         assert!(resolve_hosts(None, None).is_err());
+    }
+
+    #[test]
+    fn test_parse_hosts_csv_rejects_injection() {
+        let result = parse_hosts_csv("-oProxyCommand=evil,node1");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("starts with '-'"));
+    }
+
+    #[test]
+    fn test_parse_hosts_csv_rejects_invalid_chars() {
+        let result = parse_hosts_csv("node1,host;rm -rf /");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_hosts_csv_valid() {
+        let result = parse_hosts_csv("my-host.example.com,192.168.1.1");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), vec!["my-host.example.com", "192.168.1.1"]);
     }
 }

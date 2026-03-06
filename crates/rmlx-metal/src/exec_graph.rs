@@ -125,7 +125,16 @@ impl<'q, 'e> ExecGraph<'q, 'e> {
     ///
     /// Returns an `EventToken` that subsequent batches can wait on.
     /// The command buffer is committed but the CPU does not block.
+    ///
+    /// If there is no pending work (no encoders were created since the last
+    /// submit), this returns the previous token unchanged without incrementing
+    /// the counter or submitting an empty command buffer.
     pub fn submit_batch(&mut self) -> EventToken {
+        if !self.batcher.has_pending() {
+            return EventToken {
+                value: self.counter,
+            };
+        }
         self.counter += 1;
         let value = self.counter;
         self.batcher.flush_signal(self.event, value);
@@ -324,6 +333,51 @@ mod tests {
         let mut graph = ExecGraph::new(&queue, &event, 32);
 
         // Sync with nothing submitted should be instant
+        let elapsed = graph.sync().expect("sync should succeed");
+        assert_eq!(elapsed, Duration::ZERO);
+    }
+
+    #[test]
+    fn submit_batch_no_pending_returns_previous_token() {
+        let device = metal::Device::system_default().expect("Metal device required");
+        let queue = device.new_command_queue();
+        let event = GpuEvent::new(&device);
+        let mut graph = ExecGraph::new(&queue, &event, 32);
+
+        // submit_batch with no pending work should return token with value 0
+        // and not increment the counter or total_batches
+        let t = graph.submit_batch();
+        assert_eq!(t.value(), 0);
+        assert_eq!(graph.counter(), 0);
+        assert_eq!(graph.total_batches(), 0);
+
+        // Now do real work and submit
+        let enc = graph.encoder();
+        enc.end_encoding();
+        graph.end_encoder();
+        let t1 = graph.submit_batch();
+        assert_eq!(t1.value(), 1);
+        assert_eq!(graph.total_batches(), 1);
+
+        // Another empty submit should return the previous token (value 1)
+        let t2 = graph.submit_batch();
+        assert_eq!(t2.value(), 1);
+        assert_eq!(graph.total_batches(), 1); // unchanged
+        assert_eq!(graph.counter(), 1); // unchanged
+    }
+
+    #[test]
+    fn wait_for_empty_submit_completes_immediately() {
+        let device = metal::Device::system_default().expect("Metal device required");
+        let queue = device.new_command_queue();
+        let event = GpuEvent::new(&device);
+        let mut graph = ExecGraph::new(&queue, &event, 32);
+
+        // submit_batch with no pending work
+        let t = graph.submit_batch();
+        assert_eq!(t.value(), 0);
+
+        // sync should complete immediately since counter is 0
         let elapsed = graph.sync().expect("sync should succeed");
         assert_eq!(elapsed, Duration::ZERO);
     }

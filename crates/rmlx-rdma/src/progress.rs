@@ -457,6 +457,32 @@ impl ProgressEngine {
     }
 }
 
+// ─── Test utilities ───────────────────────────────────────────────────────
+
+#[cfg(feature = "test-utils")]
+impl ProgressEngine {
+    /// Synthetically mark a registered op as successfully completed.
+    ///
+    /// This is intended for testing only — it bypasses the CQ polling path
+    /// and directly resolves the op slot, waking any waiters.
+    pub fn synthetic_complete(&self, wr_id: u64) {
+        let slot = lock_or_recover(&self.pending, &self.healthy)
+            .remove(&wr_id)
+            .unwrap_or_else(|| panic!("synthetic_complete: wr_id {wr_id} not pending"));
+        let result = Ok(Completion {
+            wr_id,
+            fields: try_decode_wr_id(wr_id),
+            byte_len: 0,
+            opcode: 0,
+        });
+        let _ = slot.result.set(result);
+        slot.state.store(OP_DONE, Ordering::Release);
+        let (lock, cvar) = &slot.notify;
+        let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        cvar.notify_all();
+    }
+}
+
 impl Default for ProgressEngine {
     fn default() -> Self {
         Self::new()
