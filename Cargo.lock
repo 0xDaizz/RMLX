@@ -454,6 +454,7 @@ dependencies = [
  "rmlx-metal",
  "rmlx-nn",
  "rmlx-rdma",
+ "serde_json",
 ]
 
 [[package]]

@@ -1,6 +1,6 @@
-# Implementation Roadmap — Phases 0-9B + S1-S5 + Audit Remediation + Phase 3 + Phase 4 Complete
+# Implementation Roadmap — Phases 0-9B + S1-S5 + Audit Remediation + Phase 3 + Phase 4 + Phase 5 Complete
 
-The rmlx project implementation roadmap. All phases through 9B-opt and serving support phases S1-S5 are complete. A full-crate audit (Phases 0, 1, 2) has been completed with 76 remediation items resolved across all 6 crates. Phase 3 adds FlashAttention-2 Metal kernel, paged KV cache, continuous batching scheduler, centralized CB commit, f16/bf16 RDMA collectives, ring allreduce chunk rounding fix, MoePolicy thread safety, and CLI signal forwarding. Phase 4 adds performance and allocator improvements: atomic CAS allocation limits, pointer ownership validation, SmallBufferPool/LeakDetector/ResidencyManager wiring, ChipTuning per-generation GPU tuning, DiskPipelineCache with sha2 hashing, HazardTrackingModeUntracked, fused RMSNorm+residual add kernel, gather_mm batched MoE strategy, SlabRing condvar backpressure, ProgressEngine EP dispatch wiring, ICB sparse expert dispatch, and BFC-style allocator. Current test count: 1,003+.
+The rmlx project implementation roadmap. All phases through 9B-opt and serving support phases S1-S5 are complete. A full-crate audit (Phases 0, 1, 2) has been completed with 76 remediation items resolved across all 6 crates. Phase 3 adds FlashAttention-2 Metal kernel, paged KV cache, continuous batching scheduler, centralized CB commit, f16/bf16 RDMA collectives, ring allreduce chunk rounding fix, MoePolicy thread safety, and CLI signal forwarding. Phase 4 adds performance and allocator improvements: atomic CAS allocation limits, pointer ownership validation, SmallBufferPool/LeakDetector/ResidencyManager wiring, ChipTuning per-generation GPU tuning, DiskPipelineCache with sha2 hashing, HazardTrackingModeUntracked, fused RMSNorm+residual add kernel, gather_mm batched MoE strategy, SlabRing condvar backpressure, ProgressEngine EP dispatch wiring, ICB sparse expert dispatch, and BFC-style allocator. Phase 5 (Feature Breadth) adds 5 new core ops (slice, sort, scan, argreduce, random), 11 new activations (16 total), full MLA and SlidingWindowAttention forward implementations, AWQ/GPTQ/K-quant quantization layers, prefix cache, chunked prefill, 4 full model architectures (LlamaModel, Qwen2Model, DeepSeekV3Model, MixtralModel), tree allreduce with auto selection, pipelined ring buffer, and topology-aware CLI backend selection. Current test count: 1,142+.
 
 ---
 
@@ -54,6 +54,7 @@ The rmlx project implementation roadmap. All phases through 9B-opt and serving s
 | P4-10 | ProgressEngine EP Dispatch | ProgressEngine wiring with consecutive-error threshold | P4-9 | Complete |
 | P4-11 | ICB Sparse Expert Dispatch | grouped_forward_icb(), IcbReplay per-sparsity cache, forward_sparse_icb() | P4-8 + P4-10 | Complete |
 | P4-12 | BFC Allocator | BfcAllocator with block splitting, coalescing, best-fit BTreeMap | P4-1+2 | Complete |
+| Phase 5 | Feature Breadth | 5 new core ops (slice/sort/scan/argreduce/random), 16 activations, full MLA+SlidingWindow forward, AWQ/GPTQ/K-quant, prefix cache, chunked prefill, 4 model architectures, tree allreduce, pipelined ring buffer, topology-aware CLI | P4 | Complete |
 | EP-7 | ICB Full Metal Indirect Dispatch | Wire SparseExpertPlan into ExpertGroup GEMM encoding via Metal ICB indirect dispatch; skip empty experts at GPU command level | EP-6 | Planned |
 
 ---
@@ -113,6 +114,7 @@ The rmlx project implementation roadmap. All phases through 9B-opt and serving s
 | P4-10: ProgressEngine EP Dispatch | feat/phase4 (merged) | 1,003 tests | Complete |
 | P4-11: ICB Sparse Expert Dispatch | feat/phase4 (merged) | 1,003 tests | Complete |
 | P4-12: BFC Allocator | feat/phase4 (merged) | 1,003 tests | Complete |
+| Phase 5: Feature Breadth | feat/phase5-feature-breadth (merged) | 1,142 tests | Complete |
 | EP-7: ICB Full Metal Indirect Dispatch | -- | -- | Planned |
 
 ---
@@ -656,7 +658,7 @@ Post-audit EP optimization phases were merged into main to remove the remaining 
 | EP-5 | `crates/rmlx-core/src/ops/fp8.rs`, `crates/rmlx-distributed/src/fp8_exchange.rs` | Per-token FP8 E4M3 wire format, fused `dequant_scatter_fp8e4m3`, `_into_cb` pipelining variants | Complete |
 | EP-6 | `crates/rmlx-metal/src/icb_sparse.rs`, `crates/rmlx-distributed/src/slab_ring.rs` | Sparse expert ICB launch cache + pre-registered RDMA slab ring with `GpuEvent` timeline sync | Complete |
 
-Current op module count: 27+. Current test count: 1,003+.
+Current op module count: 32+. Current test count: 1,142+.
 
 ---
 
@@ -694,6 +696,20 @@ Phase 4 delivers performance optimizations and allocator hardening across all cr
 | P4-10 | rmlx-distributed, rmlx-rdma | ProgressEngine wiring for EP dispatch with consecutive-error threshold | Complete |
 | P4-11 | rmlx-metal, rmlx-nn | ICB Sparse Expert Dispatch: `grouped_forward_icb()` for active experts only, `IcbReplay` per-sparsity-pattern cache, `forward_sparse_icb()` in moe.rs | Complete |
 | P4-12 | rmlx-alloc | BFC-style allocator (`BfcAllocator`) with block splitting, coalescing, and best-fit BTreeMap lookup | Complete |
+
+---
+
+## Phase 5: Feature Breadth -- Complete
+
+Phase 5 delivers significant feature breadth across all crates, closing gaps with MLX and adding production inference capabilities. Test count grew from 1,003 to 1,142.
+
+| Crate | Key Additions | Status |
+|-------|---------------|--------|
+| **rmlx-core** | 5 new op modules: `slice.rs` (multi-dim slice up to 8D), `sort.rs` (bitonic sort/argsort up to 2048 elements), `scan.rs` (parallel prefix scan: cumsum/cumprod), `argreduce.rs` (argmin/argmax with SIMD), `random.rs` (Philox 4x32-10 PRNG: uniform/normal) | Complete |
+| **rmlx-nn** | 11 new activations (16 total: +ReLU, LeakyReLU, ELU, SELU, Mish, QuickGELU, HardSwish, HardSigmoid, Softplus, Softsign, GLU); full MLA forward (DeepSeek-V3 9-step pipeline with latent KV compression); full SlidingWindowAttention forward (Mistral-style RoPE+SDPA+KV cache); AwqLinear/GptqLinear/KQuantType/KQuantConfig; K-quant GGUF mapping; radix-tree prefix cache with LRU eviction; chunked prefill scheduler; 4 full model architectures (LlamaModel, Qwen2Model, DeepSeekV3Model, MixtralModel) | Complete |
+| **rmlx-distributed** | Tree allreduce (binary tree, O(log N) rounds); `allreduce_auto()` (tree <1MB / ring >=1MB); `TopologyRing` (greedy nearest-unvisited from hop matrix, `RMLX_TOPOLOGY` env) | Complete |
+| **rmlx-rdma** | `PipelinedRingBuffer` (N-slot overlapping send/recv/reduce); `pipelined_ring_allreduce()` | Complete |
+| **rmlx-cli** | TB5/TB4 discovery via `system_profiler`; `Interconnect` enum; `detect_topology()`; `resolve_auto_backend()`; `--backend auto` default | Complete |
 
 ---
 

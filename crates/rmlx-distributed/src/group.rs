@@ -1168,6 +1168,338 @@ fn bf16_to_f32(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
 }
 
+// ─── Tree allreduce ───
+
+/// Default threshold in bytes for choosing tree vs ring allreduce.
+/// For data smaller than this, tree allreduce (lower latency) is preferred.
+/// For data at or above this, ring allreduce (higher bandwidth) is preferred.
+pub const TREE_ALLREDUCE_THRESHOLD: usize = 1024 * 1024; // 1 MB
+
+/// Tree allreduce on f32 data (byte slices).
+///
+/// For small tensors (<1MB default), tree allreduce has lower latency than ring
+/// because it completes in O(log N) steps instead of O(N).
+///
+/// Phase 1 (reduce): binary tree reduction to rank 0.
+///   - At each round, the active set is halved. Ranks in the upper half send
+///     their data to the corresponding rank in the lower half, which accumulates.
+///     Phase 2 (broadcast): rank 0 broadcasts the result back down the tree.
+///   - Reverses the tree: the lower-half rank sends to the upper-half rank.
+///
+/// Operates on raw byte slices interpreted as f32 arrays.
+///
+/// # Arguments
+/// * `data` - raw byte slice (f32 elements in native endian), modified in-place.
+/// * `ranks` - sorted rank list for this group.
+/// * `local_rank` - this node's rank.
+/// * `transport` - RDMA transport for send/recv.
+///
+/// # Returns
+/// The allreduced data as a new `Vec<u8>`.
+pub fn tree_allreduce(
+    data: &[u8],
+    ranks: &[u32],
+    local_rank: u32,
+    transport: &Arc<dyn RdmaTransport>,
+) -> Result<Vec<u8>, DistributedError> {
+    let n = ranks.len();
+    if n <= 1 {
+        return Ok(data.to_vec());
+    }
+
+    if data.len() % 4 != 0 {
+        return Err(DistributedError::Protocol(format!(
+            "tree_allreduce: data length ({}) must be a multiple of 4 (f32 element size)",
+            data.len()
+        )));
+    }
+
+    let my_idx = ranks.iter().position(|&r| r == local_rank).ok_or_else(|| {
+        DistributedError::Transport(format!(
+            "local_rank {local_rank} not found in ranks {:?}",
+            ranks
+        ))
+    })?;
+
+    let mut buf = data.to_vec();
+
+    // Phase 1: tree reduce to index 0
+    // stride doubles each round: 1, 2, 4, ...
+    let mut stride = 1;
+    while stride < n {
+        if my_idx % (2 * stride) == 0 {
+            // Receiver: receive from my_idx + stride (if it exists)
+            let sender_idx = my_idx + stride;
+            if sender_idx < n {
+                let received = transport.recv(ranks[sender_idx], buf.len())?;
+                add_f32_inplace(&mut buf, &received);
+            }
+        } else if my_idx % (2 * stride) == stride {
+            // Sender: send to my_idx - stride
+            let receiver_idx = my_idx - stride;
+            transport.send(&buf, ranks[receiver_idx])?;
+        }
+        // Ranks that are neither sender nor receiver at this level are idle.
+        stride *= 2;
+    }
+
+    // Phase 2: tree broadcast from index 0
+    // stride halves each round, starting from the largest power of 2 < n
+    let mut stride = 1;
+    while stride * 2 < n {
+        stride *= 2;
+    }
+    while stride >= 1 {
+        if my_idx % (2 * stride) == 0 {
+            // Sender: send to my_idx + stride (if it exists)
+            let receiver_idx = my_idx + stride;
+            if receiver_idx < n {
+                transport.send(&buf, ranks[receiver_idx])?;
+            }
+        } else if my_idx % (2 * stride) == stride {
+            // Receiver: receive from my_idx - stride
+            let sender_idx = my_idx - stride;
+            let received = transport.recv(ranks[sender_idx], buf.len())?;
+            buf.copy_from_slice(&received);
+        }
+        stride /= 2;
+    }
+
+    Ok(buf)
+}
+
+/// Tree allreduce with typed elements.
+///
+/// Works with any type that can be converted to/from f32 byte representation.
+/// The data is treated as raw bytes internally — the type parameter controls
+/// element alignment validation.
+pub fn tree_allreduce_typed<T: Copy + Default>(
+    data: &[u8],
+    ranks: &[u32],
+    local_rank: u32,
+    transport: &Arc<dyn RdmaTransport>,
+) -> Result<Vec<u8>, DistributedError> {
+    let elem_size = std::mem::size_of::<T>();
+    if elem_size == 0 || data.len() % elem_size != 0 {
+        return Err(DistributedError::Protocol(format!(
+            "tree_allreduce_typed: data length ({}) must be a multiple of element size ({})",
+            data.len(),
+            elem_size
+        )));
+    }
+    // Delegate to the f32 tree allreduce (reduction is always f32 sum)
+    tree_allreduce(data, ranks, local_rank, transport)
+}
+
+/// Auto-selecting allreduce: picks tree or ring based on data size.
+///
+/// - Data < `TREE_ALLREDUCE_THRESHOLD` (1MB): uses tree allreduce (lower latency).
+/// - Data >= `TREE_ALLREDUCE_THRESHOLD`: uses ring allreduce (higher bandwidth).
+///
+/// Returns `AllreduceAlgorithm` indicating which algorithm was used, along with
+/// the result.
+pub fn allreduce_auto(
+    data: &[u8],
+    ranks: &[u32],
+    local_rank: u32,
+    transport: &Arc<dyn RdmaTransport>,
+) -> Result<(Vec<u8>, AllreduceAlgorithm), DistributedError> {
+    allreduce_auto_with_threshold(data, ranks, local_rank, transport, TREE_ALLREDUCE_THRESHOLD)
+}
+
+/// Auto-selecting allreduce with a configurable threshold.
+pub fn allreduce_auto_with_threshold(
+    data: &[u8],
+    ranks: &[u32],
+    local_rank: u32,
+    transport: &Arc<dyn RdmaTransport>,
+    threshold: usize,
+) -> Result<(Vec<u8>, AllreduceAlgorithm), DistributedError> {
+    if data.len() < threshold {
+        let result = tree_allreduce(data, ranks, local_rank, transport)?;
+        Ok((result, AllreduceAlgorithm::Tree))
+    } else {
+        let result = ring_allreduce(data, ranks, local_rank, transport)?;
+        Ok((result, AllreduceAlgorithm::Ring))
+    }
+}
+
+/// Which allreduce algorithm was selected by `allreduce_auto`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllreduceAlgorithm {
+    /// Binary tree allreduce (lower latency, better for small data).
+    Tree,
+    /// Ring allreduce (higher bandwidth, better for large data).
+    Ring,
+}
+
+// ─── Topology-aware ring ordering ───
+
+/// Topology-aware ring that reorders ranks based on inter-node hop counts.
+///
+/// Constructs a ring where consecutive ranks are as "close" as possible
+/// in the network topology, minimizing total communication cost.
+#[derive(Debug, Clone)]
+pub struct TopologyRing {
+    /// Ordered list of ranks forming the ring.
+    pub order: Vec<u32>,
+}
+
+impl TopologyRing {
+    /// Construct a topology-aware ring from a hop-count matrix.
+    ///
+    /// Uses greedy nearest-unvisited ordering: starting from rank 0 (or the
+    /// first rank), repeatedly pick the closest unvisited rank.
+    ///
+    /// # Arguments
+    /// * `hops` - NxN matrix where `hops[i][j]` is the hop count from rank i to rank j.
+    ///   Must be square and have size matching the number of ranks.
+    /// * `ranks` - The ranks to order (indices into the hop matrix).
+    ///
+    /// # Returns
+    /// A `TopologyRing` with ranks ordered for minimal hop-distance ring.
+    pub fn from_hops(hops: &[Vec<u32>], ranks: &[u32]) -> Result<Self, DistributedError> {
+        let n = ranks.len();
+        if n == 0 {
+            return Ok(Self { order: Vec::new() });
+        }
+        if n == 1 {
+            return Ok(Self {
+                order: ranks.to_vec(),
+            });
+        }
+
+        // Validate hop matrix dimensions
+        for (i, row) in hops.iter().enumerate() {
+            if row.len() != hops.len() {
+                return Err(DistributedError::Config(format!(
+                    "TopologyRing: hop matrix row {i} has length {}, expected {}",
+                    row.len(),
+                    hops.len()
+                )));
+            }
+        }
+
+        // Validate all ranks are valid indices into the hop matrix
+        for &r in ranks {
+            if (r as usize) >= hops.len() {
+                return Err(DistributedError::Config(format!(
+                    "TopologyRing: rank {r} out of bounds for hop matrix of size {}",
+                    hops.len()
+                )));
+            }
+        }
+
+        // Greedy nearest-unvisited ordering
+        let mut visited = vec![false; n];
+        let mut order = Vec::with_capacity(n);
+
+        // Start from the first rank
+        visited[0] = true;
+        order.push(ranks[0]);
+
+        for _ in 1..n {
+            let current = *order.last().unwrap();
+            let current_idx = current as usize;
+
+            // Find nearest unvisited rank
+            let mut best_rank_pos = None;
+            let mut best_dist = u32::MAX;
+
+            for (pos, &rank) in ranks.iter().enumerate() {
+                if visited[pos] {
+                    continue;
+                }
+                let dist = hops[current_idx][rank as usize];
+                if dist < best_dist {
+                    best_dist = dist;
+                    best_rank_pos = Some(pos);
+                }
+            }
+
+            if let Some(pos) = best_rank_pos {
+                visited[pos] = true;
+                order.push(ranks[pos]);
+            }
+        }
+
+        Ok(Self { order })
+    }
+
+    /// Construct a topology-aware ring from the `RMLX_TOPOLOGY` environment variable.
+    ///
+    /// Expected format: JSON object with a "hops" key containing a 2D array:
+    /// ```json
+    /// {"hops": [[0,1,2,1], [1,0,1,2], [2,1,0,1], [1,2,1,0]]}
+    /// ```
+    ///
+    /// If the environment variable is not set, falls back to sequential ordering.
+    ///
+    /// # Arguments
+    /// * `ranks` - The ranks to order.
+    pub fn from_env(ranks: &[u32]) -> Result<Self, DistributedError> {
+        match std::env::var("RMLX_TOPOLOGY") {
+            Ok(json_str) => {
+                let parsed: serde_json::Value = serde_json::from_str(&json_str).map_err(|e| {
+                    DistributedError::Config(format!(
+                        "TopologyRing: failed to parse RMLX_TOPOLOGY JSON: {e}"
+                    ))
+                })?;
+
+                let hops_val = parsed.get("hops").ok_or_else(|| {
+                    DistributedError::Config(
+                        "TopologyRing: RMLX_TOPOLOGY JSON missing 'hops' key".to_string(),
+                    )
+                })?;
+
+                let hops_array = hops_val.as_array().ok_or_else(|| {
+                    DistributedError::Config(
+                        "TopologyRing: 'hops' value is not an array".to_string(),
+                    )
+                })?;
+
+                let hops: Vec<Vec<u32>> = hops_array
+                    .iter()
+                    .enumerate()
+                    .map(|(i, row)| {
+                        row.as_array()
+                            .ok_or_else(|| {
+                                DistributedError::Config(format!(
+                                    "TopologyRing: hops row {i} is not an array"
+                                ))
+                            })?
+                            .iter()
+                            .enumerate()
+                            .map(|(j, v)| {
+                                v.as_u64()
+                                    .ok_or_else(|| {
+                                        DistributedError::Config(format!(
+                                            "TopologyRing: hops[{i}][{j}] is not a number"
+                                        ))
+                                    })
+                                    .map(|n| n as u32)
+                            })
+                            .collect::<Result<Vec<u32>, _>>()
+                    })
+                    .collect::<Result<Vec<Vec<u32>>, _>>()?;
+
+                Self::from_hops(&hops, ranks)
+            }
+            Err(_) => {
+                // Fallback: sequential ordering
+                Ok(Self {
+                    order: ranks.to_vec(),
+                })
+            }
+        }
+    }
+
+    /// Return the ring ordering as a slice.
+    pub fn as_slice(&self) -> &[u32] {
+        &self.order
+    }
+}
+
 /// Convert f32 to bfloat16 bits (truncation).
 ///
 /// bf16 shares the same exponent range as f32, so overflow/subnormal concerns

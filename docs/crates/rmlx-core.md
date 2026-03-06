@@ -4,7 +4,7 @@
 
 `rmlx-core` is the Metal GPU compute engine, providing data types, N-dimensional arrays, a kernel registry, GPU compute kernels, automatic differentiation, LoRA fine-tuning, runtime metrics, structured logging, numerical stability monitoring, and graceful shutdown.
 
-> **Status:** DType (with FP8), Array, KernelRegistry, **27+ op modules** (including SDPA/FA2 with bf16 + backward, SiLU/SwiGLU, GELU, FP8 dequant/quant, Conv1d/Conv2d, tiled conv, GatherMM, LayerNorm, unary ops, concat, select, VJP GPU), GGUF format parser, AWQ/GPTQ dequant, VJP autodiff, LoRA, logging, metrics, PrecisionGuard, and ShutdownSignal are all implemented. Phase 0+1+2 audit remediation complete (items C1-C9). **Phase 3 additions:** FlashAttention-2 Metal kernel (`flash_attention.rs`) with tiled online softmax, f32 head_dim=128, causal mask, and naive SDPA fallback; all ops routed through centralized `commit_with_mode()` with sync/async `ExecMode` and `CommandBufferHandle` for async tracking. **Phase 4 addition:** Fused `rms_norm_residual_add` JIT Metal kernel combining input+residual add and RMSNorm in a single GPU dispatch.
+> **Status:** DType (with FP8), Array, KernelRegistry, **32+ op modules** (including SDPA/FA2 with bf16 + backward, SiLU/SwiGLU, GELU, FP8 dequant/quant, Conv1d/Conv2d, tiled conv, GatherMM, LayerNorm, unary ops, concat, select, VJP GPU), GGUF format parser, AWQ/GPTQ dequant, VJP autodiff, LoRA, logging, metrics, PrecisionGuard, and ShutdownSignal are all implemented. Phase 0+1+2 audit remediation complete (items C1-C9). **Phase 3 additions:** FlashAttention-2 Metal kernel (`flash_attention.rs`) with tiled online softmax, f32 head_dim=128, causal mask, and naive SDPA fallback; all ops routed through centralized `commit_with_mode()` with sync/async `ExecMode` and `CommandBufferHandle` for async tracking. **Phase 4 addition:** Fused `rms_norm_residual_add` JIT Metal kernel combining input+residual add and RMSNorm in a single GPU dispatch. **Phase 5 additions:** 5 new op modules -- `slice.rs` (multi-dimensional slice with per-dimension start/end/stride, Metal kernel up to 8D, f32/f16/bf16), `sort.rs` (bitonic sort on Metal: sort/argsort, ascending/descending, any axis, up to 2048 elements), `scan.rs` (parallel prefix scan via Hillis-Steele: cumsum/cumprod along any axis), `argreduce.rs` (argmin/argmax reduction along any axis, SIMD reductions, UInt32 output), `random.rs` (Philox 4x32-10 PRNG: uniform/normal with deterministic seeding).
 
 ---
 
@@ -44,6 +44,11 @@ rmlx-core/src/
 │   ├── select.rs       # Index select operation
 │   ├── conv_tiled.rs   # Tiled convolution for large inputs
 │   ├── flash_attention.rs # FlashAttention-2 Metal kernel (tiled online softmax, causal mask)
+│   ├── slice.rs        # Multi-dimensional slice (up to 8D, per-dim start/end/stride)
+│   ├── sort.rs         # Bitonic sort/argsort (ascending/descending, any axis, up to 2048)
+│   ├── scan.rs         # Parallel prefix scan (Hillis-Steele: cumsum/cumprod)
+│   ├── argreduce.rs    # Argmin/argmax reduction (any axis, SIMD, UInt32 output)
+│   ├── random.rs       # Philox 4x32-10 PRNG (uniform/normal, deterministic seeding)
 │   ├── vjp_gpu.rs      # GPU-accelerated VJP backward pass
 ├── formats/
 │   ├── mod.rs          # Format parser module
@@ -148,7 +153,7 @@ unsafe fn to_vec<T: HasDType + Clone>(&self) -> Vec<T>
 
 ## ops/ — Compute Kernels
 
-Registers 27 op modules with the `KernelRegistry`. Bulk registration via `register_all()`.
+Registers 32+ op modules with the `KernelRegistry`. Bulk registration via `register_all()`.
 
 ```rust
 pub fn register_all(registry: &KernelRegistry) -> Result<(), KernelError> {
@@ -198,6 +203,11 @@ pub fn register_all(registry: &KernelRegistry) -> Result<(), KernelError> {
 | `conv_tiled` | Tiled Conv | Tiled convolution for large inputs |
 | `flash_attention` | FlashAttention-2 Metal | Tiled online softmax Metal kernel, f32 head_dim=128, causal mask, falls back to naive SDPA for unsupported configs |
 | `rms_norm_residual_add` | Fused RMSNorm+Residual | Single-dispatch kernel combining input+residual add and RMSNorm (Phase 4) |
+| `slice` | Slice | Multi-dimensional slice with per-dimension start/end/stride; Metal kernel supports up to 8D; f32/f16/bf16 |
+| `sort` | Sort, Argsort | Bitonic sort on Metal: sort() and argsort(), ascending/descending, any axis, up to 2048 elements |
+| `scan` | Cumsum, Cumprod | Parallel prefix scan (Hillis-Steele algorithm) along any axis |
+| `argreduce` | Argmin, Argmax | Reduction along any axis returning index of min/max element; SIMD reductions; UInt32 output |
+| `random` | Uniform, Normal | Philox 4x32-10 PRNG: deterministic seeding, uniform [0,1) and normal N(0,1) distributions |
 | `vjp_gpu` | VJP GPU | GPU-accelerated backward pass for VJP |
 
 ### silu.rs — SiLU Activation + Fused SwiGLU
@@ -311,6 +321,89 @@ A dedicated FlashAttention-2 Metal kernel implementation with tiled online softm
 - **f32 head_dim=128**: optimized for the most common LLM head dimension
 - **Causal mask**: built-in causal masking with block-level skipping
 - **Fallback**: automatically falls back to naive SDPA for unsupported configurations (non-f32 dtypes, head_dim != 128)
+
+---
+
+### slice.rs -- Multi-Dimensional Slice (Phase 5)
+
+Multi-dimensional array slicing with per-dimension start/end/stride parameters.
+
+| Function | Description |
+|----------|-------------|
+| `slice(registry, input, starts, ends, strides, queue)` | Slice input along each dimension with start/end/stride |
+
+**Key characteristics:**
+- **Up to 8D**: Metal kernel supports slicing up to 8-dimensional arrays
+- **Per-dimension control**: each dimension can have independent start, end, and stride values
+- **Negative stride**: supports reverse slicing via negative strides
+- **Supported dtypes:** Float32, Float16, Bfloat16
+
+---
+
+### sort.rs -- Bitonic Sort (Phase 5)
+
+GPU-accelerated sorting using the bitonic sort algorithm on Metal.
+
+| Function | Description |
+|----------|-------------|
+| `sort(registry, input, axis, ascending, queue)` | Sort elements along the given axis |
+| `argsort(registry, input, axis, ascending, queue)` | Return indices that would sort the array along the given axis |
+
+**Key characteristics:**
+- **Bitonic sort**: O(n log^2 n) parallel sorting network, well-suited for GPU execution
+- **Any axis**: sorts along any dimension of the input array
+- **Ascending/descending**: configurable sort order
+- **Up to 2048 elements**: per-axis element count limit for the Metal kernel
+- **Supported dtypes:** Float32, Float16, Bfloat16
+
+---
+
+### scan.rs -- Parallel Prefix Scan (Phase 5)
+
+Parallel prefix scan (inclusive) using the Hillis-Steele algorithm on Metal.
+
+| Function | Description |
+|----------|-------------|
+| `cumsum(registry, input, axis, queue)` | Cumulative sum along the given axis |
+| `cumprod(registry, input, axis, queue)` | Cumulative product along the given axis |
+
+**Key characteristics:**
+- **Hillis-Steele algorithm**: O(n log n) work, O(log n) depth -- optimized for GPU parallelism
+- **Any axis**: scan along any dimension
+- **Supported dtypes:** Float32, Float16, Bfloat16
+
+---
+
+### argreduce.rs -- Argmin/Argmax (Phase 5)
+
+Index-returning reduction operations along any axis.
+
+| Function | Description |
+|----------|-------------|
+| `argmin(registry, input, axis, queue)` | Index of minimum element along axis |
+| `argmax(registry, input, axis, queue)` | Index of maximum element along axis |
+
+**Key characteristics:**
+- **SIMD reductions**: uses Metal SIMD group operations for efficient parallel reduction
+- **UInt32 output**: returns indices as UInt32 arrays
+- **Any axis**: reduces along any dimension
+- **Supported dtypes (input):** Float32, Float16, Bfloat16
+
+---
+
+### random.rs -- Philox PRNG (Phase 5)
+
+Deterministic pseudo-random number generation using the Philox 4x32-10 counter-based PRNG.
+
+| Function | Description |
+|----------|-------------|
+| `uniform(registry, device, shape, dtype, seed, queue)` | Uniform random values in [0, 1) |
+| `normal(registry, device, shape, dtype, seed, queue)` | Normal random values with mean=0, std=1 (Box-Muller transform) |
+
+**Key characteristics:**
+- **Philox 4x32-10**: high-quality PRNG with 10 rounds, widely used in ML frameworks
+- **Deterministic seeding**: same seed produces identical output across runs
+- **Supported dtypes:** Float32, Float16, Bfloat16
 
 ---
 

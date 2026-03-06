@@ -1609,3 +1609,241 @@ fn test_gemv_t_dtype_mismatch_vec() {
         "error should mention dtype mismatch: {msg}"
     );
 }
+
+// =========================================================================
+// PR 5.3: Slice ops
+// =========================================================================
+
+#[test]
+fn test_slice_1d() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    let input = Array::from_slice(dev, &[10.0f32, 20.0, 30.0, 40.0, 50.0], vec![5]);
+    let out = ops::slice::slice(&registry, &input, &[1], &[4], &[1], &queue).unwrap();
+    let vals: Vec<f32> = out.to_vec_checked();
+    assert_eq!(vals, vec![20.0, 30.0, 40.0]);
+}
+
+#[test]
+fn test_slice_2d_strided() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    let data: Vec<f32> = (0..20).map(|i| i as f32).collect();
+    let input = Array::from_slice(dev, &data, vec![4, 5]);
+    // Every other row, every other col from [0,0] to [4,5)
+    let out = ops::slice::slice(&registry, &input, &[0, 0], &[4, 5], &[2, 2], &queue).unwrap();
+    assert_eq!(out.shape(), &[2, 3]);
+    let vals: Vec<f32> = out.to_vec_checked();
+    // rows 0,2; cols 0,2,4 -> [0,2,4, 10,12,14]
+    assert_eq!(vals, vec![0.0, 2.0, 4.0, 10.0, 12.0, 14.0]);
+}
+
+// =========================================================================
+// PR 5.3: Sort ops
+// =========================================================================
+
+#[test]
+fn test_sort_ascending() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    let input = Array::from_slice(dev, &[3.0f32, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0, 6.0], vec![8]);
+    let out = ops::sort::sort(&registry, &input, 0, false, &queue).unwrap();
+    let vals: Vec<f32> = out.to_vec_checked();
+    assert_eq!(vals, vec![1.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 9.0]);
+}
+
+#[test]
+fn test_sort_descending() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    let input = Array::from_slice(dev, &[3.0f32, 1.0, 4.0, 1.0, 5.0], vec![5]);
+    let out = ops::sort::sort(&registry, &input, 0, true, &queue).unwrap();
+    let vals: Vec<f32> = out.to_vec_checked();
+    assert_eq!(vals, vec![5.0, 4.0, 3.0, 1.0, 1.0]);
+}
+
+#[test]
+fn test_argsort() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    let input = Array::from_slice(dev, &[30.0f32, 10.0, 20.0], vec![3]);
+    let out = ops::sort::argsort(&registry, &input, 0, false, &queue).unwrap();
+    let vals: Vec<u32> = out.to_vec_checked();
+    assert_eq!(vals, vec![1, 2, 0]);
+}
+
+// =========================================================================
+// PR 5.3: Scan ops (cumsum, cumprod)
+// =========================================================================
+
+#[test]
+fn test_cumsum_1d() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    let input = Array::from_slice(dev, &[1.0f32, 2.0, 3.0, 4.0, 5.0], vec![5]);
+    let out = ops::scan::cumsum(&registry, &input, 0, &queue).unwrap();
+    let vals: Vec<f32> = out.to_vec_checked();
+    assert_eq!(vals, vec![1.0, 3.0, 6.0, 10.0, 15.0]);
+}
+
+#[test]
+fn test_cumprod_1d() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    let input = Array::from_slice(dev, &[1.0f32, 2.0, 3.0, 4.0], vec![4]);
+    let out = ops::scan::cumprod(&registry, &input, 0, &queue).unwrap();
+    let vals: Vec<f32> = out.to_vec_checked();
+    assert_eq!(vals, vec![1.0, 2.0, 6.0, 24.0]);
+}
+
+#[test]
+fn test_cumsum_2d_axis1() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    let input = Array::from_slice(dev, &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]);
+    let out = ops::scan::cumsum(&registry, &input, 1, &queue).unwrap();
+    assert_eq!(out.shape(), &[2, 3]);
+    let vals: Vec<f32> = out.to_vec_checked();
+    assert_eq!(vals, vec![1.0, 3.0, 6.0, 4.0, 9.0, 15.0]);
+}
+
+// =========================================================================
+// PR 5.3: Argreduce ops (argmin, argmax)
+// =========================================================================
+
+#[test]
+fn test_argmax_1d() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    let input = Array::from_slice(dev, &[3.0f32, 1.0, 5.0, 2.0, 4.0], vec![5]);
+    let out = ops::argreduce::argmax(&registry, &input, 0, &queue).unwrap();
+    let vals: Vec<u32> = out.to_vec_checked();
+    assert_eq!(vals, vec![2]); // index of 5.0
+}
+
+#[test]
+fn test_argmin_1d() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    let input = Array::from_slice(dev, &[3.0f32, 1.0, 5.0, 2.0, 4.0], vec![5]);
+    let out = ops::argreduce::argmin(&registry, &input, 0, &queue).unwrap();
+    let vals: Vec<u32> = out.to_vec_checked();
+    assert_eq!(vals, vec![1]); // index of 1.0
+}
+
+#[test]
+fn test_argmax_2d_axis1() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    // [[1, 5, 3], [9, 2, 7]]
+    let input = Array::from_slice(dev, &[1.0f32, 5.0, 3.0, 9.0, 2.0, 7.0], vec![2, 3]);
+    let out = ops::argreduce::argmax(&registry, &input, 1, &queue).unwrap();
+    assert_eq!(out.shape(), &[2]);
+    let vals: Vec<u32> = out.to_vec_checked();
+    assert_eq!(vals, vec![1, 0]);
+}
+
+// =========================================================================
+// PR 5.3: Random ops (uniform, normal)
+// =========================================================================
+
+#[test]
+fn test_random_uniform_shape_and_range() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let out = ops::random::uniform(&registry, &[3, 4], 0.0, 1.0, 42, &queue).unwrap();
+    assert_eq!(out.shape(), &[3, 4]);
+    assert_eq!(out.dtype(), DType::Float32);
+    let vals: Vec<f32> = out.to_vec_checked();
+    for &v in &vals {
+        assert!((0.0..1.0).contains(&v), "value {v} out of [0.0, 1.0)");
+    }
+}
+
+#[test]
+fn test_random_uniform_custom_range() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let out = ops::random::uniform(&registry, &[1000], 2.0, 5.0, 42, &queue).unwrap();
+    let vals: Vec<f32> = out.to_vec_checked();
+    for &v in &vals {
+        assert!((2.0..5.0).contains(&v), "value {v} out of [2.0, 5.0)");
+    }
+}
+
+#[test]
+fn test_random_uniform_deterministic() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let a = ops::random::uniform(&registry, &[100], 0.0, 1.0, 123, &queue).unwrap();
+    let b = ops::random::uniform(&registry, &[100], 0.0, 1.0, 123, &queue).unwrap();
+    let va: Vec<f32> = a.to_vec_checked();
+    let vb: Vec<f32> = b.to_vec_checked();
+    assert_eq!(va, vb, "same seed should produce same output");
+}
+
+#[test]
+fn test_random_normal_statistics() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let n = 10000;
+    let target_mean = 3.0f32;
+    let target_std = 2.0f32;
+    let out = ops::random::normal(&registry, &[n], target_mean, target_std, 42, &queue).unwrap();
+    let vals: Vec<f32> = out.to_vec_checked();
+
+    let sum: f32 = vals.iter().sum();
+    let mean = sum / n as f32;
+    let var: f32 = vals.iter().map(|&v| (v - mean).powi(2)).sum::<f32>() / n as f32;
+    let std = var.sqrt();
+
+    assert!(
+        (mean - target_mean).abs() < 0.2,
+        "mean {mean} too far from {target_mean}"
+    );
+    assert!(
+        (std - target_std).abs() < 0.3,
+        "std {std} too far from {target_std}"
+    );
+}
