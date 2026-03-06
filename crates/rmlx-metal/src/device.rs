@@ -530,10 +530,7 @@ mod tests {
     #[test]
     fn test_detect_architecture_case_sensitivity() {
         // Only exact substrings should match.
-        assert!(matches!(
-            detect_architecture("m1"),
-            Architecture::Unknown
-        ));
+        assert!(matches!(detect_architecture("m1"), Architecture::Unknown));
         assert!(matches!(
             detect_architecture("apple m2"),
             Architecture::Unknown

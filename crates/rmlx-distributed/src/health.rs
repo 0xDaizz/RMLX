@@ -219,9 +219,8 @@ mod tests {
 
     #[test]
     fn test_heartbeat_sender_error_propagation() {
-        let sender = HeartbeatSender::new(test_config(), 0, |_rank| {
-            Err("network down".to_string())
-        });
+        let sender =
+            HeartbeatSender::new(test_config(), 0, |_rank| Err("network down".to_string()));
 
         let result = sender.send_heartbeat();
         assert!(result.is_err());

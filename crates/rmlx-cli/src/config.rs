@@ -366,10 +366,7 @@ mod tests {
 
     #[test]
     fn test_must_ok_failure() {
-        let result = must_ok(
-            std::process::Command::new("false").output(),
-            "should fail",
-        );
+        let result = must_ok(std::process::Command::new("false").output(), "should fail");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("should fail"));
     }
