@@ -34,3 +34,6 @@ __pycache__/
 
 # Internal planning docs
 PLAN.md
+fix-plan.md
+production-readiness-audit.md
+docs/roadmap/audit-*.md

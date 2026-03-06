@@ -588,6 +588,15 @@ pub fn binary_op_async(
     } else {
         a.dtype()
     };
+
+    // Handle empty tensors: return empty output without GPU dispatch.
+    if out_numel == 0 {
+        let out = Array::zeros(registry.device().raw(), &out_shape, out_dtype);
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let handle = super::CommandBufferHandle::new_from_flag(completed);
+        return Ok(super::LaunchResult::new(out, handle));
+    }
+
     let out = Array::zeros(registry.device().raw(), &out_shape, out_dtype);
 
     let command_buffer = queue.new_command_buffer();
@@ -651,12 +660,11 @@ pub fn binary_op_async(
         encoder.set_buffer(6, Some(&ndim_buf), 0);
     }
 
-    let grid_numel = if out_numel == 0 { 1 } else { out_numel };
-    let grid_size = MTLSize::new(grid_numel as u64, 1, 1);
+    let grid_size = MTLSize::new(out_numel as u64, 1, 1);
     let threadgroup_size = MTLSize::new(
         std::cmp::min(
             pipeline.max_total_threads_per_threadgroup(),
-            grid_numel as u64,
+            out_numel as u64,
         ),
         1,
         1,

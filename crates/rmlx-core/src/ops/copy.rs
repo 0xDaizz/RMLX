@@ -558,34 +558,40 @@ fn wpt(dtype: DType) -> u64 {
 }
 
 /// Vectorized contiguous kernel name.
-fn vectorized_kernel_name(dtype: DType) -> &'static str {
+fn vectorized_kernel_name(dtype: DType) -> Result<&'static str, KernelError> {
     match dtype {
-        DType::Float32 => "copy_v_f32",
-        DType::Float16 => "copy_v_f16",
-        DType::Bfloat16 => "copy_v_bf16",
-        DType::UInt32 => "copy_v_u32",
-        _ => unreachable!("vectorized copy not supported for {:?}", dtype),
+        DType::Float32 => Ok("copy_v_f32"),
+        DType::Float16 => Ok("copy_v_f16"),
+        DType::Bfloat16 => Ok("copy_v_bf16"),
+        DType::UInt32 => Ok("copy_v_u32"),
+        _ => Err(KernelError::NotFound(format!(
+            "vectorized copy not supported for {dtype}"
+        ))),
     }
 }
 
 /// Scalar broadcast kernel name.
-fn scalar_kernel_name(dtype: DType) -> &'static str {
+fn scalar_kernel_name(dtype: DType) -> Result<&'static str, KernelError> {
     match dtype {
-        DType::Float32 => "copy_s_f32",
-        DType::Float16 => "copy_s_f16",
-        DType::Bfloat16 => "copy_s_bf16",
-        DType::UInt32 => "copy_s_u32",
-        _ => unreachable!("scalar copy not supported for {:?}", dtype),
+        DType::Float32 => Ok("copy_s_f32"),
+        DType::Float16 => Ok("copy_s_f16"),
+        DType::Bfloat16 => Ok("copy_s_bf16"),
+        DType::UInt32 => Ok("copy_s_u32"),
+        _ => Err(KernelError::NotFound(format!(
+            "scalar copy not supported for {dtype}"
+        ))),
     }
 }
 
 /// Type suffix for strided kernel names.
-fn type_suffix(dtype: DType) -> &'static str {
+fn type_suffix(dtype: DType) -> Result<&'static str, KernelError> {
     match dtype {
-        DType::Float32 | DType::UInt32 => "f32",
-        DType::Float16 => "f16",
-        DType::Bfloat16 => "bf16",
-        _ => unreachable!("strided copy not supported for {:?}", dtype),
+        DType::Float32 | DType::UInt32 => Ok("f32"),
+        DType::Float16 => Ok("f16"),
+        DType::Bfloat16 => Ok("bf16"),
+        _ => Err(KernelError::NotFound(format!(
+            "strided copy not supported for {dtype}"
+        ))),
     }
 }
 
@@ -669,7 +675,7 @@ fn encode_strided(
 ) -> Result<metal::ComputePipelineState, KernelError> {
     let device = registry.device().raw();
     let ndim = src.ndim();
-    let suffix = type_suffix(src.dtype());
+    let suffix = type_suffix(src.dtype())?;
 
     let shape_data: Vec<u32> = src
         .shape()
@@ -788,7 +794,7 @@ pub fn copy_with_mode(
 
     let pipeline = if src.is_contiguous() {
         // Vectorized contiguous path
-        let kname = vectorized_kernel_name(src.dtype());
+        let kname = vectorized_kernel_name(src.dtype())?;
         let pipeline = registry.get_pipeline(kname, src.dtype())?;
         encoder.set_compute_pipeline_state(&pipeline);
         encoder.set_buffer(0, Some(src.metal_buffer()), src.offset() as u64);
@@ -841,7 +847,7 @@ pub fn copy_async(
     let encoder = command_buffer.new_compute_command_encoder();
 
     let pipeline = if src.is_contiguous() {
-        let kname = vectorized_kernel_name(src.dtype());
+        let kname = vectorized_kernel_name(src.dtype())?;
         let pipeline = registry.get_pipeline(kname, src.dtype())?;
         encoder.set_compute_pipeline_state(&pipeline);
         encoder.set_buffer(0, Some(src.metal_buffer()), src.offset() as u64);
@@ -987,7 +993,7 @@ pub fn fill_with_mode(
         return Ok(Array::zeros(registry.device().raw(), shape, dtype));
     }
 
-    let kname = scalar_kernel_name(dtype);
+    let kname = scalar_kernel_name(dtype)?;
     let pipeline = registry.get_pipeline(kname, dtype)?;
 
     let device = registry.device().raw();
@@ -1048,7 +1054,7 @@ pub fn copy_into_cb(
     let encoder = cb.new_compute_command_encoder();
 
     let pipeline = if src.is_contiguous() {
-        let kname = vectorized_kernel_name(src.dtype());
+        let kname = vectorized_kernel_name(src.dtype())?;
         let pipeline = registry.get_pipeline(kname, src.dtype())?;
         encoder.set_compute_pipeline_state(&pipeline);
         encoder.set_buffer(0, Some(src.metal_buffer()), src.offset() as u64);
@@ -1141,4 +1147,75 @@ mod tests {
     // GPU tests require Metal device — run on macOS with `cargo test -p rmlx-core`.
     // Non-contiguous copy tests verify that the strided kernel correctly
     // handles transposed and sliced array layouts.
+
+    use super::*;
+
+    #[test]
+    fn test_vectorized_kernel_name_unsupported_dtype_returns_error() {
+        let result = vectorized_kernel_name(DType::Float8E4M3);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        match &err {
+            KernelError::NotFound(msg) => {
+                assert!(
+                    msg.contains("vectorized copy not supported"),
+                    "unexpected message: {msg}"
+                );
+            }
+            _ => panic!("expected NotFound, got {err:?}"),
+        }
+    }
+
+    #[test]
+    fn test_scalar_kernel_name_unsupported_dtype_returns_error() {
+        let result = scalar_kernel_name(DType::Q4_0);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        match &err {
+            KernelError::NotFound(msg) => {
+                assert!(
+                    msg.contains("scalar copy not supported"),
+                    "unexpected message: {msg}"
+                );
+            }
+            _ => panic!("expected NotFound, got {err:?}"),
+        }
+    }
+
+    #[test]
+    fn test_type_suffix_unsupported_dtype_returns_error() {
+        let result = type_suffix(DType::Float8E5M2);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        match &err {
+            KernelError::NotFound(msg) => {
+                assert!(
+                    msg.contains("strided copy not supported"),
+                    "unexpected message: {msg}"
+                );
+            }
+            _ => panic!("expected NotFound, got {err:?}"),
+        }
+    }
+
+    #[test]
+    fn test_supported_dtypes_return_ok() {
+        // vectorized
+        assert!(vectorized_kernel_name(DType::Float32).is_ok());
+        assert!(vectorized_kernel_name(DType::Float16).is_ok());
+        assert!(vectorized_kernel_name(DType::Bfloat16).is_ok());
+        assert!(vectorized_kernel_name(DType::UInt32).is_ok());
+
+        // scalar
+        assert!(scalar_kernel_name(DType::Float32).is_ok());
+        assert!(scalar_kernel_name(DType::Float16).is_ok());
+        assert!(scalar_kernel_name(DType::Bfloat16).is_ok());
+        assert!(scalar_kernel_name(DType::UInt32).is_ok());
+
+        // type suffix
+        assert!(type_suffix(DType::Float32).is_ok());
+        assert!(type_suffix(DType::Float16).is_ok());
+        assert!(type_suffix(DType::Bfloat16).is_ok());
+        assert!(type_suffix(DType::UInt32).is_ok());
+    }
 }

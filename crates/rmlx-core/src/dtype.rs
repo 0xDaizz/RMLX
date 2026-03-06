@@ -2,6 +2,33 @@
 
 use std::fmt;
 
+/// Errors related to dtype operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DTypeError {
+    /// The number of elements is not a multiple of the quantized block size.
+    QuantBlockMisalign {
+        /// Actual number of elements provided.
+        numel: usize,
+        /// Required block size alignment.
+        block_size: usize,
+    },
+}
+
+impl fmt::Display for DTypeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DTypeError::QuantBlockMisalign { numel, block_size } => {
+                write!(
+                    f,
+                    "numel ({numel}) must be a multiple of block_size ({block_size}) for quantized dtype"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for DTypeError {}
+
 /// Supported data types for RMLX arrays.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DType {
@@ -78,19 +105,22 @@ impl DType {
     /// Compute the exact buffer size in bytes needed for `numel` elements.
     ///
     /// For non-quantized types: `numel * size_of()`.
-    /// For quantized types: `ceil(numel / block_size) * packed_block_size`.
+    /// For quantized types: `(numel / block_size) * packed_block_size`.
     ///
-    /// # Panics
-    /// Panics if `numel` is not a multiple of `block_size()` for quantized types.
-    pub fn numel_to_bytes(&self, numel: usize) -> usize {
+    /// # Errors
+    /// Returns [`DTypeError::QuantBlockMisalign`] if `numel` is not a multiple
+    /// of [`block_size()`](DType::block_size) for quantized types.
+    pub fn numel_to_bytes(&self, numel: usize) -> Result<usize, DTypeError> {
         if let (Some(bs), Some(pbs)) = (self.block_size(), self.packed_block_size()) {
-            debug_assert!(
-                numel % bs == 0,
-                "numel ({numel}) must be a multiple of block_size ({bs}) for {self}"
-            );
-            (numel / bs) * pbs
+            if numel % bs != 0 {
+                return Err(DTypeError::QuantBlockMisalign {
+                    numel,
+                    block_size: bs,
+                });
+            }
+            Ok((numel / bs) * pbs)
         } else {
-            numel * self.size_of()
+            Ok(numel * self.size_of())
         }
     }
 
@@ -192,31 +222,45 @@ mod tests {
 
     #[test]
     fn test_numel_to_bytes_float() {
-        assert_eq!(DType::Float32.numel_to_bytes(100), 400);
-        assert_eq!(DType::Float16.numel_to_bytes(100), 200);
-        assert_eq!(DType::Bfloat16.numel_to_bytes(100), 200);
+        assert_eq!(DType::Float32.numel_to_bytes(100).unwrap(), 400);
+        assert_eq!(DType::Float16.numel_to_bytes(100).unwrap(), 200);
+        assert_eq!(DType::Bfloat16.numel_to_bytes(100).unwrap(), 200);
     }
 
     #[test]
     fn test_numel_to_bytes_quantized() {
         // 32 elements = 1 block
-        assert_eq!(DType::Q4_0.numel_to_bytes(32), 18);
-        assert_eq!(DType::Q4_1.numel_to_bytes(32), 20);
-        assert_eq!(DType::Q8_0.numel_to_bytes(32), 34);
+        assert_eq!(DType::Q4_0.numel_to_bytes(32).unwrap(), 18);
+        assert_eq!(DType::Q4_1.numel_to_bytes(32).unwrap(), 20);
+        assert_eq!(DType::Q8_0.numel_to_bytes(32).unwrap(), 34);
 
         // 64 elements = 2 blocks
-        assert_eq!(DType::Q4_0.numel_to_bytes(64), 36);
-        assert_eq!(DType::Q4_1.numel_to_bytes(64), 40);
-        assert_eq!(DType::Q8_0.numel_to_bytes(64), 68);
+        assert_eq!(DType::Q4_0.numel_to_bytes(64).unwrap(), 36);
+        assert_eq!(DType::Q4_1.numel_to_bytes(64).unwrap(), 40);
+        assert_eq!(DType::Q8_0.numel_to_bytes(64).unwrap(), 68);
 
         // 1024 elements = 32 blocks
-        assert_eq!(DType::Q4_0.numel_to_bytes(1024), 576);
+        assert_eq!(DType::Q4_0.numel_to_bytes(1024).unwrap(), 576);
     }
 
     #[test]
-    #[should_panic(expected = "must be a multiple of block_size")]
-    fn test_numel_to_bytes_non_aligned_panics() {
-        DType::Q4_0.numel_to_bytes(33);
+    fn test_numel_to_bytes_non_aligned_returns_error() {
+        let err = DType::Q4_0.numel_to_bytes(33).unwrap_err();
+        assert_eq!(
+            err,
+            DTypeError::QuantBlockMisalign {
+                numel: 33,
+                block_size: 32,
+            }
+        );
+
+        // Also test other quantized types
+        assert!(DType::Q4_1.numel_to_bytes(31).is_err());
+        assert!(DType::Q8_0.numel_to_bytes(1).is_err());
+
+        // Non-quantized types always succeed
+        assert!(DType::Float32.numel_to_bytes(33).is_ok());
+        assert!(DType::Float16.numel_to_bytes(1).is_ok());
     }
 
     #[test]
@@ -227,7 +271,7 @@ mod tests {
         assert!(!DType::UInt32.is_quantized());
         assert_eq!(DType::UInt32.packed_block_size(), None);
         assert_eq!(DType::UInt32.block_size(), None);
-        assert_eq!(DType::UInt32.numel_to_bytes(100), 400);
+        assert_eq!(DType::UInt32.numel_to_bytes(100).unwrap(), 400);
     }
 
     #[test]
@@ -239,7 +283,7 @@ mod tests {
         assert!(!DType::Float8E4M3.is_quantized());
         assert_eq!(DType::Float8E4M3.packed_block_size(), None);
         assert_eq!(DType::Float8E4M3.block_size(), None);
-        assert_eq!(DType::Float8E4M3.numel_to_bytes(100), 100);
+        assert_eq!(DType::Float8E4M3.numel_to_bytes(100).unwrap(), 100);
 
         // Float8E5M2
         assert_eq!(DType::Float8E5M2.size_of(), 1);
@@ -248,7 +292,7 @@ mod tests {
         assert!(!DType::Float8E5M2.is_quantized());
         assert_eq!(DType::Float8E5M2.packed_block_size(), None);
         assert_eq!(DType::Float8E5M2.block_size(), None);
-        assert_eq!(DType::Float8E5M2.numel_to_bytes(100), 100);
+        assert_eq!(DType::Float8E5M2.numel_to_bytes(100).unwrap(), 100);
     }
 
     #[test]

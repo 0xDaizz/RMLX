@@ -40,6 +40,7 @@ pub enum AllocError {
     OutOfMemory { requested: usize, available: usize },
     PoolExhausted,
     MutexPoisoned,
+    ZeroSize,
 }
 
 impl fmt::Display for AllocError {
@@ -58,6 +59,7 @@ impl fmt::Display for AllocError {
             }
             Self::PoolExhausted => write!(f, "buffer pool exhausted"),
             Self::MutexPoisoned => write!(f, "allocator mutex poisoned"),
+            Self::ZeroSize => write!(f, "zero-size allocation is not allowed"),
         }
     }
 }

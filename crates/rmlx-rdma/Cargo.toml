@@ -8,6 +8,7 @@ license.workspace = true
 [features]
 default = []
 rdma = []
+test-utils = []
 
 [dependencies]
 rmlx-alloc = { path = "../rmlx-alloc" }
