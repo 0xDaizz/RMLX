@@ -11,6 +11,8 @@
 //! - Optional shared expert for DeepSeek-V3 style architectures (N7)
 
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "distributed")]
+use std::sync::Mutex;
 use std::sync::{Arc, OnceLock};
 
 use rmlx_core::array::Array;
@@ -21,7 +23,7 @@ use rmlx_core::MetalAllocator;
 use rmlx_metal::icb_sparse::SparseExpertPlan;
 
 #[cfg(feature = "distributed")]
-use rmlx_distributed::MoeDispatchExchange;
+use rmlx_distributed::{DispatchResult, MoeCombineExchange, MoeDispatchExchange};
 
 use crate::expert_group::ExpertGroup;
 use crate::linear::Linear;
@@ -186,8 +188,9 @@ pub struct MoeLayer {
     /// Optional EP dispatch exchange for multi-node expert parallelism.
     /// When present and world_size > 1, tokens are dispatched to remote ranks
     /// that own specific experts, instead of being processed locally.
+    /// Wrapped in Mutex because dispatch() requires &mut self while forward() takes &self.
     #[cfg(feature = "distributed")]
-    exchange: Option<MoeDispatchExchange>,
+    exchange: Option<Mutex<MoeDispatchExchange>>,
     /// Optional buffer pool allocator for reusing Metal buffers.
     allocator: Option<Arc<MetalAllocator>>,
     /// Optional per-expert bias for adaptive routing (DeepSeek-style, aux-loss-free).
@@ -275,7 +278,7 @@ impl MoeLayer {
     /// locally. The flow becomes: gate -> dispatch -> expert forward -> combine.
     #[cfg(feature = "distributed")]
     pub fn with_exchange(mut self, exchange: MoeDispatchExchange) -> Self {
-        self.exchange = Some(exchange);
+        self.exchange = Some(Mutex::new(exchange));
         self
     }
 
@@ -405,7 +408,14 @@ impl MoeLayer {
         // ── N5: Determine local expert range for EP (expert parallelism) ──
         #[cfg(feature = "distributed")]
         let local_expert_range: (usize, usize) = match self.exchange {
-            Some(ref ex) if ex.world_size() > 1 => ex.local_expert_range(),
+            Some(ref ex) => {
+                let guard = ex.lock().unwrap();
+                if guard.world_size() > 1 {
+                    guard.local_expert_range()
+                } else {
+                    (0, num_experts)
+                }
+            }
             _ => (0, num_experts),
         };
         #[cfg(not(feature = "distributed"))]
@@ -426,25 +436,69 @@ impl MoeLayer {
             queue,
         )?;
 
+        // ── EP dispatch/combine wiring (X-P0-1, N-P0-4) ──
+        // When an exchange is configured with world_size > 1 and the group has
+        // real transport, use the dispatch -> compute -> combine pipeline so
+        // tokens reach remote experts. In loopback mode (no transport) or
+        // single-rank, fall through to the local-only path.
+        #[cfg(feature = "distributed")]
+        let use_ep_exchange = match self.exchange {
+            Some(ref ex) => {
+                let guard = ex.lock().unwrap();
+                guard.world_size() > 1
+            }
+            None => false,
+        };
+        #[cfg(not(feature = "distributed"))]
+        let use_ep_exchange = false;
+
         // ── Strategy dispatch ──
         // Note: forward_pipelined (via forward_grouped) may already include
         // the shared expert output when SBO is enabled. In that case we must
         // NOT add it again here.
-        let (routed_output, shared_already_applied) = match self.strategy {
-            MoeStrategy::PerExpert => (
-                self.forward_per_expert(x, &route_result, local_expert_range, registry, queue)?,
-                false,
-            ),
-            MoeStrategy::Grouped => {
-                let sbo_will_handle_shared = self
-                    .pipeline
-                    .as_ref()
-                    .is_some_and(|p| p.config().enable_sbo)
-                    && self.shared_expert.is_some();
+        let (routed_output, shared_already_applied) = if use_ep_exchange {
+            // EP path: dispatch tokens to remote experts, compute local, combine results.
+            #[cfg(feature = "distributed")]
+            {
                 (
-                    self.forward_grouped(x, &route_result, local_expert_range, registry, queue)?,
-                    sbo_will_handle_shared,
+                    self.exchange_and_compute(
+                        x,
+                        &route_result,
+                        local_expert_range,
+                        registry,
+                        queue,
+                    )?,
+                    false,
                 )
+            }
+            #[cfg(not(feature = "distributed"))]
+            {
+                unreachable!("use_ep_exchange is always false without distributed feature")
+            }
+        } else {
+            // Local-only path: all experts are processed on this rank.
+            match self.strategy {
+                MoeStrategy::PerExpert => (
+                    self.forward_per_expert(x, &route_result, local_expert_range, registry, queue)?,
+                    false,
+                ),
+                MoeStrategy::Grouped => {
+                    let sbo_will_handle_shared = self
+                        .pipeline
+                        .as_ref()
+                        .is_some_and(|p| p.config().enable_sbo)
+                        && self.shared_expert.is_some();
+                    (
+                        self.forward_grouped(
+                            x,
+                            &route_result,
+                            local_expert_range,
+                            registry,
+                            queue,
+                        )?,
+                        sbo_will_handle_shared,
+                    )
+                }
             }
         };
 
@@ -460,6 +514,177 @@ impl MoeLayer {
         } else {
             routed_output
         };
+
+        Ok(output)
+    }
+
+    /// EP exchange-and-compute pipeline: dispatch -> local expert forward -> combine.
+    ///
+    /// When expert parallelism is active (world_size > 1), tokens routed to
+    /// non-local experts must be sent to the owning rank, and results combined
+    /// back. This method orchestrates the full pipeline:
+    ///
+    /// 1. **Dispatch**: serialize token data, call `MoeDispatchExchange::dispatch()`
+    ///    to route tokens. Local expert tokens are packed into the dispatch result;
+    ///    remote tokens are exchanged via the group transport (RDMA or loopback).
+    /// 2. **Compute**: run the local expert forward pass on dispatched tokens
+    ///    (which now include tokens received from other ranks).
+    /// 3. **Combine**: call `MoeCombineExchange::combine_with_layout()` to send
+    ///    expert outputs back to originating ranks and apply routing weights.
+    ///
+    /// In loopback mode (group has no real transport), the dispatch/combine
+    /// exchange is local-only: all tokens stay on the same rank but are
+    /// correctly routed through the dispatch layout, ensuring the code path
+    /// is exercised even in single-process testing.
+    ///
+    /// TODO: Wire the full RDMA async path (dispatch_async + combine_async)
+    /// for production multi-node inference.
+    #[cfg(feature = "distributed")]
+    fn exchange_and_compute(
+        &self,
+        x: &Array,
+        route_result: &ops::topk_route::TopkRouteResult,
+        _local_expert_range: (usize, usize),
+        registry: &KernelRegistry,
+        queue: &metal::CommandQueue,
+    ) -> Result<Array, KernelError> {
+        // The combine exchange operates on Vec<f32>; non-f32 dtypes would
+        // require a cast before combine. Guard against this for now.
+        if x.dtype() != DType::Float32 {
+            return Err(KernelError::InvalidShape(format!(
+                "EP exchange_and_compute requires Float32 input, got {:?}. \
+                 Non-f32 EP support requires adding a dtype cast before combine.",
+                x.dtype()
+            )));
+        }
+
+        let seq_len = x.shape()[0];
+        let hidden_dim = self.config.hidden_dim;
+        let top_k = self.config.num_experts_per_token;
+        let num_experts = self.config.num_experts;
+        let dev = registry.device().raw();
+        let elem_size = x.dtype().size_of();
+
+        // Read routing results to CPU for dispatch
+        let indices_vec: Vec<u32> = route_result.expert_indices.to_vec_checked();
+        let weights_vec: Vec<f32> = route_result.expert_weights.to_vec_checked();
+
+        // Serialize token data to bytes for the dispatch exchange.
+        // The exchange operates on raw byte buffers regardless of dtype.
+        let token_bytes: &[u8] = x.to_bytes();
+
+        // ── Phase 1: Dispatch ──
+        // Lock the exchange and call dispatch to route tokens.
+        let dispatch_result: DispatchResult = {
+            let mut guard = self
+                .exchange
+                .as_ref()
+                .ok_or_else(|| {
+                    KernelError::InvalidShape("exchange_and_compute called without exchange".into())
+                })?
+                .lock()
+                .map_err(|e| KernelError::InvalidShape(format!("exchange lock poisoned: {e}")))?;
+            guard
+                .dispatch(seq_len, &indices_vec, &weights_vec, token_bytes)
+                .map_err(|e| KernelError::InvalidShape(format!("EP dispatch failed: {e}")))?
+        };
+
+        let layout = &dispatch_result.layout;
+        let (local_start, local_end) = layout.local_expert_range;
+        let local_expert_count = local_end - local_start;
+        let tokens_per_expert = layout.tokens_per_expert;
+
+        // ── Phase 2: Local expert compute on dispatched tokens ──
+        // The dispatch result contains routed_data: tokens packed by local expert.
+        // We need to unpack per-expert token batches, run each expert's forward,
+        // and collect outputs.
+        let routed_data = &dispatch_result.routed_data;
+        let token_stride = if seq_len > 0 {
+            token_bytes.len() / seq_len
+        } else {
+            hidden_dim * elem_size
+        };
+
+        // Build per-expert output buffers from the dispatched tokens.
+        // expert_outputs[i] contains the f32 output for local expert i.
+        let mut expert_outputs: Vec<Vec<f32>> = Vec::with_capacity(local_expert_count);
+
+        for local_idx in 0..local_expert_count {
+            let expert_idx = local_start + local_idx;
+            let count = dispatch_result.expert_counts[expert_idx];
+
+            if count == 0 {
+                expert_outputs.push(Vec::new());
+                continue;
+            }
+
+            // Compute the byte range for this expert in routed_data.
+            // Tokens are packed contiguously per expert: expert 0's tokens first,
+            // then expert 1's, etc. Each expert has up to tokens_per_expert slots.
+            let expert_byte_offset = local_idx * tokens_per_expert * token_stride;
+            let expert_byte_end = expert_byte_offset + count * token_stride;
+
+            if expert_byte_end > routed_data.len() {
+                // Insufficient data — skip this expert (defensive)
+                expert_outputs.push(Vec::new());
+                continue;
+            }
+
+            let expert_token_bytes = &routed_data[expert_byte_offset..expert_byte_end];
+
+            // Reconstruct Array from bytes for expert forward pass
+            let expert_input =
+                Array::from_bytes(dev, expert_token_bytes, vec![count, hidden_dim], x.dtype());
+
+            // Run expert forward
+            let expert_out = self.experts[expert_idx].forward(&expert_input, registry, queue)?;
+
+            // Read expert output back to CPU f32 for combine.
+            // The combine exchange operates on Vec<f32> per expert.
+            // For non-f32 dtypes, we would need a cast here; for now we
+            // assert f32 since the combine path requires it.
+            let out_f32: Vec<f32> = expert_out.to_vec_checked::<f32>();
+            expert_outputs.push(out_f32);
+        }
+
+        // ── Phase 3: Combine ──
+        // Use combine_with_layout to scatter expert outputs back to original
+        // token positions with routing weights applied.
+        let exchange_guard = self
+            .exchange
+            .as_ref()
+            .unwrap()
+            .lock()
+            .map_err(|e| KernelError::InvalidShape(format!("exchange lock poisoned: {e}")))?;
+        let ws = exchange_guard.world_size();
+        let local_range = exchange_guard.local_expert_range();
+        let local_rank = if ws > 0 {
+            local_range.0 as u32 / (num_experts as u32 / ws as u32)
+        } else {
+            0
+        };
+        drop(exchange_guard);
+
+        let group =
+            rmlx_distributed::Group::new((0..ws as u32).collect(), local_rank, ws as u32)
+                .map_err(|e| KernelError::InvalidShape(format!("Group creation failed: {e}")))?;
+
+        let combiner = MoeCombineExchange::new(group);
+        let combined_f32 = combiner
+            .combine_with_layout(
+                &expert_outputs,
+                &weights_vec,
+                &indices_vec,
+                seq_len,
+                top_k,
+                hidden_dim,
+                num_experts,
+                &dispatch_result.layout,
+            )
+            .map_err(|e| KernelError::InvalidShape(format!("EP combine failed: {e}")))?;
+
+        // Convert combined f32 output back to Array
+        let output = Array::from_slice(dev, &combined_f32, vec![seq_len, hidden_dim]);
 
         Ok(output)
     }

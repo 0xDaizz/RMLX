@@ -39,6 +39,7 @@ pub use linear::{Linear, LinearConfig};
 pub use mla::{Mla, MlaConfig, MlaKvCache};
 pub use moe::{load_balance_loss, Expert, MoeConfig, MoeForwardMetrics, MoeLayer, MoeStrategy};
 pub use moe_pipeline::{MoePipeline, MoePipelineConfig};
+pub use parallel::{ColumnParallelLinear, RowParallelLinear, TpError};
 pub use quantized_linear::{QuantBits, QuantizedLinear, QuantizedLinearConfig};
 pub use rms_norm::{RMSNorm, RMSNormConfig};
 pub use rope::{RotaryPositionEmbedding, RotaryPositionEmbeddingConfig};

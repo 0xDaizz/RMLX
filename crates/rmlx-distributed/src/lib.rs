@@ -9,6 +9,7 @@ pub mod group;
 pub mod init;
 pub mod metrics;
 pub mod moe_exchange;
+pub mod moe_kernels;
 pub mod moe_policy;
 pub mod perf_counters;
 pub mod pipeline;
@@ -20,15 +21,16 @@ pub mod warmup;
 
 // ── Re-exports of core types ──
 pub use credit_manager::CreditManager;
-pub use ep_runtime::EpRuntimeContext;
+pub use ep_runtime::{AcquiredBuffer, EpRuntimeContext};
 pub use fp8_exchange::Fp8DispatchPayload;
 pub use group::{DistributedError, Group, RdmaTransport, ReduceDtype, ReduceOp};
 pub use init::{init, BackendHint, DistributedContext, InitConfig};
 pub use metrics::{MoeMetrics as MoeMetricsAtomic, MoeMetricsSnapshot};
 pub use moe_exchange::{
-    AsyncCombineHandle, AsyncDispatchResult, DispatchLayout, DispatchResult, MoeCombineExchange,
-    MoeDispatchConfig, MoeDispatchExchange, MoeDtype, WireProtocol,
+    AsyncCombineHandle, AsyncDispatchResult, DispatchLayout, DispatchResult, ExchangeBuffers,
+    MoeCombineExchange, MoeDispatchConfig, MoeDispatchExchange, MoeDtype, WireProtocol,
 };
+pub use moe_kernels::init_kernels as init_moe_kernels;
 pub use moe_policy::{MoeBackend, MoePolicy, ThresholdCalibration};
 pub use perf_counters::{global_counters, PerfCounters, PerfSnapshot};
 pub use pipeline::{

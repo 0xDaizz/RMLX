@@ -20,6 +20,7 @@ use rmlx_distributed::group::{DistributedError, Group};
 ///
 /// Weight shape per rank: `[out_features / world_size, in_features]`
 /// Forward: local matmul → allgather output across ranks.
+#[derive(Debug)]
 pub struct ColumnParallelLinear {
     /// Local weight shard: [out_features / world_size, in_features]
     weight: Array,
@@ -42,6 +43,7 @@ pub struct ColumnParallelLinear {
 ///
 /// Weight shape per rank: `[out_features, in_features / world_size]`
 /// Forward: local matmul on sharded input → allreduce sum.
+#[derive(Debug)]
 pub struct RowParallelLinear {
     /// Local weight shard: [out_features, in_features / world_size]
     weight: Array,
@@ -162,11 +164,30 @@ fn add_bias_f32(data: &mut [u8], bias: &[u8], rows: usize, cols: usize) {
     }
 }
 
+/// Error type for tensor-parallel layer construction.
+#[derive(Debug, Clone)]
+pub struct TpError(pub String);
+
+impl std::fmt::Display for TpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TpError: {}", self.0)
+    }
+}
+
+impl std::error::Error for TpError {}
+
 impl ColumnParallelLinear {
     /// Create a new column-parallel linear layer from a pre-sharded weight.
     ///
     /// `weight` shape: `[out_features / world_size, in_features]`
     /// `bias` shape (if present): `[out_features / world_size]`
+    ///
+    /// Returns an error if:
+    /// - `world_size` is 0
+    /// - `full_out_features` is not divisible by `world_size`
+    /// - `weight.shape()[0]` does not equal `full_out_features / world_size`
+    /// - `weight.shape()[1]` does not equal `full_in_features`
+    /// - `weight` is not 2D
     pub fn new(
         weight: Array,
         bias: Option<Array>,
@@ -174,15 +195,45 @@ impl ColumnParallelLinear {
         full_in_features: usize,
         rank: u32,
         world_size: u32,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, TpError> {
+        if world_size == 0 {
+            return Err(TpError("world_size must be > 0".into()));
+        }
+        if full_out_features % (world_size as usize) != 0 {
+            return Err(TpError(format!(
+                "full_out_features ({}) must be divisible by world_size ({})",
+                full_out_features, world_size
+            )));
+        }
+        if weight.ndim() != 2 {
+            return Err(TpError(format!(
+                "weight must be 2D, got {}D",
+                weight.ndim()
+            )));
+        }
+        let expected_rows = full_out_features / (world_size as usize);
+        if weight.shape()[0] != expected_rows {
+            return Err(TpError(format!(
+                "weight.shape()[0] ({}) must equal out_features/world_size ({})",
+                weight.shape()[0],
+                expected_rows
+            )));
+        }
+        if weight.shape()[1] != full_in_features {
+            return Err(TpError(format!(
+                "weight.shape()[1] ({}) must equal in_features ({})",
+                weight.shape()[1],
+                full_in_features
+            )));
+        }
+        Ok(Self {
             weight,
             bias,
             out_features: full_out_features,
             in_features: full_in_features,
             rank,
             world_size,
-        }
+        })
     }
 
     /// Reference to the local weight shard.
@@ -323,6 +374,13 @@ impl RowParallelLinear {
     ///
     /// `weight` shape: `[out_features, in_features / world_size]`
     /// `bias` shape (if present): `[out_features]`
+    ///
+    /// Returns an error if:
+    /// - `world_size` is 0
+    /// - `full_in_features` is not divisible by `world_size`
+    /// - `weight.shape()[0]` does not equal `full_out_features`
+    /// - `weight.shape()[1]` does not equal `full_in_features / world_size`
+    /// - `weight` is not 2D
     pub fn new(
         weight: Array,
         bias: Option<Array>,
@@ -330,15 +388,45 @@ impl RowParallelLinear {
         full_in_features: usize,
         rank: u32,
         world_size: u32,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, TpError> {
+        if world_size == 0 {
+            return Err(TpError("world_size must be > 0".into()));
+        }
+        if full_in_features % (world_size as usize) != 0 {
+            return Err(TpError(format!(
+                "full_in_features ({}) must be divisible by world_size ({})",
+                full_in_features, world_size
+            )));
+        }
+        if weight.ndim() != 2 {
+            return Err(TpError(format!(
+                "weight must be 2D, got {}D",
+                weight.ndim()
+            )));
+        }
+        if weight.shape()[0] != full_out_features {
+            return Err(TpError(format!(
+                "weight.shape()[0] ({}) must equal out_features ({})",
+                weight.shape()[0],
+                full_out_features
+            )));
+        }
+        let expected_cols = full_in_features / (world_size as usize);
+        if weight.shape()[1] != expected_cols {
+            return Err(TpError(format!(
+                "weight.shape()[1] ({}) must equal in_features/world_size ({})",
+                weight.shape()[1],
+                expected_cols
+            )));
+        }
+        Ok(Self {
             weight,
             bias,
             out_features: full_out_features,
             in_features: full_in_features,
             rank,
             world_size,
-        }
+        })
     }
 
     /// Reference to the local weight shard.
@@ -540,7 +628,7 @@ mod tests {
         let data: Vec<f32> = vec![0.0; 16];
         let weight = Array::from_slice(&device, &data, vec![4, 4]);
 
-        let layer = ColumnParallelLinear::new(weight, None, 8, 4, 0, 2);
+        let layer = ColumnParallelLinear::new(weight, None, 8, 4, 0, 2).unwrap();
         assert_eq!(layer.rank(), 0);
         assert_eq!(layer.world_size(), 2);
         assert_eq!(layer.weight().shape(), &[4, 4]);
@@ -555,7 +643,7 @@ mod tests {
         let data: Vec<f32> = vec![0.0; 16];
         let weight = Array::from_slice(&device, &data, vec![4, 4]);
 
-        let layer = RowParallelLinear::new(weight, None, 4, 8, 1, 2);
+        let layer = RowParallelLinear::new(weight, None, 4, 8, 1, 2).unwrap();
         assert_eq!(layer.rank(), 1);
         assert_eq!(layer.world_size(), 2);
         assert_eq!(layer.weight().shape(), &[4, 4]);
@@ -642,7 +730,7 @@ mod tests {
         let weight = Array::from_slice(&device, &weight_data, vec![2, 3]);
 
         // Single rank: world_size=1, out_features=2, in_features=3
-        let layer = ColumnParallelLinear::new(weight, None, 2, 3, 0, 1);
+        let layer = ColumnParallelLinear::new(weight, None, 2, 3, 0, 1).unwrap();
 
         // input: [2, 3] = [[1,2,3],[4,5,6]]
         let input_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
@@ -679,7 +767,7 @@ mod tests {
         let bias_data: Vec<f32> = vec![10.0, 20.0];
         let bias = Array::from_slice(&device, &bias_data, vec![2]);
 
-        let layer = ColumnParallelLinear::new(weight, Some(bias), 2, 2, 0, 1);
+        let layer = ColumnParallelLinear::new(weight, Some(bias), 2, 2, 0, 1).unwrap();
 
         // input: [1, 2] = [[3, 7]]
         let input_data: Vec<f32> = vec![3.0, 7.0];
@@ -712,7 +800,7 @@ mod tests {
         let weight = Array::from_slice(&device, &weight_data, vec![2, 3]);
 
         // Single rank: world_size=1
-        let layer = RowParallelLinear::new(weight, None, 2, 3, 0, 1);
+        let layer = RowParallelLinear::new(weight, None, 2, 3, 0, 1).unwrap();
 
         // input: [1, 3] = [[1, 1, 1]]
         let input_data: Vec<f32> = vec![1.0, 1.0, 1.0];
@@ -748,7 +836,7 @@ mod tests {
         let bias_data: Vec<f32> = vec![100.0, 200.0];
         let bias = Array::from_slice(&device, &bias_data, vec![2]);
 
-        let layer = RowParallelLinear::new(weight, Some(bias), 2, 2, 0, 1);
+        let layer = RowParallelLinear::new(weight, Some(bias), 2, 2, 0, 1).unwrap();
 
         // input: [1, 2] = [[5, 3]]
         let input_data: Vec<f32> = vec![5.0, 3.0];
@@ -790,7 +878,7 @@ mod tests {
 
         // Rank 0: shard rows [0..2] = [[1,0],[0,1]]
         let shard_0 = ColumnParallelLinear::shard_weight(&full_weight, 0, 2);
-        let layer_0 = ColumnParallelLinear::new(shard_0, None, 2, 2, 0, 1);
+        let layer_0 = ColumnParallelLinear::new(shard_0, None, 2, 2, 0, 1).unwrap();
         let out_0 = layer_0
             .forward_with_group(&input, &group, &registry, &queue)
             .unwrap();
@@ -799,7 +887,7 @@ mod tests {
 
         // Rank 1: shard rows [2..4] = [[2,0],[0,2]]
         let shard_1 = ColumnParallelLinear::shard_weight(&full_weight, 1, 2);
-        let layer_1 = ColumnParallelLinear::new(shard_1, None, 2, 2, 0, 1);
+        let layer_1 = ColumnParallelLinear::new(shard_1, None, 2, 2, 0, 1).unwrap();
         let out_1 = layer_1
             .forward_with_group(&input, &group, &registry, &queue)
             .unwrap();
@@ -846,7 +934,7 @@ mod tests {
         assert_eq!(shard_0_vals, vec![1.0, 2.0, 5.0, 6.0]);
 
         let input_0 = Array::from_slice(&device, &[1.0f32, 2.0], vec![1, 2]);
-        let layer_0 = RowParallelLinear::new(shard_0, None, 2, 4, 0, 1);
+        let layer_0 = RowParallelLinear::new(shard_0, None, 2, 4, 0, 1).unwrap();
         let out_0 = layer_0
             .forward_with_group(&input_0, &group, &registry, &queue)
             .unwrap();
@@ -859,7 +947,7 @@ mod tests {
         assert_eq!(shard_1_vals, vec![3.0, 4.0, 7.0, 8.0]);
 
         let input_1 = Array::from_slice(&device, &[3.0f32, 4.0], vec![1, 2]);
-        let layer_1 = RowParallelLinear::new(shard_1, None, 2, 4, 1, 1);
+        let layer_1 = RowParallelLinear::new(shard_1, None, 2, 4, 1, 1).unwrap();
         let out_1 = layer_1
             .forward_with_group(&input_1, &group, &registry, &queue)
             .unwrap();
@@ -891,7 +979,7 @@ mod tests {
         let weight = Array::from_slice(&device, &weight_data, vec![2, 3]);
 
         // Single rank, but batch=3 to exercise the interleaving path
-        let layer = ColumnParallelLinear::new(weight, None, 2, 3, 0, 1);
+        let layer = ColumnParallelLinear::new(weight, None, 2, 3, 0, 1).unwrap();
 
         // input: [3, 3] — three batch rows
         let input_data: Vec<f32> = vec![
@@ -912,5 +1000,109 @@ mod tests {
         // Row 1: [4,5,6] @ [1,0,0]^T=4, [4,5,6] @ [0,1,0]^T=5
         // Row 2: [7,8,9] @ [1,0,0]^T=7, [7,8,9] @ [0,1,0]^T=8
         assert_eq!(vals, vec![1.0, 2.0, 4.0, 5.0, 7.0, 8.0]);
+    }
+
+    // ─── Validation tests ───
+
+    #[test]
+    fn test_column_parallel_rejects_zero_world_size() {
+        let Some(device) = test_device() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let weight = Array::from_slice(&device, &[0.0f32; 4], vec![2, 2]);
+        let result = ColumnParallelLinear::new(weight, None, 2, 2, 0, 0);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().0.contains("world_size"));
+    }
+
+    #[test]
+    fn test_column_parallel_rejects_indivisible_out_features() {
+        let Some(device) = test_device() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        // out_features=3, world_size=2 -> not divisible
+        let weight = Array::from_slice(&device, &[0.0f32; 4], vec![2, 2]);
+        let result = ColumnParallelLinear::new(weight, None, 3, 2, 0, 2);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().0.contains("divisible"));
+    }
+
+    #[test]
+    fn test_column_parallel_rejects_mismatched_weight_rows() {
+        let Some(device) = test_device() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        // out_features=4, world_size=2 -> expected rows=2, but weight is [3, 2]
+        let weight = Array::from_slice(&device, &[0.0f32; 6], vec![3, 2]);
+        let result = ColumnParallelLinear::new(weight, None, 4, 2, 0, 2);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().0.contains("shape"));
+    }
+
+    #[test]
+    fn test_column_parallel_rejects_mismatched_weight_cols() {
+        let Some(device) = test_device() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        // weight [2, 3] but in_features=4
+        let weight = Array::from_slice(&device, &[0.0f32; 6], vec![2, 3]);
+        let result = ColumnParallelLinear::new(weight, None, 2, 4, 0, 1);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().0.contains("in_features"));
+    }
+
+    #[test]
+    fn test_row_parallel_rejects_zero_world_size() {
+        let Some(device) = test_device() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let weight = Array::from_slice(&device, &[0.0f32; 4], vec![2, 2]);
+        let result = RowParallelLinear::new(weight, None, 2, 2, 0, 0);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().0.contains("world_size"));
+    }
+
+    #[test]
+    fn test_row_parallel_rejects_indivisible_in_features() {
+        let Some(device) = test_device() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        // in_features=3, world_size=2 -> not divisible
+        let weight = Array::from_slice(&device, &[0.0f32; 4], vec![2, 2]);
+        let result = RowParallelLinear::new(weight, None, 2, 3, 0, 2);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().0.contains("divisible"));
+    }
+
+    #[test]
+    fn test_row_parallel_rejects_mismatched_weight_rows() {
+        let Some(device) = test_device() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        // out_features=2 but weight is [3, 2]
+        let weight = Array::from_slice(&device, &[0.0f32; 6], vec![3, 2]);
+        let result = RowParallelLinear::new(weight, None, 2, 2, 0, 1);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().0.contains("out_features"));
+    }
+
+    #[test]
+    fn test_row_parallel_rejects_mismatched_weight_cols() {
+        let Some(device) = test_device() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        // in_features=4, world_size=2 -> expected cols=2, but weight is [2, 3]
+        let weight = Array::from_slice(&device, &[0.0f32; 6], vec![2, 3]);
+        let result = RowParallelLinear::new(weight, None, 2, 4, 0, 2);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().0.contains("in_features/world_size"));
     }
 }

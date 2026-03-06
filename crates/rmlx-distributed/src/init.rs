@@ -133,14 +133,19 @@ pub(crate) fn resolve_world_size(config: &InitConfig) -> u32 {
 }
 
 /// Resolve backend hint: config > RMLX_BACKEND env > Auto.
-fn resolve_backend(config: &InitConfig) -> BackendHint {
+///
+/// Returns an error if the RMLX_BACKEND env var is set to an unrecognized value.
+fn resolve_backend(config: &InitConfig) -> Result<BackendHint, DistributedError> {
     if config.backend != BackendHint::Auto {
-        return config.backend;
+        return Ok(config.backend);
     }
     match std::env::var("RMLX_BACKEND").ok().as_deref() {
-        Some("rdma") | Some("RDMA") => BackendHint::Rdma,
-        Some("loopback") | Some("LOOPBACK") => BackendHint::Loopback,
-        _ => BackendHint::Auto,
+        Some("rdma") | Some("RDMA") => Ok(BackendHint::Rdma),
+        Some("loopback") | Some("LOOPBACK") => Ok(BackendHint::Loopback),
+        Some("auto") | Some("AUTO") | None => Ok(BackendHint::Auto),
+        Some(other) => Err(DistributedError::Config(format!(
+            "unknown RMLX_BACKEND value {other:?}; expected \"rdma\", \"loopback\", or \"auto\""
+        ))),
     }
 }
 
@@ -528,7 +533,7 @@ fn try_rdma_init(
 pub fn init(config: InitConfig) -> Result<DistributedContext, DistributedError> {
     let rank = resolve_rank(&config);
     let world_size = resolve_world_size(&config);
-    let backend = resolve_backend(&config);
+    let backend = resolve_backend(&config)?;
 
     // M1: Validate rank < world_size
     if rank >= world_size {
@@ -716,6 +721,57 @@ mod tests {
         };
         let result = init(config);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_unknown_backend_errors() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_init_env_vars();
+        std::env::set_var("RMLX_BACKEND", "ring");
+        let result = resolve_backend(&InitConfig::default());
+        assert!(result.is_err());
+        match result {
+            Err(DistributedError::Config(msg)) => {
+                assert!(
+                    msg.contains("unknown RMLX_BACKEND"),
+                    "expected 'unknown RMLX_BACKEND' in error message, got: {msg}"
+                );
+            }
+            other => panic!("expected Config error, got: {other:?}"),
+        }
+        clear_init_env_vars();
+    }
+
+    #[test]
+    fn test_known_backends_resolve() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_init_env_vars();
+
+        std::env::set_var("RMLX_BACKEND", "rdma");
+        assert_eq!(
+            resolve_backend(&InitConfig::default()).unwrap(),
+            BackendHint::Rdma
+        );
+
+        std::env::set_var("RMLX_BACKEND", "loopback");
+        assert_eq!(
+            resolve_backend(&InitConfig::default()).unwrap(),
+            BackendHint::Loopback
+        );
+
+        std::env::set_var("RMLX_BACKEND", "auto");
+        assert_eq!(
+            resolve_backend(&InitConfig::default()).unwrap(),
+            BackendHint::Auto
+        );
+
+        std::env::remove_var("RMLX_BACKEND");
+        assert_eq!(
+            resolve_backend(&InitConfig::default()).unwrap(),
+            BackendHint::Auto
+        );
+
+        clear_init_env_vars();
     }
 
     #[test]
