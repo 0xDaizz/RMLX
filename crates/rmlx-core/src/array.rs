@@ -91,7 +91,10 @@ impl Array {
     /// regardless of platform or Metal driver behavior.
     pub fn zeros(device: &metal::Device, shape: &[usize], dtype: DType) -> Self {
         let numel: usize = shape.iter().product();
-        let byte_size = dtype.numel_to_bytes(numel).expect("numel must be block-aligned for quantized dtypes") as u64;
+        let byte_size = dtype
+            .numel_to_bytes(numel)
+            .expect("numel must be block-aligned for quantized dtypes")
+            as u64;
         // Metal returns null for zero-length buffers; allocate at least 1 byte.
         let alloc_size = byte_size.max(1);
         let buffer = device.new_buffer(alloc_size, MTLResourceOptions::StorageModeShared);
@@ -126,7 +129,9 @@ impl Array {
         dtype: DType,
     ) -> Result<Self, rmlx_alloc::AllocError> {
         let numel: usize = shape.iter().product();
-        let byte_size = dtype.numel_to_bytes(numel).expect("numel must be block-aligned for quantized dtypes");
+        let byte_size = dtype
+            .numel_to_bytes(numel)
+            .expect("numel must be block-aligned for quantized dtypes");
         let buffer = allocator.alloc(byte_size)?;
 
         // Zero the buffer contents (cached buffers may contain stale data).
@@ -296,7 +301,9 @@ impl Array {
 
     /// Total data size in bytes.
     pub fn byte_size(&self) -> usize {
-        self.dtype.numel_to_bytes(self.numel()).expect("array numel must be block-aligned")
+        self.dtype
+            .numel_to_bytes(self.numel())
+            .expect("array numel must be block-aligned")
     }
 
     /// Returns the raw bytes of this array's buffer (from offset, for numel * dtype bytes).
@@ -328,7 +335,9 @@ impl Array {
         dtype: DType,
     ) -> Self {
         let numel: usize = shape.iter().product();
-        let expected = dtype.numel_to_bytes(numel).expect("numel must be block-aligned for quantized dtypes");
+        let expected = dtype
+            .numel_to_bytes(numel)
+            .expect("numel must be block-aligned for quantized dtypes");
         assert_eq!(
             bytes.len(),
             expected,

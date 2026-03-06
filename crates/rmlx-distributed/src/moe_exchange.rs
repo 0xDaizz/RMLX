@@ -23,8 +23,8 @@ use std::sync::{Arc, Mutex};
 
 use rmlx_rdma::shared_buffer::{ConnectionId, SharedBuffer};
 
-use crate::transport::ZeroCopyPendingOp;
 use crate::ep_runtime::EpRuntimeContext;
+use crate::transport::ZeroCopyPendingOp;
 // FP8 exchange functions are available for callers that set config.enable_fp8.
 // They operate on Array types and require KernelRegistry, so the actual
 // quantize/dequantize calls happen at the MoeLayer level, not in route_rdma.
@@ -2238,7 +2238,9 @@ impl MoeDispatchExchange {
                     // Remote expert — write directly into peer SharedBuffer (-1 in route_indices)
                     let target_rank = expert / experts_per_rank;
                     if target_rank < world_size && target_rank != local_rank {
-                        if let Some(send_buf) = peer_send_bufs.get(target_rank).and_then(|b| b.as_deref()) {
+                        if let Some(send_buf) =
+                            peer_send_bufs.get(target_rank).and_then(|b| b.as_deref())
+                        {
                             let cursor = peer_cursors[target_rank];
                             let needed = cursor + wire_stride;
                             if needed <= send_buf.size() {
@@ -3377,15 +3379,15 @@ mod tests {
             Some(d) => d,
             None => return, // skip on CI without Metal
         };
-        let buf = device.new_buffer(
-            64,
-            metal::MTLResourceOptions::StorageModeShared,
-        );
+        let buf = device.new_buffer(64, metal::MTLResourceOptions::StorageModeShared);
         // Requesting more bytes than the buffer holds should return Err.
         let result = read_buffer_bytes(&buf, 128);
         assert!(result.is_err(), "expected error for OOB read");
         let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("exceeds buffer length"), "error message: {msg}");
+        assert!(
+            msg.contains("exceeds buffer length"),
+            "error message: {msg}"
+        );
     }
 
     #[test]
@@ -3394,10 +3396,7 @@ mod tests {
             Some(d) => d,
             None => return,
         };
-        let buf = device.new_buffer(
-            64,
-            metal::MTLResourceOptions::StorageModeShared,
-        );
+        let buf = device.new_buffer(64, metal::MTLResourceOptions::StorageModeShared);
         // Reading exactly the buffer length should succeed.
         let result = read_buffer_bytes(&buf, 64);
         assert!(result.is_ok(), "exact-length read should succeed");
@@ -3411,15 +3410,15 @@ mod tests {
             None => return,
         };
         // 16 bytes = 4 f32 elements
-        let buf = device.new_buffer(
-            16,
-            metal::MTLResourceOptions::StorageModeShared,
-        );
+        let buf = device.new_buffer(16, metal::MTLResourceOptions::StorageModeShared);
         // Requesting 8 f32s (32 bytes) from a 16-byte buffer should fail.
         let result = read_buffer_f32(&buf, 8);
         assert!(result.is_err(), "expected error for OOB f32 read");
         let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("exceeds buffer length"), "error message: {msg}");
+        assert!(
+            msg.contains("exceeds buffer length"),
+            "error message: {msg}"
+        );
     }
 
     #[test]
@@ -3429,10 +3428,7 @@ mod tests {
             None => return,
         };
         // 16 bytes = 4 f32 elements
-        let buf = device.new_buffer(
-            16,
-            metal::MTLResourceOptions::StorageModeShared,
-        );
+        let buf = device.new_buffer(16, metal::MTLResourceOptions::StorageModeShared);
         let result = read_buffer_f32(&buf, 4);
         assert!(result.is_ok(), "exact-length f32 read should succeed");
         assert_eq!(result.unwrap().len(), 4);

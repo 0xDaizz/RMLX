@@ -1577,7 +1577,9 @@ pub fn quantized_matmul(
     }
 
     // Validate weights buffer size accounting for offset
-    let expected_weight_bytes = weights.dtype().numel_to_bytes(out_features * in_features)
+    let expected_weight_bytes = weights
+        .dtype()
+        .numel_to_bytes(out_features * in_features)
         .map_err(|e| KernelError::InvalidShape(e.to_string()))?;
     let available_bytes = weights.metal_buffer().length() as usize - weights.offset();
     if available_bytes < expected_weight_bytes {
@@ -2145,32 +2147,31 @@ mod tests {
         let w_bytes = n_experts * n * half_k;
         let w_data = vec![0x77u8; w_bytes];
         let opts = metal::MTLResourceOptions::StorageModeShared;
-        let w_packed_buf = dev.new_buffer_with_data(
-            w_data.as_ptr() as *const _,
-            w_bytes as u64,
-            opts,
-        );
+        let w_packed_buf =
+            dev.new_buffer_with_data(w_data.as_ptr() as *const _, w_bytes as u64, opts);
 
         // scales & biases: n_experts * n * groups_per_row floats
         let sb_elems = n_experts * n * groups_per_row;
         let scales_data = vec![1.0f32; sb_elems];
         let biases_data = vec![0.0f32; sb_elems];
         let sb_bytes = sb_elems * 4;
-        let scales_buf = dev.new_buffer_with_data(
-            scales_data.as_ptr() as *const _,
-            sb_bytes as u64,
-            opts,
-        );
-        let biases_buf = dev.new_buffer_with_data(
-            biases_data.as_ptr() as *const _,
-            sb_bytes as u64,
-            opts,
-        );
+        let scales_buf =
+            dev.new_buffer_with_data(scales_data.as_ptr() as *const _, sb_bytes as u64, opts);
+        let biases_buf =
+            dev.new_buffer_with_data(biases_data.as_ptr() as *const _, sb_bytes as u64, opts);
 
         let idx_data = vec![0u32, 1];
         let indices = Array::from_slice(dev, &idx_data, vec![batch]);
 
-        (registry, x, w_packed_buf, scales_buf, biases_buf, indices, queue)
+        (
+            registry,
+            x,
+            w_packed_buf,
+            scales_buf,
+            biases_buf,
+            indices,
+            queue,
+        )
     }
 
     #[test]
@@ -2178,10 +2179,25 @@ mod tests {
         let (registry, x, w_packed_buf, scales_buf, biases_buf, indices, queue) =
             setup_gather_qmm_valid();
         let result = gather_qmm(
-            &registry, &x, &w_packed_buf, &scales_buf, &biases_buf, &indices,
-            2, 1, 4, 32, 2, 32, &queue,
+            &registry,
+            &x,
+            &w_packed_buf,
+            &scales_buf,
+            &biases_buf,
+            &indices,
+            2,
+            1,
+            4,
+            32,
+            2,
+            32,
+            &queue,
         );
-        assert!(result.is_ok(), "valid gather_qmm should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "valid gather_qmm should succeed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -2191,12 +2207,26 @@ mod tests {
         let dev = registry.device().raw();
         let x = Array::from_slice(dev, &[0.0f32; 0], vec![2, 1, 0]);
         let result = gather_qmm(
-            &registry, &x, &w_packed_buf, &scales_buf, &biases_buf, &indices,
-            2, 1, 4, 0, 2, 32, &queue,
+            &registry,
+            &x,
+            &w_packed_buf,
+            &scales_buf,
+            &biases_buf,
+            &indices,
+            2,
+            1,
+            4,
+            0,
+            2,
+            32,
+            &queue,
         );
         assert!(result.is_err());
         let msg = format!("{}", result.err().unwrap());
-        assert!(msg.contains("non-zero"), "expected non-zero error, got: {msg}");
+        assert!(
+            msg.contains("non-zero"),
+            "expected non-zero error, got: {msg}"
+        );
     }
 
     #[test]
@@ -2204,12 +2234,26 @@ mod tests {
         let (registry, x, w_packed_buf, scales_buf, biases_buf, indices, queue) =
             setup_gather_qmm_valid();
         let result = gather_qmm(
-            &registry, &x, &w_packed_buf, &scales_buf, &biases_buf, &indices,
-            2, 1, 0, 32, 2, 32, &queue,
+            &registry,
+            &x,
+            &w_packed_buf,
+            &scales_buf,
+            &biases_buf,
+            &indices,
+            2,
+            1,
+            0,
+            32,
+            2,
+            32,
+            &queue,
         );
         assert!(result.is_err());
         let msg = format!("{}", result.err().unwrap());
-        assert!(msg.contains("non-zero"), "expected non-zero error, got: {msg}");
+        assert!(
+            msg.contains("non-zero"),
+            "expected non-zero error, got: {msg}"
+        );
     }
 
     #[test]
@@ -2217,12 +2261,26 @@ mod tests {
         let (registry, x, w_packed_buf, scales_buf, biases_buf, indices, queue) =
             setup_gather_qmm_valid();
         let result = gather_qmm(
-            &registry, &x, &w_packed_buf, &scales_buf, &biases_buf, &indices,
-            2, 1, 4, 32, 0, 32, &queue,
+            &registry,
+            &x,
+            &w_packed_buf,
+            &scales_buf,
+            &biases_buf,
+            &indices,
+            2,
+            1,
+            4,
+            32,
+            0,
+            32,
+            &queue,
         );
         assert!(result.is_err());
         let msg = format!("{}", result.err().unwrap());
-        assert!(msg.contains("n_experts"), "expected n_experts error, got: {msg}");
+        assert!(
+            msg.contains("n_experts"),
+            "expected n_experts error, got: {msg}"
+        );
     }
 
     #[test]
@@ -2233,12 +2291,26 @@ mod tests {
         // x has 10 elements but batch*m*k = 2*1*32 = 64
         let x_bad = Array::from_slice(dev, &[1.0f32; 10], vec![10]);
         let result = gather_qmm(
-            &registry, &x_bad, &w_packed_buf, &scales_buf, &biases_buf, &indices,
-            2, 1, 4, 32, 2, 32, &queue,
+            &registry,
+            &x_bad,
+            &w_packed_buf,
+            &scales_buf,
+            &biases_buf,
+            &indices,
+            2,
+            1,
+            4,
+            32,
+            2,
+            32,
+            &queue,
         );
         assert!(result.is_err());
         let msg = format!("{}", result.err().unwrap());
-        assert!(msg.contains("elements"), "expected element count error, got: {msg}");
+        assert!(
+            msg.contains("elements"),
+            "expected element count error, got: {msg}"
+        );
     }
 
     #[test]
@@ -2249,8 +2321,19 @@ mod tests {
         let x = Array::from_slice(dev, &[1.0f32; 6], vec![2, 1, 3]);
         let indices = Array::from_slice(dev, &[0u32, 1], vec![2]);
         let result = gather_qmm(
-            &registry, &x, &w_packed_buf, &scales_buf, &biases_buf, &indices,
-            2, 1, 4, 3, 2, 1, &queue,
+            &registry,
+            &x,
+            &w_packed_buf,
+            &scales_buf,
+            &biases_buf,
+            &indices,
+            2,
+            1,
+            4,
+            3,
+            2,
+            1,
+            &queue,
         );
         assert!(result.is_err());
         let msg = format!("{}", result.err().unwrap());
@@ -2266,12 +2349,26 @@ mod tests {
         let x = Array::from_slice(dev, &[1.0f32; 64], vec![2, 1, 32]);
         let indices = Array::from_slice(dev, &[0u32, 1], vec![2]);
         let result = gather_qmm(
-            &registry, &x, &w_packed_buf, &scales_buf, &biases_buf, &indices,
-            2, 1, 4, 32, 2, 64, &queue,
+            &registry,
+            &x,
+            &w_packed_buf,
+            &scales_buf,
+            &biases_buf,
+            &indices,
+            2,
+            1,
+            4,
+            32,
+            2,
+            64,
+            &queue,
         );
         assert!(result.is_err());
         let msg = format!("{}", result.err().unwrap());
-        assert!(msg.contains("multiple of group_size"), "expected group_size error, got: {msg}");
+        assert!(
+            msg.contains("multiple of group_size"),
+            "expected group_size error, got: {msg}"
+        );
     }
 
     #[test]
@@ -2281,18 +2378,28 @@ mod tests {
         let dev = registry.device().raw();
         // Valid w_packed needs 2*4*16 = 128 bytes, provide only 10
         let opts = metal::MTLResourceOptions::StorageModeShared;
-        let small_w = dev.new_buffer_with_data(
-            [0u8; 10].as_ptr() as *const _,
-            10,
-            opts,
-        );
+        let small_w = dev.new_buffer_with_data([0u8; 10].as_ptr() as *const _, 10, opts);
         let result = gather_qmm(
-            &registry, &x, &small_w, &scales_buf, &biases_buf, &indices,
-            2, 1, 4, 32, 2, 32, &queue,
+            &registry,
+            &x,
+            &small_w,
+            &scales_buf,
+            &biases_buf,
+            &indices,
+            2,
+            1,
+            4,
+            32,
+            2,
+            32,
+            &queue,
         );
         assert!(result.is_err());
         let msg = format!("{}", result.err().unwrap());
-        assert!(msg.contains("w_packed_buf too small"), "expected w_packed_buf error, got: {msg}");
+        assert!(
+            msg.contains("w_packed_buf too small"),
+            "expected w_packed_buf error, got: {msg}"
+        );
     }
 
     #[test]
@@ -2302,18 +2409,28 @@ mod tests {
         let dev = registry.device().raw();
         let opts = metal::MTLResourceOptions::StorageModeShared;
         // Valid scales needs 2*4*1*4 = 32 bytes, provide only 4
-        let small_s = dev.new_buffer_with_data(
-            [0u8; 4].as_ptr() as *const _,
-            4,
-            opts,
-        );
+        let small_s = dev.new_buffer_with_data([0u8; 4].as_ptr() as *const _, 4, opts);
         let result = gather_qmm(
-            &registry, &x, &w_packed_buf, &small_s, &biases_buf, &indices,
-            2, 1, 4, 32, 2, 32, &queue,
+            &registry,
+            &x,
+            &w_packed_buf,
+            &small_s,
+            &biases_buf,
+            &indices,
+            2,
+            1,
+            4,
+            32,
+            2,
+            32,
+            &queue,
         );
         assert!(result.is_err());
         let msg = format!("{}", result.err().unwrap());
-        assert!(msg.contains("scales_buf too small"), "expected scales_buf error, got: {msg}");
+        assert!(
+            msg.contains("scales_buf too small"),
+            "expected scales_buf error, got: {msg}"
+        );
     }
 
     #[test]
@@ -2322,18 +2439,28 @@ mod tests {
             setup_gather_qmm_valid();
         let dev = registry.device().raw();
         let opts = metal::MTLResourceOptions::StorageModeShared;
-        let small_b = dev.new_buffer_with_data(
-            [0u8; 4].as_ptr() as *const _,
-            4,
-            opts,
-        );
+        let small_b = dev.new_buffer_with_data([0u8; 4].as_ptr() as *const _, 4, opts);
         let result = gather_qmm(
-            &registry, &x, &w_packed_buf, &scales_buf, &small_b, &indices,
-            2, 1, 4, 32, 2, 32, &queue,
+            &registry,
+            &x,
+            &w_packed_buf,
+            &scales_buf,
+            &small_b,
+            &indices,
+            2,
+            1,
+            4,
+            32,
+            2,
+            32,
+            &queue,
         );
         assert!(result.is_err());
         let msg = format!("{}", result.err().unwrap());
-        assert!(msg.contains("biases_buf too small"), "expected biases_buf error, got: {msg}");
+        assert!(
+            msg.contains("biases_buf too small"),
+            "expected biases_buf error, got: {msg}"
+        );
     }
 
     #[test]
@@ -2344,12 +2471,26 @@ mod tests {
         // n_experts=2, but index=5 is out of range
         let bad_indices = Array::from_slice(dev, &[0u32, 5], vec![2]);
         let result = gather_qmm(
-            &registry, &x, &w_packed_buf, &scales_buf, &biases_buf, &bad_indices,
-            2, 1, 4, 32, 2, 32, &queue,
+            &registry,
+            &x,
+            &w_packed_buf,
+            &scales_buf,
+            &biases_buf,
+            &bad_indices,
+            2,
+            1,
+            4,
+            32,
+            2,
+            32,
+            &queue,
         );
         assert!(result.is_err());
         let msg = format!("{}", result.err().unwrap());
-        assert!(msg.contains("out of range"), "expected out-of-range error, got: {msg}");
+        assert!(
+            msg.contains("out of range"),
+            "expected out-of-range error, got: {msg}"
+        );
     }
 
     #[test]
@@ -2361,8 +2502,19 @@ mod tests {
         let x_u32 = Array::from_slice(dev, &[1u32; 64], vec![2, 1, 32]);
         let indices = Array::from_slice(dev, &[0u32, 1], vec![2]);
         let result = gather_qmm(
-            &registry, &x_u32, &w_packed_buf, &scales_buf, &biases_buf, &indices,
-            2, 1, 4, 32, 2, 32, &queue,
+            &registry,
+            &x_u32,
+            &w_packed_buf,
+            &scales_buf,
+            &biases_buf,
+            &indices,
+            2,
+            1,
+            4,
+            32,
+            2,
+            32,
+            &queue,
         );
         assert!(result.is_err());
         let msg = format!("{}", result.err().unwrap());
@@ -2377,12 +2529,26 @@ mod tests {
         // batch=2 but indices has 3 elements
         let bad_indices = Array::from_slice(dev, &[0u32, 1, 0], vec![3]);
         let result = gather_qmm(
-            &registry, &x, &w_packed_buf, &scales_buf, &biases_buf, &bad_indices,
-            2, 1, 4, 32, 2, 32, &queue,
+            &registry,
+            &x,
+            &w_packed_buf,
+            &scales_buf,
+            &biases_buf,
+            &bad_indices,
+            2,
+            1,
+            4,
+            32,
+            2,
+            32,
+            &queue,
         );
         assert!(result.is_err());
         let msg = format!("{}", result.err().unwrap());
-        assert!(msg.contains("indices length"), "expected indices length error, got: {msg}");
+        assert!(
+            msg.contains("indices length"),
+            "expected indices length error, got: {msg}"
+        );
     }
 
     #[test]

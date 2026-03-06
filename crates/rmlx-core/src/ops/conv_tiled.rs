@@ -458,14 +458,28 @@ mod tests {
         let weight = Array::from_slice(dev, &weight_data, vec![1, 2, 5, 5]);
 
         let out_naive = crate::ops::conv::conv2d(
-            &registry, &input, &weight, None,
-            (1, 1), (0, 0), (1, 1), 1, &queue,
+            &registry,
+            &input,
+            &weight,
+            None,
+            (1, 1),
+            (0, 0),
+            (1, 1),
+            1,
+            &queue,
         )
         .unwrap();
 
         let out_tiled = conv2d_tiled(
-            &registry, &input, &weight, None,
-            (1, 1), (0, 0), (1, 1), 1, &queue,
+            &registry,
+            &input,
+            &weight,
+            None,
+            (1, 1),
+            (0, 0),
+            (1, 1),
+            1,
+            &queue,
         )
         .unwrap();
 
@@ -480,7 +494,10 @@ mod tests {
             assert!(
                 diff < 1e-3,
                 "5x5 mismatch at index {}: naive={}, tiled={}, diff={}",
-                i, n, t, diff
+                i,
+                n,
+                t,
+                diff
             );
         }
     }
@@ -503,14 +520,28 @@ mod tests {
         let weight = Array::from_slice(dev, &weight_data, vec![1, 1, 7, 7]);
 
         let out_naive = crate::ops::conv::conv2d(
-            &registry, &input, &weight, None,
-            (1, 1), (0, 0), (1, 1), 1, &queue,
+            &registry,
+            &input,
+            &weight,
+            None,
+            (1, 1),
+            (0, 0),
+            (1, 1),
+            1,
+            &queue,
         )
         .unwrap();
 
         let out_tiled = conv2d_tiled(
-            &registry, &input, &weight, None,
-            (1, 1), (0, 0), (1, 1), 1, &queue,
+            &registry,
+            &input,
+            &weight,
+            None,
+            (1, 1),
+            (0, 0),
+            (1, 1),
+            1,
+            &queue,
         )
         .unwrap();
 
@@ -525,7 +556,10 @@ mod tests {
             assert!(
                 diff < 1e-3,
                 "7x7 mismatch at index {}: naive={}, tiled={}, diff={}",
-                i, n, t, diff
+                i,
+                n,
+                t,
+                diff
             );
         }
     }

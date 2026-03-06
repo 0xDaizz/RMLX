@@ -560,9 +560,9 @@ pub fn softmax(
     let input = input_contig.as_ref().unwrap_or(input);
 
     let shape = input.shape();
-    let axis_size = *shape.last().ok_or_else(|| {
-        KernelError::InvalidShape("softmax: empty shape (0D tensor)".to_string())
-    })?;
+    let axis_size = *shape
+        .last()
+        .ok_or_else(|| KernelError::InvalidShape("softmax: empty shape (0D tensor)".to_string()))?;
     let num_rows: usize = shape.iter().rev().skip(1).product();
     // For 1-D input there is exactly one row.
     let num_rows = if num_rows == 0 { 1 } else { num_rows };
@@ -637,10 +637,7 @@ mod tests {
         assert!(result.is_err(), "softmax on 0D tensor should return error");
         match result {
             Err(KernelError::InvalidShape(msg)) => {
-                assert!(
-                    msg.contains("0D"),
-                    "error should mention 0D: {msg}"
-                );
+                assert!(msg.contains("0D"), "error should mention 0D: {msg}");
             }
             Err(other) => panic!("expected InvalidShape, got {other:?}"),
             Ok(_) => unreachable!(),

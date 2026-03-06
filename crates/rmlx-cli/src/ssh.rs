@@ -61,9 +61,11 @@ pub fn run_remote(
     user: Option<&str>,
     timeout_secs: u32,
 ) -> std::io::Result<Output> {
-    validate_ssh_target(host, "host").map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    validate_ssh_target(host, "host")
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     if let Some(u) = user {
-        validate_ssh_target(u, "user").map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        validate_ssh_target(u, "user")
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     }
 
     let mut child = if is_localhost(host) {
@@ -141,9 +143,11 @@ pub fn run_remote(
 
 /// Spawn a command on a remote host (or locally) with separately piped stdout and stderr.
 pub fn spawn_remote(host: &str, cmd: &str, user: Option<&str>) -> std::io::Result<Child> {
-    validate_ssh_target(host, "host").map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    validate_ssh_target(host, "host")
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     if let Some(u) = user {
-        validate_ssh_target(u, "user").map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        validate_ssh_target(u, "user")
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     }
 
     if is_localhost(host) {
