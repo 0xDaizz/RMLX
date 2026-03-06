@@ -157,7 +157,7 @@ fn build_transformer_block(device: &metal::Device) -> TransformerBlock {
     let gate_proj = make_linear(device, HIDDEN_SIZE, INTERMEDIATE_DIM, 5);
     let up_proj = make_linear(device, HIDDEN_SIZE, INTERMEDIATE_DIM, 6);
     let down_proj = make_linear(device, INTERMEDIATE_DIM, HIDDEN_SIZE, 7);
-    let ffn = FeedForward::Dense {
+    let ffn = FeedForward::Gated {
         gate_proj,
         up_proj,
         down_proj,

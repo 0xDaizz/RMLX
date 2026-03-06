@@ -522,10 +522,10 @@ impl RotatingKvCache {
             )?;
             // Concat with new tokens
             let combined_k = concat_seq_dim(registry, &linear_k, &new_keys[h], queue)?;
-            // Trim to max_size (keep the most recent tokens)
+            // Trim to max_size (preserve keep region, drop oldest ring tokens)
             let total = combined_k.shape()[0];
             let trimmed_k = if total > self.max_size {
-                self.trim_to_max(&combined_k, total)
+                self.trim_to_max(&combined_k, total, registry, queue)?
             } else {
                 combined_k
             };
@@ -548,7 +548,7 @@ impl RotatingKvCache {
             let combined_v = concat_seq_dim(registry, &linear_v, &new_values[h], queue)?;
             let total = combined_v.shape()[0];
             let trimmed_v = if total > self.max_size {
-                self.trim_to_max(&combined_v, total)
+                self.trim_to_max(&combined_v, total, registry, queue)?
             } else {
                 combined_v
             };
@@ -586,9 +586,9 @@ impl RotatingKvCache {
         let dtype = buf.dtype();
         let elem_size = dtype.size_of();
 
-        if current_len <= keep || ring_start == keep {
-            // No ring region occupied, or write pointer hasn't wrapped yet —
-            // the buffer is already in temporal order. Return a view of the valid portion.
+        // The buffer hasn't wrapped yet if offset < max_size.
+        // In that case the valid data is simply [0..current_len] in physical order.
+        if self.offset < self.max_size {
             let result = Array::zeros(dev, &[current_len, self.head_dim], dtype);
             if current_len > 0 {
                 self.copy_into_buffer(&result, buf, 0, current_len, registry, queue)?;
@@ -678,18 +678,62 @@ impl RotatingKvCache {
         Ok(result)
     }
 
-    /// Return a view of the first `max_size` rows from `arr` whose total
-    /// length is `total` (trims the oldest non-keep tokens).
-    fn trim_to_max(&self, arr: &Array, total: usize) -> Array {
-        // Keep the *last* max_size tokens (most recent)
+    /// Trim a linearized array to `max_size`, preserving the keep region.
+    ///
+    /// Input `arr` has layout: `[keep_tokens | ring_tokens | new_tokens]`
+    /// with total length `total > max_size`. We must preserve `[0..keep]`
+    /// and keep the most recent `max_size - keep` tokens from the remainder.
+    fn trim_to_max(
+        &self,
+        arr: &Array,
+        total: usize,
+        registry: &KernelRegistry,
+        queue: &metal::CommandQueue,
+    ) -> Result<Array, KernelError> {
+        let dev = registry.device().raw();
+        let dtype = arr.dtype();
+        let elem_size = dtype.size_of();
+        let ring_capacity = self.max_size - self.keep;
+        // Number of non-keep tokens to skip (oldest ring entries)
         let skip = total - self.max_size;
-        let elem_size = arr.dtype().size_of();
-        let new_offset = arr.offset() + skip * self.head_dim * elem_size;
-        arr.view(
-            vec![self.max_size, self.head_dim],
+
+        if self.keep == 0 {
+            // No keep region — just take the last max_size tokens
+            let new_offset = arr.offset() + skip * self.head_dim * elem_size;
+            return Ok(arr.view(
+                vec![self.max_size, self.head_dim],
+                arr.strides().to_vec(),
+                new_offset,
+            ));
+        }
+
+        // Build result: [keep_region] + [most recent ring_capacity tokens]
+        let result = Array::zeros(dev, &[self.max_size, self.head_dim], dtype);
+
+        // Copy keep region from arr[0..keep]
+        self.copy_into_buffer(
+            &result,
+            &arr.view(
+                vec![self.keep, self.head_dim],
+                arr.strides().to_vec(),
+                arr.offset(),
+            ),
+            0,
+            self.keep,
+            registry,
+            queue,
+        )?;
+
+        // Copy most recent ring_capacity tokens from arr[keep + skip .. total]
+        let src_start = self.keep + skip;
+        let src = arr.view(
+            vec![ring_capacity, self.head_dim],
             arr.strides().to_vec(),
-            new_offset,
-        )
+            arr.offset() + src_start * self.head_dim * elem_size,
+        );
+        self.copy_into_buffer(&result, &src, self.keep, ring_capacity, registry, queue)?;
+
+        Ok(result)
     }
 
     /// Copy `count` rows from `src` into `dst` starting at row `dst_row`.
@@ -817,25 +861,52 @@ impl RotatingKvCache {
         Ok(())
     }
 
-    /// Get a view of cached keys for a specific KV head.
+    /// Get cached keys for a specific KV head in temporal order.
     ///
-    /// Returns shape `[current_len, head_dim]`. Note: when the buffer has
-    /// wrapped, the returned view is in *physical* order (not temporal).
-    /// Callers that need temporal order should use RoPE position IDs that
-    /// account for the rotation.
-    pub fn cached_keys(&self, head: usize) -> Array {
-        let len = self.current_len();
-        let a = &self.keys[head];
-        a.view(vec![len, self.head_dim], a.strides().to_vec(), a.offset())
+    /// Returns shape `[current_len, head_dim]`. When the buffer has wrapped,
+    /// the data is linearized so that the oldest non-keep token comes first
+    /// and the most recently written token comes last.
+    pub fn cached_keys(
+        &self,
+        head: usize,
+        registry: &KernelRegistry,
+        queue: &metal::CommandQueue,
+    ) -> Result<Array, KernelError> {
+        let (keep, ring_start, ring_end) = self._temporal_order();
+        let current_len = self.current_len();
+        self.linearize_head(
+            &self.keys[head],
+            keep,
+            ring_start,
+            ring_end,
+            current_len,
+            registry,
+            queue,
+        )
     }
 
-    /// Get a view of cached values for a specific KV head.
+    /// Get cached values for a specific KV head in temporal order.
     ///
-    /// Returns shape `[current_len, head_dim]`.
-    pub fn cached_values(&self, head: usize) -> Array {
-        let len = self.current_len();
-        let a = &self.values[head];
-        a.view(vec![len, self.head_dim], a.strides().to_vec(), a.offset())
+    /// Returns shape `[current_len, head_dim]`. When the buffer has wrapped,
+    /// the data is linearized so that the oldest non-keep token comes first
+    /// and the most recently written token comes last.
+    pub fn cached_values(
+        &self,
+        head: usize,
+        registry: &KernelRegistry,
+        queue: &metal::CommandQueue,
+    ) -> Result<Array, KernelError> {
+        let (keep, ring_start, ring_end) = self._temporal_order();
+        let current_len = self.current_len();
+        self.linearize_head(
+            &self.values[head],
+            keep,
+            ring_start,
+            ring_end,
+            current_len,
+            registry,
+            queue,
+        )
     }
 }
 
@@ -2200,6 +2271,307 @@ fn scale_scores(
             let data = vec![scale; numel];
             let scale_full = Array::from_slice(dev, &data, scores.shape().to_vec());
             ops::binary::mul(registry, scores, &scale_full, queue)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn setup() -> (metal::Device, KernelRegistry, metal::CommandQueue) {
+        let device = metal::Device::system_default().expect("no Metal device");
+        let gpu = rmlx_metal::device::GpuDevice::system_default().expect("no GpuDevice");
+        let queue = device.new_command_queue();
+        let registry = KernelRegistry::new(gpu);
+        ops::copy::register(&registry).expect("failed to register copy kernels");
+        (device, registry, queue)
+    }
+
+    /// Helper: create an Array from a flat f32 slice with shape [rows, cols].
+    fn make_array(device: &metal::Device, data: &[f32], rows: usize, cols: usize) -> Array {
+        assert_eq!(data.len(), rows * cols);
+        Array::from_slice(device, data, vec![rows, cols])
+    }
+
+    /// Helper: read f32 data from an Array.
+    fn read_f32(arr: &Array) -> Vec<f32> {
+        arr.to_vec_checked::<f32>()
+    }
+
+    /// Property test: append N tokens one at a time to a cache of capacity M,
+    /// verify that linearized output matches the expected sliding window.
+    ///
+    /// For keep=0: expected = last min(N, M) tokens
+    /// For keep>0: expected = first `keep` tokens + last min(N-keep, M-keep) ring tokens
+    fn check_rotating_cache(max_size: usize, keep: usize, total_tokens: usize, head_dim: usize) {
+        let (device, registry, queue) = setup();
+        let num_kv_heads = 1;
+
+        let mut cache = RotatingKvCache::new(
+            &device,
+            num_kv_heads,
+            head_dim,
+            max_size,
+            keep,
+            DType::Float32,
+        );
+
+        // Build the expected full sequence — token i has all elements = (i+1) as f32
+        let mut all_tokens: Vec<Vec<f32>> = Vec::new();
+        for t in 0..total_tokens {
+            let val = (t + 1) as f32;
+            let token_data: Vec<f32> = vec![val; head_dim];
+            all_tokens.push(token_data.clone());
+
+            let k_arr = make_array(&device, &token_data, 1, head_dim);
+            let v_arr = make_array(&device, &token_data, 1, head_dim);
+            cache
+                .append(vec![k_arr], vec![v_arr], 1, &registry, &queue)
+                .expect("append failed");
+        }
+
+        // Read linearized keys
+        let linearized = cache
+            .cached_keys(0, &registry, &queue)
+            .expect("cached_keys failed");
+        let got = read_f32(&linearized);
+        let current_len = cache.current_len();
+
+        // Build expected output
+        let expected: Vec<f32> = if total_tokens <= max_size {
+            // Haven't filled the buffer yet — all tokens in order
+            all_tokens.iter().flat_map(|t| t.iter().copied()).collect()
+        } else if keep == 0 {
+            // No keep region — last max_size tokens
+            all_tokens[total_tokens - max_size..]
+                .iter()
+                .flat_map(|t| t.iter().copied())
+                .collect()
+        } else {
+            // Keep region + most recent ring tokens
+            let ring_capacity = max_size - keep;
+            let ring_tokens_available = total_tokens - keep;
+            let ring_start_idx = if ring_tokens_available > ring_capacity {
+                keep + (ring_tokens_available - ring_capacity)
+            } else {
+                keep
+            };
+            let mut exp = Vec::new();
+            // Keep region
+            for t in &all_tokens[..keep] {
+                exp.extend_from_slice(t);
+            }
+            // Ring region (most recent)
+            for t in &all_tokens[ring_start_idx..total_tokens] {
+                exp.extend_from_slice(t);
+            }
+            exp
+        };
+
+        assert_eq!(
+            got.len(),
+            expected.len(),
+            "length mismatch: got {} expected {} (max_size={}, keep={}, total={})",
+            got.len(),
+            expected.len(),
+            max_size,
+            keep,
+            total_tokens,
+        );
+        assert_eq!(
+            current_len,
+            expected.len() / head_dim,
+            "current_len mismatch"
+        );
+        assert_eq!(
+            got, expected,
+            "data mismatch (max_size={}, keep={}, total={})\ngot:      {:?}\nexpected: {:?}",
+            max_size, keep, total_tokens, got, expected,
+        );
+    }
+
+    // --- Property tests: no keep region ---
+
+    #[test]
+    fn test_rotating_cache_no_wrap() {
+        // N < M: no wrapping
+        check_rotating_cache(8, 0, 5, 4);
+    }
+
+    #[test]
+    fn test_rotating_cache_exact_fill() {
+        // N == M: exact fill, no wrap
+        check_rotating_cache(8, 0, 8, 4);
+    }
+
+    #[test]
+    fn test_rotating_cache_one_past() {
+        // N == M+1: wraps once
+        check_rotating_cache(8, 0, 9, 4);
+    }
+
+    #[test]
+    fn test_rotating_cache_double_capacity() {
+        // N == 2M: wraps fully twice
+        check_rotating_cache(8, 0, 16, 4);
+    }
+
+    #[test]
+    fn test_rotating_cache_triple_capacity() {
+        // N == 3M: wraps fully three times
+        check_rotating_cache(8, 0, 24, 4);
+    }
+
+    #[test]
+    fn test_rotating_cache_various_no_keep() {
+        for max_size in [4, 8, 16] {
+            for total in 0..max_size * 3 {
+                if total == 0 {
+                    continue; // skip empty
+                }
+                check_rotating_cache(max_size, 0, total, 2);
+            }
+        }
+    }
+
+    // --- Property tests: with keep region ---
+
+    #[test]
+    fn test_rotating_cache_keep_no_wrap() {
+        // keep=2, N < M: no wrapping
+        check_rotating_cache(8, 2, 5, 4);
+    }
+
+    #[test]
+    fn test_rotating_cache_keep_exact_fill() {
+        // keep=2, N == M: exact fill
+        check_rotating_cache(8, 2, 8, 4);
+    }
+
+    #[test]
+    fn test_rotating_cache_keep_one_past() {
+        // keep=2, N == M+1: wraps once in ring region
+        check_rotating_cache(8, 2, 9, 4);
+    }
+
+    #[test]
+    fn test_rotating_cache_keep_double() {
+        // keep=2, N == 2M
+        check_rotating_cache(8, 2, 16, 4);
+    }
+
+    #[test]
+    fn test_rotating_cache_keep_triple() {
+        // keep=2, N == 3M
+        check_rotating_cache(8, 2, 24, 4);
+    }
+
+    #[test]
+    fn test_rotating_cache_various_with_keep() {
+        for max_size in [4, 8] {
+            for keep in 1..max_size {
+                for total in 1..max_size * 3 {
+                    check_rotating_cache(max_size, keep, total, 2);
+                }
+            }
+        }
+    }
+
+    // --- Multi-token append tests ---
+
+    #[test]
+    fn test_rotating_cache_multi_token_no_wrap() {
+        let (device, registry, queue) = setup();
+        let max_size = 8;
+        let head_dim = 4;
+        let mut cache = RotatingKvCache::new(&device, 1, head_dim, max_size, 0, DType::Float32);
+
+        // Append 3 tokens at once
+        let data: Vec<f32> = (1..=12).map(|x| x as f32).collect();
+        let k = make_array(&device, &data, 3, head_dim);
+        let v = make_array(&device, &data, 3, head_dim);
+        cache
+            .append(vec![k], vec![v], 3, &registry, &queue)
+            .expect("append failed");
+
+        let got = read_f32(
+            &cache
+                .cached_keys(0, &registry, &queue)
+                .expect("cached_keys failed"),
+        );
+        assert_eq!(got, data);
+    }
+
+    #[test]
+    fn test_rotating_cache_multi_token_wrapping() {
+        let (device, registry, queue) = setup();
+        let max_size = 4;
+        let head_dim = 2;
+        let mut cache = RotatingKvCache::new(&device, 1, head_dim, max_size, 0, DType::Float32);
+
+        // Fill to capacity with single tokens
+        for t in 0..4 {
+            let val = (t + 1) as f32;
+            let data = vec![val; head_dim];
+            let k = make_array(&device, &data, 1, head_dim);
+            let v = make_array(&device, &data, 1, head_dim);
+            cache
+                .append(vec![k], vec![v], 1, &registry, &queue)
+                .expect("append failed");
+        }
+
+        // Now append 3 more tokens (wraps via linearize_and_append)
+        let new_data: Vec<f32> = vec![5.0, 5.0, 6.0, 6.0, 7.0, 7.0];
+        let k = make_array(&device, &new_data, 3, head_dim);
+        let v = make_array(&device, &new_data, 3, head_dim);
+        cache
+            .append(vec![k], vec![v], 3, &registry, &queue)
+            .expect("append failed");
+
+        // Expected: last 4 tokens = [4, 5, 6, 7]
+        let got = read_f32(
+            &cache
+                .cached_keys(0, &registry, &queue)
+                .expect("cached_keys failed"),
+        );
+        let expected: Vec<f32> = vec![4.0, 4.0, 5.0, 5.0, 6.0, 6.0, 7.0, 7.0];
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn test_rotating_cache_offset_monotonic() {
+        let (device, registry, queue) = setup();
+        let mut cache = RotatingKvCache::new(&device, 1, 2, 4, 0, DType::Float32);
+
+        for t in 0..10 {
+            let data = vec![(t + 1) as f32; 2];
+            let k = make_array(&device, &data, 1, 2);
+            let v = make_array(&device, &data, 1, 2);
+            cache
+                .append(vec![k], vec![v], 1, &registry, &queue)
+                .expect("append failed");
+            assert_eq!(cache.offset(), t + 1);
+        }
+    }
+
+    #[test]
+    fn test_rotating_cache_current_len() {
+        let (device, registry, queue) = setup();
+        let mut cache = RotatingKvCache::new(&device, 1, 2, 4, 0, DType::Float32);
+
+        for t in 0..10 {
+            let data = vec![(t + 1) as f32; 2];
+            let k = make_array(&device, &data, 1, 2);
+            let v = make_array(&device, &data, 1, 2);
+            cache
+                .append(vec![k], vec![v], 1, &registry, &queue)
+                .expect("append failed");
+            assert_eq!(cache.current_len(), std::cmp::min(t + 1, 4));
         }
     }
 }

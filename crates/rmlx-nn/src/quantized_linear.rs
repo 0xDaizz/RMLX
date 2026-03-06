@@ -7,7 +7,9 @@
 //! - CPU `affine_qmm` fallback for Q4 batched when Metal QMM is unavailable
 
 use rmlx_core::array::Array;
+use rmlx_core::dtype::DType;
 use rmlx_core::kernels::{KernelError, KernelRegistry};
+use rmlx_core::ops::copy::copy_cast;
 use rmlx_core::ops::quantized::{self, QuantizedWeight};
 
 /// Supported quantization bit widths for `QuantizedLinear`.
@@ -161,6 +163,13 @@ impl QuantizedLinear {
                 "QuantizedLinear: input must be 1D or 2D, got {}D",
                 x.ndim()
             )));
+        };
+
+        // Cast to f32 if needed — quantized matmul requires f32 input.
+        let x_2d = if x_2d.dtype() != DType::Float32 {
+            copy_cast(registry, &x_2d, DType::Float32, queue)?
+        } else {
+            x_2d
         };
 
         if x_2d.shape()[1] != self.in_features {
