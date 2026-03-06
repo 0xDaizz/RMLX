@@ -35,6 +35,14 @@ constant constexpr uint BM = 32;
 constant constexpr uint BN = 32;
 constant constexpr uint BK = 16;
 
+inline uint2 swizzle_threadgroup(uint2 tid, uint swizzle_log) {
+    if (swizzle_log == 0) return tid;
+    return uint2(
+        tid.x >> swizzle_log,
+        (tid.y << swizzle_log) | (tid.x & ((1u << swizzle_log) - 1u))
+    );
+}
+
 // Threads per threadgroup = BM * BN (one thread per output element in the tile).
 // Each thread accumulates one C element from shared memory tiles.
 
@@ -62,9 +70,11 @@ kernel void gemm_tiled_f32(
     threadgroup float As[BM * BK];   // BM rows x BK cols
     threadgroup float Bs[BK * BN];   // BK rows x BN cols
 
+    uint2 tg = uint2(group_id.x, group_id.y);
+
     const uint batch_idx = group_id.z;
-    const uint row_start = group_id.y * BM;
-    const uint col_start = group_id.x * BN;
+    const uint row_start = tg.y * BM;
+    const uint col_start = tg.x * BN;
 
     // Thread's position within the output tile
     const uint local_row = tid_in_group / BN;
@@ -142,9 +152,11 @@ kernel void gemm_tiled_f16(
     threadgroup float As[BM * BK];
     threadgroup float Bs[BK * BN];
 
+    uint2 tg = uint2(group_id.x, group_id.y);
+
     const uint batch_idx = group_id.z;
-    const uint row_start = group_id.y * BM;
-    const uint col_start = group_id.x * BN;
+    const uint row_start = tg.y * BM;
+    const uint col_start = tg.x * BN;
     const uint local_row = tid_in_group / BN;
     const uint local_col = tid_in_group % BN;
 
@@ -207,9 +219,11 @@ kernel void gemm_tiled_bf16(
     threadgroup float As[BM * BK];
     threadgroup float Bs[BK * BN];
 
+    uint2 tg = uint2(group_id.x, group_id.y);
+
     const uint batch_idx = group_id.z;
-    const uint row_start = group_id.y * BM;
-    const uint col_start = group_id.x * BN;
+    const uint row_start = tg.y * BM;
+    const uint col_start = tg.x * BN;
     const uint local_row = tid_in_group / BN;
     const uint local_col = tid_in_group % BN;
 
@@ -295,9 +309,11 @@ kernel void gemm_simd_f32(
     // If sgid >= (BM/8)*(BN/8) = 16, this simdgroup has no work.
     if (sg_row >= BM / 8) return;
 
+    uint2 tg = uint2(group_id.x, group_id.y);
+
     const uint batch_idx = group_id.z;
-    const uint row_start = group_id.y * BM;
-    const uint col_start = group_id.x * BN;
+    const uint row_start = tg.y * BM;
+    const uint col_start = tg.x * BN;
 
     device const float* A_batch = A + batch_idx * batch_stride_a;
     device const float* B_batch = B + batch_idx * batch_stride_b;
@@ -392,9 +408,11 @@ kernel void gemm_simd_f16(
 
     if (sg_row >= BM / 8) return;
 
+    uint2 tg = uint2(group_id.x, group_id.y);
+
     const uint batch_idx = group_id.z;
-    const uint row_start = group_id.y * BM;
-    const uint col_start = group_id.x * BN;
+    const uint row_start = tg.y * BM;
+    const uint col_start = tg.x * BN;
 
     device const half* A_batch = A + batch_idx * batch_stride_a;
     device const half* B_batch = B + batch_idx * batch_stride_b;
@@ -476,9 +494,11 @@ kernel void gemm_simd_bf16(
 
     if (sg_row >= BM / 8) return;
 
+    uint2 tg = uint2(group_id.x, group_id.y);
+
     const uint batch_idx = group_id.z;
-    const uint row_start = group_id.y * BM;
-    const uint col_start = group_id.x * BN;
+    const uint row_start = tg.y * BM;
+    const uint col_start = tg.x * BN;
 
     device const bfloat* A_batch = A + batch_idx * batch_stride_a;
     device const bfloat* B_batch = B + batch_idx * batch_stride_b;
@@ -857,6 +877,15 @@ pub fn select_tile_config(m: usize, n: usize, _k: usize) -> TileConfig {
     }
 }
 
+/// Compute swizzle_log for threadblock swizzle.
+///
+/// Swizzle improves L2 cache locality for large matrices by remapping
+/// threadgroup IDs to access nearby memory locations.
+pub fn compute_swizzle_log(m: usize, bm: usize) -> u32 {
+    let tiles_m = (m + bm - 1) / bm;
+    if tiles_m > 3 { 1 } else { 0 }
+}
+
 /// Returns true if Split-K should be used for the given dimensions.
 ///
 /// Heuristic: K > 4 * max(M, N) and batch == 1 (Split-K currently
@@ -872,6 +901,79 @@ fn split_k_count(m: usize, n: usize, k: usize) -> usize {
     let max_mn = m.max(n).max(1);
     let desired = k / (4 * max_mn);
     desired.clamp(2, 16)
+}
+
+// ---------------------------------------------------------------------------
+// GEMM tile configuration — hardware-adaptive tile selection
+// ---------------------------------------------------------------------------
+
+/// GEMM tile configuration selected at runtime based on hardware and problem size.
+#[derive(Debug, Clone, Copy)]
+pub struct GemmTileConfig {
+    pub bm: usize,
+    pub bn: usize,
+    pub bk: usize,
+    pub wm: usize,
+    pub wn: usize,
+    /// Whether to use NAX (M3+ hardware MMA) path.
+    pub use_nax: bool,
+}
+
+impl GemmTileConfig {
+    /// Select optimal tile configuration based on hardware and problem dimensions.
+    ///
+    /// Uses architecture detection from `ChipTuning` to choose tiles that
+    /// maximize throughput for the given matrix size.
+    pub fn select(
+        chip: &rmlx_metal::device::ChipTuning,
+        m: usize,
+        n: usize,
+        k: usize,
+        is_half: bool,
+    ) -> Self {
+        // NAX path: M3+ non-phone, half precision, large enough problem
+        if chip.supports_nax && is_half && m >= 64 && n >= 64 && k >= 64 {
+            return Self { bm: 128, bn: 128, bk: 16, wm: 4, wn: 4, use_nax: true }
+                .clamp_to_device(chip);
+        }
+
+        // Large matrices: 64x64 tiles for better occupancy
+        if m > 512 && n > 512 {
+            return Self { bm: 64, bn: 64, bk: 16, wm: 2, wn: 2, use_nax: false }
+                .clamp_to_device(chip);
+        }
+
+        // Small matrices: 16x16 for less wasted work
+        if m < 64 || n < 64 {
+            return Self { bm: 16, bn: 16, bk: 16, wm: 1, wn: 1, use_nax: false }
+                .clamp_to_device(chip);
+        }
+
+        // Default: 32x32 (current default, proven safe)
+        Self { bm: 32, bn: 32, bk: 16, wm: 1, wn: 1, use_nax: false }
+            .clamp_to_device(chip)
+    }
+
+    /// Clamp tile config to device limits.
+    ///
+    /// Guards against exceeding threadgroup memory (32KB) or max threads (1024).
+    /// Falls back to safe 32x32x16 if limits would be exceeded.
+    fn clamp_to_device(self, chip: &rmlx_metal::device::ChipTuning) -> Self {
+        // Threadgroup memory needed: 2 * (BM*BK + BK*BN) * sizeof(float)
+        let tg_mem_needed = 2 * (self.bm * self.bk + self.bk * self.bn) * 4;
+        let threads_needed = if self.use_nax {
+            32 * self.wm * self.wn
+        } else {
+            (self.bm / self.wm) * (self.bn / self.wn)
+        };
+
+        if tg_mem_needed > chip.max_threadgroup_memory || threads_needed > chip.max_threads_per_threadgroup {
+            // Fallback to safe default
+            Self { bm: 32, bn: 32, bk: 16, wm: 1, wn: 1, use_nax: false }
+        } else {
+            self
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1280,6 +1382,18 @@ fn dispatch_split_k(
     Ok(out)
 }
 
+/// Build function constants for matmul alignment specialization.
+///
+/// When matrix dimensions are aligned to tile boundaries, bounds checks
+/// can be eliminated at compile time.
+pub fn matmul_align_constants(m: usize, n: usize, bm: usize, bn: usize) -> Vec<(u32, crate::kernels::FunctionConstantValue)> {
+    use crate::kernels::FunctionConstantValue;
+    vec![
+        (200, FunctionConstantValue::Bool(m % bm == 0)),
+        (201, FunctionConstantValue::Bool(n % bn == 0)),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1364,5 +1478,103 @@ mod tests {
         let count = split_k_count(16, 16, 4096);
         assert!(count >= 2);
         assert!(count <= 16);
+    }
+
+    // ── GemmTileConfig tests ──
+
+    #[test]
+    fn test_gemm_tile_config_small() {
+        let chip = chip_m2_max();
+        let config = GemmTileConfig::select(&chip, 16, 32, 128, false);
+        assert_eq!(config.bm, 16);
+        assert_eq!(config.bn, 16);
+        assert!(!config.use_nax);
+    }
+
+    #[test]
+    fn test_gemm_tile_config_large() {
+        let chip = chip_m2_max();
+        let config = GemmTileConfig::select(&chip, 1024, 1024, 1024, false);
+        assert_eq!(config.bm, 64);
+        assert!(!config.use_nax);
+    }
+
+    #[test]
+    fn test_gemm_tile_config_nax() {
+        let chip = chip_m3_max();
+        let config = GemmTileConfig::select(&chip, 512, 512, 512, true);
+        // M3 Max supports NAX
+        assert!(config.use_nax);
+        assert_eq!(config.bm, 128);
+    }
+
+    #[test]
+    fn test_gemm_tile_config_clamp_fallback() {
+        let chip = chip_unknown();
+        // Unknown device -> conservative
+        let config = GemmTileConfig::select(&chip, 1024, 1024, 1024, true);
+        assert!(!config.use_nax, "unknown device should not use NAX");
+    }
+
+    // ── Threadblock swizzle tests ──
+
+    #[test]
+    fn test_compute_swizzle_log() {
+        // Small matrix: no swizzle
+        assert_eq!(compute_swizzle_log(32, 32), 0);  // 1 tile
+        assert_eq!(compute_swizzle_log(96, 32), 0);  // 3 tiles
+        // Large matrix: swizzle enabled
+        assert_eq!(compute_swizzle_log(128, 32), 1); // 4 tiles
+        assert_eq!(compute_swizzle_log(4096, 32), 1);
+    }
+
+    // ── ChipTuning test helpers ──
+
+    /// Helper: build a ChipTuning that mimics Apple M2 Max.
+    fn chip_m2_max() -> rmlx_metal::device::ChipTuning {
+        rmlx_metal::device::ChipTuning {
+            max_threadgroup_memory: 32 * 1024,
+            max_threads_per_threadgroup: 1024,
+            preferred_simd_width: 32,
+            supports_unretained_refs: true,
+            arch_gen: 16,
+            arch_class: rmlx_metal::device::ArchClass::Max,
+            supports_nax: false,
+            max_ops_per_batch: 50,
+            max_mb_per_batch: 50,
+            supports_concurrent_dispatch: true,
+        }
+    }
+
+    /// Helper: build a ChipTuning that mimics Apple M3 Max.
+    fn chip_m3_max() -> rmlx_metal::device::ChipTuning {
+        rmlx_metal::device::ChipTuning {
+            max_threadgroup_memory: 32 * 1024,
+            max_threads_per_threadgroup: 1024,
+            preferred_simd_width: 32,
+            supports_unretained_refs: true,
+            arch_gen: 17,
+            arch_class: rmlx_metal::device::ArchClass::Max,
+            supports_nax: true,
+            max_ops_per_batch: 50,
+            max_mb_per_batch: 50,
+            supports_concurrent_dispatch: true,
+        }
+    }
+
+    /// Helper: build a ChipTuning for unknown/non-Apple hardware.
+    fn chip_unknown() -> rmlx_metal::device::ChipTuning {
+        rmlx_metal::device::ChipTuning {
+            max_threadgroup_memory: 16 * 1024,
+            max_threads_per_threadgroup: 512,
+            preferred_simd_width: 32,
+            supports_unretained_refs: false,
+            arch_gen: 0,
+            arch_class: rmlx_metal::device::ArchClass::Unknown,
+            supports_nax: false,
+            max_ops_per_batch: 32,
+            max_mb_per_batch: 32,
+            supports_concurrent_dispatch: false,
+        }
     }
 }

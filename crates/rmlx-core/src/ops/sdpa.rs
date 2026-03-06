@@ -47,6 +47,10 @@ constant constexpr uint Br = 16;   // Query block rows
 constant constexpr uint Bc = 16;   // Key/Value block columns
 constant constexpr uint SIMD_SIZE = 32;
 
+// Function constants for specialization (set via MTLFunctionConstantValues)
+constant uint FC_HEAD_DIM [[function_constant(200)]];
+constant bool FC_HAS_HEAD_DIM = is_function_constant_defined(FC_HEAD_DIM);
+
 // ─── Threadgroup-wide reduction helpers ────────────────────────────────────
 
 // Reduce max across all 256 threads in a threadgroup.
@@ -114,7 +118,7 @@ kernel void sdpa_decode_f32(
     uint  sg_id     [[simdgroup_index_in_threadgroup]])
 {
     const uint S        = params[1];
-    const uint D        = params[2];
+    const uint D        = FC_HAS_HEAD_DIM ? FC_HEAD_DIM : params[2];
     const uint has_mask = params[3];
     // is_causal not needed for N=1: the single query attends to all keys
 
@@ -231,7 +235,7 @@ kernel void sdpa_decode_f16(
     uint  sg_id     [[simdgroup_index_in_threadgroup]])
 {
     const uint S        = params[1];
-    const uint D        = params[2];
+    const uint D        = FC_HAS_HEAD_DIM ? FC_HEAD_DIM : params[2];
     const uint has_mask = params[3];
 
     const uint n_threads = 256;
@@ -783,7 +787,7 @@ kernel void sdpa_decode_batched_f32(
     const uint num_heads    = params[0];
     const uint num_kv_heads = params[1];
     const uint S            = params[2];
-    const uint D            = params[3];
+    const uint D            = FC_HAS_HEAD_DIM ? FC_HEAD_DIM : params[3];
     const uint has_mask     = params[4];
     const uint stride_S     = (params[5] > 0) ? params[5] : S;
 
@@ -886,7 +890,7 @@ kernel void sdpa_decode_batched_f16(
     const uint num_heads    = params[0];
     const uint num_kv_heads = params[1];
     const uint S            = params[2];
-    const uint D            = params[3];
+    const uint D            = FC_HAS_HEAD_DIM ? FC_HEAD_DIM : params[3];
     const uint has_mask     = params[4];
     const uint stride_S     = (params[5] > 0) ? params[5] : S;
 
@@ -982,6 +986,10 @@ constant constexpr uint Br = 16;
 constant constexpr uint Bc = 16;
 constant constexpr uint SIMD_SIZE = 32;
 
+// Function constants for specialization (set via MTLFunctionConstantValues)
+constant uint FC_HEAD_DIM [[function_constant(200)]];
+constant bool FC_HAS_HEAD_DIM = is_function_constant_defined(FC_HEAD_DIM);
+
 inline float tg_reduce_max_bf16(float val, uint tid, uint lane_id, uint sg_id,
                                  uint n_threads, threadgroup float* buf) {
     float sg_val = simd_max(val);
@@ -1027,7 +1035,7 @@ kernel void sdpa_decode_bf16(
     uint  sg_id     [[simdgroup_index_in_threadgroup]])
 {
     const uint S        = params[1];
-    const uint D        = params[2];
+    const uint D        = FC_HAS_HEAD_DIM ? FC_HEAD_DIM : params[2];
     const uint has_mask = params[3];
 
     const uint n_threads = 256;
@@ -1286,7 +1294,7 @@ kernel void sdpa_decode_batched_bf16(
     const uint num_heads    = params[0];
     const uint num_kv_heads = params[1];
     const uint S            = params[2];
-    const uint D            = params[3];
+    const uint D            = FC_HAS_HEAD_DIM ? FC_HEAD_DIM : params[3];
     const uint has_mask     = params[4];
     const uint stride_S     = (params[5] > 0) ? params[5] : S;
 
@@ -1557,7 +1565,12 @@ pub fn sdpa(
         }
     };
 
-    let pipeline = registry.get_pipeline(kernel_name, q.dtype())?;
+    let pipeline = if use_decode {
+        let constants = sdpa_decode_constants(d, false);
+        registry.get_pipeline_with_constants(kernel_name, q.dtype(), &constants)?
+    } else {
+        registry.get_pipeline(kernel_name, q.dtype())?
+    };
     let dev = registry.device().raw();
 
     // Output array
@@ -1781,7 +1794,12 @@ pub fn sdpa_into_cb(
         }
     };
 
-    let pipeline = registry.get_pipeline(kernel_name, q.dtype())?;
+    let pipeline = if use_decode {
+        let constants = sdpa_decode_constants(d, false);
+        registry.get_pipeline_with_constants(kernel_name, q.dtype(), &constants)?
+    } else {
+        registry.get_pipeline(kernel_name, q.dtype())?
+    };
     let dev = registry.device().raw();
 
     let out = Array::uninit(dev, &[n, d], q.dtype());
@@ -2016,7 +2034,8 @@ pub fn sdpa_decode_batched_slab_stride_into_cb(
         }
     };
 
-    let pipeline = registry.get_pipeline(kernel_name, dtype)?;
+    let constants = sdpa_decode_constants(head_dim, false);
+    let pipeline = registry.get_pipeline_with_constants(kernel_name, dtype, &constants)?;
     let dev = registry.device().raw();
 
     let out = Array::zeros(dev, &[q_expected], dtype);
@@ -2171,7 +2190,8 @@ pub fn sdpa_decode_batched_slab_stride_into_encoder(
         }
     };
 
-    let pipeline = registry.get_pipeline(kernel_name, dtype)?;
+    let constants = sdpa_decode_constants(head_dim, false);
+    let pipeline = registry.get_pipeline_with_constants(kernel_name, dtype, &constants)?;
     let dev = registry.device().raw();
 
     let out = Array::zeros(dev, &[q_expected], dtype);
@@ -2309,4 +2329,19 @@ mod tests {
             "expected dtype mismatch error, got: {msg}"
         );
     }
+}
+
+/// Build function constants for SDPA decode specialization.
+///
+/// When `head_dim` is a known common value (64, 128, 256), we specialize
+/// the kernel for that value, enabling compile-time loop unrolling.
+pub fn sdpa_decode_constants(head_dim: usize, is_causal: bool) -> Vec<(u32, crate::kernels::FunctionConstantValue)> {
+    use crate::kernels::FunctionConstantValue;
+    let mut constants = Vec::new();
+    // Only specialize for common head dims to limit PSO cache bloat
+    if matches!(head_dim, 64 | 128 | 256) {
+        constants.push((200, FunctionConstantValue::U32(head_dim as u32)));
+    }
+    constants.push((201, FunctionConstantValue::Bool(is_causal)));
+    constants
 }

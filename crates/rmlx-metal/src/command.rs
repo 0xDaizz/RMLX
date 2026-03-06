@@ -13,6 +13,8 @@ use std::collections::HashSet;
 // ---------------------------------------------------------------------------
 // M1 — auto-commit thresholds
 // ---------------------------------------------------------------------------
+/// Fallback ops-per-batch threshold. Prefer `ChipTuning::max_ops_per_batch`
+/// when a device-specific `ChipTuning` is available.
 const MAX_OPS_PER_BATCH: usize = 64;
 const MAX_BYTES_PER_BATCH: u64 = 16 * 1024 * 1024; // 16 MB
 
@@ -125,6 +127,14 @@ impl Drop for CommandBufferManager<'_> {
 pub struct BarrierTracker {
     /// Buffers that were bound as *output* (write) in the previous dispatch.
     previous_outputs: HashSet<u64>,
+    /// Buffers that were bound as *input* (read) in the previous dispatch(es).
+    /// Used by `check_concurrent` to detect WAR (write-after-read) hazards.
+    previous_inputs: HashSet<u64>,
+    /// Buffers marked as temporary — exempted from barrier checks.
+    /// These are intermediate buffers that are only used within a single
+    /// encoder scope (e.g., `normed`, `qkv`, `gate_up`, `hidden` in
+    /// the 9-dispatch decode path).
+    temporaries: HashSet<u64>,
 }
 
 impl BarrierTracker {
@@ -132,7 +142,39 @@ impl BarrierTracker {
     pub fn new() -> Self {
         Self {
             previous_outputs: HashSet::new(),
+            previous_inputs: HashSet::new(),
+            temporaries: HashSet::new(),
         }
+    }
+
+    /// Mark a buffer as temporary (exempt from barrier checks).
+    ///
+    /// Temporary buffers are intermediate results that exist only within
+    /// a single encoder scope. They are always produced and consumed in
+    /// order, so no inter-dispatch barrier is needed for them.
+    ///
+    /// # Safety invariant
+    ///
+    /// Callers **must** call [`clear_temporaries`] at encoder boundaries
+    /// or before the underlying allocator could reuse the buffer's GPU
+    /// address for a different allocation. Failing to do so may cause
+    /// a later, unrelated buffer at the same address to be incorrectly
+    /// exempted from barrier tracking.
+    pub fn mark_temporary(&mut self, buf: &Buffer) {
+        self.temporaries.insert(buf.gpu_address());
+    }
+
+    /// Clear all temporary buffer markings.
+    ///
+    /// Should be called at encoder boundaries or when the temporary
+    /// buffer set changes (e.g., between layers).
+    pub fn clear_temporaries(&mut self) {
+        self.temporaries.clear();
+    }
+
+    /// Number of buffers currently marked as temporary.
+    pub fn temporary_count(&self) -> usize {
+        self.temporaries.len()
     }
 
     /// Record a set of input/output buffer addresses for the current dispatch
@@ -149,7 +191,11 @@ impl BarrierTracker {
 
         // Check if any current input was written in the previous dispatch.
         for buf in inputs {
-            if self.previous_outputs.contains(&buf.gpu_address()) {
+            let addr = buf.gpu_address();
+            if self.temporaries.contains(&addr) {
+                continue;
+            }
+            if self.previous_outputs.contains(&addr) {
                 needs = true;
                 break;
             }
@@ -158,7 +204,11 @@ impl BarrierTracker {
         // Also check output-after-output (WAW hazard).
         if !needs {
             for buf in outputs {
-                if self.previous_outputs.contains(&buf.gpu_address()) {
+                let addr = buf.gpu_address();
+                if self.temporaries.contains(&addr) {
+                    continue;
+                }
+                if self.previous_outputs.contains(&addr) {
                     needs = true;
                     break;
                 }
@@ -174,9 +224,78 @@ impl BarrierTracker {
         needs
     }
 
+    /// Check and track dependencies, suitable for concurrent encoder mode.
+    ///
+    /// Unlike `needs_barrier` which replaces previous_outputs wholesale,
+    /// this method accumulates outputs across dispatches that don't need
+    /// barriers, and only rotates when a barrier IS needed. This correctly
+    /// tracks multi-dispatch dependency chains on a concurrent encoder.
+    pub fn check_concurrent(&mut self, inputs: &[&Buffer], outputs: &[&Buffer]) -> bool {
+        let mut needs = false;
+
+        // RAW check: current inputs vs previous outputs
+        for buf in inputs {
+            let addr = buf.gpu_address();
+            if self.temporaries.contains(&addr) {
+                continue;
+            }
+            if self.previous_outputs.contains(&addr) {
+                needs = true;
+                break;
+            }
+        }
+
+        // WAW check: current outputs vs previous outputs
+        if !needs {
+            for buf in outputs {
+                let addr = buf.gpu_address();
+                if self.temporaries.contains(&addr) {
+                    continue;
+                }
+                if self.previous_outputs.contains(&addr) {
+                    needs = true;
+                    break;
+                }
+            }
+        }
+
+        // WAR check: current outputs vs previous inputs
+        if !needs {
+            for buf in outputs {
+                let addr = buf.gpu_address();
+                if self.temporaries.contains(&addr) {
+                    continue;
+                }
+                if self.previous_inputs.contains(&addr) {
+                    needs = true;
+                    break;
+                }
+            }
+        }
+
+        if needs {
+            // Barrier needed: clear both tracking sets.
+            // After barrier, only the current dispatch's buffers are "pending".
+            self.previous_outputs.clear();
+            self.previous_inputs.clear();
+        }
+
+        // Track current outputs and inputs (accumulate)
+        for buf in outputs {
+            self.previous_outputs.insert(buf.gpu_address());
+        }
+        for buf in inputs {
+            self.previous_inputs.insert(buf.gpu_address());
+        }
+
+        needs
+    }
+
     /// Reset the tracker (e.g. when a new command buffer begins).
     pub fn reset(&mut self) {
         self.previous_outputs.clear();
+        self.previous_inputs.clear();
+        self.temporaries.clear();
     }
 }
 
@@ -340,6 +459,95 @@ pub fn encode_compute_1d_tracked(
 }
 
 // ---------------------------------------------------------------------------
+// Concurrent dispatch support
+// ---------------------------------------------------------------------------
+
+/// Create a compute command encoder with concurrent dispatch type.
+///
+/// A concurrent encoder allows multiple dispatches to run in parallel on
+/// the GPU. Memory dependencies between dispatches must be managed
+/// explicitly via `memory_barrier_scope_buffers()`.
+///
+/// Falls back to a serial encoder if the concurrent dispatch API is not
+/// available (should not happen on any Apple Silicon device).
+///
+/// # Safety
+///
+/// The caller must ensure all data dependencies between dispatches are
+/// covered by explicit `memory_barrier_scope_buffers()` calls. Without
+/// proper barriers, concurrent dispatches may read stale data.
+pub fn new_concurrent_encoder(cb: &CommandBufferRef) -> &ComputeCommandEncoderRef {
+    unsafe {
+        // MTLComputePassDescriptor
+        let desc_class = objc::runtime::Class::get("MTLComputePassDescriptor")
+            .expect("MTLComputePassDescriptor class not found");
+        let desc: *mut objc::runtime::Object = msg_send![desc_class, new];
+
+        // Set dispatch type to concurrent (1)
+        // MTLDispatchTypeConcurrent = 1
+        let _: () = msg_send![desc, setDispatchType: 1u64];
+
+        // Create encoder with descriptor
+        let encoder: &ComputeCommandEncoderRef =
+            msg_send![cb, computeCommandEncoderWithDescriptor: desc];
+
+        // Release descriptor (encoder retains what it needs)
+        let _: () = msg_send![desc, release];
+
+        encoder
+    }
+}
+
+/// Insert a scope-level memory barrier on a compute command encoder.
+///
+/// This is equivalent to `[encoder memoryBarrierWithScope:MTLBarrierScopeBuffers]`
+/// and ensures all buffer writes from previous dispatches on this encoder
+/// are visible to subsequent dispatches.
+///
+/// Use this between dependent dispatches on a concurrent encoder to
+/// prevent data races.
+pub fn memory_barrier_scope_buffers(encoder: &ComputeCommandEncoderRef) {
+    unsafe {
+        // MTLBarrierScope::Buffers = 1
+        let _: () = msg_send![encoder, memoryBarrierWithScope: 1u64];
+    }
+}
+
+/// Check if concurrent dispatch is available by attempting to create
+/// a concurrent encoder. Returns true if successful.
+///
+/// Called once at init to determine if the concurrent dispatch path
+/// can be used. If not, falls back to serial encoders.
+pub fn probe_concurrent_dispatch(device: &metal::Device) -> bool {
+    let queue = device.new_command_queue();
+    let cb = queue.new_command_buffer();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        let desc_class = objc::runtime::Class::get("MTLComputePassDescriptor");
+        if desc_class.is_none() {
+            return false;
+        }
+        let desc: *mut objc::runtime::Object = msg_send![desc_class.unwrap(), new];
+        if desc.is_null() {
+            return false;
+        }
+        let _: () = msg_send![desc, setDispatchType: 1u64];
+        let encoder: *mut objc::runtime::Object =
+            msg_send![cb, computeCommandEncoderWithDescriptor: desc];
+        let _: () = msg_send![desc, release];
+        if encoder.is_null() {
+            return false;
+        }
+        // End the encoder so we don't leak
+        let _: () = msg_send![encoder, endEncoding];
+        true
+    }));
+
+    // Don't commit — just discard the command buffer
+    result.unwrap_or(false)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -347,9 +555,15 @@ pub fn encode_compute_1d_tracked(
 mod tests {
     use super::*;
 
+    fn system_device() -> Option<metal::Device> {
+        metal::Device::system_default()
+    }
+
     #[test]
     fn test_barrier_tracker_no_conflict() {
-        let device = metal::Device::system_default().unwrap();
+        let Some(device) = system_device() else {
+            return;
+        };
         let a = device.new_buffer(256, metal::MTLResourceOptions::StorageModeShared);
         let b = device.new_buffer(256, metal::MTLResourceOptions::StorageModeShared);
 
@@ -365,7 +579,9 @@ mod tests {
 
     #[test]
     fn test_barrier_tracker_raw_hazard() {
-        let device = metal::Device::system_default().unwrap();
+        let Some(device) = system_device() else {
+            return;
+        };
         let a = device.new_buffer(256, metal::MTLResourceOptions::StorageModeShared);
 
         let mut tracker = BarrierTracker::new();
@@ -380,7 +596,9 @@ mod tests {
 
     #[test]
     fn test_barrier_tracker_waw_hazard() {
-        let device = metal::Device::system_default().unwrap();
+        let Some(device) = system_device() else {
+            return;
+        };
         let a = device.new_buffer(256, metal::MTLResourceOptions::StorageModeShared);
 
         let mut tracker = BarrierTracker::new();
@@ -395,7 +613,9 @@ mod tests {
 
     #[test]
     fn test_barrier_tracker_reset() {
-        let device = metal::Device::system_default().unwrap();
+        let Some(device) = system_device() else {
+            return;
+        };
         let a = device.new_buffer(256, metal::MTLResourceOptions::StorageModeShared);
 
         let mut tracker = BarrierTracker::new();
@@ -405,6 +625,101 @@ mod tests {
         // After reset, no hazard should be reported
         let needs = tracker.needs_barrier(&[&a], &[]);
         assert!(!needs, "no hazard after reset");
+    }
+
+    #[test]
+    fn test_barrier_tracker_temporary_exemption() {
+        let Some(device) = system_device() else {
+            return;
+        };
+        let a = device.new_buffer(256, metal::MTLResourceOptions::StorageModeShared);
+        let temp = device.new_buffer(256, metal::MTLResourceOptions::StorageModeShared);
+
+        let mut tracker = BarrierTracker::new();
+        tracker.mark_temporary(&temp);
+
+        // Write to temp
+        let needs = tracker.needs_barrier(&[], &[&temp]);
+        assert!(!needs, "first dispatch never needs barrier");
+
+        // Read temp (would be RAW, but temp is exempt)
+        let needs = tracker.needs_barrier(&[&temp], &[&a]);
+        assert!(!needs, "temporary buffer should be exempt from RAW check");
+    }
+
+    #[test]
+    fn test_barrier_tracker_temporary_waw_exemption() {
+        let Some(device) = system_device() else {
+            return;
+        };
+        let temp = device.new_buffer(256, metal::MTLResourceOptions::StorageModeShared);
+
+        let mut tracker = BarrierTracker::new();
+        tracker.mark_temporary(&temp);
+
+        let needs = tracker.needs_barrier(&[], &[&temp]);
+        assert!(!needs);
+
+        // WAW on temp (exempt)
+        let needs = tracker.needs_barrier(&[], &[&temp]);
+        assert!(!needs, "temporary buffer should be exempt from WAW check");
+    }
+
+    #[test]
+    fn test_barrier_tracker_clear_temporaries() {
+        let Some(device) = system_device() else {
+            return;
+        };
+        let temp = device.new_buffer(256, metal::MTLResourceOptions::StorageModeShared);
+
+        let mut tracker = BarrierTracker::new();
+        tracker.mark_temporary(&temp);
+        assert_eq!(tracker.temporary_count(), 1);
+
+        tracker.clear_temporaries();
+        assert_eq!(tracker.temporary_count(), 0);
+
+        // Now temp is no longer exempt
+        let needs = tracker.needs_barrier(&[], &[&temp]);
+        assert!(!needs, "first dispatch");
+
+        let needs = tracker.needs_barrier(&[&temp], &[]);
+        assert!(needs, "after clearing temporaries, RAW should be detected");
+    }
+
+    #[test]
+    fn test_barrier_tracker_mixed_temp_and_regular() {
+        let Some(device) = system_device() else {
+            return;
+        };
+        let regular = device.new_buffer(256, metal::MTLResourceOptions::StorageModeShared);
+        let temp = device.new_buffer(256, metal::MTLResourceOptions::StorageModeShared);
+
+        let mut tracker = BarrierTracker::new();
+        tracker.mark_temporary(&temp);
+
+        // Write both regular and temp
+        let needs = tracker.needs_barrier(&[], &[&regular, &temp]);
+        assert!(!needs, "first dispatch");
+
+        // Read regular (RAW) and temp (exempt)
+        let needs = tracker.needs_barrier(&[&regular, &temp], &[]);
+        assert!(needs, "regular buffer RAW should still trigger barrier");
+    }
+
+    #[test]
+    fn test_barrier_tracker_reset_clears_temporaries() {
+        let Some(device) = system_device() else {
+            return;
+        };
+        let temp = device.new_buffer(256, metal::MTLResourceOptions::StorageModeShared);
+
+        let mut tracker = BarrierTracker::new();
+        tracker.mark_temporary(&temp);
+        assert_eq!(tracker.temporary_count(), 1);
+
+        tracker.reset();
+        assert_eq!(tracker.temporary_count(), 0);
     }
 
     #[test]
@@ -495,5 +810,72 @@ mod tests {
 
         // No errors expected for a valid no-op command buffer.
         assert!(!store.has_errors());
+    }
+
+    // ----- Concurrent dispatch tests -----
+
+    #[test]
+    fn test_probe_concurrent_dispatch() {
+        let device = metal::Device::system_default().unwrap();
+        let supported = probe_concurrent_dispatch(&device);
+        // Apple Silicon always supports concurrent dispatch
+        assert!(
+            supported,
+            "concurrent dispatch should be supported on Apple Silicon"
+        );
+    }
+
+    #[test]
+    fn test_concurrent_encoder_creation() {
+        let device = metal::Device::system_default().unwrap();
+        let queue = device.new_command_queue();
+        let cb = queue.new_command_buffer();
+
+        let encoder = new_concurrent_encoder(cb);
+        // Should be able to end encoding without crash
+        encoder.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+    }
+
+    #[test]
+    fn test_memory_barrier_scope() {
+        let device = metal::Device::system_default().unwrap();
+        let queue = device.new_command_queue();
+        let cb = queue.new_command_buffer();
+
+        let encoder = new_concurrent_encoder(cb);
+        // Should be able to insert barrier without crash
+        memory_barrier_scope_buffers(encoder);
+        encoder.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+    }
+
+    #[test]
+    fn test_barrier_tracker_concurrent_mode() {
+        let device = metal::Device::system_default().unwrap();
+        let a = device.new_buffer(256, metal::MTLResourceOptions::StorageModeShared);
+        let b = device.new_buffer(256, metal::MTLResourceOptions::StorageModeShared);
+
+        let mut tracker = BarrierTracker::new();
+
+        // D1: write a
+        let needs = tracker.check_concurrent(&[], &[&a]);
+        assert!(!needs, "first dispatch");
+
+        // D2: write b (no conflict)
+        let needs = tracker.check_concurrent(&[], &[&b]);
+        assert!(!needs, "independent write");
+
+        // D3: read a (RAW with D1, which is still in previous_outputs)
+        let needs = tracker.check_concurrent(&[&a], &[]);
+        assert!(needs, "RAW with D1");
+
+        // D4: read b (was cleared by barrier, but b was also in accumulated outputs)
+        // After the barrier in D3, previous_outputs was cleared, then D3's outputs
+        // (none in this case) were added. So b is no longer tracked.
+        let needs = tracker.check_concurrent(&[&b], &[]);
+        assert!(!needs, "b was cleared by the barrier");
     }
 }

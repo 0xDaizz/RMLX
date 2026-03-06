@@ -104,12 +104,12 @@ fn test_metal_allocator_with_cache() {
     let allocator = MetalAllocator::new(Arc::clone(&device), 1024 * 1024);
 
     // Allocate and free
-    let buf = allocator.alloc(8192).expect("alloc");
+    let (buf, _offset) = allocator.alloc(8192).expect("alloc");
     assert!(buf.length() >= 8192);
     allocator.free(buf).expect("free");
 
     // Second allocation should use cache (cache hit)
-    let buf2 = allocator.alloc(8192).expect("alloc2");
+    let (buf2, _offset2) = allocator.alloc(8192).expect("alloc2");
     assert!(buf2.length() >= 8192);
 
     // Verify stats
@@ -161,7 +161,7 @@ fn test_allocator_block_limit() {
     allocator.set_block_limit(16384);
 
     // First allocation should succeed
-    let buf = allocator.alloc(8192).expect("first alloc within limit");
+    let (buf, _offset) = allocator.alloc(8192).expect("first alloc within limit");
     assert!(buf.length() >= 8192);
 
     // Second allocation that would exceed the limit should fail
@@ -343,8 +343,11 @@ fn test_small_alloc_uses_pool() {
     let initial_free = allocator.small_pool().free_count();
 
     // Allocate a small buffer (<256 B) — should route through SmallBufferPool.
-    let buf = allocator.alloc(64).expect("small alloc should succeed");
+    let (buf, sub_offset) = allocator.alloc(64).expect("small alloc should succeed");
     assert!(buf.length() > 0);
+    // Sub-allocation offset must be within the backing buffer.
+    assert!(sub_offset + 64 <= buf.length() as usize,
+        "sub_offset ({sub_offset}) + size (64) must fit within backing buffer length ({})", buf.length());
 
     // The small pool should have one fewer free slot.
     let after_alloc_free = allocator.small_pool().free_count();
@@ -374,8 +377,9 @@ fn test_large_alloc_bypasses_small_pool() {
     let initial_free = allocator.small_pool().free_count();
 
     // Allocate a buffer larger than MAX_SMALL_ALLOC (256 B).
-    let buf = allocator.alloc(4096).expect("large alloc should succeed");
+    let (buf, large_offset) = allocator.alloc(4096).expect("large alloc should succeed");
     assert!(buf.length() >= 4096);
+    assert_eq!(large_offset, 0, "large allocs should have zero offset");
 
     // Small pool should be untouched.
     assert_eq!(
@@ -399,10 +403,10 @@ fn test_leak_detector_tracks_alloc_free() {
     let allocator = MetalAllocator::new(Arc::clone(&device), 1024 * 1024);
     assert_eq!(allocator.leak_detector().outstanding_allocs(), 0);
 
-    let buf1 = allocator.alloc(4096).expect("alloc1");
+    let (buf1, _offset1) = allocator.alloc(4096).expect("alloc1");
     assert_eq!(allocator.leak_detector().outstanding_allocs(), 1);
 
-    let buf2 = allocator.alloc(8192).expect("alloc2");
+    let (buf2, _offset2) = allocator.alloc(8192).expect("alloc2");
     assert_eq!(allocator.leak_detector().outstanding_allocs(), 2);
 
     allocator.free(buf1).expect("free1");

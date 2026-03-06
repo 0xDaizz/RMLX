@@ -11,6 +11,10 @@ rmlx-alloc = { path = "../rmlx-alloc" }
 metal = { workspace = true }
 tracing = { workspace = true }
 
+[features]
+## Forward tracked_hazards through to rmlx-metal.
+tracked_hazards = ["rmlx-metal/tracked_hazards"]
+
 [[bench]]
 name = "ops_bench"
 harness = false
