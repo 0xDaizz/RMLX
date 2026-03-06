@@ -50,10 +50,11 @@ pub struct MetalAllocator {
     /// Recycles fixed-size Metal buffers to reduce runtime overhead for
     /// tiny allocations.
     small_pool: SmallBufferPool,
-    /// Mapping from GPU address to SmallAllocation for buffers that were
-    /// served by the small-buffer pool (PR 4.3). Used to route `free()`
-    /// back to the pool instead of the normal cache path.
-    small_allocs: Mutex<HashMap<u64, SmallAllocation>>,
+    /// Stack of outstanding SmallAllocations per GPU address (PR 4.3, P7-10).
+    /// With sub-allocation, all slots share the same backing buffer GPU address,
+    /// so we use a Vec per address. On free, we pop any slot — all slots are
+    /// interchangeable from the caller's perspective.
+    small_allocs: Mutex<HashMap<u64, Vec<SmallAllocation>>>,
     /// Leak detector tracking alloc/free counts and bytes (PR 4.3).
     leak_detector: LeakDetector,
     /// Optional Metal 3 residency manager (PR 4.3). Populated at runtime
@@ -239,7 +240,7 @@ impl MetalAllocator {
     /// normal cache / device path.
     ///
     /// Returns `Err(AllocError::ZeroSize)` for zero-size requests.
-    pub fn alloc(&self, size: usize) -> Result<rmlx_metal::metal::Buffer, AllocError> {
+    pub fn alloc(&self, size: usize) -> Result<(rmlx_metal::metal::Buffer, usize), AllocError> {
         // Reject zero-size allocations to prevent cache poisoning (A-P0-1).
         if size == 0 {
             return Err(AllocError::ZeroSize);
@@ -252,12 +253,15 @@ impl MetalAllocator {
             let guard = ReservationGuard::new(self, size);
 
             if let Some(mut small) = self.small_pool.alloc(size) {
+                let sub_offset = small.offset;
                 let buf = small
                     .buffer
                     .take()
                     .expect("small pool allocation must contain a buffer");
-                let alloc_size = buf.length() as usize;
-                // Adjust reservation if Metal rounded up the buffer size.
+                // With sub-allocation the backing buffer is larger than the
+                // slot, so use the slot size for accounting (not buf.length()).
+                let alloc_size = self.small_pool.slot_size();
+                // Adjust reservation if slot size differs from requested size.
                 if alloc_size > size {
                     let _ = self
                         .allocated_bytes
@@ -268,6 +272,8 @@ impl MetalAllocator {
                 self.stats.record_alloc(alloc_size);
                 self.leak_detector.record_alloc(alloc_size as u64);
                 let addr = buf.gpu_address();
+                // Track the backing buffer address in owned_ptrs (idempotent
+                // for sub-allocation — all slots share the same address).
                 self.track_buffer(&buf);
                 // Register with residency manager if available.
                 if let Ok(mut guard) = self.residency.lock() {
@@ -277,10 +283,10 @@ impl MetalAllocator {
                 }
                 // Track the SmallAllocation so free() can return the slot.
                 if let Ok(mut map) = self.small_allocs.lock() {
-                    map.insert(addr, small);
+                    map.entry(addr).or_default().push(small);
                 }
                 guard.defuse();
-                return Ok(buf);
+                return Ok((buf, sub_offset));
             }
         }
 
@@ -317,7 +323,7 @@ impl MetalAllocator {
                 }
             }
             guard.defuse();
-            return Ok(buf);
+            return Ok((buf, 0));
         }
 
         // Proactive GC: if memory pressure is high, evict cached buffers
@@ -376,7 +382,7 @@ impl MetalAllocator {
         }
 
         guard.defuse();
-        Ok(buf)
+        Ok((buf, 0))
     }
 
     /// Return a buffer to the cache for reuse.
@@ -400,6 +406,60 @@ impl MetalAllocator {
         let addr = buffer.gpu_address();
         let size = buffer.length() as usize;
 
+        // Check if this buffer came from the small-buffer pool FIRST (P7-10).
+        // With sub-allocation all small allocs share the same gpu_address, so
+        // we must check before owned_ptrs (which uses a HashSet).
+        let small = self
+            .small_allocs
+            .lock()
+            .ok()
+            .and_then(|mut map| {
+                let vec = map.get_mut(&addr)?;
+                let item = vec.pop();
+                // Remove the key entirely if the vec is now empty.
+                if vec.is_empty() {
+                    map.remove(&addr);
+                }
+                item
+            });
+
+        if let Some(mut small_alloc) = small {
+            let slot_size = self.small_pool.slot_size();
+            self.stats.record_free(slot_size);
+            self.leak_detector.record_free(slot_size as u64);
+
+            // Remove from residency manager if present.
+            if let Ok(mut guard) = self.residency.lock() {
+                if let Some(ref mut mgr) = *guard {
+                    mgr.remove_buffer(&buffer);
+                }
+            }
+
+            // Only remove from owned_ptrs when no more small allocs remain
+            // for this backing buffer address.
+            let no_more_small = self
+                .small_allocs
+                .lock()
+                .map(|map| !map.contains_key(&addr))
+                .unwrap_or(false);
+            if no_more_small {
+                if let Ok(mut set) = self.owned_ptrs.lock() {
+                    set.remove(&addr);
+                }
+            }
+
+            // Return the slot to the small-buffer pool.
+            small_alloc.buffer = Some(buffer);
+            self.small_pool.free(small_alloc);
+            // Release tracked bytes.
+            let _ = self.allocated_bytes.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |current| Some(current.saturating_sub(slot_size)),
+            );
+            return Ok(());
+        }
+
         // Ownership check (PR 4.2): only free buffers we actually own.
         {
             let mut set = self
@@ -419,28 +479,6 @@ impl MetalAllocator {
             if let Some(ref mut mgr) = *guard {
                 mgr.remove_buffer(&buffer);
             }
-        }
-
-        // Check if this buffer came from the small-buffer pool (PR 4.3).
-        let small = self
-            .small_allocs
-            .lock()
-            .ok()
-            .and_then(|mut map| map.remove(&addr));
-
-        if let Some(mut small_alloc) = small {
-            // Return the slot to the small-buffer pool.
-            small_alloc.buffer = Some(buffer);
-            self.small_pool.free(small_alloc);
-            // Release tracked bytes (small pool path uses fetch_add, not
-            // try_reserve, so we use fetch_sub here).
-            let _ = self.allocated_bytes.fetch_update(
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-                |current| Some(current.saturating_sub(size)),
-            );
-            // Drop the buffer (not cached — pool tracks the slot).
-            return Ok(());
         }
 
         self.release_reserved(size);
@@ -638,7 +676,7 @@ mod tests {
             }
         };
 
-        let buf = allocator.alloc(4096).expect("alloc failed");
+        let (buf, _offset) = allocator.alloc(4096).expect("alloc failed");
         let active_after_alloc = allocator.stats().active();
         assert!(active_after_alloc > 0);
 
@@ -679,7 +717,7 @@ mod tests {
         let allocator_b = Arc::new(MetalAllocator::new(device, 0));
 
         // Allocate from B, try to free via A.
-        let buf = allocator_b.alloc(4096).expect("alloc from B failed");
+        let (buf, _offset) = allocator_b.alloc(4096).expect("alloc from B failed");
         let returned_buf = match allocator_a.free(buf) {
             Err(AllocError::InvalidFreeBuffer(buf)) => buf,
             other => {
@@ -710,7 +748,7 @@ mod tests {
         };
         let allocator_b = Arc::new(MetalAllocator::new(device, 0));
 
-        let buf = allocator_b.alloc(4096).expect("alloc from B failed");
+        let (buf, _offset) = allocator_b.alloc(4096).expect("alloc from B failed");
         let original_addr = buf.gpu_address();
         let returned_buf = match allocator_a.free(buf) {
             Err(AllocError::InvalidFreeBuffer(buf)) => buf,
@@ -787,7 +825,7 @@ mod tests {
             }
         };
 
-        let buf = allocator.alloc(4096).expect("alloc failed");
+        let (buf, _offset) = allocator.alloc(4096).expect("alloc failed");
         // free() should succeed (same device, same allocator).
         allocator
             .free(buf)
@@ -795,10 +833,10 @@ mod tests {
         assert_eq!(allocator.allocated_bytes(), 0);
     }
 
-    // ---- #99: SmallBufferPool is_suballocating ----
+    // ---- #99 resolved: SmallBufferPool now sub-allocates (P7-10) ----
 
     #[test]
-    fn test_small_pool_is_not_suballocating() {
+    fn test_small_pool_is_suballocating() {
         let device = match GpuDevice::system_default() {
             Ok(d) => d,
             Err(_) => {
@@ -809,8 +847,8 @@ mod tests {
 
         let pool = SmallBufferPool::new(&device, None);
         assert!(
-            !pool.is_suballocating(),
-            "SmallBufferPool should report false until true sub-allocation is implemented"
+            pool.is_suballocating(),
+            "SmallBufferPool should sub-allocate from a single backing buffer (P7-10)"
         );
     }
 
@@ -836,7 +874,7 @@ mod tests {
         let mut bufs = Vec::new();
         for _ in 0..4 {
             match allocator.alloc(4096) {
-                Ok(b) => bufs.push(b),
+                Ok((b, _offset)) => bufs.push(b),
                 Err(_) => break,
             }
         }
@@ -856,12 +894,12 @@ mod tests {
         );
 
         // We should be able to allocate again up to the limit.
-        let buf = allocator.alloc(4096);
+        let result = allocator.alloc(4096);
         assert!(
-            buf.is_ok(),
+            result.is_ok(),
             "should be able to allocate again after freeing (reserved bytes were properly released)"
         );
-        if let Ok(b) = buf {
+        if let Ok((b, _offset)) = result {
             allocator.free(b).expect("free failed");
         }
     }

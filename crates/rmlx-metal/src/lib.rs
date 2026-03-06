@@ -35,10 +35,13 @@ pub use metal;
 pub use autorelease::ScopedPool;
 pub use batcher::CommandBatcher;
 pub use capture::{CaptureDestination, CaptureScope};
-pub use command::{BarrierTracker, CommandBufferManager, GpuError, GpuErrorStore};
+pub use command::{
+    memory_barrier_scope_buffers, new_concurrent_encoder, probe_concurrent_dispatch,
+    BarrierTracker, CommandBufferManager, GpuError, GpuErrorStore,
+};
 pub use device::{
-    Architecture, ChipTuning, GpuDevice, DEFAULT_BUFFER_OPTIONS, TRACKED_BUFFER_OPTIONS,
-    UNTRACKED_BUFFER_OPTIONS,
+    ArchClass, Architecture, ChipTuning, GpuDevice, DEFAULT_BUFFER_OPTIONS,
+    TRACKED_BUFFER_OPTIONS, UNTRACKED_BUFFER_OPTIONS,
 };
 pub use event::GpuEvent;
 pub use exec_graph::ExecGraph;
