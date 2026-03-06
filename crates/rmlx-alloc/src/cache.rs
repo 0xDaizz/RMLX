@@ -176,6 +176,24 @@ impl BufferCache {
     }
 }
 
+/// Align allocation size using tiered strategy to avoid over-alignment.
+///
+/// - size <= 16: align to 16 (minimum Metal buffer alignment)
+/// - size <= page_size: round up to next power of 2
+/// - size > page_size: page-align (original behavior)
+///
+/// This prevents an 8-byte request from wasting a full 16KB page.
+fn align_size(size: usize) -> usize {
+    let page = page_size();
+    if size <= 16 {
+        16
+    } else if size <= page {
+        size.next_power_of_two()
+    } else {
+        (size + page - 1) & !(page - 1)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,23 +270,5 @@ mod tests {
             "acquired buffer length {} must be >= 1024",
             acquired.length()
         );
-    }
-}
-
-/// Align allocation size using tiered strategy to avoid over-alignment.
-///
-/// - size <= 16: align to 16 (minimum Metal buffer alignment)
-/// - size <= page_size: round up to next power of 2
-/// - size > page_size: page-align (original behavior)
-///
-/// This prevents an 8-byte request from wasting a full 16KB page.
-fn align_size(size: usize) -> usize {
-    let page = page_size();
-    if size <= 16 {
-        16
-    } else if size <= page {
-        size.next_power_of_two()
-    } else {
-        (size + page - 1) & !(page - 1)
     }
 }

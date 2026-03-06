@@ -696,10 +696,8 @@ fn encode_quant_per_token(
         ));
     }
 
-    let scales_pipeline =
-        registry.get_pipeline("compute_scales_fp8e4m3", DType::Float16)?;
-    let quant_pipeline =
-        registry.get_pipeline("apply_quant_fp8e4m3", DType::Float16)?;
+    let scales_pipeline = registry.get_pipeline("compute_scales_fp8e4m3", DType::Float16)?;
+    let quant_pipeline = registry.get_pipeline("apply_quant_fp8e4m3", DType::Float16)?;
     let device = registry.device().raw();
 
     let fp8_out = Array::zeros(device, input.shape(), DType::Float8E4M3);
@@ -975,9 +973,8 @@ mod tests {
         );
 
         // Round-trip: dequantize and check values are close
-        let recovered =
-            dequant_per_token_fp8e4m3(&registry, &fp8_out, &scales, &queue)
-                .expect("dequant should succeed");
+        let recovered = dequant_per_token_fp8e4m3(&registry, &fp8_out, &scales, &queue)
+            .expect("dequant should succeed");
         assert_eq!(recovered.shape(), &[2, 4]);
 
         // Read f16 output as raw bytes and convert back to f32 for comparison
@@ -1033,23 +1030,22 @@ mod tests {
 
         let scale_vals = read_f32_array(&scales);
 
-        for row in 0..num_tokens {
+        for (row, &scale_val) in scale_vals.iter().enumerate().take(num_tokens) {
             let peak = (row as f32 + 1.0) * 100.0;
             let expected_scale = peak / 448.0;
             assert!(
-                (scale_vals[row] - expected_scale).abs() < 1e-2,
+                (scale_val - expected_scale).abs() < 1e-2,
                 "row {}: scale = {}, expected ~{} (peak={})",
                 row,
-                scale_vals[row],
+                scale_val,
                 expected_scale,
                 peak
             );
         }
 
         // Round-trip dequant and verify the peak values survive
-        let recovered =
-            dequant_per_token_fp8e4m3(&registry, &fp8_out, &scales, &queue)
-                .expect("dequant should succeed");
+        let recovered = dequant_per_token_fp8e4m3(&registry, &fp8_out, &scales, &queue)
+            .expect("dequant should succeed");
 
         let raw_ptr = recovered.metal_buffer().contents() as *const u16;
         for row in 0..num_tokens {
@@ -1107,7 +1103,11 @@ mod tests {
         } else if exp == 0 {
             // Subnormal
             let val = (mant as f32 / 1024.0) * 2.0f32.powi(-14);
-            if sign == 1 { -val } else { val }
+            if sign == 1 {
+                -val
+            } else {
+                val
+            }
         } else if exp == 31 {
             if mant != 0 {
                 f32::NAN
@@ -1118,7 +1118,11 @@ mod tests {
             }
         } else {
             let val = (1.0 + mant as f32 / 1024.0) * 2.0f32.powi(exp - 15);
-            if sign == 1 { -val } else { val }
+            if sign == 1 {
+                -val
+            } else {
+                val
+            }
         }
     }
 }

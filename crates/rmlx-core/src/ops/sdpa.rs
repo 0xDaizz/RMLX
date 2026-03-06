@@ -1166,7 +1166,10 @@ pub fn sdpa(
             let expanded = Array::zeros(dev, &[n, s], m.dtype());
             let src = m.metal_buffer().contents() as *const u8;
             let dst = expanded.metal_buffer().contents() as *mut u8;
-            let row_bytes = m.dtype().numel_to_bytes(s).expect("numel must be block-aligned");
+            let row_bytes = m
+                .dtype()
+                .numel_to_bytes(s)
+                .expect("numel must be block-aligned");
             // SAFETY: SharedMode buffers are CPU-accessible; bounds checked by
             // Array::zeros allocation and row_bytes computation.
             unsafe {
@@ -1560,7 +1563,7 @@ mod tests {
         let v = Array::zeros(dev, &[6, 8], DType::Float32);
 
         let result = sdpa(&registry, &q, &k, &v, None, 0.125, false, &queue);
-        let err = result.err().expect("expected error");
+        let err = result.expect_err("expected error");
         let msg = format!("{err}");
         assert!(
             msg.contains("dtype mismatch"),
@@ -1578,7 +1581,7 @@ mod tests {
         let v = Array::zeros(dev, &[6, 8], DType::Float32);
 
         let result = sdpa(&registry, &q, &k, &v, None, 0.125, false, &queue);
-        let err = result.err().expect("expected error");
+        let err = result.expect_err("expected error");
         let msg = format!("{err}");
         assert!(
             msg.contains("dtype mismatch"),
@@ -1601,7 +1604,7 @@ mod tests {
         assert!(!nc_mask.is_contiguous(), "mask should be non-contiguous");
 
         let result = sdpa(&registry, &q, &k, &v, Some(&nc_mask), 0.125, false, &queue);
-        let err = result.err().expect("expected error");
+        let err = result.expect_err("expected error");
         let msg = format!("{err}");
         assert!(
             msg.contains("contiguous"),
@@ -1621,7 +1624,7 @@ mod tests {
         let queue = dev.new_command_queue();
         let cb = queue.new_command_buffer();
         let result = sdpa_into_cb(&registry, &q, &k, &v, None, 0.125, cb);
-        let err = result.err().expect("expected error");
+        let err = result.expect_err("expected error");
         let msg = format!("{err}");
         assert!(
             msg.contains("dtype mismatch"),

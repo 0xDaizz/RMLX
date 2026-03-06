@@ -97,7 +97,10 @@ pub fn is_capture_supported() -> bool {
 /// Uses `metal::CaptureManager`, `metal::CaptureDescriptor`, etc. instead of
 /// raw `objc` FFI calls, avoiding pointer-cast and C-string memory corruption
 /// bugs that existed in the previous implementation.
-fn start_capture(device: &metal::Device, destination: &CaptureDestination) -> Result<(), MetalError> {
+fn start_capture(
+    device: &metal::Device,
+    destination: &CaptureDestination,
+) -> Result<(), MetalError> {
     let manager = metal::CaptureManager::shared();
 
     let descriptor = metal::CaptureDescriptor::new();

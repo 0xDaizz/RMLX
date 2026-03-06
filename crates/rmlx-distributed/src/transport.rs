@@ -39,10 +39,7 @@ pub struct ZeroCopyPendingOp {
 impl ZeroCopyPendingOp {
     /// Create a new `ZeroCopyPendingOp` that ties buffer lifetime to the op.
     pub fn new(pending: PendingOp, buf: Arc<SharedBuffer>) -> Self {
-        Self {
-            pending,
-            _buf: buf,
-        }
+        Self { pending, _buf: buf }
     }
 
     /// Non-blocking poll. Returns `Some` if the operation has completed.
@@ -58,7 +55,10 @@ impl ZeroCopyPendingOp {
     }
 
     /// Blocking wait with timeout. The buffer stays alive regardless of outcome.
-    pub fn wait(&self, timeout: std::time::Duration) -> Result<rmlx_rdma::progress::Completion, rmlx_rdma::progress::WaitError> {
+    pub fn wait(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<rmlx_rdma::progress::Completion, rmlx_rdma::progress::WaitError> {
         self.pending.wait(timeout)
     }
 
@@ -79,7 +79,9 @@ impl Drop for ZeroCopyPendingOp {
         let mut warned = false;
         while self.pending.is_pending() {
             if !warned && start.elapsed() > std::time::Duration::from_secs(5) {
-                eprintln!("WARNING: ZeroCopyPendingOp still pending after 5s, blocking until complete");
+                eprintln!(
+                    "WARNING: ZeroCopyPendingOp still pending after 5s, blocking until complete"
+                );
                 warned = true;
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -1276,6 +1278,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
     fn test_zero_copy_pending_op_keeps_buffer_alive() {
         use rmlx_rdma::progress::ProgressEngine;
         use rmlx_rdma::shared_buffer::SharedBuffer;
@@ -1318,6 +1321,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
     fn test_zero_copy_pending_op_completed_drops_immediately() {
         use rmlx_rdma::progress::ProgressEngine;
         use rmlx_rdma::shared_buffer::SharedBuffer;

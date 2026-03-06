@@ -234,6 +234,29 @@ fn auto_detect_block_limit(device: &rmlx_metal::metal::Device) -> usize {
     std::cmp::min(from_recommended, from_total)
 }
 
+/// Query total physical memory via sysctl (macOS).
+fn total_physical_memory() -> usize {
+    // SAFETY: sysctl with CTL_HW / HW_MEMSIZE is always safe on macOS.
+    unsafe {
+        let mut memsize: u64 = 0;
+        let mut size = std::mem::size_of::<u64>();
+        let mib: [libc::c_int; 2] = [libc::CTL_HW, libc::HW_MEMSIZE];
+        let ret = libc::sysctl(
+            mib.as_ptr() as *mut libc::c_int,
+            2,
+            &mut memsize as *mut u64 as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        );
+        if ret == 0 {
+            memsize as usize
+        } else {
+            0
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,28 +278,5 @@ mod tests {
             matches!(result.unwrap_err(), AllocError::ZeroSize),
             "error should be ZeroSize variant"
         );
-    }
-}
-
-/// Query total physical memory via sysctl (macOS).
-fn total_physical_memory() -> usize {
-    // SAFETY: sysctl with CTL_HW / HW_MEMSIZE is always safe on macOS.
-    unsafe {
-        let mut memsize: u64 = 0;
-        let mut size = std::mem::size_of::<u64>();
-        let mib: [libc::c_int; 2] = [libc::CTL_HW, libc::HW_MEMSIZE];
-        let ret = libc::sysctl(
-            mib.as_ptr() as *mut libc::c_int,
-            2,
-            &mut memsize as *mut u64 as *mut libc::c_void,
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        );
-        if ret == 0 {
-            memsize as usize
-        } else {
-            0
-        }
     }
 }

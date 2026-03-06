@@ -28,7 +28,11 @@ pub enum GgufError {
     InvalidGgmlType(u32),
     InvalidString,
     InvalidAlignment(u64),
-    OffsetOutOfBounds { tensor: String, offset: u64, data_len: u64 },
+    OffsetOutOfBounds {
+        tensor: String,
+        offset: u64,
+        data_len: u64,
+    },
     Overflow(String),
 }
 
@@ -48,8 +52,15 @@ impl std::fmt::Display for GgufError {
             GgufError::InvalidGgmlType(t) => write!(f, "invalid GGML type: {t}"),
             GgufError::InvalidString => write!(f, "invalid UTF-8 in GGUF string"),
             GgufError::InvalidAlignment(a) => write!(f, "invalid GGUF alignment: {a}"),
-            GgufError::OffsetOutOfBounds { tensor, offset, data_len } => {
-                write!(f, "tensor \"{tensor}\" offset {offset} exceeds data length {data_len}")
+            GgufError::OffsetOutOfBounds {
+                tensor,
+                offset,
+                data_len,
+            } => {
+                write!(
+                    f,
+                    "tensor \"{tensor}\" offset {offset} exceeds data length {data_len}"
+                )
             }
             GgufError::Overflow(msg) => write!(f, "overflow: {msg}"),
         }
@@ -415,25 +426,27 @@ pub fn parse_gguf<R: Read + Seek>(reader: &mut R) -> Result<GgufFile, GgufError>
     let data_len = end.saturating_sub(data_offset);
     for t in &tensors {
         // Compute number of elements from shape (product of dims, minimum 1 for scalars).
-        let n_elements: u64 = t.shape.iter().copied().map(|d| d as u64).product::<u64>().max(1);
+        let n_elements: u64 = t.shape.iter().copied().product::<u64>().max(1);
         let block_size = t.ggml_type.block_size() as u64;
         let type_size = t.ggml_type.type_size() as u64;
         // Number of blocks = ceil(n_elements / block_size)
         let n_blocks = n_elements.div_ceil(block_size);
-        let tensor_byte_size = n_blocks.checked_mul(type_size).ok_or_else(|| {
-            GgufError::OffsetOutOfBounds {
-                tensor: t.name.clone(),
-                offset: t.offset,
-                data_len,
-            }
-        })?;
-        let end_offset = t.offset.checked_add(tensor_byte_size).ok_or_else(|| {
-            GgufError::OffsetOutOfBounds {
-                tensor: t.name.clone(),
-                offset: t.offset,
-                data_len,
-            }
-        })?;
+        let tensor_byte_size =
+            n_blocks
+                .checked_mul(type_size)
+                .ok_or_else(|| GgufError::OffsetOutOfBounds {
+                    tensor: t.name.clone(),
+                    offset: t.offset,
+                    data_len,
+                })?;
+        let end_offset =
+            t.offset
+                .checked_add(tensor_byte_size)
+                .ok_or_else(|| GgufError::OffsetOutOfBounds {
+                    tensor: t.name.clone(),
+                    offset: t.offset,
+                    data_len,
+                })?;
         if end_offset > data_len {
             return Err(GgufError::OffsetOutOfBounds {
                 tensor: t.name.clone(),
@@ -587,7 +600,7 @@ mod tests {
         }
 
         // Append tensor data: 8 * 4 = 32 F32 elements = 128 bytes
-        buf.extend_from_slice(&vec![0u8; 32 * 4]);
+        buf.extend_from_slice(&[0u8; 32 * 4]);
 
         buf
     }

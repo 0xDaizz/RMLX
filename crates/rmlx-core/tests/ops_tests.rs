@@ -268,7 +268,9 @@ fn test_quantized_matmul_vec_size_mismatch() {
     let in_features: usize = 64;
     let out_features: usize = 32;
     // Create correctly sized Q8_0 weights buffer
-    let weight_bytes = DType::Q8_0.numel_to_bytes(out_features * in_features).unwrap();
+    let weight_bytes = DType::Q8_0
+        .numel_to_bytes(out_features * in_features)
+        .unwrap();
     let weights = Array::new(
         dev.new_buffer(
             weight_bytes as u64,
@@ -302,7 +304,9 @@ fn test_quantized_matmul_weights_buffer_too_small() {
     let in_features: usize = 64;
     let out_features: usize = 32;
     // Create UNDERSIZED weights buffer (only enough for half the rows)
-    let small_bytes = DType::Q8_0.numel_to_bytes((out_features / 2) * in_features).unwrap();
+    let small_bytes = DType::Q8_0
+        .numel_to_bytes((out_features / 2) * in_features)
+        .unwrap();
     let weights = Array::new(
         dev.new_buffer(
             small_bytes as u64,
@@ -1273,8 +1277,7 @@ fn test_softmax_empty_0x4() {
     };
     let dev = registry.device().raw();
     let input = Array::from_slice::<f32>(dev, &[], vec![0, 4]);
-    let output =
-        ops::softmax::softmax(&registry, &input, &queue).expect("softmax [0,4] failed");
+    let output = ops::softmax::softmax(&registry, &input, &queue).expect("softmax [0,4] failed");
     assert_eq!(output.shape(), &[0, 4]);
     assert_eq!(output.numel(), 0);
 }
@@ -1287,8 +1290,7 @@ fn test_softmax_empty_3x0() {
     };
     let dev = registry.device().raw();
     let input = Array::from_slice::<f32>(dev, &[], vec![3, 0]);
-    let output =
-        ops::softmax::softmax(&registry, &input, &queue).expect("softmax [3,0] failed");
+    let output = ops::softmax::softmax(&registry, &input, &queue).expect("softmax [3,0] failed");
     assert_eq!(output.shape(), &[3, 0]);
     assert_eq!(output.numel(), 0);
 }
@@ -1309,8 +1311,11 @@ fn test_rope_freq_wrong_ndim() {
     let sin_f = Array::from_slice(dev, &[0.0f32, 0.0], vec![2]);
     let result = ops::rope::rope(&registry, &input, &cos_f, &sin_f, 0, 1.0, &queue);
     assert!(result.is_err(), "1-D freq tensors should be rejected");
-    let msg = format!("{}", result.err().expect("expected Err"));
-    assert!(msg.contains("2-D"), "error should mention 2-D requirement: {msg}");
+    let msg = format!("{}", result.expect_err("expected Err"));
+    assert!(
+        msg.contains("2-D"),
+        "error should mention 2-D requirement: {msg}"
+    );
 }
 
 #[test]
@@ -1327,8 +1332,11 @@ fn test_rope_freq_wrong_cols() {
     let sin_f = Array::from_slice(dev, &[0.0f32, 0.0, 0.0], vec![1, 3]);
     let result = ops::rope::rope(&registry, &input, &cos_f, &sin_f, 0, 1.0, &queue);
     assert!(result.is_err(), "wrong freq cols should be rejected");
-    let msg = format!("{}", result.err().expect("expected Err"));
-    assert!(msg.contains("head_dim/2"), "error should mention head_dim/2: {msg}");
+    let msg = format!("{}", result.expect_err("expected Err"));
+    assert!(
+        msg.contains("head_dim/2"),
+        "error should mention head_dim/2: {msg}"
+    );
 }
 
 #[test]
@@ -1345,7 +1353,7 @@ fn test_rope_freq_insufficient_rows() {
     let sin_f = Array::from_slice(dev, &[0.0f32, 0.0], vec![1, 2]);
     let result = ops::rope::rope(&registry, &input, &cos_f, &sin_f, 0, 1.0, &queue);
     assert!(result.is_err(), "insufficient freq rows should be rejected");
-    let msg = format!("{}", result.err().expect("expected Err"));
+    let msg = format!("{}", result.expect_err("expected Err"));
     assert!(msg.contains("rows"), "error should mention rows: {msg}");
 }
 
@@ -1362,8 +1370,11 @@ fn test_rope_freq_insufficient_rows_with_offset() {
     let cos_f = Array::from_slice(dev, &[1.0f32, 1.0, 1.0, 1.0], vec![2, 2]);
     let sin_f = Array::from_slice(dev, &[0.0f32, 0.0, 0.0, 0.0], vec![2, 2]);
     let result = ops::rope::rope(&registry, &input, &cos_f, &sin_f, 2, 1.0, &queue);
-    assert!(result.is_err(), "insufficient freq rows with offset should be rejected");
-    let msg = format!("{}", result.err().expect("expected Err"));
+    assert!(
+        result.is_err(),
+        "insufficient freq rows with offset should be rejected"
+    );
+    let msg = format!("{}", result.expect_err("expected Err"));
     assert!(msg.contains("offset"), "error should mention offset: {msg}");
 }
 
@@ -1379,10 +1390,12 @@ fn test_rope_ext_into_cb_freq_validation() {
     let cos_f = Array::from_slice(dev, &[1.0f32, 1.0], vec![2]);
     let sin_f = Array::from_slice(dev, &[0.0f32, 0.0], vec![2]);
     let cb = queue.new_command_buffer();
-    let result = ops::rope::rope_ext_into_cb(
-        &registry, &input, &cos_f, &sin_f, 0, 1.0, true, true, cb,
+    let result =
+        ops::rope::rope_ext_into_cb(&registry, &input, &cos_f, &sin_f, 0, 1.0, true, true, cb);
+    assert!(
+        result.is_err(),
+        "rope_ext_into_cb should validate freq tensor dims"
     );
-    assert!(result.is_err(), "rope_ext_into_cb should validate freq tensor dims");
 }
 
 // ─── PR 0.7: GEMV dtype validation tests ───
@@ -1399,8 +1412,11 @@ fn test_gemv_dtype_mismatch_vec() {
     let vec_f16 = Array::zeros(dev, &[3], DType::Float16);
     let result = ops::gemv::gemv(&registry, &mat, &vec_f16, &queue);
     assert!(result.is_err(), "gemv should reject mismatched dtypes");
-    let msg = format!("{}", result.err().expect("expected Err"));
-    assert!(msg.contains("dtype mismatch"), "error should mention dtype mismatch: {msg}");
+    let msg = format!("{}", result.expect_err("expected Err"));
+    assert!(
+        msg.contains("dtype mismatch"),
+        "error should mention dtype mismatch: {msg}"
+    );
 }
 
 #[test]
@@ -1415,9 +1431,15 @@ fn test_gemv_bias_dtype_mismatch_vec() {
     let vec_f16 = Array::zeros(dev, &[3], DType::Float16);
     let bias = Array::from_slice(dev, &[0.1f32, 0.2], vec![2]);
     let result = ops::gemv::gemv_bias(&registry, &mat, &vec_f16, &bias, &queue);
-    assert!(result.is_err(), "gemv_bias should reject mismatched vec dtype");
-    let msg = format!("{}", result.err().expect("expected Err"));
-    assert!(msg.contains("dtype mismatch"), "error should mention dtype mismatch: {msg}");
+    assert!(
+        result.is_err(),
+        "gemv_bias should reject mismatched vec dtype"
+    );
+    let msg = format!("{}", result.expect_err("expected Err"));
+    assert!(
+        msg.contains("dtype mismatch"),
+        "error should mention dtype mismatch: {msg}"
+    );
 }
 
 #[test]
@@ -1432,9 +1454,15 @@ fn test_gemv_bias_dtype_mismatch_bias() {
     let v = Array::from_slice(dev, &[1.0f32, 1.0, 1.0], vec![3]);
     let bias_f16 = Array::zeros(dev, &[2], DType::Float16);
     let result = ops::gemv::gemv_bias(&registry, &mat, &v, &bias_f16, &queue);
-    assert!(result.is_err(), "gemv_bias should reject mismatched bias dtype");
-    let msg = format!("{}", result.err().expect("expected Err"));
-    assert!(msg.contains("dtype mismatch"), "error should mention dtype mismatch: {msg}");
+    assert!(
+        result.is_err(),
+        "gemv_bias should reject mismatched bias dtype"
+    );
+    let msg = format!("{}", result.expect_err("expected Err"));
+    assert!(
+        msg.contains("dtype mismatch"),
+        "error should mention dtype mismatch: {msg}"
+    );
 }
 
 #[test]
@@ -1449,6 +1477,9 @@ fn test_gemv_t_dtype_mismatch_vec() {
     let vec_f16 = Array::zeros(dev, &[2], DType::Float16);
     let result = ops::gemv::gemv_t(&registry, &mat, &vec_f16, &queue);
     assert!(result.is_err(), "gemv_t should reject mismatched dtypes");
-    let msg = format!("{}", result.err().expect("expected Err"));
-    assert!(msg.contains("dtype mismatch"), "error should mention dtype mismatch: {msg}");
+    let msg = format!("{}", result.expect_err("expected Err"));
+    assert!(
+        msg.contains("dtype mismatch"),
+        "error should mention dtype mismatch: {msg}"
+    );
 }

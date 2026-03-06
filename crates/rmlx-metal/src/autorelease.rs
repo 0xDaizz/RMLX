@@ -56,7 +56,10 @@ impl ScopedPool {
             let pool: *mut objc::runtime::Object = objc::msg_send![pool, init];
             pool
         };
-        Self { pool, _marker: PhantomData }
+        Self {
+            pool,
+            _marker: PhantomData,
+        }
     }
 }
 
@@ -109,8 +112,12 @@ mod tests {
     // the following test will fail.
     #[test]
     fn scoped_pool_is_not_send_or_sync() {
-        fn is_send<T: Send>() -> bool { true }
-        fn is_sync<T: Sync>() -> bool { true }
+        fn is_send<T: Send>(_: &T) -> bool {
+            true
+        }
+        fn is_sync<T: Sync>(_: &T) -> bool {
+            true
+        }
 
         // We cannot call is_send::<ScopedPool>() directly (it won't compile,
         // which is the desired behavior). Instead we verify via trait objects.
@@ -119,7 +126,7 @@ mod tests {
         // This test documents the invariant; the real guard is the
         // PhantomData marker which makes `fn needs_send<T: Send>(_: T) {}`
         // fail to compile if passed a ScopedPool.
-        let _ = (is_send::<u8>, is_sync::<u8>); // suppress unused warnings
+        let _ = (is_send::<u8>(&0), is_sync::<u8>(&0)); // suppress unused warnings
     }
 
     #[test]
