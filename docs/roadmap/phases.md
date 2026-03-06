@@ -1,6 +1,6 @@
-# 🗺️ Implementation Roadmap — Phases 0-9B + S1-S5 + Audit Remediation Complete
+# Implementation Roadmap — Phases 0-9B + S1-S5 + Audit Remediation + Phase 3 Complete
 
-The rmlx project implementation roadmap. All phases through 9B-opt and serving support phases S1-S5 are complete. A full-crate audit (Phases 0, 1, 2) has been completed with 76 remediation items resolved across all 6 crates. Current test count: 543.
+The rmlx project implementation roadmap. All phases through 9B-opt and serving support phases S1-S5 are complete. A full-crate audit (Phases 0, 1, 2) has been completed with 76 remediation items resolved across all 6 crates. Phase 3 adds FlashAttention-2 Metal kernel, paged KV cache, continuous batching scheduler, centralized CB commit, f16/bf16 RDMA collectives, ring allreduce chunk rounding fix, MoePolicy thread safety, and CLI signal forwarding. Current test count: 543+.
 
 ---
 
@@ -35,6 +35,14 @@ The rmlx project implementation roadmap. All phases through 9B-opt and serving s
 | EP-4 | Compute-Communication Overlap (TBO + SBO) | MoePipeline, GpuEvent chains, zero CPU waits in-flight | EP-2 + EP-3 | Complete |
 | EP-5 | FP8 Wire Format | Per-token E4M3 quantization, fused dequant-scatter, _into_cb exchange path | EP-3 | Complete |
 | EP-6 | ICB Sparse Expert Launch + RDMA Slab Ring | Sparse ICB execution + pre-registered slab ring zero-copy transfer | EP-4 + EP-5 | Complete |
+| P3-1 | FlashAttention-2 Metal Kernel | Tiled online softmax, f32 head_dim=128, causal mask, naive SDPA fallback | EP-6 | Complete |
+| P3-2 | Paged KV Cache + Block Manager | vLLM-style block allocation, copy-on-write, Metal buffer pool | P3-1 | Complete |
+| P3-3 | Continuous Batching Scheduler | Request queue, memory-aware batch scheduling, prefill/decode phases | P3-2 | Complete |
+| P3-4 | Centralized CB Commit (`commit_with_mode`) | All rmlx-core ops routed through `commit_with_mode()`, sync/async modes, `CommandBufferHandle` | P3-1 | Complete |
+| P3-5 | f16/bf16 RDMA Collectives | `ReduceElement` trait, `CollectiveDType` enum, typed allreduce/broadcast/allgather | EP-6 | Complete |
+| P3-6 | Ring Allreduce Chunk Rounding | Element-aligned chunks, f16/bf16 reduction via `half` crate, NaN preservation | P3-5 | Complete |
+| P3-7 | MoePolicy Thread Safety | Interior mutability via RwLock, `&self` methods, Send+Sync | EP-6 | Complete |
+| P3-8 | CLI Signal Forwarding | ctrlc handler, process cleanup in rmlx-cli launch.rs | EP-6 | Complete |
 | EP-7 | ICB Full Metal Indirect Dispatch | Wire SparseExpertPlan into ExpertGroup GEMM encoding via Metal ICB indirect dispatch; skip empty experts at GPU command level | EP-6 | Planned |
 
 ---
@@ -72,6 +80,17 @@ The rmlx project implementation roadmap. All phases through 9B-opt and serving s
 | EP-4: Compute-Communication Overlap (TBO + SBO) (`moe_pipeline.rs`) | main (merged) | 543+ tests | Complete |
 | EP-5: FP8 Wire Format (`fp8.rs`, `fp8_exchange.rs`) | main (merged) | 543+ tests | Complete |
 | EP-6: ICB Sparse Expert Launch + RDMA Slab Ring (`icb_sparse.rs`, `slab_ring.rs`) | main (merged) | 543+ tests | Complete |
+| Production Readiness Phase 0: Initial hardening pass | main | 543+ tests | Complete |
+| Production Readiness Phase 1: Metal/alloc safety | main | 543+ tests | Complete |
+| Production Readiness Phase 2: Distributed correctness | main | 543+ tests | Complete |
+| P3-1: FlashAttention-2 Metal Kernel | main (merged) | 543+ tests | Complete |
+| P3-2: Paged KV Cache + Block Manager | main (merged) | 543+ tests | Complete |
+| P3-3: Continuous Batching Scheduler | main (merged) | 543+ tests | Complete |
+| P3-4: Centralized CB Commit (`commit_with_mode`) | main (merged) | 543+ tests | Complete |
+| P3-5: f16/bf16 RDMA Collectives | main (merged) | 543+ tests | Complete |
+| P3-6: Ring Allreduce Chunk Rounding | main (merged) | 543+ tests | Complete |
+| P3-7: MoePolicy Thread Safety | main (merged) | 543+ tests | Complete |
+| P3-8: CLI Signal Forwarding | main (merged) | 543+ tests | Complete |
 | EP-7: ICB Full Metal Indirect Dispatch | -- | -- | Planned |
 
 ---
@@ -615,7 +634,24 @@ Post-audit EP optimization phases were merged into main to remove the remaining 
 | EP-5 | `crates/rmlx-core/src/ops/fp8.rs`, `crates/rmlx-distributed/src/fp8_exchange.rs` | Per-token FP8 E4M3 wire format, fused `dequant_scatter_fp8e4m3`, `_into_cb` pipelining variants | Complete |
 | EP-6 | `crates/rmlx-metal/src/icb_sparse.rs`, `crates/rmlx-distributed/src/slab_ring.rs` | Sparse expert ICB launch cache + pre-registered RDMA slab ring with `GpuEvent` timeline sync | Complete |
 
-Current op module count: 27. Current test count: 543+.
+Current op module count: 27+. Current test count: 543+.
+
+---
+
+## Phase 3: Serving Infrastructure + Correctness Hardening -- Complete
+
+Phase 3 delivers serving-critical infrastructure (FlashAttention-2 Metal kernel, paged KV cache, continuous batching scheduler), centralized command buffer commit for all ops, f16/bf16 RDMA collectives, and correctness fixes across distributed and CLI crates.
+
+| PR | Key Files | Core Changes | Status |
+|----|-----------|--------------|--------|
+| P3-1 | `crates/rmlx-core/src/ops/flash_attention.rs` | FlashAttention-2 Metal kernel: tiled online softmax, f32 head_dim=128, causal mask, falls back to naive SDPA | Complete |
+| P3-2 | `crates/rmlx-nn/src/paged_kv_cache.rs` | vLLM-style paged KV cache with block manager, copy-on-write, Metal buffer pool | Complete |
+| P3-3 | `crates/rmlx-nn/src/scheduler.rs` | Continuous batching scheduler: request queue, memory-aware batch scheduling, prefill/decode phases | Complete |
+| P3-4 | rmlx-core ops (all modules) | Centralized CB commit via `commit_with_mode()` with sync/async `ExecMode`, `CommandBufferHandle` for async tracking | Complete |
+| P3-5 | `crates/rmlx-rdma/` | `ReduceElement` trait, `CollectiveDType` enum, typed f16/bf16 allreduce/broadcast/allgather | Complete |
+| P3-6 | `crates/rmlx-distributed/` | Ring allreduce element-aligned chunk rounding, f16/bf16 reduction via `half` crate, NaN preservation | Complete |
+| P3-7 | `crates/rmlx-distributed/src/moe_policy.rs` | MoePolicy interior mutability via RwLock, all methods take `&self`, Send+Sync | Complete |
+| P3-8 | `crates/rmlx-cli/src/launch.rs` | ctrlc signal handler, child process cleanup on SIGINT/SIGTERM | Complete |
 
 ---
 

@@ -318,7 +318,7 @@ impl Group {
         op: ReduceOp,
         dtype: ReduceDtype,
     ) -> Result<Vec<u8>, DistributedError> {
-        Self::check_materialized("allreduce_op", data)?;
+        Self::check_materialized_dtype("allreduce_op", data, dtype)?;
         if self.ranks.len() <= 1 {
             return Ok(data.to_vec());
         }
@@ -608,6 +608,33 @@ impl Group {
         ensure_materialized(&shapes)
     }
 
+    /// Dtype-aware materialization check for allreduce_op.
+    ///
+    /// For f16/bf16, requires 2-byte alignment instead of 4-byte.
+    fn check_materialized_dtype(
+        op_name: &str,
+        data: &[u8],
+        dtype: ReduceDtype,
+    ) -> Result<(), DistributedError> {
+        if data.is_empty() {
+            return Err(DistributedError::NotMaterialized(format!(
+                "{op_name}: data is empty"
+            )));
+        }
+        let elem_size = match dtype {
+            ReduceDtype::F32 => 4,
+            ReduceDtype::F16 | ReduceDtype::Bf16 => 2,
+        };
+        if data.len() % elem_size != 0 {
+            return Err(DistributedError::NotMaterialized(format!(
+                "{op_name}: data length ({}) not aligned to {elem_size} bytes for {:?}",
+                data.len(),
+                dtype
+            )));
+        }
+        Ok(())
+    }
+
     /// Validate that a rank is within the group.
     fn validate_rank(&self, op_name: &str, rank: u32) -> Result<(), DistributedError> {
         if rank >= self.world_size || !self.ranks.contains(&rank) {
@@ -691,8 +718,10 @@ fn ring_allreduce(
     let right = ranks[(my_idx + 1) % n];
     let left = ranks[(my_idx + n - 1) % n];
 
-    // Split data into N equal chunks (pad if needed)
+    // Split data into N equal chunks (pad if needed).
+    // Round up to f32 element boundary (4 bytes) so reduction never reads partial elements.
     let chunk_size = data.len().div_ceil(n);
+    let chunk_size = chunk_size.div_ceil(4) * 4;
     let mut buf = data.to_vec();
     buf.resize(chunk_size * n, 0);
 
@@ -1020,7 +1049,9 @@ fn ring_allreduce_op_f32(
     let right = ranks[(my_idx + 1) % n];
     let left = ranks[(my_idx + n - 1) % n];
 
+    // Round up to f32 element boundary (4 bytes) so reduction never reads partial elements.
     let chunk_size = data.len().div_ceil(n);
+    let chunk_size = chunk_size.div_ceil(4) * 4;
     let mut buf = data.to_vec();
     buf.resize(chunk_size * n, 0);
 
@@ -1064,13 +1095,18 @@ fn f16_to_f32(bits: u16) -> f32 {
         if mantissa == 0 {
             f32::from_bits(sign << 31)
         } else {
+            // f16 subnormal: value = 2^(-14) * (mantissa / 1024)
+            // Normalize: find leading 1-bit position, then form normal f32.
             let mut m = mantissa;
             let mut e = 0i32;
             while (m & 0x400) == 0 {
                 m <<= 1;
                 e += 1;
             }
-            let f32_exp = (127 - 15 - e) as u32;
+            // m now has bit 10 set (the implicit leading 1). Strip it.
+            // Exponent: the subnormal exponent is -14, minus the shift count,
+            // plus 1 because we found the leading 1 at position 10.
+            let f32_exp = (127 - 14 - e) as u32;
             let f32_mantissa = (m & 0x3FF) << 13;
             f32::from_bits((sign << 31) | (f32_exp << 23) | f32_mantissa)
         }
@@ -1085,6 +1121,14 @@ fn f16_to_f32(bits: u16) -> f32 {
 }
 
 /// Convert f32 to IEEE 754 half-precision (f16) bits.
+///
+/// Handles NaN payload preservation: if the f32 is NaN, the resulting f16 is
+/// also NaN with as many payload bits as fit. If truncation would zero out the
+/// mantissa (turning NaN into Inf), the quiet-NaN bit is forced on.
+///
+/// Handles subnormals: f32 values in the f16 subnormal range
+/// (2^-24 <= |x| < 2^-14) are converted to f16 subnormal representation
+/// rather than being flushed to zero.
 fn f32_to_f16(val: f32) -> u16 {
     let bits = val.to_bits();
     let sign = ((bits >> 31) & 1) as u16;
@@ -1092,12 +1136,26 @@ fn f32_to_f16(val: f32) -> u16 {
     let mantissa = bits & 0x7F_FFFF;
 
     if exponent == 0xFF {
-        let f16_mantissa = (mantissa >> 13) as u16;
+        // Inf or NaN
+        let mut f16_mantissa = (mantissa >> 13) as u16;
+        if mantissa != 0 && f16_mantissa == 0 {
+            // NaN payload was lost by truncation — force quiet NaN bit
+            f16_mantissa = 0x200; // quiet NaN
+        }
         (sign << 15) | (0x1F << 10) | f16_mantissa
     } else if exponent > 127 + 15 {
+        // Overflow to Inf
         (sign << 15) | (0x1F << 10)
-    } else if exponent < 127 - 14 {
+    } else if exponent < 127 - 24 {
+        // Too small even for f16 subnormal — flush to zero
         sign << 15
+    } else if exponent < 127 - 14 {
+        // f16 subnormal range: denormalize the value
+        // Add the implicit leading 1 to the mantissa, then shift right
+        let shift = (127 - 14) - exponent; // 1..10
+        let full_mantissa = mantissa | 0x80_0000; // add implicit 1 bit
+        let f16_mantissa = (full_mantissa >> (13 + shift)) as u16;
+        (sign << 15) | f16_mantissa
     } else {
         let f16_exp = ((exponent - 127 + 15) as u16) & 0x1F;
         let f16_mantissa = (mantissa >> 13) as u16;
@@ -1111,6 +1169,302 @@ fn bf16_to_f32(bits: u16) -> f32 {
 }
 
 /// Convert f32 to bfloat16 bits (truncation).
+///
+/// bf16 shares the same exponent range as f32, so overflow/subnormal concerns
+/// don't apply. However, NaN payload bits in the lower 16 bits could be lost;
+/// if truncation would zero the mantissa, force the quiet-NaN bit.
 fn f32_to_bf16(val: f32) -> u16 {
-    (val.to_bits() >> 16) as u16
+    let bits = val.to_bits();
+    let result = (bits >> 16) as u16;
+    // Check if f32 is NaN (exponent=0xFF, mantissa!=0) but truncated bf16 looks like Inf
+    let f32_exp = (bits >> 23) & 0xFF;
+    let f32_mantissa = bits & 0x7F_FFFF;
+    if f32_exp == 0xFF && f32_mantissa != 0 && (result & 0x7F) == 0 {
+        // NaN payload was lost — force quiet NaN
+        result | 0x40 // set quiet NaN bit in bf16 mantissa
+    } else {
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[allow(unused_imports)]
+    use super::*;
+
+    // ─── Chunk rounding tests ───
+
+    #[test]
+    fn test_chunk_rounding_aligns_to_4_bytes() {
+        // 7 f32 elements = 28 bytes, 3 ranks => chunk_size should be 12 (not 10)
+        let n = 3usize;
+        let data_len = 28usize; // 7 * 4 bytes
+        let chunk_size = data_len.div_ceil(n);
+        assert_eq!(chunk_size, 10); // naive: 10 bytes, not aligned
+        let aligned = chunk_size.div_ceil(4) * 4;
+        assert_eq!(aligned, 12); // aligned to 4 bytes
+    }
+
+    #[test]
+    fn test_allreduce_non_divisible_size_single_rank() {
+        // Single rank should return data unchanged regardless of size
+        let group = Group::new(vec![0], 0, 1).unwrap();
+        // 7 f32 elements = 28 bytes (not divisible by any rank count > 1)
+        let data: Vec<u8> = (1..=7u32).flat_map(|v| (v as f32).to_ne_bytes()).collect();
+        let result = group.allreduce(&data).unwrap();
+        assert_eq!(result, data);
+    }
+
+    #[test]
+    fn test_allreduce_op_non_divisible_f32_single_rank() {
+        // 7 f32 elements through allreduce_op with single rank
+        let group = Group::new(vec![0], 0, 1).unwrap();
+        let data: Vec<u8> = (1..=7u32).flat_map(|v| (v as f32).to_ne_bytes()).collect();
+        let result = group
+            .allreduce_op(&data, ReduceOp::Sum, ReduceDtype::F32)
+            .unwrap();
+        assert_eq!(result, data);
+    }
+
+    // ─── f16 conversion edge case tests ───
+
+    #[test]
+    fn test_f16_nan_payload_survives_roundtrip() {
+        // Create a f16 NaN with a specific payload
+        // f16 NaN: sign=0, exp=0x1F, mantissa!=0
+        let nan_payloads: Vec<u16> = vec![
+            0x7C01, // quiet NaN, payload=1
+            0x7E00, // quiet NaN, payload=0x200
+            0x7DFF, // signaling NaN, payload=0x1FF
+            0xFC01, // negative NaN
+        ];
+
+        for &original in &nan_payloads {
+            let f32_val = f16_to_f32(original);
+            assert!(
+                f32_val.is_nan(),
+                "f16 0x{:04X} should convert to f32 NaN",
+                original
+            );
+            let roundtrip = f32_to_f16(f32_val);
+            // The roundtrip must also be NaN (not Inf)
+            let rt_exp = (roundtrip >> 10) & 0x1F;
+            let rt_mantissa = roundtrip & 0x3FF;
+            assert_eq!(
+                rt_exp, 0x1F,
+                "roundtrip of 0x{:04X} must have exp=0x1F",
+                original
+            );
+            assert_ne!(
+                rt_mantissa, 0,
+                "roundtrip of 0x{:04X} must have non-zero mantissa (NaN, not Inf)",
+                original
+            );
+        }
+    }
+
+    #[test]
+    fn test_f16_nan_with_low_payload_preserved() {
+        // A NaN whose payload is only in the lower 13 bits of f32 mantissa
+        // (which get truncated to f16). The conversion must still produce NaN.
+        let f32_nan = f32::from_bits(0x7F800001); // NaN with payload=1 (lowest bit)
+        assert!(f32_nan.is_nan());
+        let f16_bits = f32_to_f16(f32_nan);
+        let exp = (f16_bits >> 10) & 0x1F;
+        let mantissa = f16_bits & 0x3FF;
+        assert_eq!(exp, 0x1F);
+        assert_ne!(mantissa, 0, "NaN with small payload must not become Inf");
+    }
+
+    #[test]
+    fn test_f16_subnormal_roundtrip() {
+        // f16 subnormal: smallest positive subnormal = 2^-24 ≈ 5.96e-8
+        let f16_subnormal: u16 = 0x0001; // smallest subnormal
+        let f32_val = f16_to_f32(f16_subnormal);
+        assert!(
+            f32_val > 0.0 && f32_val < 6.2e-5,
+            "subnormal should be tiny positive"
+        );
+        let roundtrip = f32_to_f16(f32_val);
+        assert_eq!(
+            roundtrip, f16_subnormal,
+            "f16 subnormal should survive roundtrip"
+        );
+
+        // A larger f16 subnormal
+        let f16_sub2: u16 = 0x0200; // subnormal with mantissa bit 9 set
+        let f32_val2 = f16_to_f32(f16_sub2);
+        let roundtrip2 = f32_to_f16(f32_val2);
+        assert_eq!(
+            roundtrip2, f16_sub2,
+            "f16 subnormal 0x0200 should survive roundtrip"
+        );
+    }
+
+    #[test]
+    fn test_f16_inf_preserved() {
+        let pos_inf: u16 = 0x7C00;
+        let f32_val = f16_to_f32(pos_inf);
+        assert!(f32_val.is_infinite() && f32_val > 0.0);
+        let roundtrip = f32_to_f16(f32_val);
+        assert_eq!(roundtrip, pos_inf);
+
+        let neg_inf: u16 = 0xFC00;
+        let f32_val = f16_to_f32(neg_inf);
+        assert!(f32_val.is_infinite() && f32_val < 0.0);
+        let roundtrip = f32_to_f16(f32_val);
+        assert_eq!(roundtrip, neg_inf);
+    }
+
+    #[test]
+    fn test_f16_normal_values_roundtrip() {
+        // Test a few normal f16 values
+        let test_values: Vec<u16> = vec![
+            0x3C00, // 1.0
+            0x4000, // 2.0
+            0x3800, // 0.5
+            0xC000, // -2.0
+            0x0400, // smallest normal: 2^-14
+        ];
+        for &original in &test_values {
+            let f32_val = f16_to_f32(original);
+            let roundtrip = f32_to_f16(f32_val);
+            assert_eq!(
+                roundtrip, original,
+                "f16 0x{:04X} (={}) should roundtrip exactly",
+                original, f32_val
+            );
+        }
+    }
+
+    // ─── bf16 tests ───
+
+    #[test]
+    fn test_bf16_basic_roundtrip() {
+        let test_values: Vec<f32> = vec![1.0, -1.0, 0.0, 0.5, 100.0, -0.125];
+        for &val in &test_values {
+            let bf16_bits = f32_to_bf16(val);
+            let roundtrip = bf16_to_f32(bf16_bits);
+            assert_eq!(
+                roundtrip, val,
+                "bf16 roundtrip of {} should be exact for simple values",
+                val
+            );
+        }
+    }
+
+    #[test]
+    fn test_bf16_nan_preserved() {
+        let f32_nan = f32::from_bits(0x7F800001); // NaN with small payload
+        assert!(f32_nan.is_nan());
+        let bf16_bits = f32_to_bf16(f32_nan);
+        let back = bf16_to_f32(bf16_bits);
+        assert!(back.is_nan(), "bf16 roundtrip of NaN must remain NaN");
+        // Verify it's not Inf
+        assert_ne!(bf16_bits & 0x7FFF, 0x7F80, "bf16 NaN must not become Inf");
+    }
+
+    #[test]
+    fn test_bf16_allreduce_op_single_rank() {
+        let group = Group::new(vec![0], 0, 1).unwrap();
+        // 3 bf16 elements = 6 bytes
+        let values: Vec<f32> = vec![1.0, 2.0, 3.0];
+        let data: Vec<u8> = values
+            .iter()
+            .flat_map(|&v| f32_to_bf16(v).to_ne_bytes())
+            .collect();
+        let result = group
+            .allreduce_op(&data, ReduceOp::Sum, ReduceDtype::Bf16)
+            .unwrap();
+        assert_eq!(result, data);
+    }
+
+    // ─── allreduce_op f16 single-rank identity tests ───
+
+    #[test]
+    fn test_f16_allreduce_op_single_rank() {
+        let group = Group::new(vec![0], 0, 1).unwrap();
+        // 5 f16 elements = 10 bytes (odd count, not divisible by 4)
+        let values: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let data: Vec<u8> = values
+            .iter()
+            .flat_map(|&v| f32_to_f16(v).to_ne_bytes())
+            .collect();
+        let result = group
+            .allreduce_op(&data, ReduceOp::Sum, ReduceDtype::F16)
+            .unwrap();
+        assert_eq!(result, data);
+    }
+
+    #[test]
+    fn test_f16_allreduce_op_nan_single_rank() {
+        let group = Group::new(vec![0], 0, 1).unwrap();
+        // Include a NaN in the data
+        let f16_nan: u16 = 0x7E00; // quiet NaN
+        let f16_one: u16 = 0x3C00; // 1.0
+        let data: Vec<u8> = [f16_one, f16_nan, f16_one]
+            .iter()
+            .flat_map(|&v| v.to_ne_bytes())
+            .collect();
+        let result = group
+            .allreduce_op(&data, ReduceOp::Sum, ReduceDtype::F16)
+            .unwrap();
+        // Element 0 and 2 should be 1.0, element 1 should be NaN
+        let elem0 = u16::from_ne_bytes([result[0], result[1]]);
+        let elem1 = u16::from_ne_bytes([result[2], result[3]]);
+        let elem2 = u16::from_ne_bytes([result[4], result[5]]);
+        assert_eq!(elem0, f16_one);
+        assert_eq!(elem2, f16_one);
+        // elem1 must be NaN (exp=0x1F, mantissa!=0)
+        assert_eq!((elem1 >> 10) & 0x1F, 0x1F);
+        assert_ne!(elem1 & 0x3FF, 0, "NaN payload must survive allreduce_op");
+    }
+
+    // ─── Conversion function unit tests ───
+
+    #[test]
+    fn test_add_f32_inplace_basic() {
+        let a_vals = [1.0f32, 2.0, 3.0];
+        let b_vals = [4.0f32, 5.0, 6.0];
+        let mut a: Vec<u8> = a_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let b: Vec<u8> = b_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        add_f32_inplace(&mut a, &b);
+        for i in 0..3 {
+            let result = f32::from_ne_bytes([a[i * 4], a[i * 4 + 1], a[i * 4 + 2], a[i * 4 + 3]]);
+            assert_eq!(result, a_vals[i] + b_vals[i]);
+        }
+    }
+
+    #[test]
+    fn test_reduce_f32_inplace_max_min() {
+        let a_vals = [1.0f32, 5.0, 3.0];
+        let b_vals = [4.0f32, 2.0, 6.0];
+        let mut a_max: Vec<u8> = a_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let b: Vec<u8> = b_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        reduce_f32_inplace(&mut a_max, &b, ReduceOp::Max);
+        let expected_max = [4.0f32, 5.0, 6.0];
+        for i in 0..3 {
+            let result = f32::from_ne_bytes([
+                a_max[i * 4],
+                a_max[i * 4 + 1],
+                a_max[i * 4 + 2],
+                a_max[i * 4 + 3],
+            ]);
+            assert_eq!(result, expected_max[i]);
+        }
+
+        let mut a_min: Vec<u8> = a_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        reduce_f32_inplace(&mut a_min, &b, ReduceOp::Min);
+        let expected_min = [1.0f32, 2.0, 3.0];
+        for i in 0..3 {
+            let result = f32::from_ne_bytes([
+                a_min[i * 4],
+                a_min[i * 4 + 1],
+                a_min[i * 4 + 2],
+                a_min[i * 4 + 3],
+            ]);
+            assert_eq!(result, expected_min[i]);
+        }
+    }
 }

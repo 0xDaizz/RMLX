@@ -442,8 +442,7 @@ pub fn gather(
     );
     enc.dispatch_threads(grid, tg);
     enc.end_encoding();
-    cb.commit();
-    cb.wait_until_completed();
+    super::commit_with_mode(cb, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -510,8 +509,7 @@ pub fn gather_signed(
     );
     enc.dispatch_threads(grid, tg);
     enc.end_encoding();
-    cb.commit();
-    cb.wait_until_completed();
+    super::commit_with_mode(cb, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -615,8 +613,7 @@ pub fn gather_axis(
     }
 
     enc.end_encoding();
-    cb.commit();
-    cb.wait_until_completed();
+    super::commit_with_mode(cb, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -736,8 +733,7 @@ pub fn scatter(
     );
     enc.dispatch_threads(grid, tg);
     enc.end_encoding();
-    cb.commit();
-    cb.wait_until_completed();
+    super::commit_with_mode(cb, super::ExecMode::Sync);
 
     Ok(out)
 }

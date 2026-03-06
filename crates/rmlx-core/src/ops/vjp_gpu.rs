@@ -178,8 +178,7 @@ pub fn vjp_add(
     );
     enc.dispatch_threads(grid, tg);
     enc.end_encoding();
-    cb.commit();
-    cb.wait_until_completed();
+    super::commit_with_mode(cb, super::ExecMode::Sync);
 
     Ok((grad_a, grad_b))
 }
@@ -240,8 +239,7 @@ pub fn vjp_mul(
     );
     enc.dispatch_threads(grid, tg);
     enc.end_encoding();
-    cb.commit();
-    cb.wait_until_completed();
+    super::commit_with_mode(cb, super::ExecMode::Sync);
 
     Ok((grad_a, grad_b))
 }
@@ -319,8 +317,7 @@ pub fn vjp_matmul(
         let tg = MTLSize::new(tg_x, tg_y, 1);
         enc.dispatch_threads(grid, tg);
         enc.end_encoding();
-        cb.commit();
-        cb.wait_until_completed();
+        super::commit_with_mode(cb, super::ExecMode::Sync);
     }
 
     // --- grad_b = A^T @ grad_c ---
@@ -345,8 +342,7 @@ pub fn vjp_matmul(
         let tg = MTLSize::new(tg_x, tg_y, 1);
         enc.dispatch_threads(grid, tg);
         enc.end_encoding();
-        cb.commit();
-        cb.wait_until_completed();
+        super::commit_with_mode(cb, super::ExecMode::Sync);
     }
 
     Ok((grad_a, grad_b))

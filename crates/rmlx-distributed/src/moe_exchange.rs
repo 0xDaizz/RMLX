@@ -761,7 +761,7 @@ pub struct MoeDispatchExchange {
 }
 
 impl MoeDispatchExchange {
-    pub fn new(config: MoeDispatchConfig, mut policy: MoePolicy) -> Self {
+    pub fn new(config: MoeDispatchConfig, policy: MoePolicy) -> Self {
         // Auto-set policy world_size from group so RDMA zone activates correctly
         policy.set_world_size(config.group.size() as u32);
         let runtime_cf = config.capacity_factor;
@@ -1733,9 +1733,10 @@ impl MoeDispatchExchange {
         &mut self.guard
     }
 
-    /// Get mutable policy reference (for threshold updates).
-    pub fn policy_mut(&mut self) -> &mut MoePolicy {
-        &mut self.policy
+    /// Get policy reference (for threshold updates).
+    /// MoePolicy uses interior mutability, so `&MoePolicy` suffices for mutation.
+    pub fn policy_mut(&self) -> &MoePolicy {
+        &self.policy
     }
 
     /// Get policy reference.

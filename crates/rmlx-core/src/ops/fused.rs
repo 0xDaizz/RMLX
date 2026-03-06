@@ -60,8 +60,7 @@ pub fn batched_qkv_proj(
     // Encode V projection
     encode_gemm(cb, &pipeline, &input, wv_t, &v_out, m, nv, k, registry)?;
 
-    cb.commit();
-    cb.wait_until_completed();
+    super::commit_with_mode(cb, super::ExecMode::Sync);
 
     Ok((q_out, k_out, v_out))
 }
@@ -131,8 +130,7 @@ pub fn fused_silu_mul(
     let tg = std::cmp::min(pipeline.max_total_threads_per_threadgroup(), grid_threads);
     enc.dispatch_threads(MTLSize::new(grid_threads, 1, 1), MTLSize::new(tg, 1, 1));
     enc.end_encoding();
-    cb.commit();
-    cb.wait_until_completed();
+    super::commit_with_mode(cb, super::ExecMode::Sync);
 
     Ok(output)
 }

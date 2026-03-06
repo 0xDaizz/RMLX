@@ -545,8 +545,7 @@ pub fn rms_norm_opt(
     let tg_size = std::cmp::min(1024, pipeline.max_total_threads_per_threadgroup());
     encoder.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), MTLSize::new(tg_size, 1, 1));
     encoder.end_encoding();
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
+    super::commit_with_mode(command_buffer, super::ExecMode::Sync);
 
     Ok(out)
 }
