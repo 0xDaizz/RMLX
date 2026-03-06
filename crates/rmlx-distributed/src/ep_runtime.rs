@@ -63,9 +63,11 @@ impl AcquiredBuffer {
     /// re-acquisition on the next `pool.acquire()` call.
     pub fn release(self) {
         if !self.used {
-            eprintln!(
-                "[ep-runtime] releasing unused buffer slot={} size={}",
-                self.slot_index, self.size
+            tracing::debug!(
+                target: "ep_runtime",
+                slot_index = self.slot_index,
+                size = self.size,
+                "releasing unused buffer",
             );
         }
         self.mark_complete();
@@ -174,7 +176,7 @@ impl EpRuntimeContext {
                         match pending.wait(std::time::Duration::from_secs(5)) {
                             Ok(_completion) => HandlerResult::CqConfirmed,
                             Err(e) => {
-                                eprintln!("[ep-runtime] CQ wait failed for wr_id={wr_id}: {e:?}");
+                                tracing::error!(target: "ep_runtime", wr_id, ?e, "CQ wait failed");
                                 counters
                                     .rdma_ops_error
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -183,7 +185,7 @@ impl EpRuntimeContext {
                         }
                     }
                     Err(e) => {
-                        eprintln!("[ep-runtime] dispatch_descriptor error: {e}");
+                        tracing::error!(target: "ep_runtime", %e, "dispatch_descriptor error");
                         // Cancel the registered op since WR was never posted
                         progress.cancel_op(wr_id);
                         counters

@@ -79,8 +79,9 @@ impl Drop for ZeroCopyPendingOp {
         let mut warned = false;
         while self.pending.is_pending() {
             if !warned && start.elapsed() > std::time::Duration::from_secs(5) {
-                eprintln!(
-                    "WARNING: ZeroCopyPendingOp still pending after 5s, blocking until complete"
+                tracing::warn!(
+                    target: "rmlx_distributed",
+                    "ZeroCopyPendingOp still pending after 5s, blocking until complete",
                 );
                 warned = true;
             }

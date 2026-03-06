@@ -134,7 +134,7 @@ pub fn run(args: LaunchArgs) -> i32 {
         command.remove(0);
     }
     if command.is_empty() {
-        eprintln!("error: empty command after --");
+        tracing::error!(target: "rmlx_cli", "empty command after --");
         return 2;
     }
     let base_cmd: String = command
@@ -148,7 +148,7 @@ pub fn run(args: LaunchArgs) -> i32 {
         (Some(csv), None) => match hostfile::parse_hosts_csv(csv) {
             Ok(h) => (h, None),
             Err(e) => {
-                eprintln!("error: {e}");
+                tracing::error!(target: "rmlx_cli", %e, "invalid --hosts");
                 return 2;
             }
         },
@@ -158,36 +158,36 @@ pub fn run(args: LaunchArgs) -> i32 {
                 (hosts, Some(entries))
             }
             Err(e) => {
-                eprintln!("error: {e}");
+                tracing::error!(target: "rmlx_cli", %e, "failed to load hostfile");
                 return 2;
             }
         },
         (Some(_), Some(_)) => {
-            eprintln!("error: provide only one of --hosts or --hostfile");
+            tracing::error!(target: "rmlx_cli", "provide only one of --hosts or --hostfile");
             return 2;
         }
         (None, None) => {
-            eprintln!("error: provide exactly one of --hosts or --hostfile");
+            tracing::error!(target: "rmlx_cli", "provide exactly one of --hosts or --hostfile");
             return 2;
         }
     };
 
     if args.repeat_hosts < 1 {
-        eprintln!("error: --repeat-hosts must be >= 1");
+        tracing::error!(target: "rmlx_cli", "--repeat-hosts must be >= 1");
         return 2;
     }
 
     let extra_env = match parse_env_pairs(&args.extra_env) {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("error: {e}");
+            tracing::error!(target: "rmlx_cli", %e, "invalid --env");
             return 2;
         }
     };
 
     // Validate backend
     if let Err(e) = topology::validate_backend(&args.backend) {
-        eprintln!("error: {e}");
+        tracing::error!(target: "rmlx_cli", %e, "invalid backend");
         return 2;
     }
 
@@ -199,7 +199,7 @@ pub fn run(args: LaunchArgs) -> i32 {
             .unwrap_or(false);
         let local_tb = topology::probe_thunderbolt();
         let resolved = topology::resolve_auto_backend(has_rdma, &local_tb);
-        eprintln!("info: --backend auto resolved to {resolved:?}");
+        tracing::info!(target: "rmlx_cli", ?resolved, "--backend auto resolved");
         resolved.to_string()
     } else {
         args.backend.clone()
@@ -251,13 +251,13 @@ pub fn run(args: LaunchArgs) -> i32 {
                 match std::fs::write(&path, &json) {
                     Ok(()) => Some(path),
                     Err(e) => {
-                        eprintln!("warning: failed to write device map to {path}: {e}");
+                        tracing::warn!(target: "rmlx_cli", %path, %e, "failed to write device map");
                         None
                     }
                 }
             }
             Err(e) => {
-                eprintln!("warning: failed to serialize device map: {e}");
+                tracing::warn!(target: "rmlx_cli", %e, "failed to serialize device map");
                 None
             }
         }
@@ -318,9 +318,12 @@ pub fn run(args: LaunchArgs) -> i32 {
                 procs.push((slot.rank, slot.host.clone(), child));
             }
             Err(e) => {
-                eprintln!(
-                    "error: failed to spawn rank {} on {}: {e}",
-                    slot.rank, slot.host
+                tracing::error!(
+                    target: "rmlx_cli",
+                    rank = slot.rank,
+                    host = %slot.host,
+                    %e,
+                    "failed to spawn",
                 );
                 // Kill already-spawned processes
                 for (_, _, ref mut p) in &mut procs {
@@ -405,7 +408,7 @@ pub fn run(args: LaunchArgs) -> i32 {
             .iter()
             .map(|(r, c)| format!("rank {r}: {c}"))
             .collect();
-        eprintln!("launch failed ({})", ordered.join(", "));
+        tracing::error!(target: "rmlx_cli", failures = %ordered.join(", "), "launch failed");
         return 1;
     }
 
