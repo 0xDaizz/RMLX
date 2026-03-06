@@ -324,11 +324,50 @@ fn compute_tensor_byte_size(info: &GgufTensorInfo) -> usize {
     num_blocks * type_size
 }
 
+/// Known GGUF tensor name prefixes/patterns that we recognize.
+///
+/// Any tensor name that does not start with one of these patterns (after
+/// accounting for the `blk.N.` layer prefix) is considered unrecognized
+/// and `gguf_name_to_rmlx` returns `None` for it.
+const KNOWN_GGUF_PREFIXES: &[&str] = &["blk.", "token_embd.", "output_norm.", "output."];
+
+/// Suffixes recognized within a `blk.N.` layer tensor.
+const KNOWN_BLOCK_SUFFIXES: &[&str] = &[
+    ".attn_q.",
+    ".attn_k.",
+    ".attn_v.",
+    ".attn_output.",
+    ".ffn_gate.",
+    ".ffn_up.",
+    ".ffn_down.",
+    ".attn_norm.",
+    ".ffn_norm.",
+];
+
 /// Map GGUF tensor names to the standard naming convention used by RMLX models.
 ///
 /// GGUF files from llama.cpp use a specific naming scheme (e.g., "blk.0.attn_q.weight").
 /// This function provides a mapping table for common architectures.
+///
+/// Returns `None` for unrecognized tensor name patterns instead of silently
+/// passing them through with no transformation.
 pub fn gguf_name_to_rmlx(gguf_name: &str) -> Option<String> {
+    // Check that the name matches a known pattern before transforming.
+    let recognized = if gguf_name.starts_with("blk.") {
+        // For block tensors, also verify the suffix is known
+        KNOWN_BLOCK_SUFFIXES
+            .iter()
+            .any(|suffix| gguf_name.contains(suffix))
+    } else {
+        KNOWN_GGUF_PREFIXES
+            .iter()
+            .any(|prefix| gguf_name.starts_with(prefix))
+    };
+
+    if !recognized {
+        return None;
+    }
+
     // Common llama.cpp GGUF -> RMLX name mappings
     let name = gguf_name
         .replace("blk.", "layers.")
@@ -345,4 +384,143 @@ pub fn gguf_name_to_rmlx(gguf_name: &str) -> Option<String> {
         .replace("output.", "lm_head.");
 
     Some(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // gguf_name_to_rmlx: known patterns
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_gguf_name_attn_q() {
+        let mapped = gguf_name_to_rmlx("blk.0.attn_q.weight");
+        assert_eq!(mapped.as_deref(), Some("layers.0.attention.q_proj.weight"));
+    }
+
+    #[test]
+    fn test_gguf_name_attn_k() {
+        let mapped = gguf_name_to_rmlx("blk.3.attn_k.weight");
+        assert_eq!(mapped.as_deref(), Some("layers.3.attention.k_proj.weight"));
+    }
+
+    #[test]
+    fn test_gguf_name_attn_v() {
+        let mapped = gguf_name_to_rmlx("blk.1.attn_v.weight");
+        assert_eq!(mapped.as_deref(), Some("layers.1.attention.v_proj.weight"));
+    }
+
+    #[test]
+    fn test_gguf_name_attn_output() {
+        let mapped = gguf_name_to_rmlx("blk.0.attn_output.weight");
+        assert_eq!(mapped.as_deref(), Some("layers.0.attention.o_proj.weight"));
+    }
+
+    #[test]
+    fn test_gguf_name_ffn_gate() {
+        let mapped = gguf_name_to_rmlx("blk.2.ffn_gate.weight");
+        assert_eq!(
+            mapped.as_deref(),
+            Some("layers.2.feed_forward.gate_proj.weight")
+        );
+    }
+
+    #[test]
+    fn test_gguf_name_ffn_up() {
+        let mapped = gguf_name_to_rmlx("blk.5.ffn_up.weight");
+        assert_eq!(
+            mapped.as_deref(),
+            Some("layers.5.feed_forward.up_proj.weight")
+        );
+    }
+
+    #[test]
+    fn test_gguf_name_ffn_down() {
+        let mapped = gguf_name_to_rmlx("blk.0.ffn_down.weight");
+        assert_eq!(
+            mapped.as_deref(),
+            Some("layers.0.feed_forward.down_proj.weight")
+        );
+    }
+
+    #[test]
+    fn test_gguf_name_attn_norm() {
+        let mapped = gguf_name_to_rmlx("blk.0.attn_norm.weight");
+        assert_eq!(mapped.as_deref(), Some("layers.0.attention_norm.weight"));
+    }
+
+    #[test]
+    fn test_gguf_name_ffn_norm() {
+        let mapped = gguf_name_to_rmlx("blk.0.ffn_norm.weight");
+        assert_eq!(mapped.as_deref(), Some("layers.0.ffn_norm.weight"));
+    }
+
+    #[test]
+    fn test_gguf_name_token_embd() {
+        let mapped = gguf_name_to_rmlx("token_embd.weight");
+        assert_eq!(mapped.as_deref(), Some("embedding.weight"));
+    }
+
+    #[test]
+    fn test_gguf_name_output_norm() {
+        let mapped = gguf_name_to_rmlx("output_norm.weight");
+        assert_eq!(mapped.as_deref(), Some("norm.weight"));
+    }
+
+    #[test]
+    fn test_gguf_name_output() {
+        let mapped = gguf_name_to_rmlx("output.weight");
+        assert_eq!(mapped.as_deref(), Some("lm_head.weight"));
+    }
+
+    // -----------------------------------------------------------------------
+    // gguf_name_to_rmlx: unrecognized patterns return None
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_gguf_name_unknown_returns_none() {
+        assert_eq!(gguf_name_to_rmlx("some_random_tensor"), None);
+    }
+
+    #[test]
+    fn test_gguf_name_empty_returns_none() {
+        assert_eq!(gguf_name_to_rmlx(""), None);
+    }
+
+    #[test]
+    fn test_gguf_name_unknown_block_suffix_returns_none() {
+        // blk.0. prefix is recognized, but ".mystery_layer." suffix is not
+        assert_eq!(gguf_name_to_rmlx("blk.0.mystery_layer.weight"), None);
+    }
+
+    #[test]
+    fn test_gguf_name_partial_match_returns_none() {
+        // "token_emb" is close to "token_embd" but not a match
+        assert_eq!(gguf_name_to_rmlx("token_emb.weight"), None);
+    }
+
+    #[test]
+    fn test_gguf_name_arbitrary_prefix_returns_none() {
+        assert_eq!(gguf_name_to_rmlx("rope_freqs.weight"), None);
+        assert_eq!(gguf_name_to_rmlx("model.layers.0.weight"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // GgufWeightMap construction and query (synthetic, no Metal device)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_gguf_load_error_display() {
+        let e = GgufLoadError::TensorNotFound("foo.weight".to_string());
+        assert!(e.to_string().contains("foo.weight"));
+
+        let e2 = GgufLoadError::ShapeMismatch {
+            tensor_name: "bar".to_string(),
+            expected: vec![4, 4],
+            found: vec![8, 8],
+        };
+        assert!(e2.to_string().contains("bar"));
+    }
 }

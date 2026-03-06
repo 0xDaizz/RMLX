@@ -8,6 +8,7 @@ use rmlx_nn::linear::*;
 use rmlx_nn::models::*;
 use rmlx_nn::moe::*;
 use rmlx_nn::quantized_linear::*;
+use rmlx_nn::rope::*;
 use rmlx_nn::transformer::*;
 
 #[test]
@@ -65,7 +66,7 @@ fn test_llama_7b_config() {
     let cfg = llama::llama_7b();
     assert_eq!(cfg.hidden_size, 4096);
     assert_eq!(cfg.num_layers, 32);
-    assert!(matches!(cfg.ff_type, FeedForwardType::Dense { .. }));
+    assert!(matches!(cfg.ff_type, FeedForwardType::Gated { .. }));
 }
 
 #[test]
@@ -439,6 +440,227 @@ fn test_attention_forward_identity() {
     assert!(sum.abs() > 1e-6, "attention output is all zeros");
 }
 
+/// PR 1.3: Attention forward with GQA (num_kv_heads < num_heads).
+///
+/// Uses num_heads=4, num_kv_heads=2 (2x GQA ratio), head_dim=4 => hidden=16, kv_size=8.
+/// Verifies that the output shape is [seq_len, hidden_size] and values are finite.
+#[test]
+fn test_attention_forward_gqa() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+
+    let num_heads = 4;
+    let num_kv_heads = 2; // GQA: 2 KV heads shared across 4 query heads
+    let head_dim = 4;
+    let hidden_size = num_heads * head_dim; // 16
+    let kv_size = num_kv_heads * head_dim; // 8
+
+    let config = AttentionConfig {
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        max_seq_len: 16,
+        rope_theta: 10000.0,
+    };
+
+    // Q/O projections: [hidden_size, hidden_size] = [16, 16]
+    let q_proj = make_identity_linear(dev, hidden_size);
+    let o_proj = make_identity_linear(dev, hidden_size);
+
+    // K/V projections: [kv_size, hidden_size] = [8, 16]
+    // Use a simple truncation matrix (first kv_size rows of identity)
+    let mut k_data = vec![0.0f32; kv_size * hidden_size];
+    for i in 0..kv_size {
+        k_data[i * hidden_size + i] = 1.0;
+    }
+    let k_weight = Array::from_slice(dev, &k_data, vec![kv_size, hidden_size]);
+    let k_proj = Linear::from_arrays(
+        LinearConfig {
+            in_features: hidden_size,
+            out_features: kv_size,
+            has_bias: false,
+        },
+        k_weight,
+        None,
+    )
+    .expect("k_proj from_arrays failed");
+
+    let mut v_data = vec![0.0f32; kv_size * hidden_size];
+    for i in 0..kv_size {
+        v_data[i * hidden_size + i] = 1.0;
+    }
+    let v_weight = Array::from_slice(dev, &v_data, vec![kv_size, hidden_size]);
+    let v_proj = Linear::from_arrays(
+        LinearConfig {
+            in_features: hidden_size,
+            out_features: kv_size,
+            has_bias: false,
+        },
+        v_weight,
+        None,
+    )
+    .expect("v_proj from_arrays failed");
+
+    let attn = Attention::from_layers(config, q_proj, k_proj, v_proj, o_proj)
+        .expect("Attention::from_layers failed for GQA");
+
+    assert!(attn.is_gqa(), "should be GQA when num_kv_heads < num_heads");
+
+    // Input: [3, 16] — 3 tokens, 16-dim hidden
+    let seq_len = 3;
+    let input_data: Vec<f32> = (0..(seq_len * hidden_size))
+        .map(|i| (i as f32 + 1.0) * 0.01)
+        .collect();
+    let input = Array::from_slice(dev, &input_data, vec![seq_len, hidden_size]);
+
+    // No RoPE, no mask, no cache
+    let output = attn
+        .forward(&input, None, None, None, None, &registry, &queue)
+        .expect("GQA attention forward failed");
+
+    assert_eq!(
+        output.shape(),
+        &[seq_len, hidden_size],
+        "GQA output shape mismatch"
+    );
+
+    let vals: Vec<f32> = output.to_vec_checked();
+    assert!(
+        vals.iter().all(|v| v.is_finite()),
+        "GQA attention output contains non-finite values"
+    );
+    let sum: f32 = vals.iter().sum();
+    assert!(sum.abs() > 1e-6, "GQA attention output is all zeros");
+}
+
+/// PR 1.3: Attention forward with GQA + KV cache for incremental decoding.
+///
+/// Prefill 2 tokens, then decode 1 token. Verify shapes at each step.
+#[test]
+fn test_attention_forward_gqa_with_cache() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+
+    let num_heads = 4;
+    let num_kv_heads = 2;
+    let head_dim = 4;
+    let hidden_size = num_heads * head_dim; // 16
+    let kv_size = num_kv_heads * head_dim; // 8
+
+    let config = AttentionConfig {
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        max_seq_len: 16,
+        rope_theta: 10000.0,
+    };
+
+    let q_proj = make_identity_linear(dev, hidden_size);
+    let o_proj = make_identity_linear(dev, hidden_size);
+
+    let mut k_data = vec![0.0f32; kv_size * hidden_size];
+    for i in 0..kv_size {
+        k_data[i * hidden_size + i] = 1.0;
+    }
+    let k_weight = Array::from_slice(dev, &k_data, vec![kv_size, hidden_size]);
+    let k_proj = Linear::from_arrays(
+        LinearConfig {
+            in_features: hidden_size,
+            out_features: kv_size,
+            has_bias: false,
+        },
+        k_weight,
+        None,
+    )
+    .expect("k_proj failed");
+
+    let mut v_data = vec![0.0f32; kv_size * hidden_size];
+    for i in 0..kv_size {
+        v_data[i * hidden_size + i] = 1.0;
+    }
+    let v_weight = Array::from_slice(dev, &v_data, vec![kv_size, hidden_size]);
+    let v_proj = Linear::from_arrays(
+        LinearConfig {
+            in_features: hidden_size,
+            out_features: kv_size,
+            has_bias: false,
+        },
+        v_weight,
+        None,
+    )
+    .expect("v_proj failed");
+
+    let attn = Attention::from_layers(config, q_proj, k_proj, v_proj, o_proj)
+        .expect("Attention::from_layers failed");
+
+    // Pre-allocated KV cache
+    let mut cache = LayerKvCache::preallocated(
+        dev,
+        num_kv_heads,
+        head_dim,
+        16, // max_seq_len
+        rmlx_core::dtype::DType::Float32,
+    );
+
+    // Step 1: Prefill with 2 tokens
+    let prefill_data: Vec<f32> = (0..(2 * hidden_size))
+        .map(|i| (i as f32 + 1.0) * 0.01)
+        .collect();
+    let prefill_input = Array::from_slice(dev, &prefill_data, vec![2, hidden_size]);
+
+    let out1 = attn
+        .forward(
+            &prefill_input,
+            None,
+            None,
+            None,
+            Some(&mut cache),
+            &registry,
+            &queue,
+        )
+        .expect("GQA prefill forward failed");
+    assert_eq!(out1.shape(), &[2, hidden_size]);
+    assert_eq!(
+        cache.position_offset(),
+        2,
+        "cache should have 2 tokens after prefill"
+    );
+
+    // Step 2: Decode 1 token
+    let decode_data: Vec<f32> = (0..hidden_size).map(|i| (i as f32 + 1.0) * 0.05).collect();
+    let decode_input = Array::from_slice(dev, &decode_data, vec![1, hidden_size]);
+
+    let out2 = attn
+        .forward(
+            &decode_input,
+            None,
+            None,
+            None,
+            Some(&mut cache),
+            &registry,
+            &queue,
+        )
+        .expect("GQA decode forward failed");
+    assert_eq!(out2.shape(), &[1, hidden_size]);
+    assert_eq!(
+        cache.position_offset(),
+        3,
+        "cache should have 3 tokens after decode"
+    );
+
+    let vals: Vec<f32> = out2.to_vec_checked();
+    assert!(
+        vals.iter().all(|v| v.is_finite()),
+        "GQA decode output contains non-finite values"
+    );
+}
+
 // ===== NEW TESTS: MoE forward =====
 
 #[test]
@@ -568,7 +790,7 @@ fn test_transformer_block_forward() {
     )
     .expect("Attention::from_layers failed");
 
-    let ffn = FeedForward::Dense {
+    let ffn = FeedForward::Gated {
         gate_proj: make_identity_linear(dev, hidden_size),
         up_proj: make_identity_linear(dev, hidden_size),
         down_proj: make_identity_linear(dev, hidden_size),
@@ -648,7 +870,7 @@ fn test_transformer_model_forward() {
         make_identity_linear(dev, hidden_size),
     )
     .expect("Attention::from_layers failed");
-    let ffn = FeedForward::Dense {
+    let ffn = FeedForward::Gated {
         gate_proj: make_identity_linear(dev, hidden_size),
         up_proj: make_identity_linear(dev, hidden_size),
         down_proj: make_identity_linear(dev, hidden_size),
@@ -687,7 +909,7 @@ fn test_transformer_model_forward() {
         max_seq_len: 16,
         rope_theta: 10000.0,
         rms_norm_eps: 1e-5,
-        ff_type: FeedForwardType::Dense {
+        ff_type: FeedForwardType::Gated {
             intermediate_dim: hidden_size,
         },
     };
@@ -822,7 +1044,7 @@ fn test_transformer_config_zero_num_layers() {
         max_seq_len: 2048,
         rope_theta: 10000.0,
         rms_norm_eps: 1e-5,
-        ff_type: FeedForwardType::Dense {
+        ff_type: FeedForwardType::Gated {
             intermediate_dim: 512,
         },
     });
@@ -841,7 +1063,7 @@ fn test_transformer_config_zero_hidden_size() {
         max_seq_len: 2048,
         rope_theta: 10000.0,
         rms_norm_eps: 1e-5,
-        ff_type: FeedForwardType::Dense {
+        ff_type: FeedForwardType::Gated {
             intermediate_dim: 512,
         },
     });
@@ -860,7 +1082,7 @@ fn test_transformer_config_zero_vocab_size() {
         max_seq_len: 2048,
         rope_theta: 10000.0,
         rms_norm_eps: 1e-5,
-        ff_type: FeedForwardType::Dense {
+        ff_type: FeedForwardType::Gated {
             intermediate_dim: 512,
         },
     });
@@ -879,7 +1101,7 @@ fn test_transformer_config_kv_heads_exceeds_heads() {
         max_seq_len: 2048,
         rope_theta: 10000.0,
         rms_norm_eps: 1e-5,
-        ff_type: FeedForwardType::Dense {
+        ff_type: FeedForwardType::Gated {
             intermediate_dim: 512,
         },
     });
@@ -900,7 +1122,7 @@ fn test_transformer_block_new_validates_config() {
             max_seq_len: 2048,
             rope_theta: 10000.0,
             rms_norm_eps: 1e-5,
-            ff_type: FeedForwardType::Dense {
+            ff_type: FeedForwardType::Gated {
                 intermediate_dim: 512,
             },
         },
@@ -1212,4 +1434,235 @@ fn test_deepseek_v3_full_config() {
         }
         _ => panic!("DeepSeek-V3 should use MoE"),
     }
+}
+
+// ===== RoPE layer tests =====
+
+#[test]
+fn test_rope_config_defaults() {
+    let config = RotaryPositionEmbeddingConfig::new(128, 2048);
+    assert_eq!(config.head_dim, 128);
+    assert_eq!(config.max_seq_len, 2048);
+    assert!((config.base_freq - 10000.0).abs() < 1e-6);
+    assert!((config.scale - 1.0).abs() < 1e-6);
+    assert!(!config.traditional);
+}
+
+#[test]
+fn test_rope_config_validation_odd_head_dim() {
+    let Some((registry, _queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    let config = RotaryPositionEmbeddingConfig::new(127, 2048);
+    let result = RotaryPositionEmbedding::new(config, dev, rmlx_core::dtype::DType::Float32);
+    assert!(result.is_err(), "odd head_dim should fail");
+}
+
+#[test]
+fn test_rope_config_validation_zero_head_dim() {
+    let Some((registry, _queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    let config = RotaryPositionEmbeddingConfig {
+        head_dim: 0,
+        max_seq_len: 2048,
+        base_freq: 10000.0,
+        scale: 1.0,
+        traditional: false,
+    };
+    let result = RotaryPositionEmbedding::new(config, dev, rmlx_core::dtype::DType::Float32);
+    assert!(result.is_err(), "zero head_dim should fail");
+}
+
+#[test]
+fn test_rope_config_validation_zero_max_seq_len() {
+    let Some((registry, _queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    let config = RotaryPositionEmbeddingConfig {
+        head_dim: 64,
+        max_seq_len: 0,
+        base_freq: 10000.0,
+        scale: 1.0,
+        traditional: false,
+    };
+    let result = RotaryPositionEmbedding::new(config, dev, rmlx_core::dtype::DType::Float32);
+    assert!(result.is_err(), "zero max_seq_len should fail");
+}
+
+#[test]
+fn test_rope_construction_and_table_shapes() {
+    let Some((registry, _queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    let head_dim = 64;
+    let max_seq_len = 512;
+    let half_dim = head_dim / 2;
+
+    let config = RotaryPositionEmbeddingConfig::new(head_dim, max_seq_len);
+    let rope = RotaryPositionEmbedding::new(config, dev, rmlx_core::dtype::DType::Float32)
+        .expect("RoPE construction failed");
+
+    assert_eq!(rope.head_dim(), head_dim);
+    assert_eq!(rope.max_seq_len(), max_seq_len);
+    assert_eq!(rope.cos_freqs().shape(), &[max_seq_len, half_dim]);
+    assert_eq!(rope.sin_freqs().shape(), &[max_seq_len, half_dim]);
+}
+
+#[test]
+fn test_rope_forward_output_shape_2d() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    let head_dim = 8;
+    let max_seq_len = 32;
+    let seq_len = 4;
+
+    let config = RotaryPositionEmbeddingConfig::new(head_dim, max_seq_len);
+    let rope = RotaryPositionEmbedding::new(config, dev, rmlx_core::dtype::DType::Float32)
+        .expect("RoPE construction failed");
+
+    // 2D input: [seq_len, head_dim]
+    let input_data: Vec<f32> = (0..(seq_len * head_dim)).map(|i| i as f32 * 0.1).collect();
+    let input = Array::from_slice(dev, &input_data, vec![seq_len, head_dim]);
+
+    let output = rope
+        .forward(&registry, &input, 0, &queue)
+        .expect("RoPE forward failed");
+
+    assert_eq!(output.shape(), &[seq_len, head_dim]);
+    let vals: Vec<f32> = output.to_vec_checked();
+    assert!(
+        vals.iter().all(|v| v.is_finite()),
+        "RoPE output contains non-finite values"
+    );
+}
+
+#[test]
+fn test_rope_forward_output_shape_3d() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    let head_dim = 8;
+    let max_seq_len = 32;
+    let seq_len = 4;
+    let n_batch = 2;
+
+    let config = RotaryPositionEmbeddingConfig::new(head_dim, max_seq_len);
+    let rope = RotaryPositionEmbedding::new(config, dev, rmlx_core::dtype::DType::Float32)
+        .expect("RoPE construction failed");
+
+    // 3D input: [batch*n_heads, seq_len, head_dim]
+    let total = n_batch * seq_len * head_dim;
+    let input_data: Vec<f32> = (0..total).map(|i| i as f32 * 0.1).collect();
+    let input = Array::from_slice(dev, &input_data, vec![n_batch, seq_len, head_dim]);
+
+    let output = rope
+        .forward(&registry, &input, 0, &queue)
+        .expect("RoPE forward failed");
+
+    assert_eq!(output.shape(), &[n_batch, seq_len, head_dim]);
+    let vals: Vec<f32> = output.to_vec_checked();
+    assert!(
+        vals.iter().all(|v| v.is_finite()),
+        "RoPE 3D output contains non-finite values"
+    );
+}
+
+#[test]
+fn test_rope_forward_with_offset() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    let head_dim = 8;
+    let max_seq_len = 32;
+    let seq_len = 4;
+
+    let config = RotaryPositionEmbeddingConfig::new(head_dim, max_seq_len);
+    let rope = RotaryPositionEmbedding::new(config, dev, rmlx_core::dtype::DType::Float32)
+        .expect("RoPE construction failed");
+
+    let input_data: Vec<f32> = (0..(seq_len * head_dim)).map(|i| i as f32 * 0.1).collect();
+    let input = Array::from_slice(dev, &input_data, vec![seq_len, head_dim]);
+
+    // With offset=0
+    let out0 = rope
+        .forward(&registry, &input, 0, &queue)
+        .expect("forward offset=0 failed");
+    // With offset=5
+    let out5 = rope
+        .forward(&registry, &input, 5, &queue)
+        .expect("forward offset=5 failed");
+
+    let vals0: Vec<f32> = out0.to_vec_checked();
+    let vals5: Vec<f32> = out5.to_vec_checked();
+
+    // Different offsets should produce different outputs
+    let differ = vals0
+        .iter()
+        .zip(vals5.iter())
+        .any(|(a, b)| (a - b).abs() > 1e-6);
+    assert!(differ, "different offsets should produce different outputs");
+}
+
+/// PR 1.5: QuantizedLinear must accept non-f32 input without panicking.
+/// It should auto-cast to f32 internally and produce the correct output shape.
+#[test]
+fn test_quantized_linear_forward_f16_input() {
+    use rmlx_core::dtype::DType;
+    use rmlx_core::ops::copy::copy_cast;
+
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+
+    // Build a Q4 QuantizedLinear: in=64, out=32, group_size=32
+    let in_f = 64usize;
+    let out_f = 32usize;
+    let group_size = 32usize;
+    let w_packed = vec![0x88u8; out_f * (in_f / 2)]; // all nibbles = 8
+    let groups_per_row = in_f / group_size;
+    let scales = vec![1.0f32; out_f * groups_per_row];
+    let biases = vec![0.0f32; out_f * groups_per_row];
+
+    let ql = QuantizedLinear::new(
+        w_packed,
+        scales,
+        biases,
+        in_f,
+        out_f,
+        group_size,
+        QuantBits::Q4,
+    )
+    .expect("QuantizedLinear::new failed");
+
+    // Create an f32 input then cast to f16
+    let x_f32 = Array::from_slice(dev, &vec![1.0f32; in_f], vec![1, in_f]);
+    let x_f16 =
+        copy_cast(&registry, &x_f32, DType::Float16, &queue).expect("copy_cast to f16 failed");
+    assert_eq!(x_f16.dtype(), DType::Float16);
+
+    // Forward with f16 input should NOT panic
+    let out = ql
+        .forward(&x_f16, &registry, &queue)
+        .expect("forward with f16 input should not fail");
+
+    assert_eq!(out.shape(), &[1, out_f]);
+    assert_eq!(out.dtype(), DType::Float32);
 }

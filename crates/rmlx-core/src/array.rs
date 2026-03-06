@@ -131,7 +131,7 @@ impl Array {
         let numel: usize = shape.iter().product();
         let byte_size = dtype
             .numel_to_bytes(numel)
-            .expect("numel must be block-aligned for quantized dtypes");
+            .map_err(|e| rmlx_alloc::AllocError::DType(e.to_string()))?;
         let buffer = allocator.alloc(byte_size)?;
 
         // Zero the buffer contents (cached buffers may contain stale data).

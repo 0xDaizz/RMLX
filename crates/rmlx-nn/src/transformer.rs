@@ -12,7 +12,14 @@ use crate::linear::Linear;
 use crate::moe::MoeLayer;
 
 pub enum FeedForwardType {
-    Dense { intermediate_dim: usize },
+    /// Simple dense FFN: linear1 -> activation -> linear2
+    Dense {
+        intermediate_dim: usize,
+        activation: crate::activations::ActivationType,
+    },
+    /// Gated FFN (SwiGLU): gate_proj * up_proj -> down_proj (Llama-style)
+    Gated { intermediate_dim: usize },
+    /// Mixture of Experts
     MoE { config: super::moe::MoeConfig },
 }
 
@@ -77,11 +84,17 @@ impl TransformerConfig {
     }
 }
 
-/// Feed-forward network: either dense (SwiGLU) or MoE.
+/// Feed-forward network: dense, gated (SwiGLU), or MoE.
 #[allow(clippy::large_enum_variant)]
 pub enum FeedForward {
-    /// SwiGLU FFN: gate_proj, up_proj, down_proj
+    /// Simple dense FFN: linear1 -> activation -> linear2
     Dense {
+        linear1: Linear,
+        linear2: Linear,
+        activation: crate::activations::ActivationType,
+    },
+    /// Gated FFN (SwiGLU): silu(gate(x)) * up(x) -> down(x)
+    Gated {
         gate_proj: Linear,
         up_proj: Linear,
         down_proj: Linear,
@@ -103,6 +116,15 @@ impl FeedForward {
     ) -> Result<Array, KernelError> {
         match self {
             FeedForward::Dense {
+                linear1,
+                linear2,
+                activation,
+            } => linear2.forward(
+                &activation.forward(&linear1.forward(x, registry, queue)?, registry, queue)?,
+                registry,
+                queue,
+            ),
+            FeedForward::Gated {
                 gate_proj,
                 up_proj,
                 down_proj,
@@ -132,6 +154,13 @@ impl FeedForward {
     ) -> Result<(), KernelError> {
         match self {
             FeedForward::Dense {
+                linear1, linear2, ..
+            } => {
+                linear1.prepare_weight_t(registry, queue)?;
+                linear2.prepare_weight_t(registry, queue)?;
+                Ok(())
+            }
+            FeedForward::Gated {
                 gate_proj,
                 up_proj,
                 down_proj,
@@ -147,11 +176,11 @@ impl FeedForward {
 
     /// ExecGraph-based FFN forward using 2 command buffers.
     ///
-    /// For dense SwiGLU:
+    /// For gated SwiGLU:
     /// - CB5 (current): gate + up + fused silu*mul
     /// - CB6: down_proj + residual add
     ///
-    /// For MoE: falls back to sync path (graph sync + reset).
+    /// For dense and MoE: falls back to sync path (graph sync + reset).
     pub fn forward_graph(
         &self,
         normed: &Array,
@@ -161,7 +190,15 @@ impl FeedForward {
         queue: &metal::CommandQueue,
     ) -> Result<Array, KernelError> {
         match self {
-            FeedForward::Dense {
+            FeedForward::Dense { .. } => {
+                graph
+                    .sync()
+                    .map_err(|e| KernelError::InvalidShape(format!("Dense graph sync: {e}")))?;
+                graph.reset();
+                let ffn_out = self.forward(normed, registry, queue)?;
+                ops::binary::add(registry, residual, &ffn_out, queue)
+            }
+            FeedForward::Gated {
                 gate_proj,
                 up_proj,
                 down_proj,
@@ -201,7 +238,15 @@ impl FeedForward {
         queue: &metal::CommandQueue,
     ) -> Result<Array, KernelError> {
         match self {
-            FeedForward::Dense {
+            FeedForward::Dense { .. } => {
+                graph
+                    .sync()
+                    .map_err(|e| KernelError::InvalidShape(format!("Dense graph sync: {e}")))?;
+                graph.reset();
+                let ffn_out = self.forward(normed, registry, queue)?;
+                ops::binary::add(registry, residual, &ffn_out, queue)
+            }
+            FeedForward::Gated {
                 gate_proj,
                 up_proj,
                 down_proj,
@@ -228,7 +273,7 @@ impl FeedForward {
 pub struct TransformerBlock {
     layer_idx: usize,
     attention: Attention,
-    ffn: FeedForward,
+    pub(crate) ffn: FeedForward,
     norm1_weight: Option<Array>,
     norm2_weight: Option<Array>,
     rms_norm_eps: f32,
@@ -247,27 +292,53 @@ impl TransformerBlock {
             max_seq_len: config.max_seq_len,
             rope_theta: config.rope_theta,
         };
-        // Create a dummy device-less norm weight — will be replaced by from_parts
-        Ok(Self {
-            layer_idx,
-            attention: Attention::new(attn_config)?,
-            ffn: FeedForward::Dense {
+        let ffn = match config.ff_type {
+            FeedForwardType::Dense {
+                intermediate_dim,
+                activation,
+            } => FeedForward::Dense {
+                linear1: Linear::new(crate::linear::LinearConfig {
+                    in_features: hidden_size,
+                    out_features: intermediate_dim,
+                    has_bias: false,
+                }),
+                linear2: Linear::new(crate::linear::LinearConfig {
+                    in_features: intermediate_dim,
+                    out_features: hidden_size,
+                    has_bias: false,
+                }),
+                activation,
+            },
+            FeedForwardType::Gated { intermediate_dim } => FeedForward::Gated {
                 gate_proj: Linear::new(crate::linear::LinearConfig {
                     in_features: hidden_size,
-                    out_features: hidden_size,
+                    out_features: intermediate_dim,
                     has_bias: false,
                 }),
                 up_proj: Linear::new(crate::linear::LinearConfig {
                     in_features: hidden_size,
-                    out_features: hidden_size,
+                    out_features: intermediate_dim,
                     has_bias: false,
                 }),
                 down_proj: Linear::new(crate::linear::LinearConfig {
-                    in_features: hidden_size,
+                    in_features: intermediate_dim,
                     out_features: hidden_size,
                     has_bias: false,
                 }),
             },
+            FeedForwardType::MoE { .. } => {
+                return Err(KernelError::InvalidShape(
+                    "TransformerBlock::new(): MoE feed-forward cannot be constructed from config alone; \
+                     use TransformerBlock::from_parts() with a pre-built MoeLayer instead"
+                        .into(),
+                ));
+            }
+        };
+        // Create a dummy device-less norm weight — will be replaced by from_parts
+        Ok(Self {
+            layer_idx,
+            attention: Attention::new(attn_config)?,
+            ffn,
             norm1_weight: None,
             norm2_weight: None,
             rms_norm_eps,
@@ -398,9 +469,10 @@ impl TransformerBlock {
         // Pre-FFN norm
         let normed2 = ops::rms_norm::rms_norm(registry, &h, norm2_w, self.rms_norm_eps, queue)?;
 
-        // FFN with fused SwiGLU
+        // FFN: dense uses generic path; gated uses fused SwiGLU
         let ffn_out = match &self.ffn {
-            FeedForward::Dense {
+            FeedForward::Dense { .. } => self.ffn.forward(&normed2, registry, queue)?,
+            FeedForward::Gated {
                 gate_proj,
                 up_proj,
                 down_proj,
@@ -729,5 +801,92 @@ impl TransformerModel {
             .map_err(|e| KernelError::InvalidShape(format!("TransformerModel graph sync: {e}")))?;
 
         Ok(x)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_feed_forward_type_variants() {
+        let _dense = FeedForwardType::Dense {
+            intermediate_dim: 256,
+            activation: crate::activations::ActivationType::GELU,
+        };
+        let _gated = FeedForwardType::Gated {
+            intermediate_dim: 256,
+        };
+    }
+
+    #[test]
+    fn test_transformer_config_with_gated_ffn() {
+        let config = TransformerConfig {
+            hidden_size: 64,
+            num_heads: 4,
+            num_kv_heads: 4,
+            head_dim: 16,
+            num_layers: 1,
+            vocab_size: 100,
+            max_seq_len: 128,
+            rope_theta: 10000.0,
+            rms_norm_eps: 1e-5,
+            ff_type: FeedForwardType::Gated {
+                intermediate_dim: 128,
+            },
+        };
+        assert!(config.validate().is_ok());
+        let block = TransformerBlock::new(0, config).unwrap();
+        assert_eq!(block.layer_idx(), 0);
+        match &block.ffn {
+            FeedForward::Gated {
+                gate_proj,
+                up_proj,
+                down_proj,
+            } => {
+                assert_eq!(gate_proj.in_features(), 64);
+                assert_eq!(gate_proj.out_features(), 128);
+                assert_eq!(up_proj.in_features(), 64);
+                assert_eq!(up_proj.out_features(), 128);
+                assert_eq!(down_proj.in_features(), 128);
+                assert_eq!(down_proj.out_features(), 64);
+            }
+            _ => panic!("Expected Gated FFN variant"),
+        }
+    }
+
+    #[test]
+    fn test_transformer_config_with_dense_ffn() {
+        let config = TransformerConfig {
+            hidden_size: 64,
+            num_heads: 4,
+            num_kv_heads: 4,
+            head_dim: 16,
+            num_layers: 1,
+            vocab_size: 100,
+            max_seq_len: 128,
+            rope_theta: 10000.0,
+            rms_norm_eps: 1e-5,
+            ff_type: FeedForwardType::Dense {
+                intermediate_dim: 256,
+                activation: crate::activations::ActivationType::GELU,
+            },
+        };
+        assert!(config.validate().is_ok());
+        let block = TransformerBlock::new(0, config).unwrap();
+        match &block.ffn {
+            FeedForward::Dense {
+                linear1,
+                linear2,
+                activation,
+            } => {
+                assert_eq!(linear1.in_features(), 64);
+                assert_eq!(linear1.out_features(), 256);
+                assert_eq!(linear2.in_features(), 256);
+                assert_eq!(linear2.out_features(), 64);
+                assert_eq!(*activation, crate::activations::ActivationType::GELU);
+            }
+            _ => panic!("Expected Dense FFN variant"),
+        }
     }
 }
