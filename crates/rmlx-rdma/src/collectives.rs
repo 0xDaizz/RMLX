@@ -267,18 +267,10 @@ pub fn ring_allreduce_typed<T: ReduceElement>(
             let wr_id_recv = step as u64 * 2;
             let wr_id_send = step as u64 * 2 + 1;
 
-            let recv_op = left.post_recv(
-                recv_reg.mr(),
-                0,
-                (recv_len * elem_size) as u32,
-                wr_id_recv,
-            )?;
-            let send_op = right.post_send(
-                send_reg.mr(),
-                0,
-                (send_len * elem_size) as u32,
-                wr_id_send,
-            )?;
+            let recv_op =
+                left.post_recv(recv_reg.mr(), 0, (recv_len * elem_size) as u32, wr_id_recv)?;
+            let send_op =
+                right.post_send(send_reg.mr(), 0, (send_len * elem_size) as u32, wr_id_send)?;
 
             right.wait_posted(&[send_op])?;
             left.wait_posted(&[recv_op])?;
@@ -328,18 +320,10 @@ pub fn ring_allreduce_typed<T: ReduceElement>(
             let wr_id_recv = base_wr + step as u64 * 2;
             let wr_id_send = base_wr + step as u64 * 2 + 1;
 
-            let recv_op = left.post_recv(
-                recv_reg.mr(),
-                0,
-                (recv_len * elem_size) as u32,
-                wr_id_recv,
-            )?;
-            let send_op = right.post_send(
-                send_reg.mr(),
-                0,
-                (send_len * elem_size) as u32,
-                wr_id_send,
-            )?;
+            let recv_op =
+                left.post_recv(recv_reg.mr(), 0, (recv_len * elem_size) as u32, wr_id_recv)?;
+            let send_op =
+                right.post_send(send_reg.mr(), 0, (send_len * elem_size) as u32, wr_id_send)?;
 
             right.wait_posted(&[send_op])?;
             left.wait_posted(&[recv_op])?;
@@ -500,18 +484,10 @@ pub fn ring_reduce_scatter_typed<T: ReduceElement>(
             let wr_id_recv = step as u64 * 2;
             let wr_id_send = step as u64 * 2 + 1;
 
-            let recv_op = left.post_recv(
-                recv_reg.mr(),
-                0,
-                (recv_len * elem_size) as u32,
-                wr_id_recv,
-            )?;
-            let send_op = right.post_send(
-                send_reg.mr(),
-                0,
-                (send_len * elem_size) as u32,
-                wr_id_send,
-            )?;
+            let recv_op =
+                left.post_recv(recv_reg.mr(), 0, (recv_len * elem_size) as u32, wr_id_recv)?;
+            let send_op =
+                right.post_send(send_reg.mr(), 0, (send_len * elem_size) as u32, wr_id_send)?;
 
             right.wait_posted(&[send_op])?;
             left.wait_posted(&[recv_op])?;
