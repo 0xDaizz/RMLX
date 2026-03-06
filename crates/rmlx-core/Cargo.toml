@@ -9,3 +9,4 @@ license.workspace = true
 rmlx-metal = { path = "../rmlx-metal" }
 rmlx-alloc = { path = "../rmlx-alloc" }
 metal = { workspace = true }
+tracing = { workspace = true }

@@ -108,9 +108,10 @@ impl ProgressTracker {
         let new_count = prev + 1;
         if new_count >= self.error_threshold && !self.health_warning.load(Ordering::Acquire) {
             self.health_warning.store(true, Ordering::Release);
-            eprintln!(
-                "[rmlx-distributed] ProgressTracker: {} consecutive poll errors — health warning triggered",
-                new_count
+            tracing::warn!(
+                target: "rmlx_distributed",
+                consecutive_errors = new_count,
+                "ProgressTracker: consecutive poll errors — health warning triggered",
             );
         }
     }

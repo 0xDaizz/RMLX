@@ -198,9 +198,11 @@ fn load_device_map(config: &InitConfig) -> Option<DeviceMap> {
     match DeviceMap::from_file(Path::new(&path_str)) {
         Ok(dm) => Some(dm),
         Err(e) => {
-            eprintln!(
-                "[rmlx-distributed] WARN: failed to load device file '{}': {e}",
-                path_str
+            tracing::warn!(
+                target: "rmlx_distributed",
+                path = %path_str,
+                %e,
+                "failed to load device file",
             );
             None
         }
@@ -268,15 +270,16 @@ fn try_rdma_init(
                 dm.world_size()
             )));
         }
-        eprintln!(
-            "[rmlx-distributed] loaded device file with {} ranks",
-            dm.world_size()
+        tracing::info!(
+            target: "rmlx_distributed",
+            world_size = dm.world_size(),
+            "loaded device file",
         );
     }
 
     // Resolve topology (may be inferred from device file)
     let topology = resolve_topology(config, device_map.as_ref());
-    eprintln!("[rmlx-distributed] topology: {topology:?}");
+    tracing::info!(target: "rmlx_distributed", ?topology, "resolved topology");
 
     // --- Phase 1: Create per-peer QPs and gather all QP info ---
     //
@@ -470,10 +473,14 @@ fn try_rdma_init(
     let all_ranks: Vec<u32> = (0..world_size).collect();
     let group = Group::with_transport(all_ranks, rank, world_size, Arc::new(transport))?;
 
-    eprintln!(
-        "[rmlx-distributed] rank {rank}/{world_size} connected to {} peers \
-         (topology: {topology:?}, peers: {peers:?})",
-        peers.len(),
+    tracing::info!(
+        target: "rmlx_distributed",
+        rank,
+        world_size,
+        num_peers = peers.len(),
+        ?topology,
+        ?peers,
+        "connected to peers",
     );
 
     // ── Warmup: RDMA ping-pong + JIT shader pre-compilation + calibration ──
@@ -492,14 +499,18 @@ fn try_rdma_init(
             || Ok(()),
         ) {
             Ok(result) => {
-                eprintln!(
-                    "[rmlx-distributed] warmup complete: rdma={:?}, jit={:?}, calibration={:?}, total={:?}",
-                    result.rdma_warmup, result.jit_warmup, result.calibration, result.total,
+                tracing::info!(
+                    target: "rmlx_distributed",
+                    rdma_warmup = ?result.rdma_warmup,
+                    jit_warmup = ?result.jit_warmup,
+                    calibration = ?result.calibration,
+                    total = ?result.total,
+                    "warmup complete",
                 );
                 Some(result)
             }
             Err(e) => {
-                eprintln!("[rmlx-distributed] warmup failed (non-fatal): {e}");
+                tracing::warn!(target: "rmlx_distributed", %e, "warmup failed (non-fatal)");
                 None
             }
         }
@@ -557,7 +568,7 @@ pub fn init(config: InitConfig) -> Result<DistributedContext, DistributedError> 
                 Err(e)
             } else {
                 // Auto mode, non-strict: fall back to loopback with a warning.
-                eprintln!("[rmlx-distributed] RDMA init failed, falling back to loopback: {e}");
+                tracing::warn!(target: "rmlx_distributed", %e, "RDMA init failed, falling back to loopback");
                 loopback_context()
             }
         }

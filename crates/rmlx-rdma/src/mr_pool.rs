@@ -203,10 +203,11 @@ impl Drop for MrPool {
                     Err(arc) => {
                         // Outstanding handles exist — this is a usage bug.
                         // Drop the Arc anyway (MR won't deregister until last handle drops).
-                        eprintln!(
-                            "[rmlx-rdma] WARN: MrPool dropped with {} outstanding handles for slot size={}",
-                            Arc::strong_count(&arc) - 1,
-                            arc.size
+                        tracing::warn!(
+                            target: "rmlx_rdma",
+                            outstanding = Arc::strong_count(&arc) - 1,
+                            size = arc.size,
+                            "MrPool dropped with outstanding handles",
                         );
                         // The buffer will leak. This is intentional to avoid UB
                         // (freeing memory that an outstanding MrHandle may still reference).

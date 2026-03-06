@@ -94,9 +94,10 @@ impl MoePolicy {
                 "gpu" | "metal" => forced_backend = Some(MoeBackend::Metal),
                 "auto" | "" => {} // default
                 other => {
-                    eprintln!(
-                        "RMLX_MOE_BACKEND: unknown value '{other}', using auto. \
-                         Valid: cpu, gpu, metal, auto"
+                    tracing::warn!(
+                        target: "rmlx_distributed",
+                        value = %other,
+                        "RMLX_MOE_BACKEND: unknown value, using auto. Valid: cpu, gpu, metal, auto",
                     );
                 }
             }

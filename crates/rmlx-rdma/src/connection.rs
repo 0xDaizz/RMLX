@@ -346,9 +346,10 @@ impl RdmaConnection {
         size: usize,
     ) -> Result<MemoryRegion, RdmaError> {
         let max_mr_size = self.ctx.probe().map(|p| p.max_mr_size).unwrap_or_else(|| {
-            eprintln!(
-                "[rmlx-rdma] WARN: probe unavailable, using DEFAULT_MAX_MR_SIZE={}",
-                crate::mr::DEFAULT_MAX_MR_SIZE
+            tracing::warn!(
+                target: "rmlx_rdma",
+                default = crate::mr::DEFAULT_MAX_MR_SIZE,
+                "probe unavailable, using DEFAULT_MAX_MR_SIZE",
             );
             crate::mr::DEFAULT_MAX_MR_SIZE
         });
