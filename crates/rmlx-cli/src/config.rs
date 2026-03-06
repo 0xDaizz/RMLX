@@ -307,4 +307,70 @@ mod tests {
         let map = build_rdma_map(&devs, 1, 3);
         assert_eq!(map, vec![Some("d0".into()), None, Some("d1".into())]);
     }
+
+    #[test]
+    fn test_build_rdma_map_single_device_wraps() {
+        // When there is only one device, it wraps (cursor % 1 == 0 always).
+        let devs = vec!["mlx5_0".into()];
+        let map = build_rdma_map(&devs, 0, 3);
+        assert_eq!(
+            map,
+            vec![None, Some("mlx5_0".into()), Some("mlx5_0".into())]
+        );
+    }
+
+    #[test]
+    fn test_build_rdma_map_self_is_none() {
+        // For any rank configuration, self entry should be None.
+        let devs = vec!["d0".into(), "d1".into(), "d2".into()];
+        for rank in 0..4 {
+            let map = build_rdma_map(&devs, rank, 4);
+            assert_eq!(map[rank], None);
+            assert_eq!(map.len(), 4);
+        }
+    }
+
+    #[test]
+    fn test_build_rdma_map_4nodes_last_rank() {
+        let devs = vec!["d0".into(), "d1".into(), "d2".into()];
+        let map = build_rdma_map(&devs, 3, 4);
+        // rank=3: peers are 0,1,2. cursor cycles through d0,d1,d2.
+        assert_eq!(
+            map,
+            vec![
+                Some("d0".into()),
+                Some("d1".into()),
+                Some("d2".into()),
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_must_ok_success() {
+        let _output = std::process::Output {
+            status: std::process::ExitStatus::default(),
+            stdout: b"hello\n".to_vec(),
+            stderr: Vec::new(),
+        };
+        // On macOS, ExitStatus::default() is success (0).
+        // We test the function directly if we can construct a successful Output.
+        // Unfortunately ExitStatus cannot be easily constructed, so we use Command.
+        let result = must_ok(
+            std::process::Command::new("echo").arg("test123").output(),
+            "echo test",
+        );
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "test123");
+    }
+
+    #[test]
+    fn test_must_ok_failure() {
+        let result = must_ok(
+            std::process::Command::new("false").output(),
+            "should fail",
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("should fail"));
+    }
 }

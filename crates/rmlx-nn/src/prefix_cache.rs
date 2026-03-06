@@ -596,4 +596,89 @@ mod tests {
         assert_eq!(m.matched_len, 5);
         assert_eq!(m.block_ids, vec![10, 11, 12]);
     }
+
+    #[test]
+    fn test_evict_zero_blocks_is_noop() {
+        let mut cache = PrefixCache::new();
+        cache.insert(&[1, 2, 3], &[10]);
+        let freed = cache.evict(0);
+        assert_eq!(freed, 0);
+        assert_eq!(cache.total_cached_blocks(), 1);
+    }
+
+    #[test]
+    fn test_evict_more_than_available() {
+        let mut cache = PrefixCache::new();
+        cache.insert(&[1, 2], &[10]);
+        let freed = cache.evict(100);
+        // Should free whatever is available (1 block), not panic.
+        assert_eq!(freed, 1);
+        assert_eq!(cache.total_cached_blocks(), 0);
+    }
+
+    #[test]
+    fn test_insert_overwrites_existing_entry() {
+        let mut cache = PrefixCache::new();
+        cache.insert(&[1, 2, 3], &[10, 11]);
+        cache.insert(&[1, 2, 3], &[20, 21, 22]);
+
+        let m = cache.lookup(&[1, 2, 3]);
+        assert_eq!(m.matched_len, 3);
+        assert_eq!(m.block_ids, vec![20, 21, 22]);
+    }
+
+    #[test]
+    fn test_multiple_independent_sequences() {
+        let mut cache = PrefixCache::new();
+        cache.insert(&[1, 2, 3], &[10]);
+        cache.insert(&[4, 5, 6], &[20]);
+        cache.insert(&[7, 8, 9], &[30]);
+
+        let m1 = cache.lookup(&[1, 2, 3]);
+        assert_eq!(m1.matched_len, 3);
+        assert_eq!(m1.block_ids, vec![10]);
+
+        let m2 = cache.lookup(&[4, 5, 6]);
+        assert_eq!(m2.matched_len, 3);
+        assert_eq!(m2.block_ids, vec![20]);
+
+        let m3 = cache.lookup(&[7, 8, 9]);
+        assert_eq!(m3.matched_len, 3);
+        assert_eq!(m3.block_ids, vec![30]);
+
+        assert_eq!(cache.total_cached_blocks(), 3);
+    }
+
+    #[test]
+    fn test_lookup_longer_than_inserted() {
+        let mut cache = PrefixCache::new();
+        cache.insert(&[1, 2, 3], &[10, 11]);
+
+        // Query is longer than any inserted sequence.
+        let m = cache.lookup(&[1, 2, 3, 4, 5, 6]);
+        // Should match the 3-token prefix.
+        assert_eq!(m.matched_len, 3);
+        assert_eq!(m.block_ids, vec![10, 11]);
+    }
+
+    #[test]
+    fn test_single_token_sequence() {
+        let mut cache = PrefixCache::new();
+        cache.insert(&[42], &[100]);
+
+        let m = cache.lookup(&[42]);
+        assert_eq!(m.matched_len, 1);
+        assert_eq!(m.block_ids, vec![100]);
+
+        let m2 = cache.lookup(&[43]);
+        assert_eq!(m2.matched_len, 0);
+    }
+
+    #[test]
+    fn test_default_creates_empty_cache() {
+        let mut cache = PrefixCache::default();
+        assert_eq!(cache.total_cached_blocks(), 0);
+        let m = cache.lookup(&[1]);
+        assert_eq!(m.matched_len, 0);
+    }
 }

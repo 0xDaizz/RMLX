@@ -176,3 +176,162 @@ pub fn log_with_fields(level: LogLevel, target: &str, message: &str, fields: &[(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_log_level_ordering() {
+        assert!(LogLevel::Error < LogLevel::Warn);
+        assert!(LogLevel::Warn < LogLevel::Info);
+        assert!(LogLevel::Info < LogLevel::Debug);
+        assert!(LogLevel::Debug < LogLevel::Trace);
+    }
+
+    #[test]
+    fn test_log_level_as_str() {
+        assert_eq!(LogLevel::Error.as_str(), "ERROR");
+        assert_eq!(LogLevel::Warn.as_str(), "WARN");
+        assert_eq!(LogLevel::Info.as_str(), "INFO");
+        assert_eq!(LogLevel::Debug.as_str(), "DEBUG");
+        assert_eq!(LogLevel::Trace.as_str(), "TRACE");
+    }
+
+    #[test]
+    fn test_log_level_from_u8_roundtrip() {
+        for v in 0..=4u8 {
+            let level = LogLevel::from_u8(v);
+            assert_eq!(level as u8, v);
+        }
+    }
+
+    #[test]
+    fn test_log_level_from_u8_out_of_range() {
+        // Values > 4 should map to Trace.
+        assert_eq!(LogLevel::from_u8(5), LogLevel::Trace);
+        assert_eq!(LogLevel::from_u8(255), LogLevel::Trace);
+    }
+
+    #[test]
+    fn test_log_entry_format_json_basic() {
+        let entry = LogEntry {
+            timestamp_ms: 1234567890,
+            level: LogLevel::Info,
+            target: "rmlx::test".to_string(),
+            message: "hello world".to_string(),
+            fields: Vec::new(),
+        };
+        let json = entry.format_json();
+        assert!(json.contains("\"ts\":1234567890"));
+        assert!(json.contains("\"level\":\"INFO\""));
+        assert!(json.contains("\"target\":\"rmlx::test\""));
+        assert!(json.contains("\"msg\":\"hello world\""));
+    }
+
+    #[test]
+    fn test_log_entry_format_json_with_fields() {
+        let entry = LogEntry {
+            timestamp_ms: 100,
+            level: LogLevel::Error,
+            target: "test".to_string(),
+            message: "fail".to_string(),
+            fields: vec![
+                ("key1".to_string(), "val1".to_string()),
+                ("key2".to_string(), "val2".to_string()),
+            ],
+        };
+        let json = entry.format_json();
+        assert!(json.contains("\"key1\":\"val1\""));
+        assert!(json.contains("\"key2\":\"val2\""));
+    }
+
+    #[test]
+    fn test_log_entry_format_json_escaping() {
+        let entry = LogEntry {
+            timestamp_ms: 0,
+            level: LogLevel::Warn,
+            target: "test".to_string(),
+            message: "line1\nline2\ttab\"quote\\back".to_string(),
+            fields: Vec::new(),
+        };
+        let json = entry.format_json();
+        assert!(json.contains("\\n"));
+        assert!(json.contains("\\t"));
+        assert!(json.contains("\\\""));
+        assert!(json.contains("\\\\"));
+    }
+
+    #[test]
+    fn test_log_entry_format_text_basic() {
+        let entry = LogEntry {
+            timestamp_ms: 999,
+            level: LogLevel::Debug,
+            target: "mymod".to_string(),
+            message: "something happened".to_string(),
+            fields: Vec::new(),
+        };
+        let text = entry.format_text();
+        assert!(text.starts_with("[999] DEBUG mymod: something happened"));
+    }
+
+    #[test]
+    fn test_log_entry_format_text_with_fields() {
+        let entry = LogEntry {
+            timestamp_ms: 0,
+            level: LogLevel::Info,
+            target: "t".to_string(),
+            message: "m".to_string(),
+            fields: vec![("k".to_string(), "v".to_string())],
+        };
+        let text = entry.format_text();
+        assert!(text.contains("k=v"));
+    }
+
+    #[test]
+    fn test_log_entry_new_has_nonzero_timestamp() {
+        let entry = LogEntry::new(LogLevel::Info, "test", "msg");
+        // Timestamp should be non-zero (current time).
+        assert!(entry.timestamp_ms > 0);
+    }
+
+    #[test]
+    fn test_log_entry_field_builder() {
+        let entry = LogEntry::new(LogLevel::Info, "test", "msg")
+            .field("a", "1")
+            .field("b", "2");
+        assert_eq!(entry.fields.len(), 2);
+        assert_eq!(entry.fields[0], ("a".to_string(), "1".to_string()));
+        assert_eq!(entry.fields[1], ("b".to_string(), "2".to_string()));
+    }
+
+    #[test]
+    fn test_is_enabled_respects_level() {
+        // Note: this test modifies global state. In a real test suite we'd
+        // want to serialize tests that touch GLOBAL_LEVEL.
+        let original = current_level();
+
+        set_level(LogLevel::Warn);
+        assert!(is_enabled(LogLevel::Error));
+        assert!(is_enabled(LogLevel::Warn));
+        assert!(!is_enabled(LogLevel::Info));
+        assert!(!is_enabled(LogLevel::Debug));
+        assert!(!is_enabled(LogLevel::Trace));
+
+        // Restore.
+        set_level(original);
+    }
+
+    #[test]
+    fn test_set_and_get_level() {
+        let original = current_level();
+
+        set_level(LogLevel::Trace);
+        assert_eq!(current_level(), LogLevel::Trace);
+
+        set_level(LogLevel::Error);
+        assert_eq!(current_level(), LogLevel::Error);
+
+        set_level(original);
+    }
+}

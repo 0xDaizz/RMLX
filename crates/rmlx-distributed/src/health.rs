@@ -176,4 +176,72 @@ mod tests {
         assert_eq!(config.timeout, Duration::from_secs(5));
         assert_eq!(config.max_missed, 3);
     }
+
+    #[test]
+    fn test_unknown_peer_is_unhealthy() {
+        let monitor = HealthMonitor::new(test_config());
+        // A peer with no recorded heartbeat should not be considered healthy.
+        assert!(!monitor.is_healthy(99));
+    }
+
+    #[test]
+    fn test_check_health_empty_returns_empty() {
+        let monitor = HealthMonitor::new(test_config());
+        // No peers registered at all.
+        assert!(monitor.check_health().is_empty());
+    }
+
+    #[test]
+    fn test_refresh_heartbeat_resets_timeout() {
+        let monitor = HealthMonitor::new(test_config());
+        monitor.record_heartbeat(1);
+
+        // Wait almost to timeout.
+        thread::sleep(Duration::from_millis(30));
+        // Refresh heartbeat before timeout.
+        monitor.record_heartbeat(1);
+
+        // Wait another short period.
+        thread::sleep(Duration::from_millis(20));
+        // Should still be healthy because we refreshed.
+        assert!(monitor.is_healthy(1));
+    }
+
+    #[test]
+    fn test_monitor_is_clone_and_shared() {
+        let monitor = HealthMonitor::new(test_config());
+        let monitor2 = monitor.clone();
+
+        monitor.record_heartbeat(5);
+        // The clone should see the same data (Arc-backed).
+        assert!(monitor2.is_healthy(5));
+    }
+
+    #[test]
+    fn test_heartbeat_sender_error_propagation() {
+        let sender = HeartbeatSender::new(test_config(), 0, |_rank| {
+            Err("network down".to_string())
+        });
+
+        let result = sender.send_heartbeat();
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "network down");
+    }
+
+    #[test]
+    fn test_check_health_sorted_output() {
+        let monitor = HealthMonitor::new(test_config());
+
+        // Register peers in non-sorted order.
+        monitor.record_heartbeat(10);
+        monitor.record_heartbeat(3);
+        monitor.record_heartbeat(7);
+
+        // Wait for all to time out.
+        thread::sleep(Duration::from_millis(60));
+
+        let unhealthy = monitor.check_health();
+        // Should be sorted.
+        assert_eq!(unhealthy, vec![3, 7, 10]);
+    }
 }

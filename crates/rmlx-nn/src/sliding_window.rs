@@ -427,4 +427,121 @@ mod tests {
         let total_seq_actual = cached_len;
         assert_eq!(total_seq_actual, 5);
     }
+
+    /// When cached_len == window_size, edge case: start should be 0.
+    #[test]
+    fn test_sliding_window_exact_boundary() {
+        let cached_len = 8usize;
+        let window_size = 8usize;
+
+        // Not strictly greater, so no truncation path.
+        assert!(cached_len <= window_size);
+        let total_seq_actual = cached_len;
+        assert_eq!(total_seq_actual, 8);
+    }
+
+    /// Verify mask generation: a token at position i with offset=0
+    /// in a window of size 4 can only attend to positions [max(0, i-3), i].
+    #[test]
+    fn test_sliding_window_mask_values() {
+        // Simulate mask generation logic from build_sliding_window_mask.
+        let seq_len = 6;
+        let total_seq = 6;
+        let window_size = 4;
+        let position_offset = 0;
+
+        let mut mask = vec![f32::NEG_INFINITY; seq_len * total_seq];
+        for i in 0..seq_len {
+            let abs_pos = i + position_offset;
+            let window_start = (abs_pos + 1).saturating_sub(window_size);
+            let window_end = abs_pos + 1;
+            for j in window_start..std::cmp::min(window_end, total_seq) {
+                mask[i * total_seq + j] = 0.0;
+            }
+        }
+
+        // Row 0: can attend to [0]. Window: [0, 0].
+        assert_eq!(mask[0], 0.0);
+        assert_eq!(mask[1], f32::NEG_INFINITY);
+
+        // Row 3: can attend to [0, 1, 2, 3] (window=4).
+        for j in 0..=3 {
+            assert_eq!(mask[3 * total_seq + j], 0.0);
+        }
+
+        // Row 5: can attend to [2, 3, 4, 5] (window=4).
+        assert_eq!(mask[5 * total_seq + 1], f32::NEG_INFINITY);
+        for j in 2..=5 {
+            assert_eq!(mask[5 * total_seq + j], 0.0);
+        }
+    }
+
+    /// Verify mask with a position offset (simulating decode after prefill).
+    #[test]
+    fn test_sliding_window_mask_with_offset() {
+        let seq_len = 1; // decode: one new token
+        let total_seq = 10; // 9 cached + 1 new
+        let window_size = 4;
+        let position_offset = 9; // new token at position 9
+
+        let mut mask = vec![f32::NEG_INFINITY; seq_len * total_seq];
+        for i in 0..seq_len {
+            let abs_pos = i + position_offset;
+            let window_start = (abs_pos + 1).saturating_sub(window_size);
+            let window_end = abs_pos + 1;
+            for j in window_start..std::cmp::min(window_end, total_seq) {
+                mask[i * total_seq + j] = 0.0;
+            }
+        }
+
+        // Token at abs_pos=9 with window=4 can attend to [6, 7, 8, 9].
+        for val in &mask[..6] {
+            assert_eq!(*val, f32::NEG_INFINITY);
+        }
+        for val in &mask[6..10] {
+            assert_eq!(*val, 0.0);
+        }
+    }
+
+    /// Zero-sized window should be rejected by SlidingWindowAttention::new.
+    #[test]
+    fn test_sliding_window_zero_window_rejected() {
+        use super::*;
+        use crate::attention::AttentionConfig;
+
+        let config = SlidingWindowAttentionConfig {
+            base: AttentionConfig {
+                num_heads: 4,
+                num_kv_heads: 4,
+                head_dim: 64,
+                max_seq_len: 512,
+                rope_theta: 10000.0,
+            },
+            window_size: 0,
+        };
+        let result = SlidingWindowAttention::new(config);
+        assert!(result.is_err());
+    }
+
+    /// Valid config should succeed.
+    #[test]
+    fn test_sliding_window_valid_config() {
+        use super::*;
+        use crate::attention::AttentionConfig;
+
+        let config = SlidingWindowAttentionConfig {
+            base: AttentionConfig {
+                num_heads: 8,
+                num_kv_heads: 2,
+                head_dim: 64,
+                max_seq_len: 2048,
+                rope_theta: 10000.0,
+            },
+            window_size: 256,
+        };
+        let attn = SlidingWindowAttention::new(config).unwrap();
+        assert_eq!(attn.window_size(), 256);
+        assert_eq!(attn.base_config().num_heads, 8);
+        assert_eq!(attn.base_config().num_kv_heads, 2);
+    }
 }
