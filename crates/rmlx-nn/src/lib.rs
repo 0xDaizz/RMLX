@@ -17,6 +17,7 @@ pub mod moe;
 pub mod moe_pipeline;
 pub mod paged_kv_cache;
 pub mod parallel;
+pub mod prefix_cache;
 pub mod quantized_linear;
 pub mod rms_norm;
 pub mod rope;
@@ -26,7 +27,10 @@ pub mod sliding_window;
 pub mod transformer;
 
 // ── Re-exports of core types ──
-pub use activations::{Activation, ActivationType, GELUFast, SiLU, Sigmoid, Tanh, GELU};
+pub use activations::{
+    Activation, ActivationType, GELUFast, HardSigmoid, HardSwish, LeakyReLU, Mish, QuickGELU, ReLU,
+    SiLU, Sigmoid, Softplus, Softsign, Tanh, ELU, GELU, GLU, SELU,
+};
 pub use attention::{
     Attention, AttentionConfig, BatchKvCache, LayerKvCache, QuantizedArray, QuantizedKvCache,
     RotatingKvCache,
@@ -43,7 +47,11 @@ pub use moe::{load_balance_loss, Expert, MoeConfig, MoeForwardMetrics, MoeLayer,
 pub use moe_pipeline::{MoePipeline, MoePipelineConfig};
 pub use paged_kv_cache::{BlockId, BlockManager, PagedKvCache, PagedKvError};
 pub use parallel::{ColumnParallelLinear, RowParallelLinear, TpError};
-pub use quantized_linear::{QuantBits, QuantizedLinear, QuantizedLinearConfig};
+pub use prefix_cache::{PrefixCache, PrefixMatch};
+pub use quantized_linear::{
+    AwqLinear, GptqLinear, KQuantConfig, KQuantType, QuantBits, QuantizedLinear,
+    QuantizedLinearConfig,
+};
 pub use rms_norm::{RMSNorm, RMSNormConfig};
 pub use rope::{RotaryPositionEmbedding, RotaryPositionEmbeddingConfig};
 pub use sampler::{Sampler, SamplerConfig};

@@ -2,9 +2,9 @@
 
 ## Overview
 
-`rmlx-distributed` is a crate providing communication groups, MoE (Mixture of Experts) dispatch/combine exchange, 3-zone backend policy, compute-RDMA pipeline overlap, overflow monitoring (SparseGuard), variable-length EP packet protocol, FP8 exchange path, RDMA slab-ring transport, distributed initialization, warmup protocol, and MoE metrics for distributed inference.
+`rmlx-distributed` is a crate providing communication groups, MoE (Mixture of Experts) dispatch/combine exchange, 3-zone backend policy, compute-RDMA pipeline overlap, overflow monitoring (SparseGuard), variable-length EP packet protocol, FP8 exchange path, RDMA slab-ring transport, distributed initialization, warmup protocol, MoE metrics, tree allreduce, and topology ring for distributed inference.
 
-> **Status:** All modules are implemented: group, init, moe_exchange, moe_policy, pipeline, sparse_guard, warmup, metrics, v3_protocol, fp8_exchange, slab_ring, moe_kernels. Phase 0+1+2 audit remediation complete (items D1-D10): dispatch loop ordering fixed (k-outer), per-rank capacity partitioning, combine kernel caching, byte threshold (4KB->2MB), hysteresis path fix, dual cooldown semantics, shared expert support, EP integration improvements. EP-3/EP-5/EP-6 optimization additions complete. EP-2~EP-6 forward path integration: `MoeDispatchConfig::new()` constructor, `dispatch_fp8()` convenience method, `WireProtocol::V3` support in all dispatch paths, SlabRing integration in `route_rdma`, FP8 wire helpers (`pack_for_wire`, `unpack_from_wire`, `wire_token_stride`). **Production Readiness Phase 2 (distributed correctness):** new `moe_kernels.rs` (JIT-compiled MoE Metal kernels), `ExchangeBuffers` struct + `acquire_exchange_buffers()` in moe_exchange, `AcquiredBuffer` lifecycle + `acquire_send_recv_buffers()` in ep_runtime, CAS-based TOCTOU race fix in slab_ring, deadlock fix (interleaved send/recv) in v3_protocol, unknown backend now errors in init. **Phase 3 additions:** ring allreduce element-aligned chunk rounding fix (f16/bf16 reduction via `half` crate, NaN preservation); MoePolicy thread safety via interior mutability (RwLock), all methods now take `&self`, implements Send+Sync. **Phase 4 additions:** SlabRing condvar backpressure — `acquire_for_write` blocks when ring is full instead of failing, `ring_full_count` metric for monitoring (P4-9); ProgressEngine wiring for EP dispatch with consecutive-error threshold for automatic failover (P4-10).
+> **Status:** All modules are implemented: group, init, moe_exchange, moe_policy, pipeline, sparse_guard, warmup, metrics, v3_protocol, fp8_exchange, slab_ring, moe_kernels. Phase 0+1+2 audit remediation complete (items D1-D10). EP-3/EP-5/EP-6 optimization additions complete. EP-2~EP-6 forward path integration complete. **Phase 5 additions:** Tree allreduce (binary tree, O(log N) rounds) in `group.rs`; `allreduce_auto()` auto-selects tree (<1MB) or ring (>=1MB); `TopologyRing` constructs greedy nearest-unvisited ring from hop matrix, configurable via `RMLX_TOPOLOGY` env var.
 
 ---
 
@@ -107,8 +107,20 @@ Convenience wrappers that operate on `rmlx_core::array::Array` instead of raw `&
 |--------|-------------|
 | `allreduce_sum(input, device)` | All-reduce sum across ranks; returns Array with same shape/dtype |
 | `allgather_array(input, device)` | All-gather across ranks; returns Array with shape `[world_size * dim0, ...rest]` |
+| `allreduce_tree(data)` | Tree allreduce using binary tree topology (O(log N) rounds) |
+| `allreduce_auto(data)` | Auto-selects tree allreduce (<1MB) or ring allreduce (>=1MB) based on data size |
 
-Both methods return the input unchanged for single-rank groups (identity).
+Both `allreduce_sum` and `allgather_array` return the input unchanged for single-rank groups (identity).
+
+### Tree Allreduce (Phase 5)
+
+Phase 5 adds a binary tree allreduce algorithm to `group.rs`. Unlike ring allreduce which requires O(N) rounds, tree allreduce completes in O(log N) rounds by organizing ranks into a binary tree. Each round halves the number of active participants, with parent nodes receiving and reducing data from their children. This is more efficient for small messages (<1MB) where latency dominates over bandwidth.
+
+`allreduce_auto()` automatically selects the optimal algorithm: tree allreduce for messages under 1MB, ring allreduce for messages 1MB and above.
+
+### TopologyRing (Phase 5)
+
+`TopologyRing` constructs an optimized ring ordering from a hop-count matrix between nodes. It uses a greedy nearest-unvisited heuristic to minimize total inter-node hops, which is important for multi-node ring allreduce performance. The topology can be overridden via the `RMLX_TOPOLOGY` environment variable.
 
 ---
 

@@ -4,7 +4,7 @@
 
 `rmlx-rdma` is the inter-node communication layer based on Thunderbolt 5 RDMA (ibverbs). It performs high-speed data transfer between Apple Silicon Macs via the TB5 interface. It dynamically loads `librdma.dylib` via `dlopen` to interface with the macOS TB5 RDMA driver and uses UC (Unreliable Connected) mode QPs.
 
-> **Status:** Phase 1 implementation complete + Phase 0+1+2 audit remediation (items R1-R3) + Production Readiness Phase 2 (distributed correctness) + Phase 3. FFI bindings, context/PD/CQ management, UC QP lifecycle, MR registration, TCP-based QP exchange, connection management, initialization protocol, dual port striping, transfer metrics, **ring/allreduce/allgather collectives**, **connection manager**, **coordinator**, and **application-level CRC32 integrity** (`crc.rs`) are all implemented. **Phase 3 additions:** `ReduceElement` trait and `CollectiveDType` enum for typed f16/bf16 allreduce/broadcast/allgather collectives, enabling mixed-precision distributed reduction without manual dtype handling.
+> **Status:** Phase 1 implementation complete + Phase 0+1+2 audit remediation (items R1-R3) + Production Readiness Phase 2 (distributed correctness) + Phase 3 + Phase 5. FFI bindings, context/PD/CQ management, UC QP lifecycle, MR registration, TCP-based QP exchange, connection management, initialization protocol, dual port striping, transfer metrics, **ring/allreduce/allgather collectives**, **connection manager**, **coordinator**, **application-level CRC32 integrity** (`crc.rs`), and **pipelined ring buffer** are all implemented. **Phase 3 additions:** `ReduceElement` trait and `CollectiveDType` enum for typed f16/bf16 allreduce/broadcast/allgather collectives. **Phase 5 additions:** `PipelinedRingBuffer` (N-slot overlapping send/recv/reduce) and `pipelined_ring_allreduce()` in `collectives.rs`.
 
 ---
 
@@ -21,7 +21,7 @@ graph TD
     A --> H[multi_port.rs — StripeEngine / PortFailover]
     A --> I[rdma_metrics.rs — RdmaMetrics]
     A --> J[crc.rs — CRC32 integrity for UC transport]
-    A --> K[collectives — typed f16/bf16 allreduce/broadcast/allgather]
+    A --> K[collectives — typed f16/bf16 allreduce/broadcast/allgather + PipelinedRingBuffer]
 ```
 
 ### `ffi.rs` — ibverbs Dynamic FFI Bindings
@@ -448,6 +448,24 @@ pub enum CollectiveDType {
 | `typed_allgather(data, dtype)` | All-gather preserving dtype metadata |
 
 These operations use the `ReduceElement` trait internally, so f16/bf16 values are reduced natively without upcasting to f32 (preserving bandwidth savings on the wire).
+
+---
+
+## PipelinedRingBuffer -- Pipelined Ring Allreduce (Phase 5)
+
+Phase 5 adds `PipelinedRingBuffer` and `pipelined_ring_allreduce()` to `collectives.rs` for overlapping communication and reduction.
+
+**PipelinedRingBuffer** is an N-slot ring buffer that enables pipelined allreduce by overlapping send, receive, and reduce operations across multiple slots. While one slot is being sent to the next rank, another slot is receiving data from the previous rank, and a third slot is performing local reduction -- all concurrently.
+
+| Function | Description |
+|----------|-------------|
+| `PipelinedRingBuffer::new(num_slots, slot_size)` | Create a pipelined ring buffer with N slots |
+| `pipelined_ring_allreduce(data, ring_buffer, group)` | Execute pipelined ring allreduce using the multi-slot buffer |
+
+**Key characteristics:**
+- **N-slot pipelining**: configurable number of slots for send/recv/reduce overlap
+- **Reduced latency**: overlapping communication phases hides RDMA transfer latency
+- **Compatible with typed collectives**: works with f16/bf16/f32 via the `ReduceElement` trait
 
 ---
 

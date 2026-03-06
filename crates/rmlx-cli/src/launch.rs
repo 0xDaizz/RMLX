@@ -6,6 +6,7 @@ use clap::Args;
 
 use crate::hostfile;
 use crate::ssh;
+use crate::topology;
 
 #[derive(Args)]
 pub struct LaunchArgs {
@@ -21,8 +22,8 @@ pub struct LaunchArgs {
     #[arg(short = 'n', long = "repeat-hosts", default_value_t = 1)]
     repeat_hosts: usize,
 
-    /// Backend hint exported as RMLX_BACKEND
-    #[arg(long, default_value = "rdma")]
+    /// Backend hint exported as RMLX_BACKEND (auto, rdma, tb5, tb4, tcp)
+    #[arg(long, default_value = "auto")]
     backend: String,
 
     /// SSH user override
@@ -184,6 +185,26 @@ pub fn run(args: LaunchArgs) -> i32 {
         }
     };
 
+    // Validate backend
+    if let Err(e) = topology::validate_backend(&args.backend) {
+        eprintln!("error: {e}");
+        return 2;
+    }
+
+    // Resolve "auto" backend
+    let backend = if args.backend == "auto" {
+        let has_rdma = host_entries
+            .as_ref()
+            .map(|entries| entries.iter().any(|e| e.rdma.is_some()))
+            .unwrap_or(false);
+        let local_tb = topology::probe_thunderbolt();
+        let resolved = topology::resolve_auto_backend(has_rdma, &local_tb);
+        eprintln!("info: --backend auto resolved to {resolved:?}");
+        resolved.to_string()
+    } else {
+        args.backend.clone()
+    };
+
     let slots = build_slots(&hosts, args.repeat_hosts);
 
     // Use probed IP from hostfile when available, otherwise fall back to SSH hostname
@@ -250,7 +271,7 @@ pub fn run(args: LaunchArgs) -> i32 {
         let slot_cmd = build_remote_command(
             &base_cmd,
             slot,
-            &args.backend,
+            &backend,
             &coordinator,
             &extra_env,
             ibv_devices_path.as_deref(),
@@ -637,5 +658,49 @@ mod tests {
         }];
         let has_rdma = entries.iter().any(|e| e.rdma.is_some());
         assert!(!has_rdma);
+    }
+
+    #[test]
+    fn test_backend_auto_with_rdma_entries() {
+        // When hostfile has RDMA devices, auto should resolve to "rdma"
+        let entries = [hostfile::HostEntry {
+            ssh: "node1".into(),
+            ips: vec![],
+            rdma: Some(vec![None, Some("mlx5_0".into())]),
+        }];
+        let has_rdma = entries.iter().any(|e| e.rdma.is_some());
+        let resolved = topology::resolve_auto_backend(has_rdma, &[]);
+        assert_eq!(resolved, "rdma");
+    }
+
+    #[test]
+    fn test_backend_auto_no_rdma_no_tb() {
+        // No RDMA, no TB -> tcp
+        let resolved = topology::resolve_auto_backend(false, &[]);
+        assert_eq!(resolved, "tcp");
+    }
+
+    #[test]
+    fn test_backend_auto_with_tb5() {
+        let resolved =
+            topology::resolve_auto_backend(false, &[topology::Interconnect::Thunderbolt5]);
+        assert_eq!(resolved, "tb5");
+    }
+
+    #[test]
+    fn test_backend_auto_with_tb4() {
+        let resolved =
+            topology::resolve_auto_backend(false, &[topology::Interconnect::Thunderbolt4]);
+        assert_eq!(resolved, "tb4");
+    }
+
+    #[test]
+    fn test_backend_validation_rejects_unknown() {
+        assert!(topology::validate_backend("auto").is_ok());
+        assert!(topology::validate_backend("rdma").is_ok());
+        assert!(topology::validate_backend("tb5").is_ok());
+        assert!(topology::validate_backend("tb4").is_ok());
+        assert!(topology::validate_backend("tcp").is_ok());
+        assert!(topology::validate_backend("garbage").is_err());
     }
 }
