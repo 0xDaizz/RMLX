@@ -208,6 +208,23 @@ impl Linear {
         self.bias.as_ref()
     }
 
+    /// Convert all weight buffers to `StorageModePrivate` (GPU-only).
+    ///
+    /// Call after loading weights and before the inference loop. Weights
+    /// become inaccessible to the CPU but may benefit from reduced memory
+    /// pressure and faster GPU access.
+    pub fn convert_weights_private(&mut self, device: &metal::Device, queue: &metal::CommandQueue) {
+        if let Some(w) = self.weight.take() {
+            self.weight = Some(w.to_private(device, queue));
+        }
+        if let Some(b) = self.bias.take() {
+            self.bias = Some(b.to_private(device, queue));
+        }
+        if let Some(wt) = self.weight_t_cached.take() {
+            self.weight_t_cached = Some(wt.to_private(device, queue));
+        }
+    }
+
     // -------------------------------------------------------------------
     // ExecGraph path — encode into existing command buffers
     // -------------------------------------------------------------------
@@ -325,15 +342,66 @@ impl Linear {
         };
 
         // Encode GEMM into the provided CB
-        let m = input_2d.shape()[0] as u32;
-        let n = self.config.out_features as u32;
-        let k = self.config.in_features as u32;
+        let m = input_2d.shape()[0];
+        let n = self.config.out_features;
+        let k = self.config.in_features;
 
-        let kernel_name = match input_2d.dtype() {
-            rmlx_core::dtype::DType::Float32 => "gemm_tiled_f32",
-            rmlx_core::dtype::DType::Float16 => "gemm_tiled_f16",
-            rmlx_core::dtype::DType::Bfloat16 => "gemm_tiled_bf16",
-            other => {
+        // GEMV fast path for M=1 (single-token decode)
+        // Use gemv on original weight [N, K] directly — no transposition needed.
+        // gemv computes y[i] = sum_j W[i,j] * x[j], output is [N].
+        // Row-major reads on W give better memory access (float4 vectorized loads).
+        if m == 1 {
+            let input_vec = Array::new(
+                input_2d.metal_buffer().to_owned(),
+                vec![k],
+                vec![1],
+                input_2d.dtype(),
+                input_2d.offset(),
+            );
+            let weight = self.weight.as_ref().ok_or_else(|| {
+                KernelError::InvalidShape("Linear: weights not loaded".to_string())
+            })?;
+            // Ensure weight is contiguous for gemv
+            let weight_ref = if weight.is_contiguous() {
+                weight.view(
+                    weight.shape().to_vec(),
+                    weight.strides().to_vec(),
+                    weight.offset(),
+                )
+            } else {
+                ops::copy::copy_into_cb(registry, weight, cb)?
+            };
+            let result = ops::gemv::gemv_into_cb(registry, &weight_ref, &input_vec, cb)?;
+            // Reshape [N] to [1, N]
+            return Ok(Array::new(
+                result.metal_buffer().to_owned(),
+                vec![1, n],
+                vec![n, 1],
+                result.dtype(),
+                result.offset(),
+            ));
+        }
+
+        let tile = ops::matmul::select_tile_config(m, n, k);
+        let kernel_name = match (tile.variant, input_2d.dtype()) {
+            (ops::matmul::TileVariant::Simd, rmlx_core::dtype::DType::Float32) => "gemm_simd_f32",
+            (ops::matmul::TileVariant::Simd, rmlx_core::dtype::DType::Float16) => "gemm_simd_f16",
+            (ops::matmul::TileVariant::Simd, rmlx_core::dtype::DType::Bfloat16) => "gemm_simd_bf16",
+            (ops::matmul::TileVariant::Small, rmlx_core::dtype::DType::Float32) => "gemm_small_f32",
+            (ops::matmul::TileVariant::Small, rmlx_core::dtype::DType::Float16) => "gemm_small_f16",
+            (ops::matmul::TileVariant::Small, rmlx_core::dtype::DType::Bfloat16) => {
+                "gemm_small_bf16"
+            }
+            (ops::matmul::TileVariant::Medium, rmlx_core::dtype::DType::Float32) => {
+                "gemm_tiled_f32"
+            }
+            (ops::matmul::TileVariant::Medium, rmlx_core::dtype::DType::Float16) => {
+                "gemm_tiled_f16"
+            }
+            (ops::matmul::TileVariant::Medium, rmlx_core::dtype::DType::Bfloat16) => {
+                "gemm_tiled_bf16"
+            }
+            (_, other) => {
                 return Err(KernelError::InvalidShape(format!(
                     "linear: unsupported dtype {:?}",
                     other
@@ -341,21 +409,25 @@ impl Linear {
             }
         };
 
+        let m_u32 = m as u32;
+        let n_u32 = n as u32;
+        let k_u32 = k as u32;
+
         let pipeline = registry.get_pipeline(kernel_name, input_2d.dtype())?;
         let dev = registry.device().raw();
-        let output = Array::zeros(dev, &[m as usize, n as usize], input_2d.dtype());
+        let output = Array::zeros(dev, &[m, n], input_2d.dtype());
 
-        let m_buf = make_u32_buf(dev, m);
-        let n_buf = make_u32_buf(dev, n);
-        let k_buf = make_u32_buf(dev, k);
-        let bsa = make_u32_buf(dev, m * k);
-        let bsb = make_u32_buf(dev, k * n);
-        let bsc = make_u32_buf(dev, m * n);
+        let m_buf = make_u32_buf(dev, m_u32);
+        let n_buf = make_u32_buf(dev, n_u32);
+        let k_buf = make_u32_buf(dev, k_u32);
+        let bsa = make_u32_buf(dev, m_u32 * k_u32);
+        let bsb = make_u32_buf(dev, k_u32 * n_u32);
+        let bsc = make_u32_buf(dev, m_u32 * n_u32);
 
-        const BM: u64 = 32;
-        const BN: u64 = 32;
-        let grid_x = (n as u64).div_ceil(BN);
-        let grid_y = (m as u64).div_ceil(BM);
+        let bm = tile.bm as u64;
+        let bn = tile.bn as u64;
+        let grid_x = (n_u32 as u64).div_ceil(bn);
+        let grid_y = (m_u32 as u64).div_ceil(bm);
 
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&pipeline);
@@ -370,7 +442,7 @@ impl Linear {
         enc.set_buffer(8, Some(&bsc), 0);
 
         let grid = metal::MTLSize::new(grid_x, grid_y, 1);
-        let tg = metal::MTLSize::new(BM * BN, 1, 1);
+        let tg = metal::MTLSize::new(bm * bn, 1, 1);
         enc.dispatch_thread_groups(grid, tg);
         enc.end_encoding();
 

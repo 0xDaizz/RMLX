@@ -10,6 +10,12 @@ use rmlx_metal::exec_graph::{EventToken, ExecGraph};
 
 use crate::linear::{Linear, LinearConfig};
 
+/// Cast a BufferRef to a ResourceRef for use with memory_barrier_with_resources.
+/// Safe because MTLBuffer inherits from MTLResource in ObjC.
+fn buf_as_resource(buf: &metal::BufferRef) -> &metal::ResourceRef {
+    unsafe { &*(buf as *const metal::BufferRef as *const metal::ResourceRef) }
+}
+
 // ---------------------------------------------------------------------------
 // KV Cache — pre-allocated, O(1) append
 // ---------------------------------------------------------------------------
@@ -31,6 +37,10 @@ pub struct LayerKvCache {
     num_kv_heads: usize,
     /// Head dimension.
     head_dim: usize,
+    /// Contiguous K slab [num_kv_heads * max_seq_len * head_dim] for batched SDPA
+    keys_slab: Option<Array>,
+    /// Contiguous V slab [num_kv_heads * max_seq_len * head_dim] for batched SDPA
+    values_slab: Option<Array>,
 }
 
 impl LayerKvCache {
@@ -44,6 +54,8 @@ impl LayerKvCache {
             max_seq_len: 0,
             num_kv_heads,
             head_dim: 0,
+            keys_slab: None,
+            values_slab: None,
         }
     }
 
@@ -58,12 +70,34 @@ impl LayerKvCache {
         max_seq_len: usize,
         dtype: DType,
     ) -> Self {
+        let elem_size = dtype.size_of();
+        let head_size = max_seq_len * head_dim; // elements per head
+
+        // Allocate contiguous slabs
+        let k_slab = Array::zeros(device, &[num_kv_heads * max_seq_len * head_dim], dtype);
+        let v_slab = Array::zeros(device, &[num_kv_heads * max_seq_len * head_dim], dtype);
+
+        // Create per-head views into slabs (backward compatible)
         let mut keys = Vec::with_capacity(num_kv_heads);
         let mut values = Vec::with_capacity(num_kv_heads);
-        for _ in 0..num_kv_heads {
-            keys.push(Array::zeros(device, &[max_seq_len, head_dim], dtype));
-            values.push(Array::zeros(device, &[max_seq_len, head_dim], dtype));
+        for h in 0..num_kv_heads {
+            let offset = h * head_size * elem_size;
+            keys.push(Array::new(
+                k_slab.metal_buffer().to_owned(),
+                vec![max_seq_len, head_dim],
+                vec![head_dim, 1],
+                dtype,
+                offset,
+            ));
+            values.push(Array::new(
+                v_slab.metal_buffer().to_owned(),
+                vec![max_seq_len, head_dim],
+                vec![head_dim, 1],
+                dtype,
+                offset,
+            ));
         }
+
         Self {
             keys,
             values,
@@ -71,6 +105,8 @@ impl LayerKvCache {
             max_seq_len,
             num_kv_heads,
             head_dim,
+            keys_slab: Some(k_slab),
+            values_slab: Some(v_slab),
         }
     }
 
@@ -462,6 +498,43 @@ impl LayerKvCache {
             a.strides().to_vec(),
             a.offset(),
         )
+    }
+
+    /// Get K slab as flat view for batched SDPA.
+    /// Returns None if not using slab layout or cache is empty.
+    pub fn keys_slab_view(&self) -> Option<Array> {
+        let slab = self.keys_slab.as_ref()?;
+        if self.seq_len == 0 {
+            return None;
+        }
+        Some(Array::new(
+            slab.metal_buffer().to_owned(),
+            vec![self.num_kv_heads * self.max_seq_len * self.head_dim],
+            vec![1],
+            slab.dtype(),
+            slab.offset(),
+        ))
+    }
+
+    /// Get V slab as flat view for batched SDPA.
+    /// Returns None if not using slab layout or cache is empty.
+    pub fn values_slab_view(&self) -> Option<Array> {
+        let slab = self.values_slab.as_ref()?;
+        if self.seq_len == 0 {
+            return None;
+        }
+        Some(Array::new(
+            slab.metal_buffer().to_owned(),
+            vec![self.num_kv_heads * self.max_seq_len * self.head_dim],
+            vec![1],
+            slab.dtype(),
+            slab.offset(),
+        ))
+    }
+
+    /// Max sequence length (stride between KV heads in the slab).
+    pub fn max_seq_len(&self) -> usize {
+        self.max_seq_len
     }
 }
 
@@ -1307,6 +1380,8 @@ pub struct Attention {
     k_proj: Linear,
     v_proj: Linear,
     o_proj: Linear,
+    /// Merged QKV weight [q_out + k_out + v_out, in_features] for 9-dispatch path.
+    qkv_merged_weight: Option<Array>,
 }
 
 impl Attention {
@@ -1337,6 +1412,7 @@ impl Attention {
                 has_bias: false,
             }),
             config,
+            qkv_merged_weight: None,
         })
     }
 
@@ -1355,6 +1431,7 @@ impl Attention {
             k_proj,
             v_proj,
             o_proj,
+            qkv_merged_weight: None,
         })
     }
 
@@ -2006,6 +2083,519 @@ impl Attention {
         let t3 = graph.submit_batch();
 
         Ok((output, t3))
+    }
+
+    /// Single-CB decode path for seq_len=1.
+    ///
+    /// Encodes ALL attention ops into one command buffer with minimal dispatches:
+    /// - Zero-copy head views instead of per-head copy_into_cb (saves 48 dispatches)
+    /// - Batched RoPE: reshape Q/K to 3D and call rope once each (saves 38 dispatches)
+    /// - Blit concat: 1 blit encoder instead of 32 compute encoders
+    ///
+    /// Does NOT commit or wait — the caller manages the CB lifecycle.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_decode_single_cb(
+        &self,
+        x: &Array,
+        norm_weight: &Array,
+        rms_norm_eps: f32,
+        cos_freqs: Option<&Array>,
+        sin_freqs: Option<&Array>,
+        mask: Option<&Array>,
+        mut cache: Option<&mut LayerKvCache>,
+        registry: &KernelRegistry,
+        cb: &metal::CommandBufferRef,
+    ) -> Result<Array, KernelError> {
+        let num_heads = self.config.num_heads;
+        let num_kv_heads = self.config.num_kv_heads;
+        let head_dim = self.config.head_dim;
+        let hidden_size = num_heads * head_dim;
+
+        // RMS norm
+        let normed =
+            ops::rms_norm::rms_norm_into_cb(registry, x, Some(norm_weight), rms_norm_eps, cb)?;
+
+        // Q/K/V projections (all into same CB)
+        let q = self.q_proj.forward_into_cb(&normed, registry, cb)?;
+        let k = self.k_proj.forward_into_cb(&normed, registry, cb)?;
+        let v = self.v_proj.forward_into_cb(&normed, registry, cb)?;
+
+        let elem_size = q.dtype().size_of();
+        let rope_offset = cache.as_ref().map_or(0u32, |c| c.seq_len as u32);
+
+        // --- Head split + optional RoPE ---
+        // For seq_len=1, each head's data is contiguous in memory:
+        // Q is [1, num_heads * head_dim], head h starts at offset + h * head_dim * elem_size
+        let mut q_heads: Vec<Array>;
+        let mut k_heads: Vec<Array>;
+
+        if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
+            // Batched RoPE: reshape to [num_heads, 1, head_dim], apply rope once
+            let q_3d = Array::new(
+                q.metal_buffer().to_owned(),
+                vec![num_heads, 1, head_dim],
+                vec![head_dim, head_dim, 1],
+                q.dtype(),
+                q.offset(),
+            );
+            let q_roped = ops::rope::rope_ext_into_cb(
+                registry,
+                &q_3d,
+                cos,
+                sin,
+                rope_offset,
+                1.0,
+                false,
+                true,
+                cb,
+            )?;
+            // Split back into per-head views
+            q_heads = Vec::with_capacity(num_heads);
+            for h in 0..num_heads {
+                q_heads.push(Array::new(
+                    q_roped.metal_buffer().to_owned(),
+                    vec![1, head_dim],
+                    vec![head_dim, 1],
+                    q_roped.dtype(),
+                    q_roped.offset() + h * head_dim * elem_size,
+                ));
+            }
+
+            let k_3d = Array::new(
+                k.metal_buffer().to_owned(),
+                vec![num_kv_heads, 1, head_dim],
+                vec![head_dim, head_dim, 1],
+                k.dtype(),
+                k.offset(),
+            );
+            let k_roped = ops::rope::rope_ext_into_cb(
+                registry,
+                &k_3d,
+                cos,
+                sin,
+                rope_offset,
+                1.0,
+                false,
+                true,
+                cb,
+            )?;
+            k_heads = Vec::with_capacity(num_kv_heads);
+            for h in 0..num_kv_heads {
+                k_heads.push(Array::new(
+                    k_roped.metal_buffer().to_owned(),
+                    vec![1, head_dim],
+                    vec![head_dim, 1],
+                    k_roped.dtype(),
+                    k_roped.offset() + h * head_dim * elem_size,
+                ));
+            }
+        } else {
+            // No RoPE — just create zero-copy views
+            q_heads = Vec::with_capacity(num_heads);
+            for h in 0..num_heads {
+                q_heads.push(Array::new(
+                    q.metal_buffer().to_owned(),
+                    vec![1, head_dim],
+                    vec![head_dim, 1],
+                    q.dtype(),
+                    q.offset() + h * head_dim * elem_size,
+                ));
+            }
+            k_heads = Vec::with_capacity(num_kv_heads);
+            for h in 0..num_kv_heads {
+                k_heads.push(Array::new(
+                    k.metal_buffer().to_owned(),
+                    vec![1, head_dim],
+                    vec![head_dim, 1],
+                    k.dtype(),
+                    k.offset() + h * head_dim * elem_size,
+                ));
+            }
+        }
+
+        // V heads — zero-copy views (no RoPE on V)
+        let mut v_heads: Vec<Array> = Vec::with_capacity(num_kv_heads);
+        for h in 0..num_kv_heads {
+            v_heads.push(Array::new(
+                v.metal_buffer().to_owned(),
+                vec![1, head_dim],
+                vec![head_dim, 1],
+                v.dtype(),
+                v.offset() + h * head_dim * elem_size,
+            ));
+        }
+
+        // KV cache append
+        let (k_final, v_final) = match cache {
+            Some(ref mut c) => {
+                c.append_into_cb(k_heads, v_heads, 1, registry, cb)?;
+                let kf: Vec<Array> = (0..num_kv_heads).map(|h| c.cached_keys(h)).collect();
+                let vf: Vec<Array> = (0..num_kv_heads).map(|h| c.cached_values(h)).collect();
+                (kf, vf)
+            }
+            None => (k_heads, v_heads),
+        };
+
+        // SDPA (per-head, batched into same CB)
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let attn_outputs = ops::sdpa::sdpa_batched_into_cb(
+            registry, &q_heads, &k_final, &v_final, mask, scale, cb,
+        )?;
+
+        // Blit concat: 1 blit encoder instead of 32 compute encoders
+        let dev = registry.device().raw();
+        let concat = Array::zeros(dev, &[1, hidden_size], q.dtype());
+        let head_bytes = head_dim * elem_size;
+        let blit = cb.new_blit_command_encoder();
+        for (h, head_out) in attn_outputs.iter().enumerate() {
+            let src_offset = head_out.offset() as u64;
+            let dst_offset = (h * head_bytes) as u64;
+            blit.copy_from_buffer(
+                head_out.metal_buffer(),
+                src_offset,
+                concat.metal_buffer(),
+                dst_offset,
+                head_bytes as u64,
+            );
+        }
+        blit.end_encoding();
+
+        // O projection
+        self.o_proj.forward_into_cb(&concat, registry, cb)
+    }
+
+    // -----------------------------------------------------------------------
+    // 9-dispatch path: merged QKV weight + batched SDPA + fused residual
+    // -----------------------------------------------------------------------
+
+    /// Merge Q/K/V projection weights into a single [q_out+k_out+v_out, in_features] matrix.
+    ///
+    /// Must be called once after weights are loaded and before `forward_decode_9dispatch`.
+    pub fn prepare_merged_qkv(&mut self, device: &metal::Device) -> Result<(), KernelError> {
+        let q_w = self.q_proj.weight().ok_or_else(|| {
+            KernelError::InvalidShape(
+                "Attention::prepare_merged_qkv: q_proj weight not loaded".into(),
+            )
+        })?;
+        let k_w = self.k_proj.weight().ok_or_else(|| {
+            KernelError::InvalidShape(
+                "Attention::prepare_merged_qkv: k_proj weight not loaded".into(),
+            )
+        })?;
+        let v_w = self.v_proj.weight().ok_or_else(|| {
+            KernelError::InvalidShape(
+                "Attention::prepare_merged_qkv: v_proj weight not loaded".into(),
+            )
+        })?;
+
+        // Validate contiguity
+        if !q_w.is_contiguous() || !k_w.is_contiguous() || !v_w.is_contiguous() {
+            return Err(KernelError::InvalidShape(
+                "prepare_merged_qkv: all weights must be contiguous".into(),
+            ));
+        }
+        // Validate matching dtype
+        if q_w.dtype() != k_w.dtype() || q_w.dtype() != v_w.dtype() {
+            return Err(KernelError::InvalidShape(format!(
+                "prepare_merged_qkv: dtype mismatch: Q={:?}, K={:?}, V={:?}",
+                q_w.dtype(),
+                k_w.dtype(),
+                v_w.dtype()
+            )));
+        }
+        // Validate matching in_features (cols)
+        if k_w.shape()[1] != q_w.shape()[1] || v_w.shape()[1] != q_w.shape()[1] {
+            return Err(KernelError::InvalidShape(format!(
+                "prepare_merged_qkv: in_features mismatch: Q={}, K={}, V={}",
+                q_w.shape()[1],
+                k_w.shape()[1],
+                v_w.shape()[1]
+            )));
+        }
+
+        let q_rows = q_w.shape()[0]; // num_heads * head_dim
+        let k_rows = k_w.shape()[0]; // num_kv_heads * head_dim
+        let v_rows = v_w.shape()[0]; // num_kv_heads * head_dim
+        let cols = q_w.shape()[1]; // hidden_size
+        let total_rows = q_rows + k_rows + v_rows;
+        let elem_size = q_w.dtype().size_of();
+        let total_bytes = total_rows * cols * elem_size;
+
+        let buf = device.new_buffer(
+            total_bytes as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+
+        unsafe {
+            let dst = buf.contents() as *mut u8;
+            // Copy Q weight
+            let q_src = (q_w.metal_buffer().contents() as *const u8).add(q_w.offset());
+            std::ptr::copy_nonoverlapping(q_src, dst, q_rows * cols * elem_size);
+            // Copy K weight
+            let k_src = (k_w.metal_buffer().contents() as *const u8).add(k_w.offset());
+            std::ptr::copy_nonoverlapping(
+                k_src,
+                dst.add(q_rows * cols * elem_size),
+                k_rows * cols * elem_size,
+            );
+            // Copy V weight
+            let v_src = (v_w.metal_buffer().contents() as *const u8).add(v_w.offset());
+            std::ptr::copy_nonoverlapping(
+                v_src,
+                dst.add((q_rows + k_rows) * cols * elem_size),
+                v_rows * cols * elem_size,
+            );
+        }
+
+        self.qkv_merged_weight = Some(Array::new(
+            buf,
+            vec![total_rows, cols],
+            vec![cols, 1],
+            q_w.dtype(),
+            0,
+        ));
+        Ok(())
+    }
+
+    /// Convert all static weights to `StorageModePrivate` (GPU-only).
+    ///
+    /// Call after loading weights and before the inference loop.
+    pub fn prepare_weights_private(&mut self, device: &metal::Device, queue: &metal::CommandQueue) {
+        self.q_proj.convert_weights_private(device, queue);
+        self.k_proj.convert_weights_private(device, queue);
+        self.v_proj.convert_weights_private(device, queue);
+        self.o_proj.convert_weights_private(device, queue);
+        if let Some(w) = self.qkv_merged_weight.take() {
+            self.qkv_merged_weight = Some(w.to_private(device, queue));
+        }
+    }
+
+    /// 9-dispatch forward decode path for a single transformer attention block.
+    ///
+    /// Dispatches:
+    ///   1. rms_norm
+    ///   2. merged QKV gemv
+    ///   3. batched Q+K rope (1 dispatch for all heads)
+    ///   4. batched SDPA decode (all heads, 1 dispatch)
+    ///   5. gemv_bias(W_o, attn, x) — O_proj + residual fused
+    ///
+    /// Requires `prepare_merged_qkv()` to have been called first.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_decode_9dispatch(
+        &self,
+        x: &Array,
+        norm_weight: &Array,
+        rms_norm_eps: f32,
+        cos_freqs: Option<&Array>,
+        sin_freqs: Option<&Array>,
+        _mask: Option<&Array>,
+        cache: &mut LayerKvCache,
+        registry: &KernelRegistry,
+        cb: &metal::CommandBufferRef,
+    ) -> Result<Array, KernelError> {
+        let num_heads = self.config.num_heads;
+        let num_kv_heads = self.config.num_kv_heads;
+        let head_dim = self.config.head_dim;
+        let hidden_size = num_heads * head_dim;
+        // Guard: decode path requires seq_len=1
+        let seq_dim = if x.ndim() == 1 { 1 } else { x.shape()[0] };
+        if seq_dim != 1 {
+            return Err(KernelError::InvalidShape(format!(
+                "forward_decode_9dispatch: requires seq_len=1, got {}",
+                seq_dim
+            )));
+        }
+
+        // --- Single encoder for dispatches 1-3 (rms_norm, QKV gemv, rope) ---
+        let encoder_a = cb.new_compute_command_encoder();
+
+        // Dispatch 1: rms_norm
+        let x_2d = if x.ndim() == 1 {
+            Array::new(
+                x.metal_buffer().to_owned(),
+                vec![1, x.shape()[0]],
+                vec![x.shape()[0], 1],
+                x.dtype(),
+                x.offset(),
+            )
+        } else {
+            Array::new(
+                x.metal_buffer().to_owned(),
+                x.shape().to_vec(),
+                x.strides().to_vec(),
+                x.dtype(),
+                x.offset(),
+            )
+        };
+        let normed = ops::rms_norm::rms_norm_into_encoder(
+            registry,
+            &x_2d,
+            Some(norm_weight),
+            rms_norm_eps,
+            encoder_a,
+        )?;
+        // Memory barrier: ensure normed is visible to dispatch 2
+        encoder_a.memory_barrier_with_resources(&[buf_as_resource(normed.metal_buffer())]);
+
+        // Dispatch 2: merged QKV gemv
+        let qkv_weight = self.qkv_merged_weight.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape(
+                "Attention::forward_decode_9dispatch: call prepare_merged_qkv() first".into(),
+            )
+        })?;
+        let normed_vec = Array::new(
+            normed.metal_buffer().to_owned(),
+            vec![hidden_size],
+            vec![1],
+            normed.dtype(),
+            normed.offset(),
+        );
+        let qkv = ops::gemv::gemv_into_encoder(registry, qkv_weight, &normed_vec, encoder_a)?;
+        let elem_size = qkv.dtype().size_of();
+        // qkv is [q_dim + k_dim + v_dim] flat
+
+        let q_dim = num_heads * head_dim; // 4096
+        let k_dim = num_kv_heads * head_dim; // 1024
+
+        let rope_offset = cache.seq_len as u32;
+
+        // Dispatch 3: batched Q+K rope (1 dispatch for all heads)
+        // Q[q_dim] and K[k_dim] are contiguous in qkv buffer
+        let total_rope_heads = num_heads + num_kv_heads;
+
+        // Source for roped Q+K and un-roped V
+        let (qk_roped_buf, qk_roped_offset, v_buf, v_offset);
+        if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
+            // Memory barrier: ensure qkv is visible to dispatch 3
+            encoder_a.memory_barrier_with_resources(&[buf_as_resource(qkv.metal_buffer())]);
+            let qk_3d = Array::new(
+                qkv.metal_buffer().to_owned(),
+                vec![total_rope_heads, 1, head_dim],
+                vec![head_dim, head_dim, 1],
+                qkv.dtype(),
+                qkv.offset(),
+            );
+            let qk_roped = ops::rope::rope_ext_into_encoder(
+                registry,
+                &qk_3d,
+                cos,
+                sin,
+                rope_offset,
+                1.0,
+                false,
+                true,
+                encoder_a,
+            )?;
+            qk_roped_buf = qk_roped.metal_buffer().to_owned();
+            qk_roped_offset = qk_roped.offset();
+            // V is from the original qkv buffer (no rope)
+            v_buf = qkv.metal_buffer().to_owned();
+            v_offset = qkv.offset() + (q_dim + k_dim) * elem_size;
+        } else {
+            // No RoPE — use qkv directly
+            qk_roped_buf = qkv.metal_buffer().to_owned();
+            qk_roped_offset = qkv.offset();
+            v_buf = qkv.metal_buffer().to_owned();
+            v_offset = qkv.offset() + (q_dim + k_dim) * elem_size;
+        }
+
+        // End encoder A before cache append (which creates its own encoders)
+        encoder_a.end_encoding();
+
+        let k_roped_flat_offset = qk_roped_offset + q_dim * elem_size;
+
+        // KV cache append — create per-head K and V views
+        let mut k_heads = Vec::with_capacity(num_kv_heads);
+        let mut v_heads = Vec::with_capacity(num_kv_heads);
+        for h in 0..num_kv_heads {
+            k_heads.push(Array::new(
+                qk_roped_buf.clone(),
+                vec![1, head_dim],
+                vec![head_dim, 1],
+                qkv.dtype(),
+                k_roped_flat_offset + h * head_dim * elem_size,
+            ));
+            v_heads.push(Array::new(
+                v_buf.clone(),
+                vec![1, head_dim],
+                vec![head_dim, 1],
+                qkv.dtype(),
+                v_offset + h * head_dim * elem_size,
+            ));
+        }
+        cache.append_into_cb(k_heads, v_heads, 1, registry, cb)?;
+
+        // --- Single encoder for dispatches 4-5 (SDPA, O_proj+residual) ---
+        let encoder_b = cb.new_compute_command_encoder();
+
+        // Dispatch 4: batched SDPA decode (all heads, 1 dispatch)
+        let k_slab = cache.keys_slab_view().ok_or_else(|| {
+            KernelError::InvalidShape("9dispatch: no keys slab after append".into())
+        })?;
+        let v_slab = cache.values_slab_view().ok_or_else(|| {
+            KernelError::InvalidShape("9dispatch: no values slab after append".into())
+        })?;
+        let seq_len = cache.seq_len; // actual cached length after append
+        let max_seq = cache.max_seq_len();
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        // Q flat view for batched SDPA
+        let q_flat = Array::new(
+            qk_roped_buf.clone(),
+            vec![q_dim],
+            vec![1],
+            qkv.dtype(),
+            qk_roped_offset,
+        );
+        let attn_out = ops::sdpa::sdpa_decode_batched_slab_stride_into_encoder(
+            registry,
+            &q_flat,
+            &k_slab,
+            &v_slab,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            seq_len,
+            Some(max_seq),
+            None, // no additive mask for decode
+            scale,
+            encoder_b,
+        )?;
+        // attn_out is [num_heads * head_dim] = [hidden_size] flat
+        // Memory barrier: ensure attn_out is visible to dispatch 5
+        encoder_b.memory_barrier_with_resources(&[buf_as_resource(attn_out.metal_buffer())]);
+
+        // Dispatch 5: gemv_bias(W_o, attn, x) — O_proj + residual add fused
+        let o_weight = self.o_proj.weight().ok_or_else(|| {
+            KernelError::InvalidShape("Attention: o_proj weight not loaded".into())
+        })?;
+        let attn_vec = Array::new(
+            attn_out.metal_buffer().to_owned(),
+            vec![hidden_size],
+            vec![1],
+            attn_out.dtype(),
+            attn_out.offset(),
+        );
+        let x_vec = Array::new(
+            x.metal_buffer().to_owned(),
+            vec![hidden_size],
+            vec![1],
+            x.dtype(),
+            x.offset(),
+        );
+        let h =
+            ops::gemv::gemv_bias_into_encoder(registry, o_weight, &attn_vec, &x_vec, encoder_b)?;
+
+        encoder_b.end_encoding();
+
+        // Return as [1, hidden_size]
+        Ok(Array::new(
+            h.metal_buffer().to_owned(),
+            vec![1, hidden_size],
+            vec![hidden_size, 1],
+            h.dtype(),
+            h.offset(),
+        ))
     }
 }
 

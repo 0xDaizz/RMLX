@@ -85,6 +85,28 @@ impl Array {
         }
     }
 
+    /// Allocate an uninitialized array. Use ONLY for outputs that will be
+    /// fully overwritten by a GPU kernel before any read.
+    pub fn uninit(device: &metal::Device, shape: &[usize], dtype: DType) -> Self {
+        let numel: usize = shape.iter().product();
+        let byte_size = dtype
+            .numel_to_bytes(numel)
+            .expect("numel must be block-aligned for quantized dtypes")
+            as u64;
+        // Metal returns null for zero-length buffers; allocate at least 1 byte.
+        let alloc_size = byte_size.max(1);
+        let buffer = device.new_buffer(alloc_size, MTLResourceOptions::StorageModeShared);
+
+        let strides = compute_contiguous_strides(shape);
+        Self {
+            buffer,
+            shape: shape.to_vec(),
+            strides,
+            dtype,
+            offset: 0,
+        }
+    }
+
     /// Create a zero-filled array.
     ///
     /// Explicitly zeroes the buffer after allocation to guarantee correctness
@@ -304,6 +326,41 @@ impl Array {
         self.dtype
             .numel_to_bytes(self.numel())
             .expect("array numel must be block-aligned")
+    }
+
+    /// Copy this array's data into a new `StorageModePrivate` buffer.
+    ///
+    /// The returned array is GPU-only (cannot be read by CPU).
+    /// Use for static weights that are loaded once and only read by GPU kernels.
+    /// This eliminates CPU page-table mapping overhead for GPU-only buffers.
+    pub fn to_private(&self, device: &metal::Device, queue: &metal::CommandQueue) -> Self {
+        let byte_size = self.byte_size();
+        let private_buf = device.new_buffer(
+            byte_size.max(4) as u64,
+            MTLResourceOptions::StorageModePrivate,
+        );
+
+        // Blit copy from shared to private
+        let cb = queue.new_command_buffer();
+        let blit = cb.new_blit_command_encoder();
+        blit.copy_from_buffer(
+            self.metal_buffer(),
+            self.offset() as u64,
+            &private_buf,
+            0,
+            byte_size as u64,
+        );
+        blit.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        Self::new(
+            private_buf,
+            self.shape().to_vec(),
+            self.strides().to_vec(),
+            self.dtype(),
+            0, // new buffer starts at offset 0
+        )
     }
 
     /// Returns the raw bytes of this array's buffer (from offset, for numel * dtype bytes).
