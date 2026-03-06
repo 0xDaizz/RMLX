@@ -17,3 +17,4 @@ metal = { workspace = true }
 libc = { workspace = true }
 libloading = { workspace = true }
 crc32fast = { workspace = true }
+half = { workspace = true }

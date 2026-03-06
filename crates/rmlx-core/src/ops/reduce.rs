@@ -1281,8 +1281,7 @@ fn apply_mean_divisor(
     let grid = numel.div_ceil(tg_size);
     encoder.dispatch_thread_groups(MTLSize::new(grid, 1, 1), MTLSize::new(tg_size, 1, 1));
     encoder.end_encoding();
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
+    super::commit_with_mode(command_buffer, super::ExecMode::Sync);
 
     Ok(())
 }
@@ -1434,8 +1433,7 @@ fn reduce_all_two_pass(
         MTLSize::new(tg_size, 1, 1),
     );
     enc1.end_encoding();
-    cb1.commit();
-    cb1.wait_until_completed();
+    super::commit_with_mode(cb1, super::ExecMode::Sync);
 
     // --- Pass 2: reduce partial results -> scalar ---
     let pass2_pipeline = registry.get_pipeline(pass2_kernel, DType::Float32)?;
@@ -1516,8 +1514,7 @@ pub fn reduce_row(
     let tg_size = std::cmp::min(1024, pipeline.max_total_threads_per_threadgroup());
     encoder.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), MTLSize::new(tg_size, 1, 1));
     encoder.end_encoding();
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
+    super::commit_with_mode(command_buffer, super::ExecMode::Sync);
 
     if is_mean {
         apply_mean_divisor(registry, &out, cols, queue)?;
@@ -1584,8 +1581,7 @@ pub fn reduce_col(
     let tg_size = std::cmp::min(1024, pipeline.max_total_threads_per_threadgroup());
     encoder.dispatch_thread_groups(MTLSize::new(cols as u64, 1, 1), MTLSize::new(tg_size, 1, 1));
     encoder.end_encoding();
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
+    super::commit_with_mode(command_buffer, super::ExecMode::Sync);
 
     if is_mean {
         apply_mean_divisor(registry, &out, rows, queue)?;

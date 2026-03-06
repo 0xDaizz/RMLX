@@ -537,8 +537,7 @@ pub fn rope_ext(
     );
     encoder.dispatch_threads(grid, tg);
     encoder.end_encoding();
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
+    super::commit_with_mode(command_buffer, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -629,8 +628,7 @@ pub fn rope_otf(
     );
     encoder.dispatch_threads(grid, tg);
     encoder.end_encoding();
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
+    super::commit_with_mode(command_buffer, super::ExecMode::Sync);
 
     Ok(out)
 }

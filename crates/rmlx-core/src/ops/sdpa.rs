@@ -1124,6 +1124,19 @@ pub fn sdpa(
         )));
     }
 
+    // Try FlashAttention-2 for eligible configurations:
+    // f32, head_dim=128, no additive mask, seq_len >= threshold.
+    if mask.is_none() && super::flash_attention::supports_flash_attention(d, q.dtype(), n) {
+        match super::flash_attention::flash_attention_forward(
+            registry, q, k, v, scale, is_causal, queue,
+        ) {
+            Ok(out) => return Ok(out),
+            Err(_) => {
+                // Fall through to naive SDPA on any flash attention error
+            }
+        }
+    }
+
     // Validate mask shape: accept [N, S] or broadcastable shapes like [1, S].
     // The kernel expects [N, S], so if mask is [1, S] we broadcast it via copy.
     let mask_expanded: Option<Array> = if let Some(m) = mask {
@@ -1281,8 +1294,7 @@ pub fn sdpa(
     }
 
     encoder.end_encoding();
-    cb.commit();
-    cb.wait_until_completed();
+    super::commit_with_mode(cb, super::ExecMode::Sync);
 
     Ok(out)
 }

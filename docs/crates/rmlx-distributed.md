@@ -4,7 +4,7 @@
 
 `rmlx-distributed` is a crate providing communication groups, MoE (Mixture of Experts) dispatch/combine exchange, 3-zone backend policy, compute-RDMA pipeline overlap, overflow monitoring (SparseGuard), variable-length EP packet protocol, FP8 exchange path, RDMA slab-ring transport, distributed initialization, warmup protocol, and MoE metrics for distributed inference.
 
-> **Status:** All modules are implemented: group, init, moe_exchange, moe_policy, pipeline, sparse_guard, warmup, metrics, v3_protocol, fp8_exchange, slab_ring. Phase 0+1+2 audit remediation complete (items D1-D10): dispatch loop ordering fixed (k-outer), per-rank capacity partitioning, combine kernel caching, byte threshold (4KB->2MB), hysteresis path fix, dual cooldown semantics, shared expert support, EP integration improvements. EP-3/EP-5/EP-6 optimization additions complete. EP-2~EP-6 forward path integration: `MoeDispatchConfig::new()` constructor, `dispatch_fp8()` convenience method, `WireProtocol::V3` support in all dispatch paths, SlabRing integration in `route_rdma`, FP8 wire helpers (`pack_for_wire`, `unpack_from_wire`, `wire_token_stride`).
+> **Status:** All modules are implemented: group, init, moe_exchange, moe_policy, pipeline, sparse_guard, warmup, metrics, v3_protocol, fp8_exchange, slab_ring, moe_kernels. Phase 0+1+2 audit remediation complete (items D1-D10): dispatch loop ordering fixed (k-outer), per-rank capacity partitioning, combine kernel caching, byte threshold (4KB->2MB), hysteresis path fix, dual cooldown semantics, shared expert support, EP integration improvements. EP-3/EP-5/EP-6 optimization additions complete. EP-2~EP-6 forward path integration: `MoeDispatchConfig::new()` constructor, `dispatch_fp8()` convenience method, `WireProtocol::V3` support in all dispatch paths, SlabRing integration in `route_rdma`, FP8 wire helpers (`pack_for_wire`, `unpack_from_wire`, `wire_token_stride`). **Production Readiness Phase 2 (distributed correctness):** new `moe_kernels.rs` (JIT-compiled MoE Metal kernels), `ExchangeBuffers` struct + `acquire_exchange_buffers()` in moe_exchange, `AcquiredBuffer` lifecycle + `acquire_send_recv_buffers()` in ep_runtime, CAS-based TOCTOU race fix in slab_ring, deadlock fix (interleaved send/recv) in v3_protocol, unknown backend now errors in init. **Phase 3 additions:** ring allreduce element-aligned chunk rounding fix (f16/bf16 reduction via `half` crate, NaN preservation); MoePolicy thread safety via interior mutability (RwLock), all methods now take `&self`, implements Send+Sync.
 
 ---
 
@@ -23,7 +23,8 @@ rmlx-distributed/src/
 ├── sparse_guard.rs  # Expert overflow monitoring
 ├── init.rs          # Distributed initialization (MLX-style)
 ├── warmup.rs        # RDMA + JIT warmup protocol
-└── metrics.rs       # Atomic MoE metrics
+├── metrics.rs       # Atomic MoE metrics
+└── moe_kernels.rs   # JIT-compiled MoE Metal kernels (scatter-add, permute)
 ```
 
 ---
@@ -35,6 +36,18 @@ rmlx-distributed/src/
 | `v3_protocol.rs` | Variable-length two-phase exchange (count sendrecv + payload sendrecv), packed 4-byte `PacketMeta` header, 16-byte packet alignment |
 | `fp8_exchange.rs` | Per-token FP8 E4M3 wire format, fused `dequant_scatter_fp8e4m3` decode path with `_into_cb` support, wire helpers (`pack_for_wire`, `unpack_from_wire`, `wire_token_stride`) |
 | `slab_ring.rs` | Pre-registered `MTLBuffer` slab ring for zero-copy RDMA producer/consumer flow synchronized via `GpuEvent` timeline; integrated into `route_rdma` for pre-allocated `local_output` buffers |
+
+## Phase 3 Additions
+
+### Ring Allreduce Chunk Rounding Fix (P3-6)
+
+The ring allreduce implementation now uses element-aligned chunk boundaries instead of byte-aligned boundaries. This fixes correctness issues when reducing f16/bf16 data where chunk boundaries could split individual elements. The `half` crate is used for native f16/bf16 arithmetic during reduction. NaN values are preserved through the reduction (NaN + x = NaN).
+
+### MoePolicy Thread Safety (P3-7)
+
+`MoePolicy` now uses `RwLock`-based interior mutability, allowing all public methods to take `&self` instead of `&mut self`. This makes `MoePolicy` `Send + Sync`, enabling safe concurrent access from multiple dispatch threads without external synchronization.
+
+---
 
 ### fp8_exchange Wire Helpers
 
@@ -195,15 +208,21 @@ pub enum MoeBackend {
 
 ### MoePolicy
 
+`MoePolicy` uses interior mutability via `RwLock` (Phase 3), making all methods take `&self` instead of `&mut self`. This enables safe concurrent access from multiple threads and implements `Send + Sync`.
+
 ```rust
 pub struct MoePolicy {
+    inner: RwLock<MoePolicyInner>,       // interior mutability for thread safety
+    cooldown_remaining: AtomicU32,
+    step_count: AtomicU32,
+}
+
+struct MoePolicyInner {
     cpu_max: u32,                         // default: 64
     gpu_min: u32,                         // default: 320
     byte_threshold: usize,               // default: 4096 (4KB)
     cooldown_steps: u32,                 // default: 32
     current_backend: MoeBackend,
-    cooldown_remaining: AtomicU32,
-    step_count: AtomicU32,
 }
 ```
 

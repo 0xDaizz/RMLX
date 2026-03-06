@@ -4,7 +4,7 @@
 
 `rmlx-rdma` is the inter-node communication layer based on Thunderbolt 5 RDMA (ibverbs). It performs high-speed data transfer between Apple Silicon Macs via the TB5 interface. It dynamically loads `librdma.dylib` via `dlopen` to interface with the macOS TB5 RDMA driver and uses UC (Unreliable Connected) mode QPs.
 
-> **Status:** Phase 1 implementation complete + Phase 0+1+2 audit remediation (items R1-R3). FFI bindings, context/PD/CQ management, UC QP lifecycle, MR registration, TCP-based QP exchange, connection management, initialization protocol, dual port striping, transfer metrics, **ring/allreduce/allgather collectives**, **connection manager**, and **coordinator** are all implemented.
+> **Status:** Phase 1 implementation complete + Phase 0+1+2 audit remediation (items R1-R3) + Production Readiness Phase 2 (distributed correctness) + Phase 3. FFI bindings, context/PD/CQ management, UC QP lifecycle, MR registration, TCP-based QP exchange, connection management, initialization protocol, dual port striping, transfer metrics, **ring/allreduce/allgather collectives**, **connection manager**, **coordinator**, and **application-level CRC32 integrity** (`crc.rs`) are all implemented. **Phase 3 additions:** `ReduceElement` trait and `CollectiveDType` enum for typed f16/bf16 allreduce/broadcast/allgather collectives, enabling mixed-precision distributed reduction without manual dtype handling.
 
 ---
 
@@ -20,6 +20,8 @@ graph TD
     A --> G[connection.rs — RdmaConnection]
     A --> H[multi_port.rs — StripeEngine / PortFailover]
     A --> I[rdma_metrics.rs — RdmaMetrics]
+    A --> J[crc.rs — CRC32 integrity for UC transport]
+    A --> K[collectives — typed f16/bf16 allreduce/broadcast/allgather]
 ```
 
 ### `ffi.rs` — ibverbs Dynamic FFI Bindings
@@ -408,6 +410,47 @@ pub struct PortFailover {
 
 ---
 
+## Typed f16/bf16 Collectives (Phase 3)
+
+Phase 3 adds typed collective operations supporting f16 and bf16 data types alongside f32, enabling mixed-precision distributed training and inference without manual dtype conversion.
+
+### ReduceElement Trait
+
+A trait that abstracts element-wise reduction across dtypes:
+
+```rust
+pub trait ReduceElement: Copy + Send + Sync {
+    fn zero() -> Self;
+    fn add(self, other: Self) -> Self;
+}
+```
+
+Implemented for `f32`, `f16` (half crate), and `bf16` (half crate).
+
+### CollectiveDType Enum
+
+Specifies the data type for collective operations:
+
+```rust
+pub enum CollectiveDType {
+    Float32,
+    Float16,
+    Bfloat16,
+}
+```
+
+### Typed Collective Operations
+
+| Function | Description |
+|----------|-------------|
+| `typed_allreduce(data, dtype, op)` | All-reduce with dtype-aware element reduction |
+| `typed_broadcast(data, dtype, root)` | Broadcast with dtype tag for receiver-side interpretation |
+| `typed_allgather(data, dtype)` | All-gather preserving dtype metadata |
+
+These operations use the `ReduceElement` trait internally, so f16/bf16 values are reduced natively without upcasting to f32 (preserving bandwidth savings on the wire).
+
+---
+
 ## Error Handling
 
 ```rust
@@ -425,6 +468,7 @@ pub enum RdmaError {
     CqPoll(String),                // CQ poll error
     ConnectionFailed(String),      // Connection setup failed
     Unavailable(String),           // No RDMA hardware available
+    DataCorruption(String),        // CRC32 integrity check failed (UC transport)
 }
 ```
 

@@ -4,7 +4,7 @@
 
 `rmlx-nn` is a crate that implements neural network layers for GPU-accelerated inference. It builds core Transformer architecture components (Linear, Embedding, Attention, TransformerBlock, MoE) on top of `rmlx-core` compute kernels, and includes built-in model configurations for LLaMA, Qwen, DeepSeek-V3, and Mixtral.
 
-> **Status (Phase 0-9B-opt + S1-S5 + Audit + EP-2~EP-6):** Linear, QuantizedLinear, Embedding, Attention (with LayerKvCache, RotatingKvCache, BatchKvCache, QuantizedKvCache), MLA (Multi-Latent Attention), Sliding Window Attention, TransformerBlock, MoE (with shared expert + EP integration + GPU routing + `MoeStrategy` dispatch), `ExpertGroup` (stacked expert GEMM path), `MoePipeline` (TBO/SBO overlap), LayerNorm, 14 activation functions, Parallel (TP), Conv1d/Conv2d, DynamicExecContext, GGUF model loader, and 4 model configurations are implemented. Phase 0+1+2 audit remediation complete (items N1-N8). EP Phases 2-6 forward path integration complete: `MoeStrategy` enum (PerExpert/Grouped), builder API (`with_strategy`, `with_pipeline`, `with_sparse_plan`), grouped GEMM path, pipeline integration, ICB sparse dispatch placeholder, FP8/SlabRing wiring.
+> **Status (Phase 0-9B-opt + S1-S5 + Audit + EP-2~EP-6 + Prod Phase 2 + Phase 3):** Linear, QuantizedLinear, Embedding, Attention (with LayerKvCache, RotatingKvCache, BatchKvCache, QuantizedKvCache, **PagedKvCache**), MLA (Multi-Latent Attention), Sliding Window Attention, TransformerBlock, MoE (with shared expert + EP integration + GPU routing + `MoeStrategy` dispatch), `ExpertGroup` (stacked expert GEMM path), `MoePipeline` (TBO/SBO overlap), LayerNorm, 14 activation functions, Parallel (TP), Conv1d/Conv2d, DynamicExecContext, GGUF model loader, **continuous batching scheduler**, and 4 model configurations are implemented. Phase 0+1+2 audit remediation complete (items N1-N8). EP Phases 2-6 forward path integration complete: `MoeStrategy` enum (PerExpert/Grouped), builder API (`with_strategy`, `with_pipeline`, `with_sparse_plan`), grouped GEMM path, pipeline integration, ICB sparse dispatch placeholder, FP8/SlabRing wiring. **Production Readiness Phase 2:** `MoeDispatchExchange` wired into MoE forward path (dispatch -> compute -> combine) in `moe.rs`; TP validation with `TpError` type and `world_size` checks in `parallel.rs`. **Phase 3 additions:** `PagedKvCache` with vLLM-style block manager, copy-on-write, and Metal buffer pool (`paged_kv_cache.rs`); continuous batching `Scheduler` with request queue, memory-aware batch scheduling, and prefill/decode phases (`scheduler.rs`).
 
 ---
 
@@ -28,6 +28,8 @@ rmlx-nn/src/
 ├── conv.rs              # Conv1d/Conv2d layer wrappers
 ├── dynamic.rs           # DynamicExecContext for variable shapes
 ├── gguf_loader.rs       # End-to-end GGUF model loading
+├── paged_kv_cache.rs    # Paged KV cache + block manager (vLLM-style)
+├── scheduler.rs         # Continuous batching scheduler (prefill/decode)
 ├── parallel.rs          # Tensor-parallel layers (feature = "distributed")
 └── models/
     ├── mod.rs            # Model module declarations
@@ -507,6 +509,33 @@ Metrics collected during MoE forward passes, including per-expert token routing 
 
 ---
 
+## paged_kv_cache.rs -- Paged KV Cache + Block Manager (Phase 3)
+
+A vLLM-style paged KV cache that manages KV storage in fixed-size blocks, enabling efficient memory sharing across sequences and reducing memory fragmentation during serving.
+
+**Key components:**
+- **Block Manager**: allocates and tracks fixed-size KV blocks from a Metal buffer pool, supporting dynamic block allocation as sequences grow
+- **Copy-on-Write (CoW)**: blocks shared between sequences (e.g., common prefixes) are only copied when one sequence diverges, reducing memory usage for prompt caching and beam search
+- **Metal Buffer Pool**: pre-allocated pool of Metal buffers for block storage, avoiding per-request allocation overhead
+
+This is a core building block for the continuous batching scheduler, enabling memory-efficient multi-sequence serving.
+
+---
+
+## scheduler.rs -- Continuous Batching Scheduler (Phase 3)
+
+A memory-aware continuous batching scheduler that manages inference requests through prefill and decode phases, enabling efficient GPU utilization during serving.
+
+**Key features:**
+- **Request queue**: accepts incoming inference requests and manages their lifecycle (queued, prefilling, decoding, complete)
+- **Memory-aware scheduling**: uses PagedKvCache block availability to determine how many sequences can be batched concurrently, preventing OOM during serving
+- **Prefill/decode phases**: separates compute-intensive prefill (processing the full prompt) from memory-bound decode (generating tokens one at a time), allowing the scheduler to interleave new prefills with ongoing decodes
+- **Batch scheduling**: forms batches that maximize GPU utilization while respecting memory constraints
+
+Together with `PagedKvCache`, this module provides the serving infrastructure needed for production LLM inference.
+
+---
+
 ## conv.rs — Convolution Layers
 
 ### Conv1d
@@ -717,6 +746,10 @@ Megatron-LM style tensor-parallel linear layers for distributed inference.
 |--------|-------------|
 | `ColumnParallelLinear` | Splits the output dimension across TP ranks (each rank holds a column shard) |
 | `RowParallelLinear` | Splits the input dimension across TP ranks (each rank holds a row shard) |
+
+### TP Validation (Production Readiness Phase 2)
+
+TP layers now validate configuration at construction time via a `TpError` error type. `world_size` must be > 0, and `hidden_dim` / `out_features` must be evenly divisible by `world_size`. Invalid configurations return `Err(TpError)` instead of silently producing incorrect shards.
 
 ---
 
