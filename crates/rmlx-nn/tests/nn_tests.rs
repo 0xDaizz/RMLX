@@ -1666,3 +1666,368 @@ fn test_quantized_linear_forward_f16_input() {
     assert_eq!(out.shape(), &[1, out_f]);
     assert_eq!(out.dtype(), DType::Float32);
 }
+
+#[test]
+fn test_moe_gather_mm_matches_per_expert() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+
+    let hidden_dim = 8;
+    let intermediate_dim = 4;
+    let num_experts = 4;
+    let top_k = 2;
+
+    // Gate: [num_experts, hidden_dim] — deterministic routing weights
+    let gate_data: Vec<f32> = (0..num_experts * hidden_dim)
+        .map(|i| ((i % 7) as f32 - 3.0) * 0.1)
+        .collect();
+    let gate_weight = Array::from_slice(dev, &gate_data, vec![num_experts, hidden_dim]);
+    let gate = Linear::from_arrays(
+        LinearConfig {
+            in_features: hidden_dim,
+            out_features: num_experts,
+            has_bias: false,
+        },
+        gate_weight,
+        None,
+    )
+    .expect("gate from_arrays failed");
+
+    // Build experts with varied weights
+    let make_expert = |val: f32| -> Expert {
+        let gate_data: Vec<f32> = vec![val; intermediate_dim * hidden_dim];
+        let gate_w = Array::from_slice(dev, &gate_data, vec![intermediate_dim, hidden_dim]);
+        let gate_proj = Linear::from_arrays(
+            LinearConfig {
+                in_features: hidden_dim,
+                out_features: intermediate_dim,
+                has_bias: false,
+            },
+            gate_w,
+            None,
+        )
+        .unwrap();
+
+        let up_data: Vec<f32> = vec![val * 0.5; intermediate_dim * hidden_dim];
+        let up_w = Array::from_slice(dev, &up_data, vec![intermediate_dim, hidden_dim]);
+        let up_proj = Linear::from_arrays(
+            LinearConfig {
+                in_features: hidden_dim,
+                out_features: intermediate_dim,
+                has_bias: false,
+            },
+            up_w,
+            None,
+        )
+        .unwrap();
+
+        let down_data: Vec<f32> = vec![val * 0.3; hidden_dim * intermediate_dim];
+        let down_w = Array::from_slice(dev, &down_data, vec![hidden_dim, intermediate_dim]);
+        let down_proj = Linear::from_arrays(
+            LinearConfig {
+                in_features: intermediate_dim,
+                out_features: hidden_dim,
+                has_bias: false,
+            },
+            down_w,
+            None,
+        )
+        .unwrap();
+
+        Expert {
+            gate_proj,
+            up_proj,
+            down_proj,
+        }
+    };
+
+    let experts_per_expert: Vec<Expert> = vec![
+        make_expert(0.1),
+        make_expert(0.2),
+        make_expert(0.3),
+        make_expert(0.4),
+    ];
+
+    // Create second gate with same data for the GatherMM MoE layer
+    let gate_weight2 = Array::from_slice(dev, &gate_data, vec![num_experts, hidden_dim]);
+    let gate2 = Linear::from_arrays(
+        LinearConfig {
+            in_features: hidden_dim,
+            out_features: num_experts,
+            has_bias: false,
+        },
+        gate_weight2,
+        None,
+    )
+    .expect("gate2 from_arrays failed");
+
+    let experts_gather: Vec<Expert> = vec![
+        make_expert(0.1),
+        make_expert(0.2),
+        make_expert(0.3),
+        make_expert(0.4),
+    ];
+
+    let moe_per_expert = MoeLayer::from_layers(
+        MoeConfig {
+            num_experts,
+            num_experts_per_token: top_k,
+            hidden_dim,
+            intermediate_dim,
+            capacity_factor: 1.0,
+        },
+        gate,
+        experts_per_expert,
+    )
+    .expect("from_layers failed (PerExpert)")
+    .with_strategy(MoeStrategy::PerExpert);
+
+    let moe_gather_mm = MoeLayer::from_layers(
+        MoeConfig {
+            num_experts,
+            num_experts_per_token: top_k,
+            hidden_dim,
+            intermediate_dim,
+            capacity_factor: 1.0,
+        },
+        gate2,
+        experts_gather,
+    )
+    .expect("from_layers failed (GatherMM)")
+    .with_strategy(MoeStrategy::GatherMM);
+
+    // Input: [4, 8] — 4 tokens
+    let input_data: Vec<f32> = (0..4 * hidden_dim)
+        .map(|i| (i as f32 + 1.0) * 0.1)
+        .collect();
+    let input = Array::from_slice(dev, &input_data, vec![4, hidden_dim]);
+
+    let out_per_expert = moe_per_expert
+        .forward(&input, &registry, &queue)
+        .expect("PerExpert forward failed");
+    let out_gather_mm = moe_gather_mm
+        .forward(&input, &registry, &queue)
+        .expect("GatherMM forward failed");
+
+    assert_eq!(out_per_expert.shape(), out_gather_mm.shape());
+
+    let vals_pe: Vec<f32> = out_per_expert.to_vec_checked();
+    let vals_gm: Vec<f32> = out_gather_mm.to_vec_checked();
+
+    for i in 0..vals_pe.len() {
+        let diff = (vals_pe[i] - vals_gm[i]).abs();
+        let tol = 1e-3 * vals_pe[i].abs().max(1.0);
+        assert!(
+            diff < tol,
+            "Mismatch at index {i}: PerExpert={} GatherMM={} diff={diff}",
+            vals_pe[i],
+            vals_gm[i]
+        );
+    }
+}
+
+// ===== PR 4.11: ICB Sparse Expert Dispatch tests =====
+
+#[test]
+fn test_icb_replay_cache_basic() {
+    use rmlx_metal::icb_sparse::IcbReplayCache;
+
+    let mut cache = IcbReplayCache::new(16);
+    assert!(cache.is_empty());
+
+    // Record a sparsity pattern
+    let counts = [3u32, 0, 5, 0, 1, 0, 0, 2];
+    cache.record(&counts);
+    assert_eq!(cache.len(), 1);
+
+    // Lookup should find it
+    let (_key, pattern) = cache.lookup(&counts).expect("should be cached");
+    assert_eq!(pattern.active_count, 4);
+    assert_eq!(
+        pattern.active_mask,
+        vec![true, false, true, false, true, false, false, true]
+    );
+    assert_eq!(pattern.replay_count, 1);
+
+    // Same active set with different counts should hit cache
+    let counts2 = [10u32, 0, 1, 0, 2, 0, 0, 7];
+    let result2 = cache.lookup(&counts2);
+    assert!(
+        result2.is_some(),
+        "same active mask should share cache entry"
+    );
+}
+
+#[test]
+fn test_icb_replay_cache_eviction() {
+    use rmlx_metal::icb_sparse::IcbReplayCache;
+
+    let mut cache = IcbReplayCache::new(2);
+    cache.record(&[1u32, 0]);
+    cache.record(&[0u32, 1]);
+    assert_eq!(cache.len(), 2);
+
+    // Bump first pattern
+    cache.record(&[1u32, 0]);
+
+    // Third pattern should evict the one with lowest replay_count
+    cache.record(&[1u32, 1]);
+    assert_eq!(cache.len(), 2);
+
+    // First pattern (replay_count=2) should survive
+    assert!(cache.lookup(&[1u32, 0]).is_some());
+}
+
+#[test]
+fn test_moe_sparse_icb_available() {
+    // Verify MoeLayer exposes ICB replay cache
+    let moe = MoeLayer::new(MoeConfig {
+        num_experts: 8,
+        num_experts_per_token: 2,
+        hidden_dim: 256,
+        intermediate_dim: 512,
+        capacity_factor: 1.0,
+    })
+    .expect("MoeLayer::new failed");
+
+    let cache = moe.icb_replay_cache().lock().unwrap();
+    assert!(cache.is_empty());
+    assert_eq!(cache.max_entries(), 64);
+}
+
+#[test]
+fn test_sparse_dispatch_result_types() {
+    use rmlx_metal::icb_sparse::SparseDispatchResult;
+
+    let result = SparseDispatchResult {
+        dispatched_count: 3,
+        active_mask: vec![true, false, true, true, false],
+    };
+    assert_eq!(result.dispatched_count, 3);
+    assert_eq!(result.active_mask.len(), 5);
+    assert_eq!(result.active_mask.iter().filter(|&&a| a).count(), 3);
+}
+
+#[test]
+fn test_moe_grouped_forward_skips_empty_experts() {
+    // Verify that the grouped forward path correctly handles the case where
+    // some experts have zero tokens (they should not be dispatched).
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+
+    let hidden_dim = 8;
+    let intermediate_dim = 4;
+    let num_experts = 4;
+    let top_k = 1;
+
+    // Gate weights that route all tokens to expert 0
+    // (experts 1, 2, 3 get 0 tokens)
+    // Shape: [num_experts, hidden_dim] = [4, 8]
+    let mut gate_data = vec![-10.0f32; num_experts * hidden_dim];
+    for item in gate_data.iter_mut().take(hidden_dim) {
+        *item = 10.0; // expert 0: very high
+    }
+    let gate_weight = Array::from_slice(dev, &gate_data, vec![num_experts, hidden_dim]);
+    let gate = Linear::from_arrays(
+        LinearConfig {
+            in_features: hidden_dim,
+            out_features: num_experts,
+            has_bias: false,
+        },
+        gate_weight,
+        None,
+    )
+    .expect("gate from_arrays failed");
+
+    let make_exp = |val: f32| -> Expert {
+        let gw = Array::from_slice(
+            dev,
+            &vec![val; intermediate_dim * hidden_dim],
+            vec![intermediate_dim, hidden_dim],
+        );
+        let uw = Array::from_slice(
+            dev,
+            &vec![val; intermediate_dim * hidden_dim],
+            vec![intermediate_dim, hidden_dim],
+        );
+        let dw = Array::from_slice(
+            dev,
+            &vec![val; hidden_dim * intermediate_dim],
+            vec![hidden_dim, intermediate_dim],
+        );
+        Expert {
+            gate_proj: Linear::from_arrays(
+                LinearConfig {
+                    in_features: hidden_dim,
+                    out_features: intermediate_dim,
+                    has_bias: false,
+                },
+                gw,
+                None,
+            )
+            .unwrap(),
+            up_proj: Linear::from_arrays(
+                LinearConfig {
+                    in_features: hidden_dim,
+                    out_features: intermediate_dim,
+                    has_bias: false,
+                },
+                uw,
+                None,
+            )
+            .unwrap(),
+            down_proj: Linear::from_arrays(
+                LinearConfig {
+                    in_features: intermediate_dim,
+                    out_features: hidden_dim,
+                    has_bias: false,
+                },
+                dw,
+                None,
+            )
+            .unwrap(),
+        }
+    };
+
+    let experts: Vec<Expert> = vec![make_exp(0.1), make_exp(0.2), make_exp(0.3), make_exp(0.4)];
+
+    let moe = MoeLayer::from_layers(
+        MoeConfig {
+            num_experts,
+            num_experts_per_token: top_k,
+            hidden_dim,
+            intermediate_dim,
+            capacity_factor: 1.0,
+        },
+        gate,
+        experts,
+    )
+    .expect("from_layers failed")
+    .with_strategy(MoeStrategy::Grouped);
+
+    let input_data: Vec<f32> = (0..2 * hidden_dim)
+        .map(|i| (i as f32 + 1.0) * 0.1)
+        .collect();
+    let input = Array::from_slice(dev, &input_data, vec![2, hidden_dim]);
+
+    let output = moe
+        .forward(&input, &registry, &queue)
+        .expect("grouped forward with empty experts should succeed");
+
+    assert_eq!(output.shape(), &[2, hidden_dim]);
+
+    let vals: Vec<f32> = output.to_vec_checked();
+    assert!(
+        vals.iter().all(|v| v.is_finite()),
+        "output should contain finite values"
+    );
+    // Only expert 0 should have been dispatched; output should be non-zero
+    let sum: f32 = vals.iter().sum();
+    assert!(sum.abs() > 1e-8, "output should not be all zeros");
+}

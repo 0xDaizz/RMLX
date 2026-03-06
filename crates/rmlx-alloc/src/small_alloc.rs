@@ -10,7 +10,7 @@
 use std::sync::Mutex;
 
 use rmlx_metal::device::GpuDevice;
-use rmlx_metal::metal::{Buffer as MetalBuffer, MTLResourceOptions};
+use rmlx_metal::metal::Buffer as MetalBuffer;
 
 /// Maximum allocation size served by the small-buffer pool.
 pub const MAX_SMALL_ALLOC: usize = 256;
@@ -69,7 +69,7 @@ impl SmallBufferPool {
         let slot_size = MAX_SMALL_ALLOC;
         let num_slots = total / slot_size;
 
-        let buffer = device.new_buffer(total as u64, MTLResourceOptions::StorageModeShared);
+        let buffer = device.new_buffer(total as u64, rmlx_metal::device::DEFAULT_BUFFER_OPTIONS);
         let free_bitmap = vec![true; num_slots];
 
         Self {

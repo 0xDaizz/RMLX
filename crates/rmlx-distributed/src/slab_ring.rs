@@ -25,8 +25,8 @@
 //! from GPU compute output to RDMA wire transfer involves zero CPU copies.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use rmlx_metal::event::{EventError, GpuEvent};
 
@@ -150,6 +150,12 @@ pub struct SlabRing {
     event: Arc<GpuEvent>,
     /// Config snapshot.
     config: SlabRingConfig,
+    /// Mutex + Condvar for backpressure: producers block when ring is full.
+    backpressure_lock: Mutex<()>,
+    /// Condvar signalled when a slot becomes available (consumer frees a slot).
+    not_full: Condvar,
+    /// Counter: number of times a producer had to block because the ring was full.
+    ring_full_count: AtomicU64,
 }
 
 impl SlabRing {
@@ -184,23 +190,18 @@ impl SlabRing {
             consumer_pos: AtomicU64::new(0),
             event,
             config,
+            backpressure_lock: Mutex::new(()),
+            not_full: Condvar::new(),
+            ring_full_count: AtomicU64::new(0),
         }
     }
 
-    /// Acquire the next slab for GPU writing.
+    /// Try to acquire the next slab without blocking.
     ///
-    /// Returns the slab index and a reference to its Metal buffer.
-    /// Returns [`SlabRingError::Full`] if the ring is full (all slabs are
-    /// pending RDMA send).
-    ///
-    /// Uses a compare-and-swap loop on `producer_pos` to atomically claim
-    /// a slot, eliminating TOCTOU races between concurrent callers.
-    ///
-    /// After the GPU writes into the slab, the caller must call [`produce()`]
-    /// to signal that the data is ready for consumption.
-    ///
-    /// [`produce()`]: Self::produce
-    pub fn acquire_for_write(&self) -> Result<&Slab, SlabRingError> {
+    /// Returns [`SlabRingError::Full`] immediately if the ring is full.
+    /// This is the lock-free fast path used internally and by callers that
+    /// do not want to block.
+    pub fn try_acquire_for_write(&self) -> Result<&Slab, SlabRingError> {
         loop {
             let prod = self.producer_pos.load(Ordering::Acquire);
             let cons = self.consumer_pos.load(Ordering::Acquire);
@@ -222,6 +223,81 @@ impl SlabRing {
                     return Ok(&self.slabs[idx]);
                 }
                 Err(_) => continue, // another thread won the race, retry
+            }
+        }
+    }
+
+    /// Acquire the next slab for GPU writing, blocking if the ring is full.
+    ///
+    /// Returns the slab index and a reference to its Metal buffer.
+    /// If the ring is full, blocks on a [`Condvar`] until a consumer frees
+    /// a slot. The lock-free CAS fast path is tried first; the Condvar
+    /// blocking path is only entered when the ring is actually full.
+    ///
+    /// After the GPU writes into the slab, the caller must call [`produce()`]
+    /// to signal that the data is ready for consumption.
+    ///
+    /// [`produce()`]: Self::produce
+    pub fn acquire_for_write(&self) -> Result<&Slab, SlabRingError> {
+        // Fast path: try lock-free CAS first.
+        match self.try_acquire_for_write() {
+            Ok(slab) => return Ok(slab),
+            Err(SlabRingError::Full) => {}
+            Err(e) => return Err(e),
+        }
+
+        // Slow path: ring is full, block on Condvar.
+        self.ring_full_count.fetch_add(1, Ordering::Relaxed);
+        let mut guard = self.backpressure_lock.lock().unwrap();
+        loop {
+            match self.try_acquire_for_write() {
+                Ok(slab) => return Ok(slab),
+                Err(SlabRingError::Full) => {
+                    guard = self.not_full.wait(guard).unwrap();
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Acquire the next slab for GPU writing, with a timeout.
+    ///
+    /// Like [`acquire_for_write()`] but returns [`SlabRingError::Timeout`]
+    /// if no slot becomes available within `timeout`.
+    ///
+    /// [`acquire_for_write()`]: Self::acquire_for_write
+    pub fn acquire_for_write_timeout(&self, timeout: Duration) -> Result<&Slab, SlabRingError> {
+        // Fast path: try lock-free CAS first.
+        match self.try_acquire_for_write() {
+            Ok(slab) => return Ok(slab),
+            Err(SlabRingError::Full) => {}
+            Err(e) => return Err(e),
+        }
+
+        // Slow path: ring is full, block on Condvar with timeout.
+        self.ring_full_count.fetch_add(1, Ordering::Relaxed);
+        let deadline = Instant::now() + timeout;
+        let mut guard = self.backpressure_lock.lock().unwrap();
+        loop {
+            match self.try_acquire_for_write() {
+                Ok(slab) => return Ok(slab),
+                Err(SlabRingError::Full) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Err(SlabRingError::Timeout);
+                    }
+                    let remaining = deadline - now;
+                    let (new_guard, wait_result) =
+                        self.not_full.wait_timeout(guard, remaining).unwrap();
+                    guard = new_guard;
+                    if wait_result.timed_out() {
+                        // One more try before giving up.
+                        return self
+                            .try_acquire_for_write()
+                            .map_err(|_| SlabRingError::Timeout);
+                    }
+                }
+                Err(e) => return Err(e),
             }
         }
     }
@@ -270,6 +346,8 @@ impl SlabRing {
             ) {
                 Ok(_) => {
                     let idx = (cons % self.depth as u64) as usize;
+                    // Wake any blocked producer now that a slot is free.
+                    self.not_full.notify_one();
                     return Some(&self.slabs[idx]);
                 }
                 Err(_) => continue, // another consumer won the race, retry
@@ -299,6 +377,8 @@ impl SlabRing {
             ) {
                 Ok(_) => {
                     let idx = (cons % self.depth as u64) as usize;
+                    // Wake any blocked producer now that a slot is free.
+                    self.not_full.notify_one();
                     return Ok(&self.slabs[idx]);
                 }
                 Err(_) => continue,
@@ -314,7 +394,10 @@ impl SlabRing {
     /// can safely continue to call `release()` after consumption.
     pub fn release(&self) {
         // Consumer position was already advanced by try_consume/consume CAS.
-        // This is intentionally a no-op.
+        // Wake any blocked producer as an extra safety net — the primary
+        // notification happens inside try_consume/consume, but legacy callers
+        // may expect release() to unblock producers.
+        self.not_full.notify_one();
     }
 
     /// Number of slabs currently in use (produced but not yet consumed+released).
@@ -366,6 +449,14 @@ impl SlabRing {
     /// Current consumer position (monotonically increasing).
     pub fn consumer_pos_val(&self) -> u64 {
         self.consumer_pos.load(Ordering::Acquire)
+    }
+
+    /// Number of times a producer had to block because the ring was full.
+    ///
+    /// Useful for monitoring backpressure — a steadily increasing count
+    /// indicates the consumer cannot keep up with the producer.
+    pub fn ring_full_count(&self) -> u64 {
+        self.ring_full_count.load(Ordering::Relaxed)
     }
 }
 
@@ -469,7 +560,7 @@ mod tests {
     }
 
     #[test]
-    fn test_full_ring_acquire_fails() {
+    fn test_full_ring_try_acquire_fails() {
         let device = require_device();
         let config = SlabRingConfig {
             depth: 2,
@@ -483,8 +574,8 @@ mod tests {
         ring.producer_pos.store(2, Ordering::Release);
 
         assert!(ring.is_full());
-        assert!(ring.acquire_for_write().is_err());
-        match ring.acquire_for_write() {
+        assert!(ring.try_acquire_for_write().is_err());
+        match ring.try_acquire_for_write() {
             Err(SlabRingError::Full) => {} // expected
             other => panic!("expected Full, got: {other:?}"),
         }
@@ -708,7 +799,7 @@ mod tests {
             let produced = Arc::clone(&total_produced);
             let h = std::thread::spawn(move || {
                 for _ in 0..iterations {
-                    match ring.acquire_for_write() {
+                    match ring.try_acquire_for_write() {
                         Ok(_slab) => {
                             produced.fetch_add(1, Ordering::Relaxed);
                         }
@@ -758,6 +849,182 @@ mod tests {
         assert_eq!(p, c, "produced={p} consumed={c} must match");
         // The ring should be empty after all operations complete.
         assert!(ring.is_empty());
+    }
+
+    #[test]
+    fn test_backpressure_producer_blocks_and_resumes() {
+        // Verify that a producer blocks when the ring is full and resumes
+        // when the consumer makes progress.
+        let device = require_device();
+        let config = SlabRingConfig {
+            depth: 2,
+            slab_size: 256,
+        };
+        let ring = Arc::new(SlabRing::new(&device, config));
+
+        // Fill the ring (depth=2).
+        let _s0 = ring.acquire_for_write().unwrap();
+        let _s1 = ring.acquire_for_write().unwrap();
+        assert!(ring.is_full());
+
+        let ring_prod = Arc::clone(&ring);
+        let produced = Arc::new(AtomicU64::new(0));
+        let produced_c = Arc::clone(&produced);
+
+        // Spawn a producer that will block because the ring is full.
+        let producer = std::thread::spawn(move || {
+            // This call should block until the consumer frees a slot.
+            let slab = ring_prod.acquire_for_write().unwrap();
+            produced_c.store(1, Ordering::Release);
+            slab.index
+        });
+
+        // Give the producer a moment to enter the blocking path.
+        std::thread::sleep(Duration::from_millis(50));
+        // Producer should still be blocked (nothing consumed yet).
+        assert_eq!(produced.load(Ordering::Acquire), 0);
+
+        // Consumer frees a slot.
+        let consumed = ring.try_consume().unwrap();
+        assert_eq!(consumed.index, 0);
+
+        // Producer should now unblock and complete.
+        let idx = producer.join().unwrap();
+        assert_eq!(produced.load(Ordering::Acquire), 1);
+        // The producer got slab index 0 (position 2 % 2 = 0).
+        assert_eq!(idx, 0);
+    }
+
+    #[test]
+    fn test_backpressure_timeout() {
+        // Verify that acquire_for_write_timeout returns Timeout when the
+        // ring is full and no consumer frees a slot within the timeout.
+        let device = require_device();
+        let config = SlabRingConfig {
+            depth: 1,
+            slab_size: 256,
+        };
+        let ring = SlabRing::new(&device, config);
+
+        // Fill the ring.
+        let _s = ring.acquire_for_write().unwrap();
+        assert!(ring.is_full());
+
+        let result = ring.acquire_for_write_timeout(Duration::from_millis(50));
+        match result {
+            Err(SlabRingError::Timeout) => {} // expected
+            other => panic!("expected Timeout, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_backpressure_timeout_succeeds_when_freed() {
+        // Verify that acquire_for_write_timeout succeeds if a slot is freed
+        // before the timeout expires.
+        let device = require_device();
+        let config = SlabRingConfig {
+            depth: 1,
+            slab_size: 256,
+        };
+        let ring = Arc::new(SlabRing::new(&device, config));
+
+        // Fill the ring.
+        let _s = ring.acquire_for_write().unwrap();
+        assert!(ring.is_full());
+
+        let ring_prod = Arc::clone(&ring);
+        let producer = std::thread::spawn(move || {
+            ring_prod
+                .acquire_for_write_timeout(Duration::from_secs(2))
+                .map(|s| s.size) // extract owned data to avoid returning a borrow
+        });
+
+        // Free a slot after a short delay.
+        std::thread::sleep(Duration::from_millis(50));
+        let _ = ring.try_consume().unwrap();
+
+        let result = producer.join().unwrap();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_ring_full_count_increments() {
+        // Verify that ring_full_count increments each time a producer blocks.
+        let device = require_device();
+        let config = SlabRingConfig {
+            depth: 1,
+            slab_size: 256,
+        };
+        let ring = Arc::new(SlabRing::new(&device, config));
+
+        assert_eq!(ring.ring_full_count(), 0);
+
+        // Fill the ring.
+        let _s = ring.acquire_for_write().unwrap();
+
+        // First timeout: ring_full_count should increment.
+        let _ = ring.acquire_for_write_timeout(Duration::from_millis(10));
+        assert_eq!(ring.ring_full_count(), 1);
+
+        // Second timeout: ring_full_count should increment again.
+        let _ = ring.acquire_for_write_timeout(Duration::from_millis(10));
+        assert_eq!(ring.ring_full_count(), 2);
+
+        // Free the slot, acquire should succeed without incrementing.
+        let _ = ring.try_consume().unwrap();
+        let _ = ring.acquire_for_write().unwrap();
+        assert_eq!(ring.ring_full_count(), 2);
+    }
+
+    #[test]
+    fn test_backpressure_no_data_loss() {
+        // Spin up a fast producer and slow consumer, verify all data is
+        // transferred without loss.
+        let device = require_device();
+        let config = SlabRingConfig {
+            depth: 2,
+            slab_size: 256,
+        };
+        let ring = Arc::new(SlabRing::new(&device, config));
+        let total_items = 20u64;
+
+        let ring_prod = Arc::clone(&ring);
+        let producer = std::thread::spawn(move || {
+            for _ in 0..total_items {
+                // acquire_for_write blocks if ring is full — no data loss.
+                let _slab = ring_prod.acquire_for_write().unwrap();
+            }
+        });
+
+        let ring_cons = Arc::clone(&ring);
+        let consumer = std::thread::spawn(move || {
+            let mut consumed = 0u64;
+            let mut retries = 0u64;
+            while consumed < total_items {
+                match ring_cons.try_consume() {
+                    Some(_) => {
+                        consumed += 1;
+                        retries = 0;
+                        // Simulate slow consumer.
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    None => {
+                        retries += 1;
+                        if retries > 100_000 {
+                            panic!("consumer stalled after {consumed} items");
+                        }
+                        std::thread::yield_now();
+                    }
+                }
+            }
+            consumed
+        });
+
+        producer.join().unwrap();
+        let consumed = consumer.join().unwrap();
+        assert_eq!(consumed, total_items);
+        // Backpressure should have kicked in since depth=2 < total_items=20.
+        assert!(ring.ring_full_count() > 0);
     }
 
     #[test]
