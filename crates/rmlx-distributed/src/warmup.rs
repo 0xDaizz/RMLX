@@ -183,8 +183,8 @@ impl WarmupState {
             let calibration_gpu = MTLDevice::system_default();
             let cal_start = Instant::now();
             self.calibration.calibrate(
-                |n| run_cpu_calibration_bench(n),
-                |n| run_gpu_calibration_bench(calibration_gpu.as_ref(), n),
+                run_cpu_calibration_bench,
+                |n| run_gpu_calibration_bench(calibration_gpu.as_ref(), n), // closure needed: captures calibration_gpu
             );
             cal_dur = cal_start.elapsed();
         }
