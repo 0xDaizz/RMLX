@@ -3,12 +3,12 @@
 use metal::Buffer as MTLBuffer;
 use std::ffi::c_void;
 
-use crate::device::DEFAULT_BUFFER_OPTIONS;
+use crate::device::{DEFAULT_BUFFER_OPTIONS, UNTRACKED_BUFFER_OPTIONS};
 
 /// Create a new buffer initialized with data from a typed slice.
 ///
-/// Uses [`DEFAULT_BUFFER_OPTIONS`] (`StorageModeShared | HazardTrackingModeUntracked`)
-/// so the buffer is CPU+GPU visible and hazard tracking is managed by RMLX.
+/// Uses the safe default [`DEFAULT_BUFFER_OPTIONS`] (`StorageModeShared`)
+/// so the buffer is CPU+GPU visible with Metal hazard tracking enabled.
 pub fn new_buffer_with_data<T>(device: &metal::Device, data: &[T]) -> MTLBuffer {
     let size = std::mem::size_of_val(data) as u64;
     let ptr = data.as_ptr() as *const c_void;
@@ -17,7 +17,8 @@ pub fn new_buffer_with_data<T>(device: &metal::Device, data: &[T]) -> MTLBuffer 
 
 /// Create a zero-copy buffer wrapping externally allocated memory.
 ///
-/// Uses [`DEFAULT_BUFFER_OPTIONS`] (`StorageModeShared | HazardTrackingModeUntracked`).
+/// Uses [`UNTRACKED_BUFFER_OPTIONS`] for performance-critical zero-copy paths.
+/// The caller must ensure synchronisation via the barrier tracker.
 ///
 /// # Safety
 /// - `ptr` must be page-aligned (16384 bytes on Apple Silicon).
@@ -28,7 +29,7 @@ pub unsafe fn new_buffer_no_copy(device: &metal::Device, ptr: *mut c_void, size:
     // SAFETY: Caller guarantees ptr is page-aligned, valid for size bytes,
     // and will outlive the returned buffer. We pass None for the deallocator
     // because the caller manages the memory lifetime.
-    device.new_buffer_with_bytes_no_copy(ptr, size, DEFAULT_BUFFER_OPTIONS, None)
+    device.new_buffer_with_bytes_no_copy(ptr, size, UNTRACKED_BUFFER_OPTIONS, None)
 }
 
 /// Read buffer contents as a typed slice.

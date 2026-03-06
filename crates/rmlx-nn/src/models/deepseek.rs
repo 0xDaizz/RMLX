@@ -161,6 +161,7 @@ pub struct DeepSeekV3Block {
     layer_idx: usize,
     mla: Mla,
     ffn: FeedForward,
+    shared_expert: Option<FeedForward>,
     norm1_weight: Option<Array>,
     norm2_weight: Option<Array>,
     rms_norm_eps: f32,
@@ -172,6 +173,7 @@ impl DeepSeekV3Block {
         layer_idx: usize,
         mla_config: MlaConfig,
         ffn: FeedForward,
+        shared_expert: Option<FeedForward>,
         rms_norm_eps: f32,
     ) -> Result<Self, KernelError> {
         let mla = Mla::new(mla_config)?;
@@ -179,6 +181,7 @@ impl DeepSeekV3Block {
             layer_idx,
             mla,
             ffn,
+            shared_expert,
             norm1_weight: None,
             norm2_weight: None,
             rms_norm_eps,
@@ -190,6 +193,7 @@ impl DeepSeekV3Block {
         layer_idx: usize,
         mla: Mla,
         ffn: FeedForward,
+        shared_expert: Option<FeedForward>,
         norm1_weight: Array,
         norm2_weight: Array,
         rms_norm_eps: f32,
@@ -198,6 +202,7 @@ impl DeepSeekV3Block {
             layer_idx,
             mla,
             ffn,
+            shared_expert,
             norm1_weight: Some(norm1_weight),
             norm2_weight: Some(norm2_weight),
             rms_norm_eps,
@@ -242,7 +247,13 @@ impl DeepSeekV3Block {
         let normed2 = ops::rms_norm::rms_norm(registry, &h, norm2_w, self.rms_norm_eps, queue)?;
 
         // FFN (dense or MoE depending on layer index)
-        let ffn_out = self.ffn.forward(&normed2, registry, queue)?;
+        let mut ffn_out = self.ffn.forward(&normed2, registry, queue)?;
+
+        // Shared expert: runs on every token, output added to the MoE output.
+        if let Some(ref shared) = self.shared_expert {
+            let shared_out = shared.forward(&normed2, registry, queue)?;
+            ffn_out = ops::binary::add(registry, &ffn_out, &shared_out, queue)?;
+        }
 
         // Residual
         ops::binary::add(registry, &h, &ffn_out, queue)
@@ -251,6 +262,11 @@ impl DeepSeekV3Block {
     /// Layer index.
     pub fn layer_idx(&self) -> usize {
         self.layer_idx
+    }
+
+    /// Whether this block has a shared expert.
+    pub fn has_shared_expert(&self) -> bool {
+        self.shared_expert.is_some()
     }
 }
 
@@ -300,6 +316,23 @@ impl DeepSeekV3Model {
         // Determine the intermediate dim for dense layers.
         // DeepSeek-V3 uses the shared_expert_intermediate_size for the first dense layers.
         let dense_intermediate = config.shared_expert_intermediate_size;
+        let build_shared_expert = || FeedForward::Gated {
+            gate_proj: Linear::new(LinearConfig {
+                in_features: hidden_size,
+                out_features: config.shared_expert_intermediate_size,
+                has_bias: false,
+            }),
+            up_proj: Linear::new(LinearConfig {
+                in_features: hidden_size,
+                out_features: config.shared_expert_intermediate_size,
+                has_bias: false,
+            }),
+            down_proj: Linear::new(LinearConfig {
+                in_features: config.shared_expert_intermediate_size,
+                out_features: hidden_size,
+                has_bias: false,
+            }),
+        };
 
         let mut layers = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
@@ -340,7 +373,14 @@ impl DeepSeekV3Model {
                 FeedForward::MoE(moe_layer)
             };
 
-            let block = DeepSeekV3Block::new(i, mla_config_i, ffn, rms_norm_eps)?;
+            let shared_expert =
+                if i >= config.first_k_dense_replace && config.num_shared_experts > 0 {
+                    Some(build_shared_expert())
+                } else {
+                    None
+                };
+
+            let block = DeepSeekV3Block::new(i, mla_config_i, ffn, shared_expert, rms_norm_eps)?;
             layers.push(block);
         }
 
@@ -619,5 +659,95 @@ mod tests {
         assert!(result.is_err());
         let msg = format!("{}", result.err().unwrap());
         assert!(msg.contains("MoE"), "Error should mention MoE: {msg}");
+    }
+
+    #[test]
+    fn test_deepseek_v3_shared_expert_created() {
+        let small_config = DeepSeekV3Config {
+            transformer: TransformerConfig {
+                hidden_size: 128,
+                num_heads: 4,
+                num_kv_heads: 1,
+                head_dim: 32,
+                num_layers: 3,
+                vocab_size: 1000,
+                max_seq_len: 256,
+                rope_theta: 10000.0,
+                rms_norm_eps: 1e-6,
+                ff_type: FeedForwardType::MoE {
+                    config: MoeConfig {
+                        num_experts: 4,
+                        num_experts_per_token: 2,
+                        hidden_dim: 128,
+                        intermediate_dim: 64,
+                        capacity_factor: 1.0,
+                    },
+                },
+            },
+            kv_lora_rank: 32,
+            q_lora_rank: 64,
+            rope_head_dim: 8,
+            v_head_dim: 32,
+            shared_expert_intermediate_size: 64,
+            num_shared_experts: 1,
+            first_k_dense_replace: 1,
+        };
+
+        let model = DeepSeekV3Model::from_config(small_config).unwrap();
+
+        // Layer 0 is dense — should NOT have shared expert
+        let layer0 = model.layer(0).unwrap();
+        assert!(!layer0.has_shared_expert());
+
+        // Layers 1,2 are MoE — should have shared expert
+        let layer1 = model.layer(1).unwrap();
+        assert!(layer1.has_shared_expert());
+
+        let layer2 = model.layer(2).unwrap();
+        assert!(layer2.has_shared_expert());
+    }
+
+    #[test]
+    fn test_deepseek_v3_no_shared_expert_when_zero() {
+        let small_config = DeepSeekV3Config {
+            transformer: TransformerConfig {
+                hidden_size: 128,
+                num_heads: 4,
+                num_kv_heads: 1,
+                head_dim: 32,
+                num_layers: 2,
+                vocab_size: 1000,
+                max_seq_len: 256,
+                rope_theta: 10000.0,
+                rms_norm_eps: 1e-6,
+                ff_type: FeedForwardType::MoE {
+                    config: MoeConfig {
+                        num_experts: 4,
+                        num_experts_per_token: 2,
+                        hidden_dim: 128,
+                        intermediate_dim: 64,
+                        capacity_factor: 1.0,
+                    },
+                },
+            },
+            kv_lora_rank: 32,
+            q_lora_rank: 64,
+            rope_head_dim: 8,
+            v_head_dim: 32,
+            shared_expert_intermediate_size: 64,
+            num_shared_experts: 0,
+            first_k_dense_replace: 1,
+        };
+
+        let model = DeepSeekV3Model::from_config(small_config).unwrap();
+
+        // No layers should have shared expert
+        for i in 0..2 {
+            let layer = model.layer(i).unwrap();
+            assert!(
+                !layer.has_shared_expert(),
+                "layer {i} should not have shared expert"
+            );
+        }
     }
 }

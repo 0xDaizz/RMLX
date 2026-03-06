@@ -15,7 +15,7 @@
 //! - **After prefill**: Insert new KV blocks into the prefix cache via
 //!   `PrefixCache::insert()` so future requests can reuse them.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 // ---------------------------------------------------------------------------
@@ -76,18 +76,14 @@ impl RadixNode {
         }
     }
 
-    /// Count the total number of cached blocks in this subtree.
-    fn count_blocks(&self) -> usize {
-        let own = if self.has_blocks {
-            self.block_ids.len()
-        } else {
-            0
-        };
-        own + self
-            .children
-            .values()
-            .map(|c| c.count_blocks())
-            .sum::<usize>()
+    /// Collect all unique block IDs in this subtree into a HashSet.
+    fn collect_unique_block_ids(&self, out: &mut HashSet<usize>) {
+        if self.has_blocks {
+            out.extend(&self.block_ids);
+        }
+        for child in self.children.values() {
+            child.collect_unique_block_ids(out);
+        }
     }
 
     /// Collect all leaf/block-holding nodes with their last access time,
@@ -303,9 +299,14 @@ impl PrefixCache {
         }
     }
 
-    /// Total number of cached blocks across all entries.
+    /// Total number of unique cached blocks across all entries.
+    ///
+    /// Uses a `HashSet` to deduplicate block IDs, since nodes in the radix tree
+    /// may store full-prefix block lists that overlap with ancestor/descendant nodes.
     pub fn total_cached_blocks(&self) -> usize {
-        self.root.count_blocks()
+        let mut unique = HashSet::new();
+        self.root.collect_unique_block_ids(&mut unique);
+        unique.len()
     }
 
     /// Evict least recently used prefix entries to free at least `n_blocks` blocks.
@@ -327,14 +328,14 @@ impl PrefixCache {
         // Sort by last_access ascending (oldest first = evict first).
         candidates.sort_by_key(|(_, _, t)| *t);
 
-        let mut freed = 0usize;
+        let mut freed_set: HashSet<usize> = HashSet::new();
         let mut to_remove: Vec<Vec<u32>> = Vec::new();
 
         for (path, block_ids, _) in &candidates {
-            if freed >= n_blocks {
+            if freed_set.len() >= n_blocks {
                 break;
             }
-            freed += block_ids.len();
+            freed_set.extend(block_ids);
             to_remove.push(path.clone());
         }
 
@@ -343,7 +344,7 @@ impl PrefixCache {
             self.remove(&path);
         }
 
-        freed
+        freed_set.len()
     }
 
     /// Remove a specific token path from the cache.
@@ -556,5 +557,43 @@ mod tests {
         assert_eq!(m2.block_ids, vec![20, 21]);
 
         assert_eq!(cache.total_cached_blocks(), 5); // 3 + 2
+    }
+
+    #[test]
+    fn test_total_cached_blocks_deduplication() {
+        let mut cache = PrefixCache::new();
+
+        // Insert [1,2,3] with blocks [10,11].
+        cache.insert(&[1, 2, 3], &[10, 11]);
+        // Insert [1,2,3,4,5] with overlapping blocks [10,11,12].
+        // The node for [1,2,3] has blocks [10,11] and
+        // the node for [4,5] (child) has blocks [10,11,12].
+        // Without deduplication this would count 5, but unique blocks are 3.
+        cache.insert(&[1, 2, 3, 4, 5], &[10, 11, 12]);
+
+        assert_eq!(cache.total_cached_blocks(), 3); // {10, 11, 12}
+    }
+
+    #[test]
+    fn test_evict_unique_blocks() {
+        let mut cache = PrefixCache::new();
+
+        // Insert two entries that share block IDs.
+        cache.insert(&[1, 2, 3], &[10, 11]);
+        thread::sleep(Duration::from_millis(10));
+        cache.insert(&[1, 2, 3, 4, 5], &[10, 11, 12]);
+
+        // Evict 1 block — the oldest entry [1,2,3] has blocks [10,11], but
+        // those overlap with [1,2,3,4,5]'s blocks. Evicting [1,2,3] frees
+        // 2 unique block IDs from that node ({10,11}), but the remaining
+        // entry still references them. The evict return value counts unique
+        // blocks in the evicted *nodes*, not net freed.
+        let freed = cache.evict(1);
+        assert!(freed >= 1);
+
+        // After evicting the older entry, look up the newer entry.
+        let m = cache.lookup(&[1, 2, 3, 4, 5]);
+        assert_eq!(m.matched_len, 5);
+        assert_eq!(m.block_ids, vec![10, 11, 12]);
     }
 }

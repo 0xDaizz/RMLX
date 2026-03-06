@@ -26,7 +26,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use rmlx_metal::event::{EventError, GpuEvent};
 
@@ -248,16 +248,14 @@ impl SlabRing {
 
         // Slow path: ring is full, block on Condvar.
         self.ring_full_count.fetch_add(1, Ordering::Relaxed);
-        let mut guard = self.backpressure_lock.lock().unwrap();
-        loop {
-            match self.try_acquire_for_write() {
-                Ok(slab) => return Ok(slab),
-                Err(SlabRingError::Full) => {
-                    guard = self.not_full.wait(guard).unwrap();
-                }
-                Err(e) => return Err(e),
-            }
-        }
+        let guard = self.backpressure_lock.lock().unwrap();
+        // Use wait_while with a predicate: stay blocked while the ring is full.
+        // The mutex is held across both the fullness check and the wait, and
+        // consumers acquire the same mutex before calling notify_one, so
+        // notifications are never lost.
+        let _guard = self.not_full.wait_while(guard, |_| self.is_full()).unwrap();
+        // Ring is no longer full; claim a slot.
+        self.try_acquire_for_write()
     }
 
     /// Acquire the next slab for GPU writing, with a timeout.
@@ -276,30 +274,22 @@ impl SlabRing {
 
         // Slow path: ring is full, block on Condvar with timeout.
         self.ring_full_count.fetch_add(1, Ordering::Relaxed);
-        let deadline = Instant::now() + timeout;
-        let mut guard = self.backpressure_lock.lock().unwrap();
-        loop {
-            match self.try_acquire_for_write() {
-                Ok(slab) => return Ok(slab),
-                Err(SlabRingError::Full) => {
-                    let now = Instant::now();
-                    if now >= deadline {
-                        return Err(SlabRingError::Timeout);
-                    }
-                    let remaining = deadline - now;
-                    let (new_guard, wait_result) =
-                        self.not_full.wait_timeout(guard, remaining).unwrap();
-                    guard = new_guard;
-                    if wait_result.timed_out() {
-                        // One more try before giving up.
-                        return self
-                            .try_acquire_for_write()
-                            .map_err(|_| SlabRingError::Timeout);
-                    }
-                }
-                Err(e) => return Err(e),
-            }
+        let guard = self.backpressure_lock.lock().unwrap();
+        // Use wait_timeout_while with a predicate: stay blocked while full.
+        // The mutex is held across both the fullness check and the wait, and
+        // consumers acquire the same mutex before calling notify_one, so
+        // notifications are never lost.
+        let (guard, wait_result) = self
+            .not_full
+            .wait_timeout_while(guard, timeout, |_| self.is_full())
+            .unwrap();
+        drop(guard);
+        if wait_result.timed_out() && self.is_full() {
+            return Err(SlabRingError::Timeout);
         }
+        // Ring is no longer full; claim a slot.
+        self.try_acquire_for_write()
+            .map_err(|_| SlabRingError::Timeout)
     }
 
     /// Signal that the GPU has finished writing to a producer slab.
@@ -347,6 +337,13 @@ impl SlabRing {
                 Ok(_) => {
                     let idx = (cons % self.depth as u64) as usize;
                     // Wake any blocked producer now that a slot is free.
+                    // We must hold backpressure_lock while notifying to avoid
+                    // a race where the producer checks fullness, finds the ring
+                    // full, but hasn't entered wait() yet — the notification
+                    // would be lost. Holding the lock ensures the producer
+                    // either (a) sees the updated consumer_pos before waiting,
+                    // or (b) is already in wait() and receives the notification.
+                    let _guard = self.backpressure_lock.lock().unwrap();
                     self.not_full.notify_one();
                     return Some(&self.slabs[idx]);
                 }
@@ -378,6 +375,9 @@ impl SlabRing {
                 Ok(_) => {
                     let idx = (cons % self.depth as u64) as usize;
                     // Wake any blocked producer now that a slot is free.
+                    // Hold backpressure_lock to prevent lost wakeups (see
+                    // try_consume for detailed rationale).
+                    let _guard = self.backpressure_lock.lock().unwrap();
                     self.not_full.notify_one();
                     return Ok(&self.slabs[idx]);
                 }
@@ -397,6 +397,7 @@ impl SlabRing {
         // Wake any blocked producer as an extra safety net — the primary
         // notification happens inside try_consume/consume, but legacy callers
         // may expect release() to unblock producers.
+        let _guard = self.backpressure_lock.lock().unwrap();
         self.not_full.notify_one();
     }
 
@@ -465,6 +466,7 @@ impl SlabRing {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     /// Helper: get the default Metal device, skip test if unavailable.
     fn require_device() -> metal::Device {
@@ -1024,6 +1026,80 @@ mod tests {
         let consumed = consumer.join().unwrap();
         assert_eq!(consumed, total_items);
         // Backpressure should have kicked in since depth=2 < total_items=20.
+        assert!(ring.ring_full_count() > 0);
+    }
+
+    #[test]
+    fn test_backpressure_condvar_no_lost_wakeup() {
+        // Stress test for the Condvar-based backpressure: many producers
+        // block on a tiny ring while a consumer drains it. This exercises
+        // the race between consumer notify_one and producer wait. Before
+        // the fix (holding backpressure_lock during notify), producers
+        // could miss wakeups and deadlock.
+        let device = require_device();
+        let config = SlabRingConfig {
+            depth: 1, // Minimal ring — maximum contention.
+            slab_size: 64,
+        };
+        let ring = Arc::new(SlabRing::new(&device, config));
+        let total_per_producer = 50u64;
+        let num_producers = 4;
+        let total_items = total_per_producer * num_producers as u64;
+
+        let produced = Arc::new(AtomicU64::new(0));
+        let consumed = Arc::new(AtomicU64::new(0));
+
+        // Spawn producers that all use blocking acquire_for_write.
+        let mut handles = vec![];
+        for _ in 0..num_producers {
+            let ring = Arc::clone(&ring);
+            let produced = Arc::clone(&produced);
+            let h = std::thread::spawn(move || {
+                for _ in 0..total_per_producer {
+                    let _slab = ring.acquire_for_write().unwrap();
+                    produced.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+            handles.push(h);
+        }
+
+        // Consumer: drain until all items consumed.
+        let ring_c = Arc::clone(&ring);
+        let consumed_c = Arc::clone(&consumed);
+        let consumer = std::thread::spawn(move || {
+            let mut count = 0u64;
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while count < total_items {
+                match ring_c.try_consume() {
+                    Some(_) => {
+                        count += 1;
+                        consumed_c.fetch_add(1, Ordering::Relaxed);
+                    }
+                    None => {
+                        if Instant::now() > deadline {
+                            panic!(
+                                "consumer stalled: consumed {count}/{total_items}, \
+                                 produced {}, in_flight {}",
+                                ring_c.producer_pos(),
+                                ring_c.in_flight(),
+                            );
+                        }
+                        std::thread::sleep(Duration::from_micros(10));
+                    }
+                }
+            }
+        });
+
+        // Join all with a generous timeout to detect deadlocks.
+        for h in handles {
+            h.join().unwrap();
+        }
+        consumer.join().unwrap();
+
+        assert_eq!(produced.load(Ordering::Relaxed), total_items);
+        assert_eq!(consumed.load(Ordering::Relaxed), total_items);
+        assert!(ring.is_empty());
+        // With depth=1 and 200 total items, backpressure must have kicked in.
         assert!(ring.ring_full_count() > 0);
     }
 

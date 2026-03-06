@@ -36,7 +36,10 @@ pub use autorelease::ScopedPool;
 pub use batcher::CommandBatcher;
 pub use capture::{CaptureDestination, CaptureScope};
 pub use command::{BarrierTracker, CommandBufferManager, GpuError, GpuErrorStore};
-pub use device::{Architecture, ChipTuning, GpuDevice, DEFAULT_BUFFER_OPTIONS};
+pub use device::{
+    Architecture, ChipTuning, GpuDevice, DEFAULT_BUFFER_OPTIONS, TRACKED_BUFFER_OPTIONS,
+    UNTRACKED_BUFFER_OPTIONS,
+};
 pub use event::GpuEvent;
 pub use exec_graph::ExecGraph;
 pub use fence::{FenceError, GpuFence};
@@ -50,7 +53,7 @@ pub use msl_version::{DeviceInfo, MslVersion};
 pub use pipeline::{FunctionConstant, PipelineCache};
 pub use pipeline_cache::DiskPipelineCache;
 pub use queue::GpuQueue;
-pub use stream::{StreamManager, STREAM_COMPUTE, STREAM_COPY, STREAM_DEFAULT};
+pub use stream::{StreamManager, StreamSync, STREAM_COMPUTE, STREAM_COPY, STREAM_DEFAULT};
 
 /// Errors from Metal operations
 #[derive(Debug)]

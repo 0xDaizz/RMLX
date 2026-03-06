@@ -3189,3 +3189,186 @@ fn test_activation_type_dynamic_dispatch() {
         .collect();
     assert_approx(&result, &expected, 1e-5, "ActivationType::Softsign");
 }
+
+#[test]
+fn test_mla_forward_causal_mask() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+
+    // Small MLA config
+    let num_heads = 2;
+    let head_dim = 8;
+    let rope_head_dim = 4;
+    let nope_dim = head_dim - rope_head_dim;
+    let v_head_dim = head_dim;
+    let hidden_size = 16;
+    let kv_lora_rank = 6;
+    let q_lora_rank = 8;
+    let max_seq_len = 32;
+    let seq_len = 4;
+
+    let make_weight = |rows: usize, cols: usize, val: f32| -> Array {
+        let data: Vec<f32> = (0..rows * cols)
+            .map(|i| if i % (cols + 1) == 0 { val } else { val * 0.01 })
+            .collect();
+        Array::from_slice(dev, &data, vec![rows, cols])
+    };
+
+    let build_mla = || -> Mla {
+        let w_dkv = Linear::from_arrays(
+            LinearConfig {
+                in_features: hidden_size,
+                out_features: kv_lora_rank,
+                has_bias: false,
+            },
+            make_weight(kv_lora_rank, hidden_size, 0.1),
+            None,
+        )
+        .unwrap();
+        let w_uk = Linear::from_arrays(
+            LinearConfig {
+                in_features: kv_lora_rank,
+                out_features: num_heads * nope_dim,
+                has_bias: false,
+            },
+            make_weight(num_heads * nope_dim, kv_lora_rank, 0.1),
+            None,
+        )
+        .unwrap();
+        let w_uv = Linear::from_arrays(
+            LinearConfig {
+                in_features: kv_lora_rank,
+                out_features: num_heads * v_head_dim,
+                has_bias: false,
+            },
+            make_weight(num_heads * v_head_dim, kv_lora_rank, 0.1),
+            None,
+        )
+        .unwrap();
+        let w_kr = Linear::from_arrays(
+            LinearConfig {
+                in_features: hidden_size,
+                out_features: rope_head_dim,
+                has_bias: false,
+            },
+            make_weight(rope_head_dim, hidden_size, 0.1),
+            None,
+        )
+        .unwrap();
+        let w_dq = Linear::from_arrays(
+            LinearConfig {
+                in_features: hidden_size,
+                out_features: q_lora_rank,
+                has_bias: false,
+            },
+            make_weight(q_lora_rank, hidden_size, 0.1),
+            None,
+        )
+        .unwrap();
+        let w_uq = Linear::from_arrays(
+            LinearConfig {
+                in_features: q_lora_rank,
+                out_features: num_heads * head_dim,
+                has_bias: false,
+            },
+            make_weight(num_heads * head_dim, q_lora_rank, 0.1),
+            None,
+        )
+        .unwrap();
+        let o_proj = Linear::from_arrays(
+            LinearConfig {
+                in_features: num_heads * v_head_dim,
+                out_features: hidden_size,
+                has_bias: false,
+            },
+            make_weight(hidden_size, num_heads * v_head_dim, 0.1),
+            None,
+        )
+        .unwrap();
+
+        let config = MlaConfig {
+            num_heads,
+            head_dim,
+            v_head_dim,
+            hidden_size,
+            kv_lora_rank,
+            q_lora_rank,
+            rope_head_dim,
+            rope_theta: 10000.0,
+            max_seq_len,
+        };
+        Mla::from_projections(config, w_dkv, w_uk, w_uv, w_kr, w_dq, w_uq, o_proj).unwrap()
+    };
+
+    let (cos_data, sin_data) =
+        rmlx_core::ops::rope::precompute_freqs(max_seq_len, rope_head_dim, 10000.0, 1.0)
+            .expect("precompute_freqs failed");
+    let cos_freqs = Array::from_slice(dev, &cos_data, vec![max_seq_len, rope_head_dim / 2]);
+    let sin_freqs = Array::from_slice(dev, &sin_data, vec![max_seq_len, rope_head_dim / 2]);
+
+    // Run 1: input_a with specific values for all 4 tokens
+    let input_a: Vec<f32> = (0..seq_len * hidden_size)
+        .map(|i| (i as f32 + 1.0) * 0.01)
+        .collect();
+    let arr_a = Array::from_slice(dev, &input_a, vec![seq_len, hidden_size]);
+    let mla_a = build_mla();
+    let out_a = mla_a
+        .forward(
+            &arr_a,
+            Some(&cos_freqs),
+            Some(&sin_freqs),
+            None,
+            &registry,
+            &queue,
+        )
+        .expect("forward A failed");
+    let vals_a: Vec<f32> = out_a.to_vec_checked();
+
+    // Run 2: same input but token 3 (last row) is drastically different
+    let mut input_b = input_a.clone();
+    for j in 0..hidden_size {
+        input_b[3 * hidden_size + j] = 99.0; // wildly different token 3
+    }
+    let arr_b = Array::from_slice(dev, &input_b, vec![seq_len, hidden_size]);
+    let mla_b = build_mla();
+    let out_b = mla_b
+        .forward(
+            &arr_b,
+            Some(&cos_freqs),
+            Some(&sin_freqs),
+            None,
+            &registry,
+            &queue,
+        )
+        .expect("forward B failed");
+    let vals_b: Vec<f32> = out_b.to_vec_checked();
+
+    // Token 0's output should be IDENTICAL between run A and run B,
+    // because the causal mask prevents token 0 from seeing tokens 1-3.
+    let row0_a = &vals_a[0..hidden_size];
+    let row0_b = &vals_b[0..hidden_size];
+    for j in 0..hidden_size {
+        assert!(
+            (row0_a[j] - row0_b[j]).abs() < 1e-5,
+            "Token 0 output differs at dim {j}: a={} vs b={} — causal mask is broken!",
+            row0_a[j],
+            row0_b[j],
+        );
+    }
+
+    // Token 3's output SHOULD differ (it sees the same tokens 0-2 but its own input changed)
+    let row3_a = &vals_a[3 * hidden_size..4 * hidden_size];
+    let row3_b = &vals_b[3 * hidden_size..4 * hidden_size];
+    let max_diff: f32 = row3_a
+        .iter()
+        .zip(row3_b.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_diff > 1e-3,
+        "Token 3 output should differ between runs (max_diff={max_diff}), input was changed",
+    );
+}

@@ -1,11 +1,11 @@
-//! Small-buffer slab allocator (A5).
+//! Small-buffer recycling allocator (A5).
 //!
-//! MLX uses `MTL::Heap` for tiny allocations (<256 B). Creating individual
-//! Metal buffers for each tiny request adds significant Metal runtime overhead.
+//! Creating individual Metal buffers for each tiny request adds significant
+//! Metal runtime overhead.
 //!
-//! `SmallBufferPool` pre-allocates a single Metal buffer (default 1 MiB) and
-//! sub-allocates fixed-size slots from it using a free-list bitmap. Requests
-//! up to `MAX_SMALL_ALLOC` (256 bytes) are served from this pool.
+//! `SmallBufferPool` pre-allocates a fixed set of 256-byte Metal buffers and
+//! recycles them through a free-list. Requests up to `MAX_SMALL_ALLOC`
+//! (256 bytes) are served from this pool.
 
 use std::sync::Mutex;
 
@@ -15,18 +15,20 @@ use rmlx_metal::metal::Buffer as MetalBuffer;
 /// Maximum allocation size served by the small-buffer pool.
 pub const MAX_SMALL_ALLOC: usize = 256;
 
-/// Default backing buffer size: 1 MiB.
-const DEFAULT_POOL_SIZE: usize = 1024 * 1024;
+/// Default pool size: 256 buffers = 64 KiB total.
+const DEFAULT_POOL_SIZE: usize = MAX_SMALL_ALLOC * 256;
 
-/// A sub-allocation within the small-buffer pool.
+/// A small allocation checked out from the recycling pool.
 #[derive(Debug)]
 pub struct SmallAllocation {
     /// Index of the slot in the pool (for returning to the free list).
     slot: usize,
-    /// Byte offset within the parent buffer.
+    /// Logical byte offset within the pool.
     pub offset: usize,
     /// Requested size (may be smaller than slot size).
     pub size: usize,
+    /// The pooled Metal buffer handed out for this allocation.
+    pub buffer: Option<MetalBuffer>,
 }
 
 impl SmallAllocation {
@@ -38,19 +40,16 @@ impl SmallAllocation {
 
 /// Inner state protected by a mutex.
 struct PoolInner {
-    /// Bitmap: true = slot is free.
-    free_bitmap: Vec<bool>,
-    /// Number of free slots remaining.
-    free_count: usize,
+    /// Buffers currently held by the pool. `None` means the slot is checked out.
+    buffers: Vec<Option<MetalBuffer>>,
+    /// Free slot indices, stored as a stack for O(1) pop/push.
+    free_list: Vec<usize>,
 }
 
-/// Slab allocator that sub-allocates from a single pre-allocated Metal buffer.
-///
-/// Each slot is `MAX_SMALL_ALLOC` bytes. The pool hands out `SmallAllocation`
-/// descriptors referencing the parent buffer + offset.
+/// Recycling pool that hands out pre-allocated fixed-size Metal buffers.
 pub struct SmallBufferPool {
-    /// The backing Metal buffer (shared storage mode).
-    buffer: MetalBuffer,
+    /// Representative buffer kept for backward compatibility with `buffer()`.
+    sample_buffer: MetalBuffer,
     /// Slot size in bytes (= `MAX_SMALL_ALLOC`).
     slot_size: usize,
     /// Total number of slots.
@@ -60,26 +59,33 @@ pub struct SmallBufferPool {
 }
 
 impl SmallBufferPool {
-    /// Create a new small-buffer pool backed by a single Metal buffer.
+    /// Create a new small-buffer pool backed by fixed-size Metal buffers.
     ///
-    /// `pool_size` is the total backing buffer size (default: 1 MiB).
+    /// `pool_size` is the total backing buffer size (default: 64 KiB).
     /// Each slot is `MAX_SMALL_ALLOC` bytes (256 B).
     pub fn new(device: &GpuDevice, pool_size: Option<usize>) -> Self {
         let total = pool_size.unwrap_or(DEFAULT_POOL_SIZE);
         let slot_size = MAX_SMALL_ALLOC;
-        let num_slots = total / slot_size;
+        let num_slots = std::cmp::max(1, total / slot_size);
 
-        let buffer = device.new_buffer(total as u64, rmlx_metal::device::DEFAULT_BUFFER_OPTIONS);
-        let free_bitmap = vec![true; num_slots];
+        let mut buffers = Vec::with_capacity(num_slots);
+        for _ in 0..num_slots {
+            buffers.push(Some(device.new_buffer(
+                slot_size as u64,
+                rmlx_metal::device::DEFAULT_BUFFER_OPTIONS,
+            )));
+        }
+        let sample_buffer = buffers[0]
+            .as_ref()
+            .expect("pool must have a buffer")
+            .clone();
+        let free_list = (0..num_slots).rev().collect();
 
         Self {
-            buffer,
+            sample_buffer,
             slot_size,
             num_slots,
-            inner: Mutex::new(PoolInner {
-                free_bitmap,
-                free_count: num_slots,
-            }),
+            inner: Mutex::new(PoolInner { buffers, free_list }),
         }
     }
 
@@ -90,40 +96,42 @@ impl SmallBufferPool {
         if size == 0 || size > MAX_SMALL_ALLOC {
             return None;
         }
+
         let mut inner = self.inner.lock().ok()?;
-        if inner.free_count == 0 {
-            return None;
-        }
-        // Linear scan for first free slot. For 4096 slots (1 MiB / 256 B)
-        // this is fast enough; a more sophisticated approach (e.g., next-free
-        // index) can be added if profiling shows this as a bottleneck.
-        for (i, free) in inner.free_bitmap.iter_mut().enumerate() {
-            if *free {
-                *free = false;
-                inner.free_count -= 1;
-                return Some(SmallAllocation {
-                    slot: i,
-                    offset: i * self.slot_size,
-                    size,
-                });
+        let slot = inner.free_list.pop()?;
+        let buffer = match inner.buffers.get_mut(slot).and_then(Option::take) {
+            Some(buffer) => buffer,
+            None => {
+                inner.free_list.push(slot);
+                return None;
             }
-        }
-        None
+        };
+
+        Some(SmallAllocation {
+            slot,
+            offset: slot * self.slot_size,
+            size,
+            buffer: Some(buffer),
+        })
     }
 
     /// Return a small allocation to the pool.
     pub fn free(&self, alloc: SmallAllocation) {
         if let Ok(mut inner) = self.inner.lock() {
             if alloc.slot < self.num_slots {
-                inner.free_bitmap[alloc.slot] = true;
-                inner.free_count += 1;
+                if let Some(buffer) = alloc.buffer {
+                    if inner.buffers[alloc.slot].is_none() {
+                        inner.buffers[alloc.slot] = Some(buffer);
+                        inner.free_list.push(alloc.slot);
+                    }
+                }
             }
         }
     }
 
-    /// Reference to the backing Metal buffer.
+    /// Representative Metal buffer from the pool.
     pub fn buffer(&self) -> &MetalBuffer {
-        &self.buffer
+        &self.sample_buffer
     }
 
     /// Slot size in bytes.
@@ -138,12 +146,22 @@ impl SmallBufferPool {
 
     /// Number of currently free slots.
     pub fn free_count(&self) -> usize {
-        self.inner.lock().map(|inner| inner.free_count).unwrap_or(0)
+        self.inner
+            .lock()
+            .map(|inner| inner.free_list.len())
+            .unwrap_or(0)
     }
 
     /// Number of currently allocated slots.
     pub fn allocated_count(&self) -> usize {
         self.num_slots - self.free_count()
+    }
+
+    /// Whether this pool performs true sub-allocation from a larger slab.
+    ///
+    /// This recycling pool returns whole buffers, so it never sub-allocates.
+    pub fn is_suballocating(&self) -> bool {
+        false
     }
 }
 
@@ -170,9 +188,15 @@ mod tests {
         let a1 = pool.alloc(8).expect("alloc 1");
         assert_eq!(a1.offset, 0);
         assert_eq!(a1.size, 8);
+        assert!(a1.buffer.is_some());
 
         let a2 = pool.alloc(128).expect("alloc 2");
         assert_eq!(a2.offset, 256);
+        let a2_addr = a2
+            .buffer
+            .as_ref()
+            .expect("alloc 2 should carry a buffer")
+            .gpu_address();
 
         let a3 = pool.alloc(256).expect("alloc 3");
         assert_eq!(a3.offset, 512);
@@ -185,8 +209,15 @@ mod tests {
         assert_eq!(pool.free_count(), 2);
 
         let a4 = pool.alloc(64).expect("alloc 4");
-        // Should reuse slot 1 (first free)
+        // Should reuse slot 1 (LIFO free list).
         assert_eq!(a4.offset, 256);
+        assert_eq!(
+            a4.buffer
+                .as_ref()
+                .expect("alloc 4 should carry a buffer")
+                .gpu_address(),
+            a2_addr
+        );
 
         pool.free(a1);
         pool.free(a3);
@@ -205,12 +236,15 @@ mod tests {
         };
 
         let pool = SmallBufferPool::new(&device, Some(256 * 2)); // 2 slots
-        let _a1 = pool.alloc(16).expect("alloc 1");
-        let _a2 = pool.alloc(16).expect("alloc 2");
+        let a1 = pool.alloc(16).expect("alloc 1");
+        let a2 = pool.alloc(16).expect("alloc 2");
 
         // Pool is now exhausted
         assert!(pool.alloc(16).is_none());
         assert_eq!(pool.free_count(), 0);
+
+        pool.free(a1);
+        pool.free(a2);
     }
 
     #[test]
