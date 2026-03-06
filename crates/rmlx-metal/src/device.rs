@@ -5,17 +5,28 @@ use metal::{CommandBuffer, CommandQueue, MTLGPUFamily, MTLResourceOptions};
 
 use crate::MetalError;
 
-/// Default resource options for all RMLX buffer allocations.
-///
-/// Combines `StorageModeShared` (CPU+GPU visible on Apple Silicon UMA) with
-/// `HazardTrackingModeUntracked` so Metal skips automatic hazard tracking.
-/// RMLX manages synchronisation explicitly via command-buffer ordering,
-/// `MTLSharedEvent`, and `MTLFence`, making Metal's built-in tracking
-/// redundant overhead.
-pub const DEFAULT_BUFFER_OPTIONS: MTLResourceOptions = MTLResourceOptions::from_bits_truncate(
+/// Safe default: StorageModeShared only. Metal performs automatic hazard
+/// tracking, so buffers created with these options are safe to use even
+/// when code paths bypass the barrier tracker.
+pub const TRACKED_BUFFER_OPTIONS: MTLResourceOptions = MTLResourceOptions::StorageModeShared;
+
+/// Performance option: StorageModeShared + HazardTrackingModeUntracked.
+/// Use ONLY for buffers whose synchronisation is managed explicitly by
+/// the RMLX barrier tracker (command-buffer ordering / MTLSharedEvent /
+/// MTLFence). Using this for buffers that bypass the barrier tracker
+/// will cause data races.
+pub const UNTRACKED_BUFFER_OPTIONS: MTLResourceOptions = MTLResourceOptions::from_bits_truncate(
     MTLResourceOptions::StorageModeShared.bits()
         | MTLResourceOptions::HazardTrackingModeUntracked.bits(),
 );
+
+/// Default buffer options — safe by default (tracked).
+///
+/// Previously this was `StorageModeShared | HazardTrackingModeUntracked`,
+/// which skipped Metal hazard tracking globally. Now defaults to the safe
+/// tracked variant. Code that explicitly goes through the barrier tracker
+/// should use [`UNTRACKED_BUFFER_OPTIONS`] instead.
+pub const DEFAULT_BUFFER_OPTIONS: MTLResourceOptions = TRACKED_BUFFER_OPTIONS;
 
 // ---------------------------------------------------------------------------
 // Chip-class tuning
@@ -120,6 +131,7 @@ pub struct GpuDevice {
     tuning: ChipTuning,
     max_buffer_length: u64,
     max_threadgroup_memory: u64,
+    stream_manager: crate::stream::StreamManager,
 }
 
 impl GpuDevice {
@@ -128,6 +140,7 @@ impl GpuDevice {
         let device = MTLDevice::system_default().ok_or(MetalError::NoDevice)?;
         let arch = detect_architecture(device.name());
         let tuning = ChipTuning::for_device(&device);
+        let stream_manager = crate::stream::StreamManager::new(&device);
         let max_buffer_length = device.max_buffer_length();
         let max_threadgroup_memory = device.max_threadgroup_memory_length();
 
@@ -137,6 +150,7 @@ impl GpuDevice {
             tuning,
             max_buffer_length,
             max_threadgroup_memory,
+            stream_manager,
         })
     }
 
@@ -175,6 +189,11 @@ impl GpuDevice {
         &self.tuning
     }
 
+    /// Access the multi-stream manager for concurrent compute + copy scheduling.
+    pub fn stream_manager(&self) -> &crate::stream::StreamManager {
+        &self.stream_manager
+    }
+
     /// Create a command buffer on `queue`, choosing the optimal path for
     /// this chip class.
     ///
@@ -207,8 +226,8 @@ impl GpuDevice {
 
     /// Allocate a buffer and initialize it from a typed slice.
     ///
-    /// Uses [`DEFAULT_BUFFER_OPTIONS`] (`StorageModeShared | HazardTrackingModeUntracked`)
-    /// so the buffer is CPU+GPU visible and hazard tracking is managed by RMLX.
+    /// Uses the safe default [`DEFAULT_BUFFER_OPTIONS`] (`StorageModeShared`)
+    /// so the buffer is CPU+GPU visible with Metal hazard tracking enabled.
     pub fn new_buffer_with_data<T>(&self, data: &[T]) -> metal::Buffer {
         let size = std::mem::size_of_val(data) as u64;
         let ptr = data.as_ptr() as *const std::ffi::c_void;
@@ -322,6 +341,15 @@ mod tests {
     }
 
     #[test]
+    fn test_gpu_device_stream_manager() {
+        let gpu = GpuDevice::system_default().unwrap();
+        let mgr = gpu.stream_manager();
+        assert!(mgr.has_stream(crate::stream::STREAM_COMPUTE));
+        assert!(mgr.has_stream(crate::stream::STREAM_COPY));
+        assert_eq!(mgr.stream_count(), 3);
+    }
+
+    #[test]
     fn test_create_command_buffer_succeeds() {
         let gpu = GpuDevice::system_default().unwrap();
         let queue = gpu.new_command_queue();
@@ -357,11 +385,22 @@ mod tests {
     }
 
     #[test]
-    fn test_default_buffer_options_has_untracked() {
-        // Verify that DEFAULT_BUFFER_OPTIONS includes both StorageModeShared
-        // and HazardTrackingModeUntracked.
-        assert!(DEFAULT_BUFFER_OPTIONS.contains(MTLResourceOptions::StorageModeShared));
-        assert!(DEFAULT_BUFFER_OPTIONS.contains(MTLResourceOptions::HazardTrackingModeUntracked));
+    fn test_tracked_buffer_options() {
+        assert!(TRACKED_BUFFER_OPTIONS.contains(MTLResourceOptions::StorageModeShared));
+        assert!(!TRACKED_BUFFER_OPTIONS.contains(MTLResourceOptions::HazardTrackingModeUntracked));
+    }
+
+    #[test]
+    fn test_untracked_buffer_options() {
+        assert!(UNTRACKED_BUFFER_OPTIONS.contains(MTLResourceOptions::StorageModeShared));
+        assert!(UNTRACKED_BUFFER_OPTIONS.contains(MTLResourceOptions::HazardTrackingModeUntracked));
+    }
+
+    #[test]
+    fn test_default_buffer_options_is_tracked() {
+        // DEFAULT_BUFFER_OPTIONS should be the safe (tracked) variant.
+        assert_eq!(DEFAULT_BUFFER_OPTIONS, TRACKED_BUFFER_OPTIONS);
+        assert!(!DEFAULT_BUFFER_OPTIONS.contains(MTLResourceOptions::HazardTrackingModeUntracked));
     }
 
     #[test]
@@ -394,7 +433,7 @@ mod tests {
             }
         };
 
-        let buf = device.new_buffer(256, DEFAULT_BUFFER_OPTIONS);
+        let buf = device.new_buffer(256, UNTRACKED_BUFFER_OPTIONS);
         assert!(buf.length() >= 256);
         // Write and read back to confirm the buffer is functional.
         let ptr = buf.contents() as *mut u8;

@@ -504,7 +504,7 @@ impl AwqLinear {
         ))
     }
 
-    /// Normalize input to 2D and validate feature dimension.
+    /// Normalize input to 2D and validate feature dimension and dtype.
     fn normalize_input(&self, x: &Array) -> Result<(usize, Array), KernelError> {
         let (batch, x_2d) = if x.ndim() == 1 {
             (1usize, x.reshape(vec![1, x.shape()[0]])?)
@@ -521,6 +521,12 @@ impl AwqLinear {
                 "AwqLinear: input features mismatch: {} vs {}",
                 x_2d.shape()[1],
                 self.in_features
+            )));
+        }
+        if x_2d.dtype() != DType::Float32 {
+            return Err(KernelError::InvalidShape(format!(
+                "AwqLinear: input dtype must be Float32, got {:?}",
+                x_2d.dtype()
             )));
         }
         Ok((batch, x_2d))
@@ -694,7 +700,7 @@ impl GptqLinear {
         ))
     }
 
-    /// Normalize input to 2D and validate feature dimension.
+    /// Normalize input to 2D and validate feature dimension and dtype.
     fn normalize_input(&self, x: &Array) -> Result<(usize, Array), KernelError> {
         let (batch, x_2d) = if x.ndim() == 1 {
             (1usize, x.reshape(vec![1, x.shape()[0]])?)
@@ -711,6 +717,12 @@ impl GptqLinear {
                 "GptqLinear: input features mismatch: {} vs {}",
                 x_2d.shape()[1],
                 self.in_features
+            )));
+        }
+        if x_2d.dtype() != DType::Float32 {
+            return Err(KernelError::InvalidShape(format!(
+                "GptqLinear: input dtype must be Float32, got {:?}",
+                x_2d.dtype()
             )));
         }
         Ok((batch, x_2d))
@@ -817,15 +829,35 @@ impl KQuantConfig {
         }
     }
 
-    /// Q4_K dequantization (simplified reference implementation).
+    /// Q4_K dequantization — **PLACEHOLDER / SIMPLIFIED**.
     ///
-    /// Each 144-byte super block holds 256 quantized values in 8 sub-blocks
-    /// of 32 elements each. Sub-block scales and mins are packed into 12 bytes
-    /// using 6-bit values.
+    /// TODO(#105): This implementation is a simplified placeholder that does not
+    /// fully match GGML's real Q4_K super-block format. The real Q4_K layout
+    /// (see `ggml-quants.c :: dequantize_row_q4_K`) uses:
+    ///   - 256-element super blocks (144 bytes each)
+    ///   - f16 `d` (super-block scale) and f16 `dmin` (super-block minimum)
+    ///   - 8 sub-blocks of 32 elements each
+    ///   - 6-bit per-sub-block scales and mins packed into 12 bytes, where
+    ///     the lower 4 sub-blocks use the low 6 bits of bytes 0..8 and the
+    ///     upper 4 sub-blocks combine 4 bits from bytes 8..12 with 2 high
+    ///     bits borrowed from bytes 0..8
+    ///   - Dequant formula: `y[j] = d * sc * q[j] - dmin * m` per sub-block
+    ///
+    /// The current code attempts the correct unpacking but has not been
+    /// validated against GGML's reference output for edge cases (e.g.,
+    /// sub-block scales/mins > 63, mixed high-bit patterns). Do not rely
+    /// on this for production inference until verified end-to-end.
     fn dequantize_q4k(&self) -> Result<Vec<f32>, KernelError> {
         let block_size = 256usize;
         let type_size = 144usize;
         let total_elements = self.out_features * self.in_features;
+
+        if total_elements % block_size != 0 {
+            return Err(KernelError::InvalidShape(format!(
+                "KQuantConfig Q4_K: total elements ({total_elements}) must be a multiple of {block_size}"
+            )));
+        }
+
         let num_blocks = total_elements / block_size;
 
         if self.raw_data.len() != num_blocks * type_size {
@@ -847,34 +879,23 @@ impl KQuantConfig {
             let d = f16_to_f32(d_bits);
             let dmin = f16_to_f32(dmin_bits);
 
-            // 12 bytes of packed 6-bit scales and mins for 8 sub-blocks
-            // Simplified: extract lower 4 bits as scale_idx, upper 2 bits contribute
-            // TODO: Full 6-bit extraction matching llama.cpp's get_scale_min_k4
             let scales_raw = &block[4..16];
-            let mut sub_scales = [0.0f32; 8];
-            let mut sub_mins = [0.0f32; 8];
-            for i in 0..8 {
-                // Approximate extraction: use byte pairs from the 12-byte region
-                // Real Q4_K has a complex bit-packing scheme for 6-bit values.
-                // This is a simplified version that extracts the low nibble as scale
-                // and high nibble as min from the packed bytes.
-                let byte_idx = (i * 3) / 2;
-                if byte_idx < scales_raw.len() {
-                    let raw = scales_raw[byte_idx];
-                    sub_scales[i] = (raw & 0x3F) as f32;
-                    // Mins from the next set of 6 bytes (offset by 6 in the 12-byte region)
-                    let min_byte_idx = 6 + byte_idx;
-                    if min_byte_idx < scales_raw.len() {
-                        sub_mins[i] = (scales_raw[min_byte_idx] & 0x3F) as f32;
-                    }
-                }
+            let mut sub_scales = [0u8; 8];
+            let mut sub_mins = [0u8; 8];
+            for i in 0..4 {
+                sub_scales[i] = scales_raw[i] & 0x3F;
+                sub_mins[i] = scales_raw[i + 4] & 0x3F;
+            }
+            for j in 0..4 {
+                sub_scales[j + 4] = (scales_raw[j + 8] & 0x0F) | ((scales_raw[j] >> 6) << 4);
+                sub_mins[j + 4] = (scales_raw[j + 8] >> 4) | ((scales_raw[j + 4] >> 6) << 4);
             }
 
             // 128 bytes of 4-bit quantized data (256 nibbles)
             let qdata = &block[16..144];
             for sub in 0..8 {
-                let sc = d * sub_scales[sub];
-                let mn = dmin * sub_mins[sub];
+                let sc = d * sub_scales[sub] as f32;
+                let mn = dmin * sub_mins[sub] as f32;
                 for j in 0..32 {
                     let elem_idx = sub * 32 + j;
                     let byte_idx = elem_idx / 2;
@@ -883,7 +904,7 @@ impl KQuantConfig {
                     } else {
                         qdata[byte_idx] >> 4
                     };
-                    output.push(sc * nibble as f32 - mn);
+                    output.push(sc * (nibble & 0xF) as f32 - mn);
                 }
             }
         }
@@ -895,6 +916,52 @@ impl KQuantConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_device() -> metal::Device {
+        rmlx_metal::device::GpuDevice::system_default()
+            .expect("system_default Metal device")
+            .raw()
+            .clone()
+    }
+
+    fn invalid_shape_message(err: KernelError) -> String {
+        match err {
+            KernelError::InvalidShape(msg) => msg,
+            other => panic!("expected InvalidShape, got {other:?}"),
+        }
+    }
+
+    fn encode_q4k_scale_mins(scales: [u8; 8], mins: [u8; 8]) -> [u8; 12] {
+        let mut raw = [0u8; 12];
+
+        for i in 0..8 {
+            assert!(scales[i] < 64, "scale must fit in 6 bits");
+            assert!(mins[i] < 64, "min must fit in 6 bits");
+        }
+
+        for i in 0..4 {
+            raw[i] = (scales[i] & 0x3F) | (((scales[i + 4] >> 4) & 0x03) << 6);
+            raw[i + 4] = (mins[i] & 0x3F) | (((mins[i + 4] >> 4) & 0x03) << 6);
+            raw[i + 8] = (scales[i + 4] & 0x0F) | ((mins[i + 4] & 0x0F) << 4);
+        }
+
+        raw
+    }
+
+    fn make_q4k_block(
+        d_bits: u16,
+        dmin_bits: u16,
+        scales: [u8; 8],
+        mins: [u8; 8],
+        nibble: u8,
+    ) -> Vec<u8> {
+        let mut block = vec![0u8; 144];
+        block[0..2].copy_from_slice(&d_bits.to_le_bytes());
+        block[2..4].copy_from_slice(&dmin_bits.to_le_bytes());
+        block[4..16].copy_from_slice(&encode_q4k_scale_mins(scales, mins));
+        block[16..144].fill((nibble & 0x0F) | ((nibble & 0x0F) << 4));
+        block
+    }
 
     #[test]
     fn test_quantized_linear_config_validation() {
@@ -993,5 +1060,96 @@ mod tests {
             QuantBits::Q4,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_awq_normalize_input_rejects_non_f32() {
+        let awq = AwqLinear::new(vec![0u32; 64], vec![1.0; 8], vec![0.0; 8], 64, 8, 64).unwrap();
+        let device = test_device();
+        let x = Array::zeros(&device, &[1, 64], DType::Float16);
+
+        let err = awq.normalize_input(&x).unwrap_err();
+        assert_eq!(
+            invalid_shape_message(err),
+            "AwqLinear: input dtype must be Float32, got Float16"
+        );
+    }
+
+    #[test]
+    fn test_gptq_normalize_input_rejects_non_f32() {
+        let gptq = GptqLinear::new(vec![0u32; 64], vec![1.0; 8], vec![0.0; 8], 64, 8, 64).unwrap();
+        let device = test_device();
+        let x = Array::zeros(&device, &[1, 64], DType::Float16);
+
+        let err = gptq.normalize_input(&x).unwrap_err();
+        assert_eq!(
+            invalid_shape_message(err),
+            "GptqLinear: input dtype must be Float32, got Float16"
+        );
+    }
+
+    #[test]
+    fn test_q4k_dequant_known_values() {
+        let config = KQuantConfig {
+            quant_type: KQuantType::Q4K,
+            out_features: 1,
+            in_features: 256,
+            raw_data: make_q4k_block(0x3C00, 0x0000, [1; 8], [0; 8], 5),
+        };
+
+        let out = config.dequantize_to_f32().unwrap();
+        assert_eq!(out.len(), 256);
+        assert!(out.iter().all(|&v| v == 5.0));
+    }
+
+    #[test]
+    fn test_q4k_dequant_with_mins() {
+        let config = KQuantConfig {
+            quant_type: KQuantType::Q4K,
+            out_features: 1,
+            in_features: 256,
+            raw_data: make_q4k_block(0x3C00, 0x3C00, [1; 8], [2; 8], 5),
+        };
+
+        let out = config.dequantize_to_f32().unwrap();
+        assert_eq!(out.len(), 256);
+        assert!(out.iter().all(|&v| v == 3.0));
+    }
+
+    #[test]
+    fn test_q4k_dequant_wrong_length() {
+        let config = KQuantConfig {
+            quant_type: KQuantType::Q4K,
+            out_features: 1,
+            in_features: 256,
+            raw_data: vec![0u8; 143],
+        };
+
+        let err = config.dequantize_to_f32().unwrap_err();
+        assert_eq!(
+            invalid_shape_message(err),
+            "KQuantConfig Q4_K: raw_data length (143) != expected (144)"
+        );
+    }
+
+    #[test]
+    fn test_q4k_scale_high_subblocks() {
+        let scales = [0, 0, 0, 0, 17, 33, 47, 63];
+        let config = KQuantConfig {
+            quant_type: KQuantType::Q4K,
+            out_features: 1,
+            in_features: 256,
+            raw_data: make_q4k_block(0x3C00, 0x0000, scales, [0; 8], 1),
+        };
+
+        let out = config.dequantize_to_f32().unwrap();
+        assert_eq!(&out[0..32], &[0.0; 32]);
+        assert_eq!(&out[32..64], &[0.0; 32]);
+        assert_eq!(&out[64..96], &[0.0; 32]);
+        assert_eq!(&out[96..128], &[0.0; 32]);
+        assert_eq!(&out[128..160], &[17.0; 32]);
+        assert_eq!(&out[160..192], &[33.0; 32]);
+        assert_eq!(&out[192..224], &[47.0; 32]);
+        assert_eq!(&out[224..256], &[63.0; 32]);
     }
 }

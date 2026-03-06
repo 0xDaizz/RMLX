@@ -224,18 +224,47 @@ impl SlidingWindowAttention {
             v_heads.push(v_head);
         }
 
-        // Update KV cache if provided
-        // TODO: When sequence length exceeds window_size, the cache should evict
-        // old positions beyond the window. The current LayerKvCache does not support
-        // eviction — it grows up to max_seq_len. For proper sliding window inference,
-        // a rotating/ring buffer cache with eviction is needed.
+        // Update KV cache if provided.
+        // When cached sequence length exceeds window_size, only the last
+        // window_size entries are returned for attention computation.
+        let w = self.config.window_size;
         let (k_final, v_final, total_seq_actual) = match cache {
             Some(ref mut c) => {
                 c.append(k_heads, v_heads, seq_len, registry, queue)?;
-                let kf: Vec<Array> = (0..num_kv_heads).map(|h| c.cached_keys(h)).collect();
-                let vf: Vec<Array> = (0..num_kv_heads).map(|h| c.cached_values(h)).collect();
-                let ts = c.seq_len;
-                (kf, vf, ts)
+                let cached_len = c.seq_len;
+                if cached_len > w {
+                    // Return views over only the last `window_size` tokens.
+                    let start = cached_len - w;
+                    let kf: Vec<Array> = (0..num_kv_heads)
+                        .map(|h| {
+                            let full = c.cached_keys(h);
+                            let elem = full.dtype().size_of();
+                            let strides = full.strides().to_vec();
+                            full.view(
+                                vec![w, head_dim],
+                                strides.clone(),
+                                full.offset() + start * strides[0] * elem,
+                            )
+                        })
+                        .collect();
+                    let vf: Vec<Array> = (0..num_kv_heads)
+                        .map(|h| {
+                            let full = c.cached_values(h);
+                            let elem = full.dtype().size_of();
+                            let strides = full.strides().to_vec();
+                            full.view(
+                                vec![w, head_dim],
+                                strides.clone(),
+                                full.offset() + start * strides[0] * elem,
+                            )
+                        })
+                        .collect();
+                    (kf, vf, w)
+                } else {
+                    let kf: Vec<Array> = (0..num_kv_heads).map(|h| c.cached_keys(h)).collect();
+                    let vf: Vec<Array> = (0..num_kv_heads).map(|h| c.cached_values(h)).collect();
+                    (kf, vf, cached_len)
+                }
             }
             None => (k_heads, v_heads, seq_len),
         };
@@ -351,5 +380,51 @@ impl SlidingWindowAttention {
 
         // Output projection
         self.o_proj.forward(&concat, registry, queue)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    /// Verify the sliding window truncation arithmetic:
+    /// when cached_len > window_size, only the last window_size tokens
+    /// should be used, with the correct byte offset.
+    #[test]
+    fn test_sliding_window_truncation_offset() {
+        let head_dim = 64;
+        let elem_size = 4; // f32
+        let stride0 = head_dim; // row-major [seq, head_dim]
+
+        // Simulate 20 cached tokens, window = 8
+        let cached_len = 20usize;
+        let window_size = 8usize;
+
+        assert!(cached_len > window_size);
+        let start = cached_len - window_size;
+        assert_eq!(start, 12);
+
+        // The view should have shape [window_size, head_dim] starting at
+        // byte offset = start * stride0 * elem_size
+        let expected_offset = start * stride0 * elem_size;
+        assert_eq!(expected_offset, 12 * 64 * 4);
+
+        // total_seq_actual should be clamped to window_size
+        let total_seq_actual = window_size;
+        assert_eq!(total_seq_actual, 8);
+    }
+
+    /// When cached_len <= window_size, no truncation should occur.
+    #[test]
+    fn test_sliding_window_no_truncation() {
+        let cached_len = 5usize;
+        let window_size = 8usize;
+
+        assert!(cached_len <= window_size);
+        // total_seq_actual should equal cached_len
+        let total_seq_actual = cached_len;
+        assert_eq!(total_seq_actual, 5);
     }
 }

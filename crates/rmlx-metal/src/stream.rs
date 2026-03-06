@@ -55,6 +55,64 @@ pub struct StreamManager {
     sync_fence: GpuFence,
 }
 
+// SAFETY: Metal CommandQueue and Device are Objective-C objects that are
+// internally reference-counted and thread-safe. HashMap is only accessed
+// via &self or &mut self which Rust enforces at compile time.
+// GpuFence is already Send + Sync.
+unsafe impl Send for StreamManager {}
+unsafe impl Sync for StreamManager {}
+
+/// Cross-stream synchronization helper.
+///
+/// Wraps a [`GpuFence`] to provide typed signal/wait operations
+/// between compute and copy streams. Thread-safe for sharing across
+/// dispatch threads.
+pub struct StreamSync {
+    fence: GpuFence,
+}
+
+impl StreamSync {
+    /// Create a new stream synchronization primitive on `device`.
+    pub fn new(device: &metal::Device) -> Self {
+        Self {
+            fence: GpuFence::new(device),
+        }
+    }
+
+    /// Signal from a compute command buffer after compute work completes.
+    ///
+    /// Returns the signal value that the copy stream should wait on.
+    pub fn signal_from_compute(&self, compute_cb: &metal::CommandBufferRef) -> u64 {
+        let value = self.fence.next_value();
+        self.fence.signal(compute_cb, value);
+        value
+    }
+
+    /// Wait on a copy command buffer until compute signals the given value.
+    pub fn wait_on_copy(&self, copy_cb: &metal::CommandBufferRef, value: u64) {
+        self.fence.wait(copy_cb, value);
+    }
+
+    /// Signal from a copy command buffer after copy/transfer completes.
+    ///
+    /// Returns the signal value that the compute stream should wait on.
+    pub fn signal_from_copy(&self, copy_cb: &metal::CommandBufferRef) -> u64 {
+        let value = self.fence.next_value();
+        self.fence.signal(copy_cb, value);
+        value
+    }
+
+    /// Wait on a compute command buffer until copy signals the given value.
+    pub fn wait_on_compute(&self, compute_cb: &metal::CommandBufferRef, value: u64) {
+        self.fence.wait(compute_cb, value);
+    }
+
+    /// Access the underlying fence.
+    pub fn fence(&self) -> &GpuFence {
+        &self.fence
+    }
+}
+
 impl StreamManager {
     /// Create a new stream manager.
     ///
@@ -271,5 +329,70 @@ mod tests {
 
         let v = mgr.sync_transfer_after_compute(&compute_cb, &transfer_cb);
         assert!(v > 0);
+    }
+
+    #[test]
+    fn test_compute_copy_queue_independence() {
+        let device = metal::Device::system_default().unwrap();
+        let mgr = StreamManager::new(&device);
+
+        // Compute and copy queues should be distinct objects.
+        let compute_q = mgr.compute_queue();
+        let copy_q = mgr.transfer_queue();
+
+        // Create command buffers on each — both should succeed independently.
+        let compute_cb = compute_q.new_command_buffer().to_owned();
+        let copy_cb = copy_q.new_command_buffer().to_owned();
+
+        // Encode no-ops on both and commit independently.
+        let enc1 = compute_cb.new_compute_command_encoder();
+        enc1.end_encoding();
+        compute_cb.commit();
+
+        let enc2 = copy_cb.new_blit_command_encoder();
+        enc2.end_encoding();
+        copy_cb.commit();
+
+        compute_cb.wait_until_completed();
+        copy_cb.wait_until_completed();
+    }
+
+    #[test]
+    fn test_stream_sync_signal_wait() {
+        let device = metal::Device::system_default().unwrap();
+        let mgr = StreamManager::new(&device);
+        let sync = super::StreamSync::new(&device);
+
+        let compute_cb = mgr.compute_command_buffer().unwrap();
+        let copy_cb = mgr.transfer_command_buffer().unwrap();
+
+        // Encode a no-op compute, then signal.
+        let enc = compute_cb.new_compute_command_encoder();
+        enc.end_encoding();
+        let value = sync.signal_from_compute(&compute_cb);
+
+        // Copy waits for compute.
+        sync.wait_on_copy(&copy_cb, value);
+        let enc2 = copy_cb.new_blit_command_encoder();
+        enc2.end_encoding();
+
+        // Commit both — copy should wait for compute signal.
+        compute_cb.commit();
+        copy_cb.commit();
+
+        compute_cb.wait_until_completed();
+        copy_cb.wait_until_completed();
+
+        // Verify signal value was set.
+        assert!(sync.fence().signaled_value() >= value);
+    }
+
+    #[test]
+    fn test_stream_manager_thread_safe() {
+        // Compile-time check that StreamManager is Send + Sync.
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<StreamManager>();
+        assert_send_sync::<super::StreamSync>();
     }
 }

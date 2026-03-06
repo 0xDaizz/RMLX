@@ -89,6 +89,106 @@ impl LayerKvCache {
         self.seq_len
     }
 
+    /// Validate consistency among input tensors when the cache is empty (first append).
+    /// Checks that all tensors are 2D, have the same dtype, the same head_dim, and
+    /// seq dimension matches new_tokens.
+    fn validate_first_append_inputs(
+        new_keys: &[Array],
+        new_values: &[Array],
+        new_tokens: usize,
+        context: &str,
+    ) -> Result<(), KernelError> {
+        // Use the first key tensor as the reference for dtype and head_dim
+        let ref_tensor = new_keys.first().or(new_values.first());
+        let (ref_dtype, ref_head_dim) = match ref_tensor {
+            Some(t) => {
+                let shape = t.shape();
+                if shape.len() != 2 {
+                    return Err(KernelError::InvalidShape(format!(
+                        "{context}: first tensor expected 2D [seq, head_dim], got {:?}",
+                        shape
+                    )));
+                }
+                (t.dtype(), shape[1])
+            }
+            None => return Ok(()), // no tensors to validate
+        };
+
+        for (kind, tensors) in [("keys", new_keys), ("values", new_values)] {
+            for (i, tensor) in tensors.iter().enumerate() {
+                if tensor.dtype() != ref_dtype {
+                    return Err(KernelError::InvalidShape(format!(
+                        "{context}: {kind}[{i}] dtype mismatch: expected {:?}, got {:?}",
+                        ref_dtype,
+                        tensor.dtype()
+                    )));
+                }
+                let shape = tensor.shape();
+                if shape.len() != 2 {
+                    return Err(KernelError::InvalidShape(format!(
+                        "{context}: {kind}[{i}] expected 2D [seq, head_dim], got {:?}",
+                        shape
+                    )));
+                }
+                if shape[1] != ref_head_dim {
+                    return Err(KernelError::InvalidShape(format!(
+                        "{context}: {kind}[{i}] head_dim mismatch: expected {}, got {}",
+                        ref_head_dim, shape[1]
+                    )));
+                }
+                if shape[0] != new_tokens {
+                    return Err(KernelError::InvalidShape(format!(
+                        "{context}: {kind}[{i}] seq mismatch: expected {}, got {}",
+                        new_tokens, shape[0]
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_cached_inputs(
+        &self,
+        new_keys: &[Array],
+        new_values: &[Array],
+        new_tokens: usize,
+        context: &str,
+    ) -> Result<(), KernelError> {
+        let cache_dtype = self.keys[0].dtype();
+        for (kind, tensors) in [("keys", new_keys), ("values", new_values)] {
+            for (i, tensor) in tensors.iter().enumerate() {
+                if tensor.dtype() != cache_dtype {
+                    return Err(KernelError::InvalidShape(format!(
+                        "{context}: {kind}[{i}] dtype mismatch: expected {:?}, got {:?}",
+                        cache_dtype,
+                        tensor.dtype()
+                    )));
+                }
+
+                let shape = tensor.shape();
+                if shape.len() != 2 {
+                    return Err(KernelError::InvalidShape(format!(
+                        "{context}: {kind}[{i}] expected 2D [seq, head_dim], got {:?}",
+                        shape
+                    )));
+                }
+                if shape[1] != self.head_dim {
+                    return Err(KernelError::InvalidShape(format!(
+                        "{context}: {kind}[{i}] head_dim mismatch: expected {}, got {}",
+                        self.head_dim, shape[1]
+                    )));
+                }
+                if shape[0] != new_tokens {
+                    return Err(KernelError::InvalidShape(format!(
+                        "{context}: {kind}[{i}] seq mismatch: expected {}, got {}",
+                        new_tokens, shape[0]
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Append new K, V heads from the current step.
     ///
     /// For pre-allocated caches, this copies only `new_tokens` rows into the
@@ -122,7 +222,13 @@ impl LayerKvCache {
             }
             self.append_preallocated(new_keys, new_values, new_tokens, registry, queue)?;
         } else if self.keys.is_empty() {
-            // Legacy path, first append
+            // Legacy path, first append — validate consistency among inputs
+            Self::validate_first_append_inputs(
+                &new_keys,
+                &new_values,
+                new_tokens,
+                "LayerKvCache::append",
+            )?;
             self.keys = new_keys;
             self.values = new_values;
             if let Some(k) = self.keys.first() {
@@ -130,6 +236,12 @@ impl LayerKvCache {
             }
         } else {
             // Legacy path, concat
+            self.validate_cached_inputs(
+                &new_keys,
+                &new_values,
+                new_tokens,
+                "LayerKvCache::append",
+            )?;
             for (i, new_k) in new_keys.into_iter().enumerate() {
                 self.keys[i] = concat_seq_dim(registry, &self.keys[i], &new_k, queue)?;
             }
@@ -150,6 +262,12 @@ impl LayerKvCache {
         registry: &KernelRegistry,
         queue: &metal::CommandQueue,
     ) -> Result<(), KernelError> {
+        self.validate_cached_inputs(
+            &new_keys,
+            &new_values,
+            new_tokens,
+            "LayerKvCache::append_preallocated",
+        )?;
         let elem_size = self.keys[0].dtype().size_of();
         let copy_kernel = match self.keys[0].dtype() {
             DType::Float32 => "copy_f32",
@@ -253,6 +371,12 @@ impl LayerKvCache {
                 self.seq_len, new_tokens, self.max_seq_len
             )));
         }
+        self.validate_cached_inputs(
+            &new_keys,
+            &new_values,
+            new_tokens,
+            "LayerKvCache::append_into_cb",
+        )?;
 
         let elem_size = self.keys[0].dtype().size_of();
         let copy_kernel = match self.keys[0].dtype() {
@@ -418,6 +542,41 @@ impl RotatingKvCache {
     /// Whether the cache has received any tokens yet.
     pub fn is_empty(&self) -> bool {
         self.offset == 0
+    }
+
+    fn validate_copy_inputs(
+        &self,
+        new_keys: &[Array],
+        new_values: &[Array],
+        context: &str,
+    ) -> Result<(), KernelError> {
+        let cache_dtype = self.keys[0].dtype();
+        for (kind, tensors) in [("keys", new_keys), ("values", new_values)] {
+            for (i, tensor) in tensors.iter().enumerate() {
+                if tensor.dtype() != cache_dtype {
+                    return Err(KernelError::InvalidShape(format!(
+                        "{context}: {kind}[{i}] dtype mismatch: expected {:?}, got {:?}",
+                        cache_dtype,
+                        tensor.dtype()
+                    )));
+                }
+
+                let shape = tensor.shape();
+                if shape.len() != 2 {
+                    return Err(KernelError::InvalidShape(format!(
+                        "{context}: {kind}[{i}] expected 2D [seq, head_dim], got {:?}",
+                        shape
+                    )));
+                }
+                if shape[1] != self.head_dim {
+                    return Err(KernelError::InvalidShape(format!(
+                        "{context}: {kind}[{i}] head_dim mismatch: expected {}, got {}",
+                        self.head_dim, shape[1]
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Append new K/V tokens into the rotating buffer.
@@ -795,6 +954,7 @@ impl RotatingKvCache {
         registry: &KernelRegistry,
         queue: &metal::CommandQueue,
     ) -> Result<(), KernelError> {
+        self.validate_copy_inputs(new_keys, new_values, "RotatingKvCache::copy_at_index")?;
         let elem_size = self.keys[0].dtype().size_of();
         let copy_kernel = match self.keys[0].dtype() {
             DType::Float32 => "copy_f32",
@@ -1899,6 +2059,34 @@ pub struct QuantizedKvCache {
 }
 
 impl QuantizedKvCache {
+    fn validate_layer(&self, layer: usize, context: &str) -> Result<(), KernelError> {
+        if layer >= self.offsets.len() {
+            return Err(KernelError::InvalidShape(format!(
+                "{context}: layer {} out of bounds for {} layers",
+                layer,
+                self.offsets.len()
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_lookup(&self, layer: usize, head: usize, context: &str) -> Result<(), KernelError> {
+        self.validate_layer(layer, context)?;
+        if head >= self.num_kv_heads {
+            return Err(KernelError::InvalidShape(format!(
+                "{context}: head {} out of bounds for {} kv heads",
+                head, self.num_kv_heads
+            )));
+        }
+        if self.keys[layer].is_empty() {
+            return Err(KernelError::InvalidShape(format!(
+                "{context}: layer {} cache is empty",
+                layer
+            )));
+        }
+        Ok(())
+    }
+
     /// Create a new empty quantized KV cache.
     pub fn new(
         num_layers: usize,
@@ -1948,13 +2136,15 @@ impl QuantizedKvCache {
     }
 
     /// Number of cached tokens for a given layer.
-    pub fn offset(&self, layer: usize) -> usize {
-        self.offsets[layer]
+    pub fn offset(&self, layer: usize) -> Result<usize, KernelError> {
+        self.validate_layer(layer, "QuantizedKvCache::offset")?;
+        Ok(self.offsets[layer])
     }
 
     /// Whether the cache is empty for a given layer.
-    pub fn is_empty(&self, layer: usize) -> bool {
-        self.offsets[layer] == 0
+    pub fn is_empty(&self, layer: usize) -> Result<bool, KernelError> {
+        self.validate_layer(layer, "QuantizedKvCache::is_empty")?;
+        Ok(self.offsets[layer] == 0)
     }
 
     /// Append new K, V for a layer.
@@ -1974,6 +2164,7 @@ impl QuantizedKvCache {
         registry: &KernelRegistry,
         _queue: &metal::CommandQueue,
     ) -> Result<(), KernelError> {
+        self.validate_layer(layer, "QuantizedKvCache::append")?;
         if new_keys.len() != self.num_kv_heads || new_values.len() != self.num_kv_heads {
             return Err(KernelError::InvalidShape(format!(
                 "QuantizedKvCache::append: expected {} kv heads, got keys={}, values={}",
@@ -1981,6 +2172,31 @@ impl QuantizedKvCache {
                 new_keys.len(),
                 new_values.len()
             )));
+        }
+
+        // Validate input tensor shapes
+        for (kind, tensors) in [("keys", &new_keys), ("values", &new_values)] {
+            for (i, tensor) in tensors.iter().enumerate() {
+                let shape = tensor.shape();
+                if shape.len() != 2 {
+                    return Err(KernelError::InvalidShape(format!(
+                        "QuantizedKvCache::append: {kind}[{i}] expected 2D [seq, head_dim], got {:?}",
+                        shape
+                    )));
+                }
+                if shape[1] != self.head_dim {
+                    return Err(KernelError::InvalidShape(format!(
+                        "QuantizedKvCache::append: {kind}[{i}] head_dim mismatch: expected {}, got {}",
+                        self.head_dim, shape[1]
+                    )));
+                }
+                if shape[0] != new_tokens {
+                    return Err(KernelError::InvalidShape(format!(
+                        "QuantizedKvCache::append: {kind}[{i}] seq mismatch: expected {}, got {}",
+                        new_tokens, shape[0]
+                    )));
+                }
+            }
         }
 
         let dev = registry.device().raw();
@@ -2025,13 +2241,23 @@ impl QuantizedKvCache {
     }
 
     /// Get the quantized keys for a specific layer and head.
-    pub fn quantized_keys(&self, layer: usize, head: usize) -> &QuantizedArray {
-        &self.keys[layer][head]
+    pub fn quantized_keys(
+        &self,
+        layer: usize,
+        head: usize,
+    ) -> Result<&QuantizedArray, KernelError> {
+        self.validate_lookup(layer, head, "QuantizedKvCache::quantized_keys")?;
+        Ok(&self.keys[layer][head])
     }
 
     /// Get the quantized values for a specific layer and head.
-    pub fn quantized_values(&self, layer: usize, head: usize) -> &QuantizedArray {
-        &self.values[layer][head]
+    pub fn quantized_values(
+        &self,
+        layer: usize,
+        head: usize,
+    ) -> Result<&QuantizedArray, KernelError> {
+        self.validate_lookup(layer, head, "QuantizedKvCache::quantized_values")?;
+        Ok(&self.values[layer][head])
     }
 
     /// Number of KV heads.
@@ -2301,6 +2527,176 @@ mod tests {
     /// Helper: read f32 data from an Array.
     fn read_f32(arr: &Array) -> Vec<f32> {
         arr.to_vec_checked::<f32>()
+    }
+
+    #[test]
+    fn test_kv_cache_dtype_mismatch() {
+        if metal::Device::system_default().is_none() {
+            return;
+        }
+        let (device, registry, queue) = setup();
+        let mut cache = LayerKvCache::preallocated(&device, 1, 4, 8, DType::Float32);
+        let bad_k = Array::zeros(&device, &[1, 4], DType::Float16);
+        let good_v = Array::zeros(&device, &[1, 4], DType::Float32);
+        let result = cache.append(vec![bad_k], vec![good_v], 1, &registry, &queue);
+        assert!(result.is_err());
+        assert!(format!("{:?}", result.unwrap_err()).contains("dtype"));
+    }
+
+    #[test]
+    fn test_kv_cache_head_dim_mismatch() {
+        if metal::Device::system_default().is_none() {
+            return;
+        }
+        let (device, registry, queue) = setup();
+        let mut cache = LayerKvCache::preallocated(&device, 1, 4, 8, DType::Float32);
+        let bad_k = Array::zeros(&device, &[1, 8], DType::Float32);
+        let good_v = Array::zeros(&device, &[1, 4], DType::Float32);
+        let result = cache.append(vec![bad_k], vec![good_v], 1, &registry, &queue);
+        assert!(result.is_err());
+        assert!(format!("{:?}", result.unwrap_err()).contains("head_dim"));
+    }
+
+    #[test]
+    fn test_kv_cache_seq_dim_mismatch() {
+        if metal::Device::system_default().is_none() {
+            return;
+        }
+        let (device, registry, queue) = setup();
+        let mut cache = LayerKvCache::preallocated(&device, 1, 4, 8, DType::Float32);
+        let bad_k = Array::zeros(&device, &[2, 4], DType::Float32);
+        let bad_v = Array::zeros(&device, &[2, 4], DType::Float32);
+        let result = cache.append(vec![bad_k], vec![bad_v], 1, &registry, &queue);
+        assert!(result.is_err());
+        assert!(format!("{:?}", result.unwrap_err()).contains("seq"));
+    }
+
+    #[test]
+    fn test_quantized_kv_cache_layer_out_of_bounds() {
+        let cache = QuantizedKvCache::new(2, 4, 128, 64, 8);
+        assert!(cache.offset(5).is_err());
+        assert!(cache.is_empty(5).is_err());
+    }
+
+    #[test]
+    fn test_quantized_kv_cache_lookup_empty() {
+        let cache = QuantizedKvCache::new(2, 4, 128, 64, 8);
+        assert!(cache.quantized_keys(0, 0).is_err());
+        assert!(cache.quantized_values(0, 0).is_err());
+    }
+
+    #[test]
+    fn test_quantized_kv_cache_head_out_of_bounds() {
+        if metal::Device::system_default().is_none() {
+            return;
+        }
+        let (device, registry, queue) = setup();
+        let mut cache = QuantizedKvCache::new(2, 2, 128, 64, 8);
+        let k0 = Array::zeros(&device, &[1, 128], DType::Float32);
+        let k1 = Array::zeros(&device, &[1, 128], DType::Float32);
+        let v0 = Array::zeros(&device, &[1, 128], DType::Float32);
+        let v1 = Array::zeros(&device, &[1, 128], DType::Float32);
+        cache
+            .append(0, vec![k0, k1], vec![v0, v1], 1, &registry, &queue)
+            .unwrap();
+        assert!(cache.quantized_keys(0, 5).is_err());
+        assert!(cache.quantized_values(0, 5).is_err());
+    }
+
+    // --- Issue #91: Legacy first-append validation tests ---
+
+    #[test]
+    fn test_legacy_first_append_dtype_mismatch() {
+        let (device, registry, queue) = setup();
+        let mut cache = LayerKvCache::new(2);
+        let k0 = Array::zeros(&device, &[1, 4], DType::Float32);
+        let k1 = Array::zeros(&device, &[1, 4], DType::Float16);
+        let v0 = Array::zeros(&device, &[1, 4], DType::Float32);
+        let v1 = Array::zeros(&device, &[1, 4], DType::Float32);
+        let result = cache.append(vec![k0, k1], vec![v0, v1], 1, &registry, &queue);
+        assert!(result.is_err());
+        assert!(format!("{:?}", result.unwrap_err()).contains("dtype"));
+    }
+
+    #[test]
+    fn test_legacy_first_append_head_dim_mismatch() {
+        let (device, registry, queue) = setup();
+        let mut cache = LayerKvCache::new(2);
+        let k0 = Array::zeros(&device, &[1, 4], DType::Float32);
+        let k1 = Array::zeros(&device, &[1, 8], DType::Float32);
+        let v0 = Array::zeros(&device, &[1, 4], DType::Float32);
+        let v1 = Array::zeros(&device, &[1, 4], DType::Float32);
+        let result = cache.append(vec![k0, k1], vec![v0, v1], 1, &registry, &queue);
+        assert!(result.is_err());
+        assert!(format!("{:?}", result.unwrap_err()).contains("head_dim"));
+    }
+
+    #[test]
+    fn test_legacy_first_append_not_2d() {
+        let (device, registry, queue) = setup();
+        let mut cache = LayerKvCache::new(1);
+        let k = Array::from_slice(&device, &[1.0f32, 2.0, 3.0, 4.0], vec![4]);
+        let v = Array::zeros(&device, &[1, 4], DType::Float32);
+        let result = cache.append(vec![k], vec![v], 1, &registry, &queue);
+        assert!(result.is_err());
+        assert!(format!("{:?}", result.unwrap_err()).contains("2D"));
+    }
+
+    #[test]
+    fn test_legacy_first_append_seq_mismatch() {
+        let (device, registry, queue) = setup();
+        let mut cache = LayerKvCache::new(1);
+        let k = Array::zeros(&device, &[3, 4], DType::Float32);
+        let v = Array::zeros(&device, &[3, 4], DType::Float32);
+        let result = cache.append(vec![k], vec![v], 1, &registry, &queue);
+        assert!(result.is_err());
+        assert!(format!("{:?}", result.unwrap_err()).contains("seq"));
+    }
+
+    // --- Issue #92: QuantizedKvCache shape validation tests ---
+
+    #[test]
+    fn test_quantized_kv_cache_head_dim_mismatch() {
+        if metal::Device::system_default().is_none() {
+            return;
+        }
+        let (device, registry, queue) = setup();
+        let mut cache = QuantizedKvCache::new(2, 1, 128, 64, 8);
+        // Wrong head_dim: 64 instead of 128
+        let k = Array::zeros(&device, &[1, 64], DType::Float32);
+        let v = Array::zeros(&device, &[1, 128], DType::Float32);
+        let result = cache.append(0, vec![k], vec![v], 1, &registry, &queue);
+        assert!(result.is_err());
+        assert!(format!("{:?}", result.unwrap_err()).contains("head_dim"));
+    }
+
+    #[test]
+    fn test_quantized_kv_cache_not_2d() {
+        if metal::Device::system_default().is_none() {
+            return;
+        }
+        let (device, registry, queue) = setup();
+        let mut cache = QuantizedKvCache::new(2, 1, 128, 64, 8);
+        let k = Array::from_slice(&device, &vec![0.0f32; 128], vec![128]);
+        let v = Array::zeros(&device, &[1, 128], DType::Float32);
+        let result = cache.append(0, vec![k], vec![v], 1, &registry, &queue);
+        assert!(result.is_err());
+        assert!(format!("{:?}", result.unwrap_err()).contains("2D"));
+    }
+
+    #[test]
+    fn test_quantized_kv_cache_seq_mismatch() {
+        if metal::Device::system_default().is_none() {
+            return;
+        }
+        let (device, registry, queue) = setup();
+        let mut cache = QuantizedKvCache::new(2, 1, 128, 64, 8);
+        // Say 3 tokens but array has 2 rows
+        let k = Array::zeros(&device, &[2, 128], DType::Float32);
+        let v = Array::zeros(&device, &[2, 128], DType::Float32);
+        let result = cache.append(0, vec![k], vec![v], 3, &registry, &queue);
+        assert!(result.is_err());
+        assert!(format!("{:?}", result.unwrap_err()).contains("seq"));
     }
 
     /// Property test: append N tokens one at a time to a cache of capacity M,
