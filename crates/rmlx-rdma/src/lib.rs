@@ -25,6 +25,7 @@ pub use collectives::{
     apply_reduce_op, chunk_boundaries, ring_allgather, ring_allreduce, ring_reduce_scatter,
     ReduceOp,
 };
+pub mod crc;
 pub use connection::{
     CompletionTracker, PostedOp, PostedOpKind, RdmaConfig, RdmaConnection, RegisteredRecv,
     RegisteredSend,
@@ -83,6 +84,8 @@ pub enum RdmaError {
     Unavailable(String),
     /// Invalid argument (e.g. SGE out of bounds)
     InvalidArgument(String),
+    /// Data corruption detected (CRC32 mismatch on UC transport)
+    DataCorruption(String),
 }
 
 impl fmt::Display for RdmaError {
@@ -102,6 +105,7 @@ impl fmt::Display for RdmaError {
             Self::Timeout(e) => write!(f, "CQ poll timeout: {e}"),
             Self::Unavailable(e) => write!(f, "RDMA unavailable: {e}"),
             Self::InvalidArgument(e) => write!(f, "invalid argument: {e}"),
+            Self::DataCorruption(e) => write!(f, "data corruption detected: {e}"),
         }
     }
 }

@@ -2,6 +2,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use rmlx_alloc::zero_copy::CompletionTicket;
 use rmlx_metal::event::GpuEvent;
 use rmlx_rdma::gpu_doorbell::{DescriptorProxy, DescriptorRing};
 use rmlx_rdma::progress::ProgressEngine;
@@ -10,6 +11,54 @@ use rmlx_rdma::shared_buffer::{ConnectionId, SharedBufferPool};
 use crate::credit_manager::CreditManager;
 use crate::perf_counters::global_counters;
 use crate::transport::RdmaConnectionTransport;
+
+/// Handle to a SharedBuffer acquired from the pool.
+///
+/// Stores the buffer's metadata (pointer, size, slot index) and a
+/// `CompletionTicket` that keeps the buffer marked as in-use.
+/// When the ticket's GPU and RDMA flags are both marked complete,
+/// the pool's `acquire()` will consider the buffer available again.
+pub struct AcquiredBuffer {
+    /// Raw pointer to the buffer memory.
+    pub ptr: *mut u8,
+    /// Buffer size in bytes (page-aligned).
+    pub size: usize,
+    /// Slot index within the pool tier.
+    pub slot_index: u8,
+    /// Completion ticket — marks the buffer as in-use while held.
+    ticket: CompletionTicket,
+}
+
+// SAFETY: AcquiredBuffer owns a raw pointer from a posix_memalign allocation
+// managed by SharedBuffer. The pointer is valid for `size` bytes and the
+// underlying SharedBuffer lifetime is managed by SharedBufferPool. The
+// CompletionTicket is Send+Sync.
+unsafe impl Send for AcquiredBuffer {}
+
+impl AcquiredBuffer {
+    /// Release this buffer back to the pool by marking the ticket complete.
+    ///
+    /// After calling this, the underlying SharedBuffer will be eligible for
+    /// re-acquisition on the next `pool.acquire()` call.
+    pub fn release(self) {
+        // Marking both flags makes `is_safe_to_free()` return true,
+        // which in turn makes `SharedBuffer::is_available()` return true.
+        self.ticket.mark_gpu_complete();
+        self.ticket.mark_rdma_complete();
+    }
+}
+
+impl Drop for AcquiredBuffer {
+    fn drop(&mut self) {
+        // Auto-release on drop: mark the ticket complete so the buffer
+        // returns to the pool.
+        self.ticket.mark_gpu_complete();
+        self.ticket.mark_rdma_complete();
+    }
+}
+
+/// Result type for paired send/recv buffer acquisition.
+pub type SendRecvBuffers = (Vec<Option<AcquiredBuffer>>, Vec<Option<AcquiredBuffer>>);
 
 /// Unified hub connecting transport, progress engine, shared buffers,
 /// GPU events, and the descriptor proxy for EP runtime operation.
@@ -189,10 +238,215 @@ impl EpRuntimeContext {
     pub fn transfer_event(&self) -> &Arc<GpuEvent> {
         &self.transfer_event
     }
+
+    /// Acquire paired send/recv SharedBuffers from the pool for each peer.
+    ///
+    /// Returns two vectors indexed by rank:
+    /// - `send_bufs[rank]` — buffer for sending to that peer (None for self-rank)
+    /// - `recv_bufs[rank]` — buffer for receiving from that peer (None for self-rank)
+    ///
+    /// Each acquired buffer has a `CompletionTicket` attached that keeps the
+    /// underlying `SharedBuffer` marked as in-use. Dropping the `AcquiredBuffer`
+    /// (or calling `.release()`) marks the ticket complete, returning the buffer
+    /// to the pool.
+    ///
+    /// If `size` is 0, returns vectors of all `None` (no buffers acquired).
+    pub fn acquire_send_recv_buffers(
+        &self,
+        size: usize,
+        world_size: usize,
+        local_rank: usize,
+    ) -> Result<SendRecvBuffers, crate::group::DistributedError> {
+        if size == 0 || world_size == 0 {
+            let empty: Vec<Option<AcquiredBuffer>> = (0..world_size).map(|_| None).collect();
+            let empty2: Vec<Option<AcquiredBuffer>> = (0..world_size).map(|_| None).collect();
+            return Ok((empty, empty2));
+        }
+
+        let mut pool = self.shared_pool.lock().map_err(|e| {
+            crate::group::DistributedError::Transport(format!(
+                "failed to lock SharedBufferPool: {e}"
+            ))
+        })?;
+
+        let mut send_bufs: Vec<Option<AcquiredBuffer>> = (0..world_size).map(|_| None).collect();
+        let mut recv_bufs: Vec<Option<AcquiredBuffer>> = (0..world_size).map(|_| None).collect();
+
+        for rank in 0..world_size {
+            if rank == local_rank {
+                continue;
+            }
+
+            // Acquire send buffer and attach a ticket to mark it in-use.
+            let send = pool.acquire(size).ok_or_else(|| {
+                crate::group::DistributedError::Transport(format!(
+                    "no send buffer available for peer {rank} (need {size} bytes)"
+                ))
+            })?;
+            let send_ticket = CompletionTicket::new();
+            send.set_ticket(send_ticket.clone());
+            send_bufs[rank] = Some(AcquiredBuffer {
+                ptr: send.as_ptr(),
+                size: send.size(),
+                slot_index: send.slot_index(),
+                ticket: send_ticket,
+            });
+
+            // Acquire recv buffer and attach a ticket to mark it in-use.
+            let recv = pool.acquire(size).ok_or_else(|| {
+                crate::group::DistributedError::Transport(format!(
+                    "no recv buffer available for peer {rank} (need {size} bytes)"
+                ))
+            })?;
+            let recv_ticket = CompletionTicket::new();
+            recv.set_ticket(recv_ticket.clone());
+            recv_bufs[rank] = Some(AcquiredBuffer {
+                ptr: recv.as_ptr(),
+                size: recv.size(),
+                slot_index: recv.slot_index(),
+                ticket: recv_ticket,
+            });
+        }
+
+        Ok((send_bufs, recv_bufs))
+    }
 }
 
 impl Drop for EpRuntimeContext {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmlx_rdma::shared_buffer::SharedBufferPool;
+
+    /// Helper: create a pool with the given tier sizes. Skips if no Metal device.
+    fn make_pool(tier_sizes: &[usize]) -> Option<SharedBufferPool> {
+        let device = metal::Device::system_default()?;
+        SharedBufferPool::new(&device, tier_sizes).ok()
+    }
+
+    #[test]
+    fn acquire_returns_correct_size_buffers_for_each_peer() {
+        let pool = match make_pool(&[4096, 16384, 65536]) {
+            Some(p) => p,
+            None => return, // skip on CI without Metal
+        };
+        let pool = Arc::new(Mutex::new(pool));
+        let device = metal::Device::system_default().unwrap();
+        let progress = Arc::new(rmlx_rdma::progress::ProgressEngine::new());
+        let transport = Arc::new(crate::transport::RdmaConnectionTransport::new(vec![], 0));
+
+        let ctx = EpRuntimeContext::new(transport, progress, pool, vec![], &device);
+
+        let world_size = 3;
+        let local_rank = 1;
+        let requested_size = 4096;
+
+        let (send_bufs, recv_bufs) = ctx
+            .acquire_send_recv_buffers(requested_size, world_size, local_rank)
+            .expect("acquire should succeed");
+
+        assert_eq!(send_bufs.len(), world_size);
+        assert_eq!(recv_bufs.len(), world_size);
+
+        // Self-rank should be None.
+        assert!(send_bufs[local_rank].is_none());
+        assert!(recv_bufs[local_rank].is_none());
+
+        // Peer ranks should have buffers with size >= requested.
+        for rank in 0..world_size {
+            if rank == local_rank {
+                continue;
+            }
+            let send = send_bufs[rank].as_ref().expect("send buf should exist");
+            assert!(
+                send.size >= requested_size,
+                "send size {} < {}",
+                send.size,
+                requested_size
+            );
+            let recv = recv_bufs[rank].as_ref().expect("recv buf should exist");
+            assert!(
+                recv.size >= requested_size,
+                "recv size {} < {}",
+                recv.size,
+                requested_size
+            );
+        }
+    }
+
+    #[test]
+    fn buffers_returned_to_pool_after_drop() {
+        // Create a pool with exactly 2 buffers per tier (PIPELINE=2).
+        // Acquiring 2 buffers should exhaust the tier; after drop they should
+        // be available again.
+        let pool = match make_pool(&[4096]) {
+            Some(p) => p,
+            None => return,
+        };
+        let pool = Arc::new(Mutex::new(pool));
+        let device = metal::Device::system_default().unwrap();
+        let progress = Arc::new(rmlx_rdma::progress::ProgressEngine::new());
+        let transport = Arc::new(crate::transport::RdmaConnectionTransport::new(vec![], 0));
+
+        let ctx = EpRuntimeContext::new(transport, progress, Arc::clone(&pool), vec![], &device);
+
+        // world_size=2, local_rank=0 => only peer rank 1 needs buffers (1 send + 1 recv = 2).
+        // PIPELINE=2, so the pool has exactly 2 buffers in the 4096 tier.
+        {
+            let (send_bufs, recv_bufs) = ctx
+                .acquire_send_recv_buffers(4096, 2, 0)
+                .expect("first acquire should succeed");
+
+            // Both buffers are now in use.
+            {
+                let mut locked = pool.lock().unwrap();
+                assert!(
+                    locked.acquire(4096).is_none(),
+                    "pool should be exhausted while buffers are held"
+                );
+            }
+
+            // Drop send and recv buffers (out of scope).
+            drop(send_bufs);
+            drop(recv_bufs);
+        }
+
+        // After drop, buffers should be available again.
+        {
+            let mut locked = pool.lock().unwrap();
+            assert!(
+                locked.acquire(4096).is_some(),
+                "pool should have buffers available after release"
+            );
+        }
+    }
+
+    #[test]
+    fn acquire_with_size_zero_returns_empty() {
+        let pool = match make_pool(&[4096]) {
+            Some(p) => p,
+            None => return,
+        };
+        let pool = Arc::new(Mutex::new(pool));
+        let device = metal::Device::system_default().unwrap();
+        let progress = Arc::new(rmlx_rdma::progress::ProgressEngine::new());
+        let transport = Arc::new(crate::transport::RdmaConnectionTransport::new(vec![], 0));
+
+        let ctx = EpRuntimeContext::new(transport, progress, pool, vec![], &device);
+
+        let (send_bufs, recv_bufs) = ctx
+            .acquire_send_recv_buffers(0, 4, 0)
+            .expect("zero-size acquire should succeed");
+
+        assert_eq!(send_bufs.len(), 4);
+        assert_eq!(recv_bufs.len(), 4);
+        // All should be None since size is 0.
+        assert!(send_bufs.iter().all(|b| b.is_none()));
+        assert!(recv_bufs.iter().all(|b| b.is_none()));
     }
 }

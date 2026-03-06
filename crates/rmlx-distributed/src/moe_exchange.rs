@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 
 use rmlx_rdma::shared_buffer::{ConnectionId, SharedBuffer};
 
-use crate::ep_runtime::EpRuntimeContext;
+use crate::ep_runtime::{AcquiredBuffer, EpRuntimeContext};
 use crate::transport::ZeroCopyPendingOp;
 // FP8 exchange functions are available for callers that set config.enable_fp8.
 // They operate on Array types and require KernelRegistry, so the actual
@@ -37,6 +37,43 @@ use crate::slab_ring::SlabRing;
 use crate::sparse_guard::{GuardAction, SparseGuard};
 use crate::transport::RdmaConnectionTransport;
 use crate::v3_protocol;
+
+/// Pre-acquired send/recv buffer pairs for EP dispatch/combine exchange.
+///
+/// Holds one send and one recv `AcquiredBuffer` per peer rank (indexed by rank,
+/// with `None` for self-rank). When dropped, all held buffers are automatically
+/// released back to the `SharedBufferPool` via their `CompletionTicket`s.
+pub struct ExchangeBuffers {
+    /// Send buffers indexed by rank. `None` for self-rank.
+    pub send_bufs: Vec<Option<AcquiredBuffer>>,
+    /// Recv buffers indexed by rank. `None` for self-rank.
+    pub recv_bufs: Vec<Option<AcquiredBuffer>>,
+    /// World size (number of ranks).
+    pub world_size: usize,
+    /// Local rank (self-rank, excluded from buffers).
+    pub local_rank: usize,
+}
+
+impl ExchangeBuffers {
+    /// Explicitly release all buffers back to the pool.
+    ///
+    /// This is equivalent to dropping the struct, but allows the caller to
+    /// control the release point precisely. After calling this, all buffer
+    /// slots are `None`.
+    pub fn release(&mut self) {
+        for buf in self.send_bufs.iter_mut() {
+            buf.take();
+        }
+        for buf in self.recv_bufs.iter_mut() {
+            buf.take();
+        }
+    }
+
+    /// Number of active peer buffer pairs (excludes self-rank).
+    pub fn peer_count(&self) -> usize {
+        self.send_bufs.iter().filter(|b| b.is_some()).count()
+    }
+}
 
 /// Safely read `n` bytes from a Metal buffer's contents.
 ///
@@ -763,6 +800,38 @@ impl MoeDispatchExchange {
     /// Current runtime capacity factor (may differ from baseline after guard actions).
     pub fn runtime_capacity_factor(&self) -> f32 {
         self.runtime_capacity_factor
+    }
+
+    /// Acquire pre-registered send/recv buffers from the runtime's SharedBufferPool.
+    ///
+    /// Returns an `ExchangeBuffers` struct holding one send and one recv buffer
+    /// per peer rank. Buffers are automatically returned to the pool when the
+    /// `ExchangeBuffers` is dropped (or explicitly via `release()`).
+    ///
+    /// Requires a runtime context to be attached via `with_runtime_context()`.
+    /// Returns an error if no runtime context is set or buffers cannot be acquired.
+    pub fn acquire_exchange_buffers(
+        &self,
+        payload_size: usize,
+    ) -> Result<ExchangeBuffers, DistributedError> {
+        let ctx = self.runtime_ctx.as_ref().ok_or_else(|| {
+            DistributedError::Transport(
+                "acquire_exchange_buffers: no runtime context attached".to_string(),
+            )
+        })?;
+
+        let world_size = self.config.group.size();
+        let local_rank = self.config.group.local_rank() as usize;
+
+        let (send_bufs, recv_bufs) =
+            ctx.acquire_send_recv_buffers(payload_size, world_size, local_rank)?;
+
+        Ok(ExchangeBuffers {
+            send_bufs,
+            recv_bufs,
+            world_size,
+            local_rank,
+        })
     }
 
     /// Dispatch tokens to experts based on routing decisions.
@@ -3036,6 +3105,7 @@ kernel void moe_combine(
         // With per-rank capacity packing, flat_slot != batch_idx, so we must
         // use route_indices to find the right row.
         let has_route_indices = !layout.route_indices.is_empty();
+        let (local_start, _local_end) = layout.local_expert_range;
 
         match layout.backend {
             MoeBackend::Cpu | MoeBackend::Metal => {
@@ -3048,6 +3118,7 @@ kernel void moe_combine(
                         hidden_dim,
                         &layout.route_indices,
                         indices,
+                        local_start,
                     ))
                 } else {
                     // Fallback to legacy batch_idx-based addressing
@@ -3103,6 +3174,7 @@ kernel void moe_combine(
         hidden_dim: usize,
         route_indices: &[i32],
         indices: &[u32],
+        local_start: usize,
     ) -> Vec<f32> {
         let mut output = vec![0.0f32; batch_size * hidden_dim];
 
@@ -3114,11 +3186,19 @@ kernel void moe_combine(
                 if slot < 0 {
                     continue;
                 }
-                let expert_idx = indices[flat_idx] as usize;
+                let global_expert_idx = indices[flat_idx] as usize;
                 let weight = weights[flat_idx];
 
-                if expert_idx < expert_outputs.len() {
-                    let expert_out = &expert_outputs[expert_idx];
+                // Convert global expert ID to local index (0-based within
+                // this rank's expert range) since expert_outputs only
+                // contains this rank's experts.
+                if global_expert_idx < local_start {
+                    continue;
+                }
+                let local_idx = global_expert_idx - local_start;
+
+                if local_idx < expert_outputs.len() {
+                    let expert_out = &expert_outputs[local_idx];
                     let out_base = batch_idx * hidden_dim;
                     let exp_base = (slot as usize) * hidden_dim;
                     if exp_base + hidden_dim <= expert_out.len() {
@@ -3159,7 +3239,7 @@ kernel void moe_combine(
     ) -> Result<AsyncCombineHandle, DistributedError> {
         global_counters().record_async_combine();
 
-        let (local_start, _local_end) = layout.local_expert_range;
+        let (_local_start, _local_end) = layout.local_expert_range;
         let experts_per_rank = layout.experts_per_rank;
         let cap = layout.tokens_per_expert; // per-rank capacity
         let segment_elems = cap * hidden_dim;
@@ -3184,12 +3264,12 @@ kernel void moe_combine(
                 if total_send_len > 0 && total_send_len <= send_buf.size() {
                     let send_ptr = send_buf.as_ptr();
                     for i in 0..experts_per_rank {
-                        let local_expert_idx = local_start + i;
+                        // local_expert_outputs is 0-indexed (contains only this
+                        // rank's experts), so index with `i` directly, not
+                        // `local_start + i` (which is the global expert ID).
                         let buf_offset = i * segment_bytes;
-                        if local_expert_idx < local_expert_outputs.len()
-                            && !local_expert_outputs[local_expert_idx].is_empty()
-                        {
-                            let src = &local_expert_outputs[local_expert_idx];
+                        if i < local_expert_outputs.len() && !local_expert_outputs[i].is_empty() {
+                            let src = &local_expert_outputs[i];
                             let seg_start = pr * segment_elems;
                             let seg_end = (seg_start + segment_elems).min(src.len());
                             let copy_elems = if seg_start < src.len() {
@@ -3452,5 +3532,426 @@ mod tests {
             msg.contains("exceeds SharedBuffer size"),
             "error message: {msg}"
         );
+    }
+
+    // ---- EP dispatch/combine correctness tests (D-P0-2, D-P0-4) ----
+
+    /// Helper: build a single-rank MoeCombineExchange for unit tests.
+    fn make_single_rank_combine() -> MoeCombineExchange {
+        let group = Group::new(vec![0], 0, 1).expect("single-rank group");
+        MoeCombineExchange::new(group)
+    }
+
+    /// Helper: build a DispatchLayout for testing combine_with_layout.
+    fn make_test_layout(
+        batch_size: usize,
+        _top_k: usize,
+        num_experts: usize,
+        local_start: usize,
+        experts_per_rank: usize,
+        route_indices: Vec<i32>,
+        expert_indices: Vec<u32>,
+    ) -> DispatchLayout {
+        DispatchLayout {
+            backend: MoeBackend::Cpu,
+            expert_counts: vec![0; num_experts],
+            tokens_per_expert: batch_size, // capacity = batch_size for simplicity
+            local_expert_range: (local_start, local_start + experts_per_rank),
+            token_stride: 0,
+            experts_per_rank,
+            batch_size,
+            expert_indices: expert_indices.clone(),
+            peer_payload_sizes: vec![],
+            route_indices,
+        }
+    }
+
+    #[test]
+    fn combine_with_route_indices_global_to_local_mapping() {
+        // Scenario: 4 global experts, rank 1 owns experts 2 and 3.
+        // local_expert_outputs has 2 entries (index 0 = global expert 2,
+        // index 1 = global expert 3).
+        let combiner = make_single_rank_combine();
+        let hidden_dim = 2;
+        let batch_size = 2;
+        let top_k = 1;
+        let local_start = 2; // rank 1 owns experts [2, 4)
+        let experts_per_rank = 2;
+        let num_experts = 4;
+
+        // local_expert_outputs[0] = expert 2 output, local_expert_outputs[1] = expert 3 output
+        // Each expert buffer has `batch_size * hidden_dim` elements.
+        // Using route_indices: token 0 -> slot 0, token 1 -> slot 1
+        let expert_2_out = vec![1.0, 2.0, 3.0, 4.0]; // slot 0: [1,2], slot 1: [3,4]
+        let expert_3_out = vec![10.0, 20.0, 30.0, 40.0];
+        let local_expert_outputs = vec![expert_2_out, expert_3_out];
+
+        // Token 0 -> global expert 2 (slot 0), Token 1 -> global expert 3 (slot 1)
+        let indices = vec![2u32, 3u32];
+        let weights = vec![0.5f32, 0.8f32];
+        let route_indices = vec![0i32, 1i32]; // slot assignments
+
+        let layout = make_test_layout(
+            batch_size,
+            top_k,
+            num_experts,
+            local_start,
+            experts_per_rank,
+            route_indices,
+            indices.clone(),
+        );
+
+        let result = combiner
+            .combine_with_layout(
+                &local_expert_outputs,
+                &weights,
+                &indices,
+                batch_size,
+                top_k,
+                hidden_dim,
+                num_experts,
+                &layout,
+            )
+            .expect("combine_with_layout should succeed");
+
+        // Token 0: weight 0.5 * expert_2[slot 0] = 0.5 * [1, 2] = [0.5, 1.0]
+        // Token 1: weight 0.8 * expert_3[slot 1] = 0.8 * [30, 40] = [24.0, 32.0]
+        assert_eq!(result.len(), batch_size * hidden_dim);
+        let eps = 1e-6;
+        assert!(
+            (result[0] - 0.5).abs() < eps,
+            "token 0, dim 0: {}",
+            result[0]
+        );
+        assert!(
+            (result[1] - 1.0).abs() < eps,
+            "token 0, dim 1: {}",
+            result[1]
+        );
+        assert!(
+            (result[2] - 24.0).abs() < eps,
+            "token 1, dim 0: {}",
+            result[2]
+        );
+        assert!(
+            (result[3] - 32.0).abs() < eps,
+            "token 1, dim 1: {}",
+            result[3]
+        );
+    }
+
+    #[test]
+    fn combine_with_route_indices_top2_accumulation() {
+        // Scenario: top_k=2, each token routed to 2 experts.
+        // Tests that weighted outputs are correctly accumulated.
+        let combiner = make_single_rank_combine();
+        let hidden_dim = 2;
+        let batch_size = 1;
+        let top_k = 2;
+        let local_start = 0;
+        let experts_per_rank = 2;
+        let num_experts = 2;
+
+        // Expert 0: slot 0 -> [1, 2], Expert 1: slot 0 -> [10, 20]
+        let expert_0_out = vec![1.0, 2.0];
+        let expert_1_out = vec![10.0, 20.0];
+        let local_expert_outputs = vec![expert_0_out, expert_1_out];
+
+        // Token 0 -> expert 0 (slot 0, weight 0.6) and expert 1 (slot 0, weight 0.4)
+        let indices = vec![0u32, 1u32];
+        let weights = vec![0.6f32, 0.4f32];
+        let route_indices = vec![0i32, 0i32];
+
+        let layout = make_test_layout(
+            batch_size,
+            top_k,
+            num_experts,
+            local_start,
+            experts_per_rank,
+            route_indices,
+            indices.clone(),
+        );
+
+        let result = combiner
+            .combine_with_layout(
+                &local_expert_outputs,
+                &weights,
+                &indices,
+                batch_size,
+                top_k,
+                hidden_dim,
+                num_experts,
+                &layout,
+            )
+            .expect("combine_with_layout should succeed");
+
+        // output = 0.6 * [1, 2] + 0.4 * [10, 20] = [0.6+4.0, 1.2+8.0] = [4.6, 9.2]
+        let eps = 1e-5;
+        assert!((result[0] - 4.6).abs() < eps, "dim 0: {}", result[0]);
+        assert!((result[1] - 9.2).abs() < eps, "dim 1: {}", result[1]);
+    }
+
+    #[test]
+    fn combine_with_route_indices_dropped_tokens() {
+        // Tokens with route_indices == -1 should be skipped (zero output).
+        let combiner = make_single_rank_combine();
+        let hidden_dim = 2;
+        let batch_size = 2;
+        let top_k = 1;
+        let local_start = 0;
+        let experts_per_rank = 1;
+        let num_experts = 1;
+
+        let expert_0_out = vec![5.0, 6.0, 7.0, 8.0];
+        let local_expert_outputs = vec![expert_0_out];
+
+        let indices = vec![0u32, 0u32];
+        let weights = vec![1.0f32, 1.0f32];
+        // Token 0 -> slot 0, Token 1 -> dropped (-1)
+        let route_indices = vec![0i32, -1i32];
+
+        let layout = make_test_layout(
+            batch_size,
+            top_k,
+            num_experts,
+            local_start,
+            experts_per_rank,
+            route_indices,
+            indices.clone(),
+        );
+
+        let result = combiner
+            .combine_with_layout(
+                &local_expert_outputs,
+                &weights,
+                &indices,
+                batch_size,
+                top_k,
+                hidden_dim,
+                num_experts,
+                &layout,
+            )
+            .expect("combine_with_layout should succeed");
+
+        let eps = 1e-6;
+        // Token 0: 1.0 * [5, 6] = [5.0, 6.0]
+        assert!(
+            (result[0] - 5.0).abs() < eps,
+            "token 0, dim 0: {}",
+            result[0]
+        );
+        assert!(
+            (result[1] - 6.0).abs() < eps,
+            "token 0, dim 1: {}",
+            result[1]
+        );
+        // Token 1: dropped, should be zero
+        assert!(
+            (result[2]).abs() < eps,
+            "token 1, dim 0 should be 0: {}",
+            result[2]
+        );
+        assert!(
+            (result[3]).abs() < eps,
+            "token 1, dim 1 should be 0: {}",
+            result[3]
+        );
+    }
+
+    #[test]
+    fn combine_with_route_indices_empty_expert_outputs() {
+        // When local_expert_outputs is empty, output should be all zeros.
+        let combiner = make_single_rank_combine();
+        let hidden_dim = 2;
+        let batch_size = 1;
+        let top_k = 1;
+        let local_start = 0;
+        let experts_per_rank = 0;
+        let num_experts = 2;
+
+        let local_expert_outputs: Vec<Vec<f32>> = vec![];
+        let indices = vec![0u32];
+        let weights = vec![1.0f32];
+        let route_indices = vec![0i32];
+
+        let layout = make_test_layout(
+            batch_size,
+            top_k,
+            num_experts,
+            local_start,
+            experts_per_rank,
+            route_indices,
+            indices.clone(),
+        );
+
+        let result = combiner
+            .combine_with_layout(
+                &local_expert_outputs,
+                &weights,
+                &indices,
+                batch_size,
+                top_k,
+                hidden_dim,
+                num_experts,
+                &layout,
+            )
+            .expect("combine_with_layout should succeed");
+
+        // No experts to combine, output should be zeros
+        assert!(
+            result.iter().all(|&x| x == 0.0),
+            "expected all zeros: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn combine_with_route_indices_all_tokens_one_expert() {
+        // All tokens assigned to a single expert (stress test for slot indexing).
+        let combiner = make_single_rank_combine();
+        let hidden_dim = 3;
+        let batch_size = 3;
+        let top_k = 1;
+        let local_start = 1; // rank owns expert 1 only
+        let experts_per_rank = 1;
+        let num_experts = 2;
+
+        // Expert 1's local output: 3 slots x 3 hidden_dim
+        let expert_1_out = vec![
+            1.0, 2.0, 3.0, // slot 0
+            4.0, 5.0, 6.0, // slot 1
+            7.0, 8.0, 9.0, // slot 2
+        ];
+        let local_expert_outputs = vec![expert_1_out];
+
+        // All tokens -> global expert 1, each at a different slot
+        let indices = vec![1u32, 1u32, 1u32];
+        let weights = vec![1.0f32, 0.5f32, 2.0f32];
+        let route_indices = vec![0i32, 1i32, 2i32];
+
+        let layout = make_test_layout(
+            batch_size,
+            top_k,
+            num_experts,
+            local_start,
+            experts_per_rank,
+            route_indices,
+            indices.clone(),
+        );
+
+        let result = combiner
+            .combine_with_layout(
+                &local_expert_outputs,
+                &weights,
+                &indices,
+                batch_size,
+                top_k,
+                hidden_dim,
+                num_experts,
+                &layout,
+            )
+            .expect("combine_with_layout should succeed");
+
+        let eps = 1e-6;
+        // Token 0: 1.0 * [1,2,3] = [1,2,3]
+        assert!((result[0] - 1.0).abs() < eps);
+        assert!((result[1] - 2.0).abs() < eps);
+        assert!((result[2] - 3.0).abs() < eps);
+        // Token 1: 0.5 * [4,5,6] = [2,2.5,3]
+        assert!((result[3] - 2.0).abs() < eps);
+        assert!((result[4] - 2.5).abs() < eps);
+        assert!((result[5] - 3.0).abs() < eps);
+        // Token 2: 2.0 * [7,8,9] = [14,16,18]
+        assert!((result[6] - 14.0).abs() < eps);
+        assert!((result[7] - 16.0).abs() < eps);
+        assert!((result[8] - 18.0).abs() < eps);
+    }
+
+    #[test]
+    fn combine_with_route_indices_out_of_range_expert_skipped() {
+        // If a token references an expert outside this rank's range,
+        // it should be safely skipped (no panic, zero contribution).
+        let combiner = make_single_rank_combine();
+        let hidden_dim = 2;
+        let batch_size = 2;
+        let top_k = 1;
+        let local_start = 2; // owns experts [2, 4)
+        let experts_per_rank = 2;
+        let num_experts = 4;
+
+        let expert_2_out = vec![1.0, 2.0, 3.0, 4.0];
+        let expert_3_out = vec![5.0, 6.0, 7.0, 8.0];
+        let local_expert_outputs = vec![expert_2_out, expert_3_out];
+
+        // Token 0 -> global expert 0 (not local, should be skipped)
+        // Token 1 -> global expert 3 (local, slot 0)
+        let indices = vec![0u32, 3u32];
+        let weights = vec![1.0f32, 1.0f32];
+        let route_indices = vec![0i32, 0i32];
+
+        let layout = make_test_layout(
+            batch_size,
+            top_k,
+            num_experts,
+            local_start,
+            experts_per_rank,
+            route_indices,
+            indices.clone(),
+        );
+
+        let result = combiner
+            .combine_with_layout(
+                &local_expert_outputs,
+                &weights,
+                &indices,
+                batch_size,
+                top_k,
+                hidden_dim,
+                num_experts,
+                &layout,
+            )
+            .expect("combine_with_layout should succeed");
+
+        let eps = 1e-6;
+        // Token 0: expert 0 is below local_start=2, skipped -> [0, 0]
+        assert!((result[0]).abs() < eps, "token 0 dim 0: {}", result[0]);
+        assert!((result[1]).abs() < eps, "token 0 dim 1: {}", result[1]);
+        // Token 1: expert 3 -> local_idx=1, slot 0 -> expert_3_out[0..2] = [5, 6]
+        assert!(
+            (result[2] - 5.0).abs() < eps,
+            "token 1 dim 0: {}",
+            result[2]
+        );
+        assert!(
+            (result[3] - 6.0).abs() < eps,
+            "token 1 dim 1: {}",
+            result[3]
+        );
+    }
+
+    #[test]
+    fn exchange_buffers_release_clears_all_slots() {
+        // ExchangeBuffers::release() should set all slots to None.
+        let mut eb = ExchangeBuffers {
+            send_bufs: (0..4).map(|_| None).collect(),
+            recv_bufs: (0..4).map(|_| None).collect(),
+            world_size: 4,
+            local_rank: 0,
+        };
+        assert_eq!(eb.peer_count(), 0);
+        eb.release();
+        assert!(eb.send_bufs.iter().all(|b| b.is_none()));
+        assert!(eb.recv_bufs.iter().all(|b| b.is_none()));
+    }
+
+    #[test]
+    fn exchange_buffers_peer_count_excludes_none() {
+        let eb = ExchangeBuffers {
+            send_bufs: (0..3).map(|_| None).collect(),
+            recv_bufs: (0..3).map(|_| None).collect(),
+            world_size: 3,
+            local_rank: 1,
+        };
+        assert_eq!(eb.peer_count(), 0);
     }
 }

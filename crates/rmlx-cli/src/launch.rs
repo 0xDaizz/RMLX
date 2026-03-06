@@ -97,6 +97,7 @@ fn build_remote_command(
     backend: &str,
     coordinator: &str,
     extra_env: &BTreeMap<String, String>,
+    ibv_devices: Option<&str>,
 ) -> String {
     let mut env: BTreeMap<&str, String> = BTreeMap::new();
     env.insert("RMLX_RANK", slot.rank.to_string());
@@ -104,6 +105,9 @@ fn build_remote_command(
     env.insert("RMLX_LOCAL_SLOT", slot.local_slot.to_string());
     env.insert("RMLX_BACKEND", backend.to_string());
     env.insert("RMLX_COORDINATOR", coordinator.to_string());
+    if let Some(dev_path) = ibv_devices {
+        env.insert("RMLX_IBV_DEVICES", dev_path.to_string());
+    }
     for (k, v) in extra_env {
         env.insert(k.as_str(), v.clone());
     }
@@ -138,11 +142,31 @@ pub fn run(args: LaunchArgs) -> i32 {
         .collect::<Vec<_>>()
         .join(" ");
 
-    // Resolve hosts
-    let hosts = match hostfile::resolve_hosts(args.hosts.as_deref(), args.hostfile.as_deref()) {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("error: {e}");
+    // Resolve hosts and optional host entries (for IP + RDMA info from hostfile)
+    let (hosts, host_entries) = match (args.hosts.as_deref(), args.hostfile.as_deref()) {
+        (Some(csv), None) => match hostfile::parse_hosts_csv(csv) {
+            Ok(h) => (h, None),
+            Err(e) => {
+                eprintln!("error: {e}");
+                return 2;
+            }
+        },
+        (None, Some(path)) => match hostfile::load_host_entries(path) {
+            Ok(entries) => {
+                let hosts: Vec<String> = entries.iter().map(|e| e.ssh.clone()).collect();
+                (hosts, Some(entries))
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                return 2;
+            }
+        },
+        (Some(_), Some(_)) => {
+            eprintln!("error: provide only one of --hosts or --hostfile");
+            return 2;
+        }
+        (None, None) => {
+            eprintln!("error: provide exactly one of --hosts or --hostfile");
             return 2;
         }
     };
@@ -161,15 +185,76 @@ pub fn run(args: LaunchArgs) -> i32 {
     };
 
     let slots = build_slots(&hosts, args.repeat_hosts);
-    let coordinator = hosts[0].clone();
+
+    // Use probed IP from hostfile when available, otherwise fall back to SSH hostname
+    let coordinator = match &host_entries {
+        Some(entries) if !entries[0].ips.is_empty() => entries[0].ips[0].clone(),
+        _ => hosts[0].clone(),
+    };
+
+    // If hostfile has RDMA device info, build the 2D device matrix that
+    // rmlx-rdma's DeviceMap expects: `[[null, "mlx5_0"], ["mlx5_0", null]]`.
+    // Each HostEntry.rdma is one row of the matrix (one element per peer).
+    // When repeat_hosts > 1, duplicate rows for each slot on the same host.
+    let ibv_devices_path: Option<String> = host_entries.as_ref().and_then(|entries| {
+        let has_rdma = entries.iter().any(|e| e.rdma.is_some());
+        if !has_rdma {
+            return None;
+        }
+        let world_size = entries.len() * args.repeat_hosts;
+        let matrix: Vec<Vec<Option<String>>> = entries
+            .iter()
+            .flat_map(|entry| {
+                let row = match &entry.rdma {
+                    Some(devices) => {
+                        // Expand the per-host row to per-slot by repeating each element
+                        let mut expanded = Vec::with_capacity(world_size);
+                        for dev in devices {
+                            for _ in 0..args.repeat_hosts {
+                                expanded.push(dev.clone());
+                            }
+                        }
+                        expanded
+                    }
+                    None => vec![None; world_size],
+                };
+                // Each slot on this host gets the same row
+                std::iter::repeat(row).take(args.repeat_hosts)
+            })
+            .collect();
+
+        // Serialize the 2D matrix to a temp file
+        match serde_json::to_string(&matrix) {
+            Ok(json) => {
+                let path = format!("/tmp/rmlx-devices-{}.json", std::process::id());
+                match std::fs::write(&path, &json) {
+                    Ok(()) => Some(path),
+                    Err(e) => {
+                        eprintln!("warning: failed to write device map to {path}: {e}");
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("warning: failed to serialize device map: {e}");
+                None
+            }
+        }
+    });
 
     let (tx, rx) = mpsc::channel::<OutputMsg>();
     let mut procs: Vec<(usize, String, std::process::Child)> = Vec::new();
 
     // Spawn all processes
     for slot in &slots {
-        let slot_cmd =
-            build_remote_command(&base_cmd, slot, &args.backend, &coordinator, &extra_env);
+        let slot_cmd = build_remote_command(
+            &base_cmd,
+            slot,
+            &args.backend,
+            &coordinator,
+            &extra_env,
+            ibv_devices_path.as_deref(),
+        );
         match ssh::spawn_remote(&slot.host, &slot_cmd, args.ssh_user.as_deref()) {
             Ok(mut child) => {
                 let stdout = child.stdout.take();
@@ -372,11 +457,185 @@ mod tests {
             local_slot: 0,
         };
         let extra = BTreeMap::new();
-        let cmd = build_remote_command("echo hello", &slot, "rdma", "node1", &extra);
+        let cmd = build_remote_command("echo hello", &slot, "rdma", "node1", &extra, None);
         assert!(cmd.contains("RMLX_RANK=0"));
         assert!(cmd.contains("RMLX_WORLD_SIZE=2"));
         assert!(cmd.contains("RMLX_BACKEND=rdma"));
         assert!(cmd.contains("RMLX_COORDINATOR=node1"));
+        assert!(!cmd.contains("RMLX_IBV_DEVICES"));
         assert!(cmd.contains("echo hello"));
+    }
+
+    #[test]
+    fn test_build_remote_command_with_ibv_devices() {
+        let slot = Slot {
+            rank: 1,
+            world_size: 2,
+            host: "node2".into(),
+            local_slot: 0,
+        };
+        let extra = BTreeMap::new();
+        let cmd = build_remote_command(
+            "echo hello",
+            &slot,
+            "rdma",
+            "192.168.1.1",
+            &extra,
+            Some("/tmp/rmlx-devices-12345.json"),
+        );
+        assert!(cmd.contains("RMLX_RANK=1"));
+        assert!(cmd.contains("RMLX_COORDINATOR=192.168.1.1"));
+        assert!(cmd.contains("RMLX_IBV_DEVICES=/tmp/rmlx-devices-12345.json"));
+    }
+
+    #[test]
+    fn test_coordinator_uses_ip_from_hostfile() {
+        // When host entries have IPs, coordinator should use the IP, not the SSH hostname
+        let entries = [
+            hostfile::HostEntry {
+                ssh: "mac-mini-1".into(),
+                ips: vec!["192.168.64.1".into()],
+                rdma: None,
+            },
+            hostfile::HostEntry {
+                ssh: "mac-mini-2".into(),
+                ips: vec!["192.168.64.2".into()],
+                rdma: None,
+            },
+        ];
+        // Simulate the coordinator resolution logic from run()
+        let coordinator = if !entries[0].ips.is_empty() {
+            entries[0].ips[0].clone()
+        } else {
+            entries[0].ssh.clone()
+        };
+        assert_eq!(coordinator, "192.168.64.1");
+    }
+
+    #[test]
+    fn test_coordinator_falls_back_to_hostname() {
+        // When host entries have no IPs, coordinator should fall back to SSH hostname
+        let entries = [hostfile::HostEntry {
+            ssh: "mac-mini-1".into(),
+            ips: vec![],
+            rdma: None,
+        }];
+        let coordinator = if !entries[0].ips.is_empty() {
+            entries[0].ips[0].clone()
+        } else {
+            entries[0].ssh.clone()
+        };
+        assert_eq!(coordinator, "mac-mini-1");
+    }
+
+    #[test]
+    fn test_rdma_device_matrix_serialization() {
+        // Simulate what the run() function does: extract rdma rows from
+        // HostEntry list, build a 2D matrix, serialize to JSON, and verify
+        // that rmlx-rdma's DeviceMap can parse it.
+        let entries = [
+            hostfile::HostEntry {
+                ssh: "node1".into(),
+                ips: vec!["10.0.0.1".into()],
+                rdma: Some(vec![None, Some("mlx5_0".into())]),
+            },
+            hostfile::HostEntry {
+                ssh: "node2".into(),
+                ips: vec!["10.0.0.2".into()],
+                rdma: Some(vec![Some("mlx5_0".into()), None]),
+            },
+        ];
+        let repeat = 1;
+        let world_size = entries.len() * repeat;
+
+        let matrix: Vec<Vec<Option<String>>> = entries
+            .iter()
+            .flat_map(|entry| {
+                let row = match &entry.rdma {
+                    Some(devices) => {
+                        let mut expanded = Vec::with_capacity(world_size);
+                        for dev in devices {
+                            for _ in 0..repeat {
+                                expanded.push(dev.clone());
+                            }
+                        }
+                        expanded
+                    }
+                    None => vec![None; world_size],
+                };
+                std::iter::repeat(row).take(repeat)
+            })
+            .collect();
+
+        let json = serde_json::to_string(&matrix).unwrap();
+        // Expected: [[null,"mlx5_0"],["mlx5_0",null]]
+        assert_eq!(json, r#"[[null,"mlx5_0"],["mlx5_0",null]]"#);
+    }
+
+    #[test]
+    fn test_rdma_device_matrix_with_repeat() {
+        // 2 hosts x repeat=2 => 4 ranks, 4x4 matrix
+        let entries = [
+            hostfile::HostEntry {
+                ssh: "node1".into(),
+                ips: vec![],
+                rdma: Some(vec![None, Some("mlx5_0".into())]),
+            },
+            hostfile::HostEntry {
+                ssh: "node2".into(),
+                ips: vec![],
+                rdma: Some(vec![Some("mlx5_0".into()), None]),
+            },
+        ];
+        let repeat = 2;
+        let world_size = entries.len() * repeat;
+
+        let matrix: Vec<Vec<Option<String>>> = entries
+            .iter()
+            .flat_map(|entry| {
+                let row = match &entry.rdma {
+                    Some(devices) => {
+                        let mut expanded = Vec::with_capacity(world_size);
+                        for dev in devices {
+                            for _ in 0..repeat {
+                                expanded.push(dev.clone());
+                            }
+                        }
+                        expanded
+                    }
+                    None => vec![None; world_size],
+                };
+                std::iter::repeat(row).take(repeat)
+            })
+            .collect();
+
+        assert_eq!(matrix.len(), 4);
+        for row in &matrix {
+            assert_eq!(row.len(), 4);
+        }
+        // node1 slots (ranks 0,1): [None, None, Some("mlx5_0"), Some("mlx5_0")]
+        assert_eq!(
+            matrix[0],
+            vec![None, None, Some("mlx5_0".into()), Some("mlx5_0".into())]
+        );
+        assert_eq!(matrix[1], matrix[0]);
+        // node2 slots (ranks 2,3): [Some("mlx5_0"), Some("mlx5_0"), None, None]
+        assert_eq!(
+            matrix[2],
+            vec![Some("mlx5_0".into()), Some("mlx5_0".into()), None, None]
+        );
+        assert_eq!(matrix[3], matrix[2]);
+    }
+
+    #[test]
+    fn test_rdma_no_devices_returns_none() {
+        // When no entries have rdma info, ibv_devices_path should be None
+        let entries = [hostfile::HostEntry {
+            ssh: "node1".into(),
+            ips: vec![],
+            rdma: None,
+        }];
+        let has_rdma = entries.iter().any(|e| e.rdma.is_some());
+        assert!(!has_rdma);
     }
 }

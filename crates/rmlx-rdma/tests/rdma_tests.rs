@@ -448,6 +448,7 @@ fn test_rdma_error_display_all_variants() {
         RdmaError::Timeout("test".into()),
         RdmaError::Unavailable("test".into()),
         RdmaError::InvalidArgument("test".into()),
+        RdmaError::DataCorruption("test".into()),
     ];
 
     for err in &errors {
