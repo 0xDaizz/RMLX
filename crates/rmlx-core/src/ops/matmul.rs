@@ -356,22 +356,185 @@ kernel void gemm_simd_f32(
     // We need to store with bounds checking. simdgroup_store writes an 8x8
     // block, so we need the destination to be valid. For simplicity, store
     // to threadgroup memory first, then scatter to global with bounds check.
-    threadgroup float result_tile[8 * 8];
-    simdgroup_store(acc, &result_tile[0], 8);
-
-    // Only lane 0..63 need to participate but simdgroup_store distributes
-    // across all lanes. Each lane writes its assigned elements.
-    // After store, each element of result_tile is valid.
+    threadgroup float result_tiles[16][64];
+    simdgroup_store(acc, &result_tiles[sgid][0], 8);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Scatter from result_tile to C with bounds checking (use all lanes in simdgroup)
     for (uint idx = lane_id; idx < 64; idx += 32) {
         uint lr = idx / 8;
         uint lc = idx % 8;
         uint gr = out_row + lr;
         uint gc = out_col + lc;
         if (gr < M && gc < N) {
-            C_batch[gr * N + gc] = result_tile[lr * 8 + lc];
+            C_batch[gr * N + gc] = result_tiles[sgid][lr * 8 + lc];
+        }
+    }
+}
+
+kernel void gemm_simd_f16(
+    device const half* A [[buffer(0)]],
+    device const half* B [[buffer(1)]],
+    device half* C       [[buffer(2)]],
+    constant uint& M      [[buffer(3)]],
+    constant uint& N      [[buffer(4)]],
+    constant uint& K      [[buffer(5)]],
+    constant uint& batch_stride_a [[buffer(6)]],
+    constant uint& batch_stride_b [[buffer(7)]],
+    constant uint& batch_stride_c [[buffer(8)]],
+    uint3 group_id        [[threadgroup_position_in_grid]],
+    uint  tid_in_group    [[thread_index_in_threadgroup]],
+    uint  sgid            [[simdgroup_index_in_threadgroup]],
+    uint  lane_id         [[thread_index_in_simdgroup]])
+{
+    const uint sg_cols = BN / 8;
+    const uint sg_row = sgid / sg_cols;
+    const uint sg_col = sgid % sg_cols;
+
+    if (sg_row >= BM / 8) return;
+
+    const uint batch_idx = group_id.z;
+    const uint row_start = group_id.y * BM;
+    const uint col_start = group_id.x * BN;
+
+    device const half* A_batch = A + batch_idx * batch_stride_a;
+    device const half* B_batch = B + batch_idx * batch_stride_b;
+    device half*       C_batch = C + batch_idx * batch_stride_c;
+
+    threadgroup float As[BM * BK];
+    threadgroup float Bs[BK * BN];
+
+    simdgroup_float8x8 acc;
+    acc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    const uint n_threads = BM * BN;
+
+    for (uint kb = 0; kb < K; kb += BK) {
+        for (uint idx = tid_in_group; idx < BM * BK; idx += n_threads) {
+            uint r = idx / BK;
+            uint c = idx % BK;
+            uint gr = row_start + r;
+            uint gc = kb + c;
+            As[r * BK + c] = (gr < M && gc < K) ? float(A_batch[gr * K + gc]) : 0.0f;
+        }
+        for (uint idx = tid_in_group; idx < BK * BN; idx += n_threads) {
+            uint r = idx / BN;
+            uint c = idx % BN;
+            uint gr = kb + r;
+            uint gc = col_start + c;
+            Bs[r * BN + c] = (gr < K && gc < N) ? float(B_batch[gr * N + gc]) : 0.0f;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint kk = 0; kk < BK; kk += 8) {
+            simdgroup_float8x8 a_tile;
+            simdgroup_float8x8 b_tile;
+            simdgroup_load(a_tile, &As[sg_row * 8 * BK + kk], BK);
+            simdgroup_load(b_tile, &Bs[kk * BN + sg_col * 8], BN);
+            simdgroup_multiply_accumulate(acc, a_tile, b_tile, acc);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    uint out_row = row_start + sg_row * 8;
+    uint out_col = col_start + sg_col * 8;
+
+    threadgroup float result_tiles[16][64];
+    simdgroup_store(acc, &result_tiles[sgid][0], 8);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint idx = lane_id; idx < 64; idx += 32) {
+        uint lr = idx / 8;
+        uint lc = idx % 8;
+        uint gr = out_row + lr;
+        uint gc = out_col + lc;
+        if (gr < M && gc < N) {
+            C_batch[gr * N + gc] = half(result_tiles[sgid][lr * 8 + lc]);
+        }
+    }
+}
+
+kernel void gemm_simd_bf16(
+    device const bfloat* A [[buffer(0)]],
+    device const bfloat* B [[buffer(1)]],
+    device bfloat* C       [[buffer(2)]],
+    constant uint& M      [[buffer(3)]],
+    constant uint& N      [[buffer(4)]],
+    constant uint& K      [[buffer(5)]],
+    constant uint& batch_stride_a [[buffer(6)]],
+    constant uint& batch_stride_b [[buffer(7)]],
+    constant uint& batch_stride_c [[buffer(8)]],
+    uint3 group_id        [[threadgroup_position_in_grid]],
+    uint  tid_in_group    [[thread_index_in_threadgroup]],
+    uint  sgid            [[simdgroup_index_in_threadgroup]],
+    uint  lane_id         [[thread_index_in_simdgroup]])
+{
+    const uint sg_cols = BN / 8;
+    const uint sg_row = sgid / sg_cols;
+    const uint sg_col = sgid % sg_cols;
+
+    if (sg_row >= BM / 8) return;
+
+    const uint batch_idx = group_id.z;
+    const uint row_start = group_id.y * BM;
+    const uint col_start = group_id.x * BN;
+
+    device const bfloat* A_batch = A + batch_idx * batch_stride_a;
+    device const bfloat* B_batch = B + batch_idx * batch_stride_b;
+    device bfloat*       C_batch = C + batch_idx * batch_stride_c;
+
+    threadgroup float As[BM * BK];
+    threadgroup float Bs[BK * BN];
+
+    simdgroup_float8x8 acc;
+    acc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    const uint n_threads = BM * BN;
+
+    for (uint kb = 0; kb < K; kb += BK) {
+        for (uint idx = tid_in_group; idx < BM * BK; idx += n_threads) {
+            uint r = idx / BK;
+            uint c = idx % BK;
+            uint gr = row_start + r;
+            uint gc = kb + c;
+            As[r * BK + c] = (gr < M && gc < K) ? float(A_batch[gr * K + gc]) : 0.0f;
+        }
+        for (uint idx = tid_in_group; idx < BK * BN; idx += n_threads) {
+            uint r = idx / BN;
+            uint c = idx % BN;
+            uint gr = kb + r;
+            uint gc = col_start + c;
+            Bs[r * BN + c] = (gr < K && gc < N) ? float(B_batch[gr * N + gc]) : 0.0f;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint kk = 0; kk < BK; kk += 8) {
+            simdgroup_float8x8 a_tile;
+            simdgroup_float8x8 b_tile;
+            simdgroup_load(a_tile, &As[sg_row * 8 * BK + kk], BK);
+            simdgroup_load(b_tile, &Bs[kk * BN + sg_col * 8], BN);
+            simdgroup_multiply_accumulate(acc, a_tile, b_tile, acc);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    uint out_row = row_start + sg_row * 8;
+    uint out_col = col_start + sg_col * 8;
+
+    threadgroup float result_tiles[16][64];
+    simdgroup_store(acc, &result_tiles[sgid][0], 8);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint idx = lane_id; idx < 64; idx += 32) {
+        uint lr = idx / 8;
+        uint lc = idx % 8;
+        uint gr = out_row + lr;
+        uint gc = out_col + lc;
+        if (gr < M && gc < N) {
+            C_batch[gr * N + gc] = bfloat(result_tiles[sgid][lr * 8 + lc]);
         }
     }
 }
@@ -660,6 +823,8 @@ pub enum TileVariant {
     Small,
     /// 32x32x16 tiles (default).
     Medium,
+    /// 32x32x16 tiles with simdgroup MMA (for M>=64 && N>=64).
+    Simd,
 }
 
 /// Select the best tile configuration based on matrix dimensions.
@@ -676,6 +841,12 @@ pub fn select_tile_config(m: usize, n: usize, _k: usize) -> TileConfig {
             bm: 16,
             bn: 16,
             variant: TileVariant::Small,
+        }
+    } else if m >= 64 && n >= 64 {
+        TileConfig {
+            bm: 32,
+            bn: 32,
+            variant: TileVariant::Simd,
         }
     } else {
         TileConfig {
@@ -970,6 +1141,9 @@ fn dispatch_tiled_gemm(
         (TileVariant::Small, DType::Float32) => "gemm_small_f32",
         (TileVariant::Small, DType::Float16) => "gemm_small_f16",
         (TileVariant::Small, DType::Bfloat16) => "gemm_small_bf16",
+        (TileVariant::Simd, DType::Float32) => "gemm_simd_f32",
+        (TileVariant::Simd, DType::Float16) => "gemm_simd_f16",
+        (TileVariant::Simd, DType::Bfloat16) => "gemm_simd_bf16",
         (TileVariant::Medium, DType::Float32) => "gemm_tiled_f32",
         (TileVariant::Medium, DType::Float16) => "gemm_tiled_f16",
         (TileVariant::Medium, DType::Bfloat16) => "gemm_tiled_bf16",
@@ -1125,14 +1299,14 @@ mod tests {
         let cfg = select_tile_config(128, 128, 64);
         assert_eq!(cfg.bm, 32);
         assert_eq!(cfg.bn, 32);
-        assert_eq!(cfg.variant, TileVariant::Medium);
+        assert_eq!(cfg.variant, TileVariant::Simd);
     }
 
     #[test]
     fn test_select_tile_config_boundary() {
-        // M=64 is not < 64, so should be Medium
+        // M=64 and N=64 -> Simd
         let cfg = select_tile_config(64, 64, 64);
-        assert_eq!(cfg.variant, TileVariant::Medium);
+        assert_eq!(cfg.variant, TileVariant::Simd);
 
         // M=63, N=63 -> Small
         let cfg = select_tile_config(63, 63, 64);
@@ -1143,6 +1317,26 @@ mod tests {
     fn test_select_tile_config_mixed() {
         // M < 64 but N >= 64 -> Medium (both must be < 64 for Small)
         let cfg = select_tile_config(32, 128, 64);
+        assert_eq!(cfg.variant, TileVariant::Medium);
+    }
+
+    #[test]
+    fn test_select_tile_config_simd() {
+        // Both M >= 64 and N >= 64 -> Simd
+        let cfg = select_tile_config(128, 128, 128);
+        assert_eq!(cfg.bm, 32);
+        assert_eq!(cfg.bn, 32);
+        assert_eq!(cfg.variant, TileVariant::Simd);
+
+        // Exactly at boundary
+        let cfg = select_tile_config(64, 64, 128);
+        assert_eq!(cfg.variant, TileVariant::Simd);
+
+        // One dim < 64 -> Medium, not Simd
+        let cfg = select_tile_config(128, 32, 128);
+        assert_eq!(cfg.variant, TileVariant::Medium);
+
+        let cfg = select_tile_config(32, 128, 128);
         assert_eq!(cfg.variant, TileVariant::Medium);
     }
 

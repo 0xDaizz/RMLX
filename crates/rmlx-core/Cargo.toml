@@ -10,3 +10,7 @@ rmlx-metal = { path = "../rmlx-metal" }
 rmlx-alloc = { path = "../rmlx-alloc" }
 metal = { workspace = true }
 tracing = { workspace = true }
+
+[[bench]]
+name = "ops_bench"
+harness = false

@@ -1,4 +1,4 @@
-# Implementation Roadmap — Phases 0-9B + S1-S5 + Audit Remediation + Phase 3 + Phase 4 + Phase 5 Complete
+# Implementation Roadmap — Phases 0-9B + S1-S5 + Audit Remediation + Phase 3 + Phase 4 + Phase 5 Complete + Phase KO
 
 The rmlx project implementation roadmap. All phases through 9B-opt and serving support phases S1-S5 are complete. A full-crate audit (Phases 0, 1, 2) has been completed with 76 remediation items resolved across all 6 crates. Phase 3 adds FlashAttention-2 Metal kernel, paged KV cache, continuous batching scheduler, centralized CB commit, f16/bf16 RDMA collectives, ring allreduce chunk rounding fix, MoePolicy thread safety, and CLI signal forwarding. Phase 4 adds performance and allocator improvements: atomic CAS allocation limits, pointer ownership validation, SmallBufferPool/LeakDetector/ResidencyManager wiring, ChipTuning per-generation GPU tuning, DiskPipelineCache with sha2 hashing, HazardTrackingModeUntracked, fused RMSNorm+residual add kernel, gather_mm batched MoE strategy, SlabRing condvar backpressure, ProgressEngine EP dispatch wiring, ICB sparse expert dispatch, and BFC-style allocator. Phase 5 (Feature Breadth) adds 5 new core ops (slice, sort, scan, argreduce, random), 11 new activations (16 total), full MLA and SlidingWindowAttention forward implementations, AWQ/GPTQ/K-quant quantization layers, prefix cache, chunked prefill, 4 full model architectures (LlamaModel, Qwen2Model, DeepSeekV3Model, MixtralModel), tree allreduce with auto selection, pipelined ring buffer, and topology-aware CLI backend selection. Current test count: 1,142+.
 
@@ -55,6 +55,9 @@ The rmlx project implementation roadmap. All phases through 9B-opt and serving s
 | P4-11 | ICB Sparse Expert Dispatch | grouped_forward_icb(), IcbReplay per-sparsity cache, forward_sparse_icb() | P4-8 + P4-10 | Complete |
 | P4-12 | BFC Allocator | BfcAllocator with block splitting, coalescing, best-fit BTreeMap | P4-1+2 | Complete |
 | Phase 5 | Feature Breadth | 5 new core ops (slice/sort/scan/argreduce/random), 16 activations, full MLA+SlidingWindow forward, AWQ/GPTQ/K-quant, prefix cache, chunked prefill, 4 model architectures, tree allreduce, pipelined ring buffer, topology-aware CLI | P4 | Complete |
+| KO | Kernel Optimization | 9-dispatch decode, per-kernel efficiency, 77x speedup | Phase 6 (Infra) | Track 1 mostly complete, Track 2 partial |
+| KO-2 | Decode Scratch Allocator | Pre-allocated workspace, bump alloc, StorageModePrivate | KO | Planned |
+| KO-3 | ICB Decode Replay | Record/replay 9-dispatch via Metal ICB, dynamic setBytes | KO + KO-2 | Planned |
 | EP-7 | ICB Full Metal Indirect Dispatch | Wire SparseExpertPlan into ExpertGroup GEMM encoding via Metal ICB indirect dispatch; skip empty experts at GPU command level | EP-6 | Planned |
 
 ---
@@ -115,6 +118,9 @@ The rmlx project implementation roadmap. All phases through 9B-opt and serving s
 | P4-11: ICB Sparse Expert Dispatch | feat/phase4 (merged) | 1,003 tests | Complete |
 | P4-12: BFC Allocator | feat/phase4 (merged) | 1,003 tests | Complete |
 | Phase 5: Feature Breadth | feat/phase5-feature-breadth (merged) | 1,142 tests | Complete |
+| Phase KO: Kernel Optimization (Track 1) | main | 1,142+ tests | In Progress |
+| Phase KO-2: Decode Scratch Allocator | -- | -- | Planned |
+| Phase KO-3: ICB Decode Replay | -- | -- | Planned |
 | EP-7: ICB Full Metal Indirect Dispatch | -- | -- | Planned |
 
 ---
@@ -133,6 +139,7 @@ graph LR
     P7["Phase 7<br/>Production<br/>Complete"]
     P8["Phase 8<br/>KV Cache + API<br/>Complete"]
     P9["Phase 9<br/>GPU Pipeline<br/>Complete"]
+    PKO["Phase KO<br/>Kernel Optimization<br/>In Progress"]
 
     P0 --> P1
     P0 --> P2
@@ -144,6 +151,7 @@ graph LR
     P5A --> P7
     P7 --> P8
     P8 --> P9
+    P9 --> PKO
 
     PS1["Phase S1<br/>Quick Wins<br/>Complete"]
     PS2["Phase S2<br/>DType + Quant<br/>Complete"]
@@ -167,6 +175,7 @@ graph LR
     style P7 fill:#22c55e,color:#fff
     style P8 fill:#22c55e,color:#fff
     style P9 fill:#22c55e,color:#fff
+    style PKO fill:#f59e0b,color:#fff
     style PS1 fill:#22c55e,color:#fff
     style PS2 fill:#22c55e,color:#fff
     style PS3 fill:#22c55e,color:#fff
@@ -491,6 +500,59 @@ Pre-cache contiguous transposed weight matrices to eliminate transpose overhead 
 
 ---
 
+## Phase KO: Kernel Optimization -- Track 1 Mostly Complete, Track 2 Partial
+
+### Goal
+
+Close the per-layer decode performance gap with MLX. Reduce decode latency from 109,215us (per-op sync baseline) to within 5% of MLX's compiled path (1,342us).
+
+### Track 1: Dispatch Reduction (109,215us to 1,411us)
+
+| Step | Technique | Latency (us) | Speedup |
+|------|-----------|-------------|---------|
+| Baseline | Per-op sync (65 CBs) | 109,215 | 1x |
+| KO-1a | ExecGraph multi-CB batching (5 CBs) | 2,735 | 40x |
+| KO-1b | Single-CB path (44 encoders) | 2,049 | 53x |
+| KO-1c | 9-dispatch decode path (merged QKV/gate_up, batched RoPE/SDPA, fused gemv_bias) | 1,411 | 77x |
+| KO-1d | Single encoder + memory barriers (9 enc to 4 enc) | 1,411 | 77x |
+| MLX | Compiled path | 1,342 | -- |
+| Gap | | 5.1% | |
+
+Additional optimizations in Track 1:
+- KV cache reuse: pre-allocate slab layout once, reset seq_len per iteration
+- StorageModePrivate for static weights (GPU-only, no CPU-side page table overhead)
+- Array::uninit for GPU output buffers (skip memset zero-fill)
+- Unretained command buffer on Metal 3+ (M2+) hardware
+
+### Track 2: Per-Kernel Efficiency (Partial)
+
+| Kernel | Optimization | Status |
+|--------|-------------|--------|
+| GEMV | BM=8 variant: 8 simdgroups handle 32 rows independently, auto-selected when M >= 256 | Complete |
+| matmul | SIMD group MMA: TileVariant::Simd with simdgroup_float8x8 for large matrices | Complete |
+| rms_norm | Register caching: N_READS=4 + cached[MAX_PER_THREAD] | Complete |
+| layer_norm | Single-pass: E[x^2]-E[x]^2 formula + register caching (3 reads to 1) | Complete |
+| softmax | N_READS coalescing: float4 vectorized loads in looped variant | Complete |
+| Kernel fusion | Prefill-only; not beneficial for decode (cross-threadgroup reduction incompatible with row-parallel GEMV) | Deferred |
+
+### Future Work
+
+- **KO-2: Scratch Allocator** -- Arena-based scratch memory for intermediate buffers within the 9-dispatch path
+- **KO-3: ICB Decode Replay** -- Metal Indirect Command Buffer capture-replay for the 9-dispatch decode path
+
+### Benchmark Results (M3 Ultra, f32, Llama-2 7B shapes)
+
+```text
+Baseline (per-op sync):  109,215us  1x
+ExecGraph (5 CB):          2,735us  40x
+Single-CB (44 enc):        2,049us  53x
+9-Dispatch (9->4 enc):     1,411us  77x
+MLX compiled:              1,342us  --
+Gap vs MLX:                5.1%
+```
+
+---
+
 ## Phase S3a: Flash Attention 2 — Complete (previously Phase 10)
 
 ### Goal
@@ -738,6 +800,67 @@ EP-6 implemented `SparseExpertPlan` and `IcbReplay` infrastructure. The current 
 ### Estimated Impact
 
 Low-to-moderate: saves ~tens of microseconds per forward when sparsity is high. Most beneficial for large expert counts (64+) with highly sparse routing patterns.
+
+---
+
+## Phase KO-2: Decode Scratch Allocator — Planned
+
+### Goal
+
+Eliminate per-token Metal buffer allocation overhead by pre-allocating a reusable workspace for decode intermediates.
+
+### Background
+
+Each decode step currently allocates ~8 intermediate Metal buffers (~240KB total: QKV output, RoPE output, SDPA output, norm output, gate_up output, silu_mul output, etc.). While `Array::uninit` removed the CPU memset cost, `device.new_buffer()` still incurs kernel-side allocation and page table overhead (~1us per call, ~8us total per decode step).
+
+### Key Deliverables
+
+- `DecodeWorkspace` struct: pre-allocated contiguous Metal buffer (~512KB) with bump allocator
+- `alloc(bytes) -> (Buffer, offset)`: O(1) bump allocation from workspace
+- `reset()`: resets bump pointer to 0 at start of each decode step
+- Integration: all `_into_cb` functions accept optional workspace for output allocation
+- Ring variant: N-slot rotation for pipelined decode (workspace[i % N])
+
+### Expected Impact
+
+- Eliminates ~8us/step allocation overhead (meaningful at 1000us target)
+- Reduces Metal resource tracking pressure (fewer buffer objects)
+- Enables `StorageModePrivate` for intermediates (GPU-only, no CPU mapping)
+
+### Prerequisites
+
+- Phase KO (9-dispatch path stabilized)
+
+---
+
+## Phase KO-3: ICB Decode Replay — Planned
+
+### Goal
+
+Use Metal Indirect Command Buffers (ICBs) to record and replay the static 9-dispatch decode sequence, eliminating per-step CPU command encoding overhead entirely.
+
+### Background
+
+After Phase KO reduces to 9 dispatches, the dispatch sequence becomes deterministic for a given model architecture (same kernels, same threadgroup sizes, same buffer bindings). Only the KV cache offset and position change per step. This makes ICBs viable: record once, replay N times, changing only the dynamic parameters via `setBytes`.
+
+### Key Deliverables
+
+- `DecodeIcb` struct: records the 9-dispatch sequence into a Metal ICB
+- Dynamic parameter update: per-step `setBytes` for rope offset, SDPA seq_len, KV cache position
+- `replay(cb)`: executes the pre-recorded ICB in a single `executeCommandsInBuffer` call
+- Cache invalidation: re-record when model config or sequence length class changes
+- Benchmark: measure CPU-side encoding time savings (target: <100us total CPU overhead per decode step)
+
+### Expected Impact
+
+- Reduces CPU command encoding from ~100us to ~10us per decode step
+- Single `executeCommandsInBuffer` call replaces 9 separate encoder create/dispatch/end cycles
+- Most beneficial for high-throughput serving (many concurrent sequences)
+
+### Prerequisites
+
+- Phase KO (9-dispatch path complete and benchmarked)
+- Phase KO-2 (scratch allocator for stable buffer addresses)
 
 ---
 

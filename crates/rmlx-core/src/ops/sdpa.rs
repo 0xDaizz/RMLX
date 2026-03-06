@@ -746,6 +746,226 @@ kernel void sdpa_f16(
         O[(q_start + i) * D + (D_lo + d)] = half(O_acc2[idx] * inv_l);
     }
 }
+
+// ─── sdpa_decode_batched_f32 ──────────────────────────────────────────────
+//
+// Batched multi-head decode: processes ALL attention heads in a single
+// GPU dispatch.  Grid.x = num_heads, one threadgroup per head.
+// Supports GQA (grouped query attention).
+//
+// Buffers:
+//   0: Q      [num_heads * D]              — flat query slab
+//   1: K      [num_kv_heads * S * D]       — flat key slab
+//   2: V      [num_kv_heads * S * D]       — flat value slab
+//   3: O      [num_heads * D]              — flat output slab
+//   4: mask   [S]                          — additive mask (shared, or dummy)
+//   5: params [6 x uint32]: { num_heads, num_kv_heads, S, D, has_mask, stride_S }
+//      stride_S: inter-head stride in KV slab (0 = same as S, >0 = max_seq_len for pre-allocated caches)
+//   6: scale  [float]
+//
+// Grid: (num_heads, 1, 1)
+// Threads per threadgroup: 256
+
+kernel void sdpa_decode_batched_f32(
+    device const float* Q         [[buffer(0)]],
+    device const float* K         [[buffer(1)]],
+    device const float* V         [[buffer(2)]],
+    device       float* O         [[buffer(3)]],
+    device const float* mask      [[buffer(4)]],
+    constant     uint*  params    [[buffer(5)]],
+    constant     float& scale     [[buffer(6)]],
+    uint  tid       [[thread_position_in_threadgroup]],
+    uint  lane_id   [[thread_index_in_simdgroup]],
+    uint  sg_id     [[simdgroup_index_in_threadgroup]],
+    uint  tg_pos    [[threadgroup_position_in_grid]])
+{
+    const uint head_id      = tg_pos;
+    const uint num_heads    = params[0];
+    const uint num_kv_heads = params[1];
+    const uint S            = params[2];
+    const uint D            = params[3];
+    const uint has_mask     = params[4];
+    const uint stride_S     = (params[5] > 0) ? params[5] : S;
+
+    if (head_id >= num_heads) return;
+
+    // GQA: map Q head to KV head
+    const uint kv_head = head_id * num_kv_heads / num_heads;
+
+    // Per-head pointers — use stride_S for inter-head offset (slab layout)
+    device const float* q = Q + head_id * D;
+    device const float* k = K + kv_head * stride_S * D;
+    device const float* v = V + kv_head * stride_S * D;
+    device       float* o = O + head_id * D;
+
+    const uint n_threads = 256;
+
+    threadgroup float reduce_buf[SIMD_SIZE];
+    threadgroup float O_shared[256];  // D <= 256
+
+    for (uint d = tid; d < D; d += n_threads) {
+        O_shared[d] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float m_running = -INFINITY;
+    float l_running = 0.0f;
+
+    const uint n_kv_blocks = (S + Bc - 1) / Bc;
+
+    for (uint kb = 0; kb < n_kv_blocks; kb++) {
+        const uint kv_start = kb * Bc;
+        const uint kv_end   = min(kv_start + Bc, S);
+        const uint kv_count = kv_end - kv_start;
+
+        float score = -INFINITY;
+        if (tid < kv_count) {
+            float dot = 0.0f;
+            for (uint d = 0; d < D; d++) {
+                dot += q[d] * k[(kv_start + tid) * D + d];
+            }
+            dot *= scale;
+            if (has_mask) {
+                dot += mask[kv_start + tid];
+            }
+            score = dot;
+        }
+
+        float block_max = tg_reduce_max(score, tid, lane_id, sg_id,
+                                        n_threads, reduce_buf);
+        float m_new = max(m_running, block_max);
+        float correction = fast::exp(m_running - m_new);
+        float exp_score = (tid < kv_count) ? fast::exp(score - m_new) : 0.0f;
+        float block_sum = tg_reduce_sum(exp_score, tid, lane_id, sg_id,
+                                        n_threads, reduce_buf);
+        float l_new = l_running * correction + block_sum;
+
+        threadgroup float exp_scores_shared[Bc];
+        if (tid < Bc) {
+            exp_scores_shared[tid] = (tid < kv_count) ? exp_score : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint d = tid; d < D; d += n_threads) {
+            float o_val = O_shared[d] * correction;
+            float v_sum = 0.0f;
+            for (uint j = 0; j < kv_count; j++) {
+                v_sum += exp_scores_shared[j] * v[(kv_start + j) * D + d];
+            }
+            O_shared[d] = o_val + v_sum;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        m_running = m_new;
+        l_running = l_new;
+    }
+
+    float inv_l = (l_running > 0.0f) ? (1.0f / l_running) : 0.0f;
+    for (uint d = tid; d < D; d += n_threads) {
+        o[d] = O_shared[d] * inv_l;
+    }
+}
+
+// ─── sdpa_decode_batched_f16 ──────────────────────────────────────────────
+// Same as batched_f32 but reads/writes half, accumulates in float.
+
+kernel void sdpa_decode_batched_f16(
+    device const half*  Q         [[buffer(0)]],
+    device const half*  K         [[buffer(1)]],
+    device const half*  V         [[buffer(2)]],
+    device       half*  O         [[buffer(3)]],
+    device const half*  mask      [[buffer(4)]],
+    constant     uint*  params    [[buffer(5)]],
+    constant     float& scale     [[buffer(6)]],
+    uint  tid       [[thread_position_in_threadgroup]],
+    uint  lane_id   [[thread_index_in_simdgroup]],
+    uint  sg_id     [[simdgroup_index_in_threadgroup]],
+    uint  tg_pos    [[threadgroup_position_in_grid]])
+{
+    const uint head_id      = tg_pos;
+    const uint num_heads    = params[0];
+    const uint num_kv_heads = params[1];
+    const uint S            = params[2];
+    const uint D            = params[3];
+    const uint has_mask     = params[4];
+    const uint stride_S     = (params[5] > 0) ? params[5] : S;
+
+    if (head_id >= num_heads) return;
+
+    const uint kv_head = head_id * num_kv_heads / num_heads;
+
+    device const half* q = Q + head_id * D;
+    device const half* k = K + kv_head * stride_S * D;
+    device const half* v = V + kv_head * stride_S * D;
+    device       half* o = O + head_id * D;
+
+    const uint n_threads = 256;
+
+    threadgroup float reduce_buf[SIMD_SIZE];
+    threadgroup float O_shared[256];
+
+    for (uint d = tid; d < D; d += n_threads) {
+        O_shared[d] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float m_running = -INFINITY;
+    float l_running = 0.0f;
+
+    const uint n_kv_blocks = (S + Bc - 1) / Bc;
+
+    for (uint kb = 0; kb < n_kv_blocks; kb++) {
+        const uint kv_start = kb * Bc;
+        const uint kv_end   = min(kv_start + Bc, S);
+        const uint kv_count = kv_end - kv_start;
+
+        float score = -INFINITY;
+        if (tid < kv_count) {
+            float dot = 0.0f;
+            for (uint d = 0; d < D; d++) {
+                dot += float(q[d]) * float(k[(kv_start + tid) * D + d]);
+            }
+            dot *= scale;
+            if (has_mask) {
+                dot += float(mask[kv_start + tid]);
+            }
+            score = dot;
+        }
+
+        float block_max = tg_reduce_max(score, tid, lane_id, sg_id,
+                                        n_threads, reduce_buf);
+        float m_new = max(m_running, block_max);
+        float correction = fast::exp(m_running - m_new);
+        float exp_score = (tid < kv_count) ? fast::exp(score - m_new) : 0.0f;
+        float block_sum = tg_reduce_sum(exp_score, tid, lane_id, sg_id,
+                                        n_threads, reduce_buf);
+        float l_new = l_running * correction + block_sum;
+
+        threadgroup float exp_scores_shared[Bc];
+        if (tid < Bc) {
+            exp_scores_shared[tid] = (tid < kv_count) ? exp_score : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint d = tid; d < D; d += n_threads) {
+            float o_val = O_shared[d] * correction;
+            float v_sum = 0.0f;
+            for (uint j = 0; j < kv_count; j++) {
+                v_sum += exp_scores_shared[j] * float(v[(kv_start + j) * D + d]);
+            }
+            O_shared[d] = o_val + v_sum;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        m_running = m_new;
+        l_running = l_new;
+    }
+
+    float inv_l = (l_running > 0.0f) ? (1.0f / l_running) : 0.0f;
+    for (uint d = tid; d < D; d += n_threads) {
+        o[d] = half(O_shared[d] * inv_l);
+    }
+}
 "#;
 
 // ---------------------------------------------------------------------------
@@ -1042,6 +1262,108 @@ kernel void sdpa_bf16(
         float l = l_prev[i];
         float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
         O[(q_start + i) * D + (D_lo + d)] = bfloat(O_acc2[idx] * inv_l);
+    }
+}
+
+// ─── sdpa_decode_batched_bf16 ─────────────────────────────────────────────
+// Batched multi-head decode for bf16. Same as f32 variant but reads/writes
+// bfloat, accumulates in float.
+
+kernel void sdpa_decode_batched_bf16(
+    device const bfloat* Q         [[buffer(0)]],
+    device const bfloat* K         [[buffer(1)]],
+    device const bfloat* V         [[buffer(2)]],
+    device       bfloat* O         [[buffer(3)]],
+    device const bfloat* mask      [[buffer(4)]],
+    constant     uint*   params    [[buffer(5)]],
+    constant     float&  scale     [[buffer(6)]],
+    uint  tid       [[thread_position_in_threadgroup]],
+    uint  lane_id   [[thread_index_in_simdgroup]],
+    uint  sg_id     [[simdgroup_index_in_threadgroup]],
+    uint  tg_pos    [[threadgroup_position_in_grid]])
+{
+    const uint head_id      = tg_pos;
+    const uint num_heads    = params[0];
+    const uint num_kv_heads = params[1];
+    const uint S            = params[2];
+    const uint D            = params[3];
+    const uint has_mask     = params[4];
+    const uint stride_S     = (params[5] > 0) ? params[5] : S;
+
+    if (head_id >= num_heads) return;
+
+    const uint kv_head = head_id * num_kv_heads / num_heads;
+
+    device const bfloat* q = Q + head_id * D;
+    device const bfloat* k = K + kv_head * stride_S * D;
+    device const bfloat* v = V + kv_head * stride_S * D;
+    device       bfloat* o = O + head_id * D;
+
+    const uint n_threads = 256;
+
+    threadgroup float reduce_buf[SIMD_SIZE];
+    threadgroup float O_shared[256];
+
+    for (uint d = tid; d < D; d += n_threads) {
+        O_shared[d] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float m_running = -INFINITY;
+    float l_running = 0.0f;
+
+    const uint n_kv_blocks = (S + Bc - 1) / Bc;
+
+    for (uint kb = 0; kb < n_kv_blocks; kb++) {
+        const uint kv_start = kb * Bc;
+        const uint kv_end   = min(kv_start + Bc, S);
+        const uint kv_count = kv_end - kv_start;
+
+        float score = -INFINITY;
+        if (tid < kv_count) {
+            float dot = 0.0f;
+            for (uint d = 0; d < D; d++) {
+                dot += float(q[d]) * float(k[(kv_start + tid) * D + d]);
+            }
+            dot *= scale;
+            if (has_mask) {
+                dot += float(mask[kv_start + tid]);
+            }
+            score = dot;
+        }
+
+        float block_max = tg_reduce_max_bf16(score, tid, lane_id, sg_id,
+                                              n_threads, reduce_buf);
+        float m_new = max(m_running, block_max);
+        float correction = fast::exp(m_running - m_new);
+        float exp_score = (tid < kv_count) ? fast::exp(score - m_new) : 0.0f;
+        float block_sum = tg_reduce_sum_bf16(exp_score, tid, lane_id, sg_id,
+                                              n_threads, reduce_buf);
+        float l_new = l_running * correction + block_sum;
+
+        threadgroup float exp_scores_shared[Bc];
+        if (tid < Bc) {
+            exp_scores_shared[tid] = (tid < kv_count) ? exp_score : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint d = tid; d < D; d += n_threads) {
+            float o_val = O_shared[d] * correction;
+            float v_sum = 0.0f;
+            for (uint j = 0; j < kv_count; j++) {
+                v_sum += exp_scores_shared[j] * float(v[(kv_start + j) * D + d]);
+            }
+            O_shared[d] = o_val + v_sum;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        m_running = m_new;
+        l_running = l_new;
+    }
+
+    float inv_l = (l_running > 0.0f) ? (1.0f / l_running) : 0.0f;
+    for (uint d = tid; d < D; d += n_threads) {
+        o[d] = bfloat(O_shared[d] * inv_l);
     }
 }
 "#;
@@ -1462,22 +1784,11 @@ pub fn sdpa_into_cb(
     let pipeline = registry.get_pipeline(kernel_name, q.dtype())?;
     let dev = registry.device().raw();
 
-    let out = Array::zeros(dev, &[n, d], q.dtype());
+    let out = Array::uninit(dev, &[n, d], q.dtype());
 
     let has_mask: u32 = if mask.is_some() { 1 } else { 0 };
     let is_causal_u32: u32 = 0; // into_cb path does not support causal flag
     let params: [u32; 5] = [n as u32, s as u32, d as u32, has_mask, is_causal_u32];
-    let params_buf = dev.new_buffer_with_data(
-        params.as_ptr() as *const std::ffi::c_void,
-        20, // 5 * 4 bytes
-        metal::MTLResourceOptions::StorageModeShared,
-    );
-
-    let scale_buf = dev.new_buffer_with_data(
-        &scale as *const f32 as *const std::ffi::c_void,
-        4,
-        metal::MTLResourceOptions::StorageModeShared,
-    );
 
     let dummy_buf;
     let mask_buf = if let Some(m) = mask {
@@ -1495,8 +1806,8 @@ pub fn sdpa_into_cb(
     encoder.set_buffer(2, Some(v.metal_buffer()), v.offset() as u64);
     encoder.set_buffer(3, Some(out.metal_buffer()), 0);
     encoder.set_buffer(4, Some(mask_buf), mask_offset);
-    encoder.set_buffer(5, Some(&params_buf), 0);
-    encoder.set_buffer(6, Some(&scale_buf), 0);
+    encoder.set_bytes(5, 20, params.as_ptr() as *const std::ffi::c_void);
+    encoder.set_bytes(6, 4, &scale as *const f32 as *const std::ffi::c_void);
 
     if use_decode {
         // Decode kernel: single threadgroup
@@ -1550,6 +1861,361 @@ pub fn sdpa_batched_into_cb(
         outputs.push(out);
     }
     Ok(outputs)
+}
+
+/// Batched multi-head SDPA decode — single GPU dispatch for ALL heads.
+///
+/// Replaces the per-head loop in `sdpa_batched_into_cb` with a single
+/// kernel launch where `grid.x = num_heads`, processing every head in
+/// parallel on the GPU.
+///
+/// Inputs are contiguous slabs:
+/// - `q_slab`: `[num_heads * head_dim]` (flat query vector per head)
+/// - `k_slab`: `[num_kv_heads * seq_len * head_dim]` (contiguous KV cache)
+/// - `v_slab`: `[num_kv_heads * seq_len * head_dim]` (contiguous KV cache)
+/// - `mask`: optional `[seq_len]` (shared across heads for decode)
+///
+/// Returns: `[num_heads * head_dim]` (flat output slab).
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_decode_batched_slab_into_cb(
+    registry: &KernelRegistry,
+    q_slab: &Array,
+    k_slab: &Array,
+    v_slab: &Array,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    seq_len: usize,
+    mask: Option<&Array>,
+    scale: f32,
+    cb: &metal::CommandBufferRef,
+) -> Result<Array, KernelError> {
+    sdpa_decode_batched_slab_stride_into_cb(
+        registry,
+        q_slab,
+        k_slab,
+        v_slab,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        seq_len,
+        None,
+        mask,
+        scale,
+        cb,
+    )
+}
+
+/// Like [`sdpa_decode_batched_slab_into_cb`] but accepts an explicit `stride_seq_len`
+/// for KV slabs where the inter-head stride (max_seq_len) differs from actual `seq_len`.
+///
+/// When `stride_seq_len` is `Some(max_seq_len)`, the kernel uses `max_seq_len` for the
+/// inter-head pointer offset in the KV slab, but only iterates over `seq_len` keys.
+/// When `None`, stride equals `seq_len` (backward compatible).
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_decode_batched_slab_stride_into_cb(
+    registry: &KernelRegistry,
+    q_slab: &Array,
+    k_slab: &Array,
+    v_slab: &Array,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    seq_len: usize,
+    stride_seq_len: Option<usize>,
+    mask: Option<&Array>,
+    scale: f32,
+    cb: &metal::CommandBufferRef,
+) -> Result<Array, KernelError> {
+    // Validate dtypes
+    let dtype = q_slab.dtype();
+    if k_slab.dtype() != dtype || v_slab.dtype() != dtype {
+        return Err(KernelError::InvalidShape(format!(
+            "sdpa_decode_batched: Q/K/V dtype mismatch: Q={:?}, K={:?}, V={:?}",
+            dtype,
+            k_slab.dtype(),
+            v_slab.dtype()
+        )));
+    }
+
+    // Validate head counts
+    if num_kv_heads == 0 || num_heads % num_kv_heads != 0 {
+        return Err(KernelError::InvalidShape(format!(
+            "sdpa_decode_batched: num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
+        )));
+    }
+
+    // Validate head_dim
+    if head_dim > 256 {
+        return Err(KernelError::InvalidShape(format!(
+            "sdpa_decode_batched: head_dim {head_dim} > 256 not supported"
+        )));
+    }
+
+    // Validate slab sizes
+    let stride_s = stride_seq_len.unwrap_or(seq_len);
+    if stride_s < seq_len {
+        return Err(KernelError::InvalidShape(format!(
+            "sdpa_decode_batched: stride_seq_len ({stride_s}) must be >= seq_len ({seq_len})"
+        )));
+    }
+    let q_expected = num_heads * head_dim;
+    // KV slab validation uses stride (max_seq_len) for total size, not seq_len
+    let kv_expected_stride = num_kv_heads * stride_s * head_dim;
+    if q_slab.numel() < q_expected {
+        return Err(KernelError::InvalidShape(format!(
+            "sdpa_decode_batched: q_slab length {} < expected {q_expected}",
+            q_slab.numel()
+        )));
+    }
+    if k_slab.numel() < kv_expected_stride {
+        return Err(KernelError::InvalidShape(format!(
+            "sdpa_decode_batched: k_slab length {} < expected {kv_expected_stride}",
+            k_slab.numel()
+        )));
+    }
+    if v_slab.numel() < kv_expected_stride {
+        return Err(KernelError::InvalidShape(format!(
+            "sdpa_decode_batched: v_slab length {} < expected {kv_expected_stride}",
+            v_slab.numel()
+        )));
+    }
+
+    // Validate mask if provided
+    if let Some(m) = mask {
+        if m.dtype() != dtype {
+            return Err(KernelError::InvalidShape(format!(
+                "sdpa_decode_batched: mask dtype {:?} != Q dtype {:?}",
+                m.dtype(),
+                dtype
+            )));
+        }
+        if !m.is_contiguous() {
+            return Err(KernelError::InvalidShape(
+                "sdpa_decode_batched: mask must be contiguous".into(),
+            ));
+        }
+        if m.numel() < seq_len {
+            return Err(KernelError::InvalidShape(format!(
+                "sdpa_decode_batched: mask length {} < seq_len {seq_len}",
+                m.numel()
+            )));
+        }
+    }
+
+    // Select kernel by dtype
+    let kernel_name = match dtype {
+        DType::Float32 => "sdpa_decode_batched_f32",
+        DType::Float16 => "sdpa_decode_batched_f16",
+        DType::Bfloat16 => "sdpa_decode_batched_bf16",
+        _ => {
+            return Err(KernelError::NotFound(format!(
+                "sdpa_decode_batched: unsupported dtype {:?}",
+                dtype
+            )));
+        }
+    };
+
+    let pipeline = registry.get_pipeline(kernel_name, dtype)?;
+    let dev = registry.device().raw();
+
+    let out = Array::zeros(dev, &[q_expected], dtype);
+
+    let has_mask: u32 = if mask.is_some() { 1 } else { 0 };
+    let params: [u32; 6] = [
+        num_heads as u32,
+        num_kv_heads as u32,
+        seq_len as u32,
+        head_dim as u32,
+        has_mask,
+        stride_s as u32,
+    ];
+
+    let dummy_buf;
+    let mask_buf = if let Some(m) = mask {
+        m.metal_buffer()
+    } else {
+        dummy_buf = dev.new_buffer(4, metal::MTLResourceOptions::StorageModeShared);
+        &dummy_buf
+    };
+    let mask_offset = mask.map_or(0, |m| m.offset()) as u64;
+
+    let encoder = cb.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(q_slab.metal_buffer()), q_slab.offset() as u64);
+    encoder.set_buffer(1, Some(k_slab.metal_buffer()), k_slab.offset() as u64);
+    encoder.set_buffer(2, Some(v_slab.metal_buffer()), v_slab.offset() as u64);
+    encoder.set_buffer(3, Some(out.metal_buffer()), 0);
+    encoder.set_buffer(4, Some(mask_buf), mask_offset);
+    encoder.set_bytes(
+        5,
+        std::mem::size_of::<[u32; 6]>() as u64,
+        params.as_ptr() as *const std::ffi::c_void,
+    );
+    encoder.set_bytes(6, 4, &scale as *const f32 as *const std::ffi::c_void);
+
+    // One threadgroup per Q head, 256 threads each
+    let tg_size = std::cmp::min(DECODE_THREADS, pipeline.max_total_threads_per_threadgroup());
+    encoder.dispatch_thread_groups(
+        MTLSize::new(num_heads as u64, 1, 1),
+        MTLSize::new(tg_size, 1, 1),
+    );
+    encoder.end_encoding();
+
+    Ok(out)
+}
+
+/// Encode batched SDPA decode into an existing compute command encoder (no encoder create/end).
+/// Caller is responsible for creating and ending the encoder.
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_decode_batched_slab_stride_into_encoder(
+    registry: &KernelRegistry,
+    q_slab: &Array,
+    k_slab: &Array,
+    v_slab: &Array,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    seq_len: usize,
+    stride_seq_len: Option<usize>,
+    mask: Option<&Array>,
+    scale: f32,
+    encoder: &metal::ComputeCommandEncoderRef,
+) -> Result<Array, KernelError> {
+    // Validate dtypes
+    let dtype = q_slab.dtype();
+    if k_slab.dtype() != dtype || v_slab.dtype() != dtype {
+        return Err(KernelError::InvalidShape(format!(
+            "sdpa_decode_batched: Q/K/V dtype mismatch: Q={:?}, K={:?}, V={:?}",
+            dtype,
+            k_slab.dtype(),
+            v_slab.dtype()
+        )));
+    }
+
+    // Validate head counts
+    if num_kv_heads == 0 || num_heads % num_kv_heads != 0 {
+        return Err(KernelError::InvalidShape(format!(
+            "sdpa_decode_batched: num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
+        )));
+    }
+
+    // Validate head_dim
+    if head_dim > 256 {
+        return Err(KernelError::InvalidShape(format!(
+            "sdpa_decode_batched: head_dim {head_dim} > 256 not supported"
+        )));
+    }
+
+    // Validate slab sizes
+    let stride_s = stride_seq_len.unwrap_or(seq_len);
+    if stride_s < seq_len {
+        return Err(KernelError::InvalidShape(format!(
+            "sdpa_decode_batched: stride_seq_len ({stride_s}) must be >= seq_len ({seq_len})"
+        )));
+    }
+    let q_expected = num_heads * head_dim;
+    // KV slab validation uses stride (max_seq_len) for total size, not seq_len
+    let kv_expected_stride = num_kv_heads * stride_s * head_dim;
+    if q_slab.numel() < q_expected {
+        return Err(KernelError::InvalidShape(format!(
+            "sdpa_decode_batched: q_slab length {} < expected {q_expected}",
+            q_slab.numel()
+        )));
+    }
+    if k_slab.numel() < kv_expected_stride {
+        return Err(KernelError::InvalidShape(format!(
+            "sdpa_decode_batched: k_slab length {} < expected {kv_expected_stride}",
+            k_slab.numel()
+        )));
+    }
+    if v_slab.numel() < kv_expected_stride {
+        return Err(KernelError::InvalidShape(format!(
+            "sdpa_decode_batched: v_slab length {} < expected {kv_expected_stride}",
+            v_slab.numel()
+        )));
+    }
+
+    // Validate mask if provided
+    if let Some(m) = mask {
+        if m.dtype() != dtype {
+            return Err(KernelError::InvalidShape(format!(
+                "sdpa_decode_batched: mask dtype {:?} != Q dtype {:?}",
+                m.dtype(),
+                dtype
+            )));
+        }
+        if !m.is_contiguous() {
+            return Err(KernelError::InvalidShape(
+                "sdpa_decode_batched: mask must be contiguous".into(),
+            ));
+        }
+        if m.numel() < seq_len {
+            return Err(KernelError::InvalidShape(format!(
+                "sdpa_decode_batched: mask length {} < seq_len {seq_len}",
+                m.numel()
+            )));
+        }
+    }
+
+    // Select kernel by dtype
+    let kernel_name = match dtype {
+        DType::Float32 => "sdpa_decode_batched_f32",
+        DType::Float16 => "sdpa_decode_batched_f16",
+        DType::Bfloat16 => "sdpa_decode_batched_bf16",
+        _ => {
+            return Err(KernelError::NotFound(format!(
+                "sdpa_decode_batched: unsupported dtype {:?}",
+                dtype
+            )));
+        }
+    };
+
+    let pipeline = registry.get_pipeline(kernel_name, dtype)?;
+    let dev = registry.device().raw();
+
+    let out = Array::zeros(dev, &[q_expected], dtype);
+
+    let has_mask: u32 = if mask.is_some() { 1 } else { 0 };
+    let params: [u32; 6] = [
+        num_heads as u32,
+        num_kv_heads as u32,
+        seq_len as u32,
+        head_dim as u32,
+        has_mask,
+        stride_s as u32,
+    ];
+
+    let dummy_buf;
+    let mask_buf = if let Some(m) = mask {
+        m.metal_buffer()
+    } else {
+        dummy_buf = dev.new_buffer(4, metal::MTLResourceOptions::StorageModeShared);
+        &dummy_buf
+    };
+    let mask_offset = mask.map_or(0, |m| m.offset()) as u64;
+
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(q_slab.metal_buffer()), q_slab.offset() as u64);
+    encoder.set_buffer(1, Some(k_slab.metal_buffer()), k_slab.offset() as u64);
+    encoder.set_buffer(2, Some(v_slab.metal_buffer()), v_slab.offset() as u64);
+    encoder.set_buffer(3, Some(out.metal_buffer()), 0);
+    encoder.set_buffer(4, Some(mask_buf), mask_offset);
+    encoder.set_bytes(
+        5,
+        std::mem::size_of::<[u32; 6]>() as u64,
+        params.as_ptr() as *const std::ffi::c_void,
+    );
+    encoder.set_bytes(6, 4, &scale as *const f32 as *const std::ffi::c_void);
+
+    // One threadgroup per Q head, 256 threads each
+    let tg_size = std::cmp::min(DECODE_THREADS, pipeline.max_total_threads_per_threadgroup());
+    encoder.dispatch_thread_groups(
+        MTLSize::new(num_heads as u64, 1, 1),
+        MTLSize::new(tg_size, 1, 1),
+    );
+
+    Ok(out)
 }
 
 #[cfg(test)]

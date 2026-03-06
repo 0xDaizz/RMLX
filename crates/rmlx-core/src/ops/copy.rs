@@ -1049,7 +1049,7 @@ pub fn copy_into_cb(
     reject_quantized(src.dtype())?;
 
     let numel = src.numel();
-    let out = Array::zeros(registry.device().raw(), src.shape(), src.dtype());
+    let out = Array::uninit(registry.device().raw(), src.shape(), src.dtype());
 
     let encoder = cb.new_compute_command_encoder();
 
@@ -1060,8 +1060,7 @@ pub fn copy_into_cb(
         encoder.set_buffer(0, Some(src.metal_buffer()), src.offset() as u64);
         encoder.set_buffer(1, Some(out.metal_buffer()), out.offset() as u64);
         let size_val = super::checked_u32(numel, "numel")?;
-        let size_buf = u32_buffer(registry.device().raw(), size_val);
-        encoder.set_buffer(2, Some(&size_buf), 0);
+        encoder.set_bytes(2, 4, &size_val as *const u32 as *const std::ffi::c_void);
         pipeline
     } else {
         encode_strided(registry, src, encoder, &out)?
@@ -1113,21 +1112,24 @@ pub fn interleave_heads_into_cb(
     };
 
     let pipeline = registry.get_pipeline(kernel_name, src.dtype())?;
-    let device = registry.device().raw();
 
-    let seq_len_buf = u32_buffer(device, seq_len as u32);
-    let head_dim_buf = u32_buffer(device, head_dim as u32);
-    let num_heads_buf = u32_buffer(device, num_heads as u32);
-    let head_idx_buf = u32_buffer(device, head_idx as u32);
+    let seq_len_u32 = seq_len as u32;
+    let head_dim_u32 = head_dim as u32;
+    let num_heads_u32 = num_heads as u32;
+    let head_idx_u32 = head_idx as u32;
 
     let encoder = cb.new_compute_command_encoder();
     encoder.set_compute_pipeline_state(&pipeline);
     encoder.set_buffer(0, Some(src.metal_buffer()), src.offset() as u64);
     encoder.set_buffer(1, Some(dst.metal_buffer()), dst.offset() as u64);
-    encoder.set_buffer(2, Some(&seq_len_buf), 0);
-    encoder.set_buffer(3, Some(&head_dim_buf), 0);
-    encoder.set_buffer(4, Some(&num_heads_buf), 0);
-    encoder.set_buffer(5, Some(&head_idx_buf), 0);
+    encoder.set_bytes(2, 4, &seq_len_u32 as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(3, 4, &head_dim_u32 as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(
+        4,
+        4,
+        &num_heads_u32 as *const u32 as *const std::ffi::c_void,
+    );
+    encoder.set_bytes(5, 4, &head_idx_u32 as *const u32 as *const std::ffi::c_void);
 
     let total_threads = (seq_len * head_dim) as u64;
     let grid_size = MTLSize::new(total_threads, 1, 1);

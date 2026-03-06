@@ -16,7 +16,7 @@
 | **GPU API** | Apple Metal (metal-rs 0.31) | Apple Metal (metal-cpp) | NVIDIA CUDA |
 | **Memory model** | Unified Memory (UMA) | Unified Memory (UMA) | Discrete VRAM + host RAM |
 | **Execution model** | Eager-first (selective tracing for prefill) | Lazy evaluation (graph-level fusion) | Eager (PyTorch) / Graph (CUDA Graphs) |
-| **CB management** | ExecGraph: 65 CBs/layer -> 5 CBs/layer (92.3% reduction) | 1 CB per eval() batch | Stream-ordered, CUDA Graphs capture-replay |
+| **CB management** | ExecGraph + 9-dispatch: 65 CBs/layer -> 1 CB with 9 dispatches (77x speedup vs per-op baseline, 5.1% gap vs MLX) | 1 CB per eval() batch | Stream-ordered, CUDA Graphs capture-replay |
 | **Sync mechanism** | MTLSharedEvent signal/wait (263.9us) | waitUntilCompleted (424.9us) | CUDA events / streams |
 | **RDMA** | Zero-copy: posix_memalign + NoCopy + ibv_reg_mr | std::copy to transfer buffer | GPUDirect RDMA / NVLink |
 | **Expert Parallelism** | Native EP (3-zone auto backend, 7 MoE kernels, EP-1~EP-6 optimized path) | No EP support | DeepSpeed-MoE, Tutel |
@@ -32,8 +32,8 @@
 | **MLA** | Yes (DeepSeek-V3) | No | Partial |
 | **Sliding Window Attn** | Yes | Yes | Yes |
 | **GGUF model loading** | Yes | Yes | Yes |
-| **Test suite** | 543 tests | Extensive | Extensive |
-| **Phases complete** | 0-9B-opt + S1-S5 | N/A (stable release) | N/A (stable release) |
+| **Test suite** | 1,142+ tests | Extensive | Extensive |
+| **Phases complete** | 0-9B-opt + S1-S5 + Phase KO | N/A (stable release) | N/A (stable release) |
 
 ---
 
@@ -66,6 +66,17 @@ MLX submits individual command buffers per operation. RMLX's ExecGraph pre-encod
 | Latency reduction | -- | 94.3% |
 
 Numerical parity is maintained: max_diff = 6.4e-6 between baseline and ExecGraph outputs.
+
+**Phase KO Update:** The ExecGraph pipeline has been further optimized with the 9-dispatch decode path:
+
+| Metric | Phase 9B-opt | Phase KO (9-dispatch) |
+|--------|--------------|-----------------------|
+| Dispatches per layer | 65 in 5 CBs | 9 in 1 CB (4 encoders) |
+| Latency per layer | ~6.4ms | ~1.4ms |
+| Speedup vs baseline | 17.4x | 77x |
+| Gap vs MLX compiled | ~4.8x slower | 5.1% |
+
+The 9-dispatch path achieves near-parity with MLX's compiled execution through merged QKV/gate_up weight projections, batched RoPE, slab-layout SDPA decode, fused GEMV+bias, StorageModePrivate weights, and Array::uninit for output buffers.
 
 ### 2.3 Zero-Copy RDMA Data Path
 
@@ -241,15 +252,15 @@ CUDA has decades of optimization across compilers (NVCC, Triton), libraries (cuB
 | **Mechanism** | Re-encode deterministic op sequence into batched CBs | Capture GPU operations, replay recorded stream |
 | **CPU overhead** | Re-encoding cost per inference step | Near-zero (replay only) |
 | **Flexibility** | Always deterministic; works for any shape | Requires re-capture when input shapes change |
-| **CB reduction** | 65 -> 5 per layer (92.3%) | Full coalescing into single graph |
+| **CB reduction** | 65 -> 1 per layer (98.5%) | Full coalescing into single graph |
 | **Sync model** | MTLSharedEvent (non-blocking) | CUDA events (stream-ordered) |
 | **Shape dynamism** | Re-encode handles shape changes naturally | Must re-capture or use CUDA Graph updates |
-| **Latency** | ~6.4ms per layer | Sub-millisecond replay |
-| **Speedup over baseline** | 17.4x | Typically 2-5x (already from efficient baseline) |
+| **Latency** | ~1.4ms per layer (9-dispatch path) | Sub-millisecond replay |
+| **Speedup over baseline** | 77x | Typically 2-5x (already from efficient baseline) |
 | **Implementation complexity** | Moderate (deterministic sequencing) | Low (capture API is straightforward) |
 | **Memory overhead** | Minimal (re-encode reuses buffers) | Graph storage (captured operations) |
 
-**Key insight**: ExecGraph's 17.4x speedup is relative to a per-op baseline that is more overhead-heavy than CUDA's default execution model. CUDA's baseline is already more efficient due to stream-ordered execution, so CUDA Graphs provides a smaller relative improvement from a stronger starting point.
+**Key insight**: ExecGraph's 77x speedup comes from collapsing the decode path into 9 dispatches in a single command buffer. CUDA's baseline is already more efficient due to stream-ordered execution, so CUDA Graphs provides a smaller relative improvement from a stronger starting point.
 
 ---
 
@@ -318,7 +329,7 @@ RMLX maintains strict numerical parity between its baseline execution path and t
 |--------|-------|
 | max_diff (baseline vs ExecGraph) | 6.4e-6 |
 | Tolerance threshold | 1e-4 |
-| Test coverage | 543 tests |
+| Test coverage | 1,142+ tests |
 | Verification method | Element-wise comparison across all ops |
 
 This ensures that the 17.4x performance improvement from ExecGraph introduces no meaningful numerical drift.
