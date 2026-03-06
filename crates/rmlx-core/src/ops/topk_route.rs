@@ -430,8 +430,7 @@ pub fn gpu_topk_route(
 ) -> Result<TopkRouteResult, KernelError> {
     let cb = queue.new_command_buffer();
     let result = gpu_topk_route_into_cb(registry, gate_logits, top_k, expert_bias, cb)?;
-    cb.commit();
-    cb.wait_until_completed();
+    super::commit_with_mode(cb, super::ExecMode::Sync);
     Ok(result)
 }
 

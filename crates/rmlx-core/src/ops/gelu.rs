@@ -279,8 +279,7 @@ pub fn gelu(
     );
     encoder.dispatch_threads(grid_size, threadgroup_size);
     encoder.end_encoding();
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
+    super::commit_with_mode(command_buffer, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -319,8 +318,7 @@ pub fn gelu_fast(
     );
     encoder.dispatch_threads(grid_size, threadgroup_size);
     encoder.end_encoding();
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
+    super::commit_with_mode(command_buffer, super::ExecMode::Sync);
 
     Ok(out)
 }

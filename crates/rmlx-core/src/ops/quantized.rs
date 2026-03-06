@@ -558,8 +558,7 @@ pub fn affine_quantized_matmul(
         metal::MTLSize::new(tg, 1, 1),
     );
     enc.end_encoding();
-    cb.commit();
-    cb.wait_until_completed();
+    super::commit_with_mode(cb, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -680,8 +679,7 @@ pub fn awq_dequant(
     let tg = metal::MTLSize::new(tg_x, tg_y, 1);
     enc.dispatch_threads(grid, tg);
     enc.end_encoding();
-    cb.commit();
-    cb.wait_until_completed();
+    super::commit_with_mode(cb, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -848,8 +846,7 @@ pub fn gptq_dequant(
     let tg = metal::MTLSize::new(tg_x, tg_y, 1);
     enc.dispatch_threads(grid, tg);
     enc.end_encoding();
-    cb.commit();
-    cb.wait_until_completed();
+    super::commit_with_mode(cb, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -1218,8 +1215,7 @@ pub fn affine_quantized_matmul_batched(
 
     enc.dispatch_thread_groups(grid, tg);
     enc.end_encoding();
-    cb.commit();
-    cb.wait_until_completed();
+    super::commit_with_mode(cb, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -1513,8 +1509,7 @@ pub fn gather_qmm(
 
     enc.dispatch_thread_groups(grid, tg);
     enc.end_encoding();
-    cb.commit();
-    cb.wait_until_completed();
+    super::commit_with_mode(cb, super::ExecMode::Sync);
 
     Ok(out)
 }

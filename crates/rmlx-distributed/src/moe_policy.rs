@@ -7,8 +7,13 @@
 //! Cooldown: after backend switch, cooldown expires when EITHER 5000ms
 //! elapsed OR 1000 calls (matches MLX's OR condition).
 //! Hysteresis: ±hysteresis_band around thresholds to prevent oscillation.
+//!
+//! Thread safety: all mutable state is protected by an internal `RwLock`,
+//! making `MoePolicy` `Send + Sync`. Read-heavy paths (`select`) acquire a
+//! read lock; mutation paths (`switch_backend`, setters) acquire a write lock.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 /// Cooldown duration threshold (matches MLX).
@@ -24,8 +29,8 @@ pub enum MoeBackend {
     Rdma,
 }
 
-/// 3-zone dispatch policy configuration.
-pub struct MoePolicy {
+/// Interior mutable state protected by `RwLock`.
+struct MoePolicyInner {
     /// Maximum N for CPU zone.
     cpu_max: u32,
     /// Minimum N for GPU zone (also threshold for RDMA when multi-node).
@@ -40,17 +45,31 @@ pub struct MoePolicy {
     current_backend: MoeBackend,
     /// Timestamp of the last backend switch (for time-based cooldown).
     last_switch_time: Option<Instant>,
-    /// Number of `select()` calls since the last backend switch.
-    calls_since_switch: AtomicU64,
     /// Whether cooldown is active (a switch has occurred and not yet expired).
     cooldown_active: bool,
-    /// Step counter for hysteresis tracking.
-    step_count: AtomicU32,
     /// Force a specific backend (overrides all threshold logic). Used for testing.
     forced_backend: Option<MoeBackend>,
     /// Whether Metal GPU is available on this system.
     metal_available: bool,
 }
+
+/// 3-zone dispatch policy configuration.
+///
+/// Thread-safe: all mutable state is behind an internal `RwLock`.
+/// `MoePolicy` is `Send + Sync`.
+pub struct MoePolicy {
+    inner: RwLock<MoePolicyInner>,
+    /// Number of `select()` calls since the last backend switch.
+    calls_since_switch: AtomicU64,
+    /// Step counter for hysteresis tracking.
+    step_count: AtomicU32,
+}
+
+// Compile-time assertions: MoePolicy must be Send + Sync.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<MoePolicy>();
+};
 
 impl MoePolicy {
     /// Create a new policy with default thresholds.
@@ -99,50 +118,54 @@ impl MoePolicy {
         }
 
         Self {
-            cpu_max,
-            gpu_min,
-            byte_threshold,
-            hysteresis_band: 16,
-            world_size: 1,
-            current_backend: MoeBackend::Metal,
-            last_switch_time: None,
+            inner: RwLock::new(MoePolicyInner {
+                cpu_max,
+                gpu_min,
+                byte_threshold,
+                hysteresis_band: 16,
+                world_size: 1,
+                current_backend: MoeBackend::Metal,
+                last_switch_time: None,
+                cooldown_active: false,
+                forced_backend,
+                metal_available,
+            }),
             calls_since_switch: AtomicU64::new(0),
-            cooldown_active: false,
             step_count: AtomicU32::new(0),
-            forced_backend,
-            metal_available,
         }
     }
 
     /// Create with custom thresholds (for calibration).
     pub fn with_thresholds(cpu_max: u32, gpu_min: u32, byte_threshold: usize) -> Self {
-        Self {
-            cpu_max,
-            gpu_min,
-            byte_threshold,
-            ..Self::new()
+        let base = Self::new();
+        {
+            let mut inner = base.inner.write().unwrap();
+            inner.cpu_max = cpu_max;
+            inner.gpu_min = gpu_min;
+            inner.byte_threshold = byte_threshold;
         }
+        base
     }
 
     /// Set world size (enables RDMA zone when > 1).
-    pub fn set_world_size(&mut self, world_size: u32) {
-        self.world_size = world_size;
+    pub fn set_world_size(&self, world_size: u32) {
+        self.inner.write().unwrap().world_size = world_size;
     }
 
     /// Current world size.
     pub fn world_size(&self) -> u32 {
-        self.world_size
+        self.inner.read().unwrap().world_size
     }
 
     /// Set hysteresis band.
-    pub fn set_hysteresis_band(&mut self, band: u32) {
-        self.hysteresis_band = band;
+    pub fn set_hysteresis_band(&self, band: u32) {
+        self.inner.write().unwrap().hysteresis_band = band;
     }
 
     /// Force a specific backend, bypassing all threshold logic.
     /// Pass `None` to clear the override and resume normal selection.
-    pub fn force_backend(&mut self, backend: Option<MoeBackend>) {
-        self.forced_backend = backend;
+    pub fn force_backend(&self, backend: Option<MoeBackend>) {
+        self.inner.write().unwrap().forced_backend = backend;
     }
 
     /// Select dispatch backend for a given element count and byte size.
@@ -155,60 +178,85 @@ impl MoePolicy {
     /// Hysteresis: when switching away from the current backend, the threshold
     /// is adjusted by ±hysteresis_band to prevent oscillation at zone boundaries.
     pub fn select(&self, n_elements: u32, byte_size: usize) -> MoeBackend {
+        // Acquire read lock for the inner state.
+        let inner = self.inner.read().unwrap();
+
         // If a backend is forced, return it unconditionally
-        if let Some(forced) = self.forced_backend {
+        if let Some(forced) = inner.forced_backend {
             return forced;
         }
 
         // D9: If Metal is not available, always return CPU
-        if !self.metal_available {
+        if !inner.metal_available {
             return MoeBackend::Cpu;
         }
 
         // D7: During cooldown, maintain current backend.
         // Cooldown expires when EITHER 5000ms elapsed OR 1000 calls.
-        if self.cooldown_active {
-            let calls = self.calls_since_switch.fetch_add(1, Ordering::Relaxed) + 1;
-            let time_expired = self
+        if inner.cooldown_active {
+            let calls = self.calls_since_switch.fetch_add(1, Ordering::Acquire) + 1;
+            let time_expired = inner
                 .last_switch_time
                 .map(|t| t.elapsed() >= COOLDOWN_DURATION)
                 .unwrap_or(true);
             let calls_expired = calls >= COOLDOWN_CALLS;
             if !time_expired && !calls_expired {
-                return self.current_backend;
+                return inner.current_backend;
             }
-            // Cooldown has expired — fall through to normal selection
+            // Cooldown has expired — drop read lock, acquire write lock to clear it,
+            // then fall through to normal selection.
+            let current = inner.current_backend;
+            drop(inner);
+            {
+                let mut w = self.inner.write().unwrap();
+                w.cooldown_active = false;
+            }
+            // Re-acquire read lock for threshold computation below.
+            let inner = self.inner.read().unwrap();
+            return Self::compute_zone(&inner, n_elements, byte_size, current);
         }
 
+        let current = inner.current_backend;
+        Self::compute_zone(&inner, n_elements, byte_size, current)
+    }
+
+    /// Pure zone computation (no side effects). Extracted so both the normal
+    /// and cooldown-expiry paths can share it.
+    fn compute_zone(
+        inner: &MoePolicyInner,
+        n_elements: u32,
+        byte_size: usize,
+        current_backend: MoeBackend,
+    ) -> MoeBackend {
         // Apply hysteresis: to leave current zone, must cross threshold + band
-        let (cpu_thresh, gpu_thresh) = match self.current_backend {
+        let (cpu_thresh, gpu_thresh) = match current_backend {
             MoeBackend::Cpu => {
                 // To leave CPU, must exceed cpu_max + band
                 (
-                    self.cpu_max + self.hysteresis_band,
-                    self.gpu_min + self.hysteresis_band,
+                    inner.cpu_max + inner.hysteresis_band,
+                    inner.gpu_min + inner.hysteresis_band,
                 )
             }
             MoeBackend::Metal => {
                 // To drop to CPU, must go below cpu_max - band
                 // To jump to RDMA, must exceed gpu_min + band
                 (
-                    self.cpu_max.saturating_sub(self.hysteresis_band),
-                    self.gpu_min + self.hysteresis_band,
+                    inner.cpu_max.saturating_sub(inner.hysteresis_band),
+                    inner.gpu_min + inner.hysteresis_band,
                 )
             }
             MoeBackend::Rdma => {
                 // To leave RDMA, must drop below gpu_min - band
                 (
-                    self.cpu_max.saturating_sub(self.hysteresis_band),
-                    self.gpu_min.saturating_sub(self.hysteresis_band),
+                    inner.cpu_max.saturating_sub(inner.hysteresis_band),
+                    inner.gpu_min.saturating_sub(inner.hysteresis_band),
                 )
             }
         };
 
         if n_elements <= cpu_thresh {
             MoeBackend::Cpu
-        } else if n_elements > gpu_thresh && self.world_size > 1 {
+        } else if n_elements > gpu_thresh && inner.world_size > 1 {
             // RDMA zone: large messages AND multi-node
             MoeBackend::Rdma
         } else if n_elements >= gpu_thresh {
@@ -216,7 +264,7 @@ impl MoePolicy {
             MoeBackend::Metal
         } else {
             // Middle zone: byte threshold decides CPU vs Metal
-            if byte_size < self.byte_threshold {
+            if byte_size < inner.byte_threshold {
                 MoeBackend::Cpu
             } else {
                 MoeBackend::Metal
@@ -228,12 +276,13 @@ impl MoePolicy {
     ///
     /// D7: resets both time and call counters. Cooldown expires when EITHER
     /// 5000ms elapsed OR 1000 calls have been made to `select()`.
-    pub fn switch_backend(&mut self, new_backend: MoeBackend) {
-        if new_backend != self.current_backend {
-            self.current_backend = new_backend;
-            self.last_switch_time = Some(Instant::now());
-            self.calls_since_switch.store(0, Ordering::Relaxed);
-            self.cooldown_active = true;
+    pub fn switch_backend(&self, new_backend: MoeBackend) {
+        let mut inner = self.inner.write().unwrap();
+        if new_backend != inner.current_backend {
+            inner.current_backend = new_backend;
+            inner.last_switch_time = Some(Instant::now());
+            self.calls_since_switch.store(0, Ordering::Release);
+            inner.cooldown_active = true;
         }
     }
 
@@ -249,12 +298,12 @@ impl MoePolicy {
 
     /// Current backend.
     pub fn current_backend(&self) -> MoeBackend {
-        self.current_backend
+        self.inner.read().unwrap().current_backend
     }
 
     /// Whether cooldown is currently active.
     pub fn cooldown_active(&self) -> bool {
-        self.cooldown_active
+        self.inner.read().unwrap().cooldown_active
     }
 
     /// Calls since the last backend switch.
@@ -264,32 +313,32 @@ impl MoePolicy {
 
     /// CPU max threshold.
     pub fn cpu_max(&self) -> u32 {
-        self.cpu_max
+        self.inner.read().unwrap().cpu_max
     }
 
     /// GPU min threshold.
     pub fn gpu_min(&self) -> u32 {
-        self.gpu_min
+        self.inner.read().unwrap().gpu_min
     }
 
     /// Byte threshold.
     pub fn byte_threshold(&self) -> usize {
-        self.byte_threshold
+        self.inner.read().unwrap().byte_threshold
     }
 
     /// Whether Metal is available on this system.
     pub fn metal_available(&self) -> bool {
-        self.metal_available
+        self.inner.read().unwrap().metal_available
     }
 
     /// Set CPU max threshold (used by calibration).
-    pub fn set_cpu_max(&mut self, v: u32) {
-        self.cpu_max = v;
+    pub fn set_cpu_max(&self, v: u32) {
+        self.inner.write().unwrap().cpu_max = v;
     }
 
     /// Set GPU min threshold (used by calibration).
-    pub fn set_gpu_min(&mut self, v: u32) {
-        self.gpu_min = v;
+    pub fn set_gpu_min(&self, v: u32) {
+        self.inner.write().unwrap().gpu_min = v;
     }
 }
 
@@ -359,7 +408,7 @@ impl ThresholdCalibration {
     }
 
     /// Apply calibration results to a MoePolicy.
-    pub fn apply_to(&self, policy: &mut MoePolicy) {
+    pub fn apply_to(&self, policy: &MoePolicy) {
         if self.calibrated {
             policy.set_cpu_max(self.cpu_max as u32);
             policy.set_gpu_min(self.gpu_min as u32);

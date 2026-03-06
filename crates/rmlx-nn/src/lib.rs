@@ -15,11 +15,13 @@ pub mod mla;
 pub mod models;
 pub mod moe;
 pub mod moe_pipeline;
+pub mod paged_kv_cache;
 pub mod parallel;
 pub mod quantized_linear;
 pub mod rms_norm;
 pub mod rope;
 pub mod sampler;
+pub mod scheduler;
 pub mod sliding_window;
 pub mod transformer;
 
@@ -39,11 +41,13 @@ pub use linear::{Linear, LinearConfig};
 pub use mla::{Mla, MlaConfig, MlaKvCache};
 pub use moe::{load_balance_loss, Expert, MoeConfig, MoeForwardMetrics, MoeLayer, MoeStrategy};
 pub use moe_pipeline::{MoePipeline, MoePipelineConfig};
+pub use paged_kv_cache::{BlockId, BlockManager, PagedKvCache, PagedKvError};
 pub use parallel::{ColumnParallelLinear, RowParallelLinear, TpError};
 pub use quantized_linear::{QuantBits, QuantizedLinear, QuantizedLinearConfig};
 pub use rms_norm::{RMSNorm, RMSNormConfig};
 pub use rope::{RotaryPositionEmbedding, RotaryPositionEmbeddingConfig};
 pub use sampler::{Sampler, SamplerConfig};
+pub use scheduler::{Scheduler, SchedulerConfig, SchedulerError, SchedulerOutput, SeqMeta};
 pub use sliding_window::{SlidingWindowAttention, SlidingWindowAttentionConfig};
 pub use transformer::{
     FeedForward, FeedForwardType, TransformerBlock, TransformerConfig, TransformerModel,

@@ -292,8 +292,7 @@ pub fn sdpa_backward(
     );
     enc.dispatch_threads(grid, tg);
     enc.end_encoding();
-    cb.commit();
-    cb.wait_until_completed();
+    super::commit_with_mode(cb, super::ExecMode::Sync);
 
     Ok((grad_q, grad_k, grad_v))
 }

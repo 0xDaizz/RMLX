@@ -365,8 +365,7 @@ pub fn gather_mm(
 
     enc.dispatch_thread_groups(grid, tg);
     enc.end_encoding();
-    cb.commit();
-    cb.wait_until_completed();
+    super::commit_with_mode(cb, super::ExecMode::Sync);
 
     Ok(out)
 }
