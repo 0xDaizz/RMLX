@@ -170,9 +170,9 @@ pub fn resolve_auto_backend(has_rdma: bool, local_tb: &[Interconnect]) -> &'stat
 /// Validate that a backend string is a known value.
 pub fn validate_backend(backend: &str) -> Result<(), String> {
     match backend {
-        "auto" | "rdma" | "tb5" | "tb4" | "tcp" => Ok(()),
+        "auto" | "rdma" | "tb5" | "tb4" | "tcp" | "loopback" => Ok(()),
         other => Err(format!(
-            "unknown backend {other:?}: expected one of auto, rdma, tb5, tb4, tcp"
+            "unknown backend {other:?}: expected one of auto, rdma, tb5, tb4, tcp, loopback"
         )),
     }
 }
