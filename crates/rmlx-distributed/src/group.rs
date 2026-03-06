@@ -1211,9 +1211,7 @@ mod tests {
         // Single rank should return data unchanged regardless of size
         let group = Group::new(vec![0], 0, 1).unwrap();
         // 7 f32 elements = 28 bytes (not divisible by any rank count > 1)
-        let data: Vec<u8> = (1..=7u32)
-            .flat_map(|v| (v as f32).to_ne_bytes())
-            .collect();
+        let data: Vec<u8> = (1..=7u32).flat_map(|v| (v as f32).to_ne_bytes()).collect();
         let result = group.allreduce(&data).unwrap();
         assert_eq!(result, data);
     }
@@ -1222,9 +1220,7 @@ mod tests {
     fn test_allreduce_op_non_divisible_f32_single_rank() {
         // 7 f32 elements through allreduce_op with single rank
         let group = Group::new(vec![0], 0, 1).unwrap();
-        let data: Vec<u8> = (1..=7u32)
-            .flat_map(|v| (v as f32).to_ne_bytes())
-            .collect();
+        let data: Vec<u8> = (1..=7u32).flat_map(|v| (v as f32).to_ne_bytes()).collect();
         let result = group
             .allreduce_op(&data, ReduceOp::Sum, ReduceDtype::F32)
             .unwrap();
@@ -1246,12 +1242,20 @@ mod tests {
 
         for &original in &nan_payloads {
             let f32_val = f16_to_f32(original);
-            assert!(f32_val.is_nan(), "f16 0x{:04X} should convert to f32 NaN", original);
+            assert!(
+                f32_val.is_nan(),
+                "f16 0x{:04X} should convert to f32 NaN",
+                original
+            );
             let roundtrip = f32_to_f16(f32_val);
             // The roundtrip must also be NaN (not Inf)
             let rt_exp = (roundtrip >> 10) & 0x1F;
             let rt_mantissa = roundtrip & 0x3FF;
-            assert_eq!(rt_exp, 0x1F, "roundtrip of 0x{:04X} must have exp=0x1F", original);
+            assert_eq!(
+                rt_exp, 0x1F,
+                "roundtrip of 0x{:04X} must have exp=0x1F",
+                original
+            );
             assert_ne!(
                 rt_mantissa, 0,
                 "roundtrip of 0x{:04X} must have non-zero mantissa (NaN, not Inf)",
@@ -1278,7 +1282,10 @@ mod tests {
         // f16 subnormal: smallest positive subnormal = 2^-24 ≈ 5.96e-8
         let f16_subnormal: u16 = 0x0001; // smallest subnormal
         let f32_val = f16_to_f32(f16_subnormal);
-        assert!(f32_val > 0.0 && f32_val < 6.2e-5, "subnormal should be tiny positive");
+        assert!(
+            f32_val > 0.0 && f32_val < 6.2e-5,
+            "subnormal should be tiny positive"
+        );
         let roundtrip = f32_to_f16(f32_val);
         assert_eq!(
             roundtrip, f16_subnormal,
@@ -1355,11 +1362,7 @@ mod tests {
         let back = bf16_to_f32(bf16_bits);
         assert!(back.is_nan(), "bf16 roundtrip of NaN must remain NaN");
         // Verify it's not Inf
-        assert_ne!(
-            bf16_bits & 0x7FFF,
-            0x7F80,
-            "bf16 NaN must not become Inf"
-        );
+        assert_ne!(bf16_bits & 0x7FFF, 0x7F80, "bf16 NaN must not become Inf");
     }
 
     #[test]
