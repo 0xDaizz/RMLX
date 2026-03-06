@@ -1,47 +1,49 @@
 # RMLX
 
-**Rust ML runtime for Apple Silicon -- zero-copy GPU inference with 17.4x CPU-minimal speedup**
+**Rust ML runtime for Apple Silicon -- zero-copy GPU inference with 77x decode speedup (5.1% gap to MLX)**
 
 [![CI](https://github.com/0xDaizz/RMLX/actions/workflows/ci.yml/badge.svg)](https://github.com/0xDaizz/RMLX/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust 1.80+](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/tests-1142%20passing-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-1298%20passing-brightgreen.svg)]()
 [![macOS Apple Silicon](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-lightgrey.svg)]()
 
 > 한국어 문서: [docs/README_ko.md](docs/README_ko.md)
 
 ---
 
-RMLX reimplements the core Metal GPU compute pipeline of Apple's [MLX](https://github.com/ml-explore/mlx) framework **entirely in Rust**. The ExecGraph pipeline batches 65 command buffers down to 5 per transformer layer, achieving a **17.4x speedup** (~112ms to ~6.4ms) with full numerical parity (max\_diff=6.4e-6). A full-crate audit (Phases 0, 1, 2) has been completed with 76 remediation items resolved across all 6 crates. Phase 4 (Performance and Allocator) is complete with 12 PRs adding ChipTuning, DiskPipelineCache, BFC allocator, fused RMSNorm, ICB sparse dispatch, and SlabRing backpressure. Phase 5 (Feature Breadth) adds 5 new core ops (slice, sort, scan, argreduce, random), 11 new activations (16 total), full MLA/SlidingWindow forward, AWQ/GPTQ/K-quant quantization, prefix cache, chunked prefill, 4 full model architectures, tree allreduce, pipelined ring buffer, and topology-aware CLI backend selection.
+RMLX reimplements the core Metal GPU compute pipeline of Apple's [MLX](https://github.com/ml-explore/mlx) framework **entirely in Rust**. Phase KO optimizes the decode path to just 9 dispatches across 4 encoders, achieving **1,411us per layer (77x speedup)** from the 109,215us baseline -- only **5.1% behind MLX's compiled forward** (1,342us). Key techniques: merged QKV/gate\_up weight projections, batched SDPA decode with slab KV cache, single-encoder dispatch with memory barriers, and BM=8 GEMV with dynamic tile selection. A full-crate audit (Phases 0-2) resolved 76 remediation items across all 6 crates. Phases 3-6 added serving infrastructure, BFC allocator, ChipTuning, 5 new core ops, 16 activations, MLA/SlidingWindow, AWQ/GPTQ/K-quant, prefix cache, chunked prefill, 4 model architectures, tree allreduce, and topology-aware CLI.
 
 ## ✨ Why RMLX?
 
 | Feature | RMLX | MLX | CUDA |
 |---------|:----:|:---:|:----:|
-| Unified Memory (zero-copy) | yes | yes | no |
-| Expert Parallelism (EP) | yes (3-zone auto + EP-1~6 optimized) | no | DeepSpeed-MoE |
-| Zero-copy RDMA | yes | no | no |
-| MTLSharedEvent sync | yes | no | n/a |
-| ExecGraph CB batching | yes | no | CUDA Graphs |
-| Single Rust binary | yes | no | no |
-| Flash Attention 2 | yes | yes | yes |
-| GatherMM | yes | yes | yes |
-| LayerNorm | yes | yes | yes |
-| QuantizedLinear | yes | yes | yes |
-| MLA (Multi-Latent Attention) | yes | no | partial |
-| Sliding Window Attention | yes | yes | yes |
-| GGUF Model Loading | yes | yes | yes |
+| Unified Memory (zero-copy) | ✅ | ✅ | ❌ |
+| Expert Parallelism (EP) | ✅ (3-zone auto) | ❌ | ⚠️ DeepSpeed |
+| Zero-copy RDMA | ✅ | ❌ | ❌ |
+| MTLSharedEvent sync | ✅ | ❌ | ➖ |
+| ExecGraph CB batching | ✅ | ❌ | ⚠️ CUDA Graphs |
+| Single Rust binary | ✅ | ❌ | ❌ |
+| Flash Attention 2 | ✅ | ✅ | ✅ |
+| GatherMM | ✅ | ✅ | ✅ |
+| QuantizedLinear | ✅ | ✅ | ✅ |
+| MLA (Multi-Latent Attention) | ✅ | ❌ | ⚠️ |
+| Sliding Window Attention | ✅ | ✅ | ✅ |
+| GGUF Model Loading | ✅ | ✅ | ✅ |
+| 9-dispatch decode (77×) | ✅ | ➖ lazy eval | ➖ |
 
 ## 🎯 Benchmark Results
 
-Measured on Apple Silicon, single transformer layer, Phase 9B-opt complete:
+Measured on Apple Silicon, single transformer layer:
 
-| Metric | Baseline | ExecGraph | Improvement |
-|--------|----------|-----------|-------------|
-| Latency / layer | ~112 ms | ~6.4 ms | **17.4x** speedup |
-| Command buffers / layer | 65 | 5 | 92.3% reduction |
-| CPU-GPU syncs | ~65 | ~1 | 98.5% reduction |
-| Numerical parity | -- | -- | max\_diff=6.4e-6 |
+| Path | Latency | Speedup |
+|------|---------|---------|
+| Baseline (per-op sync) | 109,215 us | 1x |
+| ExecGraph (5 CB) | 2,735 us | 40x |
+| Single-CB (44 enc) | 2,049 us | 53x |
+| 9-Dispatch (4 enc) | 1,411 us | **77x** |
+| MLX compiled | 1,342 us | — |
+| Gap to MLX | 69 us | **5.1%** |
 
 ## 🛠️ Feature Matrix
 
@@ -76,6 +78,7 @@ Measured on Apple Silicon, single transformer layer, Phase 9B-opt complete:
 
 **Infrastructure**
 - **ExecGraph pipeline** -- command buffer batching with 92.3% CB reduction
+- **9-dispatch decode path** -- merged weight projections, batched SDPA decode with slab KV cache, single-encoder + memory barriers (4 encoders for 9 dispatches), BM=8 GEMV with dynamic tile selection
 - **FP8 support** -- Float8E4M3 / Float8E5M2 dtypes with dequant/quant kernels
 - **GGUF format** -- binary parser for llama.cpp GGUF v2/v3 model files
 - **4 full model architectures** -- LlamaModel, Qwen2Model, DeepSeekV3Model (MLA+MoE), MixtralModel (SlidingWindow+MoE)
@@ -124,7 +127,7 @@ cd rmlx
 # Build the entire workspace
 cargo build --workspace
 
-# Run all tests (1142)
+# Run all tests (1298)
 cargo test --workspace
 
 # Format and lint check
@@ -145,7 +148,7 @@ rmlx launch --backend rdma --hostfile rmlx-hosts.json -- ibv_devices
 ## 📁 Project Structure
 
 ```
-rmlx/                           # 7 crates, 1142 tests
+rmlx/                           # 7 crates, 1298 tests
 ├── crates/
 │   ├── rmlx-metal/             # Metal GPU abstraction (ExecGraph, CommandBatcher, Fence, Capture)
 │   ├── rmlx-alloc/             # Zero-copy memory allocator (Residency, SmallAlloc)
@@ -165,11 +168,11 @@ rmlx/                           # 7 crates, 1142 tests
 | Metric | Value |
 |--------|-------|
 | Crates | 7 |
-| Tests | 1,142 |
+| Tests | 1,298 |
 | Op modules | 32+ |
 | NN activations | 16 |
 | Model architectures | 4 (LlamaModel, Qwen2Model, DeepSeekV3Model, MixtralModel) |
-| Implementation phases | 9 + S1-S5 + EP-1~EP-6 + Phase 3 (P3-1~P3-8) + Phase 4 (P4-1~P4-12) + Phase 5 |
+| Implementation phases | 9 + S1-S5 + EP-1~EP-6 + Phase 3 (P3-1~P3-8) + Phase 4 (P4-1~P4-12) + Phase 5 + Phase KO |
 | Audit items resolved | 76 (Phase 0 + 1 + 2 full-crate audit) |
 
 ## 📚 Documentation
