@@ -702,6 +702,132 @@ fn test_rms_norm_multi_row_large() {
     }
 }
 
+// ─── PR 4.7: fused RMSNorm + residual add ───
+
+#[test]
+fn test_rms_norm_residual_add_f32() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    let eps = 1e-5f32;
+
+    // Use a non-trivial size that exercises the N_READS=4 coalescing path
+    let rows = 2usize;
+    let axis_size = 128usize;
+
+    // Deterministic pseudo-random data via simple LCG
+    let mut seed: u64 = 42;
+    let mut next_f32 = || -> f32 {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((seed >> 33) as f32) / (u32::MAX as f32) * 2.0 - 1.0
+    };
+
+    let input_data: Vec<f32> = (0..rows * axis_size).map(|_| next_f32()).collect();
+    let residual_data: Vec<f32> = (0..rows * axis_size).map(|_| next_f32()).collect();
+    let weight_data: Vec<f32> = (0..axis_size).map(|_| next_f32().abs() + 0.1).collect();
+
+    let input = Array::from_slice(dev, &input_data, vec![rows, axis_size]);
+    let residual = Array::from_slice(dev, &residual_data, vec![rows, axis_size]);
+    let weight = Array::from_slice(dev, &weight_data, vec![axis_size]);
+
+    // ── Fused path ──
+    let (fused_out, fused_residual) =
+        ops::rms_norm::rms_norm_residual_add(&registry, &input, &residual, &weight, eps, &queue)
+            .expect("rms_norm_residual_add failed");
+
+    // ── Reference: separate add + rms_norm ──
+    // Compute expected_residual = input + residual (element-wise)
+    let expected_residual: Vec<f32> = input_data
+        .iter()
+        .zip(&residual_data)
+        .map(|(a, b)| a + b)
+        .collect();
+
+    // Compute expected_output = rms_norm(expected_residual, weight, eps) per row
+    let mut expected_output = vec![0.0f32; rows * axis_size];
+    for r in 0..rows {
+        let row_start = r * axis_size;
+        let row_end = row_start + axis_size;
+        let row = &expected_residual[row_start..row_end];
+        let sum_sq: f32 = row.iter().map(|x| x * x).sum();
+        let inv_rms = 1.0 / (sum_sq / axis_size as f32 + eps).sqrt();
+        for i in 0..axis_size {
+            expected_output[row_start + i] = row[i] * inv_rms * weight_data[i];
+        }
+    }
+
+    // ── Compare residual ──
+    let got_residual: Vec<f32> = fused_residual.to_vec_checked();
+    for (i, (&got, &exp)) in got_residual.iter().zip(&expected_residual).enumerate() {
+        assert!(
+            (got - exp).abs() < 1e-5,
+            "residual[{i}]: got {got}, expected {exp}, diff={}",
+            (got - exp).abs()
+        );
+    }
+
+    // ── Compare output ──
+    let got_output: Vec<f32> = fused_out.to_vec_checked();
+    for (i, (&got, &exp)) in got_output.iter().zip(&expected_output).enumerate() {
+        assert!(
+            (got - exp).abs() < 1e-5,
+            "output[{i}]: got {got}, expected {exp}, diff={}",
+            (got - exp).abs()
+        );
+    }
+}
+
+#[test]
+fn test_rms_norm_residual_add_matches_separate_ops() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    let eps = 1e-5f32;
+
+    let rows = 4usize;
+    let axis_size = 256usize;
+
+    // Deterministic data
+    let mut seed: u64 = 12345;
+    let mut next_f32 = || -> f32 {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((seed >> 33) as f32) / (u32::MAX as f32) * 2.0 - 1.0
+    };
+
+    let input_data: Vec<f32> = (0..rows * axis_size).map(|_| next_f32()).collect();
+    let residual_data: Vec<f32> = (0..rows * axis_size).map(|_| next_f32()).collect();
+    let weight_data: Vec<f32> = (0..axis_size).map(|_| next_f32().abs() + 0.1).collect();
+
+    let input = Array::from_slice(dev, &input_data, vec![rows, axis_size]);
+    let residual = Array::from_slice(dev, &residual_data, vec![rows, axis_size]);
+    let weight = Array::from_slice(dev, &weight_data, vec![axis_size]);
+
+    // ── Fused ──
+    let (fused_out, _fused_residual) =
+        ops::rms_norm::rms_norm_residual_add(&registry, &input, &residual, &weight, eps, &queue)
+            .expect("fused failed");
+
+    // ── Separate: binary add then rms_norm ──
+    let sum_arr = ops::binary::add(&registry, &input, &residual, &queue).expect("add failed");
+    let separate_out = ops::rms_norm::rms_norm(&registry, &sum_arr, &weight, eps, &queue)
+        .expect("rms_norm failed");
+
+    let fused_vals: Vec<f32> = fused_out.to_vec_checked();
+    let separate_vals: Vec<f32> = separate_out.to_vec_checked();
+
+    for (i, (&f, &s)) in fused_vals.iter().zip(&separate_vals).enumerate() {
+        assert!(
+            (f - s).abs() < 1e-5,
+            "mismatch at [{i}]: fused={f}, separate={s}, diff={}",
+            (f - s).abs()
+        );
+    }
+}
+
 // ─── RP0-6: binary quantized returns proper error ───
 
 #[test]

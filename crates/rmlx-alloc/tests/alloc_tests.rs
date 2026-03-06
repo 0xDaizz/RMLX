@@ -6,6 +6,7 @@ use std::time::Duration;
 use rmlx_alloc::allocator::MetalAllocator;
 use rmlx_alloc::buffer_pool::BufferPool;
 use rmlx_alloc::cache::BufferCache;
+use rmlx_alloc::leak_detector::LeakDetector;
 use rmlx_alloc::stats::AllocStats;
 use rmlx_alloc::zero_copy::{CompletionTicket, ZeroCopyBuffer};
 use rmlx_metal::device::GpuDevice;
@@ -105,7 +106,7 @@ fn test_metal_allocator_with_cache() {
     // Allocate and free
     let buf = allocator.alloc(8192).expect("alloc");
     assert!(buf.length() >= 8192);
-    allocator.free(buf);
+    allocator.free(buf).expect("free");
 
     // Second allocation should use cache (cache hit)
     let buf2 = allocator.alloc(8192).expect("alloc2");
@@ -116,7 +117,7 @@ fn test_metal_allocator_with_cache() {
     assert!(stats.total_allocs() >= 1);
     assert!(stats.cache_hits() >= 1);
 
-    allocator.free(buf2);
+    allocator.free(buf2).expect("free2");
 }
 
 #[test]
@@ -170,7 +171,7 @@ fn test_allocator_block_limit() {
         "allocation exceeding block limit should fail"
     );
 
-    allocator.free(buf);
+    allocator.free(buf).expect("free");
 }
 
 // --- CompletionTicket + GpuEvent integration tests ---
@@ -327,4 +328,111 @@ fn test_buffer_pool_pending_drain() {
     pool.release(buf2);
     let _buf3 = pool.acquire(&device).expect("acquire3");
     assert_eq!(pool.pending_count(), 0); // drained
+}
+
+// --- PR 4.3: Small-buffer pool wiring tests ---
+
+#[test]
+fn test_small_alloc_uses_pool() {
+    let device = match require_gpu() {
+        Some(d) => d,
+        None => return,
+    };
+
+    let allocator = MetalAllocator::new(Arc::clone(&device), 1024 * 1024);
+    let initial_free = allocator.small_pool().free_count();
+
+    // Allocate a small buffer (<256 B) — should route through SmallBufferPool.
+    let buf = allocator.alloc(64).expect("small alloc should succeed");
+    assert!(buf.length() > 0);
+
+    // The small pool should have one fewer free slot.
+    let after_alloc_free = allocator.small_pool().free_count();
+    assert_eq!(
+        after_alloc_free,
+        initial_free - 1,
+        "small pool should have consumed one slot"
+    );
+
+    // Free the buffer — slot should be returned to the pool.
+    allocator.free(buf).expect("free should succeed");
+    let after_free = allocator.small_pool().free_count();
+    assert_eq!(
+        after_free, initial_free,
+        "small pool slot should be returned after free"
+    );
+}
+
+#[test]
+fn test_large_alloc_bypasses_small_pool() {
+    let device = match require_gpu() {
+        Some(d) => d,
+        None => return,
+    };
+
+    let allocator = MetalAllocator::new(Arc::clone(&device), 1024 * 1024);
+    let initial_free = allocator.small_pool().free_count();
+
+    // Allocate a buffer larger than MAX_SMALL_ALLOC (256 B).
+    let buf = allocator.alloc(4096).expect("large alloc should succeed");
+    assert!(buf.length() >= 4096);
+
+    // Small pool should be untouched.
+    assert_eq!(
+        allocator.small_pool().free_count(),
+        initial_free,
+        "small pool should not be used for large allocations"
+    );
+
+    allocator.free(buf).expect("free should succeed");
+}
+
+// --- PR 4.3: LeakDetector wiring tests ---
+
+#[test]
+fn test_leak_detector_tracks_alloc_free() {
+    let device = match require_gpu() {
+        Some(d) => d,
+        None => return,
+    };
+
+    let allocator = MetalAllocator::new(Arc::clone(&device), 1024 * 1024);
+    assert_eq!(allocator.leak_detector().outstanding_allocs(), 0);
+
+    let buf1 = allocator.alloc(4096).expect("alloc1");
+    assert_eq!(allocator.leak_detector().outstanding_allocs(), 1);
+
+    let buf2 = allocator.alloc(8192).expect("alloc2");
+    assert_eq!(allocator.leak_detector().outstanding_allocs(), 2);
+
+    allocator.free(buf1).expect("free1");
+    assert_eq!(allocator.leak_detector().outstanding_allocs(), 1);
+
+    allocator.free(buf2).expect("free2");
+    assert_eq!(allocator.leak_detector().outstanding_allocs(), 0);
+    assert_eq!(allocator.leak_detector().outstanding_bytes(), 0);
+}
+
+#[test]
+fn test_leak_detector_catches_leak() {
+    let detector = LeakDetector::new();
+
+    // Simulate allocating 2 MiB without freeing.
+    detector.record_alloc(2 * 1024 * 1024);
+    assert!(
+        detector.has_potential_leak(),
+        "detector should flag potential leak for >1 MiB outstanding"
+    );
+
+    let report = detector.report();
+    assert_eq!(report.outstanding_allocs, 1);
+    assert_eq!(report.outstanding_bytes, 2 * 1024 * 1024);
+    assert!(report.potential_leak);
+
+    // Free the allocation — leak flag should clear.
+    detector.record_free(2 * 1024 * 1024);
+    assert!(
+        !detector.has_potential_leak(),
+        "detector should clear after freeing all allocations"
+    );
 }

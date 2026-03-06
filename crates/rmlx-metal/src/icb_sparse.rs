@@ -20,6 +20,7 @@
 //! counts are encoded into the command buffer.
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 
 use metal::{Buffer, ComputePipelineState, MTLSize};
 
@@ -317,6 +318,196 @@ impl SparseExpertPlan {
         self.expert_dispatches
             .get(expert_id)
             .is_some_and(|e| e.is_some())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Grouped forward with ICB sparse dispatch
+// ---------------------------------------------------------------------------
+
+/// Result of a sparse ICB dispatch, containing per-expert dispatch metadata.
+#[derive(Debug, Clone)]
+pub struct SparseDispatchResult {
+    /// Number of experts that were actually dispatched (count > 0).
+    pub dispatched_count: usize,
+    /// Bitmask of active experts (expert_id -> true if dispatched).
+    pub active_mask: Vec<bool>,
+}
+
+/// Compute a hash key from the active expert mask for ICB replay caching.
+///
+/// Two invocations with the same set of active experts (same sparsity pattern)
+/// will produce the same hash, enabling ICB replay without re-encoding.
+fn compute_sparsity_hash(expert_counts: &[u32]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for (i, &count) in expert_counts.iter().enumerate() {
+        // Hash only the active/inactive status, not the exact count,
+        // so that different token counts but same active set share a key.
+        let active = if count > 0 { 1u8 } else { 0u8 };
+        i.hash(&mut hasher);
+        active.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// Encode only active experts into a command buffer using the sparse plan.
+///
+/// This is the core ICB sparse dispatch function: given expert counts from
+/// top-k routing, it encodes GEMM dispatches only for experts with non-zero
+/// token counts, skipping empty experts entirely. This avoids wasting GPU
+/// cycles on experts that received no routed tokens.
+///
+/// # Arguments
+///
+/// * `plan` - Pre-built sparse expert plan with per-expert dispatch templates.
+/// * `expert_counts` - Per-expert token counts from routing, length `E`.
+/// * `expert_input_buf` - Stacked input buffer for all expert tokens.
+/// * `expert_output_buf` - Stacked output buffer for all expert tokens.
+/// * `dispatch_offsets` - `[E+1]` prefix sum of token offsets into stacked buffers.
+/// * `queue` - Metal command queue to submit work on.
+///
+/// # Returns
+///
+/// A `SparseDispatchResult` with the number of dispatched experts and the active mask.
+pub fn grouped_forward_icb(
+    plan: &SparseExpertPlan,
+    expert_counts: &[u32],
+    expert_input_buf: &Buffer,
+    expert_output_buf: &Buffer,
+    dispatch_offsets: &[u32],
+    queue: &metal::CommandQueue,
+) -> SparseDispatchResult {
+    let active_mask: Vec<bool> = expert_counts.iter().map(|&c| c > 0).collect();
+    let active_count = active_mask.iter().filter(|&&a| a).count();
+
+    if active_count == 0 {
+        return SparseDispatchResult {
+            dispatched_count: 0,
+            active_mask,
+        };
+    }
+
+    // Encode only active experts into a single command buffer via the plan's
+    // replay_sparse method, which already skips empty experts.
+    let cb = queue.new_command_buffer();
+    let dispatched = plan.replay_sparse(
+        expert_counts,
+        expert_input_buf,
+        expert_output_buf,
+        dispatch_offsets,
+        cb,
+    );
+    cb.commit();
+    cb.wait_until_completed();
+
+    SparseDispatchResult {
+        dispatched_count: dispatched,
+        active_mask,
+    }
+}
+
+/// Cache for ICB replay keyed by sparsity pattern.
+///
+/// When the same set of active experts is seen across multiple forward passes
+/// (common in decode phase where routing is stable), the cached dispatch
+/// metadata can be reused to skip re-analysis of the sparsity pattern.
+///
+/// The cache key is a hash of the active expert bitmask, not the exact
+/// token counts -- so different batch sizes with the same active experts
+/// share a cache entry.
+pub struct IcbReplayCache {
+    /// Map from sparsity pattern hash -> cached dispatch result metadata.
+    cache: HashMap<u64, CachedSparsityPattern>,
+    /// Maximum number of entries before eviction.
+    max_entries: usize,
+}
+
+/// Cached information about a sparsity pattern.
+#[derive(Debug, Clone)]
+pub struct CachedSparsityPattern {
+    /// The active expert mask for this pattern.
+    pub active_mask: Vec<bool>,
+    /// Number of active experts.
+    pub active_count: usize,
+    /// Number of times this pattern has been replayed.
+    pub replay_count: u64,
+}
+
+impl IcbReplayCache {
+    /// Create a new cache with the given maximum entry count.
+    pub fn new(max_entries: usize) -> Self {
+        Self {
+            cache: HashMap::new(),
+            max_entries,
+        }
+    }
+
+    /// Look up a cached sparsity pattern by expert counts.
+    ///
+    /// Returns the cached pattern if the same set of active experts has been
+    /// seen before, along with the hash key for updating replay count.
+    pub fn lookup(&self, expert_counts: &[u32]) -> Option<(u64, &CachedSparsityPattern)> {
+        let key = compute_sparsity_hash(expert_counts);
+        self.cache.get(&key).map(|pattern| (key, pattern))
+    }
+
+    /// Record a sparsity pattern after a dispatch, or increment replay count
+    /// if already cached.
+    pub fn record(&mut self, expert_counts: &[u32]) {
+        let key = compute_sparsity_hash(expert_counts);
+        if let Some(entry) = self.cache.get_mut(&key) {
+            entry.replay_count += 1;
+            return;
+        }
+
+        // Evict oldest entry if at capacity (simple FIFO via oldest replay_count).
+        if self.cache.len() >= self.max_entries {
+            let evict_key = self
+                .cache
+                .iter()
+                .min_by_key(|(_, v)| v.replay_count)
+                .map(|(&k, _)| k);
+            if let Some(k) = evict_key {
+                self.cache.remove(&k);
+            }
+        }
+
+        let active_mask: Vec<bool> = expert_counts.iter().map(|&c| c > 0).collect();
+        let active_count = active_mask.iter().filter(|&&a| a).count();
+        self.cache.insert(
+            key,
+            CachedSparsityPattern {
+                active_mask,
+                active_count,
+                replay_count: 1,
+            },
+        );
+    }
+
+    /// Number of cached patterns.
+    pub fn len(&self) -> usize {
+        self.cache.len()
+    }
+
+    /// Whether the cache is empty.
+    pub fn is_empty(&self) -> bool {
+        self.cache.is_empty()
+    }
+
+    /// Clear all cached patterns.
+    pub fn clear(&mut self) {
+        self.cache.clear();
+    }
+
+    /// Maximum number of entries.
+    pub fn max_entries(&self) -> usize {
+        self.max_entries
+    }
+}
+
+impl Default for IcbReplayCache {
+    fn default() -> Self {
+        Self::new(64)
     }
 }
 
@@ -816,6 +1007,187 @@ mod tests {
         k1.hash(&mut h1);
         k2.hash(&mut h2);
         assert_eq!(h1.finish(), h2.finish());
+    }
+
+    // ── grouped_forward_icb tests ─────────────────────────────────────
+
+    #[test]
+    fn grouped_forward_icb_skips_empty_experts() {
+        let device = metal::Device::system_default().expect("Metal device required");
+        let queue = device.new_command_queue();
+
+        let (plan, _bufs) = build_test_plan(&device, 4, 64, 128);
+
+        // Experts 0 and 2 active, 1 and 3 empty
+        let expert_counts = [3u32, 0, 5, 0];
+        let dispatch_offsets = [0u32, 3, 3, 8, 8];
+
+        let total_tokens = 8u64;
+        let hidden = 64u64;
+        let elem_size = 2u64;
+        let buf_size = total_tokens * hidden * elem_size;
+
+        let input_buf = device.new_buffer(buf_size, metal::MTLResourceOptions::StorageModeShared);
+        let output_buf = device.new_buffer(buf_size, metal::MTLResourceOptions::StorageModeShared);
+
+        let result = grouped_forward_icb(
+            &plan,
+            &expert_counts,
+            &input_buf,
+            &output_buf,
+            &dispatch_offsets,
+            &queue,
+        );
+
+        assert_eq!(result.dispatched_count, 2);
+        assert_eq!(result.active_mask, vec![true, false, true, false]);
+    }
+
+    #[test]
+    fn grouped_forward_icb_all_empty() {
+        let device = metal::Device::system_default().expect("Metal device required");
+        let queue = device.new_command_queue();
+
+        let (plan, _bufs) = build_test_plan(&device, 4, 64, 128);
+
+        let expert_counts = [0u32; 4];
+        let dispatch_offsets = [0u32; 5];
+
+        let input_buf = device.new_buffer(4096, metal::MTLResourceOptions::StorageModeShared);
+        let output_buf = device.new_buffer(4096, metal::MTLResourceOptions::StorageModeShared);
+
+        let result = grouped_forward_icb(
+            &plan,
+            &expert_counts,
+            &input_buf,
+            &output_buf,
+            &dispatch_offsets,
+            &queue,
+        );
+
+        assert_eq!(result.dispatched_count, 0);
+        assert!(result.active_mask.iter().all(|&a| !a));
+    }
+
+    // ── IcbReplayCache tests ────────────────────────────────────────────
+
+    #[test]
+    fn replay_cache_new_is_empty() {
+        let cache = IcbReplayCache::new(32);
+        assert!(cache.is_empty());
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.max_entries(), 32);
+    }
+
+    #[test]
+    fn replay_cache_default() {
+        let cache = IcbReplayCache::default();
+        assert!(cache.is_empty());
+        assert_eq!(cache.max_entries(), 64);
+    }
+
+    #[test]
+    fn replay_cache_record_and_lookup() {
+        let mut cache = IcbReplayCache::new(16);
+
+        let counts_a = [3u32, 0, 5, 0];
+        let counts_b = [0u32, 2, 0, 4];
+
+        // Record pattern A
+        cache.record(&counts_a);
+        assert_eq!(cache.len(), 1);
+
+        // Lookup pattern A
+        let (_key_a, pattern_a) = cache.lookup(&counts_a).expect("pattern A should be cached");
+        assert_eq!(pattern_a.active_mask, vec![true, false, true, false]);
+        assert_eq!(pattern_a.active_count, 2);
+        assert_eq!(pattern_a.replay_count, 1);
+
+        // Record same pattern again -> replay_count increments
+        cache.record(&counts_a);
+        let (_, pattern_a2) = cache.lookup(&counts_a).unwrap();
+        assert_eq!(pattern_a2.replay_count, 2);
+        assert_eq!(cache.len(), 1); // still just one entry
+
+        // Record different pattern
+        cache.record(&counts_b);
+        assert_eq!(cache.len(), 2);
+        let (_, pattern_b) = cache.lookup(&counts_b).unwrap();
+        assert_eq!(pattern_b.active_mask, vec![false, true, false, true]);
+        assert_eq!(pattern_b.active_count, 2);
+    }
+
+    #[test]
+    fn replay_cache_same_active_set_different_counts() {
+        let mut cache = IcbReplayCache::new(16);
+
+        // Same active experts (0 and 2), different token counts
+        let counts_a = [3u32, 0, 5, 0];
+        let counts_b = [10u32, 0, 1, 0];
+
+        cache.record(&counts_a);
+        // Should produce the same hash since active mask is the same
+        let result = cache.lookup(&counts_b);
+        assert!(
+            result.is_some(),
+            "same active mask should share cache entry"
+        );
+    }
+
+    #[test]
+    fn replay_cache_eviction() {
+        let mut cache = IcbReplayCache::new(2);
+
+        cache.record(&[1u32, 0, 0, 0]); // pattern A, replay=1
+        cache.record(&[0u32, 1, 0, 0]); // pattern B, replay=1
+        assert_eq!(cache.len(), 2);
+
+        // Bump pattern A's replay count
+        cache.record(&[1u32, 0, 0, 0]); // pattern A now replay=2
+
+        // Insert pattern C -> should evict pattern B (lower replay count)
+        cache.record(&[0u32, 0, 1, 0]);
+        assert_eq!(cache.len(), 2);
+
+        // Pattern A should still be present
+        assert!(cache.lookup(&[1u32, 0, 0, 0]).is_some());
+        // Pattern B should be evicted
+        assert!(cache.lookup(&[0u32, 1, 0, 0]).is_none());
+    }
+
+    #[test]
+    fn replay_cache_clear() {
+        let mut cache = IcbReplayCache::new(16);
+        cache.record(&[1u32, 0, 0, 0]);
+        cache.record(&[0u32, 1, 0, 0]);
+        assert_eq!(cache.len(), 2);
+        cache.clear();
+        assert!(cache.is_empty());
+    }
+
+    // ── sparsity hash tests ─────────────────────────────────────────────
+
+    #[test]
+    fn sparsity_hash_deterministic() {
+        let counts = [3u32, 0, 5, 0];
+        let h1 = compute_sparsity_hash(&counts);
+        let h2 = compute_sparsity_hash(&counts);
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn sparsity_hash_same_active_set() {
+        // Different counts but same active experts -> same hash
+        let h1 = compute_sparsity_hash(&[3u32, 0, 5, 0]);
+        let h2 = compute_sparsity_hash(&[10u32, 0, 1, 0]);
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn sparsity_hash_different_active_set() {
+        let h1 = compute_sparsity_hash(&[3u32, 0, 5, 0]);
+        let h2 = compute_sparsity_hash(&[0u32, 3, 0, 5]);
+        assert_ne!(h1, h2);
     }
 
     // ── Test helpers ─────────────────────────────────────────────────────

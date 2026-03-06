@@ -4,7 +4,7 @@
 
 `rmlx-distributed` is a crate providing communication groups, MoE (Mixture of Experts) dispatch/combine exchange, 3-zone backend policy, compute-RDMA pipeline overlap, overflow monitoring (SparseGuard), variable-length EP packet protocol, FP8 exchange path, RDMA slab-ring transport, distributed initialization, warmup protocol, and MoE metrics for distributed inference.
 
-> **Status:** All modules are implemented: group, init, moe_exchange, moe_policy, pipeline, sparse_guard, warmup, metrics, v3_protocol, fp8_exchange, slab_ring, moe_kernels. Phase 0+1+2 audit remediation complete (items D1-D10): dispatch loop ordering fixed (k-outer), per-rank capacity partitioning, combine kernel caching, byte threshold (4KB->2MB), hysteresis path fix, dual cooldown semantics, shared expert support, EP integration improvements. EP-3/EP-5/EP-6 optimization additions complete. EP-2~EP-6 forward path integration: `MoeDispatchConfig::new()` constructor, `dispatch_fp8()` convenience method, `WireProtocol::V3` support in all dispatch paths, SlabRing integration in `route_rdma`, FP8 wire helpers (`pack_for_wire`, `unpack_from_wire`, `wire_token_stride`). **Production Readiness Phase 2 (distributed correctness):** new `moe_kernels.rs` (JIT-compiled MoE Metal kernels), `ExchangeBuffers` struct + `acquire_exchange_buffers()` in moe_exchange, `AcquiredBuffer` lifecycle + `acquire_send_recv_buffers()` in ep_runtime, CAS-based TOCTOU race fix in slab_ring, deadlock fix (interleaved send/recv) in v3_protocol, unknown backend now errors in init. **Phase 3 additions:** ring allreduce element-aligned chunk rounding fix (f16/bf16 reduction via `half` crate, NaN preservation); MoePolicy thread safety via interior mutability (RwLock), all methods now take `&self`, implements Send+Sync.
+> **Status:** All modules are implemented: group, init, moe_exchange, moe_policy, pipeline, sparse_guard, warmup, metrics, v3_protocol, fp8_exchange, slab_ring, moe_kernels. Phase 0+1+2 audit remediation complete (items D1-D10): dispatch loop ordering fixed (k-outer), per-rank capacity partitioning, combine kernel caching, byte threshold (4KB->2MB), hysteresis path fix, dual cooldown semantics, shared expert support, EP integration improvements. EP-3/EP-5/EP-6 optimization additions complete. EP-2~EP-6 forward path integration: `MoeDispatchConfig::new()` constructor, `dispatch_fp8()` convenience method, `WireProtocol::V3` support in all dispatch paths, SlabRing integration in `route_rdma`, FP8 wire helpers (`pack_for_wire`, `unpack_from_wire`, `wire_token_stride`). **Production Readiness Phase 2 (distributed correctness):** new `moe_kernels.rs` (JIT-compiled MoE Metal kernels), `ExchangeBuffers` struct + `acquire_exchange_buffers()` in moe_exchange, `AcquiredBuffer` lifecycle + `acquire_send_recv_buffers()` in ep_runtime, CAS-based TOCTOU race fix in slab_ring, deadlock fix (interleaved send/recv) in v3_protocol, unknown backend now errors in init. **Phase 3 additions:** ring allreduce element-aligned chunk rounding fix (f16/bf16 reduction via `half` crate, NaN preservation); MoePolicy thread safety via interior mutability (RwLock), all methods now take `&self`, implements Send+Sync. **Phase 4 additions:** SlabRing condvar backpressure — `acquire_for_write` blocks when ring is full instead of failing, `ring_full_count` metric for monitoring (P4-9); ProgressEngine wiring for EP dispatch with consecutive-error threshold for automatic failover (P4-10).
 
 ---
 
@@ -36,6 +36,18 @@ rmlx-distributed/src/
 | `v3_protocol.rs` | Variable-length two-phase exchange (count sendrecv + payload sendrecv), packed 4-byte `PacketMeta` header, 16-byte packet alignment |
 | `fp8_exchange.rs` | Per-token FP8 E4M3 wire format, fused `dequant_scatter_fp8e4m3` decode path with `_into_cb` support, wire helpers (`pack_for_wire`, `unpack_from_wire`, `wire_token_stride`) |
 | `slab_ring.rs` | Pre-registered `MTLBuffer` slab ring for zero-copy RDMA producer/consumer flow synchronized via `GpuEvent` timeline; integrated into `route_rdma` for pre-allocated `local_output` buffers |
+
+## Phase 4 Additions
+
+### SlabRing Condvar Backpressure (P4-9)
+
+The `SlabRing` now supports condvar-based backpressure. When the ring is full, `acquire_for_write()` blocks the calling thread on a condition variable until a slab becomes available, rather than returning an error. This prevents token drops under sustained load and simplifies caller error handling. A `ring_full_count` atomic metric tracks how many times the ring reached full capacity, enabling monitoring of backpressure events.
+
+### ProgressEngine Integration (P4-10)
+
+A `ProgressEngine` is now wired into the EP dispatch path for RDMA transport monitoring. The engine tracks consecutive RDMA errors per peer and triggers automatic failover (switching to loopback or CPU backend) when a configurable consecutive-error threshold is exceeded. This improves resilience during transient network failures without requiring manual intervention.
+
+---
 
 ## Phase 3 Additions
 

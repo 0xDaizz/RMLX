@@ -1,6 +1,6 @@
-# Implementation Roadmap — Phases 0-9B + S1-S5 + Audit Remediation + Phase 3 Complete
+# Implementation Roadmap — Phases 0-9B + S1-S5 + Audit Remediation + Phase 3 + Phase 4 Complete
 
-The rmlx project implementation roadmap. All phases through 9B-opt and serving support phases S1-S5 are complete. A full-crate audit (Phases 0, 1, 2) has been completed with 76 remediation items resolved across all 6 crates. Phase 3 adds FlashAttention-2 Metal kernel, paged KV cache, continuous batching scheduler, centralized CB commit, f16/bf16 RDMA collectives, ring allreduce chunk rounding fix, MoePolicy thread safety, and CLI signal forwarding. Current test count: 543+.
+The rmlx project implementation roadmap. All phases through 9B-opt and serving support phases S1-S5 are complete. A full-crate audit (Phases 0, 1, 2) has been completed with 76 remediation items resolved across all 6 crates. Phase 3 adds FlashAttention-2 Metal kernel, paged KV cache, continuous batching scheduler, centralized CB commit, f16/bf16 RDMA collectives, ring allreduce chunk rounding fix, MoePolicy thread safety, and CLI signal forwarding. Phase 4 adds performance and allocator improvements: atomic CAS allocation limits, pointer ownership validation, SmallBufferPool/LeakDetector/ResidencyManager wiring, ChipTuning per-generation GPU tuning, DiskPipelineCache with sha2 hashing, HazardTrackingModeUntracked, fused RMSNorm+residual add kernel, gather_mm batched MoE strategy, SlabRing condvar backpressure, ProgressEngine EP dispatch wiring, ICB sparse expert dispatch, and BFC-style allocator. Current test count: 1,003+.
 
 ---
 
@@ -43,6 +43,17 @@ The rmlx project implementation roadmap. All phases through 9B-opt and serving s
 | P3-6 | Ring Allreduce Chunk Rounding | Element-aligned chunks, f16/bf16 reduction via `half` crate, NaN preservation | P3-5 | Complete |
 | P3-7 | MoePolicy Thread Safety | Interior mutability via RwLock, `&self` methods, Send+Sync | EP-6 | Complete |
 | P3-8 | CLI Signal Forwarding | ctrlc handler, process cleanup in rmlx-cli launch.rs | EP-6 | Complete |
+| P4-1+2 | Atomic CAS Limits + Pointer Tracking | CAS reservation loop, HashSet+Mutex ownership, saturating_sub dealloc | P3 | Complete |
+| P4-3 | SmallBufferPool + LeakDetector + ResidencyManager Wiring | SmallBufferPool for ≤256B, LeakDetector alloc/free tracking, Metal 3 ResidencyManager | P4-1+2 | Complete |
+| P4-4 | ChipTuning | Per-generation GPU tuning (M1/M2/M3/M4) in GpuDevice | P3 | Complete |
+| P4-5 | DiskPipelineCache | sha2-hashed pipeline binary archive at ~/.cache/rmlx/pipelines/ | P4-4 | Complete |
+| P4-6 | HazardTrackingModeUntracked | Bit 0x10 for manual hazard tracking in buffer creation | P4-4 | Complete |
+| P4-7 | Fused RMSNorm+Residual Add | JIT Metal kernel combining input+residual add and RMSNorm | P3-4 | Complete |
+| P4-8 | gather_mm Batched MoE | gather_mm batched strategy replacing per-expert loop in MoE forward | P4-7 | Complete |
+| P4-9 | SlabRing Condvar Backpressure | acquire_for_write blocks when full, ring_full_count metric | EP-6 | Complete |
+| P4-10 | ProgressEngine EP Dispatch | ProgressEngine wiring with consecutive-error threshold | P4-9 | Complete |
+| P4-11 | ICB Sparse Expert Dispatch | grouped_forward_icb(), IcbReplay per-sparsity cache, forward_sparse_icb() | P4-8 + P4-10 | Complete |
+| P4-12 | BFC Allocator | BfcAllocator with block splitting, coalescing, best-fit BTreeMap | P4-1+2 | Complete |
 | EP-7 | ICB Full Metal Indirect Dispatch | Wire SparseExpertPlan into ExpertGroup GEMM encoding via Metal ICB indirect dispatch; skip empty experts at GPU command level | EP-6 | Planned |
 
 ---
@@ -91,6 +102,17 @@ The rmlx project implementation roadmap. All phases through 9B-opt and serving s
 | P3-6: Ring Allreduce Chunk Rounding | main (merged) | 543+ tests | Complete |
 | P3-7: MoePolicy Thread Safety | main (merged) | 543+ tests | Complete |
 | P3-8: CLI Signal Forwarding | main (merged) | 543+ tests | Complete |
+| P4-1+2: Atomic CAS Limits + Pointer Tracking | feat/phase4 (merged) | 1,003 tests | Complete |
+| P4-3: SmallBufferPool + LeakDetector + ResidencyManager Wiring | feat/phase4 (merged) | 1,003 tests | Complete |
+| P4-4: ChipTuning | feat/phase4 (merged) | 1,003 tests | Complete |
+| P4-5: DiskPipelineCache | feat/phase4 (merged) | 1,003 tests | Complete |
+| P4-6: HazardTrackingModeUntracked | feat/phase4 (merged) | 1,003 tests | Complete |
+| P4-7: Fused RMSNorm+Residual Add | feat/phase4 (merged) | 1,003 tests | Complete |
+| P4-8: gather_mm Batched MoE | feat/phase4 (merged) | 1,003 tests | Complete |
+| P4-9: SlabRing Condvar Backpressure | feat/phase4 (merged) | 1,003 tests | Complete |
+| P4-10: ProgressEngine EP Dispatch | feat/phase4 (merged) | 1,003 tests | Complete |
+| P4-11: ICB Sparse Expert Dispatch | feat/phase4 (merged) | 1,003 tests | Complete |
+| P4-12: BFC Allocator | feat/phase4 (merged) | 1,003 tests | Complete |
 | EP-7: ICB Full Metal Indirect Dispatch | -- | -- | Planned |
 
 ---
@@ -634,7 +656,7 @@ Post-audit EP optimization phases were merged into main to remove the remaining 
 | EP-5 | `crates/rmlx-core/src/ops/fp8.rs`, `crates/rmlx-distributed/src/fp8_exchange.rs` | Per-token FP8 E4M3 wire format, fused `dequant_scatter_fp8e4m3`, `_into_cb` pipelining variants | Complete |
 | EP-6 | `crates/rmlx-metal/src/icb_sparse.rs`, `crates/rmlx-distributed/src/slab_ring.rs` | Sparse expert ICB launch cache + pre-registered RDMA slab ring with `GpuEvent` timeline sync | Complete |
 
-Current op module count: 27+. Current test count: 543+.
+Current op module count: 27+. Current test count: 1,003+.
 
 ---
 
@@ -652,6 +674,26 @@ Phase 3 delivers serving-critical infrastructure (FlashAttention-2 Metal kernel,
 | P3-6 | `crates/rmlx-distributed/` | Ring allreduce element-aligned chunk rounding, f16/bf16 reduction via `half` crate, NaN preservation | Complete |
 | P3-7 | `crates/rmlx-distributed/src/moe_policy.rs` | MoePolicy interior mutability via RwLock, all methods take `&self`, Send+Sync | Complete |
 | P3-8 | `crates/rmlx-cli/src/launch.rs` | ctrlc signal handler, child process cleanup on SIGINT/SIGTERM | Complete |
+
+---
+
+## Phase 4: Performance and Allocator -- Complete
+
+Phase 4 delivers performance optimizations and allocator hardening across all crates (12 PRs, P4-1 through P4-12). Test count grew from 543 to 1,003.
+
+| PR | Crates | Core Changes | Status |
+|----|--------|--------------|--------|
+| P4-1+2 | rmlx-alloc | Atomic CAS reservation loop for memory limit enforcement; pointer tracking (HashSet+Mutex) for ownership validation; stats `fetch_update` with `saturating_sub` for deallocation underflow prevention | Complete |
+| P4-3 | rmlx-alloc | SmallBufferPool wired into MetalAllocator for ≤256B allocations; LeakDetector wired for alloc/free tracking; ResidencyManager (optional) for Metal 3 runtime detection | Complete |
+| P4-4 | rmlx-metal | `ChipTuning` struct with per-generation GPU tuning (M1/M2/M3/M4) integrated into GpuDevice | Complete |
+| P4-5 | rmlx-metal | `DiskPipelineCache` using sha2 hashing for pipeline binary archive at `~/.cache/rmlx/pipelines/` | Complete |
+| P4-6 | rmlx-metal, rmlx-alloc | HazardTrackingModeUntracked (bit 0x10) added to buffer creation for manual hazard tracking | Complete |
+| P4-7 | rmlx-core | Fused `rms_norm_residual_add` JIT Metal kernel combining input+residual add and RMSNorm in single dispatch | Complete |
+| P4-8 | rmlx-nn | gather_mm batched strategy replacing per-expert loop in MoE forward | Complete |
+| P4-9 | rmlx-distributed | SlabRing condvar backpressure: `acquire_for_write` blocks when full, `ring_full_count` metric | Complete |
+| P4-10 | rmlx-distributed, rmlx-rdma | ProgressEngine wiring for EP dispatch with consecutive-error threshold | Complete |
+| P4-11 | rmlx-metal, rmlx-nn | ICB Sparse Expert Dispatch: `grouped_forward_icb()` for active experts only, `IcbReplay` per-sparsity-pattern cache, `forward_sparse_icb()` in moe.rs | Complete |
+| P4-12 | rmlx-alloc | BFC-style allocator (`BfcAllocator`) with block splitting, coalescing, and best-fit BTreeMap lookup | Complete |
 
 ---
 

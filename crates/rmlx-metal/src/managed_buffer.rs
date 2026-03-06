@@ -68,9 +68,7 @@ impl ManagedBuffer {
         allocator: Arc<dyn BufferAllocator>,
         size: usize,
     ) -> Result<Self, String> {
-        let options =
-            MTLResourceOptions::StorageModeShared | MTLResourceOptions::HazardTrackingModeUntracked;
-        Self::alloc(allocator, size, options)
+        Self::alloc(allocator, size, crate::device::DEFAULT_BUFFER_OPTIONS)
     }
 
     /// Access the underlying Metal buffer.

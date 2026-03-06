@@ -4,7 +4,7 @@
 
 `rmlx-core` is the Metal GPU compute engine, providing data types, N-dimensional arrays, a kernel registry, GPU compute kernels, automatic differentiation, LoRA fine-tuning, runtime metrics, structured logging, numerical stability monitoring, and graceful shutdown.
 
-> **Status:** DType (with FP8), Array, KernelRegistry, **27+ op modules** (including SDPA/FA2 with bf16 + backward, SiLU/SwiGLU, GELU, FP8 dequant/quant, Conv1d/Conv2d, tiled conv, GatherMM, LayerNorm, unary ops, concat, select, VJP GPU), GGUF format parser, AWQ/GPTQ dequant, VJP autodiff, LoRA, logging, metrics, PrecisionGuard, and ShutdownSignal are all implemented. Phase 0+1+2 audit remediation complete (items C1-C9). **Phase 3 additions:** FlashAttention-2 Metal kernel (`flash_attention.rs`) with tiled online softmax, f32 head_dim=128, causal mask, and naive SDPA fallback; all ops routed through centralized `commit_with_mode()` with sync/async `ExecMode` and `CommandBufferHandle` for async tracking.
+> **Status:** DType (with FP8), Array, KernelRegistry, **27+ op modules** (including SDPA/FA2 with bf16 + backward, SiLU/SwiGLU, GELU, FP8 dequant/quant, Conv1d/Conv2d, tiled conv, GatherMM, LayerNorm, unary ops, concat, select, VJP GPU), GGUF format parser, AWQ/GPTQ dequant, VJP autodiff, LoRA, logging, metrics, PrecisionGuard, and ShutdownSignal are all implemented. Phase 0+1+2 audit remediation complete (items C1-C9). **Phase 3 additions:** FlashAttention-2 Metal kernel (`flash_attention.rs`) with tiled online softmax, f32 head_dim=128, causal mask, and naive SDPA fallback; all ops routed through centralized `commit_with_mode()` with sync/async `ExecMode` and `CommandBufferHandle` for async tracking. **Phase 4 addition:** Fused `rms_norm_residual_add` JIT Metal kernel combining input+residual add and RMSNorm in a single GPU dispatch.
 
 ---
 
@@ -197,6 +197,7 @@ pub fn register_all(registry: &KernelRegistry) -> Result<(), KernelError> {
 | `select` | Select | Index select (gather along a dimension) |
 | `conv_tiled` | Tiled Conv | Tiled convolution for large inputs |
 | `flash_attention` | FlashAttention-2 Metal | Tiled online softmax Metal kernel, f32 head_dim=128, causal mask, falls back to naive SDPA for unsupported configs |
+| `rms_norm_residual_add` | Fused RMSNorm+Residual | Single-dispatch kernel combining input+residual add and RMSNorm (Phase 4) |
 | `vjp_gpu` | VJP GPU | GPU-accelerated backward pass for VJP |
 
 ### silu.rs — SiLU Activation + Fused SwiGLU
@@ -278,6 +279,24 @@ Single-kernel computation of `softmax(Q @ K^T / sqrt(d) + mask) @ V` using onlin
 **Constraints:**
 - head_dim <= 256 (D<=128 uses shared memory tiles; D>128 uses split approach)
 - Supported dtypes: Float32, Float16
+
+### rms_norm_residual_add — Fused RMSNorm + Residual Add (Phase 4)
+
+A JIT-compiled Metal kernel that fuses the residual connection addition and RMS normalization into a single GPU dispatch. This eliminates one intermediate buffer and one kernel launch per transformer block.
+
+| Function | Description |
+|----------|-------------|
+| `rms_norm_residual_add(registry, input, residual, weight, eps, queue)` | Computes `rms_norm(weight, input + residual, eps)` in a single kernel |
+
+**Key characteristics:**
+- **Fused operation**: combines `input + residual` element-wise add with RMS normalization, avoiding a separate binary add dispatch
+- **Single intermediate**: the fused kernel writes the normalized output directly, skipping the intermediate sum buffer
+- **JIT compiled**: Metal source is generated and compiled at first use, then cached in KernelRegistry
+- **Supported dtypes:** Float32, Float16, Bfloat16
+
+Used in `TransformerBlock::forward()` for the pre-attention and pre-FFN normalization steps.
+
+---
 
 ### flash_attention.rs -- FlashAttention-2 Metal Kernel (Phase 3)
 

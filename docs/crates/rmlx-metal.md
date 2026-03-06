@@ -4,7 +4,7 @@
 
 `rmlx-metal` is a safe and ergonomic Rust wrapper layer over the Apple Metal GPU API. It abstracts Metal devices, command queues, buffers, compute pipelines, and shader libraries to enable concise GPU computation.
 
-Built on the `metal-rs` 0.31 crate, it takes design cues from MLX's Metal abstraction structure and remodels them into idiomatic Rust APIs. The basic wrappers were completed in Phase 0, with event synchronization (`event.rs`), self-check (`self_check.rs`), and the dual queue stream manager (`stream.rs`) added subsequently. EP-6 adds `icb_sparse.rs` for sparse expert launch via indirect command buffers.
+Built on the `metal-rs` 0.31 crate, it takes design cues from MLX's Metal abstraction structure and remodels them into idiomatic Rust APIs. The basic wrappers were completed in Phase 0, with event synchronization (`event.rs`), self-check (`self_check.rs`), and the dual queue stream manager (`stream.rs`) added subsequently. EP-6 adds `icb_sparse.rs` for sparse expert launch via indirect command buffers. **Phase 4 additions:** `ChipTuning` per-generation GPU tuning (M1/M2/M3/M4) integrated into GpuDevice; `DiskPipelineCache` with sha2-hashed pipeline binary archive at `~/.cache/rmlx/pipelines/`; `HazardTrackingModeUntracked` (bit 0x10) for manual hazard tracking in buffer creation; ICB sparse expert dispatch improvements (`grouped_forward_icb()`, `IcbReplay` per-sparsity-pattern cache).
 
 ---
 
@@ -26,6 +26,8 @@ graph TD
     A --> M[exec_graph.rs — ExecGraph]
     A --> N[icb.rs — ICB Support]
     A --> O[icb_sparse.rs — Sparse Expert ICB]
+    A --> P[chip_tuning.rs — ChipTuning]
+    A --> Q[pipeline_cache.rs — DiskPipelineCache]
 ```
 
 ### `lib.rs` — Top-Level Re-exports
@@ -487,6 +489,46 @@ EP-6 sparse expert launch support using `MTLIndirectCommandBuffer` to skip empty
 | `SparseExpertKey` | Hash key for expert activity pattern lookup |
 
 Producer/consumer coordination is synchronized with `GpuEvent` timeline signal/wait semantics.
+
+Phase 4 enhances ICB sparse dispatch with `grouped_forward_icb()` for active experts only and `IcbReplay` per-sparsity-pattern cache for zero-reencoding replay.
+
+---
+
+### `chip_tuning.rs` — `ChipTuning` (Phase 4)
+
+Per-generation GPU tuning parameters for Apple Silicon chips (M1/M2/M3/M4). Integrated into `GpuDevice` to provide chip-aware dispatch configuration.
+
+| Field | Description |
+|-------|-------------|
+| `max_threadgroup_threads` | Optimal threadgroup size for the chip generation |
+| `simd_width` | SIMD lane width (32 for all current Apple Silicon) |
+| `max_threadgroups_per_grid` | Maximum threadgroups per dispatch |
+| `preferred_tile_size` | Optimal tile size for tiled kernels |
+
+`ChipTuning` is resolved automatically from the `Architecture` enum at `GpuDevice` initialization and is accessible via `GpuDevice::chip_tuning()`.
+
+---
+
+### `pipeline_cache.rs` — `DiskPipelineCache` (Phase 4)
+
+Persistent on-disk cache for compiled Metal pipeline binaries. Uses `sha2` hashing of kernel source + function constants to generate deterministic cache keys. Cached binaries are stored at `~/.cache/rmlx/pipelines/`.
+
+| Method | Description |
+|--------|-------------|
+| `new(device)` | Creates a cache, initializing the on-disk directory |
+| `get_or_create(name, library)` | Returns a cached pipeline binary or compiles, stores, and returns a new one |
+| `invalidate(name)` | Removes a cached entry |
+| `clear()` | Removes all cached pipeline binaries |
+
+This eliminates redundant shader compilation across process restarts, significantly reducing cold-start latency.
+
+---
+
+### HazardTrackingModeUntracked (Phase 4)
+
+Phase 4 adds `HazardTrackingModeUntracked` (bit 0x10) as a buffer creation option for manual hazard tracking. When set, Metal does not automatically track read/write hazards on the buffer, allowing the application to manage synchronization explicitly via `GpuEvent` or fences. This reduces driver overhead for buffers with known access patterns (e.g., slab ring buffers, expert weight tensors).
+
+Used in `rmlx-alloc` buffer creation paths and `rmlx-metal` slab ring integration.
 
 ---
 
