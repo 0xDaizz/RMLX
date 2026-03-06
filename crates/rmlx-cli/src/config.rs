@@ -10,7 +10,7 @@ pub struct ConfigArgs {
     hosts: String,
 
     /// Distributed backend profile for hostfile generation
-    #[arg(long, default_value = "rdma", value_parser = ["rdma", "ring"])]
+    #[arg(long, default_value = "rdma", value_parser = ["rdma", "loopback"])]
     backend: String,
 
     /// Control-plane topology hint

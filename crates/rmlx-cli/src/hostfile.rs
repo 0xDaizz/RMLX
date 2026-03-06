@@ -11,8 +11,8 @@ pub struct HostEntry {
     pub rdma: Option<Vec<Option<String>>>,
 }
 
-/// Load hosts from a JSON hostfile, returning the SSH targets.
-pub fn load_hosts_from_file(path: &str) -> Result<Vec<String>, String> {
+/// Load full host entries from a JSON hostfile.
+pub fn load_host_entries(path: &str) -> Result<Vec<HostEntry>, String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("failed to read hostfile {path}: {e}"))?;
     let entries: Vec<HostEntry> = serde_json::from_str(&content)
@@ -23,7 +23,16 @@ pub fn load_hosts_from_file(path: &str) -> Result<Vec<String>, String> {
     for entry in &entries {
         validate_ssh_target(&entry.ssh, "hostfile ssh field")?;
     }
-    Ok(entries.into_iter().map(|e| e.ssh).collect())
+    Ok(entries)
+}
+
+/// Load hosts from a JSON hostfile, returning the SSH targets.
+#[allow(dead_code)]
+pub fn load_hosts_from_file(path: &str) -> Result<Vec<String>, String> {
+    Ok(load_host_entries(path)?
+        .into_iter()
+        .map(|e| e.ssh)
+        .collect())
 }
 
 /// Parse a comma-separated host list.
@@ -43,6 +52,7 @@ pub fn parse_hosts_csv(csv: &str) -> Result<Vec<String>, String> {
 }
 
 /// Resolve hosts from either --hosts CSV or --hostfile path.
+#[allow(dead_code)]
 pub fn resolve_hosts(
     hosts_csv: Option<&str>,
     hostfile: Option<&str>,

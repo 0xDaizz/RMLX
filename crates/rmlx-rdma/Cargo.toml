@@ -16,3 +16,4 @@ rmlx-metal = { path = "../rmlx-metal" }
 metal = { workspace = true }
 libc = { workspace = true }
 libloading = { workspace = true }
+crc32fast = { workspace = true }

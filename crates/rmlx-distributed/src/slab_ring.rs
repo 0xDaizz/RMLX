@@ -193,72 +193,128 @@ impl SlabRing {
     /// Returns [`SlabRingError::Full`] if the ring is full (all slabs are
     /// pending RDMA send).
     ///
+    /// Uses a compare-and-swap loop on `producer_pos` to atomically claim
+    /// a slot, eliminating TOCTOU races between concurrent callers.
+    ///
     /// After the GPU writes into the slab, the caller must call [`produce()`]
     /// to signal that the data is ready for consumption.
     ///
     /// [`produce()`]: Self::produce
     pub fn acquire_for_write(&self) -> Result<&Slab, SlabRingError> {
-        let prod = self.producer_pos.load(Ordering::Acquire);
-        let cons = self.consumer_pos.load(Ordering::Acquire);
+        loop {
+            let prod = self.producer_pos.load(Ordering::Acquire);
+            let cons = self.consumer_pos.load(Ordering::Acquire);
 
-        if prod - cons >= self.depth as u64 {
-            return Err(SlabRingError::Full);
+            if prod - cons >= self.depth as u64 {
+                return Err(SlabRingError::Full);
+            }
+
+            // Atomically claim this slot via CAS. If another thread raced us
+            // and advanced producer_pos, we retry.
+            match self.producer_pos.compare_exchange_weak(
+                prod,
+                prod + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    let idx = (prod % self.depth as u64) as usize;
+                    return Ok(&self.slabs[idx]);
+                }
+                Err(_) => continue, // another thread won the race, retry
+            }
         }
-
-        let idx = (prod % self.depth as u64) as usize;
-        Ok(&self.slabs[idx])
     }
 
-    /// Signal that the GPU has finished writing to the current producer slab.
+    /// Signal that the GPU has finished writing to a producer slab.
     ///
     /// Encodes an event signal into the given command buffer so that when the
     /// GPU finishes executing `cb`, the event timeline advances and the consumer
     /// side can observe the new data.
     ///
-    /// The producer position is advanced atomically after encoding.
+    /// The producer position was already advanced by [`acquire_for_write()`],
+    /// so this method only encodes the GPU event signal using the current
+    /// producer position (which is the value that `acquire_for_write` claimed).
+    ///
+    /// [`acquire_for_write()`]: Self::acquire_for_write
     pub fn produce(&self, cb: &metal::CommandBufferRef) {
-        let next_val = self.producer_pos.load(Ordering::Acquire) + 1;
-        self.event.signal_from_command_buffer(cb, next_val);
-        self.producer_pos.fetch_add(1, Ordering::Release);
+        // producer_pos was already advanced by acquire_for_write via CAS.
+        // Signal the event at the current producer_pos value so consumers
+        // can observe that the slab is ready.
+        let current_val = self.producer_pos.load(Ordering::Acquire);
+        self.event.signal_from_command_buffer(cb, current_val);
     }
 
     /// Try to acquire the next slab for RDMA reading (non-blocking).
     ///
     /// Returns `None` if no slab is ready (the ring is empty or the GPU has
     /// not yet finished writing the next slab).
+    ///
+    /// Uses a compare-and-swap loop on `consumer_pos` to atomically claim
+    /// consumption, eliminating TOCTOU races between concurrent consumers.
     pub fn try_consume(&self) -> Option<&Slab> {
-        let cons = self.consumer_pos.load(Ordering::Acquire);
-        let prod = self.producer_pos.load(Ordering::Acquire);
+        loop {
+            let cons = self.consumer_pos.load(Ordering::Acquire);
+            let prod = self.producer_pos.load(Ordering::Acquire);
 
-        if cons >= prod {
-            return None;
+            if cons >= prod {
+                return None;
+            }
+
+            // Atomically claim this slot for consumption via CAS.
+            match self.consumer_pos.compare_exchange_weak(
+                cons,
+                cons + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    let idx = (cons % self.depth as u64) as usize;
+                    return Some(&self.slabs[idx]);
+                }
+                Err(_) => continue, // another consumer won the race, retry
+            }
         }
-
-        let idx = (cons % self.depth as u64) as usize;
-        Some(&self.slabs[idx])
     }
 
     /// Block until a slab is ready for RDMA reading.
     ///
     /// Uses [`GpuEvent::cpu_wait()`] to wait for the GPU to finish writing
-    /// the next slab. Returns the slab reference on success.
+    /// the next slab, then atomically claims the slot via CAS on
+    /// `consumer_pos`. Returns the slab reference on success.
     pub fn consume(&self, timeout: Duration) -> Result<&Slab, SlabRingError> {
-        let cons = self.consumer_pos.load(Ordering::Acquire);
-        let target_val = cons + 1;
+        loop {
+            let cons = self.consumer_pos.load(Ordering::Acquire);
+            let target_val = cons + 1;
 
-        // Wait for the event timeline to reach our target value.
-        self.event.cpu_wait(target_val, timeout)?;
+            // Wait for the event timeline to reach our target value.
+            self.event.cpu_wait(target_val, timeout)?;
 
-        let idx = (cons % self.depth as u64) as usize;
-        Ok(&self.slabs[idx])
+            // Atomically claim this slot. If another consumer raced us, retry.
+            match self.consumer_pos.compare_exchange_weak(
+                cons,
+                cons + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    let idx = (cons % self.depth as u64) as usize;
+                    return Ok(&self.slabs[idx]);
+                }
+                Err(_) => continue,
+            }
+        }
     }
 
-    /// Release a consumed slab back to the pool.
+    /// Release a consumed slab back to the pool (no-op).
     ///
-    /// After the RDMA send is complete, call this to make the slab available
-    /// for future GPU writes. The consumer position is advanced.
+    /// With the CAS-based `try_consume` and `consume`, the consumer position
+    /// is advanced atomically at the point of consumption. This method is
+    /// retained for API compatibility but performs no work. Existing callers
+    /// can safely continue to call `release()` after consumption.
     pub fn release(&self) {
-        self.consumer_pos.fetch_add(1, Ordering::Release);
+        // Consumer position was already advanced by try_consume/consume CAS.
+        // This is intentionally a no-op.
     }
 
     /// Number of slabs currently in use (produced but not yet consumed+released).
@@ -435,10 +491,10 @@ mod tests {
     }
 
     #[test]
-    fn test_ring_lifecycle_with_manual_positions() {
-        // Test the full lifecycle: acquire -> produce -> consume -> release.
-        // Since we can't encode real GPU commands in unit tests, we manually
-        // advance positions to verify state machine correctness.
+    fn test_ring_lifecycle_with_cas() {
+        // Test the full lifecycle: acquire -> try_consume -> acquire -> try_consume.
+        // acquire_for_write now advances producer_pos via CAS, and try_consume
+        // advances consumer_pos via CAS, so no manual position management needed.
         let device = require_device();
         let config = SlabRingConfig {
             depth: 3,
@@ -446,36 +502,34 @@ mod tests {
         };
         let ring = SlabRing::new(&device, config);
 
-        // Phase 1: acquire slab 0 for write.
+        // Phase 1: acquire slab 0 for write (CAS advances producer_pos to 1).
         let slab = ring.acquire_for_write().unwrap();
         assert_eq!(slab.index, 0);
-
-        // Simulate produce (advance producer_pos without real CB).
-        ring.producer_pos.store(1, Ordering::Release);
+        assert_eq!(ring.producer_pos(), 1);
         assert_eq!(ring.in_flight(), 1);
         assert!(!ring.is_empty());
         assert!(!ring.is_full());
 
-        // Phase 2: acquire slab 1 for write.
+        // Phase 2: acquire slab 1 for write (CAS advances producer_pos to 2).
         let slab = ring.acquire_for_write().unwrap();
         assert_eq!(slab.index, 1);
-        ring.producer_pos.store(2, Ordering::Release);
+        assert_eq!(ring.producer_pos(), 2);
         assert_eq!(ring.in_flight(), 2);
 
-        // Phase 3: consume slab 0 (try_consume).
+        // Phase 3: consume slab 0 (CAS advances consumer_pos to 1).
         let consumed = ring.try_consume().unwrap();
-        assert_eq!(consumed.index, 0); // consumer_pos=0 => index 0
+        assert_eq!(consumed.index, 0);
+        assert_eq!(ring.consumer_pos_val(), 1);
+        assert_eq!(ring.in_flight(), 1);
 
-        // Release slab 0.
+        // release is now a no-op but should be safe to call.
         ring.release();
         assert_eq!(ring.consumer_pos_val(), 1);
         assert_eq!(ring.in_flight(), 1);
 
-        // Phase 4: consume slab 1.
+        // Phase 4: consume slab 1 (CAS advances consumer_pos to 2).
         let consumed = ring.try_consume().unwrap();
-        assert_eq!(consumed.index, 1); // consumer_pos=1 => index 1
-
-        ring.release();
+        assert_eq!(consumed.index, 1);
         assert!(ring.is_empty());
     }
 
@@ -489,22 +543,22 @@ mod tests {
         let ring = SlabRing::new(&device, config);
 
         // Fill and drain the ring twice to test wrap-around.
+        // acquire_for_write now advances producer_pos via CAS, and
+        // try_consume advances consumer_pos via CAS.
         for round in 0..2u64 {
             let base = round * 2;
 
-            // Produce 2 slabs.
+            // Produce 2 slabs (acquire_for_write CAS-advances producer_pos).
             for i in 0..2u64 {
                 let slab = ring.acquire_for_write().unwrap();
                 assert_eq!(slab.index, ((base + i) % 2) as usize);
-                ring.producer_pos.fetch_add(1, Ordering::Release);
             }
             assert!(ring.is_full());
 
-            // Consume 2 slabs.
+            // Consume 2 slabs (try_consume CAS-advances consumer_pos).
             for i in 0..2u64 {
                 let slab = ring.try_consume().unwrap();
                 assert_eq!(slab.index, ((base + i) % 2) as usize);
-                ring.release();
             }
             assert!(ring.is_empty());
         }
@@ -629,6 +683,81 @@ mod tests {
             let slice = std::slice::from_raw_parts(ptr, slab.size);
             assert!(slice.iter().all(|&b| b == 0xAB));
         }
+    }
+
+    #[test]
+    fn test_concurrent_acquire_release() {
+        // Test that multiple threads can concurrently acquire and consume
+        // without TOCTOU races causing double-assignment of the same slab.
+        let device = require_device();
+        let config = SlabRingConfig {
+            depth: 8,
+            slab_size: 256,
+        };
+        let ring = Arc::new(SlabRing::new(&device, config));
+
+        let iterations = 100;
+        let num_producers = 4;
+        let total_produced = Arc::new(AtomicU64::new(0));
+        let total_consumed = Arc::new(AtomicU64::new(0));
+
+        // Producers: each tries to acquire slabs
+        let mut handles = vec![];
+        for _ in 0..num_producers {
+            let ring = Arc::clone(&ring);
+            let produced = Arc::clone(&total_produced);
+            let h = std::thread::spawn(move || {
+                for _ in 0..iterations {
+                    match ring.acquire_for_write() {
+                        Ok(_slab) => {
+                            produced.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(SlabRingError::Full) => {
+                            // Ring full, that is fine under contention
+                            std::thread::yield_now();
+                        }
+                        Err(e) => panic!("unexpected error: {e}"),
+                    }
+                }
+            });
+            handles.push(h);
+        }
+
+        // Consumer: drains the ring
+        let ring_c = Arc::clone(&ring);
+        let consumed = Arc::clone(&total_consumed);
+        let consumer = std::thread::spawn(move || {
+            // Keep consuming until we have consumed everything producers produced.
+            // We loop with a bounded retry to avoid infinite loops.
+            let mut retries = 0;
+            loop {
+                match ring_c.try_consume() {
+                    Some(_slab) => {
+                        consumed.fetch_add(1, Ordering::Relaxed);
+                        retries = 0;
+                    }
+                    None => {
+                        retries += 1;
+                        if retries > 10000 {
+                            break;
+                        }
+                        std::thread::yield_now();
+                    }
+                }
+            }
+        });
+
+        for h in handles {
+            h.join().unwrap();
+        }
+        consumer.join().unwrap();
+
+        let p = total_produced.load(Ordering::Relaxed);
+        let c = total_consumed.load(Ordering::Relaxed);
+        // Every produced slab should have been consumed (no double-counting).
+        assert_eq!(p, c, "produced={p} consumed={c} must match");
+        // The ring should be empty after all operations complete.
+        assert!(ring.is_empty());
     }
 
     #[test]
