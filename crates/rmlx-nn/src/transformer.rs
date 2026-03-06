@@ -11,6 +11,12 @@ use crate::embedding::Embedding;
 use crate::linear::Linear;
 use crate::moe::MoeLayer;
 
+/// Cast a BufferRef to a ResourceRef for use with memory_barrier_with_resources.
+/// Safe because MTLBuffer inherits from MTLResource in ObjC.
+fn buf_as_resource(buf: &metal::BufferRef) -> &metal::ResourceRef {
+    unsafe { &*(buf as *const metal::BufferRef as *const metal::ResourceRef) }
+}
+
 pub enum FeedForwardType {
     /// Simple dense FFN: linear1 -> activation -> linear2
     Dense {
@@ -98,6 +104,8 @@ pub enum FeedForward {
         gate_proj: Linear,
         up_proj: Linear,
         down_proj: Linear,
+        /// Merged gate+up weight [gate_dim + up_dim, in_features] for 9-dispatch path.
+        gate_up_merged_weight: Option<Array>,
     },
     /// Mixture of Experts
     MoE(MoeLayer),
@@ -128,6 +136,7 @@ impl FeedForward {
                 gate_proj,
                 up_proj,
                 down_proj,
+                ..
             } => {
                 // SwiGLU: down(silu(gate(x)) * up(x))
                 let gate_out = gate_proj.forward(x, registry, queue)?;
@@ -164,6 +173,7 @@ impl FeedForward {
                 gate_proj,
                 up_proj,
                 down_proj,
+                ..
             } => {
                 gate_proj.prepare_weight_t(registry, queue)?;
                 up_proj.prepare_weight_t(registry, queue)?;
@@ -202,6 +212,7 @@ impl FeedForward {
                 gate_proj,
                 up_proj,
                 down_proj,
+                ..
             } => {
                 // CB5 (current): gate + up + fused silu*mul
                 let cb5 = graph.command_buffer();
@@ -228,6 +239,35 @@ impl FeedForward {
         }
     }
 
+    /// Single-CB FFN forward: entire SwiGLU + residual in a provided CB.
+    ///
+    /// Does NOT commit or wait — the caller manages the CB lifecycle.
+    pub fn forward_single_cb(
+        &self,
+        normed: &Array,
+        residual: &Array,
+        registry: &KernelRegistry,
+        cb: &metal::CommandBufferRef,
+    ) -> Result<Array, KernelError> {
+        match self {
+            FeedForward::Gated {
+                gate_proj,
+                up_proj,
+                down_proj,
+                ..
+            } => {
+                let gate_out = gate_proj.forward_into_cb(normed, registry, cb)?;
+                let up_out = up_proj.forward_into_cb(normed, registry, cb)?;
+                let hidden = ops::fused::fused_silu_mul_into_cb(registry, &gate_out, &up_out, cb)?;
+                let ffn_out = down_proj.forward_into_cb(&hidden, registry, cb)?;
+                ops::binary::add_into_cb(registry, residual, &ffn_out, cb)
+            }
+            _ => Err(KernelError::InvalidShape(
+                "forward_single_cb only supports Gated FFN".into(),
+            )),
+        }
+    }
+
     /// Fused FFN: entire SwiGLU in 1 CB (gate + up + silu_mul + down + residual).
     pub fn forward_graph_fused(
         &self,
@@ -250,6 +290,7 @@ impl FeedForward {
                 gate_proj,
                 up_proj,
                 down_proj,
+                ..
             } => {
                 let cb = graph.command_buffer();
                 let gate_out = gate_proj.forward_into_cb(normed, registry, cb)?;
@@ -266,6 +307,261 @@ impl FeedForward {
                 let ffn_out = moe.forward(normed, registry, queue)?;
                 ops::binary::add(registry, residual, &ffn_out, queue)
             }
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // 9-dispatch path: merged gate+up weight + fused residual
+    // -------------------------------------------------------------------
+
+    /// Merge gate and up projection weights into a single [gate_dim+up_dim, in_features] matrix.
+    ///
+    /// Must be called once after weights are loaded and before `forward_single_cb_9dispatch`.
+    pub fn prepare_merged_gate_up(&mut self, device: &metal::Device) -> Result<(), KernelError> {
+        match self {
+            FeedForward::Gated {
+                gate_proj,
+                up_proj,
+                gate_up_merged_weight,
+                ..
+            } => {
+                let gate_w = gate_proj.weight().ok_or_else(|| {
+                    KernelError::InvalidShape(
+                        "prepare_merged_gate_up: gate_proj weight not loaded".into(),
+                    )
+                })?;
+                let up_w = up_proj.weight().ok_or_else(|| {
+                    KernelError::InvalidShape(
+                        "prepare_merged_gate_up: up_proj weight not loaded".into(),
+                    )
+                })?;
+
+                // Validate contiguity
+                if !gate_w.is_contiguous() || !up_w.is_contiguous() {
+                    return Err(KernelError::InvalidShape(
+                        "prepare_merged_gate_up: all weights must be contiguous".into(),
+                    ));
+                }
+                // Validate matching dtype
+                if gate_w.dtype() != up_w.dtype() {
+                    return Err(KernelError::InvalidShape(format!(
+                        "prepare_merged_gate_up: dtype mismatch: gate={:?}, up={:?}",
+                        gate_w.dtype(),
+                        up_w.dtype()
+                    )));
+                }
+                // Validate matching cols (in_features)
+                if gate_w.shape()[1] != up_w.shape()[1] {
+                    return Err(KernelError::InvalidShape(format!(
+                        "prepare_merged_gate_up: in_features mismatch: gate={}, up={}",
+                        gate_w.shape()[1],
+                        up_w.shape()[1]
+                    )));
+                }
+                // Validate matching rows (out_features)
+                if gate_w.shape()[0] != up_w.shape()[0] {
+                    return Err(KernelError::InvalidShape(format!(
+                        "prepare_merged_gate_up: gate rows ({}) != up rows ({})",
+                        gate_w.shape()[0],
+                        up_w.shape()[0]
+                    )));
+                }
+
+                let gate_rows = gate_w.shape()[0];
+                let up_rows = up_w.shape()[0];
+                let cols = gate_w.shape()[1];
+                let total_rows = gate_rows + up_rows;
+                let elem_size = gate_w.dtype().size_of();
+                let total_bytes = total_rows * cols * elem_size;
+
+                let buf = device.new_buffer(
+                    total_bytes as u64,
+                    metal::MTLResourceOptions::StorageModeShared,
+                );
+
+                unsafe {
+                    let dst = buf.contents() as *mut u8;
+                    let gate_src =
+                        (gate_w.metal_buffer().contents() as *const u8).add(gate_w.offset());
+                    std::ptr::copy_nonoverlapping(gate_src, dst, gate_rows * cols * elem_size);
+                    let up_src = (up_w.metal_buffer().contents() as *const u8).add(up_w.offset());
+                    std::ptr::copy_nonoverlapping(
+                        up_src,
+                        dst.add(gate_rows * cols * elem_size),
+                        up_rows * cols * elem_size,
+                    );
+                }
+
+                *gate_up_merged_weight = Some(Array::new(
+                    buf,
+                    vec![total_rows, cols],
+                    vec![cols, 1],
+                    gate_w.dtype(),
+                    0,
+                ));
+                Ok(())
+            }
+            _ => Err(KernelError::InvalidShape(
+                "prepare_merged_gate_up: only supported for Gated FFN".into(),
+            )),
+        }
+    }
+
+    /// Convert all static weights to `StorageModePrivate` (GPU-only).
+    ///
+    /// Call after loading weights and before the inference loop.
+    pub fn prepare_weights_private(&mut self, device: &metal::Device, queue: &metal::CommandQueue) {
+        match self {
+            FeedForward::Gated {
+                gate_proj,
+                up_proj,
+                down_proj,
+                gate_up_merged_weight,
+            } => {
+                gate_proj.convert_weights_private(device, queue);
+                up_proj.convert_weights_private(device, queue);
+                down_proj.convert_weights_private(device, queue);
+                if let Some(w) = gate_up_merged_weight.take() {
+                    *gate_up_merged_weight = Some(w.to_private(device, queue));
+                }
+            }
+            FeedForward::Dense {
+                linear1, linear2, ..
+            } => {
+                linear1.convert_weights_private(device, queue);
+                linear2.convert_weights_private(device, queue);
+            }
+            FeedForward::MoE(_) => {
+                // MoE expert weights are managed separately
+            }
+        }
+    }
+
+    /// 9-dispatch FFN forward: dispatches 7-9 of the 9-dispatch path.
+    ///
+    /// Dispatches:
+    ///   7. merged gate+up gemv
+    ///   8. silu_mul
+    ///   9. gemv_bias(W_down, hidden, residual) — down_proj + residual fused
+    pub fn forward_single_cb_9dispatch(
+        &self,
+        normed: &Array,
+        residual: &Array,
+        registry: &KernelRegistry,
+        cb: &metal::CommandBufferRef,
+    ) -> Result<Array, KernelError> {
+        match self {
+            FeedForward::Gated {
+                gate_up_merged_weight,
+                down_proj,
+                ..
+            } => {
+                // Guard: decode path requires seq_len=1
+                let normed_seq = if normed.ndim() >= 2 {
+                    normed.shape()[0]
+                } else {
+                    1
+                };
+                if normed_seq != 1 {
+                    return Err(KernelError::InvalidShape(format!(
+                        "forward_single_cb_9dispatch: requires seq_len=1, got {}",
+                        normed_seq
+                    )));
+                }
+
+                let hidden_size = if normed.ndim() == 2 {
+                    normed.shape()[1]
+                } else {
+                    normed.shape()[0]
+                };
+                let normed_vec = Array::new(
+                    normed.metal_buffer().to_owned(),
+                    vec![hidden_size],
+                    vec![1],
+                    normed.dtype(),
+                    normed.offset(),
+                );
+
+                // --- Single encoder for dispatches 7-9 (gate+up, silu_mul, down+residual) ---
+                let encoder = cb.new_compute_command_encoder();
+
+                // Dispatch 7: merged gate+up gemv
+                let gate_up_w = gate_up_merged_weight.as_ref().ok_or_else(|| {
+                    KernelError::InvalidShape(
+                        "forward_single_cb_9dispatch: call prepare_merged_gate_up() first".into(),
+                    )
+                })?;
+                let gate_up =
+                    ops::gemv::gemv_into_encoder(registry, gate_up_w, &normed_vec, encoder)?;
+                // gate_up is [gate_dim + up_dim] flat
+                let gate_dim = gate_up_w.shape()[0] / 2;
+                let elem_size = gate_up.dtype().size_of();
+
+                // Memory barrier: ensure gate_up is visible to dispatch 8
+                encoder.memory_barrier_with_resources(&[buf_as_resource(gate_up.metal_buffer())]);
+
+                // Split into gate and up views
+                let gate = Array::new(
+                    gate_up.metal_buffer().to_owned(),
+                    vec![1, gate_dim],
+                    vec![gate_dim, 1],
+                    gate_up.dtype(),
+                    gate_up.offset(),
+                );
+                let up = Array::new(
+                    gate_up.metal_buffer().to_owned(),
+                    vec![1, gate_dim],
+                    vec![gate_dim, 1],
+                    gate_up.dtype(),
+                    gate_up.offset() + gate_dim * elem_size,
+                );
+
+                // Dispatch 8: silu_mul
+                let hidden =
+                    ops::fused::fused_silu_mul_into_encoder(registry, &gate, &up, encoder)?;
+
+                // Memory barrier: ensure hidden is visible to dispatch 9
+                encoder.memory_barrier_with_resources(&[buf_as_resource(hidden.metal_buffer())]);
+
+                // Dispatch 9: gemv_bias(W_down, hidden, residual) — down + residual fused
+                let down_w = down_proj.weight().ok_or_else(|| {
+                    KernelError::InvalidShape("9dispatch: down_proj weight not loaded".into())
+                })?;
+                let hidden_vec = Array::new(
+                    hidden.metal_buffer().to_owned(),
+                    vec![hidden.numel()],
+                    vec![1],
+                    hidden.dtype(),
+                    hidden.offset(),
+                );
+                let res_vec = Array::new(
+                    residual.metal_buffer().to_owned(),
+                    vec![hidden_size],
+                    vec![1],
+                    residual.dtype(),
+                    residual.offset(),
+                );
+                let out = ops::gemv::gemv_bias_into_encoder(
+                    registry,
+                    down_w,
+                    &hidden_vec,
+                    &res_vec,
+                    encoder,
+                )?;
+
+                encoder.end_encoding();
+
+                Ok(Array::new(
+                    out.metal_buffer().to_owned(),
+                    vec![1, hidden_size],
+                    vec![hidden_size, 1],
+                    out.dtype(),
+                    out.offset(),
+                ))
+            }
+            _ => Err(KernelError::InvalidShape(
+                "forward_single_cb_9dispatch only supports Gated FFN".into(),
+            )),
         }
     }
 }
@@ -325,6 +621,7 @@ impl TransformerBlock {
                     out_features: hidden_size,
                     has_bias: false,
                 }),
+                gate_up_merged_weight: None,
             },
             FeedForwardType::MoE { .. } => {
                 return Err(KernelError::InvalidShape(
@@ -433,6 +730,104 @@ impl TransformerBlock {
         Ok(())
     }
 
+    /// Prepare merged weights for the 9-dispatch path.
+    ///
+    /// Merges Q/K/V weights and gate/up weights into single matrices.
+    /// Must be called once after weights are loaded.
+    pub fn prepare_weights_9dispatch(&mut self, device: &metal::Device) -> Result<(), KernelError> {
+        self.attention.prepare_merged_qkv(device)?;
+        self.ffn.prepare_merged_gate_up(device)?;
+        Ok(())
+    }
+
+    /// Convert all static weights (projection matrices, norm weights) to
+    /// `StorageModePrivate` (GPU-only memory).
+    ///
+    /// Weights cannot be read by CPU after this call. Call after loading
+    /// weights (and after `prepare_weights_9dispatch` if using that path)
+    /// and before the inference loop.
+    pub fn prepare_weights_private(&mut self, device: &metal::Device, queue: &metal::CommandQueue) {
+        self.attention.prepare_weights_private(device, queue);
+        self.ffn.prepare_weights_private(device, queue);
+        if let Some(w) = self.norm1_weight.take() {
+            self.norm1_weight = Some(w.to_private(device, queue));
+        }
+        if let Some(w) = self.norm2_weight.take() {
+            self.norm2_weight = Some(w.to_private(device, queue));
+        }
+    }
+
+    /// 9-dispatch forward decode: entire transformer block in 9 GPU dispatches.
+    ///
+    /// Dispatches:
+    ///   1. rms_norm(x, w1)
+    ///   2. gemv(W_qkv_merged, normed)
+    ///   3. rope(qk_concat, all heads)
+    ///   4. sdpa_decode_batched(all heads)
+    ///   5. gemv_bias(W_o, attn, x) — O_proj + residual fused
+    ///   6. rms_norm(h, w2)
+    ///   7. gemv(W_gate_up_merged, normed2)
+    ///   8. silu_mul(gate, up)
+    ///   9. gemv_bias(W_down, hidden, h) — down_proj + residual fused
+    ///
+    /// Requires `prepare_weights_9dispatch()` to have been called first.
+    /// Requires a pre-allocated `LayerKvCache`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_single_cb_9dispatch(
+        &self,
+        x: &Array,
+        cos_freqs: Option<&Array>,
+        sin_freqs: Option<&Array>,
+        mask: Option<&Array>,
+        cache: &mut LayerKvCache,
+        registry: &KernelRegistry,
+        cb: &metal::CommandBufferRef,
+    ) -> Result<Array, KernelError> {
+        let norm1_w = self.norm1_weight.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape("TransformerBlock: norm1_weight not loaded".into())
+        })?;
+        let norm2_w = self.norm2_weight.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape("TransformerBlock: norm2_weight not loaded".into())
+        })?;
+
+        // Guard: decode path requires seq_len=1
+        let seq_dim = if x.ndim() == 1 { 1 } else { x.shape()[0] };
+        if seq_dim != 1 {
+            return Err(KernelError::InvalidShape(format!(
+                "forward_single_cb_9dispatch: requires seq_len=1, got {}",
+                seq_dim
+            )));
+        }
+
+        // Dispatches 1-5: attention (norm + QKV + rope + SDPA + O_proj+residual)
+        let h = self.attention.forward_decode_9dispatch(
+            x,
+            norm1_w,
+            self.rms_norm_eps,
+            cos_freqs,
+            sin_freqs,
+            mask,
+            cache,
+            registry,
+            cb,
+        )?;
+
+        // Dispatch 6: rms_norm (single encoder)
+        let enc6 = cb.new_compute_command_encoder();
+        let normed2 = ops::rms_norm::rms_norm_into_encoder(
+            registry,
+            &h,
+            Some(norm2_w),
+            self.rms_norm_eps,
+            enc6,
+        )?;
+        enc6.end_encoding();
+
+        // Dispatches 7-9: FFN (gate_up + silu_mul + down+residual)
+        self.ffn
+            .forward_single_cb_9dispatch(&normed2, &h, registry, cb)
+    }
+
     /// Pipelined forward pass using fused SwiGLU for the FFN.
     ///
     /// Same structure as `forward` but uses `ops::fused::fused_silu_mul`
@@ -476,6 +871,7 @@ impl TransformerBlock {
                 gate_proj,
                 up_proj,
                 down_proj,
+                ..
             } => {
                 let gate_out = gate_proj.forward(&normed2, registry, queue)?;
                 let up_out = up_proj.forward(&normed2, registry, queue)?;
@@ -487,6 +883,50 @@ impl TransformerBlock {
 
         // Residual connection: h + ffn_out
         ops::binary::add(registry, &h, &ffn_out, queue)
+    }
+
+    /// Single-CB forward pass for seq_len=1 decode.
+    ///
+    /// Encodes the entire transformer block (attention + FFN) into one
+    /// command buffer with minimal dispatches. Does NOT commit or wait.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_single_cb(
+        &self,
+        x: &Array,
+        cos_freqs: Option<&Array>,
+        sin_freqs: Option<&Array>,
+        mask: Option<&Array>,
+        cache: Option<&mut LayerKvCache>,
+        registry: &KernelRegistry,
+        cb: &metal::CommandBufferRef,
+    ) -> Result<Array, KernelError> {
+        let norm1_w = self.norm1_weight.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape("TransformerBlock: norm1_weight not loaded".into())
+        })?;
+        let norm2_w = self.norm2_weight.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape("TransformerBlock: norm2_weight not loaded".into())
+        })?;
+
+        // Attention (all in same CB — norm + Q/K/V + head split + RoPE + SDPA + concat + O_proj)
+        let attn_out = self.attention.forward_decode_single_cb(
+            x,
+            norm1_w,
+            self.rms_norm_eps,
+            cos_freqs,
+            sin_freqs,
+            mask,
+            cache,
+            registry,
+            cb,
+        )?;
+
+        // Residual + pre-FFN norm
+        let h = ops::binary::add_into_cb(registry, x, &attn_out, cb)?;
+        let normed2 =
+            ops::rms_norm::rms_norm_into_cb(registry, &h, Some(norm2_w), self.rms_norm_eps, cb)?;
+
+        // FFN (all in same CB)
+        self.ffn.forward_single_cb(&normed2, &h, registry, cb)
     }
 
     /// Full ExecGraph forward pass (5 CBs total).
@@ -843,6 +1283,7 @@ mod tests {
                 gate_proj,
                 up_proj,
                 down_proj,
+                ..
             } => {
                 assert_eq!(gate_proj.in_features(), 64);
                 assert_eq!(gate_proj.out_features(), 128);

@@ -325,20 +325,6 @@ impl ExpertGroup {
         let dtype = expert_inputs[0].1.dtype();
         let elem_size = dtype.size_of();
 
-        // Get GEMM pipeline
-        let gemm_kernel = match dtype {
-            DType::Float32 => "gemm_tiled_f32",
-            DType::Float16 => "gemm_tiled_f16",
-            DType::Bfloat16 => "gemm_tiled_bf16",
-            other => {
-                return Err(KernelError::InvalidShape(format!(
-                    "ExpertGroup: unsupported dtype {:?} for GEMM",
-                    other
-                )));
-            }
-        };
-        let gemm_pipeline = registry.get_pipeline(gemm_kernel, dtype)?;
-
         // SwiGLU kernel
         let silu_kernel = match dtype {
             DType::Float32 => "silu_gate_f32",
@@ -432,26 +418,26 @@ impl ExpertGroup {
             // 1. Gate GEMM: [batch, D] @ [D, inter] -> [batch, inter]
             encode_gemm(
                 cb,
-                &gemm_pipeline,
                 &item.input,
                 &gate_w,
                 &item.gate_out,
                 m,
                 inter,
                 d,
+                dtype,
                 registry,
             )?;
 
             // 2. Up GEMM: [batch, D] @ [D, inter] -> [batch, inter]
             encode_gemm(
                 cb,
-                &gemm_pipeline,
                 &item.input,
                 &up_w,
                 &item.up_out,
                 m,
                 inter,
                 d,
+                dtype,
                 registry,
             )?;
 
@@ -468,13 +454,13 @@ impl ExpertGroup {
             // 4. Down GEMM: [batch, inter] @ [inter, D] -> [batch, D]
             encode_gemm(
                 cb,
-                &gemm_pipeline,
                 &item.silu_out,
                 &down_w,
                 &item.output,
                 m,
                 d,
                 inter,
+                dtype,
                 registry,
             )?;
         }
@@ -514,18 +500,41 @@ impl ExpertGroup {
 /// Encode a single GEMM dispatch into a command buffer (no commit/wait).
 ///
 /// `C[M, N] = A[M, K] @ B[K, N]`
+///
+/// Selects the best tile configuration and kernel variant based on matrix
+/// dimensions via `ops::matmul::select_tile_config`.
 #[allow(clippy::too_many_arguments)]
 fn encode_gemm(
     cb: &metal::CommandBufferRef,
-    pipeline: &metal::ComputePipelineState,
     a: &Array,
     b: &Array,
     c: &Array,
     m: u32,
     n: u32,
     k: u32,
+    dtype: DType,
     registry: &KernelRegistry,
 ) -> Result<(), KernelError> {
+    let tile = ops::matmul::select_tile_config(m as usize, n as usize, k as usize);
+    let kernel_name = match (tile.variant, dtype) {
+        (ops::matmul::TileVariant::Simd, DType::Float32) => "gemm_simd_f32",
+        (ops::matmul::TileVariant::Simd, DType::Float16) => "gemm_simd_f16",
+        (ops::matmul::TileVariant::Simd, DType::Bfloat16) => "gemm_simd_bf16",
+        (ops::matmul::TileVariant::Small, DType::Float32) => "gemm_small_f32",
+        (ops::matmul::TileVariant::Small, DType::Float16) => "gemm_small_f16",
+        (ops::matmul::TileVariant::Small, DType::Bfloat16) => "gemm_small_bf16",
+        (ops::matmul::TileVariant::Medium, DType::Float32) => "gemm_tiled_f32",
+        (ops::matmul::TileVariant::Medium, DType::Float16) => "gemm_tiled_f16",
+        (ops::matmul::TileVariant::Medium, DType::Bfloat16) => "gemm_tiled_bf16",
+        (_, other) => {
+            return Err(KernelError::InvalidShape(format!(
+                "ExpertGroup: unsupported dtype {:?} for GEMM",
+                other
+            )));
+        }
+    };
+    let pipeline = registry.get_pipeline(kernel_name, dtype)?;
+
     let dev = registry.device().raw();
     let m_buf = make_u32_buf(dev, m);
     let n_buf = make_u32_buf(dev, n);
@@ -537,13 +546,13 @@ fn encode_gemm(
     let bsb_buf = make_u32_buf(dev, batch_stride_b);
     let bsc_buf = make_u32_buf(dev, batch_stride_c);
 
-    const BM: u64 = 32;
-    const BN: u64 = 32;
-    let grid_x = (n as u64).div_ceil(BN);
-    let grid_y = (m as u64).div_ceil(BM);
+    let bm = tile.bm as u64;
+    let bn = tile.bn as u64;
+    let grid_x = (n as u64).div_ceil(bn);
+    let grid_y = (m as u64).div_ceil(bm);
 
     let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(pipeline);
+    enc.set_compute_pipeline_state(&pipeline);
     enc.set_buffer(0, Some(a.metal_buffer()), a.offset() as u64);
     enc.set_buffer(1, Some(b.metal_buffer()), b.offset() as u64);
     enc.set_buffer(2, Some(c.metal_buffer()), c.offset() as u64);
@@ -555,7 +564,7 @@ fn encode_gemm(
     enc.set_buffer(8, Some(&bsc_buf), 0);
 
     let grid = metal::MTLSize::new(grid_x, grid_y, 1);
-    let tg = metal::MTLSize::new(BM * BN, 1, 1);
+    let tg = metal::MTLSize::new(bm * bn, 1, 1);
     enc.dispatch_thread_groups(grid, tg);
     enc.end_encoding();
 

@@ -308,12 +308,29 @@ kernel void softmax_looped_f32(
     float max_val    = -INFINITY;
     float normalizer = 0.0f;
 
-    for (uint i = tid; i < axis_size; i += tgsize) {
-        float val      = input[base + i];
-        float prev_max = max_val;
-        max_val        = max(max_val, val);
-        normalizer     = normalizer * fast::exp(prev_max - max_val)
-                       + fast::exp(val - max_val);
+    for (uint i = tid * N_READS; i < axis_size; i += tgsize * N_READS) {
+        if (i + 3 < axis_size) {
+            float v0 = input[base + i];
+            float v1 = input[base + i + 1];
+            float v2 = input[base + i + 2];
+            float v3 = input[base + i + 3];
+            float prev_max;
+            prev_max = max_val; max_val = max(max_val, v0);
+            normalizer = normalizer * fast::exp(prev_max - max_val) + fast::exp(v0 - max_val);
+            prev_max = max_val; max_val = max(max_val, v1);
+            normalizer = normalizer * fast::exp(prev_max - max_val) + fast::exp(v1 - max_val);
+            prev_max = max_val; max_val = max(max_val, v2);
+            normalizer = normalizer * fast::exp(prev_max - max_val) + fast::exp(v2 - max_val);
+            prev_max = max_val; max_val = max(max_val, v3);
+            normalizer = normalizer * fast::exp(prev_max - max_val) + fast::exp(v3 - max_val);
+        } else {
+            for (uint j = i; j < min(i + N_READS, axis_size); j++) {
+                float val = input[base + j];
+                float prev_max = max_val;
+                max_val = max(max_val, val);
+                normalizer = normalizer * fast::exp(prev_max - max_val) + fast::exp(val - max_val);
+            }
+        }
     }
 
     // Cross-threadgroup reduction
@@ -324,8 +341,17 @@ kernel void softmax_looped_f32(
     float inv_norm = normalizer;  // cross_simdgroup_reduce stores 1/sum
 
     // Write pass
-    for (uint i = tid; i < axis_size; i += tgsize) {
-        output[base + i] = fast::exp(input[base + i] - row_max) * inv_norm;
+    for (uint i = tid * N_READS; i < axis_size; i += tgsize * N_READS) {
+        if (i + 3 < axis_size) {
+            output[base + i]     = fast::exp(input[base + i]     - row_max) * inv_norm;
+            output[base + i + 1] = fast::exp(input[base + i + 1] - row_max) * inv_norm;
+            output[base + i + 2] = fast::exp(input[base + i + 2] - row_max) * inv_norm;
+            output[base + i + 3] = fast::exp(input[base + i + 3] - row_max) * inv_norm;
+        } else {
+            for (uint j = i; j < min(i + N_READS, axis_size); j++) {
+                output[base + j] = fast::exp(input[base + j] - row_max) * inv_norm;
+            }
+        }
     }
 }
 
@@ -348,12 +374,29 @@ kernel void softmax_looped_f16(
     float max_val    = -INFINITY;
     float normalizer = 0.0f;
 
-    for (uint i = tid; i < axis_size; i += tgsize) {
-        float val      = float(input[base + i]);
-        float prev_max = max_val;
-        max_val        = max(max_val, val);
-        normalizer     = normalizer * fast::exp(prev_max - max_val)
-                       + fast::exp(val - max_val);
+    for (uint i = tid * N_READS; i < axis_size; i += tgsize * N_READS) {
+        if (i + 3 < axis_size) {
+            float v0 = float(input[base + i]);
+            float v1 = float(input[base + i + 1]);
+            float v2 = float(input[base + i + 2]);
+            float v3 = float(input[base + i + 3]);
+            float prev_max;
+            prev_max = max_val; max_val = max(max_val, v0);
+            normalizer = normalizer * fast::exp(prev_max - max_val) + fast::exp(v0 - max_val);
+            prev_max = max_val; max_val = max(max_val, v1);
+            normalizer = normalizer * fast::exp(prev_max - max_val) + fast::exp(v1 - max_val);
+            prev_max = max_val; max_val = max(max_val, v2);
+            normalizer = normalizer * fast::exp(prev_max - max_val) + fast::exp(v2 - max_val);
+            prev_max = max_val; max_val = max(max_val, v3);
+            normalizer = normalizer * fast::exp(prev_max - max_val) + fast::exp(v3 - max_val);
+        } else {
+            for (uint j = i; j < min(i + N_READS, axis_size); j++) {
+                float val = float(input[base + j]);
+                float prev_max = max_val;
+                max_val = max(max_val, val);
+                normalizer = normalizer * fast::exp(prev_max - max_val) + fast::exp(val - max_val);
+            }
+        }
     }
 
     cross_simdgroup_reduce(max_val, normalizer, local_max, local_normalizer,
@@ -362,8 +405,17 @@ kernel void softmax_looped_f16(
     float row_max  = max_val;
     float inv_norm = normalizer;
 
-    for (uint i = tid; i < axis_size; i += tgsize) {
-        output[base + i] = half(fast::exp(float(input[base + i]) - row_max) * inv_norm);
+    for (uint i = tid * N_READS; i < axis_size; i += tgsize * N_READS) {
+        if (i + 3 < axis_size) {
+            output[base + i]     = half(fast::exp(float(input[base + i])     - row_max) * inv_norm);
+            output[base + i + 1] = half(fast::exp(float(input[base + i + 1]) - row_max) * inv_norm);
+            output[base + i + 2] = half(fast::exp(float(input[base + i + 2]) - row_max) * inv_norm);
+            output[base + i + 3] = half(fast::exp(float(input[base + i + 3]) - row_max) * inv_norm);
+        } else {
+            for (uint j = i; j < min(i + N_READS, axis_size); j++) {
+                output[base + j] = half(fast::exp(float(input[base + j]) - row_max) * inv_norm);
+            }
+        }
     }
 }
 
@@ -386,12 +438,29 @@ kernel void softmax_looped_bf16(
     float max_val    = -INFINITY;
     float normalizer = 0.0f;
 
-    for (uint i = tid; i < axis_size; i += tgsize) {
-        float val      = float(input[base + i]);
-        float prev_max = max_val;
-        max_val        = max(max_val, val);
-        normalizer     = normalizer * fast::exp(prev_max - max_val)
-                       + fast::exp(val - max_val);
+    for (uint i = tid * N_READS; i < axis_size; i += tgsize * N_READS) {
+        if (i + 3 < axis_size) {
+            float v0 = float(input[base + i]);
+            float v1 = float(input[base + i + 1]);
+            float v2 = float(input[base + i + 2]);
+            float v3 = float(input[base + i + 3]);
+            float prev_max;
+            prev_max = max_val; max_val = max(max_val, v0);
+            normalizer = normalizer * fast::exp(prev_max - max_val) + fast::exp(v0 - max_val);
+            prev_max = max_val; max_val = max(max_val, v1);
+            normalizer = normalizer * fast::exp(prev_max - max_val) + fast::exp(v1 - max_val);
+            prev_max = max_val; max_val = max(max_val, v2);
+            normalizer = normalizer * fast::exp(prev_max - max_val) + fast::exp(v2 - max_val);
+            prev_max = max_val; max_val = max(max_val, v3);
+            normalizer = normalizer * fast::exp(prev_max - max_val) + fast::exp(v3 - max_val);
+        } else {
+            for (uint j = i; j < min(i + N_READS, axis_size); j++) {
+                float val = float(input[base + j]);
+                float prev_max = max_val;
+                max_val = max(max_val, val);
+                normalizer = normalizer * fast::exp(prev_max - max_val) + fast::exp(val - max_val);
+            }
+        }
     }
 
     cross_simdgroup_reduce(max_val, normalizer, local_max, local_normalizer,
@@ -400,8 +469,17 @@ kernel void softmax_looped_bf16(
     float row_max  = max_val;
     float inv_norm = normalizer;
 
-    for (uint i = tid; i < axis_size; i += tgsize) {
-        output[base + i] = bfloat(fast::exp(float(input[base + i]) - row_max) * inv_norm);
+    for (uint i = tid * N_READS; i < axis_size; i += tgsize * N_READS) {
+        if (i + 3 < axis_size) {
+            output[base + i]     = bfloat(fast::exp(float(input[base + i])     - row_max) * inv_norm);
+            output[base + i + 1] = bfloat(fast::exp(float(input[base + i + 1]) - row_max) * inv_norm);
+            output[base + i + 2] = bfloat(fast::exp(float(input[base + i + 2]) - row_max) * inv_norm);
+            output[base + i + 3] = bfloat(fast::exp(float(input[base + i + 3]) - row_max) * inv_norm);
+        } else {
+            for (uint j = i; j < min(i + N_READS, axis_size); j++) {
+                output[base + j] = bfloat(fast::exp(float(input[base + j]) - row_max) * inv_norm);
+            }
+        }
     }
 }
 
@@ -424,25 +502,54 @@ kernel void softmax_f32(
 
     size_t base = size_t(row) * size_t(axis_size);
 
+    // Online pass: compute running max and normalizer simultaneously
     float max_val    = -INFINITY;
     float normalizer = 0.0f;
 
-    for (uint i = tid; i < axis_size; i += tgsize) {
-        float val      = input[base + i];
-        float prev_max = max_val;
-        max_val        = max(max_val, val);
-        normalizer     = normalizer * fast::exp(prev_max - max_val)
-                       + fast::exp(val - max_val);
+    for (uint i = tid * N_READS; i < axis_size; i += tgsize * N_READS) {
+        if (i + 3 < axis_size) {
+            float v0 = input[base + i];
+            float v1 = input[base + i + 1];
+            float v2 = input[base + i + 2];
+            float v3 = input[base + i + 3];
+            float prev_max;
+            prev_max = max_val; max_val = max(max_val, v0);
+            normalizer = normalizer * fast::exp(prev_max - max_val) + fast::exp(v0 - max_val);
+            prev_max = max_val; max_val = max(max_val, v1);
+            normalizer = normalizer * fast::exp(prev_max - max_val) + fast::exp(v1 - max_val);
+            prev_max = max_val; max_val = max(max_val, v2);
+            normalizer = normalizer * fast::exp(prev_max - max_val) + fast::exp(v2 - max_val);
+            prev_max = max_val; max_val = max(max_val, v3);
+            normalizer = normalizer * fast::exp(prev_max - max_val) + fast::exp(v3 - max_val);
+        } else {
+            for (uint j = i; j < min(i + N_READS, axis_size); j++) {
+                float val = input[base + j];
+                float prev_max = max_val;
+                max_val = max(max_val, val);
+                normalizer = normalizer * fast::exp(prev_max - max_val) + fast::exp(val - max_val);
+            }
+        }
     }
 
+    // Cross-threadgroup reduction
     cross_simdgroup_reduce(max_val, normalizer, local_max, local_normalizer,
                            simd_lane_id, simd_group_id);
 
     float row_max  = max_val;
-    float inv_norm = normalizer;
+    float inv_norm = normalizer;  // cross_simdgroup_reduce stores 1/sum
 
-    for (uint i = tid; i < axis_size; i += tgsize) {
-        output[base + i] = fast::exp(input[base + i] - row_max) * inv_norm;
+    // Write pass
+    for (uint i = tid * N_READS; i < axis_size; i += tgsize * N_READS) {
+        if (i + 3 < axis_size) {
+            output[base + i]     = fast::exp(input[base + i]     - row_max) * inv_norm;
+            output[base + i + 1] = fast::exp(input[base + i + 1] - row_max) * inv_norm;
+            output[base + i + 2] = fast::exp(input[base + i + 2] - row_max) * inv_norm;
+            output[base + i + 3] = fast::exp(input[base + i + 3] - row_max) * inv_norm;
+        } else {
+            for (uint j = i; j < min(i + N_READS, axis_size); j++) {
+                output[base + j] = fast::exp(input[base + j] - row_max) * inv_norm;
+            }
+        }
     }
 }
 
@@ -464,12 +571,29 @@ kernel void softmax_f16(
     float max_val    = -INFINITY;
     float normalizer = 0.0f;
 
-    for (uint i = tid; i < axis_size; i += tgsize) {
-        float val      = float(input[base + i]);
-        float prev_max = max_val;
-        max_val        = max(max_val, val);
-        normalizer     = normalizer * fast::exp(prev_max - max_val)
-                       + fast::exp(val - max_val);
+    for (uint i = tid * N_READS; i < axis_size; i += tgsize * N_READS) {
+        if (i + 3 < axis_size) {
+            float v0 = float(input[base + i]);
+            float v1 = float(input[base + i + 1]);
+            float v2 = float(input[base + i + 2]);
+            float v3 = float(input[base + i + 3]);
+            float prev_max;
+            prev_max = max_val; max_val = max(max_val, v0);
+            normalizer = normalizer * fast::exp(prev_max - max_val) + fast::exp(v0 - max_val);
+            prev_max = max_val; max_val = max(max_val, v1);
+            normalizer = normalizer * fast::exp(prev_max - max_val) + fast::exp(v1 - max_val);
+            prev_max = max_val; max_val = max(max_val, v2);
+            normalizer = normalizer * fast::exp(prev_max - max_val) + fast::exp(v2 - max_val);
+            prev_max = max_val; max_val = max(max_val, v3);
+            normalizer = normalizer * fast::exp(prev_max - max_val) + fast::exp(v3 - max_val);
+        } else {
+            for (uint j = i; j < min(i + N_READS, axis_size); j++) {
+                float val = float(input[base + j]);
+                float prev_max = max_val;
+                max_val = max(max_val, val);
+                normalizer = normalizer * fast::exp(prev_max - max_val) + fast::exp(val - max_val);
+            }
+        }
     }
 
     cross_simdgroup_reduce(max_val, normalizer, local_max, local_normalizer,
@@ -478,8 +602,17 @@ kernel void softmax_f16(
     float row_max  = max_val;
     float inv_norm = normalizer;
 
-    for (uint i = tid; i < axis_size; i += tgsize) {
-        output[base + i] = half(fast::exp(float(input[base + i]) - row_max) * inv_norm);
+    for (uint i = tid * N_READS; i < axis_size; i += tgsize * N_READS) {
+        if (i + 3 < axis_size) {
+            output[base + i]     = half(fast::exp(float(input[base + i])     - row_max) * inv_norm);
+            output[base + i + 1] = half(fast::exp(float(input[base + i + 1]) - row_max) * inv_norm);
+            output[base + i + 2] = half(fast::exp(float(input[base + i + 2]) - row_max) * inv_norm);
+            output[base + i + 3] = half(fast::exp(float(input[base + i + 3]) - row_max) * inv_norm);
+        } else {
+            for (uint j = i; j < min(i + N_READS, axis_size); j++) {
+                output[base + j] = half(fast::exp(float(input[base + j]) - row_max) * inv_norm);
+            }
+        }
     }
 }
 
@@ -501,12 +634,29 @@ kernel void softmax_bf16(
     float max_val    = -INFINITY;
     float normalizer = 0.0f;
 
-    for (uint i = tid; i < axis_size; i += tgsize) {
-        float val      = float(input[base + i]);
-        float prev_max = max_val;
-        max_val        = max(max_val, val);
-        normalizer     = normalizer * fast::exp(prev_max - max_val)
-                       + fast::exp(val - max_val);
+    for (uint i = tid * N_READS; i < axis_size; i += tgsize * N_READS) {
+        if (i + 3 < axis_size) {
+            float v0 = float(input[base + i]);
+            float v1 = float(input[base + i + 1]);
+            float v2 = float(input[base + i + 2]);
+            float v3 = float(input[base + i + 3]);
+            float prev_max;
+            prev_max = max_val; max_val = max(max_val, v0);
+            normalizer = normalizer * fast::exp(prev_max - max_val) + fast::exp(v0 - max_val);
+            prev_max = max_val; max_val = max(max_val, v1);
+            normalizer = normalizer * fast::exp(prev_max - max_val) + fast::exp(v1 - max_val);
+            prev_max = max_val; max_val = max(max_val, v2);
+            normalizer = normalizer * fast::exp(prev_max - max_val) + fast::exp(v2 - max_val);
+            prev_max = max_val; max_val = max(max_val, v3);
+            normalizer = normalizer * fast::exp(prev_max - max_val) + fast::exp(v3 - max_val);
+        } else {
+            for (uint j = i; j < min(i + N_READS, axis_size); j++) {
+                float val = float(input[base + j]);
+                float prev_max = max_val;
+                max_val = max(max_val, val);
+                normalizer = normalizer * fast::exp(prev_max - max_val) + fast::exp(val - max_val);
+            }
+        }
     }
 
     cross_simdgroup_reduce(max_val, normalizer, local_max, local_normalizer,
@@ -515,8 +665,17 @@ kernel void softmax_bf16(
     float row_max  = max_val;
     float inv_norm = normalizer;
 
-    for (uint i = tid; i < axis_size; i += tgsize) {
-        output[base + i] = bfloat(fast::exp(float(input[base + i]) - row_max) * inv_norm);
+    for (uint i = tid * N_READS; i < axis_size; i += tgsize * N_READS) {
+        if (i + 3 < axis_size) {
+            output[base + i]     = bfloat(fast::exp(float(input[base + i])     - row_max) * inv_norm);
+            output[base + i + 1] = bfloat(fast::exp(float(input[base + i + 1]) - row_max) * inv_norm);
+            output[base + i + 2] = bfloat(fast::exp(float(input[base + i + 2]) - row_max) * inv_norm);
+            output[base + i + 3] = bfloat(fast::exp(float(input[base + i + 3]) - row_max) * inv_norm);
+        } else {
+            for (uint j = i; j < min(i + N_READS, axis_size); j++) {
+                output[base + j] = bfloat(fast::exp(float(input[base + j]) - row_max) * inv_norm);
+            }
+        }
     }
 }
 "#;

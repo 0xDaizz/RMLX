@@ -9,7 +9,10 @@ The rmlx GPU pipeline eliminates per-operation CPU overhead by batching multiple
 | Metric | Baseline | ExecGraph | Improvement |
 |--------|----------|-----------|-------------|
 | Command buffers / layer | 65 | 5 | 92.3% reduction |
+| Command buffers / layer (Phase KO) | 65 | 1 (9 dispatches) | 98.5% reduction |
 | Latency / layer | ~112ms | ~6.4ms | 17.4x speedup |
+| Latency / layer (Phase KO) | ~109ms | ~1.4ms | 77x speedup |
+| Gap vs MLX | -- | 5.1% | near-parity |
 | CPU-GPU sync overhead | baseline | minimal | 98.5% reduction |
 | Numerical parity | -- | max_diff=6.4e-6 | exact match |
 
@@ -167,7 +170,7 @@ Benchmarks measured on a single transformer layer (LLaMA-style architecture, 409
 | Latency reduction | **94.3%** (~112ms → ~6.4ms) |
 | CB reduction | **92.3%** (65 → 5) |
 | CPU-GPU sync reduction | **98.5%** |
-| Tests passing | **543** |
+| Tests passing | **1,142+** |
 
 ---
 
@@ -190,7 +193,7 @@ model.prepare_weights_for_graph();
 // TransformerModel -> TransformerBlock -> Attention + FeedForward -> Linear
 ```
 
-This eliminates a significant portion of the per-layer overhead that remained after command buffer batching, contributing to the final 17.4x speedup.
+This eliminates a significant portion of the per-layer overhead that remained after command buffer batching, contributing to the Phase 9B-opt 17.4x speedup.
 
 ---
 
@@ -216,7 +219,49 @@ ExecGraph's re-encode strategy is well-suited to Metal's command buffer model. R
 ExecGraph produces numerically identical results to the baseline per-op execution path:
 
 - **Maximum absolute difference:** 6.4e-6
-- **Verification:** All 543 tests pass with both code paths
+- **Verification:** All 1,142+ tests pass with both code paths
 - **Guarantee:** The `_into_cb()` pattern encodes the exact same compute pipelines, threadgroup sizes, and buffer bindings as the standard `forward()` path. The only difference is command buffer grouping, which does not affect numerical results.
 
 This level of precision (max_diff=6.4e-6) is well within the expected floating-point tolerance for fp16/bf16 transformer computations and confirms that the pipeline optimization does not introduce any numerical divergence.
+
+---
+
+## Phase KO: 9-Dispatch Decode Path
+
+Phase KO extends the ExecGraph pipeline with a minimal-dispatch decode path that reduces the full transformer layer to 9 Metal dispatches (4 encoders with memory barriers) in a single command buffer.
+
+### Dispatch Breakdown
+
+| # | Operation | Encoder |
+|---|-----------|---------|
+| 1 | Merged QKV GEMV (fused Q+K+V projection) | Encoder 1 |
+| 2 | Batched RoPE (Q and K simultaneously) | Encoder 1 |
+| 3 | Batched SDPA decode (slab KV cache) | Encoder 2 |
+| 4 | Output projection (fused GEMV + bias) | Encoder 2 |
+| 5 | Attention residual add | Encoder 2 |
+| 6 | Merged gate_up GEMV (fused gate+up projection) | Encoder 3 |
+| 7 | Fused SiLU * gate | Encoder 3 |
+| 8 | Down projection (fused GEMV + bias) | Encoder 3 |
+| 9 | FFN residual add | Encoder 4 |
+
+Memory barriers between encoders replace the heavyweight encoder boundary transitions, reducing the 9 logical dispatches to 4 physical encoder switches.
+
+### Progressive Optimization Results
+
+```text
+Baseline (per-op sync):  109,215us  1x
+ExecGraph (5 CB):          2,735us  40x
+Single-CB (44 enc):        2,049us  53x
+9-Dispatch (9->4 enc):     1,411us  77x
+MLX compiled:              1,342us  --
+Gap vs MLX:                5.1%
+```
+
+### Key Enablers
+
+- **Weight merging**: QKV and gate_up weights merged at load time, eliminating 4 separate GEMV dispatches
+- **Slab KV cache**: Single contiguous allocation per layer enables stride-aware SDPA decode
+- **StorageModePrivate**: Static weights stored in GPU-only memory (no CPU page table entries)
+- **Array::uninit**: Output buffers allocated without zeroing (kernel will overwrite completely)
+- **Unretained CB**: On Metal 3+ (M2+), command buffers are not retained after commit
+- **_into_encoder pattern**: Ops encode into a shared compute encoder with memory barriers instead of encoder boundaries
