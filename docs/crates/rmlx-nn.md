@@ -4,7 +4,7 @@
 
 `rmlx-nn` is a crate that implements neural network layers for GPU-accelerated inference. It builds core Transformer architecture components (Linear, Embedding, Attention, TransformerBlock, MoE) on top of `rmlx-core` compute kernels, and includes built-in model configurations for LLaMA, Qwen, DeepSeek-V3, and Mixtral.
 
-> **Status (Phase 0-9B-opt + S1-S5 + Audit + EP-2~EP-6 + Prod Phase 2 + Phase 3):** Linear, QuantizedLinear, Embedding, Attention (with LayerKvCache, RotatingKvCache, BatchKvCache, QuantizedKvCache, **PagedKvCache**), MLA (Multi-Latent Attention), Sliding Window Attention, TransformerBlock, MoE (with shared expert + EP integration + GPU routing + `MoeStrategy` dispatch), `ExpertGroup` (stacked expert GEMM path), `MoePipeline` (TBO/SBO overlap), LayerNorm, 14 activation functions, Parallel (TP), Conv1d/Conv2d, DynamicExecContext, GGUF model loader, **continuous batching scheduler**, and 4 model configurations are implemented. Phase 0+1+2 audit remediation complete (items N1-N8). EP Phases 2-6 forward path integration complete: `MoeStrategy` enum (PerExpert/Grouped), builder API (`with_strategy`, `with_pipeline`, `with_sparse_plan`), grouped GEMM path, pipeline integration, ICB sparse dispatch placeholder, FP8/SlabRing wiring. **Production Readiness Phase 2:** `MoeDispatchExchange` wired into MoE forward path (dispatch -> compute -> combine) in `moe.rs`; TP validation with `TpError` type and `world_size` checks in `parallel.rs`. **Phase 3 additions:** `PagedKvCache` with vLLM-style block manager, copy-on-write, and Metal buffer pool (`paged_kv_cache.rs`); continuous batching `Scheduler` with request queue, memory-aware batch scheduling, and prefill/decode phases (`scheduler.rs`).
+> **Status (Phase 0-9B-opt + S1-S5 + Audit + EP-2~EP-6 + Prod Phase 2 + Phase 3 + Phase 4):** Linear, QuantizedLinear, Embedding, Attention (with LayerKvCache, RotatingKvCache, BatchKvCache, QuantizedKvCache, **PagedKvCache**), MLA (Multi-Latent Attention), Sliding Window Attention, TransformerBlock, MoE (with shared expert + EP integration + GPU routing + `MoeStrategy` dispatch), `ExpertGroup` (stacked expert GEMM path), `MoePipeline` (TBO/SBO overlap), LayerNorm, 14 activation functions, Parallel (TP), Conv1d/Conv2d, DynamicExecContext, GGUF model loader, **continuous batching scheduler**, and 4 model configurations are implemented. Phase 0+1+2 audit remediation complete (items N1-N8). EP Phases 2-6 forward path integration complete: `MoeStrategy` enum (PerExpert/Grouped), builder API (`with_strategy`, `with_pipeline`, `with_sparse_plan`), grouped GEMM path, pipeline integration, ICB sparse dispatch placeholder, FP8/SlabRing wiring. **Production Readiness Phase 2:** `MoeDispatchExchange` wired into MoE forward path (dispatch -> compute -> combine) in `moe.rs`; TP validation with `TpError` type and `world_size` checks in `parallel.rs`. **Phase 3 additions:** `PagedKvCache` with vLLM-style block manager, copy-on-write, and Metal buffer pool (`paged_kv_cache.rs`); continuous batching `Scheduler` with request queue, memory-aware batch scheduling, and prefill/decode phases (`scheduler.rs`). **Phase 4 additions:** gather_mm batched strategy replacing per-expert loop in MoE forward (P4-8); ICB sparse expert dispatch with `grouped_forward_icb()` for active experts only, `IcbReplay` per-sparsity-pattern cache, and `forward_sparse_icb()` wired in moe.rs (P4-11).
 
 ---
 
@@ -485,9 +485,18 @@ The `forward_grouped()` path executes three phases:
 
 When a `MoePipeline` is attached via `with_pipeline()`, the forward path uses SBO (Stage-Before-Output) or TBO (Token-Before-Output) overlap strategies to overlap compute and RDMA communication. The pipeline uses `GpuEvent` signal/wait chains with a single terminal CPU wait, achieving near-zero in-flight CPU blocking.
 
-### ICB Sparse Dispatch
+### ICB Sparse Expert Dispatch (Phase 4)
 
-The `with_sparse_plan()` builder attaches a `SparsePlan` that enables ICB (Index-Compressed Batch) sparse dispatch. When routing sparsity exceeds 50% (i.e., more than half the expert slots are empty), the sparse path is auto-selected to skip empty expert computation entirely. This is a placeholder for future EP-7 optimization; the plan interface is wired but the kernel-level sparse dispatch is not yet implemented.
+The `with_sparse_plan()` builder attaches a `SparsePlan` that enables ICB (Indirect Command Buffer) sparse dispatch. When routing sparsity exceeds 50% (i.e., more than half the expert slots are empty), the sparse path is auto-selected to skip empty expert computation entirely.
+
+Phase 4 (P4-11) wires the full ICB sparse dispatch path:
+- **`grouped_forward_icb()`** in `expert_group.rs`: encodes only active experts via Metal ICB indirect dispatch, skipping empty experts at the GPU command level
+- **`IcbReplay` per-sparsity-pattern cache**: caches compiled ICB commands keyed by expert activity pattern, replaying without re-encoding when the same sparsity pattern recurs
+- **`forward_sparse_icb()`** in `moe.rs`: calls `grouped_forward_icb()` with the attached `SparsePlan` and capacity vector
+
+### gather_mm Batched MoE Strategy (Phase 4)
+
+Phase 4 (P4-8) adds the `GatherMM` batched strategy as a third MoE dispatch option. Instead of the per-expert loop (O(E) kernel launches) or the grouped ExpertGroup GEMM path, this strategy uses `gather_mm` from `rmlx-core` to perform batched gather-matmul operations directly, replacing the per-expert forward loop with a single batched dispatch. This is particularly effective for models with moderate expert counts (8-64) where the gather overhead is amortized across experts.
 
 ### MoeForwardMetrics
 
@@ -503,7 +512,7 @@ Metrics collected during MoE forward passes, including per-expert token routing 
 
 ### EP Optimization Modules
 
-**`expert_group.rs` (EP-2):** `ExpertGroup` pre-stacks expert weights into `[E, D, intermediate_dim]` tensors and executes grouped expert GEMM (Gate -> Up -> fused SwiGLU -> Down) via `GatherMM` (f16/bf16, `_into_cb` support), replacing O(E) per-expert launches with a single GPU pass.
+**`expert_group.rs` (EP-2 + Phase 4):** `ExpertGroup` pre-stacks expert weights into `[E, D, intermediate_dim]` tensors and executes grouped expert GEMM (Gate -> Up -> fused SwiGLU -> Down) via `GatherMM` (f16/bf16, `_into_cb` support), replacing O(E) per-expert launches with a single GPU pass. Phase 4 adds `grouped_forward_icb()` for ICB sparse dispatch of active experts only, with `IcbReplay` per-sparsity-pattern caching.
 
 **`moe_pipeline.rs` (EP-4):** `MoePipeline` orchestrates TBO/SBO overlap using `GpuEvent` signal/wait chains with a single terminal CPU wait, achieving full compute-RDMA overlap with zero in-flight CPU waits.
 

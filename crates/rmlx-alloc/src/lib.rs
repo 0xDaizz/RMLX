@@ -9,6 +9,7 @@
 extern crate objc;
 
 pub mod allocator;
+pub mod bfc;
 pub mod buffer_pool;
 pub mod cache;
 pub mod leak_detector;
@@ -19,6 +20,7 @@ pub mod zero_copy;
 
 // ── Re-exports of core types ──
 pub use allocator::MetalAllocator;
+pub use bfc::{BfcAllocation, BfcAllocator};
 pub use buffer_pool::BufferPool;
 pub use cache::BufferCache;
 pub use leak_detector::{LeakDetector, LeakReport};
@@ -46,6 +48,9 @@ pub enum AllocError {
     ZeroSize,
     /// A dtype-related error (e.g. quantized block misalignment).
     DType(String),
+    /// Attempted to free a buffer not owned by this allocator (double-free or
+    /// untracked pointer).
+    InvalidFree,
 }
 
 impl fmt::Display for AllocError {
@@ -66,6 +71,7 @@ impl fmt::Display for AllocError {
             Self::MutexPoisoned => write!(f, "allocator mutex poisoned"),
             Self::ZeroSize => write!(f, "zero-size allocation is not allowed"),
             Self::DType(msg) => write!(f, "dtype error: {msg}"),
+            Self::InvalidFree => write!(f, "attempted to free an unowned or already-freed buffer"),
         }
     }
 }

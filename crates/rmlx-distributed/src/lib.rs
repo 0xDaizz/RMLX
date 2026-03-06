@@ -13,6 +13,7 @@ pub mod moe_kernels;
 pub mod moe_policy;
 pub mod perf_counters;
 pub mod pipeline;
+pub mod progress_tracker;
 pub mod slab_ring;
 pub mod sparse_guard;
 pub mod transport;
@@ -36,6 +37,7 @@ pub use perf_counters::{global_counters, PerfCounters, PerfSnapshot};
 pub use pipeline::{
     LayerPipeline, LayerTransferState, PipelineConfig, PipelineStage, PipelineStats,
 };
+pub use progress_tracker::ProgressTracker;
 pub use slab_ring::{Slab, SlabRing, SlabRingConfig, SlabRingError};
 pub use sparse_guard::{GuardAction, SparseGuard};
 pub use transport::{RdmaConnectionTransport, RecvCredit};

@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex};
 use rmlx_rdma::shared_buffer::{ConnectionId, SharedBuffer};
 
 use crate::ep_runtime::{AcquiredBuffer, EpRuntimeContext};
+use crate::progress_tracker::ProgressTracker;
 use crate::transport::ZeroCopyPendingOp;
 // FP8 exchange functions are available for callers that set config.enable_fp8.
 // They operate on Array types and require KernelRegistry, so the actual
@@ -758,6 +759,10 @@ pub struct MoeDispatchExchange {
     /// Optional slab ring for zero-copy GPU→RDMA transfer (Phase 6b).
     /// When present, GPU writes directly into slab's Metal buffer for RDMA send.
     slab_ring: Option<Arc<SlabRing>>,
+    /// Optional progress tracker for async dispatch health monitoring.
+    /// When present, RDMA dispatch operations are tracked through the
+    /// ProgressTracker which monitors consecutive errors and sets health flags.
+    progress_tracker: Option<Arc<ProgressTracker>>,
 }
 
 impl MoeDispatchExchange {
@@ -776,6 +781,7 @@ impl MoeDispatchExchange {
             cached_layout: None,
             runtime_ctx: None,
             slab_ring: None,
+            progress_tracker: None,
         }
     }
 
@@ -795,6 +801,20 @@ impl MoeDispatchExchange {
     pub fn with_slab_ring(mut self, ring: Arc<SlabRing>) -> Self {
         self.slab_ring = Some(ring);
         self
+    }
+
+    /// Attach a progress tracker for async dispatch health monitoring.
+    ///
+    /// When set, async RDMA dispatch operations are polled through the
+    /// tracker, which monitors consecutive errors and provides health status.
+    pub fn with_progress_tracker(mut self, tracker: Arc<ProgressTracker>) -> Self {
+        self.progress_tracker = Some(tracker);
+        self
+    }
+
+    /// Access the progress tracker, if attached.
+    pub fn progress_tracker(&self) -> Option<&Arc<ProgressTracker>> {
+        self.progress_tracker.as_ref()
     }
 
     /// Current runtime capacity factor (may differ from baseline after guard actions).
@@ -2505,6 +2525,38 @@ pub struct AsyncDispatchResult {
     pub recv_ops: Vec<ZeroCopyPendingOp>,
 }
 
+impl AsyncDispatchResult {
+    /// Poll all pending operations through a ProgressTracker.
+    ///
+    /// Returns the total number of newly completed operations (sends + recvs).
+    /// The tracker's health monitoring is updated for each polled result.
+    pub fn poll_tracked(&self, tracker: &ProgressTracker) -> usize {
+        let sends = tracker.poll_all_zero_copy(&self.send_ops);
+        let recvs = tracker.poll_all_zero_copy(&self.recv_ops);
+        sends + recvs
+    }
+
+    /// Wait for all pending operations through a ProgressTracker.
+    ///
+    /// Blocks until all send and recv ops complete or an error threshold is
+    /// reached. Returns the total number of successfully completed operations.
+    pub fn wait_tracked(
+        &self,
+        tracker: &ProgressTracker,
+        per_op_timeout: std::time::Duration,
+    ) -> Result<usize, DistributedError> {
+        let sends = tracker.wait_all_zero_copy(&self.send_ops, per_op_timeout)?;
+        let recvs = tracker.wait_all_zero_copy(&self.recv_ops, per_op_timeout)?;
+        Ok(sends + recvs)
+    }
+
+    /// Check if all operations have completed (non-blocking).
+    pub fn all_complete(&self) -> bool {
+        self.send_ops.iter().all(|op| !op.is_pending())
+            && self.recv_ops.iter().all(|op| !op.is_pending())
+    }
+}
+
 /// Result of a dispatch operation.
 #[derive(Debug)]
 pub struct DispatchResult {
@@ -2540,6 +2592,8 @@ pub struct MoeCombineExchange {
     /// When present, `combine_async_start`/`combine_async_finish` can be called
     /// with buffers from the runtime context.
     runtime_ctx: Option<Arc<EpRuntimeContext>>,
+    /// Optional progress tracker for async combine health monitoring.
+    progress_tracker: Option<Arc<ProgressTracker>>,
 }
 
 impl MoeCombineExchange {
@@ -2548,6 +2602,7 @@ impl MoeCombineExchange {
             group,
             combine_metal_cache: Mutex::new(None),
             runtime_ctx: None,
+            progress_tracker: None,
         }
     }
 
@@ -2555,6 +2610,17 @@ impl MoeCombineExchange {
     pub fn with_runtime_context(mut self, ctx: Arc<EpRuntimeContext>) -> Self {
         self.runtime_ctx = Some(ctx);
         self
+    }
+
+    /// Attach a progress tracker for async combine health monitoring.
+    pub fn with_progress_tracker(mut self, tracker: Arc<ProgressTracker>) -> Self {
+        self.progress_tracker = Some(tracker);
+        self
+    }
+
+    /// Access the progress tracker, if attached.
+    pub fn progress_tracker(&self) -> Option<&Arc<ProgressTracker>> {
+        self.progress_tracker.as_ref()
     }
 
     /// Combine expert outputs with gating weights (CPU fallback).
@@ -3447,6 +3513,28 @@ impl AsyncCombineHandle {
     pub fn pending_count(&self) -> usize {
         self.send_ops.iter().filter(|op| op.is_pending()).count()
             + self.recv_ops.iter().filter(|op| op.is_pending()).count()
+    }
+
+    /// Poll all pending operations through a ProgressTracker.
+    ///
+    /// Returns the total number of newly completed operations.
+    pub fn poll_tracked(&self, tracker: &ProgressTracker) -> usize {
+        let sends = tracker.poll_all_zero_copy(&self.send_ops);
+        let recvs = tracker.poll_all_zero_copy(&self.recv_ops);
+        sends + recvs
+    }
+
+    /// Wait for all pending operations through a ProgressTracker.
+    ///
+    /// Returns the total number of successfully completed operations.
+    pub fn wait_tracked(
+        &self,
+        tracker: &ProgressTracker,
+        per_op_timeout: std::time::Duration,
+    ) -> Result<usize, DistributedError> {
+        let sends = tracker.wait_all_zero_copy(&self.send_ops, per_op_timeout)?;
+        let recvs = tracker.wait_all_zero_copy(&self.recv_ops, per_op_timeout)?;
+        Ok(sends + recvs)
     }
 }
 

@@ -4,7 +4,7 @@
 
 `rmlx-alloc` is the crate responsible for GPU memory allocation and zero-copy buffer management. It registers page-aligned memory allocated via `posix_memalign` with Metal's `newBufferWithBytesNoCopy`, providing simultaneous CPU/GPU access to a single physical memory region. It follows the MLX MetalAllocator pattern and includes size-binned caching and allocation statistics tracking.
 
-> **Status:** Phase 1 implementation complete + Phase 0+1+2 audit remediation (items A1-A12). `ZeroCopyBuffer`, `MetalAllocator`, `BufferCache`, `AllocStats`, `LeakDetector`, and `SmallAllocator` are implemented. `ResidencyManager` API is present, but its Metal `MTLResidencySet` backend is currently a documented stub until `metal-rs` exposes the required bindings. Under feature `metal3`, current calls intentionally fail-fast with `todo!("TODO(A6)...")` rather than silently no-op.
+> **Status:** Phase 1 implementation complete + Phase 0+1+2 audit remediation (items A1-A12) + Phase 4 performance and allocator hardening (P4-1~P4-3, P4-6, P4-12). `ZeroCopyBuffer`, `MetalAllocator`, `BufferCache`, `AllocStats`, `LeakDetector`, and `SmallAllocator` are implemented. `ResidencyManager` API is present with Metal 3 runtime detection (P4-3). **Phase 4 additions:** Atomic CAS reservation loop for memory limit enforcement; pointer tracking (HashSet+Mutex) for ownership validation; stats `fetch_update` with `saturating_sub` for deallocation underflow prevention; SmallBufferPool wired into MetalAllocator for ≤256B allocations; LeakDetector wired for alloc/free tracking; HazardTrackingModeUntracked (bit 0x10) for manual hazard tracking; `BfcAllocator` — BFC-style allocator with block splitting, coalescing, and best-fit BTreeMap lookup as an alternative to MetalAllocator.
 
 ---
 
@@ -17,8 +17,13 @@ graph TD
     A --> D[cache.rs — BufferCache]
     A --> E[stats.rs — AllocStats]
     A --> F[leak_detector.rs — LeakDetector]
+    A --> I[bfc.rs — BfcAllocator]
     B --> D
     B --> E
+    B --> F
+    B --> J[SmallBufferPool]
+    B --> K[ResidencyManager]
+    I --> D
     C --> G[posix_memalign]
     C --> H[Metal NoCopy]
 ```
@@ -32,7 +37,11 @@ pub struct MetalAllocator {
     device: Arc<GpuDevice>,
     cache: Mutex<BufferCache>,
     stats: AllocStats,
-    block_limit: usize,           // maximum total allocation (0 = unlimited)
+    block_limit: AtomicUsize,           // CAS-enforced maximum total allocation (0 = unlimited)
+    active_ptrs: Mutex<HashSet<usize>>, // pointer ownership tracking
+    leak_detector: LeakDetector,        // wired alloc/free tracking (Phase 4)
+    small_pool: SmallBufferPool,        // ≤256B fast path (Phase 4)
+    residency: Option<ResidencyManager>, // Metal 3 runtime detection (Phase 4)
 }
 ```
 
@@ -45,11 +54,18 @@ pub struct MetalAllocator {
 | `stats()` | Returns a reference to allocation statistics |
 | `clear_cache()` | Clears the cache and releases all cached buffers |
 
-**Allocation flow:**
-1. Check `block_limit` (return `OutOfMemory` if exceeded)
-2. Attempt `BufferCache::acquire(size)`
-3. Cache hit -> record cache hit in stats and return
-4. Cache miss -> call `device.new_buffer()` to allocate a new buffer
+**Allocation flow (Phase 4):**
+1. If `size <= 256`, delegate to `SmallBufferPool` fast path
+2. Atomic CAS reservation loop on `block_limit` (return `OutOfMemory` if exceeded)
+3. Attempt `BufferCache::acquire(size)`
+4. Cache hit -> record cache hit in stats and return
+5. Cache miss -> call `device.new_buffer()` to allocate a new buffer
+6. Insert pointer into `active_ptrs` HashSet for ownership validation
+7. Record allocation in `LeakDetector`
+
+**Deallocation (Phase 4):**
+- Validate pointer ownership via `active_ptrs` lookup (panics on unknown pointer)
+- Stats `fetch_update` with `saturating_sub` prevents underflow on concurrent deallocation
 
 ---
 
@@ -208,6 +224,34 @@ pub struct LeakReport {
 **High-water mark update:** On each `record_alloc()` call, the current outstanding bytes (`alloc_bytes - free_bytes`) are computed. If greater than the existing high-water mark, it is atomically updated via a `compare_exchange_weak` CAS loop.
 
 > The `Default` trait is implemented, so `LeakDetector::default()` can also be used for creation.
+
+---
+
+### `bfc.rs` — `BfcAllocator` (Phase 4)
+
+A BFC (Best-Fit with Coalescing) style allocator, providing an alternative to `MetalAllocator` for workloads that benefit from reduced fragmentation.
+
+```rust
+pub struct BfcAllocator {
+    device: Arc<GpuDevice>,
+    blocks: BTreeMap<usize, Block>,  // best-fit lookup by size
+    allocated: HashMap<usize, Block>, // pointer -> block mapping
+    stats: AllocStats,
+}
+```
+
+| Method | Description |
+|--------|-------------|
+| `new(device)` | Creates a new BFC allocator |
+| `alloc(size)` | Allocates via best-fit BTreeMap lookup; splits oversized blocks |
+| `free(ptr)` | Frees a block and coalesces with adjacent free blocks |
+| `stats()` | Returns allocation statistics |
+
+**Key behaviors:**
+- **Best-fit lookup**: `BTreeMap::range(size..)` finds the smallest block that satisfies the request
+- **Block splitting**: If the best-fit block is significantly larger than requested, it is split and the remainder is returned to the free pool
+- **Coalescing**: On free, adjacent free blocks are merged to reduce fragmentation
+- Suitable for long-running inference servers where fragmentation accumulates over time
 
 ---
 

@@ -5,14 +5,14 @@
 [![CI](https://github.com/0xDaizz/RMLX/actions/workflows/ci.yml/badge.svg)](https://github.com/0xDaizz/RMLX/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust 1.80+](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/tests-543%20passing-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-1003%20passing-brightgreen.svg)]()
 [![macOS Apple Silicon](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-lightgrey.svg)]()
 
 > 한국어 문서: [docs/README_ko.md](docs/README_ko.md)
 
 ---
 
-RMLX reimplements the core Metal GPU compute pipeline of Apple's [MLX](https://github.com/ml-explore/mlx) framework **entirely in Rust**. The ExecGraph pipeline batches 65 command buffers down to 5 per transformer layer, achieving a **17.4x speedup** (~112ms to ~6.4ms) with full numerical parity (max\_diff=6.4e-6). A full-crate audit (Phases 0, 1, 2) has been completed with 76 remediation items resolved across all 6 crates.
+RMLX reimplements the core Metal GPU compute pipeline of Apple's [MLX](https://github.com/ml-explore/mlx) framework **entirely in Rust**. The ExecGraph pipeline batches 65 command buffers down to 5 per transformer layer, achieving a **17.4x speedup** (~112ms to ~6.4ms) with full numerical parity (max\_diff=6.4e-6). A full-crate audit (Phases 0, 1, 2) has been completed with 76 remediation items resolved across all 6 crates. Phase 4 (Performance and Allocator) is complete with 12 PRs adding ChipTuning, DiskPipelineCache, BFC allocator, fused RMSNorm, ICB sparse dispatch, and SlabRing backpressure.
 
 ## ✨ Why RMLX?
 
@@ -79,7 +79,10 @@ Measured on Apple Silicon, single transformer layer, Phase 9B-opt complete:
 - **MTLSharedEvent** -- non-blocking GPU-CPU synchronization
 - **Metal infrastructure** -- fence manager, library cache, MSL version detection, autorelease pool, capture manager, managed buffers
 - **RDMA framework** -- ibverbs FFI, UC QP, multi-port Thunderbolt 5, ring/allreduce/allgather collectives (f16/bf16/f32), connection manager, coordinator
-- **Zero-copy allocator** -- `posix_memalign` + `newBufferWithBytesNoCopy` + `ibv_reg_mr`, residency management, small allocation fast-path
+- **Zero-copy allocator** -- `posix_memalign` + `newBufferWithBytesNoCopy` + `ibv_reg_mr`, residency management, small allocation fast-path, BFC allocator (block splitting + coalescing)
+- **ChipTuning** -- per-generation GPU tuning for M1/M2/M3/M4 Apple Silicon
+- **DiskPipelineCache** -- sha2-hashed persistent pipeline binary cache at `~/.cache/rmlx/pipelines/`
+- **Fused RMSNorm** -- fused `rms_norm_residual_add` kernel combining residual add + RMSNorm in single dispatch
 - **Dual queue pipeline** -- separate compute and transfer command queues
 - **VJP / LoRA** -- autodiff and parameter-efficient fine-tuning primitives
 
@@ -90,8 +93,8 @@ graph TD
     NN["rmlx-nn<br/>Linear, QuantizedLinear, MLA<br/>Attention, MoE, KV Caches<br/>PagedKV, Scheduler, Conv<br/>Activations, GGUF Loader"]
     CORE["rmlx-core<br/>27+ Op Modules, Array/DType<br/>GatherMM, LayerNorm, FA2 Metal<br/>GGUF, FP8, VJP/LoRA"]
     DIST["rmlx-distributed<br/>EP / MoE / AllReduce<br/>3-zone policy, Shared Expert"]
-    METAL["rmlx-metal<br/>Device/Queue/SharedEvent<br/>ExecGraph/CommandBatcher<br/>Fence, LibraryCache, Capture"]
-    ALLOC["rmlx-alloc<br/>ZeroCopy, BufferPool<br/>Residency, SmallAlloc"]
+    METAL["rmlx-metal<br/>Device/Queue/SharedEvent<br/>ExecGraph/CommandBatcher<br/>ChipTuning, PipelineCache<br/>Fence, LibraryCache, Capture"]
+    ALLOC["rmlx-alloc<br/>ZeroCopy, BufferPool, BFC<br/>Residency, SmallAlloc"]
     RDMA["rmlx-rdma<br/>ibverbs FFI, UC QP<br/>Multi-port, Coordinator<br/>Ring/AllReduce Collectives"]
 
     NN --> CORE
@@ -113,7 +116,7 @@ cd rmlx
 # Build the entire workspace
 cargo build --workspace
 
-# Run all tests (543)
+# Run all tests (1003)
 cargo test --workspace
 
 # Format and lint check
@@ -134,7 +137,7 @@ rmlx launch --backend rdma --hostfile rmlx-hosts.json -- ibv_devices
 ## 📁 Project Structure
 
 ```
-rmlx/                           # 7 crates, 543 tests
+rmlx/                           # 7 crates, 1003 tests
 ├── crates/
 │   ├── rmlx-metal/             # Metal GPU abstraction (ExecGraph, CommandBatcher, Fence, Capture)
 │   ├── rmlx-alloc/             # Zero-copy memory allocator (Residency, SmallAlloc)
@@ -154,11 +157,11 @@ rmlx/                           # 7 crates, 543 tests
 | Metric | Value |
 |--------|-------|
 | Crates | 7 |
-| Tests | 543 |
+| Tests | 1,003 |
 | Op modules | 27+ |
 | NN activations | 14 |
 | Model architectures | 4 (LLaMA, Qwen, DeepSeek-V3, Mixtral) |
-| Implementation phases | 9 + S1-S5 + EP-1~EP-6 + Phase 3 (P3-1~P3-8) |
+| Implementation phases | 9 + S1-S5 + EP-1~EP-6 + Phase 3 (P3-1~P3-8) + Phase 4 (P4-1~P4-12) |
 | Audit items resolved | 76 (Phase 0 + 1 + 2 full-crate audit) |
 
 ## 📚 Documentation
