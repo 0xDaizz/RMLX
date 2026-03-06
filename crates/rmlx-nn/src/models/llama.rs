@@ -13,7 +13,7 @@ pub fn llama_7b() -> TransformerConfig {
         max_seq_len: 4096,
         rope_theta: 10000.0,
         rms_norm_eps: 1e-5,
-        ff_type: FeedForwardType::Dense {
+        ff_type: FeedForwardType::Gated {
             intermediate_dim: 11008,
         },
     }
@@ -30,7 +30,7 @@ pub fn llama_3_8b() -> TransformerConfig {
         max_seq_len: 8192,
         rope_theta: 500000.0,
         rms_norm_eps: 1e-5,
-        ff_type: FeedForwardType::Dense {
+        ff_type: FeedForwardType::Gated {
             intermediate_dim: 14336,
         },
     }
