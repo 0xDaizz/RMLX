@@ -68,7 +68,7 @@ impl ManagedBuffer {
         allocator: Arc<dyn BufferAllocator>,
         size: usize,
     ) -> Result<Self, String> {
-        Self::alloc(allocator, size, crate::device::DEFAULT_BUFFER_OPTIONS)
+        Self::alloc(allocator, size, crate::device::UNTRACKED_BUFFER_OPTIONS)
     }
 
     /// Access the underlying Metal buffer.

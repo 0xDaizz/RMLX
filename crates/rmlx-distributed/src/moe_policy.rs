@@ -203,17 +203,16 @@ impl MoePolicy {
             if !time_expired && !calls_expired {
                 return inner.current_backend;
             }
-            // Cooldown has expired — drop read lock, acquire write lock to clear it,
-            // then fall through to normal selection.
-            let current = inner.current_backend;
+            // Cooldown expired — drop the read lock and re-check under a write
+            // lock before clearing it, so concurrent selectors cannot race the
+            // cooldown transition.
             drop(inner);
-            {
-                let mut w = self.inner.write().unwrap();
+            let mut w = self.inner.write().unwrap();
+            if w.cooldown_active {
                 w.cooldown_active = false;
             }
-            // Re-acquire read lock for threshold computation below.
-            let inner = self.inner.read().unwrap();
-            return Self::compute_zone(&inner, n_elements, byte_size, current);
+            let current = w.current_backend;
+            return Self::compute_zone(&w, n_elements, byte_size, current);
         }
 
         let current = inner.current_backend;

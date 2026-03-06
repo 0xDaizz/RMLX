@@ -354,6 +354,37 @@ impl Mla {
         self.w_uq.forward(&c_q, registry, queue)
     }
 
+    /// Build a lower-triangular causal mask for prefill.
+    ///
+    /// Returns a 2D f32 array of shape `[seq_len, total_seq]` where:
+    /// - `mask[i][j] = 0.0` if `j <= i + position_offset` (causal: can attend)
+    /// - `mask[i][j] = -inf` otherwise (masked out)
+    ///
+    /// For single-token decode (`seq_len == 1`), returns `None` since the
+    /// single query token can attend to all cached keys.
+    fn build_causal_mask(
+        device: &metal::Device,
+        seq_len: usize,
+        total_seq: usize,
+        position_offset: usize,
+    ) -> Option<Array> {
+        if seq_len <= 1 {
+            return None;
+        }
+        let mut mask_data = vec![f32::NEG_INFINITY; seq_len * total_seq];
+        for i in 0..seq_len {
+            let abs_pos = i + position_offset;
+            for j in 0..=std::cmp::min(abs_pos, total_seq - 1) {
+                mask_data[i * total_seq + j] = 0.0;
+            }
+        }
+        Some(Array::from_slice(
+            device,
+            &mask_data,
+            vec![seq_len, total_seq],
+        ))
+    }
+
     /// Forward pass for MLA.
     ///
     /// `x`: [seq_len, hidden_size]
@@ -531,8 +562,18 @@ impl Mla {
 
         // Use batched SDPA (all heads use same K rope, but we already assembled per-head K).
         // k_heads and v_heads have 1 per query head (no GQA in MLA — all heads share same latent).
+        // Build causal mask for prefill (seq_len > 1).
+        // position_offset = total_seq - seq_len = number of past cached tokens.
+        let causal_mask = Self::build_causal_mask(dev, seq_len, total_seq, total_seq - seq_len);
         let attn_outputs = ops::sdpa::sdpa_batched(
-            registry, &q_heads, &k_heads, &v_heads, None, scale, false, queue,
+            registry,
+            &q_heads,
+            &k_heads,
+            &v_heads,
+            causal_mask.as_ref(),
+            scale,
+            false,
+            queue,
         )?;
 
         // Step 8: Concatenate head outputs -> [seq_len, num_heads * v_dim]

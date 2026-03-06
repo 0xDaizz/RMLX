@@ -47,8 +47,8 @@ pub struct MetalAllocator {
     /// (PR 4.2). Used to detect double-free and freeing unowned buffers.
     owned_ptrs: Mutex<HashSet<u64>>,
     /// Small-buffer pool for allocations <= 256 bytes (PR 4.3).
-    /// Sub-allocates from a single backing Metal buffer to reduce Metal
-    /// runtime overhead for tiny allocations.
+    /// Recycles fixed-size Metal buffers to reduce runtime overhead for
+    /// tiny allocations.
     small_pool: SmallBufferPool,
     /// Mapping from GPU address to SmallAllocation for buffers that were
     /// served by the small-buffer pool (PR 4.3). Used to route `free()`
@@ -59,6 +59,34 @@ pub struct MetalAllocator {
     /// Optional Metal 3 residency manager (PR 4.3). Populated at runtime
     /// if the device supports Metal 3; `None` otherwise.
     residency: Mutex<Option<ResidencyManager>>,
+}
+
+struct ReservationGuard<'a> {
+    allocator: &'a MetalAllocator,
+    size: usize,
+    defused: bool,
+}
+
+impl<'a> ReservationGuard<'a> {
+    fn new(allocator: &'a MetalAllocator, size: usize) -> Self {
+        Self {
+            allocator,
+            size,
+            defused: false,
+        }
+    }
+
+    fn defuse(mut self) {
+        self.defused = true;
+    }
+}
+
+impl Drop for ReservationGuard<'_> {
+    fn drop(&mut self) {
+        if !self.defused {
+            self.allocator.release_reserved(self.size);
+        }
+    }
 }
 
 impl MetalAllocator {
@@ -218,17 +246,16 @@ impl MetalAllocator {
         }
 
         // --- Small-buffer fast path (PR 4.3) ---
-        // For allocations <= MAX_SMALL_ALLOC (256 B), try the slab pool.
-        // The pool sub-allocates from a single backing Metal buffer, avoiding
-        // per-allocation Metal runtime overhead.
+        // For allocations <= MAX_SMALL_ALLOC (256 B), try the recycling pool.
         if size <= MAX_SMALL_ALLOC {
-            // Check memory/block limits before allocating (P0 fix).
             self.try_reserve(size)?;
+            let guard = ReservationGuard::new(self, size);
 
-            if let Some(small) = self.small_pool.alloc(size) {
-                let buf = self
-                    .device
-                    .new_buffer(size as u64, rmlx_metal::device::DEFAULT_BUFFER_OPTIONS);
+            if let Some(mut small) = self.small_pool.alloc(size) {
+                let buf = small
+                    .buffer
+                    .take()
+                    .expect("small pool allocation must contain a buffer");
                 let alloc_size = buf.length() as usize;
                 // Adjust reservation if Metal rounded up the buffer size.
                 if alloc_size > size {
@@ -252,24 +279,16 @@ impl MetalAllocator {
                 if let Ok(mut map) = self.small_allocs.lock() {
                     map.insert(addr, small);
                 }
+                guard.defuse();
                 return Ok(buf);
             }
-            // Pool exhausted — fall through to normal path. The reservation
-            // from try_reserve() is still held and will be used by the normal
-            // path below (skip the second try_reserve call).
-            // Note: we already reserved `size` bytes, so jump past the normal
-            // try_reserve to avoid double-reserving.
-            // (handled by the early-return structure: if we reach here we
-            // fall through, but try_reserve below would double-count. We must
-            // release and let the normal path re-reserve.)
-            self.release_reserved(size);
-            // Pool exhausted — fall through to normal path.
         }
 
         // Atomically reserve the requested bytes against limits (PR 4.1).
         self.try_reserve(size)?;
+        let guard = ReservationGuard::new(self, size);
 
-        // Try cache first
+        // Try cache first.
         let cached = self
             .cache
             .lock()
@@ -297,6 +316,7 @@ impl MetalAllocator {
                     mgr.add_buffer(&buf);
                 }
             }
+            guard.defuse();
             return Ok(buf);
         }
 
@@ -355,6 +375,7 @@ impl MetalAllocator {
             }
         }
 
+        guard.defuse();
         Ok(buf)
     }
 
@@ -363,9 +384,19 @@ impl MetalAllocator {
     /// If the buffer was allocated from the small-buffer pool (PR 4.3), the
     /// pool slot is freed instead of returning to the normal cache.
     ///
-    /// Returns `Err(AllocError::InvalidFree)` if the buffer was not allocated
-    /// by this allocator or has already been freed (PR 4.2).
+    /// Returns `Err(AllocError::InvalidFreeBuffer(_))` if the buffer was not
+    /// allocated by this allocator or has already been freed (PR 4.2).
     pub fn free(&self, buffer: rmlx_metal::metal::Buffer) -> Result<(), AllocError> {
+        // Device mismatch check (#98): verify the buffer belongs to the same
+        // Metal device as this allocator before mutating any state.
+        {
+            let buf_device_name = buffer.device().name();
+            let our_device_name = self.device.name();
+            if buf_device_name != our_device_name {
+                return Err(AllocError::DeviceMismatch);
+            }
+        }
+
         let addr = buffer.gpu_address();
         let size = buffer.length() as usize;
 
@@ -376,7 +407,7 @@ impl MetalAllocator {
                 .lock()
                 .map_err(|_| AllocError::MutexPoisoned)?;
             if !set.remove(&addr) {
-                return Err(AllocError::InvalidFree);
+                return Err(AllocError::InvalidFreeBuffer(buffer));
             }
         }
 
@@ -397,8 +428,9 @@ impl MetalAllocator {
             .ok()
             .and_then(|mut map| map.remove(&addr));
 
-        if let Some(small_alloc) = small {
+        if let Some(mut small_alloc) = small {
             // Return the slot to the small-buffer pool.
+            small_alloc.buffer = Some(buffer);
             self.small_pool.free(small_alloc);
             // Release tracked bytes (small pool path uses fetch_add, not
             // try_reserve, so we use fetch_sub here).
@@ -626,7 +658,7 @@ mod tests {
     }
 
     /// Freeing a buffer from a *different* allocator (unowned) returns
-    /// `InvalidFree`.
+    /// `InvalidFreeBuffer`.
     #[test]
     fn test_free_unowned_buffer_returns_error() {
         let allocator_a = match make_allocator(0) {
@@ -648,10 +680,78 @@ mod tests {
 
         // Allocate from B, try to free via A.
         let buf = allocator_b.alloc(4096).expect("alloc from B failed");
-        let result = allocator_a.free(buf);
+        let returned_buf = match allocator_a.free(buf) {
+            Err(AllocError::InvalidFreeBuffer(buf)) => buf,
+            other => {
+                panic!("freeing unowned buffer should return InvalidFreeBuffer, got {other:?}")
+            }
+        };
+        allocator_b
+            .free(returned_buf)
+            .expect("allocator B should free returned buffer");
+    }
+
+    #[test]
+    fn test_invalid_free_returns_buffer() {
+        let allocator_a = match make_allocator(0) {
+            Some(a) => a,
+            None => {
+                eprintln!("skipping test: no Metal device");
+                return;
+            }
+        };
+
+        let device = match GpuDevice::system_default() {
+            Ok(d) => Arc::new(d),
+            Err(_) => {
+                eprintln!("skipping test: no Metal device");
+                return;
+            }
+        };
+        let allocator_b = Arc::new(MetalAllocator::new(device, 0));
+
+        let buf = allocator_b.alloc(4096).expect("alloc from B failed");
+        let original_addr = buf.gpu_address();
+        let returned_buf = match allocator_a.free(buf) {
+            Err(AllocError::InvalidFreeBuffer(buf)) => buf,
+            other => panic!("expected InvalidFreeBuffer, got {other:?}"),
+        };
+
+        assert_eq!(returned_buf.gpu_address(), original_addr);
+        allocator_b
+            .free(returned_buf)
+            .expect("allocator B should free returned buffer");
+    }
+
+    #[test]
+    fn test_reservation_released_on_cache_poison() {
+        let allocator = match make_allocator(0) {
+            Some(a) => a,
+            None => {
+                eprintln!("skipping test: no Metal device");
+                return;
+            }
+        };
+
+        let poison_target = Arc::clone(&allocator);
+        let handle = std::thread::spawn(move || {
+            let _guard = poison_target
+                .cache
+                .lock()
+                .expect("lock cache for poisoning");
+            panic!("poison cache mutex");
+        });
+        let _ = handle.join();
+
+        let result = allocator.alloc(4096);
         assert!(
-            matches!(result, Err(AllocError::InvalidFree)),
-            "freeing unowned buffer should return InvalidFree, got {result:?}"
+            matches!(result, Err(AllocError::MutexPoisoned)),
+            "alloc should fail with MutexPoisoned after cache poison, got {result:?}"
+        );
+        assert_eq!(
+            allocator.allocated_bytes(),
+            0,
+            "reserved bytes should be released on cache poison"
         );
     }
 
@@ -667,5 +767,102 @@ mod tests {
         // Free more than was allocated -- should saturate at 0, not wrap.
         stats.record_free(200);
         assert_eq!(stats.active(), 0, "active_bytes should saturate at 0");
+    }
+
+    // ---- #98: Device mismatch on free ----
+
+    /// Freeing a buffer whose Metal device does not match this allocator's
+    /// device must return `DeviceMismatch` without corrupting state.
+    ///
+    /// On a single-GPU Mac there is only one Metal device, so the device names
+    /// always match. We test the positive path (same device, no error) and
+    /// rely on the code-level check being correct for multi-device scenarios.
+    #[test]
+    fn test_free_same_device_no_mismatch() {
+        let allocator = match make_allocator(0) {
+            Some(a) => a,
+            None => {
+                eprintln!("skipping test: no Metal device");
+                return;
+            }
+        };
+
+        let buf = allocator.alloc(4096).expect("alloc failed");
+        // free() should succeed (same device, same allocator).
+        allocator
+            .free(buf)
+            .expect("free should succeed for same-device buffer");
+        assert_eq!(allocator.allocated_bytes(), 0);
+    }
+
+    // ---- #99: SmallBufferPool is_suballocating ----
+
+    #[test]
+    fn test_small_pool_is_not_suballocating() {
+        let device = match GpuDevice::system_default() {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("skipping test: no Metal device");
+                return;
+            }
+        };
+
+        let pool = SmallBufferPool::new(&device, None);
+        assert!(
+            !pool.is_suballocating(),
+            "SmallBufferPool should report false until true sub-allocation is implemented"
+        );
+    }
+
+    // ---- #101: Reserved-byte leak on failure after try_reserve ----
+
+    /// If alloc() fails after try_reserve succeeds, the reserved bytes must be
+    /// released. We test this by setting a tight memory limit and verifying
+    /// that allocated_bytes returns to 0 after all buffers are freed.
+    #[test]
+    fn test_reserved_bytes_not_leaked_on_alloc_free_cycle() {
+        let allocator = match make_allocator(0) {
+            Some(a) => a,
+            None => {
+                eprintln!("skipping test: no Metal device");
+                return;
+            }
+        };
+
+        let limit: usize = 4096 * 4;
+        allocator.set_memory_limit(limit);
+
+        // Allocate up to the limit.
+        let mut bufs = Vec::new();
+        for _ in 0..4 {
+            match allocator.alloc(4096) {
+                Ok(b) => bufs.push(b),
+                Err(_) => break,
+            }
+        }
+        let after_alloc = allocator.allocated_bytes();
+        assert!(after_alloc > 0, "should have allocated some bytes");
+
+        // Free all buffers.
+        for b in bufs {
+            allocator.free(b).expect("free failed");
+        }
+
+        // Reserved bytes must be fully released — no leak.
+        assert_eq!(
+            allocator.allocated_bytes(),
+            0,
+            "allocated_bytes should be 0 after freeing all buffers (no reserved-byte leak)"
+        );
+
+        // We should be able to allocate again up to the limit.
+        let buf = allocator.alloc(4096);
+        assert!(
+            buf.is_ok(),
+            "should be able to allocate again after freeing (reserved bytes were properly released)"
+        );
+        if let Ok(b) = buf {
+            allocator.free(b).expect("free failed");
+        }
     }
 }
