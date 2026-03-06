@@ -217,7 +217,7 @@ pub fn run_warmup_bench(device: Option<&rmlx_metal::GpuDevice>) -> WarmupBenchRe
     } else {
         None
     };
-    let metal_device = device.map(|gpu| gpu.raw()).or_else(|| owned_gpu.as_ref());
+    let metal_device = device.map(|gpu| gpu.raw()).or(owned_gpu.as_ref());
 
     WarmupBenchResult {
         gpu_matmul_gflops: run_gpu_matmul_proxy_bench(metal_device, GPU_PROXY_DIM),
