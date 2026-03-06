@@ -103,6 +103,7 @@ impl Default for MoeForwardMetrics {
     }
 }
 
+#[derive(Clone)]
 pub struct MoeConfig {
     pub num_experts: usize,
     pub num_experts_per_token: usize,

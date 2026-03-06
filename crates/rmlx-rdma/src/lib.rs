@@ -22,9 +22,10 @@ pub mod shared_buffer;
 
 // ── Re-exports of core types ──
 pub use collectives::{
-    apply_reduce_op, apply_reduce_op_typed, chunk_boundaries, ring_allgather, ring_allreduce,
-    ring_allreduce_typed, ring_reduce_scatter, ring_reduce_scatter_typed, CollectiveDType,
-    ReduceElement, ReduceOp,
+    apply_reduce_op, apply_reduce_op_typed, chunk_boundaries, pipelined_ring_allreduce,
+    ring_allgather, ring_allreduce, ring_allreduce_typed, ring_reduce_scatter,
+    ring_reduce_scatter_typed, CollectiveDType, PipelinedRingBuffer, ReduceElement, ReduceOp,
+    SlotState,
 };
 pub mod crc;
 pub use connection::{

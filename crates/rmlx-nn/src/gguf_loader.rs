@@ -28,6 +28,8 @@ use std::path::Path;
 use rmlx_core::array::Array;
 use rmlx_core::formats::gguf::{self, GgmlType, GgufError, GgufFile, GgufTensorInfo};
 
+use crate::quantized_linear::KQuantType;
+
 /// Error type for GGUF weight loading.
 #[derive(Debug)]
 pub enum GgufLoadError {
@@ -386,6 +388,64 @@ pub fn gguf_name_to_rmlx(gguf_name: &str) -> Option<String> {
     Some(name)
 }
 
+// ---------------------------------------------------------------------------
+// K-quant type mapping
+// ---------------------------------------------------------------------------
+
+/// Map a GGML type to a k-quant type, if applicable.
+///
+/// Returns `Some(KQuantType)` for Q2_K through Q6_K types, and `None`
+/// for all other types (F32, F16, Q4_0, Q8_0, etc.).
+///
+/// This is used by the GGUF loader to determine whether a tensor uses
+/// k-quant super-block encoding and needs special handling during loading.
+pub fn ggml_type_to_kquant(ggml_type: GgmlType) -> Option<KQuantType> {
+    match ggml_type {
+        GgmlType::Q2K => Some(KQuantType::Q2K),
+        GgmlType::Q3K => Some(KQuantType::Q3K),
+        GgmlType::Q4K => Some(KQuantType::Q4K),
+        GgmlType::Q5K => Some(KQuantType::Q5K),
+        GgmlType::Q6K => Some(KQuantType::Q6K),
+        _ => None,
+    }
+}
+
+/// Check whether a GGML type is a k-quant type.
+pub fn is_kquant_type(ggml_type: GgmlType) -> bool {
+    ggml_type_to_kquant(ggml_type).is_some()
+}
+
+/// Describe how a k-quant type should be loaded.
+///
+/// K-quant tensors cannot be directly loaded as RMLX arrays because they
+/// use super-block encoding with nested quantization of scales. This
+/// function returns a [`KQuantLoadInfo`] describing the type, block
+/// size, and bytes-per-block so that callers can read the raw data and
+/// create a [`KQuantConfig`](crate::quantized_linear::KQuantConfig).
+#[derive(Debug, Clone)]
+pub struct KQuantLoadInfo {
+    /// The k-quant type.
+    pub quant_type: KQuantType,
+    /// Elements per super block (always 256).
+    pub block_size: usize,
+    /// Bytes per super block.
+    pub type_size: usize,
+    /// Effective bits per weight.
+    pub bits: u32,
+}
+
+/// Get loading info for a k-quant GGML type.
+///
+/// Returns `None` if the GGML type is not a k-quant type.
+pub fn kquant_load_info(ggml_type: GgmlType) -> Option<KQuantLoadInfo> {
+    ggml_type_to_kquant(ggml_type).map(|qt| KQuantLoadInfo {
+        quant_type: qt,
+        block_size: qt.block_size(),
+        type_size: qt.type_size(),
+        bits: qt.bits(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -522,5 +582,65 @@ mod tests {
             found: vec![8, 8],
         };
         assert!(e2.to_string().contains("bar"));
+    }
+
+    // -----------------------------------------------------------------------
+    // K-quant type mapping
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_kquant_mapping_q2k() {
+        let qt = ggml_type_to_kquant(GgmlType::Q2K);
+        assert_eq!(qt, Some(KQuantType::Q2K));
+        assert!(is_kquant_type(GgmlType::Q2K));
+    }
+
+    #[test]
+    fn test_kquant_mapping_q3k() {
+        let qt = ggml_type_to_kquant(GgmlType::Q3K);
+        assert_eq!(qt, Some(KQuantType::Q3K));
+    }
+
+    #[test]
+    fn test_kquant_mapping_q4k() {
+        let qt = ggml_type_to_kquant(GgmlType::Q4K);
+        assert_eq!(qt, Some(KQuantType::Q4K));
+    }
+
+    #[test]
+    fn test_kquant_mapping_q5k() {
+        let qt = ggml_type_to_kquant(GgmlType::Q5K);
+        assert_eq!(qt, Some(KQuantType::Q5K));
+    }
+
+    #[test]
+    fn test_kquant_mapping_q6k() {
+        let qt = ggml_type_to_kquant(GgmlType::Q6K);
+        assert_eq!(qt, Some(KQuantType::Q6K));
+    }
+
+    #[test]
+    fn test_kquant_mapping_non_kquant_returns_none() {
+        assert_eq!(ggml_type_to_kquant(GgmlType::F32), None);
+        assert_eq!(ggml_type_to_kquant(GgmlType::F16), None);
+        assert_eq!(ggml_type_to_kquant(GgmlType::Q4_0), None);
+        assert_eq!(ggml_type_to_kquant(GgmlType::Q8_0), None);
+        assert_eq!(ggml_type_to_kquant(GgmlType::BF16), None);
+        assert!(!is_kquant_type(GgmlType::F32));
+    }
+
+    #[test]
+    fn test_kquant_load_info() {
+        let info = kquant_load_info(GgmlType::Q4K).unwrap();
+        assert_eq!(info.quant_type, KQuantType::Q4K);
+        assert_eq!(info.block_size, 256);
+        assert_eq!(info.type_size, 144);
+        assert_eq!(info.bits, 4);
+
+        let info = kquant_load_info(GgmlType::Q2K).unwrap();
+        assert_eq!(info.type_size, 84);
+        assert_eq!(info.bits, 2);
+
+        assert!(kquant_load_info(GgmlType::F32).is_none());
     }
 }

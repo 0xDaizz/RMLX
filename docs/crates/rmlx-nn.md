@@ -4,7 +4,7 @@
 
 `rmlx-nn` is a crate that implements neural network layers for GPU-accelerated inference. It builds core Transformer architecture components (Linear, Embedding, Attention, TransformerBlock, MoE) on top of `rmlx-core` compute kernels, and includes built-in model configurations for LLaMA, Qwen, DeepSeek-V3, and Mixtral.
 
-> **Status (Phase 0-9B-opt + S1-S5 + Audit + EP-2~EP-6 + Prod Phase 2 + Phase 3 + Phase 4):** Linear, QuantizedLinear, Embedding, Attention (with LayerKvCache, RotatingKvCache, BatchKvCache, QuantizedKvCache, **PagedKvCache**), MLA (Multi-Latent Attention), Sliding Window Attention, TransformerBlock, MoE (with shared expert + EP integration + GPU routing + `MoeStrategy` dispatch), `ExpertGroup` (stacked expert GEMM path), `MoePipeline` (TBO/SBO overlap), LayerNorm, 14 activation functions, Parallel (TP), Conv1d/Conv2d, DynamicExecContext, GGUF model loader, **continuous batching scheduler**, and 4 model configurations are implemented. Phase 0+1+2 audit remediation complete (items N1-N8). EP Phases 2-6 forward path integration complete: `MoeStrategy` enum (PerExpert/Grouped), builder API (`with_strategy`, `with_pipeline`, `with_sparse_plan`), grouped GEMM path, pipeline integration, ICB sparse dispatch placeholder, FP8/SlabRing wiring. **Production Readiness Phase 2:** `MoeDispatchExchange` wired into MoE forward path (dispatch -> compute -> combine) in `moe.rs`; TP validation with `TpError` type and `world_size` checks in `parallel.rs`. **Phase 3 additions:** `PagedKvCache` with vLLM-style block manager, copy-on-write, and Metal buffer pool (`paged_kv_cache.rs`); continuous batching `Scheduler` with request queue, memory-aware batch scheduling, and prefill/decode phases (`scheduler.rs`). **Phase 4 additions:** gather_mm batched strategy replacing per-expert loop in MoE forward (P4-8); ICB sparse expert dispatch with `grouped_forward_icb()` for active experts only, `IcbReplay` per-sparsity-pattern cache, and `forward_sparse_icb()` wired in moe.rs (P4-11).
+> **Status (Phase 0-9B-opt + S1-S5 + Audit + EP-2~EP-6 + Prod Phase 2 + Phase 3 + Phase 4 + Phase 5):** Linear, QuantizedLinear (+ AwqLinear, GptqLinear, KQuantType/KQuantConfig), Embedding, Attention (with LayerKvCache, RotatingKvCache, BatchKvCache, QuantizedKvCache, **PagedKvCache**), MLA (full forward: DeepSeek-V3 9-step pipeline with latent KV compression), SlidingWindowAttention (full forward: Mistral-style RoPE + SDPA + KV cache), TransformerBlock, MoE (with shared expert + EP integration + GPU routing + `MoeStrategy` dispatch), `ExpertGroup` (stacked expert GEMM path), `MoePipeline` (TBO/SBO overlap), LayerNorm, **16 activation functions**, Parallel (TP), Conv1d/Conv2d, DynamicExecContext, GGUF model loader (+ K-quant type mapping), **prefix cache** (radix-tree with LRU eviction), **chunked prefill** scheduler, **continuous batching scheduler**, and **4 full model architectures** (LlamaModel, Qwen2Model, DeepSeekV3Model, MixtralModel) are implemented. Phase 0+1+2 audit remediation complete (items N1-N8). EP Phases 2-6 forward path integration complete. **Phase 5 additions:** 11 new activations (ReLU, LeakyReLU, ELU, SELU, Mish, QuickGELU, HardSwish, HardSigmoid, Softplus, Softsign, GLU -- 16 total); full MLA forward implementation; full SlidingWindowAttention forward; AwqLinear/GptqLinear/KQuantType/KQuantConfig in quantized\_linear.rs; K-quant GGUF mapping in gguf\_loader.rs; radix-tree prefix cache (prefix\_cache.rs); chunked prefill in scheduler.rs; 4 full model architectures in models/.
 
 ---
 
@@ -14,22 +14,23 @@
 rmlx-nn/src/
 ├── lib.rs               # Module declarations + re-exports
 ├── linear.rs            # Linear (FC) layer
-├── quantized_linear.rs  # QuantizedLinear (4-bit/8-bit with group quantization)
+├── quantized_linear.rs  # QuantizedLinear, AwqLinear, GptqLinear, KQuantType/KQuantConfig
 ├── embedding.rs         # Token embedding
 ├── attention.rs         # Multi-Head / GQA Attention + KV cache
 ├── mla.rs               # Multi-Latent Attention (DeepSeek-V3)
 ├── sliding_window.rs    # Sliding Window Attention
 ├── layer_norm.rs        # LayerNorm layer wrapper
-├── activations.rs       # 14 activation functions (SiLU, GELU, Mish, etc.)
+├── activations.rs       # 16 activation functions (SiLU, GELU, ReLU, Mish, GLU, etc.)
 ├── transformer.rs       # Transformer block + model
 ├── moe.rs               # Mixture of Experts (shared expert, EP integration, GPU routing)
 ├── expert_group.rs      # Grouped expert GEMM + stacked expert weights
 ├── moe_pipeline.rs      # TBO/SBO compute-communication overlap orchestration
 ├── conv.rs              # Conv1d/Conv2d layer wrappers
 ├── dynamic.rs           # DynamicExecContext for variable shapes
-├── gguf_loader.rs       # End-to-end GGUF model loading
+├── gguf_loader.rs       # End-to-end GGUF model loading + K-quant type mapping
 ├── paged_kv_cache.rs    # Paged KV cache + block manager (vLLM-style)
-├── scheduler.rs         # Continuous batching scheduler (prefill/decode)
+├── prefix_cache.rs      # Radix-tree prefix cache with LRU eviction
+├── scheduler.rs         # Continuous batching scheduler (prefill/decode + chunked prefill)
 ├── parallel.rs          # Tensor-parallel layers (feature = "distributed")
 └── models/
     ├── mod.rs            # Model module declarations
@@ -543,6 +544,22 @@ A memory-aware continuous batching scheduler that manages inference requests thr
 
 Together with `PagedKvCache`, this module provides the serving infrastructure needed for production LLM inference.
 
+### Chunked Prefill (Phase 5)
+
+Phase 5 adds chunked prefill support to the scheduler. When `max_prefill_chunk` is configured, long prompts are split into chunks and prefilled incrementally, interleaving decode steps for other requests between chunks. This prevents head-of-line blocking during long prefill sequences and improves overall throughput for mixed workloads.
+
+---
+
+## prefix_cache.rs -- Radix-Tree Prefix Cache (Phase 5)
+
+A radix-tree based prefix cache that enables KV block reuse across sequences sharing common prefixes (e.g., system prompts, few-shot examples).
+
+**Key features:**
+- **Radix tree structure**: token sequences are stored in a trie, with shared prefixes sharing the same KV blocks
+- **LRU eviction**: when cache capacity is exceeded, least-recently-used prefix entries are evicted first
+- **Block reuse**: when a new sequence matches an existing prefix, the cached KV blocks are reused directly, skipping redundant prefill computation
+- **Integration with PagedKvCache**: prefix cache entries reference paged KV blocks, enabling seamless integration with the block manager
+
 ---
 
 ## conv.rs — Convolution Layers
@@ -621,7 +638,7 @@ pub struct DynamicExecContext {
 
 ## models/ — Model Architecture Definitions
 
-Provides 4 Transformer model configurations as `TransformerConfig`.
+Provides 4 full Transformer model architectures as `TransformerConfig` with complete forward implementations.
 
 ### LLaMA (`models/llama.rs`)
 
@@ -742,6 +759,56 @@ pub use transformer::{
     FeedForward, FeedForwardType, TransformerBlock, TransformerConfig, TransformerModel,
 };
 ```
+
+---
+
+## MLA Forward Implementation (Phase 5)
+
+Phase 5 delivers the full MLA (Multi-Latent Attention) forward implementation in `mla.rs`, replacing the previous stub. This implements the DeepSeek-V3 style 9-step pipeline:
+
+1. Latent KV compression (down-projection)
+2. KV up-projection from compressed latent
+3. K/V split from up-projected tensor
+4. RoPE application to queries and keys
+5. Q/K/V reshape for multi-head layout
+6. KV cache update (append new K/V)
+7. Scaled dot-product attention (SDPA)
+8. Output reshape and projection
+9. Final output projection
+
+This enables efficient inference for DeepSeek-V3 and similar architectures that use latent KV compression to reduce the KV cache memory footprint.
+
+---
+
+## SlidingWindowAttention Forward (Phase 5)
+
+Phase 5 delivers the full SlidingWindowAttention forward implementation in `sliding_window.rs`, replacing the previous stub. This implements Mistral-style sliding window attention:
+
+- **RoPE**: rotary position embeddings applied to Q and K
+- **SDPA with window mask**: attention is restricted to a configurable window size, enabling efficient long-context inference
+- **KV cache integration**: seamless integration with RotatingKvCache for sliding window KV management
+
+---
+
+## Quantized Linear Additions (Phase 5)
+
+Phase 5 expands `quantized_linear.rs` with three new quantization types:
+
+| Type | Description |
+|------|-------------|
+| `AwqLinear` | INT4 row-major quantization (AWQ format), unpacks packed uint32 weights with per-group scales and zeros |
+| `GptqLinear` | INT4 column-major quantization (GPTQ format), supports g\_idx for act\_order reordering |
+| `KQuantType` | K-quant type enum (Q2K, Q3K, Q4K, Q5K, Q6K) for GGUF K-quantized models |
+| `KQuantConfig` | Configuration for K-quant layers (quant type, group size, super-block size) |
+
+### GGUF K-Quant Mapping (Phase 5)
+
+The `gguf_loader.rs` module adds K-quant type mapping functions:
+
+| Function | Description |
+|----------|-------------|
+| `ggml_type_to_kquant(ggml_type)` | Maps GGML K-quant types to `KQuantType` |
+| `kquant_load_info(kquant_type)` | Returns load parameters (group size, bits per weight) for a K-quant type |
 
 ---
 

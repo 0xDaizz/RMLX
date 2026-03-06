@@ -24,7 +24,10 @@ pub mod warmup;
 pub use credit_manager::CreditManager;
 pub use ep_runtime::{AcquiredBuffer, EpRuntimeContext};
 pub use fp8_exchange::Fp8DispatchPayload;
-pub use group::{DistributedError, Group, RdmaTransport, ReduceDtype, ReduceOp};
+pub use group::{
+    AllreduceAlgorithm, DistributedError, Group, RdmaTransport, ReduceDtype, ReduceOp,
+    TopologyRing, TREE_ALLREDUCE_THRESHOLD,
+};
 pub use init::{init, BackendHint, DistributedContext, InitConfig};
 pub use metrics::{MoeMetrics as MoeMetricsAtomic, MoeMetricsSnapshot};
 pub use moe_exchange::{
