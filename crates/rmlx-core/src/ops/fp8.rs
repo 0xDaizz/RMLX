@@ -516,8 +516,7 @@ pub fn dequant_fp8e4m3_to_f16(
     );
     encoder.dispatch_threads(grid_size, threadgroup_size);
     encoder.end_encoding();
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
+    super::commit_with_mode(command_buffer, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -565,8 +564,7 @@ pub fn dequant_fp8e5m2_to_f16(
     );
     encoder.dispatch_threads(grid_size, threadgroup_size);
     encoder.end_encoding();
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
+    super::commit_with_mode(command_buffer, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -617,8 +615,7 @@ pub fn quant_f16_to_fp8e4m3(
     );
     encoder.dispatch_threads(grid_size, threadgroup_size);
     encoder.end_encoding();
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
+    super::commit_with_mode(command_buffer, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -669,8 +666,7 @@ pub fn quant_f16_to_fp8e5m2(
     );
     encoder.dispatch_threads(grid_size, threadgroup_size);
     encoder.end_encoding();
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
+    super::commit_with_mode(command_buffer, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -828,8 +824,7 @@ pub fn quant_per_token_fp8e4m3(
 ) -> Result<(Array, Array), KernelError> {
     let command_buffer = queue.new_command_buffer();
     let result = encode_quant_per_token(registry, input, command_buffer)?;
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
+    super::commit_with_mode(command_buffer, super::ExecMode::Sync);
     Ok(result)
 }
 
@@ -846,8 +841,7 @@ pub fn dequant_per_token_fp8e4m3(
 ) -> Result<Array, KernelError> {
     let command_buffer = queue.new_command_buffer();
     let result = encode_dequant_per_token(registry, input, scales, command_buffer)?;
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
+    super::commit_with_mode(command_buffer, super::ExecMode::Sync);
     Ok(result)
 }
 

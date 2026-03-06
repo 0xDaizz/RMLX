@@ -49,7 +49,7 @@ Measured on Apple Silicon, single transformer layer, Phase 9B-opt complete:
 
 **Compute Ops (27 op modules)**
 - **Core ops** -- matmul, softmax, rms\_norm, rope, gemv, quantized GEMM, binary, reduce, copy, indexing
-- **Attention** -- SDPA/Flash Attention 2 (D≤256, decode fast path, causal mask, bf16), SDPA backward
+- **Attention** -- SDPA/Flash Attention 2 (D≤256, decode fast path, causal mask, bf16), FlashAttention-2 Metal kernel (tiled online softmax, f32 head_dim=128), SDPA backward
 - **Activations** -- SiLU, SwiGLU, GELU (approx + fast), unary ops (exp, log, sqrt, abs, neg, tanh, sigmoid, erf, ceil, floor, round, sign, reciprocal)
 - **Normalization** -- RMS norm, LayerNorm (with affine parameters)
 - **Quantization** -- quantized GEMM (Q4/Q8), FP8 dequant/quant (E4M3/E5M2), AWQ/GPTQ INT4 unpacking
@@ -64,7 +64,7 @@ Measured on Apple Silicon, single transformer layer, Phase 9B-opt complete:
 - **Activations** -- SiLU, GELU, SwiGLU, Mish, QuickGELU, ReLU, LeakyReLU, ELU, SELU, Swish, HardSwish, HardSigmoid, Softplus, Softsign (14 activations)
 - **MoE** -- Expert Parallelism with shared expert support, EP integration, GPU routing, ExpertGroup (grouped GEMM), MoePipeline (TBO/SBO overlap)
 - **Sliding Window Attention** -- configurable window size for efficient long-context inference
-- **KV cache** -- static, rotating (circular buffer), batch (per-sequence), quantized (q4/q8 compressed)
+- **KV cache** -- static, rotating (circular buffer), batch (per-sequence), quantized (q4/q8 compressed), paged (vLLM-style block manager with copy-on-write)
 - **Convolution** -- Conv1d/Conv2d neural network layer wrappers
 - **GGUF loading** -- end-to-end model loading from GGUF files with tensor mapping
 
@@ -74,10 +74,11 @@ Measured on Apple Silicon, single transformer layer, Phase 9B-opt complete:
 - **GGUF format** -- binary parser for llama.cpp GGUF v2/v3 model files
 - **4 model architectures** -- LLaMA, Qwen, DeepSeek-V3, Mixtral
 - **Expert Parallelism** -- EP dispatch/combine with 3-zone auto backend (CPU/Metal/RDMA), 7 MoE Metal kernels, SparseGuard overflow monitoring, 6-phase EP optimization (GPU top-k routing, grouped expert GEMM, v3 protocol, TBO/SBO overlap, FP8 wire, ICB sparse + slab ring)
+- **Continuous batching** -- memory-aware scheduler with prefill/decode phases, request queue
 - **Dynamic shapes** -- max-size pre-allocation with variable dispatch
 - **MTLSharedEvent** -- non-blocking GPU-CPU synchronization
 - **Metal infrastructure** -- fence manager, library cache, MSL version detection, autorelease pool, capture manager, managed buffers
-- **RDMA framework** -- ibverbs FFI, UC QP, multi-port Thunderbolt 5, ring/allreduce/allgather collectives, connection manager, coordinator
+- **RDMA framework** -- ibverbs FFI, UC QP, multi-port Thunderbolt 5, ring/allreduce/allgather collectives (f16/bf16/f32), connection manager, coordinator
 - **Zero-copy allocator** -- `posix_memalign` + `newBufferWithBytesNoCopy` + `ibv_reg_mr`, residency management, small allocation fast-path
 - **Dual queue pipeline** -- separate compute and transfer command queues
 - **VJP / LoRA** -- autodiff and parameter-efficient fine-tuning primitives
@@ -86,8 +87,8 @@ Measured on Apple Silicon, single transformer layer, Phase 9B-opt complete:
 
 ```mermaid
 graph TD
-    NN["rmlx-nn<br/>Linear, QuantizedLinear, MLA<br/>Attention, MoE, KV Caches<br/>Conv, Activations, GGUF Loader"]
-    CORE["rmlx-core<br/>25 Op Modules, Array/DType<br/>GatherMM, LayerNorm, Unary<br/>GGUF, FP8, VJP/LoRA"]
+    NN["rmlx-nn<br/>Linear, QuantizedLinear, MLA<br/>Attention, MoE, KV Caches<br/>PagedKV, Scheduler, Conv<br/>Activations, GGUF Loader"]
+    CORE["rmlx-core<br/>27+ Op Modules, Array/DType<br/>GatherMM, LayerNorm, FA2 Metal<br/>GGUF, FP8, VJP/LoRA"]
     DIST["rmlx-distributed<br/>EP / MoE / AllReduce<br/>3-zone policy, Shared Expert"]
     METAL["rmlx-metal<br/>Device/Queue/SharedEvent<br/>ExecGraph/CommandBatcher<br/>Fence, LibraryCache, Capture"]
     ALLOC["rmlx-alloc<br/>ZeroCopy, BufferPool<br/>Residency, SmallAlloc"]
@@ -138,10 +139,10 @@ rmlx/                           # 7 crates, 543 tests
 │   ├── rmlx-metal/             # Metal GPU abstraction (ExecGraph, CommandBatcher, Fence, Capture)
 │   ├── rmlx-alloc/             # Zero-copy memory allocator (Residency, SmallAlloc)
 │   ├── rmlx-rdma/              # RDMA communication (ibverbs FFI, Coordinator, Collectives)
-│   ├── rmlx-core/              # Compute engine (25 op modules, formats, graph, autodiff)
+│   ├── rmlx-core/              # Compute engine (27+ op modules, formats, graph, autodiff)
 │   ├── rmlx-distributed/       # Distributed primitives (EP, MoE, Shared Expert)
 │   ├── rmlx-nn/                # Neural network layers (Transformer, MoE, MLA, QuantizedLinear, GGUF)
-│   └── rmlx-cli/               # Native CLI tooling (rmlx launch, rmlx config)
+│   └── rmlx-cli/               # Native CLI tooling (rmlx launch, rmlx config, signal forwarding)
 ├── shaders/                    # Metal shader sources
 ├── tests/                      # Integration tests
 ├── benches/                    # Criterion benchmarks
@@ -154,10 +155,10 @@ rmlx/                           # 7 crates, 543 tests
 |--------|-------|
 | Crates | 7 |
 | Tests | 543 |
-| Op modules | 27 |
+| Op modules | 27+ |
 | NN activations | 14 |
 | Model architectures | 4 (LLaMA, Qwen, DeepSeek-V3, Mixtral) |
-| Implementation phases | 9 + S1-S5 + EP-1~EP-6 |
+| Implementation phases | 9 + S1-S5 + EP-1~EP-6 + Phase 3 (P3-1~P3-8) |
 | Audit items resolved | 76 (Phase 0 + 1 + 2 full-crate audit) |
 
 ## 📚 Documentation

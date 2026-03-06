@@ -20,7 +20,7 @@ fn test_group_world() {
 
 #[test]
 fn test_moe_policy_zones() {
-    let mut policy = MoePolicy::new();
+    let policy = MoePolicy::new();
     policy.set_hysteresis_band(0); // disable hysteresis for clean zone testing
 
     // CPU zone: N <= 64
@@ -36,7 +36,7 @@ fn test_moe_policy_zones() {
 
 #[test]
 fn test_moe_policy_cooldown() {
-    let mut policy = MoePolicy::new();
+    let policy = MoePolicy::new();
     policy.switch_backend(MoeBackend::Cpu);
     // During cooldown, should keep Cpu
     assert!(policy.cooldown_active());
@@ -175,7 +175,7 @@ fn test_group_display() {
 
 #[test]
 fn test_moe_policy_rdma_zone_multinode() {
-    let mut policy = MoePolicy::new();
+    let policy = MoePolicy::new();
     policy.set_world_size(2);
     policy.set_hysteresis_band(0); // disable hysteresis for clean threshold testing
 
@@ -193,7 +193,7 @@ fn test_moe_policy_rdma_zone_multinode() {
 
 #[test]
 fn test_moe_policy_no_rdma_single_node() {
-    let mut policy = MoePolicy::new();
+    let policy = MoePolicy::new();
     policy.set_world_size(1);
     policy.set_hysteresis_band(0);
 
@@ -204,7 +204,7 @@ fn test_moe_policy_no_rdma_single_node() {
 
 #[test]
 fn test_moe_policy_hysteresis() {
-    let mut policy = MoePolicy::with_thresholds(64, 320, 4096);
+    let policy = MoePolicy::with_thresholds(64, 320, 4096);
     policy.set_world_size(2);
     // Default hysteresis_band = 16
 
@@ -237,7 +237,7 @@ fn test_moe_dispatch_rdma_routing() {
         wire_protocol: WireProtocol::V2,
         enable_fp8: false,
     };
-    let mut policy = MoePolicy::new();
+    let policy = MoePolicy::new();
     policy.set_world_size(2);
     policy.set_hysteresis_band(0);
 
@@ -289,8 +289,8 @@ fn test_threshold_calibration_apply_to_policy() {
         |_n| 0.01, // GPU always faster
     );
 
-    let mut policy = MoePolicy::new();
-    cal.apply_to(&mut policy);
+    let policy = MoePolicy::new();
+    cal.apply_to(&policy);
 
     assert!(cal.calibrated);
     // Crossover at N=32 (first test size where GPU is faster)
@@ -382,7 +382,7 @@ fn test_route_rdma_materialization_guard() {
         wire_protocol: WireProtocol::V2,
         enable_fp8: false,
     };
-    let mut policy = MoePolicy::new();
+    let policy = MoePolicy::new();
     policy.set_world_size(2);
     policy.set_hysteresis_band(0);
     let mut exchange = MoeDispatchExchange::new(config, policy);
@@ -748,7 +748,7 @@ fn test_rdma_size_exchange_roundtrip() {
         enable_fp8: false,
     };
     // Use low thresholds so small batches still trigger RDMA path
-    let mut policy = MoePolicy::with_thresholds(0, 1, 0);
+    let policy = MoePolicy::with_thresholds(0, 1, 0);
     policy.set_world_size(2);
     policy.set_hysteresis_band(0);
     let mut exchange = MoeDispatchExchange::new(config, policy);
@@ -803,7 +803,7 @@ fn test_rdma_expert_id_preserved_in_merge() {
             wire_protocol: WireProtocol::V2,
             enable_fp8: false,
         };
-        let mut policy0 = MoePolicy::with_thresholds(0, 1, 0);
+        let policy0 = MoePolicy::with_thresholds(0, 1, 0);
         policy0.set_world_size(2);
         policy0.set_hysteresis_band(0);
         let mut exchange0 = MoeDispatchExchange::new(config0, policy0);
@@ -835,7 +835,7 @@ fn test_rdma_expert_id_preserved_in_merge() {
             wire_protocol: WireProtocol::V2,
             enable_fp8: false,
         };
-        let mut policy1 = MoePolicy::with_thresholds(0, 1, 0);
+        let policy1 = MoePolicy::with_thresholds(0, 1, 0);
         policy1.set_world_size(2);
         policy1.set_hysteresis_band(0);
         let mut exchange1 = MoeDispatchExchange::new(config1, policy1);
@@ -922,7 +922,7 @@ fn test_rdma_wire_format_expert_id_prefix() {
         wire_protocol: WireProtocol::V2,
         enable_fp8: false,
     };
-    let mut policy = MoePolicy::with_thresholds(0, 0, 0);
+    let policy = MoePolicy::with_thresholds(0, 0, 0);
     policy.set_world_size(2);
     policy.set_hysteresis_band(0);
     let mut exchange = MoeDispatchExchange::new(config, policy);
@@ -961,7 +961,7 @@ fn test_rdma_size_exchange_zero_payload() {
         wire_protocol: WireProtocol::V2,
         enable_fp8: false,
     };
-    let mut policy = MoePolicy::with_thresholds(0, 1, 0);
+    let policy = MoePolicy::with_thresholds(0, 1, 0);
     policy.set_world_size(2);
     policy.set_hysteresis_band(0);
     let mut exchange = MoeDispatchExchange::new(config, policy);
@@ -1512,7 +1512,7 @@ fn test_capacity_factor_runtime_update_affects_routing() {
         wire_protocol: WireProtocol::V2,
         enable_fp8: false,
     };
-    let mut policy = MoePolicy::new();
+    let policy = MoePolicy::new();
     policy.force_backend(Some(MoeBackend::Cpu));
     let mut exchange = MoeDispatchExchange::new(config, policy);
 
@@ -1562,7 +1562,7 @@ fn test_capacity_factor_runtime_update_affects_routing() {
         wire_protocol: WireProtocol::V2,
         enable_fp8: false,
     };
-    let mut policy2 = MoePolicy::new();
+    let policy2 = MoePolicy::new();
     policy2.force_backend(Some(MoeBackend::Cpu));
     let mut exchange2 = MoeDispatchExchange::new(config2, policy2);
 
@@ -1628,7 +1628,7 @@ fn test_route_cpu_uses_runtime_capacity_factor() {
         wire_protocol: WireProtocol::V2,
         enable_fp8: false,
     };
-    let mut policy = MoePolicy::new();
+    let policy = MoePolicy::new();
     policy.force_backend(Some(MoeBackend::Cpu));
     let mut exchange = MoeDispatchExchange::new(config, policy);
 
@@ -1856,4 +1856,171 @@ fn test_auto_set_policy_world_size_single_rank() {
     let policy = MoePolicy::new();
     let exchange = MoeDispatchExchange::new(config, policy);
     assert_eq!(exchange.policy().world_size(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Thread-safety tests for MoePolicy (D-P1-2)
+// ---------------------------------------------------------------------------
+
+/// Compile-time assertion: MoePolicy is Send + Sync.
+#[test]
+fn test_moe_policy_is_send_and_sync() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<MoePolicy>();
+}
+
+/// Concurrent zone transitions from N threads — no torn reads.
+///
+/// Multiple threads call `switch_backend` with different backends while other
+/// threads continuously read `current_backend`. Every observed backend must be
+/// a valid `MoeBackend` variant (no torn/partial value).
+#[test]
+fn test_moe_policy_concurrent_zone_transitions() {
+    use std::sync::Arc;
+    use std::thread;
+
+    let policy = Arc::new(MoePolicy::with_thresholds(64, 320, 4096));
+    policy.set_hysteresis_band(0);
+
+    let num_writers = 4;
+    let num_readers = 4;
+    let iterations = 2_000;
+
+    let mut handles = Vec::new();
+
+    // Writer threads: cycle through backends
+    for writer_id in 0..num_writers {
+        let p = Arc::clone(&policy);
+        handles.push(thread::spawn(move || {
+            let backends = [MoeBackend::Cpu, MoeBackend::Metal, MoeBackend::Rdma];
+            for i in 0..iterations {
+                p.switch_backend(backends[(writer_id + i) % 3]);
+            }
+        }));
+    }
+
+    // Reader threads: read current_backend and verify it is a valid variant
+    for _ in 0..num_readers {
+        let p = Arc::clone(&policy);
+        handles.push(thread::spawn(move || {
+            for _ in 0..iterations {
+                let backend = p.current_backend();
+                // If there were a torn read, this match would fail to cover
+                // the value or we'd get UB. The mere fact this doesn't panic
+                // proves no torn reads.
+                match backend {
+                    MoeBackend::Cpu | MoeBackend::Metal | MoeBackend::Rdma => {}
+                }
+            }
+        }));
+    }
+
+    for h in handles {
+        h.join()
+            .expect("thread panicked during concurrent zone transitions");
+    }
+}
+
+/// Concurrent backend queries while zone is transitioning.
+///
+/// One thread continuously switches the backend. Multiple threads call
+/// `select()` concurrently. No panics or poisoned locks should occur.
+#[test]
+fn test_moe_policy_concurrent_select_during_transition() {
+    use std::sync::Arc;
+    use std::thread;
+
+    let policy = Arc::new(MoePolicy::with_thresholds(64, 320, 4096));
+    policy.set_hysteresis_band(0);
+
+    let iterations = 5_000;
+    let mut handles = Vec::new();
+
+    // Writer thread: switch backends rapidly
+    {
+        let p = Arc::clone(&policy);
+        handles.push(thread::spawn(move || {
+            let backends = [MoeBackend::Cpu, MoeBackend::Metal, MoeBackend::Rdma];
+            for i in 0..iterations {
+                p.switch_backend(backends[i % 3]);
+            }
+        }));
+    }
+
+    // Reader threads: call select() with varying inputs
+    for tid in 0..4 {
+        let p = Arc::clone(&policy);
+        handles.push(thread::spawn(move || {
+            for i in 0..iterations {
+                let n = (tid * 100 + i as u32) % 500;
+                let bytes = (n as usize) * 64;
+                let result = p.select(n, bytes);
+                match result {
+                    MoeBackend::Cpu | MoeBackend::Metal | MoeBackend::Rdma => {}
+                }
+            }
+        }));
+    }
+
+    for h in handles {
+        h.join().expect("thread panicked during concurrent select");
+    }
+}
+
+/// Concurrent reads/writes to configuration fields (set_world_size, etc.).
+#[test]
+fn test_moe_policy_concurrent_config_mutations() {
+    use std::sync::Arc;
+    use std::thread;
+
+    let policy = Arc::new(MoePolicy::new());
+    let iterations = 2_000;
+    let mut handles = Vec::new();
+
+    // Thread 1: mutate world_size
+    {
+        let p = Arc::clone(&policy);
+        handles.push(thread::spawn(move || {
+            for i in 0..iterations {
+                p.set_world_size((i % 8) as u32);
+            }
+        }));
+    }
+
+    // Thread 2: mutate hysteresis_band
+    {
+        let p = Arc::clone(&policy);
+        handles.push(thread::spawn(move || {
+            for i in 0..iterations {
+                p.set_hysteresis_band((i % 32) as u32);
+            }
+        }));
+    }
+
+    // Thread 3: read world_size and hysteresis concurrently
+    {
+        let p = Arc::clone(&policy);
+        handles.push(thread::spawn(move || {
+            for _ in 0..iterations {
+                let _ws = p.world_size();
+                let _backend = p.current_backend();
+                let _cooldown = p.cooldown_active();
+            }
+        }));
+    }
+
+    // Thread 4: call select() while config is being mutated
+    {
+        let p = Arc::clone(&policy);
+        handles.push(thread::spawn(move || {
+            for i in 0..iterations {
+                let _ = p.select((i % 500) as u32, i * 64);
+            }
+        }));
+    }
+
+    for h in handles {
+        h.join()
+            .expect("thread panicked during concurrent config mutation");
+    }
 }

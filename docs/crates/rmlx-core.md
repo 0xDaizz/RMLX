@@ -4,7 +4,7 @@
 
 `rmlx-core` is the Metal GPU compute engine, providing data types, N-dimensional arrays, a kernel registry, GPU compute kernels, automatic differentiation, LoRA fine-tuning, runtime metrics, structured logging, numerical stability monitoring, and graceful shutdown.
 
-> **Status:** DType (with FP8), Array, KernelRegistry, **27 op modules** (including SDPA/FA2 with bf16 + backward, SiLU/SwiGLU, GELU, FP8 dequant/quant, Conv1d/Conv2d, tiled conv, GatherMM, LayerNorm, unary ops, concat, select, VJP GPU), GGUF format parser, AWQ/GPTQ dequant, VJP autodiff, LoRA, logging, metrics, PrecisionGuard, and ShutdownSignal are all implemented. Phase 0+1+2 audit remediation complete (items C1-C9).
+> **Status:** DType (with FP8), Array, KernelRegistry, **27+ op modules** (including SDPA/FA2 with bf16 + backward, SiLU/SwiGLU, GELU, FP8 dequant/quant, Conv1d/Conv2d, tiled conv, GatherMM, LayerNorm, unary ops, concat, select, VJP GPU), GGUF format parser, AWQ/GPTQ dequant, VJP autodiff, LoRA, logging, metrics, PrecisionGuard, and ShutdownSignal are all implemented. Phase 0+1+2 audit remediation complete (items C1-C9). **Phase 3 additions:** FlashAttention-2 Metal kernel (`flash_attention.rs`) with tiled online softmax, f32 head_dim=128, causal mask, and naive SDPA fallback; all ops routed through centralized `commit_with_mode()` with sync/async `ExecMode` and `CommandBufferHandle` for async tracking.
 
 ---
 
@@ -43,6 +43,7 @@ rmlx-core/src/
 │   ├── concat.rs       # Tensor concatenation along arbitrary axis
 │   ├── select.rs       # Index select operation
 │   ├── conv_tiled.rs   # Tiled convolution for large inputs
+│   ├── flash_attention.rs # FlashAttention-2 Metal kernel (tiled online softmax, causal mask)
 │   ├── vjp_gpu.rs      # GPU-accelerated VJP backward pass
 ├── formats/
 │   ├── mod.rs          # Format parser module
@@ -195,6 +196,7 @@ pub fn register_all(registry: &KernelRegistry) -> Result<(), KernelError> {
 | `concat` | Concat | Tensor concatenation along arbitrary axis |
 | `select` | Select | Index select (gather along a dimension) |
 | `conv_tiled` | Tiled Conv | Tiled convolution for large inputs |
+| `flash_attention` | FlashAttention-2 Metal | Tiled online softmax Metal kernel, f32 head_dim=128, causal mask, falls back to naive SDPA for unsupported configs |
 | `vjp_gpu` | VJP GPU | GPU-accelerated backward pass for VJP |
 
 ### silu.rs — SiLU Activation + Fused SwiGLU
@@ -277,6 +279,22 @@ Single-kernel computation of `softmax(Q @ K^T / sqrt(d) + mask) @ V` using onlin
 - head_dim <= 256 (D<=128 uses shared memory tiles; D>128 uses split approach)
 - Supported dtypes: Float32, Float16
 
+### flash_attention.rs -- FlashAttention-2 Metal Kernel (Phase 3)
+
+A dedicated FlashAttention-2 Metal kernel implementation with tiled online softmax. This is separate from the existing `sdpa.rs` FA2 dispatch and provides a native Metal kernel path optimized for f32 with head_dim=128.
+
+| Function | Description |
+|----------|-------------|
+| `flash_attention(registry, q, k, v, scale, is_causal, queue)` | FlashAttention-2 forward with tiled online softmax |
+
+**Key characteristics:**
+- **Tiled online softmax**: numerically stable softmax computed tile-by-tile without materializing the full attention matrix
+- **f32 head_dim=128**: optimized for the most common LLM head dimension
+- **Causal mask**: built-in causal masking with block-level skipping
+- **Fallback**: automatically falls back to naive SDPA for unsupported configurations (non-f32 dtypes, head_dim != 128)
+
+---
+
 ### AWQ/GPTQ Dequantization (in quantized.rs)
 
 Converts AWQ/GPTQ packed INT4 weights to f32 for inference.
@@ -296,6 +314,15 @@ Types for async kernel dispatch control.
 |---------|-------------|
 | `Sync` | Commit and wait immediately (default, safe) |
 | `Async` | Commit without waiting; caller manages sync |
+
+#### `commit_with_mode()` (Phase 3)
+
+All rmlx-core ops now route command buffer commit through the centralized `commit_with_mode()` function. This replaces per-op `commit()` + `waitUntilCompleted()` calls with a single dispatch point that respects `ExecMode`:
+
+- **`ExecMode::Sync`** (default): commits the command buffer and blocks until GPU completion.
+- **`ExecMode::Async`**: commits without blocking; returns a `CommandBufferHandle` for caller-managed sync.
+
+This eliminates redundant CPU-GPU sync points when ops are chained, and enables callers to batch multiple ops before a single sync.
 
 #### CommandBufferHandle
 

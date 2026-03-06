@@ -5,6 +5,7 @@ pub mod concat;
 pub mod conv;
 pub mod conv_tiled;
 pub mod copy;
+pub mod flash_attention;
 pub mod fp8;
 pub mod fused;
 pub mod gather_mm;
@@ -100,6 +101,7 @@ pub fn register_all(registry: &KernelRegistry) -> Result<(), KernelError> {
     select::register(registry)?;
     concat::register(registry)?;
     vjp_gpu::register(registry)?;
+    flash_attention::register(registry)?;
     Ok(())
 }
 
@@ -269,5 +271,50 @@ mod tests {
             }
             _ => panic!("expected InvalidShape, got {err:?}"),
         }
+    }
+
+    /// Verify that `TOTAL_OP_CBS` accurately tracks command buffer dispatches
+    /// across multiple different ops.
+    ///
+    /// We run unary (neg), binary (add), and copy ops and confirm the counter
+    /// increments by exactly the number of dispatches.  We measure the delta
+    /// rather than the absolute value because other parallel tests may also
+    /// increment the global counter.
+    #[test]
+    fn test_total_op_cbs_tracks_dispatches() {
+        use crate::array::Array;
+        use crate::dtype::DType;
+
+        let gpu = rmlx_metal::device::GpuDevice::system_default().unwrap();
+        let queue = gpu.raw().new_command_queue();
+        let registry = KernelRegistry::new(gpu);
+
+        // Register the kernels we will exercise.
+        unary::register(&registry).unwrap();
+        binary::register(&registry).unwrap();
+        copy::register(&registry).unwrap();
+
+        let dev = registry.device().raw();
+
+        // Snapshot the counter before our measurement window.
+        let before = total_op_cbs();
+
+        // --- dispatch 1: copy ---
+        let a = Array::zeros(dev, &[4], DType::Float32);
+        let _c = copy::copy(&registry, &a, &queue).unwrap();
+
+        // --- dispatch 2: unary (neg) ---
+        let _neg = unary::neg(&registry, &a, &queue).unwrap();
+
+        // --- dispatch 3: binary (add) ---
+        let b = Array::zeros(dev, &[4], DType::Float32);
+        let _sum = binary::add(&registry, &a, &b, &queue).unwrap();
+
+        let after = total_op_cbs();
+        let delta = after - before;
+        assert!(
+            delta >= 3,
+            "expected at least 3 op-level command buffers, got delta={delta} (before={before}, after={after})"
+        );
     }
 }

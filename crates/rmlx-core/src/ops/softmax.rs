@@ -611,8 +611,7 @@ pub fn softmax(
         MTLSize::new(tg_size, 1, 1),
     );
     encoder.end_encoding();
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
+    super::commit_with_mode(command_buffer, super::ExecMode::Sync);
 
     Ok(out)
 }
