@@ -783,21 +783,12 @@ pub fn rope_ext_into_cb(
     let kname = kernel_name_table(input.dtype())?;
     let pipeline = registry.get_pipeline(kname, input.dtype())?;
 
-    let out = Array::zeros(registry.device().raw(), input.shape(), input.dtype());
+    let out = Array::uninit(registry.device().raw(), input.shape(), input.dtype());
 
-    let dev = registry.device().raw();
-    let opts = metal::MTLResourceOptions::StorageModeShared;
     let seq_u32 = super::checked_u32(seq_len, "seq_len")?;
     let dim_u32 = super::checked_u32(head_dim, "head_dim")?;
     let trad_u32: u32 = if traditional { 1 } else { 0 };
     let fwd_u32: u32 = if forward { 1 } else { 0 };
-
-    let seq_buf = dev.new_buffer_with_data(&seq_u32 as *const u32 as *const _, 4, opts);
-    let dim_buf = dev.new_buffer_with_data(&dim_u32 as *const u32 as *const _, 4, opts);
-    let off_buf = dev.new_buffer_with_data(&offset as *const u32 as *const _, 4, opts);
-    let scl_buf = dev.new_buffer_with_data(&scale as *const f32 as *const _, 4, opts);
-    let trad_buf = dev.new_buffer_with_data(&trad_u32 as *const u32 as *const _, 4, opts);
-    let fwd_buf = dev.new_buffer_with_data(&fwd_u32 as *const u32 as *const _, 4, opts);
 
     let encoder = cb.new_compute_command_encoder();
     encoder.set_compute_pipeline_state(&pipeline);
@@ -805,12 +796,12 @@ pub fn rope_ext_into_cb(
     encoder.set_buffer(1, Some(cos_freqs.metal_buffer()), cos_freqs.offset() as u64);
     encoder.set_buffer(2, Some(sin_freqs.metal_buffer()), sin_freqs.offset() as u64);
     encoder.set_buffer(3, Some(out.metal_buffer()), 0);
-    encoder.set_buffer(4, Some(&seq_buf), 0);
-    encoder.set_buffer(5, Some(&dim_buf), 0);
-    encoder.set_buffer(6, Some(&off_buf), 0);
-    encoder.set_buffer(7, Some(&scl_buf), 0);
-    encoder.set_buffer(8, Some(&trad_buf), 0);
-    encoder.set_buffer(9, Some(&fwd_buf), 0);
+    encoder.set_bytes(4, 4, &seq_u32 as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(5, 4, &dim_u32 as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(6, 4, &offset as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(7, 4, &scale as *const f32 as *const std::ffi::c_void);
+    encoder.set_bytes(8, 4, &trad_u32 as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(9, 4, &fwd_u32 as *const u32 as *const std::ffi::c_void);
 
     let grid = MTLSize::new(half_dim as u64, seq_len as u64, n_batch as u64);
     let tg = MTLSize::new(
@@ -820,6 +811,102 @@ pub fn rope_ext_into_cb(
     );
     encoder.dispatch_threads(grid, tg);
     encoder.end_encoding();
+
+    Ok(out)
+}
+
+/// Encode RoPE into an existing compute command encoder (no encoder create/end).
+/// Caller is responsible for creating and ending the encoder.
+#[allow(clippy::too_many_arguments)]
+pub fn rope_ext_into_encoder(
+    registry: &KernelRegistry,
+    input: &Array,
+    cos_freqs: &Array,
+    sin_freqs: &Array,
+    offset: u32,
+    scale: f32,
+    traditional: bool,
+    forward: bool,
+    encoder: &metal::ComputeCommandEncoderRef,
+) -> Result<Array, KernelError> {
+    let (n_batch, seq_len, head_dim) = parse_input_shape(input)?;
+
+    if head_dim % 2 != 0 {
+        return Err(KernelError::InvalidShape(format!(
+            "head_dim must be even, got {}",
+            head_dim
+        )));
+    }
+
+    let half_dim = head_dim / 2;
+
+    // Validate frequency table dimensions (matches rope_ext validation).
+    let freq_rows_needed = (offset as usize) + seq_len;
+    if cos_freqs.ndim() != 2 || sin_freqs.ndim() != 2 {
+        return Err(KernelError::InvalidShape(
+            "cos_freqs and sin_freqs must be 2-D [max_seq_len, half_dim]".into(),
+        ));
+    }
+    if cos_freqs.shape()[0] < freq_rows_needed {
+        return Err(KernelError::InvalidShape(format!(
+            "cos_freqs rows ({}) < seq_len ({}) + offset ({})",
+            cos_freqs.shape()[0],
+            seq_len,
+            offset,
+        )));
+    }
+    if sin_freqs.shape()[0] < freq_rows_needed {
+        return Err(KernelError::InvalidShape(format!(
+            "sin_freqs rows ({}) < seq_len ({}) + offset ({})",
+            sin_freqs.shape()[0],
+            seq_len,
+            offset,
+        )));
+    }
+    if cos_freqs.shape()[1] != half_dim {
+        return Err(KernelError::InvalidShape(format!(
+            "cos_freqs cols ({}) != head_dim/2 ({})",
+            cos_freqs.shape()[1],
+            half_dim,
+        )));
+    }
+    if sin_freqs.shape()[1] != half_dim {
+        return Err(KernelError::InvalidShape(format!(
+            "sin_freqs cols ({}) != head_dim/2 ({})",
+            sin_freqs.shape()[1],
+            half_dim,
+        )));
+    }
+
+    let kname = kernel_name_table(input.dtype())?;
+    let pipeline = registry.get_pipeline(kname, input.dtype())?;
+
+    let out = Array::uninit(registry.device().raw(), input.shape(), input.dtype());
+
+    let seq_u32 = super::checked_u32(seq_len, "seq_len")?;
+    let dim_u32 = super::checked_u32(head_dim, "head_dim")?;
+    let trad_u32: u32 = if traditional { 1 } else { 0 };
+    let fwd_u32: u32 = if forward { 1 } else { 0 };
+
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
+    encoder.set_buffer(1, Some(cos_freqs.metal_buffer()), cos_freqs.offset() as u64);
+    encoder.set_buffer(2, Some(sin_freqs.metal_buffer()), sin_freqs.offset() as u64);
+    encoder.set_buffer(3, Some(out.metal_buffer()), 0);
+    encoder.set_bytes(4, 4, &seq_u32 as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(5, 4, &dim_u32 as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(6, 4, &offset as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(7, 4, &scale as *const f32 as *const std::ffi::c_void);
+    encoder.set_bytes(8, 4, &trad_u32 as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(9, 4, &fwd_u32 as *const u32 as *const std::ffi::c_void);
+
+    let grid = MTLSize::new(half_dim as u64, seq_len as u64, n_batch as u64);
+    let tg = MTLSize::new(
+        std::cmp::min(64, half_dim as u64),
+        std::cmp::min(16, seq_len as u64),
+        1,
+    );
+    encoder.dispatch_threads(grid, tg);
 
     Ok(out)
 }

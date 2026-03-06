@@ -20,7 +20,9 @@ use rmlx_metal::batcher::reset_counters;
 use rmlx_metal::device::GpuDevice;
 use rmlx_metal::event::GpuEvent;
 use rmlx_metal::exec_graph::{ExecGraph, ExecGraphStats};
-use rmlx_nn::{Attention, AttentionConfig, FeedForward, Linear, LinearConfig, TransformerBlock};
+use rmlx_nn::{
+    Attention, AttentionConfig, FeedForward, LayerKvCache, Linear, LinearConfig, TransformerBlock,
+};
 
 const HIDDEN_SIZE: usize = 4096;
 const NUM_HEADS: usize = 32;
@@ -161,12 +163,48 @@ fn build_transformer_block(device: &metal::Device) -> TransformerBlock {
         gate_proj,
         up_proj,
         down_proj,
+        gate_up_merged_weight: None,
     };
 
     let norm1_weight = Array::ones(device, &[HIDDEN_SIZE]);
     let norm2_weight = Array::ones(device, &[HIDDEN_SIZE]);
 
     TransformerBlock::from_parts(0, attention, ffn, norm1_weight, norm2_weight, RMS_NORM_EPS)
+}
+
+// ---------------------------------------------------------------------------
+// Per-dispatch profiling helper
+// ---------------------------------------------------------------------------
+
+/// Time a single operation: warm up `WARMUP_ITERS` times, then measure
+/// `BENCH_ITERS` iterations, each with its own command buffer commit+wait
+/// to capture accurate GPU timing per dispatch.
+fn profile_op<F>(label: &str, queue: &metal::CommandQueue, mut op: F) -> Stats
+where
+    F: FnMut(&metal::CommandBufferRef),
+{
+    // Warmup
+    for _ in 0..WARMUP_ITERS {
+        let cb = queue.new_command_buffer();
+        op(cb);
+        cb.commit();
+        cb.wait_until_completed();
+    }
+
+    // Benchmark
+    let mut latencies = Vec::with_capacity(BENCH_ITERS);
+    for _ in 0..BENCH_ITERS {
+        let start = Instant::now();
+        let cb = queue.new_command_buffer();
+        op(cb);
+        cb.commit();
+        cb.wait_until_completed();
+        latencies.push(start.elapsed());
+    }
+
+    let stats = Stats::from_durations(&latencies);
+    println!("  {:40} {}", label, stats);
+    stats
 }
 
 // ---------------------------------------------------------------------------
@@ -276,11 +314,88 @@ fn main() {
         }
     }
 
+    // ---- Benchmark Single-CB: forward_single_cb() ----
+    println!("\nWarming up Single-CB ({} iterations)...", WARMUP_ITERS);
+    for _ in 0..WARMUP_ITERS {
+        let cb = queue.new_command_buffer();
+        let _ = block
+            .forward_single_cb(&input, None, None, None, None, &registry, cb)
+            .unwrap();
+        cb.commit();
+        cb.wait_until_completed();
+    }
+    println!("Benchmarking Single-CB ({} iterations)...", BENCH_ITERS);
+    let mut single_cb_latencies = Vec::with_capacity(BENCH_ITERS);
+    for _ in 0..BENCH_ITERS {
+        let start = Instant::now();
+        let cb = queue.new_command_buffer();
+        let _ = block
+            .forward_single_cb(&input, None, None, None, None, &registry, cb)
+            .unwrap();
+        cb.commit();
+        cb.wait_until_completed();
+        single_cb_latencies.push(start.elapsed());
+    }
+
+    // ---- Prepare weights for 9-dispatch ----
+    println!("\nPreparing weights for 9-dispatch (merging QKV and gate+up)...");
+    block
+        .prepare_weights_9dispatch(device)
+        .expect("prepare_weights_9dispatch failed");
+    // Convert weights to StorageModePrivate (GPU-only) for optimal performance
+    block.prepare_weights_private(device, &queue);
+
+    // ---- Warmup 9-dispatch ----
+    println!("Warming up 9-dispatch ({} iterations)...", WARMUP_ITERS);
+    let mut cache_9d = LayerKvCache::preallocated(
+        device,
+        NUM_KV_HEADS,
+        HEAD_DIM,
+        2048,
+        rmlx_core::dtype::DType::Float32,
+    );
+    for _ in 0..WARMUP_ITERS {
+        cache_9d.seq_len = 0;
+        let cb = queue.new_command_buffer();
+        let _ = block
+            .forward_single_cb_9dispatch(&input, None, None, None, &mut cache_9d, &registry, cb)
+            .unwrap();
+        cb.commit();
+        cb.wait_until_completed();
+    }
+
+    // ---- Benchmark 9-dispatch ----
+    println!("Benchmarking 9-dispatch ({} iterations)...", BENCH_ITERS);
+    let mut nine_dispatch_latencies = Vec::with_capacity(BENCH_ITERS);
+    for _ in 0..BENCH_ITERS {
+        cache_9d.seq_len = 0; // Reset position instead of reallocating
+        let start = Instant::now();
+        let cb = queue.new_command_buffer();
+        let _ = block
+            .forward_single_cb_9dispatch(&input, None, None, None, &mut cache_9d, &registry, cb)
+            .unwrap();
+        cb.commit();
+        cb.wait_until_completed();
+        nine_dispatch_latencies.push(start.elapsed());
+    }
+
     // ---- Results ----
     let baseline_stats = Stats::from_durations(&baseline_latencies);
     let graph_stats = Stats::from_durations(&graph_latencies);
+    let single_cb_stats = Stats::from_durations(&single_cb_latencies);
+    let nine_dispatch_stats = Stats::from_durations(&nine_dispatch_latencies);
     let speedup = if graph_stats.mean > 0.0 {
         baseline_stats.mean / graph_stats.mean
+    } else {
+        0.0
+    };
+    let single_cb_speedup = if single_cb_stats.mean > 0.0 {
+        baseline_stats.mean / single_cb_stats.mean
+    } else {
+        0.0
+    };
+    let nine_dispatch_speedup = if nine_dispatch_stats.mean > 0.0 {
+        baseline_stats.mean / nine_dispatch_stats.mean
     } else {
         0.0
     };
@@ -297,16 +412,360 @@ fn main() {
         graph_total_batches, graph_total_cbs, graph_total_encoders
     );
     println!();
-    println!("Speedup:        {:.2}x", speedup);
+    println!("Single-CB (forward_single_cb):");
+    println!("  {}", single_cb_stats);
+    println!("  Command buffers per forward: 1");
+    println!();
+    println!("9-Dispatch (forward_single_cb_9dispatch):");
+    println!("  {}", nine_dispatch_stats);
+    println!("  Dispatches per forward: 9");
+    println!();
+    println!("ExecGraph speedup:  {:.2}x", speedup);
+    println!("Single-CB speedup:  {:.2}x", single_cb_speedup);
+    println!("9-Dispatch speedup: {:.2}x", nine_dispatch_speedup);
     println!(
-        "CB reduction:   {} -> {} ({:.1}% fewer)",
-        baseline_cbs,
-        graph_total_cbs,
-        if baseline_cbs > 0 {
-            (1.0 - graph_total_cbs as f64 / baseline_cbs as f64) * 100.0
+        "CB reduction:   {} -> {} -> 1",
+        baseline_cbs, graph_total_cbs
+    );
+    println!("=================================");
+
+    // =====================================================================
+    // 9-Dispatch Profiling: per-dispatch GPU timing
+    // =====================================================================
+    // Each of the 9 dispatches is run in isolation with its own CB to
+    // measure individual kernel latencies and identify the bottleneck.
+    println!("\n========== 9-Dispatch Profiling ==========");
+    println!(
+        "Each dispatch: {} warmup + {} measured iterations, separate CB per iteration",
+        WARMUP_ITERS, BENCH_ITERS
+    );
+    println!();
+
+    // KV cache seq_len for SDPA decode — realistic decode-time value
+    let kv_seq_len: usize = 128;
+    let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+
+    // --- Pre-allocate all arrays needed for profiling ---
+
+    // Inputs
+    let prof_hidden = rand_array(device, &[SEQ_LEN, HIDDEN_SIZE], 100); // [1, 4096]
+    let prof_hidden_1d = rand_array(device, &[HIDDEN_SIZE], 101); // [4096]
+    let norm_weight = rand_array(device, &[HIDDEN_SIZE], 102); // [4096]
+
+    // Merged QKV weight: [6144, 4096] where 6144 = 4096 + 1024 + 1024
+    let qkv_dim = HIDDEN_SIZE + NUM_KV_HEADS * HEAD_DIM * 2; // 4096 + 2048 = 6144
+    let qkv_weight = rand_array(device, &[qkv_dim, HIDDEN_SIZE], 110);
+
+    // RoPE inputs: [n_batch, seq_len=1, head_dim=128]
+    // We apply rope to Q (32 heads) and K (8 heads) = 40 heads total
+    let rope_n_batch = NUM_HEADS + NUM_KV_HEADS; // 40
+    let rope_input = rand_array(device, &[rope_n_batch, SEQ_LEN, HEAD_DIM], 120);
+    // cos/sin freq tables: [max_seq_len, head_dim/2] -- 2D
+    let rope_cos = rand_array(device, &[2048, HEAD_DIM / 2], 121);
+    let rope_sin = rand_array(device, &[2048, HEAD_DIM / 2], 122);
+
+    // SDPA decode inputs (flat slab layout)
+    // q_slab: [NUM_HEADS * HEAD_DIM] = [4096]
+    let sdpa_q = rand_array(device, &[NUM_HEADS * HEAD_DIM], 130);
+    // k_slab: [NUM_KV_HEADS * kv_seq_len * HEAD_DIM]
+    let sdpa_k = rand_array(device, &[NUM_KV_HEADS * kv_seq_len * HEAD_DIM], 131);
+    // v_slab: same shape as k_slab
+    let sdpa_v = rand_array(device, &[NUM_KV_HEADS * kv_seq_len * HEAD_DIM], 132);
+
+    // O_proj weight [4096, 4096] and bias [4096] (for residual add)
+    let oproj_weight = rand_array(device, &[HIDDEN_SIZE, HIDDEN_SIZE], 140);
+    let oproj_bias = rand_array(device, &[HIDDEN_SIZE], 141); // residual
+
+    // Merged gate+up weight: [22016, 4096] where 22016 = 11008 * 2
+    let gate_up_dim = INTERMEDIATE_DIM * 2; // 22016
+    let gate_up_weight = rand_array(device, &[gate_up_dim, HIDDEN_SIZE], 150);
+
+    // SiLU*mul inputs: gate_out [1, 11008] and up_out [1, 11008]
+    let silu_gate = rand_array(device, &[SEQ_LEN, INTERMEDIATE_DIM], 160);
+    let silu_up = rand_array(device, &[SEQ_LEN, INTERMEDIATE_DIM], 161);
+
+    // Down projection: [4096, 11008] weight, [4096] bias (for residual add)
+    let down_weight = rand_array(device, &[HIDDEN_SIZE, INTERMEDIATE_DIM], 170);
+    let down_bias = rand_array(device, &[HIDDEN_SIZE], 171); // residual
+
+    // --- Profile each dispatch ---
+    let mut all_stats: Vec<(&str, Stats)> = Vec::new();
+
+    // 1. RMSNorm (pre-attention)
+    let s = profile_op("1. rms_norm [1,4096]", &queue, |cb| {
+        let _ = ops::rms_norm::rms_norm_into_cb(
+            &registry,
+            &prof_hidden,
+            Some(&norm_weight),
+            RMS_NORM_EPS,
+            cb,
+        )
+        .expect("rms_norm failed");
+    });
+    all_stats.push(("1. rms_norm (pre-attn)", s));
+
+    // 2. GEMV merged QKV: [6144, 4096] * [4096]
+    let s = profile_op("2. gemv QKV [6144,4096]*[4096]", &queue, |cb| {
+        let _ = ops::gemv::gemv_into_cb(&registry, &qkv_weight, &prof_hidden_1d, cb)
+            .expect("gemv QKV failed");
+    });
+    all_stats.push(("2. gemv QKV", s));
+
+    // 3. RoPE: [40, 1, 128]
+    let s = profile_op("3. rope [40,1,128]", &queue, |cb| {
+        let _ = ops::rope::rope_ext_into_cb(
+            &registry,
+            &rope_input,
+            &rope_cos,
+            &rope_sin,
+            0,     // offset
+            1.0,   // scale
+            false, // traditional
+            true,  // forward
+            cb,
+        )
+        .expect("rope failed");
+    });
+    all_stats.push(("3. rope", s));
+
+    // 4. SDPA decode batched: 32 heads, kv_seq_len, head_dim=128
+    let s = profile_op(
+        &format!("4. sdpa_decode 32h seq={}", kv_seq_len),
+        &queue,
+        |cb| {
+            let _ = ops::sdpa::sdpa_decode_batched_slab_into_cb(
+                &registry,
+                &sdpa_q,
+                &sdpa_k,
+                &sdpa_v,
+                NUM_HEADS,
+                NUM_KV_HEADS,
+                HEAD_DIM,
+                kv_seq_len,
+                None, // no mask
+                scale,
+                cb,
+            )
+            .expect("sdpa_decode failed");
+        },
+    );
+    all_stats.push(("4. sdpa_decode", s));
+
+    // 5. GEMV + bias (O_proj + residual): [4096, 4096] * [4096] + [4096]
+    let s = profile_op("5. gemv_bias O_proj [4096,4096]*[4096]", &queue, |cb| {
+        let _ = ops::gemv::gemv_bias_into_cb(
+            &registry,
+            &oproj_weight,
+            &prof_hidden_1d,
+            &oproj_bias,
+            cb,
+        )
+        .expect("gemv_bias O_proj failed");
+    });
+    all_stats.push(("5. gemv_bias O_proj+res", s));
+
+    // 6. RMSNorm (pre-FFN)
+    let s = profile_op("6. rms_norm [1,4096]", &queue, |cb| {
+        let _ = ops::rms_norm::rms_norm_into_cb(
+            &registry,
+            &prof_hidden,
+            Some(&norm_weight),
+            RMS_NORM_EPS,
+            cb,
+        )
+        .expect("rms_norm failed");
+    });
+    all_stats.push(("6. rms_norm (pre-FFN)", s));
+
+    // 7. GEMV merged gate+up: [22016, 4096] * [4096]
+    let s = profile_op("7. gemv gate+up [22016,4096]*[4096]", &queue, |cb| {
+        let _ = ops::gemv::gemv_into_cb(&registry, &gate_up_weight, &prof_hidden_1d, cb)
+            .expect("gemv gate+up failed");
+    });
+    all_stats.push(("7. gemv gate+up", s));
+
+    // 8. Fused SiLU*mul: [1, 11008] * [1, 11008]
+    let s = profile_op("8. fused_silu_mul [1,11008]", &queue, |cb| {
+        let _ = ops::fused::fused_silu_mul_into_cb(&registry, &silu_gate, &silu_up, cb)
+            .expect("fused_silu_mul failed");
+    });
+    all_stats.push(("8. fused_silu_mul", s));
+
+    // 9. GEMV + bias (down_proj + residual): [4096, 11008] * [11008] + [4096]
+    let down_vec = rand_array(device, &[INTERMEDIATE_DIM], 180); // [11008]
+    let s = profile_op("9. gemv_bias down [4096,11008]*[11008]", &queue, |cb| {
+        let _ = ops::gemv::gemv_bias_into_cb(&registry, &down_weight, &down_vec, &down_bias, cb)
+            .expect("gemv_bias down failed");
+    });
+    all_stats.push(("9. gemv_bias down+res", s));
+
+    // --- Summary ---
+    println!();
+    println!("---------- Per-Dispatch Summary ----------");
+    let total_mean: f64 = all_stats.iter().map(|(_, s)| s.mean).sum();
+    for (label, s) in &all_stats {
+        let pct = if total_mean > 0.0 {
+            s.mean / total_mean * 100.0
+        } else {
+            0.0
+        };
+        println!("  {:30} {:8.1}us  ({:5.1}%)", label, s.mean, pct);
+    }
+    println!(
+        "  {:30} {:8.1}us  (100.0%)",
+        "TOTAL (sum of means)", total_mean
+    );
+
+    // Identify bottleneck
+    if let Some((label, s)) = all_stats
+        .iter()
+        .max_by(|a, b| a.1.mean.partial_cmp(&b.1.mean).unwrap())
+    {
+        let pct = s.mean / total_mean * 100.0;
+        println!();
+        println!(
+            "  BOTTLENECK: {} at {:.1}us ({:.1}% of total)",
+            label, s.mean, pct
+        );
+    }
+
+    // Compare sum-of-parts to end-to-end 9-dispatch
+    println!();
+    println!("  Sum of 9 individual dispatches: {:8.1}us", total_mean);
+    println!(
+        "  End-to-end 9-dispatch (single CB): {:8.1}us",
+        nine_dispatch_stats.mean
+    );
+    let overhead = total_mean - nine_dispatch_stats.mean;
+    println!(
+        "  CB overhead (9 CBs vs 1 CB):   {:8.1}us ({:.1}%)",
+        overhead,
+        if nine_dispatch_stats.mean > 0.0 {
+            overhead / nine_dispatch_stats.mean * 100.0
         } else {
             0.0
         }
     );
-    println!("=================================");
+    println!("==========================================");
+
+    // ========================================================================
+    // Allocation overhead measurement
+    // ========================================================================
+    println!("\n========== Allocation Overhead ==========");
+
+    // 1. Measure KV cache allocation cost
+    {
+        let mut cache_alloc_times = Vec::with_capacity(BENCH_ITERS);
+        for _ in 0..BENCH_ITERS {
+            let start = Instant::now();
+            let _cache = LayerKvCache::preallocated(
+                device,
+                NUM_KV_HEADS,
+                HEAD_DIM,
+                2048,
+                rmlx_core::dtype::DType::Float32,
+            );
+            cache_alloc_times.push(start.elapsed());
+        }
+        let stats = Stats::from_durations(&cache_alloc_times);
+        println!("  KV cache alloc (2x8MB slab):             {}", stats);
+    }
+
+    // 2. Measure intermediate buffer allocation cost (mimics 9-dispatch)
+    {
+        let mut buf_alloc_times = Vec::with_capacity(BENCH_ITERS);
+        for _ in 0..BENCH_ITERS {
+            let start = Instant::now();
+            let _b1 = Array::uninit(device, &[1, HIDDEN_SIZE], rmlx_core::dtype::DType::Float32);
+            let _b2 = Array::uninit(
+                device,
+                &[NUM_HEADS * HEAD_DIM + NUM_KV_HEADS * HEAD_DIM * 2],
+                rmlx_core::dtype::DType::Float32,
+            );
+            let _b3 = Array::uninit(
+                device,
+                &[(NUM_HEADS + NUM_KV_HEADS), 1, HEAD_DIM],
+                rmlx_core::dtype::DType::Float32,
+            );
+            let _b4 = Array::uninit(
+                device,
+                &[NUM_HEADS * HEAD_DIM],
+                rmlx_core::dtype::DType::Float32,
+            );
+            let _b5 = Array::uninit(device, &[HIDDEN_SIZE], rmlx_core::dtype::DType::Float32);
+            let _b6 = Array::uninit(device, &[1, HIDDEN_SIZE], rmlx_core::dtype::DType::Float32);
+            let _b7 = Array::uninit(
+                device,
+                &[INTERMEDIATE_DIM * 2],
+                rmlx_core::dtype::DType::Float32,
+            );
+            let _b8 = Array::uninit(
+                device,
+                &[1, INTERMEDIATE_DIM],
+                rmlx_core::dtype::DType::Float32,
+            );
+            let _b9 = Array::uninit(device, &[HIDDEN_SIZE], rmlx_core::dtype::DType::Float32);
+            buf_alloc_times.push(start.elapsed());
+        }
+        let stats = Stats::from_durations(&buf_alloc_times);
+        println!("  Intermediate buf alloc (9 buffers):      {}", stats);
+    }
+
+    // 3. 9-dispatch with pre-allocated cache (amortized)
+    {
+        let mut cache_pre = LayerKvCache::preallocated(
+            device,
+            NUM_KV_HEADS,
+            HEAD_DIM,
+            2048,
+            rmlx_core::dtype::DType::Float32,
+        );
+        // Warmup
+        for _ in 0..WARMUP_ITERS {
+            cache_pre.seq_len = 0; // reset position
+            let cb = queue.new_command_buffer();
+            let _ = block
+                .forward_single_cb_9dispatch(
+                    &input,
+                    None,
+                    None,
+                    None,
+                    &mut cache_pre,
+                    &registry,
+                    cb,
+                )
+                .unwrap();
+            cb.commit();
+            cb.wait_until_completed();
+        }
+        // Bench
+        let mut pre_alloc_times = Vec::with_capacity(BENCH_ITERS);
+        for _ in 0..BENCH_ITERS {
+            cache_pre.seq_len = 0; // reset position
+            let start = Instant::now();
+            let cb = queue.new_command_buffer();
+            let _ = block
+                .forward_single_cb_9dispatch(
+                    &input,
+                    None,
+                    None,
+                    None,
+                    &mut cache_pre,
+                    &registry,
+                    cb,
+                )
+                .unwrap();
+            cb.commit();
+            cb.wait_until_completed();
+            pre_alloc_times.push(start.elapsed());
+        }
+        let stats = Stats::from_durations(&pre_alloc_times);
+        println!("  9-dispatch (pre-alloc cache, reset seq):  {}", stats);
+        println!(
+            "  vs original 9-dispatch:                   {}",
+            nine_dispatch_stats
+        );
+        let diff = nine_dispatch_stats.mean - stats.mean;
+        println!("  Diff (cache alloc overhead):               {:.1}us", diff);
+    }
 }

@@ -4,14 +4,16 @@
 //!
 //! - **N_READS=4 coalescing**: each thread processes 4 consecutive elements per
 //!   iteration for better memory throughput.
+//! - **Register caching**: input values read in Phase 1 are cached in registers
+//!   so Phase 2 reads from cache instead of device memory (eliminates 2nd pass).
 //! - **Weight stride support** (`w_stride`): handles non-contiguous weight tensors.
 //! - **Optional weight** (`has_w`): when the weight pointer is null the
 //!   multiplication is skipped (pure RMS normalisation).
 //! - **uint32 overflow fix**: uses `size_t` for row-base addressing so that
 //!   `row * axis_size` does not overflow 32 bits on large tensors.
 //! - **f16 / bf16 support**: accumulation in f32, read/write in half / bfloat.
-//! - **Single-row vs looped variants**: for `axis_size <= 4096` a simpler
-//!   single-row kernel is selected; for larger sizes the looped variant is used.
+//! - **Single-row vs looped variants**: for `axis_size <= 1024` (i.e. <= tgsize)
+//!   a simpler single-row kernel is selected; for larger sizes the looped variant is used.
 
 use crate::array::Array;
 use crate::dtype::DType;
@@ -25,6 +27,9 @@ using namespace metal;
 
 // ─── N_READS = 4 coalescing constant ──────────────────────────────────────
 constant constexpr uint N_READS = 4;
+
+// ─── Max elements cached per thread in registers ─────────────────────────
+constant constexpr uint MAX_PER_THREAD = 64;
 
 // ─── Shared reduction helper ──────────────────────────────────────────────
 // Reduces per-thread `acc` across the threadgroup and writes 1/rms into
@@ -92,7 +97,9 @@ kernel void rms_norm_f32(
 
     size_t base = size_t(row) * size_t(axis_size);
 
-    // ── Phase 1: sum of squares with N_READS coalescing ──
+    // ── Phase 1: sum of squares with N_READS coalescing + register caching ──
+    float cached[MAX_PER_THREAD];
+    uint n_cached = 0;
     float acc = 0.0;
     for (uint i = tid * N_READS; i < axis_size; i += tgsize * N_READS) {
         if (i + 3 < axis_size) {
@@ -100,10 +107,15 @@ kernel void rms_norm_f32(
             float v1 = input[base + i + 1];
             float v2 = input[base + i + 2];
             float v3 = input[base + i + 3];
+            cached[n_cached++] = v0;
+            cached[n_cached++] = v1;
+            cached[n_cached++] = v2;
+            cached[n_cached++] = v3;
             acc += v0*v0 + v1*v1 + v2*v2 + v3*v3;
         } else {
             for (uint j = i; j < min(i + N_READS, axis_size); j++) {
                 float v = input[base + j];
+                cached[n_cached++] = v;
                 acc += v * v;
             }
         }
@@ -113,13 +125,14 @@ kernel void rms_norm_f32(
                                        simd_lane_id, simd_group_id,
                                        local_sums, local_inv_rms);
 
-    // ── Phase 2: normalise + optional weight ──
+    // ── Phase 2: normalise + optional weight (read from cached[]) ──
+    n_cached = 0;
     for (uint i = tid * N_READS; i < axis_size; i += tgsize * N_READS) {
         if (i + 3 < axis_size) {
-            float o0 = input[base + i]     * rms;
-            float o1 = input[base + i + 1] * rms;
-            float o2 = input[base + i + 2] * rms;
-            float o3 = input[base + i + 3] * rms;
+            float o0 = cached[n_cached++] * rms;
+            float o1 = cached[n_cached++] * rms;
+            float o2 = cached[n_cached++] * rms;
+            float o3 = cached[n_cached++] * rms;
             if (has_w) {
                 o0 *= weight[i       * w_stride];
                 o1 *= weight[(i + 1) * w_stride];
@@ -132,7 +145,7 @@ kernel void rms_norm_f32(
             output[base + i + 3] = o3;
         } else {
             for (uint j = i; j < min(i + N_READS, axis_size); j++) {
-                float o = input[base + j] * rms;
+                float o = cached[n_cached++] * rms;
                 if (has_w) { o *= weight[j * w_stride]; }
                 output[base + j] = o;
             }
@@ -163,9 +176,11 @@ kernel void rms_norm_single_f32(
 
     // ── Phase 1: sum of squares (single pass, no outer loop) ──
     float acc = 0.0;
+    float cached_val = 0.0;
     uint i = tid;
     if (i < axis_size) {
         float v = input[base + i];
+        cached_val = v;
         acc = v * v;
     }
 
@@ -173,9 +188,9 @@ kernel void rms_norm_single_f32(
                                        simd_lane_id, simd_group_id,
                                        local_sums, local_inv_rms);
 
-    // ── Phase 2: normalise + optional weight ──
+    // ── Phase 2: normalise + optional weight (read from cached_val) ──
     if (i < axis_size) {
-        float o = input[base + i] * rms;
+        float o = cached_val * rms;
         if (has_w) { o *= weight[i * w_stride]; }
         output[base + i] = o;
     }
@@ -205,6 +220,9 @@ kernel void rms_norm_f16(
 
     size_t base = size_t(row) * size_t(axis_size);
 
+    // ── Phase 1: sum of squares with register caching (cache as f32) ──
+    float cached[MAX_PER_THREAD];
+    uint n_cached = 0;
     float acc = 0.0;
     for (uint i = tid * N_READS; i < axis_size; i += tgsize * N_READS) {
         if (i + 3 < axis_size) {
@@ -212,10 +230,15 @@ kernel void rms_norm_f16(
             float v1 = float(input[base + i + 1]);
             float v2 = float(input[base + i + 2]);
             float v3 = float(input[base + i + 3]);
+            cached[n_cached++] = v0;
+            cached[n_cached++] = v1;
+            cached[n_cached++] = v2;
+            cached[n_cached++] = v3;
             acc += v0*v0 + v1*v1 + v2*v2 + v3*v3;
         } else {
             for (uint j = i; j < min(i + N_READS, axis_size); j++) {
                 float v = float(input[base + j]);
+                cached[n_cached++] = v;
                 acc += v * v;
             }
         }
@@ -225,12 +248,14 @@ kernel void rms_norm_f16(
                                        simd_lane_id, simd_group_id,
                                        local_sums, local_inv_rms);
 
+    // ── Phase 2: normalise + optional weight (read from cached[]) ──
+    n_cached = 0;
     for (uint i = tid * N_READS; i < axis_size; i += tgsize * N_READS) {
         if (i + 3 < axis_size) {
-            float o0 = float(input[base + i])     * rms;
-            float o1 = float(input[base + i + 1]) * rms;
-            float o2 = float(input[base + i + 2]) * rms;
-            float o3 = float(input[base + i + 3]) * rms;
+            float o0 = cached[n_cached++] * rms;
+            float o1 = cached[n_cached++] * rms;
+            float o2 = cached[n_cached++] * rms;
+            float o3 = cached[n_cached++] * rms;
             if (has_w) {
                 o0 *= float(weight[i       * w_stride]);
                 o1 *= float(weight[(i + 1) * w_stride]);
@@ -243,7 +268,7 @@ kernel void rms_norm_f16(
             output[base + i + 3] = half(o3);
         } else {
             for (uint j = i; j < min(i + N_READS, axis_size); j++) {
-                float o = float(input[base + j]) * rms;
+                float o = cached[n_cached++] * rms;
                 if (has_w) { o *= float(weight[j * w_stride]); }
                 output[base + j] = half(o);
             }
@@ -271,10 +296,13 @@ kernel void rms_norm_single_f16(
 
     size_t base = size_t(row) * size_t(axis_size);
 
+    // ── Phase 1: sum of squares (single pass, no outer loop) ──
     float acc = 0.0;
+    float cached_val = 0.0;
     uint i = tid;
     if (i < axis_size) {
         float v = float(input[base + i]);
+        cached_val = v;
         acc = v * v;
     }
 
@@ -282,8 +310,9 @@ kernel void rms_norm_single_f16(
                                        simd_lane_id, simd_group_id,
                                        local_sums, local_inv_rms);
 
+    // ── Phase 2: normalise + optional weight (read from cached_val) ──
     if (i < axis_size) {
-        float o = float(input[base + i]) * rms;
+        float o = cached_val * rms;
         if (has_w) { o *= float(weight[i * w_stride]); }
         output[base + i] = half(o);
     }
@@ -313,6 +342,9 @@ kernel void rms_norm_bf16(
 
     size_t base = size_t(row) * size_t(axis_size);
 
+    // ── Phase 1: sum of squares with register caching (cache as f32) ──
+    float cached[MAX_PER_THREAD];
+    uint n_cached = 0;
     float acc = 0.0;
     for (uint i = tid * N_READS; i < axis_size; i += tgsize * N_READS) {
         if (i + 3 < axis_size) {
@@ -320,10 +352,15 @@ kernel void rms_norm_bf16(
             float v1 = float(input[base + i + 1]);
             float v2 = float(input[base + i + 2]);
             float v3 = float(input[base + i + 3]);
+            cached[n_cached++] = v0;
+            cached[n_cached++] = v1;
+            cached[n_cached++] = v2;
+            cached[n_cached++] = v3;
             acc += v0*v0 + v1*v1 + v2*v2 + v3*v3;
         } else {
             for (uint j = i; j < min(i + N_READS, axis_size); j++) {
                 float v = float(input[base + j]);
+                cached[n_cached++] = v;
                 acc += v * v;
             }
         }
@@ -333,12 +370,14 @@ kernel void rms_norm_bf16(
                                        simd_lane_id, simd_group_id,
                                        local_sums, local_inv_rms);
 
+    // ── Phase 2: normalise + optional weight (read from cached[]) ──
+    n_cached = 0;
     for (uint i = tid * N_READS; i < axis_size; i += tgsize * N_READS) {
         if (i + 3 < axis_size) {
-            float o0 = float(input[base + i])     * rms;
-            float o1 = float(input[base + i + 1]) * rms;
-            float o2 = float(input[base + i + 2]) * rms;
-            float o3 = float(input[base + i + 3]) * rms;
+            float o0 = cached[n_cached++] * rms;
+            float o1 = cached[n_cached++] * rms;
+            float o2 = cached[n_cached++] * rms;
+            float o3 = cached[n_cached++] * rms;
             if (has_w) {
                 o0 *= float(weight[i       * w_stride]);
                 o1 *= float(weight[(i + 1) * w_stride]);
@@ -351,7 +390,7 @@ kernel void rms_norm_bf16(
             output[base + i + 3] = bfloat(o3);
         } else {
             for (uint j = i; j < min(i + N_READS, axis_size); j++) {
-                float o = float(input[base + j]) * rms;
+                float o = cached[n_cached++] * rms;
                 if (has_w) { o *= float(weight[j * w_stride]); }
                 output[base + j] = bfloat(o);
             }
@@ -379,10 +418,13 @@ kernel void rms_norm_single_bf16(
 
     size_t base = size_t(row) * size_t(axis_size);
 
+    // ── Phase 1: sum of squares (single pass, no outer loop) ──
     float acc = 0.0;
+    float cached_val = 0.0;
     uint i = tid;
     if (i < axis_size) {
         float v = float(input[base + i]);
+        cached_val = v;
         acc = v * v;
     }
 
@@ -390,8 +432,9 @@ kernel void rms_norm_single_bf16(
                                        simd_lane_id, simd_group_id,
                                        local_sums, local_inv_rms);
 
+    // ── Phase 2: normalise + optional weight (read from cached_val) ──
     if (i < axis_size) {
-        float o = float(input[base + i]) * rms;
+        float o = cached_val * rms;
         if (has_w) { o *= float(weight[i * w_stride]); }
         output[base + i] = bfloat(o);
     }
@@ -408,6 +451,9 @@ pub const RMS_NORM_RESIDUAL_ADD_SHADER_SOURCE: &str = r#"
 using namespace metal;
 
 constant constexpr uint N_READS = 4;
+
+// ─── Max elements cached per thread in registers ─────────────────────────
+constant constexpr uint MAX_PER_THREAD = 64;
 
 // ─── Shared reduction helper (same as rms_norm) ─────────────────────────
 inline float reduce_sum_of_squares_fused(
@@ -469,7 +515,9 @@ kernel void rms_norm_residual_add_f32(
 
     size_t base = size_t(row) * size_t(axis_size);
 
-    // ── Phase 1: add residual + sum of squares ──
+    // ── Phase 1: add residual + sum of squares + register caching ──
+    float cached[MAX_PER_THREAD];
+    uint n_cached = 0;
     float acc = 0.0;
     for (uint i = tid * N_READS; i < axis_size; i += tgsize * N_READS) {
         if (i + 3 < axis_size) {
@@ -481,11 +529,16 @@ kernel void rms_norm_residual_add_f32(
             residual[base + i + 1] = x1;
             residual[base + i + 2] = x2;
             residual[base + i + 3] = x3;
+            cached[n_cached++] = x0;
+            cached[n_cached++] = x1;
+            cached[n_cached++] = x2;
+            cached[n_cached++] = x3;
             acc += x0*x0 + x1*x1 + x2*x2 + x3*x3;
         } else {
             for (uint j = i; j < min(i + N_READS, axis_size); j++) {
                 float x = input[base + j] + residual[base + j];
                 residual[base + j] = x;
+                cached[n_cached++] = x;
                 acc += x * x;
             }
         }
@@ -495,13 +548,14 @@ kernel void rms_norm_residual_add_f32(
                                              simd_lane_id, simd_group_id,
                                              local_sums, local_inv_rms);
 
-    // ── Phase 2: normalise + optional weight ──
+    // ── Phase 2: normalise + optional weight (read from cached[]) ──
+    n_cached = 0;
     for (uint i = tid * N_READS; i < axis_size; i += tgsize * N_READS) {
         if (i + 3 < axis_size) {
-            float o0 = residual[base + i]     * rms;
-            float o1 = residual[base + i + 1] * rms;
-            float o2 = residual[base + i + 2] * rms;
-            float o3 = residual[base + i + 3] * rms;
+            float o0 = cached[n_cached++] * rms;
+            float o1 = cached[n_cached++] * rms;
+            float o2 = cached[n_cached++] * rms;
+            float o3 = cached[n_cached++] * rms;
             if (has_w) {
                 o0 *= weight[i       * w_stride];
                 o1 *= weight[(i + 1) * w_stride];
@@ -514,7 +568,7 @@ kernel void rms_norm_residual_add_f32(
             output[base + i + 3] = o3;
         } else {
             for (uint j = i; j < min(i + N_READS, axis_size); j++) {
-                float o = residual[base + j] * rms;
+                float o = cached[n_cached++] * rms;
                 if (has_w) { o *= weight[j * w_stride]; }
                 output[base + j] = o;
             }
@@ -547,6 +601,9 @@ kernel void rms_norm_residual_add_f16(
 
     size_t base = size_t(row) * size_t(axis_size);
 
+    // ── Phase 1: add residual + sum of squares + register caching (cache as f32) ──
+    float cached[MAX_PER_THREAD];
+    uint n_cached = 0;
     float acc = 0.0;
     for (uint i = tid * N_READS; i < axis_size; i += tgsize * N_READS) {
         if (i + 3 < axis_size) {
@@ -558,11 +615,16 @@ kernel void rms_norm_residual_add_f16(
             residual[base + i + 1] = half(x1);
             residual[base + i + 2] = half(x2);
             residual[base + i + 3] = half(x3);
+            cached[n_cached++] = x0;
+            cached[n_cached++] = x1;
+            cached[n_cached++] = x2;
+            cached[n_cached++] = x3;
             acc += x0*x0 + x1*x1 + x2*x2 + x3*x3;
         } else {
             for (uint j = i; j < min(i + N_READS, axis_size); j++) {
                 float x = float(input[base + j]) + float(residual[base + j]);
                 residual[base + j] = half(x);
+                cached[n_cached++] = x;
                 acc += x * x;
             }
         }
@@ -572,12 +634,14 @@ kernel void rms_norm_residual_add_f16(
                                              simd_lane_id, simd_group_id,
                                              local_sums, local_inv_rms);
 
+    // ── Phase 2: normalise + optional weight (read from cached[]) ──
+    n_cached = 0;
     for (uint i = tid * N_READS; i < axis_size; i += tgsize * N_READS) {
         if (i + 3 < axis_size) {
-            float o0 = float(residual[base + i])     * rms;
-            float o1 = float(residual[base + i + 1]) * rms;
-            float o2 = float(residual[base + i + 2]) * rms;
-            float o3 = float(residual[base + i + 3]) * rms;
+            float o0 = cached[n_cached++] * rms;
+            float o1 = cached[n_cached++] * rms;
+            float o2 = cached[n_cached++] * rms;
+            float o3 = cached[n_cached++] * rms;
             if (has_w) {
                 o0 *= float(weight[i       * w_stride]);
                 o1 *= float(weight[(i + 1) * w_stride]);
@@ -590,7 +654,7 @@ kernel void rms_norm_residual_add_f16(
             output[base + i + 3] = half(o3);
         } else {
             for (uint j = i; j < min(i + N_READS, axis_size); j++) {
-                float o = float(residual[base + j]) * rms;
+                float o = cached[n_cached++] * rms;
                 if (has_w) { o *= float(weight[j * w_stride]); }
                 output[base + j] = half(o);
             }
@@ -623,6 +687,9 @@ kernel void rms_norm_residual_add_bf16(
 
     size_t base = size_t(row) * size_t(axis_size);
 
+    // ── Phase 1: add residual + sum of squares + register caching (cache as f32) ──
+    float cached[MAX_PER_THREAD];
+    uint n_cached = 0;
     float acc = 0.0;
     for (uint i = tid * N_READS; i < axis_size; i += tgsize * N_READS) {
         if (i + 3 < axis_size) {
@@ -634,11 +701,16 @@ kernel void rms_norm_residual_add_bf16(
             residual[base + i + 1] = bfloat(x1);
             residual[base + i + 2] = bfloat(x2);
             residual[base + i + 3] = bfloat(x3);
+            cached[n_cached++] = x0;
+            cached[n_cached++] = x1;
+            cached[n_cached++] = x2;
+            cached[n_cached++] = x3;
             acc += x0*x0 + x1*x1 + x2*x2 + x3*x3;
         } else {
             for (uint j = i; j < min(i + N_READS, axis_size); j++) {
                 float x = float(input[base + j]) + float(residual[base + j]);
                 residual[base + j] = bfloat(x);
+                cached[n_cached++] = x;
                 acc += x * x;
             }
         }
@@ -648,12 +720,14 @@ kernel void rms_norm_residual_add_bf16(
                                              simd_lane_id, simd_group_id,
                                              local_sums, local_inv_rms);
 
+    // ── Phase 2: normalise + optional weight (read from cached[]) ──
+    n_cached = 0;
     for (uint i = tid * N_READS; i < axis_size; i += tgsize * N_READS) {
         if (i + 3 < axis_size) {
-            float o0 = float(residual[base + i])     * rms;
-            float o1 = float(residual[base + i + 1]) * rms;
-            float o2 = float(residual[base + i + 2]) * rms;
-            float o3 = float(residual[base + i + 3]) * rms;
+            float o0 = cached[n_cached++] * rms;
+            float o1 = cached[n_cached++] * rms;
+            float o2 = cached[n_cached++] * rms;
+            float o3 = cached[n_cached++] * rms;
             if (has_w) {
                 o0 *= float(weight[i       * w_stride]);
                 o1 *= float(weight[(i + 1) * w_stride]);
@@ -666,7 +740,7 @@ kernel void rms_norm_residual_add_bf16(
             output[base + i + 3] = bfloat(o3);
         } else {
             for (uint j = i; j < min(i + N_READS, axis_size); j++) {
-                float o = float(residual[base + j]) * rms;
+                float o = cached[n_cached++] * rms;
                 if (has_w) { o *= float(weight[j * w_stride]); }
                 output[base + j] = bfloat(o);
             }
@@ -875,12 +949,7 @@ pub fn rms_norm_into_cb(
     let rows = input.shape()[0];
     let axis_size = super::checked_u32(axis_size_usize, "axis_size")?;
 
-    let out = Array::zeros(registry.device().raw(), input.shape(), input.dtype());
-
-    let axis_buf = make_const_buf(registry.device().raw(), axis_size);
-    let eps_buf = make_const_buf(registry.device().raw(), eps);
-    let w_stride_buf = make_const_buf(registry.device().raw(), w_stride);
-    let has_w_buf = make_const_buf(registry.device().raw(), has_w);
+    let out = Array::uninit(registry.device().raw(), input.shape(), input.dtype());
 
     let encoder = cb.new_compute_command_encoder();
     encoder.set_compute_pipeline_state(&pipeline);
@@ -891,14 +960,79 @@ pub fn rms_norm_into_cb(
         encoder.set_buffer(1, Some(input.metal_buffer()), 0);
     }
     encoder.set_buffer(2, Some(out.metal_buffer()), 0);
-    encoder.set_buffer(3, Some(&axis_buf), 0);
-    encoder.set_buffer(4, Some(&eps_buf), 0);
-    encoder.set_buffer(5, Some(&w_stride_buf), 0);
-    encoder.set_buffer(6, Some(&has_w_buf), 0);
+    encoder.set_bytes(3, 4, &axis_size as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(4, 4, &eps as *const f32 as *const std::ffi::c_void);
+    encoder.set_bytes(5, 4, &w_stride as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(6, 4, &has_w as *const u32 as *const std::ffi::c_void);
 
     let tg_size = std::cmp::min(1024, pipeline.max_total_threads_per_threadgroup());
     encoder.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), MTLSize::new(tg_size, 1, 1));
     encoder.end_encoding();
+
+    Ok(out)
+}
+
+/// Encode RMS normalization into an existing compute command encoder (no encoder create/end).
+/// Caller is responsible for creating and ending the encoder.
+pub fn rms_norm_into_encoder(
+    registry: &KernelRegistry,
+    input: &Array,
+    weight: Option<&Array>,
+    eps: f32,
+    encoder: &metal::ComputeCommandEncoderRef,
+) -> Result<Array, KernelError> {
+    if input.ndim() != 2 {
+        return Err(KernelError::InvalidShape(format!(
+            "rms_norm requires 2D input, got {}D",
+            input.ndim()
+        )));
+    }
+
+    let axis_size_usize = input.shape()[1];
+
+    let (has_w, w_stride): (u32, u32) = if let Some(w) = weight {
+        if w.ndim() != 1 {
+            return Err(KernelError::InvalidShape(format!(
+                "rms_norm requires 1D weight, got {}D",
+                w.ndim()
+            )));
+        }
+        if w.shape()[0] != axis_size_usize {
+            return Err(KernelError::InvalidShape(format!(
+                "axis size mismatch: input[1]={} vs weight[0]={}",
+                axis_size_usize,
+                w.shape()[0]
+            )));
+        }
+        let ws = w.strides()[0] as u32;
+        (1, ws)
+    } else {
+        (0, 1)
+    };
+
+    let kernel_name = rms_kernel_name(input.dtype(), axis_size_usize)?;
+    let pipeline = registry.get_pipeline(kernel_name, input.dtype())?;
+
+    let rows = input.shape()[0];
+    let axis_size = super::checked_u32(axis_size_usize, "axis_size")?;
+
+    let out = Array::uninit(registry.device().raw(), input.shape(), input.dtype());
+
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
+    if let Some(w) = weight {
+        encoder.set_buffer(1, Some(w.metal_buffer()), w.offset() as u64);
+    } else {
+        encoder.set_buffer(1, Some(input.metal_buffer()), 0);
+    }
+    encoder.set_buffer(2, Some(out.metal_buffer()), 0);
+    encoder.set_bytes(3, 4, &axis_size as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(4, 4, &eps as *const f32 as *const std::ffi::c_void);
+    encoder.set_bytes(5, 4, &w_stride as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(6, 4, &has_w as *const u32 as *const std::ffi::c_void);
+
+    let tg_size = std::cmp::min(1024, pipeline.max_total_threads_per_threadgroup());
+    encoder.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), MTLSize::new(tg_size, 1, 1));
 
     Ok(out)
 }

@@ -467,7 +467,7 @@ pub fn gather_mm_into_cb(
 
     let pipeline = registry.get_pipeline(kernel_name, x.dtype())?;
     let dev = registry.device().raw();
-    let out = Array::zeros(dev, &[batch, m_per_batch, n], x.dtype());
+    let out = Array::uninit(dev, &[batch, m_per_batch, n], x.dtype());
 
     let batch_buf = make_u32_buf(dev, super::checked_u32(batch, "batch")?);
     let m_buf = make_u32_buf(dev, super::checked_u32(m_per_batch, "M_per_batch")?);

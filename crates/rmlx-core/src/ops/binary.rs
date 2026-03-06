@@ -826,7 +826,7 @@ pub fn binary_op_into_cb(
     } else {
         a.dtype()
     };
-    let out = Array::zeros(registry.device().raw(), &out_shape, out_dtype);
+    let out = Array::uninit(registry.device().raw(), &out_shape, out_dtype);
 
     let encoder = cb.new_compute_command_encoder();
     encoder.set_compute_pipeline_state(&pipeline);
@@ -835,7 +835,6 @@ pub fn binary_op_into_cb(
     encoder.set_buffer(2, Some(out.metal_buffer()), out.offset() as u64);
 
     if matches!(variant, DispatchVariant::General) {
-        let device = registry.device().raw();
         let ndim = out_shape.len();
 
         let shape_u32: Vec<u32> = out_shape
@@ -859,33 +858,24 @@ pub fn binary_op_into_cb(
             .collect::<Result<Vec<u32>, _>>()?;
 
         let buf_size = |v: &[u32]| std::mem::size_of_val(v) as u64;
-
-        let shape_buf = device.new_buffer_with_data(
-            shape_u32.as_ptr() as *const _,
-            buf_size(&shape_u32),
-            metal::MTLResourceOptions::StorageModeShared,
-        );
-        let a_stride_buf = device.new_buffer_with_data(
-            a_strides_u32.as_ptr() as *const _,
-            buf_size(&a_strides_u32),
-            metal::MTLResourceOptions::StorageModeShared,
-        );
-        let b_stride_buf = device.new_buffer_with_data(
-            b_strides_u32.as_ptr() as *const _,
-            buf_size(&b_strides_u32),
-            metal::MTLResourceOptions::StorageModeShared,
-        );
         let ndim_val = super::checked_u32(ndim, "ndim")?;
-        let ndim_buf = device.new_buffer_with_data(
-            &ndim_val as *const u32 as *const _,
-            std::mem::size_of::<u32>() as u64,
-            metal::MTLResourceOptions::StorageModeShared,
-        );
 
-        encoder.set_buffer(3, Some(&shape_buf), 0);
-        encoder.set_buffer(4, Some(&a_stride_buf), 0);
-        encoder.set_buffer(5, Some(&b_stride_buf), 0);
-        encoder.set_buffer(6, Some(&ndim_buf), 0);
+        encoder.set_bytes(
+            3,
+            buf_size(&shape_u32),
+            shape_u32.as_ptr() as *const std::ffi::c_void,
+        );
+        encoder.set_bytes(
+            4,
+            buf_size(&a_strides_u32),
+            a_strides_u32.as_ptr() as *const std::ffi::c_void,
+        );
+        encoder.set_bytes(
+            5,
+            buf_size(&b_strides_u32),
+            b_strides_u32.as_ptr() as *const std::ffi::c_void,
+        );
+        encoder.set_bytes(6, 4, &ndim_val as *const u32 as *const std::ffi::c_void);
     }
 
     let grid_size = MTLSize::new(out_numel as u64, 1, 1);

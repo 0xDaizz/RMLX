@@ -1,8 +1,8 @@
 //! Layer Normalization: y = (x - mean) / sqrt(var + eps) * weight + bias
 //!
-//! Two-pass approach:
-//! - Pass 1: compute mean and variance per row
-//! - Pass 2: normalize, scale, and shift
+//! Optimised two-phase approach:
+//! - Phase 1: single pass computes sum and sum-of-squares, caches values in registers
+//! - Phase 2: normalize from cached values, scale, and shift (no re-read from device memory)
 //!
 //! Reuses the simdgroup reduction pattern from RMS norm.
 //! Supports f32, f16, and bf16 (f16/bf16 accumulate in f32).
@@ -23,15 +23,17 @@ use metal::MTLSize;
 /// - `layer_norm_f16`: f16 read/write, f32 accumulation
 /// - `layer_norm_bf16`: bf16 read/write, f32 accumulation
 ///
-/// Each threadgroup processes one row. Two-pass within a single kernel launch:
-/// 1. Compute mean and variance via cooperative reduction
-/// 2. Normalize and apply affine transform
+/// Each threadgroup processes one row. Two-pass statistics + cached normalize:
+/// 1. Compute sum via cooperative reduction while caching values in registers
+/// 2. Compute variance from cached values (no device re-read, avoids catastrophic cancellation)
+/// 3. Normalize cached values and apply affine transform
 pub const LAYER_NORM_SHADER_SOURCE: &str = r#"
 #include <metal_stdlib>
 #include <metal_simdgroup>
 using namespace metal;
 
 constant constexpr uint N_READS = 4;
+constant constexpr uint MAX_PER_THREAD = 64;
 
 // ─── Shared reduction helper ──────────────────────────────────────────────
 
@@ -84,48 +86,51 @@ kernel void layer_norm_f32(
 
     size_t base = size_t(row) * size_t(axis_size);
 
-    // ── Pass 1a: compute mean ──
+    // ── Single pass: compute sum + cache values ──
+    float cached[MAX_PER_THREAD];
+    uint n_cached = 0;
     float sum_val = 0.0f;
     for (uint i = tid * N_READS; i < axis_size; i += tgsize * N_READS) {
         if (i + 3 < axis_size) {
-            sum_val += input[base + i] + input[base + i + 1]
-                     + input[base + i + 2] + input[base + i + 3];
+            float v0 = input[base + i];
+            float v1 = input[base + i + 1];
+            float v2 = input[base + i + 2];
+            float v3 = input[base + i + 3];
+            cached[n_cached++] = v0;
+            cached[n_cached++] = v1;
+            cached[n_cached++] = v2;
+            cached[n_cached++] = v3;
+            sum_val += v0 + v1 + v2 + v3;
         } else {
             for (uint j = i; j < min(i + N_READS, axis_size); j++) {
-                sum_val += input[base + j];
+                float v = input[base + j];
+                cached[n_cached++] = v;
+                sum_val += v;
             }
         }
     }
-    float mean = tg_reduce_sum_ln(sum_val, simd_lane_id, simd_group_id, reduce_buf)
-                 / float(axis_size);
 
-    // ── Pass 1b: compute variance ──
+    float total_sum = tg_reduce_sum_ln(sum_val, simd_lane_id, simd_group_id, reduce_buf);
+    float mean = total_sum / float(axis_size);
+
+    // ── Variance pass over cached values (no device memory re-read) ──
     float var_acc = 0.0f;
-    for (uint i = tid * N_READS; i < axis_size; i += tgsize * N_READS) {
-        if (i + 3 < axis_size) {
-            float d0 = input[base + i] - mean;
-            float d1 = input[base + i + 1] - mean;
-            float d2 = input[base + i + 2] - mean;
-            float d3 = input[base + i + 3] - mean;
-            var_acc += d0*d0 + d1*d1 + d2*d2 + d3*d3;
-        } else {
-            for (uint j = i; j < min(i + N_READS, axis_size); j++) {
-                float d = input[base + j] - mean;
-                var_acc += d * d;
-            }
-        }
+    for (uint ci = 0; ci < n_cached; ci++) {
+        float d = cached[ci] - mean;
+        var_acc += d * d;
     }
     float variance = tg_reduce_sum_ln(var_acc, simd_lane_id, simd_group_id, reduce_buf)
                      / float(axis_size);
     float inv_std = rsqrt(variance + eps);
 
-    // ── Pass 2: normalize + affine ──
+    // ── Pass 2: normalize + affine (read from cached[]) ──
+    n_cached = 0;
     for (uint i = tid * N_READS; i < axis_size; i += tgsize * N_READS) {
         if (i + 3 < axis_size) {
-            float o0 = (input[base + i]     - mean) * inv_std;
-            float o1 = (input[base + i + 1] - mean) * inv_std;
-            float o2 = (input[base + i + 2] - mean) * inv_std;
-            float o3 = (input[base + i + 3] - mean) * inv_std;
+            float o0 = (cached[n_cached++] - mean) * inv_std;
+            float o1 = (cached[n_cached++] - mean) * inv_std;
+            float o2 = (cached[n_cached++] - mean) * inv_std;
+            float o3 = (cached[n_cached++] - mean) * inv_std;
             if (has_w) {
                 o0 *= weight[i];     o1 *= weight[i + 1];
                 o2 *= weight[i + 2]; o3 *= weight[i + 3];
@@ -140,7 +145,7 @@ kernel void layer_norm_f32(
             output[base + i + 3] = o3;
         } else {
             for (uint j = i; j < min(i + N_READS, axis_size); j++) {
-                float o = (input[base + j] - mean) * inv_std;
+                float o = (cached[n_cached++] - mean) * inv_std;
                 if (has_w) { o *= weight[j]; }
                 if (has_b) { o += bias[j]; }
                 output[base + j] = o;
@@ -173,45 +178,49 @@ kernel void layer_norm_f16(
 
     size_t base = size_t(row) * size_t(axis_size);
 
+    float cached[MAX_PER_THREAD];
+    uint n_cached = 0;
     float sum_val = 0.0f;
     for (uint i = tid * N_READS; i < axis_size; i += tgsize * N_READS) {
         if (i + 3 < axis_size) {
-            sum_val += float(input[base + i]) + float(input[base + i + 1])
-                     + float(input[base + i + 2]) + float(input[base + i + 3]);
+            float v0 = float(input[base + i]);
+            float v1 = float(input[base + i + 1]);
+            float v2 = float(input[base + i + 2]);
+            float v3 = float(input[base + i + 3]);
+            cached[n_cached++] = v0;
+            cached[n_cached++] = v1;
+            cached[n_cached++] = v2;
+            cached[n_cached++] = v3;
+            sum_val += v0 + v1 + v2 + v3;
         } else {
             for (uint j = i; j < min(i + N_READS, axis_size); j++) {
-                sum_val += float(input[base + j]);
+                float v = float(input[base + j]);
+                cached[n_cached++] = v;
+                sum_val += v;
             }
         }
     }
-    float mean = tg_reduce_sum_ln(sum_val, simd_lane_id, simd_group_id, reduce_buf)
-                 / float(axis_size);
 
+    float total_sum = tg_reduce_sum_ln(sum_val, simd_lane_id, simd_group_id, reduce_buf);
+    float mean = total_sum / float(axis_size);
+
+    // ── Variance pass over cached values (no device memory re-read) ──
     float var_acc = 0.0f;
-    for (uint i = tid * N_READS; i < axis_size; i += tgsize * N_READS) {
-        if (i + 3 < axis_size) {
-            float d0 = float(input[base + i]) - mean;
-            float d1 = float(input[base + i + 1]) - mean;
-            float d2 = float(input[base + i + 2]) - mean;
-            float d3 = float(input[base + i + 3]) - mean;
-            var_acc += d0*d0 + d1*d1 + d2*d2 + d3*d3;
-        } else {
-            for (uint j = i; j < min(i + N_READS, axis_size); j++) {
-                float d = float(input[base + j]) - mean;
-                var_acc += d * d;
-            }
-        }
+    for (uint ci = 0; ci < n_cached; ci++) {
+        float d = cached[ci] - mean;
+        var_acc += d * d;
     }
     float variance = tg_reduce_sum_ln(var_acc, simd_lane_id, simd_group_id, reduce_buf)
                      / float(axis_size);
     float inv_std = rsqrt(variance + eps);
 
+    n_cached = 0;
     for (uint i = tid * N_READS; i < axis_size; i += tgsize * N_READS) {
         if (i + 3 < axis_size) {
-            float o0 = (float(input[base + i])     - mean) * inv_std;
-            float o1 = (float(input[base + i + 1]) - mean) * inv_std;
-            float o2 = (float(input[base + i + 2]) - mean) * inv_std;
-            float o3 = (float(input[base + i + 3]) - mean) * inv_std;
+            float o0 = (cached[n_cached++] - mean) * inv_std;
+            float o1 = (cached[n_cached++] - mean) * inv_std;
+            float o2 = (cached[n_cached++] - mean) * inv_std;
+            float o3 = (cached[n_cached++] - mean) * inv_std;
             if (has_w) {
                 o0 *= float(weight[i]);     o1 *= float(weight[i + 1]);
                 o2 *= float(weight[i + 2]); o3 *= float(weight[i + 3]);
@@ -226,7 +235,7 @@ kernel void layer_norm_f16(
             output[base + i + 3] = half(o3);
         } else {
             for (uint j = i; j < min(i + N_READS, axis_size); j++) {
-                float o = (float(input[base + j]) - mean) * inv_std;
+                float o = (cached[n_cached++] - mean) * inv_std;
                 if (has_w) { o *= float(weight[j]); }
                 if (has_b) { o += float(bias[j]); }
                 output[base + j] = half(o);
@@ -259,45 +268,49 @@ kernel void layer_norm_bf16(
 
     size_t base = size_t(row) * size_t(axis_size);
 
+    float cached[MAX_PER_THREAD];
+    uint n_cached = 0;
     float sum_val = 0.0f;
     for (uint i = tid * N_READS; i < axis_size; i += tgsize * N_READS) {
         if (i + 3 < axis_size) {
-            sum_val += float(input[base + i]) + float(input[base + i + 1])
-                     + float(input[base + i + 2]) + float(input[base + i + 3]);
+            float v0 = float(input[base + i]);
+            float v1 = float(input[base + i + 1]);
+            float v2 = float(input[base + i + 2]);
+            float v3 = float(input[base + i + 3]);
+            cached[n_cached++] = v0;
+            cached[n_cached++] = v1;
+            cached[n_cached++] = v2;
+            cached[n_cached++] = v3;
+            sum_val += v0 + v1 + v2 + v3;
         } else {
             for (uint j = i; j < min(i + N_READS, axis_size); j++) {
-                sum_val += float(input[base + j]);
+                float v = float(input[base + j]);
+                cached[n_cached++] = v;
+                sum_val += v;
             }
         }
     }
-    float mean = tg_reduce_sum_ln(sum_val, simd_lane_id, simd_group_id, reduce_buf)
-                 / float(axis_size);
 
+    float total_sum = tg_reduce_sum_ln(sum_val, simd_lane_id, simd_group_id, reduce_buf);
+    float mean = total_sum / float(axis_size);
+
+    // ── Variance pass over cached values (no device memory re-read) ──
     float var_acc = 0.0f;
-    for (uint i = tid * N_READS; i < axis_size; i += tgsize * N_READS) {
-        if (i + 3 < axis_size) {
-            float d0 = float(input[base + i]) - mean;
-            float d1 = float(input[base + i + 1]) - mean;
-            float d2 = float(input[base + i + 2]) - mean;
-            float d3 = float(input[base + i + 3]) - mean;
-            var_acc += d0*d0 + d1*d1 + d2*d2 + d3*d3;
-        } else {
-            for (uint j = i; j < min(i + N_READS, axis_size); j++) {
-                float d = float(input[base + j]) - mean;
-                var_acc += d * d;
-            }
-        }
+    for (uint ci = 0; ci < n_cached; ci++) {
+        float d = cached[ci] - mean;
+        var_acc += d * d;
     }
     float variance = tg_reduce_sum_ln(var_acc, simd_lane_id, simd_group_id, reduce_buf)
                      / float(axis_size);
     float inv_std = rsqrt(variance + eps);
 
+    n_cached = 0;
     for (uint i = tid * N_READS; i < axis_size; i += tgsize * N_READS) {
         if (i + 3 < axis_size) {
-            float o0 = (float(input[base + i])     - mean) * inv_std;
-            float o1 = (float(input[base + i + 1]) - mean) * inv_std;
-            float o2 = (float(input[base + i + 2]) - mean) * inv_std;
-            float o3 = (float(input[base + i + 3]) - mean) * inv_std;
+            float o0 = (cached[n_cached++] - mean) * inv_std;
+            float o1 = (cached[n_cached++] - mean) * inv_std;
+            float o2 = (cached[n_cached++] - mean) * inv_std;
+            float o3 = (cached[n_cached++] - mean) * inv_std;
             if (has_w) {
                 o0 *= float(weight[i]);     o1 *= float(weight[i + 1]);
                 o2 *= float(weight[i + 2]); o3 *= float(weight[i + 3]);
@@ -312,7 +325,7 @@ kernel void layer_norm_bf16(
             output[base + i + 3] = bfloat(o3);
         } else {
             for (uint j = i; j < min(i + N_READS, axis_size); j++) {
-                float o = (float(input[base + j]) - mean) * inv_std;
+                float o = (cached[n_cached++] - mean) * inv_std;
                 if (has_w) { o *= float(weight[j]); }
                 if (has_b) { o += float(bias[j]); }
                 output[base + j] = bfloat(o);

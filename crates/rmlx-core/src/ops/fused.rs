@@ -174,8 +174,8 @@ pub fn fused_silu_mul_into_cb(
     let pipeline = registry.get_pipeline(kernel_name, gate_out.dtype())?;
     let numel = gate_out.numel();
     let dev = registry.device().raw();
-    let output = Array::zeros(dev, gate_out.shape(), gate_out.dtype());
-    let numel_buf = make_u32_buf(dev, numel as u32);
+    let output = Array::uninit(dev, gate_out.shape(), gate_out.dtype());
+    let numel_u32 = numel as u32;
 
     let elems_per_thread: u64 = match gate_out.dtype() {
         DType::Float32 => 2,
@@ -188,11 +188,70 @@ pub fn fused_silu_mul_into_cb(
     enc.set_buffer(0, Some(gate_out.metal_buffer()), gate_out.offset() as u64);
     enc.set_buffer(1, Some(up_out.metal_buffer()), up_out.offset() as u64);
     enc.set_buffer(2, Some(output.metal_buffer()), output.offset() as u64);
-    enc.set_buffer(3, Some(&numel_buf), 0);
+    enc.set_bytes(3, 4, &numel_u32 as *const u32 as *const std::ffi::c_void);
 
     let tg = std::cmp::min(pipeline.max_total_threads_per_threadgroup(), grid_threads);
     enc.dispatch_threads(MTLSize::new(grid_threads, 1, 1), MTLSize::new(tg, 1, 1));
     enc.end_encoding();
+
+    Ok(output)
+}
+
+/// Encode fused SiLU * mul into an existing compute command encoder (no encoder create/end).
+/// Caller is responsible for creating and ending the encoder.
+pub fn fused_silu_mul_into_encoder(
+    registry: &KernelRegistry,
+    gate_out: &Array,
+    up_out: &Array,
+    encoder: &metal::ComputeCommandEncoderRef,
+) -> Result<Array, KernelError> {
+    if gate_out.shape() != up_out.shape() {
+        return Err(KernelError::InvalidShape(format!(
+            "fused_silu_mul_into_encoder: shape mismatch: {:?} vs {:?}",
+            gate_out.shape(),
+            up_out.shape()
+        )));
+    }
+    if gate_out.dtype() != up_out.dtype() {
+        return Err(KernelError::InvalidShape(format!(
+            "fused_silu_mul_into_encoder: dtype mismatch: {:?} vs {:?}",
+            gate_out.dtype(),
+            up_out.dtype()
+        )));
+    }
+
+    let kernel_name = match gate_out.dtype() {
+        DType::Float32 => "silu_gate_f32",
+        DType::Float16 => "silu_gate_f16",
+        DType::Bfloat16 => "silu_gate_bf16",
+        other => {
+            return Err(KernelError::InvalidShape(format!(
+                "fused_silu_mul_into_encoder: unsupported dtype {:?}",
+                other
+            )))
+        }
+    };
+
+    let pipeline = registry.get_pipeline(kernel_name, gate_out.dtype())?;
+    let numel = gate_out.numel();
+    let dev = registry.device().raw();
+    let output = Array::uninit(dev, gate_out.shape(), gate_out.dtype());
+    let numel_u32 = numel as u32;
+
+    let elems_per_thread: u64 = match gate_out.dtype() {
+        DType::Float32 => 2,
+        _ => 4,
+    };
+    let grid_threads = (numel as u64).div_ceil(elems_per_thread);
+
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(gate_out.metal_buffer()), gate_out.offset() as u64);
+    encoder.set_buffer(1, Some(up_out.metal_buffer()), up_out.offset() as u64);
+    encoder.set_buffer(2, Some(output.metal_buffer()), output.offset() as u64);
+    encoder.set_bytes(3, 4, &numel_u32 as *const u32 as *const std::ffi::c_void);
+
+    let tg = std::cmp::min(pipeline.max_total_threads_per_threadgroup(), grid_threads);
+    encoder.dispatch_threads(MTLSize::new(grid_threads, 1, 1), MTLSize::new(tg, 1, 1));
 
     Ok(output)
 }
@@ -253,9 +312,9 @@ pub fn batched_qkv_proj_into(
     let nv = wv_t.shape()[1] as u32;
 
     let dev = registry.device().raw();
-    let q_out = Array::zeros(dev, &[m as usize, nq as usize], input.dtype());
-    let k_out = Array::zeros(dev, &[m as usize, nk as usize], input.dtype());
-    let v_out = Array::zeros(dev, &[m as usize, nv as usize], input.dtype());
+    let q_out = Array::uninit(dev, &[m as usize, nq as usize], input.dtype());
+    let k_out = Array::uninit(dev, &[m as usize, nk as usize], input.dtype());
+    let v_out = Array::uninit(dev, &[m as usize, nv as usize], input.dtype());
 
     let kernel_name = gemm_kernel_name(input.dtype())?;
     let pipeline = registry.get_pipeline(kernel_name, input.dtype())?;
@@ -296,18 +355,11 @@ fn encode_gemm(
     m: u32,
     n: u32,
     k: u32,
-    registry: &KernelRegistry,
+    _registry: &KernelRegistry,
 ) -> Result<(), KernelError> {
-    let dev = registry.device().raw();
-    let m_buf = make_u32_buf(dev, m);
-    let n_buf = make_u32_buf(dev, n);
-    let k_buf = make_u32_buf(dev, k);
     let batch_stride_a = m * k;
     let batch_stride_b = k * n;
     let batch_stride_c = m * n;
-    let bsa_buf = make_u32_buf(dev, batch_stride_a);
-    let bsb_buf = make_u32_buf(dev, batch_stride_b);
-    let bsc_buf = make_u32_buf(dev, batch_stride_c);
 
     const BM: u64 = 32;
     const BN: u64 = 32;
@@ -319,12 +371,24 @@ fn encode_gemm(
     enc.set_buffer(0, Some(a.metal_buffer()), a.offset() as u64);
     enc.set_buffer(1, Some(b.metal_buffer()), b.offset() as u64);
     enc.set_buffer(2, Some(c.metal_buffer()), c.offset() as u64);
-    enc.set_buffer(3, Some(&m_buf), 0);
-    enc.set_buffer(4, Some(&n_buf), 0);
-    enc.set_buffer(5, Some(&k_buf), 0);
-    enc.set_buffer(6, Some(&bsa_buf), 0);
-    enc.set_buffer(7, Some(&bsb_buf), 0);
-    enc.set_buffer(8, Some(&bsc_buf), 0);
+    enc.set_bytes(3, 4, &m as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(4, 4, &n as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(5, 4, &k as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(
+        6,
+        4,
+        &batch_stride_a as *const u32 as *const std::ffi::c_void,
+    );
+    enc.set_bytes(
+        7,
+        4,
+        &batch_stride_b as *const u32 as *const std::ffi::c_void,
+    );
+    enc.set_bytes(
+        8,
+        4,
+        &batch_stride_c as *const u32 as *const std::ffi::c_void,
+    );
 
     let grid = MTLSize::new(grid_x, grid_y, 1);
     let tg = MTLSize::new(BM * BN, 1, 1);

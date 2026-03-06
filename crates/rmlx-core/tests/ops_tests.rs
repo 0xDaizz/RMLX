@@ -1847,3 +1847,43 @@ fn test_random_normal_statistics() {
         "std {std} too far from {target_std}"
     );
 }
+
+#[test]
+fn test_layer_norm_pathological_precision() {
+    let Some((registry, queue)) = setup() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let dev = registry.device().raw();
+    // All values near 1e6 + small noise — stresses E[x^2] - E[x]^2
+    let axis_size = 128;
+    let rows = 2;
+    let mut data = vec![1_000_000.0f32; rows * axis_size];
+    for (i, v) in data.iter_mut().enumerate() {
+        *v += (i as f32) * 0.001;
+    }
+    let input = Array::from_slice(dev, &data, vec![rows, axis_size]);
+    let weight_data: Vec<f32> = vec![1.0; axis_size];
+    let bias_data: Vec<f32> = vec![0.0; axis_size];
+    let weight = Array::from_slice(dev, &weight_data, vec![axis_size]);
+    let bias = Array::from_slice(dev, &bias_data, vec![axis_size]);
+
+    let result =
+        ops::layer_norm::layer_norm(&registry, &input, Some(&weight), Some(&bias), 1e-5, &queue)
+            .expect("layer_norm failed");
+    let out: Vec<f32> = result.to_vec_checked();
+
+    // Just verify no NaN/Inf and values are reasonable
+    for v in &out {
+        assert!(v.is_finite(), "layer_norm produced non-finite value: {v}");
+    }
+    // Output should be roughly zero-mean for each row
+    for row in 0..rows {
+        let row_sum: f32 = out[row * axis_size..(row + 1) * axis_size].iter().sum();
+        let row_mean = row_sum / axis_size as f32;
+        assert!(
+            row_mean.abs() < 0.1,
+            "row {row} mean should be near 0, got {row_mean}"
+        );
+    }
+}
