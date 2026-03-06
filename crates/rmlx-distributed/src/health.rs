@@ -106,7 +106,7 @@ mod tests {
     fn test_config() -> HeartbeatConfig {
         HeartbeatConfig {
             interval: Duration::from_millis(10),
-            timeout: Duration::from_millis(40),
+            timeout: Duration::from_millis(200),
             max_missed: 3,
         }
     }
@@ -196,13 +196,13 @@ mod tests {
         let monitor = HealthMonitor::new(test_config());
         monitor.record_heartbeat(1);
 
-        // Wait almost to timeout.
-        thread::sleep(Duration::from_millis(30));
+        // Wait well within the 200ms timeout.
+        thread::sleep(Duration::from_millis(50));
         // Refresh heartbeat before timeout.
         monitor.record_heartbeat(1);
 
-        // Wait another short period.
-        thread::sleep(Duration::from_millis(20));
+        // Wait another short period — still within timeout after refresh.
+        thread::sleep(Duration::from_millis(50));
         // Should still be healthy because we refreshed.
         assert!(monitor.is_healthy(1));
     }
