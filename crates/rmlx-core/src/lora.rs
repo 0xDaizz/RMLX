@@ -467,3 +467,203 @@ impl LoraTrainer {
         Ok(loss)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_lora_config_default() {
+        let c = LoraConfig::default();
+        assert_eq!(c.rank, 8);
+        assert_eq!(c.alpha, 16.0);
+        assert_eq!(c.dropout, 0.0);
+        assert_eq!(c.target_modules, vec!["q_proj", "v_proj"]);
+    }
+
+    #[test]
+    fn test_lora_config_new_valid() {
+        let c = LoraConfig::new(4, 8.0).unwrap();
+        assert_eq!(c.rank, 4);
+        assert_eq!(c.alpha, 8.0);
+        assert_eq!(c.scaling(), 2.0); // 8.0 / 4
+    }
+
+    #[test]
+    fn test_lora_config_new_zero_rank_rejected() {
+        let result = LoraConfig::new(0, 16.0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_lora_config_scaling() {
+        let c = LoraConfig {
+            rank: 4,
+            alpha: 16.0,
+            dropout: 0.0,
+            target_modules: Vec::new(),
+        };
+        assert_eq!(c.scaling(), 4.0); // 16.0 / 4
+    }
+
+    #[test]
+    fn test_lora_layer_dimensions() {
+        let config = LoraConfig::new(4, 8.0).unwrap();
+        let layer = LoraLayer::new(128, 256, &config);
+        assert_eq!(layer.in_features, 128);
+        assert_eq!(layer.out_features, 256);
+        assert_eq!(layer.rank, 4);
+        assert_eq!(layer.lora_a.len(), 4 * 128); // rank * in_features
+        assert_eq!(layer.lora_b.len(), 256 * 4); // out_features * rank
+    }
+
+    #[test]
+    fn test_lora_layer_b_is_zero_initialized() {
+        let config = LoraConfig::new(2, 4.0).unwrap();
+        let layer = LoraLayer::new(8, 16, &config);
+        assert!(layer.lora_b.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn test_lora_layer_num_params() {
+        let config = LoraConfig::new(4, 8.0).unwrap();
+        let layer = LoraLayer::new(64, 128, &config);
+        // rank * in_features + out_features * rank = 4*64 + 128*4 = 256 + 512 = 768
+        assert_eq!(layer.num_params(), 768);
+    }
+
+    #[test]
+    fn test_lora_layer_with_weights_valid() {
+        let a = vec![1.0f32; 2 * 4]; // rank=2, in=4
+        let b = vec![0.0f32; 8 * 2]; // out=8, rank=2
+        let layer = LoraLayer::with_weights(4, 8, 2, 4.0, a, b).unwrap();
+        assert_eq!(layer.scaling, 2.0);
+        assert_eq!(layer.in_features, 4);
+        assert_eq!(layer.out_features, 8);
+    }
+
+    #[test]
+    fn test_lora_layer_with_weights_bad_a_size() {
+        let a = vec![1.0f32; 3]; // wrong size
+        let b = vec![0.0f32; 8 * 2];
+        let result = LoraLayer::with_weights(4, 8, 2, 4.0, a, b);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_lora_layer_with_weights_bad_b_size() {
+        let a = vec![1.0f32; 2 * 4];
+        let b = vec![0.0f32; 5]; // wrong size
+        let result = LoraLayer::with_weights(4, 8, 2, 4.0, a, b);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_lora_forward_zero_b_is_identity() {
+        // B is zero-initialized, so LoRA delta should be zero.
+        // output should equal base_output.
+        let config = LoraConfig::new(2, 4.0).unwrap();
+        let layer = LoraLayer::new(4, 4, &config);
+
+        let base = vec![1.0, 2.0, 3.0, 4.0]; // batch=1, out=4
+        let input = vec![0.5, 0.5, 0.5, 0.5]; // batch=1, in=4
+
+        let result = layer.forward(&base, &input, 1).unwrap();
+        assert_eq!(result, base);
+    }
+
+    #[test]
+    fn test_lora_forward_shape_mismatch_input() {
+        let config = LoraConfig::new(2, 4.0).unwrap();
+        let layer = LoraLayer::new(4, 4, &config);
+
+        let base = vec![1.0; 4];
+        let bad_input = vec![1.0; 3]; // wrong length
+        let result = layer.forward(&base, &bad_input, 1);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_lora_forward_shape_mismatch_base() {
+        let config = LoraConfig::new(2, 4.0).unwrap();
+        let layer = LoraLayer::new(4, 4, &config);
+
+        let bad_base = vec![1.0; 3]; // wrong length
+        let input = vec![1.0; 4];
+        let result = layer.forward(&bad_base, &input, 1);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_lora_model_add_and_get_adapter() {
+        let config = LoraConfig::new(4, 8.0).unwrap();
+        let mut model = LoraModel::new(config);
+        model.add_adapter("q_proj", 64, 64);
+        model.add_adapter("v_proj", 64, 64);
+
+        assert!(model.get_layer("q_proj").is_some());
+        assert!(model.get_layer("v_proj").is_some());
+        assert!(model.get_layer("k_proj").is_none());
+    }
+
+    #[test]
+    fn test_lora_model_total_params() {
+        let config = LoraConfig::new(4, 8.0).unwrap();
+        let mut model = LoraModel::new(config);
+        model.add_adapter("q_proj", 64, 128);
+        model.add_adapter("v_proj", 64, 128);
+
+        // Each: 4*64 + 128*4 = 256 + 512 = 768. Total: 1536.
+        assert_eq!(model.total_params(), 1536);
+    }
+
+    #[test]
+    fn test_lora_model_get_layer_mut() {
+        let config = LoraConfig::new(2, 4.0).unwrap();
+        let mut model = LoraModel::new(config);
+        model.add_adapter("test", 4, 4);
+
+        let layer = model.get_layer_mut("test").unwrap();
+        // Mutate B to non-zero.
+        layer.lora_b[0] = 1.0;
+        assert_eq!(model.get_layer("test").unwrap().lora_b[0], 1.0);
+    }
+
+    #[test]
+    fn test_train_config_default() {
+        let tc = TrainConfig::default();
+        assert_eq!(tc.learning_rate, 1e-4);
+        assert_eq!(tc.num_epochs, 1);
+        assert_eq!(tc.batch_size, 1);
+    }
+
+    #[test]
+    fn test_compute_loss_valid() {
+        // Simple case: 1 sample, 3 classes, target = class 0.
+        let logits = vec![2.0, 1.0, 0.0]; // batch=1, vocab=3
+        let targets = vec![0];
+        let loss = LoraTrainer::compute_loss(&logits, &targets, 3).unwrap();
+        // Loss should be positive (cross-entropy is always >= 0).
+        assert!(loss >= 0.0);
+        // For these logits, class 0 has highest logit -> loss should be small.
+        assert!(loss < 2.0);
+    }
+
+    #[test]
+    fn test_compute_loss_shape_mismatch() {
+        let logits = vec![1.0, 2.0]; // batch*vocab should be 3 not 2
+        let targets = vec![0];
+        let result = LoraTrainer::compute_loss(&logits, &targets, 3);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_compute_loss_grad_sums_to_zero() {
+        // For softmax-based CE, the gradient for each sample sums to ~0.
+        let logits = vec![1.0, 2.0, 3.0, 4.0]; // batch=1, vocab=4
+        let targets = vec![2];
+        let grad = LoraTrainer::compute_loss_grad(&logits, &targets, 4).unwrap();
+        let sum: f32 = grad.iter().sum();
+        assert!(sum.abs() < 1e-5);
+    }
+}

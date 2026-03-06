@@ -443,4 +443,101 @@ mod tests {
             assert!(slice.iter().all(|&b| b == 0xAB));
         }
     }
+
+    #[test]
+    fn test_gpu_device_name_not_empty() {
+        let gpu = match GpuDevice::system_default() {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("skipping test: no Metal device");
+                return;
+            }
+        };
+        assert!(!gpu.name().is_empty());
+    }
+
+    #[test]
+    fn test_gpu_device_has_unified_memory() {
+        let gpu = match GpuDevice::system_default() {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("skipping test: no Metal device");
+                return;
+            }
+        };
+        // Apple Silicon always has unified memory.
+        assert!(gpu.has_unified_memory());
+    }
+
+    #[test]
+    fn test_gpu_device_max_buffer_length_positive() {
+        let gpu = match GpuDevice::system_default() {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("skipping test: no Metal device");
+                return;
+            }
+        };
+        assert!(gpu.max_buffer_length() > 0);
+    }
+
+    #[test]
+    fn test_gpu_device_max_threadgroup_memory_positive() {
+        let gpu = match GpuDevice::system_default() {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("skipping test: no Metal device");
+                return;
+            }
+        };
+        assert!(gpu.max_threadgroup_memory() > 0);
+    }
+
+    #[test]
+    fn test_gpu_device_architecture_detection() {
+        let gpu = match GpuDevice::system_default() {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("skipping test: no Metal device");
+                return;
+            }
+        };
+        // On Apple Silicon, should detect an Apple architecture.
+        match gpu.architecture() {
+            Architecture::Apple { generation } => {
+                assert!(generation >= 15); // M1 or later
+            }
+            Architecture::Unknown => {
+                // Acceptable on non-Apple hardware.
+            }
+        }
+    }
+
+    #[test]
+    fn test_gpu_device_raw_returns_valid_device() {
+        let gpu = match GpuDevice::system_default() {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("skipping test: no Metal device");
+                return;
+            }
+        };
+        let raw = gpu.raw();
+        // Should be able to call methods on the raw device.
+        assert!(!raw.name().is_empty());
+    }
+
+    #[test]
+    fn test_detect_architecture_case_sensitivity() {
+        // Only exact substrings should match.
+        assert!(matches!(detect_architecture("m1"), Architecture::Unknown));
+        assert!(matches!(
+            detect_architecture("apple m2"),
+            Architecture::Unknown
+        ));
+        assert!(matches!(
+            detect_architecture("Apple M2 Ultra"),
+            Architecture::Apple { generation: 16 }
+        ));
+    }
 }

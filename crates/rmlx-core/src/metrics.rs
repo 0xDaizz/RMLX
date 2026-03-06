@@ -88,3 +88,106 @@ pub struct MetricsSnapshot {
     pub cache_hits: u64,
     pub cache_misses: u64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_new_metrics_zeroed() {
+        let m = RuntimeMetrics::new();
+        let s = m.snapshot();
+        assert_eq!(s.kernel_dispatches, 0);
+        assert_eq!(s.kernel_total_time_us, 0);
+        assert_eq!(s.buffer_allocs, 0);
+        assert_eq!(s.buffer_frees, 0);
+        assert_eq!(s.buffer_bytes_allocated, 0);
+        assert_eq!(s.cache_hits, 0);
+        assert_eq!(s.cache_misses, 0);
+    }
+
+    #[test]
+    fn test_default_is_zeroed() {
+        let m = RuntimeMetrics::default();
+        let s = m.snapshot();
+        assert_eq!(s.kernel_dispatches, 0);
+    }
+
+    #[test]
+    fn test_record_kernel_dispatch() {
+        let m = RuntimeMetrics::new();
+        m.record_kernel_dispatch(100);
+        m.record_kernel_dispatch(250);
+
+        let s = m.snapshot();
+        assert_eq!(s.kernel_dispatches, 2);
+        assert_eq!(s.kernel_total_time_us, 350);
+    }
+
+    #[test]
+    fn test_record_buffer_alloc() {
+        let m = RuntimeMetrics::new();
+        m.record_buffer_alloc(1024);
+        m.record_buffer_alloc(2048);
+
+        let s = m.snapshot();
+        assert_eq!(s.buffer_allocs, 2);
+        assert_eq!(s.buffer_bytes_allocated, 3072);
+    }
+
+    #[test]
+    fn test_record_buffer_free() {
+        let m = RuntimeMetrics::new();
+        m.record_buffer_alloc(4096);
+        m.record_buffer_free(1024);
+
+        let s = m.snapshot();
+        assert_eq!(s.buffer_allocs, 1);
+        assert_eq!(s.buffer_frees, 1);
+        assert_eq!(s.buffer_bytes_allocated, 3072);
+    }
+
+    #[test]
+    fn test_cache_hit_miss() {
+        let m = RuntimeMetrics::new();
+        m.record_cache_hit();
+        m.record_cache_hit();
+        m.record_cache_miss();
+        m.record_cache_hit();
+
+        let s = m.snapshot();
+        assert_eq!(s.cache_hits, 3);
+        assert_eq!(s.cache_misses, 1);
+    }
+
+    #[test]
+    fn test_snapshot_is_independent() {
+        let m = RuntimeMetrics::new();
+        m.record_kernel_dispatch(10);
+        let s1 = m.snapshot();
+
+        m.record_kernel_dispatch(20);
+        let s2 = m.snapshot();
+
+        // s1 should not be affected by later mutations.
+        assert_eq!(s1.kernel_dispatches, 1);
+        assert_eq!(s2.kernel_dispatches, 2);
+        assert_eq!(s1.kernel_total_time_us, 10);
+        assert_eq!(s2.kernel_total_time_us, 30);
+    }
+
+    #[test]
+    fn test_alloc_free_cycle() {
+        let m = RuntimeMetrics::new();
+        for i in 0..10 {
+            m.record_buffer_alloc((i + 1) * 100);
+        }
+        for i in 0..10 {
+            m.record_buffer_free((i + 1) * 100);
+        }
+        let s = m.snapshot();
+        assert_eq!(s.buffer_allocs, 10);
+        assert_eq!(s.buffer_frees, 10);
+        assert_eq!(s.buffer_bytes_allocated, 0);
+    }
+}
