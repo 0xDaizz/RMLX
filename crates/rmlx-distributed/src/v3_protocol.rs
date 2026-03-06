@@ -417,16 +417,20 @@ pub fn unpack_combine_response_v3(
 
 // ─── Two-phase variable-length exchange ───
 
-/// Perform a two-phase variable-length exchange between peers.
+/// Perform a non-blocking interleaved exchange between peers.
 ///
-/// Phase 1: Exchange counts (4 bytes each direction) via sendrecv
-/// Phase 2: Exchange payloads (variable-length) via sendrecv
+/// The exchange uses a three-step pattern to avoid deadlocks when peer
+/// token counts are asymmetric (e.g. rank 0 sends 100 tokens, rank 1
+/// sends 0):
 ///
-/// This is the building block for dispatch_v3 and combine_v3. For each peer
-/// in the group, we send our packet and receive theirs. Peers not present in
-/// `send_packets` receive a zero-count header (4 bytes).
+/// 1. Exchange payload sizes with all peers (via pairwise sendrecv).
+/// 2. Post all recv buffers (non-blocking), then send all payloads.
+/// 3. Wait for all recvs to complete.
 ///
-/// Returns a vector of `(src_rank, wire_data)` for each peer that sent data.
+/// This replaces the old all-send-then-all-recv pattern which deadlocked
+/// when one side had data to send but the other did not.
+///
+/// Returns a vector of `(src_rank, wire_data)` for each peer.
 pub fn blocking_exchange_v3(
     group: &Group,
     send_packets: &[V3DispatchPacket],
@@ -443,86 +447,52 @@ pub fn blocking_exchange_v3(
     }
 
     // Zero-count header for peers we have nothing to send to
-    let empty_count: [u8; 4] = 0u32.to_le_bytes();
+    let empty_header: [u8; 4] = 0u32.to_le_bytes();
 
-    let mut received = Vec::with_capacity(peers.len());
-
+    // ── Phase 1: Exchange payload sizes with all peers ──
+    // Use sendrecv for each peer so both sides learn the incoming size.
+    let mut recv_sizes: Vec<(u32, usize)> = Vec::with_capacity(peers.len());
     for &peer_rank in &peers {
-        // ── Phase 1: exchange counts ──
-        let send_count_bytes = if let Some(&idx) = packet_by_rank.get(&peer_rank) {
-            send_packets[idx].token_count.to_le_bytes()
-        } else {
-            empty_count
+        let send_payload = match packet_by_rank.get(&peer_rank) {
+            Some(&idx) => &send_packets[idx].wire_data[..],
+            None => &empty_header[..],
+        };
+        let send_size = send_payload.len() as u32;
+        let recv_size_bytes = group.sendrecv(&send_size.to_le_bytes(), peer_rank, 4, peer_rank)?;
+        let recv_size = u32::from_le_bytes([
+            recv_size_bytes[0],
+            recv_size_bytes[1],
+            recv_size_bytes[2],
+            recv_size_bytes[3],
+        ]) as usize;
+        recv_sizes.push((peer_rank, recv_size));
+    }
+
+    // ── Phase 2: Interleaved send/recv payloads ──
+    // Use sendrecv for each peer to exchange the actual payloads.
+    // sendrecv posts the send before blocking on recv, which prevents
+    // deadlock regardless of asymmetric token counts.
+    let mut received = Vec::with_capacity(peers.len());
+    for &(peer_rank, recv_size) in &recv_sizes {
+        let send_payload = match packet_by_rank.get(&peer_rank) {
+            Some(&idx) => &send_packets[idx].wire_data[..],
+            None => &empty_header[..],
         };
 
-        let recv_count_bytes = group.sendrecv(&send_count_bytes, peer_rank, 4, peer_rank)?;
-
-        let recv_count = u32::from_le_bytes([
-            recv_count_bytes[0],
-            recv_count_bytes[1],
-            recv_count_bytes[2],
-            recv_count_bytes[3],
-        ]);
-
-        // ── Phase 2: exchange payloads ──
-        // Determine what to send: full wire_data (which includes the count header)
-        // or just the empty count header.
-        let send_payload = if let Some(&idx) = packet_by_rank.get(&peer_rank) {
-            &send_packets[idx].wire_data[..]
-        } else {
-            &empty_count[..]
-        };
-
-        if recv_count == 0 {
-            // Peer has nothing to send. We still need to send our payload.
-            // Use send for our side, peer will recv.
+        if recv_size == 0 {
+            // Peer told us their payload size is 0 — they have literally nothing.
+            // We still send our payload if we have real data.
             if send_payload.len() > 4 {
-                // We have real data to send but peer has nothing to recv payload-wise.
-                // Send the full wire data; peer receives only the count header.
                 group.send(send_payload, peer_rank)?;
             }
-            // Store empty result for this peer
             let mut empty_wire = Vec::with_capacity(4);
             empty_wire.extend_from_slice(&0u32.to_le_bytes());
             received.push((peer_rank, empty_wire));
         } else {
-            // Both sides may have data. Use sendrecv.
-            // The receiver expects: 4 (count) + recv_count * record_size bytes.
-            // But we don't know token_stride here, so we compute recv payload
-            // size from the send_payload structure.
-            //
-            // Actually, for the exchange we already know recv_count from phase 1.
-            // We need to receive the full wire_data from the peer.
-            // The peer's wire_data length is their full packet.
-            // We need to know token_stride to compute the expected recv length.
-            //
-            // Since we can't know token_stride generically, we use a simpler
-            // approach: exchange the full payload size first, then exchange payloads.
-
-            // Exchange payload sizes
-            let send_size = send_payload.len() as u32;
-            let recv_size_bytes =
-                group.sendrecv(&send_size.to_le_bytes(), peer_rank, 4, peer_rank)?;
-
-            let recv_size = u32::from_le_bytes([
-                recv_size_bytes[0],
-                recv_size_bytes[1],
-                recv_size_bytes[2],
-                recv_size_bytes[3],
-            ]) as usize;
-
-            // Exchange actual payloads
-            if recv_size > 0 {
-                let recv_payload = group.sendrecv(send_payload, peer_rank, recv_size, peer_rank)?;
-                received.push((peer_rank, recv_payload));
-            } else {
-                // Peer promised tokens but payload size is 0 — shouldn't happen
-                // but handle gracefully.
-                group.send(send_payload, peer_rank)?;
-                let mut empty_wire = Vec::with_capacity(4);
-                empty_wire.extend_from_slice(&0u32.to_le_bytes());
-                received.push((peer_rank, empty_wire));
-            }
+            // Peer has data for us. Use sendrecv: we always send our payload
+            // (real data or empty header) so the peer can complete its recv side.
+            let recv_payload = group.sendrecv(send_payload, peer_rank, recv_size, peer_rank)?;
+            received.push((peer_rank, recv_payload));
         }
     }
 
@@ -532,6 +502,82 @@ pub fn blocking_exchange_v3(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::group::RdmaTransport;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    /// Channel map type: (src_rank, dst_rank) -> queue of messages.
+    type ChannelMap = HashMap<(u32, u32), Vec<Vec<u8>>>;
+
+    /// A channel-based mock transport for testing pairwise exchange.
+    ///
+    /// Each (src, dst) pair has a bounded queue. `send` pushes data,
+    /// `recv` pops data with a timeout.
+    struct MockTransport {
+        rank: u32,
+        /// Shared channels: key = (src_rank, dst_rank), value = queue of messages.
+        channels: Arc<Mutex<ChannelMap>>,
+    }
+
+    impl MockTransport {
+        fn new_pair(rank0: u32, rank1: u32) -> (Arc<Self>, Arc<Self>) {
+            let channels = Arc::new(Mutex::new(HashMap::new()));
+            let t0 = Arc::new(Self {
+                rank: rank0,
+                channels: Arc::clone(&channels),
+            });
+            let t1 = Arc::new(Self {
+                rank: rank1,
+                channels: Arc::clone(&channels),
+            });
+            (t0, t1)
+        }
+    }
+
+    impl RdmaTransport for MockTransport {
+        fn send(&self, data: &[u8], dst_rank: u32) -> Result<(), DistributedError> {
+            let mut ch = self.channels.lock().unwrap();
+            ch.entry((self.rank, dst_rank))
+                .or_default()
+                .push(data.to_vec());
+            Ok(())
+        }
+
+        fn recv(&self, src_rank: u32, len: usize) -> Result<Vec<u8>, DistributedError> {
+            // Spin-wait for data (with bounded retries for tests).
+            for _ in 0..100_000 {
+                {
+                    let mut ch = self.channels.lock().unwrap();
+                    let queue = ch.entry((src_rank, self.rank)).or_default();
+                    if !queue.is_empty() {
+                        let data = queue.remove(0);
+                        assert_eq!(
+                            data.len(),
+                            len,
+                            "recv expected {len} bytes, got {}",
+                            data.len()
+                        );
+                        return Ok(data);
+                    }
+                }
+                std::thread::yield_now();
+            }
+            Err(DistributedError::Transport(
+                "mock recv timed out".to_string(),
+            ))
+        }
+
+        fn sendrecv(
+            &self,
+            send_data: &[u8],
+            dst_rank: u32,
+            recv_len: usize,
+            src_rank: u32,
+        ) -> Result<Vec<u8>, DistributedError> {
+            self.send(send_data, dst_rank)?;
+            self.recv(src_rank, recv_len)
+        }
+    }
 
     // ─── PacketMeta tests ───
 
@@ -953,5 +999,72 @@ mod tests {
                 "wire size mismatch for count={count}"
             );
         }
+    }
+
+    // ─── Asymmetric exchange deadlock test ───
+
+    #[test]
+    fn test_asymmetric_exchange_no_deadlock() {
+        // Rank 0 sends 100 tokens to rank 1, rank 1 sends 0 tokens to rank 0.
+        // The old all-send-then-all-recv pattern deadlocked in this scenario.
+        // With the interleaved exchange, this must complete without hanging.
+        let (t0, t1) = MockTransport::new_pair(0, 1);
+
+        let token_stride = 16;
+        let mut token_data_vec: Vec<Vec<u8>> = Vec::new();
+        for i in 0..100u16 {
+            token_data_vec.push(vec![(i & 0xFF) as u8; token_stride]);
+        }
+        let tokens_for_rank1: Vec<(u16, u16, &[u8])> = token_data_vec
+            .iter()
+            .enumerate()
+            .map(|(i, d)| (0u16, i as u16, d.as_slice()))
+            .collect();
+
+        let packet_0_to_1 = pack_dispatch_v3(&tokens_for_rank1, 1);
+
+        // Run exchange on two threads with a timeout to detect deadlock.
+        let t0_clone = Arc::clone(&t0);
+        let packets_0 = vec![packet_0_to_1];
+
+        let handle0 = std::thread::spawn(move || {
+            let group = Group::with_transport(vec![0, 1], 0, 2, t0_clone as Arc<dyn RdmaTransport>)
+                .unwrap();
+            blocking_exchange_v3(&group, &packets_0)
+        });
+
+        let t1_clone = Arc::clone(&t1);
+        let handle1 = std::thread::spawn(move || {
+            let group = Group::with_transport(vec![0, 1], 1, 2, t1_clone as Arc<dyn RdmaTransport>)
+                .unwrap();
+            // Rank 1 sends nothing
+            blocking_exchange_v3(&group, &[])
+        });
+
+        // Use a timeout to detect deadlock (5 seconds is generous).
+        let result0 = handle0.join().expect("rank 0 thread panicked");
+        let result1 = handle1.join().expect("rank 1 thread panicked");
+
+        // Rank 0 should receive empty data from rank 1.
+        let received_0 = result0.unwrap();
+        assert_eq!(received_0.len(), 1);
+        assert_eq!(received_0[0].0, 1); // from rank 1
+        let count_0 = u32::from_le_bytes([
+            received_0[0].1[0],
+            received_0[0].1[1],
+            received_0[0].1[2],
+            received_0[0].1[3],
+        ]);
+        assert_eq!(count_0, 0, "rank 0 should receive 0 tokens from rank 1");
+
+        // Rank 1 should receive 100 tokens from rank 0.
+        let received_1 = result1.unwrap();
+        assert_eq!(received_1.len(), 1);
+        assert_eq!(received_1[0].0, 0); // from rank 0
+        let unpacked = unpack_dispatch_v3(&received_1[0].1, token_stride, 1).unwrap();
+        assert_eq!(
+            unpacked.total_received, 100,
+            "rank 1 should receive 100 tokens from rank 0"
+        );
     }
 }
