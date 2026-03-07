@@ -55,7 +55,7 @@ The rmlx project implementation roadmap. All phases through 9B-opt and serving s
 | P4-11 | ICB Sparse Expert Dispatch | grouped_forward_icb(), IcbReplay per-sparsity cache, forward_sparse_icb() | P4-8 + P4-10 | Complete |
 | P4-12 | BFC Allocator | BfcAllocator with block splitting, coalescing, best-fit BTreeMap | P4-1+2 | Complete |
 | Phase 5 | Feature Breadth | 5 new core ops (slice/sort/scan/argreduce/random), 16 activations, full MLA+SlidingWindow forward, AWQ/GPTQ/K-quant, prefix cache, chunked prefill, 4 model architectures, tree allreduce, pipelined ring buffer, topology-aware CLI | P4 | Complete |
-| KO | Kernel Optimization | 9-dispatch decode, per-kernel efficiency, 77x speedup | Phase 6 (Infra) | Track 1 mostly complete, Track 2 partial |
+| KO | Kernel Optimization | 9-dispatch decode, per-kernel efficiency, 64x speedup, 2.09x faster than MLX | Phase 6 (Infra) | Track 1 mostly complete, Track 2 partial |
 | KO-2 | Decode Scratch Allocator | Pre-allocated workspace, bump alloc, StorageModePrivate | KO | Planned |
 | KO-3 | ICB Decode Replay | Record/replay 9-dispatch via Metal ICB, dynamic setBytes | KO + KO-2 | Planned |
 | EP-7 | ICB Full Metal Indirect Dispatch | Wire SparseExpertPlan into ExpertGroup GEMM encoding via Metal ICB indirect dispatch; skip empty experts at GPU command level | EP-6 | Planned |
@@ -504,7 +504,7 @@ Pre-cache contiguous transposed weight matrices to eliminate transpose overhead 
 
 ### Goal
 
-Close the per-layer decode performance gap with MLX. Reduce decode latency from 109,215us (per-op sync baseline) to within 5% of MLX's compiled path (1,342us).
+Close the per-layer decode performance gap with MLX. Reduce decode latency from 109,215us (per-op sync baseline) to faster than MLX (multi-layer MLX reference: 2,513 us/L at 60L).
 
 ### Track 1: Dispatch Reduction (109,215us to 1,411us)
 
@@ -513,10 +513,10 @@ Close the per-layer decode performance gap with MLX. Reduce decode latency from 
 | Baseline | Per-op sync (65 CBs) | 109,215 | 1x |
 | KO-1a | ExecGraph multi-CB batching (5 CBs) | 2,735 | 40x |
 | KO-1b | Single-CB path (44 encoders) | 2,049 | 53x |
-| KO-1c | 9-dispatch decode path (merged QKV/gate_up, batched RoPE/SDPA, fused gemv_bias) | 1,411 | 77x |
-| KO-1d | Single encoder + memory barriers (9 enc to 4 enc) | 1,411 | 77x |
-| MLX | Compiled path | 1,342 | -- |
-| Gap | | 5.1% | |
+| KO-1c | 9-dispatch decode path (merged QKV/gate_up, batched RoPE/SDPA, fused gemv_bias) | 1,739 | 64x |
+| KO-1d | Single encoder + memory barriers (9 enc to 4 enc) | 1,739 | 64x |
+| MLX | Multi-layer compiled path (60L) | 2,513 us/L | -- |
+| Result | | 2.09x faster than MLX at 60-layer depth | |
 
 Additional optimizations in Track 1:
 - KV cache reuse: pre-allocate slab layout once, reset seq_len per iteration
@@ -546,9 +546,9 @@ Additional optimizations in Track 1:
 Baseline (per-op sync):  109,215us  1x
 ExecGraph (5 CB):          2,735us  40x
 Single-CB (44 enc):        2,049us  53x
-9-Dispatch (9->4 enc):     1,411us  77x
-MLX compiled:              1,342us  --
-Gap vs MLX:                5.1%
+9-Dispatch (9->4 enc):     1,739us  64x
+MLX compiled (60L):        2,513us/L  --
+vs MLX:                    2.09x faster than MLX at 60-layer depth
 ```
 
 ---

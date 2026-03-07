@@ -25,7 +25,7 @@ use metal::MTLSize;
 
 // Tiling parameters — must match the Metal shader constants.
 const BR: usize = 16; // Query block rows
-const _BC: usize = 16; // Key/Value block columns (used in shader only)
+const _BC: usize = 64; // Key/Value block columns (used in shader only)
 const THREADS_PER_TG: u64 = 128; // Threads per threadgroup
 const DECODE_THREADS: u64 = 256; // Threads for decode kernel
 
@@ -44,7 +44,7 @@ using namespace metal;
 
 // Tile sizes — keep in sync with Rust constants.
 constant constexpr uint Br = 16;   // Query block rows
-constant constexpr uint Bc = 16;   // Key/Value block columns
+constant constexpr uint Bc = 64;   // Key/Value block columns
 constant constexpr uint SIMD_SIZE = 32;
 
 // Function constants for specialization (set via MTLFunctionConstantValues)
@@ -87,11 +87,22 @@ inline float tg_reduce_sum(float val, uint tid, uint lane_id, uint sg_id,
     return buf[0];
 }
 
+// ─── MLX sdpa_vector constants ────────────────────────────────────────────
+//
+// BN_DECODE = number of simdgroups per threadgroup (8 for 256 threads)
+// BD_DECODE = SIMD width (always 32 on Apple Silicon)
+// All threads parallel across D: each thread handles D/BD elements.
+constant constexpr uint BN_DECODE = 8;
+constant constexpr uint BD_DECODE = 32;
+
 // ─── sdpa_decode_f32 ──────────────────────────────────────────────────────
 //
-// Optimised single-query path (N == 1). No Q tile or score tile needed in
-// shared memory — Q is loaded once into registers, and we iterate over K/V
-// blocks with online softmax.
+// MLX sdpa_vector pattern: parallelize across head dimension D, not keys.
+// All 256 threads (8 simdgroups x 32 lanes) stay active throughout.
+//
+// Each thread owns D/32 elements of Q, K, V, and O in registers.
+// Each simdgroup processes keys at stride BN_DECODE.
+// Cross-simdgroup reduction via transposed shared memory + simd_sum.
 //
 // Buffers:
 //   0: Q      [1, D]     — single query vector
@@ -113,114 +124,109 @@ kernel void sdpa_decode_f32(
     device const float* mask      [[buffer(4)]],
     constant     uint*  params    [[buffer(5)]],
     constant     float& scale     [[buffer(6)]],
-    uint  tid       [[thread_position_in_threadgroup]],
-    uint  lane_id   [[thread_index_in_simdgroup]],
-    uint  sg_id     [[simdgroup_index_in_threadgroup]])
+    uint  simd_lid  [[thread_index_in_simdgroup]],
+    uint  simd_gid  [[simdgroup_index_in_threadgroup]])
 {
     const uint S        = params[1];
     const uint D        = FC_HAS_HEAD_DIM ? FC_HEAD_DIM : params[2];
     const uint has_mask = params[3];
-    // is_causal not needed for N=1: the single query attends to all keys
 
-    const uint n_threads = 256;
+    const uint elems_per_thread = D / BD_DECODE;
 
-    // Shared memory for reductions and O accumulator
-    threadgroup float reduce_buf[SIMD_SIZE];
-    threadgroup float O_shared[256];  // D <= 256
+    // Load Q into registers (each thread owns its D-slice, pre-scaled)
+    float q_reg[8];  // max D=256 -> 256/32 = 8
+    for (uint i = 0; i < elems_per_thread; i++) {
+        q_reg[i] = Q[simd_lid * elems_per_thread + i] * scale;
+    }
 
-    // Initialise output accumulator in shared memory
-    for (uint d = tid; d < D; d += n_threads) {
-        O_shared[d] = 0.0f;
+    // Output accumulator in registers
+    float o_reg[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+
+    // Per-simdgroup online softmax state
+    float max_score = -INFINITY;
+    float sum_exp_score = 0.0f;
+
+    // Each simdgroup handles keys at stride BN_DECODE
+    for (uint i = simd_gid; i < S; i += BN_DECODE) {
+        // Load K[i] slice into registers
+        float k_reg[8];
+        for (uint j = 0; j < elems_per_thread; j++) {
+            k_reg[j] = K[i * D + simd_lid * elems_per_thread + j];
+        }
+
+        // Q·K dot product: partial per thread, then simd_sum across lanes
+        float score = 0.0f;
+        for (uint j = 0; j < elems_per_thread; j++) {
+            score += q_reg[j] * k_reg[j];
+        }
+        score = simd_sum(score);
+
+        // Apply mask
+        if (has_mask) {
+            score += mask[i];
+        }
+
+        // Online softmax update
+        float new_max = max(max_score, score);
+        float factor = fast::exp(max_score - new_max);
+        float exp_score = fast::exp(score - new_max);
+
+        max_score = new_max;
+        sum_exp_score = sum_exp_score * factor + exp_score;
+
+        // Accumulate V[i] weighted by exp_score, with correction
+        for (uint j = 0; j < elems_per_thread; j++) {
+            o_reg[j] = o_reg[j] * factor + exp_score * V[i * D + simd_lid * elems_per_thread + j];
+        }
+    }
+
+    // Cross-simdgroup reduction (MLX pattern)
+    threadgroup float tg_max[BN_DECODE];
+    threadgroup float tg_sum[BN_DECODE];
+    threadgroup float tg_out[BN_DECODE * BD_DECODE];
+
+    if (simd_lid == 0) {
+        tg_max[simd_gid] = max_score;
+        tg_sum[simd_gid] = sum_exp_score;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float m_running = -INFINITY;
-    float l_running = 0.0f;
+    // Compute global max using SIMD reduction
+    float loaded_max = (simd_lid < BN_DECODE) ? tg_max[simd_lid] : -INFINITY;
+    float g_max = simd_max(loaded_max);
 
-    // Process K/V in blocks of Bc
-    const uint n_kv_blocks = (S + Bc - 1) / Bc;
+    // Per-simdgroup correction factor (each lane holds factor for one simdgroup)
+    float factor = fast::exp(max_score - g_max);
 
-    for (uint kb = 0; kb < n_kv_blocks; kb++) {
-        const uint kv_start = kb * Bc;
-        const uint kv_end   = min(kv_start + Bc, S);
-        const uint kv_count = kv_end - kv_start;
+    // Compute global sum
+    float loaded_sum = (simd_lid < BN_DECODE)
+        ? tg_sum[simd_lid] * fast::exp(tg_max[simd_lid] - g_max)
+        : 0.0f;
+    float g_sum = simd_sum(loaded_sum);
 
-        // Each thread computes a subset of the Bc dot products
-        // Thread tid handles key index (tid) if tid < kv_count
-        // With 256 threads and Bc=32, we have plenty of threads per key.
-        // Strategy: each thread computes one score by looping over D.
-        // Only threads with tid < kv_count compute a valid score.
-
-        float score = -INFINITY;
-        if (tid < kv_count) {
-            float dot = 0.0f;
-            for (uint d = 0; d < D; d++) {
-                dot += Q[d] * K[(kv_start + tid) * D + d];
-            }
-            dot *= scale;
-            if (has_mask) {
-                dot += mask[kv_start + tid];
-            }
-            score = dot;
-        }
-
-        // Find block max across all threads
-        float block_max = tg_reduce_max(score, tid, lane_id, sg_id,
-                                        n_threads, reduce_buf);
-
-        // Online softmax update
-        float m_new = max(m_running, block_max);
-        float correction = fast::exp(m_running - m_new);
-
-        // Compute exp(score - m_new) for this thread's key
-        float exp_score = (tid < kv_count) ? fast::exp(score - m_new) : 0.0f;
-
-        // Sum exp scores across threads
-        float block_sum = tg_reduce_sum(exp_score, tid, lane_id, sg_id,
-                                        n_threads, reduce_buf);
-
-        float l_new = l_running * correction + block_sum;
-
-        // Update O: rescale old accumulator and add new contribution
-        // Each thread handles a subset of D dimensions
-        // We need each thread's exp_score, but we also need to sum over keys.
-        // With Bc=32 and n_threads=256, threads 0..31 have valid exp_scores.
-        // We need to broadcast V[j,:] * exp_score[j] across D.
-
-        // Store exp_scores in shared memory for broadcasting
-        threadgroup float exp_scores_shared[Bc];
-        if (tid < Bc) {
-            exp_scores_shared[tid] = (tid < kv_count) ? exp_score : 0.0f;
-        }
-        // Need scores from threads 0..Bc-1 — they are already computed above.
-        // But only threads tid < kv_count have valid scores. With Bc=32 and
-        // n_threads=256, threads 0..31 hold the scores for this block.
+    // Aggregate outputs across simdgroups via transpose + simd_sum
+    for (uint j = 0; j < elems_per_thread; j++) {
+        tg_out[simd_lid * BN_DECODE + simd_gid] = o_reg[j];
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Now update O_shared: each thread handles a stripe of D
-        for (uint d = tid; d < D; d += n_threads) {
-            float o_val = O_shared[d] * correction;
-            float v_sum = 0.0f;
-            for (uint j = 0; j < kv_count; j++) {
-                v_sum += exp_scores_shared[j] * V[(kv_start + j) * D + d];
-            }
-            O_shared[d] = o_val + v_sum;
-        }
+        float val = (simd_lid < BN_DECODE)
+            ? tg_out[simd_gid * BN_DECODE + simd_lid] * fast::exp(tg_max[simd_lid] - g_max)
+            : 0.0f;
+        o_reg[j] = simd_sum(val);
+        o_reg[j] = (g_sum > 0.0f) ? (o_reg[j] / g_sum) : 0.0f;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        m_running = m_new;
-        l_running = l_new;
     }
 
-    // Final normalisation
-    float inv_l = (l_running > 0.0f) ? (1.0f / l_running) : 0.0f;
-    for (uint d = tid; d < D; d += n_threads) {
-        O[d] = O_shared[d] * inv_l;
+    // Write output — only lane 0 of each simdgroup writes its chunk
+    if (simd_lid == 0) {
+        for (uint j = 0; j < elems_per_thread; j++) {
+            O[simd_gid * elems_per_thread + j] = o_reg[j];
+        }
     }
 }
 
 // ─── sdpa_decode_f16 ──────────────────────────────────────────────────────
-// Same as decode_f32 but reads/writes half, accumulates in float.
+// MLX sdpa_vector pattern for f16. Reads/writes half, accumulates in float.
 
 kernel void sdpa_decode_f16(
     device const half*  Q         [[buffer(0)]],
@@ -230,79 +236,86 @@ kernel void sdpa_decode_f16(
     device const half*  mask      [[buffer(4)]],
     constant     uint*  params    [[buffer(5)]],
     constant     float& scale     [[buffer(6)]],
-    uint  tid       [[thread_position_in_threadgroup]],
-    uint  lane_id   [[thread_index_in_simdgroup]],
-    uint  sg_id     [[simdgroup_index_in_threadgroup]])
+    uint  simd_lid  [[thread_index_in_simdgroup]],
+    uint  simd_gid  [[simdgroup_index_in_threadgroup]])
 {
     const uint S        = params[1];
     const uint D        = FC_HAS_HEAD_DIM ? FC_HEAD_DIM : params[2];
     const uint has_mask = params[3];
 
-    const uint n_threads = 256;
+    const uint elems_per_thread = D / BD_DECODE;
 
-    threadgroup float reduce_buf[SIMD_SIZE];
-    threadgroup float O_shared[256];
+    float q_reg[8];
+    for (uint i = 0; i < elems_per_thread; i++) {
+        q_reg[i] = float(Q[simd_lid * elems_per_thread + i]) * scale;
+    }
 
-    for (uint d = tid; d < D; d += n_threads) {
-        O_shared[d] = 0.0f;
+    float o_reg[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    float max_score = -INFINITY;
+    float sum_exp_score = 0.0f;
+
+    for (uint i = simd_gid; i < S; i += BN_DECODE) {
+        float k_reg[8];
+        for (uint j = 0; j < elems_per_thread; j++) {
+            k_reg[j] = float(K[i * D + simd_lid * elems_per_thread + j]);
+        }
+
+        float score = 0.0f;
+        for (uint j = 0; j < elems_per_thread; j++) {
+            score += q_reg[j] * k_reg[j];
+        }
+        score = simd_sum(score);
+
+        if (has_mask) {
+            score += float(mask[i]);
+        }
+
+        float new_max = max(max_score, score);
+        float factor = fast::exp(max_score - new_max);
+        float exp_score = fast::exp(score - new_max);
+
+        max_score = new_max;
+        sum_exp_score = sum_exp_score * factor + exp_score;
+
+        for (uint j = 0; j < elems_per_thread; j++) {
+            o_reg[j] = o_reg[j] * factor + exp_score * float(V[i * D + simd_lid * elems_per_thread + j]);
+        }
+    }
+
+    threadgroup float tg_max[BN_DECODE];
+    threadgroup float tg_sum[BN_DECODE];
+    threadgroup float tg_out[BN_DECODE * BD_DECODE];
+
+    if (simd_lid == 0) {
+        tg_max[simd_gid] = max_score;
+        tg_sum[simd_gid] = sum_exp_score;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float m_running = -INFINITY;
-    float l_running = 0.0f;
+    float loaded_max = (simd_lid < BN_DECODE) ? tg_max[simd_lid] : -INFINITY;
+    float g_max = simd_max(loaded_max);
+    float factor = fast::exp(max_score - g_max);
+    float loaded_sum = (simd_lid < BN_DECODE)
+        ? tg_sum[simd_lid] * fast::exp(tg_max[simd_lid] - g_max)
+        : 0.0f;
+    float g_sum = simd_sum(loaded_sum);
 
-    const uint n_kv_blocks = (S + Bc - 1) / Bc;
-
-    for (uint kb = 0; kb < n_kv_blocks; kb++) {
-        const uint kv_start = kb * Bc;
-        const uint kv_end   = min(kv_start + Bc, S);
-        const uint kv_count = kv_end - kv_start;
-
-        float score = -INFINITY;
-        if (tid < kv_count) {
-            float dot = 0.0f;
-            for (uint d = 0; d < D; d++) {
-                dot += float(Q[d]) * float(K[(kv_start + tid) * D + d]);
-            }
-            dot *= scale;
-            if (has_mask) {
-                dot += float(mask[kv_start + tid]);
-            }
-            score = dot;
-        }
-
-        float block_max = tg_reduce_max(score, tid, lane_id, sg_id,
-                                        n_threads, reduce_buf);
-        float m_new = max(m_running, block_max);
-        float correction = fast::exp(m_running - m_new);
-        float exp_score = (tid < kv_count) ? fast::exp(score - m_new) : 0.0f;
-        float block_sum = tg_reduce_sum(exp_score, tid, lane_id, sg_id,
-                                        n_threads, reduce_buf);
-        float l_new = l_running * correction + block_sum;
-
-        threadgroup float exp_scores_shared[Bc];
-        if (tid < Bc) {
-            exp_scores_shared[tid] = (tid < kv_count) ? exp_score : 0.0f;
-        }
+    for (uint j = 0; j < elems_per_thread; j++) {
+        tg_out[simd_lid * BN_DECODE + simd_gid] = o_reg[j];
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (uint d = tid; d < D; d += n_threads) {
-            float o_val = O_shared[d] * correction;
-            float v_sum = 0.0f;
-            for (uint j = 0; j < kv_count; j++) {
-                v_sum += exp_scores_shared[j] * float(V[(kv_start + j) * D + d]);
-            }
-            O_shared[d] = o_val + v_sum;
-        }
+        float val = (simd_lid < BN_DECODE)
+            ? tg_out[simd_gid * BN_DECODE + simd_lid] * fast::exp(tg_max[simd_lid] - g_max)
+            : 0.0f;
+        o_reg[j] = simd_sum(val);
+        o_reg[j] = (g_sum > 0.0f) ? (o_reg[j] / g_sum) : 0.0f;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        m_running = m_new;
-        l_running = l_new;
     }
 
-    float inv_l = (l_running > 0.0f) ? (1.0f / l_running) : 0.0f;
-    for (uint d = tid; d < D; d += n_threads) {
-        O[d] = half(O_shared[d] * inv_l);
+    if (simd_lid == 0) {
+        for (uint j = 0; j < elems_per_thread; j++) {
+            O[simd_gid * elems_per_thread + j] = half(o_reg[j]);
+        }
     }
 }
 
@@ -753,9 +766,9 @@ kernel void sdpa_f16(
 
 // ─── sdpa_decode_batched_f32 ──────────────────────────────────────────────
 //
-// Batched multi-head decode: processes ALL attention heads in a single
-// GPU dispatch.  Grid.x = num_heads, one threadgroup per head.
-// Supports GQA (grouped query attention).
+// MLX sdpa_vector pattern — batched multi-head decode.
+// Grid.x = num_heads, one threadgroup per head.
+// All 256 threads parallel across D for full GPU utilization.
 //
 // Buffers:
 //   0: Q      [num_heads * D]              — flat query slab
@@ -764,7 +777,6 @@ kernel void sdpa_f16(
 //   3: O      [num_heads * D]              — flat output slab
 //   4: mask   [S]                          — additive mask (shared, or dummy)
 //   5: params [6 x uint32]: { num_heads, num_kv_heads, S, D, has_mask, stride_S }
-//      stride_S: inter-head stride in KV slab (0 = same as S, >0 = max_seq_len for pre-allocated caches)
 //   6: scale  [float]
 //
 // Grid: (num_heads, 1, 1)
@@ -778,9 +790,8 @@ kernel void sdpa_decode_batched_f32(
     device const float* mask      [[buffer(4)]],
     constant     uint*  params    [[buffer(5)]],
     constant     float& scale     [[buffer(6)]],
-    uint  tid       [[thread_position_in_threadgroup]],
-    uint  lane_id   [[thread_index_in_simdgroup]],
-    uint  sg_id     [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid  [[thread_index_in_simdgroup]],
+    uint  simd_gid  [[simdgroup_index_in_threadgroup]],
     uint  tg_pos    [[threadgroup_position_in_grid]])
 {
     const uint head_id      = tg_pos;
@@ -793,85 +804,93 @@ kernel void sdpa_decode_batched_f32(
 
     if (head_id >= num_heads) return;
 
-    // GQA: map Q head to KV head
     const uint kv_head = head_id * num_kv_heads / num_heads;
 
-    // Per-head pointers — use stride_S for inter-head offset (slab layout)
     device const float* q = Q + head_id * D;
     device const float* k = K + kv_head * stride_S * D;
     device const float* v = V + kv_head * stride_S * D;
-    device       float* o = O + head_id * D;
 
-    const uint n_threads = 256;
+    const uint elems_per_thread = D / BD_DECODE;
 
-    threadgroup float reduce_buf[SIMD_SIZE];
-    threadgroup float O_shared[256];  // D <= 256
+    // Load Q into registers (pre-scaled)
+    float q_reg[8];
+    for (uint i = 0; i < elems_per_thread; i++) {
+        q_reg[i] = q[simd_lid * elems_per_thread + i] * scale;
+    }
 
-    for (uint d = tid; d < D; d += n_threads) {
-        O_shared[d] = 0.0f;
+    float o_reg[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    float max_score = -INFINITY;
+    float sum_exp_score = 0.0f;
+
+    for (uint i = simd_gid; i < S; i += BN_DECODE) {
+        float k_reg[8];
+        for (uint j = 0; j < elems_per_thread; j++) {
+            k_reg[j] = k[i * D + simd_lid * elems_per_thread + j];
+        }
+
+        float score = 0.0f;
+        for (uint j = 0; j < elems_per_thread; j++) {
+            score += q_reg[j] * k_reg[j];
+        }
+        score = simd_sum(score);
+
+        if (has_mask) {
+            score += mask[i];
+        }
+
+        float new_max = max(max_score, score);
+        float factor = fast::exp(max_score - new_max);
+        float exp_score = fast::exp(score - new_max);
+
+        max_score = new_max;
+        sum_exp_score = sum_exp_score * factor + exp_score;
+
+        for (uint j = 0; j < elems_per_thread; j++) {
+            o_reg[j] = o_reg[j] * factor + exp_score * v[i * D + simd_lid * elems_per_thread + j];
+        }
+    }
+
+    // Cross-simdgroup reduction
+    threadgroup float tg_max[BN_DECODE];
+    threadgroup float tg_sum[BN_DECODE];
+    threadgroup float tg_out[BN_DECODE * BD_DECODE];
+
+    if (simd_lid == 0) {
+        tg_max[simd_gid] = max_score;
+        tg_sum[simd_gid] = sum_exp_score;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float m_running = -INFINITY;
-    float l_running = 0.0f;
+    float loaded_max = (simd_lid < BN_DECODE) ? tg_max[simd_lid] : -INFINITY;
+    float g_max = simd_max(loaded_max);
+    float factor = fast::exp(max_score - g_max);
+    float loaded_sum = (simd_lid < BN_DECODE)
+        ? tg_sum[simd_lid] * fast::exp(tg_max[simd_lid] - g_max)
+        : 0.0f;
+    float g_sum = simd_sum(loaded_sum);
 
-    const uint n_kv_blocks = (S + Bc - 1) / Bc;
-
-    for (uint kb = 0; kb < n_kv_blocks; kb++) {
-        const uint kv_start = kb * Bc;
-        const uint kv_end   = min(kv_start + Bc, S);
-        const uint kv_count = kv_end - kv_start;
-
-        float score = -INFINITY;
-        if (tid < kv_count) {
-            float dot = 0.0f;
-            for (uint d = 0; d < D; d++) {
-                dot += q[d] * k[(kv_start + tid) * D + d];
-            }
-            dot *= scale;
-            if (has_mask) {
-                dot += mask[kv_start + tid];
-            }
-            score = dot;
-        }
-
-        float block_max = tg_reduce_max(score, tid, lane_id, sg_id,
-                                        n_threads, reduce_buf);
-        float m_new = max(m_running, block_max);
-        float correction = fast::exp(m_running - m_new);
-        float exp_score = (tid < kv_count) ? fast::exp(score - m_new) : 0.0f;
-        float block_sum = tg_reduce_sum(exp_score, tid, lane_id, sg_id,
-                                        n_threads, reduce_buf);
-        float l_new = l_running * correction + block_sum;
-
-        threadgroup float exp_scores_shared[Bc];
-        if (tid < Bc) {
-            exp_scores_shared[tid] = (tid < kv_count) ? exp_score : 0.0f;
-        }
+    for (uint j = 0; j < elems_per_thread; j++) {
+        tg_out[simd_lid * BN_DECODE + simd_gid] = o_reg[j];
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (uint d = tid; d < D; d += n_threads) {
-            float o_val = O_shared[d] * correction;
-            float v_sum = 0.0f;
-            for (uint j = 0; j < kv_count; j++) {
-                v_sum += exp_scores_shared[j] * v[(kv_start + j) * D + d];
-            }
-            O_shared[d] = o_val + v_sum;
-        }
+        float val = (simd_lid < BN_DECODE)
+            ? tg_out[simd_gid * BN_DECODE + simd_lid] * fast::exp(tg_max[simd_lid] - g_max)
+            : 0.0f;
+        o_reg[j] = simd_sum(val);
+        o_reg[j] = (g_sum > 0.0f) ? (o_reg[j] / g_sum) : 0.0f;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        m_running = m_new;
-        l_running = l_new;
     }
 
-    float inv_l = (l_running > 0.0f) ? (1.0f / l_running) : 0.0f;
-    for (uint d = tid; d < D; d += n_threads) {
-        o[d] = O_shared[d] * inv_l;
+    if (simd_lid == 0) {
+        device float* o = O + head_id * D;
+        for (uint j = 0; j < elems_per_thread; j++) {
+            o[simd_gid * elems_per_thread + j] = o_reg[j];
+        }
     }
 }
 
 // ─── sdpa_decode_batched_f16 ──────────────────────────────────────────────
-// Same as batched_f32 but reads/writes half, accumulates in float.
+// MLX sdpa_vector pattern for batched f16 decode.
 
 kernel void sdpa_decode_batched_f16(
     device const half*  Q         [[buffer(0)]],
@@ -881,9 +900,8 @@ kernel void sdpa_decode_batched_f16(
     device const half*  mask      [[buffer(4)]],
     constant     uint*  params    [[buffer(5)]],
     constant     float& scale     [[buffer(6)]],
-    uint  tid       [[thread_position_in_threadgroup]],
-    uint  lane_id   [[thread_index_in_simdgroup]],
-    uint  sg_id     [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid  [[thread_index_in_simdgroup]],
+    uint  simd_gid  [[simdgroup_index_in_threadgroup]],
     uint  tg_pos    [[threadgroup_position_in_grid]])
 {
     const uint head_id      = tg_pos;
@@ -901,73 +919,81 @@ kernel void sdpa_decode_batched_f16(
     device const half* q = Q + head_id * D;
     device const half* k = K + kv_head * stride_S * D;
     device const half* v = V + kv_head * stride_S * D;
-    device       half* o = O + head_id * D;
 
-    const uint n_threads = 256;
+    const uint elems_per_thread = D / BD_DECODE;
 
-    threadgroup float reduce_buf[SIMD_SIZE];
-    threadgroup float O_shared[256];
+    float q_reg[8];
+    for (uint i = 0; i < elems_per_thread; i++) {
+        q_reg[i] = float(q[simd_lid * elems_per_thread + i]) * scale;
+    }
 
-    for (uint d = tid; d < D; d += n_threads) {
-        O_shared[d] = 0.0f;
+    float o_reg[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    float max_score = -INFINITY;
+    float sum_exp_score = 0.0f;
+
+    for (uint i = simd_gid; i < S; i += BN_DECODE) {
+        float k_reg[8];
+        for (uint j = 0; j < elems_per_thread; j++) {
+            k_reg[j] = float(k[i * D + simd_lid * elems_per_thread + j]);
+        }
+
+        float score = 0.0f;
+        for (uint j = 0; j < elems_per_thread; j++) {
+            score += q_reg[j] * k_reg[j];
+        }
+        score = simd_sum(score);
+
+        if (has_mask) {
+            score += float(mask[i]);
+        }
+
+        float new_max = max(max_score, score);
+        float factor = fast::exp(max_score - new_max);
+        float exp_score = fast::exp(score - new_max);
+
+        max_score = new_max;
+        sum_exp_score = sum_exp_score * factor + exp_score;
+
+        for (uint j = 0; j < elems_per_thread; j++) {
+            o_reg[j] = o_reg[j] * factor + exp_score * float(v[i * D + simd_lid * elems_per_thread + j]);
+        }
+    }
+
+    threadgroup float tg_max[BN_DECODE];
+    threadgroup float tg_sum[BN_DECODE];
+    threadgroup float tg_out[BN_DECODE * BD_DECODE];
+
+    if (simd_lid == 0) {
+        tg_max[simd_gid] = max_score;
+        tg_sum[simd_gid] = sum_exp_score;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float m_running = -INFINITY;
-    float l_running = 0.0f;
+    float loaded_max = (simd_lid < BN_DECODE) ? tg_max[simd_lid] : -INFINITY;
+    float g_max = simd_max(loaded_max);
+    float factor = fast::exp(max_score - g_max);
+    float loaded_sum = (simd_lid < BN_DECODE)
+        ? tg_sum[simd_lid] * fast::exp(tg_max[simd_lid] - g_max)
+        : 0.0f;
+    float g_sum = simd_sum(loaded_sum);
 
-    const uint n_kv_blocks = (S + Bc - 1) / Bc;
-
-    for (uint kb = 0; kb < n_kv_blocks; kb++) {
-        const uint kv_start = kb * Bc;
-        const uint kv_end   = min(kv_start + Bc, S);
-        const uint kv_count = kv_end - kv_start;
-
-        float score = -INFINITY;
-        if (tid < kv_count) {
-            float dot = 0.0f;
-            for (uint d = 0; d < D; d++) {
-                dot += float(q[d]) * float(k[(kv_start + tid) * D + d]);
-            }
-            dot *= scale;
-            if (has_mask) {
-                dot += float(mask[kv_start + tid]);
-            }
-            score = dot;
-        }
-
-        float block_max = tg_reduce_max(score, tid, lane_id, sg_id,
-                                        n_threads, reduce_buf);
-        float m_new = max(m_running, block_max);
-        float correction = fast::exp(m_running - m_new);
-        float exp_score = (tid < kv_count) ? fast::exp(score - m_new) : 0.0f;
-        float block_sum = tg_reduce_sum(exp_score, tid, lane_id, sg_id,
-                                        n_threads, reduce_buf);
-        float l_new = l_running * correction + block_sum;
-
-        threadgroup float exp_scores_shared[Bc];
-        if (tid < Bc) {
-            exp_scores_shared[tid] = (tid < kv_count) ? exp_score : 0.0f;
-        }
+    for (uint j = 0; j < elems_per_thread; j++) {
+        tg_out[simd_lid * BN_DECODE + simd_gid] = o_reg[j];
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (uint d = tid; d < D; d += n_threads) {
-            float o_val = O_shared[d] * correction;
-            float v_sum = 0.0f;
-            for (uint j = 0; j < kv_count; j++) {
-                v_sum += exp_scores_shared[j] * float(v[(kv_start + j) * D + d]);
-            }
-            O_shared[d] = o_val + v_sum;
-        }
+        float val = (simd_lid < BN_DECODE)
+            ? tg_out[simd_gid * BN_DECODE + simd_lid] * fast::exp(tg_max[simd_lid] - g_max)
+            : 0.0f;
+        o_reg[j] = simd_sum(val);
+        o_reg[j] = (g_sum > 0.0f) ? (o_reg[j] / g_sum) : 0.0f;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        m_running = m_new;
-        l_running = l_new;
     }
 
-    float inv_l = (l_running > 0.0f) ? (1.0f / l_running) : 0.0f;
-    for (uint d = tid; d < D; d += n_threads) {
-        o[d] = half(O_shared[d] * inv_l);
+    if (simd_lid == 0) {
+        device half* o = O + head_id * D;
+        for (uint j = 0; j < elems_per_thread; j++) {
+            o[simd_gid * elems_per_thread + j] = half(o_reg[j]);
+        }
     }
 }
 "#;
@@ -983,7 +1009,7 @@ pub const SDPA_BF16_SHADER_SOURCE: &str = r#"
 using namespace metal;
 
 constant constexpr uint Br = 16;
-constant constexpr uint Bc = 16;
+constant constexpr uint Bc = 64;
 constant constexpr uint SIMD_SIZE = 32;
 
 // Function constants for specialization (set via MTLFunctionConstantValues)
@@ -1020,7 +1046,12 @@ inline float tg_reduce_sum_bf16(float val, uint tid, uint lane_id, uint sg_id,
     return buf[0];
 }
 
+// ─── MLX sdpa_vector constants for bf16 shader ────────────────────────────
+constant constexpr uint BN_DECODE = 8;
+constant constexpr uint BD_DECODE = 32;
+
 // ─── sdpa_decode_bf16 ─────────────────────────────────────────────────────
+// MLX sdpa_vector pattern for bf16. Reads/writes bfloat, accumulates in float.
 
 kernel void sdpa_decode_bf16(
     device const bfloat* Q         [[buffer(0)]],
@@ -1030,79 +1061,86 @@ kernel void sdpa_decode_bf16(
     device const bfloat* mask      [[buffer(4)]],
     constant     uint*   params    [[buffer(5)]],
     constant     float&  scale     [[buffer(6)]],
-    uint  tid       [[thread_position_in_threadgroup]],
-    uint  lane_id   [[thread_index_in_simdgroup]],
-    uint  sg_id     [[simdgroup_index_in_threadgroup]])
+    uint  simd_lid  [[thread_index_in_simdgroup]],
+    uint  simd_gid  [[simdgroup_index_in_threadgroup]])
 {
     const uint S        = params[1];
     const uint D        = FC_HAS_HEAD_DIM ? FC_HEAD_DIM : params[2];
     const uint has_mask = params[3];
 
-    const uint n_threads = 256;
+    const uint elems_per_thread = D / BD_DECODE;
 
-    threadgroup float reduce_buf[SIMD_SIZE];
-    threadgroup float O_shared[256];
+    float q_reg[8];
+    for (uint i = 0; i < elems_per_thread; i++) {
+        q_reg[i] = float(Q[simd_lid * elems_per_thread + i]) * scale;
+    }
 
-    for (uint d = tid; d < D; d += n_threads) {
-        O_shared[d] = 0.0f;
+    float o_reg[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    float max_score = -INFINITY;
+    float sum_exp_score = 0.0f;
+
+    for (uint i = simd_gid; i < S; i += BN_DECODE) {
+        float k_reg[8];
+        for (uint j = 0; j < elems_per_thread; j++) {
+            k_reg[j] = float(K[i * D + simd_lid * elems_per_thread + j]);
+        }
+
+        float score = 0.0f;
+        for (uint j = 0; j < elems_per_thread; j++) {
+            score += q_reg[j] * k_reg[j];
+        }
+        score = simd_sum(score);
+
+        if (has_mask) {
+            score += float(mask[i]);
+        }
+
+        float new_max = max(max_score, score);
+        float factor = fast::exp(max_score - new_max);
+        float exp_score = fast::exp(score - new_max);
+
+        max_score = new_max;
+        sum_exp_score = sum_exp_score * factor + exp_score;
+
+        for (uint j = 0; j < elems_per_thread; j++) {
+            o_reg[j] = o_reg[j] * factor + exp_score * float(V[i * D + simd_lid * elems_per_thread + j]);
+        }
+    }
+
+    threadgroup float tg_max[BN_DECODE];
+    threadgroup float tg_sum[BN_DECODE];
+    threadgroup float tg_out[BN_DECODE * BD_DECODE];
+
+    if (simd_lid == 0) {
+        tg_max[simd_gid] = max_score;
+        tg_sum[simd_gid] = sum_exp_score;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float m_running = -INFINITY;
-    float l_running = 0.0f;
+    float loaded_max = (simd_lid < BN_DECODE) ? tg_max[simd_lid] : -INFINITY;
+    float g_max = simd_max(loaded_max);
+    float factor = fast::exp(max_score - g_max);
+    float loaded_sum = (simd_lid < BN_DECODE)
+        ? tg_sum[simd_lid] * fast::exp(tg_max[simd_lid] - g_max)
+        : 0.0f;
+    float g_sum = simd_sum(loaded_sum);
 
-    const uint n_kv_blocks = (S + Bc - 1) / Bc;
-
-    for (uint kb = 0; kb < n_kv_blocks; kb++) {
-        const uint kv_start = kb * Bc;
-        const uint kv_end   = min(kv_start + Bc, S);
-        const uint kv_count = kv_end - kv_start;
-
-        float score = -INFINITY;
-        if (tid < kv_count) {
-            float dot = 0.0f;
-            for (uint d = 0; d < D; d++) {
-                dot += float(Q[d]) * float(K[(kv_start + tid) * D + d]);
-            }
-            dot *= scale;
-            if (has_mask) {
-                dot += float(mask[kv_start + tid]);
-            }
-            score = dot;
-        }
-
-        float block_max = tg_reduce_max_bf16(score, tid, lane_id, sg_id,
-                                              n_threads, reduce_buf);
-        float m_new = max(m_running, block_max);
-        float correction = fast::exp(m_running - m_new);
-        float exp_score = (tid < kv_count) ? fast::exp(score - m_new) : 0.0f;
-        float block_sum = tg_reduce_sum_bf16(exp_score, tid, lane_id, sg_id,
-                                              n_threads, reduce_buf);
-        float l_new = l_running * correction + block_sum;
-
-        threadgroup float exp_scores_shared[Bc];
-        if (tid < Bc) {
-            exp_scores_shared[tid] = (tid < kv_count) ? exp_score : 0.0f;
-        }
+    for (uint j = 0; j < elems_per_thread; j++) {
+        tg_out[simd_lid * BN_DECODE + simd_gid] = o_reg[j];
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (uint d = tid; d < D; d += n_threads) {
-            float o_val = O_shared[d] * correction;
-            float v_sum = 0.0f;
-            for (uint j = 0; j < kv_count; j++) {
-                v_sum += exp_scores_shared[j] * float(V[(kv_start + j) * D + d]);
-            }
-            O_shared[d] = o_val + v_sum;
-        }
+        float val = (simd_lid < BN_DECODE)
+            ? tg_out[simd_gid * BN_DECODE + simd_lid] * fast::exp(tg_max[simd_lid] - g_max)
+            : 0.0f;
+        o_reg[j] = simd_sum(val);
+        o_reg[j] = (g_sum > 0.0f) ? (o_reg[j] / g_sum) : 0.0f;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        m_running = m_new;
-        l_running = l_new;
     }
 
-    float inv_l = (l_running > 0.0f) ? (1.0f / l_running) : 0.0f;
-    for (uint d = tid; d < D; d += n_threads) {
-        O[d] = bfloat(O_shared[d] * inv_l);
+    if (simd_lid == 0) {
+        for (uint j = 0; j < elems_per_thread; j++) {
+            O[simd_gid * elems_per_thread + j] = bfloat(o_reg[j]);
+        }
     }
 }
 
@@ -1274,8 +1312,7 @@ kernel void sdpa_bf16(
 }
 
 // ─── sdpa_decode_batched_bf16 ─────────────────────────────────────────────
-// Batched multi-head decode for bf16. Same as f32 variant but reads/writes
-// bfloat, accumulates in float.
+// MLX sdpa_vector pattern for batched bf16 decode.
 
 kernel void sdpa_decode_batched_bf16(
     device const bfloat* Q         [[buffer(0)]],
@@ -1285,9 +1322,8 @@ kernel void sdpa_decode_batched_bf16(
     device const bfloat* mask      [[buffer(4)]],
     constant     uint*   params    [[buffer(5)]],
     constant     float&  scale     [[buffer(6)]],
-    uint  tid       [[thread_position_in_threadgroup]],
-    uint  lane_id   [[thread_index_in_simdgroup]],
-    uint  sg_id     [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid  [[thread_index_in_simdgroup]],
+    uint  simd_gid  [[simdgroup_index_in_threadgroup]],
     uint  tg_pos    [[threadgroup_position_in_grid]])
 {
     const uint head_id      = tg_pos;
@@ -1305,73 +1341,81 @@ kernel void sdpa_decode_batched_bf16(
     device const bfloat* q = Q + head_id * D;
     device const bfloat* k = K + kv_head * stride_S * D;
     device const bfloat* v = V + kv_head * stride_S * D;
-    device       bfloat* o = O + head_id * D;
 
-    const uint n_threads = 256;
+    const uint elems_per_thread = D / BD_DECODE;
 
-    threadgroup float reduce_buf[SIMD_SIZE];
-    threadgroup float O_shared[256];
+    float q_reg[8];
+    for (uint i = 0; i < elems_per_thread; i++) {
+        q_reg[i] = float(q[simd_lid * elems_per_thread + i]) * scale;
+    }
 
-    for (uint d = tid; d < D; d += n_threads) {
-        O_shared[d] = 0.0f;
+    float o_reg[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    float max_score = -INFINITY;
+    float sum_exp_score = 0.0f;
+
+    for (uint i = simd_gid; i < S; i += BN_DECODE) {
+        float k_reg[8];
+        for (uint j = 0; j < elems_per_thread; j++) {
+            k_reg[j] = float(k[i * D + simd_lid * elems_per_thread + j]);
+        }
+
+        float score = 0.0f;
+        for (uint j = 0; j < elems_per_thread; j++) {
+            score += q_reg[j] * k_reg[j];
+        }
+        score = simd_sum(score);
+
+        if (has_mask) {
+            score += float(mask[i]);
+        }
+
+        float new_max = max(max_score, score);
+        float factor = fast::exp(max_score - new_max);
+        float exp_score = fast::exp(score - new_max);
+
+        max_score = new_max;
+        sum_exp_score = sum_exp_score * factor + exp_score;
+
+        for (uint j = 0; j < elems_per_thread; j++) {
+            o_reg[j] = o_reg[j] * factor + exp_score * float(v[i * D + simd_lid * elems_per_thread + j]);
+        }
+    }
+
+    threadgroup float tg_max[BN_DECODE];
+    threadgroup float tg_sum[BN_DECODE];
+    threadgroup float tg_out[BN_DECODE * BD_DECODE];
+
+    if (simd_lid == 0) {
+        tg_max[simd_gid] = max_score;
+        tg_sum[simd_gid] = sum_exp_score;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float m_running = -INFINITY;
-    float l_running = 0.0f;
+    float loaded_max = (simd_lid < BN_DECODE) ? tg_max[simd_lid] : -INFINITY;
+    float g_max = simd_max(loaded_max);
+    float factor = fast::exp(max_score - g_max);
+    float loaded_sum = (simd_lid < BN_DECODE)
+        ? tg_sum[simd_lid] * fast::exp(tg_max[simd_lid] - g_max)
+        : 0.0f;
+    float g_sum = simd_sum(loaded_sum);
 
-    const uint n_kv_blocks = (S + Bc - 1) / Bc;
-
-    for (uint kb = 0; kb < n_kv_blocks; kb++) {
-        const uint kv_start = kb * Bc;
-        const uint kv_end   = min(kv_start + Bc, S);
-        const uint kv_count = kv_end - kv_start;
-
-        float score = -INFINITY;
-        if (tid < kv_count) {
-            float dot = 0.0f;
-            for (uint d = 0; d < D; d++) {
-                dot += float(q[d]) * float(k[(kv_start + tid) * D + d]);
-            }
-            dot *= scale;
-            if (has_mask) {
-                dot += float(mask[kv_start + tid]);
-            }
-            score = dot;
-        }
-
-        float block_max = tg_reduce_max_bf16(score, tid, lane_id, sg_id,
-                                              n_threads, reduce_buf);
-        float m_new = max(m_running, block_max);
-        float correction = fast::exp(m_running - m_new);
-        float exp_score = (tid < kv_count) ? fast::exp(score - m_new) : 0.0f;
-        float block_sum = tg_reduce_sum_bf16(exp_score, tid, lane_id, sg_id,
-                                              n_threads, reduce_buf);
-        float l_new = l_running * correction + block_sum;
-
-        threadgroup float exp_scores_shared[Bc];
-        if (tid < Bc) {
-            exp_scores_shared[tid] = (tid < kv_count) ? exp_score : 0.0f;
-        }
+    for (uint j = 0; j < elems_per_thread; j++) {
+        tg_out[simd_lid * BN_DECODE + simd_gid] = o_reg[j];
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (uint d = tid; d < D; d += n_threads) {
-            float o_val = O_shared[d] * correction;
-            float v_sum = 0.0f;
-            for (uint j = 0; j < kv_count; j++) {
-                v_sum += exp_scores_shared[j] * float(v[(kv_start + j) * D + d]);
-            }
-            O_shared[d] = o_val + v_sum;
-        }
+        float val = (simd_lid < BN_DECODE)
+            ? tg_out[simd_gid * BN_DECODE + simd_lid] * fast::exp(tg_max[simd_lid] - g_max)
+            : 0.0f;
+        o_reg[j] = simd_sum(val);
+        o_reg[j] = (g_sum > 0.0f) ? (o_reg[j] / g_sum) : 0.0f;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        m_running = m_new;
-        l_running = l_new;
     }
 
-    float inv_l = (l_running > 0.0f) ? (1.0f / l_running) : 0.0f;
-    for (uint d = tid; d < D; d += n_threads) {
-        o[d] = bfloat(O_shared[d] * inv_l);
+    if (simd_lid == 0) {
+        device bfloat* o = O + head_id * D;
+        for (uint j = 0; j < elems_per_thread; j++) {
+            o[simd_gid * elems_per_thread + j] = bfloat(o_reg[j]);
+        }
     }
 }
 "#;

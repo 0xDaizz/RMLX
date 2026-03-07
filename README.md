@@ -1,6 +1,6 @@
 # RMLX
 
-**Rust ML runtime for Apple Silicon — 78x decode speedup, beats MLX by 6.4%**
+**Rust ML runtime for Apple Silicon — 2.09x faster than MLX at model-scale decode**
 
 [![CI](https://github.com/0xDaizz/RMLX/actions/workflows/ci.yml/badge.svg)](https://github.com/0xDaizz/RMLX/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -12,27 +12,28 @@
 
 ---
 
-RMLX reimplements Apple's [MLX](https://github.com/ml-explore/mlx) Metal GPU pipeline **entirely in Rust**. The 9-dispatch decode path achieves **1,256 us/layer in multi-layer pipeline (87x speedup, beats MLX)** — **6.4% faster than MLX compiled** (1,342 us) on identical hardware.
+RMLX reimplements Apple's [MLX](https://github.com/ml-explore/mlx) Metal GPU pipeline **entirely in Rust**. The 9-dispatch decode path achieves **1,204 us/layer at 60-layer depth** — **2.09x faster than MLX compiled** (2,513 us/layer) on identical hardware (M3 Ultra, f32).
 
 ## ⚡ Performance
 
-Single transformer layer decode (Llama-2 7B shapes, f32, Apple Silicon):
+Single transformer layer decode (Llama-2 7B shapes, f32, M3 Ultra):
 
 | Path | Latency | Speedup |
 |------|--------:|--------:|
-| Baseline (per-op sync) | 109,215 us | 1x |
-| ExecGraph (5 CB) | 2,735 us | 40x |
-| Single-CB (44 enc) | 2,049 us | 53x |
-| **9-Dispatch (single layer)** | **1,401 us** | **78x** |
-| **Multi-layer (4L pipeline)** | **1,256 us/L** | **87x** |
-| MLX compiled | 1,342 us | — |
+| Baseline (per-op sync) | 111,083 us | 1x |
+| ExecGraph (5 CB) | 2,846 us | 39x |
+| Single-CB (44 enc) | 2,143 us | 52x |
+| **9-Dispatch (single layer)** | **1,739 us** | **64x** |
+| **60-layer pipeline** | **1,204 us/L** | **2.09x vs MLX** |
+| f16 9-Dispatch | 1,081 us | 103x |
+| MLX compiled (60L) | 2,513 us/L | — |
 
 ## ✨ RMLX vs MLX vs CUDA
 
 | Feature | RMLX | MLX | CUDA |
 |---------|:----:|:---:|:----:|
 | Unified memory (zero-copy) | ✅ | ✅ | ❌ |
-| 9-dispatch decode (87x) | ✅ | ➖ | ➖ |
+| 9-dispatch decode (2.09x vs MLX) | ✅ | ➖ | ➖ |
 | Expert parallelism | ✅ | ❌ | ⚠️ |
 | Zero-copy RDMA | ✅ | ❌ | ❌ |
 | Flash Attention 2 | ✅ | ✅ | ✅ |
@@ -57,7 +58,7 @@ Single transformer layer decode (Llama-2 7B shapes, f32, Apple Silicon):
 <details open>
 <summary><b>Infrastructure</b> — ExecGraph, 9-dispatch decode, RDMA, BFC allocator</summary>
 
-- **9-dispatch decode**: merged QKV/gate-up weights, batched SDPA, function-constant specialization, 1,256 us/layer (beats MLX)
+- **9-dispatch decode**: merged QKV/gate-up weights, batched SDPA, function-constant specialization, 1,204 us/layer at 60L depth (2.09x faster than MLX)
 - **ExecGraph**: command buffer batching (65 CB down to 5)
 - **Metal**: ChipTuning (M1–M4), DiskPipelineCache, fence manager, dual queues
 - **Allocator**: zero-copy (posix_memalign + MTLBuffer), BFC, residency manager
@@ -136,8 +137,8 @@ rmlx launch --backend rdma --hostfile rmlx-hosts.json -- ibv_devices
 | GPU ops | 32+ |
 | Activations | 16 |
 | Model architectures | 4 |
-| Decode latency | 1,256 us/L (87x) |
-| Gap to MLX | 6.4% faster |
+| Decode latency | 1,204 us/L (60L pipeline) |
+| vs MLX (60L compiled) | 2.09x faster |
 
 ## 📚 Docs
 

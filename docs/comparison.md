@@ -16,7 +16,7 @@
 | **GPU API** | Apple Metal (metal-rs 0.31) | Apple Metal (metal-cpp) | NVIDIA CUDA |
 | **Memory model** | Unified Memory (UMA) | Unified Memory (UMA) | Discrete VRAM + host RAM |
 | **Execution model** | Eager-first (selective tracing for prefill) | Lazy evaluation (graph-level fusion) | Eager (PyTorch) / Graph (CUDA Graphs) |
-| **CB management** | ExecGraph + 9-dispatch: 65 CBs/layer -> 1 CB with 9 dispatches (77x speedup vs per-op baseline, 5.1% gap vs MLX) | 1 CB per eval() batch | Stream-ordered, CUDA Graphs capture-replay |
+| **CB management** | ExecGraph + 9-dispatch: 65 CBs/layer -> 1 CB with 9 dispatches (64x speedup vs per-op baseline, 2.09x faster than MLX at 60L) | 1 CB per eval() batch | Stream-ordered, CUDA Graphs capture-replay |
 | **Sync mechanism** | MTLSharedEvent signal/wait (263.9us) | waitUntilCompleted (424.9us) | CUDA events / streams |
 | **RDMA** | Zero-copy: posix_memalign + NoCopy + ibv_reg_mr | std::copy to transfer buffer | GPUDirect RDMA / NVLink |
 | **Expert Parallelism** | Native EP (3-zone auto backend, 7 MoE kernels, EP-1~EP-6 optimized path) | No EP support | DeepSpeed-MoE, Tutel |
@@ -72,11 +72,12 @@ Numerical parity is maintained: max_diff = 6.4e-6 between baseline and ExecGraph
 | Metric | Phase 9B-opt | Phase KO (9-dispatch) |
 |--------|--------------|-----------------------|
 | Dispatches per layer | 65 in 5 CBs | 9 in 1 CB (4 encoders) |
-| Latency per layer | ~6.4ms | ~1.4ms |
-| Speedup vs baseline | 17.4x | 77x |
-| Gap vs MLX compiled | ~4.8x slower | 5.1% |
+| Latency (single layer) | ~6.4ms | ~1.7ms |
+| Latency (60L pipeline) | — | 1,204 us/L |
+| Speedup vs baseline | 17.4x | 64x |
+| vs MLX compiled (60L) | ~4.8x slower | **2.09x faster** |
 
-The 9-dispatch path achieves near-parity with MLX's compiled execution through merged QKV/gate_up weight projections, batched RoPE, slab-layout SDPA decode, fused GEMV+bias, StorageModePrivate weights, and Array::uninit for output buffers.
+The 9-dispatch path is 2.09x faster than MLX's compiled execution at 60-layer depth through merged QKV/gate_up weight projections, batched RoPE, slab-layout SDPA decode, fused GEMV+bias, StorageModePrivate weights, and Array::uninit for output buffers. Multi-layer CB amortization reduces per-layer overhead from 1,739 us (single) to 1,204 us/L (60L).
 
 ### 2.3 Zero-Copy RDMA Data Path
 
@@ -255,12 +256,12 @@ CUDA has decades of optimization across compilers (NVCC, Triton), libraries (cuB
 | **CB reduction** | 65 -> 1 per layer (98.5%) | Full coalescing into single graph |
 | **Sync model** | MTLSharedEvent (non-blocking) | CUDA events (stream-ordered) |
 | **Shape dynamism** | Re-encode handles shape changes naturally | Must re-capture or use CUDA Graph updates |
-| **Latency** | ~1.4ms per layer (9-dispatch path) | Sub-millisecond replay |
-| **Speedup over baseline** | 77x | Typically 2-5x (already from efficient baseline) |
+| **Latency** | ~1.2ms per layer at 60L (9-dispatch path) | Sub-millisecond replay |
+| **Speedup over baseline** | 64x | Typically 2-5x (already from efficient baseline) |
 | **Implementation complexity** | Moderate (deterministic sequencing) | Low (capture API is straightforward) |
 | **Memory overhead** | Minimal (re-encode reuses buffers) | Graph storage (captured operations) |
 
-**Key insight**: ExecGraph's 77x speedup comes from collapsing the decode path into 9 dispatches in a single command buffer. CUDA's baseline is already more efficient due to stream-ordered execution, so CUDA Graphs provides a smaller relative improvement from a stronger starting point.
+**Key insight**: ExecGraph's 64x speedup comes from collapsing the decode path into 9 dispatches in a single command buffer. CUDA's baseline is already more efficient due to stream-ordered execution, so CUDA Graphs provides a smaller relative improvement from a stronger starting point.
 
 ---
 

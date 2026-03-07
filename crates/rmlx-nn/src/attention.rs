@@ -435,10 +435,11 @@ impl LayerKvCache {
 
         let dst_row_offset = self.seq_len * self.head_dim * elem_size;
 
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+
         for i in 0..self.num_kv_heads {
             // Copy new keys into slot
-            let enc = cb.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&pipeline);
             enc.set_buffer(
                 0,
                 Some(new_keys[i].metal_buffer()),
@@ -456,11 +457,8 @@ impl LayerKvCache {
                 1,
             );
             enc.dispatch_threads(grid, tg);
-            enc.end_encoding();
 
             // Copy new values into slot
-            let enc = cb.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&pipeline);
             enc.set_buffer(
                 0,
                 Some(new_values[i].metal_buffer()),
@@ -472,8 +470,8 @@ impl LayerKvCache {
                 (self.values[i].offset() + dst_row_offset) as u64,
             );
             enc.dispatch_threads(grid, tg);
-            enc.end_encoding();
         }
+        enc.end_encoding();
 
         self.seq_len += new_tokens;
         Ok(())
@@ -1372,6 +1370,23 @@ impl AttentionConfig {
         }
         Ok(())
     }
+}
+
+/// Intermediate state from attention D1-D3 + KV blit, for 2-encoder decode path.
+///
+/// Holds everything needed for `Attention::encode_phase2_into()` to encode
+/// D4-D5 into a caller-supplied encoder without a full GPU barrier.
+pub struct DecodePhase1 {
+    /// Roped Q+K buffer (Q portion used for SDPA).
+    pub qk_roped_buf: metal::Buffer,
+    /// Byte offset into `qk_roped_buf` where Q starts.
+    pub qk_roped_offset: usize,
+    /// Q dimension (num_heads * head_dim).
+    pub q_dim: usize,
+    /// Original input `x` reshaped as [hidden_size] for residual in D5.
+    pub x: Array,
+    /// DType of the QKV output (for building views).
+    pub dtype: rmlx_core::dtype::DType,
 }
 
 pub struct Attention {
@@ -2589,6 +2604,227 @@ impl Attention {
         encoder_b.end_encoding();
 
         // Return as [1, hidden_size]
+        Ok(Array::new(
+            h.metal_buffer().to_owned(),
+            vec![1, hidden_size],
+            vec![hidden_size, 1],
+            h.dtype(),
+            h.offset(),
+        ))
+    }
+
+    /// Phase-1 of 9-dispatch decode: D1-D3 in encoder A + KV cache blit.
+    ///
+    /// Returns `DecodePhase1` containing the intermediate state needed for
+    /// `encode_phase2_into()` to encode D4-D5 into a caller-provided encoder.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_decode_phase1(
+        &self,
+        x: &Array,
+        norm_weight: &Array,
+        rms_norm_eps: f32,
+        cos_freqs: Option<&Array>,
+        sin_freqs: Option<&Array>,
+        _mask: Option<&Array>,
+        cache: &mut LayerKvCache,
+        registry: &KernelRegistry,
+        cb: &metal::CommandBufferRef,
+    ) -> Result<DecodePhase1, KernelError> {
+        let num_heads = self.config.num_heads;
+        let num_kv_heads = self.config.num_kv_heads;
+        let head_dim = self.config.head_dim;
+        let hidden_size = num_heads * head_dim;
+        let seq_dim = if x.ndim() == 1 { 1 } else { x.shape()[0] };
+        if seq_dim != 1 {
+            return Err(KernelError::InvalidShape(format!(
+                "forward_decode_phase1: requires seq_len=1, got {}",
+                seq_dim
+            )));
+        }
+
+        // --- Encoder A: dispatches 1-3 (rms_norm, QKV gemv, rope) ---
+        let encoder_a = cb.new_compute_command_encoder();
+
+        let x_2d = if x.ndim() == 1 {
+            Array::new(
+                x.metal_buffer().to_owned(),
+                vec![1, x.shape()[0]],
+                vec![x.shape()[0], 1],
+                x.dtype(),
+                x.offset(),
+            )
+        } else {
+            Array::new(
+                x.metal_buffer().to_owned(),
+                x.shape().to_vec(),
+                x.strides().to_vec(),
+                x.dtype(),
+                x.offset(),
+            )
+        };
+        let normed = ops::rms_norm::rms_norm_into_encoder(
+            registry,
+            &x_2d,
+            Some(norm_weight),
+            rms_norm_eps,
+            encoder_a,
+        )?;
+        encoder_a.memory_barrier_with_resources(&[buf_as_resource(normed.metal_buffer())]);
+
+        let qkv_weight = self.qkv_merged_weight.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape(
+                "forward_decode_phase1: call prepare_merged_qkv() first".into(),
+            )
+        })?;
+        let normed_vec = Array::new(
+            normed.metal_buffer().to_owned(),
+            vec![hidden_size],
+            vec![1],
+            normed.dtype(),
+            normed.offset(),
+        );
+        let qkv = ops::gemv::gemv_into_encoder(registry, qkv_weight, &normed_vec, encoder_a)?;
+        let elem_size = qkv.dtype().size_of();
+
+        let q_dim = num_heads * head_dim;
+        let k_dim = num_kv_heads * head_dim;
+        let rope_offset = cache.seq_len as u32;
+        let total_rope_heads = num_heads + num_kv_heads;
+
+        let (qk_roped_buf, qk_roped_offset, v_buf, v_offset);
+        if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
+            encoder_a.memory_barrier_with_resources(&[buf_as_resource(qkv.metal_buffer())]);
+            let qk_3d = Array::new(
+                qkv.metal_buffer().to_owned(),
+                vec![total_rope_heads, 1, head_dim],
+                vec![head_dim, head_dim, 1],
+                qkv.dtype(),
+                qkv.offset(),
+            );
+            let qk_roped = ops::rope::rope_ext_into_encoder(
+                registry,
+                &qk_3d,
+                cos,
+                sin,
+                rope_offset,
+                1.0,
+                false,
+                true,
+                encoder_a,
+            )?;
+            qk_roped_buf = qk_roped.metal_buffer().to_owned();
+            qk_roped_offset = qk_roped.offset();
+            v_buf = qkv.metal_buffer().to_owned();
+            v_offset = qkv.offset() + (q_dim + k_dim) * elem_size;
+        } else {
+            qk_roped_buf = qkv.metal_buffer().to_owned();
+            qk_roped_offset = qkv.offset();
+            v_buf = qkv.metal_buffer().to_owned();
+            v_offset = qkv.offset() + (q_dim + k_dim) * elem_size;
+        }
+
+        encoder_a.end_encoding();
+
+        // KV cache blit
+        let k_roped_flat_offset = qk_roped_offset + q_dim * elem_size;
+        let mut k_heads = Vec::with_capacity(num_kv_heads);
+        let mut v_heads = Vec::with_capacity(num_kv_heads);
+        for h in 0..num_kv_heads {
+            k_heads.push(Array::new(
+                qk_roped_buf.clone(),
+                vec![1, head_dim],
+                vec![head_dim, 1],
+                qkv.dtype(),
+                k_roped_flat_offset + h * head_dim * elem_size,
+            ));
+            v_heads.push(Array::new(
+                v_buf.clone(),
+                vec![1, head_dim],
+                vec![head_dim, 1],
+                qkv.dtype(),
+                v_offset + h * head_dim * elem_size,
+            ));
+        }
+        cache.append_into_cb(k_heads, v_heads, 1, registry, cb)?;
+
+        Ok(DecodePhase1 {
+            qk_roped_buf,
+            qk_roped_offset,
+            q_dim,
+            x: Array::new(
+                x.metal_buffer().to_owned(),
+                vec![hidden_size],
+                vec![1],
+                x.dtype(),
+                x.offset(),
+            ),
+            dtype: qkv.dtype(),
+        })
+    }
+
+    /// Phase-2 of 9-dispatch decode: encode D4-D5 into a caller-supplied encoder.
+    ///
+    /// Returns `h` — the residual-updated attention output [1, hidden_size].
+    pub fn encode_phase2_into(
+        &self,
+        phase1: &DecodePhase1,
+        cache: &LayerKvCache,
+        registry: &KernelRegistry,
+        encoder: &metal::ComputeCommandEncoderRef,
+    ) -> Result<Array, KernelError> {
+        let num_heads = self.config.num_heads;
+        let num_kv_heads = self.config.num_kv_heads;
+        let head_dim = self.config.head_dim;
+        let hidden_size = num_heads * head_dim;
+
+        // D4: batched SDPA decode
+        let k_slab = cache
+            .keys_slab_view()
+            .ok_or_else(|| KernelError::InvalidShape("encode_phase2_into: no keys slab".into()))?;
+        let v_slab = cache.values_slab_view().ok_or_else(|| {
+            KernelError::InvalidShape("encode_phase2_into: no values slab".into())
+        })?;
+        let seq_len = cache.seq_len;
+        let max_seq = cache.max_seq_len();
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let q_flat = Array::new(
+            phase1.qk_roped_buf.clone(),
+            vec![phase1.q_dim],
+            vec![1],
+            phase1.dtype,
+            phase1.qk_roped_offset,
+        );
+        let attn_out = ops::sdpa::sdpa_decode_batched_slab_stride_into_encoder(
+            registry,
+            &q_flat,
+            &k_slab,
+            &v_slab,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            seq_len,
+            Some(max_seq),
+            None,
+            scale,
+            encoder,
+        )?;
+        encoder.memory_barrier_with_resources(&[buf_as_resource(attn_out.metal_buffer())]);
+
+        // D5: gemv_bias(W_o, attn, x) — O_proj + residual
+        let o_weight = self.o_proj.weight().ok_or_else(|| {
+            KernelError::InvalidShape("Attention: o_proj weight not loaded".into())
+        })?;
+        let attn_vec = Array::new(
+            attn_out.metal_buffer().to_owned(),
+            vec![hidden_size],
+            vec![1],
+            attn_out.dtype(),
+            attn_out.offset(),
+        );
+        let h =
+            ops::gemv::gemv_bias_into_encoder(registry, o_weight, &attn_vec, &phase1.x, encoder)?;
+
         Ok(Array::new(
             h.metal_buffer().to_owned(),
             vec![1, hidden_size],
