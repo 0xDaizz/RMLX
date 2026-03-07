@@ -1947,6 +1947,96 @@ fn main() {
     println!("=====================================================");
 
     // ========================================================================
+    // Selective Fusion A/B Testing (60 layers)
+    // ========================================================================
+    println!("\n========== Selective Fusion A/B Testing (60 layers) ==========");
+
+    let fusion_configs: Vec<(&str, bool, bool, bool)> = vec![
+        ("B-only (swiglu)", false, false, true),
+        ("A-QKV-only", true, false, false),
+        ("A-gateup-only", false, true, false),
+        ("A-QKV + B", true, false, true),
+        ("A-gateup + B", false, true, true),
+        ("A-both (no B)", true, true, false),
+    ];
+
+    let baseline_us_per_layer = cached_1enc_60_stats.mean / num_layers_60 as f64;
+    for (name, fuse_qkv, fuse_gate_up, fuse_swiglu) in &fusion_configs {
+        // Warmup
+        for _ in 0..WARMUP_ITERS {
+            for cache in caches_60.iter_mut() {
+                cache.seq_len = 0;
+            }
+            let cb = queue.new_command_buffer();
+            let mut x = rand_array(device, &[SEQ_LEN, HIDDEN_SIZE], 200);
+            for ((layer, cache), cached) in blocks_60
+                .iter()
+                .zip(caches_60.iter_mut())
+                .zip(cached_60.iter())
+            {
+                x = layer
+                    .forward_cached_selective_fusion(
+                        &x,
+                        None,
+                        None,
+                        cache,
+                        cached,
+                        cb,
+                        *fuse_qkv,
+                        *fuse_gate_up,
+                        *fuse_swiglu,
+                    )
+                    .expect("selective fusion warmup failed");
+            }
+            cb.commit();
+            cb.wait_until_completed();
+        }
+        // Bench
+        let mut latencies = Vec::with_capacity(BENCH_ITERS);
+        for _ in 0..BENCH_ITERS {
+            for cache in caches_60.iter_mut() {
+                cache.seq_len = 0;
+            }
+            let start = Instant::now();
+            let cb = queue.new_command_buffer();
+            let mut x = rand_array(device, &[SEQ_LEN, HIDDEN_SIZE], 200);
+            for ((layer, cache), cached) in blocks_60
+                .iter()
+                .zip(caches_60.iter_mut())
+                .zip(cached_60.iter())
+            {
+                x = layer
+                    .forward_cached_selective_fusion(
+                        &x,
+                        None,
+                        None,
+                        cache,
+                        cached,
+                        cb,
+                        *fuse_qkv,
+                        *fuse_gate_up,
+                        *fuse_swiglu,
+                    )
+                    .expect("selective fusion bench failed");
+            }
+            cb.commit();
+            cb.wait_until_completed();
+            latencies.push(start.elapsed());
+        }
+        let stats = Stats::from_durations(&latencies);
+        let us_per_layer = stats.mean / num_layers_60 as f64;
+        let delta = us_per_layer - baseline_us_per_layer;
+        println!(
+            "  {:30} {:.1} us/layer  ({:+.1} us vs 9-dispatch, {:+.1}%)",
+            name,
+            us_per_layer,
+            delta,
+            delta / baseline_us_per_layer * 100.0
+        );
+    }
+    println!("=====================================================");
+
+    // ========================================================================
     // ExecGraph Overhead Decomposition
     // ========================================================================
     // Isolate: CB creation, commit, event signal/wait, and pipeline bubble costs
