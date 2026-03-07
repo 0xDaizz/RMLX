@@ -386,7 +386,7 @@ Pre-caches all weight transposes for ExecGraph execution.
 
 #### Phase KO Additions: 9-Dispatch Decode Path
 
-Phase KO introduces a minimal-dispatch decode path that reduces a full transformer layer to 9 Metal dispatches (further optimized to 4 encoders with memory barriers), achieving 77x speedup over the per-op baseline.
+Phase KO introduces a minimal-dispatch decode path that reduces a full transformer layer to 9 Metal dispatches (further optimized to 4 encoders with memory barriers), achieving 64x speedup over the per-op baseline.
 
 ##### 9-Dispatch Decode Architecture
 
@@ -863,9 +863,9 @@ Phase KO closes the per-layer decode performance gap with MLX:
 | Baseline (per-op sync) | 109,215 | 1x | ~65 |
 | ExecGraph (5 CB) | 2,735 | 40x | ~65 in 5 CBs |
 | Single-CB (44 enc) | 2,049 | 53x | 44 |
-| 9-Dispatch (4 enc) | 1,411 | 77x | 9 |
-| MLX compiled | 1,342 | -- | -- |
-| Gap vs MLX | | 5.1% | |
+| 9-Dispatch (4 enc) | 1,739 | 64x | 9 |
+| MLX compiled (60L) | 2,513 us/L | -- | -- |
+| vs MLX (60L) | | 2.09x faster | |
 
 ---
 

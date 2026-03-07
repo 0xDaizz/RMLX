@@ -278,7 +278,7 @@ def main():
     args = parser.parse_args()
 
     print("=" * 72)
-    print("MLX Single-Layer Decode Latency Benchmark (raw ops)")
+    print("MLX Multi-Layer Decode Latency Benchmark (raw ops)")
     print(f"  mlx version : {mx.__version__}")
     print(f"  device      : {mx.default_device()}")
     print(f"  dtype       : float32")
@@ -358,6 +358,46 @@ def main():
     compiled_4 = mx.compile(run_4_layers)
 
     bench_layer(compiled_4, "4-layer sequential (mx.compile)", args.warmup, args.iters)
+
+    # ---- Multi-layer benchmarks (30, 60 layers) ----
+    for num_layers in [30, 60]:
+        layers_w_n = []
+        for _ in range(num_layers):
+            lw = {
+                "w_qkv":     mx.random.normal((HIDDEN_SIZE, (NUM_HEADS + 2 * NUM_KV_HEADS) * HEAD_DIM)) * scale,
+                "w_o":       mx.random.normal((NUM_HEADS * HEAD_DIM, HIDDEN_SIZE)) * scale,
+                "w_gate_up": mx.random.normal((HIDDEN_SIZE, INTERMEDIATE_SIZE * 2)) * scale,
+                "w_down":    mx.random.normal((INTERMEDIATE_SIZE, HIDDEN_SIZE)) * scale,
+                "rms_w1":    mx.ones((HIDDEN_SIZE,)),
+                "rms_w2":    mx.ones((HIDDEN_SIZE,)),
+                "k_cache":   mx.random.normal((1, NUM_KV_HEADS, KV_CACHE_LEN, HEAD_DIM)) * scale,
+                "v_cache":   mx.random.normal((1, NUM_KV_HEADS, KV_CACHE_LEN, HEAD_DIM)) * scale,
+            }
+            mx.eval(*lw.values())
+            layers_w_n.append(lw)
+
+        def make_run_n(lws):
+            def run():
+                h = x
+                all_kv = []
+                for lw in lws:
+                    h, k_out, v_out = layer_forward(
+                        h, lw["w_qkv"], lw["w_o"], lw["w_gate_up"], lw["w_down"],
+                        lw["rms_w1"], lw["rms_w2"], lw["k_cache"], lw["v_cache"],
+                        rope_offset,
+                    )
+                    all_kv.extend([k_out, v_out])
+                return (h, *all_kv)
+            return run
+
+        run_n = make_run_n(layers_w_n)
+
+        # Uncompiled
+        bench_layer(run_n, f"{num_layers}-layer sequential (uncompiled)", args.warmup, args.iters)
+
+        # Compiled
+        compiled_n = mx.compile(run_n)
+        bench_layer(compiled_n, f"{num_layers}-layer sequential (mx.compile)", args.warmup, args.iters)
 
     # ---- 4. Per-operation breakdown ----
     bench_per_op(x, w_qkv, w_o, w_gate_up, w_down, rms_w1, rms_w2,

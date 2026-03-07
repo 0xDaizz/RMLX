@@ -35,7 +35,7 @@ MLX is an excellent framework, but it carries the following software overheads i
 2-node EP decode: 64ms/step -> 33ms/step (~30 tok/s)
 Achieve near-parity with single-node 32ms/step
 
-Phase KO result: ~109ms/layer -> ~1.4ms/layer (77x speedup, 5.1% gap vs MLX)
+Phase KO result: ~109ms/layer -> ~1.7ms/layer (64x speedup, 2.09x faster than MLX at 60L depth)
 92.3% CB reduction, 98.5% CPU-GPU sync reduction
 ```
 
@@ -61,8 +61,8 @@ The ultimate goal is to connect two Mac Studio M3 Ultras via Thunderbolt 5 RDMA 
    Pre-allocates dual Metal + RDMA registered buffers, eliminating runtime registration overhead.
 
 6. **ExecGraph CB batching**
-   Phase KO further reduces to 9 dispatches per layer in a single CB, achieving 77x speedup
-   (~109ms → ~1.4ms) within 5.1% of MLX compiled performance.
+   Phase KO further reduces to 9 dispatches per layer in a single CB, achieving 64x speedup
+   (~109ms → ~1.7ms), 2.09x faster than MLX at 60-layer depth.
 
 7. **Expert Parallelism (EP)**
    MLX has no built-in EP support. RMLX provides a complete EP stack: 3-zone auto backend policy (CPU/Metal/RDMA) that selects the optimal path by data size, 7 dedicated MoE Metal kernels, SparseGuard overflow monitoring with capacity auto-tuning, and compute-RDMA pipeline overlap for distributed MoE inference on models like Mixtral and DeepSeek-V3. Six post-audit EP optimization phases (EP-1 through EP-6) further eliminate CPU sync points with GPU-native top-k routing, replace per-expert loops with grouped GEMM, reduce wire bytes via variable-length v3 protocol + FP8 quantization, and overlap compute/communication with TBO/SBO pipelines.
