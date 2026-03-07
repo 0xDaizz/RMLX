@@ -1467,6 +1467,306 @@ impl TransformerBlock {
         ))
     }
 
+    /// Single-encoder 9-dispatch forward pass (Optimization A).
+    ///
+    /// Merges both encoders from `forward_cached_2encoder_9dispatch` into one,
+    /// using memory barriers on KV slab buffers instead of an encoder boundary
+    /// to synchronize the KV copy → SDPA dependency.
+    ///
+    /// Also uses `append_direct_into_encoder` (Optimization B) to avoid
+    /// Vec<Array> allocation for KV copies, and pre-cached threadgroup sizes
+    /// (Optimization C).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_cached_1encoder_9dispatch(
+        &self,
+        x: &Array,
+        cos_freqs: Option<&Array>,
+        sin_freqs: Option<&Array>,
+        cache: &mut LayerKvCache,
+        cached: &CachedDecode,
+        cb: &metal::CommandBufferRef,
+    ) -> Result<Array, KernelError> {
+        let hidden_size = cached.hidden_size;
+        let num_heads = cached.num_heads;
+        let num_kv_heads = cached.num_kv_heads;
+        let head_dim = cached.head_dim;
+        let elem_size = cached.dtype.size_of();
+
+        let norm1_w = self.norm1_weight.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape("forward_cached: norm1_weight not loaded".into())
+        })?;
+        let norm2_w = self.norm2_weight.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape("forward_cached: norm2_weight not loaded".into())
+        })?;
+        let qkv_weight = self.attention.qkv_merged_weight().ok_or_else(|| {
+            KernelError::InvalidShape("forward_cached: qkv_merged_weight not loaded".into())
+        })?;
+        let o_weight = self.attention.o_proj_weight().ok_or_else(|| {
+            KernelError::InvalidShape("forward_cached: o_proj weight not loaded".into())
+        })?;
+        let (gate_up_w, down_w) = match &self.ffn {
+            FeedForward::Gated {
+                gate_up_merged_weight,
+                down_proj,
+                ..
+            } => {
+                let guw = gate_up_merged_weight.as_ref().ok_or_else(|| {
+                    KernelError::InvalidShape(
+                        "forward_cached: gate_up_merged_weight not loaded".into(),
+                    )
+                })?;
+                let dw = down_proj.weight().ok_or_else(|| {
+                    KernelError::InvalidShape("forward_cached: down_proj weight not loaded".into())
+                })?;
+                (guw, dw)
+            }
+            _ => {
+                return Err(KernelError::InvalidShape(
+                    "forward_cached only supports Gated FFN".into(),
+                ))
+            }
+        };
+
+        // =====================================================================
+        // Single Encoder: all 9 dispatches + KV copy
+        // =====================================================================
+        let encoder = cb.new_compute_command_encoder();
+
+        // D1: rms_norm -> normed_buf
+        ops::rms_norm::rms_norm_preresolved_into_encoder(
+            &cached.rms_norm_pso,
+            x.metal_buffer(),
+            x.offset() as u64,
+            norm1_w.metal_buffer(),
+            norm1_w.offset() as u64,
+            &cached.normed_buf,
+            0,
+            cached.rms_axis_size,
+            cached.rms_norm_eps,
+            cached.norm1_w_stride,
+            1,
+            1,
+            encoder,
+        );
+        encoder.memory_barrier_with_resources(&[buf_as_resource(&cached.normed_buf)]);
+
+        // D2: QKV gemv -> qkv_buf
+        ops::gemv::gemv_preresolved_into_encoder(
+            &cached.gemv_qkv_pso,
+            qkv_weight.metal_buffer(),
+            qkv_weight.offset() as u64,
+            &cached.normed_buf,
+            0,
+            &cached.qkv_buf,
+            0,
+            cached.gemv_qkv_m,
+            cached.gemv_qkv_k,
+            cached.gemv_qkv_grid,
+            cached.gemv_qkv_tg,
+            encoder,
+        );
+
+        // D3: rope -> rope_buf (or use qkv_buf directly if no RoPE)
+        let q_dim = num_heads * head_dim;
+        let k_dim = num_kv_heads * head_dim;
+        let total_rope_heads = num_heads + num_kv_heads;
+        let rope_offset = cache.seq_len as u32;
+
+        let (qk_buf_ref, qk_offset, v_buf_ref, v_offset): (
+            &metal::BufferRef,
+            u64,
+            &metal::BufferRef,
+            u64,
+        );
+
+        if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
+            encoder.memory_barrier_with_resources(&[buf_as_resource(&cached.qkv_buf)]);
+            ops::rope::rope_ext_preresolved_into_encoder(
+                &cached.rope_pso,
+                &cached.qkv_buf,
+                0,
+                cos.metal_buffer(),
+                cos.offset() as u64,
+                sin.metal_buffer(),
+                sin.offset() as u64,
+                &cached.rope_buf,
+                0,
+                1,
+                head_dim as u32,
+                rope_offset,
+                1.0,
+                0,
+                1,
+                total_rope_heads as u64,
+                encoder,
+            );
+            qk_buf_ref = &cached.rope_buf;
+            qk_offset = 0;
+            v_buf_ref = &cached.qkv_buf;
+            v_offset = ((q_dim + k_dim) * elem_size) as u64;
+        } else {
+            qk_buf_ref = &cached.qkv_buf;
+            qk_offset = 0;
+            v_buf_ref = &cached.qkv_buf;
+            v_offset = ((q_dim + k_dim) * elem_size) as u64;
+        }
+
+        // Memory barrier: ensure rope/qkv output visible to KV copy
+        encoder.memory_barrier_with_resources(&[buf_as_resource(qk_buf_ref)]);
+
+        // KV cache append using direct buffer refs (Optimization B)
+        let k_roped_flat_offset = qk_offset + (q_dim * elem_size) as u64;
+        cache.append_direct_into_encoder(
+            qk_buf_ref,
+            k_roped_flat_offset,
+            v_buf_ref,
+            v_offset,
+            1,
+            &cached.copy_pso,
+            cached.copy_max_tg,
+            encoder,
+        )?;
+
+        // Memory barrier on KV slab buffers: KV copy -> SDPA read dependency
+        // (replaces encoder boundary from the 2-encoder path)
+        let k_slab = cache.keys_slab_view().ok_or_else(|| {
+            KernelError::InvalidShape("forward_cached: no keys slab after append".into())
+        })?;
+        let v_slab = cache.values_slab_view().ok_or_else(|| {
+            KernelError::InvalidShape("forward_cached: no values slab after append".into())
+        })?;
+        encoder.memory_barrier_with_resources(&[
+            buf_as_resource(k_slab.metal_buffer()),
+            buf_as_resource(v_slab.metal_buffer()),
+        ]);
+
+        let seq_len = cache.seq_len;
+        let max_seq = cache.max_seq_len();
+
+        // D4: SDPA decode -> attn_out_buf
+        ops::sdpa::sdpa_decode_preresolved_into_encoder(
+            &cached.sdpa_pso,
+            qk_buf_ref,
+            qk_offset,
+            k_slab.metal_buffer(),
+            k_slab.offset() as u64,
+            v_slab.metal_buffer(),
+            v_slab.offset() as u64,
+            &cached.attn_out_buf,
+            0,
+            &cached.dummy_mask_buf,
+            0,
+            num_heads as u32,
+            num_kv_heads as u32,
+            seq_len as u32,
+            head_dim as u32,
+            0,
+            max_seq as u32,
+            cached.scale,
+            encoder,
+        );
+        encoder.memory_barrier_with_resources(&[buf_as_resource(&cached.attn_out_buf)]);
+
+        // D5: gemv_bias(W_o, attn, x) -> h_buf (O_proj + residual add)
+        ops::gemv::gemv_bias_preresolved_into_encoder(
+            &cached.gemv_bias_oproj_pso,
+            o_weight.metal_buffer(),
+            o_weight.offset() as u64,
+            &cached.attn_out_buf,
+            0,
+            &cached.h_buf,
+            0,
+            cached.gemv_bias_oproj_m,
+            cached.gemv_bias_oproj_k,
+            x.metal_buffer(),
+            x.offset() as u64,
+            cached.gemv_bias_oproj_grid,
+            cached.gemv_bias_oproj_tg,
+            encoder,
+        );
+        encoder.memory_barrier_with_resources(&[buf_as_resource(&cached.h_buf)]);
+
+        // D6: rms_norm -> normed2_buf
+        ops::rms_norm::rms_norm_preresolved_into_encoder(
+            &cached.rms_norm2_pso,
+            &cached.h_buf,
+            0,
+            norm2_w.metal_buffer(),
+            norm2_w.offset() as u64,
+            &cached.normed2_buf,
+            0,
+            cached.rms_axis_size,
+            cached.rms_norm_eps,
+            cached.norm2_w_stride,
+            1,
+            1,
+            encoder,
+        );
+        encoder.memory_barrier_with_resources(&[buf_as_resource(&cached.normed2_buf)]);
+
+        // D7: gate_up gemv -> gate_up_buf
+        ops::gemv::gemv_preresolved_into_encoder(
+            &cached.gemv_gate_up_pso,
+            gate_up_w.metal_buffer(),
+            gate_up_w.offset() as u64,
+            &cached.normed2_buf,
+            0,
+            &cached.gate_up_buf,
+            0,
+            cached.gemv_gate_up_m,
+            cached.gemv_gate_up_k,
+            cached.gemv_gate_up_grid,
+            cached.gemv_gate_up_tg,
+            encoder,
+        );
+        encoder.memory_barrier_with_resources(&[buf_as_resource(&cached.gate_up_buf)]);
+
+        // D8: silu_mul -> silu_buf
+        let gate_dim = cached.intermediate_dim;
+        ops::fused::fused_silu_mul_preresolved_into_encoder(
+            &cached.silu_mul_pso,
+            &cached.gate_up_buf,
+            0,
+            &cached.gate_up_buf,
+            (gate_dim * elem_size) as u64,
+            &cached.silu_buf,
+            0,
+            cached.silu_numel,
+            cached.silu_elems_per_thread,
+            encoder,
+        );
+        encoder.memory_barrier_with_resources(&[buf_as_resource(&cached.silu_buf)]);
+
+        // D9: gemv_bias(W_down, silu, h) -> out_buf (down_proj + residual add)
+        ops::gemv::gemv_bias_preresolved_into_encoder(
+            &cached.gemv_bias_down_pso,
+            down_w.metal_buffer(),
+            down_w.offset() as u64,
+            &cached.silu_buf,
+            0,
+            &cached.out_buf,
+            0,
+            cached.gemv_bias_down_m,
+            cached.gemv_bias_down_k,
+            &cached.h_buf,
+            0,
+            cached.gemv_bias_down_grid,
+            cached.gemv_bias_down_tg,
+            encoder,
+        );
+
+        encoder.end_encoding();
+
+        // Return as [1, hidden_size]
+        Ok(Array::new(
+            cached.out_buf.clone(),
+            vec![1, hidden_size],
+            vec![hidden_size, 1],
+            cached.dtype,
+            0,
+        ))
+    }
+
     /// 9-dispatch forward using concurrent encoders for better GPU scheduling.
     #[allow(clippy::too_many_arguments)]
     pub fn forward_concurrent_9dispatch(
@@ -1763,6 +2063,16 @@ pub struct CachedDecode {
     pub scale: f32,
     pub norm1_w_stride: u32,
     pub norm2_w_stride: u32,
+
+    // --- Pre-cached threadgroup sizes (Optimization C) ---
+    /// Pre-computed SDPA threadgroup size: min(DECODE_THREADS, pso.max_total_threads)
+    pub sdpa_tg_size: u64,
+    /// Pre-computed RMS norm threadgroup size: min(1024, pso.max_total_threads)
+    pub rms_tg_size: u64,
+    /// Pre-computed RMS norm2 threadgroup size: min(1024, pso.max_total_threads)
+    pub rms2_tg_size: u64,
+    /// Pre-computed copy threadgroup size: min(max_threads, count)
+    pub copy_max_tg: u64,
 }
 
 impl CachedDecode {
@@ -1942,6 +2252,13 @@ impl CachedDecode {
 
         let scale = 1.0 / (head_dim as f32).sqrt();
 
+        // Pre-cache threadgroup sizes (Optimization C)
+        let sdpa_tg_size = std::cmp::min(256u64, sdpa_pso.max_total_threads_per_threadgroup());
+        let rms_tg_size = std::cmp::min(1024u64, rms_norm_pso.max_total_threads_per_threadgroup());
+        let rms2_tg_size =
+            std::cmp::min(1024u64, rms_norm2_pso.max_total_threads_per_threadgroup());
+        let copy_max_tg = copy_pso.max_total_threads_per_threadgroup();
+
         Ok(Self {
             rms_norm_pso,
             gemv_qkv_pso,
@@ -1992,6 +2309,10 @@ impl CachedDecode {
             scale,
             norm1_w_stride,
             norm2_w_stride,
+            sdpa_tg_size,
+            rms_tg_size,
+            rms2_tg_size,
+            copy_max_tg,
         })
     }
 }

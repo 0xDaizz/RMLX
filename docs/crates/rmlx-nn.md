@@ -896,9 +896,9 @@ Phase KO closes the per-layer decode performance gap with MLX:
 | ExecGraph (5 CB) | 2,735 | 40x | ~65 in 5 CBs |
 | Single-CB (44 enc) | 2,049 | 53x | 44 |
 | 9-Dispatch (4 enc) | 1,739 | 64x | 9 |
-| Cached 2-encoder (60L) | 1,367 us/L | 8% faster, 6x lower σ | 9 (2 encoders) |
-| MLX compiled (60L) | 2,513 us/L | -- | -- |
-| vs MLX (60L) | | 2.09x faster | |
+| Cached 2-encoder (60L) | 714 us/L | 6x lower σ | 9 (2 encoders) |
+| MLX compiled (60L) | 4,525 us/L | -- | -- |
+| vs MLX (60L) | | 6.34x faster | |
 
 ---
 

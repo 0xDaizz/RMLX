@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """MLX single transformer layer decode latency benchmark.
 
-Measures raw-op latency for a Llama-2 7B style decoder layer in decode mode
+Measures raw-op latency for a Llama-3 8B / Mixtral-style GQA decoder layer in decode mode
 (seq_len=1) for direct comparison with RMLX benchmarks.
 
 All operations use raw MLX primitives (no mlx.nn layers) for fair comparison.
@@ -17,13 +17,13 @@ import statistics
 import mlx.core as mx
 
 # ---------------------------------------------------------------------------
-# Llama-2 7B shapes
+# Llama-3 8B / Mixtral-style GQA shapes
 # ---------------------------------------------------------------------------
 HIDDEN_SIZE = 4096
 NUM_HEADS = 32
 HEAD_DIM = 128
-INTERMEDIATE_SIZE = 11008
-NUM_KV_HEADS = 32
+INTERMEDIATE_SIZE = 14336
+NUM_KV_HEADS = 8
 SEQ_LEN = 1          # decode
 KV_CACHE_LEN = 128   # existing cached tokens
 
@@ -64,18 +64,18 @@ def rms_norm(x, weight, eps=1e-5):
 # ---------------------------------------------------------------------------
 def layer_forward(x, w_qkv, w_o, w_gate_up, w_down, rms_w1, rms_w2,
                   k_cache, v_cache, rope_offset):
-    """Single Llama-2 7B decoder layer forward pass (decode mode).
+    """Single Llama-3 8B / Mixtral-style GQA decoder layer forward pass (decode mode).
 
     Args:
         x:          [1, 1, 4096]  input hidden state
-        w_qkv:      [4096, 12288] merged QKV projection  (32+32+32)*128 = 12288
+        w_qkv:      [4096, 6144]  merged QKV projection  (32+8+8)*128 = 6144
         w_o:        [4096, 4096]  output projection
-        w_gate_up:  [4096, 22016] merged gate+up projection (11008*2)
-        w_down:     [11008, 4096] down projection
+        w_gate_up:  [4096, 28672] merged gate+up projection (14336*2)
+        w_down:     [14336, 4096] down projection
         rms_w1:     [4096]        pre-attention RMS norm weight
         rms_w2:     [4096]        pre-FFN RMS norm weight
-        k_cache:    [1, 32, 128, 128]  key cache (KV_CACHE_LEN tokens)
-        v_cache:    [1, 32, 128, 128]  value cache
+        k_cache:    [1, 8, 128, 128]  key cache (KV_CACHE_LEN tokens)
+        v_cache:    [1, 8, 128, 128]  value cache
         rope_offset: int  position offset for RoPE
     """
     B = 1
@@ -84,26 +84,26 @@ def layer_forward(x, w_qkv, w_o, w_gate_up, w_down, rms_w1, rms_w2,
     normed = rms_norm(x, rms_w1)
 
     # --- QKV projection ---
-    # normed: [1, 1, 4096] @ w_qkv: [4096, 12288] -> [1, 1, 12288]
+    # normed: [1, 1, 4096] @ w_qkv: [4096, 6144] -> [1, 1, 6144]
     qkv = normed @ w_qkv
 
     # Split into Q, K, V
     q = qkv[..., :NUM_HEADS * HEAD_DIM]                                    # [1, 1, 4096]
-    k = qkv[..., NUM_HEADS * HEAD_DIM:NUM_HEADS * HEAD_DIM + NUM_KV_HEADS * HEAD_DIM]  # [1, 1, 4096]
-    v = qkv[..., NUM_HEADS * HEAD_DIM + NUM_KV_HEADS * HEAD_DIM:]          # [1, 1, 4096]
+    k = qkv[..., NUM_HEADS * HEAD_DIM:NUM_HEADS * HEAD_DIM + NUM_KV_HEADS * HEAD_DIM]  # [1, 1, 1024]
+    v = qkv[..., NUM_HEADS * HEAD_DIM + NUM_KV_HEADS * HEAD_DIM:]          # [1, 1, 1024]
 
     # Reshape to [B, n_heads, seq, head_dim]
     q = q.reshape(B, SEQ_LEN, NUM_HEADS, HEAD_DIM).transpose(0, 2, 1, 3)     # [1, 32, 1, 128]
-    k = k.reshape(B, SEQ_LEN, NUM_KV_HEADS, HEAD_DIM).transpose(0, 2, 1, 3)  # [1, 32, 1, 128]
-    v = v.reshape(B, SEQ_LEN, NUM_KV_HEADS, HEAD_DIM).transpose(0, 2, 1, 3)  # [1, 32, 1, 128]
+    k = k.reshape(B, SEQ_LEN, NUM_KV_HEADS, HEAD_DIM).transpose(0, 2, 1, 3)  # [1, 8, 1, 128]
+    v = v.reshape(B, SEQ_LEN, NUM_KV_HEADS, HEAD_DIM).transpose(0, 2, 1, 3)  # [1, 8, 1, 128]
 
     # --- RoPE ---
     q = apply_rope(q, rope_offset, HEAD_DIM)
     k = apply_rope(k, rope_offset, HEAD_DIM)
 
     # --- Append to KV cache ---
-    k_full = mx.concatenate([k_cache, k], axis=2)  # [1, 32, 129, 128]
-    v_full = mx.concatenate([v_cache, v], axis=2)   # [1, 32, 129, 128]
+    k_full = mx.concatenate([k_cache, k], axis=2)  # [1, 8, 129, 128]
+    v_full = mx.concatenate([v_cache, v], axis=2)   # [1, 8, 129, 128]
 
     # --- Scaled dot-product attention ---
     scale = HEAD_DIM ** -0.5
@@ -119,10 +119,10 @@ def layer_forward(x, w_qkv, w_o, w_gate_up, w_down, rms_w1, rms_w2,
     normed2 = rms_norm(x, rms_w2)
 
     # --- Gate+Up projection ---
-    # normed2: [1, 1, 4096] @ w_gate_up: [4096, 22016] -> [1, 1, 22016]
+    # normed2: [1, 1, 4096] @ w_gate_up: [4096, 28672] -> [1, 1, 28672]
     gate_up = normed2 @ w_gate_up
-    gate = gate_up[..., :INTERMEDIATE_SIZE]   # [1, 1, 11008]
-    up = gate_up[..., INTERMEDIATE_SIZE:]     # [1, 1, 11008]
+    gate = gate_up[..., :INTERMEDIATE_SIZE]   # [1, 1, 14336]
+    up = gate_up[..., INTERMEDIATE_SIZE:]     # [1, 1, 14336]
 
     # --- SiLU * gate ---
     ffn = (gate * mx.sigmoid(gate)) * up  # SiLU(gate) * up
@@ -165,7 +165,7 @@ def bench_per_op(x, w_qkv, w_o, w_gate_up, w_down, rms_w1, rms_w2,
     t_rms1 = bench_single("rms_norm (pre-attn)", lambda: rms_norm(x, rms_w1))
 
     # QKV projection
-    t_qkv = bench_single("qkv_proj [4096x12288]", lambda: normed @ w_qkv)
+    t_qkv = bench_single("qkv_proj [4096x6144]", lambda: normed @ w_qkv)
 
     qkv = normed @ w_qkv
     mx.eval(qkv)
@@ -205,7 +205,7 @@ def bench_per_op(x, w_qkv, w_o, w_gate_up, w_down, rms_w1, rms_w2,
     # Gate+Up projection
     normed2 = rms_norm(x2, rms_w2)
     mx.eval(normed2)
-    t_gateup = bench_single("gate_up_proj [4096x22016]", lambda: normed2 @ w_gate_up)
+    t_gateup = bench_single("gate_up_proj [4096x28672]", lambda: normed2 @ w_gate_up)
 
     # SiLU * gate
     gate_up = normed2 @ w_gate_up
@@ -218,7 +218,7 @@ def bench_per_op(x, w_qkv, w_o, w_gate_up, w_down, rms_w1, rms_w2,
     # Down projection
     ffn = (gate * mx.sigmoid(gate)) * up
     mx.eval(ffn)
-    t_down = bench_single("down_proj [11008x4096]", lambda: ffn @ w_down)
+    t_down = bench_single("down_proj [14336x4096]", lambda: ffn @ w_down)
 
     total = t_rms1 + t_qkv + t_rope + t_kv + t_sdpa + t_oproj + t_rms2 + t_gateup + t_silu + t_down
     print(f"  {'sum of ops':42s}  total={total:8.1f}us")
@@ -281,7 +281,7 @@ def main():
     print("MLX Multi-Layer Decode Latency Benchmark (raw ops)")
     print(f"  mlx version : {mx.__version__}")
     print(f"  device      : {mx.default_device()}")
-    print(f"  dtype       : float32")
+    print(f"  dtype       : float16")
     print(f"  hidden      : {HIDDEN_SIZE}")
     print(f"  heads       : {NUM_HEADS} (kv_heads={NUM_KV_HEADS})")
     print(f"  head_dim    : {HEAD_DIM}")
@@ -292,19 +292,19 @@ def main():
     print(f"  iters       : {args.iters}")
     print("=" * 72)
 
-    # --- Allocate weights (f32) ---
+    # --- Allocate weights (f16) ---
     scale = 0.01
-    w_qkv     = mx.random.normal((HIDDEN_SIZE, (NUM_HEADS + 2 * NUM_KV_HEADS) * HEAD_DIM)) * scale
-    w_o       = mx.random.normal((NUM_HEADS * HEAD_DIM, HIDDEN_SIZE)) * scale
-    w_gate_up = mx.random.normal((HIDDEN_SIZE, INTERMEDIATE_SIZE * 2)) * scale
-    w_down    = mx.random.normal((INTERMEDIATE_SIZE, HIDDEN_SIZE)) * scale
-    rms_w1    = mx.ones((HIDDEN_SIZE,))
-    rms_w2    = mx.ones((HIDDEN_SIZE,))
+    w_qkv     = (mx.random.normal((HIDDEN_SIZE, (NUM_HEADS + 2 * NUM_KV_HEADS) * HEAD_DIM)) * scale).astype(mx.float16)
+    w_o       = (mx.random.normal((NUM_HEADS * HEAD_DIM, HIDDEN_SIZE)) * scale).astype(mx.float16)
+    w_gate_up = (mx.random.normal((HIDDEN_SIZE, INTERMEDIATE_SIZE * 2)) * scale).astype(mx.float16)
+    w_down    = (mx.random.normal((INTERMEDIATE_SIZE, HIDDEN_SIZE)) * scale).astype(mx.float16)
+    rms_w1    = mx.ones((HIDDEN_SIZE,), dtype=mx.float16)
+    rms_w2    = mx.ones((HIDDEN_SIZE,), dtype=mx.float16)
 
     # --- Allocate input and KV cache ---
-    x = mx.random.normal((1, SEQ_LEN, HIDDEN_SIZE))
-    k_cache = mx.random.normal((1, NUM_KV_HEADS, KV_CACHE_LEN, HEAD_DIM)) * scale
-    v_cache = mx.random.normal((1, NUM_KV_HEADS, KV_CACHE_LEN, HEAD_DIM)) * scale
+    x = (mx.random.normal((1, SEQ_LEN, HIDDEN_SIZE)) * scale).astype(mx.float16)
+    k_cache = (mx.random.normal((1, NUM_KV_HEADS, KV_CACHE_LEN, HEAD_DIM)) * scale).astype(mx.float16)
+    v_cache = (mx.random.normal((1, NUM_KV_HEADS, KV_CACHE_LEN, HEAD_DIM)) * scale).astype(mx.float16)
     rope_offset = KV_CACHE_LEN
 
     # Force materialization
@@ -331,14 +331,14 @@ def main():
     layers_w = []
     for _ in range(4):
         lw = {
-            "w_qkv":     mx.random.normal((HIDDEN_SIZE, (NUM_HEADS + 2 * NUM_KV_HEADS) * HEAD_DIM)) * scale,
-            "w_o":       mx.random.normal((NUM_HEADS * HEAD_DIM, HIDDEN_SIZE)) * scale,
-            "w_gate_up": mx.random.normal((HIDDEN_SIZE, INTERMEDIATE_SIZE * 2)) * scale,
-            "w_down":    mx.random.normal((INTERMEDIATE_SIZE, HIDDEN_SIZE)) * scale,
-            "rms_w1":    mx.ones((HIDDEN_SIZE,)),
-            "rms_w2":    mx.ones((HIDDEN_SIZE,)),
-            "k_cache":   mx.random.normal((1, NUM_KV_HEADS, KV_CACHE_LEN, HEAD_DIM)) * scale,
-            "v_cache":   mx.random.normal((1, NUM_KV_HEADS, KV_CACHE_LEN, HEAD_DIM)) * scale,
+            "w_qkv":     (mx.random.normal((HIDDEN_SIZE, (NUM_HEADS + 2 * NUM_KV_HEADS) * HEAD_DIM)) * scale).astype(mx.float16),
+            "w_o":       (mx.random.normal((NUM_HEADS * HEAD_DIM, HIDDEN_SIZE)) * scale).astype(mx.float16),
+            "w_gate_up": (mx.random.normal((HIDDEN_SIZE, INTERMEDIATE_SIZE * 2)) * scale).astype(mx.float16),
+            "w_down":    (mx.random.normal((INTERMEDIATE_SIZE, HIDDEN_SIZE)) * scale).astype(mx.float16),
+            "rms_w1":    mx.ones((HIDDEN_SIZE,), dtype=mx.float16),
+            "rms_w2":    mx.ones((HIDDEN_SIZE,), dtype=mx.float16),
+            "k_cache":   (mx.random.normal((1, NUM_KV_HEADS, KV_CACHE_LEN, HEAD_DIM)) * scale).astype(mx.float16),
+            "v_cache":   (mx.random.normal((1, NUM_KV_HEADS, KV_CACHE_LEN, HEAD_DIM)) * scale).astype(mx.float16),
         }
         mx.eval(*lw.values())
         layers_w.append(lw)
@@ -364,14 +364,14 @@ def main():
         layers_w_n = []
         for _ in range(num_layers):
             lw = {
-                "w_qkv":     mx.random.normal((HIDDEN_SIZE, (NUM_HEADS + 2 * NUM_KV_HEADS) * HEAD_DIM)) * scale,
-                "w_o":       mx.random.normal((NUM_HEADS * HEAD_DIM, HIDDEN_SIZE)) * scale,
-                "w_gate_up": mx.random.normal((HIDDEN_SIZE, INTERMEDIATE_SIZE * 2)) * scale,
-                "w_down":    mx.random.normal((INTERMEDIATE_SIZE, HIDDEN_SIZE)) * scale,
-                "rms_w1":    mx.ones((HIDDEN_SIZE,)),
-                "rms_w2":    mx.ones((HIDDEN_SIZE,)),
-                "k_cache":   mx.random.normal((1, NUM_KV_HEADS, KV_CACHE_LEN, HEAD_DIM)) * scale,
-                "v_cache":   mx.random.normal((1, NUM_KV_HEADS, KV_CACHE_LEN, HEAD_DIM)) * scale,
+                "w_qkv":     (mx.random.normal((HIDDEN_SIZE, (NUM_HEADS + 2 * NUM_KV_HEADS) * HEAD_DIM)) * scale).astype(mx.float16),
+                "w_o":       (mx.random.normal((NUM_HEADS * HEAD_DIM, HIDDEN_SIZE)) * scale).astype(mx.float16),
+                "w_gate_up": (mx.random.normal((HIDDEN_SIZE, INTERMEDIATE_SIZE * 2)) * scale).astype(mx.float16),
+                "w_down":    (mx.random.normal((INTERMEDIATE_SIZE, HIDDEN_SIZE)) * scale).astype(mx.float16),
+                "rms_w1":    mx.ones((HIDDEN_SIZE,), dtype=mx.float16),
+                "rms_w2":    mx.ones((HIDDEN_SIZE,), dtype=mx.float16),
+                "k_cache":   (mx.random.normal((1, NUM_KV_HEADS, KV_CACHE_LEN, HEAD_DIM)) * scale).astype(mx.float16),
+                "v_cache":   (mx.random.normal((1, NUM_KV_HEADS, KV_CACHE_LEN, HEAD_DIM)) * scale).astype(mx.float16),
             }
             mx.eval(*lw.values())
             layers_w_n.append(lw)
