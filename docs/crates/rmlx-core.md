@@ -4,7 +4,7 @@
 
 `rmlx-core` is the Metal GPU compute engine, providing data types, N-dimensional arrays, a kernel registry, GPU compute kernels, automatic differentiation, LoRA fine-tuning, runtime metrics, structured logging, numerical stability monitoring, and graceful shutdown.
 
-> **Status:** DType (with FP8), Array, KernelRegistry, **32+ op modules** (including SDPA/FA2 with bf16 + backward, SiLU/SwiGLU, GELU, FP8 dequant/quant, Conv1d/Conv2d, tiled conv, GatherMM, LayerNorm, unary ops, concat, select, VJP GPU), GGUF format parser, AWQ/GPTQ dequant, VJP autodiff, LoRA, logging, metrics, PrecisionGuard, and ShutdownSignal are all implemented. Phase 0+1+2 audit remediation complete (items C1-C9). **Phase 3 additions:** FlashAttention-2 Metal kernel (`flash_attention.rs`) with tiled online softmax, f32 head_dim=128, causal mask, and naive SDPA fallback; all ops routed through centralized `commit_with_mode()` with sync/async `ExecMode` and `CommandBufferHandle` for async tracking. **Phase 4 addition:** Fused `rms_norm_residual_add` JIT Metal kernel combining input+residual add and RMSNorm in a single GPU dispatch. **Phase 5 additions:** 5 new op modules -- `slice.rs` (multi-dimensional slice with per-dimension start/end/stride, Metal kernel up to 8D, f32/f16/bf16), `sort.rs` (bitonic sort on Metal: sort/argsort, ascending/descending, any axis, up to 2048 elements), `scan.rs` (parallel prefix scan via Hillis-Steele: cumsum/cumprod along any axis), `argreduce.rs` (argmin/argmax reduction along any axis, SIMD reductions, UInt32 output), `random.rs` (Philox 4x32-10 PRNG: uniform/normal with deterministic seeding). **Phase KO additions:** GEMV BM=8 variant with dynamic tile selection, `_into_encoder` API pattern for single-encoder dispatch, Array::uninit and Array::to_private, batched SDPA decode kernel, layer_norm single-pass optimization, softmax N_READS coalescing. **Phase 8c additions:** `_preresolved_into_encoder` variants for GEMV, RMS norm, RoPE, SDPA decode, and fused SiLU*mul; GEMV BM8 barrier removal (6 spurious threadgroup barriers removed); f32 BM8 load widening from 2×float4 to 4×float4 (64B/thread); public kernel name helpers (`gemv_kernel_name`, `rms_norm_kernel_name_for`, `rope_table_kernel_name`, `sdpa_decode_kernel_name`, `silu_gate_kernel_name`).
+> **Status:** DType (with FP8), Array, KernelRegistry, **32+ op modules** (including SDPA/FA2 with bf16 + backward, SiLU/SwiGLU, GELU, FP8 dequant/quant, Conv1d/Conv2d, tiled conv, GatherMM, LayerNorm, unary ops, concat, select, VJP GPU), GGUF format parser, AWQ/GPTQ dequant, VJP autodiff, LoRA, logging, metrics, PrecisionGuard, and ShutdownSignal are all implemented. Phase 0+1+2 audit remediation complete (items C1-C9). **Phase 3 additions:** FlashAttention-2 Metal kernel (`flash_attention.rs`) with tiled online softmax, f32 head_dim=128, causal mask, and naive SDPA fallback; all ops routed through centralized `commit_with_mode()` with sync/async `ExecMode` and `CommandBufferHandle` for async tracking. **Phase 4 addition:** Fused `rms_norm_residual_add` JIT Metal kernel combining input+residual add and RMSNorm in a single GPU dispatch. **Phase 5 additions:** 5 new op modules -- `slice.rs` (multi-dimensional slice with per-dimension start/end/stride, Metal kernel up to 8D, f32/f16/bf16), `sort.rs` (bitonic sort on Metal: sort/argsort, ascending/descending, any axis, up to 2048 elements), `scan.rs` (parallel prefix scan via Hillis-Steele: cumsum/cumprod along any axis), `argreduce.rs` (argmin/argmax reduction along any axis, SIMD reductions, UInt32 output), `random.rs` (Philox 4x32-10 PRNG: uniform/normal with deterministic seeding). **Phase KO additions:** GEMV BM=8 variant with dynamic tile selection, `_into_encoder` API pattern for single-encoder dispatch, Array::uninit and Array::to_private, batched SDPA decode kernel, layer_norm single-pass optimization, softmax N_READS coalescing. **Phase 8c additions:** `_preresolved_into_encoder` variants for GEMV, RMS norm, RoPE, SDPA decode, and fused SiLU*mul; GEMV BM8 barrier removal (6 spurious threadgroup barriers removed); f32 BM8 load widening from 2×float4 to 4×float4 (64B/thread); public kernel name helpers (`gemv_kernel_name`, `rms_norm_kernel_name_for`, `rope_table_kernel_name`, `sdpa_decode_kernel_name`, `silu_gate_kernel_name`). **Phase 10 additions:** `fused_rms_gemv` (RMS norm + GEMV in single dispatch) and `fused_swiglu_down` (SiLU*gate + down GEMV in single dispatch), reducing decode pipeline from 9 to 7 dispatches, achieving 703.4 us/layer. **Phase 11 conclusion:** All kernel-level optimization experiments failed (col-major +84%, interleaved +2.2%, SRAM+f16+funcconst +3.6%); 73.6% bandwidth efficiency confirmed as practical floor for f16 decode on Apple Silicon.
 
 ---
 
@@ -387,6 +387,29 @@ New SDPA decode kernels optimized for the slab KV cache layout used in the 9-dis
 | `sdpa_decode_batched_slab_into_cb(registry, q, k_cache, v_cache, ...)` | Batched SDPA decode with slab KV cache layout |
 | `sdpa_decode_batched_slab_stride_into_cb(registry, q, k_cache, v_cache, ...)` | Stride-aware variant for non-contiguous slab layouts |
 | `gemv_bias_into_cb(registry, input, weight, bias, ...)` | Fused GEMV + bias in single dispatch |
+
+### Phase 10: Fused Decode Kernels
+
+Phase 10 introduces two fused Metal kernels that reduce the decode pipeline from 9 dispatches to 7, achieving 703.4 us/layer at 60L depth (M3 Ultra, f16).
+
+| Kernel | Description |
+|--------|-------------|
+| `fused_rms_gemv` | Combines RMS normalization and subsequent GEMV into a single dispatch. The threadgroup computes the RMS norm in-register and immediately feeds the result into the GEMV, avoiding a full round-trip through device memory. Used for both pre-attention and pre-FFN norm+projection stages. |
+| `fused_swiglu_down` | Combines SiLU activation, element-wise gate multiply, and down projection GEMV into a single dispatch. Eliminates the intermediate scratch buffer between SiLU*gate and down_proj. |
+
+Both fused kernels include automatic fallback: if the fused PSO fails to compile at init time, `CachedDecode` transparently falls back to the 9-dispatch path.
+
+### Phase 11: GEMV Kernel Optimization Experiments — CONCLUDED
+
+Phase 11 investigated three alternative GEMV kernel strategies to push below the 703.4 us/layer floor. All three failed:
+
+| Experiment | Result |
+|-----------|--------|
+| Column-major GEMV | +84% regression (strided output writes destroy throughput) |
+| Interleaved GEMV (4-way packed) | +2.2% regression (packing overhead negates bandwidth gain) |
+| SRAM prefetch + f16 accumulation + function constants | +3.6% regression (f16 precision loss forces wider tiles, SRAM pressure increases) |
+
+The experimental kernel variants remain in the codebase but are not on the hot path. Row-major BM8 GEMV with f32 accumulation at 73.6% bandwidth efficiency is the practical floor for f16 decode on Apple Silicon.
 
 ---
 

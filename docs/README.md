@@ -2,7 +2,7 @@
 
 > **A Rust-based Metal GPU ML framework optimized for Apple Silicon**
 >
-> Status: All Phases complete (0-9B-opt + S1-S5 + Phase KO + Audit Remediation) (1,142+ tests, 0 failures) | License: MIT | Rust 1.80+ | macOS (Apple Silicon)
+> Status: All Phases complete (0-9B-opt + S1-S5 + Phase KO + Phase 8c + Phase 9 + Phase 10 + Phase 11) (1,298 tests, 0 failures) | License: MIT | Rust 1.80+ | macOS (Apple Silicon)
 
 ---
 
@@ -35,8 +35,8 @@ MLX is an excellent framework, but it carries the following software overheads i
 2-node EP decode: 64ms/step -> 33ms/step (~30 tok/s)
 Achieve near-parity with single-node 32ms/step
 
-Phase KO result: ~109ms/layer -> ~0.71ms/layer (64x speedup, 6.34x faster than MLX at 60L depth)
-92.3% CB reduction, 98.5% CPU-GPU sync reduction
+Phase 10 result: 703.4 us/layer (fused 7-dispatch, 64x speedup, 6.34x faster than MLX at 60L depth)
+Phase 11 conclusion: kernel-level optimization CONCLUDED — 73.6% bandwidth efficiency is the practical floor
 ```
 
 The ultimate goal is to connect two Mac Studio M3 Ultras via Thunderbolt 5 RDMA and achieve inference performance nearly identical to a single node.
@@ -61,8 +61,9 @@ The ultimate goal is to connect two Mac Studio M3 Ultras via Thunderbolt 5 RDMA 
    Pre-allocates dual Metal + RDMA registered buffers, eliminating runtime registration overhead.
 
 6. **ExecGraph CB batching**
-   Phase KO further reduces to 9 dispatches per layer in a single CB, achieving 64x speedup
-   (~109ms → ~0.71ms), 6.34x faster than MLX at 60-layer depth.
+   Phase 10 fused 7-dispatch pipeline achieves 703.4 us/layer at 60L depth (64x speedup
+   vs baseline, 6.34x faster than MLX). Phase 11 confirmed this as the practical floor
+   for f16 decode on Apple Silicon (73.6% bandwidth efficiency).
 
 7. **Expert Parallelism (EP)**
    MLX has no built-in EP support. RMLX provides a complete EP stack: 3-zone auto backend policy (CPU/Metal/RDMA) that selects the optimal path by data size, 7 dedicated MoE Metal kernels, SparseGuard overflow monitoring with capacity auto-tuning, and compute-RDMA pipeline overlap for distributed MoE inference on models like Mixtral and DeepSeek-V3. Six post-audit EP optimization phases (EP-1 through EP-6) further eliminate CPU sync points with GPU-native top-k routing, replace per-expert loops with grouped GEMM, reduce wire bytes via variable-length v3 protocol + FP8 quantization, and overlap compute/communication with TBO/SBO pipelines.

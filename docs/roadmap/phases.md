@@ -1,6 +1,6 @@
-# Implementation Roadmap — Phases 0-9B + S1-S5 + Audit Remediation + Phase 3 + Phase 4 + Phase 5 Complete + Phase KO + Phase 8c + Phase 9 + Phase 10
+# Implementation Roadmap — Phases 0-9B + S1-S5 + Audit Remediation + Phase 3 + Phase 4 + Phase 5 Complete + Phase KO + Phase 8c + Phase 9 + Phase 10 + Phase 11
 
-The rmlx project implementation roadmap. All phases through 9B-opt and serving support phases S1-S5 are complete. A full-crate audit (Phases 0, 1, 2) has been completed with 76 remediation items resolved across all 6 crates. Phase 3 adds FlashAttention-2 Metal kernel, paged KV cache, continuous batching scheduler, centralized CB commit, f16/bf16 RDMA collectives, ring allreduce chunk rounding fix, MoePolicy thread safety, and CLI signal forwarding. Phase 4 adds performance and allocator improvements: atomic CAS allocation limits, pointer ownership validation, SmallBufferPool/LeakDetector/ResidencyManager wiring, ChipTuning per-generation GPU tuning, DiskPipelineCache with sha2 hashing, HazardTrackingModeUntracked, fused RMSNorm+residual add kernel, gather_mm batched MoE strategy, SlabRing condvar backpressure, ProgressEngine EP dispatch wiring, ICB sparse expert dispatch, and BFC-style allocator. Phase 5 (Feature Breadth) adds 5 new core ops (slice, sort, scan, argreduce, random), 11 new activations (16 total), full MLA and SlidingWindowAttention forward implementations, AWQ/GPTQ/K-quant quantization layers, prefix cache, chunked prefill, 4 full model architectures (LlamaModel, Qwen2Model, DeepSeekV3Model, MixtralModel), tree allreduce with auto selection, pipelined ring buffer, and topology-aware CLI backend selection. Current test count: 1,142+. Phase 8c adds CachedDecode with pre-resolved PSOs and pre-allocated scratch buffers, 2-encoder decode path, `_preresolved_into_encoder` pattern, and GEMV BM8 optimizations (barrier removal + widened f32 loads), achieving 714 us/layer at 60L depth (f16, 6x lower variance). Phase 10 (Kernel Fusion) adds fused_rms_gemv and fused_swiglu_down kernels, reducing the decode pipeline from 9 to 7 dispatches. Current test count: 1,151.
+The rmlx project implementation roadmap. All phases through 9B-opt and serving support phases S1-S5 are complete. A full-crate audit (Phases 0, 1, 2) has been completed with 76 remediation items resolved across all 6 crates. Phase 3 adds FlashAttention-2 Metal kernel, paged KV cache, continuous batching scheduler, centralized CB commit, f16/bf16 RDMA collectives, ring allreduce chunk rounding fix, MoePolicy thread safety, and CLI signal forwarding. Phase 4 adds performance and allocator improvements: atomic CAS allocation limits, pointer ownership validation, SmallBufferPool/LeakDetector/ResidencyManager wiring, ChipTuning per-generation GPU tuning, DiskPipelineCache with sha2 hashing, HazardTrackingModeUntracked, fused RMSNorm+residual add kernel, gather_mm batched MoE strategy, SlabRing condvar backpressure, ProgressEngine EP dispatch wiring, ICB sparse expert dispatch, and BFC-style allocator. Phase 5 (Feature Breadth) adds 5 new core ops (slice, sort, scan, argreduce, random), 11 new activations (16 total), full MLA and SlidingWindowAttention forward implementations, AWQ/GPTQ/K-quant quantization layers, prefix cache, chunked prefill, 4 full model architectures (LlamaModel, Qwen2Model, DeepSeekV3Model, MixtralModel), tree allreduce with auto selection, pipelined ring buffer, and topology-aware CLI backend selection. Current test count: 1,142+. Phase 8c adds CachedDecode with pre-resolved PSOs and pre-allocated scratch buffers, 2-encoder decode path, `_preresolved_into_encoder` pattern, and GEMV BM8 optimizations (barrier removal + widened f32 loads), achieving 714 us/layer at 60L depth (f16, 6x lower variance). Phase 10 (Kernel Fusion) adds fused_rms_gemv and fused_swiglu_down kernels, reducing the decode pipeline from 9 to 7 dispatches, achieving 703.4 us/layer. Phase 11 (GEMV Kernel Optimization Experiments) concluded that all kernel-level optimization attempts failed (col-major +84%, interleaved +2.2%, SRAM+f16+funcconst +3.6%); row-major BM8 GEMV with f32 accumulation at 705 us/layer is the practical floor for f16 decode on Apple Silicon (73.6% bandwidth efficiency). Current test count: 1,151.
 
 ---
 
@@ -58,7 +58,13 @@ The rmlx project implementation roadmap. All phases through 9B-opt and serving s
 | KO | Kernel Optimization | 9-dispatch decode, per-kernel efficiency, 64x speedup, 6.34x faster than MLX | Phase 6 (Infra) | Track 1 mostly complete, Track 2 partial |
 | 8c | Serial Decode Opts B-E | CachedDecode (pre-resolved PSOs + scratch buffers), 2-encoder decode, _preresolved pattern, GEMV BM8 barrier removal + f32 4×float4 loads | KO | Complete |
 | 9 | f16 Default + Framework Optimization | f16 default dtype, single-encoder decode, direct KV append, pre-cached threadgroup sizes | 8c | Complete |
-| 10 | Kernel Fusion | fused_rms_gemv (Fusion A), fused_swiglu_down (Fusion B), 9→7 dispatch pipeline, auto fallback | 9 | Complete |
+| 10 | Kernel Fusion | fused_rms_gemv (Fusion A), fused_swiglu_down (Fusion B), 9→7 dispatch pipeline, auto fallback — **703.4 us/layer** | 9 | Complete |
+| 11 | GEMV Kernel Optimization Experiments | Col-major GEMV (+84%), interleaved GEMV (+2.2%), SRAM prefetch + f16 acc + function constants (+3.6%) — all failed; 705 us/layer practical floor confirmed | 10 | Complete (concluded) |
+| 12 | GEMM Optimization (seq_len=N) | Tiled GEMM autotuning, split-K parallel reduction, prefill throughput | 11 | Planned |
+| 13 | Paged Attention + Speculative Decode Kernels | Paged KV SDPA kernel, tree attention, batch verify, variable-length KV append | 12 | Planned |
+| 14 | SDPA / Attention Optimization | Split-K SDPA for long sequences, GQA-optimized decode kernel, sliding window kernel | 12 | Planned |
+| 15 | Multi-Node RDMA Optimization | TP/EP end-to-end latency, compute-communication overlap, pipeline parallelism | 11 | Planned |
+| 16 | Memory Efficiency | KV cache quantization (f8/int8), dynamic memory pool, weight deduplication | 13 + 14 | Planned |
 | KO-2 | Decode Scratch Allocator | Pre-allocated workspace, bump alloc, StorageModePrivate | KO | Planned |
 | KO-3 | ICB Decode Replay | Record/replay 9-dispatch via Metal ICB, dynamic setBytes | KO + KO-2 | Planned |
 | EP-7 | ICB Full Metal Indirect Dispatch | Wire SparseExpertPlan into ExpertGroup GEMM encoding via Metal ICB indirect dispatch; skip empty experts at GPU command level | EP-6 | Planned |
@@ -125,6 +131,7 @@ The rmlx project implementation roadmap. All phases through 9B-opt and serving s
 | Phase 8c: Serial Decode Optimizations B-E | phase8c/serial-decode-opts-bce | 1,298 tests | Complete |
 | Phase 9: f16 Default + Framework Optimization | main | 1,298 tests | Complete |
 | Phase 10: Kernel Fusion | phase10/kernel-fusion | 1,151 tests | Complete |
+| Phase 11: GEMV Kernel Optimization Experiments | main | 1,151 tests | Complete (concluded — no improvement) |
 | Phase KO-2: Decode Scratch Allocator | -- | -- | Planned |
 | Phase KO-3: ICB Decode Replay | -- | -- | Planned |
 | EP-7: ICB Full Metal Indirect Dispatch | -- | -- | Planned |
@@ -145,7 +152,7 @@ graph LR
     P7["Phase 7<br/>Production<br/>Complete"]
     P8["Phase 8<br/>KV Cache + API<br/>Complete"]
     P9["Phase 9<br/>GPU Pipeline<br/>Complete"]
-    PKO["Phase KO<br/>Kernel Optimization<br/>In Progress"]
+    PKO["Phase KO<br/>Kernel Optimization<br/>Complete"]
 
     P0 --> P1
     P0 --> P2
@@ -181,7 +188,7 @@ graph LR
     style P7 fill:#22c55e,color:#fff
     style P8 fill:#22c55e,color:#fff
     style P9 fill:#22c55e,color:#fff
-    style PKO fill:#f59e0b,color:#fff
+    style PKO fill:#22c55e,color:#fff
     style PS1 fill:#22c55e,color:#fff
     style PS2 fill:#22c55e,color:#fff
     style PS3 fill:#22c55e,color:#fff
@@ -607,7 +614,7 @@ Reduce inter-kernel dispatch overhead by fusing adjacent operations in the decod
 | Metric | Before (Phase 9) | After (Phase 10) |
 |--------|------------------:|------------------:|
 | Dispatches per layer | 9 | **7** |
-| Target latency (60L) | 714 us/L | **600-650 us/L** (pending benchmarks) |
+| Actual latency (60L) | 714 us/L | **703.4 us/L** (M3 Ultra, f16, 60L) |
 | Tests | 1,142 | **1,151** |
 
 ### Definition of Done (DoD)
@@ -617,6 +624,150 @@ Reduce inter-kernel dispatch overhead by fusing adjacent operations in the decod
 - [x] 7-dispatch pipeline end-to-end decode test passes
 - [x] Automatic fallback to 9-dispatch verified
 - [x] 1,151 tests passing
+
+---
+
+## Phase 12: GEMM Optimization (seq_len=N) — Planned
+
+### Goal
+
+Optimize the GEMM (General Matrix Multiply) path for seq_len > 1 workloads — prefill, prompt processing, and speculative decode verification. Phase 11 concluded seq_len=1 (GEMV) optimization; this phase targets the compute-bound regime.
+
+### Framework (rmlx-core / rmlx-nn) Deliverables
+
+- **GEMM autotuning**: Systematic tile-size search (TM/TN/TK) per GPU generation and matrix dimensions. Offline profiling → lookup table at init.
+- **Split-K parallel reduction**: Partition K dimension across threadgroups for better GPU utilization on small-M, large-K shapes (seq_len=4~64).
+- **Small-batch GEMM (seq_len=3~8)**: Optimized path for speculative decode verification — neither GEMV nor full tiled GEMM. Candidate: persistent threadgroup with warp-level accumulation.
+- **Fused GEMM+bias+activation**: Combine projection + bias + SiLU/GELU in a single kernel for FFN prefill.
+
+### Serving Layer (rmlx-serve) Responsibility
+
+- Chunked prefill scheduling (split long prompts into chunks for interleaving with decode)
+- Prefill/decode phase management and priority arbitration
+
+### Definition of Done (DoD)
+
+- [ ] GEMM autotuning framework with per-GPU-generation presets
+- [ ] Split-K GEMM kernel for small-M shapes
+- [ ] Small-batch GEMM path (seq_len=3~8) benchmarked against baseline
+- [ ] Prefill throughput (tokens/sec) measured and documented
+
+---
+
+## Phase 13: Paged Attention + Speculative Decode Kernels — Planned
+
+### Goal
+
+Provide GPU kernel primitives required by paged memory management and speculative decoding. These are **framework-level building blocks** that the serving layer orchestrates.
+
+### Framework (rmlx-core / rmlx-nn) Deliverables
+
+- **Paged SDPA kernel**: Attention kernel that reads KV via block page table (indirect indexing into non-contiguous KV blocks). Replaces contiguous-slab assumption in current SDPA decode kernel.
+- **Variable-length KV cache append**: Append K tokens (K=1~8) to KV cache in a single dispatch, supporting both contiguous slab and paged layouts.
+- **Tree attention kernel**: Causal mask from tree structure (for tree-based speculative decoding). Supports variable-depth draft trees.
+- **Batch verify kernel**: Given K draft logits and K target logits, compute acceptance probabilities and rejection sampling in a single GPU dispatch.
+- **Batch sampling kernel**: Top-k / top-p / temperature sampling across multiple positions simultaneously.
+
+### Serving Layer (rmlx-serve) Responsibility
+
+- Page block allocator (alloc/free/eviction policy, copy-on-write)
+- Draft model selection and speculation depth policy
+- Rejection sampling orchestration and token acceptance logic
+- Request-level KV cache lifecycle management
+
+### Definition of Done (DoD)
+
+- [ ] Paged SDPA decode kernel with block table indirection
+- [ ] Variable-length KV append (1~8 tokens per call)
+- [ ] Tree attention with arbitrary tree mask
+- [ ] Batch verify + rejection sampling kernel
+- [ ] Correctness tests against non-paged / single-token baselines
+
+---
+
+## Phase 14: SDPA / Attention Optimization — Planned
+
+### Goal
+
+Improve attention kernel performance for diverse sequence lengths and model architectures.
+
+### Framework (rmlx-core / rmlx-nn) Deliverables
+
+- **Split-K SDPA for long sequences**: Partition KV sequence across threadgroups for S > 2048. Current single-threadgroup decode kernel saturates at ~4K tokens.
+- **GQA-optimized decode kernel**: Specialized kernel for grouped-query attention (num_kv_heads << num_heads) — avoid redundant KV reads by broadcasting across Q head groups.
+- **Sliding window attention kernel**: Efficient attention with fixed window size (e.g., Mistral's 4096-window). Skip KV entries outside window at block granularity.
+- **MLA (Multi-head Latent Attention) kernel**: Optimized kernel for DeepSeek-style latent attention with compressed KV.
+
+### Serving Layer (rmlx-serve) Responsibility
+
+- Context length management and truncation policy
+- Dynamic window size configuration per model
+
+### Definition of Done (DoD)
+
+- [ ] Split-K SDPA benchmarked at S=2048, 4096, 8192, 16384
+- [ ] GQA kernel with measured KV bandwidth reduction
+- [ ] Sliding window kernel with block-skip verification
+- [ ] MLA kernel matching DeepSeek reference output
+
+---
+
+## Phase 15: Multi-Node RDMA Optimization — Planned
+
+### Goal
+
+Optimize the existing RDMA/TB5 infrastructure for production-grade distributed inference. TP (Tensor Parallelism) and EP (Expert Parallelism) end-to-end latency.
+
+### Framework (rmlx-core / rmlx-distributed) Deliverables
+
+- **Compute-communication overlap**: Pipeline GEMM computation with allreduce for TP — overlap current layer's allreduce with next layer's GEMM.
+- **Fused allreduce + residual add**: Combine RDMA receive completion with residual connection in a single kernel, avoiding extra memory round-trip.
+- **EP dispatch coalescing**: Batch multiple expert dispatches into fewer RDMA operations. Reduce per-expert overhead for sparse MoE.
+- **Pipeline parallelism**: Layer-level pipeline across nodes for models that exceed single-node memory.
+- **Multi-path striping**: Utilize dual TB5 links for 2x bandwidth (infrastructure exists in Phase 6, needs optimization).
+
+### Serving Layer (rmlx-serve) Responsibility
+
+- Node health monitoring and failover
+- Load balancing across nodes
+- Model placement strategy (which layers on which nodes)
+
+### Definition of Done (DoD)
+
+- [ ] TP allreduce overlapped with compute (measured overlap %)
+- [ ] EP dispatch latency reduced vs Phase 4 baseline
+- [ ] Pipeline parallelism with 2+ node verified
+- [ ] Dual-TB5 bandwidth utilization measured
+
+---
+
+## Phase 16: Memory Efficiency — Planned
+
+### Goal
+
+Reduce GPU memory footprint to enable larger models and longer contexts on fixed hardware.
+
+### Framework (rmlx-core / rmlx-nn) Deliverables
+
+- **KV cache quantization**: Store KV cache in f8/int8 with per-head or per-block scales. Dequantize on-the-fly in SDPA kernel. 2-4x KV memory reduction.
+- **Dynamic memory pool**: Replace fixed StorageModePrivate allocations with a BFC-style pool that grows/shrinks based on actual usage. Reduce peak memory waste.
+- **Weight deduplication**: Shared layers (e.g., tied embeddings) reference same buffer. Eliminate redundant copies.
+- **Activation checkpointing**: For prefill, trade compute for memory by recomputing activations instead of storing all intermediate results.
+
+### Serving Layer (rmlx-serve) Responsibility
+
+- Memory budget enforcement per request
+- KV cache eviction policy (LRU, priority-based)
+- OOM handling and graceful degradation
+
+### Definition of Done (DoD)
+
+- [ ] KV cache f8 quantization with SDPA integration
+- [ ] Dynamic memory pool with measured peak reduction
+- [ ] Weight dedup for tied embeddings
+- [ ] Memory usage profiled across model sizes (7B, 13B, 70B)
+
+---
 
 ## Phase S3a: Flash Attention 2 — Complete (previously Phase 10)
 
