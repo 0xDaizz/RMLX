@@ -471,6 +471,15 @@ fn encode_gemm(
         &batch_stride_c as *const u32 as *const std::ffi::c_void,
     );
 
+    // Steel and Full/Skinny kernels require swizzle_log (buffer 9)
+    if matches!(
+        tile.variant,
+        super::matmul::TileVariant::Full | super::matmul::TileVariant::Skinny
+    ) {
+        let swizzle_log = super::matmul::compute_swizzle_log(m as usize, tile.bm);
+        enc.set_bytes(9, 4, &swizzle_log as *const u32 as *const std::ffi::c_void);
+    }
+
     let grid = MTLSize::new(grid_x, grid_y, 1);
     let tg = MTLSize::new(tg_threads, 1, 1);
     enc.dispatch_thread_groups(grid, tg);

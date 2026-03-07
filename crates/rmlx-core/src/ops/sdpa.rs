@@ -1029,7 +1029,7 @@ kernel void sdpa_decode_batched_f16(
 //   2: V      [num_kv_heads * S * D]  — all KV heads contiguous
 //   3: O      [num_heads * N * D]     — output, same layout as Q
 //   4: mask   [N * S] or dummy        — additive mask (shared across heads)
-//   5: params [8 x uint32]: { N, S, D, has_mask, is_causal, num_heads, num_kv_heads, gqa_ratio }
+//   5: params [10 x uint32]: { N, S, D, has_mask, is_causal, num_heads, num_kv_heads, gqa_ratio, n_q_blocks, kv_stride_S }
 //   6: scale  [float]
 //
 // Threads per threadgroup: 128
@@ -1037,6 +1037,7 @@ kernel void sdpa_decode_batched_f16(
 // Grid is dispatched as 1D: grid.x = n_q_blocks * num_kv_heads
 // We compute q_block_id and kv_head_id from the flat threadgroup index.
 // params[8] = n_q_blocks (grid stride for kv_head decomposition)
+// params[9] = kv_stride_S (inter-head stride in KV slab, may be > S for pre-alloc cache)
 
 kernel void sdpa_prefill_gqa_f16(
     device const half*  Q         [[buffer(0)]],
@@ -1060,6 +1061,7 @@ kernel void sdpa_prefill_gqa_f16(
     const uint num_kv_heads = params[6];
     const uint gqa_ratio  = params[7];  // num_heads / num_kv_heads
     const uint n_q_blocks = params[8];  // ceil(N / Br)
+    const uint kv_stride_S = params[9]; // inter-head stride (may be > S for pre-alloc cache)
 
     const uint q_block_id = tg_flat % n_q_blocks;
     const uint kv_head_id = tg_flat / n_q_blocks;
@@ -1072,9 +1074,9 @@ kernel void sdpa_prefill_gqa_f16(
     const uint n_threads = 128;
     const uint D_lo = min(D, 128u);
 
-    // KV pointers for this KV head
-    device const half* K_head = K + kv_head_id * S * D;
-    device const half* V_head = V + kv_head_id * S * D;
+    // KV pointers for this KV head (use kv_stride_S for inter-head offset)
+    device const half* K_head = K + kv_head_id * kv_stride_S * D;
+    device const half* V_head = V + kv_head_id * kv_stride_S * D;
 
     const uint n_kv_blocks = (S + Bc_f16 - 1) / Bc_f16;
 
@@ -2146,6 +2148,10 @@ pub fn sdpa_batched_into_cb(
 /// - `q_slab`: `[num_heads, N, D]` (contiguous Q for all heads)
 /// - `k_slab`: `[num_kv_heads, S, D]` (contiguous K for all KV heads)
 /// - `v_slab`: `[num_kv_heads, S, D]` (contiguous V for all KV heads)
+/// - `kv_seq_stride`: optional inter-head stride for KV slabs. When `Some(max_seq_len)`,
+///   the kernel uses `max_seq_len * D` for KV head offsets instead of `kv_len * D`.
+///   Use this when KV comes from a pre-allocated cache with `max_seq_len` stride.
+///   When `None`, stride equals `kv_len` (backward compatible).
 /// - `mask`: optional `[N, S]` (shared across heads)
 ///
 /// Returns: `[num_heads, N, D]` output slab.
@@ -2160,6 +2166,7 @@ pub fn sdpa_prefill_gqa_slab_into_cb(
     head_dim: usize,
     seq_len: usize,
     kv_len: usize,
+    kv_seq_stride: Option<usize>,
     mask: Option<&Array>,
     scale: f32,
     is_causal: bool,
@@ -2187,6 +2194,12 @@ pub fn sdpa_prefill_gqa_slab_into_cb(
     }
 
     let gqa_ratio = num_heads / num_kv_heads;
+    let stride_s = kv_seq_stride.unwrap_or(kv_len);
+    if stride_s < kv_len {
+        return Err(KernelError::InvalidShape(format!(
+            "sdpa_prefill_gqa: kv_seq_stride ({stride_s}) must be >= kv_len ({kv_len})"
+        )));
+    }
 
     let pipeline = registry.get_pipeline("sdpa_prefill_gqa_f16", dtype)?;
     let dev = registry.device().raw();
@@ -2197,7 +2210,7 @@ pub fn sdpa_prefill_gqa_slab_into_cb(
     let has_mask_u32: u32 = if mask.is_some() { 1 } else { 0 };
     let is_causal_u32: u32 = if is_causal { 1 } else { 0 };
     let n_q_blocks = seq_len.div_ceil(BR);
-    let params: [u32; 9] = [
+    let params: [u32; 10] = [
         seq_len as u32,
         kv_len as u32,
         head_dim as u32,
@@ -2207,6 +2220,7 @@ pub fn sdpa_prefill_gqa_slab_into_cb(
         num_kv_heads as u32,
         gqa_ratio as u32,
         n_q_blocks as u32,
+        stride_s as u32,
     ];
 
     let dummy_buf;
@@ -2227,7 +2241,7 @@ pub fn sdpa_prefill_gqa_slab_into_cb(
     encoder.set_buffer(4, Some(mask_buf), mask_offset);
     encoder.set_bytes(
         5,
-        std::mem::size_of::<[u32; 9]>() as u64,
+        std::mem::size_of::<[u32; 10]>() as u64,
         params.as_ptr() as *const std::ffi::c_void,
     );
     encoder.set_bytes(6, 4, &scale as *const f32 as *const std::ffi::c_void);
@@ -2867,6 +2881,7 @@ mod tests {
             head_dim,
             seq_len,
             kv_len,
+            None, // kv_seq_stride = kv_len (contiguous)
             None,
             scale,
             is_causal,

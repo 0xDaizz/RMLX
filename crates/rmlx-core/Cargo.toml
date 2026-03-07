@@ -21,3 +21,7 @@ half = { workspace = true }
 [[bench]]
 name = "ops_bench"
 harness = false
+
+[[bench]]
+name = "gemm_bench"
+harness = false

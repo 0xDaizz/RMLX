@@ -239,7 +239,7 @@ def main():
     block = LlamaTransformerBlock(CONFIG)
 
     # Cast all weights to float16
-    block.update(block.apply(lambda p, x: x.astype(mx.float16)))
+    block.update(block.apply(lambda x: x.astype(mx.float16)))
     mx.eval(block.parameters())
 
     # Run benchmarks

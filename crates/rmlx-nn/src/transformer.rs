@@ -2649,6 +2649,59 @@ impl TransformerBlock {
         self.ffn.forward_single_cb(&normed2, &h, registry, cb)
     }
 
+    /// Single-CB forward pass for prefill (seq_len >= 1).
+    ///
+    /// Encodes the entire transformer block (attention + FFN) into one command
+    /// buffer with no intermediate commit/wait. This eliminates ~54 sync points
+    /// per layer that the standard `forward()` path incurs.
+    ///
+    /// **Prerequisites:**
+    /// - `prepare_weights_for_graph()` must have been called so that all
+    ///   projection weights (Q/K/V/O, gate/up/down) are pre-transposed.
+    /// - The KV cache must be pre-allocated (`max_seq_len > 0`).
+    ///
+    /// Does NOT commit or wait on the CB — the caller manages its lifecycle.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_prefill_single_cb(
+        &self,
+        x: &Array,
+        cos_freqs: Option<&Array>,
+        sin_freqs: Option<&Array>,
+        mask: Option<&Array>,
+        cache: &mut LayerKvCache,
+        registry: &KernelRegistry,
+        cb: &metal::CommandBufferRef,
+    ) -> Result<Array, KernelError> {
+        let norm1_w = self.norm1_weight.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape("TransformerBlock: norm1_weight not loaded".into())
+        })?;
+        let norm2_w = self.norm2_weight.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape("TransformerBlock: norm2_weight not loaded".into())
+        })?;
+
+        // Attention (all in same CB — norm + Q/K/V + deinterleave/RoPE
+        //   + cache append + SDPA + head concat + O_proj)
+        let attn_out = self.attention.forward_prefill_single_cb(
+            x,
+            norm1_w,
+            self.rms_norm_eps,
+            cos_freqs,
+            sin_freqs,
+            mask,
+            cache,
+            registry,
+            cb,
+        )?;
+
+        // Residual + pre-FFN norm
+        let h = ops::binary::add_into_cb(registry, x, &attn_out, cb)?;
+        let normed2 =
+            ops::rms_norm::rms_norm_into_cb(registry, &h, Some(norm2_w), self.rms_norm_eps, cb)?;
+
+        // FFN (all in same CB)
+        self.ffn.forward_single_cb(&normed2, &h, registry, cb)
+    }
+
     /// Full ExecGraph forward pass (5 CBs total).
     ///
     /// CB1: RMS norm + Q/K/V projections (fused)

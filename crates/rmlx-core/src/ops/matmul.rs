@@ -4,9 +4,12 @@
 //! operations on Apple Silicon.
 //!
 //! Kernel variants:
+//! - **Steel GEMM** (BM=64, BN=64, BK=16): 64 threads (2 simdgroups),
+//!   MLX-style serpentine MMA, single-buffered with bank-conflict padding.
+//!   Used for f16 when M >= 33, N >= 33.
 //! - **Full tile GEMM** (BM=64, BN=64, BK=32): 256 threads (8 simdgroups),
 //!   half-precision shared memory, double buffering, simdgroup MMA.
-//!   Used for M >= 33.
+//!   Used for f32/bf16 when M >= 33.
 //! - **Skinny GEMM** (BM=32, BN=128, BK=32): optimized for M=5..32 (small
 //!   batch prefill) with high N-direction parallelism.
 //! - **Small tile GEMM** (BM=16, BN=16, BK=16): for tiny matrices (M,N < 33).
@@ -87,6 +90,7 @@ kernel void gemm_tiled_f32(
     constant uint& batch_stride_a [[buffer(6)]],
     constant uint& batch_stride_b [[buffer(7)]],
     constant uint& batch_stride_c [[buffer(8)]],
+    constant uint& swizzle_log    [[buffer(9)]],
     uint3 group_id        [[threadgroup_position_in_grid]],
     uint  tid_in_group    [[thread_index_in_threadgroup]],
     uint  sgid            [[simdgroup_index_in_threadgroup]],
@@ -97,8 +101,9 @@ kernel void gemm_tiled_f32(
     threadgroup float Bs[2][BK * BN];  // 2 * 32 * 64 * 4 = 16KB
 
     const uint batch_idx = group_id.z;
-    const uint row_start = group_id.y * as_uniform(BM);
-    const uint col_start = group_id.x * as_uniform(BN);
+    uint2 swizzled = swizzle_threadgroup(uint2(group_id.x, group_id.y), swizzle_log);
+    const uint row_start = swizzled.y * as_uniform(BM);
+    const uint col_start = swizzled.x * as_uniform(BN);
 
     device const float* A_batch = A + batch_idx * as_uniform(batch_stride_a);
     device const float* B_batch = B + batch_idx * as_uniform(batch_stride_b);
@@ -237,6 +242,7 @@ kernel void gemm_tiled_f16(
     constant uint& batch_stride_a [[buffer(6)]],
     constant uint& batch_stride_b [[buffer(7)]],
     constant uint& batch_stride_c [[buffer(8)]],
+    constant uint& swizzle_log    [[buffer(9)]],
     uint3 group_id        [[threadgroup_position_in_grid]],
     uint  tid_in_group    [[thread_index_in_threadgroup]],
     uint  sgid            [[simdgroup_index_in_threadgroup]],
@@ -248,8 +254,9 @@ kernel void gemm_tiled_f16(
     threadgroup half Bs[2][BK * BN];
 
     const uint batch_idx = group_id.z;
-    const uint row_start = group_id.y * as_uniform(BM);
-    const uint col_start = group_id.x * as_uniform(BN);
+    uint2 swizzled = swizzle_threadgroup(uint2(group_id.x, group_id.y), swizzle_log);
+    const uint row_start = swizzled.y * as_uniform(BM);
+    const uint col_start = swizzled.x * as_uniform(BN);
 
     device const half* A_batch = A + batch_idx * as_uniform(batch_stride_a);
     device const half* B_batch = B + batch_idx * as_uniform(batch_stride_b);
@@ -382,6 +389,7 @@ kernel void gemm_tiled_bf16(
     constant uint& batch_stride_a [[buffer(6)]],
     constant uint& batch_stride_b [[buffer(7)]],
     constant uint& batch_stride_c [[buffer(8)]],
+    constant uint& swizzle_log    [[buffer(9)]],
     uint3 group_id         [[threadgroup_position_in_grid]],
     uint  tid_in_group     [[thread_index_in_threadgroup]],
     uint  sgid             [[simdgroup_index_in_threadgroup]],
@@ -391,8 +399,9 @@ kernel void gemm_tiled_bf16(
     threadgroup bfloat Bs[2][BK * BN];
 
     const uint batch_idx = group_id.z;
-    const uint row_start = group_id.y * as_uniform(BM);
-    const uint col_start = group_id.x * as_uniform(BN);
+    uint2 swizzled = swizzle_threadgroup(uint2(group_id.x, group_id.y), swizzle_log);
+    const uint row_start = swizzled.y * as_uniform(BM);
+    const uint col_start = swizzled.x * as_uniform(BN);
 
     device const bfloat* A_batch = A + batch_idx * as_uniform(batch_stride_a);
     device const bfloat* B_batch = B + batch_idx * as_uniform(batch_stride_b);
@@ -819,6 +828,14 @@ METAL_FUNC T as_uniform(T val) {
 }
 #endif
 
+inline uint2 swizzle_threadgroup(uint2 tid, uint swizzle_log) {
+    if (swizzle_log == 0) return tid;
+    return uint2(
+        tid.x >> swizzle_log,
+        (tid.y << swizzle_log) | (tid.x & ((1u << swizzle_log) - 1u))
+    );
+}
+
 // f32 skinny GEMM
 kernel void gemm_skinny_f32(
     device const float* A [[buffer(0)]],
@@ -830,6 +847,7 @@ kernel void gemm_skinny_f32(
     constant uint& batch_stride_a [[buffer(6)]],
     constant uint& batch_stride_b [[buffer(7)]],
     constant uint& batch_stride_c [[buffer(8)]],
+    constant uint& swizzle_log    [[buffer(9)]],
     uint3 group_id        [[threadgroup_position_in_grid]],
     uint  tid_in_group    [[thread_index_in_threadgroup]],
     uint  sgid            [[simdgroup_index_in_threadgroup]],
@@ -845,8 +863,9 @@ kernel void gemm_skinny_f32(
     threadgroup float Bs[SBK * SBN];   // 32 * 128 * 4 = 16KB
 
     const uint batch_idx = group_id.z;
-    const uint row_start = group_id.y * as_uniform(SBM);
-    const uint col_start = group_id.x * as_uniform(SBN);
+    uint2 swizzled = swizzle_threadgroup(uint2(group_id.x, group_id.y), swizzle_log);
+    const uint row_start = swizzled.y * as_uniform(SBM);
+    const uint col_start = swizzled.x * as_uniform(SBN);
 
     device const float* A_batch = A + batch_idx * as_uniform(batch_stride_a);
     device const float* B_batch = B + batch_idx * as_uniform(batch_stride_b);
@@ -945,6 +964,7 @@ kernel void gemm_skinny_f16(
     constant uint& batch_stride_a [[buffer(6)]],
     constant uint& batch_stride_b [[buffer(7)]],
     constant uint& batch_stride_c [[buffer(8)]],
+    constant uint& swizzle_log    [[buffer(9)]],
     uint3 group_id        [[threadgroup_position_in_grid]],
     uint  tid_in_group    [[thread_index_in_threadgroup]],
     uint  sgid            [[simdgroup_index_in_threadgroup]],
@@ -954,8 +974,9 @@ kernel void gemm_skinny_f16(
     threadgroup half Bs[SBK * SBN];   // 32 * 128 * 2 = 8KB
 
     const uint batch_idx = group_id.z;
-    const uint row_start = group_id.y * as_uniform(SBM);
-    const uint col_start = group_id.x * as_uniform(SBN);
+    uint2 swizzled = swizzle_threadgroup(uint2(group_id.x, group_id.y), swizzle_log);
+    const uint row_start = swizzled.y * as_uniform(SBM);
+    const uint col_start = swizzled.x * as_uniform(SBN);
 
     device const half* A_batch = A + batch_idx * as_uniform(batch_stride_a);
     device const half* B_batch = B + batch_idx * as_uniform(batch_stride_b);
@@ -1052,6 +1073,7 @@ kernel void gemm_skinny_bf16(
     constant uint& batch_stride_a [[buffer(6)]],
     constant uint& batch_stride_b [[buffer(7)]],
     constant uint& batch_stride_c [[buffer(8)]],
+    constant uint& swizzle_log    [[buffer(9)]],
     uint3 group_id         [[threadgroup_position_in_grid]],
     uint  tid_in_group     [[thread_index_in_threadgroup]],
     uint  sgid             [[simdgroup_index_in_threadgroup]],
@@ -1061,8 +1083,9 @@ kernel void gemm_skinny_bf16(
     threadgroup float Bs[SBK * SBN];
 
     const uint batch_idx = group_id.z;
-    const uint row_start = group_id.y * as_uniform(SBM);
-    const uint col_start = group_id.x * as_uniform(SBN);
+    uint2 swizzled = swizzle_threadgroup(uint2(group_id.x, group_id.y), swizzle_log);
+    const uint row_start = swizzled.y * as_uniform(SBM);
+    const uint col_start = swizzled.x * as_uniform(SBN);
 
     device const bfloat* A_batch = A + batch_idx * as_uniform(batch_stride_a);
     device const bfloat* B_batch = B + batch_idx * as_uniform(batch_stride_b);
@@ -1921,6 +1944,17 @@ fn dispatch_tiled_gemm(
     enc.set_buffer(7, Some(&bsb_buf), 0);
     enc.set_buffer(8, Some(&bsc_buf), 0);
 
+    // Pass swizzle_log for Full and Skinny variants (buffer 9)
+    let swizzle_log_buf = match tile.variant {
+        TileVariant::Full | TileVariant::Skinny => {
+            let swizzle_log = compute_swizzle_log(m, tile.bm);
+            let buf = make_u32_buf(dev, swizzle_log);
+            enc.set_buffer(9, Some(&buf), 0);
+            Some(buf)
+        }
+        _ => None,
+    };
+
     let grid_x = ceil_div(n, tile.bn) as u64;
     let grid_y = ceil_div(m, tile.bm) as u64;
     let grid_z = batch as u64;
@@ -1930,13 +1964,14 @@ fn dispatch_tiled_gemm(
     let tg_threads = match tile.variant {
         TileVariant::Small => (16 * 16) as u64,      // 256
         TileVariant::Medium | TileVariant::Simd => (32 * 32) as u64, // 1024
-        TileVariant::Skinny => 256_u64,               // 8 simdgroups
-        TileVariant::Full => 256_u64,                  // 8 simdgroups
+        TileVariant::Skinny | TileVariant::Full => 256_u64, // 8 simdgroups
     };
     let tg = MTLSize::new(tg_threads, 1, 1);
 
     enc.dispatch_thread_groups(grid, tg);
     enc.end_encoding();
+    // Keep swizzle_log_buf alive until after encoding
+    drop(swizzle_log_buf);
     super::commit_with_mode(cb, super::ExecMode::Sync);
 
     Ok(out)
@@ -2028,6 +2063,206 @@ pub fn matmul_align_constants(
         (200, FunctionConstantValue::Bool(m % bm == 0)),
         (201, FunctionConstantValue::Bool(n % bn == 0)),
     ]
+}
+
+// ---------------------------------------------------------------------------
+// Public API: matmul_into_cb — encode into an existing command buffer
+// ---------------------------------------------------------------------------
+
+/// Matrix multiply encoded into an existing command buffer (no commit/wait).
+///
+/// Like [`matmul`] but does not create its own command buffer. The caller is
+/// responsible for committing and waiting on `cb`.
+///
+/// **Inputs must be contiguous.** If either `a` or `b` is non-contiguous this
+/// function returns an error. The prefill path should pre-transpose weights
+/// before calling this.
+///
+/// Supports the same dispatch hierarchy as `matmul`:
+/// - M=1 → GEMV via `gemv_into_cb` (B^T @ a_vec)
+/// - N=1 → GEMV via `gemv_into_cb` (A @ b_vec)
+/// - M>=5 → tiled GEMM (Small / Skinny / Simd / Medium / Full)
+///
+/// Split-K is **not** supported in this path (it requires a two-pass
+/// encode with an intermediate buffer; the caller should use `matmul()` for
+/// K-dominated problems).
+pub fn matmul_into_cb(
+    registry: &KernelRegistry,
+    a: &Array,
+    b: &Array,
+    cb: &metal::CommandBufferRef,
+) -> Result<Array, KernelError> {
+    // --- Validation ---
+    if a.ndim() != 2 {
+        return Err(KernelError::InvalidShape(format!(
+            "matmul_into_cb requires 2D arrays, a is {}D",
+            a.ndim()
+        )));
+    }
+    if b.ndim() != 2 {
+        return Err(KernelError::InvalidShape(format!(
+            "matmul_into_cb requires 2D arrays, b is {}D",
+            b.ndim()
+        )));
+    }
+    if a.shape()[1] != b.shape()[0] {
+        return Err(KernelError::InvalidShape(format!(
+            "inner dimensions must match: {} vs {}",
+            a.shape()[1],
+            b.shape()[0]
+        )));
+    }
+    if a.dtype() != b.dtype() {
+        return Err(KernelError::InvalidShape(format!(
+            "dtypes must match: {:?} vs {:?}",
+            a.dtype(),
+            b.dtype()
+        )));
+    }
+    if !a.is_contiguous() {
+        return Err(KernelError::InvalidShape(
+            "matmul_into_cb: input `a` must be contiguous".to_string(),
+        ));
+    }
+    if !b.is_contiguous() {
+        return Err(KernelError::InvalidShape(
+            "matmul_into_cb: input `b` must be contiguous".to_string(),
+        ));
+    }
+
+    let m = a.shape()[0];
+    let k = a.shape()[1];
+    let n = b.shape()[1];
+
+    // -------------------------------------------------------------------
+    // GEMV fast-paths (same logic as matmul)
+    // -------------------------------------------------------------------
+
+    // Case 1: M=1 — [1,K] @ [K,N] → transpose B to [N,K], GEMV → [N], reshape [1,N]
+    if m == 1 {
+        let a_vec = Array::new(
+            a.metal_buffer().to_owned(),
+            vec![k],
+            vec![1],
+            a.dtype(),
+            a.offset(),
+        );
+        // B is [K,N] row-major. We need B^T = [N,K] contiguous for GEMV.
+        let b_t_view = b.view(vec![n, k], vec![1, n], b.offset());
+        let b_t = super::copy::copy_into_cb(registry, &b_t_view, cb)?;
+        let result = super::gemv::gemv_into_cb(registry, &b_t, &a_vec, cb)?;
+        return Ok(Array::new(
+            result.metal_buffer().to_owned(),
+            vec![1, n],
+            vec![n, 1],
+            result.dtype(),
+            result.offset(),
+        ));
+    }
+
+    // Case 2: N=1 — [M,K] @ [K,1] → GEMV A @ b_vec → [M], reshape [M,1]
+    if n == 1 {
+        let b_vec = Array::new(
+            b.metal_buffer().to_owned(),
+            vec![k],
+            vec![1],
+            b.dtype(),
+            b.offset(),
+        );
+        let result = super::gemv::gemv_into_cb(registry, a, &b_vec, cb)?;
+        return Ok(Array::new(
+            result.metal_buffer().to_owned(),
+            vec![m, 1],
+            vec![1, 1],
+            result.dtype(),
+            result.offset(),
+        ));
+    }
+
+    // -------------------------------------------------------------------
+    // Tiled GEMM dispatch (batch=1)
+    // -------------------------------------------------------------------
+    let tile = select_tile_config(m, n, k);
+
+    let kernel_name = match (tile.variant, a.dtype()) {
+        (TileVariant::Small, DType::Float32) => "gemm_small_f32",
+        (TileVariant::Small, DType::Float16) => "gemm_small_f16",
+        (TileVariant::Small, DType::Bfloat16) => "gemm_small_bf16",
+        (TileVariant::Simd, DType::Float32) | (TileVariant::Medium, DType::Float32) => {
+            "gemm_simd_f32"
+        }
+        (TileVariant::Simd, DType::Float16) | (TileVariant::Medium, DType::Float16) => {
+            "gemm_simd_f16"
+        }
+        (TileVariant::Simd, DType::Bfloat16) | (TileVariant::Medium, DType::Bfloat16) => {
+            "gemm_simd_bf16"
+        }
+        (TileVariant::Skinny, DType::Float32) => "gemm_skinny_f32",
+        (TileVariant::Skinny, DType::Float16) => "gemm_skinny_f16",
+        (TileVariant::Skinny, DType::Bfloat16) => "gemm_skinny_bf16",
+        (TileVariant::Full, DType::Float32) => "gemm_tiled_f32",
+        (TileVariant::Full, DType::Float16) => "gemm_tiled_f16",
+        (TileVariant::Full, DType::Bfloat16) => "gemm_tiled_bf16",
+        _ => {
+            return Err(KernelError::NotFound(format!(
+                "matmul_into_cb: unsupported dtype {:?}",
+                a.dtype()
+            )))
+        }
+    };
+
+    let pipeline = registry.get_pipeline(kernel_name, a.dtype())?;
+    let dev = registry.device().raw();
+    let out = Array::zeros(dev, &[m, n], a.dtype());
+
+    let m_buf = make_u32_buf(dev, super::checked_u32(m, "M")?);
+    let n_buf = make_u32_buf(dev, super::checked_u32(n, "N")?);
+    let k_buf = make_u32_buf(dev, super::checked_u32(k, "K")?);
+    let bsa_buf = make_u32_buf(dev, super::checked_u32(m * k, "batch_stride_a")?);
+    let bsb_buf = make_u32_buf(dev, super::checked_u32(k * n, "batch_stride_b")?);
+    let bsc_buf = make_u32_buf(dev, super::checked_u32(m * n, "batch_stride_c")?);
+
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_buffer(0, Some(a.metal_buffer()), a.offset() as u64);
+    enc.set_buffer(1, Some(b.metal_buffer()), b.offset() as u64);
+    enc.set_buffer(2, Some(out.metal_buffer()), 0);
+    enc.set_buffer(3, Some(&m_buf), 0);
+    enc.set_buffer(4, Some(&n_buf), 0);
+    enc.set_buffer(5, Some(&k_buf), 0);
+    enc.set_buffer(6, Some(&bsa_buf), 0);
+    enc.set_buffer(7, Some(&bsb_buf), 0);
+    enc.set_buffer(8, Some(&bsc_buf), 0);
+
+    // Pass swizzle_log for Full and Skinny variants (buffer 9)
+    let swizzle_log_buf = match tile.variant {
+        TileVariant::Full | TileVariant::Skinny => {
+            let swizzle_log = compute_swizzle_log(m, tile.bm);
+            let buf = make_u32_buf(dev, swizzle_log);
+            enc.set_buffer(9, Some(&buf), 0);
+            Some(buf)
+        }
+        _ => None,
+    };
+
+    let grid_x = ceil_div(n, tile.bn) as u64;
+    let grid_y = ceil_div(m, tile.bm) as u64;
+    let grid = MTLSize::new(grid_x, grid_y, 1); // batch=1
+
+    // Thread count per threadgroup depends on variant
+    let tg_threads = match tile.variant {
+        TileVariant::Small => 256_u64,
+        TileVariant::Medium | TileVariant::Simd => 1024_u64,
+        TileVariant::Skinny | TileVariant::Full => 256_u64,
+    };
+    let tg = MTLSize::new(tg_threads, 1, 1);
+
+    enc.dispatch_thread_groups(grid, tg);
+    enc.end_encoding();
+    // Keep swizzle_log_buf alive until after encoding
+    drop(swizzle_log_buf);
+
+    Ok(out)
 }
 
 #[cfg(test)]

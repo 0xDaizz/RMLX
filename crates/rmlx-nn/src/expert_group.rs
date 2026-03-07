@@ -539,6 +539,7 @@ fn encode_gemm(
             )));
         }
     };
+
     let pipeline = registry.get_pipeline(kernel_name, dtype)?;
 
     let dev = registry.device().raw();
@@ -569,6 +570,19 @@ fn encode_gemm(
     enc.set_buffer(7, Some(&bsb_buf), 0);
     enc.set_buffer(8, Some(&bsc_buf), 0);
 
+    // Steel and Full/Skinny kernels require swizzle_log (buffer 9)
+    let swizzle_log_buf = if matches!(
+        tile.variant,
+        ops::matmul::TileVariant::Full | ops::matmul::TileVariant::Skinny
+    ) {
+        let swizzle_log = ops::matmul::compute_swizzle_log(m as usize, tile.bm);
+        let buf = make_u32_buf(dev, swizzle_log);
+        enc.set_buffer(9, Some(&buf), 0);
+        Some(buf)
+    } else {
+        None
+    };
+
     let tg_threads = match tile.variant {
         ops::matmul::TileVariant::Small => 256_u64,
         ops::matmul::TileVariant::Medium | ops::matmul::TileVariant::Simd => 1024_u64,
@@ -579,6 +593,7 @@ fn encode_gemm(
     let tg = metal::MTLSize::new(tg_threads, 1, 1);
     enc.dispatch_thread_groups(grid, tg);
     enc.end_encoding();
+    drop(swizzle_log_buf);
 
     Ok(())
 }

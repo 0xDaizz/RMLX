@@ -2650,6 +2650,165 @@ impl Attention {
         self.o_proj.forward_into_cb(&concat, registry, cb)
     }
 
+    /// Single-CB forward pass for prefill (seq_len >= 1).
+    ///
+    /// Encodes the entire attention block into the provided command buffer:
+    ///   RMS norm → Q/K/V projections → deinterleave + RoPE → KV cache append
+    ///   → SDPA → pack heads → interleave → O projection
+    ///
+    /// **Requires** `prepare_weights_for_graph()` to have been called beforehand
+    /// so that projection weights are pre-transposed for GEMM.
+    ///
+    /// KV cache handling: uses `append_into_cb` which encodes copy dispatches
+    /// into the same command buffer (no separate commit/wait).
+    ///
+    /// Does NOT commit or wait — the caller manages the CB lifecycle.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_prefill_single_cb(
+        &self,
+        x: &Array,
+        norm_weight: &Array,
+        rms_norm_eps: f32,
+        cos_freqs: Option<&Array>,
+        sin_freqs: Option<&Array>,
+        mask: Option<&Array>,
+        cache: &mut LayerKvCache,
+        registry: &KernelRegistry,
+        cb: &metal::CommandBufferRef,
+    ) -> Result<Array, KernelError> {
+        let num_heads = self.config.num_heads;
+        let num_kv_heads = self.config.num_kv_heads;
+        let head_dim = self.config.head_dim;
+        let hidden_size = num_heads * head_dim;
+        let seq_len = x.shape()[0];
+
+        // RMS norm (pre-attention)
+        let normed =
+            ops::rms_norm::rms_norm_into_cb(registry, x, Some(norm_weight), rms_norm_eps, cb)?;
+
+        // Q/K/V projections (GEMM, all into same CB)
+        let q = self.q_proj.forward_into_cb(&normed, registry, cb)?;
+        let k = self.k_proj.forward_into_cb(&normed, registry, cb)?;
+        let v = self.v_proj.forward_into_cb(&normed, registry, cb)?;
+
+        let elem_size = q.dtype().size_of();
+        let rope_offset = cache.seq_len as u32;
+
+        // Deinterleave + RoPE for Q and K; deinterleave-only for V
+        // Output layout: [num_heads * seq_len, head_dim] (batch-major)
+        let q_batched;
+        let k_batched;
+        let v_batched;
+
+        if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
+            q_batched = ops::rope::rope_multihead_into_cb(
+                registry, &q, cos, sin, num_heads, rope_offset, cb,
+            )?;
+            k_batched = ops::rope::rope_multihead_into_cb(
+                registry, &k, cos, sin, num_kv_heads, rope_offset, cb,
+            )?;
+            v_batched = ops::rope::deinterleave_heads_into_cb(
+                registry, &v, num_kv_heads, cb,
+            )?;
+        } else {
+            q_batched = ops::rope::deinterleave_heads_into_cb(
+                registry, &q, num_heads, cb,
+            )?;
+            k_batched = ops::rope::deinterleave_heads_into_cb(
+                registry, &k, num_kv_heads, cb,
+            )?;
+            v_batched = ops::rope::deinterleave_heads_into_cb(
+                registry, &v, num_kv_heads, cb,
+            )?;
+        }
+
+        // Create per-head views for KV cache append (zero-copy into batched output)
+        let head_elems = seq_len * head_dim;
+        let k_heads: Vec<Array> = (0..num_kv_heads)
+            .map(|h| {
+                k_batched.view(
+                    vec![seq_len, head_dim],
+                    vec![head_dim, 1],
+                    k_batched.offset() + h * head_elems * elem_size,
+                )
+            })
+            .collect();
+        let v_heads: Vec<Array> = (0..num_kv_heads)
+            .map(|h| {
+                v_batched.view(
+                    vec![seq_len, head_dim],
+                    vec![head_dim, 1],
+                    v_batched.offset() + h * head_elems * elem_size,
+                )
+            })
+            .collect();
+
+        // KV cache append (into same CB — no separate commit/wait)
+        cache.append_into_cb(k_heads, v_heads, seq_len, registry, cb)?;
+        let total_seq = cache.seq_len;
+
+        // Single-dispatch GQA SDPA over all heads using contiguous slabs.
+        // Q slab: [num_heads * seq_len * head_dim] from deinterleave/RoPE
+        // K/V slabs: from cache slab with max_seq_len stride between heads
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let k_slab = cache.keys_slab_view().ok_or_else(|| {
+            KernelError::InvalidShape(
+                "forward_prefill_single_cb: cache has no slab layout (use preallocated cache)"
+                    .into(),
+            )
+        })?;
+        let v_slab = cache.values_slab_view().ok_or_else(|| {
+            KernelError::InvalidShape(
+                "forward_prefill_single_cb: cache has no slab layout (use preallocated cache)"
+                    .into(),
+            )
+        })?;
+
+        let kv_stride = if cache.max_seq_len() != total_seq {
+            Some(cache.max_seq_len())
+        } else {
+            None // contiguous, no stride override needed
+        };
+
+        let attn_slab = ops::sdpa::sdpa_prefill_gqa_slab_into_cb(
+            registry,
+            &q_batched,
+            &k_slab,
+            &v_slab,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            seq_len,
+            total_seq,
+            kv_stride,
+            mask,
+            scale,
+            mask.is_none(), // use kernel causal masking only when no explicit mask provided
+            cb,
+        )?;
+
+        // Output slab is [num_heads * seq_len * head_dim] (head-major).
+        // Reshape to [num_heads * seq_len, head_dim] for interleave.
+        let packed = attn_slab.view(
+            vec![num_heads * seq_len, head_dim],
+            vec![head_dim, 1],
+            attn_slab.offset(),
+        );
+
+        // Interleave [num_heads, seq_len, head_dim] → [seq_len, hidden_size]
+        let concat = if seq_len == 1 {
+            // For seq_len=1, head-major == token-major: [1, hidden_size]
+            packed.view(vec![1, hidden_size], vec![hidden_size, 1], packed.offset())
+        } else {
+            ops::rope::interleave_heads_into_cb(
+                registry, &packed, num_heads, seq_len, cb,
+            )?
+        };
+
+        // O projection
+        self.o_proj.forward_into_cb(&concat, registry, cb)
+    }
+
     // -----------------------------------------------------------------------
     // 9-dispatch path: merged QKV weight + batched SDPA + fused residual
     // -----------------------------------------------------------------------

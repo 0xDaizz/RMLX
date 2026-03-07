@@ -256,6 +256,21 @@ fn estimate_bytes(seq_len: usize) -> f64 {
 // Benchmark entry point
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// MLX reference numbers (hardcoded from earlier benchmark runs)
+// ---------------------------------------------------------------------------
+
+fn mlx_ref_us(seq_len: usize) -> Option<f64> {
+    match seq_len {
+        128 => Some(3466.0),
+        256 => Some(6743.0),
+        512 => Some(14872.0),
+        1024 => Some(42618.0),
+        2048 => Some(153721.0),
+        _ => None,
+    }
+}
+
 fn main() {
     let gpu = GpuDevice::system_default().expect("Metal GPU device required");
     println!(
@@ -279,8 +294,14 @@ fn main() {
         WARMUP_ITERS, BENCH_ITERS
     );
 
-    // Build transformer block (f16)
+    // Build transformer blocks (f16) — one for baseline, one for single_cb
     let block = build_transformer_block(device);
+    let mut block_cb = build_transformer_block(device);
+
+    // Pre-transpose weights for the single_cb path
+    block_cb
+        .prepare_weights_for_graph(&registry, &queue)
+        .expect("prepare_weights_for_graph failed");
 
     // Precompute RoPE cos/sin tables: shape [MAX_SEQ_LEN, HEAD_DIM/2]
     let (cos_vec, sin_vec) =
@@ -289,17 +310,12 @@ fn main() {
     let cos_full = Array::from_slice(device, &cos_vec, vec![MAX_SEQ_LEN, HEAD_DIM / 2]);
     let sin_full = Array::from_slice(device, &sin_vec, vec![MAX_SEQ_LEN, HEAD_DIM / 2]);
 
-    println!("\n{}", "=".repeat(120));
-    println!(
-        "{:>8} | {:>12} | {:>14} | {:>12} | {}",
-        "seq_len", "latency (us)", "tokens/sec", "BW (GB/s)", "distribution"
-    );
-    println!("{}", "-".repeat(120));
-
-    // Collect results for summary table
-    let mut results: Vec<(usize, Stats, f64, f64)> = Vec::new();
+    // Collect results for summary table: (seq_len, forward_stats, single_cb_stats)
+    let mut results: Vec<(usize, Stats, Stats)> = Vec::new();
 
     for &seq_len in SEQ_LENS {
+        println!("\nseq_len={}:", seq_len);
+
         // Slice RoPE tables to [seq_len, HEAD_DIM/2] (view into precomputed table)
         let cos_freqs = cos_full
             .slice(0, 0, seq_len)
@@ -314,31 +330,16 @@ fn main() {
         // Input: [seq_len, HIDDEN_SIZE]
         let input = rand_array(device, &[seq_len, HIDDEN_SIZE], 42);
 
-        // KV cache (preallocated)
-        let mut cache =
-            LayerKvCache::preallocated(device, NUM_KV_HEADS, HEAD_DIM, MAX_SEQ_LEN, DType::Float16);
-
-        // Warmup
-        for _ in 0..WARMUP_ITERS {
-            cache.seq_len = 0;
-            let _ = block.forward(
-                &input,
-                Some(&cos_freqs),
-                Some(&sin_freqs),
-                Some(&mask),
-                Some(&mut cache),
-                &registry,
-                &queue,
+        // ---- Benchmark 1: forward() baseline ----
+        {
+            let mut cache = LayerKvCache::preallocated(
+                device, NUM_KV_HEADS, HEAD_DIM, MAX_SEQ_LEN, DType::Float16,
             );
-        }
 
-        // Benchmark
-        let mut latencies = Vec::with_capacity(BENCH_ITERS);
-        for _ in 0..BENCH_ITERS {
-            cache.seq_len = 0;
-            let start = Instant::now();
-            let _ = block
-                .forward(
+            // Warmup
+            for _ in 0..WARMUP_ITERS {
+                cache.seq_len = 0;
+                let _ = block.forward(
                     &input,
                     Some(&cos_freqs),
                     Some(&sin_freqs),
@@ -346,39 +347,106 @@ fn main() {
                     Some(&mut cache),
                     &registry,
                     &queue,
-                )
-                .expect("forward failed");
-            latencies.push(start.elapsed());
+                );
+            }
+
+            // Benchmark
+            let mut latencies = Vec::with_capacity(BENCH_ITERS);
+            for _ in 0..BENCH_ITERS {
+                cache.seq_len = 0;
+                let start = Instant::now();
+                let _ = block
+                    .forward(
+                        &input,
+                        Some(&cos_freqs),
+                        Some(&sin_freqs),
+                        Some(&mask),
+                        Some(&mut cache),
+                        &registry,
+                        &queue,
+                    )
+                    .expect("forward failed");
+                latencies.push(start.elapsed());
+            }
+
+            let stats = Stats::from_durations(&latencies);
+            println!("  forward()              : {}", stats);
+
+            // ---- Benchmark 2: forward_prefill_single_cb() ----
+            let mut cache_cb = LayerKvCache::preallocated(
+                device, NUM_KV_HEADS, HEAD_DIM, MAX_SEQ_LEN, DType::Float16,
+            );
+
+            // Warmup
+            for _ in 0..WARMUP_ITERS {
+                cache_cb.seq_len = 0;
+                let cb = queue.new_command_buffer();
+                let _ = block_cb.forward_prefill_single_cb(
+                    &input,
+                    Some(&cos_freqs),
+                    Some(&sin_freqs),
+                    Some(&mask),
+                    &mut cache_cb,
+                    &registry,
+                    cb,
+                );
+                cb.commit();
+                cb.wait_until_completed();
+            }
+
+            // Benchmark
+            let mut latencies_cb = Vec::with_capacity(BENCH_ITERS);
+            for _ in 0..BENCH_ITERS {
+                cache_cb.seq_len = 0;
+                let cb = queue.new_command_buffer();
+                let start = Instant::now();
+                let _ = block_cb
+                    .forward_prefill_single_cb(
+                        &input,
+                        Some(&cos_freqs),
+                        Some(&sin_freqs),
+                        Some(&mask),
+                        &mut cache_cb,
+                        &registry,
+                        cb,
+                    )
+                    .expect("forward_prefill_single_cb failed");
+                cb.commit();
+                cb.wait_until_completed();
+                latencies_cb.push(start.elapsed());
+            }
+
+            let stats_cb = Stats::from_durations(&latencies_cb);
+            let speedup = stats.mean / stats_cb.mean;
+            println!(
+                "  prefill_single_cb()    : {}   speedup={:.2}x",
+                stats_cb, speedup
+            );
+
+            results.push((seq_len, stats, stats_cb));
         }
-
-        let stats = Stats::from_durations(&latencies);
-        let tokens_per_sec = seq_len as f64 / (stats.mean * 1e-6);
-        let total_bytes = estimate_bytes(seq_len);
-        let bw_gb_s = total_bytes / (stats.mean * 1e-6) / 1e9;
-
-        println!(
-            "{:>8} | {:>12.1} | {:>14.0} | {:>12.1} | {}",
-            seq_len, stats.mean, tokens_per_sec, bw_gb_s, stats
-        );
-
-        results.push((seq_len, stats, tokens_per_sec, bw_gb_s));
     }
 
-    // Summary table
-    println!("{}", "=".repeat(120));
-    println!("\nSummary:");
+    // Comparison summary table
+    println!("\n{}", "=".repeat(80));
+    println!("========== Comparison ==========");
     println!(
-        "{:>8} {:>12} {:>14} {:>12} {:>12}",
-        "seq_len", "p50 (us)", "tokens/sec", "BW (GB/s)", "us/token"
+        "{:>8} | {:>14} | {:>14} | {:>8} | {:>12}",
+        "seq_len", "forward (us)", "single_cb (us)", "speedup", "MLX ref (us)"
     );
-    println!("{}", "-".repeat(62));
-    for (seq_len, stats, tps, bw) in &results {
-        let us_per_token = stats.p50 / *seq_len as f64;
+    println!("{}", "-".repeat(80));
+    for (seq_len, fwd_stats, cb_stats) in &results {
+        let speedup = fwd_stats.mean / cb_stats.mean;
+        let mlx_str = match mlx_ref_us(*seq_len) {
+            Some(v) => format!("{:.0}", v),
+            None => "-".to_string(),
+        };
         println!(
-            "{:>8} {:>12.1} {:>14.0} {:>12.1} {:>12.2}",
-            seq_len, stats.p50, tps, bw, us_per_token
+            "{:>8} | {:>14.0} | {:>14.0} | {:>7.2}x | {:>12}",
+            seq_len, fwd_stats.mean, cb_stats.mean, speedup, mlx_str
         );
     }
+    println!("{}", "=".repeat(80));
 
     // Weight size reference
     let weight_mb = estimate_bytes(0) / 1e6;
