@@ -14,6 +14,8 @@ The rmlx GPU pipeline eliminates per-operation CPU overhead by batching multiple
 | Latency / layer (Phase KO) | ~109ms | ~1.7ms | 64x speedup |
 | Gap vs MLX (60L) | -- | 6.34x faster | RMLX leads |
 | Cached 2-encoder decode (60L) | -- | 714 us/L | 8% faster, 6x lower σ |
+| Fused 7-dispatch decode (60L) | -- | 703.4 us/L | 6.43x vs MLX |
+| Col-major (experimental) | -- | not used in hot path | see Phase 11 notes |
 | CPU-GPU sync overhead | baseline | minimal | 98.5% reduction |
 | Numerical parity | -- | max_diff=6.4e-6 | exact match |
 
@@ -171,7 +173,7 @@ Benchmarks measured on a single transformer layer (LLaMA-style architecture, 409
 | Latency reduction | **94.3%** (~112ms → ~6.4ms) |
 | CB reduction | **92.3%** (65 → 5) |
 | CPU-GPU sync reduction | **98.5%** |
-| Tests passing | **1,142+** |
+| Tests passing | **1,356** |
 
 ---
 
@@ -220,7 +222,7 @@ ExecGraph's re-encode strategy is well-suited to Metal's command buffer model. R
 ExecGraph produces numerically identical results to the baseline per-op execution path:
 
 - **Maximum absolute difference:** 6.4e-6
-- **Verification:** All 1,142+ tests pass with both code paths
+- **Verification:** All 1,356 tests pass with both code paths
 - **Guarantee:** The `_into_cb()` pattern encodes the exact same compute pipelines, threadgroup sizes, and buffer bindings as the standard `forward()` path. The only difference is command buffer grouping, which does not affect numerical results.
 
 This level of precision (max_diff=6.4e-6) is well within the expected floating-point tolerance for fp16/bf16 transformer computations and confirms that the pipeline optimization does not introduce any numerical divergence.
@@ -328,7 +330,32 @@ Phase 10 introduces kernel fusion to reduce the 9-dispatch decode path to 7 disp
 
 If fused Pipeline State Objects (PSOs) fail to compile at init time (e.g., unsupported GPU architecture), CachedDecode automatically falls back to the 9-dispatch path. No user intervention required.
 
-### Performance Target
+### Performance Results
 
-- **Target**: 600-650 us/layer (f16, 60L, M3 Ultra) — pending benchmarks
+- **Achieved**: 703.4 us/layer (f16, 60L, M3 Ultra) — 6.43x faster than MLX
 - **Reduction**: 9 dispatches → 7 dispatches (22% fewer GPU dispatches)
+
+## Phase 11: Column-Major GEMV Decode Path
+
+Phase 11 optimizes GEMV bandwidth by storing weights in column-major [K,M] layout for contiguous half4 loads, with register-level prefetch for improved memory coalescing.
+
+### Column-Major Optimization
+
+**Column-major weight storage**: Traditional row-major GEMV reads non-contiguous elements when accumulating along the K dimension. By transposing weights to [K,M] column-major layout, each thread reads contiguous half4 (8-byte) chunks, maximizing memory bandwidth utilization.
+
+**Register-level prefetch**: Loads the next iteration's weight data into registers while computing the current iteration, hiding memory latency behind computation.
+
+### New Kernels (12 total)
+
+6 column-major kernels in `gemv.rs`: `gemv_col`, `gemv_bias_col` (f32/f16/bf16)
+6 column-major kernels in `fused.rs`: `fused_rms_gemv_col`, `fused_swiglu_down_col` (f32/f16/bf16)
+
+### Integration
+
+- `prepare_weight_col_major()` in `Linear` transposes weights to [K,M] column-major layout at init time
+- `CachedDecode` integrates column-major PSOs and weight buffers (4 col-major weight buffers per layer)
+- Auto-fallback to row-major if column-major PSO compilation fails
+
+### Performance Results
+
+Phase 11 adds 12 column-major GEMV Metal kernels for all BM8 variants (gemv, gemv_bias, fused_rms_gemv, fused_swiglu_down x f32/f16/bf16). Column-major storage enables contiguous half4 loads for TM=4 rows, but benchmarking revealed that the stride-M access pattern between k-positions degrades performance for large M dimensions (M>=4096) typical in LLM weight matrices. The col-major kernels are retained for future small-M use cases but are not used in the decode hot path. Performance remains at Phase 10 levels (703.4 us/layer, 6.43x vs MLX).

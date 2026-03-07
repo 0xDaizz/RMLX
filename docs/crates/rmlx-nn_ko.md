@@ -4,7 +4,7 @@
 
 `rmlx-nn`은 GPU 가속 추론을 위한 신경망 레이어를 구현하는 크레이트입니다. Transformer 아키텍처의 핵심 구성 요소(Linear, Embedding, Attention, TransformerBlock, MoE)를 `rmlx-core`의 연산 커널 위에 구성하며, LLaMA, Qwen, DeepSeek-V3, Mixtral 모델 설정을 내장하고 있습니다.
 
-> **상태 (Phase 0-9B-opt + S1-S5 + EP-2~EP-6):** Linear, Embedding, Attention (KV 캐시 포함), TransformerBlock, MoE (`MoeStrategy` 디스패치 포함), Parallel (TP), 4종 모델 설정(LLaMA 7B/3-8B, Qwen2 7B, DeepSeek-V3, Mixtral 8x7B), RotatingKvCache, BatchKvCache, QuantizedKvCache, QuantizedArray, Conv1d/Conv2d, DynamicExecContext가 구현되어 있습니다. Phase 9에서 `forward_graph()`, `forward_into_cb()`, 가중치 사전 캐싱(`prepare_weight_t`)이 추가되어 ExecGraph CB 배칭을 지원합니다 (레이어당 65 CB -> 5 CB, 92.3% 감소, 17.4x 속도 향상). EP Phase 2-6 순방향 경로 통합 완료: `MoeStrategy` 열거형 (PerExpert/Grouped), 빌더 API (`with_strategy`, `with_pipeline`, `with_sparse_plan`), 그룹형 GEMM 경로, 파이프라인 통합, ICB 희소 디스패치 플레이스홀더, FP8/SlabRing 와이어링. **Phase KO 추가:** 9-디스패치 디코드 경로 (`forward_decode_9dispatch`, `forward_single_cb_9dispatch`), 병합 QKV/gate_up 가중치 준비, slab 레이아웃 KV 캐시 (`LayerKvCache::preallocated` with slab), `StorageModePrivate` 가중치를 위한 `prepare_weights_private()` 파이프라인. **Phase 8c 추가:** `CachedDecode` 구조체 (사전 해석 PSO + 사전 할당 스크래치 버퍼), `forward_cached_2encoder_9dispatch` 메서드, `append_into_encoder` 및 `append_preresolved_into_encoder` KV 캐시 메서드, 모든 op에 걸친 `_preresolved_into_encoder` 패턴.
+> **상태 (Phase 0-9B-opt + S1-S5 + EP-2~EP-6):** Linear, Embedding, Attention (KV 캐시 포함), TransformerBlock, MoE (`MoeStrategy` 디스패치 포함), Parallel (TP), 4종 모델 설정(LLaMA 7B/3-8B, Qwen2 7B, DeepSeek-V3, Mixtral 8x7B), RotatingKvCache, BatchKvCache, QuantizedKvCache, QuantizedArray, Conv1d/Conv2d, DynamicExecContext가 구현되어 있습니다. Phase 9에서 `forward_graph()`, `forward_into_cb()`, 가중치 사전 캐싱(`prepare_weight_t`)이 추가되어 ExecGraph CB 배칭을 지원합니다 (레이어당 65 CB -> 5 CB, 92.3% 감소, 17.4x 속도 향상). EP Phase 2-6 순방향 경로 통합 완료: `MoeStrategy` 열거형 (PerExpert/Grouped), 빌더 API (`with_strategy`, `with_pipeline`, `with_sparse_plan`), 그룹형 GEMM 경로, 파이프라인 통합, ICB 희소 디스패치 플레이스홀더, FP8/SlabRing 와이어링. **Phase KO 추가:** 9-디스패치 디코드 경로 (`forward_decode_9dispatch`, `forward_single_cb_9dispatch`), 병합 QKV/gate_up 가중치 준비, slab 레이아웃 KV 캐시 (`LayerKvCache::preallocated` with slab), `StorageModePrivate` 가중치를 위한 `prepare_weights_private()` 파이프라인. **Phase 8c 추가:** `CachedDecode` 구조체 (사전 해석 PSO + 사전 할당 스크래치 버퍼), `forward_cached_2encoder_9dispatch` 메서드, `append_into_encoder` 및 `append_preresolved_into_encoder` KV 캐시 메서드, 모든 op에 걸친 `_preresolved_into_encoder` 패턴. **Phase 10 추가:** 융합 RMSNorm+GEMV 및 SwiGLU+down 커널을 사용하는 TransformerBlock의 `forward_cached_fused_7dispatch` 메서드; CachedDecode 융합 PSO 필드와 자동 폴백. **Phase 11 추가:** 열-주도(column-major) 가중치 저장을 위한 Linear의 `prepare_weight_col_major()`; 4개 열-주도 가중치 버퍼와 행-주도 자동 폴백을 포함하는 CachedDecode 열-주도 PSO/가중치 통합.
 
 ---
 
@@ -50,6 +50,8 @@ pub struct Linear {
     config: LinearConfig,
     weight: Option<Array>,
     bias: Option<Array>,
+    // Phase 11: GEMV 대역폭 최적화를 위한 캐시된 열-주도 가중치
+    // weight_col_cached: Option<Array>,
 }
 ```
 
@@ -87,6 +89,15 @@ pub struct Linear {
 
 가중치 메모리를 약 2배 사용하는 대신 추론 시 전치 비용을 제거하여
 17.4x 속도 향상에 기여합니다.
+
+#### `prepare_weight_col_major()` (Phase 11)
+
+GEMV 대역폭 최적화를 위해 모델 로드 시점에 열-주도(column-major) [K,M] 가중치 행렬을 사전 계산하고 캐싱합니다.
+
+| 메서드 | 설명 |
+|--------|------|
+| `prepare_weight_col_major(registry, queue)` | 가중치를 [K,M] 열-주도 레이아웃으로 전치 및 캐싱 |
+| `weight_col_cached()` | 캐싱된 열-주도 가중치 반환 (사전 준비된 경우) |
 
 ---
 

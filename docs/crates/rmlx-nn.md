@@ -4,7 +4,7 @@
 
 `rmlx-nn` is a crate that implements neural network layers for GPU-accelerated inference. It builds core Transformer architecture components (Linear, Embedding, Attention, TransformerBlock, MoE) on top of `rmlx-core` compute kernels, and includes built-in model configurations for LLaMA, Qwen, DeepSeek-V3, and Mixtral.
 
-> **Status (Phase 0-9B-opt + S1-S5 + Audit + EP-2~EP-6 + Prod Phase 2 + Phase 3 + Phase 4 + Phase 5):** Linear, QuantizedLinear (+ AwqLinear, GptqLinear, KQuantType/KQuantConfig), Embedding, Attention (with LayerKvCache, RotatingKvCache, BatchKvCache, QuantizedKvCache, **PagedKvCache**), MLA (full forward: DeepSeek-V3 9-step pipeline with latent KV compression), SlidingWindowAttention (full forward: Mistral-style RoPE + SDPA + KV cache), TransformerBlock, MoE (with shared expert + EP integration + GPU routing + `MoeStrategy` dispatch), `ExpertGroup` (stacked expert GEMM path), `MoePipeline` (TBO/SBO overlap), LayerNorm, **16 activation functions**, Parallel (TP), Conv1d/Conv2d, DynamicExecContext, GGUF model loader (+ K-quant type mapping), **prefix cache** (radix-tree with LRU eviction), **chunked prefill** scheduler, **continuous batching scheduler**, and **4 full model architectures** (LlamaModel, Qwen2Model, DeepSeekV3Model, MixtralModel) are implemented. Phase 0+1+2 audit remediation complete (items N1-N8). EP Phases 2-6 forward path integration complete. **Phase 5 additions:** 11 new activations (ReLU, LeakyReLU, ELU, SELU, Mish, QuickGELU, HardSwish, HardSigmoid, Softplus, Softsign, GLU -- 16 total); full MLA forward implementation; full SlidingWindowAttention forward; AwqLinear/GptqLinear/KQuantType/KQuantConfig in quantized\_linear.rs; K-quant GGUF mapping in gguf\_loader.rs; radix-tree prefix cache (prefix\_cache.rs); chunked prefill in scheduler.rs; 4 full model architectures in models/. **Phase KO additions:** 9-dispatch decode path (forward_decode_9dispatch, forward_single_cb_9dispatch), merged QKV and gate_up weight preparation, slab-layout KV cache (LayerKvCache::preallocated with slab), prepare_weights_private() pipeline for StorageModePrivate weights. **Phase 8c additions:** `CachedDecode` struct with pre-resolved PSOs and pre-allocated scratch buffers, `forward_cached_2encoder_9dispatch` method, `append_into_encoder` and `append_preresolved_into_encoder` for KV cache, `_preresolved_into_encoder` pattern across all ops.
+> **Status (Phase 0-9B-opt + S1-S5 + Audit + EP-2~EP-6 + Prod Phase 2 + Phase 3 + Phase 4 + Phase 5):** Linear, QuantizedLinear (+ AwqLinear, GptqLinear, KQuantType/KQuantConfig), Embedding, Attention (with LayerKvCache, RotatingKvCache, BatchKvCache, QuantizedKvCache, **PagedKvCache**), MLA (full forward: DeepSeek-V3 9-step pipeline with latent KV compression), SlidingWindowAttention (full forward: Mistral-style RoPE + SDPA + KV cache), TransformerBlock, MoE (with shared expert + EP integration + GPU routing + `MoeStrategy` dispatch), `ExpertGroup` (stacked expert GEMM path), `MoePipeline` (TBO/SBO overlap), LayerNorm, **16 activation functions**, Parallel (TP), Conv1d/Conv2d, DynamicExecContext, GGUF model loader (+ K-quant type mapping), **prefix cache** (radix-tree with LRU eviction), **chunked prefill** scheduler, **continuous batching scheduler**, and **4 full model architectures** (LlamaModel, Qwen2Model, DeepSeekV3Model, MixtralModel) are implemented. Phase 0+1+2 audit remediation complete (items N1-N8). EP Phases 2-6 forward path integration complete. **Phase 5 additions:** 11 new activations (ReLU, LeakyReLU, ELU, SELU, Mish, QuickGELU, HardSwish, HardSigmoid, Softplus, Softsign, GLU -- 16 total); full MLA forward implementation; full SlidingWindowAttention forward; AwqLinear/GptqLinear/KQuantType/KQuantConfig in quantized\_linear.rs; K-quant GGUF mapping in gguf\_loader.rs; radix-tree prefix cache (prefix\_cache.rs); chunked prefill in scheduler.rs; 4 full model architectures in models/. **Phase KO additions:** 9-dispatch decode path (forward_decode_9dispatch, forward_single_cb_9dispatch), merged QKV and gate_up weight preparation, slab-layout KV cache (LayerKvCache::preallocated with slab), prepare_weights_private() pipeline for StorageModePrivate weights. **Phase 8c additions:** `CachedDecode` struct with pre-resolved PSOs and pre-allocated scratch buffers, `forward_cached_2encoder_9dispatch` method, `append_into_encoder` and `append_preresolved_into_encoder` for KV cache, `_preresolved_into_encoder` pattern across all ops. **Phase 10 additions:** `forward_cached_fused_7dispatch` method in TransformerBlock using fused RMSNorm+GEMV and SwiGLU+down kernels; CachedDecode fused PSO fields with automatic fallback. **Phase 11 additions:** `prepare_weight_col_major()` in Linear for column-major weight storage; CachedDecode column-major PSO/weight integration with 4 col-major weight buffers and auto-fallback to row-major.
 
 ---
 
@@ -57,6 +57,8 @@ pub struct Linear {
     config: LinearConfig,
     weight: Option<Array>,
     bias: Option<Array>,
+    // Phase 11: cached column-major weight for GEMV bandwidth optimization
+    // weight_col_cached: Option<Array>,
 }
 ```
 
@@ -94,6 +96,15 @@ Pre-computes and caches the contiguous transposed weight matrix at model load ti
 
 This trades ~2x weight memory for zero-cost transpose during inference, contributing
 to the 17.4x speedup.
+
+#### `prepare_weight_col_major()` (Phase 11)
+
+Pre-computes and caches the column-major [K,M] weight matrix at model load time for GEMV bandwidth optimization.
+
+| Method | Description |
+|--------|-------------|
+| `prepare_weight_col_major(registry, queue)` | Transpose weight to [K,M] column-major layout and cache it |
+| `weight_col_cached()` | Returns the cached column-major weight (if prepared) |
 
 ---
 

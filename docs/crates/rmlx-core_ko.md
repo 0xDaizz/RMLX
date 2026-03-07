@@ -4,7 +4,7 @@
 
 `rmlx-core`는 Metal GPU 연산 엔진으로, 데이터 타입, N차원 배열, 커널 레지스트리, GPU 연산 커널, 자동 미분, LoRA 파인튜닝, 런타임 메트릭, 구조화된 로깅, 수치 안정성 감시, 그레이스풀 셧다운 등을 제공합니다.
 
-> **상태:** DType (FP8 포함), Array, KernelRegistry, **27종의 op 모듈** (SDPA/FA2 bf16 + backward, SiLU/SwiGLU, GELU, FP8 dequant/quant + 토큰별 E4M3 와이어 커널, Conv1d/Conv2d, tiled conv, GatherMM, LayerNorm, 단항 연산, concat, select, VJP GPU 포함), GGUF 포맷 파서, AWQ/GPTQ dequant, VJP 자동 미분, LoRA, 로깅, 메트릭, PrecisionGuard, ShutdownSignal이 모두 구현되어 있습니다. Phase 0+1+2 감사 수정 완료 (항목 C1-C9). **Phase KO 추가:** GEMV BM=8 변형(동적 타일 선택), _into_encoder API 패턴(단일 인코더 디스패치), Array::uninit 및 Array::to_private, 배치 SDPA 디코드 커널, layer_norm 단일 패스 최적화, softmax N_READS 통합. **Phase 8c 추가:** GEMV, RMS norm, RoPE, SDPA decode, fused SiLU*mul에 대한 `_preresolved_into_encoder` 변형; GEMV BM8 배리어 제거 (6개 불필요 threadgroup 배리어 제거); f32 BM8 로드 확대 (2×float4에서 4×float4, 64B/스레드); 공개 커널 이름 도우미.
+> **상태:** DType (FP8 포함), Array, KernelRegistry, **27종의 op 모듈** (SDPA/FA2 bf16 + backward, SiLU/SwiGLU, GELU, FP8 dequant/quant + 토큰별 E4M3 와이어 커널, Conv1d/Conv2d, tiled conv, GatherMM, LayerNorm, 단항 연산, concat, select, VJP GPU 포함), GGUF 포맷 파서, AWQ/GPTQ dequant, VJP 자동 미분, LoRA, 로깅, 메트릭, PrecisionGuard, ShutdownSignal이 모두 구현되어 있습니다. Phase 0+1+2 감사 수정 완료 (항목 C1-C9). **Phase KO 추가:** GEMV BM=8 변형(동적 타일 선택), _into_encoder API 패턴(단일 인코더 디스패치), Array::uninit 및 Array::to_private, 배치 SDPA 디코드 커널, layer_norm 단일 패스 최적화, softmax N_READS 통합. **Phase 8c 추가:** GEMV, RMS norm, RoPE, SDPA decode, fused SiLU*mul에 대한 `_preresolved_into_encoder` 변형; GEMV BM8 배리어 제거 (6개 불필요 threadgroup 배리어 제거); f32 BM8 로드 확대 (2×float4에서 4×float4, 64B/스레드); 공개 커널 이름 도우미. **Phase 10 추가:** RMSNorm+GEMV와 SwiGLU+down-projection을 단일 디스패치로 결합하는 `fused_rms_gemv` 및 `fused_swiglu_down` 융합 커널; 융합 커널 등록 및 디스패치 함수를 포함하는 `fused.rs` 모듈. **Phase 11 추가:** 모든 BM8 커널(gemv, gemv_bias, fused_rms_gemv, fused_swiglu_down)에 대한 열-주도(column-major) GEMV 변형(`_col` 접미사) — f32/f16/bf16; `gemv_col_kernel_name`, `gemv_bias_col_kernel_name`, `fused_rms_gemv_col_kernel_name`, `fused_swiglu_down_col_kernel_name` 도우미 함수; 연속 half4 로드를 위한 레지스터 수준 프리페치.
 
 ---
 
@@ -31,6 +31,7 @@ rmlx-core/src/
 │   ├── matmul.rs       # 행렬 곱셈 (GEMM)
 │   ├── quantized.rs    # 양자화 행렬 곱 (Q4_0, Q4_1, Q8_0, AWQ, GPTQ)
 │   ├── indexing.rs     # gather, scatter
+│   ├── fused.rs        # 융합 커널 (fused_rms_gemv, fused_swiglu_down) + 열-주도 변형
 │   ├── silu.rs         # SiLU 활성화 + fused SwiGLU
 │   ├── gelu.rs         # GELU 활성화 (gelu_approx + gelu_fast)
 │   ├── fp8.rs          # FP8 dequant/quant + 토큰별 E4M3 와이어 커널

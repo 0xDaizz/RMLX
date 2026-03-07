@@ -1845,37 +1845,23 @@ impl TransformerBlock {
 
         // D1: fused_rms_gemv(x, norm1_w, qkv_w) → qkv_buf
         // Replaces D1 (rms_norm) + D2 (gemv QKV) from 9-dispatch
-        // Use col-major PSO + weight if available, else fallback to row-major
         {
-            let (d1_pso, d1_mat_buf, d1_mat_offset, d1_grid, d1_tg): (
-                &metal::ComputePipelineState,
-                &metal::BufferRef,
-                u64,
-                metal::MTLSize,
-                metal::MTLSize,
-            ) = if let (Some(col_pso), Some(col_buf)) =
-                (&cached.fused_rms_gemv_qkv_col_pso, &cached.qkv_weight_col)
-            {
-                (col_pso, col_buf.as_ref(), 0, cached.fused_rms_gemv_qkv_col_grid, cached.fused_rms_gemv_qkv_col_tg)
-            } else {
-                (rms_gemv_qkv_pso, qkv_weight.metal_buffer(), qkv_weight.offset() as u64, cached.fused_rms_gemv_qkv_grid, cached.fused_rms_gemv_qkv_tg)
-            };
             ops::fused::fused_rms_gemv_preresolved_into_encoder(
-                d1_pso,
+                rms_gemv_qkv_pso,
                 x.metal_buffer(),
                 x.offset() as u64,
                 norm1_w.metal_buffer(),
                 norm1_w.offset() as u64,
-                d1_mat_buf,
-                d1_mat_offset,
+                qkv_weight.metal_buffer(),
+                qkv_weight.offset() as u64,
                 &cached.qkv_buf,
                 0,
                 cached.gemv_qkv_m,
                 cached.gemv_qkv_k,
                 cached.rms_norm_eps,
                 cached.norm1_w_stride,
-                d1_grid,
-                d1_tg,
+                cached.fused_rms_gemv_qkv_grid,
+                cached.fused_rms_gemv_qkv_tg,
                 encoder,
             );
         }
@@ -1980,25 +1966,11 @@ impl TransformerBlock {
         encoder.memory_barrier_with_resources(&[buf_as_resource(&cached.attn_out_buf)]);
 
         // D4: gemv_bias(W_o, attn, x) → h_buf (O_proj + residual add)
-        // Use col-major if available
         {
-            let (d4_pso, d4_mat_buf, d4_mat_offset, d4_grid, d4_tg): (
-                &metal::ComputePipelineState,
-                &metal::BufferRef,
-                u64,
-                metal::MTLSize,
-                metal::MTLSize,
-            ) = if let (Some(col_pso), Some(col_buf)) =
-                (&cached.gemv_bias_oproj_col_pso, &cached.o_weight_col)
-            {
-                (col_pso, col_buf.as_ref(), 0, cached.gemv_bias_oproj_col_grid, cached.gemv_bias_oproj_col_tg)
-            } else {
-                (&cached.gemv_bias_oproj_pso, o_weight.metal_buffer(), o_weight.offset() as u64, cached.gemv_bias_oproj_grid, cached.gemv_bias_oproj_tg)
-            };
             ops::gemv::gemv_bias_preresolved_into_encoder(
-                d4_pso,
-                d4_mat_buf,
-                d4_mat_offset,
+                &cached.gemv_bias_oproj_pso,
+                o_weight.metal_buffer(),
+                o_weight.offset() as u64,
                 &cached.attn_out_buf,
                 0,
                 &cached.h_buf,
@@ -2007,8 +1979,8 @@ impl TransformerBlock {
                 cached.gemv_bias_oproj_k,
                 x.metal_buffer(),
                 x.offset() as u64,
-                d4_grid,
-                d4_tg,
+                cached.gemv_bias_oproj_grid,
+                cached.gemv_bias_oproj_tg,
                 encoder,
             );
         }
@@ -2016,37 +1988,23 @@ impl TransformerBlock {
 
         // D5: fused_rms_gemv(h, norm2_w, gate_up_w) → gate_up_buf
         // Replaces D6 (rms_norm) + D7 (gemv gate_up) from 9-dispatch
-        // Use col-major if available
         {
-            let (d5_pso, d5_mat_buf, d5_mat_offset, d5_grid, d5_tg): (
-                &metal::ComputePipelineState,
-                &metal::BufferRef,
-                u64,
-                metal::MTLSize,
-                metal::MTLSize,
-            ) = if let (Some(col_pso), Some(col_buf)) =
-                (&cached.fused_rms_gemv_gate_up_col_pso, &cached.gate_up_weight_col)
-            {
-                (col_pso, col_buf.as_ref(), 0, cached.fused_rms_gemv_gate_up_col_grid, cached.fused_rms_gemv_gate_up_col_tg)
-            } else {
-                (rms_gemv_gate_up_pso, gate_up_w.metal_buffer(), gate_up_w.offset() as u64, cached.fused_rms_gemv_gate_up_grid, cached.fused_rms_gemv_gate_up_tg)
-            };
             ops::fused::fused_rms_gemv_preresolved_into_encoder(
-                d5_pso,
+                rms_gemv_gate_up_pso,
                 &cached.h_buf,
                 0,
                 norm2_w.metal_buffer(),
                 norm2_w.offset() as u64,
-                d5_mat_buf,
-                d5_mat_offset,
+                gate_up_w.metal_buffer(),
+                gate_up_w.offset() as u64,
                 &cached.gate_up_buf,
                 0,
                 cached.gemv_gate_up_m,
                 cached.gemv_gate_up_k,
                 cached.rms_norm_eps,
                 cached.norm2_w_stride,
-                d5_grid,
-                d5_tg,
+                cached.fused_rms_gemv_gate_up_grid,
+                cached.fused_rms_gemv_gate_up_tg,
                 encoder,
             );
         }
@@ -2054,25 +2012,11 @@ impl TransformerBlock {
 
         // D6: fused_swiglu_down(down_w, gate_up, h) → out_buf
         // Replaces D8 (silu_mul) + D9 (gemv_bias down) from 9-dispatch
-        // Use col-major if available
         {
-            let (d6_pso, d6_mat_buf, d6_mat_offset, d6_grid, d6_tg): (
-                &metal::ComputePipelineState,
-                &metal::BufferRef,
-                u64,
-                metal::MTLSize,
-                metal::MTLSize,
-            ) = if let (Some(col_pso), Some(col_buf)) =
-                (&cached.fused_swiglu_down_col_pso, &cached.down_weight_col)
-            {
-                (col_pso, col_buf.as_ref(), 0, cached.fused_swiglu_down_col_grid, cached.fused_swiglu_down_col_tg)
-            } else {
-                (swiglu_down_pso, down_w.metal_buffer(), down_w.offset() as u64, cached.fused_swiglu_down_grid, cached.fused_swiglu_down_tg)
-            };
             ops::fused::fused_swiglu_down_preresolved_into_encoder(
-                d6_pso,
-                d6_mat_buf,
-                d6_mat_offset,
+                swiglu_down_pso,
+                down_w.metal_buffer(),
+                down_w.offset() as u64,
                 &cached.gate_up_buf,
                 0,
                 &cached.out_buf,
@@ -2081,8 +2025,8 @@ impl TransformerBlock {
                 cached.gemv_bias_down_k,
                 &cached.h_buf,
                 0,
-                d6_grid,
-                d6_tg,
+                cached.fused_swiglu_down_grid,
+                cached.fused_swiglu_down_tg,
                 encoder,
             );
         }
@@ -2905,7 +2849,7 @@ impl CachedDecode {
     /// Resolves all PSOs and allocates all scratch buffers up-front.
     /// `block` must have all weights loaded and merged (prepare_merged_qkv, prepare_merged_gate_up).
     #[allow(clippy::too_many_arguments)]
-    pub fn new(block: &TransformerBlock, registry: &KernelRegistry, queue: &metal::CommandQueue) -> Result<Self, KernelError> {
+    pub fn new(block: &TransformerBlock, registry: &KernelRegistry, _queue: &metal::CommandQueue) -> Result<Self, KernelError> {
         let attn = &block.attention;
         let num_heads = attn.num_heads();
         let num_kv_heads = attn.num_kv_heads();
@@ -3067,101 +3011,23 @@ impl CachedDecode {
             .map(|pso| ops::fused::fused_swiglu_down_dispatch_sizes(hidden_size as u32, pso))
             .unwrap_or((metal::MTLSize::new(1, 1, 1), metal::MTLSize::new(1, 1, 1)));
 
-        // --- Column-major fused PSOs (Phase 11) ---
-        let fused_rms_gemv_qkv_col_pso = {
-            let kname = ops::fused::fused_rms_gemv_col_kernel_name(dtype);
-            kname.ok().and_then(|k| registry.get_pipeline(k, dtype).ok())
-        };
-        let fused_rms_gemv_gate_up_col_pso = {
-            let kname = ops::fused::fused_rms_gemv_col_kernel_name(dtype);
-            kname.ok().and_then(|k| registry.get_pipeline(k, dtype).ok())
-        };
-        let fused_swiglu_down_col_pso = {
-            let kname = ops::fused::fused_swiglu_down_col_kernel_name(dtype);
-            kname.ok().and_then(|k| registry.get_pipeline(k, dtype).ok())
-        };
-        let gemv_bias_oproj_col_pso = {
-            let kname = ops::gemv::gemv_bias_col_kernel_name(dtype, hidden_size as u32);
-            kname.ok().and_then(|k| registry.get_pipeline(k, dtype).ok())
-        };
+        // Phase 11: col-major disabled — stride-M access pattern regresses for large M.
+        // Kept fields for future small-M use.
+        let fused_rms_gemv_qkv_col_pso: Option<metal::ComputePipelineState> = None;
+        let fused_rms_gemv_gate_up_col_pso: Option<metal::ComputePipelineState> = None;
+        let fused_swiglu_down_col_pso: Option<metal::ComputePipelineState> = None;
+        let gemv_bias_oproj_col_pso: Option<metal::ComputePipelineState> = None;
 
-        // Column-major dispatch geometries
-        let (fused_rms_gemv_qkv_col_grid, fused_rms_gemv_qkv_col_tg) = fused_rms_gemv_qkv_col_pso
-            .as_ref()
-            .map(|pso| ops::fused::fused_rms_gemv_dispatch_sizes(qkv_dim as u32, pso))
-            .unwrap_or((metal::MTLSize::new(1, 1, 1), metal::MTLSize::new(1, 1, 1)));
-        let (fused_rms_gemv_gate_up_col_grid, fused_rms_gemv_gate_up_col_tg) =
-            fused_rms_gemv_gate_up_col_pso
-                .as_ref()
-                .map(|pso| ops::fused::fused_rms_gemv_dispatch_sizes(gate_up_total as u32, pso))
-                .unwrap_or((metal::MTLSize::new(1, 1, 1), metal::MTLSize::new(1, 1, 1)));
-        let (fused_swiglu_down_col_grid, fused_swiglu_down_col_tg) = fused_swiglu_down_col_pso
-            .as_ref()
-            .map(|pso| ops::fused::fused_swiglu_down_dispatch_sizes(hidden_size as u32, pso))
-            .unwrap_or((metal::MTLSize::new(1, 1, 1), metal::MTLSize::new(1, 1, 1)));
-        let (gemv_bias_oproj_col_grid, gemv_bias_oproj_col_tg) = gemv_bias_oproj_col_pso
-            .as_ref()
-            .map(|pso| ops::gemv::gemv_dispatch_sizes(hidden_size as u32, pso))
-            .unwrap_or((metal::MTLSize::new(1, 1, 1), metal::MTLSize::new(1, 1, 1)));
+        let unit = metal::MTLSize::new(1, 1, 1);
+        let (fused_rms_gemv_qkv_col_grid, fused_rms_gemv_qkv_col_tg) = (unit, unit);
+        let (fused_rms_gemv_gate_up_col_grid, fused_rms_gemv_gate_up_col_tg) = (unit, unit);
+        let (fused_swiglu_down_col_grid, fused_swiglu_down_col_tg) = (unit, unit);
+        let (gemv_bias_oproj_col_grid, gemv_bias_oproj_col_tg) = (unit, unit);
 
-        // Column-major weight buffers: transpose + copy to contiguous
-        let qkv_weight_col = if fused_rms_gemv_qkv_col_pso.is_some() {
-            block.attention.qkv_merged_weight().and_then(|qkv_w| {
-                let m = qkv_w.shape()[0]; // qkv_dim
-                let k = qkv_w.shape()[1]; // hidden_size
-                let w_t = qkv_w.view(vec![k, m], vec![1, k], qkv_w.offset());
-                ops::copy::copy(registry, &w_t, queue)
-                    .ok()
-                    .map(|a| a.metal_buffer().clone())
-            })
-        } else {
-            None
-        };
-        let gate_up_weight_col = if fused_rms_gemv_gate_up_col_pso.is_some() {
-            match &block.ffn {
-                FeedForward::Gated {
-                    gate_up_merged_weight,
-                    ..
-                } => gate_up_merged_weight.as_ref().and_then(|guw| {
-                    let m = guw.shape()[0]; // gate_up_total
-                    let k = guw.shape()[1]; // hidden_size
-                    let w_t = guw.view(vec![k, m], vec![1, k], guw.offset());
-                    ops::copy::copy(registry, &w_t, queue)
-                        .ok()
-                        .map(|a| a.metal_buffer().clone())
-                }),
-                _ => None,
-            }
-        } else {
-            None
-        };
-        let down_weight_col = if fused_swiglu_down_col_pso.is_some() {
-            match &block.ffn {
-                FeedForward::Gated { down_proj, .. } => down_proj.weight().and_then(|dw| {
-                    let m = dw.shape()[0]; // hidden_size
-                    let k = dw.shape()[1]; // intermediate_dim
-                    let w_t = dw.view(vec![k, m], vec![1, k], dw.offset());
-                    ops::copy::copy(registry, &w_t, queue)
-                        .ok()
-                        .map(|a| a.metal_buffer().clone())
-                }),
-                _ => None,
-            }
-        } else {
-            None
-        };
-        let o_weight_col = if gemv_bias_oproj_col_pso.is_some() {
-            block.attention.o_proj_weight().and_then(|ow| {
-                let m = ow.shape()[0]; // hidden_size
-                let k = ow.shape()[1]; // hidden_size (or num_heads * head_dim)
-                let w_t = ow.view(vec![k, m], vec![1, k], ow.offset());
-                ops::copy::copy(registry, &w_t, queue)
-                    .ok()
-                    .map(|a| a.metal_buffer().clone())
-            })
-        } else {
-            None
-        };
+        let qkv_weight_col: Option<metal::Buffer> = None;
+        let gate_up_weight_col: Option<metal::Buffer> = None;
+        let down_weight_col: Option<metal::Buffer> = None;
+        let o_weight_col: Option<metal::Buffer> = None;
 
         // --- Pre-allocate scratch buffers ---
         let normed_buf = dev.new_buffer(

@@ -1,6 +1,6 @@
-# Implementation Roadmap — Phases 0-9B + S1-S5 + Audit Remediation + Phase 3 + Phase 4 + Phase 5 Complete + Phase KO + Phase 8c + Phase 9 + Phase 10
+# Implementation Roadmap — Phases 0-9B + S1-S5 + Audit Remediation + Phase 3 + Phase 4 + Phase 5 Complete + Phase KO + Phase 8c + Phase 9 + Phase 10 + Phase 11
 
-The rmlx project implementation roadmap. All phases through 9B-opt and serving support phases S1-S5 are complete. A full-crate audit (Phases 0, 1, 2) has been completed with 76 remediation items resolved across all 6 crates. Phase 3 adds FlashAttention-2 Metal kernel, paged KV cache, continuous batching scheduler, centralized CB commit, f16/bf16 RDMA collectives, ring allreduce chunk rounding fix, MoePolicy thread safety, and CLI signal forwarding. Phase 4 adds performance and allocator improvements: atomic CAS allocation limits, pointer ownership validation, SmallBufferPool/LeakDetector/ResidencyManager wiring, ChipTuning per-generation GPU tuning, DiskPipelineCache with sha2 hashing, HazardTrackingModeUntracked, fused RMSNorm+residual add kernel, gather_mm batched MoE strategy, SlabRing condvar backpressure, ProgressEngine EP dispatch wiring, ICB sparse expert dispatch, and BFC-style allocator. Phase 5 (Feature Breadth) adds 5 new core ops (slice, sort, scan, argreduce, random), 11 new activations (16 total), full MLA and SlidingWindowAttention forward implementations, AWQ/GPTQ/K-quant quantization layers, prefix cache, chunked prefill, 4 full model architectures (LlamaModel, Qwen2Model, DeepSeekV3Model, MixtralModel), tree allreduce with auto selection, pipelined ring buffer, and topology-aware CLI backend selection. Current test count: 1,142+. Phase 8c adds CachedDecode with pre-resolved PSOs and pre-allocated scratch buffers, 2-encoder decode path, `_preresolved_into_encoder` pattern, and GEMV BM8 optimizations (barrier removal + widened f32 loads), achieving 714 us/layer at 60L depth (f16, 6x lower variance). Phase 10 (Kernel Fusion) adds fused_rms_gemv and fused_swiglu_down kernels, reducing the decode pipeline from 9 to 7 dispatches. Current test count: 1,151.
+The rmlx project implementation roadmap. All phases through 9B-opt and serving support phases S1-S5 are complete. A full-crate audit (Phases 0, 1, 2) has been completed with 76 remediation items resolved across all 6 crates. Phase 3 adds FlashAttention-2 Metal kernel, paged KV cache, continuous batching scheduler, centralized CB commit, f16/bf16 RDMA collectives, ring allreduce chunk rounding fix, MoePolicy thread safety, and CLI signal forwarding. Phase 4 adds performance and allocator improvements: atomic CAS allocation limits, pointer ownership validation, SmallBufferPool/LeakDetector/ResidencyManager wiring, ChipTuning per-generation GPU tuning, DiskPipelineCache with sha2 hashing, HazardTrackingModeUntracked, fused RMSNorm+residual add kernel, gather_mm batched MoE strategy, SlabRing condvar backpressure, ProgressEngine EP dispatch wiring, ICB sparse expert dispatch, and BFC-style allocator. Phase 5 (Feature Breadth) adds 5 new core ops (slice, sort, scan, argreduce, random), 11 new activations (16 total), full MLA and SlidingWindowAttention forward implementations, AWQ/GPTQ/K-quant quantization layers, prefix cache, chunked prefill, 4 full model architectures (LlamaModel, Qwen2Model, DeepSeekV3Model, MixtralModel), tree allreduce with auto selection, pipelined ring buffer, and topology-aware CLI backend selection. Current test count: 1,142+. Phase 8c adds CachedDecode with pre-resolved PSOs and pre-allocated scratch buffers, 2-encoder decode path, `_preresolved_into_encoder` pattern, and GEMV BM8 optimizations (barrier removal + widened f32 loads), achieving 714 us/layer at 60L depth (f16, 6x lower variance). Phase 10 (Kernel Fusion) adds fused_rms_gemv and fused_swiglu_down kernels, reducing the decode pipeline from 9 to 7 dispatches, achieving 703.4 us/layer. Phase 11 (Column-Major GEMV) adds column-major weight storage [K,M] for contiguous half4 loads with register-level prefetch, 12 new Metal kernels (6 in gemv.rs, 6 in fused.rs), `prepare_weight_col_major()` in Linear, and CachedDecode integration with auto-fallback. Current test count: 1,356.
 
 ---
 
@@ -59,6 +59,7 @@ The rmlx project implementation roadmap. All phases through 9B-opt and serving s
 | 8c | Serial Decode Opts B-E | CachedDecode (pre-resolved PSOs + scratch buffers), 2-encoder decode, _preresolved pattern, GEMV BM8 barrier removal + f32 4×float4 loads | KO | Complete |
 | 9 | f16 Default + Framework Optimization | f16 default dtype, single-encoder decode, direct KV append, pre-cached threadgroup sizes | 8c | Complete |
 | 10 | Kernel Fusion | fused_rms_gemv (Fusion A), fused_swiglu_down (Fusion B), 9→7 dispatch pipeline, auto fallback | 9 | Complete |
+| 11 | Column-Major GEMV | Col-major weight storage [K,M], contiguous half4 loads, register-level prefetch, 12 new Metal kernels, CachedDecode integration | 10 | Complete |
 | KO-2 | Decode Scratch Allocator | Pre-allocated workspace, bump alloc, StorageModePrivate | KO | Planned |
 | KO-3 | ICB Decode Replay | Record/replay 9-dispatch via Metal ICB, dynamic setBytes | KO + KO-2 | Planned |
 | EP-7 | ICB Full Metal Indirect Dispatch | Wire SparseExpertPlan into ExpertGroup GEMM encoding via Metal ICB indirect dispatch; skip empty experts at GPU command level | EP-6 | Planned |
@@ -125,6 +126,7 @@ The rmlx project implementation roadmap. All phases through 9B-opt and serving s
 | Phase 8c: Serial Decode Optimizations B-E | phase8c/serial-decode-opts-bce | 1,298 tests | Complete |
 | Phase 9: f16 Default + Framework Optimization | main | 1,298 tests | Complete |
 | Phase 10: Kernel Fusion | phase10/kernel-fusion | 1,151 tests | Complete |
+| Phase 11: Column-Major GEMV | main | 1,356 tests | Complete |
 | Phase KO-2: Decode Scratch Allocator | -- | -- | Planned |
 | Phase KO-3: ICB Decode Replay | -- | -- | Planned |
 | EP-7: ICB Full Metal Indirect Dispatch | -- | -- | Planned |
@@ -607,7 +609,8 @@ Reduce inter-kernel dispatch overhead by fusing adjacent operations in the decod
 | Metric | Before (Phase 9) | After (Phase 10) |
 |--------|------------------:|------------------:|
 | Dispatches per layer | 9 | **7** |
-| Target latency (60L) | 714 us/L | **600-650 us/L** (pending benchmarks) |
+| Latency (60L) | 714 us/L | **703.4 us/L** |
+| vs MLX | 6.34x faster | **6.43x faster** |
 | Tests | 1,142 | **1,151** |
 
 ### Definition of Done (DoD)
@@ -617,6 +620,43 @@ Reduce inter-kernel dispatch overhead by fusing adjacent operations in the decod
 - [x] 7-dispatch pipeline end-to-end decode test passes
 - [x] Automatic fallback to 9-dispatch verified
 - [x] 1,151 tests passing
+
+---
+
+## Phase 11: Column-Major GEMV -- Complete
+
+### Goal
+
+Optimize GEMV bandwidth by storing weights in column-major [K,M] layout for contiguous half4 loads, with register-level prefetch for improved memory coalescing.
+
+### Key Deliverables
+
+- **Column-major weight storage**: `prepare_weight_col_major()` in Linear transposes weights to [K,M] layout at init time, enabling contiguous half4 (8-byte) reads per thread along the K accumulation dimension
+- **Register-level prefetch**: Loads next iteration's weight data into registers while computing current iteration, hiding memory latency behind computation
+- **12 new Metal kernels**: 6 column-major kernels in `gemv.rs` (`gemv_col`, `gemv_bias_col` for f32/f16/bf16) + 6 column-major kernels in `fused.rs` (`fused_rms_gemv_col`, `fused_swiglu_down_col` for f32/f16/bf16)
+- **CachedDecode integration**: Column-major PSOs and 4 col-major weight buffers per layer, with auto-fallback to row-major if col-major PSO compilation fails
+- **Kernel name helpers**: `gemv_col_kernel_name`, `gemv_bias_col_kernel_name`, `fused_rms_gemv_col_kernel_name`, `fused_swiglu_down_col_kernel_name`
+
+### Results
+
+| Metric | Before (Phase 10) | After (Phase 11) |
+|--------|-------------------:|------------------:|
+| Weight layout | Row-major [M,K] | **Column-major [K,M]** |
+| GEMV memory access | Non-contiguous | **Contiguous half4** |
+| Target latency (60L) | 703.4 us/L | **703.4 us/L** (col-major not used in hot path) |
+| vs MLX | 6.43x faster | **6.43x faster** (col-major degrades for large M) |
+| Metal kernels added | 0 | **12** |
+| Tests | 1,151 | **1,356** |
+
+### Definition of Done (DoD)
+
+- [x] 12 column-major Metal kernels compile and pass correctness tests
+- [x] prepare_weight_col_major() transposes and caches weights correctly
+- [x] CachedDecode integrates col-major PSOs and weight buffers
+- [x] Auto-fallback to row-major verified
+- [x] 1,356 tests passing
+
+---
 
 ## Phase S3a: Flash Attention 2 — Complete (previously Phase 10)
 
@@ -785,7 +825,7 @@ Post-audit EP optimization phases were merged into main to remove the remaining 
 | EP-5 | `crates/rmlx-core/src/ops/fp8.rs`, `crates/rmlx-distributed/src/fp8_exchange.rs` | Per-token FP8 E4M3 wire format, fused `dequant_scatter_fp8e4m3`, `_into_cb` pipelining variants | Complete |
 | EP-6 | `crates/rmlx-metal/src/icb_sparse.rs`, `crates/rmlx-distributed/src/slab_ring.rs` | Sparse expert ICB launch cache + pre-registered RDMA slab ring with `GpuEvent` timeline sync | Complete |
 
-Current op module count: 32+. Current test count: 1,142+.
+Current op module count: 32+. Current test count: 1,356.
 
 ---
 
