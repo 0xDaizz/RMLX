@@ -2597,6 +2597,225 @@ impl Attention {
             h.offset(),
         ))
     }
+
+    /// 9-dispatch attention decode using concurrent encoders for better GPU scheduling.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_decode_concurrent(
+        &self,
+        x: &Array,
+        norm_weight: &Array,
+        rms_norm_eps: f32,
+        cos_freqs: Option<&Array>,
+        sin_freqs: Option<&Array>,
+        _mask: Option<&Array>,
+        cache: &mut LayerKvCache,
+        registry: &KernelRegistry,
+        cb: &metal::CommandBufferRef,
+    ) -> Result<Array, KernelError> {
+        let num_heads = self.config.num_heads;
+        let num_kv_heads = self.config.num_kv_heads;
+        let head_dim = self.config.head_dim;
+        let hidden_size = num_heads * head_dim;
+        // Guard: decode path requires seq_len=1
+        let seq_dim = if x.ndim() == 1 { 1 } else { x.shape()[0] };
+        if seq_dim != 1 {
+            return Err(KernelError::InvalidShape(format!(
+                "forward_decode_9dispatch: requires seq_len=1, got {}",
+                seq_dim
+            )));
+        }
+
+        // --- Single encoder for dispatches 1-3 (rms_norm, QKV gemv, rope) ---
+        let encoder_a = rmlx_metal::new_concurrent_encoder(cb);
+
+        // Dispatch 1: rms_norm
+        let x_2d = if x.ndim() == 1 {
+            Array::new(
+                x.metal_buffer().to_owned(),
+                vec![1, x.shape()[0]],
+                vec![x.shape()[0], 1],
+                x.dtype(),
+                x.offset(),
+            )
+        } else {
+            Array::new(
+                x.metal_buffer().to_owned(),
+                x.shape().to_vec(),
+                x.strides().to_vec(),
+                x.dtype(),
+                x.offset(),
+            )
+        };
+        let normed = ops::rms_norm::rms_norm_into_encoder(
+            registry,
+            &x_2d,
+            Some(norm_weight),
+            rms_norm_eps,
+            encoder_a,
+        )?;
+        // Memory barrier: ensure normed is visible to dispatch 2
+        rmlx_metal::memory_barrier_scope_buffers(encoder_a);
+
+        // Dispatch 2: merged QKV gemv
+        let qkv_weight = self.qkv_merged_weight.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape(
+                "Attention::forward_decode_9dispatch: call prepare_merged_qkv() first".into(),
+            )
+        })?;
+        let normed_vec = Array::new(
+            normed.metal_buffer().to_owned(),
+            vec![hidden_size],
+            vec![1],
+            normed.dtype(),
+            normed.offset(),
+        );
+        let qkv = ops::gemv::gemv_into_encoder(registry, qkv_weight, &normed_vec, encoder_a)?;
+        let elem_size = qkv.dtype().size_of();
+        // qkv is [q_dim + k_dim + v_dim] flat
+
+        let q_dim = num_heads * head_dim; // 4096
+        let k_dim = num_kv_heads * head_dim; // 1024
+
+        let rope_offset = cache.seq_len as u32;
+
+        // Dispatch 3: batched Q+K rope (1 dispatch for all heads)
+        // Q[q_dim] and K[k_dim] are contiguous in qkv buffer
+        let total_rope_heads = num_heads + num_kv_heads;
+
+        // Source for roped Q+K and un-roped V
+        let (qk_roped_buf, qk_roped_offset, v_buf, v_offset);
+        if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
+            // Memory barrier: ensure qkv is visible to dispatch 3
+            rmlx_metal::memory_barrier_scope_buffers(encoder_a);
+            let qk_3d = Array::new(
+                qkv.metal_buffer().to_owned(),
+                vec![total_rope_heads, 1, head_dim],
+                vec![head_dim, head_dim, 1],
+                qkv.dtype(),
+                qkv.offset(),
+            );
+            let qk_roped = ops::rope::rope_ext_into_encoder(
+                registry,
+                &qk_3d,
+                cos,
+                sin,
+                rope_offset,
+                1.0,
+                false,
+                true,
+                encoder_a,
+            )?;
+            qk_roped_buf = qk_roped.metal_buffer().to_owned();
+            qk_roped_offset = qk_roped.offset();
+            // V is from the original qkv buffer (no rope)
+            v_buf = qkv.metal_buffer().to_owned();
+            v_offset = qkv.offset() + (q_dim + k_dim) * elem_size;
+        } else {
+            // No RoPE — use qkv directly
+            qk_roped_buf = qkv.metal_buffer().to_owned();
+            qk_roped_offset = qkv.offset();
+            v_buf = qkv.metal_buffer().to_owned();
+            v_offset = qkv.offset() + (q_dim + k_dim) * elem_size;
+        }
+
+        // End encoder A before cache append (which creates its own encoders)
+        encoder_a.end_encoding();
+
+        let k_roped_flat_offset = qk_roped_offset + q_dim * elem_size;
+
+        // KV cache append — create per-head K and V views
+        let mut k_heads = Vec::with_capacity(num_kv_heads);
+        let mut v_heads = Vec::with_capacity(num_kv_heads);
+        for h in 0..num_kv_heads {
+            k_heads.push(Array::new(
+                qk_roped_buf.clone(),
+                vec![1, head_dim],
+                vec![head_dim, 1],
+                qkv.dtype(),
+                k_roped_flat_offset + h * head_dim * elem_size,
+            ));
+            v_heads.push(Array::new(
+                v_buf.clone(),
+                vec![1, head_dim],
+                vec![head_dim, 1],
+                qkv.dtype(),
+                v_offset + h * head_dim * elem_size,
+            ));
+        }
+        cache.append_into_cb(k_heads, v_heads, 1, registry, cb)?;
+
+        // --- Single encoder for dispatches 4-5 (SDPA, O_proj+residual) ---
+        let encoder_b = rmlx_metal::new_concurrent_encoder(cb);
+
+        // Dispatch 4: batched SDPA decode (all heads, 1 dispatch)
+        let k_slab = cache.keys_slab_view().ok_or_else(|| {
+            KernelError::InvalidShape("9dispatch: no keys slab after append".into())
+        })?;
+        let v_slab = cache.values_slab_view().ok_or_else(|| {
+            KernelError::InvalidShape("9dispatch: no values slab after append".into())
+        })?;
+        let seq_len = cache.seq_len; // actual cached length after append
+        let max_seq = cache.max_seq_len();
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        // Q flat view for batched SDPA
+        let q_flat = Array::new(
+            qk_roped_buf.clone(),
+            vec![q_dim],
+            vec![1],
+            qkv.dtype(),
+            qk_roped_offset,
+        );
+        let attn_out = ops::sdpa::sdpa_decode_batched_slab_stride_into_encoder(
+            registry,
+            &q_flat,
+            &k_slab,
+            &v_slab,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            seq_len,
+            Some(max_seq),
+            None, // no additive mask for decode
+            scale,
+            encoder_b,
+        )?;
+        // attn_out is [num_heads * head_dim] = [hidden_size] flat
+        // Memory barrier: ensure attn_out is visible to dispatch 5
+        rmlx_metal::memory_barrier_scope_buffers(encoder_b);
+
+        // Dispatch 5: gemv_bias(W_o, attn, x) — O_proj + residual add fused
+        let o_weight = self.o_proj.weight().ok_or_else(|| {
+            KernelError::InvalidShape("Attention: o_proj weight not loaded".into())
+        })?;
+        let attn_vec = Array::new(
+            attn_out.metal_buffer().to_owned(),
+            vec![hidden_size],
+            vec![1],
+            attn_out.dtype(),
+            attn_out.offset(),
+        );
+        let x_vec = Array::new(
+            x.metal_buffer().to_owned(),
+            vec![hidden_size],
+            vec![1],
+            x.dtype(),
+            x.offset(),
+        );
+        let h =
+            ops::gemv::gemv_bias_into_encoder(registry, o_weight, &attn_vec, &x_vec, encoder_b)?;
+
+        encoder_b.end_encoding();
+
+        // Return as [1, hidden_size]
+        Ok(Array::new(
+            h.metal_buffer().to_owned(),
+            vec![1, hidden_size],
+            vec![hidden_size, 1],
+            h.dtype(),
+            h.offset(),
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------

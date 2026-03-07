@@ -559,6 +559,90 @@ impl fmt::Display for LazyEvalError {
 impl std::error::Error for LazyEvalError {}
 
 // ---------------------------------------------------------------------------
+// BFS width-limited topological sort
+// ---------------------------------------------------------------------------
+
+/// BFS topological sort with width limiting.
+///
+/// Evaluates a DAG in topological order but limits the frontier width
+/// to `max_width` nodes. When the frontier exceeds this limit, the
+/// algorithm switches to DFS on the deepest branch to reduce the number
+/// of live intermediates.
+///
+/// This prevents memory explosion for wide graphs (e.g., during prefill
+/// with many independent attention heads). Does NOT affect the 9-dispatch
+/// decode path, which bypasses LazyGraph entirely.
+///
+/// Returns node IDs in evaluation order.
+pub fn topo_sort_bfs_width_limited(
+    nodes: &[Option<Vec<NodeId>>], // adjacency: node -> children
+    num_nodes: usize,
+    max_width: usize,
+) -> Vec<NodeId> {
+    use std::collections::VecDeque;
+
+    let max_width = max_width.max(1);
+
+    // Compute in-degree
+    let mut in_degree = vec![0u32; num_nodes];
+    for children in nodes.iter().flatten() {
+        for &child in children {
+            if child.0 < num_nodes {
+                in_degree[child.0] += 1;
+            }
+        }
+    }
+
+    // Initialize frontier with zero-degree nodes
+    let mut frontier: VecDeque<NodeId> = VecDeque::new();
+    for (i, &deg) in in_degree.iter().enumerate() {
+        if deg == 0 {
+            frontier.push_back(NodeId(i));
+        }
+    }
+
+    let mut order = Vec::with_capacity(num_nodes);
+
+    while !frontier.is_empty() {
+        // If frontier exceeds max_width, process deepest node via DFS
+        if frontier.len() > max_width {
+            // Pop from back (deepest/most recently added)
+            let node = frontier.pop_back().unwrap();
+            order.push(node);
+
+            if let Some(children) = &nodes[node.0] {
+                for &child in children {
+                    if child.0 < num_nodes {
+                        in_degree[child.0] -= 1;
+                        if in_degree[child.0] == 0 {
+                            // Push to back for DFS behavior
+                            frontier.push_back(child);
+                        }
+                    }
+                }
+            }
+        } else {
+            // Normal BFS: pop from front
+            let node = frontier.pop_front().unwrap();
+            order.push(node);
+
+            if let Some(children) = &nodes[node.0] {
+                for &child in children {
+                    if child.0 < num_nodes {
+                        in_degree[child.0] -= 1;
+                        if in_degree[child.0] == 0 {
+                            frontier.push_back(child);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    order
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -777,5 +861,78 @@ mod tests {
         let dbg = format!("{:?}", lazy);
         assert!(dbg.contains("LazyArray"));
         assert!(dbg.contains("materialized"));
+    }
+
+    #[test]
+    fn test_topo_sort_bfs_linear() {
+        // Linear chain: 0 -> 1 -> 2 -> 3
+        let nodes: Vec<Option<Vec<NodeId>>> = vec![
+            Some(vec![NodeId(1)]),
+            Some(vec![NodeId(2)]),
+            Some(vec![NodeId(3)]),
+            Some(vec![]),
+        ];
+        let order = topo_sort_bfs_width_limited(&nodes, 4, 20);
+        assert_eq!(order.len(), 4);
+        // Must respect dependencies
+        let pos = |id: usize| order.iter().position(|n| n.0 == id).unwrap();
+        assert!(pos(0) < pos(1));
+        assert!(pos(1) < pos(2));
+        assert!(pos(2) < pos(3));
+    }
+
+    #[test]
+    fn test_topo_sort_bfs_wide() {
+        // Wide fan-out: 0 -> {1,2,3,4,5} -> 6
+        let nodes: Vec<Option<Vec<NodeId>>> = vec![
+            Some(vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4), NodeId(5)]),
+            Some(vec![NodeId(6)]),
+            Some(vec![NodeId(6)]),
+            Some(vec![NodeId(6)]),
+            Some(vec![NodeId(6)]),
+            Some(vec![NodeId(6)]),
+            Some(vec![]),
+        ];
+        let order = topo_sort_bfs_width_limited(&nodes, 7, 3);
+        assert_eq!(order.len(), 7);
+        let pos = |id: usize| order.iter().position(|n| n.0 == id).unwrap();
+        // 0 must come first, 6 must come last
+        assert_eq!(pos(0), 0);
+        assert_eq!(pos(6), 6);
+    }
+
+    #[test]
+    fn test_topo_sort_bfs_disconnected() {
+        // Two independent chains: 0->1, 2->3
+        let nodes: Vec<Option<Vec<NodeId>>> = vec![
+            Some(vec![NodeId(1)]),
+            Some(vec![]),
+            Some(vec![NodeId(3)]),
+            Some(vec![]),
+        ];
+        let order = topo_sort_bfs_width_limited(&nodes, 4, 20);
+        assert_eq!(order.len(), 4);
+        let pos = |id: usize| order.iter().position(|n| n.0 == id).unwrap();
+        assert!(pos(0) < pos(1));
+        assert!(pos(2) < pos(3));
+    }
+
+    #[test]
+    fn test_topo_sort_bfs_width_1() {
+        // Extreme: max_width=1, forces pure DFS
+        let nodes: Vec<Option<Vec<NodeId>>> = vec![
+            Some(vec![NodeId(1), NodeId(2)]),
+            Some(vec![NodeId(3)]),
+            Some(vec![NodeId(3)]),
+            Some(vec![]),
+        ];
+        let order = topo_sort_bfs_width_limited(&nodes, 4, 1);
+        assert_eq!(order.len(), 4);
+        let pos = |id: usize| order.iter().position(|n| n.0 == id).unwrap();
+        assert!(pos(0) < pos(1));
+        assert!(pos(0) < pos(2));
+        // 3 depends on both 1 and 2
+        assert!(pos(1) < pos(3));
+        assert!(pos(2) < pos(3));
     }
 }

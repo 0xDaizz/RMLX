@@ -564,6 +564,129 @@ impl FeedForward {
             )),
         }
     }
+
+    /// 9-dispatch FFN forward using concurrent encoder.
+    pub fn forward_concurrent_9dispatch(
+        &self,
+        normed: &Array,
+        residual: &Array,
+        registry: &KernelRegistry,
+        cb: &metal::CommandBufferRef,
+    ) -> Result<Array, KernelError> {
+        match self {
+            FeedForward::Gated {
+                gate_up_merged_weight,
+                down_proj,
+                ..
+            } => {
+                // Guard: decode path requires seq_len=1
+                let normed_seq = if normed.ndim() >= 2 {
+                    normed.shape()[0]
+                } else {
+                    1
+                };
+                if normed_seq != 1 {
+                    return Err(KernelError::InvalidShape(format!(
+                        "forward_concurrent_9dispatch: requires seq_len=1, got {}",
+                        normed_seq
+                    )));
+                }
+
+                let hidden_size = if normed.ndim() == 2 {
+                    normed.shape()[1]
+                } else {
+                    normed.shape()[0]
+                };
+                let normed_vec = Array::new(
+                    normed.metal_buffer().to_owned(),
+                    vec![hidden_size],
+                    vec![1],
+                    normed.dtype(),
+                    normed.offset(),
+                );
+
+                // --- Single encoder for dispatches 7-9 (gate+up, silu_mul, down+residual) ---
+                let encoder = rmlx_metal::new_concurrent_encoder(cb);
+
+                // Dispatch 7: merged gate+up gemv
+                let gate_up_w = gate_up_merged_weight.as_ref().ok_or_else(|| {
+                    KernelError::InvalidShape(
+                        "forward_single_cb_9dispatch: call prepare_merged_gate_up() first".into(),
+                    )
+                })?;
+                let gate_up =
+                    ops::gemv::gemv_into_encoder(registry, gate_up_w, &normed_vec, encoder)?;
+                // gate_up is [gate_dim + up_dim] flat
+                let gate_dim = gate_up_w.shape()[0] / 2;
+                let elem_size = gate_up.dtype().size_of();
+
+                // Memory barrier: ensure gate_up is visible to dispatch 8
+                rmlx_metal::memory_barrier_scope_buffers(encoder);
+
+                // Split into gate and up views
+                let gate = Array::new(
+                    gate_up.metal_buffer().to_owned(),
+                    vec![1, gate_dim],
+                    vec![gate_dim, 1],
+                    gate_up.dtype(),
+                    gate_up.offset(),
+                );
+                let up = Array::new(
+                    gate_up.metal_buffer().to_owned(),
+                    vec![1, gate_dim],
+                    vec![gate_dim, 1],
+                    gate_up.dtype(),
+                    gate_up.offset() + gate_dim * elem_size,
+                );
+
+                // Dispatch 8: silu_mul
+                let hidden =
+                    ops::fused::fused_silu_mul_into_encoder(registry, &gate, &up, encoder)?;
+
+                // Memory barrier: ensure hidden is visible to dispatch 9
+                rmlx_metal::memory_barrier_scope_buffers(encoder);
+
+                // Dispatch 9: gemv_bias(W_down, hidden, residual) — down + residual fused
+                let down_w = down_proj.weight().ok_or_else(|| {
+                    KernelError::InvalidShape("9dispatch: down_proj weight not loaded".into())
+                })?;
+                let hidden_vec = Array::new(
+                    hidden.metal_buffer().to_owned(),
+                    vec![hidden.numel()],
+                    vec![1],
+                    hidden.dtype(),
+                    hidden.offset(),
+                );
+                let res_vec = Array::new(
+                    residual.metal_buffer().to_owned(),
+                    vec![hidden_size],
+                    vec![1],
+                    residual.dtype(),
+                    residual.offset(),
+                );
+                let out = ops::gemv::gemv_bias_into_encoder(
+                    registry,
+                    down_w,
+                    &hidden_vec,
+                    &res_vec,
+                    encoder,
+                )?;
+
+                encoder.end_encoding();
+
+                Ok(Array::new(
+                    out.metal_buffer().to_owned(),
+                    vec![1, hidden_size],
+                    vec![hidden_size, 1],
+                    out.dtype(),
+                    out.offset(),
+                ))
+            }
+            _ => Err(KernelError::InvalidShape(
+                "forward_concurrent_9dispatch only supports Gated FFN".into(),
+            )),
+        }
+    }
 }
 
 pub struct TransformerBlock {
@@ -826,6 +949,63 @@ impl TransformerBlock {
         // Dispatches 7-9: FFN (gate_up + silu_mul + down+residual)
         self.ffn
             .forward_single_cb_9dispatch(&normed2, &h, registry, cb)
+    }
+
+    /// 9-dispatch forward using concurrent encoders for better GPU scheduling.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_concurrent_9dispatch(
+        &self,
+        x: &Array,
+        cos_freqs: Option<&Array>,
+        sin_freqs: Option<&Array>,
+        mask: Option<&Array>,
+        cache: &mut LayerKvCache,
+        registry: &KernelRegistry,
+        cb: &metal::CommandBufferRef,
+    ) -> Result<Array, KernelError> {
+        let norm1_w = self.norm1_weight.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape("TransformerBlock: norm1_weight not loaded".into())
+        })?;
+        let norm2_w = self.norm2_weight.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape("TransformerBlock: norm2_weight not loaded".into())
+        })?;
+
+        // Guard: decode path requires seq_len=1
+        let seq_dim = if x.ndim() == 1 { 1 } else { x.shape()[0] };
+        if seq_dim != 1 {
+            return Err(KernelError::InvalidShape(format!(
+                "forward_concurrent_9dispatch: requires seq_len=1, got {}",
+                seq_dim
+            )));
+        }
+
+        // Dispatches 1-5: attention (norm + QKV + rope + SDPA + O_proj+residual)
+        let h = self.attention.forward_decode_concurrent(
+            x,
+            norm1_w,
+            self.rms_norm_eps,
+            cos_freqs,
+            sin_freqs,
+            mask,
+            cache,
+            registry,
+            cb,
+        )?;
+
+        // Dispatch 6: rms_norm (single encoder)
+        let enc6 = rmlx_metal::new_concurrent_encoder(cb);
+        let normed2 = ops::rms_norm::rms_norm_into_encoder(
+            registry,
+            &h,
+            Some(norm2_w),
+            self.rms_norm_eps,
+            enc6,
+        )?;
+        enc6.end_encoding();
+
+        // Dispatches 7-9: FFN (gate_up + silu_mul + down+residual)
+        self.ffn
+            .forward_concurrent_9dispatch(&normed2, &h, registry, cb)
     }
 
     /// Pipelined forward pass using fused SwiGLU for the FFN.

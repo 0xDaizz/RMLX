@@ -379,11 +379,52 @@ fn main() {
         nine_dispatch_latencies.push(start.elapsed());
     }
 
+    // ---- Warmup Concurrent-9-dispatch ----
+    println!(
+        "\nWarming up Concurrent-9-dispatch ({} iterations)...",
+        WARMUP_ITERS
+    );
+    let mut cache_c9d = LayerKvCache::preallocated(
+        device,
+        NUM_KV_HEADS,
+        HEAD_DIM,
+        2048,
+        rmlx_core::dtype::DType::Float32,
+    );
+    for _ in 0..WARMUP_ITERS {
+        cache_c9d.seq_len = 0;
+        let cb = queue.new_command_buffer();
+        let _ = block
+            .forward_concurrent_9dispatch(&input, None, None, None, &mut cache_c9d, &registry, cb)
+            .unwrap();
+        cb.commit();
+        cb.wait_until_completed();
+    }
+
+    // ---- Benchmark Concurrent-9-dispatch ----
+    println!(
+        "Benchmarking Concurrent-9-dispatch ({} iterations)...",
+        BENCH_ITERS
+    );
+    let mut concurrent_9d_latencies = Vec::with_capacity(BENCH_ITERS);
+    for _ in 0..BENCH_ITERS {
+        cache_c9d.seq_len = 0;
+        let start = Instant::now();
+        let cb = queue.new_command_buffer();
+        let _ = block
+            .forward_concurrent_9dispatch(&input, None, None, None, &mut cache_c9d, &registry, cb)
+            .unwrap();
+        cb.commit();
+        cb.wait_until_completed();
+        concurrent_9d_latencies.push(start.elapsed());
+    }
+
     // ---- Results ----
     let baseline_stats = Stats::from_durations(&baseline_latencies);
     let graph_stats = Stats::from_durations(&graph_latencies);
     let single_cb_stats = Stats::from_durations(&single_cb_latencies);
     let nine_dispatch_stats = Stats::from_durations(&nine_dispatch_latencies);
+    let concurrent_9d_stats = Stats::from_durations(&concurrent_9d_latencies);
     let speedup = if graph_stats.mean > 0.0 {
         baseline_stats.mean / graph_stats.mean
     } else {
@@ -396,6 +437,11 @@ fn main() {
     };
     let nine_dispatch_speedup = if nine_dispatch_stats.mean > 0.0 {
         baseline_stats.mean / nine_dispatch_stats.mean
+    } else {
+        0.0
+    };
+    let concurrent_9d_speedup = if concurrent_9d_stats.mean > 0.0 {
+        baseline_stats.mean / concurrent_9d_stats.mean
     } else {
         0.0
     };
@@ -420,9 +466,17 @@ fn main() {
     println!("  {}", nine_dispatch_stats);
     println!("  Dispatches per forward: 9");
     println!();
+    println!("Concurrent-9-Dispatch (forward_concurrent_9dispatch):");
+    println!("  {}", concurrent_9d_stats);
+    println!("  Dispatches per forward: 9 (concurrent encoders)");
+    println!();
     println!("ExecGraph speedup:  {:.2}x", speedup);
     println!("Single-CB speedup:  {:.2}x", single_cb_speedup);
     println!("9-Dispatch speedup: {:.2}x", nine_dispatch_speedup);
+    println!(
+        "Concurrent-9-Dispatch speedup: {:.2}x",
+        concurrent_9d_speedup
+    );
     println!(
         "CB reduction:   {} -> {} -> 1",
         baseline_cbs, graph_total_cbs
@@ -768,4 +822,140 @@ fn main() {
         let diff = nine_dispatch_stats.mean - stats.mean;
         println!("  Diff (cache alloc overhead):               {:.1}us", diff);
     }
+
+    // ========================================================================
+    // Multi-Layer Pipeline (4 layers)
+    // ========================================================================
+    println!("\n========== Multi-Layer Pipeline (4 layers) ==========");
+
+    const NUM_LAYERS: usize = 4;
+
+    // Build 4 transformer blocks, each with its own weights and KV cache
+    let mut blocks: Vec<TransformerBlock> = Vec::with_capacity(NUM_LAYERS);
+    for _ in 0..NUM_LAYERS {
+        let mut blk = build_transformer_block(device);
+        blk.prepare_weights_9dispatch(device)
+            .expect("prepare_weights_9dispatch for multi-layer");
+        blk.prepare_weights_private(device, &queue);
+        blocks.push(blk);
+    }
+
+    let mut ml_kv_caches: Vec<LayerKvCache> = (0..NUM_LAYERS)
+        .map(|_| {
+            LayerKvCache::preallocated(
+                device,
+                NUM_KV_HEADS,
+                HEAD_DIM,
+                2048,
+                rmlx_core::dtype::DType::Float32,
+            )
+        })
+        .collect();
+
+    // ---- Warmup serial 9-dispatch (4 layers, single CB) ----
+    println!(
+        "Warming up serial 9-dispatch x{} ({} iterations)...",
+        NUM_LAYERS, WARMUP_ITERS
+    );
+    for _ in 0..WARMUP_ITERS {
+        for cache in ml_kv_caches.iter_mut() {
+            cache.seq_len = 0;
+        }
+        let cb = queue.new_command_buffer();
+        let mut x = Array::ones(device, &[SEQ_LEN, HIDDEN_SIZE]);
+        for (layer, cache) in blocks.iter().zip(ml_kv_caches.iter_mut()) {
+            x = layer
+                .forward_single_cb_9dispatch(&x, None, None, None, cache, &registry, cb)
+                .expect("serial multi-layer warmup failed");
+        }
+        cb.commit();
+        cb.wait_until_completed();
+    }
+
+    // ---- Benchmark serial 9-dispatch (4 layers) ----
+    println!(
+        "Benchmarking serial 9-dispatch x{} ({} iterations)...",
+        NUM_LAYERS, BENCH_ITERS
+    );
+    let mut ml_serial_latencies = Vec::with_capacity(BENCH_ITERS);
+    for _ in 0..BENCH_ITERS {
+        for cache in ml_kv_caches.iter_mut() {
+            cache.seq_len = 0;
+        }
+        let start = Instant::now();
+        let cb = queue.new_command_buffer();
+        let mut x = Array::ones(device, &[SEQ_LEN, HIDDEN_SIZE]);
+        for (layer, cache) in blocks.iter().zip(ml_kv_caches.iter_mut()) {
+            x = layer
+                .forward_single_cb_9dispatch(&x, None, None, None, cache, &registry, cb)
+                .expect("serial multi-layer bench failed");
+        }
+        cb.commit();
+        cb.wait_until_completed();
+        ml_serial_latencies.push(start.elapsed());
+    }
+
+    // ---- Warmup concurrent 9-dispatch (4 layers, single CB) ----
+    println!(
+        "\nWarming up concurrent 9-dispatch x{} ({} iterations)...",
+        NUM_LAYERS, WARMUP_ITERS
+    );
+    for _ in 0..WARMUP_ITERS {
+        for cache in ml_kv_caches.iter_mut() {
+            cache.seq_len = 0;
+        }
+        let cb = queue.new_command_buffer();
+        let mut x = Array::ones(device, &[SEQ_LEN, HIDDEN_SIZE]);
+        for (layer, cache) in blocks.iter().zip(ml_kv_caches.iter_mut()) {
+            x = layer
+                .forward_concurrent_9dispatch(&x, None, None, None, cache, &registry, cb)
+                .expect("concurrent multi-layer warmup failed");
+        }
+        cb.commit();
+        cb.wait_until_completed();
+    }
+
+    // ---- Benchmark concurrent 9-dispatch (4 layers) ----
+    println!(
+        "Benchmarking concurrent 9-dispatch x{} ({} iterations)...",
+        NUM_LAYERS, BENCH_ITERS
+    );
+    let mut ml_concurrent_latencies = Vec::with_capacity(BENCH_ITERS);
+    for _ in 0..BENCH_ITERS {
+        for cache in ml_kv_caches.iter_mut() {
+            cache.seq_len = 0;
+        }
+        let start = Instant::now();
+        let cb = queue.new_command_buffer();
+        let mut x = Array::ones(device, &[SEQ_LEN, HIDDEN_SIZE]);
+        for (layer, cache) in blocks.iter().zip(ml_kv_caches.iter_mut()) {
+            x = layer
+                .forward_concurrent_9dispatch(&x, None, None, None, cache, &registry, cb)
+                .expect("concurrent multi-layer bench failed");
+        }
+        cb.commit();
+        cb.wait_until_completed();
+        ml_concurrent_latencies.push(start.elapsed());
+    }
+
+    // ---- Multi-layer results ----
+    let ml_serial_stats = Stats::from_durations(&ml_serial_latencies);
+    let ml_concurrent_stats = Stats::from_durations(&ml_concurrent_latencies);
+    let ml_speedup = if ml_concurrent_stats.mean > 0.0 {
+        ml_serial_stats.mean / ml_concurrent_stats.mean
+    } else {
+        0.0
+    };
+
+    println!();
+    println!(
+        "  Serial 9-dispatch ({} layers):     {}",
+        NUM_LAYERS, ml_serial_stats
+    );
+    println!(
+        "  Concurrent 9-dispatch ({} layers): {}",
+        NUM_LAYERS, ml_concurrent_stats
+    );
+    println!("  Multi-layer concurrent speedup: {:.2}x", ml_speedup);
+    println!("=====================================================");
 }

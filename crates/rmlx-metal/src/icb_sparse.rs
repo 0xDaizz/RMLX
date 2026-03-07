@@ -178,6 +178,8 @@ impl SparseExpertPlan {
                     // weight buffer at index 2
                     (2, gate_weights.clone(), eid * gate_expert_stride),
                 ],
+                input_indices: vec![0],
+                output_indices: vec![0],
                 grid_size: MTLSize::new(max_cap, inter, 1),
                 threadgroup_size: Self::compute_threadgroup(gate_pipeline, max_cap, inter),
             };
@@ -186,6 +188,8 @@ impl SparseExpertPlan {
             let up_dispatch = CapturedDispatch {
                 pipeline: up_pipeline.clone(),
                 buffers: vec![(2, up_weights.clone(), eid * up_expert_stride)],
+                input_indices: vec![0],
+                output_indices: vec![0],
                 grid_size: MTLSize::new(max_cap, inter, 1),
                 threadgroup_size: Self::compute_threadgroup(up_pipeline, max_cap, inter),
             };
@@ -196,6 +200,8 @@ impl SparseExpertPlan {
             let swiglu_dispatch = CapturedDispatch {
                 pipeline: swiglu_pipeline.clone(),
                 buffers: vec![],
+                input_indices: vec![],
+                output_indices: vec![],
                 grid_size: MTLSize::new(max_cap, inter, 1),
                 threadgroup_size: Self::compute_threadgroup(swiglu_pipeline, max_cap, inter),
             };
@@ -204,6 +210,8 @@ impl SparseExpertPlan {
             let down_dispatch = CapturedDispatch {
                 pipeline: down_pipeline.clone(),
                 buffers: vec![(2, down_weights.clone(), eid * down_expert_stride)],
+                input_indices: vec![0],
+                output_indices: vec![0],
                 grid_size: MTLSize::new(max_cap, hidden, 1),
                 threadgroup_size: Self::compute_threadgroup(down_pipeline, max_cap, hidden),
             };

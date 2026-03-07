@@ -157,6 +157,19 @@ mod inner {
         pub fn is_dirty(&self) -> bool {
             self.dirty
         }
+
+        /// Batch-register multiple buffers and commit in one operation.
+        ///
+        /// Convenience method for ensuring a set of weight and KV cache
+        /// buffers are resident before starting a decode loop.
+        pub fn ensure_resident(&mut self, buffers: &[&metal::Buffer]) {
+            for buf in buffers {
+                self.add_buffer(buf);
+            }
+            if self.is_dirty() {
+                self.commit();
+            }
+        }
     }
 
     impl Drop for ResidencyManager {
@@ -237,6 +250,19 @@ mod inner {
         /// Whether there are uncommitted changes.
         pub fn is_dirty(&self) -> bool {
             self.dirty
+        }
+
+        /// Batch-register multiple buffers and commit in one operation.
+        ///
+        /// Convenience method for ensuring a set of weight and KV cache
+        /// buffers are resident before starting a decode loop.
+        pub fn ensure_resident(&mut self, buffers: &[&metal::Buffer]) {
+            for buf in buffers {
+                self.add_buffer(buf);
+            }
+            if self.is_dirty() {
+                self.commit();
+            }
         }
     }
 }
@@ -363,5 +389,46 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("test error"));
         assert!(msg.contains("residency set creation failed"));
+    }
+
+    #[test]
+    fn test_residency_batch_ensure_resident() {
+        use rmlx_metal::device::GpuDevice;
+        use rmlx_metal::metal::MTLResourceOptions;
+
+        let device = match GpuDevice::system_default() {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("skipping test: no Metal device");
+                return;
+            }
+        };
+
+        let mut mgr = ResidencyManager::new(device.raw()).expect("stub new should not fail");
+        let buf1 = device.new_buffer(4096, MTLResourceOptions::StorageModeShared);
+        let buf2 = device.new_buffer(4096, MTLResourceOptions::StorageModeShared);
+        let buf3 = device.new_buffer(4096, MTLResourceOptions::StorageModeShared);
+
+        mgr.ensure_resident(&[&buf1, &buf2, &buf3]);
+        assert_eq!(mgr.buffer_count(), 3);
+        assert!(!mgr.is_dirty(), "should be committed after ensure_resident");
+    }
+
+    #[test]
+    fn test_residency_ensure_resident_empty() {
+        use rmlx_metal::device::GpuDevice;
+
+        let device = match GpuDevice::system_default() {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("skipping test: no Metal device");
+                return;
+            }
+        };
+
+        let mut mgr = ResidencyManager::new(device.raw()).expect("stub new should not fail");
+        mgr.ensure_resident(&[]);
+        assert_eq!(mgr.buffer_count(), 0);
+        assert!(!mgr.is_dirty());
     }
 }

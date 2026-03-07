@@ -5,6 +5,7 @@
 pub mod array;
 pub mod dtype;
 pub mod formats;
+pub mod fusion;
 pub mod kernels;
 pub mod lazy;
 pub mod logging;
