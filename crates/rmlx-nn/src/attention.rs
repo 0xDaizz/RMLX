@@ -435,10 +435,11 @@ impl LayerKvCache {
 
         let dst_row_offset = self.seq_len * self.head_dim * elem_size;
 
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+
         for i in 0..self.num_kv_heads {
             // Copy new keys into slot
-            let enc = cb.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&pipeline);
             enc.set_buffer(
                 0,
                 Some(new_keys[i].metal_buffer()),
@@ -456,11 +457,8 @@ impl LayerKvCache {
                 1,
             );
             enc.dispatch_threads(grid, tg);
-            enc.end_encoding();
 
             // Copy new values into slot
-            let enc = cb.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&pipeline);
             enc.set_buffer(
                 0,
                 Some(new_values[i].metal_buffer()),
@@ -472,8 +470,8 @@ impl LayerKvCache {
                 (self.values[i].offset() + dst_row_offset) as u64,
             );
             enc.dispatch_threads(grid, tg);
-            enc.end_encoding();
         }
+        enc.end_encoding();
 
         self.seq_len += new_tokens;
         Ok(())
