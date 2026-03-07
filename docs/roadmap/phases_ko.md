@@ -1,6 +1,6 @@
-# 🗺️ 구현 로드맵 — Phase 0-9B + S1-S5 + Audit Remediation 완료 + Phase KO
+# 🗺️ 구현 로드맵 — Phase 0-9B + S1-S5 + Audit Remediation 완료 + Phase KO + Phase 8c
 
-rmlx 프로젝트의 구현 로드맵입니다. Phase 9B-opt 및 서빙 지원 Phase S1-S5, 그리고 전체 크레이트 감사 수정(76개 항목)까지 모든 Phase가 완료되었습니다. 현재 테스트 수: 1,142+.
+rmlx 프로젝트의 구현 로드맵입니다. Phase 9B-opt 및 서빙 지원 Phase S1-S5, 그리고 전체 크레이트 감사 수정(76개 항목)까지 모든 Phase가 완료되었습니다. 현재 테스트 수: 1,142+. Phase 8c는 CachedDecode (사전 해석 PSO + 사전 할당 스크래치 버퍼), 2-인코더 디코드 경로, `_preresolved_into_encoder` 패턴, GEMV BM8 최적화 (배리어 제거 + f32 확대 로드)를 추가하여 60L 깊이에서 1,367 us/layer를 달성합니다 (8% 빠름, 6x 낮은 분산).
 
 ---
 
@@ -24,6 +24,7 @@ rmlx 프로젝트의 구현 로드맵입니다. Phase 9B-opt 및 서빙 지원 P
 | 9A | GPU Pipeline — ExecGraph | CommandBatcher, ExecGraph, ICB, `_into_cb()` 패턴 | Phase 8 | ✅ 완료 |
 | 9B-opt | GPU Pipeline — Optimization | 가중치 사전 캐싱, contiguous transpose, 17.4x 속도 향상 | Phase 9A | ✅ 완료 |
 | KO | 커널 최적화 | 9-디스패치 디코드, 커널별 효율화, 64x 속도 향상, MLX 대비 2.09x | Phase 6 (인프라) | Track 1 대부분 완료, Track 2 부분 완료 |
+| 8c | 직렬 디코드 최적화 B-E | CachedDecode (사전 해석 PSO + 스크래치 버퍼), 2-인코더 디코드, _preresolved 패턴, GEMV BM8 배리어 제거 + f32 4×float4 로드 | KO | ✅ 완료 |
 | S1 | Serving Quick Wins | GELU, RotatingKV, BatchKV | Phase 9 | ✅ 완료 |
 | S2 | DType + Quantization | FP8, GGUF, AWQ/GPTQ | Phase 9 | ✅ 완료 |
 | S3 | Attention Upgrade | Flash Attention 2, QuantizedKV | Phase 9 | ✅ 완료 |
@@ -74,6 +75,7 @@ rmlx 프로젝트의 구현 로드맵입니다. Phase 9B-opt 및 서빙 지원 P
 | EP-5: FP8 와이어 포맷 (`fp8.rs`, `fp8_exchange.rs`) | main (merged) | 1,142+ tests | ✅ Complete |
 | EP-6: ICB Sparse Expert 실행 + RDMA Slab 링 (`icb_sparse.rs`, `slab_ring.rs`) | main (merged) | 1,142+ tests | ✅ Complete |
 | Phase KO: 커널 최적화 (Track 1) | main | 1,142+ tests | 진행 중 |
+| Phase 8c: 직렬 디코드 최적화 B-E | phase8c/serial-decode-opts-bce | 1,298 tests | ✅ Complete |
 
 ---
 

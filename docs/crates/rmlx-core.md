@@ -4,7 +4,7 @@
 
 `rmlx-core` is the Metal GPU compute engine, providing data types, N-dimensional arrays, a kernel registry, GPU compute kernels, automatic differentiation, LoRA fine-tuning, runtime metrics, structured logging, numerical stability monitoring, and graceful shutdown.
 
-> **Status:** DType (with FP8), Array, KernelRegistry, **32+ op modules** (including SDPA/FA2 with bf16 + backward, SiLU/SwiGLU, GELU, FP8 dequant/quant, Conv1d/Conv2d, tiled conv, GatherMM, LayerNorm, unary ops, concat, select, VJP GPU), GGUF format parser, AWQ/GPTQ dequant, VJP autodiff, LoRA, logging, metrics, PrecisionGuard, and ShutdownSignal are all implemented. Phase 0+1+2 audit remediation complete (items C1-C9). **Phase 3 additions:** FlashAttention-2 Metal kernel (`flash_attention.rs`) with tiled online softmax, f32 head_dim=128, causal mask, and naive SDPA fallback; all ops routed through centralized `commit_with_mode()` with sync/async `ExecMode` and `CommandBufferHandle` for async tracking. **Phase 4 addition:** Fused `rms_norm_residual_add` JIT Metal kernel combining input+residual add and RMSNorm in a single GPU dispatch. **Phase 5 additions:** 5 new op modules -- `slice.rs` (multi-dimensional slice with per-dimension start/end/stride, Metal kernel up to 8D, f32/f16/bf16), `sort.rs` (bitonic sort on Metal: sort/argsort, ascending/descending, any axis, up to 2048 elements), `scan.rs` (parallel prefix scan via Hillis-Steele: cumsum/cumprod along any axis), `argreduce.rs` (argmin/argmax reduction along any axis, SIMD reductions, UInt32 output), `random.rs` (Philox 4x32-10 PRNG: uniform/normal with deterministic seeding). **Phase KO additions:** GEMV BM=8 variant with dynamic tile selection, `_into_encoder` API pattern for single-encoder dispatch, Array::uninit and Array::to_private, batched SDPA decode kernel, layer_norm single-pass optimization, softmax N_READS coalescing.
+> **Status:** DType (with FP8), Array, KernelRegistry, **32+ op modules** (including SDPA/FA2 with bf16 + backward, SiLU/SwiGLU, GELU, FP8 dequant/quant, Conv1d/Conv2d, tiled conv, GatherMM, LayerNorm, unary ops, concat, select, VJP GPU), GGUF format parser, AWQ/GPTQ dequant, VJP autodiff, LoRA, logging, metrics, PrecisionGuard, and ShutdownSignal are all implemented. Phase 0+1+2 audit remediation complete (items C1-C9). **Phase 3 additions:** FlashAttention-2 Metal kernel (`flash_attention.rs`) with tiled online softmax, f32 head_dim=128, causal mask, and naive SDPA fallback; all ops routed through centralized `commit_with_mode()` with sync/async `ExecMode` and `CommandBufferHandle` for async tracking. **Phase 4 addition:** Fused `rms_norm_residual_add` JIT Metal kernel combining input+residual add and RMSNorm in a single GPU dispatch. **Phase 5 additions:** 5 new op modules -- `slice.rs` (multi-dimensional slice with per-dimension start/end/stride, Metal kernel up to 8D, f32/f16/bf16), `sort.rs` (bitonic sort on Metal: sort/argsort, ascending/descending, any axis, up to 2048 elements), `scan.rs` (parallel prefix scan via Hillis-Steele: cumsum/cumprod along any axis), `argreduce.rs` (argmin/argmax reduction along any axis, SIMD reductions, UInt32 output), `random.rs` (Philox 4x32-10 PRNG: uniform/normal with deterministic seeding). **Phase KO additions:** GEMV BM=8 variant with dynamic tile selection, `_into_encoder` API pattern for single-encoder dispatch, Array::uninit and Array::to_private, batched SDPA decode kernel, layer_norm single-pass optimization, softmax N_READS coalescing. **Phase 8c additions:** `_preresolved_into_encoder` variants for GEMV, RMS norm, RoPE, SDPA decode, and fused SiLU*mul; GEMV BM8 barrier removal (6 spurious threadgroup barriers removed); f32 BM8 load widening from 2×float4 to 4×float4 (64B/thread); public kernel name helpers (`gemv_kernel_name`, `rms_norm_kernel_name_for`, `rope_table_kernel_name`, `sdpa_decode_kernel_name`, `silu_gate_kernel_name`).
 
 ---
 
@@ -347,6 +347,36 @@ Phase KO introduces a finer-grained dispatch pattern below `_into_cb()`. While `
 | `rope_ext_into_encoder(encoder, ...)` | Extended RoPE into existing encoder |
 | `sdpa_decode_batched_slab_stride_into_encoder(encoder, ...)` | Batched SDPA decode with slab KV cache into existing encoder |
 | `fused_silu_mul_into_encoder(encoder, ...)` | Fused SiLU * gate into existing encoder |
+
+#### The `_preresolved_into_encoder` Pattern (Phase 8c)
+
+Phase 8c introduces a further optimization layer below `_into_encoder()`. While `_into_encoder()` accepts a registry and resolves the PSO dynamically, `_preresolved_into_encoder()` accepts a pre-resolved `ComputePipelineState` directly, eliminating all per-dispatch overhead.
+
+| Function | Description |
+|----------|-------------|
+| `gemv_preresolved_into_encoder(pso, ...)` | GEMV with pre-resolved PSO |
+| `gemv_bias_preresolved_into_encoder(pso, ...)` | Fused GEMV+bias with pre-resolved PSO |
+| `rms_norm_preresolved_into_encoder(pso, ...)` | RMS norm with pre-resolved PSO |
+| `rope_ext_preresolved_into_encoder(pso, ...)` | RoPE with pre-resolved PSO |
+| `sdpa_decode_preresolved_into_encoder(pso, ...)` | SDPA decode with pre-resolved PSO |
+| `fused_silu_mul_preresolved_into_encoder(pso, ...)` | Fused SiLU*mul with pre-resolved PSO |
+
+Public kernel name helpers enable callers to pre-resolve PSOs at init time:
+
+| Function | Description |
+|----------|-------------|
+| `gemv_kernel_name(dtype, m)` | Returns BM8/standard kernel name for GEMV |
+| `gemv_bias_kernel_name(dtype, m)` | Returns kernel name for GEMV+bias |
+| `rms_norm_kernel_name_for(dtype, axis_size)` | Returns kernel name for RMS norm |
+| `rope_table_kernel_name(dtype)` | Returns kernel name for table-based RoPE |
+| `sdpa_decode_kernel_name(dtype)` | Returns kernel name for SDPA decode |
+| `silu_gate_kernel_name(dtype)` | Returns kernel name for SiLU*gate |
+| `gemv_dispatch_sizes(m, pso)` | Returns pre-computed (grid, threadgroup) sizes |
+
+#### GEMV BM8 Optimizations (Phase 8c)
+
+- **Barrier removal**: Removed 6 spurious `threadgroup_barrier(mem_flags::mem_none)` calls from all BM8 kernel variants (f32, f16, bf16, and bias variants). These barriers were unnecessary because BM8 uses independent simdgroups with no shared memory.
+- **Wider f32 loads**: Widened f32 BM8 loads from k8 (2×float4, 32 bytes/thread/iter) to k16 (4×float4, 64 bytes/thread/iter), reducing loop iterations and improving memory coalescing.
 
 #### Batched SDPA Decode Kernel
 
