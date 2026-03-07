@@ -938,11 +938,102 @@ fn main() {
         ml_concurrent_latencies.push(start.elapsed());
     }
 
+    // ---- 2-encoder 9-dispatch (single layer) ----
+    println!(
+        "\nWarming up 2-encoder 9-dispatch ({} iterations)...",
+        WARMUP_ITERS
+    );
+    let mut cache_2enc = LayerKvCache::preallocated(
+        device,
+        NUM_KV_HEADS,
+        HEAD_DIM,
+        2048,
+        rmlx_core::dtype::DType::Float32,
+    );
+    for _ in 0..WARMUP_ITERS {
+        cache_2enc.seq_len = 0;
+        let cb = queue.new_command_buffer();
+        let _ = block
+            .forward_2encoder_9dispatch(&input, None, None, None, &mut cache_2enc, &registry, cb)
+            .unwrap();
+        cb.commit();
+        cb.wait_until_completed();
+    }
+    println!(
+        "Benchmarking 2-encoder 9-dispatch ({} iterations)...",
+        BENCH_ITERS
+    );
+    let mut times_2enc = Vec::with_capacity(BENCH_ITERS);
+    for _ in 0..BENCH_ITERS {
+        cache_2enc.seq_len = 0;
+        let start = Instant::now();
+        let cb = queue.new_command_buffer();
+        let _ = block
+            .forward_2encoder_9dispatch(&input, None, None, None, &mut cache_2enc, &registry, cb)
+            .unwrap();
+        cb.commit();
+        cb.wait_until_completed();
+        times_2enc.push(start.elapsed());
+    }
+    let two_enc_stats = Stats::from_durations(&times_2enc);
+    println!("  2-encoder 9-dispatch (single layer): {}", two_enc_stats);
+
+    // ---- 2-encoder 9-dispatch x4 (multi-layer) ----
+    println!(
+        "\nWarming up 2-encoder 9-dispatch x{} ({} iterations)...",
+        NUM_LAYERS, WARMUP_ITERS
+    );
+    for _ in 0..WARMUP_ITERS {
+        for c in &mut ml_kv_caches {
+            c.seq_len = 0;
+        }
+        let cb = queue.new_command_buffer();
+        let mut h = Array::ones(device, &[SEQ_LEN, HIDDEN_SIZE]);
+        for (i, c) in ml_kv_caches.iter_mut().enumerate() {
+            h = blocks[i]
+                .forward_2encoder_9dispatch(&h, None, None, None, c, &registry, cb)
+                .unwrap();
+        }
+        cb.commit();
+        cb.wait_until_completed();
+    }
+    println!(
+        "Benchmarking 2-encoder 9-dispatch x{} ({} iterations)...",
+        NUM_LAYERS, BENCH_ITERS
+    );
+    let mut times_2enc_4l = Vec::with_capacity(BENCH_ITERS);
+    for _ in 0..BENCH_ITERS {
+        for c in &mut ml_kv_caches {
+            c.seq_len = 0;
+        }
+        let start = Instant::now();
+        let cb = queue.new_command_buffer();
+        let mut h = Array::ones(device, &[SEQ_LEN, HIDDEN_SIZE]);
+        for (i, c) in ml_kv_caches.iter_mut().enumerate() {
+            h = blocks[i]
+                .forward_2encoder_9dispatch(&h, None, None, None, c, &registry, cb)
+                .unwrap();
+        }
+        cb.commit();
+        cb.wait_until_completed();
+        times_2enc_4l.push(start.elapsed());
+    }
+    let stats_2enc_4l = Stats::from_durations(&times_2enc_4l);
+    println!(
+        "  2-encoder 9-dispatch ({} layers):  {}",
+        NUM_LAYERS, stats_2enc_4l
+    );
+
     // ---- Multi-layer results ----
     let ml_serial_stats = Stats::from_durations(&ml_serial_latencies);
     let ml_concurrent_stats = Stats::from_durations(&ml_concurrent_latencies);
     let ml_speedup = if ml_concurrent_stats.mean > 0.0 {
         ml_serial_stats.mean / ml_concurrent_stats.mean
+    } else {
+        0.0
+    };
+    let ml_2enc_speedup = if stats_2enc_4l.mean > 0.0 {
+        ml_serial_stats.mean / stats_2enc_4l.mean
     } else {
         0.0
     };
@@ -956,6 +1047,56 @@ fn main() {
         "  Concurrent 9-dispatch ({} layers): {}",
         NUM_LAYERS, ml_concurrent_stats
     );
+    println!(
+        "  2-encoder 9-dispatch ({} layers):  {}",
+        NUM_LAYERS, stats_2enc_4l
+    );
     println!("  Multi-layer concurrent speedup: {:.2}x", ml_speedup);
+    println!("  Multi-layer 2-encoder speedup:  {:.2}x", ml_2enc_speedup);
     println!("=====================================================");
+
+    // ---- Summary comparison ----
+    let two_enc_speedup = if two_enc_stats.mean > 0.0 {
+        baseline_stats.mean / two_enc_stats.mean
+    } else {
+        0.0
+    };
+    println!("\n  --- Summary ---");
+    println!(
+        "  {:40} mean={:8.1}us  (1.00x)",
+        "Baseline (per-op forward)", baseline_stats.mean
+    );
+    println!(
+        "  {:40} mean={:8.1}us  ({:.2}x)",
+        "ExecGraph", graph_stats.mean, speedup
+    );
+    println!(
+        "  {:40} mean={:8.1}us  ({:.2}x)",
+        "Single-CB", single_cb_stats.mean, single_cb_speedup
+    );
+    println!(
+        "  {:40} mean={:8.1}us  ({:.2}x)",
+        "9-Dispatch", nine_dispatch_stats.mean, nine_dispatch_speedup
+    );
+    println!(
+        "  {:40} mean={:8.1}us  ({:.2}x)",
+        "Concurrent-9-Dispatch", concurrent_9d_stats.mean, concurrent_9d_speedup
+    );
+    println!(
+        "  {:40} mean={:8.1}us  ({:.2}x)",
+        "2-Encoder 9-Dispatch", two_enc_stats.mean, two_enc_speedup
+    );
+    println!(
+        "  {:40} mean={:8.1}us  ({:.2}x)",
+        "Serial x4", ml_serial_stats.mean, 1.0
+    );
+    println!(
+        "  {:40} mean={:8.1}us  ({:.2}x vs serial x4)",
+        "Concurrent x4", ml_concurrent_stats.mean, ml_speedup
+    );
+    println!(
+        "  {:40} mean={:8.1}us  ({:.2}x vs serial x4)",
+        "2-Encoder x4", stats_2enc_4l.mean, ml_2enc_speedup
+    );
+    println!("  -----------------");
 }
