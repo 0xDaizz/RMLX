@@ -12,7 +12,7 @@
 
 ---
 
-RMLX reimplements Apple's [MLX](https://github.com/ml-explore/mlx) Metal GPU pipeline **entirely in Rust**. The 9-dispatch decode path achieves **751 us/layer at 60-layer depth** — **6.34x faster than MLX compiled** (4,525 us/layer) on identical hardware (M3 Ultra). The **CachedDecode** path with pre-resolved PSOs and pre-allocated scratch buffers achieves **714 us/layer** with 6x lower variance.
+RMLX reimplements Apple's [MLX](https://github.com/ml-explore/mlx) Metal GPU pipeline **entirely in Rust**. The fused 7-dispatch decode path achieves **703.4 us/layer at 60-layer depth** — **6.34x faster than MLX compiled** (4,525 us/layer) on identical hardware (M3 Ultra). Phase 11 kernel optimization experiments confirmed this as the practical floor for f16 decode on Apple Silicon (73.6% bandwidth efficiency).
 
 ## ⚡ Performance
 
@@ -26,6 +26,7 @@ Single transformer layer decode (Llama-2 7B shapes, f16, M3 Ultra):
 | **9-Dispatch (single layer)** | **1,081 us** | **103x** |
 | **60-layer pipeline** | **751 us/L** | **6.34x vs MLX** |
 | **Cached 2-encoder (60L)** | **714 us/L** | **8% faster, 6x lower σ** |
+| **Fused 7-dispatch (60L)** | **703.4 us/L** | **Phase 10 best** |
 | MLX compiled (60L, f16) | 4,525 us/L | — |
 
 ## ✨ RMLX vs MLX vs CUDA
@@ -58,7 +59,7 @@ Single transformer layer decode (Llama-2 7B shapes, f16, M3 Ultra):
 <details open>
 <summary><b>Infrastructure</b> — ExecGraph, 9-dispatch decode, RDMA, BFC allocator</summary>
 
-- **9-dispatch decode**: merged QKV/gate-up weights, batched SDPA, function-constant specialization, 751 us/layer at 60L depth (6.34x faster than MLX); **CachedDecode** path at 714 us/layer with pre-resolved PSOs + zero per-token allocation
+- **7-dispatch fused decode**: merged QKV/gate-up weights, batched SDPA, fused_rms_gemv + fused_swiglu_down kernel fusion, 703.4 us/layer at 60L depth (6.34x faster than MLX); **CachedDecode** path with pre-resolved PSOs + zero per-token allocation
 - **ExecGraph**: command buffer batching (65 CB down to 5)
 - **Metal**: ChipTuning (M1–M4), DiskPipelineCache, fence manager, dual queues
 - **Allocator**: zero-copy (posix_memalign + MTLBuffer), BFC, residency manager
@@ -137,9 +138,24 @@ rmlx launch --backend rdma --hostfile rmlx-hosts.json -- ibv_devices
 | GPU ops | 32+ |
 | Activations | 16 |
 | Model architectures | 4 |
-| Decode latency | 751 us/L (60L pipeline) |
-| Cached decode | 714 us/L (6x lower variance) |
+| Decode latency | 703.4 us/L (60L fused 7-dispatch) |
 | vs MLX (60L compiled) | 6.34x faster |
+
+## 🗺️ Roadmap
+
+seq_len=1 decode optimization is concluded at 703.4 us/layer (73.6% bandwidth efficiency — practical floor for f16 on Apple Silicon). Next phases focus on broader workloads.
+
+| Phase | Focus | Scope | Status |
+|:-----:|-------|:-----:|:------:|
+| 12 | **GEMM optimization (seq_len=N)** | Framework | Planned |
+| 13 | **Paged attention + speculative decode kernels** | Framework | Planned |
+| 14 | **SDPA / attention optimization** | Framework | Planned |
+| 15 | **Multi-node RDMA optimization (TP/EP)** | Framework | Planned |
+| 16 | **Memory efficiency** | Framework | Planned |
+
+> Framework = rmlx-core / rmlx-nn / rmlx-distributed kernel-level work.
+> Serving-layer concerns (scheduling, eviction, orchestration) belong in rmlx-serve.
+> See [full roadmap](docs/roadmap/phases.md) for details.
 
 ## 📚 Docs
 
