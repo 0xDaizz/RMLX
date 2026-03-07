@@ -15,6 +15,9 @@ tracing = { workspace = true }
 ## Forward tracked_hazards through to rmlx-metal.
 tracked_hazards = ["rmlx-metal/tracked_hazards"]
 
+[dev-dependencies]
+half = { workspace = true }
+
 [[bench]]
 name = "ops_bench"
 harness = false

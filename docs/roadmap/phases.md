@@ -1,6 +1,6 @@
-# Implementation Roadmap — Phases 0-9B + S1-S5 + Audit Remediation + Phase 3 + Phase 4 + Phase 5 Complete + Phase KO + Phase 8c + Phase 9
+# Implementation Roadmap — Phases 0-9B + S1-S5 + Audit Remediation + Phase 3 + Phase 4 + Phase 5 Complete + Phase KO + Phase 8c + Phase 9 + Phase 10
 
-The rmlx project implementation roadmap. All phases through 9B-opt and serving support phases S1-S5 are complete. A full-crate audit (Phases 0, 1, 2) has been completed with 76 remediation items resolved across all 6 crates. Phase 3 adds FlashAttention-2 Metal kernel, paged KV cache, continuous batching scheduler, centralized CB commit, f16/bf16 RDMA collectives, ring allreduce chunk rounding fix, MoePolicy thread safety, and CLI signal forwarding. Phase 4 adds performance and allocator improvements: atomic CAS allocation limits, pointer ownership validation, SmallBufferPool/LeakDetector/ResidencyManager wiring, ChipTuning per-generation GPU tuning, DiskPipelineCache with sha2 hashing, HazardTrackingModeUntracked, fused RMSNorm+residual add kernel, gather_mm batched MoE strategy, SlabRing condvar backpressure, ProgressEngine EP dispatch wiring, ICB sparse expert dispatch, and BFC-style allocator. Phase 5 (Feature Breadth) adds 5 new core ops (slice, sort, scan, argreduce, random), 11 new activations (16 total), full MLA and SlidingWindowAttention forward implementations, AWQ/GPTQ/K-quant quantization layers, prefix cache, chunked prefill, 4 full model architectures (LlamaModel, Qwen2Model, DeepSeekV3Model, MixtralModel), tree allreduce with auto selection, pipelined ring buffer, and topology-aware CLI backend selection. Current test count: 1,142+. Phase 8c adds CachedDecode with pre-resolved PSOs and pre-allocated scratch buffers, 2-encoder decode path, `_preresolved_into_encoder` pattern, and GEMV BM8 optimizations (barrier removal + widened f32 loads), achieving 714 us/layer at 60L depth (f16, 6x lower variance).
+The rmlx project implementation roadmap. All phases through 9B-opt and serving support phases S1-S5 are complete. A full-crate audit (Phases 0, 1, 2) has been completed with 76 remediation items resolved across all 6 crates. Phase 3 adds FlashAttention-2 Metal kernel, paged KV cache, continuous batching scheduler, centralized CB commit, f16/bf16 RDMA collectives, ring allreduce chunk rounding fix, MoePolicy thread safety, and CLI signal forwarding. Phase 4 adds performance and allocator improvements: atomic CAS allocation limits, pointer ownership validation, SmallBufferPool/LeakDetector/ResidencyManager wiring, ChipTuning per-generation GPU tuning, DiskPipelineCache with sha2 hashing, HazardTrackingModeUntracked, fused RMSNorm+residual add kernel, gather_mm batched MoE strategy, SlabRing condvar backpressure, ProgressEngine EP dispatch wiring, ICB sparse expert dispatch, and BFC-style allocator. Phase 5 (Feature Breadth) adds 5 new core ops (slice, sort, scan, argreduce, random), 11 new activations (16 total), full MLA and SlidingWindowAttention forward implementations, AWQ/GPTQ/K-quant quantization layers, prefix cache, chunked prefill, 4 full model architectures (LlamaModel, Qwen2Model, DeepSeekV3Model, MixtralModel), tree allreduce with auto selection, pipelined ring buffer, and topology-aware CLI backend selection. Current test count: 1,142+. Phase 8c adds CachedDecode with pre-resolved PSOs and pre-allocated scratch buffers, 2-encoder decode path, `_preresolved_into_encoder` pattern, and GEMV BM8 optimizations (barrier removal + widened f32 loads), achieving 714 us/layer at 60L depth (f16, 6x lower variance). Phase 10 (Kernel Fusion) adds fused_rms_gemv and fused_swiglu_down kernels, reducing the decode pipeline from 9 to 7 dispatches. Current test count: 1,151.
 
 ---
 
@@ -58,6 +58,7 @@ The rmlx project implementation roadmap. All phases through 9B-opt and serving s
 | KO | Kernel Optimization | 9-dispatch decode, per-kernel efficiency, 64x speedup, 6.34x faster than MLX | Phase 6 (Infra) | Track 1 mostly complete, Track 2 partial |
 | 8c | Serial Decode Opts B-E | CachedDecode (pre-resolved PSOs + scratch buffers), 2-encoder decode, _preresolved pattern, GEMV BM8 barrier removal + f32 4×float4 loads | KO | Complete |
 | 9 | f16 Default + Framework Optimization | f16 default dtype, single-encoder decode, direct KV append, pre-cached threadgroup sizes | 8c | Complete |
+| 10 | Kernel Fusion | fused_rms_gemv (Fusion A), fused_swiglu_down (Fusion B), 9→7 dispatch pipeline, auto fallback | 9 | Complete |
 | KO-2 | Decode Scratch Allocator | Pre-allocated workspace, bump alloc, StorageModePrivate | KO | Planned |
 | KO-3 | ICB Decode Replay | Record/replay 9-dispatch via Metal ICB, dynamic setBytes | KO + KO-2 | Planned |
 | EP-7 | ICB Full Metal Indirect Dispatch | Wire SparseExpertPlan into ExpertGroup GEMM encoding via Metal ICB indirect dispatch; skip empty experts at GPU command level | EP-6 | Planned |
@@ -123,6 +124,7 @@ The rmlx project implementation roadmap. All phases through 9B-opt and serving s
 | Phase KO: Kernel Optimization (Track 1) | main | 1,142+ tests | In Progress |
 | Phase 8c: Serial Decode Optimizations B-E | phase8c/serial-decode-opts-bce | 1,298 tests | Complete |
 | Phase 9: f16 Default + Framework Optimization | main | 1,298 tests | Complete |
+| Phase 10: Kernel Fusion | phase10/kernel-fusion | 1,151 tests | Complete |
 | Phase KO-2: Decode Scratch Allocator | -- | -- | Planned |
 | Phase KO-3: ICB Decode Replay | -- | -- | Planned |
 | EP-7: ICB Full Metal Indirect Dispatch | -- | -- | Planned |
@@ -586,6 +588,35 @@ Establish f16 as the default inference dtype (the industry standard for LLM infe
 - Argument Buffers for batch buffer binding
 
 ---
+
+## Phase 10: Kernel Fusion -- Complete
+
+### Goal
+
+Reduce inter-kernel dispatch overhead by fusing adjacent operations in the decode pipeline, lowering the dispatch count from 9 to 7.
+
+### Key Deliverables
+
+- **Fusion A — `fused_rms_gemv`**: Single Metal kernel combining RMS normalization with the subsequent GEMV. Used for both pre-attention and pre-FFN norm+projection stages.
+- **Fusion B — `fused_swiglu_down`**: Single Metal kernel combining SiLU activation, element-wise gate multiply, and down projection GEMV. Eliminates intermediate scratch buffer.
+- **7-dispatch decode pipeline**: 9 dispatches reduced to 7 (22% fewer GPU dispatches)
+- **Automatic fallback**: If fused PSOs fail to compile, CachedDecode falls back to the 9-dispatch path transparently
+
+### Results
+
+| Metric | Before (Phase 9) | After (Phase 10) |
+|--------|------------------:|------------------:|
+| Dispatches per layer | 9 | **7** |
+| Target latency (60L) | 714 us/L | **600-650 us/L** (pending benchmarks) |
+| Tests | 1,142 | **1,151** |
+
+### Definition of Done (DoD)
+
+- [x] fused_rms_gemv kernel compiles and passes correctness tests
+- [x] fused_swiglu_down kernel compiles and passes correctness tests
+- [x] 7-dispatch pipeline end-to-end decode test passes
+- [x] Automatic fallback to 9-dispatch verified
+- [x] 1,151 tests passing
 
 ## Phase S3a: Flash Attention 2 — Complete (previously Phase 10)
 

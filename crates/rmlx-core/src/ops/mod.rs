@@ -115,6 +115,7 @@ pub fn register_all(registry: &KernelRegistry) -> Result<(), KernelError> {
     scan::register(registry)?;
     argreduce::register(registry)?;
     random::register(registry)?;
+    fused::register_fused_kernels(registry)?;
     Ok(())
 }
 
