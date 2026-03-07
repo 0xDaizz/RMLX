@@ -12,8 +12,8 @@ rmlx GPU 파이프라인은 여러 Metal GPU 연산을 최소한의 command buff
 | 레이어당 Command buffer (Phase KO) | 65 | 1 (9개 디스패치) | 98.5% 감소 |
 | 레이어당 레이턴시 | ~112ms | ~6.4ms | 17.4x 속도 향상 |
 | 레이어당 레이턴시 (Phase KO) | ~109ms | ~1.7ms | 64x 속도 향상 |
-| MLX 대비 격차 | -- | 2.09x 빠름 | MLX 대비 우위 |
-| Cached 2-인코더 디코드 (60L) | -- | 1,367 us/L | 8% 빠름, 6x 낮은 σ |
+| MLX 대비 격차 | -- | 6.34x 빠름 | MLX 대비 우위 |
+| Cached 2-인코더 디코드 (60L) | -- | 714 us/L | 8% 빠름, 6x 낮은 σ |
 | CPU-GPU 동기화 오버헤드 | baseline | 최소 | 98.5% 감소 |
 | 수치 정합성 | -- | max_diff=6.4e-6 | 일치 |
 
@@ -254,9 +254,9 @@ Baseline (per-op sync):  109,215us  1x
 ExecGraph (5 CB):          2,735us  40x
 Single-CB (44 enc):        2,049us  53x
 9-Dispatch (9->4 enc):     1,739us  64x
-MLX compiled:              2,513 us/L (60L)  --
-Gap vs MLX:                2.09x 빠름 (60L)
-Cached 2-enc (60L):       1,367us/layer  8% 빠름, 6x 낮은 σ
+MLX compiled:              4,525 us/L (60L)  --
+Gap vs MLX:                6.34x 빠름 (60L)
+Cached 2-enc (60L):         714us/layer  8% 빠름, 6x 낮은 σ
 ```
 
 ### 핵심 구현 요소
@@ -291,12 +291,12 @@ Phase 8c는 9-디스패치 경로에 CPU 측 오버헤드 제거를 추가합니
 
 **GEMV BM8 개선:**
 - 모든 BM8 커널에서 6개의 불필요한 `threadgroup_barrier(mem_flags::mem_none)` 제거
-- f32 BM8 로드를 2×float4 (32B/스레드)에서 4×float4 (64B/스레드)로 확대
+- BM8 로드를 2×float4 (32B/스레드)에서 4×float4 (64B/스레드)로 확대
 
-**벤치마크 결과 (M3 Ultra, f32, 60레이어 파이프라인):**
+**벤치마크 결과 (M3 Ultra, f16, 60레이어 파이프라인):**
 
 | 경로 | 레이턴시 (us/L) | std_dev (us) |
 |------|----------------:|-------------:|
-| 직렬 9-디스패치 | 1,482 | 507 |
-| Cached 2-인코더 | 1,367 | 84 |
+| 직렬 9-디스패치 | ~751 | 507 |
+| Cached 2-인코더 | 714 | 84 |
 | **개선** | **8% 빠름** | **6x 낮음** |

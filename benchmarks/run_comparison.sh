@@ -9,7 +9,7 @@ set -euo pipefail
 #   2. Custom MLX (~/mlx)  — Python with custom-built MLX
 #   3. Vanilla MLX          — Python with stock MLX from ~/mlx-vanilla
 #
-# Prerequisites on M3-Ultra-80c:
+# Prerequisites on ARM64 build server:
 #   - Custom MLX built and installed:
 #       cd ~/mlx && pip install -e .
 #     OR built in-tree so that ~/mlx/build/lib.* exists.
