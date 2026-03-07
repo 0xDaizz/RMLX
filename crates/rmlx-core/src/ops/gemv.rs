@@ -35,13 +35,29 @@ impl GemvTuning {
     /// Follows the MLX dimension-adaptive pattern for optimal throughput.
     pub fn select(in_vec: usize, out_vec: usize) -> Self {
         if in_vec >= 8192 && out_vec >= 2048 {
-            Self { sm: 4, sn: 8, bn: 16 }
+            Self {
+                sm: 4,
+                sn: 8,
+                bn: 16,
+            }
         } else if out_vec >= 2048 {
-            Self { sm: 8, sn: 4, bn: 16 }
+            Self {
+                sm: 8,
+                sn: 4,
+                bn: 16,
+            }
         } else if out_vec >= 512 {
-            Self { sm: 8, sn: 4, bn: 4 }
+            Self {
+                sm: 8,
+                sn: 4,
+                bn: 4,
+            }
         } else {
-            Self { sm: 8, sn: 4, bn: 2 }
+            Self {
+                sm: 8,
+                sn: 4,
+                bn: 2,
+            }
         }
     }
 }

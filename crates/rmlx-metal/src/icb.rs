@@ -196,14 +196,22 @@ impl IcbReplay {
                 .input_indices
                 .iter()
                 .filter_map(|&i| {
-                    dispatch.buffers.iter().find(|(idx, _, _)| *idx == i as u64).map(|(_, buf, _)| buf)
+                    dispatch
+                        .buffers
+                        .iter()
+                        .find(|(idx, _, _)| *idx == i as u64)
+                        .map(|(_, buf, _)| buf)
                 })
                 .collect();
             let outputs: Vec<&metal::Buffer> = dispatch
                 .output_indices
                 .iter()
                 .filter_map(|&i| {
-                    dispatch.buffers.iter().find(|(idx, _, _)| *idx == i as u64).map(|(_, buf, _)| buf)
+                    dispatch
+                        .buffers
+                        .iter()
+                        .find(|(idx, _, _)| *idx == i as u64)
+                        .map(|(_, buf, _)| buf)
                 })
                 .collect();
 
@@ -247,14 +255,22 @@ impl IcbReplay {
                 .input_indices
                 .iter()
                 .filter_map(|&i| {
-                    dispatch.buffers.iter().find(|(idx, _, _)| *idx == i as u64).map(|(_, buf, _)| buf)
+                    dispatch
+                        .buffers
+                        .iter()
+                        .find(|(idx, _, _)| *idx == i as u64)
+                        .map(|(_, buf, _)| buf)
                 })
                 .collect();
             let outputs: Vec<&metal::Buffer> = dispatch
                 .output_indices
                 .iter()
                 .filter_map(|&i| {
-                    dispatch.buffers.iter().find(|(idx, _, _)| *idx == i as u64).map(|(_, buf, _)| buf)
+                    dispatch
+                        .buffers
+                        .iter()
+                        .find(|(idx, _, _)| *idx == i as u64)
+                        .map(|(_, buf, _)| buf)
                 })
                 .collect();
 
@@ -460,10 +476,7 @@ mod tests {
 
         let validity = IcbValidity::new(1, &buf_k, &buf_v);
         assert!(validity.is_valid(1, &buf_k, &buf_v));
-        assert!(
-            !validity.is_valid(2, &buf_k, &buf_v),
-            "batch size changed"
-        );
+        assert!(!validity.is_valid(2, &buf_k, &buf_v), "batch size changed");
 
         let buf_k2 = device.new_buffer(4096, metal::MTLResourceOptions::StorageModeShared);
         assert!(!validity.is_valid(1, &buf_k2, &buf_v), "k slab moved");
@@ -511,13 +524,19 @@ mod tests {
         let validity = IcbValidity::new(1, &buf_k, &buf_v);
 
         // Valid: same batch_size and same buffers
-        assert!(cache.get_valid(&key, &validity, 1, &buf_k, &buf_v).is_some());
+        assert!(cache
+            .get_valid(&key, &validity, 1, &buf_k, &buf_v)
+            .is_some());
 
         // Invalid: batch_size changed
-        assert!(cache.get_valid(&key, &validity, 2, &buf_k, &buf_v).is_none());
+        assert!(cache
+            .get_valid(&key, &validity, 2, &buf_k, &buf_v)
+            .is_none());
 
         // Invalid: k slab moved
         let buf_k2 = device.new_buffer(4096, metal::MTLResourceOptions::StorageModeShared);
-        assert!(cache.get_valid(&key, &validity, 1, &buf_k2, &buf_v).is_none());
+        assert!(cache
+            .get_valid(&key, &validity, 1, &buf_k2, &buf_v)
+            .is_none());
     }
 }

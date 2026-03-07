@@ -91,9 +91,7 @@ impl FusionCodegen {
 
         // Input buffers
         for i in 0..n_inputs {
-            src.push_str(&format!(
-                "    device const float* in{i} [[buffer({i})]],\n"
-            ));
+            src.push_str(&format!("    device const float* in{i} [[buffer({i})]],\n"));
         }
 
         // Output buffers
@@ -106,9 +104,7 @@ impl FusionCodegen {
 
         // Size parameter and thread position
         let params_idx = n_inputs + n_outputs;
-        src.push_str(&format!(
-            "    constant uint& N [[buffer({params_idx})]],\n"
-        ));
+        src.push_str(&format!("    constant uint& N [[buffer({params_idx})]],\n"));
         src.push_str("    uint tid [[thread_position_in_grid]])\n");
         src.push_str("{\n");
         src.push_str("    if (tid >= N) return;\n\n");
@@ -117,7 +113,7 @@ impl FusionCodegen {
         for i in 0..n_inputs {
             src.push_str(&format!("    float v{i} = in{i}[tid];\n"));
         }
-        src.push_str("\n");
+        src.push('\n');
 
         // Compute ops
         for (idx, (op, inputs)) in ops.iter().enumerate() {
@@ -126,7 +122,7 @@ impl FusionCodegen {
             let expr = op.metal_expr(&args);
             src.push_str(&format!("    float v{node_idx} = {expr};\n"));
         }
-        src.push_str("\n");
+        src.push('\n');
 
         // Store outputs (last n_outputs nodes)
         for o in 0..n_outputs {
@@ -257,6 +253,10 @@ mod tests {
 
         let options = metal::CompileOptions::new();
         let result = device.new_library_with_source(&source, &options);
-        assert!(result.is_ok(), "generated source should compile: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "generated source should compile: {:?}",
+            result.err()
+        );
     }
 }

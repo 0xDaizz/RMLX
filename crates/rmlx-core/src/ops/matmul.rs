@@ -882,8 +882,12 @@ pub fn select_tile_config(m: usize, n: usize, _k: usize) -> TileConfig {
 /// Swizzle improves L2 cache locality for large matrices by remapping
 /// threadgroup IDs to access nearby memory locations.
 pub fn compute_swizzle_log(m: usize, bm: usize) -> u32 {
-    let tiles_m = (m + bm - 1) / bm;
-    if tiles_m > 3 { 1 } else { 0 }
+    let tiles_m = m.div_ceil(bm);
+    if tiles_m > 3 {
+        1
+    } else {
+        0
+    }
 }
 
 /// Returns true if Split-K should be used for the given dimensions.
@@ -933,25 +937,53 @@ impl GemmTileConfig {
     ) -> Self {
         // NAX path: M3+ non-phone, half precision, large enough problem
         if chip.supports_nax && is_half && m >= 64 && n >= 64 && k >= 64 {
-            return Self { bm: 128, bn: 128, bk: 16, wm: 4, wn: 4, use_nax: true }
-                .clamp_to_device(chip);
+            return Self {
+                bm: 128,
+                bn: 128,
+                bk: 16,
+                wm: 4,
+                wn: 4,
+                use_nax: true,
+            }
+            .clamp_to_device(chip);
         }
 
         // Large matrices: 64x64 tiles for better occupancy
         if m > 512 && n > 512 {
-            return Self { bm: 64, bn: 64, bk: 16, wm: 2, wn: 2, use_nax: false }
-                .clamp_to_device(chip);
+            return Self {
+                bm: 64,
+                bn: 64,
+                bk: 16,
+                wm: 2,
+                wn: 2,
+                use_nax: false,
+            }
+            .clamp_to_device(chip);
         }
 
         // Small matrices: 16x16 for less wasted work
         if m < 64 || n < 64 {
-            return Self { bm: 16, bn: 16, bk: 16, wm: 1, wn: 1, use_nax: false }
-                .clamp_to_device(chip);
+            return Self {
+                bm: 16,
+                bn: 16,
+                bk: 16,
+                wm: 1,
+                wn: 1,
+                use_nax: false,
+            }
+            .clamp_to_device(chip);
         }
 
         // Default: 32x32 (current default, proven safe)
-        Self { bm: 32, bn: 32, bk: 16, wm: 1, wn: 1, use_nax: false }
-            .clamp_to_device(chip)
+        Self {
+            bm: 32,
+            bn: 32,
+            bk: 16,
+            wm: 1,
+            wn: 1,
+            use_nax: false,
+        }
+        .clamp_to_device(chip)
     }
 
     /// Clamp tile config to device limits.
@@ -967,9 +999,18 @@ impl GemmTileConfig {
             (self.bm / self.wm) * (self.bn / self.wn)
         };
 
-        if tg_mem_needed > chip.max_threadgroup_memory || threads_needed > chip.max_threads_per_threadgroup {
+        if tg_mem_needed > chip.max_threadgroup_memory
+            || threads_needed > chip.max_threads_per_threadgroup
+        {
             // Fallback to safe default
-            Self { bm: 32, bn: 32, bk: 16, wm: 1, wn: 1, use_nax: false }
+            Self {
+                bm: 32,
+                bn: 32,
+                bk: 16,
+                wm: 1,
+                wn: 1,
+                use_nax: false,
+            }
         } else {
             self
         }
@@ -1386,7 +1427,12 @@ fn dispatch_split_k(
 ///
 /// When matrix dimensions are aligned to tile boundaries, bounds checks
 /// can be eliminated at compile time.
-pub fn matmul_align_constants(m: usize, n: usize, bm: usize, bn: usize) -> Vec<(u32, crate::kernels::FunctionConstantValue)> {
+pub fn matmul_align_constants(
+    m: usize,
+    n: usize,
+    bm: usize,
+    bn: usize,
+) -> Vec<(u32, crate::kernels::FunctionConstantValue)> {
     use crate::kernels::FunctionConstantValue;
     vec![
         (200, FunctionConstantValue::Bool(m % bm == 0)),
@@ -1521,9 +1567,9 @@ mod tests {
     #[test]
     fn test_compute_swizzle_log() {
         // Small matrix: no swizzle
-        assert_eq!(compute_swizzle_log(32, 32), 0);  // 1 tile
-        assert_eq!(compute_swizzle_log(96, 32), 0);  // 3 tiles
-        // Large matrix: swizzle enabled
+        assert_eq!(compute_swizzle_log(32, 32), 0); // 1 tile
+        assert_eq!(compute_swizzle_log(96, 32), 0); // 3 tiles
+                                                    // Large matrix: swizzle enabled
         assert_eq!(compute_swizzle_log(128, 32), 1); // 4 tiles
         assert_eq!(compute_swizzle_log(4096, 32), 1);
     }

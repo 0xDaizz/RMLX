@@ -409,19 +409,15 @@ impl MetalAllocator {
         // Check if this buffer came from the small-buffer pool FIRST (P7-10).
         // With sub-allocation all small allocs share the same gpu_address, so
         // we must check before owned_ptrs (which uses a HashSet).
-        let small = self
-            .small_allocs
-            .lock()
-            .ok()
-            .and_then(|mut map| {
-                let vec = map.get_mut(&addr)?;
-                let item = vec.pop();
-                // Remove the key entirely if the vec is now empty.
-                if vec.is_empty() {
-                    map.remove(&addr);
-                }
-                item
-            });
+        let small = self.small_allocs.lock().ok().and_then(|mut map| {
+            let vec = map.get_mut(&addr)?;
+            let item = vec.pop();
+            // Remove the key entirely if the vec is now empty.
+            if vec.is_empty() {
+                map.remove(&addr);
+            }
+            item
+        });
 
         if let Some(mut small_alloc) = small {
             let slot_size = self.small_pool.slot_size();

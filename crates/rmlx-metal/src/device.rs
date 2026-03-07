@@ -89,9 +89,8 @@ impl ChipTuning {
             Architecture::Unknown => 0,
         };
         let arch_class = detect_arch_class(device.name());
-        let supports_nax = generation >= 17
-            && arch_class != ArchClass::Phone
-            && arch_class != ArchClass::Unknown;
+        let supports_nax =
+            generation >= 17 && arch_class != ArchClass::Phone && arch_class != ArchClass::Unknown;
         let (max_ops, max_mb) = match arch_class {
             ArchClass::Ultra | ArchClass::Max => (50, 50),
             ArchClass::Base => (40, 40),
@@ -141,9 +140,8 @@ impl ChipTuning {
             Architecture::Unknown => 0,
         };
         let arch_class = detect_arch_class(name);
-        let supports_nax = generation >= 17
-            && arch_class != ArchClass::Phone
-            && arch_class != ArchClass::Unknown;
+        let supports_nax =
+            generation >= 17 && arch_class != ArchClass::Phone && arch_class != ArchClass::Unknown;
         let (max_ops, max_mb) = match arch_class {
             ArchClass::Ultra | ArchClass::Max => (50, 50),
             ArchClass::Base => (40, 40),
@@ -332,8 +330,8 @@ impl GpuDevice {
 /// Non-Apple devices always get `Unknown`.
 fn detect_arch_class(name: &str) -> ArchClass {
     // Only classify if it's an Apple Silicon device
-    let is_apple_silicon = name.contains("M1") || name.contains("M2")
-        || name.contains("M3") || name.contains("M4");
+    let is_apple_silicon =
+        name.contains("M1") || name.contains("M2") || name.contains("M3") || name.contains("M4");
     if !is_apple_silicon {
         return ArchClass::Unknown;
     }

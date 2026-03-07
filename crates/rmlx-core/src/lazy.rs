@@ -585,20 +585,18 @@ pub fn topo_sort_bfs_width_limited(
 
     // Compute in-degree
     let mut in_degree = vec![0u32; num_nodes];
-    for children in nodes.iter() {
-        if let Some(children) = children {
-            for &child in children {
-                if child.0 < num_nodes {
-                    in_degree[child.0] += 1;
-                }
+    for children in nodes.iter().flatten() {
+        for &child in children {
+            if child.0 < num_nodes {
+                in_degree[child.0] += 1;
             }
         }
     }
 
     // Initialize frontier with zero-degree nodes
     let mut frontier: VecDeque<NodeId> = VecDeque::new();
-    for i in 0..num_nodes {
-        if in_degree[i] == 0 {
+    for (i, &deg) in in_degree.iter().enumerate() {
+        if deg == 0 {
             frontier.push_back(NodeId(i));
         }
     }

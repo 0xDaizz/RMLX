@@ -2238,6 +2238,24 @@ pub fn sdpa_decode_batched_slab_stride_into_encoder(
     Ok(out)
 }
 
+/// Build function constants for SDPA decode specialization.
+///
+/// When `head_dim` is a known common value (64, 128, 256), we specialize
+/// the kernel for that value, enabling compile-time loop unrolling.
+pub fn sdpa_decode_constants(
+    head_dim: usize,
+    is_causal: bool,
+) -> Vec<(u32, crate::kernels::FunctionConstantValue)> {
+    use crate::kernels::FunctionConstantValue;
+    let mut constants = Vec::new();
+    // Only specialize for common head dims to limit PSO cache bloat
+    if matches!(head_dim, 64 | 128 | 256) {
+        constants.push((200, FunctionConstantValue::U32(head_dim as u32)));
+    }
+    constants.push((201, FunctionConstantValue::Bool(is_causal)));
+    constants
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2329,19 +2347,4 @@ mod tests {
             "expected dtype mismatch error, got: {msg}"
         );
     }
-}
-
-/// Build function constants for SDPA decode specialization.
-///
-/// When `head_dim` is a known common value (64, 128, 256), we specialize
-/// the kernel for that value, enabling compile-time loop unrolling.
-pub fn sdpa_decode_constants(head_dim: usize, is_causal: bool) -> Vec<(u32, crate::kernels::FunctionConstantValue)> {
-    use crate::kernels::FunctionConstantValue;
-    let mut constants = Vec::new();
-    // Only specialize for common head dims to limit PSO cache bloat
-    if matches!(head_dim, 64 | 128 | 256) {
-        constants.push((200, FunctionConstantValue::U32(head_dim as u32)));
-    }
-    constants.push((201, FunctionConstantValue::Bool(is_causal)));
-    constants
 }
