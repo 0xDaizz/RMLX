@@ -17,3 +17,7 @@ distributed = ["rmlx-distributed"]
 [[bench]]
 name = "pipeline_bench"
 harness = false
+
+[[bench]]
+name = "prefill_bench"
+harness = false
