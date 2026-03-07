@@ -357,3 +357,35 @@ Row-major BM8 GEMV with f32 accumulation achieves 73.6% bandwidth efficiency on 
 2. **Hardware change** — higher memory bandwidth (future Apple Silicon generations)
 
 Decode optimization is **CONCLUDED** at the kernel level. The 703.4 us/layer (Phase 10 fused 7-dispatch) represents the best achievable latency for f16 decode on current Apple Silicon.
+
+---
+
+## Phase A: Prefill (seq_len=N) Single-Layer Optimization
+
+Phase A extends the GPU pipeline to prefill workloads (seq_len > 1), where the bottleneck shifts from dispatch overhead to GEMM throughput. While decode (seq_len=1) is dominated by GEMV memory bandwidth, prefill involves large matrix multiplications that benefit from different optimizations.
+
+### Key Optimizations
+
+**Single-CB pipeline**: The prefill path previously required 54 CPU-GPU sync points per layer. Phase A consolidates the entire prefill layer into a single command buffer, reducing sync points to 1. This eliminates the majority of CPU-side overhead during prefill.
+
+**GQA slab SDPA**: The baseline prefill path dispatched 32 separate SDPA kernels (one per attention head). Phase A introduces a slab-layout SDPA kernel that processes all GQA heads in a single dispatch, reducing 32 dispatches to 1.
+
+**GEMM threadgroup swizzle**: Enables threadgroup swizzle pattern for GEMM dispatches, improving L2 cache locality during large matrix multiplications.
+
+**New ops**: `matmul_into_cb` and `silu_into_cb` allow GEMM and SiLU operations to encode directly into a caller-provided command buffer without creating new command buffers, enabling the single-CB pipeline.
+
+### Benchmark Results
+
+Benchmarks measured on a single transformer layer (Llama-style architecture, f16, M3 Ultra):
+
+| Metric | Baseline | Phase A | Improvement |
+|--------|----------|---------|-------------|
+| CPU-GPU sync points | 54 | 1 | 98.1% reduction |
+| SDPA dispatches (GQA) | 32 | 1 | 96.9% reduction |
+| Single-layer speedup | 1x | 3.5-7.3x | sequence-length dependent |
+| vs MLX (single-layer) | — | within 1.2-3.4x | |
+| GEMM TFLOPS | — | 13T (rmlx) vs 24T (MLX) | remaining gap |
+
+The GEMM throughput gap (13T vs 24T TFLOPS) is the primary remaining bottleneck. MLX's GEMM kernels benefit from more aggressive tiling and occupancy tuning.
+
+**Benchmarks**: `prefill_bench.rs`, `gemm_bench.rs`
