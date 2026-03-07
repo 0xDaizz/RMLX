@@ -86,6 +86,14 @@ constant constexpr uint SIMD_SIZE = 32;
 constant constexpr uint TM = 4;   // rows per threadgroup
 constant constexpr uint BM8 = 8;  // simdgroups per threadgroup for bm8 variant
 
+// Uniform hint — tells Metal compiler a value is warp-uniform (same across all threads).
+// This enables better instruction scheduling and reduces register pressure.
+// constant uint& params are already uniform, but derived values (K/4, K/8) may lose it.
+template <typename T>
+METAL_FUNC T as_uniform(T val) {
+    return val;
+}
+
 // ---------------------------------------------------------------------------
 // gemv_f32:  y = A * x    (A: [M, K], x: [K], y: [M])
 // ---------------------------------------------------------------------------
@@ -109,7 +117,7 @@ kernel void gemv_f32(
     float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
 
     // Vectorised loads (4 elements per iteration when possible)
-    uint k4 = K / 4;
+    uint k4 = as_uniform(K / 4);
     for (uint i = tid; i < k4; i += tgsize) {
         uint idx = i * 4;
         float4 v4 = *reinterpret_cast<device const float4*>(vec + idx);
@@ -184,7 +192,7 @@ kernel void gemv_f16(
     row_base = (row_base + TM <= M) ? row_base : M - TM;
     float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-    uint k4 = K / 4;
+    uint k4 = as_uniform(K / 4);
     for (uint i = tid; i < k4; i += tgsize) {
         uint idx = i * 4;
         half4 v4h = *reinterpret_cast<device const half4*>(vec + idx);
@@ -319,7 +327,7 @@ kernel void gemv_bm8_f32(
     float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
 
     // Double-buffered: process 2×float4 per iteration for latency hiding
-    uint k8 = K / 8;
+    uint k8 = as_uniform(K / 8);
     for (uint i = simd_lane_id; i < k8; i += SIMD_SIZE) {
         threadgroup_barrier(mem_flags::mem_none);  // sync threads for cache coherence
         uint idx = i * 8;
@@ -378,7 +386,7 @@ kernel void gemv_bm8_f16(
     float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
 
     // Double-buffered: process 2×half4 per iteration for latency hiding
-    uint k8 = K / 8;
+    uint k8 = as_uniform(K / 8);
     for (uint i = simd_lane_id; i < k8; i += SIMD_SIZE) {
         threadgroup_barrier(mem_flags::mem_none);  // sync threads for cache coherence
         uint idx = i * 8;
@@ -483,7 +491,7 @@ kernel void gemv_bias_f32(
     row_base = (row_base + TM <= M) ? row_base : M - TM;
     float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-    uint k4 = K / 4;
+    uint k4 = as_uniform(K / 4);
     for (uint i = tid; i < k4; i += tgsize) {
         uint idx = i * 4;
         float4 v4 = *reinterpret_cast<device const float4*>(vec + idx);
@@ -551,7 +559,7 @@ kernel void gemv_bias_f16(
     row_base = (row_base + TM <= M) ? row_base : M - TM;
     float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-    uint k4 = K / 4;
+    uint k4 = as_uniform(K / 4);
     for (uint i = tid; i < k4; i += tgsize) {
         uint idx = i * 4;
         half4 v4h = *reinterpret_cast<device const half4*>(vec + idx);
@@ -681,7 +689,7 @@ kernel void gemv_bias_bm8_f32(
     float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
 
     // Double-buffered: process 2×float4 per iteration for latency hiding
-    uint k8 = K / 8;
+    uint k8 = as_uniform(K / 8);
     for (uint i = simd_lane_id; i < k8; i += SIMD_SIZE) {
         threadgroup_barrier(mem_flags::mem_none);  // sync threads for cache coherence
         uint idx = i * 8;
@@ -740,7 +748,7 @@ kernel void gemv_bias_bm8_f16(
     float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
 
     // Double-buffered: process 2×half4 per iteration for latency hiding
-    uint k8 = K / 8;
+    uint k8 = as_uniform(K / 8);
     for (uint i = simd_lane_id; i < k8; i += SIMD_SIZE) {
         threadgroup_barrier(mem_flags::mem_none);  // sync threads for cache coherence
         uint idx = i * 8;

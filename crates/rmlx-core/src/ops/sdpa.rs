@@ -25,7 +25,7 @@ use metal::MTLSize;
 
 // Tiling parameters — must match the Metal shader constants.
 const BR: usize = 16; // Query block rows
-const _BC: usize = 16; // Key/Value block columns (used in shader only)
+const _BC: usize = 64; // Key/Value block columns (used in shader only)
 const THREADS_PER_TG: u64 = 128; // Threads per threadgroup
 const DECODE_THREADS: u64 = 256; // Threads for decode kernel
 
@@ -44,7 +44,7 @@ using namespace metal;
 
 // Tile sizes — keep in sync with Rust constants.
 constant constexpr uint Br = 16;   // Query block rows
-constant constexpr uint Bc = 16;   // Key/Value block columns
+constant constexpr uint Bc = 64;   // Key/Value block columns
 constant constexpr uint SIMD_SIZE = 32;
 
 // Function constants for specialization (set via MTLFunctionConstantValues)
@@ -153,15 +153,23 @@ kernel void sdpa_decode_f32(
 
         float score = -INFINITY;
         if (tid < kv_count) {
-            float dot = 0.0f;
-            for (uint d = 0; d < D; d++) {
-                dot += Q[d] * K[(kv_start + tid) * D + d];
+            float dot_val = 0.0f;
+            device const float* q_ptr = Q;
+            device const float* k_ptr = K + (kv_start + tid) * D;
+            uint d4 = D / 4;
+            for (uint i = 0; i < d4; i++) {
+                float4 q4 = *reinterpret_cast<device const float4*>(q_ptr + i * 4);
+                float4 k4 = *reinterpret_cast<device const float4*>(k_ptr + i * 4);
+                dot_val += dot(q4, k4);
             }
-            dot *= scale;
+            for (uint d = d4 * 4; d < D; d++) {
+                dot_val += q_ptr[d] * k_ptr[d];
+            }
+            dot_val *= scale;
             if (has_mask) {
-                dot += mask[kv_start + tid];
+                dot_val += mask[kv_start + tid];
             }
-            score = dot;
+            score = dot_val;
         }
 
         // Find block max across all threads
@@ -260,15 +268,25 @@ kernel void sdpa_decode_f16(
 
         float score = -INFINITY;
         if (tid < kv_count) {
-            float dot = 0.0f;
-            for (uint d = 0; d < D; d++) {
-                dot += float(Q[d]) * float(K[(kv_start + tid) * D + d]);
+            float dot_val = 0.0f;
+            device const half* q_ptr = Q;
+            device const half* k_ptr = K + (kv_start + tid) * D;
+            uint d4 = D / 4;
+            for (uint i = 0; i < d4; i++) {
+                half4 q4h = *reinterpret_cast<device const half4*>(q_ptr + i * 4);
+                half4 k4h = *reinterpret_cast<device const half4*>(k_ptr + i * 4);
+                float4 q4 = float4(q4h);
+                float4 k4 = float4(k4h);
+                dot_val += dot(q4, k4);
             }
-            dot *= scale;
+            for (uint d = d4 * 4; d < D; d++) {
+                dot_val += float(q_ptr[d]) * float(k_ptr[d]);
+            }
+            dot_val *= scale;
             if (has_mask) {
-                dot += float(mask[kv_start + tid]);
+                dot_val += float(mask[kv_start + tid]);
             }
-            score = dot;
+            score = dot_val;
         }
 
         float block_max = tg_reduce_max(score, tid, lane_id, sg_id,
@@ -824,15 +842,23 @@ kernel void sdpa_decode_batched_f32(
 
         float score = -INFINITY;
         if (tid < kv_count) {
-            float dot = 0.0f;
-            for (uint d = 0; d < D; d++) {
-                dot += q[d] * k[(kv_start + tid) * D + d];
+            float dot_val = 0.0f;
+            device const float* q_ptr = q;
+            device const float* k_ptr = k + (kv_start + tid) * D;
+            uint d4 = D / 4;
+            for (uint i = 0; i < d4; i++) {
+                float4 q4 = *reinterpret_cast<device const float4*>(q_ptr + i * 4);
+                float4 k4 = *reinterpret_cast<device const float4*>(k_ptr + i * 4);
+                dot_val += dot(q4, k4);
             }
-            dot *= scale;
+            for (uint d = d4 * 4; d < D; d++) {
+                dot_val += q_ptr[d] * k_ptr[d];
+            }
+            dot_val *= scale;
             if (has_mask) {
-                dot += mask[kv_start + tid];
+                dot_val += mask[kv_start + tid];
             }
-            score = dot;
+            score = dot_val;
         }
 
         float block_max = tg_reduce_max(score, tid, lane_id, sg_id,
@@ -925,15 +951,25 @@ kernel void sdpa_decode_batched_f16(
 
         float score = -INFINITY;
         if (tid < kv_count) {
-            float dot = 0.0f;
-            for (uint d = 0; d < D; d++) {
-                dot += float(q[d]) * float(k[(kv_start + tid) * D + d]);
+            float dot_val = 0.0f;
+            device const half* q_ptr = q;
+            device const half* k_ptr = k + (kv_start + tid) * D;
+            uint d4 = D / 4;
+            for (uint i = 0; i < d4; i++) {
+                half4 q4h = *reinterpret_cast<device const half4*>(q_ptr + i * 4);
+                half4 k4h = *reinterpret_cast<device const half4*>(k_ptr + i * 4);
+                float4 q4 = float4(q4h);
+                float4 k4 = float4(k4h);
+                dot_val += dot(q4, k4);
             }
-            dot *= scale;
+            for (uint d = d4 * 4; d < D; d++) {
+                dot_val += float(q_ptr[d]) * float(k_ptr[d]);
+            }
+            dot_val *= scale;
             if (has_mask) {
-                dot += float(mask[kv_start + tid]);
+                dot_val += float(mask[kv_start + tid]);
             }
-            score = dot;
+            score = dot_val;
         }
 
         float block_max = tg_reduce_max(score, tid, lane_id, sg_id,
@@ -983,7 +1019,7 @@ pub const SDPA_BF16_SHADER_SOURCE: &str = r#"
 using namespace metal;
 
 constant constexpr uint Br = 16;
-constant constexpr uint Bc = 16;
+constant constexpr uint Bc = 64;
 constant constexpr uint SIMD_SIZE = 32;
 
 // Function constants for specialization (set via MTLFunctionConstantValues)
@@ -1060,15 +1096,15 @@ kernel void sdpa_decode_bf16(
 
         float score = -INFINITY;
         if (tid < kv_count) {
-            float dot = 0.0f;
+            float dot_val = 0.0f;
             for (uint d = 0; d < D; d++) {
-                dot += float(Q[d]) * float(K[(kv_start + tid) * D + d]);
+                dot_val += float(Q[d]) * float(K[(kv_start + tid) * D + d]);
             }
-            dot *= scale;
+            dot_val *= scale;
             if (has_mask) {
-                dot += float(mask[kv_start + tid]);
+                dot_val += float(mask[kv_start + tid]);
             }
-            score = dot;
+            score = dot_val;
         }
 
         float block_max = tg_reduce_max_bf16(score, tid, lane_id, sg_id,
@@ -1329,15 +1365,15 @@ kernel void sdpa_decode_batched_bf16(
 
         float score = -INFINITY;
         if (tid < kv_count) {
-            float dot = 0.0f;
+            float dot_val = 0.0f;
             for (uint d = 0; d < D; d++) {
-                dot += float(q[d]) * float(k[(kv_start + tid) * D + d]);
+                dot_val += float(q[d]) * float(k[(kv_start + tid) * D + d]);
             }
-            dot *= scale;
+            dot_val *= scale;
             if (has_mask) {
-                dot += float(mask[kv_start + tid]);
+                dot_val += float(mask[kv_start + tid]);
             }
-            score = dot;
+            score = dot_val;
         }
 
         float block_max = tg_reduce_max_bf16(score, tid, lane_id, sg_id,
