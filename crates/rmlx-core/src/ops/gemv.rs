@@ -104,6 +104,8 @@ kernel void gemv_f32(
     threadgroup float local_sums[TM * SIMD_SIZE];
 
     uint row_base = tg_id * TM;
+    if (row_base >= M) return;
+    row_base = (row_base + TM <= M) ? row_base : M - TM;
     float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
 
     // Vectorised loads (4 elements per iteration when possible)
@@ -111,30 +113,30 @@ kernel void gemv_f32(
     for (uint i = tid; i < k4; i += tgsize) {
         uint idx = i * 4;
         float4 v4 = *reinterpret_cast<device const float4*>(vec + idx);
+        #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
-            if (row_base + r < M) {
-                float4 m4 = *reinterpret_cast<device const float4*>(mat + (row_base + r) * K + idx);
-                acc[r] += dot(m4, v4);
-            }
+            float4 m4 = *reinterpret_cast<device const float4*>(mat + (row_base + r) * K + idx);
+            acc[r] += dot(m4, v4);
         }
     }
     // Handle remaining elements
     for (uint i = k4 * 4 + tid; i < K; i += tgsize) {
         float v = vec[i];
+        #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
-            if (row_base + r < M) {
-                acc[r] += mat[(row_base + r) * K + i] * v;
-            }
+            acc[r] += mat[(row_base + r) * K + i] * v;
         }
     }
 
     // Intra-simdgroup reduction via simd_sum
+    #pragma clang loop unroll(full)
     for (uint r = 0; r < TM; r++) {
         acc[r] = simd_sum(acc[r]);
     }
 
     // Cross-simdgroup reduction using shared memory
     if (simd_group_id == 0) {
+        #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
             local_sums[r * SIMD_SIZE + simd_lane_id] = 0.0f;
         }
@@ -142,6 +144,7 @@ kernel void gemv_f32(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (simd_lane_id == 0) {
+        #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
             local_sums[r * SIMD_SIZE + simd_group_id] = acc[r];
         }
@@ -149,9 +152,10 @@ kernel void gemv_f32(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (simd_group_id == 0) {
+        #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
             float val = simd_sum(local_sums[r * SIMD_SIZE + simd_lane_id]);
-            if (simd_lane_id == 0 && (row_base + r) < M) {
+            if (simd_lane_id == 0) {
                 output[row_base + r] = val;
             }
         }
@@ -176,6 +180,8 @@ kernel void gemv_f16(
     threadgroup float local_sums[TM * SIMD_SIZE];
 
     uint row_base = tg_id * TM;
+    if (row_base >= M) return;
+    row_base = (row_base + TM <= M) ? row_base : M - TM;
     float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
 
     uint k4 = K / 4;
@@ -183,37 +189,45 @@ kernel void gemv_f16(
         uint idx = i * 4;
         half4 v4h = *reinterpret_cast<device const half4*>(vec + idx);
         float4 v4 = float4(v4h);
+        #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
-            if (row_base + r < M) {
-                half4 m4h = *reinterpret_cast<device const half4*>(mat + (row_base + r) * K + idx);
-                float4 m4 = float4(m4h);
-                acc[r] += dot(m4, v4);
-            }
+            half4 m4h = *reinterpret_cast<device const half4*>(mat + (row_base + r) * K + idx);
+            float4 m4 = float4(m4h);
+            acc[r] += dot(m4, v4);
         }
     }
     for (uint i = k4 * 4 + tid; i < K; i += tgsize) {
         float v = float(vec[i]);
+        #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
-            if (row_base + r < M) {
-                acc[r] += float(mat[(row_base + r) * K + i]) * v;
-            }
+            acc[r] += float(mat[(row_base + r) * K + i]) * v;
         }
     }
 
-    for (uint r = 0; r < TM; r++) acc[r] = simd_sum(acc[r]);
+    #pragma clang loop unroll(full)
+    for (uint r = 0; r < TM; r++) {
+        acc[r] = simd_sum(acc[r]);
+    }
 
     if (simd_group_id == 0) {
-        for (uint r = 0; r < TM; r++) local_sums[r * SIMD_SIZE + simd_lane_id] = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            local_sums[r * SIMD_SIZE + simd_lane_id] = 0.0f;
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (simd_lane_id == 0) {
-        for (uint r = 0; r < TM; r++) local_sums[r * SIMD_SIZE + simd_group_id] = acc[r];
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            local_sums[r * SIMD_SIZE + simd_group_id] = acc[r];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (simd_group_id == 0) {
+        #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
             float val = simd_sum(local_sums[r * SIMD_SIZE + simd_lane_id]);
-            if (simd_lane_id == 0 && (row_base + r) < M) {
+            if (simd_lane_id == 0) {
                 output[row_base + r] = half(val);
             }
         }
@@ -238,33 +252,44 @@ kernel void gemv_bf16(
     threadgroup float local_sums[TM * SIMD_SIZE];
 
     uint row_base = tg_id * TM;
+    if (row_base >= M) return;
+    row_base = (row_base + TM <= M) ? row_base : M - TM;
     float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
 
     // bfloat does not support vector loads wider than scalar on all HW,
     // so we fall back to scalar loads with f32 accumulation.
     for (uint i = tid; i < K; i += tgsize) {
         float v = float(vec[i]);
+        #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
-            if (row_base + r < M) {
-                acc[r] += float(mat[(row_base + r) * K + i]) * v;
-            }
+            acc[r] += float(mat[(row_base + r) * K + i]) * v;
         }
     }
 
-    for (uint r = 0; r < TM; r++) acc[r] = simd_sum(acc[r]);
+    #pragma clang loop unroll(full)
+    for (uint r = 0; r < TM; r++) {
+        acc[r] = simd_sum(acc[r]);
+    }
 
     if (simd_group_id == 0) {
-        for (uint r = 0; r < TM; r++) local_sums[r * SIMD_SIZE + simd_lane_id] = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            local_sums[r * SIMD_SIZE + simd_lane_id] = 0.0f;
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (simd_lane_id == 0) {
-        for (uint r = 0; r < TM; r++) local_sums[r * SIMD_SIZE + simd_group_id] = acc[r];
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            local_sums[r * SIMD_SIZE + simd_group_id] = acc[r];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (simd_group_id == 0) {
+        #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
             float val = simd_sum(local_sums[r * SIMD_SIZE + simd_lane_id]);
-            if (simd_lane_id == 0 && (row_base + r) < M) {
+            if (simd_lane_id == 0) {
                 output[row_base + r] = bfloat(val);
             }
         }
@@ -289,34 +314,48 @@ kernel void gemv_bm8_f32(
     // Each simdgroup handles TM=4 rows independently
     uint row_base = tg_id * (BM8 * TM) + simd_group_id * TM;
     if (row_base >= M) return;
+    row_base = (row_base + TM <= M) ? row_base : M - TM;
 
     float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-    uint k4 = K / 4;
-    for (uint i = simd_lane_id; i < k4; i += SIMD_SIZE) {
-        uint idx = i * 4;
-        float4 v4 = *reinterpret_cast<device const float4*>(vec + idx);
+    // Double-buffered: process 2×float4 per iteration for latency hiding
+    uint k8 = K / 8;
+    for (uint i = simd_lane_id; i < k8; i += SIMD_SIZE) {
+        threadgroup_barrier(mem_flags::mem_none);  // sync threads for cache coherence
+        uint idx = i * 8;
+        float4 v4a = *reinterpret_cast<device const float4*>(vec + idx);
+        float4 v4b = *reinterpret_cast<device const float4*>(vec + idx + 4);
+        #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
-            if (row_base + r < M) {
-                float4 m4 = *reinterpret_cast<device const float4*>(mat + (row_base + r) * K + idx);
-                acc[r] += dot(m4, v4);
-            }
+            device const float* row = mat + (row_base + r) * K + idx;
+            float4 m4a = *reinterpret_cast<device const float4*>(row);
+            float4 m4b = *reinterpret_cast<device const float4*>(row + 4);
+            acc[r] += dot(m4a, v4a) + dot(m4b, v4b);
         }
     }
-    // Handle remaining elements
-    for (uint i = k4 * 4 + simd_lane_id; i < K; i += SIMD_SIZE) {
-        float v = vec[i];
+    // Handle remainder (K%8 > 0)
+    for (uint i = k8 * 8 + simd_lane_id * 4; i + 3 < K; i += SIMD_SIZE * 4) {
+        float4 v4 = *reinterpret_cast<device const float4*>(vec + i);
+        #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
-            if (row_base + r < M) {
-                acc[r] += mat[(row_base + r) * K + i] * v;
-            }
+            float4 m4 = *reinterpret_cast<device const float4*>(mat + (row_base + r) * K + i);
+            acc[r] += dot(m4, v4);
+        }
+    }
+    // Handle scalar remainder (K%4 > 0)
+    for (uint i = (K / 4) * 4 + simd_lane_id; i < K; i += SIMD_SIZE) {
+        float v = vec[i];
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            acc[r] += mat[(row_base + r) * K + i] * v;
         }
     }
 
     // Intra-simdgroup reduction only — no barriers needed!
+    #pragma clang loop unroll(full)
     for (uint r = 0; r < TM; r++) {
         acc[r] = simd_sum(acc[r]);
-        if (simd_lane_id == 0 && (row_base + r) < M) {
+        if (simd_lane_id == 0) {
             output[row_base + r] = acc[r];
         }
     }
@@ -334,34 +373,53 @@ kernel void gemv_bm8_f16(
 {
     uint row_base = tg_id * (BM8 * TM) + simd_group_id * TM;
     if (row_base >= M) return;
+    row_base = (row_base + TM <= M) ? row_base : M - TM;
 
     float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-    uint k4 = K / 4;
-    for (uint i = simd_lane_id; i < k4; i += SIMD_SIZE) {
-        uint idx = i * 4;
-        half4 v4h = *reinterpret_cast<device const half4*>(vec + idx);
-        float4 v4 = float4(v4h);
+    // Double-buffered: process 2×half4 per iteration for latency hiding
+    uint k8 = K / 8;
+    for (uint i = simd_lane_id; i < k8; i += SIMD_SIZE) {
+        threadgroup_barrier(mem_flags::mem_none);  // sync threads for cache coherence
+        uint idx = i * 8;
+        half4 v4ha = *reinterpret_cast<device const half4*>(vec + idx);
+        half4 v4hb = *reinterpret_cast<device const half4*>(vec + idx + 4);
+        float4 v4a = float4(v4ha);
+        float4 v4b = float4(v4hb);
+        #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
-            if (row_base + r < M) {
-                half4 m4h = *reinterpret_cast<device const half4*>(mat + (row_base + r) * K + idx);
-                float4 m4 = float4(m4h);
-                acc[r] += dot(m4, v4);
-            }
+            device const half* row = mat + (row_base + r) * K + idx;
+            half4 m4ha = *reinterpret_cast<device const half4*>(row);
+            half4 m4hb = *reinterpret_cast<device const half4*>(row + 4);
+            float4 m4a = float4(m4ha);
+            float4 m4b = float4(m4hb);
+            acc[r] += dot(m4a, v4a) + dot(m4b, v4b);
         }
     }
-    for (uint i = k4 * 4 + simd_lane_id; i < K; i += SIMD_SIZE) {
-        float v = float(vec[i]);
+    // Handle remainder (K%8 > 0)
+    for (uint i = k8 * 8 + simd_lane_id * 4; i + 3 < K; i += SIMD_SIZE * 4) {
+        half4 v4h = *reinterpret_cast<device const half4*>(vec + i);
+        float4 v4 = float4(v4h);
+        #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
-            if (row_base + r < M) {
-                acc[r] += float(mat[(row_base + r) * K + i]) * v;
-            }
+            half4 m4h = *reinterpret_cast<device const half4*>(mat + (row_base + r) * K + i);
+            float4 m4 = float4(m4h);
+            acc[r] += dot(m4, v4);
+        }
+    }
+    // Handle scalar remainder (K%4 > 0)
+    for (uint i = (K / 4) * 4 + simd_lane_id; i < K; i += SIMD_SIZE) {
+        float v = float(vec[i]);
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            acc[r] += float(mat[(row_base + r) * K + i]) * v;
         }
     }
 
+    #pragma clang loop unroll(full)
     for (uint r = 0; r < TM; r++) {
         acc[r] = simd_sum(acc[r]);
-        if (simd_lane_id == 0 && (row_base + r) < M) {
+        if (simd_lane_id == 0) {
             output[row_base + r] = half(acc[r]);
         }
     }
@@ -379,21 +437,23 @@ kernel void gemv_bm8_bf16(
 {
     uint row_base = tg_id * (BM8 * TM) + simd_group_id * TM;
     if (row_base >= M) return;
+    row_base = (row_base + TM <= M) ? row_base : M - TM;
 
     float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
 
     for (uint i = simd_lane_id; i < K; i += SIMD_SIZE) {
+        threadgroup_barrier(mem_flags::mem_none);  // sync threads for cache coherence
         float v = float(vec[i]);
+        #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
-            if (row_base + r < M) {
-                acc[r] += float(mat[(row_base + r) * K + i]) * v;
-            }
+            acc[r] += float(mat[(row_base + r) * K + i]) * v;
         }
     }
 
+    #pragma clang loop unroll(full)
     for (uint r = 0; r < TM; r++) {
         acc[r] = simd_sum(acc[r]);
-        if (simd_lane_id == 0 && (row_base + r) < M) {
+        if (simd_lane_id == 0) {
             output[row_base + r] = bfloat(acc[r]);
         }
     }
@@ -419,42 +479,52 @@ kernel void gemv_bias_f32(
     threadgroup float local_sums[TM * SIMD_SIZE];
 
     uint row_base = tg_id * TM;
+    if (row_base >= M) return;
+    row_base = (row_base + TM <= M) ? row_base : M - TM;
     float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
 
     uint k4 = K / 4;
     for (uint i = tid; i < k4; i += tgsize) {
         uint idx = i * 4;
         float4 v4 = *reinterpret_cast<device const float4*>(vec + idx);
+        #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
-            if (row_base + r < M) {
-                float4 m4 = *reinterpret_cast<device const float4*>(mat + (row_base + r) * K + idx);
-                acc[r] += dot(m4, v4);
-            }
+            float4 m4 = *reinterpret_cast<device const float4*>(mat + (row_base + r) * K + idx);
+            acc[r] += dot(m4, v4);
         }
     }
     for (uint i = k4 * 4 + tid; i < K; i += tgsize) {
         float v = vec[i];
+        #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
-            if (row_base + r < M) {
-                acc[r] += mat[(row_base + r) * K + i] * v;
-            }
+            acc[r] += mat[(row_base + r) * K + i] * v;
         }
     }
 
-    for (uint r = 0; r < TM; r++) acc[r] = simd_sum(acc[r]);
+    #pragma clang loop unroll(full)
+    for (uint r = 0; r < TM; r++) {
+        acc[r] = simd_sum(acc[r]);
+    }
 
     if (simd_group_id == 0) {
-        for (uint r = 0; r < TM; r++) local_sums[r * SIMD_SIZE + simd_lane_id] = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            local_sums[r * SIMD_SIZE + simd_lane_id] = 0.0f;
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (simd_lane_id == 0) {
-        for (uint r = 0; r < TM; r++) local_sums[r * SIMD_SIZE + simd_group_id] = acc[r];
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            local_sums[r * SIMD_SIZE + simd_group_id] = acc[r];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (simd_group_id == 0) {
+        #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
             float val = simd_sum(local_sums[r * SIMD_SIZE + simd_lane_id]);
-            if (simd_lane_id == 0 && (row_base + r) < M) {
+            if (simd_lane_id == 0) {
                 output[row_base + r] = val + bias[row_base + r];
             }
         }
@@ -477,6 +547,8 @@ kernel void gemv_bias_f16(
     threadgroup float local_sums[TM * SIMD_SIZE];
 
     uint row_base = tg_id * TM;
+    if (row_base >= M) return;
+    row_base = (row_base + TM <= M) ? row_base : M - TM;
     float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
 
     uint k4 = K / 4;
@@ -484,37 +556,45 @@ kernel void gemv_bias_f16(
         uint idx = i * 4;
         half4 v4h = *reinterpret_cast<device const half4*>(vec + idx);
         float4 v4 = float4(v4h);
+        #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
-            if (row_base + r < M) {
-                half4 m4h = *reinterpret_cast<device const half4*>(mat + (row_base + r) * K + idx);
-                float4 m4 = float4(m4h);
-                acc[r] += dot(m4, v4);
-            }
+            half4 m4h = *reinterpret_cast<device const half4*>(mat + (row_base + r) * K + idx);
+            float4 m4 = float4(m4h);
+            acc[r] += dot(m4, v4);
         }
     }
     for (uint i = k4 * 4 + tid; i < K; i += tgsize) {
         float v = float(vec[i]);
+        #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
-            if (row_base + r < M) {
-                acc[r] += float(mat[(row_base + r) * K + i]) * v;
-            }
+            acc[r] += float(mat[(row_base + r) * K + i]) * v;
         }
     }
 
-    for (uint r = 0; r < TM; r++) acc[r] = simd_sum(acc[r]);
+    #pragma clang loop unroll(full)
+    for (uint r = 0; r < TM; r++) {
+        acc[r] = simd_sum(acc[r]);
+    }
 
     if (simd_group_id == 0) {
-        for (uint r = 0; r < TM; r++) local_sums[r * SIMD_SIZE + simd_lane_id] = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            local_sums[r * SIMD_SIZE + simd_lane_id] = 0.0f;
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (simd_lane_id == 0) {
-        for (uint r = 0; r < TM; r++) local_sums[r * SIMD_SIZE + simd_group_id] = acc[r];
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            local_sums[r * SIMD_SIZE + simd_group_id] = acc[r];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (simd_group_id == 0) {
+        #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
             float val = simd_sum(local_sums[r * SIMD_SIZE + simd_lane_id]);
-            if (simd_lane_id == 0 && (row_base + r) < M) {
+            if (simd_lane_id == 0) {
                 output[row_base + r] = half(val + float(bias[row_base + r]));
             }
         }
@@ -537,31 +617,42 @@ kernel void gemv_bias_bf16(
     threadgroup float local_sums[TM * SIMD_SIZE];
 
     uint row_base = tg_id * TM;
+    if (row_base >= M) return;
+    row_base = (row_base + TM <= M) ? row_base : M - TM;
     float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
 
     for (uint i = tid; i < K; i += tgsize) {
         float v = float(vec[i]);
+        #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
-            if (row_base + r < M) {
-                acc[r] += float(mat[(row_base + r) * K + i]) * v;
-            }
+            acc[r] += float(mat[(row_base + r) * K + i]) * v;
         }
     }
 
-    for (uint r = 0; r < TM; r++) acc[r] = simd_sum(acc[r]);
+    #pragma clang loop unroll(full)
+    for (uint r = 0; r < TM; r++) {
+        acc[r] = simd_sum(acc[r]);
+    }
 
     if (simd_group_id == 0) {
-        for (uint r = 0; r < TM; r++) local_sums[r * SIMD_SIZE + simd_lane_id] = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            local_sums[r * SIMD_SIZE + simd_lane_id] = 0.0f;
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (simd_lane_id == 0) {
-        for (uint r = 0; r < TM; r++) local_sums[r * SIMD_SIZE + simd_group_id] = acc[r];
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            local_sums[r * SIMD_SIZE + simd_group_id] = acc[r];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (simd_group_id == 0) {
+        #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
             float val = simd_sum(local_sums[r * SIMD_SIZE + simd_lane_id]);
-            if (simd_lane_id == 0 && (row_base + r) < M) {
+            if (simd_lane_id == 0) {
                 output[row_base + r] = bfloat(val + float(bias[row_base + r]));
             }
         }
@@ -585,32 +676,47 @@ kernel void gemv_bias_bm8_f32(
 {
     uint row_base = tg_id * (BM8 * TM) + simd_group_id * TM;
     if (row_base >= M) return;
+    row_base = (row_base + TM <= M) ? row_base : M - TM;
 
     float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-    uint k4 = K / 4;
-    for (uint i = simd_lane_id; i < k4; i += SIMD_SIZE) {
-        uint idx = i * 4;
-        float4 v4 = *reinterpret_cast<device const float4*>(vec + idx);
+    // Double-buffered: process 2×float4 per iteration for latency hiding
+    uint k8 = K / 8;
+    for (uint i = simd_lane_id; i < k8; i += SIMD_SIZE) {
+        threadgroup_barrier(mem_flags::mem_none);  // sync threads for cache coherence
+        uint idx = i * 8;
+        float4 v4a = *reinterpret_cast<device const float4*>(vec + idx);
+        float4 v4b = *reinterpret_cast<device const float4*>(vec + idx + 4);
+        #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
-            if (row_base + r < M) {
-                float4 m4 = *reinterpret_cast<device const float4*>(mat + (row_base + r) * K + idx);
-                acc[r] += dot(m4, v4);
-            }
+            device const float* row = mat + (row_base + r) * K + idx;
+            float4 m4a = *reinterpret_cast<device const float4*>(row);
+            float4 m4b = *reinterpret_cast<device const float4*>(row + 4);
+            acc[r] += dot(m4a, v4a) + dot(m4b, v4b);
         }
     }
-    for (uint i = k4 * 4 + simd_lane_id; i < K; i += SIMD_SIZE) {
-        float v = vec[i];
+    // Handle remainder (K%8 > 0)
+    for (uint i = k8 * 8 + simd_lane_id * 4; i + 3 < K; i += SIMD_SIZE * 4) {
+        float4 v4 = *reinterpret_cast<device const float4*>(vec + i);
+        #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
-            if (row_base + r < M) {
-                acc[r] += mat[(row_base + r) * K + i] * v;
-            }
+            float4 m4 = *reinterpret_cast<device const float4*>(mat + (row_base + r) * K + i);
+            acc[r] += dot(m4, v4);
+        }
+    }
+    // Handle scalar remainder (K%4 > 0)
+    for (uint i = (K / 4) * 4 + simd_lane_id; i < K; i += SIMD_SIZE) {
+        float v = vec[i];
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            acc[r] += mat[(row_base + r) * K + i] * v;
         }
     }
 
+    #pragma clang loop unroll(full)
     for (uint r = 0; r < TM; r++) {
         acc[r] = simd_sum(acc[r]);
-        if (simd_lane_id == 0 && (row_base + r) < M) {
+        if (simd_lane_id == 0) {
             output[row_base + r] = acc[r] + bias[row_base + r];
         }
     }
@@ -629,34 +735,53 @@ kernel void gemv_bias_bm8_f16(
 {
     uint row_base = tg_id * (BM8 * TM) + simd_group_id * TM;
     if (row_base >= M) return;
+    row_base = (row_base + TM <= M) ? row_base : M - TM;
 
     float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-    uint k4 = K / 4;
-    for (uint i = simd_lane_id; i < k4; i += SIMD_SIZE) {
-        uint idx = i * 4;
-        half4 v4h = *reinterpret_cast<device const half4*>(vec + idx);
-        float4 v4 = float4(v4h);
+    // Double-buffered: process 2×half4 per iteration for latency hiding
+    uint k8 = K / 8;
+    for (uint i = simd_lane_id; i < k8; i += SIMD_SIZE) {
+        threadgroup_barrier(mem_flags::mem_none);  // sync threads for cache coherence
+        uint idx = i * 8;
+        half4 v4ha = *reinterpret_cast<device const half4*>(vec + idx);
+        half4 v4hb = *reinterpret_cast<device const half4*>(vec + idx + 4);
+        float4 v4a = float4(v4ha);
+        float4 v4b = float4(v4hb);
+        #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
-            if (row_base + r < M) {
-                half4 m4h = *reinterpret_cast<device const half4*>(mat + (row_base + r) * K + idx);
-                float4 m4 = float4(m4h);
-                acc[r] += dot(m4, v4);
-            }
+            device const half* row = mat + (row_base + r) * K + idx;
+            half4 m4ha = *reinterpret_cast<device const half4*>(row);
+            half4 m4hb = *reinterpret_cast<device const half4*>(row + 4);
+            float4 m4a = float4(m4ha);
+            float4 m4b = float4(m4hb);
+            acc[r] += dot(m4a, v4a) + dot(m4b, v4b);
         }
     }
-    for (uint i = k4 * 4 + simd_lane_id; i < K; i += SIMD_SIZE) {
-        float v = float(vec[i]);
+    // Handle remainder (K%8 > 0)
+    for (uint i = k8 * 8 + simd_lane_id * 4; i + 3 < K; i += SIMD_SIZE * 4) {
+        half4 v4h = *reinterpret_cast<device const half4*>(vec + i);
+        float4 v4 = float4(v4h);
+        #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
-            if (row_base + r < M) {
-                acc[r] += float(mat[(row_base + r) * K + i]) * v;
-            }
+            half4 m4h = *reinterpret_cast<device const half4*>(mat + (row_base + r) * K + i);
+            float4 m4 = float4(m4h);
+            acc[r] += dot(m4, v4);
+        }
+    }
+    // Handle scalar remainder (K%4 > 0)
+    for (uint i = (K / 4) * 4 + simd_lane_id; i < K; i += SIMD_SIZE) {
+        float v = float(vec[i]);
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            acc[r] += float(mat[(row_base + r) * K + i]) * v;
         }
     }
 
+    #pragma clang loop unroll(full)
     for (uint r = 0; r < TM; r++) {
         acc[r] = simd_sum(acc[r]);
-        if (simd_lane_id == 0 && (row_base + r) < M) {
+        if (simd_lane_id == 0) {
             output[row_base + r] = half(acc[r] + float(bias[row_base + r]));
         }
     }
@@ -675,21 +800,23 @@ kernel void gemv_bias_bm8_bf16(
 {
     uint row_base = tg_id * (BM8 * TM) + simd_group_id * TM;
     if (row_base >= M) return;
+    row_base = (row_base + TM <= M) ? row_base : M - TM;
 
     float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
 
     for (uint i = simd_lane_id; i < K; i += SIMD_SIZE) {
+        threadgroup_barrier(mem_flags::mem_none);  // sync threads for cache coherence
         float v = float(vec[i]);
+        #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
-            if (row_base + r < M) {
-                acc[r] += float(mat[(row_base + r) * K + i]) * v;
-            }
+            acc[r] += float(mat[(row_base + r) * K + i]) * v;
         }
     }
 
+    #pragma clang loop unroll(full)
     for (uint r = 0; r < TM; r++) {
         acc[r] = simd_sum(acc[r]);
-        if (simd_lane_id == 0 && (row_base + r) < M) {
+        if (simd_lane_id == 0) {
             output[row_base + r] = bfloat(acc[r] + float(bias[row_base + r]));
         }
     }
@@ -719,32 +846,45 @@ kernel void gemv_t_f32(
     threadgroup float local_sums[TM * SIMD_SIZE];
 
     uint col_base = tg_id * TM;
+    if (col_base >= N_out) return;
+    col_base = (col_base + TM <= N_out) ? col_base : N_out - TM;
     float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
 
     // Each thread strides across the reduction dimension (rows of A)
     for (uint i = tid; i < K_red; i += tgsize) {
+        threadgroup_barrier(mem_flags::mem_none);
         float v = vec[i];
+        float4 m4 = *reinterpret_cast<device const float4*>(mat + i * lda + col_base);
+        #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
-            if (col_base + r < N_out) {
-                acc[r] += mat[i * lda + col_base + r] * v;
-            }
+            acc[r] += m4[r] * v;
         }
     }
 
-    for (uint r = 0; r < TM; r++) acc[r] = simd_sum(acc[r]);
+    #pragma clang loop unroll(full)
+    for (uint r = 0; r < TM; r++) {
+        acc[r] = simd_sum(acc[r]);
+    }
 
     if (simd_group_id == 0) {
-        for (uint r = 0; r < TM; r++) local_sums[r * SIMD_SIZE + simd_lane_id] = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            local_sums[r * SIMD_SIZE + simd_lane_id] = 0.0f;
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (simd_lane_id == 0) {
-        for (uint r = 0; r < TM; r++) local_sums[r * SIMD_SIZE + simd_group_id] = acc[r];
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            local_sums[r * SIMD_SIZE + simd_group_id] = acc[r];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (simd_group_id == 0) {
+        #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
             float val = simd_sum(local_sums[r * SIMD_SIZE + simd_lane_id]);
-            if (simd_lane_id == 0 && (col_base + r) < N_out) {
+            if (simd_lane_id == 0) {
                 output[col_base + r] = val;
             }
         }
@@ -767,31 +907,44 @@ kernel void gemv_t_f16(
     threadgroup float local_sums[TM * SIMD_SIZE];
 
     uint col_base = tg_id * TM;
+    if (col_base >= N_out) return;
+    col_base = (col_base + TM <= N_out) ? col_base : N_out - TM;
     float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
 
     for (uint i = tid; i < K_red; i += tgsize) {
+        threadgroup_barrier(mem_flags::mem_none);
         float v = float(vec[i]);
+        half4 m4h = *reinterpret_cast<device const half4*>(mat + i * lda + col_base);
+        #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
-            if (col_base + r < N_out) {
-                acc[r] += float(mat[i * lda + col_base + r]) * v;
-            }
+            acc[r] += float(m4h[r]) * v;
         }
     }
 
-    for (uint r = 0; r < TM; r++) acc[r] = simd_sum(acc[r]);
+    #pragma clang loop unroll(full)
+    for (uint r = 0; r < TM; r++) {
+        acc[r] = simd_sum(acc[r]);
+    }
 
     if (simd_group_id == 0) {
-        for (uint r = 0; r < TM; r++) local_sums[r * SIMD_SIZE + simd_lane_id] = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            local_sums[r * SIMD_SIZE + simd_lane_id] = 0.0f;
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (simd_lane_id == 0) {
-        for (uint r = 0; r < TM; r++) local_sums[r * SIMD_SIZE + simd_group_id] = acc[r];
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            local_sums[r * SIMD_SIZE + simd_group_id] = acc[r];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (simd_group_id == 0) {
+        #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
             float val = simd_sum(local_sums[r * SIMD_SIZE + simd_lane_id]);
-            if (simd_lane_id == 0 && (col_base + r) < N_out) {
+            if (simd_lane_id == 0) {
                 output[col_base + r] = half(val);
             }
         }
@@ -814,31 +967,43 @@ kernel void gemv_t_bf16(
     threadgroup float local_sums[TM * SIMD_SIZE];
 
     uint col_base = tg_id * TM;
+    if (col_base >= N_out) return;
+    col_base = (col_base + TM <= N_out) ? col_base : N_out - TM;
     float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
 
     for (uint i = tid; i < K_red; i += tgsize) {
+        threadgroup_barrier(mem_flags::mem_none);
         float v = float(vec[i]);
+        #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
-            if (col_base + r < N_out) {
-                acc[r] += float(mat[i * lda + col_base + r]) * v;
-            }
+            acc[r] += float(mat[i * lda + col_base + r]) * v;
         }
     }
 
-    for (uint r = 0; r < TM; r++) acc[r] = simd_sum(acc[r]);
+    #pragma clang loop unroll(full)
+    for (uint r = 0; r < TM; r++) {
+        acc[r] = simd_sum(acc[r]);
+    }
 
     if (simd_group_id == 0) {
-        for (uint r = 0; r < TM; r++) local_sums[r * SIMD_SIZE + simd_lane_id] = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            local_sums[r * SIMD_SIZE + simd_lane_id] = 0.0f;
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (simd_lane_id == 0) {
-        for (uint r = 0; r < TM; r++) local_sums[r * SIMD_SIZE + simd_group_id] = acc[r];
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            local_sums[r * SIMD_SIZE + simd_group_id] = acc[r];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (simd_group_id == 0) {
+        #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
             float val = simd_sum(local_sums[r * SIMD_SIZE + simd_lane_id]);
-            if (simd_lane_id == 0 && (col_base + r) < N_out) {
+            if (simd_lane_id == 0) {
                 output[col_base + r] = bfloat(val);
             }
         }
@@ -951,10 +1116,12 @@ pub fn gemv(
     } else {
         ceil_div(m as u64, TM)
     };
-    encoder.dispatch_thread_groups(
-        MTLSize::new(num_threadgroups, 1, 1),
-        MTLSize::new(tg_size, 1, 1),
-    );
+    let tg_dim = if use_bm8 {
+        MTLSize::new(32, 1, BM8)
+    } else {
+        MTLSize::new(tg_size, 1, 1)
+    };
+    encoder.dispatch_thread_groups(MTLSize::new(num_threadgroups, 1, 1), tg_dim);
     encoder.end_encoding();
     super::commit_with_mode(command_buffer, super::ExecMode::Sync);
 
@@ -1029,10 +1196,12 @@ pub fn gemv_into_cb(
     } else {
         ceil_div(m as u64, TM)
     };
-    encoder.dispatch_thread_groups(
-        MTLSize::new(num_threadgroups, 1, 1),
-        MTLSize::new(tg_size, 1, 1),
-    );
+    let tg_dim = if use_bm8 {
+        MTLSize::new(32, 1, BM8)
+    } else {
+        MTLSize::new(tg_size, 1, 1)
+    };
+    encoder.dispatch_thread_groups(MTLSize::new(num_threadgroups, 1, 1), tg_dim);
     encoder.end_encoding();
 
     Ok(out)
@@ -1106,10 +1275,12 @@ pub fn gemv_into_encoder(
     } else {
         ceil_div(m as u64, TM)
     };
-    encoder.dispatch_thread_groups(
-        MTLSize::new(num_threadgroups, 1, 1),
-        MTLSize::new(tg_size, 1, 1),
-    );
+    let tg_dim = if use_bm8 {
+        MTLSize::new(32, 1, BM8)
+    } else {
+        MTLSize::new(tg_size, 1, 1)
+    };
+    encoder.dispatch_thread_groups(MTLSize::new(num_threadgroups, 1, 1), tg_dim);
 
     Ok(out)
 }
@@ -1212,10 +1383,12 @@ pub fn gemv_bias_into_cb(
     } else {
         ceil_div(m as u64, TM)
     };
-    encoder.dispatch_thread_groups(
-        MTLSize::new(num_threadgroups, 1, 1),
-        MTLSize::new(tg_size, 1, 1),
-    );
+    let tg_dim = if use_bm8 {
+        MTLSize::new(32, 1, BM8)
+    } else {
+        MTLSize::new(tg_size, 1, 1)
+    };
+    encoder.dispatch_thread_groups(MTLSize::new(num_threadgroups, 1, 1), tg_dim);
     encoder.end_encoding();
 
     Ok(out)
@@ -1318,10 +1491,12 @@ pub fn gemv_bias_into_encoder(
     } else {
         ceil_div(m as u64, TM)
     };
-    encoder.dispatch_thread_groups(
-        MTLSize::new(num_threadgroups, 1, 1),
-        MTLSize::new(tg_size, 1, 1),
-    );
+    let tg_dim = if use_bm8 {
+        MTLSize::new(32, 1, BM8)
+    } else {
+        MTLSize::new(tg_size, 1, 1)
+    };
+    encoder.dispatch_thread_groups(MTLSize::new(num_threadgroups, 1, 1), tg_dim);
 
     Ok(out)
 }
@@ -1439,10 +1614,12 @@ pub fn gemv_bias(
     } else {
         ceil_div(m as u64, TM)
     };
-    encoder.dispatch_thread_groups(
-        MTLSize::new(num_threadgroups, 1, 1),
-        MTLSize::new(tg_size, 1, 1),
-    );
+    let tg_dim = if use_bm8 {
+        MTLSize::new(32, 1, BM8)
+    } else {
+        MTLSize::new(tg_size, 1, 1)
+    };
+    encoder.dispatch_thread_groups(MTLSize::new(num_threadgroups, 1, 1), tg_dim);
     encoder.end_encoding();
     super::commit_with_mode(command_buffer, super::ExecMode::Sync);
 
