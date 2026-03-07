@@ -154,13 +154,14 @@ impl Array {
         let byte_size = dtype
             .numel_to_bytes(numel)
             .map_err(|e| rmlx_alloc::AllocError::DType(e.to_string()))?;
-        let buffer = allocator.alloc(byte_size)?;
+        let (buffer, sub_offset) = allocator.alloc(byte_size)?;
 
         // Zero the buffer contents (cached buffers may contain stale data).
         // SAFETY: SharedMode buffer contents() is CPU-accessible and valid
-        // for buffer.length() bytes.
+        // for buffer.length() bytes. We zero only our sub-allocation region.
         unsafe {
-            std::ptr::write_bytes(buffer.contents() as *mut u8, 0, byte_size);
+            let base = (buffer.contents() as *mut u8).add(sub_offset);
+            std::ptr::write_bytes(base, 0, byte_size);
         }
 
         let strides = compute_contiguous_strides(shape);
@@ -169,7 +170,7 @@ impl Array {
             shape: shape.to_vec(),
             strides,
             dtype,
-            offset: 0,
+            offset: sub_offset,
         })
     }
 

@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+tracked_hazards = []
+
 [dependencies]
 metal = { workspace = true }
 objc = { workspace = true }

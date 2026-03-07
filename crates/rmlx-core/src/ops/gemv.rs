@@ -17,6 +17,51 @@ use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
 use metal::MTLSize;
 
+// ---------------------------------------------------------------------------
+// GEMV tuning — dimension-adaptive parameter selection
+// ---------------------------------------------------------------------------
+
+/// GEMV tuning parameters derived from matrix dimensions (MLX pattern).
+#[derive(Debug, Clone, Copy)]
+pub struct GemvTuning {
+    pub sm: u64,
+    pub sn: u64,
+    pub bn: u64,
+}
+
+impl GemvTuning {
+    /// Select GEMV tuning based on input/output vector dimensions.
+    ///
+    /// Follows the MLX dimension-adaptive pattern for optimal throughput.
+    pub fn select(in_vec: usize, out_vec: usize) -> Self {
+        if in_vec >= 8192 && out_vec >= 2048 {
+            Self {
+                sm: 4,
+                sn: 8,
+                bn: 16,
+            }
+        } else if out_vec >= 2048 {
+            Self {
+                sm: 8,
+                sn: 4,
+                bn: 16,
+            }
+        } else if out_vec >= 512 {
+            Self {
+                sm: 8,
+                sn: 4,
+                bn: 4,
+            }
+        } else {
+            Self {
+                sm: 8,
+                sn: 4,
+                bn: 2,
+            }
+        }
+    }
+}
+
 /// Threadgroup size used for GEMV dispatch.
 const GEMV_THREADGROUP_SIZE: u64 = 256;
 
@@ -1583,4 +1628,39 @@ pub fn gemv_t_into_cb(
     encoder.end_encoding();
 
     Ok(out)
+}
+
+/// Build function constants for GEMV specialization.
+pub fn gemv_constants(use_bias: bool) -> Vec<(u32, crate::kernels::FunctionConstantValue)> {
+    use crate::kernels::FunctionConstantValue;
+    vec![(200, FunctionConstantValue::Bool(use_bias))]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_gemv_tuning_large() {
+        let t = GemvTuning::select(8192, 4096);
+        assert_eq!(t.sm, 4);
+        assert_eq!(t.sn, 8);
+        assert_eq!(t.bn, 16);
+    }
+
+    #[test]
+    fn test_gemv_tuning_medium() {
+        let t = GemvTuning::select(4096, 2048);
+        assert_eq!(t.sm, 8);
+        assert_eq!(t.sn, 4);
+        assert_eq!(t.bn, 16);
+    }
+
+    #[test]
+    fn test_gemv_tuning_small() {
+        let t = GemvTuning::select(512, 128);
+        assert_eq!(t.sm, 8);
+        assert_eq!(t.sn, 4);
+        assert_eq!(t.bn, 2);
+    }
 }

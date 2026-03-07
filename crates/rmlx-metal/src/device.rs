@@ -20,12 +20,15 @@ pub const UNTRACKED_BUFFER_OPTIONS: MTLResourceOptions = MTLResourceOptions::fro
         | MTLResourceOptions::HazardTrackingModeUntracked.bits(),
 );
 
-/// Default buffer options — safe by default (tracked).
+/// Default buffer options — untracked for performance (MLX-compatible).
 ///
-/// Previously this was `StorageModeShared | HazardTrackingModeUntracked`,
-/// which skipped Metal hazard tracking globally. Now defaults to the safe
-/// tracked variant. Code that explicitly goes through the barrier tracker
-/// should use [`UNTRACKED_BUFFER_OPTIONS`] instead.
+/// RMLX manages synchronisation explicitly via the barrier tracker and
+/// encoder boundaries, so Metal's automatic hazard tracking is redundant.
+/// Enable the `tracked_hazards` feature to restore the safe-but-slower default.
+#[cfg(not(feature = "tracked_hazards"))]
+pub const DEFAULT_BUFFER_OPTIONS: MTLResourceOptions = UNTRACKED_BUFFER_OPTIONS;
+
+#[cfg(feature = "tracked_hazards")]
 pub const DEFAULT_BUFFER_OPTIONS: MTLResourceOptions = TRACKED_BUFFER_OPTIONS;
 
 // ---------------------------------------------------------------------------
@@ -49,6 +52,20 @@ pub struct ChipTuning {
     /// references (`newCommandBufferWithUnretainedReferences`), which avoids
     /// the overhead of retaining every resource referenced by the CB.
     pub supports_unretained_refs: bool,
+    /// Architecture generation: 0=unknown, 15=M1, 16=M2, 17=M3, 18=M4, ...
+    pub arch_gen: u32,
+    /// GPU class within the generation.
+    pub arch_class: ArchClass,
+    /// Whether the device supports NAX (Neural Accelerated matriX) MMA.
+    /// True for gen>=17 && class != Phone && class != Unknown.
+    pub supports_nax: bool,
+    /// Maximum ops per command buffer batch (Ultra/Max=50, Base=40, Unknown=32).
+    pub max_ops_per_batch: u32,
+    /// Maximum MB per command buffer batch (Ultra/Max=50, Base=40, Unknown=32).
+    pub max_mb_per_batch: u32,
+    /// Whether concurrent compute dispatch is supported.
+    /// True for all Apple Silicon (M1+), false for unknown hardware.
+    pub supports_concurrent_dispatch: bool,
 }
 
 impl ChipTuning {
@@ -66,12 +83,32 @@ impl ChipTuning {
             || device.supports_family(MTLGPUFamily::Apple8)
             || device.supports_family(MTLGPUFamily::Apple9);
 
+        let arch = detect_architecture(device.name());
+        let generation = match arch {
+            Architecture::Apple { generation } => generation,
+            Architecture::Unknown => 0,
+        };
+        let arch_class = detect_arch_class(device.name());
+        let supports_nax =
+            generation >= 17 && arch_class != ArchClass::Phone && arch_class != ArchClass::Unknown;
+        let (max_ops, max_mb) = match arch_class {
+            ArchClass::Ultra | ArchClass::Max => (50, 50),
+            ArchClass::Base => (40, 40),
+            _ => (32, 32),
+        };
+
         if is_apple {
             Self {
                 max_threadgroup_memory: 32 * 1024,
                 max_threads_per_threadgroup: 1024,
                 preferred_simd_width: 32,
                 supports_unretained_refs: supports_metal3,
+                arch_gen: generation,
+                arch_class,
+                supports_nax,
+                max_ops_per_batch: max_ops,
+                max_mb_per_batch: max_mb,
+                supports_concurrent_dispatch: true,
             }
         } else {
             // Conservative defaults for unknown hardware.
@@ -80,6 +117,12 @@ impl ChipTuning {
                 max_threads_per_threadgroup: 512,
                 preferred_simd_width: 32,
                 supports_unretained_refs: false,
+                arch_gen: generation,
+                arch_class,
+                supports_nax,
+                max_ops_per_batch: max_ops,
+                max_mb_per_batch: max_mb,
+                supports_concurrent_dispatch: false,
             }
         }
     }
@@ -92,24 +135,54 @@ impl ChipTuning {
     #[cfg(test)]
     pub(crate) fn from_name(name: &str) -> Self {
         let arch = detect_architecture(name);
+        let generation = match arch {
+            Architecture::Apple { generation } => generation,
+            Architecture::Unknown => 0,
+        };
+        let arch_class = detect_arch_class(name);
+        let supports_nax =
+            generation >= 17 && arch_class != ArchClass::Phone && arch_class != ArchClass::Unknown;
+        let (max_ops, max_mb) = match arch_class {
+            ArchClass::Ultra | ArchClass::Max => (50, 50),
+            ArchClass::Base => (40, 40),
+            _ => (32, 32),
+        };
         match arch {
             Architecture::Apple { generation } if generation >= 16 => Self {
                 max_threadgroup_memory: 32 * 1024,
                 max_threads_per_threadgroup: 1024,
                 preferred_simd_width: 32,
                 supports_unretained_refs: true, // M2+ => Metal 3
+                arch_gen: generation,
+                arch_class,
+                supports_nax,
+                max_ops_per_batch: max_ops,
+                max_mb_per_batch: max_mb,
+                supports_concurrent_dispatch: true,
             },
-            Architecture::Apple { .. } => Self {
+            Architecture::Apple { generation } => Self {
                 max_threadgroup_memory: 32 * 1024,
                 max_threads_per_threadgroup: 1024,
                 preferred_simd_width: 32,
                 supports_unretained_refs: false, // M1 => Metal 2
+                arch_gen: generation,
+                arch_class,
+                supports_nax,
+                max_ops_per_batch: max_ops,
+                max_mb_per_batch: max_mb,
+                supports_concurrent_dispatch: true,
             },
             Architecture::Unknown => Self {
                 max_threadgroup_memory: 16 * 1024,
                 max_threads_per_threadgroup: 512,
                 preferred_simd_width: 32,
                 supports_unretained_refs: false,
+                arch_gen: 0,
+                arch_class,
+                supports_nax: false,
+                max_ops_per_batch: max_ops,
+                max_mb_per_batch: max_mb,
+                supports_concurrent_dispatch: false,
             },
         }
     }
@@ -121,6 +194,21 @@ pub enum Architecture {
     /// Apple Silicon GPU with generation number (M1=15, M2=16, M3=17, M4=18).
     Apple { generation: u32 },
     /// Unknown or unrecognized architecture.
+    Unknown,
+}
+
+/// GPU class within an Apple Silicon generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchClass {
+    /// iPhone/iPad GPU (A-series equivalent)
+    Phone,
+    /// Base chip (M1, M2, M3, M4)
+    Base,
+    /// Max variant (higher GPU core count)
+    Max,
+    /// Ultra variant (two Max dies fused)
+    Ultra,
+    /// Unrecognized class — gets conservative defaults
     Unknown,
 }
 
@@ -233,6 +321,28 @@ impl GpuDevice {
         let ptr = data.as_ptr() as *const std::ffi::c_void;
         self.device
             .new_buffer_with_data(ptr, size, DEFAULT_BUFFER_OPTIONS)
+    }
+}
+
+/// Parse chip class from device name string.
+///
+/// Only classifies Apple Silicon devices (names containing "M1"/"M2"/etc).
+/// Non-Apple devices always get `Unknown`.
+fn detect_arch_class(name: &str) -> ArchClass {
+    // Only classify if it's an Apple Silicon device
+    let is_apple_silicon =
+        name.contains("M1") || name.contains("M2") || name.contains("M3") || name.contains("M4");
+    if !is_apple_silicon {
+        return ArchClass::Unknown;
+    }
+
+    if name.contains("Ultra") {
+        ArchClass::Ultra
+    } else if name.contains("Max") {
+        ArchClass::Max
+    } else {
+        // Pro and base are the same GPU class for tuning purposes
+        ArchClass::Base
     }
 }
 
@@ -397,8 +507,15 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "tracked_hazards"))]
+    fn test_default_buffer_options_is_untracked() {
+        assert_eq!(DEFAULT_BUFFER_OPTIONS, UNTRACKED_BUFFER_OPTIONS);
+        assert!(DEFAULT_BUFFER_OPTIONS.contains(MTLResourceOptions::HazardTrackingModeUntracked));
+    }
+
+    #[test]
+    #[cfg(feature = "tracked_hazards")]
     fn test_default_buffer_options_is_tracked() {
-        // DEFAULT_BUFFER_OPTIONS should be the safe (tracked) variant.
         assert_eq!(DEFAULT_BUFFER_OPTIONS, TRACKED_BUFFER_OPTIONS);
         assert!(!DEFAULT_BUFFER_OPTIONS.contains(MTLResourceOptions::HazardTrackingModeUntracked));
     }
@@ -539,5 +656,45 @@ mod tests {
             detect_architecture("Apple M2 Ultra"),
             Architecture::Apple { generation: 16 }
         ));
+    }
+
+    // ----- ArchClass detection tests -----
+
+    #[test]
+    fn test_arch_class_detection() {
+        assert_eq!(detect_arch_class("Apple M2 Ultra"), ArchClass::Ultra);
+        assert_eq!(detect_arch_class("Apple M3 Max"), ArchClass::Max);
+        assert_eq!(detect_arch_class("Apple M3 Pro"), ArchClass::Base);
+        assert_eq!(detect_arch_class("Apple M4"), ArchClass::Base);
+        assert_eq!(detect_arch_class("Intel HD 630"), ArchClass::Unknown);
+        assert_eq!(detect_arch_class("Radeon Pro"), ArchClass::Unknown);
+    }
+
+    #[test]
+    fn test_chip_tuning_nax_support() {
+        let t = ChipTuning::from_name("Apple M3 Max");
+        assert!(t.supports_nax, "M3 Max should support NAX");
+        assert_eq!(t.arch_gen, 17);
+        assert_eq!(t.arch_class, ArchClass::Max);
+        assert_eq!(t.max_ops_per_batch, 50);
+    }
+
+    #[test]
+    fn test_chip_tuning_no_nax_m2() {
+        let t = ChipTuning::from_name("Apple M2 Ultra");
+        assert!(!t.supports_nax, "M2 should not support NAX");
+        assert_eq!(t.arch_gen, 16);
+        assert_eq!(t.arch_class, ArchClass::Ultra);
+        assert_eq!(t.max_ops_per_batch, 50);
+    }
+
+    #[test]
+    fn test_chip_tuning_unknown_conservative() {
+        let t = ChipTuning::from_name("Intel HD 630");
+        assert!(!t.supports_nax);
+        assert_eq!(t.arch_gen, 0);
+        assert_eq!(t.arch_class, ArchClass::Unknown);
+        assert_eq!(t.max_ops_per_batch, 32);
+        assert_eq!(t.max_mb_per_batch, 32);
     }
 }
