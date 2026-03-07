@@ -517,15 +517,21 @@ fn encode_gemm(
 ) -> Result<(), KernelError> {
     let tile = ops::matmul::select_tile_config(m as usize, n as usize, k as usize);
     let kernel_name = match (tile.variant, dtype) {
-        (ops::matmul::TileVariant::Simd, DType::Float32) => "gemm_simd_f32",
-        (ops::matmul::TileVariant::Simd, DType::Float16) => "gemm_simd_f16",
-        (ops::matmul::TileVariant::Simd, DType::Bfloat16) => "gemm_simd_bf16",
+        (ops::matmul::TileVariant::Simd, DType::Float32)
+        | (ops::matmul::TileVariant::Medium, DType::Float32) => "gemm_simd_f32",
+        (ops::matmul::TileVariant::Simd, DType::Float16)
+        | (ops::matmul::TileVariant::Medium, DType::Float16) => "gemm_simd_f16",
+        (ops::matmul::TileVariant::Simd, DType::Bfloat16)
+        | (ops::matmul::TileVariant::Medium, DType::Bfloat16) => "gemm_simd_bf16",
         (ops::matmul::TileVariant::Small, DType::Float32) => "gemm_small_f32",
         (ops::matmul::TileVariant::Small, DType::Float16) => "gemm_small_f16",
         (ops::matmul::TileVariant::Small, DType::Bfloat16) => "gemm_small_bf16",
-        (ops::matmul::TileVariant::Medium, DType::Float32) => "gemm_tiled_f32",
-        (ops::matmul::TileVariant::Medium, DType::Float16) => "gemm_tiled_f16",
-        (ops::matmul::TileVariant::Medium, DType::Bfloat16) => "gemm_tiled_bf16",
+        (ops::matmul::TileVariant::Skinny, DType::Float32) => "gemm_skinny_f32",
+        (ops::matmul::TileVariant::Skinny, DType::Float16) => "gemm_skinny_f16",
+        (ops::matmul::TileVariant::Skinny, DType::Bfloat16) => "gemm_skinny_bf16",
+        (ops::matmul::TileVariant::Full, DType::Float32) => "gemm_tiled_f32",
+        (ops::matmul::TileVariant::Full, DType::Float16) => "gemm_tiled_f16",
+        (ops::matmul::TileVariant::Full, DType::Bfloat16) => "gemm_tiled_bf16",
         (_, other) => {
             return Err(KernelError::InvalidShape(format!(
                 "ExpertGroup: unsupported dtype {:?} for GEMM",
@@ -563,8 +569,14 @@ fn encode_gemm(
     enc.set_buffer(7, Some(&bsb_buf), 0);
     enc.set_buffer(8, Some(&bsc_buf), 0);
 
+    let tg_threads = match tile.variant {
+        ops::matmul::TileVariant::Small => 256_u64,
+        ops::matmul::TileVariant::Medium | ops::matmul::TileVariant::Simd => 1024_u64,
+        ops::matmul::TileVariant::Skinny | ops::matmul::TileVariant::Full => 256_u64,
+    };
+
     let grid = metal::MTLSize::new(grid_x, grid_y, 1);
-    let tg = metal::MTLSize::new(bm * bn, 1, 1);
+    let tg = metal::MTLSize::new(tg_threads, 1, 1);
     enc.dispatch_thread_groups(grid, tg);
     enc.end_encoding();
 

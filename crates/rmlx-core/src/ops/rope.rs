@@ -200,6 +200,283 @@ kernel void rope_bf16(
 // Computes theta = scale * (offset + seq_pos) * base^(-2k/dim) without
 // requiring precomputed cos/sin tables.
 
+// ---- Multi-head strided RoPE (fused deinterleave + RoPE) ----
+//
+// Reads from interleaved layout [seq_len, num_heads * head_dim] and writes to
+// batch-major [num_heads, seq_len, head_dim], applying RoPE in-flight.
+// Grid: (half_dim, seq_len, num_heads)
+// This fuses per-head copy + per-head RoPE into a single dispatch.
+
+kernel void rope_multihead_f32(
+    device const float* input       [[buffer(0)]],
+    device const float* cos_freqs   [[buffer(1)]],
+    device const float* sin_freqs   [[buffer(2)]],
+    device float*       output      [[buffer(3)]],
+    constant uint&  seq_len     [[buffer(4)]],
+    constant uint&  head_dim    [[buffer(5)]],
+    constant uint&  num_heads   [[buffer(6)]],
+    constant uint&  offset      [[buffer(7)]],
+    constant uint&  traditional [[buffer(8)]],
+    constant uint&  forward     [[buffer(9)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    uint pair_idx = gid.x;  // 0 .. half_dim-1
+    uint seq_pos  = gid.y;  // 0 .. seq_len-1
+    uint head     = gid.z;  // 0 .. num_heads-1
+
+    uint half_dim = head_dim / 2;
+    if (pair_idx >= half_dim || seq_pos >= seq_len || head >= num_heads) return;
+
+    uint freq_row = offset + seq_pos;
+    uint freq_idx = freq_row * half_dim + pair_idx;
+    float cos_val = cos_freqs[freq_idx];
+    float sin_val = sin_freqs[freq_idx];
+    if (!forward) sin_val = -sin_val;
+
+    // Input layout: [seq_len, num_heads * head_dim], row-major
+    uint in_base = seq_pos * (num_heads * head_dim) + head * head_dim;
+    uint in_idx1, in_idx2;
+    if (traditional) {
+        in_idx1 = in_base + 2 * pair_idx;
+        in_idx2 = in_idx1 + 1;
+    } else {
+        in_idx1 = in_base + pair_idx;
+        in_idx2 = in_base + pair_idx + half_dim;
+    }
+
+    // Output layout: [num_heads, seq_len, head_dim], contiguous
+    uint out_base = (head * seq_len + seq_pos) * head_dim;
+    uint out_idx1, out_idx2;
+    if (traditional) {
+        out_idx1 = out_base + 2 * pair_idx;
+        out_idx2 = out_idx1 + 1;
+    } else {
+        out_idx1 = out_base + pair_idx;
+        out_idx2 = out_base + pair_idx + half_dim;
+    }
+
+    float x0 = input[in_idx1];
+    float x1 = input[in_idx2];
+    output[out_idx1] = x0 * cos_val - x1 * sin_val;
+    output[out_idx2] = x0 * sin_val + x1 * cos_val;
+}
+
+kernel void rope_multihead_f16(
+    device const half*  input       [[buffer(0)]],
+    device const float* cos_freqs   [[buffer(1)]],
+    device const float* sin_freqs   [[buffer(2)]],
+    device half*        output      [[buffer(3)]],
+    constant uint&  seq_len     [[buffer(4)]],
+    constant uint&  head_dim    [[buffer(5)]],
+    constant uint&  num_heads   [[buffer(6)]],
+    constant uint&  offset      [[buffer(7)]],
+    constant uint&  traditional [[buffer(8)]],
+    constant uint&  forward     [[buffer(9)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    uint pair_idx = gid.x;
+    uint seq_pos  = gid.y;
+    uint head     = gid.z;
+
+    uint half_dim = head_dim / 2;
+    if (pair_idx >= half_dim || seq_pos >= seq_len || head >= num_heads) return;
+
+    uint freq_row = offset + seq_pos;
+    uint freq_idx = freq_row * half_dim + pair_idx;
+    float cos_val = cos_freqs[freq_idx];
+    float sin_val = sin_freqs[freq_idx];
+    if (!forward) sin_val = -sin_val;
+
+    uint in_base = seq_pos * (num_heads * head_dim) + head * head_dim;
+    uint in_idx1, in_idx2;
+    if (traditional) {
+        in_idx1 = in_base + 2 * pair_idx;
+        in_idx2 = in_idx1 + 1;
+    } else {
+        in_idx1 = in_base + pair_idx;
+        in_idx2 = in_base + pair_idx + half_dim;
+    }
+
+    uint out_base = (head * seq_len + seq_pos) * head_dim;
+    uint out_idx1, out_idx2;
+    if (traditional) {
+        out_idx1 = out_base + 2 * pair_idx;
+        out_idx2 = out_idx1 + 1;
+    } else {
+        out_idx1 = out_base + pair_idx;
+        out_idx2 = out_base + pair_idx + half_dim;
+    }
+
+    float x0 = float(input[in_idx1]);
+    float x1 = float(input[in_idx2]);
+    output[out_idx1] = half(x0 * cos_val - x1 * sin_val);
+    output[out_idx2] = half(x0 * sin_val + x1 * cos_val);
+}
+
+kernel void rope_multihead_bf16(
+    device const bfloat* input      [[buffer(0)]],
+    device const float*  cos_freqs  [[buffer(1)]],
+    device const float*  sin_freqs  [[buffer(2)]],
+    device bfloat*       output     [[buffer(3)]],
+    constant uint&  seq_len     [[buffer(4)]],
+    constant uint&  head_dim    [[buffer(5)]],
+    constant uint&  num_heads   [[buffer(6)]],
+    constant uint&  offset      [[buffer(7)]],
+    constant uint&  traditional [[buffer(8)]],
+    constant uint&  forward     [[buffer(9)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    uint pair_idx = gid.x;
+    uint seq_pos  = gid.y;
+    uint head     = gid.z;
+
+    uint half_dim = head_dim / 2;
+    if (pair_idx >= half_dim || seq_pos >= seq_len || head >= num_heads) return;
+
+    uint freq_row = offset + seq_pos;
+    uint freq_idx = freq_row * half_dim + pair_idx;
+    float cos_val = cos_freqs[freq_idx];
+    float sin_val = sin_freqs[freq_idx];
+    if (!forward) sin_val = -sin_val;
+
+    uint in_base = seq_pos * (num_heads * head_dim) + head * head_dim;
+    uint in_idx1, in_idx2;
+    if (traditional) {
+        in_idx1 = in_base + 2 * pair_idx;
+        in_idx2 = in_idx1 + 1;
+    } else {
+        in_idx1 = in_base + pair_idx;
+        in_idx2 = in_base + pair_idx + half_dim;
+    }
+
+    uint out_base = (head * seq_len + seq_pos) * head_dim;
+    uint out_idx1, out_idx2;
+    if (traditional) {
+        out_idx1 = out_base + 2 * pair_idx;
+        out_idx2 = out_idx1 + 1;
+    } else {
+        out_idx1 = out_base + pair_idx;
+        out_idx2 = out_base + pair_idx + half_dim;
+    }
+
+    float x0 = float(input[in_idx1]);
+    float x1 = float(input[in_idx2]);
+    output[out_idx1] = bfloat(x0 * cos_val - x1 * sin_val);
+    output[out_idx2] = bfloat(x0 * sin_val + x1 * cos_val);
+}
+
+// ---- Multi-head deinterleave (no RoPE, just layout transform) ----
+// Same layout transform as rope_multihead but without rotation.
+// For V heads that don't need RoPE.
+
+kernel void deinterleave_heads_f32(
+    device const float* input   [[buffer(0)]],
+    device float*       output  [[buffer(1)]],
+    constant uint& seq_len      [[buffer(2)]],
+    constant uint& head_dim     [[buffer(3)]],
+    constant uint& num_heads    [[buffer(4)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    uint d        = gid.x;
+    uint seq_pos  = gid.y;
+    uint head     = gid.z;
+    if (d >= head_dim || seq_pos >= seq_len || head >= num_heads) return;
+    uint in_idx  = seq_pos * (num_heads * head_dim) + head * head_dim + d;
+    uint out_idx = (head * seq_len + seq_pos) * head_dim + d;
+        output[out_idx] = input[in_idx];
+}
+
+kernel void deinterleave_heads_f16(
+    device const half* input    [[buffer(0)]],
+    device half*       output   [[buffer(1)]],
+    constant uint& seq_len      [[buffer(2)]],
+    constant uint& head_dim     [[buffer(3)]],
+    constant uint& num_heads    [[buffer(4)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    uint d        = gid.x;
+    uint seq_pos  = gid.y;
+    uint head     = gid.z;
+    if (d >= head_dim || seq_pos >= seq_len || head >= num_heads) return;
+    uint in_idx  = seq_pos * (num_heads * head_dim) + head * head_dim + d;
+    uint out_idx = (head * seq_len + seq_pos) * head_dim + d;
+    output[out_idx] = input[in_idx];
+}
+
+kernel void deinterleave_heads_bf16(
+    device const bfloat* input  [[buffer(0)]],
+    device bfloat*       output [[buffer(1)]],
+    constant uint& seq_len      [[buffer(2)]],
+    constant uint& head_dim     [[buffer(3)]],
+    constant uint& num_heads    [[buffer(4)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    uint d        = gid.x;
+    uint seq_pos  = gid.y;
+    uint head     = gid.z;
+    if (d >= head_dim || seq_pos >= seq_len || head >= num_heads) return;
+    uint in_idx  = seq_pos * (num_heads * head_dim) + head * head_dim + d;
+    uint out_idx = (head * seq_len + seq_pos) * head_dim + d;
+    output[out_idx] = input[in_idx];
+}
+
+// ---- Interleave heads (batch-major -> row-major) ----
+// Input: [num_heads, seq_len, head_dim] contiguous
+// Output: [seq_len, num_heads * head_dim] contiguous
+
+kernel void interleave_heads_f32(
+    device const float* input   [[buffer(0)]],
+    device float*       output  [[buffer(1)]],
+    constant uint& seq_len      [[buffer(2)]],
+    constant uint& head_dim     [[buffer(3)]],
+    constant uint& num_heads    [[buffer(4)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    uint d        = gid.x;
+    uint seq_pos  = gid.y;
+    uint head     = gid.z;
+    if (d >= head_dim || seq_pos >= seq_len || head >= num_heads) return;
+    uint in_idx  = (head * seq_len + seq_pos) * head_dim + d;
+    uint out_idx = seq_pos * (num_heads * head_dim) + head * head_dim + d;
+    output[out_idx] = input[in_idx];
+}
+
+kernel void interleave_heads_f16(
+    device const half* input    [[buffer(0)]],
+    device half*       output   [[buffer(1)]],
+    constant uint& seq_len      [[buffer(2)]],
+    constant uint& head_dim     [[buffer(3)]],
+    constant uint& num_heads    [[buffer(4)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    uint d        = gid.x;
+    uint seq_pos  = gid.y;
+    uint head     = gid.z;
+    if (d >= head_dim || seq_pos >= seq_len || head >= num_heads) return;
+    uint in_idx  = (head * seq_len + seq_pos) * head_dim + d;
+    uint out_idx = seq_pos * (num_heads * head_dim) + head * head_dim + d;
+    output[out_idx] = input[in_idx];
+}
+
+kernel void interleave_heads_bf16(
+    device const bfloat* input  [[buffer(0)]],
+    device bfloat*       output [[buffer(1)]],
+    constant uint& seq_len      [[buffer(2)]],
+    constant uint& head_dim     [[buffer(3)]],
+    constant uint& num_heads    [[buffer(4)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    uint d        = gid.x;
+    uint seq_pos  = gid.y;
+    uint head     = gid.z;
+    if (d >= head_dim || seq_pos >= seq_len || head >= num_heads) return;
+    uint in_idx  = (head * seq_len + seq_pos) * head_dim + d;
+    uint out_idx = seq_pos * (num_heads * head_dim) + head * head_dim + d;
+    output[out_idx] = input[in_idx];
+}
+
+// ---- On-the-fly frequency computation variant ----
+
 kernel void rope_otf_f32(
     device const float* input       [[buffer(0)]],
     device float*       output      [[buffer(1)]],
@@ -961,4 +1238,370 @@ pub fn rope_ext_preresolved_into_encoder(
 /// Get the table-based RoPE kernel name for a dtype.
 pub fn rope_table_kernel_name(dtype: DType) -> Result<&'static str, KernelError> {
     kernel_name_table(dtype)
+}
+
+// ---------------------------------------------------------------------------
+// Multi-head strided RoPE: fused deinterleave + RoPE in a single dispatch
+// ---------------------------------------------------------------------------
+
+fn kernel_name_multihead(dtype: DType) -> Result<&'static str, KernelError> {
+    match dtype {
+        DType::Float32 => Ok("rope_multihead_f32"),
+        DType::Float16 => Ok("rope_multihead_f16"),
+        DType::Bfloat16 => Ok("rope_multihead_bf16"),
+        _ => Err(KernelError::NotFound(format!(
+            "rope_multihead not supported for {:?}",
+            dtype
+        ))),
+    }
+}
+
+fn kernel_name_deinterleave(dtype: DType) -> Result<&'static str, KernelError> {
+    match dtype {
+        DType::Float32 => Ok("deinterleave_heads_f32"),
+        DType::Float16 => Ok("deinterleave_heads_f16"),
+        DType::Bfloat16 => Ok("deinterleave_heads_bf16"),
+        _ => Err(KernelError::NotFound(format!(
+            "deinterleave_heads not supported for {:?}",
+            dtype
+        ))),
+    }
+}
+
+fn kernel_name_interleave(dtype: DType) -> Result<&'static str, KernelError> {
+    match dtype {
+        DType::Float32 => Ok("interleave_heads_f32"),
+        DType::Float16 => Ok("interleave_heads_f16"),
+        DType::Bfloat16 => Ok("interleave_heads_bf16"),
+        _ => Err(KernelError::NotFound(format!(
+            "interleave_heads not supported for {:?}",
+            dtype
+        ))),
+    }
+}
+
+/// Fused deinterleave + RoPE for multi-head projections.
+///
+/// Input: `[seq_len, num_heads * head_dim]` (interleaved, contiguous)
+/// Output: `[num_heads, seq_len, head_dim]` (batch-major, contiguous)
+///
+/// Replaces `num_heads` separate copy + RoPE dispatches with a single dispatch.
+#[allow(clippy::too_many_arguments)]
+pub fn rope_multihead(
+    registry: &KernelRegistry,
+    input: &Array,
+    cos_freqs: &Array,
+    sin_freqs: &Array,
+    num_heads: usize,
+    offset: u32,
+    queue: &metal::CommandQueue,
+) -> Result<Array, KernelError> {
+    let seq_len = input.shape()[0];
+    let total_dim = input.shape()[1];
+    let head_dim = total_dim / num_heads;
+    if head_dim * num_heads != total_dim {
+        return Err(KernelError::InvalidShape(format!(
+            "rope_multihead: total_dim ({total_dim}) not divisible by num_heads ({num_heads})"
+        )));
+    }
+    if head_dim % 2 != 0 {
+        return Err(KernelError::InvalidShape(format!(
+            "rope_multihead: head_dim must be even, got {head_dim}"
+        )));
+    }
+
+    let half_dim = head_dim / 2;
+    let kname = kernel_name_multihead(input.dtype())?;
+    let pipeline = registry.get_pipeline(kname, input.dtype())?;
+
+    let out = Array::zeros(
+        registry.device().raw(),
+        &[num_heads * seq_len, head_dim],
+        input.dtype(),
+    );
+
+    let seq_u32 = super::checked_u32(seq_len, "seq_len")?;
+    let dim_u32 = super::checked_u32(head_dim, "head_dim")?;
+    let heads_u32 = super::checked_u32(num_heads, "num_heads")?;
+    let trad_u32: u32 = 1; // traditional pairing
+    let fwd_u32: u32 = 1;  // forward
+
+    let cb = queue.new_command_buffer();
+    let encoder = cb.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
+    encoder.set_buffer(1, Some(cos_freqs.metal_buffer()), cos_freqs.offset() as u64);
+    encoder.set_buffer(2, Some(sin_freqs.metal_buffer()), sin_freqs.offset() as u64);
+    encoder.set_buffer(3, Some(out.metal_buffer()), 0);
+    encoder.set_bytes(4, 4, &seq_u32 as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(5, 4, &dim_u32 as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(6, 4, &heads_u32 as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(7, 4, &offset as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(8, 4, &trad_u32 as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(9, 4, &fwd_u32 as *const u32 as *const std::ffi::c_void);
+
+    let max_tg = pipeline.max_total_threads_per_threadgroup();
+    let tg_x = std::cmp::min(64, half_dim as u64).min(max_tg);
+    let tg_y = std::cmp::min(16, seq_len as u64).min(max_tg / tg_x);
+    let tg = MTLSize::new(tg_x, tg_y, 1);
+    let groups = MTLSize::new(
+        (half_dim as u64 + tg_x - 1) / tg_x,
+        (seq_len as u64 + tg_y - 1) / tg_y,
+        num_heads as u64,
+    );
+    encoder.dispatch_thread_groups(groups, tg);
+    encoder.end_encoding();
+    super::commit_with_mode(cb, super::ExecMode::Sync);
+
+    Ok(out)
+}
+
+/// Fused deinterleave + RoPE into an existing command buffer (no commit/wait).
+#[allow(clippy::too_many_arguments)]
+pub fn rope_multihead_into_cb(
+    registry: &KernelRegistry,
+    input: &Array,
+    cos_freqs: &Array,
+    sin_freqs: &Array,
+    num_heads: usize,
+    offset: u32,
+    cb: &metal::CommandBufferRef,
+) -> Result<Array, KernelError> {
+    let seq_len = input.shape()[0];
+    let total_dim = input.shape()[1];
+    let head_dim = total_dim / num_heads;
+
+    let half_dim = head_dim / 2;
+    let kname = kernel_name_multihead(input.dtype())?;
+    let pipeline = registry.get_pipeline(kname, input.dtype())?;
+
+    let out = Array::uninit(
+        registry.device().raw(),
+        &[num_heads * seq_len, head_dim],
+        input.dtype(),
+    );
+
+    let seq_u32 = super::checked_u32(seq_len, "seq_len")?;
+    let dim_u32 = super::checked_u32(head_dim, "head_dim")?;
+    let heads_u32 = super::checked_u32(num_heads, "num_heads")?;
+    let trad_u32: u32 = 1;
+    let fwd_u32: u32 = 1;
+
+    let encoder = cb.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
+    encoder.set_buffer(1, Some(cos_freqs.metal_buffer()), cos_freqs.offset() as u64);
+    encoder.set_buffer(2, Some(sin_freqs.metal_buffer()), sin_freqs.offset() as u64);
+    encoder.set_buffer(3, Some(out.metal_buffer()), 0);
+    encoder.set_bytes(4, 4, &seq_u32 as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(5, 4, &dim_u32 as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(6, 4, &heads_u32 as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(7, 4, &offset as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(8, 4, &trad_u32 as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(9, 4, &fwd_u32 as *const u32 as *const std::ffi::c_void);
+
+    let max_tg = pipeline.max_total_threads_per_threadgroup();
+    let tg_x = std::cmp::min(64, half_dim as u64).min(max_tg);
+    let tg_y = std::cmp::min(16, seq_len as u64).min(max_tg / tg_x);
+    let tg = MTLSize::new(tg_x, tg_y, 1);
+    let groups = MTLSize::new(
+        (half_dim as u64 + tg_x - 1) / tg_x,
+        (seq_len as u64 + tg_y - 1) / tg_y,
+        num_heads as u64,
+    );
+    encoder.dispatch_thread_groups(groups, tg);
+    encoder.end_encoding();
+
+    Ok(out)
+}
+
+/// Deinterleave heads without RoPE (for V projections).
+///
+/// Input: `[seq_len, num_heads * head_dim]` (interleaved)
+/// Output: `[num_heads, seq_len, head_dim]` (batch-major, contiguous)
+pub fn deinterleave_heads(
+    registry: &KernelRegistry,
+    input: &Array,
+    num_heads: usize,
+    queue: &metal::CommandQueue,
+) -> Result<Array, KernelError> {
+    let seq_len = input.shape()[0];
+    let total_dim = input.shape()[1];
+    let head_dim = total_dim / num_heads;
+
+    let kname = kernel_name_deinterleave(input.dtype())?;
+    let pipeline = registry.get_pipeline(kname, input.dtype())?;
+
+    let out = Array::zeros(
+        registry.device().raw(),
+        &[num_heads * seq_len, head_dim],
+        input.dtype(),
+    );
+
+    let seq_u32 = super::checked_u32(seq_len, "seq_len")?;
+    let dim_u32 = super::checked_u32(head_dim, "head_dim")?;
+    let heads_u32 = super::checked_u32(num_heads, "num_heads")?;
+
+    let cb = queue.new_command_buffer();
+    let encoder = cb.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
+    encoder.set_buffer(1, Some(out.metal_buffer()), 0);
+    encoder.set_bytes(2, 4, &seq_u32 as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(3, 4, &dim_u32 as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(4, 4, &heads_u32 as *const u32 as *const std::ffi::c_void);
+
+    let max_tg = pipeline.max_total_threads_per_threadgroup();
+    let tg_x = std::cmp::min(64, head_dim as u64).min(max_tg);
+    let tg_y = std::cmp::min(4, seq_len as u64).min(max_tg / tg_x);
+    let tg = MTLSize::new(tg_x, tg_y, 1);
+    let groups = MTLSize::new(
+        (head_dim as u64 + tg_x - 1) / tg_x,
+        (seq_len as u64 + tg_y - 1) / tg_y,
+        num_heads as u64,
+    );
+    encoder.dispatch_thread_groups(groups, tg);
+    encoder.end_encoding();
+    super::commit_with_mode(cb, super::ExecMode::Sync);
+
+    Ok(out)
+}
+
+/// Deinterleave heads into an existing command buffer (no commit/wait).
+pub fn deinterleave_heads_into_cb(
+    registry: &KernelRegistry,
+    input: &Array,
+    num_heads: usize,
+    cb: &metal::CommandBufferRef,
+) -> Result<Array, KernelError> {
+    let seq_len = input.shape()[0];
+    let total_dim = input.shape()[1];
+    let head_dim = total_dim / num_heads;
+
+    let kname = kernel_name_deinterleave(input.dtype())?;
+    let pipeline = registry.get_pipeline(kname, input.dtype())?;
+
+    let out = Array::uninit(
+        registry.device().raw(),
+        &[num_heads * seq_len, head_dim],
+        input.dtype(),
+    );
+
+    let seq_u32 = super::checked_u32(seq_len, "seq_len")?;
+    let dim_u32 = super::checked_u32(head_dim, "head_dim")?;
+    let heads_u32 = super::checked_u32(num_heads, "num_heads")?;
+
+    let encoder = cb.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
+    encoder.set_buffer(1, Some(out.metal_buffer()), 0);
+    encoder.set_bytes(2, 4, &seq_u32 as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(3, 4, &dim_u32 as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(4, 4, &heads_u32 as *const u32 as *const std::ffi::c_void);
+
+    let max_tg = pipeline.max_total_threads_per_threadgroup();
+    let tg_x = std::cmp::min(64, head_dim as u64).min(max_tg);
+    let tg_y = std::cmp::min(4, seq_len as u64).min(max_tg / tg_x);
+    let tg = MTLSize::new(tg_x, tg_y, 1);
+    let groups = MTLSize::new(
+        (head_dim as u64 + tg_x - 1) / tg_x,
+        (seq_len as u64 + tg_y - 1) / tg_y,
+        num_heads as u64,
+    );
+    encoder.dispatch_thread_groups(groups, tg);
+    encoder.end_encoding();
+
+    Ok(out)
+}
+
+/// Interleave heads back into row-major layout.
+///
+/// Input: `[num_heads, seq_len, head_dim]` (batch-major, contiguous — flat [num_heads*seq_len, head_dim])
+/// Output: `[seq_len, num_heads * head_dim]` (row-major, contiguous)
+pub fn interleave_heads(
+    registry: &KernelRegistry,
+    input: &Array,
+    num_heads: usize,
+    seq_len: usize,
+    queue: &metal::CommandQueue,
+) -> Result<Array, KernelError> {
+    let head_dim = input.shape()[input.ndim() - 1];
+
+    let kname = kernel_name_interleave(input.dtype())?;
+    let pipeline = registry.get_pipeline(kname, input.dtype())?;
+
+    let dev = registry.device().raw();
+    let opts = metal::MTLResourceOptions::StorageModeShared;
+    let out = Array::zeros(dev, &[seq_len, num_heads * head_dim], input.dtype());
+
+    let seq_u32 = super::checked_u32(seq_len, "seq_len")?;
+    let dim_u32 = super::checked_u32(head_dim, "head_dim")?;
+    let heads_u32 = super::checked_u32(num_heads, "num_heads")?;
+    let seq_buf = dev.new_buffer_with_data(&seq_u32 as *const u32 as *const _, 4, opts);
+    let dim_buf = dev.new_buffer_with_data(&dim_u32 as *const u32 as *const _, 4, opts);
+    let heads_buf = dev.new_buffer_with_data(&heads_u32 as *const u32 as *const _, 4, opts);
+
+    let cb = queue.new_command_buffer();
+    let encoder = cb.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
+    encoder.set_buffer(1, Some(out.metal_buffer()), 0);
+    encoder.set_buffer(2, Some(&seq_buf), 0);
+    encoder.set_buffer(3, Some(&dim_buf), 0);
+    encoder.set_buffer(4, Some(&heads_buf), 0);
+
+    let grid = MTLSize::new(head_dim as u64, seq_len as u64, num_heads as u64);
+    let tg = MTLSize::new(
+        std::cmp::min(head_dim as u64, 64),
+        std::cmp::min(seq_len as u64, 4),
+        1,
+    );
+    encoder.dispatch_threads(grid, tg);
+    encoder.end_encoding();
+    super::commit_with_mode(cb, super::ExecMode::Sync);
+
+    Ok(out)
+}
+
+/// Interleave heads into an existing command buffer (no commit/wait).
+pub fn interleave_heads_into_cb(
+    registry: &KernelRegistry,
+    input: &Array,
+    num_heads: usize,
+    seq_len: usize,
+    cb: &metal::CommandBufferRef,
+) -> Result<Array, KernelError> {
+    let head_dim = input.shape()[input.ndim() - 1];
+
+    let kname = kernel_name_interleave(input.dtype())?;
+    let pipeline = registry.get_pipeline(kname, input.dtype())?;
+
+    let out = Array::uninit(
+        registry.device().raw(),
+        &[seq_len, num_heads * head_dim],
+        input.dtype(),
+    );
+
+    let seq_u32 = super::checked_u32(seq_len, "seq_len")?;
+    let dim_u32 = super::checked_u32(head_dim, "head_dim")?;
+    let heads_u32 = super::checked_u32(num_heads, "num_heads")?;
+
+    let encoder = cb.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
+    encoder.set_buffer(1, Some(out.metal_buffer()), 0);
+    encoder.set_bytes(2, 4, &seq_u32 as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(3, 4, &dim_u32 as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(4, 4, &heads_u32 as *const u32 as *const std::ffi::c_void);
+
+    let grid = MTLSize::new(head_dim as u64, seq_len as u64, num_heads as u64);
+    let tg = MTLSize::new(
+        std::cmp::min(head_dim as u64, 64),
+        std::cmp::min(seq_len as u64, 4),
+        1,
+    );
+    encoder.dispatch_threads(grid, tg);
+    encoder.end_encoding();
+
+    Ok(out)
 }

@@ -1,5 +1,10 @@
 //! FlashAttention-2 Metal kernel for efficient long-sequence attention.
 //!
+//! **DEPRECATED**: This module is superseded by `sdpa.rs` which supports f32/f16/bf16,
+//! variable head_dim (up to 256), GQA, additive masks, and optimized tile sizes.
+//! This module is retained for backward compatibility and its existing test suite.
+//! New code should use `sdpa::sdpa()` or `sdpa::sdpa_batched()` instead.
+//!
 //! Implements the FlashAttention-2 algorithm via a JIT-compiled Metal compute shader.
 //! Uses tiling with online softmax to achieve O(N) memory instead of O(N^2) for the
 //! attention score matrix.
@@ -33,7 +38,9 @@ const HEAD_DIM: usize = 128;
 const THREADS_PER_TG: u64 = 128;
 
 /// Minimum sequence length to prefer flash attention over naive SDPA.
-pub const FLASH_ATTN_SEQ_THRESHOLD: usize = 128;
+/// Lowered from 128 to 32: FA2 tiling wins over naive even at modest seq lengths.
+/// Below 32, naive SDPA is fine since the score matrix is tiny.
+pub const FLASH_ATTN_SEQ_THRESHOLD: usize = 32;
 
 // ---------------------------------------------------------------------------
 // Metal shader source — FlashAttention-2, f32, head_dim=128
@@ -758,9 +765,10 @@ mod tests {
     fn test_flash_attn_supports_check() {
         assert!(supports_flash_attention(128, DType::Float32, 256));
         assert!(supports_flash_attention(128, DType::Float32, 128));
+        assert!(supports_flash_attention(128, DType::Float32, 32));
         assert!(!supports_flash_attention(64, DType::Float32, 256));
         assert!(!supports_flash_attention(128, DType::Float16, 256));
-        assert!(!supports_flash_attention(128, DType::Float32, 64));
+        assert!(!supports_flash_attention(128, DType::Float32, 16));
     }
 
     #[test]
