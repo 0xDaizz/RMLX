@@ -1867,6 +1867,86 @@ fn main() {
     println!("=====================================================");
 
     // ========================================================================
+    // Cached Fused 7-Dispatch (60 layers)
+    // ========================================================================
+    println!("\n========== Cached Fused 7-Dispatch (60 layers) ==========");
+
+    // Warmup
+    println!(
+        "Warming up cached fused 7-dispatch x{} ({} iterations)...",
+        num_layers_60, WARMUP_ITERS
+    );
+    for _ in 0..WARMUP_ITERS {
+        for cache in caches_60.iter_mut() {
+            cache.seq_len = 0;
+        }
+        let cb = queue.new_command_buffer();
+        let mut x = rand_array(device, &[SEQ_LEN, HIDDEN_SIZE], 200);
+        for ((layer, cache), cached) in blocks_60
+            .iter()
+            .zip(caches_60.iter_mut())
+            .zip(cached_60.iter())
+        {
+            x = layer
+                .forward_cached_fused_7dispatch(&x, None, None, cache, cached, cb)
+                .expect("cached fused 7-dispatch warmup failed");
+        }
+        cb.commit();
+        cb.wait_until_completed();
+    }
+
+    // Bench
+    println!(
+        "Benchmarking cached fused 7-dispatch x{} ({} iterations)...",
+        num_layers_60, BENCH_ITERS
+    );
+    let mut cached_fused_60_latencies = Vec::with_capacity(BENCH_ITERS);
+    for _ in 0..BENCH_ITERS {
+        for cache in caches_60.iter_mut() {
+            cache.seq_len = 0;
+        }
+        let start = Instant::now();
+        let cb = queue.new_command_buffer();
+        let mut x = rand_array(device, &[SEQ_LEN, HIDDEN_SIZE], 200);
+        for ((layer, cache), cached) in blocks_60
+            .iter()
+            .zip(caches_60.iter_mut())
+            .zip(cached_60.iter())
+        {
+            x = layer
+                .forward_cached_fused_7dispatch(&x, None, None, cache, cached, cb)
+                .expect("cached fused 7-dispatch bench failed");
+        }
+        cb.commit();
+        cb.wait_until_completed();
+        cached_fused_60_latencies.push(start.elapsed());
+    }
+
+    let cached_fused_60_stats = Stats::from_durations(&cached_fused_60_latencies);
+    let cached_fused_60_speedup = if cached_fused_60_stats.mean > 0.0 {
+        serial_60_stats.mean / cached_fused_60_stats.mean
+    } else {
+        0.0
+    };
+    println!();
+    println!(
+        "  Cached Fused 7-dispatch ({} layers): {}  ({:.1} us/layer)",
+        num_layers_60,
+        cached_fused_60_stats,
+        cached_fused_60_stats.mean / num_layers_60 as f64
+    );
+    println!(
+        "  vs Cached 1-enc 9-dispatch:    {:.1} us/layer saving ({:.1}% faster)",
+        (cached_1enc_60_stats.mean - cached_fused_60_stats.mean) / num_layers_60 as f64,
+        if cached_1enc_60_stats.mean > 0.0 {
+            (1.0 - cached_fused_60_stats.mean / cached_1enc_60_stats.mean) * 100.0
+        } else {
+            0.0
+        }
+    );
+    println!("=====================================================");
+
+    // ========================================================================
     // ExecGraph Overhead Decomposition
     // ========================================================================
     // Isolate: CB creation, commit, event signal/wait, and pipeline bubble costs
@@ -2125,6 +2205,13 @@ fn main() {
         cached_1enc_60_stats.mean,
         cached_1enc_60_speedup,
         cached_1enc_60_stats.mean / num_layers_60 as f64
+    );
+    println!(
+        "  {:40} mean={:8.1}us  ({:.2}x vs serial x60, {:.1} us/layer)",
+        "Cached Fused 7-dispatch x60",
+        cached_fused_60_stats.mean,
+        cached_fused_60_speedup,
+        cached_fused_60_stats.mean / num_layers_60 as f64
     );
     println!("  -----------------");
 }
