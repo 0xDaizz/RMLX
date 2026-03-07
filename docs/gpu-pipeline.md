@@ -11,8 +11,8 @@ The rmlx GPU pipeline eliminates per-operation CPU overhead by batching multiple
 | Command buffers / layer | 65 | 5 | 92.3% reduction |
 | Command buffers / layer (Phase KO) | 65 | 1 (9 dispatches) | 98.5% reduction |
 | Latency / layer | ~112ms | ~6.4ms | 17.4x speedup |
-| Latency / layer (Phase KO) | ~109ms | ~1.4ms | 77x speedup |
-| Gap vs MLX | -- | 5.1% | near-parity |
+| Latency / layer (Phase KO) | ~109ms | ~1.7ms | 64x speedup |
+| Gap vs MLX (60L) | -- | 2.09x faster | RMLX leads |
 | CPU-GPU sync overhead | baseline | minimal | 98.5% reduction |
 | Numerical parity | -- | max_diff=6.4e-6 | exact match |
 
@@ -252,9 +252,10 @@ Memory barriers between encoders replace the heavyweight encoder boundary transi
 Baseline (per-op sync):  109,215us  1x
 ExecGraph (5 CB):          2,735us  40x
 Single-CB (44 enc):        2,049us  53x
-9-Dispatch (9->4 enc):     1,411us  77x
-MLX compiled:              1,342us  --
-Gap vs MLX:                5.1%
+9-Dispatch (9->4 enc):     1,739us  64x
+RMLX 60L pipeline:         1,204us/layer
+MLX compiled 60L:          2,513us/layer
+Result:                    2.09x faster
 ```
 
 ### Key Enablers

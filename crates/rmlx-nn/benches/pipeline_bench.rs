@@ -825,10 +825,7 @@ fn main() {
     );
 
     // ---- Warmup f16 9-dispatch ----
-    println!(
-        "Warming up f16 9-dispatch ({} iterations)...",
-        WARMUP_ITERS
-    );
+    println!("Warming up f16 9-dispatch ({} iterations)...", WARMUP_ITERS);
     for _ in 0..WARMUP_ITERS {
         cache_f16.seq_len = 0;
         let cb = queue.new_command_buffer();
@@ -1226,6 +1223,302 @@ fn main() {
     println!("  Multi-layer 2-encoder speedup:  {:.2}x", ml_2enc_speedup);
     println!("=====================================================");
 
+    // ========================================================================
+    // Multi-Layer Pipeline (30 layers)
+    // ========================================================================
+    println!("\n========== Multi-Layer Pipeline (30 layers) ==========");
+
+    let num_layers_30: usize = 30;
+
+    let mut blocks_30: Vec<TransformerBlock> = Vec::with_capacity(num_layers_30);
+    for _ in 0..num_layers_30 {
+        let mut blk = build_transformer_block(device);
+        blk.prepare_weights_9dispatch(device)
+            .expect("prepare_weights_9dispatch");
+        blk.prepare_weights_private(device, &queue);
+        blocks_30.push(blk);
+    }
+
+    let mut caches_30: Vec<LayerKvCache> = (0..num_layers_30)
+        .map(|_| {
+            LayerKvCache::preallocated(
+                device,
+                NUM_KV_HEADS,
+                HEAD_DIM,
+                2048,
+                rmlx_core::dtype::DType::Float32,
+            )
+        })
+        .collect();
+
+    // ---- Serial 9-dispatch x30 ----
+    println!(
+        "Warming up serial 9-dispatch x{} ({} iterations)...",
+        num_layers_30, WARMUP_ITERS
+    );
+    for _ in 0..WARMUP_ITERS {
+        for cache in caches_30.iter_mut() {
+            cache.seq_len = 0;
+        }
+        let cb = queue.new_command_buffer();
+        let mut x = Array::ones(device, &[SEQ_LEN, HIDDEN_SIZE]);
+        for (layer, cache) in blocks_30.iter().zip(caches_30.iter_mut()) {
+            x = layer
+                .forward_single_cb_9dispatch(&x, None, None, None, cache, &registry, cb)
+                .expect("serial warmup failed");
+        }
+        cb.commit();
+        cb.wait_until_completed();
+    }
+
+    println!(
+        "Benchmarking serial 9-dispatch x{} ({} iterations)...",
+        num_layers_30, BENCH_ITERS
+    );
+    let mut serial_30_latencies = Vec::with_capacity(BENCH_ITERS);
+    for _ in 0..BENCH_ITERS {
+        for cache in caches_30.iter_mut() {
+            cache.seq_len = 0;
+        }
+        let start = Instant::now();
+        let cb = queue.new_command_buffer();
+        let mut x = Array::ones(device, &[SEQ_LEN, HIDDEN_SIZE]);
+        for (layer, cache) in blocks_30.iter().zip(caches_30.iter_mut()) {
+            x = layer
+                .forward_single_cb_9dispatch(&x, None, None, None, cache, &registry, cb)
+                .expect("serial bench failed");
+        }
+        cb.commit();
+        cb.wait_until_completed();
+        serial_30_latencies.push(start.elapsed());
+    }
+
+    // ---- ExecGraph pipeline x30 ----
+    println!(
+        "\nWarming up ExecGraph pipeline x{} ({} iterations)...",
+        num_layers_30, WARMUP_ITERS
+    );
+    for _ in 0..WARMUP_ITERS {
+        for cache in caches_30.iter_mut() {
+            cache.seq_len = 0;
+        }
+        let event = GpuEvent::new(device);
+        let mut graph = ExecGraph::new(&queue, &event, 32);
+        let mut x = Array::ones(device, &[SEQ_LEN, HIDDEN_SIZE]);
+        let mut prev_token = None;
+        for (layer, cache) in blocks_30.iter().zip(caches_30.iter_mut()) {
+            if let Some(token) = prev_token {
+                graph.wait_for(token);
+            }
+            let cb = graph.command_buffer();
+            x = layer
+                .forward_single_cb_9dispatch(&x, None, None, None, cache, &registry, cb)
+                .expect("execgraph warmup failed");
+            prev_token = Some(graph.submit_batch());
+        }
+        graph.sync().expect("execgraph warmup sync failed");
+    }
+
+    println!(
+        "Benchmarking ExecGraph pipeline x{} ({} iterations)...",
+        num_layers_30, BENCH_ITERS
+    );
+    let mut execgraph_30_latencies = Vec::with_capacity(BENCH_ITERS);
+    for _ in 0..BENCH_ITERS {
+        for cache in caches_30.iter_mut() {
+            cache.seq_len = 0;
+        }
+        let event = GpuEvent::new(device);
+        let mut graph = ExecGraph::new(&queue, &event, 32);
+        let start = Instant::now();
+        let mut x = Array::ones(device, &[SEQ_LEN, HIDDEN_SIZE]);
+        let mut prev_token = None;
+        for (layer, cache) in blocks_30.iter().zip(caches_30.iter_mut()) {
+            if let Some(token) = prev_token {
+                graph.wait_for(token);
+            }
+            let cb = graph.command_buffer();
+            x = layer
+                .forward_single_cb_9dispatch(&x, None, None, None, cache, &registry, cb)
+                .expect("execgraph bench failed");
+            prev_token = Some(graph.submit_batch());
+        }
+        let _ = graph.sync().expect("execgraph sync failed");
+        execgraph_30_latencies.push(start.elapsed());
+    }
+
+    // ---- Results for 30 layers ----
+    let serial_30_stats = Stats::from_durations(&serial_30_latencies);
+    let execgraph_30_stats = Stats::from_durations(&execgraph_30_latencies);
+    let eg_30_speedup = if execgraph_30_stats.mean > 0.0 {
+        serial_30_stats.mean / execgraph_30_stats.mean
+    } else {
+        0.0
+    };
+    println!();
+    println!(
+        "  Serial 9-dispatch ({} layers):     {}  ({:.1} us/layer)",
+        num_layers_30,
+        serial_30_stats,
+        serial_30_stats.mean / num_layers_30 as f64
+    );
+    println!(
+        "  ExecGraph pipeline ({} layers):    {}  ({:.1} us/layer)",
+        num_layers_30,
+        execgraph_30_stats,
+        execgraph_30_stats.mean / num_layers_30 as f64
+    );
+    println!("  ExecGraph speedup vs serial:       {:.2}x", eg_30_speedup);
+    println!("=====================================================");
+
+    // ========================================================================
+    // Multi-Layer Pipeline (60 layers)
+    // ========================================================================
+    println!("\n========== Multi-Layer Pipeline (60 layers) ==========");
+
+    let num_layers_60: usize = 60;
+
+    let mut blocks_60: Vec<TransformerBlock> = Vec::with_capacity(num_layers_60);
+    for _ in 0..num_layers_60 {
+        let mut blk = build_transformer_block(device);
+        blk.prepare_weights_9dispatch(device)
+            .expect("prepare_weights_9dispatch");
+        blk.prepare_weights_private(device, &queue);
+        blocks_60.push(blk);
+    }
+
+    let mut caches_60: Vec<LayerKvCache> = (0..num_layers_60)
+        .map(|_| {
+            LayerKvCache::preallocated(
+                device,
+                NUM_KV_HEADS,
+                HEAD_DIM,
+                2048,
+                rmlx_core::dtype::DType::Float32,
+            )
+        })
+        .collect();
+
+    // ---- Serial 9-dispatch x60 ----
+    println!(
+        "Warming up serial 9-dispatch x{} ({} iterations)...",
+        num_layers_60, WARMUP_ITERS
+    );
+    for _ in 0..WARMUP_ITERS {
+        for cache in caches_60.iter_mut() {
+            cache.seq_len = 0;
+        }
+        let cb = queue.new_command_buffer();
+        let mut x = Array::ones(device, &[SEQ_LEN, HIDDEN_SIZE]);
+        for (layer, cache) in blocks_60.iter().zip(caches_60.iter_mut()) {
+            x = layer
+                .forward_single_cb_9dispatch(&x, None, None, None, cache, &registry, cb)
+                .expect("serial warmup failed");
+        }
+        cb.commit();
+        cb.wait_until_completed();
+    }
+
+    println!(
+        "Benchmarking serial 9-dispatch x{} ({} iterations)...",
+        num_layers_60, BENCH_ITERS
+    );
+    let mut serial_60_latencies = Vec::with_capacity(BENCH_ITERS);
+    for _ in 0..BENCH_ITERS {
+        for cache in caches_60.iter_mut() {
+            cache.seq_len = 0;
+        }
+        let start = Instant::now();
+        let cb = queue.new_command_buffer();
+        let mut x = Array::ones(device, &[SEQ_LEN, HIDDEN_SIZE]);
+        for (layer, cache) in blocks_60.iter().zip(caches_60.iter_mut()) {
+            x = layer
+                .forward_single_cb_9dispatch(&x, None, None, None, cache, &registry, cb)
+                .expect("serial bench failed");
+        }
+        cb.commit();
+        cb.wait_until_completed();
+        serial_60_latencies.push(start.elapsed());
+    }
+
+    // ---- ExecGraph pipeline x60 ----
+    println!(
+        "\nWarming up ExecGraph pipeline x{} ({} iterations)...",
+        num_layers_60, WARMUP_ITERS
+    );
+    for _ in 0..WARMUP_ITERS {
+        for cache in caches_60.iter_mut() {
+            cache.seq_len = 0;
+        }
+        let event = GpuEvent::new(device);
+        let mut graph = ExecGraph::new(&queue, &event, 32);
+        let mut x = Array::ones(device, &[SEQ_LEN, HIDDEN_SIZE]);
+        let mut prev_token = None;
+        for (layer, cache) in blocks_60.iter().zip(caches_60.iter_mut()) {
+            if let Some(token) = prev_token {
+                graph.wait_for(token);
+            }
+            let cb = graph.command_buffer();
+            x = layer
+                .forward_single_cb_9dispatch(&x, None, None, None, cache, &registry, cb)
+                .expect("execgraph warmup failed");
+            prev_token = Some(graph.submit_batch());
+        }
+        graph.sync().expect("execgraph warmup sync failed");
+    }
+
+    println!(
+        "Benchmarking ExecGraph pipeline x{} ({} iterations)...",
+        num_layers_60, BENCH_ITERS
+    );
+    let mut execgraph_60_latencies = Vec::with_capacity(BENCH_ITERS);
+    for _ in 0..BENCH_ITERS {
+        for cache in caches_60.iter_mut() {
+            cache.seq_len = 0;
+        }
+        let event = GpuEvent::new(device);
+        let mut graph = ExecGraph::new(&queue, &event, 32);
+        let start = Instant::now();
+        let mut x = Array::ones(device, &[SEQ_LEN, HIDDEN_SIZE]);
+        let mut prev_token = None;
+        for (layer, cache) in blocks_60.iter().zip(caches_60.iter_mut()) {
+            if let Some(token) = prev_token {
+                graph.wait_for(token);
+            }
+            let cb = graph.command_buffer();
+            x = layer
+                .forward_single_cb_9dispatch(&x, None, None, None, cache, &registry, cb)
+                .expect("execgraph bench failed");
+            prev_token = Some(graph.submit_batch());
+        }
+        let _ = graph.sync().expect("execgraph sync failed");
+        execgraph_60_latencies.push(start.elapsed());
+    }
+
+    // ---- Results for 60 layers ----
+    let serial_60_stats = Stats::from_durations(&serial_60_latencies);
+    let execgraph_60_stats = Stats::from_durations(&execgraph_60_latencies);
+    let eg_60_speedup = if execgraph_60_stats.mean > 0.0 {
+        serial_60_stats.mean / execgraph_60_stats.mean
+    } else {
+        0.0
+    };
+    println!();
+    println!(
+        "  Serial 9-dispatch ({} layers):     {}  ({:.1} us/layer)",
+        num_layers_60,
+        serial_60_stats,
+        serial_60_stats.mean / num_layers_60 as f64
+    );
+    println!(
+        "  ExecGraph pipeline ({} layers):    {}  ({:.1} us/layer)",
+        num_layers_60,
+        execgraph_60_stats,
+        execgraph_60_stats.mean / num_layers_60 as f64
+    );
+    println!("  ExecGraph speedup vs serial:       {:.2}x", eg_60_speedup);
+    println!("=====================================================");
+
     // ---- Summary comparison ----
     let two_enc_speedup = if two_enc_stats.mean > 0.0 {
         baseline_stats.mean / two_enc_stats.mean
@@ -1272,6 +1565,32 @@ fn main() {
     println!(
         "  {:40} mean={:8.1}us  ({:.2}x vs serial x4)",
         "2-Encoder x4", stats_2enc_4l.mean, ml_2enc_speedup
+    );
+    println!(
+        "  {:40} mean={:8.1}us  ({:.1} us/layer)",
+        "Serial x30",
+        serial_30_stats.mean,
+        serial_30_stats.mean / num_layers_30 as f64
+    );
+    println!(
+        "  {:40} mean={:8.1}us  ({:.2}x vs serial x30, {:.1} us/layer)",
+        "ExecGraph x30",
+        execgraph_30_stats.mean,
+        eg_30_speedup,
+        execgraph_30_stats.mean / num_layers_30 as f64
+    );
+    println!(
+        "  {:40} mean={:8.1}us  ({:.1} us/layer)",
+        "Serial x60",
+        serial_60_stats.mean,
+        serial_60_stats.mean / num_layers_60 as f64
+    );
+    println!(
+        "  {:40} mean={:8.1}us  ({:.2}x vs serial x60, {:.1} us/layer)",
+        "ExecGraph x60",
+        execgraph_60_stats.mean,
+        eg_60_speedup,
+        execgraph_60_stats.mean / num_layers_60 as f64
     );
     println!("  -----------------");
 }
