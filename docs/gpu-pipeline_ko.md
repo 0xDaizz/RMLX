@@ -13,6 +13,7 @@ rmlx GPU 파이프라인은 여러 Metal GPU 연산을 최소한의 command buff
 | 레이어당 레이턴시 | ~112ms | ~6.4ms | 17.4x 속도 향상 |
 | 레이어당 레이턴시 (Phase KO) | ~109ms | ~1.7ms | 64x 속도 향상 |
 | MLX 대비 격차 | -- | 2.09x 빠름 | MLX 대비 우위 |
+| Cached 2-인코더 디코드 (60L) | -- | 1,367 us/L | 8% 빠름, 6x 낮은 σ |
 | CPU-GPU 동기화 오버헤드 | baseline | 최소 | 98.5% 감소 |
 | 수치 정합성 | -- | max_diff=6.4e-6 | 일치 |
 
@@ -255,6 +256,7 @@ Single-CB (44 enc):        2,049us  53x
 9-Dispatch (9->4 enc):     1,739us  64x
 MLX compiled:              2,513 us/L (60L)  --
 Gap vs MLX:                2.09x 빠름 (60L)
+Cached 2-enc (60L):       1,367us/layer  8% 빠름, 6x 낮은 σ
 ```
 
 ### 핵심 구현 요소
@@ -265,3 +267,36 @@ Gap vs MLX:                2.09x 빠름 (60L)
 - **Array::uninit**: 출력 버퍼를 zeroing 없이 할당하여 커널이 전체를 덮어쓰도록 구성
 - **Unretained CB**: Metal 3+ (M2+)에서 commit 후 command buffer retain을 생략
 - **_into_encoder 패턴**: encoder 경계 대신 메모리 배리어를 사용하며 ops가 공유 compute encoder에 인코딩
+
+### Phase 8c: CachedDecode 최적화
+
+Phase 8c는 9-디스패치 경로에 CPU 측 오버헤드 제거를 추가합니다:
+
+**CachedDecode 구조체**는 모델 초기화 시 모든 레이어별 상태를 사전 해석합니다:
+- 10개 사전 해석된 Pipeline State Object (PSO) — 토큰당 `registry.get_pipeline()` 호출 제로
+- 9개 사전 할당된 스크래치 버퍼 (매 토큰 재사용) — 토큰당 `Array::uninit` 제로
+- 사전 계산된 디스패치 기하 (그리드 크기, threadgroup 크기)
+- 비연속 가중치를 올바르게 처리하기 위한 캐시된 norm 가중치 스트라이드
+
+**2-인코더 디코드 경로**는 인코더 전환을 5회에서 2회로 줄입니다:
+- 인코더 A: RMS norm + QKV GEMV + RoPE + KV 캐시 추가 (메모리 배리어 포함)
+- 인코더 B: SDPA + O_proj + 잔차 + RMS norm + gate_up GEMV + SiLU*mul + down GEMV + 잔차
+
+**`_preresolved_into_encoder` 패턴**은 검증과 PSO 조회를 건너뜁니다:
+- `gemv_preresolved_into_encoder()` — 직접 PSO + 버퍼 바인드 + 디스패치
+- `rms_norm_preresolved_into_encoder()` — 직접 PSO + 버퍼 바인드 + 디스패치
+- `rope_ext_preresolved_into_encoder()` — 직접 PSO + 버퍼 바인드 + 디스패치
+- `sdpa_decode_preresolved_into_encoder()` — 직접 PSO + 버퍼 바인드 + 디스패치
+- `fused_silu_mul_preresolved_into_encoder()` — 직접 PSO + 버퍼 바인드 + 디스패치
+
+**GEMV BM8 개선:**
+- 모든 BM8 커널에서 6개의 불필요한 `threadgroup_barrier(mem_flags::mem_none)` 제거
+- f32 BM8 로드를 2×float4 (32B/스레드)에서 4×float4 (64B/스레드)로 확대
+
+**벤치마크 결과 (M3 Ultra, f32, 60레이어 파이프라인):**
+
+| 경로 | 레이턴시 (us/L) | std_dev (us) |
+|------|----------------:|-------------:|
+| 직렬 9-디스패치 | 1,482 | 507 |
+| Cached 2-인코더 | 1,367 | 84 |
+| **개선** | **8% 빠름** | **6x 낮음** |

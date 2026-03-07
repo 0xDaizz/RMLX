@@ -13,6 +13,7 @@ The rmlx GPU pipeline eliminates per-operation CPU overhead by batching multiple
 | Latency / layer | ~112ms | ~6.4ms | 17.4x speedup |
 | Latency / layer (Phase KO) | ~109ms | ~1.7ms | 64x speedup |
 | Gap vs MLX (60L) | -- | 2.09x faster | RMLX leads |
+| Cached 2-encoder decode (60L) | -- | 1,367 us/L | 8% faster, 6x lower σ |
 | CPU-GPU sync overhead | baseline | minimal | 98.5% reduction |
 | Numerical parity | -- | max_diff=6.4e-6 | exact match |
 
@@ -256,6 +257,7 @@ Single-CB (44 enc):        2,049us  53x
 RMLX 60L pipeline:         1,204us/layer
 MLX compiled 60L:          2,513us/layer
 Result:                    2.09x faster
+Cached 2-enc (60L):       1,367us/layer  8% faster, 6x lower σ
 ```
 
 ### Key Enablers
@@ -266,3 +268,36 @@ Result:                    2.09x faster
 - **Array::uninit**: Output buffers allocated without zeroing (kernel will overwrite completely)
 - **Unretained CB**: On Metal 3+ (M2+), command buffers are not retained after commit
 - **_into_encoder pattern**: Ops encode into a shared compute encoder with memory barriers instead of encoder boundaries
+
+### Phase 8c: CachedDecode Optimizations
+
+Phase 8c extends the 9-dispatch path with CPU-side overhead elimination:
+
+**CachedDecode struct** pre-resolves all per-layer state at model init time:
+- 10 pre-resolved Pipeline State Objects (PSOs) — zero `registry.get_pipeline()` calls per token
+- 9 pre-allocated scratch buffers (reused every token) — zero `Array::uninit` per token
+- Pre-computed dispatch geometries (grid sizes, threadgroup sizes)
+- Cached norm weight strides for correct non-contiguous weight handling
+
+**2-encoder decode path** reduces encoder transitions from 5 to 2:
+- Encoder A: RMS norm + QKV GEMV + RoPE + KV cache append (with memory barrier)
+- Encoder B: SDPA + O_proj + residual + RMS norm + gate_up GEMV + SiLU*mul + down GEMV + residual
+
+**`_preresolved_into_encoder` pattern** skips validation and PSO lookup:
+- `gemv_preresolved_into_encoder()` — direct PSO + buffer bind + dispatch
+- `rms_norm_preresolved_into_encoder()` — direct PSO + buffer bind + dispatch
+- `rope_ext_preresolved_into_encoder()` — direct PSO + buffer bind + dispatch
+- `sdpa_decode_preresolved_into_encoder()` — direct PSO + buffer bind + dispatch
+- `fused_silu_mul_preresolved_into_encoder()` — direct PSO + buffer bind + dispatch
+
+**GEMV BM8 improvements:**
+- Removed 6 spurious `threadgroup_barrier(mem_flags::mem_none)` from all BM8 kernels
+- Widened f32 BM8 loads from 2×float4 (32B/thread) to 4×float4 (64B/thread)
+
+**Benchmark results (M3 Ultra, f32, 60-layer pipeline):**
+
+| Path | Latency (us/L) | std_dev (us) |
+|------|---------------:|-------------:|
+| Serial 9-dispatch | 1,482 | 507 |
+| Cached 2-encoder | 1,367 | 84 |
+| **Improvement** | **8% faster** | **6x lower** |
