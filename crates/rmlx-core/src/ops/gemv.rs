@@ -392,33 +392,31 @@ kernel void gemv_bm8_f16(
 
     float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-    // Double-buffered: process 2×half4 per iteration for latency hiding
-    uint k8 = as_uniform(K / 8);
-    for (uint i = simd_lane_id; i < k8; i += SIMD_SIZE) {
+    // Quad-buffered f16: process 4×half4 (32 bytes) per iteration — matches f32 bandwidth
+    uint k16 = as_uniform(K / 16);
+    for (uint i = simd_lane_id; i < k16; i += SIMD_SIZE) {
         threadgroup_barrier(mem_flags::mem_none);  // sync threads for cache coherence
-        uint idx = i * 8;
-        half4 v4ha = *reinterpret_cast<device const half4*>(vec + idx);
-        half4 v4hb = *reinterpret_cast<device const half4*>(vec + idx + 4);
-        float4 v4a = float4(v4ha);
-        float4 v4b = float4(v4hb);
+        uint idx = i * 16;
+        float4 v4a = float4(*reinterpret_cast<device const half4*>(vec + idx));
+        float4 v4b = float4(*reinterpret_cast<device const half4*>(vec + idx + 4));
+        float4 v4c = float4(*reinterpret_cast<device const half4*>(vec + idx + 8));
+        float4 v4d = float4(*reinterpret_cast<device const half4*>(vec + idx + 12));
         #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
             device const half* row = mat + (row_base + r) * K + idx;
-            half4 m4ha = *reinterpret_cast<device const half4*>(row);
-            half4 m4hb = *reinterpret_cast<device const half4*>(row + 4);
-            float4 m4a = float4(m4ha);
-            float4 m4b = float4(m4hb);
-            acc[r] += dot(m4a, v4a) + dot(m4b, v4b);
+            float4 m4a = float4(*reinterpret_cast<device const half4*>(row));
+            float4 m4b = float4(*reinterpret_cast<device const half4*>(row + 4));
+            float4 m4c = float4(*reinterpret_cast<device const half4*>(row + 8));
+            float4 m4d = float4(*reinterpret_cast<device const half4*>(row + 12));
+            acc[r] += dot(m4a, v4a) + dot(m4b, v4b) + dot(m4c, v4c) + dot(m4d, v4d);
         }
     }
-    // Handle remainder (K%8 > 0)
-    for (uint i = k8 * 8 + simd_lane_id * 4; i + 3 < K; i += SIMD_SIZE * 4) {
-        half4 v4h = *reinterpret_cast<device const half4*>(vec + i);
-        float4 v4 = float4(v4h);
+    // Handle remainder (K%16 > 0) in groups of 4
+    for (uint i = k16 * 16 + simd_lane_id * 4; i + 3 < K; i += SIMD_SIZE * 4) {
+        float4 v4 = float4(*reinterpret_cast<device const half4*>(vec + i));
         #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
-            half4 m4h = *reinterpret_cast<device const half4*>(mat + (row_base + r) * K + i);
-            float4 m4 = float4(m4h);
+            float4 m4 = float4(*reinterpret_cast<device const half4*>(mat + (row_base + r) * K + i));
             acc[r] += dot(m4, v4);
         }
     }
@@ -754,33 +752,31 @@ kernel void gemv_bias_bm8_f16(
 
     float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-    // Double-buffered: process 2×half4 per iteration for latency hiding
-    uint k8 = as_uniform(K / 8);
-    for (uint i = simd_lane_id; i < k8; i += SIMD_SIZE) {
+    // Quad-buffered f16: process 4×half4 (32 bytes) per iteration — matches f32 bandwidth
+    uint k16 = as_uniform(K / 16);
+    for (uint i = simd_lane_id; i < k16; i += SIMD_SIZE) {
         threadgroup_barrier(mem_flags::mem_none);  // sync threads for cache coherence
-        uint idx = i * 8;
-        half4 v4ha = *reinterpret_cast<device const half4*>(vec + idx);
-        half4 v4hb = *reinterpret_cast<device const half4*>(vec + idx + 4);
-        float4 v4a = float4(v4ha);
-        float4 v4b = float4(v4hb);
+        uint idx = i * 16;
+        float4 v4a = float4(*reinterpret_cast<device const half4*>(vec + idx));
+        float4 v4b = float4(*reinterpret_cast<device const half4*>(vec + idx + 4));
+        float4 v4c = float4(*reinterpret_cast<device const half4*>(vec + idx + 8));
+        float4 v4d = float4(*reinterpret_cast<device const half4*>(vec + idx + 12));
         #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
             device const half* row = mat + (row_base + r) * K + idx;
-            half4 m4ha = *reinterpret_cast<device const half4*>(row);
-            half4 m4hb = *reinterpret_cast<device const half4*>(row + 4);
-            float4 m4a = float4(m4ha);
-            float4 m4b = float4(m4hb);
-            acc[r] += dot(m4a, v4a) + dot(m4b, v4b);
+            float4 m4a = float4(*reinterpret_cast<device const half4*>(row));
+            float4 m4b = float4(*reinterpret_cast<device const half4*>(row + 4));
+            float4 m4c = float4(*reinterpret_cast<device const half4*>(row + 8));
+            float4 m4d = float4(*reinterpret_cast<device const half4*>(row + 12));
+            acc[r] += dot(m4a, v4a) + dot(m4b, v4b) + dot(m4c, v4c) + dot(m4d, v4d);
         }
     }
-    // Handle remainder (K%8 > 0)
-    for (uint i = k8 * 8 + simd_lane_id * 4; i + 3 < K; i += SIMD_SIZE * 4) {
-        half4 v4h = *reinterpret_cast<device const half4*>(vec + i);
-        float4 v4 = float4(v4h);
+    // Handle remainder (K%16 > 0) in groups of 4
+    for (uint i = k16 * 16 + simd_lane_id * 4; i + 3 < K; i += SIMD_SIZE * 4) {
+        float4 v4 = float4(*reinterpret_cast<device const half4*>(vec + i));
         #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
-            half4 m4h = *reinterpret_cast<device const half4*>(mat + (row_base + r) * K + i);
-            float4 m4 = float4(m4h);
+            float4 m4 = float4(*reinterpret_cast<device const half4*>(mat + (row_base + r) * K + i));
             acc[r] += dot(m4, v4);
         }
     }
