@@ -319,6 +319,8 @@ where
 // ---------------------------------------------------------------------------
 
 fn main() {
+    use rmlx_core::dtype::DType;
+
     let gpu = GpuDevice::system_default().expect("Metal GPU device required");
     println!(
         "Device: {} (unified_memory={})",
@@ -761,6 +763,134 @@ fn main() {
     });
     all_stats.push(("9. gemv_bias down+res", s));
 
+    // =================================================================
+    // Fused kernel microbenchmarks
+    // =================================================================
+    println!();
+    println!("---------- Fused Kernel Microbenchmarks ----------");
+
+    let mut fused_stats: Vec<(&str, Stats)> = Vec::new();
+
+    // 8+9 Fused: fused_swiglu_down [4096, 14336] gate_up=[28672] + bias=[4096]
+    {
+        let fused_m = HIDDEN_SIZE as u32;
+        let fused_k = INTERMEDIATE_DIM as u32;
+        let kernel_name =
+            ops::fused::fused_swiglu_down_kernel_name(DType::Float16, fused_m).unwrap();
+        let fused_pso = registry
+            .get_pipeline(kernel_name, DType::Float16)
+            .expect("fused_swiglu_down PSO");
+        let (grid, tg) = ops::fused::fused_swiglu_down_dispatch_sizes(fused_m, &fused_pso);
+
+        // Buffers: gate_up [2*INTERMEDIATE_DIM], down_weight [HIDDEN*INTERMEDIATE], bias [HIDDEN], output [HIDDEN]
+        let fsd_gate_up = rand_array(device, &[2 * INTERMEDIATE_DIM], 200);
+        let fsd_down_w = rand_array(device, &[HIDDEN_SIZE, INTERMEDIATE_DIM], 201);
+        let fsd_bias = rand_array(device, &[HIDDEN_SIZE], 202);
+        let fsd_output = rand_array(device, &[HIDDEN_SIZE], 203);
+
+        let s = profile_op("F1. fused_swiglu_down [4096,14336]", &queue, |cb| {
+            let enc = cb.new_compute_command_encoder();
+            ops::fused::fused_swiglu_down_preresolved_into_encoder(
+                &fused_pso,
+                fsd_down_w.metal_buffer(),
+                fsd_down_w.offset() as u64,
+                fsd_gate_up.metal_buffer(),
+                fsd_gate_up.offset() as u64,
+                fsd_output.metal_buffer(),
+                fsd_output.offset() as u64,
+                fused_m,
+                fused_k,
+                fsd_bias.metal_buffer(),
+                fsd_bias.offset() as u64,
+                grid,
+                tg,
+                enc,
+            );
+            enc.end_encoding();
+        });
+        fused_stats.push(("F1. fused_swiglu_down", s));
+    }
+
+    // 1+2 Fused: fused_rms_gemv QKV [6144, 4096] input=[4096] norm_w=[4096]
+    {
+        let qkv_m = (HIDDEN_SIZE + NUM_KV_HEADS * HEAD_DIM * 2) as u32; // 6144
+        let qkv_k = HIDDEN_SIZE as u32;
+        let kernel_name = ops::fused::fused_rms_gemv_kernel_name(DType::Float16, qkv_m).unwrap();
+        let fused_pso = registry
+            .get_pipeline(kernel_name, DType::Float16)
+            .expect("fused_rms_gemv QKV PSO");
+        let (grid, tg) = ops::fused::fused_rms_gemv_dispatch_sizes(qkv_m, &fused_pso);
+
+        let frg_input = rand_array(device, &[HIDDEN_SIZE], 210);
+        let frg_norm_w = rand_array(device, &[HIDDEN_SIZE], 211);
+        let frg_qkv_w = rand_array(device, &[qkv_m as usize, HIDDEN_SIZE], 212);
+        let frg_output = rand_array(device, &[qkv_m as usize], 213);
+
+        let s = profile_op("F2. fused_rms_gemv QKV [6144,4096]", &queue, |cb| {
+            let enc = cb.new_compute_command_encoder();
+            ops::fused::fused_rms_gemv_preresolved_into_encoder(
+                &fused_pso,
+                frg_input.metal_buffer(),
+                frg_input.offset() as u64,
+                frg_norm_w.metal_buffer(),
+                frg_norm_w.offset() as u64,
+                frg_qkv_w.metal_buffer(),
+                frg_qkv_w.offset() as u64,
+                frg_output.metal_buffer(),
+                frg_output.offset() as u64,
+                qkv_m,
+                qkv_k,
+                RMS_NORM_EPS,
+                1u32, // w_stride
+                grid,
+                tg,
+                enc,
+            );
+            enc.end_encoding();
+        });
+        fused_stats.push(("F2. fused_rms_gemv QKV", s));
+    }
+
+    // 6+7 Fused: fused_rms_gemv gate_up [28672, 4096] input=[4096] norm_w=[4096]
+    {
+        let gu_m = (2 * INTERMEDIATE_DIM) as u32; // 28672
+        let gu_k = HIDDEN_SIZE as u32;
+        let kernel_name = ops::fused::fused_rms_gemv_kernel_name(DType::Float16, gu_m).unwrap();
+        let fused_pso = registry
+            .get_pipeline(kernel_name, DType::Float16)
+            .expect("fused_rms_gemv gate_up PSO");
+        let (grid, tg) = ops::fused::fused_rms_gemv_dispatch_sizes(gu_m, &fused_pso);
+
+        let frg2_input = rand_array(device, &[HIDDEN_SIZE], 220);
+        let frg2_norm_w = rand_array(device, &[HIDDEN_SIZE], 221);
+        let frg2_gu_w = rand_array(device, &[gu_m as usize, HIDDEN_SIZE], 222);
+        let frg2_output = rand_array(device, &[gu_m as usize], 223);
+
+        let s = profile_op("F3. fused_rms_gemv gate_up [28672,4096]", &queue, |cb| {
+            let enc = cb.new_compute_command_encoder();
+            ops::fused::fused_rms_gemv_preresolved_into_encoder(
+                &fused_pso,
+                frg2_input.metal_buffer(),
+                frg2_input.offset() as u64,
+                frg2_norm_w.metal_buffer(),
+                frg2_norm_w.offset() as u64,
+                frg2_gu_w.metal_buffer(),
+                frg2_gu_w.offset() as u64,
+                frg2_output.metal_buffer(),
+                frg2_output.offset() as u64,
+                gu_m,
+                gu_k,
+                RMS_NORM_EPS,
+                1u32, // w_stride
+                grid,
+                tg,
+                enc,
+            );
+            enc.end_encoding();
+        });
+        fused_stats.push(("F3. fused_rms_gemv gate_up", s));
+    }
+
     // --- Summary ---
     println!();
     println!("---------- Per-Dispatch Summary ----------");
@@ -808,6 +938,124 @@ fn main() {
             0.0
         }
     );
+    println!("==========================================");
+
+    // --- Fused Kernel Summary ---
+    println!();
+    println!("---------- Fused Kernel Summary ----------");
+    for (label, s) in &fused_stats {
+        println!("  {:35} {:8.1}us", label, s.mean);
+    }
+
+    // Compare fused vs unfused equivalents
+    // F1 (fused_swiglu_down) replaces dispatches 8 (fused_silu_mul) + 9 (gemv_bias down)
+    if let (Some((_, s8)), Some((_, s9)), Some((_, f1))) = (
+        all_stats.iter().find(|(l, _)| *l == "8. fused_silu_mul"),
+        all_stats
+            .iter()
+            .find(|(l, _)| *l == "9. gemv_bias down+res"),
+        fused_stats
+            .iter()
+            .find(|(l, _)| *l == "F1. fused_swiglu_down"),
+    ) {
+        let unfused = s8.mean + s9.mean;
+        let saved = unfused - f1.mean;
+        println!(
+            "  F1 vs (8+9): fused={:.1}us, unfused={:.1}us, saved={:.1}us ({:.1}%)",
+            f1.mean,
+            unfused,
+            saved,
+            if unfused > 0.0 {
+                saved / unfused * 100.0
+            } else {
+                0.0
+            }
+        );
+    }
+
+    // F2 (fused_rms_gemv QKV) replaces dispatches 1 (rms_norm) + 2 (gemv QKV)
+    if let (Some((_, s1)), Some((_, s2)), Some((_, f2))) = (
+        all_stats
+            .iter()
+            .find(|(l, _)| *l == "1. rms_norm (pre-attn)"),
+        all_stats.iter().find(|(l, _)| *l == "2. gemv QKV"),
+        fused_stats
+            .iter()
+            .find(|(l, _)| *l == "F2. fused_rms_gemv QKV"),
+    ) {
+        let unfused = s1.mean + s2.mean;
+        let saved = unfused - f2.mean;
+        println!(
+            "  F2 vs (1+2): fused={:.1}us, unfused={:.1}us, saved={:.1}us ({:.1}%)",
+            f2.mean,
+            unfused,
+            saved,
+            if unfused > 0.0 {
+                saved / unfused * 100.0
+            } else {
+                0.0
+            }
+        );
+    }
+
+    // F3 (fused_rms_gemv gate_up) replaces dispatches 6 (rms_norm) + 7 (gemv gate+up)
+    if let (Some((_, s6)), Some((_, s7)), Some((_, f3))) = (
+        all_stats
+            .iter()
+            .find(|(l, _)| *l == "6. rms_norm (pre-FFN)"),
+        all_stats.iter().find(|(l, _)| *l == "7. gemv gate+up"),
+        fused_stats
+            .iter()
+            .find(|(l, _)| *l == "F3. fused_rms_gemv gate_up"),
+    ) {
+        let unfused = s6.mean + s7.mean;
+        let saved = unfused - f3.mean;
+        println!(
+            "  F3 vs (6+7): fused={:.1}us, unfused={:.1}us, saved={:.1}us ({:.1}%)",
+            f3.mean,
+            unfused,
+            saved,
+            if unfused > 0.0 {
+                saved / unfused * 100.0
+            } else {
+                0.0
+            }
+        );
+    }
+
+    // Total fused pipeline estimate (replacing 9 dispatches with 6)
+    // Fused pipeline: F2 (1+2), 3 (rope), 4 (sdpa), 5 (gemv_bias O_proj), F3 (6+7), F1 (8+9)
+    if let (Some((_, f1)), Some((_, f2)), Some((_, f3))) = (
+        fused_stats
+            .iter()
+            .find(|(l, _)| *l == "F1. fused_swiglu_down"),
+        fused_stats
+            .iter()
+            .find(|(l, _)| *l == "F2. fused_rms_gemv QKV"),
+        fused_stats
+            .iter()
+            .find(|(l, _)| *l == "F3. fused_rms_gemv gate_up"),
+    ) {
+        let kept: f64 = all_stats
+            .iter()
+            .filter(|(l, _)| {
+                *l == "3. rope_ext" || *l == "4. sdpa_decode" || *l == "5. gemv_bias O_proj+res"
+            })
+            .map(|(_, s)| s.mean)
+            .sum();
+        let fused_total = f2.mean + kept + f3.mean + f1.mean;
+        println!();
+        println!(
+            "  Estimated 6-dispatch fused pipeline: {:8.1}us (vs {:.1}us unfused, {:.1}% saving)",
+            fused_total,
+            total_mean,
+            if total_mean > 0.0 {
+                (total_mean - fused_total) / total_mean * 100.0
+            } else {
+                0.0
+            }
+        );
+    }
     println!("==========================================");
 
     // ========================================================================

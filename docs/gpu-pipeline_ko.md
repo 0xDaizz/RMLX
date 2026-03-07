@@ -300,3 +300,34 @@ Phase 8c는 9-디스패치 경로에 CPU 측 오버헤드 제거를 추가합니
 | 직렬 9-디스패치 | ~751 | 507 |
 | Cached 2-인코더 | 714 | 84 |
 | **개선** | **8% 빠름** | **6x 낮음** |
+
+## Phase 10: 융합 7-디스패치 디코드 경로
+
+Phase 10은 커널 융합을 도입하여 9-디스패치 디코드 경로를 7-디스패치로 줄이고, 두 개의 커널 간 디스패치 경계를 제거합니다.
+
+### 융합 커널
+
+**Fusion B — `fused_swiglu_down`**: SiLU 활성화, element-wise gate 곱셈, down projection GEMV를 단일 Metal 디스패치로 결합합니다. SiLU*gate와 down_proj 사이의 중간 버퍼를 제거하여 디스패치 1회와 스크래치 할당 1회를 절약합니다.
+
+**Fusion A — `fused_rms_gemv`**: RMS 정규화와 후속 GEMV (어텐션 전/FFN 전 norm에 사용)를 단일 디스패치로 결합합니다. Threadgroup이 레지스터 내에서 RMS norm을 계산하고, 정규화된 결과를 바로 GEMV에 전달하여 디바이스 메모리 왕복을 방지합니다.
+
+### 7-디스패치 파이프라인 레이아웃
+
+| # | 연산 | 비고 |
+|---|------|------|
+| 1 | **fused_rms_gemv** (RMS norm + QKV GEMV) | Fusion A — 어텐션 전 norm과 QKV projection 융합 |
+| 2 | 배치형 RoPE (Q와 K 동시 처리) | 9-디스패치와 동일 |
+| 3 | SDPA decode (slab KV cache) | 동일 |
+| 4 | 출력 projection GEMV + 어텐션 residual add | 동일 |
+| 5 | **fused_rms_gemv** (RMS norm + gate_up GEMV) | Fusion A — FFN 전 norm과 gate_up projection 융합 |
+| 6 | **fused_swiglu_down** (SiLU * gate + down GEMV) | Fusion B — 활성화 + down projection |
+| 7 | FFN residual add | 동일 |
+
+### 폴백 동작
+
+융합 Pipeline State Object (PSO)가 초기화 시 컴파일에 실패하면 (예: 미지원 GPU 아키텍처), CachedDecode가 자동으로 9-디스패치 경로로 폴백합니다. 사용자 개입이 필요하지 않습니다.
+
+### 성능 목표
+
+- **목표**: 600-650 us/layer (f16, 60L, M3 Ultra) — 벤치마크 대기 중
+- **감소**: 9 디스패치 → 7 디스패치 (GPU 디스패치 22% 감소)

@@ -472,6 +472,1291 @@ fn ensure_contiguous(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Fusion B: fused SwiGLU + down-projection
+// ---------------------------------------------------------------------------
+//
+// Combines D8 (silu_gate) + D9 (gemv_bias down_proj) into a single dispatch.
+// Buffer layout:
+//   0: mat [M, K]       — down_proj weight matrix (row-major)
+//   1: gate_up [2*K]    — concatenated [gate_0..gate_{K-1}, up_0..up_{K-1}]
+//   2: output [M]
+//   3: M (u32)
+//   4: K (u32)
+//   5: bias [M]         — residual (h_buf)
+
+/// Threadgroup size used for fused SwiGLU+down dispatch.
+const FUSED_SWIGLU_DOWN_TG_SIZE: u64 = 256;
+/// Number of rows processed per threadgroup (tile-M).
+const FUSED_TM: u64 = 4;
+/// Number of simdgroups per threadgroup for the BM=8 variant.
+const FUSED_BM8: u64 = 8;
+/// Rows per threadgroup in BM=8 mode: BM8 * TM = 32.
+const FUSED_BM8_ROWS: u64 = FUSED_BM8 * FUSED_TM;
+/// Minimum M to use BM=8 variant.
+const FUSED_BM8_THRESHOLD: u64 = 256;
+
+pub const FUSED_SWIGLU_DOWN_SHADER_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+constant constexpr uint SIMD_SIZE = 32;
+constant constexpr uint TM = 4;   // rows per threadgroup
+constant constexpr uint BM8 = 8;  // simdgroups per threadgroup for bm8 variant
+
+#if __METAL_VERSION__ >= 310
+template <typename T>
+METAL_FUNC uniform<T> as_uniform(T val) {
+    return make_uniform(val);
+}
+#else
+template <typename T>
+METAL_FUNC T as_uniform(T val) {
+    return val;
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// SwiGLU helpers — always compute in f32
+// ---------------------------------------------------------------------------
+inline float stable_sigmoid_f32(float x) {
+    float e = exp(-abs(x));
+    return x >= 0.0f ? 1.0f / (1.0f + e) : e / (1.0f + e);
+}
+
+// Compute silu(gate) * up in f32 from scalar values
+inline float swiglu_f32(float gate, float up) {
+    return gate * stable_sigmoid_f32(gate) * up;
+}
+
+// ===========================================================================
+// Regular TM=4 variants (M < 256): cross-simdgroup reduction
+// ===========================================================================
+
+kernel void fused_swiglu_down_f32(
+    device const float* mat     [[buffer(0)]],
+    device const float* gate_up [[buffer(1)]],
+    device       float* output  [[buffer(2)]],
+    constant     uint&  M       [[buffer(3)]],
+    constant     uint&  K       [[buffer(4)]],
+    device const float* bias    [[buffer(5)]],
+    uint tg_id        [[threadgroup_position_in_grid]],
+    uint tid           [[thread_position_in_threadgroup]],
+    uint tgsize        [[threads_per_threadgroup]],
+    uint simd_lane_id  [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float local_sums[TM * SIMD_SIZE];
+
+    uint row_base = tg_id * TM;
+    if (row_base >= M) return;
+    row_base = (row_base + TM <= M) ? row_base : M - TM;
+    float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    uint k4 = as_uniform(K / 4);
+    for (uint i = tid; i < k4; i += tgsize) {
+        uint idx = i * 4;
+        // Read gate and up, compute SwiGLU in f32
+        float4 g4 = *reinterpret_cast<device const float4*>(gate_up + idx);
+        float4 u4 = *reinterpret_cast<device const float4*>(gate_up + K + idx);
+        float4 v4 = float4(
+            swiglu_f32(g4[0], u4[0]),
+            swiglu_f32(g4[1], u4[1]),
+            swiglu_f32(g4[2], u4[2]),
+            swiglu_f32(g4[3], u4[3])
+        );
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            float4 m4 = *reinterpret_cast<device const float4*>(mat + (row_base + r) * K + idx);
+            acc[r] += dot(m4, v4);
+        }
+    }
+    for (uint i = k4 * 4 + tid; i < K; i += tgsize) {
+        float v = swiglu_f32(gate_up[i], gate_up[K + i]);
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            acc[r] += mat[(row_base + r) * K + i] * v;
+        }
+    }
+
+    #pragma clang loop unroll(full)
+    for (uint r = 0; r < TM; r++) {
+        acc[r] = simd_sum(acc[r]);
+    }
+
+    if (simd_group_id == 0) {
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            local_sums[r * SIMD_SIZE + simd_lane_id] = 0.0f;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_lane_id == 0) {
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            local_sums[r * SIMD_SIZE + simd_group_id] = acc[r];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group_id == 0) {
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            float val = simd_sum(local_sums[r * SIMD_SIZE + simd_lane_id]);
+            if (simd_lane_id == 0) {
+                output[row_base + r] = val + bias[row_base + r];
+            }
+        }
+    }
+}
+
+kernel void fused_swiglu_down_f16(
+    device const half*  mat     [[buffer(0)]],
+    device const half*  gate_up [[buffer(1)]],
+    device       half*  output  [[buffer(2)]],
+    constant     uint&  M       [[buffer(3)]],
+    constant     uint&  K       [[buffer(4)]],
+    device const half*  bias    [[buffer(5)]],
+    uint tg_id        [[threadgroup_position_in_grid]],
+    uint tid           [[thread_position_in_threadgroup]],
+    uint tgsize        [[threads_per_threadgroup]],
+    uint simd_lane_id  [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float local_sums[TM * SIMD_SIZE];
+
+    uint row_base = tg_id * TM;
+    if (row_base >= M) return;
+    row_base = (row_base + TM <= M) ? row_base : M - TM;
+    float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    uint k4 = as_uniform(K / 4);
+    for (uint i = tid; i < k4; i += tgsize) {
+        uint idx = i * 4;
+        float4 g4 = float4(*reinterpret_cast<device const half4*>(gate_up + idx));
+        float4 u4 = float4(*reinterpret_cast<device const half4*>(gate_up + K + idx));
+        float4 v4 = float4(
+            swiglu_f32(g4[0], u4[0]),
+            swiglu_f32(g4[1], u4[1]),
+            swiglu_f32(g4[2], u4[2]),
+            swiglu_f32(g4[3], u4[3])
+        );
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            float4 m4 = float4(*reinterpret_cast<device const half4*>(mat + (row_base + r) * K + idx));
+            acc[r] += dot(m4, v4);
+        }
+    }
+    for (uint i = k4 * 4 + tid; i < K; i += tgsize) {
+        float v = swiglu_f32(float(gate_up[i]), float(gate_up[K + i]));
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            acc[r] += float(mat[(row_base + r) * K + i]) * v;
+        }
+    }
+
+    #pragma clang loop unroll(full)
+    for (uint r = 0; r < TM; r++) {
+        acc[r] = simd_sum(acc[r]);
+    }
+
+    if (simd_group_id == 0) {
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            local_sums[r * SIMD_SIZE + simd_lane_id] = 0.0f;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_lane_id == 0) {
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            local_sums[r * SIMD_SIZE + simd_group_id] = acc[r];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group_id == 0) {
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            float val = simd_sum(local_sums[r * SIMD_SIZE + simd_lane_id]);
+            if (simd_lane_id == 0) {
+                output[row_base + r] = half(val + float(bias[row_base + r]));
+            }
+        }
+    }
+}
+
+kernel void fused_swiglu_down_bf16(
+    device const bfloat*  mat     [[buffer(0)]],
+    device const bfloat*  gate_up [[buffer(1)]],
+    device       bfloat*  output  [[buffer(2)]],
+    constant     uint&    M       [[buffer(3)]],
+    constant     uint&    K       [[buffer(4)]],
+    device const bfloat*  bias    [[buffer(5)]],
+    uint tg_id        [[threadgroup_position_in_grid]],
+    uint tid           [[thread_position_in_threadgroup]],
+    uint tgsize        [[threads_per_threadgroup]],
+    uint simd_lane_id  [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float local_sums[TM * SIMD_SIZE];
+
+    uint row_base = tg_id * TM;
+    if (row_base >= M) return;
+    row_base = (row_base + TM <= M) ? row_base : M - TM;
+    float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    // bf16 does not support vector loads — scalar only
+    for (uint i = tid; i < K; i += tgsize) {
+        float v = swiglu_f32(float(gate_up[i]), float(gate_up[K + i]));
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            acc[r] += float(mat[(row_base + r) * K + i]) * v;
+        }
+    }
+
+    #pragma clang loop unroll(full)
+    for (uint r = 0; r < TM; r++) {
+        acc[r] = simd_sum(acc[r]);
+    }
+
+    if (simd_group_id == 0) {
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            local_sums[r * SIMD_SIZE + simd_lane_id] = 0.0f;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_lane_id == 0) {
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            local_sums[r * SIMD_SIZE + simd_group_id] = acc[r];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group_id == 0) {
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            float val = simd_sum(local_sums[r * SIMD_SIZE + simd_lane_id]);
+            if (simd_lane_id == 0) {
+                output[row_base + r] = bfloat(val + float(bias[row_base + r]));
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// BM=8 variants (M >= 256): no cross-simdgroup barriers, simd_sum only
+// ===========================================================================
+
+kernel void fused_swiglu_down_bm8_f32(
+    device const float* mat     [[buffer(0)]],
+    device const float* gate_up [[buffer(1)]],
+    device       float* output  [[buffer(2)]],
+    constant     uint&  M       [[buffer(3)]],
+    constant     uint&  K       [[buffer(4)]],
+    device const float* bias    [[buffer(5)]],
+    uint tg_id         [[threadgroup_position_in_grid]],
+    uint simd_lane_id  [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]])
+{
+    uint row_base = tg_id * (BM8 * TM) + simd_group_id * TM;
+    if (row_base >= M) return;
+    row_base = (row_base + TM <= M) ? row_base : M - TM;
+
+    float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    // Quad-buffered: process 4×float4 (64 bytes) per iteration
+    uint k16 = as_uniform(K / 16);
+    for (uint i = simd_lane_id; i < k16; i += SIMD_SIZE) {
+        uint idx = i * 16;
+        // Read gate and up vectors, compute SwiGLU
+        float4 g4a = *reinterpret_cast<device const float4*>(gate_up + idx);
+        float4 u4a = *reinterpret_cast<device const float4*>(gate_up + K + idx);
+        float4 g4b = *reinterpret_cast<device const float4*>(gate_up + idx + 4);
+        float4 u4b = *reinterpret_cast<device const float4*>(gate_up + K + idx + 4);
+        float4 g4c = *reinterpret_cast<device const float4*>(gate_up + idx + 8);
+        float4 u4c = *reinterpret_cast<device const float4*>(gate_up + K + idx + 8);
+        float4 g4d = *reinterpret_cast<device const float4*>(gate_up + idx + 12);
+        float4 u4d = *reinterpret_cast<device const float4*>(gate_up + K + idx + 12);
+        float4 v4a = float4(swiglu_f32(g4a[0], u4a[0]), swiglu_f32(g4a[1], u4a[1]),
+                            swiglu_f32(g4a[2], u4a[2]), swiglu_f32(g4a[3], u4a[3]));
+        float4 v4b = float4(swiglu_f32(g4b[0], u4b[0]), swiglu_f32(g4b[1], u4b[1]),
+                            swiglu_f32(g4b[2], u4b[2]), swiglu_f32(g4b[3], u4b[3]));
+        float4 v4c = float4(swiglu_f32(g4c[0], u4c[0]), swiglu_f32(g4c[1], u4c[1]),
+                            swiglu_f32(g4c[2], u4c[2]), swiglu_f32(g4c[3], u4c[3]));
+        float4 v4d = float4(swiglu_f32(g4d[0], u4d[0]), swiglu_f32(g4d[1], u4d[1]),
+                            swiglu_f32(g4d[2], u4d[2]), swiglu_f32(g4d[3], u4d[3]));
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            device const float* row = mat + (row_base + r) * K + idx;
+            float4 m4a = *reinterpret_cast<device const float4*>(row);
+            float4 m4b = *reinterpret_cast<device const float4*>(row + 4);
+            float4 m4c = *reinterpret_cast<device const float4*>(row + 8);
+            float4 m4d = *reinterpret_cast<device const float4*>(row + 12);
+            acc[r] += dot(m4a, v4a) + dot(m4b, v4b) + dot(m4c, v4c) + dot(m4d, v4d);
+        }
+    }
+    // Remainder in groups of 4
+    for (uint i = k16 * 16 + simd_lane_id * 4; i + 3 < K; i += SIMD_SIZE * 4) {
+        float4 g4 = *reinterpret_cast<device const float4*>(gate_up + i);
+        float4 u4 = *reinterpret_cast<device const float4*>(gate_up + K + i);
+        float4 v4 = float4(swiglu_f32(g4[0], u4[0]), swiglu_f32(g4[1], u4[1]),
+                           swiglu_f32(g4[2], u4[2]), swiglu_f32(g4[3], u4[3]));
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            float4 m4 = *reinterpret_cast<device const float4*>(mat + (row_base + r) * K + i);
+            acc[r] += dot(m4, v4);
+        }
+    }
+    // Scalar remainder
+    for (uint i = (K / 4) * 4 + simd_lane_id; i < K; i += SIMD_SIZE) {
+        float v = swiglu_f32(gate_up[i], gate_up[K + i]);
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            acc[r] += mat[(row_base + r) * K + i] * v;
+        }
+    }
+
+    #pragma clang loop unroll(full)
+    for (uint r = 0; r < TM; r++) {
+        acc[r] = simd_sum(acc[r]);
+        if (simd_lane_id == 0) {
+            output[row_base + r] = acc[r] + bias[row_base + r];
+        }
+    }
+}
+
+kernel void fused_swiglu_down_bm8_f16(
+    device const half*  mat     [[buffer(0)]],
+    device const half*  gate_up [[buffer(1)]],
+    device       half*  output  [[buffer(2)]],
+    constant     uint&  M       [[buffer(3)]],
+    constant     uint&  K       [[buffer(4)]],
+    device const half*  bias    [[buffer(5)]],
+    uint tg_id         [[threadgroup_position_in_grid]],
+    uint simd_lane_id  [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]])
+{
+    uint row_base = tg_id * (BM8 * TM) + simd_group_id * TM;
+    if (row_base >= M) return;
+    row_base = (row_base + TM <= M) ? row_base : M - TM;
+
+    float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    // Quad-buffered f16: process 4×half4 (32 bytes) per iteration
+    uint k16 = as_uniform(K / 16);
+    for (uint i = simd_lane_id; i < k16; i += SIMD_SIZE) {
+        uint idx = i * 16;
+        float4 g4a = float4(*reinterpret_cast<device const half4*>(gate_up + idx));
+        float4 u4a = float4(*reinterpret_cast<device const half4*>(gate_up + K + idx));
+        float4 g4b = float4(*reinterpret_cast<device const half4*>(gate_up + idx + 4));
+        float4 u4b = float4(*reinterpret_cast<device const half4*>(gate_up + K + idx + 4));
+        float4 g4c = float4(*reinterpret_cast<device const half4*>(gate_up + idx + 8));
+        float4 u4c = float4(*reinterpret_cast<device const half4*>(gate_up + K + idx + 8));
+        float4 g4d = float4(*reinterpret_cast<device const half4*>(gate_up + idx + 12));
+        float4 u4d = float4(*reinterpret_cast<device const half4*>(gate_up + K + idx + 12));
+        float4 v4a = float4(swiglu_f32(g4a[0], u4a[0]), swiglu_f32(g4a[1], u4a[1]),
+                            swiglu_f32(g4a[2], u4a[2]), swiglu_f32(g4a[3], u4a[3]));
+        float4 v4b = float4(swiglu_f32(g4b[0], u4b[0]), swiglu_f32(g4b[1], u4b[1]),
+                            swiglu_f32(g4b[2], u4b[2]), swiglu_f32(g4b[3], u4b[3]));
+        float4 v4c = float4(swiglu_f32(g4c[0], u4c[0]), swiglu_f32(g4c[1], u4c[1]),
+                            swiglu_f32(g4c[2], u4c[2]), swiglu_f32(g4c[3], u4c[3]));
+        float4 v4d = float4(swiglu_f32(g4d[0], u4d[0]), swiglu_f32(g4d[1], u4d[1]),
+                            swiglu_f32(g4d[2], u4d[2]), swiglu_f32(g4d[3], u4d[3]));
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            device const half* row = mat + (row_base + r) * K + idx;
+            float4 m4a = float4(*reinterpret_cast<device const half4*>(row));
+            float4 m4b = float4(*reinterpret_cast<device const half4*>(row + 4));
+            float4 m4c = float4(*reinterpret_cast<device const half4*>(row + 8));
+            float4 m4d = float4(*reinterpret_cast<device const half4*>(row + 12));
+            acc[r] += dot(m4a, v4a) + dot(m4b, v4b) + dot(m4c, v4c) + dot(m4d, v4d);
+        }
+    }
+    // Remainder in groups of 4
+    for (uint i = k16 * 16 + simd_lane_id * 4; i + 3 < K; i += SIMD_SIZE * 4) {
+        float4 g4 = float4(*reinterpret_cast<device const half4*>(gate_up + i));
+        float4 u4 = float4(*reinterpret_cast<device const half4*>(gate_up + K + i));
+        float4 v4 = float4(swiglu_f32(g4[0], u4[0]), swiglu_f32(g4[1], u4[1]),
+                           swiglu_f32(g4[2], u4[2]), swiglu_f32(g4[3], u4[3]));
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            float4 m4 = float4(*reinterpret_cast<device const half4*>(mat + (row_base + r) * K + i));
+            acc[r] += dot(m4, v4);
+        }
+    }
+    // Scalar remainder
+    for (uint i = (K / 4) * 4 + simd_lane_id; i < K; i += SIMD_SIZE) {
+        float v = swiglu_f32(float(gate_up[i]), float(gate_up[K + i]));
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            acc[r] += float(mat[(row_base + r) * K + i]) * v;
+        }
+    }
+
+    #pragma clang loop unroll(full)
+    for (uint r = 0; r < TM; r++) {
+        acc[r] = simd_sum(acc[r]);
+        if (simd_lane_id == 0) {
+            output[row_base + r] = half(acc[r] + float(bias[row_base + r]));
+        }
+    }
+}
+
+kernel void fused_swiglu_down_bm8_bf16(
+    device const bfloat*  mat     [[buffer(0)]],
+    device const bfloat*  gate_up [[buffer(1)]],
+    device       bfloat*  output  [[buffer(2)]],
+    constant     uint&    M       [[buffer(3)]],
+    constant     uint&    K       [[buffer(4)]],
+    device const bfloat*  bias    [[buffer(5)]],
+    uint tg_id         [[threadgroup_position_in_grid]],
+    uint simd_lane_id  [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]])
+{
+    uint row_base = tg_id * (BM8 * TM) + simd_group_id * TM;
+    if (row_base >= M) return;
+    row_base = (row_base + TM <= M) ? row_base : M - TM;
+
+    float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    // bf16 does not support vector loads — scalar only
+    for (uint i = simd_lane_id; i < K; i += SIMD_SIZE) {
+        float v = swiglu_f32(float(gate_up[i]), float(gate_up[K + i]));
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            acc[r] += float(mat[(row_base + r) * K + i]) * v;
+        }
+    }
+
+    #pragma clang loop unroll(full)
+    for (uint r = 0; r < TM; r++) {
+        acc[r] = simd_sum(acc[r]);
+        if (simd_lane_id == 0) {
+            output[row_base + r] = bfloat(acc[r] + float(bias[row_base + r]));
+        }
+    }
+}
+"#;
+
+/// Get the fused SwiGLU+down kernel name for a given dtype and M dimension.
+///
+/// Returns the BM8 variant for M >= 256, regular variant otherwise.
+pub fn fused_swiglu_down_kernel_name(dtype: DType, m: u32) -> Result<&'static str, KernelError> {
+    let use_bm8 = (m as u64) >= FUSED_BM8_THRESHOLD;
+    match (dtype, use_bm8) {
+        (DType::Float32, true) => Ok("fused_swiglu_down_bm8_f32"),
+        (DType::Float32, false) => Ok("fused_swiglu_down_f32"),
+        (DType::Float16, true) => Ok("fused_swiglu_down_bm8_f16"),
+        (DType::Float16, false) => Ok("fused_swiglu_down_f16"),
+        (DType::Bfloat16, true) => Ok("fused_swiglu_down_bm8_bf16"),
+        (DType::Bfloat16, false) => Ok("fused_swiglu_down_bf16"),
+        _ => Err(KernelError::NotFound(format!(
+            "fused_swiglu_down not supported for {:?}",
+            dtype
+        ))),
+    }
+}
+
+/// Compute dispatch grid and threadgroup sizes for fused SwiGLU+down with given M.
+pub fn fused_swiglu_down_dispatch_sizes(
+    m: u32,
+    pso: &metal::ComputePipelineState,
+) -> (metal::MTLSize, metal::MTLSize) {
+    let use_bm8 = (m as u64) >= FUSED_BM8_THRESHOLD;
+    let num_threadgroups = if use_bm8 {
+        fused_ceil_div(m as u64, FUSED_BM8_ROWS)
+    } else {
+        fused_ceil_div(m as u64, FUSED_TM)
+    };
+    let tg_dim = if use_bm8 {
+        MTLSize::new(32, 1, FUSED_BM8)
+    } else {
+        let tg_size = std::cmp::min(
+            FUSED_SWIGLU_DOWN_TG_SIZE,
+            pso.max_total_threads_per_threadgroup(),
+        );
+        MTLSize::new(tg_size, 1, 1)
+    };
+    (MTLSize::new(num_threadgroups, 1, 1), tg_dim)
+}
+
+/// Encode fused SwiGLU+down using a pre-resolved PSO and pre-allocated buffers.
+///
+/// Buffer layout:
+/// - 0: mat [M, K]     (down_proj weights)
+/// - 1: gate_up [2*K]  (concatenated gate and up activations)
+/// - 2: output [M]
+/// - 3: M (u32)
+/// - 4: K (u32)
+/// - 5: bias [M]       (residual / h_buf)
+#[allow(clippy::too_many_arguments)]
+pub fn fused_swiglu_down_preresolved_into_encoder(
+    pso: &metal::ComputePipelineState,
+    mat_buf: &metal::BufferRef,
+    mat_offset: u64,
+    gate_up_buf: &metal::BufferRef,
+    gate_up_offset: u64,
+    out_buf: &metal::BufferRef,
+    out_offset: u64,
+    m: u32,
+    k: u32,
+    bias_buf: &metal::BufferRef,
+    bias_offset: u64,
+    grid: metal::MTLSize,
+    tg: metal::MTLSize,
+    encoder: &metal::ComputeCommandEncoderRef,
+) {
+    encoder.set_compute_pipeline_state(pso);
+    encoder.set_buffer(0, Some(mat_buf), mat_offset);
+    encoder.set_buffer(1, Some(gate_up_buf), gate_up_offset);
+    encoder.set_buffer(2, Some(out_buf), out_offset);
+    encoder.set_bytes(3, 4, &m as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(4, 4, &k as *const u32 as *const std::ffi::c_void);
+    encoder.set_buffer(5, Some(bias_buf), bias_offset);
+    encoder.dispatch_thread_groups(grid, tg);
+}
+
+/// Register all fused kernel shaders with the kernel registry.
+pub fn register_fused_kernels(registry: &KernelRegistry) -> Result<(), KernelError> {
+    registry.register_jit_source("fused_swiglu_down", FUSED_SWIGLU_DOWN_SHADER_SOURCE)?;
+    registry.register_jit_source("fused_rms_gemv", FUSED_RMS_GEMV_SHADER_SOURCE)
+}
+
+/// Compute ceil(a / b) for unsigned integers.
+#[allow(clippy::manual_div_ceil)]
+fn fused_ceil_div(a: u64, b: u64) -> u64 {
+    (a + b - 1) / b
+}
+
+// ---------------------------------------------------------------------------
+// Fusion A: fused RMS-norm + GEMV
+// ---------------------------------------------------------------------------
+//
+// Combines D1 (rms_norm) + D2 (gemv) into a single dispatch.
+// Each threadgroup redundantly computes inv_rms (no cross-TG sync in Metal),
+// then performs GEMV with inline normalization.
+//
+// Buffer layout:
+//   0: input [K]         — raw pre-norm input vector
+//   1: norm_weight [K]   — RMS norm weight vector
+//   2: mat [M, K]        — projection weight matrix (row-major)
+//   3: output [M]
+//   4: M (u32)
+//   5: K (u32)
+//   6: eps (f32)         — RMS norm epsilon
+//   7: w_stride (u32)    — norm weight stride (usually 1)
+
+/// Threadgroup size used for fused RMS-norm + GEMV dispatch.
+const FUSED_RMS_GEMV_TG_SIZE: u64 = 256;
+
+pub const FUSED_RMS_GEMV_SHADER_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+constant constexpr uint SIMD_SIZE = 32;
+constant constexpr uint TM = 4;   // rows per simdgroup (BM8) or per threadgroup (regular)
+constant constexpr uint BM8 = 8;  // simdgroups per threadgroup for bm8 variant
+
+#if __METAL_VERSION__ >= 310
+template <typename T>
+METAL_FUNC uniform<T> as_uniform(T val) {
+    return make_uniform(val);
+}
+#else
+template <typename T>
+METAL_FUNC T as_uniform(T val) {
+    return val;
+}
+#endif
+
+// ===========================================================================
+// Regular TM=4 variants (M < 256): cross-simdgroup reduction
+// ===========================================================================
+
+kernel void fused_rms_gemv_f32(
+    device const float* input       [[buffer(0)]],
+    device const float* norm_weight [[buffer(1)]],
+    device const float* mat         [[buffer(2)]],
+    device       float* output      [[buffer(3)]],
+    constant     uint&  M           [[buffer(4)]],
+    constant     uint&  K           [[buffer(5)]],
+    constant     float& eps         [[buffer(6)]],
+    constant     uint&  w_stride    [[buffer(7)]],
+    uint tg_id         [[threadgroup_position_in_grid]],
+    uint tid           [[thread_position_in_threadgroup]],
+    uint tgsize        [[threads_per_threadgroup]],
+    uint simd_lane_id  [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float local_sums[BM8 * SIMD_SIZE];
+
+    // --- Phase 1: compute inv_rms cooperatively ---
+    float ss_acc = 0.0f;
+    for (uint i = tid; i < K; i += tgsize) {
+        float v = input[i];
+        ss_acc += v * v;
+    }
+    ss_acc = simd_sum(ss_acc);
+
+    if (simd_group_id == 0) {
+        local_sums[simd_lane_id] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_lane_id == 0) {
+        local_sums[simd_group_id] = ss_acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group_id == 0) {
+        float total = simd_sum(local_sums[simd_lane_id]);
+        if (simd_lane_id == 0) {
+            local_sums[0] = metal::precise::rsqrt(total / float(K) + eps);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_rms = local_sums[0];
+
+    // --- Phase 2: GEMV with inline normalization ---
+    uint row_base = tg_id * TM;
+    if (row_base >= M) return;
+    row_base = (row_base + TM <= M) ? row_base : M - TM;
+    float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    if (w_stride == 1) {
+        uint k4 = as_uniform(K / 4);
+        for (uint i = tid; i < k4; i += tgsize) {
+            uint idx = i * 4;
+            float4 in4 = *reinterpret_cast<device const float4*>(input + idx);
+            float4 nw4 = *reinterpret_cast<device const float4*>(norm_weight + idx);
+            float4 v4 = in4 * inv_rms * nw4;
+            #pragma clang loop unroll(full)
+            for (uint r = 0; r < TM; r++) {
+                float4 m4 = *reinterpret_cast<device const float4*>(mat + (row_base + r) * K + idx);
+                acc[r] += dot(m4, v4);
+            }
+        }
+        for (uint i = k4 * 4 + tid; i < K; i += tgsize) {
+            float v = input[i] * inv_rms * norm_weight[i];
+            #pragma clang loop unroll(full)
+            for (uint r = 0; r < TM; r++) {
+                acc[r] += mat[(row_base + r) * K + i] * v;
+            }
+        }
+    } else {
+        for (uint i = tid; i < K; i += tgsize) {
+            float v = input[i] * inv_rms * norm_weight[i * w_stride];
+            #pragma clang loop unroll(full)
+            for (uint r = 0; r < TM; r++) {
+                acc[r] += mat[(row_base + r) * K + i] * v;
+            }
+        }
+    }
+
+    // Cross-simdgroup reduction
+    #pragma clang loop unroll(full)
+    for (uint r = 0; r < TM; r++) {
+        acc[r] = simd_sum(acc[r]);
+    }
+    if (simd_group_id == 0) {
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            local_sums[r * SIMD_SIZE + simd_lane_id] = 0.0f;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_lane_id == 0) {
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            local_sums[r * SIMD_SIZE + simd_group_id] = acc[r];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group_id == 0) {
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            float val = simd_sum(local_sums[r * SIMD_SIZE + simd_lane_id]);
+            if (simd_lane_id == 0) {
+                output[row_base + r] = val;
+            }
+        }
+    }
+}
+
+kernel void fused_rms_gemv_f16(
+    device const half*  input       [[buffer(0)]],
+    device const half*  norm_weight [[buffer(1)]],
+    device const half*  mat         [[buffer(2)]],
+    device       half*  output      [[buffer(3)]],
+    constant     uint&  M           [[buffer(4)]],
+    constant     uint&  K           [[buffer(5)]],
+    constant     float& eps         [[buffer(6)]],
+    constant     uint&  w_stride    [[buffer(7)]],
+    uint tg_id         [[threadgroup_position_in_grid]],
+    uint tid           [[thread_position_in_threadgroup]],
+    uint tgsize        [[threads_per_threadgroup]],
+    uint simd_lane_id  [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float local_sums[BM8 * SIMD_SIZE];
+
+    // --- Phase 1: compute inv_rms cooperatively ---
+    float ss_acc = 0.0f;
+    for (uint i = tid; i < K; i += tgsize) {
+        float v = float(input[i]);
+        ss_acc += v * v;
+    }
+    ss_acc = simd_sum(ss_acc);
+
+    if (simd_group_id == 0) {
+        local_sums[simd_lane_id] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_lane_id == 0) {
+        local_sums[simd_group_id] = ss_acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group_id == 0) {
+        float total = simd_sum(local_sums[simd_lane_id]);
+        if (simd_lane_id == 0) {
+            local_sums[0] = metal::precise::rsqrt(total / float(K) + eps);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_rms = local_sums[0];
+
+    // --- Phase 2: GEMV with inline normalization ---
+    uint row_base = tg_id * TM;
+    if (row_base >= M) return;
+    row_base = (row_base + TM <= M) ? row_base : M - TM;
+    float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    if (w_stride == 1) {
+        uint k4 = as_uniform(K / 4);
+        for (uint i = tid; i < k4; i += tgsize) {
+            uint idx = i * 4;
+            float4 in4 = float4(*reinterpret_cast<device const half4*>(input + idx));
+            float4 nw4 = float4(*reinterpret_cast<device const half4*>(norm_weight + idx));
+            float4 v4 = in4 * inv_rms * nw4;
+            #pragma clang loop unroll(full)
+            for (uint r = 0; r < TM; r++) {
+                float4 m4 = float4(*reinterpret_cast<device const half4*>(mat + (row_base + r) * K + idx));
+                acc[r] += dot(m4, v4);
+            }
+        }
+        for (uint i = k4 * 4 + tid; i < K; i += tgsize) {
+            float v = float(input[i]) * inv_rms * float(norm_weight[i]);
+            #pragma clang loop unroll(full)
+            for (uint r = 0; r < TM; r++) {
+                acc[r] += float(mat[(row_base + r) * K + i]) * v;
+            }
+        }
+    } else {
+        for (uint i = tid; i < K; i += tgsize) {
+            float v = float(input[i]) * inv_rms * float(norm_weight[i * w_stride]);
+            #pragma clang loop unroll(full)
+            for (uint r = 0; r < TM; r++) {
+                acc[r] += float(mat[(row_base + r) * K + i]) * v;
+            }
+        }
+    }
+
+    // Cross-simdgroup reduction
+    #pragma clang loop unroll(full)
+    for (uint r = 0; r < TM; r++) {
+        acc[r] = simd_sum(acc[r]);
+    }
+    if (simd_group_id == 0) {
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            local_sums[r * SIMD_SIZE + simd_lane_id] = 0.0f;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_lane_id == 0) {
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            local_sums[r * SIMD_SIZE + simd_group_id] = acc[r];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group_id == 0) {
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            float val = simd_sum(local_sums[r * SIMD_SIZE + simd_lane_id]);
+            if (simd_lane_id == 0) {
+                output[row_base + r] = half(val);
+            }
+        }
+    }
+}
+
+kernel void fused_rms_gemv_bf16(
+    device const bfloat* input       [[buffer(0)]],
+    device const bfloat* norm_weight [[buffer(1)]],
+    device const bfloat* mat         [[buffer(2)]],
+    device       bfloat* output      [[buffer(3)]],
+    constant     uint&   M           [[buffer(4)]],
+    constant     uint&   K           [[buffer(5)]],
+    constant     float&  eps         [[buffer(6)]],
+    constant     uint&   w_stride    [[buffer(7)]],
+    uint tg_id         [[threadgroup_position_in_grid]],
+    uint tid           [[thread_position_in_threadgroup]],
+    uint tgsize        [[threads_per_threadgroup]],
+    uint simd_lane_id  [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float local_sums[BM8 * SIMD_SIZE];
+
+    // --- Phase 1: compute inv_rms cooperatively ---
+    float ss_acc = 0.0f;
+    for (uint i = tid; i < K; i += tgsize) {
+        float v = float(input[i]);
+        ss_acc += v * v;
+    }
+    ss_acc = simd_sum(ss_acc);
+
+    if (simd_group_id == 0) {
+        local_sums[simd_lane_id] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_lane_id == 0) {
+        local_sums[simd_group_id] = ss_acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group_id == 0) {
+        float total = simd_sum(local_sums[simd_lane_id]);
+        if (simd_lane_id == 0) {
+            local_sums[0] = metal::precise::rsqrt(total / float(K) + eps);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_rms = local_sums[0];
+
+    // --- Phase 2: GEMV with inline normalization (bf16: scalar only) ---
+    uint row_base = tg_id * TM;
+    if (row_base >= M) return;
+    row_base = (row_base + TM <= M) ? row_base : M - TM;
+    float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (uint i = tid; i < K; i += tgsize) {
+        float v = float(input[i]) * inv_rms * float(norm_weight[i * w_stride]);
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            acc[r] += float(mat[(row_base + r) * K + i]) * v;
+        }
+    }
+
+    // Cross-simdgroup reduction
+    #pragma clang loop unroll(full)
+    for (uint r = 0; r < TM; r++) {
+        acc[r] = simd_sum(acc[r]);
+    }
+    if (simd_group_id == 0) {
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            local_sums[r * SIMD_SIZE + simd_lane_id] = 0.0f;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_lane_id == 0) {
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            local_sums[r * SIMD_SIZE + simd_group_id] = acc[r];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group_id == 0) {
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            float val = simd_sum(local_sums[r * SIMD_SIZE + simd_lane_id]);
+            if (simd_lane_id == 0) {
+                output[row_base + r] = bfloat(val);
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// BM=8 variants (M >= 256): each simdgroup handles TM=4 rows independently
+// Phase 1 needs threadgroup_barrier for inv_rms; Phase 2 is barrier-free.
+// ===========================================================================
+
+kernel void fused_rms_gemv_bm8_f32(
+    device const float* input       [[buffer(0)]],
+    device const float* norm_weight [[buffer(1)]],
+    device const float* mat         [[buffer(2)]],
+    device       float* output      [[buffer(3)]],
+    constant     uint&  M           [[buffer(4)]],
+    constant     uint&  K           [[buffer(5)]],
+    constant     float& eps         [[buffer(6)]],
+    constant     uint&  w_stride    [[buffer(7)]],
+    uint tg_id         [[threadgroup_position_in_grid]],
+    uint simd_lane_id  [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float local_sums[BM8 * SIMD_SIZE];
+    uint tid = simd_group_id * SIMD_SIZE + simd_lane_id;
+
+    // --- Phase 1: compute inv_rms cooperatively (all 256 threads) ---
+    float ss_acc = 0.0f;
+    for (uint i = tid; i < K; i += BM8 * SIMD_SIZE) {
+        float v = input[i];
+        ss_acc += v * v;
+    }
+    ss_acc = simd_sum(ss_acc);
+
+    if (simd_group_id == 0) {
+        local_sums[simd_lane_id] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_lane_id == 0) {
+        local_sums[simd_group_id] = ss_acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group_id == 0) {
+        float total = simd_sum(local_sums[simd_lane_id]);
+        if (simd_lane_id == 0) {
+            local_sums[0] = metal::precise::rsqrt(total / float(K) + eps);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_rms = local_sums[0];
+
+    // --- Phase 2: BM8 GEMV with inline normalization ---
+    uint row_base = tg_id * (BM8 * TM) + simd_group_id * TM;
+    if (row_base >= M) return;
+    row_base = (row_base + TM <= M) ? row_base : M - TM;
+    float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    if (w_stride == 1) {
+        uint k16 = as_uniform(K / 16);
+        for (uint i = simd_lane_id; i < k16; i += SIMD_SIZE) {
+            uint idx = i * 16;
+            float4 in4a = *reinterpret_cast<device const float4*>(input + idx);
+            float4 nw4a = *reinterpret_cast<device const float4*>(norm_weight + idx);
+            float4 v4a = in4a * inv_rms * nw4a;
+            float4 in4b = *reinterpret_cast<device const float4*>(input + idx + 4);
+            float4 nw4b = *reinterpret_cast<device const float4*>(norm_weight + idx + 4);
+            float4 v4b = in4b * inv_rms * nw4b;
+            float4 in4c = *reinterpret_cast<device const float4*>(input + idx + 8);
+            float4 nw4c = *reinterpret_cast<device const float4*>(norm_weight + idx + 8);
+            float4 v4c = in4c * inv_rms * nw4c;
+            float4 in4d = *reinterpret_cast<device const float4*>(input + idx + 12);
+            float4 nw4d = *reinterpret_cast<device const float4*>(norm_weight + idx + 12);
+            float4 v4d = in4d * inv_rms * nw4d;
+            #pragma clang loop unroll(full)
+            for (uint r = 0; r < TM; r++) {
+                device const float* row = mat + (row_base + r) * K + idx;
+                float4 m4a = *reinterpret_cast<device const float4*>(row);
+                float4 m4b = *reinterpret_cast<device const float4*>(row + 4);
+                float4 m4c = *reinterpret_cast<device const float4*>(row + 8);
+                float4 m4d = *reinterpret_cast<device const float4*>(row + 12);
+                acc[r] += dot(m4a, v4a) + dot(m4b, v4b) + dot(m4c, v4c) + dot(m4d, v4d);
+            }
+        }
+        // Remainder in groups of 4
+        for (uint i = k16 * 16 + simd_lane_id * 4; i + 3 < K; i += SIMD_SIZE * 4) {
+            float4 in4 = *reinterpret_cast<device const float4*>(input + i);
+            float4 nw4 = *reinterpret_cast<device const float4*>(norm_weight + i);
+            float4 v4 = in4 * inv_rms * nw4;
+            #pragma clang loop unroll(full)
+            for (uint r = 0; r < TM; r++) {
+                float4 m4 = *reinterpret_cast<device const float4*>(mat + (row_base + r) * K + i);
+                acc[r] += dot(m4, v4);
+            }
+        }
+        // Scalar remainder
+        for (uint i = (K / 4) * 4 + simd_lane_id; i < K; i += SIMD_SIZE) {
+            float v = input[i] * inv_rms * norm_weight[i];
+            #pragma clang loop unroll(full)
+            for (uint r = 0; r < TM; r++) {
+                acc[r] += mat[(row_base + r) * K + i] * v;
+            }
+        }
+    } else {
+        for (uint i = simd_lane_id; i < K; i += SIMD_SIZE) {
+            float v = input[i] * inv_rms * norm_weight[i * w_stride];
+            #pragma clang loop unroll(full)
+            for (uint r = 0; r < TM; r++) {
+                acc[r] += mat[(row_base + r) * K + i] * v;
+            }
+        }
+    }
+
+    #pragma clang loop unroll(full)
+    for (uint r = 0; r < TM; r++) {
+        acc[r] = simd_sum(acc[r]);
+        if (simd_lane_id == 0) {
+            output[row_base + r] = acc[r];
+        }
+    }
+}
+
+kernel void fused_rms_gemv_bm8_f16(
+    device const half*  input       [[buffer(0)]],
+    device const half*  norm_weight [[buffer(1)]],
+    device const half*  mat         [[buffer(2)]],
+    device       half*  output      [[buffer(3)]],
+    constant     uint&  M           [[buffer(4)]],
+    constant     uint&  K           [[buffer(5)]],
+    constant     float& eps         [[buffer(6)]],
+    constant     uint&  w_stride    [[buffer(7)]],
+    uint tg_id         [[threadgroup_position_in_grid]],
+    uint simd_lane_id  [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float local_sums[BM8 * SIMD_SIZE];
+    uint tid = simd_group_id * SIMD_SIZE + simd_lane_id;
+
+    // --- Phase 1: compute inv_rms cooperatively (all 256 threads) ---
+    float ss_acc = 0.0f;
+    for (uint i = tid; i < K; i += BM8 * SIMD_SIZE) {
+        float v = float(input[i]);
+        ss_acc += v * v;
+    }
+    ss_acc = simd_sum(ss_acc);
+
+    if (simd_group_id == 0) {
+        local_sums[simd_lane_id] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_lane_id == 0) {
+        local_sums[simd_group_id] = ss_acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group_id == 0) {
+        float total = simd_sum(local_sums[simd_lane_id]);
+        if (simd_lane_id == 0) {
+            local_sums[0] = metal::precise::rsqrt(total / float(K) + eps);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_rms = local_sums[0];
+
+    // --- Phase 2: BM8 GEMV with inline normalization ---
+    uint row_base = tg_id * (BM8 * TM) + simd_group_id * TM;
+    if (row_base >= M) return;
+    row_base = (row_base + TM <= M) ? row_base : M - TM;
+    float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    if (w_stride == 1) {
+        uint k16 = as_uniform(K / 16);
+        for (uint i = simd_lane_id; i < k16; i += SIMD_SIZE) {
+            uint idx = i * 16;
+            float4 in4a = float4(*reinterpret_cast<device const half4*>(input + idx));
+            float4 nw4a = float4(*reinterpret_cast<device const half4*>(norm_weight + idx));
+            float4 v4a = in4a * inv_rms * nw4a;
+            float4 in4b = float4(*reinterpret_cast<device const half4*>(input + idx + 4));
+            float4 nw4b = float4(*reinterpret_cast<device const half4*>(norm_weight + idx + 4));
+            float4 v4b = in4b * inv_rms * nw4b;
+            float4 in4c = float4(*reinterpret_cast<device const half4*>(input + idx + 8));
+            float4 nw4c = float4(*reinterpret_cast<device const half4*>(norm_weight + idx + 8));
+            float4 v4c = in4c * inv_rms * nw4c;
+            float4 in4d = float4(*reinterpret_cast<device const half4*>(input + idx + 12));
+            float4 nw4d = float4(*reinterpret_cast<device const half4*>(norm_weight + idx + 12));
+            float4 v4d = in4d * inv_rms * nw4d;
+            #pragma clang loop unroll(full)
+            for (uint r = 0; r < TM; r++) {
+                device const half* row = mat + (row_base + r) * K + idx;
+                float4 m4a = float4(*reinterpret_cast<device const half4*>(row));
+                float4 m4b = float4(*reinterpret_cast<device const half4*>(row + 4));
+                float4 m4c = float4(*reinterpret_cast<device const half4*>(row + 8));
+                float4 m4d = float4(*reinterpret_cast<device const half4*>(row + 12));
+                acc[r] += dot(m4a, v4a) + dot(m4b, v4b) + dot(m4c, v4c) + dot(m4d, v4d);
+            }
+        }
+        // Remainder in groups of 4
+        for (uint i = k16 * 16 + simd_lane_id * 4; i + 3 < K; i += SIMD_SIZE * 4) {
+            float4 in4 = float4(*reinterpret_cast<device const half4*>(input + i));
+            float4 nw4 = float4(*reinterpret_cast<device const half4*>(norm_weight + i));
+            float4 v4 = in4 * inv_rms * nw4;
+            #pragma clang loop unroll(full)
+            for (uint r = 0; r < TM; r++) {
+                float4 m4 = float4(*reinterpret_cast<device const half4*>(mat + (row_base + r) * K + i));
+                acc[r] += dot(m4, v4);
+            }
+        }
+        // Scalar remainder
+        for (uint i = (K / 4) * 4 + simd_lane_id; i < K; i += SIMD_SIZE) {
+            float v = float(input[i]) * inv_rms * float(norm_weight[i]);
+            #pragma clang loop unroll(full)
+            for (uint r = 0; r < TM; r++) {
+                acc[r] += float(mat[(row_base + r) * K + i]) * v;
+            }
+        }
+    } else {
+        for (uint i = simd_lane_id; i < K; i += SIMD_SIZE) {
+            float v = float(input[i]) * inv_rms * float(norm_weight[i * w_stride]);
+            #pragma clang loop unroll(full)
+            for (uint r = 0; r < TM; r++) {
+                acc[r] += float(mat[(row_base + r) * K + i]) * v;
+            }
+        }
+    }
+
+    #pragma clang loop unroll(full)
+    for (uint r = 0; r < TM; r++) {
+        acc[r] = simd_sum(acc[r]);
+        if (simd_lane_id == 0) {
+            output[row_base + r] = half(acc[r]);
+        }
+    }
+}
+
+kernel void fused_rms_gemv_bm8_bf16(
+    device const bfloat* input       [[buffer(0)]],
+    device const bfloat* norm_weight [[buffer(1)]],
+    device const bfloat* mat         [[buffer(2)]],
+    device       bfloat* output      [[buffer(3)]],
+    constant     uint&   M           [[buffer(4)]],
+    constant     uint&   K           [[buffer(5)]],
+    constant     float&  eps         [[buffer(6)]],
+    constant     uint&   w_stride    [[buffer(7)]],
+    uint tg_id         [[threadgroup_position_in_grid]],
+    uint simd_lane_id  [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float local_sums[BM8 * SIMD_SIZE];
+    uint tid = simd_group_id * SIMD_SIZE + simd_lane_id;
+
+    // --- Phase 1: compute inv_rms cooperatively (all 256 threads) ---
+    float ss_acc = 0.0f;
+    for (uint i = tid; i < K; i += BM8 * SIMD_SIZE) {
+        float v = float(input[i]);
+        ss_acc += v * v;
+    }
+    ss_acc = simd_sum(ss_acc);
+
+    if (simd_group_id == 0) {
+        local_sums[simd_lane_id] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_lane_id == 0) {
+        local_sums[simd_group_id] = ss_acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group_id == 0) {
+        float total = simd_sum(local_sums[simd_lane_id]);
+        if (simd_lane_id == 0) {
+            local_sums[0] = metal::precise::rsqrt(total / float(K) + eps);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_rms = local_sums[0];
+
+    // --- Phase 2: BM8 GEMV with inline normalization (bf16: scalar only) ---
+    uint row_base = tg_id * (BM8 * TM) + simd_group_id * TM;
+    if (row_base >= M) return;
+    row_base = (row_base + TM <= M) ? row_base : M - TM;
+    float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (uint i = simd_lane_id; i < K; i += SIMD_SIZE) {
+        float v = float(input[i]) * inv_rms * float(norm_weight[i * w_stride]);
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            acc[r] += float(mat[(row_base + r) * K + i]) * v;
+        }
+    }
+
+    #pragma clang loop unroll(full)
+    for (uint r = 0; r < TM; r++) {
+        acc[r] = simd_sum(acc[r]);
+        if (simd_lane_id == 0) {
+            output[row_base + r] = bfloat(acc[r]);
+        }
+    }
+}
+"#;
+
+/// Get the fused RMS-norm + GEMV kernel name for a given dtype and M dimension.
+///
+/// Returns the BM8 variant for M >= 256, regular variant otherwise.
+pub fn fused_rms_gemv_kernel_name(dtype: DType, m: u32) -> Result<&'static str, KernelError> {
+    let use_bm8 = (m as u64) >= FUSED_BM8_THRESHOLD;
+    match (dtype, use_bm8) {
+        (DType::Float32, true) => Ok("fused_rms_gemv_bm8_f32"),
+        (DType::Float32, false) => Ok("fused_rms_gemv_f32"),
+        (DType::Float16, true) => Ok("fused_rms_gemv_bm8_f16"),
+        (DType::Float16, false) => Ok("fused_rms_gemv_f16"),
+        (DType::Bfloat16, true) => Ok("fused_rms_gemv_bm8_bf16"),
+        (DType::Bfloat16, false) => Ok("fused_rms_gemv_bf16"),
+        _ => Err(KernelError::NotFound(format!(
+            "fused_rms_gemv not supported for {:?}",
+            dtype
+        ))),
+    }
+}
+
+/// Compute dispatch grid and threadgroup sizes for fused RMS-norm + GEMV.
+pub fn fused_rms_gemv_dispatch_sizes(
+    m: u32,
+    pso: &metal::ComputePipelineState,
+) -> (metal::MTLSize, metal::MTLSize) {
+    let use_bm8 = (m as u64) >= FUSED_BM8_THRESHOLD;
+    let num_threadgroups = if use_bm8 {
+        fused_ceil_div(m as u64, FUSED_BM8_ROWS)
+    } else {
+        fused_ceil_div(m as u64, FUSED_TM)
+    };
+    let tg_dim = if use_bm8 {
+        MTLSize::new(32, 1, FUSED_BM8)
+    } else {
+        let tg_size = std::cmp::min(
+            FUSED_RMS_GEMV_TG_SIZE,
+            pso.max_total_threads_per_threadgroup(),
+        );
+        MTLSize::new(tg_size, 1, 1)
+    };
+    (MTLSize::new(num_threadgroups, 1, 1), tg_dim)
+}
+
+/// Encode fused RMS-norm + GEMV using a pre-resolved PSO and pre-allocated buffers.
+///
+/// Buffer layout:
+/// - 0: input [K]         (raw pre-norm input vector)
+/// - 1: norm_weight [K]   (RMS norm weight vector)
+/// - 2: mat [M, K]        (projection weight matrix, row-major)
+/// - 3: output [M]
+/// - 4: M (u32)
+/// - 5: K (u32)
+/// - 6: eps (f32)
+/// - 7: w_stride (u32)
+#[allow(clippy::too_many_arguments)]
+pub fn fused_rms_gemv_preresolved_into_encoder(
+    pso: &metal::ComputePipelineState,
+    input_buf: &metal::BufferRef,
+    input_offset: u64,
+    norm_w_buf: &metal::BufferRef,
+    norm_w_offset: u64,
+    mat_buf: &metal::BufferRef,
+    mat_offset: u64,
+    out_buf: &metal::BufferRef,
+    out_offset: u64,
+    m: u32,
+    k: u32,
+    eps: f32,
+    w_stride: u32,
+    grid: metal::MTLSize,
+    tg: metal::MTLSize,
+    encoder: &metal::ComputeCommandEncoderRef,
+) {
+    encoder.set_compute_pipeline_state(pso);
+    encoder.set_buffer(0, Some(input_buf), input_offset);
+    encoder.set_buffer(1, Some(norm_w_buf), norm_w_offset);
+    encoder.set_buffer(2, Some(mat_buf), mat_offset);
+    encoder.set_buffer(3, Some(out_buf), out_offset);
+    encoder.set_bytes(4, 4, &m as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(5, 4, &k as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(6, 4, &eps as *const f32 as *const std::ffi::c_void);
+    encoder.set_bytes(7, 4, &w_stride as *const u32 as *const std::ffi::c_void);
+    encoder.dispatch_thread_groups(grid, tg);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

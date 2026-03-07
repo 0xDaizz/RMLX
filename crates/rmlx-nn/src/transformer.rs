@@ -1767,6 +1767,272 @@ impl TransformerBlock {
         ))
     }
 
+    /// Fused 7-dispatch forward using kernel fusion (Phase 10).
+    ///
+    /// Replaces the 9-dispatch path by fusing:
+    /// - D1+D2 → fused_rms_gemv (rms_norm + QKV GEMV)
+    /// - D6+D7 → fused_rms_gemv (rms_norm + gate_up GEMV)
+    /// - D8+D9 → fused_swiglu_down (SwiGLU + down_proj GEMV + residual)
+    ///
+    /// Falls back to 9-dispatch if any fused PSO is unavailable.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_cached_fused_7dispatch(
+        &self,
+        x: &Array,
+        cos_freqs: Option<&Array>,
+        sin_freqs: Option<&Array>,
+        cache: &mut LayerKvCache,
+        cached: &CachedDecode,
+        cb: &metal::CommandBufferRef,
+    ) -> Result<Array, KernelError> {
+        // Check fused PSOs available — fallback to 9-dispatch if not
+        let (rms_gemv_qkv_pso, rms_gemv_gate_up_pso, swiglu_down_pso) = match (
+            &cached.fused_rms_gemv_qkv_pso,
+            &cached.fused_rms_gemv_gate_up_pso,
+            &cached.fused_swiglu_down_pso,
+        ) {
+            (Some(a), Some(b), Some(c)) => (a, b, c),
+            _ => {
+                return self
+                    .forward_cached_1encoder_9dispatch(x, cos_freqs, sin_freqs, cache, cached, cb)
+            }
+        };
+
+        let hidden_size = cached.hidden_size;
+        let num_heads = cached.num_heads;
+        let num_kv_heads = cached.num_kv_heads;
+        let head_dim = cached.head_dim;
+        let elem_size = cached.dtype.size_of();
+
+        // Get weights (same as 9-dispatch)
+        let norm1_w = self.norm1_weight.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape("forward_cached: norm1_weight not loaded".into())
+        })?;
+        let norm2_w = self.norm2_weight.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape("forward_cached: norm2_weight not loaded".into())
+        })?;
+        let qkv_weight = self.attention.qkv_merged_weight().ok_or_else(|| {
+            KernelError::InvalidShape("forward_cached: qkv_merged_weight not loaded".into())
+        })?;
+        let o_weight = self.attention.o_proj_weight().ok_or_else(|| {
+            KernelError::InvalidShape("forward_cached: o_proj weight not loaded".into())
+        })?;
+        let (gate_up_w, down_w) = match &self.ffn {
+            FeedForward::Gated {
+                gate_up_merged_weight,
+                down_proj,
+                ..
+            } => {
+                let guw = gate_up_merged_weight.as_ref().ok_or_else(|| {
+                    KernelError::InvalidShape(
+                        "forward_cached: gate_up_merged_weight not loaded".into(),
+                    )
+                })?;
+                let dw = down_proj.weight().ok_or_else(|| {
+                    KernelError::InvalidShape("forward_cached: down_proj weight not loaded".into())
+                })?;
+                (guw, dw)
+            }
+            _ => {
+                return Err(KernelError::InvalidShape(
+                    "forward_cached only supports Gated FFN".into(),
+                ))
+            }
+        };
+
+        let encoder = cb.new_compute_command_encoder();
+
+        // D1: fused_rms_gemv(x, norm1_w, qkv_w) → qkv_buf
+        // Replaces D1 (rms_norm) + D2 (gemv QKV) from 9-dispatch
+        ops::fused::fused_rms_gemv_preresolved_into_encoder(
+            rms_gemv_qkv_pso,
+            x.metal_buffer(),
+            x.offset() as u64,
+            norm1_w.metal_buffer(),
+            norm1_w.offset() as u64,
+            qkv_weight.metal_buffer(),
+            qkv_weight.offset() as u64,
+            &cached.qkv_buf,
+            0,
+            cached.gemv_qkv_m,
+            cached.gemv_qkv_k,
+            cached.rms_norm_eps,
+            cached.norm1_w_stride,
+            cached.fused_rms_gemv_qkv_grid,
+            cached.fused_rms_gemv_qkv_tg,
+            encoder,
+        );
+
+        // D2: rope → rope_buf
+        let q_dim = num_heads * head_dim;
+        let k_dim = num_kv_heads * head_dim;
+        let total_rope_heads = num_heads + num_kv_heads;
+        let rope_offset = cache.seq_len as u32;
+
+        let (qk_buf_ref, qk_offset, v_buf_ref, v_offset): (
+            &metal::BufferRef,
+            u64,
+            &metal::BufferRef,
+            u64,
+        );
+
+        if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
+            encoder.memory_barrier_with_resources(&[buf_as_resource(&cached.qkv_buf)]);
+            ops::rope::rope_ext_preresolved_into_encoder(
+                &cached.rope_pso,
+                &cached.qkv_buf,
+                0,
+                cos.metal_buffer(),
+                cos.offset() as u64,
+                sin.metal_buffer(),
+                sin.offset() as u64,
+                &cached.rope_buf,
+                0,
+                1,
+                head_dim as u32,
+                rope_offset,
+                1.0,
+                0,
+                1,
+                total_rope_heads as u64,
+                encoder,
+            );
+            qk_buf_ref = &cached.rope_buf;
+            qk_offset = 0;
+            v_buf_ref = &cached.qkv_buf;
+            v_offset = ((q_dim + k_dim) * elem_size) as u64;
+        } else {
+            qk_buf_ref = &cached.qkv_buf;
+            qk_offset = 0;
+            v_buf_ref = &cached.qkv_buf;
+            v_offset = ((q_dim + k_dim) * elem_size) as u64;
+        }
+
+        encoder.memory_barrier_with_resources(&[buf_as_resource(qk_buf_ref)]);
+
+        // KV cache append
+        let k_roped_flat_offset = qk_offset + (q_dim * elem_size) as u64;
+        cache.append_direct_into_encoder(
+            qk_buf_ref,
+            k_roped_flat_offset,
+            v_buf_ref,
+            v_offset,
+            1,
+            &cached.copy_pso,
+            cached.copy_max_tg,
+            encoder,
+        )?;
+
+        // Memory barrier on KV slab buffers
+        let k_slab = cache.keys_slab_view().ok_or_else(|| {
+            KernelError::InvalidShape("forward_cached: no keys slab after append".into())
+        })?;
+        let v_slab = cache.values_slab_view().ok_or_else(|| {
+            KernelError::InvalidShape("forward_cached: no values slab after append".into())
+        })?;
+        encoder.memory_barrier_with_resources(&[
+            buf_as_resource(k_slab.metal_buffer()),
+            buf_as_resource(v_slab.metal_buffer()),
+        ]);
+
+        let seq_len = cache.seq_len;
+        let max_seq = cache.max_seq_len();
+
+        // D3: SDPA decode → attn_out_buf
+        ops::sdpa::sdpa_decode_preresolved_into_encoder(
+            &cached.sdpa_pso,
+            qk_buf_ref,
+            qk_offset,
+            k_slab.metal_buffer(),
+            k_slab.offset() as u64,
+            v_slab.metal_buffer(),
+            v_slab.offset() as u64,
+            &cached.attn_out_buf,
+            0,
+            &cached.dummy_mask_buf,
+            0,
+            num_heads as u32,
+            num_kv_heads as u32,
+            seq_len as u32,
+            head_dim as u32,
+            0,
+            max_seq as u32,
+            cached.scale,
+            encoder,
+        );
+        encoder.memory_barrier_with_resources(&[buf_as_resource(&cached.attn_out_buf)]);
+
+        // D4: gemv_bias(W_o, attn, x) → h_buf (O_proj + residual add)
+        ops::gemv::gemv_bias_preresolved_into_encoder(
+            &cached.gemv_bias_oproj_pso,
+            o_weight.metal_buffer(),
+            o_weight.offset() as u64,
+            &cached.attn_out_buf,
+            0,
+            &cached.h_buf,
+            0,
+            cached.gemv_bias_oproj_m,
+            cached.gemv_bias_oproj_k,
+            x.metal_buffer(),
+            x.offset() as u64,
+            cached.gemv_bias_oproj_grid,
+            cached.gemv_bias_oproj_tg,
+            encoder,
+        );
+        encoder.memory_barrier_with_resources(&[buf_as_resource(&cached.h_buf)]);
+
+        // D5: fused_rms_gemv(h, norm2_w, gate_up_w) → gate_up_buf
+        // Replaces D6 (rms_norm) + D7 (gemv gate_up) from 9-dispatch
+        ops::fused::fused_rms_gemv_preresolved_into_encoder(
+            rms_gemv_gate_up_pso,
+            &cached.h_buf,
+            0,
+            norm2_w.metal_buffer(),
+            norm2_w.offset() as u64,
+            gate_up_w.metal_buffer(),
+            gate_up_w.offset() as u64,
+            &cached.gate_up_buf,
+            0,
+            cached.gemv_gate_up_m,
+            cached.gemv_gate_up_k,
+            cached.rms_norm_eps,
+            cached.norm2_w_stride,
+            cached.fused_rms_gemv_gate_up_grid,
+            cached.fused_rms_gemv_gate_up_tg,
+            encoder,
+        );
+        encoder.memory_barrier_with_resources(&[buf_as_resource(&cached.gate_up_buf)]);
+
+        // D6: fused_swiglu_down(down_w, gate_up, h) → out_buf
+        // Replaces D8 (silu_mul) + D9 (gemv_bias down) from 9-dispatch
+        ops::fused::fused_swiglu_down_preresolved_into_encoder(
+            swiglu_down_pso,
+            down_w.metal_buffer(),
+            down_w.offset() as u64,
+            &cached.gate_up_buf,
+            0,
+            &cached.out_buf,
+            0,
+            cached.gemv_bias_down_m,
+            cached.gemv_bias_down_k,
+            &cached.h_buf,
+            0,
+            cached.fused_swiglu_down_grid,
+            cached.fused_swiglu_down_tg,
+            encoder,
+        );
+
+        encoder.end_encoding();
+
+        Ok(Array::new(
+            cached.out_buf.clone(),
+            vec![1, hidden_size],
+            vec![hidden_size, 1],
+            cached.dtype,
+            0,
+        ))
+    }
+
     /// 9-dispatch forward using concurrent encoders for better GPU scheduling.
     #[allow(clippy::too_many_arguments)]
     pub fn forward_concurrent_9dispatch(
@@ -2073,6 +2339,19 @@ pub struct CachedDecode {
     pub rms2_tg_size: u64,
     /// Pre-computed copy threadgroup size: min(max_threads, count)
     pub copy_max_tg: u64,
+
+    // --- Fused PSOs (Phase 10) ---
+    pub fused_rms_gemv_qkv_pso: Option<metal::ComputePipelineState>,
+    pub fused_rms_gemv_gate_up_pso: Option<metal::ComputePipelineState>,
+    pub fused_swiglu_down_pso: Option<metal::ComputePipelineState>,
+
+    // --- Fused dispatch geometries ---
+    pub fused_rms_gemv_qkv_grid: metal::MTLSize,
+    pub fused_rms_gemv_qkv_tg: metal::MTLSize,
+    pub fused_rms_gemv_gate_up_grid: metal::MTLSize,
+    pub fused_rms_gemv_gate_up_tg: metal::MTLSize,
+    pub fused_swiglu_down_grid: metal::MTLSize,
+    pub fused_swiglu_down_tg: metal::MTLSize,
 }
 
 impl CachedDecode {
@@ -2210,6 +2489,39 @@ impl CachedDecode {
 
         let silu_elems_per_thread = ops::fused::silu_gate_elems_per_thread(dtype);
 
+        // --- Fused PSOs (Phase 10) ---
+        let fused_rms_gemv_qkv_pso = {
+            let kname = ops::fused::fused_rms_gemv_kernel_name(dtype, qkv_dim as u32);
+            kname
+                .ok()
+                .and_then(|k| registry.get_pipeline(k, dtype).ok())
+        };
+        let fused_rms_gemv_gate_up_pso = {
+            let kname = ops::fused::fused_rms_gemv_kernel_name(dtype, gate_up_total as u32);
+            kname
+                .ok()
+                .and_then(|k| registry.get_pipeline(k, dtype).ok())
+        };
+        let fused_swiglu_down_pso = {
+            let kname = ops::fused::fused_swiglu_down_kernel_name(dtype, hidden_size as u32);
+            kname
+                .ok()
+                .and_then(|k| registry.get_pipeline(k, dtype).ok())
+        };
+
+        let (fused_rms_gemv_qkv_grid, fused_rms_gemv_qkv_tg) = fused_rms_gemv_qkv_pso
+            .as_ref()
+            .map(|pso| ops::fused::fused_rms_gemv_dispatch_sizes(qkv_dim as u32, pso))
+            .unwrap_or((metal::MTLSize::new(1, 1, 1), metal::MTLSize::new(1, 1, 1)));
+        let (fused_rms_gemv_gate_up_grid, fused_rms_gemv_gate_up_tg) = fused_rms_gemv_gate_up_pso
+            .as_ref()
+            .map(|pso| ops::fused::fused_rms_gemv_dispatch_sizes(gate_up_total as u32, pso))
+            .unwrap_or((metal::MTLSize::new(1, 1, 1), metal::MTLSize::new(1, 1, 1)));
+        let (fused_swiglu_down_grid, fused_swiglu_down_tg) = fused_swiglu_down_pso
+            .as_ref()
+            .map(|pso| ops::fused::fused_swiglu_down_dispatch_sizes(hidden_size as u32, pso))
+            .unwrap_or((metal::MTLSize::new(1, 1, 1), metal::MTLSize::new(1, 1, 1)));
+
         // --- Pre-allocate scratch buffers ---
         let normed_buf = dev.new_buffer(
             (hidden_size * elem_size) as u64,
@@ -2313,6 +2625,15 @@ impl CachedDecode {
             rms_tg_size,
             rms2_tg_size,
             copy_max_tg,
+            fused_rms_gemv_qkv_pso,
+            fused_rms_gemv_gate_up_pso,
+            fused_swiglu_down_pso,
+            fused_rms_gemv_qkv_grid,
+            fused_rms_gemv_qkv_tg,
+            fused_rms_gemv_gate_up_grid,
+            fused_rms_gemv_gate_up_tg,
+            fused_swiglu_down_grid,
+            fused_swiglu_down_tg,
         })
     }
 }
