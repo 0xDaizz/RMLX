@@ -333,23 +333,26 @@ kernel void gemv_bm8_f32(
 
     float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-    // Double-buffered: process 2×float4 per iteration for latency hiding
-    uint k8 = as_uniform(K / 8);
-    for (uint i = simd_lane_id; i < k8; i += SIMD_SIZE) {
-        threadgroup_barrier(mem_flags::mem_none);  // sync threads for cache coherence
-        uint idx = i * 8;
+    // Quad-buffered: process 4×float4 (64 bytes) per iteration for bandwidth
+    uint k16 = as_uniform(K / 16);
+    for (uint i = simd_lane_id; i < k16; i += SIMD_SIZE) {
+        uint idx = i * 16;
         float4 v4a = *reinterpret_cast<device const float4*>(vec + idx);
         float4 v4b = *reinterpret_cast<device const float4*>(vec + idx + 4);
+        float4 v4c = *reinterpret_cast<device const float4*>(vec + idx + 8);
+        float4 v4d = *reinterpret_cast<device const float4*>(vec + idx + 12);
         #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
             device const float* row = mat + (row_base + r) * K + idx;
             float4 m4a = *reinterpret_cast<device const float4*>(row);
             float4 m4b = *reinterpret_cast<device const float4*>(row + 4);
-            acc[r] += dot(m4a, v4a) + dot(m4b, v4b);
+            float4 m4c = *reinterpret_cast<device const float4*>(row + 8);
+            float4 m4d = *reinterpret_cast<device const float4*>(row + 12);
+            acc[r] += dot(m4a, v4a) + dot(m4b, v4b) + dot(m4c, v4c) + dot(m4d, v4d);
         }
     }
-    // Handle remainder (K%8 > 0)
-    for (uint i = k8 * 8 + simd_lane_id * 4; i + 3 < K; i += SIMD_SIZE * 4) {
+    // Handle remainder (K%16 > 0) in groups of 4
+    for (uint i = k16 * 16 + simd_lane_id * 4; i + 3 < K; i += SIMD_SIZE * 4) {
         float4 v4 = *reinterpret_cast<device const float4*>(vec + i);
         #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
@@ -395,7 +398,6 @@ kernel void gemv_bm8_f16(
     // Quad-buffered f16: process 4×half4 (32 bytes) per iteration — matches f32 bandwidth
     uint k16 = as_uniform(K / 16);
     for (uint i = simd_lane_id; i < k16; i += SIMD_SIZE) {
-        threadgroup_barrier(mem_flags::mem_none);  // sync threads for cache coherence
         uint idx = i * 16;
         float4 v4a = float4(*reinterpret_cast<device const half4*>(vec + idx));
         float4 v4b = float4(*reinterpret_cast<device const half4*>(vec + idx + 4));
@@ -455,7 +457,6 @@ kernel void gemv_bm8_bf16(
     float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
 
     for (uint i = simd_lane_id; i < K; i += SIMD_SIZE) {
-        threadgroup_barrier(mem_flags::mem_none);  // sync threads for cache coherence
         float v = float(vec[i]);
         #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
@@ -693,23 +694,26 @@ kernel void gemv_bias_bm8_f32(
 
     float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-    // Double-buffered: process 2×float4 per iteration for latency hiding
-    uint k8 = as_uniform(K / 8);
-    for (uint i = simd_lane_id; i < k8; i += SIMD_SIZE) {
-        threadgroup_barrier(mem_flags::mem_none);  // sync threads for cache coherence
-        uint idx = i * 8;
+    // Quad-buffered: process 4×float4 (64 bytes) per iteration for bandwidth
+    uint k16 = as_uniform(K / 16);
+    for (uint i = simd_lane_id; i < k16; i += SIMD_SIZE) {
+        uint idx = i * 16;
         float4 v4a = *reinterpret_cast<device const float4*>(vec + idx);
         float4 v4b = *reinterpret_cast<device const float4*>(vec + idx + 4);
+        float4 v4c = *reinterpret_cast<device const float4*>(vec + idx + 8);
+        float4 v4d = *reinterpret_cast<device const float4*>(vec + idx + 12);
         #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
             device const float* row = mat + (row_base + r) * K + idx;
             float4 m4a = *reinterpret_cast<device const float4*>(row);
             float4 m4b = *reinterpret_cast<device const float4*>(row + 4);
-            acc[r] += dot(m4a, v4a) + dot(m4b, v4b);
+            float4 m4c = *reinterpret_cast<device const float4*>(row + 8);
+            float4 m4d = *reinterpret_cast<device const float4*>(row + 12);
+            acc[r] += dot(m4a, v4a) + dot(m4b, v4b) + dot(m4c, v4c) + dot(m4d, v4d);
         }
     }
-    // Handle remainder (K%8 > 0)
-    for (uint i = k8 * 8 + simd_lane_id * 4; i + 3 < K; i += SIMD_SIZE * 4) {
+    // Handle remainder (K%16 > 0) in groups of 4
+    for (uint i = k16 * 16 + simd_lane_id * 4; i + 3 < K; i += SIMD_SIZE * 4) {
         float4 v4 = *reinterpret_cast<device const float4*>(vec + i);
         #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
@@ -755,7 +759,6 @@ kernel void gemv_bias_bm8_f16(
     // Quad-buffered f16: process 4×half4 (32 bytes) per iteration — matches f32 bandwidth
     uint k16 = as_uniform(K / 16);
     for (uint i = simd_lane_id; i < k16; i += SIMD_SIZE) {
-        threadgroup_barrier(mem_flags::mem_none);  // sync threads for cache coherence
         uint idx = i * 16;
         float4 v4a = float4(*reinterpret_cast<device const half4*>(vec + idx));
         float4 v4b = float4(*reinterpret_cast<device const half4*>(vec + idx + 4));
@@ -816,7 +819,6 @@ kernel void gemv_bias_bm8_bf16(
     float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
 
     for (uint i = simd_lane_id; i < K; i += SIMD_SIZE) {
-        threadgroup_barrier(mem_flags::mem_none);  // sync threads for cache coherence
         float v = float(vec[i]);
         #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
@@ -1822,6 +1824,122 @@ pub fn gemv_t_into_cb(
 pub fn gemv_constants(use_bias: bool) -> Vec<(u32, crate::kernels::FunctionConstantValue)> {
     use crate::kernels::FunctionConstantValue;
     vec![(200, FunctionConstantValue::Bool(use_bias))]
+}
+
+// ---------------------------------------------------------------------------
+// Pre-resolved (zero-overhead) encoder helpers
+// ---------------------------------------------------------------------------
+
+/// Encode GEMV using a pre-resolved PSO and pre-allocated output buffer.
+/// Skips all validation and allocation — caller must ensure correctness.
+/// mat: [M, K], vec: [K] → writes into out_buf at out_offset
+#[allow(clippy::too_many_arguments)]
+pub fn gemv_preresolved_into_encoder(
+    pso: &metal::ComputePipelineState,
+    mat_buf: &metal::BufferRef,
+    mat_offset: u64,
+    vec_buf: &metal::BufferRef,
+    vec_offset: u64,
+    out_buf: &metal::BufferRef,
+    out_offset: u64,
+    m: u32,
+    k: u32,
+    grid: metal::MTLSize,
+    tg: metal::MTLSize,
+    encoder: &metal::ComputeCommandEncoderRef,
+) {
+    encoder.set_compute_pipeline_state(pso);
+    encoder.set_buffer(0, Some(mat_buf), mat_offset);
+    encoder.set_buffer(1, Some(vec_buf), vec_offset);
+    encoder.set_buffer(2, Some(out_buf), out_offset);
+    encoder.set_bytes(3, 4, &m as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(4, 4, &k as *const u32 as *const std::ffi::c_void);
+    encoder.dispatch_thread_groups(grid, tg);
+}
+
+/// Encode GEMV+bias using a pre-resolved PSO and pre-allocated output buffer.
+#[allow(clippy::too_many_arguments)]
+pub fn gemv_bias_preresolved_into_encoder(
+    pso: &metal::ComputePipelineState,
+    mat_buf: &metal::BufferRef,
+    mat_offset: u64,
+    vec_buf: &metal::BufferRef,
+    vec_offset: u64,
+    out_buf: &metal::BufferRef,
+    out_offset: u64,
+    m: u32,
+    k: u32,
+    bias_buf: &metal::BufferRef,
+    bias_offset: u64,
+    grid: metal::MTLSize,
+    tg: metal::MTLSize,
+    encoder: &metal::ComputeCommandEncoderRef,
+) {
+    encoder.set_compute_pipeline_state(pso);
+    encoder.set_buffer(0, Some(mat_buf), mat_offset);
+    encoder.set_buffer(1, Some(vec_buf), vec_offset);
+    encoder.set_buffer(2, Some(out_buf), out_offset);
+    encoder.set_bytes(3, 4, &m as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(4, 4, &k as *const u32 as *const std::ffi::c_void);
+    encoder.set_buffer(5, Some(bias_buf), bias_offset);
+    encoder.dispatch_thread_groups(grid, tg);
+}
+
+/// Compute dispatch grid and threadgroup sizes for GEMV with given M.
+pub fn gemv_dispatch_sizes(
+    m: u32,
+    pso: &metal::ComputePipelineState,
+) -> (metal::MTLSize, metal::MTLSize) {
+    let use_bm8 = (m as u64) >= BM8_THRESHOLD;
+    let num_threadgroups = if use_bm8 {
+        ceil_div(m as u64, BM8_ROWS)
+    } else {
+        ceil_div(m as u64, TM)
+    };
+    let tg_dim = if use_bm8 {
+        MTLSize::new(32, 1, BM8)
+    } else {
+        let tg_size = std::cmp::min(
+            GEMV_THREADGROUP_SIZE,
+            pso.max_total_threads_per_threadgroup(),
+        );
+        MTLSize::new(tg_size, 1, 1)
+    };
+    (MTLSize::new(num_threadgroups, 1, 1), tg_dim)
+}
+
+/// Get the GEMV kernel name for a given dtype and M dimension.
+pub fn gemv_kernel_name(dtype: DType, m: u32) -> Result<&'static str, KernelError> {
+    let use_bm8 = (m as u64) >= BM8_THRESHOLD;
+    match (dtype, use_bm8) {
+        (DType::Float32, true) => Ok("gemv_bm8_f32"),
+        (DType::Float32, false) => Ok("gemv_f32"),
+        (DType::Float16, true) => Ok("gemv_bm8_f16"),
+        (DType::Float16, false) => Ok("gemv_f16"),
+        (DType::Bfloat16, true) => Ok("gemv_bm8_bf16"),
+        (DType::Bfloat16, false) => Ok("gemv_bf16"),
+        _ => Err(KernelError::NotFound(format!(
+            "gemv not supported for {:?}",
+            dtype
+        ))),
+    }
+}
+
+/// Get the GEMV+bias kernel name for a given dtype and M dimension.
+pub fn gemv_bias_kernel_name(dtype: DType, m: u32) -> Result<&'static str, KernelError> {
+    let use_bm8 = (m as u64) >= BM8_THRESHOLD;
+    match (dtype, use_bm8) {
+        (DType::Float32, true) => Ok("gemv_bias_bm8_f32"),
+        (DType::Float32, false) => Ok("gemv_bias_f32"),
+        (DType::Float16, true) => Ok("gemv_bias_bm8_f16"),
+        (DType::Float16, false) => Ok("gemv_bias_f16"),
+        (DType::Bfloat16, true) => Ok("gemv_bias_bm8_bf16"),
+        (DType::Bfloat16, false) => Ok("gemv_bias_bf16"),
+        _ => Err(KernelError::NotFound(format!(
+            "gemv_bias not supported for {:?}",
+            dtype
+        ))),
+    }
 }
 
 #[cfg(test)]

@@ -1038,6 +1038,48 @@ pub fn rms_norm_into_encoder(
 }
 
 // ---------------------------------------------------------------------------
+// Pre-resolved (zero-overhead) encoder helpers
+// ---------------------------------------------------------------------------
+
+/// Encode RMS norm using a pre-resolved PSO and pre-allocated output buffer.
+/// Skips all validation — caller must ensure correctness.
+#[allow(clippy::too_many_arguments)]
+pub fn rms_norm_preresolved_into_encoder(
+    pso: &metal::ComputePipelineState,
+    input_buf: &metal::BufferRef,
+    input_offset: u64,
+    weight_buf: &metal::BufferRef,
+    weight_offset: u64,
+    out_buf: &metal::BufferRef,
+    out_offset: u64,
+    axis_size: u32,
+    eps: f32,
+    w_stride: u32,
+    has_w: u32,
+    rows: u64,
+    encoder: &metal::ComputeCommandEncoderRef,
+) {
+    encoder.set_compute_pipeline_state(pso);
+    encoder.set_buffer(0, Some(input_buf), input_offset);
+    encoder.set_buffer(1, Some(weight_buf), weight_offset);
+    encoder.set_buffer(2, Some(out_buf), out_offset);
+    encoder.set_bytes(3, 4, &axis_size as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(4, 4, &eps as *const f32 as *const std::ffi::c_void);
+    encoder.set_bytes(5, 4, &w_stride as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(6, 4, &has_w as *const u32 as *const std::ffi::c_void);
+    let tg_size = std::cmp::min(1024, pso.max_total_threads_per_threadgroup());
+    encoder.dispatch_thread_groups(MTLSize::new(rows, 1, 1), MTLSize::new(tg_size, 1, 1));
+}
+
+/// Get the RMS norm kernel name for a given dtype and axis_size.
+pub fn rms_norm_kernel_name_for(
+    dtype: DType,
+    axis_size: usize,
+) -> Result<&'static str, KernelError> {
+    rms_kernel_name(dtype, axis_size)
+}
+
+// ---------------------------------------------------------------------------
 // Fused RMSNorm + residual add
 // ---------------------------------------------------------------------------
 

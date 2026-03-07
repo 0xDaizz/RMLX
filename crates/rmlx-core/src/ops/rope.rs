@@ -910,3 +910,55 @@ pub fn rope_ext_into_encoder(
 
     Ok(out)
 }
+
+// ---------------------------------------------------------------------------
+// Pre-resolved (zero-overhead) encoder helpers
+// ---------------------------------------------------------------------------
+
+/// Encode RoPE using a pre-resolved PSO and pre-allocated output buffer.
+/// Skips all validation — caller must ensure correctness.
+#[allow(clippy::too_many_arguments)]
+pub fn rope_ext_preresolved_into_encoder(
+    pso: &metal::ComputePipelineState,
+    input_buf: &metal::BufferRef,
+    input_offset: u64,
+    cos_buf: &metal::BufferRef,
+    cos_offset: u64,
+    sin_buf: &metal::BufferRef,
+    sin_offset: u64,
+    out_buf: &metal::BufferRef,
+    out_offset: u64,
+    seq_len: u32,
+    head_dim: u32,
+    offset: u32,
+    scale: f32,
+    traditional: u32,
+    forward: u32,
+    n_batch: u64,
+    encoder: &metal::ComputeCommandEncoderRef,
+) {
+    let half_dim = head_dim / 2;
+    encoder.set_compute_pipeline_state(pso);
+    encoder.set_buffer(0, Some(input_buf), input_offset);
+    encoder.set_buffer(1, Some(cos_buf), cos_offset);
+    encoder.set_buffer(2, Some(sin_buf), sin_offset);
+    encoder.set_buffer(3, Some(out_buf), out_offset);
+    encoder.set_bytes(4, 4, &seq_len as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(5, 4, &head_dim as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(6, 4, &offset as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(7, 4, &scale as *const f32 as *const std::ffi::c_void);
+    encoder.set_bytes(8, 4, &traditional as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(9, 4, &forward as *const u32 as *const std::ffi::c_void);
+    let grid = metal::MTLSize::new(half_dim as u64, seq_len as u64, n_batch);
+    let tg = metal::MTLSize::new(
+        std::cmp::min(64, half_dim as u64),
+        std::cmp::min(16, seq_len as u64),
+        1,
+    );
+    encoder.dispatch_threads(grid, tg);
+}
+
+/// Get the table-based RoPE kernel name for a dtype.
+pub fn rope_table_kernel_name(dtype: DType) -> Result<&'static str, KernelError> {
+    kernel_name_table(dtype)
+}
