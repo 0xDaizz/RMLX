@@ -11,8 +11,8 @@
 //! - `gemv_t_f32` / `gemv_t_f16` / `gemv_t_bf16` -- transposed: y = A^T @ x
 //! - Fused bias variants: `gemv_bias_f32`, `gemv_bias_f16`, `gemv_bias_bf16`
 //! - Fused bias BM=8 variants: `gemv_bias_bm8_f32`, `gemv_bias_bm8_f16`, `gemv_bias_bm8_bf16`
-//! - Column-major BM=8 variants: `gemv_bm8_f32_col`, `gemv_bm8_f16_col`, `gemv_bm8_bf16_col`
-//! - Column-major fused bias BM=8: `gemv_bias_bm8_f32_col`, `gemv_bias_bm8_f16_col`, `gemv_bias_bm8_bf16_col`
+//! - Interleaved [M/TM, K, TM] BM=8 variants: `gemv_bm8_f32_interleaved`, `gemv_bm8_f16_interleaved`, `gemv_bm8_bf16_interleaved`
+//! - Interleaved fused bias BM=8: `gemv_bias_bm8_f32_interleaved`, `gemv_bias_bm8_f16_interleaved`, `gemv_bias_bm8_bf16_interleaved`
 
 use crate::array::Array;
 use crate::dtype::DType;
@@ -838,13 +838,13 @@ kernel void gemv_bias_bm8_bf16(
 }
 
 // ===========================================================================
-// Column-major BM=8 variants:  y = A_col * x
-// A stored column-major [K, M] (i.e. TM=4 rows contiguous per k position)
-// Same buffer layout (0=mat, 1=vec, 2=output, 3=M, 4=K)
+// Interleaved [M/TM, K, TM] BM=8 variants:  y = A_interleaved * x
+// Weight matrix stored as mat[group * K * TM + k * TM + r] where group = row_base / TM
+// 16 consecutive k-values x TM=4 rows = 64 halfs = 128 bytes = 1 GPU cache line
 // ===========================================================================
 
-kernel void gemv_bm8_f16_col(
-    device const half*  mat    [[buffer(0)]],
+kernel void gemv_bm8_f16_interleaved(
+    device const half*  mat    [[buffer(0)]],  // [M/TM, K, TM] interleaved layout
     device const half*  vec    [[buffer(1)]],
     device       half*  output [[buffer(2)]],
     constant     uint&  M      [[buffer(3)]],
@@ -855,12 +855,14 @@ kernel void gemv_bm8_f16_col(
 {
     uint row_base = tg_id * (BM8 * TM) + simd_group_id * TM;
     if (row_base >= M) return;
-    row_base = (row_base + TM <= M) ? row_base : M - TM;
+    if (row_base + TM > M) row_base = (M / TM - 1) * TM;
 
     float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-    // Col-major: mat is [K, M] row-major = [M, K] col-major
-    // For each k, TM=4 rows are contiguous: half4 at mat + k*M + row_base
+    // tile_base points to this group's interleaved tile
+    device const half* tile_base = mat + (row_base / TM) * K * TM;
+
+    // Quad-buffered: process 16 k-values per iteration
     uint k16 = as_uniform(K / 16);
     for (uint i = simd_lane_id; i < k16; i += SIMD_SIZE) {
         uint idx = i * 16;
@@ -869,13 +871,17 @@ kernel void gemv_bm8_f16_col(
         float4 v4c = float4(*reinterpret_cast<device const half4*>(vec + idx + 8));
         float4 v4d = float4(*reinterpret_cast<device const half4*>(vec + idx + 12));
 
+        // 16 k-values x TM=4 rows = 64 halfs = 128 bytes contiguous
+        device const half* chunk = tile_base + idx * TM;
+
         #pragma clang loop unroll(full)
         for (uint sub = 0; sub < 4; sub++) {
-            uint k_base = idx + sub * 4;
-            half4 c0 = *reinterpret_cast<device const half4*>(mat + k_base * M + row_base);
-            half4 c1 = *reinterpret_cast<device const half4*>(mat + (k_base+1) * M + row_base);
-            half4 c2 = *reinterpret_cast<device const half4*>(mat + (k_base+2) * M + row_base);
-            half4 c3 = *reinterpret_cast<device const half4*>(mat + (k_base+3) * M + row_base);
+            device const half* p = chunk + sub * 4 * TM;
+            // Each half4 load gives [row0, row1, row2, row3] at one k-position
+            half4 c0 = *reinterpret_cast<device const half4*>(p);
+            half4 c1 = *reinterpret_cast<device const half4*>(p + TM);
+            half4 c2 = *reinterpret_cast<device const half4*>(p + 2 * TM);
+            half4 c3 = *reinterpret_cast<device const half4*>(p + 3 * TM);
             float4 v4 = (sub == 0) ? v4a : (sub == 1) ? v4b : (sub == 2) ? v4c : v4d;
             acc[0] += float(c0[0]) * v4[0] + float(c1[0]) * v4[1] + float(c2[0]) * v4[2] + float(c3[0]) * v4[3];
             acc[1] += float(c0[1]) * v4[0] + float(c1[1]) * v4[1] + float(c2[1]) * v4[2] + float(c3[1]) * v4[3];
@@ -886,10 +892,11 @@ kernel void gemv_bm8_f16_col(
     // Remainder in groups of 4
     for (uint i = k16 * 16 + simd_lane_id * 4; i + 3 < K; i += SIMD_SIZE * 4) {
         float4 v4 = float4(*reinterpret_cast<device const half4*>(vec + i));
-        half4 c0 = *reinterpret_cast<device const half4*>(mat + i * M + row_base);
-        half4 c1 = *reinterpret_cast<device const half4*>(mat + (i+1) * M + row_base);
-        half4 c2 = *reinterpret_cast<device const half4*>(mat + (i+2) * M + row_base);
-        half4 c3 = *reinterpret_cast<device const half4*>(mat + (i+3) * M + row_base);
+        device const half* chunk = tile_base + i * TM;
+        half4 c0 = *reinterpret_cast<device const half4*>(chunk);
+        half4 c1 = *reinterpret_cast<device const half4*>(chunk + TM);
+        half4 c2 = *reinterpret_cast<device const half4*>(chunk + 2 * TM);
+        half4 c3 = *reinterpret_cast<device const half4*>(chunk + 3 * TM);
         acc[0] += float(c0[0]) * v4[0] + float(c1[0]) * v4[1] + float(c2[0]) * v4[2] + float(c3[0]) * v4[3];
         acc[1] += float(c0[1]) * v4[0] + float(c1[1]) * v4[1] + float(c2[1]) * v4[2] + float(c3[1]) * v4[3];
         acc[2] += float(c0[2]) * v4[0] + float(c1[2]) * v4[1] + float(c2[2]) * v4[2] + float(c3[2]) * v4[3];
@@ -898,11 +905,11 @@ kernel void gemv_bm8_f16_col(
     // Scalar remainder
     for (uint i = (K / 4) * 4 + simd_lane_id; i < K; i += SIMD_SIZE) {
         float v = float(vec[i]);
-        half4 c = *reinterpret_cast<device const half4*>(mat + i * M + row_base);
-        acc[0] += float(c[0]) * v;
-        acc[1] += float(c[1]) * v;
-        acc[2] += float(c[2]) * v;
-        acc[3] += float(c[3]) * v;
+        device const half* p = tile_base + i * TM;
+        acc[0] += float(p[0]) * v;
+        acc[1] += float(p[1]) * v;
+        acc[2] += float(p[2]) * v;
+        acc[3] += float(p[3]) * v;
     }
 
     #pragma clang loop unroll(full)
@@ -914,8 +921,8 @@ kernel void gemv_bm8_f16_col(
     }
 }
 
-kernel void gemv_bm8_f32_col(
-    device const float* mat  [[buffer(0)]],
+kernel void gemv_bm8_f32_interleaved(
+    device const float* mat  [[buffer(0)]],  // [M/TM, K, TM] interleaved layout
     device const float* vec  [[buffer(1)]],
     device       float* output [[buffer(2)]],
     constant     uint&  M    [[buffer(3)]],
@@ -926,14 +933,17 @@ kernel void gemv_bm8_f32_col(
 {
     uint row_base = tg_id * (BM8 * TM) + simd_group_id * TM;
     if (row_base >= M) return;
-    row_base = (row_base + TM <= M) ? row_base : M - TM;
+    if (row_base + TM > M) row_base = (M / TM - 1) * TM;
 
     float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-    // Col-major: TM=4 floats contiguous per k position
+    // tile_base points to this group's interleaved tile
+    device const float* tile_base = mat + (row_base / TM) * K * TM;
+
+    // Interleaved f32: each k-position has TM=4 floats contiguous (float4 load)
     for (uint i = simd_lane_id; i < K; i += SIMD_SIZE) {
         float v = vec[i];
-        float4 c = *reinterpret_cast<device const float4*>(mat + i * M + row_base);
+        float4 c = *reinterpret_cast<device const float4*>(tile_base + i * TM);
         acc[0] += c[0] * v;
         acc[1] += c[1] * v;
         acc[2] += c[2] * v;
@@ -949,8 +959,8 @@ kernel void gemv_bm8_f32_col(
     }
 }
 
-kernel void gemv_bm8_bf16_col(
-    device const bfloat*  mat    [[buffer(0)]],
+kernel void gemv_bm8_bf16_interleaved(
+    device const bfloat*  mat    [[buffer(0)]],  // [M/TM, K, TM] interleaved layout
     device const bfloat*  vec    [[buffer(1)]],
     device       bfloat*  output [[buffer(2)]],
     constant     uint&    M      [[buffer(3)]],
@@ -961,16 +971,20 @@ kernel void gemv_bm8_bf16_col(
 {
     uint row_base = tg_id * (BM8 * TM) + simd_group_id * TM;
     if (row_base >= M) return;
-    row_base = (row_base + TM <= M) ? row_base : M - TM;
+    if (row_base + TM > M) row_base = (M / TM - 1) * TM;
 
     float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-    // Col-major scalar: bf16 doesn't support vector loads
+    // tile_base points to this group's interleaved tile
+    device const bfloat* tile_base = mat + (row_base / TM) * K * TM;
+
+    // bf16 scalar: process per-element with interleaved addressing
     for (uint i = simd_lane_id; i < K; i += SIMD_SIZE) {
         float v = float(vec[i]);
+        device const bfloat* p = tile_base + i * TM;
         #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
-            acc[r] += float(mat[i * M + row_base + r]) * v;
+            acc[r] += float(p[r]) * v;
         }
     }
 
@@ -984,11 +998,11 @@ kernel void gemv_bm8_bf16_col(
 }
 
 // ===========================================================================
-// Column-major fused bias BM=8 variants:  y = A_col * x + bias
+// Interleaved [M/TM, K, TM] fused bias BM=8 variants:  y = A_interleaved * x + bias
 // ===========================================================================
 
-kernel void gemv_bias_bm8_f16_col(
-    device const half*  mat    [[buffer(0)]],
+kernel void gemv_bias_bm8_f16_interleaved(
+    device const half*  mat    [[buffer(0)]],  // [M/TM, K, TM] interleaved layout
     device const half*  vec    [[buffer(1)]],
     device       half*  output [[buffer(2)]],
     constant     uint&  M      [[buffer(3)]],
@@ -1000,9 +1014,11 @@ kernel void gemv_bias_bm8_f16_col(
 {
     uint row_base = tg_id * (BM8 * TM) + simd_group_id * TM;
     if (row_base >= M) return;
-    row_base = (row_base + TM <= M) ? row_base : M - TM;
+    if (row_base + TM > M) row_base = (M / TM - 1) * TM;
 
     float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    device const half* tile_base = mat + (row_base / TM) * K * TM;
 
     uint k16 = as_uniform(K / 16);
     for (uint i = simd_lane_id; i < k16; i += SIMD_SIZE) {
@@ -1012,13 +1028,15 @@ kernel void gemv_bias_bm8_f16_col(
         float4 v4c = float4(*reinterpret_cast<device const half4*>(vec + idx + 8));
         float4 v4d = float4(*reinterpret_cast<device const half4*>(vec + idx + 12));
 
+        device const half* chunk = tile_base + idx * TM;
+
         #pragma clang loop unroll(full)
         for (uint sub = 0; sub < 4; sub++) {
-            uint k_base = idx + sub * 4;
-            half4 c0 = *reinterpret_cast<device const half4*>(mat + k_base * M + row_base);
-            half4 c1 = *reinterpret_cast<device const half4*>(mat + (k_base+1) * M + row_base);
-            half4 c2 = *reinterpret_cast<device const half4*>(mat + (k_base+2) * M + row_base);
-            half4 c3 = *reinterpret_cast<device const half4*>(mat + (k_base+3) * M + row_base);
+            device const half* p = chunk + sub * 4 * TM;
+            half4 c0 = *reinterpret_cast<device const half4*>(p);
+            half4 c1 = *reinterpret_cast<device const half4*>(p + TM);
+            half4 c2 = *reinterpret_cast<device const half4*>(p + 2 * TM);
+            half4 c3 = *reinterpret_cast<device const half4*>(p + 3 * TM);
             float4 v4 = (sub == 0) ? v4a : (sub == 1) ? v4b : (sub == 2) ? v4c : v4d;
             acc[0] += float(c0[0]) * v4[0] + float(c1[0]) * v4[1] + float(c2[0]) * v4[2] + float(c3[0]) * v4[3];
             acc[1] += float(c0[1]) * v4[0] + float(c1[1]) * v4[1] + float(c2[1]) * v4[2] + float(c3[1]) * v4[3];
@@ -1028,10 +1046,11 @@ kernel void gemv_bias_bm8_f16_col(
     }
     for (uint i = k16 * 16 + simd_lane_id * 4; i + 3 < K; i += SIMD_SIZE * 4) {
         float4 v4 = float4(*reinterpret_cast<device const half4*>(vec + i));
-        half4 c0 = *reinterpret_cast<device const half4*>(mat + i * M + row_base);
-        half4 c1 = *reinterpret_cast<device const half4*>(mat + (i+1) * M + row_base);
-        half4 c2 = *reinterpret_cast<device const half4*>(mat + (i+2) * M + row_base);
-        half4 c3 = *reinterpret_cast<device const half4*>(mat + (i+3) * M + row_base);
+        device const half* chunk = tile_base + i * TM;
+        half4 c0 = *reinterpret_cast<device const half4*>(chunk);
+        half4 c1 = *reinterpret_cast<device const half4*>(chunk + TM);
+        half4 c2 = *reinterpret_cast<device const half4*>(chunk + 2 * TM);
+        half4 c3 = *reinterpret_cast<device const half4*>(chunk + 3 * TM);
         acc[0] += float(c0[0]) * v4[0] + float(c1[0]) * v4[1] + float(c2[0]) * v4[2] + float(c3[0]) * v4[3];
         acc[1] += float(c0[1]) * v4[0] + float(c1[1]) * v4[1] + float(c2[1]) * v4[2] + float(c3[1]) * v4[3];
         acc[2] += float(c0[2]) * v4[0] + float(c1[2]) * v4[1] + float(c2[2]) * v4[2] + float(c3[2]) * v4[3];
@@ -1039,11 +1058,11 @@ kernel void gemv_bias_bm8_f16_col(
     }
     for (uint i = (K / 4) * 4 + simd_lane_id; i < K; i += SIMD_SIZE) {
         float v = float(vec[i]);
-        half4 c = *reinterpret_cast<device const half4*>(mat + i * M + row_base);
-        acc[0] += float(c[0]) * v;
-        acc[1] += float(c[1]) * v;
-        acc[2] += float(c[2]) * v;
-        acc[3] += float(c[3]) * v;
+        device const half* p = tile_base + i * TM;
+        acc[0] += float(p[0]) * v;
+        acc[1] += float(p[1]) * v;
+        acc[2] += float(p[2]) * v;
+        acc[3] += float(p[3]) * v;
     }
 
     #pragma clang loop unroll(full)
@@ -1055,8 +1074,8 @@ kernel void gemv_bias_bm8_f16_col(
     }
 }
 
-kernel void gemv_bias_bm8_f32_col(
-    device const float* mat    [[buffer(0)]],
+kernel void gemv_bias_bm8_f32_interleaved(
+    device const float* mat    [[buffer(0)]],  // [M/TM, K, TM] interleaved layout
     device const float* vec    [[buffer(1)]],
     device       float* output [[buffer(2)]],
     constant     uint&  M      [[buffer(3)]],
@@ -1068,13 +1087,15 @@ kernel void gemv_bias_bm8_f32_col(
 {
     uint row_base = tg_id * (BM8 * TM) + simd_group_id * TM;
     if (row_base >= M) return;
-    row_base = (row_base + TM <= M) ? row_base : M - TM;
+    if (row_base + TM > M) row_base = (M / TM - 1) * TM;
 
     float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
 
+    device const float* tile_base = mat + (row_base / TM) * K * TM;
+
     for (uint i = simd_lane_id; i < K; i += SIMD_SIZE) {
         float v = vec[i];
-        float4 c = *reinterpret_cast<device const float4*>(mat + i * M + row_base);
+        float4 c = *reinterpret_cast<device const float4*>(tile_base + i * TM);
         acc[0] += c[0] * v;
         acc[1] += c[1] * v;
         acc[2] += c[2] * v;
@@ -1090,8 +1111,8 @@ kernel void gemv_bias_bm8_f32_col(
     }
 }
 
-kernel void gemv_bias_bm8_bf16_col(
-    device const bfloat*  mat    [[buffer(0)]],
+kernel void gemv_bias_bm8_bf16_interleaved(
+    device const bfloat*  mat    [[buffer(0)]],  // [M/TM, K, TM] interleaved layout
     device const bfloat*  vec    [[buffer(1)]],
     device       bfloat*  output [[buffer(2)]],
     constant     uint&    M      [[buffer(3)]],
@@ -1103,15 +1124,18 @@ kernel void gemv_bias_bm8_bf16_col(
 {
     uint row_base = tg_id * (BM8 * TM) + simd_group_id * TM;
     if (row_base >= M) return;
-    row_base = (row_base + TM <= M) ? row_base : M - TM;
+    if (row_base + TM > M) row_base = (M / TM - 1) * TM;
 
     float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
 
+    device const bfloat* tile_base = mat + (row_base / TM) * K * TM;
+
     for (uint i = simd_lane_id; i < K; i += SIMD_SIZE) {
         float v = float(vec[i]);
+        device const bfloat* p = tile_base + i * TM;
         #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
-            acc[r] += float(mat[i * M + row_base + r]) * v;
+            acc[r] += float(p[r]) * v;
         }
     }
 
@@ -2231,39 +2255,39 @@ pub fn gemv_bias_kernel_name(dtype: DType, m: u32) -> Result<&'static str, Kerne
     }
 }
 
-/// Get the column-major GEMV kernel name (BM8 only, M >= 256).
-pub fn gemv_col_kernel_name(dtype: DType, m: u32) -> Result<&'static str, KernelError> {
+/// Get the interleaved [M/TM, K, TM] GEMV kernel name (BM8 only, M >= 256).
+pub fn gemv_interleaved_kernel_name(dtype: DType, m: u32) -> Result<&'static str, KernelError> {
     if (m as u64) < BM8_THRESHOLD {
         return Err(KernelError::NotFound(format!(
-            "gemv_col requires M >= {} (BM8), got {}",
+            "gemv_interleaved requires M >= {} (BM8), got {}",
             BM8_THRESHOLD, m
         )));
     }
     match dtype {
-        DType::Float32 => Ok("gemv_bm8_f32_col"),
-        DType::Float16 => Ok("gemv_bm8_f16_col"),
-        DType::Bfloat16 => Ok("gemv_bm8_bf16_col"),
+        DType::Float32 => Ok("gemv_bm8_f32_interleaved"),
+        DType::Float16 => Ok("gemv_bm8_f16_interleaved"),
+        DType::Bfloat16 => Ok("gemv_bm8_bf16_interleaved"),
         _ => Err(KernelError::NotFound(format!(
-            "gemv_col not supported for {:?}",
+            "gemv_interleaved not supported for {:?}",
             dtype
         ))),
     }
 }
 
-/// Get the column-major GEMV+bias kernel name (BM8 only, M >= 256).
-pub fn gemv_bias_col_kernel_name(dtype: DType, m: u32) -> Result<&'static str, KernelError> {
+/// Get the interleaved [M/TM, K, TM] GEMV+bias kernel name (BM8 only, M >= 256).
+pub fn gemv_bias_interleaved_kernel_name(dtype: DType, m: u32) -> Result<&'static str, KernelError> {
     if (m as u64) < BM8_THRESHOLD {
         return Err(KernelError::NotFound(format!(
-            "gemv_bias_col requires M >= {} (BM8), got {}",
+            "gemv_bias_interleaved requires M >= {} (BM8), got {}",
             BM8_THRESHOLD, m
         )));
     }
     match dtype {
-        DType::Float32 => Ok("gemv_bias_bm8_f32_col"),
-        DType::Float16 => Ok("gemv_bias_bm8_f16_col"),
-        DType::Bfloat16 => Ok("gemv_bias_bm8_bf16_col"),
+        DType::Float32 => Ok("gemv_bias_bm8_f32_interleaved"),
+        DType::Float16 => Ok("gemv_bias_bm8_f16_interleaved"),
+        DType::Bfloat16 => Ok("gemv_bias_bm8_bf16_interleaved"),
         _ => Err(KernelError::NotFound(format!(
-            "gemv_bias_col not supported for {:?}",
+            "gemv_bias_interleaved not supported for {:?}",
             dtype
         ))),
     }

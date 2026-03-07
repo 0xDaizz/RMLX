@@ -1844,24 +1844,30 @@ impl TransformerBlock {
         let encoder = cb.new_compute_command_encoder();
 
         // D1: fused_rms_gemv(x, norm1_w, qkv_w) → qkv_buf
-        // Replaces D1 (rms_norm) + D2 (gemv QKV) from 9-dispatch
+        // Prefer interleaved layout if available, else fall back to row-major fused
         {
+            let (d1_pso, d1_mat, d1_mat_off, d1_grid, d1_tg) =
+                if let (Some(pso), Some(w)) = (&cached.fused_rms_gemv_qkv_interleaved_pso, &cached.qkv_weight_interleaved) {
+                    (pso, w, 0u64, cached.fused_rms_gemv_qkv_interleaved_grid, cached.fused_rms_gemv_qkv_interleaved_tg)
+                } else {
+                    (rms_gemv_qkv_pso, qkv_weight.metal_buffer(), qkv_weight.offset() as u64, cached.fused_rms_gemv_qkv_grid, cached.fused_rms_gemv_qkv_tg)
+                };
             ops::fused::fused_rms_gemv_preresolved_into_encoder(
-                rms_gemv_qkv_pso,
+                d1_pso,
                 x.metal_buffer(),
                 x.offset() as u64,
                 norm1_w.metal_buffer(),
                 norm1_w.offset() as u64,
-                qkv_weight.metal_buffer(),
-                qkv_weight.offset() as u64,
+                d1_mat,
+                d1_mat_off,
                 &cached.qkv_buf,
                 0,
                 cached.gemv_qkv_m,
                 cached.gemv_qkv_k,
                 cached.rms_norm_eps,
                 cached.norm1_w_stride,
-                cached.fused_rms_gemv_qkv_grid,
-                cached.fused_rms_gemv_qkv_tg,
+                d1_grid,
+                d1_tg,
                 encoder,
             );
         }
@@ -1966,11 +1972,18 @@ impl TransformerBlock {
         encoder.memory_barrier_with_resources(&[buf_as_resource(&cached.attn_out_buf)]);
 
         // D4: gemv_bias(W_o, attn, x) → h_buf (O_proj + residual add)
+        // Prefer interleaved layout if available
         {
+            let (d4_pso, d4_mat, d4_mat_off, d4_grid, d4_tg) =
+                if let (Some(pso), Some(w)) = (&cached.gemv_bias_oproj_interleaved_pso, &cached.o_weight_interleaved) {
+                    (pso, w, 0u64, cached.gemv_bias_oproj_interleaved_grid, cached.gemv_bias_oproj_interleaved_tg)
+                } else {
+                    (&cached.gemv_bias_oproj_pso, o_weight.metal_buffer(), o_weight.offset() as u64, cached.gemv_bias_oproj_grid, cached.gemv_bias_oproj_tg)
+                };
             ops::gemv::gemv_bias_preresolved_into_encoder(
-                &cached.gemv_bias_oproj_pso,
-                o_weight.metal_buffer(),
-                o_weight.offset() as u64,
+                d4_pso,
+                d4_mat,
+                d4_mat_off,
                 &cached.attn_out_buf,
                 0,
                 &cached.h_buf,
@@ -1979,44 +1992,56 @@ impl TransformerBlock {
                 cached.gemv_bias_oproj_k,
                 x.metal_buffer(),
                 x.offset() as u64,
-                cached.gemv_bias_oproj_grid,
-                cached.gemv_bias_oproj_tg,
+                d4_grid,
+                d4_tg,
                 encoder,
             );
         }
         encoder.memory_barrier_with_resources(&[buf_as_resource(&cached.h_buf)]);
 
         // D5: fused_rms_gemv(h, norm2_w, gate_up_w) → gate_up_buf
-        // Replaces D6 (rms_norm) + D7 (gemv gate_up) from 9-dispatch
+        // Prefer interleaved layout if available
         {
+            let (d5_pso, d5_mat, d5_mat_off, d5_grid, d5_tg) =
+                if let (Some(pso), Some(w)) = (&cached.fused_rms_gemv_gate_up_interleaved_pso, &cached.gate_up_weight_interleaved) {
+                    (pso, w, 0u64, cached.fused_rms_gemv_gate_up_interleaved_grid, cached.fused_rms_gemv_gate_up_interleaved_tg)
+                } else {
+                    (rms_gemv_gate_up_pso, gate_up_w.metal_buffer(), gate_up_w.offset() as u64, cached.fused_rms_gemv_gate_up_grid, cached.fused_rms_gemv_gate_up_tg)
+                };
             ops::fused::fused_rms_gemv_preresolved_into_encoder(
-                rms_gemv_gate_up_pso,
+                d5_pso,
                 &cached.h_buf,
                 0,
                 norm2_w.metal_buffer(),
                 norm2_w.offset() as u64,
-                gate_up_w.metal_buffer(),
-                gate_up_w.offset() as u64,
+                d5_mat,
+                d5_mat_off,
                 &cached.gate_up_buf,
                 0,
                 cached.gemv_gate_up_m,
                 cached.gemv_gate_up_k,
                 cached.rms_norm_eps,
                 cached.norm2_w_stride,
-                cached.fused_rms_gemv_gate_up_grid,
-                cached.fused_rms_gemv_gate_up_tg,
+                d5_grid,
+                d5_tg,
                 encoder,
             );
         }
         encoder.memory_barrier_with_resources(&[buf_as_resource(&cached.gate_up_buf)]);
 
         // D6: fused_swiglu_down(down_w, gate_up, h) → out_buf
-        // Replaces D8 (silu_mul) + D9 (gemv_bias down) from 9-dispatch
+        // Prefer interleaved layout if available
         {
+            let (d6_pso, d6_mat, d6_mat_off, d6_grid, d6_tg) =
+                if let (Some(pso), Some(w)) = (&cached.fused_swiglu_down_interleaved_pso, &cached.down_weight_interleaved) {
+                    (pso, w, 0u64, cached.fused_swiglu_down_interleaved_grid, cached.fused_swiglu_down_interleaved_tg)
+                } else {
+                    (swiglu_down_pso, down_w.metal_buffer(), down_w.offset() as u64, cached.fused_swiglu_down_grid, cached.fused_swiglu_down_tg)
+                };
             ops::fused::fused_swiglu_down_preresolved_into_encoder(
-                swiglu_down_pso,
-                down_w.metal_buffer(),
-                down_w.offset() as u64,
+                d6_pso,
+                d6_mat,
+                d6_mat_off,
                 &cached.gate_up_buf,
                 0,
                 &cached.out_buf,
@@ -2025,8 +2050,8 @@ impl TransformerBlock {
                 cached.gemv_bias_down_k,
                 &cached.h_buf,
                 0,
-                cached.fused_swiglu_down_grid,
-                cached.fused_swiglu_down_tg,
+                d6_grid,
+                d6_tg,
                 encoder,
             );
         }
@@ -2820,27 +2845,27 @@ pub struct CachedDecode {
     pub fused_swiglu_down_grid: metal::MTLSize,
     pub fused_swiglu_down_tg: metal::MTLSize,
 
-    // --- Column-major fused PSOs (Phase 11) ---
-    pub fused_rms_gemv_qkv_col_pso: Option<metal::ComputePipelineState>,
-    pub fused_rms_gemv_gate_up_col_pso: Option<metal::ComputePipelineState>,
-    pub fused_swiglu_down_col_pso: Option<metal::ComputePipelineState>,
-    pub gemv_bias_oproj_col_pso: Option<metal::ComputePipelineState>,
+    // --- Interleaved fused PSOs (Phase 11) ---
+    pub fused_rms_gemv_qkv_interleaved_pso: Option<metal::ComputePipelineState>,
+    pub fused_rms_gemv_gate_up_interleaved_pso: Option<metal::ComputePipelineState>,
+    pub fused_swiglu_down_interleaved_pso: Option<metal::ComputePipelineState>,
+    pub gemv_bias_oproj_interleaved_pso: Option<metal::ComputePipelineState>,
 
-    // --- Column-major weight buffers (Phase 11) ---
-    pub qkv_weight_col: Option<metal::Buffer>,
-    pub o_weight_col: Option<metal::Buffer>,
-    pub gate_up_weight_col: Option<metal::Buffer>,
-    pub down_weight_col: Option<metal::Buffer>,
+    // --- Interleaved weight buffers (Phase 11) ---
+    pub qkv_weight_interleaved: Option<metal::Buffer>,
+    pub o_weight_interleaved: Option<metal::Buffer>,
+    pub gate_up_weight_interleaved: Option<metal::Buffer>,
+    pub down_weight_interleaved: Option<metal::Buffer>,
 
-    // --- Column-major dispatch geometries (Phase 11) ---
-    pub fused_rms_gemv_qkv_col_grid: metal::MTLSize,
-    pub fused_rms_gemv_qkv_col_tg: metal::MTLSize,
-    pub fused_rms_gemv_gate_up_col_grid: metal::MTLSize,
-    pub fused_rms_gemv_gate_up_col_tg: metal::MTLSize,
-    pub fused_swiglu_down_col_grid: metal::MTLSize,
-    pub fused_swiglu_down_col_tg: metal::MTLSize,
-    pub gemv_bias_oproj_col_grid: metal::MTLSize,
-    pub gemv_bias_oproj_col_tg: metal::MTLSize,
+    // --- Interleaved dispatch geometries (Phase 11) ---
+    pub fused_rms_gemv_qkv_interleaved_grid: metal::MTLSize,
+    pub fused_rms_gemv_qkv_interleaved_tg: metal::MTLSize,
+    pub fused_rms_gemv_gate_up_interleaved_grid: metal::MTLSize,
+    pub fused_rms_gemv_gate_up_interleaved_tg: metal::MTLSize,
+    pub fused_swiglu_down_interleaved_grid: metal::MTLSize,
+    pub fused_swiglu_down_interleaved_tg: metal::MTLSize,
+    pub gemv_bias_oproj_interleaved_grid: metal::MTLSize,
+    pub gemv_bias_oproj_interleaved_tg: metal::MTLSize,
 }
 
 impl CachedDecode {
@@ -3011,23 +3036,86 @@ impl CachedDecode {
             .map(|pso| ops::fused::fused_swiglu_down_dispatch_sizes(hidden_size as u32, pso))
             .unwrap_or((metal::MTLSize::new(1, 1, 1), metal::MTLSize::new(1, 1, 1)));
 
-        // Phase 11: col-major disabled — stride-M access pattern regresses for large M.
-        // Kept fields for future small-M use.
-        let fused_rms_gemv_qkv_col_pso: Option<metal::ComputePipelineState> = None;
-        let fused_rms_gemv_gate_up_col_pso: Option<metal::ComputePipelineState> = None;
-        let fused_swiglu_down_col_pso: Option<metal::ComputePipelineState> = None;
-        let gemv_bias_oproj_col_pso: Option<metal::ComputePipelineState> = None;
+        // Phase 11: Interleaved [M/TM, K, TM] layout for cache-optimal GEMV
+        let fused_rms_gemv_qkv_interleaved_pso = {
+            let kname = ops::fused::fused_rms_gemv_interleaved_kernel_name(dtype);
+            kname.ok().and_then(|k| registry.get_pipeline(k, dtype).ok())
+        };
+        let fused_rms_gemv_gate_up_interleaved_pso = {
+            let kname = ops::fused::fused_rms_gemv_interleaved_kernel_name(dtype);
+            kname.ok().and_then(|k| registry.get_pipeline(k, dtype).ok())
+        };
+        let fused_swiglu_down_interleaved_pso = {
+            let kname = ops::fused::fused_swiglu_down_interleaved_kernel_name(dtype);
+            kname.ok().and_then(|k| registry.get_pipeline(k, dtype).ok())
+        };
+        let gemv_bias_oproj_interleaved_pso = {
+            let kname = ops::gemv::gemv_bias_interleaved_kernel_name(dtype, hidden_size as u32);
+            kname.ok().and_then(|k| registry.get_pipeline(k, dtype).ok())
+        };
 
-        let unit = metal::MTLSize::new(1, 1, 1);
-        let (fused_rms_gemv_qkv_col_grid, fused_rms_gemv_qkv_col_tg) = (unit, unit);
-        let (fused_rms_gemv_gate_up_col_grid, fused_rms_gemv_gate_up_col_tg) = (unit, unit);
-        let (fused_swiglu_down_col_grid, fused_swiglu_down_col_tg) = (unit, unit);
-        let (gemv_bias_oproj_col_grid, gemv_bias_oproj_col_tg) = (unit, unit);
+        // Interleaved dispatch geometries (same as BM8 row-major — same threadgroup structure)
+        let (fused_rms_gemv_qkv_interleaved_grid, fused_rms_gemv_qkv_interleaved_tg) =
+            fused_rms_gemv_qkv_interleaved_pso.as_ref()
+                .map(|pso| ops::fused::fused_rms_gemv_dispatch_sizes(qkv_dim as u32, pso))
+                .unwrap_or((metal::MTLSize::new(1, 1, 1), metal::MTLSize::new(1, 1, 1)));
+        let (fused_rms_gemv_gate_up_interleaved_grid, fused_rms_gemv_gate_up_interleaved_tg) =
+            fused_rms_gemv_gate_up_interleaved_pso.as_ref()
+                .map(|pso| ops::fused::fused_rms_gemv_dispatch_sizes(gate_up_total as u32, pso))
+                .unwrap_or((metal::MTLSize::new(1, 1, 1), metal::MTLSize::new(1, 1, 1)));
+        let (fused_swiglu_down_interleaved_grid, fused_swiglu_down_interleaved_tg) =
+            fused_swiglu_down_interleaved_pso.as_ref()
+                .map(|pso| ops::fused::fused_swiglu_down_dispatch_sizes(hidden_size as u32, pso))
+                .unwrap_or((metal::MTLSize::new(1, 1, 1), metal::MTLSize::new(1, 1, 1)));
+        let (gemv_bias_oproj_interleaved_grid, gemv_bias_oproj_interleaved_tg) =
+            gemv_bias_oproj_interleaved_pso.as_ref()
+                .map(|pso| ops::gemv::gemv_dispatch_sizes(hidden_size as u32, pso))
+                .unwrap_or((metal::MTLSize::new(1, 1, 1), metal::MTLSize::new(1, 1, 1)));
 
-        let qkv_weight_col: Option<metal::Buffer> = None;
-        let gate_up_weight_col: Option<metal::Buffer> = None;
-        let down_weight_col: Option<metal::Buffer> = None;
-        let o_weight_col: Option<metal::Buffer> = None;
+        // Helper: create interleaved [M/TM, K, TM] buffer from row-major [M, K] weight
+        fn interleave_weight(src: &Array, m: usize, k: usize, dev: &metal::DeviceRef) -> Option<metal::Buffer> {
+            let tm = 4usize;
+            if m < tm { return None; }
+            let m_padded = (m / tm) * tm;
+            let elem_size = src.dtype().size_of();
+            let src_ptr = src.metal_buffer().contents() as *const u8;
+            let src_offset = src.offset();
+            let byte_size = m_padded * k * elem_size;
+            let dst_buf = dev.new_buffer(byte_size as u64, metal::MTLResourceOptions::StorageModeShared);
+            let dst_ptr = dst_buf.contents() as *mut u8;
+            unsafe {
+                for group in 0..(m_padded / tm) {
+                    for ki in 0..k {
+                        for r in 0..tm {
+                            let src_row = group * tm + r;
+                            let src_idx = src_offset + (src_row * k + ki) * elem_size;
+                            let dst_idx = (group * k * tm + ki * tm + r) * elem_size;
+                            std::ptr::copy_nonoverlapping(
+                                src_ptr.add(src_idx),
+                                dst_ptr.add(dst_idx),
+                                elem_size,
+                            );
+                        }
+                    }
+                }
+            }
+            Some(dst_buf)
+        }
+
+        // Prepare interleaved weights from the block's weight arrays
+        let qkv_w = block.attention.qkv_merged_weight();
+        let o_w = block.attention.o_proj_weight();
+        let (gu_w, d_w) = match &block.ffn {
+            FeedForward::Gated { gate_up_merged_weight, down_proj, .. } => {
+                (gate_up_merged_weight.as_ref(), down_proj.weight())
+            }
+            _ => (None, None),
+        };
+
+        let qkv_weight_interleaved = qkv_w.and_then(|w| interleave_weight(w, qkv_dim, hidden_size, dev));
+        let o_weight_interleaved = o_w.and_then(|w| interleave_weight(w, hidden_size, hidden_size, dev));
+        let gate_up_weight_interleaved = gu_w.and_then(|w| interleave_weight(w, gate_up_total, hidden_size, dev));
+        let down_weight_interleaved = d_w.and_then(|w| interleave_weight(w, hidden_size, intermediate_dim, dev));
 
         // --- Pre-allocate scratch buffers ---
         let normed_buf = dev.new_buffer(
@@ -3141,22 +3229,22 @@ impl CachedDecode {
             fused_rms_gemv_gate_up_tg,
             fused_swiglu_down_grid,
             fused_swiglu_down_tg,
-            fused_rms_gemv_qkv_col_pso,
-            fused_rms_gemv_gate_up_col_pso,
-            fused_swiglu_down_col_pso,
-            gemv_bias_oproj_col_pso,
-            qkv_weight_col,
-            o_weight_col,
-            gate_up_weight_col,
-            down_weight_col,
-            fused_rms_gemv_qkv_col_grid,
-            fused_rms_gemv_qkv_col_tg,
-            fused_rms_gemv_gate_up_col_grid,
-            fused_rms_gemv_gate_up_col_tg,
-            fused_swiglu_down_col_grid,
-            fused_swiglu_down_col_tg,
-            gemv_bias_oproj_col_grid,
-            gemv_bias_oproj_col_tg,
+            fused_rms_gemv_qkv_interleaved_pso,
+            fused_rms_gemv_gate_up_interleaved_pso,
+            fused_swiglu_down_interleaved_pso,
+            gemv_bias_oproj_interleaved_pso,
+            qkv_weight_interleaved,
+            o_weight_interleaved,
+            gate_up_weight_interleaved,
+            down_weight_interleaved,
+            fused_rms_gemv_qkv_interleaved_grid,
+            fused_rms_gemv_qkv_interleaved_tg,
+            fused_rms_gemv_gate_up_interleaved_grid,
+            fused_rms_gemv_gate_up_interleaved_tg,
+            fused_swiglu_down_interleaved_grid,
+            fused_swiglu_down_interleaved_tg,
+            gemv_bias_oproj_interleaved_grid,
+            gemv_bias_oproj_interleaved_tg,
         })
     }
 }

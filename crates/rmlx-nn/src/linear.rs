@@ -22,9 +22,9 @@ pub struct Linear {
     bias: Option<Array>,
     /// Pre-computed contiguous transposed weight for the ExecGraph path.
     weight_t_cached: Option<Array>,
-    /// Pre-computed column-major weight for GEMV decode path.
-    /// Stores [K, M] row-major = [M, K] column-major for contiguous TM=4 access.
-    weight_col_cached: Option<Array>,
+    /// Pre-computed interleaved weight for GEMV decode path.
+    /// Stores [M/TM, K, TM] layout for cache-optimal GEMV access (TM=4).
+    weight_interleaved_cached: Option<Array>,
 }
 
 impl Linear {
@@ -35,7 +35,7 @@ impl Linear {
             weight: None,
             bias: None,
             weight_t_cached: None,
-            weight_col_cached: None,
+            weight_interleaved_cached: None,
         }
     }
 
@@ -88,7 +88,7 @@ impl Linear {
             weight: Some(weight),
             bias,
             weight_t_cached: None,
-            weight_col_cached: None,
+            weight_interleaved_cached: None,
         })
     }
 
@@ -228,8 +228,8 @@ impl Linear {
         if let Some(wt) = self.weight_t_cached.take() {
             self.weight_t_cached = Some(wt.to_private(device, queue));
         }
-        if let Some(wc) = self.weight_col_cached.take() {
-            self.weight_col_cached = Some(wc.to_private(device, queue));
+        if let Some(wc) = self.weight_interleaved_cached.take() {
+            self.weight_interleaved_cached = Some(wc.to_private(device, queue));
         }
     }
 
@@ -288,31 +288,71 @@ impl Linear {
         self.weight_transposed()
     }
 
-    /// Pre-compute column-major weight: [M, K] row-major -> [K, M] row-major (= [M,K] col-major).
+    /// Pre-compute interleaved weight: [M, K] row-major → [M/TM, K, TM] interleaved layout.
+    /// TM=4. Each group of 4 rows has their K values interleaved for cache-optimal GEMV.
     /// Call once after weight loading for GEMV decode optimization.
-    pub fn prepare_weight_col_major(
+    pub fn prepare_weight_interleaved(
         &mut self,
-        registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        _registry: &KernelRegistry,
+        _queue: &metal::CommandQueue,
     ) -> Result<(), KernelError> {
         let weight = self.weight.as_ref().ok_or_else(|| {
             KernelError::InvalidShape("Linear: weights not loaded".to_string())
         })?;
-        // Create a transposed view [K, M] with strides [1, K]
-        let w_col = weight.view(
-            vec![self.config.in_features, self.config.out_features],
-            vec![1, self.config.in_features],
-            weight.offset(),
+        let m = self.config.out_features;
+        let k = self.config.in_features;
+        let tm = 4usize;
+
+        // M must be >= TM for interleaved layout
+        if m < tm {
+            return Ok(());
+        }
+
+        let m_padded = (m / tm) * tm; // Round down to TM boundary
+        let elem_size = weight.dtype().size_of();
+        let src_ptr = weight.metal_buffer().contents() as *const u8;
+        let src_offset = weight.offset();
+
+        let total_elems = m_padded * k;
+        let byte_size = total_elems * elem_size;
+        let dev = _registry.device().raw();
+        let dst_buf = dev.new_buffer(
+            byte_size as u64,
+            metal::MTLResourceOptions::StorageModeShared,
         );
-        // Make it contiguous: copies [K, M] into a contiguous buffer
-        let w_col_contig = ops::copy::copy(registry, &w_col, queue)?;
-        self.weight_col_cached = Some(w_col_contig);
+        let dst_ptr = dst_buf.contents() as *mut u8;
+
+        // Byte-level interleave: [M, K] row-major → [M/TM, K, TM] (works for any dtype)
+        unsafe {
+            for group in 0..(m_padded / tm) {
+                for ki in 0..k {
+                    for r in 0..tm {
+                        let src_row = group * tm + r;
+                        let src_idx = src_offset + (src_row * k + ki) * elem_size;
+                        let dst_idx = (group * k * tm + ki * tm + r) * elem_size;
+                        std::ptr::copy_nonoverlapping(
+                            src_ptr.add(src_idx),
+                            dst_ptr.add(dst_idx),
+                            elem_size,
+                        );
+                    }
+                }
+            }
+        }
+
+        self.weight_interleaved_cached = Some(Array::new(
+            dst_buf,
+            vec![m_padded, k],
+            vec![k, 1],
+            weight.dtype(),
+            0,
+        ));
         Ok(())
     }
 
-    /// Reference to column-major weight, if prepared.
-    pub fn weight_col(&self) -> Option<&Array> {
-        self.weight_col_cached.as_ref()
+    /// Reference to interleaved weight, if prepared.
+    pub fn weight_interleaved(&self) -> Option<&Array> {
+        self.weight_interleaved_cached.as_ref()
     }
 
     /// Encode the linear forward pass into an existing command buffer.
