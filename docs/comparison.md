@@ -33,7 +33,7 @@
 | **Sliding Window Attn** | Yes | Yes | Yes |
 | **GGUF model loading** | Yes | Yes | Yes |
 | **Test suite** | 1,142+ tests | Extensive | Extensive |
-| **Phases complete** | 0-9B-opt + S1-S5 + Phase KO + Phase 8c | N/A (stable release) | N/A (stable release) |
+| **Phases complete** | 0-9B-opt + S1-S5 + Phase KO + Phase 8c + Phase 9 + Phase 10 + Phase 11 | N/A (stable release) | N/A (stable release) |
 
 ---
 
@@ -77,6 +77,7 @@ Numerical parity is maintained: max_diff = 6.4e-6 between baseline and ExecGraph
 | Speedup vs baseline | 17.4x | 64x |
 | vs MLX compiled (60L) | ~4.8x slower | **6.34x faster** |
 | Latency (Cached 2-enc, 60L) | — | 714 us/L (6x lower σ) |
+| Latency (Fused 7-dispatch, 60L) | — | **703.4 us/L** (Phase 10 best) |
 
 The 9-dispatch path is 6.34x faster than MLX's compiled execution at 60-layer depth through merged QKV/gate_up weight projections, batched RoPE, slab-layout SDPA decode, fused GEMV+bias, StorageModePrivate weights, and Array::uninit for output buffers. Multi-layer CB amortization reduces per-layer overhead from 1,739 us (single) to 751 us/L (60L).
 
@@ -257,7 +258,7 @@ CUDA has decades of optimization across compilers (NVCC, Triton), libraries (cuB
 | **CB reduction** | 65 -> 1 per layer (98.5%) | Full coalescing into single graph |
 | **Sync model** | MTLSharedEvent (non-blocking) | CUDA events (stream-ordered) |
 | **Shape dynamism** | Re-encode handles shape changes naturally | Must re-capture or use CUDA Graph updates |
-| **Latency** | ~0.7-0.75ms per layer at 60L (9-dispatch / cached 2-encoder) | Sub-millisecond replay |
+| **Latency** | ~0.70ms per layer at 60L (fused 7-dispatch) | Sub-millisecond replay |
 | **Speedup over baseline** | 64x | Typically 2-5x (already from efficient baseline) |
 | **Implementation complexity** | Moderate (deterministic sequencing) | Low (capture API is straightforward) |
 | **Memory overhead** | Minimal (re-encode reuses buffers) | Graph storage (captured operations) |

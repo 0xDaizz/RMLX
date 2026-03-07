@@ -14,6 +14,7 @@ The rmlx GPU pipeline eliminates per-operation CPU overhead by batching multiple
 | Latency / layer (Phase KO) | ~109ms | ~1.7ms | 64x speedup |
 | Gap vs MLX (60L) | -- | 6.34x faster | RMLX leads |
 | Cached 2-encoder decode (60L) | -- | 714 us/L | 8% faster, 6x lower σ |
+| Fused 7-dispatch (60L) | -- | 703.4 us/L | Phase 10 best |
 | CPU-GPU sync overhead | baseline | minimal | 98.5% reduction |
 | Numerical parity | -- | max_diff=6.4e-6 | exact match |
 
@@ -328,7 +329,31 @@ Phase 10 introduces kernel fusion to reduce the 9-dispatch decode path to 7 disp
 
 If fused Pipeline State Objects (PSOs) fail to compile at init time (e.g., unsupported GPU architecture), CachedDecode automatically falls back to the 9-dispatch path. No user intervention required.
 
-### Performance Target
+### Performance Result
 
-- **Target**: 600-650 us/layer (f16, 60L, M3 Ultra) — pending benchmarks
+- **Actual**: 703.4 us/layer (f16, 60L, M3 Ultra)
 - **Reduction**: 9 dispatches → 7 dispatches (22% fewer GPU dispatches)
+- **Improvement**: 714 us/L → 703.4 us/L (1.5% latency reduction from kernel fusion)
+
+---
+
+## Phase 11: GEMV Kernel Optimization Experiments — CONCLUDED
+
+Phase 11 investigated three alternative GEMV kernel strategies to push below the 703.4 us/layer floor established in Phase 10. All three experiments failed to improve performance, confirming that the current row-major BM8 GEMV with f32 accumulation at 705 us/layer is the practical floor for f16 decode on Apple Silicon.
+
+### Experiment Results
+
+| Experiment | Strategy | Result | Regression |
+|-----------|----------|--------|------------|
+| Column-major GEMV | Transpose weight layout to column-major for coalesced reads | **+84% regression** | Catastrophic — strided output writes destroy throughput |
+| Interleaved GEMV | 4-way interleaved weight packing for better cache line utilization | **+2.2% regression** | Marginal — packing overhead negates any bandwidth gain |
+| SRAM prefetch + f16 acc + function constants | Threadgroup SRAM prefetch buffer, f16 accumulation, function-constant tile sizes | **+3.6% regression** | f16 accumulation precision loss forces wider tiles, SRAM pressure increases |
+
+### Conclusion
+
+Row-major BM8 GEMV with f32 accumulation achieves 73.6% bandwidth efficiency on M3 Ultra. This is near the practical ceiling for the Apple Silicon memory subsystem at f16 precision. No further kernel-level improvements are expected without:
+
+1. **Quantization** (INT4/INT8) — reduces memory bandwidth demand
+2. **Hardware change** — higher memory bandwidth (future Apple Silicon generations)
+
+Decode optimization is **CONCLUDED** at the kernel level. The 703.4 us/layer (Phase 10 fused 7-dispatch) represents the best achievable latency for f16 decode on current Apple Silicon.
