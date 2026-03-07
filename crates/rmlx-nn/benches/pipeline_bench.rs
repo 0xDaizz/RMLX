@@ -1716,7 +1716,7 @@ fn main() {
     let cached_60: Vec<CachedDecode> = blocks_60
         .iter()
         .map(|blk| {
-            blk.prepare_cached_decode(&registry)
+            blk.prepare_cached_decode(&registry, &queue)
                 .expect("prepare_cached_decode")
         })
         .collect();

@@ -22,6 +22,9 @@ pub struct Linear {
     bias: Option<Array>,
     /// Pre-computed contiguous transposed weight for the ExecGraph path.
     weight_t_cached: Option<Array>,
+    /// Pre-computed column-major weight for GEMV decode path.
+    /// Stores [K, M] row-major = [M, K] column-major for contiguous TM=4 access.
+    weight_col_cached: Option<Array>,
 }
 
 impl Linear {
@@ -32,6 +35,7 @@ impl Linear {
             weight: None,
             bias: None,
             weight_t_cached: None,
+            weight_col_cached: None,
         }
     }
 
@@ -84,6 +88,7 @@ impl Linear {
             weight: Some(weight),
             bias,
             weight_t_cached: None,
+            weight_col_cached: None,
         })
     }
 
@@ -223,6 +228,9 @@ impl Linear {
         if let Some(wt) = self.weight_t_cached.take() {
             self.weight_t_cached = Some(wt.to_private(device, queue));
         }
+        if let Some(wc) = self.weight_col_cached.take() {
+            self.weight_col_cached = Some(wc.to_private(device, queue));
+        }
     }
 
     // -------------------------------------------------------------------
@@ -278,6 +286,33 @@ impl Linear {
             ));
         }
         self.weight_transposed()
+    }
+
+    /// Pre-compute column-major weight: [M, K] row-major -> [K, M] row-major (= [M,K] col-major).
+    /// Call once after weight loading for GEMV decode optimization.
+    pub fn prepare_weight_col_major(
+        &mut self,
+        registry: &KernelRegistry,
+        queue: &metal::CommandQueue,
+    ) -> Result<(), KernelError> {
+        let weight = self.weight.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape("Linear: weights not loaded".to_string())
+        })?;
+        // Create a transposed view [K, M] with strides [1, K]
+        let w_col = weight.view(
+            vec![self.config.in_features, self.config.out_features],
+            vec![1, self.config.in_features],
+            weight.offset(),
+        );
+        // Make it contiguous: copies [K, M] into a contiguous buffer
+        let w_col_contig = ops::copy::copy(registry, &w_col, queue)?;
+        self.weight_col_cached = Some(w_col_contig);
+        Ok(())
+    }
+
+    /// Reference to column-major weight, if prepared.
+    pub fn weight_col(&self) -> Option<&Array> {
+        self.weight_col_cached.as_ref()
     }
 
     /// Encode the linear forward pass into an existing command buffer.

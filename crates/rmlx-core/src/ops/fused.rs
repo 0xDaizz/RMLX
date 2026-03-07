@@ -939,6 +939,213 @@ kernel void fused_swiglu_down_bm8_bf16(
         }
     }
 }
+
+// ===========================================================================
+// Column-major BM8 variants: mat stored as [K, M] instead of [M, K]
+// ===========================================================================
+
+kernel void fused_swiglu_down_bm8_f32_col(
+    device const float* mat     [[buffer(0)]],
+    device const float* gate_up [[buffer(1)]],
+    device       float* output  [[buffer(2)]],
+    constant     uint&  M       [[buffer(3)]],
+    constant     uint&  K       [[buffer(4)]],
+    device const float* bias    [[buffer(5)]],
+    uint tg_id         [[threadgroup_position_in_grid]],
+    uint simd_lane_id  [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]])
+{
+    uint row_base = tg_id * (BM8 * TM) + simd_group_id * TM;
+    if (row_base >= M) return;
+    row_base = (row_base + TM <= M) ? row_base : M - TM;
+
+    float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    uint k16 = as_uniform(K / 16);
+    for (uint i = simd_lane_id; i < k16; i += SIMD_SIZE) {
+        uint idx = i * 16;
+        float4 g4a = *reinterpret_cast<device const float4*>(gate_up + idx);
+        float4 u4a = *reinterpret_cast<device const float4*>(gate_up + K + idx);
+        float4 g4b = *reinterpret_cast<device const float4*>(gate_up + idx + 4);
+        float4 u4b = *reinterpret_cast<device const float4*>(gate_up + K + idx + 4);
+        float4 g4c = *reinterpret_cast<device const float4*>(gate_up + idx + 8);
+        float4 u4c = *reinterpret_cast<device const float4*>(gate_up + K + idx + 8);
+        float4 g4d = *reinterpret_cast<device const float4*>(gate_up + idx + 12);
+        float4 u4d = *reinterpret_cast<device const float4*>(gate_up + K + idx + 12);
+        float4 v4a = float4(swiglu_f32(g4a[0], u4a[0]), swiglu_f32(g4a[1], u4a[1]),
+                            swiglu_f32(g4a[2], u4a[2]), swiglu_f32(g4a[3], u4a[3]));
+        float4 v4b = float4(swiglu_f32(g4b[0], u4b[0]), swiglu_f32(g4b[1], u4b[1]),
+                            swiglu_f32(g4b[2], u4b[2]), swiglu_f32(g4b[3], u4b[3]));
+        float4 v4c = float4(swiglu_f32(g4c[0], u4c[0]), swiglu_f32(g4c[1], u4c[1]),
+                            swiglu_f32(g4c[2], u4c[2]), swiglu_f32(g4c[3], u4c[3]));
+        float4 v4d = float4(swiglu_f32(g4d[0], u4d[0]), swiglu_f32(g4d[1], u4d[1]),
+                            swiglu_f32(g4d[2], u4d[2]), swiglu_f32(g4d[3], u4d[3]));
+        // Col-major weight loads: for each group of 4 k positions, load float4 of TM=4 rows
+        #pragma clang loop unroll(full)
+        for (uint sub = 0; sub < 4; sub++) {
+            uint k_base = idx + sub * 4;
+            float4 c0 = *reinterpret_cast<device const float4*>(mat + k_base * M + row_base);
+            float4 c1 = *reinterpret_cast<device const float4*>(mat + (k_base+1) * M + row_base);
+            float4 c2 = *reinterpret_cast<device const float4*>(mat + (k_base+2) * M + row_base);
+            float4 c3 = *reinterpret_cast<device const float4*>(mat + (k_base+3) * M + row_base);
+            float4 v4 = (sub == 0) ? v4a : (sub == 1) ? v4b : (sub == 2) ? v4c : v4d;
+            acc[0] += c0[0] * v4[0] + c1[0] * v4[1] + c2[0] * v4[2] + c3[0] * v4[3];
+            acc[1] += c0[1] * v4[0] + c1[1] * v4[1] + c2[1] * v4[2] + c3[1] * v4[3];
+            acc[2] += c0[2] * v4[0] + c1[2] * v4[1] + c2[2] * v4[2] + c3[2] * v4[3];
+            acc[3] += c0[3] * v4[0] + c1[3] * v4[1] + c2[3] * v4[2] + c3[3] * v4[3];
+        }
+    }
+    // Remainder in groups of 4
+    for (uint i = k16 * 16 + simd_lane_id * 4; i + 3 < K; i += SIMD_SIZE * 4) {
+        float4 g4 = *reinterpret_cast<device const float4*>(gate_up + i);
+        float4 u4 = *reinterpret_cast<device const float4*>(gate_up + K + i);
+        float4 v4 = float4(swiglu_f32(g4[0], u4[0]), swiglu_f32(g4[1], u4[1]),
+                           swiglu_f32(g4[2], u4[2]), swiglu_f32(g4[3], u4[3]));
+        float4 c0 = *reinterpret_cast<device const float4*>(mat + i * M + row_base);
+        float4 c1 = *reinterpret_cast<device const float4*>(mat + (i+1) * M + row_base);
+        float4 c2 = *reinterpret_cast<device const float4*>(mat + (i+2) * M + row_base);
+        float4 c3 = *reinterpret_cast<device const float4*>(mat + (i+3) * M + row_base);
+        acc[0] += c0[0] * v4[0] + c1[0] * v4[1] + c2[0] * v4[2] + c3[0] * v4[3];
+        acc[1] += c0[1] * v4[0] + c1[1] * v4[1] + c2[1] * v4[2] + c3[1] * v4[3];
+        acc[2] += c0[2] * v4[0] + c1[2] * v4[1] + c2[2] * v4[2] + c3[2] * v4[3];
+        acc[3] += c0[3] * v4[0] + c1[3] * v4[1] + c2[3] * v4[2] + c3[3] * v4[3];
+    }
+    // Scalar remainder
+    for (uint i = (K / 4) * 4 + simd_lane_id; i < K; i += SIMD_SIZE) {
+        float v = swiglu_f32(gate_up[i], gate_up[K + i]);
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            acc[r] += mat[i * M + row_base + r] * v;
+        }
+    }
+
+    #pragma clang loop unroll(full)
+    for (uint r = 0; r < TM; r++) {
+        acc[r] = simd_sum(acc[r]);
+        if (simd_lane_id == 0) {
+            output[row_base + r] = acc[r] + bias[row_base + r];
+        }
+    }
+}
+
+kernel void fused_swiglu_down_bm8_f16_col(
+    device const half*  mat     [[buffer(0)]],
+    device const half*  gate_up [[buffer(1)]],
+    device       half*  output  [[buffer(2)]],
+    constant     uint&  M       [[buffer(3)]],
+    constant     uint&  K       [[buffer(4)]],
+    device const half*  bias    [[buffer(5)]],
+    uint tg_id         [[threadgroup_position_in_grid]],
+    uint simd_lane_id  [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]])
+{
+    uint row_base = tg_id * (BM8 * TM) + simd_group_id * TM;
+    if (row_base >= M) return;
+    row_base = (row_base + TM <= M) ? row_base : M - TM;
+
+    float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    uint k16 = as_uniform(K / 16);
+    for (uint i = simd_lane_id; i < k16; i += SIMD_SIZE) {
+        uint idx = i * 16;
+        float4 g4a = float4(*reinterpret_cast<device const half4*>(gate_up + idx));
+        float4 u4a = float4(*reinterpret_cast<device const half4*>(gate_up + K + idx));
+        float4 g4b = float4(*reinterpret_cast<device const half4*>(gate_up + idx + 4));
+        float4 u4b = float4(*reinterpret_cast<device const half4*>(gate_up + K + idx + 4));
+        float4 g4c = float4(*reinterpret_cast<device const half4*>(gate_up + idx + 8));
+        float4 u4c = float4(*reinterpret_cast<device const half4*>(gate_up + K + idx + 8));
+        float4 g4d = float4(*reinterpret_cast<device const half4*>(gate_up + idx + 12));
+        float4 u4d = float4(*reinterpret_cast<device const half4*>(gate_up + K + idx + 12));
+        float4 v4a = float4(swiglu_f32(g4a[0], u4a[0]), swiglu_f32(g4a[1], u4a[1]),
+                            swiglu_f32(g4a[2], u4a[2]), swiglu_f32(g4a[3], u4a[3]));
+        float4 v4b = float4(swiglu_f32(g4b[0], u4b[0]), swiglu_f32(g4b[1], u4b[1]),
+                            swiglu_f32(g4b[2], u4b[2]), swiglu_f32(g4b[3], u4b[3]));
+        float4 v4c = float4(swiglu_f32(g4c[0], u4c[0]), swiglu_f32(g4c[1], u4c[1]),
+                            swiglu_f32(g4c[2], u4c[2]), swiglu_f32(g4c[3], u4c[3]));
+        float4 v4d = float4(swiglu_f32(g4d[0], u4d[0]), swiglu_f32(g4d[1], u4d[1]),
+                            swiglu_f32(g4d[2], u4d[2]), swiglu_f32(g4d[3], u4d[3]));
+        // Col-major weight loads
+        #pragma clang loop unroll(full)
+        for (uint sub = 0; sub < 4; sub++) {
+            uint k_base = idx + sub * 4;
+            half4 c0 = *reinterpret_cast<device const half4*>(mat + k_base * M + row_base);
+            half4 c1 = *reinterpret_cast<device const half4*>(mat + (k_base+1) * M + row_base);
+            half4 c2 = *reinterpret_cast<device const half4*>(mat + (k_base+2) * M + row_base);
+            half4 c3 = *reinterpret_cast<device const half4*>(mat + (k_base+3) * M + row_base);
+            float4 v4 = (sub == 0) ? v4a : (sub == 1) ? v4b : (sub == 2) ? v4c : v4d;
+            acc[0] += float(c0[0]) * v4[0] + float(c1[0]) * v4[1] + float(c2[0]) * v4[2] + float(c3[0]) * v4[3];
+            acc[1] += float(c0[1]) * v4[0] + float(c1[1]) * v4[1] + float(c2[1]) * v4[2] + float(c3[1]) * v4[3];
+            acc[2] += float(c0[2]) * v4[0] + float(c1[2]) * v4[1] + float(c2[2]) * v4[2] + float(c3[2]) * v4[3];
+            acc[3] += float(c0[3]) * v4[0] + float(c1[3]) * v4[1] + float(c2[3]) * v4[2] + float(c3[3]) * v4[3];
+        }
+    }
+    // Remainder in groups of 4
+    for (uint i = k16 * 16 + simd_lane_id * 4; i + 3 < K; i += SIMD_SIZE * 4) {
+        float4 g4 = float4(*reinterpret_cast<device const half4*>(gate_up + i));
+        float4 u4 = float4(*reinterpret_cast<device const half4*>(gate_up + K + i));
+        float4 v4 = float4(swiglu_f32(g4[0], u4[0]), swiglu_f32(g4[1], u4[1]),
+                           swiglu_f32(g4[2], u4[2]), swiglu_f32(g4[3], u4[3]));
+        half4 c0 = *reinterpret_cast<device const half4*>(mat + i * M + row_base);
+        half4 c1 = *reinterpret_cast<device const half4*>(mat + (i+1) * M + row_base);
+        half4 c2 = *reinterpret_cast<device const half4*>(mat + (i+2) * M + row_base);
+        half4 c3 = *reinterpret_cast<device const half4*>(mat + (i+3) * M + row_base);
+        acc[0] += float(c0[0]) * v4[0] + float(c1[0]) * v4[1] + float(c2[0]) * v4[2] + float(c3[0]) * v4[3];
+        acc[1] += float(c0[1]) * v4[0] + float(c1[1]) * v4[1] + float(c2[1]) * v4[2] + float(c3[1]) * v4[3];
+        acc[2] += float(c0[2]) * v4[0] + float(c1[2]) * v4[1] + float(c2[2]) * v4[2] + float(c3[2]) * v4[3];
+        acc[3] += float(c0[3]) * v4[0] + float(c1[3]) * v4[1] + float(c2[3]) * v4[2] + float(c3[3]) * v4[3];
+    }
+    // Scalar remainder
+    for (uint i = (K / 4) * 4 + simd_lane_id; i < K; i += SIMD_SIZE) {
+        float v = swiglu_f32(float(gate_up[i]), float(gate_up[K + i]));
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            acc[r] += float(mat[i * M + row_base + r]) * v;
+        }
+    }
+
+    #pragma clang loop unroll(full)
+    for (uint r = 0; r < TM; r++) {
+        acc[r] = simd_sum(acc[r]);
+        if (simd_lane_id == 0) {
+            output[row_base + r] = half(acc[r] + float(bias[row_base + r]));
+        }
+    }
+}
+
+kernel void fused_swiglu_down_bm8_bf16_col(
+    device const bfloat*  mat     [[buffer(0)]],
+    device const bfloat*  gate_up [[buffer(1)]],
+    device       bfloat*  output  [[buffer(2)]],
+    constant     uint&    M       [[buffer(3)]],
+    constant     uint&    K       [[buffer(4)]],
+    device const bfloat*  bias    [[buffer(5)]],
+    uint tg_id         [[threadgroup_position_in_grid]],
+    uint simd_lane_id  [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]])
+{
+    uint row_base = tg_id * (BM8 * TM) + simd_group_id * TM;
+    if (row_base >= M) return;
+    row_base = (row_base + TM <= M) ? row_base : M - TM;
+
+    float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    // bf16 col-major: scalar only
+    for (uint i = simd_lane_id; i < K; i += SIMD_SIZE) {
+        float v = swiglu_f32(float(gate_up[i]), float(gate_up[K + i]));
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            acc[r] += float(mat[i * M + row_base + r]) * v;
+        }
+    }
+
+    #pragma clang loop unroll(full)
+    for (uint r = 0; r < TM; r++) {
+        acc[r] = simd_sum(acc[r]);
+        if (simd_lane_id == 0) {
+            output[row_base + r] = bfloat(acc[r] + float(bias[row_base + r]));
+        }
+    }
+}
 "#;
 
 /// Get the fused SwiGLU+down kernel name for a given dtype and M dimension.
@@ -955,6 +1162,21 @@ pub fn fused_swiglu_down_kernel_name(dtype: DType, m: u32) -> Result<&'static st
         (DType::Bfloat16, false) => Ok("fused_swiglu_down_bf16"),
         _ => Err(KernelError::NotFound(format!(
             "fused_swiglu_down not supported for {:?}",
+            dtype
+        ))),
+    }
+}
+
+/// Get the fused SwiGLU+down column-major kernel name for a given dtype.
+///
+/// Only BM8 variants are available (M >= 256 assumed by caller).
+pub fn fused_swiglu_down_col_kernel_name(dtype: DType) -> Result<&'static str, KernelError> {
+    match dtype {
+        DType::Float32 => Ok("fused_swiglu_down_bm8_f32_col"),
+        DType::Float16 => Ok("fused_swiglu_down_bm8_f16_col"),
+        DType::Bfloat16 => Ok("fused_swiglu_down_bm8_bf16_col"),
+        _ => Err(KernelError::NotFound(format!(
+            "fused_swiglu_down_col not supported for {:?}",
             dtype
         ))),
     }
@@ -1671,6 +1893,312 @@ kernel void fused_rms_gemv_bm8_bf16(
         }
     }
 }
+
+// ===========================================================================
+// Column-major BM8 variants: mat stored as [K, M] instead of [M, K]
+// ===========================================================================
+
+kernel void fused_rms_gemv_bm8_f32_col(
+    device const float* input       [[buffer(0)]],
+    device const float* norm_weight [[buffer(1)]],
+    device const float* mat         [[buffer(2)]],
+    device       float* output      [[buffer(3)]],
+    constant     uint&  M           [[buffer(4)]],
+    constant     uint&  K           [[buffer(5)]],
+    constant     float& eps         [[buffer(6)]],
+    constant     uint&  w_stride    [[buffer(7)]],
+    uint tg_id         [[threadgroup_position_in_grid]],
+    uint simd_lane_id  [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float local_sums[BM8 * SIMD_SIZE];
+    uint tid = simd_group_id * SIMD_SIZE + simd_lane_id;
+
+    // --- Phase 1: compute inv_rms cooperatively (all 256 threads) ---
+    float ss_acc = 0.0f;
+    for (uint i = tid; i < K; i += BM8 * SIMD_SIZE) {
+        float v = input[i];
+        ss_acc += v * v;
+    }
+    ss_acc = simd_sum(ss_acc);
+
+    if (simd_group_id == 0) {
+        local_sums[simd_lane_id] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_lane_id == 0) {
+        local_sums[simd_group_id] = ss_acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group_id == 0) {
+        float total = simd_sum(local_sums[simd_lane_id]);
+        if (simd_lane_id == 0) {
+            local_sums[0] = metal::precise::rsqrt(total / float(K) + eps);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_rms = local_sums[0];
+
+    // --- Phase 2: BM8 GEMV with inline normalization (col-major) ---
+    uint row_base = tg_id * (BM8 * TM) + simd_group_id * TM;
+    if (row_base >= M) return;
+    row_base = (row_base + TM <= M) ? row_base : M - TM;
+    float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    if (w_stride == 1) {
+        uint k16 = as_uniform(K / 16);
+        for (uint i = simd_lane_id; i < k16; i += SIMD_SIZE) {
+            uint idx = i * 16;
+            float4 in4a = *reinterpret_cast<device const float4*>(input + idx);
+            float4 nw4a = *reinterpret_cast<device const float4*>(norm_weight + idx);
+            float4 v4a = in4a * inv_rms * nw4a;
+            float4 in4b = *reinterpret_cast<device const float4*>(input + idx + 4);
+            float4 nw4b = *reinterpret_cast<device const float4*>(norm_weight + idx + 4);
+            float4 v4b = in4b * inv_rms * nw4b;
+            float4 in4c = *reinterpret_cast<device const float4*>(input + idx + 8);
+            float4 nw4c = *reinterpret_cast<device const float4*>(norm_weight + idx + 8);
+            float4 v4c = in4c * inv_rms * nw4c;
+            float4 in4d = *reinterpret_cast<device const float4*>(input + idx + 12);
+            float4 nw4d = *reinterpret_cast<device const float4*>(norm_weight + idx + 12);
+            float4 v4d = in4d * inv_rms * nw4d;
+            // Col-major weight loads
+            #pragma clang loop unroll(full)
+            for (uint sub = 0; sub < 4; sub++) {
+                uint k_base = idx + sub * 4;
+                float4 c0 = *reinterpret_cast<device const float4*>(mat + k_base * M + row_base);
+                float4 c1 = *reinterpret_cast<device const float4*>(mat + (k_base+1) * M + row_base);
+                float4 c2 = *reinterpret_cast<device const float4*>(mat + (k_base+2) * M + row_base);
+                float4 c3 = *reinterpret_cast<device const float4*>(mat + (k_base+3) * M + row_base);
+                float4 v4 = (sub == 0) ? v4a : (sub == 1) ? v4b : (sub == 2) ? v4c : v4d;
+                acc[0] += c0[0] * v4[0] + c1[0] * v4[1] + c2[0] * v4[2] + c3[0] * v4[3];
+                acc[1] += c0[1] * v4[0] + c1[1] * v4[1] + c2[1] * v4[2] + c3[1] * v4[3];
+                acc[2] += c0[2] * v4[0] + c1[2] * v4[1] + c2[2] * v4[2] + c3[2] * v4[3];
+                acc[3] += c0[3] * v4[0] + c1[3] * v4[1] + c2[3] * v4[2] + c3[3] * v4[3];
+            }
+        }
+        // Remainder in groups of 4
+        for (uint i = k16 * 16 + simd_lane_id * 4; i + 3 < K; i += SIMD_SIZE * 4) {
+            float4 in4 = *reinterpret_cast<device const float4*>(input + i);
+            float4 nw4 = *reinterpret_cast<device const float4*>(norm_weight + i);
+            float4 v4 = in4 * inv_rms * nw4;
+            float4 c0 = *reinterpret_cast<device const float4*>(mat + i * M + row_base);
+            float4 c1 = *reinterpret_cast<device const float4*>(mat + (i+1) * M + row_base);
+            float4 c2 = *reinterpret_cast<device const float4*>(mat + (i+2) * M + row_base);
+            float4 c3 = *reinterpret_cast<device const float4*>(mat + (i+3) * M + row_base);
+            acc[0] += c0[0] * v4[0] + c1[0] * v4[1] + c2[0] * v4[2] + c3[0] * v4[3];
+            acc[1] += c0[1] * v4[0] + c1[1] * v4[1] + c2[1] * v4[2] + c3[1] * v4[3];
+            acc[2] += c0[2] * v4[0] + c1[2] * v4[1] + c2[2] * v4[2] + c3[2] * v4[3];
+            acc[3] += c0[3] * v4[0] + c1[3] * v4[1] + c2[3] * v4[2] + c3[3] * v4[3];
+        }
+        // Scalar remainder
+        for (uint i = (K / 4) * 4 + simd_lane_id; i < K; i += SIMD_SIZE) {
+            float v = input[i] * inv_rms * norm_weight[i];
+            #pragma clang loop unroll(full)
+            for (uint r = 0; r < TM; r++) {
+                acc[r] += mat[i * M + row_base + r] * v;
+            }
+        }
+    } else {
+        for (uint i = simd_lane_id; i < K; i += SIMD_SIZE) {
+            float v = input[i] * inv_rms * norm_weight[i * w_stride];
+            #pragma clang loop unroll(full)
+            for (uint r = 0; r < TM; r++) {
+                acc[r] += mat[i * M + row_base + r] * v;
+            }
+        }
+    }
+
+    #pragma clang loop unroll(full)
+    for (uint r = 0; r < TM; r++) {
+        acc[r] = simd_sum(acc[r]);
+        if (simd_lane_id == 0) {
+            output[row_base + r] = acc[r];
+        }
+    }
+}
+
+kernel void fused_rms_gemv_bm8_f16_col(
+    device const half*  input       [[buffer(0)]],
+    device const half*  norm_weight [[buffer(1)]],
+    device const half*  mat         [[buffer(2)]],
+    device       half*  output      [[buffer(3)]],
+    constant     uint&  M           [[buffer(4)]],
+    constant     uint&  K           [[buffer(5)]],
+    constant     float& eps         [[buffer(6)]],
+    constant     uint&  w_stride    [[buffer(7)]],
+    uint tg_id         [[threadgroup_position_in_grid]],
+    uint simd_lane_id  [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float local_sums[BM8 * SIMD_SIZE];
+    uint tid = simd_group_id * SIMD_SIZE + simd_lane_id;
+
+    // --- Phase 1: compute inv_rms cooperatively (all 256 threads) ---
+    float ss_acc = 0.0f;
+    for (uint i = tid; i < K; i += BM8 * SIMD_SIZE) {
+        float v = float(input[i]);
+        ss_acc += v * v;
+    }
+    ss_acc = simd_sum(ss_acc);
+
+    if (simd_group_id == 0) {
+        local_sums[simd_lane_id] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_lane_id == 0) {
+        local_sums[simd_group_id] = ss_acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group_id == 0) {
+        float total = simd_sum(local_sums[simd_lane_id]);
+        if (simd_lane_id == 0) {
+            local_sums[0] = metal::precise::rsqrt(total / float(K) + eps);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_rms = local_sums[0];
+
+    // --- Phase 2: BM8 GEMV with inline normalization (col-major) ---
+    uint row_base = tg_id * (BM8 * TM) + simd_group_id * TM;
+    if (row_base >= M) return;
+    row_base = (row_base + TM <= M) ? row_base : M - TM;
+    float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    if (w_stride == 1) {
+        uint k16 = as_uniform(K / 16);
+        for (uint i = simd_lane_id; i < k16; i += SIMD_SIZE) {
+            uint idx = i * 16;
+            float4 in4a = float4(*reinterpret_cast<device const half4*>(input + idx));
+            float4 nw4a = float4(*reinterpret_cast<device const half4*>(norm_weight + idx));
+            float4 v4a = in4a * inv_rms * nw4a;
+            float4 in4b = float4(*reinterpret_cast<device const half4*>(input + idx + 4));
+            float4 nw4b = float4(*reinterpret_cast<device const half4*>(norm_weight + idx + 4));
+            float4 v4b = in4b * inv_rms * nw4b;
+            float4 in4c = float4(*reinterpret_cast<device const half4*>(input + idx + 8));
+            float4 nw4c = float4(*reinterpret_cast<device const half4*>(norm_weight + idx + 8));
+            float4 v4c = in4c * inv_rms * nw4c;
+            float4 in4d = float4(*reinterpret_cast<device const half4*>(input + idx + 12));
+            float4 nw4d = float4(*reinterpret_cast<device const half4*>(norm_weight + idx + 12));
+            float4 v4d = in4d * inv_rms * nw4d;
+            // Col-major weight loads
+            #pragma clang loop unroll(full)
+            for (uint sub = 0; sub < 4; sub++) {
+                uint k_base = idx + sub * 4;
+                half4 c0 = *reinterpret_cast<device const half4*>(mat + k_base * M + row_base);
+                half4 c1 = *reinterpret_cast<device const half4*>(mat + (k_base+1) * M + row_base);
+                half4 c2 = *reinterpret_cast<device const half4*>(mat + (k_base+2) * M + row_base);
+                half4 c3 = *reinterpret_cast<device const half4*>(mat + (k_base+3) * M + row_base);
+                float4 v4 = (sub == 0) ? v4a : (sub == 1) ? v4b : (sub == 2) ? v4c : v4d;
+                acc[0] += float(c0[0]) * v4[0] + float(c1[0]) * v4[1] + float(c2[0]) * v4[2] + float(c3[0]) * v4[3];
+                acc[1] += float(c0[1]) * v4[0] + float(c1[1]) * v4[1] + float(c2[1]) * v4[2] + float(c3[1]) * v4[3];
+                acc[2] += float(c0[2]) * v4[0] + float(c1[2]) * v4[1] + float(c2[2]) * v4[2] + float(c3[2]) * v4[3];
+                acc[3] += float(c0[3]) * v4[0] + float(c1[3]) * v4[1] + float(c2[3]) * v4[2] + float(c3[3]) * v4[3];
+            }
+        }
+        // Remainder in groups of 4
+        for (uint i = k16 * 16 + simd_lane_id * 4; i + 3 < K; i += SIMD_SIZE * 4) {
+            float4 in4 = float4(*reinterpret_cast<device const half4*>(input + i));
+            float4 nw4 = float4(*reinterpret_cast<device const half4*>(norm_weight + i));
+            float4 v4 = in4 * inv_rms * nw4;
+            half4 c0 = *reinterpret_cast<device const half4*>(mat + i * M + row_base);
+            half4 c1 = *reinterpret_cast<device const half4*>(mat + (i+1) * M + row_base);
+            half4 c2 = *reinterpret_cast<device const half4*>(mat + (i+2) * M + row_base);
+            half4 c3 = *reinterpret_cast<device const half4*>(mat + (i+3) * M + row_base);
+            acc[0] += float(c0[0]) * v4[0] + float(c1[0]) * v4[1] + float(c2[0]) * v4[2] + float(c3[0]) * v4[3];
+            acc[1] += float(c0[1]) * v4[0] + float(c1[1]) * v4[1] + float(c2[1]) * v4[2] + float(c3[1]) * v4[3];
+            acc[2] += float(c0[2]) * v4[0] + float(c1[2]) * v4[1] + float(c2[2]) * v4[2] + float(c3[2]) * v4[3];
+            acc[3] += float(c0[3]) * v4[0] + float(c1[3]) * v4[1] + float(c2[3]) * v4[2] + float(c3[3]) * v4[3];
+        }
+        // Scalar remainder
+        for (uint i = (K / 4) * 4 + simd_lane_id; i < K; i += SIMD_SIZE) {
+            float v = float(input[i]) * inv_rms * float(norm_weight[i]);
+            #pragma clang loop unroll(full)
+            for (uint r = 0; r < TM; r++) {
+                acc[r] += float(mat[i * M + row_base + r]) * v;
+            }
+        }
+    } else {
+        for (uint i = simd_lane_id; i < K; i += SIMD_SIZE) {
+            float v = float(input[i]) * inv_rms * float(norm_weight[i * w_stride]);
+            #pragma clang loop unroll(full)
+            for (uint r = 0; r < TM; r++) {
+                acc[r] += float(mat[i * M + row_base + r]) * v;
+            }
+        }
+    }
+
+    #pragma clang loop unroll(full)
+    for (uint r = 0; r < TM; r++) {
+        acc[r] = simd_sum(acc[r]);
+        if (simd_lane_id == 0) {
+            output[row_base + r] = half(acc[r]);
+        }
+    }
+}
+
+kernel void fused_rms_gemv_bm8_bf16_col(
+    device const bfloat* input       [[buffer(0)]],
+    device const bfloat* norm_weight [[buffer(1)]],
+    device const bfloat* mat         [[buffer(2)]],
+    device       bfloat* output      [[buffer(3)]],
+    constant     uint&   M           [[buffer(4)]],
+    constant     uint&   K           [[buffer(5)]],
+    constant     float&  eps         [[buffer(6)]],
+    constant     uint&   w_stride    [[buffer(7)]],
+    uint tg_id         [[threadgroup_position_in_grid]],
+    uint simd_lane_id  [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float local_sums[BM8 * SIMD_SIZE];
+    uint tid = simd_group_id * SIMD_SIZE + simd_lane_id;
+
+    // --- Phase 1: compute inv_rms cooperatively (all 256 threads) ---
+    float ss_acc = 0.0f;
+    for (uint i = tid; i < K; i += BM8 * SIMD_SIZE) {
+        float v = float(input[i]);
+        ss_acc += v * v;
+    }
+    ss_acc = simd_sum(ss_acc);
+
+    if (simd_group_id == 0) {
+        local_sums[simd_lane_id] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_lane_id == 0) {
+        local_sums[simd_group_id] = ss_acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group_id == 0) {
+        float total = simd_sum(local_sums[simd_lane_id]);
+        if (simd_lane_id == 0) {
+            local_sums[0] = metal::precise::rsqrt(total / float(K) + eps);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_rms = local_sums[0];
+
+    // --- Phase 2: BM8 GEMV with inline normalization (bf16 col-major: scalar only) ---
+    uint row_base = tg_id * (BM8 * TM) + simd_group_id * TM;
+    if (row_base >= M) return;
+    row_base = (row_base + TM <= M) ? row_base : M - TM;
+    float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (uint i = simd_lane_id; i < K; i += SIMD_SIZE) {
+        float v = float(input[i]) * inv_rms * float(norm_weight[i * w_stride]);
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            acc[r] += float(mat[i * M + row_base + r]) * v;
+        }
+    }
+
+    #pragma clang loop unroll(full)
+    for (uint r = 0; r < TM; r++) {
+        acc[r] = simd_sum(acc[r]);
+        if (simd_lane_id == 0) {
+            output[row_base + r] = bfloat(acc[r]);
+        }
+    }
+}
 "#;
 
 /// Get the fused RMS-norm + GEMV kernel name for a given dtype and M dimension.
@@ -1687,6 +2215,21 @@ pub fn fused_rms_gemv_kernel_name(dtype: DType, m: u32) -> Result<&'static str, 
         (DType::Bfloat16, false) => Ok("fused_rms_gemv_bf16"),
         _ => Err(KernelError::NotFound(format!(
             "fused_rms_gemv not supported for {:?}",
+            dtype
+        ))),
+    }
+}
+
+/// Get the fused RMS-norm + GEMV column-major kernel name for a given dtype.
+///
+/// Only BM8 variants are available (M >= 256 assumed by caller).
+pub fn fused_rms_gemv_col_kernel_name(dtype: DType) -> Result<&'static str, KernelError> {
+    match dtype {
+        DType::Float32 => Ok("fused_rms_gemv_bm8_f32_col"),
+        DType::Float16 => Ok("fused_rms_gemv_bm8_f16_col"),
+        DType::Bfloat16 => Ok("fused_rms_gemv_bm8_bf16_col"),
+        _ => Err(KernelError::NotFound(format!(
+            "fused_rms_gemv_col not supported for {:?}",
             dtype
         ))),
     }

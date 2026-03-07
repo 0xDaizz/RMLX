@@ -11,6 +11,8 @@
 //! - `gemv_t_f32` / `gemv_t_f16` / `gemv_t_bf16` -- transposed: y = A^T @ x
 //! - Fused bias variants: `gemv_bias_f32`, `gemv_bias_f16`, `gemv_bias_bf16`
 //! - Fused bias BM=8 variants: `gemv_bias_bm8_f32`, `gemv_bias_bm8_f16`, `gemv_bias_bm8_bf16`
+//! - Column-major BM=8 variants: `gemv_bm8_f32_col`, `gemv_bm8_f16_col`, `gemv_bm8_bf16_col`
+//! - Column-major fused bias BM=8: `gemv_bias_bm8_f32_col`, `gemv_bias_bm8_f16_col`, `gemv_bias_bm8_bf16_col`
 
 use crate::array::Array;
 use crate::dtype::DType;
@@ -823,6 +825,293 @@ kernel void gemv_bias_bm8_bf16(
         #pragma clang loop unroll(full)
         for (uint r = 0; r < TM; r++) {
             acc[r] += float(mat[(row_base + r) * K + i]) * v;
+        }
+    }
+
+    #pragma clang loop unroll(full)
+    for (uint r = 0; r < TM; r++) {
+        acc[r] = simd_sum(acc[r]);
+        if (simd_lane_id == 0) {
+            output[row_base + r] = bfloat(acc[r] + float(bias[row_base + r]));
+        }
+    }
+}
+
+// ===========================================================================
+// Column-major BM=8 variants:  y = A_col * x
+// A stored column-major [K, M] (i.e. TM=4 rows contiguous per k position)
+// Same buffer layout (0=mat, 1=vec, 2=output, 3=M, 4=K)
+// ===========================================================================
+
+kernel void gemv_bm8_f16_col(
+    device const half*  mat    [[buffer(0)]],
+    device const half*  vec    [[buffer(1)]],
+    device       half*  output [[buffer(2)]],
+    constant     uint&  M      [[buffer(3)]],
+    constant     uint&  K      [[buffer(4)]],
+    uint tg_id         [[threadgroup_position_in_grid]],
+    uint simd_lane_id  [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]])
+{
+    uint row_base = tg_id * (BM8 * TM) + simd_group_id * TM;
+    if (row_base >= M) return;
+    row_base = (row_base + TM <= M) ? row_base : M - TM;
+
+    float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    // Col-major: mat is [K, M] row-major = [M, K] col-major
+    // For each k, TM=4 rows are contiguous: half4 at mat + k*M + row_base
+    uint k16 = as_uniform(K / 16);
+    for (uint i = simd_lane_id; i < k16; i += SIMD_SIZE) {
+        uint idx = i * 16;
+        float4 v4a = float4(*reinterpret_cast<device const half4*>(vec + idx));
+        float4 v4b = float4(*reinterpret_cast<device const half4*>(vec + idx + 4));
+        float4 v4c = float4(*reinterpret_cast<device const half4*>(vec + idx + 8));
+        float4 v4d = float4(*reinterpret_cast<device const half4*>(vec + idx + 12));
+
+        #pragma clang loop unroll(full)
+        for (uint sub = 0; sub < 4; sub++) {
+            uint k_base = idx + sub * 4;
+            half4 c0 = *reinterpret_cast<device const half4*>(mat + k_base * M + row_base);
+            half4 c1 = *reinterpret_cast<device const half4*>(mat + (k_base+1) * M + row_base);
+            half4 c2 = *reinterpret_cast<device const half4*>(mat + (k_base+2) * M + row_base);
+            half4 c3 = *reinterpret_cast<device const half4*>(mat + (k_base+3) * M + row_base);
+            float4 v4 = (sub == 0) ? v4a : (sub == 1) ? v4b : (sub == 2) ? v4c : v4d;
+            acc[0] += float(c0[0]) * v4[0] + float(c1[0]) * v4[1] + float(c2[0]) * v4[2] + float(c3[0]) * v4[3];
+            acc[1] += float(c0[1]) * v4[0] + float(c1[1]) * v4[1] + float(c2[1]) * v4[2] + float(c3[1]) * v4[3];
+            acc[2] += float(c0[2]) * v4[0] + float(c1[2]) * v4[1] + float(c2[2]) * v4[2] + float(c3[2]) * v4[3];
+            acc[3] += float(c0[3]) * v4[0] + float(c1[3]) * v4[1] + float(c2[3]) * v4[2] + float(c3[3]) * v4[3];
+        }
+    }
+    // Remainder in groups of 4
+    for (uint i = k16 * 16 + simd_lane_id * 4; i + 3 < K; i += SIMD_SIZE * 4) {
+        float4 v4 = float4(*reinterpret_cast<device const half4*>(vec + i));
+        half4 c0 = *reinterpret_cast<device const half4*>(mat + i * M + row_base);
+        half4 c1 = *reinterpret_cast<device const half4*>(mat + (i+1) * M + row_base);
+        half4 c2 = *reinterpret_cast<device const half4*>(mat + (i+2) * M + row_base);
+        half4 c3 = *reinterpret_cast<device const half4*>(mat + (i+3) * M + row_base);
+        acc[0] += float(c0[0]) * v4[0] + float(c1[0]) * v4[1] + float(c2[0]) * v4[2] + float(c3[0]) * v4[3];
+        acc[1] += float(c0[1]) * v4[0] + float(c1[1]) * v4[1] + float(c2[1]) * v4[2] + float(c3[1]) * v4[3];
+        acc[2] += float(c0[2]) * v4[0] + float(c1[2]) * v4[1] + float(c2[2]) * v4[2] + float(c3[2]) * v4[3];
+        acc[3] += float(c0[3]) * v4[0] + float(c1[3]) * v4[1] + float(c2[3]) * v4[2] + float(c3[3]) * v4[3];
+    }
+    // Scalar remainder
+    for (uint i = (K / 4) * 4 + simd_lane_id; i < K; i += SIMD_SIZE) {
+        float v = float(vec[i]);
+        half4 c = *reinterpret_cast<device const half4*>(mat + i * M + row_base);
+        acc[0] += float(c[0]) * v;
+        acc[1] += float(c[1]) * v;
+        acc[2] += float(c[2]) * v;
+        acc[3] += float(c[3]) * v;
+    }
+
+    #pragma clang loop unroll(full)
+    for (uint r = 0; r < TM; r++) {
+        acc[r] = simd_sum(acc[r]);
+        if (simd_lane_id == 0) {
+            output[row_base + r] = half(acc[r]);
+        }
+    }
+}
+
+kernel void gemv_bm8_f32_col(
+    device const float* mat  [[buffer(0)]],
+    device const float* vec  [[buffer(1)]],
+    device       float* output [[buffer(2)]],
+    constant     uint&  M    [[buffer(3)]],
+    constant     uint&  K    [[buffer(4)]],
+    uint tg_id         [[threadgroup_position_in_grid]],
+    uint simd_lane_id  [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]])
+{
+    uint row_base = tg_id * (BM8 * TM) + simd_group_id * TM;
+    if (row_base >= M) return;
+    row_base = (row_base + TM <= M) ? row_base : M - TM;
+
+    float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    // Col-major: TM=4 floats contiguous per k position
+    for (uint i = simd_lane_id; i < K; i += SIMD_SIZE) {
+        float v = vec[i];
+        float4 c = *reinterpret_cast<device const float4*>(mat + i * M + row_base);
+        acc[0] += c[0] * v;
+        acc[1] += c[1] * v;
+        acc[2] += c[2] * v;
+        acc[3] += c[3] * v;
+    }
+
+    #pragma clang loop unroll(full)
+    for (uint r = 0; r < TM; r++) {
+        acc[r] = simd_sum(acc[r]);
+        if (simd_lane_id == 0) {
+            output[row_base + r] = acc[r];
+        }
+    }
+}
+
+kernel void gemv_bm8_bf16_col(
+    device const bfloat*  mat    [[buffer(0)]],
+    device const bfloat*  vec    [[buffer(1)]],
+    device       bfloat*  output [[buffer(2)]],
+    constant     uint&    M      [[buffer(3)]],
+    constant     uint&    K      [[buffer(4)]],
+    uint tg_id         [[threadgroup_position_in_grid]],
+    uint simd_lane_id  [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]])
+{
+    uint row_base = tg_id * (BM8 * TM) + simd_group_id * TM;
+    if (row_base >= M) return;
+    row_base = (row_base + TM <= M) ? row_base : M - TM;
+
+    float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    // Col-major scalar: bf16 doesn't support vector loads
+    for (uint i = simd_lane_id; i < K; i += SIMD_SIZE) {
+        float v = float(vec[i]);
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            acc[r] += float(mat[i * M + row_base + r]) * v;
+        }
+    }
+
+    #pragma clang loop unroll(full)
+    for (uint r = 0; r < TM; r++) {
+        acc[r] = simd_sum(acc[r]);
+        if (simd_lane_id == 0) {
+            output[row_base + r] = bfloat(acc[r]);
+        }
+    }
+}
+
+// ===========================================================================
+// Column-major fused bias BM=8 variants:  y = A_col * x + bias
+// ===========================================================================
+
+kernel void gemv_bias_bm8_f16_col(
+    device const half*  mat    [[buffer(0)]],
+    device const half*  vec    [[buffer(1)]],
+    device       half*  output [[buffer(2)]],
+    constant     uint&  M      [[buffer(3)]],
+    constant     uint&  K      [[buffer(4)]],
+    device const half*  bias   [[buffer(5)]],
+    uint tg_id         [[threadgroup_position_in_grid]],
+    uint simd_lane_id  [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]])
+{
+    uint row_base = tg_id * (BM8 * TM) + simd_group_id * TM;
+    if (row_base >= M) return;
+    row_base = (row_base + TM <= M) ? row_base : M - TM;
+
+    float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    uint k16 = as_uniform(K / 16);
+    for (uint i = simd_lane_id; i < k16; i += SIMD_SIZE) {
+        uint idx = i * 16;
+        float4 v4a = float4(*reinterpret_cast<device const half4*>(vec + idx));
+        float4 v4b = float4(*reinterpret_cast<device const half4*>(vec + idx + 4));
+        float4 v4c = float4(*reinterpret_cast<device const half4*>(vec + idx + 8));
+        float4 v4d = float4(*reinterpret_cast<device const half4*>(vec + idx + 12));
+
+        #pragma clang loop unroll(full)
+        for (uint sub = 0; sub < 4; sub++) {
+            uint k_base = idx + sub * 4;
+            half4 c0 = *reinterpret_cast<device const half4*>(mat + k_base * M + row_base);
+            half4 c1 = *reinterpret_cast<device const half4*>(mat + (k_base+1) * M + row_base);
+            half4 c2 = *reinterpret_cast<device const half4*>(mat + (k_base+2) * M + row_base);
+            half4 c3 = *reinterpret_cast<device const half4*>(mat + (k_base+3) * M + row_base);
+            float4 v4 = (sub == 0) ? v4a : (sub == 1) ? v4b : (sub == 2) ? v4c : v4d;
+            acc[0] += float(c0[0]) * v4[0] + float(c1[0]) * v4[1] + float(c2[0]) * v4[2] + float(c3[0]) * v4[3];
+            acc[1] += float(c0[1]) * v4[0] + float(c1[1]) * v4[1] + float(c2[1]) * v4[2] + float(c3[1]) * v4[3];
+            acc[2] += float(c0[2]) * v4[0] + float(c1[2]) * v4[1] + float(c2[2]) * v4[2] + float(c3[2]) * v4[3];
+            acc[3] += float(c0[3]) * v4[0] + float(c1[3]) * v4[1] + float(c2[3]) * v4[2] + float(c3[3]) * v4[3];
+        }
+    }
+    for (uint i = k16 * 16 + simd_lane_id * 4; i + 3 < K; i += SIMD_SIZE * 4) {
+        float4 v4 = float4(*reinterpret_cast<device const half4*>(vec + i));
+        half4 c0 = *reinterpret_cast<device const half4*>(mat + i * M + row_base);
+        half4 c1 = *reinterpret_cast<device const half4*>(mat + (i+1) * M + row_base);
+        half4 c2 = *reinterpret_cast<device const half4*>(mat + (i+2) * M + row_base);
+        half4 c3 = *reinterpret_cast<device const half4*>(mat + (i+3) * M + row_base);
+        acc[0] += float(c0[0]) * v4[0] + float(c1[0]) * v4[1] + float(c2[0]) * v4[2] + float(c3[0]) * v4[3];
+        acc[1] += float(c0[1]) * v4[0] + float(c1[1]) * v4[1] + float(c2[1]) * v4[2] + float(c3[1]) * v4[3];
+        acc[2] += float(c0[2]) * v4[0] + float(c1[2]) * v4[1] + float(c2[2]) * v4[2] + float(c3[2]) * v4[3];
+        acc[3] += float(c0[3]) * v4[0] + float(c1[3]) * v4[1] + float(c2[3]) * v4[2] + float(c3[3]) * v4[3];
+    }
+    for (uint i = (K / 4) * 4 + simd_lane_id; i < K; i += SIMD_SIZE) {
+        float v = float(vec[i]);
+        half4 c = *reinterpret_cast<device const half4*>(mat + i * M + row_base);
+        acc[0] += float(c[0]) * v;
+        acc[1] += float(c[1]) * v;
+        acc[2] += float(c[2]) * v;
+        acc[3] += float(c[3]) * v;
+    }
+
+    #pragma clang loop unroll(full)
+    for (uint r = 0; r < TM; r++) {
+        acc[r] = simd_sum(acc[r]);
+        if (simd_lane_id == 0) {
+            output[row_base + r] = half(acc[r] + float(bias[row_base + r]));
+        }
+    }
+}
+
+kernel void gemv_bias_bm8_f32_col(
+    device const float* mat    [[buffer(0)]],
+    device const float* vec    [[buffer(1)]],
+    device       float* output [[buffer(2)]],
+    constant     uint&  M      [[buffer(3)]],
+    constant     uint&  K      [[buffer(4)]],
+    device const float* bias   [[buffer(5)]],
+    uint tg_id         [[threadgroup_position_in_grid]],
+    uint simd_lane_id  [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]])
+{
+    uint row_base = tg_id * (BM8 * TM) + simd_group_id * TM;
+    if (row_base >= M) return;
+    row_base = (row_base + TM <= M) ? row_base : M - TM;
+
+    float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (uint i = simd_lane_id; i < K; i += SIMD_SIZE) {
+        float v = vec[i];
+        float4 c = *reinterpret_cast<device const float4*>(mat + i * M + row_base);
+        acc[0] += c[0] * v;
+        acc[1] += c[1] * v;
+        acc[2] += c[2] * v;
+        acc[3] += c[3] * v;
+    }
+
+    #pragma clang loop unroll(full)
+    for (uint r = 0; r < TM; r++) {
+        acc[r] = simd_sum(acc[r]);
+        if (simd_lane_id == 0) {
+            output[row_base + r] = acc[r] + bias[row_base + r];
+        }
+    }
+}
+
+kernel void gemv_bias_bm8_bf16_col(
+    device const bfloat*  mat    [[buffer(0)]],
+    device const bfloat*  vec    [[buffer(1)]],
+    device       bfloat*  output [[buffer(2)]],
+    constant     uint&    M      [[buffer(3)]],
+    constant     uint&    K      [[buffer(4)]],
+    device const bfloat*  bias   [[buffer(5)]],
+    uint tg_id         [[threadgroup_position_in_grid]],
+    uint simd_lane_id  [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]])
+{
+    uint row_base = tg_id * (BM8 * TM) + simd_group_id * TM;
+    if (row_base >= M) return;
+    row_base = (row_base + TM <= M) ? row_base : M - TM;
+
+    float acc[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (uint i = simd_lane_id; i < K; i += SIMD_SIZE) {
+        float v = float(vec[i]);
+        #pragma clang loop unroll(full)
+        for (uint r = 0; r < TM; r++) {
+            acc[r] += float(mat[i * M + row_base + r]) * v;
         }
     }
 
@@ -1937,6 +2226,44 @@ pub fn gemv_bias_kernel_name(dtype: DType, m: u32) -> Result<&'static str, Kerne
         (DType::Bfloat16, false) => Ok("gemv_bias_bf16"),
         _ => Err(KernelError::NotFound(format!(
             "gemv_bias not supported for {:?}",
+            dtype
+        ))),
+    }
+}
+
+/// Get the column-major GEMV kernel name (BM8 only, M >= 256).
+pub fn gemv_col_kernel_name(dtype: DType, m: u32) -> Result<&'static str, KernelError> {
+    if (m as u64) < BM8_THRESHOLD {
+        return Err(KernelError::NotFound(format!(
+            "gemv_col requires M >= {} (BM8), got {}",
+            BM8_THRESHOLD, m
+        )));
+    }
+    match dtype {
+        DType::Float32 => Ok("gemv_bm8_f32_col"),
+        DType::Float16 => Ok("gemv_bm8_f16_col"),
+        DType::Bfloat16 => Ok("gemv_bm8_bf16_col"),
+        _ => Err(KernelError::NotFound(format!(
+            "gemv_col not supported for {:?}",
+            dtype
+        ))),
+    }
+}
+
+/// Get the column-major GEMV+bias kernel name (BM8 only, M >= 256).
+pub fn gemv_bias_col_kernel_name(dtype: DType, m: u32) -> Result<&'static str, KernelError> {
+    if (m as u64) < BM8_THRESHOLD {
+        return Err(KernelError::NotFound(format!(
+            "gemv_bias_col requires M >= {} (BM8), got {}",
+            BM8_THRESHOLD, m
+        )));
+    }
+    match dtype {
+        DType::Float32 => Ok("gemv_bias_bm8_f32_col"),
+        DType::Float16 => Ok("gemv_bias_bm8_f16_col"),
+        DType::Bfloat16 => Ok("gemv_bias_bm8_bf16_col"),
+        _ => Err(KernelError::NotFound(format!(
+            "gemv_bias_col not supported for {:?}",
             dtype
         ))),
     }
