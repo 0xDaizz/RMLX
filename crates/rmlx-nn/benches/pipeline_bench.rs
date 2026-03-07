@@ -473,7 +473,10 @@ fn main() {
     println!("ExecGraph speedup:  {:.2}x", speedup);
     println!("Single-CB speedup:  {:.2}x", single_cb_speedup);
     println!("9-Dispatch speedup: {:.2}x", nine_dispatch_speedup);
-    println!("Concurrent-9-Dispatch speedup: {:.2}x", concurrent_9d_speedup);
+    println!(
+        "Concurrent-9-Dispatch speedup: {:.2}x",
+        concurrent_9d_speedup
+    );
     println!(
         "CB reduction:   {} -> {} -> 1",
         baseline_cbs, graph_total_cbs

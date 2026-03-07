@@ -40,8 +40,8 @@ pub use command::{
     BarrierTracker, CommandBufferManager, GpuError, GpuErrorStore,
 };
 pub use device::{
-    ArchClass, Architecture, ChipTuning, GpuDevice, DEFAULT_BUFFER_OPTIONS,
-    TRACKED_BUFFER_OPTIONS, UNTRACKED_BUFFER_OPTIONS,
+    ArchClass, Architecture, ChipTuning, GpuDevice, DEFAULT_BUFFER_OPTIONS, TRACKED_BUFFER_OPTIONS,
+    UNTRACKED_BUFFER_OPTIONS,
 };
 pub use event::GpuEvent;
 pub use exec_graph::ExecGraph;

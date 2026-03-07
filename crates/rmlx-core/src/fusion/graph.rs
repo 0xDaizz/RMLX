@@ -38,12 +38,28 @@ impl FusableOp {
     /// Number of inputs this op requires.
     pub fn arity(&self) -> usize {
         match self {
-            Self::Neg | Self::Exp | Self::Log | Self::Sqrt | Self::Rsqrt
-            | Self::Abs | Self::Sigmoid | Self::Tanh | Self::SiLU | Self::GELU
-            | Self::Relu | Self::CastF16ToF32 | Self::CastF32ToF16
+            Self::Neg
+            | Self::Exp
+            | Self::Log
+            | Self::Sqrt
+            | Self::Rsqrt
+            | Self::Abs
+            | Self::Sigmoid
+            | Self::Tanh
+            | Self::SiLU
+            | Self::GELU
+            | Self::Relu
+            | Self::CastF16ToF32
+            | Self::CastF32ToF16
             | Self::CastBf16ToF32 => 1,
-            Self::Add | Self::Mul | Self::Sub | Self::Div | Self::Max
-            | Self::Min | Self::Pow | Self::Mod => 2,
+            Self::Add
+            | Self::Mul
+            | Self::Sub
+            | Self::Div
+            | Self::Max
+            | Self::Min
+            | Self::Pow
+            | Self::Mod => 2,
             Self::Select => 3,
         }
     }
@@ -215,7 +231,11 @@ mod tests {
         g3.set_outputs(1);
 
         assert_eq!(g1.cache_key(), g2.cache_key(), "same graph = same key");
-        assert_ne!(g1.cache_key(), g3.cache_key(), "different op = different key");
+        assert_ne!(
+            g1.cache_key(),
+            g3.cache_key(),
+            "different op = different key"
+        );
     }
 
     #[test]

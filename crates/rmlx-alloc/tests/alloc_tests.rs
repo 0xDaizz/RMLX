@@ -346,8 +346,11 @@ fn test_small_alloc_uses_pool() {
     let (buf, sub_offset) = allocator.alloc(64).expect("small alloc should succeed");
     assert!(buf.length() > 0);
     // Sub-allocation offset must be within the backing buffer.
-    assert!(sub_offset + 64 <= buf.length() as usize,
-        "sub_offset ({sub_offset}) + size (64) must fit within backing buffer length ({})", buf.length());
+    assert!(
+        sub_offset + 64 <= buf.length() as usize,
+        "sub_offset ({sub_offset}) + size (64) must fit within backing buffer length ({})",
+        buf.length()
+    );
 
     // The small pool should have one fewer free slot.
     let after_alloc_free = allocator.small_pool().free_count();
