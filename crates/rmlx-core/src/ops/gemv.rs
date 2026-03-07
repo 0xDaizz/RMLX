@@ -86,13 +86,20 @@ constant constexpr uint SIMD_SIZE = 32;
 constant constexpr uint TM = 4;   // rows per threadgroup
 constant constexpr uint BM8 = 8;  // simdgroups per threadgroup for bm8 variant
 
-// Uniform hint — tells Metal compiler a value is warp-uniform (same across all threads).
-// This enables better instruction scheduling and reduces register pressure.
-// constant uint& params are already uniform, but derived values (K/4, K/8) may lose it.
+// Uniform hint — on Metal 3.1+ (M3 and later), uses the real uniform<T> type
+// to tell the compiler a value is warp-uniform (same across all threads).
+// On older devices, falls back to a no-op.
+#if __METAL_VERSION__ >= 310
+template <typename T>
+METAL_FUNC uniform<T> as_uniform(T val) {
+    return make_uniform(val);
+}
+#else
 template <typename T>
 METAL_FUNC T as_uniform(T val) {
     return val;
 }
+#endif
 
 // ---------------------------------------------------------------------------
 // gemv_f32:  y = A * x    (A: [M, K], x: [K], y: [M])
