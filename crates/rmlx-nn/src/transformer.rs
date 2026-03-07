@@ -2874,7 +2874,7 @@ impl CachedDecode {
     /// Resolves all PSOs and allocates all scratch buffers up-front.
     /// `block` must have all weights loaded and merged (prepare_merged_qkv, prepare_merged_gate_up).
     #[allow(clippy::too_many_arguments)]
-    pub fn new(block: &TransformerBlock, registry: &KernelRegistry, _queue: &metal::CommandQueue) -> Result<Self, KernelError> {
+    pub fn new(block: &TransformerBlock, registry: &KernelRegistry, queue: &metal::CommandQueue) -> Result<Self, KernelError> {
         let attn = &block.attention;
         let num_heads = attn.num_heads();
         let num_kv_heads = attn.num_kv_heads();
@@ -3073,14 +3073,33 @@ impl CachedDecode {
                 .unwrap_or((metal::MTLSize::new(1, 1, 1), metal::MTLSize::new(1, 1, 1)));
 
         // Helper: create interleaved [M/TM, K, TM] buffer from row-major [M, K] weight
-        fn interleave_weight(src: &Array, m: usize, k: usize, dev: &metal::DeviceRef) -> Option<metal::Buffer> {
+        // Uses blit copy to handle StorageModePrivate weights safely.
+        fn interleave_weight(src: &Array, m: usize, k: usize, dev: &metal::DeviceRef, queue: &metal::CommandQueue) -> Option<metal::Buffer> {
             let tm = 4usize;
             if m < tm { return None; }
             let m_padded = (m / tm) * tm;
             let elem_size = src.dtype().size_of();
-            let src_ptr = src.metal_buffer().contents() as *const u8;
-            let src_offset = src.offset();
             let byte_size = m_padded * k * elem_size;
+
+            // Blit source to a temporary Shared buffer (handles Private storage mode)
+            let tmp_buf = dev.new_buffer(
+                byte_size as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+            let cb = queue.new_command_buffer();
+            let blit = cb.new_blit_command_encoder();
+            blit.copy_from_buffer(
+                src.metal_buffer(),
+                src.offset() as u64,
+                &tmp_buf,
+                0,
+                byte_size as u64,
+            );
+            blit.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+
+            let src_ptr = tmp_buf.contents() as *const u8;
             let dst_buf = dev.new_buffer(byte_size as u64, metal::MTLResourceOptions::StorageModeShared);
             let dst_ptr = dst_buf.contents() as *mut u8;
             unsafe {
@@ -3088,7 +3107,7 @@ impl CachedDecode {
                     for ki in 0..k {
                         for r in 0..tm {
                             let src_row = group * tm + r;
-                            let src_idx = src_offset + (src_row * k + ki) * elem_size;
+                            let src_idx = (src_row * k + ki) * elem_size;
                             let dst_idx = (group * k * tm + ki * tm + r) * elem_size;
                             std::ptr::copy_nonoverlapping(
                                 src_ptr.add(src_idx),
@@ -3112,10 +3131,10 @@ impl CachedDecode {
             _ => (None, None),
         };
 
-        let qkv_weight_interleaved = qkv_w.and_then(|w| interleave_weight(w, qkv_dim, hidden_size, dev));
-        let o_weight_interleaved = o_w.and_then(|w| interleave_weight(w, hidden_size, hidden_size, dev));
-        let gate_up_weight_interleaved = gu_w.and_then(|w| interleave_weight(w, gate_up_total, hidden_size, dev));
-        let down_weight_interleaved = d_w.and_then(|w| interleave_weight(w, hidden_size, intermediate_dim, dev));
+        let qkv_weight_interleaved = qkv_w.and_then(|w| interleave_weight(w, qkv_dim, hidden_size, dev, queue));
+        let o_weight_interleaved = o_w.and_then(|w| interleave_weight(w, hidden_size, hidden_size, dev, queue));
+        let gate_up_weight_interleaved = gu_w.and_then(|w| interleave_weight(w, gate_up_total, hidden_size, dev, queue));
+        let down_weight_interleaved = d_w.and_then(|w| interleave_weight(w, hidden_size, intermediate_dim, dev, queue));
 
         // --- Pre-allocate scratch buffers ---
         let normed_buf = dev.new_buffer(

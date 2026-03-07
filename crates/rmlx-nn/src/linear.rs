@@ -310,12 +310,30 @@ impl Linear {
 
         let m_padded = (m / tm) * tm; // Round down to TM boundary
         let elem_size = weight.dtype().size_of();
-        let src_ptr = weight.metal_buffer().contents() as *const u8;
-        let src_offset = weight.offset();
 
         let total_elems = m_padded * k;
         let byte_size = total_elems * elem_size;
         let dev = _registry.device().raw();
+
+        // Blit source to a temporary Shared buffer (handles Private storage mode)
+        let tmp_buf = dev.new_buffer(
+            byte_size as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        let cb = _queue.new_command_buffer();
+        let blit = cb.new_blit_command_encoder();
+        blit.copy_from_buffer(
+            weight.metal_buffer(),
+            weight.offset() as u64,
+            &tmp_buf,
+            0,
+            byte_size as u64,
+        );
+        blit.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        let src_ptr = tmp_buf.contents() as *const u8;
         let dst_buf = dev.new_buffer(
             byte_size as u64,
             metal::MTLResourceOptions::StorageModeShared,
@@ -328,7 +346,7 @@ impl Linear {
                 for ki in 0..k {
                     for r in 0..tm {
                         let src_row = group * tm + r;
-                        let src_idx = src_offset + (src_row * k + ki) * elem_size;
+                        let src_idx = (src_row * k + ki) * elem_size;
                         let dst_idx = (group * k * tm + ki * tm + r) * elem_size;
                         std::ptr::copy_nonoverlapping(
                             src_ptr.add(src_idx),
