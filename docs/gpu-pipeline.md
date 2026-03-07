@@ -301,3 +301,34 @@ Phase 8c extends the 9-dispatch path with CPU-side overhead elimination:
 | Serial 9-dispatch | ~751 | 507 |
 | Cached 2-encoder | 714 | 84 |
 | **Improvement** | **8% faster** | **6x lower** |
+
+## Phase 10: Fused 7-Dispatch Decode Path
+
+Phase 10 introduces kernel fusion to reduce the 9-dispatch decode path to 7 dispatches, eliminating two inter-kernel dispatch boundaries.
+
+### Fused Kernels
+
+**Fusion B — `fused_swiglu_down`**: Combines the SiLU activation, element-wise gate multiply, and down projection GEMV into a single Metal dispatch. This eliminates the intermediate buffer between SiLU*gate and down_proj, saving one dispatch and one scratch allocation.
+
+**Fusion A — `fused_rms_gemv`**: Combines RMS normalization and the subsequent GEMV (used for both pre-attention and pre-FFN norms) into a single dispatch. The threadgroup computes the RMS norm in-register and immediately feeds the normalized result into the GEMV, avoiding a full round-trip through device memory.
+
+### 7-Dispatch Pipeline Layout
+
+| # | Operation | Notes |
+|---|-----------|-------|
+| 1 | **fused_rms_gemv** (RMS norm + QKV GEMV) | Fusion A — pre-attention norm fused with QKV projection |
+| 2 | Batched RoPE (Q and K simultaneously) | Unchanged from 9-dispatch |
+| 3 | SDPA decode (slab KV cache) | Unchanged |
+| 4 | Output projection GEMV + attention residual add | Unchanged |
+| 5 | **fused_rms_gemv** (RMS norm + gate_up GEMV) | Fusion A — pre-FFN norm fused with gate_up projection |
+| 6 | **fused_swiglu_down** (SiLU * gate + down GEMV) | Fusion B — activation + down projection |
+| 7 | FFN residual add | Unchanged |
+
+### Fallback Behavior
+
+If fused Pipeline State Objects (PSOs) fail to compile at init time (e.g., unsupported GPU architecture), CachedDecode automatically falls back to the 9-dispatch path. No user intervention required.
+
+### Performance Target
+
+- **Target**: 600-650 us/layer (f16, 60L, M3 Ultra) — pending benchmarks
+- **Reduction**: 9 dispatches → 7 dispatches (22% fewer GPU dispatches)
