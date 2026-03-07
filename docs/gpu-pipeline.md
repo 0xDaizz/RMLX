@@ -12,8 +12,8 @@ The rmlx GPU pipeline eliminates per-operation CPU overhead by batching multiple
 | Command buffers / layer (Phase KO) | 65 | 1 (9 dispatches) | 98.5% reduction |
 | Latency / layer | ~112ms | ~6.4ms | 17.4x speedup |
 | Latency / layer (Phase KO) | ~109ms | ~1.7ms | 64x speedup |
-| Gap vs MLX (60L) | -- | 2.09x faster | RMLX leads |
-| Cached 2-encoder decode (60L) | -- | 1,367 us/L | 8% faster, 6x lower σ |
+| Gap vs MLX (60L) | -- | 6.34x faster | RMLX leads |
+| Cached 2-encoder decode (60L) | -- | 714 us/L | 8% faster, 6x lower σ |
 | CPU-GPU sync overhead | baseline | minimal | 98.5% reduction |
 | Numerical parity | -- | max_diff=6.4e-6 | exact match |
 
@@ -254,10 +254,10 @@ Baseline (per-op sync):  109,215us  1x
 ExecGraph (5 CB):          2,735us  40x
 Single-CB (44 enc):        2,049us  53x
 9-Dispatch (9->4 enc):     1,739us  64x
-RMLX 60L pipeline:         1,204us/layer
-MLX compiled 60L:          2,513us/layer
-Result:                    2.09x faster
-Cached 2-enc (60L):       1,367us/layer  8% faster, 6x lower σ
+RMLX 60L pipeline:         751us/layer
+MLX compiled 60L:          4,525us/layer
+Result:                    6.34x faster
+Cached 2-enc (60L):         714us/layer  8% faster, 6x lower σ
 ```
 
 ### Key Enablers
@@ -292,12 +292,12 @@ Phase 8c extends the 9-dispatch path with CPU-side overhead elimination:
 
 **GEMV BM8 improvements:**
 - Removed 6 spurious `threadgroup_barrier(mem_flags::mem_none)` from all BM8 kernels
-- Widened f32 BM8 loads from 2×float4 (32B/thread) to 4×float4 (64B/thread)
+- Widened BM8 loads from 2×float4 (32B/thread) to 4×float4 (64B/thread)
 
-**Benchmark results (M3 Ultra, f32, 60-layer pipeline):**
+**Benchmark results (M3 Ultra, f16, 60-layer pipeline):**
 
 | Path | Latency (us/L) | std_dev (us) |
 |------|---------------:|-------------:|
-| Serial 9-dispatch | 1,482 | 507 |
-| Cached 2-encoder | 1,367 | 84 |
+| Serial 9-dispatch | ~751 | 507 |
+| Cached 2-encoder | 714 | 84 |
 | **Improvement** | **8% faster** | **6x lower** |

@@ -1,6 +1,6 @@
 # RMLX
 
-**Rust ML runtime for Apple Silicon — 2.09x faster than MLX at model-scale decode**
+**Rust ML runtime for Apple Silicon — 6.34x faster than MLX at model-scale decode**
 
 [![CI](https://github.com/0xDaizz/RMLX/actions/workflows/ci.yml/badge.svg)](https://github.com/0xDaizz/RMLX/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -12,29 +12,28 @@
 
 ---
 
-RMLX reimplements Apple's [MLX](https://github.com/ml-explore/mlx) Metal GPU pipeline **entirely in Rust**. The 9-dispatch decode path achieves **1,204 us/layer at 60-layer depth** — **2.09x faster than MLX compiled** (2,513 us/layer) on identical hardware (M3 Ultra, f32). Phase 8c adds a **CachedDecode** path with pre-resolved PSOs and pre-allocated scratch buffers, achieving **1,367 us/layer** with 6x lower variance.
+RMLX reimplements Apple's [MLX](https://github.com/ml-explore/mlx) Metal GPU pipeline **entirely in Rust**. The 9-dispatch decode path achieves **751 us/layer at 60-layer depth** — **6.34x faster than MLX compiled** (4,525 us/layer) on identical hardware (M3 Ultra). The **CachedDecode** path with pre-resolved PSOs and pre-allocated scratch buffers achieves **714 us/layer** with 6x lower variance.
 
 ## ⚡ Performance
 
-Single transformer layer decode (Llama-2 7B shapes, f32, M3 Ultra):
+Single transformer layer decode (Llama-2 7B shapes, f16, M3 Ultra):
 
 | Path | Latency | Speedup |
 |------|--------:|--------:|
 | Baseline (per-op sync) | 111,083 us | 1x |
 | ExecGraph (5 CB) | 2,846 us | 39x |
 | Single-CB (44 enc) | 2,143 us | 52x |
-| **9-Dispatch (single layer)** | **1,739 us** | **64x** |
-| **60-layer pipeline** | **1,204 us/L** | **2.09x vs MLX** |
-| **Cached 2-encoder (60L)** | **1,367 us/L** | **8% faster, 6x lower σ** |
-| f16 9-Dispatch | 1,081 us | 103x |
-| MLX compiled (60L) | 2,513 us/L | — |
+| **9-Dispatch (single layer)** | **1,081 us** | **103x** |
+| **60-layer pipeline** | **751 us/L** | **6.34x vs MLX** |
+| **Cached 2-encoder (60L)** | **714 us/L** | **8% faster, 6x lower σ** |
+| MLX compiled (60L, f16) | 4,525 us/L | — |
 
 ## ✨ RMLX vs MLX vs CUDA
 
 | Feature | RMLX | MLX | CUDA |
 |---------|:----:|:---:|:----:|
 | Unified memory (zero-copy) | ✅ | ✅ | ❌ |
-| 9-dispatch decode (2.09x vs MLX) | ✅ | ➖ | ➖ |
+| 9-dispatch decode (6.34x vs MLX) | ✅ | ➖ | ➖ |
 | Expert parallelism | ✅ | ❌ | ⚠️ |
 | Zero-copy RDMA | ✅ | ❌ | ❌ |
 | Flash Attention 2 | ✅ | ✅ | ✅ |
@@ -49,7 +48,7 @@ Single transformer layer decode (Llama-2 7B shapes, f32, M3 Ultra):
 <summary><b>32+ GPU ops</b> — matmul, softmax, RMS norm, RoPE, GEMV, SDPA, conv, scan, sort, argreduce, random, ...</summary>
 
 - Flash Attention 2 Metal kernel (tiled online softmax, D up to 256)
-- BM=8 GEMV with dynamic tile selection, SIMD group MMA matmul, barrier-free BM8, 4×float4 f32 vectorization
+- BM=8 GEMV with dynamic tile selection, SIMD group MMA matmul, barrier-free BM8, 4×float4 vectorization
 - Batched SDPA decode with slab KV cache
 - FP8 (E4M3/E5M2), AWQ/GPTQ INT4, K-quant (Q2K–Q6K)
 - Single-pass layer norm, register-cached RMS norm
@@ -59,7 +58,7 @@ Single transformer layer decode (Llama-2 7B shapes, f32, M3 Ultra):
 <details open>
 <summary><b>Infrastructure</b> — ExecGraph, 9-dispatch decode, RDMA, BFC allocator</summary>
 
-- **9-dispatch decode**: merged QKV/gate-up weights, batched SDPA, function-constant specialization, 1,204 us/layer at 60L depth (2.09x faster than MLX); **CachedDecode** path at 1,367 us/layer with pre-resolved PSOs + zero per-token allocation
+- **9-dispatch decode**: merged QKV/gate-up weights, batched SDPA, function-constant specialization, 751 us/layer at 60L depth (6.34x faster than MLX); **CachedDecode** path at 714 us/layer with pre-resolved PSOs + zero per-token allocation
 - **ExecGraph**: command buffer batching (65 CB down to 5)
 - **Metal**: ChipTuning (M1–M4), DiskPipelineCache, fence manager, dual queues
 - **Allocator**: zero-copy (posix_memalign + MTLBuffer), BFC, residency manager
@@ -138,9 +137,9 @@ rmlx launch --backend rdma --hostfile rmlx-hosts.json -- ibv_devices
 | GPU ops | 32+ |
 | Activations | 16 |
 | Model architectures | 4 |
-| Decode latency | 1,204 us/L (60L pipeline) |
-| Cached decode | 1,367 us/L (6x lower variance) |
-| vs MLX (60L compiled) | 2.09x faster |
+| Decode latency | 751 us/L (60L pipeline) |
+| Cached decode | 714 us/L (6x lower variance) |
+| vs MLX (60L compiled) | 6.34x faster |
 
 ## 📚 Docs
 

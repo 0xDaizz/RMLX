@@ -104,10 +104,11 @@ impl std::fmt::Display for Stats {
 }
 
 // ---------------------------------------------------------------------------
-// Random array generation (deterministic PRNG)
+// Random array generation (f32 deterministic PRNG)
 // ---------------------------------------------------------------------------
 
-fn rand_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
+#[allow(dead_code)]
+fn rand_array_f32(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
     let numel: usize = shape.iter().product();
     let mut data = Vec::with_capacity(numel);
     let mut state = seed;
@@ -122,7 +123,7 @@ fn rand_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
 }
 
 // ---------------------------------------------------------------------------
-// f16 random array generation
+// Random array generation (f16 deterministic PRNG)
 // ---------------------------------------------------------------------------
 
 fn f32_to_f16_bits(val: f32) -> u16 {
@@ -150,7 +151,7 @@ fn f32_to_f16_bits(val: f32) -> u16 {
     ((sign << 15) | (new_exp as u32) << 10 | (frac >> 13)) as u16
 }
 
-fn rand_array_f16(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
+fn rand_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
     use rmlx_core::dtype::DType;
     let numel: usize = shape.iter().product();
     let mut f16_bytes = Vec::with_capacity(numel * 2);
@@ -170,6 +171,56 @@ fn rand_array_f16(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
 // Layer construction helpers
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
+fn make_linear_f32(device: &metal::Device, in_f: usize, out_f: usize, seed: u64) -> Linear {
+    let weight = rand_array_f32(device, &[out_f, in_f], seed);
+    Linear::from_arrays(
+        LinearConfig {
+            in_features: in_f,
+            out_features: out_f,
+            has_bias: false,
+        },
+        weight,
+        None,
+    )
+    .expect("linear from_arrays")
+}
+
+#[allow(dead_code)]
+fn build_transformer_block_f32(device: &metal::Device) -> TransformerBlock {
+    let kv_size = NUM_KV_HEADS * HEAD_DIM;
+
+    let q_proj = make_linear_f32(device, HIDDEN_SIZE, HIDDEN_SIZE, 1);
+    let k_proj = make_linear_f32(device, HIDDEN_SIZE, kv_size, 2);
+    let v_proj = make_linear_f32(device, HIDDEN_SIZE, kv_size, 3);
+    let o_proj = make_linear_f32(device, HIDDEN_SIZE, HIDDEN_SIZE, 4);
+
+    let attn_config = AttentionConfig {
+        num_heads: NUM_HEADS,
+        num_kv_heads: NUM_KV_HEADS,
+        head_dim: HEAD_DIM,
+        max_seq_len: 2048,
+        rope_theta: 10000.0,
+    };
+    let attention =
+        Attention::from_layers(attn_config, q_proj, k_proj, v_proj, o_proj).expect("attention");
+
+    let gate_proj = make_linear_f32(device, HIDDEN_SIZE, INTERMEDIATE_DIM, 5);
+    let up_proj = make_linear_f32(device, HIDDEN_SIZE, INTERMEDIATE_DIM, 6);
+    let down_proj = make_linear_f32(device, INTERMEDIATE_DIM, HIDDEN_SIZE, 7);
+    let ffn = FeedForward::Gated {
+        gate_proj,
+        up_proj,
+        down_proj,
+        gate_up_merged_weight: None,
+    };
+
+    let norm1_weight = Array::ones(device, &[HIDDEN_SIZE]);
+    let norm2_weight = Array::ones(device, &[HIDDEN_SIZE]);
+
+    TransformerBlock::from_parts(0, attention, ffn, norm1_weight, norm2_weight, RMS_NORM_EPS)
+}
+
 fn make_linear(device: &metal::Device, in_f: usize, out_f: usize, seed: u64) -> Linear {
     let weight = rand_array(device, &[out_f, in_f], seed);
     Linear::from_arrays(
@@ -185,6 +236,8 @@ fn make_linear(device: &metal::Device, in_f: usize, out_f: usize, seed: u64) -> 
 }
 
 fn build_transformer_block(device: &metal::Device) -> TransformerBlock {
+    use rmlx_core::dtype::DType;
+
     let kv_size = NUM_KV_HEADS * HEAD_DIM;
 
     let q_proj = make_linear(device, HIDDEN_SIZE, HIDDEN_SIZE, 1);
@@ -205,56 +258,6 @@ fn build_transformer_block(device: &metal::Device) -> TransformerBlock {
     let gate_proj = make_linear(device, HIDDEN_SIZE, INTERMEDIATE_DIM, 5);
     let up_proj = make_linear(device, HIDDEN_SIZE, INTERMEDIATE_DIM, 6);
     let down_proj = make_linear(device, INTERMEDIATE_DIM, HIDDEN_SIZE, 7);
-    let ffn = FeedForward::Gated {
-        gate_proj,
-        up_proj,
-        down_proj,
-        gate_up_merged_weight: None,
-    };
-
-    let norm1_weight = Array::ones(device, &[HIDDEN_SIZE]);
-    let norm2_weight = Array::ones(device, &[HIDDEN_SIZE]);
-
-    TransformerBlock::from_parts(0, attention, ffn, norm1_weight, norm2_weight, RMS_NORM_EPS)
-}
-
-fn make_linear_f16(device: &metal::Device, in_f: usize, out_f: usize, seed: u64) -> Linear {
-    let weight = rand_array_f16(device, &[out_f, in_f], seed);
-    Linear::from_arrays(
-        LinearConfig {
-            in_features: in_f,
-            out_features: out_f,
-            has_bias: false,
-        },
-        weight,
-        None,
-    )
-    .expect("linear from_arrays")
-}
-
-fn build_transformer_block_f16(device: &metal::Device) -> TransformerBlock {
-    use rmlx_core::dtype::DType;
-
-    let kv_size = NUM_KV_HEADS * HEAD_DIM;
-
-    let q_proj = make_linear_f16(device, HIDDEN_SIZE, HIDDEN_SIZE, 1);
-    let k_proj = make_linear_f16(device, HIDDEN_SIZE, kv_size, 2);
-    let v_proj = make_linear_f16(device, HIDDEN_SIZE, kv_size, 3);
-    let o_proj = make_linear_f16(device, HIDDEN_SIZE, HIDDEN_SIZE, 4);
-
-    let attn_config = AttentionConfig {
-        num_heads: NUM_HEADS,
-        num_kv_heads: NUM_KV_HEADS,
-        head_dim: HEAD_DIM,
-        max_seq_len: 2048,
-        rope_theta: 10000.0,
-    };
-    let attention =
-        Attention::from_layers(attn_config, q_proj, k_proj, v_proj, o_proj).expect("attention");
-
-    let gate_proj = make_linear_f16(device, HIDDEN_SIZE, INTERMEDIATE_DIM, 5);
-    let up_proj = make_linear_f16(device, HIDDEN_SIZE, INTERMEDIATE_DIM, 6);
-    let down_proj = make_linear_f16(device, INTERMEDIATE_DIM, HIDDEN_SIZE, 7);
     let ffn = FeedForward::Gated {
         gate_proj,
         up_proj,
@@ -332,6 +335,7 @@ fn main() {
         "Config: hidden={}, heads={}/{}, head_dim={}, intermediate={}, seq_len={}",
         HIDDEN_SIZE, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, INTERMEDIATE_DIM, SEQ_LEN
     );
+    println!("dtype: float16");
 
     let mut block = build_transformer_block(device);
     let input = rand_array(device, &[SEQ_LEN, HIDDEN_SIZE], 42);
@@ -456,7 +460,7 @@ fn main() {
         NUM_KV_HEADS,
         HEAD_DIM,
         2048,
-        rmlx_core::dtype::DType::Float32,
+        rmlx_core::dtype::DType::Float16,
     );
     for _ in 0..WARMUP_ITERS {
         cache_9d.seq_len = 0;
@@ -493,7 +497,7 @@ fn main() {
         NUM_KV_HEADS,
         HEAD_DIM,
         2048,
-        rmlx_core::dtype::DType::Float32,
+        rmlx_core::dtype::DType::Float16,
     );
     for _ in 0..WARMUP_ITERS {
         cache_c9d.seq_len = 0;
@@ -807,71 +811,6 @@ fn main() {
     println!("==========================================");
 
     // ========================================================================
-    // f16 Weight Benchmark
-    // ========================================================================
-    println!("\n========== f16 Weight Benchmark ==========");
-    let mut block_f16 = build_transformer_block_f16(device);
-    block_f16
-        .prepare_weights_9dispatch(device)
-        .expect("prepare_weights_9dispatch f16 failed");
-    block_f16.prepare_weights_private(device, &queue);
-
-    let x_f16 = rand_array_f16(device, &[SEQ_LEN, HIDDEN_SIZE], 200);
-    let mut cache_f16 = LayerKvCache::preallocated(
-        device,
-        NUM_KV_HEADS,
-        HEAD_DIM,
-        2048,
-        rmlx_core::dtype::DType::Float16,
-    );
-
-    // ---- Warmup f16 9-dispatch ----
-    println!("Warming up f16 9-dispatch ({} iterations)...", WARMUP_ITERS);
-    for _ in 0..WARMUP_ITERS {
-        cache_f16.seq_len = 0;
-        let cb = queue.new_command_buffer();
-        let _ = block_f16
-            .forward_single_cb_9dispatch(&x_f16, None, None, None, &mut cache_f16, &registry, cb)
-            .unwrap();
-        cb.commit();
-        cb.wait_until_completed();
-    }
-
-    // ---- Benchmark f16 9-dispatch ----
-    println!(
-        "Benchmarking f16 9-dispatch ({} iterations)...",
-        BENCH_ITERS
-    );
-    let mut f16_9d_latencies = Vec::with_capacity(BENCH_ITERS);
-    for _ in 0..BENCH_ITERS {
-        cache_f16.seq_len = 0;
-        let start = Instant::now();
-        let cb = queue.new_command_buffer();
-        let _ = block_f16
-            .forward_single_cb_9dispatch(&x_f16, None, None, None, &mut cache_f16, &registry, cb)
-            .unwrap();
-        cb.commit();
-        cb.wait_until_completed();
-        f16_9d_latencies.push(start.elapsed());
-    }
-    let f16_9d_stats = Stats::from_durations(&f16_9d_latencies);
-    let f16_9d_speedup = if f16_9d_stats.mean > 0.0 {
-        baseline_stats.mean / f16_9d_stats.mean
-    } else {
-        0.0
-    };
-    let f16_vs_f32_speedup = if f16_9d_stats.mean > 0.0 {
-        nine_dispatch_stats.mean / f16_9d_stats.mean
-    } else {
-        0.0
-    };
-    println!("  f16 9-dispatch: {}", f16_9d_stats);
-    println!(
-        "  vs baseline: {:.2}x, vs f32 9-dispatch: {:.2}x",
-        f16_9d_speedup, f16_vs_f32_speedup
-    );
-
-    // ========================================================================
     // Allocation overhead measurement
     // ========================================================================
     println!("\n========== Allocation Overhead ==========");
@@ -886,7 +825,7 @@ fn main() {
                 NUM_KV_HEADS,
                 HEAD_DIM,
                 2048,
-                rmlx_core::dtype::DType::Float32,
+                rmlx_core::dtype::DType::Float16,
             );
             cache_alloc_times.push(start.elapsed());
         }
@@ -899,35 +838,35 @@ fn main() {
         let mut buf_alloc_times = Vec::with_capacity(BENCH_ITERS);
         for _ in 0..BENCH_ITERS {
             let start = Instant::now();
-            let _b1 = Array::uninit(device, &[1, HIDDEN_SIZE], rmlx_core::dtype::DType::Float32);
+            let _b1 = Array::uninit(device, &[1, HIDDEN_SIZE], rmlx_core::dtype::DType::Float16);
             let _b2 = Array::uninit(
                 device,
                 &[NUM_HEADS * HEAD_DIM + NUM_KV_HEADS * HEAD_DIM * 2],
-                rmlx_core::dtype::DType::Float32,
+                rmlx_core::dtype::DType::Float16,
             );
             let _b3 = Array::uninit(
                 device,
                 &[(NUM_HEADS + NUM_KV_HEADS), 1, HEAD_DIM],
-                rmlx_core::dtype::DType::Float32,
+                rmlx_core::dtype::DType::Float16,
             );
             let _b4 = Array::uninit(
                 device,
                 &[NUM_HEADS * HEAD_DIM],
-                rmlx_core::dtype::DType::Float32,
+                rmlx_core::dtype::DType::Float16,
             );
-            let _b5 = Array::uninit(device, &[HIDDEN_SIZE], rmlx_core::dtype::DType::Float32);
-            let _b6 = Array::uninit(device, &[1, HIDDEN_SIZE], rmlx_core::dtype::DType::Float32);
+            let _b5 = Array::uninit(device, &[HIDDEN_SIZE], rmlx_core::dtype::DType::Float16);
+            let _b6 = Array::uninit(device, &[1, HIDDEN_SIZE], rmlx_core::dtype::DType::Float16);
             let _b7 = Array::uninit(
                 device,
                 &[INTERMEDIATE_DIM * 2],
-                rmlx_core::dtype::DType::Float32,
+                rmlx_core::dtype::DType::Float16,
             );
             let _b8 = Array::uninit(
                 device,
                 &[1, INTERMEDIATE_DIM],
-                rmlx_core::dtype::DType::Float32,
+                rmlx_core::dtype::DType::Float16,
             );
-            let _b9 = Array::uninit(device, &[HIDDEN_SIZE], rmlx_core::dtype::DType::Float32);
+            let _b9 = Array::uninit(device, &[HIDDEN_SIZE], rmlx_core::dtype::DType::Float16);
             buf_alloc_times.push(start.elapsed());
         }
         let stats = Stats::from_durations(&buf_alloc_times);
@@ -941,7 +880,7 @@ fn main() {
             NUM_KV_HEADS,
             HEAD_DIM,
             2048,
-            rmlx_core::dtype::DType::Float32,
+            rmlx_core::dtype::DType::Float16,
         );
         // Warmup
         for _ in 0..WARMUP_ITERS {
@@ -1016,7 +955,7 @@ fn main() {
                 NUM_KV_HEADS,
                 HEAD_DIM,
                 2048,
-                rmlx_core::dtype::DType::Float32,
+                rmlx_core::dtype::DType::Float16,
             )
         })
         .collect();
@@ -1031,7 +970,7 @@ fn main() {
             cache.seq_len = 0;
         }
         let cb = queue.new_command_buffer();
-        let mut x = Array::ones(device, &[SEQ_LEN, HIDDEN_SIZE]);
+        let mut x = rand_array(device, &[SEQ_LEN, HIDDEN_SIZE], 200);
         for (layer, cache) in blocks.iter().zip(ml_kv_caches.iter_mut()) {
             x = layer
                 .forward_single_cb_9dispatch(&x, None, None, None, cache, &registry, cb)
@@ -1053,7 +992,7 @@ fn main() {
         }
         let start = Instant::now();
         let cb = queue.new_command_buffer();
-        let mut x = Array::ones(device, &[SEQ_LEN, HIDDEN_SIZE]);
+        let mut x = rand_array(device, &[SEQ_LEN, HIDDEN_SIZE], 200);
         for (layer, cache) in blocks.iter().zip(ml_kv_caches.iter_mut()) {
             x = layer
                 .forward_single_cb_9dispatch(&x, None, None, None, cache, &registry, cb)
@@ -1074,7 +1013,7 @@ fn main() {
             cache.seq_len = 0;
         }
         let cb = queue.new_command_buffer();
-        let mut x = Array::ones(device, &[SEQ_LEN, HIDDEN_SIZE]);
+        let mut x = rand_array(device, &[SEQ_LEN, HIDDEN_SIZE], 200);
         for (layer, cache) in blocks.iter().zip(ml_kv_caches.iter_mut()) {
             x = layer
                 .forward_concurrent_9dispatch(&x, None, None, None, cache, &registry, cb)
@@ -1096,7 +1035,7 @@ fn main() {
         }
         let start = Instant::now();
         let cb = queue.new_command_buffer();
-        let mut x = Array::ones(device, &[SEQ_LEN, HIDDEN_SIZE]);
+        let mut x = rand_array(device, &[SEQ_LEN, HIDDEN_SIZE], 200);
         for (layer, cache) in blocks.iter().zip(ml_kv_caches.iter_mut()) {
             x = layer
                 .forward_concurrent_9dispatch(&x, None, None, None, cache, &registry, cb)
@@ -1117,7 +1056,7 @@ fn main() {
         NUM_KV_HEADS,
         HEAD_DIM,
         2048,
-        rmlx_core::dtype::DType::Float32,
+        rmlx_core::dtype::DType::Float16,
     );
     for _ in 0..WARMUP_ITERS {
         cache_2enc.seq_len = 0;
@@ -1157,7 +1096,7 @@ fn main() {
             c.seq_len = 0;
         }
         let cb = queue.new_command_buffer();
-        let mut h = Array::ones(device, &[SEQ_LEN, HIDDEN_SIZE]);
+        let mut h = rand_array(device, &[SEQ_LEN, HIDDEN_SIZE], 200);
         for (i, c) in ml_kv_caches.iter_mut().enumerate() {
             h = blocks[i]
                 .forward_2encoder_9dispatch(&h, None, None, None, c, &registry, cb)
@@ -1177,7 +1116,7 @@ fn main() {
         }
         let start = Instant::now();
         let cb = queue.new_command_buffer();
-        let mut h = Array::ones(device, &[SEQ_LEN, HIDDEN_SIZE]);
+        let mut h = rand_array(device, &[SEQ_LEN, HIDDEN_SIZE], 200);
         for (i, c) in ml_kv_caches.iter_mut().enumerate() {
             h = blocks[i]
                 .forward_2encoder_9dispatch(&h, None, None, None, c, &registry, cb)
@@ -1247,7 +1186,7 @@ fn main() {
                 NUM_KV_HEADS,
                 HEAD_DIM,
                 2048,
-                rmlx_core::dtype::DType::Float32,
+                rmlx_core::dtype::DType::Float16,
             )
         })
         .collect();
@@ -1262,7 +1201,7 @@ fn main() {
             cache.seq_len = 0;
         }
         let cb = queue.new_command_buffer();
-        let mut x = Array::ones(device, &[SEQ_LEN, HIDDEN_SIZE]);
+        let mut x = rand_array(device, &[SEQ_LEN, HIDDEN_SIZE], 200);
         for (layer, cache) in blocks_30.iter().zip(caches_30.iter_mut()) {
             x = layer
                 .forward_single_cb_9dispatch(&x, None, None, None, cache, &registry, cb)
@@ -1283,7 +1222,7 @@ fn main() {
         }
         let start = Instant::now();
         let cb = queue.new_command_buffer();
-        let mut x = Array::ones(device, &[SEQ_LEN, HIDDEN_SIZE]);
+        let mut x = rand_array(device, &[SEQ_LEN, HIDDEN_SIZE], 200);
         for (layer, cache) in blocks_30.iter().zip(caches_30.iter_mut()) {
             x = layer
                 .forward_single_cb_9dispatch(&x, None, None, None, cache, &registry, cb)
@@ -1305,7 +1244,7 @@ fn main() {
         }
         let event = GpuEvent::new(device);
         let mut graph = ExecGraph::new(&queue, &event, 32);
-        let mut x = Array::ones(device, &[SEQ_LEN, HIDDEN_SIZE]);
+        let mut x = rand_array(device, &[SEQ_LEN, HIDDEN_SIZE], 200);
         let mut prev_token = None;
         for (layer, cache) in blocks_30.iter().zip(caches_30.iter_mut()) {
             if let Some(token) = prev_token {
@@ -1332,7 +1271,7 @@ fn main() {
         let event = GpuEvent::new(device);
         let mut graph = ExecGraph::new(&queue, &event, 32);
         let start = Instant::now();
-        let mut x = Array::ones(device, &[SEQ_LEN, HIDDEN_SIZE]);
+        let mut x = rand_array(device, &[SEQ_LEN, HIDDEN_SIZE], 200);
         let mut prev_token = None;
         for (layer, cache) in blocks_30.iter().zip(caches_30.iter_mut()) {
             if let Some(token) = prev_token {
@@ -1395,7 +1334,7 @@ fn main() {
                 NUM_KV_HEADS,
                 HEAD_DIM,
                 2048,
-                rmlx_core::dtype::DType::Float32,
+                rmlx_core::dtype::DType::Float16,
             )
         })
         .collect();
@@ -1410,7 +1349,7 @@ fn main() {
             cache.seq_len = 0;
         }
         let cb = queue.new_command_buffer();
-        let mut x = Array::ones(device, &[SEQ_LEN, HIDDEN_SIZE]);
+        let mut x = rand_array(device, &[SEQ_LEN, HIDDEN_SIZE], 200);
         for (layer, cache) in blocks_60.iter().zip(caches_60.iter_mut()) {
             x = layer
                 .forward_single_cb_9dispatch(&x, None, None, None, cache, &registry, cb)
@@ -1431,7 +1370,7 @@ fn main() {
         }
         let start = Instant::now();
         let cb = queue.new_command_buffer();
-        let mut x = Array::ones(device, &[SEQ_LEN, HIDDEN_SIZE]);
+        let mut x = rand_array(device, &[SEQ_LEN, HIDDEN_SIZE], 200);
         for (layer, cache) in blocks_60.iter().zip(caches_60.iter_mut()) {
             x = layer
                 .forward_single_cb_9dispatch(&x, None, None, None, cache, &registry, cb)
@@ -1453,7 +1392,7 @@ fn main() {
         }
         let event = GpuEvent::new(device);
         let mut graph = ExecGraph::new(&queue, &event, 32);
-        let mut x = Array::ones(device, &[SEQ_LEN, HIDDEN_SIZE]);
+        let mut x = rand_array(device, &[SEQ_LEN, HIDDEN_SIZE], 200);
         let mut prev_token = None;
         for (layer, cache) in blocks_60.iter().zip(caches_60.iter_mut()) {
             if let Some(token) = prev_token {
@@ -1480,7 +1419,7 @@ fn main() {
         let event = GpuEvent::new(device);
         let mut graph = ExecGraph::new(&queue, &event, 32);
         let start = Instant::now();
-        let mut x = Array::ones(device, &[SEQ_LEN, HIDDEN_SIZE]);
+        let mut x = rand_array(device, &[SEQ_LEN, HIDDEN_SIZE], 200);
         let mut prev_token = None;
         for (layer, cache) in blocks_60.iter().zip(caches_60.iter_mut()) {
             if let Some(token) = prev_token {
@@ -1544,7 +1483,7 @@ fn main() {
             cache.seq_len = 0;
         }
         let cb = queue.new_command_buffer();
-        let mut x = Array::ones(device, &[SEQ_LEN, HIDDEN_SIZE]);
+        let mut x = rand_array(device, &[SEQ_LEN, HIDDEN_SIZE], 200);
         for ((layer, cache), cached) in blocks_60
             .iter()
             .zip(caches_60.iter_mut())
@@ -1570,7 +1509,7 @@ fn main() {
         }
         let start = Instant::now();
         let cb = queue.new_command_buffer();
-        let mut x = Array::ones(device, &[SEQ_LEN, HIDDEN_SIZE]);
+        let mut x = rand_array(device, &[SEQ_LEN, HIDDEN_SIZE], 200);
         for ((layer, cache), cached) in blocks_60
             .iter()
             .zip(caches_60.iter_mut())
@@ -1601,6 +1540,81 @@ fn main() {
     println!(
         "  vs Serial 60L:                 {:.2}x speedup",
         cached_60_speedup
+    );
+    println!("=====================================================");
+
+    // ========================================================================
+    // Cached 1-Encoder 9-Dispatch (60 layers)
+    // ========================================================================
+    println!("\n========== Cached 1-Encoder 9-Dispatch (60 layers) ==========");
+
+    // Warmup
+    println!(
+        "Warming up cached 1-encoder x{} ({} iterations)...",
+        num_layers_60, WARMUP_ITERS
+    );
+    for _ in 0..WARMUP_ITERS {
+        for cache in caches_60.iter_mut() {
+            cache.seq_len = 0;
+        }
+        let cb = queue.new_command_buffer();
+        let mut x = rand_array(device, &[SEQ_LEN, HIDDEN_SIZE], 200);
+        for ((layer, cache), cached) in blocks_60
+            .iter()
+            .zip(caches_60.iter_mut())
+            .zip(cached_60.iter())
+        {
+            x = layer
+                .forward_cached_1encoder_9dispatch(&x, None, None, cache, cached, cb)
+                .expect("cached 1-encoder warmup failed");
+        }
+        cb.commit();
+        cb.wait_until_completed();
+    }
+
+    // Bench
+    println!(
+        "Benchmarking cached 1-encoder x{} ({} iterations)...",
+        num_layers_60, BENCH_ITERS
+    );
+    let mut cached_1enc_60_latencies = Vec::with_capacity(BENCH_ITERS);
+    for _ in 0..BENCH_ITERS {
+        for cache in caches_60.iter_mut() {
+            cache.seq_len = 0;
+        }
+        let start = Instant::now();
+        let cb = queue.new_command_buffer();
+        let mut x = rand_array(device, &[SEQ_LEN, HIDDEN_SIZE], 200);
+        for ((layer, cache), cached) in blocks_60
+            .iter()
+            .zip(caches_60.iter_mut())
+            .zip(cached_60.iter())
+        {
+            x = layer
+                .forward_cached_1encoder_9dispatch(&x, None, None, cache, cached, cb)
+                .expect("cached 1-encoder bench failed");
+        }
+        cb.commit();
+        cb.wait_until_completed();
+        cached_1enc_60_latencies.push(start.elapsed());
+    }
+
+    let cached_1enc_60_stats = Stats::from_durations(&cached_1enc_60_latencies);
+    let cached_1enc_60_speedup = if cached_1enc_60_stats.mean > 0.0 {
+        serial_60_stats.mean / cached_1enc_60_stats.mean
+    } else {
+        0.0
+    };
+    println!();
+    println!(
+        "  Cached 1-enc ({} layers):     {}  ({:.1} us/layer)",
+        num_layers_60,
+        cached_1enc_60_stats,
+        cached_1enc_60_stats.mean / num_layers_60 as f64
+    );
+    println!(
+        "  vs Serial 60L:                 {:.2}x speedup",
+        cached_1enc_60_speedup
     );
     println!("=====================================================");
 
@@ -1813,10 +1827,6 @@ fn main() {
         "2-Encoder 9-Dispatch", two_enc_stats.mean, two_enc_speedup
     );
     println!(
-        "  {:40} mean={:8.1}us  ({:.2}x) [{:.2}x vs f32 9d]",
-        "f16 9-Dispatch", f16_9d_stats.mean, f16_9d_speedup, f16_vs_f32_speedup
-    );
-    println!(
         "  {:40} mean={:8.1}us  ({:.2}x)",
         "Serial x4", ml_serial_stats.mean, 1.0
     );
@@ -1860,6 +1870,13 @@ fn main() {
         cached_60_stats.mean,
         cached_60_speedup,
         cached_60_stats.mean / num_layers_60 as f64
+    );
+    println!(
+        "  {:40} mean={:8.1}us  ({:.2}x vs serial x60, {:.1} us/layer)",
+        "Cached 1-enc x60",
+        cached_1enc_60_stats.mean,
+        cached_1enc_60_speedup,
+        cached_1enc_60_stats.mean / num_layers_60 as f64
     );
     println!("  -----------------");
 }

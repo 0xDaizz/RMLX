@@ -659,6 +659,79 @@ impl LayerKvCache {
         Ok(())
     }
 
+    /// Append KV using raw buffer references (no Vec<Array> allocation).
+    ///
+    /// `k_buf`/`v_buf` are the source buffers containing contiguous per-head data.
+    /// `k_base_offset`/`v_base_offset` are byte offsets to the first K/V head.
+    /// Each head's data is `head_dim` elements starting at base + h * head_dim * elem_size.
+    /// `copy_max_tg` is the pre-cached max threadgroup size for the copy PSO.
+    ///
+    /// # Safety
+    /// Same as `append_preresolved_into_encoder` — caller validates dimensions.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_direct_into_encoder(
+        &mut self,
+        k_buf: &metal::BufferRef,
+        k_base_offset: u64,
+        v_buf: &metal::BufferRef,
+        v_base_offset: u64,
+        new_tokens: usize,
+        copy_pso: &metal::ComputePipelineState,
+        copy_max_tg: u64,
+        encoder: &metal::ComputeCommandEncoderRef,
+    ) -> Result<(), KernelError> {
+        if self.max_seq_len == 0 {
+            return Err(KernelError::InvalidShape(
+                "LayerKvCache::append_direct requires pre-allocated cache".to_string(),
+            ));
+        }
+
+        if self.seq_len + new_tokens > self.max_seq_len {
+            return Err(KernelError::InvalidShape(format!(
+                "LayerKvCache::append_direct: overflow: {} cached + {} new > {} max",
+                self.seq_len, new_tokens, self.max_seq_len
+            )));
+        }
+
+        let elem_size = self.keys[0].dtype().size_of();
+        let count = (new_tokens * self.head_dim) as u64;
+        if count == 0 {
+            self.seq_len += new_tokens;
+            return Ok(());
+        }
+
+        let dst_row_offset = self.seq_len * self.head_dim * elem_size;
+        let head_stride = (self.head_dim * elem_size) as u64;
+
+        encoder.set_compute_pipeline_state(copy_pso);
+
+        let grid = metal::MTLSize::new(count, 1, 1);
+        let tg = metal::MTLSize::new(std::cmp::min(copy_max_tg, count), 1, 1);
+
+        for i in 0..self.num_kv_heads {
+            let src_k_off = k_base_offset + (i as u64) * head_stride;
+            encoder.set_buffer(0, Some(k_buf), src_k_off);
+            encoder.set_buffer(
+                1,
+                Some(self.keys[i].metal_buffer()),
+                (self.keys[i].offset() + dst_row_offset) as u64,
+            );
+            encoder.dispatch_threads(grid, tg);
+
+            let src_v_off = v_base_offset + (i as u64) * head_stride;
+            encoder.set_buffer(0, Some(v_buf), src_v_off);
+            encoder.set_buffer(
+                1,
+                Some(self.values[i].metal_buffer()),
+                (self.values[i].offset() + dst_row_offset) as u64,
+            );
+            encoder.dispatch_threads(grid, tg);
+        }
+
+        self.seq_len += new_tokens;
+        Ok(())
+    }
+
     /// Get a view of cached keys for head `h`, shape [seq_len, head_dim].
     pub fn cached_keys(&self, head: usize) -> Array {
         let a = &self.keys[head];
