@@ -2687,10 +2687,19 @@ impl Attention {
         let normed =
             ops::rms_norm::rms_norm_into_cb(registry, x, Some(norm_weight), rms_norm_eps, cb)?;
 
-        // Q/K/V projections (GEMM, all into same CB)
-        let q = self.q_proj.forward_into_cb(&normed, registry, cb)?;
-        let k = self.k_proj.forward_into_cb(&normed, registry, cb)?;
-        let v = self.v_proj.forward_into_cb(&normed, registry, cb)?;
+        // Q/K/V projections — batched into fewer encoders via fused dispatch.
+        // Uses pre-transposed weights (from prepare_weights_for_graph) when available.
+        let (q, k, v) = {
+            let wq_t = self.q_proj.weight_transposed_contiguous()?;
+            let wk_t = self.k_proj.weight_transposed_contiguous()?;
+            let wv_t = self.v_proj.weight_transposed_contiguous()?;
+            let normed_2d = if normed.ndim() == 1 {
+                normed.reshape(vec![1, normed.shape()[0]])?
+            } else {
+                normed.reshape(vec![normed.shape()[0], normed.shape()[1]])?
+            };
+            ops::fused::batched_qkv_proj_into(registry, &normed_2d, &wq_t, &wk_t, &wv_t, cb)?
+        };
 
         let elem_size = q.dtype().size_of();
         let rope_offset = cache.seq_len as u32;
