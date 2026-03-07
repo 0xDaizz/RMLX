@@ -121,6 +121,51 @@ fn rand_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
 }
 
 // ---------------------------------------------------------------------------
+// f16 random array generation
+// ---------------------------------------------------------------------------
+
+fn f32_to_f16_bits(val: f32) -> u16 {
+    let bits = val.to_bits();
+    let sign = (bits >> 31) & 1;
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    let frac = bits & 0x7FFFFF;
+    if exp == 0 {
+        // zero or subnormal
+        return (sign << 15) as u16;
+    }
+    if exp == 0xFF {
+        // inf or nan
+        return ((sign << 15) | 0x7C00 | if frac != 0 { 0x200 } else { 0 }) as u16;
+    }
+    let new_exp = exp - 127 + 15;
+    if new_exp >= 31 {
+        // overflow → inf
+        return ((sign << 15) | 0x7C00) as u16;
+    }
+    if new_exp <= 0 {
+        // underflow → zero
+        return (sign << 15) as u16;
+    }
+    ((sign << 15) | (new_exp as u32) << 10 | (frac >> 13)) as u16
+}
+
+fn rand_array_f16(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
+    use rmlx_core::dtype::DType;
+    let numel: usize = shape.iter().product();
+    let mut f16_bytes = Vec::with_capacity(numel * 2);
+    let mut state = seed;
+    for _ in 0..numel {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let val = ((state >> 33) as f64 / (1u64 << 31) as f64 - 0.5) * 0.04;
+        let h = f32_to_f16_bits(val as f32);
+        f16_bytes.extend_from_slice(&h.to_le_bytes());
+    }
+    Array::from_bytes(device, &f16_bytes, shape.to_vec(), DType::Float16)
+}
+
+// ---------------------------------------------------------------------------
 // Layer construction helpers
 // ---------------------------------------------------------------------------
 
@@ -168,6 +213,64 @@ fn build_transformer_block(device: &metal::Device) -> TransformerBlock {
 
     let norm1_weight = Array::ones(device, &[HIDDEN_SIZE]);
     let norm2_weight = Array::ones(device, &[HIDDEN_SIZE]);
+
+    TransformerBlock::from_parts(0, attention, ffn, norm1_weight, norm2_weight, RMS_NORM_EPS)
+}
+
+fn make_linear_f16(device: &metal::Device, in_f: usize, out_f: usize, seed: u64) -> Linear {
+    let weight = rand_array_f16(device, &[out_f, in_f], seed);
+    Linear::from_arrays(
+        LinearConfig {
+            in_features: in_f,
+            out_features: out_f,
+            has_bias: false,
+        },
+        weight,
+        None,
+    )
+    .expect("linear from_arrays")
+}
+
+fn build_transformer_block_f16(device: &metal::Device) -> TransformerBlock {
+    use rmlx_core::dtype::DType;
+
+    let kv_size = NUM_KV_HEADS * HEAD_DIM;
+
+    let q_proj = make_linear_f16(device, HIDDEN_SIZE, HIDDEN_SIZE, 1);
+    let k_proj = make_linear_f16(device, HIDDEN_SIZE, kv_size, 2);
+    let v_proj = make_linear_f16(device, HIDDEN_SIZE, kv_size, 3);
+    let o_proj = make_linear_f16(device, HIDDEN_SIZE, HIDDEN_SIZE, 4);
+
+    let attn_config = AttentionConfig {
+        num_heads: NUM_HEADS,
+        num_kv_heads: NUM_KV_HEADS,
+        head_dim: HEAD_DIM,
+        max_seq_len: 2048,
+        rope_theta: 10000.0,
+    };
+    let attention =
+        Attention::from_layers(attn_config, q_proj, k_proj, v_proj, o_proj).expect("attention");
+
+    let gate_proj = make_linear_f16(device, HIDDEN_SIZE, INTERMEDIATE_DIM, 5);
+    let up_proj = make_linear_f16(device, HIDDEN_SIZE, INTERMEDIATE_DIM, 6);
+    let down_proj = make_linear_f16(device, INTERMEDIATE_DIM, HIDDEN_SIZE, 7);
+    let ffn = FeedForward::Gated {
+        gate_proj,
+        up_proj,
+        down_proj,
+        gate_up_merged_weight: None,
+    };
+
+    let norm1_weight = {
+        let ones_f16: Vec<u16> = vec![0x3C00u16; HIDDEN_SIZE]; // f16 value 1.0
+        let bytes: Vec<u8> = ones_f16.iter().flat_map(|h| h.to_le_bytes()).collect();
+        Array::from_bytes(device, &bytes, vec![HIDDEN_SIZE], DType::Float16)
+    };
+    let norm2_weight = {
+        let ones_f16: Vec<u16> = vec![0x3C00u16; HIDDEN_SIZE]; // f16 value 1.0
+        let bytes: Vec<u8> = ones_f16.iter().flat_map(|h| h.to_le_bytes()).collect();
+        Array::from_bytes(device, &bytes, vec![HIDDEN_SIZE], DType::Float16)
+    };
 
     TransformerBlock::from_parts(0, attention, ffn, norm1_weight, norm2_weight, RMS_NORM_EPS)
 }
@@ -703,6 +806,74 @@ fn main() {
     println!("==========================================");
 
     // ========================================================================
+    // f16 Weight Benchmark
+    // ========================================================================
+    println!("\n========== f16 Weight Benchmark ==========");
+    let mut block_f16 = build_transformer_block_f16(device);
+    block_f16
+        .prepare_weights_9dispatch(device)
+        .expect("prepare_weights_9dispatch f16 failed");
+    block_f16.prepare_weights_private(device, &queue);
+
+    let x_f16 = rand_array_f16(device, &[SEQ_LEN, HIDDEN_SIZE], 200);
+    let mut cache_f16 = LayerKvCache::preallocated(
+        device,
+        NUM_KV_HEADS,
+        HEAD_DIM,
+        2048,
+        rmlx_core::dtype::DType::Float16,
+    );
+
+    // ---- Warmup f16 9-dispatch ----
+    println!(
+        "Warming up f16 9-dispatch ({} iterations)...",
+        WARMUP_ITERS
+    );
+    for _ in 0..WARMUP_ITERS {
+        cache_f16.seq_len = 0;
+        let cb = queue.new_command_buffer();
+        let _ = block_f16
+            .forward_single_cb_9dispatch(&x_f16, None, None, None, &mut cache_f16, &registry, cb)
+            .unwrap();
+        cb.commit();
+        cb.wait_until_completed();
+    }
+
+    // ---- Benchmark f16 9-dispatch ----
+    println!(
+        "Benchmarking f16 9-dispatch ({} iterations)...",
+        BENCH_ITERS
+    );
+    let mut f16_9d_latencies = Vec::with_capacity(BENCH_ITERS);
+    for _ in 0..BENCH_ITERS {
+        cache_f16.seq_len = 0;
+        let start = Instant::now();
+        let cb = queue.new_command_buffer();
+        let _ = block_f16
+            .forward_single_cb_9dispatch(&x_f16, None, None, None, &mut cache_f16, &registry, cb)
+            .unwrap();
+        cb.commit();
+        cb.wait_until_completed();
+        f16_9d_latencies.push(start.elapsed());
+    }
+    let f16_9d_stats = Stats::from_durations(&f16_9d_latencies);
+    let f16_9d_speedup = if f16_9d_stats.mean > 0.0 {
+        baseline_stats.mean / f16_9d_stats.mean
+    } else {
+        0.0
+    };
+    let f16_vs_f32_speedup = if f16_9d_stats.mean > 0.0 {
+        nine_dispatch_stats.mean / f16_9d_stats.mean
+    } else {
+        0.0
+    };
+    println!("  f16 9-dispatch: {}", f16_9d_stats);
+    println!(
+        "  vs baseline: {:.2}x, vs f32 9-dispatch: {:.2}x",
+        f16_9d_speedup, f16_vs_f32_speedup
+    );
+
+    // ========================================================================
     // Allocation overhead measurement
     // ========================================================================
     println!("\n========== Allocation Overhead ==========");
@@ -1085,6 +1256,10 @@ fn main() {
     println!(
         "  {:40} mean={:8.1}us  ({:.2}x)",
         "2-Encoder 9-Dispatch", two_enc_stats.mean, two_enc_speedup
+    );
+    println!(
+        "  {:40} mean={:8.1}us  ({:.2}x) [{:.2}x vs f32 9d]",
+        "f16 9-Dispatch", f16_9d_stats.mean, f16_9d_speedup, f16_vs_f32_speedup
     );
     println!(
         "  {:40} mean={:8.1}us  ({:.2}x)",
