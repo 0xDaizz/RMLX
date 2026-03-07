@@ -477,6 +477,188 @@ impl LayerKvCache {
         Ok(())
     }
 
+    /// Like append_into_cb but dispatches into an already-open encoder.
+    pub fn append_into_encoder(
+        &mut self,
+        new_keys: Vec<Array>,
+        new_values: Vec<Array>,
+        new_tokens: usize,
+        registry: &KernelRegistry,
+        encoder: &metal::ComputeCommandEncoderRef,
+    ) -> Result<(), KernelError> {
+        if new_keys.len() != self.num_kv_heads || new_values.len() != self.num_kv_heads {
+            return Err(KernelError::InvalidShape(format!(
+                "LayerKvCache::append_into_cb: expected {} kv heads, got keys={}, values={}",
+                self.num_kv_heads,
+                new_keys.len(),
+                new_values.len()
+            )));
+        }
+
+        if self.max_seq_len == 0 {
+            return Err(KernelError::InvalidShape(
+                "LayerKvCache::append_into_cb requires pre-allocated cache".to_string(),
+            ));
+        }
+
+        if self.seq_len + new_tokens > self.max_seq_len {
+            return Err(KernelError::InvalidShape(format!(
+                "LayerKvCache::append_into_cb: overflow: {} cached + {} new > {} max",
+                self.seq_len, new_tokens, self.max_seq_len
+            )));
+        }
+        self.validate_cached_inputs(
+            &new_keys,
+            &new_values,
+            new_tokens,
+            "LayerKvCache::append_into_cb",
+        )?;
+
+        let elem_size = self.keys[0].dtype().size_of();
+        let copy_kernel = match self.keys[0].dtype() {
+            DType::Float32 => "copy_f32",
+            DType::Float16 => "copy_f16",
+            DType::Bfloat16 => "copy_bf16",
+            other => {
+                return Err(KernelError::InvalidShape(format!(
+                    "LayerKvCache: unsupported dtype {:?}",
+                    other
+                )))
+            }
+        };
+        let pipeline = registry.get_pipeline(copy_kernel, self.keys[0].dtype())?;
+        let count = (new_tokens * self.head_dim) as u64;
+        if count == 0 {
+            self.seq_len += new_tokens;
+            return Ok(());
+        }
+
+        let dst_row_offset = self.seq_len * self.head_dim * elem_size;
+
+        encoder.set_compute_pipeline_state(&pipeline);
+
+        for i in 0..self.num_kv_heads {
+            // Copy new keys into slot
+            encoder.set_buffer(
+                0,
+                Some(new_keys[i].metal_buffer()),
+                new_keys[i].offset() as u64,
+            );
+            encoder.set_buffer(
+                1,
+                Some(self.keys[i].metal_buffer()),
+                (self.keys[i].offset() + dst_row_offset) as u64,
+            );
+            let grid = metal::MTLSize::new(count, 1, 1);
+            let tg = metal::MTLSize::new(
+                std::cmp::min(pipeline.max_total_threads_per_threadgroup(), count),
+                1,
+                1,
+            );
+            encoder.dispatch_threads(grid, tg);
+
+            // Copy new values into slot
+            encoder.set_buffer(
+                0,
+                Some(new_values[i].metal_buffer()),
+                new_values[i].offset() as u64,
+            );
+            encoder.set_buffer(
+                1,
+                Some(self.values[i].metal_buffer()),
+                (self.values[i].offset() + dst_row_offset) as u64,
+            );
+            encoder.dispatch_threads(grid, tg);
+        }
+
+        self.seq_len += new_tokens;
+        Ok(())
+    }
+
+    /// Append KV using pre-resolved copy PSO (no registry lookup or input validation).
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure inputs have correct shapes, dtypes, and head counts.
+    /// This skips `validate_cached_inputs` for performance — use only from
+    /// `CachedDecode` where dimensions are validated once at init time.
+    pub fn append_preresolved_into_encoder(
+        &mut self,
+        new_keys: Vec<Array>,
+        new_values: Vec<Array>,
+        new_tokens: usize,
+        copy_pso: &metal::ComputePipelineState,
+        encoder: &metal::ComputeCommandEncoderRef,
+    ) -> Result<(), KernelError> {
+        if new_keys.len() != self.num_kv_heads || new_values.len() != self.num_kv_heads {
+            return Err(KernelError::InvalidShape(format!(
+                "LayerKvCache::append_preresolved: expected {} kv heads, got keys={}, values={}",
+                self.num_kv_heads,
+                new_keys.len(),
+                new_values.len()
+            )));
+        }
+
+        if self.max_seq_len == 0 {
+            return Err(KernelError::InvalidShape(
+                "LayerKvCache::append_preresolved requires pre-allocated cache".to_string(),
+            ));
+        }
+
+        if self.seq_len + new_tokens > self.max_seq_len {
+            return Err(KernelError::InvalidShape(format!(
+                "LayerKvCache::append_preresolved: overflow: {} cached + {} new > {} max",
+                self.seq_len, new_tokens, self.max_seq_len
+            )));
+        }
+
+        let elem_size = self.keys[0].dtype().size_of();
+        let count = (new_tokens * self.head_dim) as u64;
+        if count == 0 {
+            self.seq_len += new_tokens;
+            return Ok(());
+        }
+
+        let dst_row_offset = self.seq_len * self.head_dim * elem_size;
+
+        encoder.set_compute_pipeline_state(copy_pso);
+
+        for i in 0..self.num_kv_heads {
+            encoder.set_buffer(
+                0,
+                Some(new_keys[i].metal_buffer()),
+                new_keys[i].offset() as u64,
+            );
+            encoder.set_buffer(
+                1,
+                Some(self.keys[i].metal_buffer()),
+                (self.keys[i].offset() + dst_row_offset) as u64,
+            );
+            let grid = metal::MTLSize::new(count, 1, 1);
+            let tg = metal::MTLSize::new(
+                std::cmp::min(copy_pso.max_total_threads_per_threadgroup(), count),
+                1,
+                1,
+            );
+            encoder.dispatch_threads(grid, tg);
+
+            encoder.set_buffer(
+                0,
+                Some(new_values[i].metal_buffer()),
+                new_values[i].offset() as u64,
+            );
+            encoder.set_buffer(
+                1,
+                Some(self.values[i].metal_buffer()),
+                (self.values[i].offset() + dst_row_offset) as u64,
+            );
+            encoder.dispatch_threads(grid, tg);
+        }
+
+        self.seq_len += new_tokens;
+        Ok(())
+    }
+
     /// Get a view of cached keys for head `h`, shape [seq_len, head_dim].
     pub fn cached_keys(&self, head: usize) -> Array {
         let a = &self.keys[head];
@@ -1699,6 +1881,16 @@ impl Attention {
         &self.config
     }
 
+    /// Access the merged QKV weight (if prepared).
+    pub fn qkv_merged_weight(&self) -> Option<&Array> {
+        self.qkv_merged_weight.as_ref()
+    }
+
+    /// Access the O-projection weight.
+    pub fn o_proj_weight(&self) -> Option<&Array> {
+        self.o_proj.weight()
+    }
+
     // -------------------------------------------------------------------
     // ExecGraph path
     // -------------------------------------------------------------------
@@ -2514,8 +2706,8 @@ impl Attention {
             v_offset = qkv.offset() + (q_dim + k_dim) * elem_size;
         }
 
-        // End encoder A before cache append (which creates its own encoders)
-        encoder_a.end_encoding();
+        // Memory barrier: ensure rope output visible to KV copy
+        encoder_a.memory_barrier_with_resources(&[buf_as_resource(&qk_roped_buf)]);
 
         let k_roped_flat_offset = qk_roped_offset + q_dim * elem_size;
 
@@ -2538,7 +2730,10 @@ impl Attention {
                 v_offset + h * head_dim * elem_size,
             ));
         }
-        cache.append_into_cb(k_heads, v_heads, 1, registry, cb)?;
+        cache.append_into_encoder(k_heads, v_heads, 1, registry, encoder_a)?;
+
+        // End encoder A after KV append (no separate blit encoder needed)
+        encoder_a.end_encoding();
 
         // --- Single encoder for dispatches 4-5 (SDPA, O_proj+residual) ---
         let encoder_b = cb.new_compute_command_encoder();
@@ -2723,7 +2918,8 @@ impl Attention {
             v_offset = qkv.offset() + (q_dim + k_dim) * elem_size;
         }
 
-        encoder_a.end_encoding();
+        // Memory barrier: ensure rope output visible to KV copy
+        encoder_a.memory_barrier_with_resources(&[buf_as_resource(&qk_roped_buf)]);
 
         // KV cache blit
         let k_roped_flat_offset = qk_roped_offset + q_dim * elem_size;
@@ -2745,7 +2941,9 @@ impl Attention {
                 v_offset + h * head_dim * elem_size,
             ));
         }
-        cache.append_into_cb(k_heads, v_heads, 1, registry, cb)?;
+        cache.append_into_encoder(k_heads, v_heads, 1, registry, encoder_a)?;
+
+        encoder_a.end_encoding();
 
         Ok(DecodePhase1 {
             qk_roped_buf,

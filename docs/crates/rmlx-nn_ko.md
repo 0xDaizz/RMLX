@@ -4,7 +4,7 @@
 
 `rmlx-nn`은 GPU 가속 추론을 위한 신경망 레이어를 구현하는 크레이트입니다. Transformer 아키텍처의 핵심 구성 요소(Linear, Embedding, Attention, TransformerBlock, MoE)를 `rmlx-core`의 연산 커널 위에 구성하며, LLaMA, Qwen, DeepSeek-V3, Mixtral 모델 설정을 내장하고 있습니다.
 
-> **상태 (Phase 0-9B-opt + S1-S5 + EP-2~EP-6):** Linear, Embedding, Attention (KV 캐시 포함), TransformerBlock, MoE (`MoeStrategy` 디스패치 포함), Parallel (TP), 4종 모델 설정(LLaMA 7B/3-8B, Qwen2 7B, DeepSeek-V3, Mixtral 8x7B), RotatingKvCache, BatchKvCache, QuantizedKvCache, QuantizedArray, Conv1d/Conv2d, DynamicExecContext가 구현되어 있습니다. Phase 9에서 `forward_graph()`, `forward_into_cb()`, 가중치 사전 캐싱(`prepare_weight_t`)이 추가되어 ExecGraph CB 배칭을 지원합니다 (레이어당 65 CB -> 5 CB, 92.3% 감소, 17.4x 속도 향상). EP Phase 2-6 순방향 경로 통합 완료: `MoeStrategy` 열거형 (PerExpert/Grouped), 빌더 API (`with_strategy`, `with_pipeline`, `with_sparse_plan`), 그룹형 GEMM 경로, 파이프라인 통합, ICB 희소 디스패치 플레이스홀더, FP8/SlabRing 와이어링. **Phase KO 추가:** 9-디스패치 디코드 경로 (`forward_decode_9dispatch`, `forward_single_cb_9dispatch`), 병합 QKV/gate_up 가중치 준비, slab 레이아웃 KV 캐시 (`LayerKvCache::preallocated` with slab), `StorageModePrivate` 가중치를 위한 `prepare_weights_private()` 파이프라인.
+> **상태 (Phase 0-9B-opt + S1-S5 + EP-2~EP-6):** Linear, Embedding, Attention (KV 캐시 포함), TransformerBlock, MoE (`MoeStrategy` 디스패치 포함), Parallel (TP), 4종 모델 설정(LLaMA 7B/3-8B, Qwen2 7B, DeepSeek-V3, Mixtral 8x7B), RotatingKvCache, BatchKvCache, QuantizedKvCache, QuantizedArray, Conv1d/Conv2d, DynamicExecContext가 구현되어 있습니다. Phase 9에서 `forward_graph()`, `forward_into_cb()`, 가중치 사전 캐싱(`prepare_weight_t`)이 추가되어 ExecGraph CB 배칭을 지원합니다 (레이어당 65 CB -> 5 CB, 92.3% 감소, 17.4x 속도 향상). EP Phase 2-6 순방향 경로 통합 완료: `MoeStrategy` 열거형 (PerExpert/Grouped), 빌더 API (`with_strategy`, `with_pipeline`, `with_sparse_plan`), 그룹형 GEMM 경로, 파이프라인 통합, ICB 희소 디스패치 플레이스홀더, FP8/SlabRing 와이어링. **Phase KO 추가:** 9-디스패치 디코드 경로 (`forward_decode_9dispatch`, `forward_single_cb_9dispatch`), 병합 QKV/gate_up 가중치 준비, slab 레이아웃 KV 캐시 (`LayerKvCache::preallocated` with slab), `StorageModePrivate` 가중치를 위한 `prepare_weights_private()` 파이프라인. **Phase 8c 추가:** `CachedDecode` 구조체 (사전 해석 PSO + 사전 할당 스크래치 버퍼), `forward_cached_2encoder_9dispatch` 메서드, `append_into_encoder` 및 `append_preresolved_into_encoder` KV 캐시 메서드, 모든 op에 걸친 `_preresolved_into_encoder` 패턴.
 
 ---
 
@@ -205,6 +205,15 @@ pub struct LayerKvCache {
 | 메서드 | 설명 |
 |--------|------|
 | `append_into_cb(new_keys, new_values, new_tokens, registry, cb)` | 호출자의 CB에 추가 |
+
+#### `append_into_encoder()` / `append_preresolved_into_encoder()`
+
+호출자가 제공한 compute encoder를 사용하여 새 K/V를 캐시에 추가합니다 (인코더 생성 없음).
+
+| 메서드 | 설명 |
+|--------|------|
+| `append_into_encoder(new_keys, new_values, new_tokens, registry, encoder)` | 기존 인코더를 사용하여 추가 (생성/종료 없음) |
+| `append_preresolved_into_encoder(new_keys, new_values, new_tokens, copy_pso, encoder)` | 사전 해석된 copy PSO로 추가 (레지스트리 조회 없음, 검증 없음) |
 
 ---
 
@@ -470,6 +479,29 @@ Phase KO는 전체 transformer 레이어를 9개의 Metal 디스패치(메모리
 | `TransformerBlock::forward_single_cb_9dispatch(x, kv_cache, cos, sin, encoder, ...)` | 어텐션 + FFN + 잔차를 결합하는 전체 9-디스패치 오케스트레이션 |
 | `TransformerBlock::prepare_weights_9dispatch(registry, queue)` | 9-디스패치 경로를 위한 모든 병합 가중치 준비 |
 
+#### Phase 8c 추가 사항: CachedDecode + 2-인코더 경로
+
+Phase 8c는 모델 초기화 시 모든 파이프라인 상태 객체를 사전 해석하고 스크래치 버퍼를 사전 할당하여 토큰별 CPU 오버헤드를 제거합니다.
+
+##### CachedDecode
+
+```rust
+pub struct CachedDecode {
+    // 10개 사전 해석 PSO (토큰당 레지스트리 조회 제로)
+    // 9개 사전 할당 스크래치 버퍼 (토큰당 Array::uninit 제로)
+    // 사전 계산된 디스패치 기하
+    // 캐시된 norm 가중치 스트라이드
+}
+```
+
+| 메서드 | 설명 |
+|--------|------|
+| `CachedDecode::new(block, registry)` | 모든 PSO 사전 해석, 스크래치 버퍼 할당, 디스패치 기하 계산 |
+| `TransformerBlock::prepare_cached_decode(registry)` | 편의 생성자 |
+| `TransformerBlock::forward_cached_2encoder_9dispatch(x, cos, sin, cache, cached, cb)` | 사전 해석 상태를 사용하는 2-인코더 디코드 (동적 할당 제로) |
+
+**비재진입성**: `CachedDecode`는 호출 간 스크래치 버퍼를 재사용합니다. 이전 출력에 대한 참조를 이후 호출에 걸쳐 유지하면 데이터가 앨리어싱되어 덮어쓰여집니다.
+
 ##### `StorageModePrivate` 가중치 파이프라인
 
 | 메서드 | 설명 |
@@ -621,6 +653,7 @@ Phase KO는 MLX 대비 레이어당 디코드 성능 격차를 해소합니다:
 | ExecGraph (5 CB) | 2,735 | 40x | 5 CB에 ~65 |
 | 단일-CB (44 인코더) | 2,049 | 53x | 44 |
 | 9-디스패치 (4 인코더) | 1,739 | 64x | 9 |
+| Cached 2-인코더 (60L) | 1,367 us/L | 8% 빠름, 6x 낮은 σ | 9 (2 인코더) |
 | MLX 컴파일 | 2,513 (60L) | -- | -- |
 | MLX 대비 격차 | | 2.09x 빠름 | |
 
@@ -735,7 +768,7 @@ pub use embedding::{Embedding, EmbeddingConfig};
 pub use linear::{Linear, LinearConfig};
 pub use moe::{MoeConfig, MoeForwardMetrics, MoeLayer};
 pub use transformer::{
-    FeedForward, FeedForwardType, TransformerBlock, TransformerConfig, TransformerModel,
+    CachedDecode, FeedForward, FeedForwardType, TransformerBlock, TransformerConfig, TransformerModel,
 };
 ```
 

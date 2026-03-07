@@ -2282,6 +2282,76 @@ pub fn sdpa_decode_batched_slab_stride_into_encoder(
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------
+// Pre-resolved (zero-overhead) encoder helpers
+// ---------------------------------------------------------------------------
+
+/// Encode SDPA decode using a pre-resolved PSO and pre-allocated output buffer.
+/// Skips all validation — caller must ensure correctness.
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_decode_preresolved_into_encoder(
+    pso: &metal::ComputePipelineState,
+    q_buf: &metal::BufferRef,
+    q_offset: u64,
+    k_buf: &metal::BufferRef,
+    k_offset: u64,
+    v_buf: &metal::BufferRef,
+    v_offset: u64,
+    out_buf: &metal::BufferRef,
+    out_offset: u64,
+    mask_buf: &metal::BufferRef,
+    mask_offset: u64,
+    num_heads: u32,
+    num_kv_heads: u32,
+    seq_len: u32,
+    head_dim: u32,
+    has_mask: u32,
+    stride_s: u32,
+    scale: f32,
+    encoder: &metal::ComputeCommandEncoderRef,
+) {
+    let params: [u32; 6] = [
+        num_heads,
+        num_kv_heads,
+        seq_len,
+        head_dim,
+        has_mask,
+        stride_s,
+    ];
+
+    encoder.set_compute_pipeline_state(pso);
+    encoder.set_buffer(0, Some(q_buf), q_offset);
+    encoder.set_buffer(1, Some(k_buf), k_offset);
+    encoder.set_buffer(2, Some(v_buf), v_offset);
+    encoder.set_buffer(3, Some(out_buf), out_offset);
+    encoder.set_buffer(4, Some(mask_buf), mask_offset);
+    encoder.set_bytes(
+        5,
+        std::mem::size_of::<[u32; 6]>() as u64,
+        params.as_ptr() as *const std::ffi::c_void,
+    );
+    encoder.set_bytes(6, 4, &scale as *const f32 as *const std::ffi::c_void);
+
+    let tg_size = std::cmp::min(DECODE_THREADS, pso.max_total_threads_per_threadgroup());
+    encoder.dispatch_thread_groups(
+        metal::MTLSize::new(num_heads as u64, 1, 1),
+        metal::MTLSize::new(tg_size, 1, 1),
+    );
+}
+
+/// Get the SDPA decode kernel name for a dtype.
+pub fn sdpa_decode_kernel_name(dtype: DType) -> Result<&'static str, KernelError> {
+    match dtype {
+        DType::Float32 => Ok("sdpa_decode_batched_f32"),
+        DType::Float16 => Ok("sdpa_decode_batched_f16"),
+        DType::Bfloat16 => Ok("sdpa_decode_batched_bf16"),
+        _ => Err(KernelError::NotFound(format!(
+            "sdpa_decode: unsupported dtype {:?}",
+            dtype
+        ))),
+    }
+}
+
 /// Build function constants for SDPA decode specialization.
 ///
 /// When `head_dim` is a known common value (64, 128, 256), we specialize

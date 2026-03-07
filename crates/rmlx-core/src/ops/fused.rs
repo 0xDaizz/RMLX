@@ -256,6 +256,55 @@ pub fn fused_silu_mul_into_encoder(
     Ok(output)
 }
 
+// ---------------------------------------------------------------------------
+// Pre-resolved (zero-overhead) encoder helpers
+// ---------------------------------------------------------------------------
+
+/// Encode fused SiLU * mul using a pre-resolved PSO and pre-allocated output buffer.
+#[allow(clippy::too_many_arguments)]
+pub fn fused_silu_mul_preresolved_into_encoder(
+    pso: &metal::ComputePipelineState,
+    gate_buf: &metal::BufferRef,
+    gate_offset: u64,
+    up_buf: &metal::BufferRef,
+    up_offset: u64,
+    out_buf: &metal::BufferRef,
+    out_offset: u64,
+    numel: u32,
+    elems_per_thread: u64,
+    encoder: &metal::ComputeCommandEncoderRef,
+) {
+    let grid_threads = (numel as u64).div_ceil(elems_per_thread);
+    encoder.set_compute_pipeline_state(pso);
+    encoder.set_buffer(0, Some(gate_buf), gate_offset);
+    encoder.set_buffer(1, Some(up_buf), up_offset);
+    encoder.set_buffer(2, Some(out_buf), out_offset);
+    encoder.set_bytes(3, 4, &numel as *const u32 as *const std::ffi::c_void);
+    let tg = std::cmp::min(pso.max_total_threads_per_threadgroup(), grid_threads);
+    encoder.dispatch_threads(MTLSize::new(grid_threads, 1, 1), MTLSize::new(tg, 1, 1));
+}
+
+/// Get the silu_gate kernel name for a dtype.
+pub fn silu_gate_kernel_name(dtype: DType) -> Result<&'static str, KernelError> {
+    match dtype {
+        DType::Float32 => Ok("silu_gate_f32"),
+        DType::Float16 => Ok("silu_gate_f16"),
+        DType::Bfloat16 => Ok("silu_gate_bf16"),
+        _ => Err(KernelError::NotFound(format!(
+            "silu_gate: unsupported dtype {:?}",
+            dtype
+        ))),
+    }
+}
+
+/// Get the number of elements per thread for fused silu_mul.
+pub fn silu_gate_elems_per_thread(dtype: DType) -> u64 {
+    match dtype {
+        DType::Float32 => 2,
+        _ => 4,
+    }
+}
+
 /// Batched Q/K/V projection using the CommandBatcher (no commit/wait).
 ///
 /// Same as `batched_qkv_proj` but encodes into a provided command buffer.

@@ -4,7 +4,7 @@
 
 `rmlx-nn` is a crate that implements neural network layers for GPU-accelerated inference. It builds core Transformer architecture components (Linear, Embedding, Attention, TransformerBlock, MoE) on top of `rmlx-core` compute kernels, and includes built-in model configurations for LLaMA, Qwen, DeepSeek-V3, and Mixtral.
 
-> **Status (Phase 0-9B-opt + S1-S5 + Audit + EP-2~EP-6 + Prod Phase 2 + Phase 3 + Phase 4 + Phase 5):** Linear, QuantizedLinear (+ AwqLinear, GptqLinear, KQuantType/KQuantConfig), Embedding, Attention (with LayerKvCache, RotatingKvCache, BatchKvCache, QuantizedKvCache, **PagedKvCache**), MLA (full forward: DeepSeek-V3 9-step pipeline with latent KV compression), SlidingWindowAttention (full forward: Mistral-style RoPE + SDPA + KV cache), TransformerBlock, MoE (with shared expert + EP integration + GPU routing + `MoeStrategy` dispatch), `ExpertGroup` (stacked expert GEMM path), `MoePipeline` (TBO/SBO overlap), LayerNorm, **16 activation functions**, Parallel (TP), Conv1d/Conv2d, DynamicExecContext, GGUF model loader (+ K-quant type mapping), **prefix cache** (radix-tree with LRU eviction), **chunked prefill** scheduler, **continuous batching scheduler**, and **4 full model architectures** (LlamaModel, Qwen2Model, DeepSeekV3Model, MixtralModel) are implemented. Phase 0+1+2 audit remediation complete (items N1-N8). EP Phases 2-6 forward path integration complete. **Phase 5 additions:** 11 new activations (ReLU, LeakyReLU, ELU, SELU, Mish, QuickGELU, HardSwish, HardSigmoid, Softplus, Softsign, GLU -- 16 total); full MLA forward implementation; full SlidingWindowAttention forward; AwqLinear/GptqLinear/KQuantType/KQuantConfig in quantized\_linear.rs; K-quant GGUF mapping in gguf\_loader.rs; radix-tree prefix cache (prefix\_cache.rs); chunked prefill in scheduler.rs; 4 full model architectures in models/. **Phase KO additions:** 9-dispatch decode path (forward_decode_9dispatch, forward_single_cb_9dispatch), merged QKV and gate_up weight preparation, slab-layout KV cache (LayerKvCache::preallocated with slab), prepare_weights_private() pipeline for StorageModePrivate weights.
+> **Status (Phase 0-9B-opt + S1-S5 + Audit + EP-2~EP-6 + Prod Phase 2 + Phase 3 + Phase 4 + Phase 5):** Linear, QuantizedLinear (+ AwqLinear, GptqLinear, KQuantType/KQuantConfig), Embedding, Attention (with LayerKvCache, RotatingKvCache, BatchKvCache, QuantizedKvCache, **PagedKvCache**), MLA (full forward: DeepSeek-V3 9-step pipeline with latent KV compression), SlidingWindowAttention (full forward: Mistral-style RoPE + SDPA + KV cache), TransformerBlock, MoE (with shared expert + EP integration + GPU routing + `MoeStrategy` dispatch), `ExpertGroup` (stacked expert GEMM path), `MoePipeline` (TBO/SBO overlap), LayerNorm, **16 activation functions**, Parallel (TP), Conv1d/Conv2d, DynamicExecContext, GGUF model loader (+ K-quant type mapping), **prefix cache** (radix-tree with LRU eviction), **chunked prefill** scheduler, **continuous batching scheduler**, and **4 full model architectures** (LlamaModel, Qwen2Model, DeepSeekV3Model, MixtralModel) are implemented. Phase 0+1+2 audit remediation complete (items N1-N8). EP Phases 2-6 forward path integration complete. **Phase 5 additions:** 11 new activations (ReLU, LeakyReLU, ELU, SELU, Mish, QuickGELU, HardSwish, HardSigmoid, Softplus, Softsign, GLU -- 16 total); full MLA forward implementation; full SlidingWindowAttention forward; AwqLinear/GptqLinear/KQuantType/KQuantConfig in quantized\_linear.rs; K-quant GGUF mapping in gguf\_loader.rs; radix-tree prefix cache (prefix\_cache.rs); chunked prefill in scheduler.rs; 4 full model architectures in models/. **Phase KO additions:** 9-dispatch decode path (forward_decode_9dispatch, forward_single_cb_9dispatch), merged QKV and gate_up weight preparation, slab-layout KV cache (LayerKvCache::preallocated with slab), prepare_weights_private() pipeline for StorageModePrivate weights. **Phase 8c additions:** `CachedDecode` struct with pre-resolved PSOs and pre-allocated scratch buffers, `forward_cached_2encoder_9dispatch` method, `append_into_encoder` and `append_preresolved_into_encoder` for KV cache, `_preresolved_into_encoder` pattern across all ops.
 
 ---
 
@@ -214,6 +214,15 @@ Appends new K/V into the cache using a caller-provided command buffer (ExecGraph
 |--------|-------------|
 | `append_into_cb(new_keys, new_values, new_tokens, registry, cb)` | Append into caller's CB |
 
+#### `append_into_encoder()` / `append_preresolved_into_encoder()`
+
+Appends new K/V into the cache using a caller-provided compute encoder (no encoder creation).
+
+| Method | Description |
+|--------|-------------|
+| `append_into_encoder(new_keys, new_values, new_tokens, registry, encoder)` | Append using existing encoder (no create/end) |
+| `append_preresolved_into_encoder(new_keys, new_values, new_tokens, copy_pso, encoder)` | Append with pre-resolved copy PSO (no registry lookup, no validation) |
+
 ### RotatingKvCache
 
 Circular buffer KV cache following mlx-lm's rotating cache design. Supports a `keep` parameter to preserve system prompt tokens.
@@ -410,6 +419,29 @@ The 9-dispatch path splits a transformer layer into:
 | `FeedForward::forward_single_cb_9dispatch(x, encoder, ...)` | 3-dispatch FFN path using merged gate_up, fused SiLU*mul |
 | `TransformerBlock::forward_single_cb_9dispatch(x, kv_cache, cos, sin, encoder, ...)` | Full 9-dispatch orchestration combining attention + FFN + residuals |
 | `TransformerBlock::prepare_weights_9dispatch(registry, queue)` | Prepare all merged weights for the 9-dispatch path |
+
+#### Phase 8c Additions: CachedDecode + 2-Encoder Path
+
+Phase 8c eliminates per-token CPU overhead by pre-resolving all pipeline state objects and pre-allocating scratch buffers at model initialization.
+
+##### CachedDecode
+
+```rust
+pub struct CachedDecode {
+    // 10 pre-resolved PSOs (zero registry lookups per token)
+    // 9 pre-allocated scratch buffers (zero Array::uninit per token)
+    // Pre-computed dispatch geometries
+    // Cached norm weight strides
+}
+```
+
+| Method | Description |
+|--------|-------------|
+| `CachedDecode::new(block, registry)` | Pre-resolve all PSOs, allocate scratch buffers, compute dispatch geometries |
+| `TransformerBlock::prepare_cached_decode(registry)` | Convenience constructor |
+| `TransformerBlock::forward_cached_2encoder_9dispatch(x, cos, sin, cache, cached, cb)` | 2-encoder decode using pre-resolved state (zero dynamic allocation) |
+
+**Non-reentrancy**: `CachedDecode` reuses scratch buffers across calls. Holding a reference to a previous output across a subsequent call will alias and overwrite data.
 
 ##### StorageModePrivate Weight Pipeline
 
@@ -798,7 +830,7 @@ pub use embedding::{Embedding, EmbeddingConfig};
 pub use linear::{Linear, LinearConfig};
 pub use moe::{MoeConfig, MoeForwardMetrics, MoeLayer};
 pub use transformer::{
-    FeedForward, FeedForwardType, TransformerBlock, TransformerConfig, TransformerModel,
+    CachedDecode, FeedForward, FeedForwardType, TransformerBlock, TransformerConfig, TransformerModel,
 };
 ```
 
@@ -864,6 +896,7 @@ Phase KO closes the per-layer decode performance gap with MLX:
 | ExecGraph (5 CB) | 2,735 | 40x | ~65 in 5 CBs |
 | Single-CB (44 enc) | 2,049 | 53x | 44 |
 | 9-Dispatch (4 enc) | 1,739 | 64x | 9 |
+| Cached 2-encoder (60L) | 1,367 us/L | 8% faster, 6x lower σ | 9 (2 encoders) |
 | MLX compiled (60L) | 2,513 us/L | -- | -- |
 | vs MLX (60L) | | 2.09x faster | |
 

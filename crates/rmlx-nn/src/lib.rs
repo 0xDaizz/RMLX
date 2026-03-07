@@ -58,5 +58,6 @@ pub use sampler::{Sampler, SamplerConfig};
 pub use scheduler::{Scheduler, SchedulerConfig, SchedulerError, SchedulerOutput, SeqMeta};
 pub use sliding_window::{SlidingWindowAttention, SlidingWindowAttentionConfig};
 pub use transformer::{
-    FeedForward, FeedForwardType, TransformerBlock, TransformerConfig, TransformerModel,
+    CachedDecode, FeedForward, FeedForwardType, TransformerBlock, TransformerConfig,
+    TransformerModel,
 };
