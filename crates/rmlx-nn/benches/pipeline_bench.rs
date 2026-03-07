@@ -1,4 +1,4 @@
-//! GPU Pipeline Performance Benchmark
+//! GPU Pipeline Performance Benchmark (Llama-3 8B / Mixtral-style GQA)
 //!
 //! Apples-to-apples comparison of single-layer transformer forward pass:
 //! - **Baseline**: `forward()` — per-op dispatch, each op commits+waits its own CB
@@ -21,14 +21,15 @@ use rmlx_metal::device::GpuDevice;
 use rmlx_metal::event::GpuEvent;
 use rmlx_metal::exec_graph::{ExecGraph, ExecGraphStats};
 use rmlx_nn::{
-    Attention, AttentionConfig, FeedForward, LayerKvCache, Linear, LinearConfig, TransformerBlock,
+    Attention, AttentionConfig, CachedDecode, FeedForward, LayerKvCache, Linear, LinearConfig,
+    TransformerBlock,
 };
 
 const HIDDEN_SIZE: usize = 4096;
 const NUM_HEADS: usize = 32;
 const NUM_KV_HEADS: usize = 8;
 const HEAD_DIM: usize = 128;
-const INTERMEDIATE_DIM: usize = 11008;
+const INTERMEDIATE_DIM: usize = 14336;
 const SEQ_LEN: usize = 1;
 const RMS_NORM_EPS: f32 = 1e-5;
 
@@ -1519,6 +1520,267 @@ fn main() {
     println!("  ExecGraph speedup vs serial:       {:.2}x", eg_60_speedup);
     println!("=====================================================");
 
+    // ========================================================================
+    // Cached 2-Encoder 9-Dispatch (60 layers)
+    // ========================================================================
+    println!("\n========== Cached 2-Encoder 9-Dispatch (60 layers) ==========");
+
+    // Pre-resolve CachedDecode for each layer
+    let cached_60: Vec<CachedDecode> = blocks_60
+        .iter()
+        .map(|blk| {
+            blk.prepare_cached_decode(&registry)
+                .expect("prepare_cached_decode")
+        })
+        .collect();
+
+    // Warmup
+    println!(
+        "Warming up cached 2-encoder x{} ({} iterations)...",
+        num_layers_60, WARMUP_ITERS
+    );
+    for _ in 0..WARMUP_ITERS {
+        for cache in caches_60.iter_mut() {
+            cache.seq_len = 0;
+        }
+        let cb = queue.new_command_buffer();
+        let mut x = Array::ones(device, &[SEQ_LEN, HIDDEN_SIZE]);
+        for ((layer, cache), cached) in blocks_60
+            .iter()
+            .zip(caches_60.iter_mut())
+            .zip(cached_60.iter())
+        {
+            x = layer
+                .forward_cached_2encoder_9dispatch(&x, None, None, cache, cached, cb)
+                .expect("cached warmup failed");
+        }
+        cb.commit();
+        cb.wait_until_completed();
+    }
+
+    // Bench
+    println!(
+        "Benchmarking cached 2-encoder x{} ({} iterations)...",
+        num_layers_60, BENCH_ITERS
+    );
+    let mut cached_60_latencies = Vec::with_capacity(BENCH_ITERS);
+    for _ in 0..BENCH_ITERS {
+        for cache in caches_60.iter_mut() {
+            cache.seq_len = 0;
+        }
+        let start = Instant::now();
+        let cb = queue.new_command_buffer();
+        let mut x = Array::ones(device, &[SEQ_LEN, HIDDEN_SIZE]);
+        for ((layer, cache), cached) in blocks_60
+            .iter()
+            .zip(caches_60.iter_mut())
+            .zip(cached_60.iter())
+        {
+            x = layer
+                .forward_cached_2encoder_9dispatch(&x, None, None, cache, cached, cb)
+                .expect("cached bench failed");
+        }
+        cb.commit();
+        cb.wait_until_completed();
+        cached_60_latencies.push(start.elapsed());
+    }
+
+    let cached_60_stats = Stats::from_durations(&cached_60_latencies);
+    let cached_60_speedup = if cached_60_stats.mean > 0.0 {
+        serial_60_stats.mean / cached_60_stats.mean
+    } else {
+        0.0
+    };
+    println!();
+    println!(
+        "  Cached 2-enc ({} layers):     {}  ({:.1} us/layer)",
+        num_layers_60,
+        cached_60_stats,
+        cached_60_stats.mean / num_layers_60 as f64
+    );
+    println!(
+        "  vs Serial 60L:                 {:.2}x speedup",
+        cached_60_speedup
+    );
+    println!("=====================================================");
+
+    // ========================================================================
+    // ExecGraph Overhead Decomposition
+    // ========================================================================
+    // Isolate: CB creation, commit, event signal/wait, and pipeline bubble costs
+    println!("\n========== ExecGraph Overhead Decomposition ==========");
+
+    // 1. CB creation + commit overhead (no GPU work, just empty CBs)
+    {
+        let mut times = Vec::with_capacity(BENCH_ITERS);
+        let n_cbs = 60usize;
+        // warmup
+        for _ in 0..WARMUP_ITERS {
+            for _ in 0..n_cbs {
+                let cb = queue.new_command_buffer();
+                cb.commit();
+            }
+            // wait for last one
+            let cb = queue.new_command_buffer();
+            cb.commit();
+            cb.wait_until_completed();
+        }
+        for _ in 0..BENCH_ITERS {
+            let start = Instant::now();
+            for _ in 0..n_cbs {
+                let cb = queue.new_command_buffer();
+                cb.commit();
+            }
+            let fence = queue.new_command_buffer();
+            fence.commit();
+            fence.wait_until_completed();
+            times.push(start.elapsed());
+        }
+        let stats = Stats::from_durations(&times);
+        println!(
+            "  60x empty CB create+commit:          {}  ({:.1} us/CB)",
+            stats,
+            stats.mean / n_cbs as f64
+        );
+    }
+
+    // 2. Event signal/wait chain overhead (60 CBs with signal->wait, no work)
+    {
+        let mut times = Vec::with_capacity(BENCH_ITERS);
+        let n_cbs = 60usize;
+        // warmup
+        for _ in 0..WARMUP_ITERS {
+            let ev = GpuEvent::new(device);
+            for i in 0..n_cbs {
+                let cb = queue.new_command_buffer();
+                if i > 0 {
+                    ev.wait_from_command_buffer(cb, i as u64);
+                }
+                ev.signal_from_command_buffer(cb, (i + 1) as u64);
+                cb.commit();
+            }
+            ev.cpu_wait(n_cbs as u64, Duration::from_secs(10))
+                .expect("warmup sync");
+        }
+        for _ in 0..BENCH_ITERS {
+            let ev = GpuEvent::new(device);
+            let start = Instant::now();
+            for i in 0..n_cbs {
+                let cb = queue.new_command_buffer();
+                if i > 0 {
+                    ev.wait_from_command_buffer(cb, i as u64);
+                }
+                ev.signal_from_command_buffer(cb, (i + 1) as u64);
+                cb.commit();
+            }
+            ev.cpu_wait(n_cbs as u64, Duration::from_secs(10))
+                .expect("sync");
+            times.push(start.elapsed());
+        }
+        let stats = Stats::from_durations(&times);
+        println!(
+            "  60x empty CB with signal/wait chain: {}  ({:.1} us/CB)",
+            stats,
+            stats.mean / n_cbs as f64
+        );
+    }
+
+    // 3. Single CB with 360 no-op encoders (matches serial encoder count)
+    {
+        let mut times = Vec::with_capacity(BENCH_ITERS);
+        let n_encoders = 360usize;
+        for _ in 0..WARMUP_ITERS {
+            let cb = queue.new_command_buffer();
+            for _ in 0..n_encoders {
+                let enc = cb.new_compute_command_encoder();
+                enc.end_encoding();
+            }
+            cb.commit();
+            cb.wait_until_completed();
+        }
+        for _ in 0..BENCH_ITERS {
+            let start = Instant::now();
+            let cb = queue.new_command_buffer();
+            for _ in 0..n_encoders {
+                let enc = cb.new_compute_command_encoder();
+                enc.end_encoding();
+            }
+            cb.commit();
+            cb.wait_until_completed();
+            times.push(start.elapsed());
+        }
+        let stats = Stats::from_durations(&times);
+        println!(
+            "  1 CB with 360 no-op encoders:        {}  ({:.1} us/enc)",
+            stats,
+            stats.mean / n_encoders as f64
+        );
+    }
+
+    // 4. 60 CBs with 6 no-op encoders each + signal/wait chain
+    {
+        let mut times = Vec::with_capacity(BENCH_ITERS);
+        let n_cbs = 60usize;
+        let enc_per_cb = 6usize;
+        for _ in 0..WARMUP_ITERS {
+            let ev = GpuEvent::new(device);
+            for i in 0..n_cbs {
+                let cb = queue.new_command_buffer();
+                if i > 0 {
+                    ev.wait_from_command_buffer(cb, i as u64);
+                }
+                for _ in 0..enc_per_cb {
+                    let enc = cb.new_compute_command_encoder();
+                    enc.end_encoding();
+                }
+                ev.signal_from_command_buffer(cb, (i + 1) as u64);
+                cb.commit();
+            }
+            ev.cpu_wait(n_cbs as u64, Duration::from_secs(10))
+                .expect("warmup sync");
+        }
+        for _ in 0..BENCH_ITERS {
+            let ev = GpuEvent::new(device);
+            let start = Instant::now();
+            for i in 0..n_cbs {
+                let cb = queue.new_command_buffer();
+                if i > 0 {
+                    ev.wait_from_command_buffer(cb, i as u64);
+                }
+                for _ in 0..enc_per_cb {
+                    let enc = cb.new_compute_command_encoder();
+                    enc.end_encoding();
+                }
+                ev.signal_from_command_buffer(cb, (i + 1) as u64);
+                cb.commit();
+            }
+            ev.cpu_wait(n_cbs as u64, Duration::from_secs(10))
+                .expect("sync");
+            times.push(start.elapsed());
+        }
+        let stats = Stats::from_durations(&times);
+        println!(
+            "  60 CBs x 6 no-op enc + sig/wait:     {}  ({:.1} us/CB)",
+            stats,
+            stats.mean / n_cbs as f64
+        );
+    }
+
+    // 5. Actual overhead delta
+    let serial_60_per_layer = serial_60_stats.mean / num_layers_60 as f64;
+    let eg_60_per_layer = execgraph_60_stats.mean / num_layers_60 as f64;
+    let overhead_per_layer = eg_60_per_layer - serial_60_per_layer;
+    println!();
+    println!("  --- Measured overhead ---");
+    println!("  Serial 60L per-layer:   {:.1} us", serial_60_per_layer);
+    println!("  ExecGraph 60L per-layer: {:.1} us", eg_60_per_layer);
+    println!(
+        "  Delta (ExecGraph overhead): {:.1} us/layer  ({:.1} us total for 60L)",
+        overhead_per_layer,
+        execgraph_60_stats.mean - serial_60_stats.mean
+    );
+    println!("=====================================================");
+
     // ---- Summary comparison ----
     let two_enc_speedup = if two_enc_stats.mean > 0.0 {
         baseline_stats.mean / two_enc_stats.mean
@@ -1591,6 +1853,13 @@ fn main() {
         execgraph_60_stats.mean,
         eg_60_speedup,
         execgraph_60_stats.mean / num_layers_60 as f64
+    );
+    println!(
+        "  {:40} mean={:8.1}us  ({:.2}x vs serial x60, {:.1} us/layer)",
+        "Cached 2-enc x60",
+        cached_60_stats.mean,
+        cached_60_speedup,
+        cached_60_stats.mean / num_layers_60 as f64
     );
     println!("  -----------------");
 }
