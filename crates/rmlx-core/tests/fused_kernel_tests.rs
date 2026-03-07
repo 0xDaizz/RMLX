@@ -153,6 +153,7 @@ fn assert_close(expected: &[f32], actual: &[f32], tol: f32, label: &str) {
 // Fusion B: fused_swiglu_down tests
 // ===========================================================================
 
+#[allow(clippy::too_many_arguments)]
 fn run_fused_swiglu_down(
     dev: &metal::Device,
     queue: &metal::CommandQueue,
@@ -322,6 +323,7 @@ fn test_fused_swiglu_down_edge_k_not_multiple_of_4() {
 // Fusion A: fused_rms_gemv tests
 // ===========================================================================
 
+#[allow(clippy::too_many_arguments)]
 fn run_fused_rms_gemv(
     dev: &metal::Device,
     queue: &metal::CommandQueue,
