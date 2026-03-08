@@ -41,3 +41,7 @@ harness = false
 [[bench]]
 name = "gemm_kernel_opt"
 harness = false
+
+[[bench]]
+name = "dispatch_overhead"
+harness = false
