@@ -203,8 +203,8 @@ kernel void gemm_tiled_f32(
     }
 
     // Store 2x4 grid of 8x8 results
-    // Use threadgroup memory for bounds-checked store
-    threadgroup float result_buf[N_SIMDGROUPS * 64];
+    // Reuse As[0] as scratch to stay within 32KB threadgroup memory limit
+    threadgroup float* result_buf = (threadgroup float*)&As[0][0];
 
     #pragma clang loop unroll(full)
     for (uint i = 0; i < 2; i++) {
