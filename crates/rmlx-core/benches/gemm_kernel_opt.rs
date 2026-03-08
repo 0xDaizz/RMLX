@@ -225,18 +225,20 @@ fn generate_kernel_opt_shader(cfg: &GemmKernelOptConfig) -> String {
     s
 }
 
-/// Generate the load code for A matrix (either half4 or half8, with or without bounds checks)
+/// Generate the load code for A matrix (either half4 or 2x half4, with or without bounds checks)
 fn generate_a_load(s: &mut String, wide_load: bool, aligned: bool, stage_expr: &str, k_offset_expr: &str) {
     if wide_load {
-        // half8 loads
+        // 2x half4 loads (8 elements per iteration)
         if aligned {
             s.push_str(&format!(
                 "        for (uint idx = tid_in_group; idx < (SW_BM * SW_BK) / 8; idx += SW_N_THREADS) {{\n\
                  \x20           uint elem = idx * 8;\n\
                  \x20           uint r = elem / SW_BK;\n\
                  \x20           uint c = elem % SW_BK;\n\
-                 \x20           *reinterpret_cast<threadgroup half8*>(&As[{stage_expr}][r * SW_A_STRIDE + c]) =\n\
-                 \x20               *reinterpret_cast<device const half8*>(&A_batch[(row_start + r) * uK + {k_offset_expr} + c]);\n\
+                 \x20           *reinterpret_cast<threadgroup half4*>(&As[{stage_expr}][r * SW_A_STRIDE + c]) =\n\
+                 \x20               *reinterpret_cast<device const half4*>(&A_batch[(row_start + r) * uK + {k_offset_expr} + c]);\n\
+                 \x20           *reinterpret_cast<threadgroup half4*>(&As[{stage_expr}][r * SW_A_STRIDE + c + 4]) =\n\
+                 \x20               *reinterpret_cast<device const half4*>(&A_batch[(row_start + r) * uK + {k_offset_expr} + c + 4]);\n\
                  \x20       }}\n"
             ));
         } else {
@@ -248,8 +250,10 @@ fn generate_a_load(s: &mut String, wide_load: bool, aligned: bool, stage_expr: &
                  \x20           uint gr = row_start + r;\n\
                  \x20           uint gc = {k_offset_expr} + c;\n\
                  \x20           if (gr < uM && gc + 7 < uK) {{\n\
-                 \x20               *reinterpret_cast<threadgroup half8*>(&As[{stage_expr}][r * SW_A_STRIDE + c]) =\n\
-                 \x20                   *reinterpret_cast<device const half8*>(&A_batch[gr * uK + gc]);\n\
+                 \x20               *reinterpret_cast<threadgroup half4*>(&As[{stage_expr}][r * SW_A_STRIDE + c]) =\n\
+                 \x20                   *reinterpret_cast<device const half4*>(&A_batch[gr * uK + gc]);\n\
+                 \x20               *reinterpret_cast<threadgroup half4*>(&As[{stage_expr}][r * SW_A_STRIDE + c + 4]) =\n\
+                 \x20                   *reinterpret_cast<device const half4*>(&A_batch[gr * uK + gc + 4]);\n\
                  \x20           }} else {{\n\
                  \x20               for (uint d = 0; d < 8; d++) {{\n\
                  \x20                   As[{stage_expr}][r * SW_A_STRIDE + c + d] = (gr < uM && gc + d < uK)\n\
@@ -297,15 +301,17 @@ fn generate_a_load(s: &mut String, wide_load: bool, aligned: bool, stage_expr: &
 /// Generate the load code for B matrix (either half4 or half8, with or without bounds checks)
 fn generate_b_load(s: &mut String, wide_load: bool, aligned: bool, stage_expr: &str, k_offset_expr: &str) {
     if wide_load {
-        // half8 loads
+        // 2x half4 loads (8 elements per iteration)
         if aligned {
             s.push_str(&format!(
                 "        for (uint idx = tid_in_group; idx < (SW_BK * SW_BN) / 8; idx += SW_N_THREADS) {{\n\
                  \x20           uint elem = idx * 8;\n\
                  \x20           uint r = elem / SW_BN;\n\
                  \x20           uint c = elem % SW_BN;\n\
-                 \x20           *reinterpret_cast<threadgroup half8*>(&Bs[{stage_expr}][r * SW_B_STRIDE + c]) =\n\
-                 \x20               *reinterpret_cast<device const half8*>(&B_batch[({k_offset_expr} + r) * uN + col_start + c]);\n\
+                 \x20           *reinterpret_cast<threadgroup half4*>(&Bs[{stage_expr}][r * SW_B_STRIDE + c]) =\n\
+                 \x20               *reinterpret_cast<device const half4*>(&B_batch[({k_offset_expr} + r) * uN + col_start + c]);\n\
+                 \x20           *reinterpret_cast<threadgroup half4*>(&Bs[{stage_expr}][r * SW_B_STRIDE + c + 4]) =\n\
+                 \x20               *reinterpret_cast<device const half4*>(&B_batch[({k_offset_expr} + r) * uN + col_start + c + 4]);\n\
                  \x20       }}\n"
             ));
         } else {
@@ -317,8 +323,10 @@ fn generate_b_load(s: &mut String, wide_load: bool, aligned: bool, stage_expr: &
                  \x20           uint gr = {k_offset_expr} + r;\n\
                  \x20           uint gc = col_start + c;\n\
                  \x20           if (gr < uK && gc + 7 < uN) {{\n\
-                 \x20               *reinterpret_cast<threadgroup half8*>(&Bs[{stage_expr}][r * SW_B_STRIDE + c]) =\n\
-                 \x20                   *reinterpret_cast<device const half8*>(&B_batch[gr * uN + gc]);\n\
+                 \x20               *reinterpret_cast<threadgroup half4*>(&Bs[{stage_expr}][r * SW_B_STRIDE + c]) =\n\
+                 \x20                   *reinterpret_cast<device const half4*>(&B_batch[gr * uN + gc]);\n\
+                 \x20               *reinterpret_cast<threadgroup half4*>(&Bs[{stage_expr}][r * SW_B_STRIDE + c + 4]) =\n\
+                 \x20                   *reinterpret_cast<device const half4*>(&B_batch[gr * uN + gc + 4]);\n\
                  \x20           }} else {{\n\
                  \x20               for (uint d = 0; d < 8; d++) {{\n\
                  \x20                   Bs[{stage_expr}][r * SW_B_STRIDE + c + d] = (gr < uK && gc + d < uN)\n\
