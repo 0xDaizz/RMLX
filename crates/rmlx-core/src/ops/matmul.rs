@@ -2923,6 +2923,178 @@ kernel void grouped_gemm_mlx_f16(
         }
     }
 }
+
+// ===== Grouped Split-K pass 1: BM=32, BN=32, BK=16 =====
+// Combines grouped GEMM (tile_to_problem mapping) with K-dimension splitting.
+// Each threadgroup computes a partial K-range for one expert tile.
+// Output: f32 partials in C_partial[split_idx * total_M * N + global_row * N + col].
+// Grid: (total_tiles, 1, n_splits).
+
+constant constexpr uint GSK_BM = 32;
+constant constexpr uint GSK_BN = 32;
+constant constexpr uint GSK_BK = 16;
+constant constexpr uint GSK_N_THREADS = 64;
+constant constexpr uint GSK_TM = 4;   // BM / 8
+constant constexpr uint GSK_TN = 2;   // (BN/2) / 8
+
+constant bool gsk_align_N [[function_constant(201)]];
+
+kernel void grouped_splitk_pass1_f16(
+    device const half* A_stacked       [[buffer(0)]],  // [sum(M_i), K]
+    device const half* B_stacked       [[buffer(1)]],  // [num_experts, K, N]
+    device float* C_partial            [[buffer(2)]],  // [n_splits, total_M, N] f32
+    device const uint* problem_offsets [[buffer(3)]],  // [num_experts+1]
+    device const uint* tile_to_problem [[buffer(4)]],  // [total_tiles]
+    device const uint* tile_offsets    [[buffer(5)]],  // [num_experts]
+    constant uint& K                   [[buffer(6)]],
+    constant uint& N                   [[buffer(7)]],
+    constant uint& total_M             [[buffer(8)]],
+    constant uint& n_splits            [[buffer(9)]],
+    uint3 group_id       [[threadgroup_position_in_grid]],
+    uint  tid_in_group   [[thread_index_in_threadgroup]],
+    uint  sgid           [[simdgroup_index_in_threadgroup]],
+    uint  lane_id        [[thread_index_in_simdgroup]])
+{
+    threadgroup half As[GSK_BM * GSK_BK];  // 1KB
+    threadgroup half Bs[GSK_BK * GSK_BN];  // 1KB
+
+    // 1. Flat tile index -> expert lookup (from X dimension only)
+    uint flat_tile = group_id.x;
+    uint split_idx = group_id.z;
+    uint expert_id = tile_to_problem[flat_tile];
+
+    // 2. Expert's M offset and local tile position
+    uint m_offset = problem_offsets[expert_id];
+    uint m_i = problem_offsets[expert_id + 1] - m_offset;
+    uint tiles_n = (N + GSK_BN - 1) / GSK_BN;
+    uint local_tile = flat_tile - tile_offsets[expert_id];
+    uint tile_m = local_tile / tiles_n;
+    uint tile_n = local_tile % tiles_n;
+
+    uint row_start = tile_m * GSK_BM;
+    uint col_start = tile_n * GSK_BN;
+
+    // 3. Expert-specific pointers
+    uint uK = gg_as_uniform(K);
+    uint uN = gg_as_uniform(N);
+    uint uTotalM = gg_as_uniform(total_M);
+    device const half* A_expert = A_stacked + m_offset * uK;
+    device const half* B_expert = B_stacked + expert_id * uK * uN;
+
+    // SG grid: 1x2
+    const uint base_n = sgid * 16;
+
+    simdgroup_float8x8 acc[GSK_TM][GSK_TN];
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < GSK_TM; i++)
+        #pragma clang loop unroll(full)
+        for (uint j = 0; j < GSK_TN; j++)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    // K range for this split
+    uint k_per_split = (uK + n_splits - 1) / n_splits;
+    uint k_start = split_idx * k_per_split;
+    uint k_end = min(k_start + k_per_split, uK);
+    uint n_tiles_k = (k_end - k_start + GSK_BK - 1) / GSK_BK;
+
+    for (uint tile_k = 0; tile_k < n_tiles_k; tile_k++) {
+        uint kb = k_start + tile_k * GSK_BK;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Load A tile: 64 threads load 32x16 = 512 elements (8 per thread)
+        {
+            uint a_row = tid_in_group / 2;        // 0..31
+            uint a_col_base = (tid_in_group % 2) * 8;  // 0 or 8
+            uint gr = row_start + a_row;
+            if (gr < m_i && kb + a_col_base + 7 < k_end) {
+                *reinterpret_cast<threadgroup half4*>(&As[a_row * GSK_BK + a_col_base]) =
+                    *reinterpret_cast<device const half4*>(&A_expert[gr * uK + kb + a_col_base]);
+                *reinterpret_cast<threadgroup half4*>(&As[a_row * GSK_BK + a_col_base + 4]) =
+                    *reinterpret_cast<device const half4*>(&A_expert[gr * uK + kb + a_col_base + 4]);
+            } else if (gr < m_i) {
+                for (uint d = 0; d < 8; d++) {
+                    As[a_row * GSK_BK + a_col_base + d] = (kb + a_col_base + d < k_end)
+                        ? A_expert[gr * uK + kb + a_col_base + d] : half(0);
+                }
+            } else {
+                for (uint d = 0; d < 8; d++) {
+                    As[a_row * GSK_BK + a_col_base + d] = half(0);
+                }
+            }
+        }
+
+        // Load B tile: 64 threads load 16x32 = 512 elements (8 per thread)
+        {
+            uint b_row = tid_in_group / 4;         // 0..15
+            uint b_col_base = (tid_in_group % 4) * 8;  // 0, 8, 16, 24
+            uint gr = kb + b_row;
+            uint gc = col_start + b_col_base;
+            if (gr < k_end && (gsk_align_N || gc + 7 < uN)) {
+                *reinterpret_cast<threadgroup half4*>(&Bs[b_row * GSK_BN + b_col_base]) =
+                    *reinterpret_cast<device const half4*>(&B_expert[gr * uN + gc]);
+                *reinterpret_cast<threadgroup half4*>(&Bs[b_row * GSK_BN + b_col_base + 4]) =
+                    *reinterpret_cast<device const half4*>(&B_expert[gr * uN + gc + 4]);
+            } else {
+                for (uint d = 0; d < 8; d++) {
+                    Bs[b_row * GSK_BN + b_col_base + d] = (gr < k_end && (gsk_align_N || gc + d < uN))
+                        ? B_expert[gr * uN + gc + d] : half(0);
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // MMA compute (serpentine)
+        #pragma clang loop unroll(full)
+        for (uint kk = 0; kk < 2; kk++) {
+            simdgroup_half8x8 a_frag[GSK_TM];
+            simdgroup_half8x8 b_frag[GSK_TN];
+
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < GSK_TM; i++)
+                simdgroup_load(a_frag[i], &As[(i * 8) * GSK_BK + kk * 8], GSK_BK);
+
+            #pragma clang loop unroll(full)
+            for (uint j = 0; j < GSK_TN; j++)
+                simdgroup_load(b_frag[j], &Bs[kk * 8 * GSK_BN + (base_n + j * 8)], GSK_BN);
+
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < GSK_TM; i++)
+                #pragma clang loop unroll(full)
+                for (uint j = 0; j < GSK_TN; j++) {
+                    uint n_serp = (i % 2) ? (GSK_TN - 1 - j) : j;
+                    simdgroup_multiply_accumulate(
+                        acc[i][n_serp], a_frag[i], b_frag[n_serp], acc[i][n_serp]);
+                }
+        }
+    }
+
+    // Store f32 partial results: C_partial[split_idx * total_M * N + global_row * N + col]
+    const uint qid = lane_id / 4;
+    const uint fm = (qid & 4u) + ((lane_id / 2u) % 4u);
+    const uint fn_val = (qid & 2u) * 2u + (lane_id % 2u) * 2u;
+
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < GSK_TM; i++) {
+        #pragma clang loop unroll(full)
+        for (uint j = 0; j < GSK_TN; j++) {
+            uint local_r = row_start + i * 8 + fm;
+            uint gc0 = col_start + base_n + j * 8 + fn_val;
+            uint gc1 = gc0 + 1;
+            uint global_r = m_offset + local_r;
+
+            auto elems = acc[i][j].thread_elements();
+
+            if (local_r < m_i && (gsk_align_N || gc0 < uN)) {
+                C_partial[split_idx * uTotalM * uN + global_r * uN + gc0] = elems[0];
+            }
+            if (local_r < m_i && (gsk_align_N || gc1 < uN)) {
+                C_partial[split_idx * uTotalM * uN + global_r * uN + gc1] = elems[1];
+            }
+        }
+    }
+}
 "#;
 
 // ---------------------------------------------------------------------------
@@ -3004,25 +3176,25 @@ pub fn select_tile_config(m: usize, n: usize, _k: usize) -> TileConfig {
 
 /// Select the best tile configuration considering dtype.
 ///
-/// For f16: uses MlxArchMicro (BM=16, BN=32) for Skinny M=5-16 range,
-/// MlxArchSmall (BM=32, BN=32) for Skinny M=17-32 range,
-/// and MlxArch (BM=64, BN=64) for Full (M>=33) range.
-/// For f32: uses MlxArch (BM=64, BN=64) for Full (M>=33) range.
+/// For f16 Skinny (M=5..32): N-aware dispatch —
+///   N > 4096 (compute-bound) → MlxArchSmall (BM=32, BN=32),
+///   N ≤ 4096 (memory-bound)  → MlxArchMicro (BM=16, BN=32).
+/// For f16/f32 Full (M>=33): MlxArch (BM=64, BN=64).
 pub fn select_tile_config_with_dtype(m: usize, n: usize, k: usize, dtype: DType) -> TileConfig {
     let base = select_tile_config(m, n, k);
-    // MlxArchMicro/MlxArchSmall for f16 small-M (Skinny range)
+    // MlxArchMicro/MlxArchSmall for f16 small-M (Skinny range), N-aware
     if dtype == DType::Float16 && base.variant == TileVariant::Skinny {
-        if m <= 16 {
-            return TileConfig {
-                bm: 16,
-                bn: 32,
-                variant: TileVariant::MlxArchMicro,
-            };
-        } else {
+        if n > 4096 {
             return TileConfig {
                 bm: 32,
                 bn: 32,
                 variant: TileVariant::MlxArchSmall,
+            };
+        } else {
+            return TileConfig {
+                bm: 16,
+                bn: 32,
+                variant: TileVariant::MlxArchMicro,
             };
         }
     }
@@ -4070,6 +4242,165 @@ pub fn dispatch_grouped_gemm(
     Ok(out)
 }
 
+/// Dispatch a grouped GEMM with Split-K for MoE: combines tile_to_problem mapping
+/// with K-dimension splitting for better GPU occupancy when expert M values are small.
+///
+/// Falls back to `dispatch_grouped_gemm` when Split-K is not beneficial.
+///
+/// - `a_stacked`: [sum(M_i), K] — concatenated tokens for all experts
+/// - `b_stacked`: [num_experts, K, N] — stacked expert weights
+/// - `expert_ms`: slice of M values per expert
+/// - `gpu_cores`: number of GPU compute units (for occupancy heuristic)
+/// - Returns: [sum(M_i), N]
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_grouped_splitk(
+    registry: &KernelRegistry,
+    queue: &metal::CommandQueue,
+    a_stacked: &Array,
+    b_stacked: &Array,
+    expert_ms: &[usize],
+    k: usize,
+    n: usize,
+    gpu_cores: usize,
+) -> Result<Array, KernelError> {
+    let dev = registry.device().raw();
+    let num_experts = expert_ms.len();
+    let total_m: usize = expert_ms.iter().sum();
+
+    // Build tile_to_problem and tile_offsets with BM=32, BN=32
+    let bm = 32usize;
+    let bn = 32usize;
+    let tiles_n = n.div_ceil(bn);
+    let mut problem_offsets = Vec::with_capacity(num_experts + 1);
+    let mut prefix = 0u32;
+    for &m_i in expert_ms {
+        problem_offsets.push(prefix);
+        prefix += m_i as u32;
+    }
+    problem_offsets.push(prefix);
+
+    let mut tile_offsets = Vec::with_capacity(num_experts);
+    let mut tile_to_problem = Vec::new();
+    let mut tile_count = 0u32;
+    for (expert_id, &m_i) in expert_ms.iter().enumerate() {
+        tile_offsets.push(tile_count);
+        let tiles_m = m_i.div_ceil(bm);
+        let expert_tiles = tiles_m * tiles_n;
+        for _ in 0..expert_tiles {
+            tile_to_problem.push(expert_id as u32);
+        }
+        tile_count += expert_tiles as u32;
+    }
+    let total_tiles = tile_count as usize;
+
+    if total_tiles == 0 {
+        return Ok(Array::zeros(dev, &[total_m, n], DType::Float16));
+    }
+
+    // Decide n_splits: if total_tiles < 2x GPU cores, split K to fill the GPU
+    let n_splits = if total_tiles < gpu_cores * 2 && k >= 256 {
+        let target = gpu_cores * 2;
+        let splits = (target / total_tiles.max(1)).min(k / 128).min(8);
+        if splits > 1 {
+            splits
+        } else {
+            1
+        }
+    } else {
+        1
+    };
+
+    // Fall back to regular grouped GEMM when Split-K is not needed
+    if n_splits == 1 {
+        return dispatch_grouped_gemm(registry, a_stacked, b_stacked, queue, expert_ms, k, n);
+    }
+
+    // Allocate f32 partial buffer and f16 output
+    let partial = Array::zeros(dev, &[n_splits * total_m * n], DType::Float32);
+    let out = Array::zeros(dev, &[total_m, n], DType::Float16);
+
+    // Function constant: align_N (index 201)
+    let align_n = n % bn == 0;
+    let constants = vec![(201u32, crate::kernels::FunctionConstantValue::Bool(align_n))];
+    let pass1_pipeline = registry.get_pipeline_with_constants(
+        "grouped_splitk_pass1_f16",
+        DType::Float16,
+        &constants,
+    )?;
+
+    // Create Metal buffers for metadata
+    let opts = metal::MTLResourceOptions::StorageModeShared;
+    let offsets_buf = dev.new_buffer_with_data(
+        problem_offsets.as_ptr() as *const _,
+        (problem_offsets.len() * 4) as u64,
+        opts,
+    );
+    let tile_map_buf = dev.new_buffer_with_data(
+        tile_to_problem.as_ptr() as *const _,
+        (tile_to_problem.len() * 4) as u64,
+        opts,
+    );
+    let tile_off_buf = dev.new_buffer_with_data(
+        tile_offsets.as_ptr() as *const _,
+        (tile_offsets.len() * 4) as u64,
+        opts,
+    );
+    let k_buf = make_u32_buf(dev, super::checked_u32(k, "K")?);
+    let n_buf = make_u32_buf(dev, super::checked_u32(n, "N")?);
+    let total_m_buf = make_u32_buf(dev, super::checked_u32(total_m, "total_M")?);
+    let splits_buf = make_u32_buf(dev, super::checked_u32(n_splits, "n_splits")?);
+
+    let cb = queue.new_command_buffer();
+
+    // Pass 1: grouped split-K
+    {
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pass1_pipeline);
+        enc.set_buffer(0, Some(a_stacked.metal_buffer()), a_stacked.offset() as u64);
+        enc.set_buffer(1, Some(b_stacked.metal_buffer()), b_stacked.offset() as u64);
+        enc.set_buffer(2, Some(partial.metal_buffer()), 0);
+        enc.set_buffer(3, Some(&offsets_buf), 0);
+        enc.set_buffer(4, Some(&tile_map_buf), 0);
+        enc.set_buffer(5, Some(&tile_off_buf), 0);
+        enc.set_buffer(6, Some(&k_buf), 0);
+        enc.set_buffer(7, Some(&n_buf), 0);
+        enc.set_buffer(8, Some(&total_m_buf), 0);
+        enc.set_buffer(9, Some(&splits_buf), 0);
+
+        // Grid: (total_tiles, 1, n_splits)
+        let grid = MTLSize::new(total_tiles as u64, 1, n_splits as u64);
+        let tg = MTLSize::new(64, 1, 1);
+        enc.dispatch_thread_groups(grid, tg);
+        enc.end_encoding();
+    }
+
+    // Pass 2: reduce f32 partials → f16 output
+    // Reuse splitk_reduce_f16: it sums n_splits planes of size total_M * N
+    {
+        let pass2_pipeline = registry.get_pipeline("splitk_reduce_f16", DType::Float16)?;
+        let reduce_m_buf = make_u32_buf(dev, super::checked_u32(total_m, "M")?);
+        let reduce_n_buf = make_u32_buf(dev, super::checked_u32(n, "N")?);
+        let reduce_splits_buf = make_u32_buf(dev, super::checked_u32(n_splits, "n_splits")?);
+
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pass2_pipeline);
+        enc.set_buffer(0, Some(partial.metal_buffer()), 0);
+        enc.set_buffer(1, Some(out.metal_buffer()), 0);
+        enc.set_buffer(2, Some(&reduce_m_buf), 0);
+        enc.set_buffer(3, Some(&reduce_n_buf), 0);
+        enc.set_buffer(4, Some(&reduce_splits_buf), 0);
+
+        let total_elems = total_m * n;
+        let tg_size = 256u64;
+        let n_groups = ceil_div(total_elems, tg_size as usize) as u64;
+        enc.dispatch_thread_groups(MTLSize::new(n_groups, 1, 1), MTLSize::new(tg_size, 1, 1));
+        enc.end_encoding();
+    }
+
+    super::commit_with_mode(cb, super::ExecMode::Sync);
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4304,5 +4635,78 @@ mod tests {
         // Expert 1: ceil(5/64)=1 * 32 = 32 tiles
         // Expert 2: ceil(8/64)=1 * 32 = 32 tiles
         assert_eq!(total_tiles, 96);
+    }
+
+    #[test]
+    fn test_grouped_splitk_tile_mapping() {
+        // BM=32, BN=32 tiles for grouped split-K
+        let expert_ms: [usize; 4] = [4, 2, 8, 6];
+        let bm: usize = 32;
+        let bn: usize = 32;
+        let n: usize = 2048;
+        let tiles_n = n.div_ceil(bn); // 64
+
+        let mut total_tiles: usize = 0;
+        for &m_i in &expert_ms {
+            total_tiles += m_i.div_ceil(bm) * tiles_n;
+        }
+        // Expert 0: ceil(4/32)=1 * 64 = 64
+        // Expert 1: ceil(2/32)=1 * 64 = 64
+        // Expert 2: ceil(8/32)=1 * 64 = 64
+        // Expert 3: ceil(6/32)=1 * 64 = 64
+        assert_eq!(total_tiles, 256);
+    }
+
+    #[test]
+    fn test_grouped_splitk_heuristic() {
+        let gpu_cores = 80; // M3 Ultra
+        let expert_ms: [usize; 8] = [4, 2, 3, 5, 2, 4, 3, 1];
+        let bm = 32usize;
+        let bn = 32usize;
+        let k = 4096usize;
+        let n = 2048usize;
+        let tiles_n = n.div_ceil(bn); // 64
+
+        let total_tiles: usize = expert_ms
+            .iter()
+            .map(|&m_i| m_i.div_ceil(bm) * tiles_n)
+            .sum();
+        // 8 experts, each 1 tile_m * 64 tiles_n = 512 total tiles
+
+        // 512 > 160, so n_splits should be 1 (no split-K needed)
+        let n_splits = if total_tiles < gpu_cores * 2 && k >= 256 {
+            let target = gpu_cores * 2;
+            let splits = (target / total_tiles.max(1)).min(k / 128).min(8);
+            if splits > 1 {
+                splits
+            } else {
+                1
+            }
+        } else {
+            1
+        };
+        assert_eq!(n_splits, 1);
+
+        // Now with N=128 (fewer tiles): total_tiles = 8 * 1 * 4 = 32
+        let n_small: usize = 128;
+        let tiles_n_small = n_small.div_ceil(bn); // 4
+        let total_tiles_small: usize = expert_ms
+            .iter()
+            .map(|&m_i| m_i.div_ceil(bm) * tiles_n_small)
+            .sum();
+        assert_eq!(total_tiles_small, 32);
+        // 32 < 160, should split: target=160, 160/32=5, min(5, 4096/128=32, 8) = 5
+        let n_splits_small = if total_tiles_small < gpu_cores * 2 && k >= 256 {
+            let target = gpu_cores * 2;
+            let splits = (target / total_tiles_small.max(1)).min(k / 128).min(8);
+            if splits > 1 {
+                splits
+            } else {
+                1
+            }
+        } else {
+            1
+        };
+        assert_eq!(n_splits_small, 5);
     }
 }
