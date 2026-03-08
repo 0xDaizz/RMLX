@@ -266,6 +266,7 @@ fn main() {
         let flops =
             n_q_heads as f64 * 2.0 * (q_sl as f64) * (k_sl as f64) * (head_dim as f64) * 2.0;
         let gqa_ratio = n_q_heads / n_kv_heads;
+        #[allow(clippy::needless_range_loop)]
         bench("sdpa 32h GQA [1024,128] (32Q/8KV)", Some(flops), || {
             for h in 0..n_q_heads {
                 let kv_idx = h / gqa_ratio;
@@ -305,6 +306,7 @@ fn main() {
         let flops =
             n_q_heads as f64 * 2.0 * (q_sl as f64) * (k_sl as f64) * (head_dim as f64) * 2.0;
         let gqa_ratio = n_q_heads / n_kv_heads;
+        #[allow(clippy::needless_range_loop)]
         bench("sdpa 32h GQA [1024,128] causal", Some(flops), || {
             for h in 0..n_q_heads {
                 let kv_idx = h / gqa_ratio;
@@ -341,6 +343,7 @@ fn main() {
             .collect();
 
         let gqa_ratio = n_q_heads / n_kv_heads;
+        #[allow(clippy::needless_range_loop)]
         bench("sdpa 32h GQA [1,128]x[1024,128] decode", None, || {
             for h in 0..n_q_heads {
                 let kv_idx = h / gqa_ratio;

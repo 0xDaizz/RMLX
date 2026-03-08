@@ -7,8 +7,8 @@
 #   ./scripts/run_distributed_bench.sh --ep          # EP benchmark instead of TP
 #
 # Environment:
-#   hwstudio1: 10.254.0.5 (rank 0, coordinator)
-#   hwstudio2: 10.254.0.6 (rank 1)
+#   node0: 10.0.0.1 (rank 0, coordinator)
+#   node1: 10.0.0.2 (rank 1)
 #   TB5 RDMA: en5, GID_INDEX=1, IB_PORT=1, IBV_QPT_UC
 #   Coordinator port: 18520
 
@@ -18,12 +18,12 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # ─── Configuration ──────────────────────────────────────────────────────────
-HWSTUDIO1="hwstudio1"
-HWSTUDIO2="hwstudio2"
+NODE0="node0"
+NODE1="node1"
 # Coordinator uses LAN IPs (TCP-based QP exchange)
 # TB5 RDMA (en5) doesn't support TCP/IP — only raw RDMA verbs
-HWSTUDIO1_IP="192.168.0.105"
-HWSTUDIO2_IP="192.168.0.117"
+NODE0_IP="10.0.0.1"
+NODE1_IP="10.0.0.2"
 COORDINATOR_PORT=18520
 
 REMOTE_DIR="~/rmlx"
@@ -66,70 +66,70 @@ if [ "$LOCAL_ONLY" = true ]; then
 fi
 
 # ─── Check connectivity ────────────────────────────────────────────────────
-log "Checking connectivity to $HWSTUDIO1 and $HWSTUDIO2..."
-if ! ssh_cmd "$HWSTUDIO1" true 2>/dev/null; then
-    echo "ERROR: Cannot SSH to $HWSTUDIO1" >&2
+log "Checking connectivity to $NODE0 and $NODE1..."
+if ! ssh_cmd "$NODE0" true 2>/dev/null; then
+    echo "ERROR: Cannot SSH to $NODE0" >&2
     exit 1
 fi
-if ! ssh_cmd "$HWSTUDIO2" true 2>/dev/null; then
-    echo "ERROR: Cannot SSH to $HWSTUDIO2" >&2
+if ! ssh_cmd "$NODE1" true 2>/dev/null; then
+    echo "ERROR: Cannot SSH to $NODE1" >&2
     exit 1
 fi
 log "Both hosts reachable."
 
 # ─── Sync code to both machines ────────────────────────────────────────────
-log "Syncing code to $HWSTUDIO1..."
+log "Syncing code to $NODE0..."
 rsync -az --delete \
     --exclude target \
     --exclude .git \
     --exclude bench_results \
-    "$PROJECT_DIR/" "$HWSTUDIO1:$REMOTE_DIR/"
+    "$PROJECT_DIR/" "$NODE0:$REMOTE_DIR/"
 
-log "Syncing code to $HWSTUDIO2..."
+log "Syncing code to $NODE1..."
 rsync -az --delete \
     --exclude target \
     --exclude .git \
     --exclude bench_results \
-    "$PROJECT_DIR/" "$HWSTUDIO2:$REMOTE_DIR/"
+    "$PROJECT_DIR/" "$NODE1:$REMOTE_DIR/"
 
 log "Code synced."
 
 # ─── Build on both machines (parallel) ─────────────────────────────────────
 log "Building on both machines (parallel)..."
-ssh_cmd "$HWSTUDIO1" "cd $REMOTE_DIR && cargo build --release -p rmlx-nn --bench $BENCH_NAME --features distributed 2>&1" &
+ssh_cmd "$NODE0" "cd $REMOTE_DIR && cargo build --release -p rmlx-nn --bench $BENCH_NAME --features distributed 2>&1" &
 PID1=$!
-ssh_cmd "$HWSTUDIO2" "cd $REMOTE_DIR && cargo build --release -p rmlx-nn --bench $BENCH_NAME --features distributed 2>&1" &
+ssh_cmd "$NODE1" "cd $REMOTE_DIR && cargo build --release -p rmlx-nn --bench $BENCH_NAME --features distributed 2>&1" &
 PID2=$!
 
-wait $PID1 || { echo "ERROR: Build failed on $HWSTUDIO1" >&2; exit 1; }
-wait $PID2 || { echo "ERROR: Build failed on $HWSTUDIO2" >&2; exit 1; }
+wait $PID1 || { echo "ERROR: Build failed on $NODE0" >&2; exit 1; }
+wait $PID2 || { echo "ERROR: Build failed on $NODE1" >&2; exit 1; }
 log "Build complete on both machines."
 
 # ─── Create results directory ──────────────────────────────────────────────
 mkdir -p "$RESULTS_DIR"
 TIMESTAMP=$(date '+%Y%m%d_%H%M%S')
 
-# ─── Run single-node baseline on hwstudio1 first ──────────────────────────
-log "Running single-node baseline on $HWSTUDIO1..."
-ssh_cmd "$HWSTUDIO1" "cd $REMOTE_DIR && \
+# ─── Run single-node baseline on node0 first ──────────────────────────
+log "Running single-node baseline on $NODE0..."
+ssh_cmd "$NODE0" "cd $REMOTE_DIR && \
     cargo bench -p rmlx-nn --bench $BENCH_NAME --features distributed 2>&1" \
-    | tee "$RESULTS_DIR/${TIMESTAMP}_${BENCH_NAME}_baseline_hwstudio1.txt"
+    | tee "$RESULTS_DIR/${TIMESTAMP}_${BENCH_NAME}_baseline_node0.txt"
 
 # ─── Run distributed benchmark on both machines ───────────────────────────
 log "Starting distributed benchmark (2-node)..."
-log "  Rank 0 (coordinator): $HWSTUDIO1 ($HWSTUDIO1_IP)"
-log "  Rank 1:               $HWSTUDIO2 ($HWSTUDIO2_IP)"
+log "  Rank 0 (coordinator): $NODE0 ($NODE0_IP)"
+log "  Rank 1:               $NODE1 ($NODE1_IP)"
 
 # Environment variables for distributed init (rmlx_distributed::init)
 # Uses RMLX_COORDINATOR for coordinator-mediated QP exchange
 COMMON_ENV="RMLX_WORLD_SIZE=2 \
-RMLX_COORDINATOR=$HWSTUDIO1_IP \
+RMLX_COORDINATOR=$NODE0_IP \
 RMLX_COORDINATOR_PORT=$COORDINATOR_PORT \
 RMLX_IBV_DEVICES=$REMOTE_DIR/config/devices_tb5.json"
 
 # Start rank 1 first (it will connect to rank 0's coordinator)
-log "Starting rank 1 on $HWSTUDIO2..."
-ssh_cmd "$HWSTUDIO2" "cd $REMOTE_DIR && \
+log "Starting rank 1 on $NODE1..."
+ssh_cmd "$NODE1" "cd $REMOTE_DIR && \
     RMLX_RANK=1 $COMMON_ENV \
     cargo bench -p rmlx-nn --bench $BENCH_NAME --features distributed 2>&1" \
     > "$RESULTS_DIR/${TIMESTAMP}_${BENCH_NAME}_tp2_rank1.txt" 2>&1 &
@@ -139,8 +139,8 @@ RANK1_PID=$!
 sleep 2
 
 # Start rank 0 (coordinator)
-log "Starting rank 0 on $HWSTUDIO1..."
-ssh_cmd "$HWSTUDIO1" "cd $REMOTE_DIR && \
+log "Starting rank 0 on $NODE0..."
+ssh_cmd "$NODE0" "cd $REMOTE_DIR && \
     RMLX_RANK=0 $COMMON_ENV \
     cargo bench -p rmlx-nn --bench $BENCH_NAME --features distributed 2>&1" \
     | tee "$RESULTS_DIR/${TIMESTAMP}_${BENCH_NAME}_tp2_rank0.txt" &
@@ -162,13 +162,13 @@ fi
 # ─── Collect results ───────────────────────────────────────────────────────
 log "=== Results ==="
 echo ""
-echo "--- Baseline (single-node, hwstudio1) ---"
-cat "$RESULTS_DIR/${TIMESTAMP}_${BENCH_NAME}_baseline_hwstudio1.txt"
+echo "--- Baseline (single-node, node0) ---"
+cat "$RESULTS_DIR/${TIMESTAMP}_${BENCH_NAME}_baseline_node0.txt"
 echo ""
-echo "--- 2-node Rank 0 (hwstudio1) ---"
+echo "--- 2-node Rank 0 (node0) ---"
 cat "$RESULTS_DIR/${TIMESTAMP}_${BENCH_NAME}_tp2_rank0.txt"
 echo ""
-echo "--- 2-node Rank 1 (hwstudio2) ---"
+echo "--- 2-node Rank 1 (node1) ---"
 cat "$RESULTS_DIR/${TIMESTAMP}_${BENCH_NAME}_tp2_rank1.txt"
 echo ""
 log "Results saved to $RESULTS_DIR/"

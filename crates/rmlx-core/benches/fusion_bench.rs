@@ -7,7 +7,7 @@
 //!
 //! MLX reference values are loaded from a JSON file via `MLX_FUSION_REF` env var:
 //!
-//!   # Step 1: Run MLX reference on hwstudio1
+//!   # Step 1: Run MLX reference on node0
 //!   python benchmarks/mlx_fusion_bench.py --out /tmp/mlx_fusion_ref.json
 //!
 //!   # Step 2: Run RMLX benchmark with MLX reference

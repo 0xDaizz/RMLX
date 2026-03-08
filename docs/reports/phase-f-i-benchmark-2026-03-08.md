@@ -4,7 +4,7 @@
 
 | Item | Value |
 |------|-------|
-| Machine | hwstudio1 (Mac Studio) |
+| Machine | node0 (Mac Studio) |
 | SoC | Apple M3 Ultra, 80 GPU cores |
 | RAM | 512 GB Unified Memory |
 | GPU API | Metal 4 |
@@ -162,7 +162,7 @@ MLX 아키텍처 기반 QMM 전면 재작성 완료 (qmm-porter 브랜치).
 - `fc_group_size` function constant (컴파일타임 나눗셈 제거)
 - Vectorized `uchar4` B load
 
-**v1 실측 (hwstudio2)**: M=32 1.87T (MLX 3.22T, 1.72x), M=256 6.30T (MLX 12.91T, 2.05x). BM=64 타일로는 한계 확인.
+**v1 실측 (node1)**: M=32 1.87T (MLX 3.22T, 1.72x), M=256 6.30T (MLX 12.91T, 2.05x). BM=64 타일로는 한계 확인.
 **v2 (BM32)**: MLX QuantizedBlockLoader 패턴 기반 재작성 진행 중 — BM=32/BN=32/BK=32/BK_padded=40.
 
 ### QMV qdot (Q4/Q8, Decode M=1)
@@ -231,7 +231,7 @@ QMV is correctly dispatched for decode (M=1) path.
 
 ### MoE Parallelism Comparison (f16, Mixtral 8x7B config)
 
-**Config:** E=8, D=4096, top_k=2, intermediate=14336, cf=1.25, hwstudio1+hwstudio2 (M3 Ultra x2, TB5 RDMA)
+**Config:** E=8, D=4096, top_k=2, intermediate=14336, cf=1.25, node0+node1 (M3 Ultra x2, TB5 RDMA)
 
 #### 1. EP Comparison (EP vs EP, 2-node)
 
@@ -411,7 +411,7 @@ Phase J was executed as the follow-up to Phase F-I, targeting the quantized kern
 - All benchmarks use 3-way comparison structure: MLX reference / RMLX baseline / RMLX optimized
 - MLX reference values passed via JSON environment variables for reproducibility
 - Full model bench uses safetensors loading (not GGUF) for fair MLX comparison
-- Awaiting hwstudio1 execution for actual numbers
+- Awaiting node0 execution for actual numbers
 
 ### J-5 RMSNorm+GEMM Fusion 결론: 이득 없음
 
@@ -444,7 +444,7 @@ Phase J was executed as the follow-up to Phase F-I, targeting the quantized kern
 | A input f32→half scalar | 10-15% |
 | Bank conflict (no padding) | ~5% |
 
-### QMM MLX-arch v1 벤치마크 (hwstudio2, BM=64 버전)
+### QMM MLX-arch v1 벤치마크 (node1, BM=64 버전)
 
 | M | RMLX (TFLOPS) | MLX (TFLOPS) | Gap |
 |---|------:|-----:|----:|

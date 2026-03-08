@@ -3094,7 +3094,7 @@ pub fn qmm_add_residual_into_cb(
     let k = x.shape()[1];
     let n = qw.out_features;
 
-    if residual.shape() != &[m, n] {
+    if residual.shape() != [m, n] {
         return Err(KernelError::InvalidShape(format!(
             "qmm_add_residual_into_cb: residual shape must be [{}, {}], got {:?}",
             m,
@@ -3178,7 +3178,7 @@ pub fn qmm_swiglu_into_cb(
     let k = x.shape()[1];
     let n = qw.out_features;
 
-    if gate_result.shape() != &[m, n] {
+    if gate_result.shape() != [m, n] {
         return Err(KernelError::InvalidShape(format!(
             "qmm_swiglu_into_cb: gate_result shape must be [{}, {}], got {:?}",
             m,

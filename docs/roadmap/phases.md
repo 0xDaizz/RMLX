@@ -1181,7 +1181,7 @@ Systematically find the optimal GEMM kernel configuration to close the TFLOPS ga
 
 - [x] 3 sweep benchmarks implemented (27 total kernel variants)
 - [x] bk32_2x4 confirmed optimal across M/N combinations
-- [x] MLX comparison on hwstudio1 hardware
+- [x] MLX comparison on node0 hardware
 - [x] 1,298 tests pass
 
 ---
@@ -1229,7 +1229,7 @@ Following Phase B's config sweep, optimize the GEMM kernel internals to further 
 - [x] Wide load optimization applied to production kernels
 - [x] SG=2x4 layout integrated into `matmul.rs` (f32/f16/bf16)
 - [x] `gemm_bench.rs` fixed for direct kernel dispatch
-- [x] MLX comparison on hwstudio1 hardware
+- [x] MLX comparison on node0 hardware
 
 ---
 
@@ -1413,7 +1413,7 @@ Close the QMM/QMV MLX gap identified in Phase G benchmarks, remove ExecGraph int
 | J-7 | Distributed bench RDMA 2-node | Real RDMA communication wired | Complete |
 | J-8 | MoE fused kernels (index_gather + scatter_weighted_add) | Scatter N x 3 sync -> 1 sync | In review |
 
-### Benchmark Results (hwstudio1, M3 Ultra 80-core)
+### Benchmark Results (node0, M3 Ultra 80-core)
 
 **QMM Q4 (Prefill)**
 

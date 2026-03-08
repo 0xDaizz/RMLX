@@ -203,12 +203,12 @@ pub enum Interconnect {
 ```json
 [
   {
-    "ssh": "hwstudio1",
+    "ssh": "node0",
     "ips": ["192.168.0.1"],
     "rdma": [null, "rdma_en5"]
   },
   {
-    "ssh": "hwstudio2",
+    "ssh": "node1",
     "ips": ["192.168.0.2"],
     "rdma": ["rdma_en5", null]
   }

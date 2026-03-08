@@ -4841,7 +4841,7 @@ pub fn matmul_swiglu_gemm_into_cb(
     let k = a.shape()[1];
     let n = b.shape()[1];
 
-    if gate_result.shape() != &[m, n] {
+    if gate_result.shape() != [m, n] {
         return Err(KernelError::InvalidShape(format!(
             "gate_result shape must be [{}, {}], got {:?}",
             m,
