@@ -1,6 +1,6 @@
-# 🗺️ 구현 로드맵 — Phase 0-9B + S1-S5 + Audit Remediation 완료 + Phase KO + Phase 8c + Phase 9 + Phase 10 + Phase 11 + Phase A + Phase B
+# 🗺️ 구현 로드맵 — Phase 0-9B + S1-S5 + Audit Remediation 완료 + Phase KO + Phase 8c + Phase 9 + Phase 10 + Phase 11 + Phase A + Phase B + Phase C + Phase D + Phase F + Phase G + Phase H + Phase I + Phase J
 
-rmlx 프로젝트의 구현 로드맵입니다. Phase 9B-opt 및 서빙 지원 Phase S1-S5, 그리고 전체 크레이트 감사 수정(76개 항목)까지 모든 Phase가 완료되었습니다. 현재 테스트 수: 1,298. Phase 8c는 CachedDecode (사전 해석 PSO + 사전 할당 스크래치 버퍼), 2-인코더 디코드 경로, `_preresolved_into_encoder` 패턴, GEMV BM8 최적화 (배리어 제거 + f16 확대 로드)를 추가하여 60L 깊이에서 714 us/layer를 달성합니다 (f16, 6x 낮은 분산). Phase 10 (커널 융합)은 fused_rms_gemv와 fused_swiglu_down 커널을 추가하여 디코드 파이프라인을 9에서 7 디스패치로 줄이고, 703.4 us/layer를 달성합니다. Phase 11 (GEMV 커널 최적화 실험)은 모든 커널 수준 최적화 시도가 실패했음을 확인했습니다 (col-major +84%, interleaved +2.2%, SRAM+f16+funcconst +3.6%); row-major BM8 GEMV + f32 누산기가 705 us/layer의 실질적 하한선입니다 (73.6% 대역폭 효율). Phase A (프리필 최적화)는 단일-CB 프리필 파이프라인(54개 동기화 지점→1), GQA slab SDPA(32개 디스패치→1), GEMM threadgroup swizzle, 새 연산 matmul_into_cb/silu_into_cb를 추가하여 베이스라인 대비 3.5-7.3x 속도 향상, MLX 대비 1.2-3.4x 이내를 달성합니다. Phase B (GEMM Config Sweep)는 3회 sweep에서 27개 커널 변형을 테스트하여 bk32_2x4 (BM=64, BN=64, BK=32, SG=2x4, 256 스레드)를 최적 구성으로 확정했습니다 — 21.54T TFLOPS, MLX 23.97T 대비 -10.1% 격차.
+rmlx 프로젝트의 구현 로드맵입니다. Phase 9B-opt 및 서빙 지원 Phase S1-S5, 그리고 전체 크레이트 감사 수정(76개 항목)까지 모든 Phase가 완료되었습니다. 현재 테스트 수: 1,298+. Phase 8c는 CachedDecode (사전 해석 PSO + 사전 할당 스크래치 버퍼), 2-인코더 디코드 경로, `_preresolved_into_encoder` 패턴, GEMV BM8 최적화 (배리어 제거 + f16 확대 로드)를 추가하여 60L 깊이에서 714 us/layer를 달성합니다 (f16, 6x 낮은 분산). Phase 10 (커널 융합)은 fused_rms_gemv와 fused_swiglu_down 커널을 추가하여 디코드 파이프라인을 9에서 7 디스패치로 줄이고, 703.4 us/layer를 달성합니다. Phase 11 (GEMV 커널 최적화 실험)은 모든 커널 수준 최적화 시도가 실패했음을 확인했습니다 (col-major +84%, interleaved +2.2%, SRAM+f16+funcconst +3.6%); row-major BM8 GEMV + f32 누산기가 705 us/layer의 실질적 하한선입니다 (73.6% 대역폭 효율). Phase A (프리필 최적화)는 단일-CB 프리필 파이프라인(54개 동기화 지점→1), GQA slab SDPA(32개 디스패치→1), GEMM threadgroup swizzle, 새 연산 matmul_into_cb/silu_into_cb를 추가하여 베이스라인 대비 3.5-7.3x 속도 향상, MLX 대비 1.2-3.4x 이내를 달성합니다. Phase B (GEMM Config Sweep)는 3회 sweep에서 27개 커널 변형을 테스트하여 bk32_2x4 (BM=64, BN=64, BK=32, SG=2x4, 256 스레드)를 최적 구성으로 확정했습니다 — 21.54T TFLOPS, MLX 23.97T 대비 -10.1% 격차. Phase C (커널 수준 최적화)는 wide_load와 SG=2x4 레이아웃을 프로덕션 커널에 적용하여 21.21T를 달성했습니다. Phase D2 (MLX 아키텍처 커널)는 BK=16, 2 SG, 64 스레드, 단일 버퍼, 4xhalf4 와이드 로드로 **23.82T TFLOPS**를 달성하여 MLX 대비 격차를 -0.6%로 축소했습니다. Phase F (인프라 최적화)는 디스패치 오버헤드 벤치마크(176us/CB, 12.4%), DiskPipelineCache, GatherMM MMA(4-12x)를 추가했습니다. Phase G (양자화 최적화)는 QMM MMA Q4/Q8, QMV qdot, CPU 폴백 제거를 완료했습니다. Phase H-2 (GEMM+잔차 에필로그 퓨전)는 대형 N에서 5-12% 개선을 달성했습니다. Phase I-1 (분산 TP)은 DistributedTransformerModel과 forward_with_group/shard_for_tp를 추가하여 TP=2에서 1.94x 추정 속도 향상을 달성했습니다. Phase J (양자화 패리티 + 인프라)는 QMM 격차를 4.78x에서 2.55x로 축소(+73%), QMV 격차를 1.15x로 축소(+37%), ExecGraph inter-layer stall 32개 제거, FusionCompiler(lazy.rs -> FusionAnalyzer -> codegen -> Metal JIT) 추가, RMSNorm+GEMM fusion(function constant 203, -40.5%), Split-K QMM, MoE 융합 커널, forward_auto()(eager+lazy 하이브리드 디스패치)를 추가했습니다.
 
 ---
 
@@ -30,6 +30,17 @@ rmlx 프로젝트의 구현 로드맵입니다. Phase 9B-opt 및 서빙 지원 P
 | 11 | GEMV 커널 최적화 실험 | col-major GEMV (+84%), interleaved GEMV (+2.2%), SRAM prefetch + f16 acc + function constants (+3.6%) — 전부 실패; 705 us/layer 실질적 하한선 확인 | 10 | ✅ 완료 (실험 종결) |
 | A | 프리필 최적화 | 단일-CB 파이프라인 (54→1 동기화), GQA slab SDPA (32→1), GEMM swizzle, matmul_into_cb, silu_into_cb | 11 | ✅ 완료 |
 | B | GEMM Config Sweep | bk32_2x4 최적 config 확정, 27 kernel variants sweep, 21.54T TFLOPS (MLX 대비 -10.1%) | A | ✅ 완료 |
+| C | GEMM 커널 수준 최적화 | wide_load + SG=2x4 프로덕션 적용, 21.21T TFLOPS (MLX 대비 -11.5%) | B | ✅ 완료 |
+| D | GEMM 커널 아키텍처 | D2: MLX 아키텍처 커널 — **23.82T** (MLX 대비 -0.6%), D3: function constants, D5: bf16 배리어 수정 | C | D2 완료 |
+| F-1 | 디스패치 오버헤드 벤치마크 | 176us/CB, 레이어 시간의 12.4% | D | ✅ 완료 |
+| F-2 | DiskPipelineCache | KernelRegistry에 SHA-256 기반 디스크 파이프라인 캐시 연결 | D | ✅ 완료 |
+| F-3 | Grouped GEMM MMA | GatherMM 스칼라→simdgroup MMA 전환, MoE 4-12x 개선 | D | ✅ 완료 |
+| G-1 | QMM MMA Q4 | Q4 양자화 행렬 곱셈 simdgroup MMA (BM=32, BN=32, BK=32) | F | ✅ 완료 |
+| G-2 | QMV qdot Q4/Q8 | MLX qdot 패턴 (mask 곱셈 + uchar4 벡터화 로드) | F | ✅ 완료 |
+| G-3 | Q8 QMM MMA + CPU 폴백 제거 | Q8 simdgroup MMA, CPU 폴백 경로 완전 제거 | G-1 | ✅ 완료 |
+| H-2 | GEMM+잔차 에필로그 퓨전 | function constant 202 (has_residual), 대형 N에서 5-12% | G | ✅ 완료 |
+| I-1 | 분산 TP | DistributedTransformerModel, forward_with_group, shard_for_tp, TP=2 1.94x | H | ✅ 완료 |
+| J | 양자화 패리티 + 인프라 | QMM +73%, QMV +37% (MLX 1.15x), ExecGraph stall 제거, lazy.rs FusionCompiler, RMSNorm+GEMM fusion, Split-K, MoE fuse, forward_auto() | I | ✅ 완료 (J-3c/J-8 보류) |
 | S1 | Serving Quick Wins | GELU, RotatingKV, BatchKV | Phase 9 | ✅ 완료 |
 | S2 | DType + Quantization | FP8, GGUF, AWQ/GPTQ | Phase 9 | ✅ 완료 |
 | S3 | Attention Upgrade | Flash Attention 2, QuantizedKV | Phase 9 | ✅ 완료 |
@@ -86,6 +97,25 @@ rmlx 프로젝트의 구현 로드맵입니다. Phase 9B-opt 및 서빙 지원 P
 | Phase 11: GEMV 커널 최적화 실험 | main | 1,151 tests | ✅ Complete (실험 종결 — 개선 없음) |
 | Phase A: 프리필 최적화 | main | 1,298 tests | ✅ Complete |
 | Phase B: GEMM Config Sweep | gemm-sweep | 1,298 tests | ✅ Complete |
+| Phase C: GEMM 커널 수준 최적화 | main | 1,298 tests | ✅ Complete |
+| Phase D2: MLX 아키텍처 커널 (23.82T, -0.6% vs MLX) | gemm-kernel-d2 | 1,298+ tests | ✅ Complete |
+| Phase F-1: 디스패치 오버헤드 벤치마크 (176us/CB, 12.4%) | main (PR #65) | 1,298+ tests | ✅ Complete |
+| Phase F-2: DiskPipelineCache | main (PR #65) | 1,298+ tests | ✅ Complete |
+| Phase F-3: GatherMM MMA (4-12x) | main (PR #65) | 1,298+ tests | ✅ Complete |
+| Phase G-1: QMM MMA Q4 | main (PR #66) | 1,298+ tests | ✅ Complete |
+| Phase G-2: QMV qdot Q4/Q8 | main (PR #66) | 1,298+ tests | ✅ Complete |
+| Phase G-3: Q8 QMM MMA + CPU 폴백 제거 | main (PR #66) | 1,298+ tests | ✅ Complete |
+| Phase H-2: GEMM+잔차 에필로그 퓨전 | main (PR #67) | 1,298+ tests | ✅ Complete |
+| Phase I-1: 분산 TP (DistributedTransformerModel) | main (PR #68) | 1,298+ tests | ✅ Complete |
+| Phase J-1: QMM MMA 4SG/128-thread (+73% TFLOPS) | main | 1,298+ tests | ✅ Complete |
+| Phase J-2: QMV qdot load_vector + multi-row TG (+37%) | main | 1,298+ tests | ✅ Complete |
+| Phase J-3: ExecGraph inter-layer stall 제거 (32→0) | main | 1,298+ tests | ✅ Complete |
+| Phase J-4: lazy.rs FusionCompiler + eval_fused | main | 1,298+ tests | ✅ Complete |
+| Phase J-4e: forward_auto() in TransformerModel | main | 1,298+ tests | ✅ Complete |
+| Phase J-5: RMSNorm+GEMM fusion (function constant 203) | main | 1,298+ tests | ✅ Complete |
+| Phase J-6: Split-K QMM (+20% at M=128) | main | 1,298+ tests | ✅ Complete |
+| Phase J-7: Distributed bench RDMA 2-node | main | 1,298+ tests | ✅ Complete |
+| Phase J-8: MoE fused kernels | -- | -- | 🔄 리뷰 중 |
 
 ---
 
@@ -864,6 +894,78 @@ bf16 커널의 fragment당 배리어 폭발(bf16→f32 변환으로 K 루프 반
 - [ ] D3: Function constants 적용, 정렬된 경로에서 분기 없음 검증
 - [ ] D4: 저장 배리어 축소 (또는 D2로 대체)
 - [ ] D5: bf16 배리어 수가 f16 커널과 동일
+
+---
+
+## Phase J: 양자화 커널 패리티 + 인프라 -- ✅ 완료 (J-3c/J-8 보류)
+
+### 목표
+
+Phase G 벤치마크에서 확인된 QMM/QMV MLX 격차 해소, ExecGraph inter-layer stall 제거, lazy.rs fusion 파이프라인 활성화, RMSNorm+GEMM fusion 추가, FusionCompiler를 TransformerModel에 통합하는 forward_auto() 구현.
+
+### 세부 단계
+
+| 작업 | 설명 | 결과 | 상태 |
+|------|------|------|------|
+| J-1 | QMM MMA 재설계 (4SG, 128 threads) | 3.09T → 4.79T (+55%) | ✅ 완료 |
+| J-1b | Vectorized dequant + half input | 4.79T → 5.34T (+12%) | ✅ 완료 |
+| J-2 | QMV qdot (load_vector + multi-row TG) | 0.26T → 0.36T (+37%), MLX 1.15x | ✅ 완료 |
+| J-3 | ExecGraph inter-layer stall 제거 | 32 stalls → 0 (Metal FIFO) | ✅ 완료 |
+| J-3c | ICB decode replay | stub 존재, icb.rs 연결 필요 | 대기 |
+| J-4 | lazy.rs FusionCompiler + eval_fused | FusionAnalyzer + FusionCompiler + EvalContext | ✅ 완료 |
+| J-4e | TransformerModel에 forward_auto() 추가 | eager+lazy 하이브리드 디스패치 (자동 모드 선택) | ✅ 완료 |
+| J-5 | RMSNorm+GEMM fusion | Function constant 203, 2-pass inv_rms | ✅ 완료 |
+| J-6 | Split-K QMM | M=128에서 +20% | ✅ 완료 |
+| J-7 | 분산 벤치마크 RDMA 2-node | 실제 RDMA 통신 연결 | ✅ 완료 |
+| J-8 | MoE fused kernels (index_gather + scatter_weighted_add) | Scatter N×3 sync → 1 sync | 🔄 리뷰 중 |
+
+### 벤치마크 결과 (hwstudio1, M3 Ultra 80-core)
+
+**QMM Q4 (프리필)**
+
+| 구성 | Phase G | Phase J | vs MLX (13.6T) |
+|------|--------:|--------:|---------------:|
+| M=128 K=4096 N=4096 | -- | 4.59T | 3.0x 느림 |
+| M=256 K=4096 N=4096 | 3.09T | **5.34T** (+73%) | 2.55x 느림 |
+
+**QMV (디코드 M=1)**
+
+| 구성 | Phase G | Phase J | vs MLX |
+|------|--------:|--------:|-------:|
+| Q4 K=4096 N=14336 | 0.26T | **0.36T** (+37%) | 1.15x 느림 |
+| Q8 K=4096 N=14336 | 0.29T | **0.39T** (+36%) | 1.08x 느림 |
+
+**융합 커널**
+
+| 융합 | 절감 |
+|------|-----:|
+| fused_swiglu_down | -38.8% |
+| fused_rms_gemv QKV | -40.5% |
+| fused_rms_gemv gate_up | -34.6% |
+
+### 주요 변경 사항
+
+- **quantized.rs**: Multi-row TG (8 rows/TG), load_vector 전처리, K-striding, 4SG/128-thread QMM, vectorized dequant, Split-K 경로
+- **matmul.rs**: Function constant 203 (has_norm), buffer(11) norm_weight, buffer(12) inv_rms, `matmul_norm_gemm_into_cb()`
+- **rms_norm.rs**: `inv_rms_f32/f16/bf16` 커널, `compute_inv_rms()` API
+- **transformer.rs**: Inter-layer wait_for 제거 (Metal FIFO 보장 활용); `forward_auto()` 추가 (eager+lazy 하이브리드)
+- **attention.rs**: EventToken과 forward_graph 반환값 분리
+- **fusion/analyzer.rs**: LazyGraph → Fused/Standalone 세그먼트 분할
+- **fusion/compiler.rs**: FusionGraph → Metal JIT → dispatch
+- **lazy.rs**: EvalContext 구조체, eval_fused() 메서드
+
+### 완료 조건 (DoD)
+
+- [x] J-1: QMM 4SG 커널 (+73% TFLOPS)
+- [x] J-2: QMV qdot MLX 근접 패리티 (1.15x)
+- [x] J-3: ExecGraph stall 제거
+- [x] J-4: FusionCompiler + ExecGraph 연결
+- [x] J-4e: forward_auto() TransformerModel 통합 (eager+lazy 하이브리드)
+- [x] J-5: RMSNorm+GEMM fusion (function constant 203)
+- [x] J-6: Split-K QMM (저-M 경로)
+- [x] J-7: RDMA 2-node 벤치마크 연결
+- [ ] J-3c: ICB decode replay
+- [ ] J-8: MoE fused kernels (리뷰 중)
 
 ---
 
