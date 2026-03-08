@@ -1989,6 +1989,269 @@ impl Attention {
         self.o_proj.forward(&concat, registry, queue)
     }
 
+    /// Forward pass from pre-projected Q, K, V tensors (no QKV projection, no O projection).
+    ///
+    /// Used by tensor-parallel forward: each rank computes its local QKV shard,
+    /// then calls this to run RoPE + SDPA + head concatenation on local heads.
+    /// The caller handles O projection separately (via RowParallelLinear).
+    ///
+    /// - `q`: [seq_len, local_num_heads * head_dim] — pre-projected Q for this rank's heads
+    /// - `k`: [seq_len, local_num_kv_heads * head_dim]
+    /// - `v`: [seq_len, local_num_kv_heads * head_dim]
+    /// - `local_num_heads`, `local_num_kv_heads`: head counts for this rank
+    ///
+    /// Returns: [seq_len, local_num_heads * head_dim] — concatenated attention output
+    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
+    pub(crate) fn forward_from_qkv(
+        &self,
+        q: &Array,
+        k: &Array,
+        v: &Array,
+        local_num_heads: usize,
+        local_num_kv_heads: usize,
+        cos_freqs: Option<&Array>,
+        sin_freqs: Option<&Array>,
+        mask: Option<&Array>,
+        mut cache: Option<&mut LayerKvCache>,
+        registry: &KernelRegistry,
+        queue: &metal::CommandQueue,
+    ) -> Result<Array, KernelError> {
+        let head_dim = self.config.head_dim;
+        let seq_len = q.shape()[0];
+        let repeats = local_num_heads / local_num_kv_heads;
+        let elem_size = q.dtype().size_of();
+
+        // RoPE offset from cache position
+        let rope_offset = cache.as_ref().map_or(0u32, |c| c.seq_len as u32);
+
+        let q_heads: Vec<Array>;
+        let k_heads: Vec<Array>;
+        let v_heads: Vec<Array>;
+
+        if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
+            let q_batched = ops::rope::rope_multihead(
+                registry, q, cos, sin, local_num_heads, rope_offset, queue,
+            )?;
+            let k_batched = ops::rope::rope_multihead(
+                registry, k, cos, sin, local_num_kv_heads, rope_offset, queue,
+            )?;
+            let v_batched =
+                ops::rope::deinterleave_heads(registry, v, local_num_kv_heads, queue)?;
+
+            let head_elems = seq_len * head_dim;
+            q_heads = (0..local_num_heads)
+                .map(|h| {
+                    q_batched.view(
+                        vec![seq_len, head_dim],
+                        vec![head_dim, 1],
+                        q_batched.offset() + h * head_elems * elem_size,
+                    )
+                })
+                .collect();
+            k_heads = (0..local_num_kv_heads)
+                .map(|h| {
+                    k_batched.view(
+                        vec![seq_len, head_dim],
+                        vec![head_dim, 1],
+                        k_batched.offset() + h * head_elems * elem_size,
+                    )
+                })
+                .collect();
+            v_heads = (0..local_num_kv_heads)
+                .map(|h| {
+                    v_batched.view(
+                        vec![seq_len, head_dim],
+                        vec![head_dim, 1],
+                        v_batched.offset() + h * head_elems * elem_size,
+                    )
+                })
+                .collect();
+        } else {
+            let q_batched =
+                ops::rope::deinterleave_heads(registry, q, local_num_heads, queue)?;
+            let k_batched =
+                ops::rope::deinterleave_heads(registry, k, local_num_kv_heads, queue)?;
+            let v_batched =
+                ops::rope::deinterleave_heads(registry, v, local_num_kv_heads, queue)?;
+
+            let head_elems = seq_len * head_dim;
+            q_heads = (0..local_num_heads)
+                .map(|h| {
+                    q_batched.view(
+                        vec![seq_len, head_dim],
+                        vec![head_dim, 1],
+                        q_batched.offset() + h * head_elems * elem_size,
+                    )
+                })
+                .collect();
+            k_heads = (0..local_num_kv_heads)
+                .map(|h| {
+                    k_batched.view(
+                        vec![seq_len, head_dim],
+                        vec![head_dim, 1],
+                        k_batched.offset() + h * head_elems * elem_size,
+                    )
+                })
+                .collect();
+            v_heads = (0..local_num_kv_heads)
+                .map(|h| {
+                    v_batched.view(
+                        vec![seq_len, head_dim],
+                        vec![head_dim, 1],
+                        v_batched.offset() + h * head_elems * elem_size,
+                    )
+                })
+                .collect();
+        }
+
+        // Append to KV cache
+        let (k_final, v_final, total_seq) = match cache {
+            Some(ref mut c) => {
+                c.append(k_heads, v_heads, seq_len, registry, queue)?;
+                let kf: Vec<Array> =
+                    (0..local_num_kv_heads).map(|h| c.cached_keys(h)).collect();
+                let vf: Vec<Array> =
+                    (0..local_num_kv_heads).map(|h| c.cached_values(h)).collect();
+                let ts = c.seq_len;
+                (kf, vf, ts)
+            }
+            None => (k_heads, v_heads, seq_len),
+        };
+
+        // SDPA
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let dev = registry.device().raw();
+
+        let attn_outputs = if head_dim <= 256 {
+            ops::sdpa::sdpa_batched(
+                registry,
+                &q_heads,
+                &k_final,
+                &v_final,
+                mask,
+                scale,
+                false,
+                queue,
+            )?
+        } else {
+            let mut outputs: Vec<Array> = Vec::with_capacity(local_num_heads);
+            for (h, q_h) in q_heads.iter().enumerate() {
+                let kv_idx = h / repeats;
+                let k_h = &k_final[kv_idx];
+                let v_h = &v_final[kv_idx];
+                let k_t =
+                    k_h.view(vec![head_dim, total_seq], vec![1, head_dim], k_h.offset());
+                let k_t = ops::copy::copy(registry, &k_t, queue)?;
+                let scores = ops::matmul::matmul(registry, q_h, &k_t, queue)?;
+                let scores = scale_scores(&scores, scale, registry, queue)?;
+                let scores = if let Some(m) = mask {
+                    ops::binary::add(registry, &scores, m, queue)?
+                } else {
+                    scores
+                };
+                let attn_weights = ops::softmax::softmax(registry, &scores, queue)?;
+                let head_out =
+                    ops::matmul::matmul(registry, &attn_weights, v_h, queue)?;
+                outputs.push(head_out);
+            }
+            outputs
+        };
+
+        // Concatenate heads → [seq_len, local_num_heads * head_dim]
+        let local_hidden = local_num_heads * head_dim;
+
+        if seq_len == 1 {
+            let concat = Array::zeros(dev, &[seq_len, local_hidden], q.dtype());
+            let copy_kernel = match q.dtype() {
+                DType::Float32 => "copy_f32",
+                DType::Float16 => "copy_f16",
+                DType::Bfloat16 => "copy_bf16",
+                _ => {
+                    return Err(KernelError::InvalidShape(format!(
+                        "attention concat: unsupported dtype {:?}",
+                        q.dtype()
+                    )));
+                }
+            };
+            let pipeline = registry.get_pipeline(copy_kernel, q.dtype())?;
+            let head_bytes = head_dim * elem_size;
+            let cb = queue.new_command_buffer();
+            for (h, head_out) in attn_outputs.iter().enumerate() {
+                let dst_col_offset = h * head_bytes;
+                let enc = cb.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&pipeline);
+                enc.set_buffer(
+                    0,
+                    Some(head_out.metal_buffer()),
+                    head_out.offset() as u64,
+                );
+                enc.set_buffer(1, Some(concat.metal_buffer()), dst_col_offset as u64);
+                let count = head_dim as u64;
+                let grid = metal::MTLSize::new(count, 1, 1);
+                let tg = metal::MTLSize::new(
+                    std::cmp::min(pipeline.max_total_threads_per_threadgroup(), count),
+                    1,
+                    1,
+                );
+                enc.dispatch_threads(grid, tg);
+                enc.end_encoding();
+            }
+            cb.commit();
+            cb.wait_until_completed();
+            Ok(concat)
+        } else {
+            let head_elems = seq_len * head_dim;
+            let packed =
+                Array::zeros(dev, &[local_num_heads * seq_len, head_dim], q.dtype());
+            {
+                let copy_kernel = match q.dtype() {
+                    DType::Float32 => "copy_f32",
+                    DType::Float16 => "copy_f16",
+                    DType::Bfloat16 => "copy_bf16",
+                    _ => {
+                        return Err(KernelError::InvalidShape(format!(
+                            "attention concat: unsupported dtype {:?}",
+                            q.dtype()
+                        )));
+                    }
+                };
+                let pipeline = registry.get_pipeline(copy_kernel, q.dtype())?;
+                let cb = queue.new_command_buffer();
+                for (h, head_out) in attn_outputs.iter().enumerate() {
+                    let dst_offset = h * head_elems * elem_size;
+                    let enc = cb.new_compute_command_encoder();
+                    enc.set_compute_pipeline_state(&pipeline);
+                    enc.set_buffer(
+                        0,
+                        Some(head_out.metal_buffer()),
+                        head_out.offset() as u64,
+                    );
+                    enc.set_buffer(1, Some(packed.metal_buffer()), dst_offset as u64);
+                    let count = head_elems as u64;
+                    let grid = metal::MTLSize::new(count, 1, 1);
+                    let tg = metal::MTLSize::new(
+                        std::cmp::min(pipeline.max_total_threads_per_threadgroup(), count),
+                        1,
+                        1,
+                    );
+                    enc.dispatch_threads(grid, tg);
+                    enc.end_encoding();
+                }
+                cb.commit();
+                cb.wait_until_completed();
+            }
+            let concat = ops::rope::interleave_heads(
+                registry,
+                &packed,
+                local_num_heads,
+                seq_len,
+                queue,
+            )?;
+            Ok(concat)
+        }
+    }
+
     pub fn num_heads(&self) -> usize {
         self.config.num_heads
     }
@@ -2021,6 +2284,116 @@ impl Attention {
     /// Access the O-projection weight.
     pub fn o_proj_weight(&self) -> Option<&Array> {
         self.o_proj.weight()
+    }
+
+    /// Shard this attention layer's weights for Tensor Parallelism.
+    ///
+    /// Column-parallel: Q, K, V projection weights are sharded by output rows
+    /// (each rank gets its local head slice).
+    /// Row-parallel: O projection weight is sharded by input columns
+    #[cfg(feature = "distributed")]
+    /// (each rank holds columns for its local heads).
+    ///
+    /// Also updates the config to reflect the local head counts.
+    ///
+    /// # Panics
+    /// Panics if weights are not loaded or head counts are not divisible by `world_size`.
+    pub(crate) fn shard_for_tp(&mut self, rank: u32, world_size: u32) -> Result<(), KernelError> {
+        use crate::parallel::{ColumnParallelLinear, RowParallelLinear};
+
+        if world_size <= 1 {
+            return Ok(());
+        }
+        if self.config.num_heads % (world_size as usize) != 0 {
+            return Err(KernelError::InvalidShape(format!(
+                "num_heads ({}) not divisible by world_size ({})",
+                self.config.num_heads, world_size
+            )));
+        }
+        if self.config.num_kv_heads % (world_size as usize) != 0 {
+            return Err(KernelError::InvalidShape(format!(
+                "num_kv_heads ({}) not divisible by world_size ({})",
+                self.config.num_kv_heads, world_size
+            )));
+        }
+
+        let local_num_heads = self.config.num_heads / (world_size as usize);
+        let local_num_kv_heads = self.config.num_kv_heads / (world_size as usize);
+        let head_dim = self.config.head_dim;
+        let hidden_size = self.config.num_heads * head_dim;
+        let local_q_out = local_num_heads * head_dim;
+        let local_kv_out = local_num_kv_heads * head_dim;
+
+        // Shard Q weight: [full_q_out, hidden] → [local_q_out, hidden]
+        let q_w = self.q_proj.weight().ok_or_else(|| {
+            KernelError::InvalidShape("shard_for_tp: q_proj weight not loaded".into())
+        })?;
+        let q_shard = ColumnParallelLinear::shard_weight(q_w, rank, world_size);
+        self.q_proj = Linear::from_arrays(
+            LinearConfig {
+                in_features: hidden_size,
+                out_features: local_q_out,
+                has_bias: false,
+            },
+            q_shard,
+            None,
+        )?;
+
+        // Shard K weight
+        let k_w = self.k_proj.weight().ok_or_else(|| {
+            KernelError::InvalidShape("shard_for_tp: k_proj weight not loaded".into())
+        })?;
+        let k_shard = ColumnParallelLinear::shard_weight(k_w, rank, world_size);
+        self.k_proj = Linear::from_arrays(
+            LinearConfig {
+                in_features: hidden_size,
+                out_features: local_kv_out,
+                has_bias: false,
+            },
+            k_shard,
+            None,
+        )?;
+
+        // Shard V weight
+        let v_w = self.v_proj.weight().ok_or_else(|| {
+            KernelError::InvalidShape("shard_for_tp: v_proj weight not loaded".into())
+        })?;
+        let v_shard = ColumnParallelLinear::shard_weight(v_w, rank, world_size);
+        self.v_proj = Linear::from_arrays(
+            LinearConfig {
+                in_features: hidden_size,
+                out_features: local_kv_out,
+                has_bias: false,
+            },
+            v_shard,
+            None,
+        )?;
+
+        // Shard O weight: row-parallel — [hidden, hidden] → [hidden, local_hidden]
+        let o_w = self.o_proj.weight().ok_or_else(|| {
+            KernelError::InvalidShape("shard_for_tp: o_proj weight not loaded".into())
+        })?;
+        let o_shard = RowParallelLinear::shard_weight(o_w, rank, world_size);
+        let local_o_in = hidden_size / (world_size as usize);
+        self.o_proj = Linear::from_arrays(
+            LinearConfig {
+                in_features: local_o_in,
+                out_features: hidden_size,
+                has_bias: false,
+            },
+            o_shard,
+            None,
+        )?;
+
+        // Update config to local head counts
+        self.config.num_heads = local_num_heads;
+        self.config.num_kv_heads = local_num_kv_heads;
+
+        // Invalidate merged QKV weights (they're for the full model)
+        self.qkv_merged_weight = None;
+        self.qkv_merged_weight_t = None;
+
+        Ok(())
     }
 
     // -------------------------------------------------------------------

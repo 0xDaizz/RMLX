@@ -540,6 +540,132 @@ impl FeedForward {
         }
     }
 
+    /// Shard FFN weights for Tensor Parallelism.
+    ///
+    /// - Gated: gate/up → column-parallel (shard output rows), down → row-parallel (shard input cols)
+    /// - Dense: linear1 → column-parallel, linear2 → row-parallel
+    /// - MoE: not supported (returns error)
+    #[cfg(feature = "distributed")]
+    pub(crate) fn shard_for_tp(
+        &mut self,
+        rank: u32,
+        world_size: u32,
+    ) -> Result<(), KernelError> {
+        use crate::parallel::{ColumnParallelLinear, RowParallelLinear};
+
+        if world_size <= 1 {
+            return Ok(());
+        }
+        match self {
+            FeedForward::Gated {
+                gate_proj,
+                up_proj,
+                down_proj,
+                gate_up_merged_weight,
+                gate_up_merged_weight_t,
+            } => {
+                let gate_w = gate_proj.weight().ok_or_else(|| {
+                    KernelError::InvalidShape("shard_for_tp: gate_proj weight not loaded".into())
+                })?;
+                let up_w = up_proj.weight().ok_or_else(|| {
+                    KernelError::InvalidShape("shard_for_tp: up_proj weight not loaded".into())
+                })?;
+                let down_w = down_proj.weight().ok_or_else(|| {
+                    KernelError::InvalidShape("shard_for_tp: down_proj weight not loaded".into())
+                })?;
+
+                let inter_dim = gate_w.shape()[0];
+                let hidden_size = gate_w.shape()[1];
+                let local_inter = inter_dim / (world_size as usize);
+
+                // Gate: column-parallel (shard output)
+                let gate_shard = ColumnParallelLinear::shard_weight(gate_w, rank, world_size);
+                *gate_proj = Linear::from_arrays(
+                    crate::linear::LinearConfig {
+                        in_features: hidden_size,
+                        out_features: local_inter,
+                        has_bias: false,
+                    },
+                    gate_shard,
+                    None,
+                )?;
+
+                // Up: column-parallel
+                let up_shard = ColumnParallelLinear::shard_weight(up_w, rank, world_size);
+                *up_proj = Linear::from_arrays(
+                    crate::linear::LinearConfig {
+                        in_features: hidden_size,
+                        out_features: local_inter,
+                        has_bias: false,
+                    },
+                    up_shard,
+                    None,
+                )?;
+
+                // Down: row-parallel (shard input columns)
+                let down_shard = RowParallelLinear::shard_weight(down_w, rank, world_size);
+                *down_proj = Linear::from_arrays(
+                    crate::linear::LinearConfig {
+                        in_features: local_inter,
+                        out_features: hidden_size,
+                        has_bias: false,
+                    },
+                    down_shard,
+                    None,
+                )?;
+
+                // Invalidate merged weights
+                *gate_up_merged_weight = None;
+                *gate_up_merged_weight_t = None;
+
+                Ok(())
+            }
+            FeedForward::Dense {
+                linear1, linear2, ..
+            } => {
+                let w1 = linear1.weight().ok_or_else(|| {
+                    KernelError::InvalidShape("shard_for_tp: linear1 weight not loaded".into())
+                })?;
+                let w2 = linear2.weight().ok_or_else(|| {
+                    KernelError::InvalidShape("shard_for_tp: linear2 weight not loaded".into())
+                })?;
+
+                let inter_dim = w1.shape()[0];
+                let hidden_size = w1.shape()[1];
+                let local_inter = inter_dim / (world_size as usize);
+
+                // linear1: column-parallel
+                let w1_shard = ColumnParallelLinear::shard_weight(w1, rank, world_size);
+                *linear1 = Linear::from_arrays(
+                    crate::linear::LinearConfig {
+                        in_features: hidden_size,
+                        out_features: local_inter,
+                        has_bias: false,
+                    },
+                    w1_shard,
+                    None,
+                )?;
+
+                // linear2: row-parallel
+                let w2_shard = RowParallelLinear::shard_weight(w2, rank, world_size);
+                *linear2 = Linear::from_arrays(
+                    crate::linear::LinearConfig {
+                        in_features: local_inter,
+                        out_features: hidden_size,
+                        has_bias: false,
+                    },
+                    w2_shard,
+                    None,
+                )?;
+
+                Ok(())
+            }
+            FeedForward::MoE(_) => Err(KernelError::InvalidShape(
+                "shard_for_tp: MoE not supported for TP".into(),
+            )),
+        }
+    }
+
     /// 9-dispatch FFN forward: dispatches 7-9 of the 9-dispatch path.
     ///
     /// Dispatches:
@@ -1075,6 +1201,24 @@ impl TransformerBlock {
         Ok(())
     }
 
+    /// Shard this block's weights for Tensor Parallelism.
+    ///
+    /// Shards attention (QKV column-parallel, O row-parallel) and FFN
+    /// (gate/up column-parallel, down row-parallel) weights, and updates
+    /// the attention config to reflect local head counts.
+    ///
+    /// Must be called after weights are loaded and before `forward_with_group()`.
+    #[cfg(feature = "distributed")]
+    pub(crate) fn shard_for_tp(
+        &mut self,
+        rank: u32,
+        world_size: u32,
+    ) -> Result<(), KernelError> {
+        self.attention.shard_for_tp(rank, world_size)?;
+        self.ffn.shard_for_tp(rank, world_size)?;
+        Ok(())
+    }
+
     /// Prepare merged weights for the 9-dispatch path.
     ///
     /// Merges Q/K/V weights and gate/up weights into single matrices.
@@ -1100,275 +1244,6 @@ impl TransformerBlock {
         if let Some(w) = self.norm2_weight.take() {
             self.norm2_weight = Some(w.to_private(device, queue));
         }
-    }
-
-    // -------------------------------------------------------------------
-    // Distributed (Tensor Parallel) path
-    // -------------------------------------------------------------------
-
-    /// Forward pass for one transformer block with tensor parallelism.
-    ///
-    /// Each rank operates on its shard of attention heads and FFN features.
-    /// Communication is via the `Group` collective operations (allreduce).
-    ///
-    /// For `world_size == 1`, this delegates to the standard `forward()`.
-    ///
-    /// **Megatron-LM TP pattern:**
-    /// - QKV projections: local matmul on sharded weights (no communication)
-    /// - Attention: local SDPA on this rank's heads (no communication)
-    /// - O projection: RowParallel (local matmul + allreduce)
-    /// - Gate+Up projections: local matmul on sharded weights (no communication)
-    /// - SwiGLU: local on sharded activations
-    /// - Down projection: RowParallel (local matmul + allreduce)
-    /// - RMSNorm, residual add: local (replicated)
-    #[cfg(feature = "distributed")]
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward_with_group(
-        &self,
-        x: &Array,
-        cos_freqs: Option<&Array>,
-        sin_freqs: Option<&Array>,
-        mask: Option<&Array>,
-        cache: Option<&mut LayerKvCache>,
-        group: &Group,
-        registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
-    ) -> Result<Array, KernelError> {
-        // For single-rank groups, no communication needed — use standard path
-        if group.size() <= 1 {
-            return self.forward(x, cos_freqs, sin_freqs, mask, cache, registry, queue);
-        }
-
-        let world_size = group.size() as u32;
-        let rank = group.local_rank();
-
-        let norm1_w = self.norm1_weight.as_ref().ok_or_else(|| {
-            KernelError::InvalidShape("TransformerBlock: norm1_weight not loaded".into())
-        })?;
-        let norm2_w = self.norm2_weight.as_ref().ok_or_else(|| {
-            KernelError::InvalidShape("TransformerBlock: norm2_weight not loaded".into())
-        })?;
-
-        // ── Pre-attention norm (local) ──
-        let normed =
-            ops::rms_norm::rms_norm(registry, x, norm1_w, self.rms_norm_eps, queue)?;
-
-        // ── Attention with TP ──
-        let q_weight = self.attention.q_proj().weight().ok_or_else(|| {
-            KernelError::InvalidShape("Attention: q_proj weight not loaded".into())
-        })?;
-        let k_weight = self.attention.k_proj().weight().ok_or_else(|| {
-            KernelError::InvalidShape("Attention: k_proj weight not loaded".into())
-        })?;
-        let v_weight = self.attention.v_proj().weight().ok_or_else(|| {
-            KernelError::InvalidShape("Attention: v_proj weight not loaded".into())
-        })?;
-        let o_weight = self.attention.o_proj().weight().ok_or_else(|| {
-            KernelError::InvalidShape("Attention: o_proj weight not loaded".into())
-        })?;
-
-        let hidden_size = q_weight.shape()[1];
-
-        let num_heads = self.attention.num_heads();
-        let num_kv_heads = self.attention.num_kv_heads();
-        let head_dim = self.attention.head_dim();
-        if num_heads % (world_size as usize) != 0 {
-            return Err(KernelError::InvalidShape(format!(
-                "num_heads ({num_heads}) must be divisible by world_size ({world_size})"
-            )));
-        }
-        if num_kv_heads % (world_size as usize) != 0 {
-            return Err(KernelError::InvalidShape(format!(
-                "num_kv_heads ({num_kv_heads}) must be divisible by world_size ({world_size})"
-            )));
-        }
-
-        let local_num_heads = num_heads / (world_size as usize);
-        let local_num_kv_heads = num_kv_heads / (world_size as usize);
-        let local_q_dim = local_num_heads * head_dim;
-        let local_kv_dim = local_num_kv_heads * head_dim;
-
-        // Ensure input is 2D
-        let normed_2d = if normed.ndim() == 1 {
-            normed.reshape(vec![1, normed.shape()[0]])?
-        } else {
-            normed.clone()
-        };
-
-        // QKV: local matmul with sharded weights (no communication)
-        // Shard weights by output rows (heads): take this rank's head slice
-        let q_shard = ColumnParallelLinear::shard_weight(q_weight, rank, world_size);
-        let k_shard = ColumnParallelLinear::shard_weight(k_weight, rank, world_size);
-        let v_shard = ColumnParallelLinear::shard_weight(v_weight, rank, world_size);
-
-        // Local matmul: input @ shard^T → local Q/K/V
-        let q_shard_t = q_shard.view(
-            vec![hidden_size, local_q_dim],
-            vec![1, hidden_size],
-            q_shard.offset(),
-        );
-        let q_local = ops::matmul::matmul(registry, &normed_2d, &q_shard_t, queue)?;
-
-        let k_shard_t = k_shard.view(
-            vec![hidden_size, local_kv_dim],
-            vec![1, hidden_size],
-            k_shard.offset(),
-        );
-        let k_local = ops::matmul::matmul(registry, &normed_2d, &k_shard_t, queue)?;
-
-        let v_shard_t = v_shard.view(
-            vec![hidden_size, local_kv_dim],
-            vec![1, hidden_size],
-            v_shard.offset(),
-        );
-        let v_local = ops::matmul::matmul(registry, &normed_2d, &v_shard_t, queue)?;
-
-        // Attention on local heads (RoPE + SDPA + head concat, no O projection)
-        let attn_concat = self.attention.forward_from_qkv(
-            &q_local,
-            &k_local,
-            &v_local,
-            local_num_heads,
-            local_num_kv_heads,
-            cos_freqs,
-            sin_freqs,
-            mask,
-            cache,
-            registry,
-            queue,
-        )?;
-
-        // O projection: RowParallel — each rank has [seq, local_hidden],
-        // O weight is [hidden, hidden], sharded by input columns
-        let attn_2d = if attn_concat.ndim() == 1 {
-            attn_concat.reshape(vec![1, attn_concat.shape()[0]])?
-        } else {
-            attn_concat
-        };
-        let o_shard = RowParallelLinear::shard_weight(o_weight, rank, world_size);
-        let o_rp = RowParallelLinear::new(
-            o_shard, None, hidden_size, hidden_size, rank, world_size,
-        )
-        .map_err(|e| KernelError::InvalidShape(format!("O RowParallel: {e}")))?;
-        // attn_2d is already the local shard [seq, local_hidden]
-        let o_out = o_rp
-            .forward_with_group(&attn_2d, group, registry, queue)
-            .map_err(|e| KernelError::InvalidShape(format!("O forward: {e}")))?;
-
-        // Residual connection
-        let x_2d = if x.ndim() == 1 {
-            x.reshape(vec![1, x.shape()[0]])?
-        } else {
-            x.clone()
-        };
-        let h = ops::binary::add(registry, &x_2d, &o_out, queue)?;
-
-        // ── Pre-FFN norm (local) ──
-        let normed2 =
-            ops::rms_norm::rms_norm(registry, &h, norm2_w, self.rms_norm_eps, queue)?;
-
-        // ── FFN with TP ──
-        let ffn_out = match &self.ffn {
-            FeedForward::Gated {
-                gate_proj,
-                up_proj,
-                down_proj,
-                ..
-            } => {
-                let gate_w = gate_proj.weight().ok_or_else(|| {
-                    KernelError::InvalidShape("FFN: gate_proj weight not loaded".into())
-                })?;
-                let up_w = up_proj.weight().ok_or_else(|| {
-                    KernelError::InvalidShape("FFN: up_proj weight not loaded".into())
-                })?;
-                let down_w = down_proj.weight().ok_or_else(|| {
-                    KernelError::InvalidShape("FFN: down_proj weight not loaded".into())
-                })?;
-
-                let intermediate_dim = gate_w.shape()[0];
-                let local_inter = intermediate_dim / (world_size as usize);
-
-                // Gate/Up: local matmul with sharded weights (no communication)
-                let gate_shard =
-                    ColumnParallelLinear::shard_weight(gate_w, rank, world_size);
-                let gate_t = gate_shard.view(
-                    vec![hidden_size, local_inter],
-                    vec![1, hidden_size],
-                    gate_shard.offset(),
-                );
-                let gate_local =
-                    ops::matmul::matmul(registry, &normed2, &gate_t, queue)?;
-
-                let up_shard =
-                    ColumnParallelLinear::shard_weight(up_w, rank, world_size);
-                let up_t = up_shard.view(
-                    vec![hidden_size, local_inter],
-                    vec![1, hidden_size],
-                    up_shard.offset(),
-                );
-                let up_local =
-                    ops::matmul::matmul(registry, &normed2, &up_t, queue)?;
-
-                // SwiGLU on local shard
-                let gate_act = ops::silu::silu(registry, &gate_local, queue)?;
-                let hidden_ffn =
-                    ops::binary::mul(registry, &gate_act, &up_local, queue)?;
-
-                // Down: RowParallel (local matmul + allreduce)
-                let down_shard =
-                    RowParallelLinear::shard_weight(down_w, rank, world_size);
-                let down_rp = RowParallelLinear::new(
-                    down_shard, None, hidden_size, intermediate_dim, rank, world_size,
-                )
-                .map_err(|e| KernelError::InvalidShape(format!("Down RP: {e}")))?;
-                // hidden_ffn is [seq, local_inter] — already the correct shard
-                down_rp
-                    .forward_with_group(&hidden_ffn, group, registry, queue)
-                    .map_err(|e| KernelError::InvalidShape(format!("Down fwd: {e}")))?
-            }
-            FeedForward::Dense {
-                linear1, linear2, ..
-            } => {
-                let w1 = linear1.weight().ok_or_else(|| {
-                    KernelError::InvalidShape("FFN: linear1 weight not loaded".into())
-                })?;
-                let w2 = linear2.weight().ok_or_else(|| {
-                    KernelError::InvalidShape("FFN: linear2 weight not loaded".into())
-                })?;
-
-                let inter_dim = w1.shape()[0];
-                let local_inter = inter_dim / (world_size as usize);
-
-                // linear1: local matmul with sharded weights
-                let w1_shard =
-                    ColumnParallelLinear::shard_weight(w1, rank, world_size);
-                let w1_t = w1_shard.view(
-                    vec![hidden_size, local_inter],
-                    vec![1, hidden_size],
-                    w1_shard.offset(),
-                );
-                let l1_local =
-                    ops::matmul::matmul(registry, &normed2, &w1_t, queue)?;
-
-                // linear2: RowParallel (local matmul + allreduce)
-                let w2_shard =
-                    RowParallelLinear::shard_weight(w2, rank, world_size);
-                let rp2 = RowParallelLinear::new(
-                    w2_shard, None, hidden_size, inter_dim, rank, world_size,
-                )
-                .map_err(|e| KernelError::InvalidShape(format!("FFN2 RP: {e}")))?;
-                rp2.forward_with_group(&l1_local, group, registry, queue)
-                    .map_err(|e| KernelError::InvalidShape(format!("FFN2 fwd: {e}")))?
-            }
-            FeedForward::MoE(_) => {
-                return Err(KernelError::InvalidShape(
-                    "forward_with_group: MoE not yet supported for TP".into(),
-                ));
-            }
-        };
-
-        // Residual connection: h + ffn_out
-        ops::binary::add(registry, &h, &ffn_out, queue)
     }
 
     /// 9-dispatch forward decode: entire transformer block in 9 GPU dispatches.
@@ -3956,6 +3831,36 @@ impl TransformerBlock {
 
 #[cfg(feature = "distributed")]
 impl TransformerModel {
+    /// Shard all layer weights for Tensor Parallelism.
+    ///
+    /// Must be called once after weights are loaded and before `forward_with_group()`.
+    ///
+    /// Shards:
+    /// - Attention QKV: column-parallel (each rank gets `num_heads / world_size` heads)
+    /// - Attention O: row-parallel (input cols sharded)
+    /// - FFN gate/up: column-parallel (output sharded)
+    /// - FFN down: row-parallel (input cols sharded)
+    ///
+    /// Norm weights and embedding weights are NOT sharded (replicated on all ranks).
+    /// LM head is NOT sharded (each rank computes full logits).
+    pub fn shard_weights_for_tp(
+        &mut self,
+        group: &rmlx_distributed::group::Group,
+    ) -> Result<(), KernelError> {
+        let world_size = group.size() as u32;
+        let rank = group.local_rank();
+
+        if world_size <= 1 {
+            return Ok(());
+        }
+
+        for layer in &mut self.layers {
+            layer.shard_for_tp(rank, world_size)?;
+        }
+
+        Ok(())
+    }
+
     /// Distributed forward pass: token IDs → logits with Tensor Parallelism.
     ///
     /// Each rank holds pre-sharded weights (column-parallel for QKV/gate/up,
