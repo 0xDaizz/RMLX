@@ -1,7 +1,7 @@
 //! Standalone GEMM kernel benchmark — per-op latency and TFLOPS.
 //!
 //! Tests matmul [M, 4096] @ [4096, K] for K in {4096, 14336}
-//! and M in {128, 256, 512, 1024, 2048}, using f16 dtype.
+//! and M in {16, 32, 64, 128, 256, 512, 1024, 2048}, using f16 dtype.
 //!
 //! Run with:
 //!   cargo bench -p rmlx-core --bench gemm_bench
@@ -175,9 +175,16 @@ fn bench_gemm(
         }
     };
 
-    let pipeline = registry
-        .get_pipeline(kernel_name, a.dtype())
-        .unwrap_or_else(|e| panic!("Failed to get pipeline for {kernel_name}: {e}"));
+    let pipeline = if tile.variant == ops::matmul::TileVariant::MlxArch {
+        let constants = ops::matmul::matmul_align_constants(m, n, tile.bm, tile.bn);
+        registry
+            .get_pipeline_with_constants(kernel_name, a.dtype(), &constants)
+            .unwrap_or_else(|e| panic!("Failed to get pipeline for {kernel_name}: {e}"))
+    } else {
+        registry
+            .get_pipeline(kernel_name, a.dtype())
+            .unwrap_or_else(|e| panic!("Failed to get pipeline for {kernel_name}: {e}"))
+    };
 
     // Pre-allocate output and constant buffers ONCE
     let c = Array::zeros(device, &[m, n], a.dtype());
@@ -270,7 +277,7 @@ fn main() {
 
     // --- [M, 4096] @ [4096, 4096] ---
     println!("[M, 4096] @ [4096, 4096]:");
-    for m in [128, 256, 512, 1024, 2048] {
+    for m in [16, 32, 64, 128, 256, 512, 1024, 2048] {
         let a = rand_array(device, &[m, 4096], 42);
         let b = rand_array(device, &[4096, 4096], 43);
         bench_gemm(
@@ -289,7 +296,7 @@ fn main() {
 
     // --- [M, 4096] @ [4096, 14336] ---
     println!("[M, 4096] @ [4096, 14336]:");
-    for m in [128, 256, 512, 1024, 2048] {
+    for m in [16, 32, 64, 128, 256, 512, 1024, 2048] {
         let a = rand_array(device, &[m, 4096], 42);
         let b = rand_array(device, &[4096, 14336], 44);
         bench_gemm(

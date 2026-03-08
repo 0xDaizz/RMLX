@@ -428,7 +428,13 @@ impl Linear {
         let n_u32 = n as u32;
         let k_u32 = k as u32;
 
-        let pipeline = registry.get_pipeline(kernel_name, input_2d.dtype())?;
+        // MlxArch uses function constants for alignment specialization
+        let pipeline = if tile.variant == ops::matmul::TileVariant::MlxArch {
+            let constants = ops::matmul::matmul_align_constants(m, n, tile.bm, tile.bn);
+            registry.get_pipeline_with_constants(kernel_name, input_2d.dtype(), &constants)?
+        } else {
+            registry.get_pipeline(kernel_name, input_2d.dtype())?
+        };
         let dev = registry.device().raw();
         let output = Array::zeros(dev, &[m, n], input_2d.dtype());
 
