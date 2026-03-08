@@ -448,8 +448,28 @@ pub fn batched_gate_up_into_cb(
     let gate_pipeline = registry.get_pipeline(gate_kernel, input.dtype())?;
     let up_pipeline = registry.get_pipeline(up_kernel, input.dtype())?;
 
-    encode_gemm(cb, &gate_pipeline, &input, &wgate_t, &gate_out, m, n_gate, k, registry)?;
-    encode_gemm(cb, &up_pipeline, &input, &wup_t, &up_out, m, n_up, k, registry)?;
+    encode_gemm(
+        cb,
+        &gate_pipeline,
+        &input,
+        &wgate_t,
+        &gate_out,
+        m,
+        n_gate,
+        k,
+        registry,
+    )?;
+    encode_gemm(
+        cb,
+        &up_pipeline,
+        &input,
+        &wup_t,
+        &up_out,
+        m,
+        n_up,
+        k,
+        registry,
+    )?;
 
     Ok((gate_out, up_out))
 }

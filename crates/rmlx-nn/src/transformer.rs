@@ -2737,9 +2737,8 @@ impl TransformerBlock {
         graph: &mut ExecGraph<'_, '_>,
     ) -> Result<Array, KernelError> {
         let cb = graph.command_buffer();
-        let result = self.forward_prefill_single_cb(
-            x, cos_freqs, sin_freqs, mask, cache, registry, cb,
-        )?;
+        let result =
+            self.forward_prefill_single_cb(x, cos_freqs, sin_freqs, mask, cache, registry, cb)?;
         let t = graph.submit_batch();
         graph.wait_for(t);
         Ok(result)
@@ -3464,7 +3463,7 @@ impl TransformerModel {
         cos_freqs: Option<&Array>,
         sin_freqs: Option<&Array>,
         mask: Option<&Array>,
-        cache: &mut Vec<LayerKvCache>,
+        cache: &mut [LayerKvCache],
         registry: &KernelRegistry,
         queue: &metal::CommandQueue,
         event: &GpuEvent,
@@ -3496,8 +3495,13 @@ impl TransformerModel {
 
         for (i, layer) in self.layers.iter().enumerate() {
             x = layer.forward_prefill_graph(
-                &x, cos_freqs, sin_freqs, mask,
-                &mut cache[i], registry, &mut graph,
+                &x,
+                cos_freqs,
+                sin_freqs,
+                mask,
+                &mut cache[i],
+                registry,
+                &mut graph,
             )?;
         }
 

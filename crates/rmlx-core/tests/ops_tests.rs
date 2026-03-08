@@ -2373,12 +2373,7 @@ fn test_matmul_large_f32() {
     let vals: Vec<f32> = c.to_vec_checked();
     assert_eq!(vals.len(), 64 * 64, "output should have 64*64 elements");
     for (i, &v) in vals.iter().enumerate() {
-        assert!(
-            (v - 128.0).abs() < 1e-3,
-            "C[{}] = {}, expected 128.0",
-            i,
-            v
-        );
+        assert!((v - 128.0).abs() < 1e-3, "C[{}] = {}, expected 128.0", i, v);
     }
 }
 
@@ -2391,22 +2386,15 @@ fn test_matmul_large_f16() {
     // Create f32 ones and cast to f16
     let a_f32 = Array::ones(registry.device().raw(), &[64, 128]);
     let b_f32 = Array::ones(registry.device().raw(), &[128, 64]);
-    let a = ops::copy::copy_cast(&registry, &a_f32, DType::Float16, &queue)
-        .expect("cast A to f16");
-    let b = ops::copy::copy_cast(&registry, &b_f32, DType::Float16, &queue)
-        .expect("cast B to f16");
+    let a = ops::copy::copy_cast(&registry, &a_f32, DType::Float16, &queue).expect("cast A to f16");
+    let b = ops::copy::copy_cast(&registry, &b_f32, DType::Float16, &queue).expect("cast B to f16");
     let c = ops::matmul::matmul(&registry, &a, &b, &queue).expect("matmul f16 failed");
     // Cast result back to f32 for inspection
-    let c_f32 = ops::copy::copy_cast(&registry, &c, DType::Float32, &queue)
-        .expect("cast result to f32");
+    let c_f32 =
+        ops::copy::copy_cast(&registry, &c, DType::Float32, &queue).expect("cast result to f32");
     let vals: Vec<f32> = c_f32.to_vec_checked();
     assert_eq!(vals.len(), 64 * 64, "output should have 64*64 elements");
     for (i, &v) in vals.iter().enumerate() {
-        assert!(
-            (v - 128.0).abs() < 1.0,
-            "C[{}] = {}, expected ~128.0",
-            i,
-            v
-        );
+        assert!((v - 128.0).abs() < 1.0, "C[{}] = {}, expected ~128.0", i, v);
     }
 }

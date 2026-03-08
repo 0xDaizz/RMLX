@@ -434,7 +434,11 @@ fn main() {
 
             // ---- Benchmark 3: forward_prefill_graph() (ExecGraph) ----
             let mut cache_graph = LayerKvCache::preallocated(
-                device, NUM_KV_HEADS, HEAD_DIM, MAX_SEQ_LEN, DType::Float16,
+                device,
+                NUM_KV_HEADS,
+                HEAD_DIM,
+                MAX_SEQ_LEN,
+                DType::Float16,
             );
 
             // Warmup
@@ -496,7 +500,13 @@ fn main() {
     println!("========== Comparison ==========");
     println!(
         "{:>8} | {:>14} | {:>14} | {:>14} | {:>8} | {:>8} | {:>12}",
-        "seq_len", "forward (us)", "single_cb (us)", "graph (us)", "cb spdup", "gr spdup", "MLX ref (us)"
+        "seq_len",
+        "forward (us)",
+        "single_cb (us)",
+        "graph (us)",
+        "cb spdup",
+        "gr spdup",
+        "MLX ref (us)"
     );
     println!("{}", "-".repeat(100));
     for (seq_len, fwd_stats, cb_stats, graph_stats) in &results {
@@ -508,7 +518,13 @@ fn main() {
         };
         println!(
             "{:>8} | {:>14.0} | {:>14.0} | {:>14.0} | {:>7.2}x | {:>7.2}x | {:>12}",
-            seq_len, fwd_stats.mean, cb_stats.mean, graph_stats.mean, speedup_cb, speedup_graph, mlx_str
+            seq_len,
+            fwd_stats.mean,
+            cb_stats.mean,
+            graph_stats.mean,
+            speedup_cb,
+            speedup_graph,
+            mlx_str
         );
     }
     println!("{}", "=".repeat(100));
