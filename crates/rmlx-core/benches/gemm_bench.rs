@@ -8,6 +8,7 @@
 
 use std::time::{Duration, Instant};
 
+use metal::MTLSize;
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::KernelRegistry;
@@ -110,6 +111,19 @@ fn rand_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
 }
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn make_u32_buf(device: &metal::Device, val: u32) -> metal::Buffer {
+    let opts = metal::MTLResourceOptions::StorageModeShared;
+    device.new_buffer_with_data(&val as *const u32 as *const _, 4, opts)
+}
+
+fn ceil_div(a: usize, b: usize) -> usize {
+    a.div_ceil(b)
+}
+
+// ---------------------------------------------------------------------------
 // Benchmark runner
 // ---------------------------------------------------------------------------
 
@@ -117,6 +131,7 @@ fn rand_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
 fn bench_gemm(
     registry: &KernelRegistry,
     queue: &metal::CommandQueue,
+    device: &metal::Device,
     a: &Array,
     b: &Array,
     m: usize,
@@ -124,10 +139,77 @@ fn bench_gemm(
     n: usize,
     label: &str,
 ) {
+    // Select tile config and kernel
+    let tile = ops::matmul::select_tile_config(m, n, k);
+    let kernel_name = match (tile.variant, a.dtype()) {
+        (ops::matmul::TileVariant::Full, DType::Float16) => "gemm_tiled_f16",
+        (ops::matmul::TileVariant::Full, DType::Float32) => "gemm_tiled_f32",
+        _ => {
+            // Fallback to matmul_into_cb for non-full variants
+            // (not the focus of this benchmark)
+            for _ in 0..WARMUP_ITERS {
+                let cb = queue.new_command_buffer();
+                let _ = ops::matmul::matmul_into_cb(registry, a, b, cb).unwrap();
+                cb.commit();
+                cb.wait_until_completed();
+            }
+            let mut times = Vec::with_capacity(BENCH_ITERS);
+            for _ in 0..BENCH_ITERS {
+                let start = Instant::now();
+                let cb = queue.new_command_buffer();
+                let _ = ops::matmul::matmul_into_cb(registry, a, b, cb).unwrap();
+                cb.commit();
+                cb.wait_until_completed();
+                times.push(start.elapsed());
+            }
+            let stats = Stats::from_durations(&times);
+            let flops = 2.0 * m as f64 * k as f64 * n as f64;
+            let tflops_p50 = flops / (stats.p50 * 1e-6) / 1e12;
+            let tflops_mean = flops / (stats.mean * 1e-6) / 1e12;
+            println!(
+                "  M={:5}  {:<12}  p50={:8.1}us  mean={:8.1}us  std={:6.1}us  p95={:8.1}us  min={:8.1}us  max={:8.1}us  TFLOPS(p50)={:.2}  TFLOPS(mean)={:.2}",
+                m, label, stats.p50, stats.mean, stats.std_dev, stats.p95, stats.min, stats.max, tflops_p50, tflops_mean,
+            );
+            return;
+        }
+    };
+
+    let pipeline = registry
+        .get_pipeline(kernel_name, a.dtype())
+        .unwrap_or_else(|e| panic!("Failed to get pipeline for {kernel_name}: {e}"));
+
+    // Pre-allocate output and constant buffers ONCE
+    let c = Array::zeros(device, &[m, n], a.dtype());
+    let m_buf = make_u32_buf(device, m as u32);
+    let n_buf = make_u32_buf(device, n as u32);
+    let k_buf = make_u32_buf(device, k as u32);
+    let bsa_buf = make_u32_buf(device, (m * k) as u32);
+    let bsb_buf = make_u32_buf(device, (k * n) as u32);
+    let bsc_buf = make_u32_buf(device, (m * n) as u32);
+    let swizzle_buf = make_u32_buf(device, ops::matmul::compute_swizzle_log(m, tile.bm));
+
+    let grid_x = ceil_div(n, tile.bn) as u64;
+    let grid_y = ceil_div(m, tile.bm) as u64;
+    let grid = MTLSize::new(grid_x, grid_y, 1);
+    let tg = MTLSize::new(256, 1, 1);
+
     // Warmup
     for _ in 0..WARMUP_ITERS {
         let cb = queue.new_command_buffer();
-        let _ = ops::matmul::matmul_into_cb(registry, a, b, cb).unwrap();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(a.metal_buffer()), 0);
+        enc.set_buffer(1, Some(b.metal_buffer()), 0);
+        enc.set_buffer(2, Some(c.metal_buffer()), 0);
+        enc.set_buffer(3, Some(&m_buf), 0);
+        enc.set_buffer(4, Some(&n_buf), 0);
+        enc.set_buffer(5, Some(&k_buf), 0);
+        enc.set_buffer(6, Some(&bsa_buf), 0);
+        enc.set_buffer(7, Some(&bsb_buf), 0);
+        enc.set_buffer(8, Some(&bsc_buf), 0);
+        enc.set_buffer(9, Some(&swizzle_buf), 0);
+        enc.dispatch_thread_groups(grid, tg);
+        enc.end_encoding();
         cb.commit();
         cb.wait_until_completed();
     }
@@ -137,7 +219,20 @@ fn bench_gemm(
     for _ in 0..BENCH_ITERS {
         let start = Instant::now();
         let cb = queue.new_command_buffer();
-        let _ = ops::matmul::matmul_into_cb(registry, a, b, cb).unwrap();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(a.metal_buffer()), 0);
+        enc.set_buffer(1, Some(b.metal_buffer()), 0);
+        enc.set_buffer(2, Some(c.metal_buffer()), 0);
+        enc.set_buffer(3, Some(&m_buf), 0);
+        enc.set_buffer(4, Some(&n_buf), 0);
+        enc.set_buffer(5, Some(&k_buf), 0);
+        enc.set_buffer(6, Some(&bsa_buf), 0);
+        enc.set_buffer(7, Some(&bsb_buf), 0);
+        enc.set_buffer(8, Some(&bsc_buf), 0);
+        enc.set_buffer(9, Some(&swizzle_buf), 0);
+        enc.dispatch_thread_groups(grid, tg);
+        enc.end_encoding();
         cb.commit();
         cb.wait_until_completed();
         times.push(start.elapsed());
@@ -173,7 +268,17 @@ fn main() {
     for m in [128, 256, 512, 1024, 2048] {
         let a = rand_array(device, &[m, 4096], 42);
         let b = rand_array(device, &[4096, 4096], 43);
-        bench_gemm(&registry, &queue, &a, &b, m, 4096, 4096, "4096x4096");
+        bench_gemm(
+            &registry,
+            &queue,
+            device,
+            &a,
+            &b,
+            m,
+            4096,
+            4096,
+            "4096x4096",
+        );
     }
     println!();
 
@@ -182,7 +287,17 @@ fn main() {
     for m in [128, 256, 512, 1024, 2048] {
         let a = rand_array(device, &[m, 4096], 42);
         let b = rand_array(device, &[4096, 14336], 44);
-        bench_gemm(&registry, &queue, &a, &b, m, 4096, 14336, "4096x14336");
+        bench_gemm(
+            &registry,
+            &queue,
+            device,
+            &a,
+            &b,
+            m,
+            4096,
+            14336,
+            "4096x14336",
+        );
     }
     println!();
     println!("Done.");
