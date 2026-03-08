@@ -309,9 +309,6 @@ fn main() {
         .prepare_weights_for_graph(&registry, &queue)
         .expect("prepare_weights_for_graph failed (graph)");
 
-    // GpuEvent for ExecGraph
-    let event = GpuEvent::new(device);
-
     // Precompute RoPE cos/sin tables: shape [MAX_SEQ_LEN, HEAD_DIM/2]
     let (cos_vec, sin_vec) = ops::rope::precompute_freqs(MAX_SEQ_LEN, HEAD_DIM, ROPE_THETA, 1.0)
         .expect("precompute_freqs failed");
@@ -443,6 +440,7 @@ fn main() {
             // Warmup
             for _ in 0..WARMUP_ITERS {
                 cache_graph.seq_len = 0;
+                let event = GpuEvent::new(device);
                 let mut graph = ExecGraph::new(&queue, &event, 64);
                 let cb = graph.command_buffer();
                 let _ = block_graph.forward_prefill_single_cb(
@@ -462,6 +460,7 @@ fn main() {
             let mut latencies_graph = Vec::with_capacity(BENCH_ITERS);
             for _ in 0..BENCH_ITERS {
                 cache_graph.seq_len = 0;
+                let event = GpuEvent::new(device);
                 let mut graph = ExecGraph::new(&queue, &event, 64);
                 let start = Instant::now();
                 let cb = graph.command_buffer();

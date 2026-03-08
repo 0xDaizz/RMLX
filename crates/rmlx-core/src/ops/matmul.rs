@@ -2089,7 +2089,7 @@ fn dispatch_tiled_gemm(
         (TileVariant::Skinny, DType::Float16) => "gemm_skinny_f16",
         (TileVariant::Skinny, DType::Bfloat16) => "gemm_skinny_bf16",
         (TileVariant::Full, DType::Float32) => "gemm_tiled_f32",
-        (TileVariant::Full, DType::Float16) => "gemm_hiperf_f16",
+        (TileVariant::Full, DType::Float16) => "gemm_tiled_f16",
         (TileVariant::Full, DType::Bfloat16) => "gemm_tiled_bf16",
         _ => {
             return Err(KernelError::NotFound(format!(
@@ -2140,14 +2140,12 @@ fn dispatch_tiled_gemm(
     let grid_z = batch as u64;
     let grid = MTLSize::new(grid_x, grid_y, grid_z);
 
-    // Thread count per threadgroup depends on variant and dtype
-    // HiPerf f16 uses 128 threads (4 simdgroups); others use legacy counts
-    let is_hiperf = tile.variant == TileVariant::Full && a.dtype() == DType::Float16;
+    // Thread count per threadgroup depends on variant
     let tg_threads = match tile.variant {
         TileVariant::Small => (16 * 16) as u64, // 256
         TileVariant::Medium | TileVariant::Simd => (32 * 32) as u64, // 1024
         TileVariant::Skinny => 256_u64,               // 8 simdgroups
-        TileVariant::Full => if is_hiperf { 128_u64 } else { 256_u64 },
+        TileVariant::Full => 256_u64,
     };
     let tg = MTLSize::new(tg_threads, 1, 1);
 
@@ -2384,7 +2382,7 @@ pub fn matmul_into_cb(
         (TileVariant::Skinny, DType::Float16) => "gemm_skinny_f16",
         (TileVariant::Skinny, DType::Bfloat16) => "gemm_skinny_bf16",
         (TileVariant::Full, DType::Float32) => "gemm_tiled_f32",
-        (TileVariant::Full, DType::Float16) => "gemm_hiperf_f16",
+        (TileVariant::Full, DType::Float16) => "gemm_tiled_f16",
         (TileVariant::Full, DType::Bfloat16) => "gemm_tiled_bf16",
         _ => {
             return Err(KernelError::NotFound(format!(
@@ -2432,14 +2430,12 @@ pub fn matmul_into_cb(
     let grid_y = ceil_div(m, tile.bm) as u64;
     let grid = MTLSize::new(grid_x, grid_y, 1); // batch=1
 
-    // Thread count per threadgroup depends on variant and dtype
-    // HiPerf f16 uses 128 threads (4 simdgroups); others use legacy counts
-    let is_hiperf = tile.variant == TileVariant::Full && a.dtype() == DType::Float16;
+    // Thread count per threadgroup depends on variant
     let tg_threads = match tile.variant {
         TileVariant::Small => 256_u64,
         TileVariant::Medium | TileVariant::Simd => 1024_u64,
         TileVariant::Skinny => 256_u64,
-        TileVariant::Full => if is_hiperf { 128_u64 } else { 256_u64 },
+        TileVariant::Full => 256_u64,
     };
     let tg = MTLSize::new(tg_threads, 1, 1);
 
