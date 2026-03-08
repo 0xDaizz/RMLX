@@ -439,10 +439,17 @@ impl MoeLayer {
         // Gate logits: [seq_len, num_experts]
         let gate_logits = gate.forward(x, registry, queue)?;
 
+        // gpu_topk_route requires Float32 logits — cast if necessary
+        let gate_logits_f32 = if gate_logits.dtype() != DType::Float32 {
+            ops::copy::copy_cast(registry, &gate_logits, DType::Float32, queue)?
+        } else {
+            gate_logits
+        };
+
         // ── GPU top-k routing: eliminates the GPU→CPU→GPU round-trip ──
         let route_result = ops::topk_route::gpu_topk_route(
             registry,
-            &gate_logits,
+            &gate_logits_f32,
             top_k,
             self.expert_bias.as_ref(),
             queue,
@@ -829,8 +836,7 @@ impl MoeLayer {
                 let expert_tok_view =
                     expert_out.view(vec![1, hidden_dim], vec![hidden_dim, 1], expert_tok_offset);
 
-                let scale_data = vec![weight; hidden_dim];
-                let scale_arr = Array::from_slice(dev, &scale_data, vec![1, hidden_dim]);
+                let scale_arr = make_scale_array(dev, weight, hidden_dim, x.dtype());
                 let scaled = ops::binary::mul(registry, &expert_tok_view, &scale_arr, queue)?;
 
                 let dst_offset = output.offset() + tok * hidden_dim * elem_size;
@@ -887,7 +893,6 @@ impl MoeLayer {
         let intermediate_dim = self.config.intermediate_dim;
         let top_k = self.config.num_experts_per_token;
         let dev = registry.device().raw();
-        let elem_size = x.dtype().size_of();
 
         // Read routing results to CPU
         let indices_vec: Vec<u32> = route_result.expert_indices.to_vec_checked();
@@ -929,45 +934,23 @@ impl MoeLayer {
 
         let n_assign = assignments.len();
 
-        // Build the gathered input: [n_assign, 1, hidden_dim]
-        // and the expert index tensor: [n_assign] (UInt32)
-        let gathered_input = Array::zeros(dev, &[n_assign, 1, hidden_dim], x.dtype());
-        {
-            let copy_kernel = match x.dtype() {
-                DType::Float32 => "copy_f32",
-                DType::Float16 => "copy_f16",
-                DType::Bfloat16 => "copy_bf16",
-                other => {
-                    return Err(KernelError::InvalidShape(format!(
-                        "MoE gather_mm: unsupported dtype {:?}",
-                        other
-                    )));
-                }
-            };
-            let pipeline = registry.get_pipeline(copy_kernel, x.dtype())?;
-            let cb = queue.new_command_buffer();
-            for (i, &(tok, _, _)) in assignments.iter().enumerate() {
-                let src_offset = x.offset() + tok * hidden_dim * elem_size;
-                let dst_offset = i * hidden_dim * elem_size;
-                let enc = cb.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&pipeline);
-                enc.set_buffer(0, Some(x.metal_buffer()), src_offset as u64);
-                enc.set_buffer(1, Some(gathered_input.metal_buffer()), dst_offset as u64);
-                let grid = metal::MTLSize::new(hidden_dim as u64, 1, 1);
-                let tg = metal::MTLSize::new(
-                    std::cmp::min(
-                        pipeline.max_total_threads_per_threadgroup(),
-                        hidden_dim as u64,
-                    ),
-                    1,
-                    1,
-                );
-                enc.dispatch_threads(grid, tg);
-                enc.end_encoding();
-            }
-            cb.commit();
-            cb.wait_until_completed();
-        }
+        // Build token index array for fused gather
+        let tok_indices: Vec<u32> = assignments.iter().map(|&(tok, _, _)| tok as u32).collect();
+        let tok_indices_arr = Array::from_slice(dev, &tok_indices, vec![n_assign]);
+
+        // Fused index_gather: single dispatch gathers all assigned token rows
+        let x_2d = if x.shape().len() == 2 {
+            x.view(x.shape().to_vec(), x.strides().to_vec(), x.offset())
+        } else {
+            x.view(vec![seq_len, hidden_dim], vec![hidden_dim, 1], x.offset())
+        };
+        let gathered_2d = ops::moe_kernels::index_gather(registry, &x_2d, &tok_indices_arr, queue)?;
+        // Reshape to [n_assign, 1, hidden_dim] for gather_mm
+        let gathered_input = gathered_2d.view(
+            vec![n_assign, 1, hidden_dim],
+            vec![hidden_dim, hidden_dim, 1],
+            gathered_2d.offset(),
+        );
 
         let expert_indices: Vec<u32> = assignments.iter().map(|&(_, eidx, _)| eidx).collect();
         let indices_arr = Array::from_slice(dev, &expert_indices, vec![n_assign]);
@@ -1028,54 +1011,27 @@ impl MoeLayer {
             queue,
         )?;
 
-        // Scatter-add weighted results back to output positions
+        // Fused scatter-weighted-add: single dispatch replaces N×3 sync points
         {
-            let copy_kernel = match x.dtype() {
-                DType::Float32 => "copy_f32",
-                DType::Float16 => "copy_f16",
-                DType::Bfloat16 => "copy_bf16",
-                other => {
-                    return Err(KernelError::InvalidShape(format!(
-                        "MoE gather_mm scatter: unsupported dtype {:?}",
-                        other
-                    )));
-                }
-            };
-            let pipeline = registry.get_pipeline(copy_kernel, x.dtype())?;
+            // Reshape down_out from [n_assign, 1, hidden_dim] to [n_assign, hidden_dim]
+            let down_2d = down_out.view(
+                vec![n_assign, hidden_dim],
+                vec![hidden_dim, 1],
+                down_out.offset(),
+            );
 
-            for (i, &(tok, _, weight)) in assignments.iter().enumerate() {
-                let expert_tok_offset = down_out.offset() + i * hidden_dim * elem_size;
-                let expert_tok_view =
-                    down_out.view(vec![1, hidden_dim], vec![hidden_dim, 1], expert_tok_offset);
+            // Build weights array (f32) for the scatter kernel
+            let weight_vals: Vec<f32> = assignments.iter().map(|&(_, _, w)| w).collect();
+            let weights_arr = Array::from_slice(dev, &weight_vals, vec![n_assign]);
 
-                let scale_data = vec![weight; hidden_dim];
-                let scale_arr = Array::from_slice(dev, &scale_data, vec![1, hidden_dim]);
-                let scaled = ops::binary::mul(registry, &expert_tok_view, &scale_arr, queue)?;
-
-                let dst_offset = output.offset() + tok * hidden_dim * elem_size;
-                let dst_view = output.view(vec![1, hidden_dim], vec![hidden_dim, 1], dst_offset);
-
-                let summed = ops::binary::add(registry, &dst_view, &scaled, queue)?;
-
-                let cb = queue.new_command_buffer();
-                let enc = cb.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&pipeline);
-                enc.set_buffer(0, Some(summed.metal_buffer()), summed.offset() as u64);
-                enc.set_buffer(1, Some(output.metal_buffer()), dst_offset as u64);
-                let grid = metal::MTLSize::new(hidden_dim as u64, 1, 1);
-                let tg = metal::MTLSize::new(
-                    std::cmp::min(
-                        pipeline.max_total_threads_per_threadgroup(),
-                        hidden_dim as u64,
-                    ),
-                    1,
-                    1,
-                );
-                enc.dispatch_threads(grid, tg);
-                enc.end_encoding();
-                cb.commit();
-                cb.wait_until_completed();
-            }
+            ops::moe_kernels::scatter_weighted_add(
+                registry,
+                &down_2d,
+                &output,
+                &tok_indices_arr,
+                &weights_arr,
+                queue,
+            )?;
         }
 
         Ok(output)
@@ -1492,6 +1448,41 @@ fn gather_all_experts(
     Ok(results)
 }
 
+/// Convert f32 to f16 bit representation (IEEE 754 half precision).
+fn f32_to_f16_bits(val: f32) -> u16 {
+    let bits = val.to_bits();
+    let sign = (bits >> 16) & 0x8000;
+    let exp = ((bits >> 23) & 0xFF) as i32 - 127 + 15;
+    let frac = (bits >> 13) & 0x03FF;
+    if exp <= 0 {
+        sign as u16
+    } else if exp >= 31 {
+        (sign | 0x7C00) as u16
+    } else {
+        (sign | ((exp as u32) << 10) | frac) as u16
+    }
+}
+
+/// Create a scale array filled with `weight` matching the given dtype.
+fn make_scale_array(dev: &metal::Device, weight: f32, hidden_dim: usize, dtype: DType) -> Array {
+    match dtype {
+        DType::Float32 => {
+            let scale_data = vec![weight; hidden_dim];
+            Array::from_slice(dev, &scale_data, vec![1, hidden_dim])
+        }
+        DType::Float16 | DType::Bfloat16 => {
+            let w_bits = f32_to_f16_bits(weight);
+            let f16_bytes: Vec<u8> = (0..hidden_dim).flat_map(|_| w_bits.to_le_bytes()).collect();
+            Array::from_bytes(dev, &f16_bytes, vec![1, hidden_dim], dtype)
+        }
+        _ => {
+            // Fallback to f32
+            let scale_data = vec![weight; hidden_dim];
+            Array::from_slice(dev, &scale_data, vec![1, hidden_dim])
+        }
+    }
+}
+
 /// Scatter ALL expert outputs back into the output array with one CB per active expert.
 ///
 /// For each expert output, scales by routing weight and adds to the output at
@@ -1541,8 +1532,7 @@ fn scatter_add_all_experts(
             let expert_tok_view =
                 expert_out.view(vec![1, hidden_dim], vec![hidden_dim, 1], expert_tok_offset);
 
-            let scale_data = vec![weight; hidden_dim];
-            let scale_arr = Array::from_slice(dev, &scale_data, vec![1, hidden_dim]);
+            let scale_arr = make_scale_array(dev, weight, hidden_dim, output.dtype());
             let scaled = ops::binary::mul(registry, &expert_tok_view, &scale_arr, queue)?;
 
             let dst_offset = output.offset() + tok * hidden_dim * elem_size;
