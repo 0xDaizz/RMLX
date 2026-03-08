@@ -1271,6 +1271,101 @@ pub fn affine_qmm(
     }
 }
 
+/// Affine quantized matrix-matrix multiply (Q8, CPU).
+///
+/// Computes `output[m, n] = sum_k x[m, k] * dequant(w[n, k])` for Q8
+/// quantized weights. Each weight is a single `u8` byte (no bit packing).
+///
+/// # Layout
+/// - `x`: `[M, K]` row-major f32 input activations.
+/// - `w_packed`: `[N, K]` row-major packed Q8 weights (1 byte per value).
+/// - `scales`: `[N, K/group_size]` row-major per-group f32 scale factors.
+/// - `biases`: `[N, K/group_size]` row-major per-group f32 bias values.
+/// - `output`: `[M, N]` row-major f32 output (pre-allocated).
+#[allow(clippy::too_many_arguments)]
+pub fn affine_qmm_q8(
+    x: &[f32],
+    w_packed: &[u8],
+    scales: &[f32],
+    biases: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
+    group_size: usize,
+    output: &mut [f32],
+) {
+    debug_assert_eq!(x.len(), m * k, "x must have M*K elements");
+    debug_assert_eq!(
+        w_packed.len(),
+        n * k,
+        "w_packed must have N*K elements for Q8"
+    );
+    let groups_per_row = k / group_size;
+    debug_assert_eq!(
+        scales.len(),
+        n * groups_per_row,
+        "scales must have N*(K/group_size) elements"
+    );
+    debug_assert_eq!(
+        biases.len(),
+        n * groups_per_row,
+        "biases must have N*(K/group_size) elements"
+    );
+    debug_assert_eq!(output.len(), m * n, "output must have M*N elements");
+    debug_assert!(
+        [32, 64, 128].contains(&group_size),
+        "group_size must be 32, 64, or 128"
+    );
+    debug_assert_eq!(k % group_size, 0, "K must be a multiple of group_size");
+
+    const TILE_M: usize = 4;
+    const TILE_N: usize = 4;
+
+    output.iter_mut().for_each(|v| *v = 0.0);
+
+    let mut row = 0;
+    while row < m {
+        let rm = std::cmp::min(TILE_M, m - row);
+        let mut col = 0;
+        while col < n {
+            let rn = std::cmp::min(TILE_N, n - col);
+
+            for g in 0..groups_per_row {
+                let k_start = g * group_size;
+                let k_end = k_start + group_size;
+
+                for jj in 0..rn {
+                    let j = col + jj;
+                    let scale = scales[j * groups_per_row + g];
+                    let bias = biases[j * groups_per_row + g];
+                    let w_row = &w_packed[j * k..];
+
+                    for ii in 0..rm {
+                        let i = row + ii;
+                        let x_row = &x[i * k..];
+
+                        let mut dot = 0.0f32;
+                        let mut xsum = 0.0f32;
+
+                        #[allow(clippy::needless_range_loop)]
+                        for kk in k_start..k_end {
+                            let q = w_row[kk] as f32;
+                            let xv = x_row[kk];
+                            dot += q * xv;
+                            xsum += xv;
+                        }
+
+                        output[i * n + j] += scale * dot + bias * xsum;
+                    }
+                }
+            }
+
+            col += TILE_N;
+        }
+        row += TILE_M;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Metal shader source -- affine quantized matrix-matrix multiply
 // ---------------------------------------------------------------------------
@@ -1626,34 +1721,251 @@ kernel void affine_qmm_mma_q4(
 }
 "#;
 
+// ---------------------------------------------------------------------------
+// Metal shader source -- simdgroup MMA-based Q8 QMM kernel
+// ---------------------------------------------------------------------------
+
+/// High-performance Q8 QMM kernel using simdgroup MMA (8x8 fragments).
+///
+/// Architecture identical to [`QMM_MMA_SHADER_SOURCE`] (Q4) but with simplified
+/// dequantization: each quantized weight is a full `uint8_t` (no nibble
+/// extraction), so the loader reads bytes directly and converts to `half`.
+///
+/// - Tile: BM=32, BN=32, BK=32
+/// - 2 simdgroups per threadgroup (64 threads total)
+/// - Dequant-in-loader: `uint8_t` → `half` (1 byte per weight, no bit packing)
+/// - f32 accumulation via `simdgroup_matrix<float, 8, 8>`
+/// - Double-buffered threadgroup memory (ping-pong A and B tiles)
+/// - Function constants `align_M`, `align_N` for bounds check elimination
+pub const QMM_MMA_Q8_SHADER_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+using namespace metal::simdgroup;
+
+// Function constants for compile-time bounds check elimination
+constant bool align_M [[function_constant(200)]];
+constant bool align_N [[function_constant(201)]];
+
+// Tile dimensions
+constant constexpr uint BM = 32;
+constant constexpr uint BN = 32;
+constant constexpr uint BK = 32;
+
+// Each threadgroup has 2 simdgroups x 32 threads = 64 threads
+constant constexpr uint THREADGROUP_SIZE = 64;
+constant constexpr uint SIMDGROUPS_PER_TG = 2;
+
+// -----------------------------------------------------------------------
+// affine_qmm_mma_q8: Simdgroup MMA-based Q8 quantized matrix-matrix multiply.
+//
+// Computes: output[m, n] = sum_k x[m, k] * dequant(w[n, k])
+//
+// where dequant(q_i) = scales[n, group] * q_i + biases[n, group]
+// and q_i is a uint8_t value (1 byte per weight, no bit packing).
+//
+// Weight layout: w_packed is [N, K] row-major (uint8), where weight
+// row n has K bytes. Each byte holds 1 Q8 value.
+//
+// Buffers:
+//   buffer(0) x         - float32 input activations [M, K], row-major
+//   buffer(1) w_packed  - uint8 weights [N, K], row-major (1 byte per value)
+//   buffer(2) scales    - float32 per-group scales [N, groups_per_row]
+//   buffer(3) biases    - float32 per-group biases [N, groups_per_row]
+//   buffer(4) output    - float32 output [M, N], row-major
+//   buffer(5) params    - uint4: (M, N, K, group_size)
+//
+// Grid: 2D - (ceil(N/BN), ceil(M/BM), 1) threadgroups
+//   Each threadgroup computes a BM x BN tile of the output.
+// -----------------------------------------------------------------------
+kernel void affine_qmm_mma_q8(
+    device const float*   x         [[buffer(0)]],
+    device const uint8_t* w_packed  [[buffer(1)]],
+    device const float*   scales    [[buffer(2)]],
+    device const float*   biases    [[buffer(3)]],
+    device float*         output    [[buffer(4)]],
+    constant uint4&       params    [[buffer(5)]],
+    uint3 group_id        [[threadgroup_position_in_grid]],
+    uint  tid_in_group    [[thread_index_in_threadgroup]],
+    uint  simd_gid        [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid        [[thread_index_in_simdgroup]])
+{
+    const uint M          = params.x;
+    const uint N          = params.y;
+    const uint K          = params.z;
+    const uint group_size = params.w;
+
+    const uint groups_per_row = K / group_size;
+
+    // Tile origin in output space
+    const uint tile_m = group_id.y * BM;
+    const uint tile_n = group_id.x * BN;
+
+    // Early exit for entirely out-of-bounds threadgroups
+    if (!align_M && tile_m >= M) return;
+    if (!align_N && tile_n >= N) return;
+
+    // ------------------------------------------------------------------
+    // Threadgroup shared memory (double-buffered for A and B)
+    // A: [BM, BK] half -- loaded from x (f32 -> half conversion)
+    // B: [BK, BN] half -- dequantized from w_packed (transposed)
+    // ------------------------------------------------------------------
+    threadgroup half As[2][BM * BK];
+    threadgroup half Bs[2][BK * BN];
+
+    // ------------------------------------------------------------------
+    // Accumulator fragments: each simdgroup computes a 16x16 sub-tile
+    // ------------------------------------------------------------------
+    simdgroup_matrix<float, 8, 8> acc[2][4];
+    for (uint i = 0; i < 2; i++)
+        for (uint j = 0; j < 4; j++)
+            acc[i][j] = simdgroup_matrix<float, 8, 8>(0);
+
+    const uint num_k_tiles = (K + BK - 1) / BK;
+
+    // Helper: load A tile [BM, BK] from x (f32 -> half)
+    auto load_A = [&](uint buf, uint k_base) {
+        for (uint idx = tid_in_group; idx < BM * BK; idx += THREADGROUP_SIZE) {
+            uint row = idx / BK;
+            uint col = idx % BK;
+            uint global_m = tile_m + row;
+            uint global_k = k_base + col;
+            half val = 0.0h;
+            if (align_M || global_m < M) {
+                if (global_k < K) {
+                    val = half(x[global_m * K + global_k]);
+                }
+            }
+            As[buf][row * BK + col] = val;
+        }
+    };
+
+    // Helper: load B tile [BK, BN] from w_packed (Q8 dequant, transposed)
+    // Q8: 1 byte per element -- no nibble extraction needed.
+    auto load_B = [&](uint buf, uint k_base) {
+        for (uint idx = tid_in_group; idx < BK * BN; idx += THREADGROUP_SIZE) {
+            uint k_local = idx / BN;
+            uint n_local = idx % BN;
+            uint global_k = k_base + k_local;
+            uint global_n = tile_n + n_local;
+            half val = 0.0h;
+            if (align_N || global_n < N) {
+                if (global_k < K) {
+                    // Q8: read single byte directly
+                    uint8_t q_byte = w_packed[global_n * K + global_k];
+
+                    // Scale and bias for this element's group
+                    uint group_idx = global_k / group_size;
+                    float scale = scales[global_n * groups_per_row + group_idx];
+                    float bias  = biases[global_n * groups_per_row + group_idx];
+
+                    val = half(scale * float(q_byte) + bias);
+                }
+            }
+            Bs[buf][k_local * BN + n_local] = val;
+        }
+    };
+
+    // Main loop with double buffering
+    load_A(0, 0);
+    load_B(0, 0);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint t = 0; t < num_k_tiles; t++) {
+        uint cur_buf = t % 2;
+        uint nxt_buf = 1 - cur_buf;
+
+        if (t + 1 < num_k_tiles) {
+            uint next_k_base = (t + 1) * BK;
+            load_A(nxt_buf, next_k_base);
+            load_B(nxt_buf, next_k_base);
+        }
+
+        uint sg_row_base = simd_gid * 16;
+
+        for (uint kk = 0; kk < BK; kk += 8) {
+            simdgroup_matrix<half, 8, 8> a_frag[2];
+            simdgroup_load(a_frag[0], &As[cur_buf][(sg_row_base + 0) * BK + kk], BK);
+            simdgroup_load(a_frag[1], &As[cur_buf][(sg_row_base + 8) * BK + kk], BK);
+
+            simdgroup_matrix<half, 8, 8> b_frag[4];
+            simdgroup_load(b_frag[0], &Bs[cur_buf][kk * BN + 0],  BN);
+            simdgroup_load(b_frag[1], &Bs[cur_buf][kk * BN + 8],  BN);
+            simdgroup_load(b_frag[2], &Bs[cur_buf][kk * BN + 16], BN);
+            simdgroup_load(b_frag[3], &Bs[cur_buf][kk * BN + 24], BN);
+
+            for (uint bi = 0; bi < 2; bi++) {
+                for (uint bj = 0; bj < 4; bj++) {
+                    simdgroup_multiply_accumulate(acc[bi][bj], a_frag[bi], b_frag[bj], acc[bi][bj]);
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Store accumulated results
+    uint sg_row_base = simd_gid * 16;
+    threadgroup float* staging = reinterpret_cast<threadgroup float*>(&As[0][0]);
+
+    for (uint bi = 0; bi < 2; bi++) {
+        for (uint bj = 0; bj < 4; bj++) {
+            uint store_row = sg_row_base + bi * 8;
+            uint store_col = bj * 8;
+            simdgroup_store(acc[bi][bj], &staging[store_row * BN + store_col], BN);
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint idx = tid_in_group; idx < BM * BN; idx += THREADGROUP_SIZE) {
+        uint local_row = idx / BN;
+        uint local_col = idx % BN;
+        uint global_m = tile_m + local_row;
+        uint global_n = tile_n + local_col;
+
+        if (align_M || global_m < M) {
+            if (align_N || global_n < N) {
+                output[global_m * N + global_n] = staging[local_row * BN + local_col];
+            }
+        }
+    }
+}
+"#;
+
 /// Register the QMM Metal kernels with the given registry.
 ///
-/// Registers both the legacy scalar kernel (`qmm`) and the new simdgroup
-/// MMA kernel (`qmm_mma`). The batched dispatch function
-/// [`affine_quantized_matmul_batched`] uses the MMA kernel by default.
+/// Registers the legacy scalar kernel (`qmm`), the simdgroup MMA Q4 kernel
+/// (`qmm_mma`), and the simdgroup MMA Q8 kernel (`qmm_mma_q8`).
+/// The batched dispatch function [`affine_quantized_matmul_batched`] selects
+/// the appropriate kernel based on the weight bit width.
 pub fn register_qmm(registry: &KernelRegistry) -> Result<(), KernelError> {
     registry.register_jit_source("qmm", QMM_SHADER_SOURCE)?;
     registry.register_jit_source("qmm_mma", QMM_MMA_SHADER_SOURCE)?;
+    registry.register_jit_source("qmm_mma_q8", QMM_MMA_Q8_SHADER_SOURCE)?;
     Ok(())
 }
 
-/// Affine quantized matrix-matrix multiply on GPU (Q4, Metal).
+/// Affine quantized matrix-matrix multiply on GPU (Q4/Q8, Metal).
 ///
 /// Computes `output[m, n] = sum_k x[m, k] * dequant(w[n, k])` using a Metal
-/// compute kernel for Q4 quantized weights.
+/// compute kernel for quantized weights.
 ///
-/// Uses the simdgroup MMA kernel (`affine_qmm_mma_q4`) with function constants
-/// for alignment-based bounds check elimination. Falls back to the legacy scalar
-/// kernel (`affine_qmm`) only when the MMA kernel is unavailable.
+/// - **Q4** (`bits == 4`): uses `affine_qmm_mma_q4` (dequant from nibble pairs).
+/// - **Q8** (`bits == 8`): uses `affine_qmm_mma_q8` (1 byte per weight, no bit
+///   packing).
 ///
-/// This function requires the `qmm_mma` (and optionally `qmm`) kernel sources
+/// Both kernels share the same MMA framework (BM=32, BN=32, BK=32, 2 simdgroups,
+/// double-buffered, f32 accumulation) with function constants for alignment-based
+/// bounds check elimination.
+///
+/// This function requires the `qmm_mma` and `qmm_mma_q8` kernel sources
 /// to be registered via [`register_qmm`]. They are automatically registered by
 /// [`register`] in this module.
 ///
 /// # Arguments
-/// - `registry`: kernel registry with `qmm_mma` source registered.
+/// - `registry`: kernel registry with `qmm_mma` / `qmm_mma_q8` sources registered.
 /// - `x`: f32 input activations `[M, K]`.
-/// - `qw`: quantized weight description (must be Q4, i.e. `bits == 4`).
+/// - `qw`: quantized weight description (must be Q4 or Q8).
 /// - `queue`: Metal command queue.
 ///
 /// # Returns
@@ -1684,9 +1996,9 @@ pub fn affine_quantized_matmul_batched(
             qw.in_features
         )));
     }
-    if qw.bits != 4 {
+    if qw.bits != 4 && qw.bits != 8 {
         return Err(KernelError::InvalidShape(format!(
-            "affine_quantized_matmul_batched currently requires bits==4, got {}",
+            "affine_quantized_matmul_batched requires bits==4 or bits==8, got {}",
             qw.bits
         )));
     }
@@ -1707,8 +2019,14 @@ pub fn affine_quantized_matmul_batched(
         (201u32, FunctionConstantValue::Bool(align_n)),
     ];
 
-    let pipeline =
-        registry.get_pipeline_with_constants("affine_qmm_mma_q4", DType::Float32, &constants)?;
+    // Select kernel based on bit width
+    let kernel_name = match qw.bits {
+        4 => "affine_qmm_mma_q4",
+        8 => "affine_qmm_mma_q8",
+        _ => unreachable!(), // validated above
+    };
+
+    let pipeline = registry.get_pipeline_with_constants(kernel_name, DType::Float32, &constants)?;
     let out = Array::zeros(registry.device().raw(), &[m, n], DType::Float32);
 
     let params: [u32; 4] = [
@@ -3214,6 +3532,354 @@ mod tests {
                 "output[1,{}] = {} expected 192.0",
                 j,
                 output[n + j]
+            );
+        }
+    }
+
+    // =====================================================================
+    // Q8 QMM CPU tests
+    // =====================================================================
+
+    /// Helper: quantize a row of f32 weights into Q8 bytes + scales + biases.
+    ///
+    /// For each group, finds the min and max, computes:
+    ///   scale = (max - min) / 255
+    ///   bias  = min
+    ///   q_i   = round((w_i - bias) / scale)
+    ///
+    /// Returns (packed_bytes, scales, biases).
+    fn quantize_q8_row(weights: &[f32], group_size: usize) -> (Vec<u8>, Vec<f32>, Vec<f32>) {
+        let k = weights.len();
+        assert_eq!(k % group_size, 0);
+        let num_groups = k / group_size;
+
+        let mut packed = vec![0u8; k];
+        let mut scales = Vec::with_capacity(num_groups);
+        let mut biases = Vec::with_capacity(num_groups);
+
+        for g in 0..num_groups {
+            let start = g * group_size;
+            let end = start + group_size;
+            let group = &weights[start..end];
+
+            let min = group.iter().cloned().fold(f32::INFINITY, f32::min);
+            let max = group.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+
+            let range = max - min;
+            let scale = if range < 1e-10 { 1.0 } else { range / 255.0 };
+            let bias = min;
+
+            scales.push(scale);
+            biases.push(bias);
+
+            for (i, &w) in group.iter().enumerate() {
+                let q = ((w - bias) / scale).round().clamp(0.0, 255.0) as u8;
+                packed[start + i] = q;
+            }
+        }
+
+        (packed, scales, biases)
+    }
+
+    /// Naive (unquantized) matmul for Q8: C[m,n] = X[m,k] * W_dequant[n,k]^T
+    #[allow(clippy::too_many_arguments)]
+    fn naive_matmul_with_dequant_q8(
+        x: &[f32],
+        w_packed: &[u8],
+        scales: &[f32],
+        biases: &[f32],
+        m: usize,
+        n: usize,
+        k: usize,
+        group_size: usize,
+    ) -> Vec<f32> {
+        let mut output = vec![0.0f32; m * n];
+        let groups_per_row = k / group_size;
+
+        for j in 0..n {
+            for i in 0..m {
+                let mut dot = 0.0f32;
+                for kk in 0..k {
+                    let q = w_packed[j * k + kk] as f32;
+                    let g = kk / group_size;
+                    let scale = scales[j * groups_per_row + g];
+                    let bias = biases[j * groups_per_row + g];
+                    let w_val = scale * q + bias;
+                    dot += x[i * k + kk] * w_val;
+                }
+                output[i * n + j] = dot;
+            }
+        }
+
+        output
+    }
+
+    #[test]
+    fn test_affine_qmm_q8_matches_naive_group32() {
+        test_affine_qmm_q8_matches_naive(32);
+    }
+
+    #[test]
+    fn test_affine_qmm_q8_matches_naive_group64() {
+        test_affine_qmm_q8_matches_naive(64);
+    }
+
+    #[test]
+    fn test_affine_qmm_q8_matches_naive_group128() {
+        test_affine_qmm_q8_matches_naive(128);
+    }
+
+    fn test_affine_qmm_q8_matches_naive(group_size: usize) {
+        let m = 8;
+        let n = 4;
+        let k = 128;
+
+        let mut seed = 42u64;
+        let mut next_f32 = || -> f32 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((seed >> 33) as f32 / (u32::MAX as f32 / 2.0)) - 1.0
+        };
+
+        let weights_f32: Vec<f32> = (0..n * k).map(|_| next_f32()).collect();
+        let x: Vec<f32> = (0..m * k).map(|_| next_f32()).collect();
+
+        let mut all_packed = Vec::new();
+        let mut all_scales = Vec::new();
+        let mut all_biases = Vec::new();
+
+        for j in 0..n {
+            let row = &weights_f32[j * k..(j + 1) * k];
+            let (packed, sc, bi) = quantize_q8_row(row, group_size);
+            all_packed.extend_from_slice(&packed);
+            all_scales.extend_from_slice(&sc);
+            all_biases.extend_from_slice(&bi);
+        }
+
+        let mut output_qmm = vec![0.0f32; m * n];
+        affine_qmm_q8(
+            &x,
+            &all_packed,
+            &all_scales,
+            &all_biases,
+            m,
+            n,
+            k,
+            group_size,
+            &mut output_qmm,
+        );
+
+        let output_naive = naive_matmul_with_dequant_q8(
+            &x,
+            &all_packed,
+            &all_scales,
+            &all_biases,
+            m,
+            n,
+            k,
+            group_size,
+        );
+
+        for idx in 0..m * n {
+            let diff = (output_qmm[idx] - output_naive[idx]).abs();
+            let scale = output_naive[idx].abs().max(1.0);
+            assert!(
+                diff / scale < 1e-4,
+                "Q8 mismatch at [{}, {}]: qmm={} naive={} diff={} (group_size={})",
+                idx / n,
+                idx % n,
+                output_qmm[idx],
+                output_naive[idx],
+                diff,
+                group_size
+            );
+        }
+    }
+
+    #[test]
+    fn test_affine_qmm_q8_identity_scale_zero_bias() {
+        // When scale=1, bias=0, dequant(q) = q.
+        let m = 2;
+        let n = 2;
+        let k = 32;
+        let group_size = 32;
+
+        // All bytes = 7
+        let w_packed = vec![7u8; n * k];
+        let scales = vec![1.0f32; n]; // 1 group per row
+        let biases = vec![0.0f32; n];
+
+        let mut x = vec![0.0f32; m * k];
+        for kk in 0..k {
+            x[kk] = 1.0;
+            x[k + kk] = 2.0;
+        }
+        let mut output = vec![0.0f32; m * n];
+
+        affine_qmm_q8(
+            &x,
+            &w_packed,
+            &scales,
+            &biases,
+            m,
+            n,
+            k,
+            group_size,
+            &mut output,
+        );
+
+        // Row 0: sum(1.0 * 7.0 for k=32) = 224.0
+        // Row 1: sum(2.0 * 7.0 for k=32) = 448.0
+        for j in 0..n {
+            assert!(
+                (output[j] - 224.0).abs() < 1e-4,
+                "output[0,{}] = {} expected 224.0",
+                j,
+                output[j]
+            );
+            assert!(
+                (output[n + j] - 448.0).abs() < 1e-4,
+                "output[1,{}] = {} expected 448.0",
+                j,
+                output[n + j]
+            );
+        }
+    }
+
+    #[test]
+    fn test_affine_qmm_q8_large_batch() {
+        let m = 32;
+        let n = 8;
+        let k = 64;
+        let group_size = 32;
+
+        let mut seed = 7u64;
+        let mut next_f32 = || -> f32 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((seed >> 33) as f32 / (u32::MAX as f32 / 2.0)) - 1.0
+        };
+
+        let weights_f32: Vec<f32> = (0..n * k).map(|_| next_f32()).collect();
+        let x: Vec<f32> = (0..m * k).map(|_| next_f32()).collect();
+
+        let mut all_packed = Vec::new();
+        let mut all_scales = Vec::new();
+        let mut all_biases = Vec::new();
+
+        for j in 0..n {
+            let row = &weights_f32[j * k..(j + 1) * k];
+            let (packed, sc, bi) = quantize_q8_row(row, group_size);
+            all_packed.extend_from_slice(&packed);
+            all_scales.extend_from_slice(&sc);
+            all_biases.extend_from_slice(&bi);
+        }
+
+        let mut output_qmm = vec![0.0f32; m * n];
+        affine_qmm_q8(
+            &x,
+            &all_packed,
+            &all_scales,
+            &all_biases,
+            m,
+            n,
+            k,
+            group_size,
+            &mut output_qmm,
+        );
+
+        let output_naive = naive_matmul_with_dequant_q8(
+            &x,
+            &all_packed,
+            &all_scales,
+            &all_biases,
+            m,
+            n,
+            k,
+            group_size,
+        );
+
+        for idx in 0..m * n {
+            let diff = (output_qmm[idx] - output_naive[idx]).abs();
+            let scale = output_naive[idx].abs().max(1.0);
+            assert!(
+                diff / scale < 1e-4,
+                "Q8 large batch mismatch at {}: qmm={} naive={} diff={}",
+                idx,
+                output_qmm[idx],
+                output_naive[idx],
+                diff,
+            );
+        }
+    }
+
+    #[test]
+    fn test_affine_qmm_q8_vs_float_matmul_tolerance() {
+        // Q8 should have much lower quantization error than Q4 (255 levels vs 15).
+        let m = 4;
+        let n = 2;
+        let k = 64;
+        let group_size = 32;
+
+        let mut seed = 123u64;
+        let mut next_f32 = || -> f32 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((seed >> 33) as f32 / (u32::MAX as f32 / 2.0)) - 1.0
+        };
+
+        let weights_f32: Vec<f32> = (0..n * k).map(|_| next_f32()).collect();
+        let x: Vec<f32> = (0..m * k).map(|_| next_f32()).collect();
+
+        // Exact float matmul
+        let mut output_exact = vec![0.0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut dot = 0.0f32;
+                for kk in 0..k {
+                    dot += x[i * k + kk] * weights_f32[j * k + kk];
+                }
+                output_exact[i * n + j] = dot;
+            }
+        }
+
+        // Quantize and compute via Q8 QMM
+        let mut all_packed = Vec::new();
+        let mut all_scales = Vec::new();
+        let mut all_biases = Vec::new();
+
+        for j in 0..n {
+            let row = &weights_f32[j * k..(j + 1) * k];
+            let (packed, sc, bi) = quantize_q8_row(row, group_size);
+            all_packed.extend_from_slice(&packed);
+            all_scales.extend_from_slice(&sc);
+            all_biases.extend_from_slice(&bi);
+        }
+
+        let mut output_qmm = vec![0.0f32; m * n];
+        affine_qmm_q8(
+            &x,
+            &all_packed,
+            &all_scales,
+            &all_biases,
+            m,
+            n,
+            k,
+            group_size,
+            &mut output_qmm,
+        );
+
+        // Q8 should be within ~5% tolerance (much tighter than Q4's 50%)
+        for idx in 0..m * n {
+            let exact = output_exact[idx];
+            let qmm = output_qmm[idx];
+            let diff = (exact - qmm).abs();
+            let scale = exact.abs().max(0.01);
+            assert!(
+                diff / scale < 0.10,
+                "Q8 vs float too far at [{}, {}]: exact={} qmm={} rel_err={}",
+                idx / n,
+                idx % n,
+                exact,
+                qmm,
+                diff / scale
             );
         }
     }
