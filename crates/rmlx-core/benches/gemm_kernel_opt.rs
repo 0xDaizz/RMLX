@@ -710,6 +710,113 @@ fn main() {
             .unwrap_or_else(|e| panic!("Failed to compile {}: {e}", cfg.label));
     }
 
+    // ── Correctness verification ──
+    // Run each variant on M=128,K=128,N=128 and compare against ref
+    println!("=== Correctness Verification (M=128, K=128, N=128) ===");
+    {
+        let vm = 128usize;
+        let vk = 128usize;
+        let vn = 128usize;
+        let va = rand_array(device, &[vm, vk], 42);
+        let vb = rand_array(device, &[vk, vn], 43);
+
+        // Run ref kernel to get ground truth
+        let ref_pipeline = registry
+            .get_pipeline("gemm_ko_ref", DType::Float16)
+            .expect("ref pipeline");
+        let c_ref = Array::zeros(device, &[vm, vn], DType::Float16);
+        let m_buf = make_u32_buf(device, vm as u32);
+        let n_buf = make_u32_buf(device, vn as u32);
+        let k_buf = make_u32_buf(device, vk as u32);
+        let bsa_buf = make_u32_buf(device, (vm * vk) as u32);
+        let bsb_buf = make_u32_buf(device, (vk * vn) as u32);
+        let bsc_buf = make_u32_buf(device, (vm * vn) as u32);
+        let sw_buf = make_u32_buf(device, 0u32);
+        let grid = MTLSize::new(
+            ceil_div(vn, BN as usize) as u64,
+            ceil_div(vm, BM as usize) as u64,
+            1,
+        );
+        let tg = MTLSize::new(N_THREADS as u64, 1, 1);
+
+        let cb = queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&ref_pipeline);
+        enc.set_buffer(0, Some(va.metal_buffer()), 0);
+        enc.set_buffer(1, Some(vb.metal_buffer()), 0);
+        enc.set_buffer(2, Some(c_ref.metal_buffer()), 0);
+        enc.set_buffer(3, Some(&m_buf), 0);
+        enc.set_buffer(4, Some(&n_buf), 0);
+        enc.set_buffer(5, Some(&k_buf), 0);
+        enc.set_buffer(6, Some(&bsa_buf), 0);
+        enc.set_buffer(7, Some(&bsb_buf), 0);
+        enc.set_buffer(8, Some(&bsc_buf), 0);
+        enc.set_buffer(9, Some(&sw_buf), 0);
+        enc.dispatch_thread_groups(grid, tg);
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        let ref_ptr = c_ref.metal_buffer().contents() as *const u16;
+        let ref_vals: Vec<u16> =
+            unsafe { std::slice::from_raw_parts(ref_ptr, vm * vn) }.to_vec();
+
+        // Test each non-ref variant
+        for cfg in &CONFIGS[1..] {
+            let kernel_name = format!("gemm_ko_{}", cfg.label);
+            let pipeline = registry
+                .get_pipeline(&kernel_name, DType::Float16)
+                .expect(&format!("{} pipeline", cfg.label));
+            let c_test = Array::zeros(device, &[vm, vn], DType::Float16);
+
+            let cb = queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&pipeline);
+            enc.set_buffer(0, Some(va.metal_buffer()), 0);
+            enc.set_buffer(1, Some(vb.metal_buffer()), 0);
+            enc.set_buffer(2, Some(c_test.metal_buffer()), 0);
+            enc.set_buffer(3, Some(&m_buf), 0);
+            enc.set_buffer(4, Some(&n_buf), 0);
+            enc.set_buffer(5, Some(&k_buf), 0);
+            enc.set_buffer(6, Some(&bsa_buf), 0);
+            enc.set_buffer(7, Some(&bsb_buf), 0);
+            enc.set_buffer(8, Some(&bsc_buf), 0);
+            enc.set_buffer(9, Some(&sw_buf), 0);
+            enc.dispatch_thread_groups(grid, tg);
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+
+            let test_ptr = c_test.metal_buffer().contents() as *const u16;
+            let test_vals: Vec<u16> =
+                unsafe { std::slice::from_raw_parts(test_ptr, vm * vn) }.to_vec();
+
+            let mut mismatches = 0u32;
+            let mut first_mm: Option<(usize, u16, u16)> = None;
+            for i in 0..ref_vals.len() {
+                if ref_vals[i] != test_vals[i] {
+                    mismatches += 1;
+                    if first_mm.is_none() {
+                        first_mm = Some((i, ref_vals[i], test_vals[i]));
+                    }
+                }
+            }
+
+            if mismatches == 0 {
+                println!("  {} : PASS (exact match)", cfg.label);
+            } else {
+                let (idx, rv, tv) = first_mm.unwrap();
+                let row = idx / vn;
+                let col = idx % vn;
+                println!(
+                    "  {} : FAIL — {} mismatches / {} (first: [{},{}] ref=0x{:04x} test=0x{:04x})",
+                    cfg.label, mismatches, ref_vals.len(), row, col, rv, tv,
+                );
+            }
+        }
+    }
+    println!();
+
     println!("=== GEMM Kernel Optimization Benchmark (f16) ===");
     println!(
         "Base: BM={} BN={} BK={} SG={}x{} thr={} double-buffered PAD={}",
