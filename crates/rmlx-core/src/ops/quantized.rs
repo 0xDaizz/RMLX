@@ -1578,60 +1578,51 @@ kernel void affine_qmm_mma_q4(
     const uint num_k_tiles = (K + BK - 1) / BK;
 
     // ------------------------------------------------------------------
-    // Helper: load A tile [BM, BK] from x (f32 → half)
-    // 64 threads load 32×32 = 1024 elements → 16 elements per thread
+    // Inline tile loaders (Metal does not support C++ lambdas)
     // ------------------------------------------------------------------
-    auto load_A = [&](uint buf, uint k_base) {
-        for (uint idx = tid_in_group; idx < BM * BK; idx += THREADGROUP_SIZE) {
-            uint row = idx / BK;
-            uint col = idx % BK;
-            uint global_m = tile_m + row;
-            uint global_k = k_base + col;
-            half val = 0.0h;
-            if (align_M || global_m < M) {
-                if (global_k < K) {
-                    val = half(x[global_m * K + global_k]);
-                }
-            }
-            As[buf][row * BK + col] = val;
-        }
-    };
 
-    // ------------------------------------------------------------------
-    // Helper: load B tile [BK, BN] from w_packed (Q4 dequant, transposed)
+    // Macro: load A tile [BM, BK] from x (f32 → half)
+    // 64 threads load 32×32 = 1024 elements → 16 elements per thread
+    #define LOAD_A(BUF, K_BASE) \
+        for (uint idx_a = tid_in_group; idx_a < BM * BK; idx_a += THREADGROUP_SIZE) { \
+            uint row_a = idx_a / BK; \
+            uint col_a = idx_a % BK; \
+            uint gm_a = tile_m + row_a; \
+            uint gk_a = (K_BASE) + col_a; \
+            half val_a = 0.0h; \
+            if (align_M || gm_a < M) { \
+                if (gk_a < K) { \
+                    val_a = half(x[gm_a * K + gk_a]); \
+                } \
+            } \
+            As[(BUF)][row_a * BK + col_a] = val_a; \
+        }
+
+    // Macro: load B tile [BK, BN] from w_packed (Q4 dequant, transposed)
     //
     // W is [N, K] row-major. We need B[k, n] = dequant(W[n, k]).
-    // For the k-tile [k_base, k_base+BK), and n-tile [tile_n, tile_n+BN):
-    //
-    // Each thread handles multiple (k, n) pairs.
     // Dequant: val = scale * q + bias, where q = 4-bit nibble from w_packed.
-    // ------------------------------------------------------------------
-    auto load_B = [&](uint buf, uint k_base) {
-        for (uint idx = tid_in_group; idx < BK * BN; idx += THREADGROUP_SIZE) {
-            uint k_local = idx / BN;  // row in B = k dimension
-            uint n_local = idx % BN;  // col in B = n dimension
-            uint global_k = k_base + k_local;
-            uint global_n = tile_n + n_local;
-            half val = 0.0h;
-            if (align_N || global_n < N) {
-                if (global_k < K) {
-                    // Dequant: read Q4 nibble from w_packed[global_n, global_k]
-                    uint byte_idx = global_k / 2;
-                    uint nibble_idx = global_k % 2;
-                    uint8_t packed = w_packed[global_n * half_k + byte_idx];
-                    uint q = nibble_idx == 0 ? (packed & 0x0F) : ((packed >> 4) & 0x0F);
-
-                    // Scale and bias for this element's group
-                    uint group_idx = global_k / group_size;
-                    float scale = scales[global_n * groups_per_row + group_idx];
-                    float bias  = biases[global_n * groups_per_row + group_idx];
-
-                    val = half(scale * float(q) + bias);
-                }
-            }
-            Bs[buf][k_local * BN + n_local] = val;
+    #define LOAD_B(BUF, K_BASE) \
+        for (uint idx_b = tid_in_group; idx_b < BK * BN; idx_b += THREADGROUP_SIZE) { \
+            uint kl_b = idx_b / BN; \
+            uint nl_b = idx_b % BN; \
+            uint gk_b = (K_BASE) + kl_b; \
+            uint gn_b = tile_n + nl_b; \
+            half val_b = 0.0h; \
+            if (align_N || gn_b < N) { \
+                if (gk_b < K) { \
+                    uint byte_idx_b = gk_b / 2; \
+                    uint nibble_idx_b = gk_b % 2; \
+                    uint8_t packed_b = w_packed[gn_b * half_k + byte_idx_b]; \
+                    uint q_b = nibble_idx_b == 0 ? (packed_b & 0x0F) : ((packed_b >> 4) & 0x0F); \
+                    uint group_idx_b = gk_b / group_size; \
+                    float scale_b = scales[gn_b * groups_per_row + group_idx_b]; \
+                    float bias_b  = biases[gn_b * groups_per_row + group_idx_b]; \
+                    val_b = half(scale_b * float(q_b) + bias_b); \
+                } \
+            } \
+            Bs[(BUF)][kl_b * BN + nl_b] = val_b; \
         }
-    };
 
     // ------------------------------------------------------------------
     // Main loop: iterate over K dimension in BK-sized tiles
@@ -1639,8 +1630,8 @@ kernel void affine_qmm_mma_q4(
     // ------------------------------------------------------------------
 
     // Load first tile into buffer 0
-    load_A(0, 0);
-    load_B(0, 0);
+    LOAD_A(0, 0);
+    LOAD_B(0, 0);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint t = 0; t < num_k_tiles; t++) {
@@ -1650,8 +1641,8 @@ kernel void affine_qmm_mma_q4(
         // Prefetch next tile if available
         if (t + 1 < num_k_tiles) {
             uint next_k_base = (t + 1) * BK;
-            load_A(nxt_buf, next_k_base);
-            load_B(nxt_buf, next_k_base);
+            LOAD_A(nxt_buf, next_k_base);
+            LOAD_B(nxt_buf, next_k_base);
         }
 
         // Compute MMA for current tile
@@ -1822,52 +1813,50 @@ kernel void affine_qmm_mma_q8(
 
     const uint num_k_tiles = (K + BK - 1) / BK;
 
-    // Helper: load A tile [BM, BK] from x (f32 -> half)
-    auto load_A = [&](uint buf, uint k_base) {
-        for (uint idx = tid_in_group; idx < BM * BK; idx += THREADGROUP_SIZE) {
-            uint row = idx / BK;
-            uint col = idx % BK;
-            uint global_m = tile_m + row;
-            uint global_k = k_base + col;
-            half val = 0.0h;
-            if (align_M || global_m < M) {
-                if (global_k < K) {
-                    val = half(x[global_m * K + global_k]);
-                }
-            }
-            As[buf][row * BK + col] = val;
-        }
-    };
+    // ------------------------------------------------------------------
+    // Inline tile loaders (Metal does not support C++ lambdas)
+    // ------------------------------------------------------------------
 
-    // Helper: load B tile [BK, BN] from w_packed (Q8 dequant, transposed)
+    // Macro: load A tile [BM, BK] from x (f32 -> half)
+    #define LOAD_A(BUF, K_BASE) \
+        for (uint idx_a = tid_in_group; idx_a < BM * BK; idx_a += THREADGROUP_SIZE) { \
+            uint row_a = idx_a / BK; \
+            uint col_a = idx_a % BK; \
+            uint gm_a = tile_m + row_a; \
+            uint gk_a = (K_BASE) + col_a; \
+            half val_a = 0.0h; \
+            if (align_M || gm_a < M) { \
+                if (gk_a < K) { \
+                    val_a = half(x[gm_a * K + gk_a]); \
+                } \
+            } \
+            As[(BUF)][row_a * BK + col_a] = val_a; \
+        }
+
+    // Macro: load B tile [BK, BN] from w_packed (Q8 dequant, transposed)
     // Q8: 1 byte per element -- no nibble extraction needed.
-    auto load_B = [&](uint buf, uint k_base) {
-        for (uint idx = tid_in_group; idx < BK * BN; idx += THREADGROUP_SIZE) {
-            uint k_local = idx / BN;
-            uint n_local = idx % BN;
-            uint global_k = k_base + k_local;
-            uint global_n = tile_n + n_local;
-            half val = 0.0h;
-            if (align_N || global_n < N) {
-                if (global_k < K) {
-                    // Q8: read single byte directly
-                    uint8_t q_byte = w_packed[global_n * K + global_k];
-
-                    // Scale and bias for this element's group
-                    uint group_idx = global_k / group_size;
-                    float scale = scales[global_n * groups_per_row + group_idx];
-                    float bias  = biases[global_n * groups_per_row + group_idx];
-
-                    val = half(scale * float(q_byte) + bias);
-                }
-            }
-            Bs[buf][k_local * BN + n_local] = val;
+    #define LOAD_B(BUF, K_BASE) \
+        for (uint idx_b = tid_in_group; idx_b < BK * BN; idx_b += THREADGROUP_SIZE) { \
+            uint kl_b = idx_b / BN; \
+            uint nl_b = idx_b % BN; \
+            uint gk_b = (K_BASE) + kl_b; \
+            uint gn_b = tile_n + nl_b; \
+            half val_b = 0.0h; \
+            if (align_N || gn_b < N) { \
+                if (gk_b < K) { \
+                    uint8_t q_byte_b = w_packed[gn_b * K + gk_b]; \
+                    uint group_idx_b = gk_b / group_size; \
+                    float scale_b = scales[gn_b * groups_per_row + group_idx_b]; \
+                    float bias_b  = biases[gn_b * groups_per_row + group_idx_b]; \
+                    val_b = half(scale_b * float(q_byte_b) + bias_b); \
+                } \
+            } \
+            Bs[(BUF)][kl_b * BN + nl_b] = val_b; \
         }
-    };
 
     // Main loop with double buffering
-    load_A(0, 0);
-    load_B(0, 0);
+    LOAD_A(0, 0);
+    LOAD_B(0, 0);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint t = 0; t < num_k_tiles; t++) {
@@ -1876,8 +1865,8 @@ kernel void affine_qmm_mma_q8(
 
         if (t + 1 < num_k_tiles) {
             uint next_k_base = (t + 1) * BK;
-            load_A(nxt_buf, next_k_base);
-            load_B(nxt_buf, next_k_base);
+            LOAD_A(nxt_buf, next_k_base);
+            LOAD_B(nxt_buf, next_k_base);
         }
 
         uint sg_row_base = simd_gid * 16;
