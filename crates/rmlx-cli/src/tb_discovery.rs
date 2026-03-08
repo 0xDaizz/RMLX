@@ -34,6 +34,7 @@ pub struct TbLink {
 
 /// Complete Thunderbolt topology across all hosts.
 pub struct TbTopology {
+    #[allow(dead_code)]
     pub hosts: Vec<TbHost>,
     pub links: Vec<TbLink>,
 }
@@ -155,10 +156,7 @@ fn resolve_iface_from_bus(
     // Try receptacle_1_tag, receptacle_2_tag, etc.
     for suffix in &["receptacle_1_tag", "receptacle_2_tag"] {
         if let Some(tag_obj) = bus.get(*suffix) {
-            if let Some(tag) = tag_obj
-                .get("receptacle_id_key")
-                .and_then(|v| v.as_str())
-            {
+            if let Some(tag) = tag_obj.get("receptacle_id_key").and_then(|v| v.as_str()) {
                 let port_name = format!("Thunderbolt {tag}");
                 if let Some(iface) = hardware_ports.get(&port_name) {
                     return Some(iface.clone());
@@ -283,7 +281,7 @@ fn match_links(hosts: &[TbHost]) -> Vec<TbLink> {
                         dst_host: pj,
                         dst_iface: hosts[pj].ports[qj].iface.clone(),
                         dst_ip: String::new(),
-                        });
+                    });
                 }
             }
         }
