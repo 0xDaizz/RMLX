@@ -49,28 +49,138 @@ impl GemmOptConfig {
 
 const CONFIGS: &[GemmOptConfig] = &[
     // 1. Reference: current best config, no optimizations
-    GemmOptConfig { label: "ref_bk32_2x4", bm: 64, bn: 64, bk: 32, sg_rows: 2, sg_cols: 4, serpentine: false, pad: 0, double_buffered: true },
+    GemmOptConfig {
+        label: "ref_bk32_2x4",
+        bm: 64,
+        bn: 64,
+        bk: 32,
+        sg_rows: 2,
+        sg_cols: 4,
+        serpentine: false,
+        pad: 0,
+        double_buffered: true,
+    },
     // 2. Serpentine MMA only
-    GemmOptConfig { label: "serp_bk32_2x4", bm: 64, bn: 64, bk: 32, sg_rows: 2, sg_cols: 4, serpentine: true, pad: 0, double_buffered: true },
+    GemmOptConfig {
+        label: "serp_bk32_2x4",
+        bm: 64,
+        bn: 64,
+        bk: 32,
+        sg_rows: 2,
+        sg_cols: 4,
+        serpentine: true,
+        pad: 0,
+        double_buffered: true,
+    },
     // 3. TG memory padding only (PAD=8 halves = 16 bytes per row)
-    GemmOptConfig { label: "pad_bk32_2x4", bm: 64, bn: 64, bk: 32, sg_rows: 2, sg_cols: 4, serpentine: false, pad: 8, double_buffered: true },
+    GemmOptConfig {
+        label: "pad_bk32_2x4",
+        bm: 64,
+        bn: 64,
+        bk: 32,
+        sg_rows: 2,
+        sg_cols: 4,
+        serpentine: false,
+        pad: 8,
+        double_buffered: true,
+    },
     // 4. Both serpentine + padding
-    GemmOptConfig { label: "full_bk32_2x4", bm: 64, bn: 64, bk: 32, sg_rows: 2, sg_cols: 4, serpentine: true, pad: 8, double_buffered: true },
+    GemmOptConfig {
+        label: "full_bk32_2x4",
+        bm: 64,
+        bn: 64,
+        bk: 32,
+        sg_rows: 2,
+        sg_cols: 4,
+        serpentine: true,
+        pad: 8,
+        double_buffered: true,
+    },
     // 5. bk16_2x2 + both optimizations
-    GemmOptConfig { label: "full_bk16_2x2", bm: 64, bn: 64, bk: 16, sg_rows: 2, sg_cols: 2, serpentine: true, pad: 8, double_buffered: true },
+    GemmOptConfig {
+        label: "full_bk16_2x2",
+        bm: 64,
+        bn: 64,
+        bk: 16,
+        sg_rows: 2,
+        sg_cols: 2,
+        serpentine: true,
+        pad: 8,
+        double_buffered: true,
+    },
     // 6. MLX-like: bk16_1x2, 64 threads, acc[8][4]=32 MMA/SG + both optimizations
-    GemmOptConfig { label: "full_bk16_1x2", bm: 64, bn: 64, bk: 16, sg_rows: 1, sg_cols: 2, serpentine: true, pad: 8, double_buffered: true },
+    GemmOptConfig {
+        label: "full_bk16_1x2",
+        bm: 64,
+        bn: 64,
+        bk: 16,
+        sg_rows: 1,
+        sg_cols: 2,
+        serpentine: true,
+        pad: 8,
+        double_buffered: true,
+    },
     // --- Occupancy-focused: single buffer to reduce TG memory ---
     // 7. MLX-like: single buffer, 2 SG, serpentine+pad (~5KB TG → ~6 TG/core)
-    GemmOptConfig { label: "mlx_like", bm: 64, bn: 64, bk: 16, sg_rows: 1, sg_cols: 2, serpentine: true, pad: 8, double_buffered: false },
+    GemmOptConfig {
+        label: "mlx_like",
+        bm: 64,
+        bn: 64,
+        bk: 16,
+        sg_rows: 1,
+        sg_cols: 2,
+        serpentine: true,
+        pad: 8,
+        double_buffered: false,
+    },
     // 8. MLX-like without padding (~4KB TG)
-    GemmOptConfig { label: "mlx_nopad", bm: 64, bn: 64, bk: 16, sg_rows: 1, sg_cols: 2, serpentine: true, pad: 0, double_buffered: false },
+    GemmOptConfig {
+        label: "mlx_nopad",
+        bm: 64,
+        bn: 64,
+        bk: 16,
+        sg_rows: 1,
+        sg_cols: 2,
+        serpentine: true,
+        pad: 0,
+        double_buffered: false,
+    },
     // 9. Single buffer, 4 SG, 2x2 layout (~6KB TG → ~5 TG/core)
-    GemmOptConfig { label: "occ_2x2", bm: 64, bn: 64, bk: 16, sg_rows: 2, sg_cols: 2, serpentine: true, pad: 8, double_buffered: false },
+    GemmOptConfig {
+        label: "occ_2x2",
+        bm: 64,
+        bn: 64,
+        bk: 16,
+        sg_rows: 2,
+        sg_cols: 2,
+        serpentine: true,
+        pad: 8,
+        double_buffered: false,
+    },
     // 10. Reference: double buffer bk32_2x4, NO optimizations → single buffer version
-    GemmOptConfig { label: "ref_single", bm: 64, bn: 64, bk: 32, sg_rows: 2, sg_cols: 4, serpentine: false, pad: 0, double_buffered: false },
+    GemmOptConfig {
+        label: "ref_single",
+        bm: 64,
+        bn: 64,
+        bk: 32,
+        sg_rows: 2,
+        sg_cols: 4,
+        serpentine: false,
+        pad: 0,
+        double_buffered: false,
+    },
     // 11. 128x128 tile, single buffer, 8 SG (~10KB TG → ~3 TG/core)
-    GemmOptConfig { label: "big_tile", bm: 128, bn: 128, bk: 16, sg_rows: 2, sg_cols: 4, serpentine: true, pad: 8, double_buffered: false },
+    GemmOptConfig {
+        label: "big_tile",
+        bm: 128,
+        bn: 128,
+        bk: 16,
+        sg_rows: 2,
+        sg_cols: 4,
+        serpentine: true,
+        pad: 8,
+        double_buffered: false,
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -127,7 +237,7 @@ fn generate_optimized_gemm_shader(cfg: &GemmOptConfig) -> String {
          METAL_FUNC T sw_as_uniform(T val) {\n\
              return val;\n\
          }\n\
-         #endif\n\n"
+         #endif\n\n",
     );
 
     // Swizzle helper
@@ -138,7 +248,7 @@ fn generate_optimized_gemm_shader(cfg: &GemmOptConfig) -> String {
                  tid.x >> swizzle_log,\n\
                  (tid.y << swizzle_log) | (tid.x & ((1u << swizzle_log) - 1u))\n\
              );\n\
-         }\n\n"
+         }\n\n",
     );
 
     // Kernel function signature
@@ -164,7 +274,7 @@ fn generate_optimized_gemm_shader(cfg: &GemmOptConfig) -> String {
     // Shared memory (with padded stride)
     s.push_str(
         "    threadgroup half As[SW_BUFS][SW_BM * SW_A_STRIDE];\n\
-         \x20   threadgroup half Bs[SW_BUFS][SW_BK * SW_B_STRIDE];\n\n"
+         \x20   threadgroup half Bs[SW_BUFS][SW_BK * SW_B_STRIDE];\n\n",
     );
 
     // Batch / swizzle setup
@@ -175,13 +285,13 @@ fn generate_optimized_gemm_shader(cfg: &GemmOptConfig) -> String {
          \x20   const uint col_start = swizzled.x * sw_as_uniform(SW_BN);\n\n\
          \x20   device const half* A_batch = A + batch_idx * sw_as_uniform(batch_stride_a);\n\
          \x20   device const half* B_batch = B + batch_idx * sw_as_uniform(batch_stride_b);\n\
-         \x20   device half*       C_batch = C + batch_idx * sw_as_uniform(batch_stride_c);\n\n"
+         \x20   device half*       C_batch = C + batch_idx * sw_as_uniform(batch_stride_c);\n\n",
     );
 
     // SG grid position
     s.push_str(
         "    const uint sg_row = sgid / SW_SG_COLS;\n\
-         \x20   const uint sg_col = sgid % SW_SG_COLS;\n\n"
+         \x20   const uint sg_col = sgid % SW_SG_COLS;\n\n",
     );
 
     // Accumulators
@@ -191,7 +301,7 @@ fn generate_optimized_gemm_shader(cfg: &GemmOptConfig) -> String {
          \x20   for (uint i = 0; i < SW_TM; i++)\n\
          \x20       #pragma clang loop unroll(full)\n\
          \x20       for (uint j = 0; j < SW_TN; j++)\n\
-         \x20           acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);\n\n"
+         \x20           acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);\n\n",
     );
 
     // Uniform dimension copies
@@ -199,7 +309,7 @@ fn generate_optimized_gemm_shader(cfg: &GemmOptConfig) -> String {
         "    const uint uK = sw_as_uniform(K);\n\
          \x20   const uint uM = sw_as_uniform(M);\n\
          \x20   const uint uN = sw_as_uniform(N);\n\
-         \x20   const uint n_tiles = (uK + SW_BK - 1) / SW_BK;\n\n"
+         \x20   const uint n_tiles = (uK + SW_BK - 1) / SW_BK;\n\n",
     );
 
     // Main compute loop — double-buffered or single-buffered
@@ -279,7 +389,7 @@ fn generate_optimized_double_buffered_loop(s: &mut String, tm: u32, tn: u32, ser
          \x20           }\n\
          \x20       }\n\
          \x20   }\n\
-         \x20   threadgroup_barrier(mem_flags::mem_threadgroup);\n\n"
+         \x20   threadgroup_barrier(mem_flags::mem_threadgroup);\n\n",
     );
 
     // Main double-buffered loop
@@ -332,23 +442,21 @@ fn generate_optimized_double_buffered_loop(s: &mut String, tm: u32, tn: u32, ser
 
     // MMA loop — serpentine or standard
     let mma_body = if serpentine {
-        format!(
-            "\x20           #pragma clang loop unroll(full)\n\
+        "\x20           #pragma clang loop unroll(full)\n\
              \x20           for (uint i = 0; i < SW_TM; i++)\n\
              \x20               #pragma clang loop unroll(full)\n\
              \x20               for (uint jj = 0; jj < SW_TN; jj++) {{\n\
              \x20                   uint j = (i & 1u) ? (SW_TN - 1u - jj) : jj;\n\
              \x20                   simdgroup_multiply_accumulate(acc[i][j], a_frag[i], b_frag[j], acc[i][j]);\n\
              \x20               }}\n"
-        )
+            .to_string()
     } else {
-        format!(
-            "\x20           #pragma clang loop unroll(full)\n\
+        "\x20           #pragma clang loop unroll(full)\n\
              \x20           for (uint i = 0; i < SW_TM; i++)\n\
              \x20               #pragma clang loop unroll(full)\n\
              \x20               for (uint j = 0; j < SW_TN; j++)\n\
              \x20                   simdgroup_multiply_accumulate(acc[i][j], a_frag[i], b_frag[j], acc[i][j]);\n"
-        )
+            .to_string()
     };
 
     s.push_str(&format!(
@@ -382,23 +490,21 @@ fn generate_optimized_single_buffered_loop(s: &mut String, tm: u32, tn: u32, ser
 
     // MMA body — serpentine or standard (same as double-buffered but always stage 0)
     let mma_body = if serpentine {
-        format!(
-            "\x20           #pragma clang loop unroll(full)\n\
+        "\x20           #pragma clang loop unroll(full)\n\
              \x20           for (uint i = 0; i < SW_TM; i++)\n\
              \x20               #pragma clang loop unroll(full)\n\
              \x20               for (uint jj = 0; jj < SW_TN; jj++) {{\n\
              \x20                   uint j = (i & 1u) ? (SW_TN - 1u - jj) : jj;\n\
              \x20                   simdgroup_multiply_accumulate(acc[i][j], a_frag[i], b_frag[j], acc[i][j]);\n\
              \x20               }}\n"
-        )
+            .to_string()
     } else {
-        format!(
-            "\x20           #pragma clang loop unroll(full)\n\
+        "\x20           #pragma clang loop unroll(full)\n\
              \x20           for (uint i = 0; i < SW_TM; i++)\n\
              \x20               #pragma clang loop unroll(full)\n\
              \x20               for (uint j = 0; j < SW_TN; j++)\n\
              \x20                   simdgroup_multiply_accumulate(acc[i][j], a_frag[i], b_frag[j], acc[i][j]);\n"
-        )
+            .to_string()
     };
 
     s.push_str(&format!(
@@ -548,12 +654,16 @@ fn make_u32_buf(device: &metal::Device, val: u32) -> metal::Buffer {
 }
 
 fn ceil_div(a: usize, b: usize) -> usize {
-    (a + b - 1) / b
+    a.div_ceil(b)
 }
 
 fn compute_swizzle_log(m: usize, bm: usize) -> u32 {
     let tiles_m = m.div_ceil(bm);
-    if tiles_m > 3 { 1 } else { 0 }
+    if tiles_m > 3 {
+        1
+    } else {
+        0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -676,7 +786,11 @@ fn main() {
     let kn_combos: &[(usize, usize)] = &[(4096, 4096), (4096, 14336)];
 
     for cfg in CONFIGS {
-        let buf_label = if cfg.double_buffered { "double" } else { "single" };
+        let buf_label = if cfg.double_buffered {
+            "double"
+        } else {
+            "single"
+        };
         println!(
             "--- Config: {} (BM={} BN={} BK={} SG={}x{} thr={} serp={} pad={} buf={}) ---",
             cfg.label,
