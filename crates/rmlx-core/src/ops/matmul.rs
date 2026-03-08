@@ -1724,6 +1724,7 @@ constant constexpr uint SK2_TN = 4;   // (BN/2) / 8
 // Function constants for alignment specialization
 constant bool align_M [[function_constant(200)]];
 constant bool align_N [[function_constant(201)]];
+constant bool has_residual [[function_constant(202)]];
 
 #if __METAL_VERSION__ >= 310
 template <typename T>
@@ -2097,6 +2098,7 @@ constant constexpr uint MLX_TN = 4;   // (BN/2) / 8 = 32/8
 // When N % BN == 0, align_N is true → column bounds checks are elided.
 constant bool align_M [[function_constant(200)]];
 constant bool align_N [[function_constant(201)]];
+constant bool has_residual [[function_constant(202)]];
 
 #if __METAL_VERSION__ >= 310
 template <typename T>
