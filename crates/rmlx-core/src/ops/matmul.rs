@@ -280,43 +280,43 @@ kernel void gemm_tiled_f16(
 
     // Prefetch first tile (vectorized half4 loads)
     {
-        for (uint idx = tid_in_group; idx < (BM * BK) / 4; idx += N_THREADS) {
-            uint flat = idx * 4;
+        // wide_load: 2×half4 per iteration (8 elements)
+        for (uint idx = tid_in_group; idx < (BM * BK) / 8; idx += N_THREADS) {
+            uint flat = idx * 8;
             uint r = flat / BK;
             uint c = flat % BK;
             uint gr = row_start + r;
             uint gc = c;
-            half4 val;
-            if (gr < uM && gc + 3 < uK) {
-                val = *((device const half4*)(&A_batch[gr * uK + gc]));
+            if (gr < uM && gc + 7 < uK) {
+                *((threadgroup half4*)(&As[0][r * BK + c])) =
+                    *((device const half4*)(&A_batch[gr * uK + gc]));
+                *((threadgroup half4*)(&As[0][r * BK + c + 4])) =
+                    *((device const half4*)(&A_batch[gr * uK + gc + 4]));
             } else {
-                val = half4(
-                    (gr < uM && gc+0 < uK) ? A_batch[gr*uK + gc+0] : half(0),
-                    (gr < uM && gc+1 < uK) ? A_batch[gr*uK + gc+1] : half(0),
-                    (gr < uM && gc+2 < uK) ? A_batch[gr*uK + gc+2] : half(0),
-                    (gr < uM && gc+3 < uK) ? A_batch[gr*uK + gc+3] : half(0)
-                );
+                for (uint d = 0; d < 8; d++) {
+                    As[0][r * BK + c + d] = (gr < uM && gc + d < uK)
+                        ? A_batch[gr * uK + gc + d] : half(0);
+                }
             }
-            *((threadgroup half4*)(&As[0][r * BK + c])) = val;
         }
-        for (uint idx = tid_in_group; idx < (BK * BN) / 4; idx += N_THREADS) {
-            uint flat = idx * 4;
+        // wide_load: 2×half4 per iteration (8 elements)
+        for (uint idx = tid_in_group; idx < (BK * BN) / 8; idx += N_THREADS) {
+            uint flat = idx * 8;
             uint r = flat / BN;
             uint c = flat % BN;
             uint gr = r;
             uint gc = col_start + c;
-            half4 val;
-            if (gr < uK && gc + 3 < uN) {
-                val = *((device const half4*)(&B_batch[gr * uN + gc]));
+            if (gr < uK && gc + 7 < uN) {
+                *((threadgroup half4*)(&Bs[0][r * BN + c])) =
+                    *((device const half4*)(&B_batch[gr * uN + gc]));
+                *((threadgroup half4*)(&Bs[0][r * BN + c + 4])) =
+                    *((device const half4*)(&B_batch[gr * uN + gc + 4]));
             } else {
-                val = half4(
-                    (gr < uK && gc+0 < uN) ? B_batch[gr*uN + gc+0] : half(0),
-                    (gr < uK && gc+1 < uN) ? B_batch[gr*uN + gc+1] : half(0),
-                    (gr < uK && gc+2 < uN) ? B_batch[gr*uN + gc+2] : half(0),
-                    (gr < uK && gc+3 < uN) ? B_batch[gr*uN + gc+3] : half(0)
-                );
+                for (uint d = 0; d < 8; d++) {
+                    Bs[0][r * BN + c + d] = (gr < uK && gc + d < uN)
+                        ? B_batch[gr * uN + gc + d] : half(0);
+                }
             }
-            *((threadgroup half4*)(&Bs[0][r * BN + c])) = val;
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -328,43 +328,43 @@ kernel void gemm_tiled_f16(
         uint next_kb = (tile + 1) * BK;
 
         if (tile + 1 < n_tiles) {
-            for (uint idx = tid_in_group; idx < (BM * BK) / 4; idx += N_THREADS) {
-                uint flat = idx * 4;
+            // wide_load: 2×half4 per iteration (8 elements)
+            for (uint idx = tid_in_group; idx < (BM * BK) / 8; idx += N_THREADS) {
+                uint flat = idx * 8;
                 uint r = flat / BK;
                 uint c = flat % BK;
                 uint gr = row_start + r;
                 uint gc = next_kb + c;
-                half4 val;
-                if (gr < uM && gc + 3 < uK) {
-                    val = *((device const half4*)(&A_batch[gr * uK + gc]));
+                if (gr < uM && gc + 7 < uK) {
+                    *((threadgroup half4*)(&As[next_stage][r * BK + c])) =
+                        *((device const half4*)(&A_batch[gr * uK + gc]));
+                    *((threadgroup half4*)(&As[next_stage][r * BK + c + 4])) =
+                        *((device const half4*)(&A_batch[gr * uK + gc + 4]));
                 } else {
-                    val = half4(
-                        (gr < uM && gc+0 < uK) ? A_batch[gr*uK + gc+0] : half(0),
-                        (gr < uM && gc+1 < uK) ? A_batch[gr*uK + gc+1] : half(0),
-                        (gr < uM && gc+2 < uK) ? A_batch[gr*uK + gc+2] : half(0),
-                        (gr < uM && gc+3 < uK) ? A_batch[gr*uK + gc+3] : half(0)
-                    );
+                    for (uint d = 0; d < 8; d++) {
+                        As[next_stage][r * BK + c + d] = (gr < uM && gc + d < uK)
+                            ? A_batch[gr * uK + gc + d] : half(0);
+                    }
                 }
-                *((threadgroup half4*)(&As[next_stage][r * BK + c])) = val;
             }
-            for (uint idx = tid_in_group; idx < (BK * BN) / 4; idx += N_THREADS) {
-                uint flat = idx * 4;
+            // wide_load: 2×half4 per iteration (8 elements)
+            for (uint idx = tid_in_group; idx < (BK * BN) / 8; idx += N_THREADS) {
+                uint flat = idx * 8;
                 uint r = flat / BN;
                 uint c = flat % BN;
                 uint gr = next_kb + r;
                 uint gc = col_start + c;
-                half4 val;
-                if (gr < uK && gc + 3 < uN) {
-                    val = *((device const half4*)(&B_batch[gr * uN + gc]));
+                if (gr < uK && gc + 7 < uN) {
+                    *((threadgroup half4*)(&Bs[next_stage][r * BN + c])) =
+                        *((device const half4*)(&B_batch[gr * uN + gc]));
+                    *((threadgroup half4*)(&Bs[next_stage][r * BN + c + 4])) =
+                        *((device const half4*)(&B_batch[gr * uN + gc + 4]));
                 } else {
-                    val = half4(
-                        (gr < uK && gc+0 < uN) ? B_batch[gr*uN + gc+0] : half(0),
-                        (gr < uK && gc+1 < uN) ? B_batch[gr*uN + gc+1] : half(0),
-                        (gr < uK && gc+2 < uN) ? B_batch[gr*uN + gc+2] : half(0),
-                        (gr < uK && gc+3 < uN) ? B_batch[gr*uN + gc+3] : half(0)
-                    );
+                    for (uint d = 0; d < 8; d++) {
+                        Bs[next_stage][r * BN + c + d] = (gr < uK && gc + d < uN)
+                            ? B_batch[gr * uN + gc + d] : half(0);
+                    }
                 }
-                *((threadgroup half4*)(&Bs[next_stage][r * BN + c])) = val;
             }
         }
 
