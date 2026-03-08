@@ -6,7 +6,7 @@ use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::{KernelError, KernelRegistry};
 use rmlx_core::ops;
-use rmlx_metal::exec_graph::{EventToken, ExecGraph};
+use rmlx_metal::exec_graph::ExecGraph;
 
 use crate::linear::{Linear, LinearConfig};
 
@@ -2409,7 +2409,7 @@ impl Attention {
     /// - CB3: SDPA
     /// - CB4: head concat (interleave) + O_proj
     ///
-    /// Returns `(output_array, EventToken)`.
+    /// Returns the output array.
     #[allow(clippy::too_many_arguments)]
     pub fn forward_graph(
         &self,
@@ -2420,7 +2420,7 @@ impl Attention {
         mut cache: Option<&mut LayerKvCache>,
         registry: &KernelRegistry,
         graph: &mut ExecGraph<'_, '_>,
-    ) -> Result<(Array, EventToken), KernelError> {
+    ) -> Result<Array, KernelError> {
         let seq_len = x.shape()[0];
         let num_heads = self.config.num_heads;
         let num_kv_heads = self.config.num_kv_heads;
@@ -2431,10 +2431,10 @@ impl Attention {
         let q = self.q_proj.forward_into_cb(x, registry, cb1)?;
         let k = self.k_proj.forward_into_cb(x, registry, cb1)?;
         let v = self.v_proj.forward_into_cb(x, registry, cb1)?;
-        let t1 = graph.submit_batch();
+        let _t1 = graph.submit_batch();
 
         // ---- CB2: head split, contiguous copy, RoPE, cache append ----
-        graph.wait_for(t1);
+        // GPU FIFO ordering on a single queue guarantees CB1 completes first.
         let cb2 = graph.command_buffer();
 
         let dev = registry.device().raw();
@@ -2540,19 +2540,17 @@ impl Attention {
             None => (k_heads, v_heads),
         };
 
-        let t2 = graph.submit_batch();
+        let _t2 = graph.submit_batch();
 
         // ---- CB3: SDPA ----
-        graph.wait_for(t2);
         let cb3 = graph.command_buffer();
         let scale = 1.0 / (head_dim as f32).sqrt();
         let attn_outputs = ops::sdpa::sdpa_batched_into_cb(
             registry, &q_heads, &k_final, &v_final, mask, scale, cb3,
         )?;
-        let t3 = graph.submit_batch();
+        let _t3 = graph.submit_batch();
 
         // ---- CB4: head concat + O_proj ----
-        graph.wait_for(t3);
         let cb4 = graph.command_buffer();
 
         let hidden_size = num_heads * head_dim;
@@ -2591,8 +2589,8 @@ impl Attention {
                 enc.end_encoding();
             }
             let output = self.o_proj.forward_into_cb(&concat, registry, cb4)?;
-            let t4 = graph.submit_batch();
-            Ok((output, t4))
+            let _t4 = graph.submit_batch();
+            Ok(output)
         } else {
             // Prefill: pack into batch-major, then interleave
             let head_elems_graph = seq_len * head_dim;
@@ -2616,8 +2614,8 @@ impl Attention {
             let concat =
                 ops::rope::interleave_heads_into_cb(registry, &packed, num_heads, seq_len, cb4)?;
             let output = self.o_proj.forward_into_cb(&concat, registry, cb4)?;
-            let t4 = graph.submit_batch();
-            Ok((output, t4))
+            let _t4 = graph.submit_batch();
+            Ok(output)
         }
     }
 
@@ -2628,7 +2626,8 @@ impl Attention {
     /// - CB2: head split + RoPE + cache append
     /// - CB3: SDPA + head concat + O_proj
     ///
-    /// Returns `(output_array, EventToken)`.
+    /// Returns the output array. GPU-side event dependencies are managed
+    /// internally; callers rely on single-queue FIFO ordering between layers.
     #[allow(clippy::too_many_arguments)]
     pub fn forward_graph_fused(
         &self,
@@ -2641,7 +2640,7 @@ impl Attention {
         mut cache: Option<&mut LayerKvCache>,
         registry: &KernelRegistry,
         graph: &mut ExecGraph<'_, '_>,
-    ) -> Result<(Array, EventToken), KernelError> {
+    ) -> Result<Array, KernelError> {
         let seq_len = x.shape()[0];
         let num_heads = self.config.num_heads;
         let num_kv_heads = self.config.num_kv_heads;
@@ -2654,10 +2653,10 @@ impl Attention {
         let q = self.q_proj.forward_into_cb(&normed, registry, cb1)?;
         let k = self.k_proj.forward_into_cb(&normed, registry, cb1)?;
         let v = self.v_proj.forward_into_cb(&normed, registry, cb1)?;
-        let t1 = graph.submit_batch();
+        let _t1 = graph.submit_batch();
 
         // ---- CB2: head split + RoPE + cache append ----
-        graph.wait_for(t1);
+        // GPU FIFO ordering on a single queue guarantees CB1 completes first.
         let cb2 = graph.command_buffer();
 
         let dev = registry.device().raw();
@@ -2762,10 +2761,9 @@ impl Attention {
             None => (k_heads, v_heads),
         };
 
-        let t2 = graph.submit_batch();
+        let _t2 = graph.submit_batch();
 
         // ---- CB3: SDPA + head concat + O_proj ----
-        graph.wait_for(t2);
         let cb3 = graph.command_buffer();
         let scale = 1.0 / (head_dim as f32).sqrt();
         let attn_outputs = ops::sdpa::sdpa_batched_into_cb(
@@ -2805,8 +2803,8 @@ impl Attention {
                 enc.end_encoding();
             }
             let output = self.o_proj.forward_into_cb(&concat, registry, cb3)?;
-            let t3 = graph.submit_batch();
-            Ok((output, t3))
+            let _t3 = graph.submit_batch();
+            Ok(output)
         } else {
             let head_elems_c = seq_len * head_dim;
             let packed = Array::zeros(dev, &[num_heads * seq_len, head_dim], q.dtype());
@@ -2829,8 +2827,8 @@ impl Attention {
             let concat =
                 ops::rope::interleave_heads_into_cb(registry, &packed, num_heads, seq_len, cb3)?;
             let output = self.o_proj.forward_into_cb(&concat, registry, cb3)?;
-            let t3 = graph.submit_batch();
-            Ok((output, t3))
+            let _t3 = graph.submit_batch();
+            Ok(output)
         }
     }
 
