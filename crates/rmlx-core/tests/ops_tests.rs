@@ -1562,15 +1562,18 @@ fn per_head_rope_reference(
 
     for h in 0..num_heads {
         let off = input.offset() + h * head_dim * elem_size;
-        let head_view = input.view(
-            vec![seq_len, head_dim],
-            vec![num_heads * head_dim, 1],
-            off,
-        );
+        let head_view = input.view(vec![seq_len, head_dim], vec![num_heads * head_dim, 1], off);
         let head_contig = ops::copy::copy(registry, &head_view, queue).expect("copy failed");
-        let roped =
-            ops::rope::rope(registry, &head_contig, cos_freqs, sin_freqs, offset, 1.0, queue)
-                .expect("rope failed");
+        let roped = ops::rope::rope(
+            registry,
+            &head_contig,
+            cos_freqs,
+            sin_freqs,
+            offset,
+            1.0,
+            queue,
+        )
+        .expect("rope failed");
         results.push(roped.to_vec_checked::<f32>());
     }
     results
@@ -1599,11 +1602,13 @@ fn test_rope_multihead_vs_per_head_f32() {
     let sin_f = Array::from_slice(dev, &sin_data, vec![max_seq, head_dim / 2]);
 
     // Reference: per-head RoPE
-    let reference = per_head_rope_reference(&registry, &input, &cos_f, &sin_f, num_heads, offset, &queue);
+    let reference =
+        per_head_rope_reference(&registry, &input, &cos_f, &sin_f, num_heads, offset, &queue);
 
     // Fused: rope_multihead
-    let fused = ops::rope::rope_multihead(&registry, &input, &cos_f, &sin_f, num_heads, offset, &queue)
-        .expect("rope_multihead failed");
+    let fused =
+        ops::rope::rope_multihead(&registry, &input, &cos_f, &sin_f, num_heads, offset, &queue)
+            .expect("rope_multihead failed");
     // Output is [num_heads * seq_len, head_dim]
     assert_eq!(fused.shape(), &[num_heads * seq_len, head_dim]);
 
@@ -1639,8 +1644,8 @@ fn test_rope_multihead_vs_per_head_f16() {
 
     // Create f32 input, then cast to f16
     let (input_f32, _) = make_interleaved(dev, seq_len, num_heads, head_dim, 77);
-    let input_f16 = ops::copy::copy_cast(&registry, &input_f32, DType::Float16, &queue)
-        .expect("cast to f16");
+    let input_f16 =
+        ops::copy::copy_cast(&registry, &input_f32, DType::Float16, &queue).expect("cast to f16");
 
     let max_seq = (offset as usize) + seq_len + 1;
     let (cos_data, sin_data) =
@@ -1653,22 +1658,21 @@ fn test_rope_multihead_vs_per_head_f16() {
     let mut ref_heads: Vec<Vec<f32>> = Vec::new();
     for h in 0..num_heads {
         let off = input_f16.offset() + h * head_dim * elem_size;
-        let head_view = input_f16.view(
-            vec![seq_len, head_dim],
-            vec![num_heads * head_dim, 1],
-            off,
-        );
+        let head_view = input_f16.view(vec![seq_len, head_dim], vec![num_heads * head_dim, 1], off);
         let head_contig = ops::copy::copy(&registry, &head_view, &queue).expect("copy");
         let roped = ops::rope::rope(&registry, &head_contig, &cos_f, &sin_f, offset, 1.0, &queue)
             .expect("rope");
         // Cast back to f32 for comparison
-        let roped_f32 = ops::copy::copy_cast(&registry, &roped, DType::Float32, &queue).expect("cast");
+        let roped_f32 =
+            ops::copy::copy_cast(&registry, &roped, DType::Float32, &queue).expect("cast");
         ref_heads.push(roped_f32.to_vec_checked::<f32>());
     }
 
     // Fused
-    let fused = ops::rope::rope_multihead(&registry, &input_f16, &cos_f, &sin_f, num_heads, offset, &queue)
-        .expect("rope_multihead f16");
+    let fused = ops::rope::rope_multihead(
+        &registry, &input_f16, &cos_f, &sin_f, num_heads, offset, &queue,
+    )
+    .expect("rope_multihead f16");
     let fused_f32 = ops::copy::copy_cast(&registry, &fused, DType::Float32, &queue).expect("cast");
     let fused_data: Vec<f32> = fused_f32.to_vec_checked();
     let head_elems = seq_len * head_dim;
@@ -1718,7 +1722,8 @@ fn test_deinterleave_interleave_roundtrip() {
                 assert!(
                     (deint_data[deint_idx] - original_data[orig_idx]).abs() < 1e-6,
                     "deinterleave h={h} s={s} d={d}: got {}, expected {}",
-                    deint_data[deint_idx], original_data[orig_idx]
+                    deint_data[deint_idx],
+                    original_data[orig_idx]
                 );
             }
         }
@@ -1732,15 +1737,13 @@ fn test_deinterleave_interleave_roundtrip() {
         .collect();
     let mut last_err = String::new();
     for attempt in 0..3 {
-        let batch_arr =
-            Array::from_slice(dev, &batch_data, vec![num_heads * seq_len, head_dim]);
+        let batch_arr = Array::from_slice(dev, &batch_data, vec![num_heads * seq_len, head_dim]);
         let interleaved =
             ops::rope::interleave_heads(&registry, &batch_arr, num_heads, seq_len, &queue)
                 .expect("interleave");
         // Use deinterleave (always reliable) to verify interleave output
-        let roundtrip =
-            ops::rope::deinterleave_heads(&registry, &interleaved, num_heads, &queue)
-                .expect("deinterleave roundtrip");
+        let roundtrip = ops::rope::deinterleave_heads(&registry, &interleaved, num_heads, &queue)
+            .expect("deinterleave roundtrip");
         let rt_data: Vec<f32> = roundtrip.to_vec_checked();
         let mut ok = true;
         for i in 0..batch_data.len() {
@@ -1781,17 +1784,15 @@ fn test_deinterleave_interleave_roundtrip_f16() {
         .collect();
     let mut last_err = String::new();
     for attempt in 0..3 {
-        let batch_f32 =
-            Array::from_slice(dev, &batch_data, vec![num_heads * seq_len, head_dim]);
+        let batch_f32 = Array::from_slice(dev, &batch_data, vec![num_heads * seq_len, head_dim]);
         let batch_f16 =
             ops::copy::copy_cast(&registry, &batch_f32, DType::Float16, &queue).expect("cast f16");
         let interleaved =
             ops::rope::interleave_heads(&registry, &batch_f16, num_heads, seq_len, &queue)
                 .expect("interleave f16");
         // Use deinterleave (always reliable) to verify interleave output
-        let roundtrip =
-            ops::rope::deinterleave_heads(&registry, &interleaved, num_heads, &queue)
-                .expect("deinterleave roundtrip f16");
+        let roundtrip = ops::rope::deinterleave_heads(&registry, &interleaved, num_heads, &queue)
+            .expect("deinterleave roundtrip f16");
         let rt_f32 =
             ops::copy::copy_cast(&registry, &roundtrip, DType::Float32, &queue).expect("cast back");
         let rt_data: Vec<f32> = rt_f32.to_vec_checked();
@@ -1838,13 +1839,13 @@ fn test_rope_multihead_gqa_configs() {
     for &(num_q, num_kv) in &configs {
         // Test Q heads
         let (q_input, _) = make_interleaved(dev, seq_len, num_q, head_dim, 100 + num_q as u32);
-        let q_fused = ops::rope::rope_multihead(
-            &registry, &q_input, &cos_f, &sin_f, num_q, offset, &queue,
-        )
-        .unwrap_or_else(|e| panic!("rope_multihead Q ({num_q}/{num_kv}): {e}"));
+        let q_fused =
+            ops::rope::rope_multihead(&registry, &q_input, &cos_f, &sin_f, num_q, offset, &queue)
+                .unwrap_or_else(|e| panic!("rope_multihead Q ({num_q}/{num_kv}): {e}"));
         assert_eq!(q_fused.shape(), &[num_q * seq_len, head_dim]);
 
-        let q_ref = per_head_rope_reference(&registry, &q_input, &cos_f, &sin_f, num_q, offset, &queue);
+        let q_ref =
+            per_head_rope_reference(&registry, &q_input, &cos_f, &sin_f, num_q, offset, &queue);
         let q_data: Vec<f32> = q_fused.to_vec_checked();
         let head_elems = seq_len * head_dim;
 
@@ -1861,13 +1862,13 @@ fn test_rope_multihead_gqa_configs() {
 
         // Test KV heads
         let (kv_input, _) = make_interleaved(dev, seq_len, num_kv, head_dim, 200 + num_kv as u32);
-        let kv_fused = ops::rope::rope_multihead(
-            &registry, &kv_input, &cos_f, &sin_f, num_kv, offset, &queue,
-        )
-        .unwrap_or_else(|e| panic!("rope_multihead KV ({num_q}/{num_kv}): {e}"));
+        let kv_fused =
+            ops::rope::rope_multihead(&registry, &kv_input, &cos_f, &sin_f, num_kv, offset, &queue)
+                .unwrap_or_else(|e| panic!("rope_multihead KV ({num_q}/{num_kv}): {e}"));
         assert_eq!(kv_fused.shape(), &[num_kv * seq_len, head_dim]);
 
-        let kv_ref = per_head_rope_reference(&registry, &kv_input, &cos_f, &sin_f, num_kv, offset, &queue);
+        let kv_ref =
+            per_head_rope_reference(&registry, &kv_input, &cos_f, &sin_f, num_kv, offset, &queue);
         let kv_data: Vec<f32> = kv_fused.to_vec_checked();
 
         for h in 0..num_kv {
@@ -1905,11 +1906,13 @@ fn test_rope_multihead_seq_len_1() {
     let sin_f = Array::from_slice(dev, &sin_data, vec![max_seq, head_dim / 2]);
 
     // Reference
-    let reference = per_head_rope_reference(&registry, &input, &cos_f, &sin_f, num_heads, offset, &queue);
+    let reference =
+        per_head_rope_reference(&registry, &input, &cos_f, &sin_f, num_heads, offset, &queue);
 
     // Fused
-    let fused = ops::rope::rope_multihead(&registry, &input, &cos_f, &sin_f, num_heads, offset, &queue)
-        .expect("rope_multihead seq=1");
+    let fused =
+        ops::rope::rope_multihead(&registry, &input, &cos_f, &sin_f, num_heads, offset, &queue)
+            .expect("rope_multihead seq=1");
     assert_eq!(fused.shape(), &[num_heads, head_dim]); // num_heads * 1 = num_heads
 
     let fused_data: Vec<f32> = fused.to_vec_checked();
@@ -1944,8 +1947,8 @@ fn test_deinterleave_correctness() {
     let data: Vec<f32> = (0..48).map(|i| i as f32).collect();
     let input = Array::from_slice(dev, &data, vec![seq_len, num_heads * head_dim]);
 
-    let result = ops::rope::deinterleave_heads(&registry, &input, num_heads, &queue)
-        .expect("deinterleave");
+    let result =
+        ops::rope::deinterleave_heads(&registry, &input, num_heads, &queue).expect("deinterleave");
     assert_eq!(result.shape(), &[num_heads * seq_len, head_dim]);
 
     let out: Vec<f32> = result.to_vec_checked();
@@ -1960,14 +1963,34 @@ fn test_deinterleave_correctness() {
 
     // head 1: columns [4..8]
     let h1_start = seq_len * head_dim; // 12
-    assert_eq!(&out[h1_start..h1_start + 4], &[4.0, 5.0, 6.0, 7.0], "head 1 seq 0");
-    assert_eq!(&out[h1_start + 4..h1_start + 8], &[20.0, 21.0, 22.0, 23.0], "head 1 seq 1");
+    assert_eq!(
+        &out[h1_start..h1_start + 4],
+        &[4.0, 5.0, 6.0, 7.0],
+        "head 1 seq 0"
+    );
+    assert_eq!(
+        &out[h1_start + 4..h1_start + 8],
+        &[20.0, 21.0, 22.0, 23.0],
+        "head 1 seq 1"
+    );
 
     // head 3: columns [12..16]
     let h3_start = 3 * seq_len * head_dim; // 36
-    assert_eq!(&out[h3_start..h3_start + 4], &[12.0, 13.0, 14.0, 15.0], "head 3 seq 0");
-    assert_eq!(&out[h3_start + 4..h3_start + 8], &[28.0, 29.0, 30.0, 31.0], "head 3 seq 1");
-    assert_eq!(&out[h3_start + 8..h3_start + 12], &[44.0, 45.0, 46.0, 47.0], "head 3 seq 2");
+    assert_eq!(
+        &out[h3_start..h3_start + 4],
+        &[12.0, 13.0, 14.0, 15.0],
+        "head 3 seq 0"
+    );
+    assert_eq!(
+        &out[h3_start + 4..h3_start + 8],
+        &[28.0, 29.0, 30.0, 31.0],
+        "head 3 seq 1"
+    );
+    assert_eq!(
+        &out[h3_start + 8..h3_start + 12],
+        &[44.0, 45.0, 46.0, 47.0],
+        "head 3 seq 2"
+    );
 }
 
 // ─── PR 0.7: GEMV dtype validation tests ───

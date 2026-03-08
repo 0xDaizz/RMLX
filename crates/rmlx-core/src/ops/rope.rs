@@ -1324,7 +1324,7 @@ pub fn rope_multihead(
     let dim_u32 = super::checked_u32(head_dim, "head_dim")?;
     let heads_u32 = super::checked_u32(num_heads, "num_heads")?;
     let trad_u32: u32 = 1; // traditional pairing
-    let fwd_u32: u32 = 1;  // forward
+    let fwd_u32: u32 = 1; // forward
 
     let cb = queue.new_command_buffer();
     let encoder = cb.new_compute_command_encoder();
@@ -1345,8 +1345,8 @@ pub fn rope_multihead(
     let tg_y = std::cmp::min(16, seq_len as u64).min(max_tg / tg_x);
     let tg = MTLSize::new(tg_x, tg_y, 1);
     let groups = MTLSize::new(
-        (half_dim as u64 + tg_x - 1) / tg_x,
-        (seq_len as u64 + tg_y - 1) / tg_y,
+        (half_dim as u64).div_ceil(tg_x),
+        (seq_len as u64).div_ceil(tg_y),
         num_heads as u64,
     );
     encoder.dispatch_thread_groups(groups, tg);
@@ -1405,8 +1405,8 @@ pub fn rope_multihead_into_cb(
     let tg_y = std::cmp::min(16, seq_len as u64).min(max_tg / tg_x);
     let tg = MTLSize::new(tg_x, tg_y, 1);
     let groups = MTLSize::new(
-        (half_dim as u64 + tg_x - 1) / tg_x,
-        (seq_len as u64 + tg_y - 1) / tg_y,
+        (half_dim as u64).div_ceil(tg_x),
+        (seq_len as u64).div_ceil(tg_y),
         num_heads as u64,
     );
     encoder.dispatch_thread_groups(groups, tg);
@@ -1456,8 +1456,8 @@ pub fn deinterleave_heads(
     let tg_y = std::cmp::min(4, seq_len as u64).min(max_tg / tg_x);
     let tg = MTLSize::new(tg_x, tg_y, 1);
     let groups = MTLSize::new(
-        (head_dim as u64 + tg_x - 1) / tg_x,
-        (seq_len as u64 + tg_y - 1) / tg_y,
+        (head_dim as u64).div_ceil(tg_x),
+        (seq_len as u64).div_ceil(tg_y),
         num_heads as u64,
     );
     encoder.dispatch_thread_groups(groups, tg);
@@ -1504,8 +1504,8 @@ pub fn deinterleave_heads_into_cb(
     let tg_y = std::cmp::min(4, seq_len as u64).min(max_tg / tg_x);
     let tg = MTLSize::new(tg_x, tg_y, 1);
     let groups = MTLSize::new(
-        (head_dim as u64 + tg_x - 1) / tg_x,
-        (seq_len as u64 + tg_y - 1) / tg_y,
+        (head_dim as u64).div_ceil(tg_x),
+        (seq_len as u64).div_ceil(tg_y),
         num_heads as u64,
     );
     encoder.dispatch_thread_groups(groups, tg);

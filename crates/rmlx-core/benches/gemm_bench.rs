@@ -113,6 +113,7 @@ fn rand_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
 // Benchmark runner
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn bench_gemm(
     registry: &KernelRegistry,
     queue: &metal::CommandQueue,
@@ -161,7 +162,10 @@ fn main() {
     let queue = device.new_command_queue();
 
     println!("=== GEMM Benchmark (f16) ===");
-    println!("Warmup: {} iters, Bench: {} iters", WARMUP_ITERS, BENCH_ITERS);
+    println!(
+        "Warmup: {} iters, Bench: {} iters",
+        WARMUP_ITERS, BENCH_ITERS
+    );
     println!();
 
     // --- [M, 4096] @ [4096, 4096] ---

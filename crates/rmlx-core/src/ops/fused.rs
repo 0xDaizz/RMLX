@@ -415,7 +415,6 @@ fn gemm_kernel_name_for_dims(dtype: DType, m: u32, n: u32) -> Result<&'static st
     }
 }
 
-
 /// Encode a single GEMM dispatch into a command buffer.
 ///
 /// C[M, N] = A[M, K] @ B[K, N]

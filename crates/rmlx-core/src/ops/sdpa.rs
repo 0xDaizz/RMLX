@@ -2249,10 +2249,7 @@ pub fn sdpa_prefill_gqa_slab_into_cb(
     // Grid: 1D, n_q_blocks * num_kv_heads threadgroups
     let total_tgs = (n_q_blocks * num_kv_heads) as u64;
     let tg_size = std::cmp::min(THREADS_PER_TG, pipeline.max_total_threads_per_threadgroup());
-    encoder.dispatch_thread_groups(
-        MTLSize::new(total_tgs, 1, 1),
-        MTLSize::new(tg_size, 1, 1),
-    );
+    encoder.dispatch_thread_groups(MTLSize::new(total_tgs, 1, 1), MTLSize::new(tg_size, 1, 1));
     encoder.end_encoding();
 
     Ok(out)
@@ -2830,8 +2827,7 @@ mod tests {
         queue: &metal::CommandQueue,
         arr: &Array,
     ) -> Vec<f32> {
-        let f32_arr =
-            crate::ops::copy::copy_cast(registry, arr, DType::Float32, queue).unwrap();
+        let f32_arr = crate::ops::copy::copy_cast(registry, arr, DType::Float32, queue).unwrap();
         f32_arr.to_vec_checked()
     }
 
@@ -2856,7 +2852,7 @@ mod tests {
         head_dim: usize,
         is_causal: bool,
     ) -> (Vec<f32>, Vec<f32>) {
-        let gqa_ratio = num_heads / num_kv_heads;
+        let _gqa_ratio = num_heads / num_kv_heads;
         let scale = 1.0 / (head_dim as f32).sqrt();
 
         // Generate data
@@ -2865,9 +2861,24 @@ mod tests {
         let v_data = pseudo_random(num_kv_heads * kv_len * head_dim, 256);
 
         // Create f16 slabs
-        let q_slab = make_f16_array(registry, queue, &q_data, vec![num_heads * seq_len * head_dim]);
-        let k_slab = make_f16_array(registry, queue, &k_data, vec![num_kv_heads * kv_len * head_dim]);
-        let v_slab = make_f16_array(registry, queue, &v_data, vec![num_kv_heads * kv_len * head_dim]);
+        let q_slab = make_f16_array(
+            registry,
+            queue,
+            &q_data,
+            vec![num_heads * seq_len * head_dim],
+        );
+        let k_slab = make_f16_array(
+            registry,
+            queue,
+            &k_data,
+            vec![num_kv_heads * kv_len * head_dim],
+        );
+        let v_slab = make_f16_array(
+            registry,
+            queue,
+            &v_data,
+            vec![num_kv_heads * kv_len * head_dim],
+        );
 
         // --- GQA prefill path ---
         let cb = queue.new_command_buffer();
@@ -2894,7 +2905,7 @@ mod tests {
 
         // --- Reference: per-head sdpa path ---
         // Split slabs into per-head arrays via views
-        let dev = registry.device().raw();
+        let _dev = registry.device().raw();
         let head_q_size = seq_len * head_dim;
         let head_kv_size = kv_len * head_dim;
         let elem_bytes = 2usize; // f16
@@ -2931,7 +2942,13 @@ mod tests {
     }
 
     fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
-        assert_eq!(a.len(), b.len(), "length mismatch: {} vs {}", a.len(), b.len());
+        assert_eq!(
+            a.len(),
+            b.len(),
+            "length mismatch: {} vs {}",
+            a.len(),
+            b.len()
+        );
         a.iter()
             .zip(b.iter())
             .map(|(x, y)| (x - y).abs())
@@ -2942,12 +2959,11 @@ mod tests {
     fn test_gqa_prefill_ratio4_seq64() {
         let (registry, queue) = setup_with_copy();
         let (gqa, reference) = run_gqa_vs_reference(
-            &registry, &queue,
-            32,   // num_heads
-            8,    // num_kv_heads (ratio=4)
-            64,   // seq_len
-            64,   // kv_len
-            128,  // head_dim
+            &registry, &queue, 32,  // num_heads
+            8,   // num_kv_heads (ratio=4)
+            64,  // seq_len
+            64,  // kv_len
+            128, // head_dim
             false,
         );
         let diff = max_abs_diff(&gqa, &reference);
@@ -2961,12 +2977,11 @@ mod tests {
     fn test_gqa_prefill_ratio1_seq64() {
         let (registry, queue) = setup_with_copy();
         let (gqa, reference) = run_gqa_vs_reference(
-            &registry, &queue,
-            8,    // num_heads
-            8,    // num_kv_heads (ratio=1, non-GQA)
-            64,   // seq_len
-            64,   // kv_len
-            128,  // head_dim
+            &registry, &queue, 8,   // num_heads
+            8,   // num_kv_heads (ratio=1, non-GQA)
+            64,  // seq_len
+            64,  // kv_len
+            128, // head_dim
             false,
         );
         let diff = max_abs_diff(&gqa, &reference);
@@ -2980,11 +2995,8 @@ mod tests {
     fn test_gqa_prefill_ratio4_seq33_unaligned() {
         let (registry, queue) = setup_with_copy();
         let (gqa, reference) = run_gqa_vs_reference(
-            &registry, &queue,
-            32, 8,
-            33,   // seq_len — not aligned to BR=16
-            33,
-            128, false,
+            &registry, &queue, 32, 8, 33, // seq_len — not aligned to BR=16
+            33, 128, false,
         );
         let diff = max_abs_diff(&gqa, &reference);
         assert!(
@@ -2996,13 +3008,7 @@ mod tests {
     #[test]
     fn test_gqa_prefill_ratio4_seq128() {
         let (registry, queue) = setup_with_copy();
-        let (gqa, reference) = run_gqa_vs_reference(
-            &registry, &queue,
-            32, 8,
-            128,
-            128,
-            128, false,
-        );
+        let (gqa, reference) = run_gqa_vs_reference(&registry, &queue, 32, 8, 128, 128, 128, false);
         let diff = max_abs_diff(&gqa, &reference);
         assert!(
             diff < 1e-2,
@@ -3014,11 +3020,8 @@ mod tests {
     fn test_gqa_prefill_ratio4_seq257_unaligned() {
         let (registry, queue) = setup_with_copy();
         let (gqa, reference) = run_gqa_vs_reference(
-            &registry, &queue,
-            32, 8,
-            257,  // seq_len — not aligned to BR=16 or BC=128
-            257,
-            128, false,
+            &registry, &queue, 32, 8, 257, // seq_len — not aligned to BR=16 or BC=128
+            257, 128, false,
         );
         let diff = max_abs_diff(&gqa, &reference);
         assert!(
@@ -3031,11 +3034,7 @@ mod tests {
     fn test_gqa_prefill_ratio4_causal() {
         let (registry, queue) = setup_with_copy();
         let (gqa, reference) = run_gqa_vs_reference(
-            &registry, &queue,
-            32, 8,
-            64, 64,
-            128,
-            true, // causal
+            &registry, &queue, 32, 8, 64, 64, 128, true, // causal
         );
         let diff = max_abs_diff(&gqa, &reference);
         assert!(

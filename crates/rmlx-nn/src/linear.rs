@@ -411,9 +411,7 @@ impl Linear {
                 "gemm_skinny_bf16"
             }
             (ops::matmul::TileVariant::Full, rmlx_core::dtype::DType::Float32) => "gemm_tiled_f32",
-            (ops::matmul::TileVariant::Full, rmlx_core::dtype::DType::Float16) => {
-                "gemm_tiled_f16"
-            }
+            (ops::matmul::TileVariant::Full, rmlx_core::dtype::DType::Float16) => "gemm_tiled_f16",
             (ops::matmul::TileVariant::Full, rmlx_core::dtype::DType::Bfloat16) => {
                 "gemm_tiled_bf16"
             }

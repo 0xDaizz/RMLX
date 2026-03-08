@@ -1769,16 +1769,19 @@ impl Attention {
 
         if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
             // Fused path: deinterleave + RoPE in single dispatch each
-            let q_batched = ops::rope::rope_multihead(
-                registry, &q, cos, sin, num_heads, rope_offset, queue,
-            )?;
+            let q_batched =
+                ops::rope::rope_multihead(registry, &q, cos, sin, num_heads, rope_offset, queue)?;
             let k_batched = ops::rope::rope_multihead(
-                registry, &k, cos, sin, num_kv_heads, rope_offset, queue,
+                registry,
+                &k,
+                cos,
+                sin,
+                num_kv_heads,
+                rope_offset,
+                queue,
             )?;
             // V doesn't need RoPE, just deinterleave
-            let v_batched = ops::rope::deinterleave_heads(
-                registry, &v, num_kv_heads, queue,
-            )?;
+            let v_batched = ops::rope::deinterleave_heads(registry, &v, num_kv_heads, queue)?;
 
             // Create per-head views into the batched outputs (zero-copy)
             let head_elems = seq_len * head_dim;
@@ -1811,15 +1814,9 @@ impl Attention {
                 .collect();
         } else {
             // No RoPE — just deinterleave
-            let q_batched = ops::rope::deinterleave_heads(
-                registry, &q, num_heads, queue,
-            )?;
-            let k_batched = ops::rope::deinterleave_heads(
-                registry, &k, num_kv_heads, queue,
-            )?;
-            let v_batched = ops::rope::deinterleave_heads(
-                registry, &v, num_kv_heads, queue,
-            )?;
+            let q_batched = ops::rope::deinterleave_heads(registry, &q, num_heads, queue)?;
+            let k_batched = ops::rope::deinterleave_heads(registry, &k, num_kv_heads, queue)?;
+            let v_batched = ops::rope::deinterleave_heads(registry, &v, num_kv_heads, queue)?;
 
             let head_elems = seq_len * head_dim;
             q_heads = (0..num_heads)
@@ -1982,9 +1979,7 @@ impl Attention {
             cb.wait_until_completed();
         }
         // Single interleave dispatch: [num_heads, seq_len, head_dim] → [seq_len, hidden_size]
-        let concat = ops::rope::interleave_heads(
-            registry, &packed, num_heads, seq_len, queue,
-        )?;
+        let concat = ops::rope::interleave_heads(registry, &packed, num_heads, seq_len, queue)?;
 
         // Output projection
         self.o_proj.forward(&concat, registry, queue)
@@ -2092,14 +2087,24 @@ impl Attention {
         let head_elems = seq_len * head_dim;
         if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
             let q_batched = ops::rope::rope_multihead_into_cb(
-                registry, &q, cos, sin, num_heads, rope_offset, cb2,
+                registry,
+                &q,
+                cos,
+                sin,
+                num_heads,
+                rope_offset,
+                cb2,
             )?;
             let k_batched = ops::rope::rope_multihead_into_cb(
-                registry, &k, cos, sin, num_kv_heads, rope_offset, cb2,
+                registry,
+                &k,
+                cos,
+                sin,
+                num_kv_heads,
+                rope_offset,
+                cb2,
             )?;
-            let v_batched = ops::rope::deinterleave_heads_into_cb(
-                registry, &v, num_kv_heads, cb2,
-            )?;
+            let v_batched = ops::rope::deinterleave_heads_into_cb(registry, &v, num_kv_heads, cb2)?;
 
             q_heads = (0..num_heads)
                 .map(|h| {
@@ -2129,15 +2134,9 @@ impl Attention {
                 })
                 .collect();
         } else {
-            let q_batched = ops::rope::deinterleave_heads_into_cb(
-                registry, &q, num_heads, cb2,
-            )?;
-            let k_batched = ops::rope::deinterleave_heads_into_cb(
-                registry, &k, num_kv_heads, cb2,
-            )?;
-            let v_batched = ops::rope::deinterleave_heads_into_cb(
-                registry, &v, num_kv_heads, cb2,
-            )?;
+            let q_batched = ops::rope::deinterleave_heads_into_cb(registry, &q, num_heads, cb2)?;
+            let k_batched = ops::rope::deinterleave_heads_into_cb(registry, &k, num_kv_heads, cb2)?;
+            let v_batched = ops::rope::deinterleave_heads_into_cb(registry, &v, num_kv_heads, cb2)?;
 
             q_heads = (0..num_heads)
                 .map(|h| {
@@ -2252,9 +2251,8 @@ impl Attention {
                 enc.dispatch_threads(grid, tg);
                 enc.end_encoding();
             }
-            let concat = ops::rope::interleave_heads_into_cb(
-                registry, &packed, num_heads, seq_len, cb4,
-            )?;
+            let concat =
+                ops::rope::interleave_heads_into_cb(registry, &packed, num_heads, seq_len, cb4)?;
             let output = self.o_proj.forward_into_cb(&concat, registry, cb4)?;
             let t4 = graph.submit_batch();
             Ok((output, t4))
@@ -2312,14 +2310,24 @@ impl Attention {
         let head_elems_fused = seq_len * head_dim;
         if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
             let q_batched = ops::rope::rope_multihead_into_cb(
-                registry, &q, cos, sin, num_heads, rope_offset, cb2,
+                registry,
+                &q,
+                cos,
+                sin,
+                num_heads,
+                rope_offset,
+                cb2,
             )?;
             let k_batched = ops::rope::rope_multihead_into_cb(
-                registry, &k, cos, sin, num_kv_heads, rope_offset, cb2,
+                registry,
+                &k,
+                cos,
+                sin,
+                num_kv_heads,
+                rope_offset,
+                cb2,
             )?;
-            let v_batched = ops::rope::deinterleave_heads_into_cb(
-                registry, &v, num_kv_heads, cb2,
-            )?;
+            let v_batched = ops::rope::deinterleave_heads_into_cb(registry, &v, num_kv_heads, cb2)?;
 
             q_heads = (0..num_heads)
                 .map(|h| {
@@ -2349,15 +2357,9 @@ impl Attention {
                 })
                 .collect();
         } else {
-            let q_batched = ops::rope::deinterleave_heads_into_cb(
-                registry, &q, num_heads, cb2,
-            )?;
-            let k_batched = ops::rope::deinterleave_heads_into_cb(
-                registry, &k, num_kv_heads, cb2,
-            )?;
-            let v_batched = ops::rope::deinterleave_heads_into_cb(
-                registry, &v, num_kv_heads, cb2,
-            )?;
+            let q_batched = ops::rope::deinterleave_heads_into_cb(registry, &q, num_heads, cb2)?;
+            let k_batched = ops::rope::deinterleave_heads_into_cb(registry, &k, num_kv_heads, cb2)?;
+            let v_batched = ops::rope::deinterleave_heads_into_cb(registry, &v, num_kv_heads, cb2)?;
 
             q_heads = (0..num_heads)
                 .map(|h| {
@@ -2462,9 +2464,8 @@ impl Attention {
                 enc.dispatch_threads(grid, tg);
                 enc.end_encoding();
             }
-            let concat = ops::rope::interleave_heads_into_cb(
-                registry, &packed, num_heads, seq_len, cb3,
-            )?;
+            let concat =
+                ops::rope::interleave_heads_into_cb(registry, &packed, num_heads, seq_len, cb3)?;
             let output = self.o_proj.forward_into_cb(&concat, registry, cb3)?;
             let t3 = graph.submit_batch();
             Ok((output, t3))
@@ -2702,24 +2703,28 @@ impl Attention {
 
         if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
             q_batched = ops::rope::rope_multihead_into_cb(
-                registry, &q, cos, sin, num_heads, rope_offset, cb,
+                registry,
+                &q,
+                cos,
+                sin,
+                num_heads,
+                rope_offset,
+                cb,
             )?;
             k_batched = ops::rope::rope_multihead_into_cb(
-                registry, &k, cos, sin, num_kv_heads, rope_offset, cb,
+                registry,
+                &k,
+                cos,
+                sin,
+                num_kv_heads,
+                rope_offset,
+                cb,
             )?;
-            v_batched = ops::rope::deinterleave_heads_into_cb(
-                registry, &v, num_kv_heads, cb,
-            )?;
+            v_batched = ops::rope::deinterleave_heads_into_cb(registry, &v, num_kv_heads, cb)?;
         } else {
-            q_batched = ops::rope::deinterleave_heads_into_cb(
-                registry, &q, num_heads, cb,
-            )?;
-            k_batched = ops::rope::deinterleave_heads_into_cb(
-                registry, &k, num_kv_heads, cb,
-            )?;
-            v_batched = ops::rope::deinterleave_heads_into_cb(
-                registry, &v, num_kv_heads, cb,
-            )?;
+            q_batched = ops::rope::deinterleave_heads_into_cb(registry, &q, num_heads, cb)?;
+            k_batched = ops::rope::deinterleave_heads_into_cb(registry, &k, num_kv_heads, cb)?;
+            v_batched = ops::rope::deinterleave_heads_into_cb(registry, &v, num_kv_heads, cb)?;
         }
 
         // Create per-head views for KV cache append (zero-copy into batched output)
@@ -2800,9 +2805,7 @@ impl Attention {
             // For seq_len=1, head-major == token-major: [1, hidden_size]
             packed.view(vec![1, hidden_size], vec![hidden_size, 1], packed.offset())
         } else {
-            ops::rope::interleave_heads_into_cb(
-                registry, &packed, num_heads, seq_len, cb,
-            )?
+            ops::rope::interleave_heads_into_cb(registry, &packed, num_heads, seq_len, cb)?
         };
 
         // O projection

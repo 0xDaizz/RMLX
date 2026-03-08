@@ -304,9 +304,8 @@ fn main() {
         .expect("prepare_weights_for_graph failed");
 
     // Precompute RoPE cos/sin tables: shape [MAX_SEQ_LEN, HEAD_DIM/2]
-    let (cos_vec, sin_vec) =
-        ops::rope::precompute_freqs(MAX_SEQ_LEN, HEAD_DIM, ROPE_THETA, 1.0)
-            .expect("precompute_freqs failed");
+    let (cos_vec, sin_vec) = ops::rope::precompute_freqs(MAX_SEQ_LEN, HEAD_DIM, ROPE_THETA, 1.0)
+        .expect("precompute_freqs failed");
     let cos_full = Array::from_slice(device, &cos_vec, vec![MAX_SEQ_LEN, HEAD_DIM / 2]);
     let sin_full = Array::from_slice(device, &sin_vec, vec![MAX_SEQ_LEN, HEAD_DIM / 2]);
 
@@ -317,12 +316,8 @@ fn main() {
         println!("\nseq_len={}:", seq_len);
 
         // Slice RoPE tables to [seq_len, HEAD_DIM/2] (view into precomputed table)
-        let cos_freqs = cos_full
-            .slice(0, 0, seq_len)
-            .expect("cos slice failed");
-        let sin_freqs = sin_full
-            .slice(0, 0, seq_len)
-            .expect("sin slice failed");
+        let cos_freqs = cos_full.slice(0, 0, seq_len).expect("cos slice failed");
+        let sin_freqs = sin_full.slice(0, 0, seq_len).expect("sin slice failed");
 
         // Build causal mask [seq_len, seq_len]
         let mask = build_causal_mask(device, seq_len);
@@ -333,7 +328,11 @@ fn main() {
         // ---- Benchmark 1: forward() baseline ----
         {
             let mut cache = LayerKvCache::preallocated(
-                device, NUM_KV_HEADS, HEAD_DIM, MAX_SEQ_LEN, DType::Float16,
+                device,
+                NUM_KV_HEADS,
+                HEAD_DIM,
+                MAX_SEQ_LEN,
+                DType::Float16,
             );
 
             // Warmup
@@ -374,7 +373,11 @@ fn main() {
 
             // ---- Benchmark 2: forward_prefill_single_cb() ----
             let mut cache_cb = LayerKvCache::preallocated(
-                device, NUM_KV_HEADS, HEAD_DIM, MAX_SEQ_LEN, DType::Float16,
+                device,
+                NUM_KV_HEADS,
+                HEAD_DIM,
+                MAX_SEQ_LEN,
+                DType::Float16,
             );
 
             // Warmup

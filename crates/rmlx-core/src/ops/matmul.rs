@@ -1472,7 +1472,7 @@ pub enum TileVariant {
 /// - M >= 33, N >= 33: full tile GEMM (BM=64, BN=64)
 pub fn select_tile_config(m: usize, n: usize, _k: usize) -> TileConfig {
     // Skinny GEMM for small M with large N
-    if m >= 5 && m <= 32 && n >= 33 {
+    if (5..=32).contains(&m) && n >= 33 {
         return TileConfig {
             bm: 32,
             bn: 128,
@@ -1962,7 +1962,7 @@ fn dispatch_tiled_gemm(
 
     // Thread count per threadgroup depends on variant
     let tg_threads = match tile.variant {
-        TileVariant::Small => (16 * 16) as u64,      // 256
+        TileVariant::Small => (16 * 16) as u64, // 256
         TileVariant::Medium | TileVariant::Simd => (32 * 32) as u64, // 1024
         TileVariant::Skinny | TileVariant::Full => 256_u64, // 8 simdgroups
     };
