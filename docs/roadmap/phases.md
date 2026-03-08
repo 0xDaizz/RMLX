@@ -1206,6 +1206,62 @@ Following Phase B's config sweep, optimize the GEMM kernel internals to further 
 
 ---
 
+## Phase D: GEMM Kernel Architecture — In Progress
+
+### Goal
+
+Close the remaining ~11.5% GEMM throughput gap vs MLX through kernel architecture changes (occupancy, store path, alignment specialization).
+
+### Sub-phases
+
+#### D1: HiPerf Kernel Activation — Failed
+
+Activated the existing `gemm_hiperf_f16` kernel (BK=16, 4 SG, 128 threads, double-buffered). Result: **-39% regression** (12.88T vs 21.21T). Root causes:
+
+1. **Scalar loads**: 2 bytes/transaction vs Full kernel's 16 bytes (2×half4) — 8x less efficient
+2. **2x K-iterations**: BK=16 doubles loop count and barrier overhead vs BK=32
+3. **2x store barriers**: acc[4][4] = 16 store rounds (32 barriers) vs Full's acc[4][2] = 8 rounds (16 barriers)
+
+3x occupancy gain could not compensate for these inefficiencies. The HiPerf kernel was unoptimized dead code. **Reverted.**
+
+#### D2: MLX-Architecture Kernel — In Progress
+
+Write a new kernel matching MLX's M3 legacy architecture: BK=16, 2 SG (WM=1, WN=2), 64 threads, single buffer, ReadVector-style wide loads (4×half4 = 16 elements/thread), direct register-to-device store (no scratch buffer), serpentine MMA ordering.
+
+- **Expected impact**: +15-25% (5-6 TG/core, 0 store barriers, wide loads)
+- **Effort**: High (new kernel design, benchmark in gemm_kernel_opt.rs first)
+
+#### D3: Function Constants for Alignment
+
+Use Metal function constants (`align_M`, `align_N`, `align_K`) instead of runtime branching for bounds checks. Compiler eliminates dead code at pipeline creation time.
+
+- **Expected impact**: +2-5% for aligned dimensions
+- **Effort**: Low-medium (JIT pipeline modification)
+
+#### D4: Store Path Batching (Full Kernel)
+
+Reduce store-phase barriers from 16 to 2 by batching all 8 accumulator tiles into a single scratch→device write pass.
+
+- **Expected impact**: +3-5%
+- **Effort**: Medium (superseded if D2 is adopted)
+
+#### D5: bf16 Kernel Barrier Fix
+
+Fix the bf16 kernel's per-fragment barrier explosion (24 extra barriers per K-loop iteration from bf16→f32 conversion). Move conversion to fragment load time.
+
+- **Expected impact**: +30-50% for bf16 path
+- **Effort**: Medium
+
+### Definition of Done (DoD)
+
+- [x] ~~D1: HiPerf kernel activation~~ — Failed (-39% regression), reverted
+- [ ] D2: MLX-arch kernel benchmarked, promoted to production if superior
+- [ ] D3: Function constants applied, aligned path verified branch-free
+- [ ] D4: Store barriers reduced (or superseded by D2)
+- [ ] D5: bf16 barrier count matches f16 kernel
+
+---
+
 ## 🧪 CI Required Test Matrix
 
 The CI pipeline applied across all phases:
