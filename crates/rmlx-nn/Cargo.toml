@@ -24,3 +24,15 @@ harness = false
 [[bench]]
 name = "prefill_bench"
 harness = false
+
+[[bench]]
+name = "distributed_bench"
+harness = false
+
+[[bench]]
+name = "ep_bench"
+harness = false
+
+[[bench]]
+name = "model_bench"
+harness = false

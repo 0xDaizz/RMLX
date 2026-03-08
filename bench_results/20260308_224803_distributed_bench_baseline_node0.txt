@@ -1,0 +1,62 @@
+warning: function `read_f32_strided` is never used
+  --> crates/rmlx-nn/src/parallel.rs:69:4
+   |
+69 | fn read_f32_strided(arr: &Array) -> Vec<f32> {
+   |    ^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `cpu_matmul_f32` is never used
+  --> crates/rmlx-nn/src/parallel.rs:99:4
+   |
+99 | fn cpu_matmul_f32(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+   |    ^^^^^^^^^^^^^^
+
+warning: `rmlx-nn` (lib) generated 2 warnings
+    Finished `bench` profile [optimized] target(s) in 0.02s
+     Running benches/distributed_bench.rs (target/release/deps/distributed_bench-f6f106b562cdc5a1)
+Device: Apple M3 Ultra (unified_memory=true)
+
+Config: Mixtral 8x7B-like single expert layer
+  hidden=4096, heads=32/8, head_dim=128, intermediate=14336, seq_len=1
+  dtype: float16, warmup=5, bench_iters=50
+
+=== Baseline sync: single-layer forward() — per-op dispatch (slow) ===
+  baseline_sync_forward                    mean= 60479.9us std= 1238.4us p50= 60663.4us p95= 62298.6us min= 57467.8us max= 62916.1us (n=50)
+
+=== Optimized: forward_single_cb() — all ops in one command buffer ===
+  optimized_single_cb                      mean= 16018.3us std=  328.7us p50= 16029.5us p95= 16282.8us min= 13887.4us max= 16473.3us (n=50)
+
+=== TP-sharded compute (half-size weights, single-CB, no allreduce) ===
+  Simulates rank 0 of TP=2: Q/K/V/gate/up halved, O/down halved.
+  sharded_single_cb (TP=2 rank0)           mean=  8120.9us std=  893.1us p50=  7943.4us p95=  9773.5us min=  6905.5us max= 10071.9us (n=50)
+
+=== Weight sharding overhead (Mixtral-like, TP=2) ===
+  shard_all_weights (7 matrices)           mean=     0.3us std=    0.0us p50=     0.3us p95=     0.4us min=     0.3us max=     0.5us (n=50)
+  Total weight params: 218103808 (416.0 MB f16)
+
+=== Simulated allreduce overhead (single-rank stub) ===
+  Per allreduce payload: 8192 bytes (8.0 KB)
+  2x allreduce_sum (stub, identity)        mean=     0.1us std=    0.0us p50=     0.1us p95=     0.1us min=     0.1us max=     0.2us (n=50)
+
+=== Parallel linear layer forward (single-rank stub, half-size weights) ===
+  Uses world_size=1 group with pre-sharded (half-size) weights.
+  ColumnParallel [4096->7168] (half)       mean=  8012.7us std=  421.0us p50=  7916.1us p95=  8745.9us min=  7131.7us max=  8920.8us (n=50)
+  RowParallel    [7168->4096] (half)       mean=  7902.9us std=  454.6us p50=  7782.5us p95=  8823.1us min=  7034.3us max=  8955.0us (n=50)
+
+========================================================================
+SUMMARY (f16)
+========================================================================
+  Distributed mode                             rank=0/1 (transport=false)
+  Baseline sync forward (per-op dispatch)       60479.9 us
+  Optimized single-CB forward (full weights)    16018.3 us
+    Sync / single-CB ratio                         3.78x
+  Sharded single-CB (TP=2, half weights)         8120.9 us
+  Compute saving from TP=2 (vs single-CB)        7897.5 us (49.3% reduction)
+  Weight sharding (7 matrices, one-time)            0.3 us
+  Allreduce stub (2x per layer)                     0.1 us
+
+  Estimated real TP layer time (TB5 RDMA):
+    sharded compute + 2x RDMA allreduce          8140.9 us
+    Estimated TP=2 speedup vs single-CB            1.97x
+

@@ -1,0 +1,19 @@
+warning: function `read_f32_strided` is never used
+  --> crates/rmlx-nn/src/parallel.rs:69:4
+   |
+69 | fn read_f32_strided(arr: &Array) -> Vec<f32> {
+   |    ^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `cpu_matmul_f32` is never used
+  --> crates/rmlx-nn/src/parallel.rs:99:4
+   |
+99 | fn cpu_matmul_f32(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+   |    ^^^^^^^^^^^^^^
+
+warning: `rmlx-nn` (lib) generated 2 warnings
+    Finished `bench` profile [optimized] target(s) in 0.02s
+     Running benches/distributed_bench.rs (target/release/deps/distributed_bench-f6f106b562cdc5a1)
+Device: Apple M3 Ultra (unified_memory=true)
+[distributed_bench] Initializing RDMA (world_size=2, rank=0)...

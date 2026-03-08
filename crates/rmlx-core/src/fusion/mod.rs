@@ -11,10 +11,14 @@
 //! - `MAX_FUSION_DEPTH`: 11 ops max in a single fused kernel
 //! - `MAX_FUSION_ARRAYS`: 24 distinct input/output arrays
 
+pub mod analyzer;
 pub mod codegen;
+pub mod compiler;
 pub mod graph;
 
+pub use analyzer::{partition, to_fusable, Segment};
 pub use codegen::FusionCodegen;
+pub use compiler::{compile_fused, dispatch_fused, dispatch_fused_into_cb};
 pub use graph::{FusableOp, FusionGraph};
 
 /// Maximum number of ops in a fused kernel.

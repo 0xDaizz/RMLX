@@ -489,3 +489,159 @@ Phase C targets the kernel-level performance gap identified in Phase B. While Ph
 Note: Phase C baseline (15.73T) differs from Phase B (21.54T) because the bench structural fix removed allocation overhead measurement, establishing a more accurate baseline. The +34.8% gain from wide_load reaches 21.21T from this corrected baseline.
 
 **Benchmarks**: `gemm_kernel_opt.rs`, `gemm_bench.rs`
+
+---
+
+## Phase D2: MLX-Architecture GEMM Kernel
+
+Phase D2 writes a new kernel matching MLX's M3 legacy architecture, closing the GEMM gap from -11.5% to -0.6%.
+
+### Kernel Design
+
+- **BK=16**, 2 simdgroups (WM=1, WN=2), 64 threads, single buffer
+- **4xhalf4 wide loads** (16 elements/thread via ReadVector pattern)
+- **Direct register-to-device store** (no scratch buffer, 0 store barriers)
+- **Serpentine MMA ordering** for improved data reuse
+- **TG memory ~4KB** enabling 7-8 threadgroups/core (vs old kernel 18KB = 1 TG/core)
+
+### Key Insight
+
+Occupancy was the dominant factor, not individual optimizations. The D2 kernel fits 7-8 TG/core vs 1 TG/core for the old kernel, hiding memory latency far more effectively.
+
+### Results
+
+| Config | TFLOPS | vs MLX |
+|--------|-------:|-------:|
+| MLX 0.30.7.dev | 23.97T | -- |
+| RMLX Phase D2 (gemm_mlx_f16) | 23.82T | -0.6% |
+| RMLX Phase C (wide_load) | 21.21T | -11.5% |
+
+### Function Constants (D3)
+
+Phase D3 adds `align_M` (function constant 200) and `align_N` (function constant 201) for compile-time bounds check elimination. Uses `get_pipeline_with_constants()`. Impact: +10% at M=256, 0% at large M.
+
+### bf16 Barrier Fix (D5)
+
+Phase D5 fixes the bf16 kernel's barrier explosion: bulk pre-conversion reduces barriers from 24 to 4 per tile.
+
+---
+
+## Phase F: Infrastructure Optimization
+
+### F-1: Dispatch Overhead
+
+Measured 176us/CB dispatch overhead (12.4% of layer time). This validates the investment in CB batching and fused kernels — dispatch overhead is significant but not dominant.
+
+### F-3: GatherMM MMA
+
+GatherMM upgraded from scalar multiplication to simdgroup MMA (simdgroup_float8x8), providing 4-12x improvement for MoE expert compute. This is critical for Mixtral (8 experts) and DeepSeek-V3 (256 experts).
+
+---
+
+## Phase G: Quantized Kernel Optimization
+
+### QMM MMA (G-1, G-3)
+
+Quantized matrix multiply upgraded to simdgroup MMA for both Q4 (G-1) and Q8 (G-3) with BM=32, BN=32, BK=32 tile size and dequant-in-loader pattern. CPU fallback path fully removed.
+
+### QMV qdot (G-2)
+
+Quantized matrix-vector product using MLX qdot pattern with mask multiplication and uchar4 vectorized loads.
+
+### MLX Comparison
+
+| Kernel | Phase G Gap | Phase J Gap | Root Cause / Fix |
+|--------|-----------|------------|------------------|
+| QMV (Q4, M=1) | 1.58x | **1.15x** | J-2: load_vector preprocessing + multi-row TG ported |
+| QMV (Q8, M=1) | 1.52x | **1.08x** | J-2: same optimization |
+| QMM (Q4, M=256) | 4.78x | **2.55x** | J-1/J-1b/J-6: 4SG/128-thread + vectorized dequant + Split-K |
+
+---
+
+## Phase H-2: GEMM + Residual Epilogue Fusion
+
+Fuses residual addition into the GEMM epilogue via Metal function constant 202 (`has_residual`). The residual buffer is passed as `[[buffer(10)]]`.
+
+| N Range | Improvement |
+|---------|------------|
+| Large N (>=4096) | 5-12% |
+| Small N (<4096) | 0-2% |
+
+Metal shader fixes discovered during this phase:
+- `using namespace metal::simdgroup;` is invalid
+- Function constants must be declared in all shader sources
+- Buffer 10 must be in kernel signature even when unused
+
+---
+
+## Phase J: Quantized Kernel Parity + Infrastructure
+
+### J-1/J-1b/J-6: QMM MMA Redesign + Split-K
+
+QMM Q4 redesigned with 4 simdgroups (128 threads), vectorized dequant, and Split-K path for low-M cases.
+
+| Config | Phase G | Phase J | Change |
+|--------|--------:|--------:|-------:|
+| Q4 M=256 K=4096 N=4096 | 3.09T | **5.34T** | +73% |
+| Q4 M=128 K=4096 N=4096 | -- | **4.59T** | -- |
+
+### J-2: QMV qdot Optimization
+
+QMV ported MLX's `qmv_fast_impl` pattern: load_vector preprocessing (divide by powers of 16), mask-only qdot, multi-row threadgroup (8 rows/TG via 2 simdgroups x 4 results/SG).
+
+| Config | Phase G | Phase J | vs MLX |
+|--------|--------:|--------:|-------:|
+| Q4 K=4096 N=14336 | 0.26T | **0.36T** (+37%) | 1.15x |
+| Q8 K=4096 N=14336 | 0.29T | **0.39T** (+36%) | 1.08x |
+
+### J-3: ExecGraph Inter-Layer Stall Removal
+
+Removed 32 inter-layer `wait_for` calls in `forward_graph()`. Metal's single-CommandQueue FIFO ordering guarantees correct execution order without explicit CPU-GPU synchronization between layers. Only one final `sync()` call remains.
+
+### J-5: RMSNorm+GEMM Fusion
+
+2-pass fusion for prefill (M>=5):
+1. **Pass 1**: Lightweight `compute_inv_rms` kernel computes `inv_rms[row] = rsqrt(mean(x^2) + eps)` per row
+2. **Pass 2**: GEMM kernel applies norm on-the-fly during A-tile loading via function constant 203 (`has_norm`)
+
+Buffers: `norm_weight [[buffer(11)]]`, `inv_rms [[buffer(12)]]`
+
+### Fused Kernel Microbenchmarks
+
+| Fusion | Saving |
+|--------|-------:|
+| fused_swiglu_down (silu_mul + down_proj) | -38.8% |
+| fused_rms_gemv QKV (rms_norm + QKV proj) | -40.5% |
+| fused_rms_gemv gate_up (rms_norm + gate_up) | -34.6% |
+
+### J-3: ExecGraph Inter-Layer Stall Removal
+
+Removed 32 inter-layer `wait_for` calls in `forward_graph()`. Metal's single-CommandQueue FIFO ordering guarantees correct execution order without explicit CPU-GPU synchronization between layers. Only one final `sync()` call remains. Result: 32 stalls -> 0.
+
+### J-4/J-4e: FusionCompiler + forward_auto()
+
+**FusionCompiler** (J-4) activates the lazy.rs DAG evaluation path:
+1. **FusionAnalyzer**: Partitions LazyGraph into Fused and Standalone segments
+2. **FusionCompiler**: Codegen -> Metal JIT compilation -> dispatch
+3. **EvalContext**: Manages evaluation state for fused subgraphs via `eval_fused()`
+
+**forward_auto()** (J-4e) integrates FusionCompiler into TransformerModel as an eager+lazy hybrid dispatch mode. The model automatically selects between:
+- **Eager path**: Direct `forward()` / `forward_graph()` for decode (M=1)
+- **Lazy path**: `eval_fused()` via FusionCompiler for prefill (M>1) where fusion opportunities exist
+
+### J-5: RMSNorm+GEMM Fusion
+
+2-pass fusion for prefill (M>=5) via function constant 203 (`has_norm`):
+1. **Pass 1**: Lightweight `compute_inv_rms` kernel computes `inv_rms[row] = rsqrt(mean(x^2) + eps)` per row
+2. **Pass 2**: GEMM kernel applies norm on-the-fly during A-tile loading
+
+Buffers: `norm_weight [[buffer(11)]]`, `inv_rms [[buffer(12)]]`
+
+| Fusion | Saving |
+|--------|-------:|
+| fused_rms_gemv QKV | -40.5% |
+| fused_rms_gemv gate_up | -34.6% |
+
+### J-8: MoE Fused Kernels
+
+Fused `index_gather` and `scatter_weighted_add` Metal kernels reduce MoE scatter synchronization from N x 3 sync points to 1.

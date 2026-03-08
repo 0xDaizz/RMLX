@@ -416,6 +416,166 @@ impl LazyArray {
         Ok(())
     }
 
+    /// Evaluate with fusion: partition the graph into fusable and standalone
+    /// segments, dispatch fused element-wise kernels via JIT codegen, and
+    /// run standalone ops through `standalone_fn`.
+    ///
+    /// When `ctx.exec_graph` is `Some`, fused kernels are encoded into the
+    /// ExecGraph's command buffers. Otherwise they dispatch standalone via
+    /// the queue.
+    ///
+    /// `standalone_fn` handles non-fusable ops (MatMul, Softmax, RoPE, etc.)
+    /// and receives the `EvalContext` for dispatch.
+    pub fn eval_fused<F>(
+        &self,
+        ctx: &mut EvalContext<'_, '_, '_>,
+        standalone_fn: &F,
+    ) -> Result<(), LazyEvalError>
+    where
+        F: Fn(&LazyOp, Vec<&Array>, &mut EvalContext<'_, '_, '_>) -> Result<Array, LazyEvalError>,
+    {
+        let order = self.topo_sort()?;
+        let mut nodes = self.graph.inner.lock().unwrap();
+
+        // Build topo_ops list (only non-materialized nodes)
+        let topo_ops: Vec<(NodeId, LazyOp)> = order
+            .iter()
+            .filter_map(|nid| {
+                if nodes[nid.0].value.is_some() {
+                    None
+                } else {
+                    nodes[nid.0].op.clone().map(|op| (*nid, op))
+                }
+            })
+            .collect();
+
+        if topo_ops.is_empty() {
+            return Ok(());
+        }
+
+        // Build consumer map for partition
+        let num_nodes = nodes.len();
+        let mut consumers = vec![Vec::new(); num_nodes];
+        for (nid, op) in &topo_ops {
+            for inp in op.inputs() {
+                if inp.0 < num_nodes {
+                    consumers[inp.0].push(*nid);
+                }
+            }
+        }
+
+        // Partition into segments
+        let segments = crate::fusion::analyzer::partition(&topo_ops, &consumers, num_nodes);
+
+        // Execute each segment
+        for segment in &segments {
+            match segment {
+                crate::fusion::Segment::Fused {
+                    graph: fusion_graph,
+                    nodes: seg_nodes,
+                    input_nodes,
+                    ..
+                } => {
+                    // Try JIT fusion if codegen is available
+                    if let Some(codegen) = ctx.codegen {
+                        // Gather input arrays
+                        let input_arrays: Vec<&Array> = input_nodes
+                            .iter()
+                            .map(|inp| {
+                                nodes[inp.0]
+                                    .value
+                                    .as_ref()
+                                    .expect("fusion input must be materialized")
+                            })
+                            .collect();
+
+                        let outputs = if let Some(ref mut exec_graph) = ctx.exec_graph {
+                            // J-4d: Dispatch into ExecGraph CB
+                            let cb = exec_graph.command_buffer();
+                            crate::fusion::dispatch_fused_into_cb(
+                                fusion_graph,
+                                codegen,
+                                ctx.registry,
+                                &input_arrays,
+                                cb,
+                            )
+                            .map_err(|e| {
+                                LazyEvalError::EvalFailed(format!("fused dispatch: {e}"))
+                            })?
+                        } else {
+                            // Standalone dispatch via queue
+                            crate::fusion::dispatch_fused(
+                                fusion_graph,
+                                codegen,
+                                ctx.registry,
+                                &input_arrays,
+                                ctx.queue,
+                            )
+                            .map_err(|e| {
+                                LazyEvalError::EvalFailed(format!("fused dispatch: {e}"))
+                            })?
+                        };
+
+                        // Store output in the last node of the segment
+                        if let Some(output) = outputs.into_iter().next() {
+                            let last_node = seg_nodes.last().unwrap();
+                            nodes[last_node.0].value = Some(output);
+                        }
+                    } else {
+                        // No codegen: fall back to per-op eval
+                        for (nid, op) in &topo_ops {
+                            if !seg_nodes.contains(nid) {
+                                continue;
+                            }
+                            if nodes[nid.0].value.is_some() {
+                                continue;
+                            }
+                            let op = op.clone();
+                            let input_ids = op.inputs();
+                            let input_ptrs: Vec<*const Array> = input_ids
+                                .iter()
+                                .map(|id| {
+                                    nodes[id.0]
+                                        .value
+                                        .as_ref()
+                                        .ok_or(LazyEvalError::UnmaterializedInput(*id))
+                                        .map(|a| a as *const Array)
+                                })
+                                .collect::<Result<Vec<_>, _>>()?;
+                            let input_refs: Vec<&Array> =
+                                input_ptrs.iter().map(|p| unsafe { &**p }).collect();
+                            let result = standalone_fn(&op, input_refs, ctx)?;
+                            nodes[nid.0].value = Some(result);
+                        }
+                    }
+                }
+                crate::fusion::Segment::Standalone { node, op } => {
+                    if nodes[node.0].value.is_some() {
+                        continue;
+                    }
+                    let input_ids = op.inputs();
+                    let input_ptrs: Vec<*const Array> = input_ids
+                        .iter()
+                        .map(|id| {
+                            nodes[id.0]
+                                .value
+                                .as_ref()
+                                .ok_or(LazyEvalError::UnmaterializedInput(*id))
+                                .map(|a| a as *const Array)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    // SAFETY: Same reasoning as in eval() — inputs are disjoint from node.
+                    let input_refs: Vec<&Array> =
+                        input_ptrs.iter().map(|p| unsafe { &**p }).collect();
+                    let result = standalone_fn(op, input_refs, ctx)?;
+                    nodes[node.0].value = Some(result);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Extract the materialized array after evaluation.
     ///
     /// Returns `None` if the node has not been evaluated yet.
@@ -557,6 +717,87 @@ impl fmt::Display for LazyEvalError {
 }
 
 impl std::error::Error for LazyEvalError {}
+
+// ---------------------------------------------------------------------------
+// EvalContext — execution context for lazy graph evaluation
+// ---------------------------------------------------------------------------
+
+/// Execution context for materializing a lazy compute graph.
+///
+/// Bundles all the Metal resources needed to dispatch kernels during
+/// lazy evaluation. This decouples the lazy graph infrastructure from
+/// concrete kernel dispatch, allowing `LazyArray::eval` callers to
+/// pass a context instead of individual resource references.
+///
+/// # Lifetime parameters
+///
+/// - `'q`: lifetime of the `CommandQueue`
+/// - `'e`: lifetime of the `GpuEvent` (used by ExecGraph)
+/// - `'r`: lifetime of the `KernelRegistry`
+pub struct EvalContext<'q, 'e, 'r> {
+    /// Metal device reference.
+    pub device: &'q metal::Device,
+    /// Kernel registry for pipeline state lookups.
+    pub registry: &'r crate::kernels::KernelRegistry,
+    /// Command queue for dispatch.
+    pub queue: &'q metal::CommandQueue,
+    /// Optional ExecGraph for batched GPU-side execution.
+    /// When `Some`, ops should encode into the graph's command buffers
+    /// instead of creating standalone CBs. When `None`, ops use
+    /// synchronous dispatch via the queue directly.
+    pub exec_graph: Option<&'e mut rmlx_metal::exec_graph::ExecGraph<'q, 'e>>,
+    /// Optional FusionCodegen for JIT element-wise kernel fusion.
+    pub codegen: Option<&'r crate::fusion::FusionCodegen>,
+}
+
+impl<'q, 'e, 'r> EvalContext<'q, 'e, 'r> {
+    /// Create a minimal context without ExecGraph or fusion.
+    pub fn new(
+        device: &'q metal::Device,
+        registry: &'r crate::kernels::KernelRegistry,
+        queue: &'q metal::CommandQueue,
+    ) -> Self {
+        Self {
+            device,
+            registry,
+            queue,
+            exec_graph: None,
+            codegen: None,
+        }
+    }
+
+    /// Create a context with ExecGraph for batched execution.
+    pub fn with_exec_graph(
+        device: &'q metal::Device,
+        registry: &'r crate::kernels::KernelRegistry,
+        queue: &'q metal::CommandQueue,
+        graph: &'e mut rmlx_metal::exec_graph::ExecGraph<'q, 'e>,
+    ) -> Self {
+        Self {
+            device,
+            registry,
+            queue,
+            exec_graph: Some(graph),
+            codegen: None,
+        }
+    }
+
+    /// Attach a FusionCodegen for JIT kernel fusion.
+    pub fn with_codegen(mut self, codegen: &'r crate::fusion::FusionCodegen) -> Self {
+        self.codegen = Some(codegen);
+        self
+    }
+
+    /// Whether an ExecGraph is available for batched dispatch.
+    pub fn has_exec_graph(&self) -> bool {
+        self.exec_graph.is_some()
+    }
+
+    /// Whether JIT fusion is available.
+    pub fn has_codegen(&self) -> bool {
+        self.codegen.is_some()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // BFS width-limited topological sort

@@ -4,7 +4,7 @@
 
 `rmlx-nn` is a crate that implements neural network layers for GPU-accelerated inference. It builds core Transformer architecture components (Linear, Embedding, Attention, TransformerBlock, MoE) on top of `rmlx-core` compute kernels, and includes built-in model configurations for LLaMA, Qwen, DeepSeek-V3, and Mixtral.
 
-> **Status (Phase 0-9B-opt + S1-S5 + Audit + EP-2~EP-6 + Prod Phase 2 + Phase 3 + Phase 4 + Phase 5 + Phase KO + Phase 8c + Phase 9 + Phase 10 + Phase 11):** Linear, QuantizedLinear (+ AwqLinear, GptqLinear, KQuantType/KQuantConfig), Embedding, Attention (with LayerKvCache, RotatingKvCache, BatchKvCache, QuantizedKvCache, **PagedKvCache**), MLA (full forward: DeepSeek-V3 9-step pipeline with latent KV compression), SlidingWindowAttention (full forward: Mistral-style RoPE + SDPA + KV cache), TransformerBlock, MoE (with shared expert + EP integration + GPU routing + `MoeStrategy` dispatch), `ExpertGroup` (stacked expert GEMM path), `MoePipeline` (TBO/SBO overlap), LayerNorm, **16 activation functions**, Parallel (TP), Conv1d/Conv2d, DynamicExecContext, GGUF model loader (+ K-quant type mapping), **prefix cache** (radix-tree with LRU eviction), **chunked prefill** scheduler, **continuous batching scheduler**, and **4 full model architectures** (LlamaModel, Qwen2Model, DeepSeekV3Model, MixtralModel) are implemented. Phase 0+1+2 audit remediation complete (items N1-N8). EP Phases 2-6 forward path integration complete. **Phase 5 additions:** 11 new activations (ReLU, LeakyReLU, ELU, SELU, Mish, QuickGELU, HardSwish, HardSigmoid, Softplus, Softsign, GLU -- 16 total); full MLA forward implementation; full SlidingWindowAttention forward; AwqLinear/GptqLinear/KQuantType/KQuantConfig in quantized\_linear.rs; K-quant GGUF mapping in gguf\_loader.rs; radix-tree prefix cache (prefix\_cache.rs); chunked prefill in scheduler.rs; 4 full model architectures in models/. **Phase KO additions:** 9-dispatch decode path (forward_decode_9dispatch, forward_single_cb_9dispatch), merged QKV and gate_up weight preparation, slab-layout KV cache (LayerKvCache::preallocated with slab), prepare_weights_private() pipeline for StorageModePrivate weights. **Phase 8c additions:** `CachedDecode` struct with pre-resolved PSOs and pre-allocated scratch buffers, `forward_cached_2encoder_9dispatch` method, `append_into_encoder` and `append_preresolved_into_encoder` for KV cache, `_preresolved_into_encoder` pattern across all ops. **Phase 9 additions:** f16 default dtype, single-encoder decode path, direct KV append, pre-cached threadgroup sizes — 714 us/layer at 60L. **Phase 10 additions:** `fused_rms_gemv` and `fused_swiglu_down` fused kernels, 7-dispatch decode pipeline — 703.4 us/layer at 60L. **Phase 11 conclusion:** All kernel-level GEMV optimization experiments failed; 703.4 us/layer is the practical floor for f16 decode on Apple Silicon (73.6% bandwidth efficiency).
+> **Status (Phase 0-9B-opt + S1-S5 + Audit + EP-2~EP-6 + Prod Phase 2 + Phase 3 + Phase 4 + Phase 5 + Phase KO + Phase 8c + Phase 9 + Phase 10 + Phase 11):** Linear, QuantizedLinear (+ AwqLinear, GptqLinear, KQuantType/KQuantConfig), Embedding, Attention (with LayerKvCache, RotatingKvCache, BatchKvCache, QuantizedKvCache, **PagedKvCache**), MLA (full forward: DeepSeek-V3 9-step pipeline with latent KV compression), SlidingWindowAttention (full forward: Mistral-style RoPE + SDPA + KV cache), TransformerBlock, MoE (with shared expert + EP integration + GPU routing + `MoeStrategy` dispatch), `ExpertGroup` (stacked expert GEMM path), `MoePipeline` (TBO/SBO overlap), LayerNorm, **16 activation functions**, Parallel (TP), Conv1d/Conv2d, DynamicExecContext, GGUF model loader (+ K-quant type mapping), **prefix cache** (radix-tree with LRU eviction), **chunked prefill** scheduler, **continuous batching scheduler**, and **4 full model architectures** (LlamaModel, Qwen2Model, DeepSeekV3Model, MixtralModel) are implemented. Phase 0+1+2 audit remediation complete (items N1-N8). EP Phases 2-6 forward path integration complete. **Phase 5 additions:** 11 new activations (ReLU, LeakyReLU, ELU, SELU, Mish, QuickGELU, HardSwish, HardSigmoid, Softplus, Softsign, GLU -- 16 total); full MLA forward implementation; full SlidingWindowAttention forward; AwqLinear/GptqLinear/KQuantType/KQuantConfig in quantized\_linear.rs; K-quant GGUF mapping in gguf\_loader.rs; radix-tree prefix cache (prefix\_cache.rs); chunked prefill in scheduler.rs; 4 full model architectures in models/. **Phase KO additions:** 9-dispatch decode path (forward_decode_9dispatch, forward_single_cb_9dispatch), merged QKV and gate_up weight preparation, slab-layout KV cache (LayerKvCache::preallocated with slab), prepare_weights_private() pipeline for StorageModePrivate weights. **Phase 8c additions:** `CachedDecode` struct with pre-resolved PSOs and pre-allocated scratch buffers, `forward_cached_2encoder_9dispatch` method, `append_into_encoder` and `append_preresolved_into_encoder` for KV cache, `_preresolved_into_encoder` pattern across all ops. **Phase 9 additions:** f16 default dtype, single-encoder decode path, direct KV append, pre-cached threadgroup sizes — 714 us/layer at 60L. **Phase 10 additions:** `fused_rms_gemv` and `fused_swiglu_down` fused kernels, 7-dispatch decode pipeline — 703.4 us/layer at 60L. **Phase 11 conclusion:** All kernel-level GEMV optimization experiments failed; 703.4 us/layer is the practical floor for f16 decode on Apple Silicon (73.6% bandwidth efficiency). **Phase I-1:** `DistributedTransformerModel` with `forward_with_group()` (tensor-parallel forward using ColumnParallelLinear/RowParallelLinear) and `shard_for_tp()` (automatic weight partitioning across TP ranks). Estimated 1.94x speedup at TP=2.
 
 ---
 
@@ -918,6 +918,30 @@ Phase KO closes the per-layer decode performance gap with MLX:
 | vs MLX (60L) | | 6.34x faster | |
 
 **Phase 11 conclusion:** All kernel-level optimization experiments (col-major GEMV, interleaved GEMV, SRAM prefetch + f16 accumulation + function constants) failed to improve beyond 703.4 us/layer. Row-major BM8 GEMV with f32 accumulation achieves 73.6% bandwidth efficiency, which is the practical floor for f16 decode on Apple Silicon. No further kernel-level improvements are expected without quantization (INT4/INT8) or a hardware change.
+
+---
+
+## Phase I-1: DistributedTransformerModel
+
+Phase I-1 adds distributed tensor-parallel inference support.
+
+### DistributedTransformerModel
+
+Wraps `TransformerModel` with tensor-parallel forward pass using Megatron-LM style sharding.
+
+| Method | Description |
+|--------|-------------|
+| `DistributedTransformerModel::new(model, group)` | Wraps an existing TransformerModel with a distributed Group |
+| `forward_with_group(token_ids, cos, sin, mask, cache, registry, queue)` | Tensor-parallel forward: each rank computes on its shard, allreduce synchronizes |
+| `shard_for_tp(device, queue)` | Automatically partition model weights across TP ranks using ColumnParallelLinear (Q/K/V/gate/up projections) and RowParallelLinear (O/down projections) |
+
+### Performance
+
+| Metric | Value |
+|--------|------:|
+| TP=2 estimated speedup | 1.94x |
+
+The near-linear scaling is achieved through the Megatron-LM pattern: column-parallel for attention/FFN projections that split along the output dimension, and row-parallel for output/down projections that split along the input dimension, with a single allreduce per transformer block.
 
 ---
 

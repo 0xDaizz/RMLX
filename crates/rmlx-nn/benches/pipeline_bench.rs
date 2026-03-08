@@ -1495,16 +1495,12 @@ fn main() {
         let event = GpuEvent::new(device);
         let mut graph = ExecGraph::new(&queue, &event, 32);
         let mut x = rand_array(device, &[SEQ_LEN, HIDDEN_SIZE], 200);
-        let mut prev_token = None;
         for (layer, cache) in blocks_30.iter().zip(caches_30.iter_mut()) {
-            if let Some(token) = prev_token {
-                graph.wait_for(token);
-            }
             let cb = graph.command_buffer();
             x = layer
                 .forward_single_cb_9dispatch(&x, None, None, None, cache, &registry, cb)
                 .expect("execgraph warmup failed");
-            prev_token = Some(graph.submit_batch());
+            let _t = graph.submit_batch();
         }
         graph.sync().expect("execgraph warmup sync failed");
     }
@@ -1522,16 +1518,12 @@ fn main() {
         let mut graph = ExecGraph::new(&queue, &event, 32);
         let start = Instant::now();
         let mut x = rand_array(device, &[SEQ_LEN, HIDDEN_SIZE], 200);
-        let mut prev_token = None;
         for (layer, cache) in blocks_30.iter().zip(caches_30.iter_mut()) {
-            if let Some(token) = prev_token {
-                graph.wait_for(token);
-            }
             let cb = graph.command_buffer();
             x = layer
                 .forward_single_cb_9dispatch(&x, None, None, None, cache, &registry, cb)
                 .expect("execgraph bench failed");
-            prev_token = Some(graph.submit_batch());
+            let _t = graph.submit_batch();
         }
         let _ = graph.sync().expect("execgraph sync failed");
         execgraph_30_latencies.push(start.elapsed());
@@ -1643,16 +1635,12 @@ fn main() {
         let event = GpuEvent::new(device);
         let mut graph = ExecGraph::new(&queue, &event, 32);
         let mut x = rand_array(device, &[SEQ_LEN, HIDDEN_SIZE], 200);
-        let mut prev_token = None;
         for (layer, cache) in blocks_60.iter().zip(caches_60.iter_mut()) {
-            if let Some(token) = prev_token {
-                graph.wait_for(token);
-            }
             let cb = graph.command_buffer();
             x = layer
                 .forward_single_cb_9dispatch(&x, None, None, None, cache, &registry, cb)
                 .expect("execgraph warmup failed");
-            prev_token = Some(graph.submit_batch());
+            let _t = graph.submit_batch();
         }
         graph.sync().expect("execgraph warmup sync failed");
     }
@@ -1670,16 +1658,12 @@ fn main() {
         let mut graph = ExecGraph::new(&queue, &event, 32);
         let start = Instant::now();
         let mut x = rand_array(device, &[SEQ_LEN, HIDDEN_SIZE], 200);
-        let mut prev_token = None;
         for (layer, cache) in blocks_60.iter().zip(caches_60.iter_mut()) {
-            if let Some(token) = prev_token {
-                graph.wait_for(token);
-            }
             let cb = graph.command_buffer();
             x = layer
                 .forward_single_cb_9dispatch(&x, None, None, None, cache, &registry, cb)
                 .expect("execgraph bench failed");
-            prev_token = Some(graph.submit_batch());
+            let _t = graph.submit_batch();
         }
         let _ = graph.sync().expect("execgraph sync failed");
         execgraph_60_latencies.push(start.elapsed());
