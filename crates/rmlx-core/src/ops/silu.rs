@@ -323,3 +323,41 @@ pub fn silu_gate(
 
     Ok(out)
 }
+
+// ---------------------------------------------------------------------------
+// Into-CB variant (encode into existing command buffer, no commit/wait)
+// ---------------------------------------------------------------------------
+
+/// Encode SiLU activation into an existing command buffer (no commit/wait).
+///
+/// **Caller must ensure `input` is contiguous.**
+pub fn silu_into_cb(
+    registry: &KernelRegistry,
+    input: &Array,
+    cb: &metal::CommandBufferRef,
+) -> Result<Array, KernelError> {
+    let (kernel_name, elems_per_thread) = silu_kernel_info(input.dtype(), false)?;
+    let pipeline = registry.get_pipeline(kernel_name, input.dtype())?;
+    let numel = input.numel();
+
+    let out = Array::uninit(registry.device().raw(), input.shape(), input.dtype());
+    let numel_u32 = numel as u32;
+
+    let grid_threads = (numel as u64).div_ceil(elems_per_thread);
+
+    let encoder = cb.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
+    encoder.set_buffer(1, Some(out.metal_buffer()), out.offset() as u64);
+    encoder.set_bytes(2, 4, &numel_u32 as *const u32 as *const std::ffi::c_void);
+
+    let threadgroup_size = MTLSize::new(
+        std::cmp::min(pipeline.max_total_threads_per_threadgroup(), grid_threads),
+        1,
+        1,
+    );
+    encoder.dispatch_threads(MTLSize::new(grid_threads, 1, 1), threadgroup_size);
+    encoder.end_encoding();
+
+    Ok(out)
+}

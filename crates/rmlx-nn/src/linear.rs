@@ -384,21 +384,35 @@ impl Linear {
 
         let tile = ops::matmul::select_tile_config(m, n, k);
         let kernel_name = match (tile.variant, input_2d.dtype()) {
-            (ops::matmul::TileVariant::Simd, rmlx_core::dtype::DType::Float32) => "gemm_simd_f32",
-            (ops::matmul::TileVariant::Simd, rmlx_core::dtype::DType::Float16) => "gemm_simd_f16",
-            (ops::matmul::TileVariant::Simd, rmlx_core::dtype::DType::Bfloat16) => "gemm_simd_bf16",
+            (ops::matmul::TileVariant::Simd, rmlx_core::dtype::DType::Float32)
+            | (ops::matmul::TileVariant::Medium, rmlx_core::dtype::DType::Float32) => {
+                "gemm_simd_f32"
+            }
+            (ops::matmul::TileVariant::Simd, rmlx_core::dtype::DType::Float16)
+            | (ops::matmul::TileVariant::Medium, rmlx_core::dtype::DType::Float16) => {
+                "gemm_simd_f16"
+            }
+            (ops::matmul::TileVariant::Simd, rmlx_core::dtype::DType::Bfloat16)
+            | (ops::matmul::TileVariant::Medium, rmlx_core::dtype::DType::Bfloat16) => {
+                "gemm_simd_bf16"
+            }
             (ops::matmul::TileVariant::Small, rmlx_core::dtype::DType::Float32) => "gemm_small_f32",
             (ops::matmul::TileVariant::Small, rmlx_core::dtype::DType::Float16) => "gemm_small_f16",
             (ops::matmul::TileVariant::Small, rmlx_core::dtype::DType::Bfloat16) => {
                 "gemm_small_bf16"
             }
-            (ops::matmul::TileVariant::Medium, rmlx_core::dtype::DType::Float32) => {
-                "gemm_tiled_f32"
+            (ops::matmul::TileVariant::Skinny, rmlx_core::dtype::DType::Float32) => {
+                "gemm_skinny_f32"
             }
-            (ops::matmul::TileVariant::Medium, rmlx_core::dtype::DType::Float16) => {
-                "gemm_tiled_f16"
+            (ops::matmul::TileVariant::Skinny, rmlx_core::dtype::DType::Float16) => {
+                "gemm_skinny_f16"
             }
-            (ops::matmul::TileVariant::Medium, rmlx_core::dtype::DType::Bfloat16) => {
+            (ops::matmul::TileVariant::Skinny, rmlx_core::dtype::DType::Bfloat16) => {
+                "gemm_skinny_bf16"
+            }
+            (ops::matmul::TileVariant::Full, rmlx_core::dtype::DType::Float32) => "gemm_tiled_f32",
+            (ops::matmul::TileVariant::Full, rmlx_core::dtype::DType::Float16) => "gemm_tiled_f16",
+            (ops::matmul::TileVariant::Full, rmlx_core::dtype::DType::Bfloat16) => {
                 "gemm_tiled_bf16"
             }
             (_, other) => {
@@ -441,10 +455,30 @@ impl Linear {
         enc.set_buffer(7, Some(&bsb), 0);
         enc.set_buffer(8, Some(&bsc), 0);
 
+        // Steel and Full/Skinny kernels require swizzle_log (buffer 9)
+        let swizzle_log_buf = if matches!(
+            tile.variant,
+            ops::matmul::TileVariant::Full | ops::matmul::TileVariant::Skinny
+        ) {
+            let swizzle_log = ops::matmul::compute_swizzle_log(m, tile.bm);
+            let buf = make_u32_buf(dev, swizzle_log);
+            enc.set_buffer(9, Some(&buf), 0);
+            Some(buf)
+        } else {
+            None
+        };
+
+        let tg_threads = match tile.variant {
+            ops::matmul::TileVariant::Small => 256_u64,
+            ops::matmul::TileVariant::Medium | ops::matmul::TileVariant::Simd => 1024_u64,
+            ops::matmul::TileVariant::Skinny | ops::matmul::TileVariant::Full => 256_u64,
+        };
+
         let grid = metal::MTLSize::new(grid_x, grid_y, 1);
-        let tg = metal::MTLSize::new(bm * bn, 1, 1);
+        let tg = metal::MTLSize::new(tg_threads, 1, 1);
         enc.dispatch_thread_groups(grid, tg);
         enc.end_encoding();
+        drop(swizzle_log_buf);
 
         Ok(output)
     }

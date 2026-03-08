@@ -1,6 +1,6 @@
 # RMLX
 
-**Rust ML runtime for Apple Silicon — 6.34x faster than MLX at model-scale decode**
+**Rust ML runtime for Apple Silicon — 6.34x faster than MLX at model-scale decode, prefill within 1.2-3.4x of MLX**
 
 [![CI](https://github.com/0xDaizz/RMLX/actions/workflows/ci.yml/badge.svg)](https://github.com/0xDaizz/RMLX/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -27,6 +27,7 @@ Single transformer layer decode (Llama-2 7B shapes, f16, M3 Ultra):
 | **60-layer pipeline** | **751 us/L** | **6.34x vs MLX** |
 | **Cached 2-encoder (60L)** | **714 us/L** | **8% faster, 6x lower σ** |
 | **Fused 7-dispatch (60L)** | **703.4 us/L** | **Phase 10 best** |
+| **Phase A prefill (single-layer)** | **3.5-7.3x vs baseline** | **MLX parity within 1.2-3.4x** |
 | MLX compiled (60L, f16) | 4,525 us/L | — |
 
 ## ✨ RMLX vs MLX vs CUDA
@@ -35,6 +36,7 @@ Single transformer layer decode (Llama-2 7B shapes, f16, M3 Ultra):
 |---------|:----:|:---:|:----:|
 | Unified memory (zero-copy) | ✅ | ✅ | ❌ |
 | 9-dispatch decode (6.34x vs MLX) | ✅ | ➖ | ➖ |
+| Prefill single-CB pipeline | ✅ | ➖ | ➖ |
 | Expert parallelism | ✅ | ❌ | ⚠️ |
 | Zero-copy RDMA | ✅ | ❌ | ❌ |
 | Flash Attention 2 | ✅ | ✅ | ✅ |
@@ -60,6 +62,7 @@ Single transformer layer decode (Llama-2 7B shapes, f16, M3 Ultra):
 <summary><b>Infrastructure</b> — ExecGraph, 9-dispatch decode, RDMA, BFC allocator</summary>
 
 - **7-dispatch fused decode**: merged QKV/gate-up weights, batched SDPA, fused_rms_gemv + fused_swiglu_down kernel fusion, 703.4 us/layer at 60L depth (6.34x faster than MLX); **CachedDecode** path with pre-resolved PSOs + zero per-token allocation
+- **Phase A prefill**: single-CB pipeline (54 sync points to 1), GQA slab SDPA (32 per-head dispatches to 1), GEMM threadgroup swizzle, 3.5-7.3x speedup over baseline
 - **ExecGraph**: command buffer batching (65 CB down to 5)
 - **Metal**: ChipTuning (M1–M4), DiskPipelineCache, fence manager, dual queues
 - **Allocator**: zero-copy (posix_memalign + MTLBuffer), BFC, residency manager
@@ -139,6 +142,8 @@ rmlx launch --backend rdma --hostfile rmlx-hosts.json -- ibv_devices
 | Activations | 16 |
 | Model architectures | 4 |
 | Decode latency | 703.4 us/L (60L fused 7-dispatch) |
+| Prefill speedup | 3.5-7.3x vs baseline |
+| Prefill vs MLX | within 1.2-3.4x |
 | vs MLX (60L compiled) | 6.34x faster |
 
 ## 🗺️ Roadmap

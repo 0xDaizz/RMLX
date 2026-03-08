@@ -25,8 +25,9 @@
 | **KV 캐시** | 정적/순환/배치/양자화 KV 캐시 | 정적 레이어별 캐시 | PagedAttention (vLLM) |
 | **학습** | LoRA 파인튜닝만 지원 | 전체 학습 지원 | 전체 학습 + LoRA + QLoRA |
 | **Op 모듈 수** | 27 | ~50+ | 수백 개 |
-| **테스트 수** | 1,142+ | 광범위 | 광범위 |
-| **완료된 Phase** | 0-9B-opt + S1-S5 + Phase KO + Phase 8c | N/A (안정 릴리스) | N/A (안정 릴리스) |
+| **테스트 수** | 1,298+ | 광범위 | 광범위 |
+| **프리필 최적화** | Phase A: 단일-CB 파이프라인, GQA slab SDPA, 3.5-7.3x 속도 향상 | Lazy eval 그래프 퓨전 | CUDA Graphs + cuBLAS |
+| **완료된 Phase** | 0-9B-opt + S1-S5 + Phase KO + Phase 8c + Phase A | N/A (안정 릴리스) | N/A (안정 릴리스) |
 
 ---
 
@@ -258,6 +259,8 @@ CUDA는 컴파일러(NVCC, Triton), 라이브러리(cuBLAS, cuDNN, NCCL, cuSPARS
 
 **핵심 인사이트**: ExecGraph의 64x 속도 향상은 디코드 경로를 단일 command buffer 안의 9개 디스패치로 축소한 데서 나옵니다. CUDA의 베이스라인은 스트림 순서 실행으로 이미 더 효율적이므로, CUDA Graphs는 더 강한 시작점에서 상대적으로 작은 개선을 제공합니다.
 
+**Phase A 업데이트**: 프리필 경로도 이제 단일-CB 파이프라인(54개 동기화 지점을 1개로 감소), GQA slab SDPA(32개 헤드별 디스패치를 1개로 감소), GEMM threadgroup swizzle을 사용합니다. 단일 레이어 프리필은 베이스라인 대비 3.5-7.3x 속도 향상을 달성하며, MLX 대비 1.2-3.4x 이내입니다. 잔여 격차는 주로 GEMM 처리량(rmlx 13 TFLOPS vs MLX 24 TFLOPS)에 있습니다.
+
 ---
 
 ## 7. 메모리 모델 비교
@@ -343,6 +346,7 @@ Phase S1-S5를 통해 4절과 5절에서 식별된 주요 격차가 해소되었
 | **Phase S3** | 어텐션 업그레이드 | Flash Attention 2, QuantizedKV | 4.1절, 5.1절 | ✅ 완료 |
 | **Phase S4** | 런타임 유연성 | Array 수준 집합 연산, 동적 shape | 런타임 편의성 | ✅ 완료 |
 | **Phase S5** | 멀티모달 확장 | Conv1d/Conv2d | 멀티모달 지원 | ✅ 완료 |
+| **Phase A** | 프리필 최적화 | 단일-CB 파이프라인, GQA slab SDPA, GEMM swizzle, 3.5-7.3x 속도 향상 | 프리필 성능 격차 축소 | ✅ 완료 |
 
 Flash Attention 2와 고급 양자화(GGUF, AWQ, GPTQ, FP8)가 구현되어, MLX 대비 주요 기술 격차가 해소되었습니다. CUDA 생태계와의 격차는 여전히 존재하나, 주로 하드웨어 차이(Tensor Cores, NVLink 대역폭)와 생태계 성숙도에 기인합니다.
 
