@@ -536,6 +536,7 @@ fn encode_gemm(
         (ops::matmul::TileVariant::MlxArch, DType::Float16) => "gemm_mlx_f16",
         (ops::matmul::TileVariant::MlxArch, DType::Float32) => "gemm_mlx_f32",
         (ops::matmul::TileVariant::MlxArchSmall, DType::Float16) => "gemm_mlx_small_f16",
+        (ops::matmul::TileVariant::MlxArchMicro, DType::Float16) => "gemm_mlx_m16_f16",
         (_, other) => {
             return Err(KernelError::InvalidShape(format!(
                 "ExpertGroup: unsupported dtype {:?} for GEMM",
@@ -547,6 +548,7 @@ fn encode_gemm(
     // MlxArch/MlxArchSmall use function constants for alignment specialization
     let pipeline = if tile.variant == ops::matmul::TileVariant::MlxArch
         || tile.variant == ops::matmul::TileVariant::MlxArchSmall
+        || tile.variant == ops::matmul::TileVariant::MlxArchMicro
     {
         let constants =
             ops::matmul::matmul_align_constants(m as usize, n as usize, tile.bm, tile.bn);
@@ -590,6 +592,7 @@ fn encode_gemm(
             | ops::matmul::TileVariant::Skinny
             | ops::matmul::TileVariant::MlxArch
             | ops::matmul::TileVariant::MlxArchSmall
+            | ops::matmul::TileVariant::MlxArchMicro
     ) {
         let swizzle_log =
             ops::matmul::compute_swizzle_log(m as usize, n as usize, tile.bm, tile.bn);
@@ -604,7 +607,9 @@ fn encode_gemm(
         ops::matmul::TileVariant::Small => 256_u64,
         ops::matmul::TileVariant::Medium | ops::matmul::TileVariant::Simd => 1024_u64,
         ops::matmul::TileVariant::Skinny | ops::matmul::TileVariant::Full => 256_u64,
-        ops::matmul::TileVariant::MlxArch | ops::matmul::TileVariant::MlxArchSmall => 64_u64,
+        ops::matmul::TileVariant::MlxArch
+        | ops::matmul::TileVariant::MlxArchSmall
+        | ops::matmul::TileVariant::MlxArchMicro => 64_u64,
     };
 
     let grid = metal::MTLSize::new(grid_x, grid_y, 1);

@@ -489,6 +489,7 @@ fn gemm_kernel_name_for_dims(dtype: DType, m: u32, n: u32) -> Result<&'static st
         (super::matmul::TileVariant::MlxArch, DType::Float16) => Ok("gemm_mlx_f16"),
         (super::matmul::TileVariant::MlxArch, DType::Float32) => Ok("gemm_mlx_f32"),
         (super::matmul::TileVariant::MlxArchSmall, DType::Float16) => Ok("gemm_mlx_small_f16"),
+        (super::matmul::TileVariant::MlxArchMicro, DType::Float16) => Ok("gemm_mlx_m16_f16"),
         (_, other) => Err(KernelError::InvalidShape(format!(
             "fused: unsupported dtype for GEMM: {:?}",
             other
@@ -507,6 +508,7 @@ fn gemm_pipeline_for_dims(
     let tile = super::matmul::select_tile_config_with_dtype(m as usize, n as usize, 0, dtype);
     if tile.variant == super::matmul::TileVariant::MlxArch
         || tile.variant == super::matmul::TileVariant::MlxArchSmall
+        || tile.variant == super::matmul::TileVariant::MlxArchMicro
     {
         let constants =
             super::matmul::matmul_align_constants(m as usize, n as usize, tile.bm, tile.bn);
@@ -546,7 +548,9 @@ fn encode_gemm(
         super::matmul::TileVariant::Small => 256_u64,
         super::matmul::TileVariant::Medium | super::matmul::TileVariant::Simd => 1024_u64,
         super::matmul::TileVariant::Skinny | super::matmul::TileVariant::Full => 256_u64,
-        super::matmul::TileVariant::MlxArch | super::matmul::TileVariant::MlxArchSmall => 64_u64,
+        super::matmul::TileVariant::MlxArch
+        | super::matmul::TileVariant::MlxArchSmall
+        | super::matmul::TileVariant::MlxArchMicro => 64_u64,
     };
 
     let enc = cb.new_compute_command_encoder();
@@ -580,6 +584,7 @@ fn encode_gemm(
             | super::matmul::TileVariant::Skinny
             | super::matmul::TileVariant::MlxArch
             | super::matmul::TileVariant::MlxArchSmall
+            | super::matmul::TileVariant::MlxArchMicro
     ) {
         let swizzle_log =
             super::matmul::compute_swizzle_log(m as usize, n as usize, tile.bm, tile.bn);

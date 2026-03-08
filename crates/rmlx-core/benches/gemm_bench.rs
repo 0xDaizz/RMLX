@@ -456,5 +456,84 @@ fn main() {
         bench_grouped_gemm(&registry, &queue, device);
     }
 
+    // GEMV vs GEMM comparison for low-M (set BENCH_GEMV=0 to skip)
+    let bench_gemv = std::env::var("BENCH_GEMV").unwrap_or_else(|_| "1".to_string());
+    if bench_gemv != "0" {
+        println!("=== GEMV vs GEMM Comparison (f16) ===");
+        println!();
+
+        let gemv_k = 4096;
+        for &gemv_n in &[2048usize, 1536, 768] {
+            println!(
+                "[M, {}] @ [{}, {}] — GEMV(M×row) vs GEMM:",
+                gemv_k, gemv_k, gemv_n
+            );
+            for &gemv_m in &[2usize, 4, 8, 16] {
+                // GEMM timing (this is what currently happens for M>=5)
+                let a = rand_array(device, &[gemv_m, gemv_k], 42);
+                let b = rand_array(device, &[gemv_k, gemv_n], 44);
+
+                // GEMM
+                for _ in 0..WARMUP_ITERS {
+                    let cb = queue.new_command_buffer();
+                    let _ = ops::matmul::matmul_into_cb(&registry, &a, &b, cb);
+                    cb.commit();
+                    cb.wait_until_completed();
+                }
+                let mut gemm_times = Vec::with_capacity(BENCH_ITERS);
+                for _ in 0..BENCH_ITERS {
+                    let start = Instant::now();
+                    let cb = queue.new_command_buffer();
+                    let _ = ops::matmul::matmul_into_cb(&registry, &a, &b, cb);
+                    cb.commit();
+                    cb.wait_until_completed();
+                    gemm_times.push(start.elapsed());
+                }
+                let gemm_stats = Stats::from_durations(&gemm_times);
+
+                // GEMV: M individual row×matrix multiplications in one CB
+                let a_rows: Vec<_> = (0..gemv_m)
+                    .map(|i| rand_array(device, &[1, gemv_k], 42 + i as u64))
+                    .collect();
+
+                for _ in 0..WARMUP_ITERS {
+                    let cb = queue.new_command_buffer();
+                    for a_row in &a_rows {
+                        let _ = ops::matmul::matmul_into_cb(&registry, a_row, &b, cb);
+                    }
+                    cb.commit();
+                    cb.wait_until_completed();
+                }
+                let mut gemv_times = Vec::with_capacity(BENCH_ITERS);
+                for _ in 0..BENCH_ITERS {
+                    let start = Instant::now();
+                    let cb = queue.new_command_buffer();
+                    for a_row in &a_rows {
+                        let _ = ops::matmul::matmul_into_cb(&registry, a_row, &b, cb);
+                    }
+                    cb.commit();
+                    cb.wait_until_completed();
+                    gemv_times.push(start.elapsed());
+                }
+                let gemv_stats = Stats::from_durations(&gemv_times);
+
+                let flops = 2.0 * gemv_m as f64 * gemv_k as f64 * gemv_n as f64;
+                let gemm_tflops = flops / (gemm_stats.p50 * 1e-6) / 1e12;
+                let gemv_tflops = flops / (gemv_stats.p50 * 1e-6) / 1e12;
+                let winner = if gemv_stats.p50 < gemm_stats.p50 {
+                    "GEMV"
+                } else {
+                    "GEMM"
+                };
+
+                println!(
+                    "  M={:3}  GEMM p50={:8.1}us ({:.2}T)  GEMV×{} p50={:8.1}us ({:.2}T)  winner={}",
+                    gemv_m, gemm_stats.p50, gemm_tflops, gemv_m, gemv_stats.p50, gemv_tflops, winner,
+                );
+            }
+            println!();
+        }
+    }
+
     println!("Done.");
 }
