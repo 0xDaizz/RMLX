@@ -366,6 +366,254 @@ kernel void affine_qmv_q4(
 }
 
 // -----------------------------------------------------------------------
+// affine_qmv_fast_q4: MLX qdot-pattern Q4 fast QMV kernel.
+//
+// Key optimizations over affine_qmv_q4:
+// - Each thread processes VALS_PER_THREAD (=8) Q4 values per inner step
+// - uint16 vectorized loads with 4-nibble mask extraction (qdot pattern)
+// - Pre-scaled x accumulation: x_thread tracks x/scale and x/bias
+//   contributions separately via group_dot and group_xsum
+// - Multiple simdgroups cooperate on each output row via simd_sum +
+//   threadgroup reduction
+//
+// Each threadgroup handles one output row.
+// Thread mapping: threads stride across groups within the row.
+// -----------------------------------------------------------------------
+
+constant constexpr uint QMV_FAST_Q4_VALS_PER_THREAD = 8;
+
+kernel void affine_qmv_fast_q4(
+    device const uint16_t* weights  [[buffer(0)]],
+    device const float*    scales   [[buffer(1)]],
+    device const float*    biases   [[buffer(2)]],
+    device const float*    vec      [[buffer(3)]],
+    device float*          output   [[buffer(4)]],
+    constant uint4&        params   [[buffer(5)]],
+    uint row        [[threadgroup_position_in_grid]],
+    uint simd_gid   [[simdgroup_index_in_threadgroup]],
+    uint simd_lid   [[thread_index_in_simdgroup]],
+    uint simd_count [[simdgroups_per_threadgroup]])
+{
+    const uint out_features = params.x;
+    const uint in_features  = params.y;
+    const uint group_size   = params.z;
+    // bits == 4
+
+    if (row >= out_features) return;
+
+    // 4 nibbles per uint16 → group_size/4 uint16 words per group
+    const uint words_per_group = group_size / 4u;
+    const uint groups_per_row  = in_features / group_size;
+    const uint words_per_row   = groups_per_row * words_per_group;
+
+    const uint tid = simd_gid * 32u + simd_lid;
+    const uint tg_size = simd_count * 32u;
+
+    float accum = 0.0f;
+
+    device const uint16_t* row_weights = weights + row * words_per_row;
+    device const float*    row_scales  = scales  + row * groups_per_row;
+    device const float*    row_biases  = biases  + row * groups_per_row;
+
+    // Each thread strides across groups
+    for (uint g = tid; g < groups_per_row; g += tg_size) {
+        float scale = row_scales[g];
+        float bias  = row_biases[g];
+
+        float group_dot = 0.0f;
+        float group_xsum = 0.0f;
+
+        uint base_elem = g * group_size;
+        device const uint16_t* ws = row_weights + g * words_per_group;
+        device const float*    x  = vec + base_elem;
+
+        // Process QMV_FAST_Q4_VALS_PER_THREAD (8) values per iteration
+        // = 2 uint16 words (4 nibbles each)
+        const uint words_per_step = QMV_FAST_Q4_VALS_PER_THREAD / 4u;
+        const uint num_steps = words_per_group / words_per_step;
+
+        for (uint s = 0; s < num_steps; s++) {
+            uint w_off = s * words_per_step;
+            uint x_off = s * QMV_FAST_Q4_VALS_PER_THREAD;
+
+            // qdot pattern: load 2 uint16 words, extract 4 nibbles each
+            uint16_t w0 = ws[w_off];
+            uint16_t w1 = ws[w_off + 1u];
+
+            // Load 8 x values
+            float x0 = x[x_off];
+            float x1 = x[x_off + 1u];
+            float x2 = x[x_off + 2u];
+            float x3 = x[x_off + 3u];
+            float x4 = x[x_off + 4u];
+            float x5 = x[x_off + 5u];
+            float x6 = x[x_off + 6u];
+            float x7 = x[x_off + 7u];
+
+            // qdot: nibble extraction via masks (MLX pattern)
+            group_dot += float(w0 & 0x000Fu) * x0;
+            group_dot += float((w0 >> 4u)  & 0x000Fu) * x1;
+            group_dot += float((w0 >> 8u)  & 0x000Fu) * x2;
+            group_dot += float((w0 >> 12u) & 0x000Fu) * x3;
+
+            group_dot += float(w1 & 0x000Fu) * x4;
+            group_dot += float((w1 >> 4u)  & 0x000Fu) * x5;
+            group_dot += float((w1 >> 8u)  & 0x000Fu) * x6;
+            group_dot += float((w1 >> 12u) & 0x000Fu) * x7;
+
+            group_xsum += x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7;
+        }
+
+        // Handle remaining words (when words_per_group is not multiple of words_per_step)
+        for (uint w = num_steps * words_per_step; w < words_per_group; w++) {
+            uint16_t word = ws[w];
+            uint elem = w * 4u;
+            float q0 = float(word & 0x000Fu);
+            float q1 = float((word >> 4u)  & 0x000Fu);
+            float q2 = float((word >> 8u)  & 0x000Fu);
+            float q3 = float((word >> 12u) & 0x000Fu);
+
+            float xv0 = x[elem];
+            float xv1 = x[elem + 1u];
+            float xv2 = x[elem + 2u];
+            float xv3 = x[elem + 3u];
+
+            group_dot  += q0 * xv0 + q1 * xv1 + q2 * xv2 + q3 * xv3;
+            group_xsum += xv0 + xv1 + xv2 + xv3;
+        }
+
+        accum += scale * group_dot + bias * group_xsum;
+    }
+
+    // SIMD reduction
+    accum = simd_sum(accum);
+
+    threadgroup float simd_sums[32];
+    if (simd_lid == 0) {
+        simd_sums[simd_gid] = accum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_gid == 0) {
+        float val = (simd_lid < simd_count) ? simd_sums[simd_lid] : 0.0f;
+        val = simd_sum(val);
+        if (simd_lid == 0) {
+            output[row] = val;
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
+// affine_qmv_fast_q8: Vectorized Q8 QMV kernel.
+//
+// Q8 stores 1 byte per quantized value (no bit packing needed).
+// Key optimizations:
+// - uchar4 vectorized loads (4 bytes at a time)
+// - Direct float conversion + FMA (no bit extraction overhead)
+// - Same simd_sum + threadgroup reduction pattern
+//
+// Each threadgroup handles one output row.
+// -----------------------------------------------------------------------
+
+constant constexpr uint QMV_FAST_Q8_VALS_PER_THREAD = 8;
+
+kernel void affine_qmv_fast_q8(
+    device const uint8_t*  weights  [[buffer(0)]],
+    device const float*    scales   [[buffer(1)]],
+    device const float*    biases   [[buffer(2)]],
+    device const float*    vec      [[buffer(3)]],
+    device float*          output   [[buffer(4)]],
+    constant uint4&        params   [[buffer(5)]],
+    uint row        [[threadgroup_position_in_grid]],
+    uint simd_gid   [[simdgroup_index_in_threadgroup]],
+    uint simd_lid   [[thread_index_in_simdgroup]],
+    uint simd_count [[simdgroups_per_threadgroup]])
+{
+    const uint out_features = params.x;
+    const uint in_features  = params.y;
+    const uint group_size   = params.z;
+    // bits == 8
+
+    if (row >= out_features) return;
+
+    // Q8: 1 byte per element, but MLX affine format packs 32/8 = 4 values per uint32
+    // We read raw bytes via uint8_t* pointer.
+    // bytes_per_row = in_features (1 byte per element)
+    const uint bytes_per_row   = in_features;
+    const uint groups_per_row  = in_features / group_size;
+
+    const uint tid = simd_gid * 32u + simd_lid;
+    const uint tg_size = simd_count * 32u;
+
+    float accum = 0.0f;
+
+    device const uint8_t* row_weights = weights + row * bytes_per_row;
+    device const float*   row_scales  = scales  + row * groups_per_row;
+    device const float*   row_biases  = biases  + row * groups_per_row;
+
+    for (uint g = tid; g < groups_per_row; g += tg_size) {
+        float scale = row_scales[g];
+        float bias  = row_biases[g];
+
+        float group_dot = 0.0f;
+        float group_xsum = 0.0f;
+
+        uint base_elem = g * group_size;
+        device const uint8_t* ws = row_weights + base_elem;
+        device const float*   x  = vec + base_elem;
+
+        // Process 4 bytes at a time via uchar4 (vectorized load)
+        const uint vec4_count = group_size / 4u;
+        device const uchar4* ws4 = (device const uchar4*)ws;
+
+        for (uint i = 0; i < vec4_count; i++) {
+            uchar4 packed = ws4[i];
+            uint x_off = i * 4u;
+
+            float q0 = float(packed.x);
+            float q1 = float(packed.y);
+            float q2 = float(packed.z);
+            float q3 = float(packed.w);
+
+            float x0 = x[x_off];
+            float x1 = x[x_off + 1u];
+            float x2 = x[x_off + 2u];
+            float x3 = x[x_off + 3u];
+
+            group_dot  += q0 * x0 + q1 * x1 + q2 * x2 + q3 * x3;
+            group_xsum += x0 + x1 + x2 + x3;
+        }
+
+        // Handle remaining elements (when group_size not multiple of 4)
+        for (uint i = vec4_count * 4u; i < group_size; i++) {
+            float q = float(ws[i]);
+            float xv = x[i];
+            group_dot  += q * xv;
+            group_xsum += xv;
+        }
+
+        accum += scale * group_dot + bias * group_xsum;
+    }
+
+    // SIMD reduction
+    accum = simd_sum(accum);
+
+    threadgroup float simd_sums[32];
+    if (simd_lid == 0) {
+        simd_sums[simd_gid] = accum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_gid == 0) {
+        float val = (simd_lid < simd_count) ? simd_sums[simd_lid] : 0.0f;
+        val = simd_sum(val);
+        if (simd_lid == 0) {
+            output[row] = val;
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
 // AWQ dequantization: INT4 packed in uint32 (8 nibbles per uint32).
 //
 // AWQ packs along the output (column) dimension:
@@ -469,11 +717,17 @@ pub fn register(registry: &KernelRegistry) -> Result<(), KernelError> {
 // Dispatch helpers
 // ---------------------------------------------------------------------------
 
-/// Select the kernel name based on the bit width. For 4-bit weights we use
-/// the specialized Q4 kernel; everything else goes through the generic kernel.
+/// Select the kernel name based on the bit width.
+///
+/// For 4-bit weights we use the fast qdot-pattern Q4 kernel; for 8-bit weights
+/// we use the vectorized Q8 kernel. Everything else goes through the generic kernel.
+///
+/// The older `affine_qmv_q4` and `affine_qmv` kernels are still registered and
+/// available as fallbacks.
 fn kernel_for_bits(bits: u32) -> &'static str {
     match bits {
-        4 => "affine_qmv_q4",
+        4 => "affine_qmv_fast_q4",
+        8 => "affine_qmv_fast_q8",
         _ => "affine_qmv",
     }
 }
@@ -1992,7 +2246,12 @@ mod tests {
 
     #[test]
     fn test_kernel_for_bits_q4() {
-        assert_eq!(kernel_for_bits(4), "affine_qmv_q4");
+        assert_eq!(kernel_for_bits(4), "affine_qmv_fast_q4");
+    }
+
+    #[test]
+    fn test_kernel_for_bits_q8() {
+        assert_eq!(kernel_for_bits(8), "affine_qmv_fast_q8");
     }
 
     #[test]
@@ -2000,7 +2259,6 @@ mod tests {
         assert_eq!(kernel_for_bits(2), "affine_qmv");
         assert_eq!(kernel_for_bits(3), "affine_qmv");
         assert_eq!(kernel_for_bits(6), "affine_qmv");
-        assert_eq!(kernel_for_bits(8), "affine_qmv");
     }
 
     #[test]
