@@ -2,6 +2,7 @@ use clap::Args;
 
 use crate::hostfile::HostEntry;
 use crate::ssh;
+use crate::tb_discovery;
 
 #[derive(Args)]
 pub struct ConfigArgs {
@@ -165,8 +166,8 @@ pub fn run(args: ConfigArgs) -> i32 {
     }
 
     let user = args.ssh_user.as_deref();
-    let mut infos: Vec<HostInfo> = Vec::new();
 
+    // SSH verify all hosts first (common to both paths)
     for host in &hosts {
         if args.verbose {
             println!("[{host}] probing ssh");
@@ -175,91 +176,144 @@ pub fn run(args: ConfigArgs) -> i32 {
             tracing::error!(target: "rmlx_cli", %e, "SSH verification failed");
             return 1;
         }
+    }
 
-        if args.auto_setup && args.over == "thunderbolt" {
-            if let Err(e) = auto_setup_host(host, user, args.timeout, args.verbose) {
-                tracing::error!(target: "rmlx_cli", %e, "auto-setup failed");
-                return 1;
-            }
-        }
-
-        if args.verbose {
-            println!("[{host}] probing control IP via {}", args.control_iface);
-        }
-        let ip = match probe_control_ip(host, &args.control_iface, user, args.timeout) {
-            Ok(ip) => ip,
+    let entries: Vec<HostEntry> = if args.auto_setup && args.over == "thunderbolt" {
+        // ---- TB Discovery path ----
+        // 1. Discover TB topology via system_profiler + networksetup
+        let mut topology = match tb_discovery::discover(&hosts, user, args.timeout, args.verbose) {
+            Ok(t) => t,
             Err(e) => {
-                tracing::error!(target: "rmlx_cli", %e, "failed to probe control IP");
+                tracing::error!(target: "rmlx_cli", %e, "TB discovery failed");
                 return 1;
             }
         };
 
-        let mut rdma_devs = Vec::new();
-        if args.backend == "rdma" && !args.no_verify_rdma {
-            if args.verbose {
-                println!("[{host}] probing RDMA devices (ibv_devices)");
+        if topology.links.is_empty() {
+            tracing::error!(
+                target: "rmlx_cli",
+                "no Thunderbolt links found between hosts; check cables and connections",
+            );
+            return 1;
+        }
+
+        // 2. Assign /30 point-to-point IPs
+        topology.assign_ips();
+
+        // 3. Apply setup (ifconfig/route) on each host
+        if let Err(e) = topology.apply_setup(&hosts, user, args.timeout, args.verbose) {
+            tracing::error!(target: "rmlx_cli", %e, "TB setup failed");
+            return 1;
+        }
+
+        // 4. Build hostfile entries from topology
+        let world = hosts.len();
+        let mut entries = Vec::with_capacity(world);
+        for (rank, host) in hosts.iter().enumerate() {
+            let ips = topology.data_ips(rank);
+            let rdma = if args.backend == "rdma" {
+                Some(topology.rdma_map(rank, world))
+            } else {
+                None
+            };
+            entries.push(HostEntry {
+                ssh: host.clone(),
+                ips,
+                rdma,
+            });
+        }
+        entries
+    } else {
+        // ---- Legacy path (no TB auto-setup) ----
+        let mut infos: Vec<HostInfo> = Vec::new();
+
+        for host in &hosts {
+            if args.auto_setup {
+                if let Err(e) = auto_setup_host(host, user, args.timeout, args.verbose) {
+                    tracing::error!(target: "rmlx_cli", %e, "auto-setup failed");
+                    return 1;
+                }
             }
-            match probe_rdma_devices(host, user, args.timeout) {
-                Ok(devs) => {
-                    if devs.is_empty() {
+
+            if args.verbose {
+                println!("[{host}] probing control IP via {}", args.control_iface);
+            }
+            let ip = match probe_control_ip(host, &args.control_iface, user, args.timeout) {
+                Ok(ip) => ip,
+                Err(e) => {
+                    tracing::error!(target: "rmlx_cli", %e, "failed to probe control IP");
+                    return 1;
+                }
+            };
+
+            let mut rdma_devs = Vec::new();
+            if args.backend == "rdma" && !args.no_verify_rdma {
+                if args.verbose {
+                    println!("[{host}] probing RDMA devices (ibv_devices)");
+                }
+                match probe_rdma_devices(host, user, args.timeout) {
+                    Ok(devs) => {
+                        if devs.is_empty() {
+                            tracing::error!(
+                                target: "rmlx_cli",
+                                %host,
+                                "no RDMA devices found; use --no-verify-rdma to bypass",
+                            );
+                            return 1;
+                        }
+                        rdma_devs = devs;
+                    }
+                    Err(e) => {
+                        tracing::error!(target: "rmlx_cli", %e, "RDMA probe failed");
+                        return 1;
+                    }
+                }
+            }
+
+            infos.push(HostInfo {
+                ssh: host.clone(),
+                ip,
+                rdma_devices: rdma_devs,
+            });
+        }
+
+        let world = infos.len();
+        let mut entries: Vec<HostEntry> = Vec::new();
+
+        for (rank, info) in infos.iter().enumerate() {
+            let rdma = if args.backend == "rdma" {
+                if !args.no_verify_rdma {
+                    let needed = world - 1;
+                    if info.rdma_devices.len() < needed {
                         tracing::error!(
                             target: "rmlx_cli",
-                            %host,
-                            "no RDMA devices found; use --no-verify-rdma to bypass",
+                            host = %info.ssh,
+                            needed,
+                            found = info.rdma_devices.len(),
+                            devices = ?info.rdma_devices,
+                            "insufficient RDMA devices for full mesh",
                         );
                         return 1;
                     }
-                    rdma_devs = devs;
                 }
-                Err(e) => {
-                    tracing::error!(target: "rmlx_cli", %e, "RDMA probe failed");
-                    return 1;
-                }
-            }
-        }
-
-        infos.push(HostInfo {
-            ssh: host.clone(),
-            ip,
-            rdma_devices: rdma_devs,
-        });
-    }
-
-    let world = infos.len();
-    let mut entries: Vec<HostEntry> = Vec::new();
-
-    for (rank, info) in infos.iter().enumerate() {
-        let rdma = if args.backend == "rdma" {
-            if !args.no_verify_rdma {
-                let needed = world - 1;
-                if info.rdma_devices.len() < needed {
-                    tracing::error!(
-                        target: "rmlx_cli",
-                        host = %info.ssh,
-                        needed,
-                        found = info.rdma_devices.len(),
-                        devices = ?info.rdma_devices,
-                        "insufficient RDMA devices for full mesh",
-                    );
-                    return 1;
-                }
-            }
-            let devs = if info.rdma_devices.is_empty() {
-                vec!["rdma_device_todo".to_string()]
+                let devs = if info.rdma_devices.is_empty() {
+                    vec!["rdma_device_todo".to_string()]
+                } else {
+                    info.rdma_devices.clone()
+                };
+                Some(build_rdma_map(&devs, rank, world))
             } else {
-                info.rdma_devices.clone()
+                None
             };
-            Some(build_rdma_map(&devs, rank, world))
-        } else {
-            None
-        };
 
-        entries.push(HostEntry {
-            ssh: info.ssh.clone(),
-            ips: vec![info.ip.clone()],
-            rdma,
-        });
-    }
+            entries.push(HostEntry {
+                ssh: info.ssh.clone(),
+                ips: vec![info.ip.clone()],
+                rdma,
+            });
+        }
+        entries
+    };
 
     let json = match serde_json::to_string_pretty(&entries) {
         Ok(j) => j,

@@ -4,6 +4,7 @@ mod config;
 mod hostfile;
 mod launch;
 mod ssh;
+mod tb_discovery;
 mod topology;
 
 #[derive(Parser)]
