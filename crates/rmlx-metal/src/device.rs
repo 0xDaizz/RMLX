@@ -66,6 +66,9 @@ pub struct ChipTuning {
     /// Whether concurrent compute dispatch is supported.
     /// True for all Apple Silicon (M1+), false for unknown hardware.
     pub supports_concurrent_dispatch: bool,
+    /// Estimated GPU core count for occupancy heuristics (e.g. split-K).
+    /// Derived from arch_class: Ultra=80, Max=40, Base=10, Unknown=10.
+    pub gpu_cores: usize,
 }
 
 impl ChipTuning {
@@ -96,6 +99,12 @@ impl ChipTuning {
             ArchClass::Base => (40, 40),
             _ => (32, 32),
         };
+        let gpu_cores = match arch_class {
+            ArchClass::Ultra => 80,
+            ArchClass::Max => 40,
+            ArchClass::Base | ArchClass::Phone => 10,
+            ArchClass::Unknown => 10,
+        };
 
         if is_apple {
             Self {
@@ -109,6 +118,7 @@ impl ChipTuning {
                 max_ops_per_batch: max_ops,
                 max_mb_per_batch: max_mb,
                 supports_concurrent_dispatch: true,
+                gpu_cores,
             }
         } else {
             // Conservative defaults for unknown hardware.
@@ -123,6 +133,7 @@ impl ChipTuning {
                 max_ops_per_batch: max_ops,
                 max_mb_per_batch: max_mb,
                 supports_concurrent_dispatch: false,
+                gpu_cores,
             }
         }
     }
@@ -147,6 +158,12 @@ impl ChipTuning {
             ArchClass::Base => (40, 40),
             _ => (32, 32),
         };
+        let gpu_cores = match arch_class {
+            ArchClass::Ultra => 80,
+            ArchClass::Max => 40,
+            ArchClass::Base | ArchClass::Phone => 10,
+            ArchClass::Unknown => 10,
+        };
         match arch {
             Architecture::Apple { generation } if generation >= 16 => Self {
                 max_threadgroup_memory: 32 * 1024,
@@ -159,6 +176,7 @@ impl ChipTuning {
                 max_ops_per_batch: max_ops,
                 max_mb_per_batch: max_mb,
                 supports_concurrent_dispatch: true,
+                gpu_cores,
             },
             Architecture::Apple { generation } => Self {
                 max_threadgroup_memory: 32 * 1024,
@@ -171,6 +189,7 @@ impl ChipTuning {
                 max_ops_per_batch: max_ops,
                 max_mb_per_batch: max_mb,
                 supports_concurrent_dispatch: true,
+                gpu_cores,
             },
             Architecture::Unknown => Self {
                 max_threadgroup_memory: 16 * 1024,
@@ -183,6 +202,7 @@ impl ChipTuning {
                 max_ops_per_batch: max_ops,
                 max_mb_per_batch: max_mb,
                 supports_concurrent_dispatch: false,
+                gpu_cores,
             },
         }
     }
