@@ -10,6 +10,8 @@ use std::sync::RwLock;
 use metal::{CompileOptions, FunctionConstantValues, MTLDataType};
 
 use rmlx_metal::device::GpuDevice;
+use rmlx_metal::pipeline_cache::DiskPipelineCache;
+use rmlx_metal::FunctionConstant;
 
 use crate::dtype::DType;
 
@@ -79,20 +81,64 @@ pub struct PipelineKey {
 
 /// Kernel registry managing AOT libraries and JIT compilation with pipeline caching.
 ///
-/// Lookup order: pipeline cache -> AOT metallib -> JIT cache -> JIT compile.
+/// Lookup order: in-memory pipeline cache -> disk pipeline cache -> AOT metallib
+/// -> JIT cache -> error.
 ///
 /// Uses `RwLock` instead of `Mutex` for the caches, allowing concurrent readers
 /// (the common case — pipeline lookups) without contention.
 pub struct KernelRegistry {
     device: GpuDevice,
     aot_lib: Option<metal::Library>,
-    jit_cache: RwLock<HashMap<String, metal::Library>>,
+    /// JIT cache: name -> (source text, compiled Library).
+    /// The source text is retained so that [`DiskPipelineCache`] can compute a
+    /// stable SHA-256 key when a pipeline miss occurs.
+    jit_cache: RwLock<HashMap<String, JitEntry>>,
     pipelines: RwLock<HashMap<PipelineKey, metal::ComputePipelineState>>,
+    /// Persistent disk-backed pipeline cache.  `None` only when explicitly
+    /// disabled (e.g., in tests via `new_without_disk_cache`).
+    disk_cache: Option<DiskPipelineCache>,
+}
+
+/// A JIT-compiled library together with the source text it was compiled from.
+struct JitEntry {
+    source: String,
+    library: metal::Library,
 }
 
 impl KernelRegistry {
     /// Create a new registry. Tries to load AOT metallib from `METALLIB_PATH`.
+    ///
+    /// A [`DiskPipelineCache`] is created automatically and will persist
+    /// compiled metallib binaries to `~/.cache/rmlx/pipelines/`.
     pub fn new(device: GpuDevice) -> Self {
+        let metallib_path = crate::METALLIB_PATH;
+        let aot_lib = if metallib_path.is_empty() {
+            None
+        } else {
+            let path = std::path::Path::new(metallib_path);
+            if path.exists() {
+                device.raw().new_library_with_file(path).ok()
+            } else {
+                None
+            }
+        };
+
+        let disk_cache = Some(DiskPipelineCache::new(device.raw()));
+
+        Self {
+            device,
+            aot_lib,
+            jit_cache: RwLock::new(HashMap::new()),
+            pipelines: RwLock::new(HashMap::new()),
+            disk_cache,
+        }
+    }
+
+    /// Create a registry without a disk pipeline cache.
+    ///
+    /// Useful for tests or environments where disk persistence is undesirable.
+    #[cfg(test)]
+    pub fn new_without_disk_cache(device: GpuDevice) -> Self {
         let metallib_path = crate::METALLIB_PATH;
         let aot_lib = if metallib_path.is_empty() {
             None
@@ -110,12 +156,14 @@ impl KernelRegistry {
             aot_lib,
             jit_cache: RwLock::new(HashMap::new()),
             pipelines: RwLock::new(HashMap::new()),
+            disk_cache: None,
         }
     }
 
     /// Get or create a compute pipeline for the given kernel and dtype.
     ///
-    /// Tries: pipeline cache -> AOT library -> JIT cache -> error.
+    /// Tries: in-memory pipeline cache -> disk pipeline cache -> AOT library
+    /// -> JIT cache -> error.
     pub fn get_pipeline(
         &self,
         kernel_name: &str,
@@ -127,7 +175,7 @@ impl KernelRegistry {
             constants: vec![],
         };
 
-        // 1. Check pipeline cache (read lock)
+        // 1. Check in-memory pipeline cache (read lock)
         {
             let cache = self
                 .pipelines
@@ -138,13 +186,26 @@ impl KernelRegistry {
             }
         }
 
-        // 2. Try AOT library
+        // 2. Try disk pipeline cache — needs JIT source for the cache key.
+        if let Some(ref disk) = self.disk_cache {
+            if let Some(source) = self.find_jit_source_for_kernel(kernel_name) {
+                if let Ok(pso) = disk.get_or_compile(&source, kernel_name, &[]) {
+                    // Store in the in-memory cache for future fast-path hits.
+                    if let Ok(mut cache) = self.pipelines.write() {
+                        cache.insert(key, pso.clone());
+                    }
+                    return Ok(pso);
+                }
+            }
+        }
+
+        // 3. Try AOT library
         let function = self
             .aot_lib
             .as_ref()
             .and_then(|lib| lib.get_function(kernel_name, None).ok());
 
-        // 3. If AOT miss, try JIT cache (read lock)
+        // 4. If AOT miss, try JIT cache (read lock)
         let function = match function {
             Some(f) => f,
             None => {
@@ -154,7 +215,7 @@ impl KernelRegistry {
                     .map_err(|_| KernelError::Internal("JIT cache lock poisoned".into()))?;
                 let jit_fn = jit
                     .values()
-                    .find_map(|lib| lib.get_function(kernel_name, None).ok());
+                    .find_map(|entry| entry.library.get_function(kernel_name, None).ok());
                 match jit_fn {
                     Some(f) => f,
                     None => {
@@ -166,14 +227,14 @@ impl KernelRegistry {
             }
         };
 
-        // 4. Create pipeline from the function
+        // 5. Create pipeline from the function
         let pipeline = self
             .device
             .raw()
             .new_compute_pipeline_state_with_function(&function)
             .map_err(|e| KernelError::PipelineFailed(e.to_string()))?;
 
-        // 5. Cache it (write lock)
+        // 6. Cache it (write lock)
         {
             let mut cache = self
                 .pipelines
@@ -242,8 +303,8 @@ impl KernelRegistry {
             .read()
             .map_err(|_| KernelError::Internal("JIT cache lock poisoned".into()))?;
 
-        for lib in jit.values() {
-            match try_library(lib, fcv.clone()) {
+        for entry in jit.values() {
+            match try_library(&entry.library, fcv.clone()) {
                 Ok(f) => return Ok(f),
                 Err(Some(metal_err)) => {
                     return Err(KernelError::Specialization(format!(
@@ -283,7 +344,7 @@ impl KernelRegistry {
             constants: constants.to_vec(),
         };
 
-        // 1. Check pipeline cache (read lock)
+        // 1. Check in-memory pipeline cache (read lock)
         {
             let cache = self
                 .pipelines
@@ -294,7 +355,20 @@ impl KernelRegistry {
             }
         }
 
-        // 2. Build FunctionConstantValues if needed
+        // 2. Try disk pipeline cache with function constants.
+        if let Some(ref disk) = self.disk_cache {
+            let disk_constants = Self::to_disk_constants(constants);
+            if let Some(source) = self.find_jit_source_for_kernel(kernel_name) {
+                if let Ok(pso) = disk.get_or_compile(&source, kernel_name, &disk_constants) {
+                    if let Ok(mut cache) = self.pipelines.write() {
+                        cache.insert(key, pso.clone());
+                    }
+                    return Ok(pso);
+                }
+            }
+        }
+
+        // 3. Build FunctionConstantValues if needed
         let fcv = if constants.is_empty() {
             None
         } else {
@@ -328,7 +402,7 @@ impl KernelRegistry {
             Some(values)
         };
 
-        // 3. Find the function from library (AOT then JIT), applying constants.
+        // 4. Find the function from library (AOT then JIT), applying constants.
         //
         // When function constants are provided, we must distinguish between
         // "kernel not found" (name doesn't exist in the library) and
@@ -338,14 +412,14 @@ impl KernelRegistry {
         // determine whether the function exists, then apply constants.
         let function = self.lookup_function_with_constants(kernel_name, fcv, dtype)?;
 
-        // 4. Create pipeline from the (possibly specialized) function
+        // 5. Create pipeline from the (possibly specialized) function
         let pipeline = self
             .device
             .raw()
             .new_compute_pipeline_state_with_function(&function)
             .map_err(|e| KernelError::PipelineFailed(e.to_string()))?;
 
-        // 5. Cache it (write lock)
+        // 6. Cache it (write lock)
         {
             let mut cache = self
                 .pipelines
@@ -372,7 +446,13 @@ impl KernelRegistry {
             .jit_cache
             .write()
             .map_err(|_| KernelError::Internal("JIT cache lock poisoned".into()))?;
-        cache.insert(name.to_string(), lib);
+        cache.insert(
+            name.to_string(),
+            JitEntry {
+                source: source.to_string(),
+                library: lib,
+            },
+        );
         Ok(())
     }
 
@@ -505,6 +585,47 @@ impl KernelRegistry {
             .map_err(|_| KernelError::Internal("pipeline cache lock poisoned".into()))?;
         cache.clear();
         Ok(())
+    }
+
+    /// Reference to the disk pipeline cache, if available.
+    pub fn disk_cache(&self) -> Option<&DiskPipelineCache> {
+        self.disk_cache.as_ref()
+    }
+
+    // -----------------------------------------------------------------------
+    // Internal helpers
+    // -----------------------------------------------------------------------
+
+    /// Find the MSL source string for a kernel by scanning the JIT cache.
+    ///
+    /// Returns the source of the first JIT entry whose compiled library
+    /// contains a function named `kernel_name`.
+    fn find_jit_source_for_kernel(&self, kernel_name: &str) -> Option<String> {
+        let jit = self.jit_cache.read().ok()?;
+        for entry in jit.values() {
+            if entry.library.get_function(kernel_name, None).is_ok() {
+                return Some(entry.source.clone());
+            }
+        }
+        None
+    }
+
+    /// Convert `FunctionConstantValue` slice to `FunctionConstant` slice
+    /// for use with [`DiskPipelineCache`].
+    fn to_disk_constants(
+        constants: &[(u32, FunctionConstantValue)],
+    ) -> Vec<(u32, FunctionConstant)> {
+        constants
+            .iter()
+            .map(|(idx, val)| {
+                let fc = match val {
+                    FunctionConstantValue::Bool(v) => FunctionConstant::Bool(*v),
+                    FunctionConstantValue::U32(v) => FunctionConstant::U32(*v),
+                    FunctionConstantValue::F32(v) => FunctionConstant::F32(*v),
+                };
+                (*idx, fc)
+            })
+            .collect()
     }
 }
 
