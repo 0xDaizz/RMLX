@@ -13,8 +13,9 @@
 //! On older macOS versions, serialization is skipped and the library is always
 //! compiled from source.
 //!
-//! This module is intentionally *not* wired into the main compilation flow yet.
-//! Integration is planned for a follow-up PR.
+//! Integrated into `KernelRegistry` (rmlx-core) as a persistent cache layer:
+//! on pipeline miss the registry delegates to `DiskPipelineCache` before
+//! falling back to runtime MSL compilation.
 
 use std::collections::HashMap;
 use std::fs;
