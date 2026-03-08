@@ -547,6 +547,93 @@ fn main() {
         bench_grouped_gemm(&registry, &queue, device);
     }
 
+    // Grouped Split-K benchmark (same gate as grouped GEMM)
+    if bench_grouped != "0" {
+        println!("=== Grouped Split-K Benchmark (low-occupancy MoE) ===");
+        println!();
+
+        let gpu_cores = registry.device().tuning().gpu_cores;
+        let splitk_k = 4096;
+
+        // Scenarios where per-expert occupancy is very low (few tiles)
+        let splitk_scenarios: Vec<(&str, Vec<usize>, usize)> = vec![
+            ("4E×M=2 N=768", vec![2; 4], 768),
+            ("4E×M=4 N=512", vec![4; 4], 512),
+            ("8E×M=1 N=1024", vec![1; 8], 1024),
+            ("8E×M=2 N=2048", vec![2; 8], 2048),
+        ];
+
+        for (label, expert_ms, n) in &splitk_scenarios {
+            let total_m: usize = expert_ms.iter().sum();
+            let num_experts = expert_ms.len();
+            let total_flops = 2.0 * total_m as f64 * splitk_k as f64 * *n as f64;
+
+            let a_stacked = rand_array(device, &[total_m, splitk_k], 42);
+            let b_3d = {
+                let b_flat = rand_array(device, &[num_experts, splitk_k * *n], 44);
+                Array::from_bytes(
+                    device,
+                    unsafe {
+                        std::slice::from_raw_parts(
+                            b_flat.metal_buffer().contents() as *const u8,
+                            num_experts * splitk_k * *n * 2,
+                        )
+                    },
+                    vec![num_experts, splitk_k, *n],
+                    DType::Float16,
+                )
+            };
+
+            // Grouped (no split-K)
+            {
+                for _ in 0..WARMUP_ITERS {
+                    let _ = ops::matmul::dispatch_grouped_gemm(
+                        &registry, &a_stacked, &b_3d, &queue, expert_ms, splitk_k, *n,
+                    );
+                }
+                let mut times = Vec::with_capacity(BENCH_ITERS);
+                for _ in 0..BENCH_ITERS {
+                    let start = Instant::now();
+                    let _ = ops::matmul::dispatch_grouped_gemm(
+                        &registry, &a_stacked, &b_3d, &queue, expert_ms, splitk_k, *n,
+                    );
+                    times.push(start.elapsed());
+                }
+                let stats = Stats::from_durations(&times);
+                let tflops_p50 = total_flops / (stats.p50 * 1e-6) / 1e12;
+                println!(
+                    "  {:<25}  grouped    p50={:8.1}us  mean={:8.1}us  TFLOPS(p50)={:.2}",
+                    label, stats.p50, stats.mean, tflops_p50,
+                );
+            }
+
+            // Grouped Split-K
+            {
+                for _ in 0..WARMUP_ITERS {
+                    let _ = ops::matmul::dispatch_grouped_splitk(
+                        &registry, &queue, &a_stacked, &b_3d, expert_ms, splitk_k, *n, gpu_cores,
+                    );
+                }
+                let mut times = Vec::with_capacity(BENCH_ITERS);
+                for _ in 0..BENCH_ITERS {
+                    let start = Instant::now();
+                    let _ = ops::matmul::dispatch_grouped_splitk(
+                        &registry, &queue, &a_stacked, &b_3d, expert_ms, splitk_k, *n, gpu_cores,
+                    );
+                    times.push(start.elapsed());
+                }
+                let stats = Stats::from_durations(&times);
+                let tflops_p50 = total_flops / (stats.p50 * 1e-6) / 1e12;
+                println!(
+                    "  {:<25}  grp-splitk p50={:8.1}us  mean={:8.1}us  TFLOPS(p50)={:.2}",
+                    label, stats.p50, stats.mean, tflops_p50,
+                );
+            }
+
+            println!();
+        }
+    }
+
     // GEMV vs GEMM comparison for low-M (set BENCH_GEMV=0 to skip)
     let bench_gemv = std::env::var("BENCH_GEMV").unwrap_or_else(|_| "1".to_string());
     if bench_gemv != "0" {
