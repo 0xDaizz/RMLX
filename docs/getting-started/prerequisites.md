@@ -32,20 +32,29 @@ The following additional hardware is required for distributed inference (Expert 
 
 ### RDMA Setup (Cluster Validation)
 
-RMLX includes lightweight distributed setup/launch helpers modeled after
-`mlx.distributed_config` and `mlx.launch`.
+RMLX includes distributed setup/launch helpers modeled after
+`mlx.distributed_config` and `mlx.launch`. With `--auto-setup`, you only need to
+plug in the TB5 cable and run one command — TB topology detection, IP assignment,
+and RDMA device mapping are all handled automatically.
 
 ```bash
-# 1) Generate hostfile + baseline host setup (from control node)
+# 1) Auto-detect TB5 topology + assign IPs + generate hostfile (one-time)
 rmlx config \
   --hosts node1,node2 \
-  --backend rdma \
-  --over thunderbolt \
-  --control-iface en0 \
   --auto-setup \
   --output rmlx-hosts.json \
   --verbose
+```
 
+This performs the following steps automatically:
+1. SSH to each host and query `system_profiler SPThunderboltDataType -json`
+2. Parse TB port UUIDs and match connections across hosts
+3. Map TB port tags to network interfaces via `networksetup -listallhardwareports`
+4. Assign /30 point-to-point IPs (192.168.x.x) to each TB link
+5. Run `sudo ifconfig` and `sudo route` on each host
+6. Generate hostfile with data-plane IPs and RDMA device mappings (`rdma_{iface}`)
+
+```bash
 # 2) Validate RDMA visibility on each host
 rmlx launch \
   --backend rdma \
@@ -59,8 +68,8 @@ rmlx launch \
   -- cargo test -p rmlx-rdma -- --nocapture
 ```
 
-> **Note**: `--auto-setup` requires passwordless `sudo` on each host (SSH mode).
-> If you only want hostfile generation, omit `--auto-setup`.
+> **Note**: `--auto-setup` requires passwordless `sudo` on each host (for `ifconfig`/`route`).
+> If you only want hostfile generation without IP configuration, omit `--auto-setup`.
 
 ---
 
