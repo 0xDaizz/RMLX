@@ -275,6 +275,25 @@ fn main() {
     );
     println!();
 
+    // --- [M, 4096] @ [4096, 14336] (run FIRST to avoid thermal throttling) ---
+    println!("[M, 4096] @ [4096, 14336]:");
+    for m in [16, 32, 64, 128, 256, 512, 1024, 2048] {
+        let a = rand_array(device, &[m, 4096], 42);
+        let b = rand_array(device, &[4096, 14336], 44);
+        bench_gemm(
+            &registry,
+            &queue,
+            device,
+            &a,
+            &b,
+            m,
+            4096,
+            14336,
+            "4096x14336",
+        );
+    }
+    println!();
+
     // --- [M, 4096] @ [4096, 4096] ---
     println!("[M, 4096] @ [4096, 4096]:");
     for m in [16, 32, 64, 128, 256, 512, 1024, 2048] {
@@ -294,23 +313,5 @@ fn main() {
     }
     println!();
 
-    // --- [M, 4096] @ [4096, 14336] ---
-    println!("[M, 4096] @ [4096, 14336]:");
-    for m in [16, 32, 64, 128, 256, 512, 1024, 2048] {
-        let a = rand_array(device, &[m, 4096], 42);
-        let b = rand_array(device, &[4096, 14336], 44);
-        bench_gemm(
-            &registry,
-            &queue,
-            device,
-            &a,
-            &b,
-            m,
-            4096,
-            14336,
-            "4096x14336",
-        );
-    }
-    println!();
     println!("Done.");
 }
