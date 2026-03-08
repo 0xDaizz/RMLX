@@ -1484,7 +1484,7 @@ kernel void affine_qmm(
 pub const QMM_MMA_SHADER_SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
-using namespace metal::simdgroup;
+
 
 // Function constants for compile-time bounds check elimination
 constant bool align_M [[function_constant(200)]];
@@ -1740,7 +1740,7 @@ kernel void affine_qmm_mma_q4(
 pub const QMM_MMA_Q8_SHADER_SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
-using namespace metal::simdgroup;
+
 
 // Function constants for compile-time bounds check elimination
 constant bool align_M [[function_constant(200)]];
