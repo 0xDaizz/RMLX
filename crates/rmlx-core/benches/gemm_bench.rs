@@ -410,6 +410,97 @@ fn bench_grouped_gemm(
     }
 }
 
+/// Benchmark a specific tile configuration, returning p50 latency in microseconds.
+#[allow(clippy::too_many_arguments)]
+fn bench_with_tile(
+    registry: &KernelRegistry,
+    queue: &metal::CommandQueue,
+    device: &metal::Device,
+    a: &Array,
+    b: &Array,
+    m: usize,
+    k: usize,
+    n: usize,
+    tile: &ops::matmul::TileConfig,
+) -> f64 {
+    let kernel_name = match (tile.variant, a.dtype()) {
+        (ops::matmul::TileVariant::MlxArchMicro, DType::Float16) => "gemm_mlx_m16_f16",
+        (ops::matmul::TileVariant::MlxArchSmall, DType::Float16) => "gemm_mlx_small_f16",
+        (ops::matmul::TileVariant::MlxArch, DType::Float16) => "gemm_mlx_f16",
+        _ => panic!("Unsupported tile variant for boundary bench"),
+    };
+
+    let constants = ops::matmul::matmul_align_constants(m, n, tile.bm, tile.bn);
+    let pipeline = registry
+        .get_pipeline_with_constants(kernel_name, a.dtype(), &constants)
+        .unwrap_or_else(|e| panic!("Failed to get pipeline for {kernel_name}: {e}"));
+
+    let c = Array::zeros(device, &[m, n], a.dtype());
+    let m_buf = make_u32_buf(device, m as u32);
+    let n_buf = make_u32_buf(device, n as u32);
+    let k_buf = make_u32_buf(device, k as u32);
+    let bsa_buf = make_u32_buf(device, (m * k) as u32);
+    let bsb_buf = make_u32_buf(device, (k * n) as u32);
+    let bsc_buf = make_u32_buf(device, (m * n) as u32);
+    let swizzle_buf = make_u32_buf(
+        device,
+        ops::matmul::compute_swizzle_log(m, n, tile.bm, tile.bn),
+    );
+
+    let grid_x = ceil_div(n, tile.bn) as u64;
+    let grid_y = ceil_div(m, tile.bm) as u64;
+    let grid = MTLSize::new(grid_x, grid_y, 1);
+    let tg = MTLSize::new(64, 1, 1);
+
+    // Warmup
+    for _ in 0..WARMUP_ITERS {
+        let cb = queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(a.metal_buffer()), 0);
+        enc.set_buffer(1, Some(b.metal_buffer()), 0);
+        enc.set_buffer(2, Some(c.metal_buffer()), 0);
+        enc.set_buffer(3, Some(&m_buf), 0);
+        enc.set_buffer(4, Some(&n_buf), 0);
+        enc.set_buffer(5, Some(&k_buf), 0);
+        enc.set_buffer(6, Some(&bsa_buf), 0);
+        enc.set_buffer(7, Some(&bsb_buf), 0);
+        enc.set_buffer(8, Some(&bsc_buf), 0);
+        enc.set_buffer(9, Some(&swizzle_buf), 0);
+        enc.dispatch_thread_groups(grid, tg);
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+    }
+
+    // Bench
+    let mut times = Vec::with_capacity(BENCH_ITERS);
+    for _ in 0..BENCH_ITERS {
+        let start = Instant::now();
+        let cb = queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(a.metal_buffer()), 0);
+        enc.set_buffer(1, Some(b.metal_buffer()), 0);
+        enc.set_buffer(2, Some(c.metal_buffer()), 0);
+        enc.set_buffer(3, Some(&m_buf), 0);
+        enc.set_buffer(4, Some(&n_buf), 0);
+        enc.set_buffer(5, Some(&k_buf), 0);
+        enc.set_buffer(6, Some(&bsa_buf), 0);
+        enc.set_buffer(7, Some(&bsb_buf), 0);
+        enc.set_buffer(8, Some(&bsc_buf), 0);
+        enc.set_buffer(9, Some(&swizzle_buf), 0);
+        enc.dispatch_thread_groups(grid, tg);
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        times.push(start.elapsed());
+    }
+
+    let stats = Stats::from_durations(&times);
+    stats.p50
+}
+
 fn main() {
     let gpu = GpuDevice::system_default().expect("No GPU device found");
     let registry = KernelRegistry::new(gpu);
@@ -529,6 +620,71 @@ fn main() {
                 println!(
                     "  M={:3}  GEMM p50={:8.1}us ({:.2}T)  GEMV×{} p50={:8.1}us ({:.2}T)  winner={}",
                     gemv_m, gemm_stats.p50, gemm_tflops, gemv_m, gemv_stats.p50, gemv_tflops, winner,
+                );
+            }
+            println!();
+        }
+    }
+
+    // BM Tile Boundary Sweep (set BENCH_BOUNDARY=0 to skip)
+    let bench_boundary = std::env::var("BENCH_BOUNDARY").unwrap_or_else(|_| "1".to_string());
+    if bench_boundary != "0" {
+        println!("=== BM Tile Boundary Sweep (f16) ===");
+        println!("Comparing BM=16/BN=32 vs BM=32/BN=32 for each M");
+        println!();
+
+        let boundary_k = 4096;
+        for &n in &[14336usize, 4096, 2048, 1536, 768] {
+            println!("N={}:", n);
+            for &m in &[5usize, 6, 8, 10, 12, 14, 16, 20, 24, 28, 32] {
+                let a = rand_array(device, &[m, boundary_k], 42);
+                let b = rand_array(device, &[boundary_k, n], 44);
+
+                // BM=16, BN=32 (MlxArchMicro)
+                let tile_micro = ops::matmul::TileConfig {
+                    bm: 16,
+                    bn: 32,
+                    variant: ops::matmul::TileVariant::MlxArchMicro,
+                };
+                let t_micro = bench_with_tile(
+                    &registry,
+                    &queue,
+                    device,
+                    &a,
+                    &b,
+                    m,
+                    boundary_k,
+                    n,
+                    &tile_micro,
+                );
+
+                // BM=32, BN=32 (MlxArchSmall)
+                let tile_small = ops::matmul::TileConfig {
+                    bm: 32,
+                    bn: 32,
+                    variant: ops::matmul::TileVariant::MlxArchSmall,
+                };
+                let t_small = bench_with_tile(
+                    &registry,
+                    &queue,
+                    device,
+                    &a,
+                    &b,
+                    m,
+                    boundary_k,
+                    n,
+                    &tile_small,
+                );
+
+                let flops = 2.0 * m as f64 * boundary_k as f64 * n as f64;
+                let tf_micro = flops / (t_micro * 1e-6) / 1e12;
+                let tf_small = flops / (t_small * 1e-6) / 1e12;
+                let winner = if t_micro < t_small { "BM16" } else { "BM32" };
+                let pct = ((t_small as f64 / t_micro as f64) - 1.0) * 100.0;
+
+                println!(
+                    "  M={:3}  BM16={:8.1}us ({:.2}T)  BM32={:8.1}us ({:.2}T)  winner={:<4}  diff={:+.1}%",
+                    m, t_micro, tf_micro, t_small, tf_small, winner, pct,
                 );
             }
             println!();
