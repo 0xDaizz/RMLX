@@ -238,57 +238,124 @@ fn main() {
     // =====================================================================
     // sdpa (Scaled Dot-Product Attention)
     // =====================================================================
+    // RMLX SDPA is per-head 2D [tokens, head_dim]. To match MLX's multi-head
+    // benchmark (4D [1, 32, 1024, 128] with 8 KV heads for GQA), we loop
+    // over all 32 query heads. GQA: 32 Q heads, 8 KV heads (ratio 4:1).
     println!("\n=== sdpa ===");
     {
-        // SDPA expects 2D [tokens, head_dim].
-        // For a single head: Q=[1024, 128], K=[1024, 128], V=[1024, 128]
+        let n_q_heads: usize = 32;
+        let n_kv_heads: usize = 8;
         let head_dim: usize = 128;
         let q_sl: usize = 1024;
         let k_sl: usize = 1024;
         let scale = 1.0 / (head_dim as f32).sqrt();
 
-        let q = rand_array(device, &[q_sl, head_dim], 40);
-        let k = rand_array(device, &[k_sl, head_dim], 41);
-        let v = rand_array(device, &[k_sl, head_dim], 42);
+        // Per-head Q arrays (32 heads)
+        let q_heads: Vec<Array> = (0..n_q_heads)
+            .map(|i| rand_array(device, &[q_sl, head_dim], 40 + i as u64))
+            .collect();
+        // Per-head KV arrays (8 KV heads, each shared by 4 Q heads)
+        let k_heads: Vec<Array> = (0..n_kv_heads)
+            .map(|i| rand_array(device, &[k_sl, head_dim], 140 + i as u64))
+            .collect();
+        let v_heads: Vec<Array> = (0..n_kv_heads)
+            .map(|i| rand_array(device, &[k_sl, head_dim], 240 + i as u64))
+            .collect();
 
-        // FLOPS for one head: 2*N*S*D (QK^T) + 2*N*S*D (attn@V)
-        let flops = 2.0 * (q_sl as f64) * (k_sl as f64) * (head_dim as f64) * 2.0;
-        bench(
-            "sdpa [1024, 128] x [1024, 128] (1 head)",
-            Some(flops),
-            || {
-                let _ = ops::sdpa::sdpa(&registry, &q, &k, &v, None, scale, false, &queue).unwrap();
-            },
-        );
-    }
-    {
-        // Causal SDPA
-        let head_dim: usize = 128;
-        let q_sl: usize = 1024;
-        let k_sl: usize = 1024;
-        let scale = 1.0 / (head_dim as f32).sqrt();
-
-        let q = rand_array(device, &[q_sl, head_dim], 43);
-        let k = rand_array(device, &[k_sl, head_dim], 44);
-        let v = rand_array(device, &[k_sl, head_dim], 45);
-
-        let flops = 2.0 * (q_sl as f64) * (k_sl as f64) * (head_dim as f64) * 2.0;
-        bench("sdpa [1024, 128] causal (1 head)", Some(flops), || {
-            let _ = ops::sdpa::sdpa(&registry, &q, &k, &v, None, scale, true, &queue).unwrap();
+        // FLOPS for all heads: n_q_heads * (2*N*S*D for QK^T + 2*N*S*D for attn@V)
+        let flops =
+            n_q_heads as f64 * 2.0 * (q_sl as f64) * (k_sl as f64) * (head_dim as f64) * 2.0;
+        let gqa_ratio = n_q_heads / n_kv_heads;
+        bench("sdpa 32h GQA [1024,128] (32Q/8KV)", Some(flops), || {
+            for h in 0..n_q_heads {
+                let kv_idx = h / gqa_ratio;
+                let _ = ops::sdpa::sdpa(
+                    &registry,
+                    &q_heads[h],
+                    &k_heads[kv_idx],
+                    &v_heads[kv_idx],
+                    None,
+                    scale,
+                    false,
+                    &queue,
+                )
+                .unwrap();
+            }
         });
     }
     {
-        // Decode path: single query token
+        // Causal SDPA — 32 heads, GQA 32Q/8KV
+        let n_q_heads: usize = 32;
+        let n_kv_heads: usize = 8;
+        let head_dim: usize = 128;
+        let q_sl: usize = 1024;
+        let k_sl: usize = 1024;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let q_heads: Vec<Array> = (0..n_q_heads)
+            .map(|i| rand_array(device, &[q_sl, head_dim], 43 + i as u64))
+            .collect();
+        let k_heads: Vec<Array> = (0..n_kv_heads)
+            .map(|i| rand_array(device, &[k_sl, head_dim], 143 + i as u64))
+            .collect();
+        let v_heads: Vec<Array> = (0..n_kv_heads)
+            .map(|i| rand_array(device, &[k_sl, head_dim], 243 + i as u64))
+            .collect();
+
+        let flops =
+            n_q_heads as f64 * 2.0 * (q_sl as f64) * (k_sl as f64) * (head_dim as f64) * 2.0;
+        let gqa_ratio = n_q_heads / n_kv_heads;
+        bench("sdpa 32h GQA [1024,128] causal", Some(flops), || {
+            for h in 0..n_q_heads {
+                let kv_idx = h / gqa_ratio;
+                let _ = ops::sdpa::sdpa(
+                    &registry,
+                    &q_heads[h],
+                    &k_heads[kv_idx],
+                    &v_heads[kv_idx],
+                    None,
+                    scale,
+                    true,
+                    &queue,
+                )
+                .unwrap();
+            }
+        });
+    }
+    {
+        // Decode path: single query token, 32 heads GQA
+        let n_q_heads: usize = 32;
+        let n_kv_heads: usize = 8;
         let head_dim: usize = 128;
         let k_sl: usize = 1024;
         let scale = 1.0 / (head_dim as f32).sqrt();
 
-        let q = rand_array(device, &[1, head_dim], 46);
-        let k = rand_array(device, &[k_sl, head_dim], 47);
-        let v = rand_array(device, &[k_sl, head_dim], 48);
+        let q_heads: Vec<Array> = (0..n_q_heads)
+            .map(|i| rand_array(device, &[1, head_dim], 46 + i as u64))
+            .collect();
+        let k_heads: Vec<Array> = (0..n_kv_heads)
+            .map(|i| rand_array(device, &[k_sl, head_dim], 146 + i as u64))
+            .collect();
+        let v_heads: Vec<Array> = (0..n_kv_heads)
+            .map(|i| rand_array(device, &[k_sl, head_dim], 246 + i as u64))
+            .collect();
 
-        bench("sdpa [1, 128] x [1024, 128] (decode)", None, || {
-            let _ = ops::sdpa::sdpa(&registry, &q, &k, &v, None, scale, false, &queue).unwrap();
+        let gqa_ratio = n_q_heads / n_kv_heads;
+        bench("sdpa 32h GQA [1,128]x[1024,128] decode", None, || {
+            for h in 0..n_q_heads {
+                let kv_idx = h / gqa_ratio;
+                let _ = ops::sdpa::sdpa(
+                    &registry,
+                    &q_heads[h],
+                    &k_heads[kv_idx],
+                    &v_heads[kv_idx],
+                    None,
+                    scale,
+                    false,
+                    &queue,
+                )
+                .unwrap();
+            }
         });
     }
 
@@ -349,19 +416,30 @@ fn main() {
     }
 
     // =====================================================================
-    // reduce::sum (full reduction)
+    // reduce::sum
     // =====================================================================
+    // MLX benchmark uses axis=0 reduce on [32M] (1D), which for 1D is
+    // equivalent to full reduce. For 2D we benchmark axis=0 (Col) to match
+    // MLX's mx.sum(x, axis=0) semantics.
     println!("\n=== reduce ===");
     {
-        let x = rand_array(device, &[32 * 1024 * 1024], 90);
-        bench("sum [32M] (full reduce)", None, || {
-            let _ = ops::reduce::sum(&registry, &x, &queue).unwrap();
+        // axis=0 reduce on 2D: [1024, 1024] -> [1024] (matches MLX axis=0)
+        let x = rand_array(device, &[1024, 1024], 90);
+        bench("sum [1024, 1024] axis=0 (col reduce)", None, || {
+            let _ = ops::reduce::reduce(
+                &registry,
+                &x,
+                ops::reduce::ReduceOp::Sum,
+                ops::reduce::ReduceAxis::Col,
+                &queue,
+            )
+            .unwrap();
         });
     }
     {
-        // Row reduction: [1024, 1024] -> reduce along rows
+        // Row reduction: [1024, 1024] -> [1024] (axis=-1)
         let x = rand_array(device, &[1024, 1024], 91);
-        bench("reduce_sum [1024, 1024] ReduceAxis::Row", None, || {
+        bench("sum [1024, 1024] axis=-1 (row reduce)", None, || {
             let _ = ops::reduce::reduce(
                 &registry,
                 &x,
@@ -373,17 +451,10 @@ fn main() {
         });
     }
     {
-        // Col reduction: [1024, 1024] -> reduce along cols
-        let x = rand_array(device, &[1024, 1024], 92);
-        bench("reduce_sum [1024, 1024] ReduceAxis::Col", None, || {
-            let _ = ops::reduce::reduce(
-                &registry,
-                &x,
-                ops::reduce::ReduceOp::Sum,
-                ops::reduce::ReduceAxis::Col,
-                &queue,
-            )
-            .unwrap();
+        // Full reduce for reference
+        let x = rand_array(device, &[32 * 1024 * 1024], 92);
+        bench("sum [32M] (full reduce, reference)", None, || {
+            let _ = ops::reduce::sum(&registry, &x, &queue).unwrap();
         });
     }
 
