@@ -2176,7 +2176,7 @@ fn dispatch_tiled_gemm(
         (TileVariant::Skinny, DType::Float16) => "gemm_skinny_f16",
         (TileVariant::Skinny, DType::Bfloat16) => "gemm_skinny_bf16",
         (TileVariant::Full, DType::Float32) => "gemm_tiled_f32",
-        (TileVariant::Full, DType::Float16) => "gemm_hiperf_f16",
+        (TileVariant::Full, DType::Float16) => "gemm_tiled_f16",
         (TileVariant::Full, DType::Bfloat16) => "gemm_tiled_bf16",
         _ => {
             return Err(KernelError::NotFound(format!(
@@ -2228,13 +2228,11 @@ fn dispatch_tiled_gemm(
     let grid = MTLSize::new(grid_x, grid_y, grid_z);
 
     // Thread count per threadgroup depends on variant
-    // Full+f16 uses gemm_hiperf_f16 (4 SG = 128 threads), others use 256
-    let tg_threads = match (tile.variant, a.dtype()) {
-        (TileVariant::Small, _) => 256_u64,
-        (TileVariant::Medium, _) | (TileVariant::Simd, _) => 1024_u64,
-        (TileVariant::Skinny, _) => 256_u64,
-        (TileVariant::Full, DType::Float16) => 128_u64, // gemm_hiperf_f16: 4 simdgroups
-        (TileVariant::Full, _) => 256_u64,
+    let tg_threads = match tile.variant {
+        TileVariant::Small => 256_u64,
+        TileVariant::Medium | TileVariant::Simd => 1024_u64,
+        TileVariant::Skinny => 256_u64,
+        TileVariant::Full => 256_u64,
     };
     let tg = MTLSize::new(tg_threads, 1, 1);
 
@@ -2471,7 +2469,7 @@ pub fn matmul_into_cb(
         (TileVariant::Skinny, DType::Float16) => "gemm_skinny_f16",
         (TileVariant::Skinny, DType::Bfloat16) => "gemm_skinny_bf16",
         (TileVariant::Full, DType::Float32) => "gemm_tiled_f32",
-        (TileVariant::Full, DType::Float16) => "gemm_hiperf_f16",
+        (TileVariant::Full, DType::Float16) => "gemm_tiled_f16",
         (TileVariant::Full, DType::Bfloat16) => "gemm_tiled_bf16",
         _ => {
             return Err(KernelError::NotFound(format!(
@@ -2520,13 +2518,11 @@ pub fn matmul_into_cb(
     let grid = MTLSize::new(grid_x, grid_y, 1); // batch=1
 
     // Thread count per threadgroup depends on variant
-    // Full+f16 uses gemm_hiperf_f16 (4 SG = 128 threads), others use 256
-    let tg_threads = match (tile.variant, a.dtype()) {
-        (TileVariant::Small, _) => 256_u64,
-        (TileVariant::Medium, _) | (TileVariant::Simd, _) => 1024_u64,
-        (TileVariant::Skinny, _) => 256_u64,
-        (TileVariant::Full, DType::Float16) => 128_u64,  // gemm_hiperf_f16: 4 simdgroups
-        (TileVariant::Full, _) => 256_u64,
+    let tg_threads = match tile.variant {
+        TileVariant::Small => 256_u64,
+        TileVariant::Medium | TileVariant::Simd => 1024_u64,
+        TileVariant::Skinny => 256_u64,
+        TileVariant::Full => 256_u64,
     };
     let tg = MTLSize::new(tg_threads, 1, 1);
 
