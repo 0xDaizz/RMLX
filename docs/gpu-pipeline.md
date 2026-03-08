@@ -384,8 +384,58 @@ Benchmarks measured on a single transformer layer (Llama-style architecture, f16
 | SDPA dispatches (GQA) | 32 | 1 | 96.9% reduction |
 | Single-layer speedup | 1x | 3.5-7.3x | sequence-length dependent |
 | vs MLX (single-layer) | — | within 1.2-3.4x | |
-| GEMM TFLOPS | — | 13T (rmlx) vs 24T (MLX) | remaining gap |
+| GEMM TFLOPS | — | 21.54T (rmlx) vs 23.97T (MLX) | -10% gap (Phase B) |
 
-The GEMM throughput gap (13T vs 24T TFLOPS) is the primary remaining bottleneck. MLX's GEMM kernels benefit from more aggressive tiling and occupancy tuning.
+The GEMM throughput gap has been narrowed from 13T to 21.54T TFLOPS through the Phase B config sweep (MLX: 23.97T, -10.1% gap). The remaining difference is kernel-level (load pattern, store path), not configuration.
 
 **Benchmarks**: `prefill_bench.rs`, `gemm_bench.rs`
+
+---
+
+## Phase B: GEMM Config Sweep
+
+Phase B systematically searches for the optimal GEMM kernel configuration to close the TFLOPS gap identified in Phase A. Three benchmark sweeps tested 27 kernel variants across M={64..2048} and N={4096,14336}.
+
+### Methodology
+
+| Sweep | File | Configs | Focus |
+|-------|------|---------|-------|
+| 1st | `gemm_sweep.rs` | 7 | BK/SG layout variations |
+| 2nd | `gemm_sweep2.rs` | 9 | BK=16/32/64, thread counts |
+| 3rd | `gemm_opt.rs` | 11 | Occupancy-focused, MLX-style configs |
+
+### Result: bk32_2x4
+
+**Winner: BM=64, BN=64, BK=32, SG=2x4, 256 threads, double-buffered**
+
+This config wins across most M/N combinations. The 2x4 SG layout (2 groups along M, 4 along N) outperforms the previous 4x2 layout because B matrix loads [K,N] benefit from N-direction coalescing.
+
+### MLX Comparison (hwstudio1, M=2048, K=4096, N=14336, f16)
+
+| Config | TFLOPS | vs MLX |
+|--------|-------:|-------:|
+| MLX 0.30.7-dev | 23.97T | -- |
+| rmlx mlx_nopad | 22.11T | -7.8% |
+| rmlx bk32_2x4 | 21.54T | -10.1% |
+
+At small M (<=128), bk32_2x4 beats MLX: 14.73T vs 14.46T.
+
+### Key Findings
+
+1. **SG layout direction**: 2x4 > 4x2 due to B matrix [K,N] coalesced reads
+2. **Padding hurts**: +16B threadgroup padding reduces M3 Ultra occupancy by ~7%
+3. **MLX strategy**: BK=16, 2 SG (64 threads), single buffer — prioritizes occupancy over tile size
+4. **Remaining gap is kernel-level**: load pattern and store path differences, not configuration
+5. **M3 Ultra FP16 peak**: 65.54 TFLOPS; current utilization ~33%
+
+### Updated GEMM TFLOPS
+
+Phase A reported 13T (rmlx) vs 24T (MLX). After the config sweep:
+
+| Metric | Phase A | Phase B |
+|--------|--------:|--------:|
+| rmlx GEMM TFLOPS | 13T | 21.54T |
+| MLX GEMM TFLOPS | 24T | 23.97T |
+| Gap | -46% | -10.1% |
+
+**Benchmarks**: `gemm_sweep.rs`, `gemm_sweep2.rs`, `gemm_opt.rs`
