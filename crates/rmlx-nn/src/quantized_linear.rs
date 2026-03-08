@@ -146,7 +146,7 @@ impl QuantizedLinear {
     ///
     /// - batch=1: dispatches to `affine_quantized_matmul` (QMV kernel).
     /// - batch>1 + Q4: dispatches to `affine_quantized_matmul_batched` (QMM kernel).
-    /// - batch>1 + Q8: falls back to CPU `affine_qmm` (no Metal Q8 QMM kernel yet).
+    /// - batch>1 + Q8: dispatches to `affine_quantized_matmul_batched` (QMM Q8 kernel).
     pub fn forward(
         &self,
         x: &Array,
@@ -192,61 +192,9 @@ impl QuantizedLinear {
             // Reshape to [1, out_features]
             out_1d.reshape(vec![1, self.out_features])
         } else {
-            // Batched: use QMM kernel for Q4, CPU fallback for Q8
-            match self.bits {
-                QuantBits::Q4 => {
-                    quantized::affine_quantized_matmul_batched(registry, &x_2d, &qw, queue)
-                }
-                QuantBits::Q8 => {
-                    // CPU fallback: read x to CPU, run affine_qmm, upload result
-                    self.forward_cpu_fallback(&x_2d, batch, dev)
-                }
-            }
+            // Batched: use MMA QMM kernel for both Q4 and Q8
+            quantized::affine_quantized_matmul_batched(registry, &x_2d, &qw, queue)
         }
-    }
-
-    /// CPU fallback for Q8 batched matmul (no Metal QMM kernel for Q8 yet).
-    fn forward_cpu_fallback(
-        &self,
-        x_2d: &Array,
-        batch: usize,
-        dev: &metal::Device,
-    ) -> Result<Array, KernelError> {
-        let x_vec: Vec<f32> = x_2d.to_vec_checked();
-        let mut output = vec![0.0f32; batch * self.out_features];
-
-        // For Q8, we need to adapt the data to the affine_qmm format which
-        // expects Q4 nibble packing. Instead, do a simple dequant-and-matmul.
-        for m in 0..batch {
-            for n in 0..self.out_features {
-                let mut acc = 0.0f32;
-                let groups_per_row = self.in_features / self.group_size;
-                for g in 0..groups_per_row {
-                    let k_start = g * self.group_size;
-                    let scale = self.scales[n * groups_per_row + g];
-                    let bias = self.biases[n * groups_per_row + g];
-
-                    let mut group_dot = 0.0f32;
-                    let mut group_xsum = 0.0f32;
-
-                    for kk in k_start..k_start + self.group_size {
-                        let q = self.w_packed[n * self.in_features + kk] as f32;
-                        let xv = x_vec[m * self.in_features + kk];
-                        group_dot += q * xv;
-                        group_xsum += xv;
-                    }
-
-                    acc += scale * group_dot + bias * group_xsum;
-                }
-                output[m * self.out_features + n] = acc;
-            }
-        }
-
-        Ok(Array::from_slice(
-            dev,
-            &output,
-            vec![batch, self.out_features],
-        ))
     }
 
     /// Build a `QuantizedWeight` by uploading CPU buffers to Metal.
