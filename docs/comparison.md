@@ -266,7 +266,7 @@ CUDA has decades of optimization across compilers (NVCC, Triton), libraries (cuB
 
 **Key insight**: ExecGraph's 64x speedup comes from collapsing the decode path into 9 dispatches in a single command buffer. CUDA's baseline is already more efficient due to stream-ordered execution, so CUDA Graphs provides a smaller relative improvement from a stronger starting point.
 
-**Phase A update**: The prefill path now also uses a single-CB pipeline (54 sync points reduced to 1), GQA slab SDPA (32 per-head dispatches reduced to 1), and GEMM threadgroup swizzle. Single-layer prefill achieves 3.5-7.3x speedup over baseline, with MLX parity within 1.2-3.4x. The remaining gap is primarily in GEMM throughput (rmlx 13 TFLOPS vs MLX 24 TFLOPS).
+**Phase A/B/C update**: The prefill path now also uses a single-CB pipeline (54 sync points reduced to 1), GQA slab SDPA (32 per-head dispatches reduced to 1), and GEMM threadgroup swizzle. Single-layer prefill achieves 3.5-7.3x speedup over baseline, with MLX parity within 1.2-3.4x. GEMM throughput has been optimized from 13T to 21.21T TFLOPS through config sweep (Phase B) and kernel-level optimization (Phase C), narrowing the gap vs MLX (23.97T) to ~11.5%.
 
 ---
 
@@ -351,6 +351,7 @@ The following gaps identified in earlier versions have been closed:
 | **Phase S3a** | Attention Optimization | Flash Attention 2 (K/V outer loop, D≤256, decode fast path) | Sections 4.1 (closed) |
 | **Phase S2** | Advanced Quantization | GGUF loader, AWQ/GPTQ dequant, FP8 dtypes | Section 4.4 (closed) |
 | **Phase A** | Prefill Optimization | Single-CB pipeline, GQA slab SDPA, GEMM swizzle, 3.5-7.3x speedup | Prefill performance gap narrowed |
+| **Phase B+C** | GEMM Optimization | Config sweep (27 variants), kernel-level opt (wide_load, SG=2×4 layout), gemm_bench fix | GEMM throughput gap narrowed to 11.5% |
 
 The Phase 0+1+2 full-crate audit added 76 items including GatherMM, LayerNorm, unary ops, QuantizedLinear, MLA, sliding window attention, GGUF loading, 14 activation functions, ring/allreduce collectives, connection manager, and coordinator.
 

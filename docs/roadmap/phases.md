@@ -1159,6 +1159,53 @@ Systematically find the optimal GEMM kernel configuration to close the TFLOPS ga
 
 ---
 
+## Phase C: GEMM Kernel-Level Optimization — Complete
+
+### Objective
+
+Following Phase B's config sweep, optimize the GEMM kernel internals to further close the TFLOPS gap with MLX. Three kernel-level optimizations tested via a 6-variant ablation benchmark.
+
+### Key Deliverables
+
+- **Ablation benchmark**: `gemm_kernel_opt.rs` (6 variants)
+- **Production integration**: SG=2x4 layout applied to `matmul.rs` kernels (f32/f16/bf16)
+- **Bench infrastructure fix**: `gemm_bench.rs` updated to direct kernel dispatch with pre-allocated buffers
+- **TFLOPS improvement**: 15.73T (baseline) to 21.21T (+34.8%) — MLX 23.97T (~11.5% gap)
+
+### Optimization Results
+
+| Optimization | Description | Result |
+|-------------|-------------|--------|
+| direct_store | simdgroup register → device memory (no scratch buffer/barriers) | Correct, ~1-2% slower (per-lane scatter writes don't coalesce) |
+| **wide_load** | 2×half4 per iteration (8 elements vs 4), loop iterations/memory requests halved | **Winner: +5% improvement** |
+| aligned | Bounds check removal for tile-aligned dimensions | Correct on small matrices, performance collapse on large M + N=14336 |
+
+### Results
+
+| Metric | Value |
+|--------|-------|
+| Kernel variants tested | 6 |
+| TFLOPS (M=2048, K=4096, N=14336) | 21.21T |
+| vs MLX | ~11.5% gap (23.97T) |
+| Improvement from baseline | +34.8% (from 15.73T) |
+
+### Key Findings
+
+1. Direct store (bypassing scratch buffer) hurts coalescing — threadgroup-mediated writes remain superior on M3
+2. Wide loads (2×half4) effectively halve loop iterations and memory requests → consistent +5% gain
+3. Aligned (bounds-check-free) path collapses at large dimensions; not viable as default
+4. SG=2x4 layout confirmed optimal (Phase B finding) and integrated into production kernels
+
+### Completion Criteria (DoD)
+
+- [x] 6-variant ablation benchmark implemented (`gemm_kernel_opt.rs`)
+- [x] Wide load optimization applied to production kernels
+- [x] SG=2x4 layout integrated into `matmul.rs` (f32/f16/bf16)
+- [x] `gemm_bench.rs` fixed for direct kernel dispatch
+- [x] MLX comparison on hwstudio1 hardware
+
+---
+
 ## 🧪 CI Required Test Matrix
 
 The CI pipeline applied across all phases:
