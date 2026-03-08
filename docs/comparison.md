@@ -335,7 +335,7 @@ RMLX maintains strict numerical parity between its baseline execution path and t
 |--------|-------|
 | max_diff (baseline vs ExecGraph) | 6.4e-6 |
 | Tolerance threshold | 1e-4 |
-| Test coverage | 1,142+ tests |
+| Test coverage | 1,298+ tests |
 | Verification method | Element-wise comparison across all ops |
 
 This ensures that the 17.4x performance improvement from ExecGraph introduces no meaningful numerical drift.
