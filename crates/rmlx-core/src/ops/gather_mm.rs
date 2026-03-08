@@ -40,7 +40,7 @@ use metal::MTLSize;
 pub const GATHER_MM_SHADER_SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
-using namespace metal::simdgroup;
+
 
 constant constexpr uint BM = 32;
 constant constexpr uint BN = 32;
