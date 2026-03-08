@@ -43,7 +43,7 @@
 
 use std::time::Duration;
 
-use metal::CommandQueue;
+use metal::{CommandBuffer, CommandQueue};
 
 use crate::batcher::CommandBatcher;
 use crate::event::{EventError, GpuEvent};
@@ -75,6 +75,11 @@ pub struct ExecGraph<'q, 'e> {
     counter: u64,
     total_batches: usize,
     sync_timeout: Duration,
+    /// Last committed command buffer, retained for `wait_until_completed` in `sync()`.
+    /// `MTLSharedEvent.signaledValue` polling is unreliable on Apple Silicon when
+    /// multiple command buffers are in flight across iterations; using the CB's own
+    /// completion mechanism is more robust.
+    last_cb: Option<CommandBuffer>,
 }
 
 impl<'q, 'e> ExecGraph<'q, 'e> {
@@ -94,6 +99,7 @@ impl<'q, 'e> ExecGraph<'q, 'e> {
             counter: 0,
             total_batches: 0,
             sync_timeout: Duration::from_secs(10),
+            last_cb: None,
         }
     }
 
@@ -137,7 +143,7 @@ impl<'q, 'e> ExecGraph<'q, 'e> {
         }
         self.counter += 1;
         let value = self.counter;
-        self.batcher.flush_signal(self.event, value);
+        self.last_cb = self.batcher.flush_signal(self.event, value);
         self.total_batches += 1;
         EventToken { value }
     }
@@ -167,7 +173,7 @@ impl<'q, 'e> ExecGraph<'q, 'e> {
         // Flush any pending work
         if self.batcher.has_pending() {
             self.counter += 1;
-            self.batcher.flush_signal(self.event, self.counter);
+            self.last_cb = self.batcher.flush_signal(self.event, self.counter);
             self.total_batches += 1;
         }
 
@@ -175,7 +181,15 @@ impl<'q, 'e> ExecGraph<'q, 'e> {
             return Ok(Duration::ZERO);
         }
 
-        self.event.cpu_wait(self.counter, self.sync_timeout)
+        // Use CB's own wait_until_completed instead of SharedEvent polling.
+        // MTLSharedEvent.signaledValue polling is unreliable on Apple Silicon
+        // when GPU has prior in-flight work from previous iterations.
+        let start = std::time::Instant::now();
+        if let Some(ref cb) = self.last_cb {
+            cb.wait_until_completed();
+        }
+        self.last_cb = None;
+        Ok(start.elapsed())
     }
 
     /// Sync and reset for the next forward pass.
@@ -191,6 +205,7 @@ impl<'q, 'e> ExecGraph<'q, 'e> {
     pub fn reset(&mut self) {
         self.counter = 0;
         self.total_batches = 0;
+        self.last_cb = None;
         self.event.reset();
     }
 
