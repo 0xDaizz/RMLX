@@ -13,6 +13,8 @@ use rmlx_core::dtype::DType;
 use rmlx_core::kernels::KernelRegistry;
 use rmlx_core::ops;
 use rmlx_metal::device::GpuDevice;
+use rmlx_metal::event::GpuEvent;
+use rmlx_metal::exec_graph::ExecGraph;
 use rmlx_nn::{
     Attention, AttentionConfig, FeedForward, LayerKvCache, Linear, LinearConfig, TransformerBlock,
 };
@@ -294,14 +296,18 @@ fn main() {
         WARMUP_ITERS, BENCH_ITERS
     );
 
-    // Build transformer blocks (f16) — one for baseline, one for single_cb
+    // Build transformer blocks (f16) — one for baseline, one for single_cb, one for graph
     let block = build_transformer_block(device);
     let mut block_cb = build_transformer_block(device);
+    let mut block_graph = build_transformer_block(device);
 
-    // Pre-transpose weights for the single_cb path
+    // Pre-transpose weights for the single_cb and graph paths
     block_cb
         .prepare_weights_for_graph(&registry, &queue)
         .expect("prepare_weights_for_graph failed");
+    block_graph
+        .prepare_weights_for_graph(&registry, &queue)
+        .expect("prepare_weights_for_graph failed (graph)");
 
     // Precompute RoPE cos/sin tables: shape [MAX_SEQ_LEN, HEAD_DIM/2]
     let (cos_vec, sin_vec) = ops::rope::precompute_freqs(MAX_SEQ_LEN, HEAD_DIM, ROPE_THETA, 1.0)
@@ -309,8 +315,8 @@ fn main() {
     let cos_full = Array::from_slice(device, &cos_vec, vec![MAX_SEQ_LEN, HEAD_DIM / 2]);
     let sin_full = Array::from_slice(device, &sin_vec, vec![MAX_SEQ_LEN, HEAD_DIM / 2]);
 
-    // Collect results for summary table: (seq_len, forward_stats, single_cb_stats)
-    let mut results: Vec<(usize, Stats, Stats)> = Vec::new();
+    // Collect results for summary table: (seq_len, forward_stats, single_cb_stats, graph_stats)
+    let mut results: Vec<(usize, Stats, Stats, Stats)> = Vec::new();
 
     for &seq_len in SEQ_LENS {
         println!("\nseq_len={}:", seq_len);
@@ -426,30 +432,102 @@ fn main() {
                 stats_cb, speedup
             );
 
-            results.push((seq_len, stats, stats_cb));
+            // ---- Benchmark 3: forward_prefill_graph() (ExecGraph) ----
+            let mut cache_graph = LayerKvCache::preallocated(
+                device,
+                NUM_KV_HEADS,
+                HEAD_DIM,
+                MAX_SEQ_LEN,
+                DType::Float16,
+            );
+
+            // Warmup
+            for _ in 0..WARMUP_ITERS {
+                cache_graph.seq_len = 0;
+                let event = GpuEvent::new(device);
+                let mut graph = ExecGraph::new(&queue, &event, 64);
+                let cb = graph.command_buffer();
+                let _ = block_graph.forward_prefill_single_cb(
+                    &input,
+                    Some(&cos_freqs),
+                    Some(&sin_freqs),
+                    Some(&mask),
+                    &mut cache_graph,
+                    &registry,
+                    cb,
+                );
+                let _t = graph.submit_batch();
+                let _ = graph.sync();
+            }
+
+            // Benchmark
+            let mut latencies_graph = Vec::with_capacity(BENCH_ITERS);
+            for _ in 0..BENCH_ITERS {
+                cache_graph.seq_len = 0;
+                let event = GpuEvent::new(device);
+                let mut graph = ExecGraph::new(&queue, &event, 64);
+                let start = Instant::now();
+                let cb = graph.command_buffer();
+                let _ = block_graph
+                    .forward_prefill_single_cb(
+                        &input,
+                        Some(&cos_freqs),
+                        Some(&sin_freqs),
+                        Some(&mask),
+                        &mut cache_graph,
+                        &registry,
+                        cb,
+                    )
+                    .expect("forward_prefill_graph failed");
+                let _t = graph.submit_batch();
+                graph.sync().expect("graph sync failed");
+                latencies_graph.push(start.elapsed());
+            }
+
+            let stats_graph = Stats::from_durations(&latencies_graph);
+            let speedup_graph = stats.mean / stats_graph.mean;
+            println!(
+                "  prefill_graph()        : {}   speedup={:.2}x",
+                stats_graph, speedup_graph
+            );
+
+            results.push((seq_len, stats, stats_cb, stats_graph));
         }
     }
 
     // Comparison summary table
-    println!("\n{}", "=".repeat(80));
+    println!("\n{}", "=".repeat(100));
     println!("========== Comparison ==========");
     println!(
-        "{:>8} | {:>14} | {:>14} | {:>8} | {:>12}",
-        "seq_len", "forward (us)", "single_cb (us)", "speedup", "MLX ref (us)"
+        "{:>8} | {:>14} | {:>14} | {:>14} | {:>8} | {:>8} | {:>12}",
+        "seq_len",
+        "forward (us)",
+        "single_cb (us)",
+        "graph (us)",
+        "cb spdup",
+        "gr spdup",
+        "MLX ref (us)"
     );
-    println!("{}", "-".repeat(80));
-    for (seq_len, fwd_stats, cb_stats) in &results {
-        let speedup = fwd_stats.mean / cb_stats.mean;
+    println!("{}", "-".repeat(100));
+    for (seq_len, fwd_stats, cb_stats, graph_stats) in &results {
+        let speedup_cb = fwd_stats.mean / cb_stats.mean;
+        let speedup_graph = fwd_stats.mean / graph_stats.mean;
         let mlx_str = match mlx_ref_us(*seq_len) {
             Some(v) => format!("{:.0}", v),
             None => "-".to_string(),
         };
         println!(
-            "{:>8} | {:>14.0} | {:>14.0} | {:>7.2}x | {:>12}",
-            seq_len, fwd_stats.mean, cb_stats.mean, speedup, mlx_str
+            "{:>8} | {:>14.0} | {:>14.0} | {:>14.0} | {:>7.2}x | {:>7.2}x | {:>12}",
+            seq_len,
+            fwd_stats.mean,
+            cb_stats.mean,
+            graph_stats.mean,
+            speedup_cb,
+            speedup_graph,
+            mlx_str
         );
     }
-    println!("{}", "=".repeat(80));
+    println!("{}", "=".repeat(100));
 
     // Weight size reference
     let weight_mb = estimate_bytes(0) / 1e6;

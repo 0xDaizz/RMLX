@@ -4,12 +4,13 @@
 //! operations on Apple Silicon.
 //!
 //! Kernel variants:
-//! - **Steel GEMM** (BM=64, BN=64, BK=16): 64 threads (2 simdgroups),
-//!   MLX-style serpentine MMA, single-buffered with bank-conflict padding.
-//!   Used for f16 when M >= 33, N >= 33.
+//! - **HiPerf GEMM v2** (BM=64, BN=64, BK=16): 128 threads (4 simdgroups),
+//!   2×2 SG grid with 4×4 MMA per SG (16 accumulators), double-buffered 8KB shmem.
+//!   Used for f16 when M >= 33, N >= 33. Combines deeper MMA pipeline with
+//!   memory latency hiding via double buffering.
 //! - **Full tile GEMM** (BM=64, BN=64, BK=32): 256 threads (8 simdgroups),
-//!   half-precision shared memory, double buffering, simdgroup MMA.
-//!   Used for f32/bf16 when M >= 33.
+//!   4×2 SG grid with 2×4 MMA per SG (16×32 sub-tile), half-precision shared
+//!   memory, double buffering, simdgroup MMA. Used for f32/bf16 when M >= 33.
 //! - **Skinny GEMM** (BM=32, BN=128, BK=32): optimized for M=5..32 (small
 //!   batch prefill) with high N-direction parallelism.
 //! - **Small tile GEMM** (BM=16, BN=16, BK=16): for tiny matrices (M,N < 33).
@@ -40,8 +41,8 @@ using namespace metal;
 
 // ===== Full-tile GEMM: BM=64, BN=64, BK=32 =====
 // 256 threads = 8 simdgroups.
-// Each simdgroup handles a 16x16 sub-tile of C (2x2 grid of 8x8 MMA tiles).
-// Simdgroups laid out as 2 rows x 4 cols over the 64x64 output tile.
+// Each simdgroup handles a 16x32 sub-tile of C (2x4 grid of 8x8 MMA tiles).
+// Simdgroups laid out as 4 rows x 2 cols over the 64x64 output tile.
 // Shared memory: half A[2][64*32] + half B[2][32*64] = 2 * 2 * (64*32*2) = 16KB
 // (double-buffered, half precision) — fits in 32KB threadgroup memory.
 //
@@ -52,8 +53,8 @@ constant constexpr uint BM = 64;
 constant constexpr uint BN = 64;
 constant constexpr uint BK = 32;
 constant constexpr uint N_SIMDGROUPS = 8;  // 256 / 32
-constant constexpr uint SG_ROWS = 2;       // simdgroup grid rows
-constant constexpr uint SG_COLS = 4;       // simdgroup grid cols
+constant constexpr uint SG_ROWS = 4;       // simdgroup grid rows
+constant constexpr uint SG_COLS = 2;       // simdgroup grid cols
 constant constexpr uint N_THREADS = 256;
 
 // Uniform hint for Metal 3.1+ (M3 and later)
@@ -109,16 +110,16 @@ kernel void gemm_tiled_f32(
     device const float* B_batch = B + batch_idx * as_uniform(batch_stride_b);
     device float*       C_batch = C + batch_idx * as_uniform(batch_stride_c);
 
-    // Simdgroup 2D position: 2 rows x 4 cols
-    const uint sg_row = sgid / SG_COLS;  // 0..1
-    const uint sg_col = sgid % SG_COLS;  // 0..3
+    // Simdgroup 2D position: 4 rows x 2 cols
+    const uint sg_row = sgid / SG_COLS;  // 0..3
+    const uint sg_col = sgid % SG_COLS;  // 0..1
 
-    // Each simdgroup computes 2x2 grid of 8x8 MMA tiles = 16x16 output
-    simdgroup_float8x8 acc[2][2];
+    // Each simdgroup computes 2x4 grid of 8x8 MMA tiles = 16x32 output
+    simdgroup_float8x8 acc[2][4];
     #pragma clang loop unroll(full)
     for (uint i = 0; i < 2; i++)
         #pragma clang loop unroll(full)
-        for (uint j = 0; j < 2; j++)
+        for (uint j = 0; j < 4; j++)
             acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
 
     const uint uK = as_uniform(K);
@@ -173,7 +174,7 @@ kernel void gemm_tiled_f32(
         // Compute on current stage
         for (uint kk = 0; kk < BK; kk += 8) {
             simdgroup_float8x8 a_frag[2];
-            simdgroup_float8x8 b_frag[2];
+            simdgroup_float8x8 b_frag[4];
 
             // Load A sub-tiles: sg_row * 16 + {0,8} rows, kk col
             #pragma clang loop unroll(full)
@@ -181,18 +182,18 @@ kernel void gemm_tiled_f32(
                 simdgroup_load(a_frag[i],
                     &As[stage][(sg_row * 16 + i * 8) * BK + kk], BK);
             }
-            // Load B sub-tiles: kk row, sg_col * 16 + {0,8} cols
+            // Load B sub-tiles: kk row, sg_col * 32 + {0,8,16,24} cols
             #pragma clang loop unroll(full)
-            for (uint j = 0; j < 2; j++) {
+            for (uint j = 0; j < 4; j++) {
                 simdgroup_load(b_frag[j],
-                    &Bs[stage][kk * BN + sg_col * 16 + j * 8], BN);
+                    &Bs[stage][kk * BN + sg_col * 32 + j * 8], BN);
             }
 
-            // 2x2 outer product
+            // 2x4 outer product
             #pragma clang loop unroll(full)
             for (uint i = 0; i < 2; i++)
                 #pragma clang loop unroll(full)
-                for (uint j = 0; j < 2; j++)
+                for (uint j = 0; j < 4; j++)
                     simdgroup_multiply_accumulate(acc[i][j], a_frag[i], b_frag[j], acc[i][j]);
         }
 
@@ -201,19 +202,19 @@ kernel void gemm_tiled_f32(
         }
     }
 
-    // Store 2x2 grid of 8x8 results
-    // Use threadgroup memory for bounds-checked store
-    threadgroup float result_buf[N_SIMDGROUPS * 64];
+    // Store 2x4 grid of 8x8 results
+    // Reuse As[0] as scratch to stay within 32KB threadgroup memory limit
+    threadgroup float* result_buf = (threadgroup float*)&As[0][0];
 
     #pragma clang loop unroll(full)
     for (uint i = 0; i < 2; i++) {
         #pragma clang loop unroll(full)
-        for (uint j = 0; j < 2; j++) {
+        for (uint j = 0; j < 4; j++) {
             simdgroup_store(acc[i][j], &result_buf[sgid * 64], 8);
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
             uint base_row = row_start + sg_row * 16 + i * 8;
-            uint base_col = col_start + sg_col * 16 + j * 8;
+            uint base_col = col_start + sg_col * 32 + j * 8;
 
             for (uint idx = lane_id; idx < 64; idx += 32) {
                 uint lr = idx / 8;
@@ -262,36 +263,60 @@ kernel void gemm_tiled_f16(
     device const half* B_batch = B + batch_idx * as_uniform(batch_stride_b);
     device half*       C_batch = C + batch_idx * as_uniform(batch_stride_c);
 
-    const uint sg_row = sgid / SG_COLS;
-    const uint sg_col = sgid % SG_COLS;
+    const uint sg_row = sgid / SG_COLS;  // 0..3
+    const uint sg_col = sgid % SG_COLS;  // 0..1
 
     // f32 accumulators for numerical stability
-    simdgroup_float8x8 acc[2][2];
+    simdgroup_float8x8 acc[2][4];
     #pragma clang loop unroll(full)
     for (uint i = 0; i < 2; i++)
         #pragma clang loop unroll(full)
-        for (uint j = 0; j < 2; j++)
+        for (uint j = 0; j < 4; j++)
             acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
 
     const uint uK = as_uniform(K);
     const uint uM = as_uniform(M);
     const uint uN = as_uniform(N);
 
-    // Prefetch first tile
+    // Prefetch first tile (vectorized half4 loads)
     {
-        for (uint idx = tid_in_group; idx < BM * BK; idx += N_THREADS) {
-            uint r = idx / BK;
-            uint c = idx % BK;
+        for (uint idx = tid_in_group; idx < (BM * BK) / 4; idx += N_THREADS) {
+            uint flat = idx * 4;
+            uint r = flat / BK;
+            uint c = flat % BK;
             uint gr = row_start + r;
             uint gc = c;
-            As[0][r * BK + c] = (gr < uM && gc < uK) ? A_batch[gr * uK + gc] : half(0);
+            half4 val;
+            if (gr < uM && gc + 3 < uK) {
+                val = *((device const half4*)(&A_batch[gr * uK + gc]));
+            } else {
+                val = half4(
+                    (gr < uM && gc+0 < uK) ? A_batch[gr*uK + gc+0] : half(0),
+                    (gr < uM && gc+1 < uK) ? A_batch[gr*uK + gc+1] : half(0),
+                    (gr < uM && gc+2 < uK) ? A_batch[gr*uK + gc+2] : half(0),
+                    (gr < uM && gc+3 < uK) ? A_batch[gr*uK + gc+3] : half(0)
+                );
+            }
+            *((threadgroup half4*)(&As[0][r * BK + c])) = val;
         }
-        for (uint idx = tid_in_group; idx < BK * BN; idx += N_THREADS) {
-            uint r = idx / BN;
-            uint c = idx % BN;
+        for (uint idx = tid_in_group; idx < (BK * BN) / 4; idx += N_THREADS) {
+            uint flat = idx * 4;
+            uint r = flat / BN;
+            uint c = flat % BN;
             uint gr = r;
             uint gc = col_start + c;
-            Bs[0][r * BN + c] = (gr < uK && gc < uN) ? B_batch[gr * uN + gc] : half(0);
+            half4 val;
+            if (gr < uK && gc + 3 < uN) {
+                val = *((device const half4*)(&B_batch[gr * uN + gc]));
+            } else {
+                val = half4(
+                    (gr < uK && gc+0 < uN) ? B_batch[gr*uN + gc+0] : half(0),
+                    (gr < uK && gc+1 < uN) ? B_batch[gr*uN + gc+1] : half(0),
+                    (gr < uK && gc+2 < uN) ? B_batch[gr*uN + gc+2] : half(0),
+                    (gr < uK && gc+3 < uN) ? B_batch[gr*uN + gc+3] : half(0)
+                );
+            }
+            *((threadgroup half4*)(&Bs[0][r * BN + c])) = val;
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -303,28 +328,50 @@ kernel void gemm_tiled_f16(
         uint next_kb = (tile + 1) * BK;
 
         if (tile + 1 < n_tiles) {
-            for (uint idx = tid_in_group; idx < BM * BK; idx += N_THREADS) {
-                uint r = idx / BK;
-                uint c = idx % BK;
+            for (uint idx = tid_in_group; idx < (BM * BK) / 4; idx += N_THREADS) {
+                uint flat = idx * 4;
+                uint r = flat / BK;
+                uint c = flat % BK;
                 uint gr = row_start + r;
                 uint gc = next_kb + c;
-                As[next_stage][r * BK + c] = (gr < uM && gc < uK)
-                    ? A_batch[gr * uK + gc] : half(0);
+                half4 val;
+                if (gr < uM && gc + 3 < uK) {
+                    val = *((device const half4*)(&A_batch[gr * uK + gc]));
+                } else {
+                    val = half4(
+                        (gr < uM && gc+0 < uK) ? A_batch[gr*uK + gc+0] : half(0),
+                        (gr < uM && gc+1 < uK) ? A_batch[gr*uK + gc+1] : half(0),
+                        (gr < uM && gc+2 < uK) ? A_batch[gr*uK + gc+2] : half(0),
+                        (gr < uM && gc+3 < uK) ? A_batch[gr*uK + gc+3] : half(0)
+                    );
+                }
+                *((threadgroup half4*)(&As[next_stage][r * BK + c])) = val;
             }
-            for (uint idx = tid_in_group; idx < BK * BN; idx += N_THREADS) {
-                uint r = idx / BN;
-                uint c = idx % BN;
+            for (uint idx = tid_in_group; idx < (BK * BN) / 4; idx += N_THREADS) {
+                uint flat = idx * 4;
+                uint r = flat / BN;
+                uint c = flat % BN;
                 uint gr = next_kb + r;
                 uint gc = col_start + c;
-                Bs[next_stage][r * BN + c] = (gr < uK && gc < uN)
-                    ? B_batch[gr * uN + gc] : half(0);
+                half4 val;
+                if (gr < uK && gc + 3 < uN) {
+                    val = *((device const half4*)(&B_batch[gr * uN + gc]));
+                } else {
+                    val = half4(
+                        (gr < uK && gc+0 < uN) ? B_batch[gr*uN + gc+0] : half(0),
+                        (gr < uK && gc+1 < uN) ? B_batch[gr*uN + gc+1] : half(0),
+                        (gr < uK && gc+2 < uN) ? B_batch[gr*uN + gc+2] : half(0),
+                        (gr < uK && gc+3 < uN) ? B_batch[gr*uN + gc+3] : half(0)
+                    );
+                }
+                *((threadgroup half4*)(&Bs[next_stage][r * BN + c])) = val;
             }
         }
 
         // Compute using half-precision simdgroup loads, f32 accumulation
         for (uint kk = 0; kk < BK; kk += 8) {
             simdgroup_half8x8 a_frag[2];
-            simdgroup_half8x8 b_frag[2];
+            simdgroup_half8x8 b_frag[4];
 
             #pragma clang loop unroll(full)
             for (uint i = 0; i < 2; i++) {
@@ -332,15 +379,15 @@ kernel void gemm_tiled_f16(
                     &As[stage][(sg_row * 16 + i * 8) * BK + kk], BK);
             }
             #pragma clang loop unroll(full)
-            for (uint j = 0; j < 2; j++) {
+            for (uint j = 0; j < 4; j++) {
                 simdgroup_load(b_frag[j],
-                    &Bs[stage][kk * BN + sg_col * 16 + j * 8], BN);
+                    &Bs[stage][kk * BN + sg_col * 32 + j * 8], BN);
             }
 
             #pragma clang loop unroll(full)
             for (uint i = 0; i < 2; i++)
                 #pragma clang loop unroll(full)
-                for (uint j = 0; j < 2; j++)
+                for (uint j = 0; j < 4; j++)
                     simdgroup_multiply_accumulate(acc[i][j], a_frag[i], b_frag[j], acc[i][j]);
         }
 
@@ -350,28 +397,46 @@ kernel void gemm_tiled_f16(
     }
 
     // Store results — convert f32 acc to half output
+    // Fast path: simdgroup_store directly to device memory when fully in-bounds
+    // Slow path: bounds-checked store via threadgroup scratch
     threadgroup float result_buf[N_SIMDGROUPS * 64];
 
     #pragma clang loop unroll(full)
     for (uint i = 0; i < 2; i++) {
         #pragma clang loop unroll(full)
-        for (uint j = 0; j < 2; j++) {
-            simdgroup_store(acc[i][j], &result_buf[sgid * 64], 8);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
+        for (uint j = 0; j < 4; j++) {
             uint base_row = row_start + sg_row * 16 + i * 8;
-            uint base_col = col_start + sg_col * 16 + j * 8;
+            uint base_col = col_start + sg_col * 32 + j * 8;
 
-            for (uint idx = lane_id; idx < 64; idx += 32) {
-                uint lr = idx / 8;
-                uint lc = idx % 8;
-                uint gr = base_row + lr;
-                uint gc = base_col + lc;
-                if (gr < uM && gc < uN) {
-                    C_batch[gr * uN + gc] = half(result_buf[sgid * 64 + lr * 8 + lc]);
+            if (base_row + 7 < uM && base_col + 7 < uN) {
+                // Fast path: entire 8x8 block is in-bounds
+                // Store f32 acc to threadgroup, convert to half, write to device
+                simdgroup_store(acc[i][j], &result_buf[sgid * 64], 8);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                for (uint idx = lane_id; idx < 64; idx += 32) {
+                    uint lr = idx / 8;
+                    uint lc = idx % 8;
+                    C_batch[(base_row + lr) * uN + (base_col + lc)] =
+                        half(result_buf[sgid * 64 + lr * 8 + lc]);
                 }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            } else {
+                // Slow path: boundary tile — per-element bounds check
+                simdgroup_store(acc[i][j], &result_buf[sgid * 64], 8);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                for (uint idx = lane_id; idx < 64; idx += 32) {
+                    uint lr = idx / 8;
+                    uint lc = idx % 8;
+                    uint gr = base_row + lr;
+                    uint gc = base_col + lc;
+                    if (gr < uM && gc < uN) {
+                        C_batch[gr * uN + gc] = half(result_buf[sgid * 64 + lr * 8 + lc]);
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
             }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
     }
 }
@@ -410,11 +475,11 @@ kernel void gemm_tiled_bf16(
     const uint sg_row = sgid / SG_COLS;
     const uint sg_col = sgid % SG_COLS;
 
-    simdgroup_float8x8 acc[2][2];
+    simdgroup_float8x8 acc[2][4];
     #pragma clang loop unroll(full)
     for (uint i = 0; i < 2; i++)
         #pragma clang loop unroll(full)
-        for (uint j = 0; j < 2; j++)
+        for (uint j = 0; j < 4; j++)
             acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
 
     const uint uK = as_uniform(K);
@@ -468,7 +533,7 @@ kernel void gemm_tiled_bf16(
         for (uint kk = 0; kk < BK; kk += 8) {
             // Load as float from bfloat shmem (no native bfloat simdgroup_matrix)
             simdgroup_float8x8 a_frag[2];
-            simdgroup_float8x8 b_frag[2];
+            simdgroup_float8x8 b_frag[4];
 
             // Manual load: bfloat -> float for simdgroup_load
             // We use threadgroup float scratch for the conversion
@@ -485,12 +550,12 @@ kernel void gemm_tiled_bf16(
                 simdgroup_load(a_frag[i], a_tmp, 8);
             }
             #pragma clang loop unroll(full)
-            for (uint j = 0; j < 2; j++) {
+            for (uint j = 0; j < 4; j++) {
                 threadgroup float b_tmp[64];
                 for (uint t = lane_id; t < 64; t += 32) {
                     uint tr = t / 8;
                     uint tc = t % 8;
-                    b_tmp[t] = float(Bs[stage][(kk + tr) * BN + sg_col * 16 + j * 8 + tc]);
+                    b_tmp[t] = float(Bs[stage][(kk + tr) * BN + sg_col * 32 + j * 8 + tc]);
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 simdgroup_load(b_frag[j], b_tmp, 8);
@@ -499,7 +564,7 @@ kernel void gemm_tiled_bf16(
             #pragma clang loop unroll(full)
             for (uint i = 0; i < 2; i++)
                 #pragma clang loop unroll(full)
-                for (uint j = 0; j < 2; j++)
+                for (uint j = 0; j < 4; j++)
                     simdgroup_multiply_accumulate(acc[i][j], a_frag[i], b_frag[j], acc[i][j]);
         }
 
@@ -513,12 +578,12 @@ kernel void gemm_tiled_bf16(
     #pragma clang loop unroll(full)
     for (uint i = 0; i < 2; i++) {
         #pragma clang loop unroll(full)
-        for (uint j = 0; j < 2; j++) {
+        for (uint j = 0; j < 4; j++) {
             simdgroup_store(acc[i][j], &result_buf[sgid * 64], 8);
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
             uint base_row = row_start + sg_row * 16 + i * 8;
-            uint base_col = col_start + sg_col * 16 + j * 8;
+            uint base_col = col_start + sg_col * 32 + j * 8;
 
             for (uint idx = lane_id; idx < 64; idx += 32) {
                 uint lr = idx / 8;
@@ -793,6 +858,207 @@ kernel void gemm_simd_bf16(
         uint gc = out_col + lc;
         if (gr < M && gc < N) {
             C_batch[gr * N + gc] = bfloat(result_tiles[sgid][lr * 8 + lc]);
+        }
+    }
+}
+"#;
+
+// ---------------------------------------------------------------------------
+// HiPerf f16 GEMM: BM=64, BN=64, BK=16 — 128 threads (4 simdgroups)
+// Each SG computes 32×32 output = 4×4 grid of 8×8 MMA = 16 accumulators.
+// Single-buffered shmem: (64*16 + 16*64) * 2 bytes = 4KB — minimal footprint.
+// 16 MMA ops per SG per K-step (vs 4 in old kernel) = 4× pipeline utilization.
+// ---------------------------------------------------------------------------
+
+pub const GEMM_HIPERF_SHADER_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// ===== HiPerf v2 f16 GEMM: BM=64, BN=64, BK=16, 4 simdgroups, DOUBLE-BUFFERED =====
+// 128 threads = 4 simdgroups, 2×2 SG grid.
+// Each simdgroup computes a 32×32 sub-tile = 4×4 grid of 8×8 MMA tiles.
+// This gives 16 accumulators per SG, keeping the MMA pipeline fully occupied.
+// Double-buffered shared memory: 2 × (64×16 + 16×64) × 2 bytes = 8KB total.
+// While computing on buffer[stage], the next tile is prefetched into buffer[1-stage],
+// hiding global memory latency.
+
+constant constexpr uint HP_BM = 64;
+constant constexpr uint HP_BN = 64;
+constant constexpr uint HP_BK = 16;
+constant constexpr uint HP_N_SG = 4;       // 4 simdgroups
+constant constexpr uint HP_SG_ROWS = 2;
+constant constexpr uint HP_SG_COLS = 2;
+constant constexpr uint HP_N_THREADS = 128; // 4 * 32
+
+// Uniform hint for Metal 3.1+ (M3 and later)
+#if __METAL_VERSION__ >= 310
+template <typename T>
+METAL_FUNC uniform<T> hp_as_uniform(T val) {
+    return make_uniform(val);
+}
+#else
+template <typename T>
+METAL_FUNC T hp_as_uniform(T val) {
+    return val;
+}
+#endif
+
+inline uint2 hp_swizzle_threadgroup(uint2 tid, uint swizzle_log) {
+    if (swizzle_log == 0) return tid;
+    return uint2(
+        tid.x >> swizzle_log,
+        (tid.y << swizzle_log) | (tid.x & ((1u << swizzle_log) - 1u))
+    );
+}
+
+kernel void gemm_hiperf_f16(
+    device const half* A [[buffer(0)]],
+    device const half* B [[buffer(1)]],
+    device half* C       [[buffer(2)]],
+    constant uint& M     [[buffer(3)]],
+    constant uint& N     [[buffer(4)]],
+    constant uint& K     [[buffer(5)]],
+    constant uint& batch_stride_a [[buffer(6)]],
+    constant uint& batch_stride_b [[buffer(7)]],
+    constant uint& batch_stride_c [[buffer(8)]],
+    constant uint& swizzle_log    [[buffer(9)]],
+    uint3 group_id       [[threadgroup_position_in_grid]],
+    uint  tid_in_group   [[thread_index_in_threadgroup]],
+    uint  sgid           [[simdgroup_index_in_threadgroup]],
+    uint  lane_id        [[thread_index_in_simdgroup]])
+{
+    // Double-buffered shared memory — 8KB total
+    threadgroup half As[2][HP_BM * HP_BK]; // 2 * 64*16 = 2048 halves = 4KB
+    threadgroup half Bs[2][HP_BK * HP_BN]; // 2 * 16*64 = 2048 halves = 4KB
+
+    const uint batch_idx = group_id.z;
+    uint2 swizzled = hp_swizzle_threadgroup(uint2(group_id.x, group_id.y), swizzle_log);
+    const uint row_start = swizzled.y * hp_as_uniform(HP_BM);
+    const uint col_start = swizzled.x * hp_as_uniform(HP_BN);
+
+    device const half* A_batch = A + batch_idx * hp_as_uniform(batch_stride_a);
+    device const half* B_batch = B + batch_idx * hp_as_uniform(batch_stride_b);
+    device half*       C_batch = C + batch_idx * hp_as_uniform(batch_stride_c);
+
+    // SG 2×2 grid: each SG handles a 32×32 sub-tile of the 64×64 output
+    const uint sg_row = sgid / HP_SG_COLS; // 0..1
+    const uint sg_col = sgid % HP_SG_COLS; // 0..1
+
+    // 16 f32 accumulators per SG: 4×4 grid of 8×8 tiles
+    simdgroup_float8x8 acc[4][4];
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < 4; i++)
+        #pragma clang loop unroll(full)
+        for (uint j = 0; j < 4; j++)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    const uint uK = hp_as_uniform(K);
+    const uint uM = hp_as_uniform(M);
+    const uint uN = hp_as_uniform(N);
+    const uint n_tiles = (uK + HP_BK - 1) / HP_BK;
+
+    // ── Prefetch first tile into buffer[0] ──
+    for (uint idx = tid_in_group; idx < HP_BM * HP_BK; idx += HP_N_THREADS) {
+        uint r = idx / HP_BK;
+        uint c = idx % HP_BK;
+        uint gr = row_start + r;
+        uint gc = c;
+        As[0][r * HP_BK + c] = (gr < uM && gc < uK) ? A_batch[gr * uK + gc] : half(0);
+    }
+    for (uint idx = tid_in_group; idx < HP_BK * HP_BN; idx += HP_N_THREADS) {
+        uint r = idx / HP_BN;
+        uint c = idx % HP_BN;
+        uint gr = r;
+        uint gc = col_start + c;
+        Bs[0][r * HP_BN + c] = (gr < uK && gc < uN) ? B_batch[gr * uN + gc] : half(0);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ── Main loop: double-buffered over K dimension ──
+    for (uint tile = 0; tile < n_tiles; tile++) {
+        uint stage = tile & 1;
+        uint next_stage = 1 - stage;
+        uint next_kb = (tile + 1) * HP_BK;
+
+        // Prefetch next tile into buffer[next_stage] (if exists)
+        if (tile + 1 < n_tiles) {
+            for (uint idx = tid_in_group; idx < HP_BM * HP_BK; idx += HP_N_THREADS) {
+                uint r = idx / HP_BK;
+                uint c = idx % HP_BK;
+                uint gr = row_start + r;
+                uint gc = next_kb + c;
+                As[next_stage][r * HP_BK + c] = (gr < uM && gc < uK)
+                    ? A_batch[gr * uK + gc] : half(0);
+            }
+            for (uint idx = tid_in_group; idx < HP_BK * HP_BN; idx += HP_N_THREADS) {
+                uint r = idx / HP_BN;
+                uint c = idx % HP_BN;
+                uint gr = next_kb + r;
+                uint gc = col_start + c;
+                Bs[next_stage][r * HP_BN + c] = (gr < uK && gc < uN)
+                    ? B_batch[gr * uN + gc] : half(0);
+            }
+        }
+
+        // ── Compute on buffer[stage]: 2 kk iterations (BK=16, step 8) ──
+        #pragma clang loop unroll(full)
+        for (uint kk = 0; kk < HP_BK; kk += 8) {
+            simdgroup_half8x8 a_frag[4]; // 4 tiles in M direction (32 rows)
+            simdgroup_half8x8 b_frag[4]; // 4 tiles in N direction (32 cols)
+
+            // Load A fragments: sg_row*32 + {0,8,16,24} rows, kk col
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 4; i++) {
+                simdgroup_load(a_frag[i],
+                    &As[stage][(sg_row * 32 + i * 8) * HP_BK + kk], HP_BK);
+            }
+
+            // Load B fragments: kk row, sg_col*32 + {0,8,16,24} cols
+            #pragma clang loop unroll(full)
+            for (uint j = 0; j < 4; j++) {
+                simdgroup_load(b_frag[j],
+                    &Bs[stage][kk * HP_BN + sg_col * 32 + j * 8], HP_BN);
+            }
+
+            // 4×4 outer product = 16 MMA ops per kk iteration
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 4; i++)
+                #pragma clang loop unroll(full)
+                for (uint j = 0; j < 4; j++)
+                    simdgroup_multiply_accumulate(acc[i][j], a_frag[i], b_frag[j], acc[i][j]);
+        }
+
+        if (tile + 1 < n_tiles) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    // ── Store results: 4×4 grid of 8×8 tiles per simdgroup ──
+    // Each SG writes 32×32 = 1024 values at its sub-tile position.
+    // Use threadgroup scratch for bounds-checked output (one 8×8 tile at a time).
+    threadgroup float result_scratch[HP_N_SG * 64]; // 4 SGs * 64 floats = 1KB
+
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < 4; i++) {
+        #pragma clang loop unroll(full)
+        for (uint j = 0; j < 4; j++) {
+            simdgroup_store(acc[i][j], &result_scratch[sgid * 64], 8);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            uint base_row = row_start + sg_row * 32 + i * 8;
+            uint base_col = col_start + sg_col * 32 + j * 8;
+
+            // Each lane writes 2 elements (64 elements / 32 lanes)
+            for (uint idx = lane_id; idx < 64; idx += 32) {
+                uint lr = idx / 8;
+                uint lc = idx % 8;
+                uint gr = base_row + lr;
+                uint gc = base_col + lc;
+                if (gr < uM && gc < uN) {
+                    C_batch[gr * uN + gc] = half(result_scratch[sgid * 64 + lr * 8 + lc]);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
     }
 }
@@ -1636,6 +1902,7 @@ const BN: usize = 32;
 /// Register all GEMM kernels with the registry.
 pub fn register(registry: &KernelRegistry) -> Result<(), KernelError> {
     registry.register_jit_source("gemm", GEMM_SHADER_SOURCE)?;
+    registry.register_jit_source("gemm_hiperf", GEMM_HIPERF_SHADER_SOURCE)?;
     registry.register_jit_source("gemm_small", GEMM_SMALL_SHADER_SOURCE)?;
     registry.register_jit_source("gemm_skinny", GEMM_SKINNY_SHADER_SOURCE)?;
     registry.register_jit_source("gemm_splitk", SPLIT_K_SHADER_SOURCE)?;
@@ -1962,9 +2229,10 @@ fn dispatch_tiled_gemm(
 
     // Thread count per threadgroup depends on variant
     let tg_threads = match tile.variant {
-        TileVariant::Small => (16 * 16) as u64, // 256
-        TileVariant::Medium | TileVariant::Simd => (32 * 32) as u64, // 1024
-        TileVariant::Skinny | TileVariant::Full => 256_u64, // 8 simdgroups
+        TileVariant::Small => 256_u64,
+        TileVariant::Medium | TileVariant::Simd => 1024_u64,
+        TileVariant::Skinny => 256_u64,
+        TileVariant::Full => 256_u64,
     };
     let tg = MTLSize::new(tg_threads, 1, 1);
 
@@ -2253,7 +2521,8 @@ pub fn matmul_into_cb(
     let tg_threads = match tile.variant {
         TileVariant::Small => 256_u64,
         TileVariant::Medium | TileVariant::Simd => 1024_u64,
-        TileVariant::Skinny | TileVariant::Full => 256_u64,
+        TileVariant::Skinny => 256_u64,
+        TileVariant::Full => 256_u64,
     };
     let tg = MTLSize::new(tg_threads, 1, 1);
 

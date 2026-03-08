@@ -172,7 +172,7 @@ Benchmarks measured on a single transformer layer (LLaMA-style architecture, 409
 | Latency reduction | **94.3%** (~112ms → ~6.4ms) |
 | CB reduction | **92.3%** (65 → 5) |
 | CPU-GPU sync reduction | **98.5%** |
-| Tests passing | **1,142+** |
+| Tests passing | **1,298+** |
 
 ---
 
@@ -221,7 +221,7 @@ ExecGraph's re-encode strategy is well-suited to Metal's command buffer model. R
 ExecGraph produces numerically identical results to the baseline per-op execution path:
 
 - **Maximum absolute difference:** 6.4e-6
-- **Verification:** All 1,142+ tests pass with both code paths
+- **Verification:** All 1,298+ tests pass with both code paths
 - **Guarantee:** The `_into_cb()` pattern encodes the exact same compute pipelines, threadgroup sizes, and buffer bindings as the standard `forward()` path. The only difference is command buffer grouping, which does not affect numerical results.
 
 This level of precision (max_diff=6.4e-6) is well within the expected floating-point tolerance for fp16/bf16 transformer computations and confirms that the pipeline optimization does not introduce any numerical divergence.

@@ -386,6 +386,94 @@ pub fn batched_qkv_proj_into(
     Ok((q_out, k_out, v_out))
 }
 
+/// Batched gate + up projection into an existing command buffer (no commit/wait).
+///
+/// Encodes both gate and up GEMM dispatches into a single command buffer,
+/// saving one compute command encoder creation compared to two separate
+/// `forward_into_cb` calls.
+///
+/// `input`: [seq_len, hidden_size]
+/// `wgate_t`: gate projection weight transposed [in_features, gate_dim]
+/// `wup_t`: up projection weight transposed [in_features, up_dim]
+///
+/// Returns (gate_out, up_out) arrays.
+pub fn batched_gate_up_into_cb(
+    registry: &KernelRegistry,
+    input: &Array,
+    wgate_t: &Array,
+    wup_t: &Array,
+    cb: &metal::CommandBufferRef,
+) -> Result<(Array, Array), KernelError> {
+    // Ensure all inputs are contiguous for the GEMM kernel
+    let input = if input.is_contiguous() {
+        input.view(
+            input.shape().to_vec(),
+            input.strides().to_vec(),
+            input.offset(),
+        )
+    } else {
+        super::copy::copy_into_cb(registry, input, cb)?
+    };
+    let wgate_t = if wgate_t.is_contiguous() {
+        wgate_t.view(
+            wgate_t.shape().to_vec(),
+            wgate_t.strides().to_vec(),
+            wgate_t.offset(),
+        )
+    } else {
+        super::copy::copy_into_cb(registry, wgate_t, cb)?
+    };
+    let wup_t = if wup_t.is_contiguous() {
+        wup_t.view(
+            wup_t.shape().to_vec(),
+            wup_t.strides().to_vec(),
+            wup_t.offset(),
+        )
+    } else {
+        super::copy::copy_into_cb(registry, wup_t, cb)?
+    };
+
+    let m = input.shape()[0] as u32;
+    let k = input.shape()[1] as u32;
+    let n_gate = wgate_t.shape()[1] as u32;
+    let n_up = wup_t.shape()[1] as u32;
+
+    let dev = registry.device().raw();
+    let gate_out = Array::uninit(dev, &[m as usize, n_gate as usize], input.dtype());
+    let up_out = Array::uninit(dev, &[m as usize, n_up as usize], input.dtype());
+
+    let gate_kernel = gemm_kernel_name_for_dims(input.dtype(), m, n_gate)?;
+    let up_kernel = gemm_kernel_name_for_dims(input.dtype(), m, n_up)?;
+
+    let gate_pipeline = registry.get_pipeline(gate_kernel, input.dtype())?;
+    let up_pipeline = registry.get_pipeline(up_kernel, input.dtype())?;
+
+    encode_gemm(
+        cb,
+        &gate_pipeline,
+        &input,
+        &wgate_t,
+        &gate_out,
+        m,
+        n_gate,
+        k,
+        registry,
+    )?;
+    encode_gemm(
+        cb,
+        &up_pipeline,
+        &input,
+        &wup_t,
+        &up_out,
+        m,
+        n_up,
+        k,
+        registry,
+    )?;
+
+    Ok((gate_out, up_out))
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------

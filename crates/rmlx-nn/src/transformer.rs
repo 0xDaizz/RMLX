@@ -257,8 +257,17 @@ impl FeedForward {
                 down_proj,
                 ..
             } => {
-                let gate_out = gate_proj.forward_into_cb(normed, registry, cb)?;
-                let up_out = up_proj.forward_into_cb(normed, registry, cb)?;
+                // Batched gate+up projection: 2 GEMMs in fewer encoders
+                let normed_2d = if normed.ndim() == 1 {
+                    normed.reshape(vec![1, normed.shape()[0]])?
+                } else {
+                    normed.reshape(vec![normed.shape()[0], normed.shape()[1]])?
+                };
+                let wgate_t = gate_proj.weight_transposed_contiguous()?;
+                let wup_t = up_proj.weight_transposed_contiguous()?;
+                let (gate_out, up_out) = ops::fused::batched_gate_up_into_cb(
+                    registry, &normed_2d, &wgate_t, &wup_t, cb,
+                )?;
                 let hidden = ops::fused::fused_silu_mul_into_cb(registry, &gate_out, &up_out, cb)?;
                 let ffn_out = down_proj.forward_into_cb(&hidden, registry, cb)?;
                 ops::binary::add_into_cb(registry, residual, &ffn_out, cb)
@@ -294,8 +303,17 @@ impl FeedForward {
                 ..
             } => {
                 let cb = graph.command_buffer();
-                let gate_out = gate_proj.forward_into_cb(normed, registry, cb)?;
-                let up_out = up_proj.forward_into_cb(normed, registry, cb)?;
+                // Batched gate+up projection: 2 GEMMs in fewer encoders
+                let normed_2d = if normed.ndim() == 1 {
+                    normed.reshape(vec![1, normed.shape()[0]])?
+                } else {
+                    normed.reshape(vec![normed.shape()[0], normed.shape()[1]])?
+                };
+                let wgate_t = gate_proj.weight_transposed_contiguous()?;
+                let wup_t = up_proj.weight_transposed_contiguous()?;
+                let (gate_out, up_out) = ops::fused::batched_gate_up_into_cb(
+                    registry, &normed_2d, &wgate_t, &wup_t, cb,
+                )?;
                 let hidden = ops::fused::fused_silu_mul_into_cb(registry, &gate_out, &up_out, cb)?;
                 let ffn_out = down_proj.forward_into_cb(&hidden, registry, cb)?;
                 ops::binary::add_into_cb(registry, residual, &ffn_out, cb)
@@ -2702,6 +2720,30 @@ impl TransformerBlock {
         self.ffn.forward_single_cb(&normed2, &h, registry, cb)
     }
 
+    /// ExecGraph-based prefill forward: 1 CB per block, GPU-side chaining.
+    ///
+    /// Like `forward_prefill_single_cb` but uses ExecGraph to submit
+    /// the CB with GPU-side event signaling, enabling inter-layer
+    /// overlap when the GPU has spare execution bandwidth.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_prefill_graph(
+        &self,
+        x: &Array,
+        cos_freqs: Option<&Array>,
+        sin_freqs: Option<&Array>,
+        mask: Option<&Array>,
+        cache: &mut LayerKvCache,
+        registry: &KernelRegistry,
+        graph: &mut ExecGraph<'_, '_>,
+    ) -> Result<Array, KernelError> {
+        let cb = graph.command_buffer();
+        let result =
+            self.forward_prefill_single_cb(x, cos_freqs, sin_freqs, mask, cache, registry, cb)?;
+        let t = graph.submit_batch();
+        graph.wait_for(t);
+        Ok(result)
+    }
+
     /// Full ExecGraph forward pass (5 CBs total).
     ///
     /// CB1: RMS norm + Q/K/V projections (fused)
@@ -3403,6 +3445,81 @@ impl TransformerModel {
         graph
             .sync()
             .map_err(|e| KernelError::InvalidShape(format!("TransformerModel graph sync: {e}")))?;
+
+        Ok(x)
+    }
+
+    /// ExecGraph prefill forward: token IDs -> logits.
+    ///
+    /// Uses 1 CB per layer via `forward_prefill_single_cb`, chained
+    /// with GPU-side events through ExecGraph. CPU blocks only once
+    /// at the end.
+    ///
+    /// **Requires** `prepare_weights_for_graph()` to have been called.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_prefill_graph(
+        &self,
+        token_ids: &[u32],
+        cos_freqs: Option<&Array>,
+        sin_freqs: Option<&Array>,
+        mask: Option<&Array>,
+        cache: &mut [LayerKvCache],
+        registry: &KernelRegistry,
+        queue: &metal::CommandQueue,
+        event: &GpuEvent,
+    ) -> Result<Array, KernelError> {
+        let embedding = self.embedding.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape("TransformerModel: embedding not loaded".into())
+        })?;
+        let final_norm = self.final_norm_weight.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape("TransformerModel: final_norm not loaded".into())
+        })?;
+        let lm_head = self.lm_head.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape("TransformerModel: lm_head not loaded".into())
+        })?;
+
+        // Embedding lookup (sync — typically fast)
+        let mut x = embedding.forward(token_ids, registry, queue)?;
+
+        // Validate cache vector length matches number of layers
+        if cache.len() != self.layers.len() {
+            return Err(KernelError::InvalidShape(format!(
+                "TransformerModel: cache has {} entries but model has {} layers",
+                cache.len(),
+                self.layers.len()
+            )));
+        }
+
+        // High encoder limit since each layer uses only 1 CB
+        let mut graph = ExecGraph::new(queue, event, 64);
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            x = layer.forward_prefill_graph(
+                &x,
+                cos_freqs,
+                sin_freqs,
+                mask,
+                &mut cache[i],
+                registry,
+                &mut graph,
+            )?;
+        }
+
+        // Final norm + LM head (encode into graph)
+        let cb_final = graph.command_buffer();
+        x = ops::rms_norm::rms_norm_into_cb(
+            registry,
+            &x,
+            Some(final_norm),
+            self.config.rms_norm_eps,
+            cb_final,
+        )?;
+        x = lm_head.forward_into_cb(&x, registry, cb_final)?;
+
+        // Single CPU sync at the end
+        graph
+            .sync()
+            .map_err(|e| KernelError::InvalidShape(format!("prefill graph sync: {e}")))?;
 
         Ok(x)
     }

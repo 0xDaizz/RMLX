@@ -938,7 +938,7 @@ Post-audit EP optimization phases were merged into main to remove the remaining 
 | EP-5 | `crates/rmlx-core/src/ops/fp8.rs`, `crates/rmlx-distributed/src/fp8_exchange.rs` | Per-token FP8 E4M3 wire format, fused `dequant_scatter_fp8e4m3`, `_into_cb` pipelining variants | Complete |
 | EP-6 | `crates/rmlx-metal/src/icb_sparse.rs`, `crates/rmlx-distributed/src/slab_ring.rs` | Sparse expert ICB launch cache + pre-registered RDMA slab ring with `GpuEvent` timeline sync | Complete |
 
-Current op module count: 32+. Current test count: 1,142+.
+Current op module count: 32+. Current test count: 1,298+.
 
 ---
 
