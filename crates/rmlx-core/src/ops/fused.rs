@@ -479,7 +479,7 @@ pub fn batched_gate_up_into_cb(
 // ---------------------------------------------------------------------------
 
 fn gemm_kernel_name_for_dims(dtype: DType, m: u32, n: u32) -> Result<&'static str, KernelError> {
-    let tile = super::matmul::select_tile_config(m as usize, n as usize, 0);
+    let tile = super::matmul::select_tile_config_with_dtype(m as usize, n as usize, 0, dtype);
     match (tile.variant, dtype) {
         (super::matmul::TileVariant::Small, DType::Float32) => Ok("gemm_small_f32"),
         (super::matmul::TileVariant::Small, DType::Float16) => Ok("gemm_small_f16"),
@@ -496,6 +496,7 @@ fn gemm_kernel_name_for_dims(dtype: DType, m: u32, n: u32) -> Result<&'static st
         (super::matmul::TileVariant::Full, DType::Float32) => Ok("gemm_tiled_f32"),
         (super::matmul::TileVariant::Full, DType::Float16) => Ok("gemm_tiled_f16"),
         (super::matmul::TileVariant::Full, DType::Bfloat16) => Ok("gemm_tiled_bf16"),
+        (super::matmul::TileVariant::MlxArch, DType::Float16) => Ok("gemm_mlx_f16"),
         (_, other) => Err(KernelError::InvalidShape(format!(
             "fused: unsupported dtype for GEMM: {:?}",
             other
@@ -522,7 +523,8 @@ fn encode_gemm(
     let batch_stride_b = k * n;
     let batch_stride_c = m * n;
 
-    let tile = super::matmul::select_tile_config(m as usize, n as usize, k as usize);
+    let tile =
+        super::matmul::select_tile_config_with_dtype(m as usize, n as usize, k as usize, a.dtype());
     let bm = tile.bm as u64;
     let bn = tile.bn as u64;
     let grid_x = (n as u64).div_ceil(bn);
@@ -532,6 +534,7 @@ fn encode_gemm(
         super::matmul::TileVariant::Small => 256_u64,
         super::matmul::TileVariant::Medium | super::matmul::TileVariant::Simd => 1024_u64,
         super::matmul::TileVariant::Skinny | super::matmul::TileVariant::Full => 256_u64,
+        super::matmul::TileVariant::MlxArch => 64_u64,
     };
 
     let enc = cb.new_compute_command_encoder();
@@ -558,10 +561,12 @@ fn encode_gemm(
         &batch_stride_c as *const u32 as *const std::ffi::c_void,
     );
 
-    // Steel and Full/Skinny kernels require swizzle_log (buffer 9)
+    // Full, Skinny, and MlxArch kernels require swizzle_log (buffer 9)
     if matches!(
         tile.variant,
-        super::matmul::TileVariant::Full | super::matmul::TileVariant::Skinny
+        super::matmul::TileVariant::Full
+            | super::matmul::TileVariant::Skinny
+            | super::matmul::TileVariant::MlxArch
     ) {
         let swizzle_log = super::matmul::compute_swizzle_log(m as usize, tile.bm);
         enc.set_bytes(9, 4, &swizzle_log as *const u32 as *const std::ffi::c_void);
