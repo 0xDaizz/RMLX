@@ -595,7 +595,18 @@ kernel void sdpa_f32(
 }
 
 // ─── sdpa_f16 ─────────────────────────────────────────────────────────────
-// Same FA2 algorithm as sdpa_f32, but reads/writes half, accumulates in float.
+// Flash Attention 2 for f16. Q_tile stored as half (2x memory savings),
+// enabling BC=128 (doubled from 64). S_tile, O_acc, softmax stats remain f32.
+//
+// Shared memory budget (D=128, Br=16, Bc_f16=128):
+//   Q_tile:  16*128*2 =  4096 bytes (half)
+//   O_acc:   16*128*4 =  8192 bytes (float)
+//   O_acc2:  16*128*4 =  8192 bytes (float, for D>128)
+//   S_tile:  16*128*4 =  8192 bytes (float, for softmax numerics)
+//   m/l/red: ~288 bytes
+//   Total:   ~28960 bytes < 32KB
+
+constant constexpr uint Bc_f16 = 128;  // Doubled KV block size for f16
 
 kernel void sdpa_f16(
     device const half*  Q         [[buffer(0)]],
@@ -621,8 +632,9 @@ kernel void sdpa_f16(
     const uint q_end   = min(q_start + Br, N);
     const uint q_count = q_end - q_start;
 
-    threadgroup float Q_tile[Br * 128];
-    threadgroup float S_tile[Br * Bc];
+    // Q_tile in half — 2x memory savings vs float
+    threadgroup half  Q_tile[Br * 128];
+    threadgroup float S_tile[Br * Bc_f16];   // f32 for softmax numerics
     threadgroup float m_prev[Br];
     threadgroup float l_prev[Br];
     threadgroup float reduce_buf[SIMD_SIZE];
@@ -645,33 +657,35 @@ kernel void sdpa_f16(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Load Q as float (first D_lo dims)
+    // Load Q as half (first D_lo dims) — stays in half precision
     for (uint idx = tid; idx < q_count * D_lo; idx += n_threads) {
         uint r = idx / D_lo;
         uint d = idx % D_lo;
-        Q_tile[r * D_lo + d] = float(Q[(q_start + r) * D + d]);
+        Q_tile[r * D_lo + d] = Q[(q_start + r) * D + d];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    const uint n_kv_blocks = (S + Bc - 1) / Bc;
+    const uint n_kv_blocks = (S + Bc_f16 - 1) / Bc_f16;
     const uint max_kv_block = is_causal
-        ? min(n_kv_blocks, ((q_start + q_count - 1) / Bc) + 1)
+        ? min(n_kv_blocks, ((q_start + q_count - 1) / Bc_f16) + 1)
         : n_kv_blocks;
 
     for (uint kb = 0; kb < max_kv_block; kb++) {
-        const uint kv_start = kb * Bc;
-        const uint kv_end   = min(kv_start + Bc, S);
+        const uint kv_start = kb * Bc_f16;
+        const uint kv_end   = min(kv_start + Bc_f16, S);
         const uint kv_count = kv_end - kv_start;
 
-        // Compute S = Q @ K^T * scale (K read as float from global)
+        // Compute S = Q @ K^T * scale (Q from half shmem, K from global half)
         for (uint idx = tid; idx < q_count * kv_count; idx += n_threads) {
             uint i = idx / kv_count;
             uint j = idx % kv_count;
             float dot = 0.0f;
 
+            // First D_lo dims from half shared memory
             for (uint d = 0; d < D_lo; d++) {
-                dot += Q_tile[i * D_lo + d] * float(K[(kv_start + j) * D + d]);
+                dot += float(Q_tile[i * D_lo + d]) * float(K[(kv_start + j) * D + d]);
             }
+            // Remaining dims (D > 128) from global memory
             for (uint d = D_lo; d < D; d++) {
                 dot += float(Q[(q_start + i) * D + d]) * float(K[(kv_start + j) * D + d]);
             }
@@ -688,13 +702,13 @@ kernel void sdpa_f16(
                 }
             }
 
-            S_tile[i * Bc + j] = dot;
+            S_tile[i * Bc_f16 + j] = dot;
         }
-        for (uint idx = tid; idx < q_count * Bc; idx += n_threads) {
-            uint j = idx % Bc;
+        for (uint idx = tid; idx < q_count * Bc_f16; idx += n_threads) {
+            uint j = idx % Bc_f16;
             if (j >= kv_count) {
-                uint i = idx / Bc;
-                S_tile[i * Bc + j] = -INFINITY;
+                uint i = idx / Bc_f16;
+                S_tile[i * Bc_f16 + j] = -INFINITY;
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -703,7 +717,7 @@ kernel void sdpa_f16(
         for (uint i = 0; i < q_count; i++) {
             float local_max = -INFINITY;
             for (uint j = tid; j < kv_count; j += n_threads) {
-                local_max = max(local_max, S_tile[i * Bc + j]);
+                local_max = max(local_max, S_tile[i * Bc_f16 + j]);
             }
             float m_new = tg_reduce_max(local_max, tid, lane_id, sg_id,
                                         n_threads, reduce_buf);
@@ -711,8 +725,8 @@ kernel void sdpa_f16(
 
             float local_sum = 0.0f;
             for (uint j = tid; j < kv_count; j += n_threads) {
-                float e = fast::exp(S_tile[i * Bc + j] - m_new);
-                S_tile[i * Bc + j] = e;
+                float e = fast::exp(S_tile[i * Bc_f16 + j] - m_new);
+                S_tile[i * Bc_f16 + j] = e;
                 local_sum += e;
             }
             float sum_exp = tg_reduce_sum(local_sum, tid, lane_id, sg_id,
@@ -725,7 +739,7 @@ kernel void sdpa_f16(
                 float o_val = O_acc[i * D_lo + d] * correction;
                 float v_sum = 0.0f;
                 for (uint j = 0; j < kv_count; j++) {
-                    v_sum += S_tile[i * Bc + j] * float(V[(kv_start + j) * D + d]);
+                    v_sum += S_tile[i * Bc_f16 + j] * float(V[(kv_start + j) * D + d]);
                 }
                 O_acc[i * D_lo + d] = o_val + v_sum;
             }
@@ -733,7 +747,7 @@ kernel void sdpa_f16(
                 float o_val = O_acc2[i * D_hi + d] * correction;
                 float v_sum = 0.0f;
                 for (uint j = 0; j < kv_count; j++) {
-                    v_sum += S_tile[i * Bc + j] * float(V[(kv_start + j) * D + (D_lo + d)]);
+                    v_sum += S_tile[i * Bc_f16 + j] * float(V[(kv_start + j) * D + (D_lo + d)]);
                 }
                 O_acc2[i * D_hi + d] = o_val + v_sum;
             }
@@ -996,6 +1010,200 @@ kernel void sdpa_decode_batched_f16(
         }
     }
 }
+
+// ─── sdpa_prefill_gqa_f16 ─────────────────────────────────────────────────
+//
+// GQA-optimized prefill: processes multiple Q heads sharing the same K/V head
+// in a single threadgroup, loading K/V once for all Q heads in the group.
+//
+// For GQA with ratio R (e.g., 32 Q heads / 8 KV heads = R=4), this kernel
+// loads each K/V block once and computes attention for R Q heads, saving
+// R-1 redundant K/V global memory reads per block.
+//
+// Grid: (ceil(N/Br), num_kv_heads, 1)
+// Each threadgroup iterates over R Q heads internally.
+//
+// Buffers:
+//   0: Q      [num_heads * N * D]     — all Q heads contiguous
+//   1: K      [num_kv_heads * S * D]  — all KV heads contiguous
+//   2: V      [num_kv_heads * S * D]  — all KV heads contiguous
+//   3: O      [num_heads * N * D]     — output, same layout as Q
+//   4: mask   [N * S] or dummy        — additive mask (shared across heads)
+//   5: params [10 x uint32]: { N, S, D, has_mask, is_causal, num_heads, num_kv_heads, gqa_ratio, n_q_blocks, kv_stride_S }
+//   6: scale  [float]
+//
+// Threads per threadgroup: 128
+
+// Grid is dispatched as 1D: grid.x = n_q_blocks * num_kv_heads
+// We compute q_block_id and kv_head_id from the flat threadgroup index.
+// params[8] = n_q_blocks (grid stride for kv_head decomposition)
+// params[9] = kv_stride_S (inter-head stride in KV slab, may be > S for pre-alloc cache)
+
+kernel void sdpa_prefill_gqa_f16(
+    device const half*  Q         [[buffer(0)]],
+    device const half*  K         [[buffer(1)]],
+    device const half*  V         [[buffer(2)]],
+    device       half*  O         [[buffer(3)]],
+    device const half*  mask      [[buffer(4)]],
+    constant     uint*  params    [[buffer(5)]],
+    constant     float& scale     [[buffer(6)]],
+    uint  tg_flat   [[threadgroup_position_in_grid]],
+    uint  tid       [[thread_position_in_threadgroup]],
+    uint  lane_id   [[thread_index_in_simdgroup]],
+    uint  sg_id     [[simdgroup_index_in_threadgroup]])
+{
+    const uint N          = params[0];
+    const uint S          = params[1];
+    const uint D          = params[2];
+    const uint has_mask   = params[3];
+    const uint is_causal  = params[4];
+    const uint num_heads  = params[5];
+    const uint num_kv_heads = params[6];
+    const uint gqa_ratio  = params[7];  // num_heads / num_kv_heads
+    const uint n_q_blocks = params[8];  // ceil(N / Br)
+    const uint kv_stride_S = params[9]; // inter-head stride (may be > S for pre-alloc cache)
+
+    const uint q_block_id = tg_flat % n_q_blocks;
+    const uint kv_head_id = tg_flat / n_q_blocks;
+
+    const uint q_start = q_block_id * Br;
+    if (q_start >= N) return;
+    const uint q_end   = min(q_start + Br, N);
+    const uint q_count = q_end - q_start;
+
+    const uint n_threads = 128;
+    const uint D_lo = min(D, 128u);
+
+    // KV pointers for this KV head (use kv_stride_S for inter-head offset)
+    device const half* K_head = K + kv_head_id * kv_stride_S * D;
+    device const half* V_head = V + kv_head_id * kv_stride_S * D;
+
+    const uint n_kv_blocks = (S + Bc_f16 - 1) / Bc_f16;
+
+    // Process each Q head in this GQA group
+    for (uint qh = 0; qh < gqa_ratio; qh++) {
+        const uint head_id = kv_head_id * gqa_ratio + qh;
+        if (head_id >= num_heads) break;
+
+        device const half* Q_head = Q + head_id * N * D;
+        device       half* O_head = O + head_id * N * D;
+
+        // Shared memory — reused for each Q head in the group
+        threadgroup half  Q_tile[Br * 128];
+        threadgroup float S_tile[Br * Bc_f16];
+        threadgroup float m_prev[Br];
+        threadgroup float l_prev[Br];
+        threadgroup float reduce_buf[SIMD_SIZE];
+        threadgroup float O_acc[Br * 128];
+
+        // Initialize accumulators
+        for (uint idx = tid; idx < Br * D_lo; idx += n_threads) {
+            O_acc[idx] = 0.0f;
+        }
+        for (uint idx = tid; idx < Br; idx += n_threads) {
+            m_prev[idx] = -INFINITY;
+            l_prev[idx] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Load Q tile for this head
+        for (uint idx = tid; idx < q_count * D_lo; idx += n_threads) {
+            uint r = idx / D_lo;
+            uint d = idx % D_lo;
+            Q_tile[r * D_lo + d] = Q_head[(q_start + r) * D + d];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const uint max_kv_block = is_causal
+            ? min(n_kv_blocks, ((q_start + q_count - 1) / Bc_f16) + 1)
+            : n_kv_blocks;
+
+        for (uint kb = 0; kb < max_kv_block; kb++) {
+            const uint kv_start = kb * Bc_f16;
+            const uint kv_end   = min(kv_start + Bc_f16, S);
+            const uint kv_count = kv_end - kv_start;
+
+            // Compute S = Q @ K^T * scale
+            for (uint idx = tid; idx < q_count * kv_count; idx += n_threads) {
+                uint i = idx / kv_count;
+                uint j = idx % kv_count;
+                float dot = 0.0f;
+
+                for (uint d = 0; d < D_lo; d++) {
+                    dot += float(Q_tile[i * D_lo + d]) * float(K_head[(kv_start + j) * D + d]);
+                }
+                dot *= scale;
+
+                if (has_mask) {
+                    dot += float(mask[(q_start + i) * S + (kv_start + j)]);
+                }
+                if (is_causal) {
+                    if ((kv_start + j) > (q_start + i)) {
+                        dot = -INFINITY;
+                    }
+                }
+                S_tile[i * Bc_f16 + j] = dot;
+            }
+            for (uint idx = tid; idx < q_count * Bc_f16; idx += n_threads) {
+                uint j = idx % Bc_f16;
+                if (j >= kv_count) {
+                    uint i = idx / Bc_f16;
+                    S_tile[i * Bc_f16 + j] = -INFINITY;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Online softmax + accumulate
+            for (uint i = 0; i < q_count; i++) {
+                float local_max = -INFINITY;
+                for (uint j = tid; j < kv_count; j += n_threads) {
+                    local_max = max(local_max, S_tile[i * Bc_f16 + j]);
+                }
+                float m_new = tg_reduce_max(local_max, tid, lane_id, sg_id,
+                                            n_threads, reduce_buf);
+                m_new = max(m_prev[i], m_new);
+
+                float local_sum = 0.0f;
+                for (uint j = tid; j < kv_count; j += n_threads) {
+                    float e = fast::exp(S_tile[i * Bc_f16 + j] - m_new);
+                    S_tile[i * Bc_f16 + j] = e;
+                    local_sum += e;
+                }
+                float sum_exp = tg_reduce_sum(local_sum, tid, lane_id, sg_id,
+                                              n_threads, reduce_buf);
+
+                float correction = fast::exp(m_prev[i] - m_new);
+                float l_new = l_prev[i] * correction + sum_exp;
+
+                for (uint d = tid; d < D_lo; d += n_threads) {
+                    float o_val = O_acc[i * D_lo + d] * correction;
+                    float v_sum = 0.0f;
+                    for (uint j = 0; j < kv_count; j++) {
+                        v_sum += S_tile[i * Bc_f16 + j] * float(V_head[(kv_start + j) * D + d]);
+                    }
+                    O_acc[i * D_lo + d] = o_val + v_sum;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                if (tid == 0) {
+                    m_prev[i] = m_new;
+                    l_prev[i] = l_new;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+
+        // Write output
+        for (uint idx = tid; idx < q_count * D_lo; idx += n_threads) {
+            uint i = idx / D_lo;
+            uint d = idx % D_lo;
+            float l = l_prev[i];
+            float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
+            O_head[(q_start + i) * D + d] = half(O_acc[idx] * inv_l);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
 "#;
 
 // ---------------------------------------------------------------------------
@@ -1145,6 +1353,9 @@ kernel void sdpa_decode_bf16(
 }
 
 // ─── sdpa_bf16 ────────────────────────────────────────────────────────────
+// Q_tile stored as bfloat (2x memory savings), BC doubled to 128.
+
+constant constexpr uint Bc_bf16 = 128;  // Doubled KV block size for bf16
 
 kernel void sdpa_bf16(
     device const bfloat* Q         [[buffer(0)]],
@@ -1170,13 +1381,13 @@ kernel void sdpa_bf16(
     const uint q_end   = min(q_start + Br, N);
     const uint q_count = q_end - q_start;
 
-    threadgroup float Q_tile[Br * 128];
-    threadgroup float S_tile[Br * Bc];
-    threadgroup float m_prev[Br];
-    threadgroup float l_prev[Br];
-    threadgroup float reduce_buf[SIMD_SIZE];
-    threadgroup float O_acc[Br * 128];
-    threadgroup float O_acc2[Br * 128];
+    threadgroup bfloat Q_tile[Br * 128];    // bfloat — 2x savings
+    threadgroup float  S_tile[Br * Bc_bf16]; // f32 for softmax numerics
+    threadgroup float  m_prev[Br];
+    threadgroup float  l_prev[Br];
+    threadgroup float  reduce_buf[SIMD_SIZE];
+    threadgroup float  O_acc[Br * 128];
+    threadgroup float  O_acc2[Br * 128];
 
     const uint n_threads = 128;
     const uint D_lo = min(D, 128u);
@@ -1194,22 +1405,22 @@ kernel void sdpa_bf16(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Load Q as float
+    // Load Q as bfloat (first D_lo dims) — stays in bfloat precision
     for (uint idx = tid; idx < q_count * D_lo; idx += n_threads) {
         uint r = idx / D_lo;
         uint d = idx % D_lo;
-        Q_tile[r * D_lo + d] = float(Q[(q_start + r) * D + d]);
+        Q_tile[r * D_lo + d] = Q[(q_start + r) * D + d];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    const uint n_kv_blocks = (S + Bc - 1) / Bc;
+    const uint n_kv_blocks = (S + Bc_bf16 - 1) / Bc_bf16;
     const uint max_kv_block = is_causal
-        ? min(n_kv_blocks, ((q_start + q_count - 1) / Bc) + 1)
+        ? min(n_kv_blocks, ((q_start + q_count - 1) / Bc_bf16) + 1)
         : n_kv_blocks;
 
     for (uint kb = 0; kb < max_kv_block; kb++) {
-        const uint kv_start = kb * Bc;
-        const uint kv_end   = min(kv_start + Bc, S);
+        const uint kv_start = kb * Bc_bf16;
+        const uint kv_end   = min(kv_start + Bc_bf16, S);
         const uint kv_count = kv_end - kv_start;
 
         for (uint idx = tid; idx < q_count * kv_count; idx += n_threads) {
@@ -1218,7 +1429,7 @@ kernel void sdpa_bf16(
             float dot = 0.0f;
 
             for (uint d = 0; d < D_lo; d++) {
-                dot += Q_tile[i * D_lo + d] * float(K[(kv_start + j) * D + d]);
+                dot += float(Q_tile[i * D_lo + d]) * float(K[(kv_start + j) * D + d]);
             }
             for (uint d = D_lo; d < D; d++) {
                 dot += float(Q[(q_start + i) * D + d]) * float(K[(kv_start + j) * D + d]);
@@ -1236,13 +1447,13 @@ kernel void sdpa_bf16(
                 }
             }
 
-            S_tile[i * Bc + j] = dot;
+            S_tile[i * Bc_bf16 + j] = dot;
         }
-        for (uint idx = tid; idx < q_count * Bc; idx += n_threads) {
-            uint j = idx % Bc;
+        for (uint idx = tid; idx < q_count * Bc_bf16; idx += n_threads) {
+            uint j = idx % Bc_bf16;
             if (j >= kv_count) {
-                uint i = idx / Bc;
-                S_tile[i * Bc + j] = -INFINITY;
+                uint i = idx / Bc_bf16;
+                S_tile[i * Bc_bf16 + j] = -INFINITY;
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1250,7 +1461,7 @@ kernel void sdpa_bf16(
         for (uint i = 0; i < q_count; i++) {
             float local_max = -INFINITY;
             for (uint j = tid; j < kv_count; j += n_threads) {
-                local_max = max(local_max, S_tile[i * Bc + j]);
+                local_max = max(local_max, S_tile[i * Bc_bf16 + j]);
             }
             float m_new = tg_reduce_max_bf16(local_max, tid, lane_id, sg_id,
                                               n_threads, reduce_buf);
@@ -1258,8 +1469,8 @@ kernel void sdpa_bf16(
 
             float local_sum = 0.0f;
             for (uint j = tid; j < kv_count; j += n_threads) {
-                float e = fast::exp(S_tile[i * Bc + j] - m_new);
-                S_tile[i * Bc + j] = e;
+                float e = fast::exp(S_tile[i * Bc_bf16 + j] - m_new);
+                S_tile[i * Bc_bf16 + j] = e;
                 local_sum += e;
             }
             float sum_exp = tg_reduce_sum_bf16(local_sum, tid, lane_id, sg_id,
@@ -1272,7 +1483,7 @@ kernel void sdpa_bf16(
                 float o_val = O_acc[i * D_lo + d] * correction;
                 float v_sum = 0.0f;
                 for (uint j = 0; j < kv_count; j++) {
-                    v_sum += S_tile[i * Bc + j] * float(V[(kv_start + j) * D + d]);
+                    v_sum += S_tile[i * Bc_bf16 + j] * float(V[(kv_start + j) * D + d]);
                 }
                 O_acc[i * D_lo + d] = o_val + v_sum;
             }
@@ -1280,7 +1491,7 @@ kernel void sdpa_bf16(
                 float o_val = O_acc2[i * D_hi + d] * correction;
                 float v_sum = 0.0f;
                 for (uint j = 0; j < kv_count; j++) {
-                    v_sum += S_tile[i * Bc + j] * float(V[(kv_start + j) * D + (D_lo + d)]);
+                    v_sum += S_tile[i * Bc_bf16 + j] * float(V[(kv_start + j) * D + (D_lo + d)]);
                 }
                 O_acc2[i * D_hi + d] = o_val + v_sum;
             }
@@ -1925,6 +2136,125 @@ pub fn sdpa_batched_into_cb(
     Ok(outputs)
 }
 
+/// GQA-optimized batched prefill SDPA — single kernel dispatch for all heads.
+///
+/// For GQA models (e.g., num_heads=32, num_kv_heads=8), processes R=4 Q heads
+/// per KV head in a single threadgroup, loading K/V once for all Q heads in
+/// the group. This saves (R-1)/R of K/V global memory reads.
+///
+/// Currently f16-only. Falls back to per-head `sdpa_into_cb` for f32/bf16.
+///
+/// Inputs are contiguous slabs:
+/// - `q_slab`: `[num_heads, N, D]` (contiguous Q for all heads)
+/// - `k_slab`: `[num_kv_heads, S, D]` (contiguous K for all KV heads)
+/// - `v_slab`: `[num_kv_heads, S, D]` (contiguous V for all KV heads)
+/// - `kv_seq_stride`: optional inter-head stride for KV slabs. When `Some(max_seq_len)`,
+///   the kernel uses `max_seq_len * D` for KV head offsets instead of `kv_len * D`.
+///   Use this when KV comes from a pre-allocated cache with `max_seq_len` stride.
+///   When `None`, stride equals `kv_len` (backward compatible).
+/// - `mask`: optional `[N, S]` (shared across heads)
+///
+/// Returns: `[num_heads, N, D]` output slab.
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_prefill_gqa_slab_into_cb(
+    registry: &KernelRegistry,
+    q_slab: &Array,
+    k_slab: &Array,
+    v_slab: &Array,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    seq_len: usize,
+    kv_len: usize,
+    kv_seq_stride: Option<usize>,
+    mask: Option<&Array>,
+    scale: f32,
+    is_causal: bool,
+    cb: &metal::CommandBufferRef,
+) -> Result<Array, KernelError> {
+    let dtype = q_slab.dtype();
+
+    // Currently only f16 has the GQA prefill kernel
+    if dtype != DType::Float16 {
+        return Err(KernelError::NotFound(format!(
+            "sdpa_prefill_gqa: only f16 supported, got {:?}",
+            dtype
+        )));
+    }
+
+    if num_kv_heads == 0 || num_heads % num_kv_heads != 0 {
+        return Err(KernelError::InvalidShape(format!(
+            "sdpa_prefill_gqa: num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
+        )));
+    }
+    if head_dim > 128 {
+        return Err(KernelError::InvalidShape(format!(
+            "sdpa_prefill_gqa: head_dim {head_dim} > 128 not supported (D>128 needs O_acc2)"
+        )));
+    }
+
+    let gqa_ratio = num_heads / num_kv_heads;
+    let stride_s = kv_seq_stride.unwrap_or(kv_len);
+    if stride_s < kv_len {
+        return Err(KernelError::InvalidShape(format!(
+            "sdpa_prefill_gqa: kv_seq_stride ({stride_s}) must be >= kv_len ({kv_len})"
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("sdpa_prefill_gqa_f16", dtype)?;
+    let dev = registry.device().raw();
+
+    let out_numel = num_heads * seq_len * head_dim;
+    let out = Array::zeros(dev, &[out_numel], dtype);
+
+    let has_mask_u32: u32 = if mask.is_some() { 1 } else { 0 };
+    let is_causal_u32: u32 = if is_causal { 1 } else { 0 };
+    let n_q_blocks = seq_len.div_ceil(BR);
+    let params: [u32; 10] = [
+        seq_len as u32,
+        kv_len as u32,
+        head_dim as u32,
+        has_mask_u32,
+        is_causal_u32,
+        num_heads as u32,
+        num_kv_heads as u32,
+        gqa_ratio as u32,
+        n_q_blocks as u32,
+        stride_s as u32,
+    ];
+
+    let dummy_buf;
+    let mask_buf = if let Some(m) = mask {
+        m.metal_buffer()
+    } else {
+        dummy_buf = dev.new_buffer(4, metal::MTLResourceOptions::StorageModeShared);
+        &dummy_buf
+    };
+    let mask_offset = mask.map_or(0, |m| m.offset()) as u64;
+
+    let encoder = cb.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(q_slab.metal_buffer()), q_slab.offset() as u64);
+    encoder.set_buffer(1, Some(k_slab.metal_buffer()), k_slab.offset() as u64);
+    encoder.set_buffer(2, Some(v_slab.metal_buffer()), v_slab.offset() as u64);
+    encoder.set_buffer(3, Some(out.metal_buffer()), 0);
+    encoder.set_buffer(4, Some(mask_buf), mask_offset);
+    encoder.set_bytes(
+        5,
+        std::mem::size_of::<[u32; 10]>() as u64,
+        params.as_ptr() as *const std::ffi::c_void,
+    );
+    encoder.set_bytes(6, 4, &scale as *const f32 as *const std::ffi::c_void);
+
+    // Grid: 1D, n_q_blocks * num_kv_heads threadgroups
+    let total_tgs = (n_q_blocks * num_kv_heads) as u64;
+    let tg_size = std::cmp::min(THREADS_PER_TG, pipeline.max_total_threads_per_threadgroup());
+    encoder.dispatch_thread_groups(MTLSize::new(total_tgs, 1, 1), MTLSize::new(tg_size, 1, 1));
+    encoder.end_encoding();
+
+    Ok(out)
+}
+
 /// Batched multi-head SDPA decode — single GPU dispatch for ALL heads.
 ///
 /// Replaces the per-head loop in `sdpa_batched_into_cb` with a single
@@ -2459,6 +2789,257 @@ mod tests {
         assert!(
             msg.contains("dtype mismatch"),
             "expected dtype mismatch error, got: {msg}"
+        );
+    }
+
+    // --- GQA prefill kernel tests -----------------------------------------------
+
+    /// Generate deterministic pseudo-random f32 data in [-0.5, 0.5].
+    /// Smaller range to avoid f16 overflow in attention scores.
+    fn pseudo_random(len: usize, seed: u64) -> Vec<f32> {
+        let mut data = Vec::with_capacity(len);
+        let mut state = seed;
+        for _ in 0..len {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let val = ((state & 0xFFFF) as f32 / 65536.0) - 0.5;
+            data.push(val);
+        }
+        data
+    }
+
+    /// Create an f16 array from f32 data using GPU copy_cast.
+    fn make_f16_array(
+        registry: &KernelRegistry,
+        queue: &metal::CommandQueue,
+        data: &[f32],
+        shape: Vec<usize>,
+    ) -> Array {
+        let dev = registry.device().raw();
+        let f32_arr = Array::from_slice(dev, data, shape);
+        crate::ops::copy::copy_cast(registry, &f32_arr, DType::Float16, queue).unwrap()
+    }
+
+    /// Read f16 array back as f32 via GPU copy_cast.
+    fn read_f16_as_f32(
+        registry: &KernelRegistry,
+        queue: &metal::CommandQueue,
+        arr: &Array,
+    ) -> Vec<f32> {
+        let f32_arr = crate::ops::copy::copy_cast(registry, arr, DType::Float32, queue).unwrap();
+        f32_arr.to_vec_checked()
+    }
+
+    fn setup_with_copy() -> (KernelRegistry, metal::CommandQueue) {
+        let gpu_dev = rmlx_metal::device::GpuDevice::system_default().unwrap();
+        let queue = gpu_dev.raw().new_command_queue();
+        let registry = KernelRegistry::new(gpu_dev);
+        register(&registry).unwrap();
+        crate::ops::copy::register(&registry).unwrap();
+        (registry, queue)
+    }
+
+    /// Helper: run GQA prefill and reference sdpa_batched, return (gqa_f32, ref_f32).
+    #[allow(clippy::too_many_arguments)]
+    fn run_gqa_vs_reference(
+        registry: &KernelRegistry,
+        queue: &metal::CommandQueue,
+        num_heads: usize,
+        num_kv_heads: usize,
+        seq_len: usize,
+        kv_len: usize,
+        head_dim: usize,
+        is_causal: bool,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let _gqa_ratio = num_heads / num_kv_heads;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        // Generate data
+        let q_data = pseudo_random(num_heads * seq_len * head_dim, 42);
+        let k_data = pseudo_random(num_kv_heads * kv_len * head_dim, 137);
+        let v_data = pseudo_random(num_kv_heads * kv_len * head_dim, 256);
+
+        // Create f16 slabs
+        let q_slab = make_f16_array(
+            registry,
+            queue,
+            &q_data,
+            vec![num_heads * seq_len * head_dim],
+        );
+        let k_slab = make_f16_array(
+            registry,
+            queue,
+            &k_data,
+            vec![num_kv_heads * kv_len * head_dim],
+        );
+        let v_slab = make_f16_array(
+            registry,
+            queue,
+            &v_data,
+            vec![num_kv_heads * kv_len * head_dim],
+        );
+
+        // --- GQA prefill path ---
+        let cb = queue.new_command_buffer();
+        let gqa_out = sdpa_prefill_gqa_slab_into_cb(
+            registry,
+            &q_slab,
+            &k_slab,
+            &v_slab,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            seq_len,
+            kv_len,
+            None, // kv_seq_stride = kv_len (contiguous)
+            None,
+            scale,
+            is_causal,
+            cb,
+        )
+        .unwrap();
+        cb.commit();
+        cb.wait_until_completed();
+        let gqa_f32 = read_f16_as_f32(registry, queue, &gqa_out);
+
+        // --- Reference: per-head sdpa path ---
+        // Split slabs into per-head arrays via views
+        let _dev = registry.device().raw();
+        let head_q_size = seq_len * head_dim;
+        let head_kv_size = kv_len * head_dim;
+        let elem_bytes = 2usize; // f16
+
+        let mut q_heads = Vec::with_capacity(num_heads);
+        for h in 0..num_heads {
+            let offset = h * head_q_size * elem_bytes;
+            let view = q_slab.view(vec![seq_len, head_dim], vec![head_dim, 1], offset);
+            q_heads.push(view);
+        }
+
+        let mut k_heads = Vec::with_capacity(num_kv_heads);
+        let mut v_heads = Vec::with_capacity(num_kv_heads);
+        for kh in 0..num_kv_heads {
+            let k_offset = kh * head_kv_size * elem_bytes;
+            let v_offset = kh * head_kv_size * elem_bytes;
+            k_heads.push(k_slab.view(vec![kv_len, head_dim], vec![head_dim, 1], k_offset));
+            v_heads.push(v_slab.view(vec![kv_len, head_dim], vec![head_dim, 1], v_offset));
+        }
+
+        let ref_outputs = sdpa_batched(
+            registry, &q_heads, &k_heads, &v_heads, None, scale, is_causal, queue,
+        )
+        .unwrap();
+
+        // Concatenate reference outputs into a flat f32 vec
+        let mut ref_f32 = Vec::with_capacity(num_heads * head_q_size);
+        for out in &ref_outputs {
+            let f32_out = read_f16_as_f32(registry, queue, out);
+            ref_f32.extend_from_slice(&f32_out);
+        }
+
+        (gqa_f32, ref_f32)
+    }
+
+    fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(
+            a.len(),
+            b.len(),
+            "length mismatch: {} vs {}",
+            a.len(),
+            b.len()
+        );
+        a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    #[test]
+    fn test_gqa_prefill_ratio4_seq64() {
+        let (registry, queue) = setup_with_copy();
+        let (gqa, reference) = run_gqa_vs_reference(
+            &registry, &queue, 32,  // num_heads
+            8,   // num_kv_heads (ratio=4)
+            64,  // seq_len
+            64,  // kv_len
+            128, // head_dim
+            false,
+        );
+        let diff = max_abs_diff(&gqa, &reference);
+        assert!(
+            diff < 1e-2,
+            "GQA ratio=4 seq=64: max_abs_diff={diff} (expected < 1e-2)"
+        );
+    }
+
+    #[test]
+    fn test_gqa_prefill_ratio1_seq64() {
+        let (registry, queue) = setup_with_copy();
+        let (gqa, reference) = run_gqa_vs_reference(
+            &registry, &queue, 8,   // num_heads
+            8,   // num_kv_heads (ratio=1, non-GQA)
+            64,  // seq_len
+            64,  // kv_len
+            128, // head_dim
+            false,
+        );
+        let diff = max_abs_diff(&gqa, &reference);
+        assert!(
+            diff < 1e-2,
+            "GQA ratio=1 seq=64: max_abs_diff={diff} (expected < 1e-2)"
+        );
+    }
+
+    #[test]
+    fn test_gqa_prefill_ratio4_seq33_unaligned() {
+        let (registry, queue) = setup_with_copy();
+        let (gqa, reference) = run_gqa_vs_reference(
+            &registry, &queue, 32, 8, 33, // seq_len — not aligned to BR=16
+            33, 128, false,
+        );
+        let diff = max_abs_diff(&gqa, &reference);
+        assert!(
+            diff < 1e-2,
+            "GQA ratio=4 seq=33 (unaligned): max_abs_diff={diff} (expected < 1e-2)"
+        );
+    }
+
+    #[test]
+    fn test_gqa_prefill_ratio4_seq128() {
+        let (registry, queue) = setup_with_copy();
+        let (gqa, reference) = run_gqa_vs_reference(&registry, &queue, 32, 8, 128, 128, 128, false);
+        let diff = max_abs_diff(&gqa, &reference);
+        assert!(
+            diff < 1e-2,
+            "GQA ratio=4 seq=128: max_abs_diff={diff} (expected < 1e-2)"
+        );
+    }
+
+    #[test]
+    fn test_gqa_prefill_ratio4_seq257_unaligned() {
+        let (registry, queue) = setup_with_copy();
+        let (gqa, reference) = run_gqa_vs_reference(
+            &registry, &queue, 32, 8, 257, // seq_len — not aligned to BR=16 or BC=128
+            257, 128, false,
+        );
+        let diff = max_abs_diff(&gqa, &reference);
+        assert!(
+            diff < 1e-2,
+            "GQA ratio=4 seq=257 (unaligned): max_abs_diff={diff} (expected < 1e-2)"
+        );
+    }
+
+    #[test]
+    fn test_gqa_prefill_ratio4_causal() {
+        let (registry, queue) = setup_with_copy();
+        let (gqa, reference) = run_gqa_vs_reference(
+            &registry, &queue, 32, 8, 64, 64, 128, true, // causal
+        );
+        let diff = max_abs_diff(&gqa, &reference);
+        assert!(
+            diff < 1e-2,
+            "GQA ratio=4 seq=64 causal: max_abs_diff={diff} (expected < 1e-2)"
         );
     }
 }

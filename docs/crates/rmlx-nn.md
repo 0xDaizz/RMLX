@@ -886,6 +886,22 @@ The `gguf_loader.rs` module adds K-quant type mapping functions:
 
 ---
 
+## Phase A: Prefill Performance Summary
+
+Phase A optimizes the prefill (seq_len=N) single-layer path, extending the GPU pipeline beyond decode:
+
+| Optimization | Before | After | Reduction |
+|-------------|--------|-------|-----------|
+| CPU-GPU sync points | 54 | 1 | 98.1% |
+| SDPA dispatches (GQA) | 32 | 1 | 96.9% |
+| Single-layer speedup | 1x | 3.5-7.3x | sequence-length dependent |
+| vs MLX (single-layer) | — | within 1.2-3.4x | |
+| GEMM TFLOPS | — | 13T (rmlx) vs 24T (MLX) | remaining gap |
+
+Key enablers: single-CB prefill pipeline, GQA slab SDPA, GEMM threadgroup swizzle, `matmul_into_cb`, `silu_into_cb`. Benchmarks: `prefill_bench.rs`, `gemm_bench.rs`.
+
+---
+
 ## Phase KO: Decode Performance Summary
 
 Phase KO closes the per-layer decode performance gap with MLX:
