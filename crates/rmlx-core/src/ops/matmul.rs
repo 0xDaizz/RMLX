@@ -2131,6 +2131,7 @@ kernel void gemm_mlx_f16(
     constant uint& batch_stride_b [[buffer(7)]],
     constant uint& batch_stride_c [[buffer(8)]],
     constant uint& swizzle_log    [[buffer(9)]],
+    device const half* residual    [[buffer(10)]],
     uint3 group_id       [[threadgroup_position_in_grid]],
     uint  tid_in_group   [[thread_index_in_threadgroup]],
     uint  sgid           [[simdgroup_index_in_threadgroup]],
