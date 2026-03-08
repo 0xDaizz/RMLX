@@ -168,7 +168,7 @@ fn generate_gemm_shader(cfg: &GemmConfig) -> String {
          METAL_FUNC T sw_as_uniform(T val) {\n\
              return val;\n\
          }\n\
-         #endif\n\n"
+         #endif\n\n",
     );
 
     // Swizzle helper
@@ -179,7 +179,7 @@ fn generate_gemm_shader(cfg: &GemmConfig) -> String {
                  tid.x >> swizzle_log,\n\
                  (tid.y << swizzle_log) | (tid.x & ((1u << swizzle_log) - 1u))\n\
              );\n\
-         }\n\n"
+         }\n\n",
     );
 
     // Kernel function signature
@@ -203,10 +203,10 @@ fn generate_gemm_shader(cfg: &GemmConfig) -> String {
     ));
 
     // Shared memory
-    s.push_str(&format!(
+    s.push_str(
         "    threadgroup half As[SW_BUFS][SW_BM * SW_BK];\n\
-         \x20   threadgroup half Bs[SW_BUFS][SW_BK * SW_BN];\n\n"
-    ));
+         \x20   threadgroup half Bs[SW_BUFS][SW_BK * SW_BN];\n\n",
+    );
 
     // Batch / swizzle setup
     s.push_str(
@@ -216,31 +216,31 @@ fn generate_gemm_shader(cfg: &GemmConfig) -> String {
          \x20   const uint col_start = swizzled.x * sw_as_uniform(SW_BN);\n\n\
          \x20   device const half* A_batch = A + batch_idx * sw_as_uniform(batch_stride_a);\n\
          \x20   device const half* B_batch = B + batch_idx * sw_as_uniform(batch_stride_b);\n\
-         \x20   device half*       C_batch = C + batch_idx * sw_as_uniform(batch_stride_c);\n\n"
+         \x20   device half*       C_batch = C + batch_idx * sw_as_uniform(batch_stride_c);\n\n",
     );
 
     // SG grid position
     s.push_str(
         "    const uint sg_row = sgid / SW_SG_COLS;\n\
-         \x20   const uint sg_col = sgid % SW_SG_COLS;\n\n"
+         \x20   const uint sg_col = sgid % SW_SG_COLS;\n\n",
     );
 
     // Accumulators
-    s.push_str(&format!(
+    s.push_str(
         "    simdgroup_float8x8 acc[SW_TM][SW_TN];\n\
          \x20   #pragma clang loop unroll(full)\n\
          \x20   for (uint i = 0; i < SW_TM; i++)\n\
          \x20       #pragma clang loop unroll(full)\n\
          \x20       for (uint j = 0; j < SW_TN; j++)\n\
-         \x20           acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);\n\n"
-    ));
+         \x20           acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);\n\n",
+    );
 
     // Uniform dimension copies
     s.push_str(
         "    const uint uK = sw_as_uniform(K);\n\
          \x20   const uint uM = sw_as_uniform(M);\n\
          \x20   const uint uN = sw_as_uniform(N);\n\
-         \x20   const uint n_tiles = (uK + SW_BK - 1) / SW_BK;\n\n"
+         \x20   const uint n_tiles = (uK + SW_BK - 1) / SW_BK;\n\n",
     );
 
     if cfg.double_buffered {
@@ -319,7 +319,7 @@ fn generate_double_buffered_loop(s: &mut String, tm: u32, tn: u32) {
          \x20           }\n\
          \x20       }\n\
          \x20   }\n\
-         \x20   threadgroup_barrier(mem_flags::mem_threadgroup);\n\n"
+         \x20   threadgroup_barrier(mem_flags::mem_threadgroup);\n\n",
     );
 
     // Main double-buffered loop
@@ -552,12 +552,16 @@ fn make_u32_buf(device: &metal::Device, val: u32) -> metal::Buffer {
 }
 
 fn ceil_div(a: usize, b: usize) -> usize {
-    (a + b - 1) / b
+    a.div_ceil(b)
 }
 
 fn compute_swizzle_log(m: usize, bm: usize) -> u32 {
     let tiles_m = m.div_ceil(bm);
-    if tiles_m > 3 { 1 } else { 0 }
+    if tiles_m > 3 {
+        1
+    } else {
+        0
+    }
 }
 
 // ---------------------------------------------------------------------------
