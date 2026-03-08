@@ -534,6 +534,7 @@ fn encode_gemm(
         (ops::matmul::TileVariant::Full, DType::Float16) => "gemm_tiled_f16",
         (ops::matmul::TileVariant::Full, DType::Bfloat16) => "gemm_tiled_bf16",
         (ops::matmul::TileVariant::MlxArch, DType::Float16) => "gemm_mlx_f16",
+        (ops::matmul::TileVariant::MlxArch, DType::Float32) => "gemm_mlx_f32",
         (_, other) => {
             return Err(KernelError::InvalidShape(format!(
                 "ExpertGroup: unsupported dtype {:?} for GEMM",
@@ -586,7 +587,8 @@ fn encode_gemm(
             | ops::matmul::TileVariant::Skinny
             | ops::matmul::TileVariant::MlxArch
     ) {
-        let swizzle_log = ops::matmul::compute_swizzle_log(m as usize, tile.bm);
+        let swizzle_log =
+            ops::matmul::compute_swizzle_log(m as usize, n as usize, tile.bm, tile.bn);
         let buf = make_u32_buf(dev, swizzle_log);
         enc.set_buffer(9, Some(&buf), 0);
         Some(buf)

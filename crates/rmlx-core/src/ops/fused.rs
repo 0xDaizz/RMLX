@@ -487,6 +487,7 @@ fn gemm_kernel_name_for_dims(dtype: DType, m: u32, n: u32) -> Result<&'static st
         (super::matmul::TileVariant::Full, DType::Float16) => Ok("gemm_tiled_f16"),
         (super::matmul::TileVariant::Full, DType::Bfloat16) => Ok("gemm_tiled_bf16"),
         (super::matmul::TileVariant::MlxArch, DType::Float16) => Ok("gemm_mlx_f16"),
+        (super::matmul::TileVariant::MlxArch, DType::Float32) => Ok("gemm_mlx_f32"),
         (_, other) => Err(KernelError::InvalidShape(format!(
             "fused: unsupported dtype for GEMM: {:?}",
             other
@@ -576,7 +577,8 @@ fn encode_gemm(
             | super::matmul::TileVariant::Skinny
             | super::matmul::TileVariant::MlxArch
     ) {
-        let swizzle_log = super::matmul::compute_swizzle_log(m as usize, tile.bm);
+        let swizzle_log =
+            super::matmul::compute_swizzle_log(m as usize, n as usize, tile.bm, tile.bn);
         enc.set_bytes(9, 4, &swizzle_log as *const u32 as *const std::ffi::c_void);
     }
 

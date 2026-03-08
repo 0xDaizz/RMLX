@@ -1,7 +1,7 @@
 //! Standalone GEMM kernel benchmark — per-op latency and TFLOPS.
 //!
-//! Tests matmul [M, 4096] @ [4096, K] for K in {4096, 14336}
-//! and M in {16, 32, 64, 128, 256, 512, 1024, 2048}, using f16 dtype.
+//! Tests matmul [M, K] @ [K, N] for various M, K, N combinations using f16 dtype.
+//! Includes MoE grouped GEMM benchmarks (set BENCH_GROUPED=0 to skip).
 //!
 //! Run with:
 //!   cargo bench -p rmlx-core --bench gemm_bench
@@ -194,7 +194,10 @@ fn bench_gemm(
     let bsa_buf = make_u32_buf(device, (m * k) as u32);
     let bsb_buf = make_u32_buf(device, (k * n) as u32);
     let bsc_buf = make_u32_buf(device, (m * n) as u32);
-    let swizzle_buf = make_u32_buf(device, ops::matmul::compute_swizzle_log(m, tile.bm));
+    let swizzle_buf = make_u32_buf(
+        device,
+        ops::matmul::compute_swizzle_log(m, n, tile.bm, tile.bn),
+    );
 
     let grid_x = ceil_div(n, tile.bn) as u64;
     let grid_y = ceil_div(m, tile.bm) as u64;
@@ -261,12 +264,122 @@ fn bench_gemm(
     );
 }
 
+fn bench_grouped_gemm(
+    registry: &KernelRegistry,
+    queue: &metal::CommandQueue,
+    device: &metal::Device,
+) {
+    let k = 4096;
+
+    // MoE scenarios: (label, expert_ms, N)
+    let scenarios: Vec<(&str, Vec<usize>, usize)> = vec![
+        ("8E×M=4 N=2048", vec![4; 8], 2048),
+        ("8E×variable N=2048", vec![3, 5, 8, 2, 6, 4, 7, 1], 2048),
+        ("8E×M=8 N=1536", vec![8; 8], 1536),
+        ("8E×M=4 N=768", vec![4; 8], 768),
+        ("64E×M=1 N=2048", vec![1; 64], 2048),
+    ];
+
+    for (label, expert_ms, n) in &scenarios {
+        let total_m: usize = expert_ms.iter().sum();
+        let num_experts = expert_ms.len();
+        let total_flops = 2.0 * total_m as f64 * k as f64 * *n as f64;
+
+        // Create stacked inputs
+        let a_stacked = rand_array(device, &[total_m, k], 42);
+        let b_stacked = rand_array(device, &[num_experts, k * *n], 44);
+
+        // Baseline: individual dispatches
+        {
+            // Pre-allocate expert arrays ONCE
+            let experts: Vec<_> = expert_ms
+                .iter()
+                .map(|&m_i| {
+                    (
+                        rand_array(device, &[m_i.max(1), k], 42),
+                        rand_array(device, &[k, *n], 44),
+                    )
+                })
+                .collect();
+
+            // Warmup
+            for _ in 0..WARMUP_ITERS {
+                for (a_exp, b_exp) in &experts {
+                    let cb = queue.new_command_buffer();
+                    let _ = ops::matmul::matmul_into_cb(registry, a_exp, b_exp, cb);
+                    cb.commit();
+                    cb.wait_until_completed();
+                }
+            }
+            let mut times = Vec::with_capacity(BENCH_ITERS);
+            for _ in 0..BENCH_ITERS {
+                let start = Instant::now();
+                for (a_exp, b_exp) in &experts {
+                    let cb = queue.new_command_buffer();
+                    let _ = ops::matmul::matmul_into_cb(registry, a_exp, b_exp, cb);
+                    cb.commit();
+                    cb.wait_until_completed();
+                }
+                times.push(start.elapsed());
+            }
+            let stats = Stats::from_durations(&times);
+            let tflops_p50 = total_flops / (stats.p50 * 1e-6) / 1e12;
+            println!(
+                "  {:<25}  baseline   p50={:8.1}us  mean={:8.1}us  TFLOPS(p50)={:.2}",
+                label, stats.p50, stats.mean, tflops_p50,
+            );
+        }
+
+        // Grouped: single dispatch via dispatch_grouped_gemm
+        {
+            let b_3d = Array::from_bytes(
+                device,
+                unsafe {
+                    std::slice::from_raw_parts(
+                        b_stacked.metal_buffer().contents() as *const u8,
+                        num_experts * k * *n * 2, // f16
+                    )
+                },
+                vec![num_experts, k, *n],
+                DType::Float16,
+            );
+
+            // Warmup
+            for _ in 0..WARMUP_ITERS {
+                let _ = ops::matmul::dispatch_grouped_gemm(
+                    registry, &a_stacked, &b_3d, queue, expert_ms, k, *n,
+                );
+            }
+            let mut times = Vec::with_capacity(BENCH_ITERS);
+            for _ in 0..BENCH_ITERS {
+                let start = Instant::now();
+                let _ = ops::matmul::dispatch_grouped_gemm(
+                    registry, &a_stacked, &b_3d, queue, expert_ms, k, *n,
+                );
+                times.push(start.elapsed());
+            }
+            let stats = Stats::from_durations(&times);
+            let tflops_p50 = total_flops / (stats.p50 * 1e-6) / 1e12;
+            println!(
+                "  {:<25}  grouped    p50={:8.1}us  mean={:8.1}us  TFLOPS(p50)={:.2}",
+                label, stats.p50, stats.mean, tflops_p50,
+            );
+        }
+
+        println!();
+    }
+}
+
 fn main() {
     let gpu = GpuDevice::system_default().expect("No GPU device found");
     let registry = KernelRegistry::new(gpu);
     ops::register_all(&registry).expect("Failed to register kernels");
     let device = registry.device().raw();
     let queue = device.new_command_queue();
+
+    let k = 4096;
+    let n_values = [14336, 4096, 2048, 1536, 768];
+    let m_values = [1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048];
 
     println!("=== GEMM Benchmark (f16) ===");
     println!(
@@ -275,43 +388,33 @@ fn main() {
     );
     println!();
 
-    // --- [M, 4096] @ [4096, 14336] (run FIRST to avoid thermal throttling) ---
-    println!("[M, 4096] @ [4096, 14336]:");
-    for m in [16, 32, 64, 128, 256, 512, 1024, 2048] {
-        let a = rand_array(device, &[m, 4096], 42);
-        let b = rand_array(device, &[4096, 14336], 44);
-        bench_gemm(
-            &registry,
-            &queue,
-            device,
-            &a,
-            &b,
-            m,
-            4096,
-            14336,
-            "4096x14336",
-        );
+    for &n in &n_values {
+        println!("[M, {}] @ [{}, {}]:", k, k, n);
+        for &m in &m_values {
+            let a = rand_array(device, &[m, k], 42);
+            let b = rand_array(device, &[k, n], 44);
+            bench_gemm(
+                &registry,
+                &queue,
+                device,
+                &a,
+                &b,
+                m,
+                k,
+                n,
+                &format!("{}x{}", k, n),
+            );
+        }
+        println!();
     }
-    println!();
 
-    // --- [M, 4096] @ [4096, 4096] ---
-    println!("[M, 4096] @ [4096, 4096]:");
-    for m in [16, 32, 64, 128, 256, 512, 1024, 2048] {
-        let a = rand_array(device, &[m, 4096], 42);
-        let b = rand_array(device, &[4096, 4096], 43);
-        bench_gemm(
-            &registry,
-            &queue,
-            device,
-            &a,
-            &b,
-            m,
-            4096,
-            4096,
-            "4096x4096",
-        );
+    // Grouped GEMM benchmark (if BENCH_GROUPED != "0")
+    let bench_grouped = std::env::var("BENCH_GROUPED").unwrap_or_else(|_| "1".to_string());
+    if bench_grouped != "0" {
+        println!("=== Grouped GEMM Benchmark (MoE simulation) ===");
+        println!();
+        bench_grouped_gemm(&registry, &queue, device);
     }
-    println!();
 
     println!("Done.");
 }

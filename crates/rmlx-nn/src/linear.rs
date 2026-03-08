@@ -416,6 +416,7 @@ impl Linear {
                 "gemm_tiled_bf16"
             }
             (ops::matmul::TileVariant::MlxArch, rmlx_core::dtype::DType::Float16) => "gemm_mlx_f16",
+            (ops::matmul::TileVariant::MlxArch, rmlx_core::dtype::DType::Float32) => "gemm_mlx_f32",
             (_, other) => {
                 return Err(KernelError::InvalidShape(format!(
                     "linear: unsupported dtype {:?}",
@@ -469,7 +470,7 @@ impl Linear {
                 | ops::matmul::TileVariant::Skinny
                 | ops::matmul::TileVariant::MlxArch
         ) {
-            let swizzle_log = ops::matmul::compute_swizzle_log(m, tile.bm);
+            let swizzle_log = ops::matmul::compute_swizzle_log(m, n, tile.bm, tile.bn);
             let buf = make_u32_buf(dev, swizzle_log);
             enc.set_buffer(9, Some(&buf), 0);
             Some(buf)
