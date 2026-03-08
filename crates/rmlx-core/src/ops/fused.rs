@@ -1931,19 +1931,19 @@ mod tests {
 
     #[test]
     fn test_gemm_kernel_name_for_dims() {
-        // Full tile (M>=33, N>=33) -> gemm_tiled_*
+        // Full tile (M>=33, N>=33) -> MlxArch kernels
         assert_eq!(
             gemm_kernel_name_for_dims(DType::Float32, 64, 64).unwrap(),
-            "gemm_tiled_f32"
+            "gemm_mlx_f32"
         );
         assert_eq!(
             gemm_kernel_name_for_dims(DType::Float16, 128, 128).unwrap(),
-            "gemm_tiled_f16"
+            "gemm_mlx_f16"
         );
-        // Skinny (M=5..32, N>=33) -> gemm_skinny_*
+        // Skinny f16 (M=5..32, N<=4096) -> MlxArchMicro
         assert_eq!(
             gemm_kernel_name_for_dims(DType::Float16, 16, 128).unwrap(),
-            "gemm_skinny_f16"
+            "gemm_mlx_m16_f16"
         );
         // Unsupported dtype
         assert!(gemm_kernel_name_for_dims(DType::Q4_0, 64, 64).is_err());
