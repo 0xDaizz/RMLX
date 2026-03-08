@@ -2276,13 +2276,13 @@ impl Attention {
     /// Column-parallel: Q, K, V projection weights are sharded by output rows
     /// (each rank gets its local head slice).
     /// Row-parallel: O projection weight is sharded by input columns
-    #[cfg(feature = "distributed")]
     /// (each rank holds columns for its local heads).
     ///
     /// Also updates the config to reflect the local head counts.
     ///
     /// # Panics
     /// Panics if weights are not loaded or head counts are not divisible by `world_size`.
+    #[cfg(feature = "distributed")]
     pub(crate) fn shard_for_tp(&mut self, rank: u32, world_size: u32) -> Result<(), KernelError> {
         use crate::parallel::{ColumnParallelLinear, RowParallelLinear};
 
