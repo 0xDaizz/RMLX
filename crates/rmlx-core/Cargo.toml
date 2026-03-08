@@ -29,3 +29,7 @@ harness = false
 [[bench]]
 name = "gemm_sweep"
 harness = false
+
+[[bench]]
+name = "gemm_sweep2"
+harness = false
