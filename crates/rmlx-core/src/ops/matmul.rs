@@ -1917,7 +1917,7 @@ pub enum TileVariant {
     Full,
     /// 64x64x16 MLX-architecture kernel: 2 SG (1×2), 64 threads,
     /// single buffer, wide loads, direct store, serpentine MMA.
-    /// f16-only, used when M >= 512 and N >= 33.
+    /// f16-only, used when base config returns Full (M >= 33 and N >= 33).
     MlxArch,
 }
 
@@ -1963,12 +1963,12 @@ pub fn select_tile_config(m: usize, n: usize, _k: usize) -> TileConfig {
 
 /// Select the best tile configuration considering dtype.
 ///
-/// For f16 with M >= 512 and N >= 33, uses the MLX-architecture kernel
-/// which achieves near-MLX throughput at large M.
+/// For f16 with M >= 33 and N >= 33 (i.e. base config returns Full),
+/// uses the MLX-architecture kernel which achieves near-MLX throughput.
 pub fn select_tile_config_with_dtype(m: usize, n: usize, k: usize, dtype: DType) -> TileConfig {
     let base = select_tile_config(m, n, k);
-    // MLX-arch kernel wins at large M (≥512) for f16 — use it instead of Full
-    if dtype == DType::Float16 && m >= 512 && n >= 33 {
+    // MLX-arch kernel for all large f16 matrices where base would use Full
+    if dtype == DType::Float16 && base.variant == TileVariant::Full {
         TileConfig {
             bm: 64,
             bn: 64,
