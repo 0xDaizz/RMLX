@@ -152,7 +152,7 @@ seq_len=1 decode optimization is concluded at 703.4 us/layer (73.6% bandwidth ef
 
 | Phase | Focus | Scope | Status |
 |:-----:|-------|:-----:|:------:|
-| 12 | **GEMM optimization (seq_len=N)** | Framework | Planned |
+| 12 | **GEMM optimization (seq_len=N)** | Framework | In Progress |
 | 13 | **Paged attention + speculative decode kernels** | Framework | Planned |
 | 14 | **SDPA / attention optimization** | Framework | Planned |
 | 15 | **Multi-node RDMA optimization (TP/EP)** | Framework | Planned |
