@@ -333,6 +333,7 @@ impl DeepSeekV3Model {
                 has_bias: false,
             }),
             gate_up_merged_weight: None,
+            gate_up_merged_weight_t: None,
         };
 
         let mut layers = Vec::with_capacity(num_layers);
@@ -368,6 +369,7 @@ impl DeepSeekV3Model {
                         has_bias: false,
                     }),
                     gate_up_merged_weight: None,
+                    gate_up_merged_weight_t: None,
                 }
             } else {
                 // MoE FFN for remaining layers (config-only, experts loaded later)

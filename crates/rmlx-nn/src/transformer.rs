@@ -107,6 +107,8 @@ pub enum FeedForward {
         down_proj: Linear,
         /// Merged gate+up weight [gate_dim + up_dim, in_features] for 9-dispatch path.
         gate_up_merged_weight: Option<Array>,
+        /// Transposed merged gate+up weight [in_features, gate_dim + up_dim] for prefill GEMM.
+        gate_up_merged_weight_t: Option<Array>,
     },
     /// Mixture of Experts
     MoE(MoeLayer),
@@ -255,19 +257,44 @@ impl FeedForward {
                 gate_proj,
                 up_proj,
                 down_proj,
+                gate_up_merged_weight_t,
                 ..
             } => {
-                // Batched gate+up projection: 2 GEMMs in fewer encoders
                 let normed_2d = if normed.ndim() == 1 {
                     normed.reshape(vec![1, normed.shape()[0]])?
                 } else {
                     normed.reshape(vec![normed.shape()[0], normed.shape()[1]])?
                 };
-                let wgate_t = gate_proj.weight_transposed_contiguous()?;
-                let wup_t = up_proj.weight_transposed_contiguous()?;
-                let (gate_out, up_out) = ops::fused::batched_gate_up_into_cb(
-                    registry, &normed_2d, &wgate_t, &wup_t, cb,
-                )?;
+                let (gate_out, up_out) = if let Some(ref guw_t) = gate_up_merged_weight_t {
+                    // Single merged GEMM: [seq, hidden] @ [hidden, gate+up] = [seq, gate+up]
+                    let merged = ops::matmul::matmul_into_cb(registry, &normed_2d, guw_t, cb)?;
+                    let gate_dim = guw_t.shape()[1] / 2;
+                    let total_out = guw_t.shape()[1];
+                    let seq_len = normed_2d.shape()[0];
+                    let elem_size = merged.dtype().size_of();
+                    let gate_view = Array::new(
+                        merged.metal_buffer().to_owned(),
+                        vec![seq_len, gate_dim],
+                        vec![total_out, 1],
+                        merged.dtype(),
+                        merged.offset(),
+                    );
+                    let up_view = Array::new(
+                        merged.metal_buffer().to_owned(),
+                        vec![seq_len, gate_dim],
+                        vec![total_out, 1],
+                        merged.dtype(),
+                        merged.offset() + gate_dim * elem_size,
+                    );
+                    let g = ops::copy::copy_into_cb(registry, &gate_view, cb)?;
+                    let u = ops::copy::copy_into_cb(registry, &up_view, cb)?;
+                    (g, u)
+                } else {
+                    // Fallback: 2 separate GEMMs
+                    let wgate_t = gate_proj.weight_transposed_contiguous()?;
+                    let wup_t = up_proj.weight_transposed_contiguous()?;
+                    ops::fused::batched_gate_up_into_cb(registry, &normed_2d, &wgate_t, &wup_t, cb)?
+                };
                 let hidden = ops::fused::fused_silu_mul_into_cb(registry, &gate_out, &up_out, cb)?;
                 let ffn_out = down_proj.forward_into_cb(&hidden, registry, cb)?;
                 ops::binary::add_into_cb(registry, residual, &ffn_out, cb)
@@ -300,20 +327,43 @@ impl FeedForward {
                 gate_proj,
                 up_proj,
                 down_proj,
+                gate_up_merged_weight_t,
                 ..
             } => {
                 let cb = graph.command_buffer();
-                // Batched gate+up projection: 2 GEMMs in fewer encoders
                 let normed_2d = if normed.ndim() == 1 {
                     normed.reshape(vec![1, normed.shape()[0]])?
                 } else {
                     normed.reshape(vec![normed.shape()[0], normed.shape()[1]])?
                 };
-                let wgate_t = gate_proj.weight_transposed_contiguous()?;
-                let wup_t = up_proj.weight_transposed_contiguous()?;
-                let (gate_out, up_out) = ops::fused::batched_gate_up_into_cb(
-                    registry, &normed_2d, &wgate_t, &wup_t, cb,
-                )?;
+                let (gate_out, up_out) = if let Some(ref guw_t) = gate_up_merged_weight_t {
+                    let merged = ops::matmul::matmul_into_cb(registry, &normed_2d, guw_t, cb)?;
+                    let gate_dim = guw_t.shape()[1] / 2;
+                    let total_out = guw_t.shape()[1];
+                    let seq_len = normed_2d.shape()[0];
+                    let elem_size = merged.dtype().size_of();
+                    let gate_view = Array::new(
+                        merged.metal_buffer().to_owned(),
+                        vec![seq_len, gate_dim],
+                        vec![total_out, 1],
+                        merged.dtype(),
+                        merged.offset(),
+                    );
+                    let up_view = Array::new(
+                        merged.metal_buffer().to_owned(),
+                        vec![seq_len, gate_dim],
+                        vec![total_out, 1],
+                        merged.dtype(),
+                        merged.offset() + gate_dim * elem_size,
+                    );
+                    let g = ops::copy::copy_into_cb(registry, &gate_view, cb)?;
+                    let u = ops::copy::copy_into_cb(registry, &up_view, cb)?;
+                    (g, u)
+                } else {
+                    let wgate_t = gate_proj.weight_transposed_contiguous()?;
+                    let wup_t = up_proj.weight_transposed_contiguous()?;
+                    ops::fused::batched_gate_up_into_cb(registry, &normed_2d, &wgate_t, &wup_t, cb)?
+                };
                 let hidden = ops::fused::fused_silu_mul_into_cb(registry, &gate_out, &up_out, cb)?;
                 let ffn_out = down_proj.forward_into_cb(&hidden, registry, cb)?;
                 ops::binary::add_into_cb(registry, residual, &ffn_out, cb)
@@ -342,6 +392,7 @@ impl FeedForward {
                 gate_proj,
                 up_proj,
                 gate_up_merged_weight,
+                gate_up_merged_weight_t,
                 ..
             } => {
                 let gate_w = gate_proj.weight().ok_or_else(|| {
@@ -412,12 +463,41 @@ impl FeedForward {
                 }
 
                 *gate_up_merged_weight = Some(Array::new(
-                    buf,
+                    buf.clone(),
                     vec![total_rows, cols],
                     vec![cols, 1],
                     gate_w.dtype(),
                     0,
                 ));
+
+                // Also create transposed merged weight [cols, total_rows] for prefill GEMM.
+                let buf_t = device.new_buffer(
+                    total_bytes as u64,
+                    metal::MTLResourceOptions::StorageModeShared,
+                );
+                unsafe {
+                    let src = buf.contents() as *const u8;
+                    let dst = buf_t.contents() as *mut u8;
+                    for r in 0..total_rows {
+                        for c in 0..cols {
+                            let src_idx = (r * cols + c) * elem_size;
+                            let dst_idx = (c * total_rows + r) * elem_size;
+                            std::ptr::copy_nonoverlapping(
+                                src.add(src_idx),
+                                dst.add(dst_idx),
+                                elem_size,
+                            );
+                        }
+                    }
+                }
+                *gate_up_merged_weight_t = Some(Array::new(
+                    buf_t,
+                    vec![cols, total_rows],
+                    vec![total_rows, 1],
+                    gate_w.dtype(),
+                    0,
+                ));
+
                 Ok(())
             }
             _ => Err(KernelError::InvalidShape(
@@ -436,12 +516,16 @@ impl FeedForward {
                 up_proj,
                 down_proj,
                 gate_up_merged_weight,
+                gate_up_merged_weight_t,
             } => {
                 gate_proj.convert_weights_private(device, queue);
                 up_proj.convert_weights_private(device, queue);
                 down_proj.convert_weights_private(device, queue);
                 if let Some(w) = gate_up_merged_weight.take() {
                     *gate_up_merged_weight = Some(w.to_private(device, queue));
+                }
+                if let Some(w) = gate_up_merged_weight_t.take() {
+                    *gate_up_merged_weight_t = Some(w.to_private(device, queue));
                 }
             }
             FeedForward::Dense {
@@ -882,6 +966,7 @@ impl TransformerBlock {
                     has_bias: false,
                 }),
                 gate_up_merged_weight: None,
+                gate_up_merged_weight_t: None,
             },
             FeedForwardType::MoE { .. } => {
                 return Err(KernelError::InvalidShape(
