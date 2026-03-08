@@ -140,10 +140,11 @@ fn bench_gemm(
     label: &str,
 ) {
     // Select tile config and kernel
-    let tile = ops::matmul::select_tile_config(m, n, k);
+    let tile = ops::matmul::select_tile_config_with_dtype(m, n, k, a.dtype());
     let kernel_name = match (tile.variant, a.dtype()) {
         (ops::matmul::TileVariant::Full, DType::Float16) => "gemm_tiled_f16",
         (ops::matmul::TileVariant::Full, DType::Float32) => "gemm_tiled_f32",
+        (ops::matmul::TileVariant::MlxArch, DType::Float16) => "gemm_mlx_f16",
         _ => {
             // Fallback to matmul_into_cb for non-full variants
             // (not the focus of this benchmark)
@@ -191,7 +192,11 @@ fn bench_gemm(
     let grid_x = ceil_div(n, tile.bn) as u64;
     let grid_y = ceil_div(m, tile.bm) as u64;
     let grid = MTLSize::new(grid_x, grid_y, 1);
-    let tg = MTLSize::new(256, 1, 1);
+    let tg_threads = match tile.variant {
+        ops::matmul::TileVariant::MlxArch => 64_u64,
+        _ => 256_u64,
+    };
+    let tg = MTLSize::new(tg_threads, 1, 1);
 
     // Warmup
     for _ in 0..WARMUP_ITERS {

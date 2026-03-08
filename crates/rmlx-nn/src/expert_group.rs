@@ -515,7 +515,8 @@ fn encode_gemm(
     dtype: DType,
     registry: &KernelRegistry,
 ) -> Result<(), KernelError> {
-    let tile = ops::matmul::select_tile_config(m as usize, n as usize, k as usize);
+    let tile =
+        ops::matmul::select_tile_config_with_dtype(m as usize, n as usize, k as usize, dtype);
     let kernel_name = match (tile.variant, dtype) {
         (ops::matmul::TileVariant::Simd, DType::Float32)
         | (ops::matmul::TileVariant::Medium, DType::Float32) => "gemm_simd_f32",
@@ -532,6 +533,7 @@ fn encode_gemm(
         (ops::matmul::TileVariant::Full, DType::Float32) => "gemm_tiled_f32",
         (ops::matmul::TileVariant::Full, DType::Float16) => "gemm_tiled_f16",
         (ops::matmul::TileVariant::Full, DType::Bfloat16) => "gemm_tiled_bf16",
+        (ops::matmul::TileVariant::MlxArch, DType::Float16) => "gemm_mlx_f16",
         (_, other) => {
             return Err(KernelError::InvalidShape(format!(
                 "ExpertGroup: unsupported dtype {:?} for GEMM",
@@ -570,10 +572,12 @@ fn encode_gemm(
     enc.set_buffer(7, Some(&bsb_buf), 0);
     enc.set_buffer(8, Some(&bsc_buf), 0);
 
-    // Steel and Full/Skinny kernels require swizzle_log (buffer 9)
+    // Full, Skinny, and MlxArch kernels require swizzle_log (buffer 9)
     let swizzle_log_buf = if matches!(
         tile.variant,
-        ops::matmul::TileVariant::Full | ops::matmul::TileVariant::Skinny
+        ops::matmul::TileVariant::Full
+            | ops::matmul::TileVariant::Skinny
+            | ops::matmul::TileVariant::MlxArch
     ) {
         let swizzle_log = ops::matmul::compute_swizzle_log(m as usize, tile.bm);
         let buf = make_u32_buf(dev, swizzle_log);
@@ -587,6 +591,7 @@ fn encode_gemm(
         ops::matmul::TileVariant::Small => 256_u64,
         ops::matmul::TileVariant::Medium | ops::matmul::TileVariant::Simd => 1024_u64,
         ops::matmul::TileVariant::Skinny | ops::matmul::TileVariant::Full => 256_u64,
+        ops::matmul::TileVariant::MlxArch => 64_u64,
     };
 
     let grid = metal::MTLSize::new(grid_x, grid_y, 1);

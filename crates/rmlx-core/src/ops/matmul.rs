@@ -1702,6 +1702,195 @@ kernel void splitk_reduce_f32(
 "#;
 
 // ---------------------------------------------------------------------------
+// MLX-architecture f16 GEMM: BM=64, BN=64, BK=16, 2 SG (1×2), 64 threads,
+// single buffer, 4×half4 wide loads, direct register→device store,
+// serpentine MMA. Matches MLX's legacy GEMM path on M3.
+// ---------------------------------------------------------------------------
+
+pub const GEMM_MLX_SHADER_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant constexpr uint MLX_BM = 64;
+constant constexpr uint MLX_BN = 64;
+constant constexpr uint MLX_BK = 16;
+constant constexpr uint MLX_N_SG = 2;
+constant constexpr uint MLX_N_THREADS = 64;
+constant constexpr uint MLX_TM = 8;   // BM / 8 = 64/8
+constant constexpr uint MLX_TN = 4;   // (BN/2) / 8 = 32/8
+
+#if __METAL_VERSION__ >= 310
+template <typename T>
+METAL_FUNC uniform<T> mlx_as_uniform(T val) {
+    return make_uniform(val);
+}
+#else
+template <typename T>
+METAL_FUNC T mlx_as_uniform(T val) {
+    return val;
+}
+#endif
+
+inline uint2 mlx_swizzle_tg(uint2 tid, uint swizzle_log) {
+    if (swizzle_log == 0) return tid;
+    return uint2(
+        tid.x >> swizzle_log,
+        (tid.y << swizzle_log) | (tid.x & ((1u << swizzle_log) - 1u))
+    );
+}
+
+kernel void gemm_mlx_f16(
+    device const half* A [[buffer(0)]],
+    device const half* B [[buffer(1)]],
+    device half* C       [[buffer(2)]],
+    constant uint& M     [[buffer(3)]],
+    constant uint& N     [[buffer(4)]],
+    constant uint& K     [[buffer(5)]],
+    constant uint& batch_stride_a [[buffer(6)]],
+    constant uint& batch_stride_b [[buffer(7)]],
+    constant uint& batch_stride_c [[buffer(8)]],
+    constant uint& swizzle_log    [[buffer(9)]],
+    uint3 group_id       [[threadgroup_position_in_grid]],
+    uint  tid_in_group   [[thread_index_in_threadgroup]],
+    uint  sgid           [[simdgroup_index_in_threadgroup]],
+    uint  lane_id        [[thread_index_in_simdgroup]])
+{
+    threadgroup half As[MLX_BM * MLX_BK];  // 64x16 = 1024 halves = 2KB
+    threadgroup half Bs[MLX_BK * MLX_BN];  // 16x64 = 1024 halves = 2KB
+
+    const uint batch_idx = group_id.z;
+    uint2 swizzled = mlx_swizzle_tg(uint2(group_id.x, group_id.y), swizzle_log);
+    const uint row_start = swizzled.y * mlx_as_uniform(MLX_BM);
+    const uint col_start = swizzled.x * mlx_as_uniform(MLX_BN);
+
+    device const half* A_batch = A + batch_idx * mlx_as_uniform(batch_stride_a);
+    device const half* B_batch = B + batch_idx * mlx_as_uniform(batch_stride_b);
+    device half*       C_batch = C + batch_idx * mlx_as_uniform(batch_stride_c);
+
+    // SG grid: 1x2 -- sg_row always 0, sg_col = sgid (0 or 1)
+    const uint base_m = 0;        // WM=1, single row of SG
+    const uint base_n = sgid * 32; // each SG covers 32 cols
+
+    simdgroup_float8x8 acc[MLX_TM][MLX_TN];
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < MLX_TM; i++)
+        #pragma clang loop unroll(full)
+        for (uint j = 0; j < MLX_TN; j++)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    const uint uK = mlx_as_uniform(K);
+    const uint uM = mlx_as_uniform(M);
+    const uint uN = mlx_as_uniform(N);
+    const uint n_tiles = (uK + MLX_BK - 1) / MLX_BK;
+
+    // -- Main loop: single-buffered --
+    for (uint tile = 0; tile < n_tiles; tile++) {
+        uint kb = tile * MLX_BK;
+
+        // Load A tile: 64 threads x 16 elements = 64x16 = BM x BK
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            uint a_row = tid_in_group;  // 0..63
+            uint gr = row_start + a_row;
+            if (gr < uM && kb + 15 < uK) {
+                *reinterpret_cast<threadgroup half4*>(&As[a_row * 16]) =
+                    *reinterpret_cast<device const half4*>(&A_batch[gr * uK + kb]);
+                *reinterpret_cast<threadgroup half4*>(&As[a_row * 16 + 4]) =
+                    *reinterpret_cast<device const half4*>(&A_batch[gr * uK + kb + 4]);
+                *reinterpret_cast<threadgroup half4*>(&As[a_row * 16 + 8]) =
+                    *reinterpret_cast<device const half4*>(&A_batch[gr * uK + kb + 8]);
+                *reinterpret_cast<threadgroup half4*>(&As[a_row * 16 + 12]) =
+                    *reinterpret_cast<device const half4*>(&A_batch[gr * uK + kb + 12]);
+            } else {
+                for (uint d = 0; d < 16; d++) {
+                    As[a_row * 16 + d] = (gr < uM && kb + d < uK)
+                        ? A_batch[gr * uK + kb + d] : half(0);
+                }
+            }
+        }
+
+        // Load B tile: 64 threads x 16 elements = 16x64 = BK x BN
+        {
+            uint bi = tid_in_group >> 2;         // 0..15 (row in B tile)
+            uint bj = (tid_in_group & 3u) << 4;  // 0, 16, 32, 48
+            uint gr = kb + bi;
+            uint gc = col_start + bj;
+            if (gr < uK && gc + 15 < uN) {
+                *reinterpret_cast<threadgroup half4*>(&Bs[bi * 64 + bj]) =
+                    *reinterpret_cast<device const half4*>(&B_batch[gr * uN + gc]);
+                *reinterpret_cast<threadgroup half4*>(&Bs[bi * 64 + bj + 4]) =
+                    *reinterpret_cast<device const half4*>(&B_batch[gr * uN + gc + 4]);
+                *reinterpret_cast<threadgroup half4*>(&Bs[bi * 64 + bj + 8]) =
+                    *reinterpret_cast<device const half4*>(&B_batch[gr * uN + gc + 8]);
+                *reinterpret_cast<threadgroup half4*>(&Bs[bi * 64 + bj + 12]) =
+                    *reinterpret_cast<device const half4*>(&B_batch[gr * uN + gc + 12]);
+            } else {
+                for (uint d = 0; d < 16; d++) {
+                    Bs[bi * 64 + bj + d] = (gr < uK && gc + d < uN)
+                        ? B_batch[gr * uN + gc + d] : half(0);
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // MMA compute (serpentine)
+        #pragma clang loop unroll(full)
+        for (uint kk = 0; kk < 2; kk++) {
+            simdgroup_half8x8 a_frag[MLX_TM];
+            simdgroup_half8x8 b_frag[MLX_TN];
+
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < MLX_TM; i++) {
+                simdgroup_load(a_frag[i],
+                    &As[(base_m + i * 8) * 16 + kk * 8], 16);
+            }
+
+            #pragma clang loop unroll(full)
+            for (uint j = 0; j < MLX_TN; j++) {
+                simdgroup_load(b_frag[j],
+                    &Bs[kk * 8 * 64 + (base_n + j * 8)], 64);
+            }
+
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < MLX_TM; i++) {
+                #pragma clang loop unroll(full)
+                for (uint j = 0; j < MLX_TN; j++) {
+                    uint n_serp = (i % 2) ? (3 - j) : j;
+                    simdgroup_multiply_accumulate(
+                        acc[i][n_serp], a_frag[i], b_frag[n_serp], acc[i][n_serp]);
+                }
+            }
+        }
+    }
+
+    // -- Store results: direct store from simdgroup registers --
+    const uint qid = lane_id / 4;
+    const uint fm = (qid & 4u) + ((lane_id / 2u) % 4u);
+    const uint fn_val = (qid & 2u) * 2u + (lane_id % 2u) * 2u;
+
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < MLX_TM; i++) {
+        #pragma clang loop unroll(full)
+        for (uint j = 0; j < MLX_TN; j++) {
+            uint gr = row_start + base_m + i * 8 + fm;
+            uint gc0 = col_start + base_n + j * 8 + fn_val;
+            uint gc1 = gc0 + 1;
+
+            auto elems = acc[i][j].thread_elements();
+
+            if (gr < uM && gc0 < uN) {
+                C_batch[gr * uN + gc0] = half(elems[0]);
+            }
+            if (gr < uM && gc1 < uN) {
+                C_batch[gr * uN + gc1] = half(elems[1]);
+            }
+        }
+    }
+}
+"#;
+
+// ---------------------------------------------------------------------------
 // Tile configuration — adaptive tile sizing
 // ---------------------------------------------------------------------------
 
@@ -1726,6 +1915,10 @@ pub enum TileVariant {
     Skinny,
     /// 64x64x32 full tile GEMM with double buffering.
     Full,
+    /// 64x64x16 MLX-architecture kernel: 2 SG (1×2), 64 threads,
+    /// single buffer, wide loads, direct store, serpentine MMA.
+    /// f16-only, used when M >= 512 and N >= 33.
+    MlxArch,
 }
 
 /// Select the best tile configuration based on matrix dimensions.
@@ -1765,6 +1958,24 @@ pub fn select_tile_config(m: usize, n: usize, _k: usize) -> TileConfig {
             bn: 32,
             variant: TileVariant::Simd,
         }
+    }
+}
+
+/// Select the best tile configuration considering dtype.
+///
+/// For f16 with M >= 512 and N >= 33, uses the MLX-architecture kernel
+/// which achieves near-MLX throughput at large M.
+pub fn select_tile_config_with_dtype(m: usize, n: usize, k: usize, dtype: DType) -> TileConfig {
+    let base = select_tile_config(m, n, k);
+    // MLX-arch kernel wins at large M (≥512) for f16 — use it instead of Full
+    if dtype == DType::Float16 && m >= 512 && n >= 33 {
+        TileConfig {
+            bm: 64,
+            bn: 64,
+            variant: TileVariant::MlxArch,
+        }
+    } else {
+        base
     }
 }
 
@@ -1906,6 +2117,7 @@ pub fn register(registry: &KernelRegistry) -> Result<(), KernelError> {
     registry.register_jit_source("gemm_small", GEMM_SMALL_SHADER_SOURCE)?;
     registry.register_jit_source("gemm_skinny", GEMM_SKINNY_SHADER_SOURCE)?;
     registry.register_jit_source("gemm_splitk", SPLIT_K_SHADER_SOURCE)?;
+    registry.register_jit_source("gemm_mlx", GEMM_MLX_SHADER_SOURCE)?;
     Ok(())
 }
 
@@ -2160,7 +2372,7 @@ fn dispatch_tiled_gemm(
     batch_stride_c: usize,
     output_shape: &[usize],
 ) -> Result<Array, KernelError> {
-    let tile = select_tile_config(m, n, k);
+    let tile = select_tile_config_with_dtype(m, n, k, a.dtype());
 
     let kernel_name = match (tile.variant, a.dtype()) {
         (TileVariant::Small, DType::Float32) => "gemm_small_f32",
@@ -2178,6 +2390,7 @@ fn dispatch_tiled_gemm(
         (TileVariant::Full, DType::Float32) => "gemm_tiled_f32",
         (TileVariant::Full, DType::Float16) => "gemm_tiled_f16",
         (TileVariant::Full, DType::Bfloat16) => "gemm_tiled_bf16",
+        (TileVariant::MlxArch, DType::Float16) => "gemm_mlx_f16",
         _ => {
             return Err(KernelError::NotFound(format!(
                 "matmul not supported for {:?}",
@@ -2211,9 +2424,9 @@ fn dispatch_tiled_gemm(
     enc.set_buffer(7, Some(&bsb_buf), 0);
     enc.set_buffer(8, Some(&bsc_buf), 0);
 
-    // Pass swizzle_log for Full and Skinny variants (buffer 9)
+    // Pass swizzle_log for Full, Skinny, and MlxArch variants (buffer 9)
     let swizzle_log_buf = match tile.variant {
-        TileVariant::Full | TileVariant::Skinny => {
+        TileVariant::Full | TileVariant::Skinny | TileVariant::MlxArch => {
             let swizzle_log = compute_swizzle_log(m, tile.bm);
             let buf = make_u32_buf(dev, swizzle_log);
             enc.set_buffer(9, Some(&buf), 0);
@@ -2233,6 +2446,7 @@ fn dispatch_tiled_gemm(
         TileVariant::Medium | TileVariant::Simd => 1024_u64,
         TileVariant::Skinny => 256_u64,
         TileVariant::Full => 256_u64,
+        TileVariant::MlxArch => 64_u64,
     };
     let tg = MTLSize::new(tg_threads, 1, 1);
 
@@ -2450,7 +2664,7 @@ pub fn matmul_into_cb(
     // -------------------------------------------------------------------
     // Tiled GEMM dispatch (batch=1)
     // -------------------------------------------------------------------
-    let tile = select_tile_config(m, n, k);
+    let tile = select_tile_config_with_dtype(m, n, k, a.dtype());
 
     let kernel_name = match (tile.variant, a.dtype()) {
         (TileVariant::Small, DType::Float32) => "gemm_small_f32",
@@ -2471,6 +2685,7 @@ pub fn matmul_into_cb(
         (TileVariant::Full, DType::Float32) => "gemm_tiled_f32",
         (TileVariant::Full, DType::Float16) => "gemm_tiled_f16",
         (TileVariant::Full, DType::Bfloat16) => "gemm_tiled_bf16",
+        (TileVariant::MlxArch, DType::Float16) => "gemm_mlx_f16",
         _ => {
             return Err(KernelError::NotFound(format!(
                 "matmul_into_cb: unsupported dtype {:?}",
@@ -2502,9 +2717,9 @@ pub fn matmul_into_cb(
     enc.set_buffer(7, Some(&bsb_buf), 0);
     enc.set_buffer(8, Some(&bsc_buf), 0);
 
-    // Pass swizzle_log for Full and Skinny variants (buffer 9)
+    // Pass swizzle_log for Full, Skinny, and MlxArch variants (buffer 9)
     let swizzle_log_buf = match tile.variant {
-        TileVariant::Full | TileVariant::Skinny => {
+        TileVariant::Full | TileVariant::Skinny | TileVariant::MlxArch => {
             let swizzle_log = compute_swizzle_log(m, tile.bm);
             let buf = make_u32_buf(dev, swizzle_log);
             enc.set_buffer(9, Some(&buf), 0);
@@ -2523,6 +2738,7 @@ pub fn matmul_into_cb(
         TileVariant::Medium | TileVariant::Simd => 1024_u64,
         TileVariant::Skinny => 256_u64,
         TileVariant::Full => 256_u64,
+        TileVariant::MlxArch => 64_u64,
     };
     let tg = MTLSize::new(tg_threads, 1, 1);
 
