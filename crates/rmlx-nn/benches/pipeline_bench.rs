@@ -213,6 +213,7 @@ fn build_transformer_block_f32(device: &metal::Device) -> TransformerBlock {
         up_proj,
         down_proj,
         gate_up_merged_weight: None,
+        gate_up_merged_weight_t: None,
     };
 
     let norm1_weight = Array::ones(device, &[HIDDEN_SIZE]);
@@ -263,6 +264,7 @@ fn build_transformer_block(device: &metal::Device) -> TransformerBlock {
         up_proj,
         down_proj,
         gate_up_merged_weight: None,
+        gate_up_merged_weight_t: None,
     };
 
     let norm1_weight = {

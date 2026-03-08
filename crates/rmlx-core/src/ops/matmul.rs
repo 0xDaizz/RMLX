@@ -2742,6 +2742,176 @@ kernel void gemm_mlx_m16_f16(
         }
     }
 }
+
+// ===== MLX-arch bf16 GEMM: BM=64, BN=64, BK=16, 2 SG (1×2), 64 threads =====
+// bfloat data in shared memory, bulk convert to f32 for simdgroup MMA.
+// Same tile dimensions as f16 MLX-arch (bfloat is 2 bytes like half).
+
+kernel void gemm_mlx_bf16(
+    device const bfloat* A [[buffer(0)]],
+    device const bfloat* B [[buffer(1)]],
+    device bfloat* C       [[buffer(2)]],
+    constant uint& M     [[buffer(3)]],
+    constant uint& N     [[buffer(4)]],
+    constant uint& K     [[buffer(5)]],
+    constant uint& batch_stride_a [[buffer(6)]],
+    constant uint& batch_stride_b [[buffer(7)]],
+    constant uint& batch_stride_c [[buffer(8)]],
+    constant uint& swizzle_log    [[buffer(9)]],
+    uint3 group_id       [[threadgroup_position_in_grid]],
+    uint  tid_in_group   [[thread_index_in_threadgroup]],
+    uint  sgid           [[simdgroup_index_in_threadgroup]],
+    uint  lane_id        [[thread_index_in_simdgroup]])
+{
+    threadgroup bfloat As[MLX_BM * MLX_BK];  // 64x16 = 1024 bfloats = 2KB
+    threadgroup bfloat Bs[MLX_BK * MLX_BN];  // 16x64 = 1024 bfloats = 2KB
+
+    const uint batch_idx = group_id.z;
+    uint2 swizzled = mlx_swizzle_tg(uint2(group_id.x, group_id.y), swizzle_log);
+    const uint row_start = swizzled.y * mlx_as_uniform(MLX_BM);
+    const uint col_start = swizzled.x * mlx_as_uniform(MLX_BN);
+
+    device const bfloat* A_batch = A + batch_idx * mlx_as_uniform(batch_stride_a);
+    device const bfloat* B_batch = B + batch_idx * mlx_as_uniform(batch_stride_b);
+    device bfloat*       C_batch = C + batch_idx * mlx_as_uniform(batch_stride_c);
+
+    // SG grid: 1x2 -- sg_row always 0, sg_col = sgid (0 or 1)
+    const uint base_m = 0;        // WM=1, single row of SG
+    const uint base_n = sgid * 32; // each SG covers 32 cols
+
+    simdgroup_float8x8 acc[MLX_TM][MLX_TN];
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < MLX_TM; i++)
+        #pragma clang loop unroll(full)
+        for (uint j = 0; j < MLX_TN; j++)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    const uint uK = mlx_as_uniform(K);
+    const uint uM = mlx_as_uniform(M);
+    const uint uN = mlx_as_uniform(N);
+    const uint n_tiles = (uK + MLX_BK - 1) / MLX_BK;
+
+    // bf16→f32 conversion buffers for simdgroup_load
+    // A slice: BM * 8 = 64 * 8 = 512 floats = 2KB
+    // B slice: 8 * (BN/2) = 8 * 32 = 256 floats = 1KB per SG
+    // Total extra: 2KB + 1KB = 3KB (well within 32KB TG limit)
+    threadgroup float A_f32[MLX_BM * 8];
+    threadgroup float B_f32[8 * 32];  // per-kk slice for one SG half
+
+    // -- Main loop: single-buffered --
+    for (uint tile = 0; tile < n_tiles; tile++) {
+        uint kb = tile * MLX_BK;
+
+        // Load A tile: 64 threads x 16 elements = 64x16 = BM x BK
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            uint a_row = tid_in_group;  // 0..63
+            uint gr = row_start + a_row;
+            if ((align_M || gr < uM) && kb + 15 < uK) {
+                // bfloat4 doesn't exist as a native vector, load element by element in groups
+                for (uint d = 0; d < 16; d++) {
+                    As[a_row * 16 + d] = A_batch[gr * uK + kb + d];
+                }
+            } else {
+                for (uint d = 0; d < 16; d++) {
+                    As[a_row * 16 + d] = ((align_M || gr < uM) && kb + d < uK)
+                        ? A_batch[gr * uK + kb + d] : bfloat(0);
+                }
+            }
+        }
+
+        // Load B tile: 64 threads x 16 elements = 16x64 = BK x BN
+        {
+            uint bi = tid_in_group >> 2;         // 0..15 (row in B tile)
+            uint bj = (tid_in_group & 3u) << 4;  // 0, 16, 32, 48
+            uint gr = kb + bi;
+            uint gc = col_start + bj;
+            if (gr < uK && (align_N || gc + 15 < uN)) {
+                for (uint d = 0; d < 16; d++) {
+                    Bs[bi * 64 + bj + d] = B_batch[gr * uN + gc + d];
+                }
+            } else {
+                for (uint d = 0; d < 16; d++) {
+                    Bs[bi * 64 + bj + d] = (gr < uK && (align_N || gc + d < uN))
+                        ? B_batch[gr * uN + gc + d] : bfloat(0);
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // MMA compute with bf16→f32 conversion per kk step
+        #pragma clang loop unroll(full)
+        for (uint kk = 0; kk < 2; kk++) {
+            // Convert A slice: BM rows x 8 cols → f32
+            for (uint idx = tid_in_group; idx < MLX_BM * 8; idx += MLX_N_THREADS) {
+                uint r = idx / 8;
+                uint c = idx % 8;
+                A_f32[idx] = float(As[r * 16 + kk * 8 + c]);
+            }
+            // Convert B slice for this SG's half: 8 rows x 32 cols → f32
+            for (uint idx = tid_in_group; idx < 8 * 32; idx += MLX_N_THREADS) {
+                uint r = idx / 32;
+                uint c = idx % 32;
+                B_f32[idx] = float(Bs[(kk * 8 + r) * 64 + base_n + c]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            simdgroup_float8x8 a_frag[MLX_TM];
+            simdgroup_float8x8 b_frag[MLX_TN];
+
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < MLX_TM; i++) {
+                simdgroup_load(a_frag[i], &A_f32[(base_m + i * 8) * 8], 8);
+            }
+
+            #pragma clang loop unroll(full)
+            for (uint j = 0; j < MLX_TN; j++) {
+                simdgroup_load(b_frag[j], &B_f32[j * 8], 32);
+            }
+
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < MLX_TM; i++) {
+                #pragma clang loop unroll(full)
+                for (uint j = 0; j < MLX_TN; j++) {
+                    uint n_serp = (i % 2) ? (3 - j) : j;
+                    simdgroup_multiply_accumulate(
+                        acc[i][n_serp], a_frag[i], b_frag[n_serp], acc[i][n_serp]);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    // -- Store results: direct store from simdgroup registers --
+    const uint qid = lane_id / 4;
+    const uint fm = (qid & 4u) + ((lane_id / 2u) % 4u);
+    const uint fn_val = (qid & 2u) * 2u + (lane_id % 2u) * 2u;
+
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < MLX_TM; i++) {
+        #pragma clang loop unroll(full)
+        for (uint j = 0; j < MLX_TN; j++) {
+            uint gr = row_start + base_m + i * 8 + fm;
+            uint gc0 = col_start + base_n + j * 8 + fn_val;
+            uint gc1 = gc0 + 1;
+
+            auto elems = acc[i][j].thread_elements();
+
+            if (align_M && align_N) {
+                C_batch[gr * uN + gc0] = bfloat(elems[0]);
+                C_batch[gr * uN + gc1] = bfloat(elems[1]);
+            } else {
+                if ((align_M || gr < uM) && (align_N || gc0 < uN)) {
+                    C_batch[gr * uN + gc0] = bfloat(elems[0]);
+                }
+                if ((align_M || gr < uM) && (align_N || gc1 < uN)) {
+                    C_batch[gr * uN + gc1] = bfloat(elems[1]);
+                }
+            }
+        }
+    }
+}
 "#;
 
 // ---------------------------------------------------------------------------
@@ -3124,7 +3294,7 @@ pub enum TileVariant {
     Full,
     /// 64x64x16 MLX-architecture kernel: 2 SG (1×2), 64 threads,
     /// single buffer, wide loads, direct store, serpentine MMA.
-    /// f16-only, used when base config returns Full (M >= 33 and N >= 33).
+    /// f16/f32/bf16, used when base config returns Full (M >= 33 and N >= 33).
     MlxArch,
     /// 32x32x16 MLX-architecture kernel for small-M: 2 SG (1×2), 64 threads.
     /// f16-only, used for M=17-32 with large N.
@@ -3198,8 +3368,10 @@ pub fn select_tile_config_with_dtype(m: usize, n: usize, k: usize, dtype: DType)
             };
         }
     }
-    // MLX-arch kernel for f16/f32: covers Full (M>=33) range
-    if (dtype == DType::Float16 || dtype == DType::Float32) && base.variant == TileVariant::Full {
+    // MLX-arch kernel for f16/f32/bf16: covers Full (M>=33) range
+    if (dtype == DType::Float16 || dtype == DType::Float32 || dtype == DType::Bfloat16)
+        && base.variant == TileVariant::Full
+    {
         TileConfig {
             bm: 64,
             bn: 64,
@@ -3675,6 +3847,7 @@ fn dispatch_tiled_gemm(
         (TileVariant::Full, DType::Bfloat16) => "gemm_tiled_bf16",
         (TileVariant::MlxArch, DType::Float16) => "gemm_mlx_f16",
         (TileVariant::MlxArch, DType::Float32) => "gemm_mlx_f32",
+        (TileVariant::MlxArch, DType::Bfloat16) => "gemm_mlx_bf16",
         (TileVariant::MlxArchSmall, DType::Float16) => "gemm_mlx_small_f16",
         (TileVariant::MlxArchMicro, DType::Float16) => "gemm_mlx_m16_f16",
         _ => {
@@ -4067,6 +4240,7 @@ pub fn matmul_into_cb(
         (TileVariant::Full, DType::Bfloat16) => "gemm_tiled_bf16",
         (TileVariant::MlxArch, DType::Float16) => "gemm_mlx_f16",
         (TileVariant::MlxArch, DType::Float32) => "gemm_mlx_f32",
+        (TileVariant::MlxArch, DType::Bfloat16) => "gemm_mlx_bf16",
         (TileVariant::MlxArchSmall, DType::Float16) => "gemm_mlx_small_f16",
         (TileVariant::MlxArchMicro, DType::Float16) => "gemm_mlx_m16_f16",
         _ => {

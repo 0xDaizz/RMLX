@@ -10,6 +10,9 @@ rmlx-core = { path = "../rmlx-core" }
 rmlx-metal = { path = "../rmlx-metal" }
 rmlx-distributed = { path = "../rmlx-distributed", optional = true }
 metal = { workspace = true }
+safetensors = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [features]
 distributed = ["rmlx-distributed"]

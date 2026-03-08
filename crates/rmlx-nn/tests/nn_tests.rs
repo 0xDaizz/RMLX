@@ -799,6 +799,7 @@ fn test_transformer_block_forward() {
         up_proj: make_identity_linear(dev, hidden_size),
         down_proj: make_identity_linear(dev, hidden_size),
         gate_up_merged_weight: None,
+        gate_up_merged_weight_t: None,
     };
 
     // RMS norm weights (all ones)
@@ -880,6 +881,7 @@ fn test_transformer_model_forward() {
         up_proj: make_identity_linear(dev, hidden_size),
         down_proj: make_identity_linear(dev, hidden_size),
         gate_up_merged_weight: None,
+        gate_up_merged_weight_t: None,
     };
     let norm1 = Array::ones(dev, &[hidden_size]);
     let norm2 = Array::ones(dev, &[hidden_size]);
