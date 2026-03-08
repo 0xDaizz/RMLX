@@ -45,14 +45,11 @@ pub fn batched_qkv_proj(
     let k_out = Array::zeros(dev, &[m as usize, nk as usize], input.dtype());
     let v_out = Array::zeros(dev, &[m as usize, nv as usize], input.dtype());
 
-    // Each projection may use a different kernel depending on M and N dims
-    let q_kernel = gemm_kernel_name_for_dims(input.dtype(), m, nq)?;
-    let k_kernel = gemm_kernel_name_for_dims(input.dtype(), m, nk)?;
-    let v_kernel = gemm_kernel_name_for_dims(input.dtype(), m, nv)?;
-
-    let q_pipeline = registry.get_pipeline(q_kernel, input.dtype())?;
-    let k_pipeline = registry.get_pipeline(k_kernel, input.dtype())?;
-    let v_pipeline = registry.get_pipeline(v_kernel, input.dtype())?;
+    // Each projection may use a different kernel depending on M and N dims;
+    // MlxArch gets alignment-specialized pipelines via function constants.
+    let q_pipeline = gemm_pipeline_for_dims(registry, input.dtype(), m, nq)?;
+    let k_pipeline = gemm_pipeline_for_dims(registry, input.dtype(), m, nk)?;
+    let v_pipeline = gemm_pipeline_for_dims(registry, input.dtype(), m, nv)?;
 
     // Single command buffer for all 3 projections
     let cb = queue.new_command_buffer();
@@ -371,13 +368,9 @@ pub fn batched_qkv_proj_into(
     let k_out = Array::uninit(dev, &[m as usize, nk as usize], input.dtype());
     let v_out = Array::uninit(dev, &[m as usize, nv as usize], input.dtype());
 
-    let q_kernel = gemm_kernel_name_for_dims(input.dtype(), m, nq)?;
-    let k_kernel = gemm_kernel_name_for_dims(input.dtype(), m, nk)?;
-    let v_kernel = gemm_kernel_name_for_dims(input.dtype(), m, nv)?;
-
-    let q_pipeline = registry.get_pipeline(q_kernel, input.dtype())?;
-    let k_pipeline = registry.get_pipeline(k_kernel, input.dtype())?;
-    let v_pipeline = registry.get_pipeline(v_kernel, input.dtype())?;
+    let q_pipeline = gemm_pipeline_for_dims(registry, input.dtype(), m, nq)?;
+    let k_pipeline = gemm_pipeline_for_dims(registry, input.dtype(), m, nk)?;
+    let v_pipeline = gemm_pipeline_for_dims(registry, input.dtype(), m, nv)?;
 
     encode_gemm(cb, &q_pipeline, &input, &wq_t, &q_out, m, nq, k, registry)?;
     encode_gemm(cb, &k_pipeline, &input, &wk_t, &k_out, m, nk, k, registry)?;
@@ -442,11 +435,8 @@ pub fn batched_gate_up_into_cb(
     let gate_out = Array::uninit(dev, &[m as usize, n_gate as usize], input.dtype());
     let up_out = Array::uninit(dev, &[m as usize, n_up as usize], input.dtype());
 
-    let gate_kernel = gemm_kernel_name_for_dims(input.dtype(), m, n_gate)?;
-    let up_kernel = gemm_kernel_name_for_dims(input.dtype(), m, n_up)?;
-
-    let gate_pipeline = registry.get_pipeline(gate_kernel, input.dtype())?;
-    let up_pipeline = registry.get_pipeline(up_kernel, input.dtype())?;
+    let gate_pipeline = gemm_pipeline_for_dims(registry, input.dtype(), m, n_gate)?;
+    let up_pipeline = gemm_pipeline_for_dims(registry, input.dtype(), m, n_up)?;
 
     encode_gemm(
         cb,
@@ -479,7 +469,7 @@ pub fn batched_gate_up_into_cb(
 // ---------------------------------------------------------------------------
 
 fn gemm_kernel_name_for_dims(dtype: DType, m: u32, n: u32) -> Result<&'static str, KernelError> {
-    let tile = super::matmul::select_tile_config(m as usize, n as usize, 0);
+    let tile = super::matmul::select_tile_config_with_dtype(m as usize, n as usize, 0, dtype);
     match (tile.variant, dtype) {
         (super::matmul::TileVariant::Small, DType::Float32) => Ok("gemm_small_f32"),
         (super::matmul::TileVariant::Small, DType::Float16) => Ok("gemm_small_f16"),
@@ -496,10 +486,35 @@ fn gemm_kernel_name_for_dims(dtype: DType, m: u32, n: u32) -> Result<&'static st
         (super::matmul::TileVariant::Full, DType::Float32) => Ok("gemm_tiled_f32"),
         (super::matmul::TileVariant::Full, DType::Float16) => Ok("gemm_tiled_f16"),
         (super::matmul::TileVariant::Full, DType::Bfloat16) => Ok("gemm_tiled_bf16"),
+        (super::matmul::TileVariant::MlxArch, DType::Float16) => Ok("gemm_mlx_f16"),
+        (super::matmul::TileVariant::MlxArch, DType::Float32) => Ok("gemm_mlx_f32"),
+        (super::matmul::TileVariant::MlxArchSmall, DType::Float16) => Ok("gemm_mlx_small_f16"),
+        (super::matmul::TileVariant::MlxArchMicro, DType::Float16) => Ok("gemm_mlx_m16_f16"),
         (_, other) => Err(KernelError::InvalidShape(format!(
             "fused: unsupported dtype for GEMM: {:?}",
             other
         ))),
+    }
+}
+
+/// Get a GEMM pipeline, using function constants for MlxArch alignment specialization.
+fn gemm_pipeline_for_dims(
+    registry: &KernelRegistry,
+    dtype: DType,
+    m: u32,
+    n: u32,
+) -> Result<metal::ComputePipelineState, KernelError> {
+    let kernel_name = gemm_kernel_name_for_dims(dtype, m, n)?;
+    let tile = super::matmul::select_tile_config_with_dtype(m as usize, n as usize, 0, dtype);
+    if tile.variant == super::matmul::TileVariant::MlxArch
+        || tile.variant == super::matmul::TileVariant::MlxArchSmall
+        || tile.variant == super::matmul::TileVariant::MlxArchMicro
+    {
+        let constants =
+            super::matmul::matmul_align_constants(m as usize, n as usize, tile.bm, tile.bn);
+        registry.get_pipeline_with_constants(kernel_name, dtype, &constants)
+    } else {
+        registry.get_pipeline(kernel_name, dtype)
     }
 }
 
@@ -522,7 +537,8 @@ fn encode_gemm(
     let batch_stride_b = k * n;
     let batch_stride_c = m * n;
 
-    let tile = super::matmul::select_tile_config(m as usize, n as usize, k as usize);
+    let tile =
+        super::matmul::select_tile_config_with_dtype(m as usize, n as usize, k as usize, a.dtype());
     let bm = tile.bm as u64;
     let bn = tile.bn as u64;
     let grid_x = (n as u64).div_ceil(bn);
@@ -532,6 +548,9 @@ fn encode_gemm(
         super::matmul::TileVariant::Small => 256_u64,
         super::matmul::TileVariant::Medium | super::matmul::TileVariant::Simd => 1024_u64,
         super::matmul::TileVariant::Skinny | super::matmul::TileVariant::Full => 256_u64,
+        super::matmul::TileVariant::MlxArch
+        | super::matmul::TileVariant::MlxArchSmall
+        | super::matmul::TileVariant::MlxArchMicro => 64_u64,
     };
 
     let enc = cb.new_compute_command_encoder();
@@ -558,12 +577,17 @@ fn encode_gemm(
         &batch_stride_c as *const u32 as *const std::ffi::c_void,
     );
 
-    // Steel and Full/Skinny kernels require swizzle_log (buffer 9)
+    // Full, Skinny, and MlxArch kernels require swizzle_log (buffer 9)
     if matches!(
         tile.variant,
-        super::matmul::TileVariant::Full | super::matmul::TileVariant::Skinny
+        super::matmul::TileVariant::Full
+            | super::matmul::TileVariant::Skinny
+            | super::matmul::TileVariant::MlxArch
+            | super::matmul::TileVariant::MlxArchSmall
+            | super::matmul::TileVariant::MlxArchMicro
     ) {
-        let swizzle_log = super::matmul::compute_swizzle_log(m as usize, tile.bm);
+        let swizzle_log =
+            super::matmul::compute_swizzle_log(m as usize, n as usize, tile.bm, tile.bn);
         enc.set_bytes(9, 4, &swizzle_log as *const u32 as *const std::ffi::c_void);
     }
 
@@ -1907,19 +1931,19 @@ mod tests {
 
     #[test]
     fn test_gemm_kernel_name_for_dims() {
-        // Full tile (M>=33, N>=33) -> gemm_tiled_*
+        // Full tile (M>=33, N>=33) -> MlxArch kernels
         assert_eq!(
             gemm_kernel_name_for_dims(DType::Float32, 64, 64).unwrap(),
-            "gemm_tiled_f32"
+            "gemm_mlx_f32"
         );
         assert_eq!(
             gemm_kernel_name_for_dims(DType::Float16, 128, 128).unwrap(),
-            "gemm_tiled_f16"
+            "gemm_mlx_f16"
         );
-        // Skinny (M=5..32, N>=33) -> gemm_skinny_*
+        // Skinny f16 (M=5..32, N<=4096) -> MlxArchMicro
         assert_eq!(
             gemm_kernel_name_for_dims(DType::Float16, 16, 128).unwrap(),
-            "gemm_skinny_f16"
+            "gemm_mlx_m16_f16"
         );
         // Unsupported dtype
         assert!(gemm_kernel_name_for_dims(DType::Q4_0, 64, 64).is_err());

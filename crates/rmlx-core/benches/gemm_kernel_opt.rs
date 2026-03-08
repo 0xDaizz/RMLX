@@ -88,6 +88,14 @@ const CONFIGS: &[GemmKernelOptConfig] = &[
         use_wide_load: true,
         use_aligned: true,
     },
+    // 7. MLX architecture: BM=64, BN=64, BK=16, 2 SG (1×2), 64 threads,
+    //    single buffer, wide loads, direct store, serpentine MMA
+    GemmKernelOptConfig {
+        label: "mlx_arch",
+        use_direct_store: true,
+        use_wide_load: true,
+        use_aligned: false,
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -520,6 +528,242 @@ fn generate_scratch_store(s: &mut String, aligned: bool) {
 }
 
 // ---------------------------------------------------------------------------
+// MLX-architecture kernel generator (variant 7)
+// BM=64, BN=64, BK=16, WM=1, WN=2 (2 SG), 64 threads, single buffer,
+// wide loads (4×half4 = 16 elements/thread), direct store, serpentine MMA
+// ---------------------------------------------------------------------------
+
+fn generate_mlx_arch_shader() -> String {
+    let mut s = String::with_capacity(16384);
+
+    // Header
+    s.push_str("#include <metal_stdlib>\nusing namespace metal;\n\n");
+
+    // Constants
+    s.push_str(
+        "constant constexpr uint MLX_BM = 64;\n\
+         constant constexpr uint MLX_BN = 64;\n\
+         constant constexpr uint MLX_BK = 16;\n\
+         constant constexpr uint MLX_N_SG = 2;\n\
+         constant constexpr uint MLX_N_THREADS = 64;\n\
+         constant constexpr uint MLX_TM = 8;   // BM / 8 = 64/8\n\
+         constant constexpr uint MLX_TN = 4;   // (BN/2) / 8 = 32/8\n\n",
+    );
+
+    // Uniform hint
+    s.push_str(
+        "#if __METAL_VERSION__ >= 310\n\
+         template <typename T>\n\
+         METAL_FUNC uniform<T> mlx_as_uniform(T val) {\n\
+             return make_uniform(val);\n\
+         }\n\
+         #else\n\
+         template <typename T>\n\
+         METAL_FUNC T mlx_as_uniform(T val) {\n\
+             return val;\n\
+         }\n\
+         #endif\n\n",
+    );
+
+    // Swizzle helper
+    s.push_str(
+        "inline uint2 mlx_swizzle_tg(uint2 tid, uint swizzle_log) {\n\
+             if (swizzle_log == 0) return tid;\n\
+             return uint2(\n\
+                 tid.x >> swizzle_log,\n\
+                 (tid.y << swizzle_log) | (tid.x & ((1u << swizzle_log) - 1u))\n\
+             );\n\
+         }\n\n",
+    );
+
+    // Kernel function signature — same buffer layout as other variants
+    s.push_str(
+        "kernel void gemm_ko_mlx_arch(\n\
+         \x20   device const half* A [[buffer(0)]],\n\
+         \x20   device const half* B [[buffer(1)]],\n\
+         \x20   device half* C       [[buffer(2)]],\n\
+         \x20   constant uint& M     [[buffer(3)]],\n\
+         \x20   constant uint& N     [[buffer(4)]],\n\
+         \x20   constant uint& K     [[buffer(5)]],\n\
+         \x20   constant uint& batch_stride_a [[buffer(6)]],\n\
+         \x20   constant uint& batch_stride_b [[buffer(7)]],\n\
+         \x20   constant uint& batch_stride_c [[buffer(8)]],\n\
+         \x20   constant uint& swizzle_log    [[buffer(9)]],\n\
+         \x20   uint3 group_id       [[threadgroup_position_in_grid]],\n\
+         \x20   uint  tid_in_group   [[thread_index_in_threadgroup]],\n\
+         \x20   uint  sgid           [[simdgroup_index_in_threadgroup]],\n\
+         \x20   uint  lane_id        [[thread_index_in_simdgroup]])\n\
+         {\n",
+    );
+
+    // Threadgroup memory — single buffer (no double buffering)
+    s.push_str(
+        "    threadgroup half As[MLX_BM * MLX_BK];  // 64×16 = 1024 halves = 2KB\n\
+         \x20   threadgroup half Bs[MLX_BK * MLX_BN];  // 16×64 = 1024 halves = 2KB\n\n",
+    );
+
+    // Batch / swizzle setup
+    s.push_str(
+        "    const uint batch_idx = group_id.z;\n\
+         \x20   uint2 swizzled = mlx_swizzle_tg(uint2(group_id.x, group_id.y), swizzle_log);\n\
+         \x20   const uint row_start = swizzled.y * mlx_as_uniform(MLX_BM);\n\
+         \x20   const uint col_start = swizzled.x * mlx_as_uniform(MLX_BN);\n\n\
+         \x20   device const half* A_batch = A + batch_idx * mlx_as_uniform(batch_stride_a);\n\
+         \x20   device const half* B_batch = B + batch_idx * mlx_as_uniform(batch_stride_b);\n\
+         \x20   device half*       C_batch = C + batch_idx * mlx_as_uniform(batch_stride_c);\n\n",
+    );
+
+    // SG position: 1×2 grid (WM=1, WN=2)
+    s.push_str(
+        "    // SG grid: 1×2 — sg_row always 0, sg_col = sgid (0 or 1)\n\
+         \x20   const uint base_m = 0;        // WM=1, single row of SG\n\
+         \x20   const uint base_n = sgid * 32; // each SG covers 32 cols\n\n",
+    );
+
+    // Accumulators: TM=8, TN=4
+    s.push_str(
+        "    simdgroup_float8x8 acc[MLX_TM][MLX_TN];\n\
+         \x20   #pragma clang loop unroll(full)\n\
+         \x20   for (uint i = 0; i < MLX_TM; i++)\n\
+         \x20       #pragma clang loop unroll(full)\n\
+         \x20       for (uint j = 0; j < MLX_TN; j++)\n\
+         \x20           acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);\n\n",
+    );
+
+    // Uniform dimension copies
+    s.push_str(
+        "    const uint uK = mlx_as_uniform(K);\n\
+         \x20   const uint uM = mlx_as_uniform(M);\n\
+         \x20   const uint uN = mlx_as_uniform(N);\n\
+         \x20   const uint n_tiles = (uK + MLX_BK - 1) / MLX_BK;\n\n",
+    );
+
+    // ── Main loop: single-buffered ──
+    // barrier → load A+B → barrier → MMA → advance
+    s.push_str(
+        "    // ── Main loop: single-buffered ──\n\
+         \x20   for (uint tile = 0; tile < n_tiles; tile++) {\n\
+         \x20       uint kb = tile * MLX_BK;\n\n",
+    );
+
+    // Load A: each of 64 threads loads one row of BK=16 elements (4×half4)
+    s.push_str(
+        "        // Load A tile: 64 threads × 16 elements = 64×16 = BM×BK\n\
+         \x20       threadgroup_barrier(mem_flags::mem_threadgroup);\n\
+         \x20       {\n\
+         \x20           uint a_row = tid_in_group;  // 0..63\n\
+         \x20           uint gr = row_start + a_row;\n\
+         \x20           if (gr < uM && kb + 15 < uK) {\n\
+         \x20               *reinterpret_cast<threadgroup half4*>(&As[a_row * 16]) =\n\
+         \x20                   *reinterpret_cast<device const half4*>(&A_batch[gr * uK + kb]);\n\
+         \x20               *reinterpret_cast<threadgroup half4*>(&As[a_row * 16 + 4]) =\n\
+         \x20                   *reinterpret_cast<device const half4*>(&A_batch[gr * uK + kb + 4]);\n\
+         \x20               *reinterpret_cast<threadgroup half4*>(&As[a_row * 16 + 8]) =\n\
+         \x20                   *reinterpret_cast<device const half4*>(&A_batch[gr * uK + kb + 8]);\n\
+         \x20               *reinterpret_cast<threadgroup half4*>(&As[a_row * 16 + 12]) =\n\
+         \x20                   *reinterpret_cast<device const half4*>(&A_batch[gr * uK + kb + 12]);\n\
+         \x20           } else {\n\
+         \x20               for (uint d = 0; d < 16; d++) {\n\
+         \x20                   As[a_row * 16 + d] = (gr < uM && kb + d < uK)\n\
+         \x20                       ? A_batch[gr * uK + kb + d] : half(0);\n\
+         \x20               }\n\
+         \x20           }\n\
+         \x20       }\n\n",
+    );
+
+    // Load B: 16 rows × 64 cols = 1024 elements, 64 threads, each loads 16 elements
+    // Map: bi = tid_in_group / 4, bj = (tid_in_group % 4) * 16
+    s.push_str(
+        "        // Load B tile: 64 threads × 16 elements = 16×64 = BK×BN\n\
+         \x20       {\n\
+         \x20           uint bi = tid_in_group >> 2;         // 0..15 (row in B tile)\n\
+         \x20           uint bj = (tid_in_group & 3u) << 4;  // 0, 16, 32, 48\n\
+         \x20           uint gr = kb + bi;\n\
+         \x20           uint gc = col_start + bj;\n\
+         \x20           if (gr < uK && gc + 15 < uN) {\n\
+         \x20               *reinterpret_cast<threadgroup half4*>(&Bs[bi * 64 + bj]) =\n\
+         \x20                   *reinterpret_cast<device const half4*>(&B_batch[gr * uN + gc]);\n\
+         \x20               *reinterpret_cast<threadgroup half4*>(&Bs[bi * 64 + bj + 4]) =\n\
+         \x20                   *reinterpret_cast<device const half4*>(&B_batch[gr * uN + gc + 4]);\n\
+         \x20               *reinterpret_cast<threadgroup half4*>(&Bs[bi * 64 + bj + 8]) =\n\
+         \x20                   *reinterpret_cast<device const half4*>(&B_batch[gr * uN + gc + 8]);\n\
+         \x20               *reinterpret_cast<threadgroup half4*>(&Bs[bi * 64 + bj + 12]) =\n\
+         \x20                   *reinterpret_cast<device const half4*>(&B_batch[gr * uN + gc + 12]);\n\
+         \x20           } else {\n\
+         \x20               for (uint d = 0; d < 16; d++) {\n\
+         \x20                   Bs[bi * 64 + bj + d] = (gr < uK && gc + d < uN)\n\
+         \x20                       ? B_batch[gr * uN + gc + d] : half(0);\n\
+         \x20               }\n\
+         \x20           }\n\
+         \x20       }\n\n",
+    );
+
+    // Second barrier before compute
+    s.push_str("        threadgroup_barrier(mem_flags::mem_threadgroup);\n\n");
+
+    // MMA compute with serpentine — BK/8 = 16/8 = 2 inner iterations
+    s.push_str(
+        "        // MMA compute (serpentine)\n\
+         \x20       #pragma clang loop unroll(full)\n\
+         \x20       for (uint kk = 0; kk < 2; kk++) {\n\
+         \x20           simdgroup_half8x8 a_frag[MLX_TM];\n\
+         \x20           simdgroup_half8x8 b_frag[MLX_TN];\n\n\
+         \x20           #pragma clang loop unroll(full)\n\
+         \x20           for (uint i = 0; i < MLX_TM; i++) {\n\
+         \x20               simdgroup_load(a_frag[i],\n\
+         \x20                   &As[(base_m + i * 8) * 16 + kk * 8], 16);\n\
+         \x20           }\n\n\
+         \x20           #pragma clang loop unroll(full)\n\
+         \x20           for (uint j = 0; j < MLX_TN; j++) {\n\
+         \x20               simdgroup_load(b_frag[j],\n\
+         \x20                   &Bs[kk * 8 * 64 + (base_n + j * 8)], 64);\n\
+         \x20           }\n\n\
+         \x20           #pragma clang loop unroll(full)\n\
+         \x20           for (uint i = 0; i < MLX_TM; i++) {\n\
+         \x20               #pragma clang loop unroll(full)\n\
+         \x20               for (uint j = 0; j < MLX_TN; j++) {\n\
+         \x20                   uint n_serp = (i % 2) ? (3 - j) : j;\n\
+         \x20                   simdgroup_multiply_accumulate(\n\
+         \x20                       acc[i][n_serp], a_frag[i], b_frag[n_serp], acc[i][n_serp]);\n\
+         \x20               }\n\
+         \x20           }\n\
+         \x20       }\n",
+    );
+
+    // Close main loop
+    s.push_str("    }\n\n");
+
+    // Direct store — MLX lane mapping
+    s.push_str(
+        "    // ── Store results: direct store from simdgroup registers ──\n\
+         \x20   const uint qid = lane_id / 4;\n\
+         \x20   const uint fm = (qid & 4u) + ((lane_id / 2u) % 4u);\n\
+         \x20   const uint fn_val = (qid & 2u) * 2u + (lane_id % 2u) * 2u;\n\n\
+         \x20   #pragma clang loop unroll(full)\n\
+         \x20   for (uint i = 0; i < MLX_TM; i++) {\n\
+         \x20       #pragma clang loop unroll(full)\n\
+         \x20       for (uint j = 0; j < MLX_TN; j++) {\n\
+         \x20           uint gr = row_start + base_m + i * 8 + fm;\n\
+         \x20           uint gc0 = col_start + base_n + j * 8 + fn_val;\n\
+         \x20           uint gc1 = gc0 + 1;\n\n\
+         \x20           auto elems = acc[i][j].thread_elements();\n\n\
+         \x20           if (gr < uM && gc0 < uN) {\n\
+         \x20               C_batch[gr * uN + gc0] = half(elems[0]);\n\
+         \x20           }\n\
+         \x20           if (gr < uM && gc1 < uN) {\n\
+         \x20               C_batch[gr * uN + gc1] = half(elems[1]);\n\
+         \x20           }\n\
+         \x20       }\n\
+         \x20   }\n",
+    );
+
+    // Close kernel
+    s.push_str("}\n");
+
+    s
+}
+
+// ---------------------------------------------------------------------------
 // Stats helper
 // ---------------------------------------------------------------------------
 
@@ -652,7 +896,13 @@ fn bench_config(
     let grid_x = ceil_div(n, BN as usize) as u64;
     let grid_y = ceil_div(m, BM as usize) as u64;
     let grid = MTLSize::new(grid_x, grid_y, 1);
-    let tg = MTLSize::new(N_THREADS as u64, 1, 1);
+    // mlx_arch uses 64 threads; all other variants use N_THREADS (256)
+    let n_threads = if cfg.label == "mlx_arch" {
+        64u64
+    } else {
+        N_THREADS as u64
+    };
+    let tg = MTLSize::new(n_threads, 1, 1);
 
     // Warmup
     for _ in 0..WARMUP_ITERS {
@@ -719,11 +969,19 @@ fn main() {
 
     // Register all optimization kernels via JIT
     for cfg in CONFIGS {
-        let source = generate_kernel_opt_shader(cfg);
         let jit_name = format!("gemm_ko_{}", cfg.label);
-        registry
-            .register_jit_source(&jit_name, &source)
-            .unwrap_or_else(|e| panic!("Failed to compile {}: {e}", cfg.label));
+        if cfg.label == "mlx_arch" {
+            // MLX-architecture variant uses its own dedicated shader generator
+            let source = generate_mlx_arch_shader();
+            registry
+                .register_jit_source(&jit_name, &source)
+                .unwrap_or_else(|e| panic!("Failed to compile {}: {e}", cfg.label));
+        } else {
+            let source = generate_kernel_opt_shader(cfg);
+            registry
+                .register_jit_source(&jit_name, &source)
+                .unwrap_or_else(|e| panic!("Failed to compile {}: {e}", cfg.label));
+        }
     }
 
     // ── Correctness verification ──
@@ -784,6 +1042,13 @@ fn main() {
                 .unwrap_or_else(|_| panic!("{} pipeline", cfg.label));
             let c_test = Array::zeros(device, &[vm, vn], DType::Float16);
 
+            // mlx_arch uses 64 threads; all other variants use N_THREADS (256)
+            let verify_tg = if cfg.label == "mlx_arch" {
+                MTLSize::new(64, 1, 1)
+            } else {
+                tg
+            };
+
             let cb = queue.new_command_buffer();
             let enc = cb.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&pipeline);
@@ -797,7 +1062,7 @@ fn main() {
             enc.set_buffer(7, Some(&bsb_buf), 0);
             enc.set_buffer(8, Some(&bsc_buf), 0);
             enc.set_buffer(9, Some(&sw_buf), 0);
-            enc.dispatch_thread_groups(grid, tg);
+            enc.dispatch_thread_groups(grid, verify_tg);
             enc.end_encoding();
             cb.commit();
             cb.wait_until_completed();

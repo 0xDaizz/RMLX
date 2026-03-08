@@ -382,7 +382,7 @@ impl Linear {
             ));
         }
 
-        let tile = ops::matmul::select_tile_config(m, n, k);
+        let tile = ops::matmul::select_tile_config_with_dtype(m, n, k, input_2d.dtype());
         let kernel_name = match (tile.variant, input_2d.dtype()) {
             (ops::matmul::TileVariant::Simd, rmlx_core::dtype::DType::Float32)
             | (ops::matmul::TileVariant::Medium, rmlx_core::dtype::DType::Float32) => {
@@ -415,6 +415,14 @@ impl Linear {
             (ops::matmul::TileVariant::Full, rmlx_core::dtype::DType::Bfloat16) => {
                 "gemm_tiled_bf16"
             }
+            (ops::matmul::TileVariant::MlxArch, rmlx_core::dtype::DType::Float16) => "gemm_mlx_f16",
+            (ops::matmul::TileVariant::MlxArch, rmlx_core::dtype::DType::Float32) => "gemm_mlx_f32",
+            (ops::matmul::TileVariant::MlxArchSmall, rmlx_core::dtype::DType::Float16) => {
+                "gemm_mlx_small_f16"
+            }
+            (ops::matmul::TileVariant::MlxArchMicro, rmlx_core::dtype::DType::Float16) => {
+                "gemm_mlx_m16_f16"
+            }
             (_, other) => {
                 return Err(KernelError::InvalidShape(format!(
                     "linear: unsupported dtype {:?}",
@@ -427,7 +435,16 @@ impl Linear {
         let n_u32 = n as u32;
         let k_u32 = k as u32;
 
-        let pipeline = registry.get_pipeline(kernel_name, input_2d.dtype())?;
+        // MlxArch/MlxArchSmall use function constants for alignment specialization
+        let pipeline = if tile.variant == ops::matmul::TileVariant::MlxArch
+            || tile.variant == ops::matmul::TileVariant::MlxArchSmall
+            || tile.variant == ops::matmul::TileVariant::MlxArchMicro
+        {
+            let constants = ops::matmul::matmul_align_constants(m, n, tile.bm, tile.bn);
+            registry.get_pipeline_with_constants(kernel_name, input_2d.dtype(), &constants)?
+        } else {
+            registry.get_pipeline(kernel_name, input_2d.dtype())?
+        };
         let dev = registry.device().raw();
         let output = Array::zeros(dev, &[m, n], input_2d.dtype());
 
@@ -455,12 +472,16 @@ impl Linear {
         enc.set_buffer(7, Some(&bsb), 0);
         enc.set_buffer(8, Some(&bsc), 0);
 
-        // Steel and Full/Skinny kernels require swizzle_log (buffer 9)
+        // Steel, Full/Skinny/MlxArch kernels require swizzle_log (buffer 9)
         let swizzle_log_buf = if matches!(
             tile.variant,
-            ops::matmul::TileVariant::Full | ops::matmul::TileVariant::Skinny
+            ops::matmul::TileVariant::Full
+                | ops::matmul::TileVariant::Skinny
+                | ops::matmul::TileVariant::MlxArch
+                | ops::matmul::TileVariant::MlxArchSmall
+                | ops::matmul::TileVariant::MlxArchMicro
         ) {
-            let swizzle_log = ops::matmul::compute_swizzle_log(m, tile.bm);
+            let swizzle_log = ops::matmul::compute_swizzle_log(m, n, tile.bm, tile.bn);
             let buf = make_u32_buf(dev, swizzle_log);
             enc.set_buffer(9, Some(&buf), 0);
             Some(buf)
@@ -472,6 +493,9 @@ impl Linear {
             ops::matmul::TileVariant::Small => 256_u64,
             ops::matmul::TileVariant::Medium | ops::matmul::TileVariant::Simd => 1024_u64,
             ops::matmul::TileVariant::Skinny | ops::matmul::TileVariant::Full => 256_u64,
+            ops::matmul::TileVariant::MlxArch
+            | ops::matmul::TileVariant::MlxArchSmall
+            | ops::matmul::TileVariant::MlxArchMicro => 64_u64,
         };
 
         let grid = metal::MTLSize::new(grid_x, grid_y, 1);
