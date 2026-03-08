@@ -488,6 +488,7 @@ fn gemm_kernel_name_for_dims(dtype: DType, m: u32, n: u32) -> Result<&'static st
         (super::matmul::TileVariant::Full, DType::Bfloat16) => Ok("gemm_tiled_bf16"),
         (super::matmul::TileVariant::MlxArch, DType::Float16) => Ok("gemm_mlx_f16"),
         (super::matmul::TileVariant::MlxArch, DType::Float32) => Ok("gemm_mlx_f32"),
+        (super::matmul::TileVariant::MlxArch, DType::Bfloat16) => Ok("gemm_mlx_bf16"),
         (super::matmul::TileVariant::MlxArchSmall, DType::Float16) => Ok("gemm_mlx_small_f16"),
         (super::matmul::TileVariant::MlxArchMicro, DType::Float16) => Ok("gemm_mlx_m16_f16"),
         (_, other) => Err(KernelError::InvalidShape(format!(
@@ -1944,6 +1945,11 @@ mod tests {
         assert_eq!(
             gemm_kernel_name_for_dims(DType::Float16, 16, 128).unwrap(),
             "gemm_mlx_m16_f16"
+        );
+        // Full tile bf16 -> MlxArch
+        assert_eq!(
+            gemm_kernel_name_for_dims(DType::Bfloat16, 128, 128).unwrap(),
+            "gemm_mlx_bf16"
         );
         // Unsupported dtype
         assert!(gemm_kernel_name_for_dims(DType::Q4_0, 64, 64).is_err());

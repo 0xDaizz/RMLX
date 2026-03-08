@@ -2793,10 +2793,10 @@ kernel void gemm_mlx_bf16(
 
     // bf16→f32 conversion buffers for simdgroup_load
     // A slice: BM * 8 = 64 * 8 = 512 floats = 2KB
-    // B slice: 8 * (BN/2) = 8 * 32 = 256 floats = 1KB per SG
-    // Total extra: 2KB + 1KB = 3KB (well within 32KB TG limit)
+    // B slice: 2 * 8 * 32 = 512 floats = 2KB (per-SG to avoid write-write race)
+    // Total extra: 2KB + 2KB = 4KB (well within 32KB TG limit)
     threadgroup float A_f32[MLX_BM * 8];
-    threadgroup float B_f32[8 * 32];  // per-kk slice for one SG half
+    threadgroup float B_f32[2][8 * 32];  // per-SG to avoid write-write race
 
     // -- Main loop: single-buffered --
     for (uint tile = 0; tile < n_tiles; tile++) {
@@ -2853,7 +2853,7 @@ kernel void gemm_mlx_bf16(
             for (uint idx = tid_in_group; idx < 8 * 32; idx += MLX_N_THREADS) {
                 uint r = idx / 32;
                 uint c = idx % 32;
-                B_f32[idx] = float(Bs[(kk * 8 + r) * 64 + base_n + c]);
+                B_f32[sgid][idx] = float(Bs[(kk * 8 + r) * 64 + base_n + c]);
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -2867,7 +2867,7 @@ kernel void gemm_mlx_bf16(
 
             #pragma clang loop unroll(full)
             for (uint j = 0; j < MLX_TN; j++) {
-                simdgroup_load(b_frag[j], &B_f32[j * 8], 32);
+                simdgroup_load(b_frag[j], &B_f32[sgid][j * 8], 32);
             }
 
             #pragma clang loop unroll(full)
@@ -3664,25 +3664,6 @@ pub fn matmul(
             result.dtype(),
             result.offset(),
         ));
-    }
-
-    // Case 3: M=2..4 -- use GEMV per row (small enough that GEMV is faster)
-    if m <= 4 {
-        let b_t = b.view(vec![n, k], vec![1, n], b.offset());
-        let b_t = super::copy::copy(registry, &b_t, queue)?;
-        let a_vec = Array::new(
-            a.metal_buffer().to_owned(),
-            vec![k],
-            vec![1],
-            a.dtype(),
-            a.offset(),
-        );
-        // For M=2..4, use B^T @ a_rows approach:
-        // Actually, let's just use the GEMM path for M=2..4 with small tiles.
-        // The overhead of calling GEMV M times may not be worth it.
-        // Fall through to GEMM dispatch.
-        drop(b_t);
-        drop(a_vec);
     }
 
     // -----------------------------------------------------------------------
