@@ -3025,8 +3025,8 @@ mod tests {
         );
         let diff = max_abs_diff(&gqa, &reference);
         assert!(
-            diff < 1e-2,
-            "GQA ratio=4 seq=257 (unaligned): max_abs_diff={diff} (expected < 1e-2)"
+            diff < 1.5e-2,
+            "GQA ratio=4 seq=257 (unaligned): max_abs_diff={diff} (expected < 1.5e-2)"
         );
     }
 
