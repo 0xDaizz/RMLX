@@ -65,7 +65,8 @@ impl CompletionQueue {
     /// Poll for completions. Returns number of completions (0 = none ready).
     pub fn poll(&self, wc: &mut [IbvWc]) -> Result<usize, RdmaError> {
         // SAFETY: self.cq is a valid ibv_cq pointer, wc is a valid mutable slice.
-        let n = unsafe { (self.lib.poll_cq)(self.cq, wc.len() as c_int, wc.as_mut_ptr()) };
+        // SAFETY: self.cq is valid, calls through context->ops vtable (inline in C).
+        let n = unsafe { ibv_poll_cq(self.cq, wc.len() as c_int, wc.as_mut_ptr()) };
         if n < 0 {
             return Err(RdmaError::CqPoll(format!("ibv_poll_cq returned {n}")));
         }
@@ -334,7 +335,8 @@ impl QueuePair {
         let mut bad_wr: *mut IbvSendWr = ptr::null_mut();
         // SAFETY: self.qp is valid, wr points to a valid send work request,
         // bad_wr receives the pointer to the first failed WR on error.
-        let ret = unsafe { (self.lib.post_send)(self.qp, wr, &mut bad_wr) };
+        // SAFETY: self.qp is valid, calls through context->ops vtable (inline in C).
+        let ret = unsafe { ibv_post_send(self.qp, wr, &mut bad_wr) };
         if ret != 0 {
             return Err(RdmaError::PostFailed(format!(
                 "ibv_post_send failed: {ret}"
@@ -348,7 +350,8 @@ impl QueuePair {
         let mut bad_wr: *mut IbvRecvWr = ptr::null_mut();
         // SAFETY: self.qp is valid, wr points to a valid recv work request,
         // bad_wr receives the pointer to the first failed WR on error.
-        let ret = unsafe { (self.lib.post_recv)(self.qp, wr, &mut bad_wr) };
+        // SAFETY: self.qp is valid, calls through context->ops vtable (inline in C).
+        let ret = unsafe { ibv_post_recv(self.qp, wr, &mut bad_wr) };
         if ret != 0 {
             return Err(RdmaError::PostFailed(format!(
                 "ibv_post_recv failed: {ret}"

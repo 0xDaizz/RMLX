@@ -110,12 +110,17 @@ fn cpu_matmul_f32(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32
     out
 }
 
-/// Create an f32 Array from raw bytes, using a DeviceRef.
+/// Create an Array from raw bytes with the given dtype, using a DeviceRef.
 ///
 /// This avoids the `&Device` vs `&DeviceRef` mismatch when the device is
 /// obtained from `buffer.device()`.
 #[cfg(feature = "distributed")]
-fn array_from_raw_bytes(device: &metal::DeviceRef, bytes: &[u8], shape: Vec<usize>) -> Array {
+fn array_from_raw_bytes(
+    device: &metal::DeviceRef,
+    bytes: &[u8],
+    shape: Vec<usize>,
+    dtype: DType,
+) -> Array {
     use metal::MTLResourceOptions;
     let ptr = bytes.as_ptr() as *const std::ffi::c_void;
     let buffer = device.new_buffer_with_data(
@@ -124,22 +129,24 @@ fn array_from_raw_bytes(device: &metal::DeviceRef, bytes: &[u8], shape: Vec<usiz
         MTLResourceOptions::StorageModeShared,
     );
     let numel: usize = shape.iter().product();
+    let elem_bytes = dtype.size_of();
     assert_eq!(
         bytes.len(),
-        numel * 4,
-        "byte length ({}) does not match shape {:?} * 4",
+        numel * elem_bytes,
+        "byte length ({}) does not match shape {:?} * {}",
         bytes.len(),
-        shape
+        shape,
+        elem_bytes
     );
     let ndim = shape.len();
     let mut strides = vec![1usize; ndim];
     for i in (0..ndim.saturating_sub(1)).rev() {
         strides[i] = strides[i + 1] * shape[i + 1];
     }
-    Array::new(buffer, shape, strides, DType::Float32, 0)
+    Array::new(buffer, shape, strides, dtype, 0)
 }
 
-/// Element-wise f32 addition: a[i] += b[i] for raw byte slices interpreted as f32.
+/// Element-wise addition: a[i] += b[i] for raw byte slices interpreted as f32.
 #[cfg(feature = "distributed")]
 fn add_bias_f32(data: &mut [u8], bias: &[u8], rows: usize, cols: usize) {
     assert_eq!(bias.len(), cols * 4);
@@ -160,6 +167,70 @@ fn add_bias_f32(data: &mut [u8], bias: &[u8], rows: usize, cols: usize) {
             ]);
             let sum = val + b;
             data[offset..offset + 4].copy_from_slice(&sum.to_ne_bytes());
+        }
+    }
+}
+
+/// f16 ↔ f32 conversion helpers for bias addition.
+#[cfg(feature = "distributed")]
+fn f16_to_f32(bits: u16) -> f32 {
+    let sign = ((bits >> 15) & 1) as u32;
+    let exp = ((bits >> 10) & 0x1F) as u32;
+    let frac = (bits & 0x3FF) as u32;
+    if exp == 0 {
+        // zero or subnormal
+        if frac == 0 {
+            return f32::from_bits(sign << 31);
+        }
+        // subnormal: 2^-14 * (frac/1024)
+        let val = (frac as f32) / 1024.0 * (2.0f32).powi(-14);
+        if sign == 1 {
+            -val
+        } else {
+            val
+        }
+    } else if exp == 31 {
+        // inf or NaN
+        f32::from_bits((sign << 31) | 0x7F800000 | if frac != 0 { 0x400000 } else { 0 })
+    } else {
+        let new_exp = (exp as i32 - 15 + 127) as u32;
+        f32::from_bits((sign << 31) | (new_exp << 23) | (frac << 13))
+    }
+}
+
+#[cfg(feature = "distributed")]
+fn f32_to_f16(val: f32) -> u16 {
+    let bits = val.to_bits();
+    let sign = (bits >> 31) & 1;
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    let frac = bits & 0x7FFFFF;
+    if exp == 0 {
+        return (sign << 15) as u16;
+    }
+    if exp == 0xFF {
+        return ((sign << 15) | 0x7C00 | if frac != 0 { 0x200 } else { 0 }) as u16;
+    }
+    let new_exp = exp - 127 + 15;
+    if new_exp >= 31 {
+        return ((sign << 15) | 0x7C00) as u16;
+    }
+    if new_exp <= 0 {
+        return (sign << 15) as u16;
+    }
+    ((sign << 15) | (new_exp as u32) << 10 | (frac >> 13)) as u16
+}
+
+/// Element-wise addition: a[i] += b[i] for raw byte slices interpreted as f16.
+#[cfg(feature = "distributed")]
+fn add_bias_f16(data: &mut [u8], bias: &[u8], rows: usize, cols: usize) {
+    assert_eq!(bias.len(), cols * 2);
+    for r in 0..rows {
+        for c in 0..cols {
+            let offset = (r * cols + c) * 2;
+            let val = f16_to_f32(u16::from_ne_bytes([data[offset], data[offset + 1]]));
+            let b = f16_to_f32(u16::from_ne_bytes([bias[c * 2], bias[c * 2 + 1]]));
+            let sum = f32_to_f16(val + b);
+            data[offset..offset + 2].copy_from_slice(&sum.to_ne_bytes());
         }
     }
 }
@@ -301,9 +372,19 @@ impl ColumnParallelLinear {
         queue: &metal::CommandQueue,
     ) -> Result<Array, DistributedError> {
         assert_eq!(input.ndim(), 2, "input must be 2D [batch, in_features]");
-        assert_eq!(input.dtype(), DType::Float32, "only f32 supported for now");
-        assert_eq!(self.weight.dtype(), DType::Float32);
+        let dtype = input.dtype();
+        assert!(
+            dtype == DType::Float32 || dtype == DType::Float16,
+            "only f32 and f16 supported, got {:?}",
+            dtype
+        );
+        assert_eq!(
+            self.weight.dtype(),
+            dtype,
+            "weight dtype must match input dtype"
+        );
 
+        let elem_bytes = dtype.size_of();
         let batch = input.shape()[0];
         let k = input.shape()[1]; // in_features
         assert_eq!(k, self.in_features, "input in_features mismatch");
@@ -346,8 +427,8 @@ impl ColumnParallelLinear {
         );
 
         let world = self.world_size as usize;
-        let shard_bytes = shard_out * 4; // bytes per rank per row
-        let row_bytes = self.out_features * 4; // bytes per output row
+        let shard_bytes = shard_out * elem_bytes; // bytes per rank per row
+        let row_bytes = self.out_features * elem_bytes; // bytes per output row
 
         let mut interleaved = vec![0u8; batch * row_bytes];
         for r in 0..batch {
@@ -364,6 +445,7 @@ impl ColumnParallelLinear {
             input.metal_buffer().device(),
             &interleaved,
             vec![batch, self.out_features],
+            dtype,
         );
         Ok(result)
     }
@@ -490,8 +572,17 @@ impl RowParallelLinear {
             2,
             "input must be 2D [batch, in_features/world_size]"
         );
-        assert_eq!(input.dtype(), DType::Float32, "only f32 supported for now");
-        assert_eq!(self.weight.dtype(), DType::Float32);
+        let dtype = input.dtype();
+        assert!(
+            dtype == DType::Float32 || dtype == DType::Float16,
+            "only f32 and f16 supported, got {:?}",
+            dtype
+        );
+        assert_eq!(
+            self.weight.dtype(),
+            dtype,
+            "weight dtype must match input dtype"
+        );
 
         let batch = input.shape()[0];
         let shard_in = input.shape()[1]; // in_features / world_size
@@ -520,11 +611,20 @@ impl RowParallelLinear {
         // Add bias after allreduce (all ranks have the same summed result)
         if let Some(ref bias) = self.bias {
             let bias_data = bias.to_bytes();
-            add_bias_f32(&mut reduced, bias_data, batch, n);
+            match dtype {
+                DType::Float32 => add_bias_f32(&mut reduced, bias_data, batch, n),
+                DType::Float16 => add_bias_f16(&mut reduced, bias_data, batch, n),
+                _ => unreachable!(),
+            }
         }
 
         // Reconstruct Array from reduced bytes
-        let result = array_from_raw_bytes(input.metal_buffer().device(), &reduced, vec![batch, n]);
+        let result = array_from_raw_bytes(
+            input.metal_buffer().device(),
+            &reduced,
+            vec![batch, n],
+            dtype,
+        );
         Ok(result)
     }
 }

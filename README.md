@@ -28,6 +28,7 @@ Single transformer layer decode (Llama-2 7B shapes, f16, M3 Ultra):
 | **Cached 2-encoder (60L)** | **714 us/L** | **8% faster, 6x lower σ** |
 | **Fused 7-dispatch (60L)** | **703.4 us/L** | **Phase 10 best** |
 | **Phase A prefill (single-layer)** | **3.5-7.3x vs baseline** | **MLX parity within 1.2-3.4x** |
+| **GEMM TFLOPS (Phase D2)** | **23.82T** | **MLX 23.97T (-0.6%)** |
 | MLX compiled (60L, f16) | 4,525 us/L | — |
 
 ## ✨ RMLX vs MLX vs CUDA
@@ -55,7 +56,9 @@ Single transformer layer decode (Llama-2 7B shapes, f16, M3 Ultra):
 - Batched SDPA decode with slab KV cache
 - FP8 (E4M3/E5M2), AWQ/GPTQ INT4, K-quant (Q2K–Q6K)
 - Single-pass layer norm, register-cached RMS norm
-- Fused kernels: silu-mul, RMSNorm+residual, GEMV+bias
+- Fused kernels: silu-mul, RMSNorm+residual, GEMV+bias, GEMM+residual epilogue
+- GEMM: 23.82T TFLOPS (MLX -0.6%), MLX-architecture kernel (BK=16, 2 SG, serpentine MMA)
+- Quantized: QMM MMA Q4/Q8, QMV qdot pattern, no CPU fallback
 </details>
 
 <details open>
@@ -67,7 +70,12 @@ Single transformer layer decode (Llama-2 7B shapes, f16, M3 Ultra):
 - **Metal**: ChipTuning (M1–M4), DiskPipelineCache, fence manager, dual queues
 - **Allocator**: zero-copy (posix_memalign + MTLBuffer), BFC, residency manager
 - **RDMA**: ibverbs FFI, TB5 multi-port, ring/allreduce/allgather collectives
-- **Distributed**: expert parallelism (3-zone auto), tree allreduce, topology-aware CLI
+- **Distributed**: expert parallelism (3-zone auto), tree allreduce, topology-aware CLI, **DistributedTransformerModel** (TP with forward_with_group + shard_for_tp)
+- **Phase F**: Dispatch overhead bench (176us/CB), DiskPipelineCache, GatherMM MMA (4-12x for MoE)
+- **Phase G**: QMM MMA Q4/Q8, QMV qdot, CPU fallback removed
+- **Phase H-2**: GEMM+residual epilogue fusion (5-12% for large N)
+- **Phase I-1**: Distributed TP (TP=2 1.94x estimated)
+- **Phase J**: QMM +73% (5.34T), QMV +37% (MLX 1.15x), ExecGraph stall removal, lazy.rs fusion, RMSNorm+GEMM fusion, Split-K QMM, MoE fused kernels
 </details>
 
 <details>
@@ -128,9 +136,15 @@ Distributed 2-node RDMA runbook (minimal):
 
 ```bash
 # cargo install --path crates/rmlx-cli   (one-time)
-rmlx config --hosts node1,node2 --backend rdma --over thunderbolt --output rmlx-hosts.json --verbose
+
+# Auto-detect TB5 topology, assign IPs, configure interfaces, generate hostfile
+rmlx config --hosts node1,node2 --auto-setup --output rmlx-hosts.json --verbose
+
+# Launch distributed job
 rmlx launch --backend rdma --hostfile rmlx-hosts.json -- ibv_devices
 ```
+
+`--auto-setup` automatically discovers Thunderbolt connections via `system_profiler`, assigns point-to-point IPs, and configures RDMA interfaces — no manual `ifconfig` or hostfile editing required.
 
 ## 📊 Stats
 
@@ -148,19 +162,20 @@ rmlx launch --backend rdma --hostfile rmlx-hosts.json -- ibv_devices
 
 ## 🗺️ Roadmap
 
-seq_len=1 decode optimization is concluded at 703.4 us/layer (73.6% bandwidth efficiency — practical floor for f16 on Apple Silicon). Next phases focus on broader workloads.
+seq_len=1 decode optimization is concluded at 703.4 us/layer (73.6% bandwidth efficiency -- practical floor for f16 on Apple Silicon). GEMM throughput has reached 23.82T TFLOPS (-0.6% vs MLX). Phase J closes quantized kernel gaps and adds infrastructure improvements.
 
-| Phase | Focus | Scope | Status |
-|:-----:|-------|:-----:|:------:|
-| 12 | **GEMM optimization (seq_len=N)** | Framework | In Progress |
-| 13 | **Paged attention + speculative decode kernels** | Framework | Planned |
-| 14 | **SDPA / attention optimization** | Framework | Planned |
-| 15 | **Multi-node RDMA optimization (TP/EP)** | Framework | Planned |
-| 16 | **Memory efficiency** | Framework | Planned |
+| Phase | Focus | Key Result | Status |
+|:-----:|-------|:----------:|:------:|
+| J-1 | **QMM MMA redesign** | 3.09T -> 5.34T (+73%), MLX gap 4.78x -> 2.55x | Complete |
+| J-2 | **QMV qdot optimization** | 0.26T -> 0.36T (+37%), MLX 1.15x (near parity) | Complete |
+| J-3 | **ExecGraph stall removal** | 32 inter-layer stalls -> 0 | Complete |
+| J-4 | **lazy.rs FusionCompiler** | FusionGraph -> Metal JIT -> ExecGraph | Complete |
+| J-5 | **RMSNorm+GEMM fusion** | Function constant 203, 2-pass inv_rms | Complete |
+| J-6 | **Split-K QMM** | +20% at M=128 | Complete |
+| J-8 | **MoE fused kernels** | Scatter N x 3 sync -> 1 sync | In review |
 
 > Framework = rmlx-core / rmlx-nn / rmlx-distributed kernel-level work.
-> Serving-layer concerns (scheduling, eviction, orchestration) belong in rmlx-serve.
-> See [full roadmap](docs/roadmap/phases.md) for details.
+> See [full roadmap](docs/roadmap/phases.md) and [benchmark report](docs/reports/phase-f-i-benchmark-2026-03-08.md) for details.
 
 ## 📚 Docs
 

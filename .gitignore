@@ -20,6 +20,10 @@ _tmp_*
 .env.*
 *.local
 
+# Generated hostfiles (may contain IPs/hostnames)
+*-hosts.json
+hostfile*.json
+
 # Python
 venv/
 __pycache__/
@@ -37,3 +41,4 @@ PLAN.md
 fix-plan.md
 production-readiness-audit.md
 docs/roadmap/audit-*.md
+.claude/

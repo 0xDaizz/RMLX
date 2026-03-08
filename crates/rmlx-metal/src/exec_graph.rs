@@ -6,12 +6,21 @@
 //!
 //! # Architecture
 //!
+//! On a single `MTLCommandQueue`, command buffers execute in FIFO order.
+//! Each `submit_batch()` commits the current CB and starts a new one.
+//! GPU FIFO ordering guarantees that CB N completes before CB N+1 begins
+//! execution, so explicit `wait_for()` is typically not needed between
+//! sequential batches on the same queue. The `wait_for()` API remains
+//! available for cases requiring cross-queue synchronization.
+//!
 //! ```text
-//! [Batch 1: norm+projections] --signal(1)--> [Batch 2: RoPE] --signal(2)--> [Batch 3: SDPA]
-//!                                                                               |
-//! [Batch 6: down+residual] <--signal(5)-- [Batch 5: norm+ffn] <--signal(4)-- [Batch 4: O_proj]
-//!                 |
-//!          signal(6) -> CPU wait (ONCE per forward pass)
+//! [Batch 1: norm+proj] --commit--> [Batch 2: RoPE] --commit--> [Batch 3: SDPA+O_proj]
+//!                                                                       |
+//! [Batch 5: FFN] <--commit-- [Batch 4: residual+norm]                   |
+//!        |                                                              |
+//!  GPU FIFO ordering ensures sequential execution across all batches
+//!        |
+//!  sync() -> CPU wait (ONCE per forward pass)
 //! ```
 //!
 //! # Usage
@@ -25,15 +34,14 @@
 //! // ... encode norm + projections ...
 //! enc.end_encoding();
 //! graph.end_encoder();
-//! let t1 = graph.submit_batch();
+//! let _t1 = graph.submit_batch();
 //!
-//! // Batch 2: waits for batch 1, then encodes
-//! graph.wait_for(t1);
+//! // Batch 2: GPU FIFO ensures batch 1 completes first
 //! let enc = graph.encoder();
 //! // ... encode RoPE ...
 //! enc.end_encoding();
 //! graph.end_encoder();
-//! let t2 = graph.submit_batch();
+//! let _t2 = graph.submit_batch();
 //!
 //! // ... more batches ...
 //!

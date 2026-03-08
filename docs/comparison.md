@@ -34,7 +34,11 @@
 | **GGUF model loading** | Yes | Yes | Yes |
 | **Test suite** | 1,298+ tests | Extensive | Extensive |
 | **Prefill optimization** | Phase A: single-CB pipeline, GQA slab SDPA, 3.5-7.3x speedup | Lazy eval graph fusion | CUDA Graphs + cuBLAS |
-| **Phases complete** | 0-9B-opt + S1-S5 + Phase KO + Phase 8c + Phase 9 + Phase 10 + Phase 11 + Phase A | N/A (stable release) | N/A (stable release) |
+| **GEMM TFLOPS** | 23.82T (Phase D2, -0.6% vs MLX) | 23.97T | cuBLAS |
+| **Quantized inference** | QMM MMA Q4/Q8, QMV qdot, no CPU fallback | Yes | Yes |
+| **QMV vs MLX** | Q4 1.15x, Q8 1.08x (Phase J near-parity) | -- | -- |
+| **QMM vs MLX** | Q4 2.55x gap (Phase J, was 4.78x) | -- | -- |
+| **Phases complete** | 0-9B-opt + S1-S5 + Phase KO + 8c + 9-11 + A-D + F-J | N/A (stable release) | N/A (stable release) |
 
 ---
 
@@ -266,7 +270,7 @@ CUDA has decades of optimization across compilers (NVCC, Triton), libraries (cuB
 
 **Key insight**: ExecGraph's 64x speedup comes from collapsing the decode path into 9 dispatches in a single command buffer. CUDA's baseline is already more efficient due to stream-ordered execution, so CUDA Graphs provides a smaller relative improvement from a stronger starting point.
 
-**Phase A/B/C update**: The prefill path now also uses a single-CB pipeline (54 sync points reduced to 1), GQA slab SDPA (32 per-head dispatches reduced to 1), and GEMM threadgroup swizzle. Single-layer prefill achieves 3.5-7.3x speedup over baseline, with MLX parity within 1.2-3.4x. GEMM throughput has been optimized from 13T to 21.21T TFLOPS through config sweep (Phase B) and kernel-level optimization (Phase C), narrowing the gap vs MLX (23.97T) to ~11.5%.
+**Phase A/B/C/D update**: The prefill path now also uses a single-CB pipeline (54 sync points reduced to 1), GQA slab SDPA (32 per-head dispatches reduced to 1), and GEMM threadgroup swizzle. Single-layer prefill achieves 3.5-7.3x speedup over baseline, with MLX parity within 1.2-3.4x. GEMM throughput has been optimized from 13T to 23.82T TFLOPS through config sweep (Phase B), kernel-level optimization (Phase C), and MLX-architecture kernel (Phase D2), narrowing the gap vs MLX (23.97T) to **-0.6%**. Phase F adds GatherMM MMA (4-12x for MoE). Phase G upgrades QMM/QMV to MMA/qdot. Phase H-2 adds GEMM+residual fusion (5-12%). Phase I-1 adds distributed TP (1.94x at TP=2).
 
 ---
 
@@ -351,11 +355,17 @@ The following gaps identified in earlier versions have been closed:
 | **Phase S3a** | Attention Optimization | Flash Attention 2 (K/V outer loop, D≤256, decode fast path) | Sections 4.1 (closed) |
 | **Phase S2** | Advanced Quantization | GGUF loader, AWQ/GPTQ dequant, FP8 dtypes | Section 4.4 (closed) |
 | **Phase A** | Prefill Optimization | Single-CB pipeline, GQA slab SDPA, GEMM swizzle, 3.5-7.3x speedup | Prefill performance gap narrowed |
-| **Phase B+C** | GEMM Optimization | Config sweep (27 variants), kernel-level opt (wide_load, SG=2×4 layout), gemm_bench fix | GEMM throughput gap narrowed to 11.5% |
+| **Phase B+C** | GEMM Optimization | Config sweep (27 variants), kernel-level opt (wide_load, SG=2x4 layout), gemm_bench fix | GEMM throughput gap narrowed to 11.5% |
+| **Phase D2** | MLX-Architecture GEMM Kernel | BK=16, 2 SG, 64 threads, 4xhalf4 wide loads, serpentine MMA — 23.82T TFLOPS | GEMM gap closed to **-0.6%** vs MLX |
+| **Phase F** | Infrastructure Optimization | Dispatch overhead bench (176us/CB), DiskPipelineCache, GatherMM MMA (4-12x for MoE) | MoE compute and dispatch efficiency |
+| **Phase G** | Quantized Kernel Optimization | QMM MMA Q4/Q8, QMV qdot pattern, CPU fallback removed | Quantized inference fully GPU-resident |
+| **Phase H-2** | GEMM+Residual Fusion | Function constant 202, residual epilogue, 5-12% for large N | Reduced dispatch count and memory round-trips |
+| **Phase I-1** | Distributed TP | DistributedTransformerModel, forward_with_group, shard_for_tp | TP=2 estimated 1.94x speedup |
+| **Phase J** | Quantized Parity + Infrastructure | QMM +73% (5.34T), QMV +37% (MLX 1.15x), ExecGraph stall removal, lazy.rs fusion, RMSNorm+GEMM fusion, Split-K, MoE fuse | QMV near-parity, QMM gap 4.78x -> 2.55x |
 
 The Phase 0+1+2 full-crate audit added 76 items including GatherMM, LayerNorm, unary ops, QuantizedLinear, MLA, sliding window attention, GGUF loading, 14 activation functions, ring/allreduce collectives, connection manager, and coordinator.
 
-Remaining gaps: Python API, speculative decoding, and NVIDIA-specific quantization formats (INT4/INT8).
+Remaining gaps: Python API, speculative decoding, NVIDIA-specific quantization formats (INT4/INT8), QMM gap vs MLX (2.55x, reduced from 4.78x in Phase J), and MoE framework overhead (19.9x geomean gap, kernel parity achieved).
 
 ---
 

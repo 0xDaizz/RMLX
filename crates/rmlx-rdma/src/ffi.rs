@@ -11,12 +11,77 @@ use crate::RdmaError;
 
 // ─── ibverbs opaque types (pointers only, no struct layout needed) ───
 
-/// Opaque ibverbs context
-pub enum IbvContext {}
 /// Opaque protection domain
 pub enum IbvPd {}
-/// Opaque completion queue
-pub enum IbvCq {}
+
+// ─── ibv_context_ops vtable (from macOS SDK verbs.h) ───
+// These 3 ops (poll_cq, post_send, post_recv) are static inline in C headers,
+// so Apple's librdma.dylib does NOT export them as dynamic symbols.
+// We must call through the context ops vtable directly.
+
+/// Function pointer types for vtable ops
+type FnPollCq = unsafe extern "C" fn(*mut IbvCq, c_int, *mut IbvWc) -> c_int;
+type FnPostSend = unsafe extern "C" fn(*mut IbvQp, *mut IbvSendWr, *mut *mut IbvSendWr) -> c_int;
+type FnPostRecv = unsafe extern "C" fn(*mut IbvQp, *mut IbvRecvWr, *mut *mut IbvRecvWr) -> c_int;
+
+/// ibv_context_ops — 32 function pointers matching verbs.h layout.
+/// Only poll_cq, post_send, post_recv are typed; the rest are opaque void*.
+#[repr(C)]
+pub struct IbvContextOps {
+    _compat_query_device: *const c_void,
+    _compat_query_port: *const c_void,
+    _compat_alloc_pd: *const c_void,
+    _compat_dealloc_pd: *const c_void,
+    _compat_reg_mr: *const c_void,
+    _compat_rereg_mr: *const c_void,
+    _compat_dereg_mr: *const c_void,
+    _alloc_mw: *const c_void,
+    _bind_mw: *const c_void,
+    _dealloc_mw: *const c_void,
+    _compat_create_cq: *const c_void,
+    pub poll_cq: FnPollCq, // index 11
+    _req_notify_cq: *const c_void,
+    _compat_cq_event: *const c_void,
+    _compat_resize_cq: *const c_void,
+    _compat_destroy_cq: *const c_void,
+    _compat_create_srq: *const c_void,
+    _compat_modify_srq: *const c_void,
+    _compat_query_srq: *const c_void,
+    _compat_destroy_srq: *const c_void,
+    _post_srq_recv: *const c_void,
+    _compat_create_qp: *const c_void,
+    _compat_query_qp: *const c_void,
+    _compat_modify_qp: *const c_void,
+    _compat_destroy_qp: *const c_void,
+    pub post_send: FnPostSend, // index 25
+    pub post_recv: FnPostRecv, // index 26
+    _compat_create_ah: *const c_void,
+    _compat_destroy_ah: *const c_void,
+    _compat_attach_mcast: *const c_void,
+    _compat_detach_mcast: *const c_void,
+    _compat_async_event: *const c_void,
+}
+
+/// ibv_context — non-opaque, we need access to the ops vtable.
+#[repr(C)]
+pub struct IbvContext {
+    pub device: *mut IbvDevice,
+    pub ops: IbvContextOps,
+    // Remaining fields (cmd_fd, async_fd, num_comp_vectors, mutex, abi_compat) are opaque
+    _opaque: [u8; 128], // generous padding
+}
+
+/// ibv_cq — non-opaque, we need context pointer for poll_cq vtable call.
+#[repr(C)]
+pub struct IbvCq {
+    pub context: *mut IbvContext,
+    _channel: *mut c_void,
+    _cq_context: *mut c_void,
+    pub handle: u32,
+    pub cqe: c_int,
+    // Remaining fields (mutex, cond, event counters) are opaque
+    _opaque: [u8; 128], // generous padding for pthread types
+}
 /// Queue pair — we need to read qp_num from this.
 /// Only the first fields up to qp_num are defined; the rest is opaque.
 #[repr(C)]
@@ -453,7 +518,9 @@ pub struct IbverbsLib {
     pub create_cq:
         unsafe extern "C" fn(*mut IbvContext, c_int, *mut c_void, *mut c_void, c_int) -> *mut IbvCq,
     pub destroy_cq: unsafe extern "C" fn(*mut IbvCq) -> c_int,
-    pub poll_cq: unsafe extern "C" fn(*mut IbvCq, c_int, *mut IbvWc) -> c_int,
+    // NOTE: poll_cq, post_send, post_recv are NOT loaded from the library.
+    // Apple's librdma.dylib does not export them (they are static inline in verbs.h).
+    // Use ibv_poll_cq(), ibv_post_send(), ibv_post_recv() free functions instead.
     // QP management
     pub create_qp: unsafe extern "C" fn(*mut IbvPd, *mut IbvQpInitAttr) -> *mut IbvQp,
     pub destroy_qp: unsafe extern "C" fn(*mut IbvQp) -> c_int,
@@ -462,9 +529,6 @@ pub struct IbverbsLib {
     pub query_device: unsafe extern "C" fn(*mut IbvContext, *mut IbvDeviceAttr) -> c_int,
     pub query_port: unsafe extern "C" fn(*mut IbvContext, u8, *mut IbvPortAttr) -> c_int,
     pub query_gid: unsafe extern "C" fn(*mut IbvContext, u8, c_int, *mut IbvGid) -> c_int,
-    // Post operations
-    pub post_send: unsafe extern "C" fn(*mut IbvQp, *mut IbvSendWr, *mut *mut IbvSendWr) -> c_int,
-    pub post_recv: unsafe extern "C" fn(*mut IbvQp, *mut IbvRecvWr, *mut *mut IbvRecvWr) -> c_int,
 }
 
 static LIB: OnceLock<Result<IbverbsLib, String>> = OnceLock::new();
@@ -483,7 +547,18 @@ impl IbverbsLib {
         // SAFETY: We load the library and immediately resolve all needed symbols.
         // The Library is kept alive in the struct for the 'static lifetime via OnceLock.
         unsafe {
-            let lib = Library::new("librdma.dylib")?;
+            // Try short name first (works when librdma.dylib is on DYLD_LIBRARY_PATH or
+            // in the dyld shared cache). Fall back to absolute path for macOS Big Sur+
+            // where /usr/lib dylibs only exist in the shared cache.
+            let lib = Library::new("librdma.dylib")
+                .or_else(|e1| {
+                    eprintln!("[rmlx-rdma] dlopen(librdma.dylib) failed: {e1}, trying /usr/lib/librdma.dylib");
+                    Library::new("/usr/lib/librdma.dylib")
+                })
+                .or_else(|e2| {
+                    eprintln!("[rmlx-rdma] dlopen(/usr/lib/librdma.dylib) failed: {e2}, trying /usr/lib/rdma/libibverbs.dylib");
+                    Library::new("/usr/lib/rdma/libibverbs.dylib")
+                })?;
 
             // Helper macro to load a symbol with an explicit type
             macro_rules! load_sym {
@@ -511,7 +586,6 @@ impl IbverbsLib {
                 c_int,
             ) -> *mut IbvCq;
             type FnDestroyCq = unsafe extern "C" fn(*mut IbvCq) -> c_int;
-            type FnPollCq = unsafe extern "C" fn(*mut IbvCq, c_int, *mut IbvWc) -> c_int;
             type FnCreateQp = unsafe extern "C" fn(*mut IbvPd, *mut IbvQpInitAttr) -> *mut IbvQp;
             type FnDestroyQp = unsafe extern "C" fn(*mut IbvQp) -> c_int;
             type FnModifyQp = unsafe extern "C" fn(*mut IbvQp, *mut IbvQpAttr, c_int) -> c_int;
@@ -519,10 +593,6 @@ impl IbverbsLib {
             type FnQueryPort = unsafe extern "C" fn(*mut IbvContext, u8, *mut IbvPortAttr) -> c_int;
             type FnQueryGid =
                 unsafe extern "C" fn(*mut IbvContext, u8, c_int, *mut IbvGid) -> c_int;
-            type FnPostSend =
-                unsafe extern "C" fn(*mut IbvQp, *mut IbvSendWr, *mut *mut IbvSendWr) -> c_int;
-            type FnPostRecv =
-                unsafe extern "C" fn(*mut IbvQp, *mut IbvRecvWr, *mut *mut IbvRecvWr) -> c_int;
 
             Ok(Self {
                 get_device_list: load_sym!(lib, "ibv_get_device_list", FnGetDeviceList),
@@ -536,18 +606,64 @@ impl IbverbsLib {
                 dereg_mr: load_sym!(lib, "ibv_dereg_mr", FnDeregMr),
                 create_cq: load_sym!(lib, "ibv_create_cq", FnCreateCq),
                 destroy_cq: load_sym!(lib, "ibv_destroy_cq", FnDestroyCq),
-                poll_cq: load_sym!(lib, "ibv_poll_cq", FnPollCq),
                 create_qp: load_sym!(lib, "ibv_create_qp", FnCreateQp),
                 destroy_qp: load_sym!(lib, "ibv_destroy_qp", FnDestroyQp),
                 modify_qp: load_sym!(lib, "ibv_modify_qp", FnModifyQp),
                 query_device: load_sym!(lib, "ibv_query_device", FnQueryDevice),
                 query_port: load_sym!(lib, "ibv_query_port", FnQueryPort),
                 query_gid: load_sym!(lib, "ibv_query_gid", FnQueryGid),
-                post_send: load_sym!(lib, "ibv_post_send", FnPostSend),
-                post_recv: load_sym!(lib, "ibv_post_recv", FnPostRecv),
                 _lib: lib,
             })
         }
+    }
+}
+
+// ─── Inline vtable wrappers ───
+// These replicate the static inline functions from verbs.h that Apple's
+// librdma.dylib does NOT export as dynamic symbols.
+
+/// Poll a CQ for work completions (replicates inline ibv_poll_cq from verbs.h).
+///
+/// # Safety
+/// `cq` must be a valid ibv_cq pointer. `wc` must point to valid memory for
+/// at least `num_entries` IbvWc structs.
+pub unsafe fn ibv_poll_cq(cq: *mut IbvCq, num_entries: c_int, wc: *mut IbvWc) -> c_int {
+    // C inline: return cq->context->ops.poll_cq(cq, num_entries, wc);
+    unsafe {
+        let ctx = (*cq).context;
+        ((*ctx).ops.poll_cq)(cq, num_entries, wc)
+    }
+}
+
+/// Post a list of send work requests (replicates inline ibv_post_send from verbs.h).
+///
+/// # Safety
+/// `qp` must be a valid ibv_qp pointer. `wr` must point to a valid send work request.
+pub unsafe fn ibv_post_send(
+    qp: *mut IbvQp,
+    wr: *mut IbvSendWr,
+    bad_wr: *mut *mut IbvSendWr,
+) -> c_int {
+    // C inline: return qp->context->ops.post_send(qp, wr, bad_wr);
+    unsafe {
+        let ctx = (*qp).context;
+        ((*ctx).ops.post_send)(qp, wr, bad_wr)
+    }
+}
+
+/// Post a list of recv work requests (replicates inline ibv_post_recv from verbs.h).
+///
+/// # Safety
+/// `qp` must be a valid ibv_qp pointer. `wr` must point to a valid recv work request.
+pub unsafe fn ibv_post_recv(
+    qp: *mut IbvQp,
+    wr: *mut IbvRecvWr,
+    bad_wr: *mut *mut IbvRecvWr,
+) -> c_int {
+    // C inline: return qp->context->ops.post_recv(qp, wr, bad_wr);
+    unsafe {
+        let ctx = (*qp).context;
+        ((*ctx).ops.post_recv)(qp, wr, bad_wr)
     }
 }
 

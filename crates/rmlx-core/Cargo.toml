@@ -45,3 +45,15 @@ harness = false
 [[bench]]
 name = "dispatch_overhead"
 harness = false
+
+[[bench]]
+name = "residual_bench"
+harness = false
+
+[[bench]]
+name = "quantized_bench"
+harness = false
+
+[[bench]]
+name = "fusion_bench"
+harness = false

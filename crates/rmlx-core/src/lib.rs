@@ -21,7 +21,7 @@ pub mod vjp;
 pub use array::{broadcast_shape, Array};
 pub use dtype::{DType, DTypeError, HasDType};
 pub use kernels::{KernelError, KernelRegistry};
-pub use lazy::{LazyArray, LazyEvalError, LazyGraph, LazyOp, NodeId};
+pub use lazy::{EvalContext, LazyArray, LazyEvalError, LazyGraph, LazyOp, NodeId};
 pub use logging::{LogEntry, LogLevel};
 pub use lora::{LoraConfig, LoraLayer, LoraModel, LoraTrainer, TrainConfig};
 pub use metrics::{MetricsSnapshot, RuntimeMetrics};
