@@ -14,7 +14,7 @@ use metal::Buffer as MTLBuffer;
 
 use crate::array::Array;
 use crate::dtype::DType;
-use crate::kernels::{KernelError, KernelRegistry};
+use crate::kernels::{FunctionConstantValue, KernelError, KernelRegistry};
 
 // ---------------------------------------------------------------------------
 // Deprecated GGML-format block structs (kept for backward compatibility)
@@ -1021,6 +1021,8 @@ pub fn affine_qmm(
 // Metal shader source -- affine quantized matrix-matrix multiply
 // ---------------------------------------------------------------------------
 
+/// Legacy scalar QMM shader (BM=16, BN=16, one thread per output element).
+/// Kept as fallback for non-Q4 or non-aligned cases.
 pub const QMM_SHADER_SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -1117,9 +1119,268 @@ kernel void affine_qmm(
 }
 "#;
 
-/// Register the QMM Metal kernel with the given registry.
+// ---------------------------------------------------------------------------
+// Metal shader source -- simdgroup MMA-based Q4 QMM kernel
+// ---------------------------------------------------------------------------
+
+/// High-performance Q4 QMM kernel using simdgroup MMA (8x8 fragments).
+///
+/// Architecture:
+/// - Tile: BM=32, BN=32, BK=32
+/// - 2 simdgroups per threadgroup (64 threads total)
+/// - Dequant-in-loader: Q4 uint8 → half in threadgroup memory
+/// - f32 accumulation via simdgroup_matrix<float, 8, 8>
+/// - Double-buffered threadgroup memory for A tile (ping-pong)
+/// - Function constants for alignment-based bounds check elimination
+pub const QMM_MMA_SHADER_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+using namespace metal::simdgroup;
+
+// Function constants for compile-time bounds check elimination
+constant bool align_M [[function_constant(200)]];
+constant bool align_N [[function_constant(201)]];
+
+// Tile dimensions
+constant constexpr uint BM = 32;
+constant constexpr uint BN = 32;
+constant constexpr uint BK = 32;
+
+// Each threadgroup has 2 simdgroups × 32 threads = 64 threads
+constant constexpr uint THREADGROUP_SIZE = 64;
+constant constexpr uint SIMDGROUPS_PER_TG = 2;
+
+// -----------------------------------------------------------------------
+// affine_qmm_mma_q4: Simdgroup MMA-based Q4 quantized matrix-matrix multiply.
+//
+// Computes: output[m, n] = sum_k x[m, k] * dequant(w[n, k])
+//
+// where dequant(q_i) = scales[n, group] * q_i + biases[n, group]
+// and q_i is a 4-bit value packed 2 per byte in w_packed.
+//
+// Weight layout: w_packed is [N, K/2] row-major (uint8), where weight
+// row n has K/2 bytes. Each byte holds 2 Q4 values (low nibble first).
+//
+// For MMA, we need A=[BM, BK] from x and B=[BK, BN] from W^T.
+// Since W is [N, K] (row = output feature), B[k, n] = W[n, k].
+// We dequantize W[n, k_range] into threadgroup memory transposed as B[k, n].
+//
+// Buffers:
+//   buffer(0) x         - float32 input activations [M, K], row-major
+//   buffer(1) w_packed  - uint8 packed Q4 weights [N, K/2], row-major
+//   buffer(2) scales    - float32 per-group scales [N, groups_per_row]
+//   buffer(3) biases    - float32 per-group biases [N, groups_per_row]
+//   buffer(4) output    - float32 output [M, N], row-major
+//   buffer(5) params    - uint4: (M, N, K, group_size)
+//
+// Grid: 2D — (ceil(N/BN), ceil(M/BM), 1) threadgroups
+//   Each threadgroup computes a BM x BN tile of the output.
+// -----------------------------------------------------------------------
+kernel void affine_qmm_mma_q4(
+    device const float*   x         [[buffer(0)]],
+    device const uint8_t* w_packed  [[buffer(1)]],
+    device const float*   scales    [[buffer(2)]],
+    device const float*   biases    [[buffer(3)]],
+    device float*         output    [[buffer(4)]],
+    constant uint4&       params    [[buffer(5)]],
+    uint3 group_id        [[threadgroup_position_in_grid]],
+    uint  tid_in_group    [[thread_index_in_threadgroup]],
+    uint  simd_gid        [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid        [[thread_index_in_simdgroup]])
+{
+    const uint M          = params.x;
+    const uint N          = params.y;
+    const uint K          = params.z;
+    const uint group_size = params.w;
+
+    const uint groups_per_row = K / group_size;
+    const uint half_k = K / 2;  // bytes per weight row
+
+    // Tile origin in output space
+    const uint tile_m = group_id.y * BM;
+    const uint tile_n = group_id.x * BN;
+
+    // Early exit for entirely out-of-bounds threadgroups
+    if (!align_M && tile_m >= M) return;
+    if (!align_N && tile_n >= N) return;
+
+    // ------------------------------------------------------------------
+    // Threadgroup shared memory (double-buffered for A, single for B)
+    // A: [BM, BK] half — loaded from x (f32 → half conversion)
+    // B: [BK, BN] half — dequantized from w_packed (transposed)
+    // Double buffering: 2 × BM × BK + 2 × BK × BN halfs
+    // = 2 × 32 × 32 + 2 × 32 × 32 = 4096 halfs = 8192 bytes
+    // ------------------------------------------------------------------
+    threadgroup half As[2][BM * BK];  // ping-pong A tiles
+    threadgroup half Bs[2][BK * BN];  // ping-pong B tiles
+
+    // ------------------------------------------------------------------
+    // Accumulator fragments: each simdgroup computes a 16×16 sub-tile
+    // using 2×2 grid of 8×8 MMA fragments.
+    //
+    // simdgroup 0 → rows [0..16), simdgroup 1 → rows [16..32)
+    // Each simdgroup covers all BN=32 columns via 4 column fragments (0..8, 8..16, 16..24, 24..32)
+    // ------------------------------------------------------------------
+    simdgroup_matrix<float, 8, 8> acc[2][4];  // [2 row frags][4 col frags]
+    for (uint i = 0; i < 2; i++)
+        for (uint j = 0; j < 4; j++)
+            acc[i][j] = simdgroup_matrix<float, 8, 8>(0);
+
+    const uint num_k_tiles = (K + BK - 1) / BK;
+
+    // ------------------------------------------------------------------
+    // Helper: load A tile [BM, BK] from x (f32 → half)
+    // 64 threads load 32×32 = 1024 elements → 16 elements per thread
+    // ------------------------------------------------------------------
+    auto load_A = [&](uint buf, uint k_base) {
+        for (uint idx = tid_in_group; idx < BM * BK; idx += THREADGROUP_SIZE) {
+            uint row = idx / BK;
+            uint col = idx % BK;
+            uint global_m = tile_m + row;
+            uint global_k = k_base + col;
+            half val = 0.0h;
+            if (align_M || global_m < M) {
+                if (global_k < K) {
+                    val = half(x[global_m * K + global_k]);
+                }
+            }
+            As[buf][row * BK + col] = val;
+        }
+    };
+
+    // ------------------------------------------------------------------
+    // Helper: load B tile [BK, BN] from w_packed (Q4 dequant, transposed)
+    //
+    // W is [N, K] row-major. We need B[k, n] = dequant(W[n, k]).
+    // For the k-tile [k_base, k_base+BK), and n-tile [tile_n, tile_n+BN):
+    //
+    // Each thread handles multiple (k, n) pairs.
+    // Dequant: val = scale * q + bias, where q = 4-bit nibble from w_packed.
+    // ------------------------------------------------------------------
+    auto load_B = [&](uint buf, uint k_base) {
+        for (uint idx = tid_in_group; idx < BK * BN; idx += THREADGROUP_SIZE) {
+            uint k_local = idx / BN;  // row in B = k dimension
+            uint n_local = idx % BN;  // col in B = n dimension
+            uint global_k = k_base + k_local;
+            uint global_n = tile_n + n_local;
+            half val = 0.0h;
+            if (align_N || global_n < N) {
+                if (global_k < K) {
+                    // Dequant: read Q4 nibble from w_packed[global_n, global_k]
+                    uint byte_idx = global_k / 2;
+                    uint nibble_idx = global_k % 2;
+                    uint8_t packed = w_packed[global_n * half_k + byte_idx];
+                    uint q = nibble_idx == 0 ? (packed & 0x0F) : ((packed >> 4) & 0x0F);
+
+                    // Scale and bias for this element's group
+                    uint group_idx = global_k / group_size;
+                    float scale = scales[global_n * groups_per_row + group_idx];
+                    float bias  = biases[global_n * groups_per_row + group_idx];
+
+                    val = half(scale * float(q) + bias);
+                }
+            }
+            Bs[buf][k_local * BN + n_local] = val;
+        }
+    };
+
+    // ------------------------------------------------------------------
+    // Main loop: iterate over K dimension in BK-sized tiles
+    // with double buffering (load next tile while computing current)
+    // ------------------------------------------------------------------
+
+    // Load first tile into buffer 0
+    load_A(0, 0);
+    load_B(0, 0);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint t = 0; t < num_k_tiles; t++) {
+        uint cur_buf = t % 2;
+        uint nxt_buf = 1 - cur_buf;
+
+        // Prefetch next tile if available
+        if (t + 1 < num_k_tiles) {
+            uint next_k_base = (t + 1) * BK;
+            load_A(nxt_buf, next_k_base);
+            load_B(nxt_buf, next_k_base);
+        }
+
+        // Compute MMA for current tile
+        // Each simdgroup handles 16 rows of the BM=32 tile
+        uint sg_row_base = simd_gid * 16;  // 0 or 16
+
+        // Iterate over BK in 8-element steps for 8×8 MMA fragments
+        for (uint kk = 0; kk < BK; kk += 8) {
+            // Load A fragments: 2 row fragments × 1 k fragment
+            simdgroup_matrix<half, 8, 8> a_frag[2];
+            simdgroup_load(a_frag[0], &As[cur_buf][(sg_row_base + 0) * BK + kk], BK);
+            simdgroup_load(a_frag[1], &As[cur_buf][(sg_row_base + 8) * BK + kk], BK);
+
+            // Load B fragments: 1 k fragment × 4 column fragments
+            simdgroup_matrix<half, 8, 8> b_frag[4];
+            simdgroup_load(b_frag[0], &Bs[cur_buf][kk * BN + 0],  BN);
+            simdgroup_load(b_frag[1], &Bs[cur_buf][kk * BN + 8],  BN);
+            simdgroup_load(b_frag[2], &Bs[cur_buf][kk * BN + 16], BN);
+            simdgroup_load(b_frag[3], &Bs[cur_buf][kk * BN + 24], BN);
+
+            // Multiply-accumulate: 2×4 grid of 8×8 fragments
+            for (uint bi = 0; bi < 2; bi++) {
+                for (uint bj = 0; bj < 4; bj++) {
+                    simdgroup_multiply_accumulate(acc[bi][bj], a_frag[bi], b_frag[bj], acc[bi][bj]);
+                }
+            }
+        }
+
+        // Wait for prefetched tile
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // ------------------------------------------------------------------
+    // Store accumulated results to output
+    // Each simdgroup stores its 16×32 sub-tile (2×4 grid of 8×8 fragments)
+    // ------------------------------------------------------------------
+    uint sg_row_base = simd_gid * 16;
+
+    // Use threadgroup memory as staging for f32 → device write
+    // Reuse As[0] area as f32 staging (32×32 floats = 4096 bytes, fits in 2*32*32 halfs = 4096 bytes)
+    threadgroup float* staging = reinterpret_cast<threadgroup float*>(&As[0][0]);
+
+    for (uint bi = 0; bi < 2; bi++) {
+        for (uint bj = 0; bj < 4; bj++) {
+            // Store f32 accumulator fragment to staging area
+            uint store_row = sg_row_base + bi * 8;
+            uint store_col = bj * 8;
+            simdgroup_store(acc[bi][bj], &staging[store_row * BN + store_col], BN);
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Cooperative store from staging to device memory
+    for (uint idx = tid_in_group; idx < BM * BN; idx += THREADGROUP_SIZE) {
+        uint local_row = idx / BN;
+        uint local_col = idx % BN;
+        uint global_m = tile_m + local_row;
+        uint global_n = tile_n + local_col;
+
+        if (align_M || global_m < M) {
+            if (align_N || global_n < N) {
+                output[global_m * N + global_n] = staging[local_row * BN + local_col];
+            }
+        }
+    }
+}
+"#;
+
+/// Register the QMM Metal kernels with the given registry.
+///
+/// Registers both the legacy scalar kernel (`qmm`) and the new simdgroup
+/// MMA kernel (`qmm_mma`). The batched dispatch function
+/// [`affine_quantized_matmul_batched`] uses the MMA kernel by default.
 pub fn register_qmm(registry: &KernelRegistry) -> Result<(), KernelError> {
-    registry.register_jit_source("qmm", QMM_SHADER_SOURCE)
+    registry.register_jit_source("qmm", QMM_SHADER_SOURCE)?;
+    registry.register_jit_source("qmm_mma", QMM_MMA_SHADER_SOURCE)?;
+    Ok(())
 }
 
 /// Affine quantized matrix-matrix multiply on GPU (Q4, Metal).
@@ -1127,12 +1388,16 @@ pub fn register_qmm(registry: &KernelRegistry) -> Result<(), KernelError> {
 /// Computes `output[m, n] = sum_k x[m, k] * dequant(w[n, k])` using a Metal
 /// compute kernel for Q4 quantized weights.
 ///
-/// This function requires the `qmm` kernel source to be registered via
-/// [`register_qmm`] (or manually). It is automatically registered by
+/// Uses the simdgroup MMA kernel (`affine_qmm_mma_q4`) with function constants
+/// for alignment-based bounds check elimination. Falls back to the legacy scalar
+/// kernel (`affine_qmm`) only when the MMA kernel is unavailable.
+///
+/// This function requires the `qmm_mma` (and optionally `qmm`) kernel sources
+/// to be registered via [`register_qmm`]. They are automatically registered by
 /// [`register`] in this module.
 ///
 /// # Arguments
-/// - `registry`: kernel registry with `qmm` source registered.
+/// - `registry`: kernel registry with `qmm_mma` source registered.
 /// - `x`: f32 input activations `[M, K]`.
 /// - `qw`: quantized weight description (must be Q4, i.e. `bits == 4`).
 /// - `queue`: Metal command queue.
@@ -1176,6 +1441,103 @@ pub fn affine_quantized_matmul_batched(
     let n = qw.out_features;
     let k = qw.in_features;
 
+    // MMA tile sizes
+    const BM: usize = 32;
+    const BN: usize = 32;
+
+    // Function constants for alignment-based bounds check elimination
+    let align_m = m % BM == 0;
+    let align_n = n % BN == 0;
+    let constants = [
+        (200u32, FunctionConstantValue::Bool(align_m)),
+        (201u32, FunctionConstantValue::Bool(align_n)),
+    ];
+
+    let pipeline =
+        registry.get_pipeline_with_constants("affine_qmm_mma_q4", DType::Float32, &constants)?;
+    let out = Array::zeros(registry.device().raw(), &[m, n], DType::Float32);
+
+    let params: [u32; 4] = [
+        super::checked_u32(m, "M")?,
+        super::checked_u32(n, "N")?,
+        super::checked_u32(k, "K")?,
+        qw.group_size,
+    ];
+
+    let dev = registry.device().raw();
+    let opts = metal::MTLResourceOptions::StorageModeShared;
+    let params_buf = dev.new_buffer_with_data(
+        params.as_ptr() as *const _,
+        (params.len() * std::mem::size_of::<u32>()) as u64,
+        opts,
+    );
+
+    let cb = queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
+    enc.set_buffer(1, Some(&qw.weights_buf), 0);
+    enc.set_buffer(2, Some(&qw.scales_buf), 0);
+    enc.set_buffer(3, Some(&qw.biases_buf), 0);
+    enc.set_buffer(4, Some(out.metal_buffer()), 0);
+    enc.set_buffer(5, Some(&params_buf), 0);
+
+    // Grid: (ceil(N/BN), ceil(M/BM), 1) threadgroups
+    // Threadgroup: 64 threads (2 simdgroups of 32)
+    let grid_x = n.div_ceil(BN) as u64;
+    let grid_y = m.div_ceil(BM) as u64;
+    let grid = metal::MTLSize::new(grid_x, grid_y, 1);
+    let tg = metal::MTLSize::new(64, 1, 1);
+
+    enc.dispatch_thread_groups(grid, tg);
+    enc.end_encoding();
+    super::commit_with_mode(cb, super::ExecMode::Sync);
+
+    Ok(out)
+}
+
+/// Affine quantized matrix-matrix multiply on GPU using the legacy scalar kernel.
+///
+/// This is the fallback path using the original BM=16, BN=16 scalar kernel.
+/// Prefer [`affine_quantized_matmul_batched`] which uses simdgroup MMA for
+/// significantly higher throughput.
+pub fn affine_quantized_matmul_batched_scalar(
+    registry: &KernelRegistry,
+    x: &Array,
+    qw: &QuantizedWeight,
+    queue: &metal::CommandQueue,
+) -> Result<Array, KernelError> {
+    // Validate input
+    if x.dtype() != DType::Float32 {
+        return Err(KernelError::InvalidShape(format!(
+            "affine_quantized_matmul_batched_scalar requires Float32 input x, got {:?}",
+            x.dtype()
+        )));
+    }
+    if x.ndim() != 2 {
+        return Err(KernelError::InvalidShape(format!(
+            "affine_quantized_matmul_batched_scalar requires 2D input x, got {}D",
+            x.ndim()
+        )));
+    }
+    if x.shape()[1] != qw.in_features {
+        return Err(KernelError::InvalidShape(format!(
+            "x.shape[1] ({}) != in_features ({})",
+            x.shape()[1],
+            qw.in_features
+        )));
+    }
+    if qw.bits != 4 {
+        return Err(KernelError::InvalidShape(format!(
+            "affine_quantized_matmul_batched_scalar currently requires bits==4, got {}",
+            qw.bits
+        )));
+    }
+
+    let m = x.shape()[0];
+    let n = qw.out_features;
+    let k = qw.in_features;
+
     let pipeline = registry.get_pipeline("affine_qmm", DType::Float32)?;
     let out = Array::zeros(registry.device().raw(), &[m, n], DType::Float32);
 
@@ -1204,13 +1566,13 @@ pub fn affine_quantized_matmul_batched(
     enc.set_buffer(4, Some(out.metal_buffer()), 0);
     enc.set_buffer(5, Some(&params_buf), 0);
 
-    // Tile sizes matching the shader
+    // Legacy tile sizes
     const BM_Q: usize = 16;
     const BN_Q: usize = 16;
 
-    let grid_x = m.div_ceil(BM_Q) as u64;
-    let grid_y = n.div_ceil(BN_Q) as u64;
-    let grid = metal::MTLSize::new(grid_y, grid_x, 1);
+    let grid_x = n.div_ceil(BN_Q) as u64;
+    let grid_y = m.div_ceil(BM_Q) as u64;
+    let grid = metal::MTLSize::new(grid_x, grid_y, 1);
     let tg = metal::MTLSize::new((BM_Q * BN_Q) as u64, 1, 1);
 
     enc.dispatch_thread_groups(grid, tg);
