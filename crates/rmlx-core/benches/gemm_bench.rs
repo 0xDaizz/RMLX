@@ -268,7 +268,17 @@ fn main() {
     for m in [128, 256, 512, 1024, 2048] {
         let a = rand_array(device, &[m, 4096], 42);
         let b = rand_array(device, &[4096, 4096], 43);
-        bench_gemm(&registry, &queue, device, &a, &b, m, 4096, 4096, "4096x4096");
+        bench_gemm(
+            &registry,
+            &queue,
+            device,
+            &a,
+            &b,
+            m,
+            4096,
+            4096,
+            "4096x4096",
+        );
     }
     println!();
 
@@ -277,7 +287,17 @@ fn main() {
     for m in [128, 256, 512, 1024, 2048] {
         let a = rand_array(device, &[m, 4096], 42);
         let b = rand_array(device, &[4096, 14336], 44);
-        bench_gemm(&registry, &queue, device, &a, &b, m, 4096, 14336, "4096x14336");
+        bench_gemm(
+            &registry,
+            &queue,
+            device,
+            &a,
+            &b,
+            m,
+            4096,
+            14336,
+            "4096x14336",
+        );
     }
     println!();
     println!("Done.");

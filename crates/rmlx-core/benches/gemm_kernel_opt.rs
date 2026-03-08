@@ -226,7 +226,13 @@ fn generate_kernel_opt_shader(cfg: &GemmKernelOptConfig) -> String {
 }
 
 /// Generate the load code for A matrix (either half4 or 2x half4, with or without bounds checks)
-fn generate_a_load(s: &mut String, wide_load: bool, aligned: bool, stage_expr: &str, k_offset_expr: &str) {
+fn generate_a_load(
+    s: &mut String,
+    wide_load: bool,
+    aligned: bool,
+    stage_expr: &str,
+    k_offset_expr: &str,
+) {
     if wide_load {
         // 2x half4 loads (8 elements per iteration)
         if aligned {
@@ -299,7 +305,13 @@ fn generate_a_load(s: &mut String, wide_load: bool, aligned: bool, stage_expr: &
 }
 
 /// Generate the load code for B matrix (either half4 or half8, with or without bounds checks)
-fn generate_b_load(s: &mut String, wide_load: bool, aligned: bool, stage_expr: &str, k_offset_expr: &str) {
+fn generate_b_load(
+    s: &mut String,
+    wide_load: bool,
+    aligned: bool,
+    stage_expr: &str,
+    k_offset_expr: &str,
+) {
     if wide_load {
         // 2x half4 loads (8 elements per iteration)
         if aligned {
@@ -386,7 +398,7 @@ fn generate_double_buffered_loop(s: &mut String, wide_load: bool, aligned: bool)
          \x20       uint next_stage = 1 - stage;\n\
          \x20       uint next_kb = (tile + 1) * SW_BK;\n\n\
          \x20       // Prefetch next tile\n\
-         \x20       if (tile + 1 < n_tiles) {\n"
+         \x20       if (tile + 1 < n_tiles) {\n",
     );
     generate_a_load(s, wide_load, aligned, "next_stage", "next_kb");
     generate_b_load(s, wide_load, aligned, "next_stage", "next_kb");
@@ -444,7 +456,7 @@ fn generate_direct_store(s: &mut String, aligned: bool) {
     if aligned {
         s.push_str(
             "            C_batch[gr * uN + gc0] = half(elems[0]);\n\
-             \x20           C_batch[gr * uN + gc1] = half(elems[1]);\n"
+             \x20           C_batch[gr * uN + gc1] = half(elems[1]);\n",
         );
     } else {
         s.push_str(
@@ -453,13 +465,13 @@ fn generate_direct_store(s: &mut String, aligned: bool) {
              \x20           }\n\
              \x20           if (gr < uM && gc1 < uN) {\n\
              \x20               C_batch[gr * uN + gc1] = half(elems[1]);\n\
-             \x20           }\n"
+             \x20           }\n",
         );
     }
 
     s.push_str(
         "        }\n\
-         \x20   }\n"
+         \x20   }\n",
     );
 }
 
@@ -484,7 +496,7 @@ fn generate_scratch_store(s: &mut String, aligned: bool) {
              \x20               uint lc = idx % 8;\n\
              \x20               C_batch[(base_row + lr) * uN + (base_col + lc)] =\n\
              \x20                   half(result_scratch[sgid * 64 + lr * 8 + lc]);\n\
-             \x20           }\n"
+             \x20           }\n",
         );
     } else {
         s.push_str(
@@ -503,7 +515,7 @@ fn generate_scratch_store(s: &mut String, aligned: bool) {
     s.push_str(
         "            threadgroup_barrier(mem_flags::mem_threadgroup);\n\
          \x20       }\n\
-         \x20   }\n"
+         \x20   }\n",
     );
 }
 
@@ -599,7 +611,11 @@ fn ceil_div(a: usize, b: usize) -> usize {
 
 fn compute_swizzle_log(m: usize, bm: usize) -> u32 {
     let tiles_m = m.div_ceil(bm);
-    if tiles_m > 3 { 1 } else { 0 }
+    if tiles_m > 3 {
+        1
+    } else {
+        0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -758,15 +774,14 @@ fn main() {
         cb.wait_until_completed();
 
         let ref_ptr = c_ref.metal_buffer().contents() as *const u16;
-        let ref_vals: Vec<u16> =
-            unsafe { std::slice::from_raw_parts(ref_ptr, vm * vn) }.to_vec();
+        let ref_vals: Vec<u16> = unsafe { std::slice::from_raw_parts(ref_ptr, vm * vn) }.to_vec();
 
         // Test each non-ref variant
         for cfg in &CONFIGS[1..] {
             let kernel_name = format!("gemm_ko_{}", cfg.label);
             let pipeline = registry
                 .get_pipeline(&kernel_name, DType::Float16)
-                .expect(&format!("{} pipeline", cfg.label));
+                .unwrap_or_else(|_| panic!("{} pipeline", cfg.label));
             let c_test = Array::zeros(device, &[vm, vn], DType::Float16);
 
             let cb = queue.new_command_buffer();
@@ -810,7 +825,13 @@ fn main() {
                 let col = idx % vn;
                 println!(
                     "  {} : FAIL — {} mismatches / {} (first: [{},{}] ref=0x{:04x} test=0x{:04x})",
-                    cfg.label, mismatches, ref_vals.len(), row, col, rv, tv,
+                    cfg.label,
+                    mismatches,
+                    ref_vals.len(),
+                    row,
+                    col,
+                    rv,
+                    tv,
                 );
             }
         }
@@ -822,7 +843,12 @@ fn main() {
         "Base: BM={} BN={} BK={} SG={}x{} thr={} double-buffered PAD={}",
         BM, BN, BK, SG_ROWS, SG_COLS, N_THREADS, PAD,
     );
-    println!("Variants: {}, Warmup: {}, Bench: {}", CONFIGS.len(), WARMUP_ITERS, BENCH_ITERS);
+    println!(
+        "Variants: {}, Warmup: {}, Bench: {}",
+        CONFIGS.len(),
+        WARMUP_ITERS,
+        BENCH_ITERS
+    );
     println!();
 
     let m_values = [128, 256, 512, 1024, 2048];
@@ -830,9 +856,21 @@ fn main() {
 
     for cfg in CONFIGS {
         let opts: Vec<&str> = [
-            if cfg.use_direct_store { Some("direct_store") } else { None },
-            if cfg.use_wide_load { Some("wide_load") } else { None },
-            if cfg.use_aligned { Some("aligned") } else { None },
+            if cfg.use_direct_store {
+                Some("direct_store")
+            } else {
+                None
+            },
+            if cfg.use_wide_load {
+                Some("wide_load")
+            } else {
+                None
+            },
+            if cfg.use_aligned {
+                Some("aligned")
+            } else {
+                None
+            },
         ]
         .iter()
         .filter_map(|x| *x)
