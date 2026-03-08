@@ -366,6 +366,46 @@ fn bench_grouped_gemm(
             );
         }
 
+        // CB-batched: all expert GEMMs in ONE command buffer
+        {
+            let experts: Vec<_> = expert_ms
+                .iter()
+                .map(|&m_i| {
+                    (
+                        rand_array(device, &[m_i.max(1), k], 42),
+                        rand_array(device, &[k, *n], 44),
+                    )
+                })
+                .collect();
+
+            // Warmup
+            for _ in 0..WARMUP_ITERS {
+                let cb = queue.new_command_buffer();
+                for (a_exp, b_exp) in &experts {
+                    let _ = ops::matmul::matmul_into_cb(registry, a_exp, b_exp, cb);
+                }
+                cb.commit();
+                cb.wait_until_completed();
+            }
+            let mut times = Vec::with_capacity(BENCH_ITERS);
+            for _ in 0..BENCH_ITERS {
+                let start = Instant::now();
+                let cb = queue.new_command_buffer();
+                for (a_exp, b_exp) in &experts {
+                    let _ = ops::matmul::matmul_into_cb(registry, a_exp, b_exp, cb);
+                }
+                cb.commit();
+                cb.wait_until_completed();
+                times.push(start.elapsed());
+            }
+            let stats = Stats::from_durations(&times);
+            let tflops_p50 = total_flops / (stats.p50 * 1e-6) / 1e12;
+            println!(
+                "  {:<25}  cb-batch   p50={:8.1}us  mean={:8.1}us  TFLOPS(p50)={:.2}",
+                label, stats.p50, stats.mean, tflops_p50,
+            );
+        }
+
         println!();
     }
 }
