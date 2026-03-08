@@ -4,9 +4,10 @@
 //! operations on Apple Silicon.
 //!
 //! Kernel variants:
-//! - **HiPerf GEMM** (BM=64, BN=64, BK=16): 128 threads (4 simdgroups),
-//!   2×2 SG grid with 4×4 MMA per SG (16 accumulators), single-buffered 4KB shmem.
-//!   Used for f16 when M >= 33, N >= 33. Maximizes MMA pipeline utilization.
+//! - **HiPerf GEMM v2** (BM=64, BN=64, BK=16): 128 threads (4 simdgroups),
+//!   2×2 SG grid with 4×4 MMA per SG (16 accumulators), double-buffered 8KB shmem.
+//!   Used for f16 when M >= 33, N >= 33. Combines deeper MMA pipeline with
+//!   memory latency hiding via double buffering.
 //! - **Full tile GEMM** (BM=64, BN=64, BK=32): 256 threads (8 simdgroups),
 //!   half-precision shared memory, double buffering, simdgroup MMA.
 //!   Used for f32/bf16 when M >= 33.
@@ -277,21 +278,45 @@ kernel void gemm_tiled_f16(
     const uint uM = as_uniform(M);
     const uint uN = as_uniform(N);
 
-    // Prefetch first tile
+    // Prefetch first tile (vectorized half4 loads)
     {
-        for (uint idx = tid_in_group; idx < BM * BK; idx += N_THREADS) {
-            uint r = idx / BK;
-            uint c = idx % BK;
+        for (uint idx = tid_in_group; idx < (BM * BK) / 4; idx += N_THREADS) {
+            uint flat = idx * 4;
+            uint r = flat / BK;
+            uint c = flat % BK;
             uint gr = row_start + r;
             uint gc = c;
-            As[0][r * BK + c] = (gr < uM && gc < uK) ? A_batch[gr * uK + gc] : half(0);
+            half4 val;
+            if (gr < uM && gc + 3 < uK) {
+                val = *((device const half4*)(&A_batch[gr * uK + gc]));
+            } else {
+                val = half4(
+                    (gr < uM && gc+0 < uK) ? A_batch[gr*uK + gc+0] : half(0),
+                    (gr < uM && gc+1 < uK) ? A_batch[gr*uK + gc+1] : half(0),
+                    (gr < uM && gc+2 < uK) ? A_batch[gr*uK + gc+2] : half(0),
+                    (gr < uM && gc+3 < uK) ? A_batch[gr*uK + gc+3] : half(0)
+                );
+            }
+            *((threadgroup half4*)(&As[0][r * BK + c])) = val;
         }
-        for (uint idx = tid_in_group; idx < BK * BN; idx += N_THREADS) {
-            uint r = idx / BN;
-            uint c = idx % BN;
+        for (uint idx = tid_in_group; idx < (BK * BN) / 4; idx += N_THREADS) {
+            uint flat = idx * 4;
+            uint r = flat / BN;
+            uint c = flat % BN;
             uint gr = r;
             uint gc = col_start + c;
-            Bs[0][r * BN + c] = (gr < uK && gc < uN) ? B_batch[gr * uN + gc] : half(0);
+            half4 val;
+            if (gr < uK && gc + 3 < uN) {
+                val = *((device const half4*)(&B_batch[gr * uN + gc]));
+            } else {
+                val = half4(
+                    (gr < uK && gc+0 < uN) ? B_batch[gr*uN + gc+0] : half(0),
+                    (gr < uK && gc+1 < uN) ? B_batch[gr*uN + gc+1] : half(0),
+                    (gr < uK && gc+2 < uN) ? B_batch[gr*uN + gc+2] : half(0),
+                    (gr < uK && gc+3 < uN) ? B_batch[gr*uN + gc+3] : half(0)
+                );
+            }
+            *((threadgroup half4*)(&Bs[0][r * BN + c])) = val;
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -303,21 +328,43 @@ kernel void gemm_tiled_f16(
         uint next_kb = (tile + 1) * BK;
 
         if (tile + 1 < n_tiles) {
-            for (uint idx = tid_in_group; idx < BM * BK; idx += N_THREADS) {
-                uint r = idx / BK;
-                uint c = idx % BK;
+            for (uint idx = tid_in_group; idx < (BM * BK) / 4; idx += N_THREADS) {
+                uint flat = idx * 4;
+                uint r = flat / BK;
+                uint c = flat % BK;
                 uint gr = row_start + r;
                 uint gc = next_kb + c;
-                As[next_stage][r * BK + c] = (gr < uM && gc < uK)
-                    ? A_batch[gr * uK + gc] : half(0);
+                half4 val;
+                if (gr < uM && gc + 3 < uK) {
+                    val = *((device const half4*)(&A_batch[gr * uK + gc]));
+                } else {
+                    val = half4(
+                        (gr < uM && gc+0 < uK) ? A_batch[gr*uK + gc+0] : half(0),
+                        (gr < uM && gc+1 < uK) ? A_batch[gr*uK + gc+1] : half(0),
+                        (gr < uM && gc+2 < uK) ? A_batch[gr*uK + gc+2] : half(0),
+                        (gr < uM && gc+3 < uK) ? A_batch[gr*uK + gc+3] : half(0)
+                    );
+                }
+                *((threadgroup half4*)(&As[next_stage][r * BK + c])) = val;
             }
-            for (uint idx = tid_in_group; idx < BK * BN; idx += N_THREADS) {
-                uint r = idx / BN;
-                uint c = idx % BN;
+            for (uint idx = tid_in_group; idx < (BK * BN) / 4; idx += N_THREADS) {
+                uint flat = idx * 4;
+                uint r = flat / BN;
+                uint c = flat % BN;
                 uint gr = next_kb + r;
                 uint gc = col_start + c;
-                Bs[next_stage][r * BN + c] = (gr < uK && gc < uN)
-                    ? B_batch[gr * uN + gc] : half(0);
+                half4 val;
+                if (gr < uK && gc + 3 < uN) {
+                    val = *((device const half4*)(&B_batch[gr * uN + gc]));
+                } else {
+                    val = half4(
+                        (gr < uK && gc+0 < uN) ? B_batch[gr*uN + gc+0] : half(0),
+                        (gr < uK && gc+1 < uN) ? B_batch[gr*uN + gc+1] : half(0),
+                        (gr < uK && gc+2 < uN) ? B_batch[gr*uN + gc+2] : half(0),
+                        (gr < uK && gc+3 < uN) ? B_batch[gr*uN + gc+3] : half(0)
+                    );
+                }
+                *((threadgroup half4*)(&Bs[next_stage][r * BN + c])) = val;
             }
         }
 
@@ -350,28 +397,46 @@ kernel void gemm_tiled_f16(
     }
 
     // Store results — convert f32 acc to half output
+    // Fast path: simdgroup_store directly to device memory when fully in-bounds
+    // Slow path: bounds-checked store via threadgroup scratch
     threadgroup float result_buf[N_SIMDGROUPS * 64];
 
     #pragma clang loop unroll(full)
     for (uint i = 0; i < 2; i++) {
         #pragma clang loop unroll(full)
         for (uint j = 0; j < 2; j++) {
-            simdgroup_store(acc[i][j], &result_buf[sgid * 64], 8);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
             uint base_row = row_start + sg_row * 16 + i * 8;
             uint base_col = col_start + sg_col * 16 + j * 8;
 
-            for (uint idx = lane_id; idx < 64; idx += 32) {
-                uint lr = idx / 8;
-                uint lc = idx % 8;
-                uint gr = base_row + lr;
-                uint gc = base_col + lc;
-                if (gr < uM && gc < uN) {
-                    C_batch[gr * uN + gc] = half(result_buf[sgid * 64 + lr * 8 + lc]);
+            if (base_row + 7 < uM && base_col + 7 < uN) {
+                // Fast path: entire 8x8 block is in-bounds
+                // Store f32 acc to threadgroup, convert to half, write to device
+                simdgroup_store(acc[i][j], &result_buf[sgid * 64], 8);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                for (uint idx = lane_id; idx < 64; idx += 32) {
+                    uint lr = idx / 8;
+                    uint lc = idx % 8;
+                    C_batch[(base_row + lr) * uN + (base_col + lc)] =
+                        half(result_buf[sgid * 64 + lr * 8 + lc]);
                 }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            } else {
+                // Slow path: boundary tile — per-element bounds check
+                simdgroup_store(acc[i][j], &result_buf[sgid * 64], 8);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                for (uint idx = lane_id; idx < 64; idx += 32) {
+                    uint lr = idx / 8;
+                    uint lc = idx % 8;
+                    uint gr = base_row + lr;
+                    uint gc = base_col + lc;
+                    if (gr < uM && gc < uN) {
+                        C_batch[gr * uN + gc] = half(result_buf[sgid * 64 + lr * 8 + lc]);
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
             }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
     }
 }
@@ -809,11 +874,13 @@ pub const GEMM_HIPERF_SHADER_SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
-// ===== HiPerf f16 GEMM: BM=64, BN=64, BK=16, 4 simdgroups =====
+// ===== HiPerf v2 f16 GEMM: BM=64, BN=64, BK=16, 4 simdgroups, DOUBLE-BUFFERED =====
 // 128 threads = 4 simdgroups, 2×2 SG grid.
 // Each simdgroup computes a 32×32 sub-tile = 4×4 grid of 8×8 MMA tiles.
 // This gives 16 accumulators per SG, keeping the MMA pipeline fully occupied.
-// Single-buffered shared memory: only 4KB total.
+// Double-buffered shared memory: 2 × (64×16 + 16×64) × 2 bytes = 8KB total.
+// While computing on buffer[stage], the next tile is prefetched into buffer[1-stage],
+// hiding global memory latency.
 
 constant constexpr uint HP_BM = 64;
 constant constexpr uint HP_BN = 64;
@@ -860,9 +927,9 @@ kernel void gemm_hiperf_f16(
     uint  sgid           [[simdgroup_index_in_threadgroup]],
     uint  lane_id        [[thread_index_in_simdgroup]])
 {
-    // Single-buffered shared memory — only 4KB total
-    threadgroup half As[HP_BM * HP_BK]; // 64*16 = 1024 halves = 2KB
-    threadgroup half Bs[HP_BK * HP_BN]; // 16*64 = 1024 halves = 2KB
+    // Double-buffered shared memory — 8KB total
+    threadgroup half As[2][HP_BM * HP_BK]; // 2 * 64*16 = 2048 halves = 4KB
+    threadgroup half Bs[2][HP_BK * HP_BN]; // 2 * 16*64 = 2048 halves = 4KB
 
     const uint batch_idx = group_id.z;
     uint2 swizzled = hp_swizzle_threadgroup(uint2(group_id.x, group_id.y), swizzle_log);
@@ -890,32 +957,50 @@ kernel void gemm_hiperf_f16(
     const uint uN = hp_as_uniform(N);
     const uint n_tiles = (uK + HP_BK - 1) / HP_BK;
 
-    // Main loop over K dimension
+    // ── Prefetch first tile into buffer[0] ──
+    for (uint idx = tid_in_group; idx < HP_BM * HP_BK; idx += HP_N_THREADS) {
+        uint r = idx / HP_BK;
+        uint c = idx % HP_BK;
+        uint gr = row_start + r;
+        uint gc = c;
+        As[0][r * HP_BK + c] = (gr < uM && gc < uK) ? A_batch[gr * uK + gc] : half(0);
+    }
+    for (uint idx = tid_in_group; idx < HP_BK * HP_BN; idx += HP_N_THREADS) {
+        uint r = idx / HP_BN;
+        uint c = idx % HP_BN;
+        uint gr = r;
+        uint gc = col_start + c;
+        Bs[0][r * HP_BN + c] = (gr < uK && gc < uN) ? B_batch[gr * uN + gc] : half(0);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ── Main loop: double-buffered over K dimension ──
     for (uint tile = 0; tile < n_tiles; tile++) {
-        const uint kb = tile * HP_BK;
+        uint stage = tile & 1;
+        uint next_stage = 1 - stage;
+        uint next_kb = (tile + 1) * HP_BK;
 
-        // ── Load A tile: HP_BM × HP_BK = 64×16 = 1024 halves ──
-        // 128 threads, each loads 1024/128 = 8 elements
-        for (uint idx = tid_in_group; idx < HP_BM * HP_BK; idx += HP_N_THREADS) {
-            uint r = idx / HP_BK;
-            uint c = idx % HP_BK;
-            uint gr = row_start + r;
-            uint gc = kb + c;
-            As[r * HP_BK + c] = (gr < uM && gc < uK) ? A_batch[gr * uK + gc] : half(0);
+        // Prefetch next tile into buffer[next_stage] (if exists)
+        if (tile + 1 < n_tiles) {
+            for (uint idx = tid_in_group; idx < HP_BM * HP_BK; idx += HP_N_THREADS) {
+                uint r = idx / HP_BK;
+                uint c = idx % HP_BK;
+                uint gr = row_start + r;
+                uint gc = next_kb + c;
+                As[next_stage][r * HP_BK + c] = (gr < uM && gc < uK)
+                    ? A_batch[gr * uK + gc] : half(0);
+            }
+            for (uint idx = tid_in_group; idx < HP_BK * HP_BN; idx += HP_N_THREADS) {
+                uint r = idx / HP_BN;
+                uint c = idx % HP_BN;
+                uint gr = next_kb + r;
+                uint gc = col_start + c;
+                Bs[next_stage][r * HP_BN + c] = (gr < uK && gc < uN)
+                    ? B_batch[gr * uN + gc] : half(0);
+            }
         }
 
-        // ── Load B tile: HP_BK × HP_BN = 16×64 = 1024 halves ──
-        for (uint idx = tid_in_group; idx < HP_BK * HP_BN; idx += HP_N_THREADS) {
-            uint r = idx / HP_BN;
-            uint c = idx % HP_BN;
-            uint gr = kb + r;
-            uint gc = col_start + c;
-            Bs[r * HP_BN + c] = (gr < uK && gc < uN) ? B_batch[gr * uN + gc] : half(0);
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // ── Compute: 2 kk iterations (BK=16, step 8) ──
+        // ── Compute on buffer[stage]: 2 kk iterations (BK=16, step 8) ──
         #pragma clang loop unroll(full)
         for (uint kk = 0; kk < HP_BK; kk += 8) {
             simdgroup_half8x8 a_frag[4]; // 4 tiles in M direction (32 rows)
@@ -925,14 +1010,14 @@ kernel void gemm_hiperf_f16(
             #pragma clang loop unroll(full)
             for (uint i = 0; i < 4; i++) {
                 simdgroup_load(a_frag[i],
-                    &As[(sg_row * 32 + i * 8) * HP_BK + kk], HP_BK);
+                    &As[stage][(sg_row * 32 + i * 8) * HP_BK + kk], HP_BK);
             }
 
             // Load B fragments: kk row, sg_col*32 + {0,8,16,24} cols
             #pragma clang loop unroll(full)
             for (uint j = 0; j < 4; j++) {
                 simdgroup_load(b_frag[j],
-                    &Bs[kk * HP_BN + sg_col * 32 + j * 8], HP_BN);
+                    &Bs[stage][kk * HP_BN + sg_col * 32 + j * 8], HP_BN);
             }
 
             // 4×4 outer product = 16 MMA ops per kk iteration
@@ -943,7 +1028,9 @@ kernel void gemm_hiperf_f16(
                     simdgroup_multiply_accumulate(acc[i][j], a_frag[i], b_frag[j], acc[i][j]);
         }
 
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tile + 1 < n_tiles) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
     }
 
     // ── Store results: 4×4 grid of 8×8 tiles per simdgroup ──
@@ -2089,7 +2176,7 @@ fn dispatch_tiled_gemm(
         (TileVariant::Skinny, DType::Float16) => "gemm_skinny_f16",
         (TileVariant::Skinny, DType::Bfloat16) => "gemm_skinny_bf16",
         (TileVariant::Full, DType::Float32) => "gemm_tiled_f32",
-        (TileVariant::Full, DType::Float16) => "gemm_tiled_f16",
+        (TileVariant::Full, DType::Float16) => "gemm_hiperf_f16",
         (TileVariant::Full, DType::Bfloat16) => "gemm_tiled_bf16",
         _ => {
             return Err(KernelError::NotFound(format!(
@@ -2141,11 +2228,13 @@ fn dispatch_tiled_gemm(
     let grid = MTLSize::new(grid_x, grid_y, grid_z);
 
     // Thread count per threadgroup depends on variant
-    let tg_threads = match tile.variant {
-        TileVariant::Small => (16 * 16) as u64, // 256
-        TileVariant::Medium | TileVariant::Simd => (32 * 32) as u64, // 1024
-        TileVariant::Skinny => 256_u64,               // 8 simdgroups
-        TileVariant::Full => 256_u64,
+    // Full+f16 uses gemm_hiperf_f16 (4 SG = 128 threads), others use 256
+    let tg_threads = match (tile.variant, a.dtype()) {
+        (TileVariant::Small, _) => 256_u64,
+        (TileVariant::Medium, _) | (TileVariant::Simd, _) => 1024_u64,
+        (TileVariant::Skinny, _) => 256_u64,
+        (TileVariant::Full, DType::Float16) => 128_u64, // gemm_hiperf_f16: 4 simdgroups
+        (TileVariant::Full, _) => 256_u64,
     };
     let tg = MTLSize::new(tg_threads, 1, 1);
 
@@ -2382,7 +2471,7 @@ pub fn matmul_into_cb(
         (TileVariant::Skinny, DType::Float16) => "gemm_skinny_f16",
         (TileVariant::Skinny, DType::Bfloat16) => "gemm_skinny_bf16",
         (TileVariant::Full, DType::Float32) => "gemm_tiled_f32",
-        (TileVariant::Full, DType::Float16) => "gemm_tiled_f16",
+        (TileVariant::Full, DType::Float16) => "gemm_hiperf_f16",
         (TileVariant::Full, DType::Bfloat16) => "gemm_tiled_bf16",
         _ => {
             return Err(KernelError::NotFound(format!(
@@ -2431,11 +2520,13 @@ pub fn matmul_into_cb(
     let grid = MTLSize::new(grid_x, grid_y, 1); // batch=1
 
     // Thread count per threadgroup depends on variant
-    let tg_threads = match tile.variant {
-        TileVariant::Small => 256_u64,
-        TileVariant::Medium | TileVariant::Simd => 1024_u64,
-        TileVariant::Skinny => 256_u64,
-        TileVariant::Full => 256_u64,
+    // Full+f16 uses gemm_hiperf_f16 (4 SG = 128 threads), others use 256
+    let tg_threads = match (tile.variant, a.dtype()) {
+        (TileVariant::Small, _) => 256_u64,
+        (TileVariant::Medium, _) | (TileVariant::Simd, _) => 1024_u64,
+        (TileVariant::Skinny, _) => 256_u64,
+        (TileVariant::Full, DType::Float16) => 128_u64,  // gemm_hiperf_f16: 4 simdgroups
+        (TileVariant::Full, _) => 256_u64,
     };
     let tg = MTLSize::new(tg_threads, 1, 1);
 
