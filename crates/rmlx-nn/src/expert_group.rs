@@ -542,7 +542,14 @@ fn encode_gemm(
         }
     };
 
-    let pipeline = registry.get_pipeline(kernel_name, dtype)?;
+    // MlxArch uses function constants for alignment specialization
+    let pipeline = if tile.variant == ops::matmul::TileVariant::MlxArch {
+        let constants =
+            ops::matmul::matmul_align_constants(m as usize, n as usize, tile.bm, tile.bn);
+        registry.get_pipeline_with_constants(kernel_name, dtype, &constants)?
+    } else {
+        registry.get_pipeline(kernel_name, dtype)?
+    };
 
     let dev = registry.device().raw();
     let m_buf = make_u32_buf(dev, m);

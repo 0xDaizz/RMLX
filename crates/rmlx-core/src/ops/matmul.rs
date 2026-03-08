@@ -530,35 +530,35 @@ kernel void gemm_tiled_bf16(
             }
         }
 
-        for (uint kk = 0; kk < BK; kk += 8) {
-            // Load as float from bfloat shmem (no native bfloat simdgroup_matrix)
-            simdgroup_float8x8 a_frag[4];
-            simdgroup_float8x8 b_frag[2];
+        // Bulk bf16→f32 pre-conversion buffers (2KB + 2KB = 4KB)
+        // Reduces barriers from 6 per kk step to 1 per kk step
+        threadgroup float A_f32[BM * 8];   // 64 * 8 = 512 floats
+        threadgroup float B_f32[8 * BN];   // 8 * 64 = 512 floats
 
-            // Manual load: bfloat -> float for simdgroup_load
-            // We use threadgroup float scratch for the conversion
+        for (uint kk = 0; kk < BK; kk += 8) {
+            // All 256 threads cooperatively convert bf16→f32 for this kk step
+            for (uint idx = tid_in_group; idx < BM * 8; idx += N_THREADS) {
+                uint r = idx / 8;
+                uint c = idx % 8;
+                A_f32[idx] = float(As[stage][r * BK + kk + c]);
+            }
+            for (uint idx = tid_in_group; idx < 8 * BN; idx += N_THREADS) {
+                uint r = idx / BN;
+                uint c = idx % BN;
+                B_f32[idx] = float(Bs[stage][(kk + r) * BN + c]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);  // ONE barrier per kk step
+
+            // Load fragments directly from f32 buffer — no barriers needed
+            simdgroup_float8x8 a_frag[4];
             #pragma clang loop unroll(full)
             for (uint i = 0; i < 4; i++) {
-                // Load from bfloat shared memory and convert
-                threadgroup float a_tmp[64];
-                for (uint t = lane_id; t < 64; t += 32) {
-                    uint tr = t / 8;
-                    uint tc = t % 8;
-                    a_tmp[t] = float(As[stage][(sg_row * 32 + i * 8 + tr) * BK + kk + tc]);
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                simdgroup_load(a_frag[i], a_tmp, 8);
+                simdgroup_load(a_frag[i], &A_f32[(sg_row * 32 + i * 8) * 8], 8);
             }
+            simdgroup_float8x8 b_frag[2];
             #pragma clang loop unroll(full)
             for (uint j = 0; j < 2; j++) {
-                threadgroup float b_tmp[64];
-                for (uint t = lane_id; t < 64; t += 32) {
-                    uint tr = t / 8;
-                    uint tc = t % 8;
-                    b_tmp[t] = float(Bs[stage][(kk + tr) * BN + sg_col * 16 + j * 8 + tc]);
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                simdgroup_load(b_frag[j], b_tmp, 8);
+                simdgroup_load(b_frag[j], &B_f32[sg_col * 16 + j * 8], BN);
             }
 
             #pragma clang loop unroll(full)
@@ -1719,6 +1719,12 @@ constant constexpr uint MLX_N_THREADS = 64;
 constant constexpr uint MLX_TM = 8;   // BM / 8 = 64/8
 constant constexpr uint MLX_TN = 4;   // (BN/2) / 8 = 32/8
 
+// Function constants for alignment specialization (set at pipeline creation).
+// When M % BM == 0, align_M is true → row bounds checks are elided.
+// When N % BN == 0, align_N is true → column bounds checks are elided.
+constant bool align_M [[function_constant(200)]];
+constant bool align_N [[function_constant(201)]];
+
 #if __METAL_VERSION__ >= 310
 template <typename T>
 METAL_FUNC uniform<T> mlx_as_uniform(T val) {
@@ -1792,7 +1798,9 @@ kernel void gemm_mlx_f16(
         {
             uint a_row = tid_in_group;  // 0..63
             uint gr = row_start + a_row;
-            if (gr < uM && kb + 15 < uK) {
+            // When align_M is true, gr < uM is guaranteed (M % BM == 0 and
+            // we have exactly M/BM threadgroups in Y), so skip the row check.
+            if ((align_M || gr < uM) && kb + 15 < uK) {
                 *reinterpret_cast<threadgroup half4*>(&As[a_row * 16]) =
                     *reinterpret_cast<device const half4*>(&A_batch[gr * uK + kb]);
                 *reinterpret_cast<threadgroup half4*>(&As[a_row * 16 + 4]) =
@@ -1803,7 +1811,7 @@ kernel void gemm_mlx_f16(
                     *reinterpret_cast<device const half4*>(&A_batch[gr * uK + kb + 12]);
             } else {
                 for (uint d = 0; d < 16; d++) {
-                    As[a_row * 16 + d] = (gr < uM && kb + d < uK)
+                    As[a_row * 16 + d] = ((align_M || gr < uM) && kb + d < uK)
                         ? A_batch[gr * uK + kb + d] : half(0);
                 }
             }
@@ -1815,7 +1823,9 @@ kernel void gemm_mlx_f16(
             uint bj = (tid_in_group & 3u) << 4;  // 0, 16, 32, 48
             uint gr = kb + bi;
             uint gc = col_start + bj;
-            if (gr < uK && gc + 15 < uN) {
+            // When align_N is true, gc + 15 < uN is guaranteed (N % BN == 0
+            // and we have exactly N/BN threadgroups in X), so skip the col check.
+            if (gr < uK && (align_N || gc + 15 < uN)) {
                 *reinterpret_cast<threadgroup half4*>(&Bs[bi * 64 + bj]) =
                     *reinterpret_cast<device const half4*>(&B_batch[gr * uN + gc]);
                 *reinterpret_cast<threadgroup half4*>(&Bs[bi * 64 + bj + 4]) =
@@ -1826,7 +1836,7 @@ kernel void gemm_mlx_f16(
                     *reinterpret_cast<device const half4*>(&B_batch[gr * uN + gc + 12]);
             } else {
                 for (uint d = 0; d < 16; d++) {
-                    Bs[bi * 64 + bj + d] = (gr < uK && gc + d < uN)
+                    Bs[bi * 64 + bj + d] = (gr < uK && (align_N || gc + d < uN))
                         ? B_batch[gr * uN + gc + d] : half(0);
                 }
             }
@@ -1879,11 +1889,17 @@ kernel void gemm_mlx_f16(
 
             auto elems = acc[i][j].thread_elements();
 
-            if (gr < uM && gc0 < uN) {
+            // When both align_M and align_N are true, all stores are in-bounds.
+            if (align_M && align_N) {
                 C_batch[gr * uN + gc0] = half(elems[0]);
-            }
-            if (gr < uM && gc1 < uN) {
                 C_batch[gr * uN + gc1] = half(elems[1]);
+            } else {
+                if ((align_M || gr < uM) && (align_N || gc0 < uN)) {
+                    C_batch[gr * uN + gc0] = half(elems[0]);
+                }
+                if ((align_M || gr < uM) && (align_N || gc1 < uN)) {
+                    C_batch[gr * uN + gc1] = half(elems[1]);
+                }
             }
         }
     }
@@ -1963,12 +1979,16 @@ pub fn select_tile_config(m: usize, n: usize, _k: usize) -> TileConfig {
 
 /// Select the best tile configuration considering dtype.
 ///
-/// For f16 with M >= 33 and N >= 33 (i.e. base config returns Full),
-/// uses the MLX-architecture kernel which achieves near-MLX throughput.
+/// For f16, uses the MLX-architecture kernel for both Full (M>=33) and
+/// Skinny (M=5-32) ranges. The MlxArch kernel handles M<BM via bounds
+/// checks, and produces more threadgroups with fewer threads each,
+/// yielding better occupancy than the Skinny variant.
 pub fn select_tile_config_with_dtype(m: usize, n: usize, k: usize, dtype: DType) -> TileConfig {
     let base = select_tile_config(m, n, k);
-    // MLX-arch kernel for all large f16 matrices where base would use Full
-    if dtype == DType::Float16 && base.variant == TileVariant::Full {
+    // MLX-arch kernel for f16: covers both Full (M>=33) and Skinny (M=5-32) ranges
+    if dtype == DType::Float16
+        && (base.variant == TileVariant::Full || base.variant == TileVariant::Skinny)
+    {
         TileConfig {
             bm: 64,
             bn: 64,
@@ -2399,7 +2419,13 @@ fn dispatch_tiled_gemm(
         }
     };
 
-    let pipeline = registry.get_pipeline(kernel_name, a.dtype())?;
+    // MlxArch uses function constants for alignment specialization
+    let pipeline = if tile.variant == TileVariant::MlxArch {
+        let constants = matmul_align_constants(m, n, tile.bm, tile.bn);
+        registry.get_pipeline_with_constants(kernel_name, a.dtype(), &constants)?
+    } else {
+        registry.get_pipeline(kernel_name, a.dtype())?
+    };
     let out = Array::zeros(registry.device().raw(), output_shape, a.dtype());
 
     let dev = registry.device().raw();
@@ -2694,7 +2720,13 @@ pub fn matmul_into_cb(
         }
     };
 
-    let pipeline = registry.get_pipeline(kernel_name, a.dtype())?;
+    // MlxArch uses function constants for alignment specialization
+    let pipeline = if tile.variant == TileVariant::MlxArch {
+        let constants = matmul_align_constants(m, n, tile.bm, tile.bn);
+        registry.get_pipeline_with_constants(kernel_name, a.dtype(), &constants)?
+    } else {
+        registry.get_pipeline(kernel_name, a.dtype())?
+    };
     let dev = registry.device().raw();
     let out = Array::zeros(dev, &[m, n], a.dtype());
 
