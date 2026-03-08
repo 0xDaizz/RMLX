@@ -2099,6 +2099,20 @@ constant constexpr uint MLX_TN = 4;   // (BN/2) / 8 = 32/8
 constant bool align_M [[function_constant(200)]];
 constant bool align_N [[function_constant(201)]];
 constant bool has_residual [[function_constant(202)]];
+constant bool has_norm [[function_constant(203)]];
+constant bool has_swiglu [[function_constant(204)]];
+
+// Stable sigmoid for half precision: avoids overflow by using exp(-|x|).
+inline half stable_silu_h(half x) {
+    float xf = float(x);
+    float e = exp(-abs(xf));
+    float sig = xf >= 0.0f ? 1.0f / (1.0f + e) : e / (1.0f + e);
+    return half(xf * sig);
+}
+
+inline float stable_silu_f(float x) {
+    return x / (1.0f + exp(-x));
+}
 
 #if __METAL_VERSION__ >= 310
 template <typename T>
@@ -2132,6 +2146,9 @@ kernel void gemm_mlx_f16(
     constant uint& batch_stride_c [[buffer(8)]],
     constant uint& swizzle_log    [[buffer(9)]],
     device const half* residual    [[buffer(10)]],
+    device const half* norm_weight [[buffer(11)]],
+    device const float* inv_rms   [[buffer(12)]],
+    device const half* gate_result [[buffer(13)]],
     uint3 group_id       [[threadgroup_position_in_grid]],
     uint  tid_in_group   [[thread_index_in_threadgroup]],
     uint  sgid           [[simdgroup_index_in_threadgroup]],
@@ -2139,6 +2156,8 @@ kernel void gemm_mlx_f16(
 {
     threadgroup half As[MLX_BM * MLX_BK];  // 64x16 = 1024 halves = 2KB
     threadgroup half Bs[MLX_BK * MLX_BN];  // 16x64 = 1024 halves = 2KB
+    // TG-cached norm_weight for the current K tile (avoids 64x redundant device reads)
+    threadgroup half norm_w_cache[MLX_BK]; // 16 halves = 32 bytes
 
     const uint batch_idx = group_id.z;
     uint2 swizzled = mlx_swizzle_tg(uint2(group_id.x, group_id.y), swizzle_log);
@@ -2149,6 +2168,7 @@ kernel void gemm_mlx_f16(
     device const half* B_batch = B + batch_idx * mlx_as_uniform(batch_stride_b);
     device half*       C_batch = C + batch_idx * mlx_as_uniform(batch_stride_c);
     device const half* R_batch = has_residual ? (residual + batch_idx * mlx_as_uniform(batch_stride_c)) : nullptr;
+    device const half* G_batch = has_swiglu ? (gate_result + batch_idx * mlx_as_uniform(batch_stride_c)) : nullptr;
 
     // SG grid: 1x2 -- sg_row always 0, sg_col = sgid (0 or 1)
     const uint base_m = 0;        // WM=1, single row of SG
@@ -2171,25 +2191,63 @@ kernel void gemm_mlx_f16(
         uint kb = tile * MLX_BK;
 
         // Load A tile: 64 threads x 16 elements = 64x16 = BM x BK
+        // When has_norm is true, apply on-the-fly RMSNorm:
+        //   As[row][col] = A[row][col] * inv_rms[row] * norm_weight[col]
         threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Pre-load norm_weight[kb..kb+16] into TG cache (1 thread loads all 16)
+        if (has_norm && tid_in_group == 0) {
+            for (uint d = 0; d < MLX_BK; d++) {
+                norm_w_cache[d] = (kb + d < uK) ? norm_weight[kb + d] : half(0);
+            }
+        }
+        if (has_norm) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
         {
             uint a_row = tid_in_group;  // 0..63
             uint gr = row_start + a_row;
-            // When align_M is true, gr < uM is guaranteed (M % BM == 0 and
-            // we have exactly M/BM threadgroups in Y), so skip the row check.
             if ((align_M || gr < uM) && kb + 15 < uK) {
-                *reinterpret_cast<threadgroup half4*>(&As[a_row * 16]) =
-                    *reinterpret_cast<device const half4*>(&A_batch[gr * uK + kb]);
-                *reinterpret_cast<threadgroup half4*>(&As[a_row * 16 + 4]) =
-                    *reinterpret_cast<device const half4*>(&A_batch[gr * uK + kb + 4]);
-                *reinterpret_cast<threadgroup half4*>(&As[a_row * 16 + 8]) =
-                    *reinterpret_cast<device const half4*>(&A_batch[gr * uK + kb + 8]);
-                *reinterpret_cast<threadgroup half4*>(&As[a_row * 16 + 12]) =
-                    *reinterpret_cast<device const half4*>(&A_batch[gr * uK + kb + 12]);
+                if (has_norm) {
+                    // Read inv_rms once into register
+                    half row_scale = half(inv_rms[gr]);
+                    // Vectorized half4 load + scale from TG-cached norm_weight
+                    half4 w0 = *reinterpret_cast<threadgroup const half4*>(&norm_w_cache[0]);
+                    half4 w1 = *reinterpret_cast<threadgroup const half4*>(&norm_w_cache[4]);
+                    half4 w2 = *reinterpret_cast<threadgroup const half4*>(&norm_w_cache[8]);
+                    half4 w3 = *reinterpret_cast<threadgroup const half4*>(&norm_w_cache[12]);
+                    half4 a0 = *reinterpret_cast<device const half4*>(&A_batch[gr * uK + kb]);
+                    half4 a1 = *reinterpret_cast<device const half4*>(&A_batch[gr * uK + kb + 4]);
+                    half4 a2 = *reinterpret_cast<device const half4*>(&A_batch[gr * uK + kb + 8]);
+                    half4 a3 = *reinterpret_cast<device const half4*>(&A_batch[gr * uK + kb + 12]);
+                    *reinterpret_cast<threadgroup half4*>(&As[a_row * 16])     = a0 * w0 * row_scale;
+                    *reinterpret_cast<threadgroup half4*>(&As[a_row * 16 + 4]) = a1 * w1 * row_scale;
+                    *reinterpret_cast<threadgroup half4*>(&As[a_row * 16 + 8]) = a2 * w2 * row_scale;
+                    *reinterpret_cast<threadgroup half4*>(&As[a_row * 16 + 12]) = a3 * w3 * row_scale;
+                } else {
+                    *reinterpret_cast<threadgroup half4*>(&As[a_row * 16]) =
+                        *reinterpret_cast<device const half4*>(&A_batch[gr * uK + kb]);
+                    *reinterpret_cast<threadgroup half4*>(&As[a_row * 16 + 4]) =
+                        *reinterpret_cast<device const half4*>(&A_batch[gr * uK + kb + 4]);
+                    *reinterpret_cast<threadgroup half4*>(&As[a_row * 16 + 8]) =
+                        *reinterpret_cast<device const half4*>(&A_batch[gr * uK + kb + 8]);
+                    *reinterpret_cast<threadgroup half4*>(&As[a_row * 16 + 12]) =
+                        *reinterpret_cast<device const half4*>(&A_batch[gr * uK + kb + 12]);
+                }
             } else {
-                for (uint d = 0; d < 16; d++) {
-                    As[a_row * 16 + d] = ((align_M || gr < uM) && kb + d < uK)
-                        ? A_batch[gr * uK + kb + d] : half(0);
+                if (has_norm) {
+                    half row_scale = (align_M || gr < uM) ? half(inv_rms[gr]) : half(0);
+                    for (uint d = 0; d < 16; d++) {
+                        As[a_row * 16 + d] = ((align_M || gr < uM) && kb + d < uK)
+                            ? A_batch[gr * uK + kb + d] * row_scale * norm_w_cache[d]
+                            : half(0);
+                    }
+                } else {
+                    for (uint d = 0; d < 16; d++) {
+                        As[a_row * 16 + d] = ((align_M || gr < uM) && kb + d < uK)
+                            ? A_batch[gr * uK + kb + d] : half(0);
+                    }
                 }
             }
         }
@@ -2270,6 +2328,12 @@ kernel void gemm_mlx_f16(
             if (align_M && align_N) {
                 half v0 = half(elems[0]);
                 half v1 = half(elems[1]);
+                if (has_swiglu) {
+                    uint idx0 = gr * uN + gc0;
+                    uint idx1 = gr * uN + gc1;
+                    v0 = half(float(stable_silu_h(G_batch[idx0])) * float(v0));
+                    v1 = half(float(stable_silu_h(G_batch[idx1])) * float(v1));
+                }
                 if (has_residual) {
                     v0 += R_batch[gr * uN + gc0];
                     v1 += R_batch[gr * uN + gc1];
@@ -2279,11 +2343,13 @@ kernel void gemm_mlx_f16(
             } else {
                 if ((align_M || gr < uM) && (align_N || gc0 < uN)) {
                     half v0 = half(elems[0]);
+                    if (has_swiglu) v0 = half(float(stable_silu_h(G_batch[gr * uN + gc0])) * float(v0));
                     if (has_residual) v0 += R_batch[gr * uN + gc0];
                     C_batch[gr * uN + gc0] = v0;
                 }
                 if ((align_M || gr < uM) && (align_N || gc1 < uN)) {
                     half v1 = half(elems[1]);
+                    if (has_swiglu) v1 = half(float(stable_silu_h(G_batch[gr * uN + gc1])) * float(v1));
                     if (has_residual) v1 += R_batch[gr * uN + gc1];
                     C_batch[gr * uN + gc1] = v1;
                 }
@@ -2304,6 +2370,9 @@ kernel void gemm_mlx_f32(
     constant uint& batch_stride_c [[buffer(8)]],
     constant uint& swizzle_log    [[buffer(9)]],
     device const float* residual   [[buffer(10)]],
+    device const float* norm_weight [[buffer(11)]],
+    device const float* inv_rms    [[buffer(12)]],
+    device const float* gate_result [[buffer(13)]],
     uint3 group_id       [[threadgroup_position_in_grid]],
     uint  tid_in_group   [[thread_index_in_threadgroup]],
     uint  sgid           [[simdgroup_index_in_threadgroup]],
@@ -2311,6 +2380,8 @@ kernel void gemm_mlx_f32(
 {
     threadgroup float As[MLX_BM * MLX_BK];  // 64x16 = 1024 floats = 4KB
     threadgroup float Bs[MLX_BK * MLX_BN];  // 16x64 = 1024 floats = 4KB
+    // TG-cached norm_weight for the current K tile (avoids 64x redundant device reads)
+    threadgroup float norm_w_cache_f32[MLX_BK]; // 16 floats = 64 bytes
 
     const uint batch_idx = group_id.z;
     uint2 swizzled = mlx_swizzle_tg(uint2(group_id.x, group_id.y), swizzle_log);
@@ -2321,6 +2392,7 @@ kernel void gemm_mlx_f32(
     device const float* B_batch = B + batch_idx * mlx_as_uniform(batch_stride_b);
     device float*       C_batch = C + batch_idx * mlx_as_uniform(batch_stride_c);
     device const float* R_batch = has_residual ? (residual + batch_idx * mlx_as_uniform(batch_stride_c)) : nullptr;
+    device const float* G_batch = has_swiglu ? (gate_result + batch_idx * mlx_as_uniform(batch_stride_c)) : nullptr;
 
     // SG grid: 1x2 -- sg_row always 0, sg_col = sgid (0 or 1)
     const uint base_m = 0;        // WM=1, single row of SG
@@ -2344,22 +2416,60 @@ kernel void gemm_mlx_f32(
 
         // Load A tile: 64 threads x 16 elements = 64x16 = BM x BK
         threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Pre-load norm_weight[kb..kb+16] into TG cache (1 thread loads all 16)
+        if (has_norm && tid_in_group == 0) {
+            for (uint d = 0; d < MLX_BK; d++) {
+                norm_w_cache_f32[d] = (kb + d < uK) ? norm_weight[kb + d] : 0.0f;
+            }
+        }
+        if (has_norm) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
         {
             uint a_row = tid_in_group;  // 0..63
             uint gr = row_start + a_row;
             if ((align_M || gr < uM) && kb + 15 < uK) {
-                *reinterpret_cast<threadgroup float4*>(&As[a_row * 16]) =
-                    *reinterpret_cast<device const float4*>(&A_batch[gr * uK + kb]);
-                *reinterpret_cast<threadgroup float4*>(&As[a_row * 16 + 4]) =
-                    *reinterpret_cast<device const float4*>(&A_batch[gr * uK + kb + 4]);
-                *reinterpret_cast<threadgroup float4*>(&As[a_row * 16 + 8]) =
-                    *reinterpret_cast<device const float4*>(&A_batch[gr * uK + kb + 8]);
-                *reinterpret_cast<threadgroup float4*>(&As[a_row * 16 + 12]) =
-                    *reinterpret_cast<device const float4*>(&A_batch[gr * uK + kb + 12]);
+                if (has_norm) {
+                    // Read inv_rms once into register
+                    float row_scale = inv_rms[gr];
+                    // Vectorized float4 load + scale from TG-cached norm_weight
+                    float4 w0 = *reinterpret_cast<threadgroup const float4*>(&norm_w_cache_f32[0]);
+                    float4 w1 = *reinterpret_cast<threadgroup const float4*>(&norm_w_cache_f32[4]);
+                    float4 w2 = *reinterpret_cast<threadgroup const float4*>(&norm_w_cache_f32[8]);
+                    float4 w3 = *reinterpret_cast<threadgroup const float4*>(&norm_w_cache_f32[12]);
+                    float4 a0 = *reinterpret_cast<device const float4*>(&A_batch[gr * uK + kb]);
+                    float4 a1 = *reinterpret_cast<device const float4*>(&A_batch[gr * uK + kb + 4]);
+                    float4 a2 = *reinterpret_cast<device const float4*>(&A_batch[gr * uK + kb + 8]);
+                    float4 a3 = *reinterpret_cast<device const float4*>(&A_batch[gr * uK + kb + 12]);
+                    *reinterpret_cast<threadgroup float4*>(&As[a_row * 16])     = a0 * w0 * row_scale;
+                    *reinterpret_cast<threadgroup float4*>(&As[a_row * 16 + 4]) = a1 * w1 * row_scale;
+                    *reinterpret_cast<threadgroup float4*>(&As[a_row * 16 + 8]) = a2 * w2 * row_scale;
+                    *reinterpret_cast<threadgroup float4*>(&As[a_row * 16 + 12]) = a3 * w3 * row_scale;
+                } else {
+                    *reinterpret_cast<threadgroup float4*>(&As[a_row * 16]) =
+                        *reinterpret_cast<device const float4*>(&A_batch[gr * uK + kb]);
+                    *reinterpret_cast<threadgroup float4*>(&As[a_row * 16 + 4]) =
+                        *reinterpret_cast<device const float4*>(&A_batch[gr * uK + kb + 4]);
+                    *reinterpret_cast<threadgroup float4*>(&As[a_row * 16 + 8]) =
+                        *reinterpret_cast<device const float4*>(&A_batch[gr * uK + kb + 8]);
+                    *reinterpret_cast<threadgroup float4*>(&As[a_row * 16 + 12]) =
+                        *reinterpret_cast<device const float4*>(&A_batch[gr * uK + kb + 12]);
+                }
             } else {
-                for (uint d = 0; d < 16; d++) {
-                    As[a_row * 16 + d] = ((align_M || gr < uM) && kb + d < uK)
-                        ? A_batch[gr * uK + kb + d] : float(0);
+                if (has_norm) {
+                    float row_scale = (align_M || gr < uM) ? inv_rms[gr] : 0.0f;
+                    for (uint d = 0; d < 16; d++) {
+                        As[a_row * 16 + d] = ((align_M || gr < uM) && kb + d < uK)
+                            ? A_batch[gr * uK + kb + d] * row_scale * norm_w_cache_f32[d]
+                            : float(0);
+                    }
+                } else {
+                    for (uint d = 0; d < 16; d++) {
+                        As[a_row * 16 + d] = ((align_M || gr < uM) && kb + d < uK)
+                            ? A_batch[gr * uK + kb + d] : float(0);
+                    }
                 }
             }
         }
@@ -2437,6 +2547,12 @@ kernel void gemm_mlx_f32(
             if (align_M && align_N) {
                 float v0 = elems[0];
                 float v1 = elems[1];
+                if (has_swiglu) {
+                    uint idx0 = gr * uN + gc0;
+                    uint idx1 = gr * uN + gc1;
+                    v0 = stable_silu_f(G_batch[idx0]) * v0;
+                    v1 = stable_silu_f(G_batch[idx1]) * v1;
+                }
                 if (has_residual) {
                     v0 += R_batch[gr * uN + gc0];
                     v1 += R_batch[gr * uN + gc1];
@@ -2446,11 +2562,13 @@ kernel void gemm_mlx_f32(
             } else {
                 if ((align_M || gr < uM) && (align_N || gc0 < uN)) {
                     float v0 = elems[0];
+                    if (has_swiglu) v0 = stable_silu_f(G_batch[gr * uN + gc0]) * v0;
                     if (has_residual) v0 += R_batch[gr * uN + gc0];
                     C_batch[gr * uN + gc0] = v0;
                 }
                 if ((align_M || gr < uM) && (align_N || gc1 < uN)) {
                     float v1 = elems[1];
+                    if (has_swiglu) v1 = stable_silu_f(G_batch[gr * uN + gc1]) * v1;
                     if (has_residual) v1 += R_batch[gr * uN + gc1];
                     C_batch[gr * uN + gc1] = v1;
                 }
@@ -2787,6 +2905,9 @@ kernel void gemm_mlx_bf16(
     constant uint& batch_stride_c [[buffer(8)]],
     constant uint& swizzle_log    [[buffer(9)]],
     device const bfloat* residual  [[buffer(10)]],
+    device const bfloat* norm_weight [[buffer(11)]],
+    device const float* inv_rms    [[buffer(12)]],
+    device const bfloat* gate_result [[buffer(13)]],
     uint3 group_id       [[threadgroup_position_in_grid]],
     uint  tid_in_group   [[thread_index_in_threadgroup]],
     uint  sgid           [[simdgroup_index_in_threadgroup]],
@@ -2794,6 +2915,8 @@ kernel void gemm_mlx_bf16(
 {
     threadgroup bfloat As[MLX_BM * MLX_BK];  // 64x16 = 1024 bfloats = 2KB
     threadgroup bfloat Bs[MLX_BK * MLX_BN];  // 16x64 = 1024 bfloats = 2KB
+    // TG-cached norm_weight for the current K tile (f32 for precision, avoids 64x redundant device reads)
+    threadgroup float norm_w_cache_bf[MLX_BK]; // 16 floats = 64 bytes
 
     const uint batch_idx = group_id.z;
     uint2 swizzled = mlx_swizzle_tg(uint2(group_id.x, group_id.y), swizzle_log);
@@ -2804,6 +2927,7 @@ kernel void gemm_mlx_bf16(
     device const bfloat* B_batch = B + batch_idx * mlx_as_uniform(batch_stride_b);
     device bfloat*       C_batch = C + batch_idx * mlx_as_uniform(batch_stride_c);
     device const bfloat* R_batch = has_residual ? (residual + batch_idx * mlx_as_uniform(batch_stride_c)) : nullptr;
+    device const bfloat* G_batch = has_swiglu ? (gate_result + batch_idx * mlx_as_uniform(batch_stride_c)) : nullptr;
 
     // SG grid: 1x2 -- sg_row always 0, sg_col = sgid (0 or 1)
     const uint base_m = 0;        // WM=1, single row of SG
@@ -2834,18 +2958,46 @@ kernel void gemm_mlx_bf16(
 
         // Load A tile: 64 threads x 16 elements = 64x16 = BM x BK
         threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Pre-load norm_weight[kb..kb+16] into TG cache (1 thread loads all 16)
+        if (has_norm && tid_in_group == 0) {
+            for (uint d = 0; d < MLX_BK; d++) {
+                norm_w_cache_bf[d] = (kb + d < uK) ? float(norm_weight[kb + d]) : 0.0f;
+            }
+        }
+        if (has_norm) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
         {
             uint a_row = tid_in_group;  // 0..63
             uint gr = row_start + a_row;
             if ((align_M || gr < uM) && kb + 15 < uK) {
-                // bfloat4 doesn't exist as a native vector, load element by element in groups
-                for (uint d = 0; d < 16; d++) {
-                    As[a_row * 16 + d] = A_batch[gr * uK + kb + d];
+                if (has_norm) {
+                    // Read inv_rms once into register, norm_weight from TG cache
+                    float row_scale = inv_rms[gr];
+                    for (uint d = 0; d < 16; d++) {
+                        As[a_row * 16 + d] = bfloat(float(A_batch[gr * uK + kb + d])
+                            * row_scale * norm_w_cache_bf[d]);
+                    }
+                } else {
+                    for (uint d = 0; d < 16; d++) {
+                        As[a_row * 16 + d] = A_batch[gr * uK + kb + d];
+                    }
                 }
             } else {
-                for (uint d = 0; d < 16; d++) {
-                    As[a_row * 16 + d] = ((align_M || gr < uM) && kb + d < uK)
-                        ? A_batch[gr * uK + kb + d] : bfloat(0);
+                if (has_norm) {
+                    float row_scale = (align_M || gr < uM) ? inv_rms[gr] : 0.0f;
+                    for (uint d = 0; d < 16; d++) {
+                        As[a_row * 16 + d] = ((align_M || gr < uM) && kb + d < uK)
+                            ? bfloat(float(A_batch[gr * uK + kb + d]) * row_scale * norm_w_cache_bf[d])
+                            : bfloat(0);
+                    }
+                } else {
+                    for (uint d = 0; d < 16; d++) {
+                        As[a_row * 16 + d] = ((align_M || gr < uM) && kb + d < uK)
+                            ? A_batch[gr * uK + kb + d] : bfloat(0);
+                    }
                 }
             }
         }
@@ -2929,24 +3081,32 @@ kernel void gemm_mlx_bf16(
             auto elems = acc[i][j].thread_elements();
 
             if (align_M && align_N) {
-                bfloat v0 = bfloat(elems[0]);
-                bfloat v1 = bfloat(elems[1]);
-                if (has_residual) {
-                    v0 = bfloat(elems[0] + float(R_batch[gr * uN + gc0]));
-                    v1 = bfloat(elems[1] + float(R_batch[gr * uN + gc1]));
+                float fv0 = elems[0];
+                float fv1 = elems[1];
+                if (has_swiglu) {
+                    uint idx0 = gr * uN + gc0;
+                    uint idx1 = gr * uN + gc1;
+                    fv0 = stable_silu_f(float(G_batch[idx0])) * fv0;
+                    fv1 = stable_silu_f(float(G_batch[idx1])) * fv1;
                 }
-                C_batch[gr * uN + gc0] = v0;
-                C_batch[gr * uN + gc1] = v1;
+                if (has_residual) {
+                    fv0 += float(R_batch[gr * uN + gc0]);
+                    fv1 += float(R_batch[gr * uN + gc1]);
+                }
+                C_batch[gr * uN + gc0] = bfloat(fv0);
+                C_batch[gr * uN + gc1] = bfloat(fv1);
             } else {
                 if ((align_M || gr < uM) && (align_N || gc0 < uN)) {
-                    bfloat v0 = bfloat(elems[0]);
-                    if (has_residual) v0 = bfloat(elems[0] + float(R_batch[gr * uN + gc0]));
-                    C_batch[gr * uN + gc0] = v0;
+                    float fv0 = elems[0];
+                    if (has_swiglu) fv0 = stable_silu_f(float(G_batch[gr * uN + gc0])) * fv0;
+                    if (has_residual) fv0 += float(R_batch[gr * uN + gc0]);
+                    C_batch[gr * uN + gc0] = bfloat(fv0);
                 }
                 if ((align_M || gr < uM) && (align_N || gc1 < uN)) {
-                    bfloat v1 = bfloat(elems[1]);
-                    if (has_residual) v1 = bfloat(elems[1] + float(R_batch[gr * uN + gc1]));
-                    C_batch[gr * uN + gc1] = v1;
+                    float fv1 = elems[1];
+                    if (has_swiglu) fv1 = stable_silu_f(float(G_batch[gr * uN + gc1])) * fv1;
+                    if (has_residual) fv1 += float(R_batch[gr * uN + gc1]);
+                    C_batch[gr * uN + gc1] = bfloat(fv1);
                 }
             }
         }
@@ -4119,6 +4279,8 @@ pub fn matmul_align_constants(
         (200, FunctionConstantValue::Bool(m % bm == 0)),
         (201, FunctionConstantValue::Bool(n % bn == 0)),
         (202, FunctionConstantValue::Bool(false)), // has_residual = false
+        (203, FunctionConstantValue::Bool(false)), // has_norm = false
+        (204, FunctionConstantValue::Bool(false)), // has_swiglu = false
     ]
 }
 
@@ -4451,12 +4613,14 @@ pub fn matmul_add_residual_into_cb(
         }
     };
 
-    // Function constants: align_M (200), align_N (201), has_residual (202)
+    // Function constants: align_M (200), align_N (201), has_residual (202), has_norm (203), has_swiglu (204)
     use crate::kernels::FunctionConstantValue;
     let constants = vec![
         (200, FunctionConstantValue::Bool(m % tile.bm == 0)),
         (201, FunctionConstantValue::Bool(n % tile.bn == 0)),
         (202, FunctionConstantValue::Bool(true)),
+        (203, FunctionConstantValue::Bool(false)),
+        (205, FunctionConstantValue::Bool(false)),
     ];
     let pipeline = registry.get_pipeline_with_constants(kernel_name, a.dtype(), &constants)?;
 
@@ -4493,6 +4657,266 @@ pub fn matmul_add_residual_into_cb(
     let grid_y = ceil_div(m, tile.bm) as u64;
     let grid = MTLSize::new(grid_x, grid_y, 1);
     let tg = MTLSize::new(64, 1, 1); // MlxArch = 64 threads
+    enc.dispatch_thread_groups(grid, tg);
+    enc.end_encoding();
+    drop(swizzle_log_buf);
+
+    Ok(out)
+}
+
+/// Fused RMSNorm + GEMM: `C = matmul(RMSNorm(A, norm_weight, eps), B)`.
+///
+/// Encodes two dispatches into an existing command buffer:
+/// 1. `inv_rms` kernel: computes per-row `inv_rms[i] = rsqrt(mean(A[i,:]^2) + eps)`
+/// 2. `gemm_mlx_*`: GEMM with `has_norm=true`, applying norm on-the-fly during A-tile load
+///
+/// This eliminates the separate RMSNorm dispatch and the intermediate normalized tensor,
+/// saving one full read+write of the [M, K] matrix.
+///
+/// **Constraints:**
+/// - Only MlxArch tile variant is supported (M >= 33, N >= 33).
+/// - `norm_weight` must be 1-D of length K with the same dtype as A.
+/// - All inputs must be 2D and contiguous.
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_norm_gemm_into_cb(
+    registry: &KernelRegistry,
+    a: &Array,
+    b: &Array,
+    norm_weight: &Array,
+    eps: f32,
+    cb: &metal::CommandBufferRef,
+) -> Result<Array, KernelError> {
+    // --- Validation ---
+    if a.ndim() != 2 || b.ndim() != 2 {
+        return Err(KernelError::InvalidShape(
+            "matmul_norm_gemm_into_cb requires 2D arrays".to_string(),
+        ));
+    }
+    if a.shape()[1] != b.shape()[0] {
+        return Err(KernelError::InvalidShape(format!(
+            "inner dimensions must match: {} vs {}",
+            a.shape()[1],
+            b.shape()[0]
+        )));
+    }
+    if a.dtype() != b.dtype() || a.dtype() != norm_weight.dtype() {
+        return Err(KernelError::InvalidShape(format!(
+            "dtypes must match: a={:?}, b={:?}, norm_weight={:?}",
+            a.dtype(),
+            b.dtype(),
+            norm_weight.dtype()
+        )));
+    }
+    if norm_weight.ndim() != 1 || norm_weight.shape()[0] != a.shape()[1] {
+        return Err(KernelError::InvalidShape(format!(
+            "norm_weight must be 1D of length K={}, got shape {:?}",
+            a.shape()[1],
+            norm_weight.shape()
+        )));
+    }
+    if !a.is_contiguous() || !b.is_contiguous() {
+        return Err(KernelError::InvalidShape(
+            "matmul_norm_gemm_into_cb: inputs must be contiguous".to_string(),
+        ));
+    }
+
+    let m = a.shape()[0];
+    let k = a.shape()[1];
+    let n = b.shape()[1];
+
+    // Only MlxArch kernels support the norm prologue
+    let tile = select_tile_config_with_dtype(m, n, k, a.dtype());
+    if tile.variant != TileVariant::MlxArch {
+        return Err(KernelError::NotFound(format!(
+            "matmul_norm_gemm_into_cb: only MlxArch tile supported, got {:?} (M={}, N={})",
+            tile.variant, m, n
+        )));
+    }
+
+    // --- Pass 1: compute inv_rms[M] ---
+    let inv_rms = super::rms_norm::compute_inv_rms(registry, a, eps, cb)?;
+
+    // --- Pass 2: GEMM with has_norm=true ---
+    let kernel_name = match a.dtype() {
+        DType::Float16 => "gemm_mlx_f16",
+        DType::Float32 => "gemm_mlx_f32",
+        DType::Bfloat16 => "gemm_mlx_bf16",
+        _ => {
+            return Err(KernelError::NotFound(format!(
+                "matmul_norm_gemm_into_cb: unsupported dtype {:?}",
+                a.dtype()
+            )))
+        }
+    };
+
+    // Function constants: align_M (200), align_N (201), has_residual (202), has_norm (203), has_swiglu (204)
+    use crate::kernels::FunctionConstantValue;
+    let constants = vec![
+        (200, FunctionConstantValue::Bool(m % tile.bm == 0)),
+        (201, FunctionConstantValue::Bool(n % tile.bn == 0)),
+        (202, FunctionConstantValue::Bool(false)), // no residual
+        (203, FunctionConstantValue::Bool(true)),  // has_norm = true
+        (204, FunctionConstantValue::Bool(false)), // no swiglu
+    ];
+    let pipeline = registry.get_pipeline_with_constants(kernel_name, a.dtype(), &constants)?;
+
+    let dev = registry.device().raw();
+    let out = Array::zeros(dev, &[m, n], a.dtype());
+
+    let m_buf = make_u32_buf(dev, super::checked_u32(m, "M")?);
+    let n_buf = make_u32_buf(dev, super::checked_u32(n, "N")?);
+    let k_buf = make_u32_buf(dev, super::checked_u32(k, "K")?);
+    let bsa_buf = make_u32_buf(dev, super::checked_u32(m * k, "batch_stride_a")?);
+    let bsb_buf = make_u32_buf(dev, super::checked_u32(k * n, "batch_stride_b")?);
+    let bsc_buf = make_u32_buf(dev, super::checked_u32(m * n, "batch_stride_c")?);
+
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_buffer(0, Some(a.metal_buffer()), a.offset() as u64);
+    enc.set_buffer(1, Some(b.metal_buffer()), b.offset() as u64);
+    enc.set_buffer(2, Some(out.metal_buffer()), 0);
+    enc.set_buffer(3, Some(&m_buf), 0);
+    enc.set_buffer(4, Some(&n_buf), 0);
+    enc.set_buffer(5, Some(&k_buf), 0);
+    enc.set_buffer(6, Some(&bsa_buf), 0);
+    enc.set_buffer(7, Some(&bsb_buf), 0);
+    enc.set_buffer(8, Some(&bsc_buf), 0);
+
+    let swizzle_log = compute_swizzle_log(m, n, tile.bm, tile.bn);
+    let swizzle_log_buf = make_u32_buf(dev, swizzle_log);
+    enc.set_buffer(9, Some(&swizzle_log_buf), 0);
+
+    // Buffer 10: residual (dummy, not used when has_residual=false)
+    enc.set_buffer(10, Some(out.metal_buffer()), 0);
+    // Buffer 11: norm_weight [K]
+    enc.set_buffer(
+        11,
+        Some(norm_weight.metal_buffer()),
+        norm_weight.offset() as u64,
+    );
+    // Buffer 12: inv_rms [M]
+    enc.set_buffer(12, Some(inv_rms.metal_buffer()), 0);
+
+    let grid_x = ceil_div(n, tile.bn) as u64;
+    let grid_y = ceil_div(m, tile.bm) as u64;
+    let grid = MTLSize::new(grid_x, grid_y, 1);
+    let tg = MTLSize::new(64, 1, 1);
+    enc.dispatch_thread_groups(grid, tg);
+    enc.end_encoding();
+
+    Ok(out)
+}
+
+/// Fused SwiGLU GEMM: `C = silu(gate_result) * matmul(A, B)`.
+///
+/// The up_proj GEMM result is element-wise multiplied with `silu(gate_result)` in the
+/// store epilogue, eliminating the separate silu_gate kernel dispatch.
+///
+/// **Constraints:**
+/// - Only MlxArch tile variant is supported (M >= 33, N >= 33).
+/// - `gate_result` must have shape [M, N] with the same dtype as A.
+/// - All inputs must be 2D and contiguous.
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_swiglu_gemm_into_cb(
+    registry: &KernelRegistry,
+    a: &Array,
+    b: &Array,
+    gate_result: &Array,
+    cb: &metal::CommandBufferRef,
+) -> Result<Array, KernelError> {
+    if a.ndim() != 2 || b.ndim() != 2 {
+        return Err(KernelError::InvalidShape(
+            "matmul_swiglu_gemm_into_cb requires 2D arrays".to_string(),
+        ));
+    }
+    if a.shape()[1] != b.shape()[0] {
+        return Err(KernelError::InvalidShape(format!(
+            "inner dimensions must match: {} vs {}",
+            a.shape()[1],
+            b.shape()[0]
+        )));
+    }
+
+    let m = a.shape()[0];
+    let k = a.shape()[1];
+    let n = b.shape()[1];
+
+    if gate_result.shape() != &[m, n] {
+        return Err(KernelError::InvalidShape(format!(
+            "gate_result shape must be [{}, {}], got {:?}",
+            m,
+            n,
+            gate_result.shape()
+        )));
+    }
+    if a.dtype() != gate_result.dtype() {
+        return Err(KernelError::InvalidShape(format!(
+            "dtypes must match: a={:?}, gate_result={:?}",
+            a.dtype(),
+            gate_result.dtype()
+        )));
+    }
+
+    let tile = select_tile_config_with_dtype(m, n, k, a.dtype());
+    let kernel_name = match a.dtype() {
+        DType::Float16 => "gemm_mlx_f16",
+        DType::Float32 => "gemm_mlx_f32",
+        DType::Bfloat16 => "gemm_mlx_bf16",
+        _ => {
+            return Err(KernelError::NotFound(format!(
+                "matmul_swiglu_gemm_into_cb: unsupported dtype {:?}",
+                a.dtype()
+            )))
+        }
+    };
+
+    use crate::kernels::FunctionConstantValue;
+    let constants = vec![
+        (200, FunctionConstantValue::Bool(m % tile.bm == 0)),
+        (201, FunctionConstantValue::Bool(n % tile.bn == 0)),
+        (202, FunctionConstantValue::Bool(false)), // no residual
+        (203, FunctionConstantValue::Bool(false)), // no norm
+        (204, FunctionConstantValue::Bool(true)),  // has_swiglu = true
+    ];
+    let pipeline = registry.get_pipeline_with_constants(kernel_name, a.dtype(), &constants)?;
+
+    let dev = registry.device().raw();
+    let out = Array::zeros(dev, &[m, n], a.dtype());
+
+    let m_buf = make_u32_buf(dev, super::checked_u32(m, "M")?);
+    let n_buf = make_u32_buf(dev, super::checked_u32(n, "N")?);
+    let k_buf = make_u32_buf(dev, super::checked_u32(k, "K")?);
+    let bsa_buf = make_u32_buf(dev, super::checked_u32(m * k, "batch_stride_a")?);
+    let bsb_buf = make_u32_buf(dev, super::checked_u32(k * n, "batch_stride_b")?);
+    let bsc_buf = make_u32_buf(dev, super::checked_u32(m * n, "batch_stride_c")?);
+
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_buffer(0, Some(a.metal_buffer()), a.offset() as u64);
+    enc.set_buffer(1, Some(b.metal_buffer()), b.offset() as u64);
+    enc.set_buffer(2, Some(out.metal_buffer()), 0);
+    enc.set_buffer(3, Some(&m_buf), 0);
+    enc.set_buffer(4, Some(&n_buf), 0);
+    enc.set_buffer(5, Some(&k_buf), 0);
+    enc.set_buffer(6, Some(&bsa_buf), 0);
+    enc.set_buffer(7, Some(&bsb_buf), 0);
+    enc.set_buffer(8, Some(&bsc_buf), 0);
+
+    let swizzle_log = compute_swizzle_log(m, n, tile.bm, tile.bn);
+    let swizzle_log_buf = make_u32_buf(dev, swizzle_log);
+    enc.set_buffer(9, Some(&swizzle_log_buf), 0);
+
+    // Buffer 13: gate_result [M, N]
+    enc.set_buffer(
+        13,
+        Some(gate_result.metal_buffer()),
+        gate_result.offset() as u64,
+    );
+
+    let grid_x = ceil_div(n, tile.bn) as u64;
+    let grid_y = ceil_div(m, tile.bm) as u64;
+    let grid = MTLSize::new(grid_x, grid_y, 1);
+    let tg = MTLSize::new(64, 1, 1);
     enc.dispatch_thread_groups(grid, tg);
     enc.end_encoding();
     drop(swizzle_log_buf);
@@ -5070,7 +5494,7 @@ mod tests {
     fn test_align_constants_include_has_residual() {
         use crate::kernels::FunctionConstantValue;
         let constants = matmul_align_constants(64, 64, 64, 64);
-        assert_eq!(constants.len(), 3);
+        assert_eq!(constants.len(), 5);
         // index 200: align_M
         assert_eq!(constants[0].0, 200);
         assert!(matches!(constants[0].1, FunctionConstantValue::Bool(true)));
@@ -5080,6 +5504,12 @@ mod tests {
         // index 202: has_residual = false
         assert_eq!(constants[2].0, 202);
         assert!(matches!(constants[2].1, FunctionConstantValue::Bool(false)));
+        // index 203: has_norm = false
+        assert_eq!(constants[3].0, 203);
+        assert!(matches!(constants[3].1, FunctionConstantValue::Bool(false)));
+        // index 204: has_swiglu = false
+        assert_eq!(constants[4].0, 204);
+        assert!(matches!(constants[4].1, FunctionConstantValue::Bool(false)));
     }
 
     #[test]
@@ -5089,6 +5519,8 @@ mod tests {
         assert!(matches!(constants[0].1, FunctionConstantValue::Bool(false))); // 65%64!=0
         assert!(matches!(constants[1].1, FunctionConstantValue::Bool(false))); // 63%64!=0
         assert!(matches!(constants[2].1, FunctionConstantValue::Bool(false))); // always false
+        assert!(matches!(constants[3].1, FunctionConstantValue::Bool(false))); // always false
+        assert!(matches!(constants[4].1, FunctionConstantValue::Bool(false))); // always false
     }
 
     // ── MlxArch tile selection test for residual path ──

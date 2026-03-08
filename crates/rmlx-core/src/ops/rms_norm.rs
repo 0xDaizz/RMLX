@@ -439,6 +439,138 @@ kernel void rms_norm_single_bf16(
         output[base + i] = bfloat(o);
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// inv_rms kernels: compute only inv_rms[row] = 1/rms without normalization.
+// Output: float32 inv_rms vector [rows], one value per row.
+// Used for fused RMSNorm+GEMM where GEMM applies norm on-the-fly.
+// ═══════════════════════════════════════════════════════════════════════════
+
+kernel void inv_rms_f32(
+    device const float* input    [[buffer(0)]],
+    device       float* inv_out  [[buffer(1)]],
+    constant     uint&  axis_size [[buffer(2)]],
+    constant     float& eps      [[buffer(3)]],
+    uint row            [[threadgroup_position_in_grid]],
+    uint tid            [[thread_position_in_threadgroup]],
+    uint tgsize         [[threads_per_threadgroup]],
+    uint simd_lane_id   [[thread_index_in_simdgroup]],
+    uint simd_group_id  [[simdgroup_index_in_threadgroup]])
+{
+    constexpr int SIMD_SIZE = 32;
+    threadgroup float local_sums[SIMD_SIZE];
+    threadgroup float local_inv_rms[1];
+
+    size_t base = size_t(row) * size_t(axis_size);
+
+    float acc = 0.0;
+    for (uint i = tid * N_READS; i < axis_size; i += tgsize * N_READS) {
+        if (i + 3 < axis_size) {
+            float v0 = input[base + i];
+            float v1 = input[base + i + 1];
+            float v2 = input[base + i + 2];
+            float v3 = input[base + i + 3];
+            acc += v0*v0 + v1*v1 + v2*v2 + v3*v3;
+        } else {
+            for (uint j = i; j < min(i + N_READS, axis_size); j++) {
+                float v = input[base + j];
+                acc += v * v;
+            }
+        }
+    }
+
+    float rms = reduce_sum_of_squares(acc, axis_size, eps,
+                                       simd_lane_id, simd_group_id,
+                                       local_sums, local_inv_rms);
+
+    if (tid == 0) {
+        inv_out[row] = rms;
+    }
+}
+
+kernel void inv_rms_f16(
+    device const half*  input    [[buffer(0)]],
+    device       float* inv_out  [[buffer(1)]],
+    constant     uint&  axis_size [[buffer(2)]],
+    constant     float& eps      [[buffer(3)]],
+    uint row            [[threadgroup_position_in_grid]],
+    uint tid            [[thread_position_in_threadgroup]],
+    uint tgsize         [[threads_per_threadgroup]],
+    uint simd_lane_id   [[thread_index_in_simdgroup]],
+    uint simd_group_id  [[simdgroup_index_in_threadgroup]])
+{
+    constexpr int SIMD_SIZE = 32;
+    threadgroup float local_sums[SIMD_SIZE];
+    threadgroup float local_inv_rms[1];
+
+    size_t base = size_t(row) * size_t(axis_size);
+
+    float acc = 0.0;
+    for (uint i = tid * N_READS; i < axis_size; i += tgsize * N_READS) {
+        if (i + 3 < axis_size) {
+            float v0 = float(input[base + i]);
+            float v1 = float(input[base + i + 1]);
+            float v2 = float(input[base + i + 2]);
+            float v3 = float(input[base + i + 3]);
+            acc += v0*v0 + v1*v1 + v2*v2 + v3*v3;
+        } else {
+            for (uint j = i; j < min(i + N_READS, axis_size); j++) {
+                float v = float(input[base + j]);
+                acc += v * v;
+            }
+        }
+    }
+
+    float rms = reduce_sum_of_squares(acc, axis_size, eps,
+                                       simd_lane_id, simd_group_id,
+                                       local_sums, local_inv_rms);
+
+    if (tid == 0) {
+        inv_out[row] = rms;
+    }
+}
+
+kernel void inv_rms_bf16(
+    device const bfloat* input    [[buffer(0)]],
+    device       float*  inv_out  [[buffer(1)]],
+    constant     uint&   axis_size [[buffer(2)]],
+    constant     float&  eps      [[buffer(3)]],
+    uint row            [[threadgroup_position_in_grid]],
+    uint tid            [[thread_position_in_threadgroup]],
+    uint tgsize         [[threads_per_threadgroup]],
+    uint simd_lane_id   [[thread_index_in_simdgroup]],
+    uint simd_group_id  [[simdgroup_index_in_threadgroup]])
+{
+    constexpr int SIMD_SIZE = 32;
+    threadgroup float local_sums[SIMD_SIZE];
+    threadgroup float local_inv_rms[1];
+
+    size_t base = size_t(row) * size_t(axis_size);
+
+    float acc = 0.0;
+    for (uint i = tid * N_READS; i < axis_size; i += tgsize * N_READS) {
+        if (i + 3 < axis_size) {
+            float v0 = float(input[base + i]);
+            float v1 = float(input[base + i + 1]);
+            float v2 = float(input[base + i + 2]);
+            float v3 = float(input[base + i + 3]);
+            acc += v0*v0 + v1*v1 + v2*v2 + v3*v3;
+        } else {
+            for (uint j = i; j < min(i + N_READS, axis_size); j++) {
+                float v = float(input[base + j]);
+                acc += v * v;
+            }
+        }
+    }
+
+    float rms = reduce_sum_of_squares(acc, axis_size, eps,
+                                       simd_lane_id, simd_group_id,
+                                       local_sums, local_inv_rms);
+
+    if (tid == 0) {
+        inv_out[row] = rms;
+    }
+}
 "#;
 
 /// Metal shader source for the fused RMSNorm + residual add kernel.
@@ -1077,6 +1209,62 @@ pub fn rms_norm_kernel_name_for(
     axis_size: usize,
 ) -> Result<&'static str, KernelError> {
     rms_kernel_name(dtype, axis_size)
+}
+
+// ---------------------------------------------------------------------------
+// inv_rms: compute only the inverse-RMS per row (no normalization output)
+// ---------------------------------------------------------------------------
+
+fn inv_rms_kernel_name(dtype: DType) -> Result<&'static str, KernelError> {
+    match dtype {
+        DType::Float32 => Ok("inv_rms_f32"),
+        DType::Float16 => Ok("inv_rms_f16"),
+        DType::Bfloat16 => Ok("inv_rms_bf16"),
+        _ => Err(KernelError::NotFound(format!(
+            "inv_rms not supported for {:?}",
+            dtype
+        ))),
+    }
+}
+
+/// Compute per-row inverse-RMS: `inv_rms[row] = rsqrt(mean(x[row,:]^2) + eps)`.
+///
+/// Returns a 1-D f32 array of shape `[rows]`.
+/// Used internally for fused RMSNorm+GEMM (the GEMM kernel applies norm on-the-fly).
+pub fn compute_inv_rms(
+    registry: &KernelRegistry,
+    input: &Array,
+    eps: f32,
+    cb: &metal::CommandBufferRef,
+) -> Result<Array, KernelError> {
+    if input.ndim() != 2 {
+        return Err(KernelError::InvalidShape(format!(
+            "compute_inv_rms requires 2D input, got {}D",
+            input.ndim()
+        )));
+    }
+
+    let rows = input.shape()[0];
+    let axis_size = super::checked_u32(input.shape()[1], "axis_size")?;
+
+    let kernel_name = inv_rms_kernel_name(input.dtype())?;
+    let pipeline = registry.get_pipeline(kernel_name, input.dtype())?;
+
+    let dev = registry.device().raw();
+    let out = Array::zeros(dev, &[rows], DType::Float32);
+
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
+    enc.set_buffer(1, Some(out.metal_buffer()), 0);
+    enc.set_bytes(2, 4, &axis_size as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(3, 4, &eps as *const f32 as *const std::ffi::c_void);
+
+    let tg_size = std::cmp::min(1024, pipeline.max_total_threads_per_threadgroup());
+    enc.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), MTLSize::new(tg_size, 1, 1));
+    enc.end_encoding();
+
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------

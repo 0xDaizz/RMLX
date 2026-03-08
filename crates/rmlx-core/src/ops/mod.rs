@@ -13,6 +13,7 @@ pub mod gemv;
 pub mod indexing;
 pub mod layer_norm;
 pub mod matmul;
+pub mod moe_kernels;
 pub mod quantized;
 pub mod reduce;
 pub mod rms_norm;
@@ -103,6 +104,7 @@ pub fn register_all(registry: &KernelRegistry) -> Result<(), KernelError> {
     unary::register(registry)?;
     layer_norm::register(registry)?;
     gather_mm::register(registry)?;
+    moe_kernels::register(registry)?;
     topk_route::register(registry)?;
     select::register(registry)?;
     concat::register(registry)?;

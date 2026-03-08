@@ -366,156 +366,136 @@ kernel void affine_qmv_q4(
 }
 
 // -----------------------------------------------------------------------
-// affine_qmv_fast_q4: MLX qdot-pattern Q4 fast QMV kernel.
+// affine_qmv_fast_q4: MLX qmv_fast_impl port for Q4.
 //
-// Key optimizations over affine_qmv_q4:
-// - Each thread processes VALS_PER_THREAD (=8) Q4 values per inner step
-// - uint16 vectorized loads with 4-nibble mask extraction (qdot pattern)
-// - Pre-scaled x accumulation: x_thread tracks x/scale and x/bias
-//   contributions separately via group_dot and group_xsum
-// - Multiple simdgroups cooperate on each output row via simd_sum +
-//   threadgroup reduction
+// Faithfully ports MLX's load_vector + qdot pattern:
+// 1. load_vector pre-divides x by powers of 16 so that qdot can use
+//    mask-only multiplication (no shift needed per nibble).
+// 2. Multi-row: 2 simdgroups × 4 rows = 8 output rows per threadgroup.
+// 3. K-striding: each thread processes values_per_thread=16 elements per
+//    k-step, block_size = 16 × 32 = 512 elements per step across the TG.
 //
-// Each threadgroup handles one output row.
-// Thread mapping: threads stride across groups within the row.
+// Q4 constants (from MLX):
+//   pack_factor = 8 (32/4), packs_per_thread = 2
+//   values_per_thread = 16, block_size = 512
+//   bytes_per_pack = 4 (one uint32 per pack)
 // -----------------------------------------------------------------------
 
-constant constexpr uint QMV_FAST_Q4_VALS_PER_THREAD = 8;
+constant constexpr int QMV_Q4_NUM_SIMDGROUPS = 2;
+constant constexpr int QMV_Q4_RESULTS_PER_SG = 4;
+constant constexpr int QMV_Q4_PACKS_PER_THREAD = 2;
+constant constexpr int QMV_Q4_PACK_FACTOR = 8;   // 32 / 4
+constant constexpr int QMV_Q4_VALUES_PER_THREAD = QMV_Q4_PACK_FACTOR * QMV_Q4_PACKS_PER_THREAD; // 16
+constant constexpr int QMV_Q4_BLOCK_SIZE = QMV_Q4_VALUES_PER_THREAD * 32; // 512
 
 kernel void affine_qmv_fast_q4(
-    device const uint16_t* weights  [[buffer(0)]],
+    device const uint32_t* weights  [[buffer(0)]],
     device const float*    scales   [[buffer(1)]],
     device const float*    biases   [[buffer(2)]],
     device const float*    vec      [[buffer(3)]],
     device float*          output   [[buffer(4)]],
     constant uint4&        params   [[buffer(5)]],
-    uint row        [[threadgroup_position_in_grid]],
+    uint3 tgid      [[threadgroup_position_in_grid]],
     uint simd_gid   [[simdgroup_index_in_threadgroup]],
-    uint simd_lid   [[thread_index_in_simdgroup]],
-    uint simd_count [[simdgroups_per_threadgroup]])
+    uint simd_lid   [[thread_index_in_simdgroup]])
 {
-    const uint out_features = params.x;
-    const uint in_features  = params.y;
-    const uint group_size   = params.z;
+    const int out_features = int(params.x);
+    const int in_features  = int(params.y);
+    const int group_size   = int(params.z);
     // bits == 4
 
-    if (row >= out_features) return;
+    // bytes_per_pack for Q4 = 4 (one uint32 = 8 nibbles)
+    const int in_vec_size_w = in_features / QMV_Q4_PACK_FACTOR;  // uint32s per row
+    const int in_vec_size_g = in_features / group_size;           // groups per row
+    const int scale_step    = group_size / QMV_Q4_VALUES_PER_THREAD;
 
-    // 4 nibbles per uint16 → group_size/4 uint16 words per group
-    const uint words_per_group = group_size / 4u;
-    const uint groups_per_row  = in_features / group_size;
-    const uint words_per_row   = groups_per_row * words_per_group;
+    const int out_row = int(tgid.y) * (QMV_Q4_NUM_SIMDGROUPS * QMV_Q4_RESULTS_PER_SG)
+                      + simd_gid * QMV_Q4_RESULTS_PER_SG;
 
-    const uint tid = simd_gid * 32u + simd_lid;
-    const uint tg_size = simd_count * 32u;
+    if (out_row >= out_features) return;
 
-    float accum = 0.0f;
+    // Pointer setup: each thread starts at its slice of K
+    device const uint8_t* ws = (device const uint8_t*)(weights)
+        + out_row * in_vec_size_w * 4      // row offset in bytes
+        + simd_lid * QMV_Q4_PACKS_PER_THREAD * 4;  // thread offset in bytes
+    device const float* sl = scales + out_row * in_vec_size_g
+        + simd_lid / scale_step;
+    device const float* bl = biases + out_row * in_vec_size_g
+        + simd_lid / scale_step;
+    device const float* x  = vec + simd_lid * QMV_Q4_VALUES_PER_THREAD;
 
-    device const uint16_t* row_weights = weights + row * words_per_row;
-    device const float*    row_scales  = scales  + row * groups_per_row;
-    device const float*    row_biases  = biases  + row * groups_per_row;
+    float result[QMV_Q4_RESULTS_PER_SG] = {0, 0, 0, 0};
 
-    // Each thread strides across groups
-    for (uint g = tid; g < groups_per_row; g += tg_size) {
-        float scale = row_scales[g];
-        float bias  = row_biases[g];
+    for (int k = 0; k < in_features; k += QMV_Q4_BLOCK_SIZE) {
+        // --- load_vector: pre-divide x for Q4 qdot ---
+        // For Q4, groups of 4 values: x[0], x[1]/16, x[2]/256, x[3]/4096
+        float x_thread[QMV_Q4_VALUES_PER_THREAD];
+        float xsum = 0.0f;
 
-        float group_dot = 0.0f;
-        float group_xsum = 0.0f;
-
-        uint base_elem = g * group_size;
-        device const uint16_t* ws = row_weights + g * words_per_group;
-        device const float*    x  = vec + base_elem;
-
-        // Process QMV_FAST_Q4_VALS_PER_THREAD (8) values per iteration
-        // = 2 uint16 words (4 nibbles each)
-        const uint words_per_step = QMV_FAST_Q4_VALS_PER_THREAD / 4u;
-        const uint num_steps = words_per_group / words_per_step;
-
-        for (uint s = 0; s < num_steps; s++) {
-            uint w_off = s * words_per_step;
-            uint x_off = s * QMV_FAST_Q4_VALS_PER_THREAD;
-
-            // qdot pattern: load 2 uint16 words, extract 4 nibbles each
-            uint16_t w0 = ws[w_off];
-            uint16_t w1 = ws[w_off + 1u];
-
-            // Load 8 x values
-            float x0 = x[x_off];
-            float x1 = x[x_off + 1u];
-            float x2 = x[x_off + 2u];
-            float x3 = x[x_off + 3u];
-            float x4 = x[x_off + 4u];
-            float x5 = x[x_off + 5u];
-            float x6 = x[x_off + 6u];
-            float x7 = x[x_off + 7u];
-
-            // qdot: nibble extraction via masks (MLX pattern)
-            group_dot += float(w0 & 0x000Fu) * x0;
-            group_dot += float((w0 >> 4u)  & 0x000Fu) * x1;
-            group_dot += float((w0 >> 8u)  & 0x000Fu) * x2;
-            group_dot += float((w0 >> 12u) & 0x000Fu) * x3;
-
-            group_dot += float(w1 & 0x000Fu) * x4;
-            group_dot += float((w1 >> 4u)  & 0x000Fu) * x5;
-            group_dot += float((w1 >> 8u)  & 0x000Fu) * x6;
-            group_dot += float((w1 >> 12u) & 0x000Fu) * x7;
-
-            group_xsum += x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7;
+        for (int i = 0; i < QMV_Q4_VALUES_PER_THREAD; i += 4) {
+            float v0 = x[i];
+            float v1 = x[i + 1];
+            float v2 = x[i + 2];
+            float v3 = x[i + 3];
+            xsum += v0 + v1 + v2 + v3;
+            x_thread[i]     = v0;
+            x_thread[i + 1] = v1 / 16.0f;
+            x_thread[i + 2] = v2 / 256.0f;
+            x_thread[i + 3] = v3 / 4096.0f;
         }
 
-        // Handle remaining words (when words_per_group is not multiple of words_per_step)
-        for (uint w = num_steps * words_per_step; w < words_per_group; w++) {
-            uint16_t word = ws[w];
-            uint elem = w * 4u;
-            float q0 = float(word & 0x000Fu);
-            float q1 = float((word >> 4u)  & 0x000Fu);
-            float q2 = float((word >> 8u)  & 0x000Fu);
-            float q3 = float((word >> 12u) & 0x000Fu);
+        // --- qdot for each output row ---
+        for (int row = 0; row < QMV_Q4_RESULTS_PER_SG; row++) {
+            device const uint8_t* wl = ws + row * in_vec_size_w * 4;
+            float s = sl[row * in_vec_size_g];
+            float b = bl[row * in_vec_size_g];
 
-            float xv0 = x[elem];
-            float xv1 = x[elem + 1u];
-            float xv2 = x[elem + 2u];
-            float xv3 = x[elem + 3u];
-
-            group_dot  += q0 * xv0 + q1 * xv1 + q2 * xv2 + q3 * xv3;
-            group_xsum += xv0 + xv1 + xv2 + xv3;
+            if (row + out_row < out_features) {
+                // qdot Q4: cast to uint16_t*, mask-only multiplication
+                device const uint16_t* wp = (device const uint16_t*)wl;
+                float accum = 0.0f;
+                for (int i = 0; i < QMV_Q4_VALUES_PER_THREAD / 4; i++) {
+                    accum += x_thread[4 * i]     * float(wp[i] & 0x000fu)
+                           + x_thread[4 * i + 1] * float(wp[i] & 0x00f0u)
+                           + x_thread[4 * i + 2] * float(wp[i] & 0x0f00u)
+                           + x_thread[4 * i + 3] * float(wp[i] & 0xf000u);
+                }
+                result[row] += s * accum + xsum * b;
+            }
         }
 
-        accum += scale * group_dot + bias * group_xsum;
+        // Advance pointers by block_size
+        ws += QMV_Q4_BLOCK_SIZE / QMV_Q4_PACK_FACTOR * 4;  // bytes
+        sl += QMV_Q4_BLOCK_SIZE / group_size;
+        bl += QMV_Q4_BLOCK_SIZE / group_size;
+        x  += QMV_Q4_BLOCK_SIZE;
     }
 
-    // SIMD reduction
-    accum = simd_sum(accum);
-
-    threadgroup float simd_sums[32];
-    if (simd_lid == 0) {
-        simd_sums[simd_gid] = accum;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (simd_gid == 0) {
-        float val = (simd_lid < simd_count) ? simd_sums[simd_lid] : 0.0f;
-        val = simd_sum(val);
-        if (simd_lid == 0) {
-            output[row] = val;
+    // simd_sum reduction + direct write (no threadgroup reduction needed)
+    for (int row = 0; row < QMV_Q4_RESULTS_PER_SG; row++) {
+        result[row] = simd_sum(result[row]);
+        if (simd_lid == 0 && out_row + row < out_features) {
+            output[out_row + row] = result[row];
         }
     }
 }
 
 // -----------------------------------------------------------------------
-// affine_qmv_fast_q8: Vectorized Q8 QMV kernel.
+// affine_qmv_fast_q8: MLX qmv_fast_impl port for Q8.
 //
-// Q8 stores 1 byte per quantized value (no bit packing needed).
-// Key optimizations:
-// - uchar4 vectorized loads (4 bytes at a time)
-// - Direct float conversion + FMA (no bit extraction overhead)
-// - Same simd_sum + threadgroup reduction pattern
-//
-// Each threadgroup handles one output row.
+// Same multi-row + K-striding structure as Q4.
+// Q8 constants:
+//   pack_factor = 4 (32/8), packs_per_thread = 2
+//   values_per_thread = 8, block_size = 256
+//   bytes_per_pack = 4 (one uint32 = 4 bytes)
 // -----------------------------------------------------------------------
 
-constant constexpr uint QMV_FAST_Q8_VALS_PER_THREAD = 8;
+constant constexpr int QMV_Q8_NUM_SIMDGROUPS = 2;
+constant constexpr int QMV_Q8_RESULTS_PER_SG = 4;
+constant constexpr int QMV_Q8_PACKS_PER_THREAD = 2;
+constant constexpr int QMV_Q8_PACK_FACTOR = 4;   // 32 / 8
+constant constexpr int QMV_Q8_VALUES_PER_THREAD = QMV_Q8_PACK_FACTOR * QMV_Q8_PACKS_PER_THREAD; // 8
+constant constexpr int QMV_Q8_BLOCK_SIZE = QMV_Q8_VALUES_PER_THREAD * 32; // 256
 
 kernel void affine_qmv_fast_q8(
     device const uint8_t*  weights  [[buffer(0)]],
@@ -524,91 +504,72 @@ kernel void affine_qmv_fast_q8(
     device const float*    vec      [[buffer(3)]],
     device float*          output   [[buffer(4)]],
     constant uint4&        params   [[buffer(5)]],
-    uint row        [[threadgroup_position_in_grid]],
+    uint3 tgid      [[threadgroup_position_in_grid]],
     uint simd_gid   [[simdgroup_index_in_threadgroup]],
-    uint simd_lid   [[thread_index_in_simdgroup]],
-    uint simd_count [[simdgroups_per_threadgroup]])
+    uint simd_lid   [[thread_index_in_simdgroup]])
 {
-    const uint out_features = params.x;
-    const uint in_features  = params.y;
-    const uint group_size   = params.z;
+    const int out_features = int(params.x);
+    const int in_features  = int(params.y);
+    const int group_size   = int(params.z);
     // bits == 8
 
-    if (row >= out_features) return;
+    const int in_vec_size_w = in_features;            // 1 byte per element
+    const int in_vec_size_g = in_features / group_size;
+    const int scale_step    = group_size / QMV_Q8_VALUES_PER_THREAD;
 
-    // Q8: 1 byte per element, but MLX affine format packs 32/8 = 4 values per uint32
-    // We read raw bytes via uint8_t* pointer.
-    // bytes_per_row = in_features (1 byte per element)
-    const uint bytes_per_row   = in_features;
-    const uint groups_per_row  = in_features / group_size;
+    const int out_row = int(tgid.y) * (QMV_Q8_NUM_SIMDGROUPS * QMV_Q8_RESULTS_PER_SG)
+                      + simd_gid * QMV_Q8_RESULTS_PER_SG;
 
-    const uint tid = simd_gid * 32u + simd_lid;
-    const uint tg_size = simd_count * 32u;
+    if (out_row >= out_features) return;
 
-    float accum = 0.0f;
+    device const uint8_t* ws = weights
+        + out_row * in_vec_size_w
+        + simd_lid * QMV_Q8_PACKS_PER_THREAD * 4;  // 4 bytes per pack (uint32)
+    device const float* sl = scales + out_row * in_vec_size_g
+        + simd_lid / scale_step;
+    device const float* bl = biases + out_row * in_vec_size_g
+        + simd_lid / scale_step;
+    device const float* x  = vec + simd_lid * QMV_Q8_VALUES_PER_THREAD;
 
-    device const uint8_t* row_weights = weights + row * bytes_per_row;
-    device const float*   row_scales  = scales  + row * groups_per_row;
-    device const float*   row_biases  = biases  + row * groups_per_row;
+    float result[QMV_Q8_RESULTS_PER_SG] = {0, 0, 0, 0};
 
-    for (uint g = tid; g < groups_per_row; g += tg_size) {
-        float scale = row_scales[g];
-        float bias  = row_biases[g];
+    for (int k = 0; k < in_features; k += QMV_Q8_BLOCK_SIZE) {
+        // --- load_vector Q8: just load and sum ---
+        float x_thread[QMV_Q8_VALUES_PER_THREAD];
+        float xsum = 0.0f;
 
-        float group_dot = 0.0f;
-        float group_xsum = 0.0f;
-
-        uint base_elem = g * group_size;
-        device const uint8_t* ws = row_weights + base_elem;
-        device const float*   x  = vec + base_elem;
-
-        // Process 4 bytes at a time via uchar4 (vectorized load)
-        const uint vec4_count = group_size / 4u;
-        device const uchar4* ws4 = (device const uchar4*)ws;
-
-        for (uint i = 0; i < vec4_count; i++) {
-            uchar4 packed = ws4[i];
-            uint x_off = i * 4u;
-
-            float q0 = float(packed.x);
-            float q1 = float(packed.y);
-            float q2 = float(packed.z);
-            float q3 = float(packed.w);
-
-            float x0 = x[x_off];
-            float x1 = x[x_off + 1u];
-            float x2 = x[x_off + 2u];
-            float x3 = x[x_off + 3u];
-
-            group_dot  += q0 * x0 + q1 * x1 + q2 * x2 + q3 * x3;
-            group_xsum += x0 + x1 + x2 + x3;
+        for (int i = 0; i < QMV_Q8_VALUES_PER_THREAD; i++) {
+            float v = x[i];
+            xsum += v;
+            x_thread[i] = v;
         }
 
-        // Handle remaining elements (when group_size not multiple of 4)
-        for (uint i = vec4_count * 4u; i < group_size; i++) {
-            float q = float(ws[i]);
-            float xv = x[i];
-            group_dot  += q * xv;
-            group_xsum += xv;
+        // --- qdot Q8 for each output row ---
+        for (int row = 0; row < QMV_Q8_RESULTS_PER_SG; row++) {
+            device const uint8_t* wl = ws + row * in_vec_size_w;
+            float s = sl[row * in_vec_size_g];
+            float b = bl[row * in_vec_size_g];
+
+            if (row + out_row < out_features) {
+                float accum = 0.0f;
+                for (int i = 0; i < QMV_Q8_VALUES_PER_THREAD; i++) {
+                    accum += x_thread[i] * float(wl[i]);
+                }
+                result[row] += s * accum + xsum * b;
+            }
         }
 
-        accum += scale * group_dot + bias * group_xsum;
+        ws += QMV_Q8_BLOCK_SIZE;  // 1 byte per element
+        sl += QMV_Q8_BLOCK_SIZE / group_size;
+        bl += QMV_Q8_BLOCK_SIZE / group_size;
+        x  += QMV_Q8_BLOCK_SIZE;
     }
 
-    // SIMD reduction
-    accum = simd_sum(accum);
-
-    threadgroup float simd_sums[32];
-    if (simd_lid == 0) {
-        simd_sums[simd_gid] = accum;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (simd_gid == 0) {
-        float val = (simd_lid < simd_count) ? simd_sums[simd_lid] : 0.0f;
-        val = simd_sum(val);
-        if (simd_lid == 0) {
-            output[row] = val;
+    // simd_sum reduction + direct write
+    for (int row = 0; row < QMV_Q8_RESULTS_PER_SG; row++) {
+        result[row] = simd_sum(result[row]);
+        if (simd_lid == 0 && out_row + row < out_features) {
+            output[out_row + row] = result[row];
         }
     }
 }
@@ -799,17 +760,16 @@ pub fn affine_quantized_matmul(
     enc.set_buffer(4, Some(out.metal_buffer()), 0);
     enc.set_buffer(5, Some(&params_buf), 0);
 
-    let max_tg = pipeline.max_total_threads_per_threadgroup();
-    // Use up to 256 threads (8 simdgroups of 32). The kernel uses simd_sum
-    // so we need the threadgroup size to be a multiple of 32.
-    let tg = std::cmp::min(256, max_tg);
-    // Round down to multiple of 32 (simdgroup width on Apple GPU).
-    let tg = (tg / 32) * 32;
-    let tg = std::cmp::max(tg, 32); // at least one simdgroup
+    // MLX qmv_fast layout: 2 simdgroups × 4 rows = 8 rows per threadgroup.
+    // Threadgroup size = 2 × 32 = 64 threads.
+    // Grid: (1, ceil(out_features / 8), 1)
+    let rows_per_tg: u64 = 8; // NUM_SIMDGROUPS(2) * RESULTS_PER_SG(4)
+    let num_tgs_y = (qw.out_features as u64).div_ceil(rows_per_tg);
+    let tg_size: u64 = 64; // 2 simdgroups × 32
 
     enc.dispatch_thread_groups(
-        metal::MTLSize::new(qw.out_features as u64, 1, 1),
-        metal::MTLSize::new(tg, 1, 1),
+        metal::MTLSize::new(1, num_tgs_y, 1),
+        metal::MTLSize::new(tg_size, 1, 1),
     );
     enc.end_encoding();
     super::commit_with_mode(cb, super::ExecMode::Sync);
@@ -1472,243 +1432,921 @@ kernel void affine_qmm(
 // Metal shader source -- simdgroup MMA-based Q4 QMM kernel
 // ---------------------------------------------------------------------------
 
-/// High-performance Q4 QMM kernel using simdgroup MMA (8x8 fragments).
+/// MLX-architecture Q4 QMM kernel using simdgroup MMA (8x8 fragments).
 ///
-/// Architecture:
-/// - Tile: BM=32, BN=32, BK=32
-/// - 2 simdgroups per threadgroup (64 threads total)
-/// - Dequant-in-loader: Q4 uint8 → half in threadgroup memory
-/// - f32 accumulation via simdgroup_matrix<float, 8, 8>
-/// - Double-buffered threadgroup memory for A tile (ping-pong)
+/// Architecture (matches gemm_mlx_f16 for maximum occupancy):
+/// - Tile: BM=64, BN=64, BK=16
+/// - 2 simdgroups per threadgroup (64 threads total), ~4KB TG memory
+/// - Q4 dequant in B loader: uint8 nibble → half in threadgroup memory
+/// - f32 accumulation, serpentine MMA, direct register→device store
+/// - Single-buffered (low TG memory → high occupancy)
+///
+/// M3 Ultra-specific optimizations beyond MLX:
+/// - `fc_group_size` (204): function constant → compile-time division elimination
+/// - `has_norm` (203): RMSNorm fusion in A loader (eliminates separate norm kernel)
+/// - Vectorized uchar4 B loads: 4 bytes → 4 halves per load iteration
 /// - Function constants for alignment-based bounds check elimination
 pub const QMM_MMA_SHADER_SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
-
-// Function constants for compile-time bounds check elimination
-constant bool align_M [[function_constant(200)]];
-constant bool align_N [[function_constant(201)]];
-
-// Tile dimensions
-constant constexpr uint BM = 32;
-constant constexpr uint BN = 32;
-constant constexpr uint BK = 32;
-
-// Each threadgroup has 2 simdgroups × 32 threads = 64 threads
-constant constexpr uint THREADGROUP_SIZE = 64;
-constant constexpr uint SIMDGROUPS_PER_TG = 2;
-
-// -----------------------------------------------------------------------
-// affine_qmm_mma_q4: Simdgroup MMA-based Q4 quantized matrix-matrix multiply.
+// ---------------------------------------------------------------------------
+// MLX-architecture Q4 QMM: BM=64, BN=64, BK=16, 2 SG (1x2), 64 threads.
+//
+// Same architecture as gemm_mlx_f16 (which achieves 23.82T for fp16 GEMM)
+// but with B loader replaced by Q4 dequant.
+//
+// M3 Ultra-specific optimizations beyond MLX:
+//   1. group_size as function constant → compile-time division elimination
+//   2. has_norm fusion → RMSNorm applied on-the-fly during A load
+//   3. Vectorized uchar4 B loads → 4 bytes → 8 halves per load
+//   4. Scale/bias hoisted outside inner N loop (constant within group)
 //
 // Computes: output[m, n] = sum_k x[m, k] * dequant(w[n, k])
-//
-// where dequant(q_i) = scales[n, group] * q_i + biases[n, group]
-// and q_i is a 4-bit value packed 2 per byte in w_packed.
-//
-// Weight layout: w_packed is [N, K/2] row-major (uint8), where weight
-// row n has K/2 bytes. Each byte holds 2 Q4 values (low nibble first).
-//
-// For MMA, we need A=[BM, BK] from x and B=[BK, BN] from W^T.
-// Since W is [N, K] (row = output feature), B[k, n] = W[n, k].
-// We dequantize W[n, k_range] into threadgroup memory transposed as B[k, n].
-//
-// Buffers:
-//   buffer(0) x         - float32 input activations [M, K], row-major
-//   buffer(1) w_packed  - uint8 packed Q4 weights [N, K/2], row-major
-//   buffer(2) scales    - float32 per-group scales [N, groups_per_row]
-//   buffer(3) biases    - float32 per-group biases [N, groups_per_row]
-//   buffer(4) output    - float32 output [M, N], row-major
-//   buffer(5) params    - uint4: (M, N, K, group_size)
-//
-// Grid: 2D — (ceil(N/BN), ceil(M/BM), 1) threadgroups
-//   Each threadgroup computes a BM x BN tile of the output.
-// -----------------------------------------------------------------------
+//   When has_norm=true: x[m, k] is replaced by x[m,k] * inv_rms[m] * norm_weight[k]
+// Weight layout: w_packed[n, k/2] (Q4: 2 values per byte, low nibble first)
+// Grid: (ceil(N/64), ceil(M/64), 1) threadgroups, 64 threads each
+// ---------------------------------------------------------------------------
+
+constant constexpr uint QBM = 64;
+constant constexpr uint QBN = 64;
+constant constexpr uint QBK = 16;
+constant constexpr uint QTM = 8;   // BM / 8 = 64/8
+constant constexpr uint QTN = 4;   // (BN/2) / 8 = 32/8
+
+constant bool align_M [[function_constant(200)]];
+constant bool align_N [[function_constant(201)]];
+constant bool has_residual [[function_constant(202)]];
+constant bool has_norm [[function_constant(203)]];
+constant bool has_swiglu [[function_constant(204)]];
+// group_size as function constant: eliminates division in dequant inner loop
+constant uint fc_group_size [[function_constant(205)]];
+
+// Stable SiLU for use in epilogue fusion
+inline float q_silu_f(float x) {
+    return x / (1.0f + exp(-x));
+}
+
+#if __METAL_VERSION__ >= 310
+template <typename T>
+METAL_FUNC uniform<T> q_as_uniform(T val) {
+    return make_uniform(val);
+}
+#else
+template <typename T>
+METAL_FUNC T q_as_uniform(T val) {
+    return val;
+}
+#endif
+
+inline uint2 q_swizzle_tg(uint2 tid, uint swizzle_log) {
+    if (swizzle_log == 0) return tid;
+    return uint2(
+        tid.x >> swizzle_log,
+        (tid.y << swizzle_log) | (tid.x & ((1u << swizzle_log) - 1u))
+    );
+}
+
 kernel void affine_qmm_mma_q4(
     device const float*   x         [[buffer(0)]],
     device const uint8_t* w_packed  [[buffer(1)]],
     device const float*   scales    [[buffer(2)]],
     device const float*   biases    [[buffer(3)]],
     device float*         output    [[buffer(4)]],
-    constant uint4&       params    [[buffer(5)]],
+    constant uint&        M         [[buffer(5)]],
+    constant uint&        N         [[buffer(6)]],
+    constant uint&        K         [[buffer(7)]],
+    constant uint&        swizzle_log [[buffer(8)]],
+    device const half* norm_weight  [[buffer(9)]],
+    device const float* inv_rms    [[buffer(10)]],
+    device const float* residual    [[buffer(11)]],
+    device const float* gate_result [[buffer(12)]],
     uint3 group_id        [[threadgroup_position_in_grid]],
     uint  tid_in_group    [[thread_index_in_threadgroup]],
-    uint  simd_gid        [[simdgroup_index_in_threadgroup]],
-    uint  simd_lid        [[thread_index_in_simdgroup]])
+    uint  sgid            [[simdgroup_index_in_threadgroup]],
+    uint  lane_id         [[thread_index_in_simdgroup]])
 {
-    const uint M          = params.x;
-    const uint N          = params.y;
-    const uint K          = params.z;
-    const uint group_size = params.w;
+    threadgroup half As[QBM * QBK];  // 64x16 = 1024 halves = 2KB
+    threadgroup half Bs[QBK * QBN];  // 16x64 = 1024 halves = 2KB  (total ~4KB)
 
-    const uint groups_per_row = K / group_size;
-    const uint half_k = K / 2;  // bytes per weight row
+    uint2 swizzled = q_swizzle_tg(uint2(group_id.x, group_id.y), swizzle_log);
+    const uint row_start = swizzled.y * q_as_uniform(QBM);
+    const uint col_start = swizzled.x * q_as_uniform(QBN);
 
-    // Tile origin in output space
-    const uint tile_m = group_id.y * BM;
-    const uint tile_n = group_id.x * BN;
+    const uint uK = q_as_uniform(K);
+    const uint uM = q_as_uniform(M);
+    const uint uN = q_as_uniform(N);
+    // fc_group_size is a function constant — division by it becomes shift/multiply
+    const uint groups_per_row = uK / fc_group_size;
+    const uint half_k = uK / 2;
 
-    // Early exit for entirely out-of-bounds threadgroups
-    if (!align_M && tile_m >= M) return;
-    if (!align_N && tile_n >= N) return;
+    // SG grid: 1x2 -- sg_row always 0, sg_col = sgid (0 or 1)
+    const uint base_n = sgid * 32; // each SG covers 32 cols
 
-    // ------------------------------------------------------------------
-    // Threadgroup shared memory (double-buffered for A, single for B)
-    // A: [BM, BK] half — loaded from x (f32 → half conversion)
-    // B: [BK, BN] half — dequantized from w_packed (transposed)
-    // Double buffering: 2 × BM × BK + 2 × BK × BN halfs
-    // = 2 × 32 × 32 + 2 × 32 × 32 = 4096 halfs = 8192 bytes
-    // ------------------------------------------------------------------
-    threadgroup half As[2][BM * BK];  // ping-pong A tiles
-    threadgroup half Bs[2][BK * BN];  // ping-pong B tiles
+    simdgroup_float8x8 acc[QTM][QTN];
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < QTM; i++)
+        #pragma clang loop unroll(full)
+        for (uint j = 0; j < QTN; j++)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
 
-    // ------------------------------------------------------------------
-    // Accumulator fragments: each simdgroup computes a 16×16 sub-tile
-    // using 2×2 grid of 8×8 MMA fragments.
-    //
-    // simdgroup 0 → rows [0..16), simdgroup 1 → rows [16..32)
-    // Each simdgroup covers all BN=32 columns via 4 column fragments (0..8, 8..16, 16..24, 24..32)
-    // ------------------------------------------------------------------
-    simdgroup_matrix<float, 8, 8> acc[2][4];  // [2 row frags][4 col frags]
-    for (uint i = 0; i < 2; i++)
-        for (uint j = 0; j < 4; j++)
-            acc[i][j] = simdgroup_matrix<float, 8, 8>(0);
+    const uint n_tiles = (uK + QBK - 1) / QBK;
 
-    const uint num_k_tiles = (K + BK - 1) / BK;
+    // -- Main loop: single-buffered --
+    for (uint tile = 0; tile < n_tiles; tile++) {
+        uint kb = tile * QBK;
 
-    // ------------------------------------------------------------------
-    // Inline tile loaders (Metal does not support C++ lambdas)
-    // ------------------------------------------------------------------
-
-    // Macro: load A tile [BM, BK] from x (f32 → half)
-    // 64 threads load 32×32 = 1024 elements → 16 elements per thread
-    #define LOAD_A(BUF, K_BASE) \
-        for (uint idx_a = tid_in_group; idx_a < BM * BK; idx_a += THREADGROUP_SIZE) { \
-            uint row_a = idx_a / BK; \
-            uint col_a = idx_a % BK; \
-            uint gm_a = tile_m + row_a; \
-            uint gk_a = (K_BASE) + col_a; \
-            half val_a = 0.0h; \
-            if (align_M || gm_a < M) { \
-                if (gk_a < K) { \
-                    val_a = half(x[gm_a * K + gk_a]); \
-                } \
-            } \
-            As[(BUF)][row_a * BK + col_a] = val_a; \
-        }
-
-    // Macro: load B tile [BK, BN] from w_packed (Q4 dequant, transposed)
-    //
-    // W is [N, K] row-major. We need B[k, n] = dequant(W[n, k]).
-    // Dequant: val = scale * q + bias, where q = 4-bit nibble from w_packed.
-    #define LOAD_B(BUF, K_BASE) \
-        for (uint idx_b = tid_in_group; idx_b < BK * BN; idx_b += THREADGROUP_SIZE) { \
-            uint kl_b = idx_b / BN; \
-            uint nl_b = idx_b % BN; \
-            uint gk_b = (K_BASE) + kl_b; \
-            uint gn_b = tile_n + nl_b; \
-            half val_b = 0.0h; \
-            if (align_N || gn_b < N) { \
-                if (gk_b < K) { \
-                    uint byte_idx_b = gk_b / 2; \
-                    uint nibble_idx_b = gk_b % 2; \
-                    uint8_t packed_b = w_packed[gn_b * half_k + byte_idx_b]; \
-                    uint q_b = nibble_idx_b == 0 ? (packed_b & 0x0F) : ((packed_b >> 4) & 0x0F); \
-                    uint group_idx_b = gk_b / group_size; \
-                    float scale_b = scales[gn_b * groups_per_row + group_idx_b]; \
-                    float bias_b  = biases[gn_b * groups_per_row + group_idx_b]; \
-                    val_b = half(scale_b * float(q_b) + bias_b); \
-                } \
-            } \
-            Bs[(BUF)][kl_b * BN + nl_b] = val_b; \
-        }
-
-    // ------------------------------------------------------------------
-    // Main loop: iterate over K dimension in BK-sized tiles
-    // with double buffering (load next tile while computing current)
-    // ------------------------------------------------------------------
-
-    // Load first tile into buffer 0
-    LOAD_A(0, 0);
-    LOAD_B(0, 0);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint t = 0; t < num_k_tiles; t++) {
-        uint cur_buf = t % 2;
-        uint nxt_buf = 1 - cur_buf;
-
-        // Prefetch next tile if available
-        if (t + 1 < num_k_tiles) {
-            uint next_k_base = (t + 1) * BK;
-            LOAD_A(nxt_buf, next_k_base);
-            LOAD_B(nxt_buf, next_k_base);
-        }
-
-        // Compute MMA for current tile
-        // Each simdgroup handles 16 rows of the BM=32 tile
-        uint sg_row_base = simd_gid * 16;  // 0 or 16
-
-        // Iterate over BK in 8-element steps for 8×8 MMA fragments
-        for (uint kk = 0; kk < BK; kk += 8) {
-            // Load A fragments: 2 row fragments × 1 k fragment
-            simdgroup_matrix<half, 8, 8> a_frag[2];
-            simdgroup_load(a_frag[0], &As[cur_buf][(sg_row_base + 0) * BK + kk], BK);
-            simdgroup_load(a_frag[1], &As[cur_buf][(sg_row_base + 8) * BK + kk], BK);
-
-            // Load B fragments: 1 k fragment × 4 column fragments
-            simdgroup_matrix<half, 8, 8> b_frag[4];
-            simdgroup_load(b_frag[0], &Bs[cur_buf][kk * BN + 0],  BN);
-            simdgroup_load(b_frag[1], &Bs[cur_buf][kk * BN + 8],  BN);
-            simdgroup_load(b_frag[2], &Bs[cur_buf][kk * BN + 16], BN);
-            simdgroup_load(b_frag[3], &Bs[cur_buf][kk * BN + 24], BN);
-
-            // Multiply-accumulate: 2×4 grid of 8×8 fragments
-            for (uint bi = 0; bi < 2; bi++) {
-                for (uint bj = 0; bj < 4; bj++) {
-                    simdgroup_multiply_accumulate(acc[bi][bj], a_frag[bi], b_frag[bj], acc[bi][bj]);
+        // ---- Load A tile: 64 threads x 16 elements = 64x16 = BM x BK ----
+        // When has_norm=true: As[row][col] = x[row][col] * inv_rms[row] * norm_weight[col]
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            uint a_row = tid_in_group;  // 0..63
+            uint gr = row_start + a_row;
+            if ((align_M || gr < uM) && kb + 15 < uK) {
+                if (has_norm) {
+                    half row_scale = half(inv_rms[gr]);
+                    for (uint d = 0; d < 16; d++) {
+                        As[a_row * 16 + d] = half(x[gr * uK + kb + d])
+                            * row_scale * norm_weight[kb + d];
+                    }
+                } else {
+                    for (uint d = 0; d < 16; d += 4) {
+                        As[a_row * 16 + d + 0] = half(x[gr * uK + kb + d + 0]);
+                        As[a_row * 16 + d + 1] = half(x[gr * uK + kb + d + 1]);
+                        As[a_row * 16 + d + 2] = half(x[gr * uK + kb + d + 2]);
+                        As[a_row * 16 + d + 3] = half(x[gr * uK + kb + d + 3]);
+                    }
+                }
+            } else {
+                if (has_norm) {
+                    half row_scale = (align_M || gr < uM) ? half(inv_rms[gr]) : half(0);
+                    for (uint d = 0; d < 16; d++) {
+                        As[a_row * 16 + d] = ((align_M || gr < uM) && kb + d < uK)
+                            ? half(x[gr * uK + kb + d]) * row_scale * norm_weight[kb + d]
+                            : half(0);
+                    }
+                } else {
+                    for (uint d = 0; d < 16; d++) {
+                        As[a_row * 16 + d] = ((align_M || gr < uM) && kb + d < uK)
+                            ? half(x[gr * uK + kb + d]) : half(0);
+                    }
                 }
             }
         }
 
-        // Wait for prefetched tile
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
+        // ---- Load B tile: Q4 dequant into BK x BN = 16x64 half ----
+        // 64 threads: tid/4 → k-row (0..15), (tid%4)*16 → n-col (0,16,32,48)
+        // Each thread dequants 16 N columns for one k index.
+        // Vectorized: load 4 bytes (uchar4) → 8 halves, then another 4 → 8.
+        {
+            uint bi = tid_in_group >> 2;         // 0..15 (row in B tile = k offset)
+            uint bj = (tid_in_group & 3u) << 4;  // 0, 16, 32, 48 (col block)
+            uint gk = kb + bi;                    // global k index
+            uint gc = col_start + bj;             // global n start
 
-    // ------------------------------------------------------------------
-    // Store accumulated results to output
-    // Each simdgroup stores its 16×32 sub-tile (2×4 grid of 8×8 fragments)
-    // ------------------------------------------------------------------
-    uint sg_row_base = simd_gid * 16;
+            if (gk < uK && (align_N || gc + 15 < uN)) {
+                // All 16 N columns share the same k → same group_idx for scale/bias
+                uint group_idx = gk / fc_group_size;  // compile-time optimized division
+                uint byte_idx_base = gk / 2;
+                bool is_lo = (gk & 1u) == 0;
 
-    // Use threadgroup memory as staging for f32 → device write
-    // Reuse As[0] area as f32 staging (32×32 floats = 4096 bytes, fits in 2*32*32 halfs = 4096 bytes)
-    threadgroup float* staging = reinterpret_cast<threadgroup float*>(&As[0][0]);
+                // Process 4 N columns at a time using uchar4 vectorized load
+                for (uint d = 0; d < 16; d += 4) {
+                    // Load 4 packed bytes from 4 consecutive N rows
+                    uchar4 packed4 = uchar4(
+                        w_packed[(gc + d + 0) * half_k + byte_idx_base],
+                        w_packed[(gc + d + 1) * half_k + byte_idx_base],
+                        w_packed[(gc + d + 2) * half_k + byte_idx_base],
+                        w_packed[(gc + d + 3) * half_k + byte_idx_base]
+                    );
+                    // Load scales/biases for 4 N columns (same group_idx)
+                    float s0 = scales[(gc + d + 0) * groups_per_row + group_idx];
+                    float s1 = scales[(gc + d + 1) * groups_per_row + group_idx];
+                    float s2 = scales[(gc + d + 2) * groups_per_row + group_idx];
+                    float s3 = scales[(gc + d + 3) * groups_per_row + group_idx];
+                    float b0 = biases[(gc + d + 0) * groups_per_row + group_idx];
+                    float b1 = biases[(gc + d + 1) * groups_per_row + group_idx];
+                    float b2 = biases[(gc + d + 2) * groups_per_row + group_idx];
+                    float b3 = biases[(gc + d + 3) * groups_per_row + group_idx];
 
-    for (uint bi = 0; bi < 2; bi++) {
-        for (uint bj = 0; bj < 4; bj++) {
-            // Store f32 accumulator fragment to staging area
-            uint store_row = sg_row_base + bi * 8;
-            uint store_col = bj * 8;
-            simdgroup_store(acc[bi][bj], &staging[store_row * BN + store_col], BN);
+                    if (is_lo) {
+                        Bs[bi * 64 + bj + d + 0] = half(s0 * float(packed4.x & 0x0F) + b0);
+                        Bs[bi * 64 + bj + d + 1] = half(s1 * float(packed4.y & 0x0F) + b1);
+                        Bs[bi * 64 + bj + d + 2] = half(s2 * float(packed4.z & 0x0F) + b2);
+                        Bs[bi * 64 + bj + d + 3] = half(s3 * float(packed4.w & 0x0F) + b3);
+                    } else {
+                        Bs[bi * 64 + bj + d + 0] = half(s0 * float((packed4.x >> 4) & 0x0F) + b0);
+                        Bs[bi * 64 + bj + d + 1] = half(s1 * float((packed4.y >> 4) & 0x0F) + b1);
+                        Bs[bi * 64 + bj + d + 2] = half(s2 * float((packed4.z >> 4) & 0x0F) + b2);
+                        Bs[bi * 64 + bj + d + 3] = half(s3 * float((packed4.w >> 4) & 0x0F) + b3);
+                    }
+                }
+            } else {
+                for (uint d = 0; d < 16; d++) {
+                    uint gn = gc + d;
+                    half val = half(0);
+                    if (gk < uK && (align_N || gn < uN)) {
+                        uint byte_idx = gk / 2;
+                        uint8_t packed_b = w_packed[gn * half_k + byte_idx];
+                        uint group_idx = gk / fc_group_size;
+                        float scale_b = scales[gn * groups_per_row + group_idx];
+                        float bias_b  = biases[gn * groups_per_row + group_idx];
+                        bool is_lo = (gk & 1u) == 0;
+                        uint nibble = is_lo ? (packed_b & 0x0F) : ((packed_b >> 4) & 0x0F);
+                        val = half(scale_b * float(nibble) + bias_b);
+                    }
+                    Bs[bi * 64 + bj + d] = val;
+                }
+            }
         }
-    }
 
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Cooperative store from staging to device memory
-    for (uint idx = tid_in_group; idx < BM * BN; idx += THREADGROUP_SIZE) {
-        uint local_row = idx / BN;
-        uint local_col = idx % BN;
-        uint global_m = tile_m + local_row;
-        uint global_n = tile_n + local_col;
+        // ---- MMA compute (serpentine, matching gemm_mlx_f16) ----
+        #pragma clang loop unroll(full)
+        for (uint kk = 0; kk < 2; kk++) {
+            simdgroup_half8x8 a_frag[QTM];
+            simdgroup_half8x8 b_frag[QTN];
 
-        if (align_M || global_m < M) {
-            if (align_N || global_n < N) {
-                output[global_m * N + global_n] = staging[local_row * BN + local_col];
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < QTM; i++) {
+                simdgroup_load(a_frag[i],
+                    &As[(i * 8) * 16 + kk * 8], 16);
+            }
+
+            #pragma clang loop unroll(full)
+            for (uint j = 0; j < QTN; j++) {
+                simdgroup_load(b_frag[j],
+                    &Bs[kk * 8 * 64 + (base_n + j * 8)], 64);
+            }
+
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < QTM; i++) {
+                #pragma clang loop unroll(full)
+                for (uint j = 0; j < QTN; j++) {
+                    uint n_serp = (i % 2) ? (3 - j) : j;
+                    simdgroup_multiply_accumulate(
+                        acc[i][n_serp], a_frag[i], b_frag[n_serp], acc[i][n_serp]);
+                }
             }
         }
     }
+
+    // -- Store results: direct store from simdgroup registers --
+    // When has_residual=true: output[i] += residual[i] (epilogue fusion)
+    const uint qid = lane_id / 4;
+    const uint fm = (qid & 4u) + ((lane_id / 2u) % 4u);
+    const uint fn_val = (qid & 2u) * 2u + (lane_id % 2u) * 2u;
+
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < QTM; i++) {
+        #pragma clang loop unroll(full)
+        for (uint j = 0; j < QTN; j++) {
+            uint gr = row_start + i * 8 + fm;
+            uint gc0 = col_start + base_n + j * 8 + fn_val;
+            uint gc1 = gc0 + 1;
+
+            auto elems = acc[i][j].thread_elements();
+
+            if (align_M && align_N) {
+                float v0 = elems[0];
+                float v1 = elems[1];
+                if (has_swiglu) {
+                    uint idx0 = gr * uN + gc0;
+                    uint idx1 = gr * uN + gc1;
+                    v0 = q_silu_f(gate_result[idx0]) * v0;
+                    v1 = q_silu_f(gate_result[idx1]) * v1;
+                }
+                if (has_residual) {
+                    v0 += residual[gr * uN + gc0];
+                    v1 += residual[gr * uN + gc1];
+                }
+                output[gr * uN + gc0] = v0;
+                output[gr * uN + gc1] = v1;
+            } else {
+                if ((align_M || gr < uM) && (align_N || gc0 < uN)) {
+                    float v0 = elems[0];
+                    if (has_swiglu) v0 = q_silu_f(gate_result[gr * uN + gc0]) * v0;
+                    if (has_residual) v0 += residual[gr * uN + gc0];
+                    output[gr * uN + gc0] = v0;
+                }
+                if ((align_M || gr < uM) && (align_N || gc1 < uN)) {
+                    float v1 = elems[1];
+                    if (has_swiglu) v1 = q_silu_f(gate_result[gr * uN + gc1]) * v1;
+                    if (has_residual) v1 += residual[gr * uN + gc1];
+                    output[gr * uN + gc1] = v1;
+                }
+            }
+        }
+    }
+}
+"#;
+
+// ---------------------------------------------------------------------------
+// Metal shader source -- Steel-architecture Q4 QMM (BM=32, BN=32, BK=32)
+// ---------------------------------------------------------------------------
+
+/// Steel-architecture Q4 QMM kernel matching MLX's QuantizedBlockLoader pattern.
+///
+/// Key differences from the previous `affine_qmm_mma_q4` (BM=64, BN=64, BK=16):
+///
+/// 1. **BM=32, BN=32, BK=32**: Smaller output tile but deeper K.
+///    - K tiles halved (128 vs 256 for K=4096) → half the barrier overhead.
+///    - group_size=32 fits exactly in one BK tile → 1 scale+bias per dequant.
+///
+/// 2. **K-contiguous B loader** (MLX QuantizedBlockLoader pattern):
+///    - Each thread loads from a single N row, reading K-contiguous packed bytes.
+///    - 64 threads → 32 N rows × 2 packed reads (n_reads=2) per thread.
+///    - True contiguous memory access (vs scattered N-stride in old kernel).
+///    - MLX dequant trick: `s[0]=scale, s[1]=scale/16` → no shift for high nibble.
+///
+/// 3. **BK_padded=40**: Bank conflict avoidance (matches MLX BK + 16/sizeof(half)).
+///
+/// 4. **half input**: A buffer is `device const half*` (pre-converted from f32).
+///    - Enables vectorized half4 loads in A loader.
+///
+/// 5. **Double-buffered**: As/Ws use ping-pong buffers to overlap load with compute.
+///
+/// 6. **2 SG layout**: SG0 covers rows 0-15, SG1 covers rows 16-31 of BM=32.
+///    Each SG computes 2×4 = 8 accumulators (16×32 output per SG, full BN width).
+///
+/// TG memory: As[2][32×40] + Ws[2][32×40] = 2×(2560+2560) = 10240 bytes ≈ 10KB
+/// → 3 TG/core (32KB limit). Lower occupancy than 4KB kernel but massively
+///   better load efficiency compensates.
+///
+/// Weight layout: w_packed[n, k/2] (N-major, Q4: 2 values per byte, low nibble first)
+/// Scales: scales[n * groups_per_row + group_idx] (N-major)
+/// Grid: (ceil(N/32), ceil(M/32), 1) threadgroups, 64 threads each
+pub const QMM_STEEL_Q4_SHADER_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// ---------------------------------------------------------------------------
+// Steel-architecture Q4 QMM: BM=32, BN=32, BK=32, 2 SG (64 threads).
+// K-contiguous B loader matching MLX QuantizedBlockLoader pattern.
+// Double-buffered. As uses BK_padded for bank conflict avoidance.
+// Ws stored as [K, N] for correct simdgroup_load orientation.
+// ---------------------------------------------------------------------------
+
+constant constexpr uint ST_BM = 32;
+constant constexpr uint ST_BN = 32;
+constant constexpr uint ST_BK = 32;
+constant constexpr uint ST_BK_PAD = 40;  // BK + 16/sizeof(half) = 32 + 8
+constant constexpr uint ST_TG_SIZE = 64;
+
+// Q4 pack constants
+constant constexpr uint ST_PACK_FACTOR = 8;   // 32 / 4 bits
+constant constexpr uint ST_BYTES_PER_PACK = 4; // one uint32 = 8 nibbles = 4 bytes
+constant constexpr uint ST_BK_PACKED = ST_BK / ST_PACK_FACTOR;  // 32/8 = 4
+constant constexpr uint ST_N_READS = (ST_BK_PACKED * ST_BN) / ST_TG_SIZE;  // (4*32)/64 = 2
+
+constant bool align_M [[function_constant(200)]];
+constant bool align_N [[function_constant(201)]];
+constant bool has_residual [[function_constant(202)]];
+constant bool has_swiglu [[function_constant(204)]];
+constant uint st_fc_group_size [[function_constant(205)]];
+
+inline float st_silu_f(float x) {
+    return x / (1.0f + exp(-x));
+}
+
+#if __METAL_VERSION__ >= 310
+template <typename T>
+METAL_FUNC uniform<T> st_as_uniform(T val) {
+    return make_uniform(val);
+}
+#else
+template <typename T>
+METAL_FUNC T st_as_uniform(T val) {
+    return val;
+}
+#endif
+
+inline uint2 st_swizzle_tg(uint2 tid, uint swizzle_log) {
+    if (swizzle_log == 0) return tid;
+    return uint2(
+        tid.x >> swizzle_log,
+        (tid.y << swizzle_log) | (tid.x & ((1u << swizzle_log) - 1u))
+    );
+}
+
+kernel void affine_qmm_steel_q4(
+    device const half*    x         [[buffer(0)]],   // half input [M, K]
+    device const uint8_t* w_packed  [[buffer(1)]],   // packed Q4 [N, K/2]
+    device const float*   scales    [[buffer(2)]],   // [N * groups_per_row]
+    device const float*   biases    [[buffer(3)]],   // [N * groups_per_row]
+    device float*         output    [[buffer(4)]],   // [M, N]
+    constant uint&        M         [[buffer(5)]],
+    constant uint&        N         [[buffer(6)]],
+    constant uint&        K         [[buffer(7)]],
+    constant uint&        swizzle_log [[buffer(8)]],
+    device const float* residual    [[buffer(9)]],
+    device const float* gate_result [[buffer(10)]],
+    uint3 group_id        [[threadgroup_position_in_grid]],
+    uint  tid_in_group    [[thread_index_in_threadgroup]],
+    uint  sgid            [[simdgroup_index_in_threadgroup]],
+    uint  lane_id         [[thread_index_in_simdgroup]])
+{
+    // Double-buffered threadgroup memory
+    // As: [M_local, K_padded] — M rows, K+pad cols. BK_padded avoids bank conflicts.
+    // Ws: [K_local, N_local]  — K rows, N cols. No padding needed (stride=32=64 bytes).
+    threadgroup half As[2][ST_BM * ST_BK_PAD];  // 2 × 32×40 × 2 = 5120 bytes
+    threadgroup half Ws[2][ST_BK * ST_BN];       // 2 × 32×32 × 2 = 4096 bytes (total ~9KB)
+
+    uint2 swizzled = st_swizzle_tg(uint2(group_id.x, group_id.y), swizzle_log);
+    const uint row_start = swizzled.y * st_as_uniform(ST_BM);
+    const uint col_start = swizzled.x * st_as_uniform(ST_BN);
+
+    const uint uK = st_as_uniform(K);
+    const uint uM = st_as_uniform(M);
+    const uint uN = st_as_uniform(N);
+    const uint groups_per_row = uK / st_fc_group_size;
+    const uint half_k = uK / 2;  // bytes per N row in packed weights
+
+    // Early exit for out-of-bounds threadgroups
+    if (!align_M && row_start >= uM) return;
+    if (!align_N && col_start >= uN) return;
+
+    // 2-SG layout: SG0=rows 0-15, SG1=rows 16-31
+    // Each SG: acc[2][4] = 16 rows × 32 cols of 8×8 MMA tiles
+    const uint sg_row_base = sgid * 16;
+
+    simdgroup_float8x8 acc[2][4];
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < 2; i++)
+        #pragma clang loop unroll(full)
+        for (uint j = 0; j < 4; j++)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    // --- B loader thread mapping (MLX QuantizedBlockLoader pattern) ---
+    // Weight layout in device memory: w_packed[n][k/2] (N-major, K contiguous)
+    // B loader: each thread reads from one N row, K-contiguous packed bytes.
+    // 64 threads load BN × BK_PACKED = 32 × 4 = 128 packed byte positions.
+    // n_reads = 128/64 = 2 per thread.
+    // bi = thread's N row in tile (0..31), bj = thread's K col packed (0..3)
+    const uint w_bi = (ST_N_READS * tid_in_group) / ST_BK_PACKED;   // N row: 0..31
+    const uint w_bj = (ST_N_READS * tid_in_group) % ST_BK_PACKED;   // K col (packed): 0..3
+    const uint w_n_global = col_start + w_bi;
+
+    // Scale/bias: scales[n * groups_per_row + group_idx]
+    // group_idx for tile t = t * BK / group_size. With group_size=32, BK=32: one group per tile.
+    const uint group_steps = st_fc_group_size / ST_BK;  // how many BK tiles per group
+
+    const uint num_k_tiles = (uK + ST_BK - 1) / ST_BK;
+
+    // Macro to load A tile into buffer BUF at K offset KB
+    #define LOAD_A_STEEL(BUF, KB) \
+    { \
+        uint a_row = tid_in_group & 31u; \
+        uint a_col_base = (tid_in_group >> 5u) * 16u; \
+        uint gr = row_start + a_row; \
+        uint gk_base = (KB) + a_col_base; \
+        if ((align_M || gr < uM) && gk_base + 15 < uK) { \
+            for (uint d = 0; d < 16; d += 4) { \
+                *reinterpret_cast<threadgroup half4*>(&As[(BUF)][a_row * ST_BK_PAD + a_col_base + d]) = \
+                    *reinterpret_cast<device const half4*>(&x[gr * uK + gk_base + d]); \
+            } \
+        } else if (align_M || gr < uM) { \
+            for (uint d = 0; d < 16; d++) { \
+                uint gk = gk_base + d; \
+                As[(BUF)][a_row * ST_BK_PAD + a_col_base + d] = (gk < uK) ? x[gr * uK + gk] : half(0); \
+            } \
+        } else { \
+            for (uint d = 0; d < 16; d++) { \
+                As[(BUF)][a_row * ST_BK_PAD + a_col_base + d] = half(0); \
+            } \
+        } \
+    }
+
+    // Macro to load B tile (dequant Q4) into buffer BUF at tile index TILE_IDX
+    // Dequant: each thread reads 2 packs (16 Q4 values) from its N row at K offset.
+    // Writes to Ws[BUF][k_local * BN + n_local] (K-major for correct MMA orientation).
+    #define LOAD_B_STEEL(BUF, TILE_IDX) \
+    { \
+        uint kb = (TILE_IDX) * ST_BK; \
+        if (align_N || w_n_global < uN) { \
+            /* Source: K-contiguous bytes from this thread's N row */ \
+            device const uint8_t* src = w_packed + w_n_global * half_k + kb / 2 + w_bj * ST_BYTES_PER_PACK; \
+            /* Scale/bias for this N row at this K group */ \
+            uint group_idx = kb / st_fc_group_size; \
+            float scale_f = scales[w_n_global * groups_per_row + group_idx]; \
+            float bias_f  = biases[w_n_global * groups_per_row + group_idx]; \
+            half s_lo = half(scale_f); \
+            half s_hi = half(scale_f) / half(16.0f); \
+            half bias_h = half(bias_f); \
+            /* Dequant 2 packs (16 values), write to Ws[k][n] layout */ \
+            uint k_local_base = w_bj * ST_PACK_FACTOR; \
+            for (uint r = 0; r < ST_N_READS; r++) { \
+                uint k_local = k_local_base + r * ST_PACK_FACTOR; \
+                if (kb + k_local + ST_PACK_FACTOR <= uK) { \
+                    device const uint8_t* wp = src + r * ST_BYTES_PER_PACK; \
+                    for (uint i = 0; i < ST_PACK_FACTOR / 2; i++) { \
+                        uint8_t byte = wp[i]; \
+                        Ws[(BUF)][(k_local + 2*i) * ST_BN + w_bi] = s_lo * half(byte & 0x0f) + bias_h; \
+                        Ws[(BUF)][(k_local + 2*i + 1) * ST_BN + w_bi] = s_hi * half(byte & 0xf0) + bias_h; \
+                    } \
+                } else { \
+                    for (uint d = 0; d < ST_PACK_FACTOR; d++) { \
+                        if (kb + k_local + d < uK) { \
+                            device const uint8_t* wp = src + r * ST_BYTES_PER_PACK; \
+                            uint8_t byte = wp[d / 2]; \
+                            half val = (d & 1) == 0 \
+                                ? (s_lo * half(byte & 0x0f) + bias_h) \
+                                : (s_hi * half(byte & 0xf0) + bias_h); \
+                            Ws[(BUF)][(k_local + d) * ST_BN + w_bi] = val; \
+                        } else { \
+                            Ws[(BUF)][(k_local + d) * ST_BN + w_bi] = half(0); \
+                        } \
+                    } \
+                } \
+            } \
+        } else { \
+            uint k_local_base = w_bj * ST_PACK_FACTOR; \
+            for (uint d = 0; d < ST_N_READS * ST_PACK_FACTOR; d++) { \
+                Ws[(BUF)][(k_local_base + d) * ST_BN + w_bi] = half(0); \
+            } \
+        } \
+    }
+
+    // Load first tile (buffer 0)
+    LOAD_A_STEEL(0, 0);
+    LOAD_B_STEEL(0, 0);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // --- Main loop: double-buffered ---
+    for (uint tile = 0; tile < num_k_tiles; tile++) {
+        uint cur_buf = tile & 1;
+        uint nxt_buf = 1 - cur_buf;
+
+        // Prefetch next tile into nxt_buf (if exists)
+        if (tile + 1 < num_k_tiles) {
+            uint next_kb = (tile + 1) * ST_BK;
+            LOAD_A_STEEL(nxt_buf, next_kb);
+            LOAD_B_STEEL(nxt_buf, tile + 1);
+        }
+
+        // --- MMA compute on current buffer ---
+        // BK=32 → 4 k-steps of 8
+        // As layout: As[m][k_padded], stride = ST_BK_PAD
+        // Ws layout: Ws[k][n], stride = ST_BN
+        #pragma clang loop unroll(full)
+        for (uint kk = 0; kk < 4; kk++) {
+            simdgroup_half8x8 a_frag[2];
+            simdgroup_half8x8 b_frag[4];
+
+            // Load A fragments: 2 × 8×8 covering 16 rows of this SG's portion
+            // a_frag[i] row=M(8), col=K(8). As[m * BK_PAD + k] → stride=BK_PAD
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 2; i++) {
+                simdgroup_load(a_frag[i],
+                    &As[cur_buf][(sg_row_base + i * 8) * ST_BK_PAD + kk * 8], ST_BK_PAD);
+            }
+
+            // Load B fragments: 4 × 8×8 covering full 32 cols
+            // b_frag[j] row=K(8), col=N(8). Ws[k * BN + n] → stride=BN
+            #pragma clang loop unroll(full)
+            for (uint j = 0; j < 4; j++) {
+                simdgroup_load(b_frag[j],
+                    &Ws[cur_buf][kk * 8 * ST_BN + j * 8], ST_BN);
+            }
+
+            // 2×4 outer product with serpentine
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 2; i++) {
+                #pragma clang loop unroll(full)
+                for (uint j = 0; j < 4; j++) {
+                    uint n_serp = (i % 2) ? (3 - j) : j;
+                    simdgroup_multiply_accumulate(
+                        acc[i][n_serp], a_frag[i], b_frag[n_serp], acc[i][n_serp]);
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    #undef LOAD_A_STEEL
+    #undef LOAD_B_STEEL
+
+    // --- Store results: direct register store ---
+    const uint qid = lane_id / 4;
+    const uint fm = (qid & 4u) + ((lane_id / 2u) % 4u);
+    const uint fn_val = (qid & 2u) * 2u + (lane_id % 2u) * 2u;
+
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < 2; i++) {
+        #pragma clang loop unroll(full)
+        for (uint j = 0; j < 4; j++) {
+            uint gr = row_start + sg_row_base + i * 8 + fm;
+            uint gc0 = col_start + j * 8 + fn_val;
+            uint gc1 = gc0 + 1;
+
+            auto elems = acc[i][j].thread_elements();
+
+            if (align_M && align_N) {
+                float v0 = elems[0];
+                float v1 = elems[1];
+                if (has_swiglu) {
+                    v0 = st_silu_f(gate_result[gr * uN + gc0]) * v0;
+                    v1 = st_silu_f(gate_result[gr * uN + gc1]) * v1;
+                }
+                if (has_residual) {
+                    v0 += residual[gr * uN + gc0];
+                    v1 += residual[gr * uN + gc1];
+                }
+                output[gr * uN + gc0] = v0;
+                output[gr * uN + gc1] = v1;
+            } else {
+                if ((align_M || gr < uM) && (align_N || gc0 < uN)) {
+                    float v0 = elems[0];
+                    if (has_swiglu) v0 = st_silu_f(gate_result[gr * uN + gc0]) * v0;
+                    if (has_residual) v0 += residual[gr * uN + gc0];
+                    output[gr * uN + gc0] = v0;
+                }
+                if ((align_M || gr < uM) && (align_N || gc1 < uN)) {
+                    float v1 = elems[1];
+                    if (has_swiglu) v1 = st_silu_f(gate_result[gr * uN + gc1]) * v1;
+                    if (has_residual) v1 += residual[gr * uN + gc1];
+                    output[gr * uN + gc1] = v1;
+                }
+            }
+        }
+    }
+}
+"#;
+
+// ---------------------------------------------------------------------------
+// Metal shader source -- Skinny-M Q4 QMM kernel (BM=32, BN=64, BK=32)
+// ---------------------------------------------------------------------------
+
+/// Skinny-M Q4 QMM kernel for M <= 32.
+///
+/// When M is small (1-32), the standard 64×64 kernel wastes 50%+ of compute
+/// on zero-padded rows. This kernel uses BM=32 to eliminate that waste.
+///
+/// Key differences from the standard kernel:
+/// - BM=32, BN=64, BK=32: narrower M tile, deeper K tile for more work/TG
+/// - TG memory: As[32×32]=2KB + Bs[32×64]=4KB = 6KB (still high occupancy)
+/// - TM=4 (32/8), TN=4 ((64/2)/8): 4×4=16 MMA ops per SG per k-step
+/// - Built-in split-K via grid.z: each z-partition handles a K range
+/// - Separate reduce kernel accumulates partial sums
+///
+/// With BK=32 (vs 16 in standard), each tile does more K work, reducing
+/// the loop overhead and barrier count per output element.
+pub const QMM_SKINNY_SHADER_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant constexpr uint SBM = 32;
+constant constexpr uint SBN = 64;
+constant constexpr uint SBK = 32;
+constant constexpr uint STM = 4;   // SBM / 8 = 32/8
+constant constexpr uint STN = 4;   // (SBN/2) / 8 = 32/8
+
+constant bool align_M [[function_constant(200)]];
+constant bool align_N [[function_constant(201)]];
+constant uint skinny_fc_group_size [[function_constant(205)]];
+
+#if __METAL_VERSION__ >= 310
+template <typename T>
+METAL_FUNC uniform<T> skinny_as_uniform(T val) {
+    return make_uniform(val);
+}
+#else
+template <typename T>
+METAL_FUNC T skinny_as_uniform(T val) {
+    return val;
+}
+#endif
+
+// Skinny-M Q4 QMM with split-K support.
+// Grid: (ceil(N/SBN), ceil(M/SBM), k_partitions)
+// When k_partitions == 1, writes directly to output.
+// When k_partitions > 1, writes partial sums to c_split[partition * M * N].
+kernel void affine_qmm_skinny_q4(
+    device const float*   x         [[buffer(0)]],
+    device const uint8_t* w_packed  [[buffer(1)]],
+    device const float*   scales    [[buffer(2)]],
+    device const float*   biases    [[buffer(3)]],
+    device float*         output    [[buffer(4)]],
+    constant uint&        M         [[buffer(5)]],
+    constant uint&        N         [[buffer(6)]],
+    constant uint&        K         [[buffer(7)]],
+    constant uint&        k_partitions [[buffer(8)]],
+    uint3 group_id        [[threadgroup_position_in_grid]],
+    uint  tid_in_group    [[thread_index_in_threadgroup]],
+    uint  sgid            [[simdgroup_index_in_threadgroup]],
+    uint  lane_id         [[thread_index_in_simdgroup]])
+{
+    threadgroup half As[SBM * SBK];   // 32x32 = 1024 halves = 2KB
+    threadgroup half Bs[SBK * SBN];   // 32x64 = 2048 halves = 4KB  (total 6KB)
+
+    const uint row_start = group_id.y * skinny_as_uniform(SBM);
+    const uint col_start = group_id.x * skinny_as_uniform(SBN);
+    const uint partition_id = group_id.z;
+
+    const uint uK = skinny_as_uniform(K);
+    const uint uM = skinny_as_uniform(M);
+    const uint uN = skinny_as_uniform(N);
+    const uint u_k_parts = skinny_as_uniform(k_partitions);
+    const uint groups_per_row = uK / skinny_fc_group_size;
+    const uint half_k = uK / 2;
+
+    if (!align_M && row_start >= uM) return;
+    if (!align_N && col_start >= uN) return;
+
+    // Split-K: compute K range for this partition
+    const uint k_per_part = ((uK + u_k_parts - 1) / u_k_parts);
+    // Round up to SBK boundary
+    const uint k_per_part_aligned = ((k_per_part + SBK - 1) / SBK) * SBK;
+    const uint k_start = partition_id * k_per_part_aligned;
+    uint k_end = k_start + k_per_part_aligned;
+    if (k_end > uK) k_end = uK;
+    if (k_start >= uK) return;
+
+    // SG grid: 1x2 -- each SG covers 32 cols
+    const uint base_n = sgid * 32;
+
+    simdgroup_float8x8 acc[STM][STN];
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < STM; i++)
+        #pragma clang loop unroll(full)
+        for (uint j = 0; j < STN; j++)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    const uint n_k_tiles = (k_end - k_start + SBK - 1) / SBK;
+
+    for (uint tile = 0; tile < n_k_tiles; tile++) {
+        uint kb = k_start + tile * SBK;
+
+        // Load A: 64 threads load 32×32 = 1024 halves (16 per thread)
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            // 64 threads for 32 rows × 32 cols = 1024 elements
+            // thread 0..31 → row 0..31, cols 0..15
+            // thread 32..63 → row 0..31, cols 16..31
+            uint a_row = tid_in_group & 31u;
+            uint a_col_base = (tid_in_group >> 5u) * 16u;  // 0 or 16
+            uint gr = row_start + a_row;
+
+            if ((align_M || gr < uM) && kb + a_col_base + 15 < k_end) {
+                for (uint d = 0; d < 16; d += 4) {
+                    As[a_row * SBK + a_col_base + d + 0] = half(x[gr * uK + kb + a_col_base + d + 0]);
+                    As[a_row * SBK + a_col_base + d + 1] = half(x[gr * uK + kb + a_col_base + d + 1]);
+                    As[a_row * SBK + a_col_base + d + 2] = half(x[gr * uK + kb + a_col_base + d + 2]);
+                    As[a_row * SBK + a_col_base + d + 3] = half(x[gr * uK + kb + a_col_base + d + 3]);
+                }
+            } else if (align_M || gr < uM) {
+                for (uint d = 0; d < 16; d++) {
+                    uint gk = kb + a_col_base + d;
+                    As[a_row * SBK + a_col_base + d] = (gk < k_end)
+                        ? half(x[gr * uK + gk]) : half(0);
+                }
+            } else {
+                for (uint d = 0; d < 16; d++) {
+                    As[a_row * SBK + a_col_base + d] = half(0);
+                }
+            }
+        }
+
+        // Load B: Q4 dequant, 64 threads load 32×64 = 2048 halves (32 per thread)
+        // Thread mapping: tid/2 → k-row (0..31), (tid%2)*32 → n-col base (0 or 32)
+        // Each thread handles 32 contiguous N columns for one k index
+        {
+            uint bi = tid_in_group >> 1;          // 0..31
+            uint bj = (tid_in_group & 1u) << 5;   // 0 or 32
+            uint gk = kb + bi;
+            uint gc = col_start + bj;
+
+            if (gk < k_end && (align_N || gc + 31 < uN)) {
+                uint group_idx = gk / skinny_fc_group_size;
+                uint byte_idx_base = gk / 2;
+                bool is_lo = (gk & 1u) == 0;
+
+                for (uint d = 0; d < 32; d += 4) {
+                    uchar4 packed4 = uchar4(
+                        w_packed[(gc + d + 0) * half_k + byte_idx_base],
+                        w_packed[(gc + d + 1) * half_k + byte_idx_base],
+                        w_packed[(gc + d + 2) * half_k + byte_idx_base],
+                        w_packed[(gc + d + 3) * half_k + byte_idx_base]
+                    );
+                    float s0 = scales[(gc + d + 0) * groups_per_row + group_idx];
+                    float s1 = scales[(gc + d + 1) * groups_per_row + group_idx];
+                    float s2 = scales[(gc + d + 2) * groups_per_row + group_idx];
+                    float s3 = scales[(gc + d + 3) * groups_per_row + group_idx];
+                    float b0 = biases[(gc + d + 0) * groups_per_row + group_idx];
+                    float b1 = biases[(gc + d + 1) * groups_per_row + group_idx];
+                    float b2 = biases[(gc + d + 2) * groups_per_row + group_idx];
+                    float b3 = biases[(gc + d + 3) * groups_per_row + group_idx];
+
+                    if (is_lo) {
+                        Bs[bi * 64 + bj + d + 0] = half(s0 * float(packed4.x & 0x0F) + b0);
+                        Bs[bi * 64 + bj + d + 1] = half(s1 * float(packed4.y & 0x0F) + b1);
+                        Bs[bi * 64 + bj + d + 2] = half(s2 * float(packed4.z & 0x0F) + b2);
+                        Bs[bi * 64 + bj + d + 3] = half(s3 * float(packed4.w & 0x0F) + b3);
+                    } else {
+                        Bs[bi * 64 + bj + d + 0] = half(s0 * float((packed4.x >> 4) & 0x0F) + b0);
+                        Bs[bi * 64 + bj + d + 1] = half(s1 * float((packed4.y >> 4) & 0x0F) + b1);
+                        Bs[bi * 64 + bj + d + 2] = half(s2 * float((packed4.z >> 4) & 0x0F) + b2);
+                        Bs[bi * 64 + bj + d + 3] = half(s3 * float((packed4.w >> 4) & 0x0F) + b3);
+                    }
+                }
+            } else {
+                for (uint d = 0; d < 32; d++) {
+                    uint gn = gc + d;
+                    half val = half(0);
+                    if (gk < k_end && (align_N || gn < uN)) {
+                        uint byte_idx = gk / 2;
+                        uint8_t packed_b = w_packed[gn * half_k + byte_idx];
+                        uint group_idx = gk / skinny_fc_group_size;
+                        float scale_b = scales[gn * groups_per_row + group_idx];
+                        float bias_b  = biases[gn * groups_per_row + group_idx];
+                        bool is_lo_s = (gk & 1u) == 0;
+                        uint nibble = is_lo_s ? (packed_b & 0x0F) : ((packed_b >> 4) & 0x0F);
+                        val = half(scale_b * float(nibble) + bias_b);
+                    }
+                    Bs[bi * 64 + bj + d] = val;
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // MMA compute: BK=32 → 4 k-steps of 8
+        #pragma clang loop unroll(full)
+        for (uint kk = 0; kk < 4; kk++) {
+            simdgroup_half8x8 a_frag[STM];
+            simdgroup_half8x8 b_frag[STN];
+
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < STM; i++)
+                simdgroup_load(a_frag[i], &As[(i * 8) * SBK + kk * 8], SBK);
+
+            #pragma clang loop unroll(full)
+            for (uint j = 0; j < STN; j++)
+                simdgroup_load(b_frag[j], &Bs[kk * 8 * 64 + (base_n + j * 8)], 64);
+
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < STM; i++) {
+                #pragma clang loop unroll(full)
+                for (uint j = 0; j < STN; j++) {
+                    uint n_serp = (i % 2) ? (3 - j) : j;
+                    simdgroup_multiply_accumulate(
+                        acc[i][n_serp], a_frag[i], b_frag[n_serp], acc[i][n_serp]);
+                }
+            }
+        }
+    }
+
+    // Store: direct register store
+    // When k_partitions > 1, write to partition slice; otherwise direct to output
+    const uint partition_stride = uM * uN;
+    device float* out_ptr = (u_k_parts > 1)
+        ? output + partition_id * partition_stride
+        : output;
+
+    const uint qid = lane_id / 4;
+    const uint fm = (qid & 4u) + ((lane_id / 2u) % 4u);
+    const uint fn_val = (qid & 2u) * 2u + (lane_id % 2u) * 2u;
+
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < STM; i++) {
+        #pragma clang loop unroll(full)
+        for (uint j = 0; j < STN; j++) {
+            uint gr = row_start + i * 8 + fm;
+            uint gc0 = col_start + base_n + j * 8 + fn_val;
+            uint gc1 = gc0 + 1;
+
+            auto elems = acc[i][j].thread_elements();
+
+            if (align_M && align_N) {
+                out_ptr[gr * uN + gc0] = elems[0];
+                out_ptr[gr * uN + gc1] = elems[1];
+            } else {
+                if ((align_M || gr < uM) && (align_N || gc0 < uN))
+                    out_ptr[gr * uN + gc0] = elems[0];
+                if ((align_M || gr < uM) && (align_N || gc1 < uN))
+                    out_ptr[gr * uN + gc1] = elems[1];
+            }
+        }
+    }
+}
+
+// Reduce split-K partial sums for skinny kernel
+kernel void skinny_qmm_reduce(
+    device const float* partial [[buffer(0)]],
+    device float* output        [[buffer(1)]],
+    constant uint& N            [[buffer(2)]],
+    constant uint& k_partitions [[buffer(3)]],
+    constant uint& mn_total     [[buffer(4)]],
+    uint id [[thread_position_in_grid]])
+{
+    if (id >= mn_total) return;
+    float sum = 0.0f;
+    for (uint p = 0; p < k_partitions; p++) {
+        sum += partial[p * mn_total + id];
+    }
+    output[id] = sum;
 }
 "#;
 
@@ -1718,56 +2356,28 @@ kernel void affine_qmm_mma_q4(
 
 /// High-performance Q8 QMM kernel using simdgroup MMA (8x8 fragments).
 ///
-/// Architecture identical to [`QMM_MMA_SHADER_SOURCE`] (Q4) but with simplified
-/// dequantization: each quantized weight is a full `uint8_t` (no nibble
-/// extraction), so the loader reads bytes directly and converts to `half`.
-///
-/// - Tile: BM=32, BN=32, BK=32
-/// - 2 simdgroups per threadgroup (64 threads total)
-/// - Dequant-in-loader: `uint8_t` → `half` (1 byte per weight, no bit packing)
-/// - f32 accumulation via `simdgroup_matrix<float, 8, 8>`
-/// - Double-buffered threadgroup memory (ping-pong A and B tiles)
-/// - Function constants `align_M`, `align_N` for bounds check elimination
+/// Same architecture as Q4 (WM=2, WN=2, 4 SG, BK_PAD=40) but with
+/// simplified dequantization: 1 byte per weight, no nibble extraction.
 pub const QMM_MMA_Q8_SHADER_SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
-
 
 // Function constants for compile-time bounds check elimination
 constant bool align_M [[function_constant(200)]];
 constant bool align_N [[function_constant(201)]];
 
-// Tile dimensions
+// Q8 uses 2 simdgroups / 64 threads for better occupancy.
+// Q8 has no nibble-packing benefit from 4-SG vectorization (each weight is
+// a full byte), so the extra threads per TG reduce concurrent TGs per core
+// without compensating load savings. 2 SG gives 2x occupancy vs 4 SG.
 constant constexpr uint BM = 32;
 constant constexpr uint BN = 32;
 constant constexpr uint BK = 32;
+constant constexpr uint BK_PAD = 40;  // Bank conflict avoidance (same as Q4)
 
-// Each threadgroup has 2 simdgroups x 32 threads = 64 threads
-constant constexpr uint THREADGROUP_SIZE = 64;
 constant constexpr uint SIMDGROUPS_PER_TG = 2;
+constant constexpr uint THREADGROUP_SIZE = 64;
 
-// -----------------------------------------------------------------------
-// affine_qmm_mma_q8: Simdgroup MMA-based Q8 quantized matrix-matrix multiply.
-//
-// Computes: output[m, n] = sum_k x[m, k] * dequant(w[n, k])
-//
-// where dequant(q_i) = scales[n, group] * q_i + biases[n, group]
-// and q_i is a uint8_t value (1 byte per weight, no bit packing).
-//
-// Weight layout: w_packed is [N, K] row-major (uint8), where weight
-// row n has K bytes. Each byte holds 1 Q8 value.
-//
-// Buffers:
-//   buffer(0) x         - float32 input activations [M, K], row-major
-//   buffer(1) w_packed  - uint8 weights [N, K], row-major (1 byte per value)
-//   buffer(2) scales    - float32 per-group scales [N, groups_per_row]
-//   buffer(3) biases    - float32 per-group biases [N, groups_per_row]
-//   buffer(4) output    - float32 output [M, N], row-major
-//   buffer(5) params    - uint4: (M, N, K, group_size)
-//
-// Grid: 2D - (ceil(N/BN), ceil(M/BM), 1) threadgroups
-//   Each threadgroup computes a BM x BN tile of the output.
-// -----------------------------------------------------------------------
 kernel void affine_qmm_mma_q8(
     device const float*   x         [[buffer(0)]],
     device const uint8_t* w_packed  [[buffer(1)]],
@@ -1787,25 +2397,20 @@ kernel void affine_qmm_mma_q8(
 
     const uint groups_per_row = K / group_size;
 
-    // Tile origin in output space
     const uint tile_m = group_id.y * BM;
     const uint tile_n = group_id.x * BN;
 
-    // Early exit for entirely out-of-bounds threadgroups
     if (!align_M && tile_m >= M) return;
     if (!align_N && tile_n >= N) return;
 
-    // ------------------------------------------------------------------
-    // Threadgroup shared memory (double-buffered for A and B)
-    // A: [BM, BK] half -- loaded from x (f32 -> half conversion)
-    // B: [BK, BN] half -- dequantized from w_packed (transposed)
-    // ------------------------------------------------------------------
-    threadgroup half As[2][BM * BK];
+    threadgroup half As[2][BM * BK_PAD];
     threadgroup half Bs[2][BK * BN];
 
-    // ------------------------------------------------------------------
-    // Accumulator fragments: each simdgroup computes a 16x16 sub-tile
-    // ------------------------------------------------------------------
+    // 2-SG layout: each SG handles 16 rows × 32 cols (full N width)
+    // SG0: rows 0-15, SG1: rows 16-31
+    // acc[2][4]: 2 row-fragments × 4 col-fragments of 8×8 each = 16×32
+    uint sg_row_base = simd_gid * 16;
+
     simdgroup_matrix<float, 8, 8> acc[2][4];
     for (uint i = 0; i < 2; i++)
         for (uint j = 0; j < 4; j++)
@@ -1813,11 +2418,6 @@ kernel void affine_qmm_mma_q8(
 
     const uint num_k_tiles = (K + BK - 1) / BK;
 
-    // ------------------------------------------------------------------
-    // Inline tile loaders (Metal does not support C++ lambdas)
-    // ------------------------------------------------------------------
-
-    // Macro: load A tile [BM, BK] from x (f32 -> half)
     #define LOAD_A(BUF, K_BASE) \
         for (uint idx_a = tid_in_group; idx_a < BM * BK; idx_a += THREADGROUP_SIZE) { \
             uint row_a = idx_a / BK; \
@@ -1830,11 +2430,9 @@ kernel void affine_qmm_mma_q8(
                     val_a = half(x[gm_a * K + gk_a]); \
                 } \
             } \
-            As[(BUF)][row_a * BK + col_a] = val_a; \
+            As[(BUF)][row_a * BK_PAD + col_a] = val_a; \
         }
 
-    // Macro: load B tile [BK, BN] from w_packed (Q8 dequant, transposed)
-    // Q8: 1 byte per element -- no nibble extraction needed.
     #define LOAD_B(BUF, K_BASE) \
         for (uint idx_b = tid_in_group; idx_b < BK * BN; idx_b += THREADGROUP_SIZE) { \
             uint kl_b = idx_b / BN; \
@@ -1854,7 +2452,6 @@ kernel void affine_qmm_mma_q8(
             Bs[(BUF)][kl_b * BN + nl_b] = val_b; \
         }
 
-    // Main loop with double buffering
     LOAD_A(0, 0);
     LOAD_B(0, 0);
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1869,12 +2466,10 @@ kernel void affine_qmm_mma_q8(
             LOAD_B(nxt_buf, next_k_base);
         }
 
-        uint sg_row_base = simd_gid * 16;
-
         for (uint kk = 0; kk < BK; kk += 8) {
             simdgroup_matrix<half, 8, 8> a_frag[2];
-            simdgroup_load(a_frag[0], &As[cur_buf][(sg_row_base + 0) * BK + kk], BK);
-            simdgroup_load(a_frag[1], &As[cur_buf][(sg_row_base + 8) * BK + kk], BK);
+            simdgroup_load(a_frag[0], &As[cur_buf][(sg_row_base + 0) * BK_PAD + kk], BK_PAD);
+            simdgroup_load(a_frag[1], &As[cur_buf][(sg_row_base + 8) * BK_PAD + kk], BK_PAD);
 
             simdgroup_matrix<half, 8, 8> b_frag[4];
             simdgroup_load(b_frag[0], &Bs[cur_buf][kk * BN + 0],  BN);
@@ -1892,8 +2487,6 @@ kernel void affine_qmm_mma_q8(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // Store accumulated results
-    uint sg_row_base = simd_gid * 16;
     threadgroup float* staging = reinterpret_cast<threadgroup float*>(&As[0][0]);
 
     for (uint bi = 0; bi < 2; bi++) {
@@ -1921,16 +2514,258 @@ kernel void affine_qmm_mma_q8(
 }
 "#;
 
-/// Register the QMM Metal kernels with the given registry.
+// ---------------------------------------------------------------------------
+// Split-K QMM kernels for low-M cases (M <= 32)
+// ---------------------------------------------------------------------------
+
+/// Split-K Q4 QMM kernel: partitions K dimension across threadgroups.
 ///
-/// Registers the legacy scalar kernel (`qmm`), the simdgroup MMA Q4 kernel
-/// (`qmm_mma`), and the simdgroup MMA Q8 kernel (`qmm_mma_q8`).
-/// The batched dispatch function [`affine_quantized_matmul_batched`] selects
-/// the appropriate kernel based on the weight bit width.
+/// When M is small (M <= 32), the standard QMM kernel has very few threadgroups
+/// (often just 1 in the M dimension), leaving GPU cores idle. Split-K divides K
+/// into `split_k_partitions` chunks, each processed by a separate threadgroup
+/// in the z-dimension, writing partial results to `C_split[partition][M][N]`.
+///
+/// A second `qmm_splitk_accum` kernel sums partial results into the final output.
+///
+/// Architecture matches the main QMM kernel (BM=64, BN=64, BK=16, 2 SG, 64 threads).
+pub const QMM_SPLITK_Q4_SHADER_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// ---------------------------------------------------------------------------
+// Split-K Q4 QMM: MLX-architecture (BM=64, BN=64, BK=16, 2 SG, 64 threads).
+// Each z-partition processes [k_start, k_start+k_partition_size) of K.
+// Output: C_split[partition_id * M * N + m * N + n] (f32 partial sums).
+// ---------------------------------------------------------------------------
+
+constant constexpr uint SK_BM = 64;
+constant constexpr uint SK_BN = 64;
+constant constexpr uint SK_BK = 16;
+constant constexpr uint SK_TM = 8;   // BM / 8
+constant constexpr uint SK_TN = 4;   // (BN/2) / 8
+
+constant bool align_M [[function_constant(200)]];
+constant bool align_N [[function_constant(201)]];
+constant uint sk_fc_group_size [[function_constant(205)]];
+
+kernel void affine_qmm_splitk_q4(
+    device const float*   x         [[buffer(0)]],
+    device const uint8_t* w_packed  [[buffer(1)]],
+    device const float*   scales    [[buffer(2)]],
+    device const float*   biases    [[buffer(3)]],
+    device float*         c_split   [[buffer(4)]],
+    constant uint3&       params    [[buffer(5)]],
+    constant uint2&       split_params [[buffer(6)]],
+    uint3 group_id        [[threadgroup_position_in_grid]],
+    uint  tid_in_group    [[thread_index_in_threadgroup]],
+    uint  sgid            [[simdgroup_index_in_threadgroup]],
+    uint  lane_id         [[thread_index_in_simdgroup]])
+{
+    const uint M          = params.x;
+    const uint N          = params.y;
+    const uint K          = params.z;
+
+    const uint k_partition_size = split_params.x;
+    const uint partition_stride = split_params.y;  // M * N
+
+    const uint groups_per_row = K / sk_fc_group_size;
+    const uint half_k = K / 2;
+
+    const uint tile_m = group_id.y * SK_BM;
+    const uint tile_n = group_id.x * SK_BN;
+    const uint partition_id = group_id.z;
+
+    if (!align_M && tile_m >= M) return;
+    if (!align_N && tile_n >= N) return;
+
+    // K range for this partition
+    const uint k_start = partition_id * k_partition_size;
+    uint k_end = k_start + k_partition_size;
+    if (k_end > K) k_end = K;
+    if (k_start >= K) return;
+    const uint k_len = k_end - k_start;
+
+    threadgroup half As[SK_BM * SK_BK];  // 64x16 = 2KB
+    threadgroup half Bs[SK_BK * SK_BN];  // 16x64 = 2KB
+
+    const uint base_n = sgid * 32;
+
+    simdgroup_float8x8 acc[SK_TM][SK_TN];
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < SK_TM; i++)
+        #pragma clang loop unroll(full)
+        for (uint j = 0; j < SK_TN; j++)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    const uint num_k_tiles = (k_len + SK_BK - 1) / SK_BK;
+
+    for (uint tile = 0; tile < num_k_tiles; tile++) {
+        uint kb = k_start + tile * SK_BK;
+
+        // Load A: 64 threads x 16 elements
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            uint a_row = tid_in_group;
+            uint gr = tile_m + a_row;
+            if ((align_M || gr < M) && kb + 15 < k_end) {
+                for (uint d = 0; d < 16; d += 4) {
+                    As[a_row * 16 + d + 0] = half(x[gr * K + kb + d + 0]);
+                    As[a_row * 16 + d + 1] = half(x[gr * K + kb + d + 1]);
+                    As[a_row * 16 + d + 2] = half(x[gr * K + kb + d + 2]);
+                    As[a_row * 16 + d + 3] = half(x[gr * K + kb + d + 3]);
+                }
+            } else {
+                for (uint d = 0; d < 16; d++) {
+                    As[a_row * 16 + d] = ((align_M || gr < M) && kb + d < k_end)
+                        ? half(x[gr * K + kb + d]) : half(0);
+                }
+            }
+        }
+
+        // Load B: Q4 dequant, 64 threads x 16 elements
+        {
+            uint bi = tid_in_group >> 2;
+            uint bj = (tid_in_group & 3u) << 4;
+            uint gk = kb + bi;
+            uint gc = tile_n + bj;
+
+            if (gk < k_end && (align_N || gc + 15 < N)) {
+                uint group_idx = gk / sk_fc_group_size;
+                uint byte_idx_base = gk / 2;
+                bool is_lo = (gk & 1u) == 0;
+
+                for (uint d = 0; d < 16; d += 4) {
+                    uchar4 packed4 = uchar4(
+                        w_packed[(gc + d + 0) * half_k + byte_idx_base],
+                        w_packed[(gc + d + 1) * half_k + byte_idx_base],
+                        w_packed[(gc + d + 2) * half_k + byte_idx_base],
+                        w_packed[(gc + d + 3) * half_k + byte_idx_base]
+                    );
+                    float s0 = scales[(gc + d + 0) * groups_per_row + group_idx];
+                    float s1 = scales[(gc + d + 1) * groups_per_row + group_idx];
+                    float s2 = scales[(gc + d + 2) * groups_per_row + group_idx];
+                    float s3 = scales[(gc + d + 3) * groups_per_row + group_idx];
+                    float b0 = biases[(gc + d + 0) * groups_per_row + group_idx];
+                    float b1 = biases[(gc + d + 1) * groups_per_row + group_idx];
+                    float b2 = biases[(gc + d + 2) * groups_per_row + group_idx];
+                    float b3 = biases[(gc + d + 3) * groups_per_row + group_idx];
+
+                    if (is_lo) {
+                        Bs[bi * 64 + bj + d + 0] = half(s0 * float(packed4.x & 0x0F) + b0);
+                        Bs[bi * 64 + bj + d + 1] = half(s1 * float(packed4.y & 0x0F) + b1);
+                        Bs[bi * 64 + bj + d + 2] = half(s2 * float(packed4.z & 0x0F) + b2);
+                        Bs[bi * 64 + bj + d + 3] = half(s3 * float(packed4.w & 0x0F) + b3);
+                    } else {
+                        Bs[bi * 64 + bj + d + 0] = half(s0 * float((packed4.x >> 4) & 0x0F) + b0);
+                        Bs[bi * 64 + bj + d + 1] = half(s1 * float((packed4.y >> 4) & 0x0F) + b1);
+                        Bs[bi * 64 + bj + d + 2] = half(s2 * float((packed4.z >> 4) & 0x0F) + b2);
+                        Bs[bi * 64 + bj + d + 3] = half(s3 * float((packed4.w >> 4) & 0x0F) + b3);
+                    }
+                }
+            } else {
+                for (uint d = 0; d < 16; d++) {
+                    uint gn = gc + d;
+                    half val = half(0);
+                    if (gk < k_end && (align_N || gn < N)) {
+                        uint byte_idx = gk / 2;
+                        uint8_t packed_b = w_packed[gn * half_k + byte_idx];
+                        uint group_idx = gk / sk_fc_group_size;
+                        float scale_b = scales[gn * groups_per_row + group_idx];
+                        float bias_b  = biases[gn * groups_per_row + group_idx];
+                        bool is_lo = (gk & 1u) == 0;
+                        uint nibble = is_lo ? (packed_b & 0x0F) : ((packed_b >> 4) & 0x0F);
+                        val = half(scale_b * float(nibble) + bias_b);
+                    }
+                    Bs[bi * 64 + bj + d] = val;
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // MMA compute (serpentine)
+        #pragma clang loop unroll(full)
+        for (uint kk = 0; kk < 2; kk++) {
+            simdgroup_half8x8 a_frag[SK_TM];
+            simdgroup_half8x8 b_frag[SK_TN];
+
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < SK_TM; i++)
+                simdgroup_load(a_frag[i], &As[(i * 8) * 16 + kk * 8], 16);
+
+            #pragma clang loop unroll(full)
+            for (uint j = 0; j < SK_TN; j++)
+                simdgroup_load(b_frag[j], &Bs[kk * 8 * 64 + (base_n + j * 8)], 64);
+
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < SK_TM; i++) {
+                #pragma clang loop unroll(full)
+                for (uint j = 0; j < SK_TN; j++) {
+                    uint n_serp = (i % 2) ? (3 - j) : j;
+                    simdgroup_multiply_accumulate(
+                        acc[i][n_serp], a_frag[i], b_frag[n_serp], acc[i][n_serp]);
+                }
+            }
+        }
+    }
+
+    // Store to partition slice via direct register store
+    device float* out_partition = c_split + partition_id * partition_stride;
+
+    const uint qid = lane_id / 4;
+    const uint fm = (qid & 4u) + ((lane_id / 2u) % 4u);
+    const uint fn_val = (qid & 2u) * 2u + (lane_id % 2u) * 2u;
+
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < SK_TM; i++) {
+        #pragma clang loop unroll(full)
+        for (uint j = 0; j < SK_TN; j++) {
+            uint gr = tile_m + i * 8 + fm;
+            uint gc0 = tile_n + base_n + j * 8 + fn_val;
+            uint gc1 = gc0 + 1;
+
+            auto elems = acc[i][j].thread_elements();
+
+            if (align_M && align_N) {
+                out_partition[gr * N + gc0] = elems[0];
+                out_partition[gr * N + gc1] = elems[1];
+            } else {
+                if ((align_M || gr < M) && (align_N || gc0 < N))
+                    out_partition[gr * N + gc0] = elems[0];
+                if ((align_M || gr < M) && (align_N || gc1 < N))
+                    out_partition[gr * N + gc1] = elems[1];
+            }
+        }
+    }
+}
+
+// Accumulate split-K partitions into final output
+kernel void qmm_splitk_accum(
+    device const float* c_split     [[buffer(0)]],
+    device float*       output      [[buffer(1)]],
+    constant uint3&     acc_params  [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    const uint N               = acc_params.x;
+    const uint k_partitions    = acc_params.y;
+    const uint partition_stride = acc_params.z;
+
+    float sum = 0.0f;
+    for (uint p = 0; p < k_partitions; p++) {
+        sum += c_split[p * partition_stride + gid.y * N + gid.x];
+    }
+    output[gid.y * N + gid.x] = sum;
+}
+"#;
+
+/// Register the QMM Metal kernels with the given registry.
 pub fn register_qmm(registry: &KernelRegistry) -> Result<(), KernelError> {
     registry.register_jit_source("qmm", QMM_SHADER_SOURCE)?;
     registry.register_jit_source("qmm_mma", QMM_MMA_SHADER_SOURCE)?;
     registry.register_jit_source("qmm_mma_q8", QMM_MMA_Q8_SHADER_SOURCE)?;
+    registry.register_jit_source("qmm_splitk_q4", QMM_SPLITK_Q4_SHADER_SOURCE)?;
+    registry.register_jit_source("qmm_skinny", QMM_SKINNY_SHADER_SOURCE)?;
+    registry.register_jit_source("qmm_steel_q4", QMM_STEEL_Q4_SHADER_SOURCE)?;
     Ok(())
 }
 
@@ -1939,17 +2774,10 @@ pub fn register_qmm(registry: &KernelRegistry) -> Result<(), KernelError> {
 /// Computes `output[m, n] = sum_k x[m, k] * dequant(w[n, k])` using a Metal
 /// compute kernel for quantized weights.
 ///
-/// - **Q4** (`bits == 4`): uses `affine_qmm_mma_q4` (dequant from nibble pairs).
-/// - **Q8** (`bits == 8`): uses `affine_qmm_mma_q8` (1 byte per weight, no bit
-///   packing).
-///
-/// Both kernels share the same MMA framework (BM=32, BN=32, BK=32, 2 simdgroups,
-/// double-buffered, f32 accumulation) with function constants for alignment-based
-/// bounds check elimination.
-///
-/// This function requires the `qmm_mma` and `qmm_mma_q8` kernel sources
-/// to be registered via [`register_qmm`]. They are automatically registered by
-/// [`register`] in this module.
+/// - **Q4** (`bits == 4`): uses `affine_qmm_mma_q4` — MLX-architecture kernel
+///   (BM=64, BN=64, BK=16, 2 SG, 64 threads, single-buffered, direct store,
+///   serpentine MMA). Same architecture as the fp16 GEMM that achieves 23.82T.
+/// - **Q8** (`bits == 8`): uses `affine_qmm_mma_q8` (BM=32, BN=32, 2 SG).
 ///
 /// # Arguments
 /// - `registry`: kernel registry with `qmm_mma` / `qmm_mma_q8` sources registered.
@@ -1996,44 +2824,318 @@ pub fn affine_quantized_matmul_batched(
     let n = qw.out_features;
     let k = qw.in_features;
 
-    // MMA tile sizes
-    const BM: usize = 32;
-    const BN: usize = 32;
+    let dev = registry.device().raw();
+    let opts = metal::MTLResourceOptions::StorageModeShared;
 
-    // Function constants for alignment-based bounds check elimination
-    let align_m = m % BM == 0;
-    let align_n = n % BN == 0;
-    let constants = [
-        (200u32, FunctionConstantValue::Bool(align_m)),
-        (201u32, FunctionConstantValue::Bool(align_n)),
-    ];
+    if qw.bits == 4 {
+        // Q4 dispatch: choose kernel variant based on M
+        // - M <= 32: skinny kernel (BM=32, BN=64, BK=32) with aggressive split-K
+        // - M > 32: standard kernel (BM=64, BN=64, BK=16)
+        const SKINNY_BM: usize = 32;
+        const SKINNY_BN: usize = 64;
+        const SKINNY_BK: usize = 32;
+        const STD_BM: usize = 64;
+        const STD_BN: usize = 64;
 
-    // Select kernel based on bit width
-    let kernel_name = match qw.bits {
-        4 => "affine_qmm_mma_q4",
-        8 => "affine_qmm_mma_q8",
-        _ => unreachable!(), // validated above
-    };
+        if m <= SKINNY_BM {
+            // --- Skinny-M path: BM=32, BN=64, BK=32 with built-in split-K ---
+            let sm_tiles = m.div_ceil(SKINNY_BM);
+            let sn_tiles = n.div_ceil(SKINNY_BN);
 
-    let pipeline = registry.get_pipeline_with_constants(kernel_name, DType::Float32, &constants)?;
-    let out = Array::zeros(registry.device().raw(), &[m, n], DType::Float32);
+            let align_m = m % SKINNY_BM == 0;
+            let align_n = n % SKINNY_BN == 0;
 
-    let params: [u32; 4] = [
-        super::checked_u32(m, "M")?,
-        super::checked_u32(n, "N")?,
-        super::checked_u32(k, "K")?,
-        qw.group_size,
-    ];
+            // Aggressive split-K: target ~256+ total threadgroups for M3 Ultra 80 cores.
+            // Each core can run multiple TGs, so we want 3-4x core count.
+            let mn_tgs = sm_tiles * sn_tiles;
+            let target_tgs: usize = 320; // 4x M3 Ultra 80 cores
+            let k_tiles_total = k.div_ceil(SKINNY_BK);
+            let k_partitions = if mn_tgs >= target_tgs || k_tiles_total <= 2 {
+                1 // enough spatial parallelism, no split-K needed
+            } else {
+                let desired = (target_tgs / mn_tgs).clamp(2, k_tiles_total.max(2));
+                // Don't exceed k_tiles_total (each partition needs at least 1 BK tile)
+                desired.min(k_tiles_total)
+            };
+
+            let skinny_constants = [
+                (200u32, FunctionConstantValue::Bool(align_m)),
+                (201u32, FunctionConstantValue::Bool(align_n)),
+                (205u32, FunctionConstantValue::U32(qw.group_size)),
+            ];
+            let pipeline = registry.get_pipeline_with_constants(
+                "affine_qmm_skinny_q4",
+                DType::Float32,
+                &skinny_constants,
+            )?;
+
+            let m_u32 = super::checked_u32(m, "M")?;
+            let n_u32 = super::checked_u32(n, "N")?;
+            let k_u32 = super::checked_u32(k, "K")?;
+            let kp_u32 = super::checked_u32(k_partitions, "k_partitions")?;
+
+            let m_buf = dev.new_buffer_with_data(&m_u32 as *const u32 as *const _, 4, opts);
+            let n_buf = dev.new_buffer_with_data(&n_u32 as *const u32 as *const _, 4, opts);
+            let k_buf = dev.new_buffer_with_data(&k_u32 as *const u32 as *const _, 4, opts);
+            let kp_buf = dev.new_buffer_with_data(&kp_u32 as *const u32 as *const _, 4, opts);
+
+            if k_partitions == 1 {
+                // No split-K: write directly to output
+                let out = Array::zeros(dev, &[m, n], DType::Float32);
+
+                let cb = queue.new_command_buffer();
+                let enc = cb.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&pipeline);
+                enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
+                enc.set_buffer(1, Some(&qw.weights_buf), 0);
+                enc.set_buffer(2, Some(&qw.scales_buf), 0);
+                enc.set_buffer(3, Some(&qw.biases_buf), 0);
+                enc.set_buffer(4, Some(out.metal_buffer()), 0);
+                enc.set_buffer(5, Some(&m_buf), 0);
+                enc.set_buffer(6, Some(&n_buf), 0);
+                enc.set_buffer(7, Some(&k_buf), 0);
+                enc.set_buffer(8, Some(&kp_buf), 0);
+
+                let grid = metal::MTLSize::new(sn_tiles as u64, sm_tiles as u64, 1);
+                let tg = metal::MTLSize::new(64, 1, 1);
+                enc.dispatch_thread_groups(grid, tg);
+                enc.end_encoding();
+                super::commit_with_mode(cb, super::ExecMode::Sync);
+
+                Ok(out)
+            } else {
+                // Split-K: partial sums → reduce
+                let partition_stride = m * n;
+                let c_split_size =
+                    (k_partitions * partition_stride * std::mem::size_of::<f32>()) as u64;
+                let c_split_buf = dev.new_buffer(c_split_size, opts);
+                let out = Array::zeros(dev, &[m, n], DType::Float32);
+
+                let cb = queue.new_command_buffer();
+
+                // Phase 1: Split-K partial GEMM
+                let enc = cb.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&pipeline);
+                enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
+                enc.set_buffer(1, Some(&qw.weights_buf), 0);
+                enc.set_buffer(2, Some(&qw.scales_buf), 0);
+                enc.set_buffer(3, Some(&qw.biases_buf), 0);
+                enc.set_buffer(4, Some(&c_split_buf), 0);
+                enc.set_buffer(5, Some(&m_buf), 0);
+                enc.set_buffer(6, Some(&n_buf), 0);
+                enc.set_buffer(7, Some(&k_buf), 0);
+                enc.set_buffer(8, Some(&kp_buf), 0);
+
+                let grid =
+                    metal::MTLSize::new(sn_tiles as u64, sm_tiles as u64, k_partitions as u64);
+                let tg = metal::MTLSize::new(64, 1, 1);
+                enc.dispatch_thread_groups(grid, tg);
+                enc.end_encoding();
+
+                // Phase 2: Reduce
+                let reduce_pipeline = registry.get_pipeline_with_constants(
+                    "skinny_qmm_reduce",
+                    DType::Float32,
+                    &[],
+                )?;
+                let mn_total_u32 = super::checked_u32(partition_stride, "mn_total")?;
+                let n_reduce_buf =
+                    dev.new_buffer_with_data(&n_u32 as *const u32 as *const _, 4, opts);
+                let kp_reduce_buf =
+                    dev.new_buffer_with_data(&kp_u32 as *const u32 as *const _, 4, opts);
+                let mn_buf =
+                    dev.new_buffer_with_data(&mn_total_u32 as *const u32 as *const _, 4, opts);
+
+                let enc2 = cb.new_compute_command_encoder();
+                enc2.set_compute_pipeline_state(&reduce_pipeline);
+                enc2.set_buffer(0, Some(&c_split_buf), 0);
+                enc2.set_buffer(1, Some(out.metal_buffer()), 0);
+                enc2.set_buffer(2, Some(&n_reduce_buf), 0);
+                enc2.set_buffer(3, Some(&kp_reduce_buf), 0);
+                enc2.set_buffer(4, Some(&mn_buf), 0);
+
+                let reduce_grid = metal::MTLSize::new(partition_stride as u64, 1, 1);
+                let reduce_tg = metal::MTLSize::new(partition_stride.min(256) as u64, 1, 1);
+                enc2.dispatch_threads(reduce_grid, reduce_tg);
+                enc2.end_encoding();
+
+                super::commit_with_mode(cb, super::ExecMode::Sync);
+
+                Ok(out)
+            }
+        } else {
+            // --- Standard path: BM=64, BN=64, BK=16 ---
+            let m_tiles = m.div_ceil(STD_BM);
+            let n_tiles = n.div_ceil(STD_BN);
+
+            let align_m = m % STD_BM == 0;
+            let align_n = n % STD_BN == 0;
+
+            let q4_constants = [
+                (200u32, FunctionConstantValue::Bool(align_m)),
+                (201u32, FunctionConstantValue::Bool(align_n)),
+                (202u32, FunctionConstantValue::Bool(false)), // has_residual = false
+                (203u32, FunctionConstantValue::Bool(false)), // has_norm = false
+                (204u32, FunctionConstantValue::Bool(false)), // has_swiglu = false
+                (205u32, FunctionConstantValue::U32(qw.group_size)),
+            ];
+            let pipeline = registry.get_pipeline_with_constants(
+                "affine_qmm_mma_q4",
+                DType::Float32,
+                &q4_constants,
+            )?;
+            let out = Array::zeros(dev, &[m, n], DType::Float32);
+
+            let m_u32 = super::checked_u32(m, "M")?;
+            let n_u32 = super::checked_u32(n, "N")?;
+            let k_u32 = super::checked_u32(k, "K")?;
+            let swizzle_log: u32 = if n_tiles >= 4 { 1 } else { 0 };
+
+            let m_buf = dev.new_buffer_with_data(&m_u32 as *const u32 as *const _, 4, opts);
+            let n_buf = dev.new_buffer_with_data(&n_u32 as *const u32 as *const _, 4, opts);
+            let k_buf = dev.new_buffer_with_data(&k_u32 as *const u32 as *const _, 4, opts);
+            let sw_buf = dev.new_buffer_with_data(&swizzle_log as *const u32 as *const _, 4, opts);
+            let dummy_buf = dev.new_buffer(4, opts);
+
+            let cb = queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&pipeline);
+            enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
+            enc.set_buffer(1, Some(&qw.weights_buf), 0);
+            enc.set_buffer(2, Some(&qw.scales_buf), 0);
+            enc.set_buffer(3, Some(&qw.biases_buf), 0);
+            enc.set_buffer(4, Some(out.metal_buffer()), 0);
+            enc.set_buffer(5, Some(&m_buf), 0);
+            enc.set_buffer(6, Some(&n_buf), 0);
+            enc.set_buffer(7, Some(&k_buf), 0);
+            enc.set_buffer(8, Some(&sw_buf), 0);
+            enc.set_buffer(9, Some(&dummy_buf), 0); // norm_weight (unused)
+            enc.set_buffer(10, Some(&dummy_buf), 0); // inv_rms (unused)
+            enc.set_buffer(11, Some(&dummy_buf), 0); // residual (unused)
+            enc.set_buffer(12, Some(&dummy_buf), 0); // gate_result (unused)
+
+            let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
+            let tg = metal::MTLSize::new(64, 1, 1);
+
+            enc.dispatch_thread_groups(grid, tg);
+            enc.end_encoding();
+            super::commit_with_mode(cb, super::ExecMode::Sync);
+
+            Ok(out)
+        }
+    } else {
+        // Q8 path: keep old architecture (BM=32, BN=32, 2 SG, 64 threads)
+        let q8_bm: usize = 32;
+        let q8_bn: usize = 32;
+        let q8_align_m = m % q8_bm == 0;
+        let q8_align_n = n % q8_bn == 0;
+        let q8_constants = [
+            (200u32, FunctionConstantValue::Bool(q8_align_m)),
+            (201u32, FunctionConstantValue::Bool(q8_align_n)),
+        ];
+        let pipeline = registry.get_pipeline_with_constants(
+            "affine_qmm_mma_q8",
+            DType::Float32,
+            &q8_constants,
+        )?;
+        let out = Array::zeros(dev, &[m, n], DType::Float32);
+
+        let params: [u32; 4] = [
+            super::checked_u32(m, "M")?,
+            super::checked_u32(n, "N")?,
+            super::checked_u32(k, "K")?,
+            qw.group_size,
+        ];
+
+        let params_buf = dev.new_buffer_with_data(
+            params.as_ptr() as *const _,
+            (params.len() * std::mem::size_of::<u32>()) as u64,
+            opts,
+        );
+
+        let cb = queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
+        enc.set_buffer(1, Some(&qw.weights_buf), 0);
+        enc.set_buffer(2, Some(&qw.scales_buf), 0);
+        enc.set_buffer(3, Some(&qw.biases_buf), 0);
+        enc.set_buffer(4, Some(out.metal_buffer()), 0);
+        enc.set_buffer(5, Some(&params_buf), 0);
+
+        let q8_m_tiles = m.div_ceil(q8_bm);
+        let q8_n_tiles = n.div_ceil(q8_bn);
+        let grid = metal::MTLSize::new(q8_n_tiles as u64, q8_m_tiles as u64, 1);
+        let tg = metal::MTLSize::new(64, 1, 1);
+
+        enc.dispatch_thread_groups(grid, tg);
+        enc.end_encoding();
+        super::commit_with_mode(cb, super::ExecMode::Sync);
+
+        Ok(out)
+    }
+}
+
+/// Fused QMM + residual add: `output = QMM(x, qw) + residual`.
+///
+/// Encodes into an existing command buffer. Only Q4 standard path (M > 32).
+/// The residual is added in the store epilogue via `has_residual` function constant.
+#[allow(clippy::too_many_arguments)]
+pub fn qmm_add_residual_into_cb(
+    registry: &KernelRegistry,
+    x: &Array,
+    qw: &QuantizedWeight,
+    residual: &Array,
+    cb: &metal::CommandBufferRef,
+) -> Result<Array, KernelError> {
+    use crate::kernels::FunctionConstantValue;
+
+    let m = x.shape()[0];
+    let k = x.shape()[1];
+    let n = qw.out_features;
+
+    if residual.shape() != &[m, n] {
+        return Err(KernelError::InvalidShape(format!(
+            "qmm_add_residual_into_cb: residual shape must be [{}, {}], got {:?}",
+            m,
+            n,
+            residual.shape()
+        )));
+    }
 
     let dev = registry.device().raw();
     let opts = metal::MTLResourceOptions::StorageModeShared;
-    let params_buf = dev.new_buffer_with_data(
-        params.as_ptr() as *const _,
-        (params.len() * std::mem::size_of::<u32>()) as u64,
-        opts,
-    );
 
-    let cb = queue.new_command_buffer();
+    let std_bm: usize = 64;
+    let std_bn: usize = 64;
+    let m_tiles = m.div_ceil(std_bm);
+    let n_tiles = n.div_ceil(std_bn);
+    let align_m = m % std_bm == 0;
+    let align_n = n % std_bn == 0;
+
+    let q4_constants = [
+        (200u32, FunctionConstantValue::Bool(align_m)),
+        (201u32, FunctionConstantValue::Bool(align_n)),
+        (202u32, FunctionConstantValue::Bool(true)), // has_residual = true
+        (203u32, FunctionConstantValue::Bool(false)),
+        (204u32, FunctionConstantValue::Bool(false)),
+        (205u32, FunctionConstantValue::U32(qw.group_size)),
+    ];
+    let pipeline =
+        registry.get_pipeline_with_constants("affine_qmm_mma_q4", DType::Float32, &q4_constants)?;
+    let out = Array::zeros(dev, &[m, n], DType::Float32);
+
+    let m_u32 = super::checked_u32(m, "M")?;
+    let n_u32 = super::checked_u32(n, "N")?;
+    let k_u32 = super::checked_u32(k, "K")?;
+    let swizzle_log: u32 = if n_tiles >= 4 { 1 } else { 0 };
+
+    let m_buf = dev.new_buffer_with_data(&m_u32 as *const u32 as *const _, 4, opts);
+    let n_buf = dev.new_buffer_with_data(&n_u32 as *const u32 as *const _, 4, opts);
+    let k_buf = dev.new_buffer_with_data(&k_u32 as *const u32 as *const _, 4, opts);
+    let sw_buf = dev.new_buffer_with_data(&swizzle_log as *const u32 as *const _, 4, opts);
+    let dummy_buf = dev.new_buffer(4, opts);
+
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&pipeline);
     enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
@@ -2041,15 +3143,222 @@ pub fn affine_quantized_matmul_batched(
     enc.set_buffer(2, Some(&qw.scales_buf), 0);
     enc.set_buffer(3, Some(&qw.biases_buf), 0);
     enc.set_buffer(4, Some(out.metal_buffer()), 0);
-    enc.set_buffer(5, Some(&params_buf), 0);
+    enc.set_buffer(5, Some(&m_buf), 0);
+    enc.set_buffer(6, Some(&n_buf), 0);
+    enc.set_buffer(7, Some(&k_buf), 0);
+    enc.set_buffer(8, Some(&sw_buf), 0);
+    enc.set_buffer(9, Some(&dummy_buf), 0); // norm_weight (unused)
+    enc.set_buffer(10, Some(&dummy_buf), 0); // inv_rms (unused)
+    enc.set_buffer(11, Some(residual.metal_buffer()), residual.offset() as u64);
+    enc.set_buffer(12, Some(&dummy_buf), 0); // gate_result (unused)
 
-    // Grid: (ceil(N/BN), ceil(M/BM), 1) threadgroups
-    // Threadgroup: 64 threads (2 simdgroups of 32)
-    let grid_x = n.div_ceil(BN) as u64;
-    let grid_y = m.div_ceil(BM) as u64;
-    let grid = metal::MTLSize::new(grid_x, grid_y, 1);
+    let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
     let tg = metal::MTLSize::new(64, 1, 1);
+    enc.dispatch_thread_groups(grid, tg);
+    enc.end_encoding();
 
+    Ok(out)
+}
+
+/// Fused QMM + SwiGLU: `output = silu(gate_result) * QMM(x, qw)`.
+///
+/// Encodes into an existing command buffer. Only Q4 standard path (M > 32).
+/// The SwiGLU fusion is applied in the store epilogue via `has_swiglu` function constant.
+#[allow(clippy::too_many_arguments)]
+pub fn qmm_swiglu_into_cb(
+    registry: &KernelRegistry,
+    x: &Array,
+    qw: &QuantizedWeight,
+    gate_result: &Array,
+    cb: &metal::CommandBufferRef,
+) -> Result<Array, KernelError> {
+    use crate::kernels::FunctionConstantValue;
+
+    let m = x.shape()[0];
+    let k = x.shape()[1];
+    let n = qw.out_features;
+
+    if gate_result.shape() != &[m, n] {
+        return Err(KernelError::InvalidShape(format!(
+            "qmm_swiglu_into_cb: gate_result shape must be [{}, {}], got {:?}",
+            m,
+            n,
+            gate_result.shape()
+        )));
+    }
+
+    let dev = registry.device().raw();
+    let opts = metal::MTLResourceOptions::StorageModeShared;
+
+    let std_bm: usize = 64;
+    let std_bn: usize = 64;
+    let m_tiles = m.div_ceil(std_bm);
+    let n_tiles = n.div_ceil(std_bn);
+    let align_m = m % std_bm == 0;
+    let align_n = n % std_bn == 0;
+
+    let q4_constants = [
+        (200u32, FunctionConstantValue::Bool(align_m)),
+        (201u32, FunctionConstantValue::Bool(align_n)),
+        (202u32, FunctionConstantValue::Bool(false)),
+        (203u32, FunctionConstantValue::Bool(false)),
+        (204u32, FunctionConstantValue::Bool(true)), // has_swiglu = true
+        (205u32, FunctionConstantValue::U32(qw.group_size)),
+    ];
+    let pipeline =
+        registry.get_pipeline_with_constants("affine_qmm_mma_q4", DType::Float32, &q4_constants)?;
+    let out = Array::zeros(dev, &[m, n], DType::Float32);
+
+    let m_u32 = super::checked_u32(m, "M")?;
+    let n_u32 = super::checked_u32(n, "N")?;
+    let k_u32 = super::checked_u32(k, "K")?;
+    let swizzle_log: u32 = if n_tiles >= 4 { 1 } else { 0 };
+
+    let m_buf = dev.new_buffer_with_data(&m_u32 as *const u32 as *const _, 4, opts);
+    let n_buf = dev.new_buffer_with_data(&n_u32 as *const u32 as *const _, 4, opts);
+    let k_buf = dev.new_buffer_with_data(&k_u32 as *const u32 as *const _, 4, opts);
+    let sw_buf = dev.new_buffer_with_data(&swizzle_log as *const u32 as *const _, 4, opts);
+    let dummy_buf = dev.new_buffer(4, opts);
+
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
+    enc.set_buffer(1, Some(&qw.weights_buf), 0);
+    enc.set_buffer(2, Some(&qw.scales_buf), 0);
+    enc.set_buffer(3, Some(&qw.biases_buf), 0);
+    enc.set_buffer(4, Some(out.metal_buffer()), 0);
+    enc.set_buffer(5, Some(&m_buf), 0);
+    enc.set_buffer(6, Some(&n_buf), 0);
+    enc.set_buffer(7, Some(&k_buf), 0);
+    enc.set_buffer(8, Some(&sw_buf), 0);
+    enc.set_buffer(9, Some(&dummy_buf), 0); // norm_weight (unused)
+    enc.set_buffer(10, Some(&dummy_buf), 0); // inv_rms (unused)
+    enc.set_buffer(11, Some(&dummy_buf), 0); // residual (unused)
+    enc.set_buffer(
+        12,
+        Some(gate_result.metal_buffer()),
+        gate_result.offset() as u64,
+    );
+
+    let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
+    let tg = metal::MTLSize::new(64, 1, 1);
+    enc.dispatch_thread_groups(grid, tg);
+    enc.end_encoding();
+
+    Ok(out)
+}
+
+/// Steel-architecture affine quantized matrix-matrix multiply (Q4 only).
+///
+/// Uses the `affine_qmm_steel_q4` kernel with:
+/// - BM=32, BN=32, BK=32 tiles (matching MLX steel GEMM dimensions)
+/// - K-contiguous B loader (MLX QuantizedBlockLoader pattern)
+/// - BK_padded=40 for bank conflict avoidance
+/// - half input (f32→half pre-conversion)
+/// - Double-buffered A/B tiles
+///
+/// This kernel is expected to be significantly faster than `affine_qmm_mma_q4`
+/// due to coalesced B loads and reduced barrier overhead.
+///
+/// The input `x` must be Float32; it will be converted to Float16 internally
+/// before dispatch.
+pub fn affine_quantized_matmul_steel(
+    registry: &KernelRegistry,
+    x: &Array,
+    qw: &QuantizedWeight,
+    queue: &metal::CommandQueue,
+) -> Result<Array, KernelError> {
+    if x.dtype() != DType::Float32 {
+        return Err(KernelError::InvalidShape(format!(
+            "affine_quantized_matmul_steel requires Float32 input x, got {:?}",
+            x.dtype()
+        )));
+    }
+    if x.ndim() != 2 {
+        return Err(KernelError::InvalidShape(format!(
+            "affine_quantized_matmul_steel requires 2D input x, got {}D",
+            x.ndim()
+        )));
+    }
+    if x.shape()[1] != qw.in_features {
+        return Err(KernelError::InvalidShape(format!(
+            "x.shape[1] ({}) != in_features ({})",
+            x.shape()[1],
+            qw.in_features
+        )));
+    }
+    if qw.bits != 4 {
+        return Err(KernelError::InvalidShape(format!(
+            "affine_quantized_matmul_steel requires bits==4, got {}",
+            qw.bits
+        )));
+    }
+
+    let m = x.shape()[0];
+    let n = qw.out_features;
+    let k = qw.in_features;
+
+    let dev = registry.device().raw();
+    let opts = metal::MTLResourceOptions::StorageModeShared;
+
+    // --- Step 1: Convert f32 input to half ---
+    // Use a simple GPU cast kernel or CPU fallback.
+    // For now, allocate a half buffer and use the GPU cast.
+    let x_half = crate::ops::copy::copy_cast(registry, x, DType::Float16, queue)?;
+
+    // --- Step 2: Dispatch steel kernel ---
+    const STEEL_BM: usize = 32;
+    const STEEL_BN: usize = 32;
+
+    let m_tiles = m.div_ceil(STEEL_BM);
+    let n_tiles = n.div_ceil(STEEL_BN);
+
+    let align_m = m % STEEL_BM == 0;
+    let align_n = n % STEEL_BN == 0;
+
+    let steel_constants = [
+        (200u32, FunctionConstantValue::Bool(align_m)),
+        (201u32, FunctionConstantValue::Bool(align_n)),
+        (202u32, FunctionConstantValue::Bool(false)), // has_residual
+        (204u32, FunctionConstantValue::Bool(false)), // has_swiglu
+        (205u32, FunctionConstantValue::U32(qw.group_size)),
+    ];
+    let pipeline = registry.get_pipeline_with_constants(
+        "affine_qmm_steel_q4",
+        DType::Float32,
+        &steel_constants,
+    )?;
+
+    let out = Array::zeros(dev, &[m, n], DType::Float32);
+
+    let m_u32 = super::checked_u32(m, "M")?;
+    let n_u32 = super::checked_u32(n, "N")?;
+    let k_u32 = super::checked_u32(k, "K")?;
+    let swizzle_log: u32 = if n_tiles >= 4 { 1 } else { 0 };
+
+    let m_buf = dev.new_buffer_with_data(&m_u32 as *const u32 as *const _, 4, opts);
+    let n_buf = dev.new_buffer_with_data(&n_u32 as *const u32 as *const _, 4, opts);
+    let k_buf = dev.new_buffer_with_data(&k_u32 as *const u32 as *const _, 4, opts);
+    let sw_buf = dev.new_buffer_with_data(&swizzle_log as *const u32 as *const _, 4, opts);
+    let dummy_buf = dev.new_buffer(4, opts);
+
+    let cb = queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_buffer(0, Some(x_half.metal_buffer()), x_half.offset() as u64);
+    enc.set_buffer(1, Some(&qw.weights_buf), 0);
+    enc.set_buffer(2, Some(&qw.scales_buf), 0);
+    enc.set_buffer(3, Some(&qw.biases_buf), 0);
+    enc.set_buffer(4, Some(out.metal_buffer()), 0);
+    enc.set_buffer(5, Some(&m_buf), 0);
+    enc.set_buffer(6, Some(&n_buf), 0);
+    enc.set_buffer(7, Some(&k_buf), 0);
+    enc.set_buffer(8, Some(&sw_buf), 0);
+    enc.set_buffer(9, Some(&dummy_buf), 0); // residual (unused)
+    enc.set_buffer(10, Some(&dummy_buf), 0); // gate_result (unused)
+
+    let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
+    let tg = metal::MTLSize::new(64, 1, 1);
     enc.dispatch_thread_groups(grid, tg);
     enc.end_encoding();
     super::commit_with_mode(cb, super::ExecMode::Sync);
