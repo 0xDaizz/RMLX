@@ -21,6 +21,7 @@ pub mod prefix_cache;
 pub mod quantized_linear;
 pub mod rms_norm;
 pub mod rope;
+pub mod safetensors_loader;
 pub mod sampler;
 pub mod scheduler;
 pub mod sliding_window;
@@ -54,6 +55,7 @@ pub use quantized_linear::{
 };
 pub use rms_norm::{RMSNorm, RMSNormConfig};
 pub use rope::{RotaryPositionEmbedding, RotaryPositionEmbeddingConfig};
+pub use safetensors_loader::{QuantizationConfig, SafetensorsLoadError, SafetensorsWeightMap};
 pub use sampler::{Sampler, SamplerConfig};
 pub use scheduler::{Scheduler, SchedulerConfig, SchedulerError, SchedulerOutput, SeqMeta};
 pub use sliding_window::{SlidingWindowAttention, SlidingWindowAttentionConfig};

@@ -5,7 +5,6 @@ pub mod concat;
 pub mod conv;
 pub mod conv_tiled;
 pub mod copy;
-pub mod flash_attention;
 pub mod fp8;
 pub mod fused;
 pub mod gather_mm;
@@ -108,7 +107,6 @@ pub fn register_all(registry: &KernelRegistry) -> Result<(), KernelError> {
     select::register(registry)?;
     concat::register(registry)?;
     vjp_gpu::register(registry)?;
-    flash_attention::register(registry)?;
     // PR 5.3: Missing critical ops
     slice::register(registry)?;
     sort::register(registry)?;

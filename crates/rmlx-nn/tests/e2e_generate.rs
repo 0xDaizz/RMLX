@@ -188,6 +188,7 @@ fn build_tiny_model(device: &metal::Device) -> TransformerModel {
             up_proj,
             down_proj,
             gate_up_merged_weight: None,
+            gate_up_merged_weight_t: None,
         };
 
         // Norm weights: [HIDDEN], initialized to 1.0 (like a real RMSNorm init)

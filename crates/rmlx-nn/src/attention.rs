@@ -1650,6 +1650,8 @@ pub struct Attention {
     o_proj: Linear,
     /// Merged QKV weight [q_out + k_out + v_out, in_features] for 9-dispatch path.
     qkv_merged_weight: Option<Array>,
+    /// Transposed merged QKV weight [in_features, q_out + k_out + v_out] for prefill GEMM.
+    qkv_merged_weight_t: Option<Array>,
 }
 
 impl Attention {
@@ -1681,6 +1683,7 @@ impl Attention {
             }),
             config,
             qkv_merged_weight: None,
+            qkv_merged_weight_t: None,
         })
     }
 
@@ -1700,6 +1703,7 @@ impl Attention {
             v_proj,
             o_proj,
             qkv_merged_weight: None,
+            qkv_merged_weight_t: None,
         })
     }
 
@@ -2687,18 +2691,55 @@ impl Attention {
         let normed =
             ops::rms_norm::rms_norm_into_cb(registry, x, Some(norm_weight), rms_norm_eps, cb)?;
 
-        // Q/K/V projections — batched into fewer encoders via fused dispatch.
-        // Uses pre-transposed weights (from prepare_weights_for_graph) when available.
+        // Q/K/V projections — merged into a single GEMM dispatch when available.
+        let q_dim = num_heads * head_dim;
+        let k_dim = num_kv_heads * head_dim;
+        let v_dim = num_kv_heads * head_dim;
         let (q, k, v) = {
-            let wq_t = self.q_proj.weight_transposed_contiguous()?;
-            let wk_t = self.k_proj.weight_transposed_contiguous()?;
-            let wv_t = self.v_proj.weight_transposed_contiguous()?;
             let normed_2d = if normed.ndim() == 1 {
                 normed.reshape(vec![1, normed.shape()[0]])?
             } else {
                 normed.reshape(vec![normed.shape()[0], normed.shape()[1]])?
             };
-            ops::fused::batched_qkv_proj_into(registry, &normed_2d, &wq_t, &wk_t, &wv_t, cb)?
+            if let Some(ref qkv_wt) = self.qkv_merged_weight_t {
+                // Single merged GEMM: [seq_len, hidden] @ [hidden, q+k+v] = [seq_len, q+k+v]
+                let qkv = ops::matmul::matmul_into_cb(registry, &normed_2d, qkv_wt, cb)?;
+                let total_out = q_dim + k_dim + v_dim;
+                let elem_size = qkv.dtype().size_of();
+                // Offset slice views (non-contiguous: stride[0] = total_out)
+                let q_view = Array::new(
+                    qkv.metal_buffer().to_owned(),
+                    vec![seq_len, q_dim],
+                    vec![total_out, 1],
+                    qkv.dtype(),
+                    qkv.offset(),
+                );
+                let k_view = Array::new(
+                    qkv.metal_buffer().to_owned(),
+                    vec![seq_len, k_dim],
+                    vec![total_out, 1],
+                    qkv.dtype(),
+                    qkv.offset() + q_dim * elem_size,
+                );
+                let v_view = Array::new(
+                    qkv.metal_buffer().to_owned(),
+                    vec![seq_len, v_dim],
+                    vec![total_out, 1],
+                    qkv.dtype(),
+                    qkv.offset() + (q_dim + k_dim) * elem_size,
+                );
+                // Copy to contiguous buffers for downstream kernels
+                let q = ops::copy::copy_into_cb(registry, &q_view, cb)?;
+                let k = ops::copy::copy_into_cb(registry, &k_view, cb)?;
+                let v = ops::copy::copy_into_cb(registry, &v_view, cb)?;
+                (q, k, v)
+            } else {
+                // Fallback: 3 separate GEMMs
+                let wq_t = self.q_proj.weight_transposed_contiguous()?;
+                let wk_t = self.k_proj.weight_transposed_contiguous()?;
+                let wv_t = self.v_proj.weight_transposed_contiguous()?;
+                ops::fused::batched_qkv_proj_into(registry, &normed_2d, &wq_t, &wk_t, &wv_t, cb)?
+            }
         };
 
         let elem_size = q.dtype().size_of();
@@ -2911,6 +2952,39 @@ impl Attention {
             q_w.dtype(),
             0,
         ));
+
+        // Also create transposed merged weight [cols, total_rows] for prefill GEMM.
+        // Column-concatenate the transposed individual weights.
+        let buf_t = device.new_buffer(
+            total_bytes as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        unsafe {
+            let dst = buf_t.contents() as *mut u8;
+            // Transpose: dst[col][row] = src[row][col]
+            // src is [total_rows, cols], dst is [cols, total_rows]
+            let src = self
+                .qkv_merged_weight
+                .as_ref()
+                .unwrap()
+                .metal_buffer()
+                .contents() as *const u8;
+            for r in 0..total_rows {
+                for c in 0..cols {
+                    let src_idx = (r * cols + c) * elem_size;
+                    let dst_idx = (c * total_rows + r) * elem_size;
+                    std::ptr::copy_nonoverlapping(src.add(src_idx), dst.add(dst_idx), elem_size);
+                }
+            }
+        }
+        self.qkv_merged_weight_t = Some(Array::new(
+            buf_t,
+            vec![cols, total_rows],
+            vec![total_rows, 1],
+            q_w.dtype(),
+            0,
+        ));
+
         Ok(())
     }
 
@@ -2924,6 +2998,9 @@ impl Attention {
         self.o_proj.convert_weights_private(device, queue);
         if let Some(w) = self.qkv_merged_weight.take() {
             self.qkv_merged_weight = Some(w.to_private(device, queue));
+        }
+        if let Some(w) = self.qkv_merged_weight_t.take() {
+            self.qkv_merged_weight_t = Some(w.to_private(device, queue));
         }
     }
 

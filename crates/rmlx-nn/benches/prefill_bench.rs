@@ -187,6 +187,7 @@ fn build_transformer_block(device: &metal::Device) -> TransformerBlock {
         up_proj,
         down_proj,
         gate_up_merged_weight: None,
+        gate_up_merged_weight_t: None,
     };
 
     let norm1_weight = {
