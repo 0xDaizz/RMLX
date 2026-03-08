@@ -1899,6 +1899,162 @@ kernel void splitk_pass1_mlx_f16(
     }
 }
 
+// ===== Small-tile Split-K: BM=32, BN=32, BK=16 =====
+// For M<=32 problems where BM=64 wastes 50-75% of tile rows.
+// 64 threads = 2 simdgroups (1×2 grid). TM=4, TN=2.
+// TG memory: 32*16*2 + 16*32*2 = 2KB.
+
+constant constexpr uint SK3_BM = 32;
+constant constexpr uint SK3_BN = 32;
+constant constexpr uint SK3_BK = 16;
+constant constexpr uint SK3_TM = 4;   // BM / 8
+constant constexpr uint SK3_TN = 2;   // (BN/2) / 8
+
+kernel void splitk_small_pass1_f16(
+    device const half* A      [[buffer(0)]],
+    device const half* B      [[buffer(1)]],
+    device float* C_partial   [[buffer(2)]],
+    constant uint& M          [[buffer(3)]],
+    constant uint& N          [[buffer(4)]],
+    constant uint& K          [[buffer(5)]],
+    constant uint& n_splits   [[buffer(6)]],
+    constant uint& swizzle_log [[buffer(7)]],
+    uint3 group_id            [[threadgroup_position_in_grid]],
+    uint  tid_in_group        [[thread_index_in_threadgroup]],
+    uint  sgid                [[simdgroup_index_in_threadgroup]],
+    uint  lane_id             [[thread_index_in_simdgroup]])
+{
+    threadgroup half As[SK3_BM * SK3_BK];  // 32x16 = 1KB
+    threadgroup half Bs[SK3_BK * SK3_BN];  // 16x32 = 1KB
+
+    const uint split_idx = group_id.z;
+    uint2 swizzled = sk2_swizzle_tg(uint2(group_id.x, group_id.y), swizzle_log);
+    const uint row_start = swizzled.y * sk2_as_uniform(SK3_BM);
+    const uint col_start = swizzled.x * sk2_as_uniform(SK3_BN);
+
+    // SG grid: 1x2 -- each SG covers 16 cols
+    const uint base_n = sgid * 16;
+
+    simdgroup_float8x8 acc[SK3_TM][SK3_TN];
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < SK3_TM; i++)
+        #pragma clang loop unroll(full)
+        for (uint j = 0; j < SK3_TN; j++)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    const uint uK = sk2_as_uniform(K);
+    const uint uM = sk2_as_uniform(M);
+    const uint uN = sk2_as_uniform(N);
+
+    // K range for this split
+    uint k_per_split = (uK + n_splits - 1) / n_splits;
+    uint k_start = split_idx * k_per_split;
+    uint k_end = min(k_start + k_per_split, uK);
+    uint n_tiles = (k_end - k_start + SK3_BK - 1) / SK3_BK;
+
+    for (uint tile = 0; tile < n_tiles; tile++) {
+        uint kb = k_start + tile * SK3_BK;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Load A tile: 64 threads load 32x16 = 512 elements (8 per thread)
+        {
+            uint a_row = tid_in_group / 2;        // 0..31
+            uint a_col_base = (tid_in_group % 2) * 8;  // 0 or 8
+            uint gr = row_start + a_row;
+            if ((align_M || gr < uM) && kb + a_col_base + 7 < k_end) {
+                *reinterpret_cast<threadgroup half4*>(&As[a_row * SK3_BK + a_col_base]) =
+                    *reinterpret_cast<device const half4*>(&A[gr * uK + kb + a_col_base]);
+                *reinterpret_cast<threadgroup half4*>(&As[a_row * SK3_BK + a_col_base + 4]) =
+                    *reinterpret_cast<device const half4*>(&A[gr * uK + kb + a_col_base + 4]);
+            } else if (align_M || gr < uM) {
+                for (uint d = 0; d < 8; d++) {
+                    As[a_row * SK3_BK + a_col_base + d] = (kb + a_col_base + d < k_end)
+                        ? A[gr * uK + kb + a_col_base + d] : half(0);
+                }
+            } else {
+                for (uint d = 0; d < 8; d++) {
+                    As[a_row * SK3_BK + a_col_base + d] = half(0);
+                }
+            }
+        }
+
+        // Load B tile: 64 threads load 16x32 = 512 elements (8 per thread)
+        {
+            uint b_row = tid_in_group / 4;         // 0..15
+            uint b_col_base = (tid_in_group % 4) * 8;  // 0, 8, 16, 24
+            uint gr = kb + b_row;
+            uint gc = col_start + b_col_base;
+            if (gr < k_end && (align_N || gc + 7 < uN)) {
+                *reinterpret_cast<threadgroup half4*>(&Bs[b_row * SK3_BN + b_col_base]) =
+                    *reinterpret_cast<device const half4*>(&B[gr * uN + gc]);
+                *reinterpret_cast<threadgroup half4*>(&Bs[b_row * SK3_BN + b_col_base + 4]) =
+                    *reinterpret_cast<device const half4*>(&B[gr * uN + gc + 4]);
+            } else {
+                for (uint d = 0; d < 8; d++) {
+                    Bs[b_row * SK3_BN + b_col_base + d] = (gr < k_end && (align_N || gc + d < uN))
+                        ? B[gr * uN + gc + d] : half(0);
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // MMA compute (serpentine)
+        #pragma clang loop unroll(full)
+        for (uint kk = 0; kk < 2; kk++) {
+            simdgroup_half8x8 a_frag[SK3_TM];
+            simdgroup_half8x8 b_frag[SK3_TN];
+
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < SK3_TM; i++)
+                simdgroup_load(a_frag[i], &As[(i * 8) * SK3_BK + kk * 8], SK3_BK);
+
+            #pragma clang loop unroll(full)
+            for (uint j = 0; j < SK3_TN; j++)
+                simdgroup_load(b_frag[j], &Bs[kk * 8 * SK3_BN + (base_n + j * 8)], SK3_BN);
+
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < SK3_TM; i++)
+                #pragma clang loop unroll(full)
+                for (uint j = 0; j < SK3_TN; j++) {
+                    uint n_serp = (i % 2) ? (SK3_TN - 1 - j) : j;
+                    simdgroup_multiply_accumulate(
+                        acc[i][n_serp], a_frag[i], b_frag[n_serp], acc[i][n_serp]);
+                }
+        }
+    }
+
+    // Store f32 partial results via direct store (thread_elements)
+    const uint qid = lane_id / 4;
+    const uint fm = (qid & 4u) + ((lane_id / 2u) % 4u);
+    const uint fn_val = (qid & 2u) * 2u + (lane_id % 2u) * 2u;
+
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < SK3_TM; i++) {
+        #pragma clang loop unroll(full)
+        for (uint j = 0; j < SK3_TN; j++) {
+            uint gr = row_start + i * 8 + fm;
+            uint gc0 = col_start + base_n + j * 8 + fn_val;
+            uint gc1 = gc0 + 1;
+
+            auto elems = acc[i][j].thread_elements();
+
+            if (align_M && align_N) {
+                C_partial[split_idx * uM * uN + gr * uN + gc0] = elems[0];
+                C_partial[split_idx * uM * uN + gr * uN + gc1] = elems[1];
+            } else {
+                if ((align_M || gr < uM) && (align_N || gc0 < uN)) {
+                    C_partial[split_idx * uM * uN + gr * uN + gc0] = elems[0];
+                }
+                if ((align_M || gr < uM) && (align_N || gc1 < uN)) {
+                    C_partial[split_idx * uM * uN + gr * uN + gc1] = elems[1];
+                }
+            }
+        }
+    }
+}
+
 // Pass 2: reduce f32 partial sums across splits -> half output.
 kernel void splitk_reduce_f16(
     device const float* partial [[buffer(0)]],
@@ -3195,8 +3351,9 @@ pub fn matmul(
         let tile = select_tile_config_with_dtype(m, n, k, DType::Float16);
         let non_splitk_tgs = m.div_ceil(tile.bm) * n.div_ceil(tile.bn);
         if non_splitk_tgs < gpu_cores * 2 && k >= 256 {
-            // Compute splits based on the split-K kernel's actual BM=64, BN=64 tiles
-            let splitk_tgs = m.div_ceil(64) * n.div_ceil(64);
+            // Select split-K tile size: BM=32 for small M, BM=64 otherwise
+            let (splitk_bm, splitk_bn) = if m <= 32 { (32, 32) } else { (64, 64) };
+            let splitk_tgs = m.div_ceil(splitk_bm) * n.div_ceil(splitk_bn);
             let target = gpu_cores * 2;
             let splits = (target / splitk_tgs.max(1)).min(k / 128).min(8);
             if splits > 1 {
@@ -3518,16 +3675,23 @@ fn dispatch_split_k_f16(
     let partial = Array::zeros(dev, &[n_splits * m * n], DType::Float32);
     let out = Array::zeros(dev, &[m, n], DType::Float16);
 
+    // Select tile size: BM=32 for small M, BM=64 otherwise
+    let (bm, bn, kernel_name) = if m <= 32 {
+        (32usize, 32usize, "splitk_small_pass1_f16")
+    } else {
+        (64usize, 64usize, "splitk_pass1_mlx_f16")
+    };
+
     // Pass 1: MLX-arch split-k
-    let constants = matmul_align_constants(m, n, 64, 64);
+    let constants = matmul_align_constants(m, n, bm, bn);
     let pass1_pipeline =
-        registry.get_pipeline_with_constants("splitk_pass1_mlx_f16", DType::Float16, &constants)?;
+        registry.get_pipeline_with_constants(kernel_name, DType::Float16, &constants)?;
 
     let m_buf = make_u32_buf(dev, super::checked_u32(m, "M")?);
     let n_buf = make_u32_buf(dev, super::checked_u32(n, "N")?);
     let k_buf = make_u32_buf(dev, super::checked_u32(k, "K")?);
     let splits_buf = make_u32_buf(dev, super::checked_u32(n_splits, "n_splits")?);
-    let swizzle_log = compute_swizzle_log(m, n, 64, 64);
+    let swizzle_log = compute_swizzle_log(m, n, bm, bn);
     let swizzle_buf = make_u32_buf(dev, swizzle_log);
 
     let cb = queue.new_command_buffer();
@@ -3546,8 +3710,8 @@ fn dispatch_split_k_f16(
         enc.set_buffer(7, Some(&swizzle_buf), 0);
 
         let grid = MTLSize::new(
-            ceil_div(n, 64) as u64,
-            ceil_div(m, 64) as u64,
+            ceil_div(n, bn) as u64,
+            ceil_div(m, bm) as u64,
             n_splits as u64,
         );
         let tg = MTLSize::new(64, 1, 1);
