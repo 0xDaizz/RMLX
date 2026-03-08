@@ -53,10 +53,44 @@ impl FusionCodegen {
             }
         }
 
-        // Generate
-        let source = Self::emit_kernel(graph);
+        // Generate with default name
+        let source = Self::emit_kernel_named(graph, "fused_elementwise");
 
         // Cache
+        if let Ok(mut cache) = self.cache.write() {
+            cache.insert(key, source.clone());
+        }
+
+        Ok(source)
+    }
+
+    /// Generate Metal source with a specific kernel function name.
+    ///
+    /// This avoids pipeline cache collisions when multiple fusion graphs
+    /// are compiled — each gets a unique function name.
+    pub fn generate_named(&self, graph: &FusionGraph, name: &str) -> Result<String, String> {
+        for (op, _) in graph.ops() {
+            match op {
+                FusableOp::CastF16ToF32 | FusableOp::CastBf16ToF32 | FusableOp::CastF32ToF16 => {
+                    return Err(format!(
+                        "fusion codegen does not yet support cast ops: {:?}",
+                        op
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        let key = graph.cache_key();
+
+        if let Ok(cache) = self.cache.read() {
+            if let Some(source) = cache.get(&key) {
+                return Ok(source.clone());
+            }
+        }
+
+        let source = Self::emit_kernel_named(graph, name);
+
         if let Ok(mut cache) = self.cache.write() {
             cache.insert(key, source.clone());
         }
@@ -76,8 +110,9 @@ impl FusionCodegen {
         }
     }
 
-    /// Emit a Metal kernel source for the given fusion graph.
-    fn emit_kernel(graph: &FusionGraph) -> String {
+    /// Emit a Metal kernel source for the given fusion graph with a specific
+    /// kernel function name.
+    fn emit_kernel_named(graph: &FusionGraph, name: &str) -> String {
         let n_inputs = graph.n_inputs();
         let n_outputs = graph.n_outputs();
         let ops = graph.ops();
@@ -87,7 +122,7 @@ impl FusionCodegen {
         src.push_str("#include <metal_stdlib>\nusing namespace metal;\n\n");
 
         // Kernel signature
-        src.push_str("kernel void fused_elementwise(\n");
+        src.push_str(&format!("kernel void {name}(\n"));
 
         // Input buffers
         for i in 0..n_inputs {
