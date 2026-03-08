@@ -411,6 +411,24 @@ Phase 11 investigated three alternative GEMV kernel strategies to push below the
 
 The experimental kernel variants remain in the codebase but are not on the hot path. Row-major BM8 GEMV with f32 accumulation at 73.6% bandwidth efficiency is the practical floor for f16 decode on Apple Silicon.
 
+### Phase C: GEMM Kernel-Level Optimization
+
+Phase C applies kernel-level optimizations to the GEMM kernel, building on the Phase B config sweep results. Three optimizations were tested via a 6-variant ablation benchmark (`gemm_kernel_opt.rs`):
+
+| Optimization | Description | Result |
+|-------------|-------------|--------|
+| `direct_store` | Write from simdgroup registers directly to device memory (no scratch buffer) | -1-2% (non-coalesced scatter) |
+| `wide_load` | 2×half4 per iteration (8 elements vs 4) | **+5% (applied)** |
+| `aligned` | Remove bounds checks for tile-aligned dimensions | Performance collapse on large matrices |
+
+Additionally, the SG=2×4 layout (confirmed optimal in Phase B) was applied to the production matmul.rs kernels (f32/f16/bf16), and `gemm_bench.rs` was fixed to use direct kernel dispatch with pre-allocated buffers.
+
+| Metric | Before | After |
+|--------|-------:|------:|
+| GEMM TFLOPS (M=2048, N=14336) | 15.73T | 21.21T |
+| Improvement | — | +34.8% |
+| vs MLX (23.97T) | — | -11.5% |
+
 ---
 
 ### flash_attention.rs -- FlashAttention-2 Metal Kernel (Phase 3)
