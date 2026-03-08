@@ -2145,6 +2145,7 @@ kernel void gemm_mlx_f16(
     device const half* A_batch = A + batch_idx * mlx_as_uniform(batch_stride_a);
     device const half* B_batch = B + batch_idx * mlx_as_uniform(batch_stride_b);
     device half*       C_batch = C + batch_idx * mlx_as_uniform(batch_stride_c);
+    device const half* R_batch = has_residual ? (residual + batch_idx * mlx_as_uniform(batch_stride_c)) : nullptr;
 
     // SG grid: 1x2 -- sg_row always 0, sg_col = sgid (0 or 1)
     const uint base_m = 0;        // WM=1, single row of SG
@@ -2264,14 +2265,24 @@ kernel void gemm_mlx_f16(
 
             // When both align_M and align_N are true, all stores are in-bounds.
             if (align_M && align_N) {
-                C_batch[gr * uN + gc0] = half(elems[0]);
-                C_batch[gr * uN + gc1] = half(elems[1]);
+                half v0 = half(elems[0]);
+                half v1 = half(elems[1]);
+                if (has_residual) {
+                    v0 += R_batch[gr * uN + gc0];
+                    v1 += R_batch[gr * uN + gc1];
+                }
+                C_batch[gr * uN + gc0] = v0;
+                C_batch[gr * uN + gc1] = v1;
             } else {
                 if ((align_M || gr < uM) && (align_N || gc0 < uN)) {
-                    C_batch[gr * uN + gc0] = half(elems[0]);
+                    half v0 = half(elems[0]);
+                    if (has_residual) v0 += R_batch[gr * uN + gc0];
+                    C_batch[gr * uN + gc0] = v0;
                 }
                 if ((align_M || gr < uM) && (align_N || gc1 < uN)) {
-                    C_batch[gr * uN + gc1] = half(elems[1]);
+                    half v1 = half(elems[1]);
+                    if (has_residual) v1 += R_batch[gr * uN + gc1];
+                    C_batch[gr * uN + gc1] = v1;
                 }
             }
         }
@@ -2289,6 +2300,7 @@ kernel void gemm_mlx_f32(
     constant uint& batch_stride_b [[buffer(7)]],
     constant uint& batch_stride_c [[buffer(8)]],
     constant uint& swizzle_log    [[buffer(9)]],
+    device const float* residual   [[buffer(10)]],
     uint3 group_id       [[threadgroup_position_in_grid]],
     uint  tid_in_group   [[thread_index_in_threadgroup]],
     uint  sgid           [[simdgroup_index_in_threadgroup]],
@@ -2305,6 +2317,7 @@ kernel void gemm_mlx_f32(
     device const float* A_batch = A + batch_idx * mlx_as_uniform(batch_stride_a);
     device const float* B_batch = B + batch_idx * mlx_as_uniform(batch_stride_b);
     device float*       C_batch = C + batch_idx * mlx_as_uniform(batch_stride_c);
+    device const float* R_batch = has_residual ? (residual + batch_idx * mlx_as_uniform(batch_stride_c)) : nullptr;
 
     // SG grid: 1x2 -- sg_row always 0, sg_col = sgid (0 or 1)
     const uint base_m = 0;        // WM=1, single row of SG
@@ -2419,14 +2432,24 @@ kernel void gemm_mlx_f32(
             auto elems = acc[i][j].thread_elements();
 
             if (align_M && align_N) {
-                C_batch[gr * uN + gc0] = elems[0];
-                C_batch[gr * uN + gc1] = elems[1];
+                float v0 = elems[0];
+                float v1 = elems[1];
+                if (has_residual) {
+                    v0 += R_batch[gr * uN + gc0];
+                    v1 += R_batch[gr * uN + gc1];
+                }
+                C_batch[gr * uN + gc0] = v0;
+                C_batch[gr * uN + gc1] = v1;
             } else {
                 if ((align_M || gr < uM) && (align_N || gc0 < uN)) {
-                    C_batch[gr * uN + gc0] = elems[0];
+                    float v0 = elems[0];
+                    if (has_residual) v0 += R_batch[gr * uN + gc0];
+                    C_batch[gr * uN + gc0] = v0;
                 }
                 if ((align_M || gr < uM) && (align_N || gc1 < uN)) {
-                    C_batch[gr * uN + gc1] = elems[1];
+                    float v1 = elems[1];
+                    if (has_residual) v1 += R_batch[gr * uN + gc1];
+                    C_batch[gr * uN + gc1] = v1;
                 }
             }
         }
@@ -2455,6 +2478,7 @@ kernel void gemm_mlx_small_f16(
     constant uint& batch_stride_b [[buffer(7)]],
     constant uint& batch_stride_c [[buffer(8)]],
     constant uint& swizzle_log    [[buffer(9)]],
+    device const half* residual    [[buffer(10)]],
     uint3 group_id       [[threadgroup_position_in_grid]],
     uint  tid_in_group   [[thread_index_in_threadgroup]],
     uint  sgid           [[simdgroup_index_in_threadgroup]],
@@ -2612,6 +2636,7 @@ kernel void gemm_mlx_m16_f16(
     constant uint& batch_stride_b [[buffer(7)]],
     constant uint& batch_stride_c [[buffer(8)]],
     constant uint& swizzle_log    [[buffer(9)]],
+    device const half* residual    [[buffer(10)]],
     uint3 group_id       [[threadgroup_position_in_grid]],
     uint  tid_in_group   [[thread_index_in_threadgroup]],
     uint  sgid           [[simdgroup_index_in_threadgroup]],
@@ -2758,6 +2783,7 @@ kernel void gemm_mlx_bf16(
     constant uint& batch_stride_b [[buffer(7)]],
     constant uint& batch_stride_c [[buffer(8)]],
     constant uint& swizzle_log    [[buffer(9)]],
+    device const bfloat* residual  [[buffer(10)]],
     uint3 group_id       [[threadgroup_position_in_grid]],
     uint  tid_in_group   [[thread_index_in_threadgroup]],
     uint  sgid           [[simdgroup_index_in_threadgroup]],
@@ -2774,6 +2800,7 @@ kernel void gemm_mlx_bf16(
     device const bfloat* A_batch = A + batch_idx * mlx_as_uniform(batch_stride_a);
     device const bfloat* B_batch = B + batch_idx * mlx_as_uniform(batch_stride_b);
     device bfloat*       C_batch = C + batch_idx * mlx_as_uniform(batch_stride_c);
+    device const bfloat* R_batch = has_residual ? (residual + batch_idx * mlx_as_uniform(batch_stride_c)) : nullptr;
 
     // SG grid: 1x2 -- sg_row always 0, sg_col = sgid (0 or 1)
     const uint base_m = 0;        // WM=1, single row of SG
@@ -2899,14 +2926,24 @@ kernel void gemm_mlx_bf16(
             auto elems = acc[i][j].thread_elements();
 
             if (align_M && align_N) {
-                C_batch[gr * uN + gc0] = bfloat(elems[0]);
-                C_batch[gr * uN + gc1] = bfloat(elems[1]);
+                bfloat v0 = bfloat(elems[0]);
+                bfloat v1 = bfloat(elems[1]);
+                if (has_residual) {
+                    v0 = bfloat(elems[0] + float(R_batch[gr * uN + gc0]));
+                    v1 = bfloat(elems[1] + float(R_batch[gr * uN + gc1]));
+                }
+                C_batch[gr * uN + gc0] = v0;
+                C_batch[gr * uN + gc1] = v1;
             } else {
                 if ((align_M || gr < uM) && (align_N || gc0 < uN)) {
-                    C_batch[gr * uN + gc0] = bfloat(elems[0]);
+                    bfloat v0 = bfloat(elems[0]);
+                    if (has_residual) v0 = bfloat(elems[0] + float(R_batch[gr * uN + gc0]));
+                    C_batch[gr * uN + gc0] = v0;
                 }
                 if ((align_M || gr < uM) && (align_N || gc1 < uN)) {
-                    C_batch[gr * uN + gc1] = bfloat(elems[1]);
+                    bfloat v1 = bfloat(elems[1]);
+                    if (has_residual) v1 = bfloat(elems[1] + float(R_batch[gr * uN + gc1]));
+                    C_batch[gr * uN + gc1] = v1;
                 }
             }
         }
@@ -4078,6 +4115,7 @@ pub fn matmul_align_constants(
     vec![
         (200, FunctionConstantValue::Bool(m % bm == 0)),
         (201, FunctionConstantValue::Bool(n % bn == 0)),
+        (202, FunctionConstantValue::Bool(false)), // has_residual = false
     ]
 }
 
@@ -4296,6 +4334,164 @@ pub fn matmul_into_cb(
     enc.dispatch_thread_groups(grid, tg);
     enc.end_encoding();
     // Keep swizzle_log_buf alive until after encoding
+    drop(swizzle_log_buf);
+
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Public API: matmul_add_residual_into_cb — GEMM + residual epilogue fusion
+// ---------------------------------------------------------------------------
+
+/// Fused matrix multiply + residual add: `C = matmul(A, B) + residual`.
+///
+/// Encodes into an existing command buffer. The residual addition is fused into
+/// the GEMM store phase via a function constant (`has_residual`), eliminating a
+/// separate dispatch for the element-wise add.
+///
+/// **Constraints:**
+/// - Only MlxArch tile variant is supported (M >= 33, N >= 33 with f16/f32/bf16).
+/// - `residual` must have the same shape `[M, N]` and dtype as the output.
+/// - All inputs must be 2D and contiguous.
+///
+/// For inputs that would dispatch to GEMV or non-MlxArch tiles, the caller
+/// should fall back to separate matmul + add operations.
+pub fn matmul_add_residual_into_cb(
+    registry: &KernelRegistry,
+    a: &Array,
+    b: &Array,
+    residual: &Array,
+    cb: &metal::CommandBufferRef,
+) -> Result<Array, KernelError> {
+    // --- Validation ---
+    if a.ndim() != 2 {
+        return Err(KernelError::InvalidShape(format!(
+            "matmul_add_residual_into_cb requires 2D arrays, a is {}D",
+            a.ndim()
+        )));
+    }
+    if b.ndim() != 2 {
+        return Err(KernelError::InvalidShape(format!(
+            "matmul_add_residual_into_cb requires 2D arrays, b is {}D",
+            b.ndim()
+        )));
+    }
+    if residual.ndim() != 2 {
+        return Err(KernelError::InvalidShape(format!(
+            "matmul_add_residual_into_cb requires 2D residual, got {}D",
+            residual.ndim()
+        )));
+    }
+    if a.shape()[1] != b.shape()[0] {
+        return Err(KernelError::InvalidShape(format!(
+            "inner dimensions must match: {} vs {}",
+            a.shape()[1],
+            b.shape()[0]
+        )));
+    }
+    if a.dtype() != b.dtype() || a.dtype() != residual.dtype() {
+        return Err(KernelError::InvalidShape(format!(
+            "dtypes must match: a={:?}, b={:?}, residual={:?}",
+            a.dtype(),
+            b.dtype(),
+            residual.dtype()
+        )));
+    }
+
+    let m = a.shape()[0];
+    let k = a.shape()[1];
+    let n = b.shape()[1];
+
+    if residual.shape()[0] != m || residual.shape()[1] != n {
+        return Err(KernelError::InvalidShape(format!(
+            "residual shape [{}, {}] must match output shape [{}, {}]",
+            residual.shape()[0],
+            residual.shape()[1],
+            m,
+            n
+        )));
+    }
+    if !a.is_contiguous() {
+        return Err(KernelError::InvalidShape(
+            "matmul_add_residual_into_cb: input `a` must be contiguous".to_string(),
+        ));
+    }
+    if !b.is_contiguous() {
+        return Err(KernelError::InvalidShape(
+            "matmul_add_residual_into_cb: input `b` must be contiguous".to_string(),
+        ));
+    }
+    if !residual.is_contiguous() {
+        return Err(KernelError::InvalidShape(
+            "matmul_add_residual_into_cb: `residual` must be contiguous".to_string(),
+        ));
+    }
+
+    // Only MlxArch kernels support the residual epilogue
+    let tile = select_tile_config_with_dtype(m, n, k, a.dtype());
+    if tile.variant != TileVariant::MlxArch {
+        return Err(KernelError::NotFound(format!(
+            "matmul_add_residual_into_cb: only MlxArch tile supported, got {:?} (M={}, N={})",
+            tile.variant, m, n
+        )));
+    }
+
+    let kernel_name = match a.dtype() {
+        DType::Float16 => "gemm_mlx_f16",
+        DType::Float32 => "gemm_mlx_f32",
+        DType::Bfloat16 => "gemm_mlx_bf16",
+        _ => {
+            return Err(KernelError::NotFound(format!(
+                "matmul_add_residual_into_cb: unsupported dtype {:?}",
+                a.dtype()
+            )))
+        }
+    };
+
+    // Function constants: align_M (200), align_N (201), has_residual (202)
+    use crate::kernels::FunctionConstantValue;
+    let constants = vec![
+        (200, FunctionConstantValue::Bool(m % tile.bm == 0)),
+        (201, FunctionConstantValue::Bool(n % tile.bn == 0)),
+        (202, FunctionConstantValue::Bool(true)),
+    ];
+    let pipeline = registry.get_pipeline_with_constants(kernel_name, a.dtype(), &constants)?;
+
+    let dev = registry.device().raw();
+    let out = Array::zeros(dev, &[m, n], a.dtype());
+
+    let m_buf = make_u32_buf(dev, super::checked_u32(m, "M")?);
+    let n_buf = make_u32_buf(dev, super::checked_u32(n, "N")?);
+    let k_buf = make_u32_buf(dev, super::checked_u32(k, "K")?);
+    let bsa_buf = make_u32_buf(dev, super::checked_u32(m * k, "batch_stride_a")?);
+    let bsb_buf = make_u32_buf(dev, super::checked_u32(k * n, "batch_stride_b")?);
+    let bsc_buf = make_u32_buf(dev, super::checked_u32(m * n, "batch_stride_c")?);
+
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_buffer(0, Some(a.metal_buffer()), a.offset() as u64);
+    enc.set_buffer(1, Some(b.metal_buffer()), b.offset() as u64);
+    enc.set_buffer(2, Some(out.metal_buffer()), 0);
+    enc.set_buffer(3, Some(&m_buf), 0);
+    enc.set_buffer(4, Some(&n_buf), 0);
+    enc.set_buffer(5, Some(&k_buf), 0);
+    enc.set_buffer(6, Some(&bsa_buf), 0);
+    enc.set_buffer(7, Some(&bsb_buf), 0);
+    enc.set_buffer(8, Some(&bsc_buf), 0);
+
+    let swizzle_log = compute_swizzle_log(m, n, tile.bm, tile.bn);
+    let swizzle_log_buf = make_u32_buf(dev, swizzle_log);
+    enc.set_buffer(9, Some(&swizzle_log_buf), 0);
+
+    // Residual buffer at index 10
+    enc.set_buffer(10, Some(residual.metal_buffer()), residual.offset() as u64);
+
+    let grid_x = ceil_div(n, tile.bn) as u64;
+    let grid_y = ceil_div(m, tile.bm) as u64;
+    let grid = MTLSize::new(grid_x, grid_y, 1);
+    let tg = MTLSize::new(64, 1, 1); // MlxArch = 64 threads
+    enc.dispatch_thread_groups(grid, tg);
+    enc.end_encoding();
     drop(swizzle_log_buf);
 
     Ok(out)
@@ -4863,5 +5059,49 @@ mod tests {
             1
         };
         assert_eq!(n_splits_small, 5);
+    }
+
+    // ── matmul_align_constants includes has_residual ──
+
+    #[test]
+    fn test_align_constants_include_has_residual() {
+        use crate::kernels::FunctionConstantValue;
+        let constants = matmul_align_constants(64, 64, 64, 64);
+        assert_eq!(constants.len(), 3);
+        // index 200: align_M
+        assert_eq!(constants[0].0, 200);
+        assert!(matches!(constants[0].1, FunctionConstantValue::Bool(true)));
+        // index 201: align_N
+        assert_eq!(constants[1].0, 201);
+        assert!(matches!(constants[1].1, FunctionConstantValue::Bool(true)));
+        // index 202: has_residual = false
+        assert_eq!(constants[2].0, 202);
+        assert!(matches!(
+            constants[2].1,
+            FunctionConstantValue::Bool(false)
+        ));
+    }
+
+    #[test]
+    fn test_align_constants_unaligned() {
+        use crate::kernels::FunctionConstantValue;
+        let constants = matmul_align_constants(65, 63, 64, 64);
+        assert!(matches!(constants[0].1, FunctionConstantValue::Bool(false))); // 65%64!=0
+        assert!(matches!(constants[1].1, FunctionConstantValue::Bool(false))); // 63%64!=0
+        assert!(matches!(
+            constants[2].1,
+            FunctionConstantValue::Bool(false)
+        )); // always false
+    }
+
+    // ── MlxArch tile selection test for residual path ──
+
+    #[test]
+    fn test_mlx_arch_tile_selected_for_large_m_n() {
+        // M>=33, N>=33 with f16 should select MlxArch
+        let tile = select_tile_config_with_dtype(64, 4096, 4096, DType::Float16);
+        assert_eq!(tile.variant, TileVariant::MlxArch);
+        assert_eq!(tile.bm, 64);
+        assert_eq!(tile.bn, 64);
     }
 }
