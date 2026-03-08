@@ -2031,13 +2031,24 @@ impl Attention {
 
         if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
             let q_batched = ops::rope::rope_multihead(
-                registry, q, cos, sin, local_num_heads, rope_offset, queue,
+                registry,
+                q,
+                cos,
+                sin,
+                local_num_heads,
+                rope_offset,
+                queue,
             )?;
             let k_batched = ops::rope::rope_multihead(
-                registry, k, cos, sin, local_num_kv_heads, rope_offset, queue,
+                registry,
+                k,
+                cos,
+                sin,
+                local_num_kv_heads,
+                rope_offset,
+                queue,
             )?;
-            let v_batched =
-                ops::rope::deinterleave_heads(registry, v, local_num_kv_heads, queue)?;
+            let v_batched = ops::rope::deinterleave_heads(registry, v, local_num_kv_heads, queue)?;
 
             let head_elems = seq_len * head_dim;
             q_heads = (0..local_num_heads)
@@ -2068,12 +2079,9 @@ impl Attention {
                 })
                 .collect();
         } else {
-            let q_batched =
-                ops::rope::deinterleave_heads(registry, q, local_num_heads, queue)?;
-            let k_batched =
-                ops::rope::deinterleave_heads(registry, k, local_num_kv_heads, queue)?;
-            let v_batched =
-                ops::rope::deinterleave_heads(registry, v, local_num_kv_heads, queue)?;
+            let q_batched = ops::rope::deinterleave_heads(registry, q, local_num_heads, queue)?;
+            let k_batched = ops::rope::deinterleave_heads(registry, k, local_num_kv_heads, queue)?;
+            let v_batched = ops::rope::deinterleave_heads(registry, v, local_num_kv_heads, queue)?;
 
             let head_elems = seq_len * head_dim;
             q_heads = (0..local_num_heads)
@@ -2109,10 +2117,10 @@ impl Attention {
         let (k_final, v_final, total_seq) = match cache {
             Some(ref mut c) => {
                 c.append(k_heads, v_heads, seq_len, registry, queue)?;
-                let kf: Vec<Array> =
-                    (0..local_num_kv_heads).map(|h| c.cached_keys(h)).collect();
-                let vf: Vec<Array> =
-                    (0..local_num_kv_heads).map(|h| c.cached_values(h)).collect();
+                let kf: Vec<Array> = (0..local_num_kv_heads).map(|h| c.cached_keys(h)).collect();
+                let vf: Vec<Array> = (0..local_num_kv_heads)
+                    .map(|h| c.cached_values(h))
+                    .collect();
                 let ts = c.seq_len;
                 (kf, vf, ts)
             }
@@ -2125,14 +2133,7 @@ impl Attention {
 
         let attn_outputs = if head_dim <= 256 {
             ops::sdpa::sdpa_batched(
-                registry,
-                &q_heads,
-                &k_final,
-                &v_final,
-                mask,
-                scale,
-                false,
-                queue,
+                registry, &q_heads, &k_final, &v_final, mask, scale, false, queue,
             )?
         } else {
             let mut outputs: Vec<Array> = Vec::with_capacity(local_num_heads);
@@ -2140,8 +2141,7 @@ impl Attention {
                 let kv_idx = h / repeats;
                 let k_h = &k_final[kv_idx];
                 let v_h = &v_final[kv_idx];
-                let k_t =
-                    k_h.view(vec![head_dim, total_seq], vec![1, head_dim], k_h.offset());
+                let k_t = k_h.view(vec![head_dim, total_seq], vec![1, head_dim], k_h.offset());
                 let k_t = ops::copy::copy(registry, &k_t, queue)?;
                 let scores = ops::matmul::matmul(registry, q_h, &k_t, queue)?;
                 let scores = scale_scores(&scores, scale, registry, queue)?;
@@ -2151,8 +2151,7 @@ impl Attention {
                     scores
                 };
                 let attn_weights = ops::softmax::softmax(registry, &scores, queue)?;
-                let head_out =
-                    ops::matmul::matmul(registry, &attn_weights, v_h, queue)?;
+                let head_out = ops::matmul::matmul(registry, &attn_weights, v_h, queue)?;
                 outputs.push(head_out);
             }
             outputs
@@ -2181,11 +2180,7 @@ impl Attention {
                 let dst_col_offset = h * head_bytes;
                 let enc = cb.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(&pipeline);
-                enc.set_buffer(
-                    0,
-                    Some(head_out.metal_buffer()),
-                    head_out.offset() as u64,
-                );
+                enc.set_buffer(0, Some(head_out.metal_buffer()), head_out.offset() as u64);
                 enc.set_buffer(1, Some(concat.metal_buffer()), dst_col_offset as u64);
                 let count = head_dim as u64;
                 let grid = metal::MTLSize::new(count, 1, 1);
@@ -2202,8 +2197,7 @@ impl Attention {
             Ok(concat)
         } else {
             let head_elems = seq_len * head_dim;
-            let packed =
-                Array::zeros(dev, &[local_num_heads * seq_len, head_dim], q.dtype());
+            let packed = Array::zeros(dev, &[local_num_heads * seq_len, head_dim], q.dtype());
             {
                 let copy_kernel = match q.dtype() {
                     DType::Float32 => "copy_f32",
@@ -2222,11 +2216,7 @@ impl Attention {
                     let dst_offset = h * head_elems * elem_size;
                     let enc = cb.new_compute_command_encoder();
                     enc.set_compute_pipeline_state(&pipeline);
-                    enc.set_buffer(
-                        0,
-                        Some(head_out.metal_buffer()),
-                        head_out.offset() as u64,
-                    );
+                    enc.set_buffer(0, Some(head_out.metal_buffer()), head_out.offset() as u64);
                     enc.set_buffer(1, Some(packed.metal_buffer()), dst_offset as u64);
                     let count = head_elems as u64;
                     let grid = metal::MTLSize::new(count, 1, 1);
@@ -2241,13 +2231,8 @@ impl Attention {
                 cb.commit();
                 cb.wait_until_completed();
             }
-            let concat = ops::rope::interleave_heads(
-                registry,
-                &packed,
-                local_num_heads,
-                seq_len,
-                queue,
-            )?;
+            let concat =
+                ops::rope::interleave_heads(registry, &packed, local_num_heads, seq_len, queue)?;
             Ok(concat)
         }
     }
@@ -2291,13 +2276,13 @@ impl Attention {
     /// Column-parallel: Q, K, V projection weights are sharded by output rows
     /// (each rank gets its local head slice).
     /// Row-parallel: O projection weight is sharded by input columns
-    #[cfg(feature = "distributed")]
     /// (each rank holds columns for its local heads).
     ///
     /// Also updates the config to reflect the local head counts.
     ///
     /// # Panics
     /// Panics if weights are not loaded or head counts are not divisible by `world_size`.
+    #[cfg(feature = "distributed")]
     pub(crate) fn shard_for_tp(&mut self, rank: u32, world_size: u32) -> Result<(), KernelError> {
         use crate::parallel::{ColumnParallelLinear, RowParallelLinear};
 

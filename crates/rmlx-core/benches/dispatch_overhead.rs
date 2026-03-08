@@ -322,8 +322,7 @@ fn bench_llama3_layer_ops(
     let wdown = rand_f16_array(device, &[INTERMEDIATE_DIM, HIDDEN_DIM], 107);
 
     // RoPE freqs
-    let (cos_data, sin_data) =
-        ops::rope::precompute_freqs(2048, HEAD_DIM, 500000.0, 1.0).unwrap();
+    let (cos_data, sin_data) = ops::rope::precompute_freqs(2048, HEAD_DIM, 500000.0, 1.0).unwrap();
     let cos_bytes: Vec<u8> = cos_data[..HEAD_DIM / 2]
         .iter()
         .flat_map(|v| f32_to_f16_bits(*v).to_le_bytes())
@@ -332,10 +331,8 @@ fn bench_llama3_layer_ops(
         .iter()
         .flat_map(|v| f32_to_f16_bits(*v).to_le_bytes())
         .collect();
-    let cos_freqs =
-        Array::from_bytes(device, &cos_bytes, vec![1, 1, HEAD_DIM / 2], DType::Float16);
-    let sin_freqs =
-        Array::from_bytes(device, &sin_bytes, vec![1, 1, HEAD_DIM / 2], DType::Float16);
+    let cos_freqs = Array::from_bytes(device, &cos_bytes, vec![1, 1, HEAD_DIM / 2], DType::Float16);
+    let sin_freqs = Array::from_bytes(device, &sin_bytes, vec![1, 1, HEAD_DIM / 2], DType::Float16);
     let rope_input = rand_f16_array(device, &[1, 1, HEAD_DIM], 150);
 
     // FFN intermediates
@@ -569,10 +566,10 @@ fn bench_llama3_layer_ops(
     println!("  --- Full layer comparison: 11 individual CBs vs 1 batched CB ---");
 
     let do_layer_individual = || {
+        #[allow(clippy::type_complexity)]
         let ops_list: Vec<Box<dyn Fn(&KernelRegistry, &metal::CommandBufferRef)>> = vec![
             Box::new(|reg: &KernelRegistry, cb: &metal::CommandBufferRef| {
-                let _ =
-                    ops::rms_norm::rms_norm_into_cb(reg, &x, Some(&norm_w), RMS_NORM_EPS, cb);
+                let _ = ops::rms_norm::rms_norm_into_cb(reg, &x, Some(&norm_w), RMS_NORM_EPS, cb);
             }),
             Box::new(|reg: &KernelRegistry, cb: &metal::CommandBufferRef| {
                 let _ = ops::matmul::matmul_into_cb(reg, &x, &wq, cb);
@@ -600,8 +597,7 @@ fn bench_llama3_layer_ops(
                 let _ = ops::matmul::matmul_into_cb(reg, &x, &wo, cb);
             }),
             Box::new(|reg: &KernelRegistry, cb: &metal::CommandBufferRef| {
-                let _ =
-                    ops::rms_norm::rms_norm_into_cb(reg, &x, Some(&norm_w), RMS_NORM_EPS, cb);
+                let _ = ops::rms_norm::rms_norm_into_cb(reg, &x, Some(&norm_w), RMS_NORM_EPS, cb);
             }),
             Box::new(|reg: &KernelRegistry, cb: &metal::CommandBufferRef| {
                 let _ = ops::matmul::matmul_into_cb(reg, &x, &wgate, cb);

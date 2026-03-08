@@ -5079,10 +5079,7 @@ mod tests {
         assert!(matches!(constants[1].1, FunctionConstantValue::Bool(true)));
         // index 202: has_residual = false
         assert_eq!(constants[2].0, 202);
-        assert!(matches!(
-            constants[2].1,
-            FunctionConstantValue::Bool(false)
-        ));
+        assert!(matches!(constants[2].1, FunctionConstantValue::Bool(false)));
     }
 
     #[test]
@@ -5091,10 +5088,7 @@ mod tests {
         let constants = matmul_align_constants(65, 63, 64, 64);
         assert!(matches!(constants[0].1, FunctionConstantValue::Bool(false))); // 65%64!=0
         assert!(matches!(constants[1].1, FunctionConstantValue::Bool(false))); // 63%64!=0
-        assert!(matches!(
-            constants[2].1,
-            FunctionConstantValue::Bool(false)
-        )); // always false
+        assert!(matches!(constants[2].1, FunctionConstantValue::Bool(false))); // always false
     }
 
     // ── MlxArch tile selection test for residual path ──

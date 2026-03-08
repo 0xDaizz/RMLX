@@ -546,11 +546,7 @@ impl FeedForward {
     /// - Dense: linear1 → column-parallel, linear2 → row-parallel
     /// - MoE: not supported (returns error)
     #[cfg(feature = "distributed")]
-    pub(crate) fn shard_for_tp(
-        &mut self,
-        rank: u32,
-        world_size: u32,
-    ) -> Result<(), KernelError> {
+    pub(crate) fn shard_for_tp(&mut self, rank: u32, world_size: u32) -> Result<(), KernelError> {
         use crate::parallel::{ColumnParallelLinear, RowParallelLinear};
 
         if world_size <= 1 {
@@ -1209,11 +1205,7 @@ impl TransformerBlock {
     ///
     /// Must be called after weights are loaded and before `forward_with_group()`.
     #[cfg(feature = "distributed")]
-    pub(crate) fn shard_for_tp(
-        &mut self,
-        rank: u32,
-        world_size: u32,
-    ) -> Result<(), KernelError> {
+    pub(crate) fn shard_for_tp(&mut self, rank: u32, world_size: u32) -> Result<(), KernelError> {
         self.attention.shard_for_tp(rank, world_size)?;
         self.ffn.shard_for_tp(rank, world_size)?;
         Ok(())
