@@ -946,11 +946,11 @@ Current op module count: 32+. Current test count: 1,298+.
 
 ## Phase 3: Serving Infrastructure + Correctness Hardening -- Complete
 
-Phase 3 delivers serving-critical infrastructure (FlashAttention-2 Metal kernel, paged KV cache, continuous batching scheduler), centralized command buffer commit for all ops, f16/bf16 RDMA collectives, and correctness fixes across distributed and CLI crates.
+Phase 3 delivers serving-critical infrastructure (paged KV cache, continuous batching scheduler), centralized command buffer commit for all ops, f16/bf16 RDMA collectives, and correctness fixes across distributed and CLI crates.
 
 | PR | Key Files | Core Changes | Status |
 |----|-----------|--------------|--------|
-| P3-1 | `crates/rmlx-core/src/ops/flash_attention.rs` | FlashAttention-2 Metal kernel: tiled online softmax, f32 head_dim=128, causal mask, falls back to naive SDPA | Complete |
+| P3-1 | _(removed)_ | FlashAttention-2 legacy kernel — superseded by `sdpa.rs` FA2 implementation; deleted in Phase E | Complete |
 | P3-2 | `crates/rmlx-nn/src/paged_kv_cache.rs` | vLLM-style paged KV cache with block manager, copy-on-write, Metal buffer pool | Complete |
 | P3-3 | `crates/rmlx-nn/src/scheduler.rs` | Continuous batching scheduler: request queue, memory-aware batch scheduling, prefill/decode phases | Complete |
 | P3-4 | rmlx-core ops (all modules) | Centralized CB commit via `commit_with_mode()` with sync/async `ExecMode`, `CommandBufferHandle` for async tracking | Complete |
