@@ -2348,6 +2348,7 @@ struct TransposeLoader {
 //   8: gqa_factor (num_q_heads / num_kv_heads)
 //   9: scale  (1/sqrt(D))
 
+[[max_total_threads_per_threadgroup(128)]]
 kernel void sdpa_prefill_mma_bk32_f16(
     device const half* Q [[buffer(0)]],
     device const half* K [[buffer(1)]],
@@ -4033,6 +4034,32 @@ pub fn sdpa_prefill_mma_bk32_f16_into_cb(
 
     let pipeline =
         registry.get_pipeline_with_constants("sdpa_prefill_mma_bk32_f16", dtype, &constants)?;
+
+    // BK=32 cooperative loaders require exactly 128 threads.
+    // If Metal compiler reduced max_threads (register pressure), fall back to BK=16.
+    let max_threads = pipeline.max_total_threads_per_threadgroup();
+    if max_threads < MMA_THREADS {
+        eprintln!(
+            "sdpa_prefill_mma_bk32: max_threads={max_threads} < {MMA_THREADS}, falling back to BK=16"
+        );
+        return sdpa_prefill_mma_f16_into_cb(
+            registry,
+            q_slab,
+            k_slab,
+            v_slab,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            seq_len,
+            kv_len,
+            kv_seq_stride,
+            mask,
+            scale,
+            is_causal,
+            cb,
+        );
+    }
+
     let dev = registry.device().raw();
 
     let out_numel = num_heads * seq_len * head_dim;
@@ -4071,7 +4098,7 @@ pub fn sdpa_prefill_mma_bk32_f16_into_cb(
     );
 
     let n_q_blocks = seq_len.div_ceil(MMA_BQ) as u64;
-    let tg_size = std::cmp::min(MMA_THREADS, pipeline.max_total_threads_per_threadgroup());
+    let tg_size = MMA_THREADS;
     encoder.dispatch_thread_groups(
         MTLSize::new(n_q_blocks, num_heads as u64, 1),
         MTLSize::new(tg_size, 1, 1),

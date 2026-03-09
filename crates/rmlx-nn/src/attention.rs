@@ -3239,7 +3239,7 @@ impl Attention {
         let use_mma = q_batched.dtype() == DType::Float16 && head_dim == 128 && seq_len > 1;
 
         let attn_slab = if use_mma {
-            // BK=16 MMA variant: best occupancy (~14.8KB TG memory)
+            // BK=16 MMA variant: optimal for BD=128 (BK=32 offers no gain due to register pressure)
             ops::sdpa::sdpa_prefill_mma_f16_into_cb(
                 registry,
                 &q_batched,
