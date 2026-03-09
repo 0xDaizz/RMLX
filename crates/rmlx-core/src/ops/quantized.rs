@@ -3124,7 +3124,68 @@ pub fn affine_quantized_matmul_batched(
     let opts = metal::MTLResourceOptions::StorageModeShared;
 
     if qw.bits == 4 {
-        // Q4 dispatch: choose kernel variant based on M
+        // Q4 dispatch priority:
+        // 1. NAX (HW MMA, f16): M >= 32, K % 64 == 0 → highest throughput
+        // 2. Skinny (split-K): M <= 32 → best for low-M
+        // 3. Standard MMA: fallback
+        const NAX_MIN_M: usize = 32;
+
+        if k % 64 == 0 && m >= NAX_MIN_M {
+            // --- NAX path: f16 HW MMA, BM=64 BN=64, 128 threads ---
+            // Convert f32 input → f16, cast scales/biases f32 → f16, run NAX, cast output f16 → f32.
+            let num_groups = (qw.out_features * qw.in_features) / qw.group_size as usize;
+
+            // Wrap scales/biases as 1D f32 Arrays for GPU cast
+            let scales_f32 = Array::new(
+                qw.scales_buf.clone(),
+                vec![num_groups],
+                vec![1],
+                DType::Float32,
+                0,
+            );
+            let biases_f32 = Array::new(
+                qw.biases_buf.clone(),
+                vec![num_groups],
+                vec![1],
+                DType::Float32,
+                0,
+            );
+
+            let cb = queue.new_command_buffer();
+
+            // Cast x: f32 → f16
+            let x_f16 = super::copy::copy_cast_into_cb(registry, x, DType::Float16, cb)?;
+
+            // Cast scales: f32 → f16
+            let scales_f16 =
+                super::copy::copy_cast_into_cb(registry, &scales_f32, DType::Float16, cb)?;
+            // Cast biases: f32 → f16
+            let biases_f16 =
+                super::copy::copy_cast_into_cb(registry, &biases_f32, DType::Float16, cb)?;
+
+            // Build a temporary QuantizedWeight with f16 scales/biases for NAX
+            let qw_f16 = QuantizedWeight {
+                weights_buf: qw.weights_buf.clone(),
+                scales_buf: scales_f16.metal_buffer().to_owned(),
+                biases_buf: biases_f16.metal_buffer().to_owned(),
+                group_size: qw.group_size,
+                bits: qw.bits,
+                out_features: qw.out_features,
+                in_features: qw.in_features,
+            };
+
+            // Dispatch NAX kernel (encodes into same CB)
+            let out_f16 = affine_qmm_nax_q4_into_cb(registry, &x_f16, &qw_f16, cb)?;
+
+            // Cast output: f16 → f32
+            let out_f32 = super::copy::copy_cast_into_cb(registry, &out_f16, DType::Float32, cb)?;
+
+            super::commit_with_mode(cb, super::ExecMode::Sync);
+
+            return Ok(out_f32);
+        }
+
+        // Q4 non-NAX dispatch: choose kernel variant based on M
         // - M <= 32: skinny kernel (BM=32, BN=64, BK=32) with aggressive split-K
         // - M > 32: standard kernel (BM=64, BN=64, BK=16)
         const SKINNY_BM: usize = 32;

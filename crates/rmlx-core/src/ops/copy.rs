@@ -981,6 +981,53 @@ pub fn copy_cast_with_mode(
     Ok(out)
 }
 
+/// Copy with type conversion, encoded into an existing command buffer.
+///
+/// Like [`copy_cast`] but does not create or commit a command buffer.
+/// The caller is responsible for committing the CB.
+/// Source must be contiguous.
+pub fn copy_cast_into_cb(
+    registry: &KernelRegistry,
+    src: &Array,
+    dst_dtype: DType,
+    cb: &metal::CommandBufferRef,
+) -> Result<Array, KernelError> {
+    reject_quantized(src.dtype())?;
+    reject_quantized(dst_dtype)?;
+
+    if src.dtype() == dst_dtype {
+        return copy_into_cb(registry, src, cb);
+    }
+
+    if !src.is_contiguous() {
+        return Err(KernelError::InvalidShape(
+            "copy_cast_into_cb requires a contiguous source array".to_string(),
+        ));
+    }
+
+    let kname = cast_kernel_name(src.dtype(), dst_dtype)?;
+    let pipeline = registry.get_pipeline(kname, src.dtype())?;
+    let numel = src.numel();
+
+    let out = Array::zeros(registry.device().raw(), src.shape(), dst_dtype);
+
+    let encoder = cb.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(src.metal_buffer()), src.offset() as u64);
+    encoder.set_buffer(1, Some(out.metal_buffer()), out.offset() as u64);
+
+    let grid_size = MTLSize::new(numel as u64, 1, 1);
+    let threadgroup_size = MTLSize::new(
+        std::cmp::min(pipeline.max_total_threads_per_threadgroup(), numel as u64),
+        1,
+        1,
+    );
+    encoder.dispatch_threads(grid_size, threadgroup_size);
+    encoder.end_encoding();
+
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // Public API — fill (scalar broadcast)
 // ---------------------------------------------------------------------------
