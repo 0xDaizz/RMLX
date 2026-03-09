@@ -1080,6 +1080,16 @@ kernel void sdpa_prefill_gqa_f16(
 
     const uint n_kv_blocks = (S + Bc_f16 - 1) / Bc_f16;
 
+    // Threadgroup memory — declared OUTSIDE the GQA loop so the Metal
+    // compiler allocates a single set (not per-iteration).  All arrays
+    // are re-initialised at the top of each iteration so this is safe.
+    threadgroup half  Q_tile[Br * 128];
+    threadgroup float S_tile[Br * Bc_f16];
+    threadgroup float m_prev[Br];
+    threadgroup float l_prev[Br];
+    threadgroup float reduce_buf[SIMD_SIZE];
+    threadgroup float O_acc[Br * 128];
+
     // Process each Q head in this GQA group
     for (uint qh = 0; qh < gqa_ratio; qh++) {
         const uint head_id = kv_head_id * gqa_ratio + qh;

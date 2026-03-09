@@ -1344,12 +1344,8 @@ pub fn rope_multihead(
     let tg_x = std::cmp::min(64, half_dim as u64).min(max_tg);
     let tg_y = std::cmp::min(16, seq_len as u64).min(max_tg / tg_x);
     let tg = MTLSize::new(tg_x, tg_y, 1);
-    let groups = MTLSize::new(
-        (half_dim as u64).div_ceil(tg_x),
-        (seq_len as u64).div_ceil(tg_y),
-        num_heads as u64,
-    );
-    encoder.dispatch_thread_groups(groups, tg);
+    let grid = MTLSize::new(half_dim as u64, seq_len as u64, num_heads as u64);
+    encoder.dispatch_threads(grid, tg);
     encoder.end_encoding();
     super::commit_with_mode(cb, super::ExecMode::Sync);
 
@@ -1404,12 +1400,8 @@ pub fn rope_multihead_into_cb(
     let tg_x = std::cmp::min(64, half_dim as u64).min(max_tg);
     let tg_y = std::cmp::min(16, seq_len as u64).min(max_tg / tg_x);
     let tg = MTLSize::new(tg_x, tg_y, 1);
-    let groups = MTLSize::new(
-        (half_dim as u64).div_ceil(tg_x),
-        (seq_len as u64).div_ceil(tg_y),
-        num_heads as u64,
-    );
-    encoder.dispatch_thread_groups(groups, tg);
+    let grid = MTLSize::new(half_dim as u64, seq_len as u64, num_heads as u64);
+    encoder.dispatch_threads(grid, tg);
     encoder.end_encoding();
 
     Ok(out)
@@ -1455,12 +1447,8 @@ pub fn deinterleave_heads(
     let tg_x = std::cmp::min(64, head_dim as u64).min(max_tg);
     let tg_y = std::cmp::min(4, seq_len as u64).min(max_tg / tg_x);
     let tg = MTLSize::new(tg_x, tg_y, 1);
-    let groups = MTLSize::new(
-        (head_dim as u64).div_ceil(tg_x),
-        (seq_len as u64).div_ceil(tg_y),
-        num_heads as u64,
-    );
-    encoder.dispatch_thread_groups(groups, tg);
+    let grid = MTLSize::new(head_dim as u64, seq_len as u64, num_heads as u64);
+    encoder.dispatch_threads(grid, tg);
     encoder.end_encoding();
     super::commit_with_mode(cb, super::ExecMode::Sync);
 
@@ -1503,12 +1491,8 @@ pub fn deinterleave_heads_into_cb(
     let tg_x = std::cmp::min(64, head_dim as u64).min(max_tg);
     let tg_y = std::cmp::min(4, seq_len as u64).min(max_tg / tg_x);
     let tg = MTLSize::new(tg_x, tg_y, 1);
-    let groups = MTLSize::new(
-        (head_dim as u64).div_ceil(tg_x),
-        (seq_len as u64).div_ceil(tg_y),
-        num_heads as u64,
-    );
-    encoder.dispatch_thread_groups(groups, tg);
+    let grid = MTLSize::new(head_dim as u64, seq_len as u64, num_heads as u64);
+    encoder.dispatch_threads(grid, tg);
     encoder.end_encoding();
 
     Ok(out)

@@ -535,13 +535,48 @@ kernel void interleave_heads_bf16(
 }
 "#;
 
+/// Metal shader source for batched KV cache copy (all heads in one dispatch).
+pub const KV_CACHE_COPY_BATCHED_F16: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// Copy K and V for all heads in a single dispatch.
+// src layout:  [num_kv_heads, new_tokens, head_dim] (contiguous, head-major)
+// dst layout:  [num_kv_heads, max_seq_len, head_dim] (slab with max_seq_len stride)
+// Writes into dst at rows [offset .. offset+new_tokens] per head.
+kernel void kv_cache_copy_batched_f16(
+    device const half* src_k [[buffer(0)]],
+    device const half* src_v [[buffer(1)]],
+    device half* dst_k       [[buffer(2)]],
+    device half* dst_v       [[buffer(3)]],
+    constant uint& num_kv_heads [[buffer(4)]],
+    constant uint& new_tokens   [[buffer(5)]],
+    constant uint& head_dim     [[buffer(6)]],
+    constant uint& max_seq_len  [[buffer(7)]],
+    constant uint& offset       [[buffer(8)]],
+    uint3 tid [[thread_position_in_grid]]
+) {
+    uint elem = tid.x;
+    uint tok  = tid.y;
+    uint head = tid.z;
+    if (elem >= head_dim || tok >= new_tokens || head >= num_kv_heads) return;
+
+    uint src_idx = head * new_tokens * head_dim + tok * head_dim + elem;
+    uint dst_idx = head * max_seq_len * head_dim + (offset + tok) * head_dim + elem;
+    dst_k[dst_idx] = src_k[src_idx];
+    dst_v[dst_idx] = src_v[src_idx];
+}
+"#;
+
 // ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
 
 /// Register all copy / cast / fill kernels with the registry via JIT.
 pub fn register(registry: &KernelRegistry) -> Result<(), KernelError> {
-    registry.register_jit_source("copy", COPY_SHADER_SOURCE)
+    registry.register_jit_source("copy", COPY_SHADER_SOURCE)?;
+    registry.register_jit_source("kv_cache_copy_batched", KV_CACHE_COPY_BATCHED_F16)?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1140,6 +1175,80 @@ pub fn interleave_heads_into_cb(
     );
     encoder.dispatch_threads(grid_size, threadgroup_size);
     encoder.end_encoding();
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Batched KV cache copy (single dispatch for all heads)
+// ---------------------------------------------------------------------------
+
+/// Encode a batched KV cache copy into an existing command buffer.
+///
+/// Copies K and V for all heads in a single GPU dispatch, replacing per-head
+/// copy loops (2 * num_kv_heads dispatches → 1 dispatch).
+///
+/// Source layout: `[num_kv_heads, new_tokens, head_dim]` (contiguous, head-major).
+/// Destination layout: `[num_kv_heads, max_seq_len, head_dim]` (slab with stride).
+/// Writes into destination rows `[offset .. offset + new_tokens]` per head.
+#[allow(clippy::too_many_arguments)]
+pub fn kv_cache_copy_batched_f16_into_cb(
+    src_k: &Array,
+    src_v: &Array,
+    dst_k: &Array,
+    dst_v: &Array,
+    num_kv_heads: usize,
+    new_tokens: usize,
+    head_dim: usize,
+    max_seq_len: usize,
+    offset: usize,
+    registry: &KernelRegistry,
+    cb: &metal::CommandBufferRef,
+) -> Result<(), KernelError> {
+    if new_tokens == 0 {
+        return Ok(());
+    }
+
+    let pipeline = registry.get_pipeline("kv_cache_copy_batched_f16", DType::Float16)?;
+
+    let num_kv_heads_u32 = super::checked_u32(num_kv_heads, "num_kv_heads")?;
+    let new_tokens_u32 = super::checked_u32(new_tokens, "new_tokens")?;
+    let head_dim_u32 = super::checked_u32(head_dim, "head_dim")?;
+    let max_seq_len_u32 = super::checked_u32(max_seq_len, "max_seq_len")?;
+    let offset_u32 = super::checked_u32(offset, "offset")?;
+
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_buffer(0, Some(src_k.metal_buffer()), src_k.offset() as u64);
+    enc.set_buffer(1, Some(src_v.metal_buffer()), src_v.offset() as u64);
+    enc.set_buffer(2, Some(dst_k.metal_buffer()), dst_k.offset() as u64);
+    enc.set_buffer(3, Some(dst_v.metal_buffer()), dst_v.offset() as u64);
+    enc.set_bytes(
+        4,
+        4,
+        &num_kv_heads_u32 as *const u32 as *const std::ffi::c_void,
+    );
+    enc.set_bytes(
+        5,
+        4,
+        &new_tokens_u32 as *const u32 as *const std::ffi::c_void,
+    );
+    enc.set_bytes(6, 4, &head_dim_u32 as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(
+        7,
+        4,
+        &max_seq_len_u32 as *const u32 as *const std::ffi::c_void,
+    );
+    enc.set_bytes(8, 4, &offset_u32 as *const u32 as *const std::ffi::c_void);
+
+    let grid = MTLSize::new(head_dim as u64, new_tokens as u64, num_kv_heads as u64);
+    let tg = MTLSize::new(
+        std::cmp::min(64, head_dim as u64),
+        std::cmp::min(4, new_tokens as u64),
+        1,
+    );
+    enc.dispatch_threads(grid, tg);
+    enc.end_encoding();
 
     Ok(())
 }
