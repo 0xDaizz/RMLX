@@ -11,6 +11,7 @@
 
 use std::time::{Duration, Instant};
 
+use half::f16;
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::KernelRegistry;
@@ -152,6 +153,90 @@ fn make_quantized_weight(
         in_features,
     )
     .expect("Failed to create QuantizedWeight")
+}
+
+/// Create a random f16 Array on GPU with small values (suitable as activations).
+fn rand_f16_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
+    let numel: usize = shape.iter().product();
+    let mut state = seed;
+    let mut f16_bytes = Vec::with_capacity(numel * 2);
+    for _ in 0..numel {
+        let v = lcg_next(&mut state);
+        let val = ((v >> 33) as f64 / (1u64 << 31) as f64 - 0.5) as f32 * 0.1;
+        let h = f16::from_f32(val);
+        f16_bytes.extend_from_slice(&h.to_bits().to_le_bytes());
+    }
+    Array::from_bytes(device, &f16_bytes, shape.to_vec(), DType::Float16)
+}
+
+/// Create a QuantizedWeight with f16 scales and biases (required by NAX kernel).
+///
+/// The NAX Metal shader reads `device const half* scales` and `device const half* biases`,
+/// so the buffers must contain f16 data. We construct the struct directly (all fields are pub)
+/// to bypass QuantizedWeight::new() which validates for f32-sized buffers.
+fn make_quantized_weight_f16(
+    device: &metal::Device,
+    out_features: usize,
+    in_features: usize,
+    bits: u32,
+    group_size: u32,
+    seed: u64,
+) -> QuantizedWeight {
+    let mut state = seed;
+    let opts = metal::MTLResourceOptions::StorageModeShared;
+
+    // Packed weights buffer (same as f32 version)
+    let elems_per_u32 = 32 / bits as usize;
+    let total_elements = out_features * in_features;
+    let num_u32s = total_elements.div_ceil(elems_per_u32);
+    let w_data: Vec<u32> = (0..num_u32s)
+        .map(|_| {
+            let v = lcg_next(&mut state);
+            v as u32
+        })
+        .collect();
+    let weights_buf =
+        device.new_buffer_with_data(w_data.as_ptr() as *const _, (num_u32s * 4) as u64, opts);
+
+    // Scales and biases as f16, one per group
+    let num_groups = total_elements / group_size as usize;
+    let scales_data: Vec<u16> = (0..num_groups)
+        .map(|_| {
+            let v = lcg_next(&mut state);
+            let val = ((v >> 33) as f64 / (1u64 << 31) as f64) as f32 * 0.02 + 0.001;
+            f16::from_f32(val).to_bits()
+        })
+        .collect();
+    let biases_data: Vec<u16> = (0..num_groups)
+        .map(|_| {
+            let v = lcg_next(&mut state);
+            let val = ((v >> 33) as f64 / (1u64 << 31) as f64 - 0.5) as f32 * 0.01;
+            f16::from_f32(val).to_bits()
+        })
+        .collect();
+
+    let scales_buf = device.new_buffer_with_data(
+        scales_data.as_ptr() as *const _,
+        (num_groups * 2) as u64, // f16 = 2 bytes
+        opts,
+    );
+    let biases_buf = device.new_buffer_with_data(
+        biases_data.as_ptr() as *const _,
+        (num_groups * 2) as u64,
+        opts,
+    );
+
+    // Construct directly — QuantizedWeight::new() validates for f32 buffer sizes,
+    // but NAX requires f16 scales/biases.
+    QuantizedWeight {
+        weights_buf,
+        scales_buf,
+        biases_buf,
+        group_size,
+        bits,
+        out_features,
+        in_features,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -404,6 +489,136 @@ fn bench_qmv_vs_qmm(
     );
 }
 
+/// Benchmark the NAX (MPP) QMM Q4 kernel with f16 input and f16 scales/biases.
+/// Uses command buffer directly for precise timing.
+#[allow(clippy::too_many_arguments)]
+fn bench_qmm_nax(
+    registry: &KernelRegistry,
+    queue: &metal::CommandQueue,
+    device: &metal::Device,
+    m: usize,
+    n: usize,
+    k: usize,
+    group_size: u32,
+    label: &str,
+) {
+    let qw = make_quantized_weight_f16(device, n, k, 4, group_size, 42);
+    let x_f16 = rand_f16_array(device, &[m, k], 99);
+
+    // Warmup
+    for _ in 0..WARMUP_ITERS {
+        let cb = queue.new_command_buffer();
+        let _ = ops::quantized::affine_qmm_nax_q4_into_cb(registry, &x_f16, &qw, cb)
+            .expect("NAX warmup failed");
+        cb.commit();
+        cb.wait_until_completed();
+    }
+
+    // Bench
+    let mut times = Vec::with_capacity(BENCH_ITERS);
+    for _ in 0..BENCH_ITERS {
+        let cb = queue.new_command_buffer();
+        let start = Instant::now();
+        let _ = ops::quantized::affine_qmm_nax_q4_into_cb(registry, &x_f16, &qw, cb)
+            .expect("NAX bench failed");
+        cb.commit();
+        cb.wait_until_completed();
+        times.push(start.elapsed());
+    }
+
+    let stats = Stats::from_durations(&times);
+    let tf_p50 = tflops(m, n, k, stats.p50);
+    let tf_mean = tflops(m, n, k, stats.mean);
+    println!(
+        "  QMM-NAX  Q4  M={:<4}  {:<16}  p50={:8.1}us  mean={:8.1}us  std={:6.1}us  TFLOPS(p50)={:.3}  TFLOPS(mean)={:.3}",
+        m, label, stats.p50, stats.mean, stats.std_dev, tf_p50, tf_mean,
+    );
+}
+
+/// Head-to-head: QMM MMA v1 (f32) vs QMM Steel v2 (f32) vs QMM NAX (f16).
+/// Prints all three latencies and speedup of NAX over each.
+#[allow(clippy::too_many_arguments)]
+fn bench_qmm_nax_vs_mma(
+    registry: &KernelRegistry,
+    queue: &metal::CommandQueue,
+    device: &metal::Device,
+    m: usize,
+    n: usize,
+    k: usize,
+    group_size_f32: u32,
+    group_size_nax: u32,
+    label: &str,
+) {
+    // --- MMA v1 (f32 scales, group_size_f32) ---
+    let qw_f32 = make_quantized_weight(device, n, k, 4, group_size_f32, 42);
+    let x_f32 = rand_f32_array(device, &[m, k], 99);
+
+    for _ in 0..WARMUP_ITERS {
+        let _ = ops::quantized::affine_quantized_matmul_batched(registry, &x_f32, &qw_f32, queue)
+            .expect("MMA v1 warmup failed");
+    }
+    let mut v1_times = Vec::with_capacity(BENCH_ITERS);
+    for _ in 0..BENCH_ITERS {
+        let start = Instant::now();
+        let _ = ops::quantized::affine_quantized_matmul_batched(registry, &x_f32, &qw_f32, queue)
+            .expect("MMA v1 bench failed");
+        v1_times.push(start.elapsed());
+    }
+    let v1_stats = Stats::from_durations(&v1_times);
+
+    // --- Steel v2 (f32 scales, group_size_f32) ---
+    for _ in 0..WARMUP_ITERS {
+        let _ = ops::quantized::affine_quantized_matmul_steel(registry, &x_f32, &qw_f32, queue)
+            .expect("Steel v2 warmup failed");
+    }
+    let mut v2_times = Vec::with_capacity(BENCH_ITERS);
+    for _ in 0..BENCH_ITERS {
+        let start = Instant::now();
+        let _ = ops::quantized::affine_quantized_matmul_steel(registry, &x_f32, &qw_f32, queue)
+            .expect("Steel v2 bench failed");
+        v2_times.push(start.elapsed());
+    }
+    let v2_stats = Stats::from_durations(&v2_times);
+
+    // --- NAX (f16 scales, group_size_nax) ---
+    let qw_nax = make_quantized_weight_f16(device, n, k, 4, group_size_nax, 42);
+    let x_f16 = rand_f16_array(device, &[m, k], 99);
+
+    for _ in 0..WARMUP_ITERS {
+        let cb = queue.new_command_buffer();
+        let _ = ops::quantized::affine_qmm_nax_q4_into_cb(registry, &x_f16, &qw_nax, cb)
+            .expect("NAX warmup failed");
+        cb.commit();
+        cb.wait_until_completed();
+    }
+    let mut nax_times = Vec::with_capacity(BENCH_ITERS);
+    for _ in 0..BENCH_ITERS {
+        let cb = queue.new_command_buffer();
+        let start = Instant::now();
+        let _ = ops::quantized::affine_qmm_nax_q4_into_cb(registry, &x_f16, &qw_nax, cb)
+            .expect("NAX bench failed");
+        cb.commit();
+        cb.wait_until_completed();
+        nax_times.push(start.elapsed());
+    }
+    let nax_stats = Stats::from_durations(&nax_times);
+
+    let v1_tf = tflops(m, n, k, v1_stats.p50);
+    let v2_tf = tflops(m, n, k, v2_stats.p50);
+    let nax_tf = tflops(m, n, k, nax_stats.p50);
+    let nax_vs_v1 = v1_stats.p50 / nax_stats.p50;
+    let nax_vs_v2 = v2_stats.p50 / nax_stats.p50;
+
+    println!(
+        "  Q4  M={:<4}  {:<16}  v1={:8.1}us ({:.3}T)  v2={:8.1}us ({:.3}T)  NAX={:8.1}us ({:.3}T)  NAX/v1={:.2}x  NAX/v2={:.2}x",
+        m, label,
+        v1_stats.p50, v1_tf,
+        v2_stats.p50, v2_tf,
+        nax_stats.p50, nax_tf,
+        nax_vs_v1, nax_vs_v2,
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -552,6 +767,76 @@ fn main() {
         14336,
         4096,
         group_size,
+        "K=4096 N=14336",
+    );
+    println!();
+
+    // =========================================================================
+    // 6. QMM NAX (MPP) Benchmark — Q4 only, f16 input, f16 scales/biases
+    //    group_size=64 (NAX prefers BK=64 aligned groups)
+    // =========================================================================
+    println!("=== QMM NAX (MPP) Benchmark (Q4 only, f16 input, group_size=64) ===");
+    println!();
+
+    let nax_group_size: u32 = 64;
+    let nax_m_values = [32, 128, 256];
+
+    for &m in &nax_m_values {
+        bench_qmm_nax(
+            &registry,
+            &queue,
+            device,
+            m,
+            4096,
+            4096,
+            nax_group_size,
+            "K=4096 N=4096",
+        );
+    }
+    // Large dimension: K=4096 N=14336, M=256
+    bench_qmm_nax(
+        &registry,
+        &queue,
+        device,
+        256,
+        14336,
+        4096,
+        nax_group_size,
+        "K=4096 N=14336",
+    );
+    println!();
+
+    // =========================================================================
+    // 7. QMM MMA v1 vs Steel v2 vs NAX Head-to-Head — Q4 only
+    //    Compares all three kernels at each (M,N,K) configuration.
+    //    Note: v1/v2 use group_size=32 (f32 scales), NAX uses group_size=64 (f16 scales).
+    // =========================================================================
+    println!("=== QMM v1 vs v2 (Steel) vs NAX Head-to-Head (Q4 only) ===");
+    println!();
+
+    for &m in &nax_m_values {
+        bench_qmm_nax_vs_mma(
+            &registry,
+            &queue,
+            device,
+            m,
+            4096,
+            4096,
+            group_size,     // v1/v2: group_size=32
+            nax_group_size, // NAX: group_size=64
+            "K=4096 N=4096",
+        );
+    }
+    // Large dimension head-to-head
+    bench_qmm_nax_vs_mma(
+        &registry,
+        &queue,
+        device,
+        256,
+        14336,
+        4096,
+        group_size,
+        nax_group_size,
         "K=4096 N=14336",
     );
     println!();
