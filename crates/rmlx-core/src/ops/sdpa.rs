@@ -4353,6 +4353,60 @@ mod tests {
         }
     }
 
+    /// Probe whether MetalPerformancePrimitives headers are available at JIT compile time.
+    /// This test never panics — it prints the result for diagnostic purposes.
+    #[test]
+    fn test_mpp_jit_availability() {
+        let gpu_dev = rmlx_metal::device::GpuDevice::system_default().unwrap();
+        let registry = KernelRegistry::new(gpu_dev);
+
+        // --- Probe 1: MPP header inclusion ---
+        let mpp_source = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+
+kernel void mpp_probe(device float* out [[buffer(0)]], uint tid [[thread_position_in_grid]]) {
+    out[tid] = 1.0f;
+}
+"#;
+
+        let mpp_result = registry.register_jit_source("mpp_probe", mpp_source);
+        match &mpp_result {
+            Ok(()) => eprintln!("[MPP probe] SUCCESS — MetalPerformancePrimitives header is available at JIT compile time"),
+            Err(e) => eprintln!("[MPP probe] FAILED — MetalPerformancePrimitives header NOT available: {e}"),
+        }
+
+        // --- Probe 2: Baseline Metal 3.2 simdgroup_matrix (no MPP) ---
+        let baseline_source = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup>
+using namespace metal;
+
+kernel void metal32_probe(device float* out [[buffer(0)]], uint tid [[thread_position_in_grid]]) {
+    simdgroup_float8x8 mat;
+    simdgroup_load(mat, out, 8);
+    simdgroup_store(mat, out, 8);
+    out[tid] = 1.0f;
+}
+"#;
+
+        let baseline_result = registry.register_jit_source("metal32_probe", baseline_source);
+        match &baseline_result {
+            Ok(()) => eprintln!("[Metal 3.2 baseline] SUCCESS — simdgroup_matrix compiles OK"),
+            Err(e) => eprintln!("[Metal 3.2 baseline] FAILED — simdgroup_matrix compilation error: {e}"),
+        }
+
+        // Summary
+        eprintln!("---");
+        eprintln!(
+            "MPP available: {}  |  Metal 3.2 baseline: {}",
+            mpp_result.is_ok(),
+            baseline_result.is_ok()
+        );
+    }
+
     #[test]
     fn test_sdpa_mma_bk32_vs_scalar_correctness() {
         let (registry, queue) = setup_with_copy();
