@@ -2610,11 +2610,506 @@ kernel void sdpa_prefill_mma_bk32_f16(
 }
 "#;
 
+// ---------------------------------------------------------------------------
+// NAX SDPA kernel: BQ=64, BK=32, BD=128, 4 SGs, 128 threads
+// Uses MetalPerformancePrimitives matmul2d (16×16 NAX fragments).
+// NO threadgroup memory — all loads go directly from device to registers.
+// ---------------------------------------------------------------------------
+const NAX_BQ: usize = 64;
+const NAX_BK: usize = 32;
+const NAX_THREADS: u64 = 128;
+
+pub const SDPA_NAX_SHADER_SOURCE: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup>
+using namespace metal;
+
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+namespace mpp = MetalPerformancePrimitives;
+
+// ─── Tile sizes ────────────────────────────────────────────────────────────
+constant constexpr int BQ  = 64;   // Query block rows
+constant constexpr int BK  = 32;   // K/V block rows
+constant constexpr int BD  = 128;  // Head dimension (fixed)
+constant constexpr int WM  = 4;    // Simdgroups along Q dimension
+constant constexpr int WN  = 1;    // Simdgroups along K dimension
+
+// NAX subtile dimensions (16×16 fragments):
+//   UQ  = 16  (Q subtile M-dim per SG)
+//   UK  = 16  (P@V K-dim fragment)
+//   UD  = 32  (output D-dim subtile = 1×2 fragments)
+//   UKs = 32  (S subtile K-dim = 1×2 fragments)
+//   UDs = 16  (Q@K^T D-dim fragment)
+constant constexpr int UQ  = 16;
+constant constexpr int UD  = 32;
+constant constexpr int UK  = 16;
+constant constexpr int UKs = 32;
+constant constexpr int UDs = 16;
+
+// Derived tile counts:
+constant constexpr int TQ  = BQ / (WM * UQ);    // 64 / (4*16) = 1
+constant constexpr int TD  = BD / UD;            // 128 / 32 = 4
+constant constexpr int TK  = BK / UK;            // 32 / 16 = 2  (P@V subtiles)
+constant constexpr int TKs = BK / UKs;           // 32 / 32 = 1  (S subtile)
+constant constexpr int TDs = BD / UDs;           // 128 / 16 = 8  (D-dim chunks for Q@K^T)
+
+// ─── Function constants ────────────────────────────────────────────────────
+constant bool align_Q [[function_constant(200)]];   // seq_len divisible by BQ
+constant bool align_K [[function_constant(201)]];   // kv_len divisible by BK
+constant bool is_causal [[function_constant(300)]]; // Causal masking
+
+// ─── NAX fragment coordinate helpers ────────────────────────────────────────
+// Each lane in a 16×16 fragment holds 8 elements: 2 rows × 4 cols
+// Row indices: fm, fm+8
+// Col indices: fn, fn+1, fn+2, fn+3
+//
+// Element layout per lane (8 elements):
+//   [0..3] = row fm,   cols fn..fn+3
+//   [4..7] = row fm+8, cols fn..fn+3
+
+inline short nax_fm(uint slid) {
+    short qid = short(slid) >> 2;
+    return ((qid & 4) | ((short(slid) >> 1) & 3));
+}
+
+inline short nax_fn(uint slid) {
+    short qid = short(slid) >> 2;
+    return ((qid & 2) | (short(slid) & 1)) * 4;
+}
+
+// ─── Row reduction for a 16×16 fragment (8 elements/lane) ──────────────────
+// Reduces across 4 cols within lane, then across lanes sharing the same row.
+// ri = 0 → row fm, ri = 1 → row fm+8.
+// Returns the same value in all lanes that share the same row.
+
+template <typename Op>
+METAL_FUNC float nax_frag_row_reduce(thread const float* frag, int ri) {
+    // Reduce 4 cols within this lane
+    float v = Op::apply(Op::apply(frag[ri*4+0], frag[ri*4+1]),
+                        Op::apply(frag[ri*4+2], frag[ri*4+3]));
+    // Reduce across quads (lanes with same row but different fn)
+    float xor1 = simd_shuffle_xor(v, ushort(1));
+    v = Op::apply(v, xor1);
+    // Reduce across row groups (lanes offset by 8 share fm vs fm+8)
+    float xor8 = simd_shuffle_xor(v, ushort(8));
+    v = Op::apply(v, xor8);
+    return v;
+}
+
+// Row reduction for a 16×32 tile (two 16×16 sub-fragments, 16 elements/lane).
+// frag0[8] = first 16×16 (cols 0..15), frag1[8] = second 16×16 (cols 16..31).
+template <typename Op>
+METAL_FUNC float nax_wide_row_reduce(thread const float* frag0,
+                                      thread const float* frag1, int ri) {
+    float v0 = Op::apply(Op::apply(frag0[ri*4+0], frag0[ri*4+1]),
+                         Op::apply(frag0[ri*4+2], frag0[ri*4+3]));
+    float v1 = Op::apply(Op::apply(frag1[ri*4+0], frag1[ri*4+1]),
+                         Op::apply(frag1[ri*4+2], frag1[ri*4+3]));
+    float v = Op::apply(v0, v1);
+    float xor1 = simd_shuffle_xor(v, ushort(1));
+    v = Op::apply(v, xor1);
+    float xor8 = simd_shuffle_xor(v, ushort(8));
+    v = Op::apply(v, xor8);
+    return v;
+}
+
+struct MaxOp {
+    template <typename T>
+    METAL_FUNC static constexpr T apply(T x, T y) { return metal::max(x, y); }
+};
+
+struct SumOp {
+    template <typename T>
+    METAL_FUNC static constexpr T apply(T x, T y) { return x + y; }
+};
+
+// ─── Device memory loader helpers ──────────────────────────────────────────
+// Load a 16×16 block from device memory into a NAX fragment register array.
+// src points to the top-left corner, src_ld is the leading dimension.
+// The fragment stores 8 elements per lane: rows [fm, fm+8], cols [fn..fn+3].
+
+METAL_FUNC void load_frag_16x16(thread half* frag,
+                                  const device half* src, int src_ld,
+                                  short fm, short fn,
+                                  int valid_rows, int valid_cols) {
+    // Row fm
+    for (short c = 0; c < 4; c++) {
+        bool ok = (fm < valid_rows) && (fn + c < valid_cols);
+        frag[c] = ok ? src[fm * src_ld + fn + c] : half(0);
+    }
+    // Row fm+8
+    for (short c = 0; c < 4; c++) {
+        bool ok = (fm + 8 < valid_rows) && (fn + c < valid_cols);
+        frag[4 + c] = ok ? src[(fm + 8) * src_ld + fn + c] : half(0);
+    }
+}
+
+METAL_FUNC void load_frag_16x16_unsafe(thread half* frag,
+                                         const device half* src, int src_ld,
+                                         short fm, short fn) {
+    for (short c = 0; c < 4; c++) {
+        frag[c] = src[fm * src_ld + fn + c];
+    }
+    for (short c = 0; c < 4; c++) {
+        frag[4 + c] = src[(fm + 8) * src_ld + fn + c];
+    }
+}
+
+// Store a 16×16 block from float accumulator to device half memory.
+METAL_FUNC void store_frag_16x16(device half* dst, int dst_ld,
+                                   thread const float* frag,
+                                   short fm, short fn,
+                                   int valid_rows, int valid_cols) {
+    for (short c = 0; c < 4; c++) {
+        if (fm < valid_rows && fn + c < valid_cols) {
+            dst[fm * dst_ld + fn + c] = half(frag[c]);
+        }
+    }
+    for (short c = 0; c < 4; c++) {
+        if (fm + 8 < valid_rows && fn + c < valid_cols) {
+            dst[(fm + 8) * dst_ld + fn + c] = half(frag[4 + c]);
+        }
+    }
+}
+
+METAL_FUNC void store_frag_16x16_unsafe(device half* dst, int dst_ld,
+                                          thread const float* frag,
+                                          short fm, short fn) {
+    for (short c = 0; c < 4; c++) {
+        dst[fm * dst_ld + fn + c] = half(frag[c]);
+    }
+    for (short c = 0; c < 4; c++) {
+        dst[(fm + 8) * dst_ld + fn + c] = half(frag[4 + c]);
+    }
+}
+
+// ─── NAX matmul2d descriptors ──────────────────────────────────────────────
+// Q@K^T: MMA(16, 32, 16, trans_a=false, trans_b=true)
+// The output S is 16×32 = two 16×16 sub-fragments.
+// Actually uses MMA(16, 16, 16) since NAX processes 16×16 at a time.
+// We iterate TKs=1 K-subtile of 32 cols = 2 × 16-col fragments.
+
+// For Q@K^T: each D-chunk is MMA(16, 16, 16), accumulating across D.
+// A = Q[16, 16], B = K[16, 16] transposed.
+constexpr auto desc_qk = mpp::tensor_ops::matmul2d_descriptor(
+    16, 16, 16, false, true, true,
+    mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+
+// For P@V: MMA(16, 16, 16), A = P[16, 16], B = V[16, 16].
+// Neither transposed.
+constexpr auto desc_pv = mpp::tensor_ops::matmul2d_descriptor(
+    16, 16, 16, false, false, true,
+    mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+
+// ─── Main NAX SDPA prefill kernel ──────────────────────────────────────────
+//
+// Grid: (ceildiv(seq_len, BQ), num_q_heads, batch_size)
+// Threadgroup: (128, 1, 1) — 4 simdgroups × 32 lanes
+//
+// Buffers:
+//   0: Q      [batch, q_heads, seq_len, head_dim]
+//   1: K      [batch, kv_heads, kv_len, head_dim]
+//   2: V      [batch, kv_heads, kv_len, head_dim]
+//   3: O      [batch, q_heads, seq_len, head_dim]
+//   4: seq_len
+//   5: kv_len
+//   6: head_dim (must be 128)
+//   7: gqa_factor
+//   8: scale
+//   9: kv_stride_S
+
+kernel void sdpa_prefill_nax_f16(
+    device const half*  Q      [[buffer(0)]],
+    device const half*  K      [[buffer(1)]],
+    device const half*  V      [[buffer(2)]],
+    device half*        O      [[buffer(3)]],
+    constant uint& N           [[buffer(4)]],
+    constant uint& S           [[buffer(5)]],
+    constant uint& D_val       [[buffer(6)]],
+    constant uint& gqa_factor  [[buffer(7)]],
+    constant float& scale      [[buffer(8)]],
+    constant uint& kv_stride_S [[buffer(9)]],
+    uint3 tid    [[threadgroup_position_in_grid]],
+    uint  sgid   [[simdgroup_index_in_threadgroup]],
+    uint  slid   [[thread_index_in_simdgroup]])
+{
+    // tid.x = q_block index, tid.y = q_head index
+    const uint q_block = tid.x;
+    const uint q_head  = tid.y;
+    const uint kv_head = q_head / gqa_factor;
+
+    const uint q_start = q_block * BQ;
+    if (q_start >= N) return;
+
+    // Head pointers
+    const device half* Q_head = Q + q_head  * N * BD;
+    const device half* K_head = K + kv_head * kv_stride_S * BD;
+    const device half* V_head = V + kv_head * kv_stride_S * BD;
+    device half*       O_head = O + q_head  * N * BD;
+
+    const float scale2 = scale * M_LOG2E_F;
+
+    // SG-local row offset: each SG handles UQ=16 rows
+    const short tm = short(UQ * TQ * sgid);  // 0, 16, 32, 48
+
+    // Per-lane fragment coordinates within a 16×16 fragment
+    const short fm = nax_fm(slid);
+    const short fn = nax_fn(slid);
+
+    // ─── Output accumulators: TD=4 subtiles of 1×2 fragments (16×32) ────
+    // Each subtile has 2 fragments × 8 elems = 16 floats.
+    // O_acc[id][frag_idx][elem] — id=0..3, frag_idx=0..1
+    float O_acc[TD][2][8];
+    for (int id = 0; id < TD; id++)
+        for (int fi = 0; fi < 2; fi++)
+            for (int e = 0; e < 8; e++)
+                O_acc[id][fi][e] = 0.0f;
+
+    // ─── Softmax state: per-row (2 rows per lane: fm and fm+8) ──────────
+    float row_max[2] = {-INFINITY, -INFINITY};
+    float row_sum[2] = {0.0f, 0.0f};
+
+    // ─── KV block loop ──────────────────────────────────────────────────
+    int NK = (int(S) + BK - 1) / BK;
+    int kb_lim = NK;
+
+    if (is_causal) {
+        int q_max = int(q_start) + tm + UQ;  // max Q row for this SG
+        kb_lim = (q_max + BK - 1) / BK;
+        kb_lim = min(NK, kb_lim);
+    }
+
+    const int NK_aligned = align_K ? NK : (NK - 1);
+    const bool is_last_q_block = !align_Q && (q_block == ((N - 1) / BQ));
+    const int q_rows_valid = is_last_q_block ? int(N) - int(q_start) : BQ;
+
+    for (int kb = 0; kb < kb_lim; kb++) {
+        const int kv_start = kb * BK;
+        const bool is_last_kv = (!align_K && kb == NK_aligned);
+        const int kv_rows_valid = is_last_kv ? (int(S) - kv_start) : BK;
+
+        // ── Step 1: Compute S = Q @ K^T ─────────────────────────────────
+        // S is 16×32 = two 16×16 sub-fragments per SG.
+        // S_frag[0][8] = cols 0..15, S_frag[1][8] = cols 16..31
+        float S_frag[2][8];
+        for (int fi = 0; fi < 2; fi++)
+            for (int e = 0; e < 8; e++)
+                S_frag[fi][e] = 0.0f;
+
+        // Iterate over D in chunks of UDs=16
+        for (int dd = 0; dd < TDs; dd++) {
+            // Load Q fragment: 16×16 from Q_head[(q_start+tm).., dd*16..]
+            half Q_frag[8];
+            const device half* Q_ptr = Q_head + (q_start + tm) * BD + dd * UDs;
+            int q_valid = min(int(UQ), q_rows_valid - int(tm));
+            if (q_valid <= 0) {
+                for (int e = 0; e < 8; e++) Q_frag[e] = half(0);
+            } else if (is_last_q_block && q_valid < UQ) {
+                load_frag_16x16(Q_frag, Q_ptr, BD, fm, fn, q_valid, UDs);
+            } else {
+                load_frag_16x16_unsafe(Q_frag, Q_ptr, BD, fm, fn);
+            }
+
+            // For each of the 2 K sub-fragments (16 cols each in K dim)
+            for (int ki = 0; ki < 2; ki++) {
+                // Load K fragment: K is [kv_len, BD], we want K^T.
+                // K^T[D, kv_len]: row=dd*16+.., col=kv_start+ki*16+..
+                // Equivalently: K[kv_start+ki*16+row, dd*16+col] transposed.
+                // For desc_qk (trans_b=true), B input is K in original layout,
+                // and the MMA transposes it internally.
+                // So load K[kv_start+ki*16.., dd*16..] as 16×16.
+                half K_frag[8];
+                int k_row_start = kv_start + ki * 16;
+                const device half* K_ptr = K_head + k_row_start * BD + dd * UDs;
+                int k_valid = min(16, kv_rows_valid - ki * 16);
+                if (k_valid <= 0) {
+                    for (int e = 0; e < 8; e++) K_frag[e] = half(0);
+                } else if (is_last_kv && k_valid < 16) {
+                    load_frag_16x16(K_frag, K_ptr, BD, fm, fn, k_valid, UDs);
+                } else {
+                    load_frag_16x16_unsafe(K_frag, K_ptr, BD, fm, fn);
+                }
+
+                // MMA: S_frag[ki] += Q_frag @ K_frag^T
+                mpp::tensor_ops::matmul2d(desc_qk, S_frag[ki], Q_frag, K_frag, S_frag[ki],
+                                           slid);
+            }
+        }
+
+        // ── Step 2: Scale S by scale * log2(e) ─────────────────────────
+        for (int fi = 0; fi < 2; fi++)
+            for (int e = 0; e < 8; e++)
+                S_frag[fi][e] *= scale2;
+
+        // ── Step 3: Mask out-of-bounds K positions ──────────────────────
+        if (is_last_kv) {
+            // S_frag[0] covers K cols 0..15, S_frag[1] covers K cols 16..31
+            // Fragment element (ri, ci): row = fm + ri*8, col = fn + ci
+            // For S_frag[fi]: actual K col = fi*16 + fn + ci
+            for (int fi = 0; fi < 2; fi++) {
+                for (int ri = 0; ri < 2; ri++) {
+                    for (int ci = 0; ci < 4; ci++) {
+                        int col = fi * 16 + fn + ci;
+                        if (col >= kv_rows_valid) {
+                            S_frag[fi][ri * 4 + ci] = -INFINITY;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Step 3b: Causal masking ─────────────────────────────────────
+        if (is_causal) {
+            for (int fi = 0; fi < 2; fi++) {
+                for (int ri = 0; ri < 2; ri++) {
+                    int q_row = int(q_start) + tm + fm + ri * 8;
+                    for (int ci = 0; ci < 4; ci++) {
+                        int k_col = kv_start + fi * 16 + fn + ci;
+                        if (k_col > q_row) {
+                            S_frag[fi][ri * 4 + ci] = -INFINITY;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Step 3c: Mask out-of-bounds Q rows ──────────────────────────
+        if (is_last_q_block) {
+            int q_valid_local = q_rows_valid - int(tm);
+            for (int fi = 0; fi < 2; fi++) {
+                for (int ri = 0; ri < 2; ri++) {
+                    int row = fm + ri * 8;
+                    if (row >= q_valid_local) {
+                        for (int ci = 0; ci < 4; ci++)
+                            S_frag[fi][ri * 4 + ci] = -INFINITY;
+                    }
+                }
+            }
+        }
+
+        // ── Step 4: Online softmax ──────────────────────────────────────
+        // 4a. Row max across the 16×32 S tile
+        float new_max[2];
+        for (int ri = 0; ri < 2; ri++) {
+            new_max[ri] = nax_wide_row_reduce<MaxOp>(S_frag[0], S_frag[1], ri);
+            new_max[ri] = max(new_max[ri], row_max[ri]);
+        }
+
+        // 4b. P = exp2(S - new_max)  (in-place)
+        for (int fi = 0; fi < 2; fi++) {
+            for (int ri = 0; ri < 2; ri++) {
+                for (int ci = 0; ci < 4; ci++) {
+                    S_frag[fi][ri * 4 + ci] = fast::exp2(S_frag[fi][ri * 4 + ci] - new_max[ri]);
+                }
+            }
+        }
+
+        // 4c. Correction factor for old accumulator
+        float factor[2];
+        for (int ri = 0; ri < 2; ri++) {
+            factor[ri] = fast::exp2(row_max[ri] - new_max[ri]);
+            row_max[ri] = new_max[ri];
+        }
+
+        // 4d. Row sum of exp scores
+        float new_sum[2];
+        for (int ri = 0; ri < 2; ri++) {
+            new_sum[ri] = nax_wide_row_reduce<SumOp>(S_frag[0], S_frag[1], ri);
+            row_sum[ri] = row_sum[ri] * factor[ri] + new_sum[ri];
+        }
+
+        // 4e. Rescale existing O accumulator
+        for (int id = 0; id < TD; id++) {
+            for (int fi = 0; fi < 2; fi++) {
+                for (int ri = 0; ri < 2; ri++) {
+                    for (int ci = 0; ci < 4; ci++) {
+                        O_acc[id][fi][ri * 4 + ci] *= factor[ri];
+                    }
+                }
+            }
+        }
+
+        // ── Step 5: S→P retile ──────────────────────────────────────────
+        // S_frag[0..1] are already two 16×16 sub-fragments = P[0..1].
+        // Convert to half for MMA input.
+        half P_frag[2][8];
+        for (int fi = 0; fi < 2; fi++)
+            for (int e = 0; e < 8; e++)
+                P_frag[fi][e] = half(S_frag[fi][e]);
+
+        // ── Step 6: O += P @ V ──────────────────────────────────────────
+        // For each of TD=4 output D-subtiles (each 16×32 = 2 fragments):
+        for (int id = 0; id < TD; id++) {
+            // For each of TK=2 P subtiles along K dim:
+            for (int ik = 0; ik < TK; ik++) {
+                // Load V fragment: V[kv_start+ik*16.., id*32+fi*16..]
+                // V is [kv_len, BD], we load 16×16 blocks.
+                for (int fi = 0; fi < 2; fi++) {
+                    half V_frag[8];
+                    int v_row = kv_start + ik * 16;
+                    int v_col = id * UD + fi * 16;
+                    const device half* V_ptr = V_head + v_row * BD + v_col;
+                    int v_valid = min(16, kv_rows_valid - ik * 16);
+                    if (v_valid <= 0) {
+                        for (int e = 0; e < 8; e++) V_frag[e] = half(0);
+                    } else if (is_last_kv && v_valid < 16) {
+                        load_frag_16x16(V_frag, V_ptr, BD, fm, fn, v_valid, 16);
+                    } else {
+                        load_frag_16x16_unsafe(V_frag, V_ptr, BD, fm, fn);
+                    }
+
+                    // MMA: O_acc[id][fi] += P_frag[ik] @ V_frag
+                    mpp::tensor_ops::matmul2d(desc_pv, O_acc[id][fi], P_frag[ik], V_frag,
+                                               O_acc[id][fi], slid);
+                }
+            }
+        }
+    } // end KV block loop
+
+    // ─── Final normalization: O /= row_sum ──────────────────────────────
+    for (int id = 0; id < TD; id++) {
+        for (int fi = 0; fi < 2; fi++) {
+            for (int ri = 0; ri < 2; ri++) {
+                float inv_sum = (row_sum[ri] > 0.0f) ? (1.0f / row_sum[ri]) : 0.0f;
+                for (int ci = 0; ci < 4; ci++) {
+                    O_acc[id][fi][ri * 4 + ci] *= inv_sum;
+                }
+            }
+        }
+    }
+
+    // ─── Store output ───────────────────────────────────────────────────
+    // O layout: [num_q_heads, N, BD], row-major
+    device half* O_base = O_head + (q_start + tm) * BD;
+
+    if (is_last_q_block) {
+        int q_valid_local = int(q_rows_valid) - int(tm);
+        if (fm >= q_valid_local && fm + 8 >= q_valid_local) return;
+
+        for (int id = 0; id < TD; id++) {
+            for (int fi = 0; fi < 2; fi++) {
+                int col_base = id * UD + fi * 16;
+                store_frag_16x16(O_base, BD, O_acc[id][fi], fm, short(col_base + fn),
+                                  q_valid_local, BD);
+            }
+        }
+    } else {
+        for (int id = 0; id < TD; id++) {
+            for (int fi = 0; fi < 2; fi++) {
+                int col_base = id * UD + fi * 16;
+                store_frag_16x16_unsafe(O_base, BD, O_acc[id][fi], fm, short(col_base + fn));
+            }
+        }
+    }
+}
+"#;
+
 pub fn register(registry: &KernelRegistry) -> Result<(), KernelError> {
     registry.register_jit_source("sdpa", SDPA_SHADER_SOURCE)?;
     registry.register_jit_source("sdpa_bf16", SDPA_BF16_SHADER_SOURCE)?;
     registry.register_jit_source("sdpa_mma", SDPA_MMA_SHADER_SOURCE)?;
     registry.register_jit_source("sdpa_mma_bk32", SDPA_MMA_BK32_SHADER_SOURCE)?;
+    registry.register_jit_source("sdpa_nax", SDPA_NAX_SHADER_SOURCE)?;
     Ok(())
 }
 
@@ -3434,6 +3929,95 @@ pub fn sdpa_prefill_mma_bk32_f16_into_cb(
 
     let n_q_blocks = seq_len.div_ceil(MMA_BQ) as u64;
     let tg_size = std::cmp::min(MMA_THREADS, pipeline.max_total_threads_per_threadgroup());
+    encoder.dispatch_thread_groups(
+        MTLSize::new(n_q_blocks, num_heads as u64, 1),
+        MTLSize::new(tg_size, 1, 1),
+    );
+    encoder.end_encoding();
+
+    Ok(out)
+}
+
+/// NAX SDPA prefill kernel — MetalPerformancePrimitives based.
+///
+/// Uses BQ=64, BK=32, BD=128 with 4 simdgroups (128 threads).
+/// No threadgroup memory — all loads go directly from device to registers.
+///
+/// Grid: (ceildiv(seq_len, 64), num_heads, 1) — each TG processes 64 Q rows.
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_prefill_nax_f16_into_cb(
+    registry: &KernelRegistry,
+    q_slab: &Array,
+    k_slab: &Array,
+    v_slab: &Array,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    seq_len: usize,
+    kv_len: usize,
+    kv_seq_stride: Option<usize>,
+    scale: f32,
+    is_causal: bool,
+    cb: &metal::CommandBufferRef,
+) -> Result<Array, KernelError> {
+    use crate::kernels::FunctionConstantValue;
+
+    let dtype = q_slab.dtype();
+    if dtype != DType::Float16 {
+        return Err(KernelError::NotFound(format!(
+            "sdpa_prefill_nax: only f16 supported, got {:?}",
+            dtype
+        )));
+    }
+    if head_dim != 128 {
+        return Err(KernelError::InvalidShape(format!(
+            "sdpa_prefill_nax: only head_dim=128 supported, got {head_dim}"
+        )));
+    }
+    if num_kv_heads == 0 || num_heads % num_kv_heads != 0 {
+        return Err(KernelError::InvalidShape(format!(
+            "sdpa_prefill_nax: num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
+        )));
+    }
+
+    let gqa_factor = (num_heads / num_kv_heads) as u32;
+    let align_q = seq_len % NAX_BQ == 0;
+    let align_k = kv_len % NAX_BK == 0;
+
+    let constants = vec![
+        (200u32, FunctionConstantValue::Bool(align_q)),
+        (201, FunctionConstantValue::Bool(align_k)),
+        (300, FunctionConstantValue::Bool(is_causal)),
+    ];
+
+    let pipeline =
+        registry.get_pipeline_with_constants("sdpa_prefill_nax_f16", dtype, &constants)?;
+    let dev = registry.device().raw();
+
+    let out_numel = num_heads * seq_len * head_dim;
+    let out = Array::zeros(dev, &[out_numel], dtype);
+
+    let n_val = seq_len as u32;
+    let s_val = kv_len as u32;
+    let d_val = head_dim as u32;
+
+    let encoder = cb.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(q_slab.metal_buffer()), q_slab.offset() as u64);
+    encoder.set_buffer(1, Some(k_slab.metal_buffer()), k_slab.offset() as u64);
+    encoder.set_buffer(2, Some(v_slab.metal_buffer()), v_slab.offset() as u64);
+    encoder.set_buffer(3, Some(out.metal_buffer()), 0);
+    encoder.set_bytes(4, 4, &n_val as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(5, 4, &s_val as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(6, 4, &d_val as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(7, 4, &gqa_factor as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(8, 4, &scale as *const f32 as *const std::ffi::c_void);
+    let stride_s_val = kv_seq_stride.unwrap_or(kv_len) as u32;
+    encoder.set_bytes(9, 4, &stride_s_val as *const u32 as *const std::ffi::c_void);
+
+    // Grid: (ceildiv(seq_len, BQ=64), num_heads, 1)
+    let n_q_blocks = seq_len.div_ceil(NAX_BQ) as u64;
+    let tg_size = std::cmp::min(NAX_THREADS, pipeline.max_total_threads_per_threadgroup());
     encoder.dispatch_thread_groups(
         MTLSize::new(n_q_blocks, num_heads as u64, 1),
         MTLSize::new(tg_size, 1, 1),
@@ -4395,7 +4979,9 @@ kernel void metal32_probe(device float* out [[buffer(0)]], uint tid [[thread_pos
         let baseline_result = registry.register_jit_source("metal32_probe", baseline_source);
         match &baseline_result {
             Ok(()) => eprintln!("[Metal 3.2 baseline] SUCCESS — simdgroup_matrix compiles OK"),
-            Err(e) => eprintln!("[Metal 3.2 baseline] FAILED — simdgroup_matrix compilation error: {e}"),
+            Err(e) => {
+                eprintln!("[Metal 3.2 baseline] FAILED — simdgroup_matrix compilation error: {e}")
+            }
         }
 
         // Summary
@@ -4494,6 +5080,95 @@ kernel void metal32_probe(device float* out [[buffer(0)]], uint tid [[thread_pos
                 "MMA BK32 vs Scalar seq_len={seq_len}: max_abs_diff={diff} (expected < {tol})"
             );
             eprintln!("  BK32 seq_len={seq_len:>4}: max_abs_diff={diff:.6} (tol={tol})");
+        }
+    }
+
+    #[test]
+    fn test_sdpa_nax_vs_scalar_correctness() {
+        let (registry, queue) = setup_with_copy();
+
+        let num_heads = 4;
+        let num_kv_heads = 2;
+        let head_dim = 128;
+        let max_seq = 1024;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        for seq_len in [64, 128, 256, 512] {
+            let q_data = pseudo_random(num_heads * seq_len * head_dim, 42);
+            let k_data = pseudo_random(num_kv_heads * max_seq * head_dim, 137);
+            let v_data = pseudo_random(num_kv_heads * max_seq * head_dim, 256);
+
+            let q_slab = make_f16_array(
+                &registry,
+                &queue,
+                &q_data,
+                vec![num_heads * seq_len * head_dim],
+            );
+            let k_slab = make_f16_array(
+                &registry,
+                &queue,
+                &k_data,
+                vec![num_kv_heads * max_seq * head_dim],
+            );
+            let v_slab = make_f16_array(
+                &registry,
+                &queue,
+                &v_data,
+                vec![num_kv_heads * max_seq * head_dim],
+            );
+
+            // --- Scalar kernel ---
+            let cb_scalar = queue.new_command_buffer();
+            let scalar_out = sdpa_prefill_gqa_slab_into_cb(
+                &registry,
+                &q_slab,
+                &k_slab,
+                &v_slab,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                seq_len,
+                seq_len,
+                Some(max_seq),
+                None,
+                scale,
+                true,
+                cb_scalar,
+            )
+            .unwrap();
+            cb_scalar.commit();
+            cb_scalar.wait_until_completed();
+            let scalar_f32 = read_f16_as_f32(&registry, &queue, &scalar_out);
+
+            // --- NAX kernel ---
+            let cb_nax = queue.new_command_buffer();
+            let nax_out = sdpa_prefill_nax_f16_into_cb(
+                &registry,
+                &q_slab,
+                &k_slab,
+                &v_slab,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                seq_len,
+                seq_len,
+                Some(max_seq),
+                scale,
+                true,
+                cb_nax,
+            )
+            .unwrap();
+            cb_nax.commit();
+            cb_nax.wait_until_completed();
+            let nax_f32 = read_f16_as_f32(&registry, &queue, &nax_out);
+
+            let diff = max_abs_diff(&scalar_f32, &nax_f32);
+            let tol = if seq_len <= 128 { 2e-2 } else { 5e-2 };
+            assert!(
+                diff < tol,
+                "NAX vs Scalar seq_len={seq_len}: max_abs_diff={diff} (expected < {tol})"
+            );
+            eprintln!("  NAX seq_len={seq_len:>4}: max_abs_diff={diff:.6} (tol={tol})");
         }
     }
 }
