@@ -3169,8 +3169,8 @@ kernel void affine_qmm_qldr_q4(
     // Each byte holds 2 Q4 nibbles.
     // Thread mapping: n_reads = (BK_PACKED * BN) / TG_SIZE = (4 * 64) / 64 = 4
     // bi = thread's N row in tile, bj = thread's K column (packed uint32 index)
-    constant constexpr uint QL_N_READS = (QL_BK_PACKED * QL_BN) / 64;  // = 4
-    constant constexpr uint QL_BYTES_PER_PACK = 4;  // one uint32 = 4 bytes
+    constexpr uint QL_N_READS = (QL_BK_PACKED * QL_BN) / 64;  // = 4
+    constexpr uint QL_BYTES_PER_PACK = 4;  // one uint32 = 4 bytes
 
     const uint w_bi = (QL_N_READS * tid_in_group) / QL_BK_PACKED;   // N row: 0..63
     const uint w_bj = (QL_N_READS * tid_in_group) % QL_BK_PACKED;   // K col (packed): 0..3
