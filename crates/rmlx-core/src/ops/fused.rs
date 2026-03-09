@@ -308,6 +308,71 @@ pub fn silu_gate_elems_per_thread(dtype: DType) -> u64 {
     }
 }
 
+/// Fused SiLU * mul reading from a merged `[seq_len, 2 * gate_dim]` buffer.
+///
+/// Gate data occupies columns `[0..gate_dim)`, Up data occupies `[gate_dim..2*gate_dim)`.
+/// Output is `[seq_len, gate_dim]` contiguous.
+///
+/// This eliminates two intermediate copy dispatches that were previously needed to
+/// extract contiguous gate/up slices from the merged GEMM output.
+pub fn fused_silu_mul_strided_into_cb(
+    registry: &KernelRegistry,
+    merged: &Array,
+    gate_dim: usize,
+    cb: &metal::CommandBufferRef,
+) -> Result<Array, KernelError> {
+    if merged.ndim() != 2 {
+        return Err(KernelError::InvalidShape(format!(
+            "fused_silu_mul_strided_into_cb: expected 2D merged, got {}D",
+            merged.ndim()
+        )));
+    }
+    let seq_len = merged.shape()[0];
+    let total_dim = merged.shape()[1];
+    if total_dim != 2 * gate_dim {
+        return Err(KernelError::InvalidShape(format!(
+            "fused_silu_mul_strided_into_cb: total_dim {} != 2 * gate_dim {}",
+            total_dim, gate_dim
+        )));
+    }
+
+    let (kernel_name, elems_per_thread) =
+        super::silu::silu_gate_strided_kernel_info(merged.dtype())?;
+    let pipeline = registry.get_pipeline(kernel_name, merged.dtype())?;
+
+    let dev = registry.device().raw();
+    let output = Array::uninit(dev, &[seq_len, gate_dim], merged.dtype());
+
+    let gate_dim_u32 = gate_dim as u32;
+    let total_dim_u32 = total_dim as u32;
+    let seq_len_u32 = seq_len as u32;
+
+    // 2D grid: x = ceil(gate_dim / elems_per_thread), y = seq_len
+    let grid_x = (gate_dim as u64).div_ceil(elems_per_thread);
+    let grid_y = seq_len as u64;
+
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_buffer(0, Some(merged.metal_buffer()), merged.offset() as u64);
+    enc.set_buffer(1, Some(output.metal_buffer()), output.offset() as u64);
+    enc.set_bytes(2, 4, &gate_dim_u32 as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(
+        3,
+        4,
+        &total_dim_u32 as *const u32 as *const std::ffi::c_void,
+    );
+    enc.set_bytes(4, 4, &seq_len_u32 as *const u32 as *const std::ffi::c_void);
+
+    let grid_size = MTLSize::new(grid_x, grid_y, 1);
+    let max_tg = pipeline.max_total_threads_per_threadgroup();
+    let tg_x = std::cmp::min(max_tg, grid_x);
+    let threadgroup_size = MTLSize::new(tg_x, 1, 1);
+    enc.dispatch_threads(grid_size, threadgroup_size);
+    enc.end_encoding();
+
+    Ok(output)
+}
+
 /// Batched Q/K/V projection using the CommandBatcher (no commit/wait).
 ///
 /// Same as `batched_qkv_proj` but encodes into a provided command buffer.

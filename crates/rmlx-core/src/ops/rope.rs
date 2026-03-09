@@ -218,6 +218,7 @@ kernel void rope_multihead_f32(
     constant uint&  offset      [[buffer(7)]],
     constant uint&  traditional [[buffer(8)]],
     constant uint&  forward     [[buffer(9)]],
+    constant uint&  input_row_stride [[buffer(10)]],
     uint3 gid [[thread_position_in_grid]])
 {
     uint pair_idx = gid.x;  // 0 .. half_dim-1
@@ -233,8 +234,8 @@ kernel void rope_multihead_f32(
     float sin_val = sin_freqs[freq_idx];
     if (!forward) sin_val = -sin_val;
 
-    // Input layout: [seq_len, num_heads * head_dim], row-major
-    uint in_base = seq_pos * (num_heads * head_dim) + head * head_dim;
+    // Input layout: [seq_len, ?], row-major with configurable stride
+    uint in_base = seq_pos * input_row_stride + head * head_dim;
     uint in_idx1, in_idx2;
     if (traditional) {
         in_idx1 = in_base + 2 * pair_idx;
@@ -272,6 +273,7 @@ kernel void rope_multihead_f16(
     constant uint&  offset      [[buffer(7)]],
     constant uint&  traditional [[buffer(8)]],
     constant uint&  forward     [[buffer(9)]],
+    constant uint&  input_row_stride [[buffer(10)]],
     uint3 gid [[thread_position_in_grid]])
 {
     uint pair_idx = gid.x;
@@ -287,7 +289,7 @@ kernel void rope_multihead_f16(
     float sin_val = sin_freqs[freq_idx];
     if (!forward) sin_val = -sin_val;
 
-    uint in_base = seq_pos * (num_heads * head_dim) + head * head_dim;
+    uint in_base = seq_pos * input_row_stride + head * head_dim;
     uint in_idx1, in_idx2;
     if (traditional) {
         in_idx1 = in_base + 2 * pair_idx;
@@ -324,6 +326,7 @@ kernel void rope_multihead_bf16(
     constant uint&  offset      [[buffer(7)]],
     constant uint&  traditional [[buffer(8)]],
     constant uint&  forward     [[buffer(9)]],
+    constant uint&  input_row_stride [[buffer(10)]],
     uint3 gid [[thread_position_in_grid]])
 {
     uint pair_idx = gid.x;
@@ -339,7 +342,7 @@ kernel void rope_multihead_bf16(
     float sin_val = sin_freqs[freq_idx];
     if (!forward) sin_val = -sin_val;
 
-    uint in_base = seq_pos * (num_heads * head_dim) + head * head_dim;
+    uint in_base = seq_pos * input_row_stride + head * head_dim;
     uint in_idx1, in_idx2;
     if (traditional) {
         in_idx1 = in_base + 2 * pair_idx;
@@ -375,13 +378,14 @@ kernel void deinterleave_heads_f32(
     constant uint& seq_len      [[buffer(2)]],
     constant uint& head_dim     [[buffer(3)]],
     constant uint& num_heads    [[buffer(4)]],
+    constant uint& input_row_stride [[buffer(5)]],
     uint3 gid [[thread_position_in_grid]])
 {
     uint d        = gid.x;
     uint seq_pos  = gid.y;
     uint head     = gid.z;
     if (d >= head_dim || seq_pos >= seq_len || head >= num_heads) return;
-    uint in_idx  = seq_pos * (num_heads * head_dim) + head * head_dim + d;
+    uint in_idx  = seq_pos * input_row_stride + head * head_dim + d;
     uint out_idx = (head * seq_len + seq_pos) * head_dim + d;
         output[out_idx] = input[in_idx];
 }
@@ -392,13 +396,14 @@ kernel void deinterleave_heads_f16(
     constant uint& seq_len      [[buffer(2)]],
     constant uint& head_dim     [[buffer(3)]],
     constant uint& num_heads    [[buffer(4)]],
+    constant uint& input_row_stride [[buffer(5)]],
     uint3 gid [[thread_position_in_grid]])
 {
     uint d        = gid.x;
     uint seq_pos  = gid.y;
     uint head     = gid.z;
     if (d >= head_dim || seq_pos >= seq_len || head >= num_heads) return;
-    uint in_idx  = seq_pos * (num_heads * head_dim) + head * head_dim + d;
+    uint in_idx  = seq_pos * input_row_stride + head * head_dim + d;
     uint out_idx = (head * seq_len + seq_pos) * head_dim + d;
     output[out_idx] = input[in_idx];
 }
@@ -409,13 +414,14 @@ kernel void deinterleave_heads_bf16(
     constant uint& seq_len      [[buffer(2)]],
     constant uint& head_dim     [[buffer(3)]],
     constant uint& num_heads    [[buffer(4)]],
+    constant uint& input_row_stride [[buffer(5)]],
     uint3 gid [[thread_position_in_grid]])
 {
     uint d        = gid.x;
     uint seq_pos  = gid.y;
     uint head     = gid.z;
     if (d >= head_dim || seq_pos >= seq_len || head >= num_heads) return;
-    uint in_idx  = seq_pos * (num_heads * head_dim) + head * head_dim + d;
+    uint in_idx  = seq_pos * input_row_stride + head * head_dim + d;
     uint out_idx = (head * seq_len + seq_pos) * head_dim + d;
     output[out_idx] = input[in_idx];
 }
@@ -1294,6 +1300,7 @@ pub fn rope_multihead(
     sin_freqs: &Array,
     num_heads: usize,
     offset: u32,
+    input_row_stride: usize,
     queue: &metal::CommandQueue,
 ) -> Result<Array, KernelError> {
     let seq_len = input.shape()[0];
@@ -1339,6 +1346,8 @@ pub fn rope_multihead(
     encoder.set_bytes(7, 4, &offset as *const u32 as *const std::ffi::c_void);
     encoder.set_bytes(8, 4, &trad_u32 as *const u32 as *const std::ffi::c_void);
     encoder.set_bytes(9, 4, &fwd_u32 as *const u32 as *const std::ffi::c_void);
+    let stride_u32 = super::checked_u32(input_row_stride, "input_row_stride")?;
+    encoder.set_bytes(10, 4, &stride_u32 as *const u32 as *const std::ffi::c_void);
 
     let max_tg = pipeline.max_total_threads_per_threadgroup();
     let tg_x = std::cmp::min(64, half_dim as u64).min(max_tg);
@@ -1361,6 +1370,7 @@ pub fn rope_multihead_into_cb(
     sin_freqs: &Array,
     num_heads: usize,
     offset: u32,
+    input_row_stride: usize,
     cb: &metal::CommandBufferRef,
 ) -> Result<Array, KernelError> {
     let seq_len = input.shape()[0];
@@ -1395,6 +1405,8 @@ pub fn rope_multihead_into_cb(
     encoder.set_bytes(7, 4, &offset as *const u32 as *const std::ffi::c_void);
     encoder.set_bytes(8, 4, &trad_u32 as *const u32 as *const std::ffi::c_void);
     encoder.set_bytes(9, 4, &fwd_u32 as *const u32 as *const std::ffi::c_void);
+    let stride_u32 = super::checked_u32(input_row_stride, "input_row_stride")?;
+    encoder.set_bytes(10, 4, &stride_u32 as *const u32 as *const std::ffi::c_void);
 
     let max_tg = pipeline.max_total_threads_per_threadgroup();
     let tg_x = std::cmp::min(64, half_dim as u64).min(max_tg);
@@ -1415,6 +1427,7 @@ pub fn deinterleave_heads(
     registry: &KernelRegistry,
     input: &Array,
     num_heads: usize,
+    input_row_stride: usize,
     queue: &metal::CommandQueue,
 ) -> Result<Array, KernelError> {
     let seq_len = input.shape()[0];
@@ -1442,6 +1455,8 @@ pub fn deinterleave_heads(
     encoder.set_bytes(2, 4, &seq_u32 as *const u32 as *const std::ffi::c_void);
     encoder.set_bytes(3, 4, &dim_u32 as *const u32 as *const std::ffi::c_void);
     encoder.set_bytes(4, 4, &heads_u32 as *const u32 as *const std::ffi::c_void);
+    let stride_u32 = super::checked_u32(input_row_stride, "input_row_stride")?;
+    encoder.set_bytes(5, 4, &stride_u32 as *const u32 as *const std::ffi::c_void);
 
     let max_tg = pipeline.max_total_threads_per_threadgroup();
     let tg_x = std::cmp::min(64, head_dim as u64).min(max_tg);
@@ -1460,6 +1475,7 @@ pub fn deinterleave_heads_into_cb(
     registry: &KernelRegistry,
     input: &Array,
     num_heads: usize,
+    input_row_stride: usize,
     cb: &metal::CommandBufferRef,
 ) -> Result<Array, KernelError> {
     let seq_len = input.shape()[0];
@@ -1486,6 +1502,8 @@ pub fn deinterleave_heads_into_cb(
     encoder.set_bytes(2, 4, &seq_u32 as *const u32 as *const std::ffi::c_void);
     encoder.set_bytes(3, 4, &dim_u32 as *const u32 as *const std::ffi::c_void);
     encoder.set_bytes(4, 4, &heads_u32 as *const u32 as *const std::ffi::c_void);
+    let stride_u32 = super::checked_u32(input_row_stride, "input_row_stride")?;
+    encoder.set_bytes(5, 4, &stride_u32 as *const u32 as *const std::ffi::c_void);
 
     let max_tg = pipeline.max_total_threads_per_threadgroup();
     let tg_x = std::cmp::min(64, head_dim as u64).min(max_tg);

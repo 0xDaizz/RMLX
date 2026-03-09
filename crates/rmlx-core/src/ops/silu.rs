@@ -182,6 +182,108 @@ kernel void silu_gate_bf16(
         }
     }
 }
+
+// ─── Strided SiLU * gate (reads gate+up from single merged buffer) ──────────
+// merged layout: [seq_len, total_dim] where gate=[0..gate_dim), up=[gate_dim..total_dim)
+// output: [seq_len, gate_dim] contiguous
+
+kernel void silu_gate_strided_f32(
+    device const float* merged   [[buffer(0)]],
+    device       float* output   [[buffer(1)]],
+    constant     uint&  gate_dim [[buffer(2)]],
+    constant     uint&  total_dim[[buffer(3)]],
+    constant     uint&  seq_len  [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint base_d = gid.x * 2;
+    uint s      = gid.y;
+    if (base_d >= gate_dim || s >= seq_len) return;
+
+    uint gate_base = s * total_dim + base_d;
+    uint up_base   = s * total_dim + gate_dim + base_d;
+    uint out_base  = s * gate_dim  + base_d;
+
+    uint remain = min(gate_dim - base_d, 2u);
+    if (remain == 2) {
+        float x0 = merged[gate_base];
+        float x1 = merged[gate_base + 1];
+        float g0 = merged[up_base];
+        float g1 = merged[up_base + 1];
+        output[out_base]     = x0 * stable_sigmoid_f32(x0) * g0;
+        output[out_base + 1] = x1 * stable_sigmoid_f32(x1) * g1;
+    } else {
+        float x0 = merged[gate_base];
+        output[out_base] = x0 * stable_sigmoid_f32(x0) * merged[up_base];
+    }
+}
+
+kernel void silu_gate_strided_f16(
+    device const half*  merged   [[buffer(0)]],
+    device       half*  output   [[buffer(1)]],
+    constant     uint&  gate_dim [[buffer(2)]],
+    constant     uint&  total_dim[[buffer(3)]],
+    constant     uint&  seq_len  [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint base_d = gid.x * 4;
+    uint s      = gid.y;
+    if (base_d >= gate_dim || s >= seq_len) return;
+
+    uint gate_base = s * total_dim + base_d;
+    uint up_base   = s * total_dim + gate_dim + base_d;
+    uint out_base  = s * gate_dim  + base_d;
+
+    uint remain = min(gate_dim - base_d, 4u);
+    if (remain == 4) {
+        half x0 = merged[gate_base];
+        half x1 = merged[gate_base + 1];
+        half x2 = merged[gate_base + 2];
+        half x3 = merged[gate_base + 3];
+        output[out_base]     = x0 * stable_sigmoid_h(x0) * merged[up_base];
+        output[out_base + 1] = x1 * stable_sigmoid_h(x1) * merged[up_base + 1];
+        output[out_base + 2] = x2 * stable_sigmoid_h(x2) * merged[up_base + 2];
+        output[out_base + 3] = x3 * stable_sigmoid_h(x3) * merged[up_base + 3];
+    } else {
+        for (uint i = 0; i < remain; i++) {
+            half x = merged[gate_base + i];
+            output[out_base + i] = x * stable_sigmoid_h(x) * merged[up_base + i];
+        }
+    }
+}
+
+kernel void silu_gate_strided_bf16(
+    device const bfloat* merged   [[buffer(0)]],
+    device       bfloat* output   [[buffer(1)]],
+    constant     uint&   gate_dim [[buffer(2)]],
+    constant     uint&   total_dim[[buffer(3)]],
+    constant     uint&   seq_len  [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint base_d = gid.x * 4;
+    uint s      = gid.y;
+    if (base_d >= gate_dim || s >= seq_len) return;
+
+    uint gate_base = s * total_dim + base_d;
+    uint up_base   = s * total_dim + gate_dim + base_d;
+    uint out_base  = s * gate_dim  + base_d;
+
+    uint remain = min(gate_dim - base_d, 4u);
+    if (remain == 4) {
+        float x0 = float(merged[gate_base]);
+        float x1 = float(merged[gate_base + 1]);
+        float x2 = float(merged[gate_base + 2]);
+        float x3 = float(merged[gate_base + 3]);
+        output[out_base]     = bfloat(x0 * stable_sigmoid_f32(x0) * float(merged[up_base]));
+        output[out_base + 1] = bfloat(x1 * stable_sigmoid_f32(x1) * float(merged[up_base + 1]));
+        output[out_base + 2] = bfloat(x2 * stable_sigmoid_f32(x2) * float(merged[up_base + 2]));
+        output[out_base + 3] = bfloat(x3 * stable_sigmoid_f32(x3) * float(merged[up_base + 3]));
+    } else {
+        for (uint i = 0; i < remain; i++) {
+            float x = float(merged[gate_base + i]);
+            output[out_base + i] = bfloat(x * stable_sigmoid_f32(x) * float(merged[up_base + i]));
+        }
+    }
+}
 "#;
 
 /// Register SiLU kernels with the registry via JIT.
@@ -192,6 +294,19 @@ pub fn register(registry: &KernelRegistry) -> Result<(), KernelError> {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Return (kernel_name, elements_per_thread) for the strided fused SiLU*gate variant.
+pub fn silu_gate_strided_kernel_info(dtype: DType) -> Result<(&'static str, u64), KernelError> {
+    match dtype {
+        DType::Float32 => Ok(("silu_gate_strided_f32", 2)),
+        DType::Float16 => Ok(("silu_gate_strided_f16", 4)),
+        DType::Bfloat16 => Ok(("silu_gate_strided_bf16", 4)),
+        other => Err(KernelError::InvalidShape(format!(
+            "silu_gate_strided: unsupported dtype {:?}",
+            other
+        ))),
+    }
+}
 
 /// Return (kernel_name, elements_per_thread) for the given dtype.
 fn silu_kernel_info(dtype: DType, fused_gate: bool) -> Result<(&'static str, u64), KernelError> {

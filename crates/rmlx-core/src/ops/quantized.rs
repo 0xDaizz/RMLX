@@ -3053,6 +3053,301 @@ kernel void qmm_splitk_accum(
 }
 "#;
 
+// ---------------------------------------------------------------------------
+// Metal shader source -- QLdr Q4 QMM kernel (BM=64, BN=64, BK=32)
+// ---------------------------------------------------------------------------
+
+/// QLdr Q4 QMM kernel: FP16 MMA engine from gemm_mlx_f16 with QuantizedBlockLoader B-path.
+///
+/// Architecture:
+/// - BM=64, BN=64, BK=32: same spatial tile as gemm_mlx_f16, deeper K for Q4 dequant
+/// - A-loader: half4 vectorized cooperative loading (identical to gemm_mlx_f16)
+/// - B-loader: QuantizedBlockLoader — coalesced uint8_t Q4 load, dequant to half in TG memory
+/// - MMA engine: 1×2 SG grid (2 SG, 64 threads), serpentine 8×8 simdgroup matrices
+/// - Store: thread_elements() direct write with has_residual epilogue
+/// - Single-buffered, swizzled threadgroup mapping
+///
+/// Compared to `affine_qmm_steel_q4` (BM=32, BN=32):
+/// - 4× larger spatial tile → fewer dispatch overhead, better occupancy
+/// - Same B-loader pattern (K-contiguous, per-group scale/bias)
+/// - Same MMA engine as the 23.82T fp16 GEMM
+///
+/// TG memory: As[64×32]=4KB + Bs[32×64]=4KB = 8KB (no padding needed on B since stride=64)
+pub const QMM_QLDR_Q4_SHADER_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// ---------------------------------------------------------------------------
+// QLdr Q4 QMM: BM=64, BN=64, BK=32, 2 SG (1×2), 64 threads.
+// FP16 MMA engine with Q4 dequantizing B-loader.
+// Single-buffered. Output is f32 (float accumulators, store as float).
+// ---------------------------------------------------------------------------
+
+constant constexpr uint QL_BM = 64;
+constant constexpr uint QL_BN = 64;
+constant constexpr uint QL_BK = 32;
+constant constexpr uint QL_TM = 8;   // BM / 8 = 64/8
+constant constexpr uint QL_TN = 4;   // (BN/2) / 8 = 32/8
+
+// Q4 pack constants
+constant constexpr uint QL_PACK_FACTOR = 8;   // 32 / 4 bits = 8 nibbles per uint32
+constant constexpr uint QL_BK_PACKED = QL_BK / QL_PACK_FACTOR;  // 32/8 = 4
+
+// Function constants
+constant bool align_M [[function_constant(200)]];
+constant bool align_N [[function_constant(201)]];
+constant bool has_residual [[function_constant(202)]];
+constant uint ql_fc_group_size [[function_constant(205)]];
+
+#if __METAL_VERSION__ >= 310
+template <typename T>
+METAL_FUNC uniform<T> ql_as_uniform(T val) {
+    return make_uniform(val);
+}
+#else
+template <typename T>
+METAL_FUNC T ql_as_uniform(T val) {
+    return val;
+}
+#endif
+
+inline uint2 ql_swizzle_tg(uint2 tid, uint swizzle_log) {
+    if (swizzle_log == 0) return tid;
+    return uint2(
+        tid.x >> swizzle_log,
+        (tid.y << swizzle_log) | (tid.x & ((1u << swizzle_log) - 1u))
+    );
+}
+
+kernel void affine_qmm_qldr_q4(
+    device const half*    A         [[buffer(0)]],   // half input [M, K]
+    device const uint8_t* w_packed  [[buffer(1)]],   // packed Q4 [N, K/2] (byte-addressed)
+    device const float*   scales    [[buffer(2)]],   // [N * groups_per_row]
+    device const float*   biases    [[buffer(3)]],   // [N * groups_per_row]
+    device float*         output    [[buffer(4)]],   // [M, N]
+    constant uint&        M         [[buffer(5)]],
+    constant uint&        N         [[buffer(6)]],
+    constant uint&        K         [[buffer(7)]],
+    constant uint&        swizzle_log [[buffer(8)]],
+    device const float*   residual  [[buffer(9)]],   // [M, N] (optional via has_residual)
+    uint3 group_id        [[threadgroup_position_in_grid]],
+    uint  tid_in_group    [[thread_index_in_threadgroup]],
+    uint  sgid            [[simdgroup_index_in_threadgroup]],
+    uint  lane_id         [[thread_index_in_simdgroup]])
+{
+    // Threadgroup memory — single-buffered
+    // As: [BM, BK] = 64×32 = 2048 halves = 4KB
+    // Bs: [BK, BN] = 32×64 = 2048 halves = 4KB  (K-major for simdgroup_load)
+    // Total: 8KB — high occupancy on M3 (32KB TG / 8KB = 4 TG/core)
+    threadgroup half As[QL_BM * QL_BK];
+    threadgroup half Bs[QL_BK * QL_BN];
+
+    const uint uK = ql_as_uniform(K);
+    const uint uM = ql_as_uniform(M);
+    const uint uN = ql_as_uniform(N);
+
+    uint2 swizzled = ql_swizzle_tg(uint2(group_id.x, group_id.y), swizzle_log);
+    const uint row_start = swizzled.y * ql_as_uniform(QL_BM);
+    const uint col_start = swizzled.x * ql_as_uniform(QL_BN);
+
+    // Early exit for out-of-bounds threadgroups
+    if (!align_M && row_start >= uM) return;
+    if (!align_N && col_start >= uN) return;
+
+    // SG grid: 1×2 — sg_row always 0, sg_col = sgid (0 or 1)
+    const uint base_n = sgid * 32; // each SG covers 32 cols
+
+    simdgroup_float8x8 acc[QL_TM][QL_TN];
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < QL_TM; i++)
+        #pragma clang loop unroll(full)
+        for (uint j = 0; j < QL_TN; j++)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    // --- B-loader thread mapping (QuantizedBlockLoader pattern) ---
+    // Weight layout: w_packed[n][K/2] — N-major, K contiguous as bytes.
+    // Each byte holds 2 Q4 nibbles.
+    // Thread mapping: n_reads = (BK_PACKED * BN) / TG_SIZE = (4 * 64) / 64 = 4
+    // bi = thread's N row in tile, bj = thread's K column (packed uint32 index)
+    constant constexpr uint QL_N_READS = (QL_BK_PACKED * QL_BN) / 64;  // = 4
+    constant constexpr uint QL_BYTES_PER_PACK = 4;  // one uint32 = 4 bytes
+
+    const uint w_bi = (QL_N_READS * tid_in_group) / QL_BK_PACKED;   // N row: 0..63
+    const uint w_bj = (QL_N_READS * tid_in_group) % QL_BK_PACKED;   // K col (packed): 0..3
+    const uint w_n_global = col_start + w_bi;
+
+    const uint groups_per_row = uK / ql_fc_group_size;
+    const uint half_k = uK / 2;  // bytes per N row in packed weights
+
+    const uint num_k_tiles = (uK + QL_BK - 1) / QL_BK;
+
+    // --- Main K-loop: single-buffered ---
+    for (uint tile = 0; tile < num_k_tiles; tile++) {
+        uint kb = tile * QL_BK;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ──── Load A tile: gemm_mlx_f16 pattern ────
+        // 64 threads, each loads one row of BK=32 elements using 2×half4
+        // tid_in_group maps directly to row index (0..63)
+        {
+            uint a_row = tid_in_group;  // 0..63
+            uint gr = row_start + a_row;
+            if ((align_M || gr < uM) && kb + 31 < uK) {
+                // Fast path: full half4 vectorized loads (8 × half4 = 32 elements)
+                *reinterpret_cast<threadgroup half4*>(&As[a_row * QL_BK])      =
+                    *reinterpret_cast<device const half4*>(&A[gr * uK + kb]);
+                *reinterpret_cast<threadgroup half4*>(&As[a_row * QL_BK + 4])  =
+                    *reinterpret_cast<device const half4*>(&A[gr * uK + kb + 4]);
+                *reinterpret_cast<threadgroup half4*>(&As[a_row * QL_BK + 8])  =
+                    *reinterpret_cast<device const half4*>(&A[gr * uK + kb + 8]);
+                *reinterpret_cast<threadgroup half4*>(&As[a_row * QL_BK + 12]) =
+                    *reinterpret_cast<device const half4*>(&A[gr * uK + kb + 12]);
+                *reinterpret_cast<threadgroup half4*>(&As[a_row * QL_BK + 16]) =
+                    *reinterpret_cast<device const half4*>(&A[gr * uK + kb + 16]);
+                *reinterpret_cast<threadgroup half4*>(&As[a_row * QL_BK + 20]) =
+                    *reinterpret_cast<device const half4*>(&A[gr * uK + kb + 20]);
+                *reinterpret_cast<threadgroup half4*>(&As[a_row * QL_BK + 24]) =
+                    *reinterpret_cast<device const half4*>(&A[gr * uK + kb + 24]);
+                *reinterpret_cast<threadgroup half4*>(&As[a_row * QL_BK + 28]) =
+                    *reinterpret_cast<device const half4*>(&A[gr * uK + kb + 28]);
+            } else {
+                // Slow path: element-by-element with bounds checks
+                for (uint d = 0; d < QL_BK; d++) {
+                    As[a_row * QL_BK + d] = ((align_M || gr < uM) && kb + d < uK)
+                        ? A[gr * uK + kb + d] : half(0);
+                }
+            }
+        }
+
+        // ──── Load B tile: QuantizedBlockLoader pattern ────
+        // Dequant Q4 → half, write to Bs[k][n] layout (K-major for MMA)
+        // Each thread reads n_reads=4 packed bytes, each byte → 2 nibbles → 2 halves
+        {
+            if (align_N || w_n_global < uN) {
+                // Source: K-contiguous bytes from this thread's N row
+                device const uint8_t* src = w_packed + w_n_global * half_k + kb / 2 + w_bj * QL_BYTES_PER_PACK;
+                // Scale/bias for this N row at this K group
+                uint group_idx = (kb + w_bj * QL_PACK_FACTOR) / ql_fc_group_size;
+                float scale_f = scales[w_n_global * groups_per_row + group_idx];
+                float bias_f  = biases[w_n_global * groups_per_row + group_idx];
+                half s_lo = half(scale_f);
+                half s_hi = half(scale_f) / half(16.0f);
+                half bias_h = half(bias_f);
+
+                // Unpack n_reads=4 packs × PACK_FACTOR=8 nibbles each → 32 elements
+                uint k_local_base = w_bj * QL_PACK_FACTOR;
+                for (uint r = 0; r < QL_N_READS; r++) {
+                    uint k_local = k_local_base + r * QL_PACK_FACTOR;
+                    if (kb + k_local + QL_PACK_FACTOR <= uK) {
+                        device const uint8_t* wp = src + r * QL_BYTES_PER_PACK;
+                        // Each byte: low nibble, high nibble
+                        for (uint i = 0; i < QL_PACK_FACTOR / 2; i++) {
+                            uint8_t byte = wp[i];
+                            Bs[(k_local + 2*i) * QL_BN + w_bi]     = s_lo * half(byte & 0x0f) + bias_h;
+                            Bs[(k_local + 2*i + 1) * QL_BN + w_bi] = s_hi * half(byte & 0xf0) + bias_h;
+                        }
+                    } else {
+                        // Tail: element-by-element
+                        for (uint d = 0; d < QL_PACK_FACTOR; d++) {
+                            if (kb + k_local + d < uK) {
+                                device const uint8_t* wp = src + r * QL_BYTES_PER_PACK;
+                                uint8_t byte = wp[d / 2];
+                                half val = (d & 1) == 0
+                                    ? (s_lo * half(byte & 0x0f) + bias_h)
+                                    : (s_hi * half(byte & 0xf0) + bias_h);
+                                Bs[(k_local + d) * QL_BN + w_bi] = val;
+                            } else {
+                                Bs[(k_local + d) * QL_BN + w_bi] = half(0);
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Out-of-bounds N row: zero-fill
+                uint k_local_base = w_bj * QL_PACK_FACTOR;
+                for (uint d = 0; d < QL_N_READS * QL_PACK_FACTOR; d++) {
+                    Bs[(k_local_base + d) * QL_BN + w_bi] = half(0);
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ──── MMA compute: gemm_mlx_f16 serpentine pattern ────
+        // BK=32 → 4 k-steps of 8
+        // As layout: As[m * BK + k], stride = BK
+        // Bs layout: Bs[k * BN + n], stride = BN
+        #pragma clang loop unroll(full)
+        for (uint kk = 0; kk < 4; kk++) {
+            simdgroup_half8x8 a_frag[QL_TM];
+            simdgroup_half8x8 b_frag[QL_TN];
+
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < QL_TM; i++) {
+                simdgroup_load(a_frag[i],
+                    &As[i * 8 * QL_BK + kk * 8], QL_BK);
+            }
+
+            #pragma clang loop unroll(full)
+            for (uint j = 0; j < QL_TN; j++) {
+                simdgroup_load(b_frag[j],
+                    &Bs[kk * 8 * QL_BN + (base_n + j * 8)], QL_BN);
+            }
+
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < QL_TM; i++) {
+                #pragma clang loop unroll(full)
+                for (uint j = 0; j < QL_TN; j++) {
+                    uint n_serp = (i % 2) ? (3 - j) : j;
+                    simdgroup_multiply_accumulate(
+                        acc[i][n_serp], a_frag[i], b_frag[n_serp], acc[i][n_serp]);
+                }
+            }
+        }
+    }
+
+    // ──── Store results: direct register store (gemm_mlx_f16 pattern) ────
+    const uint qid = lane_id / 4;
+    const uint fm = (qid & 4u) + ((lane_id / 2u) % 4u);
+    const uint fn_val = (qid & 2u) * 2u + (lane_id % 2u) * 2u;
+
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < QL_TM; i++) {
+        #pragma clang loop unroll(full)
+        for (uint j = 0; j < QL_TN; j++) {
+            uint gr = row_start + i * 8 + fm;
+            uint gc0 = col_start + base_n + j * 8 + fn_val;
+            uint gc1 = gc0 + 1;
+
+            auto elems = acc[i][j].thread_elements();
+
+            if (align_M && align_N) {
+                float v0 = elems[0];
+                float v1 = elems[1];
+                if (has_residual) {
+                    v0 += residual[gr * uN + gc0];
+                    v1 += residual[gr * uN + gc1];
+                }
+                output[gr * uN + gc0] = v0;
+                output[gr * uN + gc1] = v1;
+            } else {
+                if ((align_M || gr < uM) && (align_N || gc0 < uN)) {
+                    float v0 = elems[0];
+                    if (has_residual) v0 += residual[gr * uN + gc0];
+                    output[gr * uN + gc0] = v0;
+                }
+                if ((align_M || gr < uM) && (align_N || gc1 < uN)) {
+                    float v1 = elems[1];
+                    if (has_residual) v1 += residual[gr * uN + gc1];
+                    output[gr * uN + gc1] = v1;
+                }
+            }
+        }
+    }
+}
+"#;
+
 /// Register the QMM Metal kernels with the given registry.
 pub fn register_qmm(registry: &KernelRegistry) -> Result<(), KernelError> {
     registry.register_jit_source("qmm", QMM_SHADER_SOURCE)?;
@@ -3061,6 +3356,7 @@ pub fn register_qmm(registry: &KernelRegistry) -> Result<(), KernelError> {
     registry.register_jit_source("qmm_splitk_q4", QMM_SPLITK_Q4_SHADER_SOURCE)?;
     registry.register_jit_source("qmm_skinny", QMM_SKINNY_SHADER_SOURCE)?;
     registry.register_jit_source("qmm_steel_q4", QMM_STEEL_Q4_SHADER_SOURCE)?;
+    registry.register_jit_source("qmm_qldr_q4", QMM_QLDR_Q4_SHADER_SOURCE)?;
     // NAX kernel requires MetalPerformancePrimitives (Metal 3.1+), gracefully skip if unavailable
     if let Err(e) = registry.register_jit_source("qmm_nax_q4", QMM_NAX_Q4_SHADER_SOURCE) {
         eprintln!("warning: qmm_nax_q4 registration skipped (MPP unavailable): {e}");
@@ -3323,6 +3619,9 @@ pub fn affine_quantized_matmul_batched(
 
                 Ok(out)
             }
+        } else if k >= 4096 || (m <= 128 && n >= 4096) {
+            // --- QLdr path: BM=64 BN=64 BK=32, coalesced dequant B-loader ---
+            affine_quantized_matmul_qldr(registry, x, qw, queue)
         } else {
             // --- Standard path: BM=64, BN=64, BK=16 ---
             let m_tiles = m.div_ceil(STD_BM);
@@ -3438,8 +3737,13 @@ pub fn affine_quantized_matmul_batched(
 
 /// Fused QMM + residual add: `output = QMM(x, qw) + residual`.
 ///
-/// Encodes into an existing command buffer. Only Q4 standard path (M > 32).
+/// Encodes into an existing command buffer. Only Q4 (M > 32).
 /// The residual is added in the store epilogue via `has_residual` function constant.
+///
+/// Dispatch strategy:
+/// - **QLdr path** (`affine_qmm_qldr_q4`): when `k >= 4096` or `(m <= 128 && n >= 4096)`.
+///   Uses BK=32 coalesced B-loader with half input (f32→f16 pre-conversion).
+/// - **MMA path** (`affine_qmm_mma_q4`): fallback for smaller dimensions.
 #[allow(clippy::too_many_arguments)]
 pub fn qmm_add_residual_into_cb(
     registry: &KernelRegistry,
@@ -3466,58 +3770,120 @@ pub fn qmm_add_residual_into_cb(
     let dev = registry.device().raw();
     let opts = metal::MTLResourceOptions::StorageModeShared;
 
-    let std_bm: usize = 64;
-    let std_bn: usize = 64;
-    let m_tiles = m.div_ceil(std_bm);
-    let n_tiles = n.div_ceil(std_bn);
-    let align_m = m % std_bm == 0;
-    let align_n = n % std_bn == 0;
+    let use_qldr = k >= 4096 || (m <= 128 && n >= 4096);
 
-    let q4_constants = [
-        (200u32, FunctionConstantValue::Bool(align_m)),
-        (201u32, FunctionConstantValue::Bool(align_n)),
-        (202u32, FunctionConstantValue::Bool(true)), // has_residual = true
-        (203u32, FunctionConstantValue::Bool(false)),
-        (204u32, FunctionConstantValue::Bool(false)),
-        (205u32, FunctionConstantValue::U32(qw.group_size)),
-    ];
-    let pipeline =
-        registry.get_pipeline_with_constants("affine_qmm_mma_q4", DType::Float32, &q4_constants)?;
-    let out = Array::zeros(dev, &[m, n], DType::Float32);
+    if use_qldr && qw.bits == 4 {
+        // --- QLdr path: BM=64, BN=64, BK=32, coalesced dequant B-loader ---
+        // QLdr kernel takes half input; cast f32 → f16 within the same command buffer.
+        let x_half = super::copy::copy_cast_into_cb(registry, x, DType::Float16, cb)?;
 
-    let m_u32 = super::checked_u32(m, "M")?;
-    let n_u32 = super::checked_u32(n, "N")?;
-    let k_u32 = super::checked_u32(k, "K")?;
-    let swizzle_log: u32 = if n_tiles >= 4 { 1 } else { 0 };
+        const QLDR_BM: usize = 64;
+        const QLDR_BN: usize = 64;
+        let m_tiles = m.div_ceil(QLDR_BM);
+        let n_tiles = n.div_ceil(QLDR_BN);
+        let align_m = m % QLDR_BM == 0;
+        let align_n = n % QLDR_BN == 0;
 
-    let m_buf = dev.new_buffer_with_data(&m_u32 as *const u32 as *const _, 4, opts);
-    let n_buf = dev.new_buffer_with_data(&n_u32 as *const u32 as *const _, 4, opts);
-    let k_buf = dev.new_buffer_with_data(&k_u32 as *const u32 as *const _, 4, opts);
-    let sw_buf = dev.new_buffer_with_data(&swizzle_log as *const u32 as *const _, 4, opts);
-    let dummy_buf = dev.new_buffer(4, opts);
+        let qldr_constants = [
+            (200u32, FunctionConstantValue::Bool(align_m)),
+            (201u32, FunctionConstantValue::Bool(align_n)),
+            (202u32, FunctionConstantValue::Bool(true)), // has_residual = true
+            (205u32, FunctionConstantValue::U32(qw.group_size)),
+        ];
+        let pipeline = registry.get_pipeline_with_constants(
+            "affine_qmm_qldr_q4",
+            DType::Float32,
+            &qldr_constants,
+        )?;
+        let out = Array::zeros(dev, &[m, n], DType::Float32);
 
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
-    enc.set_buffer(1, Some(&qw.weights_buf), 0);
-    enc.set_buffer(2, Some(&qw.scales_buf), 0);
-    enc.set_buffer(3, Some(&qw.biases_buf), 0);
-    enc.set_buffer(4, Some(out.metal_buffer()), 0);
-    enc.set_buffer(5, Some(&m_buf), 0);
-    enc.set_buffer(6, Some(&n_buf), 0);
-    enc.set_buffer(7, Some(&k_buf), 0);
-    enc.set_buffer(8, Some(&sw_buf), 0);
-    enc.set_buffer(9, Some(&dummy_buf), 0); // norm_weight (unused)
-    enc.set_buffer(10, Some(&dummy_buf), 0); // inv_rms (unused)
-    enc.set_buffer(11, Some(residual.metal_buffer()), residual.offset() as u64);
-    enc.set_buffer(12, Some(&dummy_buf), 0); // gate_result (unused)
+        let m_u32 = super::checked_u32(m, "M")?;
+        let n_u32 = super::checked_u32(n, "N")?;
+        let k_u32 = super::checked_u32(k, "K")?;
+        let swizzle_log: u32 = if n_tiles >= 4 { 1 } else { 0 };
 
-    let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
-    let tg = metal::MTLSize::new(64, 1, 1);
-    enc.dispatch_thread_groups(grid, tg);
-    enc.end_encoding();
+        let m_buf = dev.new_buffer_with_data(&m_u32 as *const u32 as *const _, 4, opts);
+        let n_buf = dev.new_buffer_with_data(&n_u32 as *const u32 as *const _, 4, opts);
+        let k_buf = dev.new_buffer_with_data(&k_u32 as *const u32 as *const _, 4, opts);
+        let sw_buf = dev.new_buffer_with_data(&swizzle_log as *const u32 as *const _, 4, opts);
 
-    Ok(out)
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(x_half.metal_buffer()), x_half.offset() as u64);
+        enc.set_buffer(1, Some(&qw.weights_buf), 0);
+        enc.set_buffer(2, Some(&qw.scales_buf), 0);
+        enc.set_buffer(3, Some(&qw.biases_buf), 0);
+        enc.set_buffer(4, Some(out.metal_buffer()), 0);
+        enc.set_buffer(5, Some(&m_buf), 0);
+        enc.set_buffer(6, Some(&n_buf), 0);
+        enc.set_buffer(7, Some(&k_buf), 0);
+        enc.set_buffer(8, Some(&sw_buf), 0);
+        enc.set_buffer(9, Some(residual.metal_buffer()), residual.offset() as u64);
+
+        let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
+        let tg = metal::MTLSize::new(64, 1, 1);
+        enc.dispatch_thread_groups(grid, tg);
+        enc.end_encoding();
+
+        Ok(out)
+    } else {
+        // --- MMA fallback path: affine_qmm_mma_q4 ---
+        let std_bm: usize = 64;
+        let std_bn: usize = 64;
+        let m_tiles = m.div_ceil(std_bm);
+        let n_tiles = n.div_ceil(std_bn);
+        let align_m = m % std_bm == 0;
+        let align_n = n % std_bn == 0;
+
+        let q4_constants = [
+            (200u32, FunctionConstantValue::Bool(align_m)),
+            (201u32, FunctionConstantValue::Bool(align_n)),
+            (202u32, FunctionConstantValue::Bool(true)), // has_residual = true
+            (203u32, FunctionConstantValue::Bool(false)),
+            (204u32, FunctionConstantValue::Bool(false)),
+            (205u32, FunctionConstantValue::U32(qw.group_size)),
+        ];
+        let pipeline = registry.get_pipeline_with_constants(
+            "affine_qmm_mma_q4",
+            DType::Float32,
+            &q4_constants,
+        )?;
+        let out = Array::zeros(dev, &[m, n], DType::Float32);
+
+        let m_u32 = super::checked_u32(m, "M")?;
+        let n_u32 = super::checked_u32(n, "N")?;
+        let k_u32 = super::checked_u32(k, "K")?;
+        let swizzle_log: u32 = if n_tiles >= 4 { 1 } else { 0 };
+
+        let m_buf = dev.new_buffer_with_data(&m_u32 as *const u32 as *const _, 4, opts);
+        let n_buf = dev.new_buffer_with_data(&n_u32 as *const u32 as *const _, 4, opts);
+        let k_buf = dev.new_buffer_with_data(&k_u32 as *const u32 as *const _, 4, opts);
+        let sw_buf = dev.new_buffer_with_data(&swizzle_log as *const u32 as *const _, 4, opts);
+        let dummy_buf = dev.new_buffer(4, opts);
+
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
+        enc.set_buffer(1, Some(&qw.weights_buf), 0);
+        enc.set_buffer(2, Some(&qw.scales_buf), 0);
+        enc.set_buffer(3, Some(&qw.biases_buf), 0);
+        enc.set_buffer(4, Some(out.metal_buffer()), 0);
+        enc.set_buffer(5, Some(&m_buf), 0);
+        enc.set_buffer(6, Some(&n_buf), 0);
+        enc.set_buffer(7, Some(&k_buf), 0);
+        enc.set_buffer(8, Some(&sw_buf), 0);
+        enc.set_buffer(9, Some(&dummy_buf), 0); // norm_weight (unused)
+        enc.set_buffer(10, Some(&dummy_buf), 0); // inv_rms (unused)
+        enc.set_buffer(11, Some(residual.metal_buffer()), residual.offset() as u64);
+        enc.set_buffer(12, Some(&dummy_buf), 0); // gate_result (unused)
+
+        let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
+        let tg = metal::MTLSize::new(64, 1, 1);
+        enc.dispatch_thread_groups(grid, tg);
+        enc.end_encoding();
+
+        Ok(out)
+    }
 }
 
 /// Fused QMM + SwiGLU: `output = silu(gate_result) * QMM(x, qw)`.
@@ -3821,6 +4187,120 @@ pub fn affine_quantized_matmul_steel(
     enc.set_buffer(8, Some(&sw_buf), 0);
     enc.set_buffer(9, Some(&dummy_buf), 0); // residual (unused)
     enc.set_buffer(10, Some(&dummy_buf), 0); // gate_result (unused)
+
+    let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
+    let tg = metal::MTLSize::new(64, 1, 1);
+    enc.dispatch_thread_groups(grid, tg);
+    enc.end_encoding();
+    super::commit_with_mode(cb, super::ExecMode::Sync);
+
+    Ok(out)
+}
+
+/// QLdr-architecture affine quantized matrix-matrix multiply (Q4 only).
+///
+/// Uses the `affine_qmm_qldr_q4` kernel with:
+/// - BM=64, BN=64, BK=32 tiles (same spatial tile as gemm_mlx_f16, deeper K)
+/// - K-contiguous B loader (MLX QuantizedBlockLoader pattern)
+/// - FP16 MMA engine (2 SG, 64 threads, serpentine, 8×8 matrices)
+/// - half input (f32→half pre-conversion)
+/// - Single-buffered A/B tiles (8KB TG memory)
+///
+/// Compared to Steel (BM=32, BN=32):
+/// - 4× larger spatial tile → fewer threadgroups, better L2 reuse
+/// - Same B-loader dequant pattern, same MMA engine as 23.82T fp16 GEMM
+///
+/// The input `x` must be Float32; it will be converted to Float16 internally.
+pub fn affine_quantized_matmul_qldr(
+    registry: &KernelRegistry,
+    x: &Array,
+    qw: &QuantizedWeight,
+    queue: &metal::CommandQueue,
+) -> Result<Array, KernelError> {
+    if x.dtype() != DType::Float32 {
+        return Err(KernelError::InvalidShape(format!(
+            "affine_quantized_matmul_qldr requires Float32 input x, got {:?}",
+            x.dtype()
+        )));
+    }
+    if x.ndim() != 2 {
+        return Err(KernelError::InvalidShape(format!(
+            "affine_quantized_matmul_qldr requires 2D input x, got {}D",
+            x.ndim()
+        )));
+    }
+    if x.shape()[1] != qw.in_features {
+        return Err(KernelError::InvalidShape(format!(
+            "x.shape[1] ({}) != in_features ({})",
+            x.shape()[1],
+            qw.in_features
+        )));
+    }
+    if qw.bits != 4 {
+        return Err(KernelError::InvalidShape(format!(
+            "affine_quantized_matmul_qldr requires bits==4, got {}",
+            qw.bits
+        )));
+    }
+
+    let m = x.shape()[0];
+    let n = qw.out_features;
+    let k = qw.in_features;
+
+    let dev = registry.device().raw();
+    let opts = metal::MTLResourceOptions::StorageModeShared;
+
+    // --- Step 1: Convert f32 input to half ---
+    let x_half = crate::ops::copy::copy_cast(registry, x, DType::Float16, queue)?;
+
+    // --- Step 2: Dispatch QLdr kernel ---
+    const QLDR_BM: usize = 64;
+    const QLDR_BN: usize = 64;
+
+    let m_tiles = m.div_ceil(QLDR_BM);
+    let n_tiles = n.div_ceil(QLDR_BN);
+
+    let align_m = m % QLDR_BM == 0;
+    let align_n = n % QLDR_BN == 0;
+
+    let qldr_constants = [
+        (200u32, FunctionConstantValue::Bool(align_m)),
+        (201u32, FunctionConstantValue::Bool(align_n)),
+        (202u32, FunctionConstantValue::Bool(false)), // has_residual
+        (205u32, FunctionConstantValue::U32(qw.group_size)),
+    ];
+    let pipeline = registry.get_pipeline_with_constants(
+        "affine_qmm_qldr_q4",
+        DType::Float32,
+        &qldr_constants,
+    )?;
+
+    let out = Array::zeros(dev, &[m, n], DType::Float32);
+
+    let m_u32 = super::checked_u32(m, "M")?;
+    let n_u32 = super::checked_u32(n, "N")?;
+    let k_u32 = super::checked_u32(k, "K")?;
+    let swizzle_log: u32 = if n_tiles >= 4 { 1 } else { 0 };
+
+    let m_buf = dev.new_buffer_with_data(&m_u32 as *const u32 as *const _, 4, opts);
+    let n_buf = dev.new_buffer_with_data(&n_u32 as *const u32 as *const _, 4, opts);
+    let k_buf = dev.new_buffer_with_data(&k_u32 as *const u32 as *const _, 4, opts);
+    let sw_buf = dev.new_buffer_with_data(&swizzle_log as *const u32 as *const _, 4, opts);
+    let dummy_buf = dev.new_buffer(4, opts);
+
+    let cb = queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_buffer(0, Some(x_half.metal_buffer()), x_half.offset() as u64);
+    enc.set_buffer(1, Some(&qw.weights_buf), 0);
+    enc.set_buffer(2, Some(&qw.scales_buf), 0);
+    enc.set_buffer(3, Some(&qw.biases_buf), 0);
+    enc.set_buffer(4, Some(out.metal_buffer()), 0);
+    enc.set_buffer(5, Some(&m_buf), 0);
+    enc.set_buffer(6, Some(&n_buf), 0);
+    enc.set_buffer(7, Some(&k_buf), 0);
+    enc.set_buffer(8, Some(&sw_buf), 0);
+    enc.set_buffer(9, Some(&dummy_buf), 0); // residual (unused)
 
     let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
     let tg = metal::MTLSize::new(64, 1, 1);

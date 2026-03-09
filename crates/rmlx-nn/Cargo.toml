@@ -36,3 +36,7 @@ harness = false
 [[bench]]
 name = "model_bench"
 harness = false
+
+[[bench]]
+name = "op_profile_bench"
+harness = false

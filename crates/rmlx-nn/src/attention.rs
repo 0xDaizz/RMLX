@@ -1848,8 +1848,16 @@ impl Attention {
 
         if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
             // Fused path: deinterleave + RoPE in single dispatch each
-            let q_batched =
-                ops::rope::rope_multihead(registry, &q, cos, sin, num_heads, rope_offset, queue)?;
+            let q_batched = ops::rope::rope_multihead(
+                registry,
+                &q,
+                cos,
+                sin,
+                num_heads,
+                rope_offset,
+                q.strides()[0],
+                queue,
+            )?;
             let k_batched = ops::rope::rope_multihead(
                 registry,
                 &k,
@@ -1857,10 +1865,12 @@ impl Attention {
                 sin,
                 num_kv_heads,
                 rope_offset,
+                k.strides()[0],
                 queue,
             )?;
             // V doesn't need RoPE, just deinterleave
-            let v_batched = ops::rope::deinterleave_heads(registry, &v, num_kv_heads, queue)?;
+            let v_batched =
+                ops::rope::deinterleave_heads(registry, &v, num_kv_heads, v.strides()[0], queue)?;
 
             // Create per-head views into the batched outputs (zero-copy)
             let head_elems = seq_len * head_dim;
@@ -1893,9 +1903,12 @@ impl Attention {
                 .collect();
         } else {
             // No RoPE — just deinterleave
-            let q_batched = ops::rope::deinterleave_heads(registry, &q, num_heads, queue)?;
-            let k_batched = ops::rope::deinterleave_heads(registry, &k, num_kv_heads, queue)?;
-            let v_batched = ops::rope::deinterleave_heads(registry, &v, num_kv_heads, queue)?;
+            let q_batched =
+                ops::rope::deinterleave_heads(registry, &q, num_heads, q.strides()[0], queue)?;
+            let k_batched =
+                ops::rope::deinterleave_heads(registry, &k, num_kv_heads, k.strides()[0], queue)?;
+            let v_batched =
+                ops::rope::deinterleave_heads(registry, &v, num_kv_heads, v.strides()[0], queue)?;
 
             let head_elems = seq_len * head_dim;
             q_heads = (0..num_heads)
@@ -2112,6 +2125,7 @@ impl Attention {
                 sin,
                 local_num_heads,
                 rope_offset,
+                q.strides()[0],
                 queue,
             )?;
             let k_batched = ops::rope::rope_multihead(
@@ -2121,9 +2135,16 @@ impl Attention {
                 sin,
                 local_num_kv_heads,
                 rope_offset,
+                k.strides()[0],
                 queue,
             )?;
-            let v_batched = ops::rope::deinterleave_heads(registry, v, local_num_kv_heads, queue)?;
+            let v_batched = ops::rope::deinterleave_heads(
+                registry,
+                v,
+                local_num_kv_heads,
+                v.strides()[0],
+                queue,
+            )?;
 
             let head_elems = seq_len * head_dim;
             q_heads = (0..local_num_heads)
@@ -2154,9 +2175,22 @@ impl Attention {
                 })
                 .collect();
         } else {
-            let q_batched = ops::rope::deinterleave_heads(registry, q, local_num_heads, queue)?;
-            let k_batched = ops::rope::deinterleave_heads(registry, k, local_num_kv_heads, queue)?;
-            let v_batched = ops::rope::deinterleave_heads(registry, v, local_num_kv_heads, queue)?;
+            let q_batched =
+                ops::rope::deinterleave_heads(registry, q, local_num_heads, q.strides()[0], queue)?;
+            let k_batched = ops::rope::deinterleave_heads(
+                registry,
+                k,
+                local_num_kv_heads,
+                k.strides()[0],
+                queue,
+            )?;
+            let v_batched = ops::rope::deinterleave_heads(
+                registry,
+                v,
+                local_num_kv_heads,
+                v.strides()[0],
+                queue,
+            )?;
 
             let head_elems = seq_len * head_dim;
             q_heads = (0..local_num_heads)
@@ -2530,6 +2564,7 @@ impl Attention {
                 sin,
                 num_heads,
                 rope_offset,
+                q.strides()[0],
                 cb2,
             )?;
             let k_batched = ops::rope::rope_multihead_into_cb(
@@ -2539,9 +2574,16 @@ impl Attention {
                 sin,
                 num_kv_heads,
                 rope_offset,
+                k.strides()[0],
                 cb2,
             )?;
-            let v_batched = ops::rope::deinterleave_heads_into_cb(registry, &v, num_kv_heads, cb2)?;
+            let v_batched = ops::rope::deinterleave_heads_into_cb(
+                registry,
+                &v,
+                num_kv_heads,
+                v.strides()[0],
+                cb2,
+            )?;
 
             q_heads = (0..num_heads)
                 .map(|h| {
@@ -2571,9 +2613,27 @@ impl Attention {
                 })
                 .collect();
         } else {
-            let q_batched = ops::rope::deinterleave_heads_into_cb(registry, &q, num_heads, cb2)?;
-            let k_batched = ops::rope::deinterleave_heads_into_cb(registry, &k, num_kv_heads, cb2)?;
-            let v_batched = ops::rope::deinterleave_heads_into_cb(registry, &v, num_kv_heads, cb2)?;
+            let q_batched = ops::rope::deinterleave_heads_into_cb(
+                registry,
+                &q,
+                num_heads,
+                q.strides()[0],
+                cb2,
+            )?;
+            let k_batched = ops::rope::deinterleave_heads_into_cb(
+                registry,
+                &k,
+                num_kv_heads,
+                k.strides()[0],
+                cb2,
+            )?;
+            let v_batched = ops::rope::deinterleave_heads_into_cb(
+                registry,
+                &v,
+                num_kv_heads,
+                v.strides()[0],
+                cb2,
+            )?;
 
             q_heads = (0..num_heads)
                 .map(|h| {
@@ -2752,6 +2812,7 @@ impl Attention {
                 sin,
                 num_heads,
                 rope_offset,
+                q.strides()[0],
                 cb2,
             )?;
             let k_batched = ops::rope::rope_multihead_into_cb(
@@ -2761,9 +2822,16 @@ impl Attention {
                 sin,
                 num_kv_heads,
                 rope_offset,
+                k.strides()[0],
                 cb2,
             )?;
-            let v_batched = ops::rope::deinterleave_heads_into_cb(registry, &v, num_kv_heads, cb2)?;
+            let v_batched = ops::rope::deinterleave_heads_into_cb(
+                registry,
+                &v,
+                num_kv_heads,
+                v.strides()[0],
+                cb2,
+            )?;
 
             q_heads = (0..num_heads)
                 .map(|h| {
@@ -2793,9 +2861,27 @@ impl Attention {
                 })
                 .collect();
         } else {
-            let q_batched = ops::rope::deinterleave_heads_into_cb(registry, &q, num_heads, cb2)?;
-            let k_batched = ops::rope::deinterleave_heads_into_cb(registry, &k, num_kv_heads, cb2)?;
-            let v_batched = ops::rope::deinterleave_heads_into_cb(registry, &v, num_kv_heads, cb2)?;
+            let q_batched = ops::rope::deinterleave_heads_into_cb(
+                registry,
+                &q,
+                num_heads,
+                q.strides()[0],
+                cb2,
+            )?;
+            let k_batched = ops::rope::deinterleave_heads_into_cb(
+                registry,
+                &k,
+                num_kv_heads,
+                k.strides()[0],
+                cb2,
+            )?;
+            let v_batched = ops::rope::deinterleave_heads_into_cb(
+                registry,
+                &v,
+                num_kv_heads,
+                v.strides()[0],
+                cb2,
+            )?;
 
             q_heads = (0..num_heads)
                 .map(|h| {
@@ -3159,11 +3245,9 @@ impl Attention {
                     qkv.dtype(),
                     qkv.offset() + (q_dim + k_dim) * elem_size,
                 );
-                // Copy to contiguous buffers for downstream kernels
-                let q = ops::copy::copy_into_cb(registry, &q_view, cb)?;
-                let k = ops::copy::copy_into_cb(registry, &k_view, cb)?;
-                let v = ops::copy::copy_into_cb(registry, &v_view, cb)?;
-                (q, k, v)
+                // Views are non-contiguous (stride[0] = total_out > shape[1]).
+                // RoPE/deinterleave kernels accept input_row_stride, so no copy needed.
+                (q_view, k_view, v_view)
             } else {
                 // Fallback: 3 separate GEMMs
                 let wq_t = self.q_proj.weight_transposed_contiguous()?;
@@ -3181,6 +3265,12 @@ impl Attention {
         let k_batched;
         let v_batched;
 
+        // Use strides()[0] as input_row_stride — handles both merged QKV
+        // (stride = total_qkv) and separate GEMM (stride = shape[1]) paths.
+        let q_row_stride = q.strides()[0];
+        let k_row_stride = k.strides()[0];
+        let v_row_stride = v.strides()[0];
+
         if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
             q_batched = ops::rope::rope_multihead_into_cb(
                 registry,
@@ -3189,6 +3279,7 @@ impl Attention {
                 sin,
                 num_heads,
                 rope_offset,
+                q_row_stride,
                 cb,
             )?;
             k_batched = ops::rope::rope_multihead_into_cb(
@@ -3198,42 +3289,77 @@ impl Attention {
                 sin,
                 num_kv_heads,
                 rope_offset,
+                k_row_stride,
                 cb,
             )?;
-            v_batched = ops::rope::deinterleave_heads_into_cb(registry, &v, num_kv_heads, cb)?;
+            v_batched = ops::rope::deinterleave_heads_into_cb(
+                registry,
+                &v,
+                num_kv_heads,
+                v_row_stride,
+                cb,
+            )?;
         } else {
-            q_batched = ops::rope::deinterleave_heads_into_cb(registry, &q, num_heads, cb)?;
-            k_batched = ops::rope::deinterleave_heads_into_cb(registry, &k, num_kv_heads, cb)?;
-            v_batched = ops::rope::deinterleave_heads_into_cb(registry, &v, num_kv_heads, cb)?;
+            q_batched =
+                ops::rope::deinterleave_heads_into_cb(registry, &q, num_heads, q_row_stride, cb)?;
+            k_batched = ops::rope::deinterleave_heads_into_cb(
+                registry,
+                &k,
+                num_kv_heads,
+                k_row_stride,
+                cb,
+            )?;
+            v_batched = ops::rope::deinterleave_heads_into_cb(
+                registry,
+                &v,
+                num_kv_heads,
+                v_row_stride,
+                cb,
+            )?;
         }
 
-        // KV cache append — batched path (1 dispatch) when possible,
-        // falls back to per-head copies internally if preconditions not met.
-        cache.append_batched_into_cb(&k_batched, &v_batched, seq_len, registry, cb)?;
-        let total_seq = cache.seq_len;
+        // ── 4) KV cache: bypass on initial prefill (cache empty) ──
+        let needs_initial_append = cache.seq_len == 0;
+        let (k_for_sdpa, v_for_sdpa, kv_stride, total_seq) = if needs_initial_append {
+            // RoPE output is contiguous — pass directly to SDPA, skip blit
+            let k_view = k_batched.view(
+                k_batched.shape().to_vec(),
+                k_batched.strides().to_vec(),
+                k_batched.offset(),
+            );
+            let v_view = v_batched.view(
+                v_batched.shape().to_vec(),
+                v_batched.strides().to_vec(),
+                v_batched.offset(),
+            );
+            (k_view, v_view, None, seq_len)
+        } else {
+            cache.append_batched_into_cb(&k_batched, &v_batched, seq_len, registry, cb)?;
+            let total_seq = cache.seq_len;
+            let k_slab = cache.keys_slab_view().ok_or_else(|| {
+                KernelError::InvalidShape(
+                    "forward_prefill_single_cb: cache has no slab layout (use preallocated cache)"
+                        .into(),
+                )
+            })?;
+            let v_slab = cache.values_slab_view().ok_or_else(|| {
+                KernelError::InvalidShape(
+                    "forward_prefill_single_cb: cache has no slab layout (use preallocated cache)"
+                        .into(),
+                )
+            })?;
+            let kv_stride = if cache.max_seq_len() != total_seq {
+                Some(cache.max_seq_len())
+            } else {
+                None // contiguous, no stride override needed
+            };
+            (k_slab, v_slab, kv_stride, total_seq)
+        };
 
         // Single-dispatch GQA SDPA over all heads using contiguous slabs.
         // Q slab: [num_heads * seq_len * head_dim] from deinterleave/RoPE
-        // K/V slabs: from cache slab with max_seq_len stride between heads
+        // K/V slabs: from cache slab (or direct RoPE output on initial prefill)
         let scale = 1.0 / (head_dim as f32).sqrt();
-        let k_slab = cache.keys_slab_view().ok_or_else(|| {
-            KernelError::InvalidShape(
-                "forward_prefill_single_cb: cache has no slab layout (use preallocated cache)"
-                    .into(),
-            )
-        })?;
-        let v_slab = cache.values_slab_view().ok_or_else(|| {
-            KernelError::InvalidShape(
-                "forward_prefill_single_cb: cache has no slab layout (use preallocated cache)"
-                    .into(),
-            )
-        })?;
-
-        let kv_stride = if cache.max_seq_len() != total_seq {
-            Some(cache.max_seq_len())
-        } else {
-            None // contiguous, no stride override needed
-        };
 
         // Use MMA kernel when conditions are met: f16, D=128, seq_len>1
         let use_mma = q_batched.dtype() == DType::Float16 && head_dim == 128 && seq_len > 1;
@@ -3243,8 +3369,8 @@ impl Attention {
             ops::sdpa::sdpa_prefill_mma_f16_into_cb(
                 registry,
                 &q_batched,
-                &k_slab,
-                &v_slab,
+                &k_for_sdpa,
+                &v_for_sdpa,
                 num_heads,
                 num_kv_heads,
                 head_dim,
@@ -3260,8 +3386,8 @@ impl Attention {
             ops::sdpa::sdpa_prefill_gqa_slab_into_cb(
                 registry,
                 &q_batched,
-                &k_slab,
-                &v_slab,
+                &k_for_sdpa,
+                &v_for_sdpa,
                 num_heads,
                 num_kv_heads,
                 head_dim,
@@ -3275,20 +3401,33 @@ impl Attention {
             )?
         };
 
-        // Output slab is [num_heads * seq_len * head_dim] (head-major).
-        // Reshape to [num_heads * seq_len, head_dim] for interleave.
-        let packed = attn_slab.view(
-            vec![num_heads * seq_len, head_dim],
-            vec![head_dim, 1],
-            attn_slab.offset(),
-        );
+        // Deferred KV write: after SDPA critical path
+        if needs_initial_append {
+            cache.append_batched_into_cb(&k_batched, &v_batched, seq_len, registry, cb)?;
+        }
 
-        // Interleave [num_heads, seq_len, head_dim] → [seq_len, hidden_size]
-        let concat = if seq_len == 1 {
-            // For seq_len=1, head-major == token-major: [1, hidden_size]
-            packed.view(vec![1, hidden_size], vec![hidden_size, 1], packed.offset())
+        // MMA kernel writes seq-major [seq_len, num_heads * head_dim] directly.
+        // Scalar kernel still writes head-major [num_heads, seq_len, head_dim].
+        let concat = if use_mma {
+            // Already seq-major: just reshape to [seq_len, hidden_size]
+            attn_slab.view(
+                vec![seq_len, hidden_size],
+                vec![hidden_size, 1],
+                attn_slab.offset(),
+            )
         } else {
-            ops::rope::interleave_heads_into_cb(registry, &packed, num_heads, seq_len, cb)?
+            // Scalar path: head-major → need interleave
+            let packed = attn_slab.view(
+                vec![num_heads * seq_len, head_dim],
+                vec![head_dim, 1],
+                attn_slab.offset(),
+            );
+            if seq_len == 1 {
+                // For seq_len=1, head-major == token-major: [1, hidden_size]
+                packed.view(vec![1, hidden_size], vec![hidden_size, 1], packed.offset())
+            } else {
+                ops::rope::interleave_heads_into_cb(registry, &packed, num_heads, seq_len, cb)?
+            }
         };
 
         // O projection

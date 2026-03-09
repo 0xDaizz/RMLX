@@ -1719,14 +1719,19 @@ METAL_FUNC void frag_row_sub_exp2(thread float2& frag, float row_max) {
     frag.y = fast::exp2(frag.y - row_max);
 }
 
+// ─── Wide load type for aligned 4×half vectorized reads ─────────────────────
+struct alignas(8) ReadVec4 { half v[4]; };
+
 // ─── Cooperative block loader (row-major, no transpose) ────────────────────
 // Loads [BROWS, BCOLS] from device memory into threadgroup memory.
 // dst_ld is the threadgroup leading dimension (includes padding).
+// Uses ReadVec4 wide loads when n_reads is divisible by 4.
 template <int BROWS, int BCOLS, int dst_ld, int tgp_size>
 struct RowLoader {
     static constant constexpr int n_reads = (BCOLS * BROWS) / tgp_size;
     static constant constexpr int TCOLS = BCOLS / n_reads;
     static constant constexpr int TROWS = tgp_size / TCOLS;
+    static constant constexpr int n_reads_v = n_reads / 4;  // vec4 groups
 
     const int src_ld;
     const short bi;
@@ -1746,8 +1751,10 @@ struct RowLoader {
 
     METAL_FUNC void load_unsafe() const {
         for (short i = 0; i < BROWS; i += TROWS) {
-            for (short j = 0; j < n_reads; j++) {
-                dst[i * dst_ld + j] = src[i * src_ld + j];
+            #pragma clang loop unroll(full)
+            for (short j = 0; j < n_reads_v; j++) {
+                *((threadgroup ReadVec4*)(dst + i * dst_ld + j * 4)) =
+                    *((const device ReadVec4*)(src + i * src_ld + j * 4));
             }
         }
     }
@@ -1849,6 +1856,8 @@ struct TransposeLoader {
 //   7: D_val  (head dimension, must be 128)
 //   8: gqa_factor (num_q_heads / num_kv_heads)
 //   9: scale  (1/sqrt(D))
+//  10: kv_stride_S
+//  11: num_q_heads (for seq-major output indexing)
 
 kernel void sdpa_prefill_mma_f16(
     device const half* Q [[buffer(0)]],
@@ -1862,6 +1871,7 @@ kernel void sdpa_prefill_mma_f16(
     constant uint& gqa_factor [[buffer(8)]],
     constant float& scale [[buffer(9)]],
     constant uint& kv_stride_S [[buffer(10)]],
+    constant uint& num_q_heads [[buffer(11)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint  simd_gid [[simdgroup_index_in_threadgroup]],
     uint  simd_lid [[thread_index_in_simdgroup]])
@@ -1878,7 +1888,8 @@ kernel void sdpa_prefill_mma_f16(
     const device half* Q_head = Q + q_head * N * BD;
     const device half* K_head = K + kv_head * kv_stride_S * BD;
     const device half* V_head = V + kv_head * kv_stride_S * BD;
-    device half* O_head = O + q_head * N * BD;
+    // Seq-major output: O[seq_pos * num_q_heads * BD + q_head * BD + d]
+    const uint o_row_stride = num_q_heads * BD;
 
     // Pre-multiply scale by log2(e) for exp2-based softmax
     const float scale_log2e = scale * M_LOG2E_F;
@@ -1985,6 +1996,7 @@ kernel void sdpa_prefill_mma_f16(
             // Load K^T fragment: K is stored as [BD, LDK] (transposed)
             // For MMA: K^T is [K, N] = [8, TK*8]
             // Each TK fragment is [8, 8] at K_smem[dd*8][tk*8]
+            #pragma clang loop unroll(full)
             for (short tk = 0; tk < TK; tk++) {
                 simdgroup_matrix<half, 8, 8> K_mat;
                 simdgroup_load(K_mat, Ks + dd * kFragSize * LDK + tk * kFragSize, LDK);
@@ -2089,6 +2101,7 @@ kernel void sdpa_prefill_mma_f16(
 
         // P @ V: S_frags[1, TK] @ V_smem[TK, TD] → O_frags[1, TD]
         for (short id = 0; id < TD; id++) {
+            #pragma clang loop unroll(full)
             for (short tk = 0; tk < TK; tk++) {
                 simdgroup_barrier(mem_flags::mem_none);
 
@@ -2096,9 +2109,9 @@ kernel void sdpa_prefill_mma_f16(
                 simdgroup_matrix<half, 8, 8> V_mat;
                 simdgroup_load(V_mat, Vs + tk * kFragSize * LDV + id * kFragSize, LDV);
 
-                // Convert S scores to half for MMA input
+                // Convert S scores to half for MMA input — use half2 bulk conversion
                 simdgroup_matrix<half, 8, 8> S_half;
-                { float2 sv = S_frags[0 * TK + tk]; thread auto& sh = S_half.thread_elements(); sh[0] = half(sv.x); sh[1] = half(sv.y); }
+                { float2 sv = S_frags[0 * TK + tk]; thread auto& sh = S_half.thread_elements(); half2 h2 = half2(sv); sh[0] = h2.x; sh[1] = h2.y; }
 
                 simdgroup_matrix<float, 8, 8> O_mat;
                 { thread auto& oe = O_mat.thread_elements(); oe[0] = O_frags[0 * TD + id].x; oe[1] = O_frags[0 * TD + id].y; }
@@ -2120,9 +2133,11 @@ kernel void sdpa_prefill_mma_f16(
         O_frags[0 * TD + id] *= inv_sum;
     }
 
-    // ─── Store output ──────────────────────────────────────────────────
-    // O layout: [num_q_heads, N, BD], row-major
-    device half* O_row = O_head + (q_start + tm + fm) * BD + fn;
+    // ─── Store output (seq-major) ─────────────────────────────────────
+    // O layout: [N, num_q_heads * BD], seq-major
+    // O[seq_pos * o_row_stride + q_head * BD + d]
+    uint seq_pos = q_start + tm + fm;
+    device half* O_row = O + seq_pos * o_row_stride + q_head * BD + fn;
 
     if (!align_Q && q_block == ((N - 1) / BQ)) {
         int qL_rem = int(N) - int(q_start);
@@ -2221,12 +2236,17 @@ METAL_FUNC void frag_row_sub_exp2(thread float2& frag, float row_max) {
     frag.y = fast::exp2(frag.y - row_max);
 }
 
+// ─── Wide load type for aligned 4×half vectorized reads ─────────────────────
+struct alignas(8) ReadVec4 { half v[4]; };
+
 // ─── Cooperative block loader (row-major, no transpose) ────────────────────
+// Uses ReadVec4 wide loads when n_reads is divisible by 4.
 template <int BROWS, int BCOLS, int dst_ld, int tgp_size>
 struct RowLoader {
     static constant constexpr int n_reads = (BCOLS * BROWS) / tgp_size;
     static constant constexpr int TCOLS = BCOLS / n_reads;
     static constant constexpr int TROWS = tgp_size / TCOLS;
+    static constant constexpr int n_reads_v = n_reads / 4;  // vec4 groups
 
     const int src_ld;
     const short bi;
@@ -2246,8 +2266,10 @@ struct RowLoader {
 
     METAL_FUNC void load_unsafe() const {
         for (short i = 0; i < BROWS; i += TROWS) {
-            for (short j = 0; j < n_reads; j++) {
-                dst[i * dst_ld + j] = src[i * src_ld + j];
+            #pragma clang loop unroll(full)
+            for (short j = 0; j < n_reads_v; j++) {
+                *((threadgroup ReadVec4*)(dst + i * dst_ld + j * 4)) =
+                    *((const device ReadVec4*)(src + i * src_ld + j * 4));
             }
         }
     }
@@ -2361,6 +2383,7 @@ kernel void sdpa_prefill_mma_bk32_f16(
     constant uint& gqa_factor [[buffer(8)]],
     constant float& scale [[buffer(9)]],
     constant uint& kv_stride_S [[buffer(10)]],
+    constant uint& num_q_heads [[buffer(11)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint  simd_gid [[simdgroup_index_in_threadgroup]],
     uint  simd_lid [[thread_index_in_simdgroup]])
@@ -2375,7 +2398,8 @@ kernel void sdpa_prefill_mma_bk32_f16(
     const device half* Q_head = Q + q_head * N * BD;
     const device half* K_head = K + kv_head * kv_stride_S * BD;
     const device half* V_head = V + kv_head * kv_stride_S * BD;
-    device half* O_head = O + q_head * N * BD;
+    // Seq-major output: O[seq_pos * num_q_heads * BD + q_head * BD + d]
+    const uint o_row_stride = num_q_heads * BD;
 
     const float scale_log2e = scale * M_LOG2E_F;
 
@@ -2460,6 +2484,7 @@ kernel void sdpa_prefill_mma_bk32_f16(
             simdgroup_matrix<half, 8, 8> Q_mat;
             simdgroup_load(Q_mat, Qs + tm * LDQ + dd * kFragSize, LDQ);
 
+            #pragma clang loop unroll(full)
             for (short tk = 0; tk < TK; tk++) {
                 simdgroup_matrix<half, 8, 8> K_mat;
                 simdgroup_load(K_mat, Ks + dd * kFragSize * LDK + tk * kFragSize, LDK);
@@ -2557,14 +2582,16 @@ kernel void sdpa_prefill_mma_bk32_f16(
 
         // P @ V: S_frags[1, TK] @ V_smem[TK, TD] → O_frags[1, TD]
         for (short id = 0; id < TD; id++) {
+            #pragma clang loop unroll(full)
             for (short tk = 0; tk < TK; tk++) {
                 simdgroup_barrier(mem_flags::mem_none);
 
                 simdgroup_matrix<half, 8, 8> V_mat;
                 simdgroup_load(V_mat, Vs + tk * kFragSize * LDV + id * kFragSize, LDV);
 
+                // Convert S scores to half for MMA input — use half2 bulk conversion
                 simdgroup_matrix<half, 8, 8> S_half;
-                { float2 sv = S_frags[0 * TK + tk]; thread auto& sh = S_half.thread_elements(); sh[0] = half(sv.x); sh[1] = half(sv.y); }
+                { float2 sv = S_frags[0 * TK + tk]; thread auto& sh = S_half.thread_elements(); half2 h2 = half2(sv); sh[0] = h2.x; sh[1] = h2.y; }
 
                 simdgroup_matrix<float, 8, 8> O_mat;
                 { thread auto& oe = O_mat.thread_elements(); oe[0] = O_frags[0 * TD + id].x; oe[1] = O_frags[0 * TD + id].y; }
@@ -2585,8 +2612,10 @@ kernel void sdpa_prefill_mma_bk32_f16(
         O_frags[0 * TD + id] *= inv_sum;
     }
 
-    // ─── Store output ──────────────────────────────────────────────────
-    device half* O_row = O_head + (q_start + tm + fm) * BD + fn;
+    // ─── Store output (seq-major) ─────────────────────────────────────
+    // O layout: [N, num_q_heads * BD], seq-major
+    uint seq_pos = q_start + tm + fm;
+    device half* O_row = O + seq_pos * o_row_stride + q_head * BD + fn;
 
     if (!align_Q && q_block == ((N - 1) / BQ)) {
         int qL_rem = int(N) - int(q_start);
@@ -3871,6 +3900,8 @@ pub fn sdpa_prefill_gqa_slab_into_cb(
 ///
 /// Returns: `[num_heads * seq_len * head_dim]` output slab.
 ///
+/// Output is in seq-major layout `[seq_len, num_heads * head_dim]` (not head-major).
+///
 /// Grid: (ceildiv(seq_len, 32), num_heads, 1) — each TG processes 32 Q rows.
 /// Function constants control alignment and masking specialisation.
 #[allow(clippy::too_many_arguments)]
@@ -3961,6 +3992,12 @@ pub fn sdpa_prefill_mma_f16_into_cb(
         4,
         &stride_s_val as *const u32 as *const std::ffi::c_void,
     );
+    let num_q_heads_val = num_heads as u32;
+    encoder.set_bytes(
+        11,
+        4,
+        &num_q_heads_val as *const u32 as *const std::ffi::c_void,
+    );
 
     // Grid: (ceildiv(seq_len, BQ), num_heads, 1)
     let n_q_blocks = seq_len.div_ceil(MMA_BQ) as u64;
@@ -3975,6 +4012,8 @@ pub fn sdpa_prefill_mma_f16_into_cb(
 }
 
 /// MMA SDPA prefill kernel with BK=32 — halves KV loop iterations.
+///
+/// Output is in seq-major layout `[seq_len, num_heads * head_dim]` (not head-major).
 ///
 /// Same interface as [`sdpa_prefill_mma_f16_into_cb`] but uses a larger K/V
 /// block size (32 instead of 16), reducing the number of outer-loop iterations
@@ -4095,6 +4134,12 @@ pub fn sdpa_prefill_mma_bk32_f16_into_cb(
         10,
         4,
         &stride_s_val as *const u32 as *const std::ffi::c_void,
+    );
+    let num_q_heads_val = num_heads as u32;
+    encoder.set_bytes(
+        11,
+        4,
+        &num_q_heads_val as *const u32 as *const std::ffi::c_void,
     );
 
     let n_q_blocks = seq_len.div_ceil(MMA_BQ) as u64;
@@ -4961,6 +5006,26 @@ mod tests {
             .fold(0.0f32, f32::max)
     }
 
+    /// Reorder head-major [num_heads, seq_len, head_dim] → seq-major [seq_len, num_heads * head_dim]
+    fn head_major_to_seq_major(
+        data: &[f32],
+        num_heads: usize,
+        seq_len: usize,
+        head_dim: usize,
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; data.len()];
+        for h in 0..num_heads {
+            for s in 0..seq_len {
+                for d in 0..head_dim {
+                    let src = h * seq_len * head_dim + s * head_dim + d;
+                    let dst = s * num_heads * head_dim + h * head_dim + d;
+                    out[dst] = data[src];
+                }
+            }
+        }
+        out
+    }
+
     fn read_f32_array(arr: &Array) -> Vec<f32> {
         let ptr = arr.metal_buffer().contents() as *const f32;
         let len = arr.numel();
@@ -5117,9 +5182,11 @@ mod tests {
         .unwrap();
         cb_scalar.commit();
         cb_scalar.wait_until_completed();
-        let scalar_f32 = read_f16_as_f32(registry, queue, &scalar_out);
+        let scalar_f32_raw = read_f16_as_f32(registry, queue, &scalar_out);
+        // Convert scalar head-major output to seq-major for comparison with MMA
+        let scalar_f32 = head_major_to_seq_major(&scalar_f32_raw, num_heads, seq_len, head_dim);
 
-        // --- MMA kernel ---
+        // --- MMA kernel (outputs seq-major) ---
         let cb_mma = queue.new_command_buffer();
         let mma_out = sdpa_prefill_mma_f16_into_cb(
             registry,
@@ -5288,9 +5355,11 @@ kernel void metal32_probe(device float* out [[buffer(0)]], uint tid [[thread_pos
             .unwrap();
             cb_scalar.commit();
             cb_scalar.wait_until_completed();
-            let scalar_f32 = read_f16_as_f32(&registry, &queue, &scalar_out);
+            let scalar_f32_raw = read_f16_as_f32(&registry, &queue, &scalar_out);
+            // Convert scalar head-major output to seq-major for comparison with MMA
+            let scalar_f32 = head_major_to_seq_major(&scalar_f32_raw, num_heads, seq_len, head_dim);
 
-            // --- MMA BK=32 kernel ---
+            // --- MMA BK=32 kernel (outputs seq-major) ---
             let cb_mma = queue.new_command_buffer();
             let mma_out = sdpa_prefill_mma_bk32_f16_into_cb(
                 &registry,
