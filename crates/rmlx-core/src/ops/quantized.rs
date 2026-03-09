@@ -5644,12 +5644,12 @@ mod tests {
         // (This test validates the algorithm structure, not GPU execution)
         // The actual GPU test would require Metal device access.
         // Here we just verify the CPU reference is self-consistent.
-        for idx in 0..m * n {
+        for (idx, &val) in output_naive.iter().enumerate().take(m * n) {
             assert!(
-                output_naive[idx].is_finite(),
+                val.is_finite(),
                 "naive output at {} is not finite: {}",
                 idx,
-                output_naive[idx]
+                val
             );
         }
     }
