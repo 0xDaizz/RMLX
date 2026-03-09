@@ -2625,7 +2625,6 @@ pub const SDPA_NAX_SHADER_SOURCE: &str = r#"
 using namespace metal;
 
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
-namespace mpp = MetalPerformancePrimitives;
 
 // ─── Tile sizes ────────────────────────────────────────────────────────────
 constant constexpr int BQ  = 64;   // Query block rows
@@ -2789,18 +2788,6 @@ METAL_FUNC void store_frag_16x16_unsafe(device half* dst, int dst_ld,
 // Actually uses MMA(16, 16, 16) since NAX processes 16×16 at a time.
 // We iterate TKs=1 K-subtile of 32 cols = 2 × 16-col fragments.
 
-// For Q@K^T: each D-chunk is MMA(16, 16, 16), accumulating across D.
-// A = Q[16, 16], B = K[16, 16] transposed.
-constexpr auto desc_qk = mpp::tensor_ops::matmul2d_descriptor(
-    16, 16, 16, false, true, true,
-    mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
-
-// For P@V: MMA(16, 16, 16), A = P[16, 16], B = V[16, 16].
-// Neither transposed.
-constexpr auto desc_pv = mpp::tensor_ops::matmul2d_descriptor(
-    16, 16, 16, false, false, true,
-    mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
-
 // ─── Main NAX SDPA prefill kernel ──────────────────────────────────────────
 //
 // Grid: (ceildiv(seq_len, BQ), num_q_heads, batch_size)
@@ -2855,6 +2842,14 @@ kernel void sdpa_prefill_nax_f16(
     // Per-lane fragment coordinates within a 16×16 fragment
     const short fm = nax_fm(slid);
     const short fn = nax_fn(slid);
+
+    // MPP matmul2d descriptors (must be inside function, not program scope)
+    constexpr auto desc_qk = mpp::tensor_ops::matmul2d_descriptor(
+        16, 16, 16, false, true, true,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    constexpr auto desc_pv = mpp::tensor_ops::matmul2d_descriptor(
+        16, 16, 16, false, false, true,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
 
     // ─── Output accumulators: TD=4 subtiles of 1×2 fragments (16×32) ────
     // Each subtile has 2 fragments × 8 elems = 16 floats.
