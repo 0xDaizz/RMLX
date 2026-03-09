@@ -340,6 +340,14 @@ fn main() {
     let mut block_cb = build_transformer_block(device);
     let mut block_graph = build_transformer_block(device);
 
+    // Merge Q/K/V into a single weight matrix (3 GEMMs → 1 GEMM per layer)
+    block_cb
+        .prepare_weights_9dispatch(device)
+        .expect("prepare_weights_9dispatch failed (single_cb)");
+    block_graph
+        .prepare_weights_9dispatch(device)
+        .expect("prepare_weights_9dispatch failed (graph)");
+
     // Pre-transpose weights for both paths
     block_cb
         .prepare_weights_for_graph(&registry, &setup_queue)
