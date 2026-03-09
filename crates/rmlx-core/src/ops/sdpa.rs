@@ -3246,8 +3246,13 @@ pub fn register(registry: &KernelRegistry) -> Result<(), KernelError> {
     registry.register_jit_source("sdpa_bf16", SDPA_BF16_SHADER_SOURCE)?;
     registry.register_jit_source("sdpa_mma", SDPA_MMA_SHADER_SOURCE)?;
     registry.register_jit_source("sdpa_mma_bk32", SDPA_MMA_BK32_SHADER_SOURCE)?;
-    registry.register_jit_source("sdpa_nax", SDPA_NAX_SHADER_SOURCE)?;
-    registry.register_jit_source("sdpa_nax_diag", SDPA_NAX_DIAG_SHADER_SOURCE)?;
+    // NAX kernels require MetalPerformancePrimitives (Metal 3.1+), gracefully skip if unavailable
+    if let Err(e) = registry.register_jit_source("sdpa_nax", SDPA_NAX_SHADER_SOURCE) {
+        eprintln!("warning: sdpa_nax registration skipped (MPP unavailable): {e}");
+    }
+    if let Err(e) = registry.register_jit_source("sdpa_nax_diag", SDPA_NAX_DIAG_SHADER_SOURCE) {
+        eprintln!("warning: sdpa_nax_diag registration skipped (MPP unavailable): {e}");
+    }
     Ok(())
 }
 

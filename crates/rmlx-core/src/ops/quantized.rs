@@ -3061,7 +3061,10 @@ pub fn register_qmm(registry: &KernelRegistry) -> Result<(), KernelError> {
     registry.register_jit_source("qmm_splitk_q4", QMM_SPLITK_Q4_SHADER_SOURCE)?;
     registry.register_jit_source("qmm_skinny", QMM_SKINNY_SHADER_SOURCE)?;
     registry.register_jit_source("qmm_steel_q4", QMM_STEEL_Q4_SHADER_SOURCE)?;
-    registry.register_jit_source("qmm_nax_q4", QMM_NAX_Q4_SHADER_SOURCE)?;
+    // NAX kernel requires MetalPerformancePrimitives (Metal 3.1+), gracefully skip if unavailable
+    if let Err(e) = registry.register_jit_source("qmm_nax_q4", QMM_NAX_Q4_SHADER_SOURCE) {
+        eprintln!("warning: qmm_nax_q4 registration skipped (MPP unavailable): {e}");
+    }
     Ok(())
 }
 
