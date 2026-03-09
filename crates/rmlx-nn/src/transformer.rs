@@ -264,37 +264,21 @@ impl FeedForward {
                 } else {
                     normed.reshape(vec![normed.shape()[0], normed.shape()[1]])?
                 };
-                let (gate_out, up_out) = if let Some(ref guw_t) = gate_up_merged_weight_t {
+                let hidden = if let Some(ref guw_t) = gate_up_merged_weight_t {
                     // Single merged GEMM: [seq, hidden] @ [hidden, gate+up] = [seq, gate+up]
                     let merged = ops::matmul::matmul_into_cb(registry, &normed_2d, guw_t, cb)?;
                     let gate_dim = guw_t.shape()[1] / 2;
-                    let total_out = guw_t.shape()[1];
-                    let seq_len = normed_2d.shape()[0];
-                    let elem_size = merged.dtype().size_of();
-                    let gate_view = Array::new(
-                        merged.metal_buffer().to_owned(),
-                        vec![seq_len, gate_dim],
-                        vec![total_out, 1],
-                        merged.dtype(),
-                        merged.offset(),
-                    );
-                    let up_view = Array::new(
-                        merged.metal_buffer().to_owned(),
-                        vec![seq_len, gate_dim],
-                        vec![total_out, 1],
-                        merged.dtype(),
-                        merged.offset() + gate_dim * elem_size,
-                    );
-                    let g = ops::copy::copy_into_cb(registry, &gate_view, cb)?;
-                    let u = ops::copy::copy_into_cb(registry, &up_view, cb)?;
-                    (g, u)
+                    // Strided SiLU*mul reads gate+up directly from merged buffer (no copy)
+                    ops::fused::fused_silu_mul_strided_into_cb(registry, &merged, gate_dim, cb)?
                 } else {
                     // Fallback: 2 separate GEMMs
                     let wgate_t = gate_proj.weight_transposed_contiguous()?;
                     let wup_t = up_proj.weight_transposed_contiguous()?;
-                    ops::fused::batched_gate_up_into_cb(registry, &normed_2d, &wgate_t, &wup_t, cb)?
+                    let (gate_out, up_out) = ops::fused::batched_gate_up_into_cb(
+                        registry, &normed_2d, &wgate_t, &wup_t, cb,
+                    )?;
+                    ops::fused::fused_silu_mul_into_cb(registry, &gate_out, &up_out, cb)?
                 };
-                let hidden = ops::fused::fused_silu_mul_into_cb(registry, &gate_out, &up_out, cb)?;
                 let ffn_out = down_proj.forward_into_cb(&hidden, registry, cb)?;
                 ops::binary::add_into_cb(registry, residual, &ffn_out, cb)
             }
@@ -335,35 +319,19 @@ impl FeedForward {
                 } else {
                     normed.reshape(vec![normed.shape()[0], normed.shape()[1]])?
                 };
-                let (gate_out, up_out) = if let Some(ref guw_t) = gate_up_merged_weight_t {
+                let hidden = if let Some(ref guw_t) = gate_up_merged_weight_t {
                     let merged = ops::matmul::matmul_into_cb(registry, &normed_2d, guw_t, cb)?;
                     let gate_dim = guw_t.shape()[1] / 2;
-                    let total_out = guw_t.shape()[1];
-                    let seq_len = normed_2d.shape()[0];
-                    let elem_size = merged.dtype().size_of();
-                    let gate_view = Array::new(
-                        merged.metal_buffer().to_owned(),
-                        vec![seq_len, gate_dim],
-                        vec![total_out, 1],
-                        merged.dtype(),
-                        merged.offset(),
-                    );
-                    let up_view = Array::new(
-                        merged.metal_buffer().to_owned(),
-                        vec![seq_len, gate_dim],
-                        vec![total_out, 1],
-                        merged.dtype(),
-                        merged.offset() + gate_dim * elem_size,
-                    );
-                    let g = ops::copy::copy_into_cb(registry, &gate_view, cb)?;
-                    let u = ops::copy::copy_into_cb(registry, &up_view, cb)?;
-                    (g, u)
+                    // Strided SiLU*mul reads gate+up directly from merged buffer (no copy)
+                    ops::fused::fused_silu_mul_strided_into_cb(registry, &merged, gate_dim, cb)?
                 } else {
                     let wgate_t = gate_proj.weight_transposed_contiguous()?;
                     let wup_t = up_proj.weight_transposed_contiguous()?;
-                    ops::fused::batched_gate_up_into_cb(registry, &normed_2d, &wgate_t, &wup_t, cb)?
+                    let (gate_out, up_out) = ops::fused::batched_gate_up_into_cb(
+                        registry, &normed_2d, &wgate_t, &wup_t, cb,
+                    )?;
+                    ops::fused::fused_silu_mul_into_cb(registry, &gate_out, &up_out, cb)?
                 };
-                let hidden = ops::fused::fused_silu_mul_into_cb(registry, &gate_out, &up_out, cb)?;
                 let ffn_out = down_proj.forward_into_cb(&hidden, registry, cb)?;
                 ops::binary::add_into_cb(registry, residual, &ffn_out, cb)
             }
