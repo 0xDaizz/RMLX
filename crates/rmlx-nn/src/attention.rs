@@ -475,6 +475,81 @@ impl LayerKvCache {
         Ok(())
     }
 
+    /// Append new K, V into the pre-allocated slab cache using a single batched
+    /// GPU dispatch (1 dispatch instead of 2 * num_kv_heads).
+    ///
+    /// Requires:
+    ///   - Pre-allocated slab cache (`keys_slab` / `values_slab` present)
+    ///   - f16 dtype
+    ///   - `src_k` / `src_v` are contiguous with layout `[num_kv_heads * new_tokens, head_dim]`
+    ///     (head-major, i.e. output of `deinterleave_heads` / `rope_multihead`)
+    ///
+    /// Falls back to `append_into_cb` if preconditions are not met.
+    pub fn append_batched_into_cb(
+        &mut self,
+        src_k: &Array,
+        src_v: &Array,
+        new_tokens: usize,
+        registry: &KernelRegistry,
+        cb: &metal::CommandBufferRef,
+    ) -> Result<(), KernelError> {
+        // Check preconditions for the batched path
+        let has_slab = self.keys_slab.is_some() && self.values_slab.is_some();
+        let is_f16 = !self.keys.is_empty() && self.keys[0].dtype() == DType::Float16;
+
+        if !has_slab || !is_f16 || self.max_seq_len == 0 {
+            // Fallback: split into per-head views and use the old path
+            let elem_size = src_k.dtype().size_of();
+            let head_elems = new_tokens * self.head_dim;
+            let k_heads: Vec<Array> = (0..self.num_kv_heads)
+                .map(|h| {
+                    src_k.view(
+                        vec![new_tokens, self.head_dim],
+                        vec![self.head_dim, 1],
+                        src_k.offset() + h * head_elems * elem_size,
+                    )
+                })
+                .collect();
+            let v_heads: Vec<Array> = (0..self.num_kv_heads)
+                .map(|h| {
+                    src_v.view(
+                        vec![new_tokens, self.head_dim],
+                        vec![self.head_dim, 1],
+                        src_v.offset() + h * head_elems * elem_size,
+                    )
+                })
+                .collect();
+            return self.append_into_cb(k_heads, v_heads, new_tokens, registry, cb);
+        }
+
+        if self.seq_len + new_tokens > self.max_seq_len {
+            return Err(KernelError::InvalidShape(format!(
+                "LayerKvCache::append_batched_into_cb: overflow: {} cached + {} new > {} max",
+                self.seq_len, new_tokens, self.max_seq_len
+            )));
+        }
+
+        let k_slab = self.keys_slab.as_ref().unwrap();
+        let v_slab = self.values_slab.as_ref().unwrap();
+
+        ops::copy::kv_cache_copy_batched_f16_into_cb(
+            src_k,
+            src_v,
+            k_slab,
+            v_slab,
+            self.num_kv_heads,
+            new_tokens,
+            self.head_dim,
+            self.max_seq_len,
+            self.seq_len,
+            registry,
+            cb,
+        )?;
+
+        self.seq_len += new_tokens;
+        Ok(())
+    }
+
     /// Like append_into_cb but dispatches into an already-open encoder.
     pub fn append_into_encoder(
         &mut self,
@@ -3098,7 +3173,6 @@ impl Attention {
             }
         };
 
-        let elem_size = q.dtype().size_of();
         let rope_offset = cache.seq_len as u32;
 
         // Deinterleave + RoPE for Q and K; deinterleave-only for V
@@ -3133,29 +3207,9 @@ impl Attention {
             v_batched = ops::rope::deinterleave_heads_into_cb(registry, &v, num_kv_heads, cb)?;
         }
 
-        // Create per-head views for KV cache append (zero-copy into batched output)
-        let head_elems = seq_len * head_dim;
-        let k_heads: Vec<Array> = (0..num_kv_heads)
-            .map(|h| {
-                k_batched.view(
-                    vec![seq_len, head_dim],
-                    vec![head_dim, 1],
-                    k_batched.offset() + h * head_elems * elem_size,
-                )
-            })
-            .collect();
-        let v_heads: Vec<Array> = (0..num_kv_heads)
-            .map(|h| {
-                v_batched.view(
-                    vec![seq_len, head_dim],
-                    vec![head_dim, 1],
-                    v_batched.offset() + h * head_elems * elem_size,
-                )
-            })
-            .collect();
-
-        // KV cache append (into same CB — no separate commit/wait)
-        cache.append_into_cb(k_heads, v_heads, seq_len, registry, cb)?;
+        // KV cache append — batched path (1 dispatch) when possible,
+        // falls back to per-head copies internally if preconditions not met.
+        cache.append_batched_into_cb(&k_batched, &v_batched, seq_len, registry, cb)?;
         let total_seq = cache.seq_len;
 
         // Single-dispatch GQA SDPA over all heads using contiguous slabs.
@@ -3181,22 +3235,44 @@ impl Attention {
             None // contiguous, no stride override needed
         };
 
-        let attn_slab = ops::sdpa::sdpa_prefill_gqa_slab_into_cb(
-            registry,
-            &q_batched,
-            &k_slab,
-            &v_slab,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            seq_len,
-            total_seq,
-            kv_stride,
-            mask,
-            scale,
-            mask.is_none(), // use kernel causal masking only when no explicit mask provided
-            cb,
-        )?;
+        // Use MMA kernel when conditions are met: f16, D=128, seq_len>1
+        let use_mma = q_batched.dtype() == DType::Float16 && head_dim == 128 && seq_len > 1;
+
+        let attn_slab = if use_mma {
+            ops::sdpa::sdpa_prefill_mma_f16_into_cb(
+                registry,
+                &q_batched,
+                &k_slab,
+                &v_slab,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                seq_len,
+                total_seq,
+                kv_stride,
+                mask,
+                scale,
+                mask.is_none(),
+                cb,
+            )?
+        } else {
+            ops::sdpa::sdpa_prefill_gqa_slab_into_cb(
+                registry,
+                &q_batched,
+                &k_slab,
+                &v_slab,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                seq_len,
+                total_seq,
+                kv_stride,
+                mask,
+                scale,
+                mask.is_none(), // use kernel causal masking only when no explicit mask provided
+                cb,
+            )?
+        };
 
         // Output slab is [num_heads * seq_len * head_dim] (head-major).
         // Reshape to [num_heads * seq_len, head_dim] for interleave.

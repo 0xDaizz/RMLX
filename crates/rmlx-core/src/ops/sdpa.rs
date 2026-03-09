@@ -1098,14 +1098,6 @@ kernel void sdpa_prefill_gqa_f16(
         device const half* Q_head = Q + head_id * N * D;
         device       half* O_head = O + head_id * N * D;
 
-        // Shared memory — reused for each Q head in the group
-        threadgroup half  Q_tile[Br * 128];
-        threadgroup float S_tile[Br * Bc_f16];
-        threadgroup float m_prev[Br];
-        threadgroup float l_prev[Br];
-        threadgroup float reduce_buf[SIMD_SIZE];
-        threadgroup float O_acc[Br * 128];
-
         // Initialize accumulators
         for (uint idx = tid; idx < Br * D_lo; idx += n_threads) {
             O_acc[idx] = 0.0f;
@@ -1641,9 +1633,531 @@ kernel void sdpa_decode_batched_bf16(
 }
 "#;
 
+// ---------------------------------------------------------------------------
+// MMA-based SDPA prefill kernel — simdgroup 8×8 matrix multiply for Q@K^T
+// and P@V, matching the MLX steel attention architecture.
+//
+// Design: BQ=32, BK=16, BD=128, 4 simdgroups × 32 lanes = 128 threads
+// Online softmax with exp2 (not exp) and simd_shuffle_xor reductions.
+// Function constants: align_Q, align_K, is_causal, has_mask
+// ---------------------------------------------------------------------------
+
+/// MMA tile sizes — must match the Metal shader constants.
+const MMA_BQ: usize = 32;
+const MMA_BK: usize = 16;
+const MMA_THREADS: u64 = 128;
+
+pub const SDPA_MMA_SHADER_SOURCE: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+
+// ─── Tile sizes ────────────────────────────────────────────────────────────
+constant constexpr int BQ = 32;    // Query block rows
+constant constexpr int BK = 16;    // K/V block rows
+constant constexpr int BD = 128;   // Head dimension (fixed for this kernel)
+constant constexpr int WM = 4;     // Simdgroups along Q dimension
+constant constexpr int WN = 1;     // Simdgroups along K dimension (always 1)
+constant constexpr int kFragSize = 8;
+constant constexpr int kNWarps = WM * WN;
+
+// MMA tile dimensions:
+//   TQ = BQ / (WM * 8) = 32 / (4*8) = 1 fragment per SG in Q dim
+//   TK = BK / 8 = 2 fragments in K dim
+//   TD = BD / 8 = 16 fragments in head dim
+constant constexpr int TQ = BQ / (kNWarps * kFragSize);  // 1
+constant constexpr int TK = BK / kFragSize;               // 2
+constant constexpr int TD = BD / kFragSize;                // 16
+
+// Shared memory padding to avoid bank conflicts (8 halfs = 16 bytes)
+constant constexpr int padQ = 8;
+constant constexpr int padKV = 8;
+constant constexpr int LDQ = BD + padQ;     // Q: [BQ, BD+pad] row-major
+constant constexpr int LDK = BK + padKV;    // K transposed: [BD, BK+pad]
+constant constexpr int LDV = BD + padKV;    // V: [BK, BD+pad] row-major
+
+// ─── Function constants ────────────────────────────────────────────────────
+constant bool align_Q [[function_constant(200)]];   // N divisible by BQ
+constant bool align_K [[function_constant(201)]];   // S divisible by BK
+constant bool is_causal [[function_constant(300)]]; // Causal masking
+constant bool has_mask [[function_constant(301)]];  // Explicit additive mask
+
+// ─── Helper ops ────────────────────────────────────────────────────────────
+struct MaxOp {
+    template <typename T>
+    METAL_FUNC static constexpr T apply(T x, T y) { return metal::max(x, y); }
+};
+
+struct SumOp {
+    template <typename T>
+    METAL_FUNC static constexpr T apply(T x, T y) { return x + y; }
+};
+
+// Row-wise reduction across a simdgroup_matrix 8x8 fragment.
+// Each thread holds 2 elements (kElemRows=1, kElemCols=2).
+// The 2 elements belong to the same row, so we reduce cols first,
+// then use simd_shuffle_xor to reduce across threads in the same row.
+template <typename Op>
+METAL_FUNC void frag_row_reduce(thread const float2& frag, thread float* out) {
+    float thr = Op::apply(frag.x, frag.y);
+    float xor1 = simd_shuffle_xor(thr, ushort(1));
+    xor1 = Op::apply(thr, xor1);
+    float xor8 = simd_shuffle_xor(xor1, ushort(8));
+    xor8 = Op::apply(xor1, xor8);
+    out[0] = Op::apply(out[0], xor8);
+}
+
+// Apply a scalar row-value to both elements of a fragment.
+METAL_FUNC void frag_row_mul(thread float2& frag, float val) {
+    frag.x *= val;
+    frag.y *= val;
+}
+
+METAL_FUNC void frag_row_sub_exp2(thread float2& frag, float row_max) {
+    frag.x = fast::exp2(frag.x - row_max);
+    frag.y = fast::exp2(frag.y - row_max);
+}
+
+// ─── Cooperative block loader (row-major, no transpose) ────────────────────
+// Loads [BROWS, BCOLS] from device memory into threadgroup memory.
+// dst_ld is the threadgroup leading dimension (includes padding).
+template <int BROWS, int BCOLS, int dst_ld, int tgp_size>
+struct RowLoader {
+    static constant constexpr int n_reads = (BCOLS * BROWS) / tgp_size;
+    static constant constexpr int TCOLS = BCOLS / n_reads;
+    static constant constexpr int TROWS = tgp_size / TCOLS;
+
+    const int src_ld;
+    const short bi;
+    const short bj;
+    threadgroup half* dst;
+    const device half* src;
+
+    METAL_FUNC RowLoader(
+        const device half* src_, int src_ld_,
+        threadgroup half* dst_,
+        ushort simd_group_id, ushort simd_lane_id)
+        : src_ld(src_ld_),
+          bi(short(simd_group_id * 32 + simd_lane_id) / TCOLS),
+          bj(n_reads * (short(simd_group_id * 32 + simd_lane_id) % TCOLS)),
+          dst(dst_ + bi * dst_ld + bj),
+          src(src_ + bi * src_ld_ + bj) {}
+
+    METAL_FUNC void load_unsafe() const {
+        for (short i = 0; i < BROWS; i += TROWS) {
+            for (short j = 0; j < n_reads; j++) {
+                dst[i * dst_ld + j] = src[i * src_ld + j];
+            }
+        }
+    }
+
+    METAL_FUNC void load_safe(short2 tile_dim) const {
+        // tile_dim = (cols_valid, rows_valid)
+        short2 adj = tile_dim - short2(bj, bi);
+        if (adj.x <= 0 || adj.y <= 0) {
+            for (short i = 0; i < BROWS; i += TROWS) {
+                for (short j = 0; j < n_reads; j++) {
+                    dst[i * dst_ld + j] = half(0);
+                }
+            }
+            return;
+        }
+        for (short i = 0; i < BROWS; i += TROWS) {
+            for (short j = 0; j < n_reads; j++) {
+                bool valid = (i < adj.y) && (j < adj.x);
+                dst[i * dst_ld + j] = valid ? src[i * src_ld + j] : half(0);
+            }
+        }
+    }
+
+    METAL_FUNC void next() {
+        src += BROWS * src_ld;
+    }
+};
+
+// Transposed loader: loads [BROWS, BCOLS] from device (row-major, ld=src_ld)
+// and stores transposed as [BCOLS, BROWS+pad] in threadgroup memory.
+// dst layout: dst[col * dst_col_stride + row]
+template <int BROWS, int BCOLS, int dst_row_stride, int dst_col_stride, int tgp_size>
+struct TransposeLoader {
+    static constant constexpr int n_reads = (BCOLS * BROWS) / tgp_size;
+    static constant constexpr int TCOLS = BCOLS / n_reads;
+    static constant constexpr int TROWS = tgp_size / TCOLS;
+
+    const int src_ld;
+    const short bi;
+    const short bj;
+    threadgroup half* dst;
+    const device half* src;
+
+    METAL_FUNC TransposeLoader(
+        const device half* src_, int src_ld_,
+        threadgroup half* dst_,
+        ushort simd_group_id, ushort simd_lane_id)
+        : src_ld(src_ld_),
+          bi(short(simd_group_id * 32 + simd_lane_id) / TCOLS),
+          bj(n_reads * (short(simd_group_id * 32 + simd_lane_id) % TCOLS)),
+          dst(dst_ + bi * dst_row_stride + bj * dst_col_stride),
+          src(src_ + bi * src_ld_ + bj) {}
+
+    METAL_FUNC void load_unsafe() const {
+        for (short i = 0; i < BROWS; i += TROWS) {
+            for (short j = 0; j < n_reads; j++) {
+                dst[i * dst_row_stride + j * dst_col_stride] = src[i * src_ld + j];
+            }
+        }
+    }
+
+    METAL_FUNC void load_safe(short2 tile_dim) const {
+        short2 adj = tile_dim - short2(bj, bi);
+        if (adj.x <= 0 || adj.y <= 0) {
+            for (short i = 0; i < BROWS; i += TROWS) {
+                for (short j = 0; j < n_reads; j++) {
+                    dst[i * dst_row_stride + j * dst_col_stride] = half(0);
+                }
+            }
+            return;
+        }
+        for (short i = 0; i < BROWS; i += TROWS) {
+            for (short j = 0; j < n_reads; j++) {
+                bool valid = (i < adj.y) && (j < adj.x);
+                dst[i * dst_row_stride + j * dst_col_stride] =
+                    valid ? src[i * src_ld + j] : half(0);
+            }
+        }
+    }
+
+    METAL_FUNC void next() {
+        src += BROWS * src_ld;
+    }
+};
+
+// ─── Main MMA attention kernel ─────────────────────────────────────────────
+//
+// Grid: (ceildiv(N, BQ), num_q_heads, 1)
+// Threadgroup: (128, 1, 1)
+//
+// Buffers:
+//   0: Q      [num_q_heads, N, D]
+//   1: K      [num_kv_heads, S, D]
+//   2: V      [num_kv_heads, S, D]
+//   3: O      [num_q_heads, N, D]
+//   4: mask   [N, S] or nullptr
+//   5: N      (query sequence length)
+//   6: S      (key/value sequence length)
+//   7: D_val  (head dimension, must be 128)
+//   8: gqa_factor (num_q_heads / num_kv_heads)
+//   9: scale  (1/sqrt(D))
+
+kernel void sdpa_prefill_mma_f16(
+    device const half* Q [[buffer(0)]],
+    device const half* K [[buffer(1)]],
+    device const half* V [[buffer(2)]],
+    device half* O       [[buffer(3)]],
+    device const half* mask_buf [[buffer(4)]],
+    constant uint& N     [[buffer(5)]],
+    constant uint& S     [[buffer(6)]],
+    constant uint& D_val [[buffer(7)]],
+    constant uint& gqa_factor [[buffer(8)]],
+    constant float& scale [[buffer(9)]],
+    constant uint& kv_stride_S [[buffer(10)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+    // tid.x = q_block index, tid.y = q_head index
+    const uint q_block = tid.x;
+    const uint q_head = tid.y;
+    const uint kv_head = q_head / gqa_factor;
+
+    const uint q_start = q_block * BQ;
+    if (q_start >= N) return;
+
+    // Pointer offsets for this head (use kv_stride_S for KV inter-head offset)
+    const device half* Q_head = Q + q_head * N * BD;
+    const device half* K_head = K + kv_head * kv_stride_S * BD;
+    const device half* V_head = V + kv_head * kv_stride_S * BD;
+    device half* O_head = O + q_head * N * BD;
+
+    // Pre-multiply scale by log2(e) for exp2-based softmax
+    const float scale_log2e = scale * M_LOG2E_F;
+
+    // ─── Threadgroup memory ────────────────────────────────────────────
+    threadgroup half Q_smem[BQ * LDQ];          // [BQ, BD+pad]
+    // KV_smem shared between K (transposed) and V (row-major)
+    // K transposed: [BD, LDK] = [128, 24] — but we only need BK cols at a time
+    // V row-major: [BK, LDV] = [16, 136]
+    // Size needed: max(BD * LDK, BK * LDV) = max(128*24, 16*136) = max(3072, 2176) = 3072
+    threadgroup half KV_smem[BD * LDK];  // large enough for both K^T and V tiles
+
+    threadgroup half* Qs = Q_smem;
+    threadgroup half* Ks = KV_smem;
+    threadgroup half* Vs = KV_smem;
+
+    // ─── Load Q tile ───────────────────────────────────────────────────
+    // Q: [BQ, BD] row-major → Q_smem: [BQ, BD+pad]
+    using QLoader = RowLoader<BQ, BD, LDQ, kNWarps * 32>;
+    QLoader loader_q(Q_head + q_start * BD, BD, Qs, simd_gid, simd_lid);
+
+    if (!align_Q && q_block == ((N - 1) / BQ)) {
+        loader_q.load_safe(short2(BD, N - q_start));
+    } else {
+        loader_q.load_unsafe();
+    }
+
+    // ─── Prepare K and V loaders ───────────────────────────────────────
+    // K is loaded transposed: [BK, BD] from device → [BD, BK+pad] in TG mem
+    // So: BROWS=BK, BCOLS=BD, but stored transposed with dst_row_stride=1, dst_col_stride=LDK
+    using KLoader = TransposeLoader<BK, BD, 1, LDK, kNWarps * 32>;
+    KLoader loader_k(K_head, BD, Ks, simd_gid, simd_lid);
+
+    // V is loaded row-major: [BK, BD] → [BK, BD+pad]
+    using VLoader = RowLoader<BK, BD, LDV, kNWarps * 32>;
+    VLoader loader_v(V_head, BD, Vs, simd_gid, simd_lid);
+
+    // ─── MMA fragment setup ────────────────────────────────────────────
+    // Each simdgroup owns TQ=1 rows of 8 query positions
+    // Position within the BQ tile: row offset = simd_gid * 8
+    const short tm = kFragSize * TQ * simd_gid;  // row offset in Q tile
+
+    // simd_lane coordinate within 8x8 fragment
+    const short qid = simd_lid / 4;
+    const short fm = (qid & 4) + ((simd_lid / 2) % 4);
+    const short fn = (qid & 2) * 2 + (simd_lid % 2) * 2;
+
+    // TG memory offsets for MMA tile loads
+    const short Qs_off = (tm + fm) * LDQ + fn;
+    const short Ks_off = fm * LDK + fn;     // K is [BD, BK+pad]: row=d, col=k
+    const short Vs_off = fm * LDV + fn;     // V is [BK, BD+pad]: row=k, col=d
+
+    // ─── Output and softmax accumulators ───────────────────────────────
+    // O tile: TQ × TD = 1 × 16 fragments per SG
+    float2 O_frags[TQ * TD];  // 16 fragments, 2 elems each = 32 floats
+    for (int i = 0; i < TQ * TD; i++) O_frags[i] = float2(0.0f);
+
+    // S tile: TQ × TK = 1 × 2 fragments (score)
+    float2 S_frags[TQ * TK];
+
+    // Running softmax state (1 row per TQ)
+    float max_score[TQ];
+    float sum_score[TQ];
+    for (int i = 0; i < TQ; i++) {
+        max_score[i] = -INFINITY;
+        sum_score[i] = 0.0f;
+    }
+
+    // ─── Compute KV block limit ────────────────────────────────────────
+    int NK = (int(S) + BK - 1) / BK;
+    int kb_lim = NK;
+
+    if (is_causal) {
+        int q_max = int(q_start) + BQ;
+        kb_lim = (q_max + BK - 1) / BK;
+        kb_lim = min(NK, kb_lim);
+    }
+
+    const int NK_aligned = align_K ? NK : (NK - 1);
+
+    // ─── Main loop over KV blocks ──────────────────────────────────────
+    for (int kb = 0; kb < kb_lim; kb++) {
+        // ── Load K^T tile ──────────────────────────────────────────────
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (!align_K && kb == NK_aligned) {
+            loader_k.load_safe(short2(BD, int(S) - kb * BK));
+        } else {
+            loader_k.load_unsafe();
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ── Compute S = Q @ K^T ───────────────────────────────────────
+        // S_frags[tq][tk]: TQ=1 × TK=2
+        for (int i = 0; i < TQ * TK; i++) S_frags[i] = float2(0.0f);
+
+        // Iterate over head dimension in blocks of kFragSize
+        for (short dd = 0; dd < TD; dd++) {
+            simdgroup_barrier(mem_flags::mem_none);
+
+            // Load Q fragment: [8, 8] from Qs at row offset, col = dd*8
+            simdgroup_matrix<half, 8, 8> Q_mat;
+            // Q_smem layout: [BQ, LDQ], row-major
+            // For MMA Q @ K^T: Q is [M, K] = [8, 8] loaded from [row, d]
+            simdgroup_load(Q_mat, &Qs[Qs_off + dd * kFragSize], LDQ);
+
+            // Load K^T fragment: K is stored as [BD, LDK] (transposed)
+            // For MMA: K^T is [K, N] = [8, TK*8]
+            // Each TK fragment is [8, 8] at K_smem[dd*8][tk*8]
+            for (short tk = 0; tk < TK; tk++) {
+                simdgroup_matrix<half, 8, 8> K_mat;
+                simdgroup_load(K_mat, &Ks[Ks_off + dd * kFragSize * LDK + tk * kFragSize], LDK);
+
+                simdgroup_matrix<float, 8, 8> S_mat;
+                // Load current accumulator
+                reinterpret_cast<thread float2&>(S_mat.thread_elements()) = S_frags[0 * TK + tk];
+                simdgroup_multiply_accumulate(S_mat, Q_mat, K_mat, S_mat);
+                S_frags[0 * TK + tk] = reinterpret_cast<thread float2&>(S_mat.thread_elements());
+            }
+
+            simdgroup_barrier(mem_flags::mem_none);
+        }
+
+        // ── Apply scale ────────────────────────────────────────────────
+        for (int i = 0; i < TQ * TK; i++) {
+            S_frags[i] *= scale_log2e;
+        }
+
+        // ── Mask out-of-bounds K positions ─────────────────────────────
+        if (!align_K && kb == NK_aligned) {
+            int kL_rem = int(S) - kb * BK;
+            for (short tk = 0; tk < TK; tk++) {
+                short col_pos = fn + tk * kFragSize;
+                if (col_pos >= kL_rem) S_frags[0 * TK + tk] = float2(-INFINITY);
+                else if (col_pos + 1 >= kL_rem) S_frags[0 * TK + tk].y = -INFINITY;
+            }
+        }
+
+        // ── Causal masking ─────────────────────────────────────────────
+        if (is_causal) {
+            // Check if we're near the diagonal
+            int kb_start = kb * BK;
+            int q_end_pos = int(q_start) + tm + fm;  // row in Q
+            for (short tk = 0; tk < TK; tk++) {
+                short col_base = kb_start + fn + tk * kFragSize;
+                if (col_base > q_end_pos) {
+                    S_frags[0 * TK + tk] = float2(-INFINITY);
+                } else if (col_base + 1 > q_end_pos) {
+                    S_frags[0 * TK + tk].y = -INFINITY;
+                }
+            }
+        }
+
+        // ── Additive mask ──────────────────────────────────────────────
+        if (has_mask) {
+            int row_pos = int(q_start) + tm + fm;
+            for (short tk = 0; tk < TK; tk++) {
+                short col_base = kb * BK + fn + tk * kFragSize;
+                float m0 = (row_pos < int(N) && col_base < int(S))
+                    ? float(mask_buf[row_pos * int(S) + col_base]) * M_LOG2E_F : 0.0f;
+                float m1 = (row_pos < int(N) && col_base + 1 < int(S))
+                    ? float(mask_buf[row_pos * int(S) + col_base + 1]) * M_LOG2E_F : 0.0f;
+                S_frags[0 * TK + tk].x += m0;
+                S_frags[0 * TK + tk].y += m1;
+            }
+        }
+
+        // ── Online softmax ─────────────────────────────────────────────
+        // 1. Row max over S_frags
+        float new_max[TQ];
+        for (int i = 0; i < TQ; i++) new_max[i] = max_score[i];
+
+        for (short tk = 0; tk < TK; tk++) {
+            frag_row_reduce<MaxOp>(S_frags[0 * TK + tk], &new_max[0]);
+        }
+
+        // 2. exp2(S - max) in-place
+        for (short tk = 0; tk < TK; tk++) {
+            frag_row_sub_exp2(S_frags[0 * TK + tk], new_max[0]);
+        }
+
+        // 3. Correction factor for old accumulator
+        float factor[TQ];
+        for (int i = 0; i < TQ; i++) {
+            factor[i] = fast::exp2(max_score[i] - new_max[i]);
+            max_score[i] = new_max[i];
+        }
+
+        // 4. Row sum of exp scores
+        float sum_tmp[TQ] = {0.0f};
+        for (short tk = 0; tk < TK; tk++) {
+            frag_row_reduce<SumOp>(S_frags[0 * TK + tk], &sum_tmp[0]);
+        }
+        for (int i = 0; i < TQ; i++) {
+            sum_score[i] = sum_score[i] * factor[i] + sum_tmp[i];
+        }
+
+        // 5. Rescale existing O accumulator
+        for (int id = 0; id < TD; id++) {
+            frag_row_mul(O_frags[0 * TD + id], factor[0]);
+        }
+
+        // ── Load V and compute O += S @ V ──────────────────────────────
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (!align_K && kb == NK_aligned) {
+            loader_v.load_safe(short2(BD, int(S) - kb * BK));
+        } else {
+            loader_v.load_unsafe();
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // P @ V: S_frags[1, TK] @ V_smem[TK, TD] → O_frags[1, TD]
+        for (short id = 0; id < TD; id++) {
+            for (short tk = 0; tk < TK; tk++) {
+                simdgroup_barrier(mem_flags::mem_none);
+
+                // Load V fragment: V_smem[BK, BD+pad], row=k, col=d
+                simdgroup_matrix<half, 8, 8> V_mat;
+                simdgroup_load(V_mat, &Vs[Vs_off + tk * kFragSize * LDV + id * kFragSize], LDV);
+
+                // Load S (score) as half for MMA
+                simdgroup_matrix<float, 8, 8> S_mat;
+                reinterpret_cast<thread float2&>(S_mat.thread_elements()) = S_frags[0 * TK + tk];
+
+                // Convert S to half for MMA input
+                simdgroup_matrix<half, 8, 8> S_half;
+                float2 sv = S_frags[0 * TK + tk];
+                reinterpret_cast<thread half2&>(S_half.thread_elements()) = half2(sv);
+
+                simdgroup_matrix<float, 8, 8> O_mat;
+                reinterpret_cast<thread float2&>(O_mat.thread_elements()) = O_frags[0 * TD + id];
+                simdgroup_multiply_accumulate(O_mat, S_half, V_mat, O_mat);
+                O_frags[0 * TD + id] = reinterpret_cast<thread float2&>(O_mat.thread_elements());
+
+                simdgroup_barrier(mem_flags::mem_none);
+            }
+        }
+
+        // Advance K/V loaders
+        loader_k.next();
+        loader_v.next();
+    }
+
+    // ─── Final normalization: O /= sum_score ───────────────────────────
+    for (int id = 0; id < TD; id++) {
+        float inv_sum = (sum_score[0] > 0.0f) ? (1.0f / sum_score[0]) : 0.0f;
+        O_frags[0 * TD + id] *= inv_sum;
+    }
+
+    // ─── Store output ──────────────────────────────────────────────────
+    // O layout: [num_q_heads, N, BD], row-major
+    device half* O_row = O_head + (q_start + tm + fm) * BD + fn;
+
+    if (!align_Q && q_block == ((N - 1) / BQ)) {
+        int qL_rem = int(N) - int(q_start);
+        short row_in_tile = tm + fm;
+        if (row_in_tile >= qL_rem) return;
+
+        for (short id = 0; id < TD; id++) {
+            short col = fn + id * kFragSize;
+            if (col < BD) {
+                O_row[id * kFragSize] = half(O_frags[0 * TD + id].x);
+            }
+            if (col + 1 < BD) {
+                O_row[id * kFragSize + 1] = half(O_frags[0 * TD + id].y);
+            }
+        }
+    } else {
+        for (short id = 0; id < TD; id++) {
+            O_row[id * kFragSize] = half(O_frags[0 * TD + id].x);
+            O_row[id * kFragSize + 1] = half(O_frags[0 * TD + id].y);
+        }
+    }
+}
+"#;
+
 pub fn register(registry: &KernelRegistry) -> Result<(), KernelError> {
     registry.register_jit_source("sdpa", SDPA_SHADER_SOURCE)?;
     registry.register_jit_source("sdpa_bf16", SDPA_BF16_SHADER_SOURCE)?;
+    registry.register_jit_source("sdpa_mma", SDPA_MMA_SHADER_SOURCE)?;
     Ok(())
 }
 
@@ -2247,6 +2761,118 @@ pub fn sdpa_prefill_gqa_slab_into_cb(
     let total_tgs = (n_q_blocks * num_kv_heads) as u64;
     let tg_size = std::cmp::min(THREADS_PER_TG, pipeline.max_total_threads_per_threadgroup());
     encoder.dispatch_thread_groups(MTLSize::new(total_tgs, 1, 1), MTLSize::new(tg_size, 1, 1));
+    encoder.end_encoding();
+
+    Ok(out)
+}
+
+/// MMA-based SDPA prefill for f16, D=128 — simdgroup 8×8 matrix multiply.
+///
+/// Uses the same slab layout as [`sdpa_prefill_gqa_slab_into_cb`]:
+/// - `q_slab`: `[num_heads * seq_len * head_dim]`
+/// - `k_slab`: `[num_kv_heads * S * head_dim]`
+/// - `v_slab`: `[num_kv_heads * S * head_dim]`
+///
+/// Returns: `[num_heads * seq_len * head_dim]` output slab.
+///
+/// Grid: (ceildiv(seq_len, 32), num_heads, 1) — each TG processes 32 Q rows.
+/// Function constants control alignment and masking specialisation.
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_prefill_mma_f16_into_cb(
+    registry: &KernelRegistry,
+    q_slab: &Array,
+    k_slab: &Array,
+    v_slab: &Array,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    seq_len: usize,
+    kv_len: usize,
+    kv_seq_stride: Option<usize>,
+    mask: Option<&Array>,
+    scale: f32,
+    is_causal: bool,
+    cb: &metal::CommandBufferRef,
+) -> Result<Array, KernelError> {
+    use crate::kernels::FunctionConstantValue;
+
+    let dtype = q_slab.dtype();
+    if dtype != DType::Float16 {
+        return Err(KernelError::NotFound(format!(
+            "sdpa_prefill_mma: only f16 supported, got {:?}",
+            dtype
+        )));
+    }
+    if head_dim != 128 {
+        return Err(KernelError::InvalidShape(format!(
+            "sdpa_prefill_mma: only head_dim=128 supported, got {head_dim}"
+        )));
+    }
+    if num_kv_heads == 0 || num_heads % num_kv_heads != 0 {
+        return Err(KernelError::InvalidShape(format!(
+            "sdpa_prefill_mma: num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
+        )));
+    }
+
+    let gqa_factor = (num_heads / num_kv_heads) as u32;
+    // Function constants for pipeline specialization
+    let align_q = seq_len % MMA_BQ == 0;
+    let align_k = kv_len % MMA_BK == 0;
+    let has_mask_val = mask.is_some();
+
+    let constants = vec![
+        (200u32, FunctionConstantValue::Bool(align_q)),
+        (201, FunctionConstantValue::Bool(align_k)),
+        (300, FunctionConstantValue::Bool(is_causal)),
+        (301, FunctionConstantValue::Bool(has_mask_val)),
+    ];
+
+    let pipeline =
+        registry.get_pipeline_with_constants("sdpa_prefill_mma_f16", dtype, &constants)?;
+    let dev = registry.device().raw();
+
+    let out_numel = num_heads * seq_len * head_dim;
+    let out = Array::zeros(dev, &[out_numel], dtype);
+
+    let n_val = seq_len as u32;
+    let s_val = kv_len as u32;
+    let d_val = head_dim as u32;
+
+    let dummy_buf;
+    let mask_metal_buf = if let Some(m) = mask {
+        m.metal_buffer()
+    } else {
+        dummy_buf = dev.new_buffer(4, metal::MTLResourceOptions::StorageModeShared);
+        &dummy_buf
+    };
+    let mask_offset = mask.map_or(0, |m| m.offset()) as u64;
+
+    let encoder = cb.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(q_slab.metal_buffer()), q_slab.offset() as u64);
+    encoder.set_buffer(1, Some(k_slab.metal_buffer()), k_slab.offset() as u64);
+    encoder.set_buffer(2, Some(v_slab.metal_buffer()), v_slab.offset() as u64);
+    encoder.set_buffer(3, Some(out.metal_buffer()), 0);
+    encoder.set_buffer(4, Some(mask_metal_buf), mask_offset);
+    encoder.set_bytes(5, 4, &n_val as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(6, 4, &s_val as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(7, 4, &d_val as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(8, 4, &gqa_factor as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(9, 4, &scale as *const f32 as *const std::ffi::c_void);
+    let stride_s_val = kv_seq_stride.unwrap_or(kv_len) as u32;
+    encoder.set_bytes(
+        10,
+        4,
+        &stride_s_val as *const u32 as *const std::ffi::c_void,
+    );
+
+    // Grid: (ceildiv(seq_len, BQ), num_heads, 1)
+    let n_q_blocks = seq_len.div_ceil(MMA_BQ) as u64;
+    let tg_size = std::cmp::min(MMA_THREADS, pipeline.max_total_threads_per_threadgroup());
+    encoder.dispatch_thread_groups(
+        MTLSize::new(n_q_blocks, num_heads as u64, 1),
+        MTLSize::new(tg_size, 1, 1),
+    );
     encoder.end_encoding();
 
     Ok(out)
