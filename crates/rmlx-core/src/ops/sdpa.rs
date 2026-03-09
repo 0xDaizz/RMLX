@@ -3658,4 +3658,126 @@ mod tests {
             "GQA ratio=4 seq=64 causal: max_abs_diff={diff} (expected < 1e-2)"
         );
     }
+
+    // --- MMA vs Scalar SDPA correctness tests ------------------------------------
+
+    /// Run both scalar (GQA) and MMA prefill kernels with the same inputs,
+    /// return (scalar_f32, mma_f32) for element-wise comparison.
+    #[allow(clippy::too_many_arguments)]
+    fn run_mma_vs_scalar(
+        registry: &KernelRegistry,
+        queue: &metal::CommandQueue,
+        num_heads: usize,
+        num_kv_heads: usize,
+        seq_len: usize,
+        head_dim: usize,
+        max_seq: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        // Generate deterministic pseudo-random data
+        let q_data = pseudo_random(num_heads * seq_len * head_dim, 42);
+        let k_data = pseudo_random(num_kv_heads * max_seq * head_dim, 137);
+        let v_data = pseudo_random(num_kv_heads * max_seq * head_dim, 256);
+
+        // Create f16 slabs
+        let q_slab = make_f16_array(
+            registry,
+            queue,
+            &q_data,
+            vec![num_heads * seq_len * head_dim],
+        );
+        let k_slab = make_f16_array(
+            registry,
+            queue,
+            &k_data,
+            vec![num_kv_heads * max_seq * head_dim],
+        );
+        let v_slab = make_f16_array(
+            registry,
+            queue,
+            &v_data,
+            vec![num_kv_heads * max_seq * head_dim],
+        );
+
+        // --- Scalar kernel ---
+        let cb_scalar = queue.new_command_buffer();
+        let scalar_out = sdpa_prefill_gqa_slab_into_cb(
+            registry,
+            &q_slab,
+            &k_slab,
+            &v_slab,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            seq_len,
+            seq_len,       // kv_len = seq_len (causal prefill)
+            Some(max_seq), // kv_seq_stride = max_seq (slab stride)
+            None,          // mask
+            scale,
+            true, // is_causal
+            cb_scalar,
+        )
+        .unwrap();
+        cb_scalar.commit();
+        cb_scalar.wait_until_completed();
+        let scalar_f32 = read_f16_as_f32(registry, queue, &scalar_out);
+
+        // --- MMA kernel ---
+        let cb_mma = queue.new_command_buffer();
+        let mma_out = sdpa_prefill_mma_f16_into_cb(
+            registry,
+            &q_slab,
+            &k_slab,
+            &v_slab,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            seq_len,
+            seq_len,       // kv_len = seq_len
+            Some(max_seq), // kv_seq_stride = max_seq
+            None,          // mask
+            scale,
+            true, // is_causal
+            cb_mma,
+        )
+        .unwrap();
+        cb_mma.commit();
+        cb_mma.wait_until_completed();
+        let mma_f32 = read_f16_as_f32(registry, queue, &mma_out);
+
+        (scalar_f32, mma_f32)
+    }
+
+    #[test]
+    fn test_sdpa_mma_vs_scalar_correctness() {
+        let (registry, queue) = setup_with_copy();
+
+        let num_heads = 4;
+        let num_kv_heads = 2;
+        let head_dim = 128;
+        let max_seq = 1024;
+
+        for seq_len in [32, 64, 128, 256, 512] {
+            let (scalar, mma) = run_mma_vs_scalar(
+                &registry,
+                &queue,
+                num_heads,
+                num_kv_heads,
+                seq_len,
+                head_dim,
+                max_seq,
+            );
+            let diff = max_abs_diff(&scalar, &mma);
+            // MMA and scalar are both f16 — expect small numerical differences
+            // from different accumulation order. Tolerance scales with seq_len
+            // because longer sequences accumulate more softmax error.
+            let tol = if seq_len <= 128 { 2e-2 } else { 5e-2 };
+            assert!(
+                diff < tol,
+                "MMA vs Scalar seq_len={seq_len}: max_abs_diff={diff} (expected < {tol})"
+            );
+            eprintln!("  seq_len={seq_len:>4}: max_abs_diff={diff:.6} (tol={tol})",);
+        }
+    }
 }
