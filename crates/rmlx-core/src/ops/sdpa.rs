@@ -1926,10 +1926,8 @@ kernel void sdpa_prefill_mma_f16(
     const short fm = (qid & 4) + ((simd_lid / 2) % 4);
     const short fn = (qid & 2) * 2 + (simd_lid % 2) * 2;
 
-    // TG memory offsets for MMA tile loads
-    const short Qs_off = (tm + fm) * LDQ + fn;
-    const short Ks_off = fm * LDK + fn;     // K is [BD, BK+pad]: row=d, col=k
-    const short Vs_off = fm * LDV + fn;     // V is [BK, BD+pad]: row=k, col=d
+    // simdgroup_load base addresses use simdgroup-level offsets only (no fm/fn)
+    // — the hardware distributes elements across threads internally.
 
     // ─── Output and softmax accumulators ───────────────────────────────
     // O tile: TQ × TD = 1 × 16 fragments per SG
@@ -1982,20 +1980,20 @@ kernel void sdpa_prefill_mma_f16(
             simdgroup_matrix<half, 8, 8> Q_mat;
             // Q_smem layout: [BQ, LDQ], row-major
             // For MMA Q @ K^T: Q is [M, K] = [8, 8] loaded from [row, d]
-            simdgroup_load(Q_mat, &Qs[Qs_off + dd * kFragSize], LDQ);
+            simdgroup_load(Q_mat, Qs + tm * LDQ + dd * kFragSize, LDQ);
 
             // Load K^T fragment: K is stored as [BD, LDK] (transposed)
             // For MMA: K^T is [K, N] = [8, TK*8]
             // Each TK fragment is [8, 8] at K_smem[dd*8][tk*8]
             for (short tk = 0; tk < TK; tk++) {
                 simdgroup_matrix<half, 8, 8> K_mat;
-                simdgroup_load(K_mat, &Ks[Ks_off + dd * kFragSize * LDK + tk * kFragSize], LDK);
+                simdgroup_load(K_mat, Ks + dd * kFragSize * LDK + tk * kFragSize, LDK);
 
                 simdgroup_matrix<float, 8, 8> S_mat;
                 // Load current accumulator
-                reinterpret_cast<thread float2&>(S_mat.thread_elements()) = S_frags[0 * TK + tk];
+                { thread auto& se = S_mat.thread_elements(); se[0] = S_frags[0 * TK + tk].x; se[1] = S_frags[0 * TK + tk].y; }
                 simdgroup_multiply_accumulate(S_mat, Q_mat, K_mat, S_mat);
-                S_frags[0 * TK + tk] = reinterpret_cast<thread float2&>(S_mat.thread_elements());
+                { thread auto& se = S_mat.thread_elements(); S_frags[0 * TK + tk] = float2(se[0], se[1]); }
             }
 
             simdgroup_barrier(mem_flags::mem_none);
@@ -2096,21 +2094,16 @@ kernel void sdpa_prefill_mma_f16(
 
                 // Load V fragment: V_smem[BK, BD+pad], row=k, col=d
                 simdgroup_matrix<half, 8, 8> V_mat;
-                simdgroup_load(V_mat, &Vs[Vs_off + tk * kFragSize * LDV + id * kFragSize], LDV);
+                simdgroup_load(V_mat, Vs + tk * kFragSize * LDV + id * kFragSize, LDV);
 
-                // Load S (score) as half for MMA
-                simdgroup_matrix<float, 8, 8> S_mat;
-                reinterpret_cast<thread float2&>(S_mat.thread_elements()) = S_frags[0 * TK + tk];
-
-                // Convert S to half for MMA input
+                // Convert S scores to half for MMA input
                 simdgroup_matrix<half, 8, 8> S_half;
-                float2 sv = S_frags[0 * TK + tk];
-                reinterpret_cast<thread half2&>(S_half.thread_elements()) = half2(sv);
+                { float2 sv = S_frags[0 * TK + tk]; thread auto& sh = S_half.thread_elements(); sh[0] = half(sv.x); sh[1] = half(sv.y); }
 
                 simdgroup_matrix<float, 8, 8> O_mat;
-                reinterpret_cast<thread float2&>(O_mat.thread_elements()) = O_frags[0 * TD + id];
+                { thread auto& oe = O_mat.thread_elements(); oe[0] = O_frags[0 * TD + id].x; oe[1] = O_frags[0 * TD + id].y; }
                 simdgroup_multiply_accumulate(O_mat, S_half, V_mat, O_mat);
-                O_frags[0 * TD + id] = reinterpret_cast<thread float2&>(O_mat.thread_elements());
+                { thread auto& oe = O_mat.thread_elements(); O_frags[0 * TD + id] = float2(oe[0], oe[1]); }
 
                 simdgroup_barrier(mem_flags::mem_none);
             }

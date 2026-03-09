@@ -359,192 +359,200 @@ fn main() {
 
     for &seq_len in SEQ_LENS {
         println!("\n--- seq_len={} ---", seq_len);
+        // Scope ensures Metal command queues are dropped before next seq_len,
+        // preventing GPU state contamination between iterations.
+        let (stats_cb_out, stats_graph_out) = {
+            // Slice RoPE tables to [seq_len, HEAD_DIM/2]
+            let cos_freqs = cos_full.slice(0, 0, seq_len).expect("cos slice failed");
+            let sin_freqs = sin_full.slice(0, 0, seq_len).expect("sin slice failed");
 
-        // Slice RoPE tables to [seq_len, HEAD_DIM/2]
-        let cos_freqs = cos_full.slice(0, 0, seq_len).expect("cos slice failed");
-        let sin_freqs = sin_full.slice(0, 0, seq_len).expect("sin slice failed");
+            // Build causal mask [seq_len, seq_len] in f16
+            let mask = build_causal_mask(device, seq_len);
 
-        // Build causal mask [seq_len, seq_len] in f16
-        let mask = build_causal_mask(device, seq_len);
+            // Input: [seq_len, HIDDEN_SIZE]
+            let input = rand_array(device, &[seq_len, HIDDEN_SIZE], 42);
 
-        // Input: [seq_len, HIDDEN_SIZE]
-        let input = rand_array(device, &[seq_len, HIDDEN_SIZE], 42);
-
-        // ==== Benchmark 1: forward_prefill_single_cb() ====
-        // Fresh queue for this seq_len to prevent cross-contamination
-        let queue_cb = device.new_command_queue();
-        let stats_cb = {
-            let mut cache_cb = LayerKvCache::preallocated(
-                device,
-                NUM_KV_HEADS,
-                HEAD_DIM,
-                MAX_SEQ_LEN,
-                DType::Float16,
-            );
-
-            // Warmup
-            let mut last_output = None;
-            for _ in 0..WARMUP_ITERS {
-                let _pool = ScopedPool::new();
-                cache_cb.seq_len = 0;
-                let cb = queue_cb.new_command_buffer();
-                let out = block_cb
-                    .forward_prefill_single_cb(
-                        &input,
-                        Some(&cos_freqs),
-                        Some(&sin_freqs),
-                        Some(&mask),
-                        &mut cache_cb,
-                        &registry,
-                        cb,
-                    )
-                    .expect("single_cb warmup failed");
-                cb.commit();
-                cb.wait_until_completed();
-                assert_cb_ok(cb, "single_cb warmup");
-                last_output = Some(out);
-            }
-
-            // Validate output after warmup
-            if let Some(ref out) = last_output {
-                let out_shape = out.shape();
-                assert_eq!(
-                    out_shape,
-                    &[seq_len, HIDDEN_SIZE],
-                    "wrong output shape for single_cb: expected [{}, {}], got {:?}",
-                    seq_len,
-                    HIDDEN_SIZE,
-                    out_shape
+            // ==== Benchmark 1: forward_prefill_single_cb() ====
+            // Fresh queue for this seq_len to prevent cross-contamination
+            let queue_cb = device.new_command_queue();
+            let stats_cb = {
+                let mut cache_cb = LayerKvCache::preallocated(
+                    device,
+                    NUM_KV_HEADS,
+                    HEAD_DIM,
+                    MAX_SEQ_LEN,
+                    DType::Float16,
                 );
-            }
 
-            // Benchmark
-            let mut latencies = Vec::with_capacity(BENCH_ITERS);
-            for _ in 0..BENCH_ITERS {
-                let _pool = ScopedPool::new();
-                cache_cb.seq_len = 0;
-                let cb = queue_cb.new_command_buffer();
-                let start = Instant::now();
-                let _ = block_cb
-                    .forward_prefill_single_cb(
-                        &input,
-                        Some(&cos_freqs),
-                        Some(&sin_freqs),
-                        Some(&mask),
-                        &mut cache_cb,
-                        &registry,
-                        cb,
-                    )
-                    .expect("forward_prefill_single_cb failed");
-                cb.commit();
-                cb.wait_until_completed();
-                assert_cb_ok(cb, "single_cb bench");
-                latencies.push(start.elapsed());
-            }
+                // Warmup
+                let mut last_output = None;
+                for _ in 0..WARMUP_ITERS {
+                    let _pool = ScopedPool::new();
+                    cache_cb.seq_len = 0;
+                    let cb = queue_cb.new_command_buffer();
+                    let out = block_cb
+                        .forward_prefill_single_cb(
+                            &input,
+                            Some(&cos_freqs),
+                            Some(&sin_freqs),
+                            Some(&mask),
+                            &mut cache_cb,
+                            &registry,
+                            cb,
+                        )
+                        .expect("single_cb warmup failed");
+                    cb.commit();
+                    cb.wait_until_completed();
+                    assert_cb_ok(cb, "single_cb warmup");
+                    last_output = Some(out);
+                }
 
-            Stats::from_durations(&latencies)
-        };
+                // Validate output after warmup
+                if let Some(ref out) = last_output {
+                    let out_shape = out.shape();
+                    assert_eq!(
+                        out_shape,
+                        &[seq_len, HIDDEN_SIZE],
+                        "wrong output shape for single_cb: expected [{}, {}], got {:?}",
+                        seq_len,
+                        HIDDEN_SIZE,
+                        out_shape
+                    );
+                }
 
-        let tflops_cb = compute_tflops(seq_len, stats_cb.mean);
-        println!("  single_cb : {}", stats_cb);
-        println!("    estimated TFLOPS: {:.2}", tflops_cb);
-        assert!(
+                // Benchmark
+                let mut latencies = Vec::with_capacity(BENCH_ITERS);
+                for _ in 0..BENCH_ITERS {
+                    let _pool = ScopedPool::new();
+                    cache_cb.seq_len = 0;
+                    let cb = queue_cb.new_command_buffer();
+                    let start = Instant::now();
+                    let _ = block_cb
+                        .forward_prefill_single_cb(
+                            &input,
+                            Some(&cos_freqs),
+                            Some(&sin_freqs),
+                            Some(&mask),
+                            &mut cache_cb,
+                            &registry,
+                            cb,
+                        )
+                        .expect("forward_prefill_single_cb failed");
+                    cb.commit();
+                    cb.wait_until_completed();
+                    assert_cb_ok(cb, "single_cb bench");
+                    latencies.push(start.elapsed());
+                }
+
+                Stats::from_durations(&latencies)
+            };
+
+            let tflops_cb = compute_tflops(seq_len, stats_cb.mean);
+            println!("  single_cb : {}", stats_cb);
+            println!("    estimated TFLOPS: {:.2}", tflops_cb);
+            assert!(
             tflops_cb < 80.0,
             "single_cb TFLOPS ({:.2}) exceeds hardware peak (65.54T)! Measurement is likely wrong",
             tflops_cb
         );
 
-        // ==== Benchmark 2: forward_prefill_graph() (ExecGraph) ====
-        // Fresh queue for graph path
-        let queue_graph = device.new_command_queue();
-        let stats_graph = {
-            let mut cache_graph = LayerKvCache::preallocated(
-                device,
-                NUM_KV_HEADS,
-                HEAD_DIM,
-                MAX_SEQ_LEN,
-                DType::Float16,
+            // ==== Benchmark 2: forward_prefill_graph() (ExecGraph) ====
+            // Fresh queue for graph path
+            let queue_graph = device.new_command_queue();
+            let stats_graph = {
+                let mut cache_graph = LayerKvCache::preallocated(
+                    device,
+                    NUM_KV_HEADS,
+                    HEAD_DIM,
+                    MAX_SEQ_LEN,
+                    DType::Float16,
+                );
+
+                // Warmup
+                let mut last_output = None;
+                for _ in 0..WARMUP_ITERS {
+                    let _pool = ScopedPool::new();
+                    cache_graph.seq_len = 0;
+                    let event = GpuEvent::new(device);
+                    let mut graph = ExecGraph::new(&queue_graph, &event, 64);
+                    let cb = graph.command_buffer();
+                    let out = block_graph
+                        .forward_prefill_single_cb(
+                            &input,
+                            Some(&cos_freqs),
+                            Some(&sin_freqs),
+                            Some(&mask),
+                            &mut cache_graph,
+                            &registry,
+                            cb,
+                        )
+                        .expect("graph warmup failed");
+                    let _t = graph.submit_batch();
+                    graph.sync().expect("graph warmup sync failed");
+                    last_output = Some(out);
+                }
+
+                // Validate output after warmup
+                if let Some(ref out) = last_output {
+                    let out_shape = out.shape();
+                    assert_eq!(
+                        out_shape,
+                        &[seq_len, HIDDEN_SIZE],
+                        "wrong output shape for graph: expected [{}, {}], got {:?}",
+                        seq_len,
+                        HIDDEN_SIZE,
+                        out_shape
+                    );
+                }
+
+                // Benchmark
+                let mut latencies = Vec::with_capacity(BENCH_ITERS);
+                for _ in 0..BENCH_ITERS {
+                    let _pool = ScopedPool::new();
+                    cache_graph.seq_len = 0;
+                    let event = GpuEvent::new(device);
+                    let mut graph = ExecGraph::new(&queue_graph, &event, 64);
+                    let start = Instant::now();
+                    let cb = graph.command_buffer();
+                    let _ = block_graph
+                        .forward_prefill_single_cb(
+                            &input,
+                            Some(&cos_freqs),
+                            Some(&sin_freqs),
+                            Some(&mask),
+                            &mut cache_graph,
+                            &registry,
+                            cb,
+                        )
+                        .expect("forward_prefill_graph failed");
+                    let _t = graph.submit_batch();
+                    graph.sync().expect("graph sync failed");
+                    latencies.push(start.elapsed());
+                }
+
+                Stats::from_durations(&latencies)
+            };
+
+            let tflops_graph = compute_tflops(seq_len, stats_graph.mean);
+            let graph_speedup = stats_cb.mean / stats_graph.mean;
+            println!(
+                "  graph     : {}   speedup={:.2}x",
+                stats_graph, graph_speedup
+            );
+            println!("    estimated TFLOPS: {:.2}", tflops_graph);
+            assert!(
+                tflops_graph < 80.0,
+                "graph TFLOPS ({:.2}) exceeds hardware peak (65.54T)! Measurement is likely wrong",
+                tflops_graph
             );
 
-            // Warmup
-            let mut last_output = None;
-            for _ in 0..WARMUP_ITERS {
-                let _pool = ScopedPool::new();
-                cache_graph.seq_len = 0;
-                let event = GpuEvent::new(device);
-                let mut graph = ExecGraph::new(&queue_graph, &event, 64);
-                let cb = graph.command_buffer();
-                let out = block_graph
-                    .forward_prefill_single_cb(
-                        &input,
-                        Some(&cos_freqs),
-                        Some(&sin_freqs),
-                        Some(&mask),
-                        &mut cache_graph,
-                        &registry,
-                        cb,
-                    )
-                    .expect("graph warmup failed");
-                let _t = graph.submit_batch();
-                graph.sync().expect("graph warmup sync failed");
-                last_output = Some(out);
-            }
+            (stats_cb, stats_graph)
+        }; // drop queues, caches, and ExecGraph state
 
-            // Validate output after warmup
-            if let Some(ref out) = last_output {
-                let out_shape = out.shape();
-                assert_eq!(
-                    out_shape,
-                    &[seq_len, HIDDEN_SIZE],
-                    "wrong output shape for graph: expected [{}, {}], got {:?}",
-                    seq_len,
-                    HIDDEN_SIZE,
-                    out_shape
-                );
-            }
+        // Let Metal driver fully drain GPU resources before next seq_len
+        std::thread::sleep(std::time::Duration::from_millis(100));
 
-            // Benchmark
-            let mut latencies = Vec::with_capacity(BENCH_ITERS);
-            for _ in 0..BENCH_ITERS {
-                let _pool = ScopedPool::new();
-                cache_graph.seq_len = 0;
-                let event = GpuEvent::new(device);
-                let mut graph = ExecGraph::new(&queue_graph, &event, 64);
-                let start = Instant::now();
-                let cb = graph.command_buffer();
-                let _ = block_graph
-                    .forward_prefill_single_cb(
-                        &input,
-                        Some(&cos_freqs),
-                        Some(&sin_freqs),
-                        Some(&mask),
-                        &mut cache_graph,
-                        &registry,
-                        cb,
-                    )
-                    .expect("forward_prefill_graph failed");
-                let _t = graph.submit_batch();
-                graph.sync().expect("graph sync failed");
-                latencies.push(start.elapsed());
-            }
-
-            Stats::from_durations(&latencies)
-        };
-
-        let tflops_graph = compute_tflops(seq_len, stats_graph.mean);
-        let graph_speedup = stats_cb.mean / stats_graph.mean;
-        println!(
-            "  graph     : {}   speedup={:.2}x",
-            stats_graph, graph_speedup
-        );
-        println!("    estimated TFLOPS: {:.2}", tflops_graph);
-        assert!(
-            tflops_graph < 80.0,
-            "graph TFLOPS ({:.2}) exceeds hardware peak (65.54T)! Measurement is likely wrong",
-            tflops_graph
-        );
-
-        results.push((seq_len, stats_cb, stats_graph));
+        results.push((seq_len, stats_cb_out, stats_graph_out));
     }
 
     // ---- Comparison summary table ----
