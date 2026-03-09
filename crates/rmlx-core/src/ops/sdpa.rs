@@ -3043,10 +3043,10 @@ kernel void sdpa_prefill_nax_f16(
         // S_frag is a 16×32 fragment. For P@V MMA(16,32,16), the left input
         // is 16×16 (8 elems). We split S into two halves: P_frag[0] = first
         // 16 K-cols, P_frag[1] = next 16 K-cols, and iterate ik=0,1.
-        half P_frag[2][8];
+        float P_frag[2][8];
         for (int ik = 0; ik < 2; ik++)
             for (int e = 0; e < 8; e++)
-                P_frag[ik][e] = half(S_frag[ik * 8 + e]);
+                P_frag[ik][e] = S_frag[ik * 8 + e];
 
         // ── Step 6: O += P @ V ──────────────────────────────────────────
         // For each of TD=4 output D-subtiles (each 16×32 = 16 elems):
@@ -3130,6 +3130,115 @@ kernel void sdpa_prefill_nax_f16(
         }
     }
 }
+
+"#;
+
+pub const SDPA_NAX_DIAG_SHADER_SOURCE: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup>
+using namespace metal;
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+
+// Minimal NAX coordinate helpers (copied, no function constants)
+inline short nax_fm(uint slid) {
+    short qid = short(slid) >> 2;
+    return ((qid & 4) | ((short(slid) >> 1) & 3));
+}
+inline short nax_fn(uint slid) {
+    short qid = short(slid) >> 2;
+    return ((qid & 2) | (short(slid) & 1)) * 4;
+}
+
+// Minimal diagnostic: single 16x16 @ 16x32^T MMA, NO accumulation loop
+// Tests whether cooperative tensor element mapping is correct
+// Q: [16, 16] half, K: [32, 16] half, S_out: [16, 32] float
+kernel void sdpa_nax_diag_single_mma(
+    device const half*  Q      [[buffer(0)]],   // [16, 16]
+    device const half*  K      [[buffer(1)]],   // [32, 16]
+    device float*       S_out  [[buffer(2)]],   // [16, 32]
+    uint  sgid   [[simdgroup_index_in_threadgroup]],
+    uint  slid   [[thread_index_in_simdgroup]])
+{
+    if (sgid != 0) return;
+
+    const short fm = nax_fm(slid);
+    const short fn = nax_fn(slid);
+
+    // MLX pattern: pre-offset pointers by per-lane coordinates
+    const device half* Q_lane = Q + fm * 16 + fn;   // Q[fm, fn]
+    const device half* K_lane = K + fm * 16 + fn;   // K[fm, fn]
+    device float* S_lane = S_out + fm * 32 + fn;    // S[fm, fn]
+
+    // Load Q: 16x16 fragment using MLX's sc={0,0} pattern
+    // All lanes use same relative offsets, but pointers differ per lane
+    half Q_frag[8];
+    Q_frag[0] = Q_lane[0 * 16 + 0];
+    Q_frag[1] = Q_lane[0 * 16 + 1];
+    Q_frag[2] = Q_lane[0 * 16 + 2];
+    Q_frag[3] = Q_lane[0 * 16 + 3];
+    Q_frag[4] = Q_lane[8 * 16 + 0];
+    Q_frag[5] = Q_lane[8 * 16 + 1];
+    Q_frag[6] = Q_lane[8 * 16 + 2];
+    Q_frag[7] = Q_lane[8 * 16 + 3];
+
+    // Load K: 32x16 as two 16x16 blocks
+    half K_frag[16];
+    // Block 0: K[0..15, 0..15]
+    K_frag[0] = K_lane[0 * 16 + 0];
+    K_frag[1] = K_lane[0 * 16 + 1];
+    K_frag[2] = K_lane[0 * 16 + 2];
+    K_frag[3] = K_lane[0 * 16 + 3];
+    K_frag[4] = K_lane[8 * 16 + 0];
+    K_frag[5] = K_lane[8 * 16 + 1];
+    K_frag[6] = K_lane[8 * 16 + 2];
+    K_frag[7] = K_lane[8 * 16 + 3];
+    // Block 1: K[16..31, 0..15]
+    const device half* K_lane1 = K_lane + 16 * 16;
+    K_frag[8]  = K_lane1[0 * 16 + 0];
+    K_frag[9]  = K_lane1[0 * 16 + 1];
+    K_frag[10] = K_lane1[0 * 16 + 2];
+    K_frag[11] = K_lane1[0 * 16 + 3];
+    K_frag[12] = K_lane1[8 * 16 + 0];
+    K_frag[13] = K_lane1[8 * 16 + 1];
+    K_frag[14] = K_lane1[8 * 16 + 2];
+    K_frag[15] = K_lane1[8 * 16 + 3];
+
+    // MMA
+    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+        16, 32, 16, false, true, true,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+
+    mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+    auto ct_a = op.template get_left_input_cooperative_tensor<half, half, float>();
+    auto ct_b = op.template get_right_input_cooperative_tensor<half, half, float>();
+    auto ct_c = op.template get_destination_cooperative_tensor<decltype(ct_a), decltype(ct_b), float>();
+
+    for (int e = 0; e < 8; e++) ct_a[e] = Q_frag[e];
+    for (int e = 0; e < 16; e++) ct_b[e] = K_frag[e];
+    for (int e = 0; e < 16; e++) ct_c[e] = 0.0f;
+
+    op.run(ct_a, ct_b, ct_c);
+
+    // Store using MLX pattern: pre-offset pointer + 0-offset
+    // First 16x16 sub-frag (cols 0..15)
+    S_lane[0 * 32 + 0] = ct_c[0];
+    S_lane[0 * 32 + 1] = ct_c[1];
+    S_lane[0 * 32 + 2] = ct_c[2];
+    S_lane[0 * 32 + 3] = ct_c[3];
+    S_lane[8 * 32 + 0] = ct_c[4];
+    S_lane[8 * 32 + 1] = ct_c[5];
+    S_lane[8 * 32 + 2] = ct_c[6];
+    S_lane[8 * 32 + 3] = ct_c[7];
+    // Second 16x16 sub-frag (cols 16..31)
+    S_lane[0 * 32 + 16 + 0] = ct_c[8];
+    S_lane[0 * 32 + 16 + 1] = ct_c[9];
+    S_lane[0 * 32 + 16 + 2] = ct_c[10];
+    S_lane[0 * 32 + 16 + 3] = ct_c[11];
+    S_lane[8 * 32 + 16 + 0] = ct_c[12];
+    S_lane[8 * 32 + 16 + 1] = ct_c[13];
+    S_lane[8 * 32 + 16 + 2] = ct_c[14];
+    S_lane[8 * 32 + 16 + 3] = ct_c[15];
+}
 "#;
 
 pub fn register(registry: &KernelRegistry) -> Result<(), KernelError> {
@@ -3138,6 +3247,7 @@ pub fn register(registry: &KernelRegistry) -> Result<(), KernelError> {
     registry.register_jit_source("sdpa_mma", SDPA_MMA_SHADER_SOURCE)?;
     registry.register_jit_source("sdpa_mma_bk32", SDPA_MMA_BK32_SHADER_SOURCE)?;
     registry.register_jit_source("sdpa_nax", SDPA_NAX_SHADER_SOURCE)?;
+    registry.register_jit_source("sdpa_nax_diag", SDPA_NAX_DIAG_SHADER_SOURCE)?;
     Ok(())
 }
 
@@ -4055,6 +4165,70 @@ pub fn sdpa_prefill_nax_f16_into_cb(
     Ok(out)
 }
 
+/// Diagnostic: compute only Q@K^T using NAX MMA, output float S matrix.
+/// For debugging cooperative tensor element mapping.
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_nax_diag_qkt_into_cb(
+    registry: &KernelRegistry,
+    q: &Array, // [N, D] f16
+    k: &Array, // [S, D] f16
+    seq_len: usize,
+    kv_len: usize,
+    head_dim: usize,
+    scale: f32,
+    cb: &metal::CommandBufferRef,
+) -> Result<Array, KernelError> {
+    let pipeline = registry.get_pipeline("sdpa_nax_diag_qkt_f16", DType::Float16)?;
+    let dev = registry.device().raw();
+
+    let out = Array::zeros(dev, &[seq_len * kv_len], DType::Float32);
+
+    let n_val = seq_len as u32;
+    let s_val = kv_len as u32;
+    let d_val = head_dim as u32;
+
+    let encoder = cb.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(q.metal_buffer()), q.offset() as u64);
+    encoder.set_buffer(1, Some(k.metal_buffer()), k.offset() as u64);
+    encoder.set_buffer(2, Some(out.metal_buffer()), 0);
+    encoder.set_bytes(3, 4, &n_val as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(4, 4, &s_val as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(5, 4, &d_val as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(6, 4, &scale as *const f32 as *const std::ffi::c_void);
+
+    // Single threadgroup: 128 threads (4 SG), processes up to 64 Q rows
+    encoder.dispatch_thread_groups(metal::MTLSize::new(1, 1, 1), metal::MTLSize::new(128, 1, 1));
+    encoder.end_encoding();
+
+    Ok(out)
+}
+
+/// Diagnostic: single MMA Q@K^T (no accumulation loop).
+/// Q: [16, 16] f16, K: [32, 16] f16 → S: [16, 32] f32
+pub fn sdpa_nax_diag_single_mma_into_cb(
+    registry: &KernelRegistry,
+    q: &Array, // [16*16] f16
+    k: &Array, // [32*16] f16
+    cb: &metal::CommandBufferRef,
+) -> Result<Array, KernelError> {
+    let pipeline = registry.get_pipeline("sdpa_nax_diag_single_mma", DType::Float16)?;
+    let dev = registry.device().raw();
+
+    let out = Array::zeros(dev, &[16 * 32], DType::Float32);
+
+    let encoder = cb.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(q.metal_buffer()), q.offset() as u64);
+    encoder.set_buffer(1, Some(k.metal_buffer()), k.offset() as u64);
+    encoder.set_buffer(2, Some(out.metal_buffer()), 0);
+
+    encoder.dispatch_thread_groups(metal::MTLSize::new(1, 1, 1), metal::MTLSize::new(128, 1, 1));
+    encoder.end_encoding();
+
+    Ok(out)
+}
+
 /// Batched multi-head SDPA decode — single GPU dispatch for ALL heads.
 ///
 /// Replaces the per-head loop in `sdpa_batched_into_cb` with a single
@@ -4755,6 +4929,12 @@ mod tests {
             .fold(0.0f32, f32::max)
     }
 
+    fn read_f32_array(arr: &Array) -> Vec<f32> {
+        let ptr = arr.metal_buffer().contents() as *const f32;
+        let len = arr.numel();
+        unsafe { std::slice::from_raw_parts(ptr, len).to_vec() }
+    }
+
     #[test]
     fn test_gqa_prefill_ratio4_seq64() {
         let (registry, queue) = setup_with_copy();
@@ -5109,6 +5289,135 @@ kernel void metal32_probe(device float* out [[buffer(0)]], uint tid [[thread_pos
             );
             eprintln!("  BK32 seq_len={seq_len:>4}: max_abs_diff={diff:.6} (tol={tol})");
         }
+    }
+
+    #[test]
+    fn test_sdpa_nax_diag_qkt() {
+        let (registry, queue) = setup_with_copy();
+
+        // Minimal: Q=[16,16], K=[32,16], S=[16,32]
+        let q_data = pseudo_random(16 * 16, 42);
+        let k_data = pseudo_random(32 * 16, 137);
+
+        let q = make_f16_array(&registry, &queue, &q_data, vec![16 * 16]);
+        let k = make_f16_array(&registry, &queue, &k_data, vec![32 * 16]);
+
+        // GPU
+        let cb = queue.new_command_buffer();
+        let s_out = sdpa_nax_diag_single_mma_into_cb(&registry, &q, &k, cb).unwrap();
+        cb.commit();
+        cb.wait_until_completed();
+        let s_gpu = read_f32_array(&s_out);
+
+        // CPU reference: S = Q @ K^T where Q=[16,16], K=[32,16]
+        let q_f16 = read_f16_as_f32(&registry, &queue, &q);
+        let k_f16 = read_f16_as_f32(&registry, &queue, &k);
+
+        let mut s_ref = vec![0.0f32; 16 * 32];
+        for i in 0..16 {
+            for j in 0..32 {
+                let mut dot = 0.0f32;
+                for d in 0..16 {
+                    dot += q_f16[i * 16 + d] * k_f16[j * 16 + d];
+                }
+                s_ref[i * 32 + j] = dot;
+            }
+        }
+
+        let diff = max_abs_diff(&s_ref, &s_gpu);
+        eprintln!("NAX single MMA Q@K^T: max_abs_diff={diff:.6}");
+        eprintln!("  GPU S[0,0..8]: {:?}", &s_gpu[0..8]);
+        eprintln!("  REF S[0,0..8]: {:?}", &s_ref[0..8]);
+        eprintln!("  GPU S[1,0..8]: {:?}", &s_gpu[32..40]);
+        eprintln!("  REF S[1,0..8]: {:?}", &s_ref[32..40]);
+
+        // Also print S[0, 16..24] to check second sub-frag
+        eprintln!("  GPU S[0,16..24]: {:?}", &s_gpu[16..24]);
+        eprintln!("  REF S[0,16..24]: {:?}", &s_ref[16..24]);
+
+        // === All-ones test: Q=1, K=1, expect S=16 everywhere ===
+        {
+            let ones_q: Vec<f32> = vec![1.0; 16 * 16];
+            let ones_k: Vec<f32> = vec![1.0; 32 * 16];
+
+            let q_ones = make_f16_array(&registry, &queue, &ones_q, vec![16 * 16]);
+            let k_ones = make_f16_array(&registry, &queue, &ones_k, vec![32 * 16]);
+
+            let cb2 = queue.new_command_buffer();
+            let s_ones =
+                sdpa_nax_diag_single_mma_into_cb(&registry, &q_ones, &k_ones, cb2).unwrap();
+            cb2.commit();
+            cb2.wait_until_completed();
+            let s_ones_gpu = read_f32_array(&s_ones);
+
+            eprintln!("\n=== All-ones test (expect 16.0 everywhere) ===");
+            eprintln!("  GPU S[0,0..8]: {:?}", &s_ones_gpu[0..8]);
+            eprintln!("  GPU S[1,0..8]: {:?}", &s_ones_gpu[32..40]);
+            eprintln!("  GPU S[0,16..24]: {:?}", &s_ones_gpu[16..24]);
+            eprintln!(
+                "  GPU S[15,24..32]: {:?}",
+                &s_ones_gpu[15 * 32 + 24..15 * 32 + 32]
+            );
+
+            let expected_16: Vec<f32> = vec![16.0; 16 * 32];
+            let ones_diff = max_abs_diff(&expected_16, &s_ones_gpu);
+            eprintln!("  max_abs_diff from 16.0: {ones_diff:.6}");
+        }
+
+        // === Identity K test: K=I → S=Q@I^T → S[:,:16]=Q, S[:,16:]=0 ===
+        {
+            // Q[i,j] = (i * 16 + j) as f32 — each element encodes its position
+            let mut pos_q = vec![0.0f32; 16 * 16];
+            for i in 0..16 {
+                for j in 0..16 {
+                    pos_q[i * 16 + j] = (i * 16 + j) as f32;
+                }
+            }
+            // K[j,d] = delta(j,d) for j<16, K[j,d]=0 for j>=16
+            let mut id_k = vec![0.0f32; 32 * 16];
+            for d in 0..16 {
+                id_k[d * 16 + d] = 1.0;
+            }
+
+            let q_pos = make_f16_array(&registry, &queue, &pos_q, vec![16 * 16]);
+            let k_id = make_f16_array(&registry, &queue, &id_k, vec![32 * 16]);
+
+            let cb3 = queue.new_command_buffer();
+            let s_id = sdpa_nax_diag_single_mma_into_cb(&registry, &q_pos, &k_id, cb3).unwrap();
+            cb3.commit();
+            cb3.wait_until_completed();
+            let s_id_gpu = read_f32_array(&s_id);
+
+            eprintln!("\n=== Identity K test (S[:,:16] should equal Q, S[:,16:]=0) ===");
+            // Print first few rows of S[:,:16]
+            eprintln!("  S[0,0..16]:  {:?}", &s_id_gpu[0..16]);
+            eprintln!("  Expected:    [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]");
+            eprintln!("  S[1,0..16]:  {:?}", &s_id_gpu[32..48]);
+            eprintln!("  Expected:    [16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]");
+            eprintln!("  S[2,0..16]:  {:?}", &s_id_gpu[64..80]);
+            eprintln!("  Expected:    [32,33,...,47]");
+            // Print S[:,16:] (should be 0)
+            eprintln!("  S[0,16..32]: {:?}", &s_id_gpu[16..32]);
+            eprintln!("  Expected:    all zeros");
+
+            // Check first column: S[i,0] should be Q[i,0] = i*16
+            eprintln!("\n  Column 0 check (S[i,0] should be i*16):");
+            for i in 0..16 {
+                let actual = s_id_gpu[i * 32];
+                let expected = (i * 16) as f32;
+                let marker = if (actual - expected).abs() < 0.1 {
+                    "OK"
+                } else {
+                    "WRONG"
+                };
+                eprintln!("    S[{i},0] = {actual:.1} (expected {expected:.1}) {marker}");
+            }
+        }
+
+        assert!(
+            diff < 0.05,
+            "NAX single MMA Q@K^T: max_abs_diff={diff} (expected < 0.05)"
+        );
     }
 
     #[test]

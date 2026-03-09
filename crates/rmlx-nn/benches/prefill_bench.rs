@@ -44,7 +44,7 @@ const MAX_SEQ_LEN: usize = 2048;
 /// Used to compute TFLOPS: 2 * PARAMS_PER_LAYER * seq_len = total FLOPs.
 const PARAMS_PER_LAYER: f64 = 218_112_000.0;
 
-const SEQ_LENS: &[usize] = &[256];
+const SEQ_LENS: &[usize] = &[128, 256, 512, 1024, 2048];
 const WARMUP_ITERS: usize = 5;
 const BENCH_ITERS: usize = 20;
 
