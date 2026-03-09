@@ -3620,8 +3620,10 @@ pub fn affine_quantized_matmul_batched(
                 Ok(out)
             }
         } else if k >= 4096 || (m <= 128 && n >= 4096) {
-            // --- QLdr path: BM=64 BN=64 BK=32, coalesced dequant B-loader ---
-            affine_quantized_matmul_qldr(registry, x, qw, queue)
+            // --- Steel path: BK=32 + double-buffer, coalesced B loads ---
+            // QLdr (single-buffer) underperforms MMA — Steel is better fallback.
+            // TODO: QLdr double-buffer (8-B') may reclaim this path.
+            affine_quantized_matmul_steel(registry, x, qw, queue)
         } else {
             // --- Standard path: BM=64, BN=64, BK=16 ---
             let m_tiles = m.div_ceil(STD_BM);
@@ -3770,120 +3772,61 @@ pub fn qmm_add_residual_into_cb(
     let dev = registry.device().raw();
     let opts = metal::MTLResourceOptions::StorageModeShared;
 
-    let use_qldr = k >= 4096 || (m <= 128 && n >= 4096);
+    // QLdr single-buffer underperforms MMA — use MMA with residual fusion.
+    // TODO: revisit with QLdr double-buffer (8-B').
+    // --- MMA path: affine_qmm_mma_q4 with has_residual ---
+    let std_bm: usize = 64;
+    let std_bn: usize = 64;
+    let m_tiles = m.div_ceil(std_bm);
+    let n_tiles = n.div_ceil(std_bn);
+    let align_m = m % std_bm == 0;
+    let align_n = n % std_bn == 0;
 
-    if use_qldr && qw.bits == 4 {
-        // --- QLdr path: BM=64, BN=64, BK=32, coalesced dequant B-loader ---
-        // QLdr kernel takes half input; cast f32 → f16 within the same command buffer.
-        let x_half = super::copy::copy_cast_into_cb(registry, x, DType::Float16, cb)?;
+    let q4_constants = [
+        (200u32, FunctionConstantValue::Bool(align_m)),
+        (201u32, FunctionConstantValue::Bool(align_n)),
+        (202u32, FunctionConstantValue::Bool(true)), // has_residual = true
+        (203u32, FunctionConstantValue::Bool(false)),
+        (204u32, FunctionConstantValue::Bool(false)),
+        (205u32, FunctionConstantValue::U32(qw.group_size)),
+    ];
+    let pipeline =
+        registry.get_pipeline_with_constants("affine_qmm_mma_q4", DType::Float32, &q4_constants)?;
+    let out = Array::zeros(dev, &[m, n], DType::Float32);
 
-        const QLDR_BM: usize = 64;
-        const QLDR_BN: usize = 64;
-        let m_tiles = m.div_ceil(QLDR_BM);
-        let n_tiles = n.div_ceil(QLDR_BN);
-        let align_m = m % QLDR_BM == 0;
-        let align_n = n % QLDR_BN == 0;
+    let m_u32 = super::checked_u32(m, "M")?;
+    let n_u32 = super::checked_u32(n, "N")?;
+    let k_u32 = super::checked_u32(k, "K")?;
+    let swizzle_log: u32 = if n_tiles >= 4 { 1 } else { 0 };
 
-        let qldr_constants = [
-            (200u32, FunctionConstantValue::Bool(align_m)),
-            (201u32, FunctionConstantValue::Bool(align_n)),
-            (202u32, FunctionConstantValue::Bool(true)), // has_residual = true
-            (205u32, FunctionConstantValue::U32(qw.group_size)),
-        ];
-        let pipeline = registry.get_pipeline_with_constants(
-            "affine_qmm_qldr_q4",
-            DType::Float32,
-            &qldr_constants,
-        )?;
-        let out = Array::zeros(dev, &[m, n], DType::Float32);
+    let m_buf = dev.new_buffer_with_data(&m_u32 as *const u32 as *const _, 4, opts);
+    let n_buf = dev.new_buffer_with_data(&n_u32 as *const u32 as *const _, 4, opts);
+    let k_buf = dev.new_buffer_with_data(&k_u32 as *const u32 as *const _, 4, opts);
+    let sw_buf = dev.new_buffer_with_data(&swizzle_log as *const u32 as *const _, 4, opts);
+    let dummy_buf = dev.new_buffer(4, opts);
 
-        let m_u32 = super::checked_u32(m, "M")?;
-        let n_u32 = super::checked_u32(n, "N")?;
-        let k_u32 = super::checked_u32(k, "K")?;
-        let swizzle_log: u32 = if n_tiles >= 4 { 1 } else { 0 };
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
+    enc.set_buffer(1, Some(&qw.weights_buf), 0);
+    enc.set_buffer(2, Some(&qw.scales_buf), 0);
+    enc.set_buffer(3, Some(&qw.biases_buf), 0);
+    enc.set_buffer(4, Some(out.metal_buffer()), 0);
+    enc.set_buffer(5, Some(&m_buf), 0);
+    enc.set_buffer(6, Some(&n_buf), 0);
+    enc.set_buffer(7, Some(&k_buf), 0);
+    enc.set_buffer(8, Some(&sw_buf), 0);
+    enc.set_buffer(9, Some(&dummy_buf), 0); // norm_weight (unused)
+    enc.set_buffer(10, Some(&dummy_buf), 0); // inv_rms (unused)
+    enc.set_buffer(11, Some(residual.metal_buffer()), residual.offset() as u64);
+    enc.set_buffer(12, Some(&dummy_buf), 0); // gate_result (unused)
 
-        let m_buf = dev.new_buffer_with_data(&m_u32 as *const u32 as *const _, 4, opts);
-        let n_buf = dev.new_buffer_with_data(&n_u32 as *const u32 as *const _, 4, opts);
-        let k_buf = dev.new_buffer_with_data(&k_u32 as *const u32 as *const _, 4, opts);
-        let sw_buf = dev.new_buffer_with_data(&swizzle_log as *const u32 as *const _, 4, opts);
+    let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
+    let tg = metal::MTLSize::new(64, 1, 1);
+    enc.dispatch_thread_groups(grid, tg);
+    enc.end_encoding();
 
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pipeline);
-        enc.set_buffer(0, Some(x_half.metal_buffer()), x_half.offset() as u64);
-        enc.set_buffer(1, Some(&qw.weights_buf), 0);
-        enc.set_buffer(2, Some(&qw.scales_buf), 0);
-        enc.set_buffer(3, Some(&qw.biases_buf), 0);
-        enc.set_buffer(4, Some(out.metal_buffer()), 0);
-        enc.set_buffer(5, Some(&m_buf), 0);
-        enc.set_buffer(6, Some(&n_buf), 0);
-        enc.set_buffer(7, Some(&k_buf), 0);
-        enc.set_buffer(8, Some(&sw_buf), 0);
-        enc.set_buffer(9, Some(residual.metal_buffer()), residual.offset() as u64);
-
-        let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
-        let tg = metal::MTLSize::new(64, 1, 1);
-        enc.dispatch_thread_groups(grid, tg);
-        enc.end_encoding();
-
-        Ok(out)
-    } else {
-        // --- MMA fallback path: affine_qmm_mma_q4 ---
-        let std_bm: usize = 64;
-        let std_bn: usize = 64;
-        let m_tiles = m.div_ceil(std_bm);
-        let n_tiles = n.div_ceil(std_bn);
-        let align_m = m % std_bm == 0;
-        let align_n = n % std_bn == 0;
-
-        let q4_constants = [
-            (200u32, FunctionConstantValue::Bool(align_m)),
-            (201u32, FunctionConstantValue::Bool(align_n)),
-            (202u32, FunctionConstantValue::Bool(true)), // has_residual = true
-            (203u32, FunctionConstantValue::Bool(false)),
-            (204u32, FunctionConstantValue::Bool(false)),
-            (205u32, FunctionConstantValue::U32(qw.group_size)),
-        ];
-        let pipeline = registry.get_pipeline_with_constants(
-            "affine_qmm_mma_q4",
-            DType::Float32,
-            &q4_constants,
-        )?;
-        let out = Array::zeros(dev, &[m, n], DType::Float32);
-
-        let m_u32 = super::checked_u32(m, "M")?;
-        let n_u32 = super::checked_u32(n, "N")?;
-        let k_u32 = super::checked_u32(k, "K")?;
-        let swizzle_log: u32 = if n_tiles >= 4 { 1 } else { 0 };
-
-        let m_buf = dev.new_buffer_with_data(&m_u32 as *const u32 as *const _, 4, opts);
-        let n_buf = dev.new_buffer_with_data(&n_u32 as *const u32 as *const _, 4, opts);
-        let k_buf = dev.new_buffer_with_data(&k_u32 as *const u32 as *const _, 4, opts);
-        let sw_buf = dev.new_buffer_with_data(&swizzle_log as *const u32 as *const _, 4, opts);
-        let dummy_buf = dev.new_buffer(4, opts);
-
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pipeline);
-        enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
-        enc.set_buffer(1, Some(&qw.weights_buf), 0);
-        enc.set_buffer(2, Some(&qw.scales_buf), 0);
-        enc.set_buffer(3, Some(&qw.biases_buf), 0);
-        enc.set_buffer(4, Some(out.metal_buffer()), 0);
-        enc.set_buffer(5, Some(&m_buf), 0);
-        enc.set_buffer(6, Some(&n_buf), 0);
-        enc.set_buffer(7, Some(&k_buf), 0);
-        enc.set_buffer(8, Some(&sw_buf), 0);
-        enc.set_buffer(9, Some(&dummy_buf), 0); // norm_weight (unused)
-        enc.set_buffer(10, Some(&dummy_buf), 0); // inv_rms (unused)
-        enc.set_buffer(11, Some(residual.metal_buffer()), residual.offset() as u64);
-        enc.set_buffer(12, Some(&dummy_buf), 0); // gate_result (unused)
-
-        let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
-        let tg = metal::MTLSize::new(64, 1, 1);
-        enc.dispatch_thread_groups(grid, tg);
-        enc.end_encoding();
-
-        Ok(out)
-    }
+    Ok(out)
 }
 
 /// Fused QMM + SwiGLU: `output = silu(gate_result) * QMM(x, qw)`.
