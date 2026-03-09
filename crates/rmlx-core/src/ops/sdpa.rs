@@ -2784,9 +2784,9 @@ METAL_FUNC void store_frag_16x16_unsafe(device half* dst, int dst_ld,
 
 // ─── NAX matmul2d descriptors ──────────────────────────────────────────────
 // Q@K^T: MMA(16, 32, 16, trans_a=false, trans_b=true)
-// The output S is 16×32 = two 16×16 sub-fragments.
-// Actually uses MMA(16, 16, 16) since NAX processes 16×16 at a time.
-// We iterate TKs=1 K-subtile of 32 cols = 2 × 16-col fragments.
+// The output S is 16×32 = one fragment with 16 elements/lane.
+// P@V:   MMA(16, 32, 16, trans_a=false, trans_b=false)
+// Left input 16×16 (8 elems), right input 16×32 (16 elems), output 16×32 (16 elems).
 
 // ─── Main NAX SDPA prefill kernel ──────────────────────────────────────────
 //
@@ -2844,21 +2844,20 @@ kernel void sdpa_prefill_nax_f16(
     const short fn = nax_fn(slid);
 
     // MPP matmul2d descriptors (must be inside function, not program scope)
+    // FM=16, FN=32, FK=16 — at least one dim must be 32 for cooperative tensors
     constexpr auto desc_qk = mpp::tensor_ops::matmul2d_descriptor(
-        16, 16, 16, false, true, true,
+        16, 32, 16, false, true, true,
         mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
     constexpr auto desc_pv = mpp::tensor_ops::matmul2d_descriptor(
-        16, 16, 16, false, false, true,
+        16, 32, 16, false, false, true,
         mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
 
-    // ─── Output accumulators: TD=4 subtiles of 1×2 fragments (16×32) ────
-    // Each subtile has 2 fragments × 8 elems = 16 floats.
-    // O_acc[id][frag_idx][elem] — id=0..3, frag_idx=0..1
-    float O_acc[TD][2][8];
+    // ─── Output accumulators: TD=4 subtiles of 16×32 (16 elems/lane) ────
+    // O_acc[id][0..7] = first 16 D-cols, O_acc[id][8..15] = next 16 D-cols
+    float O_acc[TD][16];
     for (int id = 0; id < TD; id++)
-        for (int fi = 0; fi < 2; fi++)
-            for (int e = 0; e < 8; e++)
-                O_acc[id][fi][e] = 0.0f;
+        for (int e = 0; e < 16; e++)
+            O_acc[id][e] = 0.0f;
 
     // ─── Softmax state: per-row (2 rows per lane: fm and fm+8) ──────────
     float row_max[2] = {-INFINITY, -INFINITY};
@@ -2884,12 +2883,11 @@ kernel void sdpa_prefill_nax_f16(
         const int kv_rows_valid = is_last_kv ? (int(S) - kv_start) : BK;
 
         // ── Step 1: Compute S = Q @ K^T ─────────────────────────────────
-        // S is 16×32 = two 16×16 sub-fragments per SG.
-        // S_frag[0][8] = cols 0..15, S_frag[1][8] = cols 16..31
-        float S_frag[2][8];
-        for (int fi = 0; fi < 2; fi++)
-            for (int e = 0; e < 8; e++)
-                S_frag[fi][e] = 0.0f;
+        // S is 16×32 = one MMA(16,32,16) fragment per SG (16 elems/lane).
+        // S_frag[0..7] = first 16 K-cols, S_frag[8..15] = next 16 K-cols
+        float S_frag[16];
+        for (int e = 0; e < 16; e++)
+            S_frag[e] = 0.0f;
 
         // Iterate over D in chunks of UDs=16
         for (int dd = 0; dd < TDs; dd++) {
@@ -2905,57 +2903,65 @@ kernel void sdpa_prefill_nax_f16(
                 load_frag_16x16_unsafe(Q_frag, Q_ptr, BD, fm, fn);
             }
 
-            // For each of the 2 K sub-fragments (16 cols each in K dim)
-            for (int ki = 0; ki < 2; ki++) {
-                // Load K fragment: K is [kv_len, BD], we want K^T.
-                // K^T[D, kv_len]: row=dd*16+.., col=kv_start+ki*16+..
-                // Equivalently: K[kv_start+ki*16+row, dd*16+col] transposed.
-                // For desc_qk (trans_b=true), B input is K in original layout,
-                // and the MMA transposes it internally.
-                // So load K[kv_start+ki*16.., dd*16..] as 16×16.
-                half K_frag[8];
-                int k_row_start = kv_start + ki * 16;
-                const device half* K_ptr = K_head + k_row_start * BD + dd * UDs;
-                int k_valid = min(16, kv_rows_valid - ki * 16);
-                if (k_valid <= 0) {
+            // Load K fragment as 32×16: two 16×16 stacked vertically.
+            // K is [kv_len, BD], trans_b=true → MMA transposes internally.
+            // K_frag[0..7] = K[kv_start..kv_start+16, dd*16..dd*16+16]
+            // K_frag[8..15] = K[kv_start+16..kv_start+32, dd*16..dd*16+16]
+            half K_frag[16];
+            {
+                const device half* K_ptr0 = K_head + kv_start * BD + dd * UDs;
+                const device half* K_ptr1 = K_head + (kv_start + 16) * BD + dd * UDs;
+                int k_valid0 = min(16, kv_rows_valid);
+                int k_valid1 = min(16, kv_rows_valid - 16);
+
+                // First 16 rows
+                if (k_valid0 <= 0) {
                     for (int e = 0; e < 8; e++) K_frag[e] = half(0);
-                } else if (is_last_kv && k_valid < 16) {
-                    load_frag_16x16(K_frag, K_ptr, BD, fm, fn, k_valid, UDs);
+                } else if (is_last_kv && k_valid0 < 16) {
+                    load_frag_16x16(K_frag, K_ptr0, BD, fm, fn, k_valid0, UDs);
                 } else {
-                    load_frag_16x16_unsafe(K_frag, K_ptr, BD, fm, fn);
+                    load_frag_16x16_unsafe(K_frag, K_ptr0, BD, fm, fn);
                 }
 
-                // MMA: S_frag[ki] += Q_frag @ K_frag^T
-                {
-                    mpp::tensor_ops::matmul2d<desc_qk, metal::execution_simdgroup> qk_op;
-                    auto ct_a = qk_op.template get_left_input_cooperative_tensor<half, half, float>();
-                    auto ct_b = qk_op.template get_right_input_cooperative_tensor<half, half, float>();
-                    auto ct_c = qk_op.template get_destination_cooperative_tensor<decltype(ct_a), decltype(ct_b), float>();
-                    for (int e = 0; e < 8; e++) ct_a[e] = Q_frag[e];
-                    for (int e = 0; e < 8; e++) ct_b[e] = K_frag[e];
-                    for (int e = 0; e < 8; e++) ct_c[e] = S_frag[ki][e];
-                    qk_op.run(ct_a, ct_b, ct_c);
-                    for (int e = 0; e < 8; e++) S_frag[ki][e] = ct_c[e];
+                // Next 16 rows
+                if (k_valid1 <= 0) {
+                    for (int e = 0; e < 8; e++) K_frag[8 + e] = half(0);
+                } else if (is_last_kv && k_valid1 < 16) {
+                    load_frag_16x16(K_frag + 8, K_ptr1, BD, fm, fn, k_valid1, UDs);
+                } else {
+                    load_frag_16x16_unsafe(K_frag + 8, K_ptr1, BD, fm, fn);
                 }
+            }
+
+            // MMA(16,32,16): S_frag += Q @ K^T
+            // ct_a: 8 elems (FM=16, FK=16), ct_b: 16 elems (FN=32, FK=16), ct_c: 16 elems
+            {
+                mpp::tensor_ops::matmul2d<desc_qk, metal::execution_simdgroup> qk_op;
+                auto ct_a = qk_op.template get_left_input_cooperative_tensor<half, half, float>();
+                auto ct_b = qk_op.template get_right_input_cooperative_tensor<half, half, float>();
+                auto ct_c = qk_op.template get_destination_cooperative_tensor<decltype(ct_a), decltype(ct_b), float>();
+                for (int e = 0; e < 8; e++) ct_a[e] = Q_frag[e];
+                for (int e = 0; e < 16; e++) ct_b[e] = K_frag[e];
+                for (int e = 0; e < 16; e++) ct_c[e] = S_frag[e];
+                qk_op.run(ct_a, ct_b, ct_c);
+                for (int e = 0; e < 16; e++) S_frag[e] = ct_c[e];
             }
         }
 
         // ── Step 2: Scale S by scale * log2(e) ─────────────────────────
-        for (int fi = 0; fi < 2; fi++)
-            for (int e = 0; e < 8; e++)
-                S_frag[fi][e] *= scale2;
+        for (int e = 0; e < 16; e++)
+            S_frag[e] *= scale2;
 
         // ── Step 3: Mask out-of-bounds K positions ──────────────────────
         if (is_last_kv) {
-            // S_frag[0] covers K cols 0..15, S_frag[1] covers K cols 16..31
-            // Fragment element (ri, ci): row = fm + ri*8, col = fn + ci
-            // For S_frag[fi]: actual K col = fi*16 + fn + ci
-            for (int fi = 0; fi < 2; fi++) {
+            // S_frag[0..7] covers K cols 0..15, S_frag[8..15] covers K cols 16..31
+            // Sub-frag sf: actual K col = sf*16 + fn + ci
+            for (int sf = 0; sf < 2; sf++) {
                 for (int ri = 0; ri < 2; ri++) {
                     for (int ci = 0; ci < 4; ci++) {
-                        int col = fi * 16 + fn + ci;
+                        int col = sf * 16 + fn + ci;
                         if (col >= kv_rows_valid) {
-                            S_frag[fi][ri * 4 + ci] = -INFINITY;
+                            S_frag[sf * 8 + ri * 4 + ci] = -INFINITY;
                         }
                     }
                 }
@@ -2964,13 +2970,13 @@ kernel void sdpa_prefill_nax_f16(
 
         // ── Step 3b: Causal masking ─────────────────────────────────────
         if (is_causal) {
-            for (int fi = 0; fi < 2; fi++) {
+            for (int sf = 0; sf < 2; sf++) {
                 for (int ri = 0; ri < 2; ri++) {
                     int q_row = int(q_start) + tm + fm + ri * 8;
                     for (int ci = 0; ci < 4; ci++) {
-                        int k_col = kv_start + fi * 16 + fn + ci;
+                        int k_col = kv_start + sf * 16 + fn + ci;
                         if (k_col > q_row) {
-                            S_frag[fi][ri * 4 + ci] = -INFINITY;
+                            S_frag[sf * 8 + ri * 4 + ci] = -INFINITY;
                         }
                     }
                 }
@@ -2980,12 +2986,12 @@ kernel void sdpa_prefill_nax_f16(
         // ── Step 3c: Mask out-of-bounds Q rows ──────────────────────────
         if (is_last_q_block) {
             int q_valid_local = q_rows_valid - int(tm);
-            for (int fi = 0; fi < 2; fi++) {
+            for (int sf = 0; sf < 2; sf++) {
                 for (int ri = 0; ri < 2; ri++) {
                     int row = fm + ri * 8;
                     if (row >= q_valid_local) {
                         for (int ci = 0; ci < 4; ci++)
-                            S_frag[fi][ri * 4 + ci] = -INFINITY;
+                            S_frag[sf * 8 + ri * 4 + ci] = -INFINITY;
                     }
                 }
             }
@@ -2993,17 +2999,18 @@ kernel void sdpa_prefill_nax_f16(
 
         // ── Step 4: Online softmax ──────────────────────────────────────
         // 4a. Row max across the 16×32 S tile
+        // S_frag[0..7] = first 16 cols sub-frag, S_frag[8..15] = second
         float new_max[2];
         for (int ri = 0; ri < 2; ri++) {
-            new_max[ri] = nax_wide_row_reduce<MaxOp>(S_frag[0], S_frag[1], ri);
+            new_max[ri] = nax_wide_row_reduce<MaxOp>(S_frag, S_frag + 8, ri);
             new_max[ri] = max(new_max[ri], row_max[ri]);
         }
 
         // 4b. P = exp2(S - new_max)  (in-place)
-        for (int fi = 0; fi < 2; fi++) {
+        for (int sf = 0; sf < 2; sf++) {
             for (int ri = 0; ri < 2; ri++) {
                 for (int ci = 0; ci < 4; ci++) {
-                    S_frag[fi][ri * 4 + ci] = fast::exp2(S_frag[fi][ri * 4 + ci] - new_max[ri]);
+                    S_frag[sf * 8 + ri * 4 + ci] = fast::exp2(S_frag[sf * 8 + ri * 4 + ci] - new_max[ri]);
                 }
             }
         }
@@ -3018,62 +3025,70 @@ kernel void sdpa_prefill_nax_f16(
         // 4d. Row sum of exp scores
         float new_sum[2];
         for (int ri = 0; ri < 2; ri++) {
-            new_sum[ri] = nax_wide_row_reduce<SumOp>(S_frag[0], S_frag[1], ri);
+            new_sum[ri] = nax_wide_row_reduce<SumOp>(S_frag, S_frag + 8, ri);
             row_sum[ri] = row_sum[ri] * factor[ri] + new_sum[ri];
         }
 
         // 4e. Rescale existing O accumulator
         for (int id = 0; id < TD; id++) {
-            for (int fi = 0; fi < 2; fi++) {
-                for (int ri = 0; ri < 2; ri++) {
-                    for (int ci = 0; ci < 4; ci++) {
-                        O_acc[id][fi][ri * 4 + ci] *= factor[ri];
-                    }
+            for (int ri = 0; ri < 2; ri++) {
+                for (int ci = 0; ci < 4; ci++) {
+                    O_acc[id][ri * 4 + ci] *= factor[ri];
+                    O_acc[id][8 + ri * 4 + ci] *= factor[ri];
                 }
             }
         }
 
         // ── Step 5: S→P retile ──────────────────────────────────────────
-        // S_frag[0..1] are already two 16×16 sub-fragments = P[0..1].
-        // Convert to half for MMA input.
+        // S_frag is a 16×32 fragment. For P@V MMA(16,32,16), the left input
+        // is 16×16 (8 elems). We split S into two halves: P_frag[0] = first
+        // 16 K-cols, P_frag[1] = next 16 K-cols, and iterate ik=0,1.
         half P_frag[2][8];
-        for (int fi = 0; fi < 2; fi++)
+        for (int ik = 0; ik < 2; ik++)
             for (int e = 0; e < 8; e++)
-                P_frag[fi][e] = half(S_frag[fi][e]);
+                P_frag[ik][e] = half(S_frag[ik * 8 + e]);
 
         // ── Step 6: O += P @ V ──────────────────────────────────────────
-        // For each of TD=4 output D-subtiles (each 16×32 = 2 fragments):
+        // For each of TD=4 output D-subtiles (each 16×32 = 16 elems):
         for (int id = 0; id < TD; id++) {
             // For each of TK=2 P subtiles along K dim:
             for (int ik = 0; ik < TK; ik++) {
-                // Load V fragment: V[kv_start+ik*16.., id*32+fi*16..]
-                // V is [kv_len, BD], we load 16×16 blocks.
-                for (int fi = 0; fi < 2; fi++) {
-                    half V_frag[8];
-                    int v_row = kv_start + ik * 16;
-                    int v_col = id * UD + fi * 16;
-                    const device half* V_ptr = V_head + v_row * BD + v_col;
-                    int v_valid = min(16, kv_rows_valid - ik * 16);
-                    if (v_valid <= 0) {
-                        for (int e = 0; e < 8; e++) V_frag[e] = half(0);
-                    } else if (is_last_kv && v_valid < 16) {
-                        load_frag_16x16(V_frag, V_ptr, BD, fm, fn, v_valid, 16);
-                    } else {
-                        load_frag_16x16_unsafe(V_frag, V_ptr, BD, fm, fn);
-                    }
+                // Load V fragment as 16×32: V[kv_start+ik*16.., id*32..]
+                // V is [kv_len, BD]. Two 16×16 sub-frags side by side.
+                // V_frag[0..7] = cols id*32..id*32+16
+                // V_frag[8..15] = cols id*32+16..id*32+32
+                half V_frag[16];
+                int v_row = kv_start + ik * 16;
+                int v_valid = min(16, kv_rows_valid - ik * 16);
+                {
+                    int v_col0 = id * UD;
+                    int v_col1 = id * UD + 16;
+                    const device half* V_ptr0 = V_head + v_row * BD + v_col0;
+                    const device half* V_ptr1 = V_head + v_row * BD + v_col1;
 
-                    // MMA: O_acc[id][fi] += P_frag[ik] @ V_frag
-                    {
-                        mpp::tensor_ops::matmul2d<desc_pv, metal::execution_simdgroup> pv_op;
-                        auto ct_a = pv_op.template get_left_input_cooperative_tensor<float, half, float>();
-                        auto ct_b = pv_op.template get_right_input_cooperative_tensor<float, half, float>();
-                        auto ct_c = pv_op.template get_destination_cooperative_tensor<decltype(ct_a), decltype(ct_b), float>();
-                        for (int e = 0; e < 8; e++) ct_a[e] = P_frag[ik][e];
-                        for (int e = 0; e < 8; e++) ct_b[e] = V_frag[e];
-                        for (int e = 0; e < 8; e++) ct_c[e] = O_acc[id][fi][e];
-                        pv_op.run(ct_a, ct_b, ct_c);
-                        for (int e = 0; e < 8; e++) O_acc[id][fi][e] = ct_c[e];
+                    if (v_valid <= 0) {
+                        for (int e = 0; e < 16; e++) V_frag[e] = half(0);
+                    } else if (is_last_kv && v_valid < 16) {
+                        load_frag_16x16(V_frag, V_ptr0, BD, fm, fn, v_valid, 16);
+                        load_frag_16x16(V_frag + 8, V_ptr1, BD, fm, fn, v_valid, 16);
+                    } else {
+                        load_frag_16x16_unsafe(V_frag, V_ptr0, BD, fm, fn);
+                        load_frag_16x16_unsafe(V_frag + 8, V_ptr1, BD, fm, fn);
                     }
+                }
+
+                // MMA(16,32,16): O_acc[id] += P_frag[ik] @ V_frag
+                // ct_a: 8 elems (16×16 left), ct_b: 16 elems (16×32 right), ct_c: 16 elems
+                {
+                    mpp::tensor_ops::matmul2d<desc_pv, metal::execution_simdgroup> pv_op;
+                    auto ct_a = pv_op.template get_left_input_cooperative_tensor<float, half, float>();
+                    auto ct_b = pv_op.template get_right_input_cooperative_tensor<float, half, float>();
+                    auto ct_c = pv_op.template get_destination_cooperative_tensor<decltype(ct_a), decltype(ct_b), float>();
+                    for (int e = 0; e < 8; e++) ct_a[e] = P_frag[ik][e];
+                    for (int e = 0; e < 16; e++) ct_b[e] = V_frag[e];
+                    for (int e = 0; e < 16; e++) ct_c[e] = O_acc[id][e];
+                    pv_op.run(ct_a, ct_b, ct_c);
+                    for (int e = 0; e < 16; e++) O_acc[id][e] = ct_c[e];
                 }
             }
         }
@@ -3081,18 +3096,18 @@ kernel void sdpa_prefill_nax_f16(
 
     // ─── Final normalization: O /= row_sum ──────────────────────────────
     for (int id = 0; id < TD; id++) {
-        for (int fi = 0; fi < 2; fi++) {
-            for (int ri = 0; ri < 2; ri++) {
-                float inv_sum = (row_sum[ri] > 0.0f) ? (1.0f / row_sum[ri]) : 0.0f;
-                for (int ci = 0; ci < 4; ci++) {
-                    O_acc[id][fi][ri * 4 + ci] *= inv_sum;
-                }
+        for (int ri = 0; ri < 2; ri++) {
+            float inv_sum = (row_sum[ri] > 0.0f) ? (1.0f / row_sum[ri]) : 0.0f;
+            for (int ci = 0; ci < 4; ci++) {
+                O_acc[id][ri * 4 + ci] *= inv_sum;
+                O_acc[id][8 + ri * 4 + ci] *= inv_sum;
             }
         }
     }
 
     // ─── Store output ───────────────────────────────────────────────────
     // O layout: [num_q_heads, N, BD], row-major
+    // O_acc[id][0..7] = first 16 D-cols, O_acc[id][8..15] = next 16 D-cols
     device half* O_base = O_head + (q_start + tm) * BD;
 
     if (is_last_q_block) {
@@ -3100,17 +3115,17 @@ kernel void sdpa_prefill_nax_f16(
         if (fm >= q_valid_local && fm + 8 >= q_valid_local) return;
 
         for (int id = 0; id < TD; id++) {
-            for (int fi = 0; fi < 2; fi++) {
-                int col_base = id * UD + fi * 16;
-                store_frag_16x16(O_base, BD, O_acc[id][fi], fm, short(col_base + fn),
+            for (int sf = 0; sf < 2; sf++) {
+                int col_base = id * UD + sf * 16;
+                store_frag_16x16(O_base, BD, O_acc[id] + sf * 8, fm, short(col_base + fn),
                                   q_valid_local, BD);
             }
         }
     } else {
         for (int id = 0; id < TD; id++) {
-            for (int fi = 0; fi < 2; fi++) {
-                int col_base = id * UD + fi * 16;
-                store_frag_16x16_unsafe(O_base, BD, O_acc[id][fi], fm, short(col_base + fn));
+            for (int sf = 0; sf < 2; sf++) {
+                int col_base = id * UD + sf * 16;
+                store_frag_16x16_unsafe(O_base, BD, O_acc[id] + sf * 8, fm, short(col_base + fn));
             }
         }
     }
