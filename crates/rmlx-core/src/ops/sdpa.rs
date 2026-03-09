@@ -2926,8 +2926,17 @@ kernel void sdpa_prefill_nax_f16(
                 }
 
                 // MMA: S_frag[ki] += Q_frag @ K_frag^T
-                mpp::tensor_ops::matmul2d(desc_qk, S_frag[ki], Q_frag, K_frag, S_frag[ki],
-                                           slid);
+                {
+                    mpp::tensor_ops::matmul2d<desc_qk, metal::execution_simdgroup> qk_op;
+                    auto ct_a = qk_op.template get_left_input_cooperative_tensor<half, half, float>();
+                    auto ct_b = qk_op.template get_right_input_cooperative_tensor<half, half, float>();
+                    auto ct_c = qk_op.template get_destination_cooperative_tensor<decltype(ct_a), decltype(ct_b), float>();
+                    for (int e = 0; e < 8; e++) ct_a[e] = Q_frag[e];
+                    for (int e = 0; e < 8; e++) ct_b[e] = K_frag[e];
+                    for (int e = 0; e < 8; e++) ct_c[e] = S_frag[ki][e];
+                    qk_op.run(ct_a, ct_b, ct_c);
+                    for (int e = 0; e < 8; e++) S_frag[ki][e] = ct_c[e];
+                }
             }
         }
 
@@ -3054,8 +3063,17 @@ kernel void sdpa_prefill_nax_f16(
                     }
 
                     // MMA: O_acc[id][fi] += P_frag[ik] @ V_frag
-                    mpp::tensor_ops::matmul2d(desc_pv, O_acc[id][fi], P_frag[ik], V_frag,
-                                               O_acc[id][fi], slid);
+                    {
+                        mpp::tensor_ops::matmul2d<desc_pv, metal::execution_simdgroup> pv_op;
+                        auto ct_a = pv_op.template get_left_input_cooperative_tensor<float, half, float>();
+                        auto ct_b = pv_op.template get_right_input_cooperative_tensor<float, half, float>();
+                        auto ct_c = pv_op.template get_destination_cooperative_tensor<decltype(ct_a), decltype(ct_b), float>();
+                        for (int e = 0; e < 8; e++) ct_a[e] = P_frag[ik][e];
+                        for (int e = 0; e < 8; e++) ct_b[e] = V_frag[e];
+                        for (int e = 0; e < 8; e++) ct_c[e] = O_acc[id][fi][e];
+                        pv_op.run(ct_a, ct_b, ct_c);
+                        for (int e = 0; e < 8; e++) O_acc[id][fi][e] = ct_c[e];
+                    }
                 }
             }
         }
