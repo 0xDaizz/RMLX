@@ -5618,6 +5618,363 @@ pub fn affine_quantized_matmul_batched(
     result
 }
 
+/// Encode a Q4 quantized matmul into an externally-provided command buffer.
+///
+/// Replicates the exact dispatch logic of [`affine_quantized_matmul_batched`]
+/// (NAX / BatchQMV / Skinny / Standard MMA / Steel) but encodes into `cb`
+/// instead of creating its own command buffer. The caller is responsible for
+/// committing and waiting on `cb`.
+///
+/// This enables pipeline benchmarking where many QMMs are batched into a
+/// single command buffer with one sync at the end.
+///
+/// **Restrictions**: Q4 only, f16 input only (no automatic f32→f16 cast).
+/// The caller must supply f16 `x` and Q4 `qw` with f16 scales/biases
+/// (or accept scale/bias cast overhead encoded into the same CB).
+///
+/// For the Steel sub-path, a separate internal command buffer is created
+/// because Steel manages its own CB lifecycle. This is acceptable since
+/// Steel is selected only at large M where per-op overhead is negligible.
+pub fn affine_quantized_matmul_batched_into_cb(
+    registry: &KernelRegistry,
+    x: &Array,
+    qw: &QuantizedWeight,
+    cb: &metal::CommandBufferRef,
+) -> Result<Array, KernelError> {
+    // Validate: Q4, Float16, 2D
+    if x.dtype() != DType::Float16 {
+        return Err(KernelError::InvalidShape(format!(
+            "affine_quantized_matmul_batched_into_cb requires Float16 input, got {:?}",
+            x.dtype()
+        )));
+    }
+    if x.ndim() != 2 {
+        return Err(KernelError::InvalidShape(format!(
+            "affine_quantized_matmul_batched_into_cb requires 2D input x, got {}D",
+            x.ndim()
+        )));
+    }
+    if x.shape()[1] != qw.in_features {
+        return Err(KernelError::InvalidShape(format!(
+            "x.shape[1] ({}) != in_features ({})",
+            x.shape()[1],
+            qw.in_features
+        )));
+    }
+    if qw.bits != 4 {
+        return Err(KernelError::InvalidShape(format!(
+            "affine_quantized_matmul_batched_into_cb requires bits==4, got {}",
+            qw.bits
+        )));
+    }
+
+    let m = x.shape()[0];
+    let n = qw.out_features;
+    let k = qw.in_features;
+    let dev = registry.device().raw();
+    let opts = metal::MTLResourceOptions::StorageModeShared;
+
+    // Q4 dispatch priority (mirrors affine_quantized_matmul_batched):
+    // 1. NAX: M >= 32, K % 64 == 0
+    // 2. BatchQMV / QMV fast: M <= 16, K % 512 == 0
+    // 3. Skinny MMA: M <= 32
+    // 4. Steel: k >= 4096 or (m <= 128 && n >= 4096) — uses separate CB
+    // 5. Standard MMA: fallback
+
+    const NAX_MIN_M: usize = 32;
+
+    if k % 64 == 0 && m >= NAX_MIN_M {
+        // --- NAX path ---
+        let num_groups = (qw.out_features * qw.in_features) / qw.group_size as usize;
+
+        let scales_f32 = Array::new(
+            qw.scales_buf.clone(),
+            vec![num_groups],
+            vec![1],
+            DType::Float32,
+            0,
+        );
+        let biases_f32 = Array::new(
+            qw.biases_buf.clone(),
+            vec![num_groups],
+            vec![1],
+            DType::Float32,
+            0,
+        );
+
+        let x_f16 = super::copy::copy_into_cb(registry, x, cb)?;
+        let scales_f16 = super::copy::copy_cast_into_cb(registry, &scales_f32, DType::Float16, cb)?;
+        let biases_f16 = super::copy::copy_cast_into_cb(registry, &biases_f32, DType::Float16, cb)?;
+
+        let qw_f16 = QuantizedWeight {
+            weights_buf: qw.weights_buf.clone(),
+            scales_buf: scales_f16.metal_buffer().to_owned(),
+            biases_buf: biases_f16.metal_buffer().to_owned(),
+            group_size: qw.group_size,
+            bits: qw.bits,
+            out_features: qw.out_features,
+            in_features: qw.in_features,
+        };
+
+        return affine_qmm_nax_q4_into_cb(registry, &x_f16, &qw_f16, cb);
+    }
+
+    // --- BatchQMV / QMV fast: M <= 16, K % 512 == 0 ---
+    if m <= 16 && k % 512 == 0 {
+        if m == 1 {
+            // QMV fast f16 into CB
+            let pipeline = registry.get_pipeline("affine_qmv_fast_f16_q4", DType::Float16)?;
+            let vec_1d = x.reshape(vec![k])?;
+            let out = Array::zeros(dev, &[qw.out_features], DType::Float16);
+
+            let params: [u32; 4] = [
+                super::checked_u32(qw.out_features, "out_features")?,
+                super::checked_u32(qw.in_features, "in_features")?,
+                qw.group_size,
+                qw.bits,
+            ];
+            let params_buf = dev.new_buffer_with_data(
+                params.as_ptr() as *const _,
+                (params.len() * std::mem::size_of::<u32>()) as u64,
+                opts,
+            );
+
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&pipeline);
+            enc.set_buffer(0, Some(&qw.weights_buf), 0);
+            enc.set_buffer(1, Some(&qw.scales_buf), 0);
+            enc.set_buffer(2, Some(&qw.biases_buf), 0);
+            enc.set_buffer(3, Some(vec_1d.metal_buffer()), vec_1d.offset() as u64);
+            enc.set_buffer(4, Some(out.metal_buffer()), 0);
+            enc.set_buffer(5, Some(&params_buf), 0);
+
+            let rows_per_tg: u64 = 8;
+            let num_tgs_y = (qw.out_features as u64).div_ceil(rows_per_tg);
+            enc.dispatch_thread_groups(
+                metal::MTLSize::new(1, num_tgs_y, 1),
+                metal::MTLSize::new(64, 1, 1),
+            );
+            enc.end_encoding();
+
+            return out.reshape(vec![1, n]);
+        } else {
+            // Batched QMV f16 into CB
+            let pipeline = registry.get_pipeline("affine_qmv_batched_f16_q4", DType::Float16)?;
+            let out = Array::zeros(dev, &[m, n], DType::Float16);
+
+            let params: [u32; 4] = [
+                super::checked_u32(n, "out_features")?,
+                super::checked_u32(k, "in_features")?,
+                qw.group_size,
+                super::checked_u32(m, "M")?,
+            ];
+            let params_buf = dev.new_buffer_with_data(
+                params.as_ptr() as *const _,
+                (params.len() * std::mem::size_of::<u32>()) as u64,
+                opts,
+            );
+
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&pipeline);
+            enc.set_buffer(0, Some(&qw.weights_buf), 0);
+            enc.set_buffer(1, Some(&qw.scales_buf), 0);
+            enc.set_buffer(2, Some(&qw.biases_buf), 0);
+            enc.set_buffer(3, Some(x.metal_buffer()), x.offset() as u64);
+            enc.set_buffer(4, Some(out.metal_buffer()), 0);
+            enc.set_buffer(5, Some(&params_buf), 0);
+
+            let rows_per_tg: u64 = 8;
+            let num_tgs_y = (n as u64).div_ceil(rows_per_tg);
+            enc.dispatch_thread_groups(
+                metal::MTLSize::new(m as u64, num_tgs_y, 1),
+                metal::MTLSize::new(64, 1, 1),
+            );
+            enc.end_encoding();
+
+            return Ok(out);
+        }
+    }
+
+    const SKINNY_BM: usize = 32;
+    const SKINNY_BN: usize = 64;
+    const SKINNY_BK: usize = 32;
+    const STD_BM: usize = 64;
+    const STD_BN: usize = 64;
+
+    if m <= SKINNY_BM {
+        // --- Skinny MMA into CB ---
+        let sm_tiles = m.div_ceil(SKINNY_BM);
+        let sn_tiles = n.div_ceil(SKINNY_BN);
+
+        let align_m = m % SKINNY_BM == 0;
+        let align_n = n % SKINNY_BN == 0;
+
+        let mn_tgs = sm_tiles * sn_tiles;
+        let target_tgs: usize = 320;
+        let k_tiles_total = k.div_ceil(SKINNY_BK);
+        let k_partitions = if mn_tgs >= target_tgs || k_tiles_total <= 2 {
+            1
+        } else {
+            let desired = (target_tgs / mn_tgs).clamp(2, k_tiles_total.max(2));
+            desired.min(k_tiles_total)
+        };
+
+        let skinny_constants = [
+            (200u32, FunctionConstantValue::Bool(align_m)),
+            (201u32, FunctionConstantValue::Bool(align_n)),
+            (205u32, FunctionConstantValue::U32(qw.group_size)),
+        ];
+        let pipeline = registry.get_pipeline_with_constants(
+            "affine_qmm_skinny_f16_q4",
+            DType::Float16,
+            &skinny_constants,
+        )?;
+
+        let m_u32 = super::checked_u32(m, "M")?;
+        let n_u32 = super::checked_u32(n, "N")?;
+        let k_u32 = super::checked_u32(k, "K")?;
+        let kp_u32 = super::checked_u32(k_partitions, "k_partitions")?;
+
+        let m_buf = dev.new_buffer_with_data(&m_u32 as *const u32 as *const _, 4, opts);
+        let n_buf = dev.new_buffer_with_data(&n_u32 as *const u32 as *const _, 4, opts);
+        let k_buf = dev.new_buffer_with_data(&k_u32 as *const u32 as *const _, 4, opts);
+        let kp_buf = dev.new_buffer_with_data(&kp_u32 as *const u32 as *const _, 4, opts);
+
+        if k_partitions == 1 {
+            let out = Array::zeros(dev, &[m, n], DType::Float16);
+            let dummy_buf = dev.new_buffer(4, opts);
+
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&pipeline);
+            enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
+            enc.set_buffer(1, Some(&qw.weights_buf), 0);
+            enc.set_buffer(2, Some(&qw.scales_buf), 0);
+            enc.set_buffer(3, Some(&qw.biases_buf), 0);
+            enc.set_buffer(4, Some(out.metal_buffer()), 0);
+            enc.set_buffer(5, Some(&m_buf), 0);
+            enc.set_buffer(6, Some(&n_buf), 0);
+            enc.set_buffer(7, Some(&k_buf), 0);
+            enc.set_buffer(8, Some(&kp_buf), 0);
+            enc.set_buffer(9, Some(&dummy_buf), 0);
+
+            let grid = metal::MTLSize::new(sn_tiles as u64, sm_tiles as u64, 1);
+            let tg = metal::MTLSize::new(64, 1, 1);
+            enc.dispatch_thread_groups(grid, tg);
+            enc.end_encoding();
+
+            return Ok(out);
+        } else {
+            // Split-K: partial sums → reduce, both in same CB
+            let partition_stride = m * n;
+            let c_split_size =
+                (k_partitions * partition_stride * std::mem::size_of::<f32>()) as u64;
+            let c_split_buf = dev.new_buffer(c_split_size, opts);
+            let out = Array::zeros(dev, &[m, n], DType::Float16);
+
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&pipeline);
+            enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
+            enc.set_buffer(1, Some(&qw.weights_buf), 0);
+            enc.set_buffer(2, Some(&qw.scales_buf), 0);
+            enc.set_buffer(3, Some(&qw.biases_buf), 0);
+            enc.set_buffer(4, Some(out.metal_buffer()), 0);
+            enc.set_buffer(5, Some(&m_buf), 0);
+            enc.set_buffer(6, Some(&n_buf), 0);
+            enc.set_buffer(7, Some(&k_buf), 0);
+            enc.set_buffer(8, Some(&kp_buf), 0);
+            enc.set_buffer(9, Some(&c_split_buf), 0);
+
+            let grid = metal::MTLSize::new(sn_tiles as u64, sm_tiles as u64, k_partitions as u64);
+            let tg = metal::MTLSize::new(64, 1, 1);
+            enc.dispatch_thread_groups(grid, tg);
+            enc.end_encoding();
+
+            // Reduce phase
+            let reduce_pipeline = registry.get_pipeline_with_constants(
+                "skinny_qmm_f16_reduce",
+                DType::Float16,
+                &[],
+            )?;
+            let mn_total_u32 = super::checked_u32(partition_stride, "mn_total")?;
+            let n_reduce_buf = dev.new_buffer_with_data(&n_u32 as *const u32 as *const _, 4, opts);
+            let kp_reduce_buf =
+                dev.new_buffer_with_data(&kp_u32 as *const u32 as *const _, 4, opts);
+            let mn_buf = dev.new_buffer_with_data(&mn_total_u32 as *const u32 as *const _, 4, opts);
+
+            let enc2 = cb.new_compute_command_encoder();
+            enc2.set_compute_pipeline_state(&reduce_pipeline);
+            enc2.set_buffer(0, Some(&c_split_buf), 0);
+            enc2.set_buffer(1, Some(out.metal_buffer()), 0);
+            enc2.set_buffer(2, Some(&n_reduce_buf), 0);
+            enc2.set_buffer(3, Some(&kp_reduce_buf), 0);
+            enc2.set_buffer(4, Some(&mn_buf), 0);
+
+            let reduce_grid = metal::MTLSize::new(partition_stride as u64, 1, 1);
+            let reduce_tg = metal::MTLSize::new(partition_stride.min(256) as u64, 1, 1);
+            enc2.dispatch_threads(reduce_grid, reduce_tg);
+            enc2.end_encoding();
+
+            return Ok(out);
+        }
+    }
+
+    if k >= 4096 || (m <= 128 && n >= 4096) {
+        // --- Steel path: creates its own CB (Steel manages CB lifecycle) ---
+        // This is acceptable since Steel is selected only at large M where
+        // per-op overhead is negligible relative to compute time.
+        let steel_queue = dev.new_command_queue();
+        let steel_out = affine_quantized_matmul_steel(registry, x, qw, &steel_queue)?;
+        if steel_out.dtype() == DType::Float32 {
+            // Encode f32→f16 cast into the shared CB
+            return super::copy::copy_cast_into_cb(registry, &steel_out, DType::Float16, cb);
+        } else {
+            return Ok(steel_out);
+        }
+    }
+
+    // --- Standard MMA path into CB ---
+    let fc_list = vec![
+        (200u32, FunctionConstantValue::Bool(m % STD_BM == 0)),
+        (201u32, FunctionConstantValue::Bool(n % STD_BN == 0)),
+        (205u32, FunctionConstantValue::U32(qw.group_size)),
+    ];
+    let pipeline =
+        registry.get_pipeline_with_constants("affine_qmm_mma_f16_q4", DType::Float16, &fc_list)?;
+
+    let out = Array::zeros(dev, &[m, n], DType::Float16);
+    let m_tiles = m.div_ceil(STD_BM);
+    let n_tiles = n.div_ceil(STD_BN);
+
+    let m_u32 = super::checked_u32(m, "M")?;
+    let n_u32 = super::checked_u32(n, "N")?;
+    let k_u32 = super::checked_u32(k, "K")?;
+    let swizzle_log: u32 = if n_tiles >= 4 { 1 } else { 0 };
+
+    let m_buf = dev.new_buffer_with_data(&m_u32 as *const u32 as *const _, 4, opts);
+    let n_buf = dev.new_buffer_with_data(&n_u32 as *const u32 as *const _, 4, opts);
+    let k_buf = dev.new_buffer_with_data(&k_u32 as *const u32 as *const _, 4, opts);
+    let sw_buf = dev.new_buffer_with_data(&swizzle_log as *const u32 as *const _, 4, opts);
+
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
+    enc.set_buffer(1, Some(&qw.weights_buf), 0);
+    enc.set_buffer(2, Some(&qw.scales_buf), 0);
+    enc.set_buffer(3, Some(&qw.biases_buf), 0);
+    enc.set_buffer(4, Some(out.metal_buffer()), 0);
+    enc.set_buffer(5, Some(&m_buf), 0);
+    enc.set_buffer(6, Some(&n_buf), 0);
+    enc.set_buffer(7, Some(&k_buf), 0);
+    enc.set_buffer(8, Some(&sw_buf), 0);
+
+    let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
+    let tg = metal::MTLSize::new(64, 1, 1);
+    enc.dispatch_thread_groups(grid, tg);
+    enc.end_encoding();
+
+    Ok(out)
+}
+
 /// Fused QMM + residual add: `output = QMM(x, qw) + residual`.
 ///
 /// Encodes into an existing command buffer. Only Q4 (M > 32).
