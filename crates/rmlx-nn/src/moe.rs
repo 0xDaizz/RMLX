@@ -439,17 +439,11 @@ impl MoeLayer {
         // Gate logits: [seq_len, num_experts]
         let gate_logits = gate.forward(x, registry, queue)?;
 
-        // gpu_topk_route requires Float32 logits — cast if necessary
-        let gate_logits_f32 = if gate_logits.dtype() != DType::Float32 {
-            ops::copy::copy_cast(registry, &gate_logits, DType::Float32, queue)?
-        } else {
-            gate_logits
-        };
-
         // ── GPU top-k routing: eliminates the GPU→CPU→GPU round-trip ──
+        // gpu_topk_route accepts f16 natively (f32 accumulation inside)
         let route_result = ops::topk_route::gpu_topk_route(
             registry,
-            &gate_logits_f32,
+            &gate_logits,
             top_k,
             self.expert_bias.as_ref(),
             queue,
@@ -571,16 +565,7 @@ impl MoeLayer {
         registry: &KernelRegistry,
         queue: &metal::CommandQueue,
     ) -> Result<Array, KernelError> {
-        // The combine exchange operates on Vec<f32>; non-f32 dtypes would
-        // require a cast before combine. Guard against this for now.
-        if x.dtype() != DType::Float32 {
-            return Err(KernelError::InvalidShape(format!(
-                "EP exchange_and_compute requires Float32 input, got {:?}. \
-                 Non-f32 EP support requires adding a dtype cast before combine.",
-                x.dtype()
-            )));
-        }
-
+        let input_dtype = x.dtype();
         let seq_len = x.shape()[0];
         let hidden_dim = self.config.hidden_dim;
         let top_k = self.config.num_experts_per_token;
@@ -664,9 +649,13 @@ impl MoeLayer {
 
             // Read expert output back to CPU f32 for combine.
             // The combine exchange operates on Vec<f32> per expert.
-            // For non-f32 dtypes, we would need a cast here; for now we
-            // assert f32 since the combine path requires it.
-            let out_f32: Vec<f32> = expert_out.to_vec_checked::<f32>();
+            // For non-f32 dtypes, cast to f32 on GPU before readback.
+            let expert_out_f32 = if expert_out.dtype() != DType::Float32 {
+                ops::copy::copy_cast(registry, &expert_out, DType::Float32, queue)?
+            } else {
+                expert_out
+            };
+            let out_f32: Vec<f32> = expert_out_f32.to_vec_checked::<f32>();
             expert_outputs.push(out_f32);
         }
 
@@ -706,8 +695,13 @@ impl MoeLayer {
             )
             .map_err(|e| KernelError::InvalidShape(format!("EP combine failed: {e}")))?;
 
-        // Convert combined f32 output back to Array
+        // Convert combined f32 output back to Array, casting to input dtype if needed
         let output = Array::from_slice(dev, &combined_f32, vec![seq_len, hidden_dim]);
+        let output = if input_dtype != DType::Float32 {
+            ops::copy::copy_cast(registry, &output, input_dtype, queue)?
+        } else {
+            output
+        };
 
         Ok(output)
     }

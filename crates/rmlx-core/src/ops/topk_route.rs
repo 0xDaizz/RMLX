@@ -16,6 +16,7 @@
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
+use crate::ops;
 use metal::MTLSize;
 
 // ---------------------------------------------------------------------------
@@ -414,7 +415,7 @@ fn make_u32_buf(device: &metal::DeviceRef, val: u32) -> metal::Buffer {
 /// All computation stays on the GPU with zero CPU synchronization.
 ///
 /// # Arguments
-/// - `gate_logits`: Raw gate logits `[N, E]`, Float32 (NOT pre-softmaxed).
+/// - `gate_logits`: Raw gate logits `[N, E]`, Float16 or Float32 (NOT pre-softmaxed).
 /// - `top_k`: Number of experts to select per token (typically 2 or 8, max 8).
 /// - `expert_bias`: Optional `[E]` bias added to logits before softmax (adaptive routing).
 /// - `queue`: Metal command queue for dispatch.
@@ -454,12 +455,24 @@ pub fn gpu_topk_route_into_cb(
             gate_logits.ndim()
         )));
     }
-    if gate_logits.dtype() != DType::Float32 {
+    if gate_logits.dtype() != DType::Float32 && gate_logits.dtype() != DType::Float16 {
         return Err(KernelError::InvalidShape(format!(
-            "gpu_topk_route: gate_logits must be Float32, got {:?}",
+            "gpu_topk_route: gate_logits must be Float16 or Float32, got {:?}",
             gate_logits.dtype()
         )));
     }
+
+    // Softmax/topk requires f32 precision to avoid overflow/underflow.
+    // Cast f16 → f32 internally so callers can pass f16 directly.
+    let gate_logits_f32_owned;
+    let gate_logits_f32: &Array = if gate_logits.dtype() != DType::Float32 {
+        gate_logits_f32_owned =
+            ops::copy::copy_cast_into_cb(registry, gate_logits, DType::Float32, cb)?;
+        &gate_logits_f32_owned
+    } else {
+        gate_logits
+    };
+
     if top_k == 0 || top_k > 8 {
         return Err(KernelError::InvalidShape(format!(
             "gpu_topk_route: top_k must be in [1, 8], got {top_k}"
@@ -495,13 +508,23 @@ pub fn gpu_topk_route_into_cb(
                 bias.shape()[0]
             )));
         }
-        if bias.dtype() != DType::Float32 {
+        if bias.dtype() != DType::Float32 && bias.dtype() != DType::Float16 {
             return Err(KernelError::InvalidShape(format!(
-                "gpu_topk_route: expert_bias must be Float32, got {:?}",
+                "gpu_topk_route: expert_bias must be Float16 or Float32, got {:?}",
                 bias.dtype()
             )));
         }
     }
+
+    // Cast expert_bias to f32 if needed (same reasoning as gate_logits)
+    let bias_f32_owned;
+    let expert_bias_f32: Option<&Array> = match expert_bias {
+        Some(bias) if bias.dtype() != DType::Float32 => {
+            bias_f32_owned = ops::copy::copy_cast_into_cb(registry, bias, DType::Float32, cb)?;
+            Some(&bias_f32_owned)
+        }
+        other => other,
+    };
 
     let seq_len_u32 = super::checked_u32(seq_len, "seq_len")?;
     let num_experts_u32 = super::checked_u32(num_experts, "num_experts")?;
@@ -524,7 +547,7 @@ pub fn gpu_topk_route_into_cb(
     let dummy_bias_buf;
     let bias_buffer;
     let bias_offset: u64;
-    if let Some(bias) = expert_bias {
+    if let Some(bias) = expert_bias_f32 {
         bias_buffer = bias.metal_buffer();
         bias_offset = bias.offset() as u64;
     } else {
@@ -550,8 +573,8 @@ pub fn gpu_topk_route_into_cb(
         enc.set_compute_pipeline_state(&pipeline);
         enc.set_buffer(
             0,
-            Some(gate_logits.metal_buffer()),
-            gate_logits.offset() as u64,
+            Some(gate_logits_f32.metal_buffer()),
+            gate_logits_f32.offset() as u64,
         );
         enc.set_buffer(1, Some(bias_buffer), bias_offset);
         enc.set_buffer(2, Some(expert_indices.metal_buffer()), 0);
@@ -774,6 +797,40 @@ mod tests {
         assert!(
             (sum - 1.0).abs() < 1e-4,
             "weights should sum to 1.0, got {sum}"
+        );
+    }
+
+    #[test]
+    fn test_topk_route_f16_input() {
+        let (device, queue, registry) = setup();
+        crate::ops::copy::register(&registry).expect("register copy kernels");
+
+        // 2 tokens, 4 experts, top-1
+        let logits_f32: Vec<f32> = vec![
+            1.0, 5.0, 0.5, 4.0, // token 0: expert 1 dominant
+            3.0, 0.1, 0.2, 0.1, // token 1: expert 0 dominant
+        ];
+        let gate_f32 = Array::from_slice(&device, &logits_f32, vec![2, 4]);
+
+        // Cast to f16 to simulate f16 activation pipeline
+        let gate_f16 =
+            crate::ops::copy::copy_cast(&registry, &gate_f32, DType::Float16, &queue).unwrap();
+        assert_eq!(gate_f16.dtype(), DType::Float16);
+
+        let result = gpu_topk_route(&registry, &gate_f16, 1, None, &queue)
+            .expect("gpu_topk_route with f16 input");
+
+        let indices = result.expert_indices.to_vec_checked::<u32>();
+        assert_eq!(indices[0], 1, "token 0 should select expert 1");
+        assert_eq!(indices[1], 0, "token 1 should select expert 0");
+
+        // Weights should still be f32 (output is always f32)
+        assert_eq!(result.expert_weights.dtype(), DType::Float32);
+        let weights = result.expert_weights.to_vec_checked::<f32>();
+        assert!(
+            (weights[0] - 1.0).abs() < 1e-3,
+            "top-1 weight should be ~1.0, got {}",
+            weights[0]
         );
     }
 }
