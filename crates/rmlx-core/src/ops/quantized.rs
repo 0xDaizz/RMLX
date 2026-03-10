@@ -767,6 +767,330 @@ kernel void gptq_dequant_f32(
     float scale = scales[group * out_features + col];
     output[row * out_features + col] = scale * (float(nibble) - float(zero));
 }
+
+// -----------------------------------------------------------------------
+// affine_qmv_fast_f16_q4: f16-native QMV for Q4 (M=1).
+//
+// Same qdot pattern as affine_qmv_fast_q4 but with half* input/output.
+// Uses half4 vectorized loads.  Accumulation stays in float for precision.
+// -----------------------------------------------------------------------
+
+kernel void affine_qmv_fast_f16_q4(
+    device const uint32_t* weights  [[buffer(0)]],
+    device const float*    scales   [[buffer(1)]],
+    device const float*    biases   [[buffer(2)]],
+    device const half*     vec      [[buffer(3)]],
+    device half*           output   [[buffer(4)]],
+    constant uint4&        params   [[buffer(5)]],
+    uint3 tgid      [[threadgroup_position_in_grid]],
+    uint simd_gid   [[simdgroup_index_in_threadgroup]],
+    uint simd_lid   [[thread_index_in_simdgroup]])
+{
+    const int out_features = int(params.x);
+    const int in_features  = int(params.y);
+    const int group_size   = int(params.z);
+
+    const int in_vec_size_w = in_features / QMV_Q4_PACK_FACTOR;
+    const int in_vec_size_g = in_features / group_size;
+    const int scale_step    = group_size / QMV_Q4_VALUES_PER_THREAD;
+
+    const int out_row = int(tgid.y) * (QMV_Q4_NUM_SIMDGROUPS * QMV_Q4_RESULTS_PER_SG)
+                      + simd_gid * QMV_Q4_RESULTS_PER_SG;
+
+    if (out_row >= out_features) return;
+
+    device const uint8_t* ws = (device const uint8_t*)(weights)
+        + out_row * in_vec_size_w * 4
+        + simd_lid * QMV_Q4_PACKS_PER_THREAD * 4;
+    device const float* sl = scales + out_row * in_vec_size_g
+        + simd_lid / scale_step;
+    device const float* bl = biases + out_row * in_vec_size_g
+        + simd_lid / scale_step;
+    device const half* x = vec + simd_lid * QMV_Q4_VALUES_PER_THREAD;
+
+    float result[QMV_Q4_RESULTS_PER_SG] = {0, 0, 0, 0};
+
+    for (int k = 0; k < in_features; k += QMV_Q4_BLOCK_SIZE) {
+        float x_thread[QMV_Q4_VALUES_PER_THREAD];
+        float xsum = 0.0f;
+
+        for (int i = 0; i < QMV_Q4_VALUES_PER_THREAD; i += 4) {
+            half4 xh = *(device const half4*)(x + i);
+            float v0 = float(xh.x);
+            float v1 = float(xh.y);
+            float v2 = float(xh.z);
+            float v3 = float(xh.w);
+            xsum += v0 + v1 + v2 + v3;
+            x_thread[i]     = v0;
+            x_thread[i + 1] = v1 / 16.0f;
+            x_thread[i + 2] = v2 / 256.0f;
+            x_thread[i + 3] = v3 / 4096.0f;
+        }
+
+        for (int row = 0; row < QMV_Q4_RESULTS_PER_SG; row++) {
+            device const uint8_t* wl = ws + row * in_vec_size_w * 4;
+            float s = sl[row * in_vec_size_g];
+            float b = bl[row * in_vec_size_g];
+
+            if (row + out_row < out_features) {
+                device const uint16_t* wp = (device const uint16_t*)wl;
+                float accum = 0.0f;
+                for (int i = 0; i < QMV_Q4_VALUES_PER_THREAD / 4; i++) {
+                    accum += x_thread[4 * i]     * float(wp[i] & 0x000fu)
+                           + x_thread[4 * i + 1] * float(wp[i] & 0x00f0u)
+                           + x_thread[4 * i + 2] * float(wp[i] & 0x0f00u)
+                           + x_thread[4 * i + 3] * float(wp[i] & 0xf000u);
+                }
+                result[row] += s * accum + xsum * b;
+            }
+        }
+
+        ws += QMV_Q4_BLOCK_SIZE / QMV_Q4_PACK_FACTOR * 4;
+        sl += QMV_Q4_BLOCK_SIZE / group_size;
+        bl += QMV_Q4_BLOCK_SIZE / group_size;
+        x  += QMV_Q4_BLOCK_SIZE;
+    }
+
+    for (int row = 0; row < QMV_Q4_RESULTS_PER_SG; row++) {
+        result[row] = simd_sum(result[row]);
+        if (simd_lid == 0 && out_row + row < out_features) {
+            output[out_row + row] = half(result[row]);
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
+// affine_qmv_batched_f16_q4: Batched f16 QMV for Q4 (M > 1).
+//
+// Same as affine_qmv_batched_q4 but with half* input/output.
+// Grid: (M, ceil(N/8), 1)
+// -----------------------------------------------------------------------
+
+kernel void affine_qmv_batched_f16_q4(
+    device const uint32_t* weights  [[buffer(0)]],
+    device const float*    scales   [[buffer(1)]],
+    device const float*    biases   [[buffer(2)]],
+    device const half*     x_in     [[buffer(3)]],
+    device half*           output   [[buffer(4)]],
+    constant uint4&        params   [[buffer(5)]],
+    uint3 tgid      [[threadgroup_position_in_grid]],
+    uint simd_gid   [[simdgroup_index_in_threadgroup]],
+    uint simd_lid   [[thread_index_in_simdgroup]])
+{
+    const int out_features = int(params.x);
+    const int in_features  = int(params.y);
+    const int group_size   = int(params.z);
+    const int M            = int(params.w);
+
+    const int m_idx = int(tgid.x);
+    if (m_idx >= M) return;
+
+    const int in_vec_size_w = in_features / QMV_Q4_PACK_FACTOR;
+    const int in_vec_size_g = in_features / group_size;
+    const int scale_step    = group_size / QMV_Q4_VALUES_PER_THREAD;
+
+    const int out_row = int(tgid.y) * (QMV_Q4_NUM_SIMDGROUPS * QMV_Q4_RESULTS_PER_SG)
+                      + simd_gid * QMV_Q4_RESULTS_PER_SG;
+
+    if (out_row >= out_features) return;
+
+    device const uint8_t* ws = (device const uint8_t*)(weights)
+        + out_row * in_vec_size_w * 4
+        + simd_lid * QMV_Q4_PACKS_PER_THREAD * 4;
+    device const float* sl = scales + out_row * in_vec_size_g
+        + simd_lid / scale_step;
+    device const float* bl = biases + out_row * in_vec_size_g
+        + simd_lid / scale_step;
+    device const half* x = x_in + m_idx * in_features + simd_lid * QMV_Q4_VALUES_PER_THREAD;
+
+    float result[QMV_Q4_RESULTS_PER_SG] = {0, 0, 0, 0};
+
+    for (int k = 0; k < in_features; k += QMV_Q4_BLOCK_SIZE) {
+        float x_thread[QMV_Q4_VALUES_PER_THREAD];
+        float xsum = 0.0f;
+
+        for (int i = 0; i < QMV_Q4_VALUES_PER_THREAD; i += 4) {
+            half4 xh = *(device const half4*)(x + i);
+            float v0 = float(xh.x);
+            float v1 = float(xh.y);
+            float v2 = float(xh.z);
+            float v3 = float(xh.w);
+            xsum += v0 + v1 + v2 + v3;
+            x_thread[i]     = v0;
+            x_thread[i + 1] = v1 / 16.0f;
+            x_thread[i + 2] = v2 / 256.0f;
+            x_thread[i + 3] = v3 / 4096.0f;
+        }
+
+        for (int row = 0; row < QMV_Q4_RESULTS_PER_SG; row++) {
+            device const uint8_t* wl = ws + row * in_vec_size_w * 4;
+            float s = sl[row * in_vec_size_g];
+            float b = bl[row * in_vec_size_g];
+
+            if (row + out_row < out_features) {
+                device const uint16_t* wp = (device const uint16_t*)wl;
+                float accum = 0.0f;
+                for (int i = 0; i < QMV_Q4_VALUES_PER_THREAD / 4; i++) {
+                    accum += x_thread[4 * i]     * float(wp[i] & 0x000fu)
+                           + x_thread[4 * i + 1] * float(wp[i] & 0x00f0u)
+                           + x_thread[4 * i + 2] * float(wp[i] & 0x0f00u)
+                           + x_thread[4 * i + 3] * float(wp[i] & 0xf000u);
+                }
+                result[row] += s * accum + xsum * b;
+            }
+        }
+
+        ws += QMV_Q4_BLOCK_SIZE / QMV_Q4_PACK_FACTOR * 4;
+        sl += QMV_Q4_BLOCK_SIZE / group_size;
+        bl += QMV_Q4_BLOCK_SIZE / group_size;
+        x  += QMV_Q4_BLOCK_SIZE;
+    }
+
+    for (int row = 0; row < QMV_Q4_RESULTS_PER_SG; row++) {
+        result[row] = simd_sum(result[row]);
+        if (simd_lid == 0 && out_row + row < out_features) {
+            output[m_idx * out_features + out_row + row] = half(result[row]);
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
+// affine_qmv_batched_splitk_f16_q4: Batched f16 QMV with K-splitting.
+//
+// Combines BatchQMV + K-partitioning for low spatial parallelism.
+// Each TG processes a chunk of K, writes partial sums to c_split (f32).
+// A separate reduce kernel (qmm_splitk_accum_f16) sums and writes half output.
+//
+// Grid:  (M, ceil(N/8), k_partitions)
+// Group: (32, 2, 1) = 64 threads = 2 simdgroups
+// -----------------------------------------------------------------------
+
+kernel void affine_qmv_batched_splitk_f16_q4(
+    device const uint32_t* weights  [[buffer(0)]],
+    device const float*    scales   [[buffer(1)]],
+    device const float*    biases   [[buffer(2)]],
+    device const half*     x_in     [[buffer(3)]],
+    device float*          c_split  [[buffer(4)]],
+    constant uint4&        params   [[buffer(5)]],
+    constant uint2&        splitk_params [[buffer(6)]],
+    uint3 tgid      [[threadgroup_position_in_grid]],
+    uint simd_gid   [[simdgroup_index_in_threadgroup]],
+    uint simd_lid   [[thread_index_in_simdgroup]])
+{
+    const int out_features = int(params.x);
+    const int in_features  = int(params.y);
+    const int group_size   = int(params.z);
+    const int M            = int(params.w);
+
+    const int k_partitions = int(splitk_params.x);
+    const int k_per_part   = int(splitk_params.y);
+
+    const int m_idx = int(tgid.x);
+    if (m_idx >= M) return;
+
+    const int partition_id = int(tgid.z);
+    const int k_start = partition_id * k_per_part;
+    int k_end = k_start + k_per_part;
+    if (k_end > in_features) k_end = in_features;
+    if (k_start >= in_features) return;
+
+    const int in_vec_size_w = in_features / QMV_Q4_PACK_FACTOR;
+    const int in_vec_size_g = in_features / group_size;
+    const int scale_step    = group_size / QMV_Q4_VALUES_PER_THREAD;
+
+    const int out_row = int(tgid.y) * (QMV_Q4_NUM_SIMDGROUPS * QMV_Q4_RESULTS_PER_SG)
+                      + simd_gid * QMV_Q4_RESULTS_PER_SG;
+
+    if (out_row >= out_features) return;
+
+    // Pointer setup: offset to k_start within the row
+    const int k_start_packs = k_start / QMV_Q4_PACK_FACTOR;
+    const int k_start_groups = k_start / group_size;
+
+    device const uint8_t* ws = (device const uint8_t*)(weights)
+        + out_row * in_vec_size_w * 4
+        + k_start_packs * 4
+        + simd_lid * QMV_Q4_PACKS_PER_THREAD * 4;
+    device const float* sl = scales + out_row * in_vec_size_g
+        + k_start_groups
+        + simd_lid / scale_step;
+    device const float* bl = biases + out_row * in_vec_size_g
+        + k_start_groups
+        + simd_lid / scale_step;
+    device const half* x = x_in + m_idx * in_features + k_start + simd_lid * QMV_Q4_VALUES_PER_THREAD;
+
+    float result[QMV_Q4_RESULTS_PER_SG] = {0, 0, 0, 0};
+
+    for (int k = k_start; k < k_end; k += QMV_Q4_BLOCK_SIZE) {
+        float x_thread[QMV_Q4_VALUES_PER_THREAD];
+        float xsum = 0.0f;
+
+        for (int i = 0; i < QMV_Q4_VALUES_PER_THREAD; i += 4) {
+            half4 xh = *(device const half4*)(x + i);
+            float v0 = float(xh.x);
+            float v1 = float(xh.y);
+            float v2 = float(xh.z);
+            float v3 = float(xh.w);
+            xsum += v0 + v1 + v2 + v3;
+            x_thread[i]     = v0;
+            x_thread[i + 1] = v1 / 16.0f;
+            x_thread[i + 2] = v2 / 256.0f;
+            x_thread[i + 3] = v3 / 4096.0f;
+        }
+
+        for (int row = 0; row < QMV_Q4_RESULTS_PER_SG; row++) {
+            device const uint8_t* wl = ws + row * in_vec_size_w * 4;
+            float s = sl[row * in_vec_size_g];
+            float b = bl[row * in_vec_size_g];
+
+            if (row + out_row < out_features) {
+                device const uint16_t* wp = (device const uint16_t*)wl;
+                float accum = 0.0f;
+                for (int i = 0; i < QMV_Q4_VALUES_PER_THREAD / 4; i++) {
+                    accum += x_thread[4 * i]     * float(wp[i] & 0x000fu)
+                           + x_thread[4 * i + 1] * float(wp[i] & 0x00f0u)
+                           + x_thread[4 * i + 2] * float(wp[i] & 0x0f00u)
+                           + x_thread[4 * i + 3] * float(wp[i] & 0xf000u);
+                }
+                result[row] += s * accum + xsum * b;
+            }
+        }
+
+        ws += QMV_Q4_BLOCK_SIZE / QMV_Q4_PACK_FACTOR * 4;
+        sl += QMV_Q4_BLOCK_SIZE / group_size;
+        bl += QMV_Q4_BLOCK_SIZE / group_size;
+        x  += QMV_Q4_BLOCK_SIZE;
+    }
+
+    // Write partial sums to c_split[partition_id * M * N + m_idx * N + out_row + row]
+    for (int row = 0; row < QMV_Q4_RESULTS_PER_SG; row++) {
+        result[row] = simd_sum(result[row]);
+        if (simd_lid == 0 && out_row + row < out_features) {
+            c_split[partition_id * M * out_features + m_idx * out_features + out_row + row] = result[row];
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
+// qmm_splitk_accum_f16: Reduce split-K partial sums into half output.
+// -----------------------------------------------------------------------
+
+kernel void qmm_splitk_accum_f16(
+    device const float* c_split     [[buffer(0)]],
+    device half*        output      [[buffer(1)]],
+    constant uint3&     acc_params  [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    const uint N               = acc_params.x;
+    const uint k_partitions    = acc_params.y;
+    const uint partition_stride = acc_params.z;
+
+    float sum = 0.0f;
+    for (uint p = 0; p < k_partitions; p++) {
+        sum += c_split[p * partition_stride + gid.y * N + gid.x];
+    }
+    output[gid.y * N + gid.x] = half(sum);
+}
 "#;
 
 // ---------------------------------------------------------------------------
@@ -790,6 +1114,20 @@ pub fn register(registry: &KernelRegistry) -> Result<(), KernelError> {
 /// For 4-bit weights we use the fast qdot-pattern Q4 kernel; for 8-bit weights
 /// we use the vectorized Q8 kernel. Everything else goes through the generic kernel.
 ///
+/// Cast array to Float32 if not already f32. Used by f32-only kernel paths
+/// when the pipeline accepts f16 input at the top level.
+fn ensure_f32(
+    registry: &KernelRegistry,
+    x: &Array,
+    queue: &metal::CommandQueue,
+) -> Result<Array, KernelError> {
+    if x.dtype() == DType::Float32 {
+        super::copy::copy(registry, x, queue)
+    } else {
+        super::copy::copy_cast(registry, x, DType::Float32, queue)
+    }
+}
+
 /// The older `affine_qmv_q4` and `affine_qmv` kernels are still registered and
 /// available as fallbacks.
 fn kernel_for_bits(bits: u32) -> &'static str {
@@ -820,9 +1158,9 @@ pub fn affine_quantized_matmul(
     queue: &metal::CommandQueue,
 ) -> Result<Array, KernelError> {
     // --- Validate input vector ---
-    if vec.dtype() != DType::Float32 {
+    if vec.dtype() != DType::Float32 && vec.dtype() != DType::Float16 {
         return Err(KernelError::InvalidShape(format!(
-            "affine_quantized_matmul requires Float32 input vec, got {:?}",
+            "affine_quantized_matmul requires Float16 or Float32 input vec, got {:?}",
             vec.dtype()
         )));
     }
@@ -833,6 +1171,15 @@ pub fn affine_quantized_matmul(
             qw.in_features
         )));
     }
+
+    let output_dtype = vec.dtype();
+
+    // QMV kernel is f32-only; cast f16 input to f32 if needed.
+    let vec_f32 = if vec.dtype() == DType::Float16 {
+        super::copy::copy_cast(registry, vec, DType::Float32, queue)?
+    } else {
+        super::copy::copy(registry, vec, queue)?
+    };
 
     let kernel_name = kernel_for_bits(qw.bits);
 
@@ -863,7 +1210,7 @@ pub fn affine_quantized_matmul(
     enc.set_buffer(0, Some(&qw.weights_buf), 0);
     enc.set_buffer(1, Some(&qw.scales_buf), 0);
     enc.set_buffer(2, Some(&qw.biases_buf), 0);
-    enc.set_buffer(3, Some(vec.metal_buffer()), vec.offset() as u64);
+    enc.set_buffer(3, Some(vec_f32.metal_buffer()), vec_f32.offset() as u64);
     enc.set_buffer(4, Some(out.metal_buffer()), 0);
     enc.set_buffer(5, Some(&params_buf), 0);
 
@@ -881,7 +1228,12 @@ pub fn affine_quantized_matmul(
     enc.end_encoding();
     super::commit_with_mode(cb, super::ExecMode::Sync);
 
-    Ok(out)
+    // Match output dtype to input dtype
+    if output_dtype == DType::Float16 {
+        super::copy::copy_cast(registry, &out, DType::Float16, queue)
+    } else {
+        Ok(out)
+    }
 }
 
 /// Batched affine quantized matrix-vector multiply for Q4 weights.
@@ -988,6 +1340,369 @@ pub fn affine_qmv_batched_q4(
         metal::MTLSize::new(tg_size, 1, 1),
     );
     enc.end_encoding();
+    super::commit_with_mode(cb, super::ExecMode::Sync);
+
+    Ok(out)
+}
+
+/// Compute adaptive k_partitions for batched QMV split-K.
+///
+/// Targets enough threadgroups to saturate M3 Ultra 80 GPU cores.
+/// Returns 1 (no split-K) if spatial parallelism is already sufficient.
+fn calc_batchqmv_k_partitions(m: usize, n: usize, k: usize) -> usize {
+    let spatial_tgs = m * n.div_ceil(8); // 8 rows per TG
+    let target_tgs: usize = 320; // 4x M3 Ultra 80 cores
+    if spatial_tgs >= target_tgs {
+        1 // enough spatial parallelism
+    } else {
+        let desired = (target_tgs / spatial_tgs).clamp(2, 16);
+        desired.min(k / 512) // min 512 values per partition
+    }
+}
+
+/// f16-native affine quantized matrix-vector multiply for Q4 (M=1).
+///
+/// Same qdot pattern as `affine_quantized_matmul` but accepts Float16 input
+/// and returns Float16 output, avoiding f32->f16->f32 cast overhead.
+///
+/// # Arguments
+/// - `registry`: kernel registry (must have `quantized` source registered).
+/// - `qw`: the quantized weight description (must be 4-bit).
+/// - `vec`: f16 input vector of length `qw.in_features`.
+/// - `queue`: Metal command queue for dispatch.
+///
+/// # Returns
+/// A 1-D f16 `Array` of length `qw.out_features`.
+pub fn affine_qmv_fast_f16_q4(
+    registry: &KernelRegistry,
+    qw: &QuantizedWeight,
+    vec: &Array,
+    queue: &metal::CommandQueue,
+) -> Result<Array, KernelError> {
+    if qw.bits != 4 {
+        return Err(KernelError::InvalidShape(format!(
+            "affine_qmv_fast_f16_q4 requires 4-bit weights, got {}-bit",
+            qw.bits
+        )));
+    }
+    if vec.dtype() != DType::Float16 {
+        return Err(KernelError::InvalidShape(format!(
+            "affine_qmv_fast_f16_q4 requires Float16 input, got {:?}",
+            vec.dtype()
+        )));
+    }
+    if vec.numel() != qw.in_features {
+        return Err(KernelError::InvalidShape(format!(
+            "vec.numel() ({}) != in_features ({})",
+            vec.numel(),
+            qw.in_features
+        )));
+    }
+    let k = qw.in_features;
+    const QMV_Q4_BLOCK_SIZE: usize = 512;
+    if k % QMV_Q4_BLOCK_SIZE != 0 {
+        return Err(KernelError::InvalidShape(format!(
+            "affine_qmv_fast_f16_q4: in_features ({k}) must be a multiple of {QMV_Q4_BLOCK_SIZE}"
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("affine_qmv_fast_f16_q4", DType::Float16)?;
+    let out = Array::zeros(registry.device().raw(), &[qw.out_features], DType::Float16);
+
+    let params: [u32; 4] = [
+        super::checked_u32(qw.out_features, "out_features")?,
+        super::checked_u32(qw.in_features, "in_features")?,
+        qw.group_size,
+        qw.bits,
+    ];
+
+    let dev = registry.device().raw();
+    let opts = metal::MTLResourceOptions::StorageModeShared;
+    let params_buf = dev.new_buffer_with_data(
+        params.as_ptr() as *const _,
+        (params.len() * std::mem::size_of::<u32>()) as u64,
+        opts,
+    );
+
+    let cb = queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_buffer(0, Some(&qw.weights_buf), 0);
+    enc.set_buffer(1, Some(&qw.scales_buf), 0);
+    enc.set_buffer(2, Some(&qw.biases_buf), 0);
+    enc.set_buffer(3, Some(vec.metal_buffer()), vec.offset() as u64);
+    enc.set_buffer(4, Some(out.metal_buffer()), 0);
+    enc.set_buffer(5, Some(&params_buf), 0);
+
+    let rows_per_tg: u64 = 8;
+    let num_tgs_y = (qw.out_features as u64).div_ceil(rows_per_tg);
+    let tg_size: u64 = 64;
+
+    enc.dispatch_thread_groups(
+        metal::MTLSize::new(1, num_tgs_y, 1),
+        metal::MTLSize::new(tg_size, 1, 1),
+    );
+    enc.end_encoding();
+    super::commit_with_mode(cb, super::ExecMode::Sync);
+
+    Ok(out)
+}
+
+/// f16-native batched affine quantized matrix-vector multiply for Q4.
+///
+/// Computes `output[m, :] = dequant(weights) @ x[m, :]` for each batch index m.
+/// Input and output are Float16.
+///
+/// # Arguments
+/// - `registry`: kernel registry (must have `quantized` source registered).
+/// - `qw`: the quantized weight description (must be 4-bit).
+/// - `x`: f16 input matrix of shape `[M, in_features]`.
+/// - `queue`: Metal command queue for dispatch.
+///
+/// # Returns
+/// A 2-D f16 `Array` of shape `[M, out_features]`.
+pub fn affine_qmv_batched_f16_q4(
+    registry: &KernelRegistry,
+    qw: &QuantizedWeight,
+    x: &Array,
+    queue: &metal::CommandQueue,
+) -> Result<Array, KernelError> {
+    if qw.bits != 4 {
+        return Err(KernelError::InvalidShape(format!(
+            "affine_qmv_batched_f16_q4 requires 4-bit weights, got {}-bit",
+            qw.bits
+        )));
+    }
+    if x.dtype() != DType::Float16 {
+        return Err(KernelError::InvalidShape(format!(
+            "affine_qmv_batched_f16_q4 requires Float16 input, got {:?}",
+            x.dtype()
+        )));
+    }
+    let shape = x.shape();
+    if shape.len() != 2 {
+        return Err(KernelError::InvalidShape(format!(
+            "affine_qmv_batched_f16_q4 requires 2-D input [M, K], got shape {:?}",
+            shape
+        )));
+    }
+    let m = shape[0];
+    let k = shape[1];
+    if k != qw.in_features {
+        return Err(KernelError::InvalidShape(format!(
+            "x.shape[1] ({k}) != in_features ({})",
+            qw.in_features
+        )));
+    }
+    if m == 0 {
+        return Err(KernelError::InvalidShape(
+            "affine_qmv_batched_f16_q4: M must be > 0".into(),
+        ));
+    }
+    const QMV_Q4_BLOCK_SIZE: usize = 512;
+    if k % QMV_Q4_BLOCK_SIZE != 0 {
+        return Err(KernelError::InvalidShape(format!(
+            "affine_qmv_batched_f16_q4: in_features ({k}) must be a multiple of {QMV_Q4_BLOCK_SIZE}"
+        )));
+    }
+
+    let n = qw.out_features;
+    let pipeline = registry.get_pipeline("affine_qmv_batched_f16_q4", DType::Float16)?;
+    let out = Array::zeros(registry.device().raw(), &[m, n], DType::Float16);
+
+    let params: [u32; 4] = [
+        super::checked_u32(n, "out_features")?,
+        super::checked_u32(k, "in_features")?,
+        qw.group_size,
+        super::checked_u32(m, "M")?,
+    ];
+
+    let dev = registry.device().raw();
+    let opts = metal::MTLResourceOptions::StorageModeShared;
+    let params_buf = dev.new_buffer_with_data(
+        params.as_ptr() as *const _,
+        (params.len() * std::mem::size_of::<u32>()) as u64,
+        opts,
+    );
+
+    let cb = queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_buffer(0, Some(&qw.weights_buf), 0);
+    enc.set_buffer(1, Some(&qw.scales_buf), 0);
+    enc.set_buffer(2, Some(&qw.biases_buf), 0);
+    enc.set_buffer(3, Some(x.metal_buffer()), x.offset() as u64);
+    enc.set_buffer(4, Some(out.metal_buffer()), 0);
+    enc.set_buffer(5, Some(&params_buf), 0);
+
+    let rows_per_tg: u64 = 8;
+    let num_tgs_y = (n as u64).div_ceil(rows_per_tg);
+    let tg_size: u64 = 64;
+
+    enc.dispatch_thread_groups(
+        metal::MTLSize::new(m as u64, num_tgs_y, 1),
+        metal::MTLSize::new(tg_size, 1, 1),
+    );
+    enc.end_encoding();
+    super::commit_with_mode(cb, super::ExecMode::Sync);
+
+    Ok(out)
+}
+
+/// f16-native batched QMV with split-K for Q4 weights.
+///
+/// Combines BatchQMV with K-dimension partitioning for cases where spatial
+/// parallelism (M * ceil(N/8)) is insufficient to saturate GPU cores.
+/// Uses a two-phase approach: split-K partial sums in f32, then reduce to f16.
+///
+/// # Arguments
+/// - `registry`: kernel registry.
+/// - `qw`: the quantized weight description (must be 4-bit).
+/// - `x`: f16 input matrix of shape `[M, in_features]`.
+/// - `queue`: Metal command queue for dispatch.
+/// - `k_partitions`: number of K-dimension partitions.
+///
+/// # Returns
+/// A 2-D f16 `Array` of shape `[M, out_features]`.
+pub fn affine_qmv_batched_splitk_f16_q4(
+    registry: &KernelRegistry,
+    qw: &QuantizedWeight,
+    x: &Array,
+    queue: &metal::CommandQueue,
+    k_partitions: usize,
+) -> Result<Array, KernelError> {
+    if qw.bits != 4 {
+        return Err(KernelError::InvalidShape(format!(
+            "affine_qmv_batched_splitk_f16_q4 requires 4-bit weights, got {}-bit",
+            qw.bits
+        )));
+    }
+    if x.dtype() != DType::Float16 {
+        return Err(KernelError::InvalidShape(format!(
+            "affine_qmv_batched_splitk_f16_q4 requires Float16 input, got {:?}",
+            x.dtype()
+        )));
+    }
+    let shape = x.shape();
+    if shape.len() != 2 {
+        return Err(KernelError::InvalidShape(format!(
+            "affine_qmv_batched_splitk_f16_q4 requires 2-D input [M, K], got shape {:?}",
+            shape
+        )));
+    }
+    let m = shape[0];
+    let k = shape[1];
+    if k != qw.in_features {
+        return Err(KernelError::InvalidShape(format!(
+            "x.shape[1] ({k}) != in_features ({})",
+            qw.in_features
+        )));
+    }
+    if m == 0 {
+        return Err(KernelError::InvalidShape(
+            "affine_qmv_batched_splitk_f16_q4: M must be > 0".into(),
+        ));
+    }
+    if k_partitions < 2 {
+        return Err(KernelError::InvalidShape(
+            "affine_qmv_batched_splitk_f16_q4: k_partitions must be >= 2".into(),
+        ));
+    }
+    const QMV_Q4_BLOCK_SIZE: usize = 512;
+    if k % QMV_Q4_BLOCK_SIZE != 0 {
+        return Err(KernelError::InvalidShape(format!(
+            "affine_qmv_batched_splitk_f16_q4: in_features ({k}) must be a multiple of {QMV_Q4_BLOCK_SIZE}"
+        )));
+    }
+
+    let n = qw.out_features;
+    let dev = registry.device().raw();
+    let opts = metal::MTLResourceOptions::StorageModeShared;
+
+    // k_per_part aligned to BLOCK_SIZE boundary
+    let k_per_part =
+        ((k / k_partitions + QMV_Q4_BLOCK_SIZE - 1) / QMV_Q4_BLOCK_SIZE) * QMV_Q4_BLOCK_SIZE;
+
+    // Phase 1: Split-K partial sums
+    let splitk_pipeline =
+        registry.get_pipeline("affine_qmv_batched_splitk_f16_q4", DType::Float16)?;
+
+    let partition_stride = m * n;
+    let c_split_size = (k_partitions * partition_stride * std::mem::size_of::<f32>()) as u64;
+    let c_split_buf = dev.new_buffer(c_split_size, opts);
+
+    let out = Array::zeros(dev, &[m, n], DType::Float16);
+
+    let params: [u32; 4] = [
+        super::checked_u32(n, "out_features")?,
+        super::checked_u32(k, "in_features")?,
+        qw.group_size,
+        super::checked_u32(m, "M")?,
+    ];
+    let splitk_p: [u32; 2] = [
+        super::checked_u32(k_partitions, "k_partitions")?,
+        super::checked_u32(k_per_part, "k_per_part")?,
+    ];
+
+    let params_buf = dev.new_buffer_with_data(
+        params.as_ptr() as *const _,
+        (params.len() * std::mem::size_of::<u32>()) as u64,
+        opts,
+    );
+    let splitk_buf = dev.new_buffer_with_data(
+        splitk_p.as_ptr() as *const _,
+        (splitk_p.len() * std::mem::size_of::<u32>()) as u64,
+        opts,
+    );
+
+    let cb = queue.new_command_buffer();
+
+    // Encode split-K kernel
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&splitk_pipeline);
+    enc.set_buffer(0, Some(&qw.weights_buf), 0);
+    enc.set_buffer(1, Some(&qw.scales_buf), 0);
+    enc.set_buffer(2, Some(&qw.biases_buf), 0);
+    enc.set_buffer(3, Some(x.metal_buffer()), x.offset() as u64);
+    enc.set_buffer(4, Some(&c_split_buf), 0);
+    enc.set_buffer(5, Some(&params_buf), 0);
+    enc.set_buffer(6, Some(&splitk_buf), 0);
+
+    let rows_per_tg: u64 = 8;
+    let num_tgs_y = (n as u64).div_ceil(rows_per_tg);
+    let tg_size: u64 = 64;
+
+    enc.dispatch_thread_groups(
+        metal::MTLSize::new(m as u64, num_tgs_y, k_partitions as u64),
+        metal::MTLSize::new(tg_size, 1, 1),
+    );
+    enc.end_encoding();
+
+    // Phase 2: Reduce partial sums -> f16 output
+    let reduce_pipeline = registry.get_pipeline("qmm_splitk_accum_f16", DType::Float16)?;
+    let acc_params: [u32; 3] = [
+        super::checked_u32(n, "N")?,
+        super::checked_u32(k_partitions, "k_partitions")?,
+        super::checked_u32(partition_stride, "partition_stride")?,
+    ];
+    let acc_params_buf = dev.new_buffer_with_data(
+        acc_params.as_ptr() as *const _,
+        (acc_params.len() * std::mem::size_of::<u32>()) as u64,
+        opts,
+    );
+
+    let enc2 = cb.new_compute_command_encoder();
+    enc2.set_compute_pipeline_state(&reduce_pipeline);
+    enc2.set_buffer(0, Some(&c_split_buf), 0);
+    enc2.set_buffer(1, Some(out.metal_buffer()), 0);
+    enc2.set_buffer(2, Some(&acc_params_buf), 0);
+
+    enc2.dispatch_threads(
+        metal::MTLSize::new(n as u64, m as u64, 1),
+        metal::MTLSize::new(n.min(256) as u64, 1, 1),
+    );
+    enc2.end_encoding();
+
     super::commit_with_mode(cb, super::ExecMode::Sync);
 
     Ok(out)
@@ -3876,12 +4591,13 @@ pub fn affine_quantized_matmul_batched(
     queue: &metal::CommandQueue,
 ) -> Result<Array, KernelError> {
     // Validate input
-    if x.dtype() != DType::Float32 {
+    if x.dtype() != DType::Float32 && x.dtype() != DType::Float16 {
         return Err(KernelError::InvalidShape(format!(
-            "affine_quantized_matmul_batched requires Float32 input x, got {:?}",
+            "affine_quantized_matmul_batched requires Float16 or Float32 input, got {:?}",
             x.dtype()
         )));
     }
+    let output_dtype = x.dtype();
     if x.ndim() != 2 {
         return Err(KernelError::InvalidShape(format!(
             "affine_quantized_matmul_batched requires 2D input x, got {}D",
@@ -3909,7 +4625,7 @@ pub fn affine_quantized_matmul_batched(
     let dev = registry.device().raw();
     let opts = metal::MTLResourceOptions::StorageModeShared;
 
-    if qw.bits == 4 {
+    let result = if qw.bits == 4 {
         // Q4 dispatch priority:
         // 1. NAX (HW MMA, f16): M >= 32, K % 64 == 0 → highest throughput
         // 2. Skinny (split-K): M <= 32 → best for low-M
@@ -3918,7 +4634,7 @@ pub fn affine_quantized_matmul_batched(
 
         if k % 64 == 0 && m >= NAX_MIN_M {
             // --- NAX path: f16 HW MMA, BM=64 BN=64, 128 threads ---
-            // Convert f32 input → f16, cast scales/biases f32 → f16, run NAX, cast output f16 → f32.
+            // NAX kernel operates in f16. Skip casts when input is already f16.
             let num_groups = (qw.out_features * qw.in_features) / qw.group_size as usize;
 
             // Wrap scales/biases as 1D f32 Arrays for GPU cast
@@ -3939,8 +4655,12 @@ pub fn affine_quantized_matmul_batched(
 
             let cb = queue.new_command_buffer();
 
-            // Cast x: f32 → f16
-            let x_f16 = super::copy::copy_cast_into_cb(registry, x, DType::Float16, cb)?;
+            // Cast x to f16 only if not already f16
+            let x_f16 = if x.dtype() == DType::Float16 {
+                super::copy::copy_into_cb(registry, x, cb)?
+            } else {
+                super::copy::copy_cast_into_cb(registry, x, DType::Float16, cb)?
+            };
 
             // Cast scales: f32 → f16
             let scales_f16 =
@@ -3960,15 +4680,19 @@ pub fn affine_quantized_matmul_batched(
                 in_features: qw.in_features,
             };
 
-            // Dispatch NAX kernel (encodes into same CB)
+            // Dispatch NAX kernel (encodes into same CB) — output is f16
             let out_f16 = affine_qmm_nax_q4_into_cb(registry, &x_f16, &qw_f16, cb)?;
 
-            // Cast output: f16 → f32
-            let out_f32 = super::copy::copy_cast_into_cb(registry, &out_f16, DType::Float32, cb)?;
+            // Cast output to match input dtype if needed
+            let result = if output_dtype == DType::Float32 {
+                super::copy::copy_cast_into_cb(registry, &out_f16, DType::Float32, cb)?
+            } else {
+                out_f16
+            };
 
             super::commit_with_mode(cb, super::ExecMode::Sync);
 
-            return Ok(out_f32);
+            return Ok(result);
         }
 
         // Q4 non-NAX dispatch: shape-aware kernel selection
@@ -3986,7 +4710,22 @@ pub fn affine_quantized_matmul_batched(
 
         // --- M <= 16: Batched QMV (qdot pattern, M-batched) ---
         // Requires K % 512 == 0 (QMV block_size). All standard MoE models satisfy this.
+        // f16 input uses native f16 kernels (no cast overhead).
         if m <= 16 && k % 512 == 0 {
+            if x.dtype() == DType::Float16 {
+                let k_partitions = calc_batchqmv_k_partitions(m, n, k);
+                if k_partitions > 1 {
+                    return affine_qmv_batched_splitk_f16_q4(registry, qw, x, queue, k_partitions);
+                } else if m == 1 {
+                    // M=1: reshape to 1-D, dispatch fast path, reshape back to [1, N]
+                    let vec_1d = x.reshape(vec![k])?;
+                    let out_1d = affine_qmv_fast_f16_q4(registry, qw, &vec_1d, queue)?;
+                    return Ok(out_1d.reshape(vec![1, n])?);
+                } else {
+                    return affine_qmv_batched_f16_q4(registry, qw, x, queue);
+                }
+            }
+            // f32 fallback
             return affine_qmv_batched_q4(registry, qw, x, queue);
         }
 
@@ -4127,6 +4866,8 @@ pub fn affine_quantized_matmul_batched(
             }
         } else if m <= SKINNY_BM {
             // --- Skinny-M path: BM=32, BN=64, BK=32 with built-in split-K ---
+            // Skinny kernel is f32-only; cast f16 input if needed.
+            let x = &ensure_f32(registry, x, queue)?;
             let sm_tiles = m.div_ceil(SKINNY_BM);
             let sn_tiles = n.div_ceil(SKINNY_BN);
 
@@ -4255,9 +4996,12 @@ pub fn affine_quantized_matmul_batched(
             // --- Steel path: BK=32 + double-buffer, coalesced B loads ---
             // QLdr (single-buffer) underperforms MMA — Steel is better fallback.
             // TODO: QLdr double-buffer (8-B') may reclaim this path.
+            // Steel accepts f16 or f32 input (casts internally if needed).
             affine_quantized_matmul_steel(registry, x, qw, queue)
         } else {
             // --- Standard path: BM=64, BN=64, BK=16 ---
+            // Standard MMA kernel is f32-only; cast f16 input if needed.
+            let x = &ensure_f32(registry, x, queue)?;
             let m_tiles = m.div_ceil(STD_BM);
             let n_tiles = n.div_ceil(STD_BN);
 
@@ -4318,6 +5062,8 @@ pub fn affine_quantized_matmul_batched(
         }
     } else {
         // Q8 path: keep old architecture (BM=32, BN=32, 2 SG, 64 threads)
+        // Q8 kernel is f32-only; cast f16 input if needed.
+        let x = &ensure_f32(registry, x, queue)?;
         let q8_bm: usize = 32;
         let q8_bn: usize = 32;
         let q8_align_m = m % q8_bm == 0;
@@ -4366,6 +5112,14 @@ pub fn affine_quantized_matmul_batched(
         super::commit_with_mode(cb, super::ExecMode::Sync);
 
         Ok(out)
+    };
+
+    // All non-early-return paths produce f32 output. Cast to match input dtype if needed.
+    let result = result?;
+    if output_dtype == DType::Float16 && result.dtype() == DType::Float32 {
+        super::copy::copy_cast(registry, &result, DType::Float16, queue)
+    } else {
+        Ok(result)
     }
 }
 
@@ -4666,17 +5420,17 @@ pub fn affine_qmm_nax_q4_into_cb(
 /// This kernel is expected to be significantly faster than `affine_qmm_mma_q4`
 /// due to coalesced B loads and reduced barrier overhead.
 ///
-/// The input `x` must be Float32; it will be converted to Float16 internally
-/// before dispatch.
+/// The input `x` must be Float16 or Float32; it will be converted to Float16
+/// internally if needed before dispatch.
 pub fn affine_quantized_matmul_steel(
     registry: &KernelRegistry,
     x: &Array,
     qw: &QuantizedWeight,
     queue: &metal::CommandQueue,
 ) -> Result<Array, KernelError> {
-    if x.dtype() != DType::Float32 {
+    if x.dtype() != DType::Float32 && x.dtype() != DType::Float16 {
         return Err(KernelError::InvalidShape(format!(
-            "affine_quantized_matmul_steel requires Float32 input x, got {:?}",
+            "affine_quantized_matmul_steel requires Float16 or Float32 input x, got {:?}",
             x.dtype()
         )));
     }
@@ -4707,10 +5461,12 @@ pub fn affine_quantized_matmul_steel(
     let dev = registry.device().raw();
     let opts = metal::MTLResourceOptions::StorageModeShared;
 
-    // --- Step 1: Convert f32 input to half ---
-    // Use a simple GPU cast kernel or CPU fallback.
-    // For now, allocate a half buffer and use the GPU cast.
-    let x_half = crate::ops::copy::copy_cast(registry, x, DType::Float16, queue)?;
+    // --- Step 1: Convert input to half if not already ---
+    let x_half = if x.dtype() == DType::Float16 {
+        crate::ops::copy::copy(registry, x, queue)?
+    } else {
+        crate::ops::copy::copy_cast(registry, x, DType::Float16, queue)?
+    };
 
     // --- Step 2: Dispatch steel kernel ---
     const STEEL_BM: usize = 32;
@@ -5400,9 +6156,120 @@ kernel void gather_qmv_fast_q4(
 }
 "#;
 
-/// Register the GatherQMV Metal kernel with the given registry.
+/// Metal shader for GatherQMV f16 — half-precision input/output variant.
+///
+/// Same qdot pattern as `gather_qmv_fast_q4` but with:
+/// - `device const half* x` input (half4 vectorized loads)
+/// - `device half* output`
+/// - Float accumulation for precision (only I/O is half)
+pub const GATHER_QMV_F16_SHADER_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant constexpr int GQMV_F16_Q4_NUM_SIMDGROUPS  = 2;
+constant constexpr int GQMV_F16_Q4_RESULTS_PER_SG  = 4;
+constant constexpr int GQMV_F16_Q4_PACKS_PER_THREAD = 2;
+constant constexpr int GQMV_F16_Q4_PACK_FACTOR     = 8;   // 32 / 4
+constant constexpr int GQMV_F16_Q4_VALUES_PER_THREAD = GQMV_F16_Q4_PACK_FACTOR * GQMV_F16_Q4_PACKS_PER_THREAD; // 16
+constant constexpr int GQMV_F16_Q4_BLOCK_SIZE       = GQMV_F16_Q4_VALUES_PER_THREAD * 32; // 512
+
+kernel void gather_qmv_fast_f16_q4(
+    device const half*     x         [[buffer(0)]],
+    device const uint32_t* w_packed  [[buffer(1)]],
+    device const float*    scales    [[buffer(2)]],
+    device const float*    biases    [[buffer(3)]],
+    device const uint32_t* indices   [[buffer(4)]],
+    device half*           output    [[buffer(5)]],
+    constant uint4&        params    [[buffer(6)]],
+    uint3 tgid      [[threadgroup_position_in_grid]],
+    uint simd_gid   [[simdgroup_index_in_threadgroup]],
+    uint simd_lid   [[thread_index_in_simdgroup]])
+{
+    const int out_features = int(params.x);
+    const int in_features  = int(params.y);
+    const int group_size   = int(params.z);
+    const int batch_idx    = int(tgid.x);
+
+    const uint expert_idx = indices[batch_idx];
+
+    const int in_vec_size_w = in_features / GQMV_F16_Q4_PACK_FACTOR;
+    const int in_vec_size_g = in_features / group_size;
+    const int scale_step    = group_size / GQMV_F16_Q4_VALUES_PER_THREAD;
+
+    const int expert_w_offset = int(expert_idx) * out_features * in_vec_size_w;
+    const int expert_s_offset = int(expert_idx) * out_features * in_vec_size_g;
+
+    const int out_row = int(tgid.y) * (GQMV_F16_Q4_NUM_SIMDGROUPS * GQMV_F16_Q4_RESULTS_PER_SG)
+                      + simd_gid * GQMV_F16_Q4_RESULTS_PER_SG;
+
+    if (out_row >= out_features) return;
+
+    device const uint8_t* ws = (device const uint8_t*)(w_packed + expert_w_offset)
+        + out_row * in_vec_size_w * 4
+        + simd_lid * GQMV_F16_Q4_PACKS_PER_THREAD * 4;
+    device const float* sl = scales + expert_s_offset + out_row * in_vec_size_g
+        + simd_lid / scale_step;
+    device const float* bl = biases + expert_s_offset + out_row * in_vec_size_g
+        + simd_lid / scale_step;
+    device const half* xp = x + batch_idx * in_features
+        + simd_lid * GQMV_F16_Q4_VALUES_PER_THREAD;
+
+    float result[GQMV_F16_Q4_RESULTS_PER_SG] = {0, 0, 0, 0};
+
+    for (int k = 0; k < in_features; k += GQMV_F16_Q4_BLOCK_SIZE) {
+        float x_thread[GQMV_F16_Q4_VALUES_PER_THREAD];
+        float xsum = 0.0f;
+
+        for (int i = 0; i < GQMV_F16_Q4_VALUES_PER_THREAD; i += 4) {
+            half4 xh = *(device const half4*)(xp + i);
+            float v0 = float(xh.x);
+            float v1 = float(xh.y);
+            float v2 = float(xh.z);
+            float v3 = float(xh.w);
+            xsum += v0 + v1 + v2 + v3;
+            x_thread[i]     = v0;
+            x_thread[i + 1] = v1 / 16.0f;
+            x_thread[i + 2] = v2 / 256.0f;
+            x_thread[i + 3] = v3 / 4096.0f;
+        }
+
+        for (int row = 0; row < GQMV_F16_Q4_RESULTS_PER_SG; row++) {
+            device const uint8_t* wl = ws + row * in_vec_size_w * 4;
+            float s = sl[row * in_vec_size_g];
+            float b = bl[row * in_vec_size_g];
+
+            if (row + out_row < out_features) {
+                device const uint16_t* wp = (device const uint16_t*)wl;
+                float accum = 0.0f;
+                for (int i = 0; i < GQMV_F16_Q4_VALUES_PER_THREAD / 4; i++) {
+                    accum += x_thread[4 * i]     * float(wp[i] & 0x000fu)
+                           + x_thread[4 * i + 1] * float(wp[i] & 0x00f0u)
+                           + x_thread[4 * i + 2] * float(wp[i] & 0x0f00u)
+                           + x_thread[4 * i + 3] * float(wp[i] & 0xf000u);
+                }
+                result[row] += s * accum + xsum * b;
+            }
+        }
+
+        ws += GQMV_F16_Q4_BLOCK_SIZE / GQMV_F16_Q4_PACK_FACTOR * 4;
+        sl += GQMV_F16_Q4_BLOCK_SIZE / group_size;
+        bl += GQMV_F16_Q4_BLOCK_SIZE / group_size;
+        xp += GQMV_F16_Q4_BLOCK_SIZE;
+    }
+
+    for (int row = 0; row < GQMV_F16_Q4_RESULTS_PER_SG; row++) {
+        result[row] = simd_sum(result[row]);
+        if (simd_lid == 0 && out_row + row < out_features) {
+            output[batch_idx * out_features + out_row + row] = half(result[row]);
+        }
+    }
+}
+"#;
+
+/// Register the GatherQMV Metal kernels with the given registry.
 pub fn register_gather_qmv(registry: &KernelRegistry) -> Result<(), KernelError> {
-    registry.register_jit_source("gather_qmv", GATHER_QMV_SHADER_SOURCE)
+    registry.register_jit_source("gather_qmv", GATHER_QMV_SHADER_SOURCE)?;
+    registry.register_jit_source("gather_qmv_f16", GATHER_QMV_F16_SHADER_SOURCE)
 }
 
 /// Index-based quantized matrix-vector multiply for MoE expert dispatch (GatherQMV).
@@ -5598,6 +6465,178 @@ pub fn gather_qmv_fast_q4(
     Ok(out)
 }
 
+/// Float16 variant of [`gather_qmv_fast_q4`].
+///
+/// Uses the `gather_qmv_fast_f16_q4` Metal kernel which accepts half-precision
+/// input and produces half-precision output, with float accumulation internally
+/// for precision.
+pub fn gather_qmv_fast_f16_q4(
+    registry: &KernelRegistry,
+    x: &Array,
+    w_packed_buf: &metal::Buffer,
+    scales_buf: &metal::Buffer,
+    biases_buf: &metal::Buffer,
+    indices: &Array,
+    batch: usize,
+    n: usize,
+    k: usize,
+    n_experts: usize,
+    group_size: u32,
+    queue: &metal::CommandQueue,
+) -> Result<Array, KernelError> {
+    // --- dtype validation ---
+    if x.dtype() != DType::Float16 {
+        return Err(KernelError::InvalidShape(format!(
+            "gather_qmv_fast_f16_q4 requires Float16 input x, got {:?}",
+            x.dtype()
+        )));
+    }
+    if indices.dtype() != DType::UInt32 {
+        return Err(KernelError::InvalidShape(format!(
+            "gather_qmv_fast_f16_q4: indices must be UInt32, got {:?}",
+            indices.dtype()
+        )));
+    }
+
+    // --- dimension validation ---
+    if k == 0 || n == 0 {
+        return Err(KernelError::InvalidShape(format!(
+            "gather_qmv_fast_f16_q4: dimensions must be non-zero (k={k}, n={n})"
+        )));
+    }
+    if n_experts == 0 {
+        return Err(KernelError::InvalidShape(
+            "gather_qmv_fast_f16_q4: n_experts must be non-zero".to_string(),
+        ));
+    }
+    if batch == 0 {
+        let dev = registry.device().raw();
+        return Ok(Array::zeros(dev, &[0, n], DType::Float16));
+    }
+
+    // --- x shape validation ---
+    let expected_x_elems = batch * k;
+    if x.numel() != expected_x_elems {
+        return Err(KernelError::InvalidShape(format!(
+            "gather_qmv_fast_f16_q4: x has {} elements but expected \
+             batch({batch}) * k({k}) = {expected_x_elems}",
+            x.numel()
+        )));
+    }
+
+    // --- indices shape validation ---
+    if indices.numel() != batch {
+        return Err(KernelError::InvalidShape(format!(
+            "gather_qmv_fast_f16_q4: indices length {} != batch {}",
+            indices.numel(),
+            batch
+        )));
+    }
+
+    // --- group_size validation ---
+    if group_size == 0 {
+        return Err(KernelError::InvalidShape(
+            "gather_qmv_fast_f16_q4: group_size must be non-zero".into(),
+        ));
+    }
+
+    // --- K constraints for Q4 packing ---
+    let pack_factor: usize = 8; // 32 / 4 bits
+    if k % pack_factor != 0 {
+        return Err(KernelError::InvalidShape(format!(
+            "gather_qmv_fast_f16_q4: K ({k}) must be a multiple of pack_factor ({pack_factor})"
+        )));
+    }
+    if k % (group_size as usize) != 0 {
+        return Err(KernelError::InvalidShape(format!(
+            "gather_qmv_fast_f16_q4: K ({k}) must be a multiple of group_size ({group_size})"
+        )));
+    }
+
+    // --- buffer size validation ---
+    let k_div_pack = k / pack_factor;
+    let groups_per_row = k / (group_size as usize);
+    let expected_w_bytes = n_experts * n * k_div_pack * 4;
+    if (w_packed_buf.length() as usize) < expected_w_bytes {
+        return Err(KernelError::InvalidShape(format!(
+            "gather_qmv_fast_f16_q4: w_packed_buf too small: {} bytes < expected {} bytes \
+             (n_experts={n_experts}, N={n}, K/8={k_div_pack})",
+            w_packed_buf.length(),
+            expected_w_bytes,
+        )));
+    }
+    let expected_scales_bytes = n_experts * n * groups_per_row * 4; // float32
+    if (scales_buf.length() as usize) < expected_scales_bytes {
+        return Err(KernelError::InvalidShape(format!(
+            "gather_qmv_fast_f16_q4: scales_buf too small: {} bytes < expected {} bytes \
+             (n_experts={n_experts}, N={n}, groups_per_row={groups_per_row})",
+            scales_buf.length(),
+            expected_scales_bytes,
+        )));
+    }
+    if (biases_buf.length() as usize) < expected_scales_bytes {
+        return Err(KernelError::InvalidShape(format!(
+            "gather_qmv_fast_f16_q4: biases_buf too small: {} bytes < expected {} bytes \
+             (n_experts={n_experts}, N={n}, groups_per_row={groups_per_row})",
+            biases_buf.length(),
+            expected_scales_bytes,
+        )));
+    }
+
+    // --- Rust-side validation: all expert indices must be in [0, n_experts) ---
+    {
+        let idx_vec = indices.to_vec_checked::<u32>();
+        for (i, &idx) in idx_vec.iter().enumerate() {
+            if (idx as usize) >= n_experts {
+                return Err(KernelError::InvalidShape(format!(
+                    "gather_qmv_fast_f16_q4: index[{i}]={idx} out of range [0, {n_experts})"
+                )));
+            }
+        }
+    }
+
+    let pipeline = registry.get_pipeline("gather_qmv_fast_f16_q4", DType::Float16)?;
+    let dev = registry.device().raw();
+    let out = Array::zeros(dev, &[batch, n], DType::Float16);
+
+    let params: [u32; 4] = [
+        super::checked_u32(n, "N")?,
+        super::checked_u32(k, "K")?,
+        group_size,
+        super::checked_u32(batch, "batch")?,
+    ];
+    let opts = metal::MTLResourceOptions::StorageModeShared;
+    let params_buf = dev.new_buffer_with_data(
+        params.as_ptr() as *const _,
+        (params.len() * std::mem::size_of::<u32>()) as u64,
+        opts,
+    );
+
+    let cb = queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
+    enc.set_buffer(1, Some(w_packed_buf), 0);
+    enc.set_buffer(2, Some(scales_buf), 0);
+    enc.set_buffer(3, Some(biases_buf), 0);
+    enc.set_buffer(4, Some(indices.metal_buffer()), indices.offset() as u64);
+    enc.set_buffer(5, Some(out.metal_buffer()), 0);
+    enc.set_buffer(6, Some(&params_buf), 0);
+
+    let rows_per_tg: usize = 8; // NUM_SIMDGROUPS(2) * RESULTS_PER_SG(4)
+    let num_tgs_y = n.div_ceil(rows_per_tg);
+    let tg_size: u64 = 64; // 2 simdgroups x 32 lanes
+
+    let grid = metal::MTLSize::new(batch as u64, num_tgs_y as u64, 1);
+    let tg = metal::MTLSize::new(tg_size, 1, 1);
+
+    enc.dispatch_thread_groups(grid, tg);
+    enc.end_encoding();
+    super::commit_with_mode(cb, super::ExecMode::Sync);
+
+    Ok(out)
+}
+
 /// High-level MoE expert matrix-vector multiply for Q4 weights.
 ///
 /// Given a batch of input vectors and a set of pre-packed expert weights,
@@ -5711,10 +6750,18 @@ pub fn moe_expert_matmul_q4(
         }
     }
 
-    gather_qmv_fast_q4(
-        registry, x, &packed_w, &packed_s, &packed_b, indices, batch, n, k, n_experts, group_size,
-        queue,
-    )
+    // Route to f16 or f32 kernel based on input dtype
+    if x.dtype() == DType::Float16 {
+        gather_qmv_fast_f16_q4(
+            registry, x, &packed_w, &packed_s, &packed_b, indices, batch, n, k, n_experts,
+            group_size, queue,
+        )
+    } else {
+        gather_qmv_fast_q4(
+            registry, x, &packed_w, &packed_s, &packed_b, indices, batch, n, k, n_experts,
+            group_size, queue,
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -7220,6 +8267,90 @@ mod tests {
                 "naive output at {} is not finite: {}",
                 idx,
                 val
+            );
+        }
+    }
+
+    // =====================================================================
+    // f16 QMV kernel correctness tests
+    // =====================================================================
+
+    /// CPU reference: Q4 affine dequant + matvec for a single row of x.
+    fn cpu_qmv_q4_reference(
+        weights_u32: &[u32],
+        scales: &[f32],
+        biases: &[f32],
+        x: &[f32],
+        n: usize,
+        k: usize,
+        group_size: usize,
+    ) -> Vec<f32> {
+        let pack_factor = 8usize; // 32 / 4 bits
+        let u32s_per_row = k / pack_factor;
+        let groups_per_row = k / group_size;
+        let mut output = vec![0.0f32; n];
+
+        for row in 0..n {
+            let mut acc = 0.0f32;
+            for col in 0..k {
+                let word_idx = row * u32s_per_row + col / pack_factor;
+                let nibble_idx = col % pack_factor;
+                let word = weights_u32[word_idx];
+                let q_val = ((word >> (nibble_idx * 4)) & 0xF) as f32;
+
+                let group_idx = row * groups_per_row + col / group_size;
+                let scale = scales[group_idx];
+                let bias = biases[group_idx];
+                let w = scale * q_val + bias;
+                acc += w * x[col];
+            }
+            output[row] = acc;
+        }
+        output
+    }
+
+    #[test]
+    fn test_calc_batchqmv_k_partitions() {
+        // Enough spatial parallelism -> 1
+        assert_eq!(calc_batchqmv_k_partitions(16, 4096, 4096), 1);
+
+        // Low spatial parallelism -> split-K
+        let kp = calc_batchqmv_k_partitions(1, 512, 4096);
+        assert!(kp >= 2, "expected split-K for M=1 N=512 K=4096, got {kp}");
+        assert!(kp <= 8, "k_partitions too high: {kp}");
+
+        // Very small K -> capped by k/512
+        let kp2 = calc_batchqmv_k_partitions(1, 64, 1024);
+        assert_eq!(
+            kp2, 2,
+            "K=1024 has k/512=2 blocks, spatial_tgs=8 < 320, expected 2"
+        );
+    }
+
+    #[test]
+    fn test_qmv_f16_cpu_reference_consistency() {
+        // Verify our CPU reference produces sane results.
+        // 4-bit weights: each u32 holds 8 nibbles.
+        let n = 16;
+        let k = 512;
+        let group_size = 32;
+        let pack_factor = 8;
+        let u32s_per_row = k / pack_factor; // 64
+
+        // All nibbles = 1 (each u32 = 0x11111111)
+        let weights_u32: Vec<u32> = vec![0x11111111u32; n * u32s_per_row];
+        let groups_per_row = k / group_size;
+        let scales: Vec<f32> = vec![1.0; n * groups_per_row];
+        let biases: Vec<f32> = vec![0.0; n * groups_per_row];
+        let x: Vec<f32> = vec![1.0; k];
+
+        let output = cpu_qmv_q4_reference(&weights_u32, &scales, &biases, &x, n, k, group_size);
+
+        // Each row: sum of 512 * (1.0 * 1 + 0.0) * 1.0 = 512.0
+        for (i, &val) in output.iter().enumerate() {
+            assert!(
+                (val - 512.0).abs() < 1e-3,
+                "row {i}: expected 512.0, got {val}"
             );
         }
     }

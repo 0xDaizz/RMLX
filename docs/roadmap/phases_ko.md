@@ -41,6 +41,7 @@ rmlx 프로젝트의 구현 로드맵입니다. Phase 9B-opt 및 서빙 지원 P
 | H-2 | GEMM+잔차 에필로그 퓨전 | function constant 202 (has_residual), 대형 N에서 5-12% | G | ✅ 완료 |
 | I-1 | 분산 TP | DistributedTransformerModel, forward_with_group, shard_for_tp, TP=2 1.94x | H | ✅ 완료 |
 | J | 양자화 패리티 + 인프라 | QMM +73%, QMV +37% (MLX 1.15x), ExecGraph stall 제거, lazy.rs FusionCompiler, RMSNorm+GEMM fusion, Split-K, MoE fuse, forward_auto() | I | ✅ 완료 (J-3c/J-8 보류) |
+| DQ | Dual-Queue MoE Overlap 연구 | Metal 2-queue Attn∥MoE concurrent dispatch, 벤치마크 검증 | J | 🔬 연구 완료 |
 | S1 | Serving Quick Wins | GELU, RotatingKV, BatchKV | Phase 9 | ✅ 완료 |
 | S2 | DType + Quantization | FP8, GGUF, AWQ/GPTQ | Phase 9 | ✅ 완료 |
 | S3 | Attention Upgrade | Flash Attention 2, QuantizedKV | Phase 9 | ✅ 완료 |
@@ -966,6 +967,48 @@ Phase G 벤치마크에서 확인된 QMM/QMV MLX 격차 해소, ExecGraph inter-
 - [x] J-7: RDMA 2-node 벤치마크 연결
 - [ ] J-3c: ICB decode replay
 - [ ] J-8: MoE fused kernels (리뷰 중)
+
+---
+
+## 🔬 Phase DQ: Dual-Queue MoE Overlap 연구 — 연구 완료
+
+### 목표
+
+MoE prefill에서 expert당 M이 작아(M=4~32) GPU 활용률이 떨어지는 문제를 파이프라인 레벨에서 해결할 수 있는지 검증합니다. Metal dual-queue concurrent dispatch를 통해 bandwidth-bound MoE expert GEMM과 compute-bound attention projection을 동시 실행하여 wall-time을 줄이는 방법을 탐색합니다.
+
+### 배경
+
+MoE prefill (M=512, E=64~384, top_k=1~8)에서 전체 시퀀스를 처리하더라도 expert당 effective M은 4~32로 떨어집니다. 이 범위에서 QMM/QMV는 bandwidth-bound가 되어 GPU compute unit의 대부분이 유휴 상태가 됩니다. 반면 attention projection은 M=256에서 compute-bound로 GPU를 포화시킵니다. 두 workload의 자원 사용 패턴이 상보적이므로 concurrent dispatch의 이상적 후보입니다.
+
+### 벤치마크 결과 (M3 Ultra 80-core, Q4 expert vs FP16 attention)
+
+| 모델 | Expert (BW-bound) | Attention (Compute-bound) | Sequential | Concurrent | 감소율 | Expert 은닉률 |
+|------|-------------------|---------------------------|-----------|------------|--------|-------------|
+| DeepSeek-V3 (E=256, top8) | 419μs (M=16, K=7168, N=2048) | 5141μs (M=256, K=7168, N=24576) | 5321μs | 5234μs | **1.6%** | 21% |
+| Llama-4-Maverick (E=128, top1) | 304μs (M=4, K=5120, N=8192) | 1352μs (M=256, K=5120, N=5120) | 1646μs | 1428μs | **13.2%** | 72% |
+| Qwen3-235B (E=128, top8) | 726μs (M=32, K=4096, N=1536) | 1374μs (M=256, K=4096, N=8192) | 2089μs | 1572μs | **24.8%** | 71% |
+| Kimi-K2 (E=384, top8) | 364μs (M=11, K=7168, N=2048) | 2803μs (M=256, K=7168, N=12288) | 3106μs | 2988μs | **3.8%** | 32% |
+| GLM-5 (E=256, top8) | 385μs (M=16, K=6144, N=2048) | 3087μs (M=256, K=6144, N=16384) | 3410μs | 3338μs | **2.1%** | 19% |
+| MiniMax-M1 (E=32, top2) | 1409μs (M=32, K=6144, N=9216) | 1916μs (M=256, K=6144, N=8192) | 3338μs | 2183μs | **34.6%** | 82% |
+| MiniMax-M2.5 (E=256, top8) | 251μs (M=16, K=3072, N=1536) | 971μs (M=256, K=3072, N=6144) | 1236μs | 1108μs | **10.4%** | 51% |
+
+### 핵심 발견
+
+1. **Metal 2-queue에서 BW-bound ∥ compute-bound overlap이 실제로 동작함** — Apple의 "rare case" 발언에도 불구하고 이 조합에서 유효
+2. **Attn/Expert 시간 비율 1:1~1:3에서 효과 최대** — MiniMax-M1 (34.6%), Qwen3 (24.8%), Llama 4 (13.2%)에서 강한 효과
+3. **MLA 기반 모델(DeepSeek, Kimi, GLM)은 효과 적음** — attention이 압도적이어서 expert overlap 기여가 미미
+4. **기존 구현 사례 없음** — DeepSeek DualPipe, FoldMoE, COMET 등은 모두 multi-GPU 통신 overlap이며 단일 GPU Attn∥MoE overlap은 미개척
+5. **구현 방향**: Micro-batch pipeline — prefill sequence를 2+ micro-batch로 분할, Layer N MoE(Queue A) ∥ Layer N Attn for next micro-batch(Queue B) 교차 실행
+
+### 주요 산출물
+
+- `rmlx-core/benches/dual_queue_bench.rs`: 7개 모델 프로파일(DeepSeek V3, Llama 4, Qwen3, Kimi K2, GLM-5, MiniMax-M1, MiniMax-M2.5) dual-queue overlap 벤치마크
+
+### 향후 작업
+
+- [ ] Micro-batch pipeline을 TransformerModel에 구현 (forward_pipelined_dual_queue)
+- [ ] 실제 transformer 32-layer에서 end-to-end overlap 효과 측정
+- [ ] Optimal micro-batch 수 탐색 (MB당 M 감소 vs pipeline fill rate trade-off)
 
 ---
 
