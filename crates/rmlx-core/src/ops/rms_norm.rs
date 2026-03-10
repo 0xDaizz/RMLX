@@ -1393,3 +1393,111 @@ pub fn rms_norm_residual_add(
 
     Ok((out, residual_buf))
 }
+
+/// CB-based fused RMSNorm + residual add for pipeline use.
+///
+/// Like [`rms_norm_residual_add`] but encodes into an existing command buffer
+/// instead of creating and committing its own.  The caller manages the CB
+/// lifecycle.
+///
+/// **IMPORTANT**: The residual is copied before mutation.  The returned
+/// `residual_buf` contains `input + residual` (the updated hidden state *h*).
+///
+/// All inputs must be contiguous (which they are in the prefill pipeline where
+/// every array comes from GEMM / attention output).
+pub fn rms_norm_residual_add_into_cb(
+    registry: &KernelRegistry,
+    input: &Array,
+    residual: &Array,
+    weight: &Array,
+    eps: f32,
+    cb: &metal::CommandBufferRef,
+) -> Result<(Array, Array), KernelError> {
+    if input.ndim() != 2 {
+        return Err(KernelError::InvalidShape(format!(
+            "rms_norm_residual_add requires 2D input, got {}D",
+            input.ndim()
+        )));
+    }
+    if residual.shape() != input.shape() {
+        return Err(KernelError::InvalidShape(format!(
+            "residual shape {:?} does not match input shape {:?}",
+            residual.shape(),
+            input.shape()
+        )));
+    }
+    if weight.ndim() != 1 {
+        return Err(KernelError::InvalidShape(format!(
+            "rms_norm_residual_add requires 1D weight, got {}D",
+            weight.ndim()
+        )));
+    }
+    let axis_size_usize = input.shape()[1];
+    if weight.shape()[0] != axis_size_usize {
+        return Err(KernelError::InvalidShape(format!(
+            "axis size mismatch: input[1]={} vs weight[0]={}",
+            axis_size_usize,
+            weight.shape()[0]
+        )));
+    }
+    if input.dtype() != residual.dtype() || input.dtype() != weight.dtype() {
+        return Err(KernelError::InvalidShape(format!(
+            "dtype mismatch: input={:?}, residual={:?}, weight={:?}",
+            input.dtype(),
+            residual.dtype(),
+            weight.dtype()
+        )));
+    }
+
+    // In the prefill pipeline all arrays are contiguous (GEMM/attention output).
+    if !input.is_contiguous() {
+        return Err(KernelError::InvalidShape(
+            "rms_norm_residual_add_into_cb: input must be contiguous".into(),
+        ));
+    }
+    if !residual.is_contiguous() {
+        return Err(KernelError::InvalidShape(
+            "rms_norm_residual_add_into_cb: residual must be contiguous".into(),
+        ));
+    }
+    if !weight.is_contiguous() {
+        return Err(KernelError::InvalidShape(
+            "rms_norm_residual_add_into_cb: weight must be contiguous".into(),
+        ));
+    }
+
+    // Fresh copy of residual — the kernel mutates it in-place.
+    let residual_buf = super::copy::copy_into_cb(registry, residual, cb)?;
+
+    let w_stride: u32 = weight.strides()[0] as u32;
+    let has_w: u32 = 1;
+
+    let kernel_name = rms_residual_add_kernel_name(input.dtype())?;
+    let pipeline = registry.get_pipeline(kernel_name, input.dtype())?;
+
+    let rows = input.shape()[0];
+    let axis_size = super::checked_u32(axis_size_usize, "axis_size")?;
+
+    let out = Array::zeros(registry.device().raw(), input.shape(), input.dtype());
+
+    let encoder = cb.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
+    encoder.set_buffer(
+        1,
+        Some(residual_buf.metal_buffer()),
+        residual_buf.offset() as u64,
+    );
+    encoder.set_buffer(2, Some(weight.metal_buffer()), weight.offset() as u64);
+    encoder.set_buffer(3, Some(out.metal_buffer()), 0);
+    encoder.set_bytes(4, 4, &axis_size as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(5, 4, &eps as *const f32 as *const std::ffi::c_void);
+    encoder.set_bytes(6, 4, &w_stride as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(7, 4, &has_w as *const u32 as *const std::ffi::c_void);
+
+    let tg_size = std::cmp::min(1024, pipeline.max_total_threads_per_threadgroup());
+    encoder.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), MTLSize::new(tg_size, 1, 1));
+    encoder.end_encoding();
+
+    Ok((out, residual_buf))
+}

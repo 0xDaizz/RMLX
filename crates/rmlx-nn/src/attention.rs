@@ -3193,7 +3193,7 @@ impl Attention {
         rms_norm_eps: f32,
         cos_freqs: Option<&Array>,
         sin_freqs: Option<&Array>,
-        mask: Option<&Array>,
+        _mask: Option<&Array>, // unused: all kernels handle causal masking via is_causal FC
         cache: &mut LayerKvCache,
         registry: &KernelRegistry,
         cb: &metal::CommandBufferRef,
@@ -3204,23 +3204,42 @@ impl Attention {
         let hidden_size = num_heads * head_dim;
         let seq_len = x.shape()[0];
 
-        // RMS norm (pre-attention)
-        let normed =
-            ops::rms_norm::rms_norm_into_cb(registry, x, Some(norm_weight), rms_norm_eps, cb)?;
-
-        // Q/K/V projections — merged into a single GEMM dispatch when available.
+        // Q/K/V projections with fused RMSNorm
+        // For MlxArch (seq_len >= 33), fuse RMSNorm into GEMM to eliminate
+        // intermediate normalized tensor write+read (~16MB at seq=2048).
         let q_dim = num_heads * head_dim;
         let k_dim = num_kv_heads * head_dim;
         let v_dim = num_kv_heads * head_dim;
         let (q, k, v) = {
-            let normed_2d = if normed.ndim() == 1 {
-                normed.reshape(vec![1, normed.shape()[0]])?
+            let x_2d = if x.ndim() == 1 {
+                x.reshape(vec![1, x.shape()[0]])?
             } else {
-                normed.reshape(vec![normed.shape()[0], normed.shape()[1]])?
+                x.reshape(vec![x.shape()[0], x.shape()[1]])?
             };
+
             if let Some(ref qkv_wt) = self.qkv_merged_weight_t {
-                // Single merged GEMM: [seq_len, hidden] @ [hidden, q+k+v] = [seq_len, q+k+v]
-                let qkv = ops::matmul::matmul_into_cb(registry, &normed_2d, qkv_wt, cb)?;
+                // Try fused norm+GEMM first (requires MlxArch: M>=33, N>=33)
+                let qkv = if seq_len >= 33 {
+                    ops::matmul::matmul_norm_gemm_into_cb(
+                        registry,
+                        &x_2d,
+                        qkv_wt,
+                        norm_weight,
+                        rms_norm_eps,
+                        cb,
+                    )?
+                } else {
+                    // Small seq: fall back to separate norm + GEMM
+                    let normed = ops::rms_norm::rms_norm_into_cb(
+                        registry,
+                        x,
+                        Some(norm_weight),
+                        rms_norm_eps,
+                        cb,
+                    )?;
+                    let normed_2d = normed.reshape(vec![normed.shape()[0], normed.shape()[1]])?;
+                    ops::matmul::matmul_into_cb(registry, &normed_2d, qkv_wt, cb)?
+                };
                 let total_out = q_dim + k_dim + v_dim;
                 let elem_size = qkv.dtype().size_of();
                 // Offset slice views (non-contiguous: stride[0] = total_out)
@@ -3249,7 +3268,20 @@ impl Attention {
                 // RoPE/deinterleave kernels accept input_row_stride, so no copy needed.
                 (q_view, k_view, v_view)
             } else {
-                // Fallback: 3 separate GEMMs
+                // Fallback: separate norm + 3 separate GEMMs
+                // (batched_qkv_proj_into doesn't support norm fusion)
+                let normed = ops::rms_norm::rms_norm_into_cb(
+                    registry,
+                    x,
+                    Some(norm_weight),
+                    rms_norm_eps,
+                    cb,
+                )?;
+                let normed_2d = if normed.ndim() == 1 {
+                    normed.reshape(vec![1, normed.shape()[0]])?
+                } else {
+                    normed.reshape(vec![normed.shape()[0], normed.shape()[1]])?
+                };
                 let wq_t = self.q_proj.weight_transposed_contiguous()?;
                 let wk_t = self.k_proj.weight_transposed_contiguous()?;
                 let wv_t = self.v_proj.weight_transposed_contiguous()?;
@@ -3361,14 +3393,20 @@ impl Attention {
         // K/V slabs: from cache slab (or direct RoPE output on initial prefill)
         let scale = 1.0 / (head_dim as f32).sqrt();
 
-        // 3-way SDPA dispatch for prefill (f16, D=128, seq_len>1):
-        //   1. NAX  — highest throughput, requires supports_nax && no explicit mask
-        //   2. MMA BK=16 — default MMA path, accepts mask
-        //   3. GQA slab  — scalar fallback for non-f16 or non-D128
+        // 4-way SDPA dispatch for prefill (f16, D=128, seq_len>1):
+        //   1. NAX      — highest throughput (BQ=64, BK=32, register-only)
+        //   2. MMA BK=32 — fewer K-loop iterations, better for longer sequences
+        //   3. MMA BK=16 — short sequences or fallback
+        //   4. GQA slab  — scalar fallback for non-f16 or non-D128
+        //
+        // All MMA/NAX kernels handle causal masking internally via is_causal FC 300,
+        // so no explicit mask is needed for standard causal attention.
         let is_f16_d128 = q_batched.dtype() == DType::Float16 && head_dim == 128 && seq_len > 1;
 
-        // NAX: best throughput. Only when no explicit mask (NAX uses is_causal flag only).
-        let use_nax = is_f16_d128 && mask.is_none() && registry.device().tuning().supports_nax;
+        // NAX: best throughput. Kernel handles causal via is_causal FC — no explicit mask needed.
+        let use_nax = is_f16_d128 && registry.device().tuning().supports_nax;
+        // BK=32: fewer K-loop iterations, wins when KV sequence is long enough.
+        let use_mma_bk32 = is_f16_d128 && !use_nax && total_seq >= 256;
 
         // Track output layout: MMA writes seq-major, NAX and scalar write head-major.
         let seq_major_output = is_f16_d128 && !use_nax;
@@ -3386,11 +3424,29 @@ impl Attention {
                 total_seq,
                 kv_stride,
                 scale,
-                true, // is_causal — always true when no explicit mask
+                true, // is_causal
+                cb,
+            )?
+        } else if use_mma_bk32 {
+            // BK=32: fewer K-loop iterations, better for longer sequences
+            ops::sdpa::sdpa_prefill_mma_bk32_f16_into_cb(
+                registry,
+                &q_batched,
+                &k_for_sdpa,
+                &v_for_sdpa,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                seq_len,
+                total_seq,
+                kv_stride,
+                None, // kernel handles causal internally
+                scale,
+                true, // is_causal
                 cb,
             )?
         } else if is_f16_d128 {
-            // MMA BK=16 (default MMA path, supports explicit mask)
+            // MMA BK=16: short sequences or fallback
             ops::sdpa::sdpa_prefill_mma_f16_into_cb(
                 registry,
                 &q_batched,
@@ -3402,9 +3458,9 @@ impl Attention {
                 seq_len,
                 total_seq,
                 kv_stride,
-                mask,
+                None, // kernel handles causal internally
                 scale,
-                mask.is_none(),
+                true, // is_causal
                 cb,
             )?
         } else {
@@ -3419,9 +3475,9 @@ impl Attention {
                 seq_len,
                 total_seq,
                 kv_stride,
-                mask,
+                None, // kernel handles causal internally
                 scale,
-                mask.is_none(),
+                true, // is_causal
                 cb,
             )?
         };

@@ -2991,10 +2991,15 @@ impl TransformerBlock {
             cb,
         )?;
 
-        // Residual + pre-FFN norm
-        let h = ops::binary::add_into_cb(registry, x, &attn_out, cb)?;
-        let normed2 =
-            ops::rms_norm::rms_norm_into_cb(registry, &h, Some(norm2_w), self.rms_norm_eps, cb)?;
+        // Fused residual + pre-FFN norm (1 dispatch instead of 2)
+        let (normed2, h) = ops::rms_norm::rms_norm_residual_add_into_cb(
+            registry,
+            &attn_out, // input = attention output
+            x,         // residual = original input
+            norm2_w,
+            self.rms_norm_eps,
+            cb,
+        )?;
 
         // FFN (all in same CB)
         self.ffn.forward_single_cb(&normed2, &h, registry, cb)
@@ -3044,10 +3049,15 @@ impl TransformerBlock {
             cb,
         )?;
 
-        // Residual + pre-FFN norm
-        let h = ops::binary::add_into_cb(registry, x, &attn_out, cb)?;
-        let normed2 =
-            ops::rms_norm::rms_norm_into_cb(registry, &h, Some(norm2_w), self.rms_norm_eps, cb)?;
+        // Fused residual + pre-FFN norm (1 dispatch instead of 2)
+        let (normed2, h) = ops::rms_norm::rms_norm_residual_add_into_cb(
+            registry,
+            &attn_out, // input = attention output
+            x,         // residual = original input
+            norm2_w,
+            self.rms_norm_eps,
+            cb,
+        )?;
 
         // FFN (all in same CB)
         self.ffn.forward_single_cb(&normed2, &h, registry, cb)
