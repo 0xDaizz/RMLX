@@ -481,6 +481,112 @@ kernel void affine_qmv_fast_q4(
 }
 
 // -----------------------------------------------------------------------
+// affine_qmv_batched_q4: Batched QMV for Q4 with M > 1.
+//
+// Identical to affine_qmv_fast_q4 but dispatches M independent
+// vector-matrix products via grid.x = M.  Each batch index m
+// reads x[m * in_features + ...] and writes output[m * out_features + ...].
+//
+// Grid:  (M, ceil(N / 8), 1)
+// Group: (32, 2, 1) = 64 threads = 2 simdgroups
+// params.w = M
+// -----------------------------------------------------------------------
+
+kernel void affine_qmv_batched_q4(
+    device const uint32_t* weights  [[buffer(0)]],
+    device const float*    scales   [[buffer(1)]],
+    device const float*    biases   [[buffer(2)]],
+    device const float*    x_in     [[buffer(3)]],
+    device float*          output   [[buffer(4)]],
+    constant uint4&        params   [[buffer(5)]],
+    uint3 tgid      [[threadgroup_position_in_grid]],
+    uint simd_gid   [[simdgroup_index_in_threadgroup]],
+    uint simd_lid   [[thread_index_in_simdgroup]])
+{
+    const int out_features = int(params.x);
+    const int in_features  = int(params.y);
+    const int group_size   = int(params.z);
+    const int M            = int(params.w);
+    // bits == 4
+
+    const int m_idx = int(tgid.x);  // batch index
+    if (m_idx >= M) return;
+
+    const int in_vec_size_w = in_features / QMV_Q4_PACK_FACTOR;  // uint32s per row
+    const int in_vec_size_g = in_features / group_size;           // groups per row
+    const int scale_step    = group_size / QMV_Q4_VALUES_PER_THREAD;
+
+    const int out_row = int(tgid.y) * (QMV_Q4_NUM_SIMDGROUPS * QMV_Q4_RESULTS_PER_SG)
+                      + simd_gid * QMV_Q4_RESULTS_PER_SG;
+
+    if (out_row >= out_features) return;
+
+    // Pointer setup: each thread starts at its slice of K
+    device const uint8_t* ws = (device const uint8_t*)(weights)
+        + out_row * in_vec_size_w * 4      // row offset in bytes
+        + simd_lid * QMV_Q4_PACKS_PER_THREAD * 4;  // thread offset in bytes
+    device const float* sl = scales + out_row * in_vec_size_g
+        + simd_lid / scale_step;
+    device const float* bl = biases + out_row * in_vec_size_g
+        + simd_lid / scale_step;
+    // Select row m from the input matrix
+    device const float* x = x_in + m_idx * in_features + simd_lid * QMV_Q4_VALUES_PER_THREAD;
+
+    float result[QMV_Q4_RESULTS_PER_SG] = {0, 0, 0, 0};
+
+    for (int k = 0; k < in_features; k += QMV_Q4_BLOCK_SIZE) {
+        // --- load_vector: pre-divide x for Q4 qdot ---
+        float x_thread[QMV_Q4_VALUES_PER_THREAD];
+        float xsum = 0.0f;
+
+        for (int i = 0; i < QMV_Q4_VALUES_PER_THREAD; i += 4) {
+            float v0 = x[i];
+            float v1 = x[i + 1];
+            float v2 = x[i + 2];
+            float v3 = x[i + 3];
+            xsum += v0 + v1 + v2 + v3;
+            x_thread[i]     = v0;
+            x_thread[i + 1] = v1 / 16.0f;
+            x_thread[i + 2] = v2 / 256.0f;
+            x_thread[i + 3] = v3 / 4096.0f;
+        }
+
+        // --- qdot for each output row ---
+        for (int row = 0; row < QMV_Q4_RESULTS_PER_SG; row++) {
+            device const uint8_t* wl = ws + row * in_vec_size_w * 4;
+            float s = sl[row * in_vec_size_g];
+            float b = bl[row * in_vec_size_g];
+
+            if (row + out_row < out_features) {
+                device const uint16_t* wp = (device const uint16_t*)wl;
+                float accum = 0.0f;
+                for (int i = 0; i < QMV_Q4_VALUES_PER_THREAD / 4; i++) {
+                    accum += x_thread[4 * i]     * float(wp[i] & 0x000fu)
+                           + x_thread[4 * i + 1] * float(wp[i] & 0x00f0u)
+                           + x_thread[4 * i + 2] * float(wp[i] & 0x0f00u)
+                           + x_thread[4 * i + 3] * float(wp[i] & 0xf000u);
+                }
+                result[row] += s * accum + xsum * b;
+            }
+        }
+
+        // Advance pointers by block_size
+        ws += QMV_Q4_BLOCK_SIZE / QMV_Q4_PACK_FACTOR * 4;  // bytes
+        sl += QMV_Q4_BLOCK_SIZE / group_size;
+        bl += QMV_Q4_BLOCK_SIZE / group_size;
+        x  += QMV_Q4_BLOCK_SIZE;
+    }
+
+    // simd_sum reduction + direct write to row m of output
+    for (int row = 0; row < QMV_Q4_RESULTS_PER_SG; row++) {
+        result[row] = simd_sum(result[row]);
+        if (simd_lid == 0 && out_row + row < out_features) {
+            output[m_idx * out_features + out_row + row] = result[row];
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
 // affine_qmv_fast_q8: MLX qmv_fast_impl port for Q8.
 //
 // Same multi-row + K-striding structure as Q4.
@@ -671,6 +777,7 @@ pub fn register(registry: &KernelRegistry) -> Result<(), KernelError> {
     registry.register_jit_source("quantized", QUANTIZED_SHADER_SOURCE)?;
     register_qmm(registry)?;
     register_gather_qmm(registry)?;
+    register_gather_qmv(registry)?;
     Ok(())
 }
 
@@ -769,6 +876,115 @@ pub fn affine_quantized_matmul(
 
     enc.dispatch_thread_groups(
         metal::MTLSize::new(1, num_tgs_y, 1),
+        metal::MTLSize::new(tg_size, 1, 1),
+    );
+    enc.end_encoding();
+    super::commit_with_mode(cb, super::ExecMode::Sync);
+
+    Ok(out)
+}
+
+/// Batched affine quantized matrix-vector multiply for Q4 weights.
+///
+/// Computes `output[m, :] = dequant(weights) @ x[m, :]` for each batch index m.
+/// This is equivalent to calling `affine_quantized_matmul` M times, but fused
+/// into a single GPU dispatch with grid.x = M.
+///
+/// # Arguments
+/// - `registry`: kernel registry (must have `quantized` source registered).
+/// - `qw`: the quantized weight description (must be 4-bit).
+/// - `x`: f32 input matrix of shape `[M, in_features]`.
+/// - `queue`: Metal command queue for dispatch.
+///
+/// # Returns
+/// A 2-D f32 `Array` of shape `[M, out_features]`.
+pub fn affine_qmv_batched_q4(
+    registry: &KernelRegistry,
+    qw: &QuantizedWeight,
+    x: &Array,
+    queue: &metal::CommandQueue,
+) -> Result<Array, KernelError> {
+    // --- Validate bit width ---
+    if qw.bits != 4 {
+        return Err(KernelError::InvalidShape(format!(
+            "affine_qmv_batched_q4 requires 4-bit weights, got {}-bit",
+            qw.bits
+        )));
+    }
+
+    // --- Validate input ---
+    if x.dtype() != DType::Float32 {
+        return Err(KernelError::InvalidShape(format!(
+            "affine_qmv_batched_q4 requires Float32 input, got {:?}",
+            x.dtype()
+        )));
+    }
+    let shape = x.shape();
+    if shape.len() != 2 {
+        return Err(KernelError::InvalidShape(format!(
+            "affine_qmv_batched_q4 requires 2-D input [M, K], got shape {:?}",
+            shape
+        )));
+    }
+    let m = shape[0];
+    let k = shape[1];
+    if k != qw.in_features {
+        return Err(KernelError::InvalidShape(format!(
+            "x.shape[1] ({k}) != in_features ({})",
+            qw.in_features
+        )));
+    }
+    if m == 0 {
+        return Err(KernelError::InvalidShape(
+            "affine_qmv_batched_q4: M must be > 0".into(),
+        ));
+    }
+    // Q4 QMV block_size = 512 (values_per_thread=16 × 32 lanes).
+    // K must be a multiple of block_size to avoid OOB reads in the shader.
+    const QMV_Q4_BLOCK_SIZE: usize = 512;
+    if k % QMV_Q4_BLOCK_SIZE != 0 {
+        return Err(KernelError::InvalidShape(format!(
+            "affine_qmv_batched_q4: in_features ({k}) must be a multiple of {QMV_Q4_BLOCK_SIZE}"
+        )));
+    }
+
+    let n = qw.out_features;
+    let pipeline = registry.get_pipeline("affine_qmv_batched_q4", DType::Float32)?;
+    let out = Array::zeros(registry.device().raw(), &[m, n], DType::Float32);
+
+    // params: (out_features, in_features, group_size, M)
+    let params: [u32; 4] = [
+        super::checked_u32(n, "out_features")?,
+        super::checked_u32(k, "in_features")?,
+        qw.group_size,
+        super::checked_u32(m, "M")?,
+    ];
+
+    let dev = registry.device().raw();
+    let opts = metal::MTLResourceOptions::StorageModeShared;
+    let params_buf = dev.new_buffer_with_data(
+        params.as_ptr() as *const _,
+        (params.len() * std::mem::size_of::<u32>()) as u64,
+        opts,
+    );
+
+    let cb = queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_buffer(0, Some(&qw.weights_buf), 0);
+    enc.set_buffer(1, Some(&qw.scales_buf), 0);
+    enc.set_buffer(2, Some(&qw.biases_buf), 0);
+    enc.set_buffer(3, Some(x.metal_buffer()), x.offset() as u64);
+    enc.set_buffer(4, Some(out.metal_buffer()), 0);
+    enc.set_buffer(5, Some(&params_buf), 0);
+
+    // Grid: (M, ceil(N / 8), 1) — M batches × N-tile groups
+    let rows_per_tg: u64 = 8; // NUM_SIMDGROUPS(2) * RESULTS_PER_SG(4)
+    let num_tgs_y = (n as u64).div_ceil(rows_per_tg);
+    let tg_size: u64 = 64; // 2 simdgroups × 32
+
+    enc.dispatch_thread_groups(
+        metal::MTLSize::new(m as u64, num_tgs_y, 1),
         metal::MTLSize::new(tg_size, 1, 1),
     );
     enc.end_encoding();
@@ -2646,6 +2862,276 @@ kernel void skinny_qmm_reduce(
 "#;
 
 // ---------------------------------------------------------------------------
+// Metal shader source -- Tiny-M Q4 QMM kernel (BM=8, BN=64, BK=32)
+// ---------------------------------------------------------------------------
+
+/// Tiny-M Q4 QMM kernel for M = 2-16.
+///
+/// When M is very small (2-16), the skinny kernel (BM=32) wastes 50-75% of
+/// compute on zero-padded rows. This kernel uses BM=8 to eliminate that waste.
+///
+/// Key differences from the skinny kernel:
+/// - BM=8, BN=64, BK=32: much narrower M tile for tiny batch sizes
+/// - TG memory: As[8×32]=512 halves=1KB + Bs[32×64]=4KB = 5KB (high occupancy)
+/// - 1 MMA row-fragment (BM/8=1), 4 MMA col-fragments per SG ((BN/2)/8=4)
+/// - Built-in split-K via grid.z (same mechanism as skinny)
+/// - Separate reduce kernel accumulates partial sums (reuses same pattern)
+pub const QMM_TINY_SHADER_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant constexpr uint TBM = 8;
+constant constexpr uint TBN = 64;
+constant constexpr uint TBK = 32;
+constant constexpr uint TTM = 1;   // TBM / 8 = 8/8
+constant constexpr uint TTN = 4;   // (TBN/2) / 8 = 32/8
+
+constant bool tiny_align_M [[function_constant(210)]];
+constant bool tiny_align_N [[function_constant(211)]];
+constant uint tiny_fc_group_size [[function_constant(212)]];
+
+#if __METAL_VERSION__ >= 310
+template <typename T>
+METAL_FUNC uniform<T> tiny_as_uniform(T val) {
+    return make_uniform(val);
+}
+#else
+template <typename T>
+METAL_FUNC T tiny_as_uniform(T val) {
+    return val;
+}
+#endif
+
+// Tiny-M Q4 QMM with split-K support.
+// Grid: (ceil(N/TBN), ceil(M/TBM), k_partitions)
+// When k_partitions == 1, writes directly to output.
+// When k_partitions > 1, writes partial sums to c_split[partition * M * N].
+kernel void affine_qmm_tiny_q4(
+    device const float*   x         [[buffer(0)]],
+    device const uint8_t* w_packed  [[buffer(1)]],
+    device const float*   scales    [[buffer(2)]],
+    device const float*   biases    [[buffer(3)]],
+    device float*         output    [[buffer(4)]],
+    constant uint&        M         [[buffer(5)]],
+    constant uint&        N         [[buffer(6)]],
+    constant uint&        K         [[buffer(7)]],
+    constant uint&        k_partitions [[buffer(8)]],
+    uint3 group_id        [[threadgroup_position_in_grid]],
+    uint  tid_in_group    [[thread_index_in_threadgroup]],
+    uint  sgid            [[simdgroup_index_in_threadgroup]],
+    uint  lane_id         [[thread_index_in_simdgroup]])
+{
+    threadgroup half As[TBM * TBK];   // 8x32 = 256 halves = 512B
+    threadgroup half Bs[TBK * TBN];   // 32x64 = 2048 halves = 4KB  (total ~4.5KB)
+
+    const uint row_start = group_id.y * tiny_as_uniform(TBM);
+    const uint col_start = group_id.x * tiny_as_uniform(TBN);
+    const uint partition_id = group_id.z;
+
+    const uint uK = tiny_as_uniform(K);
+    const uint uM = tiny_as_uniform(M);
+    const uint uN = tiny_as_uniform(N);
+    const uint u_k_parts = tiny_as_uniform(k_partitions);
+    const uint groups_per_row = uK / tiny_fc_group_size;
+    const uint half_k = uK / 2;
+
+    if (!tiny_align_M && row_start >= uM) return;
+    if (!tiny_align_N && col_start >= uN) return;
+
+    // Split-K: compute K range for this partition
+    const uint k_per_part = ((uK + u_k_parts - 1) / u_k_parts);
+    // Round up to TBK boundary
+    const uint k_per_part_aligned = ((k_per_part + TBK - 1) / TBK) * TBK;
+    const uint k_start = partition_id * k_per_part_aligned;
+    uint k_end = k_start + k_per_part_aligned;
+    if (k_end > uK) k_end = uK;
+    if (k_start >= uK) return;
+
+    // SG grid: 1x2 -- each SG covers 32 cols
+    const uint base_n = sgid * 32;
+
+    simdgroup_float8x8 acc[TTM][TTN];
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < TTM; i++)
+        #pragma clang loop unroll(full)
+        for (uint j = 0; j < TTN; j++)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    const uint n_k_tiles = (k_end - k_start + TBK - 1) / TBK;
+
+    for (uint tile = 0; tile < n_k_tiles; tile++) {
+        uint kb = k_start + tile * TBK;
+
+        // Load A: 64 threads load 8×32 = 256 halves (4 per thread)
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            // 256 elements / 64 threads = 4 elements per thread
+            uint a_idx = tid_in_group * 4;
+            uint a_row = a_idx / TBK;        // 0..7
+            uint a_col_base = a_idx % TBK;   // 0..28 (step 4)
+
+            if (a_row < TBM) {
+                uint gr = row_start + a_row;
+                if ((tiny_align_M || gr < uM) && kb + a_col_base + 3 < k_end) {
+                    As[a_row * TBK + a_col_base + 0] = half(x[gr * uK + kb + a_col_base + 0]);
+                    As[a_row * TBK + a_col_base + 1] = half(x[gr * uK + kb + a_col_base + 1]);
+                    As[a_row * TBK + a_col_base + 2] = half(x[gr * uK + kb + a_col_base + 2]);
+                    As[a_row * TBK + a_col_base + 3] = half(x[gr * uK + kb + a_col_base + 3]);
+                } else if (tiny_align_M || gr < uM) {
+                    for (uint d = 0; d < 4; d++) {
+                        uint gk = kb + a_col_base + d;
+                        As[a_row * TBK + a_col_base + d] = (gk < k_end)
+                            ? half(x[gr * uK + gk]) : half(0);
+                    }
+                } else {
+                    As[a_row * TBK + a_col_base + 0] = half(0);
+                    As[a_row * TBK + a_col_base + 1] = half(0);
+                    As[a_row * TBK + a_col_base + 2] = half(0);
+                    As[a_row * TBK + a_col_base + 3] = half(0);
+                }
+            }
+        }
+
+        // Load B: Q4 dequant, 64 threads load 32×64 = 2048 halves (32 per thread)
+        // Same B-loader as skinny kernel: tid/2 → k-row (0..31), (tid%2)*32 → n-col base
+        {
+            uint bi = tid_in_group >> 1;          // 0..31
+            uint bj = (tid_in_group & 1u) << 5;   // 0 or 32
+            uint gk = kb + bi;
+            uint gc = col_start + bj;
+
+            if (gk < k_end && (tiny_align_N || gc + 31 < uN)) {
+                uint group_idx = gk / tiny_fc_group_size;
+                uint byte_idx_base = gk / 2;
+                bool is_lo = (gk & 1u) == 0;
+
+                for (uint d = 0; d < 32; d += 4) {
+                    uchar4 packed4 = uchar4(
+                        w_packed[(gc + d + 0) * half_k + byte_idx_base],
+                        w_packed[(gc + d + 1) * half_k + byte_idx_base],
+                        w_packed[(gc + d + 2) * half_k + byte_idx_base],
+                        w_packed[(gc + d + 3) * half_k + byte_idx_base]
+                    );
+                    float s0 = scales[(gc + d + 0) * groups_per_row + group_idx];
+                    float s1 = scales[(gc + d + 1) * groups_per_row + group_idx];
+                    float s2 = scales[(gc + d + 2) * groups_per_row + group_idx];
+                    float s3 = scales[(gc + d + 3) * groups_per_row + group_idx];
+                    float b0 = biases[(gc + d + 0) * groups_per_row + group_idx];
+                    float b1 = biases[(gc + d + 1) * groups_per_row + group_idx];
+                    float b2 = biases[(gc + d + 2) * groups_per_row + group_idx];
+                    float b3 = biases[(gc + d + 3) * groups_per_row + group_idx];
+
+                    if (is_lo) {
+                        Bs[bi * 64 + bj + d + 0] = half(s0 * float(packed4.x & 0x0F) + b0);
+                        Bs[bi * 64 + bj + d + 1] = half(s1 * float(packed4.y & 0x0F) + b1);
+                        Bs[bi * 64 + bj + d + 2] = half(s2 * float(packed4.z & 0x0F) + b2);
+                        Bs[bi * 64 + bj + d + 3] = half(s3 * float(packed4.w & 0x0F) + b3);
+                    } else {
+                        Bs[bi * 64 + bj + d + 0] = half(s0 * float((packed4.x >> 4) & 0x0F) + b0);
+                        Bs[bi * 64 + bj + d + 1] = half(s1 * float((packed4.y >> 4) & 0x0F) + b1);
+                        Bs[bi * 64 + bj + d + 2] = half(s2 * float((packed4.z >> 4) & 0x0F) + b2);
+                        Bs[bi * 64 + bj + d + 3] = half(s3 * float((packed4.w >> 4) & 0x0F) + b3);
+                    }
+                }
+            } else {
+                for (uint d = 0; d < 32; d++) {
+                    uint gn = gc + d;
+                    half val = half(0);
+                    if (gk < k_end && (tiny_align_N || gn < uN)) {
+                        uint byte_idx = gk / 2;
+                        uint8_t packed_b = w_packed[gn * half_k + byte_idx];
+                        uint group_idx = gk / tiny_fc_group_size;
+                        float scale_b = scales[gn * groups_per_row + group_idx];
+                        float bias_b  = biases[gn * groups_per_row + group_idx];
+                        bool is_lo_s = (gk & 1u) == 0;
+                        uint nibble = is_lo_s ? (packed_b & 0x0F) : ((packed_b >> 4) & 0x0F);
+                        val = half(scale_b * float(nibble) + bias_b);
+                    }
+                    Bs[bi * 64 + bj + d] = val;
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // MMA compute: BK=32 → 4 k-steps of 8
+        // TTM=1, TTN=4: 1×4 = 4 MMA ops per SG per k-step
+        #pragma clang loop unroll(full)
+        for (uint kk = 0; kk < 4; kk++) {
+            simdgroup_half8x8 a_frag[TTM];
+            simdgroup_half8x8 b_frag[TTN];
+
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < TTM; i++)
+                simdgroup_load(a_frag[i], &As[(i * 8) * TBK + kk * 8], TBK);
+
+            #pragma clang loop unroll(full)
+            for (uint j = 0; j < TTN; j++)
+                simdgroup_load(b_frag[j], &Bs[kk * 8 * 64 + (base_n + j * 8)], 64);
+
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < TTM; i++) {
+                #pragma clang loop unroll(full)
+                for (uint j = 0; j < TTN; j++) {
+                    simdgroup_multiply_accumulate(
+                        acc[i][j], a_frag[i], b_frag[j], acc[i][j]);
+                }
+            }
+        }
+    }
+
+    // Store: direct register store
+    const uint partition_stride = uM * uN;
+    device float* out_ptr = (u_k_parts > 1)
+        ? output + partition_id * partition_stride
+        : output;
+
+    const uint qid = lane_id / 4;
+    const uint fm = (qid & 4u) + ((lane_id / 2u) % 4u);
+    const uint fn_val = (qid & 2u) * 2u + (lane_id % 2u) * 2u;
+
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < TTM; i++) {
+        #pragma clang loop unroll(full)
+        for (uint j = 0; j < TTN; j++) {
+            uint gr = row_start + i * 8 + fm;
+            uint gc0 = col_start + base_n + j * 8 + fn_val;
+            uint gc1 = gc0 + 1;
+
+            auto elems = acc[i][j].thread_elements();
+
+            if (tiny_align_M && tiny_align_N) {
+                out_ptr[gr * uN + gc0] = elems[0];
+                out_ptr[gr * uN + gc1] = elems[1];
+            } else {
+                if ((tiny_align_M || gr < uM) && (tiny_align_N || gc0 < uN))
+                    out_ptr[gr * uN + gc0] = elems[0];
+                if ((tiny_align_M || gr < uM) && (tiny_align_N || gc1 < uN))
+                    out_ptr[gr * uN + gc1] = elems[1];
+            }
+        }
+    }
+}
+
+// Reduce split-K partial sums for tiny kernel (reuses same pattern)
+kernel void tiny_qmm_reduce(
+    device const float* partial [[buffer(0)]],
+    device float* output        [[buffer(1)]],
+    constant uint& N            [[buffer(2)]],
+    constant uint& k_partitions [[buffer(3)]],
+    constant uint& mn_total     [[buffer(4)]],
+    uint id [[thread_position_in_grid]])
+{
+    if (id >= mn_total) return;
+    float sum = 0.0f;
+    for (uint p = 0; p < k_partitions; p++) {
+        sum += partial[p * mn_total + id];
+    }
+    output[id] = sum;
+}
+"#;
+
+// ---------------------------------------------------------------------------
 // Metal shader source -- simdgroup MMA-based Q8 QMM kernel
 // ---------------------------------------------------------------------------
 
@@ -3355,6 +3841,7 @@ pub fn register_qmm(registry: &KernelRegistry) -> Result<(), KernelError> {
     registry.register_jit_source("qmm_mma_q8", QMM_MMA_Q8_SHADER_SOURCE)?;
     registry.register_jit_source("qmm_splitk_q4", QMM_SPLITK_Q4_SHADER_SOURCE)?;
     registry.register_jit_source("qmm_skinny", QMM_SKINNY_SHADER_SOURCE)?;
+    registry.register_jit_source("qmm_tiny", QMM_TINY_SHADER_SOURCE)?;
     registry.register_jit_source("qmm_steel_q4", QMM_STEEL_Q4_SHADER_SOURCE)?;
     registry.register_jit_source("qmm_qldr_q4", QMM_QLDR_Q4_SHADER_SOURCE)?;
     // NAX kernel requires MetalPerformancePrimitives (Metal 3.1+), gracefully skip if unavailable
@@ -3484,16 +3971,161 @@ pub fn affine_quantized_matmul_batched(
             return Ok(out_f32);
         }
 
-        // Q4 non-NAX dispatch: choose kernel variant based on M
-        // - M <= 32: skinny kernel (BM=32, BN=64, BK=32) with aggressive split-K
-        // - M > 32: standard kernel (BM=64, BN=64, BK=16)
+        // Q4 non-NAX dispatch: shape-aware kernel selection
+        //
+        // Based on comprehensive benchmarking (qmm_lowm_bench, M3 Ultra 80-core):
+        // 1. M = 1-16        → Batched QMV (qdot, grid.x=M) — fastest across all shapes
+        // 2. M = 17-32       → Skinny MMA (BM=32, BN=64, BK=32 + split-K)
+        // 3. M > 32          → Standard MMA (BM=64, BN=64, BK=16)
+        //
+        // BatchQMV beats Tiny MMA and Scalar at all tested M=1-16 configs:
+        //   M=1  K=7168: BatchQMV 0.14T vs QMV 0.08T (+73%)
+        //   M=8  K=7168: BatchQMV 0.85T vs Tiny 0.65T (+30%)
+        //   M=8  K=2048: BatchQMV 5.93T vs Scalar 5.95T (≈tie)
+        //   M=16 K=7168: BatchQMV 1.48T vs Tiny 1.18T (+25%)
+
+        // --- M <= 16: Batched QMV (qdot pattern, M-batched) ---
+        // Requires K % 512 == 0 (QMV block_size). All standard MoE models satisfy this.
+        if m <= 16 && k % 512 == 0 {
+            return affine_qmv_batched_q4(registry, qw, x, queue);
+        }
+
+        const TINY_BM: usize = 8;
+        const TINY_BN: usize = 64;
+        const TINY_BK: usize = 32;
         const SKINNY_BM: usize = 32;
         const SKINNY_BN: usize = 64;
         const SKINNY_BK: usize = 32;
         const STD_BM: usize = 64;
         const STD_BN: usize = 64;
 
-        if m <= SKINNY_BM {
+        // Tiny MMA constants kept for future use (M=17-32 could benefit if tuned)
+        let _ = (TINY_BM, TINY_BN, TINY_BK);
+
+        // --- M = 2-16, tall-K: skip (handled by BatchQMV above) ---
+        // Tiny MMA path kept as dead code for reference/future experiments
+        if false {
+            // --- Tiny-M path: BM=8, BN=64, BK=32 with built-in split-K ---
+            let tm_tiles = m.div_ceil(TINY_BM);
+            let tn_tiles = n.div_ceil(TINY_BN);
+
+            let align_m = m % TINY_BM == 0;
+            let align_n = n % TINY_BN == 0;
+
+            // Aggressive split-K: target ~320 total threadgroups for M3 Ultra 80 cores.
+            let mn_tgs = tm_tiles * tn_tiles;
+            let target_tgs: usize = 320; // 4x M3 Ultra 80 cores
+            let k_tiles_total = k.div_ceil(TINY_BK);
+            let k_partitions = if mn_tgs >= target_tgs || k_tiles_total <= 2 {
+                1
+            } else {
+                let desired = (target_tgs / mn_tgs).clamp(2, k_tiles_total.max(2));
+                desired.min(k_tiles_total)
+            };
+
+            let tiny_constants = [
+                (210u32, FunctionConstantValue::Bool(align_m)),
+                (211u32, FunctionConstantValue::Bool(align_n)),
+                (212u32, FunctionConstantValue::U32(qw.group_size)),
+            ];
+            let pipeline = registry.get_pipeline_with_constants(
+                "affine_qmm_tiny_q4",
+                DType::Float32,
+                &tiny_constants,
+            )?;
+
+            let m_u32 = super::checked_u32(m, "M")?;
+            let n_u32 = super::checked_u32(n, "N")?;
+            let k_u32 = super::checked_u32(k, "K")?;
+            let kp_u32 = super::checked_u32(k_partitions, "k_partitions")?;
+
+            let m_buf = dev.new_buffer_with_data(&m_u32 as *const u32 as *const _, 4, opts);
+            let n_buf = dev.new_buffer_with_data(&n_u32 as *const u32 as *const _, 4, opts);
+            let k_buf = dev.new_buffer_with_data(&k_u32 as *const u32 as *const _, 4, opts);
+            let kp_buf = dev.new_buffer_with_data(&kp_u32 as *const u32 as *const _, 4, opts);
+
+            if k_partitions == 1 {
+                // No split-K: write directly to output
+                let out = Array::zeros(dev, &[m, n], DType::Float32);
+
+                let cb = queue.new_command_buffer();
+                let enc = cb.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&pipeline);
+                enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
+                enc.set_buffer(1, Some(&qw.weights_buf), 0);
+                enc.set_buffer(2, Some(&qw.scales_buf), 0);
+                enc.set_buffer(3, Some(&qw.biases_buf), 0);
+                enc.set_buffer(4, Some(out.metal_buffer()), 0);
+                enc.set_buffer(5, Some(&m_buf), 0);
+                enc.set_buffer(6, Some(&n_buf), 0);
+                enc.set_buffer(7, Some(&k_buf), 0);
+                enc.set_buffer(8, Some(&kp_buf), 0);
+
+                let grid = metal::MTLSize::new(tn_tiles as u64, tm_tiles as u64, 1);
+                let tg = metal::MTLSize::new(64, 1, 1);
+                enc.dispatch_thread_groups(grid, tg);
+                enc.end_encoding();
+                super::commit_with_mode(cb, super::ExecMode::Sync);
+
+                Ok(out)
+            } else {
+                // Split-K: partial sums → reduce
+                let partition_stride = m * n;
+                let c_split_size =
+                    (k_partitions * partition_stride * std::mem::size_of::<f32>()) as u64;
+                let c_split_buf = dev.new_buffer(c_split_size, opts);
+                let out = Array::zeros(dev, &[m, n], DType::Float32);
+
+                let cb = queue.new_command_buffer();
+
+                // Phase 1: Split-K partial GEMM
+                let enc = cb.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&pipeline);
+                enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
+                enc.set_buffer(1, Some(&qw.weights_buf), 0);
+                enc.set_buffer(2, Some(&qw.scales_buf), 0);
+                enc.set_buffer(3, Some(&qw.biases_buf), 0);
+                enc.set_buffer(4, Some(&c_split_buf), 0);
+                enc.set_buffer(5, Some(&m_buf), 0);
+                enc.set_buffer(6, Some(&n_buf), 0);
+                enc.set_buffer(7, Some(&k_buf), 0);
+                enc.set_buffer(8, Some(&kp_buf), 0);
+
+                let grid =
+                    metal::MTLSize::new(tn_tiles as u64, tm_tiles as u64, k_partitions as u64);
+                let tg = metal::MTLSize::new(64, 1, 1);
+                enc.dispatch_thread_groups(grid, tg);
+                enc.end_encoding();
+
+                // Phase 2: Reduce (reuse tiny_qmm_reduce from qmm_tiny source)
+                let reduce_pipeline =
+                    registry.get_pipeline_with_constants("tiny_qmm_reduce", DType::Float32, &[])?;
+                let mn_total_u32 = super::checked_u32(partition_stride, "mn_total")?;
+                let n_reduce_buf =
+                    dev.new_buffer_with_data(&n_u32 as *const u32 as *const _, 4, opts);
+                let kp_reduce_buf =
+                    dev.new_buffer_with_data(&kp_u32 as *const u32 as *const _, 4, opts);
+                let mn_buf =
+                    dev.new_buffer_with_data(&mn_total_u32 as *const u32 as *const _, 4, opts);
+
+                let enc2 = cb.new_compute_command_encoder();
+                enc2.set_compute_pipeline_state(&reduce_pipeline);
+                enc2.set_buffer(0, Some(&c_split_buf), 0);
+                enc2.set_buffer(1, Some(out.metal_buffer()), 0);
+                enc2.set_buffer(2, Some(&n_reduce_buf), 0);
+                enc2.set_buffer(3, Some(&kp_reduce_buf), 0);
+                enc2.set_buffer(4, Some(&mn_buf), 0);
+
+                let reduce_grid = metal::MTLSize::new(partition_stride as u64, 1, 1);
+                let reduce_tg = metal::MTLSize::new(partition_stride.min(256) as u64, 1, 1);
+                enc2.dispatch_threads(reduce_grid, reduce_tg);
+                enc2.end_encoding();
+
+                super::commit_with_mode(cb, super::ExecMode::Sync);
+
+                Ok(out)
+            }
+        } else if m <= SKINNY_BM {
             // --- Skinny-M path: BM=32, BN=64, BK=32 with built-in split-K ---
             let sm_tiles = m.div_ceil(SKINNY_BM);
             let sn_tiles = n.div_ceil(SKINNY_BN);
@@ -4632,6 +5264,457 @@ pub fn gather_qmm(
     super::commit_with_mode(cb, super::ExecMode::Sync);
 
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// GatherQMV: Index-based quantized matrix-vector multiply for MoE
+// ---------------------------------------------------------------------------
+
+/// Metal shader for GatherQMV — batched QMV with per-element expert indexing.
+///
+/// Each batch element selects a different expert's Q4 weight via an index
+/// tensor, then performs the qdot-based QMV (much faster than MMA-based QMM
+/// at low M, i.e. M=1 per expert).
+///
+/// Layout:
+/// - x:         `[batch, K]`                          (f32 input activations)
+/// - w_packed:  `[n_experts, N, K/8]`                 (Q4 packed as uint32)
+/// - scales:    `[n_experts, N, groups_per_row]`       (f32)
+/// - biases:    `[n_experts, N, groups_per_row]`       (f32)
+/// - indices:   `[batch]`                              (uint32 expert index)
+/// - output:    `[batch, N]`                           (f32)
+///
+/// Grid:  `(batch, ceil(N / 8), 1)`
+/// Group: `(64, 1, 1)` — 2 simdgroups × 32 lanes
+pub const GATHER_QMV_SHADER_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant constexpr int GQMV_Q4_NUM_SIMDGROUPS  = 2;
+constant constexpr int GQMV_Q4_RESULTS_PER_SG  = 4;
+constant constexpr int GQMV_Q4_PACKS_PER_THREAD = 2;
+constant constexpr int GQMV_Q4_PACK_FACTOR     = 8;   // 32 / 4
+constant constexpr int GQMV_Q4_VALUES_PER_THREAD = GQMV_Q4_PACK_FACTOR * GQMV_Q4_PACKS_PER_THREAD; // 16
+constant constexpr int GQMV_Q4_BLOCK_SIZE       = GQMV_Q4_VALUES_PER_THREAD * 32; // 512
+
+// GatherQMV kernel: per-batch-element Q4 matrix-vector multiply with expert selection.
+// Faithfully ports the MLX qmv_fast qdot pattern with expert indexing added.
+kernel void gather_qmv_fast_q4(
+    device const float*    x         [[buffer(0)]],  // [batch, K]
+    device const uint32_t* w_packed  [[buffer(1)]],  // [n_experts, N, K/pack_factor] packed Q4
+    device const float*    scales    [[buffer(2)]],  // [n_experts, N, groups_per_row]
+    device const float*    biases    [[buffer(3)]],  // [n_experts, N, groups_per_row]
+    device const uint32_t* indices   [[buffer(4)]],  // [batch] expert index per element
+    device float*          output    [[buffer(5)]],  // [batch, N]
+    constant uint4&        params    [[buffer(6)]],  // (N, K, group_size, batch)
+    uint3 tgid      [[threadgroup_position_in_grid]],
+    uint simd_gid   [[simdgroup_index_in_threadgroup]],
+    uint simd_lid   [[thread_index_in_simdgroup]])
+{
+    const int out_features = int(params.x);  // N
+    const int in_features  = int(params.y);  // K
+    const int group_size   = int(params.z);
+    const int batch_idx    = int(tgid.x);    // which batch element
+
+    // Look up which expert this batch element uses
+    const uint expert_idx = indices[batch_idx];
+
+    // Derived constants
+    const int in_vec_size_w = in_features / GQMV_Q4_PACK_FACTOR;  // uint32s per row
+    const int in_vec_size_g = in_features / group_size;            // groups per row
+    const int scale_step    = group_size / GQMV_Q4_VALUES_PER_THREAD;
+
+    // Expert-based offsets into the stacked [n_experts, N, ...] buffers
+    const int expert_w_offset = int(expert_idx) * out_features * in_vec_size_w;
+    const int expert_s_offset = int(expert_idx) * out_features * in_vec_size_g;
+
+    // Output row within this threadgroup (2 SG x 4 rows = 8 rows per TG)
+    const int out_row = int(tgid.y) * (GQMV_Q4_NUM_SIMDGROUPS * GQMV_Q4_RESULTS_PER_SG)
+                      + simd_gid * GQMV_Q4_RESULTS_PER_SG;
+
+    if (out_row >= out_features) return;
+
+    // Pointer setup: weight/scale/bias for this expert, x for this batch element
+    device const uint8_t* ws = (device const uint8_t*)(w_packed + expert_w_offset)
+        + out_row * in_vec_size_w * 4
+        + simd_lid * GQMV_Q4_PACKS_PER_THREAD * 4;
+    device const float* sl = scales + expert_s_offset + out_row * in_vec_size_g
+        + simd_lid / scale_step;
+    device const float* bl = biases + expert_s_offset + out_row * in_vec_size_g
+        + simd_lid / scale_step;
+    device const float* xp = x + batch_idx * in_features
+        + simd_lid * GQMV_Q4_VALUES_PER_THREAD;
+
+    float result[GQMV_Q4_RESULTS_PER_SG] = {0, 0, 0, 0};
+
+    for (int k = 0; k < in_features; k += GQMV_Q4_BLOCK_SIZE) {
+        // --- load_vector: pre-divide x for Q4 qdot ---
+        float x_thread[GQMV_Q4_VALUES_PER_THREAD];
+        float xsum = 0.0f;
+
+        for (int i = 0; i < GQMV_Q4_VALUES_PER_THREAD; i += 4) {
+            float v0 = xp[i];
+            float v1 = xp[i + 1];
+            float v2 = xp[i + 2];
+            float v3 = xp[i + 3];
+            xsum += v0 + v1 + v2 + v3;
+            x_thread[i]     = v0;
+            x_thread[i + 1] = v1 / 16.0f;
+            x_thread[i + 2] = v2 / 256.0f;
+            x_thread[i + 3] = v3 / 4096.0f;
+        }
+
+        // --- qdot for each output row ---
+        for (int row = 0; row < GQMV_Q4_RESULTS_PER_SG; row++) {
+            device const uint8_t* wl = ws + row * in_vec_size_w * 4;
+            float s = sl[row * in_vec_size_g];
+            float b = bl[row * in_vec_size_g];
+
+            if (row + out_row < out_features) {
+                device const uint16_t* wp = (device const uint16_t*)wl;
+                float accum = 0.0f;
+                for (int i = 0; i < GQMV_Q4_VALUES_PER_THREAD / 4; i++) {
+                    accum += x_thread[4 * i]     * float(wp[i] & 0x000fu)
+                           + x_thread[4 * i + 1] * float(wp[i] & 0x00f0u)
+                           + x_thread[4 * i + 2] * float(wp[i] & 0x0f00u)
+                           + x_thread[4 * i + 3] * float(wp[i] & 0xf000u);
+                }
+                result[row] += s * accum + xsum * b;
+            }
+        }
+
+        // Advance pointers by block_size
+        ws += GQMV_Q4_BLOCK_SIZE / GQMV_Q4_PACK_FACTOR * 4;
+        sl += GQMV_Q4_BLOCK_SIZE / group_size;
+        bl += GQMV_Q4_BLOCK_SIZE / group_size;
+        xp += GQMV_Q4_BLOCK_SIZE;
+    }
+
+    // simd_sum reduction + write to batch output
+    for (int row = 0; row < GQMV_Q4_RESULTS_PER_SG; row++) {
+        result[row] = simd_sum(result[row]);
+        if (simd_lid == 0 && out_row + row < out_features) {
+            output[batch_idx * out_features + out_row + row] = result[row];
+        }
+    }
+}
+"#;
+
+/// Register the GatherQMV Metal kernel with the given registry.
+pub fn register_gather_qmv(registry: &KernelRegistry) -> Result<(), KernelError> {
+    registry.register_jit_source("gather_qmv", GATHER_QMV_SHADER_SOURCE)
+}
+
+/// Index-based quantized matrix-vector multiply for MoE expert dispatch (GatherQMV).
+///
+/// Each batch element selects a Q4 expert weight via `indices`, then performs
+/// the fast qdot-based QMV kernel. This is optimal for MoE inference at low M
+/// (M=1 per expert), significantly faster than MMA-based GatherQMM.
+///
+/// # Arguments
+/// - `registry`: kernel registry (must have `gather_qmv` source registered).
+/// - `x`: f32 input activations `[batch, k]`.
+/// - `w_packed_buf`: Q4 packed expert weights `[n_experts, n, k/8]` as uint32.
+/// - `scales_buf`: per-group scale factors `[n_experts, n, groups_per_row]` f32.
+/// - `biases_buf`: per-group bias terms `[n_experts, n, groups_per_row]` f32.
+/// - `indices`: expert index per batch element `[batch]` (UInt32).
+/// - `batch`: number of batch elements.
+/// - `n`: output features (N) per expert.
+/// - `k`: input features (K).
+/// - `n_experts`: number of expert weight sets.
+/// - `group_size`: quantization group size (32, 64, or 128).
+/// - `queue`: Metal command queue for dispatch.
+///
+/// # Returns
+/// f32 output `[batch, n]`.
+#[allow(clippy::too_many_arguments)]
+pub fn gather_qmv_fast_q4(
+    registry: &KernelRegistry,
+    x: &Array,
+    w_packed_buf: &metal::Buffer,
+    scales_buf: &metal::Buffer,
+    biases_buf: &metal::Buffer,
+    indices: &Array,
+    batch: usize,
+    n: usize,
+    k: usize,
+    n_experts: usize,
+    group_size: u32,
+    queue: &metal::CommandQueue,
+) -> Result<Array, KernelError> {
+    // --- dtype validation ---
+    if x.dtype() != DType::Float32 {
+        return Err(KernelError::InvalidShape(format!(
+            "gather_qmv_fast_q4 requires Float32 input x, got {:?}",
+            x.dtype()
+        )));
+    }
+    if indices.dtype() != DType::UInt32 {
+        return Err(KernelError::InvalidShape(format!(
+            "gather_qmv_fast_q4: indices must be UInt32, got {:?}",
+            indices.dtype()
+        )));
+    }
+
+    // --- dimension validation ---
+    if k == 0 || n == 0 {
+        return Err(KernelError::InvalidShape(format!(
+            "gather_qmv_fast_q4: dimensions must be non-zero (k={k}, n={n})"
+        )));
+    }
+    if n_experts == 0 {
+        return Err(KernelError::InvalidShape(
+            "gather_qmv_fast_q4: n_experts must be non-zero".to_string(),
+        ));
+    }
+    if batch == 0 {
+        // Nothing to compute — return empty output.
+        let dev = registry.device().raw();
+        return Ok(Array::zeros(dev, &[0, n], DType::Float32));
+    }
+
+    // --- x shape validation ---
+    let expected_x_elems = batch * k;
+    if x.numel() != expected_x_elems {
+        return Err(KernelError::InvalidShape(format!(
+            "gather_qmv_fast_q4: x has {} elements but expected \
+             batch({batch}) * k({k}) = {expected_x_elems}",
+            x.numel()
+        )));
+    }
+
+    // --- indices shape validation ---
+    if indices.numel() != batch {
+        return Err(KernelError::InvalidShape(format!(
+            "gather_qmv_fast_q4: indices length {} != batch {}",
+            indices.numel(),
+            batch
+        )));
+    }
+
+    // --- group_size validation ---
+    if group_size == 0 {
+        return Err(KernelError::InvalidShape(
+            "gather_qmv_fast_q4: group_size must be non-zero".into(),
+        ));
+    }
+
+    // --- K constraints for Q4 packing ---
+    let pack_factor: usize = 8; // 32 / 4 bits
+    if k % pack_factor != 0 {
+        return Err(KernelError::InvalidShape(format!(
+            "gather_qmv_fast_q4: K ({k}) must be a multiple of pack_factor ({pack_factor})"
+        )));
+    }
+    if k % (group_size as usize) != 0 {
+        return Err(KernelError::InvalidShape(format!(
+            "gather_qmv_fast_q4: K ({k}) must be a multiple of group_size ({group_size})"
+        )));
+    }
+
+    // --- buffer size validation ---
+    let k_div_pack = k / pack_factor;
+    let groups_per_row = k / (group_size as usize);
+    let expected_w_bytes = n_experts * n * k_div_pack * 4; // uint32 per pack
+    if (w_packed_buf.length() as usize) < expected_w_bytes {
+        return Err(KernelError::InvalidShape(format!(
+            "gather_qmv_fast_q4: w_packed_buf too small: {} bytes < expected {} bytes \
+             (n_experts={n_experts}, N={n}, K/8={k_div_pack})",
+            w_packed_buf.length(),
+            expected_w_bytes,
+        )));
+    }
+    let expected_scales_bytes = n_experts * n * groups_per_row * 4; // float32
+    if (scales_buf.length() as usize) < expected_scales_bytes {
+        return Err(KernelError::InvalidShape(format!(
+            "gather_qmv_fast_q4: scales_buf too small: {} bytes < expected {} bytes \
+             (n_experts={n_experts}, N={n}, groups_per_row={groups_per_row})",
+            scales_buf.length(),
+            expected_scales_bytes,
+        )));
+    }
+    if (biases_buf.length() as usize) < expected_scales_bytes {
+        return Err(KernelError::InvalidShape(format!(
+            "gather_qmv_fast_q4: biases_buf too small: {} bytes < expected {} bytes \
+             (n_experts={n_experts}, N={n}, groups_per_row={groups_per_row})",
+            biases_buf.length(),
+            expected_scales_bytes,
+        )));
+    }
+
+    // --- Rust-side validation: all expert indices must be in [0, n_experts) ---
+    {
+        let idx_vec = indices.to_vec_checked::<u32>();
+        for (i, &idx) in idx_vec.iter().enumerate() {
+            if (idx as usize) >= n_experts {
+                return Err(KernelError::InvalidShape(format!(
+                    "gather_qmv_fast_q4: index[{i}]={idx} out of range [0, {n_experts})"
+                )));
+            }
+        }
+    }
+
+    let pipeline = registry.get_pipeline("gather_qmv_fast_q4", DType::Float32)?;
+    let dev = registry.device().raw();
+    let out = Array::zeros(dev, &[batch, n], DType::Float32);
+
+    // Pack (N, K, group_size, batch) into a uint4.
+    let params: [u32; 4] = [
+        super::checked_u32(n, "N")?,
+        super::checked_u32(k, "K")?,
+        group_size,
+        super::checked_u32(batch, "batch")?,
+    ];
+    let opts = metal::MTLResourceOptions::StorageModeShared;
+    let params_buf = dev.new_buffer_with_data(
+        params.as_ptr() as *const _,
+        (params.len() * std::mem::size_of::<u32>()) as u64,
+        opts,
+    );
+
+    let cb = queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
+    enc.set_buffer(1, Some(w_packed_buf), 0);
+    enc.set_buffer(2, Some(scales_buf), 0);
+    enc.set_buffer(3, Some(biases_buf), 0);
+    enc.set_buffer(4, Some(indices.metal_buffer()), indices.offset() as u64);
+    enc.set_buffer(5, Some(out.metal_buffer()), 0);
+    enc.set_buffer(6, Some(&params_buf), 0);
+
+    // Grid: (batch, ceil(N/8), 1) — one TG per batch element x output-row tile
+    let rows_per_tg: usize = 8; // NUM_SIMDGROUPS(2) * RESULTS_PER_SG(4)
+    let num_tgs_y = n.div_ceil(rows_per_tg);
+    let tg_size: u64 = 64; // 2 simdgroups x 32 lanes
+
+    let grid = metal::MTLSize::new(batch as u64, num_tgs_y as u64, 1);
+    let tg = metal::MTLSize::new(tg_size, 1, 1);
+
+    enc.dispatch_thread_groups(grid, tg);
+    enc.end_encoding();
+    super::commit_with_mode(cb, super::ExecMode::Sync);
+
+    Ok(out)
+}
+
+/// High-level MoE expert matrix-vector multiply for Q4 weights.
+///
+/// Given a batch of input vectors and a set of pre-packed expert weights,
+/// each batch element is routed to its designated expert via `indices` and
+/// the result is computed using the fast GatherQMV kernel.
+///
+/// # Arguments
+/// - `registry`: kernel registry (must have `gather_qmv` source registered).
+/// - `x`: f32 input activations `[batch, K]`.
+/// - `expert_weights`: one `QuantizedWeight` per expert (all must have the same
+///   `out_features`, `in_features`, `group_size`, and `bits == 4`).
+/// - `indices`: expert index per batch element `[batch]` (UInt32, values in `[0, n_experts)`).
+/// - `queue`: Metal command queue for dispatch.
+///
+/// # Returns
+/// f32 output `[batch, N]`.
+///
+/// # Errors
+/// Returns `KernelError` if expert weights are inconsistent or `bits != 4`.
+pub fn moe_expert_matmul_q4(
+    registry: &KernelRegistry,
+    x: &Array,
+    expert_weights: &[QuantizedWeight],
+    indices: &Array,
+    queue: &metal::CommandQueue,
+) -> Result<Array, KernelError> {
+    if expert_weights.is_empty() {
+        return Err(KernelError::InvalidShape(
+            "moe_expert_matmul_q4: expert_weights must not be empty".into(),
+        ));
+    }
+
+    let n_experts = expert_weights.len();
+    let n = expert_weights[0].out_features;
+    let k = expert_weights[0].in_features;
+    let group_size = expert_weights[0].group_size;
+    let bits = expert_weights[0].bits;
+
+    if bits != 4 {
+        return Err(KernelError::InvalidShape(format!(
+            "moe_expert_matmul_q4: expected bits=4, got {bits}"
+        )));
+    }
+
+    // Validate all experts have consistent shapes
+    for (i, ew) in expert_weights.iter().enumerate() {
+        if ew.out_features != n
+            || ew.in_features != k
+            || ew.group_size != group_size
+            || ew.bits != bits
+        {
+            return Err(KernelError::InvalidShape(format!(
+                "moe_expert_matmul_q4: expert[{i}] shape mismatch — \
+                 expected (N={n}, K={k}, gs={group_size}, bits={bits}), \
+                 got (N={}, K={}, gs={}, bits={})",
+                ew.out_features, ew.in_features, ew.group_size, ew.bits
+            )));
+        }
+    }
+
+    let batch = if x.ndim() == 1 { 1 } else { x.shape()[0] };
+
+    let pack_factor: usize = 8; // 32 / 4
+    let k_div_pack = k / pack_factor;
+    let groups_per_row = k / (group_size as usize);
+
+    // Pack all expert weights into contiguous [n_experts, N, K/8] buffer
+    let dev = registry.device().raw();
+    let opts = metal::MTLResourceOptions::StorageModeShared;
+
+    let w_bytes_per_expert = n * k_div_pack * 4; // uint32 per pack element
+    let s_bytes_per_expert = n * groups_per_row * 4; // float32
+
+    let total_w_bytes = n_experts * w_bytes_per_expert;
+    let total_s_bytes = n_experts * s_bytes_per_expert;
+
+    let packed_w = dev.new_buffer(total_w_bytes as u64, opts);
+    let packed_s = dev.new_buffer(total_s_bytes as u64, opts);
+    let packed_b = dev.new_buffer(total_s_bytes as u64, opts);
+
+    // Copy each expert's buffers into the packed contiguous buffers.
+    //
+    // SAFETY: All source buffers were allocated by Metal with StorageModeShared
+    // and validated above. The destination buffers are freshly allocated with
+    // the exact required size. Pointer arithmetic stays within bounds.
+    unsafe {
+        let w_dst = packed_w.contents() as *mut u8;
+        let s_dst = packed_s.contents() as *mut u8;
+        let b_dst = packed_b.contents() as *mut u8;
+
+        for (i, ew) in expert_weights.iter().enumerate() {
+            let w_src = ew.weights_buf.contents() as *const u8;
+            let s_src = ew.scales_buf.contents() as *const u8;
+            let b_src = ew.biases_buf.contents() as *const u8;
+
+            std::ptr::copy_nonoverlapping(
+                w_src,
+                w_dst.add(i * w_bytes_per_expert),
+                w_bytes_per_expert,
+            );
+            std::ptr::copy_nonoverlapping(
+                s_src,
+                s_dst.add(i * s_bytes_per_expert),
+                s_bytes_per_expert,
+            );
+            std::ptr::copy_nonoverlapping(
+                b_src,
+                b_dst.add(i * s_bytes_per_expert),
+                s_bytes_per_expert,
+            );
+        }
+    }
+
+    gather_qmv_fast_q4(
+        registry, x, &packed_w, &packed_s, &packed_b, indices, batch, n, k, n_experts, group_size,
+        queue,
+    )
 }
 
 // ---------------------------------------------------------------------------

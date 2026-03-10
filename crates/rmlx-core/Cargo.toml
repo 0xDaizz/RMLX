@@ -57,3 +57,11 @@ harness = false
 [[bench]]
 name = "fusion_bench"
 harness = false
+
+[[bench]]
+name = "qmm_moe_bench"
+harness = false
+
+[[bench]]
+name = "qmm_lowm_bench"
+harness = false
