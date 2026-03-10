@@ -40,3 +40,7 @@ harness = false
 [[bench]]
 name = "op_profile_bench"
 harness = false
+
+[[bench]]
+name = "gemm_degradation_bench"
+harness = false
