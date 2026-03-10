@@ -3204,45 +3204,27 @@ impl Attention {
         let hidden_size = num_heads * head_dim;
         let seq_len = x.shape()[0];
 
-        // Q/K/V projections with fused RMSNorm
-        // For MlxArch (seq_len >= 33), fuse RMSNorm into GEMM to eliminate
-        // intermediate normalized tensor write+read (~16MB at seq=2048).
+        // RMS norm (pre-attention) — separate dispatch, then feed to Q/K/V GEMM.
+        // Note: has_norm GEMM fusion was tested but regressed prefill throughput
+        // because GEMM is compute-bound and the extra per-element ops in tile load
+        // outweigh the memory savings from eliminating the intermediate tensor.
+        let normed =
+            ops::rms_norm::rms_norm_into_cb(registry, x, Some(norm_weight), rms_norm_eps, cb)?;
+
         let q_dim = num_heads * head_dim;
         let k_dim = num_kv_heads * head_dim;
         let v_dim = num_kv_heads * head_dim;
         let (q, k, v) = {
-            let x_2d = if x.ndim() == 1 {
-                x.reshape(vec![1, x.shape()[0]])?
+            let normed_2d = if normed.ndim() == 1 {
+                normed.reshape(vec![1, normed.shape()[0]])?
             } else {
-                x.reshape(vec![x.shape()[0], x.shape()[1]])?
+                normed.reshape(vec![normed.shape()[0], normed.shape()[1]])?
             };
 
             if let Some(ref qkv_wt) = self.qkv_merged_weight_t {
-                // Try fused norm+GEMM first (requires MlxArch: M>=33, N>=33)
-                let qkv = if seq_len >= 33 {
-                    ops::matmul::matmul_norm_gemm_into_cb(
-                        registry,
-                        &x_2d,
-                        qkv_wt,
-                        norm_weight,
-                        rms_norm_eps,
-                        cb,
-                    )?
-                } else {
-                    // Small seq: fall back to separate norm + GEMM
-                    let normed = ops::rms_norm::rms_norm_into_cb(
-                        registry,
-                        x,
-                        Some(norm_weight),
-                        rms_norm_eps,
-                        cb,
-                    )?;
-                    let normed_2d = normed.reshape(vec![normed.shape()[0], normed.shape()[1]])?;
-                    ops::matmul::matmul_into_cb(registry, &normed_2d, qkv_wt, cb)?
-                };
+                let qkv = ops::matmul::matmul_into_cb(registry, &normed_2d, qkv_wt, cb)?;
                 let total_out = q_dim + k_dim + v_dim;
                 let elem_size = qkv.dtype().size_of();
-                // Offset slice views (non-contiguous: stride[0] = total_out)
                 let q_view = Array::new(
                     qkv.metal_buffer().to_owned(),
                     vec![seq_len, q_dim],
@@ -3264,24 +3246,8 @@ impl Attention {
                     qkv.dtype(),
                     qkv.offset() + (q_dim + k_dim) * elem_size,
                 );
-                // Views are non-contiguous (stride[0] = total_out > shape[1]).
-                // RoPE/deinterleave kernels accept input_row_stride, so no copy needed.
                 (q_view, k_view, v_view)
             } else {
-                // Fallback: separate norm + 3 separate GEMMs
-                // (batched_qkv_proj_into doesn't support norm fusion)
-                let normed = ops::rms_norm::rms_norm_into_cb(
-                    registry,
-                    x,
-                    Some(norm_weight),
-                    rms_norm_eps,
-                    cb,
-                )?;
-                let normed_2d = if normed.ndim() == 1 {
-                    normed.reshape(vec![1, normed.shape()[0]])?
-                } else {
-                    normed.reshape(vec![normed.shape()[0], normed.shape()[1]])?
-                };
                 let wq_t = self.q_proj.weight_transposed_contiguous()?;
                 let wk_t = self.k_proj.weight_transposed_contiguous()?;
                 let wv_t = self.v_proj.weight_transposed_contiguous()?;
