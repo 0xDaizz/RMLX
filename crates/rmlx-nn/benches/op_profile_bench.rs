@@ -869,6 +869,16 @@ fn main() {
                 ops::matmul::matmul_into_cb(&registry, &hidden_act, &w_down_t, cb).expect("down");
         }));
 
+        // 10b. Down Projection GEMM with FRESH random input (diagnostic)
+        {
+            let fresh_a = rand_array(device, &[seq_len, INTERMEDIATE_DIM], 999);
+            let fresh_b = rand_array(device, &[INTERMEDIATE_DIM, HIDDEN_SIZE], 998);
+            results.push(bench_op("Down Proj (FRESH input)", &queue, |cb| {
+                let _ = ops::matmul::matmul_into_cb(&registry, &fresh_a, &fresh_b, cb)
+                    .expect("down fresh");
+            }));
+        }
+
         // 11. Residual Add (final: h + ffn_out)
         results.push(bench_op("Residual Add (final)", &queue, |cb| {
             let _ = ops::binary::add_into_cb(&registry, &h, &ffn_out, cb).expect("add final");
