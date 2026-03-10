@@ -864,18 +864,38 @@ fn main() {
         }));
 
         // 10. Down Projection GEMM (14336 -> 4096)
+        // Diagnostic: print tensor properties to identify degradation cause
+        println!("\n  [DIAG] hidden_act: shape={:?} strides={:?} offset={} buf_len={}",
+            hidden_act.shape(), hidden_act.strides(), hidden_act.offset(),
+            hidden_act.metal_buffer().length());
+        println!("  [DIAG] w_down_t:   shape={:?} strides={:?} offset={} buf_len={}",
+            w_down_t.shape(), w_down_t.strides(), w_down_t.offset(),
+            w_down_t.metal_buffer().length());
         results.push(bench_op("Down Proj GEMM (14336->4096)", &queue, |cb| {
             let _ =
                 ops::matmul::matmul_into_cb(&registry, &hidden_act, &w_down_t, cb).expect("down");
         }));
 
-        // 10b. Down Projection GEMM with FRESH random input (diagnostic)
+        // 10b. Down Projection with FRESH A but SAME weight (isolate A tensor)
         {
             let fresh_a = rand_array(device, &[seq_len, INTERMEDIATE_DIM], 999);
+            println!("  [DIAG] fresh_a:    shape={:?} strides={:?} offset={} buf_len={}",
+                fresh_a.shape(), fresh_a.strides(), fresh_a.offset(),
+                fresh_a.metal_buffer().length());
+            results.push(bench_op("Down (fresh A, same W)", &queue, |cb| {
+                let _ = ops::matmul::matmul_into_cb(&registry, &fresh_a, &w_down_t, cb)
+                    .expect("down fresh_a");
+            }));
+            // 10c. SAME A but FRESH weight (isolate B tensor)
             let fresh_b = rand_array(device, &[INTERMEDIATE_DIM, HIDDEN_SIZE], 998);
-            results.push(bench_op("Down Proj (FRESH input)", &queue, |cb| {
+            results.push(bench_op("Down (same A, fresh W)", &queue, |cb| {
+                let _ = ops::matmul::matmul_into_cb(&registry, &hidden_act, &fresh_b, cb)
+                    .expect("down fresh_b");
+            }));
+            // 10d. Both fresh
+            results.push(bench_op("Down (both fresh)", &queue, |cb| {
                 let _ = ops::matmul::matmul_into_cb(&registry, &fresh_a, &fresh_b, cb)
-                    .expect("down fresh");
+                    .expect("down both_fresh");
             }));
         }
 
