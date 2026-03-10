@@ -7,6 +7,10 @@
 //! Uses low-level `ops::*_into_cb` functions directly with raw weight
 //! matrices, avoiding private struct field access.
 //!
+//! SDPA dispatch mirrors the production path in attention.rs:
+//!   NAX (M3+) > MMA BK=32 (total_seq>=256) > MMA BK=16 (fallback)
+//! All variants use is_causal=true (no explicit mask).
+//!
 //! Run with:
 //!   cargo bench -p rmlx-nn --bench op_profile_bench
 
@@ -40,9 +44,9 @@ const K_DIM: usize = NUM_KV_HEADS * HEAD_DIM; // 1024
 const V_DIM: usize = NUM_KV_HEADS * HEAD_DIM; // 1024
 const TOTAL_QKV: usize = Q_DIM + K_DIM + V_DIM; // 6144
 
-const SEQ_LENS: &[usize] = &[256, 512, 1024];
+const SEQ_LENS: &[usize] = &[128, 256, 512, 1024, 2048];
 const WARMUP_ITERS: usize = 3;
-const BENCH_ITERS: usize = 10;
+const BENCH_ITERS: usize = 20;
 
 // ---------------------------------------------------------------------------
 // f16 helpers
@@ -208,20 +212,8 @@ fn transpose_weight_cpu(device: &metal::Device, bytes: &[u8], rows: usize, cols:
 }
 
 // ---------------------------------------------------------------------------
-// Causal mask builder
+// CB status validation
 // ---------------------------------------------------------------------------
-
-fn build_causal_mask(device: &metal::Device, seq_len: usize) -> Array {
-    let neg_inf_f16: u16 = 0xFC00;
-    let mut mask_f16 = vec![0u16; seq_len * seq_len];
-    for i in 0..seq_len {
-        for j in (i + 1)..seq_len {
-            mask_f16[i * seq_len + j] = neg_inf_f16;
-        }
-    }
-    let bytes: Vec<u8> = mask_f16.iter().flat_map(|h| h.to_le_bytes()).collect();
-    Array::from_bytes(device, &bytes, vec![seq_len, seq_len], DType::Float16)
-}
 
 fn assert_cb_ok(cb: &metal::CommandBufferRef, context: &str) {
     let status = cb.status();
@@ -257,7 +249,7 @@ where
 struct OpResult {
     name: &'static str,
     mean_us: f64,
-    std_us: f64,
+    p50_us: f64,
     min_us: f64,
     max_us: f64,
 }
@@ -273,20 +265,37 @@ where
     for _ in 0..BENCH_ITERS {
         durations.push(time_op(queue, &mut f));
     }
-    let micros: Vec<f64> = durations.iter().map(|d| d.as_secs_f64() * 1e6).collect();
+    let mut micros: Vec<f64> = durations.iter().map(|d| d.as_secs_f64() * 1e6).collect();
+    micros.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let sum: f64 = micros.iter().sum();
     let mean = sum / micros.len() as f64;
-    let variance: f64 =
-        micros.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / micros.len() as f64;
-    let std_dev = variance.sqrt();
-    let min = micros.iter().cloned().fold(f64::INFINITY, f64::min);
-    let max = micros.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let min = micros[0];
+    let max = micros[micros.len() - 1];
+    let p50 = if micros.len() % 2 == 0 {
+        (micros[micros.len() / 2 - 1] + micros[micros.len() / 2]) / 2.0
+    } else {
+        micros[micros.len() / 2]
+    };
     OpResult {
         name,
         mean_us: mean,
-        std_us: std_dev,
+        p50_us: p50,
         min_us: min,
         max_us: max,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SDPA variant name for display
+// ---------------------------------------------------------------------------
+
+fn sdpa_variant_name(supports_nax: bool, total_seq: usize) -> &'static str {
+    if supports_nax {
+        "NAX (is_causal)"
+    } else if total_seq >= 256 {
+        "MMA BK=32 (is_causal)"
+    } else {
+        "MMA BK=16 (is_causal)"
     }
 }
 
@@ -305,6 +314,7 @@ fn main() {
     let registry = KernelRegistry::new(gpu);
     ops::register_all(&registry).expect("kernel registration failed");
     let device = registry.device().raw();
+    let supports_nax = registry.device().tuning().supports_nax;
 
     let setup_queue = device.new_command_queue();
 
@@ -312,7 +322,7 @@ fn main() {
         "Config: hidden={}, heads={}/{}, head_dim={}, intermediate={}",
         HIDDEN_SIZE, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, INTERMEDIATE_DIM
     );
-    println!("dtype: float16");
+    println!("dtype: float16, supports_nax: {}", supports_nax);
     println!(
         "Warmup: {} iters, Bench: {} iters per op",
         WARMUP_ITERS, BENCH_ITERS
@@ -372,19 +382,25 @@ fn main() {
     let cos_full = Array::from_slice(device, &cos_vec, vec![MAX_SEQ_LEN, HEAD_DIM / 2]);
     let sin_full = Array::from_slice(device, &sin_vec, vec![MAX_SEQ_LEN, HEAD_DIM / 2]);
 
+    // Let Metal driver drain setup work
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
     for &seq_len in SEQ_LENS {
         println!("\n{}", "=".repeat(100));
-        println!("seq_len={}", seq_len);
+        println!(
+            "seq_len={}  |  SDPA variant: {}",
+            seq_len,
+            sdpa_variant_name(supports_nax, seq_len)
+        );
         println!("{}", "=".repeat(100));
 
         let queue = device.new_command_queue();
 
         let cos_freqs = cos_full.slice(0, 0, seq_len).expect("cos slice");
         let sin_freqs = sin_full.slice(0, 0, seq_len).expect("sin slice");
-        let mask = build_causal_mask(device, seq_len);
         let input = rand_array(device, &[seq_len, HIDDEN_SIZE], 42);
 
-        // --- Full pipeline baseline ---
+        // --- Full pipeline baseline (uses is_causal internally, no explicit mask) ---
         let baseline = bench_op("TOTAL (full pipeline)", &queue, |cb| {
             let mut cache = LayerKvCache::preallocated(
                 device,
@@ -398,7 +414,7 @@ fn main() {
                     &input,
                     Some(&cos_freqs),
                     Some(&sin_freqs),
-                    Some(&mask),
+                    None, // causal masking handled in-kernel via is_causal FC
                     &mut cache,
                     &registry,
                     cb,
@@ -437,7 +453,7 @@ fn main() {
             r
         };
 
-        // 3. Q/K/V views + copy
+        // 3. Q/K/V views from merged QKV
         let elem_size = qkv.dtype().size_of();
         let q_view = Array::new(
             qkv.metal_buffer().to_owned(),
@@ -461,7 +477,7 @@ fn main() {
             qkv.offset() + (Q_DIM + K_DIM) * elem_size,
         );
 
-        // 4. RoPE + Deinterleave (strided — no copy needed)
+        // 4. RoPE + Deinterleave
         let (q_batched, k_batched, v_batched) = {
             let _pool = ScopedPool::new();
             let cb = queue.new_command_buffer();
@@ -500,86 +516,131 @@ fn main() {
             (qb, kb, vb)
         };
 
-        // 5. KV Cache
-        let mut cache_for_sdpa =
-            LayerKvCache::preallocated(device, NUM_KV_HEADS, HEAD_DIM, MAX_SEQ_LEN, DType::Float16);
-        {
-            let _pool = ScopedPool::new();
-            let cb = queue.new_command_buffer();
-            cache_for_sdpa
-                .append_batched_into_cb(&k_batched, &v_batched, seq_len, &registry, cb)
-                .expect("kv cache append");
-            cb.commit();
-            cb.wait_until_completed();
-        }
-        let total_seq = cache_for_sdpa.seq_len;
+        // 5. SDPA — use same dispatch logic as attention.rs forward_prefill_single_cb
+        //    On initial prefill (cache empty), RoPE output goes directly to SDPA.
+        let total_seq = seq_len; // initial prefill: no prior cache
         let scale = 1.0 / (HEAD_DIM as f32).sqrt();
-        let k_slab = cache_for_sdpa.keys_slab_view().expect("k slab");
-        let v_slab = cache_for_sdpa.values_slab_view().expect("v slab");
-        let kv_stride = if cache_for_sdpa.max_seq_len() != total_seq {
-            Some(cache_for_sdpa.max_seq_len())
-        } else {
-            None
-        };
 
-        // 6. SDPA
+        let is_f16_d128 = true; // we always use f16, head_dim=128, seq_len>1
+        let use_nax = is_f16_d128 && supports_nax;
+        let use_mma_bk32 = is_f16_d128 && !use_nax && total_seq >= 256;
+
+        // MMA writes seq-major; NAX writes head-major
+        let seq_major_output = is_f16_d128 && !use_nax;
+
         let attn_slab = {
             let _pool = ScopedPool::new();
             let cb = queue.new_command_buffer();
-            let r = ops::sdpa::sdpa_prefill_mma_f16_into_cb(
-                &registry,
-                &q_batched,
-                &k_slab,
-                &v_slab,
-                NUM_HEADS,
-                NUM_KV_HEADS,
-                HEAD_DIM,
-                seq_len,
-                total_seq,
-                kv_stride,
-                Some(&mask),
-                scale,
-                false,
-                cb,
-            )
-            .expect("sdpa");
+            let r = if use_nax {
+                ops::sdpa::sdpa_prefill_nax_f16_into_cb(
+                    &registry,
+                    &q_batched,
+                    &k_batched,
+                    &v_batched,
+                    NUM_HEADS,
+                    NUM_KV_HEADS,
+                    HEAD_DIM,
+                    seq_len,
+                    total_seq,
+                    None, // contiguous, no stride override
+                    scale,
+                    true, // is_causal
+                    cb,
+                )
+                .expect("sdpa nax")
+            } else if use_mma_bk32 {
+                ops::sdpa::sdpa_prefill_mma_bk32_f16_into_cb(
+                    &registry,
+                    &q_batched,
+                    &k_batched,
+                    &v_batched,
+                    NUM_HEADS,
+                    NUM_KV_HEADS,
+                    HEAD_DIM,
+                    seq_len,
+                    total_seq,
+                    None,
+                    None, // no explicit mask
+                    scale,
+                    true, // is_causal
+                    cb,
+                )
+                .expect("sdpa mma bk32")
+            } else {
+                ops::sdpa::sdpa_prefill_mma_f16_into_cb(
+                    &registry,
+                    &q_batched,
+                    &k_batched,
+                    &v_batched,
+                    NUM_HEADS,
+                    NUM_KV_HEADS,
+                    HEAD_DIM,
+                    seq_len,
+                    total_seq,
+                    None,
+                    None, // no explicit mask
+                    scale,
+                    true, // is_causal
+                    cb,
+                )
+                .expect("sdpa mma bk16")
+            };
             cb.commit();
             cb.wait_until_completed();
             r
         };
 
-        // 7. SDPA output is already seq-major [seq_len, num_heads * head_dim]
-        let attn_out = attn_slab
-            .reshape(vec![seq_len, HIDDEN_SIZE])
-            .expect("reshape attn");
+        // 6. Head concat (interleave if NAX, reshape if MMA)
+        let attn_concat = if seq_major_output {
+            attn_slab.view(
+                vec![seq_len, HIDDEN_SIZE],
+                vec![HIDDEN_SIZE, 1],
+                attn_slab.offset(),
+            )
+        } else {
+            // NAX: head-major [num_heads, seq_len, head_dim] -> [seq_len, hidden_size]
+            let packed = attn_slab.view(
+                vec![NUM_HEADS * seq_len, HEAD_DIM],
+                vec![HEAD_DIM, 1],
+                attn_slab.offset(),
+            );
+            let interleaved = {
+                let _pool = ScopedPool::new();
+                let cb = queue.new_command_buffer();
+                let r =
+                    ops::rope::interleave_heads_into_cb(&registry, &packed, NUM_HEADS, seq_len, cb)
+                        .expect("interleave_heads");
+                cb.commit();
+                cb.wait_until_completed();
+                r
+            };
+            interleaved
+        };
 
-        // 8. O proj
+        // 7. O projection
         let o_out = {
             let _pool = ScopedPool::new();
             let cb = queue.new_command_buffer();
-            let r = ops::matmul::matmul_into_cb(&registry, &attn_out, &w_o_t, cb).expect("o_proj");
-            cb.commit();
-            cb.wait_until_completed();
-            r
-        };
-
-        // 9. Residual add
-        let h = {
-            let _pool = ScopedPool::new();
-            let cb = queue.new_command_buffer();
-            let r = ops::binary::add_into_cb(&registry, &input, &o_out, cb).expect("add");
-            cb.commit();
-            cb.wait_until_completed();
-            r
-        };
-
-        // 10. RMSNorm (pre-FFN)
-        let normed2 = {
-            let _pool = ScopedPool::new();
-            let cb = queue.new_command_buffer();
             let r =
-                ops::rms_norm::rms_norm_into_cb(&registry, &h, Some(&norm2_w), RMS_NORM_EPS, cb)
-                    .expect("rms_norm 2");
+                ops::matmul::matmul_into_cb(&registry, &attn_concat, &w_o_t, cb).expect("o_proj");
+            cb.commit();
+            cb.wait_until_completed();
+            r
+        };
+
+        // 8. Fused residual + RMSNorm (matches forward_prefill_single_cb)
+        let (normed2, h) = {
+            let _pool = ScopedPool::new();
+            let cb = queue.new_command_buffer();
+            let r = ops::rms_norm::rms_norm_residual_add_into_cb(
+                &registry,
+                &o_out, // attention output
+                &input, // residual = original input
+                &norm2_w,
+                RMS_NORM_EPS,
+                cb,
+            )
+            .expect("fused residual+norm");
             cb.commit();
             cb.wait_until_completed();
             r
@@ -588,7 +649,7 @@ fn main() {
             .reshape(vec![seq_len, HIDDEN_SIZE])
             .expect("reshape");
 
-        // 11. Gate+Up GEMM
+        // 9. Gate+Up GEMM
         let gate_up_out = {
             let _pool = ScopedPool::new();
             let cb = queue.new_command_buffer();
@@ -599,7 +660,7 @@ fn main() {
             r
         };
 
-        // 12. SiLU*mul (strided — no copy needed)
+        // 10. SiLU*mul (strided)
         let hidden_act = {
             let _pool = ScopedPool::new();
             let cb = queue.new_command_buffer();
@@ -615,7 +676,7 @@ fn main() {
             r
         };
 
-        // 13. Down proj
+        // 11. Down proj
         let ffn_out = {
             let _pool = ScopedPool::new();
             let cb = queue.new_command_buffer();
@@ -648,8 +709,8 @@ fn main() {
             let _ = ops::matmul::matmul_into_cb(&registry, &normed_2d, &qkv_wt, cb).expect("qkv");
         }));
 
-        // 3. RoPE Q + RoPE K + Deinterleave V (strided input)
-        results.push(bench_op("RoPE Q+K + Deinterleave V", &queue, |cb| {
+        // 3. RoPE Q + RoPE K + Deinterleave V
+        results.push(bench_op("RoPE Q+K + Deint V", &queue, |cb| {
             let _ = ops::rope::rope_multihead_into_cb(
                 &registry,
                 &q_view,
@@ -682,66 +743,117 @@ fn main() {
             .expect("deinterleave v");
         }));
 
-        // 5. KV Cache Append
-        results.push(bench_op("KV Cache Append", &queue, |cb| {
-            let mut cache_tmp = LayerKvCache::preallocated(
-                device,
-                NUM_KV_HEADS,
-                HEAD_DIM,
-                MAX_SEQ_LEN,
-                DType::Float16,
-            );
-            cache_tmp
-                .append_batched_into_cb(&k_batched, &v_batched, seq_len, &registry, cb)
-                .expect("cache");
+        // 4. SDPA (matching production dispatch)
+        let sdpa_name: &'static str = if use_nax {
+            "SDPA NAX"
+        } else if use_mma_bk32 {
+            "SDPA MMA BK=32"
+        } else {
+            "SDPA MMA BK=16"
+        };
+        results.push(bench_op(sdpa_name, &queue, |cb| {
+            if use_nax {
+                let _ = ops::sdpa::sdpa_prefill_nax_f16_into_cb(
+                    &registry,
+                    &q_batched,
+                    &k_batched,
+                    &v_batched,
+                    NUM_HEADS,
+                    NUM_KV_HEADS,
+                    HEAD_DIM,
+                    seq_len,
+                    total_seq,
+                    None,
+                    scale,
+                    true,
+                    cb,
+                )
+                .expect("sdpa nax");
+            } else if use_mma_bk32 {
+                let _ = ops::sdpa::sdpa_prefill_mma_bk32_f16_into_cb(
+                    &registry,
+                    &q_batched,
+                    &k_batched,
+                    &v_batched,
+                    NUM_HEADS,
+                    NUM_KV_HEADS,
+                    HEAD_DIM,
+                    seq_len,
+                    total_seq,
+                    None,
+                    None,
+                    scale,
+                    true,
+                    cb,
+                )
+                .expect("sdpa mma bk32");
+            } else {
+                let _ = ops::sdpa::sdpa_prefill_mma_f16_into_cb(
+                    &registry,
+                    &q_batched,
+                    &k_batched,
+                    &v_batched,
+                    NUM_HEADS,
+                    NUM_KV_HEADS,
+                    HEAD_DIM,
+                    seq_len,
+                    total_seq,
+                    None,
+                    None,
+                    scale,
+                    true,
+                    cb,
+                )
+                .expect("sdpa mma bk16");
+            }
         }));
 
-        // 6. SDPA MMA
-        results.push(bench_op("SDPA MMA", &queue, |cb| {
-            let _ = ops::sdpa::sdpa_prefill_mma_f16_into_cb(
+        // 5. Head Interleave (only for NAX; MMA is seq-major, just reshape)
+        if !seq_major_output {
+            let packed_for_bench = attn_slab.view(
+                vec![NUM_HEADS * seq_len, HEAD_DIM],
+                vec![HEAD_DIM, 1],
+                attn_slab.offset(),
+            );
+            results.push(bench_op("Head Interleave", &queue, |cb| {
+                let _ = ops::rope::interleave_heads_into_cb(
+                    &registry,
+                    &packed_for_bench,
+                    NUM_HEADS,
+                    seq_len,
+                    cb,
+                )
+                .expect("interleave");
+            }));
+        }
+
+        // 6. O Projection GEMM (4096 -> 4096)
+        results.push(bench_op("O Proj GEMM (4096->4096)", &queue, |cb| {
+            let _ =
+                ops::matmul::matmul_into_cb(&registry, &attn_concat, &w_o_t, cb).expect("o_proj");
+        }));
+
+        // 7. Fused Residual + RMSNorm (pre-FFN)
+        results.push(bench_op("Res+RMSNorm (fused)", &queue, |cb| {
+            let _ = ops::rms_norm::rms_norm_residual_add_into_cb(
                 &registry,
-                &q_batched,
-                &k_slab,
-                &v_slab,
-                NUM_HEADS,
-                NUM_KV_HEADS,
-                HEAD_DIM,
-                seq_len,
-                total_seq,
-                kv_stride,
-                Some(&mask),
-                scale,
-                false,
+                &o_out,
+                &input,
+                &norm2_w,
+                RMS_NORM_EPS,
                 cb,
             )
-            .expect("sdpa");
+            .expect("fused residual+norm");
         }));
 
-        // 7. O Projection GEMM (4096 -> 4096)
-        results.push(bench_op("O Proj GEMM (4096->4096)", &queue, |cb| {
-            let _ = ops::matmul::matmul_into_cb(&registry, &attn_out, &w_o_t, cb).expect("o_proj");
-        }));
-
-        // 8. Residual Add (post-attention)
-        results.push(bench_op("Residual Add (post-attn)", &queue, |cb| {
-            let _ = ops::binary::add_into_cb(&registry, &input, &o_out, cb).expect("add");
-        }));
-
-        // 9. RMSNorm (pre-FFN)
-        results.push(bench_op("RMSNorm (pre-FFN)", &queue, |cb| {
-            let _ =
-                ops::rms_norm::rms_norm_into_cb(&registry, &h, Some(&norm2_w), RMS_NORM_EPS, cb)
-                    .expect("rms_norm 2");
-        }));
-
-        // 10. Merged Gate+Up GEMM (4096 -> 28672)
+        // 8. Merged Gate+Up GEMM (4096 -> 28672)
         results.push(bench_op("Gate+Up GEMM (4096->28672)", &queue, |cb| {
             let _ = ops::matmul::matmul_into_cb(&registry, &normed2_2d, &gate_up_wt, cb)
                 .expect("gate_up");
         }));
 
-        // 11. Fused SiLU*mul (strided)
-        results.push(bench_op("Fused SiLU*mul (strided)", &queue, |cb| {
+        // 9. Fused SiLU*mul (strided)
+        results.push(bench_op("Fused SiLU*mul", &queue, |cb| {
             let _ = ops::fused::fused_silu_mul_strided_into_cb(
                 &registry,
                 &gate_up_out,
@@ -751,13 +863,13 @@ fn main() {
             .expect("silu_mul");
         }));
 
-        // 12. Down Projection GEMM (14336 -> 4096)
+        // 10. Down Projection GEMM (14336 -> 4096)
         results.push(bench_op("Down Proj GEMM (14336->4096)", &queue, |cb| {
-            let _ = ops::matmul::matmul_into_cb(&registry, &hidden_act, &w_down_t, cb)
-                .expect("down_proj");
+            let _ =
+                ops::matmul::matmul_into_cb(&registry, &hidden_act, &w_down_t, cb).expect("down");
         }));
 
-        // 13. Residual Add (final)
+        // 11. Residual Add (final: h + ffn_out)
         results.push(bench_op("Residual Add (final)", &queue, |cb| {
             let _ = ops::binary::add_into_cb(&registry, &h, &ffn_out, cb).expect("add final");
         }));
@@ -766,24 +878,24 @@ fn main() {
         let sum_ops: f64 = results.iter().map(|r| r.mean_us).sum();
 
         println!(
-            "\n{:<32} {:>10} {:>8} {:>10} {:>10} {:>8}",
-            "Operation", "Mean (us)", "Std", "Min (us)", "Max (us)", "% Total"
+            "\n{:<32} {:>10} {:>10} {:>10} {:>10} {:>8}",
+            "Operation", "Mean(us)", "P50(us)", "Min(us)", "Max(us)", "% Total"
         );
-        println!("{}", "-".repeat(82));
+        println!("{}", "-".repeat(84));
 
         for r in &results {
             let pct = r.mean_us / sum_ops * 100.0;
             println!(
-                "{:<32} {:>10.1} {:>8.1} {:>10.1} {:>10.1} {:>7.1}%",
-                r.name, r.mean_us, r.std_us, r.min_us, r.max_us, pct
+                "{:<32} {:>10.1} {:>10.1} {:>10.1} {:>10.1} {:>7.1}%",
+                r.name, r.mean_us, r.p50_us, r.min_us, r.max_us, pct
             );
         }
 
-        println!("{}", "-".repeat(82));
+        println!("{}", "-".repeat(84));
         println!("{:<32} {:>10.1}", "Sum of individual ops", sum_ops);
         println!(
-            "{:<32} {:>10.1}",
-            "Full pipeline (single CB)", baseline.mean_us
+            "{:<32} {:>10.1}  (p50={:.1}, min={:.1})",
+            "Full pipeline (single CB)", baseline.mean_us, baseline.p50_us, baseline.min_us
         );
         let overhead = (sum_ops - baseline.mean_us) / baseline.mean_us * 100.0;
         println!("{:<32} {:>10.1}%", "CB overhead (sum - pipeline)", overhead);
