@@ -81,6 +81,7 @@ fn lcg_next(state: &mut u64) -> u64 {
     *state
 }
 
+#[allow(dead_code)]
 fn rand_f32_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
     let numel: usize = shape.iter().product();
     let mut state = seed;
@@ -311,7 +312,7 @@ fn bench_auto(
     group_size: u32,
 ) -> BenchResult {
     let qw = make_quantized_weight(device, n, k, 4, group_size, 42);
-    let x = rand_f32_array(device, &[m, k], 99);
+    let x = rand_f16_array(device, &[m, k], 99);
 
     for _ in 0..WARMUP_ITERS {
         let _ = ops::quantized::affine_quantized_matmul_batched(registry, &x, &qw, queue)
@@ -339,7 +340,7 @@ fn bench_steel(
     group_size: u32,
 ) -> BenchResult {
     let qw = make_quantized_weight(device, n, k, 4, group_size, 42);
-    let x = rand_f32_array(device, &[m, k], 99);
+    let x = rand_f16_array(device, &[m, k], 99);
 
     for _ in 0..WARMUP_ITERS {
         let _ = ops::quantized::affine_quantized_matmul_steel(registry, &x, &qw, queue)
@@ -412,7 +413,7 @@ fn bench_qmv(
 
     // Create M separate 1D vectors
     let vecs: Vec<Array> = (0..m)
-        .map(|i| rand_f32_array(device, &[k], 99 + i as u64))
+        .map(|i| rand_f16_array(device, &[k], 99 + i as u64))
         .collect();
 
     // Warmup: call QMV for each row
@@ -515,7 +516,7 @@ fn main() {
         "Warmup: {} iters, Bench: {} iters, group_size={}",
         WARMUP_ITERS, BENCH_ITERS, gs,
     );
-    println!("Auto/Steel/Scalar/QMV/BatchQMV: f32 input | NAX: f16 input (M>=32, K%64==0)");
+    println!("All kernels: f16 input | NAX: M>=32, K%64==0 only");
     println!("QMV: M=1 native; M>1 calls QMV M times sequentially");
     println!();
 
@@ -566,5 +567,68 @@ fn main() {
         }
     }
 
-    println!("Done.");
+    // === f16 vs f32 A/B comparison ===
+    println!("=========================================================");
+    println!("  f16 vs f32 A/B Comparison (same thermal state)");
+    println!("=========================================================");
+    println!();
+
+    // For each (M, K, N) combo, run f32 then f16 immediately after
+    for &(label, k, n) in dims {
+        for &m in &[1usize, 4, 8, 16] {
+            if k % 512 != 0 {
+                continue;
+            }
+
+            let qw = make_quantized_weight(device, n, k, 4, gs, 42);
+            let x_f32 = rand_f32_array(device, &[m, k], 99);
+            let x_f16 = rand_f16_array(device, &[m, k], 99);
+
+            // Warmup both
+            for _ in 0..WARMUP_ITERS {
+                let _ =
+                    ops::quantized::affine_quantized_matmul_batched(&registry, &x_f32, &qw, &queue);
+                let _ =
+                    ops::quantized::affine_quantized_matmul_batched(&registry, &x_f16, &qw, &queue);
+            }
+
+            // Bench f32
+            let mut f32_times = Vec::with_capacity(BENCH_ITERS);
+            for _ in 0..BENCH_ITERS {
+                let start = Instant::now();
+                let _ =
+                    ops::quantized::affine_quantized_matmul_batched(&registry, &x_f32, &qw, &queue)
+                        .expect("f32 bench failed");
+                f32_times.push(start.elapsed());
+            }
+            let f32_stats = Stats::from_durations(&f32_times);
+
+            // Bench f16 (immediately after, same thermal state)
+            let mut f16_times = Vec::with_capacity(BENCH_ITERS);
+            for _ in 0..BENCH_ITERS {
+                let start = Instant::now();
+                let _ =
+                    ops::quantized::affine_quantized_matmul_batched(&registry, &x_f16, &qw, &queue)
+                        .expect("f16 bench failed");
+                f16_times.push(start.elapsed());
+            }
+            let f16_stats = Stats::from_durations(&f16_times);
+
+            let flops = 2.0 * m as f64 * k as f64 * n as f64;
+            let f32_tflops = flops / (f32_stats.p50 * 1e-6) / 1e12;
+            let f16_tflops = flops / (f16_stats.p50 * 1e-6) / 1e12;
+            let speedup = f32_stats.p50 / f16_stats.p50;
+
+            println!(
+                "  {label:12} M={m:<4} K={k:<6} N={n:<6}  f32={:>8.1}us ({:.4}T)  f16={:>8.1}us ({:.4}T)  f16/f32={:.2}x",
+                f32_stats.p50,
+                f32_tflops,
+                f16_stats.p50,
+                f16_tflops,
+                speedup,
+            );
+        }
+    }
+
+    println!("\nDone.");
 }

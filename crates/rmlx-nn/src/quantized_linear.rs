@@ -165,11 +165,11 @@ impl QuantizedLinear {
             )));
         };
 
-        // Cast to f32 if needed — quantized matmul requires f32 input.
-        let x_2d = if x_2d.dtype() != DType::Float32 {
-            copy_cast(registry, &x_2d, DType::Float32, queue)?
-        } else {
-            x_2d
+        // Quantized matmul supports Float16 and Float32 input natively.
+        // Cast other dtypes (e.g., bf16) to Float16.
+        let x_2d = match x_2d.dtype() {
+            DType::Float16 | DType::Float32 => x_2d,
+            _ => copy_cast(registry, &x_2d, DType::Float16, queue)?,
         };
 
         if x_2d.shape()[1] != self.in_features {

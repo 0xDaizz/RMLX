@@ -73,6 +73,7 @@ The rmlx project implementation roadmap. All phases through 9B-opt and serving s
 | H-2 | GEMM+Residual Epilogue Fusion | Function constant 202 (has_residual), 5-12% for large N | G | Complete |
 | I-1 | Distributed TP | DistributedTransformerModel, forward_with_group, shard_for_tp, TP=2 1.94x | H | Complete |
 | J | Quantized Parity + Infra | QMM +73%, QMV +37% (MLX 1.15x), ExecGraph stall removal, lazy.rs FusionCompiler, RMSNorm+GEMM fusion, Split-K, MoE fuse, forward_auto() | I | Complete (J-3c/J-8 pending) |
+| DQ | Dual-Queue MoE Overlap Research | Metal 2-queue Attn∥MoE concurrent dispatch, benchmark validation | J | 🔬 Research Complete |
 | KO-2 | Decode Scratch Allocator | Pre-allocated workspace, bump alloc, StorageModePrivate | KO | Planned |
 | KO-3 | ICB Decode Replay | Record/replay 9-dispatch via Metal ICB, dynamic setBytes | KO + KO-2 | Planned |
 | A | Prefill Optimization | Single-CB pipeline (54 sync→1), GQA slab SDPA (32→1), GEMM swizzle, matmul_into_cb, silu_into_cb | 10 | Complete |
@@ -1465,6 +1466,48 @@ Close the QMM/QMV MLX gap identified in Phase G benchmarks, remove ExecGraph int
 - [x] J-7: RDMA 2-node bench wired
 - [ ] J-3c: ICB decode replay
 - [ ] J-8: MoE fused kernels (in review)
+
+---
+
+## 🔬 Phase DQ: Dual-Queue MoE Overlap Research — Research Complete
+
+### Goal
+
+Validate whether pipeline-level optimization can address low GPU utilization during MoE prefill where per-expert M drops to 4~32. Test Metal dual-queue concurrent dispatch to overlap bandwidth-bound MoE expert GEMM with compute-bound attention projection for wall-time reduction.
+
+### Background
+
+During MoE prefill (M=512, E=64~384, top_k=1~8), per-expert effective M drops to 4~32. In this range, QMM/QMV becomes bandwidth-bound, leaving most GPU compute units idle. Meanwhile, attention projection at M=256 is compute-bound and saturates the GPU. The complementary resource usage patterns make this an ideal candidate for concurrent dispatch.
+
+### Benchmark Results (M3 Ultra 80-core, Q4 expert vs FP16 attention)
+
+| Model | Expert (BW-bound) | Attention (Compute-bound) | Sequential | Concurrent | Reduction | Expert Hidden |
+|-------|-------------------|---------------------------|-----------|------------|-----------|---------------|
+| DeepSeek-V3 (E=256, top8) | 419μs (M=16, K=7168, N=2048) | 5141μs (M=256, K=7168, N=24576) | 5321μs | 5234μs | **1.6%** | 21% |
+| Llama-4-Maverick (E=128, top1) | 304μs (M=4, K=5120, N=8192) | 1352μs (M=256, K=5120, N=5120) | 1646μs | 1428μs | **13.2%** | 72% |
+| Qwen3-235B (E=128, top8) | 726μs (M=32, K=4096, N=1536) | 1374μs (M=256, K=4096, N=8192) | 2089μs | 1572μs | **24.8%** | 71% |
+| Kimi-K2 (E=384, top8) | 364μs (M=11, K=7168, N=2048) | 2803μs (M=256, K=7168, N=12288) | 3106μs | 2988μs | **3.8%** | 32% |
+| GLM-5 (E=256, top8) | 385μs (M=16, K=6144, N=2048) | 3087μs (M=256, K=6144, N=16384) | 3410μs | 3338μs | **2.1%** | 19% |
+| MiniMax-M1 (E=32, top2) | 1409μs (M=32, K=6144, N=9216) | 1916μs (M=256, K=6144, N=8192) | 3338μs | 2183μs | **34.6%** | 82% |
+| MiniMax-M2.5 (E=256, top8) | 251μs (M=16, K=3072, N=1536) | 971μs (M=256, K=3072, N=6144) | 1236μs | 1108μs | **10.4%** | 51% |
+
+### Key Findings
+
+1. **BW-bound ∥ compute-bound overlap works on Metal 2-queue** — despite Apple's "rare case" statement, this combination is effective
+2. **Most effective when Attn/Expert time ratio is 1:1~1:3** — MiniMax-M1 (34.6%), Qwen3 (24.8%), Llama 4 (13.2%) show strong results
+3. **MLA-heavy models (DeepSeek, Kimi, GLM) benefit less** — attention dominates so much that expert overlap contribution is marginal
+4. **No prior implementations exist** — DeepSeek DualPipe, FoldMoE, COMET all address multi-GPU communication overlap; single-GPU Attn∥MoE overlap is unexplored
+5. **Implementation direction**: Micro-batch pipeline — split prefill sequence into 2+ micro-batches, interleave Layer N MoE (Queue A) with Layer N Attn for next micro-batch (Queue B)
+
+### Key Deliverables
+
+- `rmlx-core/benches/dual_queue_bench.rs`: Dual-queue overlap benchmark with 7 model profiles (DeepSeek V3, Llama 4, Qwen3, Kimi K2, GLM-5, MiniMax-M1, MiniMax-M2.5)
+
+### Future Work
+
+- [ ] Implement micro-batch pipeline in TransformerModel (forward_pipelined_dual_queue)
+- [ ] Measure end-to-end overlap effect across real 32-layer transformer
+- [ ] Search for optimal micro-batch count (MB size reduction vs pipeline fill rate trade-off)
 
 ---
 
