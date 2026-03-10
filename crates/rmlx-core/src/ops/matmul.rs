@@ -2162,8 +2162,8 @@ kernel void gemm_mlx_f16(
     uint  lane_id        [[thread_index_in_simdgroup]])
 {
     // Padding to avoid TG memory bank conflicts
-    constant constexpr uint LDA = MLX_BK + 8;   // 16 + 8 = 24
-    constant constexpr uint LDB = MLX_BN + 8;   // 64 + 8 = 72
+    constexpr uint LDA = MLX_BK + 8;   // 16 + 8 = 24
+    constexpr uint LDB = MLX_BN + 8;   // 64 + 8 = 72
     threadgroup half As[MLX_BM * LDA];   // 64 * 24 = 1536 halves = 3KB
     threadgroup half Bs[MLX_BK * LDB];   // 16 * 72 = 1152 halves ~ 2.3KB
     // TG-cached norm_weight for the current K tile (avoids 64x redundant device reads)
@@ -2378,8 +2378,8 @@ kernel void gemm_mlx_f32(
     uint  lane_id        [[thread_index_in_simdgroup]])
 {
     // Padding to avoid TG memory bank conflicts
-    constant constexpr uint LDA_F = MLX_BK + 4;   // 16 + 4 = 20
-    constant constexpr uint LDB_F = MLX_BN + 4;   // 64 + 4 = 68
+    constexpr uint LDA_F = MLX_BK + 4;   // 16 + 4 = 20
+    constexpr uint LDB_F = MLX_BN + 4;   // 64 + 4 = 68
     threadgroup float As[MLX_BM * LDA_F];  // 64 * 20 = 1280 floats = 5KB
     threadgroup float Bs[MLX_BK * LDB_F];  // 16 * 68 = 1088 floats ~ 4.3KB
     // TG-cached norm_weight for the current K tile (avoids 64x redundant device reads)
@@ -2907,8 +2907,8 @@ kernel void gemm_mlx_bf16(
     uint  lane_id        [[thread_index_in_simdgroup]])
 {
     // Padding to avoid TG memory bank conflicts
-    constant constexpr uint LDA_BF = MLX_BK + 8;   // 16 + 8 = 24
-    constant constexpr uint LDB_BF = MLX_BN + 8;   // 64 + 8 = 72
+    constexpr uint LDA_BF = MLX_BK + 8;   // 16 + 8 = 24
+    constexpr uint LDB_BF = MLX_BN + 8;   // 64 + 8 = 72
     threadgroup bfloat As[MLX_BM * LDA_BF];  // 64 * 24 = 1536 bfloats = 3KB
     threadgroup bfloat Bs[MLX_BK * LDB_BF];  // 16 * 72 = 1152 bfloats ~ 2.3KB
     // TG-cached norm_weight for the current K tile (f32 for precision, avoids 64x redundant device reads)
@@ -3030,7 +3030,7 @@ kernel void gemm_mlx_bf16(
                 A_f32[idx] = float(As[r * LDA_BF + kk * 8 + c]);
             }
             // Convert B slice for this SG's region: 8 rows x (MLX_TN*8) cols → f32
-            constant constexpr uint B_SG_COLS = MLX_TN * 8;  // 32
+            constexpr uint B_SG_COLS = MLX_TN * 8;  // 32
             for (uint idx = tid_in_group; idx < 8 * B_SG_COLS; idx += MLX_N_THREADS) {
                 uint r = idx / B_SG_COLS;
                 uint c = idx % B_SG_COLS;
