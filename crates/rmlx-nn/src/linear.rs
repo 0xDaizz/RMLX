@@ -440,7 +440,7 @@ impl Linear {
             || tile.variant == ops::matmul::TileVariant::MlxArchSmall
             || tile.variant == ops::matmul::TileVariant::MlxArchMicro
         {
-            let constants = ops::matmul::matmul_align_constants(m, n, tile.bm, tile.bn);
+            let constants = ops::matmul::matmul_align_constants(m, n, k, tile.bm, tile.bn, tile.bk);
             registry.get_pipeline_with_constants(kernel_name, input_2d.dtype(), &constants)?
         } else {
             registry.get_pipeline(kernel_name, input_2d.dtype())?

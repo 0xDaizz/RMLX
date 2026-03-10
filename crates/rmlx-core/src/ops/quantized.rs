@@ -1072,6 +1072,119 @@ kernel void affine_qmv_batched_splitk_f16_q4(
 }
 
 // -----------------------------------------------------------------------
+// affine_qmv_splitk_f16_q4: M=1 f16 QMV with K-splitting.
+//
+// Simplified split-K for single-vector case — no batch indexing overhead.
+// Each TG processes a chunk of K, writes f32 partial sums to c_split.
+// Reuses qmm_splitk_accum_f16 for the reduction phase.
+//
+// Grid:  (1, ceil(N/8), k_partitions)
+// Group: (32, 2, 1) = 64 threads = 2 simdgroups
+// -----------------------------------------------------------------------
+
+kernel void affine_qmv_splitk_f16_q4(
+    device const uint32_t* weights  [[buffer(0)]],
+    device const float*    scales   [[buffer(1)]],
+    device const float*    biases   [[buffer(2)]],
+    device const half*     vec      [[buffer(3)]],
+    device float*          c_split  [[buffer(4)]],
+    constant uint4&        params   [[buffer(5)]],
+    constant uint2&        splitk_params [[buffer(6)]],
+    uint3 tgid      [[threadgroup_position_in_grid]],
+    uint simd_gid   [[simdgroup_index_in_threadgroup]],
+    uint simd_lid   [[thread_index_in_simdgroup]])
+{
+    const int out_features = int(params.x);
+    const int in_features  = int(params.y);
+    const int group_size   = int(params.z);
+
+    const int k_partitions = int(splitk_params.x);
+    const int k_per_part   = int(splitk_params.y);
+
+    const int partition_id = int(tgid.z);
+    const int k_start = partition_id * k_per_part;
+    int k_end = k_start + k_per_part;
+    if (k_end > in_features) k_end = in_features;
+    if (k_start >= in_features) return;
+
+    const int in_vec_size_w = in_features / QMV_Q4_PACK_FACTOR;
+    const int in_vec_size_g = in_features / group_size;
+    const int scale_step    = group_size / QMV_Q4_VALUES_PER_THREAD;
+
+    const int out_row = int(tgid.y) * (QMV_Q4_NUM_SIMDGROUPS * QMV_Q4_RESULTS_PER_SG)
+                      + simd_gid * QMV_Q4_RESULTS_PER_SG;
+
+    if (out_row >= out_features) return;
+
+    // Pointer setup: offset to k_start within the row
+    const int k_start_packs = k_start / QMV_Q4_PACK_FACTOR;
+    const int k_start_groups = k_start / group_size;
+
+    device const uint8_t* ws = (device const uint8_t*)(weights)
+        + out_row * in_vec_size_w * 4
+        + k_start_packs * 4
+        + simd_lid * QMV_Q4_PACKS_PER_THREAD * 4;
+    device const float* sl = scales + out_row * in_vec_size_g
+        + k_start_groups
+        + simd_lid / scale_step;
+    device const float* bl = biases + out_row * in_vec_size_g
+        + k_start_groups
+        + simd_lid / scale_step;
+    device const half* x = vec + k_start + simd_lid * QMV_Q4_VALUES_PER_THREAD;
+
+    float result[QMV_Q4_RESULTS_PER_SG] = {0, 0, 0, 0};
+
+    for (int k = k_start; k < k_end; k += QMV_Q4_BLOCK_SIZE) {
+        float x_thread[QMV_Q4_VALUES_PER_THREAD];
+        float xsum = 0.0f;
+
+        for (int i = 0; i < QMV_Q4_VALUES_PER_THREAD; i += 4) {
+            half4 xh = *(device const half4*)(x + i);
+            float v0 = float(xh.x);
+            float v1 = float(xh.y);
+            float v2 = float(xh.z);
+            float v3 = float(xh.w);
+            xsum += v0 + v1 + v2 + v3;
+            x_thread[i]     = v0;
+            x_thread[i + 1] = v1 / 16.0f;
+            x_thread[i + 2] = v2 / 256.0f;
+            x_thread[i + 3] = v3 / 4096.0f;
+        }
+
+        for (int row = 0; row < QMV_Q4_RESULTS_PER_SG; row++) {
+            device const uint8_t* wl = ws + row * in_vec_size_w * 4;
+            float s = sl[row * in_vec_size_g];
+            float b = bl[row * in_vec_size_g];
+
+            if (row + out_row < out_features) {
+                device const uint16_t* wp = (device const uint16_t*)wl;
+                float accum = 0.0f;
+                for (int i = 0; i < QMV_Q4_VALUES_PER_THREAD / 4; i++) {
+                    accum += x_thread[4 * i]     * float(wp[i] & 0x000fu)
+                           + x_thread[4 * i + 1] * float(wp[i] & 0x00f0u)
+                           + x_thread[4 * i + 2] * float(wp[i] & 0x0f00u)
+                           + x_thread[4 * i + 3] * float(wp[i] & 0xf000u);
+                }
+                result[row] += s * accum + xsum * b;
+            }
+        }
+
+        ws += QMV_Q4_BLOCK_SIZE / QMV_Q4_PACK_FACTOR * 4;
+        sl += QMV_Q4_BLOCK_SIZE / group_size;
+        bl += QMV_Q4_BLOCK_SIZE / group_size;
+        x  += QMV_Q4_BLOCK_SIZE;
+    }
+
+    // Write f32 partial sums to c_split[partition_id * N + out_row + row]
+    for (int row = 0; row < QMV_Q4_RESULTS_PER_SG; row++) {
+        result[row] = simd_sum(result[row]);
+        if (simd_lid == 0 && out_row + row < out_features) {
+            c_split[partition_id * out_features + out_row + row] = result[row];
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
 // qmm_splitk_accum_f16: Reduce split-K partial sums into half output.
 // -----------------------------------------------------------------------
 
@@ -1377,6 +1490,21 @@ fn calc_batchqmv_k_partitions(m: usize, n: usize, k: usize) -> usize {
     let target_tgs: usize = 320; // 4x M3 Ultra 80 cores
     if spatial_tgs >= target_tgs {
         1 // enough spatial parallelism
+    } else {
+        let desired = (target_tgs / spatial_tgs).clamp(2, 16);
+        desired.min(k / 512) // min 512 values per partition
+    }
+}
+
+/// Calculate optimal split-K partitions for M=1 QMV.
+///
+/// Target: ~320 threadgroups (4x M3 Ultra 80 cores).
+/// Spatial parallelism from N dimension: ceil(N/8) TGs.
+fn calc_qmv_splitk_partitions(n: usize, k: usize) -> usize {
+    let spatial_tgs = n.div_ceil(8); // 8 rows per TG
+    let target_tgs: usize = 320;
+    if spatial_tgs >= target_tgs {
+        1 // enough spatial parallelism (shouldn't reach here given n <= 2048 guard)
     } else {
         let desired = (target_tgs / spatial_tgs).clamp(2, 16);
         desired.min(k / 512) // min 512 values per partition
@@ -1726,6 +1854,277 @@ pub fn affine_qmv_batched_splitk_f16_q4(
     enc2.end_encoding();
 
     super::commit_with_mode(cb, super::ExecMode::Sync);
+
+    Ok(out)
+}
+
+/// f16-native QMV with split-K for Q4 weights (M=1 only).
+///
+/// Simplified split-K variant for single-vector case — avoids batch indexing
+/// overhead of `affine_qmv_batched_splitk_f16_q4`.
+/// Uses a two-phase approach: split-K partial sums in f32, then reduce to f16.
+///
+/// # Arguments
+/// - `registry`: kernel registry.
+/// - `qw`: the quantized weight description (must be 4-bit).
+/// - `vec`: f16 input vector of length `qw.in_features`.
+/// - `queue`: Metal command queue for dispatch.
+/// - `k_partitions`: number of K-dimension partitions (must be >= 2).
+///
+/// # Returns
+/// A 1-D f16 `Array` of length `qw.out_features`.
+pub fn affine_qmv_splitk_f16_q4(
+    registry: &KernelRegistry,
+    qw: &QuantizedWeight,
+    vec: &Array,
+    queue: &metal::CommandQueue,
+    k_partitions: usize,
+) -> Result<Array, KernelError> {
+    if qw.bits != 4 {
+        return Err(KernelError::InvalidShape(format!(
+            "affine_qmv_splitk_f16_q4 requires 4-bit weights, got {}-bit",
+            qw.bits
+        )));
+    }
+    if vec.dtype() != DType::Float16 {
+        return Err(KernelError::InvalidShape(format!(
+            "affine_qmv_splitk_f16_q4 requires Float16 input, got {:?}",
+            vec.dtype()
+        )));
+    }
+    if vec.numel() != qw.in_features {
+        return Err(KernelError::InvalidShape(format!(
+            "vec.numel() ({}) != in_features ({})",
+            vec.numel(),
+            qw.in_features
+        )));
+    }
+    if k_partitions < 2 {
+        return Err(KernelError::InvalidShape(
+            "affine_qmv_splitk_f16_q4: k_partitions must be >= 2".into(),
+        ));
+    }
+    let k = qw.in_features;
+    const QMV_Q4_BLOCK_SIZE: usize = 512;
+    if k % QMV_Q4_BLOCK_SIZE != 0 {
+        return Err(KernelError::InvalidShape(format!(
+            "affine_qmv_splitk_f16_q4: in_features ({k}) must be a multiple of {QMV_Q4_BLOCK_SIZE}"
+        )));
+    }
+
+    let n = qw.out_features;
+    let dev = registry.device().raw();
+    let opts = metal::MTLResourceOptions::StorageModeShared;
+
+    // k_per_part aligned to BLOCK_SIZE boundary
+    let k_per_part = (k / k_partitions).div_ceil(QMV_Q4_BLOCK_SIZE) * QMV_Q4_BLOCK_SIZE;
+
+    // Phase 1: Split-K partial sums (f32)
+    let splitk_pipeline = registry.get_pipeline("affine_qmv_splitk_f16_q4", DType::Float16)?;
+
+    let c_split_size = (k_partitions * n * std::mem::size_of::<f32>()) as u64;
+    let c_split_buf = dev.new_buffer(c_split_size, opts);
+
+    let out = Array::zeros(dev, &[n], DType::Float16);
+
+    let params: [u32; 4] = [
+        super::checked_u32(n, "out_features")?,
+        super::checked_u32(k, "in_features")?,
+        qw.group_size,
+        qw.bits,
+    ];
+    let splitk_p: [u32; 2] = [
+        super::checked_u32(k_partitions, "k_partitions")?,
+        super::checked_u32(k_per_part, "k_per_part")?,
+    ];
+
+    let params_buf = dev.new_buffer_with_data(
+        params.as_ptr() as *const _,
+        (params.len() * std::mem::size_of::<u32>()) as u64,
+        opts,
+    );
+    let splitk_buf = dev.new_buffer_with_data(
+        splitk_p.as_ptr() as *const _,
+        (splitk_p.len() * std::mem::size_of::<u32>()) as u64,
+        opts,
+    );
+
+    let cb = queue.new_command_buffer();
+
+    // Encode split-K kernel
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&splitk_pipeline);
+    enc.set_buffer(0, Some(&qw.weights_buf), 0);
+    enc.set_buffer(1, Some(&qw.scales_buf), 0);
+    enc.set_buffer(2, Some(&qw.biases_buf), 0);
+    enc.set_buffer(3, Some(vec.metal_buffer()), vec.offset() as u64);
+    enc.set_buffer(4, Some(&c_split_buf), 0);
+    enc.set_buffer(5, Some(&params_buf), 0);
+    enc.set_buffer(6, Some(&splitk_buf), 0);
+
+    let rows_per_tg: u64 = 8;
+    let num_tgs_y = (n as u64).div_ceil(rows_per_tg);
+    let tg_size: u64 = 64;
+
+    enc.dispatch_thread_groups(
+        metal::MTLSize::new(1, num_tgs_y, k_partitions as u64),
+        metal::MTLSize::new(tg_size, 1, 1),
+    );
+    enc.end_encoding();
+
+    // Phase 2: Reduce partial sums -> f16 output
+    // Reuse qmm_splitk_accum_f16 with partition_stride = N (since M=1)
+    let reduce_pipeline = registry.get_pipeline("qmm_splitk_accum_f16", DType::Float16)?;
+    let acc_params: [u32; 3] = [
+        super::checked_u32(n, "N")?,
+        super::checked_u32(k_partitions, "k_partitions")?,
+        super::checked_u32(n, "partition_stride")?, // M=1 so stride = N
+    ];
+    let acc_params_buf = dev.new_buffer_with_data(
+        acc_params.as_ptr() as *const _,
+        (acc_params.len() * std::mem::size_of::<u32>()) as u64,
+        opts,
+    );
+
+    let enc2 = cb.new_compute_command_encoder();
+    enc2.set_compute_pipeline_state(&reduce_pipeline);
+    enc2.set_buffer(0, Some(&c_split_buf), 0);
+    enc2.set_buffer(1, Some(out.metal_buffer()), 0);
+    enc2.set_buffer(2, Some(&acc_params_buf), 0);
+
+    // dispatch_threads for 1-D reduce: N threads, M=1 so gid.y=0
+    enc2.dispatch_threads(
+        metal::MTLSize::new(n as u64, 1, 1),
+        metal::MTLSize::new(n.min(256) as u64, 1, 1),
+    );
+    enc2.end_encoding();
+
+    super::commit_with_mode(cb, super::ExecMode::Sync);
+
+    Ok(out)
+}
+
+/// Split-K QMV for Q4 (M=1), encoding into an existing command buffer.
+#[allow(clippy::too_many_arguments)]
+pub fn affine_qmv_splitk_f16_q4_into_cb(
+    registry: &KernelRegistry,
+    qw: &QuantizedWeight,
+    vec: &Array,
+    k_partitions: usize,
+    cb: &metal::CommandBufferRef,
+) -> Result<Array, KernelError> {
+    if qw.bits != 4 {
+        return Err(KernelError::InvalidShape(format!(
+            "affine_qmv_splitk_f16_q4 requires 4-bit weights, got {}-bit",
+            qw.bits
+        )));
+    }
+    if vec.dtype() != DType::Float16 {
+        return Err(KernelError::InvalidShape(format!(
+            "affine_qmv_splitk_f16_q4 requires Float16 input, got {:?}",
+            vec.dtype()
+        )));
+    }
+    if vec.numel() != qw.in_features {
+        return Err(KernelError::InvalidShape(format!(
+            "vec.numel() ({}) != in_features ({})",
+            vec.numel(),
+            qw.in_features
+        )));
+    }
+    if k_partitions < 2 {
+        return Err(KernelError::InvalidShape(
+            "affine_qmv_splitk_f16_q4: k_partitions must be >= 2".into(),
+        ));
+    }
+    let k = qw.in_features;
+    const QMV_Q4_BLOCK_SIZE: usize = 512;
+    if k % QMV_Q4_BLOCK_SIZE != 0 {
+        return Err(KernelError::InvalidShape(format!(
+            "affine_qmv_splitk_f16_q4: in_features ({k}) must be a multiple of {QMV_Q4_BLOCK_SIZE}"
+        )));
+    }
+
+    let n = qw.out_features;
+    let dev = registry.device().raw();
+    let opts = metal::MTLResourceOptions::StorageModeShared;
+
+    let k_per_part = (k / k_partitions).div_ceil(QMV_Q4_BLOCK_SIZE) * QMV_Q4_BLOCK_SIZE;
+
+    let splitk_pipeline = registry.get_pipeline("affine_qmv_splitk_f16_q4", DType::Float16)?;
+
+    let c_split_size = (k_partitions * n * std::mem::size_of::<f32>()) as u64;
+    let c_split_buf = dev.new_buffer(c_split_size, opts);
+
+    let out = Array::zeros(dev, &[n], DType::Float16);
+
+    let params: [u32; 4] = [
+        super::checked_u32(n, "out_features")?,
+        super::checked_u32(k, "in_features")?,
+        qw.group_size,
+        qw.bits,
+    ];
+    let splitk_p: [u32; 2] = [
+        super::checked_u32(k_partitions, "k_partitions")?,
+        super::checked_u32(k_per_part, "k_per_part")?,
+    ];
+
+    let params_buf = dev.new_buffer_with_data(
+        params.as_ptr() as *const _,
+        (params.len() * std::mem::size_of::<u32>()) as u64,
+        opts,
+    );
+    let splitk_buf = dev.new_buffer_with_data(
+        splitk_p.as_ptr() as *const _,
+        (splitk_p.len() * std::mem::size_of::<u32>()) as u64,
+        opts,
+    );
+
+    // Encode split-K kernel
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&splitk_pipeline);
+    enc.set_buffer(0, Some(&qw.weights_buf), 0);
+    enc.set_buffer(1, Some(&qw.scales_buf), 0);
+    enc.set_buffer(2, Some(&qw.biases_buf), 0);
+    enc.set_buffer(3, Some(vec.metal_buffer()), vec.offset() as u64);
+    enc.set_buffer(4, Some(&c_split_buf), 0);
+    enc.set_buffer(5, Some(&params_buf), 0);
+    enc.set_buffer(6, Some(&splitk_buf), 0);
+
+    let rows_per_tg: u64 = 8;
+    let num_tgs_y = (n as u64).div_ceil(rows_per_tg);
+    let tg_size: u64 = 64;
+
+    enc.dispatch_thread_groups(
+        metal::MTLSize::new(1, num_tgs_y, k_partitions as u64),
+        metal::MTLSize::new(tg_size, 1, 1),
+    );
+    enc.end_encoding();
+
+    // Phase 2: Reduce
+    let reduce_pipeline = registry.get_pipeline("qmm_splitk_accum_f16", DType::Float16)?;
+    let acc_params: [u32; 3] = [
+        super::checked_u32(n, "N")?,
+        super::checked_u32(k_partitions, "k_partitions")?,
+        super::checked_u32(n, "partition_stride")?,
+    ];
+    let acc_params_buf = dev.new_buffer_with_data(
+        acc_params.as_ptr() as *const _,
+        (acc_params.len() * std::mem::size_of::<u32>()) as u64,
+        opts,
+    );
+
+    let enc2 = cb.new_compute_command_encoder();
+    enc2.set_compute_pipeline_state(&reduce_pipeline);
+    enc2.set_buffer(0, Some(&c_split_buf), 0);
+    enc2.set_buffer(1, Some(out.metal_buffer()), 0);
+    enc2.set_buffer(2, Some(&acc_params_buf), 0);
+
+    enc2.dispatch_threads(
+        metal::MTLSize::new(n as u64, 1, 1),
+        metal::MTLSize::new(n.min(256) as u64, 1, 1),
+    );
+    enc2.end_encoding();
 
     Ok(out)
 }
@@ -5199,28 +5598,35 @@ pub fn affine_quantized_matmul_batched(
         // Q4 non-NAX dispatch: shape-aware kernel selection
         //
         // Based on comprehensive benchmarking (qmm_lowm_bench, M3 Ultra 80-core):
-        // 1. M = 1-16        → Batched QMV (qdot, grid.x=M) — fastest across all shapes
-        // 2. M = 17-32       → Skinny MMA (BM=32, BN=64, BK=32 + split-K)
+        // 1. M <= qmv_limit  → Batched QMV (qdot, grid.x=M) — fastest at low M
+        // 2. M = limit+1..32 → Skinny MMA (BM=32, BN=64, BK=32 + split-K)
         // 3. M > 32          → Standard MMA (BM=64, BN=64, BK=16)
         //
-        // BatchQMV beats Tiny MMA and Scalar at all tested M=1-16 configs:
+        // BatchQMV beats Tiny MMA and Scalar at all tested low-M configs:
         //   M=1  K=7168: BatchQMV 0.14T vs QMV 0.08T (+73%)
         //   M=8  K=7168: BatchQMV 0.85T vs Tiny 0.65T (+30%)
         //   M=8  K=2048: BatchQMV 5.93T vs Scalar 5.95T (≈tie)
         //   M=16 K=7168: BatchQMV 1.48T vs Tiny 1.18T (+25%)
 
-        // --- M <= 16: Batched QMV (qdot pattern, M-batched) ---
+        // --- M <= qmv_limit: Batched QMV (qdot pattern, M-batched) ---
+        // Limit is device-aware via ChipTuning::batch_qmv_limit(k, n).
         // Requires K % 512 == 0 (QMV block_size). All standard MoE models satisfy this.
         // f16 input uses native f16 kernels (no cast overhead).
-        if m <= 16 && k % 512 == 0 {
+        let qmv_limit = registry.device().tuning().batch_qmv_limit(k, n);
+        if m <= qmv_limit && k % 512 == 0 {
             // x is guaranteed f16 (cast at entry). Use native f16 kernels.
             // Split-K disabled: reduce kernel overhead causes ~27% regression
             // at small N (e.g. M=1 K=7168 N=2048: 393us vs 233us non-split).
             // calc_batchqmv_k_partitions and affine_qmv_batched_splitk_f16_q4
             // are kept for future experimentation.
             if m == 1 {
-                // M=1: reshape to 1-D, dispatch fast path, reshape back to [1, N]
                 let vec_1d = x.reshape(vec![k])?;
+                // Split-K for large K with insufficient N parallelism
+                if k > 8192 && n <= 2048 {
+                    let split_k = calc_qmv_splitk_partitions(n, k);
+                    let out_1d = affine_qmv_splitk_f16_q4(registry, qw, &vec_1d, queue, split_k)?;
+                    return out_1d.reshape(vec![1, n]);
+                }
                 let out_1d = affine_qmv_fast_f16_q4(registry, qw, &vec_1d, queue)?;
                 return out_1d.reshape(vec![1, n]);
             } else {
@@ -5719,12 +6125,19 @@ pub fn affine_quantized_matmul_batched_into_cb(
         return affine_qmm_nax_q4_into_cb(registry, &x_f16, &qw_f16, cb);
     }
 
-    // --- BatchQMV / QMV fast: M <= 16, K % 512 == 0 ---
-    if m <= 16 && k % 512 == 0 {
+    // --- BatchQMV / QMV fast: M <= qmv_limit (device-aware), K % 512 == 0 ---
+    let qmv_limit = registry.device().tuning().batch_qmv_limit(k, n);
+    if m <= qmv_limit && k % 512 == 0 {
         if m == 1 {
+            let vec_1d = x.reshape(vec![k])?;
+            // Split-K for large K with insufficient N parallelism
+            if k > 8192 && n <= 2048 {
+                let split_k = calc_qmv_splitk_partitions(n, k);
+                return affine_qmv_splitk_f16_q4_into_cb(registry, qw, &vec_1d, split_k, cb)
+                    .and_then(|out| out.reshape(vec![1, n]));
+            }
             // QMV fast f16 into CB
             let pipeline = registry.get_pipeline("affine_qmv_fast_f16_q4", DType::Float16)?;
-            let vec_1d = x.reshape(vec![k])?;
             let out = Array::zeros(dev, &[qw.out_features], DType::Float16);
 
             let params: [u32; 4] = [

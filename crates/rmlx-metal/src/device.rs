@@ -206,6 +206,38 @@ impl ChipTuning {
             },
         }
     }
+
+    /// Device-aware M limit for BatchQMV dispatch.
+    ///
+    /// Returns the maximum M for which BatchQMV (qdot) is preferred over MMA.
+    /// Larger chips can sustain BatchQMV at higher M due to more GPU cores.
+    pub fn batch_qmv_limit(&self, k: usize, n: usize) -> usize {
+        let small_dims = k <= 2048 && n <= 2048;
+        match self.arch_class {
+            ArchClass::Ultra => {
+                if small_dims {
+                    32
+                } else {
+                    16
+                }
+            }
+            ArchClass::Max => {
+                if small_dims {
+                    18
+                } else {
+                    12
+                }
+            }
+            ArchClass::Base | ArchClass::Phone => {
+                if small_dims {
+                    14
+                } else {
+                    8
+                }
+            }
+            ArchClass::Unknown => 16, // safe default
+        }
+    }
 }
 
 /// GPU architecture information derived from device name.

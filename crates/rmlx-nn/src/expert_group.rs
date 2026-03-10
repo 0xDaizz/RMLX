@@ -550,8 +550,9 @@ fn encode_gemm(
         || tile.variant == ops::matmul::TileVariant::MlxArchSmall
         || tile.variant == ops::matmul::TileVariant::MlxArchMicro
     {
-        let constants =
-            ops::matmul::matmul_align_constants(m as usize, n as usize, tile.bm, tile.bn);
+        let constants = ops::matmul::matmul_align_constants(
+            m as usize, n as usize, k as usize, tile.bm, tile.bn, tile.bk,
+        );
         registry.get_pipeline_with_constants(kernel_name, dtype, &constants)?
     } else {
         registry.get_pipeline(kernel_name, dtype)?

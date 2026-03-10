@@ -3524,6 +3524,19 @@ impl CachedDecode {
     }
 }
 
+/// Execution mode for the unified forward path.
+#[derive(Default)]
+pub enum ForwardMode {
+    /// Prefill mode: batch multiple layers per command buffer.
+    Prefill {
+        /// Number of transformer layers encoded per command buffer.
+        layers_per_cb: usize,
+    },
+    /// Decode mode: multiple CBs per layer (existing forward_graph behavior).
+    #[default]
+    Decode,
+}
+
 pub struct TransformerModel {
     config: TransformerConfig,
     embedding: Option<Embedding>,
@@ -3769,14 +3782,21 @@ impl TransformerModel {
     /// Creates an ExecGraph per forward pass, running each transformer block
     /// through `forward_graph` (6 CBs per block), then a final norm + LM head.
     /// The CPU blocks only once at the very end.
+    /// Unified ExecGraph forward: token IDs -> logits.
+    ///
+    /// - `Decode`: multiple CBs per layer, 32 encoder limit.
+    /// - `Prefill { layers_per_cb }`: batches layers per CB, 64 encoder limit.
+    ///
+    /// CPU blocks only once at the end.
     #[allow(clippy::too_many_arguments)]
-    pub fn forward_graph(
+    pub fn forward_graph_unified(
         &self,
         token_ids: &[u32],
         cos_freqs: Option<&Array>,
         sin_freqs: Option<&Array>,
         mask: Option<&Array>,
-        mut cache: Option<&mut Vec<LayerKvCache>>,
+        cache: Option<&mut [LayerKvCache]>,
+        mode: ForwardMode,
         registry: &KernelRegistry,
         queue: &metal::CommandQueue,
         event: &GpuEvent,
@@ -3794,6 +3814,7 @@ impl TransformerModel {
         // Embedding lookup (sync — typically fast)
         let mut x = embedding.forward(token_ids, registry, queue)?;
 
+        // Validate cache length if provided
         if let Some(ref c) = cache {
             if c.len() != self.layers.len() {
                 return Err(KernelError::InvalidShape(format!(
@@ -3804,25 +3825,52 @@ impl TransformerModel {
             }
         }
 
-        // Create graph for the full forward pass
-        let mut graph = ExecGraph::new(queue, event, 32);
+        let encoder_limit = match mode {
+            ForwardMode::Decode => 32,
+            ForwardMode::Prefill { .. } => 64,
+        };
+        let mut graph = ExecGraph::new(queue, event, encoder_limit);
 
-        for (i, layer) in self.layers.iter().enumerate() {
-            let layer_cache = cache.as_mut().map(|c| &mut c[i]);
-            x = layer.forward_graph(
-                &x,
-                cos_freqs,
-                sin_freqs,
-                mask,
-                layer_cache,
-                registry,
-                &mut graph,
-                queue,
-            )?;
-            // Submit remaining work — GPU-side FIFO ordering on a single
-            // CommandQueue guarantees the next layer's CBs execute after
-            // this one. No explicit wait_for needed between layers.
-            let _t = graph.submit_batch();
+        match mode {
+            ForwardMode::Decode => {
+                let mut cache = cache;
+                for (i, layer) in self.layers.iter().enumerate() {
+                    let layer_cache = cache.as_mut().map(|c| &mut c[i]);
+                    x = layer.forward_graph(
+                        &x,
+                        cos_freqs,
+                        sin_freqs,
+                        mask,
+                        layer_cache,
+                        registry,
+                        &mut graph,
+                        queue,
+                    )?;
+                    let _t = graph.submit_batch();
+                }
+            }
+            ForwardMode::Prefill { layers_per_cb } => {
+                let cache = cache.ok_or_else(|| {
+                    KernelError::InvalidShape(
+                        "TransformerModel: prefill mode requires cache".into(),
+                    )
+                })?;
+                for (i, layer) in self.layers.iter().enumerate() {
+                    let cb = graph.command_buffer();
+                    x = layer.forward_prefill_single_cb(
+                        &x,
+                        cos_freqs,
+                        sin_freqs,
+                        mask,
+                        &mut cache[i],
+                        registry,
+                        cb,
+                    )?;
+                    if (i + 1) % layers_per_cb == 0 || i == self.layers.len() - 1 {
+                        graph.submit_batch();
+                    }
+                }
+            }
         }
 
         // Final norm + LM head (encode into graph)
@@ -3836,19 +3884,45 @@ impl TransformerModel {
         )?;
         x = lm_head.forward_into_cb(&x, registry, cb_final)?;
 
-        // Single CPU sync at the end
+        let sync_label = match mode {
+            ForwardMode::Decode => "TransformerModel graph sync",
+            ForwardMode::Prefill { .. } => "prefill graph sync",
+        };
         graph
             .sync()
-            .map_err(|e| KernelError::InvalidShape(format!("TransformerModel graph sync: {e}")))?;
+            .map_err(|e| KernelError::InvalidShape(format!("{sync_label}: {e}")))?;
 
         Ok(x)
     }
 
-    /// ExecGraph prefill forward: token IDs -> logits.
-    ///
-    /// Uses 1 CB per layer via `forward_prefill_single_cb`, chained
-    /// with GPU-side events through ExecGraph. CPU blocks only once
-    /// at the end.
+    /// ExecGraph decode forward. Delegates to [`forward_graph_unified`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_graph(
+        &self,
+        token_ids: &[u32],
+        cos_freqs: Option<&Array>,
+        sin_freqs: Option<&Array>,
+        mask: Option<&Array>,
+        cache: Option<&mut Vec<LayerKvCache>>,
+        registry: &KernelRegistry,
+        queue: &metal::CommandQueue,
+        event: &GpuEvent,
+    ) -> Result<Array, KernelError> {
+        let cache_slice = cache.map(|v| v.as_mut_slice());
+        self.forward_graph_unified(
+            token_ids,
+            cos_freqs,
+            sin_freqs,
+            mask,
+            cache_slice,
+            ForwardMode::Decode,
+            registry,
+            queue,
+            event,
+        )
+    }
+
+    /// ExecGraph prefill forward. Delegates to [`forward_graph_unified`].
     ///
     /// **Requires** `prepare_weights_for_graph()` to have been called.
     #[allow(clippy::too_many_arguments)]
@@ -3863,60 +3937,17 @@ impl TransformerModel {
         queue: &metal::CommandQueue,
         event: &GpuEvent,
     ) -> Result<Array, KernelError> {
-        let embedding = self.embedding.as_ref().ok_or_else(|| {
-            KernelError::InvalidShape("TransformerModel: embedding not loaded".into())
-        })?;
-        let final_norm = self.final_norm_weight.as_ref().ok_or_else(|| {
-            KernelError::InvalidShape("TransformerModel: final_norm not loaded".into())
-        })?;
-        let lm_head = self.lm_head.as_ref().ok_or_else(|| {
-            KernelError::InvalidShape("TransformerModel: lm_head not loaded".into())
-        })?;
-
-        // Embedding lookup (sync — typically fast)
-        let mut x = embedding.forward(token_ids, registry, queue)?;
-
-        // Validate cache vector length matches number of layers
-        if cache.len() != self.layers.len() {
-            return Err(KernelError::InvalidShape(format!(
-                "TransformerModel: cache has {} entries but model has {} layers",
-                cache.len(),
-                self.layers.len()
-            )));
-        }
-
-        // High encoder limit since each layer uses only 1 CB
-        let mut graph = ExecGraph::new(queue, event, 64);
-
-        for (i, layer) in self.layers.iter().enumerate() {
-            x = layer.forward_prefill_graph(
-                &x,
-                cos_freqs,
-                sin_freqs,
-                mask,
-                &mut cache[i],
-                registry,
-                &mut graph,
-            )?;
-        }
-
-        // Final norm + LM head (encode into graph)
-        let cb_final = graph.command_buffer();
-        x = ops::rms_norm::rms_norm_into_cb(
+        self.forward_graph_unified(
+            token_ids,
+            cos_freqs,
+            sin_freqs,
+            mask,
+            Some(cache),
+            ForwardMode::Prefill { layers_per_cb: 4 },
             registry,
-            &x,
-            Some(final_norm),
-            self.config.rms_norm_eps,
-            cb_final,
-        )?;
-        x = lm_head.forward_into_cb(&x, registry, cb_final)?;
-
-        // Single CPU sync at the end
-        graph
-            .sync()
-            .map_err(|e| KernelError::InvalidShape(format!("prefill graph sync: {e}")))?;
-
-        Ok(x)
+            queue,
+            event,
+        )
     }
 }
 

@@ -47,9 +47,9 @@ pub fn batched_qkv_proj(
 
     // Each projection may use a different kernel depending on M and N dims;
     // MlxArch gets alignment-specialized pipelines via function constants.
-    let q_pipeline = gemm_pipeline_for_dims(registry, input.dtype(), m, nq)?;
-    let k_pipeline = gemm_pipeline_for_dims(registry, input.dtype(), m, nk)?;
-    let v_pipeline = gemm_pipeline_for_dims(registry, input.dtype(), m, nv)?;
+    let q_pipeline = gemm_pipeline_for_dims(registry, input.dtype(), m, nq, k)?;
+    let k_pipeline = gemm_pipeline_for_dims(registry, input.dtype(), m, nk, k)?;
+    let v_pipeline = gemm_pipeline_for_dims(registry, input.dtype(), m, nv, k)?;
 
     // Single command buffer for all 3 projections
     let cb = queue.new_command_buffer();
@@ -433,9 +433,9 @@ pub fn batched_qkv_proj_into(
     let k_out = Array::uninit(dev, &[m as usize, nk as usize], input.dtype());
     let v_out = Array::uninit(dev, &[m as usize, nv as usize], input.dtype());
 
-    let q_pipeline = gemm_pipeline_for_dims(registry, input.dtype(), m, nq)?;
-    let k_pipeline = gemm_pipeline_for_dims(registry, input.dtype(), m, nk)?;
-    let v_pipeline = gemm_pipeline_for_dims(registry, input.dtype(), m, nv)?;
+    let q_pipeline = gemm_pipeline_for_dims(registry, input.dtype(), m, nq, k)?;
+    let k_pipeline = gemm_pipeline_for_dims(registry, input.dtype(), m, nk, k)?;
+    let v_pipeline = gemm_pipeline_for_dims(registry, input.dtype(), m, nv, k)?;
 
     encode_gemm(cb, &q_pipeline, &input, &wq_t, &q_out, m, nq, k, registry)?;
     encode_gemm(cb, &k_pipeline, &input, &wk_t, &k_out, m, nk, k, registry)?;
@@ -500,8 +500,8 @@ pub fn batched_gate_up_into_cb(
     let gate_out = Array::uninit(dev, &[m as usize, n_gate as usize], input.dtype());
     let up_out = Array::uninit(dev, &[m as usize, n_up as usize], input.dtype());
 
-    let gate_pipeline = gemm_pipeline_for_dims(registry, input.dtype(), m, n_gate)?;
-    let up_pipeline = gemm_pipeline_for_dims(registry, input.dtype(), m, n_up)?;
+    let gate_pipeline = gemm_pipeline_for_dims(registry, input.dtype(), m, n_gate, k)?;
+    let up_pipeline = gemm_pipeline_for_dims(registry, input.dtype(), m, n_up, k)?;
 
     encode_gemm(
         cb,
@@ -569,6 +569,7 @@ fn gemm_pipeline_for_dims(
     dtype: DType,
     m: u32,
     n: u32,
+    k: u32,
 ) -> Result<metal::ComputePipelineState, KernelError> {
     let kernel_name = gemm_kernel_name_for_dims(dtype, m, n)?;
     let tile = super::matmul::select_tile_config_with_dtype(m as usize, n as usize, 0, dtype);
@@ -576,8 +577,9 @@ fn gemm_pipeline_for_dims(
         || tile.variant == super::matmul::TileVariant::MlxArchSmall
         || tile.variant == super::matmul::TileVariant::MlxArchMicro
     {
-        let constants =
-            super::matmul::matmul_align_constants(m as usize, n as usize, tile.bm, tile.bn);
+        let constants = super::matmul::matmul_align_constants(
+            m as usize, n as usize, k as usize, tile.bm, tile.bn, tile.bk,
+        );
         registry.get_pipeline_with_constants(kernel_name, dtype, &constants)
     } else {
         registry.get_pipeline(kernel_name, dtype)
