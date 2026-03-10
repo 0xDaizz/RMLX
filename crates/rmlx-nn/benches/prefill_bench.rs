@@ -322,9 +322,6 @@ fn main() {
     ops::register_all(&registry).expect("kernel registration failed");
     let device = registry.device().raw();
 
-    // We need a temporary queue for prepare_weights_for_graph only.
-    let setup_queue = device.new_command_queue();
-
     println!(
         "Config: hidden={}, heads={}/{}, head_dim={}, intermediate={}",
         HIDDEN_SIZE, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, INTERMEDIATE_DIM
@@ -348,13 +345,19 @@ fn main() {
         .prepare_weights_9dispatch(device)
         .expect("prepare_weights_9dispatch failed (graph)");
 
-    // Pre-transpose weights for both paths
-    block_cb
-        .prepare_weights_for_graph(&registry, &setup_queue)
-        .expect("prepare_weights_for_graph failed (single_cb)");
-    block_graph
-        .prepare_weights_for_graph(&registry, &setup_queue)
-        .expect("prepare_weights_for_graph failed (graph)");
+    // Pre-transpose weights for both paths.
+    // Scoped so the temporary queue is dropped (and fully drained) before benchmarks start.
+    {
+        let setup_queue = device.new_command_queue();
+        block_cb
+            .prepare_weights_for_graph(&registry, &setup_queue)
+            .expect("prepare_weights_for_graph failed (single_cb)");
+        block_graph
+            .prepare_weights_for_graph(&registry, &setup_queue)
+            .expect("prepare_weights_for_graph failed (graph)");
+    }
+    // Let Metal driver fully drain GPU resources from weight preparation
+    std::thread::sleep(std::time::Duration::from_millis(50));
 
     // Precompute RoPE cos/sin tables: shape [MAX_SEQ_LEN, HEAD_DIM/2]
     let (cos_vec, sin_vec) = ops::rope::precompute_freqs(MAX_SEQ_LEN, HEAD_DIM, ROPE_THETA, 1.0)
@@ -392,27 +395,31 @@ fn main() {
                     DType::Float16,
                 );
 
-                // Warmup
+                // Warmup — single autorelease pool wraps the entire loop to prevent
+                // premature release of Metal objects (command buffers, encoders) that
+                // can leave the queue in an error state.
                 let mut last_output = None;
-                for _ in 0..WARMUP_ITERS {
+                {
                     let _pool = ScopedPool::new();
-                    cache_cb.seq_len = 0;
-                    let cb = queue_cb.new_command_buffer();
-                    let out = block_cb
-                        .forward_prefill_single_cb(
-                            &input,
-                            Some(&cos_freqs),
-                            Some(&sin_freqs),
-                            Some(&mask),
-                            &mut cache_cb,
-                            &registry,
-                            cb,
-                        )
-                        .expect("single_cb warmup failed");
-                    cb.commit();
-                    cb.wait_until_completed();
-                    assert_cb_ok(cb, "single_cb warmup");
-                    last_output = Some(out);
+                    for _ in 0..WARMUP_ITERS {
+                        cache_cb.seq_len = 0;
+                        let cb = queue_cb.new_command_buffer();
+                        let out = block_cb
+                            .forward_prefill_single_cb(
+                                &input,
+                                Some(&cos_freqs),
+                                Some(&sin_freqs),
+                                Some(&mask),
+                                &mut cache_cb,
+                                &registry,
+                                cb,
+                            )
+                            .expect("single_cb warmup failed");
+                        cb.commit();
+                        cb.wait_until_completed();
+                        assert_cb_ok(cb, "single_cb warmup");
+                        last_output = Some(out);
+                    }
                 }
 
                 // Validate output after warmup
@@ -430,26 +437,28 @@ fn main() {
 
                 // Benchmark
                 let mut latencies = Vec::with_capacity(BENCH_ITERS);
-                for _ in 0..BENCH_ITERS {
+                {
                     let _pool = ScopedPool::new();
-                    cache_cb.seq_len = 0;
-                    let cb = queue_cb.new_command_buffer();
-                    let start = Instant::now();
-                    let _ = block_cb
-                        .forward_prefill_single_cb(
-                            &input,
-                            Some(&cos_freqs),
-                            Some(&sin_freqs),
-                            Some(&mask),
-                            &mut cache_cb,
-                            &registry,
-                            cb,
-                        )
-                        .expect("forward_prefill_single_cb failed");
-                    cb.commit();
-                    cb.wait_until_completed();
-                    assert_cb_ok(cb, "single_cb bench");
-                    latencies.push(start.elapsed());
+                    for _ in 0..BENCH_ITERS {
+                        cache_cb.seq_len = 0;
+                        let cb = queue_cb.new_command_buffer();
+                        let start = Instant::now();
+                        let _ = block_cb
+                            .forward_prefill_single_cb(
+                                &input,
+                                Some(&cos_freqs),
+                                Some(&sin_freqs),
+                                Some(&mask),
+                                &mut cache_cb,
+                                &registry,
+                                cb,
+                            )
+                            .expect("forward_prefill_single_cb failed");
+                        cb.commit();
+                        cb.wait_until_completed();
+                        assert_cb_ok(cb, "single_cb bench");
+                        latencies.push(start.elapsed());
+                    }
                 }
 
                 Stats::from_durations(&latencies)
@@ -476,28 +485,30 @@ fn main() {
                     DType::Float16,
                 );
 
-                // Warmup
+                // Warmup — single autorelease pool wraps the entire loop
                 let mut last_output = None;
-                for _ in 0..WARMUP_ITERS {
+                {
                     let _pool = ScopedPool::new();
-                    cache_graph.seq_len = 0;
-                    let event = GpuEvent::new(device);
-                    let mut graph = ExecGraph::new(&queue_graph, &event, 64);
-                    let cb = graph.command_buffer();
-                    let out = block_graph
-                        .forward_prefill_single_cb(
-                            &input,
-                            Some(&cos_freqs),
-                            Some(&sin_freqs),
-                            Some(&mask),
-                            &mut cache_graph,
-                            &registry,
-                            cb,
-                        )
-                        .expect("graph warmup failed");
-                    let _t = graph.submit_batch();
-                    graph.sync().expect("graph warmup sync failed");
-                    last_output = Some(out);
+                    for _ in 0..WARMUP_ITERS {
+                        cache_graph.seq_len = 0;
+                        let event = GpuEvent::new(device);
+                        let mut graph = ExecGraph::new(&queue_graph, &event, 64);
+                        let cb = graph.command_buffer();
+                        let out = block_graph
+                            .forward_prefill_single_cb(
+                                &input,
+                                Some(&cos_freqs),
+                                Some(&sin_freqs),
+                                Some(&mask),
+                                &mut cache_graph,
+                                &registry,
+                                cb,
+                            )
+                            .expect("graph warmup failed");
+                        let _t = graph.submit_batch();
+                        graph.sync().expect("graph warmup sync failed");
+                        last_output = Some(out);
+                    }
                 }
 
                 // Validate output after warmup
@@ -515,27 +526,29 @@ fn main() {
 
                 // Benchmark
                 let mut latencies = Vec::with_capacity(BENCH_ITERS);
-                for _ in 0..BENCH_ITERS {
+                {
                     let _pool = ScopedPool::new();
-                    cache_graph.seq_len = 0;
-                    let event = GpuEvent::new(device);
-                    let mut graph = ExecGraph::new(&queue_graph, &event, 64);
-                    let start = Instant::now();
-                    let cb = graph.command_buffer();
-                    let _ = block_graph
-                        .forward_prefill_single_cb(
-                            &input,
-                            Some(&cos_freqs),
-                            Some(&sin_freqs),
-                            Some(&mask),
-                            &mut cache_graph,
-                            &registry,
-                            cb,
-                        )
-                        .expect("forward_prefill_graph failed");
-                    let _t = graph.submit_batch();
-                    graph.sync().expect("graph sync failed");
-                    latencies.push(start.elapsed());
+                    for _ in 0..BENCH_ITERS {
+                        cache_graph.seq_len = 0;
+                        let event = GpuEvent::new(device);
+                        let mut graph = ExecGraph::new(&queue_graph, &event, 64);
+                        let start = Instant::now();
+                        let cb = graph.command_buffer();
+                        let _ = block_graph
+                            .forward_prefill_single_cb(
+                                &input,
+                                Some(&cos_freqs),
+                                Some(&sin_freqs),
+                                Some(&mask),
+                                &mut cache_graph,
+                                &registry,
+                                cb,
+                            )
+                            .expect("forward_prefill_graph failed");
+                        let _t = graph.submit_batch();
+                        graph.sync().expect("graph sync failed");
+                        latencies.push(start.elapsed());
+                    }
                 }
 
                 Stats::from_durations(&latencies)

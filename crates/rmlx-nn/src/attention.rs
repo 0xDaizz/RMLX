@@ -3361,11 +3361,36 @@ impl Attention {
         // K/V slabs: from cache slab (or direct RoPE output on initial prefill)
         let scale = 1.0 / (head_dim as f32).sqrt();
 
-        // Use MMA kernel when conditions are met: f16, D=128, seq_len>1
-        let use_mma = q_batched.dtype() == DType::Float16 && head_dim == 128 && seq_len > 1;
+        // 3-way SDPA dispatch for prefill (f16, D=128, seq_len>1):
+        //   1. NAX  — highest throughput, requires supports_nax && no explicit mask
+        //   2. MMA BK=16 — default MMA path, accepts mask
+        //   3. GQA slab  — scalar fallback for non-f16 or non-D128
+        let is_f16_d128 = q_batched.dtype() == DType::Float16 && head_dim == 128 && seq_len > 1;
 
-        let attn_slab = if use_mma {
-            // BK=16 MMA variant: optimal for BD=128 (BK=32 offers no gain due to register pressure)
+        // NAX: best throughput. Only when no explicit mask (NAX uses is_causal flag only).
+        let use_nax = is_f16_d128 && mask.is_none() && registry.device().tuning().supports_nax;
+
+        // Track output layout: MMA writes seq-major, NAX and scalar write head-major.
+        let seq_major_output = is_f16_d128 && !use_nax;
+
+        let attn_slab = if use_nax {
+            ops::sdpa::sdpa_prefill_nax_f16_into_cb(
+                registry,
+                &q_batched,
+                &k_for_sdpa,
+                &v_for_sdpa,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                seq_len,
+                total_seq,
+                kv_stride,
+                scale,
+                true, // is_causal — always true when no explicit mask
+                cb,
+            )?
+        } else if is_f16_d128 {
+            // MMA BK=16 (default MMA path, supports explicit mask)
             ops::sdpa::sdpa_prefill_mma_f16_into_cb(
                 registry,
                 &q_batched,
@@ -3396,7 +3421,7 @@ impl Attention {
                 kv_stride,
                 mask,
                 scale,
-                mask.is_none(), // use kernel causal masking only when no explicit mask provided
+                mask.is_none(),
                 cb,
             )?
         };
@@ -3407,8 +3432,8 @@ impl Attention {
         }
 
         // MMA kernel writes seq-major [seq_len, num_heads * head_dim] directly.
-        // Scalar kernel still writes head-major [num_heads, seq_len, head_dim].
-        let concat = if use_mma {
+        // NAX and scalar kernels write head-major [num_heads, seq_len, head_dim].
+        let concat = if seq_major_output {
             // Already seq-major: just reshape to [seq_len, hidden_size]
             attn_slab.view(
                 vec![seq_len, hidden_size],

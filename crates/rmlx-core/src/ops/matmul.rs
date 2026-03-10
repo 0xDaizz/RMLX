@@ -2088,10 +2088,16 @@ using namespace metal;
 constant constexpr uint MLX_BM = 64;
 constant constexpr uint MLX_BN = 64;
 constant constexpr uint MLX_BK = 16;
-constant constexpr uint MLX_N_SG = 2;
-constant constexpr uint MLX_N_THREADS = 64;
-constant constexpr uint MLX_TM = 8;   // BM / 8 = 64/8
-constant constexpr uint MLX_TN = 4;   // (BN/2) / 8 = 32/8
+constant constexpr uint MLX_N_SG = 4;
+constant constexpr uint MLX_N_THREADS = 128;
+
+// SG grid: 2x2
+constant constexpr uint WM = 2;  // SGs along M dimension
+constant constexpr uint WN = 2;  // SGs along N dimension
+
+// Per-SG output tiles
+constant constexpr uint MLX_TM = 4;   // BM / (WM * 8) = 64/(2*8)
+constant constexpr uint MLX_TN = 4;   // BN / (WN * 8) = 64/(2*8)
 
 // Function constants for alignment specialization (set at pipeline creation).
 // When M % BM == 0, align_M is true → row bounds checks are elided.
@@ -2101,6 +2107,7 @@ constant bool align_N [[function_constant(201)]];
 constant bool has_residual [[function_constant(202)]];
 constant bool has_norm [[function_constant(203)]];
 constant bool has_swiglu [[function_constant(204)]];
+constant bool align_K [[function_constant(205)]];
 
 // Stable sigmoid for half precision: avoids overflow by using exp(-|x|).
 inline half stable_silu_h(half x) {
@@ -2154,8 +2161,11 @@ kernel void gemm_mlx_f16(
     uint  sgid           [[simdgroup_index_in_threadgroup]],
     uint  lane_id        [[thread_index_in_simdgroup]])
 {
-    threadgroup half As[MLX_BM * MLX_BK];  // 64x16 = 1024 halves = 2KB
-    threadgroup half Bs[MLX_BK * MLX_BN];  // 16x64 = 1024 halves = 2KB
+    // Padding to avoid TG memory bank conflicts
+    constexpr uint LDA = MLX_BK + 8;   // 16 + 8 = 24
+    constexpr uint LDB = MLX_BN + 8;   // 64 + 8 = 72
+    threadgroup half As[MLX_BM * LDA];   // 64 * 24 = 1536 halves = 3KB
+    threadgroup half Bs[MLX_BK * LDB];   // 16 * 72 = 1152 halves ~ 2.3KB
     // TG-cached norm_weight for the current K tile (avoids 64x redundant device reads)
     threadgroup half norm_w_cache[MLX_BK]; // 16 halves = 32 bytes
 
@@ -2170,9 +2180,11 @@ kernel void gemm_mlx_f16(
     device const half* R_batch = has_residual ? (residual + batch_idx * mlx_as_uniform(batch_stride_c)) : nullptr;
     device const half* G_batch = has_swiglu ? (gate_result + batch_idx * mlx_as_uniform(batch_stride_c)) : nullptr;
 
-    // SG grid: 1x2 -- sg_row always 0, sg_col = sgid (0 or 1)
-    const uint base_m = 0;        // WM=1, single row of SG
-    const uint base_n = sgid * 32; // each SG covers 32 cols
+    // SG grid: 2x2
+    const uint sg_row = sgid / WN;   // 0 or 1
+    const uint sg_col = sgid % WN;   // 0 or 1
+    const uint base_m = sg_row * (MLX_TM * 8);  // 0 or 32
+    const uint base_n = sg_col * (MLX_TN * 8);  // 0 or 32
 
     simdgroup_float8x8 acc[MLX_TM][MLX_TN];
     #pragma clang loop unroll(full)
@@ -2190,7 +2202,7 @@ kernel void gemm_mlx_f16(
     for (uint tile = 0; tile < n_tiles; tile++) {
         uint kb = tile * MLX_BK;
 
-        // Load A tile: 64 threads x 16 elements = 64x16 = BM x BK
+        // Load A tile: 128 threads x 8 elements = 64x16 = BM x BK
         // When has_norm is true, apply on-the-fly RMSNorm:
         //   As[row][col] = A[row][col] * inv_rms[row] * norm_weight[col]
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -2198,7 +2210,7 @@ kernel void gemm_mlx_f16(
         // Pre-load norm_weight[kb..kb+16] into TG cache (1 thread loads all 16)
         if (has_norm && tid_in_group == 0) {
             for (uint d = 0; d < MLX_BK; d++) {
-                norm_w_cache[d] = (kb + d < uK) ? norm_weight[kb + d] : half(0);
+                norm_w_cache[d] = (align_K || kb + d < uK) ? norm_weight[kb + d] : half(0);
             }
         }
         if (has_norm) {
@@ -2206,72 +2218,55 @@ kernel void gemm_mlx_f16(
         }
 
         {
-            uint a_row = tid_in_group;  // 0..63
+            uint a_row = tid_in_group / 2;       // 0..63
+            uint a_col_base = (tid_in_group % 2) * 8;  // 0 or 8
             uint gr = row_start + a_row;
-            if ((align_M || gr < uM) && kb + 15 < uK) {
+            if ((align_M || gr < uM) && (align_K || kb + a_col_base + 7 < uK)) {
                 if (has_norm) {
-                    // Read inv_rms once into register
                     half row_scale = half(inv_rms[gr]);
-                    // Vectorized half4 load + scale from TG-cached norm_weight
-                    half4 w0 = *reinterpret_cast<threadgroup const half4*>(&norm_w_cache[0]);
-                    half4 w1 = *reinterpret_cast<threadgroup const half4*>(&norm_w_cache[4]);
-                    half4 w2 = *reinterpret_cast<threadgroup const half4*>(&norm_w_cache[8]);
-                    half4 w3 = *reinterpret_cast<threadgroup const half4*>(&norm_w_cache[12]);
-                    half4 a0 = *reinterpret_cast<device const half4*>(&A_batch[gr * uK + kb]);
-                    half4 a1 = *reinterpret_cast<device const half4*>(&A_batch[gr * uK + kb + 4]);
-                    half4 a2 = *reinterpret_cast<device const half4*>(&A_batch[gr * uK + kb + 8]);
-                    half4 a3 = *reinterpret_cast<device const half4*>(&A_batch[gr * uK + kb + 12]);
-                    *reinterpret_cast<threadgroup half4*>(&As[a_row * 16])     = a0 * w0 * row_scale;
-                    *reinterpret_cast<threadgroup half4*>(&As[a_row * 16 + 4]) = a1 * w1 * row_scale;
-                    *reinterpret_cast<threadgroup half4*>(&As[a_row * 16 + 8]) = a2 * w2 * row_scale;
-                    *reinterpret_cast<threadgroup half4*>(&As[a_row * 16 + 12]) = a3 * w3 * row_scale;
+                    half4 w0 = *reinterpret_cast<threadgroup const half4*>(&norm_w_cache[a_col_base]);
+                    half4 w1 = *reinterpret_cast<threadgroup const half4*>(&norm_w_cache[a_col_base + 4]);
+                    half4 a0 = *reinterpret_cast<device const half4*>(&A_batch[gr * uK + kb + a_col_base]);
+                    half4 a1 = *reinterpret_cast<device const half4*>(&A_batch[gr * uK + kb + a_col_base + 4]);
+                    *reinterpret_cast<threadgroup half4*>(&As[a_row * LDA + a_col_base])     = a0 * w0 * row_scale;
+                    *reinterpret_cast<threadgroup half4*>(&As[a_row * LDA + a_col_base + 4]) = a1 * w1 * row_scale;
                 } else {
-                    *reinterpret_cast<threadgroup half4*>(&As[a_row * 16]) =
-                        *reinterpret_cast<device const half4*>(&A_batch[gr * uK + kb]);
-                    *reinterpret_cast<threadgroup half4*>(&As[a_row * 16 + 4]) =
-                        *reinterpret_cast<device const half4*>(&A_batch[gr * uK + kb + 4]);
-                    *reinterpret_cast<threadgroup half4*>(&As[a_row * 16 + 8]) =
-                        *reinterpret_cast<device const half4*>(&A_batch[gr * uK + kb + 8]);
-                    *reinterpret_cast<threadgroup half4*>(&As[a_row * 16 + 12]) =
-                        *reinterpret_cast<device const half4*>(&A_batch[gr * uK + kb + 12]);
+                    *reinterpret_cast<threadgroup half4*>(&As[a_row * LDA + a_col_base]) =
+                        *reinterpret_cast<device const half4*>(&A_batch[gr * uK + kb + a_col_base]);
+                    *reinterpret_cast<threadgroup half4*>(&As[a_row * LDA + a_col_base + 4]) =
+                        *reinterpret_cast<device const half4*>(&A_batch[gr * uK + kb + a_col_base + 4]);
                 }
             } else {
                 if (has_norm) {
                     half row_scale = (align_M || gr < uM) ? half(inv_rms[gr]) : half(0);
-                    for (uint d = 0; d < 16; d++) {
-                        As[a_row * 16 + d] = ((align_M || gr < uM) && kb + d < uK)
-                            ? A_batch[gr * uK + kb + d] * row_scale * norm_w_cache[d]
+                    for (uint d = 0; d < 8; d++) {
+                        As[a_row * LDA + a_col_base + d] = ((align_M || gr < uM) && (align_K || kb + a_col_base + d < uK))
+                            ? A_batch[gr * uK + kb + a_col_base + d] * row_scale * norm_w_cache[a_col_base + d]
                             : half(0);
                     }
                 } else {
-                    for (uint d = 0; d < 16; d++) {
-                        As[a_row * 16 + d] = ((align_M || gr < uM) && kb + d < uK)
-                            ? A_batch[gr * uK + kb + d] : half(0);
+                    for (uint d = 0; d < 8; d++) {
+                        As[a_row * LDA + a_col_base + d] = ((align_M || gr < uM) && (align_K || kb + a_col_base + d < uK))
+                            ? A_batch[gr * uK + kb + a_col_base + d] : half(0);
                     }
                 }
             }
         }
 
-        // Load B tile: 64 threads x 16 elements = 16x64 = BK x BN
+        // Load B tile: 128 threads x 8 elements = 16x64 = BK x BN
         {
-            uint bi = tid_in_group >> 2;         // 0..15 (row in B tile)
-            uint bj = (tid_in_group & 3u) << 4;  // 0, 16, 32, 48
+            uint bi = tid_in_group / 8;          // 0..15 (row in B tile)
+            uint bj = (tid_in_group & 7u) << 3;  // 0,8,16,24,32,40,48,56
             uint gr = kb + bi;
             uint gc = col_start + bj;
-            // When align_N is true, gc + 15 < uN is guaranteed (N % BN == 0
-            // and we have exactly N/BN threadgroups in X), so skip the col check.
-            if (gr < uK && (align_N || gc + 15 < uN)) {
-                *reinterpret_cast<threadgroup half4*>(&Bs[bi * 64 + bj]) =
+            if ((align_K || gr < uK) && (align_N || gc + 7 < uN)) {
+                *reinterpret_cast<threadgroup half4*>(&Bs[bi * LDB + bj]) =
                     *reinterpret_cast<device const half4*>(&B_batch[gr * uN + gc]);
-                *reinterpret_cast<threadgroup half4*>(&Bs[bi * 64 + bj + 4]) =
+                *reinterpret_cast<threadgroup half4*>(&Bs[bi * LDB + bj + 4]) =
                     *reinterpret_cast<device const half4*>(&B_batch[gr * uN + gc + 4]);
-                *reinterpret_cast<threadgroup half4*>(&Bs[bi * 64 + bj + 8]) =
-                    *reinterpret_cast<device const half4*>(&B_batch[gr * uN + gc + 8]);
-                *reinterpret_cast<threadgroup half4*>(&Bs[bi * 64 + bj + 12]) =
-                    *reinterpret_cast<device const half4*>(&B_batch[gr * uN + gc + 12]);
             } else {
-                for (uint d = 0; d < 16; d++) {
-                    Bs[bi * 64 + bj + d] = (gr < uK && (align_N || gc + d < uN))
+                for (uint d = 0; d < 8; d++) {
+                    Bs[bi * LDB + bj + d] = ((align_K || gr < uK) && (align_N || gc + d < uN))
                         ? B_batch[gr * uN + gc + d] : half(0);
                 }
             }
@@ -2279,7 +2274,7 @@ kernel void gemm_mlx_f16(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // MMA compute (serpentine)
+        // MMA compute (serpentine) with simdgroup_barrier
         #pragma clang loop unroll(full)
         for (uint kk = 0; kk < 2; kk++) {
             simdgroup_half8x8 a_frag[MLX_TM];
@@ -2288,20 +2283,24 @@ kernel void gemm_mlx_f16(
             #pragma clang loop unroll(full)
             for (uint i = 0; i < MLX_TM; i++) {
                 simdgroup_load(a_frag[i],
-                    &As[(base_m + i * 8) * 16 + kk * 8], 16);
+                    &As[(base_m + i * 8) * LDA + kk * 8], LDA);
             }
+
+            simdgroup_barrier(mem_flags::mem_none);
 
             #pragma clang loop unroll(full)
             for (uint j = 0; j < MLX_TN; j++) {
                 simdgroup_load(b_frag[j],
-                    &Bs[kk * 8 * 64 + (base_n + j * 8)], 64);
+                    &Bs[kk * 8 * LDB + (base_n + j * 8)], LDB);
             }
+
+            simdgroup_barrier(mem_flags::mem_none);
 
             #pragma clang loop unroll(full)
             for (uint i = 0; i < MLX_TM; i++) {
                 #pragma clang loop unroll(full)
                 for (uint j = 0; j < MLX_TN; j++) {
-                    uint n_serp = (i % 2) ? (3 - j) : j;
+                    uint n_serp = (i % 2) ? (MLX_TN - 1 - j) : j;
                     simdgroup_multiply_accumulate(
                         acc[i][n_serp], a_frag[i], b_frag[n_serp], acc[i][n_serp]);
                 }
@@ -2378,8 +2377,11 @@ kernel void gemm_mlx_f32(
     uint  sgid           [[simdgroup_index_in_threadgroup]],
     uint  lane_id        [[thread_index_in_simdgroup]])
 {
-    threadgroup float As[MLX_BM * MLX_BK];  // 64x16 = 1024 floats = 4KB
-    threadgroup float Bs[MLX_BK * MLX_BN];  // 16x64 = 1024 floats = 4KB
+    // Padding to avoid TG memory bank conflicts
+    constexpr uint LDA_F = MLX_BK + 4;   // 16 + 4 = 20
+    constexpr uint LDB_F = MLX_BN + 4;   // 64 + 4 = 68
+    threadgroup float As[MLX_BM * LDA_F];  // 64 * 20 = 1280 floats = 5KB
+    threadgroup float Bs[MLX_BK * LDB_F];  // 16 * 68 = 1088 floats ~ 4.3KB
     // TG-cached norm_weight for the current K tile (avoids 64x redundant device reads)
     threadgroup float norm_w_cache_f32[MLX_BK]; // 16 floats = 64 bytes
 
@@ -2394,9 +2396,11 @@ kernel void gemm_mlx_f32(
     device const float* R_batch = has_residual ? (residual + batch_idx * mlx_as_uniform(batch_stride_c)) : nullptr;
     device const float* G_batch = has_swiglu ? (gate_result + batch_idx * mlx_as_uniform(batch_stride_c)) : nullptr;
 
-    // SG grid: 1x2 -- sg_row always 0, sg_col = sgid (0 or 1)
-    const uint base_m = 0;        // WM=1, single row of SG
-    const uint base_n = sgid * 32; // each SG covers 32 cols
+    // SG grid: 2x2
+    const uint sg_row = sgid / WN;   // 0 or 1
+    const uint sg_col = sgid % WN;   // 0 or 1
+    const uint base_m = sg_row * (MLX_TM * 8);  // 0 or 32
+    const uint base_n = sg_col * (MLX_TN * 8);  // 0 or 32
 
     simdgroup_float8x8 acc[MLX_TM][MLX_TN];
     #pragma clang loop unroll(full)
@@ -2414,13 +2418,13 @@ kernel void gemm_mlx_f32(
     for (uint tile = 0; tile < n_tiles; tile++) {
         uint kb = tile * MLX_BK;
 
-        // Load A tile: 64 threads x 16 elements = 64x16 = BM x BK
+        // Load A tile: 128 threads x 8 elements = 64x16 = BM x BK
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // Pre-load norm_weight[kb..kb+16] into TG cache (1 thread loads all 16)
         if (has_norm && tid_in_group == 0) {
             for (uint d = 0; d < MLX_BK; d++) {
-                norm_w_cache_f32[d] = (kb + d < uK) ? norm_weight[kb + d] : 0.0f;
+                norm_w_cache_f32[d] = (align_K || kb + d < uK) ? norm_weight[kb + d] : 0.0f;
             }
         }
         if (has_norm) {
@@ -2428,70 +2432,55 @@ kernel void gemm_mlx_f32(
         }
 
         {
-            uint a_row = tid_in_group;  // 0..63
+            uint a_row = tid_in_group / 2;       // 0..63
+            uint a_col_base = (tid_in_group % 2) * 8;  // 0 or 8
             uint gr = row_start + a_row;
-            if ((align_M || gr < uM) && kb + 15 < uK) {
+            if ((align_M || gr < uM) && (align_K || kb + a_col_base + 7 < uK)) {
                 if (has_norm) {
-                    // Read inv_rms once into register
                     float row_scale = inv_rms[gr];
-                    // Vectorized float4 load + scale from TG-cached norm_weight
-                    float4 w0 = *reinterpret_cast<threadgroup const float4*>(&norm_w_cache_f32[0]);
-                    float4 w1 = *reinterpret_cast<threadgroup const float4*>(&norm_w_cache_f32[4]);
-                    float4 w2 = *reinterpret_cast<threadgroup const float4*>(&norm_w_cache_f32[8]);
-                    float4 w3 = *reinterpret_cast<threadgroup const float4*>(&norm_w_cache_f32[12]);
-                    float4 a0 = *reinterpret_cast<device const float4*>(&A_batch[gr * uK + kb]);
-                    float4 a1 = *reinterpret_cast<device const float4*>(&A_batch[gr * uK + kb + 4]);
-                    float4 a2 = *reinterpret_cast<device const float4*>(&A_batch[gr * uK + kb + 8]);
-                    float4 a3 = *reinterpret_cast<device const float4*>(&A_batch[gr * uK + kb + 12]);
-                    *reinterpret_cast<threadgroup float4*>(&As[a_row * 16])     = a0 * w0 * row_scale;
-                    *reinterpret_cast<threadgroup float4*>(&As[a_row * 16 + 4]) = a1 * w1 * row_scale;
-                    *reinterpret_cast<threadgroup float4*>(&As[a_row * 16 + 8]) = a2 * w2 * row_scale;
-                    *reinterpret_cast<threadgroup float4*>(&As[a_row * 16 + 12]) = a3 * w3 * row_scale;
+                    float4 w0 = *reinterpret_cast<threadgroup const float4*>(&norm_w_cache_f32[a_col_base]);
+                    float4 w1 = *reinterpret_cast<threadgroup const float4*>(&norm_w_cache_f32[a_col_base + 4]);
+                    float4 a0 = *reinterpret_cast<device const float4*>(&A_batch[gr * uK + kb + a_col_base]);
+                    float4 a1 = *reinterpret_cast<device const float4*>(&A_batch[gr * uK + kb + a_col_base + 4]);
+                    *reinterpret_cast<threadgroup float4*>(&As[a_row * LDA_F + a_col_base])     = a0 * w0 * row_scale;
+                    *reinterpret_cast<threadgroup float4*>(&As[a_row * LDA_F + a_col_base + 4]) = a1 * w1 * row_scale;
                 } else {
-                    *reinterpret_cast<threadgroup float4*>(&As[a_row * 16]) =
-                        *reinterpret_cast<device const float4*>(&A_batch[gr * uK + kb]);
-                    *reinterpret_cast<threadgroup float4*>(&As[a_row * 16 + 4]) =
-                        *reinterpret_cast<device const float4*>(&A_batch[gr * uK + kb + 4]);
-                    *reinterpret_cast<threadgroup float4*>(&As[a_row * 16 + 8]) =
-                        *reinterpret_cast<device const float4*>(&A_batch[gr * uK + kb + 8]);
-                    *reinterpret_cast<threadgroup float4*>(&As[a_row * 16 + 12]) =
-                        *reinterpret_cast<device const float4*>(&A_batch[gr * uK + kb + 12]);
+                    *reinterpret_cast<threadgroup float4*>(&As[a_row * LDA_F + a_col_base]) =
+                        *reinterpret_cast<device const float4*>(&A_batch[gr * uK + kb + a_col_base]);
+                    *reinterpret_cast<threadgroup float4*>(&As[a_row * LDA_F + a_col_base + 4]) =
+                        *reinterpret_cast<device const float4*>(&A_batch[gr * uK + kb + a_col_base + 4]);
                 }
             } else {
                 if (has_norm) {
                     float row_scale = (align_M || gr < uM) ? inv_rms[gr] : 0.0f;
-                    for (uint d = 0; d < 16; d++) {
-                        As[a_row * 16 + d] = ((align_M || gr < uM) && kb + d < uK)
-                            ? A_batch[gr * uK + kb + d] * row_scale * norm_w_cache_f32[d]
+                    for (uint d = 0; d < 8; d++) {
+                        As[a_row * LDA_F + a_col_base + d] = ((align_M || gr < uM) && (align_K || kb + a_col_base + d < uK))
+                            ? A_batch[gr * uK + kb + a_col_base + d] * row_scale * norm_w_cache_f32[a_col_base + d]
                             : float(0);
                     }
                 } else {
-                    for (uint d = 0; d < 16; d++) {
-                        As[a_row * 16 + d] = ((align_M || gr < uM) && kb + d < uK)
-                            ? A_batch[gr * uK + kb + d] : float(0);
+                    for (uint d = 0; d < 8; d++) {
+                        As[a_row * LDA_F + a_col_base + d] = ((align_M || gr < uM) && (align_K || kb + a_col_base + d < uK))
+                            ? A_batch[gr * uK + kb + a_col_base + d] : float(0);
                     }
                 }
             }
         }
 
-        // Load B tile: 64 threads x 16 elements = 16x64 = BK x BN
+        // Load B tile: 128 threads x 8 elements = 16x64 = BK x BN
         {
-            uint bi = tid_in_group >> 2;         // 0..15 (row in B tile)
-            uint bj = (tid_in_group & 3u) << 4;  // 0, 16, 32, 48
+            uint bi = tid_in_group / 8;          // 0..15
+            uint bj = (tid_in_group & 7u) << 3;  // 0,8,...,56
             uint gr = kb + bi;
             uint gc = col_start + bj;
-            if (gr < uK && (align_N || gc + 15 < uN)) {
-                *reinterpret_cast<threadgroup float4*>(&Bs[bi * 64 + bj]) =
+            if ((align_K || gr < uK) && (align_N || gc + 7 < uN)) {
+                *reinterpret_cast<threadgroup float4*>(&Bs[bi * LDB_F + bj]) =
                     *reinterpret_cast<device const float4*>(&B_batch[gr * uN + gc]);
-                *reinterpret_cast<threadgroup float4*>(&Bs[bi * 64 + bj + 4]) =
+                *reinterpret_cast<threadgroup float4*>(&Bs[bi * LDB_F + bj + 4]) =
                     *reinterpret_cast<device const float4*>(&B_batch[gr * uN + gc + 4]);
-                *reinterpret_cast<threadgroup float4*>(&Bs[bi * 64 + bj + 8]) =
-                    *reinterpret_cast<device const float4*>(&B_batch[gr * uN + gc + 8]);
-                *reinterpret_cast<threadgroup float4*>(&Bs[bi * 64 + bj + 12]) =
-                    *reinterpret_cast<device const float4*>(&B_batch[gr * uN + gc + 12]);
             } else {
-                for (uint d = 0; d < 16; d++) {
-                    Bs[bi * 64 + bj + d] = (gr < uK && (align_N || gc + d < uN))
+                for (uint d = 0; d < 8; d++) {
+                    Bs[bi * LDB_F + bj + d] = ((align_K || gr < uK) && (align_N || gc + d < uN))
                         ? B_batch[gr * uN + gc + d] : float(0);
                 }
             }
@@ -2499,7 +2488,7 @@ kernel void gemm_mlx_f32(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // MMA compute (serpentine)
+        // MMA compute (serpentine) with simdgroup_barrier
         #pragma clang loop unroll(full)
         for (uint kk = 0; kk < 2; kk++) {
             simdgroup_float8x8 a_frag[MLX_TM];
@@ -2508,20 +2497,24 @@ kernel void gemm_mlx_f32(
             #pragma clang loop unroll(full)
             for (uint i = 0; i < MLX_TM; i++) {
                 simdgroup_load(a_frag[i],
-                    &As[(base_m + i * 8) * 16 + kk * 8], 16);
+                    &As[(base_m + i * 8) * LDA_F + kk * 8], LDA_F);
             }
+
+            simdgroup_barrier(mem_flags::mem_none);
 
             #pragma clang loop unroll(full)
             for (uint j = 0; j < MLX_TN; j++) {
                 simdgroup_load(b_frag[j],
-                    &Bs[kk * 8 * 64 + (base_n + j * 8)], 64);
+                    &Bs[kk * 8 * LDB_F + (base_n + j * 8)], LDB_F);
             }
+
+            simdgroup_barrier(mem_flags::mem_none);
 
             #pragma clang loop unroll(full)
             for (uint i = 0; i < MLX_TM; i++) {
                 #pragma clang loop unroll(full)
                 for (uint j = 0; j < MLX_TN; j++) {
-                    uint n_serp = (i % 2) ? (3 - j) : j;
+                    uint n_serp = (i % 2) ? (MLX_TN - 1 - j) : j;
                     simdgroup_multiply_accumulate(
                         acc[i][n_serp], a_frag[i], b_frag[n_serp], acc[i][n_serp]);
                 }
@@ -2643,14 +2636,14 @@ kernel void gemm_mlx_small_f16(
             uint a_col_base = (tid_in_group % 2) * 8;  // 0 or 8
             uint gr = row_start + a_row;
             if (align_M || gr < uM) {
-                if (kb + a_col_base + 7 < uK) {
+                if (align_K || kb + a_col_base + 7 < uK) {
                     *reinterpret_cast<threadgroup half4*>(&As[a_row * SM_BK + a_col_base]) =
                         *reinterpret_cast<device const half4*>(&A_batch[gr * uK + kb + a_col_base]);
                     *reinterpret_cast<threadgroup half4*>(&As[a_row * SM_BK + a_col_base + 4]) =
                         *reinterpret_cast<device const half4*>(&A_batch[gr * uK + kb + a_col_base + 4]);
                 } else {
                     for (uint d = 0; d < 8; d++) {
-                        As[a_row * SM_BK + a_col_base + d] = (kb + a_col_base + d < uK)
+                        As[a_row * SM_BK + a_col_base + d] = (align_K || kb + a_col_base + d < uK)
                             ? A_batch[gr * uK + kb + a_col_base + d] : half(0);
                     }
                 }
@@ -2667,14 +2660,14 @@ kernel void gemm_mlx_small_f16(
             uint b_col_base = (tid_in_group % 4) * 8;  // 0, 8, 16, 24
             uint gr = kb + b_row;
             uint gc = col_start + b_col_base;
-            if (gr < uK && (align_N || gc + 7 < uN)) {
+            if ((align_K || gr < uK) && (align_N || gc + 7 < uN)) {
                 *reinterpret_cast<threadgroup half4*>(&Bs[b_row * SM_BN + b_col_base]) =
                     *reinterpret_cast<device const half4*>(&B_batch[gr * uN + gc]);
                 *reinterpret_cast<threadgroup half4*>(&Bs[b_row * SM_BN + b_col_base + 4]) =
                     *reinterpret_cast<device const half4*>(&B_batch[gr * uN + gc + 4]);
             } else {
                 for (uint d = 0; d < 8; d++) {
-                    Bs[b_row * SM_BN + b_col_base + d] = (gr < uK && (align_N || gc + d < uN))
+                    Bs[b_row * SM_BN + b_col_base + d] = ((align_K || gr < uK) && (align_N || gc + d < uN))
                         ? B_batch[gr * uN + gc + d] : half(0);
                 }
             }
@@ -2802,12 +2795,12 @@ kernel void gemm_mlx_m16_f16(
             uint a_row = flat / MT_BK;     // 0..15
             uint a_col = flat % MT_BK;     // 0,4,8,12
             uint gr = row_start + a_row;
-            if ((align_M || gr < uM) && kb + a_col + 3 < uK) {
+            if ((align_M || gr < uM) && (align_K || kb + a_col + 3 < uK)) {
                 *reinterpret_cast<threadgroup half4*>(&As[a_row * MT_BK + a_col]) =
                     *reinterpret_cast<device const half4*>(&A_batch[gr * uK + kb + a_col]);
             } else {
                 for (uint d = 0; d < 4; d++) {
-                    As[a_row * MT_BK + a_col + d] = ((align_M || gr < uM) && kb + a_col + d < uK)
+                    As[a_row * MT_BK + a_col + d] = ((align_M || gr < uM) && (align_K || kb + a_col + d < uK))
                         ? A_batch[gr * uK + kb + a_col + d] : half(0);
                 }
             }
@@ -2821,14 +2814,14 @@ kernel void gemm_mlx_m16_f16(
             uint b_col = flat % MT_BN;
             uint gr = kb + b_row;
             uint gc = col_start + b_col;
-            if (gr < uK && (align_N || gc + 7 < uN)) {
+            if ((align_K || gr < uK) && (align_N || gc + 7 < uN)) {
                 *reinterpret_cast<threadgroup half4*>(&Bs[b_row * MT_BN + b_col]) =
                     *reinterpret_cast<device const half4*>(&B_batch[gr * uN + gc]);
                 *reinterpret_cast<threadgroup half4*>(&Bs[b_row * MT_BN + b_col + 4]) =
                     *reinterpret_cast<device const half4*>(&B_batch[gr * uN + gc + 4]);
             } else {
                 for (uint d = 0; d < 8; d++) {
-                    Bs[b_row * MT_BN + b_col + d] = (gr < uK && (align_N || gc + d < uN))
+                    Bs[b_row * MT_BN + b_col + d] = ((align_K || gr < uK) && (align_N || gc + d < uN))
                         ? B_batch[gr * uN + gc + d] : half(0);
                 }
             }
@@ -2913,8 +2906,11 @@ kernel void gemm_mlx_bf16(
     uint  sgid           [[simdgroup_index_in_threadgroup]],
     uint  lane_id        [[thread_index_in_simdgroup]])
 {
-    threadgroup bfloat As[MLX_BM * MLX_BK];  // 64x16 = 1024 bfloats = 2KB
-    threadgroup bfloat Bs[MLX_BK * MLX_BN];  // 16x64 = 1024 bfloats = 2KB
+    // Padding to avoid TG memory bank conflicts
+    constexpr uint LDA_BF = MLX_BK + 8;   // 16 + 8 = 24
+    constexpr uint LDB_BF = MLX_BN + 8;   // 64 + 8 = 72
+    threadgroup bfloat As[MLX_BM * LDA_BF];  // 64 * 24 = 1536 bfloats = 3KB
+    threadgroup bfloat Bs[MLX_BK * LDB_BF];  // 16 * 72 = 1152 bfloats ~ 2.3KB
     // TG-cached norm_weight for the current K tile (f32 for precision, avoids 64x redundant device reads)
     threadgroup float norm_w_cache_bf[MLX_BK]; // 16 floats = 64 bytes
 
@@ -2929,9 +2925,11 @@ kernel void gemm_mlx_bf16(
     device const bfloat* R_batch = has_residual ? (residual + batch_idx * mlx_as_uniform(batch_stride_c)) : nullptr;
     device const bfloat* G_batch = has_swiglu ? (gate_result + batch_idx * mlx_as_uniform(batch_stride_c)) : nullptr;
 
-    // SG grid: 1x2 -- sg_row always 0, sg_col = sgid (0 or 1)
-    const uint base_m = 0;        // WM=1, single row of SG
-    const uint base_n = sgid * 32; // each SG covers 32 cols
+    // SG grid: 2x2
+    const uint sg_row = sgid / WN;   // 0 or 1
+    const uint sg_col = sgid % WN;   // 0 or 1
+    const uint base_m = sg_row * (MLX_TM * 8);  // 0 or 32
+    const uint base_n = sg_col * (MLX_TN * 8);  // 0 or 32
 
     simdgroup_float8x8 acc[MLX_TM][MLX_TN];
     #pragma clang loop unroll(full)
@@ -2947,22 +2945,22 @@ kernel void gemm_mlx_bf16(
 
     // bf16→f32 conversion buffers for simdgroup_load
     // A slice: BM * 8 = 64 * 8 = 512 floats = 2KB
-    // B slice: 2 * 8 * 32 = 512 floats = 2KB (per-SG to avoid write-write race)
-    // Total extra: 2KB + 2KB = 4KB (well within 32KB TG limit)
+    // B slice: 4 SGs * 8 * 32 = 4096 floats = 16KB (per-SG to avoid write-write race)
+    // Total TG: 3KB + 2.3KB + 64B + 2KB + 16KB = ~23KB (within 32KB limit)
     threadgroup float A_f32[MLX_BM * 8];
-    threadgroup float B_f32[2][8 * 32];  // per-SG to avoid write-write race
+    threadgroup float B_f32[MLX_N_SG][8 * (MLX_TN * 8)];  // per-SG to avoid write-write race
 
     // -- Main loop: single-buffered --
     for (uint tile = 0; tile < n_tiles; tile++) {
         uint kb = tile * MLX_BK;
 
-        // Load A tile: 64 threads x 16 elements = 64x16 = BM x BK
+        // Load A tile: 128 threads x 8 elements = 64x16 = BM x BK
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // Pre-load norm_weight[kb..kb+16] into TG cache (1 thread loads all 16)
         if (has_norm && tid_in_group == 0) {
             for (uint d = 0; d < MLX_BK; d++) {
-                norm_w_cache_bf[d] = (kb + d < uK) ? float(norm_weight[kb + d]) : 0.0f;
+                norm_w_cache_bf[d] = (align_K || kb + d < uK) ? float(norm_weight[kb + d]) : 0.0f;
             }
         }
         if (has_norm) {
@@ -2970,51 +2968,51 @@ kernel void gemm_mlx_bf16(
         }
 
         {
-            uint a_row = tid_in_group;  // 0..63
+            uint a_row = tid_in_group / 2;       // 0..63
+            uint a_col_base = (tid_in_group % 2) * 8;  // 0 or 8
             uint gr = row_start + a_row;
-            if ((align_M || gr < uM) && kb + 15 < uK) {
+            if ((align_M || gr < uM) && (align_K || kb + a_col_base + 7 < uK)) {
                 if (has_norm) {
-                    // Read inv_rms once into register, norm_weight from TG cache
                     float row_scale = inv_rms[gr];
-                    for (uint d = 0; d < 16; d++) {
-                        As[a_row * 16 + d] = bfloat(float(A_batch[gr * uK + kb + d])
-                            * row_scale * norm_w_cache_bf[d]);
+                    for (uint d = 0; d < 8; d++) {
+                        As[a_row * LDA_BF + a_col_base + d] = bfloat(float(A_batch[gr * uK + kb + a_col_base + d])
+                            * row_scale * norm_w_cache_bf[a_col_base + d]);
                     }
                 } else {
-                    for (uint d = 0; d < 16; d++) {
-                        As[a_row * 16 + d] = A_batch[gr * uK + kb + d];
+                    for (uint d = 0; d < 8; d++) {
+                        As[a_row * LDA_BF + a_col_base + d] = A_batch[gr * uK + kb + a_col_base + d];
                     }
                 }
             } else {
                 if (has_norm) {
                     float row_scale = (align_M || gr < uM) ? inv_rms[gr] : 0.0f;
-                    for (uint d = 0; d < 16; d++) {
-                        As[a_row * 16 + d] = ((align_M || gr < uM) && kb + d < uK)
-                            ? bfloat(float(A_batch[gr * uK + kb + d]) * row_scale * norm_w_cache_bf[d])
+                    for (uint d = 0; d < 8; d++) {
+                        As[a_row * LDA_BF + a_col_base + d] = ((align_M || gr < uM) && (align_K || kb + a_col_base + d < uK))
+                            ? bfloat(float(A_batch[gr * uK + kb + a_col_base + d]) * row_scale * norm_w_cache_bf[a_col_base + d])
                             : bfloat(0);
                     }
                 } else {
-                    for (uint d = 0; d < 16; d++) {
-                        As[a_row * 16 + d] = ((align_M || gr < uM) && kb + d < uK)
-                            ? A_batch[gr * uK + kb + d] : bfloat(0);
+                    for (uint d = 0; d < 8; d++) {
+                        As[a_row * LDA_BF + a_col_base + d] = ((align_M || gr < uM) && (align_K || kb + a_col_base + d < uK))
+                            ? A_batch[gr * uK + kb + a_col_base + d] : bfloat(0);
                     }
                 }
             }
         }
 
-        // Load B tile: 64 threads x 16 elements = 16x64 = BK x BN
+        // Load B tile: 128 threads x 8 elements = 16x64 = BK x BN
         {
-            uint bi = tid_in_group >> 2;         // 0..15 (row in B tile)
-            uint bj = (tid_in_group & 3u) << 4;  // 0, 16, 32, 48
+            uint bi = tid_in_group / 8;          // 0..15
+            uint bj = (tid_in_group & 7u) << 3;  // 0,8,...,56
             uint gr = kb + bi;
             uint gc = col_start + bj;
-            if (gr < uK && (align_N || gc + 15 < uN)) {
-                for (uint d = 0; d < 16; d++) {
-                    Bs[bi * 64 + bj + d] = B_batch[gr * uN + gc + d];
+            if ((align_K || gr < uK) && (align_N || gc + 7 < uN)) {
+                for (uint d = 0; d < 8; d++) {
+                    Bs[bi * LDB_BF + bj + d] = B_batch[gr * uN + gc + d];
                 }
             } else {
-                for (uint d = 0; d < 16; d++) {
-                    Bs[bi * 64 + bj + d] = (gr < uK && (align_N || gc + d < uN))
+                for (uint d = 0; d < 8; d++) {
+                    Bs[bi * LDB_BF + bj + d] = ((align_K || gr < uK) && (align_N || gc + d < uN))
                         ? B_batch[gr * uN + gc + d] : bfloat(0);
                 }
             }
@@ -3029,13 +3027,14 @@ kernel void gemm_mlx_bf16(
             for (uint idx = tid_in_group; idx < MLX_BM * 8; idx += MLX_N_THREADS) {
                 uint r = idx / 8;
                 uint c = idx % 8;
-                A_f32[idx] = float(As[r * 16 + kk * 8 + c]);
+                A_f32[idx] = float(As[r * LDA_BF + kk * 8 + c]);
             }
-            // Convert B slice for this SG's half: 8 rows x 32 cols → f32
-            for (uint idx = tid_in_group; idx < 8 * 32; idx += MLX_N_THREADS) {
-                uint r = idx / 32;
-                uint c = idx % 32;
-                B_f32[sgid][idx] = float(Bs[(kk * 8 + r) * 64 + base_n + c]);
+            // Convert B slice for this SG's region: 8 rows x (MLX_TN*8) cols → f32
+            constexpr uint B_SG_COLS = MLX_TN * 8;  // 32
+            for (uint idx = tid_in_group; idx < 8 * B_SG_COLS; idx += MLX_N_THREADS) {
+                uint r = idx / B_SG_COLS;
+                uint c = idx % B_SG_COLS;
+                B_f32[sgid][idx] = float(Bs[(kk * 8 + r) * LDB_BF + base_n + c]);
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -3047,16 +3046,20 @@ kernel void gemm_mlx_bf16(
                 simdgroup_load(a_frag[i], &A_f32[(base_m + i * 8) * 8], 8);
             }
 
+            simdgroup_barrier(mem_flags::mem_none);
+
             #pragma clang loop unroll(full)
             for (uint j = 0; j < MLX_TN; j++) {
-                simdgroup_load(b_frag[j], &B_f32[sgid][j * 8], 32);
+                simdgroup_load(b_frag[j], &B_f32[sgid][j * 8], B_SG_COLS);
             }
+
+            simdgroup_barrier(mem_flags::mem_none);
 
             #pragma clang loop unroll(full)
             for (uint i = 0; i < MLX_TM; i++) {
                 #pragma clang loop unroll(full)
                 for (uint j = 0; j < MLX_TN; j++) {
-                    uint n_serp = (i % 2) ? (3 - j) : j;
+                    uint n_serp = (i % 2) ? (MLX_TN - 1 - j) : j;
                     simdgroup_multiply_accumulate(
                         acc[i][n_serp], a_frag[i], b_frag[n_serp], acc[i][n_serp]);
                 }
@@ -3476,6 +3479,7 @@ kernel void grouped_splitk_pass1_f16(
 pub struct TileConfig {
     pub bm: usize,
     pub bn: usize,
+    pub bk: usize,
     pub variant: TileVariant,
 }
 
@@ -3518,6 +3522,7 @@ pub fn select_tile_config(m: usize, n: usize, _k: usize) -> TileConfig {
         return TileConfig {
             bm: 32,
             bn: 128,
+            bk: 32,
             variant: TileVariant::Skinny,
         };
     }
@@ -3526,12 +3531,14 @@ pub fn select_tile_config(m: usize, n: usize, _k: usize) -> TileConfig {
         TileConfig {
             bm: 16,
             bn: 16,
+            bk: 16,
             variant: TileVariant::Small,
         }
     } else if m >= 33 && n >= 33 {
         TileConfig {
             bm: 64,
             bn: 64,
+            bk: 32,
             variant: TileVariant::Full,
         }
     } else {
@@ -3539,6 +3546,7 @@ pub fn select_tile_config(m: usize, n: usize, _k: usize) -> TileConfig {
         TileConfig {
             bm: 32,
             bn: 32,
+            bk: 16,
             variant: TileVariant::Simd,
         }
     }
@@ -3558,12 +3566,14 @@ pub fn select_tile_config_with_dtype(m: usize, n: usize, k: usize, dtype: DType)
             return TileConfig {
                 bm: 32,
                 bn: 32,
+                bk: 16,
                 variant: TileVariant::MlxArchSmall,
             };
         } else {
             return TileConfig {
                 bm: 16,
                 bn: 32,
+                bk: 16,
                 variant: TileVariant::MlxArchMicro,
             };
         }
@@ -3575,6 +3585,7 @@ pub fn select_tile_config_with_dtype(m: usize, n: usize, k: usize, dtype: DType)
         TileConfig {
             bm: 64,
             bn: 64,
+            bk: 16,
             variant: TileVariant::MlxArch,
         }
     } else {
@@ -3604,11 +3615,11 @@ pub fn should_use_split_k(m: usize, n: usize, k: usize, batch: usize) -> bool {
 fn split_k_count(m: usize, n: usize, k: usize) -> usize {
     let max_mn = m.max(n).max(1);
     let desired = k / (4 * max_mn);
-    desired.clamp(2, 16)
+    desired.clamp(2, 32)
 }
 
 /// Returns Some(n_splits) if Split-K f16 should be used, None otherwise.
-/// Uses GPU occupancy heuristic: if total threadgroups < 2x GPU cores, split K.
+/// Uses GPU occupancy heuristic: if total threadgroups < 4x GPU cores, split K.
 pub fn should_use_split_k_v2(
     m: usize,
     n: usize,
@@ -3618,14 +3629,16 @@ pub fn should_use_split_k_v2(
     gpu_cores: usize,
 ) -> Option<usize> {
     let total_tgs = m.div_ceil(bm) * n.div_ceil(bn);
-    if total_tgs >= gpu_cores * 2 {
+    if total_tgs >= gpu_cores * 4 {
         return None;
     } // enough parallelism already
     if k < 256 {
         return None;
     } // too short to split
-    let target = gpu_cores * 2;
-    let splits = (target / total_tgs.max(1)).min(k / 128).min(8);
+    let bk = 16usize;
+    let k_tiles = k / bk;
+    let target = gpu_cores * 4;
+    let splits = (target / total_tgs.max(1)).clamp(2, k_tiles.min(32));
     if splits > 1 {
         Some(splits)
     } else {
@@ -3875,12 +3888,16 @@ pub fn matmul(
         // occupancy, but compute splits using the split-K kernel's tile size (64x64).
         let tile = select_tile_config_with_dtype(m, n, k, DType::Float16);
         let non_splitk_tgs = m.div_ceil(tile.bm) * n.div_ceil(tile.bn);
-        if non_splitk_tgs < gpu_cores * 2 && k >= 256 {
+        // Split when under-occupied AND K-dominant (k >= max(m,n)) with minimum k=256.
+        // Threshold *4 (was *2) for better latency hiding across GPU cores.
+        let target_tgs = gpu_cores * 4;
+        if non_splitk_tgs < target_tgs && k >= m.max(n) && k >= 256 {
             // Select split-K tile size: BM=32 for small M, BM=64 otherwise
             let (splitk_bm, splitk_bn) = if m <= 32 { (32, 32) } else { (64, 64) };
             let splitk_tgs = m.div_ceil(splitk_bm) * n.div_ceil(splitk_bn);
-            let target = gpu_cores * 2;
-            let splits = (target / splitk_tgs.max(1)).min(k / 128).min(8);
+            // Split-K kernels use BK=16
+            let k_tiles = k / 16;
+            let splits = (target_tgs / splitk_tgs.max(1)).clamp(2, k_tiles.min(32));
             if splits > 1 {
                 return dispatch_split_k_f16(registry, a, b, queue, m, n, k, splits);
             }
@@ -4044,7 +4061,7 @@ fn dispatch_tiled_gemm(
         || tile.variant == TileVariant::MlxArchSmall
         || tile.variant == TileVariant::MlxArchMicro
     {
-        let constants = matmul_align_constants(m, n, tile.bm, tile.bn);
+        let constants = matmul_align_constants(m, n, k, tile.bm, tile.bn, tile.bk);
         registry.get_pipeline_with_constants(kernel_name, a.dtype(), &constants)?
     } else {
         registry.get_pipeline(kernel_name, a.dtype())?
@@ -4099,7 +4116,8 @@ fn dispatch_tiled_gemm(
         TileVariant::Medium | TileVariant::Simd => 1024_u64,
         TileVariant::Skinny => 256_u64,
         TileVariant::Full => 256_u64,
-        TileVariant::MlxArch | TileVariant::MlxArchSmall | TileVariant::MlxArchMicro => 64_u64,
+        TileVariant::MlxArch => 128_u64,
+        TileVariant::MlxArchSmall | TileVariant::MlxArchMicro => 64_u64,
     };
     let tg = MTLSize::new(tg_threads, 1, 1);
 
@@ -4208,8 +4226,9 @@ fn dispatch_split_k_f16(
         (64usize, 64usize, "splitk_pass1_mlx_f16")
     };
 
-    // Pass 1: MLX-arch split-k
-    let constants = matmul_align_constants(m, n, bm, bn);
+    // Pass 1: MLX-arch split-k (align_K unused by split-K shaders, safe to pass)
+    let bk = 16usize;
+    let constants = matmul_align_constants(m, n, k, bm, bn, bk);
     let pass1_pipeline =
         registry.get_pipeline_with_constants(kernel_name, DType::Float16, &constants)?;
 
@@ -4271,8 +4290,10 @@ fn dispatch_split_k_f16(
 pub fn matmul_align_constants(
     m: usize,
     n: usize,
+    k: usize,
     bm: usize,
     bn: usize,
+    bk: usize,
 ) -> Vec<(u32, crate::kernels::FunctionConstantValue)> {
     use crate::kernels::FunctionConstantValue;
     vec![
@@ -4281,6 +4302,7 @@ pub fn matmul_align_constants(
         (202, FunctionConstantValue::Bool(false)), // has_residual = false
         (203, FunctionConstantValue::Bool(false)), // has_norm = false
         (204, FunctionConstantValue::Bool(false)), // has_swiglu = false
+        (205, FunctionConstantValue::Bool(k % bk == 0)), // align_K
     ]
 }
 
@@ -4440,7 +4462,7 @@ pub fn matmul_into_cb(
         || tile.variant == TileVariant::MlxArchSmall
         || tile.variant == TileVariant::MlxArchMicro
     {
-        let constants = matmul_align_constants(m, n, tile.bm, tile.bn);
+        let constants = matmul_align_constants(m, n, k, tile.bm, tile.bn, tile.bk);
         registry.get_pipeline_with_constants(kernel_name, a.dtype(), &constants)?
     } else {
         registry.get_pipeline(kernel_name, a.dtype())?
@@ -4492,7 +4514,8 @@ pub fn matmul_into_cb(
         TileVariant::Medium | TileVariant::Simd => 1024_u64,
         TileVariant::Skinny => 256_u64,
         TileVariant::Full => 256_u64,
-        TileVariant::MlxArch | TileVariant::MlxArchSmall | TileVariant::MlxArchMicro => 64_u64,
+        TileVariant::MlxArch => 128_u64,
+        TileVariant::MlxArchSmall | TileVariant::MlxArchMicro => 64_u64,
     };
     let tg = MTLSize::new(tg_threads, 1, 1);
 
@@ -4656,7 +4679,7 @@ pub fn matmul_add_residual_into_cb(
     let grid_x = ceil_div(n, tile.bn) as u64;
     let grid_y = ceil_div(m, tile.bm) as u64;
     let grid = MTLSize::new(grid_x, grid_y, 1);
-    let tg = MTLSize::new(64, 1, 1); // MlxArch = 64 threads
+    let tg = MTLSize::new(128, 1, 1); // MlxArch = 128 threads (4 SG)
     enc.dispatch_thread_groups(grid, tg);
     enc.end_encoding();
     drop(swizzle_log_buf);
@@ -4800,7 +4823,7 @@ pub fn matmul_norm_gemm_into_cb(
     let grid_x = ceil_div(n, tile.bn) as u64;
     let grid_y = ceil_div(m, tile.bm) as u64;
     let grid = MTLSize::new(grid_x, grid_y, 1);
-    let tg = MTLSize::new(64, 1, 1);
+    let tg = MTLSize::new(128, 1, 1); // MlxArch = 128 threads (4 SG)
     enc.dispatch_thread_groups(grid, tg);
     enc.end_encoding();
 
@@ -4916,7 +4939,7 @@ pub fn matmul_swiglu_gemm_into_cb(
     let grid_x = ceil_div(n, tile.bn) as u64;
     let grid_y = ceil_div(m, tile.bm) as u64;
     let grid = MTLSize::new(grid_x, grid_y, 1);
-    let tg = MTLSize::new(64, 1, 1);
+    let tg = MTLSize::new(128, 1, 1); // MlxArch = 128 threads (4 SG)
     enc.dispatch_thread_groups(grid, tg);
     enc.end_encoding();
     drop(swizzle_log_buf);
@@ -5076,9 +5099,9 @@ pub fn dispatch_grouped_splitk(
     }
 
     // Decide n_splits: if total_tiles < 2x GPU cores, split K to fill the GPU
-    let n_splits = if total_tiles < gpu_cores * 2 && k >= 256 {
-        let target = gpu_cores * 2;
-        let splits = (target / total_tiles.max(1)).min(k / 128).min(8);
+    let n_splits = if total_tiles < gpu_cores * 4 && k >= 256 {
+        let target = gpu_cores * 4;
+        let splits = (target / total_tiles.max(1)).clamp(2, (k / 16).min(32));
         if splits > 1 {
             splits
         } else {
@@ -5284,7 +5307,7 @@ mod tests {
     fn test_split_k_count_large_k() {
         let count = split_k_count(16, 16, 4096);
         assert!(count >= 2);
-        assert!(count <= 16);
+        assert!(count <= 32);
     }
 
     // ── GemmTileConfig tests ──
@@ -5452,9 +5475,9 @@ mod tests {
         // 8 experts, each 1 tile_m * 64 tiles_n = 512 total tiles
 
         // 512 > 160, so n_splits should be 1 (no split-K needed)
-        let n_splits = if total_tiles < gpu_cores * 2 && k >= 256 {
-            let target = gpu_cores * 2;
-            let splits = (target / total_tiles.max(1)).min(k / 128).min(8);
+        let n_splits = if total_tiles < gpu_cores * 4 && k >= 256 {
+            let target = gpu_cores * 4;
+            let splits = (target / total_tiles.max(1)).clamp(2, (k / 16).min(32));
             if splits > 1 {
                 splits
             } else {
@@ -5473,10 +5496,10 @@ mod tests {
             .map(|&m_i| m_i.div_ceil(bm) * tiles_n_small)
             .sum();
         assert_eq!(total_tiles_small, 32);
-        // 32 < 160, should split: target=160, 160/32=5, min(5, 4096/128=32, 8) = 5
-        let n_splits_small = if total_tiles_small < gpu_cores * 2 && k >= 256 {
-            let target = gpu_cores * 2;
-            let splits = (target / total_tiles_small.max(1)).min(k / 128).min(8);
+        // 32 < 320, should split: target=320, 320/32=10, clamp(2, min(256,32)) = 10
+        let n_splits_small = if total_tiles_small < gpu_cores * 4 && k >= 256 {
+            let target = gpu_cores * 4;
+            let splits = (target / total_tiles_small.max(1)).clamp(2, (k / 16).min(32));
             if splits > 1 {
                 splits
             } else {
@@ -5485,7 +5508,7 @@ mod tests {
         } else {
             1
         };
-        assert_eq!(n_splits_small, 5);
+        assert_eq!(n_splits_small, 10);
     }
 
     // ── matmul_align_constants includes has_residual ──
@@ -5493,8 +5516,8 @@ mod tests {
     #[test]
     fn test_align_constants_include_has_residual() {
         use crate::kernels::FunctionConstantValue;
-        let constants = matmul_align_constants(64, 64, 64, 64);
-        assert_eq!(constants.len(), 5);
+        let constants = matmul_align_constants(64, 64, 4096, 64, 64, 16);
+        assert_eq!(constants.len(), 6);
         // index 200: align_M
         assert_eq!(constants[0].0, 200);
         assert!(matches!(constants[0].1, FunctionConstantValue::Bool(true)));
@@ -5510,17 +5533,21 @@ mod tests {
         // index 204: has_swiglu = false
         assert_eq!(constants[4].0, 204);
         assert!(matches!(constants[4].1, FunctionConstantValue::Bool(false)));
+        // index 205: align_K (4096 % 16 == 0)
+        assert_eq!(constants[5].0, 205);
+        assert!(matches!(constants[5].1, FunctionConstantValue::Bool(true)));
     }
 
     #[test]
     fn test_align_constants_unaligned() {
         use crate::kernels::FunctionConstantValue;
-        let constants = matmul_align_constants(65, 63, 64, 64);
+        let constants = matmul_align_constants(65, 63, 4097, 64, 64, 16);
         assert!(matches!(constants[0].1, FunctionConstantValue::Bool(false))); // 65%64!=0
         assert!(matches!(constants[1].1, FunctionConstantValue::Bool(false))); // 63%64!=0
         assert!(matches!(constants[2].1, FunctionConstantValue::Bool(false))); // always false
         assert!(matches!(constants[3].1, FunctionConstantValue::Bool(false))); // always false
         assert!(matches!(constants[4].1, FunctionConstantValue::Bool(false))); // always false
+        assert!(matches!(constants[5].1, FunctionConstantValue::Bool(false))); // 4097%16!=0
     }
 
     // ── MlxArch tile selection test for residual path ──

@@ -289,6 +289,50 @@ def main():
     print("TransformerBlock::forward() which applies RoPE inside attention.")
     print("Prefill is compute-bound (unlike decode which is memory-bound),")
     print("so TFLOPS is the more relevant metric than GB/s for prefill.")
+
+    # ---- Compiled (mx.compile) benchmark for fair comparison with RMLX ExecGraph ----
+    print()
+    print("=" * 88)
+    print("MLX Single-Layer Prefill Benchmark — COMPILED (mx.compile)")
+    print("=" * 88)
+
+    compiled_block = mx.compile(block)
+
+    compiled_results = []
+
+    print()
+    print(f"{'seq_len':>8s}  {'mean':>10s}  {'std':>8s}  {'p50':>10s}  "
+          f"{'p95':>10s}  {'min':>10s}  {'max':>10s}  {'tok/s':>12s}")
+    print("-" * 88)
+
+    for seq_len in seq_lens:
+        r = bench_prefill(compiled_block, CONFIG, seq_len, args.warmup + 5, args.iters)
+        compiled_results.append(r)
+        print(f"{r['seq_len']:8d}  {r['mean']:9.1f}us  {r['std']:7.1f}us  {r['p50']:9.1f}us  "
+              f"{r['p95']:9.1f}us  {r['min']:9.1f}us  {r['max']:9.1f}us  {r['tokens_per_sec']:11,.0f}")
+
+    print("-" * 88)
+
+    # Compiled vs eager comparison
+    print()
+    print("--- Compiled vs Eager Comparison ---")
+    for eager, compiled in zip(results, compiled_results):
+        if eager["seq_len"] == compiled["seq_len"]:
+            speedup = eager["mean"] / compiled["mean"]
+            print(f"  seq_len={eager['seq_len']:5d}  eager={eager['mean']:9.1f}us  "
+                  f"compiled={compiled['mean']:9.1f}us  speedup={speedup:.3f}x")
+
+    # Compiled bandwidth estimate
+    print()
+    print("--- Compiled Bandwidth Estimate ---")
+    print(f"  Layer weight memory: {weight_mb:.1f} MB (f16)")
+    for r in compiled_results:
+        bw_gbs = weight_bytes / (r["mean"] / 1e6) / 1e9
+        flops_approx = 2 * num_params * r["seq_len"]
+        tflops = flops_approx / (r["mean"] / 1e6) / 1e12
+        print(f"  seq_len={r['seq_len']:5d}  eff_bw={bw_gbs:6.1f} GB/s  "
+              f"approx_throughput={tflops:.2f} TFLOPS")
+
     print()
     print("=" * 88)
     print("Done.")

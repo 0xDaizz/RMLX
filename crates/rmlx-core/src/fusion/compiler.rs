@@ -6,33 +6,42 @@
 //! standalone via the command queue.
 
 use crate::array::Array;
+use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
 
 use super::codegen::FusionCodegen;
 use super::graph::FusionGraph;
 
 /// Kernel function name for a fused element-wise kernel, derived from
-/// the graph's cache key.
-fn fused_kernel_name(graph: &FusionGraph) -> String {
-    format!("fused_ew_{:016x}", graph.cache_key())
+/// the graph's cache key and dtype.
+fn fused_kernel_name(graph: &FusionGraph, dtype: DType) -> String {
+    let dt_tag = match dtype {
+        DType::Float32 => "f32",
+        DType::Float16 => "f16",
+        DType::Bfloat16 => "bf16",
+        _ => "unk",
+    };
+    format!("fused_ew_{dt_tag}_{:016x}", graph.cache_key())
 }
 
 /// Compile a fused kernel from a [`FusionGraph`] and register it in the
 /// registry's JIT cache.
 ///
 /// Returns the kernel function name. If the kernel is already cached,
-/// this is a no-op.
+/// this is a no-op. The `dtype` controls the buffer element types in the
+/// generated Metal source (float / half / bfloat16_t).
 pub fn compile_fused(
     graph: &FusionGraph,
     codegen: &FusionCodegen,
     registry: &KernelRegistry,
+    dtype: DType,
 ) -> Result<String, KernelError> {
-    let name = fused_kernel_name(graph);
+    let name = fused_kernel_name(graph, dtype);
 
     // Generate Metal source with the unique kernel name so that the Metal
     // function name matches what get_pipeline() will look up.
     let source = codegen
-        .generate_named(graph, &name)
+        .generate_named(graph, &name, dtype)
         .map_err(|e| KernelError::CompilationFailed(format!("fusion codegen: {e}")))?;
 
     registry.register_jit_source_if_absent(&name, &source)?;
@@ -61,10 +70,11 @@ pub fn dispatch_fused(
         )));
     }
 
-    let name = compile_fused(graph, codegen, registry)?;
+    let dtype = inputs[0].dtype();
+    let name = compile_fused(graph, codegen, registry, dtype)?;
 
     // Get pipeline using the unique per-graph kernel name
-    let pipeline = registry.get_pipeline(&name, inputs[0].dtype())?;
+    let pipeline = registry.get_pipeline(&name, dtype)?;
 
     // Compute output size (element count of the first input — all must match
     // for element-wise ops after broadcasting).
@@ -135,8 +145,9 @@ pub fn dispatch_fused_into_cb(
         )));
     }
 
-    let name = compile_fused(graph, codegen, registry)?;
-    let pipeline = registry.get_pipeline(&name, inputs[0].dtype())?;
+    let dtype = inputs[0].dtype();
+    let name = compile_fused(graph, codegen, registry, dtype)?;
+    let pipeline = registry.get_pipeline(&name, dtype)?;
 
     let n_elements = inputs[0].shape().iter().product::<usize>();
     let device = registry.device().raw();
@@ -187,9 +198,10 @@ mod tests {
         g.add_op(FusableOp::Add, vec![0, 1]);
         g.set_outputs(1);
 
-        let name = fused_kernel_name(&g);
-        assert!(name.starts_with("fused_ew_"));
-        assert_eq!(name.len(), 9 + 16); // "fused_ew_" + 16 hex chars
+        let name = fused_kernel_name(&g, DType::Float32);
+        assert!(name.starts_with("fused_ew_f32_"));
+        // "fused_ew_f32_" (13) + 16 hex chars
+        assert_eq!(name.len(), 13 + 16);
     }
 
     #[test]
@@ -202,6 +214,28 @@ mod tests {
         g2.add_op(FusableOp::Add, vec![0, 1]);
         g2.set_outputs(1);
 
-        assert_eq!(fused_kernel_name(&g1), fused_kernel_name(&g2));
+        assert_eq!(
+            fused_kernel_name(&g1, DType::Float32),
+            fused_kernel_name(&g2, DType::Float32)
+        );
+    }
+
+    #[test]
+    fn test_fused_kernel_name_dtype_differs() {
+        let mut g = FusionGraph::new(2);
+        g.add_op(FusableOp::Add, vec![0, 1]);
+        g.set_outputs(1);
+
+        let f32_name = fused_kernel_name(&g, DType::Float32);
+        let f16_name = fused_kernel_name(&g, DType::Float16);
+        let bf16_name = fused_kernel_name(&g, DType::Bfloat16);
+
+        assert_ne!(f32_name, f16_name);
+        assert_ne!(f32_name, bf16_name);
+        assert_ne!(f16_name, bf16_name);
+
+        assert!(f32_name.contains("f32"));
+        assert!(f16_name.contains("f16"));
+        assert!(bf16_name.contains("bf16"));
     }
 }

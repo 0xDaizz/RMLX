@@ -56,6 +56,28 @@ use metal::{CommandBuffer, CommandQueue};
 use crate::batcher::CommandBatcher;
 use crate::event::{EventError, GpuEvent};
 
+/// Configuration for GPU memory backpressure in ExecGraph.
+///
+/// When the caller reports allocation sizes via [`ExecGraph::add_tracked_bytes`],
+/// the graph can automatically flush and sync to relieve memory pressure once
+/// the tracked total exceeds configurable thresholds.
+#[derive(Debug, Clone)]
+pub struct MemoryConfig {
+    /// Allocated bytes threshold that triggers a warning (default: 80 GB).
+    pub warn_threshold_bytes: u64,
+    /// Allocated bytes threshold that forces CB commit + sync (default: 100 GB).
+    pub force_commit_bytes: u64,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            warn_threshold_bytes: 80 * 1024 * 1024 * 1024, // 80 GB
+            force_commit_bytes: 100 * 1024 * 1024 * 1024,  // 100 GB
+        }
+    }
+}
+
 /// Token representing a submitted batch in the execution graph.
 ///
 /// Used to express dependencies between batches.
@@ -88,6 +110,12 @@ pub struct ExecGraph<'q, 'e> {
     /// multiple command buffers are in flight across iterations; using the CB's own
     /// completion mechanism is more robust.
     last_cb: Option<CommandBuffer>,
+    /// Memory backpressure configuration.
+    memory_config: MemoryConfig,
+    /// Caller-reported GPU allocation total in bytes. Updated via
+    /// [`add_tracked_bytes`] / [`sub_tracked_bytes`] since metal-rs does not
+    /// expose `MTLDevice.currentAllocatedSize`.
+    tracked_bytes: u64,
 }
 
 impl<'q, 'e> ExecGraph<'q, 'e> {
@@ -108,6 +136,8 @@ impl<'q, 'e> ExecGraph<'q, 'e> {
             total_batches: 0,
             sync_timeout: Duration::from_secs(10),
             last_cb: None,
+            memory_config: MemoryConfig::default(),
+            tracked_bytes: 0,
         }
     }
 
@@ -115,6 +145,50 @@ impl<'q, 'e> ExecGraph<'q, 'e> {
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.sync_timeout = timeout;
         self
+    }
+
+    /// Set a custom memory backpressure configuration.
+    pub fn with_memory_config(mut self, config: MemoryConfig) -> Self {
+        self.memory_config = config;
+        self
+    }
+
+    /// Report that `bytes` have been allocated on the GPU.
+    ///
+    /// Callers should invoke this after allocating Metal buffers so that
+    /// [`check_memory_pressure`] can trigger backpressure when appropriate.
+    pub fn add_tracked_bytes(&mut self, bytes: u64) {
+        self.tracked_bytes = self.tracked_bytes.saturating_add(bytes);
+    }
+
+    /// Report that `bytes` have been freed on the GPU.
+    pub fn sub_tracked_bytes(&mut self, bytes: u64) {
+        self.tracked_bytes = self.tracked_bytes.saturating_sub(bytes);
+    }
+
+    /// Current tracked GPU allocation in bytes.
+    pub fn tracked_bytes(&self) -> u64 {
+        self.tracked_bytes
+    }
+
+    /// Check current tracked GPU memory and force a commit + sync if above
+    /// the force threshold.
+    ///
+    /// Returns `true` if a forced sync occurred.
+    pub fn check_memory_pressure(&mut self) -> bool {
+        if self.tracked_bytes > self.memory_config.force_commit_bytes {
+            let _ = self.submit_batch();
+            let _ = self.sync();
+            return true;
+        }
+        // warn_threshold_bytes exceeded but below force — caller may choose
+        // to act on the return value or query `tracked_bytes()` directly.
+        false
+    }
+
+    /// Whether tracked bytes exceed the warning threshold.
+    pub fn is_memory_warning(&self) -> bool {
+        self.tracked_bytes > self.memory_config.warn_threshold_bytes
     }
 
     /// Get a new compute command encoder in the current batch.
@@ -214,6 +288,7 @@ impl<'q, 'e> ExecGraph<'q, 'e> {
         self.counter = 0;
         self.total_batches = 0;
         self.last_cb = None;
+        self.tracked_bytes = 0;
         self.event.reset();
     }
 

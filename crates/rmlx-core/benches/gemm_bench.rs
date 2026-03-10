@@ -176,7 +176,7 @@ fn bench_gemm(
     };
 
     let pipeline = if tile.variant == ops::matmul::TileVariant::MlxArch {
-        let constants = ops::matmul::matmul_align_constants(m, n, tile.bm, tile.bn);
+        let constants = ops::matmul::matmul_align_constants(m, n, k, tile.bm, tile.bn, tile.bk);
         registry
             .get_pipeline_with_constants(kernel_name, a.dtype(), &constants)
             .unwrap_or_else(|e| panic!("Failed to get pipeline for {kernel_name}: {e}"))
@@ -430,7 +430,7 @@ fn bench_with_tile(
         _ => panic!("Unsupported tile variant for boundary bench"),
     };
 
-    let constants = ops::matmul::matmul_align_constants(m, n, tile.bm, tile.bn);
+    let constants = ops::matmul::matmul_align_constants(m, n, k, tile.bm, tile.bn, tile.bk);
     let pipeline = registry
         .get_pipeline_with_constants(kernel_name, a.dtype(), &constants)
         .unwrap_or_else(|e| panic!("Failed to get pipeline for {kernel_name}: {e}"));
@@ -731,6 +731,7 @@ fn main() {
                 let tile_micro = ops::matmul::TileConfig {
                     bm: 16,
                     bn: 32,
+                    bk: 16,
                     variant: ops::matmul::TileVariant::MlxArchMicro,
                 };
                 let t_micro = bench_with_tile(
@@ -749,6 +750,7 @@ fn main() {
                 let tile_small = ops::matmul::TileConfig {
                     bm: 32,
                     bn: 32,
+                    bk: 16,
                     variant: ops::matmul::TileVariant::MlxArchSmall,
                 };
                 let t_small = bench_with_tile(
