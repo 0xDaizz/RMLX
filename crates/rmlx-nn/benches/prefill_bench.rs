@@ -292,7 +292,7 @@ fn compute_tflops(seq_len: usize, mean_us: f64) -> f64 {
 }
 
 // ---------------------------------------------------------------------------
-// MLX reference numbers (from hwstudio1 benchmark run, 2026-03-09)
+// MLX reference numbers (M3 Ultra 80-core benchmark run, 2026-03-09)
 // ---------------------------------------------------------------------------
 
 fn mlx_ref_us(seq_len: usize) -> Option<f64> {

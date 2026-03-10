@@ -410,7 +410,7 @@ Phase B systematically searches for the optimal GEMM kernel configuration to clo
 
 This config wins across most M/N combinations. The 2x4 SG layout (2 groups along M, 4 along N) outperforms the previous 4x2 layout because B matrix loads [K,N] benefit from N-direction coalescing.
 
-### MLX Comparison (hwstudio1, M=2048, K=4096, N=14336, f16)
+### MLX Comparison (M3 Ultra 80-core, M=2048, K=4096, N=14336, f16)
 
 | Config | TFLOPS | vs MLX |
 |--------|-------:|-------:|
@@ -470,7 +470,7 @@ Phase C targets the kernel-level performance gap identified in Phase B. While Ph
 3. **aligned is unsafe at scale**: Bounds check removal works on small matrices but causes performance collapse on large M + N=14336
 4. **Combining optimizations doesn't stack**: ds_wl and full variants show no gain beyond wide_load alone
 
-### Results (hwstudio1, M=2048, K=4096, N=14336, f16)
+### Results (M3 Ultra 80-core, M=2048, K=4096, N=14336, f16)
 
 | Config | TFLOPS | vs MLX |
 |--------|-------:|-------:|
