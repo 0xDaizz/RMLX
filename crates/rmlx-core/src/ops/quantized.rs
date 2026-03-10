@@ -9135,6 +9135,7 @@ mod tests {
     // =====================================================================
 
     /// CPU reference: Q4 affine dequant + matvec for a single row of x.
+    #[allow(clippy::needless_range_loop)]
     fn cpu_qmv_q4_reference(
         weights_u32: &[u32],
         scales: &[f32],

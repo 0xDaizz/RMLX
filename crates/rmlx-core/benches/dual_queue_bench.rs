@@ -135,6 +135,7 @@ const PROFILES: &[ModelProfile] = &[
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct Stats {
     median: f64,
     min: f64,
