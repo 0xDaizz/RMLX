@@ -1,8 +1,8 @@
 //! Qwen2 model architecture.
 //!
-//! Qwen2 uses standard GQA attention with SwiGLU (gated) FFN, structurally
-//! identical to LLaMA. This wraps `TransformerModel` with Qwen-specific
-//! config presets.
+//! Qwen2 uses standard GQA attention with SwiGLU (gated) FFN, following the
+//! standard decoder-only transformer pattern. This wraps `TransformerModel`
+//! with Qwen-specific config presets.
 
 use rmlx_core::array::Array;
 use rmlx_core::kernels::{KernelError, KernelRegistry};
@@ -34,8 +34,8 @@ pub fn qwen2_7b() -> TransformerConfig {
 
 /// Qwen2 model: standard GQA + SwiGLU wrapped as `TransformerModel`.
 ///
-/// Structurally identical to LLaMA, but with Qwen2-specific config presets
-/// (different hidden size, head counts, vocab size, RoPE theta, etc.).
+/// Standard decoder-only transformer with Qwen2-specific config presets
+/// (hidden size, head counts, vocab size, RoPE theta, etc.).
 pub struct Qwen2Model {
     inner: TransformerModel,
 }

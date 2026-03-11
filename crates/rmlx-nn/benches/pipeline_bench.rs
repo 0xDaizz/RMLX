@@ -1,4 +1,4 @@
-//! GPU Pipeline Performance Benchmark (Llama-3 8B / Mixtral-style GQA)
+//! GPU Pipeline Performance Benchmark (MoE expert layer / Mixtral-style GQA)
 //!
 //! Apples-to-apples comparison of single-layer transformer forward pass:
 //! - **Baseline**: `forward()` — per-op dispatch, each op commits+waits its own CB

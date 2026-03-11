@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Per-operation prefill profiling for MLX (Llama-3 8B config).
+"""Per-operation prefill profiling for MLX (Qwen 3.5 MoE expert config).
 
 Times each sub-operation individually within a single transformer layer
 in prefill mode, with mx.eval() synchronization between each op.
@@ -19,15 +19,15 @@ import mlx.nn as nn
 
 
 # ---------------------------------------------------------------------------
-# Llama-3 8B config
+# Qwen 3.5 MoE expert config
 # ---------------------------------------------------------------------------
 CONFIG = {
-    "hidden_size": 4096,
-    "num_heads": 32,
-    "num_kv_heads": 8,
+    "hidden_size": 3584,
+    "num_heads": 28,
+    "num_kv_heads": 4,
     "head_dim": 128,
-    "intermediate_size": 14336,
-    "rope_theta": 10000.0,
+    "intermediate_size": 2560,
+    "rope_theta": 1000000.0,
     "rms_norm_eps": 1e-5,
 }
 
@@ -77,7 +77,7 @@ def time_op(warmup, iters, fn):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="MLX per-operation prefill profiling (Llama-3 8B config)"
+        description="MLX per-operation prefill profiling (Qwen 3.5 MoE expert config)"
     )
     parser.add_argument("--warmup", type=int, default=WARMUP,
                         help=f"Warmup iterations (default {WARMUP})")
@@ -126,7 +126,7 @@ def main():
 
     # Header
     print("=" * 80)
-    print("Per-Operation Prefill Profile (MLX, Llama-3 8B, f16)")
+    print("Per-Operation Prefill Profile (MLX, Qwen 3.5 MoE expert, f16)")
     print("=" * 80)
     print(f"  mlx version   : {mx.__version__}")
     print(f"  device        : {mx.default_device()}")

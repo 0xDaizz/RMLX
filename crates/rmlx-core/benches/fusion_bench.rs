@@ -13,7 +13,7 @@
 //!   # Step 2: Run RMLX benchmark with MLX reference
 //!   MLX_FUSION_REF=/tmp/mlx_fusion_ref.json cargo bench -p rmlx-core --bench fusion_bench
 //!
-//! Parameters: M=1/32/512, K=4096, N=4096/14336 (LLaMA-3 8B).
+//! Parameters: M=1/32/512, K=3584, N=3584/2560 (Qwen2-7B).
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -224,14 +224,14 @@ struct Scenario {
 fn scenarios() -> Vec<Scenario> {
     vec![
         Scenario {
-            label: "LLaMA-3 attn proj",
-            k: 4096,
-            n: 4096,
+            label: "attn proj",
+            k: 3584,
+            n: 3584,
         },
         Scenario {
-            label: "LLaMA-3 FFN up/gate",
-            k: 4096,
-            n: 14336,
+            label: "FFN up/gate",
+            k: 3584,
+            n: 2560,
         },
     ]
 }

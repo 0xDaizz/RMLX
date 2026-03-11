@@ -168,7 +168,7 @@ pub fn register_all(registry: &KernelRegistry) -> Result<(), KernelError> {
 | `reduce` | Sum, Max, Argmax, Row_sum | 리덕션 연산 |
 | `softmax` | Softmax | Attention 스코어 정규화 |
 | `topk_route` | TopKRoute | GPU-native MoE top-k 라우팅 (softmax -> top-k -> normalize -> histogram -> prefix-scan 융합) |
-| `rms_norm` | RMS Normalization | LLaMA 스타일 정규화 |
+| `rms_norm` | RMS Normalization | RMS 정규화 |
 | `rope` | RoPE | Rotary Position Embedding |
 | `gemv` | GEMV | 행렬-벡터 곱 |
 | `matmul` | GEMM | 범용 행렬 곱셈 |

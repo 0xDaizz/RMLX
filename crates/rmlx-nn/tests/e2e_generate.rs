@@ -1,4 +1,4 @@
-//! End-to-end smoke test: build a tiny Llama-like model with random weights,
+//! End-to-end smoke test: build a tiny transformer model with random weights,
 //! run a forward pass, apply sampler, and verify the pipeline completes
 //! without panics and produces valid token IDs.
 //!

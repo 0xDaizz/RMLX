@@ -1,4 +1,4 @@
-//! GPU Prefill Benchmark (Llama-3 8B single layer, seq_len > 1)
+//! GPU Prefill Benchmark (MoE Expert Layer, Qwen 3.5-style dimensions, seq_len > 1)
 //!
 //! Measures single-layer TransformerBlock forward pass latency across
 //! multiple sequence lengths to profile prefill performance.
@@ -28,21 +28,24 @@ use rmlx_nn::{
 };
 
 // ---------------------------------------------------------------------------
-// Llama-3 8B config
+// MoE Expert Layer config (Qwen 3.5-style dimensions)
+//
+// In MoE models, each expert FFN has a small intermediate_dim (e.g., 2560)
+// and tokens are distributed across 64-128 experts, so M per expert is low.
 // ---------------------------------------------------------------------------
 
-const HIDDEN_SIZE: usize = 4096;
-const NUM_HEADS: usize = 32;
-const NUM_KV_HEADS: usize = 8;
+const HIDDEN_SIZE: usize = 3584;
+const NUM_HEADS: usize = 28;
+const NUM_KV_HEADS: usize = 4;
 const HEAD_DIM: usize = 128;
-const INTERMEDIATE_DIM: usize = 14336;
+const INTERMEDIATE_DIM: usize = 2560;
 const RMS_NORM_EPS: f32 = 1e-5;
-const ROPE_THETA: f32 = 10000.0;
+const ROPE_THETA: f32 = 1000000.0;
 const MAX_SEQ_LEN: usize = 2048;
 
-/// Total trainable parameters for a single Llama-3 8B layer (approximate).
+/// Total trainable parameters for a single MoE expert layer (approximate).
 /// Used to compute TFLOPS: 2 * PARAMS_PER_LAYER * seq_len = total FLOPs.
-const PARAMS_PER_LAYER: f64 = 218_112_000.0;
+const PARAMS_PER_LAYER: f64 = 56_885_248.0;
 
 const SEQ_LENS: &[usize] = &[128, 256, 512, 1024, 2048];
 const WARMUP_ITERS: usize = 5;
@@ -251,13 +254,13 @@ fn assert_cb_ok(cb: &metal::CommandBufferRef, context: &str) {
 /// Estimate total bytes read/written for a single-layer prefill pass.
 ///
 /// Weights (read once):
-///   Q_proj: hidden * hidden * 2  = 4096*4096*2
-///   K_proj: hidden * kv_size * 2 = 4096*1024*2
-///   V_proj: hidden * kv_size * 2 = 4096*1024*2
-///   O_proj: hidden * hidden * 2  = 4096*4096*2
-///   gate:   hidden * inter * 2   = 4096*14336*2
-///   up:     hidden * inter * 2   = 4096*14336*2
-///   down:   inter * hidden * 2   = 14336*4096*2
+///   Q_proj: hidden * hidden * 2  = 3584*3584*2
+///   K_proj: hidden * kv_size * 2 = 3584*512*2
+///   V_proj: hidden * kv_size * 2 = 3584*512*2
+///   O_proj: hidden * hidden * 2  = 3584*3584*2
+///   gate:   hidden * inter * 2   = 3584*2560*2
+///   up:     hidden * inter * 2   = 3584*2560*2
+///   down:   inter * hidden * 2   = 2560*3584*2
 ///   norms:  2 * hidden * 2       (negligible)
 ///
 /// Activations (proportional to seq_len, relatively small for typical sizes).
@@ -292,18 +295,13 @@ fn compute_tflops(seq_len: usize, mean_us: f64) -> f64 {
 }
 
 // ---------------------------------------------------------------------------
-// MLX reference numbers (from M3-Ultra-80c benchmark run, 2026-03-09)
+// MLX reference numbers
 // ---------------------------------------------------------------------------
 
-fn mlx_ref_us(seq_len: usize) -> Option<f64> {
-    match seq_len {
-        128 => Some(3443.0),
-        256 => Some(6980.0),
-        512 => Some(11369.0),
-        1024 => Some(20356.0),
-        2048 => Some(40979.0),
-        _ => None,
-    }
+fn mlx_ref_us(_seq_len: usize) -> Option<f64> {
+    // MLX reference numbers not yet collected for MoE expert dimensions.
+    // Run MLX benchmark with matching config and fill in here.
+    None
 }
 
 // ---------------------------------------------------------------------------

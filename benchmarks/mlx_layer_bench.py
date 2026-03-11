@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """MLX single transformer layer decode latency benchmark.
 
-Measures raw-op latency for a Llama-3 8B / Mixtral-style GQA decoder layer in decode mode
+Measures raw-op latency for a Qwen 3.5 MoE expert GQA decoder layer in decode mode
 (seq_len=1) for direct comparison with RMLX benchmarks.
 
 All operations use raw MLX primitives (no mlx.nn layers) for fair comparison.
@@ -17,13 +17,13 @@ import statistics
 import mlx.core as mx
 
 # ---------------------------------------------------------------------------
-# Llama-3 8B / Mixtral-style GQA shapes
+# Qwen 3.5 MoE expert GQA shapes
 # ---------------------------------------------------------------------------
-HIDDEN_SIZE = 4096
-NUM_HEADS = 32
+HIDDEN_SIZE = 3584
+NUM_HEADS = 28
 HEAD_DIM = 128
-INTERMEDIATE_SIZE = 14336
-NUM_KV_HEADS = 8
+INTERMEDIATE_SIZE = 2560
+NUM_KV_HEADS = 4
 SEQ_LEN = 1          # decode
 KV_CACHE_LEN = 128   # existing cached tokens
 
@@ -38,7 +38,7 @@ def apply_rope(x, offset, head_dim):
     """Apply rotary position embeddings. x: [B, n_heads, seq, head_dim]."""
     half = head_dim // 2
     positions = mx.arange(offset, offset + x.shape[2])  # [seq]
-    freqs = 1.0 / (10000.0 ** (mx.arange(0, half).astype(mx.float32) / half))
+    freqs = 1.0 / (1000000.0 ** (mx.arange(0, half).astype(mx.float32) / half))
     theta = positions[:, None] * freqs[None, :]  # [seq, half]
     cos_t = mx.cos(theta)  # [seq, half]
     sin_t = mx.sin(theta)  # [seq, half]
@@ -64,18 +64,18 @@ def rms_norm(x, weight, eps=1e-5):
 # ---------------------------------------------------------------------------
 def layer_forward(x, w_qkv, w_o, w_gate_up, w_down, rms_w1, rms_w2,
                   k_cache, v_cache, rope_offset):
-    """Single Llama-3 8B / Mixtral-style GQA decoder layer forward pass (decode mode).
+    """Single Qwen 3.5 MoE expert GQA decoder layer forward pass (decode mode).
 
     Args:
-        x:          [1, 1, 4096]  input hidden state
-        w_qkv:      [4096, 6144]  merged QKV projection  (32+8+8)*128 = 6144
-        w_o:        [4096, 4096]  output projection
-        w_gate_up:  [4096, 28672] merged gate+up projection (14336*2)
-        w_down:     [14336, 4096] down projection
-        rms_w1:     [4096]        pre-attention RMS norm weight
-        rms_w2:     [4096]        pre-FFN RMS norm weight
-        k_cache:    [1, 8, 128, 128]  key cache (KV_CACHE_LEN tokens)
-        v_cache:    [1, 8, 128, 128]  value cache
+        x:          [1, 1, 3584]  input hidden state
+        w_qkv:      [3584, 4608]  merged QKV projection  (28+4+4)*128 = 4608
+        w_o:        [3584, 3584]  output projection
+        w_gate_up:  [3584, 5120]  merged gate+up projection (2560*2)
+        w_down:     [2560, 3584]  down projection
+        rms_w1:     [3584]        pre-attention RMS norm weight
+        rms_w2:     [3584]        pre-FFN RMS norm weight
+        k_cache:    [1, 4, 128, 128]  key cache (KV_CACHE_LEN tokens)
+        v_cache:    [1, 4, 128, 128]  value cache
         rope_offset: int  position offset for RoPE
     """
     B = 1
@@ -84,51 +84,51 @@ def layer_forward(x, w_qkv, w_o, w_gate_up, w_down, rms_w1, rms_w2,
     normed = rms_norm(x, rms_w1)
 
     # --- QKV projection ---
-    # normed: [1, 1, 4096] @ w_qkv: [4096, 6144] -> [1, 1, 6144]
+    # normed: [1, 1, 3584] @ w_qkv: [3584, 4608] -> [1, 1, 4608]
     qkv = normed @ w_qkv
 
     # Split into Q, K, V
-    q = qkv[..., :NUM_HEADS * HEAD_DIM]                                    # [1, 1, 4096]
-    k = qkv[..., NUM_HEADS * HEAD_DIM:NUM_HEADS * HEAD_DIM + NUM_KV_HEADS * HEAD_DIM]  # [1, 1, 1024]
-    v = qkv[..., NUM_HEADS * HEAD_DIM + NUM_KV_HEADS * HEAD_DIM:]          # [1, 1, 1024]
+    q = qkv[..., :NUM_HEADS * HEAD_DIM]                                    # [1, 1, 3584]
+    k = qkv[..., NUM_HEADS * HEAD_DIM:NUM_HEADS * HEAD_DIM + NUM_KV_HEADS * HEAD_DIM]  # [1, 1, 512]
+    v = qkv[..., NUM_HEADS * HEAD_DIM + NUM_KV_HEADS * HEAD_DIM:]          # [1, 1, 512]
 
     # Reshape to [B, n_heads, seq, head_dim]
-    q = q.reshape(B, SEQ_LEN, NUM_HEADS, HEAD_DIM).transpose(0, 2, 1, 3)     # [1, 32, 1, 128]
-    k = k.reshape(B, SEQ_LEN, NUM_KV_HEADS, HEAD_DIM).transpose(0, 2, 1, 3)  # [1, 8, 1, 128]
-    v = v.reshape(B, SEQ_LEN, NUM_KV_HEADS, HEAD_DIM).transpose(0, 2, 1, 3)  # [1, 8, 1, 128]
+    q = q.reshape(B, SEQ_LEN, NUM_HEADS, HEAD_DIM).transpose(0, 2, 1, 3)     # [1, 28, 1, 128]
+    k = k.reshape(B, SEQ_LEN, NUM_KV_HEADS, HEAD_DIM).transpose(0, 2, 1, 3)  # [1, 4, 1, 128]
+    v = v.reshape(B, SEQ_LEN, NUM_KV_HEADS, HEAD_DIM).transpose(0, 2, 1, 3)  # [1, 4, 1, 128]
 
     # --- RoPE ---
     q = apply_rope(q, rope_offset, HEAD_DIM)
     k = apply_rope(k, rope_offset, HEAD_DIM)
 
     # --- Append to KV cache ---
-    k_full = mx.concatenate([k_cache, k], axis=2)  # [1, 8, 129, 128]
-    v_full = mx.concatenate([v_cache, v], axis=2)   # [1, 8, 129, 128]
+    k_full = mx.concatenate([k_cache, k], axis=2)  # [1, 4, 129, 128]
+    v_full = mx.concatenate([v_cache, v], axis=2)   # [1, 4, 129, 128]
 
     # --- Scaled dot-product attention ---
     scale = HEAD_DIM ** -0.5
     attn = mx.fast.scaled_dot_product_attention(q, k_full, v_full, scale=scale)
-    # attn: [1, 32, 1, 128]
+    # attn: [1, 28, 1, 128]
 
     # --- O projection + residual ---
-    attn_out = attn.transpose(0, 2, 1, 3).reshape(B, SEQ_LEN, NUM_HEADS * HEAD_DIM)  # [1, 1, 4096]
-    o = attn_out @ w_o  # [1, 1, 4096]
+    attn_out = attn.transpose(0, 2, 1, 3).reshape(B, SEQ_LEN, NUM_HEADS * HEAD_DIM)  # [1, 1, 3584]
+    o = attn_out @ w_o  # [1, 1, 3584]
     x = x + o
 
     # --- Pre-FFN RMS norm ---
     normed2 = rms_norm(x, rms_w2)
 
     # --- Gate+Up projection ---
-    # normed2: [1, 1, 4096] @ w_gate_up: [4096, 28672] -> [1, 1, 28672]
+    # normed2: [1, 1, 3584] @ w_gate_up: [3584, 5120] -> [1, 1, 5120]
     gate_up = normed2 @ w_gate_up
-    gate = gate_up[..., :INTERMEDIATE_SIZE]   # [1, 1, 14336]
-    up = gate_up[..., INTERMEDIATE_SIZE:]     # [1, 1, 14336]
+    gate = gate_up[..., :INTERMEDIATE_SIZE]   # [1, 1, 2560]
+    up = gate_up[..., INTERMEDIATE_SIZE:]     # [1, 1, 2560]
 
     # --- SiLU * gate ---
     ffn = (gate * mx.sigmoid(gate)) * up  # SiLU(gate) * up
 
     # --- Down projection + residual ---
-    down = ffn @ w_down  # [1, 1, 4096]
+    down = ffn @ w_down  # [1, 1, 3584]
     x = x + down
 
     return x, k_full, v_full
@@ -165,7 +165,7 @@ def bench_per_op(x, w_qkv, w_o, w_gate_up, w_down, rms_w1, rms_w2,
     t_rms1 = bench_single("rms_norm (pre-attn)", lambda: rms_norm(x, rms_w1))
 
     # QKV projection
-    t_qkv = bench_single("qkv_proj [4096x6144]", lambda: normed @ w_qkv)
+    t_qkv = bench_single("qkv_proj [3584x4608]", lambda: normed @ w_qkv)
 
     qkv = normed @ w_qkv
     mx.eval(qkv)
@@ -194,7 +194,7 @@ def bench_per_op(x, w_qkv, w_o, w_gate_up, w_down, rms_w1, rms_w2,
     attn = mx.fast.scaled_dot_product_attention(q_r, k_full, v_full, scale=scale)
     attn_out = attn.transpose(0, 2, 1, 3).reshape(B, SEQ_LEN, NUM_HEADS * HEAD_DIM)
     mx.eval(attn_out)
-    t_oproj = bench_single("o_proj [4096x4096]", lambda: attn_out @ w_o)
+    t_oproj = bench_single("o_proj [3584x3584]", lambda: attn_out @ w_o)
 
     # Pre-FFN RMS norm
     o = attn_out @ w_o
@@ -205,7 +205,7 @@ def bench_per_op(x, w_qkv, w_o, w_gate_up, w_down, rms_w1, rms_w2,
     # Gate+Up projection
     normed2 = rms_norm(x2, rms_w2)
     mx.eval(normed2)
-    t_gateup = bench_single("gate_up_proj [4096x28672]", lambda: normed2 @ w_gate_up)
+    t_gateup = bench_single("gate_up_proj [3584x5120]", lambda: normed2 @ w_gate_up)
 
     # SiLU * gate
     gate_up = normed2 @ w_gate_up
@@ -218,7 +218,7 @@ def bench_per_op(x, w_qkv, w_o, w_gate_up, w_down, rms_w1, rms_w2,
     # Down projection
     ffn = (gate * mx.sigmoid(gate)) * up
     mx.eval(ffn)
-    t_down = bench_single("down_proj [14336x4096]", lambda: ffn @ w_down)
+    t_down = bench_single("down_proj [2560x3584]", lambda: ffn @ w_down)
 
     total = t_rms1 + t_qkv + t_rope + t_kv + t_sdpa + t_oproj + t_rms2 + t_gateup + t_silu + t_down
     print(f"  {'sum of ops':42s}  total={total:8.1f}us")

@@ -118,8 +118,7 @@ rmlx/
 │   │       ├── parallel.rs       # Megatron-LM TP (Column/RowParallel)
 │   │       └── models/
 │   │           ├── mod.rs
-│   │           ├── llama.rs      # LLaMA architecture
-│   │           ├── qwen.rs       # Qwen/Qwen2.5
+│   │           ├── qwen.rs       # Qwen 3.5
 │   │           ├── deepseek.rs   # DeepSeek-V3 (MoE)
 │   │           └── mixtral.rs    # Mixtral (MoE)
 │   │
@@ -233,10 +232,10 @@ rmlx/
 
 | Item | Details |
 |------|---------|
-| **Purpose** | Provides neural network layers for Transformer-based architectures. Includes high-level modules such as Linear, Attention, and MoE, as well as model architectures for LLaMA, Qwen, DeepSeek-V3, and others. |
-| **Key modules** | `linear.rs` (Linear, `prepare_weight_t()`), `quantized_linear.rs` (QuantizedLinear), `attention.rs` (Multi-head/GQA), `mla.rs` (Multi-Latent Attention), `sliding_window.rs` (Sliding Window), `layer_norm.rs` (LayerNorm), `activations.rs` (14 activations), `transformer.rs` (Transformer block, `forward_graph()`, `forward_into_cb()`), `moe.rs` (gate + routing + shared expert + EP integration + GPU routing), `gguf_loader.rs` (GGUF model loading), `parallel.rs` (ColumnParallel/RowParallel), `models/` (llama.rs, qwen.rs, deepseek.rs, mixtral.rs) |
+| **Purpose** | Provides neural network layers for Transformer-based architectures. Includes high-level modules such as Linear, Attention, and MoE, as well as model architectures for Qwen 3.5, DeepSeek-V3, Mixtral, and others. |
+| **Key modules** | `linear.rs` (Linear, `prepare_weight_t()`), `quantized_linear.rs` (QuantizedLinear), `attention.rs` (Multi-head/GQA), `mla.rs` (Multi-Latent Attention), `sliding_window.rs` (Sliding Window), `layer_norm.rs` (LayerNorm), `activations.rs` (14 activations), `transformer.rs` (Transformer block, `forward_graph()`, `forward_into_cb()`), `moe.rs` (gate + routing + shared expert + EP integration + GPU routing), `gguf_loader.rs` (GGUF model loading), `parallel.rs` (ColumnParallel/RowParallel), `models/` (qwen.rs, deepseek.rs, mixtral.rs) |
 | **Dependencies** | `rmlx-core` |
-| **Status** | Complete — Transformer block, Linear/QuantizedLinear/Attention/MLA/MoE layers, KV cache (static/rotating/batch/quantized), sliding window attention, LayerNorm, 14 activations, parallel linear layers, GGUF model loader, LLaMA/Qwen/DeepSeek-V3/Mixtral model architectures, ExecGraph-compatible `forward_graph()`, weight pre-caching, Phase 0+1+2 audit remediation (N1-N8) fully implemented |
+| **Status** | Complete — Transformer block, Linear/QuantizedLinear/Attention/MLA/MoE layers, KV cache (static/rotating/batch/quantized), sliding window attention, LayerNorm, 14 activations, parallel linear layers, GGUF model loader, Qwen/DeepSeek-V3/Mixtral/Kimi model architectures, ExecGraph-compatible `forward_graph()`, weight pre-caching, Phase 0+1+2 audit remediation (N1-N8) fully implemented |
 
 ---
 

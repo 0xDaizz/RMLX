@@ -2,9 +2,9 @@
 
 ## 개요
 
-`rmlx-nn`은 GPU 가속 추론을 위한 신경망 레이어를 구현하는 크레이트입니다. Transformer 아키텍처의 핵심 구성 요소(Linear, Embedding, Attention, TransformerBlock, MoE)를 `rmlx-core`의 연산 커널 위에 구성하며, LLaMA, Qwen, DeepSeek-V3, Mixtral 모델 설정을 내장하고 있습니다.
+`rmlx-nn`은 GPU 가속 추론을 위한 신경망 레이어를 구현하는 크레이트입니다. Transformer 아키텍처의 핵심 구성 요소(Linear, Embedding, Attention, TransformerBlock, MoE)를 `rmlx-core`의 연산 커널 위에 구성하며, Qwen 3.5, DeepSeek-V3, Mixtral, Kimi K2.5 모델 설정을 내장하고 있습니다.
 
-> **상태 (Phase 0-9B-opt + S1-S5 + EP-2~EP-6):** Linear, Embedding, Attention (KV 캐시 포함), TransformerBlock, MoE (`MoeStrategy` 디스패치 포함), Parallel (TP), 4종 모델 설정(LLaMA 7B/3-8B, Qwen2 7B, DeepSeek-V3, Mixtral 8x7B), RotatingKvCache, BatchKvCache, QuantizedKvCache, QuantizedArray, Conv1d/Conv2d, DynamicExecContext가 구현되어 있습니다. Phase 9에서 `forward_graph()`, `forward_into_cb()`, 가중치 사전 캐싱(`prepare_weight_t`)이 추가되어 ExecGraph CB 배칭을 지원합니다 (레이어당 65 CB -> 5 CB, 92.3% 감소, 17.4x 속도 향상). EP Phase 2-6 순방향 경로 통합 완료: `MoeStrategy` 열거형 (PerExpert/Grouped), 빌더 API (`with_strategy`, `with_pipeline`, `with_sparse_plan`), 그룹형 GEMM 경로, 파이프라인 통합, ICB 희소 디스패치 플레이스홀더, FP8/SlabRing 와이어링. **Phase KO 추가:** 9-디스패치 디코드 경로 (`forward_decode_9dispatch`, `forward_single_cb_9dispatch`), 병합 QKV/gate_up 가중치 준비, slab 레이아웃 KV 캐시 (`LayerKvCache::preallocated` with slab), `StorageModePrivate` 가중치를 위한 `prepare_weights_private()` 파이프라인. **Phase 8c 추가:** `CachedDecode` 구조체 (사전 해석 PSO + 사전 할당 스크래치 버퍼), `forward_cached_2encoder_9dispatch` 메서드, `append_into_encoder` 및 `append_preresolved_into_encoder` KV 캐시 메서드, 모든 op에 걸친 `_preresolved_into_encoder` 패턴.
+> **상태 (Phase 0-9B-opt + S1-S5 + EP-2~EP-6):** Linear, Embedding, Attention (KV 캐시 포함), TransformerBlock, MoE (`MoeStrategy` 디스패치 포함), Parallel (TP), 4종 모델 설정(Qwen 3.5, DeepSeek-V3, Mixtral 8x7B, Kimi K2.5), RotatingKvCache, BatchKvCache, QuantizedKvCache, QuantizedArray, Conv1d/Conv2d, DynamicExecContext가 구현되어 있습니다. Phase 9에서 `forward_graph()`, `forward_into_cb()`, 가중치 사전 캐싱(`prepare_weight_t`)이 추가되어 ExecGraph CB 배칭을 지원합니다 (레이어당 65 CB -> 5 CB, 92.3% 감소, 17.4x 속도 향상). EP Phase 2-6 순방향 경로 통합 완료: `MoeStrategy` 열거형 (PerExpert/Grouped), 빌더 API (`with_strategy`, `with_pipeline`, `with_sparse_plan`), 그룹형 GEMM 경로, 파이프라인 통합, ICB 희소 디스패치 플레이스홀더, FP8/SlabRing 와이어링. **Phase KO 추가:** 9-디스패치 디코드 경로 (`forward_decode_9dispatch`, `forward_single_cb_9dispatch`), 병합 QKV/gate_up 가중치 준비, slab 레이아웃 KV 캐시 (`LayerKvCache::preallocated` with slab), `StorageModePrivate` 가중치를 위한 `prepare_weights_private()` 파이프라인. **Phase 8c 추가:** `CachedDecode` 구조체 (사전 해석 PSO + 사전 할당 스크래치 버퍼), `forward_cached_2encoder_9dispatch` 메서드, `append_into_encoder` 및 `append_preresolved_into_encoder` KV 캐시 메서드, 모든 op에 걸친 `_preresolved_into_encoder` 패턴.
 
 ---
 
@@ -27,8 +27,7 @@ rmlx-nn/src/
 ├── parallel.rs         # 텐서 병렬 레이어 (feature = "distributed")
 └── models/
     ├── mod.rs           # 모델 모듈 선언
-    ├── llama.rs         # LLaMA 7B, LLaMA 3 8B
-    ├── qwen.rs          # Qwen2 7B
+    ├── qwen.rs          # Qwen 3.5
     ├── deepseek.rs      # DeepSeek-V3
     └── mixtral.rs       # Mixtral 8x7B
 ```
@@ -151,8 +150,8 @@ pub struct Attention {
 
 | Attention 변형 | 조건 | 대표 모델 |
 |---------------|------|-----------|
-| MHA | `num_kv_heads == num_heads` | LLaMA 7B |
-| GQA | `num_kv_heads < num_heads` | LLaMA 3, Qwen2, Mixtral |
+| MHA | `num_kv_heads == num_heads` | 레거시 dense 모델 |
+| GQA | `num_kv_heads < num_heads` | Qwen2, Mixtral, Kimi K2.5 |
 | MLA | `num_kv_heads == 1` | DeepSeek-V3 |
 
 ### Phase 9 추가 사항
@@ -673,25 +672,15 @@ Phase KO는 MLX 대비 레이어당 디코드 성능 격차를 해소합니다:
 | MLX 컴파일 | 4,525 (60L) | -- | -- |
 | MLX 대비 격차 | | 6.34x 빠름 | |
 
-M3 Ultra, f16, Llama-2 7B 형상에서 벤치마크.
+M3 Ultra, f16, MoE expert 형상에서 벤치마크.
 
 ---
 
 ## models/ — 모델 아키텍처 정의
 
-4종의 Transformer 모델 설정을 `TransformerConfig`로 제공합니다.
+3종의 Transformer 모델 설정을 `TransformerConfig`로 제공합니다.
 
-### LLaMA (`models/llama.rs`)
-
-| 함수 | hidden | heads | kv_heads | layers | vocab | max_seq | ff_type |
-|------|--------|-------|----------|--------|-------|---------|---------|
-| `llama_7b()` | 4096 | 32 | 32 (MHA) | 32 | 32000 | 4096 | Dense(11008) |
-| `llama_3_8b()` | 4096 | 32 | 8 (GQA) | 32 | 128256 | 8192 | Dense(14336) |
-
-- LLaMA 7B: rope_theta=10000, rms_norm_eps=1e-5
-- LLaMA 3 8B: rope_theta=500000, rms_norm_eps=1e-5
-
-### Qwen2 (`models/qwen.rs`)
+### Qwen 3.5 (`models/qwen.rs`)
 
 | 함수 | hidden | heads | kv_heads | layers | vocab | max_seq | ff_type |
 |------|--------|-------|----------|--------|-------|---------|---------|
@@ -733,8 +722,7 @@ graph BT
     end
 
     subgraph "rmlx-nn/models"
-        LLAMA[LLaMA 7B / 3-8B]
-        QWEN[Qwen2 7B]
+        QWEN[Qwen 3.5]
         DS[DeepSeek-V3]
         MIX[Mixtral 8x7B]
     end
@@ -762,7 +750,6 @@ graph BT
     TB --> SILU
     EMB --> MATMUL
 
-    LLAMA --> TB
     QWEN --> TB
     DS --> TB
     DS --> MOE

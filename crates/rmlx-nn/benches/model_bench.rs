@@ -15,11 +15,11 @@
 //!
 //! ```bash
 //! # RMLX (Rust):
-//! RMLX_MODEL_DIR=~/models/Meta-Llama-3-8B-Instruct \
+//! RMLX_MODEL_DIR=~/models/YourModel \
 //!   cargo bench -p rmlx-nn --bench model_bench
 //!
 //! # MLX (Python) — run separately for comparison:
-//! python benchmarks/mlx_model_bench.py --model-dir ~/models/Meta-Llama-3-8B-Instruct
+//! python benchmarks/mlx_model_bench.py --model-dir ~/models/YourModel
 //! ```
 //!
 //! `RMLX_MODEL_DIR` should point to a HuggingFace model directory containing:
@@ -138,18 +138,18 @@ fn parse_model_config(config_path: &Path) -> Result<ModelInfo, Box<dyn std::erro
     let content = fs::read_to_string(config_path)?;
     let json: serde_json::Value = serde_json::from_str(&content)?;
 
-    let hidden_size = json["hidden_size"].as_u64().unwrap_or(4096) as usize;
-    let num_heads = json["num_attention_heads"].as_u64().unwrap_or(32) as usize;
+    let hidden_size = json["hidden_size"].as_u64().unwrap_or(3584) as usize;
+    let num_heads = json["num_attention_heads"].as_u64().unwrap_or(28) as usize;
     let num_kv_heads = json["num_key_value_heads"]
         .as_u64()
         .unwrap_or(num_heads as u64) as usize;
-    let num_layers = json["num_hidden_layers"].as_u64().unwrap_or(32) as usize;
-    let vocab_size = json["vocab_size"].as_u64().unwrap_or(32000) as usize;
-    let intermediate_dim = json["intermediate_size"].as_u64().unwrap_or(14336) as usize;
+    let num_layers = json["num_hidden_layers"].as_u64().unwrap_or(64) as usize;
+    let vocab_size = json["vocab_size"].as_u64().unwrap_or(151936) as usize;
+    let intermediate_dim = json["intermediate_size"].as_u64().unwrap_or(2560) as usize;
     let head_dim = hidden_size / num_heads;
     let rope_theta = json["rope_theta"].as_f64().unwrap_or(10000.0) as f32;
     let rms_norm_eps = json["rms_norm_eps"].as_f64().unwrap_or(1e-5) as f32;
-    let model_type = json["model_type"].as_str().unwrap_or("llama").to_string();
+    let model_type = json["model_type"].as_str().unwrap_or("qwen2").to_string();
 
     Ok(ModelInfo {
         hidden_size,
@@ -399,7 +399,7 @@ fn load_model_from_safetensors(
 fn main() {
     let model_dir = env::var("RMLX_MODEL_DIR").unwrap_or_else(|_| {
         let home = env::var("HOME").unwrap_or_else(|_| ".".into());
-        format!("{home}/models/Meta-Llama-3-8B-Instruct")
+        format!("{home}/models/model")
     });
     let model_dir = PathBuf::from(&model_dir);
 

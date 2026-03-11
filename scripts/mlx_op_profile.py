@@ -1,5 +1,5 @@
 """
-MLX per-operation profiling for Llama-3 8B single layer.
+MLX per-operation profiling for Qwen 3.5 MoE expert single layer.
 Measures each operation individually with mx.eval() synchronization.
 """
 import time
@@ -7,12 +7,12 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-# Llama-3 8B config
-HIDDEN = 4096
-NUM_HEADS = 32
-NUM_KV_HEADS = 8
+# Qwen 3.5 MoE expert config
+HIDDEN = 3584
+NUM_HEADS = 28
+NUM_KV_HEADS = 4
 HEAD_DIM = 128
-INTERMEDIATE = 14336
+INTERMEDIATE = 2560
 SEQ_LENS = [128, 256, 512, 1024]
 WARMUP = 3
 ITERS = 10
@@ -73,7 +73,7 @@ def run_profile(seq_len):
     mx.eval(mask)
 
     # RoPE frequencies
-    freqs = mx.exp(mx.arange(0, HEAD_DIM, 2, dtype=mx.float32) * (-np.log(10000.0) / HEAD_DIM))
+    freqs = mx.exp(mx.arange(0, HEAD_DIM, 2, dtype=mx.float32) * (-np.log(1000000.0) / HEAD_DIM))
     t = mx.arange(seq_len, dtype=mx.float32)
     freqs = mx.outer(t, freqs)
     mx.eval(freqs)
@@ -200,7 +200,7 @@ def run_profile(seq_len):
     return results
 
 if __name__ == "__main__":
-    print("MLX Per-Operation Profiling — Llama-3 8B Single Layer")
+    print("MLX Per-Operation Profiling — Qwen 3.5 MoE Expert Single Layer")
     print(f"Config: hidden={HIDDEN}, heads={NUM_HEADS}/{NUM_KV_HEADS}, head_dim={HEAD_DIM}, ffn={INTERMEDIATE}")
 
     for sl in SEQ_LENS:

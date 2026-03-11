@@ -316,7 +316,7 @@ The following operations were not benchmarked under fully comparable conditions:
 
 ## 9. Documentation Gaps
 
-- No end-to-end model benchmark (full Llama-3 8B inference) -- only single-layer and kernel-level benchmarks exist
+- No end-to-end model benchmark (full model inference) -- only single-layer and kernel-level benchmarks exist
 - Quantized kernel benchmark methodology not standardized (varying group sizes, sequence lengths)
 - Missing thermal throttling annotation on long-running benchmarks (see GPU Thermal Throttling notes in project memory)
 

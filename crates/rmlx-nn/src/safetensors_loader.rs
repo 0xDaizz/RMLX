@@ -740,7 +740,7 @@ mod tests {
         let dir = std::env::temp_dir().join("rmlx_st_test_noqc");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("config.json");
-        std::fs::write(&path, r#"{"model_type": "llama"}"#).unwrap();
+        std::fs::write(&path, r#"{"model_type": "qwen2"}"#).unwrap();
 
         assert!(parse_quantization_config(&path).unwrap().is_none());
     }
