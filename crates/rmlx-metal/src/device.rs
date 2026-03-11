@@ -216,9 +216,9 @@ impl ChipTuning {
         match self.arch_class {
             ArchClass::Ultra => {
                 if small_dims {
-                    32
+                    16
                 } else {
-                    32
+                    16
                 }
             }
             ArchClass::Max => {

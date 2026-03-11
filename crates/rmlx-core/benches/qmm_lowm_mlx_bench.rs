@@ -326,7 +326,7 @@ fn main() {
         "Warmup: {} iters, Bench: {} iters, Q4, group_size={}, f16 input",
         WARMUP_ITERS, BENCH_ITERS, GROUP_SIZE,
     );
-    println!("Dispatch paths: M=1 QMV fast, M=2-32 QMV batched, M>=64 NAX MMA");
+    println!("Dispatch paths: M=1 QMV fast, M=2-16 QMV batched, M=17-32 Skinny Split-K, M>=64 NAX");
     println!("MLX reference: M3 Ultra 80-core, mlx-lm 0.24, group_size=64, f16");
     println!();
 
@@ -360,6 +360,8 @@ fn main() {
                     "NAX"
                 } else if m == 1 {
                     "QMV-fast"
+                } else if m > 16 {
+                    "Skinny-SK"
                 } else {
                     "QMV-batch"
                 };
@@ -410,8 +412,9 @@ fn main() {
     println!();
     println!("Per-M-range parity summary:");
     for &(label, m_lo, m_hi) in &[
-        ("QMV (M=1)",      1usize, 1usize),
-        ("QMV (M=2-32)",   2, 32),
+        ("QMV (M=1)",       1usize, 1usize),
+        ("QMV (M=2-16)",    2, 16),
+        ("Skinny (M=32)",  32, 32),
         ("NAX (M=64)",    64, 64),
     ] {
         let filtered: Vec<f64> = results
