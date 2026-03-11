@@ -77,3 +77,7 @@ harness = false
 [[bench]]
 name = "nax_transition_bench"
 harness = false
+
+[[bench]]
+name = "qmm_lowm_mlx_bench"
+harness = false
