@@ -11072,8 +11072,15 @@ mod tests {
         let x_gpu = Array::from_bytes(device, &x_f16_bytes, vec![m, k], DType::Float16);
 
         // Run NAX on GPU (uses native f16 scales/biases)
-        let nax_out =
-            affine_quantized_matmul_nax(&registry, &x_gpu, &qw, &queue).expect("NAX QMM failed");
+        // Skip if MPP/NAX kernel is unavailable (CI without MetalPerformancePrimitives)
+        let nax_out = match affine_quantized_matmul_nax(&registry, &x_gpu, &qw, &queue) {
+            Ok(out) => out,
+            Err(KernelError::NotFound(_)) => {
+                eprintln!("Skipping test_nax_vs_cpu_reference_gpu_correctness: NAX kernel unavailable (no MPP)");
+                return;
+            }
+            Err(e) => panic!("NAX QMM failed: {e}"),
+        };
 
         // Read back NAX output
         let nax_ptr = nax_out.metal_buffer().contents() as *const u16;

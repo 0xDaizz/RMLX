@@ -4289,7 +4289,11 @@ pub fn sdpa_prefill_nax_f16_into_cb(
     let stride_s_val = kv_seq_stride.unwrap_or(kv_len) as u32;
     encoder.set_bytes(9, 4, &stride_s_val as *const u32 as *const std::ffi::c_void);
     let num_q_heads_val = num_heads as u32;
-    encoder.set_bytes(10, 4, &num_q_heads_val as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(
+        10,
+        4,
+        &num_q_heads_val as *const u32 as *const std::ffi::c_void,
+    );
     let v_hs = v_head_stride.unwrap_or(stride_s_val as usize * head_dim) as u32;
     let v_rs = v_row_stride.unwrap_or(head_dim) as u32;
     encoder.set_bytes(11, 4, &v_hs as *const u32 as *const std::ffi::c_void);
@@ -4727,7 +4731,11 @@ pub fn sdpa_prefill_nax_f16_encode(
     let stride_s_val = kv_seq_stride.unwrap_or(kv_len) as u32;
     encoder.set_bytes(9, 4, &stride_s_val as *const u32 as *const std::ffi::c_void);
     let num_q_heads_val = num_heads as u32;
-    encoder.set_bytes(10, 4, &num_q_heads_val as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(
+        10,
+        4,
+        &num_q_heads_val as *const u32 as *const std::ffi::c_void,
+    );
     let v_hs = v_head_stride.unwrap_or(stride_s_val as usize * head_dim) as u32;
     let v_rs = v_row_stride.unwrap_or(head_dim) as u32;
     encoder.set_bytes(11, 4, &v_hs as *const u32 as *const std::ffi::c_void);
@@ -6085,8 +6093,7 @@ kernel void metal32_probe(device float* out [[buffer(0)]], uint tid [[thread_pos
             cb_scalar.wait_until_completed();
             let scalar_f32_raw = read_f16_as_f32(&registry, &queue, &scalar_out);
             // Convert scalar head-major output to seq-major for comparison with NAX
-            let scalar_f32 =
-                head_major_to_seq_major(&scalar_f32_raw, num_heads, seq_len, head_dim);
+            let scalar_f32 = head_major_to_seq_major(&scalar_f32_raw, num_heads, seq_len, head_dim);
 
             // --- NAX kernel ---
             let cb_nax = queue.new_command_buffer();

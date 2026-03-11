@@ -3372,13 +3372,8 @@ impl Attention {
             )?;
         }
         // Deinterleave V — always done before SDPA for contiguous memory access
-        v_batched = ops::rope::deinterleave_heads_into_cb(
-            registry,
-            &v,
-            num_kv_heads,
-            v_row_stride,
-            cb,
-        )?;
+        v_batched =
+            ops::rope::deinterleave_heads_into_cb(registry, &v, num_kv_heads, v_row_stride, cb)?;
 
         // ── 4) KV cache: bypass on initial prefill (cache empty) ──
         let needs_initial_append = cache.seq_len == 0;
@@ -3819,13 +3814,7 @@ impl Attention {
         // KV cache append for initial prefill (cache was empty).
         // V is already deinterleaved (done before SDPA above).
         if needs_initial_append {
-            cache.append_batched_encode(
-                &k_batched,
-                &v_batched,
-                seq_len,
-                registry,
-                encoder,
-            )?;
+            cache.append_batched_encode(&k_batched, &v_batched, seq_len, registry, encoder)?;
         }
 
         // All kernels (MMA + NAX) now write seq-major — no interleave dispatch needed.
