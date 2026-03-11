@@ -216,23 +216,23 @@ impl ChipTuning {
         match self.arch_class {
             ArchClass::Ultra => {
                 if small_dims {
-                    64
+                    32
                 } else {
-                    64
+                    32
                 }
             }
             ArchClass::Max => {
                 if small_dims {
-                    48
+                    24
                 } else {
-                    32
+                    16
                 }
             }
             ArchClass::Base | ArchClass::Phone => {
                 if small_dims {
-                    32
-                } else {
                     16
+                } else {
+                    8
                 }
             }
             ArchClass::Unknown => 16, // safe default

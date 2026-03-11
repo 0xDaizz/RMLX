@@ -5579,7 +5579,7 @@ pub fn affine_quantized_matmul_batched(
         // 2. BatchQMV (M <= qmv_limit, K%512==0): fastest at low M
         // 3. Skinny (M <= 32): split-K for best low-M utilization
         // 4. Standard MMA: fallback (rarely reached)
-        const MMA_MIN_M: usize = 128;
+        const MMA_MIN_M: usize = 64;
 
         if m >= MMA_MIN_M {
             // NAX handles all K alignments via align_K function constant.
@@ -6033,7 +6033,7 @@ pub fn affine_quantized_matmul_batched_into_cb(
     // 4. Skinny MMA: M <= 32
     // 5. Standard MMA: fallback (rarely reached)
 
-    const MMA_MIN_M: usize = 128;
+    const MMA_MIN_M: usize = 64;
 
     if m >= MMA_MIN_M {
         if k % 64 == 0 {
