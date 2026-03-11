@@ -69,3 +69,7 @@ harness = false
 [[bench]]
 name = "dual_queue_bench"
 harness = false
+
+[[bench]]
+name = "qmm_dispatch_bench"
+harness = false

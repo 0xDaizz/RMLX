@@ -54,17 +54,17 @@ const VALID_GROUP_SIZES: &[u32] = &[32, 64, 128];
 ///
 /// Stores three separate Metal buffers rather than interleaved blocks:
 /// - `weights_buf`: packed uint32 data. Each uint32 holds `32 / bits` quantized values.
-/// - `scales_buf`: one float32 per group (per-group scale factor).
-/// - `biases_buf`: one float32 per group (per-group bias / zero-point).
+/// - `scales_buf`: one float16 per group (per-group scale factor).
+/// - `biases_buf`: one float16 per group (per-group bias / zero-point).
 ///
 /// Dequantization: `w_i = scale_g * q_i + bias_g`
 /// where `g = i / group_size`.
 pub struct QuantizedWeight {
     /// Packed uint32 weight data.
     pub weights_buf: MTLBuffer,
-    /// Per-group scale factors (float32).
+    /// Per-group scale factors (float16).
     pub scales_buf: MTLBuffer,
-    /// Per-group bias terms (float32).
+    /// Per-group bias terms (float16).
     pub biases_buf: MTLBuffer,
     /// Number of elements per quantization group (32, 64, or 128).
     pub group_size: u32,
@@ -116,7 +116,7 @@ impl QuantizedWeight {
         }
 
         let num_groups = total_elements / (group_size as usize);
-        let expected_scales_bytes = num_groups * 4; // float32
+        let expected_scales_bytes = num_groups * 2; // float16
         if (scales_buf.length() as usize) < expected_scales_bytes {
             return Err(KernelError::InvalidShape(format!(
                 "scales_buf too small: {} bytes < expected {} bytes ({num_groups} groups)",
@@ -193,8 +193,8 @@ inline uint extract_bits(uint word, uint idx_in_word, uint bits) {
 
 kernel void affine_qmv(
     device const uint32_t* weights  [[buffer(0)]],
-    device const float*    scales   [[buffer(1)]],
-    device const float*    biases   [[buffer(2)]],
+    device const half*    scales   [[buffer(1)]],
+    device const half*    biases   [[buffer(2)]],
     device const float*    vec      [[buffer(3)]],
     device float*          output   [[buffer(4)]],
     constant uint4&        params   [[buffer(5)]],
@@ -225,8 +225,8 @@ kernel void affine_qmv(
 
     // Pointers for this row
     device const uint32_t* row_weights = weights + row * u32s_per_row;
-    device const float*    row_scales  = scales  + row * groups_per_row;
-    device const float*    row_biases  = biases  + row * groups_per_row;
+    device const half*    row_scales  = scales  + row * groups_per_row;
+    device const half*    row_biases  = biases  + row * groups_per_row;
 
     for (uint g = tid; g < groups_per_row; g += tg_size) {
         float scale = row_scales[g];
@@ -285,8 +285,8 @@ kernel void affine_qmv(
 // -----------------------------------------------------------------------
 kernel void affine_qmv_q4(
     device const uint16_t* weights  [[buffer(0)]],
-    device const float*    scales   [[buffer(1)]],
-    device const float*    biases   [[buffer(2)]],
+    device const half*    scales   [[buffer(1)]],
+    device const half*    biases   [[buffer(2)]],
     device const float*    vec      [[buffer(3)]],
     device float*          output   [[buffer(4)]],
     constant uint4&        params   [[buffer(5)]],
@@ -313,8 +313,8 @@ kernel void affine_qmv_q4(
     float accum = 0.0f;
 
     device const uint16_t* row_weights = weights + row * words_per_row;
-    device const float*    row_scales  = scales  + row * groups_per_row;
-    device const float*    row_biases  = biases  + row * groups_per_row;
+    device const half*    row_scales  = scales  + row * groups_per_row;
+    device const half*    row_biases  = biases  + row * groups_per_row;
 
     for (uint g = tid; g < groups_per_row; g += tg_size) {
         float scale = row_scales[g];
@@ -390,8 +390,8 @@ constant constexpr int QMV_Q4_BLOCK_SIZE = QMV_Q4_VALUES_PER_THREAD * 32; // 512
 
 kernel void affine_qmv_fast_q4(
     device const uint32_t* weights  [[buffer(0)]],
-    device const float*    scales   [[buffer(1)]],
-    device const float*    biases   [[buffer(2)]],
+    device const half*    scales   [[buffer(1)]],
+    device const half*    biases   [[buffer(2)]],
     device const float*    vec      [[buffer(3)]],
     device float*          output   [[buffer(4)]],
     constant uint4&        params   [[buffer(5)]],
@@ -418,19 +418,21 @@ kernel void affine_qmv_fast_q4(
     device const uint8_t* ws = (device const uint8_t*)(weights)
         + out_row * in_vec_size_w * 4      // row offset in bytes
         + simd_lid * QMV_Q4_PACKS_PER_THREAD * 4;  // thread offset in bytes
-    device const float* sl = scales + out_row * in_vec_size_g
+    device const half* sl = scales + out_row * in_vec_size_g
         + simd_lid / scale_step;
-    device const float* bl = biases + out_row * in_vec_size_g
+    device const half* bl = biases + out_row * in_vec_size_g
         + simd_lid / scale_step;
     device const float* x  = vec + simd_lid * QMV_Q4_VALUES_PER_THREAD;
 
     float result[QMV_Q4_RESULTS_PER_SG] = {0, 0, 0, 0};
 
+    // Hoist x_thread outside K-loop for register reuse.
+    float x_thread[QMV_Q4_VALUES_PER_THREAD];
+    float xsum;
+
     for (int k = 0; k < in_features; k += QMV_Q4_BLOCK_SIZE) {
-        // --- load_vector: pre-divide x for Q4 qdot ---
-        // For Q4, groups of 4 values: x[0], x[1]/16, x[2]/256, x[3]/4096
-        float x_thread[QMV_Q4_VALUES_PER_THREAD];
-        float xsum = 0.0f;
+        // --- load_vector: raw x values (no pre-division) ---
+        xsum = 0.0f;
 
         for (int i = 0; i < QMV_Q4_VALUES_PER_THREAD; i += 4) {
             float v0 = x[i];
@@ -439,29 +441,37 @@ kernel void affine_qmv_fast_q4(
             float v3 = x[i + 3];
             xsum += v0 + v1 + v2 + v3;
             x_thread[i]     = v0;
-            x_thread[i + 1] = v1 / 16.0f;
-            x_thread[i + 2] = v2 / 256.0f;
-            x_thread[i + 3] = v3 / 4096.0f;
+            x_thread[i + 1] = v1;
+            x_thread[i + 2] = v2;
+            x_thread[i + 3] = v3;
         }
 
-        // --- qdot for each output row ---
+        // --- qdot: uint32 loads + shift extraction, fully unrolled ---
         for (int row = 0; row < QMV_Q4_RESULTS_PER_SG; row++) {
-            device const uint8_t* wl = ws + row * in_vec_size_w * 4;
+            device const uint32_t* wp = (device const uint32_t*)(ws + row * in_vec_size_w * 4);
             float s = sl[row * in_vec_size_g];
             float b = bl[row * in_vec_size_g];
 
-            if (row + out_row < out_features) {
-                // qdot Q4: cast to uint16_t*, mask-only multiplication
-                device const uint16_t* wp = (device const uint16_t*)wl;
-                float accum = 0.0f;
-                for (int i = 0; i < QMV_Q4_VALUES_PER_THREAD / 4; i++) {
-                    accum += x_thread[4 * i]     * float(wp[i] & 0x000fu)
-                           + x_thread[4 * i + 1] * float(wp[i] & 0x00f0u)
-                           + x_thread[4 * i + 2] * float(wp[i] & 0x0f00u)
-                           + x_thread[4 * i + 3] * float(wp[i] & 0xf000u);
-                }
-                result[row] += s * accum + xsum * b;
-            }
+            uint w0 = wp[0];
+            uint w1 = wp[1];
+            float accum =
+                x_thread[0]  * float( w0        & 0xfu)
+              + x_thread[1]  * float((w0 >>  4) & 0xfu)
+              + x_thread[2]  * float((w0 >>  8) & 0xfu)
+              + x_thread[3]  * float((w0 >> 12) & 0xfu)
+              + x_thread[4]  * float((w0 >> 16) & 0xfu)
+              + x_thread[5]  * float((w0 >> 20) & 0xfu)
+              + x_thread[6]  * float((w0 >> 24) & 0xfu)
+              + x_thread[7]  * float( w0 >> 28)
+              + x_thread[8]  * float( w1        & 0xfu)
+              + x_thread[9]  * float((w1 >>  4) & 0xfu)
+              + x_thread[10] * float((w1 >>  8) & 0xfu)
+              + x_thread[11] * float((w1 >> 12) & 0xfu)
+              + x_thread[12] * float((w1 >> 16) & 0xfu)
+              + x_thread[13] * float((w1 >> 20) & 0xfu)
+              + x_thread[14] * float((w1 >> 24) & 0xfu)
+              + x_thread[15] * float( w1 >> 28);
+            result[row] += s * accum + xsum * b;
         }
 
         // Advance pointers by block_size
@@ -494,8 +504,8 @@ kernel void affine_qmv_fast_q4(
 
 kernel void affine_qmv_batched_q4(
     device const uint32_t* weights  [[buffer(0)]],
-    device const float*    scales   [[buffer(1)]],
-    device const float*    biases   [[buffer(2)]],
+    device const half*    scales   [[buffer(1)]],
+    device const half*    biases   [[buffer(2)]],
     device const float*    x_in     [[buffer(3)]],
     device float*          output   [[buffer(4)]],
     constant uint4&        params   [[buffer(5)]],
@@ -525,19 +535,22 @@ kernel void affine_qmv_batched_q4(
     device const uint8_t* ws = (device const uint8_t*)(weights)
         + out_row * in_vec_size_w * 4      // row offset in bytes
         + simd_lid * QMV_Q4_PACKS_PER_THREAD * 4;  // thread offset in bytes
-    device const float* sl = scales + out_row * in_vec_size_g
+    device const half* sl = scales + out_row * in_vec_size_g
         + simd_lid / scale_step;
-    device const float* bl = biases + out_row * in_vec_size_g
+    device const half* bl = biases + out_row * in_vec_size_g
         + simd_lid / scale_step;
     // Select row m from the input matrix
     device const float* x = x_in + m_idx * in_features + simd_lid * QMV_Q4_VALUES_PER_THREAD;
 
     float result[QMV_Q4_RESULTS_PER_SG] = {0, 0, 0, 0};
 
+    // Hoist x_thread outside K-loop for register reuse.
+    float x_thread[QMV_Q4_VALUES_PER_THREAD];
+    float xsum;
+
     for (int k = 0; k < in_features; k += QMV_Q4_BLOCK_SIZE) {
-        // --- load_vector: pre-divide x for Q4 qdot ---
-        float x_thread[QMV_Q4_VALUES_PER_THREAD];
-        float xsum = 0.0f;
+        // --- load_vector: raw x values (no pre-division) ---
+        xsum = 0.0f;
 
         for (int i = 0; i < QMV_Q4_VALUES_PER_THREAD; i += 4) {
             float v0 = x[i];
@@ -546,28 +559,37 @@ kernel void affine_qmv_batched_q4(
             float v3 = x[i + 3];
             xsum += v0 + v1 + v2 + v3;
             x_thread[i]     = v0;
-            x_thread[i + 1] = v1 / 16.0f;
-            x_thread[i + 2] = v2 / 256.0f;
-            x_thread[i + 3] = v3 / 4096.0f;
+            x_thread[i + 1] = v1;
+            x_thread[i + 2] = v2;
+            x_thread[i + 3] = v3;
         }
 
-        // --- qdot for each output row ---
+        // --- qdot: uint32 loads + shift extraction, fully unrolled ---
         for (int row = 0; row < QMV_Q4_RESULTS_PER_SG; row++) {
-            device const uint8_t* wl = ws + row * in_vec_size_w * 4;
+            device const uint32_t* wp = (device const uint32_t*)(ws + row * in_vec_size_w * 4);
             float s = sl[row * in_vec_size_g];
             float b = bl[row * in_vec_size_g];
 
-            if (row + out_row < out_features) {
-                device const uint16_t* wp = (device const uint16_t*)wl;
-                float accum = 0.0f;
-                for (int i = 0; i < QMV_Q4_VALUES_PER_THREAD / 4; i++) {
-                    accum += x_thread[4 * i]     * float(wp[i] & 0x000fu)
-                           + x_thread[4 * i + 1] * float(wp[i] & 0x00f0u)
-                           + x_thread[4 * i + 2] * float(wp[i] & 0x0f00u)
-                           + x_thread[4 * i + 3] * float(wp[i] & 0xf000u);
-                }
-                result[row] += s * accum + xsum * b;
-            }
+            uint w0 = wp[0];
+            uint w1 = wp[1];
+            float accum =
+                x_thread[0]  * float( w0        & 0xfu)
+              + x_thread[1]  * float((w0 >>  4) & 0xfu)
+              + x_thread[2]  * float((w0 >>  8) & 0xfu)
+              + x_thread[3]  * float((w0 >> 12) & 0xfu)
+              + x_thread[4]  * float((w0 >> 16) & 0xfu)
+              + x_thread[5]  * float((w0 >> 20) & 0xfu)
+              + x_thread[6]  * float((w0 >> 24) & 0xfu)
+              + x_thread[7]  * float( w0 >> 28)
+              + x_thread[8]  * float( w1        & 0xfu)
+              + x_thread[9]  * float((w1 >>  4) & 0xfu)
+              + x_thread[10] * float((w1 >>  8) & 0xfu)
+              + x_thread[11] * float((w1 >> 12) & 0xfu)
+              + x_thread[12] * float((w1 >> 16) & 0xfu)
+              + x_thread[13] * float((w1 >> 20) & 0xfu)
+              + x_thread[14] * float((w1 >> 24) & 0xfu)
+              + x_thread[15] * float( w1 >> 28);
+            result[row] += s * accum + xsum * b;
         }
 
         // Advance pointers by block_size
@@ -605,8 +627,8 @@ constant constexpr int QMV_Q8_BLOCK_SIZE = QMV_Q8_VALUES_PER_THREAD * 32; // 256
 
 kernel void affine_qmv_fast_q8(
     device const uint8_t*  weights  [[buffer(0)]],
-    device const float*    scales   [[buffer(1)]],
-    device const float*    biases   [[buffer(2)]],
+    device const half*    scales   [[buffer(1)]],
+    device const half*    biases   [[buffer(2)]],
     device const float*    vec      [[buffer(3)]],
     device float*          output   [[buffer(4)]],
     constant uint4&        params   [[buffer(5)]],
@@ -631,9 +653,9 @@ kernel void affine_qmv_fast_q8(
     device const uint8_t* ws = weights
         + out_row * in_vec_size_w
         + simd_lid * QMV_Q8_PACKS_PER_THREAD * 4;  // 4 bytes per pack (uint32)
-    device const float* sl = scales + out_row * in_vec_size_g
+    device const half* sl = scales + out_row * in_vec_size_g
         + simd_lid / scale_step;
-    device const float* bl = biases + out_row * in_vec_size_g
+    device const half* bl = biases + out_row * in_vec_size_g
         + simd_lid / scale_step;
     device const float* x  = vec + simd_lid * QMV_Q8_VALUES_PER_THREAD;
 
@@ -773,12 +795,18 @@ kernel void gptq_dequant_f32(
 //
 // Same qdot pattern as affine_qmv_fast_q4 but with half* input/output.
 // Uses half4 vectorized loads.  Accumulation stays in float for precision.
+//
+// Optimizations vs baseline:
+//   1. Bounds check removed from inner K-loop (fast path assumes N%8==0)
+//   2. x_thread / xsum hoisted outside K-loop for register reuse
+//   3. qdot uses uint32 loads + shift extraction (2 loads vs 4 uint16 loads)
+//      with full unroll — no pre-division trick needed
 // -----------------------------------------------------------------------
 
 kernel void affine_qmv_fast_f16_q4(
     device const uint32_t* weights  [[buffer(0)]],
-    device const float*    scales   [[buffer(1)]],
-    device const float*    biases   [[buffer(2)]],
+    device const half*    scales   [[buffer(1)]],
+    device const half*    biases   [[buffer(2)]],
     device const half*     vec      [[buffer(3)]],
     device half*           output   [[buffer(4)]],
     constant uint4&        params   [[buffer(5)]],
@@ -802,17 +830,21 @@ kernel void affine_qmv_fast_f16_q4(
     device const uint8_t* ws = (device const uint8_t*)(weights)
         + out_row * in_vec_size_w * 4
         + simd_lid * QMV_Q4_PACKS_PER_THREAD * 4;
-    device const float* sl = scales + out_row * in_vec_size_g
+    device const half* sl = scales + out_row * in_vec_size_g
         + simd_lid / scale_step;
-    device const float* bl = biases + out_row * in_vec_size_g
+    device const half* bl = biases + out_row * in_vec_size_g
         + simd_lid / scale_step;
     device const half* x = vec + simd_lid * QMV_Q4_VALUES_PER_THREAD;
 
     float result[QMV_Q4_RESULTS_PER_SG] = {0, 0, 0, 0};
 
+    // Hoist x_thread outside K-loop for register reuse.
+    float x_thread[QMV_Q4_VALUES_PER_THREAD];
+    float xsum;
+
     for (int k = 0; k < in_features; k += QMV_Q4_BLOCK_SIZE) {
-        float x_thread[QMV_Q4_VALUES_PER_THREAD];
-        float xsum = 0.0f;
+        // --- load_vector: half4 vectorized load, raw values (no pre-division) ---
+        xsum = 0.0f;
 
         for (int i = 0; i < QMV_Q4_VALUES_PER_THREAD; i += 4) {
             half4 xh = *(device const half4*)(x + i);
@@ -822,27 +854,39 @@ kernel void affine_qmv_fast_f16_q4(
             float v3 = float(xh.w);
             xsum += v0 + v1 + v2 + v3;
             x_thread[i]     = v0;
-            x_thread[i + 1] = v1 / 16.0f;
-            x_thread[i + 2] = v2 / 256.0f;
-            x_thread[i + 3] = v3 / 4096.0f;
+            x_thread[i + 1] = v1;
+            x_thread[i + 2] = v2;
+            x_thread[i + 3] = v3;
         }
 
+        // --- qdot for each output row (no bounds check — fast path) ---
+        // Each thread holds 2 packed uint32 = 16 nibbles = 16 Q4 values.
+        // Load as 2x uint32, extract nibbles via shift+mask, fully unrolled.
         for (int row = 0; row < QMV_Q4_RESULTS_PER_SG; row++) {
-            device const uint8_t* wl = ws + row * in_vec_size_w * 4;
+            device const uint32_t* wp = (device const uint32_t*)(ws + row * in_vec_size_w * 4);
             float s = sl[row * in_vec_size_g];
             float b = bl[row * in_vec_size_g];
 
-            if (row + out_row < out_features) {
-                device const uint16_t* wp = (device const uint16_t*)wl;
-                float accum = 0.0f;
-                for (int i = 0; i < QMV_Q4_VALUES_PER_THREAD / 4; i++) {
-                    accum += x_thread[4 * i]     * float(wp[i] & 0x000fu)
-                           + x_thread[4 * i + 1] * float(wp[i] & 0x00f0u)
-                           + x_thread[4 * i + 2] * float(wp[i] & 0x0f00u)
-                           + x_thread[4 * i + 3] * float(wp[i] & 0xf000u);
-                }
-                result[row] += s * accum + xsum * b;
-            }
+            uint w0 = wp[0];
+            uint w1 = wp[1];
+            float accum =
+                x_thread[0]  * float( w0        & 0xfu)
+              + x_thread[1]  * float((w0 >>  4) & 0xfu)
+              + x_thread[2]  * float((w0 >>  8) & 0xfu)
+              + x_thread[3]  * float((w0 >> 12) & 0xfu)
+              + x_thread[4]  * float((w0 >> 16) & 0xfu)
+              + x_thread[5]  * float((w0 >> 20) & 0xfu)
+              + x_thread[6]  * float((w0 >> 24) & 0xfu)
+              + x_thread[7]  * float( w0 >> 28)
+              + x_thread[8]  * float( w1        & 0xfu)
+              + x_thread[9]  * float((w1 >>  4) & 0xfu)
+              + x_thread[10] * float((w1 >>  8) & 0xfu)
+              + x_thread[11] * float((w1 >> 12) & 0xfu)
+              + x_thread[12] * float((w1 >> 16) & 0xfu)
+              + x_thread[13] * float((w1 >> 20) & 0xfu)
+              + x_thread[14] * float((w1 >> 24) & 0xfu)
+              + x_thread[15] * float( w1 >> 28);
+            result[row] += s * accum + xsum * b;
         }
 
         ws += QMV_Q4_BLOCK_SIZE / QMV_Q4_PACK_FACTOR * 4;
@@ -868,8 +912,8 @@ kernel void affine_qmv_fast_f16_q4(
 
 kernel void affine_qmv_batched_f16_q4(
     device const uint32_t* weights  [[buffer(0)]],
-    device const float*    scales   [[buffer(1)]],
-    device const float*    biases   [[buffer(2)]],
+    device const half*    scales   [[buffer(1)]],
+    device const half*    biases   [[buffer(2)]],
     device const half*     x_in     [[buffer(3)]],
     device half*           output   [[buffer(4)]],
     constant uint4&        params   [[buffer(5)]],
@@ -897,17 +941,20 @@ kernel void affine_qmv_batched_f16_q4(
     device const uint8_t* ws = (device const uint8_t*)(weights)
         + out_row * in_vec_size_w * 4
         + simd_lid * QMV_Q4_PACKS_PER_THREAD * 4;
-    device const float* sl = scales + out_row * in_vec_size_g
+    device const half* sl = scales + out_row * in_vec_size_g
         + simd_lid / scale_step;
-    device const float* bl = biases + out_row * in_vec_size_g
+    device const half* bl = biases + out_row * in_vec_size_g
         + simd_lid / scale_step;
     device const half* x = x_in + m_idx * in_features + simd_lid * QMV_Q4_VALUES_PER_THREAD;
 
     float result[QMV_Q4_RESULTS_PER_SG] = {0, 0, 0, 0};
 
+    // Hoist x_thread outside K-loop for register reuse.
+    float x_thread[QMV_Q4_VALUES_PER_THREAD];
+    float xsum;
+
     for (int k = 0; k < in_features; k += QMV_Q4_BLOCK_SIZE) {
-        float x_thread[QMV_Q4_VALUES_PER_THREAD];
-        float xsum = 0.0f;
+        xsum = 0.0f;
 
         for (int i = 0; i < QMV_Q4_VALUES_PER_THREAD; i += 4) {
             half4 xh = *(device const half4*)(x + i);
@@ -917,27 +964,36 @@ kernel void affine_qmv_batched_f16_q4(
             float v3 = float(xh.w);
             xsum += v0 + v1 + v2 + v3;
             x_thread[i]     = v0;
-            x_thread[i + 1] = v1 / 16.0f;
-            x_thread[i + 2] = v2 / 256.0f;
-            x_thread[i + 3] = v3 / 4096.0f;
+            x_thread[i + 1] = v1;
+            x_thread[i + 2] = v2;
+            x_thread[i + 3] = v3;
         }
 
         for (int row = 0; row < QMV_Q4_RESULTS_PER_SG; row++) {
-            device const uint8_t* wl = ws + row * in_vec_size_w * 4;
+            device const uint32_t* wp = (device const uint32_t*)(ws + row * in_vec_size_w * 4);
             float s = sl[row * in_vec_size_g];
             float b = bl[row * in_vec_size_g];
 
-            if (row + out_row < out_features) {
-                device const uint16_t* wp = (device const uint16_t*)wl;
-                float accum = 0.0f;
-                for (int i = 0; i < QMV_Q4_VALUES_PER_THREAD / 4; i++) {
-                    accum += x_thread[4 * i]     * float(wp[i] & 0x000fu)
-                           + x_thread[4 * i + 1] * float(wp[i] & 0x00f0u)
-                           + x_thread[4 * i + 2] * float(wp[i] & 0x0f00u)
-                           + x_thread[4 * i + 3] * float(wp[i] & 0xf000u);
-                }
-                result[row] += s * accum + xsum * b;
-            }
+            uint w0 = wp[0];
+            uint w1 = wp[1];
+            float accum =
+                x_thread[0]  * float( w0        & 0xfu)
+              + x_thread[1]  * float((w0 >>  4) & 0xfu)
+              + x_thread[2]  * float((w0 >>  8) & 0xfu)
+              + x_thread[3]  * float((w0 >> 12) & 0xfu)
+              + x_thread[4]  * float((w0 >> 16) & 0xfu)
+              + x_thread[5]  * float((w0 >> 20) & 0xfu)
+              + x_thread[6]  * float((w0 >> 24) & 0xfu)
+              + x_thread[7]  * float( w0 >> 28)
+              + x_thread[8]  * float( w1        & 0xfu)
+              + x_thread[9]  * float((w1 >>  4) & 0xfu)
+              + x_thread[10] * float((w1 >>  8) & 0xfu)
+              + x_thread[11] * float((w1 >> 12) & 0xfu)
+              + x_thread[12] * float((w1 >> 16) & 0xfu)
+              + x_thread[13] * float((w1 >> 20) & 0xfu)
+              + x_thread[14] * float((w1 >> 24) & 0xfu)
+              + x_thread[15] * float( w1 >> 28);
+            result[row] += s * accum + xsum * b;
         }
 
         ws += QMV_Q4_BLOCK_SIZE / QMV_Q4_PACK_FACTOR * 4;
@@ -967,8 +1023,8 @@ kernel void affine_qmv_batched_f16_q4(
 
 kernel void affine_qmv_batched_splitk_f16_q4(
     device const uint32_t* weights  [[buffer(0)]],
-    device const float*    scales   [[buffer(1)]],
-    device const float*    biases   [[buffer(2)]],
+    device const half*    scales   [[buffer(1)]],
+    device const half*    biases   [[buffer(2)]],
     device const half*     x_in     [[buffer(3)]],
     device float*          c_split  [[buffer(4)]],
     constant uint4&        params   [[buffer(5)]],
@@ -1011,19 +1067,22 @@ kernel void affine_qmv_batched_splitk_f16_q4(
         + out_row * in_vec_size_w * 4
         + k_start_packs * 4
         + simd_lid * QMV_Q4_PACKS_PER_THREAD * 4;
-    device const float* sl = scales + out_row * in_vec_size_g
+    device const half* sl = scales + out_row * in_vec_size_g
         + k_start_groups
         + simd_lid / scale_step;
-    device const float* bl = biases + out_row * in_vec_size_g
+    device const half* bl = biases + out_row * in_vec_size_g
         + k_start_groups
         + simd_lid / scale_step;
     device const half* x = x_in + m_idx * in_features + k_start + simd_lid * QMV_Q4_VALUES_PER_THREAD;
 
     float result[QMV_Q4_RESULTS_PER_SG] = {0, 0, 0, 0};
 
+    // Hoist x_thread outside K-loop for register reuse.
+    float x_thread[QMV_Q4_VALUES_PER_THREAD];
+    float xsum;
+
     for (int k = k_start; k < k_end; k += QMV_Q4_BLOCK_SIZE) {
-        float x_thread[QMV_Q4_VALUES_PER_THREAD];
-        float xsum = 0.0f;
+        xsum = 0.0f;
 
         for (int i = 0; i < QMV_Q4_VALUES_PER_THREAD; i += 4) {
             half4 xh = *(device const half4*)(x + i);
@@ -1033,27 +1092,36 @@ kernel void affine_qmv_batched_splitk_f16_q4(
             float v3 = float(xh.w);
             xsum += v0 + v1 + v2 + v3;
             x_thread[i]     = v0;
-            x_thread[i + 1] = v1 / 16.0f;
-            x_thread[i + 2] = v2 / 256.0f;
-            x_thread[i + 3] = v3 / 4096.0f;
+            x_thread[i + 1] = v1;
+            x_thread[i + 2] = v2;
+            x_thread[i + 3] = v3;
         }
 
         for (int row = 0; row < QMV_Q4_RESULTS_PER_SG; row++) {
-            device const uint8_t* wl = ws + row * in_vec_size_w * 4;
+            device const uint32_t* wp = (device const uint32_t*)(ws + row * in_vec_size_w * 4);
             float s = sl[row * in_vec_size_g];
             float b = bl[row * in_vec_size_g];
 
-            if (row + out_row < out_features) {
-                device const uint16_t* wp = (device const uint16_t*)wl;
-                float accum = 0.0f;
-                for (int i = 0; i < QMV_Q4_VALUES_PER_THREAD / 4; i++) {
-                    accum += x_thread[4 * i]     * float(wp[i] & 0x000fu)
-                           + x_thread[4 * i + 1] * float(wp[i] & 0x00f0u)
-                           + x_thread[4 * i + 2] * float(wp[i] & 0x0f00u)
-                           + x_thread[4 * i + 3] * float(wp[i] & 0xf000u);
-                }
-                result[row] += s * accum + xsum * b;
-            }
+            uint w0 = wp[0];
+            uint w1 = wp[1];
+            float accum =
+                x_thread[0]  * float( w0        & 0xfu)
+              + x_thread[1]  * float((w0 >>  4) & 0xfu)
+              + x_thread[2]  * float((w0 >>  8) & 0xfu)
+              + x_thread[3]  * float((w0 >> 12) & 0xfu)
+              + x_thread[4]  * float((w0 >> 16) & 0xfu)
+              + x_thread[5]  * float((w0 >> 20) & 0xfu)
+              + x_thread[6]  * float((w0 >> 24) & 0xfu)
+              + x_thread[7]  * float( w0 >> 28)
+              + x_thread[8]  * float( w1        & 0xfu)
+              + x_thread[9]  * float((w1 >>  4) & 0xfu)
+              + x_thread[10] * float((w1 >>  8) & 0xfu)
+              + x_thread[11] * float((w1 >> 12) & 0xfu)
+              + x_thread[12] * float((w1 >> 16) & 0xfu)
+              + x_thread[13] * float((w1 >> 20) & 0xfu)
+              + x_thread[14] * float((w1 >> 24) & 0xfu)
+              + x_thread[15] * float( w1 >> 28);
+            result[row] += s * accum + xsum * b;
         }
 
         ws += QMV_Q4_BLOCK_SIZE / QMV_Q4_PACK_FACTOR * 4;
@@ -1084,8 +1152,8 @@ kernel void affine_qmv_batched_splitk_f16_q4(
 
 kernel void affine_qmv_splitk_f16_q4(
     device const uint32_t* weights  [[buffer(0)]],
-    device const float*    scales   [[buffer(1)]],
-    device const float*    biases   [[buffer(2)]],
+    device const half*    scales   [[buffer(1)]],
+    device const half*    biases   [[buffer(2)]],
     device const half*     vec      [[buffer(3)]],
     device float*          c_split  [[buffer(4)]],
     constant uint4&        params   [[buffer(5)]],
@@ -1124,19 +1192,22 @@ kernel void affine_qmv_splitk_f16_q4(
         + out_row * in_vec_size_w * 4
         + k_start_packs * 4
         + simd_lid * QMV_Q4_PACKS_PER_THREAD * 4;
-    device const float* sl = scales + out_row * in_vec_size_g
+    device const half* sl = scales + out_row * in_vec_size_g
         + k_start_groups
         + simd_lid / scale_step;
-    device const float* bl = biases + out_row * in_vec_size_g
+    device const half* bl = biases + out_row * in_vec_size_g
         + k_start_groups
         + simd_lid / scale_step;
     device const half* x = vec + k_start + simd_lid * QMV_Q4_VALUES_PER_THREAD;
 
     float result[QMV_Q4_RESULTS_PER_SG] = {0, 0, 0, 0};
 
+    // Hoist x_thread outside K-loop for register reuse.
+    float x_thread[QMV_Q4_VALUES_PER_THREAD];
+    float xsum;
+
     for (int k = k_start; k < k_end; k += QMV_Q4_BLOCK_SIZE) {
-        float x_thread[QMV_Q4_VALUES_PER_THREAD];
-        float xsum = 0.0f;
+        xsum = 0.0f;
 
         for (int i = 0; i < QMV_Q4_VALUES_PER_THREAD; i += 4) {
             half4 xh = *(device const half4*)(x + i);
@@ -1146,27 +1217,36 @@ kernel void affine_qmv_splitk_f16_q4(
             float v3 = float(xh.w);
             xsum += v0 + v1 + v2 + v3;
             x_thread[i]     = v0;
-            x_thread[i + 1] = v1 / 16.0f;
-            x_thread[i + 2] = v2 / 256.0f;
-            x_thread[i + 3] = v3 / 4096.0f;
+            x_thread[i + 1] = v1;
+            x_thread[i + 2] = v2;
+            x_thread[i + 3] = v3;
         }
 
         for (int row = 0; row < QMV_Q4_RESULTS_PER_SG; row++) {
-            device const uint8_t* wl = ws + row * in_vec_size_w * 4;
+            device const uint32_t* wp = (device const uint32_t*)(ws + row * in_vec_size_w * 4);
             float s = sl[row * in_vec_size_g];
             float b = bl[row * in_vec_size_g];
 
-            if (row + out_row < out_features) {
-                device const uint16_t* wp = (device const uint16_t*)wl;
-                float accum = 0.0f;
-                for (int i = 0; i < QMV_Q4_VALUES_PER_THREAD / 4; i++) {
-                    accum += x_thread[4 * i]     * float(wp[i] & 0x000fu)
-                           + x_thread[4 * i + 1] * float(wp[i] & 0x00f0u)
-                           + x_thread[4 * i + 2] * float(wp[i] & 0x0f00u)
-                           + x_thread[4 * i + 3] * float(wp[i] & 0xf000u);
-                }
-                result[row] += s * accum + xsum * b;
-            }
+            uint w0 = wp[0];
+            uint w1 = wp[1];
+            float accum =
+                x_thread[0]  * float( w0        & 0xfu)
+              + x_thread[1]  * float((w0 >>  4) & 0xfu)
+              + x_thread[2]  * float((w0 >>  8) & 0xfu)
+              + x_thread[3]  * float((w0 >> 12) & 0xfu)
+              + x_thread[4]  * float((w0 >> 16) & 0xfu)
+              + x_thread[5]  * float((w0 >> 20) & 0xfu)
+              + x_thread[6]  * float((w0 >> 24) & 0xfu)
+              + x_thread[7]  * float( w0 >> 28)
+              + x_thread[8]  * float( w1        & 0xfu)
+              + x_thread[9]  * float((w1 >>  4) & 0xfu)
+              + x_thread[10] * float((w1 >>  8) & 0xfu)
+              + x_thread[11] * float((w1 >> 12) & 0xfu)
+              + x_thread[12] * float((w1 >> 16) & 0xfu)
+              + x_thread[13] * float((w1 >> 20) & 0xfu)
+              + x_thread[14] * float((w1 >> 24) & 0xfu)
+              + x_thread[15] * float( w1 >> 28);
+            result[row] += s * accum + xsum * b;
         }
 
         ws += QMV_Q4_BLOCK_SIZE / QMV_Q4_PACK_FACTOR * 4;
@@ -1313,6 +1393,15 @@ pub fn affine_quantized_matmul(
         (v, DType::Float32)
     };
 
+    // Q4 f16 fast path assumes out_features is 8-aligned (no bounds check in kernel)
+    if use_f16_native {
+        assert!(
+            qw.out_features % 8 == 0,
+            "QMV fast path requires out_features divisible by 8, got {}",
+            qw.out_features
+        );
+    }
+
     let kernel_name = if use_f16_native {
         "affine_qmv_fast_f16_q4"
     } else {
@@ -1434,6 +1523,12 @@ pub fn affine_qmv_batched_q4(
             "affine_qmv_batched_q4: in_features ({k}) must be a multiple of {QMV_Q4_BLOCK_SIZE}"
         )));
     }
+    // Fast QMV path assumes out_features is 8-aligned (no bounds check in kernel)
+    assert!(
+        qw.out_features % 8 == 0,
+        "QMV fast path requires out_features divisible by 8, got {}",
+        qw.out_features
+    );
 
     let n = qw.out_features;
     let pipeline = registry.get_pipeline("affine_qmv_batched_q4", DType::Float32)?;
@@ -1556,6 +1651,12 @@ pub fn affine_qmv_fast_f16_q4(
             "affine_qmv_fast_f16_q4: in_features ({k}) must be a multiple of {QMV_Q4_BLOCK_SIZE}"
         )));
     }
+    // Fast QMV path assumes out_features is 8-aligned (no bounds check in kernel)
+    assert!(
+        qw.out_features % 8 == 0,
+        "QMV fast path requires out_features divisible by 8, got {}",
+        qw.out_features
+    );
 
     let pipeline = registry.get_pipeline("affine_qmv_fast_f16_q4", DType::Float16)?;
     let out = Array::zeros(registry.device().raw(), &[qw.out_features], DType::Float16);
@@ -1656,6 +1757,12 @@ pub fn affine_qmv_batched_f16_q4(
             "affine_qmv_batched_f16_q4: in_features ({k}) must be a multiple of {QMV_Q4_BLOCK_SIZE}"
         )));
     }
+    // Fast QMV path assumes out_features is 8-aligned (no bounds check in kernel)
+    assert!(
+        qw.out_features % 8 == 0,
+        "QMV fast path requires out_features divisible by 8, got {}",
+        qw.out_features
+    );
 
     let n = qw.out_features;
     let pipeline = registry.get_pipeline("affine_qmv_batched_f16_q4", DType::Float16)?;
@@ -1765,6 +1872,12 @@ pub fn affine_qmv_batched_splitk_f16_q4(
             "affine_qmv_batched_splitk_f16_q4: in_features ({k}) must be a multiple of {QMV_Q4_BLOCK_SIZE}"
         )));
     }
+    // Fast QMV path assumes out_features is 8-aligned (no bounds check in kernel)
+    assert!(
+        qw.out_features % 8 == 0,
+        "QMV fast path requires out_features divisible by 8, got {}",
+        qw.out_features
+    );
 
     let n = qw.out_features;
     let dev = registry.device().raw();
@@ -2699,8 +2812,8 @@ using namespace metal;
 // Buffers:
 //   buffer(0) x         - float32 input activations [M, K], row-major
 //   buffer(1) w_packed  - uint8 packed Q4 weights [N, K/2], row-major
-//   buffer(2) scales    - float32 per-group scales [N, groups_per_row]
-//   buffer(3) biases    - float32 per-group biases [N, groups_per_row]
+//   buffer(2) scales    - float16 per-group scales [N, groups_per_row]
+//   buffer(3) biases    - float16 per-group biases [N, groups_per_row]
 //   buffer(4) output    - float32 output [M, N], row-major
 //   buffer(5) params    - uint4: (M, N, K, group_size)
 //
@@ -2714,8 +2827,8 @@ constant constexpr uint BN_Q = 16;
 kernel void affine_qmm(
     device const float*   x         [[buffer(0)]],
     device const uint8_t* w_packed  [[buffer(1)]],
-    device const float*   scales    [[buffer(2)]],
-    device const float*   biases    [[buffer(3)]],
+    device const half*   scales    [[buffer(2)]],
+    device const half*   biases    [[buffer(3)]],
     device float*         output    [[buffer(4)]],
     constant uint4&       params    [[buffer(5)]],
     uint3 group_id     [[threadgroup_position_in_grid]],
@@ -2741,8 +2854,8 @@ kernel void affine_qmm(
     // Pointers for this output element
     device const float*   x_row = x + out_row * K;
     device const uint8_t* w_row = w_packed + out_col * half_k;
-    device const float*   s_row = scales + out_col * groups_per_row;
-    device const float*   b_row = biases + out_col * groups_per_row;
+    device const half*   s_row = scales + out_col * groups_per_row;
+    device const half*   b_row = biases + out_col * groups_per_row;
 
     float acc = 0.0f;
 
@@ -2862,8 +2975,8 @@ inline uint2 q_swizzle_tg(uint2 tid, uint swizzle_log) {
 kernel void affine_qmm_mma_q4(
     device const float*   x         [[buffer(0)]],
     device const uint8_t* w_packed  [[buffer(1)]],
-    device const float*   scales    [[buffer(2)]],
-    device const float*   biases    [[buffer(3)]],
+    device const half*   scales    [[buffer(2)]],
+    device const half*   biases    [[buffer(3)]],
     device float*         output    [[buffer(4)]],
     constant uint&        M         [[buffer(5)]],
     constant uint&        N         [[buffer(6)]],
@@ -3224,48 +3337,46 @@ kernel void affine_qmm_nax_q4(
         // Each thread: n_reads = (BK/2 * BN) / 128 = 16 bytes → 32 halves
         threadgroup_barrier(mem_flags::mem_threadgroup);
         {
-            // Each thread handles 16 packed bytes spread across N rows
-            // Layout: thread processes BK/2 = 32 bytes per N row, with 128 threads
-            // across BN=64 N rows → 128/2 = each thread covers ~0.5 rows
-            // Simpler: linearize all work
-            const uint total_packed = NAX_BN * (NAX_BK / 2);  // 64 * 32 = 2048
-            const uint per_thread = total_packed / 128;         // 16
+            // K-coalesced dequant: each thread owns a fixed N row, reads K-contiguous bytes.
+            // 128 threads, BN=64 rows, BK/2=32 bytes/row → 2 threads per N row.
+            // Total: 128 threads × 16 bytes/thread = 2048 bytes = 64 × 32.
+            // Threads within the same SIMD group now read adjacent K bytes (coalesced).
+            const uint threads_per_row = 2;   // 32 bytes/row ÷ 16 bytes/thread
+            const uint bytes_per_thread = 16;
+            const uint n_local = lid / threads_per_row;          // 0..63 (fixed N row)
+            const uint k_byte_offset = (lid % threads_per_row) * bytes_per_thread; // 0 or 16
 
-            for (uint idx = 0; idx < per_thread; idx++) {
-                uint linear = lid * per_thread + idx;
-                uint n_local = linear / (NAX_BK / 2);   // which N row (0..63)
-                uint byte_off = linear % (NAX_BK / 2);  // which packed byte (0..31)
+            uint gn = col_start + n_local;
 
-                uint gn = col_start + n_local;
-                uint gk_base = kb + byte_off * 2;  // each byte = 2 K elements
+            if (align_N || gn < uN) {
+                device const uint8_t* src = w_packed + gn * half_k + (kb / 2) + k_byte_offset;
 
-                if (align_N || gn < uN) {
-                    uint8_t packed = w_packed[gn * half_k + (kb / 2) + byte_off];
+                // Scale/bias for this thread's K range
+                uint group_k_start = kb + k_byte_offset * 2; // each byte = 2 Q4 values
+                uint group_idx = group_k_start / fc_group_size;
+                half scale = scales[gn * groups_per_row + group_idx];
+                half bias  = biases[gn * groups_per_row + group_idx];
+                half scale_hi = scale / half(16.0f);
 
-                    // Determine scale/bias group for low and high nibble
-                    uint gk_lo = gk_base;
-                    uint gk_hi = gk_base + 1;
-                    uint group_lo = gk_lo / fc_group_size;
-                    uint group_hi = gk_hi / fc_group_size;
+                // Dequant 16 bytes → 32 halfs, write to N-major TG memory
+                for (uint r = 0; r < bytes_per_thread; r++) {
+                    uint8_t byte_val = src[r];
+                    uint k_idx = k_byte_offset * 2 + r * 2;
 
-                    half s_lo = scales[gn * groups_per_row + group_lo];
-                    half b_lo = biases[gn * groups_per_row + group_lo];
-                    half s_hi = scales[gn * groups_per_row + group_hi];
-                    half b_hi = biases[gn * groups_per_row + group_hi];
+                    half w_lo = scale * half(byte_val & 0x0f) + bias;
+                    half w_hi = scale_hi * half(byte_val & 0xf0) + bias;
 
-                    // Shift-free dequant for high nibble:
-                    // val_hi = (scale/16) * (packed & 0xf0) + bias
-                    half w_lo = s_lo * half(packed & 0x0f) + b_lo;
-                    half w_hi = (s_hi / half(16.0f)) * half(packed & 0xf0) + b_hi;
-
-                    uint k_local_lo = byte_off * 2;
-                    uint k_local_hi = byte_off * 2 + 1;
-                    Ws[n_local * NAX_BK_PAD + k_local_lo] = w_lo;
-                    Ws[n_local * NAX_BK_PAD + k_local_hi] = w_hi;
-                } else {
-                    uint k_local = byte_off * 2;
-                    Ws[n_local * NAX_BK_PAD + k_local] = half(0);
-                    Ws[n_local * NAX_BK_PAD + k_local + 1] = half(0);
+                    // N-major TG write: Ws[n][k] — compatible with fragment reader
+                    Ws[n_local * NAX_BK_PAD + k_idx]     = w_lo;
+                    Ws[n_local * NAX_BK_PAD + k_idx + 1] = w_hi;
+                }
+            } else {
+                // Out-of-bounds N: zero-fill
+                uint k_base = k_byte_offset * 2;
+                for (uint r = 0; r < bytes_per_thread; r++) {
+                    uint k_idx = k_base + r * 2;
+                    Ws[n_local * NAX_BK_PAD + k_idx]     = half(0);
+                    Ws[n_local * NAX_BK_PAD + k_idx + 1] = half(0);
                 }
             }
         }
@@ -3480,8 +3591,8 @@ inline uint2 st_swizzle_tg(uint2 tid, uint swizzle_log) {
 kernel void affine_qmm_steel_q4(
     device const half*    x         [[buffer(0)]],   // half input [M, K]
     device const uint8_t* w_packed  [[buffer(1)]],   // packed Q4 [N, K/2]
-    device const float*   scales    [[buffer(2)]],   // [N * groups_per_row]
-    device const float*   biases    [[buffer(3)]],   // [N * groups_per_row]
+    device const half*   scales    [[buffer(2)]],   // [N * groups_per_row]
+    device const half*   biases    [[buffer(3)]],   // [N * groups_per_row]
     device float*         output    [[buffer(4)]],   // [M, N]
     constant uint&        M         [[buffer(5)]],
     constant uint&        N         [[buffer(6)]],
@@ -3773,8 +3884,8 @@ METAL_FUNC T skinny_as_uniform(T val) {
 kernel void affine_qmm_skinny_q4(
     device const float*   x         [[buffer(0)]],
     device const uint8_t* w_packed  [[buffer(1)]],
-    device const float*   scales    [[buffer(2)]],
-    device const float*   biases    [[buffer(3)]],
+    device const half*   scales    [[buffer(2)]],
+    device const half*   biases    [[buffer(3)]],
     device float*         output    [[buffer(4)]],
     constant uint&        M         [[buffer(5)]],
     constant uint&        N         [[buffer(6)]],
@@ -4033,8 +4144,8 @@ METAL_FUNC T skinny_f16_as_uniform(T val) { return val; }
 kernel void affine_qmm_skinny_f16_q4(
     device const half*    x         [[buffer(0)]],
     device const uint8_t* w_packed  [[buffer(1)]],
-    device const float*   scales    [[buffer(2)]],
-    device const float*   biases    [[buffer(3)]],
+    device const half*   scales    [[buffer(2)]],
+    device const half*   biases    [[buffer(3)]],
     device half*          output    [[buffer(4)]],
     constant uint&        M         [[buffer(5)]],
     constant uint&        N         [[buffer(6)]],
@@ -4295,8 +4406,8 @@ METAL_FUNC T mma_f16_as_uniform(T val) { return val; }
 kernel void affine_qmm_mma_f16_q4(
     device const half*    x         [[buffer(0)]],
     device const uint8_t* w_packed  [[buffer(1)]],
-    device const float*   scales    [[buffer(2)]],
-    device const float*   biases    [[buffer(3)]],
+    device const half*   scales    [[buffer(2)]],
+    device const half*   biases    [[buffer(3)]],
     device half*          output    [[buffer(4)]],
     constant uint&        M         [[buffer(5)]],
     constant uint&        N         [[buffer(6)]],
@@ -4521,8 +4632,8 @@ METAL_FUNC T tiny_as_uniform(T val) {
 kernel void affine_qmm_tiny_q4(
     device const float*   x         [[buffer(0)]],
     device const uint8_t* w_packed  [[buffer(1)]],
-    device const float*   scales    [[buffer(2)]],
-    device const float*   biases    [[buffer(3)]],
+    device const half*   scales    [[buffer(2)]],
+    device const half*   biases    [[buffer(3)]],
     device float*         output    [[buffer(4)]],
     constant uint&        M         [[buffer(5)]],
     constant uint&        N         [[buffer(6)]],
@@ -4774,8 +4885,8 @@ constant constexpr uint THREADGROUP_SIZE = 64;
 kernel void affine_qmm_mma_q8(
     device const float*   x         [[buffer(0)]],
     device const uint8_t* w_packed  [[buffer(1)]],
-    device const float*   scales    [[buffer(2)]],
-    device const float*   biases    [[buffer(3)]],
+    device const half*   scales    [[buffer(2)]],
+    device const half*   biases    [[buffer(3)]],
     device float*         output    [[buffer(4)]],
     constant uint4&       params    [[buffer(5)]],
     uint3 group_id        [[threadgroup_position_in_grid]],
@@ -4944,8 +5055,8 @@ constant uint sk_fc_group_size [[function_constant(205)]];
 kernel void affine_qmm_splitk_q4(
     device const float*   x         [[buffer(0)]],
     device const uint8_t* w_packed  [[buffer(1)]],
-    device const float*   scales    [[buffer(2)]],
-    device const float*   biases    [[buffer(3)]],
+    device const half*   scales    [[buffer(2)]],
+    device const half*   biases    [[buffer(3)]],
     device float*         c_split   [[buffer(4)]],
     constant uint3&       params    [[buffer(5)]],
     constant uint2&       split_params [[buffer(6)]],
@@ -5220,8 +5331,8 @@ inline uint2 ql_swizzle_tg(uint2 tid, uint swizzle_log) {
 kernel void affine_qmm_qldr_q4(
     device const half*    A         [[buffer(0)]],   // half input [M, K]
     device const uint8_t* w_packed  [[buffer(1)]],   // packed Q4 [N, K/2] (byte-addressed)
-    device const float*   scales    [[buffer(2)]],   // [N * groups_per_row]
-    device const float*   biases    [[buffer(3)]],   // [N * groups_per_row]
+    device const half*   scales    [[buffer(2)]],   // [N * groups_per_row]
+    device const half*   biases    [[buffer(3)]],   // [N * groups_per_row]
     device float*         output    [[buffer(4)]],   // [M, N]
     constant uint&        M         [[buffer(5)]],
     constant uint&        N         [[buffer(6)]],
@@ -5471,7 +5582,7 @@ pub fn register_qmm(registry: &KernelRegistry) -> Result<(), KernelError> {
 /// compute kernel for quantized weights.
 ///
 /// - **Q4** (`bits == 4`): f16 is the sole native dtype. f32 input is cast to f16
-///   at entry. All Q4 paths (NAX, Skinny, Steel, Standard MMA) operate in f16
+///   at entry. All Q4 paths (Steel, BatchQMV, Skinny, Standard MMA) operate in f16
 ///   and return f16 output.
 /// - **Q8** (`bits == 8`): uses `affine_qmm_mma_q8` (BM=32, BN=32, 2 SG, f32-only legacy).
 ///
@@ -5537,62 +5648,28 @@ pub fn affine_quantized_matmul_batched(
 
     let result = if qw.bits == 4 {
         // Q4 dispatch priority:
-        // 1. NAX (HW MMA, f16): M >= 32, K % 64 == 0 → highest throughput
-        // 2. Skinny (split-K): M <= 32 → best for low-M
-        // 3. Standard MMA: fallback
-        const NAX_MIN_M: usize = 32;
+        // 1. NAX (M >= 32, K % 64 == 0): K-coalesced dequant loader, 4 SG MMA
+        // 2. Steel (M >= 32, K % 64 != 0): handles any K alignment
+        // 3. BatchQMV (M <= qmv_limit, K%512==0): fastest at low M
+        // 4. Skinny (M <= 32): split-K for best low-M utilization
+        // 5. Standard MMA: fallback (rarely reached)
+        const MMA_MIN_M: usize = 32;
 
-        if k % 64 == 0 && m >= NAX_MIN_M {
-            // --- NAX path: f16 HW MMA, BM=64 BN=64, 128 threads ---
-            // NAX kernel operates in f16. Skip casts when input is already f16.
-            let num_groups = (qw.out_features * qw.in_features) / qw.group_size as usize;
-
-            // Wrap scales/biases as 1D f32 Arrays for GPU cast
-            let scales_f32 = Array::new(
-                qw.scales_buf.clone(),
-                vec![num_groups],
-                vec![1],
-                DType::Float32,
-                0,
-            );
-            let biases_f32 = Array::new(
-                qw.biases_buf.clone(),
-                vec![num_groups],
-                vec![1],
-                DType::Float32,
-                0,
-            );
-
-            let cb = queue.new_command_buffer();
-
-            // x is guaranteed f16 (cast at entry for Q4)
-            let x_f16 = super::copy::copy_into_cb(registry, x, cb)?;
-
-            // Cast scales: f32 → f16
-            let scales_f16 =
-                super::copy::copy_cast_into_cb(registry, &scales_f32, DType::Float16, cb)?;
-            // Cast biases: f32 → f16
-            let biases_f16 =
-                super::copy::copy_cast_into_cb(registry, &biases_f32, DType::Float16, cb)?;
-
-            // Build a temporary QuantizedWeight with f16 scales/biases for NAX
-            let qw_f16 = QuantizedWeight {
-                weights_buf: qw.weights_buf.clone(),
-                scales_buf: scales_f16.metal_buffer().to_owned(),
-                biases_buf: biases_f16.metal_buffer().to_owned(),
-                group_size: qw.group_size,
-                bits: qw.bits,
-                out_features: qw.out_features,
-                in_features: qw.in_features,
-            };
-
-            // Dispatch NAX kernel (encodes into same CB) — output is f16
-            let out_f16 = affine_qmm_nax_q4_into_cb(registry, &x_f16, &qw_f16, cb)?;
-
-            // NAX output is f16 — native dtype for Q4. No cast needed.
-            super::commit_with_mode(cb, super::ExecMode::Sync);
-
-            return Ok(out_f16);
+        if m >= MMA_MIN_M {
+            if k % 64 == 0 {
+                // --- NAX path: K-coalesced dequant, 4 SG (2×2), 128 threads ---
+                // NAX kernel produces f16 output directly.
+                return affine_quantized_matmul_nax(registry, x, qw, queue);
+            } else {
+                // --- Steel path: BK=32 + double-buffer, handles any K alignment ---
+                // Steel kernel produces f32 output; cast to f16 for Q4 consistency.
+                let steel_out = affine_quantized_matmul_steel(registry, x, qw, queue)?;
+                if steel_out.dtype() == DType::Float32 {
+                    return super::copy::copy_cast(registry, &steel_out, DType::Float16, queue);
+                } else {
+                    return Ok(steel_out);
+                }
+            }
         }
 
         // Q4 non-NAX dispatch: shape-aware kernel selection
@@ -5902,18 +5979,9 @@ pub fn affine_quantized_matmul_batched(
 
                 Ok(out)
             }
-        } else if k >= 4096 || (m <= 128 && n >= 4096) {
-            // --- Steel path: BK=32 + double-buffer, coalesced B loads ---
-            // Steel kernel produces f32 output; cast to f16 for Q4 consistency.
-            // TODO: add f16 output support to Steel kernel to avoid this cast.
-            let steel_out = affine_quantized_matmul_steel(registry, x, qw, queue)?;
-            if steel_out.dtype() == DType::Float32 {
-                super::copy::copy_cast(registry, &steel_out, DType::Float16, queue)
-            } else {
-                Ok(steel_out)
-            }
         } else {
-            // --- Standard path: BM=64, BN=64, BK=16 ---
+            // --- Standard MMA fallback: BM=64, BN=64, BK=16 ---
+            // Rarely reached: Steel handles M>=32, Skinny handles M<=32.
             // x is guaranteed f16 for Q4 (cast at entry). Always use f16 kernel.
             let fc_list = vec![
                 (200u32, FunctionConstantValue::Bool(m % STD_BM == 0)),
@@ -6027,7 +6095,7 @@ pub fn affine_quantized_matmul_batched(
 /// Encode a Q4 quantized matmul into an externally-provided command buffer.
 ///
 /// Replicates the exact dispatch logic of [`affine_quantized_matmul_batched`]
-/// (NAX / BatchQMV / Skinny / Standard MMA / Steel) but encodes into `cb`
+/// (Steel / BatchQMV / Skinny / Standard MMA) but encodes into `cb`
 /// instead of creating its own command buffer. The caller is responsible for
 /// committing and waiting on `cb`.
 ///
@@ -6037,10 +6105,6 @@ pub fn affine_quantized_matmul_batched(
 /// **Restrictions**: Q4 only, f16 input only (no automatic f32→f16 cast).
 /// The caller must supply f16 `x` and Q4 `qw` with f16 scales/biases
 /// (or accept scale/bias cast overhead encoded into the same CB).
-///
-/// For the Steel sub-path, a separate internal command buffer is created
-/// because Steel manages its own CB lifecycle. This is acceptable since
-/// Steel is selected only at large M where per-op overhead is negligible.
 pub fn affine_quantized_matmul_batched_into_cb(
     registry: &KernelRegistry,
     x: &Array,
@@ -6081,48 +6145,29 @@ pub fn affine_quantized_matmul_batched_into_cb(
     let opts = metal::MTLResourceOptions::StorageModeShared;
 
     // Q4 dispatch priority (mirrors affine_quantized_matmul_batched):
-    // 1. NAX: M >= 32, K % 64 == 0
-    // 2. BatchQMV / QMV fast: M <= 16, K % 512 == 0
-    // 3. Skinny MMA: M <= 32
-    // 4. Steel: k >= 4096 or (m <= 128 && n >= 4096) — uses separate CB
-    // 5. Standard MMA: fallback
+    // 1. NAX: M >= 32, K % 64 == 0 — K-coalesced dequant loader, 4 SG MMA
+    // 2. Steel: M >= 32, K % 64 != 0 — handles any K alignment
+    // 3. BatchQMV / QMV fast: M <= qmv_limit, K % 512 == 0
+    // 4. Skinny MMA: M <= 32
+    // 5. Standard MMA: fallback (rarely reached)
 
-    const NAX_MIN_M: usize = 32;
+    const MMA_MIN_M: usize = 32;
 
-    if k % 64 == 0 && m >= NAX_MIN_M {
-        // --- NAX path ---
-        let num_groups = (qw.out_features * qw.in_features) / qw.group_size as usize;
-
-        let scales_f32 = Array::new(
-            qw.scales_buf.clone(),
-            vec![num_groups],
-            vec![1],
-            DType::Float32,
-            0,
-        );
-        let biases_f32 = Array::new(
-            qw.biases_buf.clone(),
-            vec![num_groups],
-            vec![1],
-            DType::Float32,
-            0,
-        );
-
-        let x_f16 = super::copy::copy_into_cb(registry, x, cb)?;
-        let scales_f16 = super::copy::copy_cast_into_cb(registry, &scales_f32, DType::Float16, cb)?;
-        let biases_f16 = super::copy::copy_cast_into_cb(registry, &biases_f32, DType::Float16, cb)?;
-
-        let qw_f16 = QuantizedWeight {
-            weights_buf: qw.weights_buf.clone(),
-            scales_buf: scales_f16.metal_buffer().to_owned(),
-            biases_buf: biases_f16.metal_buffer().to_owned(),
-            group_size: qw.group_size,
-            bits: qw.bits,
-            out_features: qw.out_features,
-            in_features: qw.in_features,
-        };
-
-        return affine_qmm_nax_q4_into_cb(registry, &x_f16, &qw_f16, cb);
+    if m >= MMA_MIN_M {
+        if k % 64 == 0 {
+            // --- NAX path: K-coalesced dequant, 4 SG (2×2), 128 threads ---
+            // NAX kernel produces f16 output directly.
+            return affine_qmm_nax_q4_into_cb(registry, x, qw, cb);
+        } else {
+            // --- Steel path: encodes into the provided CB ---
+            // Steel kernel produces f32 output; cast to f16 for Q4 consistency.
+            let steel_out = affine_qmm_steel_q4_into_cb(registry, x, qw, cb)?;
+            if steel_out.dtype() == DType::Float32 {
+                return super::copy::copy_cast_into_cb(registry, &steel_out, DType::Float16, cb);
+            } else {
+                return Ok(steel_out);
+            }
+        }
     }
 
     // --- BatchQMV / QMV fast: M <= qmv_limit (device-aware), K % 512 == 0 ---
@@ -6331,21 +6376,8 @@ pub fn affine_quantized_matmul_batched_into_cb(
         }
     }
 
-    if k >= 4096 || (m <= 128 && n >= 4096) {
-        // --- Steel path: creates its own CB (Steel manages CB lifecycle) ---
-        // This is acceptable since Steel is selected only at large M where
-        // per-op overhead is negligible relative to compute time.
-        let steel_queue = dev.new_command_queue();
-        let steel_out = affine_quantized_matmul_steel(registry, x, qw, &steel_queue)?;
-        if steel_out.dtype() == DType::Float32 {
-            // Encode f32→f16 cast into the shared CB
-            return super::copy::copy_cast_into_cb(registry, &steel_out, DType::Float16, cb);
-        } else {
-            return Ok(steel_out);
-        }
-    }
-
-    // --- Standard MMA path into CB ---
+    // --- Standard MMA fallback into CB ---
+    // Rarely reached: Steel handles M>=32, Skinny handles M<=32.
     let fc_list = vec![
         (200u32, FunctionConstantValue::Bool(m % STD_BM == 0)),
         (201u32, FunctionConstantValue::Bool(n % STD_BN == 0)),
@@ -6568,6 +6600,91 @@ pub fn qmm_swiglu_into_cb(
     Ok(out)
 }
 
+/// NAX-architecture affine quantized matrix-matrix multiply (Q4 only).
+///
+/// Creates its own command buffer, encodes via [`affine_qmm_nax_q4_into_cb`],
+/// commits and waits. The output is Float16 directly (no f32→f16 cast needed).
+///
+/// Requires: `x` Float16 or Float32, `qw.bits == 4`, K % 64 == 0.
+/// Convert an f32 value to IEEE 754 half-precision (f16) as a `u16`.
+///
+/// Handles normals, subnormals, infinities, NaNs, and round-to-nearest-even.
+/// Used at weight upload time to convert f32 scales/biases to f16 format.
+pub fn f32_to_f16_bits(val: f32) -> u16 {
+    let bits = val.to_bits();
+    let sign = (bits >> 16) & 0x8000;
+    let exponent = ((bits >> 23) & 0xFF) as i32;
+    let mantissa = bits & 0x007F_FFFF;
+
+    if exponent == 0xFF {
+        // Inf or NaN
+        if mantissa == 0 {
+            return (sign | 0x7C00) as u16; // Inf
+        } else {
+            return (sign | 0x7E00) as u16; // NaN (quiet)
+        }
+    }
+
+    // Re-bias exponent from f32 (bias 127) to f16 (bias 15)
+    let new_exp = exponent - 127 + 15;
+
+    if new_exp >= 31 {
+        // Overflow → Inf
+        return (sign | 0x7C00) as u16;
+    }
+
+    if new_exp <= 0 {
+        // Subnormal or underflow
+        if new_exp < -10 {
+            return sign as u16; // too small → ±0
+        }
+        // Subnormal: shift mantissa right, adding implicit leading 1
+        let shift = (1 - new_exp) as u32;
+        let m = (mantissa | 0x0080_0000) >> (13 + shift);
+        // Round-to-nearest-even
+        let round_bit = 1u32 << (12 + shift);
+        let remainder = (mantissa | 0x0080_0000) & ((round_bit << 1) - 1);
+        if remainder > round_bit || (remainder == round_bit && m & 1 != 0) {
+            return (sign | (m + 1)) as u16;
+        }
+        return (sign | m) as u16;
+    }
+
+    // Normal: truncate mantissa from 23 to 10 bits with rounding
+    let m = mantissa >> 13;
+    let round_bit = 1u32 << 12;
+    let remainder = mantissa & ((round_bit << 1) - 1);
+    let half_val = sign | ((new_exp as u32) << 10) | m;
+    if remainder > round_bit || (remainder == round_bit && m & 1 != 0) {
+        // Round up (may overflow into next exponent — that's correct)
+        (half_val + 1) as u16
+    } else {
+        half_val as u16
+    }
+}
+
+pub fn affine_quantized_matmul_nax(
+    registry: &KernelRegistry,
+    x: &Array,
+    qw: &QuantizedWeight,
+    queue: &metal::CommandQueue,
+) -> Result<Array, KernelError> {
+    // Ensure f16 input (Q4 native dtype)
+    let x_native;
+    let x = if x.dtype() == DType::Float32 {
+        x_native = ensure_f16(registry, x, queue)?;
+        &x_native
+    } else {
+        x
+    };
+
+    let cb = queue.new_command_buffer();
+    let out = affine_qmm_nax_q4_into_cb(registry, x, qw, cb)?;
+    cb.commit();
+    cb.wait_until_completed();
+    Ok(out)
+}
+
 /// NAX-architecture Q4 QMM using MetalPerformancePrimitives 16×16 HW MMA.
 ///
 /// Encodes into an existing command buffer. Requires:
@@ -6651,6 +6768,7 @@ pub fn affine_qmm_nax_q4_into_cb(
     let n_buf = dev.new_buffer_with_data(&n_u32 as *const u32 as *const _, 4, opts);
     let k_buf = dev.new_buffer_with_data(&k_u32 as *const u32 as *const _, 4, opts);
 
+    // QuantizedWeight natively stores f16 scales/biases — use directly.
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&pipeline);
     enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
@@ -6789,6 +6907,111 @@ pub fn affine_quantized_matmul_steel(
     enc.dispatch_thread_groups(grid, tg);
     enc.end_encoding();
     super::commit_with_mode(cb, super::ExecMode::Sync);
+
+    Ok(out)
+}
+
+/// Steel-architecture Q4 QMM that encodes into an existing command buffer.
+///
+/// Identical to [`affine_quantized_matmul_steel`] but does not create its own
+/// command queue or command buffer — the caller provides `cb` and manages
+/// its lifecycle (commit / wait).
+///
+/// Input `x` must already be Float16 (the caller is responsible for casting).
+/// Output is Float32 (Steel kernel always produces f32).
+pub fn affine_qmm_steel_q4_into_cb(
+    registry: &KernelRegistry,
+    x: &Array,
+    qw: &QuantizedWeight,
+    cb: &metal::CommandBufferRef,
+) -> Result<Array, KernelError> {
+    if x.dtype() != DType::Float16 {
+        return Err(KernelError::InvalidShape(format!(
+            "affine_qmm_steel_q4_into_cb requires Float16 input x, got {:?}",
+            x.dtype()
+        )));
+    }
+    if x.ndim() != 2 {
+        return Err(KernelError::InvalidShape(format!(
+            "affine_qmm_steel_q4_into_cb requires 2D input x, got {}D",
+            x.ndim()
+        )));
+    }
+    if x.shape()[1] != qw.in_features {
+        return Err(KernelError::InvalidShape(format!(
+            "x.shape[1] ({}) != in_features ({})",
+            x.shape()[1],
+            qw.in_features
+        )));
+    }
+    if qw.bits != 4 {
+        return Err(KernelError::InvalidShape(format!(
+            "affine_qmm_steel_q4_into_cb requires bits==4, got {}",
+            qw.bits
+        )));
+    }
+
+    let m = x.shape()[0];
+    let n = qw.out_features;
+    let k = qw.in_features;
+
+    let dev = registry.device().raw();
+    let opts = metal::MTLResourceOptions::StorageModeShared;
+
+    // --- Dispatch steel kernel ---
+    const STEEL_BM: usize = 32;
+    const STEEL_BN: usize = 32;
+
+    let m_tiles = m.div_ceil(STEEL_BM);
+    let n_tiles = n.div_ceil(STEEL_BN);
+
+    let align_m = m % STEEL_BM == 0;
+    let align_n = n % STEEL_BN == 0;
+
+    let steel_constants = [
+        (200u32, FunctionConstantValue::Bool(align_m)),
+        (201u32, FunctionConstantValue::Bool(align_n)),
+        (202u32, FunctionConstantValue::Bool(false)), // has_residual
+        (204u32, FunctionConstantValue::Bool(false)), // has_swiglu
+        (205u32, FunctionConstantValue::U32(qw.group_size)),
+    ];
+    let pipeline = registry.get_pipeline_with_constants(
+        "affine_qmm_steel_q4",
+        DType::Float32,
+        &steel_constants,
+    )?;
+
+    let out = Array::zeros(dev, &[m, n], DType::Float32);
+
+    let m_u32 = super::checked_u32(m, "M")?;
+    let n_u32 = super::checked_u32(n, "N")?;
+    let k_u32 = super::checked_u32(k, "K")?;
+    let swizzle_log: u32 = if n_tiles >= 4 { 1 } else { 0 };
+
+    let m_buf = dev.new_buffer_with_data(&m_u32 as *const u32 as *const _, 4, opts);
+    let n_buf = dev.new_buffer_with_data(&n_u32 as *const u32 as *const _, 4, opts);
+    let k_buf = dev.new_buffer_with_data(&k_u32 as *const u32 as *const _, 4, opts);
+    let sw_buf = dev.new_buffer_with_data(&swizzle_log as *const u32 as *const _, 4, opts);
+    let dummy_buf = dev.new_buffer(4, opts);
+
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
+    enc.set_buffer(1, Some(&qw.weights_buf), 0);
+    enc.set_buffer(2, Some(&qw.scales_buf), 0);
+    enc.set_buffer(3, Some(&qw.biases_buf), 0);
+    enc.set_buffer(4, Some(out.metal_buffer()), 0);
+    enc.set_buffer(5, Some(&m_buf), 0);
+    enc.set_buffer(6, Some(&n_buf), 0);
+    enc.set_buffer(7, Some(&k_buf), 0);
+    enc.set_buffer(8, Some(&sw_buf), 0);
+    enc.set_buffer(9, Some(&dummy_buf), 0); // residual (unused)
+    enc.set_buffer(10, Some(&dummy_buf), 0); // gate_result (unused)
+
+    let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
+    let tg = metal::MTLSize::new(64, 1, 1);
+    enc.dispatch_thread_groups(grid, tg);
+    enc.end_encoding();
 
     Ok(out)
 }
@@ -7023,8 +7246,8 @@ constant constexpr uint BN_GQ = 16;
 kernel void gather_qmm_f32(
     device const float*   x         [[buffer(0)]],
     device const uint8_t* w_packed  [[buffer(1)]],
-    device const float*   scales    [[buffer(2)]],
-    device const float*   biases    [[buffer(3)]],
+    device const half*   scales    [[buffer(2)]],
+    device const half*   biases    [[buffer(3)]],
     device const uint*    indices   [[buffer(4)]],
     device float*         output    [[buffer(5)]],
     constant uint& batch_size       [[buffer(6)]],
@@ -7055,8 +7278,8 @@ kernel void gather_qmm_f32(
     // Pointers for this batch element and expert
     device const float*   x_row = x + batch_idx * M_per_batch * K + out_m * K;
     device const uint8_t* w_row = w_packed + expert_idx * N * half_k + out_n * half_k;
-    device const float*   s_row = scales + expert_idx * N * groups_per_row + out_n * groups_per_row;
-    device const float*   b_row = biases + expert_idx * N * groups_per_row + out_n * groups_per_row;
+    device const half*   s_row = scales + expert_idx * N * groups_per_row + out_n * groups_per_row;
+    device const half*   b_row = biases + expert_idx * N * groups_per_row + out_n * groups_per_row;
 
     float acc = 0.0f;
 
@@ -7217,7 +7440,7 @@ pub fn gather_qmm(
             expected_w_bytes,
         )));
     }
-    let expected_scales_bytes = n_experts * n * groups_per_row * 4; // float32
+    let expected_scales_bytes = n_experts * n * groups_per_row * 2; // float16
     if (scales_buf.length() as usize) < expected_scales_bytes {
         return Err(KernelError::InvalidShape(format!(
             "gather_qmm: scales_buf too small: {} bytes < expected {} bytes \
@@ -7327,8 +7550,8 @@ constant constexpr int GQMV_Q4_BLOCK_SIZE       = GQMV_Q4_VALUES_PER_THREAD * 32
 kernel void gather_qmv_fast_q4(
     device const float*    x         [[buffer(0)]],  // [batch, K]
     device const uint32_t* w_packed  [[buffer(1)]],  // [n_experts, N, K/pack_factor] packed Q4
-    device const float*    scales    [[buffer(2)]],  // [n_experts, N, groups_per_row]
-    device const float*    biases    [[buffer(3)]],  // [n_experts, N, groups_per_row]
+    device const half*    scales    [[buffer(2)]],  // [n_experts, N, groups_per_row]
+    device const half*    biases    [[buffer(3)]],  // [n_experts, N, groups_per_row]
     device const uint32_t* indices   [[buffer(4)]],  // [batch] expert index per element
     device float*          output    [[buffer(5)]],  // [batch, N]
     constant uint4&        params    [[buffer(6)]],  // (N, K, group_size, batch)
@@ -7363,9 +7586,9 @@ kernel void gather_qmv_fast_q4(
     device const uint8_t* ws = (device const uint8_t*)(w_packed + expert_w_offset)
         + out_row * in_vec_size_w * 4
         + simd_lid * GQMV_Q4_PACKS_PER_THREAD * 4;
-    device const float* sl = scales + expert_s_offset + out_row * in_vec_size_g
+    device const half* sl = scales + expert_s_offset + out_row * in_vec_size_g
         + simd_lid / scale_step;
-    device const float* bl = biases + expert_s_offset + out_row * in_vec_size_g
+    device const half* bl = biases + expert_s_offset + out_row * in_vec_size_g
         + simd_lid / scale_step;
     device const float* xp = x + batch_idx * in_features
         + simd_lid * GQMV_Q4_VALUES_PER_THREAD;
@@ -7445,8 +7668,8 @@ constant constexpr int GQMV_F16_Q4_BLOCK_SIZE       = GQMV_F16_Q4_VALUES_PER_THR
 kernel void gather_qmv_fast_f16_q4(
     device const half*     x         [[buffer(0)]],
     device const uint32_t* w_packed  [[buffer(1)]],
-    device const float*    scales    [[buffer(2)]],
-    device const float*    biases    [[buffer(3)]],
+    device const half*    scales    [[buffer(2)]],
+    device const half*    biases    [[buffer(3)]],
     device const uint32_t* indices   [[buffer(4)]],
     device half*           output    [[buffer(5)]],
     constant uint4&        params    [[buffer(6)]],
@@ -7476,9 +7699,9 @@ kernel void gather_qmv_fast_f16_q4(
     device const uint8_t* ws = (device const uint8_t*)(w_packed + expert_w_offset)
         + out_row * in_vec_size_w * 4
         + simd_lid * GQMV_F16_Q4_PACKS_PER_THREAD * 4;
-    device const float* sl = scales + expert_s_offset + out_row * in_vec_size_g
+    device const half* sl = scales + expert_s_offset + out_row * in_vec_size_g
         + simd_lid / scale_step;
-    device const float* bl = biases + expert_s_offset + out_row * in_vec_size_g
+    device const half* bl = biases + expert_s_offset + out_row * in_vec_size_g
         + simd_lid / scale_step;
     device const half* xp = x + batch_idx * in_features
         + simd_lid * GQMV_F16_Q4_VALUES_PER_THREAD;
@@ -7551,8 +7774,8 @@ pub fn register_gather_qmv(registry: &KernelRegistry) -> Result<(), KernelError>
 /// - `registry`: kernel registry (must have `gather_qmv` source registered).
 /// - `x`: f32 input activations `[batch, k]`.
 /// - `w_packed_buf`: Q4 packed expert weights `[n_experts, n, k/8]` as uint32.
-/// - `scales_buf`: per-group scale factors `[n_experts, n, groups_per_row]` f32.
-/// - `biases_buf`: per-group bias terms `[n_experts, n, groups_per_row]` f32.
+/// - `scales_buf`: per-group scale factors `[n_experts, n, groups_per_row]` f16.
+/// - `biases_buf`: per-group bias terms `[n_experts, n, groups_per_row]` f16.
 /// - `indices`: expert index per batch element `[batch]` (UInt32).
 /// - `batch`: number of batch elements.
 /// - `n`: output features (N) per expert.
@@ -7661,7 +7884,7 @@ pub fn gather_qmv_fast_q4(
             expected_w_bytes,
         )));
     }
-    let expected_scales_bytes = n_experts * n * groups_per_row * 4; // float32
+    let expected_scales_bytes = n_experts * n * groups_per_row * 2; // float16
     if (scales_buf.length() as usize) < expected_scales_bytes {
         return Err(KernelError::InvalidShape(format!(
             "gather_qmv_fast_q4: scales_buf too small: {} bytes < expected {} bytes \
@@ -7836,7 +8059,7 @@ pub fn gather_qmv_fast_f16_q4(
             expected_w_bytes,
         )));
     }
-    let expected_scales_bytes = n_experts * n * groups_per_row * 4; // float32
+    let expected_scales_bytes = n_experts * n * groups_per_row * 2; // float16
     if (scales_buf.length() as usize) < expected_scales_bytes {
         return Err(KernelError::InvalidShape(format!(
             "gather_qmv_fast_f16_q4: scales_buf too small: {} bytes < expected {} bytes \
@@ -7979,7 +8202,7 @@ pub fn moe_expert_matmul_q4(
     let opts = metal::MTLResourceOptions::StorageModeShared;
 
     let w_bytes_per_expert = n * k_div_pack * 4; // uint32 per pack element
-    let s_bytes_per_expert = n * groups_per_row * 4; // float32
+    let s_bytes_per_expert = n * groups_per_row * 2; // float16
 
     let total_w_bytes = n_experts * w_bytes_per_expert;
     let total_s_bytes = n_experts * s_bytes_per_expert;
@@ -8140,6 +8363,42 @@ mod tests {
     fn test_valid_bits() {
         for &b in VALID_BITS {
             assert!([2, 3, 4, 6, 8].contains(&b));
+        }
+    }
+
+    #[test]
+    fn test_f32_to_f16_bits_correctness() {
+        // Compare against half crate reference
+        let test_values: &[f32] = &[
+            0.0,
+            1.0,
+            -1.0,
+            0.5,
+            -0.5,
+            0.001,
+            0.02,
+            -0.005,
+            65504.0, // max f16
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            1e-8, // subnormal in f16
+        ];
+        for &v in test_values {
+            let ours = f32_to_f16_bits(v);
+            let reference = half::f16::from_f32(v).to_bits();
+            if v.is_nan() {
+                // Both should be NaN (quiet NaN bit set)
+                assert!(
+                    ours & 0x7C00 == 0x7C00 && ours & 0x03FF != 0,
+                    "NaN mismatch"
+                );
+            } else {
+                assert_eq!(
+                    ours, reference,
+                    "f32_to_f16_bits({v}) = 0x{ours:04X}, expected 0x{reference:04X}"
+                );
+            }
         }
     }
 
@@ -8671,15 +8930,15 @@ mod tests {
         let w_packed_buf =
             dev.new_buffer_with_data(w_data.as_ptr() as *const _, w_bytes as u64, opts);
 
-        // scales & biases: n_experts * n * groups_per_row floats
+        // scales & biases: n_experts * n * groups_per_row as f16
         let sb_elems = n_experts * n * groups_per_row;
-        let scales_data = vec![1.0f32; sb_elems];
-        let biases_data = vec![0.0f32; sb_elems];
-        let sb_bytes = sb_elems * 4;
+        let scales_f16: Vec<u16> = vec![f32_to_f16_bits(1.0); sb_elems];
+        let biases_f16: Vec<u16> = vec![f32_to_f16_bits(0.0); sb_elems];
+        let sb_bytes = sb_elems * 2; // f16 = 2 bytes
         let scales_buf =
-            dev.new_buffer_with_data(scales_data.as_ptr() as *const _, sb_bytes as u64, opts);
+            dev.new_buffer_with_data(scales_f16.as_ptr() as *const _, sb_bytes as u64, opts);
         let biases_buf =
-            dev.new_buffer_with_data(biases_data.as_ptr() as *const _, sb_bytes as u64, opts);
+            dev.new_buffer_with_data(biases_f16.as_ptr() as *const _, sb_bytes as u64, opts);
 
         let idx_data = vec![0u32, 1];
         let indices = Array::from_slice(dev, &idx_data, vec![batch]);
@@ -9892,5 +10151,164 @@ mod tests {
                  rel_diff={diff}"
             );
         }
+    }
+
+    /// GPU correctness test: NAX QMM with f32 scales/biases matches CPU reference.
+    ///
+    /// Creates properly quantized weights with f16 scales/biases (native format),
+    /// runs NAX kernel on GPU, and compares against CPU naive matmul reference.
+    /// This validates that the NAX kernel produces correct results with native f16 scales.
+    #[test]
+    fn test_nax_vs_cpu_reference_gpu_correctness() {
+        // Skip if no GPU available
+        let gpu = match rmlx_metal::device::GpuDevice::system_default() {
+            Ok(g) => g,
+            Err(_) => {
+                eprintln!("Skipping test_nax_vs_cpu_reference_gpu_correctness: no GPU");
+                return;
+            }
+        };
+        let registry = KernelRegistry::new(gpu);
+        crate::ops::register_all(&registry).expect("register_all");
+        let device = registry.device().raw();
+        let queue = device.new_command_queue();
+
+        // Dimensions: NAX requires M>=32, K%64==0
+        let m: usize = 64;
+        let k: usize = 128; // small but K%64==0
+        let n: usize = 64;
+        let group_size: usize = 32;
+        let opts = metal::MTLResourceOptions::StorageModeShared;
+
+        // Deterministic PRNG
+        let mut seed = 42u64;
+        let mut next_f32 = || -> f32 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((seed >> 33) as f32 / (u32::MAX as f32 / 2.0)) - 1.0
+        };
+
+        // Generate random weights and quantize properly
+        let weights_f32: Vec<f32> = (0..n * k).map(|_| next_f32()).collect();
+        let x_f32: Vec<f32> = (0..m * k).map(|_| next_f32() * 0.1).collect();
+
+        // Quantize all N rows
+        let mut all_packed = Vec::new();
+        let mut all_scales = Vec::new();
+        let mut all_biases = Vec::new();
+
+        for j in 0..n {
+            let row = &weights_f32[j * k..(j + 1) * k];
+            let (packed, sc, bi) = quantize_q4_row(row, group_size);
+            all_packed.extend_from_slice(&packed);
+            all_scales.extend_from_slice(&sc);
+            all_biases.extend_from_slice(&bi);
+        }
+
+        // CPU reference: simulate f16 input precision
+        let x_f16_sim: Vec<f32> = x_f32
+            .iter()
+            .map(|&v| half::f16::from_f32(v).to_f32())
+            .collect();
+
+        // CPU naive reference uses f16-simulated scales/biases (matching NAX f16 conversion)
+        let scales_f16_sim: Vec<f32> = all_scales
+            .iter()
+            .map(|&v| half::f16::from_f32(v).to_f32())
+            .collect();
+        let biases_f16_sim: Vec<f32> = all_biases
+            .iter()
+            .map(|&v| half::f16::from_f32(v).to_f32())
+            .collect();
+        let output_cpu = naive_matmul_with_dequant(
+            &x_f16_sim,
+            &all_packed,
+            &scales_f16_sim,
+            &biases_f16_sim,
+            m,
+            n,
+            k,
+            group_size,
+        );
+
+        // Build Metal QuantizedWeight with f16 scales (native format)
+        let weights_buf = device.new_buffer_with_data(
+            all_packed.as_ptr() as *const _,
+            all_packed.len() as u64,
+            opts,
+        );
+        let num_groups = n * k / group_size;
+        let scales_f16: Vec<u16> = all_scales.iter().map(|&v| f32_to_f16_bits(v)).collect();
+        let biases_f16: Vec<u16> = all_biases.iter().map(|&v| f32_to_f16_bits(v)).collect();
+        let scales_buf = device.new_buffer_with_data(
+            scales_f16.as_ptr() as *const _,
+            (num_groups * 2) as u64,
+            opts,
+        );
+        let biases_buf = device.new_buffer_with_data(
+            biases_f16.as_ptr() as *const _,
+            (num_groups * 2) as u64,
+            opts,
+        );
+
+        let qw = QuantizedWeight::new(
+            weights_buf,
+            scales_buf,
+            biases_buf,
+            group_size as u32,
+            4,
+            n,
+            k,
+        )
+        .expect("QuantizedWeight creation");
+
+        // Create f16 input on GPU
+        let numel = m * k;
+        let mut x_f16_bytes = Vec::with_capacity(numel * 2);
+        for &v in &x_f32 {
+            let h = half::f16::from_f32(v);
+            x_f16_bytes.extend_from_slice(&h.to_bits().to_le_bytes());
+        }
+        let x_gpu = Array::from_bytes(device, &x_f16_bytes, vec![m, k], DType::Float16);
+
+        // Run NAX on GPU (uses native f16 scales/biases)
+        let nax_out =
+            affine_quantized_matmul_nax(&registry, &x_gpu, &qw, &queue).expect("NAX QMM failed");
+
+        // Read back NAX output
+        let nax_ptr = nax_out.metal_buffer().contents() as *const u16;
+        let out_count = m * n;
+
+        let mut max_diff: f32 = 0.0;
+        let mut mismatch_count = 0usize;
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..out_count {
+            let nv = half::f16::from_bits(unsafe { *nax_ptr.add(i) }).to_f32();
+            let cv = output_cpu[i];
+            let scale = cv.abs().max(1e-4);
+            let diff = (cv - nv).abs() / scale;
+            if diff > max_diff {
+                max_diff = diff;
+            }
+            // f16 MMA accumulation on GPU vs f32 accumulation on CPU:
+            // Large K (128) with f16 accumulation produces significant rounding drift.
+            // rtol=0.5 is generous but validates correct scale conversion (without
+            // the f32→f16 fix, values would differ by orders of magnitude).
+            if diff > 0.5 {
+                mismatch_count += 1;
+            }
+        }
+
+        // The critical validation: with the f32→f16 bug, max_diff would be >100.0
+        // (feeding f32 bits as f16 produces garbage). After the fix, max_diff < 1.0.
+        assert!(
+            max_diff < 1.0,
+            "NAX output too far from CPU reference: max_diff={max_diff} (>1.0 suggests \
+             kernel computation bug)"
+        );
+        assert!(
+            mismatch_count == 0,
+            "NAX vs CPU mismatch: {mismatch_count}/{out_count} elements exceed rtol=0.5, \
+             max_diff={max_diff}"
+        );
     }
 }
