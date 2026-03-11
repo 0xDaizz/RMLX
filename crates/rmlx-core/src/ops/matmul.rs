@@ -4853,6 +4853,155 @@ pub fn matmul_add_residual_into_cb(
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------
+// Public API: matmul_add_residual_encode — GEMM + residual into existing encoder
+// ---------------------------------------------------------------------------
+
+/// Fused matrix multiply + residual add into an existing compute command encoder.
+///
+/// `C = matmul(A, B) + residual`
+///
+/// Unlike [`matmul_add_residual_into_cb`] which creates its own encoder from a
+/// command buffer, this function encodes directly into a caller-provided encoder.
+/// Does NOT call `end_encoding()` — the caller manages the encoder lifecycle.
+///
+/// **Constraints:**
+/// - Only MlxArch tile variant is supported (M >= 33, N >= 33 with f16/f32/bf16).
+/// - `residual` must have the same shape `[M, N]` and dtype as the output.
+/// - All inputs must be 2D and contiguous.
+pub fn matmul_add_residual_encode(
+    registry: &KernelRegistry,
+    a: &Array,
+    b: &Array,
+    residual: &Array,
+    encoder: &metal::ComputeCommandEncoderRef,
+) -> Result<Array, KernelError> {
+    // --- Validation ---
+    if a.ndim() != 2 {
+        return Err(KernelError::InvalidShape(format!(
+            "matmul_add_residual_encode requires 2D arrays, a is {}D",
+            a.ndim()
+        )));
+    }
+    if b.ndim() != 2 {
+        return Err(KernelError::InvalidShape(format!(
+            "matmul_add_residual_encode requires 2D arrays, b is {}D",
+            b.ndim()
+        )));
+    }
+    if residual.ndim() != 2 {
+        return Err(KernelError::InvalidShape(format!(
+            "matmul_add_residual_encode requires 2D residual, got {}D",
+            residual.ndim()
+        )));
+    }
+    if a.shape()[1] != b.shape()[0] {
+        return Err(KernelError::InvalidShape(format!(
+            "inner dimensions must match: {} vs {}",
+            a.shape()[1],
+            b.shape()[0]
+        )));
+    }
+    if a.dtype() != b.dtype() || a.dtype() != residual.dtype() {
+        return Err(KernelError::InvalidShape(format!(
+            "dtypes must match: a={:?}, b={:?}, residual={:?}",
+            a.dtype(),
+            b.dtype(),
+            residual.dtype()
+        )));
+    }
+
+    let m = a.shape()[0];
+    let k = a.shape()[1];
+    let n = b.shape()[1];
+
+    if residual.shape()[0] != m || residual.shape()[1] != n {
+        return Err(KernelError::InvalidShape(format!(
+            "residual shape [{}, {}] must match output shape [{}, {}]",
+            residual.shape()[0],
+            residual.shape()[1],
+            m,
+            n
+        )));
+    }
+    if !a.is_contiguous() {
+        return Err(KernelError::InvalidShape(
+            "matmul_add_residual_encode: input `a` must be contiguous".to_string(),
+        ));
+    }
+    if !b.is_contiguous() {
+        return Err(KernelError::InvalidShape(
+            "matmul_add_residual_encode: input `b` must be contiguous".to_string(),
+        ));
+    }
+    if !residual.is_contiguous() {
+        return Err(KernelError::InvalidShape(
+            "matmul_add_residual_encode: `residual` must be contiguous".to_string(),
+        ));
+    }
+
+    // Only MlxArch kernels support the residual epilogue
+    let tile = select_tile_config_with_dtype(m, n, k, a.dtype());
+    if tile.variant != TileVariant::MlxArch {
+        return Err(KernelError::NotFound(format!(
+            "matmul_add_residual_encode: only MlxArch tile supported, got {:?} (M={}, N={})",
+            tile.variant, m, n
+        )));
+    }
+
+    let kernel_name = match a.dtype() {
+        DType::Float16 => "gemm_mlx_f16",
+        DType::Float32 => "gemm_mlx_f32",
+        DType::Bfloat16 => "gemm_mlx_bf16",
+        _ => {
+            return Err(KernelError::NotFound(format!(
+                "matmul_add_residual_encode: unsupported dtype {:?}",
+                a.dtype()
+            )))
+        }
+    };
+
+    // Function constants: align_M (200), align_N (201), has_residual (202)
+    use crate::kernels::FunctionConstantValue;
+    let constants = vec![
+        (200, FunctionConstantValue::Bool(m % tile.bm == 0)),
+        (201, FunctionConstantValue::Bool(n % tile.bn == 0)),
+        (202, FunctionConstantValue::Bool(true)),
+        (203, FunctionConstantValue::Bool(false)),
+        (205, FunctionConstantValue::Bool(false)),
+    ];
+    let pipeline = registry.get_pipeline_with_constants(kernel_name, a.dtype(), &constants)?;
+
+    let dev = registry.device().raw();
+    let out = Array::uninit(dev, &[m, n], a.dtype());
+
+    // Encode into the provided encoder — do NOT call end_encoding()
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(a.metal_buffer()), a.offset() as u64);
+    encoder.set_buffer(1, Some(b.metal_buffer()), b.offset() as u64);
+    encoder.set_buffer(2, Some(out.metal_buffer()), 0);
+    set_u32(encoder, 3, super::checked_u32(m, "M")?);
+    set_u32(encoder, 4, super::checked_u32(n, "N")?);
+    set_u32(encoder, 5, super::checked_u32(k, "K")?);
+    set_u32(encoder, 6, super::checked_u32(m * k, "batch_stride_a")?);
+    set_u32(encoder, 7, super::checked_u32(k * n, "batch_stride_b")?);
+    set_u32(encoder, 8, super::checked_u32(m * n, "batch_stride_c")?);
+
+    let swizzle_log = compute_swizzle_log(m, n, tile.bm, tile.bn);
+    set_u32(encoder, 9, swizzle_log);
+
+    // Residual buffer at index 10
+    encoder.set_buffer(10, Some(residual.metal_buffer()), residual.offset() as u64);
+
+    let grid_x = ceil_div(n, tile.bn) as u64;
+    let grid_y = ceil_div(m, tile.bm) as u64;
+    let grid = MTLSize::new(grid_x, grid_y, 1);
+    let tg = MTLSize::new(128, 1, 1); // MlxArch = 128 threads (4 SG)
+    encoder.dispatch_thread_groups(grid, tg);
+
+    Ok(out)
+}
+
 /// Fused RMSNorm + GEMM: `C = matmul(RMSNorm(A, norm_weight, eps), B)`.
 ///
 /// Encodes two dispatches into an existing command buffer:

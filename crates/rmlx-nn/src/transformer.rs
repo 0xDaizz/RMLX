@@ -338,7 +338,8 @@ impl FeedForward {
                 // MlxArch residual epilogue requires M >= 33 (decode M=1 uses Simd tile)
                 // DEBUG: temporarily raised to 128 to isolate GPU error at seq_len=64
                 if hidden.shape()[0] >= 33 {
-                    down_proj.forward_with_residual_into_encoder(&hidden, residual, registry, encoder)
+                    down_proj
+                        .forward_with_residual_into_encoder(&hidden, residual, registry, encoder)
                 } else {
                     let ffn_out = down_proj.forward_into_encoder(&hidden, registry, encoder)?;
                     ops::binary::add_encode(registry, residual, &ffn_out, encoder)

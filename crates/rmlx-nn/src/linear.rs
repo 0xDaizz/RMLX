@@ -446,14 +446,7 @@ impl Linear {
             registry.get_pipeline(kernel_name, input_2d.dtype())?
         };
         let dev = registry.device().raw();
-        let output = Array::zeros(dev, &[m, n], input_2d.dtype());
-
-        let m_buf = make_u32_buf(dev, m_u32);
-        let n_buf = make_u32_buf(dev, n_u32);
-        let k_buf = make_u32_buf(dev, k_u32);
-        let bsa = make_u32_buf(dev, m_u32 * k_u32);
-        let bsb = make_u32_buf(dev, k_u32 * n_u32);
-        let bsc = make_u32_buf(dev, m_u32 * n_u32);
+        let output = Array::uninit(dev, &[m, n], input_2d.dtype());
 
         let bm = tile.bm as u64;
         let bn = tile.bn as u64;
@@ -465,15 +458,18 @@ impl Linear {
         enc.set_buffer(0, Some(input_2d.metal_buffer()), input_2d.offset() as u64);
         enc.set_buffer(1, Some(w_t.metal_buffer()), w_t.offset() as u64);
         enc.set_buffer(2, Some(output.metal_buffer()), output.offset() as u64);
-        enc.set_buffer(3, Some(&m_buf), 0);
-        enc.set_buffer(4, Some(&n_buf), 0);
-        enc.set_buffer(5, Some(&k_buf), 0);
-        enc.set_buffer(6, Some(&bsa), 0);
-        enc.set_buffer(7, Some(&bsb), 0);
-        enc.set_buffer(8, Some(&bsc), 0);
+        enc.set_bytes(3, 4, &m_u32 as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(4, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(5, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
+        let bsa_val = m_u32 * k_u32;
+        let bsb_val = k_u32 * n_u32;
+        let bsc_val = m_u32 * n_u32;
+        enc.set_bytes(6, 4, &bsa_val as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(7, 4, &bsb_val as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(8, 4, &bsc_val as *const u32 as *const std::ffi::c_void);
 
         // Steel, Full/Skinny/MlxArch kernels require swizzle_log (buffer 9)
-        let swizzle_log_buf = if matches!(
+        if matches!(
             tile.variant,
             ops::matmul::TileVariant::Full
                 | ops::matmul::TileVariant::Skinny
@@ -482,27 +478,23 @@ impl Linear {
                 | ops::matmul::TileVariant::MlxArchMicro
         ) {
             let swizzle_log = ops::matmul::compute_swizzle_log(m, n, tile.bm, tile.bn);
-            let buf = make_u32_buf(dev, swizzle_log);
-            enc.set_buffer(9, Some(&buf), 0);
-            Some(buf)
-        } else {
-            None
-        };
+            enc.set_bytes(9, 4, &swizzle_log as *const u32 as *const std::ffi::c_void);
+        }
 
         let tg_threads = match tile.variant {
             ops::matmul::TileVariant::Small => 256_u64,
             ops::matmul::TileVariant::Medium | ops::matmul::TileVariant::Simd => 1024_u64,
             ops::matmul::TileVariant::Skinny | ops::matmul::TileVariant::Full => 256_u64,
-            ops::matmul::TileVariant::MlxArch
-            | ops::matmul::TileVariant::MlxArchSmall
-            | ops::matmul::TileVariant::MlxArchMicro => 64_u64,
+            ops::matmul::TileVariant::MlxArch => 128_u64,
+            ops::matmul::TileVariant::MlxArchSmall | ops::matmul::TileVariant::MlxArchMicro => {
+                64_u64
+            }
         };
 
         let grid = metal::MTLSize::new(grid_x, grid_y, 1);
         let tg = metal::MTLSize::new(tg_threads, 1, 1);
         enc.dispatch_thread_groups(grid, tg);
         enc.end_encoding();
-        drop(swizzle_log_buf);
 
         Ok(output)
     }
@@ -550,13 +542,100 @@ impl Linear {
 
         ops::matmul::matmul_encode(registry, &input_2d, w_t, encoder)
     }
-}
 
-/// Create a constant `u32` Metal buffer.
-fn make_u32_buf(device: &metal::DeviceRef, val: u32) -> metal::Buffer {
-    device.new_buffer_with_data(
-        &val as *const u32 as *const std::ffi::c_void,
-        4,
-        metal::MTLResourceOptions::StorageModeShared,
-    )
+    // -------------------------------------------------------------------
+    // Fused GEMM + residual epilogue (DR-2)
+    // -------------------------------------------------------------------
+
+    /// Encode fused linear + residual add into an existing command buffer.
+    ///
+    /// Computes `output = input @ W^T + residual` in a single GEMM dispatch
+    /// using the residual epilogue (function constant 202). This eliminates a
+    /// separate element-wise add dispatch for the residual connection.
+    ///
+    /// **Constraints:**
+    /// - Only MlxArch tile variant is supported (M >= 33 in prefill).
+    /// - `residual` must have shape `[M, out_features]` matching the output.
+    /// - Bias is NOT supported in the fused path.
+    /// - Requires pre-cached transposed weight (`prepare_weight_t()` must have been called).
+    pub fn forward_with_residual_into_cb(
+        &self,
+        input: &Array,
+        residual: &Array,
+        registry: &KernelRegistry,
+        cb: &metal::CommandBufferRef,
+    ) -> Result<Array, KernelError> {
+        let w_t = self.weight_t_cached.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape(
+                "Linear::forward_with_residual_into_cb requires pre-cached transposed weight \
+                 (call prepare_weight_t first)"
+                    .into(),
+            )
+        })?;
+
+        let input_2d = if input.ndim() == 1 {
+            input.reshape(vec![1, input.shape()[0]])?
+        } else if input.ndim() == 2 {
+            input.reshape(vec![input.shape()[0], input.shape()[1]])?
+        } else {
+            return Err(KernelError::InvalidShape(format!(
+                "input must be 1D or 2D, got {}D",
+                input.ndim()
+            )));
+        };
+
+        if input_2d.shape()[1] != self.config.in_features {
+            return Err(KernelError::InvalidShape(format!(
+                "input features mismatch: {} vs {}",
+                input_2d.shape()[1],
+                self.config.in_features
+            )));
+        }
+
+        ops::matmul::matmul_add_residual_into_cb(registry, &input_2d, w_t, residual, cb)
+    }
+
+    /// Encode fused linear + residual add into an existing compute command encoder.
+    ///
+    /// Computes `output = input @ W^T + residual` in a single GEMM dispatch.
+    /// Does NOT call `end_encoding()` — the caller manages the encoder lifecycle.
+    ///
+    /// **Constraints:** same as [`forward_with_residual_into_cb`] — only MlxArch,
+    /// pre-cached transposed weight required, no bias support.
+    pub fn forward_with_residual_into_encoder(
+        &self,
+        input: &Array,
+        residual: &Array,
+        registry: &KernelRegistry,
+        encoder: &metal::ComputeCommandEncoderRef,
+    ) -> Result<Array, KernelError> {
+        let w_t = self.weight_t_cached.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape(
+                "Linear::forward_with_residual_into_encoder requires pre-cached transposed \
+                 weight (call prepare_weight_t first)"
+                    .into(),
+            )
+        })?;
+
+        let input_2d = if input.ndim() == 1 {
+            input.reshape(vec![1, input.shape()[0]])?
+        } else if input.ndim() == 2 {
+            input.reshape(vec![input.shape()[0], input.shape()[1]])?
+        } else {
+            return Err(KernelError::InvalidShape(format!(
+                "input must be 1D or 2D, got {}D",
+                input.ndim()
+            )));
+        };
+
+        if input_2d.shape()[1] != self.config.in_features {
+            return Err(KernelError::InvalidShape(format!(
+                "input features mismatch: {} vs {}",
+                input_2d.shape()[1],
+                self.config.in_features
+            )));
+        }
+
+        ops::matmul::matmul_add_residual_encode(registry, &input_2d, w_t, residual, encoder)
+    }
 }

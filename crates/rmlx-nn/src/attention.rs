@@ -3364,13 +3364,31 @@ impl Attention {
             } else {
                 // Separate Q/K/V buffers — use individual dispatches
                 q_batched = ops::rope::rope_multihead_into_cb(
-                    registry, &q, cos, sin, num_heads, rope_offset, q_row_stride, cb,
+                    registry,
+                    &q,
+                    cos,
+                    sin,
+                    num_heads,
+                    rope_offset,
+                    q_row_stride,
+                    cb,
                 )?;
                 k_batched = ops::rope::rope_multihead_into_cb(
-                    registry, &k, cos, sin, num_kv_heads, rope_offset, k_row_stride, cb,
+                    registry,
+                    &k,
+                    cos,
+                    sin,
+                    num_kv_heads,
+                    rope_offset,
+                    k_row_stride,
+                    cb,
                 )?;
                 v_batched = ops::rope::deinterleave_heads_into_cb(
-                    registry, &v, num_kv_heads, v_row_stride, cb,
+                    registry,
+                    &v,
+                    num_kv_heads,
+                    v_row_stride,
+                    cb,
                 )?;
             }
         } else {
@@ -3384,7 +3402,11 @@ impl Attention {
                 cb,
             )?;
             v_batched = ops::rope::deinterleave_heads_into_cb(
-                registry, &v, num_kv_heads, v_row_stride, cb,
+                registry,
+                &v,
+                num_kv_heads,
+                v_row_stride,
+                cb,
             )?;
         }
 
@@ -3649,16 +3671,12 @@ impl Attention {
         // Deinterleave + RoPE for Q and K, then deinterleave V.
         // All three are deinterleaved before SDPA so V is contiguous — strided V
         // had terrible cache line utilization (2.8%: head_dim=128 vs stride=4608).
-        let q_batched;
-        let k_batched;
-        let v_batched;
-
         let q_row_stride = q.strides()[0];
         let k_row_stride = k.strides()[0];
         let v_row_stride = v.strides()[0];
 
-        if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
-            q_batched = ops::rope::rope_multihead_encode(
+        let (q_batched, k_batched) = if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
+            let q_b = ops::rope::rope_multihead_encode(
                 registry,
                 &q,
                 cos,
@@ -3668,7 +3686,7 @@ impl Attention {
                 q_row_stride,
                 encoder,
             )?;
-            k_batched = ops::rope::rope_multihead_encode(
+            let k_b = ops::rope::rope_multihead_encode(
                 registry,
                 &k,
                 cos,
@@ -3678,24 +3696,26 @@ impl Attention {
                 k_row_stride,
                 encoder,
             )?;
+            (q_b, k_b)
         } else {
-            q_batched = ops::rope::deinterleave_heads_encode(
+            let q_b = ops::rope::deinterleave_heads_encode(
                 registry,
                 &q,
                 num_heads,
                 q_row_stride,
                 encoder,
             )?;
-            k_batched = ops::rope::deinterleave_heads_encode(
+            let k_b = ops::rope::deinterleave_heads_encode(
                 registry,
                 &k,
                 num_kv_heads,
                 k_row_stride,
                 encoder,
             )?;
-        }
+            (q_b, k_b)
+        };
         // Deinterleave V — always done before SDPA for contiguous memory access
-        v_batched = ops::rope::deinterleave_heads_encode(
+        let v_batched = ops::rope::deinterleave_heads_encode(
             registry,
             &v,
             num_kv_heads,
@@ -3747,7 +3767,6 @@ impl Attention {
         let use_mma_bk32 = is_f16_d128 && !use_nax && total_seq >= 256;
         // All SDPA kernels (MMA + NAX) now write seq-major output.
         let seq_major_output = true;
-
 
         let attn_slab = if use_nax {
             ops::sdpa::sdpa_prefill_nax_f16_encode(
