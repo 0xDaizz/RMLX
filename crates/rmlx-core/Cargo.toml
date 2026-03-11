@@ -73,3 +73,7 @@ harness = false
 [[bench]]
 name = "qmm_dispatch_bench"
 harness = false
+
+[[bench]]
+name = "nax_transition_bench"
+harness = false

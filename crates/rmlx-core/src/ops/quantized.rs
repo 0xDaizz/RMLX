@@ -3235,7 +3235,7 @@ kernel void affine_qmm_mma_q4(
 ///
 /// TG memory: Ws[BN × BK_padded] = 64 × 72 × 2 = 9,216 bytes
 /// Grid: (ceil(N/64), ceil(M/64), 1) threadgroups, 128 threads each
-/// Requires: K % 64 == 0, Metal 4.0+ (MetalPerformancePrimitives)
+/// Requires: Metal 4.0+ (MetalPerformancePrimitives). align_K specialization for K%64!=0.
 pub const QMM_NAX_Q4_SHADER_SOURCE: &str = r#"
 #include <metal_stdlib>
 #include <metal_simdgroup>
@@ -3267,6 +3267,7 @@ constant constexpr uint NAX_TK = 2;   // SK / UK = 32 / 16
 constant bool align_M [[function_constant(200)]];
 constant bool align_N [[function_constant(201)]];
 constant uint fc_group_size [[function_constant(205)]];
+constant bool align_K [[function_constant(206)]];
 
 // BaseNAXFrag coordinate: per-lane position in 16×16 fragment (32 lanes)
 // Each lane owns 2 rows × 4 cols = 8 elements
@@ -3354,21 +3355,35 @@ kernel void affine_qmm_nax_q4(
                 // Scale/bias for this thread's K range
                 uint group_k_start = kb + k_byte_offset * 2; // each byte = 2 Q4 values
                 uint group_idx = group_k_start / fc_group_size;
+                // Clamp to valid range when at tail (non-aligned K)
+                if (!align_K && group_idx >= groups_per_row) {
+                    group_idx = groups_per_row - 1;
+                }
                 half scale = scales[gn * groups_per_row + group_idx];
                 half bias  = biases[gn * groups_per_row + group_idx];
                 half scale_hi = scale / half(16.0f);
 
                 // Dequant 16 bytes → 32 halfs, write to N-major TG memory
                 for (uint r = 0; r < bytes_per_thread; r++) {
-                    uint8_t byte_val = src[r];
                     uint k_idx = k_byte_offset * 2 + r * 2;
+                    uint gk = kb + k_idx;  // global K index for this pair
 
-                    half w_lo = scale * half(byte_val & 0x0f) + bias;
-                    half w_hi = scale_hi * half(byte_val & 0xf0) + bias;
-
-                    // N-major TG write: Ws[n][k] — compatible with fragment reader
-                    Ws[n_local * NAX_BK_PAD + k_idx]     = w_lo;
-                    Ws[n_local * NAX_BK_PAD + k_idx + 1] = w_hi;
+                    if (align_K || gk + 1 < uK) {
+                        uint8_t byte_val = src[r];
+                        half w_lo = scale * half(byte_val & 0x0f) + bias;
+                        half w_hi = scale_hi * half(byte_val & 0xf0) + bias;
+                        Ws[n_local * NAX_BK_PAD + k_idx]     = w_lo;
+                        Ws[n_local * NAX_BK_PAD + k_idx + 1] = w_hi;
+                    } else if (!align_K && gk < uK) {
+                        // Partial: only low nibble is valid
+                        uint8_t byte_val = src[r];
+                        half w_lo = scale * half(byte_val & 0x0f) + bias;
+                        Ws[n_local * NAX_BK_PAD + k_idx]     = w_lo;
+                        Ws[n_local * NAX_BK_PAD + k_idx + 1] = half(0);
+                    } else {
+                        Ws[n_local * NAX_BK_PAD + k_idx]     = half(0);
+                        Ws[n_local * NAX_BK_PAD + k_idx + 1] = half(0);
+                    }
                 }
             } else {
                 // Out-of-bounds N: zero-fill
@@ -3402,7 +3417,12 @@ kernel void affine_qmm_nax_q4(
                             uint c = a_col_base + uint(coord.fn);
                             if (align_M || r < uM) {
                                 for (short cj = 0; cj < 4; cj++) {
-                                    a_frag[ri * 4 + cj] = x[r * uK + c + uint(cj)];
+                                    uint ck = c + uint(cj);
+                                    if (align_K || ck < uK) {
+                                        a_frag[ri * 4 + cj] = x[r * uK + ck];
+                                    } else {
+                                        a_frag[ri * 4 + cj] = half(0);
+                                    }
                                 }
                             } else {
                                 for (short cj = 0; cj < 4; cj++) {
@@ -5648,28 +5668,16 @@ pub fn affine_quantized_matmul_batched(
 
     let result = if qw.bits == 4 {
         // Q4 dispatch priority:
-        // 1. NAX (M >= 32, K % 64 == 0): K-coalesced dequant loader, 4 SG MMA
-        // 2. Steel (M >= 32, K % 64 != 0): handles any K alignment
-        // 3. BatchQMV (M <= qmv_limit, K%512==0): fastest at low M
-        // 4. Skinny (M <= 32): split-K for best low-M utilization
-        // 5. Standard MMA: fallback (rarely reached)
+        // 1. NAX (M >= 32): K-coalesced dequant, 4 SG MMA, align_K specialization
+        // 2. BatchQMV (M <= qmv_limit, K%512==0): fastest at low M
+        // 3. Skinny (M <= 32): split-K for best low-M utilization
+        // 4. Standard MMA: fallback (rarely reached)
         const MMA_MIN_M: usize = 32;
 
         if m >= MMA_MIN_M {
-            if k % 64 == 0 {
-                // --- NAX path: K-coalesced dequant, 4 SG (2×2), 128 threads ---
-                // NAX kernel produces f16 output directly.
-                return affine_quantized_matmul_nax(registry, x, qw, queue);
-            } else {
-                // --- Steel path: BK=32 + double-buffer, handles any K alignment ---
-                // Steel kernel produces f32 output; cast to f16 for Q4 consistency.
-                let steel_out = affine_quantized_matmul_steel(registry, x, qw, queue)?;
-                if steel_out.dtype() == DType::Float32 {
-                    return super::copy::copy_cast(registry, &steel_out, DType::Float16, queue);
-                } else {
-                    return Ok(steel_out);
-                }
-            }
+            // NAX handles all K alignments via align_K function constant.
+            // K-aligned path (K%64==0) has zero overhead vs previous implementation.
+            return affine_quantized_matmul_nax(registry, x, qw, queue);
         }
 
         // Q4 non-NAX dispatch: shape-aware kernel selection
@@ -6690,7 +6698,7 @@ pub fn affine_quantized_matmul_nax(
 /// Encodes into an existing command buffer. Requires:
 /// - `x` is Float16 (half) with shape [M, K]
 /// - `qw.bits == 4`
-/// - K % 64 == 0
+/// - align_K specialization handles K%64!=0 via function constant
 ///
 /// Grid: (ceil(N/64), ceil(M/64), 1), 128 threads/group
 /// TG memory: 9216 bytes (64 × 72 × 2)
@@ -6726,13 +6734,6 @@ pub fn affine_qmm_nax_q4_into_cb(
         )));
     }
     let k = qw.in_features;
-    if k % 64 != 0 {
-        return Err(KernelError::InvalidShape(format!(
-            "affine_qmm_nax_q4_into_cb requires K % 64 == 0, got K={}",
-            k
-        )));
-    }
-
     let m = x.shape()[0];
     let n = qw.out_features;
 
@@ -6747,10 +6748,12 @@ pub fn affine_qmm_nax_q4_into_cb(
     let align_m = m % NAX_BM == 0;
     let align_n = n % NAX_BN == 0;
 
+    let align_k = k % 64 == 0;
     let nax_constants = [
         (200u32, FunctionConstantValue::Bool(align_m)),
         (201u32, FunctionConstantValue::Bool(align_n)),
         (205u32, FunctionConstantValue::U32(qw.group_size)),
+        (206u32, FunctionConstantValue::Bool(align_k)),
     ];
     let pipeline = registry.get_pipeline_with_constants(
         "affine_qmm_nax_q4",
