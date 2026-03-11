@@ -3397,7 +3397,7 @@ pub fn sdpa(
             let m_c = super::make_contiguous(m, registry, queue)?;
             let m = m_c.as_ref().unwrap_or(m);
             let dev = registry.device().raw();
-            let expanded = Array::zeros(dev, &[n, s], m.dtype());
+            let expanded = Array::uninit(dev, &[n, s], m.dtype());
             let src = m.metal_buffer().contents() as *const u8;
             let dst = expanded.metal_buffer().contents() as *mut u8;
             let row_bytes = m
@@ -3405,7 +3405,7 @@ pub fn sdpa(
                 .numel_to_bytes(s)
                 .expect("numel must be block-aligned");
             // SAFETY: SharedMode buffers are CPU-accessible; bounds checked by
-            // Array::zeros allocation and row_bytes computation.
+            // Array::uninit allocation and row_bytes computation.
             unsafe {
                 let src_ptr = src.add(m.offset());
                 for row in 0..n {
@@ -3465,7 +3465,7 @@ pub fn sdpa(
     let dev = registry.device().raw();
 
     // Output array
-    let out = Array::zeros(dev, &[n, d], q.dtype());
+    let out = Array::uninit(dev, &[n, d], q.dtype());
 
     // Params buffer: [N, S, D, has_mask, is_causal]
     let has_mask: u32 = if mask_ref.is_some() { 1 } else { 0 };
@@ -3582,15 +3582,15 @@ pub fn sdpa_batched(
 // Into-CB variants (encode into existing command buffer, no commit/wait)
 // ---------------------------------------------------------------------------
 
-/// Encode SDPA into an existing command buffer (no commit/wait).
-pub fn sdpa_into_cb(
+/// Private: encode SDPA into an existing compute encoder (does NOT call end_encoding).
+fn sdpa_encode_impl(
     registry: &KernelRegistry,
     q: &Array,
     k: &Array,
     v: &Array,
     mask: Option<&Array>,
     scale: f32,
-    cb: &metal::CommandBufferRef,
+    encoder: &metal::ComputeCommandEncoderRef,
 ) -> Result<Array, KernelError> {
     // Validate dtypes: Q, K, V must all share the same dtype
     if q.dtype() != k.dtype() || q.dtype() != v.dtype() {
@@ -3696,7 +3696,7 @@ pub fn sdpa_into_cb(
     let out = Array::uninit(dev, &[n, d], q.dtype());
 
     let has_mask: u32 = if mask.is_some() { 1 } else { 0 };
-    let is_causal_u32: u32 = 0; // into_cb path does not support causal flag
+    let is_causal_u32: u32 = 0; // encode path does not support causal flag
     let params: [u32; 5] = [n as u32, s as u32, d as u32, has_mask, is_causal_u32];
 
     let dummy_buf;
@@ -3708,7 +3708,6 @@ pub fn sdpa_into_cb(
     };
     let mask_offset = mask.map_or(0, |m| m.offset()) as u64;
 
-    let encoder = cb.new_compute_command_encoder();
     encoder.set_compute_pipeline_state(&pipeline);
     encoder.set_buffer(0, Some(q.metal_buffer()), q.offset() as u64);
     encoder.set_buffer(1, Some(k.metal_buffer()), k.offset() as u64);
@@ -3731,9 +3730,43 @@ pub fn sdpa_into_cb(
             MTLSize::new(tg_size, 1, 1),
         );
     }
-    encoder.end_encoding();
 
     Ok(out)
+}
+
+/// Encode SDPA into an existing command buffer (no commit/wait).
+pub fn sdpa_into_cb(
+    registry: &KernelRegistry,
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    mask: Option<&Array>,
+    scale: f32,
+    cb: &metal::CommandBufferRef,
+) -> Result<Array, KernelError> {
+    let encoder = cb.new_compute_command_encoder();
+    let result = sdpa_encode_impl(registry, q, k, v, mask, scale, encoder);
+    if result.is_err() {
+        encoder.end_encoding();
+        return result;
+    }
+    encoder.end_encoding();
+    result
+}
+
+/// Encode SDPA into an existing compute encoder (no encoder create/end).
+///
+/// Caller is responsible for creating and ending the encoder.
+pub fn sdpa_encode(
+    registry: &KernelRegistry,
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    mask: Option<&Array>,
+    scale: f32,
+    encoder: &metal::ComputeCommandEncoderRef,
+) -> Result<Array, KernelError> {
+    sdpa_encode_impl(registry, q, k, v, mask, scale, encoder)
 }
 
 /// Encode batched SDPA (multi-head) into an existing command buffer (no commit/wait).
@@ -3841,7 +3874,7 @@ pub fn sdpa_prefill_gqa_slab_into_cb(
     let dev = registry.device().raw();
 
     let out_numel = num_heads * seq_len * head_dim;
-    let out = Array::zeros(dev, &[out_numel], dtype);
+    let out = Array::uninit(dev, &[out_numel], dtype);
 
     let has_mask_u32: u32 = if mask.is_some() { 1 } else { 0 };
     let is_causal_u32: u32 = if is_causal { 1 } else { 0 };
@@ -3959,7 +3992,7 @@ pub fn sdpa_prefill_mma_f16_into_cb(
     let dev = registry.device().raw();
 
     let out_numel = num_heads * seq_len * head_dim;
-    let out = Array::zeros(dev, &[out_numel], dtype);
+    let out = Array::uninit(dev, &[out_numel], dtype);
 
     let n_val = seq_len as u32;
     let s_val = kv_len as u32;
@@ -4102,7 +4135,7 @@ pub fn sdpa_prefill_mma_bk32_f16_into_cb(
     let dev = registry.device().raw();
 
     let out_numel = num_heads * seq_len * head_dim;
-    let out = Array::zeros(dev, &[out_numel], dtype);
+    let out = Array::uninit(dev, &[out_numel], dtype);
 
     let n_val = seq_len as u32;
     let s_val = kv_len as u32;
@@ -4210,7 +4243,7 @@ pub fn sdpa_prefill_nax_f16_into_cb(
     let dev = registry.device().raw();
 
     let out_numel = num_heads * seq_len * head_dim;
-    let out = Array::zeros(dev, &[out_numel], dtype);
+    let out = Array::uninit(dev, &[out_numel], dtype);
 
     let n_val = seq_len as u32;
     let s_val = kv_len as u32;
@@ -4242,6 +4275,420 @@ pub fn sdpa_prefill_nax_f16_into_cb(
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------
+// _encode variants — accept &ComputeCommandEncoderRef instead of &CommandBufferRef
+// ---------------------------------------------------------------------------
+
+/// Encode GQA slab SDPA prefill into an existing compute command encoder.
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_prefill_gqa_slab_encode(
+    registry: &KernelRegistry,
+    q_slab: &Array,
+    k_slab: &Array,
+    v_slab: &Array,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    seq_len: usize,
+    kv_len: usize,
+    kv_seq_stride: Option<usize>,
+    mask: Option<&Array>,
+    scale: f32,
+    is_causal: bool,
+    encoder: &metal::ComputeCommandEncoderRef,
+) -> Result<Array, KernelError> {
+    let dtype = q_slab.dtype();
+
+    if dtype != DType::Float16 {
+        return Err(KernelError::NotFound(format!(
+            "sdpa_prefill_gqa: only f16 supported, got {:?}",
+            dtype
+        )));
+    }
+
+    if num_kv_heads == 0 || num_heads % num_kv_heads != 0 {
+        return Err(KernelError::InvalidShape(format!(
+            "sdpa_prefill_gqa: num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
+        )));
+    }
+    if head_dim > 128 {
+        return Err(KernelError::InvalidShape(format!(
+            "sdpa_prefill_gqa: head_dim {head_dim} > 128 not supported (D>128 needs O_acc2)"
+        )));
+    }
+
+    let gqa_ratio = num_heads / num_kv_heads;
+    let stride_s = kv_seq_stride.unwrap_or(kv_len);
+    if stride_s < kv_len {
+        return Err(KernelError::InvalidShape(format!(
+            "sdpa_prefill_gqa: kv_seq_stride ({stride_s}) must be >= kv_len ({kv_len})"
+        )));
+    }
+
+    let pipeline = registry.get_pipeline("sdpa_prefill_gqa_f16", dtype)?;
+    let dev = registry.device().raw();
+
+    let out_numel = num_heads * seq_len * head_dim;
+    let out = Array::uninit(dev, &[out_numel], dtype);
+
+    let has_mask_u32: u32 = if mask.is_some() { 1 } else { 0 };
+    let is_causal_u32: u32 = if is_causal { 1 } else { 0 };
+    let n_q_blocks = seq_len.div_ceil(BR);
+    let params: [u32; 10] = [
+        seq_len as u32,
+        kv_len as u32,
+        head_dim as u32,
+        has_mask_u32,
+        is_causal_u32,
+        num_heads as u32,
+        num_kv_heads as u32,
+        gqa_ratio as u32,
+        n_q_blocks as u32,
+        stride_s as u32,
+    ];
+
+    let dummy_buf;
+    let mask_buf = if let Some(m) = mask {
+        m.metal_buffer()
+    } else {
+        dummy_buf = dev.new_buffer(4, metal::MTLResourceOptions::StorageModeShared);
+        &dummy_buf
+    };
+    let mask_offset = mask.map_or(0, |m| m.offset()) as u64;
+
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(q_slab.metal_buffer()), q_slab.offset() as u64);
+    encoder.set_buffer(1, Some(k_slab.metal_buffer()), k_slab.offset() as u64);
+    encoder.set_buffer(2, Some(v_slab.metal_buffer()), v_slab.offset() as u64);
+    encoder.set_buffer(3, Some(out.metal_buffer()), 0);
+    encoder.set_buffer(4, Some(mask_buf), mask_offset);
+    encoder.set_bytes(
+        5,
+        std::mem::size_of::<[u32; 10]>() as u64,
+        params.as_ptr() as *const std::ffi::c_void,
+    );
+    encoder.set_bytes(6, 4, &scale as *const f32 as *const std::ffi::c_void);
+
+    let total_tgs = (n_q_blocks * num_kv_heads) as u64;
+    let tg_size = std::cmp::min(THREADS_PER_TG, pipeline.max_total_threads_per_threadgroup());
+    encoder.dispatch_thread_groups(MTLSize::new(total_tgs, 1, 1), MTLSize::new(tg_size, 1, 1));
+
+    Ok(out)
+}
+
+/// Encode MMA-based SDPA prefill (f16, D=128) into an existing compute command encoder.
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_prefill_mma_f16_encode(
+    registry: &KernelRegistry,
+    q_slab: &Array,
+    k_slab: &Array,
+    v_slab: &Array,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    seq_len: usize,
+    kv_len: usize,
+    kv_seq_stride: Option<usize>,
+    mask: Option<&Array>,
+    scale: f32,
+    is_causal: bool,
+    encoder: &metal::ComputeCommandEncoderRef,
+) -> Result<Array, KernelError> {
+    use crate::kernels::FunctionConstantValue;
+
+    let dtype = q_slab.dtype();
+    if dtype != DType::Float16 {
+        return Err(KernelError::NotFound(format!(
+            "sdpa_prefill_mma: only f16 supported, got {:?}",
+            dtype
+        )));
+    }
+    if head_dim != 128 {
+        return Err(KernelError::InvalidShape(format!(
+            "sdpa_prefill_mma: only head_dim=128 supported, got {head_dim}"
+        )));
+    }
+    if num_kv_heads == 0 || num_heads % num_kv_heads != 0 {
+        return Err(KernelError::InvalidShape(format!(
+            "sdpa_prefill_mma: num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
+        )));
+    }
+
+    let gqa_factor = (num_heads / num_kv_heads) as u32;
+    let align_q = seq_len % MMA_BQ == 0;
+    let align_k = kv_len % MMA_BK == 0;
+    let has_mask_val = mask.is_some();
+
+    let constants = vec![
+        (200u32, FunctionConstantValue::Bool(align_q)),
+        (201, FunctionConstantValue::Bool(align_k)),
+        (300, FunctionConstantValue::Bool(is_causal)),
+        (301, FunctionConstantValue::Bool(has_mask_val)),
+    ];
+
+    let pipeline =
+        registry.get_pipeline_with_constants("sdpa_prefill_mma_f16", dtype, &constants)?;
+    let dev = registry.device().raw();
+
+    let out_numel = num_heads * seq_len * head_dim;
+    let out = Array::uninit(dev, &[out_numel], dtype);
+
+    let n_val = seq_len as u32;
+    let s_val = kv_len as u32;
+    let d_val = head_dim as u32;
+
+    let dummy_buf;
+    let mask_metal_buf = if let Some(m) = mask {
+        m.metal_buffer()
+    } else {
+        dummy_buf = dev.new_buffer(4, metal::MTLResourceOptions::StorageModeShared);
+        &dummy_buf
+    };
+    let mask_offset = mask.map_or(0, |m| m.offset()) as u64;
+
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(q_slab.metal_buffer()), q_slab.offset() as u64);
+    encoder.set_buffer(1, Some(k_slab.metal_buffer()), k_slab.offset() as u64);
+    encoder.set_buffer(2, Some(v_slab.metal_buffer()), v_slab.offset() as u64);
+    encoder.set_buffer(3, Some(out.metal_buffer()), 0);
+    encoder.set_buffer(4, Some(mask_metal_buf), mask_offset);
+    encoder.set_bytes(5, 4, &n_val as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(6, 4, &s_val as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(7, 4, &d_val as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(8, 4, &gqa_factor as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(9, 4, &scale as *const f32 as *const std::ffi::c_void);
+    let stride_s_val = kv_seq_stride.unwrap_or(kv_len) as u32;
+    encoder.set_bytes(
+        10,
+        4,
+        &stride_s_val as *const u32 as *const std::ffi::c_void,
+    );
+    let num_q_heads_val = num_heads as u32;
+    encoder.set_bytes(
+        11,
+        4,
+        &num_q_heads_val as *const u32 as *const std::ffi::c_void,
+    );
+
+    let n_q_blocks = seq_len.div_ceil(MMA_BQ) as u64;
+    let tg_size = std::cmp::min(MMA_THREADS, pipeline.max_total_threads_per_threadgroup());
+    encoder.dispatch_thread_groups(
+        MTLSize::new(n_q_blocks, num_heads as u64, 1),
+        MTLSize::new(tg_size, 1, 1),
+    );
+
+    Ok(out)
+}
+
+/// Encode MMA SDPA prefill with BK=32 into an existing compute command encoder.
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_prefill_mma_bk32_f16_encode(
+    registry: &KernelRegistry,
+    q_slab: &Array,
+    k_slab: &Array,
+    v_slab: &Array,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    seq_len: usize,
+    kv_len: usize,
+    kv_seq_stride: Option<usize>,
+    mask: Option<&Array>,
+    scale: f32,
+    is_causal: bool,
+    encoder: &metal::ComputeCommandEncoderRef,
+) -> Result<Array, KernelError> {
+    use crate::kernels::FunctionConstantValue;
+
+    let dtype = q_slab.dtype();
+    if dtype != DType::Float16 {
+        return Err(KernelError::NotFound(format!(
+            "sdpa_prefill_mma_bk32: only f16 supported, got {:?}",
+            dtype
+        )));
+    }
+    if head_dim != 128 {
+        return Err(KernelError::InvalidShape(format!(
+            "sdpa_prefill_mma_bk32: only head_dim=128 supported, got {head_dim}"
+        )));
+    }
+    if num_kv_heads == 0 || num_heads % num_kv_heads != 0 {
+        return Err(KernelError::InvalidShape(format!(
+            "sdpa_prefill_mma_bk32: num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
+        )));
+    }
+
+    let gqa_factor = (num_heads / num_kv_heads) as u32;
+    let align_q = seq_len % MMA_BQ == 0;
+    let align_k = kv_len % MMA_BK32 == 0;
+    let has_mask_val = mask.is_some();
+
+    let constants = vec![
+        (200u32, FunctionConstantValue::Bool(align_q)),
+        (201, FunctionConstantValue::Bool(align_k)),
+        (300, FunctionConstantValue::Bool(is_causal)),
+        (301, FunctionConstantValue::Bool(has_mask_val)),
+    ];
+
+    let pipeline =
+        registry.get_pipeline_with_constants("sdpa_prefill_mma_bk32_f16", dtype, &constants)?;
+
+    let max_threads = pipeline.max_total_threads_per_threadgroup();
+    if max_threads < MMA_THREADS {
+        eprintln!(
+            "sdpa_prefill_mma_bk32: max_threads={max_threads} < {MMA_THREADS}, falling back to BK=16"
+        );
+        return sdpa_prefill_mma_f16_encode(
+            registry,
+            q_slab,
+            k_slab,
+            v_slab,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            seq_len,
+            kv_len,
+            kv_seq_stride,
+            mask,
+            scale,
+            is_causal,
+            encoder,
+        );
+    }
+
+    let dev = registry.device().raw();
+
+    let out_numel = num_heads * seq_len * head_dim;
+    let out = Array::uninit(dev, &[out_numel], dtype);
+
+    let n_val = seq_len as u32;
+    let s_val = kv_len as u32;
+    let d_val = head_dim as u32;
+
+    let dummy_buf;
+    let mask_metal_buf = if let Some(m) = mask {
+        m.metal_buffer()
+    } else {
+        dummy_buf = dev.new_buffer(4, metal::MTLResourceOptions::StorageModeShared);
+        &dummy_buf
+    };
+    let mask_offset = mask.map_or(0, |m| m.offset()) as u64;
+
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(q_slab.metal_buffer()), q_slab.offset() as u64);
+    encoder.set_buffer(1, Some(k_slab.metal_buffer()), k_slab.offset() as u64);
+    encoder.set_buffer(2, Some(v_slab.metal_buffer()), v_slab.offset() as u64);
+    encoder.set_buffer(3, Some(out.metal_buffer()), 0);
+    encoder.set_buffer(4, Some(mask_metal_buf), mask_offset);
+    encoder.set_bytes(5, 4, &n_val as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(6, 4, &s_val as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(7, 4, &d_val as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(8, 4, &gqa_factor as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(9, 4, &scale as *const f32 as *const std::ffi::c_void);
+    let stride_s_val = kv_seq_stride.unwrap_or(kv_len) as u32;
+    encoder.set_bytes(
+        10,
+        4,
+        &stride_s_val as *const u32 as *const std::ffi::c_void,
+    );
+    let num_q_heads_val = num_heads as u32;
+    encoder.set_bytes(
+        11,
+        4,
+        &num_q_heads_val as *const u32 as *const std::ffi::c_void,
+    );
+
+    let n_q_blocks = seq_len.div_ceil(MMA_BQ) as u64;
+    let tg_size = MMA_THREADS;
+    encoder.dispatch_thread_groups(
+        MTLSize::new(n_q_blocks, num_heads as u64, 1),
+        MTLSize::new(tg_size, 1, 1),
+    );
+
+    Ok(out)
+}
+
+/// Encode NAX SDPA prefill into an existing compute command encoder.
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_prefill_nax_f16_encode(
+    registry: &KernelRegistry,
+    q_slab: &Array,
+    k_slab: &Array,
+    v_slab: &Array,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    seq_len: usize,
+    kv_len: usize,
+    kv_seq_stride: Option<usize>,
+    scale: f32,
+    is_causal: bool,
+    encoder: &metal::ComputeCommandEncoderRef,
+) -> Result<Array, KernelError> {
+    use crate::kernels::FunctionConstantValue;
+
+    let dtype = q_slab.dtype();
+    if dtype != DType::Float16 {
+        return Err(KernelError::NotFound(format!(
+            "sdpa_prefill_nax: only f16 supported, got {:?}",
+            dtype
+        )));
+    }
+    if head_dim != 128 {
+        return Err(KernelError::InvalidShape(format!(
+            "sdpa_prefill_nax: only head_dim=128 supported, got {head_dim}"
+        )));
+    }
+    if num_kv_heads == 0 || num_heads % num_kv_heads != 0 {
+        return Err(KernelError::InvalidShape(format!(
+            "sdpa_prefill_nax: num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
+        )));
+    }
+
+    let gqa_factor = (num_heads / num_kv_heads) as u32;
+    let align_q = seq_len % NAX_BQ == 0;
+    let align_k = kv_len % NAX_BK == 0;
+
+    let constants = vec![
+        (200u32, FunctionConstantValue::Bool(align_q)),
+        (201, FunctionConstantValue::Bool(align_k)),
+        (300, FunctionConstantValue::Bool(is_causal)),
+    ];
+
+    let pipeline =
+        registry.get_pipeline_with_constants("sdpa_prefill_nax_f16", dtype, &constants)?;
+    let dev = registry.device().raw();
+
+    let out_numel = num_heads * seq_len * head_dim;
+    let out = Array::uninit(dev, &[out_numel], dtype);
+
+    let n_val = seq_len as u32;
+    let s_val = kv_len as u32;
+    let d_val = head_dim as u32;
+
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(q_slab.metal_buffer()), q_slab.offset() as u64);
+    encoder.set_buffer(1, Some(k_slab.metal_buffer()), k_slab.offset() as u64);
+    encoder.set_buffer(2, Some(v_slab.metal_buffer()), v_slab.offset() as u64);
+    encoder.set_buffer(3, Some(out.metal_buffer()), 0);
+    encoder.set_bytes(4, 4, &n_val as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(5, 4, &s_val as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(6, 4, &d_val as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(7, 4, &gqa_factor as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(8, 4, &scale as *const f32 as *const std::ffi::c_void);
+    let stride_s_val = kv_seq_stride.unwrap_or(kv_len) as u32;
+    encoder.set_bytes(9, 4, &stride_s_val as *const u32 as *const std::ffi::c_void);
+
+    let n_q_blocks = seq_len.div_ceil(NAX_BQ) as u64;
+    let tg_size = std::cmp::min(NAX_THREADS, pipeline.max_total_threads_per_threadgroup());
+    encoder.dispatch_thread_groups(
+        MTLSize::new(n_q_blocks, num_heads as u64, 1),
+        MTLSize::new(tg_size, 1, 1),
+    );
+
+    Ok(out)
+}
+
 /// Diagnostic: compute only Q@K^T using NAX MMA, output float S matrix.
 /// For debugging cooperative tensor element mapping.
 #[allow(clippy::too_many_arguments)]
@@ -4258,7 +4705,7 @@ pub fn sdpa_nax_diag_qkt_into_cb(
     let pipeline = registry.get_pipeline("sdpa_nax_diag_qkt_f16", DType::Float16)?;
     let dev = registry.device().raw();
 
-    let out = Array::zeros(dev, &[seq_len * kv_len], DType::Float32);
+    let out = Array::uninit(dev, &[seq_len * kv_len], DType::Float32);
 
     let n_val = seq_len as u32;
     let s_val = kv_len as u32;
@@ -4292,7 +4739,7 @@ pub fn sdpa_nax_diag_single_mma_into_cb(
     let pipeline = registry.get_pipeline("sdpa_nax_diag_single_mma", DType::Float16)?;
     let dev = registry.device().raw();
 
-    let out = Array::zeros(dev, &[16 * 32], DType::Float32);
+    let out = Array::uninit(dev, &[16 * 32], DType::Float32);
 
     let encoder = cb.new_compute_command_encoder();
     encoder.set_compute_pipeline_state(&pipeline);
@@ -4463,7 +4910,7 @@ pub fn sdpa_decode_batched_slab_stride_into_cb(
     let pipeline = registry.get_pipeline_with_constants(kernel_name, dtype, &constants)?;
     let dev = registry.device().raw();
 
-    let out = Array::zeros(dev, &[q_expected], dtype);
+    let out = Array::uninit(dev, &[q_expected], dtype);
 
     let has_mask: u32 = if mask.is_some() { 1 } else { 0 };
     let params: [u32; 6] = [
@@ -4619,7 +5066,7 @@ pub fn sdpa_decode_batched_slab_stride_into_encoder(
     let pipeline = registry.get_pipeline_with_constants(kernel_name, dtype, &constants)?;
     let dev = registry.device().raw();
 
-    let out = Array::zeros(dev, &[q_expected], dtype);
+    let out = Array::uninit(dev, &[q_expected], dtype);
 
     let has_mask: u32 = if mask.is_some() { 1 } else { 0 };
     let params: [u32; 6] = [

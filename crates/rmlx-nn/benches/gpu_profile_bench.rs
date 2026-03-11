@@ -1,20 +1,23 @@
-//! Per-operation profiling benchmark for RMLX single-layer prefill pipeline.
+//! GPU-timestamp-based per-operation profiling benchmark for RMLX prefill.
 //!
-//! Breaks down the Llama-3 8B TransformerBlock `forward_prefill_single_cb`
-//! into individual operations, each measured with its own CommandBuffer +
-//! commit + wait_until_completed() for accurate per-op timing.
+//! Unlike `op_profile_bench.rs` which uses `Instant::now()` (wall-clock),
+//! this benchmark uses Metal's `GPUStartTime`/`GPUEndTime` properties on
+//! completed CommandBuffers to measure **pure GPU execution time**, excluding
+//! CB creation, commit, and CPU-side wait overhead.
 //!
-//! Uses low-level `ops::*_into_cb` functions directly with raw weight
-//! matrices, avoiding private struct field access.
-//!
-//! SDPA dispatch mirrors the production path in attention.rs:
-//!   NAX (M3+) > MMA BK=32 (total_seq>=256) > MMA BK=16 (fallback)
-//! All variants use is_causal=true (no explicit mask).
+//! This enables accurate per-op breakdown where Sum(GPU times) can be
+//! meaningfully compared against a full-pipeline GPU time to measure
+//! true GPU pipelining overlap.
 //!
 //! Run with:
-//!   cargo bench -p rmlx-nn --bench op_profile_bench
+//!   cargo bench -p rmlx-nn --bench gpu_profile_bench
 
-use std::time::{Duration, Instant};
+#![allow(unexpected_cfgs)]
+
+#[macro_use]
+extern crate objc;
+
+use std::time::Instant;
 
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
@@ -45,7 +48,7 @@ const V_DIM: usize = NUM_KV_HEADS * HEAD_DIM; // 1024
 const TOTAL_QKV: usize = Q_DIM + K_DIM + V_DIM; // 6144
 
 const SEQ_LENS: &[usize] = &[128, 256, 512, 1024, 2048];
-const WARMUP_ITERS: usize = 3;
+const WARMUP_ITERS: usize = 5;
 const BENCH_ITERS: usize = 20;
 
 // ---------------------------------------------------------------------------
@@ -155,29 +158,18 @@ fn build_transformer_block(device: &metal::Device) -> TransformerBlock {
 // Build merged transposed weight on CPU
 // ---------------------------------------------------------------------------
 
-/// Build a transposed merged weight matrix on CPU.
-///
-/// Given weight matrices W1=[out1, in], W2=[out2, in], ...,
-/// produces the transpose of the row-concatenation:
-///   merged = [W1; W2; ...] has shape [sum(out_i), in]
-///   merged^T has shape [in, sum(out_i)]
-///
-/// We directly produce the transposed layout.
 fn build_merged_weight_t(
     device: &metal::Device,
-    weights_row_major: &[(&[u8], usize, usize)], // (bytes, rows=out, cols=in)
+    weights_row_major: &[(&[u8], usize, usize)],
 ) -> Array {
     let in_dim = weights_row_major[0].2;
     let total_out: usize = weights_row_major.iter().map(|w| w.1).sum();
 
-    // Result: [in_dim, total_out] in row-major (i.e., transposed merged)
     let mut result_bytes = vec![0u8; in_dim * total_out * 2];
 
     let mut col_offset = 0;
     for &(bytes, rows, cols) in weights_row_major {
         assert_eq!(cols, in_dim);
-        // Source: [rows, cols] row-major
-        // Dest:   [cols, total_out] row-major, writing at column col_offset..col_offset+rows
         for r in 0..rows {
             for c in 0..cols {
                 let src_idx = (r * cols + c) * 2;
@@ -197,7 +189,6 @@ fn build_merged_weight_t(
     )
 }
 
-/// Build a single transposed weight: [out, in] -> [in, out]
 fn transpose_weight_cpu(device: &metal::Device, bytes: &[u8], rows: usize, cols: usize) -> Array {
     let mut result = vec![0u8; rows * cols * 2];
     for r in 0..rows {
@@ -224,64 +215,89 @@ fn assert_cb_ok(cb: &metal::CommandBufferRef, context: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// Timing helper
+// GPU timestamp helpers
 // ---------------------------------------------------------------------------
 
-fn time_op<F>(queue: &metal::CommandQueue, f: F) -> Duration
+/// Extract pure GPU execution time from a completed CommandBuffer.
+/// Uses Metal's GPUStartTime/GPUEndTime properties (seconds, f64).
+/// Only valid after wait_until_completed().
+fn gpu_time_us(cb: &metal::CommandBufferRef) -> f64 {
+    unsafe {
+        let obj: *const objc::runtime::Object = cb as *const metal::CommandBufferRef as *const _;
+        let start: f64 = msg_send![obj, GPUStartTime];
+        let end: f64 = msg_send![obj, GPUEndTime];
+        (end - start) * 1_000_000.0
+    }
+}
+
+/// Measure a single op with both GPU timestamp and wall-clock.
+/// Returns (gpu_us, wall_us).
+fn time_op_gpu<F>(queue: &metal::CommandQueue, f: F) -> (f64, f64)
 where
     F: FnOnce(&metal::CommandBufferRef),
 {
     let _pool = ScopedPool::new();
     let cb = queue.new_command_buffer();
-    let start = Instant::now();
+    let wall_start = Instant::now();
     f(cb);
     cb.commit();
     cb.wait_until_completed();
-    let elapsed = start.elapsed();
-    assert_cb_ok(cb, "time_op");
-    elapsed
+    let wall_us = wall_start.elapsed().as_secs_f64() * 1_000_000.0;
+    assert_cb_ok(cb, "time_op_gpu");
+    let gpu_us = gpu_time_us(cb);
+    (gpu_us, wall_us)
 }
 
 // ---------------------------------------------------------------------------
-// Op profiling result
+// Op profiling result (GPU + Wall)
 // ---------------------------------------------------------------------------
 
 struct OpResult {
     name: &'static str,
-    mean_us: f64,
-    p50_us: f64,
-    min_us: f64,
-    max_us: f64,
+    gpu_mean_us: f64,
+    gpu_p50_us: f64,
+    gpu_min_us: f64,
+    wall_mean_us: f64,
 }
 
-fn bench_op<F>(name: &'static str, queue: &metal::CommandQueue, mut f: F) -> OpResult
+fn compute_stats(values: &[f64]) -> (f64, f64, f64) {
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let sum: f64 = sorted.iter().sum();
+    let mean = sum / sorted.len() as f64;
+    let min = sorted[0];
+    let p50 = if sorted.len() % 2 == 0 {
+        (sorted[sorted.len() / 2 - 1] + sorted[sorted.len() / 2]) / 2.0
+    } else {
+        sorted[sorted.len() / 2]
+    };
+    (mean, p50, min)
+}
+
+fn bench_op_gpu<F>(name: &'static str, queue: &metal::CommandQueue, mut f: F) -> OpResult
 where
     F: FnMut(&metal::CommandBufferRef),
 {
+    // Warmup
     for _ in 0..WARMUP_ITERS {
-        time_op(queue, &mut f);
+        time_op_gpu(queue, &mut f);
     }
-    let mut durations = Vec::with_capacity(BENCH_ITERS);
+    // Bench
+    let mut gpu_times = Vec::with_capacity(BENCH_ITERS);
+    let mut wall_times = Vec::with_capacity(BENCH_ITERS);
     for _ in 0..BENCH_ITERS {
-        durations.push(time_op(queue, &mut f));
+        let (gpu_us, wall_us) = time_op_gpu(queue, &mut f);
+        gpu_times.push(gpu_us);
+        wall_times.push(wall_us);
     }
-    let mut micros: Vec<f64> = durations.iter().map(|d| d.as_secs_f64() * 1e6).collect();
-    micros.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let sum: f64 = micros.iter().sum();
-    let mean = sum / micros.len() as f64;
-    let min = micros[0];
-    let max = micros[micros.len() - 1];
-    let p50 = if micros.len() % 2 == 0 {
-        (micros[micros.len() / 2 - 1] + micros[micros.len() / 2]) / 2.0
-    } else {
-        micros[micros.len() / 2]
-    };
+    let (gpu_mean, gpu_p50, gpu_min) = compute_stats(&gpu_times);
+    let (wall_mean, _, _) = compute_stats(&wall_times);
     OpResult {
         name,
-        mean_us: mean,
-        p50_us: p50,
-        min_us: min,
-        max_us: max,
+        gpu_mean_us: gpu_mean,
+        gpu_p50_us: gpu_p50,
+        gpu_min_us: gpu_min,
+        wall_mean_us: wall_mean,
     }
 }
 
@@ -327,6 +343,7 @@ fn main() {
         "Warmup: {} iters, Bench: {} iters per op",
         WARMUP_ITERS, BENCH_ITERS
     );
+    println!("Timing: GPU timestamps (GPUStartTime/GPUEndTime) + wall-clock");
 
     // ---- Build TransformerBlock for full pipeline baseline ----
     let mut block = build_transformer_block(device);
@@ -338,7 +355,6 @@ fn main() {
         .expect("prepare_weights_for_graph");
 
     // ---- Build raw weight matrices for per-op profiling ----
-    // Generate the same random bytes used by make_linear (seeds 1-7)
     let w_q_bytes = rand_f16_bytes(Q_DIM * HIDDEN_SIZE, 1);
     let w_k_bytes = rand_f16_bytes(K_DIM * HIDDEN_SIZE, 2);
     let w_v_bytes = rand_f16_bytes(V_DIM * HIDDEN_SIZE, 3);
@@ -347,7 +363,7 @@ fn main() {
     let w_up_bytes = rand_f16_bytes(INTERMEDIATE_DIM * HIDDEN_SIZE, 6);
     let w_down_bytes = rand_f16_bytes(HIDDEN_SIZE * INTERMEDIATE_DIM, 7);
 
-    // Build merged transposed QKV weight: [HIDDEN, TOTAL_QKV]
+    // Merged transposed QKV weight: [HIDDEN, TOTAL_QKV]
     let qkv_wt = build_merged_weight_t(
         device,
         &[
@@ -357,7 +373,7 @@ fn main() {
         ],
     );
 
-    // Build merged transposed gate+up weight: [HIDDEN, 2*INTERMEDIATE]
+    // Merged transposed gate+up weight: [HIDDEN, 2*INTERMEDIATE]
     let gate_up_wt = build_merged_weight_t(
         device,
         &[
@@ -386,13 +402,13 @@ fn main() {
     std::thread::sleep(std::time::Duration::from_millis(50));
 
     for &seq_len in SEQ_LENS {
-        println!("\n{}", "=".repeat(100));
+        println!("\n{}", "=".repeat(110));
         println!(
             "seq_len={}  |  SDPA variant: {}",
             seq_len,
             sdpa_variant_name(supports_nax, seq_len)
         );
-        println!("{}", "=".repeat(100));
+        println!("{}", "=".repeat(110));
 
         let queue = device.new_command_queue();
 
@@ -400,8 +416,8 @@ fn main() {
         let sin_freqs = sin_full.slice(0, 0, seq_len).expect("sin slice");
         let input = rand_array(device, &[seq_len, HIDDEN_SIZE], 42);
 
-        // --- Full pipeline baseline (uses is_causal internally, no explicit mask) ---
-        let baseline = bench_op("TOTAL (full pipeline)", &queue, |cb| {
+        // --- Full pipeline baseline: single CB (GPU timestamp) ---
+        let baseline = bench_op_gpu("TOTAL (single-CB)", &queue, |cb| {
             let mut cache = LayerKvCache::preallocated(
                 device,
                 NUM_KV_HEADS,
@@ -414,12 +430,38 @@ fn main() {
                     &input,
                     Some(&cos_freqs),
                     Some(&sin_freqs),
-                    None, // causal masking handled in-kernel via is_causal FC
+                    None,
                     &mut cache,
                     &registry,
                     cb,
                 )
                 .expect("full pipeline");
+        });
+
+        // --- Full pipeline: single encoder (GPU timestamp) ---
+        // All ops share ONE compute command encoder, eliminating per-op
+        // encoder create/destroy overhead (~17 encoders → 1 per layer).
+        let single_encoder = bench_op_gpu("TOTAL (single-encoder)", &queue, |cb| {
+            let mut cache = LayerKvCache::preallocated(
+                device,
+                NUM_KV_HEADS,
+                HEAD_DIM,
+                MAX_SEQ_LEN,
+                DType::Float16,
+            );
+            let encoder = cb.new_compute_command_encoder();
+            let _ = block
+                .forward_prefill_single_encoder(
+                    &input,
+                    Some(&cos_freqs),
+                    Some(&sin_freqs),
+                    None,
+                    &mut cache,
+                    &registry,
+                    encoder,
+                )
+                .expect("single-encoder pipeline");
+            encoder.end_encoding();
         });
 
         // --- Materialize intermediates for downstream ops ---
@@ -516,16 +558,13 @@ fn main() {
             (qb, kb, vb)
         };
 
-        // 5. SDPA — use same dispatch logic as attention.rs forward_prefill_single_cb
-        //    On initial prefill (cache empty), RoPE output goes directly to SDPA.
-        let total_seq = seq_len; // initial prefill: no prior cache
+        // 5. SDPA
+        let total_seq = seq_len;
         let scale = 1.0 / (HEAD_DIM as f32).sqrt();
 
-        let is_f16_d128 = true; // we always use f16, head_dim=128, seq_len>1
+        let is_f16_d128 = true;
         let use_nax = is_f16_d128 && supports_nax;
         let use_mma_bk32 = is_f16_d128 && !use_nax && total_seq >= 256;
-
-        // MMA writes seq-major; NAX writes head-major
         let seq_major_output = is_f16_d128 && !use_nax;
 
         let attn_slab = {
@@ -542,9 +581,9 @@ fn main() {
                     HEAD_DIM,
                     seq_len,
                     total_seq,
-                    None, // contiguous, no stride override
+                    None,
                     scale,
-                    true, // is_causal
+                    true,
                     cb,
                 )
                 .expect("sdpa nax")
@@ -560,9 +599,9 @@ fn main() {
                     seq_len,
                     total_seq,
                     None,
-                    None, // no explicit mask
+                    None,
                     scale,
-                    true, // is_causal
+                    true,
                     cb,
                 )
                 .expect("sdpa mma bk32")
@@ -578,9 +617,9 @@ fn main() {
                     seq_len,
                     total_seq,
                     None,
-                    None, // no explicit mask
+                    None,
                     scale,
-                    true, // is_causal
+                    true,
                     cb,
                 )
                 .expect("sdpa mma bk16")
@@ -590,7 +629,7 @@ fn main() {
             r
         };
 
-        // 6. Head concat (interleave if NAX, reshape if MMA)
+        // 6. Head concat
         let attn_concat = if seq_major_output {
             attn_slab.view(
                 vec![seq_len, HIDDEN_SIZE],
@@ -598,7 +637,6 @@ fn main() {
                 attn_slab.offset(),
             )
         } else {
-            // NAX: head-major [num_heads, seq_len, head_dim] -> [seq_len, hidden_size]
             let packed = attn_slab.view(
                 vec![NUM_HEADS * seq_len, HEAD_DIM],
                 vec![HEAD_DIM, 1],
@@ -628,14 +666,14 @@ fn main() {
             r
         };
 
-        // 8. Fused residual + RMSNorm (matches forward_prefill_single_cb)
+        // 8. Fused residual + RMSNorm
         let (normed2, h) = {
             let _pool = ScopedPool::new();
             let cb = queue.new_command_buffer();
             let r = ops::rms_norm::rms_norm_residual_add_into_cb(
                 &registry,
-                &o_out, // attention output
-                &input, // residual = original input
+                &o_out,
+                &input,
                 &norm2_w,
                 RMS_NORM_EPS,
                 cb,
@@ -688,12 +726,12 @@ fn main() {
         };
 
         // ====================================================================
-        // Benchmark each op in isolation
+        // Benchmark each op in isolation (GPU timestamps)
         // ====================================================================
         let mut results: Vec<OpResult> = Vec::new();
 
         // 1. RMSNorm (pre-attention)
-        results.push(bench_op("RMSNorm (pre-attn)", &queue, |cb| {
+        results.push(bench_op_gpu("RMSNorm (pre-attn)", &queue, |cb| {
             let _ = ops::rms_norm::rms_norm_into_cb(
                 &registry,
                 &input,
@@ -705,12 +743,12 @@ fn main() {
         }));
 
         // 2. Merged QKV GEMM (4096 -> 6144)
-        results.push(bench_op("QKV GEMM (4096->6144)", &queue, |cb| {
+        results.push(bench_op_gpu("QKV GEMM (4096->6144)", &queue, |cb| {
             let _ = ops::matmul::matmul_into_cb(&registry, &normed_2d, &qkv_wt, cb).expect("qkv");
         }));
 
         // 3. RoPE Q + RoPE K + Deinterleave V
-        results.push(bench_op("RoPE Q+K + Deint V", &queue, |cb| {
+        results.push(bench_op_gpu("RoPE Q+K + Deint V", &queue, |cb| {
             let _ = ops::rope::rope_multihead_into_cb(
                 &registry,
                 &q_view,
@@ -751,7 +789,7 @@ fn main() {
         } else {
             "SDPA MMA BK=16"
         };
-        results.push(bench_op(sdpa_name, &queue, |cb| {
+        results.push(bench_op_gpu(sdpa_name, &queue, |cb| {
             if use_nax {
                 let _ = ops::sdpa::sdpa_prefill_nax_f16_into_cb(
                     &registry,
@@ -808,14 +846,14 @@ fn main() {
             }
         }));
 
-        // 5. Head Interleave (only for NAX; MMA is seq-major, just reshape)
+        // 5. Head Interleave (only for NAX)
         if !seq_major_output {
             let packed_for_bench = attn_slab.view(
                 vec![NUM_HEADS * seq_len, HEAD_DIM],
                 vec![HEAD_DIM, 1],
                 attn_slab.offset(),
             );
-            results.push(bench_op("Head Interleave", &queue, |cb| {
+            results.push(bench_op_gpu("Head Interleave", &queue, |cb| {
                 let _ = ops::rope::interleave_heads_into_cb(
                     &registry,
                     &packed_for_bench,
@@ -828,13 +866,13 @@ fn main() {
         }
 
         // 6. O Projection GEMM (4096 -> 4096)
-        results.push(bench_op("O Proj GEMM (4096->4096)", &queue, |cb| {
+        results.push(bench_op_gpu("O Proj GEMM (4096->4096)", &queue, |cb| {
             let _ =
                 ops::matmul::matmul_into_cb(&registry, &attn_concat, &w_o_t, cb).expect("o_proj");
         }));
 
         // 7. Fused Residual + RMSNorm (pre-FFN)
-        results.push(bench_op("Res+RMSNorm (fused)", &queue, |cb| {
+        results.push(bench_op_gpu("Res+RMSNorm (fused)", &queue, |cb| {
             let _ = ops::rms_norm::rms_norm_residual_add_into_cb(
                 &registry,
                 &o_out,
@@ -847,13 +885,13 @@ fn main() {
         }));
 
         // 8. Merged Gate+Up GEMM (4096 -> 28672)
-        results.push(bench_op("Gate+Up GEMM (4096->28672)", &queue, |cb| {
+        results.push(bench_op_gpu("Gate+Up GEMM (4096->28672)", &queue, |cb| {
             let _ = ops::matmul::matmul_into_cb(&registry, &normed2_2d, &gate_up_wt, cb)
                 .expect("gate_up");
         }));
 
         // 9. Fused SiLU*mul (strided)
-        results.push(bench_op("Fused SiLU*mul", &queue, |cb| {
+        results.push(bench_op_gpu("Fused SiLU*mul", &queue, |cb| {
             let _ = ops::fused::fused_silu_mul_strided_into_cb(
                 &registry,
                 &gate_up_out,
@@ -864,7 +902,6 @@ fn main() {
         }));
 
         // 10. Down Projection GEMM (14336 -> 4096)
-        // Diagnostic: print tensor properties to identify degradation cause
         println!(
             "\n  [DIAG] hidden_act: shape={:?} strides={:?} offset={} buf_len={}",
             hidden_act.shape(),
@@ -879,12 +916,12 @@ fn main() {
             w_down_t.offset(),
             w_down_t.metal_buffer().length()
         );
-        results.push(bench_op("Down Proj GEMM (14336->4096)", &queue, |cb| {
+        results.push(bench_op_gpu("Down Proj GEMM (14336->4096)", &queue, |cb| {
             let _ =
                 ops::matmul::matmul_into_cb(&registry, &hidden_act, &w_down_t, cb).expect("down");
         }));
 
-        // 10b. Down Projection with FRESH A but SAME weight (isolate A tensor)
+        // 10b-d. Down Projection 4-way diagnostic
         {
             let fresh_a = rand_array(device, &[seq_len, INTERMEDIATE_DIM], 999);
             println!(
@@ -894,53 +931,109 @@ fn main() {
                 fresh_a.offset(),
                 fresh_a.metal_buffer().length()
             );
-            results.push(bench_op("Down (fresh A, same W)", &queue, |cb| {
+            results.push(bench_op_gpu("Down (fresh A, same W)", &queue, |cb| {
                 let _ = ops::matmul::matmul_into_cb(&registry, &fresh_a, &w_down_t, cb)
                     .expect("down fresh_a");
             }));
-            // 10c. SAME A but FRESH weight (isolate B tensor)
             let fresh_b = rand_array(device, &[INTERMEDIATE_DIM, HIDDEN_SIZE], 998);
-            results.push(bench_op("Down (same A, fresh W)", &queue, |cb| {
+            results.push(bench_op_gpu("Down (same A, fresh W)", &queue, |cb| {
                 let _ = ops::matmul::matmul_into_cb(&registry, &hidden_act, &fresh_b, cb)
                     .expect("down fresh_b");
             }));
-            // 10d. Both fresh
-            results.push(bench_op("Down (both fresh)", &queue, |cb| {
+            results.push(bench_op_gpu("Down (both fresh)", &queue, |cb| {
                 let _ = ops::matmul::matmul_into_cb(&registry, &fresh_a, &fresh_b, cb)
                     .expect("down both_fresh");
             }));
         }
 
         // 11. Residual Add (final: h + ffn_out)
-        results.push(bench_op("Residual Add (final)", &queue, |cb| {
+        results.push(bench_op_gpu("Residual Add (final)", &queue, |cb| {
             let _ = ops::binary::add_into_cb(&registry, &h, &ffn_out, cb).expect("add final");
         }));
 
-        // --- Print table ---
-        let sum_ops: f64 = results.iter().map(|r| r.mean_us).sum();
+        // ====================================================================
+        // Print results table
+        // ====================================================================
+        let sum_gpu: f64 = results.iter().map(|r| r.gpu_mean_us).sum();
+        let sum_wall: f64 = results.iter().map(|r| r.wall_mean_us).sum();
 
         println!(
-            "\n{:<32} {:>10} {:>10} {:>10} {:>10} {:>8}",
-            "Operation", "Mean(us)", "P50(us)", "Min(us)", "Max(us)", "% Total"
+            "\n{:<32} {:>12} {:>10} {:>10} {:>12} {:>8}",
+            "Operation", "GPU Mean(us)", "GPU P50", "GPU Min", "Wall Mean", "CB OH(%)"
         );
-        println!("{}", "-".repeat(84));
+        println!("{}", "-".repeat(88));
 
         for r in &results {
-            let pct = r.mean_us / sum_ops * 100.0;
+            let cb_oh = if r.gpu_mean_us > 0.0 {
+                (r.wall_mean_us - r.gpu_mean_us) / r.gpu_mean_us * 100.0
+            } else {
+                0.0
+            };
             println!(
-                "{:<32} {:>10.1} {:>10.1} {:>10.1} {:>10.1} {:>7.1}%",
-                r.name, r.mean_us, r.p50_us, r.min_us, r.max_us, pct
+                "{:<32} {:>12.1} {:>10.1} {:>10.1} {:>12.1} {:>7.1}%",
+                r.name, r.gpu_mean_us, r.gpu_p50_us, r.gpu_min_us, r.wall_mean_us, cb_oh
             );
         }
 
-        println!("{}", "-".repeat(84));
-        println!("{:<32} {:>10.1}", "Sum of individual ops", sum_ops);
+        println!("{}", "-".repeat(88));
+
+        // GPU times summary
+        println!("{:<32} {:>12.1}", "Sum of GPU times", sum_gpu);
         println!(
-            "{:<32} {:>10.1}  (p50={:.1}, min={:.1})",
-            "Full pipeline (single CB)", baseline.mean_us, baseline.p50_us, baseline.min_us
+            "{:<32} {:>12.1}",
+            "Single-CB (GPU time)", baseline.gpu_mean_us
         );
-        let overhead = (sum_ops - baseline.mean_us) / baseline.mean_us * 100.0;
-        println!("{:<32} {:>10.1}%", "CB overhead (sum - pipeline)", overhead);
+        println!(
+            "{:<32} {:>12.1}",
+            "Single-encoder (GPU time)", single_encoder.gpu_mean_us
+        );
+        if baseline.gpu_mean_us > 0.0 {
+            let gpu_overlap = (sum_gpu - baseline.gpu_mean_us) / baseline.gpu_mean_us * 100.0;
+            println!("{:<32} {:>12.1}%", "GPU pipelining overlap", gpu_overlap);
+        }
+        if baseline.gpu_mean_us > 0.0 && single_encoder.gpu_mean_us > 0.0 {
+            let encoder_savings =
+                (baseline.gpu_mean_us - single_encoder.gpu_mean_us) / baseline.gpu_mean_us * 100.0;
+            println!(
+                "{:<32} {:>12.1}%",
+                "Encoder reuse GPU savings", encoder_savings
+            );
+        }
+
+        println!();
+
+        // Wall times summary
+        println!("{:<32} {:>12.1}", "Sum of Wall times", sum_wall);
+        println!(
+            "{:<32} {:>12.1}  (p50={:.1}, min={:.1})",
+            "Single-CB (Wall time)",
+            baseline.wall_mean_us,
+            baseline.gpu_p50_us,
+            baseline.gpu_min_us
+        );
+        println!(
+            "{:<32} {:>12.1}  (p50={:.1}, min={:.1})",
+            "Single-encoder (Wall time)",
+            single_encoder.wall_mean_us,
+            single_encoder.gpu_p50_us,
+            single_encoder.gpu_min_us
+        );
+        if baseline.wall_mean_us > 0.0 {
+            let cb_overhead = (sum_wall - baseline.wall_mean_us) / baseline.wall_mean_us * 100.0;
+            println!(
+                "{:<32} {:>12.1}%",
+                "CB overhead (wall sum vs pipe)", cb_overhead
+            );
+        }
+        if baseline.wall_mean_us > 0.0 && single_encoder.wall_mean_us > 0.0 {
+            let wall_savings = (baseline.wall_mean_us - single_encoder.wall_mean_us)
+                / baseline.wall_mean_us
+                * 100.0;
+            println!(
+                "{:<32} {:>12.1}%",
+                "Encoder reuse wall savings", wall_savings
+            );
+        }
 
         // Let GPU drain before next seq_len
         std::thread::sleep(std::time::Duration::from_millis(200));

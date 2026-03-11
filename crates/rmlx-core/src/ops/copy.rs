@@ -822,7 +822,7 @@ pub fn copy_with_mode(
     reject_quantized(src.dtype())?;
 
     let numel = src.numel();
-    let out = Array::zeros(registry.device().raw(), src.shape(), src.dtype());
+    let out = Array::uninit(registry.device().raw(), src.shape(), src.dtype());
 
     let command_buffer = queue.new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();
@@ -835,8 +835,7 @@ pub fn copy_with_mode(
         encoder.set_buffer(0, Some(src.metal_buffer()), src.offset() as u64);
         encoder.set_buffer(1, Some(out.metal_buffer()), out.offset() as u64);
         let size_val = super::checked_u32(numel, "numel")?;
-        let size_buf = u32_buffer(registry.device().raw(), size_val);
-        encoder.set_buffer(2, Some(&size_buf), 0);
+        encoder.set_bytes(2, 4, &size_val as *const u32 as *const std::ffi::c_void);
         pipeline
     } else {
         // Strided path — encode_strided selects the best kernel variant
@@ -876,7 +875,7 @@ pub fn copy_async(
     reject_quantized(src.dtype())?;
 
     let numel = src.numel();
-    let out = Array::zeros(registry.device().raw(), src.shape(), src.dtype());
+    let out = Array::uninit(registry.device().raw(), src.shape(), src.dtype());
 
     let command_buffer = queue.new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();
@@ -888,8 +887,7 @@ pub fn copy_async(
         encoder.set_buffer(0, Some(src.metal_buffer()), src.offset() as u64);
         encoder.set_buffer(1, Some(out.metal_buffer()), out.offset() as u64);
         let size_val = super::checked_u32(numel, "numel")?;
-        let size_buf = u32_buffer(registry.device().raw(), size_val);
-        encoder.set_buffer(2, Some(&size_buf), 0);
+        encoder.set_bytes(2, 4, &size_val as *const u32 as *const std::ffi::c_void);
         pipeline
     } else {
         encode_strided(registry, src, encoder, &out)?
@@ -960,7 +958,7 @@ pub fn copy_cast_with_mode(
     let pipeline = registry.get_pipeline(kname, src.dtype())?;
     let numel = src.numel();
 
-    let out = Array::zeros(registry.device().raw(), src.shape(), dst_dtype);
+    let out = Array::uninit(registry.device().raw(), src.shape(), dst_dtype);
 
     let command_buffer = queue.new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();
@@ -1009,7 +1007,7 @@ pub fn copy_cast_into_cb(
     let pipeline = registry.get_pipeline(kname, src.dtype())?;
     let numel = src.numel();
 
-    let out = Array::zeros(registry.device().raw(), src.shape(), dst_dtype);
+    let out = Array::uninit(registry.device().raw(), src.shape(), dst_dtype);
 
     let encoder = cb.new_compute_command_encoder();
     encoder.set_compute_pipeline_state(&pipeline);
@@ -1087,7 +1085,7 @@ pub fn fill_with_mode(
         metal::MTLResourceOptions::StorageModeShared,
     );
 
-    let out = Array::zeros(device, shape, dtype);
+    let out = Array::uninit(device, shape, dtype);
 
     let command_buffer = queue.new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();
@@ -1296,6 +1294,113 @@ pub fn kv_cache_copy_batched_f16_into_cb(
     );
     enc.dispatch_threads(grid, tg);
     enc.end_encoding();
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// _encode variants — accept &ComputeCommandEncoderRef instead of &CommandBufferRef
+// ---------------------------------------------------------------------------
+
+/// Encode a copy into an existing compute command encoder (no encoder create/end).
+pub fn copy_encode(
+    registry: &KernelRegistry,
+    src: &Array,
+    encoder: &metal::ComputeCommandEncoderRef,
+) -> Result<Array, KernelError> {
+    reject_quantized(src.dtype())?;
+
+    let numel = src.numel();
+    let out = Array::uninit(registry.device().raw(), src.shape(), src.dtype());
+
+    let pipeline = if src.is_contiguous() {
+        let kname = vectorized_kernel_name(src.dtype())?;
+        let pipeline = registry.get_pipeline(kname, src.dtype())?;
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(src.metal_buffer()), src.offset() as u64);
+        encoder.set_buffer(1, Some(out.metal_buffer()), out.offset() as u64);
+        let size_val = super::checked_u32(numel, "numel")?;
+        encoder.set_bytes(2, 4, &size_val as *const u32 as *const std::ffi::c_void);
+        pipeline
+    } else {
+        encode_strided(registry, src, encoder, &out)?
+    };
+
+    let threads = if src.is_contiguous() {
+        let w = wpt(src.dtype());
+        (numel as u64).div_ceil(w)
+    } else {
+        numel as u64
+    };
+
+    let grid_size = MTLSize::new(threads, 1, 1);
+    let threadgroup_size = MTLSize::new(
+        std::cmp::min(pipeline.max_total_threads_per_threadgroup(), threads),
+        1,
+        1,
+    );
+    encoder.dispatch_threads(grid_size, threadgroup_size);
+
+    Ok(out)
+}
+
+/// Encode batched KV cache copy into an existing compute command encoder (no encoder create/end).
+#[allow(clippy::too_many_arguments)]
+pub fn kv_cache_copy_batched_f16_encode(
+    src_k: &Array,
+    src_v: &Array,
+    dst_k: &Array,
+    dst_v: &Array,
+    num_kv_heads: usize,
+    new_tokens: usize,
+    head_dim: usize,
+    max_seq_len: usize,
+    offset: usize,
+    registry: &KernelRegistry,
+    encoder: &metal::ComputeCommandEncoderRef,
+) -> Result<(), KernelError> {
+    if new_tokens == 0 {
+        return Ok(());
+    }
+
+    let pipeline = registry.get_pipeline("kv_cache_copy_batched_f16", DType::Float16)?;
+
+    let num_kv_heads_u32 = super::checked_u32(num_kv_heads, "num_kv_heads")?;
+    let new_tokens_u32 = super::checked_u32(new_tokens, "new_tokens")?;
+    let head_dim_u32 = super::checked_u32(head_dim, "head_dim")?;
+    let max_seq_len_u32 = super::checked_u32(max_seq_len, "max_seq_len")?;
+    let offset_u32 = super::checked_u32(offset, "offset")?;
+
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(src_k.metal_buffer()), src_k.offset() as u64);
+    encoder.set_buffer(1, Some(src_v.metal_buffer()), src_v.offset() as u64);
+    encoder.set_buffer(2, Some(dst_k.metal_buffer()), dst_k.offset() as u64);
+    encoder.set_buffer(3, Some(dst_v.metal_buffer()), dst_v.offset() as u64);
+    encoder.set_bytes(
+        4,
+        4,
+        &num_kv_heads_u32 as *const u32 as *const std::ffi::c_void,
+    );
+    encoder.set_bytes(
+        5,
+        4,
+        &new_tokens_u32 as *const u32 as *const std::ffi::c_void,
+    );
+    encoder.set_bytes(6, 4, &head_dim_u32 as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(
+        7,
+        4,
+        &max_seq_len_u32 as *const u32 as *const std::ffi::c_void,
+    );
+    encoder.set_bytes(8, 4, &offset_u32 as *const u32 as *const std::ffi::c_void);
+
+    let grid = MTLSize::new(head_dim as u64, new_tokens as u64, num_kv_heads as u64);
+    let tg = MTLSize::new(
+        std::cmp::min(64, head_dim as u64),
+        std::cmp::min(4, new_tokens as u64),
+        1,
+    );
+    encoder.dispatch_threads(grid, tg);
 
     Ok(())
 }

@@ -41,9 +41,9 @@ pub fn batched_qkv_proj(
     let nv = wv_t.shape()[1] as u32;
 
     let dev = registry.device().raw();
-    let q_out = Array::zeros(dev, &[m as usize, nq as usize], input.dtype());
-    let k_out = Array::zeros(dev, &[m as usize, nk as usize], input.dtype());
-    let v_out = Array::zeros(dev, &[m as usize, nv as usize], input.dtype());
+    let q_out = Array::uninit(dev, &[m as usize, nq as usize], input.dtype());
+    let k_out = Array::uninit(dev, &[m as usize, nk as usize], input.dtype());
+    let v_out = Array::uninit(dev, &[m as usize, nv as usize], input.dtype());
 
     // Each projection may use a different kernel depending on M and N dims;
     // MlxArch gets alignment-specialized pipelines via function constants.
@@ -113,8 +113,8 @@ pub fn fused_silu_mul(
     let pipeline = registry.get_pipeline(kernel_name, gate_out.dtype())?;
     let numel = gate_out.numel();
     let dev = registry.device().raw();
-    let output = Array::zeros(dev, gate_out.shape(), gate_out.dtype());
-    let numel_buf = make_u32_buf(dev, numel as u32);
+    let output = Array::uninit(dev, gate_out.shape(), gate_out.dtype());
+    let numel_u32 = numel as u32;
 
     let elems_per_thread: u64 = match gate_out.dtype() {
         DType::Float32 => 2,
@@ -128,7 +128,7 @@ pub fn fused_silu_mul(
     enc.set_buffer(0, Some(gate_out.metal_buffer()), gate_out.offset() as u64);
     enc.set_buffer(1, Some(up_out.metal_buffer()), up_out.offset() as u64);
     enc.set_buffer(2, Some(output.metal_buffer()), output.offset() as u64);
-    enc.set_buffer(3, Some(&numel_buf), 0);
+    enc.set_bytes(3, 4, &numel_u32 as *const u32 as *const std::ffi::c_void);
 
     let tg = std::cmp::min(pipeline.max_total_threads_per_threadgroup(), grid_threads);
     enc.dispatch_threads(MTLSize::new(grid_threads, 1, 1), MTLSize::new(tg, 1, 1));
@@ -530,6 +530,111 @@ pub fn batched_gate_up_into_cb(
 }
 
 // ---------------------------------------------------------------------------
+// _encode variants — accept &ComputeCommandEncoderRef instead of &CommandBufferRef
+// ---------------------------------------------------------------------------
+
+/// Alias for [`fused_silu_mul_into_encoder`] — encode fused SiLU * mul into an
+/// existing compute command encoder (no encoder create/end).
+pub fn fused_silu_mul_encode(
+    registry: &KernelRegistry,
+    gate_out: &Array,
+    up_out: &Array,
+    encoder: &metal::ComputeCommandEncoderRef,
+) -> Result<Array, KernelError> {
+    fused_silu_mul_into_encoder(registry, gate_out, up_out, encoder)
+}
+
+/// Encode fused strided SiLU * mul into an existing compute command encoder.
+pub fn fused_silu_mul_strided_encode(
+    registry: &KernelRegistry,
+    merged: &Array,
+    gate_dim: usize,
+    encoder: &metal::ComputeCommandEncoderRef,
+) -> Result<Array, KernelError> {
+    if merged.ndim() != 2 {
+        return Err(KernelError::InvalidShape(format!(
+            "fused_silu_mul_strided_encode: expected 2D merged, got {}D",
+            merged.ndim()
+        )));
+    }
+    let seq_len = merged.shape()[0];
+    let total_dim = merged.shape()[1];
+    if total_dim != 2 * gate_dim {
+        return Err(KernelError::InvalidShape(format!(
+            "fused_silu_mul_strided_encode: total_dim {} != 2 * gate_dim {}",
+            total_dim, gate_dim
+        )));
+    }
+
+    let (kernel_name, elems_per_thread) =
+        super::silu::silu_gate_strided_kernel_info(merged.dtype())?;
+    let pipeline = registry.get_pipeline(kernel_name, merged.dtype())?;
+
+    let dev = registry.device().raw();
+    let output = Array::uninit(dev, &[seq_len, gate_dim], merged.dtype());
+
+    let gate_dim_u32 = gate_dim as u32;
+    let total_dim_u32 = total_dim as u32;
+    let seq_len_u32 = seq_len as u32;
+
+    let grid_x = (gate_dim as u64).div_ceil(elems_per_thread);
+    let grid_y = seq_len as u64;
+
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(merged.metal_buffer()), merged.offset() as u64);
+    encoder.set_buffer(1, Some(output.metal_buffer()), output.offset() as u64);
+    encoder.set_bytes(2, 4, &gate_dim_u32 as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(
+        3,
+        4,
+        &total_dim_u32 as *const u32 as *const std::ffi::c_void,
+    );
+    encoder.set_bytes(4, 4, &seq_len_u32 as *const u32 as *const std::ffi::c_void);
+
+    let grid_size = MTLSize::new(grid_x, grid_y, 1);
+    let max_tg = pipeline.max_total_threads_per_threadgroup();
+    let tg_x = std::cmp::min(max_tg, grid_x);
+    let threadgroup_size = MTLSize::new(tg_x, 1, 1);
+    encoder.dispatch_threads(grid_size, threadgroup_size);
+
+    Ok(output)
+}
+
+/// Encode batched gate + up projection into an existing compute command encoder.
+///
+/// Uses [`super::matmul::matmul_encode`] for each GEMM dispatch so that both
+/// projections share the same encoder.
+pub fn batched_gate_up_encode(
+    registry: &KernelRegistry,
+    input: &Array,
+    wgate_t: &Array,
+    wup_t: &Array,
+    encoder: &metal::ComputeCommandEncoderRef,
+) -> Result<(Array, Array), KernelError> {
+    // Inputs must be contiguous — the encoder variant does not support copy fallback.
+    if !input.is_contiguous() {
+        return Err(KernelError::InvalidShape(
+            "batched_gate_up_encode: input must be contiguous".into(),
+        ));
+    }
+    if !wgate_t.is_contiguous() {
+        return Err(KernelError::InvalidShape(
+            "batched_gate_up_encode: wgate_t must be contiguous".into(),
+        ));
+    }
+    if !wup_t.is_contiguous() {
+        return Err(KernelError::InvalidShape(
+            "batched_gate_up_encode: wup_t must be contiguous".into(),
+        ));
+    }
+
+    let gate_out = super::matmul::matmul_encode(registry, input, wgate_t, encoder)?;
+    let up_out = super::matmul::matmul_encode(registry, input, wup_t, encoder)?;
+
+    Ok((gate_out, up_out))
+}
+
+// ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
@@ -665,15 +770,6 @@ fn encode_gemm(
     enc.end_encoding();
 
     Ok(())
-}
-
-fn make_u32_buf(device: &metal::Device, value: u32) -> metal::Buffer {
-    let data = value.to_ne_bytes();
-    device.new_buffer_with_data(
-        data.as_ptr() as *const std::ffi::c_void,
-        4,
-        metal::MTLResourceOptions::StorageModeShared,
-    )
 }
 
 fn ensure_contiguous(

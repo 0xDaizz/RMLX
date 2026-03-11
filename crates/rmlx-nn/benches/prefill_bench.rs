@@ -377,8 +377,9 @@ fn main() {
             let cos_freqs = cos_full.slice(0, 0, seq_len).expect("cos slice failed");
             let sin_freqs = sin_full.slice(0, 0, seq_len).expect("sin slice failed");
 
-            // Build causal mask [seq_len, seq_len] in f16
-            let mask = build_causal_mask(device, seq_len);
+            // Causal mask no longer needed — kernels handle causal masking internally
+            // via is_causal function constant. Kept for reference/fallback.
+            let _mask = build_causal_mask(device, seq_len);
 
             // Input: [seq_len, HIDDEN_SIZE]
             let input = rand_array(device, &[seq_len, HIDDEN_SIZE], 42);
@@ -409,7 +410,7 @@ fn main() {
                                 &input,
                                 Some(&cos_freqs),
                                 Some(&sin_freqs),
-                                Some(&mask),
+                                None, // causal masking handled in-kernel via is_causal FC
                                 &mut cache_cb,
                                 &registry,
                                 cb,
@@ -448,7 +449,7 @@ fn main() {
                                 &input,
                                 Some(&cos_freqs),
                                 Some(&sin_freqs),
-                                Some(&mask),
+                                None, // causal masking handled in-kernel via is_causal FC
                                 &mut cache_cb,
                                 &registry,
                                 cb,
@@ -499,7 +500,7 @@ fn main() {
                                 &input,
                                 Some(&cos_freqs),
                                 Some(&sin_freqs),
-                                Some(&mask),
+                                None, // causal masking handled in-kernel via is_causal FC
                                 &mut cache_graph,
                                 &registry,
                                 cb,
@@ -539,7 +540,7 @@ fn main() {
                                 &input,
                                 Some(&cos_freqs),
                                 Some(&sin_freqs),
-                                Some(&mask),
+                                None, // causal masking handled in-kernel via is_causal FC
                                 &mut cache_graph,
                                 &registry,
                                 cb,

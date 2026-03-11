@@ -14,6 +14,9 @@ safetensors = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+[dev-dependencies]
+objc = { workspace = true }
+
 [features]
 distributed = ["rmlx-distributed"]
 
@@ -39,4 +42,12 @@ harness = false
 
 [[bench]]
 name = "op_profile_bench"
+harness = false
+
+[[bench]]
+name = "gemm_degradation_bench"
+harness = false
+
+[[bench]]
+name = "gpu_profile_bench"
 harness = false

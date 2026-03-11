@@ -463,7 +463,7 @@ pub fn binary_op_with_mode(
     } else {
         a.dtype()
     };
-    let out = Array::zeros(registry.device().raw(), &out_shape, out_dtype);
+    let out = Array::uninit(registry.device().raw(), &out_shape, out_dtype);
 
     let command_buffer = queue.new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();
@@ -597,7 +597,7 @@ pub fn binary_op_async(
         return Ok(super::LaunchResult::new(out, handle));
     }
 
-    let out = Array::zeros(registry.device().raw(), &out_shape, out_dtype);
+    let out = Array::uninit(registry.device().raw(), &out_shape, out_dtype);
 
     let command_buffer = queue.new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();
@@ -786,13 +786,13 @@ pub fn ge(
 // Into-CB variants (encode into existing command buffer, no commit/wait)
 // ---------------------------------------------------------------------------
 
-/// Encode a binary op into an existing command buffer (no commit/wait).
-pub fn binary_op_into_cb(
+/// Private: encode a binary op into an existing compute encoder (does NOT call end_encoding).
+fn binary_op_encode_impl(
     registry: &KernelRegistry,
     a: &Array,
     b: &Array,
     op: BinaryOp,
-    cb: &metal::CommandBufferRef,
+    encoder: &metal::ComputeCommandEncoderRef,
 ) -> Result<Array, KernelError> {
     // Validate dtypes match.
     if a.dtype() != b.dtype() {
@@ -828,7 +828,6 @@ pub fn binary_op_into_cb(
     };
     let out = Array::uninit(registry.device().raw(), &out_shape, out_dtype);
 
-    let encoder = cb.new_compute_command_encoder();
     encoder.set_compute_pipeline_state(&pipeline);
     encoder.set_buffer(0, Some(a.metal_buffer()), a.offset() as u64);
     encoder.set_buffer(1, Some(b.metal_buffer()), b.offset() as u64);
@@ -888,9 +887,35 @@ pub fn binary_op_into_cb(
         1,
     );
     encoder.dispatch_threads(grid_size, threadgroup_size);
-    encoder.end_encoding();
 
     Ok(out)
+}
+
+/// Encode a binary op into an existing command buffer (no commit/wait).
+pub fn binary_op_into_cb(
+    registry: &KernelRegistry,
+    a: &Array,
+    b: &Array,
+    op: BinaryOp,
+    cb: &metal::CommandBufferRef,
+) -> Result<Array, KernelError> {
+    let encoder = cb.new_compute_command_encoder();
+    let result = binary_op_encode_impl(registry, a, b, op, encoder)?;
+    encoder.end_encoding();
+    Ok(result)
+}
+
+/// Encode a binary op into an existing compute encoder (no encoder create/end).
+///
+/// Caller is responsible for creating and ending the encoder.
+pub fn binary_op_encode(
+    registry: &KernelRegistry,
+    a: &Array,
+    b: &Array,
+    op: BinaryOp,
+    encoder: &metal::ComputeCommandEncoderRef,
+) -> Result<Array, KernelError> {
+    binary_op_encode_impl(registry, a, b, op, encoder)
 }
 
 /// Encode add into an existing command buffer (no commit/wait).
@@ -903,6 +928,18 @@ pub fn add_into_cb(
     binary_op_into_cb(registry, a, b, BinaryOp::Add, cb)
 }
 
+/// Encode add into an existing compute encoder (no encoder create/end).
+///
+/// Caller is responsible for creating and ending the encoder.
+pub fn add_encode(
+    registry: &KernelRegistry,
+    a: &Array,
+    b: &Array,
+    encoder: &metal::ComputeCommandEncoderRef,
+) -> Result<Array, KernelError> {
+    binary_op_encode(registry, a, b, BinaryOp::Add, encoder)
+}
+
 /// Encode mul into an existing command buffer (no commit/wait).
 pub fn mul_into_cb(
     registry: &KernelRegistry,
@@ -911,6 +948,18 @@ pub fn mul_into_cb(
     cb: &metal::CommandBufferRef,
 ) -> Result<Array, KernelError> {
     binary_op_into_cb(registry, a, b, BinaryOp::Mul, cb)
+}
+
+/// Encode mul into an existing compute encoder (no encoder create/end).
+///
+/// Caller is responsible for creating and ending the encoder.
+pub fn mul_encode(
+    registry: &KernelRegistry,
+    a: &Array,
+    b: &Array,
+    encoder: &metal::ComputeCommandEncoderRef,
+) -> Result<Array, KernelError> {
+    binary_op_encode(registry, a, b, BinaryOp::Mul, encoder)
 }
 
 // ---------------------------------------------------------------------------

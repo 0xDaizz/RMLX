@@ -288,6 +288,56 @@ impl FeedForward {
         }
     }
 
+    /// Forward pass using a pre-existing compute command encoder.
+    ///
+    /// Identical logic to `forward_single_cb` but dispatches all kernels via a
+    /// shared encoder, eliminating per-op encoder create/destroy overhead.
+    ///
+    /// **Prerequisites:** `prepare_weight_t()` must have been called on all
+    /// Linear layers (gate/up/down projections).
+    pub fn forward_single_encoder(
+        &self,
+        normed: &Array,
+        residual: &Array,
+        registry: &KernelRegistry,
+        encoder: &metal::ComputeCommandEncoderRef,
+    ) -> Result<Array, KernelError> {
+        match self {
+            FeedForward::Gated {
+                down_proj,
+                gate_up_merged_weight_t,
+                gate_proj,
+                up_proj,
+                ..
+            } => {
+                let normed_2d = if normed.ndim() == 1 {
+                    normed.reshape(vec![1, normed.shape()[0]])?
+                } else {
+                    normed.reshape(vec![normed.shape()[0], normed.shape()[1]])?
+                };
+                let hidden = if let Some(ref guw_t) = gate_up_merged_weight_t {
+                    // Single merged GEMM: [seq, hidden] @ [hidden, gate+up]
+                    let merged = ops::matmul::matmul_encode(registry, &normed_2d, guw_t, encoder)?;
+                    let gate_dim = guw_t.shape()[1] / 2;
+                    ops::fused::fused_silu_mul_strided_encode(registry, &merged, gate_dim, encoder)?
+                } else {
+                    // Fallback: 2 separate GEMMs
+                    let wgate_t = gate_proj.weight_transposed_contiguous()?;
+                    let wup_t = up_proj.weight_transposed_contiguous()?;
+                    let (gate_out, up_out) = ops::fused::batched_gate_up_encode(
+                        registry, &normed_2d, &wgate_t, &wup_t, encoder,
+                    )?;
+                    ops::fused::fused_silu_mul_encode(registry, &gate_out, &up_out, encoder)?
+                };
+                let ffn_out = down_proj.forward_into_encoder(&hidden, registry, encoder)?;
+                ops::binary::add_encode(registry, residual, &ffn_out, encoder)
+            }
+            _ => Err(KernelError::InvalidShape(
+                "forward_single_encoder only supports Gated FFN".into(),
+            )),
+        }
+    }
+
     /// Fused FFN: entire SwiGLU in 1 CB (gate + up + silu_mul + down + residual).
     pub fn forward_graph_fused(
         &self,
@@ -2991,10 +3041,15 @@ impl TransformerBlock {
             cb,
         )?;
 
-        // Residual + pre-FFN norm
-        let h = ops::binary::add_into_cb(registry, x, &attn_out, cb)?;
-        let normed2 =
-            ops::rms_norm::rms_norm_into_cb(registry, &h, Some(norm2_w), self.rms_norm_eps, cb)?;
+        // Fused residual + pre-FFN norm (1 dispatch instead of 2)
+        let (normed2, h) = ops::rms_norm::rms_norm_residual_add_into_cb(
+            registry,
+            &attn_out, // input = attention output
+            x,         // residual = original input
+            norm2_w,
+            self.rms_norm_eps,
+            cb,
+        )?;
 
         // FFN (all in same CB)
         self.ffn.forward_single_cb(&normed2, &h, registry, cb)
@@ -3044,13 +3099,75 @@ impl TransformerBlock {
             cb,
         )?;
 
-        // Residual + pre-FFN norm
-        let h = ops::binary::add_into_cb(registry, x, &attn_out, cb)?;
-        let normed2 =
-            ops::rms_norm::rms_norm_into_cb(registry, &h, Some(norm2_w), self.rms_norm_eps, cb)?;
+        // Fused residual + pre-FFN norm (1 dispatch instead of 2)
+        let (normed2, h) = ops::rms_norm::rms_norm_residual_add_into_cb(
+            registry,
+            &attn_out, // input = attention output
+            x,         // residual = original input
+            norm2_w,
+            self.rms_norm_eps,
+            cb,
+        )?;
 
         // FFN (all in same CB)
         self.ffn.forward_single_cb(&normed2, &h, registry, cb)
+    }
+
+    /// Forward pass using a single compute command encoder for all ops in the block.
+    ///
+    /// This eliminates per-op encoder create/destroy overhead (~300-500us/layer)
+    /// by reusing a single encoder across RMSNorm, Q/K/V projections, RoPE,
+    /// SDPA, O projection, residual add, and the entire FFN block.
+    ///
+    /// **Prerequisites:**
+    /// - `prepare_weights_for_graph()` must have been called so that all
+    ///   projection weights are pre-transposed.
+    /// - The KV cache must be pre-allocated.
+    /// - The caller manages the encoder lifecycle (creation and `end_encoding()`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_prefill_single_encoder(
+        &self,
+        x: &Array,
+        cos_freqs: Option<&Array>,
+        sin_freqs: Option<&Array>,
+        mask: Option<&Array>,
+        cache: &mut LayerKvCache,
+        registry: &KernelRegistry,
+        encoder: &metal::ComputeCommandEncoderRef,
+    ) -> Result<Array, KernelError> {
+        let norm1_w = self.norm1_weight.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape("TransformerBlock: norm1_weight not loaded".into())
+        })?;
+        let norm2_w = self.norm2_weight.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape("TransformerBlock: norm2_weight not loaded".into())
+        })?;
+
+        // Attention (all ops share the same encoder)
+        let attn_out = self.attention.forward_prefill_single_encoder(
+            x,
+            norm1_w,
+            self.rms_norm_eps,
+            cos_freqs,
+            sin_freqs,
+            mask,
+            cache,
+            registry,
+            encoder,
+        )?;
+
+        // Fused residual + pre-FFN norm (1 dispatch instead of 2)
+        let (normed2, h) = ops::rms_norm::rms_norm_residual_add_encode(
+            registry,
+            &attn_out,
+            x,
+            norm2_w,
+            self.rms_norm_eps,
+            encoder,
+        )?;
+
+        // FFN (all ops share the same encoder)
+        self.ffn
+            .forward_single_encoder(&normed2, &h, registry, encoder)
     }
 
     /// ExecGraph-based prefill forward: 1 CB per block, GPU-side chaining.
