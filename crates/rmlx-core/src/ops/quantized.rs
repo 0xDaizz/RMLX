@@ -3761,6 +3761,328 @@ kernel void affine_qmm_steel_q4(
 "#;
 
 // ---------------------------------------------------------------------------
+// Metal shader source -- Steel Split-K Q4 QMM kernel (BM=32, BN=32, BK=32)
+// ---------------------------------------------------------------------------
+
+/// Steel Split-K Q4 QMM kernel: combines Steel double-buffering with Split-K
+/// parallelism for improved occupancy at low M.
+///
+/// When M is small (e.g. M=32), the standard Steel kernel only launches 1 TG
+/// per core. Split-K partitions the K dimension across grid.z, giving each
+/// partition a slice of K to accumulate, then a reduce kernel sums the
+/// float partials and converts to f16.
+///
+/// Key features from Steel:
+/// - Double-buffered As/Ws arrays (prefetch next tile while computing current)
+/// - ST_BK_PAD=40 for bank conflict avoidance
+/// - Serpentine MMA ordering
+/// - K-contiguous B dequant pattern (MLX QuantizedBlockLoader)
+///
+/// Split-K additions:
+/// - grid.z = k_partitions, each partition handles [k_start, k_end)
+/// - Two-path store: k_partitions==1 writes f16 to output directly;
+///   k_partitions>1 writes f32 partials to c_split buffer
+/// - Separate reduce kernel sums partials → f16 output
+pub const QMM_STEEL_SPLITK_Q4_SHADER_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// ---------------------------------------------------------------------------
+// Steel Split-K Q4 QMM: BM=32, BN=32, BK=32, 2 SG (64 threads).
+// Double-buffered. K-partitioned via grid.z for occupancy at low M.
+// ---------------------------------------------------------------------------
+
+constant constexpr uint SK_BM = 32;
+constant constexpr uint SK_BN = 32;
+constant constexpr uint SK_BK = 32;
+constant constexpr uint SK_BK_PAD = 40;  // BK + 16/sizeof(half) = 32 + 8
+constant constexpr uint SK_TG_SIZE = 64;
+
+// Q4 pack constants
+constant constexpr uint SK_PACK_FACTOR = 8;   // 32 / 4 bits
+constant constexpr uint SK_BYTES_PER_PACK = 4; // one uint32 = 8 nibbles = 4 bytes
+constant constexpr uint SK_BK_PACKED = SK_BK / SK_PACK_FACTOR;  // 32/8 = 4
+constant constexpr uint SK_N_READS = (SK_BK_PACKED * SK_BN) / SK_TG_SIZE;  // (4*32)/64 = 2
+
+constant bool sk_align_M [[function_constant(200)]];
+constant bool sk_align_N [[function_constant(201)]];
+constant uint sk_fc_group_size [[function_constant(205)]];
+
+#if __METAL_VERSION__ >= 310
+template <typename T>
+METAL_FUNC uniform<T> sk_as_uniform(T val) {
+    return make_uniform(val);
+}
+#else
+template <typename T>
+METAL_FUNC T sk_as_uniform(T val) {
+    return val;
+}
+#endif
+
+kernel void affine_qmm_steel_splitk_q4(
+    device const half*    x         [[buffer(0)]],   // half input [M, K]
+    device const uint8_t* w_packed  [[buffer(1)]],   // packed Q4 [N, K/2]
+    device const half*   scales    [[buffer(2)]],   // [N * groups_per_row]
+    device const half*   biases    [[buffer(3)]],   // [N * groups_per_row]
+    device float*         c_split   [[buffer(4)]],   // float partial sums [k_partitions, M, N]
+    device half*          output    [[buffer(5)]],   // final f16 output [M, N]
+    constant uint3&       params    [[buffer(6)]],   // [M, N, K]
+    constant uint2&       split_params [[buffer(7)]], // [k_partition_size, k_partitions]
+    uint3 group_id        [[threadgroup_position_in_grid]],
+    uint  tid_in_group    [[thread_index_in_threadgroup]],
+    uint  sgid            [[simdgroup_index_in_threadgroup]],
+    uint  lane_id         [[thread_index_in_simdgroup]])
+{
+    // Double-buffered threadgroup memory
+    threadgroup half As[2][SK_BM * SK_BK_PAD];  // 2 x 32x40 x 2 = 5120 bytes
+    threadgroup half Ws[2][SK_BK * SK_BN];       // 2 x 32x32 x 2 = 4096 bytes (total ~9KB)
+
+    const uint uM = sk_as_uniform(params.x);
+    const uint uN = sk_as_uniform(params.y);
+    const uint uK = sk_as_uniform(params.z);
+    const uint k_partition_size = sk_as_uniform(split_params.x);
+    const uint k_partitions = sk_as_uniform(split_params.y);
+
+    const uint partition_id = group_id.z;
+    const uint row_start = group_id.y * sk_as_uniform(SK_BM);
+    const uint col_start = group_id.x * sk_as_uniform(SK_BN);
+
+    const uint groups_per_row = uK / sk_fc_group_size;
+    const uint half_k = uK / 2;  // bytes per N row in packed weights
+
+    // Early exit for out-of-bounds threadgroups
+    if (!sk_align_M && row_start >= uM) return;
+    if (!sk_align_N && col_start >= uN) return;
+
+    // Split-K: compute K range for this partition
+    const uint k_start = partition_id * k_partition_size;
+    uint k_end = k_start + k_partition_size;
+    if (k_end > uK) k_end = uK;
+    if (k_start >= uK) return;
+
+    // 2-SG layout: SG0=rows 0-15, SG1=rows 16-31
+    const uint sg_row_base = sgid * 16;
+
+    simdgroup_float8x8 acc[2][4];
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < 2; i++)
+        #pragma clang loop unroll(full)
+        for (uint j = 0; j < 4; j++)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    // --- B loader thread mapping (MLX QuantizedBlockLoader pattern) ---
+    const uint w_bi = (SK_N_READS * tid_in_group) / SK_BK_PACKED;   // N row: 0..31
+    const uint w_bj = (SK_N_READS * tid_in_group) % SK_BK_PACKED;   // K col (packed): 0..3
+    const uint w_n_global = col_start + w_bi;
+
+    const uint group_steps = sk_fc_group_size / SK_BK;
+
+    // Tile range for this partition
+    const uint start_tile = k_start / SK_BK;
+    const uint end_tile = (k_end + SK_BK - 1) / SK_BK;
+    const uint num_k_tiles = end_tile - start_tile;
+
+    // Macro to load A tile into buffer BUF at K offset KB
+    #define LOAD_A_SK(BUF, KB) \
+    { \
+        uint a_row = tid_in_group & 31u; \
+        uint a_col_base = (tid_in_group >> 5u) * 16u; \
+        uint gr = row_start + a_row; \
+        uint gk_base = (KB) + a_col_base; \
+        if ((sk_align_M || gr < uM) && gk_base + 15 < uK) { \
+            for (uint d = 0; d < 16; d += 4) { \
+                *reinterpret_cast<threadgroup half4*>(&As[(BUF)][a_row * SK_BK_PAD + a_col_base + d]) = \
+                    *reinterpret_cast<device const half4*>(&x[gr * uK + gk_base + d]); \
+            } \
+        } else if (sk_align_M || gr < uM) { \
+            for (uint d = 0; d < 16; d++) { \
+                uint gk = gk_base + d; \
+                As[(BUF)][a_row * SK_BK_PAD + a_col_base + d] = (gk < uK) ? x[gr * uK + gk] : half(0); \
+            } \
+        } else { \
+            for (uint d = 0; d < 16; d++) { \
+                As[(BUF)][a_row * SK_BK_PAD + a_col_base + d] = half(0); \
+            } \
+        } \
+    }
+
+    // Macro to load B tile (dequant Q4) into buffer BUF at absolute tile index ABS_TILE
+    #define LOAD_B_SK(BUF, ABS_TILE) \
+    { \
+        uint kb = (ABS_TILE) * SK_BK; \
+        if (sk_align_N || w_n_global < uN) { \
+            device const uint8_t* src = w_packed + w_n_global * half_k + kb / 2 + w_bj * SK_BYTES_PER_PACK; \
+            uint group_idx = kb / sk_fc_group_size; \
+            float scale_f = scales[w_n_global * groups_per_row + group_idx]; \
+            float bias_f  = biases[w_n_global * groups_per_row + group_idx]; \
+            half s_lo = half(scale_f); \
+            half s_hi = half(scale_f) / half(16.0f); \
+            half bias_h = half(bias_f); \
+            uint k_local_base = w_bj * SK_PACK_FACTOR; \
+            for (uint r = 0; r < SK_N_READS; r++) { \
+                uint k_local = k_local_base + r * SK_PACK_FACTOR; \
+                if (kb + k_local + SK_PACK_FACTOR <= uK) { \
+                    device const uint8_t* wp = src + r * SK_BYTES_PER_PACK; \
+                    for (uint i = 0; i < SK_PACK_FACTOR / 2; i++) { \
+                        uint8_t byte = wp[i]; \
+                        Ws[(BUF)][(k_local + 2*i) * SK_BN + w_bi] = s_lo * half(byte & 0x0f) + bias_h; \
+                        Ws[(BUF)][(k_local + 2*i + 1) * SK_BN + w_bi] = s_hi * half(byte & 0xf0) + bias_h; \
+                    } \
+                } else { \
+                    for (uint d = 0; d < SK_PACK_FACTOR; d++) { \
+                        if (kb + k_local + d < uK) { \
+                            device const uint8_t* wp = src + r * SK_BYTES_PER_PACK; \
+                            uint8_t byte = wp[d / 2]; \
+                            half val = (d & 1) == 0 \
+                                ? (s_lo * half(byte & 0x0f) + bias_h) \
+                                : (s_hi * half(byte & 0xf0) + bias_h); \
+                            Ws[(BUF)][(k_local + d) * SK_BN + w_bi] = val; \
+                        } else { \
+                            Ws[(BUF)][(k_local + d) * SK_BN + w_bi] = half(0); \
+                        } \
+                    } \
+                } \
+            } \
+        } else { \
+            uint k_local_base = w_bj * SK_PACK_FACTOR; \
+            for (uint d = 0; d < SK_N_READS * SK_PACK_FACTOR; d++) { \
+                Ws[(BUF)][(k_local_base + d) * SK_BN + w_bi] = half(0); \
+            } \
+        } \
+    }
+
+    // Load first tile (buffer 0)
+    LOAD_A_SK(0, start_tile * SK_BK);
+    LOAD_B_SK(0, start_tile);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // --- Main loop: double-buffered ---
+    for (uint tile_offset = 0; tile_offset < num_k_tiles; tile_offset++) {
+        uint abs_tile = start_tile + tile_offset;
+        uint cur_buf = tile_offset & 1;
+        uint nxt_buf = 1 - cur_buf;
+
+        // Prefetch next tile into nxt_buf (if exists)
+        if (tile_offset + 1 < num_k_tiles) {
+            uint next_abs = abs_tile + 1;
+            uint next_kb = next_abs * SK_BK;
+            LOAD_A_SK(nxt_buf, next_kb);
+            LOAD_B_SK(nxt_buf, next_abs);
+        }
+
+        // --- MMA compute on current buffer ---
+        #pragma clang loop unroll(full)
+        for (uint kk = 0; kk < 4; kk++) {
+            simdgroup_half8x8 a_frag[2];
+            simdgroup_half8x8 b_frag[4];
+
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 2; i++) {
+                simdgroup_load(a_frag[i],
+                    &As[cur_buf][(sg_row_base + i * 8) * SK_BK_PAD + kk * 8], SK_BK_PAD);
+            }
+
+            #pragma clang loop unroll(full)
+            for (uint j = 0; j < 4; j++) {
+                simdgroup_load(b_frag[j],
+                    &Ws[cur_buf][kk * 8 * SK_BN + j * 8], SK_BN);
+            }
+
+            // 2x4 outer product with serpentine
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 2; i++) {
+                #pragma clang loop unroll(full)
+                for (uint j = 0; j < 4; j++) {
+                    uint n_serp = (i % 2) ? (3 - j) : j;
+                    simdgroup_multiply_accumulate(
+                        acc[i][n_serp], a_frag[i], b_frag[n_serp], acc[i][n_serp]);
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    #undef LOAD_A_SK
+    #undef LOAD_B_SK
+
+    // --- Store results ---
+    const uint qid = lane_id / 4;
+    const uint fm = (qid & 4u) + ((lane_id / 2u) % 4u);
+    const uint fn_val = (qid & 2u) * 2u + (lane_id % 2u) * 2u;
+
+    if (k_partitions > 1) {
+        // Split-K: write float partials to c_split
+        const uint partition_stride = uM * uN;
+        device float* out_f = c_split + partition_id * partition_stride;
+
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 2; i++) {
+            #pragma clang loop unroll(full)
+            for (uint j = 0; j < 4; j++) {
+                uint gr = row_start + sg_row_base + i * 8 + fm;
+                uint gc0 = col_start + j * 8 + fn_val;
+                uint gc1 = gc0 + 1;
+                auto elems = acc[i][j].thread_elements();
+
+                if (sk_align_M && sk_align_N) {
+                    out_f[gr * uN + gc0] = elems[0];
+                    out_f[gr * uN + gc1] = elems[1];
+                } else {
+                    if ((sk_align_M || gr < uM) && (sk_align_N || gc0 < uN))
+                        out_f[gr * uN + gc0] = elems[0];
+                    if ((sk_align_M || gr < uM) && (sk_align_N || gc1 < uN))
+                        out_f[gr * uN + gc1] = elems[1];
+                }
+            }
+        }
+    } else {
+        // No split-K: cast to half and write directly to output
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 2; i++) {
+            #pragma clang loop unroll(full)
+            for (uint j = 0; j < 4; j++) {
+                uint gr = row_start + sg_row_base + i * 8 + fm;
+                uint gc0 = col_start + j * 8 + fn_val;
+                uint gc1 = gc0 + 1;
+                auto elems = acc[i][j].thread_elements();
+
+                if (sk_align_M && sk_align_N) {
+                    output[gr * uN + gc0] = half(elems[0]);
+                    output[gr * uN + gc1] = half(elems[1]);
+                } else {
+                    if ((sk_align_M || gr < uM) && (sk_align_N || gc0 < uN))
+                        output[gr * uN + gc0] = half(elems[0]);
+                    if ((sk_align_M || gr < uM) && (sk_align_N || gc1 < uN))
+                        output[gr * uN + gc1] = half(elems[1]);
+                }
+            }
+        }
+    }
+}
+
+// Reduce split-K float partials → half output
+kernel void steel_splitk_reduce(
+    device const float* c_split   [[buffer(0)]],
+    device half*        output    [[buffer(1)]],
+    constant uint3&     params    [[buffer(2)]],  // [N, k_partitions, partition_stride]
+    uint2 gid [[thread_position_in_grid]])
+{
+    const uint N = params.x;
+    const uint k_partitions = params.y;
+    const uint partition_stride = params.z;
+    const uint idx = gid.y * N + gid.x;
+    if (gid.x >= N) return;
+    float sum = 0.0f;
+    for (uint p = 0; p < k_partitions; p++) {
+        sum += c_split[p * partition_stride + idx];
+    }
+    output[idx] = half(sum);
+}
+"#;
+
+// ---------------------------------------------------------------------------
 // Metal shader source -- Skinny-M Q4 QMM kernel (BM=32, BN=64, BK=32)
 // ---------------------------------------------------------------------------
 
@@ -5493,6 +5815,7 @@ pub fn register_qmm(registry: &KernelRegistry) -> Result<(), KernelError> {
     registry.register_jit_source("qmm_skinny", QMM_SKINNY_SHADER_SOURCE)?;
     registry.register_jit_source("qmm_tiny", QMM_TINY_SHADER_SOURCE)?;
     registry.register_jit_source("qmm_steel_q4", QMM_STEEL_Q4_SHADER_SOURCE)?;
+    registry.register_jit_source("qmm_steel_splitk_q4", QMM_STEEL_SPLITK_Q4_SHADER_SOURCE)?;
     registry.register_jit_source("qmm_qldr_q4", QMM_QLDR_Q4_SHADER_SOURCE)?;
     registry.register_jit_source("qmm_skinny_f16", QMM_SKINNY_F16_SHADER_SOURCE)?;
     registry.register_jit_source("qmm_mma_f16", QMM_MMA_F16_SHADER_SOURCE)?;
@@ -5501,6 +5824,276 @@ pub fn register_qmm(registry: &KernelRegistry) -> Result<(), KernelError> {
         eprintln!("warning: qmm_nax_q4 registration skipped (MPP unavailable): {e}");
     }
     Ok(())
+}
+
+/// Steel Split-K Q4 QMM: double-buffered Steel kernel with K-partitioning.
+///
+/// Combines Steel's double-buffered A/B tiles (prefetch next while computing
+/// current) with Split-K parallelism for improved GPU occupancy at low M.
+///
+/// - k_partitions == 1: single-pass, writes f16 directly (no reduce overhead)
+/// - k_partitions > 1: writes f32 partials → reduce kernel sums → f16 output
+///
+/// Grid: (n_tiles, m_tiles, k_partitions), TG: (64, 1, 1)
+pub fn affine_qmm_steel_splitk_q4(
+    registry: &KernelRegistry,
+    x: &Array,
+    qw: &QuantizedWeight,
+    queue: &metal::CommandQueue,
+) -> Result<Array, KernelError> {
+    let m = x.shape()[0];
+    let n = qw.out_features;
+    let k = qw.in_features;
+    let dev = registry.device().raw();
+    let opts = metal::MTLResourceOptions::StorageModeShared;
+
+    const ST_BM: usize = 32;
+    const ST_BN: usize = 32;
+    const ST_BK: usize = 32;
+
+    let m_tiles = m.div_ceil(ST_BM);
+    let n_tiles = n.div_ceil(ST_BN);
+    let mn_tgs = m_tiles * n_tiles;
+    let target_tgs: usize = 320; // M3 Ultra 80-core x 4 TG/core
+    let k_tiles = k.div_ceil(ST_BK);
+    let k_partitions = if mn_tgs >= target_tgs || k_tiles <= 2 {
+        1
+    } else {
+        let desired = (target_tgs / mn_tgs).clamp(2, k_tiles.max(2));
+        desired.min(k_tiles)
+    };
+    // Round up to BK alignment
+    let k_partition_size = {
+        let raw = k.div_ceil(k_partitions);
+        raw.div_ceil(ST_BK) * ST_BK
+    };
+
+    let align_m = m % ST_BM == 0;
+    let align_n = n % ST_BN == 0;
+
+    let constants = [
+        (200u32, FunctionConstantValue::Bool(align_m)),
+        (201u32, FunctionConstantValue::Bool(align_n)),
+        (205u32, FunctionConstantValue::U32(qw.group_size)),
+    ];
+    let pipeline = registry.get_pipeline_with_constants(
+        "affine_qmm_steel_splitk_q4",
+        DType::Float16,
+        &constants,
+    )?;
+
+    let params: [u32; 3] = [
+        super::checked_u32(m, "M")?,
+        super::checked_u32(n, "N")?,
+        super::checked_u32(k, "K")?,
+    ];
+    let split_params: [u32; 2] = [
+        super::checked_u32(k_partition_size, "k_partition_size")?,
+        super::checked_u32(k_partitions, "k_partitions")?,
+    ];
+
+    let out = Array::uninit(dev, &[m, n], DType::Float16);
+
+    if k_partitions == 1 {
+        // Single pass: no c_split needed. Bind dummy at buffer(4).
+        let dummy_buf = dev.new_buffer(4, opts);
+
+        let cb = queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
+        enc.set_buffer(1, Some(&qw.weights_buf), 0);
+        enc.set_buffer(2, Some(&qw.scales_buf), 0);
+        enc.set_buffer(3, Some(&qw.biases_buf), 0);
+        enc.set_buffer(4, Some(&dummy_buf), 0);
+        enc.set_buffer(5, Some(out.metal_buffer()), 0);
+        enc.set_bytes(6, 12, params.as_ptr() as *const std::ffi::c_void);
+        enc.set_bytes(7, 8, split_params.as_ptr() as *const std::ffi::c_void);
+
+        let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
+        let tg = metal::MTLSize::new(64, 1, 1);
+        enc.dispatch_thread_groups(grid, tg);
+        enc.end_encoding();
+        super::commit_with_mode(cb, super::ExecMode::Sync);
+
+        Ok(out)
+    } else {
+        // Split-K: partial sums (f32) → reduce → f16
+        let partition_stride = m * n;
+        let c_split_size = (k_partitions * partition_stride * std::mem::size_of::<f32>()) as u64;
+        let c_split_buf = dev.new_buffer(c_split_size, opts);
+
+        let cb = queue.new_command_buffer();
+
+        // Phase 1: Split-K partial GEMM
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
+        enc.set_buffer(1, Some(&qw.weights_buf), 0);
+        enc.set_buffer(2, Some(&qw.scales_buf), 0);
+        enc.set_buffer(3, Some(&qw.biases_buf), 0);
+        enc.set_buffer(4, Some(&c_split_buf), 0);
+        enc.set_buffer(5, Some(out.metal_buffer()), 0);
+        enc.set_bytes(6, 12, params.as_ptr() as *const std::ffi::c_void);
+        enc.set_bytes(7, 8, split_params.as_ptr() as *const std::ffi::c_void);
+
+        let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, k_partitions as u64);
+        let tg = metal::MTLSize::new(64, 1, 1);
+        enc.dispatch_thread_groups(grid, tg);
+        enc.end_encoding();
+
+        // Phase 2: Reduce float partials → half output
+        let reduce_pipeline =
+            registry.get_pipeline_with_constants("steel_splitk_reduce", DType::Float16, &[])?;
+
+        let reduce_params: [u32; 3] = [
+            super::checked_u32(n, "N")?,
+            super::checked_u32(k_partitions, "k_partitions")?,
+            super::checked_u32(partition_stride, "partition_stride")?,
+        ];
+
+        let enc2 = cb.new_compute_command_encoder();
+        enc2.set_compute_pipeline_state(&reduce_pipeline);
+        enc2.set_buffer(0, Some(&c_split_buf), 0);
+        enc2.set_buffer(1, Some(out.metal_buffer()), 0);
+        enc2.set_bytes(2, 12, reduce_params.as_ptr() as *const std::ffi::c_void);
+
+        let reduce_grid = metal::MTLSize::new(n as u64, m as u64, 1);
+        let reduce_tg = metal::MTLSize::new(n.min(256) as u64, 1, 1);
+        enc2.dispatch_threads(reduce_grid, reduce_tg);
+        enc2.end_encoding();
+
+        super::commit_with_mode(cb, super::ExecMode::Sync);
+
+        Ok(out)
+    }
+}
+
+/// Steel Split-K Q4 QMM — into an existing command buffer.
+///
+/// Same logic as [`affine_qmm_steel_splitk_q4`] but encodes into `cb`
+/// instead of creating its own. The caller is responsible for committing.
+pub fn affine_qmm_steel_splitk_q4_into_cb(
+    registry: &KernelRegistry,
+    x: &Array,
+    qw: &QuantizedWeight,
+    cb: &metal::CommandBufferRef,
+) -> Result<Array, KernelError> {
+    let m = x.shape()[0];
+    let n = qw.out_features;
+    let k = qw.in_features;
+    let dev = registry.device().raw();
+    let opts = metal::MTLResourceOptions::StorageModeShared;
+
+    const ST_BM: usize = 32;
+    const ST_BN: usize = 32;
+    const ST_BK: usize = 32;
+
+    let m_tiles = m.div_ceil(ST_BM);
+    let n_tiles = n.div_ceil(ST_BN);
+    let mn_tgs = m_tiles * n_tiles;
+    let target_tgs: usize = 320;
+    let k_tiles = k.div_ceil(ST_BK);
+    let k_partitions = if mn_tgs >= target_tgs || k_tiles <= 2 {
+        1
+    } else {
+        let desired = (target_tgs / mn_tgs).clamp(2, k_tiles.max(2));
+        desired.min(k_tiles)
+    };
+    let k_partition_size = {
+        let raw = k.div_ceil(k_partitions);
+        raw.div_ceil(ST_BK) * ST_BK
+    };
+
+    let align_m = m % ST_BM == 0;
+    let align_n = n % ST_BN == 0;
+
+    let constants = [
+        (200u32, FunctionConstantValue::Bool(align_m)),
+        (201u32, FunctionConstantValue::Bool(align_n)),
+        (205u32, FunctionConstantValue::U32(qw.group_size)),
+    ];
+    let pipeline = registry.get_pipeline_with_constants(
+        "affine_qmm_steel_splitk_q4",
+        DType::Float16,
+        &constants,
+    )?;
+
+    let params: [u32; 3] = [
+        super::checked_u32(m, "M")?,
+        super::checked_u32(n, "N")?,
+        super::checked_u32(k, "K")?,
+    ];
+    let split_params: [u32; 2] = [
+        super::checked_u32(k_partition_size, "k_partition_size")?,
+        super::checked_u32(k_partitions, "k_partitions")?,
+    ];
+
+    let out = Array::uninit(dev, &[m, n], DType::Float16);
+
+    if k_partitions == 1 {
+        let dummy_buf = dev.new_buffer(4, opts);
+
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
+        enc.set_buffer(1, Some(&qw.weights_buf), 0);
+        enc.set_buffer(2, Some(&qw.scales_buf), 0);
+        enc.set_buffer(3, Some(&qw.biases_buf), 0);
+        enc.set_buffer(4, Some(&dummy_buf), 0);
+        enc.set_buffer(5, Some(out.metal_buffer()), 0);
+        enc.set_bytes(6, 12, params.as_ptr() as *const std::ffi::c_void);
+        enc.set_bytes(7, 8, split_params.as_ptr() as *const std::ffi::c_void);
+
+        let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
+        let tg = metal::MTLSize::new(64, 1, 1);
+        enc.dispatch_thread_groups(grid, tg);
+        enc.end_encoding();
+
+        Ok(out)
+    } else {
+        let partition_stride = m * n;
+        let c_split_size = (k_partitions * partition_stride * std::mem::size_of::<f32>()) as u64;
+        let c_split_buf = dev.new_buffer(c_split_size, opts);
+
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
+        enc.set_buffer(1, Some(&qw.weights_buf), 0);
+        enc.set_buffer(2, Some(&qw.scales_buf), 0);
+        enc.set_buffer(3, Some(&qw.biases_buf), 0);
+        enc.set_buffer(4, Some(&c_split_buf), 0);
+        enc.set_buffer(5, Some(out.metal_buffer()), 0);
+        enc.set_bytes(6, 12, params.as_ptr() as *const std::ffi::c_void);
+        enc.set_bytes(7, 8, split_params.as_ptr() as *const std::ffi::c_void);
+
+        let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, k_partitions as u64);
+        let tg = metal::MTLSize::new(64, 1, 1);
+        enc.dispatch_thread_groups(grid, tg);
+        enc.end_encoding();
+
+        let reduce_pipeline =
+            registry.get_pipeline_with_constants("steel_splitk_reduce", DType::Float16, &[])?;
+
+        let reduce_params: [u32; 3] = [
+            super::checked_u32(n, "N")?,
+            super::checked_u32(k_partitions, "k_partitions")?,
+            super::checked_u32(partition_stride, "partition_stride")?,
+        ];
+
+        let enc2 = cb.new_compute_command_encoder();
+        enc2.set_compute_pipeline_state(&reduce_pipeline);
+        enc2.set_buffer(0, Some(&c_split_buf), 0);
+        enc2.set_buffer(1, Some(out.metal_buffer()), 0);
+        enc2.set_bytes(2, 12, reduce_params.as_ptr() as *const std::ffi::c_void);
+
+        let reduce_grid = metal::MTLSize::new(n as u64, m as u64, 1);
+        let reduce_tg = metal::MTLSize::new(n.min(256) as u64, 1, 1);
+        enc2.dispatch_threads(reduce_grid, reduce_tg);
+        enc2.end_encoding();
+
+        Ok(out)
+    }
 }
 
 /// Affine quantized matrix-matrix multiply on GPU (Q4/Q8, Metal).
@@ -5752,127 +6345,134 @@ pub fn affine_quantized_matmul_batched(
                 Ok(out)
             }
         } else if m <= SKINNY_MAX_M {
-            // --- Skinny-M path: BM=32, BN=64, BK=32 with built-in split-K ---
-            // x is guaranteed f16 for Q4 (cast at entry). Always use f16 kernel.
-            let sm_tiles = m.div_ceil(SKINNY_TILE_M);
-            let sn_tiles = n.div_ceil(SKINNY_BN);
+            // --- Steel Split-K: double-buffered + K-partitioned ---
+            // Replaces Skinny MMA with Steel's double-buffering for better
+            // memory latency hiding at low M.
+            return affine_qmm_steel_splitk_q4(registry, x, qw, queue);
 
-            let align_m = m % SKINNY_TILE_M == 0;
-            let align_n = n % SKINNY_BN == 0;
+            // Dead code: original Skinny-M path kept for reference/fallback.
+            #[allow(unreachable_code)]
+            {
+                let sm_tiles = m.div_ceil(SKINNY_TILE_M);
+                let sn_tiles = n.div_ceil(SKINNY_BN);
 
-            let mn_tgs = sm_tiles * sn_tiles;
-            let target_tgs: usize = 320;
-            let k_tiles_total = k.div_ceil(SKINNY_BK);
-            let k_partitions = if mn_tgs >= target_tgs || k_tiles_total <= 2 {
-                1
-            } else {
-                let desired = (target_tgs / mn_tgs).clamp(2, k_tiles_total.max(2));
-                desired.min(k_tiles_total)
-            };
+                let align_m = m % SKINNY_TILE_M == 0;
+                let align_n = n % SKINNY_BN == 0;
 
-            let skinny_constants = [
-                (200u32, FunctionConstantValue::Bool(align_m)),
-                (201u32, FunctionConstantValue::Bool(align_n)),
-                (205u32, FunctionConstantValue::U32(qw.group_size)),
-            ];
+                let mn_tgs = sm_tiles * sn_tiles;
+                let target_tgs: usize = 320;
+                let k_tiles_total = k.div_ceil(SKINNY_BK);
+                let k_partitions = if mn_tgs >= target_tgs || k_tiles_total <= 2 {
+                    1
+                } else {
+                    let desired = (target_tgs / mn_tgs).clamp(2, k_tiles_total.max(2));
+                    desired.min(k_tiles_total)
+                };
 
-            let kernel_name = "affine_qmm_skinny_f16_q4";
-            let kernel_dtype = DType::Float16;
-            let pipeline = registry.get_pipeline_with_constants(
-                kernel_name,
-                kernel_dtype,
-                &skinny_constants,
-            )?;
+                let skinny_constants = [
+                    (200u32, FunctionConstantValue::Bool(align_m)),
+                    (201u32, FunctionConstantValue::Bool(align_n)),
+                    (205u32, FunctionConstantValue::U32(qw.group_size)),
+                ];
 
-            // x is already f16 (guaranteed by entry cast for Q4)
-
-            let m_u32 = super::checked_u32(m, "M")?;
-            let n_u32 = super::checked_u32(n, "N")?;
-            let k_u32 = super::checked_u32(k, "K")?;
-            let kp_u32 = super::checked_u32(k_partitions, "k_partitions")?;
-
-            if k_partitions == 1 {
-                let out = Array::uninit(dev, &[m, n], DType::Float16);
-                let dummy_buf = dev.new_buffer(4, opts);
-
-                let cb = queue.new_command_buffer();
-                let enc = cb.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&pipeline);
-                enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
-                enc.set_buffer(1, Some(&qw.weights_buf), 0);
-                enc.set_buffer(2, Some(&qw.scales_buf), 0);
-                enc.set_buffer(3, Some(&qw.biases_buf), 0);
-                enc.set_buffer(4, Some(out.metal_buffer()), 0);
-                enc.set_bytes(5, 4, &m_u32 as *const u32 as *const std::ffi::c_void);
-                enc.set_bytes(6, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
-                enc.set_bytes(7, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
-                enc.set_bytes(8, 4, &kp_u32 as *const u32 as *const std::ffi::c_void);
-                // f16 kernel has buffer(9) for c_split (unused when k_partitions==1)
-                enc.set_buffer(9, Some(&dummy_buf), 0);
-
-                let grid = metal::MTLSize::new(sn_tiles as u64, sm_tiles as u64, 1);
-                let tg = metal::MTLSize::new(64, 1, 1);
-                enc.dispatch_thread_groups(grid, tg);
-                enc.end_encoding();
-                super::commit_with_mode(cb, super::ExecMode::Sync);
-
-                Ok(out)
-            } else {
-                // Split-K: partial sums (always float) → f16 reduce → f16 output
-                let partition_stride = m * n;
-                let c_split_size =
-                    (k_partitions * partition_stride * std::mem::size_of::<f32>()) as u64;
-                let c_split_buf = dev.new_buffer(c_split_size, opts);
-                let out = Array::uninit(dev, &[m, n], DType::Float16);
-
-                let cb = queue.new_command_buffer();
-
-                // f16 skinny: writes float partials to c_split via buffer(9)
-                let enc = cb.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&pipeline);
-                enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
-                enc.set_buffer(1, Some(&qw.weights_buf), 0);
-                enc.set_buffer(2, Some(&qw.scales_buf), 0);
-                enc.set_buffer(3, Some(&qw.biases_buf), 0);
-                // buffer(4) = output (unused for split-K, but must be bound)
-                enc.set_buffer(4, Some(out.metal_buffer()), 0);
-                enc.set_bytes(5, 4, &m_u32 as *const u32 as *const std::ffi::c_void);
-                enc.set_bytes(6, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
-                enc.set_bytes(7, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
-                enc.set_bytes(8, 4, &kp_u32 as *const u32 as *const std::ffi::c_void);
-                enc.set_buffer(9, Some(&c_split_buf), 0);
-
-                let grid =
-                    metal::MTLSize::new(sn_tiles as u64, sm_tiles as u64, k_partitions as u64);
-                let tg = metal::MTLSize::new(64, 1, 1);
-                enc.dispatch_thread_groups(grid, tg);
-                enc.end_encoding();
-
-                // f16 reduce: reads float partials, writes half output
-                let reduce_pipeline = registry.get_pipeline_with_constants(
-                    "skinny_qmm_f16_reduce",
-                    DType::Float16,
-                    &[],
+                let kernel_name = "affine_qmm_skinny_f16_q4";
+                let kernel_dtype = DType::Float16;
+                let pipeline = registry.get_pipeline_with_constants(
+                    kernel_name,
+                    kernel_dtype,
+                    &skinny_constants,
                 )?;
-                let mn_total_u32 = super::checked_u32(partition_stride, "mn_total")?;
 
-                let enc2 = cb.new_compute_command_encoder();
-                enc2.set_compute_pipeline_state(&reduce_pipeline);
-                enc2.set_buffer(0, Some(&c_split_buf), 0);
-                enc2.set_buffer(1, Some(out.metal_buffer()), 0);
-                enc2.set_bytes(2, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
-                enc2.set_bytes(3, 4, &kp_u32 as *const u32 as *const std::ffi::c_void);
-                enc2.set_bytes(4, 4, &mn_total_u32 as *const u32 as *const std::ffi::c_void);
+                // x is already f16 (guaranteed by entry cast for Q4)
 
-                let reduce_grid = metal::MTLSize::new(partition_stride as u64, 1, 1);
-                let reduce_tg = metal::MTLSize::new(partition_stride.min(256) as u64, 1, 1);
-                enc2.dispatch_threads(reduce_grid, reduce_tg);
-                enc2.end_encoding();
+                let m_u32 = super::checked_u32(m, "M")?;
+                let n_u32 = super::checked_u32(n, "N")?;
+                let k_u32 = super::checked_u32(k, "K")?;
+                let kp_u32 = super::checked_u32(k_partitions, "k_partitions")?;
 
-                super::commit_with_mode(cb, super::ExecMode::Sync);
+                if k_partitions == 1 {
+                    let out = Array::uninit(dev, &[m, n], DType::Float16);
+                    let dummy_buf = dev.new_buffer(4, opts);
 
-                Ok(out)
-            }
+                    let cb = queue.new_command_buffer();
+                    let enc = cb.new_compute_command_encoder();
+                    enc.set_compute_pipeline_state(&pipeline);
+                    enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
+                    enc.set_buffer(1, Some(&qw.weights_buf), 0);
+                    enc.set_buffer(2, Some(&qw.scales_buf), 0);
+                    enc.set_buffer(3, Some(&qw.biases_buf), 0);
+                    enc.set_buffer(4, Some(out.metal_buffer()), 0);
+                    enc.set_bytes(5, 4, &m_u32 as *const u32 as *const std::ffi::c_void);
+                    enc.set_bytes(6, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
+                    enc.set_bytes(7, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
+                    enc.set_bytes(8, 4, &kp_u32 as *const u32 as *const std::ffi::c_void);
+                    // f16 kernel has buffer(9) for c_split (unused when k_partitions==1)
+                    enc.set_buffer(9, Some(&dummy_buf), 0);
+
+                    let grid = metal::MTLSize::new(sn_tiles as u64, sm_tiles as u64, 1);
+                    let tg = metal::MTLSize::new(64, 1, 1);
+                    enc.dispatch_thread_groups(grid, tg);
+                    enc.end_encoding();
+                    super::commit_with_mode(cb, super::ExecMode::Sync);
+
+                    Ok(out)
+                } else {
+                    // Split-K: partial sums (always float) → f16 reduce → f16 output
+                    let partition_stride = m * n;
+                    let c_split_size =
+                        (k_partitions * partition_stride * std::mem::size_of::<f32>()) as u64;
+                    let c_split_buf = dev.new_buffer(c_split_size, opts);
+                    let out = Array::uninit(dev, &[m, n], DType::Float16);
+
+                    let cb = queue.new_command_buffer();
+
+                    // f16 skinny: writes float partials to c_split via buffer(9)
+                    let enc = cb.new_compute_command_encoder();
+                    enc.set_compute_pipeline_state(&pipeline);
+                    enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
+                    enc.set_buffer(1, Some(&qw.weights_buf), 0);
+                    enc.set_buffer(2, Some(&qw.scales_buf), 0);
+                    enc.set_buffer(3, Some(&qw.biases_buf), 0);
+                    // buffer(4) = output (unused for split-K, but must be bound)
+                    enc.set_buffer(4, Some(out.metal_buffer()), 0);
+                    enc.set_bytes(5, 4, &m_u32 as *const u32 as *const std::ffi::c_void);
+                    enc.set_bytes(6, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
+                    enc.set_bytes(7, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
+                    enc.set_bytes(8, 4, &kp_u32 as *const u32 as *const std::ffi::c_void);
+                    enc.set_buffer(9, Some(&c_split_buf), 0);
+
+                    let grid =
+                        metal::MTLSize::new(sn_tiles as u64, sm_tiles as u64, k_partitions as u64);
+                    let tg = metal::MTLSize::new(64, 1, 1);
+                    enc.dispatch_thread_groups(grid, tg);
+                    enc.end_encoding();
+
+                    // f16 reduce: reads float partials, writes half output
+                    let reduce_pipeline = registry.get_pipeline_with_constants(
+                        "skinny_qmm_f16_reduce",
+                        DType::Float16,
+                        &[],
+                    )?;
+                    let mn_total_u32 = super::checked_u32(partition_stride, "mn_total")?;
+
+                    let enc2 = cb.new_compute_command_encoder();
+                    enc2.set_compute_pipeline_state(&reduce_pipeline);
+                    enc2.set_buffer(0, Some(&c_split_buf), 0);
+                    enc2.set_buffer(1, Some(out.metal_buffer()), 0);
+                    enc2.set_bytes(2, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
+                    enc2.set_bytes(3, 4, &kp_u32 as *const u32 as *const std::ffi::c_void);
+                    enc2.set_bytes(4, 4, &mn_total_u32 as *const u32 as *const std::ffi::c_void);
+
+                    let reduce_grid = metal::MTLSize::new(partition_stride as u64, 1, 1);
+                    let reduce_tg = metal::MTLSize::new(partition_stride.min(256) as u64, 1, 1);
+                    enc2.dispatch_threads(reduce_grid, reduce_tg);
+                    enc2.end_encoding();
+
+                    super::commit_with_mode(cb, super::ExecMode::Sync);
+
+                    Ok(out)
+                }
+            } // end unreachable_code block
         } else {
             // --- Standard MMA fallback: BM=64, BN=64, BK=16 ---
             // Rarely reached: Steel handles M>=32, Skinny handles M<=32.
@@ -6134,111 +6734,118 @@ pub fn affine_quantized_matmul_batched_into_cb(
     const STD_BN: usize = 64;
 
     if m <= SKINNY_MAX_M {
-        // --- Skinny MMA into CB ---
-        let sm_tiles = m.div_ceil(SKINNY_TILE_M);
-        let sn_tiles = n.div_ceil(SKINNY_BN);
+        // --- Steel Split-K into CB: double-buffered + K-partitioned ---
+        return affine_qmm_steel_splitk_q4_into_cb(registry, x, qw, cb);
 
-        let align_m = m % SKINNY_TILE_M == 0;
-        let align_n = n % SKINNY_BN == 0;
+        // Dead code: original Skinny MMA into CB kept for reference/fallback.
+        #[allow(unreachable_code)]
+        {
+            let sm_tiles = m.div_ceil(SKINNY_TILE_M);
+            let sn_tiles = n.div_ceil(SKINNY_BN);
 
-        let mn_tgs = sm_tiles * sn_tiles;
-        let target_tgs: usize = 320;
-        let k_tiles_total = k.div_ceil(SKINNY_BK);
-        let k_partitions = if mn_tgs >= target_tgs || k_tiles_total <= 2 {
-            1
-        } else {
-            let desired = (target_tgs / mn_tgs).clamp(2, k_tiles_total.max(2));
-            desired.min(k_tiles_total)
-        };
+            let align_m = m % SKINNY_TILE_M == 0;
+            let align_n = n % SKINNY_BN == 0;
 
-        let skinny_constants = [
-            (200u32, FunctionConstantValue::Bool(align_m)),
-            (201u32, FunctionConstantValue::Bool(align_n)),
-            (205u32, FunctionConstantValue::U32(qw.group_size)),
-        ];
-        let pipeline = registry.get_pipeline_with_constants(
-            "affine_qmm_skinny_f16_q4",
-            DType::Float16,
-            &skinny_constants,
-        )?;
+            let mn_tgs = sm_tiles * sn_tiles;
+            let target_tgs: usize = 320;
+            let k_tiles_total = k.div_ceil(SKINNY_BK);
+            let k_partitions = if mn_tgs >= target_tgs || k_tiles_total <= 2 {
+                1
+            } else {
+                let desired = (target_tgs / mn_tgs).clamp(2, k_tiles_total.max(2));
+                desired.min(k_tiles_total)
+            };
 
-        let m_u32 = super::checked_u32(m, "M")?;
-        let n_u32 = super::checked_u32(n, "N")?;
-        let k_u32 = super::checked_u32(k, "K")?;
-        let kp_u32 = super::checked_u32(k_partitions, "k_partitions")?;
-
-        if k_partitions == 1 {
-            let out = Array::uninit(dev, &[m, n], DType::Float16);
-            let dummy_buf = dev.new_buffer(4, opts);
-
-            let enc = cb.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&pipeline);
-            enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
-            enc.set_buffer(1, Some(&qw.weights_buf), 0);
-            enc.set_buffer(2, Some(&qw.scales_buf), 0);
-            enc.set_buffer(3, Some(&qw.biases_buf), 0);
-            enc.set_buffer(4, Some(out.metal_buffer()), 0);
-            enc.set_bytes(5, 4, &m_u32 as *const u32 as *const std::ffi::c_void);
-            enc.set_bytes(6, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
-            enc.set_bytes(7, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
-            enc.set_bytes(8, 4, &kp_u32 as *const u32 as *const std::ffi::c_void);
-            enc.set_buffer(9, Some(&dummy_buf), 0);
-
-            let grid = metal::MTLSize::new(sn_tiles as u64, sm_tiles as u64, 1);
-            let tg = metal::MTLSize::new(64, 1, 1);
-            enc.dispatch_thread_groups(grid, tg);
-            enc.end_encoding();
-
-            return Ok(out);
-        } else {
-            // Split-K: partial sums → reduce, both in same CB
-            let partition_stride = m * n;
-            let c_split_size =
-                (k_partitions * partition_stride * std::mem::size_of::<f32>()) as u64;
-            let c_split_buf = dev.new_buffer(c_split_size, opts);
-            let out = Array::uninit(dev, &[m, n], DType::Float16);
-
-            let enc = cb.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&pipeline);
-            enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
-            enc.set_buffer(1, Some(&qw.weights_buf), 0);
-            enc.set_buffer(2, Some(&qw.scales_buf), 0);
-            enc.set_buffer(3, Some(&qw.biases_buf), 0);
-            enc.set_buffer(4, Some(out.metal_buffer()), 0);
-            enc.set_bytes(5, 4, &m_u32 as *const u32 as *const std::ffi::c_void);
-            enc.set_bytes(6, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
-            enc.set_bytes(7, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
-            enc.set_bytes(8, 4, &kp_u32 as *const u32 as *const std::ffi::c_void);
-            enc.set_buffer(9, Some(&c_split_buf), 0);
-
-            let grid = metal::MTLSize::new(sn_tiles as u64, sm_tiles as u64, k_partitions as u64);
-            let tg = metal::MTLSize::new(64, 1, 1);
-            enc.dispatch_thread_groups(grid, tg);
-            enc.end_encoding();
-
-            // Reduce phase
-            let reduce_pipeline = registry.get_pipeline_with_constants(
-                "skinny_qmm_f16_reduce",
+            let skinny_constants = [
+                (200u32, FunctionConstantValue::Bool(align_m)),
+                (201u32, FunctionConstantValue::Bool(align_n)),
+                (205u32, FunctionConstantValue::U32(qw.group_size)),
+            ];
+            let pipeline = registry.get_pipeline_with_constants(
+                "affine_qmm_skinny_f16_q4",
                 DType::Float16,
-                &[],
+                &skinny_constants,
             )?;
-            let mn_total_u32 = super::checked_u32(partition_stride, "mn_total")?;
 
-            let enc2 = cb.new_compute_command_encoder();
-            enc2.set_compute_pipeline_state(&reduce_pipeline);
-            enc2.set_buffer(0, Some(&c_split_buf), 0);
-            enc2.set_buffer(1, Some(out.metal_buffer()), 0);
-            enc2.set_bytes(2, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
-            enc2.set_bytes(3, 4, &kp_u32 as *const u32 as *const std::ffi::c_void);
-            enc2.set_bytes(4, 4, &mn_total_u32 as *const u32 as *const std::ffi::c_void);
+            let m_u32 = super::checked_u32(m, "M")?;
+            let n_u32 = super::checked_u32(n, "N")?;
+            let k_u32 = super::checked_u32(k, "K")?;
+            let kp_u32 = super::checked_u32(k_partitions, "k_partitions")?;
 
-            let reduce_grid = metal::MTLSize::new(partition_stride as u64, 1, 1);
-            let reduce_tg = metal::MTLSize::new(partition_stride.min(256) as u64, 1, 1);
-            enc2.dispatch_threads(reduce_grid, reduce_tg);
-            enc2.end_encoding();
+            if k_partitions == 1 {
+                let out = Array::uninit(dev, &[m, n], DType::Float16);
+                let dummy_buf = dev.new_buffer(4, opts);
 
-            return Ok(out);
-        }
+                let enc = cb.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&pipeline);
+                enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
+                enc.set_buffer(1, Some(&qw.weights_buf), 0);
+                enc.set_buffer(2, Some(&qw.scales_buf), 0);
+                enc.set_buffer(3, Some(&qw.biases_buf), 0);
+                enc.set_buffer(4, Some(out.metal_buffer()), 0);
+                enc.set_bytes(5, 4, &m_u32 as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(6, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(7, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(8, 4, &kp_u32 as *const u32 as *const std::ffi::c_void);
+                enc.set_buffer(9, Some(&dummy_buf), 0);
+
+                let grid = metal::MTLSize::new(sn_tiles as u64, sm_tiles as u64, 1);
+                let tg = metal::MTLSize::new(64, 1, 1);
+                enc.dispatch_thread_groups(grid, tg);
+                enc.end_encoding();
+
+                return Ok(out);
+            } else {
+                // Split-K: partial sums → reduce, both in same CB
+                let partition_stride = m * n;
+                let c_split_size =
+                    (k_partitions * partition_stride * std::mem::size_of::<f32>()) as u64;
+                let c_split_buf = dev.new_buffer(c_split_size, opts);
+                let out = Array::uninit(dev, &[m, n], DType::Float16);
+
+                let enc = cb.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&pipeline);
+                enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
+                enc.set_buffer(1, Some(&qw.weights_buf), 0);
+                enc.set_buffer(2, Some(&qw.scales_buf), 0);
+                enc.set_buffer(3, Some(&qw.biases_buf), 0);
+                enc.set_buffer(4, Some(out.metal_buffer()), 0);
+                enc.set_bytes(5, 4, &m_u32 as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(6, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(7, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(8, 4, &kp_u32 as *const u32 as *const std::ffi::c_void);
+                enc.set_buffer(9, Some(&c_split_buf), 0);
+
+                let grid =
+                    metal::MTLSize::new(sn_tiles as u64, sm_tiles as u64, k_partitions as u64);
+                let tg = metal::MTLSize::new(64, 1, 1);
+                enc.dispatch_thread_groups(grid, tg);
+                enc.end_encoding();
+
+                // Reduce phase
+                let reduce_pipeline = registry.get_pipeline_with_constants(
+                    "skinny_qmm_f16_reduce",
+                    DType::Float16,
+                    &[],
+                )?;
+                let mn_total_u32 = super::checked_u32(partition_stride, "mn_total")?;
+
+                let enc2 = cb.new_compute_command_encoder();
+                enc2.set_compute_pipeline_state(&reduce_pipeline);
+                enc2.set_buffer(0, Some(&c_split_buf), 0);
+                enc2.set_buffer(1, Some(out.metal_buffer()), 0);
+                enc2.set_bytes(2, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
+                enc2.set_bytes(3, 4, &kp_u32 as *const u32 as *const std::ffi::c_void);
+                enc2.set_bytes(4, 4, &mn_total_u32 as *const u32 as *const std::ffi::c_void);
+
+                let reduce_grid = metal::MTLSize::new(partition_stride as u64, 1, 1);
+                let reduce_tg = metal::MTLSize::new(partition_stride.min(256) as u64, 1, 1);
+                enc2.dispatch_threads(reduce_grid, reduce_tg);
+                enc2.end_encoding();
+
+                return Ok(out);
+            }
+        } // end unreachable_code block
     }
 
     // --- Standard MMA fallback into CB ---

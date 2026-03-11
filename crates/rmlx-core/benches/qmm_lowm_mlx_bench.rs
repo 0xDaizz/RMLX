@@ -51,47 +51,263 @@ struct MlxRef {
 fn mlx_reference() -> Vec<MlxRef> {
     vec![
         // K=2560 N=2560
-        MlxRef { k: 2560, n: 2560, m: 1,  us: 196.7, tflops: 0.067 },
-        MlxRef { k: 2560, n: 2560, m: 4,  us: 213.8, tflops: 0.245 },
-        MlxRef { k: 2560, n: 2560, m: 8,  us: 226.3, tflops: 0.463 },
-        MlxRef { k: 2560, n: 2560, m: 16, us: 236.7, tflops: 0.886 },
-        MlxRef { k: 2560, n: 2560, m: 32, us: 264.0, tflops: 1.589 },
-        MlxRef { k: 2560, n: 2560, m: 64, us: 299.2, tflops: 2.804 },
+        MlxRef {
+            k: 2560,
+            n: 2560,
+            m: 1,
+            us: 196.7,
+            tflops: 0.067,
+        },
+        MlxRef {
+            k: 2560,
+            n: 2560,
+            m: 4,
+            us: 213.8,
+            tflops: 0.245,
+        },
+        MlxRef {
+            k: 2560,
+            n: 2560,
+            m: 8,
+            us: 226.3,
+            tflops: 0.463,
+        },
+        MlxRef {
+            k: 2560,
+            n: 2560,
+            m: 16,
+            us: 236.7,
+            tflops: 0.886,
+        },
+        MlxRef {
+            k: 2560,
+            n: 2560,
+            m: 32,
+            us: 264.0,
+            tflops: 1.589,
+        },
+        MlxRef {
+            k: 2560,
+            n: 2560,
+            m: 64,
+            us: 299.2,
+            tflops: 2.804,
+        },
         // K=3584 N=2560
-        MlxRef { k: 3584, n: 2560, m: 1,  us: 191.1, tflops: 0.096 },
-        MlxRef { k: 3584, n: 2560, m: 4,  us: 206.9, tflops: 0.355 },
-        MlxRef { k: 3584, n: 2560, m: 8,  us: 218.7, tflops: 0.671 },
-        MlxRef { k: 3584, n: 2560, m: 16, us: 240.9, tflops: 1.219 },
-        MlxRef { k: 3584, n: 2560, m: 32, us: 280.5, tflops: 2.094 },
-        MlxRef { k: 3584, n: 2560, m: 64, us: 291.2, tflops: 4.033 },
+        MlxRef {
+            k: 3584,
+            n: 2560,
+            m: 1,
+            us: 191.1,
+            tflops: 0.096,
+        },
+        MlxRef {
+            k: 3584,
+            n: 2560,
+            m: 4,
+            us: 206.9,
+            tflops: 0.355,
+        },
+        MlxRef {
+            k: 3584,
+            n: 2560,
+            m: 8,
+            us: 218.7,
+            tflops: 0.671,
+        },
+        MlxRef {
+            k: 3584,
+            n: 2560,
+            m: 16,
+            us: 240.9,
+            tflops: 1.219,
+        },
+        MlxRef {
+            k: 3584,
+            n: 2560,
+            m: 32,
+            us: 280.5,
+            tflops: 2.094,
+        },
+        MlxRef {
+            k: 3584,
+            n: 2560,
+            m: 64,
+            us: 291.2,
+            tflops: 4.033,
+        },
         // K=3584 N=3584
-        MlxRef { k: 3584, n: 3584, m: 1,  us: 194.9, tflops: 0.132 },
-        MlxRef { k: 3584, n: 3584, m: 4,  us: 209.2, tflops: 0.491 },
-        MlxRef { k: 3584, n: 3584, m: 8,  us: 227.8, tflops: 0.902 },
-        MlxRef { k: 3584, n: 3584, m: 16, us: 262.0, tflops: 1.569 },
-        MlxRef { k: 3584, n: 3584, m: 32, us: 276.9, tflops: 2.969 },
-        MlxRef { k: 3584, n: 3584, m: 64, us: 295.7, tflops: 5.560 },
+        MlxRef {
+            k: 3584,
+            n: 3584,
+            m: 1,
+            us: 194.9,
+            tflops: 0.132,
+        },
+        MlxRef {
+            k: 3584,
+            n: 3584,
+            m: 4,
+            us: 209.2,
+            tflops: 0.491,
+        },
+        MlxRef {
+            k: 3584,
+            n: 3584,
+            m: 8,
+            us: 227.8,
+            tflops: 0.902,
+        },
+        MlxRef {
+            k: 3584,
+            n: 3584,
+            m: 16,
+            us: 262.0,
+            tflops: 1.569,
+        },
+        MlxRef {
+            k: 3584,
+            n: 3584,
+            m: 32,
+            us: 276.9,
+            tflops: 2.969,
+        },
+        MlxRef {
+            k: 3584,
+            n: 3584,
+            m: 64,
+            us: 295.7,
+            tflops: 5.560,
+        },
         // K=4096 N=4096
-        MlxRef { k: 4096, n: 4096, m: 1,  us: 209.4, tflops: 0.160 },
-        MlxRef { k: 4096, n: 4096, m: 4,  us: 224.4, tflops: 0.598 },
-        MlxRef { k: 4096, n: 4096, m: 8,  us: 247.1, tflops: 1.086 },
-        MlxRef { k: 4096, n: 4096, m: 16, us: 289.5, tflops: 1.855 },
-        MlxRef { k: 4096, n: 4096, m: 32, us: 298.8, tflops: 3.594 },
-        MlxRef { k: 4096, n: 4096, m: 64, us: 327.9, tflops: 6.550 },
+        MlxRef {
+            k: 4096,
+            n: 4096,
+            m: 1,
+            us: 209.4,
+            tflops: 0.160,
+        },
+        MlxRef {
+            k: 4096,
+            n: 4096,
+            m: 4,
+            us: 224.4,
+            tflops: 0.598,
+        },
+        MlxRef {
+            k: 4096,
+            n: 4096,
+            m: 8,
+            us: 247.1,
+            tflops: 1.086,
+        },
+        MlxRef {
+            k: 4096,
+            n: 4096,
+            m: 16,
+            us: 289.5,
+            tflops: 1.855,
+        },
+        MlxRef {
+            k: 4096,
+            n: 4096,
+            m: 32,
+            us: 298.8,
+            tflops: 3.594,
+        },
+        MlxRef {
+            k: 4096,
+            n: 4096,
+            m: 64,
+            us: 327.9,
+            tflops: 6.550,
+        },
         // K=3584 N=4096
-        MlxRef { k: 3584, n: 4096, m: 1,  us: 186.8, tflops: 0.157 },
-        MlxRef { k: 3584, n: 4096, m: 4,  us: 209.3, tflops: 0.561 },
-        MlxRef { k: 3584, n: 4096, m: 8,  us: 233.8, tflops: 1.005 },
-        MlxRef { k: 3584, n: 4096, m: 16, us: 268.8, tflops: 1.748 },
-        MlxRef { k: 3584, n: 4096, m: 32, us: 271.5, tflops: 3.460 },
-        MlxRef { k: 3584, n: 4096, m: 64, us: 294.5, tflops: 6.380 },
+        MlxRef {
+            k: 3584,
+            n: 4096,
+            m: 1,
+            us: 186.8,
+            tflops: 0.157,
+        },
+        MlxRef {
+            k: 3584,
+            n: 4096,
+            m: 4,
+            us: 209.3,
+            tflops: 0.561,
+        },
+        MlxRef {
+            k: 3584,
+            n: 4096,
+            m: 8,
+            us: 233.8,
+            tflops: 1.005,
+        },
+        MlxRef {
+            k: 3584,
+            n: 4096,
+            m: 16,
+            us: 268.8,
+            tflops: 1.748,
+        },
+        MlxRef {
+            k: 3584,
+            n: 4096,
+            m: 32,
+            us: 271.5,
+            tflops: 3.460,
+        },
+        MlxRef {
+            k: 3584,
+            n: 4096,
+            m: 64,
+            us: 294.5,
+            tflops: 6.380,
+        },
         // K=4096 N=2560
-        MlxRef { k: 4096, n: 2560, m: 1,  us: 200.2, tflops: 0.105 },
-        MlxRef { k: 4096, n: 2560, m: 4,  us: 218.8, tflops: 0.383 },
-        MlxRef { k: 4096, n: 2560, m: 8,  us: 231.7, tflops: 0.724 },
-        MlxRef { k: 4096, n: 2560, m: 16, us: 247.6, tflops: 1.355 },
-        MlxRef { k: 4096, n: 2560, m: 32, us: 293.3, tflops: 2.288 },
-        MlxRef { k: 4096, n: 2560, m: 64, us: 302.3, tflops: 4.439 },
+        MlxRef {
+            k: 4096,
+            n: 2560,
+            m: 1,
+            us: 200.2,
+            tflops: 0.105,
+        },
+        MlxRef {
+            k: 4096,
+            n: 2560,
+            m: 4,
+            us: 218.8,
+            tflops: 0.383,
+        },
+        MlxRef {
+            k: 4096,
+            n: 2560,
+            m: 8,
+            us: 231.7,
+            tflops: 0.724,
+        },
+        MlxRef {
+            k: 4096,
+            n: 2560,
+            m: 16,
+            us: 247.6,
+            tflops: 1.355,
+        },
+        MlxRef {
+            k: 4096,
+            n: 2560,
+            m: 32,
+            us: 293.3,
+            tflops: 2.288,
+        },
+        MlxRef {
+            k: 4096,
+            n: 2560,
+            m: 64,
+            us: 302.3,
+            tflops: 4.439,
+        },
     ]
 }
 
@@ -326,18 +542,26 @@ fn main() {
         "Warmup: {} iters, Bench: {} iters, Q4, group_size={}, f16 input",
         WARMUP_ITERS, BENCH_ITERS, GROUP_SIZE,
     );
-    println!("Dispatch paths: M=1 QMV fast, M=2-16 QMV batched, M=17-64 Skinny Split-K, M>=128 NAX");
+    println!(
+        "Dispatch paths: M=1 QMV fast, M=2-16 QMV batched, M=17-64 Steel Split-K, M>=128 NAX"
+    );
     println!("MLX reference: M3 Ultra 80-core, mlx-lm 0.24, group_size=64, f16");
     println!();
 
     // Header
     println!(
         "{:>3}  {:>4}  {:>4}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>8}  {:>14}",
-        "M", "K", "N",
-        "disp_us", "kern_us",
-        "disp_T", "kern_T",
-        "mlx_us", "mlx_T",
-        "parity%", "path",
+        "M",
+        "K",
+        "N",
+        "disp_us",
+        "kern_us",
+        "disp_T",
+        "kern_T",
+        "mlx_us",
+        "mlx_T",
+        "parity%",
+        "path",
     );
     println!("{}", "-".repeat(120));
 
@@ -361,7 +585,7 @@ fn main() {
                 } else if m <= 16 {
                     "QMV-batch"
                 } else {
-                    "Skinny-SK"
+                    "Steel-SK"
                 };
 
                 // MLX reference
@@ -402,7 +626,8 @@ fn main() {
         let avg_parity: f64 = results.iter().map(|(_, p)| p).sum::<f64>() / results.len() as f64;
         println!(
             "Average parity across {} data points: {:.1}% of MLX throughput",
-            results.len(), avg_parity,
+            results.len(),
+            avg_parity,
         );
     }
 
@@ -410,9 +635,9 @@ fn main() {
     println!();
     println!("Per-M-range parity summary:");
     for &(label, m_lo, m_hi) in &[
-        ("QMV (M=1)",         1usize, 1usize),
-        ("QMV (M=2-16)",      2, 16),
-        ("Skinny (M=32-64)", 32, 64),
+        ("QMV (M=1)", 1usize, 1usize),
+        ("QMV (M=2-16)", 2, 16),
+        ("Steel-SK (M=32-64)", 32, 64),
     ] {
         let filtered: Vec<f64> = results
             .iter()
@@ -421,7 +646,12 @@ fn main() {
             .collect();
         if !filtered.is_empty() {
             let avg = filtered.iter().sum::<f64>() / filtered.len() as f64;
-            println!("  {:<20} avg parity: {:6.1}% ({} points)", label, avg, filtered.len());
+            println!(
+                "  {:<20} avg parity: {:6.1}% ({} points)",
+                label,
+                avg,
+                filtered.len()
+            );
         }
     }
 

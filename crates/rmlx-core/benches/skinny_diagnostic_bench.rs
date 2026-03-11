@@ -43,14 +43,54 @@ struct MlxRef {
 
 fn mlx_reference() -> Vec<MlxRef> {
     vec![
-        MlxRef { m: 32, k: 3584, n: 2560, us: 280.5 },
-        MlxRef { m: 64, k: 3584, n: 2560, us: 291.2 },
-        MlxRef { m: 32, k: 3584, n: 4096, us: 271.5 },
-        MlxRef { m: 64, k: 3584, n: 4096, us: 294.5 },
-        MlxRef { m: 32, k: 4096, n: 2560, us: 293.3 },
-        MlxRef { m: 64, k: 4096, n: 2560, us: 302.3 },
-        MlxRef { m: 32, k: 4096, n: 4096, us: 298.8 },
-        MlxRef { m: 64, k: 4096, n: 4096, us: 327.9 },
+        MlxRef {
+            m: 32,
+            k: 3584,
+            n: 2560,
+            us: 280.5,
+        },
+        MlxRef {
+            m: 64,
+            k: 3584,
+            n: 2560,
+            us: 291.2,
+        },
+        MlxRef {
+            m: 32,
+            k: 3584,
+            n: 4096,
+            us: 271.5,
+        },
+        MlxRef {
+            m: 64,
+            k: 3584,
+            n: 4096,
+            us: 294.5,
+        },
+        MlxRef {
+            m: 32,
+            k: 4096,
+            n: 2560,
+            us: 293.3,
+        },
+        MlxRef {
+            m: 64,
+            k: 4096,
+            n: 2560,
+            us: 302.3,
+        },
+        MlxRef {
+            m: 32,
+            k: 4096,
+            n: 4096,
+            us: 298.8,
+        },
+        MlxRef {
+            m: 64,
+            k: 4096,
+            n: 4096,
+            us: 327.9,
+        },
     ]
 }
 
@@ -362,9 +402,21 @@ fn main() {
                 let steel_tf = tflops(m, n, k, steel.p50);
                 let nax_tf = tflops(m, n, k, nax.p50);
 
-                let sk_parity = if mlx_us > 0.0 { mlx_us / sk.p50 * 100.0 } else { 0.0 };
-                let steel_parity = if mlx_us > 0.0 { mlx_us / steel.p50 * 100.0 } else { 0.0 };
-                let nax_parity = if mlx_us > 0.0 { mlx_us / nax.p50 * 100.0 } else { 0.0 };
+                let sk_parity = if mlx_us > 0.0 {
+                    mlx_us / sk.p50 * 100.0
+                } else {
+                    0.0
+                };
+                let steel_parity = if mlx_us > 0.0 {
+                    mlx_us / steel.p50 * 100.0
+                } else {
+                    0.0
+                };
+                let nax_parity = if mlx_us > 0.0 {
+                    mlx_us / nax.p50 * 100.0
+                } else {
+                    0.0
+                };
 
                 // Find best
                 let (best_name, best_parity) = [
@@ -380,10 +432,7 @@ fn main() {
                 let gap_vs_mlx = best_parity - 100.0;
 
                 println!("M={:<3} K={:<4} N={:<4}", m, k, n);
-                println!(
-                    "  MLX ref:     {:6.1} us ({:.3} TFLOPS)",
-                    mlx_us, mlx_tf,
-                );
+                println!("  MLX ref:     {:6.1} us ({:.3} TFLOPS)", mlx_us, mlx_tf,);
                 println!(
                     "  Compute min: {:5.1} us  |  BW min (GEMM): {:5.1} us  |  BW min (QMV): {:5.1} us",
                     comp_us, bw_gemm_us, bw_qmv_us,
