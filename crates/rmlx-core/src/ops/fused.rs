@@ -724,6 +724,7 @@ fn encode_gemm(
         super::matmul::TileVariant::MlxArch
         | super::matmul::TileVariant::MlxArchSmall
         | super::matmul::TileVariant::MlxArchMicro => 64_u64,
+        super::matmul::TileVariant::NaxArch => 512_u64,
     };
 
     let enc = cb.new_compute_command_encoder();

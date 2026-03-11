@@ -42,14 +42,12 @@ class Attention(nn.Module):
         self.scale = HEAD_DIM ** -0.5
 
     def __call__(self, x, mask=None, cache=None):
-        # Add batch dim for MLX attention
         x_3d = x[None, :, :]  # [1, seq_len, hidden]
 
         q = self.q_proj(x_3d)
         k = self.k_proj(x_3d)
         v = self.v_proj(x_3d)
 
-        # Reshape to [1, seq_len, num_heads, head_dim] then transpose to [1, num_heads, seq_len, head_dim]
         q = q.reshape(1, -1, NUM_HEADS, HEAD_DIM).transpose(0, 2, 1, 3)
         k = k.reshape(1, -1, NUM_KV_HEADS, HEAD_DIM).transpose(0, 2, 1, 3)
         v = v.reshape(1, -1, NUM_KV_HEADS, HEAD_DIM).transpose(0, 2, 1, 3)
@@ -57,22 +55,19 @@ class Attention(nn.Module):
         q = self.rope(q)
         k = self.rope(k)
 
-        # GQA: repeat K/V heads
-        if NUM_KV_HEADS < NUM_HEADS:
-            n_rep = NUM_HEADS // NUM_KV_HEADS
-            k = mx.repeat(k, n_rep, axis=1)
-            v = mx.repeat(v, n_rep, axis=1)
-
-        # Scaled dot product attention with causal mask
-        w = (q * self.scale) @ k.transpose(0, 1, 3, 2)
-        if mask is not None:
-            w = w + mask
-        w = mx.softmax(w, axis=-1)
-        o = w @ v  # [1, num_heads, seq_len, head_dim]
+        # Use mx.fast.scaled_dot_product_attention — handles GQA natively
+        o = mx.fast.scaled_dot_product_attention(
+            q, k, v, scale=self.scale, mask=mask
+        )
 
         o = o.transpose(0, 2, 1, 3).reshape(1, -1, NUM_HEADS * HEAD_DIM)
         o = self.o_proj(o)
-        return o[0]  # Remove batch dim
+        return o[0]
+
+
+@mx.compile
+def _swiglu(gate, up):
+    return nn.silu(gate) * up
 
 
 class MLP(nn.Module):
@@ -83,7 +78,7 @@ class MLP(nn.Module):
         self.down_proj = nn.Linear(INTERMEDIATE_DIM, HIDDEN_SIZE, bias=False)
 
     def __call__(self, x):
-        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(_swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
 class TransformerBlock(nn.Module):
@@ -106,27 +101,20 @@ class TransformerBlock(nn.Module):
         return h
 
 
-def build_causal_mask(seq_len):
-    """Build causal attention mask."""
-    mask = nn.MultiHeadAttention.create_additive_causal_mask(seq_len)
-    return mask.astype(mx.float16)
-
-
 def bench_seq_len(block, seq_len):
     """Benchmark a single seq_len."""
     x = mx.random.normal((seq_len, HIDDEN_SIZE)).astype(mx.float16)
-    mask = build_causal_mask(seq_len)
 
     # Warmup
     for _ in range(WARMUP_ITERS):
-        out = block(x, mask=mask)
+        out = block(x, mask="causal")
         mx.eval(out)
 
     # Bench
     latencies = []
     for _ in range(BENCH_ITERS):
         start = time.perf_counter()
-        out = block(x, mask=mask)
+        out = block(x, mask="causal")
         mx.eval(out)
         elapsed = time.perf_counter() - start
         latencies.append(elapsed * 1e6)  # to microseconds

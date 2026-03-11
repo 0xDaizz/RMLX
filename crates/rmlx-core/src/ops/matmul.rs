@@ -3118,6 +3118,349 @@ kernel void gemm_mlx_bf16(
 "#;
 
 // ---------------------------------------------------------------------------
+// Metal shader source: NAX GEMM (M3+ hardware MMA via MetalPerformancePrimitives).
+// BM=128, BN=128, BK=32 (outer K-tile), 16 simdgroups (4×4), 512 threads.
+// Each SG computes 32×32 output as 2 stacked 16×32 mpp subtiles (MMA 16,32,16).
+// ---------------------------------------------------------------------------
+
+pub const GEMM_NAX_SHADER_SOURCE: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup>
+using namespace metal;
+
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+
+// Function constants (same IDs as existing kernels)
+constant bool align_M [[function_constant(200)]];
+constant bool align_N [[function_constant(201)]];
+constant bool has_residual [[function_constant(202)]];
+constant bool align_K [[function_constant(205)]];
+
+// Tile dimensions
+constant constexpr uint BM = 128;
+constant constexpr uint BN = 128;
+constant constexpr uint BK = 32;   // Outer K-tile
+constant constexpr uint WM = 4;    // SGs along M
+constant constexpr uint WN = 4;    // SGs along N
+constant constexpr uint SM = 32;   // Per-SG output M (BM/WM)
+constant constexpr uint SN = 32;   // Per-SG output N (BN/WN)
+constant constexpr uint FK = 16;   // Inner K-step for mpp (fragment K dim)
+constant constexpr uint N_THREADS = 512;
+
+// NAX coordinate helpers (same as SDPA NAX kernel)
+// Each lane in a 16×16 fragment holds 8 elements: 2 rows × 4 cols
+// Row indices: fm, fm+8
+// Col indices: fn, fn+1, fn+2, fn+3
+inline short nax_fm(uint slid) {
+    short qid = short(slid) >> 2;
+    return ((qid & 4) | ((short(slid) >> 1) & 3));
+}
+
+inline short nax_fn(uint slid) {
+    short qid = short(slid) >> 2;
+    return ((qid & 2) | (short(slid) & 1)) * 4;
+}
+
+// Load a 16×16 block from device memory into a NAX fragment register array.
+METAL_FUNC void nax_load_16x16(thread half* frag,
+                                 const device half* src, int src_ld,
+                                 short fm, short fn,
+                                 int valid_rows, int valid_cols) {
+    for (short c = 0; c < 4; c++) {
+        bool ok = (fm < valid_rows) && (fn + c < valid_cols);
+        frag[c] = ok ? src[fm * src_ld + fn + c] : half(0);
+    }
+    for (short c = 0; c < 4; c++) {
+        bool ok = (fm + 8 < valid_rows) && (fn + c < valid_cols);
+        frag[4 + c] = ok ? src[(fm + 8) * src_ld + fn + c] : half(0);
+    }
+}
+
+METAL_FUNC void nax_load_16x16_unsafe(thread half* frag,
+                                        const device half* src, int src_ld,
+                                        short fm, short fn) {
+    for (short c = 0; c < 4; c++) {
+        frag[c] = src[fm * src_ld + fn + c];
+    }
+    for (short c = 0; c < 4; c++) {
+        frag[4 + c] = src[(fm + 8) * src_ld + fn + c];
+    }
+}
+
+// Store a 16×16 block from float accumulator to device half memory.
+METAL_FUNC void nax_store_16x16(device half* dst, int dst_ld,
+                                  thread const float* frag,
+                                  short fm, short fn,
+                                  int valid_rows, int valid_cols) {
+    for (short c = 0; c < 4; c++) {
+        if (fm < valid_rows && fn + c < valid_cols) {
+            dst[fm * dst_ld + fn + c] = half(frag[c]);
+        }
+    }
+    for (short c = 0; c < 4; c++) {
+        if (fm + 8 < valid_rows && fn + c < valid_cols) {
+            dst[(fm + 8) * dst_ld + fn + c] = half(frag[4 + c]);
+        }
+    }
+}
+
+METAL_FUNC void nax_store_16x16_unsafe(device half* dst, int dst_ld,
+                                         thread const float* frag,
+                                         short fm, short fn) {
+    for (short c = 0; c < 4; c++) {
+        dst[fm * dst_ld + fn + c] = half(frag[c]);
+    }
+    for (short c = 0; c < 4; c++) {
+        dst[(fm + 8) * dst_ld + fn + c] = half(frag[4 + c]);
+    }
+}
+
+// Store with residual add
+METAL_FUNC void nax_store_16x16_residual(device half* dst,
+                                           const device half* res,
+                                           int dst_ld,
+                                           thread const float* frag,
+                                           short fm, short fn,
+                                           int valid_rows, int valid_cols) {
+    for (short c = 0; c < 4; c++) {
+        if (fm < valid_rows && fn + c < valid_cols) {
+            dst[fm * dst_ld + fn + c] = half(frag[c]) + res[fm * dst_ld + fn + c];
+        }
+    }
+    for (short c = 0; c < 4; c++) {
+        if (fm + 8 < valid_rows && fn + c < valid_cols) {
+            dst[(fm + 8) * dst_ld + fn + c] = half(frag[4 + c]) + res[(fm + 8) * dst_ld + fn + c];
+        }
+    }
+}
+
+METAL_FUNC void nax_store_16x16_residual_unsafe(device half* dst,
+                                                   const device half* res,
+                                                   int dst_ld,
+                                                   thread const float* frag,
+                                                   short fm, short fn) {
+    for (short c = 0; c < 4; c++) {
+        dst[fm * dst_ld + fn + c] = half(frag[c]) + res[fm * dst_ld + fn + c];
+    }
+    for (short c = 0; c < 4; c++) {
+        dst[(fm + 8) * dst_ld + fn + c] = half(frag[4 + c]) + res[(fm + 8) * dst_ld + fn + c];
+    }
+}
+
+// ─── Main NAX GEMM kernel ──────────────────────────────────────────────────
+//
+// A: [M, K] row-major, B: [K, N] row-major → C: [M, N]
+//
+// Grid: (ceildiv(N, BN), ceildiv(M, BM), batch)
+// Threadgroup: (512, 1, 1) — 16 simdgroups × 32 lanes
+//
+// Each SG computes a 32×32 output tile as 2 stacked 16×32 subtiles.
+// MMA descriptor is (16, 32, 16): B fragment is 16×32 (16 elems/lane).
+// K dimension is iterated in outer blocks of BK=32, with inner steps of FK=16.
+
+[[kernel, max_total_threads_per_threadgroup(512)]]
+void gemm_nax_f16(
+    device const half* A [[buffer(0)]],
+    device const half* B [[buffer(1)]],
+    device half* C [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    constant uint& K [[buffer(5)]],
+    constant uint& batch_stride_a [[buffer(6)]],
+    constant uint& batch_stride_b [[buffer(7)]],
+    constant uint& batch_stride_c [[buffer(8)]],
+    constant uint& swizzle_log [[buffer(9)]],
+    device const half* residual [[buffer(10)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint slid [[thread_index_in_simdgroup]])
+{
+    // Batch offset
+    const uint batch_idx = tid.z;
+    const device half* A_batch = A + batch_idx * batch_stride_a;
+    const device half* B_batch = B + batch_idx * batch_stride_b;
+    device half* C_batch = C + batch_idx * batch_stride_c;
+
+    // Threadblock swizzle
+    uint2 tg_pos = uint2(tid.x, tid.y);
+    if (swizzle_log > 0) {
+        tg_pos = uint2(
+            tg_pos.x >> swizzle_log,
+            (tg_pos.y << swizzle_log) | (tg_pos.x & ((1u << swizzle_log) - 1u))
+        );
+    }
+
+    // SG position within threadgroup: 4×4 grid
+    const uint sg_m = sgid / WN;  // 0..3
+    const uint sg_n = sgid % WN;  // 0..3
+
+    // Global output position for this SG
+    const uint gm = tg_pos.y * BM + sg_m * SM;  // Start row
+    const uint gn = tg_pos.x * BN + sg_n * SN;  // Start col
+
+    // Early exit for out-of-bounds SGs
+    if (!align_M && gm >= M) return;
+    if (!align_N && gn >= N) return;
+
+    // Valid rows/cols for this SG
+    const int sg_valid_m = align_M ? int(SM) : min(int(M) - int(gm), int(SM));
+    const int sg_valid_n = align_N ? int(SN) : min(int(N) - int(gn), int(SN));
+
+    if (sg_valid_m <= 0 || sg_valid_n <= 0) return;
+
+    // Per-lane fragment coordinates within a 16×16 fragment
+    const short fm = nax_fm(slid);
+    const short fn = nax_fn(slid);
+
+    // MPP matmul2d descriptor: MMA(16, 32, 16, A=normal, B=normal, accumulate)
+    // At least one of M, N, K must be 32 for cooperative tensors.
+    // A fragment: 16×16 (8 elems/lane), B fragment: 16×32 (16 elems/lane)
+    // C fragment: 16×32 (16 elems/lane)
+    constexpr auto nax_desc = mpp::tensor_ops::matmul2d_descriptor(
+        16, 32, 16, false, false, true,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+
+    // Accumulator: 2 row-blocks of 16×32 subtiles (32×32 output per SG)
+    // Each 16×32 subtile has 16 elements per lane (two 16×16 fragments)
+    // acc[fm_idx][0..7] = cols 0-15, acc[fm_idx][8..15] = cols 16-31
+    float acc[2][16];
+    for (int i = 0; i < 2; i++)
+        for (int j = 0; j < 16; j++)
+            acc[i][j] = 0.0f;
+
+    // K-loop: iterate in outer blocks of BK=32
+    const uint k_iters = align_K ? (K / BK) : ((K + BK - 1) / BK);
+
+    for (uint kk = 0; kk < k_iters; kk++) {
+        const uint gk = kk * BK;
+        const int k_remaining = align_K ? int(BK) : min(int(K) - int(gk), int(BK));
+
+        // Inner K loop in steps of FK=16
+        for (int sk = 0; sk < k_remaining; sk += int(FK)) {
+            const int fk_valid = min(int(FK), k_remaining - sk);
+            const bool k_aligned = align_K || (fk_valid == int(FK));
+
+            // Load B fragment ONCE (16×32 = 16 elems/thread)
+            // ct_b[0..7] = B[gk+sk : gk+sk+16, gn : gn+16]     (first 16×16 block)
+            // ct_b[8..15] = B[gk+sk : gk+sk+16, gn+16 : gn+32] (second 16×16 block)
+            half B_frag[16];
+            {
+                // First 16×16 block (cols 0-15)
+                const device half* B_ptr0 = B_batch + (gk + uint(sk)) * N + gn;
+                int b_cols0 = align_N ? 16 : min(16, sg_valid_n);
+                if (b_cols0 <= 0) {
+                    for (int e = 0; e < 8; e++) B_frag[e] = half(0);
+                } else if (k_aligned && b_cols0 == 16) {
+                    nax_load_16x16_unsafe(B_frag, B_ptr0, int(N), fm, fn);
+                } else {
+                    nax_load_16x16(B_frag, B_ptr0, int(N), fm, fn,
+                                  k_aligned ? 16 : fk_valid, b_cols0);
+                }
+
+                // Second 16×16 block (cols 16-31)
+                const device half* B_ptr1 = B_ptr0 + 16;
+                int b_cols1 = align_N ? 16 : min(16, sg_valid_n - 16);
+                if (b_cols1 <= 0) {
+                    for (int e = 0; e < 8; e++) B_frag[8 + e] = half(0);
+                } else if (k_aligned && b_cols1 == 16) {
+                    nax_load_16x16_unsafe(B_frag + 8, B_ptr1, int(N), fm, fn);
+                } else {
+                    nax_load_16x16(B_frag + 8, B_ptr1, int(N), fm, fn,
+                                  k_aligned ? 16 : fk_valid, b_cols1);
+                }
+            }
+
+            // For each row block (2 blocks of 16 rows = 32 rows total)
+            for (uint fm_idx = 0; fm_idx < 2; fm_idx++) {
+                // Load A fragment (16×16 = 8 elems/thread)
+                half A_frag[8];
+                {
+                    const device half* A_ptr = A_batch + (gm + fm_idx * 16) * K + gk + uint(sk);
+                    int a_rows = align_M ? 16 : min(16, sg_valid_m - int(fm_idx * 16));
+                    if (a_rows <= 0) {
+                        for (int e = 0; e < 8; e++) A_frag[e] = half(0);
+                    } else if (k_aligned && a_rows == 16) {
+                        nax_load_16x16_unsafe(A_frag, A_ptr, int(K), fm, fn);
+                    } else {
+                        nax_load_16x16(A_frag, A_ptr, int(K), fm, fn,
+                                      a_rows, k_aligned ? 16 : fk_valid);
+                    }
+                }
+
+                // MMA(16, 32, 16): acc[fm_idx] += A_frag @ B_frag
+                {
+                    mpp::tensor_ops::matmul2d<nax_desc, metal::execution_simdgroup> gemm_op;
+                    auto ct_a = gemm_op.template get_left_input_cooperative_tensor<half, half, float>();
+                    auto ct_b = gemm_op.template get_right_input_cooperative_tensor<half, half, float>();
+                    auto ct_c = gemm_op.template get_destination_cooperative_tensor<decltype(ct_a), decltype(ct_b), float>();
+                    for (int e = 0; e < 8; e++) ct_a[e] = A_frag[e];
+                    for (int e = 0; e < 16; e++) ct_b[e] = B_frag[e];
+                    for (int e = 0; e < 16; e++) ct_c[e] = acc[fm_idx][e];
+                    gemm_op.run(ct_a, ct_b, ct_c);
+                    for (int e = 0; e < 16; e++) acc[fm_idx][e] = ct_c[e];
+                }
+            }
+        }
+    }
+
+    // ─── Store results ──────────────────────────────────────────────────────
+    const bool full_m = align_M || (sg_valid_m >= int(SM));
+    const bool full_n = align_N || (sg_valid_n >= int(SN));
+
+    for (uint fm_idx = 0; fm_idx < 2; fm_idx++) {
+        const uint out_row = gm + fm_idx * 16;
+        int m_valid = full_m ? 16 : min(16, sg_valid_m - int(fm_idx * 16));
+        if (m_valid <= 0) continue;
+
+        // First 16×16 block (cols 0-15)
+        {
+            device half* C_ptr = C_batch + out_row * N + gn;
+            int n_valid = full_n ? 16 : min(16, sg_valid_n);
+            if (n_valid > 0) {
+                if (has_residual) {
+                    const device half* res_ptr = residual + out_row * N + gn;
+                    if (m_valid == 16 && n_valid == 16) {
+                        nax_store_16x16_residual_unsafe(C_ptr, res_ptr, int(N), acc[fm_idx], fm, fn);
+                    } else {
+                        nax_store_16x16_residual(C_ptr, res_ptr, int(N), acc[fm_idx], fm, fn, m_valid, n_valid);
+                    }
+                } else {
+                    if (m_valid == 16 && n_valid == 16) {
+                        nax_store_16x16_unsafe(C_ptr, int(N), acc[fm_idx], fm, fn);
+                    } else {
+                        nax_store_16x16(C_ptr, int(N), acc[fm_idx], fm, fn, m_valid, n_valid);
+                    }
+                }
+            }
+        }
+
+        // Second 16×16 block (cols 16-31)
+        {
+            device half* C_ptr = C_batch + out_row * N + gn + 16;
+            int n_valid = full_n ? 16 : min(16, sg_valid_n - 16);
+            if (n_valid > 0) {
+                if (has_residual) {
+                    const device half* res_ptr = residual + out_row * N + gn + 16;
+                    if (m_valid == 16 && n_valid == 16) {
+                        nax_store_16x16_residual_unsafe(C_ptr, res_ptr, int(N), acc[fm_idx] + 8, fm, fn);
+                    } else {
+                        nax_store_16x16_residual(C_ptr, res_ptr, int(N), acc[fm_idx] + 8, fm, fn, m_valid, n_valid);
+                    }
+                } else {
+                    if (m_valid == 16 && n_valid == 16) {
+                        nax_store_16x16_unsafe(C_ptr, int(N), acc[fm_idx] + 8, fm, fn);
+                    } else {
+                        nax_store_16x16(C_ptr, int(N), acc[fm_idx] + 8, fm, fn, m_valid, n_valid);
+                    }
+                }
+            }
+        }
+    }
+}
+
+"#;
+
+// ---------------------------------------------------------------------------
 // Metal shader source: Grouped GEMM for MoE workloads.
 // Multiple variable-M problems in a single kernel dispatch.
 // BM=64, BN=64, BK=16, 2 simdgroups (1×2), 64 threads.
@@ -3506,6 +3849,10 @@ pub enum TileVariant {
     /// 16x32x16 MLX-architecture kernel for micro-M: 2 SG (1×2), 64 threads.
     /// f16-only, used for M=5-16 with large N.
     MlxArchMicro,
+    /// 128x128x32 NAX kernel: 16 SG (4×4), 512 threads, mpp::tensor_ops::matmul2d.
+    /// f16-only, M3+ hardware MMA with 16×16 fragments. Used when supports_nax
+    /// is true and M >= 64, N >= 64, K >= 64.
+    NaxArch,
 }
 
 /// Select the best tile configuration based on matrix dimensions.
@@ -3591,6 +3938,30 @@ pub fn select_tile_config_with_dtype(m: usize, n: usize, k: usize, dtype: DType)
     } else {
         base
     }
+}
+
+/// Select the best tile configuration considering dtype and NAX hardware support.
+///
+/// When `supports_nax` is true and the problem is f16 with M >= 64, N >= 64, K >= 64,
+/// the NAX (M3+ hardware MMA) path is selected with BM=128, BN=128, BK=32.
+/// Otherwise falls back to `select_tile_config_with_dtype`.
+pub fn select_tile_config_with_nax(
+    m: usize,
+    n: usize,
+    k: usize,
+    dtype: DType,
+    supports_nax: bool,
+) -> TileConfig {
+    // NAX path: M3+ hardware MMA, f16 only, large enough problem
+    if supports_nax && dtype == DType::Float16 && m >= 64 && n >= 64 && k >= 64 {
+        return TileConfig {
+            bm: 128,
+            bn: 128,
+            bk: 32,
+            variant: TileVariant::NaxArch,
+        };
+    }
+    select_tile_config_with_dtype(m, n, k, dtype)
 }
 
 /// Compute swizzle_log for threadblock swizzle.
@@ -3765,6 +4136,10 @@ pub fn register(registry: &KernelRegistry) -> Result<(), KernelError> {
     registry.register_jit_source("gemm_mlx", GEMM_MLX_SHADER_SOURCE)?;
     registry.register_jit_source("gemm_splitk_f16", SPLIT_K_F16_SHADER_SOURCE)?;
     registry.register_jit_source("gemm_grouped", GROUPED_GEMM_SHADER_SOURCE)?;
+    // NAX GEMM requires MetalPerformancePrimitives (Metal 3.1+), gracefully skip if unavailable
+    if let Err(e) = registry.register_jit_source("gemm_nax", GEMM_NAX_SHADER_SOURCE) {
+        eprintln!("warning: gemm_nax registration skipped (MPP unavailable): {e}");
+    }
     Ok(())
 }
 
@@ -4029,7 +4404,8 @@ fn dispatch_tiled_gemm(
     batch_stride_c: usize,
     output_shape: &[usize],
 ) -> Result<Array, KernelError> {
-    let tile = select_tile_config_with_dtype(m, n, k, a.dtype());
+    let supports_nax = registry.device().tuning().supports_nax;
+    let tile = select_tile_config_with_nax(m, n, k, a.dtype(), supports_nax);
 
     let kernel_name = match (tile.variant, a.dtype()) {
         (TileVariant::Small, DType::Float32) => "gemm_small_f32",
@@ -4052,6 +4428,7 @@ fn dispatch_tiled_gemm(
         (TileVariant::MlxArch, DType::Bfloat16) => "gemm_mlx_bf16",
         (TileVariant::MlxArchSmall, DType::Float16) => "gemm_mlx_small_f16",
         (TileVariant::MlxArchMicro, DType::Float16) => "gemm_mlx_m16_f16",
+        (TileVariant::NaxArch, DType::Float16) => "gemm_nax_f16",
         _ => {
             return Err(KernelError::NotFound(format!(
                 "matmul not supported for {:?}",
@@ -4060,10 +4437,11 @@ fn dispatch_tiled_gemm(
         }
     };
 
-    // MlxArch/MlxArchSmall use function constants for alignment specialization
+    // MlxArch/MlxArchSmall/NaxArch use function constants for alignment specialization
     let pipeline = if tile.variant == TileVariant::MlxArch
         || tile.variant == TileVariant::MlxArchSmall
         || tile.variant == TileVariant::MlxArchMicro
+        || tile.variant == TileVariant::NaxArch
     {
         let constants = matmul_align_constants(m, n, k, tile.bm, tile.bn, tile.bk);
         registry.get_pipeline_with_constants(kernel_name, a.dtype(), &constants)?
@@ -4097,13 +4475,14 @@ fn dispatch_tiled_gemm(
         super::checked_u32(batch_stride_c, "batch_stride_c")?,
     );
 
-    // Pass swizzle_log for Full, Skinny, MlxArch, and MlxArchSmall variants (buffer 9)
+    // Pass swizzle_log for Full, Skinny, MlxArch, MlxArchSmall, NaxArch variants (buffer 9)
     match tile.variant {
         TileVariant::Full
         | TileVariant::Skinny
         | TileVariant::MlxArch
         | TileVariant::MlxArchSmall
-        | TileVariant::MlxArchMicro => {
+        | TileVariant::MlxArchMicro
+        | TileVariant::NaxArch => {
             let swizzle_log = compute_swizzle_log(m, n, tile.bm, tile.bn);
             set_u32(enc, 9, swizzle_log);
         }
@@ -4123,6 +4502,7 @@ fn dispatch_tiled_gemm(
         TileVariant::Full => 256_u64,
         TileVariant::MlxArch => 128_u64,
         TileVariant::MlxArchSmall | TileVariant::MlxArchMicro => 64_u64,
+        TileVariant::NaxArch => 512_u64,
     };
     let tg = MTLSize::new(tg_threads, 1, 1);
 
@@ -4425,7 +4805,8 @@ pub fn matmul_into_cb(
     // -------------------------------------------------------------------
     // Tiled GEMM dispatch (batch=1)
     // -------------------------------------------------------------------
-    let tile = select_tile_config_with_dtype(m, n, k, a.dtype());
+    let supports_nax = registry.device().tuning().supports_nax;
+    let tile = select_tile_config_with_nax(m, n, k, a.dtype(), supports_nax);
 
     let kernel_name = match (tile.variant, a.dtype()) {
         (TileVariant::Small, DType::Float32) => "gemm_small_f32",
@@ -4451,6 +4832,7 @@ pub fn matmul_into_cb(
         (TileVariant::MlxArch, DType::Bfloat16) => "gemm_mlx_bf16",
         (TileVariant::MlxArchSmall, DType::Float16) => "gemm_mlx_small_f16",
         (TileVariant::MlxArchMicro, DType::Float16) => "gemm_mlx_m16_f16",
+        (TileVariant::NaxArch, DType::Float16) => "gemm_nax_f16",
         _ => {
             return Err(KernelError::NotFound(format!(
                 "matmul_into_cb: unsupported dtype {:?}",
@@ -4459,10 +4841,11 @@ pub fn matmul_into_cb(
         }
     };
 
-    // MlxArch/MlxArchSmall use function constants for alignment specialization
+    // MlxArch/MlxArchSmall/NaxArch use function constants for alignment specialization
     let pipeline = if tile.variant == TileVariant::MlxArch
         || tile.variant == TileVariant::MlxArchSmall
         || tile.variant == TileVariant::MlxArchMicro
+        || tile.variant == TileVariant::NaxArch
     {
         let constants = matmul_align_constants(m, n, k, tile.bm, tile.bn, tile.bk);
         registry.get_pipeline_with_constants(kernel_name, a.dtype(), &constants)?
@@ -4535,13 +4918,14 @@ fn encode_gemm_core(
         super::checked_u32(batch_stride_c, "batch_stride_c")?,
     );
 
-    // Pass swizzle_log for Full, Skinny, MlxArch, and MlxArchSmall variants (buffer 9)
+    // Pass swizzle_log for Full, Skinny, MlxArch, MlxArchSmall, NaxArch variants (buffer 9)
     match tile.variant {
         TileVariant::Full
         | TileVariant::Skinny
         | TileVariant::MlxArch
         | TileVariant::MlxArchSmall
-        | TileVariant::MlxArchMicro => {
+        | TileVariant::MlxArchMicro
+        | TileVariant::NaxArch => {
             let swizzle_log = compute_swizzle_log(m, n, tile.bm, tile.bn);
             set_u32(enc, 9, swizzle_log);
         }
@@ -4560,6 +4944,7 @@ fn encode_gemm_core(
         TileVariant::Full => 256_u64,
         TileVariant::MlxArch => 128_u64,
         TileVariant::MlxArchSmall | TileVariant::MlxArchMicro => 64_u64,
+        TileVariant::NaxArch => 512_u64,
     };
     let tg = MTLSize::new(tg_threads, 1, 1);
 
@@ -4639,7 +5024,8 @@ pub fn matmul_encode(
         ));
     }
 
-    let tile = select_tile_config_with_dtype(m, n, k, a.dtype());
+    let supports_nax = registry.device().tuning().supports_nax;
+    let tile = select_tile_config_with_nax(m, n, k, a.dtype(), supports_nax);
     let kernel_name = match (tile.variant, a.dtype()) {
         (TileVariant::Small, DType::Float32) => "gemm_small_f32",
         (TileVariant::Small, DType::Float16) => "gemm_small_f16",
@@ -4664,6 +5050,7 @@ pub fn matmul_encode(
         (TileVariant::MlxArch, DType::Bfloat16) => "gemm_mlx_bf16",
         (TileVariant::MlxArchSmall, DType::Float16) => "gemm_mlx_small_f16",
         (TileVariant::MlxArchMicro, DType::Float16) => "gemm_mlx_m16_f16",
+        (TileVariant::NaxArch, DType::Float16) => "gemm_nax_f16",
         _ => {
             return Err(KernelError::NotFound(format!(
                 "matmul_encode: unsupported dtype {:?}",
@@ -4675,6 +5062,7 @@ pub fn matmul_encode(
     let pipeline = if tile.variant == TileVariant::MlxArch
         || tile.variant == TileVariant::MlxArchSmall
         || tile.variant == TileVariant::MlxArchMicro
+        || tile.variant == TileVariant::NaxArch
     {
         let constants = matmul_align_constants(m, n, k, tile.bm, tile.bn, tile.bk);
         registry.get_pipeline_with_constants(kernel_name, a.dtype(), &constants)?
@@ -4790,36 +5178,50 @@ pub fn matmul_add_residual_into_cb(
         ));
     }
 
-    // Only MlxArch kernels support the residual epilogue
-    let tile = select_tile_config_with_dtype(m, n, k, a.dtype());
-    if tile.variant != TileVariant::MlxArch {
+    // MlxArch and NaxArch kernels support the residual epilogue
+    let supports_nax = registry.device().tuning().supports_nax;
+    let tile = select_tile_config_with_nax(m, n, k, a.dtype(), supports_nax);
+    if tile.variant != TileVariant::MlxArch && tile.variant != TileVariant::NaxArch {
         return Err(KernelError::NotFound(format!(
-            "matmul_add_residual_into_cb: only MlxArch tile supported, got {:?} (M={}, N={})",
+            "matmul_add_residual_into_cb: only MlxArch/NaxArch tile supported, got {:?} (M={}, N={})",
             tile.variant, m, n
         )));
     }
 
-    let kernel_name = match a.dtype() {
-        DType::Float16 => "gemm_mlx_f16",
-        DType::Float32 => "gemm_mlx_f32",
-        DType::Bfloat16 => "gemm_mlx_bf16",
-        _ => {
-            return Err(KernelError::NotFound(format!(
-                "matmul_add_residual_into_cb: unsupported dtype {:?}",
-                a.dtype()
-            )))
+    let kernel_name = if tile.variant == TileVariant::NaxArch {
+        "gemm_nax_f16"
+    } else {
+        match a.dtype() {
+            DType::Float16 => "gemm_mlx_f16",
+            DType::Float32 => "gemm_mlx_f32",
+            DType::Bfloat16 => "gemm_mlx_bf16",
+            _ => {
+                return Err(KernelError::NotFound(format!(
+                    "matmul_add_residual_into_cb: unsupported dtype {:?}",
+                    a.dtype()
+                )))
+            }
         }
     };
 
     // Function constants: align_M (200), align_N (201), has_residual (202), has_norm (203), has_swiglu (204)
     use crate::kernels::FunctionConstantValue;
-    let constants = vec![
-        (200, FunctionConstantValue::Bool(m % tile.bm == 0)),
-        (201, FunctionConstantValue::Bool(n % tile.bn == 0)),
-        (202, FunctionConstantValue::Bool(true)),
-        (203, FunctionConstantValue::Bool(false)),
-        (205, FunctionConstantValue::Bool(false)),
-    ];
+    let constants = if tile.variant == TileVariant::NaxArch {
+        vec![
+            (200, FunctionConstantValue::Bool(m % tile.bm == 0)),
+            (201, FunctionConstantValue::Bool(n % tile.bn == 0)),
+            (202, FunctionConstantValue::Bool(true)),
+            (205, FunctionConstantValue::Bool(k % tile.bk == 0)),
+        ]
+    } else {
+        vec![
+            (200, FunctionConstantValue::Bool(m % tile.bm == 0)),
+            (201, FunctionConstantValue::Bool(n % tile.bn == 0)),
+            (202, FunctionConstantValue::Bool(true)),
+            (203, FunctionConstantValue::Bool(false)),
+            (205, FunctionConstantValue::Bool(false)),
+        ]
+    };
     let pipeline = registry.get_pipeline_with_constants(kernel_name, a.dtype(), &constants)?;
 
     let dev = registry.device().raw();
@@ -4846,7 +5248,12 @@ pub fn matmul_add_residual_into_cb(
     let grid_x = ceil_div(n, tile.bn) as u64;
     let grid_y = ceil_div(m, tile.bm) as u64;
     let grid = MTLSize::new(grid_x, grid_y, 1);
-    let tg = MTLSize::new(128, 1, 1); // MlxArch = 128 threads (4 SG)
+    let tg_threads = if tile.variant == TileVariant::NaxArch {
+        512_u64
+    } else {
+        128_u64
+    };
+    let tg = MTLSize::new(tg_threads, 1, 1);
     enc.dispatch_thread_groups(grid, tg);
     enc.end_encoding();
 
@@ -4940,36 +5347,50 @@ pub fn matmul_add_residual_encode(
         ));
     }
 
-    // Only MlxArch kernels support the residual epilogue
-    let tile = select_tile_config_with_dtype(m, n, k, a.dtype());
-    if tile.variant != TileVariant::MlxArch {
+    // MlxArch and NaxArch kernels support the residual epilogue
+    let supports_nax = registry.device().tuning().supports_nax;
+    let tile = select_tile_config_with_nax(m, n, k, a.dtype(), supports_nax);
+    if tile.variant != TileVariant::MlxArch && tile.variant != TileVariant::NaxArch {
         return Err(KernelError::NotFound(format!(
-            "matmul_add_residual_encode: only MlxArch tile supported, got {:?} (M={}, N={})",
+            "matmul_add_residual_encode: only MlxArch/NaxArch tile supported, got {:?} (M={}, N={})",
             tile.variant, m, n
         )));
     }
 
-    let kernel_name = match a.dtype() {
-        DType::Float16 => "gemm_mlx_f16",
-        DType::Float32 => "gemm_mlx_f32",
-        DType::Bfloat16 => "gemm_mlx_bf16",
-        _ => {
-            return Err(KernelError::NotFound(format!(
-                "matmul_add_residual_encode: unsupported dtype {:?}",
-                a.dtype()
-            )))
+    let kernel_name = if tile.variant == TileVariant::NaxArch {
+        "gemm_nax_f16"
+    } else {
+        match a.dtype() {
+            DType::Float16 => "gemm_mlx_f16",
+            DType::Float32 => "gemm_mlx_f32",
+            DType::Bfloat16 => "gemm_mlx_bf16",
+            _ => {
+                return Err(KernelError::NotFound(format!(
+                    "matmul_add_residual_encode: unsupported dtype {:?}",
+                    a.dtype()
+                )))
+            }
         }
     };
 
     // Function constants: align_M (200), align_N (201), has_residual (202)
     use crate::kernels::FunctionConstantValue;
-    let constants = vec![
-        (200, FunctionConstantValue::Bool(m % tile.bm == 0)),
-        (201, FunctionConstantValue::Bool(n % tile.bn == 0)),
-        (202, FunctionConstantValue::Bool(true)),
-        (203, FunctionConstantValue::Bool(false)),
-        (205, FunctionConstantValue::Bool(false)),
-    ];
+    let constants = if tile.variant == TileVariant::NaxArch {
+        vec![
+            (200, FunctionConstantValue::Bool(m % tile.bm == 0)),
+            (201, FunctionConstantValue::Bool(n % tile.bn == 0)),
+            (202, FunctionConstantValue::Bool(true)),
+            (205, FunctionConstantValue::Bool(k % tile.bk == 0)),
+        ]
+    } else {
+        vec![
+            (200, FunctionConstantValue::Bool(m % tile.bm == 0)),
+            (201, FunctionConstantValue::Bool(n % tile.bn == 0)),
+            (202, FunctionConstantValue::Bool(true)),
+            (203, FunctionConstantValue::Bool(false)),
+            (205, FunctionConstantValue::Bool(false)),
+        ]
+    };
     let pipeline = registry.get_pipeline_with_constants(kernel_name, a.dtype(), &constants)?;
 
     let dev = registry.device().raw();
@@ -4996,7 +5417,12 @@ pub fn matmul_add_residual_encode(
     let grid_x = ceil_div(n, tile.bn) as u64;
     let grid_y = ceil_div(m, tile.bm) as u64;
     let grid = MTLSize::new(grid_x, grid_y, 1);
-    let tg = MTLSize::new(128, 1, 1); // MlxArch = 128 threads (4 SG)
+    let tg_threads = if tile.variant == TileVariant::NaxArch {
+        512_u64
+    } else {
+        128_u64
+    };
+    let tg = MTLSize::new(tg_threads, 1, 1);
     encoder.dispatch_thread_groups(grid, tg);
 
     Ok(out)

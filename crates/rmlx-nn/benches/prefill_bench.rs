@@ -720,4 +720,454 @@ fn main() {
     // Weight size reference
     let weight_mb = estimate_bytes(0) / 1e6;
     println!("\nWeight size per layer: {:.1} MB (f16)", weight_mb);
+
+    // ---- Per-dispatch GPU timing breakdown (old: 9 separate CBs) ----
+    bench_dispatch_breakdown(&registry, device, &cos_full, &sin_full);
+
+    // ---- Per-dispatch GPU timing (cumulative subtraction method) ----
+    bench_cumulative_breakdown(&registry, device, &cos_full, &sin_full);
+}
+
+// ---------------------------------------------------------------------------
+// Per-dispatch GPU timing breakdown
+// ---------------------------------------------------------------------------
+
+const BREAKDOWN_SEQ_LENS: &[usize] = &[32, 128, 256];
+const BREAKDOWN_WARMUP: usize = 5;
+const BREAKDOWN_ITERS: usize = 20;
+
+const CUMULATIVE_SEQ_LENS: &[usize] = &[32, 128, 256, 512, 1024];
+const CUMULATIVE_WARMUP: usize = 5;
+const CUMULATIVE_ITERS: usize = 20;
+
+fn bench_dispatch_breakdown(
+    registry: &KernelRegistry,
+    device: &metal::Device,
+    cos_full: &Array,
+    sin_full: &Array,
+) {
+    println!("\n{}", "=".repeat(90));
+    println!("========== Per-Dispatch GPU Timing Breakdown ==========");
+    println!(
+        "Config: hidden={}, heads={}/{}, head_dim={}, intermediate={}",
+        HIDDEN_SIZE, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, INTERMEDIATE_DIM
+    );
+    println!(
+        "Warmup: {} iters, Bench: {} iters per dispatch",
+        BREAKDOWN_WARMUP, BREAKDOWN_ITERS
+    );
+
+    let mut block = build_transformer_block(device);
+    block
+        .prepare_weights_9dispatch(device)
+        .expect("prepare_weights_9dispatch failed (breakdown)");
+    {
+        let setup_queue = device.new_command_queue();
+        block
+            .prepare_weights_for_graph(registry, &setup_queue)
+            .expect("prepare_weights_for_graph failed (breakdown)");
+    }
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    for &seq_len in BREAKDOWN_SEQ_LENS {
+        println!("\n--- seq_len={} ---", seq_len);
+        let _pool = ScopedPool::new();
+
+        let cos_freqs = cos_full.slice(0, 0, seq_len).expect("cos slice failed");
+        let sin_freqs = sin_full.slice(0, 0, seq_len).expect("sin slice failed");
+        let input = rand_array(device, &[seq_len, HIDDEN_SIZE], 42);
+
+        let queue = device.new_command_queue();
+
+        // Warmup
+        for _ in 0..BREAKDOWN_WARMUP {
+            let mut cache = LayerKvCache::preallocated(
+                device,
+                NUM_KV_HEADS,
+                HEAD_DIM,
+                MAX_SEQ_LEN,
+                DType::Float16,
+            );
+            let _ = block
+                .forward_prefill_breakdown(
+                    &input,
+                    Some(&cos_freqs),
+                    Some(&sin_freqs),
+                    &mut cache,
+                    registry,
+                    &queue,
+                )
+                .expect("breakdown warmup failed");
+        }
+
+        // Collect per-dispatch timings across iterations
+        // timings_per_dispatch[dispatch_idx] = Vec<Duration> across iters
+        let num_dispatches = 9;
+        let mut dispatch_names: Vec<&str> = Vec::new();
+        let mut timings_per_dispatch: Vec<Vec<Duration>> = (0..num_dispatches)
+            .map(|_| Vec::with_capacity(BREAKDOWN_ITERS))
+            .collect();
+
+        for _ in 0..BREAKDOWN_ITERS {
+            let mut cache = LayerKvCache::preallocated(
+                device,
+                NUM_KV_HEADS,
+                HEAD_DIM,
+                MAX_SEQ_LEN,
+                DType::Float16,
+            );
+            let (_, timings) = block
+                .forward_prefill_breakdown(
+                    &input,
+                    Some(&cos_freqs),
+                    Some(&sin_freqs),
+                    &mut cache,
+                    registry,
+                    &queue,
+                )
+                .expect("breakdown bench failed");
+
+            if dispatch_names.is_empty() {
+                dispatch_names = timings.iter().map(|(name, _)| *name).collect();
+            }
+            for (i, (_, dur)) in timings.iter().enumerate() {
+                if i < num_dispatches {
+                    timings_per_dispatch[i].push(*dur);
+                }
+            }
+        }
+
+        // Also measure single_cb total for overhead comparison
+        let mut single_cb_latencies = Vec::with_capacity(BREAKDOWN_ITERS);
+        {
+            for _ in 0..BREAKDOWN_ITERS {
+                let mut cache = LayerKvCache::preallocated(
+                    device,
+                    NUM_KV_HEADS,
+                    HEAD_DIM,
+                    MAX_SEQ_LEN,
+                    DType::Float16,
+                );
+                let cb = queue.new_command_buffer();
+                let start = Instant::now();
+                let _ = block
+                    .forward_prefill_single_cb(
+                        &input,
+                        Some(&cos_freqs),
+                        Some(&sin_freqs),
+                        None,
+                        &mut cache,
+                        registry,
+                        cb,
+                    )
+                    .expect("single_cb failed");
+                cb.commit();
+                cb.wait_until_completed();
+                single_cb_latencies.push(start.elapsed());
+            }
+        }
+
+        // Compute mean for each dispatch
+        let mut means_us: Vec<f64> = Vec::with_capacity(num_dispatches);
+        for durations in &timings_per_dispatch {
+            if durations.is_empty() {
+                means_us.push(0.0);
+            } else {
+                let sum: f64 = durations.iter().map(|d| d.as_secs_f64() * 1e6).sum();
+                means_us.push(sum / durations.len() as f64);
+            }
+        }
+        let total_breakdown_us: f64 = means_us.iter().sum();
+
+        let single_cb_mean_us: f64 = {
+            let sum: f64 = single_cb_latencies
+                .iter()
+                .map(|d| d.as_secs_f64() * 1e6)
+                .sum();
+            sum / single_cb_latencies.len() as f64
+        };
+
+        // Print table
+        println!(
+            "| {:>2} | {:<28} | {:>10} | {:>6} |",
+            "#", "Dispatch", "Time (us)", "%"
+        );
+        println!("|{:-<4}|{:-<30}|{:-<12}|{:-<8}|", "", "", "", "");
+        for (i, name) in dispatch_names.iter().enumerate() {
+            let us = means_us[i];
+            let pct = if total_breakdown_us > 0.0 {
+                us / total_breakdown_us * 100.0
+            } else {
+                0.0
+            };
+            println!(
+                "| {:>2} | {:<28} | {:>10.1} | {:>5.1}% |",
+                i + 1,
+                name,
+                us,
+                pct
+            );
+        }
+        println!("|{:-<4}|{:-<30}|{:-<12}|{:-<8}|", "", "", "", "");
+        println!(
+            "|    | {:<28} | {:>10.1} | {:>5.1}% |",
+            "TOTAL (breakdown)", total_breakdown_us, 100.0
+        );
+        println!(
+            "|    | {:<28} | {:>10.1} |        |",
+            "single_cb (reference)", single_cb_mean_us
+        );
+        let overhead_us = total_breakdown_us - single_cb_mean_us;
+        let overhead_pct = if single_cb_mean_us > 0.0 {
+            overhead_us / single_cb_mean_us * 100.0
+        } else {
+            0.0
+        };
+        println!(
+            "|    | {:<28} | {:>10.1} | {:>5.1}% |",
+            "CB overhead (9 CBs vs 1)", overhead_us, overhead_pct
+        );
+
+        // Let GPU cool between seq_lens
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    println!("\n{}", "=".repeat(90));
+}
+
+// ---------------------------------------------------------------------------
+// Per-dispatch GPU timing via cumulative subtraction
+// ---------------------------------------------------------------------------
+//
+// Instead of 9 separate CBs (each with ~350-450us overhead), this method
+// measures cumulative groups: group N encodes dispatches 1..N into a single
+// CB+encoder, then subtracts group N-1 to isolate per-kernel GPU time.
+//
+// This eliminates the N × CB-overhead problem — each group's overhead is
+// amortized across all dispatches in that group.
+
+fn bench_cumulative_breakdown(
+    registry: &KernelRegistry,
+    device: &metal::Device,
+    cos_full: &Array,
+    sin_full: &Array,
+) {
+    println!("\n{}", "=".repeat(120));
+    println!("========== Per-Dispatch GPU Timing (Cumulative Subtraction) ==========");
+    println!(
+        "Config: hidden={}, heads={}/{}, head_dim={}, intermediate={}",
+        HIDDEN_SIZE, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, INTERMEDIATE_DIM
+    );
+    println!("Method: group N = dispatches 1..N in single CB → per-op = group[N] - group[N-1]");
+    println!(
+        "Warmup: {} iters, Bench: {} iters per group",
+        CUMULATIVE_WARMUP, CUMULATIVE_ITERS
+    );
+
+    let mut block = build_transformer_block(device);
+    block
+        .prepare_weights_9dispatch(device)
+        .expect("prepare_weights_9dispatch failed (cumulative)");
+    {
+        let setup_queue = device.new_command_queue();
+        block
+            .prepare_weights_for_graph(registry, &setup_queue)
+            .expect("prepare_weights_for_graph failed (cumulative)");
+    }
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    // Collect results per seq_len: Vec<(seq_len, Vec<(name, us)>, single_enc_us)>
+    let mut all_results: Vec<(usize, Vec<(&str, f64)>, f64)> = Vec::new();
+
+    for &seq_len in CUMULATIVE_SEQ_LENS {
+        println!("\n--- seq_len={} ---", seq_len);
+        let _pool = ScopedPool::new();
+
+        let cos_freqs = cos_full.slice(0, 0, seq_len).expect("cos slice failed");
+        let sin_freqs = sin_full.slice(0, 0, seq_len).expect("sin slice failed");
+        let input = rand_array(device, &[seq_len, HIDDEN_SIZE], 42);
+        let queue = device.new_command_queue();
+
+        let per_dispatch = block
+            .forward_prefill_cumulative_breakdown(
+                &input,
+                Some(&cos_freqs),
+                Some(&sin_freqs),
+                registry,
+                &queue,
+                device,
+                MAX_SEQ_LEN,
+                CUMULATIVE_WARMUP,
+                CUMULATIVE_ITERS,
+            )
+            .expect("cumulative breakdown failed");
+
+        // Also measure single_encoder total for reference
+        let mut single_enc_latencies = Vec::with_capacity(CUMULATIVE_ITERS);
+        // Warmup
+        for _ in 0..CUMULATIVE_WARMUP {
+            let mut cache = LayerKvCache::preallocated(
+                device,
+                NUM_KV_HEADS,
+                HEAD_DIM,
+                MAX_SEQ_LEN,
+                DType::Float16,
+            );
+            let cb = queue.new_command_buffer();
+            let encoder = cb.new_compute_command_encoder();
+            let _ = block
+                .forward_prefill_single_encoder(
+                    &input,
+                    Some(&cos_freqs),
+                    Some(&sin_freqs),
+                    None,
+                    &mut cache,
+                    registry,
+                    encoder,
+                )
+                .expect("single_encoder warmup failed");
+            encoder.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+        }
+        // Bench
+        for _ in 0..CUMULATIVE_ITERS {
+            let mut cache = LayerKvCache::preallocated(
+                device,
+                NUM_KV_HEADS,
+                HEAD_DIM,
+                MAX_SEQ_LEN,
+                DType::Float16,
+            );
+            let cb = queue.new_command_buffer();
+            let encoder = cb.new_compute_command_encoder();
+            let start = std::time::Instant::now();
+            let _ = block
+                .forward_prefill_single_encoder(
+                    &input,
+                    Some(&cos_freqs),
+                    Some(&sin_freqs),
+                    None,
+                    &mut cache,
+                    registry,
+                    encoder,
+                )
+                .expect("single_encoder bench failed");
+            encoder.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            single_enc_latencies.push(start.elapsed());
+        }
+        let single_enc_mean_us: f64 = {
+            let sum: f64 = single_enc_latencies
+                .iter()
+                .map(|d| d.as_secs_f64() * 1e6)
+                .sum();
+            sum / single_enc_latencies.len() as f64
+        };
+
+        // Print per-dispatch table
+        let total_cum_us: f64 = per_dispatch.iter().map(|(_, us)| us).sum();
+        println!(
+            "| {:>2} | {:<28} | {:>10} | {:>6} |",
+            "#", "Dispatch", "Time (us)", "%"
+        );
+        println!("|{:-<4}|{:-<30}|{:-<12}|{:-<8}|", "", "", "", "");
+        for (i, (name, us)) in per_dispatch.iter().enumerate() {
+            let pct = if total_cum_us > 0.0 {
+                us / total_cum_us * 100.0
+            } else {
+                0.0
+            };
+            println!(
+                "| {:>2} | {:<28} | {:>10.1} | {:>5.1}% |",
+                i + 1,
+                name,
+                us,
+                pct
+            );
+        }
+        println!("|{:-<4}|{:-<30}|{:-<12}|{:-<8}|", "", "", "", "");
+        println!(
+            "|    | {:<28} | {:>10.1} | {:>5.1}% |",
+            "TOTAL (cumulative)", total_cum_us, 100.0
+        );
+        println!(
+            "|    | {:<28} | {:>10.1} |        |",
+            "single_enc (reference)", single_enc_mean_us
+        );
+        let diff_us = total_cum_us - single_enc_mean_us;
+        let diff_pct = if single_enc_mean_us > 0.0 {
+            diff_us / single_enc_mean_us * 100.0
+        } else {
+            0.0
+        };
+        println!(
+            "|    | {:<28} | {:>10.1} | {:>5.1}% |",
+            "sum vs reference delta", diff_us, diff_pct
+        );
+
+        all_results.push((seq_len, per_dispatch, single_enc_mean_us));
+
+        // Let GPU cool between seq_lens
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    // ---- Cross-seq_len comparison table (MLX-style) ----
+    println!("\n{}", "=".repeat(120));
+    println!("========== Per-Op Timing Across Sequence Lengths (us) ==========");
+    println!("Method: cumulative subtraction (single CB+encoder per group)");
+
+    // Header
+    print!("| {:<28} |", "Dispatch");
+    for &seq_len in CUMULATIVE_SEQ_LENS {
+        print!(" {:>8} |", format!("S={}", seq_len));
+    }
+    println!();
+    print!("|{:-<30}|", "");
+    for _ in CUMULATIVE_SEQ_LENS {
+        print!("{:-<10}|", "");
+    }
+    println!();
+
+    // Dispatch names (from first result)
+    if let Some((_, ref first_per_dispatch, _)) = all_results.first() {
+        for (i, (name, _)) in first_per_dispatch.iter().enumerate() {
+            print!("| {:<28} |", name);
+            for (_, ref per_dispatch, _) in &all_results {
+                if i < per_dispatch.len() {
+                    print!(" {:>8.1} |", per_dispatch[i].1);
+                } else {
+                    print!(" {:>8} |", "-");
+                }
+            }
+            println!();
+        }
+    }
+
+    // Totals
+    print!("|{:-<30}|", "");
+    for _ in CUMULATIVE_SEQ_LENS {
+        print!("{:-<10}|", "");
+    }
+    println!();
+    print!("| {:<28} |", "TOTAL (cumulative sum)");
+    for (_, ref per_dispatch, _) in &all_results {
+        let total: f64 = per_dispatch.iter().map(|(_, us)| us).sum();
+        print!(" {:>8.1} |", total);
+    }
+    println!();
+    print!("| {:<28} |", "single_enc (1 CB actual)");
+    for (_, _, enc_us) in &all_results {
+        print!(" {:>8.1} |", enc_us);
+    }
+    println!();
+    print!("| {:<28} |", "TFLOPS (single_enc)");
+    for (seq_len, _, enc_us) in &all_results {
+        let tflops = compute_tflops(*seq_len, *enc_us);
+        print!(" {:>8.2} |", tflops);
+    }
+    println!();
+
+    println!("{}", "=".repeat(120));
 }
