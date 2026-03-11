@@ -5629,7 +5629,8 @@ pub fn affine_quantized_matmul_batched(
         const TINY_BM: usize = 8;
         const TINY_BN: usize = 64;
         const TINY_BK: usize = 32;
-        const SKINNY_BM: usize = 64;
+        const SKINNY_MAX_M: usize = 64;
+        const SKINNY_TILE_M: usize = 32;
         const SKINNY_BN: usize = 64;
         const SKINNY_BK: usize = 32;
         const STD_BM: usize = 64;
@@ -5750,13 +5751,13 @@ pub fn affine_quantized_matmul_batched(
 
                 Ok(out)
             }
-        } else if m <= SKINNY_BM {
+        } else if m <= SKINNY_MAX_M {
             // --- Skinny-M path: BM=32, BN=64, BK=32 with built-in split-K ---
             // x is guaranteed f16 for Q4 (cast at entry). Always use f16 kernel.
-            let sm_tiles = m.div_ceil(SKINNY_BM);
+            let sm_tiles = m.div_ceil(SKINNY_TILE_M);
             let sn_tiles = n.div_ceil(SKINNY_BN);
 
-            let align_m = m % SKINNY_BM == 0;
+            let align_m = m % SKINNY_TILE_M == 0;
             let align_n = n % SKINNY_BN == 0;
 
             let mn_tgs = sm_tiles * sn_tiles;
@@ -6125,18 +6126,19 @@ pub fn affine_quantized_matmul_batched_into_cb(
         }
     }
 
-    const SKINNY_BM: usize = 64;
+    const SKINNY_MAX_M: usize = 64;
+    const SKINNY_TILE_M: usize = 32;
     const SKINNY_BN: usize = 64;
     const SKINNY_BK: usize = 32;
     const STD_BM: usize = 64;
     const STD_BN: usize = 64;
 
-    if m <= SKINNY_BM {
+    if m <= SKINNY_MAX_M {
         // --- Skinny MMA into CB ---
-        let sm_tiles = m.div_ceil(SKINNY_BM);
+        let sm_tiles = m.div_ceil(SKINNY_TILE_M);
         let sn_tiles = n.div_ceil(SKINNY_BN);
 
-        let align_m = m % SKINNY_BM == 0;
+        let align_m = m % SKINNY_TILE_M == 0;
         let align_n = n % SKINNY_BN == 0;
 
         let mn_tgs = sm_tiles * sn_tiles;
