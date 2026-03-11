@@ -279,8 +279,14 @@ impl FeedForward {
                     )?;
                     ops::fused::fused_silu_mul_into_cb(registry, &gate_out, &up_out, cb)?
                 };
-                let ffn_out = down_proj.forward_into_cb(&hidden, registry, cb)?;
-                ops::binary::add_into_cb(registry, residual, &ffn_out, cb)
+                // MlxArch residual epilogue requires M >= 33 (decode M=1 uses Simd tile)
+                // DEBUG: temporarily raised to 128 to isolate GPU error at seq_len=64
+                if hidden.shape()[0] >= 33 {
+                    down_proj.forward_with_residual_into_cb(&hidden, residual, registry, cb)
+                } else {
+                    let ffn_out = down_proj.forward_into_cb(&hidden, registry, cb)?;
+                    ops::binary::add_into_cb(registry, residual, &ffn_out, cb)
+                }
             }
             _ => Err(KernelError::InvalidShape(
                 "forward_single_cb only supports Gated FFN".into(),
@@ -329,8 +335,14 @@ impl FeedForward {
                     )?;
                     ops::fused::fused_silu_mul_encode(registry, &gate_out, &up_out, encoder)?
                 };
-                let ffn_out = down_proj.forward_into_encoder(&hidden, registry, encoder)?;
-                ops::binary::add_encode(registry, residual, &ffn_out, encoder)
+                // MlxArch residual epilogue requires M >= 33 (decode M=1 uses Simd tile)
+                // DEBUG: temporarily raised to 128 to isolate GPU error at seq_len=64
+                if hidden.shape()[0] >= 33 {
+                    down_proj.forward_with_residual_into_encoder(&hidden, residual, registry, encoder)
+                } else {
+                    let ffn_out = down_proj.forward_into_encoder(&hidden, registry, encoder)?;
+                    ops::binary::add_encode(registry, residual, &ffn_out, encoder)
+                }
             }
             _ => Err(KernelError::InvalidShape(
                 "forward_single_encoder only supports Gated FFN".into(),
@@ -3154,7 +3166,6 @@ impl TransformerBlock {
             registry,
             encoder,
         )?;
-
         // Fused residual + pre-FFN norm (1 dispatch instead of 2)
         let (normed2, h) = ops::rms_norm::rms_norm_residual_add_encode(
             registry,
@@ -3164,7 +3175,6 @@ impl TransformerBlock {
             self.rms_norm_eps,
             encoder,
         )?;
-
         // FFN (all ops share the same encoder)
         self.ffn
             .forward_single_encoder(&normed2, &h, registry, encoder)
@@ -4065,6 +4075,84 @@ impl TransformerModel {
             queue,
             event,
         )
+    }
+
+    /// Compiled prefill forward: all layers in a single CB + single encoder.
+    ///
+    /// This is the most efficient prefill path, eliminating:
+    /// - Per-layer command buffer creation
+    /// - Per-layer encoder creation/destruction
+    /// - Inter-layer GPU idle time from CB boundaries
+    ///
+    /// All 32+ layers share one `ComputeCommandEncoder` within one `CommandBuffer`.
+    /// Metal's sequential dispatch ordering within a single encoder guarantees
+    /// correct inter-layer dependencies without explicit barriers.
+    ///
+    /// **Requires** `prepare_weights_for_graph()` to have been called on all layers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_prefill_compiled(
+        &self,
+        token_ids: &[u32],
+        cos_freqs: Option<&Array>,
+        sin_freqs: Option<&Array>,
+        mask: Option<&Array>,
+        cache: &mut [LayerKvCache],
+        registry: &KernelRegistry,
+        queue: &metal::CommandQueue,
+    ) -> Result<Array, KernelError> {
+        let embedding = self.embedding.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape("TransformerModel: embedding not loaded".into())
+        })?;
+        let final_norm = self.final_norm_weight.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape("TransformerModel: final_norm not loaded".into())
+        })?;
+        let lm_head = self.lm_head.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape("TransformerModel: lm_head not loaded".into())
+        })?;
+
+        // Validate cache
+        if cache.len() != self.layers.len() {
+            return Err(KernelError::InvalidShape(format!(
+                "TransformerModel: cache has {} entries but model has {} layers",
+                cache.len(),
+                self.layers.len()
+            )));
+        }
+
+        // Embedding lookup (sync — small, fast)
+        let mut x = embedding.forward(token_ids, registry, queue)?;
+
+        // Single CB + single encoder for ALL transformer layers
+        let cb = queue.new_command_buffer();
+        let encoder = cb.new_compute_command_encoder();
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            x = layer.forward_prefill_single_encoder(
+                &x,
+                cos_freqs,
+                sin_freqs,
+                mask,
+                &mut cache[i],
+                registry,
+                encoder,
+            )?;
+        }
+
+        // Final norm + LM head in same encoder
+        x = ops::rms_norm::rms_norm_encode(
+            registry,
+            &x,
+            Some(final_norm),
+            self.config.rms_norm_eps,
+            encoder,
+        )?;
+        x = lm_head.forward_into_encoder(&x, registry, encoder)?;
+
+        encoder.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        Ok(x)
     }
 }
 

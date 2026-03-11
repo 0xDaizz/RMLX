@@ -481,6 +481,410 @@ kernel void interleave_heads_bf16(
     output[out_idx] = input[in_idx];
 }
 
+// ---- Fused Q+K batch RoPE (single dispatch for both Q and K heads) ----
+//
+// Reads Q and K heads from a merged QKV buffer [seq_len, qkv_dim] and writes
+// to two separate output buffers in batch-major layout.
+// Grid: (half_dim, seq_len, num_q_heads + num_kv_heads)
+//
+// Head indices 0..num_q_heads-1 read from Q region, write to output_q.
+// Head indices num_q_heads..num_q_heads+num_kv_heads-1 read from K region,
+// write to output_k.
+
+kernel void rope_qk_batch_f16(
+    device const half*  input       [[buffer(0)]],
+    device const float* cos_freqs   [[buffer(1)]],
+    device const float* sin_freqs   [[buffer(2)]],
+    device half*        output_q    [[buffer(3)]],
+    device half*        output_k    [[buffer(4)]],
+    constant uint&  seq_len         [[buffer(5)]],
+    constant uint&  head_dim        [[buffer(6)]],
+    constant uint&  num_q_heads     [[buffer(7)]],
+    constant uint&  num_kv_heads    [[buffer(8)]],
+    constant uint&  offset          [[buffer(9)]],
+    constant uint&  input_row_stride [[buffer(10)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    uint pair_idx = gid.x;  // 0 .. half_dim-1
+    uint seq_pos  = gid.y;  // 0 .. seq_len-1
+    uint head     = gid.z;  // 0 .. num_q_heads + num_kv_heads - 1
+
+    uint half_dim = head_dim / 2;
+    uint total_heads = num_q_heads + num_kv_heads;
+    if (pair_idx >= half_dim || seq_pos >= seq_len || head >= total_heads) return;
+
+    // Frequency lookup
+    uint freq_row = offset + seq_pos;
+    uint freq_idx = freq_row * half_dim + pair_idx;
+    float cos_val = cos_freqs[freq_idx];
+    float sin_val = sin_freqs[freq_idx];
+
+    // Determine Q vs K head
+    bool is_q = (head < num_q_heads);
+    uint local_head = is_q ? head : (head - num_q_heads);
+    // Q region starts at offset 0, K region starts at num_q_heads * head_dim
+    uint head_offset_in_row = is_q ? 0 : (num_q_heads * head_dim);
+
+    // Input: [seq_len, qkv_dim] row-major with configurable stride
+    // Traditional pairing: (2k, 2k+1)
+    uint in_base = seq_pos * input_row_stride + head_offset_in_row + local_head * head_dim;
+    uint in_idx1 = in_base + 2 * pair_idx;
+    uint in_idx2 = in_idx1 + 1;
+
+    float x0 = float(input[in_idx1]);
+    float x1 = float(input[in_idx2]);
+
+    float out0 = x0 * cos_val - x1 * sin_val;
+    float out1 = x0 * sin_val + x1 * cos_val;
+
+    // Output: [num_heads * seq_len, head_dim] batch-major (traditional pairing)
+    uint out_base = (local_head * seq_len + seq_pos) * head_dim;
+    uint out_idx1 = out_base + 2 * pair_idx;
+    uint out_idx2 = out_idx1 + 1;
+
+    if (is_q) {
+        output_q[out_idx1] = half(out0);
+        output_q[out_idx2] = half(out1);
+    } else {
+        output_k[out_idx1] = half(out0);
+        output_k[out_idx2] = half(out1);
+    }
+}
+
+kernel void rope_qk_batch_f32(
+    device const float* input       [[buffer(0)]],
+    device const float* cos_freqs   [[buffer(1)]],
+    device const float* sin_freqs   [[buffer(2)]],
+    device float*       output_q    [[buffer(3)]],
+    device float*       output_k    [[buffer(4)]],
+    constant uint&  seq_len         [[buffer(5)]],
+    constant uint&  head_dim        [[buffer(6)]],
+    constant uint&  num_q_heads     [[buffer(7)]],
+    constant uint&  num_kv_heads    [[buffer(8)]],
+    constant uint&  offset          [[buffer(9)]],
+    constant uint&  input_row_stride [[buffer(10)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    uint pair_idx = gid.x;
+    uint seq_pos  = gid.y;
+    uint head     = gid.z;
+
+    uint half_dim = head_dim / 2;
+    uint total_heads = num_q_heads + num_kv_heads;
+    if (pair_idx >= half_dim || seq_pos >= seq_len || head >= total_heads) return;
+
+    uint freq_row = offset + seq_pos;
+    uint freq_idx = freq_row * half_dim + pair_idx;
+    float cos_val = cos_freqs[freq_idx];
+    float sin_val = sin_freqs[freq_idx];
+
+    bool is_q = (head < num_q_heads);
+    uint local_head = is_q ? head : (head - num_q_heads);
+    uint head_offset_in_row = is_q ? 0 : (num_q_heads * head_dim);
+
+    uint in_base = seq_pos * input_row_stride + head_offset_in_row + local_head * head_dim;
+    uint in_idx1 = in_base + 2 * pair_idx;
+    uint in_idx2 = in_idx1 + 1;
+
+    float x0 = input[in_idx1];
+    float x1 = input[in_idx2];
+
+    float out0 = x0 * cos_val - x1 * sin_val;
+    float out1 = x0 * sin_val + x1 * cos_val;
+
+    uint out_base = (local_head * seq_len + seq_pos) * head_dim;
+    uint out_idx1 = out_base + 2 * pair_idx;
+    uint out_idx2 = out_idx1 + 1;
+
+    if (is_q) {
+        output_q[out_idx1] = out0;
+        output_q[out_idx2] = out1;
+    } else {
+        output_k[out_idx1] = out0;
+        output_k[out_idx2] = out1;
+    }
+}
+
+kernel void rope_qk_batch_bf16(
+    device const bfloat* input      [[buffer(0)]],
+    device const float*  cos_freqs  [[buffer(1)]],
+    device const float*  sin_freqs  [[buffer(2)]],
+    device bfloat*       output_q   [[buffer(3)]],
+    device bfloat*       output_k   [[buffer(4)]],
+    constant uint&  seq_len         [[buffer(5)]],
+    constant uint&  head_dim        [[buffer(6)]],
+    constant uint&  num_q_heads     [[buffer(7)]],
+    constant uint&  num_kv_heads    [[buffer(8)]],
+    constant uint&  offset          [[buffer(9)]],
+    constant uint&  input_row_stride [[buffer(10)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    uint pair_idx = gid.x;
+    uint seq_pos  = gid.y;
+    uint head     = gid.z;
+
+    uint half_dim = head_dim / 2;
+    uint total_heads = num_q_heads + num_kv_heads;
+    if (pair_idx >= half_dim || seq_pos >= seq_len || head >= total_heads) return;
+
+    uint freq_row = offset + seq_pos;
+    uint freq_idx = freq_row * half_dim + pair_idx;
+    float cos_val = cos_freqs[freq_idx];
+    float sin_val = sin_freqs[freq_idx];
+
+    bool is_q = (head < num_q_heads);
+    uint local_head = is_q ? head : (head - num_q_heads);
+    uint head_offset_in_row = is_q ? 0 : (num_q_heads * head_dim);
+
+    uint in_base = seq_pos * input_row_stride + head_offset_in_row + local_head * head_dim;
+    uint in_idx1 = in_base + 2 * pair_idx;
+    uint in_idx2 = in_idx1 + 1;
+
+    float x0 = float(input[in_idx1]);
+    float x1 = float(input[in_idx2]);
+
+    float out0 = x0 * cos_val - x1 * sin_val;
+    float out1 = x0 * sin_val + x1 * cos_val;
+
+    uint out_base = (local_head * seq_len + seq_pos) * head_dim;
+    uint out_idx1 = out_base + 2 * pair_idx;
+    uint out_idx2 = out_idx1 + 1;
+
+    if (is_q) {
+        output_q[out_idx1] = bfloat(out0);
+        output_q[out_idx2] = bfloat(out1);
+    } else {
+        output_k[out_idx1] = bfloat(out0);
+        output_k[out_idx2] = bfloat(out1);
+    }
+}
+
+// ---- Fused Q+K+V batch RoPE (single dispatch for Q RoPE, K RoPE, V deinterleave) ----
+//
+// Extends rope_qk_batch to also deinterleave V heads (copy-only, no rotation).
+// Grid: (half_dim, seq_len, num_q_heads + 2*num_kv_heads)
+//
+// Head indices 0..num_q_heads-1: Q region, deinterleave + RoPE -> output_q
+// Head indices num_q_heads..num_q_heads+num_kv_heads-1: K region, deinterleave + RoPE -> output_k
+// Head indices num_q_heads+num_kv_heads..num_q_heads+2*num_kv_heads-1: V region, copy-only -> output_v
+
+kernel void rope_qkv_batch_f16(
+    device const half*  input       [[buffer(0)]],
+    device const float* cos_freqs   [[buffer(1)]],
+    device const float* sin_freqs   [[buffer(2)]],
+    device half*        output_q    [[buffer(3)]],
+    device half*        output_k    [[buffer(4)]],
+    device half*        output_v    [[buffer(5)]],
+    constant uint&  seq_len         [[buffer(6)]],
+    constant uint&  head_dim        [[buffer(7)]],
+    constant uint&  num_q_heads     [[buffer(8)]],
+    constant uint&  num_kv_heads    [[buffer(9)]],
+    constant uint&  offset          [[buffer(10)]],
+    constant uint&  input_row_stride [[buffer(11)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    uint pair_idx = gid.x;  // 0 .. half_dim-1
+    uint seq_pos  = gid.y;  // 0 .. seq_len-1
+    uint head     = gid.z;  // 0 .. num_q_heads + 2*num_kv_heads - 1
+
+    uint half_dim = head_dim / 2;
+    uint total_heads = num_q_heads + 2 * num_kv_heads;
+    if (pair_idx >= half_dim || seq_pos >= seq_len || head >= total_heads) return;
+
+    // Determine Q vs K vs V head
+    bool is_q = (head < num_q_heads);
+    bool is_k = (!is_q && head < num_q_heads + num_kv_heads);
+    // else: is_v
+
+    uint local_head;
+    uint head_offset_in_row;
+    if (is_q) {
+        local_head = head;
+        head_offset_in_row = 0;
+    } else if (is_k) {
+        local_head = head - num_q_heads;
+        head_offset_in_row = num_q_heads * head_dim;
+    } else {
+        // V heads: offset after Q and K regions
+        local_head = head - num_q_heads - num_kv_heads;
+        head_offset_in_row = (num_q_heads + num_kv_heads) * head_dim;
+    }
+
+    // Input: [seq_len, qkv_dim] row-major with configurable stride
+    uint in_base = seq_pos * input_row_stride + head_offset_in_row + local_head * head_dim;
+    uint in_idx1 = in_base + 2 * pair_idx;
+    uint in_idx2 = in_idx1 + 1;
+
+    float x0 = float(input[in_idx1]);
+    float x1 = float(input[in_idx2]);
+
+    // Output: [num_heads * seq_len, head_dim] batch-major (traditional pairing)
+    uint out_base = (local_head * seq_len + seq_pos) * head_dim;
+    uint out_idx1 = out_base + 2 * pair_idx;
+    uint out_idx2 = out_idx1 + 1;
+
+    if (is_q || is_k) {
+        // RoPE rotation
+        uint freq_row = offset + seq_pos;
+        uint freq_idx = freq_row * half_dim + pair_idx;
+        float cos_val = cos_freqs[freq_idx];
+        float sin_val = sin_freqs[freq_idx];
+        float out0 = x0 * cos_val - x1 * sin_val;
+        float out1 = x0 * sin_val + x1 * cos_val;
+        if (is_q) {
+            output_q[out_idx1] = half(out0);
+            output_q[out_idx2] = half(out1);
+        } else {
+            output_k[out_idx1] = half(out0);
+            output_k[out_idx2] = half(out1);
+        }
+    } else {
+        // V: copy-only (deinterleave, no rotation)
+        output_v[out_idx1] = half(x0);
+        output_v[out_idx2] = half(x1);
+    }
+}
+
+kernel void rope_qkv_batch_f32(
+    device const float* input       [[buffer(0)]],
+    device const float* cos_freqs   [[buffer(1)]],
+    device const float* sin_freqs   [[buffer(2)]],
+    device float*       output_q    [[buffer(3)]],
+    device float*       output_k    [[buffer(4)]],
+    device float*       output_v    [[buffer(5)]],
+    constant uint&  seq_len         [[buffer(6)]],
+    constant uint&  head_dim        [[buffer(7)]],
+    constant uint&  num_q_heads     [[buffer(8)]],
+    constant uint&  num_kv_heads    [[buffer(9)]],
+    constant uint&  offset          [[buffer(10)]],
+    constant uint&  input_row_stride [[buffer(11)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    uint pair_idx = gid.x;
+    uint seq_pos  = gid.y;
+    uint head     = gid.z;
+
+    uint half_dim = head_dim / 2;
+    uint total_heads = num_q_heads + 2 * num_kv_heads;
+    if (pair_idx >= half_dim || seq_pos >= seq_len || head >= total_heads) return;
+
+    bool is_q = (head < num_q_heads);
+    bool is_k = (!is_q && head < num_q_heads + num_kv_heads);
+
+    uint local_head;
+    uint head_offset_in_row;
+    if (is_q) {
+        local_head = head;
+        head_offset_in_row = 0;
+    } else if (is_k) {
+        local_head = head - num_q_heads;
+        head_offset_in_row = num_q_heads * head_dim;
+    } else {
+        local_head = head - num_q_heads - num_kv_heads;
+        head_offset_in_row = (num_q_heads + num_kv_heads) * head_dim;
+    }
+
+    uint in_base = seq_pos * input_row_stride + head_offset_in_row + local_head * head_dim;
+    uint in_idx1 = in_base + 2 * pair_idx;
+    uint in_idx2 = in_idx1 + 1;
+
+    float x0 = input[in_idx1];
+    float x1 = input[in_idx2];
+
+    uint out_base = (local_head * seq_len + seq_pos) * head_dim;
+    uint out_idx1 = out_base + 2 * pair_idx;
+    uint out_idx2 = out_idx1 + 1;
+
+    if (is_q || is_k) {
+        uint freq_row = offset + seq_pos;
+        uint freq_idx = freq_row * half_dim + pair_idx;
+        float cos_val = cos_freqs[freq_idx];
+        float sin_val = sin_freqs[freq_idx];
+        float out0 = x0 * cos_val - x1 * sin_val;
+        float out1 = x0 * sin_val + x1 * cos_val;
+        if (is_q) {
+            output_q[out_idx1] = out0;
+            output_q[out_idx2] = out1;
+        } else {
+            output_k[out_idx1] = out0;
+            output_k[out_idx2] = out1;
+        }
+    } else {
+        output_v[out_idx1] = x0;
+        output_v[out_idx2] = x1;
+    }
+}
+
+kernel void rope_qkv_batch_bf16(
+    device const bfloat* input      [[buffer(0)]],
+    device const float*  cos_freqs  [[buffer(1)]],
+    device const float*  sin_freqs  [[buffer(2)]],
+    device bfloat*       output_q   [[buffer(3)]],
+    device bfloat*       output_k   [[buffer(4)]],
+    device bfloat*       output_v   [[buffer(5)]],
+    constant uint&  seq_len         [[buffer(6)]],
+    constant uint&  head_dim        [[buffer(7)]],
+    constant uint&  num_q_heads     [[buffer(8)]],
+    constant uint&  num_kv_heads    [[buffer(9)]],
+    constant uint&  offset          [[buffer(10)]],
+    constant uint&  input_row_stride [[buffer(11)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    uint pair_idx = gid.x;
+    uint seq_pos  = gid.y;
+    uint head     = gid.z;
+
+    uint half_dim = head_dim / 2;
+    uint total_heads = num_q_heads + 2 * num_kv_heads;
+    if (pair_idx >= half_dim || seq_pos >= seq_len || head >= total_heads) return;
+
+    bool is_q = (head < num_q_heads);
+    bool is_k = (!is_q && head < num_q_heads + num_kv_heads);
+
+    uint local_head;
+    uint head_offset_in_row;
+    if (is_q) {
+        local_head = head;
+        head_offset_in_row = 0;
+    } else if (is_k) {
+        local_head = head - num_q_heads;
+        head_offset_in_row = num_q_heads * head_dim;
+    } else {
+        local_head = head - num_q_heads - num_kv_heads;
+        head_offset_in_row = (num_q_heads + num_kv_heads) * head_dim;
+    }
+
+    uint in_base = seq_pos * input_row_stride + head_offset_in_row + local_head * head_dim;
+    uint in_idx1 = in_base + 2 * pair_idx;
+    uint in_idx2 = in_idx1 + 1;
+
+    float x0 = float(input[in_idx1]);
+    float x1 = float(input[in_idx2]);
+
+    uint out_base = (local_head * seq_len + seq_pos) * head_dim;
+    uint out_idx1 = out_base + 2 * pair_idx;
+    uint out_idx2 = out_idx1 + 1;
+
+    if (is_q || is_k) {
+        uint freq_row = offset + seq_pos;
+        uint freq_idx = freq_row * half_dim + pair_idx;
+        float cos_val = cos_freqs[freq_idx];
+        float sin_val = sin_freqs[freq_idx];
+        float out0 = x0 * cos_val - x1 * sin_val;
+        float out1 = x0 * sin_val + x1 * cos_val;
+        if (is_q) {
+            output_q[out_idx1] = bfloat(out0);
+            output_q[out_idx2] = bfloat(out1);
+        } else {
+            output_k[out_idx1] = bfloat(out0);
+            output_k[out_idx2] = bfloat(out1);
+        }
+    } else {
+        output_v[out_idx1] = bfloat(x0);
+        output_v[out_idx2] = bfloat(x1);
+    }
+}
+
 // ---- On-the-fly frequency computation variant ----
 
 kernel void rope_otf_f32(
@@ -1727,4 +2131,271 @@ pub fn interleave_heads_encode(
     encoder.dispatch_threads(grid, tg);
 
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Fused Q+K batch RoPE: single dispatch for both Q and K heads
+// ---------------------------------------------------------------------------
+
+fn kernel_name_qk_batch(dtype: DType) -> Result<&'static str, KernelError> {
+    match dtype {
+        DType::Float32 => Ok("rope_qk_batch_f32"),
+        DType::Float16 => Ok("rope_qk_batch_f16"),
+        DType::Bfloat16 => Ok("rope_qk_batch_bf16"),
+        _ => Err(KernelError::NotFound(format!(
+            "rope_qk_batch not supported for {:?}",
+            dtype
+        ))),
+    }
+}
+
+/// Fused deinterleave + RoPE for Q and K heads in a single dispatch.
+///
+/// Input: `[seq_len, qkv_dim]` merged QKV buffer (Q region followed by K region).
+///   The Q region occupies columns `[0, num_q_heads * head_dim)` and
+///   the K region occupies columns `[num_q_heads * head_dim, (num_q_heads + num_kv_heads) * head_dim)`.
+///
+/// Returns `(q_roped, k_roped)`:
+/// - `q_roped`: `[num_q_heads * seq_len, head_dim]` (batch-major, contiguous)
+/// - `k_roped`: `[num_kv_heads * seq_len, head_dim]` (batch-major, contiguous)
+///
+/// `input_row_stride` is the stride (in elements) between consecutive rows of
+/// the merged QKV buffer — typically `num_q_heads * head_dim + 2 * num_kv_heads * head_dim`.
+#[allow(clippy::too_many_arguments)]
+pub fn rope_qk_batch_into_cb(
+    registry: &KernelRegistry,
+    input: &Array,
+    cos_freqs: &Array,
+    sin_freqs: &Array,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    offset: u32,
+    input_row_stride: usize,
+    cb: &metal::CommandBufferRef,
+) -> Result<(Array, Array), KernelError> {
+    let seq_len = input.shape()[0];
+    let half_dim = head_dim / 2;
+
+    if head_dim % 2 != 0 {
+        return Err(KernelError::InvalidShape(format!(
+            "rope_qk_batch: head_dim must be even, got {head_dim}"
+        )));
+    }
+
+    let kname = kernel_name_qk_batch(input.dtype())?;
+    let pipeline = registry.get_pipeline(kname, input.dtype())?;
+
+    let out_q = Array::uninit(
+        registry.device().raw(),
+        &[num_q_heads * seq_len, head_dim],
+        input.dtype(),
+    );
+    let out_k = Array::uninit(
+        registry.device().raw(),
+        &[num_kv_heads * seq_len, head_dim],
+        input.dtype(),
+    );
+
+    let seq_u32 = super::checked_u32(seq_len, "seq_len")?;
+    let dim_u32 = super::checked_u32(head_dim, "head_dim")?;
+    let q_heads_u32 = super::checked_u32(num_q_heads, "num_q_heads")?;
+    let kv_heads_u32 = super::checked_u32(num_kv_heads, "num_kv_heads")?;
+    let stride_u32 = super::checked_u32(input_row_stride, "input_row_stride")?;
+
+    let total_heads = num_q_heads + num_kv_heads;
+
+    let encoder = cb.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
+    encoder.set_buffer(1, Some(cos_freqs.metal_buffer()), cos_freqs.offset() as u64);
+    encoder.set_buffer(2, Some(sin_freqs.metal_buffer()), sin_freqs.offset() as u64);
+    encoder.set_buffer(3, Some(out_q.metal_buffer()), 0);
+    encoder.set_buffer(4, Some(out_k.metal_buffer()), 0);
+    encoder.set_bytes(5, 4, &seq_u32 as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(6, 4, &dim_u32 as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(7, 4, &q_heads_u32 as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(8, 4, &kv_heads_u32 as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(9, 4, &offset as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(10, 4, &stride_u32 as *const u32 as *const std::ffi::c_void);
+
+    let max_tg = pipeline.max_total_threads_per_threadgroup();
+    let tg_x = std::cmp::min(64, half_dim as u64).min(max_tg);
+    let tg_y = std::cmp::min(16, seq_len as u64).min(max_tg / tg_x);
+    let tg = MTLSize::new(tg_x, tg_y, 1);
+    let grid = MTLSize::new(half_dim as u64, seq_len as u64, total_heads as u64);
+    encoder.dispatch_threads(grid, tg);
+    encoder.end_encoding();
+
+    Ok((out_q, out_k))
+}
+
+/// Fused Q+K batch RoPE into an existing compute command encoder (no encoder create/end).
+#[allow(clippy::too_many_arguments)]
+pub fn rope_qk_batch_encode(
+    registry: &KernelRegistry,
+    input: &Array,
+    cos_freqs: &Array,
+    sin_freqs: &Array,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    offset: u32,
+    input_row_stride: usize,
+    encoder: &metal::ComputeCommandEncoderRef,
+) -> Result<(Array, Array), KernelError> {
+    let seq_len = input.shape()[0];
+    let half_dim = head_dim / 2;
+
+    if head_dim % 2 != 0 {
+        return Err(KernelError::InvalidShape(format!(
+            "rope_qk_batch: head_dim must be even, got {head_dim}"
+        )));
+    }
+
+    let kname = kernel_name_qk_batch(input.dtype())?;
+    let pipeline = registry.get_pipeline(kname, input.dtype())?;
+
+    let out_q = Array::uninit(
+        registry.device().raw(),
+        &[num_q_heads * seq_len, head_dim],
+        input.dtype(),
+    );
+    let out_k = Array::uninit(
+        registry.device().raw(),
+        &[num_kv_heads * seq_len, head_dim],
+        input.dtype(),
+    );
+
+    let seq_u32 = super::checked_u32(seq_len, "seq_len")?;
+    let dim_u32 = super::checked_u32(head_dim, "head_dim")?;
+    let q_heads_u32 = super::checked_u32(num_q_heads, "num_q_heads")?;
+    let kv_heads_u32 = super::checked_u32(num_kv_heads, "num_kv_heads")?;
+    let stride_u32 = super::checked_u32(input_row_stride, "input_row_stride")?;
+
+    let total_heads = num_q_heads + num_kv_heads;
+
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
+    encoder.set_buffer(1, Some(cos_freqs.metal_buffer()), cos_freqs.offset() as u64);
+    encoder.set_buffer(2, Some(sin_freqs.metal_buffer()), sin_freqs.offset() as u64);
+    encoder.set_buffer(3, Some(out_q.metal_buffer()), 0);
+    encoder.set_buffer(4, Some(out_k.metal_buffer()), 0);
+    encoder.set_bytes(5, 4, &seq_u32 as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(6, 4, &dim_u32 as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(7, 4, &q_heads_u32 as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(8, 4, &kv_heads_u32 as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(9, 4, &offset as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(10, 4, &stride_u32 as *const u32 as *const std::ffi::c_void);
+
+    let max_tg = pipeline.max_total_threads_per_threadgroup();
+    let tg_x = std::cmp::min(64, half_dim as u64).min(max_tg);
+    let tg_y = std::cmp::min(16, seq_len as u64).min(max_tg / tg_x);
+    let tg = MTLSize::new(tg_x, tg_y, 1);
+    let grid = MTLSize::new(half_dim as u64, seq_len as u64, total_heads as u64);
+    encoder.dispatch_threads(grid, tg);
+
+    Ok((out_q, out_k))
+}
+
+// ---------------------------------------------------------------------------
+// Fused Q+K+V batch RoPE: single dispatch for Q RoPE, K RoPE, V deinterleave
+// ---------------------------------------------------------------------------
+
+fn kernel_name_qkv_batch(dtype: DType) -> Result<&'static str, KernelError> {
+    match dtype {
+        DType::Float32 => Ok("rope_qkv_batch_f32"),
+        DType::Float16 => Ok("rope_qkv_batch_f16"),
+        DType::Bfloat16 => Ok("rope_qkv_batch_bf16"),
+        _ => Err(KernelError::NotFound(format!(
+            "rope_qkv_batch not supported for {:?}",
+            dtype
+        ))),
+    }
+}
+
+/// Fused deinterleave + RoPE for Q and K heads, plus V deinterleave, in a single dispatch.
+///
+/// Input: `[seq_len, qkv_dim]` merged QKV buffer.
+///   Q region: columns `[0, num_q_heads * head_dim)`
+///   K region: columns `[num_q_heads * head_dim, (num_q_heads + num_kv_heads) * head_dim)`
+///   V region: columns `[(num_q_heads + num_kv_heads) * head_dim, (num_q_heads + 2*num_kv_heads) * head_dim)`
+///
+/// Returns `(q_roped, k_roped, v_deinterleaved)`:
+/// - `q_roped`: `[num_q_heads * seq_len, head_dim]` (batch-major)
+/// - `k_roped`: `[num_kv_heads * seq_len, head_dim]` (batch-major)
+/// - `v_deinterleaved`: `[num_kv_heads * seq_len, head_dim]` (batch-major)
+#[allow(clippy::too_many_arguments)]
+pub fn rope_qkv_batch_into_cb(
+    registry: &KernelRegistry,
+    input: &Array,
+    cos_freqs: &Array,
+    sin_freqs: &Array,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    offset: u32,
+    input_row_stride: usize,
+    cb: &metal::CommandBufferRef,
+) -> Result<(Array, Array, Array), KernelError> {
+    let seq_len = input.shape()[0];
+    let half_dim = head_dim / 2;
+
+    if head_dim % 2 != 0 {
+        return Err(KernelError::InvalidShape(format!(
+            "rope_qkv_batch: head_dim must be even, got {head_dim}"
+        )));
+    }
+
+    let kname = kernel_name_qkv_batch(input.dtype())?;
+    let pipeline = registry.get_pipeline(kname, input.dtype())?;
+
+    let out_q = Array::uninit(
+        registry.device().raw(),
+        &[num_q_heads * seq_len, head_dim],
+        input.dtype(),
+    );
+    let out_k = Array::uninit(
+        registry.device().raw(),
+        &[num_kv_heads * seq_len, head_dim],
+        input.dtype(),
+    );
+    let out_v = Array::uninit(
+        registry.device().raw(),
+        &[num_kv_heads * seq_len, head_dim],
+        input.dtype(),
+    );
+
+    let seq_u32 = super::checked_u32(seq_len, "seq_len")?;
+    let dim_u32 = super::checked_u32(head_dim, "head_dim")?;
+    let q_heads_u32 = super::checked_u32(num_q_heads, "num_q_heads")?;
+    let kv_heads_u32 = super::checked_u32(num_kv_heads, "num_kv_heads")?;
+    let stride_u32 = super::checked_u32(input_row_stride, "input_row_stride")?;
+
+    let total_heads = num_q_heads + 2 * num_kv_heads;
+
+    let encoder = cb.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
+    encoder.set_buffer(1, Some(cos_freqs.metal_buffer()), cos_freqs.offset() as u64);
+    encoder.set_buffer(2, Some(sin_freqs.metal_buffer()), sin_freqs.offset() as u64);
+    encoder.set_buffer(3, Some(out_q.metal_buffer()), 0);
+    encoder.set_buffer(4, Some(out_k.metal_buffer()), 0);
+    encoder.set_buffer(5, Some(out_v.metal_buffer()), 0);
+    encoder.set_bytes(6, 4, &seq_u32 as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(7, 4, &dim_u32 as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(8, 4, &q_heads_u32 as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(9, 4, &kv_heads_u32 as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(10, 4, &offset as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(11, 4, &stride_u32 as *const u32 as *const std::ffi::c_void);
+
+    let max_tg = pipeline.max_total_threads_per_threadgroup();
+    let tg_x = std::cmp::min(64, half_dim as u64).min(max_tg);
+    let tg_y = std::cmp::min(16, seq_len as u64).min(max_tg / tg_x);
+    let tg = MTLSize::new(tg_x, tg_y, 1);
+    let grid = MTLSize::new(half_dim as u64, seq_len as u64, total_heads as u64);
+    encoder.dispatch_threads(grid, tg);
+    encoder.end_encoding();
+
+    Ok((out_q, out_k, out_v))
 }

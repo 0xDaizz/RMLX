@@ -2,6 +2,7 @@
 //!
 //! KV cache uses pre-allocated buffers with O(1) append (no full-history copy).
 
+use metal::foreign_types::ForeignType;
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::{KernelError, KernelRegistry};
@@ -3340,26 +3341,38 @@ impl Attention {
         let v_row_stride = v.strides()[0];
 
         if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
-            q_batched = ops::rope::rope_multihead_into_cb(
-                registry,
-                &q,
-                cos,
-                sin,
-                num_heads,
-                rope_offset,
-                q_row_stride,
-                cb,
-            )?;
-            k_batched = ops::rope::rope_multihead_into_cb(
-                registry,
-                &k,
-                cos,
-                sin,
-                num_kv_heads,
-                rope_offset,
-                k_row_stride,
-                cb,
-            )?;
+            // Check if Q, K, V share the same buffer (merged QKV path)
+            if q.metal_buffer().as_ptr() == k.metal_buffer().as_ptr()
+                && k.metal_buffer().as_ptr() == v.metal_buffer().as_ptr()
+            {
+                // Fused Q+K RoPE + V deinterleave in a single dispatch
+                let qkv_result = ops::rope::rope_qkv_batch_into_cb(
+                    registry,
+                    &q, // Q view into merged buffer (offset = 0, stride = total_qkv)
+                    cos,
+                    sin,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    rope_offset,
+                    q_row_stride, // same as k/v row stride for merged buffer
+                    cb,
+                )?;
+                q_batched = qkv_result.0;
+                k_batched = qkv_result.1;
+                v_batched = qkv_result.2;
+            } else {
+                // Separate Q/K/V buffers — use individual dispatches
+                q_batched = ops::rope::rope_multihead_into_cb(
+                    registry, &q, cos, sin, num_heads, rope_offset, q_row_stride, cb,
+                )?;
+                k_batched = ops::rope::rope_multihead_into_cb(
+                    registry, &k, cos, sin, num_kv_heads, rope_offset, k_row_stride, cb,
+                )?;
+                v_batched = ops::rope::deinterleave_heads_into_cb(
+                    registry, &v, num_kv_heads, v_row_stride, cb,
+                )?;
+            }
         } else {
             q_batched =
                 ops::rope::deinterleave_heads_into_cb(registry, &q, num_heads, q_row_stride, cb)?;
@@ -3370,10 +3383,10 @@ impl Attention {
                 k_row_stride,
                 cb,
             )?;
+            v_batched = ops::rope::deinterleave_heads_into_cb(
+                registry, &v, num_kv_heads, v_row_stride, cb,
+            )?;
         }
-        // Deinterleave V — always done before SDPA for contiguous memory access
-        v_batched =
-            ops::rope::deinterleave_heads_into_cb(registry, &v, num_kv_heads, v_row_stride, cb)?;
 
         // ── 4) KV cache: bypass on initial prefill (cache empty) ──
         let needs_initial_append = cache.seq_len == 0;
@@ -3586,7 +3599,6 @@ impl Attention {
         // RMS norm (pre-attention)
         let normed =
             ops::rms_norm::rms_norm_encode(registry, x, Some(norm_weight), rms_norm_eps, encoder)?;
-
         let q_dim = num_heads * head_dim;
         let k_dim = num_kv_heads * head_dim;
         let v_dim = num_kv_heads * head_dim;
@@ -3735,6 +3747,7 @@ impl Attention {
         let use_mma_bk32 = is_f16_d128 && !use_nax && total_seq >= 256;
         // All SDPA kernels (MMA + NAX) now write seq-major output.
         let seq_major_output = true;
+
 
         let attn_slab = if use_nax {
             ops::sdpa::sdpa_prefill_nax_f16_encode(
