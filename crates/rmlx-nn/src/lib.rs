@@ -17,6 +17,8 @@ pub mod moe;
 pub mod moe_pipeline;
 pub mod paged_kv_cache;
 pub mod parallel;
+pub mod prefill_plan;
+pub mod prefill_pool;
 pub mod prefix_cache;
 pub mod quantized_linear;
 pub mod rms_norm;
@@ -48,6 +50,8 @@ pub use moe::{load_balance_loss, Expert, MoeConfig, MoeForwardMetrics, MoeLayer,
 pub use moe_pipeline::{MoePipeline, MoePipelineConfig};
 pub use paged_kv_cache::{BlockId, BlockManager, PagedKvCache, PagedKvError};
 pub use parallel::{ColumnParallelLinear, RowParallelLinear, TpError};
+pub use prefill_plan::{PlanCache, PlanStep, PrefillPlan};
+pub use prefill_pool::{PrefillBufferPool, Slot as PrefillSlot, NUM_SLOTS as PREFILL_NUM_SLOTS};
 pub use prefix_cache::{PrefixCache, PrefixMatch};
 pub use quantized_linear::{
     AwqLinear, GptqLinear, KQuantConfig, KQuantType, QuantBits, QuantizedLinear,

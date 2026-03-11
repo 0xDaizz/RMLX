@@ -279,8 +279,14 @@ impl FeedForward {
                     )?;
                     ops::fused::fused_silu_mul_into_cb(registry, &gate_out, &up_out, cb)?
                 };
-                let ffn_out = down_proj.forward_into_cb(&hidden, registry, cb)?;
-                ops::binary::add_into_cb(registry, residual, &ffn_out, cb)
+                // MlxArch residual epilogue requires M >= 33 (decode M=1 uses Simd tile)
+                // DEBUG: temporarily raised to 128 to isolate GPU error at seq_len=64
+                if hidden.shape()[0] >= 33 {
+                    down_proj.forward_with_residual_into_cb(&hidden, residual, registry, cb)
+                } else {
+                    let ffn_out = down_proj.forward_into_cb(&hidden, registry, cb)?;
+                    ops::binary::add_into_cb(registry, residual, &ffn_out, cb)
+                }
             }
             _ => Err(KernelError::InvalidShape(
                 "forward_single_cb only supports Gated FFN".into(),
@@ -329,8 +335,15 @@ impl FeedForward {
                     )?;
                     ops::fused::fused_silu_mul_encode(registry, &gate_out, &up_out, encoder)?
                 };
-                let ffn_out = down_proj.forward_into_encoder(&hidden, registry, encoder)?;
-                ops::binary::add_encode(registry, residual, &ffn_out, encoder)
+                // MlxArch residual epilogue requires M >= 33 (decode M=1 uses Simd tile)
+                // DEBUG: temporarily raised to 128 to isolate GPU error at seq_len=64
+                if hidden.shape()[0] >= 33 {
+                    down_proj
+                        .forward_with_residual_into_encoder(&hidden, residual, registry, encoder)
+                } else {
+                    let ffn_out = down_proj.forward_into_encoder(&hidden, registry, encoder)?;
+                    ops::binary::add_encode(registry, residual, &ffn_out, encoder)
+                }
             }
             _ => Err(KernelError::InvalidShape(
                 "forward_single_encoder only supports Gated FFN".into(),
@@ -3154,7 +3167,6 @@ impl TransformerBlock {
             registry,
             encoder,
         )?;
-
         // Fused residual + pre-FFN norm (1 dispatch instead of 2)
         let (normed2, h) = ops::rms_norm::rms_norm_residual_add_encode(
             registry,
@@ -3164,10 +3176,381 @@ impl TransformerBlock {
             self.rms_norm_eps,
             encoder,
         )?;
-
         // FFN (all ops share the same encoder)
         self.ffn
             .forward_single_encoder(&normed2, &h, registry, encoder)
+    }
+
+    /// Per-dispatch GPU timing breakdown: runs each of the 9 prefill dispatches
+    /// in its own command buffer and returns wall-clock timing for each.
+    ///
+    /// Dispatches:
+    ///   1. RMSNorm (pre-attention)
+    ///   2. QKV merged GEMM
+    ///   3. RoPE Q+K + V deinterleave (fused)
+    ///   4. SDPA
+    ///   5. O Projection
+    ///   6. RMSNorm + Residual add (fused)
+    ///   7. Gate+Up merged GEMM
+    ///   8. SiLU×Mul (strided)
+    ///   9. Down Proj + Residual
+    ///
+    /// **Prerequisites:** same as `forward_prefill_single_cb`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_prefill_breakdown(
+        &self,
+        x: &Array,
+        cos_freqs: Option<&Array>,
+        sin_freqs: Option<&Array>,
+        cache: &mut LayerKvCache,
+        registry: &KernelRegistry,
+        queue: &metal::CommandQueue,
+    ) -> Result<(Array, Vec<(&'static str, std::time::Duration)>), KernelError> {
+        use std::time::Instant;
+
+        let norm1_w = self.norm1_weight.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape("TransformerBlock: norm1_weight not loaded".into())
+        })?;
+        let norm2_w = self.norm2_weight.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape("TransformerBlock: norm2_weight not loaded".into())
+        })?;
+
+        // Dispatches 1-5: attention
+        let (attn_out, mut timings) = self.attention.forward_prefill_breakdown(
+            x,
+            norm1_w,
+            self.rms_norm_eps,
+            cos_freqs,
+            sin_freqs,
+            cache,
+            registry,
+            queue,
+        )?;
+
+        // ---- Dispatch 6: RMSNorm + Residual add (fused) ----
+        let (normed2, h) = {
+            let cb = queue.new_command_buffer();
+            let start = Instant::now();
+            let result = ops::rms_norm::rms_norm_residual_add_into_cb(
+                registry,
+                &attn_out,
+                x,
+                norm2_w,
+                self.rms_norm_eps,
+                cb,
+            )?;
+            cb.commit();
+            cb.wait_until_completed();
+            timings.push(("RMSNorm + Residual", start.elapsed()));
+            result
+        };
+
+        // Dispatches 7-9: FFN
+        match &self.ffn {
+            FeedForward::Gated {
+                down_proj,
+                gate_up_merged_weight_t,
+                ..
+            } => {
+                let normed_2d = if normed2.ndim() == 1 {
+                    normed2.reshape(vec![1, normed2.shape()[0]])?
+                } else {
+                    normed2.reshape(vec![normed2.shape()[0], normed2.shape()[1]])?
+                };
+
+                let guw_t = gate_up_merged_weight_t.as_ref().ok_or_else(|| {
+                    KernelError::InvalidShape(
+                        "forward_prefill_breakdown: gate_up_merged_weight_t required".into(),
+                    )
+                })?;
+
+                // ---- Dispatch 7: Gate+Up merged GEMM ----
+                let merged = {
+                    let cb = queue.new_command_buffer();
+                    let start = Instant::now();
+                    let out = ops::matmul::matmul_into_cb(registry, &normed_2d, guw_t, cb)?;
+                    cb.commit();
+                    cb.wait_until_completed();
+                    timings.push(("Gate+Up Merged GEMM", start.elapsed()));
+                    out
+                };
+
+                // ---- Dispatch 8: SiLU×Mul (strided) ----
+                let gate_dim = guw_t.shape()[1] / 2;
+                let hidden = {
+                    let cb = queue.new_command_buffer();
+                    let start = Instant::now();
+                    let out = ops::fused::fused_silu_mul_strided_into_cb(
+                        registry, &merged, gate_dim, cb,
+                    )?;
+                    cb.commit();
+                    cb.wait_until_completed();
+                    timings.push(("SiLU*Mul (strided)", start.elapsed()));
+                    out
+                };
+
+                // ---- Dispatch 9: Down Proj + Residual ----
+                let final_out = {
+                    let cb = queue.new_command_buffer();
+                    let start = Instant::now();
+                    let out = if hidden.shape()[0] >= 33 {
+                        down_proj.forward_with_residual_into_cb(&hidden, &h, registry, cb)?
+                    } else {
+                        let ffn_out = down_proj.forward_into_cb(&hidden, registry, cb)?;
+                        ops::binary::add_into_cb(registry, &h, &ffn_out, cb)?
+                    };
+                    cb.commit();
+                    cb.wait_until_completed();
+                    timings.push(("Down Proj + Residual", start.elapsed()));
+                    out
+                };
+
+                Ok((final_out, timings))
+            }
+            _ => Err(KernelError::InvalidShape(
+                "forward_prefill_breakdown only supports Gated FFN".into(),
+            )),
+        }
+    }
+
+    /// Cumulative per-dispatch breakdown using successive subtraction.
+    ///
+    /// Runs 9 cumulative groups, each adding one more dispatch to a single
+    /// CB+encoder. By subtracting group N-1 from group N, we isolate per-kernel
+    /// GPU time with only 1 CB overhead per group (shared across all dispatches).
+    ///
+    /// Returns: `Vec<(&str, f64)>` — 9 entries of (dispatch_name, isolated_time_us).
+    ///
+    /// **Prerequisites:** same as `forward_prefill_single_encoder`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_prefill_cumulative_breakdown(
+        &self,
+        x: &Array,
+        cos_freqs: Option<&Array>,
+        sin_freqs: Option<&Array>,
+        registry: &KernelRegistry,
+        queue: &metal::CommandQueue,
+        device: &metal::Device,
+        max_seq_len: usize,
+        warmup_iters: usize,
+        bench_iters: usize,
+    ) -> Result<Vec<(&'static str, f64)>, KernelError> {
+        use std::time::Instant;
+
+        let norm1_w = self.norm1_weight.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape("TransformerBlock: norm1_weight not loaded".into())
+        })?;
+        let norm2_w = self.norm2_weight.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape("TransformerBlock: norm2_weight not loaded".into())
+        })?;
+
+        // Gate+Up merged weight needed for dispatches 7-8
+        let (guw_t, down_proj) = match &self.ffn {
+            FeedForward::Gated {
+                gate_up_merged_weight_t,
+                down_proj,
+                ..
+            } => {
+                let guw_t = gate_up_merged_weight_t.as_ref().ok_or_else(|| {
+                    KernelError::InvalidShape(
+                        "cumulative_breakdown: gate_up_merged_weight_t required".into(),
+                    )
+                })?;
+                (guw_t, down_proj)
+            }
+            _ => {
+                return Err(KernelError::InvalidShape(
+                    "cumulative_breakdown only supports Gated FFN".into(),
+                ))
+            }
+        };
+
+        let dispatch_names: &[&str] = &[
+            "RMSNorm (pre-attn)",
+            "QKV Merged GEMM",
+            "RoPE Q+K + V deinterleave",
+            "SDPA",
+            "O Projection",
+            "RMSNorm + Residual",
+            "Gate+Up Merged GEMM",
+            "SiLU*Mul (strided)",
+            "Down Proj + Residual",
+        ];
+
+        let num_groups = 9;
+        let mut group_means_us = vec![0.0f64; num_groups];
+
+        for group in 1..=num_groups {
+            // Warmup
+            for _ in 0..warmup_iters {
+                let _pool = rmlx_metal::ScopedPool::new();
+                let mut cache = LayerKvCache::preallocated(
+                    device,
+                    self.attention.config().num_kv_heads,
+                    self.attention.config().head_dim,
+                    max_seq_len,
+                    rmlx_core::dtype::DType::Float16,
+                );
+                let cb = queue.new_command_buffer();
+                let encoder = cb.new_compute_command_encoder();
+
+                // Attention dispatches 1..min(group,5)
+                let attn_stop = group.min(5);
+                let attn_out = self.attention.forward_prefill_encode_partial(
+                    x,
+                    norm1_w,
+                    self.rms_norm_eps,
+                    cos_freqs,
+                    sin_freqs,
+                    &mut cache,
+                    registry,
+                    encoder,
+                    attn_stop,
+                )?;
+
+                if group >= 6 {
+                    // Dispatch 6: RMSNorm + Residual
+                    let (normed2, h) = ops::rms_norm::rms_norm_residual_add_encode(
+                        registry,
+                        &attn_out,
+                        x,
+                        norm2_w,
+                        self.rms_norm_eps,
+                        encoder,
+                    )?;
+
+                    if group >= 7 {
+                        // Dispatch 7: Gate+Up Merged GEMM
+                        let normed_2d = if normed2.ndim() == 1 {
+                            normed2.reshape(vec![1, normed2.shape()[0]])?
+                        } else {
+                            normed2.reshape(vec![normed2.shape()[0], normed2.shape()[1]])?
+                        };
+                        let merged =
+                            ops::matmul::matmul_encode(registry, &normed_2d, guw_t, encoder)?;
+
+                        if group >= 8 {
+                            // Dispatch 8: SiLU*Mul (strided)
+                            let gate_dim = guw_t.shape()[1] / 2;
+                            let hidden = ops::fused::fused_silu_mul_strided_encode(
+                                registry, &merged, gate_dim, encoder,
+                            )?;
+
+                            if group >= 9 {
+                                // Dispatch 9: Down Proj + Residual
+                                if hidden.shape()[0] >= 33 {
+                                    let _ = down_proj.forward_with_residual_into_encoder(
+                                        &hidden, &h, registry, encoder,
+                                    )?;
+                                } else {
+                                    let ffn_out = down_proj
+                                        .forward_into_encoder(&hidden, registry, encoder)?;
+                                    let _ =
+                                        ops::binary::add_encode(registry, &h, &ffn_out, encoder)?;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                encoder.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+            }
+
+            // Benchmark
+            let mut latencies = Vec::with_capacity(bench_iters);
+            for _ in 0..bench_iters {
+                let _pool = rmlx_metal::ScopedPool::new();
+                let mut cache = LayerKvCache::preallocated(
+                    device,
+                    self.attention.config().num_kv_heads,
+                    self.attention.config().head_dim,
+                    max_seq_len,
+                    rmlx_core::dtype::DType::Float16,
+                );
+                let cb = queue.new_command_buffer();
+                let encoder = cb.new_compute_command_encoder();
+                let start = Instant::now();
+
+                let attn_stop = group.min(5);
+                let attn_out = self.attention.forward_prefill_encode_partial(
+                    x,
+                    norm1_w,
+                    self.rms_norm_eps,
+                    cos_freqs,
+                    sin_freqs,
+                    &mut cache,
+                    registry,
+                    encoder,
+                    attn_stop,
+                )?;
+
+                if group >= 6 {
+                    let (normed2, h) = ops::rms_norm::rms_norm_residual_add_encode(
+                        registry,
+                        &attn_out,
+                        x,
+                        norm2_w,
+                        self.rms_norm_eps,
+                        encoder,
+                    )?;
+
+                    if group >= 7 {
+                        let normed_2d = if normed2.ndim() == 1 {
+                            normed2.reshape(vec![1, normed2.shape()[0]])?
+                        } else {
+                            normed2.reshape(vec![normed2.shape()[0], normed2.shape()[1]])?
+                        };
+                        let merged =
+                            ops::matmul::matmul_encode(registry, &normed_2d, guw_t, encoder)?;
+
+                        if group >= 8 {
+                            let gate_dim = guw_t.shape()[1] / 2;
+                            let hidden = ops::fused::fused_silu_mul_strided_encode(
+                                registry, &merged, gate_dim, encoder,
+                            )?;
+
+                            if group >= 9 {
+                                if hidden.shape()[0] >= 33 {
+                                    let _ = down_proj.forward_with_residual_into_encoder(
+                                        &hidden, &h, registry, encoder,
+                                    )?;
+                                } else {
+                                    let ffn_out = down_proj
+                                        .forward_into_encoder(&hidden, registry, encoder)?;
+                                    let _ =
+                                        ops::binary::add_encode(registry, &h, &ffn_out, encoder)?;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                encoder.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+                latencies.push(start.elapsed());
+            }
+
+            let sum_us: f64 = latencies.iter().map(|d| d.as_secs_f64() * 1e6).sum();
+            group_means_us[group - 1] = sum_us / latencies.len() as f64;
+        }
+
+        // Successive subtraction: per-dispatch = group[N] - group[N-1]
+        let mut per_dispatch_us = vec![0.0f64; num_groups];
+        per_dispatch_us[0] = group_means_us[0];
+        for i in 1..num_groups {
+            per_dispatch_us[i] = (group_means_us[i] - group_means_us[i - 1]).max(0.0);
+        }
+
+        let result: Vec<(&'static str, f64)> = dispatch_names
+            .iter()
+            .zip(per_dispatch_us.iter())
+            .map(|(&name, &us)| (name, us))
+            .collect();
+
+        Ok(result)
     }
 
     /// ExecGraph-based prefill forward: 1 CB per block, GPU-side chaining.
@@ -4065,6 +4448,84 @@ impl TransformerModel {
             queue,
             event,
         )
+    }
+
+    /// Compiled prefill forward: all layers in a single CB + single encoder.
+    ///
+    /// This is the most efficient prefill path, eliminating:
+    /// - Per-layer command buffer creation
+    /// - Per-layer encoder creation/destruction
+    /// - Inter-layer GPU idle time from CB boundaries
+    ///
+    /// All 32+ layers share one `ComputeCommandEncoder` within one `CommandBuffer`.
+    /// Metal's sequential dispatch ordering within a single encoder guarantees
+    /// correct inter-layer dependencies without explicit barriers.
+    ///
+    /// **Requires** `prepare_weights_for_graph()` to have been called on all layers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_prefill_compiled(
+        &self,
+        token_ids: &[u32],
+        cos_freqs: Option<&Array>,
+        sin_freqs: Option<&Array>,
+        mask: Option<&Array>,
+        cache: &mut [LayerKvCache],
+        registry: &KernelRegistry,
+        queue: &metal::CommandQueue,
+    ) -> Result<Array, KernelError> {
+        let embedding = self.embedding.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape("TransformerModel: embedding not loaded".into())
+        })?;
+        let final_norm = self.final_norm_weight.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape("TransformerModel: final_norm not loaded".into())
+        })?;
+        let lm_head = self.lm_head.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape("TransformerModel: lm_head not loaded".into())
+        })?;
+
+        // Validate cache
+        if cache.len() != self.layers.len() {
+            return Err(KernelError::InvalidShape(format!(
+                "TransformerModel: cache has {} entries but model has {} layers",
+                cache.len(),
+                self.layers.len()
+            )));
+        }
+
+        // Embedding lookup (sync — small, fast)
+        let mut x = embedding.forward(token_ids, registry, queue)?;
+
+        // Single CB + single encoder for ALL transformer layers
+        let cb = queue.new_command_buffer();
+        let encoder = cb.new_compute_command_encoder();
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            x = layer.forward_prefill_single_encoder(
+                &x,
+                cos_freqs,
+                sin_freqs,
+                mask,
+                &mut cache[i],
+                registry,
+                encoder,
+            )?;
+        }
+
+        // Final norm + LM head in same encoder
+        x = ops::rms_norm::rms_norm_encode(
+            registry,
+            &x,
+            Some(final_norm),
+            self.config.rms_norm_eps,
+            encoder,
+        )?;
+        x = lm_head.forward_into_encoder(&x, registry, encoder)?;
+
+        encoder.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        Ok(x)
     }
 }
 
