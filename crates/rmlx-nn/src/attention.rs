@@ -3325,7 +3325,9 @@ impl Attention {
 
         let rope_offset = cache.seq_len as u32;
 
-        // Deinterleave + RoPE for Q and K; deinterleave-only for V
+        // Deinterleave + RoPE for Q and K, then deinterleave V.
+        // All three are deinterleaved before SDPA so V is contiguous — strided V
+        // had terrible cache line utilization (2.8%: head_dim=128 vs stride=4608).
         // Output layout: [num_heads * seq_len, head_dim] (batch-major)
         let q_batched;
         let k_batched;
@@ -3358,13 +3360,6 @@ impl Attention {
                 k_row_stride,
                 cb,
             )?;
-            v_batched = ops::rope::deinterleave_heads_into_cb(
-                registry,
-                &v,
-                num_kv_heads,
-                v_row_stride,
-                cb,
-            )?;
         } else {
             q_batched =
                 ops::rope::deinterleave_heads_into_cb(registry, &q, num_heads, q_row_stride, cb)?;
@@ -3375,19 +3370,21 @@ impl Attention {
                 k_row_stride,
                 cb,
             )?;
-            v_batched = ops::rope::deinterleave_heads_into_cb(
-                registry,
-                &v,
-                num_kv_heads,
-                v_row_stride,
-                cb,
-            )?;
         }
+        // Deinterleave V — always done before SDPA for contiguous memory access
+        v_batched = ops::rope::deinterleave_heads_into_cb(
+            registry,
+            &v,
+            num_kv_heads,
+            v_row_stride,
+            cb,
+        )?;
 
         // ── 4) KV cache: bypass on initial prefill (cache empty) ──
         let needs_initial_append = cache.seq_len == 0;
+        // V is always contiguous after deinterleave — no stride overrides needed.
         let (k_for_sdpa, v_for_sdpa, kv_stride, total_seq) = if needs_initial_append {
-            // RoPE output is contiguous — pass directly to SDPA, skip blit
+            // K/V: deinterleave outputs are contiguous — pass directly to SDPA
             let k_view = k_batched.view(
                 k_batched.shape().to_vec(),
                 k_batched.strides().to_vec(),
@@ -3400,6 +3397,7 @@ impl Attention {
             );
             (k_view, v_view, None, seq_len)
         } else {
+            // Non-initial: append to cache, then use slab for SDPA
             cache.append_batched_into_cb(&k_batched, &v_batched, seq_len, registry, cb)?;
             let total_seq = cache.seq_len;
             let k_slab = cache.keys_slab_view().ok_or_else(|| {
@@ -3442,8 +3440,10 @@ impl Attention {
         // BK=32: fewer K-loop iterations, wins when KV sequence is long enough.
         let use_mma_bk32 = is_f16_d128 && !use_nax && total_seq >= 256;
 
-        // Track output layout: MMA writes seq-major, NAX and scalar write head-major.
-        let seq_major_output = is_f16_d128 && !use_nax;
+        // All SDPA kernels (MMA + NAX) now write seq-major output.
+        // Scalar fallback also writes seq-major when is_f16_d128 is false,
+        // but that path uses head-major — handled below.
+        let seq_major_output = true;
 
         let attn_slab = if use_nax {
             ops::sdpa::sdpa_prefill_nax_f16_into_cb(
@@ -3459,6 +3459,8 @@ impl Attention {
                 kv_stride,
                 scale,
                 true, // is_causal
+                None, // v_head_stride: V is contiguous after deinterleave
+                None, // v_row_stride: V is contiguous after deinterleave
                 cb,
             )?
         } else if use_mma_bk32 {
@@ -3477,6 +3479,8 @@ impl Attention {
                 None, // kernel handles causal internally
                 scale,
                 true, // is_causal
+                None, // v_head_stride: V is contiguous after deinterleave
+                None, // v_row_stride: V is contiguous after deinterleave
                 cb,
             )?
         } else if is_f16_d128 {
@@ -3495,6 +3499,8 @@ impl Attention {
                 None, // kernel handles causal internally
                 scale,
                 true, // is_causal
+                None, // v_head_stride: V is contiguous after deinterleave
+                None, // v_row_stride: V is contiguous after deinterleave
                 cb,
             )?
         } else {
@@ -3516,13 +3522,14 @@ impl Attention {
             )?
         };
 
-        // Deferred KV write: after SDPA critical path
+        // KV cache append for initial prefill (cache was empty).
+        // V is already deinterleaved (done before SDPA above).
         if needs_initial_append {
             cache.append_batched_into_cb(&k_batched, &v_batched, seq_len, registry, cb)?;
         }
 
-        // MMA kernel writes seq-major [seq_len, num_heads * head_dim] directly.
-        // NAX and scalar kernels write head-major [num_heads, seq_len, head_dim].
+        // All kernels (MMA + NAX) now write seq-major [seq_len, num_heads * head_dim].
+        // No interleave dispatch needed.
         let concat = if seq_major_output {
             // Already seq-major: just reshape to [seq_len, hidden_size]
             attn_slab.view(
@@ -3531,14 +3538,13 @@ impl Attention {
                 attn_slab.offset(),
             )
         } else {
-            // Scalar path: head-major → need interleave
+            // Scalar path: head-major → need interleave (kept for non-f16/non-d128 fallback)
             let packed = attn_slab.view(
                 vec![num_heads * seq_len, head_dim],
                 vec![head_dim, 1],
                 attn_slab.offset(),
             );
             if seq_len == 1 {
-                // For seq_len=1, head-major == token-major: [1, hidden_size]
                 packed.view(vec![1, hidden_size], vec![hidden_size, 1], packed.offset())
             } else {
                 ops::rope::interleave_heads_into_cb(registry, &packed, num_heads, seq_len, cb)?
@@ -3633,6 +3639,9 @@ impl Attention {
 
         let rope_offset = cache.seq_len as u32;
 
+        // Deinterleave + RoPE for Q and K, then deinterleave V.
+        // All three are deinterleaved before SDPA so V is contiguous — strided V
+        // had terrible cache line utilization (2.8%: head_dim=128 vs stride=4608).
         let q_batched;
         let k_batched;
         let v_batched;
@@ -3662,13 +3671,6 @@ impl Attention {
                 k_row_stride,
                 encoder,
             )?;
-            v_batched = ops::rope::deinterleave_heads_encode(
-                registry,
-                &v,
-                num_kv_heads,
-                v_row_stride,
-                encoder,
-            )?;
         } else {
             q_batched = ops::rope::deinterleave_heads_encode(
                 registry,
@@ -3684,18 +3686,21 @@ impl Attention {
                 k_row_stride,
                 encoder,
             )?;
-            v_batched = ops::rope::deinterleave_heads_encode(
-                registry,
-                &v,
-                num_kv_heads,
-                v_row_stride,
-                encoder,
-            )?;
         }
+        // Deinterleave V — always done before SDPA for contiguous memory access
+        v_batched = ops::rope::deinterleave_heads_encode(
+            registry,
+            &v,
+            num_kv_heads,
+            v_row_stride,
+            encoder,
+        )?;
 
         // KV cache: bypass on initial prefill (cache empty)
         let needs_initial_append = cache.seq_len == 0;
+        // V is always contiguous after deinterleave — no stride overrides needed.
         let (k_for_sdpa, v_for_sdpa, kv_stride, total_seq) = if needs_initial_append {
+            // K/V: deinterleave outputs are contiguous — pass directly to SDPA
             let k_view = k_batched.view(
                 k_batched.shape().to_vec(),
                 k_batched.strides().to_vec(),
@@ -3708,6 +3713,7 @@ impl Attention {
             );
             (k_view, v_view, None, seq_len)
         } else {
+            // Non-initial: append to cache, then use slab for SDPA
             cache.append_batched_encode(&k_batched, &v_batched, seq_len, registry, encoder)?;
             let total_seq = cache.seq_len;
             let k_slab = cache.keys_slab_view().ok_or_else(|| {
@@ -3732,7 +3738,8 @@ impl Attention {
         let is_f16_d128 = q_batched.dtype() == DType::Float16 && head_dim == 128 && seq_len > 1;
         let use_nax = is_f16_d128 && registry.device().tuning().supports_nax;
         let use_mma_bk32 = is_f16_d128 && !use_nax && total_seq >= 256;
-        let seq_major_output = is_f16_d128 && !use_nax;
+        // All SDPA kernels (MMA + NAX) now write seq-major output.
+        let seq_major_output = true;
 
         let attn_slab = if use_nax {
             ops::sdpa::sdpa_prefill_nax_f16_encode(
@@ -3748,6 +3755,8 @@ impl Attention {
                 kv_stride,
                 scale,
                 true,
+                None, // v_head_stride: V is contiguous after deinterleave
+                None, // v_row_stride: V is contiguous after deinterleave
                 encoder,
             )?
         } else if use_mma_bk32 {
@@ -3765,6 +3774,8 @@ impl Attention {
                 None,
                 scale,
                 true,
+                None, // v_head_stride: V is contiguous after deinterleave
+                None, // v_row_stride: V is contiguous after deinterleave
                 encoder,
             )?
         } else if is_f16_d128 {
@@ -3782,6 +3793,8 @@ impl Attention {
                 None,
                 scale,
                 true,
+                None, // v_head_stride: V is contiguous after deinterleave
+                None, // v_row_stride: V is contiguous after deinterleave
                 encoder,
             )?
         } else {
@@ -3803,12 +3816,19 @@ impl Attention {
             )?
         };
 
-        // Deferred KV write: after SDPA critical path
+        // KV cache append for initial prefill (cache was empty).
+        // V is already deinterleaved (done before SDPA above).
         if needs_initial_append {
-            cache.append_batched_encode(&k_batched, &v_batched, seq_len, registry, encoder)?;
+            cache.append_batched_encode(
+                &k_batched,
+                &v_batched,
+                seq_len,
+                registry,
+                encoder,
+            )?;
         }
 
-        // Head concat / interleave
+        // All kernels (MMA + NAX) now write seq-major — no interleave dispatch needed.
         let concat = if seq_major_output {
             attn_slab.view(
                 vec![seq_len, hidden_size],
@@ -3816,6 +3836,7 @@ impl Attention {
                 attn_slab.offset(),
             )
         } else {
+            // Scalar path: head-major → need interleave (kept for non-f16/non-d128 fallback)
             let packed = attn_slab.view(
                 vec![num_heads * seq_len, head_dim],
                 vec![head_dim, 1],

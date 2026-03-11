@@ -1872,6 +1872,8 @@ kernel void sdpa_prefill_mma_f16(
     constant float& scale [[buffer(9)]],
     constant uint& kv_stride_S [[buffer(10)]],
     constant uint& num_q_heads [[buffer(11)]],
+    constant uint& v_head_stride [[buffer(12)]],
+    constant uint& v_row_stride  [[buffer(13)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint  simd_gid [[simdgroup_index_in_threadgroup]],
     uint  simd_lid [[thread_index_in_simdgroup]])
@@ -1884,10 +1886,10 @@ kernel void sdpa_prefill_mma_f16(
     const uint q_start = q_block * BQ;
     if (q_start >= N) return;
 
-    // Pointer offsets for this head (use kv_stride_S for KV inter-head offset)
+    // Pointer offsets for this head (use kv_stride_S for K, v_head_stride for V)
     const device half* Q_head = Q + q_head * N * BD;
     const device half* K_head = K + kv_head * kv_stride_S * BD;
-    const device half* V_head = V + kv_head * kv_stride_S * BD;
+    const device half* V_head = V + kv_head * v_head_stride;
     // Seq-major output: O[seq_pos * num_q_heads * BD + q_head * BD + d]
     const uint o_row_stride = num_q_heads * BD;
 
@@ -1924,8 +1926,9 @@ kernel void sdpa_prefill_mma_f16(
     KLoader loader_k(K_head, BD, Ks, simd_gid, simd_lid);
 
     // V is loaded row-major: [BK, BD] → [BK, BD+pad]
+    // v_row_stride allows strided V access (e.g. from merged QKV buffer)
     using VLoader = RowLoader<BK, BD, LDV, kNWarps * 32>;
-    VLoader loader_v(V_head, BD, Vs, simd_gid, simd_lid);
+    VLoader loader_v(V_head, int(v_row_stride), Vs, simd_gid, simd_lid);
 
     // ─── MMA fragment setup ────────────────────────────────────────────
     // Each simdgroup owns TQ=1 rows of 8 query positions
@@ -2384,6 +2387,8 @@ kernel void sdpa_prefill_mma_bk32_f16(
     constant float& scale [[buffer(9)]],
     constant uint& kv_stride_S [[buffer(10)]],
     constant uint& num_q_heads [[buffer(11)]],
+    constant uint& v_head_stride [[buffer(12)]],
+    constant uint& v_row_stride  [[buffer(13)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint  simd_gid [[simdgroup_index_in_threadgroup]],
     uint  simd_lid [[thread_index_in_simdgroup]])
@@ -2397,7 +2402,7 @@ kernel void sdpa_prefill_mma_bk32_f16(
 
     const device half* Q_head = Q + q_head * N * BD;
     const device half* K_head = K + kv_head * kv_stride_S * BD;
-    const device half* V_head = V + kv_head * kv_stride_S * BD;
+    const device half* V_head = V + kv_head * v_head_stride;
     // Seq-major output: O[seq_pos * num_q_heads * BD + q_head * BD + d]
     const uint o_row_stride = num_q_heads * BD;
 
@@ -2429,8 +2434,9 @@ kernel void sdpa_prefill_mma_bk32_f16(
     using KLoader = TransposeLoader<BK, BD, 1, LDK, kNWarps * 32>;
     KLoader loader_k(K_head, BD, Ks, simd_gid, simd_lid);
 
+    // v_row_stride allows strided V access (e.g. from merged QKV buffer)
     using VLoader = RowLoader<BK, BD, LDV, kNWarps * 32>;
-    VLoader loader_v(V_head, BD, Vs, simd_gid, simd_lid);
+    VLoader loader_v(V_head, int(v_row_stride), Vs, simd_gid, simd_lid);
 
     // ─── MMA fragment setup ────────────────────────────────────────────
     const short tm = kFragSize * TQ * simd_gid;
@@ -2846,6 +2852,9 @@ kernel void sdpa_prefill_nax_f16(
     constant uint& gqa_factor  [[buffer(7)]],
     constant float& scale      [[buffer(8)]],
     constant uint& kv_stride_S [[buffer(9)]],
+    constant uint& num_q_heads [[buffer(10)]],
+    constant uint& v_head_stride [[buffer(11)]],
+    constant uint& v_row_stride  [[buffer(12)]],
     uint3 tid    [[threadgroup_position_in_grid]],
     uint  sgid   [[simdgroup_index_in_threadgroup]],
     uint  slid   [[thread_index_in_simdgroup]])
@@ -2858,11 +2867,12 @@ kernel void sdpa_prefill_nax_f16(
     const uint q_start = q_block * BQ;
     if (q_start >= N) return;
 
-    // Head pointers
+    // Head pointers (use kv_stride_S for K, v_head_stride/v_row_stride for V)
     const device half* Q_head = Q + q_head  * N * BD;
     const device half* K_head = K + kv_head * kv_stride_S * BD;
-    const device half* V_head = V + kv_head * kv_stride_S * BD;
-    device half*       O_head = O + q_head  * N * BD;
+    const device half* V_head = V + kv_head * v_head_stride;
+    // Seq-major output: O[seq_pos * num_q_heads * BD + q_head * BD + d]
+    const uint o_row_stride = num_q_heads * BD;
 
     const float scale2 = scale * M_LOG2E_F;
 
@@ -3093,17 +3103,17 @@ kernel void sdpa_prefill_nax_f16(
                 {
                     int v_col0 = id * UD;
                     int v_col1 = id * UD + 16;
-                    const device half* V_ptr0 = V_head + v_row * BD + v_col0;
-                    const device half* V_ptr1 = V_head + v_row * BD + v_col1;
+                    const device half* V_ptr0 = V_head + v_row * int(v_row_stride) + v_col0;
+                    const device half* V_ptr1 = V_head + v_row * int(v_row_stride) + v_col1;
 
                     if (v_valid <= 0) {
                         for (int e = 0; e < 16; e++) V_frag[e] = half(0);
                     } else if (is_last_kv && v_valid < 16) {
-                        load_frag_16x16(V_frag, V_ptr0, BD, fm, fn, v_valid, 16);
-                        load_frag_16x16(V_frag + 8, V_ptr1, BD, fm, fn, v_valid, 16);
+                        load_frag_16x16(V_frag, V_ptr0, int(v_row_stride), fm, fn, v_valid, 16);
+                        load_frag_16x16(V_frag + 8, V_ptr1, int(v_row_stride), fm, fn, v_valid, 16);
                     } else {
-                        load_frag_16x16_unsafe(V_frag, V_ptr0, BD, fm, fn);
-                        load_frag_16x16_unsafe(V_frag + 8, V_ptr1, BD, fm, fn);
+                        load_frag_16x16_unsafe(V_frag, V_ptr0, int(v_row_stride), fm, fn);
+                        load_frag_16x16_unsafe(V_frag + 8, V_ptr1, int(v_row_stride), fm, fn);
                     }
                 }
 
@@ -3135,10 +3145,10 @@ kernel void sdpa_prefill_nax_f16(
         }
     }
 
-    // ─── Store output ───────────────────────────────────────────────────
-    // O layout: [num_q_heads, N, BD], row-major
-    // O_acc[id][0..7] = first 16 D-cols, O_acc[id][8..15] = next 16 D-cols
-    device half* O_base = O_head + (q_start + tm) * BD;
+    // ─── Store output (seq-major) ─────────────────────────────────────
+    // O layout: [N, num_q_heads * BD], seq-major
+    // O[seq_pos * o_row_stride + q_head * BD + d]
+    device half* O_base = O + (q_start + tm) * o_row_stride + q_head * BD;
 
     if (is_last_q_block) {
         int q_valid_local = int(q_rows_valid) - int(tm);
@@ -3147,7 +3157,7 @@ kernel void sdpa_prefill_nax_f16(
         for (int id = 0; id < TD; id++) {
             for (int sf = 0; sf < 2; sf++) {
                 int col_base = id * UD + sf * 16;
-                store_frag_16x16(O_base, BD, O_acc[id] + sf * 8, fm, short(col_base + fn),
+                store_frag_16x16(O_base, int(o_row_stride), O_acc[id] + sf * 8, fm, short(col_base + fn),
                                   q_valid_local, BD);
             }
         }
@@ -3155,7 +3165,7 @@ kernel void sdpa_prefill_nax_f16(
         for (int id = 0; id < TD; id++) {
             for (int sf = 0; sf < 2; sf++) {
                 int col_base = id * UD + sf * 16;
-                store_frag_16x16_unsafe(O_base, BD, O_acc[id] + sf * 8, fm, short(col_base + fn));
+                store_frag_16x16_unsafe(O_base, int(o_row_stride), O_acc[id] + sf * 8, fm, short(col_base + fn));
             }
         }
     }
@@ -3952,6 +3962,8 @@ pub fn sdpa_prefill_mma_f16_into_cb(
     mask: Option<&Array>,
     scale: f32,
     is_causal: bool,
+    v_head_stride: Option<usize>,
+    v_row_stride: Option<usize>,
     cb: &metal::CommandBufferRef,
 ) -> Result<Array, KernelError> {
     use crate::kernels::FunctionConstantValue;
@@ -4031,6 +4043,10 @@ pub fn sdpa_prefill_mma_f16_into_cb(
         4,
         &num_q_heads_val as *const u32 as *const std::ffi::c_void,
     );
+    let v_hs = v_head_stride.unwrap_or(stride_s_val as usize * head_dim) as u32;
+    let v_rs = v_row_stride.unwrap_or(head_dim) as u32;
+    encoder.set_bytes(12, 4, &v_hs as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(13, 4, &v_rs as *const u32 as *const std::ffi::c_void);
 
     // Grid: (ceildiv(seq_len, BQ), num_heads, 1)
     let n_q_blocks = seq_len.div_ceil(MMA_BQ) as u64;
@@ -4070,6 +4086,8 @@ pub fn sdpa_prefill_mma_bk32_f16_into_cb(
     mask: Option<&Array>,
     scale: f32,
     is_causal: bool,
+    v_head_stride: Option<usize>,
+    v_row_stride: Option<usize>,
     cb: &metal::CommandBufferRef,
 ) -> Result<Array, KernelError> {
     use crate::kernels::FunctionConstantValue;
@@ -4128,6 +4146,8 @@ pub fn sdpa_prefill_mma_bk32_f16_into_cb(
             mask,
             scale,
             is_causal,
+            v_head_stride,
+            v_row_stride,
             cb,
         );
     }
@@ -4174,6 +4194,10 @@ pub fn sdpa_prefill_mma_bk32_f16_into_cb(
         4,
         &num_q_heads_val as *const u32 as *const std::ffi::c_void,
     );
+    let v_hs = v_head_stride.unwrap_or(stride_s_val as usize * head_dim) as u32;
+    let v_rs = v_row_stride.unwrap_or(head_dim) as u32;
+    encoder.set_bytes(12, 4, &v_hs as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(13, 4, &v_rs as *const u32 as *const std::ffi::c_void);
 
     let n_q_blocks = seq_len.div_ceil(MMA_BQ) as u64;
     let tg_size = MMA_THREADS;
@@ -4206,6 +4230,8 @@ pub fn sdpa_prefill_nax_f16_into_cb(
     kv_seq_stride: Option<usize>,
     scale: f32,
     is_causal: bool,
+    v_head_stride: Option<usize>,
+    v_row_stride: Option<usize>,
     cb: &metal::CommandBufferRef,
 ) -> Result<Array, KernelError> {
     use crate::kernels::FunctionConstantValue;
@@ -4262,6 +4288,12 @@ pub fn sdpa_prefill_nax_f16_into_cb(
     encoder.set_bytes(8, 4, &scale as *const f32 as *const std::ffi::c_void);
     let stride_s_val = kv_seq_stride.unwrap_or(kv_len) as u32;
     encoder.set_bytes(9, 4, &stride_s_val as *const u32 as *const std::ffi::c_void);
+    let num_q_heads_val = num_heads as u32;
+    encoder.set_bytes(10, 4, &num_q_heads_val as *const u32 as *const std::ffi::c_void);
+    let v_hs = v_head_stride.unwrap_or(stride_s_val as usize * head_dim) as u32;
+    let v_rs = v_row_stride.unwrap_or(head_dim) as u32;
+    encoder.set_bytes(11, 4, &v_hs as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(12, 4, &v_rs as *const u32 as *const std::ffi::c_void);
 
     // Grid: (ceildiv(seq_len, BQ=64), num_heads, 1)
     let n_q_blocks = seq_len.div_ceil(NAX_BQ) as u64;
@@ -4392,6 +4424,8 @@ pub fn sdpa_prefill_mma_f16_encode(
     mask: Option<&Array>,
     scale: f32,
     is_causal: bool,
+    v_head_stride: Option<usize>,
+    v_row_stride: Option<usize>,
     encoder: &metal::ComputeCommandEncoderRef,
 ) -> Result<Array, KernelError> {
     use crate::kernels::FunctionConstantValue;
@@ -4469,6 +4503,10 @@ pub fn sdpa_prefill_mma_f16_encode(
         4,
         &num_q_heads_val as *const u32 as *const std::ffi::c_void,
     );
+    let v_hs = v_head_stride.unwrap_or(stride_s_val as usize * head_dim) as u32;
+    let v_rs = v_row_stride.unwrap_or(head_dim) as u32;
+    encoder.set_bytes(12, 4, &v_hs as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(13, 4, &v_rs as *const u32 as *const std::ffi::c_void);
 
     let n_q_blocks = seq_len.div_ceil(MMA_BQ) as u64;
     let tg_size = std::cmp::min(MMA_THREADS, pipeline.max_total_threads_per_threadgroup());
@@ -4496,6 +4534,8 @@ pub fn sdpa_prefill_mma_bk32_f16_encode(
     mask: Option<&Array>,
     scale: f32,
     is_causal: bool,
+    v_head_stride: Option<usize>,
+    v_row_stride: Option<usize>,
     encoder: &metal::ComputeCommandEncoderRef,
 ) -> Result<Array, KernelError> {
     use crate::kernels::FunctionConstantValue;
@@ -4552,6 +4592,8 @@ pub fn sdpa_prefill_mma_bk32_f16_encode(
             mask,
             scale,
             is_causal,
+            v_head_stride,
+            v_row_stride,
             encoder,
         );
     }
@@ -4597,6 +4639,10 @@ pub fn sdpa_prefill_mma_bk32_f16_encode(
         4,
         &num_q_heads_val as *const u32 as *const std::ffi::c_void,
     );
+    let v_hs = v_head_stride.unwrap_or(stride_s_val as usize * head_dim) as u32;
+    let v_rs = v_row_stride.unwrap_or(head_dim) as u32;
+    encoder.set_bytes(12, 4, &v_hs as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(13, 4, &v_rs as *const u32 as *const std::ffi::c_void);
 
     let n_q_blocks = seq_len.div_ceil(MMA_BQ) as u64;
     let tg_size = MMA_THREADS;
@@ -4623,6 +4669,8 @@ pub fn sdpa_prefill_nax_f16_encode(
     kv_seq_stride: Option<usize>,
     scale: f32,
     is_causal: bool,
+    v_head_stride: Option<usize>,
+    v_row_stride: Option<usize>,
     encoder: &metal::ComputeCommandEncoderRef,
 ) -> Result<Array, KernelError> {
     use crate::kernels::FunctionConstantValue;
@@ -4678,6 +4726,12 @@ pub fn sdpa_prefill_nax_f16_encode(
     encoder.set_bytes(8, 4, &scale as *const f32 as *const std::ffi::c_void);
     let stride_s_val = kv_seq_stride.unwrap_or(kv_len) as u32;
     encoder.set_bytes(9, 4, &stride_s_val as *const u32 as *const std::ffi::c_void);
+    let num_q_heads_val = num_heads as u32;
+    encoder.set_bytes(10, 4, &num_q_heads_val as *const u32 as *const std::ffi::c_void);
+    let v_hs = v_head_stride.unwrap_or(stride_s_val as usize * head_dim) as u32;
+    let v_rs = v_row_stride.unwrap_or(head_dim) as u32;
+    encoder.set_bytes(11, 4, &v_hs as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(12, 4, &v_rs as *const u32 as *const std::ffi::c_void);
 
     let n_q_blocks = seq_len.div_ceil(NAX_BQ) as u64;
     let tg_size = std::cmp::min(NAX_THREADS, pipeline.max_total_threads_per_threadgroup());
@@ -5649,6 +5703,8 @@ mod tests {
             None,          // mask
             scale,
             true, // is_causal
+            None, // v_head_stride (default)
+            None, // v_row_stride (default)
             cb_mma,
         )
         .unwrap();
@@ -5822,6 +5878,8 @@ kernel void metal32_probe(device float* out [[buffer(0)]], uint tid [[thread_pos
                 None,
                 scale,
                 true,
+                None, // v_head_stride
+                None, // v_row_stride
                 cb_mma,
             )
             .unwrap();
@@ -6025,7 +6083,10 @@ kernel void metal32_probe(device float* out [[buffer(0)]], uint tid [[thread_pos
             .unwrap();
             cb_scalar.commit();
             cb_scalar.wait_until_completed();
-            let scalar_f32 = read_f16_as_f32(&registry, &queue, &scalar_out);
+            let scalar_f32_raw = read_f16_as_f32(&registry, &queue, &scalar_out);
+            // Convert scalar head-major output to seq-major for comparison with NAX
+            let scalar_f32 =
+                head_major_to_seq_major(&scalar_f32_raw, num_heads, seq_len, head_dim);
 
             // --- NAX kernel ---
             let cb_nax = queue.new_command_buffer();
@@ -6042,6 +6103,8 @@ kernel void metal32_probe(device float* out [[buffer(0)]], uint tid [[thread_pos
                 Some(max_seq),
                 scale,
                 true,
+                None, // v_head_stride
+                None, // v_row_stride
                 cb_nax,
             )
             .unwrap();

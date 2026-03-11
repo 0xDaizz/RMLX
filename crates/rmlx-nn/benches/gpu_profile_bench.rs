@@ -565,7 +565,7 @@ fn main() {
         let is_f16_d128 = true;
         let use_nax = is_f16_d128 && supports_nax;
         let use_mma_bk32 = is_f16_d128 && !use_nax && total_seq >= 256;
-        let seq_major_output = is_f16_d128 && !use_nax;
+        let seq_major_output = is_f16_d128;
 
         let attn_slab = {
             let _pool = ScopedPool::new();
@@ -584,6 +584,8 @@ fn main() {
                     None,
                     scale,
                     true,
+                    None,
+                    None,
                     cb,
                 )
                 .expect("sdpa nax")
@@ -602,6 +604,8 @@ fn main() {
                     None,
                     scale,
                     true,
+                    None,
+                    None,
                     cb,
                 )
                 .expect("sdpa mma bk32")
@@ -620,6 +624,8 @@ fn main() {
                     None,
                     scale,
                     true,
+                    None,
+                    None,
                     cb,
                 )
                 .expect("sdpa mma bk16")
@@ -804,6 +810,8 @@ fn main() {
                     None,
                     scale,
                     true,
+                    None,
+                    None,
                     cb,
                 )
                 .expect("sdpa nax");
@@ -822,6 +830,8 @@ fn main() {
                     None,
                     scale,
                     true,
+                    None,
+                    None,
                     cb,
                 )
                 .expect("sdpa mma bk32");
@@ -840,6 +850,8 @@ fn main() {
                     None,
                     scale,
                     true,
+                    None,
+                    None,
                     cb,
                 )
                 .expect("sdpa mma bk16");

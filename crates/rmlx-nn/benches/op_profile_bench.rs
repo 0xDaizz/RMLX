@@ -526,7 +526,7 @@ fn main() {
         let use_mma_bk32 = is_f16_d128 && !use_nax && total_seq >= 256;
 
         // MMA writes seq-major; NAX writes head-major
-        let seq_major_output = is_f16_d128 && !use_nax;
+        let seq_major_output = is_f16_d128;
 
         let attn_slab = {
             let _pool = ScopedPool::new();
@@ -545,6 +545,8 @@ fn main() {
                     None, // contiguous, no stride override
                     scale,
                     true, // is_causal
+                    None, // v_head_stride
+                    None, // v_row_stride
                     cb,
                 )
                 .expect("sdpa nax")
@@ -563,6 +565,8 @@ fn main() {
                     None, // no explicit mask
                     scale,
                     true, // is_causal
+                    None, // v_head_stride
+                    None, // v_row_stride
                     cb,
                 )
                 .expect("sdpa mma bk32")
@@ -581,6 +585,8 @@ fn main() {
                     None, // no explicit mask
                     scale,
                     true, // is_causal
+                    None, // v_head_stride
+                    None, // v_row_stride
                     cb,
                 )
                 .expect("sdpa mma bk16")
@@ -766,6 +772,8 @@ fn main() {
                     None,
                     scale,
                     true,
+                    None,
+                    None,
                     cb,
                 )
                 .expect("sdpa nax");
@@ -784,6 +792,8 @@ fn main() {
                     None,
                     scale,
                     true,
+                    None,
+                    None,
                     cb,
                 )
                 .expect("sdpa mma bk32");
@@ -802,6 +812,8 @@ fn main() {
                     None,
                     scale,
                     true,
+                    None,
+                    None,
                     cb,
                 )
                 .expect("sdpa mma bk16");
