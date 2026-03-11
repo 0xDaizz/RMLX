@@ -6625,7 +6625,7 @@ pub fn affine_quantized_matmul_batched_into_cb(
     let n = qw.out_features;
     let k = qw.in_features;
     let dev = registry.device().raw();
-    let opts = metal::MTLResourceOptions::StorageModeShared;
+    let _opts = metal::MTLResourceOptions::StorageModeShared;
 
     // Q4 dispatch priority (mirrors affine_quantized_matmul_batched):
     // 1. NAX: M >= 32, K % 64 == 0 — K-coalesced dequant loader, 4 SG MMA
@@ -6774,7 +6774,7 @@ pub fn affine_quantized_matmul_batched_into_cb(
 
             if k_partitions == 1 {
                 let out = Array::uninit(dev, &[m, n], DType::Float16);
-                let dummy_buf = dev.new_buffer(4, opts);
+                let dummy_buf = dev.new_buffer(4, _opts);
 
                 let enc = cb.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(&pipeline);
@@ -6800,7 +6800,7 @@ pub fn affine_quantized_matmul_batched_into_cb(
                 let partition_stride = m * n;
                 let c_split_size =
                     (k_partitions * partition_stride * std::mem::size_of::<f32>()) as u64;
-                let c_split_buf = dev.new_buffer(c_split_size, opts);
+                let c_split_buf = dev.new_buffer(c_split_size, _opts);
                 let out = Array::uninit(dev, &[m, n], DType::Float16);
 
                 let enc = cb.new_compute_command_encoder();

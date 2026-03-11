@@ -531,6 +531,23 @@ fn main() {
     let device = registry.device().raw();
     let queue = device.new_command_queue();
 
+    // --- GPU warmup: trigger Metal shader JIT compilation before timing ---
+    println!("GPU warmup (triggering Metal shader compilation)...");
+    {
+        let warmup_qw = make_quantized_weight(device, 2560, 2560, 42);
+        // Warmup all dispatch paths: QMV-fast (M=1), QMV-batch (M=8), Steel-SK (M=32)
+        for &wm in &[1, 8, 32] {
+            let wx = rand_f16_array(device, &[wm, 2560], 99);
+            for _ in 0..5 {
+                let _ = ops::quantized::affine_quantized_matmul_batched(
+                    &registry, &wx, &warmup_qw, &queue,
+                )
+                .expect("GPU warmup failed");
+            }
+        }
+    }
+    println!("GPU warmup done.\n");
+
     let mlx_refs = mlx_reference();
 
     let k_values: &[usize] = &[2560, 3584, 4096];
@@ -542,9 +559,7 @@ fn main() {
         "Warmup: {} iters, Bench: {} iters, Q4, group_size={}, f16 input",
         WARMUP_ITERS, BENCH_ITERS, GROUP_SIZE,
     );
-    println!(
-        "Dispatch paths: M=1 QMV fast, M=2-16 QMV batched, M=17-64 Steel Split-K, M>=128 NAX"
-    );
+    println!("Dispatch paths: M=1 QMV fast, M=2-16 QMV batched, M=17-64 Steel Split-K, M>=128 NAX");
     println!("MLX reference: M3 Ultra 80-core, mlx-lm 0.24, group_size=64, f16");
     println!();
 
