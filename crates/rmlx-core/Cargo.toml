@@ -83,5 +83,9 @@ name = "qmm_lowm_mlx_bench"
 harness = false
 
 [[bench]]
+name = "qmv_vs_steelsk_bench"
+harness = false
+
+[[bench]]
 name = "skinny_diagnostic_bench"
 harness = false

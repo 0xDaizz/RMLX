@@ -431,7 +431,7 @@ kernel void affine_qmv_fast_q4(
     float xsum;
 
     for (int k = 0; k < in_features; k += QMV_Q4_BLOCK_SIZE) {
-        // --- load_vector: raw x values (no pre-division) ---
+        // --- load_vector: pre-divide for uint16 mask-only qdot ---
         xsum = 0.0f;
 
         for (int i = 0; i < QMV_Q4_VALUES_PER_THREAD; i += 4) {
@@ -441,36 +441,24 @@ kernel void affine_qmv_fast_q4(
             float v3 = x[i + 3];
             xsum += v0 + v1 + v2 + v3;
             x_thread[i]     = v0;
-            x_thread[i + 1] = v1;
-            x_thread[i + 2] = v2;
-            x_thread[i + 3] = v3;
+            x_thread[i + 1] = v1 / 16.0f;
+            x_thread[i + 2] = v2 / 256.0f;
+            x_thread[i + 3] = v3 / 4096.0f;
         }
 
-        // --- qdot: uint32 loads + shift extraction, fully unrolled ---
+        // --- qdot: uint16 mask-only pattern (no shifts) ---
         for (int row = 0; row < QMV_Q4_RESULTS_PER_SG; row++) {
-            device const uint32_t* wp = (device const uint32_t*)(ws + row * in_vec_size_w * 4);
+            device const uint16_t* wq = (device const uint16_t*)(ws + row * in_vec_size_w * 4);
             float s = sl[row * in_vec_size_g];
             float b = bl[row * in_vec_size_g];
 
-            uint w0 = wp[0];
-            uint w1 = wp[1];
-            float accum =
-                x_thread[0]  * float( w0        & 0xfu)
-              + x_thread[1]  * float((w0 >>  4) & 0xfu)
-              + x_thread[2]  * float((w0 >>  8) & 0xfu)
-              + x_thread[3]  * float((w0 >> 12) & 0xfu)
-              + x_thread[4]  * float((w0 >> 16) & 0xfu)
-              + x_thread[5]  * float((w0 >> 20) & 0xfu)
-              + x_thread[6]  * float((w0 >> 24) & 0xfu)
-              + x_thread[7]  * float( w0 >> 28)
-              + x_thread[8]  * float( w1        & 0xfu)
-              + x_thread[9]  * float((w1 >>  4) & 0xfu)
-              + x_thread[10] * float((w1 >>  8) & 0xfu)
-              + x_thread[11] * float((w1 >> 12) & 0xfu)
-              + x_thread[12] * float((w1 >> 16) & 0xfu)
-              + x_thread[13] * float((w1 >> 20) & 0xfu)
-              + x_thread[14] * float((w1 >> 24) & 0xfu)
-              + x_thread[15] * float( w1 >> 28);
+            float accum = 0.0f;
+            for (int i = 0; i < (QMV_Q4_VALUES_PER_THREAD / 4); i++) {
+                accum += (x_thread[4 * i]     * float(wq[i] & 0x000fu) +
+                          x_thread[4 * i + 1] * float(wq[i] & 0x00f0u) +
+                          x_thread[4 * i + 2] * float(wq[i] & 0x0f00u) +
+                          x_thread[4 * i + 3] * float(wq[i] & 0xf000u));
+            }
             result[row] += s * accum + xsum * b;
         }
 
@@ -549,7 +537,7 @@ kernel void affine_qmv_batched_q4(
     float xsum;
 
     for (int k = 0; k < in_features; k += QMV_Q4_BLOCK_SIZE) {
-        // --- load_vector: raw x values (no pre-division) ---
+        // --- load_vector: pre-divide for uint16 mask-only qdot ---
         xsum = 0.0f;
 
         for (int i = 0; i < QMV_Q4_VALUES_PER_THREAD; i += 4) {
@@ -559,36 +547,24 @@ kernel void affine_qmv_batched_q4(
             float v3 = x[i + 3];
             xsum += v0 + v1 + v2 + v3;
             x_thread[i]     = v0;
-            x_thread[i + 1] = v1;
-            x_thread[i + 2] = v2;
-            x_thread[i + 3] = v3;
+            x_thread[i + 1] = v1 / 16.0f;
+            x_thread[i + 2] = v2 / 256.0f;
+            x_thread[i + 3] = v3 / 4096.0f;
         }
 
-        // --- qdot: uint32 loads + shift extraction, fully unrolled ---
+        // --- qdot: uint16 mask-only pattern (no shifts) ---
         for (int row = 0; row < QMV_Q4_RESULTS_PER_SG; row++) {
-            device const uint32_t* wp = (device const uint32_t*)(ws + row * in_vec_size_w * 4);
+            device const uint16_t* wq = (device const uint16_t*)(ws + row * in_vec_size_w * 4);
             float s = sl[row * in_vec_size_g];
             float b = bl[row * in_vec_size_g];
 
-            uint w0 = wp[0];
-            uint w1 = wp[1];
-            float accum =
-                x_thread[0]  * float( w0        & 0xfu)
-              + x_thread[1]  * float((w0 >>  4) & 0xfu)
-              + x_thread[2]  * float((w0 >>  8) & 0xfu)
-              + x_thread[3]  * float((w0 >> 12) & 0xfu)
-              + x_thread[4]  * float((w0 >> 16) & 0xfu)
-              + x_thread[5]  * float((w0 >> 20) & 0xfu)
-              + x_thread[6]  * float((w0 >> 24) & 0xfu)
-              + x_thread[7]  * float( w0 >> 28)
-              + x_thread[8]  * float( w1        & 0xfu)
-              + x_thread[9]  * float((w1 >>  4) & 0xfu)
-              + x_thread[10] * float((w1 >>  8) & 0xfu)
-              + x_thread[11] * float((w1 >> 12) & 0xfu)
-              + x_thread[12] * float((w1 >> 16) & 0xfu)
-              + x_thread[13] * float((w1 >> 20) & 0xfu)
-              + x_thread[14] * float((w1 >> 24) & 0xfu)
-              + x_thread[15] * float( w1 >> 28);
+            float accum = 0.0f;
+            for (int i = 0; i < (QMV_Q4_VALUES_PER_THREAD / 4); i++) {
+                accum += (x_thread[4 * i]     * float(wq[i] & 0x000fu) +
+                          x_thread[4 * i + 1] * float(wq[i] & 0x00f0u) +
+                          x_thread[4 * i + 2] * float(wq[i] & 0x0f00u) +
+                          x_thread[4 * i + 3] * float(wq[i] & 0xf000u));
+            }
             result[row] += s * accum + xsum * b;
         }
 
@@ -799,8 +775,8 @@ kernel void gptq_dequant_f32(
 // Optimizations vs baseline:
 //   1. Bounds check removed from inner K-loop (fast path assumes N%8==0)
 //   2. x_thread / xsum hoisted outside K-loop for register reuse
-//   3. qdot uses uint32 loads + shift extraction (2 loads vs 4 uint16 loads)
-//      with full unroll — no pre-division trick needed
+//   3. qdot uses uint16 mask-only pattern with pre-divided x values
+//      (MLX pre-division trick: eliminates all shifts in inner loop)
 // -----------------------------------------------------------------------
 
 kernel void affine_qmv_fast_f16_q4(
@@ -843,7 +819,7 @@ kernel void affine_qmv_fast_f16_q4(
     float xsum;
 
     for (int k = 0; k < in_features; k += QMV_Q4_BLOCK_SIZE) {
-        // --- load_vector: half4 vectorized load, raw values (no pre-division) ---
+        // --- load_vector: half4 vectorized load, pre-divide for uint16 mask-only qdot ---
         xsum = 0.0f;
 
         for (int i = 0; i < QMV_Q4_VALUES_PER_THREAD; i += 4) {
@@ -854,38 +830,24 @@ kernel void affine_qmv_fast_f16_q4(
             float v3 = float(xh.w);
             xsum += v0 + v1 + v2 + v3;
             x_thread[i]     = v0;
-            x_thread[i + 1] = v1;
-            x_thread[i + 2] = v2;
-            x_thread[i + 3] = v3;
+            x_thread[i + 1] = v1 / 16.0f;
+            x_thread[i + 2] = v2 / 256.0f;
+            x_thread[i + 3] = v3 / 4096.0f;
         }
 
-        // --- qdot for each output row (no bounds check — fast path) ---
-        // Each thread holds 2 packed uint32 = 16 nibbles = 16 Q4 values.
-        // Load as 2x uint32, extract nibbles via shift+mask, fully unrolled.
+        // --- qdot: uint16 mask-only pattern (no shifts) ---
         for (int row = 0; row < QMV_Q4_RESULTS_PER_SG; row++) {
-            device const uint32_t* wp = (device const uint32_t*)(ws + row * in_vec_size_w * 4);
+            device const uint16_t* wq = (device const uint16_t*)(ws + row * in_vec_size_w * 4);
             float s = sl[row * in_vec_size_g];
             float b = bl[row * in_vec_size_g];
 
-            uint w0 = wp[0];
-            uint w1 = wp[1];
-            float accum =
-                x_thread[0]  * float( w0        & 0xfu)
-              + x_thread[1]  * float((w0 >>  4) & 0xfu)
-              + x_thread[2]  * float((w0 >>  8) & 0xfu)
-              + x_thread[3]  * float((w0 >> 12) & 0xfu)
-              + x_thread[4]  * float((w0 >> 16) & 0xfu)
-              + x_thread[5]  * float((w0 >> 20) & 0xfu)
-              + x_thread[6]  * float((w0 >> 24) & 0xfu)
-              + x_thread[7]  * float( w0 >> 28)
-              + x_thread[8]  * float( w1        & 0xfu)
-              + x_thread[9]  * float((w1 >>  4) & 0xfu)
-              + x_thread[10] * float((w1 >>  8) & 0xfu)
-              + x_thread[11] * float((w1 >> 12) & 0xfu)
-              + x_thread[12] * float((w1 >> 16) & 0xfu)
-              + x_thread[13] * float((w1 >> 20) & 0xfu)
-              + x_thread[14] * float((w1 >> 24) & 0xfu)
-              + x_thread[15] * float( w1 >> 28);
+            float accum = 0.0f;
+            for (int i = 0; i < (QMV_Q4_VALUES_PER_THREAD / 4); i++) {
+                accum += (x_thread[4 * i]     * float(wq[i] & 0x000fu) +
+                          x_thread[4 * i + 1] * float(wq[i] & 0x00f0u) +
+                          x_thread[4 * i + 2] * float(wq[i] & 0x0f00u) +
+                          x_thread[4 * i + 3] * float(wq[i] & 0xf000u));
+            }
             result[row] += s * accum + xsum * b;
         }
 
@@ -954,6 +916,7 @@ kernel void affine_qmv_batched_f16_q4(
     float xsum;
 
     for (int k = 0; k < in_features; k += QMV_Q4_BLOCK_SIZE) {
+        // --- load_vector: half4 vectorized load, pre-divide for uint16 mask-only qdot ---
         xsum = 0.0f;
 
         for (int i = 0; i < QMV_Q4_VALUES_PER_THREAD; i += 4) {
@@ -964,35 +927,24 @@ kernel void affine_qmv_batched_f16_q4(
             float v3 = float(xh.w);
             xsum += v0 + v1 + v2 + v3;
             x_thread[i]     = v0;
-            x_thread[i + 1] = v1;
-            x_thread[i + 2] = v2;
-            x_thread[i + 3] = v3;
+            x_thread[i + 1] = v1 / 16.0f;
+            x_thread[i + 2] = v2 / 256.0f;
+            x_thread[i + 3] = v3 / 4096.0f;
         }
 
+        // --- qdot: uint16 mask-only pattern (no shifts) ---
         for (int row = 0; row < QMV_Q4_RESULTS_PER_SG; row++) {
-            device const uint32_t* wp = (device const uint32_t*)(ws + row * in_vec_size_w * 4);
+            device const uint16_t* wq = (device const uint16_t*)(ws + row * in_vec_size_w * 4);
             float s = sl[row * in_vec_size_g];
             float b = bl[row * in_vec_size_g];
 
-            uint w0 = wp[0];
-            uint w1 = wp[1];
-            float accum =
-                x_thread[0]  * float( w0        & 0xfu)
-              + x_thread[1]  * float((w0 >>  4) & 0xfu)
-              + x_thread[2]  * float((w0 >>  8) & 0xfu)
-              + x_thread[3]  * float((w0 >> 12) & 0xfu)
-              + x_thread[4]  * float((w0 >> 16) & 0xfu)
-              + x_thread[5]  * float((w0 >> 20) & 0xfu)
-              + x_thread[6]  * float((w0 >> 24) & 0xfu)
-              + x_thread[7]  * float( w0 >> 28)
-              + x_thread[8]  * float( w1        & 0xfu)
-              + x_thread[9]  * float((w1 >>  4) & 0xfu)
-              + x_thread[10] * float((w1 >>  8) & 0xfu)
-              + x_thread[11] * float((w1 >> 12) & 0xfu)
-              + x_thread[12] * float((w1 >> 16) & 0xfu)
-              + x_thread[13] * float((w1 >> 20) & 0xfu)
-              + x_thread[14] * float((w1 >> 24) & 0xfu)
-              + x_thread[15] * float( w1 >> 28);
+            float accum = 0.0f;
+            for (int i = 0; i < (QMV_Q4_VALUES_PER_THREAD / 4); i++) {
+                accum += (x_thread[4 * i]     * float(wq[i] & 0x000fu) +
+                          x_thread[4 * i + 1] * float(wq[i] & 0x00f0u) +
+                          x_thread[4 * i + 2] * float(wq[i] & 0x0f00u) +
+                          x_thread[4 * i + 3] * float(wq[i] & 0xf000u));
+            }
             result[row] += s * accum + xsum * b;
         }
 
@@ -1082,6 +1034,7 @@ kernel void affine_qmv_batched_splitk_f16_q4(
     float xsum;
 
     for (int k = k_start; k < k_end; k += QMV_Q4_BLOCK_SIZE) {
+        // --- load_vector: half4 vectorized load, pre-divide for uint16 mask-only qdot ---
         xsum = 0.0f;
 
         for (int i = 0; i < QMV_Q4_VALUES_PER_THREAD; i += 4) {
@@ -1092,35 +1045,24 @@ kernel void affine_qmv_batched_splitk_f16_q4(
             float v3 = float(xh.w);
             xsum += v0 + v1 + v2 + v3;
             x_thread[i]     = v0;
-            x_thread[i + 1] = v1;
-            x_thread[i + 2] = v2;
-            x_thread[i + 3] = v3;
+            x_thread[i + 1] = v1 / 16.0f;
+            x_thread[i + 2] = v2 / 256.0f;
+            x_thread[i + 3] = v3 / 4096.0f;
         }
 
+        // --- qdot: uint16 mask-only pattern (no shifts) ---
         for (int row = 0; row < QMV_Q4_RESULTS_PER_SG; row++) {
-            device const uint32_t* wp = (device const uint32_t*)(ws + row * in_vec_size_w * 4);
+            device const uint16_t* wq = (device const uint16_t*)(ws + row * in_vec_size_w * 4);
             float s = sl[row * in_vec_size_g];
             float b = bl[row * in_vec_size_g];
 
-            uint w0 = wp[0];
-            uint w1 = wp[1];
-            float accum =
-                x_thread[0]  * float( w0        & 0xfu)
-              + x_thread[1]  * float((w0 >>  4) & 0xfu)
-              + x_thread[2]  * float((w0 >>  8) & 0xfu)
-              + x_thread[3]  * float((w0 >> 12) & 0xfu)
-              + x_thread[4]  * float((w0 >> 16) & 0xfu)
-              + x_thread[5]  * float((w0 >> 20) & 0xfu)
-              + x_thread[6]  * float((w0 >> 24) & 0xfu)
-              + x_thread[7]  * float( w0 >> 28)
-              + x_thread[8]  * float( w1        & 0xfu)
-              + x_thread[9]  * float((w1 >>  4) & 0xfu)
-              + x_thread[10] * float((w1 >>  8) & 0xfu)
-              + x_thread[11] * float((w1 >> 12) & 0xfu)
-              + x_thread[12] * float((w1 >> 16) & 0xfu)
-              + x_thread[13] * float((w1 >> 20) & 0xfu)
-              + x_thread[14] * float((w1 >> 24) & 0xfu)
-              + x_thread[15] * float( w1 >> 28);
+            float accum = 0.0f;
+            for (int i = 0; i < (QMV_Q4_VALUES_PER_THREAD / 4); i++) {
+                accum += (x_thread[4 * i]     * float(wq[i] & 0x000fu) +
+                          x_thread[4 * i + 1] * float(wq[i] & 0x00f0u) +
+                          x_thread[4 * i + 2] * float(wq[i] & 0x0f00u) +
+                          x_thread[4 * i + 3] * float(wq[i] & 0xf000u));
+            }
             result[row] += s * accum + xsum * b;
         }
 
@@ -1217,35 +1159,24 @@ kernel void affine_qmv_splitk_f16_q4(
             float v3 = float(xh.w);
             xsum += v0 + v1 + v2 + v3;
             x_thread[i]     = v0;
-            x_thread[i + 1] = v1;
-            x_thread[i + 2] = v2;
-            x_thread[i + 3] = v3;
+            x_thread[i + 1] = v1 / 16.0f;
+            x_thread[i + 2] = v2 / 256.0f;
+            x_thread[i + 3] = v3 / 4096.0f;
         }
 
+        // --- qdot: uint16 mask-only pattern (no shifts) ---
         for (int row = 0; row < QMV_Q4_RESULTS_PER_SG; row++) {
-            device const uint32_t* wp = (device const uint32_t*)(ws + row * in_vec_size_w * 4);
+            device const uint16_t* wq = (device const uint16_t*)(ws + row * in_vec_size_w * 4);
             float s = sl[row * in_vec_size_g];
             float b = bl[row * in_vec_size_g];
 
-            uint w0 = wp[0];
-            uint w1 = wp[1];
-            float accum =
-                x_thread[0]  * float( w0        & 0xfu)
-              + x_thread[1]  * float((w0 >>  4) & 0xfu)
-              + x_thread[2]  * float((w0 >>  8) & 0xfu)
-              + x_thread[3]  * float((w0 >> 12) & 0xfu)
-              + x_thread[4]  * float((w0 >> 16) & 0xfu)
-              + x_thread[5]  * float((w0 >> 20) & 0xfu)
-              + x_thread[6]  * float((w0 >> 24) & 0xfu)
-              + x_thread[7]  * float( w0 >> 28)
-              + x_thread[8]  * float( w1        & 0xfu)
-              + x_thread[9]  * float((w1 >>  4) & 0xfu)
-              + x_thread[10] * float((w1 >>  8) & 0xfu)
-              + x_thread[11] * float((w1 >> 12) & 0xfu)
-              + x_thread[12] * float((w1 >> 16) & 0xfu)
-              + x_thread[13] * float((w1 >> 20) & 0xfu)
-              + x_thread[14] * float((w1 >> 24) & 0xfu)
-              + x_thread[15] * float( w1 >> 28);
+            float accum = 0.0f;
+            for (int i = 0; i < (QMV_Q4_VALUES_PER_THREAD / 4); i++) {
+                accum += (x_thread[4 * i]     * float(wq[i] & 0x000fu) +
+                          x_thread[4 * i + 1] * float(wq[i] & 0x00f0u) +
+                          x_thread[4 * i + 2] * float(wq[i] & 0x0f00u) +
+                          x_thread[4 * i + 3] * float(wq[i] & 0xf000u));
+            }
             result[row] += s * accum + xsum * b;
         }
 
