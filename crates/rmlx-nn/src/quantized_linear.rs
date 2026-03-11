@@ -198,6 +198,8 @@ impl QuantizedLinear {
     }
 
     /// Build a `QuantizedWeight` by uploading CPU buffers to Metal.
+    ///
+    /// Converts f32 scales/biases to f16 at upload time (one-time cost).
     fn make_quantized_weight(&self, dev: &metal::Device) -> Result<QuantizedWeight, KernelError> {
         let opts = metal::MTLResourceOptions::StorageModeShared;
 
@@ -206,14 +208,27 @@ impl QuantizedLinear {
             self.w_packed.len() as u64,
             opts,
         );
+
+        // Convert f32 scales to f16 at upload time (industry standard format)
+        let scales_f16: Vec<u16> = self
+            .scales
+            .iter()
+            .map(|&v| quantized::f32_to_f16_bits(v))
+            .collect();
         let scales_buf = dev.new_buffer_with_data(
-            self.scales.as_ptr() as *const _,
-            (self.scales.len() * std::mem::size_of::<f32>()) as u64,
+            scales_f16.as_ptr() as *const _,
+            (scales_f16.len() * 2) as u64,
             opts,
         );
+
+        let biases_f16: Vec<u16> = self
+            .biases
+            .iter()
+            .map(|&v| quantized::f32_to_f16_bits(v))
+            .collect();
         let biases_buf = dev.new_buffer_with_data(
-            self.biases.as_ptr() as *const _,
-            (self.biases.len() * std::mem::size_of::<f32>()) as u64,
+            biases_f16.as_ptr() as *const _,
+            (biases_f16.len() * 2) as u64,
             opts,
         );
 

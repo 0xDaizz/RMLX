@@ -182,7 +182,7 @@ pub fn register_all(registry: &KernelRegistry) -> Result<(), KernelError> {
 | `reduce` | Sum, Max, Argmax, Row_sum | Reduction operations |
 | `softmax` | Softmax | Attention score normalization with N_READS-coalesced `float4` loads in the looped variant |
 | `topk_route` | MoE Top-K Route | Fused softmax -> top-k -> normalize -> histogram -> prefix-scan routing on GPU |
-| `rms_norm` | RMS Normalization | LLaMA-style normalization with `_into_encoder()` dispatch support |
+| `rms_norm` | RMS Normalization | RMS normalization with `_into_encoder()` dispatch support |
 | `rope` | RoPE | Rotary Position Embedding with `rope_ext_into_encoder()` dispatch support |
 | `gemv` | GEMV, GEMV+Bias | Matrix-vector product with BM=8 variant, dynamic tile selection, and `_into_encoder()` / fused bias dispatch paths |
 | `matmul` | GEMM | General matrix multiplication with MLX-architecture kernel (Phase D2: BK=16, 2 SG, 64 threads, 4xhalf4 wide loads, serpentine MMA — **23.82T TFLOPS**, MLX -0.6%), `TileVariant::Simd` SIMD group MMA path, threadgroup swizzle, `matmul_into_cb` for single-CB prefill pipeline, and **GEMM+residual epilogue fusion** (Phase H-2: function constant 202 `has_residual`, residual buffer at `[[buffer(10)]]`, 5-12% for large N) |

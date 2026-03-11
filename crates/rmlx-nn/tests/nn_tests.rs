@@ -65,21 +65,6 @@ fn test_moe_layer() {
 }
 
 #[test]
-fn test_llama_7b_config() {
-    let cfg = llama::llama_7b();
-    assert_eq!(cfg.hidden_size, 4096);
-    assert_eq!(cfg.num_layers, 32);
-    assert!(matches!(cfg.ff_type, FeedForwardType::Gated { .. }));
-}
-
-#[test]
-fn test_llama_3_8b_gqa() {
-    let cfg = llama::llama_3_8b();
-    assert_eq!(cfg.num_kv_heads, 8); // GQA
-    assert!(cfg.num_kv_heads < cfg.num_heads);
-}
-
-#[test]
 fn test_deepseek_v3_moe() {
     let cfg = deepseek::deepseek_v3();
     match &cfg.ff_type {
@@ -105,10 +90,10 @@ fn test_mixtral_moe() {
 
 #[test]
 fn test_transformer_model() {
-    let cfg = llama::llama_7b();
+    let cfg = qwen::qwen2_7b();
     let model = TransformerModel::new(cfg).expect("TransformerModel::new failed");
-    assert_eq!(model.num_layers(), 32);
-    assert_eq!(model.config().hidden_size, 4096);
+    assert_eq!(model.num_layers(), 28);
+    assert_eq!(model.config().hidden_size, 3584);
 }
 
 #[test]

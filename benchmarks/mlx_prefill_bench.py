@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """MLX single transformer layer PREFILL latency benchmark.
 
-Measures raw-op latency for a Llama-3 8B single transformer layer in prefill mode
-(seq_len > 1) for direct comparison with RMLX prefill benchmarks.
+Measures raw-op latency for a Qwen 3.5 MoE expert single transformer layer in
+prefill mode (seq_len > 1) for direct comparison with RMLX prefill benchmarks.
 
 Uses mlx.nn modules (Linear, RMSNorm, RoPE) to match the exact computation
 performed by rmlx-nn's TransformerBlock::forward().
@@ -21,15 +21,15 @@ import mlx.nn as nn
 
 
 # ---------------------------------------------------------------------------
-# Llama-3 8B config
+# Qwen 3.5 MoE expert config
 # ---------------------------------------------------------------------------
 CONFIG = {
-    "hidden_size": 4096,
-    "num_heads": 32,
-    "num_kv_heads": 8,
+    "hidden_size": 3584,
+    "num_heads": 28,
+    "num_kv_heads": 4,
     "head_dim": 128,
-    "intermediate_size": 14336,
-    "rope_theta": 10000.0,
+    "intermediate_size": 2560,
+    "rope_theta": 1000000.0,
     "rms_norm_eps": 1e-5,
 }
 
@@ -42,8 +42,8 @@ ITERS = 20
 # Model components
 # ---------------------------------------------------------------------------
 
-class LlamaAttention(nn.Module):
-    """Llama-3 8B GQA attention with RoPE."""
+class MoEAttention(nn.Module):
+    """Qwen 3.5 MoE GQA attention with RoPE."""
 
     def __init__(self, config):
         super().__init__()
@@ -75,8 +75,8 @@ class LlamaAttention(nn.Module):
         return self.o_proj(output)
 
 
-class LlamaFFN(nn.Module):
-    """Llama-3 8B SwiGLU FFN."""
+class MoEFFN(nn.Module):
+    """Qwen 3.5 MoE expert SwiGLU FFN."""
 
     def __init__(self, config):
         super().__init__()
@@ -88,13 +88,13 @@ class LlamaFFN(nn.Module):
         return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
-class LlamaTransformerBlock(nn.Module):
-    """Single Llama-3 8B transformer layer (pre-norm, SwiGLU, GQA+RoPE)."""
+class MoETransformerBlock(nn.Module):
+    """Single Qwen 3.5 MoE expert transformer layer (pre-norm, SwiGLU, GQA+RoPE)."""
 
     def __init__(self, config):
         super().__init__()
-        self.attention = LlamaAttention(config)
-        self.ffn = LlamaFFN(config)
+        self.attention = MoEAttention(config)
+        self.ffn = MoEFFN(config)
         self.input_layernorm = nn.RMSNorm(config["hidden_size"], eps=config["rms_norm_eps"])
         self.post_attention_layernorm = nn.RMSNorm(config["hidden_size"], eps=config["rms_norm_eps"])
 
@@ -195,7 +195,7 @@ def bench_prefill(block, config, seq_len, warmup, iters):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="MLX single-layer prefill latency benchmark (Llama-3 8B config)"
+        description="MLX single-layer prefill latency benchmark (Qwen 3.5 MoE expert config)"
     )
     parser.add_argument("--warmup", type=int, default=WARMUP,
                         help=f"Warmup iterations (default {WARMUP})")
@@ -215,7 +215,7 @@ def main():
 
     # Header
     print("=" * 88)
-    print("MLX Single-Layer Prefill Benchmark (Llama-3 8B config)")
+    print("MLX Single-Layer Prefill Benchmark (Qwen 3.5 MoE expert config)")
     print("=" * 88)
     print(f"  mlx version   : {mx.__version__}")
     print(f"  device        : {mx.default_device()}")
@@ -236,7 +236,7 @@ def main():
     print("=" * 88)
 
     # Build model
-    block = LlamaTransformerBlock(CONFIG)
+    block = MoETransformerBlock(CONFIG)
 
     # Cast all weights to float16
     block.update(block.apply(lambda x: x.astype(mx.float16)))

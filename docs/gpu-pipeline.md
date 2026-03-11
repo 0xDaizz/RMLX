@@ -32,7 +32,7 @@ In a naive Metal execution model, each GPU operation (matmul, RoPE, softmax, add
 6. Commit the command buffer
 7. **CPU-GPU synchronization barrier** (wait for completion)
 
-A single transformer layer in a LLaMA-style model executes approximately 65 individual operations. Each operation incurs CPU-side overhead for command buffer creation, encoder setup, and a CPU-GPU synchronization point. At 65 command buffers per layer, the CPU spends more time managing GPU work than the GPU spends executing it.
+A single transformer layer in a dense or MoE transformer model executes approximately 65 individual operations. Each operation incurs CPU-side overhead for command buffer creation, encoder setup, and a CPU-GPU synchronization point. At 65 command buffers per layer, the CPU spends more time managing GPU work than the GPU spends executing it.
 
 ```
 Baseline: 65 CBs/layer x N layers
@@ -150,7 +150,7 @@ This represents a **92.3% reduction** in command buffer count (65 → 5) and a *
 
 ## Benchmark Results
 
-Benchmarks measured on a single transformer layer (LLaMA-style architecture, 4096 hidden, M3 Ultra):
+Benchmarks measured on a single transformer layer (4096 hidden, M3 Ultra):
 
 ### Baseline (per-op command buffers)
 
@@ -376,7 +376,7 @@ Phase A extends the GPU pipeline to prefill workloads (seq_len > 1), where the b
 
 ### Benchmark Results
 
-Benchmarks measured on a single transformer layer (Llama-style architecture, f16, M3 Ultra):
+Benchmarks measured on a single transformer layer (f16, M3 Ultra):
 
 | Metric | Baseline | Phase A | Improvement |
 |--------|----------|---------|-------------|

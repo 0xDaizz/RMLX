@@ -117,29 +117,31 @@ fn make_quantized_weight(
     let weights_buf =
         device.new_buffer_with_data(w_data.as_ptr() as *const _, (num_u32s * 4) as u64, opts);
 
-    // Scales and biases (f32, one per group)
+    // Scales and biases as f16 (native QuantizedWeight format)
     let num_groups = total_elements / group_size as usize;
-    let scales_data: Vec<f32> = (0..num_groups)
+    let scales_data: Vec<u16> = (0..num_groups)
         .map(|_| {
             let v = lcg_next(&mut state);
-            ((v >> 33) as f64 / (1u64 << 31) as f64) as f32 * 0.02 + 0.001
+            let val = ((v >> 33) as f64 / (1u64 << 31) as f64) as f32 * 0.02 + 0.001;
+            f16::from_f32(val).to_bits()
         })
         .collect();
-    let biases_data: Vec<f32> = (0..num_groups)
+    let biases_data: Vec<u16> = (0..num_groups)
         .map(|_| {
             let v = lcg_next(&mut state);
-            ((v >> 33) as f64 / (1u64 << 31) as f64 - 0.5) as f32 * 0.01
+            let val = ((v >> 33) as f64 / (1u64 << 31) as f64 - 0.5) as f32 * 0.01;
+            f16::from_f32(val).to_bits()
         })
         .collect();
 
     let scales_buf = device.new_buffer_with_data(
         scales_data.as_ptr() as *const _,
-        (num_groups * 4) as u64,
+        (num_groups * 2) as u64,
         opts,
     );
     let biases_buf = device.new_buffer_with_data(
         biases_data.as_ptr() as *const _,
-        (num_groups * 4) as u64,
+        (num_groups * 2) as u64,
         opts,
     );
 
@@ -169,75 +171,7 @@ fn rand_f16_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
     Array::from_bytes(device, &f16_bytes, shape.to_vec(), DType::Float16)
 }
 
-/// Create a QuantizedWeight with f16 scales and biases (required by NAX kernel).
-///
-/// The NAX Metal shader reads `device const half* scales` and `device const half* biases`,
-/// so the buffers must contain f16 data. We construct the struct directly (all fields are pub)
-/// to bypass QuantizedWeight::new() which validates for f32-sized buffers.
-fn make_quantized_weight_f16(
-    device: &metal::Device,
-    out_features: usize,
-    in_features: usize,
-    bits: u32,
-    group_size: u32,
-    seed: u64,
-) -> QuantizedWeight {
-    let mut state = seed;
-    let opts = metal::MTLResourceOptions::StorageModeShared;
-
-    // Packed weights buffer (same as f32 version)
-    let elems_per_u32 = 32 / bits as usize;
-    let total_elements = out_features * in_features;
-    let num_u32s = total_elements.div_ceil(elems_per_u32);
-    let w_data: Vec<u32> = (0..num_u32s)
-        .map(|_| {
-            let v = lcg_next(&mut state);
-            v as u32
-        })
-        .collect();
-    let weights_buf =
-        device.new_buffer_with_data(w_data.as_ptr() as *const _, (num_u32s * 4) as u64, opts);
-
-    // Scales and biases as f16, one per group
-    let num_groups = total_elements / group_size as usize;
-    let scales_data: Vec<u16> = (0..num_groups)
-        .map(|_| {
-            let v = lcg_next(&mut state);
-            let val = ((v >> 33) as f64 / (1u64 << 31) as f64) as f32 * 0.02 + 0.001;
-            f16::from_f32(val).to_bits()
-        })
-        .collect();
-    let biases_data: Vec<u16> = (0..num_groups)
-        .map(|_| {
-            let v = lcg_next(&mut state);
-            let val = ((v >> 33) as f64 / (1u64 << 31) as f64 - 0.5) as f32 * 0.01;
-            f16::from_f32(val).to_bits()
-        })
-        .collect();
-
-    let scales_buf = device.new_buffer_with_data(
-        scales_data.as_ptr() as *const _,
-        (num_groups * 2) as u64, // f16 = 2 bytes
-        opts,
-    );
-    let biases_buf = device.new_buffer_with_data(
-        biases_data.as_ptr() as *const _,
-        (num_groups * 2) as u64,
-        opts,
-    );
-
-    // Construct directly — QuantizedWeight::new() validates for f32 buffer sizes,
-    // but NAX requires f16 scales/biases.
-    QuantizedWeight {
-        weights_buf,
-        scales_buf,
-        biases_buf,
-        group_size,
-        bits,
-        out_features,
-        in_features,
-    }
-}
+// make_quantized_weight_f16 removed — make_quantized_weight now natively creates f16 scales/biases.
 
 // ---------------------------------------------------------------------------
 // TFLOPS calculation
@@ -502,7 +436,7 @@ fn bench_qmm_nax(
     group_size: u32,
     label: &str,
 ) {
-    let qw = make_quantized_weight_f16(device, n, k, 4, group_size, 42);
+    let qw = make_quantized_weight(device, n, k, 4, group_size, 42);
     let x_f16 = rand_f16_array(device, &[m, k], 99);
 
     // Warmup
@@ -581,7 +515,7 @@ fn bench_qmm_nax_vs_mma(
     let v2_stats = Stats::from_durations(&v2_times);
 
     // --- NAX (f16 scales, group_size_nax) ---
-    let qw_nax = make_quantized_weight_f16(device, n, k, 4, group_size_nax, 42);
+    let qw_nax = make_quantized_weight(device, n, k, 4, group_size_nax, 42);
     let x_f16 = rand_f16_array(device, &[m, k], 99);
 
     for _ in 0..WARMUP_ITERS {
@@ -809,7 +743,7 @@ fn main() {
     // =========================================================================
     // 7. QMM MMA v1 vs Steel v2 vs NAX Head-to-Head — Q4 only
     //    Compares all three kernels at each (M,N,K) configuration.
-    //    Note: v1/v2 use group_size=32 (f32 scales), NAX uses group_size=64 (f16 scales).
+    //    Note: v1/v2 use group_size=32, NAX uses group_size=64. All use native f16 scales.
     // =========================================================================
     println!("=== QMM v1 vs v2 (Steel) vs NAX Head-to-Head (Q4 only) ===");
     println!();

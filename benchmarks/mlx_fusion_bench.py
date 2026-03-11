@@ -5,7 +5,7 @@ Measures the same operations as RMLX fusion_bench.rs:
   - RMSNorm + matmul (MLX lazy eval fuses internally)
   - Matmul only (for overhead isolation)
 
-Parameters match LLaMA-3 8B: M=1/32/512, K=4096, N=4096/14336.
+Parameters match Qwen 3.5 MoE expert: M=1/32/512, K=3584, N=3584/2560.
 
 Outputs results to stdout (human-readable) AND writes a JSON file
 for consumption by RMLX fusion_bench.rs via MLX_FUSION_REF env var.
@@ -67,8 +67,8 @@ def main():
     print("=" * 90)
 
     scenarios = [
-        ("LLaMA-3 attn proj", 4096, 4096),
-        ("LLaMA-3 FFN up/gate", 4096, 14336),
+        ("Qwen3.5-MoE attn proj", 3584, 3584),
+        ("Qwen3.5-MoE FFN up/gate", 3584, 2560),
     ]
     m_values = [1, 32, 512]
     eps = 1e-5

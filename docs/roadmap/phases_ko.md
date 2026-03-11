@@ -16,7 +16,7 @@ rmlx 프로젝트의 구현 로드맵입니다. Phase 9B-opt 및 서빙 지원 P
 | 2B | Steel GEMM + 양자화 | Steel GEMM, quantized matmul, indexing | Phase 2A | ✅ 완료 |
 | 3 | Pipeline Overlap | MTLSharedEvent, dual-queue pipeline | Phase 2 | ✅ 완료 |
 | 4 | Expert Parallelism | EP dispatch/combine, 3-zone auto backend, sparse dispatch | Phase 1 + 3 | ✅ 완료 |
-| 5A | NN Inference Core | LLaMA, Qwen, DeepSeek, Mixtral | Phase 4 | ✅ 완료 |
+| 5A | NN Inference Core | Qwen, DeepSeek, Mixtral, Kimi | Phase 4 | ✅ 완료 |
 | 6 | Multi-Port | 듀얼 TB5 multi-port striping, multi-node topology | Phase 4 | ✅ 완료 |
 | 7A | Production Hardening | Hardening, observability | Phase 5A | ✅ 완료 |
 | 7B | VJP Autodiff | VJP autodiff + LoRA fine-tuning | Phase 7A | ✅ 완료 |
@@ -70,7 +70,7 @@ rmlx 프로젝트의 구현 로드맵입니다. Phase 9B-opt 및 서빙 지원 P
 | Phase 2B: Steel GEMM, quantized matmul, indexing | e4d9c14 | 43 tests | ✅ Complete |
 | Phase 3: SharedEvent sync + dual queue + layer pipeline | f9cadcf | 52 tests | ✅ Complete |
 | Phase 4: EP 3-Zone dispatch + MoE exchange | 6fb3296 | 62 tests | ✅ Complete |
-| Phase 5A: rmlx-nn inference core (LLaMA, Qwen, DeepSeek, Mixtral) | d126aaf | + nn tests | ✅ Complete |
+| Phase 5A: rmlx-nn inference core (Qwen, DeepSeek, Mixtral, Kimi) | d126aaf | + nn tests | ✅ Complete |
 | Phase 6: Dual TB5 multi-port striping + multi-node topology | 8c8b25f | + distributed tests | ✅ Complete |
 | Phase 7A: Production hardening / observability | 0fa70bb | 98 tests | ✅ Complete |
 | Phase 7B: VJP autodiff + LoRA fine-tuning | 025ed8f | 108 tests | ✅ Complete |
@@ -349,7 +349,7 @@ rmlx-nn 크레이트에 핵심 신경망 모듈을 구현합니다.
 
 **rmlx 프레임워크** (`~/rmlx/`):
 - `rmlx-nn`: Transformer 블록 (Linear, Attention, FFN, MoE)
-- `rmlx-nn`: 모델 아키텍처 (LLaMA, Qwen, DeepSeek-V3, Mixtral)
+- `rmlx-nn`: 모델 아키텍처 (Qwen 3.5, DeepSeek-V3, Mixtral, Kimi K2.5)
 
 ### 완료 조건 (DoD)
 
@@ -599,7 +599,7 @@ Track 1 추가 최적화:
 - **KO-2: 스크래치 할당자** -- 9-디스패치 경로 내 중간 버퍼를 위한 아레나 기반 스크래치 메모리
 - **KO-3: ICB 디코드 리플레이** -- 9-디스패치 디코드 경로에 Metal Indirect Command Buffer 캡처-리플레이
 
-### 벤치마크 결과 (M3 Ultra, f16, Llama-2 7B 형상)
+### 벤치마크 결과 (M3 Ultra, f16, MoE expert 형상)
 
 ```text
 베이스라인 (연산별 동기화):  109,215us  1x

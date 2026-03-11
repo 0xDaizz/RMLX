@@ -214,23 +214,17 @@ impl ChipTuning {
     pub fn batch_qmv_limit(&self, k: usize, n: usize) -> usize {
         let small_dims = k <= 2048 && n <= 2048;
         match self.arch_class {
-            ArchClass::Ultra => {
+            ArchClass::Ultra => 16,
+            ArchClass::Max => {
                 if small_dims {
-                    32
+                    24
                 } else {
                     16
                 }
             }
-            ArchClass::Max => {
-                if small_dims {
-                    18
-                } else {
-                    12
-                }
-            }
             ArchClass::Base | ArchClass::Phone => {
                 if small_dims {
-                    14
+                    16
                 } else {
                     8
                 }

@@ -16,7 +16,7 @@ RMLX reimplements Apple's [MLX](https://github.com/ml-explore/mlx) Metal GPU pip
 
 ## ⚡ Performance
 
-Single transformer layer decode (Llama-2 7B shapes, f16, M3 Ultra):
+Single transformer layer decode (MoE expert shapes, f16, M3 Ultra):
 
 | Path | Latency | Speedup |
 |------|--------:|--------:|
@@ -81,7 +81,7 @@ Single transformer layer decode (Llama-2 7B shapes, f16, M3 Ultra):
 <details>
 <summary><b>Neural network layers</b> — 4 model architectures, 16 activations, MoE, MLA</summary>
 
-- **Models**: Llama, Qwen2, DeepSeek-V3, Mixtral
+- **Models**: Qwen 3.5, DeepSeek-V3, Mixtral, Kimi K2.5
 - **Attention**: Multi-Head, GQA, MLA, Sliding Window
 - **KV cache**: static, rotating, paged (vLLM-style), quantized, slab decode
 - **Quantization**: QuantizedLinear, AWQ, GPTQ, K-quant

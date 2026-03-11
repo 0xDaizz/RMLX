@@ -229,27 +229,37 @@ fn make_quantized_weight(
         device.new_buffer_with_data(w_data.as_ptr() as *const _, (num_u32s * 4) as u64, opts);
 
     let num_groups = total_elements / group_size as usize;
-    let scales_data: Vec<f32> = (0..num_groups)
+    let scales_f32: Vec<f32> = (0..num_groups)
         .map(|_| {
             let v = lcg_next(&mut state);
             ((v >> 33) as f64 / (1u64 << 31) as f64) as f32 * 0.02 + 0.001
         })
         .collect();
-    let biases_data: Vec<f32> = (0..num_groups)
+    let biases_f32: Vec<f32> = (0..num_groups)
         .map(|_| {
             let v = lcg_next(&mut state);
             ((v >> 33) as f64 / (1u64 << 31) as f64 - 0.5) as f32 * 0.01
         })
         .collect();
 
+    // Convert to f16 (native QuantizedWeight format)
+    let scales_data: Vec<u16> = scales_f32
+        .iter()
+        .map(|&v| rmlx_core::ops::quantized::f32_to_f16_bits(v))
+        .collect();
+    let biases_data: Vec<u16> = biases_f32
+        .iter()
+        .map(|&v| rmlx_core::ops::quantized::f32_to_f16_bits(v))
+        .collect();
+
     let scales_buf = device.new_buffer_with_data(
         scales_data.as_ptr() as *const _,
-        (num_groups * 4) as u64,
+        (num_groups * 2) as u64,
         opts,
     );
     let biases_buf = device.new_buffer_with_data(
         biases_data.as_ptr() as *const _,
-        (num_groups * 4) as u64,
+        (num_groups * 2) as u64,
         opts,
     );
 

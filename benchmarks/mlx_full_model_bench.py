@@ -3,10 +3,10 @@
 MLX full-model forward benchmark — companion to RMLX model_bench.rs
 
 Loads a HuggingFace safetensors model with MLX and measures full
-32-layer forward latency for decode (seq_len=1) and prefill (seq_len=512).
+multi-layer forward latency for decode (seq_len=1) and prefill (seq_len=512).
 
 Usage:
-  python benchmarks/mlx_full_model_bench.py --model-dir ~/models/Meta-Llama-3-8B-Instruct
+  python benchmarks/mlx_full_model_bench.py --model-dir ~/models/<model-name>
 
 Output includes mean latency in microseconds that can be passed to
 RMLX model_bench via MLX_DECODE_US / MLX_PREFILL_US env vars.
@@ -94,7 +94,7 @@ class TransformerBlock(nn.Module):
         return x
 
 
-class LlamaModel(nn.Module):
+class TransformerModel(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.embed_tokens = nn.Embedding(config["vocab_size"], config["hidden_size"])
@@ -125,10 +125,10 @@ class LlamaModel(nn.Module):
         return self.norm(h)
 
 
-class LlamaForCausalLM(nn.Module):
+class CausalLM(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.model = LlamaModel(config)
+        self.model = TransformerModel(config)
         self.lm_head = nn.Linear(config["hidden_size"], config["vocab_size"], bias=False)
 
     def __call__(self, x, cache=None):
@@ -198,7 +198,7 @@ def main():
     # Load model weights from safetensors
     print(f"\nLoading weights from {model_dir}...")
     t0 = time.time()
-    model = LlamaForCausalLM(config)
+    model = CausalLM(config)
 
     # Find and load safetensors files
     st_files = sorted(model_dir.glob("*.safetensors"))

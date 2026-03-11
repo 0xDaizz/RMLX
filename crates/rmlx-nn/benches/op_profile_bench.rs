@@ -1,6 +1,6 @@
 //! Per-operation profiling benchmark for RMLX single-layer prefill pipeline.
 //!
-//! Breaks down the Llama-3 8B TransformerBlock `forward_prefill_single_cb`
+//! Breaks down the MoE Expert Layer TransformerBlock `forward_prefill_single_cb`
 //! into individual operations, each measured with its own CommandBuffer +
 //! commit + wait_until_completed() for accurate per-op timing.
 //!
@@ -27,22 +27,22 @@ use rmlx_nn::{
 };
 
 // ---------------------------------------------------------------------------
-// Llama-3 8B config
+// MoE Expert Layer config (Qwen 3.5-style dimensions)
 // ---------------------------------------------------------------------------
 
-const HIDDEN_SIZE: usize = 4096;
-const NUM_HEADS: usize = 32;
-const NUM_KV_HEADS: usize = 8;
+const HIDDEN_SIZE: usize = 3584;
+const NUM_HEADS: usize = 28;
+const NUM_KV_HEADS: usize = 4;
 const HEAD_DIM: usize = 128;
-const INTERMEDIATE_DIM: usize = 14336;
+const INTERMEDIATE_DIM: usize = 2560;
 const RMS_NORM_EPS: f32 = 1e-5;
-const ROPE_THETA: f32 = 10000.0;
+const ROPE_THETA: f32 = 1000000.0;
 const MAX_SEQ_LEN: usize = 2048;
 
-const Q_DIM: usize = NUM_HEADS * HEAD_DIM; // 4096
-const K_DIM: usize = NUM_KV_HEADS * HEAD_DIM; // 1024
-const V_DIM: usize = NUM_KV_HEADS * HEAD_DIM; // 1024
-const TOTAL_QKV: usize = Q_DIM + K_DIM + V_DIM; // 6144
+const Q_DIM: usize = NUM_HEADS * HEAD_DIM; // 3584
+const K_DIM: usize = NUM_KV_HEADS * HEAD_DIM; // 512
+const V_DIM: usize = NUM_KV_HEADS * HEAD_DIM; // 512
+const TOTAL_QKV: usize = Q_DIM + K_DIM + V_DIM; // 4608
 
 const SEQ_LENS: &[usize] = &[128, 256, 512, 1024, 2048];
 const WARMUP_ITERS: usize = 3;
@@ -705,7 +705,7 @@ fn main() {
         }));
 
         // 2. Merged QKV GEMM (4096 -> 6144)
-        results.push(bench_op("QKV GEMM (4096->6144)", &queue, |cb| {
+        results.push(bench_op("QKV GEMM (3584->4608)", &queue, |cb| {
             let _ = ops::matmul::matmul_into_cb(&registry, &normed_2d, &qkv_wt, cb).expect("qkv");
         }));
 
@@ -828,7 +828,7 @@ fn main() {
         }
 
         // 6. O Projection GEMM (4096 -> 4096)
-        results.push(bench_op("O Proj GEMM (4096->4096)", &queue, |cb| {
+        results.push(bench_op("O Proj GEMM (3584->3584)", &queue, |cb| {
             let _ =
                 ops::matmul::matmul_into_cb(&registry, &attn_concat, &w_o_t, cb).expect("o_proj");
         }));
@@ -847,7 +847,7 @@ fn main() {
         }));
 
         // 8. Merged Gate+Up GEMM (4096 -> 28672)
-        results.push(bench_op("Gate+Up GEMM (4096->28672)", &queue, |cb| {
+        results.push(bench_op("Gate+Up GEMM (3584->5120)", &queue, |cb| {
             let _ = ops::matmul::matmul_into_cb(&registry, &normed2_2d, &gate_up_wt, cb)
                 .expect("gate_up");
         }));
@@ -863,7 +863,7 @@ fn main() {
             .expect("silu_mul");
         }));
 
-        // 10. Down Projection GEMM (14336 -> 4096)
+        // 10. Down Projection GEMM (2560 -> 3584)
         // Diagnostic: print tensor properties to identify degradation cause
         println!(
             "\n  [DIAG] hidden_act: shape={:?} strides={:?} offset={} buf_len={}",
@@ -879,7 +879,7 @@ fn main() {
             w_down_t.offset(),
             w_down_t.metal_buffer().length()
         );
-        results.push(bench_op("Down Proj GEMM (14336->4096)", &queue, |cb| {
+        results.push(bench_op("Down Proj GEMM (2560->3584)", &queue, |cb| {
             let _ =
                 ops::matmul::matmul_into_cb(&registry, &hidden_act, &w_down_t, cb).expect("down");
         }));

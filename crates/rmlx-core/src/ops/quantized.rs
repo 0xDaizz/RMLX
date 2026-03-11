@@ -54,17 +54,17 @@ const VALID_GROUP_SIZES: &[u32] = &[32, 64, 128];
 ///
 /// Stores three separate Metal buffers rather than interleaved blocks:
 /// - `weights_buf`: packed uint32 data. Each uint32 holds `32 / bits` quantized values.
-/// - `scales_buf`: one float32 per group (per-group scale factor).
-/// - `biases_buf`: one float32 per group (per-group bias / zero-point).
+/// - `scales_buf`: one float16 per group (per-group scale factor).
+/// - `biases_buf`: one float16 per group (per-group bias / zero-point).
 ///
 /// Dequantization: `w_i = scale_g * q_i + bias_g`
 /// where `g = i / group_size`.
 pub struct QuantizedWeight {
     /// Packed uint32 weight data.
     pub weights_buf: MTLBuffer,
-    /// Per-group scale factors (float32).
+    /// Per-group scale factors (float16).
     pub scales_buf: MTLBuffer,
-    /// Per-group bias terms (float32).
+    /// Per-group bias terms (float16).
     pub biases_buf: MTLBuffer,
     /// Number of elements per quantization group (32, 64, or 128).
     pub group_size: u32,
@@ -116,7 +116,7 @@ impl QuantizedWeight {
         }
 
         let num_groups = total_elements / (group_size as usize);
-        let expected_scales_bytes = num_groups * 4; // float32
+        let expected_scales_bytes = num_groups * 2; // float16
         if (scales_buf.length() as usize) < expected_scales_bytes {
             return Err(KernelError::InvalidShape(format!(
                 "scales_buf too small: {} bytes < expected {} bytes ({num_groups} groups)",
@@ -193,8 +193,8 @@ inline uint extract_bits(uint word, uint idx_in_word, uint bits) {
 
 kernel void affine_qmv(
     device const uint32_t* weights  [[buffer(0)]],
-    device const float*    scales   [[buffer(1)]],
-    device const float*    biases   [[buffer(2)]],
+    device const half*    scales   [[buffer(1)]],
+    device const half*    biases   [[buffer(2)]],
     device const float*    vec      [[buffer(3)]],
     device float*          output   [[buffer(4)]],
     constant uint4&        params   [[buffer(5)]],
@@ -225,8 +225,8 @@ kernel void affine_qmv(
 
     // Pointers for this row
     device const uint32_t* row_weights = weights + row * u32s_per_row;
-    device const float*    row_scales  = scales  + row * groups_per_row;
-    device const float*    row_biases  = biases  + row * groups_per_row;
+    device const half*    row_scales  = scales  + row * groups_per_row;
+    device const half*    row_biases  = biases  + row * groups_per_row;
 
     for (uint g = tid; g < groups_per_row; g += tg_size) {
         float scale = row_scales[g];
@@ -285,8 +285,8 @@ kernel void affine_qmv(
 // -----------------------------------------------------------------------
 kernel void affine_qmv_q4(
     device const uint16_t* weights  [[buffer(0)]],
-    device const float*    scales   [[buffer(1)]],
-    device const float*    biases   [[buffer(2)]],
+    device const half*    scales   [[buffer(1)]],
+    device const half*    biases   [[buffer(2)]],
     device const float*    vec      [[buffer(3)]],
     device float*          output   [[buffer(4)]],
     constant uint4&        params   [[buffer(5)]],
@@ -313,8 +313,8 @@ kernel void affine_qmv_q4(
     float accum = 0.0f;
 
     device const uint16_t* row_weights = weights + row * words_per_row;
-    device const float*    row_scales  = scales  + row * groups_per_row;
-    device const float*    row_biases  = biases  + row * groups_per_row;
+    device const half*    row_scales  = scales  + row * groups_per_row;
+    device const half*    row_biases  = biases  + row * groups_per_row;
 
     for (uint g = tid; g < groups_per_row; g += tg_size) {
         float scale = row_scales[g];
@@ -390,8 +390,8 @@ constant constexpr int QMV_Q4_BLOCK_SIZE = QMV_Q4_VALUES_PER_THREAD * 32; // 512
 
 kernel void affine_qmv_fast_q4(
     device const uint32_t* weights  [[buffer(0)]],
-    device const float*    scales   [[buffer(1)]],
-    device const float*    biases   [[buffer(2)]],
+    device const half*    scales   [[buffer(1)]],
+    device const half*    biases   [[buffer(2)]],
     device const float*    vec      [[buffer(3)]],
     device float*          output   [[buffer(4)]],
     constant uint4&        params   [[buffer(5)]],
@@ -418,19 +418,21 @@ kernel void affine_qmv_fast_q4(
     device const uint8_t* ws = (device const uint8_t*)(weights)
         + out_row * in_vec_size_w * 4      // row offset in bytes
         + simd_lid * QMV_Q4_PACKS_PER_THREAD * 4;  // thread offset in bytes
-    device const float* sl = scales + out_row * in_vec_size_g
+    device const half* sl = scales + out_row * in_vec_size_g
         + simd_lid / scale_step;
-    device const float* bl = biases + out_row * in_vec_size_g
+    device const half* bl = biases + out_row * in_vec_size_g
         + simd_lid / scale_step;
     device const float* x  = vec + simd_lid * QMV_Q4_VALUES_PER_THREAD;
 
     float result[QMV_Q4_RESULTS_PER_SG] = {0, 0, 0, 0};
 
+    // Hoist x_thread outside K-loop for register reuse.
+    float x_thread[QMV_Q4_VALUES_PER_THREAD];
+    float xsum;
+
     for (int k = 0; k < in_features; k += QMV_Q4_BLOCK_SIZE) {
-        // --- load_vector: pre-divide x for Q4 qdot ---
-        // For Q4, groups of 4 values: x[0], x[1]/16, x[2]/256, x[3]/4096
-        float x_thread[QMV_Q4_VALUES_PER_THREAD];
-        float xsum = 0.0f;
+        // --- load_vector: pre-divide for uint16 mask-only qdot ---
+        xsum = 0.0f;
 
         for (int i = 0; i < QMV_Q4_VALUES_PER_THREAD; i += 4) {
             float v0 = x[i];
@@ -444,24 +446,20 @@ kernel void affine_qmv_fast_q4(
             x_thread[i + 3] = v3 / 4096.0f;
         }
 
-        // --- qdot for each output row ---
+        // --- qdot: uint16 mask-only pattern (no shifts) ---
         for (int row = 0; row < QMV_Q4_RESULTS_PER_SG; row++) {
-            device const uint8_t* wl = ws + row * in_vec_size_w * 4;
+            device const uint16_t* wq = (device const uint16_t*)(ws + row * in_vec_size_w * 4);
             float s = sl[row * in_vec_size_g];
             float b = bl[row * in_vec_size_g];
 
-            if (row + out_row < out_features) {
-                // qdot Q4: cast to uint16_t*, mask-only multiplication
-                device const uint16_t* wp = (device const uint16_t*)wl;
-                float accum = 0.0f;
-                for (int i = 0; i < QMV_Q4_VALUES_PER_THREAD / 4; i++) {
-                    accum += x_thread[4 * i]     * float(wp[i] & 0x000fu)
-                           + x_thread[4 * i + 1] * float(wp[i] & 0x00f0u)
-                           + x_thread[4 * i + 2] * float(wp[i] & 0x0f00u)
-                           + x_thread[4 * i + 3] * float(wp[i] & 0xf000u);
-                }
-                result[row] += s * accum + xsum * b;
+            float accum = 0.0f;
+            for (int i = 0; i < (QMV_Q4_VALUES_PER_THREAD / 4); i++) {
+                accum += (x_thread[4 * i]     * float(wq[i] & 0x000fu) +
+                          x_thread[4 * i + 1] * float(wq[i] & 0x00f0u) +
+                          x_thread[4 * i + 2] * float(wq[i] & 0x0f00u) +
+                          x_thread[4 * i + 3] * float(wq[i] & 0xf000u));
             }
+            result[row] += s * accum + xsum * b;
         }
 
         // Advance pointers by block_size
@@ -494,8 +492,8 @@ kernel void affine_qmv_fast_q4(
 
 kernel void affine_qmv_batched_q4(
     device const uint32_t* weights  [[buffer(0)]],
-    device const float*    scales   [[buffer(1)]],
-    device const float*    biases   [[buffer(2)]],
+    device const half*    scales   [[buffer(1)]],
+    device const half*    biases   [[buffer(2)]],
     device const float*    x_in     [[buffer(3)]],
     device float*          output   [[buffer(4)]],
     constant uint4&        params   [[buffer(5)]],
@@ -525,19 +523,22 @@ kernel void affine_qmv_batched_q4(
     device const uint8_t* ws = (device const uint8_t*)(weights)
         + out_row * in_vec_size_w * 4      // row offset in bytes
         + simd_lid * QMV_Q4_PACKS_PER_THREAD * 4;  // thread offset in bytes
-    device const float* sl = scales + out_row * in_vec_size_g
+    device const half* sl = scales + out_row * in_vec_size_g
         + simd_lid / scale_step;
-    device const float* bl = biases + out_row * in_vec_size_g
+    device const half* bl = biases + out_row * in_vec_size_g
         + simd_lid / scale_step;
     // Select row m from the input matrix
     device const float* x = x_in + m_idx * in_features + simd_lid * QMV_Q4_VALUES_PER_THREAD;
 
     float result[QMV_Q4_RESULTS_PER_SG] = {0, 0, 0, 0};
 
+    // Hoist x_thread outside K-loop for register reuse.
+    float x_thread[QMV_Q4_VALUES_PER_THREAD];
+    float xsum;
+
     for (int k = 0; k < in_features; k += QMV_Q4_BLOCK_SIZE) {
-        // --- load_vector: pre-divide x for Q4 qdot ---
-        float x_thread[QMV_Q4_VALUES_PER_THREAD];
-        float xsum = 0.0f;
+        // --- load_vector: pre-divide for uint16 mask-only qdot ---
+        xsum = 0.0f;
 
         for (int i = 0; i < QMV_Q4_VALUES_PER_THREAD; i += 4) {
             float v0 = x[i];
@@ -551,23 +552,20 @@ kernel void affine_qmv_batched_q4(
             x_thread[i + 3] = v3 / 4096.0f;
         }
 
-        // --- qdot for each output row ---
+        // --- qdot: uint16 mask-only pattern (no shifts) ---
         for (int row = 0; row < QMV_Q4_RESULTS_PER_SG; row++) {
-            device const uint8_t* wl = ws + row * in_vec_size_w * 4;
+            device const uint16_t* wq = (device const uint16_t*)(ws + row * in_vec_size_w * 4);
             float s = sl[row * in_vec_size_g];
             float b = bl[row * in_vec_size_g];
 
-            if (row + out_row < out_features) {
-                device const uint16_t* wp = (device const uint16_t*)wl;
-                float accum = 0.0f;
-                for (int i = 0; i < QMV_Q4_VALUES_PER_THREAD / 4; i++) {
-                    accum += x_thread[4 * i]     * float(wp[i] & 0x000fu)
-                           + x_thread[4 * i + 1] * float(wp[i] & 0x00f0u)
-                           + x_thread[4 * i + 2] * float(wp[i] & 0x0f00u)
-                           + x_thread[4 * i + 3] * float(wp[i] & 0xf000u);
-                }
-                result[row] += s * accum + xsum * b;
+            float accum = 0.0f;
+            for (int i = 0; i < (QMV_Q4_VALUES_PER_THREAD / 4); i++) {
+                accum += (x_thread[4 * i]     * float(wq[i] & 0x000fu) +
+                          x_thread[4 * i + 1] * float(wq[i] & 0x00f0u) +
+                          x_thread[4 * i + 2] * float(wq[i] & 0x0f00u) +
+                          x_thread[4 * i + 3] * float(wq[i] & 0xf000u));
             }
+            result[row] += s * accum + xsum * b;
         }
 
         // Advance pointers by block_size
@@ -605,8 +603,8 @@ constant constexpr int QMV_Q8_BLOCK_SIZE = QMV_Q8_VALUES_PER_THREAD * 32; // 256
 
 kernel void affine_qmv_fast_q8(
     device const uint8_t*  weights  [[buffer(0)]],
-    device const float*    scales   [[buffer(1)]],
-    device const float*    biases   [[buffer(2)]],
+    device const half*    scales   [[buffer(1)]],
+    device const half*    biases   [[buffer(2)]],
     device const float*    vec      [[buffer(3)]],
     device float*          output   [[buffer(4)]],
     constant uint4&        params   [[buffer(5)]],
@@ -631,9 +629,9 @@ kernel void affine_qmv_fast_q8(
     device const uint8_t* ws = weights
         + out_row * in_vec_size_w
         + simd_lid * QMV_Q8_PACKS_PER_THREAD * 4;  // 4 bytes per pack (uint32)
-    device const float* sl = scales + out_row * in_vec_size_g
+    device const half* sl = scales + out_row * in_vec_size_g
         + simd_lid / scale_step;
-    device const float* bl = biases + out_row * in_vec_size_g
+    device const half* bl = biases + out_row * in_vec_size_g
         + simd_lid / scale_step;
     device const float* x  = vec + simd_lid * QMV_Q8_VALUES_PER_THREAD;
 
@@ -773,12 +771,18 @@ kernel void gptq_dequant_f32(
 //
 // Same qdot pattern as affine_qmv_fast_q4 but with half* input/output.
 // Uses half4 vectorized loads.  Accumulation stays in float for precision.
+//
+// Optimizations vs baseline:
+//   1. Bounds check removed from inner K-loop (fast path assumes N%8==0)
+//   2. x_thread / xsum hoisted outside K-loop for register reuse
+//   3. qdot uses uint16 mask-only pattern with pre-divided x values
+//      (MLX pre-division trick: eliminates all shifts in inner loop)
 // -----------------------------------------------------------------------
 
 kernel void affine_qmv_fast_f16_q4(
     device const uint32_t* weights  [[buffer(0)]],
-    device const float*    scales   [[buffer(1)]],
-    device const float*    biases   [[buffer(2)]],
+    device const half*    scales   [[buffer(1)]],
+    device const half*    biases   [[buffer(2)]],
     device const half*     vec      [[buffer(3)]],
     device half*           output   [[buffer(4)]],
     constant uint4&        params   [[buffer(5)]],
@@ -802,17 +806,21 @@ kernel void affine_qmv_fast_f16_q4(
     device const uint8_t* ws = (device const uint8_t*)(weights)
         + out_row * in_vec_size_w * 4
         + simd_lid * QMV_Q4_PACKS_PER_THREAD * 4;
-    device const float* sl = scales + out_row * in_vec_size_g
+    device const half* sl = scales + out_row * in_vec_size_g
         + simd_lid / scale_step;
-    device const float* bl = biases + out_row * in_vec_size_g
+    device const half* bl = biases + out_row * in_vec_size_g
         + simd_lid / scale_step;
     device const half* x = vec + simd_lid * QMV_Q4_VALUES_PER_THREAD;
 
     float result[QMV_Q4_RESULTS_PER_SG] = {0, 0, 0, 0};
 
+    // Hoist x_thread outside K-loop for register reuse.
+    float x_thread[QMV_Q4_VALUES_PER_THREAD];
+    float xsum;
+
     for (int k = 0; k < in_features; k += QMV_Q4_BLOCK_SIZE) {
-        float x_thread[QMV_Q4_VALUES_PER_THREAD];
-        float xsum = 0.0f;
+        // --- load_vector: half4 vectorized load, pre-divide for uint16 mask-only qdot ---
+        xsum = 0.0f;
 
         for (int i = 0; i < QMV_Q4_VALUES_PER_THREAD; i += 4) {
             half4 xh = *(device const half4*)(x + i);
@@ -827,22 +835,20 @@ kernel void affine_qmv_fast_f16_q4(
             x_thread[i + 3] = v3 / 4096.0f;
         }
 
+        // --- qdot: uint16 mask-only pattern (no shifts) ---
         for (int row = 0; row < QMV_Q4_RESULTS_PER_SG; row++) {
-            device const uint8_t* wl = ws + row * in_vec_size_w * 4;
+            device const uint16_t* wq = (device const uint16_t*)(ws + row * in_vec_size_w * 4);
             float s = sl[row * in_vec_size_g];
             float b = bl[row * in_vec_size_g];
 
-            if (row + out_row < out_features) {
-                device const uint16_t* wp = (device const uint16_t*)wl;
-                float accum = 0.0f;
-                for (int i = 0; i < QMV_Q4_VALUES_PER_THREAD / 4; i++) {
-                    accum += x_thread[4 * i]     * float(wp[i] & 0x000fu)
-                           + x_thread[4 * i + 1] * float(wp[i] & 0x00f0u)
-                           + x_thread[4 * i + 2] * float(wp[i] & 0x0f00u)
-                           + x_thread[4 * i + 3] * float(wp[i] & 0xf000u);
-                }
-                result[row] += s * accum + xsum * b;
+            float accum = 0.0f;
+            for (int i = 0; i < (QMV_Q4_VALUES_PER_THREAD / 4); i++) {
+                accum += (x_thread[4 * i]     * float(wq[i] & 0x000fu) +
+                          x_thread[4 * i + 1] * float(wq[i] & 0x00f0u) +
+                          x_thread[4 * i + 2] * float(wq[i] & 0x0f00u) +
+                          x_thread[4 * i + 3] * float(wq[i] & 0xf000u));
             }
+            result[row] += s * accum + xsum * b;
         }
 
         ws += QMV_Q4_BLOCK_SIZE / QMV_Q4_PACK_FACTOR * 4;
@@ -868,8 +874,8 @@ kernel void affine_qmv_fast_f16_q4(
 
 kernel void affine_qmv_batched_f16_q4(
     device const uint32_t* weights  [[buffer(0)]],
-    device const float*    scales   [[buffer(1)]],
-    device const float*    biases   [[buffer(2)]],
+    device const half*    scales   [[buffer(1)]],
+    device const half*    biases   [[buffer(2)]],
     device const half*     x_in     [[buffer(3)]],
     device half*           output   [[buffer(4)]],
     constant uint4&        params   [[buffer(5)]],
@@ -897,17 +903,21 @@ kernel void affine_qmv_batched_f16_q4(
     device const uint8_t* ws = (device const uint8_t*)(weights)
         + out_row * in_vec_size_w * 4
         + simd_lid * QMV_Q4_PACKS_PER_THREAD * 4;
-    device const float* sl = scales + out_row * in_vec_size_g
+    device const half* sl = scales + out_row * in_vec_size_g
         + simd_lid / scale_step;
-    device const float* bl = biases + out_row * in_vec_size_g
+    device const half* bl = biases + out_row * in_vec_size_g
         + simd_lid / scale_step;
     device const half* x = x_in + m_idx * in_features + simd_lid * QMV_Q4_VALUES_PER_THREAD;
 
     float result[QMV_Q4_RESULTS_PER_SG] = {0, 0, 0, 0};
 
+    // Hoist x_thread outside K-loop for register reuse.
+    float x_thread[QMV_Q4_VALUES_PER_THREAD];
+    float xsum;
+
     for (int k = 0; k < in_features; k += QMV_Q4_BLOCK_SIZE) {
-        float x_thread[QMV_Q4_VALUES_PER_THREAD];
-        float xsum = 0.0f;
+        // --- load_vector: half4 vectorized load, pre-divide for uint16 mask-only qdot ---
+        xsum = 0.0f;
 
         for (int i = 0; i < QMV_Q4_VALUES_PER_THREAD; i += 4) {
             half4 xh = *(device const half4*)(x + i);
@@ -922,22 +932,20 @@ kernel void affine_qmv_batched_f16_q4(
             x_thread[i + 3] = v3 / 4096.0f;
         }
 
+        // --- qdot: uint16 mask-only pattern (no shifts) ---
         for (int row = 0; row < QMV_Q4_RESULTS_PER_SG; row++) {
-            device const uint8_t* wl = ws + row * in_vec_size_w * 4;
+            device const uint16_t* wq = (device const uint16_t*)(ws + row * in_vec_size_w * 4);
             float s = sl[row * in_vec_size_g];
             float b = bl[row * in_vec_size_g];
 
-            if (row + out_row < out_features) {
-                device const uint16_t* wp = (device const uint16_t*)wl;
-                float accum = 0.0f;
-                for (int i = 0; i < QMV_Q4_VALUES_PER_THREAD / 4; i++) {
-                    accum += x_thread[4 * i]     * float(wp[i] & 0x000fu)
-                           + x_thread[4 * i + 1] * float(wp[i] & 0x00f0u)
-                           + x_thread[4 * i + 2] * float(wp[i] & 0x0f00u)
-                           + x_thread[4 * i + 3] * float(wp[i] & 0xf000u);
-                }
-                result[row] += s * accum + xsum * b;
+            float accum = 0.0f;
+            for (int i = 0; i < (QMV_Q4_VALUES_PER_THREAD / 4); i++) {
+                accum += (x_thread[4 * i]     * float(wq[i] & 0x000fu) +
+                          x_thread[4 * i + 1] * float(wq[i] & 0x00f0u) +
+                          x_thread[4 * i + 2] * float(wq[i] & 0x0f00u) +
+                          x_thread[4 * i + 3] * float(wq[i] & 0xf000u));
             }
+            result[row] += s * accum + xsum * b;
         }
 
         ws += QMV_Q4_BLOCK_SIZE / QMV_Q4_PACK_FACTOR * 4;
@@ -967,8 +975,8 @@ kernel void affine_qmv_batched_f16_q4(
 
 kernel void affine_qmv_batched_splitk_f16_q4(
     device const uint32_t* weights  [[buffer(0)]],
-    device const float*    scales   [[buffer(1)]],
-    device const float*    biases   [[buffer(2)]],
+    device const half*    scales   [[buffer(1)]],
+    device const half*    biases   [[buffer(2)]],
     device const half*     x_in     [[buffer(3)]],
     device float*          c_split  [[buffer(4)]],
     constant uint4&        params   [[buffer(5)]],
@@ -1011,19 +1019,23 @@ kernel void affine_qmv_batched_splitk_f16_q4(
         + out_row * in_vec_size_w * 4
         + k_start_packs * 4
         + simd_lid * QMV_Q4_PACKS_PER_THREAD * 4;
-    device const float* sl = scales + out_row * in_vec_size_g
+    device const half* sl = scales + out_row * in_vec_size_g
         + k_start_groups
         + simd_lid / scale_step;
-    device const float* bl = biases + out_row * in_vec_size_g
+    device const half* bl = biases + out_row * in_vec_size_g
         + k_start_groups
         + simd_lid / scale_step;
     device const half* x = x_in + m_idx * in_features + k_start + simd_lid * QMV_Q4_VALUES_PER_THREAD;
 
     float result[QMV_Q4_RESULTS_PER_SG] = {0, 0, 0, 0};
 
+    // Hoist x_thread outside K-loop for register reuse.
+    float x_thread[QMV_Q4_VALUES_PER_THREAD];
+    float xsum;
+
     for (int k = k_start; k < k_end; k += QMV_Q4_BLOCK_SIZE) {
-        float x_thread[QMV_Q4_VALUES_PER_THREAD];
-        float xsum = 0.0f;
+        // --- load_vector: half4 vectorized load, pre-divide for uint16 mask-only qdot ---
+        xsum = 0.0f;
 
         for (int i = 0; i < QMV_Q4_VALUES_PER_THREAD; i += 4) {
             half4 xh = *(device const half4*)(x + i);
@@ -1038,22 +1050,20 @@ kernel void affine_qmv_batched_splitk_f16_q4(
             x_thread[i + 3] = v3 / 4096.0f;
         }
 
+        // --- qdot: uint16 mask-only pattern (no shifts) ---
         for (int row = 0; row < QMV_Q4_RESULTS_PER_SG; row++) {
-            device const uint8_t* wl = ws + row * in_vec_size_w * 4;
+            device const uint16_t* wq = (device const uint16_t*)(ws + row * in_vec_size_w * 4);
             float s = sl[row * in_vec_size_g];
             float b = bl[row * in_vec_size_g];
 
-            if (row + out_row < out_features) {
-                device const uint16_t* wp = (device const uint16_t*)wl;
-                float accum = 0.0f;
-                for (int i = 0; i < QMV_Q4_VALUES_PER_THREAD / 4; i++) {
-                    accum += x_thread[4 * i]     * float(wp[i] & 0x000fu)
-                           + x_thread[4 * i + 1] * float(wp[i] & 0x00f0u)
-                           + x_thread[4 * i + 2] * float(wp[i] & 0x0f00u)
-                           + x_thread[4 * i + 3] * float(wp[i] & 0xf000u);
-                }
-                result[row] += s * accum + xsum * b;
+            float accum = 0.0f;
+            for (int i = 0; i < (QMV_Q4_VALUES_PER_THREAD / 4); i++) {
+                accum += (x_thread[4 * i]     * float(wq[i] & 0x000fu) +
+                          x_thread[4 * i + 1] * float(wq[i] & 0x00f0u) +
+                          x_thread[4 * i + 2] * float(wq[i] & 0x0f00u) +
+                          x_thread[4 * i + 3] * float(wq[i] & 0xf000u));
             }
+            result[row] += s * accum + xsum * b;
         }
 
         ws += QMV_Q4_BLOCK_SIZE / QMV_Q4_PACK_FACTOR * 4;
@@ -1084,8 +1094,8 @@ kernel void affine_qmv_batched_splitk_f16_q4(
 
 kernel void affine_qmv_splitk_f16_q4(
     device const uint32_t* weights  [[buffer(0)]],
-    device const float*    scales   [[buffer(1)]],
-    device const float*    biases   [[buffer(2)]],
+    device const half*    scales   [[buffer(1)]],
+    device const half*    biases   [[buffer(2)]],
     device const half*     vec      [[buffer(3)]],
     device float*          c_split  [[buffer(4)]],
     constant uint4&        params   [[buffer(5)]],
@@ -1124,19 +1134,22 @@ kernel void affine_qmv_splitk_f16_q4(
         + out_row * in_vec_size_w * 4
         + k_start_packs * 4
         + simd_lid * QMV_Q4_PACKS_PER_THREAD * 4;
-    device const float* sl = scales + out_row * in_vec_size_g
+    device const half* sl = scales + out_row * in_vec_size_g
         + k_start_groups
         + simd_lid / scale_step;
-    device const float* bl = biases + out_row * in_vec_size_g
+    device const half* bl = biases + out_row * in_vec_size_g
         + k_start_groups
         + simd_lid / scale_step;
     device const half* x = vec + k_start + simd_lid * QMV_Q4_VALUES_PER_THREAD;
 
     float result[QMV_Q4_RESULTS_PER_SG] = {0, 0, 0, 0};
 
+    // Hoist x_thread outside K-loop for register reuse.
+    float x_thread[QMV_Q4_VALUES_PER_THREAD];
+    float xsum;
+
     for (int k = k_start; k < k_end; k += QMV_Q4_BLOCK_SIZE) {
-        float x_thread[QMV_Q4_VALUES_PER_THREAD];
-        float xsum = 0.0f;
+        xsum = 0.0f;
 
         for (int i = 0; i < QMV_Q4_VALUES_PER_THREAD; i += 4) {
             half4 xh = *(device const half4*)(x + i);
@@ -1151,22 +1164,20 @@ kernel void affine_qmv_splitk_f16_q4(
             x_thread[i + 3] = v3 / 4096.0f;
         }
 
+        // --- qdot: uint16 mask-only pattern (no shifts) ---
         for (int row = 0; row < QMV_Q4_RESULTS_PER_SG; row++) {
-            device const uint8_t* wl = ws + row * in_vec_size_w * 4;
+            device const uint16_t* wq = (device const uint16_t*)(ws + row * in_vec_size_w * 4);
             float s = sl[row * in_vec_size_g];
             float b = bl[row * in_vec_size_g];
 
-            if (row + out_row < out_features) {
-                device const uint16_t* wp = (device const uint16_t*)wl;
-                float accum = 0.0f;
-                for (int i = 0; i < QMV_Q4_VALUES_PER_THREAD / 4; i++) {
-                    accum += x_thread[4 * i]     * float(wp[i] & 0x000fu)
-                           + x_thread[4 * i + 1] * float(wp[i] & 0x00f0u)
-                           + x_thread[4 * i + 2] * float(wp[i] & 0x0f00u)
-                           + x_thread[4 * i + 3] * float(wp[i] & 0xf000u);
-                }
-                result[row] += s * accum + xsum * b;
+            float accum = 0.0f;
+            for (int i = 0; i < (QMV_Q4_VALUES_PER_THREAD / 4); i++) {
+                accum += (x_thread[4 * i]     * float(wq[i] & 0x000fu) +
+                          x_thread[4 * i + 1] * float(wq[i] & 0x00f0u) +
+                          x_thread[4 * i + 2] * float(wq[i] & 0x0f00u) +
+                          x_thread[4 * i + 3] * float(wq[i] & 0xf000u));
             }
+            result[row] += s * accum + xsum * b;
         }
 
         ws += QMV_Q4_BLOCK_SIZE / QMV_Q4_PACK_FACTOR * 4;
@@ -1313,6 +1324,15 @@ pub fn affine_quantized_matmul(
         (v, DType::Float32)
     };
 
+    // Q4 f16 fast path assumes out_features is 8-aligned (no bounds check in kernel)
+    if use_f16_native {
+        assert!(
+            qw.out_features % 8 == 0,
+            "QMV fast path requires out_features divisible by 8, got {}",
+            qw.out_features
+        );
+    }
+
     let kernel_name = if use_f16_native {
         "affine_qmv_fast_f16_q4"
     } else {
@@ -1320,7 +1340,7 @@ pub fn affine_quantized_matmul(
     };
 
     let pipeline = registry.get_pipeline(kernel_name, kernel_dtype)?;
-    let out = Array::zeros(registry.device().raw(), &[qw.out_features], kernel_dtype);
+    let out = Array::uninit(registry.device().raw(), &[qw.out_features], kernel_dtype);
 
     // Pack (out_features, in_features, group_size, bits) into a uint4.
     let params: [u32; 4] = [
@@ -1329,14 +1349,6 @@ pub fn affine_quantized_matmul(
         qw.group_size,
         qw.bits,
     ];
-
-    let dev = registry.device().raw();
-    let opts = metal::MTLResourceOptions::StorageModeShared;
-    let params_buf = dev.new_buffer_with_data(
-        params.as_ptr() as *const _,
-        (params.len() * std::mem::size_of::<u32>()) as u64,
-        opts,
-    );
 
     let cb = queue.new_command_buffer();
     let enc = cb.new_compute_command_encoder();
@@ -1350,7 +1362,7 @@ pub fn affine_quantized_matmul(
         vec_for_kernel.offset() as u64,
     );
     enc.set_buffer(4, Some(out.metal_buffer()), 0);
-    enc.set_buffer(5, Some(&params_buf), 0);
+    enc.set_bytes(5, 16, params.as_ptr() as *const std::ffi::c_void);
 
     // MLX qmv_fast layout: 2 simdgroups × 4 rows = 8 rows per threadgroup.
     // Threadgroup size = 2 × 32 = 64 threads.
@@ -1434,10 +1446,16 @@ pub fn affine_qmv_batched_q4(
             "affine_qmv_batched_q4: in_features ({k}) must be a multiple of {QMV_Q4_BLOCK_SIZE}"
         )));
     }
+    // Fast QMV path assumes out_features is 8-aligned (no bounds check in kernel)
+    assert!(
+        qw.out_features % 8 == 0,
+        "QMV fast path requires out_features divisible by 8, got {}",
+        qw.out_features
+    );
 
     let n = qw.out_features;
     let pipeline = registry.get_pipeline("affine_qmv_batched_q4", DType::Float32)?;
-    let out = Array::zeros(registry.device().raw(), &[m, n], DType::Float32);
+    let out = Array::uninit(registry.device().raw(), &[m, n], DType::Float32);
 
     // params: (out_features, in_features, group_size, M)
     let params: [u32; 4] = [
@@ -1447,14 +1465,6 @@ pub fn affine_qmv_batched_q4(
         super::checked_u32(m, "M")?,
     ];
 
-    let dev = registry.device().raw();
-    let opts = metal::MTLResourceOptions::StorageModeShared;
-    let params_buf = dev.new_buffer_with_data(
-        params.as_ptr() as *const _,
-        (params.len() * std::mem::size_of::<u32>()) as u64,
-        opts,
-    );
-
     let cb = queue.new_command_buffer();
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&pipeline);
@@ -1463,7 +1473,7 @@ pub fn affine_qmv_batched_q4(
     enc.set_buffer(2, Some(&qw.biases_buf), 0);
     enc.set_buffer(3, Some(x.metal_buffer()), x.offset() as u64);
     enc.set_buffer(4, Some(out.metal_buffer()), 0);
-    enc.set_buffer(5, Some(&params_buf), 0);
+    enc.set_bytes(5, 16, params.as_ptr() as *const std::ffi::c_void);
 
     // Grid: (M, ceil(N / 8), 1) — M batches × N-tile groups
     let rows_per_tg: u64 = 8; // NUM_SIMDGROUPS(2) * RESULTS_PER_SG(4)
@@ -1556,9 +1566,15 @@ pub fn affine_qmv_fast_f16_q4(
             "affine_qmv_fast_f16_q4: in_features ({k}) must be a multiple of {QMV_Q4_BLOCK_SIZE}"
         )));
     }
+    // Fast QMV path assumes out_features is 8-aligned (no bounds check in kernel)
+    assert!(
+        qw.out_features % 8 == 0,
+        "QMV fast path requires out_features divisible by 8, got {}",
+        qw.out_features
+    );
 
     let pipeline = registry.get_pipeline("affine_qmv_fast_f16_q4", DType::Float16)?;
-    let out = Array::zeros(registry.device().raw(), &[qw.out_features], DType::Float16);
+    let out = Array::uninit(registry.device().raw(), &[qw.out_features], DType::Float16);
 
     let params: [u32; 4] = [
         super::checked_u32(qw.out_features, "out_features")?,
@@ -1566,14 +1582,6 @@ pub fn affine_qmv_fast_f16_q4(
         qw.group_size,
         qw.bits,
     ];
-
-    let dev = registry.device().raw();
-    let opts = metal::MTLResourceOptions::StorageModeShared;
-    let params_buf = dev.new_buffer_with_data(
-        params.as_ptr() as *const _,
-        (params.len() * std::mem::size_of::<u32>()) as u64,
-        opts,
-    );
 
     let cb = queue.new_command_buffer();
     let enc = cb.new_compute_command_encoder();
@@ -1583,7 +1591,7 @@ pub fn affine_qmv_fast_f16_q4(
     enc.set_buffer(2, Some(&qw.biases_buf), 0);
     enc.set_buffer(3, Some(vec.metal_buffer()), vec.offset() as u64);
     enc.set_buffer(4, Some(out.metal_buffer()), 0);
-    enc.set_buffer(5, Some(&params_buf), 0);
+    enc.set_bytes(5, 16, params.as_ptr() as *const std::ffi::c_void);
 
     let rows_per_tg: u64 = 8;
     let num_tgs_y = (qw.out_features as u64).div_ceil(rows_per_tg);
@@ -1656,10 +1664,16 @@ pub fn affine_qmv_batched_f16_q4(
             "affine_qmv_batched_f16_q4: in_features ({k}) must be a multiple of {QMV_Q4_BLOCK_SIZE}"
         )));
     }
+    // Fast QMV path assumes out_features is 8-aligned (no bounds check in kernel)
+    assert!(
+        qw.out_features % 8 == 0,
+        "QMV fast path requires out_features divisible by 8, got {}",
+        qw.out_features
+    );
 
     let n = qw.out_features;
     let pipeline = registry.get_pipeline("affine_qmv_batched_f16_q4", DType::Float16)?;
-    let out = Array::zeros(registry.device().raw(), &[m, n], DType::Float16);
+    let out = Array::uninit(registry.device().raw(), &[m, n], DType::Float16);
 
     let params: [u32; 4] = [
         super::checked_u32(n, "out_features")?,
@@ -1667,14 +1681,6 @@ pub fn affine_qmv_batched_f16_q4(
         qw.group_size,
         super::checked_u32(m, "M")?,
     ];
-
-    let dev = registry.device().raw();
-    let opts = metal::MTLResourceOptions::StorageModeShared;
-    let params_buf = dev.new_buffer_with_data(
-        params.as_ptr() as *const _,
-        (params.len() * std::mem::size_of::<u32>()) as u64,
-        opts,
-    );
 
     let cb = queue.new_command_buffer();
     let enc = cb.new_compute_command_encoder();
@@ -1684,7 +1690,7 @@ pub fn affine_qmv_batched_f16_q4(
     enc.set_buffer(2, Some(&qw.biases_buf), 0);
     enc.set_buffer(3, Some(x.metal_buffer()), x.offset() as u64);
     enc.set_buffer(4, Some(out.metal_buffer()), 0);
-    enc.set_buffer(5, Some(&params_buf), 0);
+    enc.set_bytes(5, 16, params.as_ptr() as *const std::ffi::c_void);
 
     let rows_per_tg: u64 = 8;
     let num_tgs_y = (n as u64).div_ceil(rows_per_tg);
@@ -1765,6 +1771,12 @@ pub fn affine_qmv_batched_splitk_f16_q4(
             "affine_qmv_batched_splitk_f16_q4: in_features ({k}) must be a multiple of {QMV_Q4_BLOCK_SIZE}"
         )));
     }
+    // Fast QMV path assumes out_features is 8-aligned (no bounds check in kernel)
+    assert!(
+        qw.out_features % 8 == 0,
+        "QMV fast path requires out_features divisible by 8, got {}",
+        qw.out_features
+    );
 
     let n = qw.out_features;
     let dev = registry.device().raw();
@@ -1781,7 +1793,7 @@ pub fn affine_qmv_batched_splitk_f16_q4(
     let c_split_size = (k_partitions * partition_stride * std::mem::size_of::<f32>()) as u64;
     let c_split_buf = dev.new_buffer(c_split_size, opts);
 
-    let out = Array::zeros(dev, &[m, n], DType::Float16);
+    let out = Array::uninit(dev, &[m, n], DType::Float16);
 
     let params: [u32; 4] = [
         super::checked_u32(n, "out_features")?,
@@ -1794,17 +1806,6 @@ pub fn affine_qmv_batched_splitk_f16_q4(
         super::checked_u32(k_per_part, "k_per_part")?,
     ];
 
-    let params_buf = dev.new_buffer_with_data(
-        params.as_ptr() as *const _,
-        (params.len() * std::mem::size_of::<u32>()) as u64,
-        opts,
-    );
-    let splitk_buf = dev.new_buffer_with_data(
-        splitk_p.as_ptr() as *const _,
-        (splitk_p.len() * std::mem::size_of::<u32>()) as u64,
-        opts,
-    );
-
     let cb = queue.new_command_buffer();
 
     // Encode split-K kernel
@@ -1815,8 +1816,8 @@ pub fn affine_qmv_batched_splitk_f16_q4(
     enc.set_buffer(2, Some(&qw.biases_buf), 0);
     enc.set_buffer(3, Some(x.metal_buffer()), x.offset() as u64);
     enc.set_buffer(4, Some(&c_split_buf), 0);
-    enc.set_buffer(5, Some(&params_buf), 0);
-    enc.set_buffer(6, Some(&splitk_buf), 0);
+    enc.set_bytes(5, 16, params.as_ptr() as *const std::ffi::c_void);
+    enc.set_bytes(6, 8, splitk_p.as_ptr() as *const std::ffi::c_void);
 
     let rows_per_tg: u64 = 8;
     let num_tgs_y = (n as u64).div_ceil(rows_per_tg);
@@ -1835,17 +1836,12 @@ pub fn affine_qmv_batched_splitk_f16_q4(
         super::checked_u32(k_partitions, "k_partitions")?,
         super::checked_u32(partition_stride, "partition_stride")?,
     ];
-    let acc_params_buf = dev.new_buffer_with_data(
-        acc_params.as_ptr() as *const _,
-        (acc_params.len() * std::mem::size_of::<u32>()) as u64,
-        opts,
-    );
 
     let enc2 = cb.new_compute_command_encoder();
     enc2.set_compute_pipeline_state(&reduce_pipeline);
     enc2.set_buffer(0, Some(&c_split_buf), 0);
     enc2.set_buffer(1, Some(out.metal_buffer()), 0);
-    enc2.set_buffer(2, Some(&acc_params_buf), 0);
+    enc2.set_bytes(2, 12, acc_params.as_ptr() as *const std::ffi::c_void);
 
     enc2.dispatch_threads(
         metal::MTLSize::new(n as u64, m as u64, 1),
@@ -1925,7 +1921,7 @@ pub fn affine_qmv_splitk_f16_q4(
     let c_split_size = (k_partitions * n * std::mem::size_of::<f32>()) as u64;
     let c_split_buf = dev.new_buffer(c_split_size, opts);
 
-    let out = Array::zeros(dev, &[n], DType::Float16);
+    let out = Array::uninit(dev, &[n], DType::Float16);
 
     let params: [u32; 4] = [
         super::checked_u32(n, "out_features")?,
@@ -1938,17 +1934,6 @@ pub fn affine_qmv_splitk_f16_q4(
         super::checked_u32(k_per_part, "k_per_part")?,
     ];
 
-    let params_buf = dev.new_buffer_with_data(
-        params.as_ptr() as *const _,
-        (params.len() * std::mem::size_of::<u32>()) as u64,
-        opts,
-    );
-    let splitk_buf = dev.new_buffer_with_data(
-        splitk_p.as_ptr() as *const _,
-        (splitk_p.len() * std::mem::size_of::<u32>()) as u64,
-        opts,
-    );
-
     let cb = queue.new_command_buffer();
 
     // Encode split-K kernel
@@ -1959,8 +1944,8 @@ pub fn affine_qmv_splitk_f16_q4(
     enc.set_buffer(2, Some(&qw.biases_buf), 0);
     enc.set_buffer(3, Some(vec.metal_buffer()), vec.offset() as u64);
     enc.set_buffer(4, Some(&c_split_buf), 0);
-    enc.set_buffer(5, Some(&params_buf), 0);
-    enc.set_buffer(6, Some(&splitk_buf), 0);
+    enc.set_bytes(5, 16, params.as_ptr() as *const std::ffi::c_void);
+    enc.set_bytes(6, 8, splitk_p.as_ptr() as *const std::ffi::c_void);
 
     let rows_per_tg: u64 = 8;
     let num_tgs_y = (n as u64).div_ceil(rows_per_tg);
@@ -1980,17 +1965,12 @@ pub fn affine_qmv_splitk_f16_q4(
         super::checked_u32(k_partitions, "k_partitions")?,
         super::checked_u32(n, "partition_stride")?, // M=1 so stride = N
     ];
-    let acc_params_buf = dev.new_buffer_with_data(
-        acc_params.as_ptr() as *const _,
-        (acc_params.len() * std::mem::size_of::<u32>()) as u64,
-        opts,
-    );
 
     let enc2 = cb.new_compute_command_encoder();
     enc2.set_compute_pipeline_state(&reduce_pipeline);
     enc2.set_buffer(0, Some(&c_split_buf), 0);
     enc2.set_buffer(1, Some(out.metal_buffer()), 0);
-    enc2.set_buffer(2, Some(&acc_params_buf), 0);
+    enc2.set_bytes(2, 12, acc_params.as_ptr() as *const std::ffi::c_void);
 
     // dispatch_threads for 1-D reduce: N threads, M=1 so gid.y=0
     enc2.dispatch_threads(
@@ -2056,7 +2036,7 @@ pub fn affine_qmv_splitk_f16_q4_into_cb(
     let c_split_size = (k_partitions * n * std::mem::size_of::<f32>()) as u64;
     let c_split_buf = dev.new_buffer(c_split_size, opts);
 
-    let out = Array::zeros(dev, &[n], DType::Float16);
+    let out = Array::uninit(dev, &[n], DType::Float16);
 
     let params: [u32; 4] = [
         super::checked_u32(n, "out_features")?,
@@ -2069,17 +2049,6 @@ pub fn affine_qmv_splitk_f16_q4_into_cb(
         super::checked_u32(k_per_part, "k_per_part")?,
     ];
 
-    let params_buf = dev.new_buffer_with_data(
-        params.as_ptr() as *const _,
-        (params.len() * std::mem::size_of::<u32>()) as u64,
-        opts,
-    );
-    let splitk_buf = dev.new_buffer_with_data(
-        splitk_p.as_ptr() as *const _,
-        (splitk_p.len() * std::mem::size_of::<u32>()) as u64,
-        opts,
-    );
-
     // Encode split-K kernel
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&splitk_pipeline);
@@ -2088,8 +2057,8 @@ pub fn affine_qmv_splitk_f16_q4_into_cb(
     enc.set_buffer(2, Some(&qw.biases_buf), 0);
     enc.set_buffer(3, Some(vec.metal_buffer()), vec.offset() as u64);
     enc.set_buffer(4, Some(&c_split_buf), 0);
-    enc.set_buffer(5, Some(&params_buf), 0);
-    enc.set_buffer(6, Some(&splitk_buf), 0);
+    enc.set_bytes(5, 16, params.as_ptr() as *const std::ffi::c_void);
+    enc.set_bytes(6, 8, splitk_p.as_ptr() as *const std::ffi::c_void);
 
     let rows_per_tg: u64 = 8;
     let num_tgs_y = (n as u64).div_ceil(rows_per_tg);
@@ -2108,17 +2077,12 @@ pub fn affine_qmv_splitk_f16_q4_into_cb(
         super::checked_u32(k_partitions, "k_partitions")?,
         super::checked_u32(n, "partition_stride")?,
     ];
-    let acc_params_buf = dev.new_buffer_with_data(
-        acc_params.as_ptr() as *const _,
-        (acc_params.len() * std::mem::size_of::<u32>()) as u64,
-        opts,
-    );
 
     let enc2 = cb.new_compute_command_encoder();
     enc2.set_compute_pipeline_state(&reduce_pipeline);
     enc2.set_buffer(0, Some(&c_split_buf), 0);
     enc2.set_buffer(1, Some(out.metal_buffer()), 0);
-    enc2.set_buffer(2, Some(&acc_params_buf), 0);
+    enc2.set_bytes(2, 12, acc_params.as_ptr() as *const std::ffi::c_void);
 
     enc2.dispatch_threads(
         metal::MTLSize::new(n as u64, 1, 1),
@@ -2208,7 +2172,7 @@ pub fn awq_dequant(
 
     // --- Build pipeline and output ---
     let pipeline = registry.get_pipeline("awq_dequant_f32", DType::Float32)?;
-    let out = Array::zeros(registry.device().raw(), &[rows, cols], DType::Float32);
+    let out = Array::uninit(registry.device().raw(), &[rows, cols], DType::Float32);
 
     let params: [u32; 4] = [
         super::checked_u32(rows, "rows")?,
@@ -2217,14 +2181,6 @@ pub fn awq_dequant(
         super::checked_u32(num_groups, "num_groups")?,
     ];
 
-    let dev = registry.device().raw();
-    let opts = metal::MTLResourceOptions::StorageModeShared;
-    let params_buf = dev.new_buffer_with_data(
-        params.as_ptr() as *const _,
-        (params.len() * std::mem::size_of::<u32>()) as u64,
-        opts,
-    );
-
     let cb = queue.new_command_buffer();
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&pipeline);
@@ -2232,7 +2188,7 @@ pub fn awq_dequant(
     enc.set_buffer(1, Some(qzeros.metal_buffer()), qzeros.offset() as u64);
     enc.set_buffer(2, Some(scales.metal_buffer()), scales.offset() as u64);
     enc.set_buffer(3, Some(out.metal_buffer()), 0);
-    enc.set_buffer(4, Some(&params_buf), 0);
+    enc.set_bytes(4, 16, params.as_ptr() as *const std::ffi::c_void);
 
     // 2D grid: (cols, rows, 1) — each thread handles one output element.
     let max_tg = pipeline.max_total_threads_per_threadgroup();
@@ -2354,7 +2310,7 @@ pub fn gptq_dequant(
 
     // --- Build pipeline and output ---
     let pipeline = registry.get_pipeline("gptq_dequant_f32", DType::Float32)?;
-    let out = Array::zeros(
+    let out = Array::uninit(
         registry.device().raw(),
         &[in_features, out_features],
         DType::Float32,
@@ -2370,11 +2326,6 @@ pub fn gptq_dequant(
 
     let dev = registry.device().raw();
     let opts = metal::MTLResourceOptions::StorageModeShared;
-    let params_buf = dev.new_buffer_with_data(
-        params.as_ptr() as *const _,
-        (params.len() * std::mem::size_of::<u32>()) as u64,
-        opts,
-    );
 
     // For GPTQ without g_idx, create a dummy single-element buffer.
     let dummy_buf;
@@ -2400,7 +2351,7 @@ pub fn gptq_dequant(
     enc.set_buffer(2, Some(scales.metal_buffer()), scales.offset() as u64);
     enc.set_buffer(3, Some(g_idx_buf), g_idx_offset);
     enc.set_buffer(4, Some(out.metal_buffer()), 0);
-    enc.set_buffer(5, Some(&params_buf), 0);
+    enc.set_bytes(5, 16, params.as_ptr() as *const std::ffi::c_void);
 
     // 2D grid: (out_features, in_features, 1) — each thread handles one output element.
     let max_tg = pipeline.max_total_threads_per_threadgroup();
@@ -2699,8 +2650,8 @@ using namespace metal;
 // Buffers:
 //   buffer(0) x         - float32 input activations [M, K], row-major
 //   buffer(1) w_packed  - uint8 packed Q4 weights [N, K/2], row-major
-//   buffer(2) scales    - float32 per-group scales [N, groups_per_row]
-//   buffer(3) biases    - float32 per-group biases [N, groups_per_row]
+//   buffer(2) scales    - float16 per-group scales [N, groups_per_row]
+//   buffer(3) biases    - float16 per-group biases [N, groups_per_row]
 //   buffer(4) output    - float32 output [M, N], row-major
 //   buffer(5) params    - uint4: (M, N, K, group_size)
 //
@@ -2714,8 +2665,8 @@ constant constexpr uint BN_Q = 16;
 kernel void affine_qmm(
     device const float*   x         [[buffer(0)]],
     device const uint8_t* w_packed  [[buffer(1)]],
-    device const float*   scales    [[buffer(2)]],
-    device const float*   biases    [[buffer(3)]],
+    device const half*   scales    [[buffer(2)]],
+    device const half*   biases    [[buffer(3)]],
     device float*         output    [[buffer(4)]],
     constant uint4&       params    [[buffer(5)]],
     uint3 group_id     [[threadgroup_position_in_grid]],
@@ -2741,8 +2692,8 @@ kernel void affine_qmm(
     // Pointers for this output element
     device const float*   x_row = x + out_row * K;
     device const uint8_t* w_row = w_packed + out_col * half_k;
-    device const float*   s_row = scales + out_col * groups_per_row;
-    device const float*   b_row = biases + out_col * groups_per_row;
+    device const half*   s_row = scales + out_col * groups_per_row;
+    device const half*   b_row = biases + out_col * groups_per_row;
 
     float acc = 0.0f;
 
@@ -2862,8 +2813,8 @@ inline uint2 q_swizzle_tg(uint2 tid, uint swizzle_log) {
 kernel void affine_qmm_mma_q4(
     device const float*   x         [[buffer(0)]],
     device const uint8_t* w_packed  [[buffer(1)]],
-    device const float*   scales    [[buffer(2)]],
-    device const float*   biases    [[buffer(3)]],
+    device const half*   scales    [[buffer(2)]],
+    device const half*   biases    [[buffer(3)]],
     device float*         output    [[buffer(4)]],
     constant uint&        M         [[buffer(5)]],
     constant uint&        N         [[buffer(6)]],
@@ -3122,7 +3073,7 @@ kernel void affine_qmm_mma_q4(
 ///
 /// TG memory: Ws[BN × BK_padded] = 64 × 72 × 2 = 9,216 bytes
 /// Grid: (ceil(N/64), ceil(M/64), 1) threadgroups, 128 threads each
-/// Requires: K % 64 == 0, Metal 4.0+ (MetalPerformancePrimitives)
+/// Requires: Metal 4.0+ (MetalPerformancePrimitives). align_K specialization for K%64!=0.
 pub const QMM_NAX_Q4_SHADER_SOURCE: &str = r#"
 #include <metal_stdlib>
 #include <metal_simdgroup>
@@ -3154,6 +3105,7 @@ constant constexpr uint NAX_TK = 2;   // SK / UK = 32 / 16
 constant bool align_M [[function_constant(200)]];
 constant bool align_N [[function_constant(201)]];
 constant uint fc_group_size [[function_constant(205)]];
+constant bool align_K [[function_constant(206)]];
 
 // BaseNAXFrag coordinate: per-lane position in 16×16 fragment (32 lanes)
 // Each lane owns 2 rows × 4 cols = 8 elements
@@ -3224,48 +3176,60 @@ kernel void affine_qmm_nax_q4(
         // Each thread: n_reads = (BK/2 * BN) / 128 = 16 bytes → 32 halves
         threadgroup_barrier(mem_flags::mem_threadgroup);
         {
-            // Each thread handles 16 packed bytes spread across N rows
-            // Layout: thread processes BK/2 = 32 bytes per N row, with 128 threads
-            // across BN=64 N rows → 128/2 = each thread covers ~0.5 rows
-            // Simpler: linearize all work
-            const uint total_packed = NAX_BN * (NAX_BK / 2);  // 64 * 32 = 2048
-            const uint per_thread = total_packed / 128;         // 16
+            // K-coalesced dequant: each thread owns a fixed N row, reads K-contiguous bytes.
+            // 128 threads, BN=64 rows, BK/2=32 bytes/row → 2 threads per N row.
+            // Total: 128 threads × 16 bytes/thread = 2048 bytes = 64 × 32.
+            // Threads within the same SIMD group now read adjacent K bytes (coalesced).
+            const uint threads_per_row = 2;   // 32 bytes/row ÷ 16 bytes/thread
+            const uint bytes_per_thread = 16;
+            const uint n_local = lid / threads_per_row;          // 0..63 (fixed N row)
+            const uint k_byte_offset = (lid % threads_per_row) * bytes_per_thread; // 0 or 16
 
-            for (uint idx = 0; idx < per_thread; idx++) {
-                uint linear = lid * per_thread + idx;
-                uint n_local = linear / (NAX_BK / 2);   // which N row (0..63)
-                uint byte_off = linear % (NAX_BK / 2);  // which packed byte (0..31)
+            uint gn = col_start + n_local;
 
-                uint gn = col_start + n_local;
-                uint gk_base = kb + byte_off * 2;  // each byte = 2 K elements
+            if (align_N || gn < uN) {
+                device const uint8_t* src = w_packed + gn * half_k + (kb / 2) + k_byte_offset;
 
-                if (align_N || gn < uN) {
-                    uint8_t packed = w_packed[gn * half_k + (kb / 2) + byte_off];
+                // Scale/bias for this thread's K range
+                uint group_k_start = kb + k_byte_offset * 2; // each byte = 2 Q4 values
+                uint group_idx = group_k_start / fc_group_size;
+                // Clamp to valid range when at tail (non-aligned K)
+                if (!align_K && group_idx >= groups_per_row) {
+                    group_idx = groups_per_row - 1;
+                }
+                half scale = scales[gn * groups_per_row + group_idx];
+                half bias  = biases[gn * groups_per_row + group_idx];
+                half scale_hi = scale / half(16.0f);
 
-                    // Determine scale/bias group for low and high nibble
-                    uint gk_lo = gk_base;
-                    uint gk_hi = gk_base + 1;
-                    uint group_lo = gk_lo / fc_group_size;
-                    uint group_hi = gk_hi / fc_group_size;
+                // Dequant 16 bytes → 32 halfs, write to N-major TG memory
+                for (uint r = 0; r < bytes_per_thread; r++) {
+                    uint k_idx = k_byte_offset * 2 + r * 2;
+                    uint gk = kb + k_idx;  // global K index for this pair
 
-                    half s_lo = scales[gn * groups_per_row + group_lo];
-                    half b_lo = biases[gn * groups_per_row + group_lo];
-                    half s_hi = scales[gn * groups_per_row + group_hi];
-                    half b_hi = biases[gn * groups_per_row + group_hi];
-
-                    // Shift-free dequant for high nibble:
-                    // val_hi = (scale/16) * (packed & 0xf0) + bias
-                    half w_lo = s_lo * half(packed & 0x0f) + b_lo;
-                    half w_hi = (s_hi / half(16.0f)) * half(packed & 0xf0) + b_hi;
-
-                    uint k_local_lo = byte_off * 2;
-                    uint k_local_hi = byte_off * 2 + 1;
-                    Ws[n_local * NAX_BK_PAD + k_local_lo] = w_lo;
-                    Ws[n_local * NAX_BK_PAD + k_local_hi] = w_hi;
-                } else {
-                    uint k_local = byte_off * 2;
-                    Ws[n_local * NAX_BK_PAD + k_local] = half(0);
-                    Ws[n_local * NAX_BK_PAD + k_local + 1] = half(0);
+                    if (align_K || gk + 1 < uK) {
+                        uint8_t byte_val = src[r];
+                        half w_lo = scale * half(byte_val & 0x0f) + bias;
+                        half w_hi = scale_hi * half(byte_val & 0xf0) + bias;
+                        Ws[n_local * NAX_BK_PAD + k_idx]     = w_lo;
+                        Ws[n_local * NAX_BK_PAD + k_idx + 1] = w_hi;
+                    } else if (!align_K && gk < uK) {
+                        // Partial: only low nibble is valid
+                        uint8_t byte_val = src[r];
+                        half w_lo = scale * half(byte_val & 0x0f) + bias;
+                        Ws[n_local * NAX_BK_PAD + k_idx]     = w_lo;
+                        Ws[n_local * NAX_BK_PAD + k_idx + 1] = half(0);
+                    } else {
+                        Ws[n_local * NAX_BK_PAD + k_idx]     = half(0);
+                        Ws[n_local * NAX_BK_PAD + k_idx + 1] = half(0);
+                    }
+                }
+            } else {
+                // Out-of-bounds N: zero-fill
+                uint k_base = k_byte_offset * 2;
+                for (uint r = 0; r < bytes_per_thread; r++) {
+                    uint k_idx = k_base + r * 2;
+                    Ws[n_local * NAX_BK_PAD + k_idx]     = half(0);
+                    Ws[n_local * NAX_BK_PAD + k_idx + 1] = half(0);
                 }
             }
         }
@@ -3291,7 +3255,12 @@ kernel void affine_qmm_nax_q4(
                             uint c = a_col_base + uint(coord.fn);
                             if (align_M || r < uM) {
                                 for (short cj = 0; cj < 4; cj++) {
-                                    a_frag[ri * 4 + cj] = x[r * uK + c + uint(cj)];
+                                    uint ck = c + uint(cj);
+                                    if (align_K || ck < uK) {
+                                        a_frag[ri * 4 + cj] = x[r * uK + ck];
+                                    } else {
+                                        a_frag[ri * 4 + cj] = half(0);
+                                    }
                                 }
                             } else {
                                 for (short cj = 0; cj < 4; cj++) {
@@ -3480,8 +3449,8 @@ inline uint2 st_swizzle_tg(uint2 tid, uint swizzle_log) {
 kernel void affine_qmm_steel_q4(
     device const half*    x         [[buffer(0)]],   // half input [M, K]
     device const uint8_t* w_packed  [[buffer(1)]],   // packed Q4 [N, K/2]
-    device const float*   scales    [[buffer(2)]],   // [N * groups_per_row]
-    device const float*   biases    [[buffer(3)]],   // [N * groups_per_row]
+    device const half*   scales    [[buffer(2)]],   // [N * groups_per_row]
+    device const half*   biases    [[buffer(3)]],   // [N * groups_per_row]
     device float*         output    [[buffer(4)]],   // [M, N]
     constant uint&        M         [[buffer(5)]],
     constant uint&        N         [[buffer(6)]],
@@ -3723,6 +3692,607 @@ kernel void affine_qmm_steel_q4(
 "#;
 
 // ---------------------------------------------------------------------------
+// Metal shader source -- Steel Split-K Q4 QMM kernel (BM=32, BN=32, BK=32)
+// ---------------------------------------------------------------------------
+
+/// Steel Split-K Q4 QMM kernel: combines Steel double-buffering with Split-K
+/// parallelism for improved occupancy at low M.
+///
+/// When M is small (e.g. M=32), the standard Steel kernel only launches 1 TG
+/// per core. Split-K partitions the K dimension across grid.z, giving each
+/// partition a slice of K to accumulate, then a reduce kernel sums the
+/// float partials and converts to f16.
+///
+/// Key features from Steel:
+/// - Double-buffered As/Ws arrays (prefetch next tile while computing current)
+/// - ST_BK_PAD=40 for bank conflict avoidance
+/// - Serpentine MMA ordering
+/// - K-contiguous B dequant pattern (MLX QuantizedBlockLoader)
+///
+/// Split-K additions:
+/// - grid.z = k_partitions, each partition handles [k_start, k_end)
+/// - Two-path store: k_partitions==1 writes f16 to output directly;
+///   k_partitions>1 writes f32 partials to c_split buffer
+/// - Separate reduce kernel sums partials → f16 output
+pub const QMM_STEEL_SPLITK_Q4_SHADER_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// ---------------------------------------------------------------------------
+// Steel Split-K Q4 QMM: BM=32, BN=32, BK=32, 2 SG (64 threads).
+// Double-buffered. K-partitioned via grid.z for occupancy at low M.
+// ---------------------------------------------------------------------------
+
+constant constexpr uint SK_BM = 32;
+constant constexpr uint SK_BN = 32;
+constant constexpr uint SK_BK = 32;
+constant constexpr uint SK_BK_PAD = 40;  // BK + 16/sizeof(half) = 32 + 8
+constant constexpr uint SK_TG_SIZE = 64;
+
+// Q4 pack constants
+constant constexpr uint SK_PACK_FACTOR = 8;   // 32 / 4 bits
+constant constexpr uint SK_BYTES_PER_PACK = 4; // one uint32 = 8 nibbles = 4 bytes
+constant constexpr uint SK_BK_PACKED = SK_BK / SK_PACK_FACTOR;  // 32/8 = 4
+constant constexpr uint SK_N_READS = (SK_BK_PACKED * SK_BN) / SK_TG_SIZE;  // (4*32)/64 = 2
+
+constant bool sk_align_M [[function_constant(200)]];
+constant bool sk_align_N [[function_constant(201)]];
+constant uint sk_fc_group_size [[function_constant(205)]];
+
+#if __METAL_VERSION__ >= 310
+template <typename T>
+METAL_FUNC uniform<T> sk_as_uniform(T val) {
+    return make_uniform(val);
+}
+#else
+template <typename T>
+METAL_FUNC T sk_as_uniform(T val) {
+    return val;
+}
+#endif
+
+kernel void affine_qmm_steel_splitk_q4(
+    device const half*    x         [[buffer(0)]],   // half input [M, K]
+    device const uint8_t* w_packed  [[buffer(1)]],   // packed Q4 [N, K/2]
+    device const half*   scales    [[buffer(2)]],   // [N * groups_per_row]
+    device const half*   biases    [[buffer(3)]],   // [N * groups_per_row]
+    device float*         c_split   [[buffer(4)]],   // float partial sums [k_partitions, M, N]
+    device half*          output    [[buffer(5)]],   // final f16 output [M, N]
+    constant uint3&       params    [[buffer(6)]],   // [M, N, K]
+    constant uint2&       split_params [[buffer(7)]], // [k_partition_size, k_partitions]
+    uint3 group_id        [[threadgroup_position_in_grid]],
+    uint  tid_in_group    [[thread_index_in_threadgroup]],
+    uint  sgid            [[simdgroup_index_in_threadgroup]],
+    uint  lane_id         [[thread_index_in_simdgroup]])
+{
+    // Double-buffered threadgroup memory
+    threadgroup half As[2][SK_BM * SK_BK_PAD];  // 2 x 32x40 x 2 = 5120 bytes
+    threadgroup half Ws[2][SK_BK * SK_BN];       // 2 x 32x32 x 2 = 4096 bytes (total ~9KB)
+
+    const uint uM = sk_as_uniform(params.x);
+    const uint uN = sk_as_uniform(params.y);
+    const uint uK = sk_as_uniform(params.z);
+    const uint k_partition_size = sk_as_uniform(split_params.x);
+    const uint k_partitions = sk_as_uniform(split_params.y);
+
+    const uint partition_id = group_id.z;
+    const uint row_start = group_id.y * sk_as_uniform(SK_BM);
+    const uint col_start = group_id.x * sk_as_uniform(SK_BN);
+
+    const uint groups_per_row = uK / sk_fc_group_size;
+    const uint half_k = uK / 2;  // bytes per N row in packed weights
+
+    // Early exit for out-of-bounds threadgroups
+    if (!sk_align_M && row_start >= uM) return;
+    if (!sk_align_N && col_start >= uN) return;
+
+    // Split-K: compute K range for this partition
+    const uint k_start = partition_id * k_partition_size;
+    uint k_end = k_start + k_partition_size;
+    if (k_end > uK) k_end = uK;
+    if (k_start >= uK) return;
+
+    // 2-SG layout: SG0=rows 0-15, SG1=rows 16-31
+    const uint sg_row_base = sgid * 16;
+
+    simdgroup_float8x8 acc[2][4];
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < 2; i++)
+        #pragma clang loop unroll(full)
+        for (uint j = 0; j < 4; j++)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    // --- B loader thread mapping (MLX QuantizedBlockLoader pattern) ---
+    const uint w_bi = (SK_N_READS * tid_in_group) / SK_BK_PACKED;   // N row: 0..31
+    const uint w_bj = (SK_N_READS * tid_in_group) % SK_BK_PACKED;   // K col (packed): 0..3
+    const uint w_n_global = col_start + w_bi;
+
+    const uint group_steps = sk_fc_group_size / SK_BK;
+
+    // Tile range for this partition
+    const uint start_tile = k_start / SK_BK;
+    const uint end_tile = (k_end + SK_BK - 1) / SK_BK;
+    const uint num_k_tiles = end_tile - start_tile;
+
+    // Macro to load A tile into buffer BUF at K offset KB
+    #define LOAD_A_SK(BUF, KB) \
+    { \
+        uint a_row = tid_in_group & 31u; \
+        uint a_col_base = (tid_in_group >> 5u) * 16u; \
+        uint gr = row_start + a_row; \
+        uint gk_base = (KB) + a_col_base; \
+        if ((sk_align_M || gr < uM) && gk_base + 15 < uK) { \
+            for (uint d = 0; d < 16; d += 4) { \
+                *reinterpret_cast<threadgroup half4*>(&As[(BUF)][a_row * SK_BK_PAD + a_col_base + d]) = \
+                    *reinterpret_cast<device const half4*>(&x[gr * uK + gk_base + d]); \
+            } \
+        } else if (sk_align_M || gr < uM) { \
+            for (uint d = 0; d < 16; d++) { \
+                uint gk = gk_base + d; \
+                As[(BUF)][a_row * SK_BK_PAD + a_col_base + d] = (gk < uK) ? x[gr * uK + gk] : half(0); \
+            } \
+        } else { \
+            for (uint d = 0; d < 16; d++) { \
+                As[(BUF)][a_row * SK_BK_PAD + a_col_base + d] = half(0); \
+            } \
+        } \
+    }
+
+    // Macro to load B tile (dequant Q4) into buffer BUF at absolute tile index ABS_TILE
+    #define LOAD_B_SK(BUF, ABS_TILE) \
+    { \
+        uint kb = (ABS_TILE) * SK_BK; \
+        if (sk_align_N || w_n_global < uN) { \
+            device const uint8_t* src = w_packed + w_n_global * half_k + kb / 2 + w_bj * SK_BYTES_PER_PACK; \
+            uint group_idx = kb / sk_fc_group_size; \
+            float scale_f = scales[w_n_global * groups_per_row + group_idx]; \
+            float bias_f  = biases[w_n_global * groups_per_row + group_idx]; \
+            half s_lo = half(scale_f); \
+            half s_hi = half(scale_f) / half(16.0f); \
+            half bias_h = half(bias_f); \
+            uint k_local_base = w_bj * SK_PACK_FACTOR; \
+            for (uint r = 0; r < SK_N_READS; r++) { \
+                uint k_local = k_local_base + r * SK_PACK_FACTOR; \
+                if (kb + k_local + SK_PACK_FACTOR <= uK) { \
+                    device const uint8_t* wp = src + r * SK_BYTES_PER_PACK; \
+                    for (uint i = 0; i < SK_PACK_FACTOR / 2; i++) { \
+                        uint8_t byte = wp[i]; \
+                        Ws[(BUF)][(k_local + 2*i) * SK_BN + w_bi] = s_lo * half(byte & 0x0f) + bias_h; \
+                        Ws[(BUF)][(k_local + 2*i + 1) * SK_BN + w_bi] = s_hi * half(byte & 0xf0) + bias_h; \
+                    } \
+                } else { \
+                    for (uint d = 0; d < SK_PACK_FACTOR; d++) { \
+                        if (kb + k_local + d < uK) { \
+                            device const uint8_t* wp = src + r * SK_BYTES_PER_PACK; \
+                            uint8_t byte = wp[d / 2]; \
+                            half val = (d & 1) == 0 \
+                                ? (s_lo * half(byte & 0x0f) + bias_h) \
+                                : (s_hi * half(byte & 0xf0) + bias_h); \
+                            Ws[(BUF)][(k_local + d) * SK_BN + w_bi] = val; \
+                        } else { \
+                            Ws[(BUF)][(k_local + d) * SK_BN + w_bi] = half(0); \
+                        } \
+                    } \
+                } \
+            } \
+        } else { \
+            uint k_local_base = w_bj * SK_PACK_FACTOR; \
+            for (uint d = 0; d < SK_N_READS * SK_PACK_FACTOR; d++) { \
+                Ws[(BUF)][(k_local_base + d) * SK_BN + w_bi] = half(0); \
+            } \
+        } \
+    }
+
+    // Load first tile (buffer 0)
+    LOAD_A_SK(0, start_tile * SK_BK);
+    LOAD_B_SK(0, start_tile);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // --- Main loop: double-buffered ---
+    for (uint tile_offset = 0; tile_offset < num_k_tiles; tile_offset++) {
+        uint abs_tile = start_tile + tile_offset;
+        uint cur_buf = tile_offset & 1;
+        uint nxt_buf = 1 - cur_buf;
+
+        // Prefetch next tile into nxt_buf (if exists)
+        if (tile_offset + 1 < num_k_tiles) {
+            uint next_abs = abs_tile + 1;
+            uint next_kb = next_abs * SK_BK;
+            LOAD_A_SK(nxt_buf, next_kb);
+            LOAD_B_SK(nxt_buf, next_abs);
+        }
+
+        // --- MMA compute on current buffer ---
+        #pragma clang loop unroll(full)
+        for (uint kk = 0; kk < 4; kk++) {
+            simdgroup_half8x8 a_frag[2];
+            simdgroup_half8x8 b_frag[4];
+
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 2; i++) {
+                simdgroup_load(a_frag[i],
+                    &As[cur_buf][(sg_row_base + i * 8) * SK_BK_PAD + kk * 8], SK_BK_PAD);
+            }
+
+            #pragma clang loop unroll(full)
+            for (uint j = 0; j < 4; j++) {
+                simdgroup_load(b_frag[j],
+                    &Ws[cur_buf][kk * 8 * SK_BN + j * 8], SK_BN);
+            }
+
+            // 2x4 outer product with serpentine
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 2; i++) {
+                #pragma clang loop unroll(full)
+                for (uint j = 0; j < 4; j++) {
+                    uint n_serp = (i % 2) ? (3 - j) : j;
+                    simdgroup_multiply_accumulate(
+                        acc[i][n_serp], a_frag[i], b_frag[n_serp], acc[i][n_serp]);
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    #undef LOAD_A_SK
+    #undef LOAD_B_SK
+
+    // --- Store results ---
+    const uint qid = lane_id / 4;
+    const uint fm = (qid & 4u) + ((lane_id / 2u) % 4u);
+    const uint fn_val = (qid & 2u) * 2u + (lane_id % 2u) * 2u;
+
+    if (k_partitions > 1) {
+        // Split-K: write float partials to c_split
+        const uint partition_stride = uM * uN;
+        device float* out_f = c_split + partition_id * partition_stride;
+
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 2; i++) {
+            #pragma clang loop unroll(full)
+            for (uint j = 0; j < 4; j++) {
+                uint gr = row_start + sg_row_base + i * 8 + fm;
+                uint gc0 = col_start + j * 8 + fn_val;
+                uint gc1 = gc0 + 1;
+                auto elems = acc[i][j].thread_elements();
+
+                if (sk_align_M && sk_align_N) {
+                    out_f[gr * uN + gc0] = elems[0];
+                    out_f[gr * uN + gc1] = elems[1];
+                } else {
+                    if ((sk_align_M || gr < uM) && (sk_align_N || gc0 < uN))
+                        out_f[gr * uN + gc0] = elems[0];
+                    if ((sk_align_M || gr < uM) && (sk_align_N || gc1 < uN))
+                        out_f[gr * uN + gc1] = elems[1];
+                }
+            }
+        }
+    } else {
+        // No split-K: cast to half and write directly to output
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 2; i++) {
+            #pragma clang loop unroll(full)
+            for (uint j = 0; j < 4; j++) {
+                uint gr = row_start + sg_row_base + i * 8 + fm;
+                uint gc0 = col_start + j * 8 + fn_val;
+                uint gc1 = gc0 + 1;
+                auto elems = acc[i][j].thread_elements();
+
+                if (sk_align_M && sk_align_N) {
+                    output[gr * uN + gc0] = half(elems[0]);
+                    output[gr * uN + gc1] = half(elems[1]);
+                } else {
+                    if ((sk_align_M || gr < uM) && (sk_align_N || gc0 < uN))
+                        output[gr * uN + gc0] = half(elems[0]);
+                    if ((sk_align_M || gr < uM) && (sk_align_N || gc1 < uN))
+                        output[gr * uN + gc1] = half(elems[1]);
+                }
+            }
+        }
+    }
+}
+
+// Reduce split-K float partials → half output
+kernel void steel_splitk_reduce(
+    device const float* c_split   [[buffer(0)]],
+    device half*        output    [[buffer(1)]],
+    constant uint3&     params    [[buffer(2)]],  // [N, k_partitions, partition_stride]
+    uint2 gid [[thread_position_in_grid]])
+{
+    const uint N = params.x;
+    const uint k_partitions = params.y;
+    const uint partition_stride = params.z;
+    const uint idx = gid.y * N + gid.x;
+    if (gid.x >= N) return;
+    float sum = 0.0f;
+    for (uint p = 0; p < k_partitions; p++) {
+        sum += c_split[p * partition_stride + idx];
+    }
+    output[idx] = half(sum);
+}
+"#;
+
+// ---------------------------------------------------------------------------
+// Metal shader source -- Steel-4SG Split-K Q4 QMM (BM=32, BN=32, BK=32, 4 SG / 128 threads)
+// ---------------------------------------------------------------------------
+
+/// Steel-4SG Split-K Q4 QMM: 4 SG (128 threads) with MPP hardware MMA.
+///
+/// Combines Steel Split-K's double-buffered A/B loading and K-partitioning
+/// with MetalPerformancePrimitives 16×16×16 hardware MMA (matmul2d).
+///
+/// - 4 SG in 2×2 layout, each covers 16×16 of the 32×32 output tile
+/// - Double-buffered TG memory (~9KB): As[2][32×40] + Ws[2][32×32]
+/// - Split-K via grid.z for GPU occupancy at low M (32-127)
+/// - Reuses `steel_splitk_reduce` kernel for multi-partition reduction
+pub const QMM_STEEL4SG_SPLITK_Q4_SHADER_SOURCE: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup>
+#include <metal_simdgroup_matrix>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+using namespace metal;
+
+// ---------------------------------------------------------------------------
+// Steel-4SG Split-K Q4 QMM: BM=32, BN=32, BK=32, 4 SG (128 threads).
+// Double-buffered. K-partitioned via grid.z for occupancy at low M.
+// Hardware MMA via mpp::tensor_ops::matmul2d (16×16×32 tiles).
+// ---------------------------------------------------------------------------
+
+constant constexpr uint S4_BM = 32;
+constant constexpr uint S4_BN = 32;
+constant constexpr uint S4_BK = 32;
+constant constexpr uint S4_BK_PAD = 40;
+constant constexpr uint S4_TG_SIZE = 128;  // 4 SG instead of 2
+
+// Q4 pack constants
+constant constexpr uint S4_PACK_FACTOR = 8;   // 32 / 4 bits
+constant constexpr uint S4_BYTES_PER_PACK = 4; // one uint32 = 8 nibbles = 4 bytes
+constant constexpr uint S4_BK_PACKED = S4_BK / S4_PACK_FACTOR;  // 32/8 = 4
+// 128 threads loading 32×4=128 packed positions → 1 read per thread
+constant constexpr uint S4_N_READS = (S4_BK_PACKED * S4_BN) / S4_TG_SIZE;  // (4*32)/128 = 1
+
+// MMA dimensions (mpp::tensor_ops::matmul2d uses 16×16×32 tiles)
+constant constexpr uint S4_UM = 16;
+constant constexpr uint S4_UN = 16;
+constant constexpr uint S4_UK = 32;
+
+// Function constants (same IDs as Steel Split-K)
+constant bool s4_align_M [[function_constant(200)]];
+constant bool s4_align_N [[function_constant(201)]];
+constant uint s4_fc_group_size [[function_constant(205)]];
+
+// Lane coordinate helper (same mapping as NAX kernel)
+struct S4Coord {
+    short fm;
+    short fn;
+};
+
+inline S4Coord s4_lane_coord(uint slid) {
+    short qid = short(slid >> 2);
+    short fm = ((qid & 4) | ((short(slid) >> 1) & 3));
+    short fn = ((qid & 2) | (short(slid) & 1)) * 4;
+    return {fm, fn};
+}
+
+kernel void affine_qmm_steel4sg_splitk_q4(
+    device const half*    x         [[buffer(0)]],
+    device const uint8_t* w_packed  [[buffer(1)]],
+    device const half*    scales    [[buffer(2)]],
+    device const half*    biases    [[buffer(3)]],
+    device float*         c_split   [[buffer(4)]],
+    device half*          output    [[buffer(5)]],
+    constant uint3&       params    [[buffer(6)]],
+    constant uint2&       split_params [[buffer(7)]],
+    uint3 tid    [[threadgroup_position_in_grid]],
+    uint  lid    [[thread_index_in_threadgroup]],
+    uint  sgid   [[simdgroup_index_in_threadgroup]],
+    uint  slid   [[thread_index_in_simdgroup]])
+{
+    // TG memory: double-buffered A and W tiles
+    threadgroup half As[2][S4_BM * S4_BK_PAD];  // 2 × 32×40 × 2 = 5120 bytes
+    threadgroup half Ws[2][S4_BK * S4_BN];       // 2 × 32×32 × 2 = 4096 bytes (~9KB total)
+
+    // Split-K setup
+    const uint uM = params.x;
+    const uint uN = params.y;
+    const uint uK = params.z;
+    const uint k_partition_size = split_params.x;
+    const uint k_partitions = split_params.y;
+    const uint partition_id = tid.z;
+    const uint k_start = partition_id * k_partition_size;
+    uint k_end = k_start + k_partition_size;
+    if (k_end > uK) k_end = uK;
+    if (k_start >= uK) return;
+    const uint row_start = tid.y * S4_BM;
+    const uint col_start = tid.x * S4_BN;
+
+    // 4 SG in 2×2 layout, each covers 16×16 of 32×32 output
+    const uint sg_row = sgid / 2;   // 0 or 1 (M dimension)
+    const uint sg_col = sgid % 2;   // 0 or 1 (N dimension)
+
+    // Accumulator: 16×16 fragment, 8 elements per lane
+    float acc[8];
+    for (int e = 0; e < 8; e++) acc[e] = 0.0f;
+
+    S4Coord coord = s4_lane_coord(slid);
+
+    constexpr auto mma_desc = mpp::tensor_ops::matmul2d_descriptor(
+        S4_UM, S4_UN, S4_UK,
+        false,   // transpose_a
+        false,   // transpose_b (Ws is K×N layout)
+        true,    // accumulate
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+
+    // --- A load macro: 128 threads load BM×BK = 32×32 halfs ---
+    #define LOAD_A_S4(BUF, KB) \
+    { \
+        const uint elems_per_thread = 8; \
+        const uint threads_per_row = S4_TG_SIZE / S4_BM; /* 128/32 = 4 */ \
+        uint a_row = lid / threads_per_row; /* 0..31 */ \
+        uint a_col_offset = (lid % threads_per_row) * elems_per_thread; /* 0,8,16,24 */ \
+        uint gr = row_start + a_row; \
+        uint gk_base = (KB) + a_col_offset; \
+        if ((s4_align_M || gr < uM) && gk_base + 7 < uK) { \
+            for (uint d = 0; d < elems_per_thread; d += 4) { \
+                *reinterpret_cast<threadgroup half4*>(&As[(BUF)][a_row * S4_BK_PAD + a_col_offset + d]) = \
+                    *reinterpret_cast<device const half4*>(&x[gr * uK + gk_base + d]); \
+            } \
+        } else if (s4_align_M || gr < uM) { \
+            for (uint d = 0; d < elems_per_thread; d++) { \
+                uint gk = gk_base + d; \
+                As[(BUF)][a_row * S4_BK_PAD + a_col_offset + d] = (gk < uK) ? x[gr * uK + gk] : half(0); \
+            } \
+        } else { \
+            for (uint d = 0; d < elems_per_thread; d++) { \
+                As[(BUF)][a_row * S4_BK_PAD + a_col_offset + d] = half(0); \
+            } \
+        } \
+    }
+
+    // --- B load macro: 128 threads dequant BN×BK_PACKED = 32×4 = 128 positions ---
+    #define LOAD_B_S4(BUF, TILE_KB) \
+    { \
+        /* 128 threads, 128 packed positions -> 1 per thread */ \
+        const uint w_bi = lid / S4_BK_PACKED; /* N row: 0..31 */ \
+        const uint w_bj = lid % S4_BK_PACKED; /* K col (packed): 0..3 */ \
+        uint w_n = col_start + w_bi; \
+        uint kb = (TILE_KB); \
+        if (s4_align_N || w_n < uN) { \
+            device const uint8_t* src = w_packed + w_n * (uK / 2) + kb / 2 + w_bj * S4_BYTES_PER_PACK; \
+            uint group_idx = kb / s4_fc_group_size; \
+            float scale_f = scales[w_n * (uK / s4_fc_group_size) + group_idx]; \
+            float bias_f  = biases[w_n * (uK / s4_fc_group_size) + group_idx]; \
+            half s_lo = half(scale_f); \
+            half s_hi = half(scale_f) / half(16.0f); \
+            half bias_h = half(bias_f); \
+            uint k_local = w_bj * S4_PACK_FACTOR; \
+            /* Dequant 1 pack (8 Q4 values = 4 bytes) */ \
+            for (uint i = 0; i < S4_PACK_FACTOR / 2; i++) { \
+                uint8_t byte = src[i]; \
+                Ws[(BUF)][(k_local + 2*i) * S4_BN + w_bi] = s_lo * half(byte & 0x0f) + bias_h; \
+                Ws[(BUF)][(k_local + 2*i + 1) * S4_BN + w_bi] = s_hi * half(byte & 0xf0) + bias_h; \
+            } \
+        } else { \
+            uint k_local = w_bj * S4_PACK_FACTOR; \
+            for (uint d = 0; d < S4_PACK_FACTOR; d++) { \
+                Ws[(BUF)][(k_local + d) * S4_BN + w_bi] = half(0); \
+            } \
+        } \
+    }
+
+    // Number of K-tiles for this partition
+    uint k_tiles_start = k_start / S4_BK;
+    uint k_tiles_end = (k_end + S4_BK - 1) / S4_BK;
+    uint num_k_tiles = k_tiles_end - k_tiles_start;
+
+    // Load first tile
+    LOAD_A_S4(0, k_start);
+    LOAD_B_S4(0, k_start);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint tile = 0; tile < num_k_tiles; tile++) {
+        uint cur_buf = tile & 1;
+        uint nxt_buf = 1 - cur_buf;
+
+        // Prefetch next tile
+        uint next_kb = k_start + (tile + 1) * S4_BK;
+        if (tile + 1 < num_k_tiles && next_kb < k_end) {
+            LOAD_A_S4(nxt_buf, next_kb);
+            LOAD_B_S4(nxt_buf, next_kb);
+        }
+
+        // MMA compute: BK=32, UK=32 → single MMA call per K-tile
+        {
+            // Load A fragment: 16×32 from As[sg_row*16..+16, 0..+32]
+            // 16 elements per lane: 2 K-blocks × 2 rows × 4 cols
+            half a_frag[16];
+            for (short ki = 0; ki < 2; ki++) {  // 2 K-blocks of 16
+                for (short ri = 0; ri < 2; ri++) {
+                    uint a_row = sg_row * S4_UM + uint(ri * 8 + coord.fm);
+                    uint a_col = ki * 16 + uint(coord.fn);
+                    for (short cj = 0; cj < 4; cj++) {
+                        a_frag[ki * 8 + ri * 4 + cj] = As[cur_buf][a_row * S4_BK_PAD + a_col + uint(cj)];
+                    }
+                }
+            }
+
+            // Load B fragment: 32×16 from Ws[0..+32, sg_col*16..+16]
+            // 16 elements per lane: 2 K-blocks × 2 rows × 4 cols
+            half b_frag[16];
+            for (short ki = 0; ki < 2; ki++) {  // 2 K-blocks of 16 K-rows
+                for (short ri = 0; ri < 2; ri++) {
+                    uint b_row = ki * 16 + uint(ri * 8 + coord.fm);
+                    uint b_col = sg_col * S4_UN + uint(coord.fn);
+                    for (short cj = 0; cj < 4; cj++) {
+                        b_frag[ki * 8 + ri * 4 + cj] = Ws[cur_buf][b_row * S4_BN + b_col + uint(cj)];
+                    }
+                }
+            }
+
+            // MMA: A(16×32) × B(32×16) → C(16×16)
+            mpp::tensor_ops::matmul2d<mma_desc, metal::execution_simdgroup> gemm_op;
+            auto ct_a = gemm_op.template get_left_input_cooperative_tensor<half, half, float>();
+            auto ct_b = gemm_op.template get_right_input_cooperative_tensor<half, half, float>();
+            auto ct_c = gemm_op.template get_destination_cooperative_tensor<decltype(ct_a), decltype(ct_b), float>();
+
+            for (int e = 0; e < ct_a.get_capacity(); e++) ct_a[e] = a_frag[e];
+            for (int e = 0; e < ct_b.get_capacity(); e++) ct_b[e] = b_frag[e];
+            for (int e = 0; e < ct_c.get_capacity(); e++) ct_c[e] = acc[e];
+
+            gemm_op.run(ct_a, ct_b, ct_c);
+
+            for (int e = 0; e < ct_c.get_capacity(); e++) acc[e] = ct_c[e];
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    #undef LOAD_A_S4
+    #undef LOAD_B_S4
+
+    // Store results: each SG writes its 16×16 tile
+    // Lane layout: 2 rows × 4 cols = 8 elements per lane
+    if (k_partitions == 1) {
+        // Direct f16 output
+        for (short ri = 0; ri < 2; ri++) {
+            uint gr = row_start + sg_row * S4_UM + uint(ri * 8 + coord.fm);
+            uint gc = col_start + sg_col * S4_UN + uint(coord.fn);
+            if ((s4_align_M || gr < uM) && (s4_align_N || gc + 3 < uN)) {
+                for (short cj = 0; cj < 4; cj++) {
+                    output[gr * uN + gc + uint(cj)] = half(acc[ri * 4 + cj]);
+                }
+            } else if (s4_align_M || gr < uM) {
+                for (short cj = 0; cj < 4; cj++) {
+                    if (s4_align_N || gc + uint(cj) < uN) {
+                        output[gr * uN + gc + uint(cj)] = half(acc[ri * 4 + cj]);
+                    }
+                }
+            }
+        }
+    } else {
+        // Write f32 partials to c_split[partition_id * M * N + ...]
+        uint part_offset = partition_id * uM * uN;
+        for (short ri = 0; ri < 2; ri++) {
+            uint gr = row_start + sg_row * S4_UM + uint(ri * 8 + coord.fm);
+            uint gc = col_start + sg_col * S4_UN + uint(coord.fn);
+            if ((s4_align_M || gr < uM) && (s4_align_N || gc + 3 < uN)) {
+                for (short cj = 0; cj < 4; cj++) {
+                    c_split[part_offset + gr * uN + gc + uint(cj)] = acc[ri * 4 + cj];
+                }
+            } else if (s4_align_M || gr < uM) {
+                for (short cj = 0; cj < 4; cj++) {
+                    if (s4_align_N || gc + uint(cj) < uN) {
+                        c_split[part_offset + gr * uN + gc + uint(cj)] = acc[ri * 4 + cj];
+                    }
+                }
+            }
+        }
+    }
+}
+"#;
+
+// ---------------------------------------------------------------------------
 // Metal shader source -- Skinny-M Q4 QMM kernel (BM=32, BN=64, BK=32)
 // ---------------------------------------------------------------------------
 
@@ -3773,8 +4343,8 @@ METAL_FUNC T skinny_as_uniform(T val) {
 kernel void affine_qmm_skinny_q4(
     device const float*   x         [[buffer(0)]],
     device const uint8_t* w_packed  [[buffer(1)]],
-    device const float*   scales    [[buffer(2)]],
-    device const float*   biases    [[buffer(3)]],
+    device const half*   scales    [[buffer(2)]],
+    device const half*   biases    [[buffer(3)]],
     device float*         output    [[buffer(4)]],
     constant uint&        M         [[buffer(5)]],
     constant uint&        N         [[buffer(6)]],
@@ -4033,8 +4603,8 @@ METAL_FUNC T skinny_f16_as_uniform(T val) { return val; }
 kernel void affine_qmm_skinny_f16_q4(
     device const half*    x         [[buffer(0)]],
     device const uint8_t* w_packed  [[buffer(1)]],
-    device const float*   scales    [[buffer(2)]],
-    device const float*   biases    [[buffer(3)]],
+    device const half*   scales    [[buffer(2)]],
+    device const half*   biases    [[buffer(3)]],
     device half*          output    [[buffer(4)]],
     constant uint&        M         [[buffer(5)]],
     constant uint&        N         [[buffer(6)]],
@@ -4295,8 +4865,8 @@ METAL_FUNC T mma_f16_as_uniform(T val) { return val; }
 kernel void affine_qmm_mma_f16_q4(
     device const half*    x         [[buffer(0)]],
     device const uint8_t* w_packed  [[buffer(1)]],
-    device const float*   scales    [[buffer(2)]],
-    device const float*   biases    [[buffer(3)]],
+    device const half*   scales    [[buffer(2)]],
+    device const half*   biases    [[buffer(3)]],
     device half*          output    [[buffer(4)]],
     constant uint&        M         [[buffer(5)]],
     constant uint&        N         [[buffer(6)]],
@@ -4521,8 +5091,8 @@ METAL_FUNC T tiny_as_uniform(T val) {
 kernel void affine_qmm_tiny_q4(
     device const float*   x         [[buffer(0)]],
     device const uint8_t* w_packed  [[buffer(1)]],
-    device const float*   scales    [[buffer(2)]],
-    device const float*   biases    [[buffer(3)]],
+    device const half*   scales    [[buffer(2)]],
+    device const half*   biases    [[buffer(3)]],
     device float*         output    [[buffer(4)]],
     constant uint&        M         [[buffer(5)]],
     constant uint&        N         [[buffer(6)]],
@@ -4774,8 +5344,8 @@ constant constexpr uint THREADGROUP_SIZE = 64;
 kernel void affine_qmm_mma_q8(
     device const float*   x         [[buffer(0)]],
     device const uint8_t* w_packed  [[buffer(1)]],
-    device const float*   scales    [[buffer(2)]],
-    device const float*   biases    [[buffer(3)]],
+    device const half*   scales    [[buffer(2)]],
+    device const half*   biases    [[buffer(3)]],
     device float*         output    [[buffer(4)]],
     constant uint4&       params    [[buffer(5)]],
     uint3 group_id        [[threadgroup_position_in_grid]],
@@ -4944,8 +5514,8 @@ constant uint sk_fc_group_size [[function_constant(205)]];
 kernel void affine_qmm_splitk_q4(
     device const float*   x         [[buffer(0)]],
     device const uint8_t* w_packed  [[buffer(1)]],
-    device const float*   scales    [[buffer(2)]],
-    device const float*   biases    [[buffer(3)]],
+    device const half*   scales    [[buffer(2)]],
+    device const half*   biases    [[buffer(3)]],
     device float*         c_split   [[buffer(4)]],
     constant uint3&       params    [[buffer(5)]],
     constant uint2&       split_params [[buffer(6)]],
@@ -5220,8 +5790,8 @@ inline uint2 ql_swizzle_tg(uint2 tid, uint swizzle_log) {
 kernel void affine_qmm_qldr_q4(
     device const half*    A         [[buffer(0)]],   // half input [M, K]
     device const uint8_t* w_packed  [[buffer(1)]],   // packed Q4 [N, K/2] (byte-addressed)
-    device const float*   scales    [[buffer(2)]],   // [N * groups_per_row]
-    device const float*   biases    [[buffer(3)]],   // [N * groups_per_row]
+    device const half*   scales    [[buffer(2)]],   // [N * groups_per_row]
+    device const half*   biases    [[buffer(3)]],   // [N * groups_per_row]
     device float*         output    [[buffer(4)]],   // [M, N]
     constant uint&        M         [[buffer(5)]],
     constant uint&        N         [[buffer(6)]],
@@ -5455,6 +6025,14 @@ pub fn register_qmm(registry: &KernelRegistry) -> Result<(), KernelError> {
     registry.register_jit_source("qmm_skinny", QMM_SKINNY_SHADER_SOURCE)?;
     registry.register_jit_source("qmm_tiny", QMM_TINY_SHADER_SOURCE)?;
     registry.register_jit_source("qmm_steel_q4", QMM_STEEL_Q4_SHADER_SOURCE)?;
+    registry.register_jit_source("qmm_steel_splitk_q4", QMM_STEEL_SPLITK_Q4_SHADER_SOURCE)?;
+    // Steel-4SG kernel requires MetalPerformancePrimitives (Metal 3.1+), gracefully skip if unavailable
+    if let Err(e) = registry.register_jit_source(
+        "qmm_steel4sg_splitk_q4",
+        QMM_STEEL4SG_SPLITK_Q4_SHADER_SOURCE,
+    ) {
+        eprintln!("warning: qmm_steel4sg_splitk_q4 registration skipped (MPP unavailable): {e}");
+    }
     registry.register_jit_source("qmm_qldr_q4", QMM_QLDR_Q4_SHADER_SOURCE)?;
     registry.register_jit_source("qmm_skinny_f16", QMM_SKINNY_F16_SHADER_SOURCE)?;
     registry.register_jit_source("qmm_mma_f16", QMM_MMA_F16_SHADER_SOURCE)?;
@@ -5465,13 +6043,438 @@ pub fn register_qmm(registry: &KernelRegistry) -> Result<(), KernelError> {
     Ok(())
 }
 
+/// Steel Split-K Q4 QMM: double-buffered Steel kernel with K-partitioning.
+///
+/// Combines Steel's double-buffered A/B tiles (prefetch next while computing
+/// current) with Split-K parallelism for improved GPU occupancy at low M.
+///
+/// - k_partitions == 1: single-pass, writes f16 directly (no reduce overhead)
+/// - k_partitions > 1: writes f32 partials → reduce kernel sums → f16 output
+///
+/// Grid: (n_tiles, m_tiles, k_partitions), TG: (64, 1, 1)
+pub fn affine_qmm_steel_splitk_q4(
+    registry: &KernelRegistry,
+    x: &Array,
+    qw: &QuantizedWeight,
+    queue: &metal::CommandQueue,
+) -> Result<Array, KernelError> {
+    let m = x.shape()[0];
+    let n = qw.out_features;
+    let k = qw.in_features;
+    let dev = registry.device().raw();
+    let opts = metal::MTLResourceOptions::StorageModeShared;
+
+    const ST_BM: usize = 32;
+    const ST_BN: usize = 32;
+    const ST_BK: usize = 32;
+
+    let m_tiles = m.div_ceil(ST_BM);
+    let n_tiles = n.div_ceil(ST_BN);
+    let mn_tgs = m_tiles * n_tiles;
+    let target_tgs: usize = 320; // M3 Ultra 80-core x 4 TG/core
+    let k_tiles = k.div_ceil(ST_BK);
+    let k_partitions = if mn_tgs >= target_tgs || k_tiles <= 2 {
+        1
+    } else {
+        let desired = (target_tgs / mn_tgs).clamp(2, k_tiles.max(2));
+        desired.min(k_tiles)
+    };
+    // Round up to BK alignment
+    let k_partition_size = {
+        let raw = k.div_ceil(k_partitions);
+        raw.div_ceil(ST_BK) * ST_BK
+    };
+
+    let align_m = m % ST_BM == 0;
+    let align_n = n % ST_BN == 0;
+
+    let constants = [
+        (200u32, FunctionConstantValue::Bool(align_m)),
+        (201u32, FunctionConstantValue::Bool(align_n)),
+        (205u32, FunctionConstantValue::U32(qw.group_size)),
+    ];
+    let pipeline = registry.get_pipeline_with_constants(
+        "affine_qmm_steel_splitk_q4",
+        DType::Float16,
+        &constants,
+    )?;
+
+    let params: [u32; 3] = [
+        super::checked_u32(m, "M")?,
+        super::checked_u32(n, "N")?,
+        super::checked_u32(k, "K")?,
+    ];
+    let split_params: [u32; 2] = [
+        super::checked_u32(k_partition_size, "k_partition_size")?,
+        super::checked_u32(k_partitions, "k_partitions")?,
+    ];
+
+    let out = Array::uninit(dev, &[m, n], DType::Float16);
+
+    if k_partitions == 1 {
+        // Single pass: no c_split needed. Bind dummy at buffer(4).
+        let dummy_buf = dev.new_buffer(4, opts);
+
+        let cb = queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
+        enc.set_buffer(1, Some(&qw.weights_buf), 0);
+        enc.set_buffer(2, Some(&qw.scales_buf), 0);
+        enc.set_buffer(3, Some(&qw.biases_buf), 0);
+        enc.set_buffer(4, Some(&dummy_buf), 0);
+        enc.set_buffer(5, Some(out.metal_buffer()), 0);
+        enc.set_bytes(6, 12, params.as_ptr() as *const std::ffi::c_void);
+        enc.set_bytes(7, 8, split_params.as_ptr() as *const std::ffi::c_void);
+
+        let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
+        let tg = metal::MTLSize::new(64, 1, 1);
+        enc.dispatch_thread_groups(grid, tg);
+        enc.end_encoding();
+        super::commit_with_mode(cb, super::ExecMode::Sync);
+
+        Ok(out)
+    } else {
+        // Split-K: partial sums (f32) → reduce → f16
+        let partition_stride = m * n;
+        let c_split_size = (k_partitions * partition_stride * std::mem::size_of::<f32>()) as u64;
+        let c_split_buf = dev.new_buffer(c_split_size, opts);
+
+        let cb = queue.new_command_buffer();
+
+        // Phase 1: Split-K partial GEMM
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
+        enc.set_buffer(1, Some(&qw.weights_buf), 0);
+        enc.set_buffer(2, Some(&qw.scales_buf), 0);
+        enc.set_buffer(3, Some(&qw.biases_buf), 0);
+        enc.set_buffer(4, Some(&c_split_buf), 0);
+        enc.set_buffer(5, Some(out.metal_buffer()), 0);
+        enc.set_bytes(6, 12, params.as_ptr() as *const std::ffi::c_void);
+        enc.set_bytes(7, 8, split_params.as_ptr() as *const std::ffi::c_void);
+
+        let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, k_partitions as u64);
+        let tg = metal::MTLSize::new(64, 1, 1);
+        enc.dispatch_thread_groups(grid, tg);
+        enc.end_encoding();
+
+        // Phase 2: Reduce float partials → half output
+        let reduce_pipeline =
+            registry.get_pipeline_with_constants("steel_splitk_reduce", DType::Float16, &[])?;
+
+        let reduce_params: [u32; 3] = [
+            super::checked_u32(n, "N")?,
+            super::checked_u32(k_partitions, "k_partitions")?,
+            super::checked_u32(partition_stride, "partition_stride")?,
+        ];
+
+        let enc2 = cb.new_compute_command_encoder();
+        enc2.set_compute_pipeline_state(&reduce_pipeline);
+        enc2.set_buffer(0, Some(&c_split_buf), 0);
+        enc2.set_buffer(1, Some(out.metal_buffer()), 0);
+        enc2.set_bytes(2, 12, reduce_params.as_ptr() as *const std::ffi::c_void);
+
+        let reduce_grid = metal::MTLSize::new(n as u64, m as u64, 1);
+        let reduce_tg = metal::MTLSize::new(n.min(256) as u64, 1, 1);
+        enc2.dispatch_threads(reduce_grid, reduce_tg);
+        enc2.end_encoding();
+
+        super::commit_with_mode(cb, super::ExecMode::Sync);
+
+        Ok(out)
+    }
+}
+
+/// Steel Split-K Q4 QMM — into an existing command buffer.
+///
+/// Same logic as [`affine_qmm_steel_splitk_q4`] but encodes into `cb`
+/// instead of creating its own. The caller is responsible for committing.
+pub fn affine_qmm_steel_splitk_q4_into_cb(
+    registry: &KernelRegistry,
+    x: &Array,
+    qw: &QuantizedWeight,
+    cb: &metal::CommandBufferRef,
+) -> Result<Array, KernelError> {
+    let m = x.shape()[0];
+    let n = qw.out_features;
+    let k = qw.in_features;
+    let dev = registry.device().raw();
+    let opts = metal::MTLResourceOptions::StorageModeShared;
+
+    const ST_BM: usize = 32;
+    const ST_BN: usize = 32;
+    const ST_BK: usize = 32;
+
+    let m_tiles = m.div_ceil(ST_BM);
+    let n_tiles = n.div_ceil(ST_BN);
+    let mn_tgs = m_tiles * n_tiles;
+    let target_tgs: usize = 320;
+    let k_tiles = k.div_ceil(ST_BK);
+    let k_partitions = if mn_tgs >= target_tgs || k_tiles <= 2 {
+        1
+    } else {
+        let desired = (target_tgs / mn_tgs).clamp(2, k_tiles.max(2));
+        desired.min(k_tiles)
+    };
+    let k_partition_size = {
+        let raw = k.div_ceil(k_partitions);
+        raw.div_ceil(ST_BK) * ST_BK
+    };
+
+    let align_m = m % ST_BM == 0;
+    let align_n = n % ST_BN == 0;
+
+    let constants = [
+        (200u32, FunctionConstantValue::Bool(align_m)),
+        (201u32, FunctionConstantValue::Bool(align_n)),
+        (205u32, FunctionConstantValue::U32(qw.group_size)),
+    ];
+    let pipeline = registry.get_pipeline_with_constants(
+        "affine_qmm_steel_splitk_q4",
+        DType::Float16,
+        &constants,
+    )?;
+
+    let params: [u32; 3] = [
+        super::checked_u32(m, "M")?,
+        super::checked_u32(n, "N")?,
+        super::checked_u32(k, "K")?,
+    ];
+    let split_params: [u32; 2] = [
+        super::checked_u32(k_partition_size, "k_partition_size")?,
+        super::checked_u32(k_partitions, "k_partitions")?,
+    ];
+
+    let out = Array::uninit(dev, &[m, n], DType::Float16);
+
+    if k_partitions == 1 {
+        let dummy_buf = dev.new_buffer(4, opts);
+
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
+        enc.set_buffer(1, Some(&qw.weights_buf), 0);
+        enc.set_buffer(2, Some(&qw.scales_buf), 0);
+        enc.set_buffer(3, Some(&qw.biases_buf), 0);
+        enc.set_buffer(4, Some(&dummy_buf), 0);
+        enc.set_buffer(5, Some(out.metal_buffer()), 0);
+        enc.set_bytes(6, 12, params.as_ptr() as *const std::ffi::c_void);
+        enc.set_bytes(7, 8, split_params.as_ptr() as *const std::ffi::c_void);
+
+        let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
+        let tg = metal::MTLSize::new(64, 1, 1);
+        enc.dispatch_thread_groups(grid, tg);
+        enc.end_encoding();
+
+        Ok(out)
+    } else {
+        let partition_stride = m * n;
+        let c_split_size = (k_partitions * partition_stride * std::mem::size_of::<f32>()) as u64;
+        let c_split_buf = dev.new_buffer(c_split_size, opts);
+
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
+        enc.set_buffer(1, Some(&qw.weights_buf), 0);
+        enc.set_buffer(2, Some(&qw.scales_buf), 0);
+        enc.set_buffer(3, Some(&qw.biases_buf), 0);
+        enc.set_buffer(4, Some(&c_split_buf), 0);
+        enc.set_buffer(5, Some(out.metal_buffer()), 0);
+        enc.set_bytes(6, 12, params.as_ptr() as *const std::ffi::c_void);
+        enc.set_bytes(7, 8, split_params.as_ptr() as *const std::ffi::c_void);
+
+        let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, k_partitions as u64);
+        let tg = metal::MTLSize::new(64, 1, 1);
+        enc.dispatch_thread_groups(grid, tg);
+        enc.end_encoding();
+
+        let reduce_pipeline =
+            registry.get_pipeline_with_constants("steel_splitk_reduce", DType::Float16, &[])?;
+
+        let reduce_params: [u32; 3] = [
+            super::checked_u32(n, "N")?,
+            super::checked_u32(k_partitions, "k_partitions")?,
+            super::checked_u32(partition_stride, "partition_stride")?,
+        ];
+
+        let enc2 = cb.new_compute_command_encoder();
+        enc2.set_compute_pipeline_state(&reduce_pipeline);
+        enc2.set_buffer(0, Some(&c_split_buf), 0);
+        enc2.set_buffer(1, Some(out.metal_buffer()), 0);
+        enc2.set_bytes(2, 12, reduce_params.as_ptr() as *const std::ffi::c_void);
+
+        let reduce_grid = metal::MTLSize::new(n as u64, m as u64, 1);
+        let reduce_tg = metal::MTLSize::new(n.min(256) as u64, 1, 1);
+        enc2.dispatch_threads(reduce_grid, reduce_tg);
+        enc2.end_encoding();
+
+        Ok(out)
+    }
+}
+
+/// Steel-4SG Split-K Q4 QMM — into an existing command buffer.
+///
+/// 4 SG (128 threads) with MPP hardware MMA (matmul2d 16×16×16).
+/// Same Split-K logic as [`affine_qmm_steel_splitk_q4_into_cb`] but with
+/// hardware MMA for better throughput at M=32-127.
+///
+/// Grid: (n_tiles, m_tiles, k_partitions), TG: (128, 1, 1)
+pub fn affine_qmm_steel4sg_splitk_q4_into_cb(
+    registry: &KernelRegistry,
+    x: &Array,
+    qw: &QuantizedWeight,
+    cb: &metal::CommandBufferRef,
+) -> Result<Array, KernelError> {
+    let m = x.shape()[0];
+    let n = qw.out_features;
+    let k = qw.in_features;
+    let dev = registry.device().raw();
+    let opts = metal::MTLResourceOptions::StorageModeShared;
+
+    const ST_BM: usize = 32;
+    const ST_BN: usize = 32;
+    const ST_BK: usize = 32;
+
+    let m_tiles = m.div_ceil(ST_BM);
+    let n_tiles = n.div_ceil(ST_BN);
+    let mn_tgs = m_tiles * n_tiles;
+    let target_tgs: usize = 320;
+    let k_tiles = k.div_ceil(ST_BK);
+    let k_partitions = if mn_tgs >= target_tgs || k_tiles <= 2 {
+        1
+    } else {
+        let desired = (target_tgs / mn_tgs).clamp(2, k_tiles.max(2));
+        desired.min(k_tiles)
+    };
+    let k_partition_size = {
+        let raw = k.div_ceil(k_partitions);
+        raw.div_ceil(ST_BK) * ST_BK
+    };
+
+    let align_m = m % ST_BM == 0;
+    let align_n = n % ST_BN == 0;
+
+    let constants = [
+        (200u32, FunctionConstantValue::Bool(align_m)),
+        (201u32, FunctionConstantValue::Bool(align_n)),
+        (205u32, FunctionConstantValue::U32(qw.group_size)),
+    ];
+    let pipeline = registry.get_pipeline_with_constants(
+        "affine_qmm_steel4sg_splitk_q4",
+        DType::Float16,
+        &constants,
+    )?;
+
+    let params: [u32; 3] = [
+        super::checked_u32(m, "M")?,
+        super::checked_u32(n, "N")?,
+        super::checked_u32(k, "K")?,
+    ];
+    let split_params: [u32; 2] = [
+        super::checked_u32(k_partition_size, "k_partition_size")?,
+        super::checked_u32(k_partitions, "k_partitions")?,
+    ];
+
+    let out = Array::uninit(dev, &[m, n], DType::Float16);
+
+    if k_partitions == 1 {
+        let dummy_buf = dev.new_buffer(4, opts);
+
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
+        enc.set_buffer(1, Some(&qw.weights_buf), 0);
+        enc.set_buffer(2, Some(&qw.scales_buf), 0);
+        enc.set_buffer(3, Some(&qw.biases_buf), 0);
+        enc.set_buffer(4, Some(&dummy_buf), 0);
+        enc.set_buffer(5, Some(out.metal_buffer()), 0);
+        enc.set_bytes(6, 12, params.as_ptr() as *const std::ffi::c_void);
+        enc.set_bytes(7, 8, split_params.as_ptr() as *const std::ffi::c_void);
+
+        let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
+        let tg = metal::MTLSize::new(128, 1, 1);
+        enc.dispatch_thread_groups(grid, tg);
+        enc.end_encoding();
+
+        Ok(out)
+    } else {
+        let partition_stride = m * n;
+        let c_split_size = (k_partitions * partition_stride * std::mem::size_of::<f32>()) as u64;
+        let c_split_buf = dev.new_buffer(c_split_size, opts);
+
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
+        enc.set_buffer(1, Some(&qw.weights_buf), 0);
+        enc.set_buffer(2, Some(&qw.scales_buf), 0);
+        enc.set_buffer(3, Some(&qw.biases_buf), 0);
+        enc.set_buffer(4, Some(&c_split_buf), 0);
+        enc.set_buffer(5, Some(out.metal_buffer()), 0);
+        enc.set_bytes(6, 12, params.as_ptr() as *const std::ffi::c_void);
+        enc.set_bytes(7, 8, split_params.as_ptr() as *const std::ffi::c_void);
+
+        let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, k_partitions as u64);
+        let tg = metal::MTLSize::new(128, 1, 1);
+        enc.dispatch_thread_groups(grid, tg);
+        enc.end_encoding();
+
+        let reduce_pipeline =
+            registry.get_pipeline_with_constants("steel_splitk_reduce", DType::Float16, &[])?;
+
+        let reduce_params: [u32; 3] = [
+            super::checked_u32(n, "N")?,
+            super::checked_u32(k_partitions, "k_partitions")?,
+            super::checked_u32(partition_stride, "partition_stride")?,
+        ];
+
+        let enc2 = cb.new_compute_command_encoder();
+        enc2.set_compute_pipeline_state(&reduce_pipeline);
+        enc2.set_buffer(0, Some(&c_split_buf), 0);
+        enc2.set_buffer(1, Some(out.metal_buffer()), 0);
+        enc2.set_bytes(2, 12, reduce_params.as_ptr() as *const std::ffi::c_void);
+
+        let reduce_grid = metal::MTLSize::new(n as u64, m as u64, 1);
+        let reduce_tg = metal::MTLSize::new(n.min(256) as u64, 1, 1);
+        enc2.dispatch_threads(reduce_grid, reduce_tg);
+        enc2.end_encoding();
+
+        Ok(out)
+    }
+}
+
+/// Steel-4SG Split-K Q4 QMM — queue wrapper.
+///
+/// Creates its own command buffer, encodes via [`affine_qmm_steel4sg_splitk_q4_into_cb`],
+/// commits and waits. Converts f32 input to f16 if needed.
+pub fn affine_quantized_matmul_steel4sg_splitk(
+    registry: &KernelRegistry,
+    x: &Array,
+    qw: &QuantizedWeight,
+    queue: &metal::CommandQueue,
+) -> Result<Array, KernelError> {
+    let x_native;
+    let x = if x.dtype() == DType::Float32 {
+        x_native = ensure_f16(registry, x, queue)?;
+        &x_native
+    } else {
+        x
+    };
+
+    let cb = queue.new_command_buffer();
+    let out = affine_qmm_steel4sg_splitk_q4_into_cb(registry, x, qw, cb)?;
+    cb.commit();
+    cb.wait_until_completed();
+    Ok(out)
+}
+
 /// Affine quantized matrix-matrix multiply on GPU (Q4/Q8, Metal).
 ///
 /// Computes `output[m, n] = sum_k x[m, k] * dequant(w[n, k])` using a Metal
 /// compute kernel for quantized weights.
 ///
 /// - **Q4** (`bits == 4`): f16 is the sole native dtype. f32 input is cast to f16
-///   at entry. All Q4 paths (NAX, Skinny, Steel, Standard MMA) operate in f16
+///   at entry. All Q4 paths (Steel, BatchQMV, Skinny, Standard MMA) operate in f16
 ///   and return f16 output.
 /// - **Q8** (`bits == 8`): uses `affine_qmm_mma_q8` (BM=32, BN=32, 2 SG, f32-only legacy).
 ///
@@ -5537,62 +6540,21 @@ pub fn affine_quantized_matmul_batched(
 
     let result = if qw.bits == 4 {
         // Q4 dispatch priority:
-        // 1. NAX (HW MMA, f16): M >= 32, K % 64 == 0 → highest throughput
-        // 2. Skinny (split-K): M <= 32 → best for low-M
-        // 3. Standard MMA: fallback
-        const NAX_MIN_M: usize = 32;
+        // 1. Steel-4SG (M=32-127): 4 SG hardware MMA + Split-K occupancy
+        // 2. NAX (M >= 128): K-coalesced dequant, 4 SG MMA, align_K specialization
+        // 3. BatchQMV (M <= qmv_limit, K%512==0): fastest at low M
+        // 4. Skinny (M <= 32): split-K for best low-M utilization
+        // 5. Standard MMA: fallback (rarely reached)
+        const MMA_MIN_M: usize = 32;
 
-        if k % 64 == 0 && m >= NAX_MIN_M {
-            // --- NAX path: f16 HW MMA, BM=64 BN=64, 128 threads ---
-            // NAX kernel operates in f16. Skip casts when input is already f16.
-            let num_groups = (qw.out_features * qw.in_features) / qw.group_size as usize;
-
-            // Wrap scales/biases as 1D f32 Arrays for GPU cast
-            let scales_f32 = Array::new(
-                qw.scales_buf.clone(),
-                vec![num_groups],
-                vec![1],
-                DType::Float32,
-                0,
-            );
-            let biases_f32 = Array::new(
-                qw.biases_buf.clone(),
-                vec![num_groups],
-                vec![1],
-                DType::Float32,
-                0,
-            );
-
-            let cb = queue.new_command_buffer();
-
-            // x is guaranteed f16 (cast at entry for Q4)
-            let x_f16 = super::copy::copy_into_cb(registry, x, cb)?;
-
-            // Cast scales: f32 → f16
-            let scales_f16 =
-                super::copy::copy_cast_into_cb(registry, &scales_f32, DType::Float16, cb)?;
-            // Cast biases: f32 → f16
-            let biases_f16 =
-                super::copy::copy_cast_into_cb(registry, &biases_f32, DType::Float16, cb)?;
-
-            // Build a temporary QuantizedWeight with f16 scales/biases for NAX
-            let qw_f16 = QuantizedWeight {
-                weights_buf: qw.weights_buf.clone(),
-                scales_buf: scales_f16.metal_buffer().to_owned(),
-                biases_buf: biases_f16.metal_buffer().to_owned(),
-                group_size: qw.group_size,
-                bits: qw.bits,
-                out_features: qw.out_features,
-                in_features: qw.in_features,
-            };
-
-            // Dispatch NAX kernel (encodes into same CB) — output is f16
-            let out_f16 = affine_qmm_nax_q4_into_cb(registry, &x_f16, &qw_f16, cb)?;
-
-            // NAX output is f16 — native dtype for Q4. No cast needed.
-            super::commit_with_mode(cb, super::ExecMode::Sync);
-
-            return Ok(out_f16);
+        if m >= MMA_MIN_M {
+            if m < 128 {
+                // Steel-4SG: 4 SG hardware MMA + Split-K for M=32-127
+                return affine_quantized_matmul_steel4sg_splitk(registry, x, qw, queue);
+            }
+            // NAX handles all K alignments via align_K function constant.
+            // K-aligned path (K%64==0) has zero overhead vs previous implementation.
+            return affine_quantized_matmul_nax(registry, x, qw, queue);
         }
 
         // Q4 non-NAX dispatch: shape-aware kernel selection
@@ -5637,7 +6599,8 @@ pub fn affine_quantized_matmul_batched(
         const TINY_BM: usize = 8;
         const TINY_BN: usize = 64;
         const TINY_BK: usize = 32;
-        const SKINNY_BM: usize = 32;
+        const SKINNY_MAX_M: usize = 64;
+        const SKINNY_TILE_M: usize = 32;
         const SKINNY_BN: usize = 64;
         const SKINNY_BK: usize = 32;
         const STD_BM: usize = 64;
@@ -5683,14 +6646,9 @@ pub fn affine_quantized_matmul_batched(
             let k_u32 = super::checked_u32(k, "K")?;
             let kp_u32 = super::checked_u32(k_partitions, "k_partitions")?;
 
-            let m_buf = dev.new_buffer_with_data(&m_u32 as *const u32 as *const _, 4, opts);
-            let n_buf = dev.new_buffer_with_data(&n_u32 as *const u32 as *const _, 4, opts);
-            let k_buf = dev.new_buffer_with_data(&k_u32 as *const u32 as *const _, 4, opts);
-            let kp_buf = dev.new_buffer_with_data(&kp_u32 as *const u32 as *const _, 4, opts);
-
             if k_partitions == 1 {
                 // No split-K: write directly to output
-                let out = Array::zeros(dev, &[m, n], DType::Float32);
+                let out = Array::uninit(dev, &[m, n], DType::Float32);
 
                 let cb = queue.new_command_buffer();
                 let enc = cb.new_compute_command_encoder();
@@ -5700,10 +6658,10 @@ pub fn affine_quantized_matmul_batched(
                 enc.set_buffer(2, Some(&qw.scales_buf), 0);
                 enc.set_buffer(3, Some(&qw.biases_buf), 0);
                 enc.set_buffer(4, Some(out.metal_buffer()), 0);
-                enc.set_buffer(5, Some(&m_buf), 0);
-                enc.set_buffer(6, Some(&n_buf), 0);
-                enc.set_buffer(7, Some(&k_buf), 0);
-                enc.set_buffer(8, Some(&kp_buf), 0);
+                enc.set_bytes(5, 4, &m_u32 as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(6, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(7, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(8, 4, &kp_u32 as *const u32 as *const std::ffi::c_void);
 
                 let grid = metal::MTLSize::new(tn_tiles as u64, tm_tiles as u64, 1);
                 let tg = metal::MTLSize::new(64, 1, 1);
@@ -5718,7 +6676,7 @@ pub fn affine_quantized_matmul_batched(
                 let c_split_size =
                     (k_partitions * partition_stride * std::mem::size_of::<f32>()) as u64;
                 let c_split_buf = dev.new_buffer(c_split_size, opts);
-                let out = Array::zeros(dev, &[m, n], DType::Float32);
+                let out = Array::uninit(dev, &[m, n], DType::Float32);
 
                 let cb = queue.new_command_buffer();
 
@@ -5730,10 +6688,10 @@ pub fn affine_quantized_matmul_batched(
                 enc.set_buffer(2, Some(&qw.scales_buf), 0);
                 enc.set_buffer(3, Some(&qw.biases_buf), 0);
                 enc.set_buffer(4, Some(&c_split_buf), 0);
-                enc.set_buffer(5, Some(&m_buf), 0);
-                enc.set_buffer(6, Some(&n_buf), 0);
-                enc.set_buffer(7, Some(&k_buf), 0);
-                enc.set_buffer(8, Some(&kp_buf), 0);
+                enc.set_bytes(5, 4, &m_u32 as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(6, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(7, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(8, 4, &kp_u32 as *const u32 as *const std::ffi::c_void);
 
                 let grid =
                     metal::MTLSize::new(tn_tiles as u64, tm_tiles as u64, k_partitions as u64);
@@ -5745,20 +6703,14 @@ pub fn affine_quantized_matmul_batched(
                 let reduce_pipeline =
                     registry.get_pipeline_with_constants("tiny_qmm_reduce", DType::Float32, &[])?;
                 let mn_total_u32 = super::checked_u32(partition_stride, "mn_total")?;
-                let n_reduce_buf =
-                    dev.new_buffer_with_data(&n_u32 as *const u32 as *const _, 4, opts);
-                let kp_reduce_buf =
-                    dev.new_buffer_with_data(&kp_u32 as *const u32 as *const _, 4, opts);
-                let mn_buf =
-                    dev.new_buffer_with_data(&mn_total_u32 as *const u32 as *const _, 4, opts);
 
                 let enc2 = cb.new_compute_command_encoder();
                 enc2.set_compute_pipeline_state(&reduce_pipeline);
                 enc2.set_buffer(0, Some(&c_split_buf), 0);
                 enc2.set_buffer(1, Some(out.metal_buffer()), 0);
-                enc2.set_buffer(2, Some(&n_reduce_buf), 0);
-                enc2.set_buffer(3, Some(&kp_reduce_buf), 0);
-                enc2.set_buffer(4, Some(&mn_buf), 0);
+                enc2.set_bytes(2, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
+                enc2.set_bytes(3, 4, &kp_u32 as *const u32 as *const std::ffi::c_void);
+                enc2.set_bytes(4, 4, &mn_total_u32 as *const u32 as *const std::ffi::c_void);
 
                 let reduce_grid = metal::MTLSize::new(partition_stride as u64, 1, 1);
                 let reduce_tg = metal::MTLSize::new(partition_stride.min(256) as u64, 1, 1);
@@ -5769,151 +6721,138 @@ pub fn affine_quantized_matmul_batched(
 
                 Ok(out)
             }
-        } else if m <= SKINNY_BM {
-            // --- Skinny-M path: BM=32, BN=64, BK=32 with built-in split-K ---
-            // x is guaranteed f16 for Q4 (cast at entry). Always use f16 kernel.
-            let sm_tiles = m.div_ceil(SKINNY_BM);
-            let sn_tiles = n.div_ceil(SKINNY_BN);
+        } else if m <= SKINNY_MAX_M {
+            // --- Steel Split-K: double-buffered + K-partitioned ---
+            // Replaces Skinny MMA with Steel's double-buffering for better
+            // memory latency hiding at low M.
+            return affine_qmm_steel_splitk_q4(registry, x, qw, queue);
 
-            let align_m = m % SKINNY_BM == 0;
-            let align_n = n % SKINNY_BN == 0;
+            // Dead code: original Skinny-M path kept for reference/fallback.
+            #[allow(unreachable_code)]
+            {
+                let sm_tiles = m.div_ceil(SKINNY_TILE_M);
+                let sn_tiles = n.div_ceil(SKINNY_BN);
 
-            let mn_tgs = sm_tiles * sn_tiles;
-            let target_tgs: usize = 320;
-            let k_tiles_total = k.div_ceil(SKINNY_BK);
-            let k_partitions = if mn_tgs >= target_tgs || k_tiles_total <= 2 {
-                1
-            } else {
-                let desired = (target_tgs / mn_tgs).clamp(2, k_tiles_total.max(2));
-                desired.min(k_tiles_total)
-            };
+                let align_m = m % SKINNY_TILE_M == 0;
+                let align_n = n % SKINNY_BN == 0;
 
-            let skinny_constants = [
-                (200u32, FunctionConstantValue::Bool(align_m)),
-                (201u32, FunctionConstantValue::Bool(align_n)),
-                (205u32, FunctionConstantValue::U32(qw.group_size)),
-            ];
+                let mn_tgs = sm_tiles * sn_tiles;
+                let target_tgs: usize = 320;
+                let k_tiles_total = k.div_ceil(SKINNY_BK);
+                let k_partitions = if mn_tgs >= target_tgs || k_tiles_total <= 2 {
+                    1
+                } else {
+                    let desired = (target_tgs / mn_tgs).clamp(2, k_tiles_total.max(2));
+                    desired.min(k_tiles_total)
+                };
 
-            let kernel_name = "affine_qmm_skinny_f16_q4";
-            let kernel_dtype = DType::Float16;
-            let pipeline = registry.get_pipeline_with_constants(
-                kernel_name,
-                kernel_dtype,
-                &skinny_constants,
-            )?;
+                let skinny_constants = [
+                    (200u32, FunctionConstantValue::Bool(align_m)),
+                    (201u32, FunctionConstantValue::Bool(align_n)),
+                    (205u32, FunctionConstantValue::U32(qw.group_size)),
+                ];
 
-            // x is already f16 (guaranteed by entry cast for Q4)
-
-            let m_u32 = super::checked_u32(m, "M")?;
-            let n_u32 = super::checked_u32(n, "N")?;
-            let k_u32 = super::checked_u32(k, "K")?;
-            let kp_u32 = super::checked_u32(k_partitions, "k_partitions")?;
-
-            let m_buf = dev.new_buffer_with_data(&m_u32 as *const u32 as *const _, 4, opts);
-            let n_buf = dev.new_buffer_with_data(&n_u32 as *const u32 as *const _, 4, opts);
-            let k_buf = dev.new_buffer_with_data(&k_u32 as *const u32 as *const _, 4, opts);
-            let kp_buf = dev.new_buffer_with_data(&kp_u32 as *const u32 as *const _, 4, opts);
-
-            if k_partitions == 1 {
-                let out = Array::zeros(dev, &[m, n], DType::Float16);
-                let dummy_buf = dev.new_buffer(4, opts);
-
-                let cb = queue.new_command_buffer();
-                let enc = cb.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&pipeline);
-                enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
-                enc.set_buffer(1, Some(&qw.weights_buf), 0);
-                enc.set_buffer(2, Some(&qw.scales_buf), 0);
-                enc.set_buffer(3, Some(&qw.biases_buf), 0);
-                enc.set_buffer(4, Some(out.metal_buffer()), 0);
-                enc.set_buffer(5, Some(&m_buf), 0);
-                enc.set_buffer(6, Some(&n_buf), 0);
-                enc.set_buffer(7, Some(&k_buf), 0);
-                enc.set_buffer(8, Some(&kp_buf), 0);
-                // f16 kernel has buffer(9) for c_split (unused when k_partitions==1)
-                enc.set_buffer(9, Some(&dummy_buf), 0);
-
-                let grid = metal::MTLSize::new(sn_tiles as u64, sm_tiles as u64, 1);
-                let tg = metal::MTLSize::new(64, 1, 1);
-                enc.dispatch_thread_groups(grid, tg);
-                enc.end_encoding();
-                super::commit_with_mode(cb, super::ExecMode::Sync);
-
-                Ok(out)
-            } else {
-                // Split-K: partial sums (always float) → f16 reduce → f16 output
-                let partition_stride = m * n;
-                let c_split_size =
-                    (k_partitions * partition_stride * std::mem::size_of::<f32>()) as u64;
-                let c_split_buf = dev.new_buffer(c_split_size, opts);
-                let out = Array::zeros(dev, &[m, n], DType::Float16);
-
-                let cb = queue.new_command_buffer();
-
-                // f16 skinny: writes float partials to c_split via buffer(9)
-                let enc = cb.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&pipeline);
-                enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
-                enc.set_buffer(1, Some(&qw.weights_buf), 0);
-                enc.set_buffer(2, Some(&qw.scales_buf), 0);
-                enc.set_buffer(3, Some(&qw.biases_buf), 0);
-                // buffer(4) = output (unused for split-K, but must be bound)
-                enc.set_buffer(4, Some(out.metal_buffer()), 0);
-                enc.set_buffer(5, Some(&m_buf), 0);
-                enc.set_buffer(6, Some(&n_buf), 0);
-                enc.set_buffer(7, Some(&k_buf), 0);
-                enc.set_buffer(8, Some(&kp_buf), 0);
-                enc.set_buffer(9, Some(&c_split_buf), 0);
-
-                let grid =
-                    metal::MTLSize::new(sn_tiles as u64, sm_tiles as u64, k_partitions as u64);
-                let tg = metal::MTLSize::new(64, 1, 1);
-                enc.dispatch_thread_groups(grid, tg);
-                enc.end_encoding();
-
-                // f16 reduce: reads float partials, writes half output
-                let reduce_pipeline = registry.get_pipeline_with_constants(
-                    "skinny_qmm_f16_reduce",
-                    DType::Float16,
-                    &[],
+                let kernel_name = "affine_qmm_skinny_f16_q4";
+                let kernel_dtype = DType::Float16;
+                let pipeline = registry.get_pipeline_with_constants(
+                    kernel_name,
+                    kernel_dtype,
+                    &skinny_constants,
                 )?;
-                let mn_total_u32 = super::checked_u32(partition_stride, "mn_total")?;
-                let n_reduce_buf =
-                    dev.new_buffer_with_data(&n_u32 as *const u32 as *const _, 4, opts);
-                let kp_reduce_buf =
-                    dev.new_buffer_with_data(&kp_u32 as *const u32 as *const _, 4, opts);
-                let mn_buf =
-                    dev.new_buffer_with_data(&mn_total_u32 as *const u32 as *const _, 4, opts);
 
-                let enc2 = cb.new_compute_command_encoder();
-                enc2.set_compute_pipeline_state(&reduce_pipeline);
-                enc2.set_buffer(0, Some(&c_split_buf), 0);
-                enc2.set_buffer(1, Some(out.metal_buffer()), 0);
-                enc2.set_buffer(2, Some(&n_reduce_buf), 0);
-                enc2.set_buffer(3, Some(&kp_reduce_buf), 0);
-                enc2.set_buffer(4, Some(&mn_buf), 0);
+                // x is already f16 (guaranteed by entry cast for Q4)
 
-                let reduce_grid = metal::MTLSize::new(partition_stride as u64, 1, 1);
-                let reduce_tg = metal::MTLSize::new(partition_stride.min(256) as u64, 1, 1);
-                enc2.dispatch_threads(reduce_grid, reduce_tg);
-                enc2.end_encoding();
+                let m_u32 = super::checked_u32(m, "M")?;
+                let n_u32 = super::checked_u32(n, "N")?;
+                let k_u32 = super::checked_u32(k, "K")?;
+                let kp_u32 = super::checked_u32(k_partitions, "k_partitions")?;
 
-                super::commit_with_mode(cb, super::ExecMode::Sync);
+                if k_partitions == 1 {
+                    let out = Array::uninit(dev, &[m, n], DType::Float16);
+                    let dummy_buf = dev.new_buffer(4, opts);
 
-                Ok(out)
-            }
-        } else if k >= 4096 || (m <= 128 && n >= 4096) {
-            // --- Steel path: BK=32 + double-buffer, coalesced B loads ---
-            // Steel kernel produces f32 output; cast to f16 for Q4 consistency.
-            // TODO: add f16 output support to Steel kernel to avoid this cast.
-            let steel_out = affine_quantized_matmul_steel(registry, x, qw, queue)?;
-            if steel_out.dtype() == DType::Float32 {
-                super::copy::copy_cast(registry, &steel_out, DType::Float16, queue)
-            } else {
-                Ok(steel_out)
-            }
+                    let cb = queue.new_command_buffer();
+                    let enc = cb.new_compute_command_encoder();
+                    enc.set_compute_pipeline_state(&pipeline);
+                    enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
+                    enc.set_buffer(1, Some(&qw.weights_buf), 0);
+                    enc.set_buffer(2, Some(&qw.scales_buf), 0);
+                    enc.set_buffer(3, Some(&qw.biases_buf), 0);
+                    enc.set_buffer(4, Some(out.metal_buffer()), 0);
+                    enc.set_bytes(5, 4, &m_u32 as *const u32 as *const std::ffi::c_void);
+                    enc.set_bytes(6, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
+                    enc.set_bytes(7, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
+                    enc.set_bytes(8, 4, &kp_u32 as *const u32 as *const std::ffi::c_void);
+                    // f16 kernel has buffer(9) for c_split (unused when k_partitions==1)
+                    enc.set_buffer(9, Some(&dummy_buf), 0);
+
+                    let grid = metal::MTLSize::new(sn_tiles as u64, sm_tiles as u64, 1);
+                    let tg = metal::MTLSize::new(64, 1, 1);
+                    enc.dispatch_thread_groups(grid, tg);
+                    enc.end_encoding();
+                    super::commit_with_mode(cb, super::ExecMode::Sync);
+
+                    Ok(out)
+                } else {
+                    // Split-K: partial sums (always float) → f16 reduce → f16 output
+                    let partition_stride = m * n;
+                    let c_split_size =
+                        (k_partitions * partition_stride * std::mem::size_of::<f32>()) as u64;
+                    let c_split_buf = dev.new_buffer(c_split_size, opts);
+                    let out = Array::uninit(dev, &[m, n], DType::Float16);
+
+                    let cb = queue.new_command_buffer();
+
+                    // f16 skinny: writes float partials to c_split via buffer(9)
+                    let enc = cb.new_compute_command_encoder();
+                    enc.set_compute_pipeline_state(&pipeline);
+                    enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
+                    enc.set_buffer(1, Some(&qw.weights_buf), 0);
+                    enc.set_buffer(2, Some(&qw.scales_buf), 0);
+                    enc.set_buffer(3, Some(&qw.biases_buf), 0);
+                    // buffer(4) = output (unused for split-K, but must be bound)
+                    enc.set_buffer(4, Some(out.metal_buffer()), 0);
+                    enc.set_bytes(5, 4, &m_u32 as *const u32 as *const std::ffi::c_void);
+                    enc.set_bytes(6, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
+                    enc.set_bytes(7, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
+                    enc.set_bytes(8, 4, &kp_u32 as *const u32 as *const std::ffi::c_void);
+                    enc.set_buffer(9, Some(&c_split_buf), 0);
+
+                    let grid =
+                        metal::MTLSize::new(sn_tiles as u64, sm_tiles as u64, k_partitions as u64);
+                    let tg = metal::MTLSize::new(64, 1, 1);
+                    enc.dispatch_thread_groups(grid, tg);
+                    enc.end_encoding();
+
+                    // f16 reduce: reads float partials, writes half output
+                    let reduce_pipeline = registry.get_pipeline_with_constants(
+                        "skinny_qmm_f16_reduce",
+                        DType::Float16,
+                        &[],
+                    )?;
+                    let mn_total_u32 = super::checked_u32(partition_stride, "mn_total")?;
+
+                    let enc2 = cb.new_compute_command_encoder();
+                    enc2.set_compute_pipeline_state(&reduce_pipeline);
+                    enc2.set_buffer(0, Some(&c_split_buf), 0);
+                    enc2.set_buffer(1, Some(out.metal_buffer()), 0);
+                    enc2.set_bytes(2, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
+                    enc2.set_bytes(3, 4, &kp_u32 as *const u32 as *const std::ffi::c_void);
+                    enc2.set_bytes(4, 4, &mn_total_u32 as *const u32 as *const std::ffi::c_void);
+
+                    let reduce_grid = metal::MTLSize::new(partition_stride as u64, 1, 1);
+                    let reduce_tg = metal::MTLSize::new(partition_stride.min(256) as u64, 1, 1);
+                    enc2.dispatch_threads(reduce_grid, reduce_tg);
+                    enc2.end_encoding();
+
+                    super::commit_with_mode(cb, super::ExecMode::Sync);
+
+                    Ok(out)
+                }
+            } // end unreachable_code block
         } else {
-            // --- Standard path: BM=64, BN=64, BK=16 ---
+            // --- Standard MMA fallback: BM=64, BN=64, BK=16 ---
+            // Rarely reached: Steel handles M>=32, Skinny handles M<=32.
             // x is guaranteed f16 for Q4 (cast at entry). Always use f16 kernel.
             let fc_list = vec![
                 (200u32, FunctionConstantValue::Bool(m % STD_BM == 0)),
@@ -5927,7 +6866,7 @@ pub fn affine_quantized_matmul_batched(
                 &fc_list,
             )?;
 
-            let out = Array::zeros(dev, &[m, n], DType::Float16);
+            let out = Array::uninit(dev, &[m, n], DType::Float16);
             let m_tiles = m.div_ceil(STD_BM);
             let n_tiles = n.div_ceil(STD_BN);
 
@@ -5935,11 +6874,6 @@ pub fn affine_quantized_matmul_batched(
             let n_u32 = super::checked_u32(n, "N")?;
             let k_u32 = super::checked_u32(k, "K")?;
             let swizzle_log: u32 = if n_tiles >= 4 { 1 } else { 0 };
-
-            let m_buf = dev.new_buffer_with_data(&m_u32 as *const u32 as *const _, 4, opts);
-            let n_buf = dev.new_buffer_with_data(&n_u32 as *const u32 as *const _, 4, opts);
-            let k_buf = dev.new_buffer_with_data(&k_u32 as *const u32 as *const _, 4, opts);
-            let sw_buf = dev.new_buffer_with_data(&swizzle_log as *const u32 as *const _, 4, opts);
 
             let cb = queue.new_command_buffer();
             let enc = cb.new_compute_command_encoder();
@@ -5949,10 +6883,10 @@ pub fn affine_quantized_matmul_batched(
             enc.set_buffer(2, Some(&qw.scales_buf), 0);
             enc.set_buffer(3, Some(&qw.biases_buf), 0);
             enc.set_buffer(4, Some(out.metal_buffer()), 0);
-            enc.set_buffer(5, Some(&m_buf), 0);
-            enc.set_buffer(6, Some(&n_buf), 0);
-            enc.set_buffer(7, Some(&k_buf), 0);
-            enc.set_buffer(8, Some(&sw_buf), 0);
+            enc.set_bytes(5, 4, &m_u32 as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(6, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(7, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(8, 4, &swizzle_log as *const u32 as *const std::ffi::c_void);
 
             let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
             let tg = metal::MTLSize::new(64, 1, 1);
@@ -5981,7 +6915,7 @@ pub fn affine_quantized_matmul_batched(
             DType::Float32,
             &q8_constants,
         )?;
-        let out = Array::zeros(dev, &[m, n], DType::Float32);
+        let out = Array::uninit(dev, &[m, n], DType::Float32);
 
         let params: [u32; 4] = [
             super::checked_u32(m, "M")?,
@@ -5989,12 +6923,6 @@ pub fn affine_quantized_matmul_batched(
             super::checked_u32(k, "K")?,
             qw.group_size,
         ];
-
-        let params_buf = dev.new_buffer_with_data(
-            params.as_ptr() as *const _,
-            (params.len() * std::mem::size_of::<u32>()) as u64,
-            opts,
-        );
 
         let cb = queue.new_command_buffer();
         let enc = cb.new_compute_command_encoder();
@@ -6004,7 +6932,7 @@ pub fn affine_quantized_matmul_batched(
         enc.set_buffer(2, Some(&qw.scales_buf), 0);
         enc.set_buffer(3, Some(&qw.biases_buf), 0);
         enc.set_buffer(4, Some(out.metal_buffer()), 0);
-        enc.set_buffer(5, Some(&params_buf), 0);
+        enc.set_bytes(5, 16, params.as_ptr() as *const std::ffi::c_void);
 
         let q8_m_tiles = m.div_ceil(q8_bm);
         let q8_n_tiles = n.div_ceil(q8_bn);
@@ -6027,7 +6955,7 @@ pub fn affine_quantized_matmul_batched(
 /// Encode a Q4 quantized matmul into an externally-provided command buffer.
 ///
 /// Replicates the exact dispatch logic of [`affine_quantized_matmul_batched`]
-/// (NAX / BatchQMV / Skinny / Standard MMA / Steel) but encodes into `cb`
+/// (Steel / BatchQMV / Skinny / Standard MMA) but encodes into `cb`
 /// instead of creating its own command buffer. The caller is responsible for
 /// committing and waiting on `cb`.
 ///
@@ -6037,10 +6965,6 @@ pub fn affine_quantized_matmul_batched(
 /// **Restrictions**: Q4 only, f16 input only (no automatic f32→f16 cast).
 /// The caller must supply f16 `x` and Q4 `qw` with f16 scales/biases
 /// (or accept scale/bias cast overhead encoded into the same CB).
-///
-/// For the Steel sub-path, a separate internal command buffer is created
-/// because Steel manages its own CB lifecycle. This is acceptable since
-/// Steel is selected only at large M where per-op overhead is negligible.
 pub fn affine_quantized_matmul_batched_into_cb(
     registry: &KernelRegistry,
     x: &Array,
@@ -6078,51 +7002,37 @@ pub fn affine_quantized_matmul_batched_into_cb(
     let n = qw.out_features;
     let k = qw.in_features;
     let dev = registry.device().raw();
-    let opts = metal::MTLResourceOptions::StorageModeShared;
+    let _opts = metal::MTLResourceOptions::StorageModeShared;
 
     // Q4 dispatch priority (mirrors affine_quantized_matmul_batched):
-    // 1. NAX: M >= 32, K % 64 == 0
-    // 2. BatchQMV / QMV fast: M <= 16, K % 512 == 0
-    // 3. Skinny MMA: M <= 32
-    // 4. Steel: k >= 4096 or (m <= 128 && n >= 4096) — uses separate CB
-    // 5. Standard MMA: fallback
+    // 1. Steel-4SG: M=32-127, 4 SG hardware MMA + Split-K occupancy
+    // 2. NAX: M >= 128, K % 64 == 0 — K-coalesced dequant loader, 4 SG MMA
+    // 3. Steel: M >= 128, K % 64 != 0 — handles any K alignment
+    // 4. BatchQMV / QMV fast: M <= qmv_limit, K % 512 == 0
+    // 5. Skinny MMA: M <= 32
+    // 6. Standard MMA: fallback (rarely reached)
 
-    const NAX_MIN_M: usize = 32;
+    const MMA_MIN_M: usize = 32;
 
-    if k % 64 == 0 && m >= NAX_MIN_M {
-        // --- NAX path ---
-        let num_groups = (qw.out_features * qw.in_features) / qw.group_size as usize;
-
-        let scales_f32 = Array::new(
-            qw.scales_buf.clone(),
-            vec![num_groups],
-            vec![1],
-            DType::Float32,
-            0,
-        );
-        let biases_f32 = Array::new(
-            qw.biases_buf.clone(),
-            vec![num_groups],
-            vec![1],
-            DType::Float32,
-            0,
-        );
-
-        let x_f16 = super::copy::copy_into_cb(registry, x, cb)?;
-        let scales_f16 = super::copy::copy_cast_into_cb(registry, &scales_f32, DType::Float16, cb)?;
-        let biases_f16 = super::copy::copy_cast_into_cb(registry, &biases_f32, DType::Float16, cb)?;
-
-        let qw_f16 = QuantizedWeight {
-            weights_buf: qw.weights_buf.clone(),
-            scales_buf: scales_f16.metal_buffer().to_owned(),
-            biases_buf: biases_f16.metal_buffer().to_owned(),
-            group_size: qw.group_size,
-            bits: qw.bits,
-            out_features: qw.out_features,
-            in_features: qw.in_features,
-        };
-
-        return affine_qmm_nax_q4_into_cb(registry, &x_f16, &qw_f16, cb);
+    if m >= MMA_MIN_M {
+        if m < 128 {
+            // Steel-4SG Split-K: 4 SG hardware MMA for M=32-127
+            return affine_qmm_steel4sg_splitk_q4_into_cb(registry, x, qw, cb);
+        }
+        if k % 64 == 0 {
+            // --- NAX path: K-coalesced dequant, 4 SG (2×2), 128 threads ---
+            // NAX kernel produces f16 output directly.
+            return affine_qmm_nax_q4_into_cb(registry, x, qw, cb);
+        } else {
+            // --- Steel path: encodes into the provided CB ---
+            // Steel kernel produces f32 output; cast to f16 for Q4 consistency.
+            let steel_out = affine_qmm_steel_q4_into_cb(registry, x, qw, cb)?;
+            if steel_out.dtype() == DType::Float32 {
+                return super::copy::copy_cast_into_cb(registry, &steel_out, DType::Float16, cb);
+            } else {
+                return Ok(steel_out);
+            }
+        }
     }
 
     // --- BatchQMV / QMV fast: M <= qmv_limit (device-aware), K % 512 == 0 ---
@@ -6138,7 +7048,7 @@ pub fn affine_quantized_matmul_batched_into_cb(
             }
             // QMV fast f16 into CB
             let pipeline = registry.get_pipeline("affine_qmv_fast_f16_q4", DType::Float16)?;
-            let out = Array::zeros(dev, &[qw.out_features], DType::Float16);
+            let out = Array::uninit(dev, &[qw.out_features], DType::Float16);
 
             let params: [u32; 4] = [
                 super::checked_u32(qw.out_features, "out_features")?,
@@ -6146,11 +7056,6 @@ pub fn affine_quantized_matmul_batched_into_cb(
                 qw.group_size,
                 qw.bits,
             ];
-            let params_buf = dev.new_buffer_with_data(
-                params.as_ptr() as *const _,
-                (params.len() * std::mem::size_of::<u32>()) as u64,
-                opts,
-            );
 
             let enc = cb.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&pipeline);
@@ -6159,7 +7064,7 @@ pub fn affine_quantized_matmul_batched_into_cb(
             enc.set_buffer(2, Some(&qw.biases_buf), 0);
             enc.set_buffer(3, Some(vec_1d.metal_buffer()), vec_1d.offset() as u64);
             enc.set_buffer(4, Some(out.metal_buffer()), 0);
-            enc.set_buffer(5, Some(&params_buf), 0);
+            enc.set_bytes(5, 16, params.as_ptr() as *const std::ffi::c_void);
 
             let rows_per_tg: u64 = 8;
             let num_tgs_y = (qw.out_features as u64).div_ceil(rows_per_tg);
@@ -6173,7 +7078,7 @@ pub fn affine_quantized_matmul_batched_into_cb(
         } else {
             // Batched QMV f16 into CB
             let pipeline = registry.get_pipeline("affine_qmv_batched_f16_q4", DType::Float16)?;
-            let out = Array::zeros(dev, &[m, n], DType::Float16);
+            let out = Array::uninit(dev, &[m, n], DType::Float16);
 
             let params: [u32; 4] = [
                 super::checked_u32(n, "out_features")?,
@@ -6181,11 +7086,6 @@ pub fn affine_quantized_matmul_batched_into_cb(
                 qw.group_size,
                 super::checked_u32(m, "M")?,
             ];
-            let params_buf = dev.new_buffer_with_data(
-                params.as_ptr() as *const _,
-                (params.len() * std::mem::size_of::<u32>()) as u64,
-                opts,
-            );
 
             let enc = cb.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&pipeline);
@@ -6194,7 +7094,7 @@ pub fn affine_quantized_matmul_batched_into_cb(
             enc.set_buffer(2, Some(&qw.biases_buf), 0);
             enc.set_buffer(3, Some(x.metal_buffer()), x.offset() as u64);
             enc.set_buffer(4, Some(out.metal_buffer()), 0);
-            enc.set_buffer(5, Some(&params_buf), 0);
+            enc.set_bytes(5, 16, params.as_ptr() as *const std::ffi::c_void);
 
             let rows_per_tg: u64 = 8;
             let num_tgs_y = (n as u64).div_ceil(rows_per_tg);
@@ -6208,144 +7108,130 @@ pub fn affine_quantized_matmul_batched_into_cb(
         }
     }
 
-    const SKINNY_BM: usize = 32;
+    const SKINNY_MAX_M: usize = 64;
+    const SKINNY_TILE_M: usize = 32;
     const SKINNY_BN: usize = 64;
     const SKINNY_BK: usize = 32;
     const STD_BM: usize = 64;
     const STD_BN: usize = 64;
 
-    if m <= SKINNY_BM {
-        // --- Skinny MMA into CB ---
-        let sm_tiles = m.div_ceil(SKINNY_BM);
-        let sn_tiles = n.div_ceil(SKINNY_BN);
+    if m <= SKINNY_MAX_M {
+        // --- Steel Split-K into CB: double-buffered + K-partitioned ---
+        return affine_qmm_steel_splitk_q4_into_cb(registry, x, qw, cb);
 
-        let align_m = m % SKINNY_BM == 0;
-        let align_n = n % SKINNY_BN == 0;
+        // Dead code: original Skinny MMA into CB kept for reference/fallback.
+        #[allow(unreachable_code)]
+        {
+            let sm_tiles = m.div_ceil(SKINNY_TILE_M);
+            let sn_tiles = n.div_ceil(SKINNY_BN);
 
-        let mn_tgs = sm_tiles * sn_tiles;
-        let target_tgs: usize = 320;
-        let k_tiles_total = k.div_ceil(SKINNY_BK);
-        let k_partitions = if mn_tgs >= target_tgs || k_tiles_total <= 2 {
-            1
-        } else {
-            let desired = (target_tgs / mn_tgs).clamp(2, k_tiles_total.max(2));
-            desired.min(k_tiles_total)
-        };
+            let align_m = m % SKINNY_TILE_M == 0;
+            let align_n = n % SKINNY_BN == 0;
 
-        let skinny_constants = [
-            (200u32, FunctionConstantValue::Bool(align_m)),
-            (201u32, FunctionConstantValue::Bool(align_n)),
-            (205u32, FunctionConstantValue::U32(qw.group_size)),
-        ];
-        let pipeline = registry.get_pipeline_with_constants(
-            "affine_qmm_skinny_f16_q4",
-            DType::Float16,
-            &skinny_constants,
-        )?;
+            let mn_tgs = sm_tiles * sn_tiles;
+            let target_tgs: usize = 320;
+            let k_tiles_total = k.div_ceil(SKINNY_BK);
+            let k_partitions = if mn_tgs >= target_tgs || k_tiles_total <= 2 {
+                1
+            } else {
+                let desired = (target_tgs / mn_tgs).clamp(2, k_tiles_total.max(2));
+                desired.min(k_tiles_total)
+            };
 
-        let m_u32 = super::checked_u32(m, "M")?;
-        let n_u32 = super::checked_u32(n, "N")?;
-        let k_u32 = super::checked_u32(k, "K")?;
-        let kp_u32 = super::checked_u32(k_partitions, "k_partitions")?;
-
-        let m_buf = dev.new_buffer_with_data(&m_u32 as *const u32 as *const _, 4, opts);
-        let n_buf = dev.new_buffer_with_data(&n_u32 as *const u32 as *const _, 4, opts);
-        let k_buf = dev.new_buffer_with_data(&k_u32 as *const u32 as *const _, 4, opts);
-        let kp_buf = dev.new_buffer_with_data(&kp_u32 as *const u32 as *const _, 4, opts);
-
-        if k_partitions == 1 {
-            let out = Array::zeros(dev, &[m, n], DType::Float16);
-            let dummy_buf = dev.new_buffer(4, opts);
-
-            let enc = cb.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&pipeline);
-            enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
-            enc.set_buffer(1, Some(&qw.weights_buf), 0);
-            enc.set_buffer(2, Some(&qw.scales_buf), 0);
-            enc.set_buffer(3, Some(&qw.biases_buf), 0);
-            enc.set_buffer(4, Some(out.metal_buffer()), 0);
-            enc.set_buffer(5, Some(&m_buf), 0);
-            enc.set_buffer(6, Some(&n_buf), 0);
-            enc.set_buffer(7, Some(&k_buf), 0);
-            enc.set_buffer(8, Some(&kp_buf), 0);
-            enc.set_buffer(9, Some(&dummy_buf), 0);
-
-            let grid = metal::MTLSize::new(sn_tiles as u64, sm_tiles as u64, 1);
-            let tg = metal::MTLSize::new(64, 1, 1);
-            enc.dispatch_thread_groups(grid, tg);
-            enc.end_encoding();
-
-            return Ok(out);
-        } else {
-            // Split-K: partial sums → reduce, both in same CB
-            let partition_stride = m * n;
-            let c_split_size =
-                (k_partitions * partition_stride * std::mem::size_of::<f32>()) as u64;
-            let c_split_buf = dev.new_buffer(c_split_size, opts);
-            let out = Array::zeros(dev, &[m, n], DType::Float16);
-
-            let enc = cb.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&pipeline);
-            enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
-            enc.set_buffer(1, Some(&qw.weights_buf), 0);
-            enc.set_buffer(2, Some(&qw.scales_buf), 0);
-            enc.set_buffer(3, Some(&qw.biases_buf), 0);
-            enc.set_buffer(4, Some(out.metal_buffer()), 0);
-            enc.set_buffer(5, Some(&m_buf), 0);
-            enc.set_buffer(6, Some(&n_buf), 0);
-            enc.set_buffer(7, Some(&k_buf), 0);
-            enc.set_buffer(8, Some(&kp_buf), 0);
-            enc.set_buffer(9, Some(&c_split_buf), 0);
-
-            let grid = metal::MTLSize::new(sn_tiles as u64, sm_tiles as u64, k_partitions as u64);
-            let tg = metal::MTLSize::new(64, 1, 1);
-            enc.dispatch_thread_groups(grid, tg);
-            enc.end_encoding();
-
-            // Reduce phase
-            let reduce_pipeline = registry.get_pipeline_with_constants(
-                "skinny_qmm_f16_reduce",
+            let skinny_constants = [
+                (200u32, FunctionConstantValue::Bool(align_m)),
+                (201u32, FunctionConstantValue::Bool(align_n)),
+                (205u32, FunctionConstantValue::U32(qw.group_size)),
+            ];
+            let pipeline = registry.get_pipeline_with_constants(
+                "affine_qmm_skinny_f16_q4",
                 DType::Float16,
-                &[],
+                &skinny_constants,
             )?;
-            let mn_total_u32 = super::checked_u32(partition_stride, "mn_total")?;
-            let n_reduce_buf = dev.new_buffer_with_data(&n_u32 as *const u32 as *const _, 4, opts);
-            let kp_reduce_buf =
-                dev.new_buffer_with_data(&kp_u32 as *const u32 as *const _, 4, opts);
-            let mn_buf = dev.new_buffer_with_data(&mn_total_u32 as *const u32 as *const _, 4, opts);
 
-            let enc2 = cb.new_compute_command_encoder();
-            enc2.set_compute_pipeline_state(&reduce_pipeline);
-            enc2.set_buffer(0, Some(&c_split_buf), 0);
-            enc2.set_buffer(1, Some(out.metal_buffer()), 0);
-            enc2.set_buffer(2, Some(&n_reduce_buf), 0);
-            enc2.set_buffer(3, Some(&kp_reduce_buf), 0);
-            enc2.set_buffer(4, Some(&mn_buf), 0);
+            let m_u32 = super::checked_u32(m, "M")?;
+            let n_u32 = super::checked_u32(n, "N")?;
+            let k_u32 = super::checked_u32(k, "K")?;
+            let kp_u32 = super::checked_u32(k_partitions, "k_partitions")?;
 
-            let reduce_grid = metal::MTLSize::new(partition_stride as u64, 1, 1);
-            let reduce_tg = metal::MTLSize::new(partition_stride.min(256) as u64, 1, 1);
-            enc2.dispatch_threads(reduce_grid, reduce_tg);
-            enc2.end_encoding();
+            if k_partitions == 1 {
+                let out = Array::uninit(dev, &[m, n], DType::Float16);
+                let dummy_buf = dev.new_buffer(4, _opts);
 
-            return Ok(out);
-        }
+                let enc = cb.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&pipeline);
+                enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
+                enc.set_buffer(1, Some(&qw.weights_buf), 0);
+                enc.set_buffer(2, Some(&qw.scales_buf), 0);
+                enc.set_buffer(3, Some(&qw.biases_buf), 0);
+                enc.set_buffer(4, Some(out.metal_buffer()), 0);
+                enc.set_bytes(5, 4, &m_u32 as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(6, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(7, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(8, 4, &kp_u32 as *const u32 as *const std::ffi::c_void);
+                enc.set_buffer(9, Some(&dummy_buf), 0);
+
+                let grid = metal::MTLSize::new(sn_tiles as u64, sm_tiles as u64, 1);
+                let tg = metal::MTLSize::new(64, 1, 1);
+                enc.dispatch_thread_groups(grid, tg);
+                enc.end_encoding();
+
+                return Ok(out);
+            } else {
+                // Split-K: partial sums → reduce, both in same CB
+                let partition_stride = m * n;
+                let c_split_size =
+                    (k_partitions * partition_stride * std::mem::size_of::<f32>()) as u64;
+                let c_split_buf = dev.new_buffer(c_split_size, _opts);
+                let out = Array::uninit(dev, &[m, n], DType::Float16);
+
+                let enc = cb.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&pipeline);
+                enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
+                enc.set_buffer(1, Some(&qw.weights_buf), 0);
+                enc.set_buffer(2, Some(&qw.scales_buf), 0);
+                enc.set_buffer(3, Some(&qw.biases_buf), 0);
+                enc.set_buffer(4, Some(out.metal_buffer()), 0);
+                enc.set_bytes(5, 4, &m_u32 as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(6, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(7, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(8, 4, &kp_u32 as *const u32 as *const std::ffi::c_void);
+                enc.set_buffer(9, Some(&c_split_buf), 0);
+
+                let grid =
+                    metal::MTLSize::new(sn_tiles as u64, sm_tiles as u64, k_partitions as u64);
+                let tg = metal::MTLSize::new(64, 1, 1);
+                enc.dispatch_thread_groups(grid, tg);
+                enc.end_encoding();
+
+                // Reduce phase
+                let reduce_pipeline = registry.get_pipeline_with_constants(
+                    "skinny_qmm_f16_reduce",
+                    DType::Float16,
+                    &[],
+                )?;
+                let mn_total_u32 = super::checked_u32(partition_stride, "mn_total")?;
+
+                let enc2 = cb.new_compute_command_encoder();
+                enc2.set_compute_pipeline_state(&reduce_pipeline);
+                enc2.set_buffer(0, Some(&c_split_buf), 0);
+                enc2.set_buffer(1, Some(out.metal_buffer()), 0);
+                enc2.set_bytes(2, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
+                enc2.set_bytes(3, 4, &kp_u32 as *const u32 as *const std::ffi::c_void);
+                enc2.set_bytes(4, 4, &mn_total_u32 as *const u32 as *const std::ffi::c_void);
+
+                let reduce_grid = metal::MTLSize::new(partition_stride as u64, 1, 1);
+                let reduce_tg = metal::MTLSize::new(partition_stride.min(256) as u64, 1, 1);
+                enc2.dispatch_threads(reduce_grid, reduce_tg);
+                enc2.end_encoding();
+
+                return Ok(out);
+            }
+        } // end unreachable_code block
     }
 
-    if k >= 4096 || (m <= 128 && n >= 4096) {
-        // --- Steel path: creates its own CB (Steel manages CB lifecycle) ---
-        // This is acceptable since Steel is selected only at large M where
-        // per-op overhead is negligible relative to compute time.
-        let steel_queue = dev.new_command_queue();
-        let steel_out = affine_quantized_matmul_steel(registry, x, qw, &steel_queue)?;
-        if steel_out.dtype() == DType::Float32 {
-            // Encode f32→f16 cast into the shared CB
-            return super::copy::copy_cast_into_cb(registry, &steel_out, DType::Float16, cb);
-        } else {
-            return Ok(steel_out);
-        }
-    }
-
-    // --- Standard MMA path into CB ---
+    // --- Standard MMA fallback into CB ---
+    // Rarely reached: Steel handles M>=32, Skinny handles M<=32.
     let fc_list = vec![
         (200u32, FunctionConstantValue::Bool(m % STD_BM == 0)),
         (201u32, FunctionConstantValue::Bool(n % STD_BN == 0)),
@@ -6354,7 +7240,7 @@ pub fn affine_quantized_matmul_batched_into_cb(
     let pipeline =
         registry.get_pipeline_with_constants("affine_qmm_mma_f16_q4", DType::Float16, &fc_list)?;
 
-    let out = Array::zeros(dev, &[m, n], DType::Float16);
+    let out = Array::uninit(dev, &[m, n], DType::Float16);
     let m_tiles = m.div_ceil(STD_BM);
     let n_tiles = n.div_ceil(STD_BN);
 
@@ -6363,11 +7249,6 @@ pub fn affine_quantized_matmul_batched_into_cb(
     let k_u32 = super::checked_u32(k, "K")?;
     let swizzle_log: u32 = if n_tiles >= 4 { 1 } else { 0 };
 
-    let m_buf = dev.new_buffer_with_data(&m_u32 as *const u32 as *const _, 4, opts);
-    let n_buf = dev.new_buffer_with_data(&n_u32 as *const u32 as *const _, 4, opts);
-    let k_buf = dev.new_buffer_with_data(&k_u32 as *const u32 as *const _, 4, opts);
-    let sw_buf = dev.new_buffer_with_data(&swizzle_log as *const u32 as *const _, 4, opts);
-
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&pipeline);
     enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
@@ -6375,10 +7256,10 @@ pub fn affine_quantized_matmul_batched_into_cb(
     enc.set_buffer(2, Some(&qw.scales_buf), 0);
     enc.set_buffer(3, Some(&qw.biases_buf), 0);
     enc.set_buffer(4, Some(out.metal_buffer()), 0);
-    enc.set_buffer(5, Some(&m_buf), 0);
-    enc.set_buffer(6, Some(&n_buf), 0);
-    enc.set_buffer(7, Some(&k_buf), 0);
-    enc.set_buffer(8, Some(&sw_buf), 0);
+    enc.set_bytes(5, 4, &m_u32 as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(6, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(7, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(8, 4, &swizzle_log as *const u32 as *const std::ffi::c_void);
 
     let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
     let tg = metal::MTLSize::new(64, 1, 1);
@@ -6443,17 +7324,13 @@ pub fn qmm_add_residual_into_cb(
     ];
     let pipeline =
         registry.get_pipeline_with_constants("affine_qmm_mma_q4", DType::Float32, &q4_constants)?;
-    let out = Array::zeros(dev, &[m, n], DType::Float32);
+    let out = Array::uninit(dev, &[m, n], DType::Float32);
 
     let m_u32 = super::checked_u32(m, "M")?;
     let n_u32 = super::checked_u32(n, "N")?;
     let k_u32 = super::checked_u32(k, "K")?;
     let swizzle_log: u32 = if n_tiles >= 4 { 1 } else { 0 };
 
-    let m_buf = dev.new_buffer_with_data(&m_u32 as *const u32 as *const _, 4, opts);
-    let n_buf = dev.new_buffer_with_data(&n_u32 as *const u32 as *const _, 4, opts);
-    let k_buf = dev.new_buffer_with_data(&k_u32 as *const u32 as *const _, 4, opts);
-    let sw_buf = dev.new_buffer_with_data(&swizzle_log as *const u32 as *const _, 4, opts);
     let dummy_buf = dev.new_buffer(4, opts);
 
     let enc = cb.new_compute_command_encoder();
@@ -6463,10 +7340,10 @@ pub fn qmm_add_residual_into_cb(
     enc.set_buffer(2, Some(&qw.scales_buf), 0);
     enc.set_buffer(3, Some(&qw.biases_buf), 0);
     enc.set_buffer(4, Some(out.metal_buffer()), 0);
-    enc.set_buffer(5, Some(&m_buf), 0);
-    enc.set_buffer(6, Some(&n_buf), 0);
-    enc.set_buffer(7, Some(&k_buf), 0);
-    enc.set_buffer(8, Some(&sw_buf), 0);
+    enc.set_bytes(5, 4, &m_u32 as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(6, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(7, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(8, 4, &swizzle_log as *const u32 as *const std::ffi::c_void);
     enc.set_buffer(9, Some(&dummy_buf), 0); // norm_weight (unused)
     enc.set_buffer(10, Some(&dummy_buf), 0); // inv_rms (unused)
     enc.set_buffer(11, Some(residual.metal_buffer()), residual.offset() as u64);
@@ -6527,17 +7404,13 @@ pub fn qmm_swiglu_into_cb(
     ];
     let pipeline =
         registry.get_pipeline_with_constants("affine_qmm_mma_q4", DType::Float32, &q4_constants)?;
-    let out = Array::zeros(dev, &[m, n], DType::Float32);
+    let out = Array::uninit(dev, &[m, n], DType::Float32);
 
     let m_u32 = super::checked_u32(m, "M")?;
     let n_u32 = super::checked_u32(n, "N")?;
     let k_u32 = super::checked_u32(k, "K")?;
     let swizzle_log: u32 = if n_tiles >= 4 { 1 } else { 0 };
 
-    let m_buf = dev.new_buffer_with_data(&m_u32 as *const u32 as *const _, 4, opts);
-    let n_buf = dev.new_buffer_with_data(&n_u32 as *const u32 as *const _, 4, opts);
-    let k_buf = dev.new_buffer_with_data(&k_u32 as *const u32 as *const _, 4, opts);
-    let sw_buf = dev.new_buffer_with_data(&swizzle_log as *const u32 as *const _, 4, opts);
     let dummy_buf = dev.new_buffer(4, opts);
 
     let enc = cb.new_compute_command_encoder();
@@ -6547,10 +7420,10 @@ pub fn qmm_swiglu_into_cb(
     enc.set_buffer(2, Some(&qw.scales_buf), 0);
     enc.set_buffer(3, Some(&qw.biases_buf), 0);
     enc.set_buffer(4, Some(out.metal_buffer()), 0);
-    enc.set_buffer(5, Some(&m_buf), 0);
-    enc.set_buffer(6, Some(&n_buf), 0);
-    enc.set_buffer(7, Some(&k_buf), 0);
-    enc.set_buffer(8, Some(&sw_buf), 0);
+    enc.set_bytes(5, 4, &m_u32 as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(6, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(7, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(8, 4, &swizzle_log as *const u32 as *const std::ffi::c_void);
     enc.set_buffer(9, Some(&dummy_buf), 0); // norm_weight (unused)
     enc.set_buffer(10, Some(&dummy_buf), 0); // inv_rms (unused)
     enc.set_buffer(11, Some(&dummy_buf), 0); // residual (unused)
@@ -6568,12 +7441,97 @@ pub fn qmm_swiglu_into_cb(
     Ok(out)
 }
 
+/// NAX-architecture affine quantized matrix-matrix multiply (Q4 only).
+///
+/// Creates its own command buffer, encodes via [`affine_qmm_nax_q4_into_cb`],
+/// commits and waits. The output is Float16 directly (no f32→f16 cast needed).
+///
+/// Requires: `x` Float16 or Float32, `qw.bits == 4`, K % 64 == 0.
+/// Convert an f32 value to IEEE 754 half-precision (f16) as a `u16`.
+///
+/// Handles normals, subnormals, infinities, NaNs, and round-to-nearest-even.
+/// Used at weight upload time to convert f32 scales/biases to f16 format.
+pub fn f32_to_f16_bits(val: f32) -> u16 {
+    let bits = val.to_bits();
+    let sign = (bits >> 16) & 0x8000;
+    let exponent = ((bits >> 23) & 0xFF) as i32;
+    let mantissa = bits & 0x007F_FFFF;
+
+    if exponent == 0xFF {
+        // Inf or NaN
+        if mantissa == 0 {
+            return (sign | 0x7C00) as u16; // Inf
+        } else {
+            return (sign | 0x7E00) as u16; // NaN (quiet)
+        }
+    }
+
+    // Re-bias exponent from f32 (bias 127) to f16 (bias 15)
+    let new_exp = exponent - 127 + 15;
+
+    if new_exp >= 31 {
+        // Overflow → Inf
+        return (sign | 0x7C00) as u16;
+    }
+
+    if new_exp <= 0 {
+        // Subnormal or underflow
+        if new_exp < -10 {
+            return sign as u16; // too small → ±0
+        }
+        // Subnormal: shift mantissa right, adding implicit leading 1
+        let shift = (1 - new_exp) as u32;
+        let m = (mantissa | 0x0080_0000) >> (13 + shift);
+        // Round-to-nearest-even
+        let round_bit = 1u32 << (12 + shift);
+        let remainder = (mantissa | 0x0080_0000) & ((round_bit << 1) - 1);
+        if remainder > round_bit || (remainder == round_bit && m & 1 != 0) {
+            return (sign | (m + 1)) as u16;
+        }
+        return (sign | m) as u16;
+    }
+
+    // Normal: truncate mantissa from 23 to 10 bits with rounding
+    let m = mantissa >> 13;
+    let round_bit = 1u32 << 12;
+    let remainder = mantissa & ((round_bit << 1) - 1);
+    let half_val = sign | ((new_exp as u32) << 10) | m;
+    if remainder > round_bit || (remainder == round_bit && m & 1 != 0) {
+        // Round up (may overflow into next exponent — that's correct)
+        (half_val + 1) as u16
+    } else {
+        half_val as u16
+    }
+}
+
+pub fn affine_quantized_matmul_nax(
+    registry: &KernelRegistry,
+    x: &Array,
+    qw: &QuantizedWeight,
+    queue: &metal::CommandQueue,
+) -> Result<Array, KernelError> {
+    // Ensure f16 input (Q4 native dtype)
+    let x_native;
+    let x = if x.dtype() == DType::Float32 {
+        x_native = ensure_f16(registry, x, queue)?;
+        &x_native
+    } else {
+        x
+    };
+
+    let cb = queue.new_command_buffer();
+    let out = affine_qmm_nax_q4_into_cb(registry, x, qw, cb)?;
+    cb.commit();
+    cb.wait_until_completed();
+    Ok(out)
+}
+
 /// NAX-architecture Q4 QMM using MetalPerformancePrimitives 16×16 HW MMA.
 ///
 /// Encodes into an existing command buffer. Requires:
 /// - `x` is Float16 (half) with shape [M, K]
 /// - `qw.bits == 4`
-/// - K % 64 == 0
+/// - align_K specialization handles K%64!=0 via function constant
 ///
 /// Grid: (ceil(N/64), ceil(M/64), 1), 128 threads/group
 /// TG memory: 9216 bytes (64 × 72 × 2)
@@ -6609,18 +7567,10 @@ pub fn affine_qmm_nax_q4_into_cb(
         )));
     }
     let k = qw.in_features;
-    if k % 64 != 0 {
-        return Err(KernelError::InvalidShape(format!(
-            "affine_qmm_nax_q4_into_cb requires K % 64 == 0, got K={}",
-            k
-        )));
-    }
-
     let m = x.shape()[0];
     let n = qw.out_features;
 
     let dev = registry.device().raw();
-    let opts = metal::MTLResourceOptions::StorageModeShared;
 
     const NAX_BM: usize = 64;
     const NAX_BN: usize = 64;
@@ -6630,10 +7580,12 @@ pub fn affine_qmm_nax_q4_into_cb(
     let align_m = m % NAX_BM == 0;
     let align_n = n % NAX_BN == 0;
 
+    let align_k = k % 64 == 0;
     let nax_constants = [
         (200u32, FunctionConstantValue::Bool(align_m)),
         (201u32, FunctionConstantValue::Bool(align_n)),
         (205u32, FunctionConstantValue::U32(qw.group_size)),
+        (206u32, FunctionConstantValue::Bool(align_k)),
     ];
     let pipeline = registry.get_pipeline_with_constants(
         "affine_qmm_nax_q4",
@@ -6641,16 +7593,13 @@ pub fn affine_qmm_nax_q4_into_cb(
         &nax_constants,
     )?;
 
-    let out = Array::zeros(dev, &[m, n], DType::Float16);
+    let out = Array::uninit(dev, &[m, n], DType::Float16);
 
     let m_u32 = super::checked_u32(m, "M")?;
     let n_u32 = super::checked_u32(n, "N")?;
     let k_u32 = super::checked_u32(k, "K")?;
 
-    let m_buf = dev.new_buffer_with_data(&m_u32 as *const u32 as *const _, 4, opts);
-    let n_buf = dev.new_buffer_with_data(&n_u32 as *const u32 as *const _, 4, opts);
-    let k_buf = dev.new_buffer_with_data(&k_u32 as *const u32 as *const _, 4, opts);
-
+    // QuantizedWeight natively stores f16 scales/biases — use directly.
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&pipeline);
     enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
@@ -6658,9 +7607,9 @@ pub fn affine_qmm_nax_q4_into_cb(
     enc.set_buffer(2, Some(&qw.scales_buf), 0);
     enc.set_buffer(3, Some(&qw.biases_buf), 0);
     enc.set_buffer(4, Some(out.metal_buffer()), 0);
-    enc.set_buffer(5, Some(&m_buf), 0);
-    enc.set_buffer(6, Some(&n_buf), 0);
-    enc.set_buffer(7, Some(&k_buf), 0);
+    enc.set_bytes(5, 4, &m_u32 as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(6, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(7, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
 
     // TG memory is statically allocated in the shader (threadgroup half Ws[BN * BK_PAD])
     // No dynamic allocation needed.
@@ -6756,17 +7705,13 @@ pub fn affine_quantized_matmul_steel(
         &steel_constants,
     )?;
 
-    let out = Array::zeros(dev, &[m, n], DType::Float32);
+    let out = Array::uninit(dev, &[m, n], DType::Float32);
 
     let m_u32 = super::checked_u32(m, "M")?;
     let n_u32 = super::checked_u32(n, "N")?;
     let k_u32 = super::checked_u32(k, "K")?;
     let swizzle_log: u32 = if n_tiles >= 4 { 1 } else { 0 };
 
-    let m_buf = dev.new_buffer_with_data(&m_u32 as *const u32 as *const _, 4, opts);
-    let n_buf = dev.new_buffer_with_data(&n_u32 as *const u32 as *const _, 4, opts);
-    let k_buf = dev.new_buffer_with_data(&k_u32 as *const u32 as *const _, 4, opts);
-    let sw_buf = dev.new_buffer_with_data(&swizzle_log as *const u32 as *const _, 4, opts);
     let dummy_buf = dev.new_buffer(4, opts);
 
     let cb = queue.new_command_buffer();
@@ -6777,10 +7722,10 @@ pub fn affine_quantized_matmul_steel(
     enc.set_buffer(2, Some(&qw.scales_buf), 0);
     enc.set_buffer(3, Some(&qw.biases_buf), 0);
     enc.set_buffer(4, Some(out.metal_buffer()), 0);
-    enc.set_buffer(5, Some(&m_buf), 0);
-    enc.set_buffer(6, Some(&n_buf), 0);
-    enc.set_buffer(7, Some(&k_buf), 0);
-    enc.set_buffer(8, Some(&sw_buf), 0);
+    enc.set_bytes(5, 4, &m_u32 as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(6, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(7, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(8, 4, &swizzle_log as *const u32 as *const std::ffi::c_void);
     enc.set_buffer(9, Some(&dummy_buf), 0); // residual (unused)
     enc.set_buffer(10, Some(&dummy_buf), 0); // gate_result (unused)
 
@@ -6789,6 +7734,107 @@ pub fn affine_quantized_matmul_steel(
     enc.dispatch_thread_groups(grid, tg);
     enc.end_encoding();
     super::commit_with_mode(cb, super::ExecMode::Sync);
+
+    Ok(out)
+}
+
+/// Steel-architecture Q4 QMM that encodes into an existing command buffer.
+///
+/// Identical to [`affine_quantized_matmul_steel`] but does not create its own
+/// command queue or command buffer — the caller provides `cb` and manages
+/// its lifecycle (commit / wait).
+///
+/// Input `x` must already be Float16 (the caller is responsible for casting).
+/// Output is Float32 (Steel kernel always produces f32).
+pub fn affine_qmm_steel_q4_into_cb(
+    registry: &KernelRegistry,
+    x: &Array,
+    qw: &QuantizedWeight,
+    cb: &metal::CommandBufferRef,
+) -> Result<Array, KernelError> {
+    if x.dtype() != DType::Float16 {
+        return Err(KernelError::InvalidShape(format!(
+            "affine_qmm_steel_q4_into_cb requires Float16 input x, got {:?}",
+            x.dtype()
+        )));
+    }
+    if x.ndim() != 2 {
+        return Err(KernelError::InvalidShape(format!(
+            "affine_qmm_steel_q4_into_cb requires 2D input x, got {}D",
+            x.ndim()
+        )));
+    }
+    if x.shape()[1] != qw.in_features {
+        return Err(KernelError::InvalidShape(format!(
+            "x.shape[1] ({}) != in_features ({})",
+            x.shape()[1],
+            qw.in_features
+        )));
+    }
+    if qw.bits != 4 {
+        return Err(KernelError::InvalidShape(format!(
+            "affine_qmm_steel_q4_into_cb requires bits==4, got {}",
+            qw.bits
+        )));
+    }
+
+    let m = x.shape()[0];
+    let n = qw.out_features;
+    let k = qw.in_features;
+
+    let dev = registry.device().raw();
+    let opts = metal::MTLResourceOptions::StorageModeShared;
+
+    // --- Dispatch steel kernel ---
+    const STEEL_BM: usize = 32;
+    const STEEL_BN: usize = 32;
+
+    let m_tiles = m.div_ceil(STEEL_BM);
+    let n_tiles = n.div_ceil(STEEL_BN);
+
+    let align_m = m % STEEL_BM == 0;
+    let align_n = n % STEEL_BN == 0;
+
+    let steel_constants = [
+        (200u32, FunctionConstantValue::Bool(align_m)),
+        (201u32, FunctionConstantValue::Bool(align_n)),
+        (202u32, FunctionConstantValue::Bool(false)), // has_residual
+        (204u32, FunctionConstantValue::Bool(false)), // has_swiglu
+        (205u32, FunctionConstantValue::U32(qw.group_size)),
+    ];
+    let pipeline = registry.get_pipeline_with_constants(
+        "affine_qmm_steel_q4",
+        DType::Float32,
+        &steel_constants,
+    )?;
+
+    let out = Array::uninit(dev, &[m, n], DType::Float32);
+
+    let m_u32 = super::checked_u32(m, "M")?;
+    let n_u32 = super::checked_u32(n, "N")?;
+    let k_u32 = super::checked_u32(k, "K")?;
+    let swizzle_log: u32 = if n_tiles >= 4 { 1 } else { 0 };
+
+    let dummy_buf = dev.new_buffer(4, opts);
+
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
+    enc.set_buffer(1, Some(&qw.weights_buf), 0);
+    enc.set_buffer(2, Some(&qw.scales_buf), 0);
+    enc.set_buffer(3, Some(&qw.biases_buf), 0);
+    enc.set_buffer(4, Some(out.metal_buffer()), 0);
+    enc.set_bytes(5, 4, &m_u32 as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(6, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(7, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(8, 4, &swizzle_log as *const u32 as *const std::ffi::c_void);
+    enc.set_buffer(9, Some(&dummy_buf), 0); // residual (unused)
+    enc.set_buffer(10, Some(&dummy_buf), 0); // gate_result (unused)
+
+    let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
+    let tg = metal::MTLSize::new(64, 1, 1);
+    enc.dispatch_thread_groups(grid, tg);
+    enc.end_encoding();
 
     Ok(out)
 }
@@ -6872,17 +7918,13 @@ pub fn affine_quantized_matmul_qldr(
         &qldr_constants,
     )?;
 
-    let out = Array::zeros(dev, &[m, n], DType::Float32);
+    let out = Array::uninit(dev, &[m, n], DType::Float32);
 
     let m_u32 = super::checked_u32(m, "M")?;
     let n_u32 = super::checked_u32(n, "N")?;
     let k_u32 = super::checked_u32(k, "K")?;
     let swizzle_log: u32 = if n_tiles >= 4 { 1 } else { 0 };
 
-    let m_buf = dev.new_buffer_with_data(&m_u32 as *const u32 as *const _, 4, opts);
-    let n_buf = dev.new_buffer_with_data(&n_u32 as *const u32 as *const _, 4, opts);
-    let k_buf = dev.new_buffer_with_data(&k_u32 as *const u32 as *const _, 4, opts);
-    let sw_buf = dev.new_buffer_with_data(&swizzle_log as *const u32 as *const _, 4, opts);
     let dummy_buf = dev.new_buffer(4, opts);
 
     let cb = queue.new_command_buffer();
@@ -6893,10 +7935,10 @@ pub fn affine_quantized_matmul_qldr(
     enc.set_buffer(2, Some(&qw.scales_buf), 0);
     enc.set_buffer(3, Some(&qw.biases_buf), 0);
     enc.set_buffer(4, Some(out.metal_buffer()), 0);
-    enc.set_buffer(5, Some(&m_buf), 0);
-    enc.set_buffer(6, Some(&n_buf), 0);
-    enc.set_buffer(7, Some(&k_buf), 0);
-    enc.set_buffer(8, Some(&sw_buf), 0);
+    enc.set_bytes(5, 4, &m_u32 as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(6, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(7, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(8, 4, &swizzle_log as *const u32 as *const std::ffi::c_void);
     enc.set_buffer(9, Some(&dummy_buf), 0); // residual (unused)
 
     let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
@@ -6952,7 +7994,7 @@ pub fn affine_quantized_matmul_batched_scalar(
     let k = qw.in_features;
 
     let pipeline = registry.get_pipeline("affine_qmm", DType::Float32)?;
-    let out = Array::zeros(registry.device().raw(), &[m, n], DType::Float32);
+    let out = Array::uninit(registry.device().raw(), &[m, n], DType::Float32);
 
     let params: [u32; 4] = [
         super::checked_u32(m, "M")?,
@@ -6960,14 +8002,6 @@ pub fn affine_quantized_matmul_batched_scalar(
         super::checked_u32(k, "K")?,
         qw.group_size,
     ];
-
-    let dev = registry.device().raw();
-    let opts = metal::MTLResourceOptions::StorageModeShared;
-    let params_buf = dev.new_buffer_with_data(
-        params.as_ptr() as *const _,
-        (params.len() * std::mem::size_of::<u32>()) as u64,
-        opts,
-    );
 
     let cb = queue.new_command_buffer();
     let enc = cb.new_compute_command_encoder();
@@ -6977,7 +8011,7 @@ pub fn affine_quantized_matmul_batched_scalar(
     enc.set_buffer(2, Some(&qw.scales_buf), 0);
     enc.set_buffer(3, Some(&qw.biases_buf), 0);
     enc.set_buffer(4, Some(out.metal_buffer()), 0);
-    enc.set_buffer(5, Some(&params_buf), 0);
+    enc.set_bytes(5, 16, params.as_ptr() as *const std::ffi::c_void);
 
     // Legacy tile sizes
     const BM_Q: usize = 16;
@@ -7023,8 +8057,8 @@ constant constexpr uint BN_GQ = 16;
 kernel void gather_qmm_f32(
     device const float*   x         [[buffer(0)]],
     device const uint8_t* w_packed  [[buffer(1)]],
-    device const float*   scales    [[buffer(2)]],
-    device const float*   biases    [[buffer(3)]],
+    device const half*   scales    [[buffer(2)]],
+    device const half*   biases    [[buffer(3)]],
     device const uint*    indices   [[buffer(4)]],
     device float*         output    [[buffer(5)]],
     constant uint& batch_size       [[buffer(6)]],
@@ -7055,8 +8089,8 @@ kernel void gather_qmm_f32(
     // Pointers for this batch element and expert
     device const float*   x_row = x + batch_idx * M_per_batch * K + out_m * K;
     device const uint8_t* w_row = w_packed + expert_idx * N * half_k + out_n * half_k;
-    device const float*   s_row = scales + expert_idx * N * groups_per_row + out_n * groups_per_row;
-    device const float*   b_row = biases + expert_idx * N * groups_per_row + out_n * groups_per_row;
+    device const half*   s_row = scales + expert_idx * N * groups_per_row + out_n * groups_per_row;
+    device const half*   b_row = biases + expert_idx * N * groups_per_row + out_n * groups_per_row;
 
     float acc = 0.0f;
 
@@ -7102,6 +8136,9 @@ fn gather_qmm_ceil_div(a: usize, b: usize) -> usize {
 }
 
 /// Create a u32 Metal constant buffer (for GatherQMM).
+/// Replaced by inline `set_bytes()` in dispatch functions — kept for potential
+/// external callers.
+#[allow(dead_code)]
 fn gather_qmm_u32_buf(device: &metal::DeviceRef, val: u32) -> metal::Buffer {
     let opts = metal::MTLResourceOptions::StorageModeShared;
     device.new_buffer_with_data(&val as *const u32 as *const _, 4, opts)
@@ -7217,7 +8254,7 @@ pub fn gather_qmm(
             expected_w_bytes,
         )));
     }
-    let expected_scales_bytes = n_experts * n * groups_per_row * 4; // float32
+    let expected_scales_bytes = n_experts * n * groups_per_row * 2; // float16
     if (scales_buf.length() as usize) < expected_scales_bytes {
         return Err(KernelError::InvalidShape(format!(
             "gather_qmm: scales_buf too small: {} bytes < expected {} bytes \
@@ -7249,14 +8286,13 @@ pub fn gather_qmm(
 
     let pipeline = registry.get_pipeline("gather_qmm_f32", DType::Float32)?;
     let dev = registry.device().raw();
-    let out = Array::zeros(dev, &[batch, m_per_batch, n], DType::Float32);
+    let out = Array::uninit(dev, &[batch, m_per_batch, n], DType::Float32);
 
-    let batch_buf = gather_qmm_u32_buf(dev, super::checked_u32(batch, "batch")?);
-    let m_buf = gather_qmm_u32_buf(dev, super::checked_u32(m_per_batch, "M_per_batch")?);
-    let n_buf = gather_qmm_u32_buf(dev, super::checked_u32(n, "N")?);
-    let k_buf = gather_qmm_u32_buf(dev, super::checked_u32(k, "K")?);
-    let gs_buf = gather_qmm_u32_buf(dev, group_size);
-    let ne_buf = gather_qmm_u32_buf(dev, super::checked_u32(n_experts, "n_experts")?);
+    let batch_u32 = super::checked_u32(batch, "batch")?;
+    let m_u32 = super::checked_u32(m_per_batch, "M_per_batch")?;
+    let n_u32 = super::checked_u32(n, "N")?;
+    let k_u32 = super::checked_u32(k, "K")?;
+    let ne_u32 = super::checked_u32(n_experts, "n_experts")?;
 
     let cb = queue.new_command_buffer();
     let enc = cb.new_compute_command_encoder();
@@ -7267,12 +8303,12 @@ pub fn gather_qmm(
     enc.set_buffer(3, Some(biases_buf), 0);
     enc.set_buffer(4, Some(indices.metal_buffer()), indices.offset() as u64);
     enc.set_buffer(5, Some(out.metal_buffer()), 0);
-    enc.set_buffer(6, Some(&batch_buf), 0);
-    enc.set_buffer(7, Some(&m_buf), 0);
-    enc.set_buffer(8, Some(&n_buf), 0);
-    enc.set_buffer(9, Some(&k_buf), 0);
-    enc.set_buffer(10, Some(&gs_buf), 0);
-    enc.set_buffer(11, Some(&ne_buf), 0);
+    enc.set_bytes(6, 4, &batch_u32 as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(7, 4, &m_u32 as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(8, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(9, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(10, 4, &group_size as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(11, 4, &ne_u32 as *const u32 as *const std::ffi::c_void);
 
     const BM_GQ: usize = 16;
     const BN_GQ: usize = 16;
@@ -7327,8 +8363,8 @@ constant constexpr int GQMV_Q4_BLOCK_SIZE       = GQMV_Q4_VALUES_PER_THREAD * 32
 kernel void gather_qmv_fast_q4(
     device const float*    x         [[buffer(0)]],  // [batch, K]
     device const uint32_t* w_packed  [[buffer(1)]],  // [n_experts, N, K/pack_factor] packed Q4
-    device const float*    scales    [[buffer(2)]],  // [n_experts, N, groups_per_row]
-    device const float*    biases    [[buffer(3)]],  // [n_experts, N, groups_per_row]
+    device const half*    scales    [[buffer(2)]],  // [n_experts, N, groups_per_row]
+    device const half*    biases    [[buffer(3)]],  // [n_experts, N, groups_per_row]
     device const uint32_t* indices   [[buffer(4)]],  // [batch] expert index per element
     device float*          output    [[buffer(5)]],  // [batch, N]
     constant uint4&        params    [[buffer(6)]],  // (N, K, group_size, batch)
@@ -7363,9 +8399,9 @@ kernel void gather_qmv_fast_q4(
     device const uint8_t* ws = (device const uint8_t*)(w_packed + expert_w_offset)
         + out_row * in_vec_size_w * 4
         + simd_lid * GQMV_Q4_PACKS_PER_THREAD * 4;
-    device const float* sl = scales + expert_s_offset + out_row * in_vec_size_g
+    device const half* sl = scales + expert_s_offset + out_row * in_vec_size_g
         + simd_lid / scale_step;
-    device const float* bl = biases + expert_s_offset + out_row * in_vec_size_g
+    device const half* bl = biases + expert_s_offset + out_row * in_vec_size_g
         + simd_lid / scale_step;
     device const float* xp = x + batch_idx * in_features
         + simd_lid * GQMV_Q4_VALUES_PER_THREAD;
@@ -7445,8 +8481,8 @@ constant constexpr int GQMV_F16_Q4_BLOCK_SIZE       = GQMV_F16_Q4_VALUES_PER_THR
 kernel void gather_qmv_fast_f16_q4(
     device const half*     x         [[buffer(0)]],
     device const uint32_t* w_packed  [[buffer(1)]],
-    device const float*    scales    [[buffer(2)]],
-    device const float*    biases    [[buffer(3)]],
+    device const half*    scales    [[buffer(2)]],
+    device const half*    biases    [[buffer(3)]],
     device const uint32_t* indices   [[buffer(4)]],
     device half*           output    [[buffer(5)]],
     constant uint4&        params    [[buffer(6)]],
@@ -7476,9 +8512,9 @@ kernel void gather_qmv_fast_f16_q4(
     device const uint8_t* ws = (device const uint8_t*)(w_packed + expert_w_offset)
         + out_row * in_vec_size_w * 4
         + simd_lid * GQMV_F16_Q4_PACKS_PER_THREAD * 4;
-    device const float* sl = scales + expert_s_offset + out_row * in_vec_size_g
+    device const half* sl = scales + expert_s_offset + out_row * in_vec_size_g
         + simd_lid / scale_step;
-    device const float* bl = biases + expert_s_offset + out_row * in_vec_size_g
+    device const half* bl = biases + expert_s_offset + out_row * in_vec_size_g
         + simd_lid / scale_step;
     device const half* xp = x + batch_idx * in_features
         + simd_lid * GQMV_F16_Q4_VALUES_PER_THREAD;
@@ -7551,8 +8587,8 @@ pub fn register_gather_qmv(registry: &KernelRegistry) -> Result<(), KernelError>
 /// - `registry`: kernel registry (must have `gather_qmv` source registered).
 /// - `x`: f32 input activations `[batch, k]`.
 /// - `w_packed_buf`: Q4 packed expert weights `[n_experts, n, k/8]` as uint32.
-/// - `scales_buf`: per-group scale factors `[n_experts, n, groups_per_row]` f32.
-/// - `biases_buf`: per-group bias terms `[n_experts, n, groups_per_row]` f32.
+/// - `scales_buf`: per-group scale factors `[n_experts, n, groups_per_row]` f16.
+/// - `biases_buf`: per-group bias terms `[n_experts, n, groups_per_row]` f16.
 /// - `indices`: expert index per batch element `[batch]` (UInt32).
 /// - `batch`: number of batch elements.
 /// - `n`: output features (N) per expert.
@@ -7661,7 +8697,7 @@ pub fn gather_qmv_fast_q4(
             expected_w_bytes,
         )));
     }
-    let expected_scales_bytes = n_experts * n * groups_per_row * 4; // float32
+    let expected_scales_bytes = n_experts * n * groups_per_row * 2; // float16
     if (scales_buf.length() as usize) < expected_scales_bytes {
         return Err(KernelError::InvalidShape(format!(
             "gather_qmv_fast_q4: scales_buf too small: {} bytes < expected {} bytes \
@@ -7693,7 +8729,7 @@ pub fn gather_qmv_fast_q4(
 
     let pipeline = registry.get_pipeline("gather_qmv_fast_q4", DType::Float32)?;
     let dev = registry.device().raw();
-    let out = Array::zeros(dev, &[batch, n], DType::Float32);
+    let out = Array::uninit(dev, &[batch, n], DType::Float32);
 
     // Pack (N, K, group_size, batch) into a uint4.
     let params: [u32; 4] = [
@@ -7702,12 +8738,6 @@ pub fn gather_qmv_fast_q4(
         group_size,
         super::checked_u32(batch, "batch")?,
     ];
-    let opts = metal::MTLResourceOptions::StorageModeShared;
-    let params_buf = dev.new_buffer_with_data(
-        params.as_ptr() as *const _,
-        (params.len() * std::mem::size_of::<u32>()) as u64,
-        opts,
-    );
 
     let cb = queue.new_command_buffer();
     let enc = cb.new_compute_command_encoder();
@@ -7718,7 +8748,7 @@ pub fn gather_qmv_fast_q4(
     enc.set_buffer(3, Some(biases_buf), 0);
     enc.set_buffer(4, Some(indices.metal_buffer()), indices.offset() as u64);
     enc.set_buffer(5, Some(out.metal_buffer()), 0);
-    enc.set_buffer(6, Some(&params_buf), 0);
+    enc.set_bytes(6, 16, params.as_ptr() as *const std::ffi::c_void);
 
     // Grid: (batch, ceil(N/8), 1) — one TG per batch element x output-row tile
     let rows_per_tg: usize = 8; // NUM_SIMDGROUPS(2) * RESULTS_PER_SG(4)
@@ -7836,7 +8866,7 @@ pub fn gather_qmv_fast_f16_q4(
             expected_w_bytes,
         )));
     }
-    let expected_scales_bytes = n_experts * n * groups_per_row * 4; // float32
+    let expected_scales_bytes = n_experts * n * groups_per_row * 2; // float16
     if (scales_buf.length() as usize) < expected_scales_bytes {
         return Err(KernelError::InvalidShape(format!(
             "gather_qmv_fast_f16_q4: scales_buf too small: {} bytes < expected {} bytes \
@@ -7868,7 +8898,7 @@ pub fn gather_qmv_fast_f16_q4(
 
     let pipeline = registry.get_pipeline("gather_qmv_fast_f16_q4", DType::Float16)?;
     let dev = registry.device().raw();
-    let out = Array::zeros(dev, &[batch, n], DType::Float16);
+    let out = Array::uninit(dev, &[batch, n], DType::Float16);
 
     let params: [u32; 4] = [
         super::checked_u32(n, "N")?,
@@ -7876,12 +8906,6 @@ pub fn gather_qmv_fast_f16_q4(
         group_size,
         super::checked_u32(batch, "batch")?,
     ];
-    let opts = metal::MTLResourceOptions::StorageModeShared;
-    let params_buf = dev.new_buffer_with_data(
-        params.as_ptr() as *const _,
-        (params.len() * std::mem::size_of::<u32>()) as u64,
-        opts,
-    );
 
     let cb = queue.new_command_buffer();
     let enc = cb.new_compute_command_encoder();
@@ -7892,7 +8916,7 @@ pub fn gather_qmv_fast_f16_q4(
     enc.set_buffer(3, Some(biases_buf), 0);
     enc.set_buffer(4, Some(indices.metal_buffer()), indices.offset() as u64);
     enc.set_buffer(5, Some(out.metal_buffer()), 0);
-    enc.set_buffer(6, Some(&params_buf), 0);
+    enc.set_bytes(6, 16, params.as_ptr() as *const std::ffi::c_void);
 
     let rows_per_tg: usize = 8; // NUM_SIMDGROUPS(2) * RESULTS_PER_SG(4)
     let num_tgs_y = n.div_ceil(rows_per_tg);
@@ -7979,7 +9003,7 @@ pub fn moe_expert_matmul_q4(
     let opts = metal::MTLResourceOptions::StorageModeShared;
 
     let w_bytes_per_expert = n * k_div_pack * 4; // uint32 per pack element
-    let s_bytes_per_expert = n * groups_per_row * 4; // float32
+    let s_bytes_per_expert = n * groups_per_row * 2; // float16
 
     let total_w_bytes = n_experts * w_bytes_per_expert;
     let total_s_bytes = n_experts * s_bytes_per_expert;
@@ -8140,6 +9164,42 @@ mod tests {
     fn test_valid_bits() {
         for &b in VALID_BITS {
             assert!([2, 3, 4, 6, 8].contains(&b));
+        }
+    }
+
+    #[test]
+    fn test_f32_to_f16_bits_correctness() {
+        // Compare against half crate reference
+        let test_values: &[f32] = &[
+            0.0,
+            1.0,
+            -1.0,
+            0.5,
+            -0.5,
+            0.001,
+            0.02,
+            -0.005,
+            65504.0, // max f16
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            1e-8, // subnormal in f16
+        ];
+        for &v in test_values {
+            let ours = f32_to_f16_bits(v);
+            let reference = half::f16::from_f32(v).to_bits();
+            if v.is_nan() {
+                // Both should be NaN (quiet NaN bit set)
+                assert!(
+                    ours & 0x7C00 == 0x7C00 && ours & 0x03FF != 0,
+                    "NaN mismatch"
+                );
+            } else {
+                assert_eq!(
+                    ours, reference,
+                    "f32_to_f16_bits({v}) = 0x{ours:04X}, expected 0x{reference:04X}"
+                );
+            }
         }
     }
 
@@ -8671,15 +9731,15 @@ mod tests {
         let w_packed_buf =
             dev.new_buffer_with_data(w_data.as_ptr() as *const _, w_bytes as u64, opts);
 
-        // scales & biases: n_experts * n * groups_per_row floats
+        // scales & biases: n_experts * n * groups_per_row as f16
         let sb_elems = n_experts * n * groups_per_row;
-        let scales_data = vec![1.0f32; sb_elems];
-        let biases_data = vec![0.0f32; sb_elems];
-        let sb_bytes = sb_elems * 4;
+        let scales_f16: Vec<u16> = vec![f32_to_f16_bits(1.0); sb_elems];
+        let biases_f16: Vec<u16> = vec![f32_to_f16_bits(0.0); sb_elems];
+        let sb_bytes = sb_elems * 2; // f16 = 2 bytes
         let scales_buf =
-            dev.new_buffer_with_data(scales_data.as_ptr() as *const _, sb_bytes as u64, opts);
+            dev.new_buffer_with_data(scales_f16.as_ptr() as *const _, sb_bytes as u64, opts);
         let biases_buf =
-            dev.new_buffer_with_data(biases_data.as_ptr() as *const _, sb_bytes as u64, opts);
+            dev.new_buffer_with_data(biases_f16.as_ptr() as *const _, sb_bytes as u64, opts);
 
         let idx_data = vec![0u32, 1];
         let indices = Array::from_slice(dev, &idx_data, vec![batch]);
@@ -9892,5 +10952,171 @@ mod tests {
                  rel_diff={diff}"
             );
         }
+    }
+
+    /// GPU correctness test: NAX QMM with f32 scales/biases matches CPU reference.
+    ///
+    /// Creates properly quantized weights with f16 scales/biases (native format),
+    /// runs NAX kernel on GPU, and compares against CPU naive matmul reference.
+    /// This validates that the NAX kernel produces correct results with native f16 scales.
+    #[test]
+    fn test_nax_vs_cpu_reference_gpu_correctness() {
+        // Skip if no GPU available
+        let gpu = match rmlx_metal::device::GpuDevice::system_default() {
+            Ok(g) => g,
+            Err(_) => {
+                eprintln!("Skipping test_nax_vs_cpu_reference_gpu_correctness: no GPU");
+                return;
+            }
+        };
+        let registry = KernelRegistry::new(gpu);
+        crate::ops::register_all(&registry).expect("register_all");
+        let device = registry.device().raw();
+        let queue = device.new_command_queue();
+
+        // Dimensions: NAX requires M>=32, K%64==0
+        let m: usize = 64;
+        let k: usize = 128; // small but K%64==0
+        let n: usize = 64;
+        let group_size: usize = 32;
+        let opts = metal::MTLResourceOptions::StorageModeShared;
+
+        // Deterministic PRNG
+        let mut seed = 42u64;
+        let mut next_f32 = || -> f32 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((seed >> 33) as f32 / (u32::MAX as f32 / 2.0)) - 1.0
+        };
+
+        // Generate random weights and quantize properly
+        let weights_f32: Vec<f32> = (0..n * k).map(|_| next_f32()).collect();
+        let x_f32: Vec<f32> = (0..m * k).map(|_| next_f32() * 0.1).collect();
+
+        // Quantize all N rows
+        let mut all_packed = Vec::new();
+        let mut all_scales = Vec::new();
+        let mut all_biases = Vec::new();
+
+        for j in 0..n {
+            let row = &weights_f32[j * k..(j + 1) * k];
+            let (packed, sc, bi) = quantize_q4_row(row, group_size);
+            all_packed.extend_from_slice(&packed);
+            all_scales.extend_from_slice(&sc);
+            all_biases.extend_from_slice(&bi);
+        }
+
+        // CPU reference: simulate f16 input precision
+        let x_f16_sim: Vec<f32> = x_f32
+            .iter()
+            .map(|&v| half::f16::from_f32(v).to_f32())
+            .collect();
+
+        // CPU naive reference uses f16-simulated scales/biases (matching NAX f16 conversion)
+        let scales_f16_sim: Vec<f32> = all_scales
+            .iter()
+            .map(|&v| half::f16::from_f32(v).to_f32())
+            .collect();
+        let biases_f16_sim: Vec<f32> = all_biases
+            .iter()
+            .map(|&v| half::f16::from_f32(v).to_f32())
+            .collect();
+        let output_cpu = naive_matmul_with_dequant(
+            &x_f16_sim,
+            &all_packed,
+            &scales_f16_sim,
+            &biases_f16_sim,
+            m,
+            n,
+            k,
+            group_size,
+        );
+
+        // Build Metal QuantizedWeight with f16 scales (native format)
+        let weights_buf = device.new_buffer_with_data(
+            all_packed.as_ptr() as *const _,
+            all_packed.len() as u64,
+            opts,
+        );
+        let num_groups = n * k / group_size;
+        let scales_f16: Vec<u16> = all_scales.iter().map(|&v| f32_to_f16_bits(v)).collect();
+        let biases_f16: Vec<u16> = all_biases.iter().map(|&v| f32_to_f16_bits(v)).collect();
+        let scales_buf = device.new_buffer_with_data(
+            scales_f16.as_ptr() as *const _,
+            (num_groups * 2) as u64,
+            opts,
+        );
+        let biases_buf = device.new_buffer_with_data(
+            biases_f16.as_ptr() as *const _,
+            (num_groups * 2) as u64,
+            opts,
+        );
+
+        let qw = QuantizedWeight::new(
+            weights_buf,
+            scales_buf,
+            biases_buf,
+            group_size as u32,
+            4,
+            n,
+            k,
+        )
+        .expect("QuantizedWeight creation");
+
+        // Create f16 input on GPU
+        let numel = m * k;
+        let mut x_f16_bytes = Vec::with_capacity(numel * 2);
+        for &v in &x_f32 {
+            let h = half::f16::from_f32(v);
+            x_f16_bytes.extend_from_slice(&h.to_bits().to_le_bytes());
+        }
+        let x_gpu = Array::from_bytes(device, &x_f16_bytes, vec![m, k], DType::Float16);
+
+        // Run NAX on GPU (uses native f16 scales/biases)
+        // Skip if MPP/NAX kernel is unavailable (CI without MetalPerformancePrimitives)
+        let nax_out = match affine_quantized_matmul_nax(&registry, &x_gpu, &qw, &queue) {
+            Ok(out) => out,
+            Err(KernelError::NotFound(_)) => {
+                eprintln!("Skipping test_nax_vs_cpu_reference_gpu_correctness: NAX kernel unavailable (no MPP)");
+                return;
+            }
+            Err(e) => panic!("NAX QMM failed: {e}"),
+        };
+
+        // Read back NAX output
+        let nax_ptr = nax_out.metal_buffer().contents() as *const u16;
+        let out_count = m * n;
+
+        let mut max_diff: f32 = 0.0;
+        let mut mismatch_count = 0usize;
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..out_count {
+            let nv = half::f16::from_bits(unsafe { *nax_ptr.add(i) }).to_f32();
+            let cv = output_cpu[i];
+            let scale = cv.abs().max(1e-4);
+            let diff = (cv - nv).abs() / scale;
+            if diff > max_diff {
+                max_diff = diff;
+            }
+            // f16 MMA accumulation on GPU vs f32 accumulation on CPU:
+            // Large K (128) with f16 accumulation produces significant rounding drift.
+            // rtol=0.5 is generous but validates correct scale conversion (without
+            // the f32→f16 fix, values would differ by orders of magnitude).
+            if diff > 0.5 {
+                mismatch_count += 1;
+            }
+        }
+
+        // The critical validation: with the f32→f16 bug, max_diff would be >100.0
+        // (feeding f32 bits as f16 produces garbage). After the fix, max_diff < 1.0.
+        assert!(
+            max_diff < 1.0,
+            "NAX output too far from CPU reference: max_diff={max_diff} (>1.0 suggests \
+             kernel computation bug)"
+        );
+        assert!(
+            mismatch_count == 0,
+            "NAX vs CPU mismatch: {mismatch_count}/{out_count} elements exceed rtol=0.5, \
+             max_diff={max_diff}"
+        );
     }
 }

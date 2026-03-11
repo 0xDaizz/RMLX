@@ -2,7 +2,7 @@
 Benchmark a single transformer layer forward pass in MLX.
 
 Configuration matches RMLX's pipeline_bench:
-  - Llama-2 7B-style single decoder layer
+  - Qwen 3.5 MoE expert-style single decoder layer
   - Decode mode (seq_len=1)
 """
 
@@ -15,11 +15,11 @@ import mlx.nn as nn
 # ---------------------------------------------------------------------------
 # Configuration (matches RMLX pipeline_bench)
 # ---------------------------------------------------------------------------
-HIDDEN_SIZE = 4096
-NUM_HEADS = 32
-NUM_KV_HEADS = 8
+HIDDEN_SIZE = 3584
+NUM_HEADS = 28
+NUM_KV_HEADS = 4
 HEAD_DIM = 128
-INTERMEDIATE_DIM = 11008
+INTERMEDIATE_DIM = 2560
 SEQ_LEN = 1
 RMS_NORM_EPS = 1e-5
 
@@ -49,10 +49,10 @@ class TransformerLayer(nn.Module):
         self.down_proj = nn.Linear(INTERMEDIATE_DIM, HIDDEN_SIZE, bias=False)
 
         # RoPE
-        self.rope = nn.RoPE(HEAD_DIM, base=10000.0)
+        self.rope = nn.RoPE(HEAD_DIM, base=1000000.0)
 
     def __call__(self, x):
-        # x: [batch=1, seq_len=1, hidden=4096]
+        # x: [batch=1, seq_len=1, hidden=3584]
 
         # ---------- Self-Attention ----------
         h = self.attention_norm(x)
@@ -60,7 +60,7 @@ class TransformerLayer(nn.Module):
         q = self.q_proj(h).reshape(1, -1, NUM_HEADS, HEAD_DIM).transpose(0, 2, 1, 3)
         k = self.k_proj(h).reshape(1, -1, NUM_KV_HEADS, HEAD_DIM).transpose(0, 2, 1, 3)
         v = self.v_proj(h).reshape(1, -1, NUM_KV_HEADS, HEAD_DIM).transpose(0, 2, 1, 3)
-        # q: [1, 32, seq, 128],  k/v: [1, 8, seq, 128]
+        # q: [1, 28, seq, 128],  k/v: [1, 4, seq, 128]
 
         q = self.rope(q)
         k = self.rope(k)

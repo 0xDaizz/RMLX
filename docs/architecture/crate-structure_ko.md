@@ -117,8 +117,7 @@ rmlx/
 │   │       ├── moe.rs            # MoE gate + expert 라우팅
 │   │       └── models/
 │   │           ├── mod.rs
-│   │           ├── llama.rs      # LLaMA 아키텍처
-│   │           ├── qwen.rs       # Qwen/Qwen2.5
+│   │           ├── qwen.rs       # Qwen 3.5
 │   │           ├── deepseek.rs   # DeepSeek-V3 (MoE)
 │   │           └── mixtral.rs    # Mixtral (MoE)
 │   │
@@ -232,10 +231,10 @@ rmlx/
 
 | 항목 | 내용 |
 |------|------|
-| **목적** | Transformer 기반 아키텍처의 신경망 레이어를 제공합니다. Linear, Attention, MoE 등의 고수준 모듈과 LLaMA, Qwen, DeepSeek-V3 등 모델 아키텍처를 포함합니다. |
-| **핵심 모듈** | `linear.rs` (quantized Linear, `prepare_weight_t()`), `attention.rs` (Multi-head/GQA), `transformer.rs` (Transformer block, `forward_graph()`, `forward_into_cb()`), `moe.rs` (gate + routing), `models/` (llama.rs, qwen.rs, deepseek.rs, mixtral.rs) |
+| **목적** | Transformer 기반 아키텍처의 신경망 레이어를 제공합니다. Linear, Attention, MoE 등의 고수준 모듈과 Qwen 3.5, DeepSeek-V3, Mixtral 등 모델 아키텍처를 포함합니다. |
+| **핵심 모듈** | `linear.rs` (quantized Linear, `prepare_weight_t()`), `attention.rs` (Multi-head/GQA), `transformer.rs` (Transformer block, `forward_graph()`, `forward_into_cb()`), `moe.rs` (gate + routing), `models/` (qwen.rs, deepseek.rs, mixtral.rs) |
 | **의존성** | `rmlx-core` |
-| **현재 상태** | 완료 — Transformer 블록, Linear/Attention/MoE 레이어, LLaMA/Qwen/DeepSeek-V3/Mixtral 모델 아키텍처, ExecGraph 호환 `forward_graph()`, 가중치 사전 캐싱 전체 구현 |
+| **현재 상태** | 완료 — Transformer 블록, Linear/Attention/MoE 레이어, Qwen/DeepSeek-V3/Mixtral/Kimi 모델 아키텍처, ExecGraph 호환 `forward_graph()`, 가중치 사전 캐싱 전체 구현 |
 
 ---
 

@@ -4,7 +4,7 @@
 //!
 //! 1. Empty kernel single-dispatch latency
 //! 2. 1CB-N encoders vs NCB-1encoder (N = 1, 4, 8, 16, 32)
-//! 3. Llama-3 8B single-layer op breakdown: matmul, rms_norm, rope, fused_silu_mul
+//! 3. MoE Expert Layer op breakdown (Qwen 3.5-style): matmul, rms_norm, rope, fused_silu_mul
 //!
 //! Run with:
 //!   cargo bench -p rmlx-core --bench dispatch_overhead
@@ -18,13 +18,13 @@ use rmlx_core::ops;
 use rmlx_metal::device::GpuDevice;
 
 // ---------------------------------------------------------------------------
-// Llama-3 8B parameters
+// MoE Expert Layer parameters (Qwen 3.5-style dimensions)
 // ---------------------------------------------------------------------------
 
-const HIDDEN_DIM: usize = 4096;
-const INTERMEDIATE_DIM: usize = 14336;
-const N_HEADS: usize = 32;
-const N_KV_HEADS: usize = 8;
+const HIDDEN_DIM: usize = 3584;
+const INTERMEDIATE_DIM: usize = 2560;
+const N_HEADS: usize = 28;
+const N_KV_HEADS: usize = 4;
 const HEAD_DIM: usize = 128;
 const RMS_NORM_EPS: f32 = 1e-5;
 
@@ -218,7 +218,7 @@ fn bench_cb_vs_encoder(
     device: &metal::Device,
 ) {
     println!("=== 2. 1CB-N encoders vs NCB-1encoder ===");
-    println!("  Using matmul [1, 4096] @ [4096, 4096] as the compute work unit");
+    println!("  Using matmul [1, 3584] @ [3584, 3584] as the compute work unit");
     println!();
 
     let a = rand_f16_array(device, &[1, HIDDEN_DIM], 42);
@@ -295,15 +295,15 @@ fn bench_cb_vs_encoder(
 }
 
 // ===========================================================================
-// Bench 3: Llama-3 8B single-layer op breakdown
+// Bench 3: MoE expert single-layer op breakdown
 // ===========================================================================
 
-fn bench_llama3_layer_ops(
+fn bench_moe_expert_layer_ops(
     registry: &KernelRegistry,
     queue: &metal::CommandQueue,
     device: &metal::Device,
 ) {
-    println!("=== 3. Llama-3 8B single-layer op breakdown (decode M=1, f16) ===");
+    println!("=== 3. MoE Expert Layer op breakdown (Qwen 3.5-style, decode M=1, f16) ===");
     println!(
         "  hidden_dim={HIDDEN_DIM}  intermediate={INTERMEDIATE_DIM}  \
          n_heads={N_HEADS}  n_kv_heads={N_KV_HEADS}  head_dim={HEAD_DIM}"
@@ -409,7 +409,7 @@ fn bench_llama3_layer_ops(
     // 1. RMS Norm (attention)
     bench_op!(
         "rms_norm",
-        "[1,4096] eps=1e-5",
+        "[1,3584] eps=1e-5",
         |reg: &KernelRegistry, cb: &metal::CommandBufferRef| {
             let _ = ops::rms_norm::rms_norm_into_cb(reg, &x, Some(&norm_w), RMS_NORM_EPS, cb);
         }
@@ -418,7 +418,7 @@ fn bench_llama3_layer_ops(
     // 2. Q matmul
     bench_op!(
         "matmul_q",
-        "[1,4096]@[4096,4096]",
+        "[1,3584]@[3584,3584]",
         |reg: &KernelRegistry, cb: &metal::CommandBufferRef| {
             let _ = ops::matmul::matmul_into_cb(reg, &x, &wq, cb);
         }
@@ -427,7 +427,7 @@ fn bench_llama3_layer_ops(
     // 3. K matmul
     bench_op!(
         "matmul_k",
-        "[1,4096]@[4096,1024]",
+        "[1,3584]@[3584,512]",
         |reg: &KernelRegistry, cb: &metal::CommandBufferRef| {
             let _ = ops::matmul::matmul_into_cb(reg, &x, &wk, cb);
         }
@@ -436,7 +436,7 @@ fn bench_llama3_layer_ops(
     // 4. V matmul
     bench_op!(
         "matmul_v",
-        "[1,4096]@[4096,1024]",
+        "[1,3584]@[3584,512]",
         |reg: &KernelRegistry, cb: &metal::CommandBufferRef| {
             let _ = ops::matmul::matmul_into_cb(reg, &x, &wv, cb);
         }
@@ -464,7 +464,7 @@ fn bench_llama3_layer_ops(
     // 6. O projection
     bench_op!(
         "matmul_o",
-        "[1,4096]@[4096,4096]",
+        "[1,3584]@[3584,3584]",
         |reg: &KernelRegistry, cb: &metal::CommandBufferRef| {
             let _ = ops::matmul::matmul_into_cb(reg, &x, &wo, cb);
         }
@@ -473,7 +473,7 @@ fn bench_llama3_layer_ops(
     // 7. RMS Norm (FFN)
     bench_op!(
         "rms_norm_ffn",
-        "[1,4096] eps=1e-5",
+        "[1,3584] eps=1e-5",
         |reg: &KernelRegistry, cb: &metal::CommandBufferRef| {
             let _ = ops::rms_norm::rms_norm_into_cb(reg, &x, Some(&norm_w), RMS_NORM_EPS, cb);
         }
@@ -482,7 +482,7 @@ fn bench_llama3_layer_ops(
     // 8. Gate matmul
     bench_op!(
         "matmul_gate",
-        "[1,4096]@[4096,14336]",
+        "[1,3584]@[3584,2560]",
         |reg: &KernelRegistry, cb: &metal::CommandBufferRef| {
             let _ = ops::matmul::matmul_into_cb(reg, &x, &wgate, cb);
         }
@@ -491,7 +491,7 @@ fn bench_llama3_layer_ops(
     // 9. Up matmul
     bench_op!(
         "matmul_up",
-        "[1,4096]@[4096,14336]",
+        "[1,3584]@[3584,2560]",
         |reg: &KernelRegistry, cb: &metal::CommandBufferRef| {
             let _ = ops::matmul::matmul_into_cb(reg, &x, &wup, cb);
         }
@@ -500,7 +500,7 @@ fn bench_llama3_layer_ops(
     // 10. Fused SiLU * mul
     bench_op!(
         "fused_silu_mul",
-        "[1,14336]",
+        "[1,2560]",
         |reg: &KernelRegistry, cb: &metal::CommandBufferRef| {
             let _ = ops::fused::fused_silu_mul_into_cb(reg, &gate_out, &up_out, cb);
         }
@@ -509,7 +509,7 @@ fn bench_llama3_layer_ops(
     // 11. Down matmul
     bench_op!(
         "matmul_down",
-        "[1,14336]@[14336,4096]",
+        "[1,2560]@[2560,3584]",
         |reg: &KernelRegistry, cb: &metal::CommandBufferRef| {
             let _ = ops::matmul::matmul_into_cb(reg, &ffn_mid, &wdown, cb);
         }
@@ -703,7 +703,7 @@ fn main() {
 
     bench_empty_dispatch(&queue);
     bench_cb_vs_encoder(&registry, &queue, device);
-    bench_llama3_layer_ops(&registry, &queue, device);
+    bench_moe_expert_layer_ops(&registry, &queue, device);
 
     println!("Done.");
 }

@@ -24,7 +24,7 @@ use crate::transformer::{FeedForward, FeedForwardType, TransformerConfig};
 /// DeepSeek-V3 specific configuration fields not captured by `TransformerConfig`.
 ///
 /// These are needed for full model instantiation but go beyond the generic
-/// transformer config (which is shared across LLaMA, Mixtral, etc.).
+/// transformer config (which is shared across all decoder-only models).
 pub struct DeepSeekV3Config {
     /// Base transformer configuration.
     pub transformer: TransformerConfig,
