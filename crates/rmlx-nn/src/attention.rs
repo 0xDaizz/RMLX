@@ -550,6 +550,74 @@ impl LayerKvCache {
         Ok(())
     }
 
+    /// Batched KV cache append using a pre-existing compute command encoder.
+    ///
+    /// Like `append_batched_into_cb` but dispatches into an already-open encoder,
+    /// avoiding encoder create/destroy overhead.
+    pub fn append_batched_encode(
+        &mut self,
+        src_k: &Array,
+        src_v: &Array,
+        new_tokens: usize,
+        registry: &KernelRegistry,
+        encoder: &metal::ComputeCommandEncoderRef,
+    ) -> Result<(), KernelError> {
+        let has_slab = self.keys_slab.is_some() && self.values_slab.is_some();
+        let is_f16 = !self.keys.is_empty() && self.keys[0].dtype() == DType::Float16;
+
+        if !has_slab || !is_f16 || self.max_seq_len == 0 {
+            // Fallback: split into per-head views and use the existing encoder path
+            let elem_size = src_k.dtype().size_of();
+            let head_elems = new_tokens * self.head_dim;
+            let k_heads: Vec<Array> = (0..self.num_kv_heads)
+                .map(|h| {
+                    src_k.view(
+                        vec![new_tokens, self.head_dim],
+                        vec![self.head_dim, 1],
+                        src_k.offset() + h * head_elems * elem_size,
+                    )
+                })
+                .collect();
+            let v_heads: Vec<Array> = (0..self.num_kv_heads)
+                .map(|h| {
+                    src_v.view(
+                        vec![new_tokens, self.head_dim],
+                        vec![self.head_dim, 1],
+                        src_v.offset() + h * head_elems * elem_size,
+                    )
+                })
+                .collect();
+            return self.append_into_encoder(k_heads, v_heads, new_tokens, registry, encoder);
+        }
+
+        if self.seq_len + new_tokens > self.max_seq_len {
+            return Err(KernelError::InvalidShape(format!(
+                "LayerKvCache::append_batched_encode: overflow: {} cached + {} new > {} max",
+                self.seq_len, new_tokens, self.max_seq_len
+            )));
+        }
+
+        let k_slab = self.keys_slab.as_ref().unwrap();
+        let v_slab = self.values_slab.as_ref().unwrap();
+
+        ops::copy::kv_cache_copy_batched_f16_encode(
+            src_k,
+            src_v,
+            k_slab,
+            v_slab,
+            self.num_kv_heads,
+            new_tokens,
+            self.head_dim,
+            self.max_seq_len,
+            self.seq_len,
+            registry,
+            encoder,
+        )?;
+
+        self.seq_len += new_tokens;
+        Ok(())
+    }
+
     /// Like append_into_cb but dispatches into an already-open encoder.
     pub fn append_into_encoder(
         &mut self,
@@ -3479,6 +3547,289 @@ impl Attention {
 
         // O projection
         self.o_proj.forward_into_cb(&concat, registry, cb)
+    }
+
+    // -----------------------------------------------------------------------
+    // Single-encoder path: all ops share one ComputeCommandEncoder
+    // -----------------------------------------------------------------------
+
+    /// Forward pass using a single pre-existing compute command encoder.
+    ///
+    /// Identical logic to `forward_prefill_single_cb` but dispatches all kernels
+    /// via a shared encoder, eliminating per-op encoder create/destroy overhead
+    /// (~300-500us/layer).
+    ///
+    /// **Prerequisites:**
+    /// - `prepare_merged_qkv_transposed()` must have been called (merged QKV weight).
+    /// - `o_proj` must have pre-cached transposed weight.
+    /// - The caller manages the encoder lifecycle (creation and `end_encoding()`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_prefill_single_encoder(
+        &self,
+        x: &Array,
+        norm_weight: &Array,
+        rms_norm_eps: f32,
+        cos_freqs: Option<&Array>,
+        sin_freqs: Option<&Array>,
+        _mask: Option<&Array>,
+        cache: &mut LayerKvCache,
+        registry: &KernelRegistry,
+        encoder: &metal::ComputeCommandEncoderRef,
+    ) -> Result<Array, KernelError> {
+        let num_heads = self.config.num_heads;
+        let num_kv_heads = self.config.num_kv_heads;
+        let head_dim = self.config.head_dim;
+        let hidden_size = num_heads * head_dim;
+        let seq_len = x.shape()[0];
+
+        // RMS norm (pre-attention)
+        let normed =
+            ops::rms_norm::rms_norm_encode(registry, x, Some(norm_weight), rms_norm_eps, encoder)?;
+
+        let q_dim = num_heads * head_dim;
+        let k_dim = num_kv_heads * head_dim;
+        let v_dim = num_kv_heads * head_dim;
+        let (q, k, v) = {
+            let normed_2d = if normed.ndim() == 1 {
+                normed.reshape(vec![1, normed.shape()[0]])?
+            } else {
+                normed.reshape(vec![normed.shape()[0], normed.shape()[1]])?
+            };
+
+            if let Some(ref qkv_wt) = self.qkv_merged_weight_t {
+                let qkv = ops::matmul::matmul_encode(registry, &normed_2d, qkv_wt, encoder)?;
+                let total_out = q_dim + k_dim + v_dim;
+                let elem_size = qkv.dtype().size_of();
+                let q_view = Array::new(
+                    qkv.metal_buffer().to_owned(),
+                    vec![seq_len, q_dim],
+                    vec![total_out, 1],
+                    qkv.dtype(),
+                    qkv.offset(),
+                );
+                let k_view = Array::new(
+                    qkv.metal_buffer().to_owned(),
+                    vec![seq_len, k_dim],
+                    vec![total_out, 1],
+                    qkv.dtype(),
+                    qkv.offset() + q_dim * elem_size,
+                );
+                let v_view = Array::new(
+                    qkv.metal_buffer().to_owned(),
+                    vec![seq_len, v_dim],
+                    vec![total_out, 1],
+                    qkv.dtype(),
+                    qkv.offset() + (q_dim + k_dim) * elem_size,
+                );
+                (q_view, k_view, v_view)
+            } else {
+                return Err(KernelError::InvalidShape(
+                    "forward_prefill_single_encoder requires merged QKV weight \
+                     (call prepare_merged_qkv_transposed first)"
+                        .into(),
+                ));
+            }
+        };
+
+        let rope_offset = cache.seq_len as u32;
+
+        let q_batched;
+        let k_batched;
+        let v_batched;
+
+        let q_row_stride = q.strides()[0];
+        let k_row_stride = k.strides()[0];
+        let v_row_stride = v.strides()[0];
+
+        if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
+            q_batched = ops::rope::rope_multihead_encode(
+                registry,
+                &q,
+                cos,
+                sin,
+                num_heads,
+                rope_offset,
+                q_row_stride,
+                encoder,
+            )?;
+            k_batched = ops::rope::rope_multihead_encode(
+                registry,
+                &k,
+                cos,
+                sin,
+                num_kv_heads,
+                rope_offset,
+                k_row_stride,
+                encoder,
+            )?;
+            v_batched = ops::rope::deinterleave_heads_encode(
+                registry,
+                &v,
+                num_kv_heads,
+                v_row_stride,
+                encoder,
+            )?;
+        } else {
+            q_batched = ops::rope::deinterleave_heads_encode(
+                registry,
+                &q,
+                num_heads,
+                q_row_stride,
+                encoder,
+            )?;
+            k_batched = ops::rope::deinterleave_heads_encode(
+                registry,
+                &k,
+                num_kv_heads,
+                k_row_stride,
+                encoder,
+            )?;
+            v_batched = ops::rope::deinterleave_heads_encode(
+                registry,
+                &v,
+                num_kv_heads,
+                v_row_stride,
+                encoder,
+            )?;
+        }
+
+        // KV cache: bypass on initial prefill (cache empty)
+        let needs_initial_append = cache.seq_len == 0;
+        let (k_for_sdpa, v_for_sdpa, kv_stride, total_seq) = if needs_initial_append {
+            let k_view = k_batched.view(
+                k_batched.shape().to_vec(),
+                k_batched.strides().to_vec(),
+                k_batched.offset(),
+            );
+            let v_view = v_batched.view(
+                v_batched.shape().to_vec(),
+                v_batched.strides().to_vec(),
+                v_batched.offset(),
+            );
+            (k_view, v_view, None, seq_len)
+        } else {
+            cache.append_batched_encode(&k_batched, &v_batched, seq_len, registry, encoder)?;
+            let total_seq = cache.seq_len;
+            let k_slab = cache.keys_slab_view().ok_or_else(|| {
+                KernelError::InvalidShape(
+                    "forward_prefill_single_encoder: cache has no slab layout".into(),
+                )
+            })?;
+            let v_slab = cache.values_slab_view().ok_or_else(|| {
+                KernelError::InvalidShape(
+                    "forward_prefill_single_encoder: cache has no slab layout".into(),
+                )
+            })?;
+            let kv_stride = if cache.max_seq_len() != total_seq {
+                Some(cache.max_seq_len())
+            } else {
+                None
+            };
+            (k_slab, v_slab, kv_stride, total_seq)
+        };
+
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let is_f16_d128 = q_batched.dtype() == DType::Float16 && head_dim == 128 && seq_len > 1;
+        let use_nax = is_f16_d128 && registry.device().tuning().supports_nax;
+        let use_mma_bk32 = is_f16_d128 && !use_nax && total_seq >= 256;
+        let seq_major_output = is_f16_d128 && !use_nax;
+
+        let attn_slab = if use_nax {
+            ops::sdpa::sdpa_prefill_nax_f16_encode(
+                registry,
+                &q_batched,
+                &k_for_sdpa,
+                &v_for_sdpa,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                seq_len,
+                total_seq,
+                kv_stride,
+                scale,
+                true,
+                encoder,
+            )?
+        } else if use_mma_bk32 {
+            ops::sdpa::sdpa_prefill_mma_bk32_f16_encode(
+                registry,
+                &q_batched,
+                &k_for_sdpa,
+                &v_for_sdpa,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                seq_len,
+                total_seq,
+                kv_stride,
+                None,
+                scale,
+                true,
+                encoder,
+            )?
+        } else if is_f16_d128 {
+            ops::sdpa::sdpa_prefill_mma_f16_encode(
+                registry,
+                &q_batched,
+                &k_for_sdpa,
+                &v_for_sdpa,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                seq_len,
+                total_seq,
+                kv_stride,
+                None,
+                scale,
+                true,
+                encoder,
+            )?
+        } else {
+            ops::sdpa::sdpa_prefill_gqa_slab_encode(
+                registry,
+                &q_batched,
+                &k_for_sdpa,
+                &v_for_sdpa,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                seq_len,
+                total_seq,
+                kv_stride,
+                None,
+                scale,
+                true,
+                encoder,
+            )?
+        };
+
+        // Deferred KV write: after SDPA critical path
+        if needs_initial_append {
+            cache.append_batched_encode(&k_batched, &v_batched, seq_len, registry, encoder)?;
+        }
+
+        // Head concat / interleave
+        let concat = if seq_major_output {
+            attn_slab.view(
+                vec![seq_len, hidden_size],
+                vec![hidden_size, 1],
+                attn_slab.offset(),
+            )
+        } else {
+            let packed = attn_slab.view(
+                vec![num_heads * seq_len, head_dim],
+                vec![head_dim, 1],
+                attn_slab.offset(),
+            );
+            if seq_len == 1 {
+                packed.view(vec![1, hidden_size], vec![hidden_size, 1], packed.offset())
+            } else {
+                ops::rope::interleave_heads_encode(registry, &packed, num_heads, seq_len, encoder)?
+            }
+        };
+
+        // O projection
+        self.o_proj.forward_into_encoder(&concat, registry, encoder)
     }
 
     // -----------------------------------------------------------------------

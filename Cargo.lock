@@ -491,6 +491,7 @@ name = "rmlx-nn"
 version = "0.1.0"
 dependencies = [
  "metal",
+ "objc",
  "rmlx-core",
  "rmlx-distributed",
  "rmlx-metal",

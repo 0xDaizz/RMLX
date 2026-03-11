@@ -329,15 +329,6 @@ fn silu_kernel_info(dtype: DType, fused_gate: bool) -> Result<(&'static str, u64
     }
 }
 
-/// Create a constant `uint` buffer on the device.
-fn make_u32_buf(device: &metal::DeviceRef, val: u32) -> metal::Buffer {
-    device.new_buffer_with_data(
-        &val as *const u32 as *const std::ffi::c_void,
-        4,
-        metal::MTLResourceOptions::StorageModeShared,
-    )
-}
-
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -355,15 +346,15 @@ pub fn silu(
     let pipeline = registry.get_pipeline(kernel_name, input.dtype())?;
     let numel = input.numel();
 
-    let out = Array::zeros(registry.device().raw(), input.shape(), input.dtype());
-    let numel_buf = make_u32_buf(registry.device().raw(), numel as u32);
+    let out = Array::uninit(registry.device().raw(), input.shape(), input.dtype());
+    let numel_u32 = numel as u32;
 
     let command_buffer = queue.new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();
     encoder.set_compute_pipeline_state(&pipeline);
     encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
     encoder.set_buffer(1, Some(out.metal_buffer()), out.offset() as u64);
-    encoder.set_buffer(2, Some(&numel_buf), 0);
+    encoder.set_bytes(2, 4, &numel_u32 as *const u32 as *const std::ffi::c_void);
 
     // Grid = ceil(numel / elems_per_thread) threads
     let grid_threads = (numel as u64).div_ceil(elems_per_thread);
@@ -414,8 +405,8 @@ pub fn silu_gate(
     let pipeline = registry.get_pipeline(kernel_name, input.dtype())?;
     let numel = input.numel();
 
-    let out = Array::zeros(registry.device().raw(), input.shape(), input.dtype());
-    let numel_buf = make_u32_buf(registry.device().raw(), numel as u32);
+    let out = Array::uninit(registry.device().raw(), input.shape(), input.dtype());
+    let numel_u32 = numel as u32;
 
     let command_buffer = queue.new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();
@@ -423,7 +414,7 @@ pub fn silu_gate(
     encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
     encoder.set_buffer(1, Some(gate.metal_buffer()), gate.offset() as u64);
     encoder.set_buffer(2, Some(out.metal_buffer()), out.offset() as u64);
-    encoder.set_buffer(3, Some(&numel_buf), 0);
+    encoder.set_bytes(3, 4, &numel_u32 as *const u32 as *const std::ffi::c_void);
 
     let grid_threads = (numel as u64).div_ceil(elems_per_thread);
     let grid_size = MTLSize::new(grid_threads, 1, 1);
@@ -443,13 +434,11 @@ pub fn silu_gate(
 // Into-CB variant (encode into existing command buffer, no commit/wait)
 // ---------------------------------------------------------------------------
 
-/// Encode SiLU activation into an existing command buffer (no commit/wait).
-///
-/// **Caller must ensure `input` is contiguous.**
-pub fn silu_into_cb(
+/// Private: encode SiLU into an existing compute encoder (does NOT call end_encoding).
+fn silu_encode_impl(
     registry: &KernelRegistry,
     input: &Array,
-    cb: &metal::CommandBufferRef,
+    encoder: &metal::ComputeCommandEncoderRef,
 ) -> Result<Array, KernelError> {
     let (kernel_name, elems_per_thread) = silu_kernel_info(input.dtype(), false)?;
     let pipeline = registry.get_pipeline(kernel_name, input.dtype())?;
@@ -460,7 +449,6 @@ pub fn silu_into_cb(
 
     let grid_threads = (numel as u64).div_ceil(elems_per_thread);
 
-    let encoder = cb.new_compute_command_encoder();
     encoder.set_compute_pipeline_state(&pipeline);
     encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
     encoder.set_buffer(1, Some(out.metal_buffer()), out.offset() as u64);
@@ -472,7 +460,32 @@ pub fn silu_into_cb(
         1,
     );
     encoder.dispatch_threads(MTLSize::new(grid_threads, 1, 1), threadgroup_size);
-    encoder.end_encoding();
 
     Ok(out)
+}
+
+/// Encode SiLU activation into an existing command buffer (no commit/wait).
+///
+/// **Caller must ensure `input` is contiguous.**
+pub fn silu_into_cb(
+    registry: &KernelRegistry,
+    input: &Array,
+    cb: &metal::CommandBufferRef,
+) -> Result<Array, KernelError> {
+    let encoder = cb.new_compute_command_encoder();
+    let result = silu_encode_impl(registry, input, encoder)?;
+    encoder.end_encoding();
+    Ok(result)
+}
+
+/// Encode SiLU activation into an existing compute encoder (no encoder create/end).
+///
+/// Caller is responsible for creating and ending the encoder.
+/// **Caller must ensure `input` is contiguous.**
+pub fn silu_encode(
+    registry: &KernelRegistry,
+    input: &Array,
+    encoder: &metal::ComputeCommandEncoderRef,
+) -> Result<Array, KernelError> {
+    silu_encode_impl(registry, input, encoder)
 }

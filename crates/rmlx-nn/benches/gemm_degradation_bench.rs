@@ -149,10 +149,8 @@ fn main() {
     let device = registry.device().raw();
     let queue = device.new_command_queue();
 
-    let sizes: Vec<(&str, usize, usize, usize)> = vec![
-        ("O_proj", 1024, 4096, 4096),
-        ("Down", 1024, 14336, 4096),
-    ];
+    let sizes: Vec<(&str, usize, usize, usize)> =
+        vec![("O_proj", 1024, 4096, 4096), ("Down", 1024, 14336, 4096)];
 
     println!("=== GEMM Pipeline Degradation Diagnostic ===");
     println!("Warmup: {} iters, Bench: {} iters", WARMUP, ITERS);
@@ -182,17 +180,17 @@ fn main() {
         // Test 2: Memory pressure (~2GB of dummy tensors)
         // ---------------------------------------------------------------
         let _dummies: Vec<Array> = vec![
-            rand_array(device, &[4096, 6144], 100),  // QKV weight ~48MB
-            rand_array(device, &[4096, 4096], 101),  // O weight ~32MB
-            rand_array(device, &[4096, 14336], 102), // gate weight ~112MB
-            rand_array(device, &[4096, 14336], 103), // up weight ~112MB
-            rand_array(device, &[14336, 4096], 104), // down weight ~112MB
-            rand_array(device, &[4096], 105),        // norm1 weight
-            rand_array(device, &[4096], 106),        // norm2 weight
-            rand_array(device, &[1024, 4096], 107),  // intermediate 1
-            rand_array(device, &[1024, 4096], 108),  // intermediate 2
-            rand_array(device, &[1024, 14336], 109), // intermediate 3
-            rand_array(device, &[1024, 28672], 110), // intermediate 4
+            rand_array(device, &[4096, 6144], 100),     // QKV weight ~48MB
+            rand_array(device, &[4096, 4096], 101),     // O weight ~32MB
+            rand_array(device, &[4096, 14336], 102),    // gate weight ~112MB
+            rand_array(device, &[4096, 14336], 103),    // up weight ~112MB
+            rand_array(device, &[14336, 4096], 104),    // down weight ~112MB
+            rand_array(device, &[4096], 105),           // norm1 weight
+            rand_array(device, &[4096], 106),           // norm2 weight
+            rand_array(device, &[1024, 4096], 107),     // intermediate 1
+            rand_array(device, &[1024, 4096], 108),     // intermediate 2
+            rand_array(device, &[1024, 14336], 109),    // intermediate 3
+            rand_array(device, &[1024, 28672], 110),    // intermediate 4
             rand_array(device, &[32 * 1024, 128], 111), // KV cache 1
             rand_array(device, &[32 * 1024, 128], 112), // KV cache 2
         ];
@@ -281,7 +279,7 @@ fn main() {
         // ---------------------------------------------------------------
         {
             let polluter = rand_array(device, &[8192, 8192], 400); // ~128MB f16
-            // Run a dummy op on polluter to push GEMM data out of caches
+                                                                   // Run a dummy op on polluter to push GEMM data out of caches
             let cb = queue.new_command_buffer();
             let _ = ops::rms_norm::rms_norm_into_cb(&registry, &polluter, None, 1e-5, cb);
             cb.commit();

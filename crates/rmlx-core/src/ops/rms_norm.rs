@@ -906,16 +906,6 @@ fn rms_kernel_name(dtype: DType, axis_size: usize) -> Result<&'static str, Kerne
     }
 }
 
-/// Create a constant buffer on the device.
-fn make_const_buf<T: Copy>(device: &metal::DeviceRef, val: T) -> metal::Buffer {
-    let size = std::mem::size_of::<T>() as u64;
-    device.new_buffer_with_data(
-        &val as *const T as *const std::ffi::c_void,
-        size,
-        metal::MTLResourceOptions::StorageModeShared,
-    )
-}
-
 /// Apply RMS normalization: y = x * rsqrt(mean(x^2) + eps) * weight.
 ///
 /// - `input` shape: `[rows, axis_size]` (2-D).
@@ -1002,12 +992,7 @@ pub fn rms_norm_opt(
     let rows = input.shape()[0];
     let axis_size = super::checked_u32(axis_size_usize, "axis_size")?;
 
-    let out = Array::zeros(registry.device().raw(), input.shape(), input.dtype());
-
-    let axis_buf = make_const_buf(registry.device().raw(), axis_size);
-    let eps_buf = make_const_buf(registry.device().raw(), eps);
-    let w_stride_buf = make_const_buf(registry.device().raw(), w_stride);
-    let has_w_buf = make_const_buf(registry.device().raw(), has_w);
+    let out = Array::uninit(registry.device().raw(), input.shape(), input.dtype());
 
     let command_buffer = queue.new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();
@@ -1021,10 +1006,10 @@ pub fn rms_norm_opt(
         encoder.set_buffer(1, Some(input.metal_buffer()), 0);
     }
     encoder.set_buffer(2, Some(out.metal_buffer()), 0);
-    encoder.set_buffer(3, Some(&axis_buf), 0);
-    encoder.set_buffer(4, Some(&eps_buf), 0);
-    encoder.set_buffer(5, Some(&w_stride_buf), 0);
-    encoder.set_buffer(6, Some(&has_w_buf), 0);
+    encoder.set_bytes(3, 4, &axis_size as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(4, 4, &eps as *const f32 as *const std::ffi::c_void);
+    encoder.set_bytes(5, 4, &w_stride as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(6, 4, &has_w as *const u32 as *const std::ffi::c_void);
 
     let tg_size = std::cmp::min(1024, pipeline.max_total_threads_per_threadgroup());
     encoder.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), MTLSize::new(tg_size, 1, 1));
@@ -1251,7 +1236,7 @@ pub fn compute_inv_rms(
     let pipeline = registry.get_pipeline(kernel_name, input.dtype())?;
 
     let dev = registry.device().raw();
-    let out = Array::zeros(dev, &[rows], DType::Float32);
+    let out = Array::uninit(dev, &[rows], DType::Float32);
 
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&pipeline);
@@ -1363,12 +1348,7 @@ pub fn rms_norm_residual_add(
     let rows = input.shape()[0];
     let axis_size = super::checked_u32(axis_size_usize, "axis_size")?;
 
-    let out = Array::zeros(registry.device().raw(), input.shape(), input.dtype());
-
-    let axis_buf = make_const_buf(registry.device().raw(), axis_size);
-    let eps_buf = make_const_buf(registry.device().raw(), eps);
-    let w_stride_buf = make_const_buf(registry.device().raw(), w_stride);
-    let has_w_buf = make_const_buf(registry.device().raw(), has_w);
+    let out = Array::uninit(registry.device().raw(), input.shape(), input.dtype());
 
     let command_buffer = queue.new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();
@@ -1381,10 +1361,10 @@ pub fn rms_norm_residual_add(
     );
     encoder.set_buffer(2, Some(weight.metal_buffer()), weight.offset() as u64);
     encoder.set_buffer(3, Some(out.metal_buffer()), 0);
-    encoder.set_buffer(4, Some(&axis_buf), 0);
-    encoder.set_buffer(5, Some(&eps_buf), 0);
-    encoder.set_buffer(6, Some(&w_stride_buf), 0);
-    encoder.set_buffer(7, Some(&has_w_buf), 0);
+    encoder.set_bytes(4, 4, &axis_size as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(5, 4, &eps as *const f32 as *const std::ffi::c_void);
+    encoder.set_bytes(6, 4, &w_stride as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(7, 4, &has_w as *const u32 as *const std::ffi::c_void);
 
     let tg_size = std::cmp::min(1024, pipeline.max_total_threads_per_threadgroup());
     encoder.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), MTLSize::new(tg_size, 1, 1));
@@ -1478,7 +1458,7 @@ pub fn rms_norm_residual_add_into_cb(
     let rows = input.shape()[0];
     let axis_size = super::checked_u32(axis_size_usize, "axis_size")?;
 
-    let out = Array::zeros(registry.device().raw(), input.shape(), input.dtype());
+    let out = Array::uninit(registry.device().raw(), input.shape(), input.dtype());
 
     let encoder = cb.new_compute_command_encoder();
     encoder.set_compute_pipeline_state(&pipeline);
@@ -1498,6 +1478,122 @@ pub fn rms_norm_residual_add_into_cb(
     let tg_size = std::cmp::min(1024, pipeline.max_total_threads_per_threadgroup());
     encoder.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), MTLSize::new(tg_size, 1, 1));
     encoder.end_encoding();
+
+    Ok((out, residual_buf))
+}
+
+// ---------------------------------------------------------------------------
+// _encode variants — accept &ComputeCommandEncoderRef instead of &CommandBufferRef
+// ---------------------------------------------------------------------------
+
+/// Alias for [`rms_norm_into_encoder`] — encode RMS norm into an existing
+/// compute command encoder (no encoder create/end).
+pub fn rms_norm_encode(
+    registry: &KernelRegistry,
+    input: &Array,
+    weight: Option<&Array>,
+    eps: f32,
+    encoder: &metal::ComputeCommandEncoderRef,
+) -> Result<Array, KernelError> {
+    rms_norm_into_encoder(registry, input, weight, eps, encoder)
+}
+
+/// Encode fused residual-add + RMS norm into an existing compute command encoder.
+///
+/// Unlike [`rms_norm_residual_add_into_cb`], this variant dispatches the copy
+/// and the norm kernel using the *same* encoder the caller provides.
+///
+/// Returns `(normed, updated_residual)`.
+#[allow(clippy::too_many_arguments)]
+pub fn rms_norm_residual_add_encode(
+    registry: &KernelRegistry,
+    input: &Array,
+    residual: &Array,
+    weight: &Array,
+    eps: f32,
+    encoder: &metal::ComputeCommandEncoderRef,
+) -> Result<(Array, Array), KernelError> {
+    if input.ndim() != 2 {
+        return Err(KernelError::InvalidShape(format!(
+            "rms_norm_residual_add requires 2D input, got {}D",
+            input.ndim()
+        )));
+    }
+    if residual.shape() != input.shape() {
+        return Err(KernelError::InvalidShape(format!(
+            "residual shape {:?} does not match input shape {:?}",
+            residual.shape(),
+            input.shape()
+        )));
+    }
+    if weight.ndim() != 1 {
+        return Err(KernelError::InvalidShape(format!(
+            "rms_norm_residual_add requires 1D weight, got {}D",
+            weight.ndim()
+        )));
+    }
+    let axis_size_usize = input.shape()[1];
+    if weight.shape()[0] != axis_size_usize {
+        return Err(KernelError::InvalidShape(format!(
+            "axis size mismatch: input[1]={} vs weight[0]={}",
+            axis_size_usize,
+            weight.shape()[0]
+        )));
+    }
+    if input.dtype() != residual.dtype() || input.dtype() != weight.dtype() {
+        return Err(KernelError::InvalidShape(format!(
+            "dtype mismatch: input={:?}, residual={:?}, weight={:?}",
+            input.dtype(),
+            residual.dtype(),
+            weight.dtype()
+        )));
+    }
+    if !input.is_contiguous() {
+        return Err(KernelError::InvalidShape(
+            "rms_norm_residual_add_encode: input must be contiguous".into(),
+        ));
+    }
+    if !residual.is_contiguous() {
+        return Err(KernelError::InvalidShape(
+            "rms_norm_residual_add_encode: residual must be contiguous".into(),
+        ));
+    }
+    if !weight.is_contiguous() {
+        return Err(KernelError::InvalidShape(
+            "rms_norm_residual_add_encode: weight must be contiguous".into(),
+        ));
+    }
+
+    // Fresh copy of residual — the kernel mutates it in-place.
+    let residual_buf = super::copy::copy_encode(registry, residual, encoder)?;
+
+    let w_stride: u32 = weight.strides()[0] as u32;
+    let has_w: u32 = 1;
+
+    let kernel_name = rms_residual_add_kernel_name(input.dtype())?;
+    let pipeline = registry.get_pipeline(kernel_name, input.dtype())?;
+
+    let rows = input.shape()[0];
+    let axis_size = super::checked_u32(axis_size_usize, "axis_size")?;
+
+    let out = Array::uninit(registry.device().raw(), input.shape(), input.dtype());
+
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
+    encoder.set_buffer(
+        1,
+        Some(residual_buf.metal_buffer()),
+        residual_buf.offset() as u64,
+    );
+    encoder.set_buffer(2, Some(weight.metal_buffer()), weight.offset() as u64);
+    encoder.set_buffer(3, Some(out.metal_buffer()), 0);
+    encoder.set_bytes(4, 4, &axis_size as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(5, 4, &eps as *const f32 as *const std::ffi::c_void);
+    encoder.set_bytes(6, 4, &w_stride as *const u32 as *const std::ffi::c_void);
+    encoder.set_bytes(7, 4, &has_w as *const u32 as *const std::ffi::c_void);
+
+    let tg_size = std::cmp::min(1024, pipeline.max_total_threads_per_threadgroup());
+    encoder.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), MTLSize::new(tg_size, 1, 1));
 
     Ok((out, residual_buf))
 }

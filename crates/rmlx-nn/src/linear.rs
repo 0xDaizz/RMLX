@@ -506,6 +506,50 @@ impl Linear {
 
         Ok(output)
     }
+
+    /// Forward pass using a pre-existing compute command encoder.
+    ///
+    /// This avoids creating/destroying an encoder per op — the caller manages
+    /// the encoder lifecycle. Requires pre-cached transposed weight (i.e.,
+    /// `prepare_weight_t()` must have been called).
+    ///
+    /// **Prefill-only**: only the GEMM path is supported (M > 1).
+    /// Falls back to error for M=1 (GEMV needs a separate encoder approach).
+    pub fn forward_into_encoder(
+        &self,
+        input: &Array,
+        registry: &KernelRegistry,
+        encoder: &metal::ComputeCommandEncoderRef,
+    ) -> Result<Array, KernelError> {
+        let w_t = self.weight_t_cached.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape(
+                "Linear::forward_into_encoder requires pre-cached transposed weight \
+                 (call prepare_weight_t first)"
+                    .into(),
+            )
+        })?;
+
+        let input_2d = if input.ndim() == 1 {
+            input.reshape(vec![1, input.shape()[0]])?
+        } else if input.ndim() == 2 {
+            input.reshape(vec![input.shape()[0], input.shape()[1]])?
+        } else {
+            return Err(KernelError::InvalidShape(format!(
+                "input must be 1D or 2D, got {}D",
+                input.ndim()
+            )));
+        };
+
+        if input_2d.shape()[1] != self.config.in_features {
+            return Err(KernelError::InvalidShape(format!(
+                "input features mismatch: {} vs {}",
+                input_2d.shape()[1],
+                self.config.in_features
+            )));
+        }
+
+        ops::matmul::matmul_encode(registry, &input_2d, w_t, encoder)
+    }
 }
 
 /// Create a constant `u32` Metal buffer.
