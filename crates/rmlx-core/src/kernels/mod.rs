@@ -3,12 +3,14 @@
 //! Uses RwLock for concurrent read access to pipeline/JIT caches.
 //! Supports Metal function constants for type specialization.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::RwLock;
 
 use metal::{CompileOptions, FunctionConstantValues, MTLDataType};
+use smallvec::SmallVec;
 
 use rmlx_metal::device::GpuDevice;
 use rmlx_metal::pipeline_cache::DiskPipelineCache;
@@ -72,12 +74,17 @@ impl std::hash::Hash for FunctionConstantValue {
 }
 
 /// Cache key for compiled pipelines.
+///
+/// Uses `Cow<'static, str>` for kernel names — zero-cost `Borrowed` for the
+/// common case (string literals) while still supporting dynamically built
+/// names (e.g. `format!`).  Constants use `SmallVec<[...; 4]>` to avoid heap
+/// allocation when there are ≤4 function constants.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct PipelineKey {
-    pub kernel_name: String,
+    pub kernel_name: Cow<'static, str>,
     pub dtype: DType,
     /// Optional function constants for specialization.
-    pub constants: Vec<(u32, FunctionConstantValue)>,
+    pub constants: SmallVec<[(u32, FunctionConstantValue); 4]>,
 }
 
 /// Kernel registry managing AOT libraries and JIT compilation with pipeline caching.
@@ -181,10 +188,17 @@ impl KernelRegistry {
         kernel_name: &str,
         dtype: DType,
     ) -> Result<metal::ComputePipelineState, KernelError> {
-        let key = PipelineKey {
-            kernel_name: kernel_name.to_string(),
+        // Fast path: build a Borrowed key for the cache lookup (no allocation).
+        let lookup_key = PipelineKey {
+            kernel_name: Cow::Borrowed(
+                // SAFETY: the borrow only lives for the cache lookup below;
+                // we never store this key.  The transmute extends the lifetime
+                // to 'static so it fits into Cow<'static, str>, which is
+                // required by PipelineKey.
+                unsafe { &*(kernel_name as *const str) },
+            ),
             dtype,
-            constants: vec![],
+            constants: SmallVec::new(),
         };
 
         // 1a. Check frozen snapshot (lock-free)
@@ -198,10 +212,17 @@ impl KernelRegistry {
                 .pipelines
                 .read()
                 .map_err(|_| KernelError::Internal("pipeline cache lock poisoned".into()))?;
-            if let Some(pipeline) = cache.get(&key) {
+            if let Some(pipeline) = cache.get(&lookup_key) {
                 return Ok(pipeline.clone());
             }
         }
+
+        // Slow path: allocate an owned key for insertion.
+        let key = PipelineKey {
+            kernel_name: Cow::Owned(kernel_name.to_string()),
+            dtype,
+            constants: SmallVec::new(),
+        };
 
         // 2. Try disk pipeline cache — needs JIT source for the cache key.
         if let Some(ref disk) = self.disk_cache {
@@ -355,10 +376,11 @@ impl KernelRegistry {
         dtype: DType,
         constants: &[(u32, FunctionConstantValue)],
     ) -> Result<metal::ComputePipelineState, KernelError> {
-        let key = PipelineKey {
-            kernel_name: kernel_name.to_string(),
+        // Fast path: build a Borrowed key for the cache lookup (no allocation).
+        let lookup_key = PipelineKey {
+            kernel_name: Cow::Borrowed(unsafe { &*(kernel_name as *const str) }),
             dtype,
-            constants: constants.to_vec(),
+            constants: constants.iter().cloned().collect(),
         };
 
         // 1a. Check frozen snapshot (lock-free)
@@ -372,10 +394,17 @@ impl KernelRegistry {
                 .pipelines
                 .read()
                 .map_err(|_| KernelError::Internal("pipeline cache lock poisoned".into()))?;
-            if let Some(pipeline) = cache.get(&key) {
+            if let Some(pipeline) = cache.get(&lookup_key) {
                 return Ok(pipeline.clone());
             }
         }
+
+        // Slow path: allocate an owned key for insertion.
+        let key = PipelineKey {
+            kernel_name: Cow::Owned(kernel_name.to_string()),
+            dtype,
+            constants: lookup_key.constants,
+        };
 
         // 2. Try disk pipeline cache with function constants.
         if let Some(ref disk) = self.disk_cache {

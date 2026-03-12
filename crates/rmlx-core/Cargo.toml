@@ -10,6 +10,7 @@ rmlx-metal = { path = "../rmlx-metal" }
 rmlx-alloc = { path = "../rmlx-alloc" }
 metal = { workspace = true }
 tracing = { workspace = true }
+smallvec = { workspace = true }
 
 [features]
 ## Forward tracked_hazards through to rmlx-metal.
