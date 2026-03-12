@@ -32,6 +32,7 @@
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
+use crate::ops::buffer_slots::{gemm, grouped_gemm, grouped_splitk, splitk, splitk_reduce};
 use metal::MTLSize;
 
 // ---------------------------------------------------------------------------
@@ -4449,29 +4450,29 @@ fn dispatch_tiled_gemm(
     let cb = queue.new_command_buffer();
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(a.metal_buffer()), a.offset() as u64);
-    enc.set_buffer(1, Some(b.metal_buffer()), b.offset() as u64);
-    enc.set_buffer(2, Some(out.metal_buffer()), 0);
-    set_u32(enc, 3, super::checked_u32(m, "M")?);
-    set_u32(enc, 4, super::checked_u32(n, "N")?);
-    set_u32(enc, 5, super::checked_u32(k, "K")?);
+    enc.set_buffer(gemm::A, Some(a.metal_buffer()), a.offset() as u64);
+    enc.set_buffer(gemm::B, Some(b.metal_buffer()), b.offset() as u64);
+    enc.set_buffer(gemm::OUT, Some(out.metal_buffer()), 0);
+    set_u32(enc, gemm::M, super::checked_u32(m, "M")?);
+    set_u32(enc, gemm::N, super::checked_u32(n, "N")?);
+    set_u32(enc, gemm::K, super::checked_u32(k, "K")?);
     set_u32(
         enc,
-        6,
+        gemm::BATCH_STRIDE_A,
         super::checked_u32(batch_stride_a, "batch_stride_a")?,
     );
     set_u32(
         enc,
-        7,
+        gemm::BATCH_STRIDE_B,
         super::checked_u32(batch_stride_b, "batch_stride_b")?,
     );
     set_u32(
         enc,
-        8,
+        gemm::BATCH_STRIDE_C,
         super::checked_u32(batch_stride_c, "batch_stride_c")?,
     );
 
-    // Pass swizzle_log for Full, Skinny, MlxArch, MlxArchSmall, NaxArch variants (buffer 9)
+    // Pass swizzle_log for Full, Skinny, MlxArch, MlxArchSmall, NaxArch variants
     match tile.variant {
         TileVariant::Full
         | TileVariant::Skinny
@@ -4480,7 +4481,7 @@ fn dispatch_tiled_gemm(
         | TileVariant::MlxArchMicro
         | TileVariant::NaxArch => {
             let swizzle_log = compute_swizzle_log(m, n, tile.bm, tile.bn);
-            set_u32(enc, 9, swizzle_log);
+            set_u32(enc, gemm::SWIZZLE_LOG, swizzle_log);
         }
         _ => {}
     };
@@ -4542,13 +4543,13 @@ fn dispatch_split_k(
     {
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&pass1_pipeline);
-        enc.set_buffer(0, Some(a.metal_buffer()), a.offset() as u64);
-        enc.set_buffer(1, Some(b.metal_buffer()), b.offset() as u64);
-        enc.set_buffer(2, Some(partial.metal_buffer()), 0);
-        set_u32(enc, 3, m_u32);
-        set_u32(enc, 4, n_u32);
-        set_u32(enc, 5, k_u32);
-        set_u32(enc, 6, splits_u32);
+        enc.set_buffer(splitk::A, Some(a.metal_buffer()), a.offset() as u64);
+        enc.set_buffer(splitk::B, Some(b.metal_buffer()), b.offset() as u64);
+        enc.set_buffer(splitk::PARTIAL, Some(partial.metal_buffer()), 0);
+        set_u32(enc, splitk::M, m_u32);
+        set_u32(enc, splitk::N, n_u32);
+        set_u32(enc, splitk::K, k_u32);
+        set_u32(enc, splitk::N_SPLITS, splits_u32);
 
         let grid = MTLSize::new(
             ceil_div(n, BN) as u64,
@@ -4565,11 +4566,11 @@ fn dispatch_split_k(
         let pass2_pipeline = registry.get_pipeline("splitk_reduce_f32", DType::Float32)?;
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&pass2_pipeline);
-        enc.set_buffer(0, Some(partial.metal_buffer()), 0);
-        enc.set_buffer(1, Some(out.metal_buffer()), 0);
-        set_u32(enc, 2, m_u32);
-        set_u32(enc, 3, n_u32);
-        set_u32(enc, 4, splits_u32);
+        enc.set_buffer(splitk_reduce::PARTIAL, Some(partial.metal_buffer()), 0);
+        enc.set_buffer(splitk_reduce::OUT, Some(out.metal_buffer()), 0);
+        set_u32(enc, splitk_reduce::M, m_u32);
+        set_u32(enc, splitk_reduce::N, n_u32);
+        set_u32(enc, splitk_reduce::N_SPLITS, splits_u32);
 
         let total = m * n;
         let tg_size = 256u64;
@@ -4623,14 +4624,14 @@ fn dispatch_split_k_f16(
     {
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&pass1_pipeline);
-        enc.set_buffer(0, Some(a.metal_buffer()), a.offset() as u64);
-        enc.set_buffer(1, Some(b.metal_buffer()), b.offset() as u64);
-        enc.set_buffer(2, Some(partial.metal_buffer()), 0);
-        set_u32(enc, 3, m_u32);
-        set_u32(enc, 4, n_u32);
-        set_u32(enc, 5, k_u32);
-        set_u32(enc, 6, splits_u32);
-        set_u32(enc, 7, swizzle_log);
+        enc.set_buffer(splitk::A, Some(a.metal_buffer()), a.offset() as u64);
+        enc.set_buffer(splitk::B, Some(b.metal_buffer()), b.offset() as u64);
+        enc.set_buffer(splitk::PARTIAL, Some(partial.metal_buffer()), 0);
+        set_u32(enc, splitk::M, m_u32);
+        set_u32(enc, splitk::N, n_u32);
+        set_u32(enc, splitk::K, k_u32);
+        set_u32(enc, splitk::N_SPLITS, splits_u32);
+        set_u32(enc, 7, swizzle_log); // f16 split-K adds swizzle_log after n_splits
 
         let grid = MTLSize::new(
             ceil_div(n, bn) as u64,
@@ -4647,11 +4648,11 @@ fn dispatch_split_k_f16(
         let pass2_pipeline = registry.get_pipeline("splitk_reduce_f16", DType::Float16)?;
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&pass2_pipeline);
-        enc.set_buffer(0, Some(partial.metal_buffer()), 0);
-        enc.set_buffer(1, Some(out.metal_buffer()), 0);
-        set_u32(enc, 2, m_u32);
-        set_u32(enc, 3, n_u32);
-        set_u32(enc, 4, splits_u32);
+        enc.set_buffer(splitk_reduce::PARTIAL, Some(partial.metal_buffer()), 0);
+        enc.set_buffer(splitk_reduce::OUT, Some(out.metal_buffer()), 0);
+        set_u32(enc, splitk_reduce::M, m_u32);
+        set_u32(enc, splitk_reduce::N, n_u32);
+        set_u32(enc, splitk_reduce::N_SPLITS, splits_u32);
 
         let total = m * n;
         let tg_size = 256u64;
@@ -4892,29 +4893,29 @@ fn encode_gemm_core(
     batch_stride_c: usize,
 ) -> Result<(), KernelError> {
     enc.set_compute_pipeline_state(pipeline);
-    enc.set_buffer(0, Some(a.metal_buffer()), a.offset() as u64);
-    enc.set_buffer(1, Some(b.metal_buffer()), b.offset() as u64);
-    enc.set_buffer(2, Some(out.metal_buffer()), 0);
-    set_u32(enc, 3, super::checked_u32(m, "M")?);
-    set_u32(enc, 4, super::checked_u32(n, "N")?);
-    set_u32(enc, 5, super::checked_u32(k, "K")?);
+    enc.set_buffer(gemm::A, Some(a.metal_buffer()), a.offset() as u64);
+    enc.set_buffer(gemm::B, Some(b.metal_buffer()), b.offset() as u64);
+    enc.set_buffer(gemm::OUT, Some(out.metal_buffer()), 0);
+    set_u32(enc, gemm::M, super::checked_u32(m, "M")?);
+    set_u32(enc, gemm::N, super::checked_u32(n, "N")?);
+    set_u32(enc, gemm::K, super::checked_u32(k, "K")?);
     set_u32(
         enc,
-        6,
+        gemm::BATCH_STRIDE_A,
         super::checked_u32(batch_stride_a, "batch_stride_a")?,
     );
     set_u32(
         enc,
-        7,
+        gemm::BATCH_STRIDE_B,
         super::checked_u32(batch_stride_b, "batch_stride_b")?,
     );
     set_u32(
         enc,
-        8,
+        gemm::BATCH_STRIDE_C,
         super::checked_u32(batch_stride_c, "batch_stride_c")?,
     );
 
-    // Pass swizzle_log for Full, Skinny, MlxArch, MlxArchSmall, NaxArch variants (buffer 9)
+    // Pass swizzle_log for Full, Skinny, MlxArch, MlxArchSmall, NaxArch variants
     match tile.variant {
         TileVariant::Full
         | TileVariant::Skinny
@@ -4923,7 +4924,7 @@ fn encode_gemm_core(
         | TileVariant::MlxArchMicro
         | TileVariant::NaxArch => {
             let swizzle_log = compute_swizzle_log(m, n, tile.bm, tile.bn);
-            set_u32(enc, 9, swizzle_log);
+            set_u32(enc, gemm::SWIZZLE_LOG, swizzle_log);
         }
         _ => {}
     };
@@ -5225,21 +5226,36 @@ pub fn matmul_add_residual_into_cb(
 
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(a.metal_buffer()), a.offset() as u64);
-    enc.set_buffer(1, Some(b.metal_buffer()), b.offset() as u64);
-    enc.set_buffer(2, Some(out.metal_buffer()), 0);
-    set_u32(enc, 3, super::checked_u32(m, "M")?);
-    set_u32(enc, 4, super::checked_u32(n, "N")?);
-    set_u32(enc, 5, super::checked_u32(k, "K")?);
-    set_u32(enc, 6, super::checked_u32(m * k, "batch_stride_a")?);
-    set_u32(enc, 7, super::checked_u32(k * n, "batch_stride_b")?);
-    set_u32(enc, 8, super::checked_u32(m * n, "batch_stride_c")?);
+    enc.set_buffer(gemm::A, Some(a.metal_buffer()), a.offset() as u64);
+    enc.set_buffer(gemm::B, Some(b.metal_buffer()), b.offset() as u64);
+    enc.set_buffer(gemm::OUT, Some(out.metal_buffer()), 0);
+    set_u32(enc, gemm::M, super::checked_u32(m, "M")?);
+    set_u32(enc, gemm::N, super::checked_u32(n, "N")?);
+    set_u32(enc, gemm::K, super::checked_u32(k, "K")?);
+    set_u32(
+        enc,
+        gemm::BATCH_STRIDE_A,
+        super::checked_u32(m * k, "batch_stride_a")?,
+    );
+    set_u32(
+        enc,
+        gemm::BATCH_STRIDE_B,
+        super::checked_u32(k * n, "batch_stride_b")?,
+    );
+    set_u32(
+        enc,
+        gemm::BATCH_STRIDE_C,
+        super::checked_u32(m * n, "batch_stride_c")?,
+    );
 
     let swizzle_log = compute_swizzle_log(m, n, tile.bm, tile.bn);
-    set_u32(enc, 9, swizzle_log);
+    set_u32(enc, gemm::SWIZZLE_LOG, swizzle_log);
 
-    // Residual buffer at index 10
-    enc.set_buffer(10, Some(residual.metal_buffer()), residual.offset() as u64);
+    enc.set_buffer(
+        gemm::RESIDUAL,
+        Some(residual.metal_buffer()),
+        residual.offset() as u64,
+    );
 
     let grid_x = ceil_div(n, tile.bn) as u64;
     let grid_y = ceil_div(m, tile.bm) as u64;
@@ -5394,21 +5410,36 @@ pub fn matmul_add_residual_encode(
 
     // Encode into the provided encoder — do NOT call end_encoding()
     encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(a.metal_buffer()), a.offset() as u64);
-    encoder.set_buffer(1, Some(b.metal_buffer()), b.offset() as u64);
-    encoder.set_buffer(2, Some(out.metal_buffer()), 0);
-    set_u32(encoder, 3, super::checked_u32(m, "M")?);
-    set_u32(encoder, 4, super::checked_u32(n, "N")?);
-    set_u32(encoder, 5, super::checked_u32(k, "K")?);
-    set_u32(encoder, 6, super::checked_u32(m * k, "batch_stride_a")?);
-    set_u32(encoder, 7, super::checked_u32(k * n, "batch_stride_b")?);
-    set_u32(encoder, 8, super::checked_u32(m * n, "batch_stride_c")?);
+    encoder.set_buffer(gemm::A, Some(a.metal_buffer()), a.offset() as u64);
+    encoder.set_buffer(gemm::B, Some(b.metal_buffer()), b.offset() as u64);
+    encoder.set_buffer(gemm::OUT, Some(out.metal_buffer()), 0);
+    set_u32(encoder, gemm::M, super::checked_u32(m, "M")?);
+    set_u32(encoder, gemm::N, super::checked_u32(n, "N")?);
+    set_u32(encoder, gemm::K, super::checked_u32(k, "K")?);
+    set_u32(
+        encoder,
+        gemm::BATCH_STRIDE_A,
+        super::checked_u32(m * k, "batch_stride_a")?,
+    );
+    set_u32(
+        encoder,
+        gemm::BATCH_STRIDE_B,
+        super::checked_u32(k * n, "batch_stride_b")?,
+    );
+    set_u32(
+        encoder,
+        gemm::BATCH_STRIDE_C,
+        super::checked_u32(m * n, "batch_stride_c")?,
+    );
 
     let swizzle_log = compute_swizzle_log(m, n, tile.bm, tile.bn);
-    set_u32(encoder, 9, swizzle_log);
+    set_u32(encoder, gemm::SWIZZLE_LOG, swizzle_log);
 
-    // Residual buffer at index 10
-    encoder.set_buffer(10, Some(residual.metal_buffer()), residual.offset() as u64);
+    encoder.set_buffer(
+        gemm::RESIDUAL,
+        Some(residual.metal_buffer()),
+        residual.offset() as u64,
+    );
 
     let grid_x = ceil_div(n, tile.bn) as u64;
     let grid_y = ceil_div(m, tile.bm) as u64;
@@ -5525,29 +5556,41 @@ pub fn matmul_norm_gemm_into_cb(
 
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(a.metal_buffer()), a.offset() as u64);
-    enc.set_buffer(1, Some(b.metal_buffer()), b.offset() as u64);
-    enc.set_buffer(2, Some(out.metal_buffer()), 0);
-    set_u32(enc, 3, super::checked_u32(m, "M")?);
-    set_u32(enc, 4, super::checked_u32(n, "N")?);
-    set_u32(enc, 5, super::checked_u32(k, "K")?);
-    set_u32(enc, 6, super::checked_u32(m * k, "batch_stride_a")?);
-    set_u32(enc, 7, super::checked_u32(k * n, "batch_stride_b")?);
-    set_u32(enc, 8, super::checked_u32(m * n, "batch_stride_c")?);
+    enc.set_buffer(gemm::A, Some(a.metal_buffer()), a.offset() as u64);
+    enc.set_buffer(gemm::B, Some(b.metal_buffer()), b.offset() as u64);
+    enc.set_buffer(gemm::OUT, Some(out.metal_buffer()), 0);
+    set_u32(enc, gemm::M, super::checked_u32(m, "M")?);
+    set_u32(enc, gemm::N, super::checked_u32(n, "N")?);
+    set_u32(enc, gemm::K, super::checked_u32(k, "K")?);
+    set_u32(
+        enc,
+        gemm::BATCH_STRIDE_A,
+        super::checked_u32(m * k, "batch_stride_a")?,
+    );
+    set_u32(
+        enc,
+        gemm::BATCH_STRIDE_B,
+        super::checked_u32(k * n, "batch_stride_b")?,
+    );
+    set_u32(
+        enc,
+        gemm::BATCH_STRIDE_C,
+        super::checked_u32(m * n, "batch_stride_c")?,
+    );
 
     let swizzle_log = compute_swizzle_log(m, n, tile.bm, tile.bn);
-    set_u32(enc, 9, swizzle_log);
+    set_u32(enc, gemm::SWIZZLE_LOG, swizzle_log);
 
-    // Buffer 10: residual (dummy, not used when has_residual=false)
-    enc.set_buffer(10, Some(out.metal_buffer()), 0);
-    // Buffer 11: norm_weight [K]
+    // Residual (dummy, not used when has_residual=false)
+    enc.set_buffer(gemm::RESIDUAL, Some(out.metal_buffer()), 0);
+    // norm_weight [K]
     enc.set_buffer(
-        11,
+        gemm::NORM_WEIGHT,
         Some(norm_weight.metal_buffer()),
         norm_weight.offset() as u64,
     );
-    // Buffer 12: inv_rms [M]
-    enc.set_buffer(12, Some(inv_rms.metal_buffer()), 0);
+    // inv_rms [M]
+    enc.set_buffer(gemm::INV_RMS, Some(inv_rms.metal_buffer()), 0);
 
     let grid_x = ceil_div(n, tile.bn) as u64;
     let grid_y = ceil_div(m, tile.bm) as u64;
@@ -5637,22 +5680,33 @@ pub fn matmul_swiglu_gemm_into_cb(
 
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(a.metal_buffer()), a.offset() as u64);
-    enc.set_buffer(1, Some(b.metal_buffer()), b.offset() as u64);
-    enc.set_buffer(2, Some(out.metal_buffer()), 0);
-    set_u32(enc, 3, super::checked_u32(m, "M")?);
-    set_u32(enc, 4, super::checked_u32(n, "N")?);
-    set_u32(enc, 5, super::checked_u32(k, "K")?);
-    set_u32(enc, 6, super::checked_u32(m * k, "batch_stride_a")?);
-    set_u32(enc, 7, super::checked_u32(k * n, "batch_stride_b")?);
-    set_u32(enc, 8, super::checked_u32(m * n, "batch_stride_c")?);
+    enc.set_buffer(gemm::A, Some(a.metal_buffer()), a.offset() as u64);
+    enc.set_buffer(gemm::B, Some(b.metal_buffer()), b.offset() as u64);
+    enc.set_buffer(gemm::OUT, Some(out.metal_buffer()), 0);
+    set_u32(enc, gemm::M, super::checked_u32(m, "M")?);
+    set_u32(enc, gemm::N, super::checked_u32(n, "N")?);
+    set_u32(enc, gemm::K, super::checked_u32(k, "K")?);
+    set_u32(
+        enc,
+        gemm::BATCH_STRIDE_A,
+        super::checked_u32(m * k, "batch_stride_a")?,
+    );
+    set_u32(
+        enc,
+        gemm::BATCH_STRIDE_B,
+        super::checked_u32(k * n, "batch_stride_b")?,
+    );
+    set_u32(
+        enc,
+        gemm::BATCH_STRIDE_C,
+        super::checked_u32(m * n, "batch_stride_c")?,
+    );
 
     let swizzle_log = compute_swizzle_log(m, n, tile.bm, tile.bn);
-    set_u32(enc, 9, swizzle_log);
+    set_u32(enc, gemm::SWIZZLE_LOG, swizzle_log);
 
-    // Buffer 13: gate_result [M, N]
     enc.set_buffer(
-        13,
+        gemm::GATE_RESULT,
         Some(gate_result.metal_buffer()),
         gate_result.offset() as u64,
     );
@@ -5742,14 +5796,22 @@ pub fn dispatch_grouped_gemm(
     let cb = queue.new_command_buffer();
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(a_stacked.metal_buffer()), a_stacked.offset() as u64);
-    enc.set_buffer(1, Some(b_stacked.metal_buffer()), b_stacked.offset() as u64);
-    enc.set_buffer(2, Some(out.metal_buffer()), 0);
-    enc.set_buffer(3, Some(&offsets_buf), 0);
-    enc.set_buffer(4, Some(&tile_map_buf), 0);
-    enc.set_buffer(5, Some(&tile_off_buf), 0);
-    set_u32(enc, 6, super::checked_u32(k, "K")?);
-    set_u32(enc, 7, super::checked_u32(n, "N")?);
+    enc.set_buffer(
+        grouped_gemm::A_STACKED,
+        Some(a_stacked.metal_buffer()),
+        a_stacked.offset() as u64,
+    );
+    enc.set_buffer(
+        grouped_gemm::B_STACKED,
+        Some(b_stacked.metal_buffer()),
+        b_stacked.offset() as u64,
+    );
+    enc.set_buffer(grouped_gemm::OUT, Some(out.metal_buffer()), 0);
+    enc.set_buffer(grouped_gemm::OFFSETS, Some(&offsets_buf), 0);
+    enc.set_buffer(grouped_gemm::TILE_MAP, Some(&tile_map_buf), 0);
+    enc.set_buffer(grouped_gemm::TILE_OFF, Some(&tile_off_buf), 0);
+    set_u32(enc, grouped_gemm::K, super::checked_u32(k, "K")?);
+    set_u32(enc, grouped_gemm::N, super::checked_u32(n, "N")?);
 
     // 1D grid: total_tiles threadgroups, 64 threads each
     let grid = MTLSize::new(total_tiles as u64, 1, 1);
@@ -5876,16 +5938,24 @@ pub fn dispatch_grouped_splitk(
     {
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&pass1_pipeline);
-        enc.set_buffer(0, Some(a_stacked.metal_buffer()), a_stacked.offset() as u64);
-        enc.set_buffer(1, Some(b_stacked.metal_buffer()), b_stacked.offset() as u64);
-        enc.set_buffer(2, Some(partial.metal_buffer()), 0);
-        enc.set_buffer(3, Some(&offsets_buf), 0);
-        enc.set_buffer(4, Some(&tile_map_buf), 0);
-        enc.set_buffer(5, Some(&tile_off_buf), 0);
-        set_u32(enc, 6, k_u32);
-        set_u32(enc, 7, n_u32);
-        set_u32(enc, 8, total_m_u32);
-        set_u32(enc, 9, splits_u32);
+        enc.set_buffer(
+            grouped_splitk::A_STACKED,
+            Some(a_stacked.metal_buffer()),
+            a_stacked.offset() as u64,
+        );
+        enc.set_buffer(
+            grouped_splitk::B_STACKED,
+            Some(b_stacked.metal_buffer()),
+            b_stacked.offset() as u64,
+        );
+        enc.set_buffer(grouped_splitk::PARTIAL, Some(partial.metal_buffer()), 0);
+        enc.set_buffer(grouped_splitk::OFFSETS, Some(&offsets_buf), 0);
+        enc.set_buffer(grouped_splitk::TILE_MAP, Some(&tile_map_buf), 0);
+        enc.set_buffer(grouped_splitk::TILE_OFF, Some(&tile_off_buf), 0);
+        set_u32(enc, grouped_splitk::K, k_u32);
+        set_u32(enc, grouped_splitk::N, n_u32);
+        set_u32(enc, grouped_splitk::TOTAL_M, total_m_u32);
+        set_u32(enc, grouped_splitk::N_SPLITS, splits_u32);
 
         // Grid: (total_tiles, 1, n_splits)
         let grid = MTLSize::new(total_tiles as u64, 1, n_splits as u64);
@@ -5900,11 +5970,11 @@ pub fn dispatch_grouped_splitk(
         let pass2_pipeline = registry.get_pipeline("splitk_reduce_f16", DType::Float16)?;
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&pass2_pipeline);
-        enc.set_buffer(0, Some(partial.metal_buffer()), 0);
-        enc.set_buffer(1, Some(out.metal_buffer()), 0);
-        set_u32(enc, 2, total_m_u32);
-        set_u32(enc, 3, n_u32);
-        set_u32(enc, 4, splits_u32);
+        enc.set_buffer(splitk_reduce::PARTIAL, Some(partial.metal_buffer()), 0);
+        enc.set_buffer(splitk_reduce::OUT, Some(out.metal_buffer()), 0);
+        set_u32(enc, splitk_reduce::M, total_m_u32);
+        set_u32(enc, splitk_reduce::N, n_u32);
+        set_u32(enc, splitk_reduce::N_SPLITS, splits_u32);
 
         let total_elems = total_m * n;
         let tg_size = 256u64;
