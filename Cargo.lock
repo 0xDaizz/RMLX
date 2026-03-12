@@ -455,6 +455,7 @@ version = "0.1.0"
 dependencies = [
  "half",
  "metal",
+ "objc",
  "rmlx-alloc",
  "rmlx-metal",
  "smallvec",

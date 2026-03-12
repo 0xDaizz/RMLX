@@ -55,3 +55,7 @@ harness = false
 [[bench]]
 name = "matmul_micro_bench"
 harness = false
+
+[[bench]]
+name = "dispatch_gpu_time_bench"
+harness = false

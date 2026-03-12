@@ -18,6 +18,7 @@ tracked_hazards = ["rmlx-metal/tracked_hazards"]
 
 [dev-dependencies]
 half = { workspace = true }
+objc = { workspace = true }
 
 [[bench]]
 name = "ops_bench"
@@ -100,5 +101,25 @@ name = "nax_gemm_bench"
 harness = false
 
 [[bench]]
+name = "nax_tile_bench"
+harness = false
+
+[[bench]]
 name = "qmm_nax_bench"
+harness = false
+
+[[bench]]
+name = "nax_lowm_bench"
+harness = false
+
+[[bench]]
+name = "dispatch_overhead_bench"
+harness = false
+
+[[bench]]
+name = "single_kernel_bench"
+harness = false
+
+[[bench]]
+name = "gemm_fair_bench"
 harness = false

@@ -385,6 +385,7 @@ fn bench_dispatch_calc() {
         TileVariant::MlxArchSmall,
         TileVariant::MlxArchMicro,
         TileVariant::NaxArch,
+        TileVariant::NaxArch64x128,
     ];
 
     // --- Bench A: Simulate old-style inline match (not const) ---
@@ -398,6 +399,8 @@ fn bench_dispatch_calc() {
             TileVariant::MlxArchSmall => 128,
             TileVariant::MlxArchMicro => 128,
             TileVariant::NaxArch => 128,
+            TileVariant::NaxArch64x128 => 128,
+            TileVariant::NaxArch64x64 => 128,
         }
     }
 
@@ -409,7 +412,9 @@ fn bench_dispatch_calc() {
             | TileVariant::MlxArch
             | TileVariant::MlxArchSmall
             | TileVariant::MlxArchMicro
-            | TileVariant::NaxArch => true,
+            | TileVariant::NaxArch
+            | TileVariant::NaxArch64x128
+            | TileVariant::NaxArch64x64 => true,
             TileVariant::Small | TileVariant::Medium | TileVariant::Simd => false,
         }
     }
@@ -500,12 +505,8 @@ fn bench_dispatch_calc() {
     }
     let stats_select = Stats::from_durations_ns(&times_select);
 
-    println!(
-        "| method                     | p50 (ns) | mean (ns) | p95 (ns) | min (ns) |"
-    );
-    println!(
-        "|----------------------------|----------|-----------|----------|----------|"
-    );
+    println!("| method                     | p50 (ns) | mean (ns) | p95 (ns) | min (ns) |");
+    println!("|----------------------------|----------|-----------|----------|----------|");
     println!(
         "| old inline match           | {:8.1} | {:9.1} | {:8.1} | {:8.1} |",
         stats_old.p50, stats_old.mean, stats_old.p95, stats_old.min,

@@ -424,6 +424,9 @@ impl Linear {
                 "gemm_mlx_m16_f16"
             }
             (ops::matmul::TileVariant::NaxArch, rmlx_core::dtype::DType::Float16) => "gemm_nax_f16",
+            (ops::matmul::TileVariant::NaxArch64x128, rmlx_core::dtype::DType::Float16) => {
+                "gemm_nax_64x128_f16"
+            }
             (_, other) => {
                 return Err(KernelError::InvalidShape(format!(
                     "linear: unsupported dtype {:?}",
@@ -441,6 +444,7 @@ impl Linear {
             || tile.variant == ops::matmul::TileVariant::MlxArchSmall
             || tile.variant == ops::matmul::TileVariant::MlxArchMicro
             || tile.variant == ops::matmul::TileVariant::NaxArch
+            || tile.variant == ops::matmul::TileVariant::NaxArch64x128
         {
             let constants = ops::matmul::matmul_align_constants(m, n, k, tile.bm, tile.bn, tile.bk);
             registry.get_pipeline_with_constants(kernel_name, input_2d.dtype(), &constants)?
@@ -479,6 +483,7 @@ impl Linear {
                 | ops::matmul::TileVariant::MlxArchSmall
                 | ops::matmul::TileVariant::MlxArchMicro
                 | ops::matmul::TileVariant::NaxArch
+                | ops::matmul::TileVariant::NaxArch64x128
         ) {
             let swizzle_log = ops::matmul::compute_swizzle_log(m, n, tile.bm, tile.bn);
             enc.set_bytes(9, 4, &swizzle_log as *const u32 as *const std::ffi::c_void);
@@ -493,6 +498,8 @@ impl Linear {
                 64_u64
             }
             ops::matmul::TileVariant::NaxArch => 512_u64,
+            ops::matmul::TileVariant::NaxArch64x128 => 256_u64,
+            ops::matmul::TileVariant::NaxArch64x64 => 128_u64,
         };
 
         let grid = metal::MTLSize::new(grid_x, grid_y, 1);
