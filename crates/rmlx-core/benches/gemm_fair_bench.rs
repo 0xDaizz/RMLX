@@ -146,7 +146,7 @@ struct GemmBuffers {
 }
 
 impl GemmBuffers {
-    fn new(device: &metal::Device, m: usize, n: usize, k: usize) -> Self {
+    fn new(device: &metal::Device, m: usize, n: usize, k: usize, bm: usize, bn: usize) -> Self {
         let a = rand_f16_array(device, &[m, k], 42);
         let b = rand_f16_array(device, &[k, n], 99);
         let c = Array::zeros(device, &[m, n], DType::Float16);
@@ -156,10 +156,8 @@ impl GemmBuffers {
         let bsa_buf = make_u32_buf(device, (m * k) as u32);
         let bsb_buf = make_u32_buf(device, (k * n) as u32);
         let bsc_buf = make_u32_buf(device, (m * n) as u32);
-        // Force swizzle_log=0 to avoid OOB writes from mlx_swizzle_tg().
-        // See: compute_swizzle_log returns values that expand new_y beyond tiles_m,
-        // causing GPU PageFault with separate output buffers.
-        let swizzle_buf = make_u32_buf(device, 0u32);
+        let swizzle_log = ops::matmul::compute_swizzle_log(m, n, bm, bn);
+        let swizzle_buf = make_u32_buf(device, swizzle_log);
         let residual_buf = make_u32_buf(device, 0u32);
         Self {
             a,
@@ -356,7 +354,7 @@ fn main() {
             .get_pipeline_with_constants(spec.name, DType::Float16, &constants)
             .unwrap_or_else(|e| panic!("Failed to get pipeline for {}: {e}", spec.name));
 
-        let bufs = GemmBuffers::new(device, m, N, K);
+        let bufs = GemmBuffers::new(device, m, N, K, spec.bm, spec.bn);
 
         let grid_x = N.div_ceil(spec.bn);
         let grid_y = m.div_ceil(spec.bm);

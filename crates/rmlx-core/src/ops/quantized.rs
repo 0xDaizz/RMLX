@@ -2835,6 +2835,7 @@ kernel void affine_qmm_mma_q4(
     uint2 swizzled = q_swizzle_tg(uint2(group_id.x, group_id.y), swizzle_log);
     const uint row_start = swizzled.y * q_as_uniform(QBM);
     const uint col_start = swizzled.x * q_as_uniform(QBN);
+    if (row_start >= M || col_start >= N) return;  // Guard against swizzle OOB
 
     const uint uK = q_as_uniform(K);
     const uint uM = q_as_uniform(M);
@@ -3766,12 +3767,9 @@ kernel void affine_qmm_steel_q4(
     const uint uK = st_as_uniform(K);
     const uint uM = st_as_uniform(M);
     const uint uN = st_as_uniform(N);
+    if (row_start >= uM || col_start >= uN) return;  // Guard against swizzle OOB
     const uint groups_per_row = uK / st_fc_group_size;
     const uint half_k = uK / 2;  // bytes per N row in packed weights
-
-    // Early exit for out-of-bounds threadgroups
-    if (!align_M && row_start >= uM) return;
-    if (!align_N && col_start >= uN) return;
 
     // 2-SG layout: SG0=rows 0-15, SG1=rows 16-31
     // Each SG: acc[2][4] = 16 rows × 32 cols of 8×8 MMA tiles
@@ -6108,9 +6106,8 @@ kernel void affine_qmm_qldr_q4(
     const uint row_start = swizzled.y * ql_as_uniform(QL_BM);
     const uint col_start = swizzled.x * ql_as_uniform(QL_BN);
 
-    // Early exit for out-of-bounds threadgroups
-    if (!align_M && row_start >= uM) return;
-    if (!align_N && col_start >= uN) return;
+    // Guard against swizzle OOB (unconditional — swizzle can remap beyond grid)
+    if (row_start >= uM || col_start >= uN) return;
 
     // SG grid: 1×2 — sg_row always 0, sg_col = sgid (0 or 1)
     const uint base_n = sgid * 32; // each SG covers 32 cols

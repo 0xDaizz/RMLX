@@ -110,6 +110,7 @@ kernel void gemm_tiled_f32(
     uint2 swizzled = swizzle_threadgroup(uint2(group_id.x, group_id.y), swizzle_log);
     const uint row_start = swizzled.y * as_uniform(BM);
     const uint col_start = swizzled.x * as_uniform(BN);
+    if (row_start >= M || col_start >= N) return;  // Guard against swizzle OOB
 
     device const float* A_batch = A + batch_idx * as_uniform(batch_stride_a);
     device const float* B_batch = B + batch_idx * as_uniform(batch_stride_b);
@@ -263,6 +264,7 @@ kernel void gemm_tiled_f16(
     uint2 swizzled = swizzle_threadgroup(uint2(group_id.x, group_id.y), swizzle_log);
     const uint row_start = swizzled.y * as_uniform(BM);
     const uint col_start = swizzled.x * as_uniform(BN);
+    if (row_start >= M || col_start >= N) return;  // Guard against swizzle OOB
 
     device const half* A_batch = A + batch_idx * as_uniform(batch_stride_a);
     device const half* B_batch = B + batch_idx * as_uniform(batch_stride_b);
@@ -472,6 +474,7 @@ kernel void gemm_tiled_bf16(
     uint2 swizzled = swizzle_threadgroup(uint2(group_id.x, group_id.y), swizzle_log);
     const uint row_start = swizzled.y * as_uniform(BM);
     const uint col_start = swizzled.x * as_uniform(BN);
+    if (row_start >= M || col_start >= N) return;  // Guard against swizzle OOB
 
     device const bfloat* A_batch = A + batch_idx * as_uniform(batch_stride_a);
     device const bfloat* B_batch = B + batch_idx * as_uniform(batch_stride_b);
@@ -940,6 +943,7 @@ kernel void gemm_hiperf_f16(
     uint2 swizzled = hp_swizzle_threadgroup(uint2(group_id.x, group_id.y), swizzle_log);
     const uint row_start = swizzled.y * hp_as_uniform(HP_BM);
     const uint col_start = swizzled.x * hp_as_uniform(HP_BN);
+    if (row_start >= M || col_start >= N) return;  // Guard against swizzle OOB
 
     device const half* A_batch = A + batch_idx * hp_as_uniform(batch_stride_a);
     device const half* B_batch = B + batch_idx * hp_as_uniform(batch_stride_b);
@@ -1137,6 +1141,7 @@ kernel void gemm_skinny_f32(
     uint2 swizzled = swizzle_threadgroup(uint2(group_id.x, group_id.y), swizzle_log);
     const uint row_start = swizzled.y * as_uniform(SBM);
     const uint col_start = swizzled.x * as_uniform(SBN);
+    if (row_start >= M || col_start >= N) return;  // Guard against swizzle OOB
 
     device const float* A_batch = A + batch_idx * as_uniform(batch_stride_a);
     device const float* B_batch = B + batch_idx * as_uniform(batch_stride_b);
@@ -1248,6 +1253,7 @@ kernel void gemm_skinny_f16(
     uint2 swizzled = swizzle_threadgroup(uint2(group_id.x, group_id.y), swizzle_log);
     const uint row_start = swizzled.y * as_uniform(SBM);
     const uint col_start = swizzled.x * as_uniform(SBN);
+    if (row_start >= M || col_start >= N) return;  // Guard against swizzle OOB
 
     device const half* A_batch = A + batch_idx * as_uniform(batch_stride_a);
     device const half* B_batch = B + batch_idx * as_uniform(batch_stride_b);
@@ -1357,6 +1363,7 @@ kernel void gemm_skinny_bf16(
     uint2 swizzled = swizzle_threadgroup(uint2(group_id.x, group_id.y), swizzle_log);
     const uint row_start = swizzled.y * as_uniform(SBM);
     const uint col_start = swizzled.x * as_uniform(SBN);
+    if (row_start >= M || col_start >= N) return;  // Guard against swizzle OOB
 
     device const bfloat* A_batch = A + batch_idx * as_uniform(batch_stride_a);
     device const bfloat* B_batch = B + batch_idx * as_uniform(batch_stride_b);
@@ -1770,6 +1777,7 @@ kernel void splitk_pass1_mlx_f16(
     uint2 swizzled = sk2_swizzle_tg(uint2(group_id.x, group_id.y), swizzle_log);
     const uint row_start = swizzled.y * sk2_as_uniform(SK2_BM);
     const uint col_start = swizzled.x * sk2_as_uniform(SK2_BN);
+    if (row_start >= M || col_start >= N) return;  // Guard against swizzle OOB
 
     // SG grid: 1x2 -- sg_row always 0, sg_col = sgid (0 or 1)
     const uint base_n = sgid * 32;
@@ -1933,6 +1941,7 @@ kernel void splitk_small_pass1_f16(
     uint2 swizzled = sk2_swizzle_tg(uint2(group_id.x, group_id.y), swizzle_log);
     const uint row_start = swizzled.y * sk2_as_uniform(SK3_BM);
     const uint col_start = swizzled.x * sk2_as_uniform(SK3_BN);
+    if (row_start >= M || col_start >= N) return;  // Guard against swizzle OOB
 
     // SG grid: 1x2 -- each SG covers 16 cols
     const uint base_n = sgid * 16;
@@ -2174,6 +2183,7 @@ kernel void gemm_mlx_f16(
     uint2 swizzled = mlx_swizzle_tg(uint2(group_id.x, group_id.y), swizzle_log);
     const uint row_start = swizzled.y * mlx_as_uniform(MLX_BM);
     const uint col_start = swizzled.x * mlx_as_uniform(MLX_BN);
+    if (row_start >= M || col_start >= N) return;  // Guard against swizzle OOB
 
     device const half* A_batch = A + batch_idx * mlx_as_uniform(batch_stride_a);
     device const half* B_batch = B + batch_idx * mlx_as_uniform(batch_stride_b);
@@ -2390,6 +2400,7 @@ kernel void gemm_mlx_f32(
     uint2 swizzled = mlx_swizzle_tg(uint2(group_id.x, group_id.y), swizzle_log);
     const uint row_start = swizzled.y * mlx_as_uniform(MLX_BM);
     const uint col_start = swizzled.x * mlx_as_uniform(MLX_BN);
+    if (row_start >= M || col_start >= N) return;  // Guard against swizzle OOB
 
     device const float* A_batch = A + batch_idx * mlx_as_uniform(batch_stride_a);
     device const float* B_batch = B + batch_idx * mlx_as_uniform(batch_stride_b);
@@ -2606,6 +2617,7 @@ kernel void gemm_mlx_small_f16(
     uint2 swizzled = mlx_swizzle_tg(uint2(group_id.x, group_id.y), swizzle_log);
     const uint row_start = swizzled.y * mlx_as_uniform(SM_BM);
     const uint col_start = swizzled.x * mlx_as_uniform(SM_BN);
+    if (row_start >= M || col_start >= N) return;  // Guard against swizzle OOB
 
     device const half* A_batch = A + batch_idx * mlx_as_uniform(batch_stride_a);
     device const half* B_batch = B + batch_idx * mlx_as_uniform(batch_stride_b);
@@ -2764,6 +2776,7 @@ kernel void gemm_mlx_m16_f16(
     uint2 swizzled = mlx_swizzle_tg(uint2(group_id.x, group_id.y), swizzle_log);
     const uint row_start = swizzled.y * mlx_as_uniform(MT_BM);
     const uint col_start = swizzled.x * mlx_as_uniform(MT_BN);
+    if (row_start >= M || col_start >= N) return;  // Guard against swizzle OOB
 
     device const half* A_batch = A + batch_idx * mlx_as_uniform(batch_stride_a);
     device const half* B_batch = B + batch_idx * mlx_as_uniform(batch_stride_b);
@@ -2919,6 +2932,7 @@ kernel void gemm_mlx_bf16(
     uint2 swizzled = mlx_swizzle_tg(uint2(group_id.x, group_id.y), swizzle_log);
     const uint row_start = swizzled.y * mlx_as_uniform(MLX_BM);
     const uint col_start = swizzled.x * mlx_as_uniform(MLX_BN);
+    if (row_start >= M || col_start >= N) return;  // Guard against swizzle OOB
 
     device const bfloat* A_batch = A + batch_idx * mlx_as_uniform(batch_stride_a);
     device const bfloat* B_batch = B + batch_idx * mlx_as_uniform(batch_stride_b);
@@ -6460,16 +6474,24 @@ pub fn select_tile_config_with_nax(
 }
 
 /// Compute swizzle_log for threadblock swizzle.
+///
+/// SAFETY: Currently disabled (always returns 0). The swizzle function
+/// `mlx_swizzle_tg(gx, gy, s)` maps grid (tiles_n, tiles_m) to coordinates
+/// `(gx>>s, (gy<<s)|(gx&mask))`. When s>0, new_x range shrinks to tiles_n/2^s
+/// while new_y expands to tiles_m*2^s — but the grid is NOT resized to match.
+/// This means tiles with col_index >= tiles_n/2^s are never computed (silent
+/// data corruption). To re-enable swizzle, the grid must be reshaped to
+/// (tiles_n << s, tiles_m >> s) so the bijection covers all output tiles.
 pub fn compute_swizzle_log(m: usize, n: usize, bm: usize, bn: usize) -> u32 {
-    let tiles_m = m.div_ceil(bm);
-    let tiles_n = n.div_ceil(bn);
-    if tiles_n >= 4 * tiles_m {
-        2
-    } else if tiles_m > 3 {
-        1
-    } else {
-        0
-    }
+    let _tiles_m = m.div_ceil(bm);
+    let _tiles_n = n.div_ceil(bn);
+    // TODO: Re-enable with proper grid reshaping:
+    //   grid_x = tiles_n << swizzle_log
+    //   grid_y = tiles_m >> swizzle_log
+    // if _tiles_n >= 4 * _tiles_m { 2 }
+    // else if _tiles_n >= 2 * _tiles_m { 1 }
+    // else { 0 }
+    0
 }
 
 /// Returns true if Split-K should be used for the given dimensions.
@@ -8612,14 +8634,15 @@ mod tests {
 
     #[test]
     fn test_compute_swizzle_log() {
-        assert_eq!(compute_swizzle_log(32, 32, 32, 32), 0); // 1x1 tiles
-        assert_eq!(compute_swizzle_log(96, 128, 32, 32), 0); // 3 tiles M
-        assert_eq!(compute_swizzle_log(128, 128, 32, 32), 1); // 4 tiles M
-        assert_eq!(compute_swizzle_log(4096, 4096, 32, 32), 1);
-        // N-asymmetric cases
-        assert_eq!(compute_swizzle_log(64, 4096, 64, 64), 2); // tiles_n=64, tiles_m=1
-        assert_eq!(compute_swizzle_log(128, 4096, 64, 64), 2); // tiles_n=64, tiles_m=2
-        assert_eq!(compute_swizzle_log(256, 4096, 64, 64), 2); // tiles_n=64, tiles_m=4, 64>=16
+        // Swizzle currently disabled (always 0) due to grid reshaping bug.
+        // See compute_swizzle_log() comment for details.
+        assert_eq!(compute_swizzle_log(32, 32, 32, 32), 0);
+        assert_eq!(compute_swizzle_log(96, 128, 32, 32), 0);
+        assert_eq!(compute_swizzle_log(128, 128, 32, 32), 0);
+        assert_eq!(compute_swizzle_log(4096, 4096, 32, 32), 0);
+        assert_eq!(compute_swizzle_log(64, 4096, 64, 64), 0);
+        assert_eq!(compute_swizzle_log(128, 4096, 64, 64), 0);
+        assert_eq!(compute_swizzle_log(256, 4096, 64, 64), 0);
     }
 
     #[test]
