@@ -94,3 +94,7 @@ harness = false
 [[bench]]
 name = "rust_opt_bench"
 harness = false
+
+[[bench]]
+name = "nax_gemm_bench"
+harness = false

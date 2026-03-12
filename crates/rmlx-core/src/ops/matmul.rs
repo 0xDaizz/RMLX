@@ -3458,6 +3458,322 @@ void gemm_nax_f16(
 "#;
 
 // ---------------------------------------------------------------------------
+// NAX GEMM V2 — vectorized half4 loads + direct cooperative tensor population
+// Two kernel variants:
+//   gemm_nax_v2_f16: vectorized loads + unroll_count(2)
+//   gemm_nax_v3_f16: vectorized loads + no unroll (compiler decides)
+// ---------------------------------------------------------------------------
+
+pub const GEMM_NAX_V2_SHADER_SOURCE: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup>
+using namespace metal;
+
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+
+// Function constants (same IDs as existing kernels)
+constant bool align_M [[function_constant(200)]];
+constant bool align_N [[function_constant(201)]];
+constant bool has_residual [[function_constant(202)]];
+constant bool align_K [[function_constant(205)]];
+
+// Tile dimensions (same as v1)
+constant constexpr uint BM = 128;
+constant constexpr uint BN = 128;
+constant constexpr uint BK = 32;
+constant constexpr uint WM = 4;
+constant constexpr uint WN = 4;
+constant constexpr uint SM = 32;
+constant constexpr uint SN = 32;
+constant constexpr uint FK = 16;
+constant constexpr uint N_THREADS = 512;
+
+// NAX coordinate helpers
+inline short nax_fm(uint slid) {
+    short qid = short(slid) >> 2;
+    return ((qid & 4) | ((short(slid) >> 1) & 3));
+}
+
+inline short nax_fn(uint slid) {
+    short qid = short(slid) >> 2;
+    return ((qid & 2) | (short(slid) & 1)) * 4;
+}
+
+// ─── Vectorized load helpers ───────────────────────────────────────────────
+
+// Unsafe vectorized load: 2x half4 instead of 8 scalar loads
+METAL_FUNC void nax_load_16x16_v4_unsafe(thread half* frag,
+                                           const device half* src, int src_ld,
+                                           short fm, short fn) {
+    // fn gives stride-4 consecutive addresses within a row
+    *reinterpret_cast<thread half4*>(frag) =
+        *reinterpret_cast<device const half4*>(&src[fm * src_ld + fn]);
+    *reinterpret_cast<thread half4*>(frag + 4) =
+        *reinterpret_cast<device const half4*>(&src[(fm + 8) * src_ld + fn]);
+}
+
+// Safe vectorized load with bounds checking
+METAL_FUNC void nax_load_16x16_v4(thread half* frag,
+                                    const device half* src, int src_ld,
+                                    short fm, short fn,
+                                    int valid_rows, int valid_cols) {
+    // Row 0: check if full half4 is in bounds
+    if (fm < valid_rows && fn + 3 < valid_cols) {
+        *reinterpret_cast<thread half4*>(frag) =
+            *reinterpret_cast<device const half4*>(&src[fm * src_ld + fn]);
+    } else {
+        for (short c = 0; c < 4; c++) {
+            bool ok = (fm < valid_rows) && (fn + c < valid_cols);
+            frag[c] = ok ? src[fm * src_ld + fn + c] : half(0);
+        }
+    }
+    // Row 1 (fm+8)
+    if (fm + 8 < valid_rows && fn + 3 < valid_cols) {
+        *reinterpret_cast<thread half4*>(frag + 4) =
+            *reinterpret_cast<device const half4*>(&src[(fm + 8) * src_ld + fn]);
+    } else {
+        for (short c = 0; c < 4; c++) {
+            bool ok = (fm + 8 < valid_rows) && (fn + c < valid_cols);
+            frag[4 + c] = ok ? src[(fm + 8) * src_ld + fn + c] : half(0);
+        }
+    }
+}
+
+// Store helpers (same as v1 — store is not the bottleneck)
+METAL_FUNC void nax_store_v2(device half* dst, int dst_ld,
+                               thread const float* frag,
+                               short fm, short fn,
+                               int valid_rows, int valid_cols) {
+    for (short c = 0; c < 4; c++) {
+        if (fm < valid_rows && fn + c < valid_cols)
+            dst[fm * dst_ld + fn + c] = half(frag[c]);
+    }
+    for (short c = 0; c < 4; c++) {
+        if (fm + 8 < valid_rows && fn + c < valid_cols)
+            dst[(fm + 8) * dst_ld + fn + c] = half(frag[4 + c]);
+    }
+}
+
+METAL_FUNC void nax_store_v2_unsafe(device half* dst, int dst_ld,
+                                      thread const float* frag,
+                                      short fm, short fn) {
+    for (short c = 0; c < 4; c++)
+        dst[fm * dst_ld + fn + c] = half(frag[c]);
+    for (short c = 0; c < 4; c++)
+        dst[(fm + 8) * dst_ld + fn + c] = half(frag[4 + c]);
+}
+
+METAL_FUNC void nax_store_v2_residual(device half* dst,
+                                        const device half* res,
+                                        int dst_ld,
+                                        thread const float* frag,
+                                        short fm, short fn,
+                                        int valid_rows, int valid_cols) {
+    for (short c = 0; c < 4; c++) {
+        if (fm < valid_rows && fn + c < valid_cols)
+            dst[fm * dst_ld + fn + c] = half(frag[c]) + res[fm * dst_ld + fn + c];
+    }
+    for (short c = 0; c < 4; c++) {
+        if (fm + 8 < valid_rows && fn + c < valid_cols)
+            dst[(fm + 8) * dst_ld + fn + c] = half(frag[4 + c]) + res[(fm + 8) * dst_ld + fn + c];
+    }
+}
+
+METAL_FUNC void nax_store_v2_residual_unsafe(device half* dst,
+                                               const device half* res,
+                                               int dst_ld,
+                                               thread const float* frag,
+                                               short fm, short fn) {
+    for (short c = 0; c < 4; c++)
+        dst[fm * dst_ld + fn + c] = half(frag[c]) + res[fm * dst_ld + fn + c];
+    for (short c = 0; c < 4; c++)
+        dst[(fm + 8) * dst_ld + fn + c] = half(frag[4 + c]) + res[(fm + 8) * dst_ld + fn + c];
+}
+
+// ─── V2 kernel body (shared between v2 and v3 via macro) ──────────────────
+
+#define NAX_V2_KERNEL_BODY(KERNEL_NAME, UNROLL_PRAGMA)                        \
+[[kernel, max_total_threads_per_threadgroup(512)]]                            \
+void KERNEL_NAME(                                                             \
+    device const half* A [[buffer(0)]],                                       \
+    device const half* B [[buffer(1)]],                                       \
+    device half* C [[buffer(2)]],                                             \
+    constant uint& M [[buffer(3)]],                                           \
+    constant uint& N [[buffer(4)]],                                           \
+    constant uint& K [[buffer(5)]],                                           \
+    constant uint& batch_stride_a [[buffer(6)]],                              \
+    constant uint& batch_stride_b [[buffer(7)]],                              \
+    constant uint& batch_stride_c [[buffer(8)]],                              \
+    constant uint& swizzle_log [[buffer(9)]],                                 \
+    device const half* residual [[buffer(10)]],                               \
+    uint3 tid [[threadgroup_position_in_grid]],                               \
+    uint sgid [[simdgroup_index_in_threadgroup]],                             \
+    uint slid [[thread_index_in_simdgroup]])                                  \
+{                                                                             \
+    const uint batch_idx = tid.z;                                             \
+    const device half* A_batch = A + batch_idx * batch_stride_a;              \
+    const device half* B_batch = B + batch_idx * batch_stride_b;              \
+    device half* C_batch = C + batch_idx * batch_stride_c;                    \
+                                                                              \
+    uint2 tg_pos = uint2(tid.x, tid.y);                                      \
+    if (swizzle_log > 0) {                                                    \
+        tg_pos = uint2(                                                       \
+            tg_pos.x >> swizzle_log,                                          \
+            (tg_pos.y << swizzle_log) | (tg_pos.x & ((1u << swizzle_log) - 1u)) \
+        );                                                                    \
+    }                                                                         \
+                                                                              \
+    const uint sg_m = sgid / WN;                                              \
+    const uint sg_n = sgid % WN;                                              \
+    const uint gm = tg_pos.y * BM + sg_m * SM;                               \
+    const uint gn = tg_pos.x * BN + sg_n * SN;                               \
+                                                                              \
+    if (!align_M && gm >= M) return;                                          \
+    if (!align_N && gn >= N) return;                                          \
+                                                                              \
+    const int sg_valid_m = align_M ? int(SM) : min(int(M) - int(gm), int(SM)); \
+    const int sg_valid_n = align_N ? int(SN) : min(int(N) - int(gn), int(SN)); \
+    if (sg_valid_m <= 0 || sg_valid_n <= 0) return;                           \
+                                                                              \
+    const short fm = nax_fm(slid);                                            \
+    const short fn = nax_fn(slid);                                            \
+                                                                              \
+    constexpr auto nax_desc = mpp::tensor_ops::matmul2d_descriptor(           \
+        16, 32, 16, false, false, true,                                       \
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);     \
+                                                                              \
+    float acc[2][16];                                                         \
+    for (int i = 0; i < 2; i++)                                               \
+        for (int j = 0; j < 16; j++)                                          \
+            acc[i][j] = 0.0f;                                                 \
+                                                                              \
+    const uint k_total_steps = align_K ? (K / FK) : ((K + FK - 1) / FK);     \
+                                                                              \
+    UNROLL_PRAGMA                                                             \
+    for (uint sk_abs = 0; sk_abs < k_total_steps; sk_abs++) {                 \
+        const uint sk_offset = sk_abs * FK;                                   \
+        const int fk_valid = align_K ? int(FK) : min(int(FK), int(K) - int(sk_offset)); \
+        const bool k_aligned = align_K || (fk_valid == int(FK));              \
+                                                                              \
+        /* Load B fragment: 16x32 = two 16x16 blocks */                       \
+        half B_frag[16];                                                      \
+        {                                                                     \
+            const device half* B_ptr0 = B_batch + sk_offset * N + gn;         \
+            int b_cols0 = align_N ? 16 : min(16, sg_valid_n);                 \
+            if (b_cols0 <= 0) {                                               \
+                for (int e = 0; e < 8; e++) B_frag[e] = half(0);             \
+            } else if (k_aligned && b_cols0 == 16) {                          \
+                nax_load_16x16_v4_unsafe(B_frag, B_ptr0, int(N), fm, fn);    \
+            } else {                                                          \
+                nax_load_16x16_v4(B_frag, B_ptr0, int(N), fm, fn,            \
+                                  k_aligned ? 16 : fk_valid, b_cols0);        \
+            }                                                                 \
+                                                                              \
+            const device half* B_ptr1 = B_ptr0 + 16;                          \
+            int b_cols1 = align_N ? 16 : min(16, sg_valid_n - 16);            \
+            if (b_cols1 <= 0) {                                               \
+                for (int e = 0; e < 8; e++) B_frag[8 + e] = half(0);         \
+            } else if (k_aligned && b_cols1 == 16) {                          \
+                nax_load_16x16_v4_unsafe(B_frag + 8, B_ptr1, int(N), fm, fn); \
+            } else {                                                          \
+                nax_load_16x16_v4(B_frag + 8, B_ptr1, int(N), fm, fn,        \
+                                  k_aligned ? 16 : fk_valid, b_cols1);        \
+            }                                                                 \
+        }                                                                     \
+                                                                              \
+        for (uint fm_idx = 0; fm_idx < 2; fm_idx++) {                         \
+            /* Load A directly into ct_a — eliminate intermediate array */    \
+            mpp::tensor_ops::matmul2d<nax_desc, metal::execution_simdgroup> gemm_op; \
+            auto ct_a = gemm_op.template get_left_input_cooperative_tensor<half, half, float>(); \
+            auto ct_b = gemm_op.template get_right_input_cooperative_tensor<half, half, float>(); \
+            auto ct_c = gemm_op.template get_destination_cooperative_tensor<decltype(ct_a), decltype(ct_b), float>(); \
+            {                                                                 \
+                const device half* A_ptr = A_batch + (gm + fm_idx * 16) * K + sk_offset; \
+                int a_rows = align_M ? 16 : min(16, sg_valid_m - int(fm_idx * 16)); \
+                if (a_rows <= 0) {                                            \
+                    for (int e = 0; e < 8; e++) ct_a[e] = half(0);           \
+                } else if (k_aligned && a_rows == 16) {                       \
+                    /* Direct half4 load into cooperative tensor */           \
+                    auto p0 = *reinterpret_cast<device const half4*>(         \
+                        &A_ptr[fm * int(K) + fn]);                            \
+                    auto p1 = *reinterpret_cast<device const half4*>(         \
+                        &A_ptr[(fm + 8) * int(K) + fn]);                      \
+                    ct_a[0] = p0[0]; ct_a[1] = p0[1];                        \
+                    ct_a[2] = p0[2]; ct_a[3] = p0[3];                        \
+                    ct_a[4] = p1[0]; ct_a[5] = p1[1];                        \
+                    ct_a[6] = p1[2]; ct_a[7] = p1[3];                        \
+                } else {                                                      \
+                    half tmp[8];                                              \
+                    nax_load_16x16_v4(tmp, A_ptr, int(K), fm, fn,            \
+                                      a_rows, k_aligned ? 16 : fk_valid);     \
+                    for (int e = 0; e < 8; e++) ct_a[e] = tmp[e];            \
+                }                                                             \
+            }                                                                 \
+            for (int e = 0; e < 16; e++) ct_b[e] = B_frag[e];                \
+            for (int e = 0; e < 16; e++) ct_c[e] = acc[fm_idx][e];           \
+            gemm_op.run(ct_a, ct_b, ct_c);                                   \
+            for (int e = 0; e < 16; e++) acc[fm_idx][e] = ct_c[e];           \
+        }                                                                     \
+    }                                                                         \
+                                                                              \
+    /* Store results */                                                       \
+    const bool full_m = align_M || (sg_valid_m >= int(SM));                   \
+    const bool full_n = align_N || (sg_valid_n >= int(SN));                   \
+                                                                              \
+    for (uint fm_idx = 0; fm_idx < 2; fm_idx++) {                             \
+        const uint out_row = gm + fm_idx * 16;                                \
+        int m_valid = full_m ? 16 : min(16, sg_valid_m - int(fm_idx * 16));   \
+        if (m_valid <= 0) continue;                                           \
+                                                                              \
+        {                                                                     \
+            device half* C_ptr = C_batch + out_row * N + gn;                  \
+            int n_valid = full_n ? 16 : min(16, sg_valid_n);                  \
+            if (n_valid > 0) {                                                \
+                if (has_residual) {                                            \
+                    const device half* res_ptr = residual + out_row * N + gn; \
+                    if (m_valid == 16 && n_valid == 16)                       \
+                        nax_store_v2_residual_unsafe(C_ptr, res_ptr, int(N), acc[fm_idx], fm, fn); \
+                    else                                                      \
+                        nax_store_v2_residual(C_ptr, res_ptr, int(N), acc[fm_idx], fm, fn, m_valid, n_valid); \
+                } else {                                                      \
+                    if (m_valid == 16 && n_valid == 16)                       \
+                        nax_store_v2_unsafe(C_ptr, int(N), acc[fm_idx], fm, fn); \
+                    else                                                      \
+                        nax_store_v2(C_ptr, int(N), acc[fm_idx], fm, fn, m_valid, n_valid); \
+                }                                                             \
+            }                                                                 \
+        }                                                                     \
+                                                                              \
+        {                                                                     \
+            device half* C_ptr = C_batch + out_row * N + gn + 16;             \
+            int n_valid = full_n ? 16 : min(16, sg_valid_n - 16);             \
+            if (n_valid > 0) {                                                \
+                if (has_residual) {                                            \
+                    const device half* res_ptr = residual + out_row * N + gn + 16; \
+                    if (m_valid == 16 && n_valid == 16)                       \
+                        nax_store_v2_residual_unsafe(C_ptr, res_ptr, int(N), acc[fm_idx] + 8, fm, fn); \
+                    else                                                      \
+                        nax_store_v2_residual(C_ptr, res_ptr, int(N), acc[fm_idx] + 8, fm, fn, m_valid, n_valid); \
+                } else {                                                      \
+                    if (m_valid == 16 && n_valid == 16)                       \
+                        nax_store_v2_unsafe(C_ptr, int(N), acc[fm_idx] + 8, fm, fn); \
+                    else                                                      \
+                        nax_store_v2(C_ptr, int(N), acc[fm_idx] + 8, fm, fn, m_valid, n_valid); \
+                }                                                             \
+            }                                                                 \
+        }                                                                     \
+    }                                                                         \
+}
+
+// V2: vectorized loads + unroll_count(2)
+NAX_V2_KERNEL_BODY(gemm_nax_v2_f16, _Pragma("clang loop unroll_count(2)"))
+
+// V3: vectorized loads + no unroll (compiler decides)
+NAX_V2_KERNEL_BODY(gemm_nax_v3_f16, )
+
+"#;
+
+// ---------------------------------------------------------------------------
 // Metal shader source: Grouped GEMM for MoE workloads.
 // Multiple variable-M problems in a single kernel dispatch.
 // BM=64, BN=64, BK=16, 2 simdgroups (1×2), 64 threads.
@@ -4175,6 +4491,9 @@ pub fn register(registry: &KernelRegistry) -> Result<(), KernelError> {
     // NAX GEMM requires MetalPerformancePrimitives (Metal 3.1+), gracefully skip if unavailable
     if let Err(e) = registry.register_jit_source("gemm_nax", GEMM_NAX_SHADER_SOURCE) {
         eprintln!("warning: gemm_nax registration skipped (MPP unavailable): {e}");
+    }
+    if let Err(e) = registry.register_jit_source("gemm_nax_v2", GEMM_NAX_V2_SHADER_SOURCE) {
+        eprintln!("warning: gemm_nax_v2 registration skipped (MPP unavailable): {e}");
     }
     Ok(())
 }
