@@ -202,7 +202,7 @@ impl KernelRegistry {
         };
 
         // 1a. Check frozen snapshot (lock-free)
-        if let Some(pipeline) = self.frozen_lookup(&key) {
+        if let Some(pipeline) = self.frozen_lookup(&lookup_key) {
             return Ok(pipeline);
         }
 
@@ -384,7 +384,7 @@ impl KernelRegistry {
         };
 
         // 1a. Check frozen snapshot (lock-free)
-        if let Some(pipeline) = self.frozen_lookup(&key) {
+        if let Some(pipeline) = self.frozen_lookup(&lookup_key) {
             return Ok(pipeline);
         }
 

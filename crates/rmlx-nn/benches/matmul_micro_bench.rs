@@ -33,10 +33,26 @@ struct GemmShape {
 }
 
 const SHAPES: &[GemmShape] = &[
-    GemmShape { name: "QKV",    k: 3584, n: 4608 },
-    GemmShape { name: "O_proj", k: 3584, n: 3584 },
-    GemmShape { name: "GateUp", k: 3584, n: 5120 },
-    GemmShape { name: "Down",   k: 2560, n: 3584 },
+    GemmShape {
+        name: "QKV",
+        k: 3584,
+        n: 4608,
+    },
+    GemmShape {
+        name: "O_proj",
+        k: 3584,
+        n: 3584,
+    },
+    GemmShape {
+        name: "GateUp",
+        k: 3584,
+        n: 5120,
+    },
+    GemmShape {
+        name: "Down",
+        k: 2560,
+        n: 3584,
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -131,7 +147,12 @@ struct BenchResult {
     tflops: f64,
 }
 
-fn compute_stats(durations: &[Duration], m: usize, k: usize, n: usize) -> (f64, f64, f64, f64, f64) {
+fn compute_stats(
+    durations: &[Duration],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> (f64, f64, f64, f64, f64) {
     let mut micros: Vec<f64> = durations.iter().map(|d| d.as_secs_f64() * 1e6).collect();
     micros.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
@@ -144,7 +165,8 @@ fn compute_stats(durations: &[Duration], m: usize, k: usize, n: usize) -> (f64, 
         micros[micros.len() / 2]
     };
 
-    let variance: f64 = micros.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / micros.len() as f64;
+    let variance: f64 =
+        micros.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / micros.len() as f64;
     let std_dev = variance.sqrt();
 
     // TFLOPS = 2*M*N*K / (mean_us * 1e-6) / 1e12
@@ -188,8 +210,8 @@ fn main() {
                 let a = rand_array(device, &[*m, shape.k], 42);
                 let b = rand_array(device, &[shape.k, shape.n], 43);
                 let cb = warmup_queue.new_command_buffer();
-                let _ = ops::matmul::matmul_into_cb(&registry, &a, &b, cb)
-                    .expect("jit warmup matmul");
+                let _ =
+                    ops::matmul::matmul_into_cb(&registry, &a, &b, cb).expect("jit warmup matmul");
                 cb.commit();
                 cb.wait_until_completed();
             }
@@ -213,8 +235,8 @@ fn main() {
             // Warmup iterations
             for _ in 0..WARMUP_ITERS {
                 time_op(&queue, |cb| {
-                    let _ = ops::matmul::matmul_into_cb(&registry, &a, &b, cb)
-                        .expect("warmup matmul");
+                    let _ =
+                        ops::matmul::matmul_into_cb(&registry, &a, &b, cb).expect("warmup matmul");
                 });
             }
 
@@ -222,15 +244,18 @@ fn main() {
             let mut durations = Vec::with_capacity(BENCH_ITERS);
             for _ in 0..BENCH_ITERS {
                 durations.push(time_op(&queue, |cb| {
-                    let _ = ops::matmul::matmul_into_cb(&registry, &a, &b, cb)
-                        .expect("bench matmul");
+                    let _ =
+                        ops::matmul::matmul_into_cb(&registry, &a, &b, cb).expect("bench matmul");
                 }));
             }
 
             let (mean, std_dev, min, p50, tflops) = compute_stats(&durations, m, shape.k, shape.n);
 
             results.push(BenchResult {
-                name: format!("{} [{}x{}]x[{}x{}]", shape.name, m, shape.k, shape.k, shape.n),
+                name: format!(
+                    "{} [{}x{}]x[{}x{}]",
+                    shape.name, m, shape.k, shape.k, shape.n
+                ),
                 m,
                 _k: shape.k,
                 _n: shape.n,
@@ -240,7 +265,6 @@ fn main() {
                 p50_us: p50,
                 tflops,
             });
-
         }
 
         // Let GPU cool between M sizes
@@ -278,22 +302,14 @@ fn main() {
 
     // ── Summary: per-M totals ──
     println!("\n## Per-M Summary\n");
-    println!(
-        "| {:>6} | {:>12} | {:>8} |",
-        "M", "Total(us)", "Avg TFLOPS"
-    );
-    println!(
-        "|{:-<8}|{:-<14}|{:-<10}|",
-        "", "", ""
-    );
+    println!("| {:>6} | {:>12} | {:>8} |", "M", "Total(us)", "Avg TFLOPS");
+    println!("|{:-<8}|{:-<14}|{:-<10}|", "", "", "");
 
     for &m in M_VALUES {
         let m_results: Vec<&BenchResult> = results.iter().filter(|r| r.m == m).collect();
         let total_us: f64 = m_results.iter().map(|r| r.mean_us).sum();
-        let avg_tflops: f64 = m_results.iter().map(|r| r.tflops).sum::<f64>() / m_results.len() as f64;
-        println!(
-            "| {:>6} | {:>12.1} | {:>8.2} |",
-            m, total_us, avg_tflops
-        );
+        let avg_tflops: f64 =
+            m_results.iter().map(|r| r.tflops).sum::<f64>() / m_results.len() as f64;
+        println!("| {:>6} | {:>12.1} | {:>8.2} |", m, total_us, avg_tflops);
     }
 }

@@ -401,8 +401,9 @@ fn main() {
         // Run RMSNorm
         let x_warm = rand_array(device, &[64, HIDDEN_SIZE], 997);
         let cb = setup_queue.new_command_buffer();
-        let _ = ops::rms_norm::rms_norm_into_cb(&registry, &x_warm, Some(&norm1_w), RMS_NORM_EPS, cb)
-            .expect("jit rms_norm");
+        let _ =
+            ops::rms_norm::rms_norm_into_cb(&registry, &x_warm, Some(&norm1_w), RMS_NORM_EPS, cb)
+                .expect("jit rms_norm");
         cb.commit();
         cb.wait_until_completed();
 
@@ -460,8 +461,13 @@ fn main() {
         // Fused SiLU*mul PSO
         let gate_up_warm = rand_array(device, &[64, INTERMEDIATE_DIM * 2], 988);
         let cb = setup_queue.new_command_buffer();
-        let _ = ops::fused::fused_silu_mul_strided_into_cb(&registry, &gate_up_warm, INTERMEDIATE_DIM, cb)
-            .expect("jit silu_mul");
+        let _ = ops::fused::fused_silu_mul_strided_into_cb(
+            &registry,
+            &gate_up_warm,
+            INTERMEDIATE_DIM,
+            cb,
+        )
+        .expect("jit silu_mul");
         cb.commit();
         cb.wait_until_completed();
 
@@ -471,7 +477,14 @@ fn main() {
         let sin_w = sin_full.slice(0, 0, 64).expect("sin slice");
         let cb = setup_queue.new_command_buffer();
         let _ = ops::rope::rope_multihead_into_cb(
-            &registry, &q_rope_warm, &cos_w, &sin_w, NUM_HEADS, 0, TOTAL_QKV, cb,
+            &registry,
+            &q_rope_warm,
+            &cos_w,
+            &sin_w,
+            NUM_HEADS,
+            0,
+            TOTAL_QKV,
+            cb,
         )
         .expect("jit rope");
         cb.commit();
@@ -488,7 +501,12 @@ fn main() {
         // Fused residual+norm PSO
         let cb = setup_queue.new_command_buffer();
         let _ = ops::rms_norm::rms_norm_residual_add_into_cb(
-            &registry, &r1, &r2, &norm1_w, RMS_NORM_EPS, cb,
+            &registry,
+            &r1,
+            &r2,
+            &norm1_w,
+            RMS_NORM_EPS,
+            cb,
         )
         .expect("jit rms_norm_residual");
         cb.commit();
