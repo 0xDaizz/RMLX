@@ -6806,6 +6806,24 @@ pub fn matmul(
     }
 
     // -----------------------------------------------------------------------
+    // Data-driven Split-K f16 for M=2..128
+    // Benchmark: SplitK-Small with optimal n_splits beats all other kernels
+    // at M=2~64 (1.5-2.7x over MLX), and wins 3/4 shapes at M=65~128.
+    // For M=65~128 with N>>K, NAX/tiled GEMM wins — skip Split-K there.
+    // -----------------------------------------------------------------------
+    if a.dtype() == DType::Float16 && k >= 256 {
+        if (2..=64).contains(&m) {
+            let n_splits = optimal_splitk_nsplits(m, n, k);
+            return dispatch_split_k_f16(registry, a, b, queue, m, n, k, n_splits);
+        }
+        // M=65~128: use Split-K only when N is not much larger than K
+        if (65..=128).contains(&m) && n <= k * 2 {
+            let n_splits = if k > n * 2 { 4 } else { 3 };
+            return dispatch_split_k_f16(registry, a, b, queue, m, n, k, n_splits);
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Split-K f16 dispatch for under-occupied problems
     // -----------------------------------------------------------------------
     if a.dtype() == DType::Float16 {
@@ -7027,6 +7045,16 @@ fn dispatch_tiled_gemm(
         0
     };
 
+    // MLX-architecture kernels declare buffer(10)..buffer(13) for fused
+    // epilogues. Bind dummies so Metal validation passes (function constants
+    // ensure the kernel never actually reads them).
+    if tile.variant.uses_function_constants() {
+        enc.set_buffer(gemm::RESIDUAL, Some(out.metal_buffer()), 0);
+        enc.set_buffer(gemm::NORM_WEIGHT, Some(out.metal_buffer()), 0);
+        enc.set_buffer(gemm::INV_RMS, Some(out.metal_buffer()), 0);
+        enc.set_buffer(gemm::GATE_RESULT, Some(out.metal_buffer()), 0);
+    }
+
     let grid = MTLSize::new(
         (ceil_div(n, tile.bn) << swizzle_log) as u64,
         (ceil_div(m, tile.bm) >> swizzle_log) as u64,
@@ -7113,6 +7141,34 @@ fn dispatch_split_k(
     super::commit_with_mode(cb, super::ExecMode::Sync);
 
     Ok(out)
+}
+
+/// Choose optimal n_splits for Split-K f16 based on benchmark data.
+///
+/// Pattern: N>>K (wide output) needs fewer splits (enough tile parallelism),
+/// K>>N (tall K) needs more splits, N≈K (balanced) uses 4-8 depending on M.
+fn optimal_splitk_nsplits(m: usize, n: usize, k: usize) -> usize {
+    // N >> K: enough tile parallelism from wide output, minimal splits
+    if n > k * 2 {
+        if m <= 8 {
+            return 3;
+        }
+        return 2;
+    }
+
+    // K >> N: need more splits to parallelize the long K-axis
+    if k > n * 2 {
+        if m <= 32 {
+            return 8;
+        }
+        return 4; // M=33~64
+    }
+
+    // Balanced (N ≈ K, e.g., 3584², 4096²)
+    if m <= 32 {
+        return 8;
+    }
+    4 // M=33~64
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7457,6 +7513,18 @@ fn encode_gemm_core(
         1,
     );
     let tg = MTLSize::new(tile.variant.threads_per_tg(), 1, 1);
+
+    // MLX-architecture kernels (gemm_mlx_*) declare buffer(10)..buffer(13)
+    // for fused residual/norm/gate epilogues. When called from a plain GEMM
+    // path the function constants (has_residual=false etc.) guarantee the
+    // kernel never reads these, but Metal validation still requires every
+    // declared buffer slot to be bound. Use the output buffer as a dummy.
+    if tile.variant.uses_function_constants() {
+        enc.set_buffer(gemm::RESIDUAL, Some(out.metal_buffer()), 0);
+        enc.set_buffer(gemm::NORM_WEIGHT, Some(out.metal_buffer()), 0);
+        enc.set_buffer(gemm::INV_RMS, Some(out.metal_buffer()), 0);
+        enc.set_buffer(gemm::GATE_RESULT, Some(out.metal_buffer()), 0);
+    }
 
     enc.dispatch_thread_groups(grid, tg);
 

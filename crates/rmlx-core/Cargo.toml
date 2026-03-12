@@ -123,5 +123,17 @@ name = "single_kernel_bench"
 harness = false
 
 [[bench]]
+name = "lowm_kernel_bench"
+harness = false
+
+[[bench]]
 name = "gemm_fair_bench"
+harness = false
+
+[[bench]]
+name = "kernel_heatmap_bench"
+harness = false
+
+[[bench]]
+name = "splitk_sweep_bench"
 harness = false
