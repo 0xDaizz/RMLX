@@ -3328,25 +3328,22 @@ void gemm_nax_f16(
         for (int j = 0; j < 16; j++)
             acc[i][j] = 0.0f;
 
-    // K-loop: iterate in outer blocks of BK=32
-    const uint k_iters = align_K ? (K / BK) : ((K + BK - 1) / BK);
+    // K-loop: flat iteration in steps of FK=16
+    const uint k_total_steps = align_K ? (K / FK) : ((K + FK - 1) / FK);
 
-    for (uint kk = 0; kk < k_iters; kk++) {
-        const uint gk = kk * BK;
-        const int k_remaining = align_K ? int(BK) : min(int(K) - int(gk), int(BK));
-
-        // Inner K loop in steps of FK=16
-        for (int sk = 0; sk < k_remaining; sk += int(FK)) {
-            const int fk_valid = min(int(FK), k_remaining - sk);
-            const bool k_aligned = align_K || (fk_valid == int(FK));
+    #pragma clang loop unroll_count(2)
+    for (uint sk_abs = 0; sk_abs < k_total_steps; sk_abs++) {
+        const uint sk_offset = sk_abs * FK;
+        const int fk_valid = align_K ? int(FK) : min(int(FK), int(K) - int(sk_offset));
+        const bool k_aligned = align_K || (fk_valid == int(FK));
 
             // Load B fragment ONCE (16×32 = 16 elems/thread)
-            // ct_b[0..7] = B[gk+sk : gk+sk+16, gn : gn+16]     (first 16×16 block)
-            // ct_b[8..15] = B[gk+sk : gk+sk+16, gn+16 : gn+32] (second 16×16 block)
+            // ct_b[0..7] = B[sk_offset : sk_offset+16, gn : gn+16]     (first 16×16 block)
+            // ct_b[8..15] = B[sk_offset : sk_offset+16, gn+16 : gn+32] (second 16×16 block)
             half B_frag[16];
             {
                 // First 16×16 block (cols 0-15)
-                const device half* B_ptr0 = B_batch + (gk + uint(sk)) * N + gn;
+                const device half* B_ptr0 = B_batch + sk_offset * N + gn;
                 int b_cols0 = align_N ? 16 : min(16, sg_valid_n);
                 if (b_cols0 <= 0) {
                     for (int e = 0; e < 8; e++) B_frag[e] = half(0);
@@ -3375,7 +3372,7 @@ void gemm_nax_f16(
                 // Load A fragment (16×16 = 8 elems/thread)
                 half A_frag[8];
                 {
-                    const device half* A_ptr = A_batch + (gm + fm_idx * 16) * K + gk + uint(sk);
+                    const device half* A_ptr = A_batch + (gm + fm_idx * 16) * K + sk_offset;
                     int a_rows = align_M ? 16 : min(16, sg_valid_m - int(fm_idx * 16));
                     if (a_rows <= 0) {
                         for (int e = 0; e < 8; e++) A_frag[e] = half(0);
@@ -3400,7 +3397,6 @@ void gemm_nax_f16(
                     for (int e = 0; e < 16; e++) acc[fm_idx][e] = ct_c[e];
                 }
             }
-        }
     }
 
     // ─── Store results ──────────────────────────────────────────────────────

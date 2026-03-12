@@ -385,6 +385,118 @@ fn main() {
     // Let Metal driver drain setup work
     std::thread::sleep(std::time::Duration::from_millis(50));
 
+    // ── Global JIT warmup: compile all Metal PSOs before timing ──
+    {
+        println!("\n[JIT Warmup] Pre-compiling all kernel variants...");
+        let _pool = ScopedPool::new();
+
+        // Run a small matmul to trigger NAX/MlxArch GEMM PSO compilation
+        let a_warm = rand_array(device, &[64, HIDDEN_SIZE], 999);
+        let b_warm = rand_array(device, &[HIDDEN_SIZE, TOTAL_QKV], 998);
+        let cb = setup_queue.new_command_buffer();
+        let _ = ops::matmul::matmul_into_cb(&registry, &a_warm, &b_warm, cb).expect("jit matmul");
+        cb.commit();
+        cb.wait_until_completed();
+
+        // Run RMSNorm
+        let x_warm = rand_array(device, &[64, HIDDEN_SIZE], 997);
+        let cb = setup_queue.new_command_buffer();
+        let _ = ops::rms_norm::rms_norm_into_cb(&registry, &x_warm, Some(&norm1_w), RMS_NORM_EPS, cb)
+            .expect("jit rms_norm");
+        cb.commit();
+        cb.wait_until_completed();
+
+        // Run matmul with residual (triggers residual PSO variant)
+        let c_warm = rand_array(device, &[64, TOTAL_QKV], 996);
+        let cb = setup_queue.new_command_buffer();
+        let _ = ops::matmul::matmul_add_residual_into_cb(&registry, &a_warm, &b_warm, &c_warm, cb)
+            .expect("jit matmul_residual");
+        cb.commit();
+        cb.wait_until_completed();
+
+        // Run SDPA NAX (if supported) to trigger that PSO
+        if supports_nax {
+            let q_warm = rand_array(device, &[1, NUM_HEADS, 64, HEAD_DIM], 995);
+            let k_warm = rand_array(device, &[1, NUM_KV_HEADS, 64, HEAD_DIM], 994);
+            let v_warm = rand_array(device, &[1, NUM_KV_HEADS, 64, HEAD_DIM], 993);
+            let cb = setup_queue.new_command_buffer();
+            let _ = ops::sdpa::sdpa_prefill_nax_f16_into_cb(
+                &registry,
+                &q_warm,
+                &k_warm,
+                &v_warm,
+                NUM_HEADS,
+                NUM_KV_HEADS,
+                HEAD_DIM,
+                64,
+                64,
+                None,
+                (HEAD_DIM as f32).sqrt().recip(),
+                true,
+                None,
+                None,
+                cb,
+            )
+            .expect("jit sdpa nax");
+            cb.commit();
+            cb.wait_until_completed();
+        }
+
+        // Additional sizes to trigger alignment variants
+        let a2 = rand_array(device, &[128, HIDDEN_SIZE], 992);
+        let b2 = rand_array(device, &[HIDDEN_SIZE, HIDDEN_SIZE], 991);
+        let cb = setup_queue.new_command_buffer();
+        let _ = ops::matmul::matmul_into_cb(&registry, &a2, &b2, cb).expect("jit matmul 2");
+        cb.commit();
+        cb.wait_until_completed();
+
+        let a3 = rand_array(device, &[128, INTERMEDIATE_DIM], 990);
+        let b3 = rand_array(device, &[INTERMEDIATE_DIM, HIDDEN_SIZE], 989);
+        let cb = setup_queue.new_command_buffer();
+        let _ = ops::matmul::matmul_into_cb(&registry, &a3, &b3, cb).expect("jit matmul 3");
+        cb.commit();
+        cb.wait_until_completed();
+
+        // Fused SiLU*mul PSO
+        let gate_up_warm = rand_array(device, &[64, INTERMEDIATE_DIM * 2], 988);
+        let cb = setup_queue.new_command_buffer();
+        let _ = ops::fused::fused_silu_mul_strided_into_cb(&registry, &gate_up_warm, INTERMEDIATE_DIM, cb)
+            .expect("jit silu_mul");
+        cb.commit();
+        cb.wait_until_completed();
+
+        // RoPE PSO
+        let q_rope_warm = rand_array(device, &[64, Q_DIM], 987);
+        let cos_w = cos_full.slice(0, 0, 64).expect("cos slice");
+        let sin_w = sin_full.slice(0, 0, 64).expect("sin slice");
+        let cb = setup_queue.new_command_buffer();
+        let _ = ops::rope::rope_multihead_into_cb(
+            &registry, &q_rope_warm, &cos_w, &sin_w, NUM_HEADS, 0, TOTAL_QKV, cb,
+        )
+        .expect("jit rope");
+        cb.commit();
+        cb.wait_until_completed();
+
+        // Residual add PSO
+        let r1 = rand_array(device, &[64, HIDDEN_SIZE], 986);
+        let r2 = rand_array(device, &[64, HIDDEN_SIZE], 985);
+        let cb = setup_queue.new_command_buffer();
+        let _ = ops::binary::add_into_cb(&registry, &r1, &r2, cb).expect("jit add");
+        cb.commit();
+        cb.wait_until_completed();
+
+        // Fused residual+norm PSO
+        let cb = setup_queue.new_command_buffer();
+        let _ = ops::rms_norm::rms_norm_residual_add_into_cb(
+            &registry, &r1, &r2, &norm1_w, RMS_NORM_EPS, cb,
+        )
+        .expect("jit rms_norm_residual");
+        cb.commit();
+        cb.wait_until_completed();
+
+        println!("[JIT Warmup] Done.\n");
+    }
+
     for &seq_len in SEQ_LENS {
         println!("\n{}", "=".repeat(100));
         println!(
