@@ -63,7 +63,7 @@ impl Qwen2Model {
     /// Delegates entirely to `TransformerModel::forward()`.
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
-        &self,
+        &mut self,
         token_ids: &[u32],
         cos_freqs: Option<&Array>,
         sin_freqs: Option<&Array>,

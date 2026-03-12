@@ -3,6 +3,7 @@
 use rmlx_core::array::Array;
 use rmlx_core::kernels::{KernelError, KernelRegistry};
 use rmlx_core::ops;
+use rmlx_core::ops::buffer_slots::gemm as slot;
 
 /// Linear layer configuration.
 pub struct LinearConfig {
@@ -456,26 +457,44 @@ impl Linear {
 
         let bm = tile.bm as u64;
         let bn = tile.bn as u64;
-        let grid_x = (n_u32 as u64).div_ceil(bn);
-        let grid_y = (m_u32 as u64).div_ceil(bm);
 
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&pipeline);
-        enc.set_buffer(0, Some(input_2d.metal_buffer()), input_2d.offset() as u64);
-        enc.set_buffer(1, Some(w_t.metal_buffer()), w_t.offset() as u64);
-        enc.set_buffer(2, Some(output.metal_buffer()), output.offset() as u64);
-        enc.set_bytes(3, 4, &m_u32 as *const u32 as *const std::ffi::c_void);
-        enc.set_bytes(4, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
-        enc.set_bytes(5, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
+        enc.set_buffer(
+            slot::A,
+            Some(input_2d.metal_buffer()),
+            input_2d.offset() as u64,
+        );
+        enc.set_buffer(slot::B, Some(w_t.metal_buffer()), w_t.offset() as u64);
+        enc.set_buffer(
+            slot::OUT,
+            Some(output.metal_buffer()),
+            output.offset() as u64,
+        );
+        enc.set_bytes(slot::M, 4, &m_u32 as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(slot::N, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(slot::K, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
         let bsa_val = m_u32 * k_u32;
         let bsb_val = k_u32 * n_u32;
         let bsc_val = m_u32 * n_u32;
-        enc.set_bytes(6, 4, &bsa_val as *const u32 as *const std::ffi::c_void);
-        enc.set_bytes(7, 4, &bsb_val as *const u32 as *const std::ffi::c_void);
-        enc.set_bytes(8, 4, &bsc_val as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(
+            slot::BATCH_STRIDE_A,
+            4,
+            &bsa_val as *const u32 as *const std::ffi::c_void,
+        );
+        enc.set_bytes(
+            slot::BATCH_STRIDE_B,
+            4,
+            &bsb_val as *const u32 as *const std::ffi::c_void,
+        );
+        enc.set_bytes(
+            slot::BATCH_STRIDE_C,
+            4,
+            &bsc_val as *const u32 as *const std::ffi::c_void,
+        );
 
         // Steel, Full/Skinny/MlxArch kernels require swizzle_log (buffer 9)
-        if matches!(
+        let swizzle_log = if matches!(
             tile.variant,
             ops::matmul::TileVariant::Full
                 | ops::matmul::TileVariant::Skinny
@@ -485,9 +504,16 @@ impl Linear {
                 | ops::matmul::TileVariant::NaxArch
                 | ops::matmul::TileVariant::NaxArch64x128
         ) {
-            let swizzle_log = ops::matmul::compute_swizzle_log(m, n, tile.bm, tile.bn);
-            enc.set_bytes(9, 4, &swizzle_log as *const u32 as *const std::ffi::c_void);
-        }
+            let s = ops::matmul::compute_swizzle_log(m, n, tile.bm, tile.bn);
+            enc.set_bytes(
+                slot::SWIZZLE_LOG,
+                4,
+                &s as *const u32 as *const std::ffi::c_void,
+            );
+            s
+        } else {
+            0
+        };
 
         let tg_threads = match tile.variant {
             ops::matmul::TileVariant::Small => 256_u64,
@@ -502,6 +528,8 @@ impl Linear {
             ops::matmul::TileVariant::NaxArch64x64 => 128_u64,
         };
 
+        let grid_x = ((n_u32 as u64).div_ceil(bn)) << swizzle_log;
+        let grid_y = ((m_u32 as u64).div_ceil(bm)) >> swizzle_log;
         let grid = metal::MTLSize::new(grid_x, grid_y, 1);
         let tg = metal::MTLSize::new(tg_threads, 1, 1);
         enc.dispatch_thread_groups(grid, tg);

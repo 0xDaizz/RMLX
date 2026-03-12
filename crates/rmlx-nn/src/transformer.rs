@@ -1,5 +1,6 @@
 //! Transformer block: attention + MLP (or MoE).
 
+use rmlx_core::arena::ForwardArena;
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::{KernelError, KernelRegistry};
@@ -347,6 +348,157 @@ impl FeedForward {
             }
             _ => Err(KernelError::InvalidShape(
                 "forward_single_encoder only supports Gated FFN".into(),
+            )),
+        }
+    }
+
+    /// Fused RMSNorm + Gate/Up GEMM FFN forward into a command buffer.
+    ///
+    /// Instead of taking a pre-normalized input, this method takes the raw
+    /// (un-normed) hidden state `h` and fuses norm2 into the gate+up GEMM
+    /// using `matmul_norm_gemm_into_cb`.  This eliminates the intermediate
+    /// `normed2` [M, K] tensor.
+    ///
+    /// `h`: un-normed hidden state [seq_len, hidden_size] (= x + attn_out)
+    /// `norm_weight`: RMSNorm weight [hidden_size]
+    /// `eps`: RMSNorm epsilon
+    /// `residual`: tensor for residual add after down_proj (same as `h`)
+    ///
+    /// **Prerequisites:** `prepare_weight_t()` must have been called.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_norm_single_cb(
+        &self,
+        h: &Array,
+        norm_weight: &Array,
+        eps: f32,
+        residual: &Array,
+        registry: &KernelRegistry,
+        cb: &metal::CommandBufferRef,
+    ) -> Result<Array, KernelError> {
+        match self {
+            FeedForward::Gated {
+                gate_proj,
+                up_proj,
+                down_proj,
+                gate_up_merged_weight_t,
+                ..
+            } => {
+                let h_2d = if h.ndim() == 1 {
+                    h.reshape(vec![1, h.shape()[0]])?
+                } else {
+                    h.reshape(vec![h.shape()[0], h.shape()[1]])?
+                };
+                let hidden = if let Some(ref guw_t) = gate_up_merged_weight_t {
+                    // Fused RMSNorm + merged gate+up GEMM (inv_rms + norm-GEMM)
+                    let merged = ops::matmul::matmul_norm_gemm_into_cb(
+                        registry,
+                        &h_2d,
+                        guw_t,
+                        norm_weight,
+                        eps,
+                        cb,
+                    )?;
+                    let gate_dim = guw_t.shape()[1] / 2;
+                    ops::fused::fused_silu_mul_strided_into_cb(registry, &merged, gate_dim, cb)?
+                } else {
+                    // Fallback: separate norm + 2 GEMMs (no fusion benefit)
+                    let normed = ops::rms_norm::rms_norm_into_cb(
+                        registry,
+                        &h_2d,
+                        Some(norm_weight),
+                        eps,
+                        cb,
+                    )?;
+                    let wgate_t = gate_proj.weight_transposed_contiguous()?;
+                    let wup_t = up_proj.weight_transposed_contiguous()?;
+                    let (gate_out, up_out) = ops::fused::batched_gate_up_into_cb(
+                        registry, &normed, &wgate_t, &wup_t, cb,
+                    )?;
+                    ops::fused::fused_silu_mul_into_cb(registry, &gate_out, &up_out, cb)?
+                };
+                if hidden.shape()[0] >= 33 {
+                    down_proj.forward_with_residual_into_cb(&hidden, residual, registry, cb)
+                } else {
+                    let ffn_out = down_proj.forward_into_cb(&hidden, registry, cb)?;
+                    ops::binary::add_into_cb(registry, residual, &ffn_out, cb)
+                }
+            }
+            _ => Err(KernelError::InvalidShape(
+                "forward_norm_single_cb only supports Gated FFN".into(),
+            )),
+        }
+    }
+
+    /// Fused RMSNorm + Gate/Up GEMM FFN forward into an existing encoder.
+    ///
+    /// Same as [`forward_norm_single_cb`] but dispatches into a caller-provided
+    /// compute command encoder.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_norm_single_encoder(
+        &self,
+        h: &Array,
+        norm_weight: &Array,
+        eps: f32,
+        residual: &Array,
+        registry: &KernelRegistry,
+        encoder: &metal::ComputeCommandEncoderRef,
+    ) -> Result<Array, KernelError> {
+        match self {
+            FeedForward::Gated {
+                down_proj,
+                gate_up_merged_weight_t,
+                gate_proj,
+                up_proj,
+                ..
+            } => {
+                let h_2d = if h.ndim() == 1 {
+                    h.reshape(vec![1, h.shape()[0]])?
+                } else {
+                    h.reshape(vec![h.shape()[0], h.shape()[1]])?
+                };
+                let hidden = if let Some(ref guw_t) = gate_up_merged_weight_t {
+                    // Fused RMSNorm + merged gate+up GEMM (inv_rms + norm-GEMM)
+                    let merged = ops::matmul::matmul_norm_gemm_encode(
+                        registry,
+                        &h_2d,
+                        guw_t,
+                        norm_weight,
+                        eps,
+                        encoder,
+                    )?;
+                    let gate_dim = guw_t.shape()[1] / 2;
+                    // Memory barrier: norm-GEMM output must be visible
+                    encoder
+                        .memory_barrier_with_resources(&[buf_as_resource(merged.metal_buffer())]);
+                    ops::fused::fused_silu_mul_strided_encode(registry, &merged, gate_dim, encoder)?
+                } else {
+                    // Fallback: separate norm + 2 GEMMs
+                    let normed = ops::rms_norm::rms_norm_encode(
+                        registry,
+                        &h_2d,
+                        Some(norm_weight),
+                        eps,
+                        encoder,
+                    )?;
+                    encoder
+                        .memory_barrier_with_resources(&[buf_as_resource(normed.metal_buffer())]);
+                    let wgate_t = gate_proj.weight_transposed_contiguous()?;
+                    let wup_t = up_proj.weight_transposed_contiguous()?;
+                    let (gate_out, up_out) = ops::fused::batched_gate_up_encode(
+                        registry, &normed, &wgate_t, &wup_t, encoder,
+                    )?;
+                    ops::fused::fused_silu_mul_encode(registry, &gate_out, &up_out, encoder)?
+                };
+                if hidden.shape()[0] >= 33 {
+                    down_proj
+                        .forward_with_residual_into_encoder(&hidden, residual, registry, encoder)
+                } else {
+                    let ffn_out = down_proj.forward_into_encoder(&hidden, registry, encoder)?;
+                    ops::binary::add_encode(registry, residual, &ffn_out, encoder)
+                }
+            }
+            _ => Err(KernelError::InvalidShape(
+                "forward_norm_single_encoder only supports Gated FFN".into(),
             )),
         }
     }
@@ -3054,18 +3206,12 @@ impl TransformerBlock {
             cb,
         )?;
 
-        // Fused residual + pre-FFN norm (1 dispatch instead of 2)
-        let (normed2, h) = ops::rms_norm::rms_norm_residual_add_into_cb(
-            registry,
-            &attn_out, // input = attention output
-            x,         // residual = original input
-            norm2_w,
-            self.rms_norm_eps,
-            cb,
-        )?;
+        // Residual connection: h = x + attn_out
+        let h = ops::binary::add_into_cb(registry, x, &attn_out, cb)?;
 
-        // FFN (all in same CB)
-        self.ffn.forward_single_cb(&normed2, &h, registry, cb)
+        // FFN with fused norm2 + gate/up GEMM (eliminates intermediate normed2 tensor)
+        self.ffn
+            .forward_norm_single_cb(&h, norm2_w, self.rms_norm_eps, &h, registry, cb)
     }
 
     /// Single-CB forward pass for prefill (seq_len >= 1).
@@ -3112,18 +3258,12 @@ impl TransformerBlock {
             cb,
         )?;
 
-        // Fused residual + pre-FFN norm (1 dispatch instead of 2)
-        let (normed2, h) = ops::rms_norm::rms_norm_residual_add_into_cb(
-            registry,
-            &attn_out, // input = attention output
-            x,         // residual = original input
-            norm2_w,
-            self.rms_norm_eps,
-            cb,
-        )?;
+        // Residual connection: h = x + attn_out
+        let h = ops::binary::add_into_cb(registry, x, &attn_out, cb)?;
 
-        // FFN (all in same CB)
-        self.ffn.forward_single_cb(&normed2, &h, registry, cb)
+        // FFN with fused norm2 + gate/up GEMM (eliminates intermediate normed2 tensor)
+        self.ffn
+            .forward_norm_single_cb(&h, norm2_w, self.rms_norm_eps, &h, registry, cb)
     }
 
     /// Forward pass using a single compute command encoder for all ops in the block.
@@ -3167,18 +3307,12 @@ impl TransformerBlock {
             registry,
             encoder,
         )?;
-        // Fused residual + pre-FFN norm (1 dispatch instead of 2)
-        let (normed2, h) = ops::rms_norm::rms_norm_residual_add_encode(
-            registry,
-            &attn_out,
-            x,
-            norm2_w,
-            self.rms_norm_eps,
-            encoder,
-        )?;
-        // FFN (all ops share the same encoder)
+        // Residual connection: h = x + attn_out
+        let h = ops::binary::add_encode(registry, x, &attn_out, encoder)?;
+        encoder.memory_barrier_with_resources(&[buf_as_resource(h.metal_buffer())]);
+        // FFN with fused norm2 + gate/up GEMM (eliminates intermediate normed2 tensor)
         self.ffn
-            .forward_single_encoder(&normed2, &h, registry, encoder)
+            .forward_norm_single_encoder(&h, norm2_w, self.rms_norm_eps, &h, registry, encoder)
     }
 
     /// Per-dispatch GPU timing breakdown: runs each of the 9 prefill dispatches
@@ -4044,6 +4178,8 @@ pub struct TransformerModel {
     final_norm_weight: Option<Array>,
     lm_head: Option<Linear>,
     num_layers: usize,
+    /// Bump arena for per-forward-pass intermediate metadata allocations.
+    arena: ForwardArena,
 }
 
 impl TransformerModel {
@@ -4058,6 +4194,7 @@ impl TransformerModel {
             final_norm_weight: None,
             lm_head: None,
             num_layers,
+            arena: ForwardArena::with_capacity(64 * 1024), // 64KB initial
         })
     }
 
@@ -4078,6 +4215,7 @@ impl TransformerModel {
             final_norm_weight: Some(final_norm_weight),
             lm_head: Some(lm_head),
             num_layers,
+            arena: ForwardArena::with_capacity(64 * 1024), // 64KB initial
         })
     }
 
@@ -4089,7 +4227,7 @@ impl TransformerModel {
     /// Returns: [seq_len, vocab_size] logits
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
-        &self,
+        &mut self,
         token_ids: &[u32],
         cos_freqs: Option<&Array>,
         sin_freqs: Option<&Array>,
@@ -4098,6 +4236,7 @@ impl TransformerModel {
         registry: &KernelRegistry,
         queue: &metal::CommandQueue,
     ) -> Result<Array, KernelError> {
+        self.arena.reset();
         let embedding = self.embedding.as_ref().ok_or_else(|| {
             KernelError::InvalidShape("TransformerModel: embedding not loaded".into())
         })?;
@@ -4963,7 +5102,7 @@ mod tests {
             ff_type: FeedForwardType::Gated { intermediate_dim },
         };
 
-        let model =
+        let mut model =
             TransformerModel::from_parts(config, embed, vec![block], final_norm, lm_head).unwrap();
 
         let token_ids = [1u32, 2, 3];

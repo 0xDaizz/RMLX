@@ -15,6 +15,10 @@ use metal::Buffer as MTLBuffer;
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{FunctionConstantValue, KernelError, KernelRegistry};
+use crate::ops::buffer_slots::{
+    awq, awq_gidx, gather_qmm, gather_qmv, qmm_legacy, qmm_mma, qmm_nax, qmm_skinny,
+    qmm_splitk_reduce, qmm_steel, qmm_steel_splitk, qmm_tiny_reduce, qmv,
+};
 
 // ---------------------------------------------------------------------------
 // Deprecated GGML-format block structs (kept for backward compatibility)
@@ -1353,16 +1357,16 @@ pub fn affine_quantized_matmul(
     let cb = queue.new_command_buffer();
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(&qw.weights_buf), 0);
-    enc.set_buffer(1, Some(&qw.scales_buf), 0);
-    enc.set_buffer(2, Some(&qw.biases_buf), 0);
+    enc.set_buffer(qmv::WEIGHTS, Some(&qw.weights_buf), 0);
+    enc.set_buffer(qmv::SCALES, Some(&qw.scales_buf), 0);
+    enc.set_buffer(qmv::BIASES, Some(&qw.biases_buf), 0);
     enc.set_buffer(
-        3,
+        qmv::INPUT,
         Some(vec_for_kernel.metal_buffer()),
         vec_for_kernel.offset() as u64,
     );
-    enc.set_buffer(4, Some(out.metal_buffer()), 0);
-    enc.set_bytes(5, 16, params.as_ptr() as *const std::ffi::c_void);
+    enc.set_buffer(qmv::OUTPUT, Some(out.metal_buffer()), 0);
+    enc.set_bytes(qmv::PARAMS, 16, params.as_ptr() as *const std::ffi::c_void);
 
     // MLX qmv_fast layout: 2 simdgroups × 4 rows = 8 rows per threadgroup.
     // Threadgroup size = 2 × 32 = 64 threads.
@@ -1468,12 +1472,12 @@ pub fn affine_qmv_batched_q4(
     let cb = queue.new_command_buffer();
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(&qw.weights_buf), 0);
-    enc.set_buffer(1, Some(&qw.scales_buf), 0);
-    enc.set_buffer(2, Some(&qw.biases_buf), 0);
-    enc.set_buffer(3, Some(x.metal_buffer()), x.offset() as u64);
-    enc.set_buffer(4, Some(out.metal_buffer()), 0);
-    enc.set_bytes(5, 16, params.as_ptr() as *const std::ffi::c_void);
+    enc.set_buffer(qmv::WEIGHTS, Some(&qw.weights_buf), 0);
+    enc.set_buffer(qmv::SCALES, Some(&qw.scales_buf), 0);
+    enc.set_buffer(qmv::BIASES, Some(&qw.biases_buf), 0);
+    enc.set_buffer(qmv::INPUT, Some(x.metal_buffer()), x.offset() as u64);
+    enc.set_buffer(qmv::OUTPUT, Some(out.metal_buffer()), 0);
+    enc.set_bytes(qmv::PARAMS, 16, params.as_ptr() as *const std::ffi::c_void);
 
     // Grid: (M, ceil(N / 8), 1) — M batches × N-tile groups
     let rows_per_tg: u64 = 8; // NUM_SIMDGROUPS(2) * RESULTS_PER_SG(4)
@@ -1586,12 +1590,12 @@ pub fn affine_qmv_fast_f16_q4(
     let cb = queue.new_command_buffer();
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(&qw.weights_buf), 0);
-    enc.set_buffer(1, Some(&qw.scales_buf), 0);
-    enc.set_buffer(2, Some(&qw.biases_buf), 0);
-    enc.set_buffer(3, Some(vec.metal_buffer()), vec.offset() as u64);
-    enc.set_buffer(4, Some(out.metal_buffer()), 0);
-    enc.set_bytes(5, 16, params.as_ptr() as *const std::ffi::c_void);
+    enc.set_buffer(qmv::WEIGHTS, Some(&qw.weights_buf), 0);
+    enc.set_buffer(qmv::SCALES, Some(&qw.scales_buf), 0);
+    enc.set_buffer(qmv::BIASES, Some(&qw.biases_buf), 0);
+    enc.set_buffer(qmv::INPUT, Some(vec.metal_buffer()), vec.offset() as u64);
+    enc.set_buffer(qmv::OUTPUT, Some(out.metal_buffer()), 0);
+    enc.set_bytes(qmv::PARAMS, 16, params.as_ptr() as *const std::ffi::c_void);
 
     let rows_per_tg: u64 = 8;
     let num_tgs_y = (qw.out_features as u64).div_ceil(rows_per_tg);
@@ -1685,12 +1689,12 @@ pub fn affine_qmv_batched_f16_q4(
     let cb = queue.new_command_buffer();
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(&qw.weights_buf), 0);
-    enc.set_buffer(1, Some(&qw.scales_buf), 0);
-    enc.set_buffer(2, Some(&qw.biases_buf), 0);
-    enc.set_buffer(3, Some(x.metal_buffer()), x.offset() as u64);
-    enc.set_buffer(4, Some(out.metal_buffer()), 0);
-    enc.set_bytes(5, 16, params.as_ptr() as *const std::ffi::c_void);
+    enc.set_buffer(qmv::WEIGHTS, Some(&qw.weights_buf), 0);
+    enc.set_buffer(qmv::SCALES, Some(&qw.scales_buf), 0);
+    enc.set_buffer(qmv::BIASES, Some(&qw.biases_buf), 0);
+    enc.set_buffer(qmv::INPUT, Some(x.metal_buffer()), x.offset() as u64);
+    enc.set_buffer(qmv::OUTPUT, Some(out.metal_buffer()), 0);
+    enc.set_bytes(qmv::PARAMS, 16, params.as_ptr() as *const std::ffi::c_void);
 
     let rows_per_tg: u64 = 8;
     let num_tgs_y = (n as u64).div_ceil(rows_per_tg);
@@ -1811,13 +1815,17 @@ pub fn affine_qmv_batched_splitk_f16_q4(
     // Encode split-K kernel
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&splitk_pipeline);
-    enc.set_buffer(0, Some(&qw.weights_buf), 0);
-    enc.set_buffer(1, Some(&qw.scales_buf), 0);
-    enc.set_buffer(2, Some(&qw.biases_buf), 0);
-    enc.set_buffer(3, Some(x.metal_buffer()), x.offset() as u64);
-    enc.set_buffer(4, Some(&c_split_buf), 0);
-    enc.set_bytes(5, 16, params.as_ptr() as *const std::ffi::c_void);
-    enc.set_bytes(6, 8, splitk_p.as_ptr() as *const std::ffi::c_void);
+    enc.set_buffer(qmv::WEIGHTS, Some(&qw.weights_buf), 0);
+    enc.set_buffer(qmv::SCALES, Some(&qw.scales_buf), 0);
+    enc.set_buffer(qmv::BIASES, Some(&qw.biases_buf), 0);
+    enc.set_buffer(qmv::INPUT, Some(x.metal_buffer()), x.offset() as u64);
+    enc.set_buffer(qmv::OUTPUT, Some(&c_split_buf), 0);
+    enc.set_bytes(qmv::PARAMS, 16, params.as_ptr() as *const std::ffi::c_void);
+    enc.set_bytes(
+        qmv::SPLITK_PARAMS,
+        8,
+        splitk_p.as_ptr() as *const std::ffi::c_void,
+    );
 
     let rows_per_tg: u64 = 8;
     let num_tgs_y = (n as u64).div_ceil(rows_per_tg);
@@ -1839,9 +1847,13 @@ pub fn affine_qmv_batched_splitk_f16_q4(
 
     let enc2 = cb.new_compute_command_encoder();
     enc2.set_compute_pipeline_state(&reduce_pipeline);
-    enc2.set_buffer(0, Some(&c_split_buf), 0);
-    enc2.set_buffer(1, Some(out.metal_buffer()), 0);
-    enc2.set_bytes(2, 12, acc_params.as_ptr() as *const std::ffi::c_void);
+    enc2.set_buffer(qmm_splitk_reduce::PARTIAL, Some(&c_split_buf), 0);
+    enc2.set_buffer(qmm_splitk_reduce::OUT, Some(out.metal_buffer()), 0);
+    enc2.set_bytes(
+        qmm_splitk_reduce::PARAMS,
+        12,
+        acc_params.as_ptr() as *const std::ffi::c_void,
+    );
 
     enc2.dispatch_threads(
         metal::MTLSize::new(n as u64, m as u64, 1),
@@ -1939,13 +1951,17 @@ pub fn affine_qmv_splitk_f16_q4(
     // Encode split-K kernel
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&splitk_pipeline);
-    enc.set_buffer(0, Some(&qw.weights_buf), 0);
-    enc.set_buffer(1, Some(&qw.scales_buf), 0);
-    enc.set_buffer(2, Some(&qw.biases_buf), 0);
-    enc.set_buffer(3, Some(vec.metal_buffer()), vec.offset() as u64);
-    enc.set_buffer(4, Some(&c_split_buf), 0);
-    enc.set_bytes(5, 16, params.as_ptr() as *const std::ffi::c_void);
-    enc.set_bytes(6, 8, splitk_p.as_ptr() as *const std::ffi::c_void);
+    enc.set_buffer(qmv::WEIGHTS, Some(&qw.weights_buf), 0);
+    enc.set_buffer(qmv::SCALES, Some(&qw.scales_buf), 0);
+    enc.set_buffer(qmv::BIASES, Some(&qw.biases_buf), 0);
+    enc.set_buffer(qmv::INPUT, Some(vec.metal_buffer()), vec.offset() as u64);
+    enc.set_buffer(qmv::OUTPUT, Some(&c_split_buf), 0);
+    enc.set_bytes(qmv::PARAMS, 16, params.as_ptr() as *const std::ffi::c_void);
+    enc.set_bytes(
+        qmv::SPLITK_PARAMS,
+        8,
+        splitk_p.as_ptr() as *const std::ffi::c_void,
+    );
 
     let rows_per_tg: u64 = 8;
     let num_tgs_y = (n as u64).div_ceil(rows_per_tg);
@@ -1968,9 +1984,13 @@ pub fn affine_qmv_splitk_f16_q4(
 
     let enc2 = cb.new_compute_command_encoder();
     enc2.set_compute_pipeline_state(&reduce_pipeline);
-    enc2.set_buffer(0, Some(&c_split_buf), 0);
-    enc2.set_buffer(1, Some(out.metal_buffer()), 0);
-    enc2.set_bytes(2, 12, acc_params.as_ptr() as *const std::ffi::c_void);
+    enc2.set_buffer(qmm_splitk_reduce::PARTIAL, Some(&c_split_buf), 0);
+    enc2.set_buffer(qmm_splitk_reduce::OUT, Some(out.metal_buffer()), 0);
+    enc2.set_bytes(
+        qmm_splitk_reduce::PARAMS,
+        12,
+        acc_params.as_ptr() as *const std::ffi::c_void,
+    );
 
     // dispatch_threads for 1-D reduce: N threads, M=1 so gid.y=0
     enc2.dispatch_threads(
@@ -2052,13 +2072,17 @@ pub fn affine_qmv_splitk_f16_q4_into_cb(
     // Encode split-K kernel
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&splitk_pipeline);
-    enc.set_buffer(0, Some(&qw.weights_buf), 0);
-    enc.set_buffer(1, Some(&qw.scales_buf), 0);
-    enc.set_buffer(2, Some(&qw.biases_buf), 0);
-    enc.set_buffer(3, Some(vec.metal_buffer()), vec.offset() as u64);
-    enc.set_buffer(4, Some(&c_split_buf), 0);
-    enc.set_bytes(5, 16, params.as_ptr() as *const std::ffi::c_void);
-    enc.set_bytes(6, 8, splitk_p.as_ptr() as *const std::ffi::c_void);
+    enc.set_buffer(qmv::WEIGHTS, Some(&qw.weights_buf), 0);
+    enc.set_buffer(qmv::SCALES, Some(&qw.scales_buf), 0);
+    enc.set_buffer(qmv::BIASES, Some(&qw.biases_buf), 0);
+    enc.set_buffer(qmv::INPUT, Some(vec.metal_buffer()), vec.offset() as u64);
+    enc.set_buffer(qmv::OUTPUT, Some(&c_split_buf), 0);
+    enc.set_bytes(qmv::PARAMS, 16, params.as_ptr() as *const std::ffi::c_void);
+    enc.set_bytes(
+        qmv::SPLITK_PARAMS,
+        8,
+        splitk_p.as_ptr() as *const std::ffi::c_void,
+    );
 
     let rows_per_tg: u64 = 8;
     let num_tgs_y = (n as u64).div_ceil(rows_per_tg);
@@ -2080,9 +2104,13 @@ pub fn affine_qmv_splitk_f16_q4_into_cb(
 
     let enc2 = cb.new_compute_command_encoder();
     enc2.set_compute_pipeline_state(&reduce_pipeline);
-    enc2.set_buffer(0, Some(&c_split_buf), 0);
-    enc2.set_buffer(1, Some(out.metal_buffer()), 0);
-    enc2.set_bytes(2, 12, acc_params.as_ptr() as *const std::ffi::c_void);
+    enc2.set_buffer(qmm_splitk_reduce::PARTIAL, Some(&c_split_buf), 0);
+    enc2.set_buffer(qmm_splitk_reduce::OUT, Some(out.metal_buffer()), 0);
+    enc2.set_bytes(
+        qmm_splitk_reduce::PARAMS,
+        12,
+        acc_params.as_ptr() as *const std::ffi::c_void,
+    );
 
     enc2.dispatch_threads(
         metal::MTLSize::new(n as u64, 1, 1),
@@ -2184,11 +2212,23 @@ pub fn awq_dequant(
     let cb = queue.new_command_buffer();
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(qweight.metal_buffer()), qweight.offset() as u64);
-    enc.set_buffer(1, Some(qzeros.metal_buffer()), qzeros.offset() as u64);
-    enc.set_buffer(2, Some(scales.metal_buffer()), scales.offset() as u64);
-    enc.set_buffer(3, Some(out.metal_buffer()), 0);
-    enc.set_bytes(4, 16, params.as_ptr() as *const std::ffi::c_void);
+    enc.set_buffer(
+        awq::QWEIGHT,
+        Some(qweight.metal_buffer()),
+        qweight.offset() as u64,
+    );
+    enc.set_buffer(
+        awq::QZEROS,
+        Some(qzeros.metal_buffer()),
+        qzeros.offset() as u64,
+    );
+    enc.set_buffer(
+        awq::SCALES,
+        Some(scales.metal_buffer()),
+        scales.offset() as u64,
+    );
+    enc.set_buffer(awq::OUT, Some(out.metal_buffer()), 0);
+    enc.set_bytes(awq::PARAMS, 16, params.as_ptr() as *const std::ffi::c_void);
 
     // 2D grid: (cols, rows, 1) — each thread handles one output element.
     let max_tg = pipeline.max_total_threads_per_threadgroup();
@@ -2346,12 +2386,28 @@ pub fn gptq_dequant(
     let cb = queue.new_command_buffer();
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(qweight.metal_buffer()), qweight.offset() as u64);
-    enc.set_buffer(1, Some(qzeros.metal_buffer()), qzeros.offset() as u64);
-    enc.set_buffer(2, Some(scales.metal_buffer()), scales.offset() as u64);
-    enc.set_buffer(3, Some(g_idx_buf), g_idx_offset);
-    enc.set_buffer(4, Some(out.metal_buffer()), 0);
-    enc.set_bytes(5, 16, params.as_ptr() as *const std::ffi::c_void);
+    enc.set_buffer(
+        awq_gidx::QWEIGHT,
+        Some(qweight.metal_buffer()),
+        qweight.offset() as u64,
+    );
+    enc.set_buffer(
+        awq_gidx::QZEROS,
+        Some(qzeros.metal_buffer()),
+        qzeros.offset() as u64,
+    );
+    enc.set_buffer(
+        awq_gidx::SCALES,
+        Some(scales.metal_buffer()),
+        scales.offset() as u64,
+    );
+    enc.set_buffer(awq_gidx::G_IDX, Some(g_idx_buf), g_idx_offset);
+    enc.set_buffer(awq_gidx::OUT, Some(out.metal_buffer()), 0);
+    enc.set_bytes(
+        awq_gidx::PARAMS,
+        16,
+        params.as_ptr() as *const std::ffi::c_void,
+    );
 
     // 2D grid: (out_features, in_features, 1) — each thread handles one output element.
     let max_tg = pipeline.max_total_threads_per_threadgroup();
@@ -6408,14 +6464,26 @@ pub fn affine_qmm_steel_splitk_q4(
         let cb = queue.new_command_buffer();
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&pipeline);
-        enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
-        enc.set_buffer(1, Some(&qw.weights_buf), 0);
-        enc.set_buffer(2, Some(&qw.scales_buf), 0);
-        enc.set_buffer(3, Some(&qw.biases_buf), 0);
-        enc.set_buffer(4, Some(&dummy_buf), 0);
-        enc.set_buffer(5, Some(out.metal_buffer()), 0);
-        enc.set_bytes(6, 12, params.as_ptr() as *const std::ffi::c_void);
-        enc.set_bytes(7, 8, split_params.as_ptr() as *const std::ffi::c_void);
+        enc.set_buffer(
+            qmm_steel_splitk::X,
+            Some(x.metal_buffer()),
+            x.offset() as u64,
+        );
+        enc.set_buffer(qmm_steel_splitk::WEIGHTS, Some(&qw.weights_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::SCALES, Some(&qw.scales_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::BIASES, Some(&qw.biases_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::PARTIAL, Some(&dummy_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::OUT, Some(out.metal_buffer()), 0);
+        enc.set_bytes(
+            qmm_steel_splitk::PARAMS,
+            12,
+            params.as_ptr() as *const std::ffi::c_void,
+        );
+        enc.set_bytes(
+            qmm_steel_splitk::SPLIT_PARAMS,
+            8,
+            split_params.as_ptr() as *const std::ffi::c_void,
+        );
 
         let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
         let tg = metal::MTLSize::new(64, 1, 1);
@@ -6435,14 +6503,26 @@ pub fn affine_qmm_steel_splitk_q4(
         // Phase 1: Split-K partial GEMM
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&pipeline);
-        enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
-        enc.set_buffer(1, Some(&qw.weights_buf), 0);
-        enc.set_buffer(2, Some(&qw.scales_buf), 0);
-        enc.set_buffer(3, Some(&qw.biases_buf), 0);
-        enc.set_buffer(4, Some(&c_split_buf), 0);
-        enc.set_buffer(5, Some(out.metal_buffer()), 0);
-        enc.set_bytes(6, 12, params.as_ptr() as *const std::ffi::c_void);
-        enc.set_bytes(7, 8, split_params.as_ptr() as *const std::ffi::c_void);
+        enc.set_buffer(
+            qmm_steel_splitk::X,
+            Some(x.metal_buffer()),
+            x.offset() as u64,
+        );
+        enc.set_buffer(qmm_steel_splitk::WEIGHTS, Some(&qw.weights_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::SCALES, Some(&qw.scales_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::BIASES, Some(&qw.biases_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::PARTIAL, Some(&c_split_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::OUT, Some(out.metal_buffer()), 0);
+        enc.set_bytes(
+            qmm_steel_splitk::PARAMS,
+            12,
+            params.as_ptr() as *const std::ffi::c_void,
+        );
+        enc.set_bytes(
+            qmm_steel_splitk::SPLIT_PARAMS,
+            8,
+            split_params.as_ptr() as *const std::ffi::c_void,
+        );
 
         let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, k_partitions as u64);
         let tg = metal::MTLSize::new(64, 1, 1);
@@ -6461,9 +6541,13 @@ pub fn affine_qmm_steel_splitk_q4(
 
         let enc2 = cb.new_compute_command_encoder();
         enc2.set_compute_pipeline_state(&reduce_pipeline);
-        enc2.set_buffer(0, Some(&c_split_buf), 0);
-        enc2.set_buffer(1, Some(out.metal_buffer()), 0);
-        enc2.set_bytes(2, 12, reduce_params.as_ptr() as *const std::ffi::c_void);
+        enc2.set_buffer(qmm_splitk_reduce::PARTIAL, Some(&c_split_buf), 0);
+        enc2.set_buffer(qmm_splitk_reduce::OUT, Some(out.metal_buffer()), 0);
+        enc2.set_bytes(
+            qmm_splitk_reduce::PARAMS,
+            12,
+            reduce_params.as_ptr() as *const std::ffi::c_void,
+        );
 
         let reduce_grid = metal::MTLSize::new(n as u64, m as u64, 1);
         let reduce_tg = metal::MTLSize::new(n.min(256) as u64, 1, 1);
@@ -6543,14 +6627,26 @@ pub fn affine_qmm_steel_splitk_q4_into_cb(
 
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&pipeline);
-        enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
-        enc.set_buffer(1, Some(&qw.weights_buf), 0);
-        enc.set_buffer(2, Some(&qw.scales_buf), 0);
-        enc.set_buffer(3, Some(&qw.biases_buf), 0);
-        enc.set_buffer(4, Some(&dummy_buf), 0);
-        enc.set_buffer(5, Some(out.metal_buffer()), 0);
-        enc.set_bytes(6, 12, params.as_ptr() as *const std::ffi::c_void);
-        enc.set_bytes(7, 8, split_params.as_ptr() as *const std::ffi::c_void);
+        enc.set_buffer(
+            qmm_steel_splitk::X,
+            Some(x.metal_buffer()),
+            x.offset() as u64,
+        );
+        enc.set_buffer(qmm_steel_splitk::WEIGHTS, Some(&qw.weights_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::SCALES, Some(&qw.scales_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::BIASES, Some(&qw.biases_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::PARTIAL, Some(&dummy_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::OUT, Some(out.metal_buffer()), 0);
+        enc.set_bytes(
+            qmm_steel_splitk::PARAMS,
+            12,
+            params.as_ptr() as *const std::ffi::c_void,
+        );
+        enc.set_bytes(
+            qmm_steel_splitk::SPLIT_PARAMS,
+            8,
+            split_params.as_ptr() as *const std::ffi::c_void,
+        );
 
         let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
         let tg = metal::MTLSize::new(64, 1, 1);
@@ -6565,14 +6661,26 @@ pub fn affine_qmm_steel_splitk_q4_into_cb(
 
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&pipeline);
-        enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
-        enc.set_buffer(1, Some(&qw.weights_buf), 0);
-        enc.set_buffer(2, Some(&qw.scales_buf), 0);
-        enc.set_buffer(3, Some(&qw.biases_buf), 0);
-        enc.set_buffer(4, Some(&c_split_buf), 0);
-        enc.set_buffer(5, Some(out.metal_buffer()), 0);
-        enc.set_bytes(6, 12, params.as_ptr() as *const std::ffi::c_void);
-        enc.set_bytes(7, 8, split_params.as_ptr() as *const std::ffi::c_void);
+        enc.set_buffer(
+            qmm_steel_splitk::X,
+            Some(x.metal_buffer()),
+            x.offset() as u64,
+        );
+        enc.set_buffer(qmm_steel_splitk::WEIGHTS, Some(&qw.weights_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::SCALES, Some(&qw.scales_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::BIASES, Some(&qw.biases_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::PARTIAL, Some(&c_split_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::OUT, Some(out.metal_buffer()), 0);
+        enc.set_bytes(
+            qmm_steel_splitk::PARAMS,
+            12,
+            params.as_ptr() as *const std::ffi::c_void,
+        );
+        enc.set_bytes(
+            qmm_steel_splitk::SPLIT_PARAMS,
+            8,
+            split_params.as_ptr() as *const std::ffi::c_void,
+        );
 
         let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, k_partitions as u64);
         let tg = metal::MTLSize::new(64, 1, 1);
@@ -6590,9 +6698,13 @@ pub fn affine_qmm_steel_splitk_q4_into_cb(
 
         let enc2 = cb.new_compute_command_encoder();
         enc2.set_compute_pipeline_state(&reduce_pipeline);
-        enc2.set_buffer(0, Some(&c_split_buf), 0);
-        enc2.set_buffer(1, Some(out.metal_buffer()), 0);
-        enc2.set_bytes(2, 12, reduce_params.as_ptr() as *const std::ffi::c_void);
+        enc2.set_buffer(qmm_splitk_reduce::PARTIAL, Some(&c_split_buf), 0);
+        enc2.set_buffer(qmm_splitk_reduce::OUT, Some(out.metal_buffer()), 0);
+        enc2.set_bytes(
+            qmm_splitk_reduce::PARAMS,
+            12,
+            reduce_params.as_ptr() as *const std::ffi::c_void,
+        );
 
         let reduce_grid = metal::MTLSize::new(n as u64, m as u64, 1);
         let reduce_tg = metal::MTLSize::new(n.min(256) as u64, 1, 1);
@@ -6673,14 +6785,26 @@ pub fn affine_qmm_steel4sg_splitk_q4_into_cb(
 
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&pipeline);
-        enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
-        enc.set_buffer(1, Some(&qw.weights_buf), 0);
-        enc.set_buffer(2, Some(&qw.scales_buf), 0);
-        enc.set_buffer(3, Some(&qw.biases_buf), 0);
-        enc.set_buffer(4, Some(&dummy_buf), 0);
-        enc.set_buffer(5, Some(out.metal_buffer()), 0);
-        enc.set_bytes(6, 12, params.as_ptr() as *const std::ffi::c_void);
-        enc.set_bytes(7, 8, split_params.as_ptr() as *const std::ffi::c_void);
+        enc.set_buffer(
+            qmm_steel_splitk::X,
+            Some(x.metal_buffer()),
+            x.offset() as u64,
+        );
+        enc.set_buffer(qmm_steel_splitk::WEIGHTS, Some(&qw.weights_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::SCALES, Some(&qw.scales_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::BIASES, Some(&qw.biases_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::PARTIAL, Some(&dummy_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::OUT, Some(out.metal_buffer()), 0);
+        enc.set_bytes(
+            qmm_steel_splitk::PARAMS,
+            12,
+            params.as_ptr() as *const std::ffi::c_void,
+        );
+        enc.set_bytes(
+            qmm_steel_splitk::SPLIT_PARAMS,
+            8,
+            split_params.as_ptr() as *const std::ffi::c_void,
+        );
 
         let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
         let tg = metal::MTLSize::new(128, 1, 1);
@@ -6695,14 +6819,26 @@ pub fn affine_qmm_steel4sg_splitk_q4_into_cb(
 
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&pipeline);
-        enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
-        enc.set_buffer(1, Some(&qw.weights_buf), 0);
-        enc.set_buffer(2, Some(&qw.scales_buf), 0);
-        enc.set_buffer(3, Some(&qw.biases_buf), 0);
-        enc.set_buffer(4, Some(&c_split_buf), 0);
-        enc.set_buffer(5, Some(out.metal_buffer()), 0);
-        enc.set_bytes(6, 12, params.as_ptr() as *const std::ffi::c_void);
-        enc.set_bytes(7, 8, split_params.as_ptr() as *const std::ffi::c_void);
+        enc.set_buffer(
+            qmm_steel_splitk::X,
+            Some(x.metal_buffer()),
+            x.offset() as u64,
+        );
+        enc.set_buffer(qmm_steel_splitk::WEIGHTS, Some(&qw.weights_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::SCALES, Some(&qw.scales_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::BIASES, Some(&qw.biases_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::PARTIAL, Some(&c_split_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::OUT, Some(out.metal_buffer()), 0);
+        enc.set_bytes(
+            qmm_steel_splitk::PARAMS,
+            12,
+            params.as_ptr() as *const std::ffi::c_void,
+        );
+        enc.set_bytes(
+            qmm_steel_splitk::SPLIT_PARAMS,
+            8,
+            split_params.as_ptr() as *const std::ffi::c_void,
+        );
 
         let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, k_partitions as u64);
         let tg = metal::MTLSize::new(128, 1, 1);
@@ -6720,9 +6856,13 @@ pub fn affine_qmm_steel4sg_splitk_q4_into_cb(
 
         let enc2 = cb.new_compute_command_encoder();
         enc2.set_compute_pipeline_state(&reduce_pipeline);
-        enc2.set_buffer(0, Some(&c_split_buf), 0);
-        enc2.set_buffer(1, Some(out.metal_buffer()), 0);
-        enc2.set_bytes(2, 12, reduce_params.as_ptr() as *const std::ffi::c_void);
+        enc2.set_buffer(qmm_splitk_reduce::PARTIAL, Some(&c_split_buf), 0);
+        enc2.set_buffer(qmm_splitk_reduce::OUT, Some(out.metal_buffer()), 0);
+        enc2.set_bytes(
+            qmm_splitk_reduce::PARAMS,
+            12,
+            reduce_params.as_ptr() as *const std::ffi::c_void,
+        );
 
         let reduce_grid = metal::MTLSize::new(n as u64, m as u64, 1);
         let reduce_tg = metal::MTLSize::new(n.min(256) as u64, 1, 1);
@@ -6943,15 +7083,31 @@ pub fn affine_quantized_matmul_batched(
                 let cb = queue.new_command_buffer();
                 let enc = cb.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(&pipeline);
-                enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
-                enc.set_buffer(1, Some(&qw.weights_buf), 0);
-                enc.set_buffer(2, Some(&qw.scales_buf), 0);
-                enc.set_buffer(3, Some(&qw.biases_buf), 0);
-                enc.set_buffer(4, Some(out.metal_buffer()), 0);
-                enc.set_bytes(5, 4, &m_u32 as *const u32 as *const std::ffi::c_void);
-                enc.set_bytes(6, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
-                enc.set_bytes(7, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
-                enc.set_bytes(8, 4, &kp_u32 as *const u32 as *const std::ffi::c_void);
+                enc.set_buffer(qmm_mma::X, Some(x.metal_buffer()), x.offset() as u64);
+                enc.set_buffer(qmm_mma::WEIGHTS, Some(&qw.weights_buf), 0);
+                enc.set_buffer(qmm_mma::SCALES, Some(&qw.scales_buf), 0);
+                enc.set_buffer(qmm_mma::BIASES, Some(&qw.biases_buf), 0);
+                enc.set_buffer(qmm_mma::OUT, Some(out.metal_buffer()), 0);
+                enc.set_bytes(
+                    qmm_mma::M,
+                    4,
+                    &m_u32 as *const u32 as *const std::ffi::c_void,
+                );
+                enc.set_bytes(
+                    qmm_mma::N,
+                    4,
+                    &n_u32 as *const u32 as *const std::ffi::c_void,
+                );
+                enc.set_bytes(
+                    qmm_mma::K,
+                    4,
+                    &k_u32 as *const u32 as *const std::ffi::c_void,
+                );
+                enc.set_bytes(
+                    qmm_mma::SWIZZLE_LOG,
+                    4,
+                    &kp_u32 as *const u32 as *const std::ffi::c_void,
+                );
 
                 let grid = metal::MTLSize::new(tn_tiles as u64, tm_tiles as u64, 1);
                 let tg = metal::MTLSize::new(64, 1, 1);
@@ -6973,15 +7129,31 @@ pub fn affine_quantized_matmul_batched(
                 // Phase 1: Split-K partial GEMM
                 let enc = cb.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(&pipeline);
-                enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
-                enc.set_buffer(1, Some(&qw.weights_buf), 0);
-                enc.set_buffer(2, Some(&qw.scales_buf), 0);
-                enc.set_buffer(3, Some(&qw.biases_buf), 0);
-                enc.set_buffer(4, Some(&c_split_buf), 0);
-                enc.set_bytes(5, 4, &m_u32 as *const u32 as *const std::ffi::c_void);
-                enc.set_bytes(6, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
-                enc.set_bytes(7, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
-                enc.set_bytes(8, 4, &kp_u32 as *const u32 as *const std::ffi::c_void);
+                enc.set_buffer(qmm_mma::X, Some(x.metal_buffer()), x.offset() as u64);
+                enc.set_buffer(qmm_mma::WEIGHTS, Some(&qw.weights_buf), 0);
+                enc.set_buffer(qmm_mma::SCALES, Some(&qw.scales_buf), 0);
+                enc.set_buffer(qmm_mma::BIASES, Some(&qw.biases_buf), 0);
+                enc.set_buffer(qmm_mma::OUT, Some(&c_split_buf), 0);
+                enc.set_bytes(
+                    qmm_mma::M,
+                    4,
+                    &m_u32 as *const u32 as *const std::ffi::c_void,
+                );
+                enc.set_bytes(
+                    qmm_mma::N,
+                    4,
+                    &n_u32 as *const u32 as *const std::ffi::c_void,
+                );
+                enc.set_bytes(
+                    qmm_mma::K,
+                    4,
+                    &k_u32 as *const u32 as *const std::ffi::c_void,
+                );
+                enc.set_bytes(
+                    qmm_mma::SWIZZLE_LOG,
+                    4,
+                    &kp_u32 as *const u32 as *const std::ffi::c_void,
+                );
 
                 let grid =
                     metal::MTLSize::new(tn_tiles as u64, tm_tiles as u64, k_partitions as u64);
@@ -6996,11 +7168,23 @@ pub fn affine_quantized_matmul_batched(
 
                 let enc2 = cb.new_compute_command_encoder();
                 enc2.set_compute_pipeline_state(&reduce_pipeline);
-                enc2.set_buffer(0, Some(&c_split_buf), 0);
-                enc2.set_buffer(1, Some(out.metal_buffer()), 0);
-                enc2.set_bytes(2, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
-                enc2.set_bytes(3, 4, &kp_u32 as *const u32 as *const std::ffi::c_void);
-                enc2.set_bytes(4, 4, &mn_total_u32 as *const u32 as *const std::ffi::c_void);
+                enc2.set_buffer(qmm_tiny_reduce::PARTIAL, Some(&c_split_buf), 0);
+                enc2.set_buffer(qmm_tiny_reduce::OUT, Some(out.metal_buffer()), 0);
+                enc2.set_bytes(
+                    qmm_tiny_reduce::N,
+                    4,
+                    &n_u32 as *const u32 as *const std::ffi::c_void,
+                );
+                enc2.set_bytes(
+                    qmm_tiny_reduce::K_PARTITIONS,
+                    4,
+                    &kp_u32 as *const u32 as *const std::ffi::c_void,
+                );
+                enc2.set_bytes(
+                    qmm_tiny_reduce::MN_TOTAL,
+                    4,
+                    &mn_total_u32 as *const u32 as *const std::ffi::c_void,
+                );
 
                 let reduce_grid = metal::MTLSize::new(partition_stride as u64, 1, 1);
                 let reduce_tg = metal::MTLSize::new(partition_stride.min(256) as u64, 1, 1);
@@ -7064,17 +7248,33 @@ pub fn affine_quantized_matmul_batched(
                     let cb = queue.new_command_buffer();
                     let enc = cb.new_compute_command_encoder();
                     enc.set_compute_pipeline_state(&pipeline);
-                    enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
-                    enc.set_buffer(1, Some(&qw.weights_buf), 0);
-                    enc.set_buffer(2, Some(&qw.scales_buf), 0);
-                    enc.set_buffer(3, Some(&qw.biases_buf), 0);
-                    enc.set_buffer(4, Some(out.metal_buffer()), 0);
-                    enc.set_bytes(5, 4, &m_u32 as *const u32 as *const std::ffi::c_void);
-                    enc.set_bytes(6, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
-                    enc.set_bytes(7, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
-                    enc.set_bytes(8, 4, &kp_u32 as *const u32 as *const std::ffi::c_void);
+                    enc.set_buffer(qmm_skinny::X, Some(x.metal_buffer()), x.offset() as u64);
+                    enc.set_buffer(qmm_skinny::WEIGHTS, Some(&qw.weights_buf), 0);
+                    enc.set_buffer(qmm_skinny::SCALES, Some(&qw.scales_buf), 0);
+                    enc.set_buffer(qmm_skinny::BIASES, Some(&qw.biases_buf), 0);
+                    enc.set_buffer(qmm_skinny::OUT, Some(out.metal_buffer()), 0);
+                    enc.set_bytes(
+                        qmm_skinny::M,
+                        4,
+                        &m_u32 as *const u32 as *const std::ffi::c_void,
+                    );
+                    enc.set_bytes(
+                        qmm_skinny::N,
+                        4,
+                        &n_u32 as *const u32 as *const std::ffi::c_void,
+                    );
+                    enc.set_bytes(
+                        qmm_skinny::K,
+                        4,
+                        &k_u32 as *const u32 as *const std::ffi::c_void,
+                    );
+                    enc.set_bytes(
+                        qmm_skinny::K_PARTITIONS,
+                        4,
+                        &kp_u32 as *const u32 as *const std::ffi::c_void,
+                    );
                     // f16 kernel has buffer(9) for c_split (unused when k_partitions==1)
-                    enc.set_buffer(9, Some(&dummy_buf), 0);
+                    enc.set_buffer(qmm_skinny::PARTIAL, Some(&dummy_buf), 0);
 
                     let grid = metal::MTLSize::new(sn_tiles as u64, sm_tiles as u64, 1);
                     let tg = metal::MTLSize::new(64, 1, 1);
@@ -7096,17 +7296,33 @@ pub fn affine_quantized_matmul_batched(
                     // f16 skinny: writes float partials to c_split via buffer(9)
                     let enc = cb.new_compute_command_encoder();
                     enc.set_compute_pipeline_state(&pipeline);
-                    enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
-                    enc.set_buffer(1, Some(&qw.weights_buf), 0);
-                    enc.set_buffer(2, Some(&qw.scales_buf), 0);
-                    enc.set_buffer(3, Some(&qw.biases_buf), 0);
+                    enc.set_buffer(qmm_skinny::X, Some(x.metal_buffer()), x.offset() as u64);
+                    enc.set_buffer(qmm_skinny::WEIGHTS, Some(&qw.weights_buf), 0);
+                    enc.set_buffer(qmm_skinny::SCALES, Some(&qw.scales_buf), 0);
+                    enc.set_buffer(qmm_skinny::BIASES, Some(&qw.biases_buf), 0);
                     // buffer(4) = output (unused for split-K, but must be bound)
-                    enc.set_buffer(4, Some(out.metal_buffer()), 0);
-                    enc.set_bytes(5, 4, &m_u32 as *const u32 as *const std::ffi::c_void);
-                    enc.set_bytes(6, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
-                    enc.set_bytes(7, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
-                    enc.set_bytes(8, 4, &kp_u32 as *const u32 as *const std::ffi::c_void);
-                    enc.set_buffer(9, Some(&c_split_buf), 0);
+                    enc.set_buffer(qmm_skinny::OUT, Some(out.metal_buffer()), 0);
+                    enc.set_bytes(
+                        qmm_skinny::M,
+                        4,
+                        &m_u32 as *const u32 as *const std::ffi::c_void,
+                    );
+                    enc.set_bytes(
+                        qmm_skinny::N,
+                        4,
+                        &n_u32 as *const u32 as *const std::ffi::c_void,
+                    );
+                    enc.set_bytes(
+                        qmm_skinny::K,
+                        4,
+                        &k_u32 as *const u32 as *const std::ffi::c_void,
+                    );
+                    enc.set_bytes(
+                        qmm_skinny::K_PARTITIONS,
+                        4,
+                        &kp_u32 as *const u32 as *const std::ffi::c_void,
+                    );
+                    enc.set_buffer(qmm_skinny::PARTIAL, Some(&c_split_buf), 0);
 
                     let grid =
                         metal::MTLSize::new(sn_tiles as u64, sm_tiles as u64, k_partitions as u64);
@@ -7124,11 +7340,23 @@ pub fn affine_quantized_matmul_batched(
 
                     let enc2 = cb.new_compute_command_encoder();
                     enc2.set_compute_pipeline_state(&reduce_pipeline);
-                    enc2.set_buffer(0, Some(&c_split_buf), 0);
-                    enc2.set_buffer(1, Some(out.metal_buffer()), 0);
-                    enc2.set_bytes(2, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
-                    enc2.set_bytes(3, 4, &kp_u32 as *const u32 as *const std::ffi::c_void);
-                    enc2.set_bytes(4, 4, &mn_total_u32 as *const u32 as *const std::ffi::c_void);
+                    enc2.set_buffer(qmm_tiny_reduce::PARTIAL, Some(&c_split_buf), 0);
+                    enc2.set_buffer(qmm_tiny_reduce::OUT, Some(out.metal_buffer()), 0);
+                    enc2.set_bytes(
+                        qmm_tiny_reduce::N,
+                        4,
+                        &n_u32 as *const u32 as *const std::ffi::c_void,
+                    );
+                    enc2.set_bytes(
+                        qmm_tiny_reduce::K_PARTITIONS,
+                        4,
+                        &kp_u32 as *const u32 as *const std::ffi::c_void,
+                    );
+                    enc2.set_bytes(
+                        qmm_tiny_reduce::MN_TOTAL,
+                        4,
+                        &mn_total_u32 as *const u32 as *const std::ffi::c_void,
+                    );
 
                     let reduce_grid = metal::MTLSize::new(partition_stride as u64, 1, 1);
                     let reduce_tg = metal::MTLSize::new(partition_stride.min(256) as u64, 1, 1);
@@ -7168,15 +7396,31 @@ pub fn affine_quantized_matmul_batched(
             let cb = queue.new_command_buffer();
             let enc = cb.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&pipeline);
-            enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
-            enc.set_buffer(1, Some(&qw.weights_buf), 0);
-            enc.set_buffer(2, Some(&qw.scales_buf), 0);
-            enc.set_buffer(3, Some(&qw.biases_buf), 0);
-            enc.set_buffer(4, Some(out.metal_buffer()), 0);
-            enc.set_bytes(5, 4, &m_u32 as *const u32 as *const std::ffi::c_void);
-            enc.set_bytes(6, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
-            enc.set_bytes(7, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
-            enc.set_bytes(8, 4, &swizzle_log as *const u32 as *const std::ffi::c_void);
+            enc.set_buffer(qmm_mma::X, Some(x.metal_buffer()), x.offset() as u64);
+            enc.set_buffer(qmm_mma::WEIGHTS, Some(&qw.weights_buf), 0);
+            enc.set_buffer(qmm_mma::SCALES, Some(&qw.scales_buf), 0);
+            enc.set_buffer(qmm_mma::BIASES, Some(&qw.biases_buf), 0);
+            enc.set_buffer(qmm_mma::OUT, Some(out.metal_buffer()), 0);
+            enc.set_bytes(
+                qmm_mma::M,
+                4,
+                &m_u32 as *const u32 as *const std::ffi::c_void,
+            );
+            enc.set_bytes(
+                qmm_mma::N,
+                4,
+                &n_u32 as *const u32 as *const std::ffi::c_void,
+            );
+            enc.set_bytes(
+                qmm_mma::K,
+                4,
+                &k_u32 as *const u32 as *const std::ffi::c_void,
+            );
+            enc.set_bytes(
+                qmm_mma::SWIZZLE_LOG,
+                4,
+                &swizzle_log as *const u32 as *const std::ffi::c_void,
+            );
 
             let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
             let tg = metal::MTLSize::new(64, 1, 1);
@@ -7217,12 +7461,16 @@ pub fn affine_quantized_matmul_batched(
         let cb = queue.new_command_buffer();
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&pipeline);
-        enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
-        enc.set_buffer(1, Some(&qw.weights_buf), 0);
-        enc.set_buffer(2, Some(&qw.scales_buf), 0);
-        enc.set_buffer(3, Some(&qw.biases_buf), 0);
-        enc.set_buffer(4, Some(out.metal_buffer()), 0);
-        enc.set_bytes(5, 16, params.as_ptr() as *const std::ffi::c_void);
+        enc.set_buffer(qmm_legacy::X, Some(x.metal_buffer()), x.offset() as u64);
+        enc.set_buffer(qmm_legacy::WEIGHTS, Some(&qw.weights_buf), 0);
+        enc.set_buffer(qmm_legacy::SCALES, Some(&qw.scales_buf), 0);
+        enc.set_buffer(qmm_legacy::BIASES, Some(&qw.biases_buf), 0);
+        enc.set_buffer(qmm_legacy::OUT, Some(out.metal_buffer()), 0);
+        enc.set_bytes(
+            qmm_legacy::PARAMS,
+            16,
+            params.as_ptr() as *const std::ffi::c_void,
+        );
 
         let q8_m_tiles = m.div_ceil(q8_bm);
         let q8_n_tiles = n.div_ceil(q8_bn);
@@ -7349,12 +7597,16 @@ pub fn affine_quantized_matmul_batched_into_cb(
 
             let enc = cb.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&pipeline);
-            enc.set_buffer(0, Some(&qw.weights_buf), 0);
-            enc.set_buffer(1, Some(&qw.scales_buf), 0);
-            enc.set_buffer(2, Some(&qw.biases_buf), 0);
-            enc.set_buffer(3, Some(vec_1d.metal_buffer()), vec_1d.offset() as u64);
-            enc.set_buffer(4, Some(out.metal_buffer()), 0);
-            enc.set_bytes(5, 16, params.as_ptr() as *const std::ffi::c_void);
+            enc.set_buffer(qmv::WEIGHTS, Some(&qw.weights_buf), 0);
+            enc.set_buffer(qmv::SCALES, Some(&qw.scales_buf), 0);
+            enc.set_buffer(qmv::BIASES, Some(&qw.biases_buf), 0);
+            enc.set_buffer(
+                qmv::INPUT,
+                Some(vec_1d.metal_buffer()),
+                vec_1d.offset() as u64,
+            );
+            enc.set_buffer(qmv::OUTPUT, Some(out.metal_buffer()), 0);
+            enc.set_bytes(qmv::PARAMS, 16, params.as_ptr() as *const std::ffi::c_void);
 
             let rows_per_tg: u64 = 8;
             let num_tgs_y = (qw.out_features as u64).div_ceil(rows_per_tg);
@@ -7379,12 +7631,12 @@ pub fn affine_quantized_matmul_batched_into_cb(
 
             let enc = cb.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&pipeline);
-            enc.set_buffer(0, Some(&qw.weights_buf), 0);
-            enc.set_buffer(1, Some(&qw.scales_buf), 0);
-            enc.set_buffer(2, Some(&qw.biases_buf), 0);
-            enc.set_buffer(3, Some(x.metal_buffer()), x.offset() as u64);
-            enc.set_buffer(4, Some(out.metal_buffer()), 0);
-            enc.set_bytes(5, 16, params.as_ptr() as *const std::ffi::c_void);
+            enc.set_buffer(qmv::WEIGHTS, Some(&qw.weights_buf), 0);
+            enc.set_buffer(qmv::SCALES, Some(&qw.scales_buf), 0);
+            enc.set_buffer(qmv::BIASES, Some(&qw.biases_buf), 0);
+            enc.set_buffer(qmv::INPUT, Some(x.metal_buffer()), x.offset() as u64);
+            enc.set_buffer(qmv::OUTPUT, Some(out.metal_buffer()), 0);
+            enc.set_bytes(qmv::PARAMS, 16, params.as_ptr() as *const std::ffi::c_void);
 
             let rows_per_tg: u64 = 8;
             let num_tgs_y = (n as u64).div_ceil(rows_per_tg);
@@ -7450,16 +7702,32 @@ pub fn affine_quantized_matmul_batched_into_cb(
 
                 let enc = cb.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(&pipeline);
-                enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
-                enc.set_buffer(1, Some(&qw.weights_buf), 0);
-                enc.set_buffer(2, Some(&qw.scales_buf), 0);
-                enc.set_buffer(3, Some(&qw.biases_buf), 0);
-                enc.set_buffer(4, Some(out.metal_buffer()), 0);
-                enc.set_bytes(5, 4, &m_u32 as *const u32 as *const std::ffi::c_void);
-                enc.set_bytes(6, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
-                enc.set_bytes(7, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
-                enc.set_bytes(8, 4, &kp_u32 as *const u32 as *const std::ffi::c_void);
-                enc.set_buffer(9, Some(&dummy_buf), 0);
+                enc.set_buffer(qmm_mma::X, Some(x.metal_buffer()), x.offset() as u64);
+                enc.set_buffer(qmm_mma::WEIGHTS, Some(&qw.weights_buf), 0);
+                enc.set_buffer(qmm_mma::SCALES, Some(&qw.scales_buf), 0);
+                enc.set_buffer(qmm_mma::BIASES, Some(&qw.biases_buf), 0);
+                enc.set_buffer(qmm_mma::OUT, Some(out.metal_buffer()), 0);
+                enc.set_bytes(
+                    qmm_mma::M,
+                    4,
+                    &m_u32 as *const u32 as *const std::ffi::c_void,
+                );
+                enc.set_bytes(
+                    qmm_mma::N,
+                    4,
+                    &n_u32 as *const u32 as *const std::ffi::c_void,
+                );
+                enc.set_bytes(
+                    qmm_mma::K,
+                    4,
+                    &k_u32 as *const u32 as *const std::ffi::c_void,
+                );
+                enc.set_bytes(
+                    qmm_mma::SWIZZLE_LOG,
+                    4,
+                    &kp_u32 as *const u32 as *const std::ffi::c_void,
+                );
+                enc.set_buffer(qmm_skinny::PARTIAL, Some(&dummy_buf), 0);
 
                 let grid = metal::MTLSize::new(sn_tiles as u64, sm_tiles as u64, 1);
                 let tg = metal::MTLSize::new(64, 1, 1);
@@ -7477,16 +7745,32 @@ pub fn affine_quantized_matmul_batched_into_cb(
 
                 let enc = cb.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(&pipeline);
-                enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
-                enc.set_buffer(1, Some(&qw.weights_buf), 0);
-                enc.set_buffer(2, Some(&qw.scales_buf), 0);
-                enc.set_buffer(3, Some(&qw.biases_buf), 0);
-                enc.set_buffer(4, Some(out.metal_buffer()), 0);
-                enc.set_bytes(5, 4, &m_u32 as *const u32 as *const std::ffi::c_void);
-                enc.set_bytes(6, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
-                enc.set_bytes(7, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
-                enc.set_bytes(8, 4, &kp_u32 as *const u32 as *const std::ffi::c_void);
-                enc.set_buffer(9, Some(&c_split_buf), 0);
+                enc.set_buffer(qmm_mma::X, Some(x.metal_buffer()), x.offset() as u64);
+                enc.set_buffer(qmm_mma::WEIGHTS, Some(&qw.weights_buf), 0);
+                enc.set_buffer(qmm_mma::SCALES, Some(&qw.scales_buf), 0);
+                enc.set_buffer(qmm_mma::BIASES, Some(&qw.biases_buf), 0);
+                enc.set_buffer(qmm_mma::OUT, Some(out.metal_buffer()), 0);
+                enc.set_bytes(
+                    qmm_mma::M,
+                    4,
+                    &m_u32 as *const u32 as *const std::ffi::c_void,
+                );
+                enc.set_bytes(
+                    qmm_mma::N,
+                    4,
+                    &n_u32 as *const u32 as *const std::ffi::c_void,
+                );
+                enc.set_bytes(
+                    qmm_mma::K,
+                    4,
+                    &k_u32 as *const u32 as *const std::ffi::c_void,
+                );
+                enc.set_bytes(
+                    qmm_mma::SWIZZLE_LOG,
+                    4,
+                    &kp_u32 as *const u32 as *const std::ffi::c_void,
+                );
+                enc.set_buffer(qmm_skinny::PARTIAL, Some(&c_split_buf), 0);
 
                 let grid =
                     metal::MTLSize::new(sn_tiles as u64, sm_tiles as u64, k_partitions as u64);
@@ -7504,11 +7788,23 @@ pub fn affine_quantized_matmul_batched_into_cb(
 
                 let enc2 = cb.new_compute_command_encoder();
                 enc2.set_compute_pipeline_state(&reduce_pipeline);
-                enc2.set_buffer(0, Some(&c_split_buf), 0);
-                enc2.set_buffer(1, Some(out.metal_buffer()), 0);
-                enc2.set_bytes(2, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
-                enc2.set_bytes(3, 4, &kp_u32 as *const u32 as *const std::ffi::c_void);
-                enc2.set_bytes(4, 4, &mn_total_u32 as *const u32 as *const std::ffi::c_void);
+                enc2.set_buffer(qmm_tiny_reduce::PARTIAL, Some(&c_split_buf), 0);
+                enc2.set_buffer(qmm_tiny_reduce::OUT, Some(out.metal_buffer()), 0);
+                enc2.set_bytes(
+                    qmm_tiny_reduce::N,
+                    4,
+                    &n_u32 as *const u32 as *const std::ffi::c_void,
+                );
+                enc2.set_bytes(
+                    qmm_tiny_reduce::K_PARTITIONS,
+                    4,
+                    &kp_u32 as *const u32 as *const std::ffi::c_void,
+                );
+                enc2.set_bytes(
+                    qmm_tiny_reduce::MN_TOTAL,
+                    4,
+                    &mn_total_u32 as *const u32 as *const std::ffi::c_void,
+                );
 
                 let reduce_grid = metal::MTLSize::new(partition_stride as u64, 1, 1);
                 let reduce_tg = metal::MTLSize::new(partition_stride.min(256) as u64, 1, 1);
@@ -7541,15 +7837,31 @@ pub fn affine_quantized_matmul_batched_into_cb(
 
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
-    enc.set_buffer(1, Some(&qw.weights_buf), 0);
-    enc.set_buffer(2, Some(&qw.scales_buf), 0);
-    enc.set_buffer(3, Some(&qw.biases_buf), 0);
-    enc.set_buffer(4, Some(out.metal_buffer()), 0);
-    enc.set_bytes(5, 4, &m_u32 as *const u32 as *const std::ffi::c_void);
-    enc.set_bytes(6, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
-    enc.set_bytes(7, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
-    enc.set_bytes(8, 4, &swizzle_log as *const u32 as *const std::ffi::c_void);
+    enc.set_buffer(qmm_mma::X, Some(x.metal_buffer()), x.offset() as u64);
+    enc.set_buffer(qmm_mma::WEIGHTS, Some(&qw.weights_buf), 0);
+    enc.set_buffer(qmm_mma::SCALES, Some(&qw.scales_buf), 0);
+    enc.set_buffer(qmm_mma::BIASES, Some(&qw.biases_buf), 0);
+    enc.set_buffer(qmm_mma::OUT, Some(out.metal_buffer()), 0);
+    enc.set_bytes(
+        qmm_mma::M,
+        4,
+        &m_u32 as *const u32 as *const std::ffi::c_void,
+    );
+    enc.set_bytes(
+        qmm_mma::N,
+        4,
+        &n_u32 as *const u32 as *const std::ffi::c_void,
+    );
+    enc.set_bytes(
+        qmm_mma::K,
+        4,
+        &k_u32 as *const u32 as *const std::ffi::c_void,
+    );
+    enc.set_bytes(
+        qmm_mma::SWIZZLE_LOG,
+        4,
+        &swizzle_log as *const u32 as *const std::ffi::c_void,
+    );
 
     let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
     let tg = metal::MTLSize::new(64, 1, 1);
@@ -7625,19 +7937,39 @@ pub fn qmm_add_residual_into_cb(
 
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
-    enc.set_buffer(1, Some(&qw.weights_buf), 0);
-    enc.set_buffer(2, Some(&qw.scales_buf), 0);
-    enc.set_buffer(3, Some(&qw.biases_buf), 0);
-    enc.set_buffer(4, Some(out.metal_buffer()), 0);
-    enc.set_bytes(5, 4, &m_u32 as *const u32 as *const std::ffi::c_void);
-    enc.set_bytes(6, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
-    enc.set_bytes(7, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
-    enc.set_bytes(8, 4, &swizzle_log as *const u32 as *const std::ffi::c_void);
-    enc.set_buffer(9, Some(&dummy_buf), 0); // norm_weight (unused)
-    enc.set_buffer(10, Some(&dummy_buf), 0); // inv_rms (unused)
-    enc.set_buffer(11, Some(residual.metal_buffer()), residual.offset() as u64);
-    enc.set_buffer(12, Some(&dummy_buf), 0); // gate_result (unused)
+    enc.set_buffer(qmm_mma::X, Some(x.metal_buffer()), x.offset() as u64);
+    enc.set_buffer(qmm_mma::WEIGHTS, Some(&qw.weights_buf), 0);
+    enc.set_buffer(qmm_mma::SCALES, Some(&qw.scales_buf), 0);
+    enc.set_buffer(qmm_mma::BIASES, Some(&qw.biases_buf), 0);
+    enc.set_buffer(qmm_mma::OUT, Some(out.metal_buffer()), 0);
+    enc.set_bytes(
+        qmm_mma::M,
+        4,
+        &m_u32 as *const u32 as *const std::ffi::c_void,
+    );
+    enc.set_bytes(
+        qmm_mma::N,
+        4,
+        &n_u32 as *const u32 as *const std::ffi::c_void,
+    );
+    enc.set_bytes(
+        qmm_mma::K,
+        4,
+        &k_u32 as *const u32 as *const std::ffi::c_void,
+    );
+    enc.set_bytes(
+        qmm_mma::SWIZZLE_LOG,
+        4,
+        &swizzle_log as *const u32 as *const std::ffi::c_void,
+    );
+    enc.set_buffer(qmm_mma::NORM_WEIGHT, Some(&dummy_buf), 0); // norm_weight (unused)
+    enc.set_buffer(qmm_mma::INV_RMS, Some(&dummy_buf), 0); // inv_rms (unused)
+    enc.set_buffer(
+        qmm_mma::RESIDUAL,
+        Some(residual.metal_buffer()),
+        residual.offset() as u64,
+    );
+    enc.set_buffer(qmm_mma::GATE_RESULT, Some(&dummy_buf), 0); // gate_result (unused)
 
     let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
     let tg = metal::MTLSize::new(64, 1, 1);
@@ -7705,20 +8037,36 @@ pub fn qmm_swiglu_into_cb(
 
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
-    enc.set_buffer(1, Some(&qw.weights_buf), 0);
-    enc.set_buffer(2, Some(&qw.scales_buf), 0);
-    enc.set_buffer(3, Some(&qw.biases_buf), 0);
-    enc.set_buffer(4, Some(out.metal_buffer()), 0);
-    enc.set_bytes(5, 4, &m_u32 as *const u32 as *const std::ffi::c_void);
-    enc.set_bytes(6, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
-    enc.set_bytes(7, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
-    enc.set_bytes(8, 4, &swizzle_log as *const u32 as *const std::ffi::c_void);
-    enc.set_buffer(9, Some(&dummy_buf), 0); // norm_weight (unused)
-    enc.set_buffer(10, Some(&dummy_buf), 0); // inv_rms (unused)
-    enc.set_buffer(11, Some(&dummy_buf), 0); // residual (unused)
+    enc.set_buffer(qmm_mma::X, Some(x.metal_buffer()), x.offset() as u64);
+    enc.set_buffer(qmm_mma::WEIGHTS, Some(&qw.weights_buf), 0);
+    enc.set_buffer(qmm_mma::SCALES, Some(&qw.scales_buf), 0);
+    enc.set_buffer(qmm_mma::BIASES, Some(&qw.biases_buf), 0);
+    enc.set_buffer(qmm_mma::OUT, Some(out.metal_buffer()), 0);
+    enc.set_bytes(
+        qmm_mma::M,
+        4,
+        &m_u32 as *const u32 as *const std::ffi::c_void,
+    );
+    enc.set_bytes(
+        qmm_mma::N,
+        4,
+        &n_u32 as *const u32 as *const std::ffi::c_void,
+    );
+    enc.set_bytes(
+        qmm_mma::K,
+        4,
+        &k_u32 as *const u32 as *const std::ffi::c_void,
+    );
+    enc.set_bytes(
+        qmm_mma::SWIZZLE_LOG,
+        4,
+        &swizzle_log as *const u32 as *const std::ffi::c_void,
+    );
+    enc.set_buffer(qmm_mma::NORM_WEIGHT, Some(&dummy_buf), 0); // norm_weight (unused)
+    enc.set_buffer(qmm_mma::INV_RMS, Some(&dummy_buf), 0); // inv_rms (unused)
+    enc.set_buffer(qmm_mma::RESIDUAL, Some(&dummy_buf), 0); // residual (unused)
     enc.set_buffer(
-        12,
+        qmm_mma::GATE_RESULT,
         Some(gate_result.metal_buffer()),
         gate_result.offset() as u64,
     );
@@ -7892,14 +8240,26 @@ pub fn affine_qmm_nax_q4_into_cb(
     // QuantizedWeight natively stores f16 scales/biases — use directly.
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
-    enc.set_buffer(1, Some(&qw.weights_buf), 0);
-    enc.set_buffer(2, Some(&qw.scales_buf), 0);
-    enc.set_buffer(3, Some(&qw.biases_buf), 0);
-    enc.set_buffer(4, Some(out.metal_buffer()), 0);
-    enc.set_bytes(5, 4, &m_u32 as *const u32 as *const std::ffi::c_void);
-    enc.set_bytes(6, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
-    enc.set_bytes(7, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
+    enc.set_buffer(qmm_nax::X, Some(x.metal_buffer()), x.offset() as u64);
+    enc.set_buffer(qmm_nax::WEIGHTS, Some(&qw.weights_buf), 0);
+    enc.set_buffer(qmm_nax::SCALES, Some(&qw.scales_buf), 0);
+    enc.set_buffer(qmm_nax::BIASES, Some(&qw.biases_buf), 0);
+    enc.set_buffer(qmm_nax::OUT, Some(out.metal_buffer()), 0);
+    enc.set_bytes(
+        qmm_nax::M,
+        4,
+        &m_u32 as *const u32 as *const std::ffi::c_void,
+    );
+    enc.set_bytes(
+        qmm_nax::N,
+        4,
+        &n_u32 as *const u32 as *const std::ffi::c_void,
+    );
+    enc.set_bytes(
+        qmm_nax::K,
+        4,
+        &k_u32 as *const u32 as *const std::ffi::c_void,
+    );
 
     // TG memory is statically allocated in the shader (threadgroup half Ws[BN * BK_PAD])
     // No dynamic allocation needed.
@@ -7991,14 +8351,26 @@ pub fn affine_qmm_nax_v2_q4_into_cb(
 
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
-    enc.set_buffer(1, Some(&qw.weights_buf), 0);
-    enc.set_buffer(2, Some(&qw.scales_buf), 0);
-    enc.set_buffer(3, Some(&qw.biases_buf), 0);
-    enc.set_buffer(4, Some(out.metal_buffer()), 0);
-    enc.set_bytes(5, 4, &m_u32 as *const u32 as *const std::ffi::c_void);
-    enc.set_bytes(6, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
-    enc.set_bytes(7, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
+    enc.set_buffer(qmm_nax::X, Some(x.metal_buffer()), x.offset() as u64);
+    enc.set_buffer(qmm_nax::WEIGHTS, Some(&qw.weights_buf), 0);
+    enc.set_buffer(qmm_nax::SCALES, Some(&qw.scales_buf), 0);
+    enc.set_buffer(qmm_nax::BIASES, Some(&qw.biases_buf), 0);
+    enc.set_buffer(qmm_nax::OUT, Some(out.metal_buffer()), 0);
+    enc.set_bytes(
+        qmm_nax::M,
+        4,
+        &m_u32 as *const u32 as *const std::ffi::c_void,
+    );
+    enc.set_bytes(
+        qmm_nax::N,
+        4,
+        &n_u32 as *const u32 as *const std::ffi::c_void,
+    );
+    enc.set_bytes(
+        qmm_nax::K,
+        4,
+        &k_u32 as *const u32 as *const std::ffi::c_void,
+    );
 
     let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
     let tg = metal::MTLSize::new(128, 1, 1);
@@ -8103,17 +8475,37 @@ pub fn affine_quantized_matmul_steel(
     let cb = queue.new_command_buffer();
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(x_half.metal_buffer()), x_half.offset() as u64);
-    enc.set_buffer(1, Some(&qw.weights_buf), 0);
-    enc.set_buffer(2, Some(&qw.scales_buf), 0);
-    enc.set_buffer(3, Some(&qw.biases_buf), 0);
-    enc.set_buffer(4, Some(out.metal_buffer()), 0);
-    enc.set_bytes(5, 4, &m_u32 as *const u32 as *const std::ffi::c_void);
-    enc.set_bytes(6, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
-    enc.set_bytes(7, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
-    enc.set_bytes(8, 4, &swizzle_log as *const u32 as *const std::ffi::c_void);
-    enc.set_buffer(9, Some(&dummy_buf), 0); // residual (unused)
-    enc.set_buffer(10, Some(&dummy_buf), 0); // gate_result (unused)
+    enc.set_buffer(
+        qmm_steel::X,
+        Some(x_half.metal_buffer()),
+        x_half.offset() as u64,
+    );
+    enc.set_buffer(qmm_steel::WEIGHTS, Some(&qw.weights_buf), 0);
+    enc.set_buffer(qmm_steel::SCALES, Some(&qw.scales_buf), 0);
+    enc.set_buffer(qmm_steel::BIASES, Some(&qw.biases_buf), 0);
+    enc.set_buffer(qmm_steel::OUT, Some(out.metal_buffer()), 0);
+    enc.set_bytes(
+        qmm_steel::M,
+        4,
+        &m_u32 as *const u32 as *const std::ffi::c_void,
+    );
+    enc.set_bytes(
+        qmm_steel::N,
+        4,
+        &n_u32 as *const u32 as *const std::ffi::c_void,
+    );
+    enc.set_bytes(
+        qmm_steel::K,
+        4,
+        &k_u32 as *const u32 as *const std::ffi::c_void,
+    );
+    enc.set_bytes(
+        qmm_steel::SWIZZLE_LOG,
+        4,
+        &swizzle_log as *const u32 as *const std::ffi::c_void,
+    );
+    enc.set_buffer(qmm_steel::RESIDUAL, Some(&dummy_buf), 0); // residual (unused)
+    enc.set_buffer(qmm_steel::GATE_RESULT, Some(&dummy_buf), 0); // gate_result (unused)
 
     let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
     let tg = metal::MTLSize::new(64, 1, 1);
@@ -8205,17 +8597,33 @@ pub fn affine_qmm_steel_q4_into_cb(
 
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
-    enc.set_buffer(1, Some(&qw.weights_buf), 0);
-    enc.set_buffer(2, Some(&qw.scales_buf), 0);
-    enc.set_buffer(3, Some(&qw.biases_buf), 0);
-    enc.set_buffer(4, Some(out.metal_buffer()), 0);
-    enc.set_bytes(5, 4, &m_u32 as *const u32 as *const std::ffi::c_void);
-    enc.set_bytes(6, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
-    enc.set_bytes(7, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
-    enc.set_bytes(8, 4, &swizzle_log as *const u32 as *const std::ffi::c_void);
-    enc.set_buffer(9, Some(&dummy_buf), 0); // residual (unused)
-    enc.set_buffer(10, Some(&dummy_buf), 0); // gate_result (unused)
+    enc.set_buffer(qmm_steel::X, Some(x.metal_buffer()), x.offset() as u64);
+    enc.set_buffer(qmm_steel::WEIGHTS, Some(&qw.weights_buf), 0);
+    enc.set_buffer(qmm_steel::SCALES, Some(&qw.scales_buf), 0);
+    enc.set_buffer(qmm_steel::BIASES, Some(&qw.biases_buf), 0);
+    enc.set_buffer(qmm_steel::OUT, Some(out.metal_buffer()), 0);
+    enc.set_bytes(
+        qmm_steel::M,
+        4,
+        &m_u32 as *const u32 as *const std::ffi::c_void,
+    );
+    enc.set_bytes(
+        qmm_steel::N,
+        4,
+        &n_u32 as *const u32 as *const std::ffi::c_void,
+    );
+    enc.set_bytes(
+        qmm_steel::K,
+        4,
+        &k_u32 as *const u32 as *const std::ffi::c_void,
+    );
+    enc.set_bytes(
+        qmm_steel::SWIZZLE_LOG,
+        4,
+        &swizzle_log as *const u32 as *const std::ffi::c_void,
+    );
+    enc.set_buffer(qmm_steel::RESIDUAL, Some(&dummy_buf), 0); // residual (unused)
+    enc.set_buffer(qmm_steel::GATE_RESULT, Some(&dummy_buf), 0); // gate_result (unused)
 
     let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
     let tg = metal::MTLSize::new(64, 1, 1);
@@ -8316,16 +8724,36 @@ pub fn affine_quantized_matmul_qldr(
     let cb = queue.new_command_buffer();
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(x_half.metal_buffer()), x_half.offset() as u64);
-    enc.set_buffer(1, Some(&qw.weights_buf), 0);
-    enc.set_buffer(2, Some(&qw.scales_buf), 0);
-    enc.set_buffer(3, Some(&qw.biases_buf), 0);
-    enc.set_buffer(4, Some(out.metal_buffer()), 0);
-    enc.set_bytes(5, 4, &m_u32 as *const u32 as *const std::ffi::c_void);
-    enc.set_bytes(6, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
-    enc.set_bytes(7, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
-    enc.set_bytes(8, 4, &swizzle_log as *const u32 as *const std::ffi::c_void);
-    enc.set_buffer(9, Some(&dummy_buf), 0); // residual (unused)
+    enc.set_buffer(
+        qmm_steel::X,
+        Some(x_half.metal_buffer()),
+        x_half.offset() as u64,
+    );
+    enc.set_buffer(qmm_steel::WEIGHTS, Some(&qw.weights_buf), 0);
+    enc.set_buffer(qmm_steel::SCALES, Some(&qw.scales_buf), 0);
+    enc.set_buffer(qmm_steel::BIASES, Some(&qw.biases_buf), 0);
+    enc.set_buffer(qmm_steel::OUT, Some(out.metal_buffer()), 0);
+    enc.set_bytes(
+        qmm_steel::M,
+        4,
+        &m_u32 as *const u32 as *const std::ffi::c_void,
+    );
+    enc.set_bytes(
+        qmm_steel::N,
+        4,
+        &n_u32 as *const u32 as *const std::ffi::c_void,
+    );
+    enc.set_bytes(
+        qmm_steel::K,
+        4,
+        &k_u32 as *const u32 as *const std::ffi::c_void,
+    );
+    enc.set_bytes(
+        qmm_steel::SWIZZLE_LOG,
+        4,
+        &swizzle_log as *const u32 as *const std::ffi::c_void,
+    );
+    enc.set_buffer(qmm_steel::RESIDUAL, Some(&dummy_buf), 0); // residual (unused)
 
     let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
     let tg = metal::MTLSize::new(64, 1, 1);
@@ -8392,12 +8820,16 @@ pub fn affine_quantized_matmul_batched_scalar(
     let cb = queue.new_command_buffer();
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
-    enc.set_buffer(1, Some(&qw.weights_buf), 0);
-    enc.set_buffer(2, Some(&qw.scales_buf), 0);
-    enc.set_buffer(3, Some(&qw.biases_buf), 0);
-    enc.set_buffer(4, Some(out.metal_buffer()), 0);
-    enc.set_bytes(5, 16, params.as_ptr() as *const std::ffi::c_void);
+    enc.set_buffer(qmm_legacy::X, Some(x.metal_buffer()), x.offset() as u64);
+    enc.set_buffer(qmm_legacy::WEIGHTS, Some(&qw.weights_buf), 0);
+    enc.set_buffer(qmm_legacy::SCALES, Some(&qw.scales_buf), 0);
+    enc.set_buffer(qmm_legacy::BIASES, Some(&qw.biases_buf), 0);
+    enc.set_buffer(qmm_legacy::OUT, Some(out.metal_buffer()), 0);
+    enc.set_bytes(
+        qmm_legacy::PARAMS,
+        16,
+        params.as_ptr() as *const std::ffi::c_void,
+    );
 
     // Legacy tile sizes
     const BM_Q: usize = 16;
@@ -8683,18 +9115,46 @@ pub fn gather_qmm(
     let cb = queue.new_command_buffer();
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
-    enc.set_buffer(1, Some(w_packed_buf), 0);
-    enc.set_buffer(2, Some(scales_buf), 0);
-    enc.set_buffer(3, Some(biases_buf), 0);
-    enc.set_buffer(4, Some(indices.metal_buffer()), indices.offset() as u64);
-    enc.set_buffer(5, Some(out.metal_buffer()), 0);
-    enc.set_bytes(6, 4, &batch_u32 as *const u32 as *const std::ffi::c_void);
-    enc.set_bytes(7, 4, &m_u32 as *const u32 as *const std::ffi::c_void);
-    enc.set_bytes(8, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
-    enc.set_bytes(9, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
-    enc.set_bytes(10, 4, &group_size as *const u32 as *const std::ffi::c_void);
-    enc.set_bytes(11, 4, &ne_u32 as *const u32 as *const std::ffi::c_void);
+    enc.set_buffer(gather_qmm::X, Some(x.metal_buffer()), x.offset() as u64);
+    enc.set_buffer(gather_qmm::WEIGHTS, Some(w_packed_buf), 0);
+    enc.set_buffer(gather_qmm::SCALES, Some(scales_buf), 0);
+    enc.set_buffer(gather_qmm::BIASES, Some(biases_buf), 0);
+    enc.set_buffer(
+        gather_qmm::INDICES,
+        Some(indices.metal_buffer()),
+        indices.offset() as u64,
+    );
+    enc.set_buffer(gather_qmm::OUT, Some(out.metal_buffer()), 0);
+    enc.set_bytes(
+        gather_qmm::BATCH,
+        4,
+        &batch_u32 as *const u32 as *const std::ffi::c_void,
+    );
+    enc.set_bytes(
+        gather_qmm::M,
+        4,
+        &m_u32 as *const u32 as *const std::ffi::c_void,
+    );
+    enc.set_bytes(
+        gather_qmm::N,
+        4,
+        &n_u32 as *const u32 as *const std::ffi::c_void,
+    );
+    enc.set_bytes(
+        gather_qmm::K,
+        4,
+        &k_u32 as *const u32 as *const std::ffi::c_void,
+    );
+    enc.set_bytes(
+        gather_qmm::GROUP_SIZE,
+        4,
+        &group_size as *const u32 as *const std::ffi::c_void,
+    );
+    enc.set_bytes(
+        gather_qmm::N_EXPERTS,
+        4,
+        &ne_u32 as *const u32 as *const std::ffi::c_void,
+    );
 
     const BM_GQ: usize = 16;
     const BN_GQ: usize = 16;
@@ -9128,13 +9588,21 @@ pub fn gather_qmv_fast_q4(
     let cb = queue.new_command_buffer();
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
-    enc.set_buffer(1, Some(w_packed_buf), 0);
-    enc.set_buffer(2, Some(scales_buf), 0);
-    enc.set_buffer(3, Some(biases_buf), 0);
-    enc.set_buffer(4, Some(indices.metal_buffer()), indices.offset() as u64);
-    enc.set_buffer(5, Some(out.metal_buffer()), 0);
-    enc.set_bytes(6, 16, params.as_ptr() as *const std::ffi::c_void);
+    enc.set_buffer(gather_qmv::X, Some(x.metal_buffer()), x.offset() as u64);
+    enc.set_buffer(gather_qmv::WEIGHTS, Some(w_packed_buf), 0);
+    enc.set_buffer(gather_qmv::SCALES, Some(scales_buf), 0);
+    enc.set_buffer(gather_qmv::BIASES, Some(biases_buf), 0);
+    enc.set_buffer(
+        gather_qmv::INDICES,
+        Some(indices.metal_buffer()),
+        indices.offset() as u64,
+    );
+    enc.set_buffer(gather_qmv::OUT, Some(out.metal_buffer()), 0);
+    enc.set_bytes(
+        gather_qmv::PARAMS,
+        16,
+        params.as_ptr() as *const std::ffi::c_void,
+    );
 
     // Grid: (batch, ceil(N/8), 1) — one TG per batch element x output-row tile
     let rows_per_tg: usize = 8; // NUM_SIMDGROUPS(2) * RESULTS_PER_SG(4)
@@ -9296,13 +9764,21 @@ pub fn gather_qmv_fast_f16_q4(
     let cb = queue.new_command_buffer();
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
-    enc.set_buffer(1, Some(w_packed_buf), 0);
-    enc.set_buffer(2, Some(scales_buf), 0);
-    enc.set_buffer(3, Some(biases_buf), 0);
-    enc.set_buffer(4, Some(indices.metal_buffer()), indices.offset() as u64);
-    enc.set_buffer(5, Some(out.metal_buffer()), 0);
-    enc.set_bytes(6, 16, params.as_ptr() as *const std::ffi::c_void);
+    enc.set_buffer(gather_qmv::X, Some(x.metal_buffer()), x.offset() as u64);
+    enc.set_buffer(gather_qmv::WEIGHTS, Some(w_packed_buf), 0);
+    enc.set_buffer(gather_qmv::SCALES, Some(scales_buf), 0);
+    enc.set_buffer(gather_qmv::BIASES, Some(biases_buf), 0);
+    enc.set_buffer(
+        gather_qmv::INDICES,
+        Some(indices.metal_buffer()),
+        indices.offset() as u64,
+    );
+    enc.set_buffer(gather_qmv::OUT, Some(out.metal_buffer()), 0);
+    enc.set_bytes(
+        gather_qmv::PARAMS,
+        16,
+        params.as_ptr() as *const std::ffi::c_void,
+    );
 
     let rows_per_tg: usize = 8; // NUM_SIMDGROUPS(2) * RESULTS_PER_SG(4)
     let num_tgs_y = n.div_ceil(rows_per_tg);

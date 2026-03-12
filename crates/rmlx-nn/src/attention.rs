@@ -3273,55 +3273,64 @@ impl Attention {
         let hidden_size = num_heads * head_dim;
         let seq_len = x.shape()[0];
 
-        // RMS norm (pre-attention) — separate dispatch, then feed to Q/K/V GEMM.
-        // Note: has_norm GEMM fusion was tested but regressed prefill throughput
-        // because GEMM is compute-bound and the extra per-element ops in tile load
-        // outweigh the memory savings from eliminating the intermediate tensor.
-        let normed =
-            ops::rms_norm::rms_norm_into_cb(registry, x, Some(norm_weight), rms_norm_eps, cb)?;
-
         let q_dim = num_heads * head_dim;
         let k_dim = num_kv_heads * head_dim;
         let v_dim = num_kv_heads * head_dim;
-        let (q, k, v) = {
+        let (q, k, v) = if let Some(ref qkv_wt) = self.qkv_merged_weight_t {
+            // Fused RMSNorm + QKV GEMM (two-pass: inv_rms then norm-GEMM).
+            // Eliminates the intermediate [M, K] normalized tensor, saving one
+            // full read+write of hidden state.  Uses MlxArch 64×64 tile with
+            // has_norm=true function constant.
+            let x_2d = if x.ndim() == 1 {
+                x.reshape(vec![1, x.shape()[0]])?
+            } else {
+                x.reshape(vec![x.shape()[0], x.shape()[1]])?
+            };
+            let qkv = ops::matmul::matmul_norm_gemm_into_cb(
+                registry,
+                &x_2d,
+                qkv_wt,
+                norm_weight,
+                rms_norm_eps,
+                cb,
+            )?;
+            let total_out = q_dim + k_dim + v_dim;
+            let elem_size = qkv.dtype().size_of();
+            let q_view = Array::new(
+                qkv.metal_buffer().to_owned(),
+                vec![seq_len, q_dim],
+                vec![total_out, 1],
+                qkv.dtype(),
+                qkv.offset(),
+            );
+            let k_view = Array::new(
+                qkv.metal_buffer().to_owned(),
+                vec![seq_len, k_dim],
+                vec![total_out, 1],
+                qkv.dtype(),
+                qkv.offset() + q_dim * elem_size,
+            );
+            let v_view = Array::new(
+                qkv.metal_buffer().to_owned(),
+                vec![seq_len, v_dim],
+                vec![total_out, 1],
+                qkv.dtype(),
+                qkv.offset() + (q_dim + k_dim) * elem_size,
+            );
+            (q_view, k_view, v_view)
+        } else {
+            // Non-merged path: separate norm then per-projection GEMM.
+            let normed =
+                ops::rms_norm::rms_norm_into_cb(registry, x, Some(norm_weight), rms_norm_eps, cb)?;
             let normed_2d = if normed.ndim() == 1 {
                 normed.reshape(vec![1, normed.shape()[0]])?
             } else {
                 normed.reshape(vec![normed.shape()[0], normed.shape()[1]])?
             };
-
-            if let Some(ref qkv_wt) = self.qkv_merged_weight_t {
-                let qkv = ops::matmul::matmul_into_cb(registry, &normed_2d, qkv_wt, cb)?;
-                let total_out = q_dim + k_dim + v_dim;
-                let elem_size = qkv.dtype().size_of();
-                let q_view = Array::new(
-                    qkv.metal_buffer().to_owned(),
-                    vec![seq_len, q_dim],
-                    vec![total_out, 1],
-                    qkv.dtype(),
-                    qkv.offset(),
-                );
-                let k_view = Array::new(
-                    qkv.metal_buffer().to_owned(),
-                    vec![seq_len, k_dim],
-                    vec![total_out, 1],
-                    qkv.dtype(),
-                    qkv.offset() + q_dim * elem_size,
-                );
-                let v_view = Array::new(
-                    qkv.metal_buffer().to_owned(),
-                    vec![seq_len, v_dim],
-                    vec![total_out, 1],
-                    qkv.dtype(),
-                    qkv.offset() + (q_dim + k_dim) * elem_size,
-                );
-                (q_view, k_view, v_view)
-            } else {
-                let wq_t = self.q_proj.weight_transposed_contiguous()?;
-                let wk_t = self.k_proj.weight_transposed_contiguous()?;
-                let wv_t = self.v_proj.weight_transposed_contiguous()?;
-                ops::fused::batched_qkv_proj_into(registry, &normed_2d, &wq_t, &wk_t, &wv_t, cb)?
-            }
+            let wq_t = self.q_proj.weight_transposed_contiguous()?;
+            let wk_t = self.k_proj.weight_transposed_contiguous()?;
+            let wv_t = self.v_proj.weight_transposed_contiguous()?;
+            ops::fused::batched_qkv_proj_into(registry, &normed_2d, &wq_t, &wk_t, &wv_t, cb)?
         };
 
         let rope_offset = cache.seq_len as u32;

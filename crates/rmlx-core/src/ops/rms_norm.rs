@@ -1738,3 +1738,56 @@ pub fn rms_norm_residual_add_encode(
 
     Ok((out, residual_buf))
 }
+
+/// Encode inv_rms computation into an existing compute command encoder.
+///
+/// Same as [`compute_inv_rms`] but dispatches into a caller-provided encoder
+/// instead of creating its own.  The caller is responsible for memory barriers
+/// and encoder lifecycle.
+///
+/// Returns a 1-D f32 array of shape `[rows]`.
+pub fn compute_inv_rms_encode(
+    registry: &KernelRegistry,
+    input: &Array,
+    eps: f32,
+    encoder: &metal::ComputeCommandEncoderRef,
+) -> Result<Array, KernelError> {
+    if input.ndim() != 2 {
+        return Err(KernelError::InvalidShape(format!(
+            "compute_inv_rms_encode requires 2D input, got {}D",
+            input.ndim()
+        )));
+    }
+
+    let rows = input.shape()[0];
+    let axis_size = super::checked_u32(input.shape()[1], "axis_size")?;
+
+    let kernel_name = inv_rms_kernel_name(input.dtype())?;
+    let pipeline = registry.get_pipeline(kernel_name, input.dtype())?;
+
+    let dev = registry.device().raw();
+    let out = Array::uninit(dev, &[rows], DType::Float32);
+
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(
+        inv_rms::INPUT,
+        Some(input.metal_buffer()),
+        input.offset() as u64,
+    );
+    encoder.set_buffer(inv_rms::OUT, Some(out.metal_buffer()), 0);
+    encoder.set_bytes(
+        inv_rms::AXIS_SIZE,
+        4,
+        &axis_size as *const u32 as *const std::ffi::c_void,
+    );
+    encoder.set_bytes(
+        inv_rms::EPS,
+        4,
+        &eps as *const f32 as *const std::ffi::c_void,
+    );
+
+    let tg_size = std::cmp::min(1024, pipeline.max_total_threads_per_threadgroup());
+    encoder.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), MTLSize::new(tg_size, 1, 1));
+
+    Ok(out)
+}

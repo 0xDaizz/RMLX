@@ -13,6 +13,7 @@ use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
 use metal::MTLSize;
+use rmlx_macros::rmlx_kernel;
 
 /// Metal shader source for SiLU kernels.
 pub const SILU_SHADER_SOURCE: &str = r#"
@@ -287,6 +288,7 @@ kernel void silu_gate_strided_bf16(
 "#;
 
 /// Register SiLU kernels with the registry via JIT.
+#[rmlx_kernel(name = "silu")]
 pub fn register(registry: &KernelRegistry) -> Result<(), KernelError> {
     registry.register_jit_source("silu", SILU_SHADER_SOURCE)
 }

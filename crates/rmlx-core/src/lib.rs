@@ -2,6 +2,7 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod arena;
 pub mod array;
 pub mod dtype;
 pub mod formats;

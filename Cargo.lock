@@ -80,6 +80,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "bumpalo"
+version = "3.20.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d20789868f4b01b2f2caec9f5c4e0213b41e3e5702a50157d699ae31ced2fcb"
+
+[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -453,10 +459,12 @@ dependencies = [
 name = "rmlx-core"
 version = "0.1.0"
 dependencies = [
+ "bumpalo",
  "half",
  "metal",
  "objc",
  "rmlx-alloc",
+ "rmlx-macros",
  "rmlx-metal",
  "smallvec",
  "tracing",
@@ -474,6 +482,15 @@ dependencies = [
  "rmlx-rdma",
  "serde_json",
  "tracing",
+]
+
+[[package]]
+name = "rmlx-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

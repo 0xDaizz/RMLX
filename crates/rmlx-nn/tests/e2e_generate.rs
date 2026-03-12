@@ -235,7 +235,7 @@ fn build_tiny_model(device: &metal::Device) -> TransformerModel {
 #[test]
 fn e2e_forward_produces_valid_logits_shape() {
     let (device, queue, registry) = setup();
-    let model = build_tiny_model(&device);
+    let mut model = build_tiny_model(&device);
 
     let input_tokens: Vec<u32> = vec![1, 42, 100, 7]; // 4 tokens
     let seq_len = input_tokens.len();
@@ -254,7 +254,7 @@ fn e2e_forward_produces_valid_logits_shape() {
 #[test]
 fn e2e_forward_then_sample_produces_valid_token() {
     let (device, queue, registry) = setup();
-    let model = build_tiny_model(&device);
+    let mut model = build_tiny_model(&device);
 
     let input_tokens: Vec<u32> = vec![1, 42, 100];
 
@@ -287,7 +287,7 @@ fn e2e_forward_then_sample_produces_valid_token() {
 #[test]
 fn e2e_greedy_decode_multi_step() {
     let (device, queue, registry) = setup();
-    let model = build_tiny_model(&device);
+    let mut model = build_tiny_model(&device);
 
     let config = SamplerConfig {
         temperature: 0.0,
@@ -346,7 +346,7 @@ fn e2e_greedy_decode_multi_step() {
 #[test]
 fn e2e_stochastic_sample_tokens_in_range() {
     let (device, queue, registry) = setup();
-    let model = build_tiny_model(&device);
+    let mut model = build_tiny_model(&device);
 
     let input_tokens: Vec<u32> = vec![5, 10, 20];
 

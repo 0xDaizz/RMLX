@@ -24,6 +24,7 @@ use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::{KernelError, KernelRegistry};
 use rmlx_core::ops;
+use rmlx_core::ops::buffer_slots::{gemm as gslot, silu_gate as sslot};
 
 use crate::moe::Expert;
 
@@ -575,23 +576,21 @@ fn encode_gemm(
 
     let bm = tile.bm as u64;
     let bn = tile.bn as u64;
-    let grid_x = (n as u64).div_ceil(bn);
-    let grid_y = (m as u64).div_ceil(bm);
 
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(a.metal_buffer()), a.offset() as u64);
-    enc.set_buffer(1, Some(b.metal_buffer()), b.offset() as u64);
-    enc.set_buffer(2, Some(c.metal_buffer()), c.offset() as u64);
-    enc.set_buffer(3, Some(&m_buf), 0);
-    enc.set_buffer(4, Some(&n_buf), 0);
-    enc.set_buffer(5, Some(&k_buf), 0);
-    enc.set_buffer(6, Some(&bsa_buf), 0);
-    enc.set_buffer(7, Some(&bsb_buf), 0);
-    enc.set_buffer(8, Some(&bsc_buf), 0);
+    enc.set_buffer(gslot::A, Some(a.metal_buffer()), a.offset() as u64);
+    enc.set_buffer(gslot::B, Some(b.metal_buffer()), b.offset() as u64);
+    enc.set_buffer(gslot::OUT, Some(c.metal_buffer()), c.offset() as u64);
+    enc.set_buffer(gslot::M, Some(&m_buf), 0);
+    enc.set_buffer(gslot::N, Some(&n_buf), 0);
+    enc.set_buffer(gslot::K, Some(&k_buf), 0);
+    enc.set_buffer(gslot::BATCH_STRIDE_A, Some(&bsa_buf), 0);
+    enc.set_buffer(gslot::BATCH_STRIDE_B, Some(&bsb_buf), 0);
+    enc.set_buffer(gslot::BATCH_STRIDE_C, Some(&bsc_buf), 0);
 
     // Full, Skinny, and MlxArch kernels require swizzle_log (buffer 9)
-    let swizzle_log_buf = if matches!(
+    let (swizzle_log, swizzle_log_buf) = if matches!(
         tile.variant,
         ops::matmul::TileVariant::Full
             | ops::matmul::TileVariant::Skinny
@@ -601,13 +600,12 @@ fn encode_gemm(
             | ops::matmul::TileVariant::NaxArch
             | ops::matmul::TileVariant::NaxArch64x128
     ) {
-        let swizzle_log =
-            ops::matmul::compute_swizzle_log(m as usize, n as usize, tile.bm, tile.bn);
-        let buf = make_u32_buf(dev, swizzle_log);
-        enc.set_buffer(9, Some(&buf), 0);
-        Some(buf)
+        let s = ops::matmul::compute_swizzle_log(m as usize, n as usize, tile.bm, tile.bn);
+        let buf = make_u32_buf(dev, s);
+        enc.set_buffer(gslot::SWIZZLE_LOG, Some(&buf), 0);
+        (s, Some(buf))
     } else {
-        None
+        (0, None)
     };
 
     let tg_threads = match tile.variant {
@@ -622,6 +620,8 @@ fn encode_gemm(
         ops::matmul::TileVariant::NaxArch64x64 => 128_u64,
     };
 
+    let grid_x = ((n as u64).div_ceil(bn)) << swizzle_log;
+    let grid_y = ((m as u64).div_ceil(bm)) >> swizzle_log;
     let grid = metal::MTLSize::new(grid_x, grid_y, 1);
     let tg = metal::MTLSize::new(tg_threads, 1, 1);
     enc.dispatch_thread_groups(grid, tg);
@@ -652,10 +652,22 @@ fn encode_silu_gate(
 
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(pipeline);
-    enc.set_buffer(0, Some(gate_out.metal_buffer()), gate_out.offset() as u64);
-    enc.set_buffer(1, Some(up_out.metal_buffer()), up_out.offset() as u64);
-    enc.set_buffer(2, Some(output.metal_buffer()), output.offset() as u64);
-    enc.set_buffer(3, Some(&numel_buf), 0);
+    enc.set_buffer(
+        sslot::GATE_OUT,
+        Some(gate_out.metal_buffer()),
+        gate_out.offset() as u64,
+    );
+    enc.set_buffer(
+        sslot::UP_OUT,
+        Some(up_out.metal_buffer()),
+        up_out.offset() as u64,
+    );
+    enc.set_buffer(
+        sslot::OUT,
+        Some(output.metal_buffer()),
+        output.offset() as u64,
+    );
+    enc.set_buffer(sslot::NUMEL, Some(&numel_buf), 0);
 
     let tg = std::cmp::min(pipeline.max_total_threads_per_threadgroup(), grid_threads);
     enc.dispatch_threads(

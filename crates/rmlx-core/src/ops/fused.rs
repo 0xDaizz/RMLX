@@ -17,6 +17,7 @@ use crate::ops::buffer_slots::{
     fused_rms_gemv, fused_swiglu_down, gemm, silu_gate, silu_gate_strided,
 };
 use metal::MTLSize;
+use rmlx_macros::rmlx_kernel;
 
 /// Batched Q/K/V projection: single command buffer for 3 matmuls.
 ///
@@ -801,8 +802,6 @@ fn encode_gemm(
         super::matmul::select_tile_config_with_dtype(m as usize, n as usize, k as usize, a.dtype());
     let bm = tile.bm as u64;
     let bn = tile.bn as u64;
-    let grid_x = (n as u64).div_ceil(bn);
-    let grid_y = (m as u64).div_ceil(bm);
 
     let tg_threads = match tile.variant {
         super::matmul::TileVariant::Small => 256_u64,
@@ -841,7 +840,7 @@ fn encode_gemm(
     );
 
     // Full, Skinny, and MlxArch kernels require swizzle_log
-    if matches!(
+    let swizzle_log = if matches!(
         tile.variant,
         super::matmul::TileVariant::Full
             | super::matmul::TileVariant::Skinny
@@ -849,15 +848,19 @@ fn encode_gemm(
             | super::matmul::TileVariant::MlxArchSmall
             | super::matmul::TileVariant::MlxArchMicro
     ) {
-        let swizzle_log =
-            super::matmul::compute_swizzle_log(m as usize, n as usize, tile.bm, tile.bn);
+        let s = super::matmul::compute_swizzle_log(m as usize, n as usize, tile.bm, tile.bn);
         enc.set_bytes(
             gemm::SWIZZLE_LOG,
             4,
-            &swizzle_log as *const u32 as *const std::ffi::c_void,
+            &s as *const u32 as *const std::ffi::c_void,
         );
-    }
+        s
+    } else {
+        0
+    };
 
+    let grid_x = ((n as u64).div_ceil(bn)) << swizzle_log;
+    let grid_y = ((m as u64).div_ceil(bm)) >> swizzle_log;
     let grid = MTLSize::new(grid_x, grid_y, 1);
     let tg = MTLSize::new(tg_threads, 1, 1);
     enc.dispatch_thread_groups(grid, tg);
@@ -1442,6 +1445,7 @@ pub fn fused_swiglu_down_preresolved_into_encoder(
 }
 
 /// Register all fused kernel shaders with the kernel registry.
+#[rmlx_kernel(name = "fused_rms_gemv")]
 pub fn register_fused_kernels(registry: &KernelRegistry) -> Result<(), KernelError> {
     registry.register_jit_source("fused_swiglu_down", FUSED_SWIGLU_DOWN_SHADER_SOURCE)?;
     registry.register_jit_source("fused_rms_gemv", FUSED_RMS_GEMV_SHADER_SOURCE)
@@ -2217,14 +2221,15 @@ mod tests {
 
     #[test]
     fn test_gemm_kernel_name_for_dims() {
-        // Full tile (M>=33, N>=33) -> MlxArch kernels
+        // f32 Full -> MlxArch (bm=64, bn=64)
         assert_eq!(
             gemm_kernel_name_for_dims(DType::Float32, 64, 64).unwrap(),
             "gemm_mlx_f32"
         );
+        // f16 M<=128 -> MlxArchMicro (bm=16, bn=32)
         assert_eq!(
             gemm_kernel_name_for_dims(DType::Float16, 128, 128).unwrap(),
-            "gemm_mlx_f16"
+            "gemm_mlx_m16_f16"
         );
         // Skinny f16 (M=5..32, N<=4096) -> MlxArchMicro
         assert_eq!(

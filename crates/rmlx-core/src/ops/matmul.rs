@@ -6475,23 +6475,29 @@ pub fn select_tile_config_with_nax(
 
 /// Compute swizzle_log for threadblock swizzle.
 ///
-/// SAFETY: Currently disabled (always returns 0). The swizzle function
-/// `mlx_swizzle_tg(gx, gy, s)` maps grid (tiles_n, tiles_m) to coordinates
-/// `(gx>>s, (gy<<s)|(gx&mask))`. When s>0, new_x range shrinks to tiles_n/2^s
-/// while new_y expands to tiles_m*2^s — but the grid is NOT resized to match.
-/// This means tiles with col_index >= tiles_n/2^s are never computed (silent
-/// data corruption). To re-enable swizzle, the grid must be reshaped to
-/// (tiles_n << s, tiles_m >> s) so the bijection covers all output tiles.
+/// The kernel's `mlx_swizzle_tg(gx, gy, s)` maps grid coordinates to:
+///   `new_x = gx >> s`, `new_y = (gy << s) | (gx & mask)`
+///
+/// When s > 0, the dispatch grid must be reshaped inversely so that the
+/// swizzled coordinates exactly cover (0..tiles_n, 0..tiles_m):
+///   `grid_x = tiles_n << s`, `grid_y = tiles_m >> s`
+///
+/// The kernel's bounds guard (`if row_start >= M || col_start >= N return`)
+/// handles any extra tiles from rounding.
 pub fn compute_swizzle_log(m: usize, n: usize, bm: usize, bn: usize) -> u32 {
-    let _tiles_m = m.div_ceil(bm);
-    let _tiles_n = n.div_ceil(bn);
-    // TODO: Re-enable with proper grid reshaping:
-    //   grid_x = tiles_n << swizzle_log
-    //   grid_y = tiles_m >> swizzle_log
-    // if _tiles_n >= 4 * _tiles_m { 2 }
-    // else if _tiles_n >= 2 * _tiles_m { 1 }
-    // else { 0 }
-    0
+    let tiles_m = m.div_ceil(bm);
+    let tiles_n = n.div_ceil(bn);
+    // Swizzle remaps grid (gx, gy) → (gx>>s, (gy<<s)|(gx&mask)).
+    // The dispatch grid must be reshaped to (tiles_n << s, tiles_m >> s) so
+    // the bijection covers all (0..tiles_n, 0..tiles_m) output tiles.
+    // Guard: tiles_m >> s must be >= 1 (i.e., tiles_m >= 2^s).
+    if tiles_n >= 4 * tiles_m && tiles_m >= 4 {
+        2
+    } else if tiles_n >= 2 * tiles_m && tiles_m >= 2 {
+        1
+    } else {
+        0
+    }
 }
 
 /// Returns true if Split-K should be used for the given dimensions.
@@ -7013,14 +7019,17 @@ fn dispatch_tiled_gemm(
         super::checked_u32(batch_stride_c, "batch_stride_c")?,
     );
 
-    if tile.variant.has_swizzle() {
-        let swizzle_log = compute_swizzle_log(m, n, tile.bm, tile.bn);
-        set_u32(enc, gemm::SWIZZLE_LOG, swizzle_log);
-    }
+    let swizzle_log = if tile.variant.has_swizzle() {
+        let s = compute_swizzle_log(m, n, tile.bm, tile.bn);
+        set_u32(enc, gemm::SWIZZLE_LOG, s);
+        s
+    } else {
+        0
+    };
 
     let grid = MTLSize::new(
-        ceil_div(n, tile.bn) as u64,
-        ceil_div(m, tile.bm) as u64,
+        (ceil_div(n, tile.bn) << swizzle_log) as u64,
+        (ceil_div(m, tile.bm) >> swizzle_log) as u64,
         batch as u64,
     );
     let tg = MTLSize::new(tile.variant.threads_per_tg(), 1, 1);
@@ -7156,8 +7165,8 @@ fn dispatch_split_k_f16(
         set_u32(enc, 7, swizzle_log); // f16 split-K adds swizzle_log after n_splits
 
         let grid = MTLSize::new(
-            ceil_div(n, bn) as u64,
-            ceil_div(m, bm) as u64,
+            (ceil_div(n, bn) << swizzle_log) as u64,
+            (ceil_div(m, bm) >> swizzle_log) as u64,
             n_splits as u64,
         );
         let tg = MTLSize::new(64, 1, 1);
@@ -7434,12 +7443,19 @@ fn encode_gemm_core(
         super::checked_u32(batch_stride_c, "batch_stride_c")?,
     );
 
-    if tile.variant.has_swizzle() {
-        let swizzle_log = compute_swizzle_log(m, n, tile.bm, tile.bn);
-        set_u32(enc, gemm::SWIZZLE_LOG, swizzle_log);
-    }
+    let swizzle_log = if tile.variant.has_swizzle() {
+        let s = compute_swizzle_log(m, n, tile.bm, tile.bn);
+        set_u32(enc, gemm::SWIZZLE_LOG, s);
+        s
+    } else {
+        0
+    };
 
-    let grid = MTLSize::new(ceil_div(n, tile.bn) as u64, ceil_div(m, tile.bm) as u64, 1);
+    let grid = MTLSize::new(
+        (ceil_div(n, tile.bn) << swizzle_log) as u64,
+        (ceil_div(m, tile.bm) >> swizzle_log) as u64,
+        1,
+    );
     let tg = MTLSize::new(tile.variant.threads_per_tg(), 1, 1);
 
     enc.dispatch_thread_groups(grid, tg);
@@ -7672,17 +7688,18 @@ pub fn matmul_add_residual_into_cb(
 
     // MlxArch and NaxArch kernels support the residual epilogue
     let supports_nax = registry.device().tuning().supports_nax;
-    let tile = select_tile_config_with_nax(m, n, k, a.dtype(), supports_nax);
-    if tile.variant != TileVariant::MlxArch
-        && tile.variant != TileVariant::NaxArch
-        && tile.variant != TileVariant::NaxArch64x128
-        && tile.variant != TileVariant::NaxArch64x64
-    {
-        return Err(KernelError::NotFound(format!(
-            "matmul_add_residual_into_cb: only MlxArch/NaxArch tile supported, got {:?} (M={}, N={})",
-            tile.variant, m, n
-        )));
-    }
+    let tile = {
+        let default = select_tile_config_with_nax(m, n, k, a.dtype(), supports_nax);
+        match default.variant {
+            TileVariant::MlxArch | TileVariant::NaxArch | TileVariant::NaxArch64x128 | TileVariant::NaxArch64x64 => default,
+            _ => TileConfig {
+                bm: 64,
+                bn: 64,
+                bk: 16,
+                variant: TileVariant::MlxArch,
+            },
+        }
+    };
 
     let kernel_name = match tile.variant {
         TileVariant::NaxArch => "gemm_nax_f16",
@@ -7760,8 +7777,8 @@ pub fn matmul_add_residual_into_cb(
         residual.offset() as u64,
     );
 
-    let grid_x = ceil_div(n, tile.bn) as u64;
-    let grid_y = ceil_div(m, tile.bm) as u64;
+    let grid_x = (ceil_div(n, tile.bn) << swizzle_log) as u64;
+    let grid_y = (ceil_div(m, tile.bm) >> swizzle_log) as u64;
     let grid = MTLSize::new(grid_x, grid_y, 1);
     let tg = MTLSize::new(tile.variant.threads_per_tg(), 1, 1);
     enc.dispatch_thread_groups(grid, tg);
@@ -7859,17 +7876,18 @@ pub fn matmul_add_residual_encode(
 
     // MlxArch and NaxArch kernels support the residual epilogue
     let supports_nax = registry.device().tuning().supports_nax;
-    let tile = select_tile_config_with_nax(m, n, k, a.dtype(), supports_nax);
-    if tile.variant != TileVariant::MlxArch
-        && tile.variant != TileVariant::NaxArch
-        && tile.variant != TileVariant::NaxArch64x128
-        && tile.variant != TileVariant::NaxArch64x64
-    {
-        return Err(KernelError::NotFound(format!(
-            "matmul_add_residual_encode: only MlxArch/NaxArch tile supported, got {:?} (M={}, N={})",
-            tile.variant, m, n
-        )));
-    }
+    let tile = {
+        let default = select_tile_config_with_nax(m, n, k, a.dtype(), supports_nax);
+        match default.variant {
+            TileVariant::MlxArch | TileVariant::NaxArch | TileVariant::NaxArch64x128 | TileVariant::NaxArch64x64 => default,
+            _ => TileConfig {
+                bm: 64,
+                bn: 64,
+                bk: 16,
+                variant: TileVariant::MlxArch,
+            },
+        }
+    };
 
     let kernel_name = match tile.variant {
         TileVariant::NaxArch => "gemm_nax_f16",
@@ -7947,8 +7965,8 @@ pub fn matmul_add_residual_encode(
         residual.offset() as u64,
     );
 
-    let grid_x = ceil_div(n, tile.bn) as u64;
-    let grid_y = ceil_div(m, tile.bm) as u64;
+    let grid_x = (ceil_div(n, tile.bn) << swizzle_log) as u64;
+    let grid_y = (ceil_div(m, tile.bm) >> swizzle_log) as u64;
     let grid = MTLSize::new(grid_x, grid_y, 1);
     let tg = MTLSize::new(tile.variant.threads_per_tg(), 1, 1);
     encoder.dispatch_thread_groups(grid, tg);
@@ -8016,14 +8034,25 @@ pub fn matmul_norm_gemm_into_cb(
     let k = a.shape()[1];
     let n = b.shape()[1];
 
-    // Only MlxArch kernels support the norm prologue
-    let tile = select_tile_config_with_dtype(m, n, k, a.dtype());
-    if tile.variant != TileVariant::MlxArch {
-        return Err(KernelError::NotFound(format!(
-            "matmul_norm_gemm_into_cb: only MlxArch tile supported, got {:?} (M={}, N={})",
-            tile.variant, m, n
-        )));
-    }
+    // Only MlxArch (64x64x16) kernels support the has_norm prologue.
+    // For f16, select_tile_config_with_dtype prefers MlxArchSmall/Micro, but those
+    // lack norm buffer bindings.  Force MlxArch here — the bandwidth saved by
+    // eliminating the intermediate [M,K] normalized tensor more than compensates
+    // for the slightly less-optimal tile choice.
+    let tile = {
+        let default = select_tile_config_with_dtype(m, n, k, a.dtype());
+        if default.variant == TileVariant::MlxArch {
+            default
+        } else {
+            // Force MlxArch 64×64×16 for norm-GEMM fusion
+            TileConfig {
+                bm: 64,
+                bn: 64,
+                bk: 16,
+                variant: TileVariant::MlxArch,
+            }
+        }
+    };
 
     // --- Pass 1: compute inv_rms[M] ---
     let inv_rms = super::rms_norm::compute_inv_rms(registry, a, eps, cb)?;
@@ -8093,12 +8122,163 @@ pub fn matmul_norm_gemm_into_cb(
     // inv_rms [M]
     enc.set_buffer(gemm::INV_RMS, Some(inv_rms.metal_buffer()), 0);
 
-    let grid_x = ceil_div(n, tile.bn) as u64;
-    let grid_y = ceil_div(m, tile.bm) as u64;
+    let grid_x = (ceil_div(n, tile.bn) << swizzle_log) as u64;
+    let grid_y = (ceil_div(m, tile.bm) >> swizzle_log) as u64;
     let grid = MTLSize::new(grid_x, grid_y, 1);
     let tg = MTLSize::new(tile.variant.threads_per_tg(), 1, 1);
     enc.dispatch_thread_groups(grid, tg);
     enc.end_encoding();
+
+    Ok(out)
+}
+
+/// Fused RMSNorm + GEMM into an existing compute command encoder.
+///
+/// Same semantics as [`matmul_norm_gemm_into_cb`] but dispatches both the
+/// `inv_rms` kernel and the norm-GEMM kernel into the caller's encoder,
+/// with a memory barrier between them.  The caller manages encoder lifecycle.
+///
+/// Returns `[M, N]` output.
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_norm_gemm_encode(
+    registry: &KernelRegistry,
+    a: &Array,
+    b: &Array,
+    norm_weight: &Array,
+    eps: f32,
+    encoder: &metal::ComputeCommandEncoderRef,
+) -> Result<Array, KernelError> {
+    // --- Validation ---
+    if a.ndim() != 2 || b.ndim() != 2 {
+        return Err(KernelError::InvalidShape(
+            "matmul_norm_gemm_encode requires 2D arrays".to_string(),
+        ));
+    }
+    if a.shape()[1] != b.shape()[0] {
+        return Err(KernelError::InvalidShape(format!(
+            "inner dimensions must match: {} vs {}",
+            a.shape()[1],
+            b.shape()[0]
+        )));
+    }
+    if a.dtype() != b.dtype() || a.dtype() != norm_weight.dtype() {
+        return Err(KernelError::InvalidShape(format!(
+            "dtypes must match: a={:?}, b={:?}, norm_weight={:?}",
+            a.dtype(),
+            b.dtype(),
+            norm_weight.dtype()
+        )));
+    }
+    if norm_weight.ndim() != 1 || norm_weight.shape()[0] != a.shape()[1] {
+        return Err(KernelError::InvalidShape(format!(
+            "norm_weight must be 1D of length K={}, got shape {:?}",
+            a.shape()[1],
+            norm_weight.shape()
+        )));
+    }
+    if !a.is_contiguous() || !b.is_contiguous() {
+        return Err(KernelError::InvalidShape(
+            "matmul_norm_gemm_encode: inputs must be contiguous".to_string(),
+        ));
+    }
+
+    let m = a.shape()[0];
+    let k = a.shape()[1];
+    let n = b.shape()[1];
+
+    let tile = {
+        let default = select_tile_config_with_dtype(m, n, k, a.dtype());
+        if default.variant == TileVariant::MlxArch {
+            default
+        } else {
+            TileConfig {
+                bm: 64,
+                bn: 64,
+                bk: 16,
+                variant: TileVariant::MlxArch,
+            }
+        }
+    };
+
+    // --- Pass 1: compute inv_rms[M] ---
+    let inv_rms = super::rms_norm::compute_inv_rms_encode(registry, a, eps, encoder)?;
+
+    // Memory barrier: inv_rms must be visible before the GEMM reads it.
+    {
+        let buf_ref: &metal::BufferRef = inv_rms.metal_buffer();
+        encoder.memory_barrier_with_resources(&[unsafe {
+            &*(buf_ref as *const metal::BufferRef as *const metal::ResourceRef)
+        }]);
+    }
+
+    // --- Pass 2: GEMM with has_norm=true ---
+    let kernel_name = match a.dtype() {
+        DType::Float16 => "gemm_mlx_f16",
+        DType::Float32 => "gemm_mlx_f32",
+        DType::Bfloat16 => "gemm_mlx_bf16",
+        _ => {
+            return Err(KernelError::NotFound(format!(
+                "matmul_norm_gemm_encode: unsupported dtype {:?}",
+                a.dtype()
+            )))
+        }
+    };
+
+    use crate::kernels::FunctionConstantValue;
+    let constants = vec![
+        (200, FunctionConstantValue::Bool(m % tile.bm == 0)),
+        (201, FunctionConstantValue::Bool(n % tile.bn == 0)),
+        (202, FunctionConstantValue::Bool(false)), // no residual
+        (203, FunctionConstantValue::Bool(true)),  // has_norm = true
+        (204, FunctionConstantValue::Bool(false)), // no swiglu
+    ];
+    let pipeline = registry.get_pipeline_with_constants(kernel_name, a.dtype(), &constants)?;
+
+    let dev = registry.device().raw();
+    let out = Array::uninit(dev, &[m, n], a.dtype());
+
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(gemm::A, Some(a.metal_buffer()), a.offset() as u64);
+    encoder.set_buffer(gemm::B, Some(b.metal_buffer()), b.offset() as u64);
+    encoder.set_buffer(gemm::OUT, Some(out.metal_buffer()), 0);
+    set_u32(encoder, gemm::M, super::checked_u32(m, "M")?);
+    set_u32(encoder, gemm::N, super::checked_u32(n, "N")?);
+    set_u32(encoder, gemm::K, super::checked_u32(k, "K")?);
+    set_u32(
+        encoder,
+        gemm::BATCH_STRIDE_A,
+        super::checked_u32(m * k, "batch_stride_a")?,
+    );
+    set_u32(
+        encoder,
+        gemm::BATCH_STRIDE_B,
+        super::checked_u32(k * n, "batch_stride_b")?,
+    );
+    set_u32(
+        encoder,
+        gemm::BATCH_STRIDE_C,
+        super::checked_u32(m * n, "batch_stride_c")?,
+    );
+
+    let swizzle_log = compute_swizzle_log(m, n, tile.bm, tile.bn);
+    set_u32(encoder, gemm::SWIZZLE_LOG, swizzle_log);
+
+    // Residual (dummy, not used when has_residual=false)
+    encoder.set_buffer(gemm::RESIDUAL, Some(out.metal_buffer()), 0);
+    // norm_weight [K]
+    encoder.set_buffer(
+        gemm::NORM_WEIGHT,
+        Some(norm_weight.metal_buffer()),
+        norm_weight.offset() as u64,
+    );
+    // inv_rms [M]
+    encoder.set_buffer(gemm::INV_RMS, Some(inv_rms.metal_buffer()), 0);
+
+    let grid_x = (ceil_div(n, tile.bn) << swizzle_log) as u64;
+    let grid_y = (ceil_div(m, tile.bm) >> swizzle_log) as u64;
+    let grid = MTLSize::new(grid_x, grid_y, 1);
+    let tg = MTLSize::new(tile.variant.threads_per_tg(), 1, 1);
+    encoder.dispatch_thread_groups(grid, tg);
 
     Ok(out)
 }
@@ -8212,8 +8392,8 @@ pub fn matmul_swiglu_gemm_into_cb(
         gate_result.offset() as u64,
     );
 
-    let grid_x = ceil_div(n, tile.bn) as u64;
-    let grid_y = ceil_div(m, tile.bm) as u64;
+    let grid_x = (ceil_div(n, tile.bn) << swizzle_log) as u64;
+    let grid_y = (ceil_div(m, tile.bm) >> swizzle_log) as u64;
     let grid = MTLSize::new(grid_x, grid_y, 1);
     let tg = MTLSize::new(tile.variant.threads_per_tg(), 1, 1);
     enc.dispatch_thread_groups(grid, tg);
@@ -8634,15 +8814,67 @@ mod tests {
 
     #[test]
     fn test_compute_swizzle_log() {
-        // Swizzle currently disabled (always 0) due to grid reshaping bug.
-        // See compute_swizzle_log() comment for details.
-        assert_eq!(compute_swizzle_log(32, 32, 32, 32), 0);
-        assert_eq!(compute_swizzle_log(96, 128, 32, 32), 0);
-        assert_eq!(compute_swizzle_log(128, 128, 32, 32), 0);
-        assert_eq!(compute_swizzle_log(4096, 4096, 32, 32), 0);
+        // Small/square: no swizzle
+        assert_eq!(compute_swizzle_log(32, 32, 32, 32), 0); // 1x1 tiles
+        assert_eq!(compute_swizzle_log(96, 128, 32, 32), 0); // 3x4, not 2x ratio
+        assert_eq!(compute_swizzle_log(128, 128, 32, 32), 0); // 4x4, equal
+                                                              // Large square: no swizzle
+        assert_eq!(compute_swizzle_log(4096, 4096, 32, 32), 0); // 128x128, equal
+
+        // m=64, n=4096, bm=64, bn=64 -> tiles_m=1, tiles_n=64
+        // tiles_m=1 < 2, so no swizzle despite high ratio
         assert_eq!(compute_swizzle_log(64, 4096, 64, 64), 0);
-        assert_eq!(compute_swizzle_log(128, 4096, 64, 64), 0);
-        assert_eq!(compute_swizzle_log(256, 4096, 64, 64), 0);
+
+        // m=128, n=4096, bm=64, bn=64 -> tiles_m=2, tiles_n=64
+        // tiles_n >= 2*tiles_m (64 >= 4) YES, tiles_m >= 2 YES -> 1
+        assert_eq!(compute_swizzle_log(128, 4096, 64, 64), 1);
+
+        // m=256, n=4096, bm=64, bn=64 -> tiles_m=4, tiles_n=64
+        // tiles_n >= 4*tiles_m (64 >= 16) YES, tiles_m >= 4 YES -> 2
+        assert_eq!(compute_swizzle_log(256, 4096, 64, 64), 2);
+
+        // m=512, n=4096, bm=64, bn=64 -> tiles_m=8, tiles_n=64
+        // tiles_n >= 4*tiles_m (64 >= 32) YES, tiles_m >= 4 YES -> 2
+        assert_eq!(compute_swizzle_log(512, 4096, 64, 64), 2);
+    }
+
+    #[test]
+    fn test_swizzle_grid_covers_all_tiles() {
+        // Verify that reshaping (tiles_n << s, tiles_m >> s) with swizzle
+        // bijection covers all (0..tiles_n, 0..tiles_m) output coordinates.
+        for &(m, n, bm, bn) in &[
+            (256usize, 4096usize, 64usize, 64usize),
+            (128, 4096, 64, 64),
+            (512, 4096, 64, 64),
+            (128, 2048, 32, 32),
+        ] {
+            let tiles_m = m.div_ceil(bm);
+            let tiles_n = n.div_ceil(bn);
+            let s = compute_swizzle_log(m, n, bm, bn) as usize;
+            if s == 0 {
+                continue;
+            }
+
+            let grid_x = tiles_n << s;
+            let grid_y = tiles_m >> s;
+            let mask = (1 << s) - 1;
+
+            let mut covered = std::collections::HashSet::new();
+            for gy in 0..grid_y {
+                for gx in 0..grid_x {
+                    let out_x = gx >> s;
+                    let out_y = (gy << s) | (gx & mask);
+                    if out_x < tiles_n && out_y < tiles_m {
+                        covered.insert((out_x, out_y));
+                    }
+                }
+            }
+            assert_eq!(
+                covered.len(),
+                tiles_m * tiles_n,
+                "swizzle s={s} must cover all {tiles_m}x{tiles_n} tiles for m={m},n={n}"
+            );
+        }
     }
 
     #[test]
@@ -8841,10 +9073,10 @@ mod tests {
 
     #[test]
     fn test_mlx_arch_tile_selected_for_large_m_n() {
-        // M>=33, N>=33 with f16 should select MlxArch
+        // f16 M<=128 -> MlxArchMicro (bm=16, bn=32)
         let tile = select_tile_config_with_dtype(64, 4096, 4096, DType::Float16);
-        assert_eq!(tile.variant, TileVariant::MlxArch);
-        assert_eq!(tile.bm, 64);
-        assert_eq!(tile.bn, 64);
+        assert_eq!(tile.variant, TileVariant::MlxArchMicro);
+        assert_eq!(tile.bm, 16);
+        assert_eq!(tile.bn, 32);
     }
 }
