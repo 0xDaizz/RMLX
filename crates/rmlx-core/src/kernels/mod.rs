@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::RwLock;
 
 use metal::{CompileOptions, FunctionConstantValues, MTLDataType};
@@ -97,6 +98,15 @@ pub struct KernelRegistry {
     /// Persistent disk-backed pipeline cache.  `None` only when explicitly
     /// disabled (e.g., in tests via `new_without_disk_cache`).
     disk_cache: Option<DiskPipelineCache>,
+    /// Frozen snapshot of pipelines for lock-free reads.
+    ///
+    /// After calling [`freeze()`](Self::freeze), this points to a heap-allocated
+    /// `HashMap` clone of `pipelines`. Pipeline lookups check this pointer first
+    /// (lock-free `Acquire` load) before falling back to the `RwLock`.
+    ///
+    /// Pipelines added after `freeze()` (e.g., JIT compilation of new kernels)
+    /// go into the `RwLock` map; call `freeze()` again to capture them.
+    frozen_pipelines: AtomicPtr<HashMap<PipelineKey, metal::ComputePipelineState>>,
 }
 
 /// A JIT-compiled library together with the source text it was compiled from.
@@ -131,6 +141,7 @@ impl KernelRegistry {
             jit_cache: RwLock::new(HashMap::new()),
             pipelines: RwLock::new(HashMap::new()),
             disk_cache,
+            frozen_pipelines: AtomicPtr::new(std::ptr::null_mut()),
         }
     }
 
@@ -157,6 +168,7 @@ impl KernelRegistry {
             jit_cache: RwLock::new(HashMap::new()),
             pipelines: RwLock::new(HashMap::new()),
             disk_cache: None,
+            frozen_pipelines: AtomicPtr::new(std::ptr::null_mut()),
         }
     }
 
@@ -175,7 +187,12 @@ impl KernelRegistry {
             constants: vec![],
         };
 
-        // 1. Check in-memory pipeline cache (read lock)
+        // 1a. Check frozen snapshot (lock-free)
+        if let Some(pipeline) = self.frozen_lookup(&key) {
+            return Ok(pipeline);
+        }
+
+        // 1b. Check in-memory pipeline cache (read lock)
         {
             let cache = self
                 .pipelines
@@ -344,7 +361,12 @@ impl KernelRegistry {
             constants: constants.to_vec(),
         };
 
-        // 1. Check in-memory pipeline cache (read lock)
+        // 1a. Check frozen snapshot (lock-free)
+        if let Some(pipeline) = self.frozen_lookup(&key) {
+            return Ok(pipeline);
+        }
+
+        // 1b. Check in-memory pipeline cache (read lock)
         {
             let cache = self
                 .pipelines
@@ -574,11 +596,22 @@ impl KernelRegistry {
         key
     }
 
-    /// Invalidate all cached pipelines.
+    /// Invalidate all cached pipelines (including any frozen snapshot).
     ///
     /// Useful after registering new specialized sources to force recompilation
     /// on next access.
     pub fn clear_pipeline_cache(&self) -> Result<(), KernelError> {
+        // Drop the frozen snapshot first so stale entries aren't served.
+        let old = self
+            .frozen_pipelines
+            .swap(std::ptr::null_mut(), Ordering::AcqRel);
+        if !old.is_null() {
+            // SAFETY: `old` was created by `freeze()` via `Box::into_raw`.
+            unsafe {
+                drop(Box::from_raw(old));
+            }
+        }
+
         let mut cache = self
             .pipelines
             .write()
@@ -592,9 +625,58 @@ impl KernelRegistry {
         self.disk_cache.as_ref()
     }
 
+    /// Snapshot the current pipeline cache for lock-free reads.
+    ///
+    /// After this call, [`get_pipeline`](Self::get_pipeline) and
+    /// [`get_pipeline_with_constants`](Self::get_pipeline_with_constants) will
+    /// first probe the frozen snapshot via an `Acquire` atomic load — no `RwLock`
+    /// contention on the hot path.
+    ///
+    /// Call this once after model warm-up (i.e., after all kernels have been
+    /// compiled at least once). Pipelines JIT-compiled after `freeze()` will
+    /// still be found via the `RwLock` fallback; call `freeze()` again to
+    /// capture them in the snapshot.
+    pub fn freeze(&self) {
+        let snap = Box::new(
+            self.pipelines
+                .read()
+                .expect("pipeline cache lock poisoned during freeze")
+                .clone(),
+        );
+        let old = self
+            .frozen_pipelines
+            .swap(Box::into_raw(snap), Ordering::AcqRel);
+        if !old.is_null() {
+            // SAFETY: `old` was created by a prior `freeze()` call via
+            // `Box::into_raw` and is no longer accessible through the atomic.
+            unsafe {
+                drop(Box::from_raw(old));
+            }
+        }
+    }
+
+    /// Returns `true` if the registry has a frozen pipeline snapshot.
+    pub fn is_frozen(&self) -> bool {
+        !self.frozen_pipelines.load(Ordering::Acquire).is_null()
+    }
+
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
+
+    /// Lock-free lookup in the frozen snapshot. Returns `None` if no snapshot
+    /// exists or the key is not found.
+    fn frozen_lookup(&self, key: &PipelineKey) -> Option<metal::ComputePipelineState> {
+        let ptr = self.frozen_pipelines.load(Ordering::Acquire);
+        if ptr.is_null() {
+            return None;
+        }
+        // SAFETY: `ptr` was created by `freeze()` via `Box::into_raw` and remains
+        // valid until the next `freeze()` or `Drop`. The `Acquire` ordering
+        // ensures we see the fully initialized `HashMap`.
+        let map = unsafe { &*ptr };
+        map.get(key).cloned()
+    }
 
     /// Find the MSL source string for a kernel by scanning the JIT cache.
     ///
@@ -626,6 +708,19 @@ impl KernelRegistry {
                 (*idx, fc)
             })
             .collect()
+    }
+}
+
+impl Drop for KernelRegistry {
+    fn drop(&mut self) {
+        let ptr = self.frozen_pipelines.load(Ordering::Acquire);
+        if !ptr.is_null() {
+            // SAFETY: `ptr` was created by `freeze()` via `Box::into_raw`.
+            // We hold `&mut self`, so no concurrent access is possible.
+            unsafe {
+                drop(Box::from_raw(ptr));
+            }
+        }
     }
 }
 
