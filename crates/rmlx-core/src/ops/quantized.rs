@@ -3359,6 +3359,296 @@ kernel void affine_qmm_nax_q4(
 "#;
 
 // ---------------------------------------------------------------------------
+// Metal shader source -- NAX V2 Q4 QMM (vectorized dequant + fragment loads)
+// ---------------------------------------------------------------------------
+
+pub const QMM_NAX_V2_Q4_SHADER_SOURCE: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup>
+#include <metal_simdgroup_matrix>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+using namespace metal;
+
+// ---------------------------------------------------------------------------
+// NAX V2 Q4 QMM: BM=64, BN=64, BK=64, 4 SG (2x2), 128 threads.
+// Vectorized dequant (uchar4 loads + half4 stores) and vectorized fragment loads.
+// Uses mpp::tensor_ops::matmul2d for 16x16 HW MMA.
+// ---------------------------------------------------------------------------
+
+constant constexpr uint NAX_BM = 64;
+constant constexpr uint NAX_BN = 64;
+constant constexpr uint NAX_BK = 64;
+constant constexpr uint NAX_BK_PAD = 72;  // BK + 16/sizeof(half) = 64 + 8
+constant constexpr uint NAX_WM = 2;
+constant constexpr uint NAX_WN = 2;
+constant constexpr uint NAX_SM = 32;  // BM / WM
+constant constexpr uint NAX_SN = 32;  // BN / WN
+constant constexpr uint NAX_UM = 16;  // MMA M-dim
+constant constexpr uint NAX_UN = 32;  // MMA N-dim (transpose_b -> rows of B subtile)
+constant constexpr uint NAX_UK = 16;  // MMA K-dim
+constant constexpr uint NAX_SK = 32;  // inner K step
+constant constexpr uint NAX_TM = 2;   // SM / UM = 32 / 16
+constant constexpr uint NAX_TN = 1;   // SN / UN = 32 / 32
+constant constexpr uint NAX_TK = 2;   // SK / UK = 32 / 16
+
+constant bool align_M [[function_constant(200)]];
+constant bool align_N [[function_constant(201)]];
+constant uint fc_group_size [[function_constant(205)]];
+constant bool align_K [[function_constant(206)]];
+
+// BaseNAXFrag coordinate: per-lane position in 16x16 fragment (32 lanes)
+// Each lane owns 2 rows x 4 cols = 8 elements
+struct NaxCoord {
+    short fm;  // row within 16
+    short fn;  // col within 16 (stride 4: fn, fn+1, fn+2, fn+3)
+};
+
+inline NaxCoord nax_lane_coord(uint slid) {
+    short qid = short(slid >> 2);
+    short fm = ((qid & 4) | ((short(slid) >> 1) & 3));
+    short fn = ((qid & 2) | (short(slid) & 1)) * 4;
+    return {fm, fn};
+}
+
+kernel void affine_qmm_nax_v2_q4(
+    device const half*    x         [[buffer(0)]],
+    device const uint8_t* w_packed  [[buffer(1)]],
+    device const half*    scales    [[buffer(2)]],
+    device const half*    biases    [[buffer(3)]],
+    device half*          output    [[buffer(4)]],
+    constant uint&        M         [[buffer(5)]],
+    constant uint&        N         [[buffer(6)]],
+    constant uint&        K         [[buffer(7)]],
+    uint3 tid    [[threadgroup_position_in_grid]],
+    uint  lid    [[thread_index_in_threadgroup]],
+    uint  sgid   [[simdgroup_index_in_threadgroup]],
+    uint  slid   [[thread_index_in_simdgroup]])
+{
+    // TG memory: dequantized weights [BN, BK_padded]
+    threadgroup half Ws[NAX_BN * NAX_BK_PAD];
+
+    const uint row_start = tid.y * NAX_BM;
+    const uint col_start = tid.x * NAX_BN;
+    const uint uK = K;
+    const uint uM = M;
+    const uint uN = N;
+    const uint groups_per_row = uK / fc_group_size;
+    const uint half_k = uK / 2;
+
+    // SG grid: 2x2
+    const uint sg_row = sgid / NAX_WN;  // 0 or 1
+    const uint sg_col = sgid % NAX_WN;  // 0 or 1
+    const uint tm_base = sg_row * NAX_SM;  // 0 or 32
+    const uint tn_base = sg_col * NAX_SN;  // 0 or 32
+
+    NaxCoord coord = nax_lane_coord(slid);
+
+    // Accumulator fragments: TM=2, TN=1
+    float acc[NAX_TM][16];  // [2][16]
+    for (uint i = 0; i < NAX_TM; i++)
+        for (uint j = 0; j < 16; j++)
+            acc[i][j] = 0.0f;
+
+    // MPP matmul2d descriptor: FM=16, FN=32, FK=16, transpose_b=true
+    constexpr auto mma_desc = mpp::tensor_ops::matmul2d_descriptor(
+        NAX_UM, NAX_UN, NAX_UK,
+        false,   // transpose_a
+        true,    // transpose_b
+        true,    // accumulate
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+
+    // Main K-loop
+    for (uint kb = 0; kb < uK; kb += NAX_BK) {
+        // ---- Phase 1: Cooperative dequant B into Ws[BN, BK_padded] ----
+        // 128 threads load BN*BK/2 = 64*32 = 2048 packed bytes -> 4096 halves
+        // Each thread: 16 bytes -> 32 halves
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            const uint threads_per_row = 2;   // 32 bytes/row / 16 bytes/thread
+            const uint bytes_per_thread = 16;
+            const uint n_local = lid / threads_per_row;          // 0..63
+            const uint k_byte_offset = (lid % threads_per_row) * bytes_per_thread; // 0 or 16
+
+            uint gn = col_start + n_local;
+
+            if (align_N || gn < uN) {
+                device const uint8_t* src = w_packed + gn * half_k + (kb / 2) + k_byte_offset;
+
+                // Scale/bias for this thread's K range
+                uint group_k_start = kb + k_byte_offset * 2;
+                uint group_idx = group_k_start / fc_group_size;
+                if (!align_K && group_idx >= groups_per_row) {
+                    group_idx = groups_per_row - 1;
+                }
+                half scale = scales[gn * groups_per_row + group_idx];
+                half bias  = biases[gn * groups_per_row + group_idx];
+                half scale_hi = scale / half(16.0f);
+
+                // V2: Vectorized dequant — uchar4 loads + half4 stores
+                if (align_K || kb + k_byte_offset * 2 + bytes_per_thread * 2 <= uK) {
+                    // Fast path: all 16 bytes are valid (4 uchar4 loads)
+                    for (uint r = 0; r < bytes_per_thread; r += 4) {
+                        uchar4 bytes = *reinterpret_cast<device const uchar4*>(&src[r]);
+                        uint k_base = k_byte_offset * 2 + r * 2;
+
+                        // Unrolled dequant for 4 bytes -> 8 half values
+                        half4 lo4 = half4(
+                            scale * half(bytes[0] & 0x0f) + bias,
+                            scale_hi * half(bytes[0] & 0xf0) + bias,
+                            scale * half(bytes[1] & 0x0f) + bias,
+                            scale_hi * half(bytes[1] & 0xf0) + bias
+                        );
+                        half4 hi4 = half4(
+                            scale * half(bytes[2] & 0x0f) + bias,
+                            scale_hi * half(bytes[2] & 0xf0) + bias,
+                            scale * half(bytes[3] & 0x0f) + bias,
+                            scale_hi * half(bytes[3] & 0xf0) + bias
+                        );
+
+                        // Vectorized TG store (half4 x 2)
+                        *reinterpret_cast<threadgroup half4*>(&Ws[n_local * NAX_BK_PAD + k_base]) = lo4;
+                        *reinterpret_cast<threadgroup half4*>(&Ws[n_local * NAX_BK_PAD + k_base + 4]) = hi4;
+                    }
+                } else {
+                    // Slow path: tail K — scalar fallback for boundary safety
+                    for (uint r = 0; r < bytes_per_thread; r++) {
+                        uint k_idx = k_byte_offset * 2 + r * 2;
+                        uint gk = kb + k_idx;
+
+                        if (gk + 1 < uK) {
+                            uint8_t byte_val = src[r];
+                            half w_lo = scale * half(byte_val & 0x0f) + bias;
+                            half w_hi = scale_hi * half(byte_val & 0xf0) + bias;
+                            Ws[n_local * NAX_BK_PAD + k_idx]     = w_lo;
+                            Ws[n_local * NAX_BK_PAD + k_idx + 1] = w_hi;
+                        } else if (gk < uK) {
+                            uint8_t byte_val = src[r];
+                            half w_lo = scale * half(byte_val & 0x0f) + bias;
+                            Ws[n_local * NAX_BK_PAD + k_idx]     = w_lo;
+                            Ws[n_local * NAX_BK_PAD + k_idx + 1] = half(0);
+                        } else {
+                            Ws[n_local * NAX_BK_PAD + k_idx]     = half(0);
+                            Ws[n_local * NAX_BK_PAD + k_idx + 1] = half(0);
+                        }
+                    }
+                }
+            } else {
+                // Out-of-bounds N: vectorized zero-fill
+                uint k_base = k_byte_offset * 2;
+                half4 zero4 = half4(0);
+                for (uint r = 0; r < bytes_per_thread; r += 4) {
+                    uint k_idx = k_base + r * 2;
+                    *reinterpret_cast<threadgroup half4*>(&Ws[n_local * NAX_BK_PAD + k_idx]) = zero4;
+                    *reinterpret_cast<threadgroup half4*>(&Ws[n_local * NAX_BK_PAD + k_idx + 4]) = zero4;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ---- Phase 2: MMA compute ----
+        for (uint kk1 = 0; kk1 < NAX_BK; kk1 += NAX_SK) {
+            for (uint ti = 0; ti < NAX_TM; ti++) {
+                for (uint tk = 0; tk < NAX_TK; tk++) {
+                    uint k_off = kk1 + tk * NAX_UK;
+
+                    // V2: Vectorized A fragment load (half4)
+                    half a_frag[8];
+                    {
+                        uint a_row_base = row_start + tm_base + ti * NAX_UM;
+                        uint a_col_base = kb + k_off;
+                        for (short ri = 0; ri < 2; ri++) {
+                            uint r = a_row_base + uint(ri * 8 + coord.fm);
+                            uint c = a_col_base + uint(coord.fn);
+                            if (align_M || r < uM) {
+                                if (align_K || c + 3 < uK) {
+                                    *reinterpret_cast<thread half4*>(&a_frag[ri * 4]) =
+                                        *reinterpret_cast<device const half4*>(&x[r * uK + c]);
+                                } else {
+                                    for (short cj = 0; cj < 4; cj++) {
+                                        uint ck = c + uint(cj);
+                                        if (ck < uK) {
+                                            a_frag[ri * 4 + cj] = x[r * uK + ck];
+                                        } else {
+                                            a_frag[ri * 4 + cj] = half(0);
+                                        }
+                                    }
+                                }
+                            } else {
+                                *reinterpret_cast<thread half4*>(&a_frag[ri * 4]) = half4(0);
+                            }
+                        }
+                    }
+
+                    // V2: Vectorized B fragment load from TG memory (half4)
+                    half b_frag[16];
+                    {
+                        for (short ni = 0; ni < 2; ni++) {
+                            uint n_off = tn_base + uint(ni * 16);
+                            for (short ri = 0; ri < 2; ri++) {
+                                uint n_idx = n_off + uint(ri * 8 + coord.fm);
+                                uint k_idx = k_off + uint(coord.fn);
+                                *reinterpret_cast<thread half4*>(&b_frag[ni * 8 + ri * 4]) =
+                                    *reinterpret_cast<threadgroup const half4*>(&Ws[n_idx * NAX_BK_PAD + k_idx]);
+                            }
+                        }
+                    }
+
+                    // Invoke MPP matmul2d
+                    {
+                        mpp::tensor_ops::matmul2d<mma_desc, metal::execution_simdgroup> gemm_op;
+
+                        auto ct_a = gemm_op.template get_left_input_cooperative_tensor<half, half, float>();
+                        auto ct_b = gemm_op.template get_right_input_cooperative_tensor<half, half, float>();
+                        auto ct_c = gemm_op.template get_destination_cooperative_tensor<decltype(ct_a), decltype(ct_b), float>();
+
+                        for (int e = 0; e < ct_a.get_capacity(); e++) {
+                            ct_a[e] = a_frag[e];
+                        }
+                        for (int e = 0; e < ct_b.get_capacity(); e++) {
+                            ct_b[e] = b_frag[e];
+                        }
+                        for (int e = 0; e < ct_c.get_capacity(); e++) {
+                            ct_c[e] = acc[ti][e];
+                        }
+
+                        gemm_op.run(ct_a, ct_b, ct_c);
+
+                        for (int e = 0; e < ct_c.get_capacity(); e++) {
+                            acc[ti][e] = ct_c[e];
+                        }
+                    }
+                }  // tk
+            }  // ti
+        }  // kk1
+    }  // kb
+
+    // ---- Store results ----
+    for (uint ti = 0; ti < NAX_TM; ti++) {
+        for (short ni = 0; ni < 2; ni++) {
+            for (short ri = 0; ri < 2; ri++) {
+                uint gr = row_start + tm_base + ti * NAX_UM + uint(ri * 8 + coord.fm);
+                uint gc = col_start + tn_base + uint(ni * 16) + uint(coord.fn);
+
+                if ((align_M || gr < uM) && (align_N || gc + 3 < uN)) {
+                    uint base = uint(ni * 8 + ri * 4);
+                    for (short cj = 0; cj < 4; cj++) {
+                        output[gr * uN + gc + uint(cj)] = half(acc[ti][base + uint(cj)]);
+                    }
+                } else if (align_M || gr < uM) {
+                    uint base = uint(ni * 8 + ri * 4);
+                    for (short cj = 0; cj < 4; cj++) {
+                        if (align_N || gc + uint(cj) < uN) {
+                            output[gr * uN + gc + uint(cj)] = half(acc[ti][base + uint(cj)]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+"#;
+
+// ---------------------------------------------------------------------------
 // Metal shader source -- Steel-architecture Q4 QMM (BM=32, BN=32, BK=32)
 // ---------------------------------------------------------------------------
 
@@ -6040,6 +6330,9 @@ pub fn register_qmm(registry: &KernelRegistry) -> Result<(), KernelError> {
     if let Err(e) = registry.register_jit_source("qmm_nax_q4", QMM_NAX_Q4_SHADER_SOURCE) {
         eprintln!("warning: qmm_nax_q4 registration skipped (MPP unavailable): {e}");
     }
+    if let Err(e) = registry.register_jit_source("qmm_nax_v2_q4", QMM_NAX_V2_Q4_SHADER_SOURCE) {
+        eprintln!("warning: qmm_nax_v2_q4 registration skipped (MPP unavailable): {e}");
+    }
     Ok(())
 }
 
@@ -7613,6 +7906,102 @@ pub fn affine_qmm_nax_q4_into_cb(
 
     // TG memory is statically allocated in the shader (threadgroup half Ws[BN * BK_PAD])
     // No dynamic allocation needed.
+
+    let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
+    let tg = metal::MTLSize::new(128, 1, 1);
+    enc.dispatch_thread_groups(grid, tg);
+    enc.end_encoding();
+
+    Ok(out)
+}
+
+/// NAX V2 Q4 QMM with vectorized dequant (uchar4 loads + half4 stores) and
+/// vectorized fragment loads (half4 for both A and B).
+///
+/// Same tile dimensions and dispatch as V1 (BM=64, BN=64, BK=64, 128 threads).
+/// Reduces dequant phase from 16 scalar loads + 32 scalar stores to
+/// 4 uchar4 loads + 8 half4 stores per thread.
+///
+/// Preconditions (same as V1):
+/// - `x` is Float16 (half) with shape [M, K]
+/// - `qw.bits == 4`
+///
+/// Grid: (ceil(N/64), ceil(M/64), 1), 128 threads/group
+/// TG memory: 9216 bytes (64 × 72 × 2)
+pub fn affine_qmm_nax_v2_q4_into_cb(
+    registry: &KernelRegistry,
+    x: &Array,
+    qw: &QuantizedWeight,
+    cb: &metal::CommandBufferRef,
+) -> Result<Array, KernelError> {
+    if x.dtype() != DType::Float16 {
+        return Err(KernelError::InvalidShape(format!(
+            "affine_qmm_nax_v2_q4_into_cb requires Float16 input x, got {:?}",
+            x.dtype()
+        )));
+    }
+    if x.ndim() != 2 {
+        return Err(KernelError::InvalidShape(format!(
+            "affine_qmm_nax_v2_q4_into_cb requires 2D input x, got {}D",
+            x.ndim()
+        )));
+    }
+    if x.shape()[1] != qw.in_features {
+        return Err(KernelError::InvalidShape(format!(
+            "x.shape[1] ({}) != in_features ({})",
+            x.shape()[1],
+            qw.in_features
+        )));
+    }
+    if qw.bits != 4 {
+        return Err(KernelError::InvalidShape(format!(
+            "affine_qmm_nax_v2_q4_into_cb requires bits==4, got {}",
+            qw.bits
+        )));
+    }
+    let k = qw.in_features;
+    let m = x.shape()[0];
+    let n = qw.out_features;
+
+    let dev = registry.device().raw();
+
+    const NAX_BM: usize = 64;
+    const NAX_BN: usize = 64;
+
+    let m_tiles = m.div_ceil(NAX_BM);
+    let n_tiles = n.div_ceil(NAX_BN);
+    let align_m = m % NAX_BM == 0;
+    let align_n = n % NAX_BN == 0;
+
+    let align_k = k % 64 == 0;
+    let nax_constants = [
+        (200u32, FunctionConstantValue::Bool(align_m)),
+        (201u32, FunctionConstantValue::Bool(align_n)),
+        (205u32, FunctionConstantValue::U32(qw.group_size)),
+        (206u32, FunctionConstantValue::Bool(align_k)),
+    ];
+    let pipeline = registry.get_pipeline_with_constants(
+        "affine_qmm_nax_v2_q4",
+        DType::Float16,
+        &nax_constants,
+    )?;
+
+    let out = Array::uninit(dev, &[m, n], DType::Float16);
+
+    let m_u32 = super::checked_u32(m, "M")?;
+    let n_u32 = super::checked_u32(n, "N")?;
+    let k_u32 = super::checked_u32(k, "K")?;
+
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
+    enc.set_buffer(1, Some(&qw.weights_buf), 0);
+    enc.set_buffer(2, Some(&qw.scales_buf), 0);
+    enc.set_buffer(3, Some(&qw.biases_buf), 0);
+    enc.set_buffer(4, Some(out.metal_buffer()), 0);
+    enc.set_bytes(5, 4, &m_u32 as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(6, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(7, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
 
     let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
     let tg = metal::MTLSize::new(128, 1, 1);

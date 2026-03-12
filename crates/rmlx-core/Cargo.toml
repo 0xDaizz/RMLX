@@ -98,3 +98,7 @@ harness = false
 [[bench]]
 name = "nax_gemm_bench"
 harness = false
+
+[[bench]]
+name = "qmm_nax_bench"
+harness = false
