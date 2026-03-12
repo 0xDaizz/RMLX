@@ -116,6 +116,14 @@ pub struct ExecGraph<'q, 'e> {
     /// [`add_tracked_bytes`] / [`sub_tracked_bytes`] since metal-rs does not
     /// expose `MTLDevice.currentAllocatedSize`.
     tracked_bytes: u64,
+    /// Number of ops (dispatches) recorded since the last actual CB commit.
+    /// Used by chunked pipeline to batch multiple layers into fewer CBs.
+    ops_since_submit: usize,
+    /// Maximum ops per command buffer before auto-submit. When set to
+    /// `usize::MAX` (default), every `submit_batch()` commits immediately
+    /// (legacy behavior). Lower values (e.g. 50) enable chunked pipeline
+    /// where `submit_batch()` becomes a no-op until the threshold is reached.
+    max_ops_per_batch: usize,
 }
 
 impl<'q, 'e> ExecGraph<'q, 'e> {
@@ -138,6 +146,8 @@ impl<'q, 'e> ExecGraph<'q, 'e> {
             last_cb: None,
             memory_config: MemoryConfig::default(),
             tracked_bytes: 0,
+            ops_since_submit: 0,
+            max_ops_per_batch: usize::MAX,
         }
     }
 
@@ -151,6 +161,44 @@ impl<'q, 'e> ExecGraph<'q, 'e> {
     pub fn with_memory_config(mut self, config: MemoryConfig) -> Self {
         self.memory_config = config;
         self
+    }
+
+    /// Set the maximum number of ops per command buffer for chunked pipeline.
+    ///
+    /// When set (e.g. to 50), `submit_batch()` becomes a soft hint that only
+    /// actually commits the CB when the ops threshold is reached. This batches
+    /// multiple transformer layers into fewer, larger command buffers, reducing
+    /// CB creation overhead while maintaining CPU-GPU overlap.
+    ///
+    /// Default is `usize::MAX` (every `submit_batch()` commits immediately).
+    pub fn with_max_ops_per_batch(mut self, max_ops: usize) -> Self {
+        self.max_ops_per_batch = max_ops.max(1);
+        self
+    }
+
+    /// Set the max ops per batch (non-builder variant).
+    pub fn set_max_ops_per_batch(&mut self, max_ops: usize) {
+        self.max_ops_per_batch = max_ops.max(1);
+    }
+
+    /// Record that `count` dispatch ops have been encoded into the current CB.
+    ///
+    /// If the accumulated ops exceed `max_ops_per_batch`, the current CB is
+    /// automatically committed (equivalent to `submit_batch()`).
+    ///
+    /// Returns `Some(EventToken)` if an auto-submit occurred, `None` otherwise.
+    pub fn record_ops(&mut self, count: usize) -> Option<EventToken> {
+        self.ops_since_submit += count;
+        if self.ops_since_submit >= self.max_ops_per_batch {
+            Some(self.force_submit_batch())
+        } else {
+            None
+        }
+    }
+
+    /// Current ops accumulated since last commit.
+    pub fn ops_since_submit(&self) -> usize {
+        self.ops_since_submit
     }
 
     /// Report that `bytes` have been allocated on the GPU.
@@ -214,6 +262,11 @@ impl<'q, 'e> ExecGraph<'q, 'e> {
     /// Returns an `EventToken` that subsequent batches can wait on.
     /// The command buffer is committed but the CPU does not block.
     ///
+    /// When `max_ops_per_batch` is set (via [`with_max_ops_per_batch`]), this
+    /// method becomes a **soft hint**: the CB is only actually committed when
+    /// the accumulated ops reach the threshold. Use [`force_submit_batch`] to
+    /// unconditionally commit regardless of the threshold.
+    ///
     /// If there is no pending work (no encoders were created since the last
     /// submit), this returns the previous token unchanged without incrementing
     /// the counter or submitting an empty command buffer.
@@ -223,10 +276,29 @@ impl<'q, 'e> ExecGraph<'q, 'e> {
                 value: self.counter,
             };
         }
+        // Chunked pipeline: skip commit if below ops threshold
+        if self.max_ops_per_batch < usize::MAX && self.ops_since_submit < self.max_ops_per_batch {
+            return EventToken {
+                value: self.counter,
+            };
+        }
+        self.force_submit_batch()
+    }
+
+    /// Unconditionally submit the current batch, ignoring the ops threshold.
+    ///
+    /// Use this when you need a hard CB boundary (e.g., cross-queue sync).
+    pub fn force_submit_batch(&mut self) -> EventToken {
+        if !self.batcher.has_pending() {
+            return EventToken {
+                value: self.counter,
+            };
+        }
         self.counter += 1;
         let value = self.counter;
         self.last_cb = self.batcher.flush_signal(self.event, value);
         self.total_batches += 1;
+        self.ops_since_submit = 0;
         EventToken { value }
     }
 
@@ -252,11 +324,12 @@ impl<'q, 'e> ExecGraph<'q, 'e> {
     /// This is the **only** point where the CPU blocks on GPU work.
     /// Should be called once at the end of a forward pass.
     pub fn sync(&mut self) -> Result<Duration, EventError> {
-        // Flush any pending work
+        // Flush any pending work (unconditionally, ignoring ops threshold)
         if self.batcher.has_pending() {
             self.counter += 1;
             self.last_cb = self.batcher.flush_signal(self.event, self.counter);
             self.total_batches += 1;
+            self.ops_since_submit = 0;
         }
 
         if self.counter == 0 {
@@ -289,6 +362,7 @@ impl<'q, 'e> ExecGraph<'q, 'e> {
         self.total_batches = 0;
         self.last_cb = None;
         self.tracked_bytes = 0;
+        self.ops_since_submit = 0;
         self.event.reset();
     }
 
@@ -508,5 +582,85 @@ mod tests {
         let stats = ExecGraphStats::from_graph(&graph);
         assert_eq!(stats.total_batches, 2);
         assert_eq!(stats.total_encoders, 5);
+    }
+
+    #[test]
+    fn chunked_pipeline_defers_submit() {
+        let device = metal::Device::system_default().expect("Metal device required");
+        let queue = device.new_command_queue();
+        let event = GpuEvent::new(&device);
+        // Set max_ops_per_batch to 20 — submit_batch() won't commit until 20 ops
+        let mut graph = ExecGraph::new(&queue, &event, 64).with_max_ops_per_batch(20);
+
+        // Simulate 2 "layers" of 9 ops each (total 18 < 20)
+        for _ in 0..2 {
+            let enc = graph.encoder();
+            enc.end_encoding();
+            graph.end_encoder();
+            // submit_batch should be a no-op (below threshold)
+            let t = graph.submit_batch();
+            assert_eq!(t.value(), 0); // no commit happened
+            graph.record_ops(9);
+        }
+        // 18 ops accumulated, 0 CBs committed
+        assert_eq!(graph.total_batches(), 0);
+        assert_eq!(graph.ops_since_submit(), 18);
+
+        // One more "layer" (9 ops) — record_ops should auto-submit at 27 >= 20
+        let enc = graph.encoder();
+        enc.end_encoding();
+        graph.end_encoder();
+        let auto_token = graph.record_ops(9);
+        assert!(auto_token.is_some()); // auto-submit triggered
+        assert_eq!(graph.total_batches(), 1);
+        assert_eq!(graph.ops_since_submit(), 0); // reset after submit
+
+        graph.sync().expect("sync");
+    }
+
+    #[test]
+    fn chunked_pipeline_force_submit_ignores_threshold() {
+        let device = metal::Device::system_default().expect("Metal device required");
+        let queue = device.new_command_queue();
+        let event = GpuEvent::new(&device);
+        let mut graph = ExecGraph::new(&queue, &event, 64).with_max_ops_per_batch(50);
+
+        let enc = graph.encoder();
+        enc.end_encoding();
+        graph.end_encoder();
+
+        // submit_batch is a no-op (0 ops < 50)
+        let t = graph.submit_batch();
+        assert_eq!(t.value(), 0);
+        assert_eq!(graph.total_batches(), 0);
+
+        // force_submit_batch always commits
+        let t = graph.force_submit_batch();
+        assert_eq!(t.value(), 1);
+        assert_eq!(graph.total_batches(), 1);
+
+        graph.sync().expect("sync");
+    }
+
+    #[test]
+    fn chunked_pipeline_sync_flushes_remaining() {
+        let device = metal::Device::system_default().expect("Metal device required");
+        let queue = device.new_command_queue();
+        let event = GpuEvent::new(&device);
+        let mut graph = ExecGraph::new(&queue, &event, 64).with_max_ops_per_batch(100);
+
+        // Encode work but never hit threshold
+        for _ in 0..5 {
+            let enc = graph.encoder();
+            enc.end_encoding();
+            graph.end_encoder();
+            graph.record_ops(9);
+        }
+        assert_eq!(graph.total_batches(), 0); // nothing committed yet
+
+        // sync() should flush remaining work
+        let elapsed = graph.sync().expect("sync");
+        assert!(elapsed.as_secs() < 5);
+        assert_eq!(graph.total_batches(), 1); // flushed in sync
     }
 }

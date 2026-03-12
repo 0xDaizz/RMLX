@@ -1,9 +1,33 @@
 //! Metal command queue management
 
-use metal::{CommandBufferRef, CommandQueue};
+use metal::{CommandBuffer, CommandBufferRef, CommandQueue};
 
 use crate::command::{CommandBufferManager, GpuError, GpuErrorStore};
 use crate::device::GpuDevice;
+
+/// Create a command buffer using `commandBufferWithUnretainedReferences`.
+///
+/// This avoids the retain/release overhead for every Metal resource referenced
+/// by the command buffer.  Safe as long as all referenced buffers (Arrays,
+/// weights, etc.) outlive the command buffer — which is always true in RMLX
+/// because `Array` storage is `Arc`-wrapped.
+///
+/// All Apple Silicon (M1+) supports this API.  On hypothetical older hardware
+/// the regular `new_command_buffer()` path would be needed, but RMLX targets
+/// M-series exclusively so we use unretained unconditionally.
+#[inline]
+pub fn fast_command_buffer(queue: &CommandQueue) -> &CommandBufferRef {
+    queue.new_command_buffer_with_unretained_references()
+}
+
+/// Owned variant: creates an unretained-references command buffer and calls
+/// `.to_owned()` so it survives the autorelease pool.
+#[inline]
+pub fn fast_command_buffer_owned(queue: &CommandQueue) -> CommandBuffer {
+    queue
+        .new_command_buffer_with_unretained_references()
+        .to_owned()
+}
 
 /// Thin wrapper around a Metal command queue.
 ///
@@ -25,14 +49,17 @@ impl GpuQueue {
     }
 
     /// Create a new command buffer from this queue.
+    ///
+    /// Uses `commandBufferWithUnretainedReferences` to skip retain/release
+    /// overhead on referenced resources.
     pub fn new_command_buffer(&self) -> &CommandBufferRef {
-        self.queue.new_command_buffer()
+        fast_command_buffer(&self.queue)
     }
 
     /// Create a new command buffer and register a completion handler that
     /// checks for GPU errors after execution (M4).
     pub fn new_checked_command_buffer(&self) -> &CommandBufferRef {
-        let cb = self.queue.new_command_buffer();
+        let cb = fast_command_buffer(&self.queue);
         let store = std::sync::Arc::clone(&self.error_store);
         let handler = block::ConcreteBlock::new(move |cmd_buf: &CommandBufferRef| {
             let status = cmd_buf.status();

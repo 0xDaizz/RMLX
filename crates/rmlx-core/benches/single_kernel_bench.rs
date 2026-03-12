@@ -160,7 +160,7 @@ fn bench_standard(
 ) -> f64 {
     // Warmup
     for _ in 0..warmup {
-        let cb = queue.new_command_buffer();
+        let cb = queue.new_command_buffer_with_unretained_references();
         let enc = cb.new_compute_command_encoder();
         bufs.encode(enc, pipeline, grid, tg);
         enc.end_encoding();
@@ -172,7 +172,7 @@ fn bench_standard(
     let mut times = Vec::with_capacity(iters);
     for _ in 0..iters {
         let start = Instant::now();
-        let cb = queue.new_command_buffer();
+        let cb = queue.new_command_buffer_with_unretained_references();
         let enc = cb.new_compute_command_encoder();
         bufs.encode(enc, pipeline, grid, tg);
         enc.end_encoding();

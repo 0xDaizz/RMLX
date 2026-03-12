@@ -207,7 +207,7 @@ fn main() {
         // Warmup
         for _ in 0..WARMUP_ITERS {
             let _pool = ScopedPool::new();
-            let cb = queue.new_command_buffer();
+            let cb = queue.new_command_buffer_with_unretained_references();
             cb.commit();
             cb.wait_until_completed();
         }
@@ -217,7 +217,7 @@ fn main() {
         for _ in 0..BENCH_ITERS {
             let _pool = ScopedPool::new();
             let start = Instant::now();
-            let cb = queue.new_command_buffer();
+            let cb = queue.new_command_buffer_with_unretained_references();
             cb.commit();
             cb.wait_until_completed();
             let wall_us = start.elapsed().as_secs_f64() * 1_000_000.0;
@@ -277,7 +277,7 @@ fn main() {
         // Warmup
         for _ in 0..WARMUP_ITERS {
             let _pool = ScopedPool::new();
-            let cb = queue.new_command_buffer();
+            let cb = queue.new_command_buffer_with_unretained_references();
             let enc = cb.new_compute_command_encoder();
             encode_gemm(
                 enc,
@@ -308,7 +308,7 @@ fn main() {
         for _ in 0..BENCH_ITERS {
             let _pool = ScopedPool::new();
             let start = Instant::now();
-            let cb = queue.new_command_buffer();
+            let cb = queue.new_command_buffer_with_unretained_references();
             let enc = cb.new_compute_command_encoder();
             encode_gemm(
                 enc,

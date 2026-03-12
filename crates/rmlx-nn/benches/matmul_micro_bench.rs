@@ -121,7 +121,7 @@ where
     F: FnOnce(&metal::CommandBufferRef),
 {
     let _pool = ScopedPool::new();
-    let cb = queue.new_command_buffer();
+    let cb = queue.new_command_buffer_with_unretained_references();
     let start = Instant::now();
     f(cb);
     cb.commit();
@@ -209,7 +209,7 @@ fn main() {
             for shape in SHAPES {
                 let a = rand_array(device, &[*m, shape.k], 42);
                 let b = rand_array(device, &[shape.k, shape.n], 43);
-                let cb = warmup_queue.new_command_buffer();
+                let cb = warmup_queue.new_command_buffer_with_unretained_references();
                 let _ =
                     ops::matmul::matmul_into_cb(&registry, &a, &b, cb).expect("jit warmup matmul");
                 cb.commit();

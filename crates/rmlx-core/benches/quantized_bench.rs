@@ -441,7 +441,7 @@ fn bench_qmm_nax(
 
     // Warmup
     for _ in 0..WARMUP_ITERS {
-        let cb = queue.new_command_buffer();
+        let cb = queue.new_command_buffer_with_unretained_references();
         let _ = ops::quantized::affine_qmm_nax_q4_into_cb(registry, &x_f16, &qw, cb)
             .expect("NAX warmup failed");
         cb.commit();
@@ -451,7 +451,7 @@ fn bench_qmm_nax(
     // Bench
     let mut times = Vec::with_capacity(BENCH_ITERS);
     for _ in 0..BENCH_ITERS {
-        let cb = queue.new_command_buffer();
+        let cb = queue.new_command_buffer_with_unretained_references();
         let start = Instant::now();
         let _ = ops::quantized::affine_qmm_nax_q4_into_cb(registry, &x_f16, &qw, cb)
             .expect("NAX bench failed");
@@ -519,7 +519,7 @@ fn bench_qmm_nax_vs_mma(
     let x_f16 = rand_f16_array(device, &[m, k], 99);
 
     for _ in 0..WARMUP_ITERS {
-        let cb = queue.new_command_buffer();
+        let cb = queue.new_command_buffer_with_unretained_references();
         let _ = ops::quantized::affine_qmm_nax_q4_into_cb(registry, &x_f16, &qw_nax, cb)
             .expect("NAX warmup failed");
         cb.commit();
@@ -527,7 +527,7 @@ fn bench_qmm_nax_vs_mma(
     }
     let mut nax_times = Vec::with_capacity(BENCH_ITERS);
     for _ in 0..BENCH_ITERS {
-        let cb = queue.new_command_buffer();
+        let cb = queue.new_command_buffer_with_unretained_references();
         let start = Instant::now();
         let _ = ops::quantized::affine_qmm_nax_q4_into_cb(registry, &x_f16, &qw_nax, cb)
             .expect("NAX bench failed");

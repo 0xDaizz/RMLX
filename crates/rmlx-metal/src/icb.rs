@@ -119,7 +119,7 @@ impl IcbReplay {
             return;
         }
 
-        let cb = queue.new_command_buffer();
+        let cb = queue.new_command_buffer_with_unretained_references();
 
         for dispatch in &self.dispatches {
             let enc = cb.new_compute_command_encoder();

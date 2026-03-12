@@ -144,14 +144,14 @@ fn main() {
     // ---- Step 1: Bare CB overhead (empty command buffer) ----
     println!("--- Bare Command Buffer Overhead ---");
     for _ in 0..WARMUP {
-        let cb = queue.new_command_buffer();
+        let cb = queue.new_command_buffer_with_unretained_references();
         cb.commit();
         cb.wait_until_completed();
     }
     let mut bare_times = Vec::with_capacity(ITERS);
     for _ in 0..ITERS {
         let start = Instant::now();
-        let cb = queue.new_command_buffer();
+        let cb = queue.new_command_buffer_with_unretained_references();
         cb.commit();
         cb.wait_until_completed();
         bare_times.push(start.elapsed().as_secs_f64() * 1e6);
@@ -199,7 +199,7 @@ fn main() {
 
         // --- Warmup (single dispatch) ---
         for _ in 0..WARMUP {
-            let cb = queue.new_command_buffer();
+            let cb = queue.new_command_buffer_with_unretained_references();
             let enc = cb.new_compute_command_encoder();
             encode_gemm(
                 enc,
@@ -226,7 +226,7 @@ fn main() {
         let mut wall_1 = Vec::with_capacity(ITERS);
         for _ in 0..ITERS {
             let start = Instant::now();
-            let cb = queue.new_command_buffer();
+            let cb = queue.new_command_buffer_with_unretained_references();
             let enc = cb.new_compute_command_encoder();
             encode_gemm(
                 enc,
@@ -252,7 +252,7 @@ fn main() {
 
         // --- Warmup (batch dispatch) ---
         for _ in 0..WARMUP {
-            let cb = queue.new_command_buffer();
+            let cb = queue.new_command_buffer_with_unretained_references();
             for _ in 0..BATCH_N {
                 let enc = cb.new_compute_command_encoder();
                 encode_gemm(
@@ -281,7 +281,7 @@ fn main() {
         let mut wall_batch = Vec::with_capacity(ITERS);
         for _ in 0..ITERS {
             let start = Instant::now();
-            let cb = queue.new_command_buffer();
+            let cb = queue.new_command_buffer_with_unretained_references();
             for _ in 0..BATCH_N {
                 let enc = cb.new_compute_command_encoder();
                 encode_gemm(
@@ -359,7 +359,7 @@ fn main() {
     // We time only the encoding portion.
     let mut encode_times = Vec::with_capacity(100);
     for _ in 0..100 {
-        let cb = queue.new_command_buffer();
+        let cb = queue.new_command_buffer_with_unretained_references();
         let start = Instant::now();
         let enc = cb.new_compute_command_encoder();
         encode_gemm(

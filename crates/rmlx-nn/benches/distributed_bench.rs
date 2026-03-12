@@ -309,7 +309,7 @@ fn bench_optimized_single_cb(
 ) -> Stats {
     println!("\n=== Optimized: forward_single_cb() — all ops in one command buffer ===");
     run_bench("optimized_single_cb", || {
-        let cb = queue.new_command_buffer();
+        let cb = queue.new_command_buffer_with_unretained_references();
         let _ = block
             .forward_single_cb(input, None, None, None, None, registry, cb)
             .expect("single_cb forward");
@@ -331,7 +331,7 @@ fn bench_sharded_compute(
     println!("\n=== TP-sharded compute (half-size weights, single-CB, no allreduce) ===");
     println!("  Simulates rank 0 of TP=2: Q/K/V/gate/up halved, O/down halved.");
     run_bench("sharded_single_cb (TP=2 rank0)", || {
-        let cb = queue.new_command_buffer();
+        let cb = queue.new_command_buffer_with_unretained_references();
         let _ = block
             .forward_single_cb(input, None, None, None, None, registry, cb)
             .expect("sharded forward");

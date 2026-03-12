@@ -54,7 +54,7 @@ impl<'q> CommandBufferManager<'q> {
     /// from reclaiming it before commit.
     pub fn get_or_create_buffer(&mut self) -> &CommandBufferRef {
         if self.current_cb.is_none() {
-            let cb = self.queue.new_command_buffer().to_owned();
+            let cb = crate::queue::fast_command_buffer_owned(self.queue);
             self.current_cb = Some(cb);
         }
         self.current_cb.as_ref().unwrap()

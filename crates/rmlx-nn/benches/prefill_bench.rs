@@ -409,7 +409,7 @@ fn main() {
                     let _pool = ScopedPool::new();
                     for _ in 0..WARMUP_ITERS {
                         cache_cb.seq_len = 0;
-                        let cb = queue_cb.new_command_buffer();
+                        let cb = queue_cb.new_command_buffer_with_unretained_references();
                         let out = block_cb
                             .forward_prefill_single_cb(
                                 &input,
@@ -447,7 +447,7 @@ fn main() {
                     let _pool = ScopedPool::new();
                     for _ in 0..BENCH_ITERS {
                         cache_cb.seq_len = 0;
-                        let cb = queue_cb.new_command_buffer();
+                        let cb = queue_cb.new_command_buffer_with_unretained_references();
                         let start = Instant::now();
                         let _ = block_cb
                             .forward_prefill_single_cb(
@@ -591,7 +591,7 @@ fn main() {
                     let _pool = ScopedPool::new();
                     for _ in 0..WARMUP_ITERS {
                         cache_enc.seq_len = 0;
-                        let cb = queue_enc.new_command_buffer();
+                        let cb = queue_enc.new_command_buffer_with_unretained_references();
                         let encoder = cb.new_compute_command_encoder();
                         let out = block_enc
                             .forward_prefill_single_encoder(
@@ -631,7 +631,7 @@ fn main() {
                     let _pool = ScopedPool::new();
                     for _ in 0..BENCH_ITERS {
                         cache_enc.seq_len = 0;
-                        let cb = queue_enc.new_command_buffer();
+                        let cb = queue_enc.new_command_buffer_with_unretained_references();
                         let encoder = cb.new_compute_command_encoder();
                         let start = Instant::now();
                         let _ = block_enc
@@ -848,7 +848,7 @@ fn bench_dispatch_breakdown(
                     MAX_SEQ_LEN,
                     DType::Float16,
                 );
-                let cb = queue.new_command_buffer();
+                let cb = queue.new_command_buffer_with_unretained_references();
                 let start = Instant::now();
                 let _ = block
                     .forward_prefill_single_cb(
@@ -1013,7 +1013,7 @@ fn bench_cumulative_breakdown(
                 MAX_SEQ_LEN,
                 DType::Float16,
             );
-            let cb = queue.new_command_buffer();
+            let cb = queue.new_command_buffer_with_unretained_references();
             let encoder = cb.new_compute_command_encoder();
             let _ = block
                 .forward_prefill_single_encoder(
@@ -1039,7 +1039,7 @@ fn bench_cumulative_breakdown(
                 MAX_SEQ_LEN,
                 DType::Float16,
             );
-            let cb = queue.new_command_buffer();
+            let cb = queue.new_command_buffer_with_unretained_references();
             let encoder = cb.new_compute_command_encoder();
             let start = std::time::Instant::now();
             let _ = block

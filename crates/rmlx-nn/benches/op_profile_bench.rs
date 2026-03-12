@@ -232,7 +232,7 @@ where
     F: FnOnce(&metal::CommandBufferRef),
 {
     let _pool = ScopedPool::new();
-    let cb = queue.new_command_buffer();
+    let cb = queue.new_command_buffer_with_unretained_references();
     let start = Instant::now();
     f(cb);
     cb.commit();
@@ -393,14 +393,14 @@ fn main() {
         // Run a small matmul to trigger NAX/MlxArch GEMM PSO compilation
         let a_warm = rand_array(device, &[64, HIDDEN_SIZE], 999);
         let b_warm = rand_array(device, &[HIDDEN_SIZE, TOTAL_QKV], 998);
-        let cb = setup_queue.new_command_buffer();
+        let cb = setup_queue.new_command_buffer_with_unretained_references();
         let _ = ops::matmul::matmul_into_cb(&registry, &a_warm, &b_warm, cb).expect("jit matmul");
         cb.commit();
         cb.wait_until_completed();
 
         // Run RMSNorm
         let x_warm = rand_array(device, &[64, HIDDEN_SIZE], 997);
-        let cb = setup_queue.new_command_buffer();
+        let cb = setup_queue.new_command_buffer_with_unretained_references();
         let _ =
             ops::rms_norm::rms_norm_into_cb(&registry, &x_warm, Some(&norm1_w), RMS_NORM_EPS, cb)
                 .expect("jit rms_norm");
@@ -409,7 +409,7 @@ fn main() {
 
         // Run matmul with residual (triggers residual PSO variant)
         let c_warm = rand_array(device, &[64, TOTAL_QKV], 996);
-        let cb = setup_queue.new_command_buffer();
+        let cb = setup_queue.new_command_buffer_with_unretained_references();
         let _ = ops::matmul::matmul_add_residual_into_cb(&registry, &a_warm, &b_warm, &c_warm, cb)
             .expect("jit matmul_residual");
         cb.commit();
@@ -420,7 +420,7 @@ fn main() {
             let q_warm = rand_array(device, &[1, NUM_HEADS, 64, HEAD_DIM], 995);
             let k_warm = rand_array(device, &[1, NUM_KV_HEADS, 64, HEAD_DIM], 994);
             let v_warm = rand_array(device, &[1, NUM_KV_HEADS, 64, HEAD_DIM], 993);
-            let cb = setup_queue.new_command_buffer();
+            let cb = setup_queue.new_command_buffer_with_unretained_references();
             let _ = ops::sdpa::sdpa_prefill_nax_f16_into_cb(
                 &registry,
                 &q_warm,
@@ -446,21 +446,21 @@ fn main() {
         // Additional sizes to trigger alignment variants
         let a2 = rand_array(device, &[128, HIDDEN_SIZE], 992);
         let b2 = rand_array(device, &[HIDDEN_SIZE, HIDDEN_SIZE], 991);
-        let cb = setup_queue.new_command_buffer();
+        let cb = setup_queue.new_command_buffer_with_unretained_references();
         let _ = ops::matmul::matmul_into_cb(&registry, &a2, &b2, cb).expect("jit matmul 2");
         cb.commit();
         cb.wait_until_completed();
 
         let a3 = rand_array(device, &[128, INTERMEDIATE_DIM], 990);
         let b3 = rand_array(device, &[INTERMEDIATE_DIM, HIDDEN_SIZE], 989);
-        let cb = setup_queue.new_command_buffer();
+        let cb = setup_queue.new_command_buffer_with_unretained_references();
         let _ = ops::matmul::matmul_into_cb(&registry, &a3, &b3, cb).expect("jit matmul 3");
         cb.commit();
         cb.wait_until_completed();
 
         // Fused SiLU*mul PSO
         let gate_up_warm = rand_array(device, &[64, INTERMEDIATE_DIM * 2], 988);
-        let cb = setup_queue.new_command_buffer();
+        let cb = setup_queue.new_command_buffer_with_unretained_references();
         let _ = ops::fused::fused_silu_mul_strided_into_cb(
             &registry,
             &gate_up_warm,
@@ -475,7 +475,7 @@ fn main() {
         let q_rope_warm = rand_array(device, &[64, Q_DIM], 987);
         let cos_w = cos_full.slice(0, 0, 64).expect("cos slice");
         let sin_w = sin_full.slice(0, 0, 64).expect("sin slice");
-        let cb = setup_queue.new_command_buffer();
+        let cb = setup_queue.new_command_buffer_with_unretained_references();
         let _ = ops::rope::rope_multihead_into_cb(
             &registry,
             &q_rope_warm,
@@ -493,13 +493,13 @@ fn main() {
         // Residual add PSO
         let r1 = rand_array(device, &[64, HIDDEN_SIZE], 986);
         let r2 = rand_array(device, &[64, HIDDEN_SIZE], 985);
-        let cb = setup_queue.new_command_buffer();
+        let cb = setup_queue.new_command_buffer_with_unretained_references();
         let _ = ops::binary::add_into_cb(&registry, &r1, &r2, cb).expect("jit add");
         cb.commit();
         cb.wait_until_completed();
 
         // Fused residual+norm PSO
-        let cb = setup_queue.new_command_buffer();
+        let cb = setup_queue.new_command_buffer_with_unretained_references();
         let _ = ops::rms_norm::rms_norm_residual_add_into_cb(
             &registry,
             &r1,
@@ -557,7 +557,7 @@ fn main() {
         // 1. RMSNorm -> normed
         let normed = {
             let _pool = ScopedPool::new();
-            let cb = queue.new_command_buffer();
+            let cb = queue.new_command_buffer_with_unretained_references();
             let r = ops::rms_norm::rms_norm_into_cb(
                 &registry,
                 &input,
@@ -575,7 +575,7 @@ fn main() {
         // 2. QKV GEMM -> qkv
         let qkv = {
             let _pool = ScopedPool::new();
-            let cb = queue.new_command_buffer();
+            let cb = queue.new_command_buffer_with_unretained_references();
             let r = ops::matmul::matmul_into_cb(&registry, &normed_2d, &qkv_wt, cb)
                 .expect("qkv matmul");
             cb.commit();
@@ -610,7 +610,7 @@ fn main() {
         // 4. RoPE + Deinterleave
         let (q_batched, k_batched, v_batched) = {
             let _pool = ScopedPool::new();
-            let cb = queue.new_command_buffer();
+            let cb = queue.new_command_buffer_with_unretained_references();
             let qb = ops::rope::rope_multihead_into_cb(
                 &registry,
                 &q_view,
@@ -660,7 +660,7 @@ fn main() {
 
         let attn_slab = {
             let _pool = ScopedPool::new();
-            let cb = queue.new_command_buffer();
+            let cb = queue.new_command_buffer_with_unretained_references();
             let r = if use_nax {
                 ops::sdpa::sdpa_prefill_nax_f16_into_cb(
                     &registry,
@@ -742,7 +742,7 @@ fn main() {
             );
             let interleaved = {
                 let _pool = ScopedPool::new();
-                let cb = queue.new_command_buffer();
+                let cb = queue.new_command_buffer_with_unretained_references();
                 let r =
                     ops::rope::interleave_heads_into_cb(&registry, &packed, NUM_HEADS, seq_len, cb)
                         .expect("interleave_heads");
@@ -756,7 +756,7 @@ fn main() {
         // 7. O projection
         let o_out = {
             let _pool = ScopedPool::new();
-            let cb = queue.new_command_buffer();
+            let cb = queue.new_command_buffer_with_unretained_references();
             let r =
                 ops::matmul::matmul_into_cb(&registry, &attn_concat, &w_o_t, cb).expect("o_proj");
             cb.commit();
@@ -767,7 +767,7 @@ fn main() {
         // 8. Fused residual + RMSNorm (matches forward_prefill_single_cb)
         let (normed2, h) = {
             let _pool = ScopedPool::new();
-            let cb = queue.new_command_buffer();
+            let cb = queue.new_command_buffer_with_unretained_references();
             let r = ops::rms_norm::rms_norm_residual_add_into_cb(
                 &registry,
                 &o_out, // attention output
@@ -788,7 +788,7 @@ fn main() {
         // 9. Gate+Up GEMM
         let gate_up_out = {
             let _pool = ScopedPool::new();
-            let cb = queue.new_command_buffer();
+            let cb = queue.new_command_buffer_with_unretained_references();
             let r = ops::matmul::matmul_into_cb(&registry, &normed2_2d, &gate_up_wt, cb)
                 .expect("gate_up");
             cb.commit();
@@ -799,7 +799,7 @@ fn main() {
         // 10. SiLU*mul (strided)
         let hidden_act = {
             let _pool = ScopedPool::new();
-            let cb = queue.new_command_buffer();
+            let cb = queue.new_command_buffer_with_unretained_references();
             let r = ops::fused::fused_silu_mul_strided_into_cb(
                 &registry,
                 &gate_up_out,
@@ -815,7 +815,7 @@ fn main() {
         // 11. Down proj
         let ffn_out = {
             let _pool = ScopedPool::new();
-            let cb = queue.new_command_buffer();
+            let cb = queue.new_command_buffer_with_unretained_references();
             let r = ops::matmul::matmul_into_cb(&registry, &hidden_act, &w_down_t, cb)
                 .expect("down_proj");
             cb.commit();

@@ -238,7 +238,7 @@ fn bench_pipeline(
 
     // Warmup
     for _ in 0..WARMUP_ITERS {
-        let cb = queue.new_command_buffer();
+        let cb = queue.new_command_buffer_with_unretained_references();
         for _ in 0..N_LAYERS {
             let _ =
                 ops::quantized::affine_quantized_matmul_batched_into_cb(registry, &x, &qw_gate, cb)
@@ -258,7 +258,7 @@ fn bench_pipeline(
     // Measure
     let mut times = Vec::with_capacity(BENCH_ITERS);
     for _ in 0..BENCH_ITERS {
-        let cb = queue.new_command_buffer();
+        let cb = queue.new_command_buffer_with_unretained_references();
         let start = Instant::now();
         for _ in 0..N_LAYERS {
             let _ =

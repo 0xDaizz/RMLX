@@ -103,7 +103,7 @@ fn bench_gemm(
     iters: usize,
 ) -> Stats {
     for _ in 0..warmup {
-        let cb = queue.new_command_buffer();
+        let cb = queue.new_command_buffer_with_unretained_references();
         let _ = ops::matmul::matmul_into_cb(registry, a, b, cb).unwrap();
         cb.commit();
         cb.wait_until_completed();
@@ -111,7 +111,7 @@ fn bench_gemm(
     let mut times = Vec::with_capacity(iters);
     for _ in 0..iters {
         let start = Instant::now();
-        let cb = queue.new_command_buffer();
+        let cb = queue.new_command_buffer_with_unretained_references();
         let _ = ops::matmul::matmul_into_cb(registry, a, b, cb).unwrap();
         cb.commit();
         cb.wait_until_completed();
@@ -133,7 +133,7 @@ fn bench_rms_norm(
     let mut times = Vec::with_capacity(iters);
     for _ in 0..iters {
         let start = Instant::now();
-        let cb = queue.new_command_buffer();
+        let cb = queue.new_command_buffer_with_unretained_references();
         let _ = ops::rms_norm::rms_norm_into_cb(registry, input, None, 1e-5, cb);
         cb.commit();
         cb.wait_until_completed();
@@ -207,7 +207,7 @@ fn main() {
         {
             let norm_input = rand_array(device, &[1024, 4096], 200);
             for _ in 0..10 {
-                let cb = queue.new_command_buffer();
+                let cb = queue.new_command_buffer_with_unretained_references();
                 let _ = ops::rms_norm::rms_norm_into_cb(&registry, &norm_input, None, 1e-5, cb);
                 cb.commit();
                 cb.wait_until_completed();
@@ -231,7 +231,7 @@ fn main() {
 
             // Warmup combo
             for _ in 0..WARMUP {
-                let cb = queue.new_command_buffer();
+                let cb = queue.new_command_buffer_with_unretained_references();
                 let _ = ops::rms_norm::rms_norm_into_cb(&registry, &norm_input, None, 1e-5, cb);
                 let _ = ops::matmul::matmul_into_cb(&registry, &a, &b, cb).unwrap();
                 cb.commit();
@@ -242,7 +242,7 @@ fn main() {
             let mut combo_times = Vec::with_capacity(ITERS);
             for _ in 0..ITERS {
                 let start = Instant::now();
-                let cb = queue.new_command_buffer();
+                let cb = queue.new_command_buffer_with_unretained_references();
                 let _ = ops::rms_norm::rms_norm_into_cb(&registry, &norm_input, None, 1e-5, cb);
                 let _ = ops::matmul::matmul_into_cb(&registry, &a, &b, cb).unwrap();
                 cb.commit();
@@ -280,7 +280,7 @@ fn main() {
         {
             let polluter = rand_array(device, &[8192, 8192], 400); // ~128MB f16
                                                                    // Run a dummy op on polluter to push GEMM data out of caches
-            let cb = queue.new_command_buffer();
+            let cb = queue.new_command_buffer_with_unretained_references();
             let _ = ops::rms_norm::rms_norm_into_cb(&registry, &polluter, None, 1e-5, cb);
             cb.commit();
             cb.wait_until_completed();

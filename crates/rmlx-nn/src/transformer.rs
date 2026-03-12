@@ -4169,6 +4169,17 @@ pub enum ForwardMode {
     /// Decode mode: multiple CBs per layer (existing forward_graph behavior).
     #[default]
     Decode,
+    /// Chunked decode: ops-based auto-submit batches ~N layers per CB.
+    ///
+    /// Instead of committing a CB after every layer, the ExecGraph accumulates
+    /// ops and only commits when the threshold is reached (~50 ops = ~5 layers).
+    /// Metal's single-queue FIFO ordering guarantees correctness without
+    /// explicit barriers between layers within the same CB.
+    ChunkedDecode {
+        /// Maximum dispatch ops per command buffer before auto-commit.
+        /// Recommended: 50 (matches MLX's strategy on M3 Ultra).
+        max_ops_per_cb: usize,
+    },
 }
 
 pub struct TransformerModel {
@@ -4467,8 +4478,15 @@ impl TransformerModel {
         let encoder_limit = match mode {
             ForwardMode::Decode => 32,
             ForwardMode::Prefill { .. } => 64,
+            // Chunked decode: raise encoder limit to accommodate ~50 ops/CB
+            ForwardMode::ChunkedDecode { max_ops_per_cb } => max_ops_per_cb.max(64),
         };
         let mut graph = ExecGraph::new(queue, event, encoder_limit);
+
+        // Configure chunked pipeline if requested
+        if let ForwardMode::ChunkedDecode { max_ops_per_cb } = mode {
+            graph.set_max_ops_per_batch(max_ops_per_cb);
+        }
 
         match mode {
             ForwardMode::Decode => {
@@ -4486,6 +4504,30 @@ impl TransformerModel {
                         queue,
                     )?;
                     let _t = graph.submit_batch();
+                }
+            }
+            ForwardMode::ChunkedDecode { .. } => {
+                // Chunked decode: same layer forward as Decode, but submit_batch()
+                // calls inside forward_graph + this loop are soft hints — the CB is
+                // only committed when accumulated ops reach max_ops_per_cb.
+                // After each layer, record ~9 dispatches (the typical count for a
+                // decode layer: norm, QKV proj, RoPE×2, deinterleave, SDPA, copy,
+                // O_proj+residual, norm2, gate+up+silu, down+residual).
+                let mut cache = cache;
+                for (i, layer) in self.layers.iter().enumerate() {
+                    let layer_cache = cache.as_mut().map(|c| &mut c[i]);
+                    x = layer.forward_graph(
+                        &x,
+                        cos_freqs,
+                        sin_freqs,
+                        mask,
+                        layer_cache,
+                        registry,
+                        &mut graph,
+                        queue,
+                    )?;
+                    // Record ~9 ops per decode layer; auto-submits when threshold reached
+                    graph.record_ops(9);
                 }
             }
             ForwardMode::Prefill { layers_per_cb } => {
@@ -4525,6 +4567,7 @@ impl TransformerModel {
 
         let sync_label = match mode {
             ForwardMode::Decode => "TransformerModel graph sync",
+            ForwardMode::ChunkedDecode { .. } => "chunked decode graph sync",
             ForwardMode::Prefill { .. } => "prefill graph sync",
         };
         graph
@@ -4583,6 +4626,39 @@ impl TransformerModel {
             mask,
             Some(cache),
             ForwardMode::Prefill { layers_per_cb: 4 },
+            registry,
+            queue,
+            event,
+        )
+    }
+
+    /// Chunked decode forward: batches ~50 ops per CB for reduced overhead.
+    ///
+    /// Instead of 4+ CBs per layer (the `Decode` default), this path accumulates
+    /// dispatch ops and only commits a CB when the threshold is reached. With 32
+    /// layers at ~9 ops/layer, this reduces total CBs from ~128 to ~6.
+    ///
+    /// Delegates to [`forward_graph_unified`] with `ChunkedDecode` mode.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_graph_chunked(
+        &self,
+        token_ids: &[u32],
+        cos_freqs: Option<&Array>,
+        sin_freqs: Option<&Array>,
+        mask: Option<&Array>,
+        cache: Option<&mut Vec<LayerKvCache>>,
+        registry: &KernelRegistry,
+        queue: &metal::CommandQueue,
+        event: &GpuEvent,
+    ) -> Result<Array, KernelError> {
+        let cache_slice = cache.map(|v| v.as_mut_slice());
+        self.forward_graph_unified(
+            token_ids,
+            cos_freqs,
+            sin_freqs,
+            mask,
+            cache_slice,
+            ForwardMode::ChunkedDecode { max_ops_per_cb: 50 },
             registry,
             queue,
             event,

@@ -7691,7 +7691,10 @@ pub fn matmul_add_residual_into_cb(
     let tile = {
         let default = select_tile_config_with_nax(m, n, k, a.dtype(), supports_nax);
         match default.variant {
-            TileVariant::MlxArch | TileVariant::NaxArch | TileVariant::NaxArch64x128 | TileVariant::NaxArch64x64 => default,
+            TileVariant::MlxArch
+            | TileVariant::NaxArch
+            | TileVariant::NaxArch64x128
+            | TileVariant::NaxArch64x64 => default,
             _ => TileConfig {
                 bm: 64,
                 bn: 64,
@@ -7879,7 +7882,10 @@ pub fn matmul_add_residual_encode(
     let tile = {
         let default = select_tile_config_with_nax(m, n, k, a.dtype(), supports_nax);
         match default.variant {
-            TileVariant::MlxArch | TileVariant::NaxArch | TileVariant::NaxArch64x128 | TileVariant::NaxArch64x64 => default,
+            TileVariant::MlxArch
+            | TileVariant::NaxArch
+            | TileVariant::NaxArch64x128
+            | TileVariant::NaxArch64x64 => default,
             _ => TileConfig {
                 bm: 64,
                 bn: 64,
