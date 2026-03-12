@@ -3852,6 +3852,45 @@ pub enum TileVariant {
     NaxArch,
 }
 
+impl TileVariant {
+    /// Threads per threadgroup for each variant.
+    #[inline(always)]
+    pub const fn threads_per_tg(self) -> u64 {
+        match self {
+            Self::Small => 256,
+            Self::Medium | Self::Simd => 1024,
+            Self::Skinny => 256,
+            Self::Full => 256,
+            Self::MlxArch => 128,
+            Self::MlxArchSmall | Self::MlxArchMicro => 64,
+            Self::NaxArch => 512,
+        }
+    }
+
+    /// Whether this variant uses tile-swizzle (buffer index 9).
+    #[inline(always)]
+    pub const fn has_swizzle(self) -> bool {
+        match self {
+            Self::Full
+            | Self::Skinny
+            | Self::MlxArch
+            | Self::MlxArchSmall
+            | Self::MlxArchMicro
+            | Self::NaxArch => true,
+            Self::Small | Self::Medium | Self::Simd => false,
+        }
+    }
+
+    /// Whether this variant uses function constants for alignment specialization.
+    #[inline(always)]
+    pub const fn uses_function_constants(self) -> bool {
+        match self {
+            Self::MlxArch | Self::MlxArchSmall | Self::MlxArchMicro | Self::NaxArch => true,
+            Self::Small | Self::Medium | Self::Simd | Self::Skinny | Self::Full => false,
+        }
+    }
+}
+
 /// Select the best tile configuration based on matrix dimensions.
 ///
 /// Dispatch hierarchy:
@@ -4434,12 +4473,7 @@ fn dispatch_tiled_gemm(
         }
     };
 
-    // MlxArch/MlxArchSmall/NaxArch use function constants for alignment specialization
-    let pipeline = if tile.variant == TileVariant::MlxArch
-        || tile.variant == TileVariant::MlxArchSmall
-        || tile.variant == TileVariant::MlxArchMicro
-        || tile.variant == TileVariant::NaxArch
-    {
+    let pipeline = if tile.variant.uses_function_constants() {
         let constants = matmul_align_constants(m, n, k, tile.bm, tile.bn, tile.bk);
         registry.get_pipeline_with_constants(kernel_name, a.dtype(), &constants)?
     } else {
@@ -4472,36 +4506,17 @@ fn dispatch_tiled_gemm(
         super::checked_u32(batch_stride_c, "batch_stride_c")?,
     );
 
-    // Pass swizzle_log for Full, Skinny, MlxArch, MlxArchSmall, NaxArch variants
-    match tile.variant {
-        TileVariant::Full
-        | TileVariant::Skinny
-        | TileVariant::MlxArch
-        | TileVariant::MlxArchSmall
-        | TileVariant::MlxArchMicro
-        | TileVariant::NaxArch => {
-            let swizzle_log = compute_swizzle_log(m, n, tile.bm, tile.bn);
-            set_u32(enc, gemm::SWIZZLE_LOG, swizzle_log);
-        }
-        _ => {}
-    };
+    if tile.variant.has_swizzle() {
+        let swizzle_log = compute_swizzle_log(m, n, tile.bm, tile.bn);
+        set_u32(enc, gemm::SWIZZLE_LOG, swizzle_log);
+    }
 
-    let grid_x = ceil_div(n, tile.bn) as u64;
-    let grid_y = ceil_div(m, tile.bm) as u64;
-    let grid_z = batch as u64;
-    let grid = MTLSize::new(grid_x, grid_y, grid_z);
-
-    // Thread count per threadgroup depends on variant
-    let tg_threads = match tile.variant {
-        TileVariant::Small => 256_u64,
-        TileVariant::Medium | TileVariant::Simd => 1024_u64,
-        TileVariant::Skinny => 256_u64,
-        TileVariant::Full => 256_u64,
-        TileVariant::MlxArch => 128_u64,
-        TileVariant::MlxArchSmall | TileVariant::MlxArchMicro => 64_u64,
-        TileVariant::NaxArch => 512_u64,
-    };
-    let tg = MTLSize::new(tg_threads, 1, 1);
+    let grid = MTLSize::new(
+        ceil_div(n, tile.bn) as u64,
+        ceil_div(m, tile.bm) as u64,
+        batch as u64,
+    );
+    let tg = MTLSize::new(tile.variant.threads_per_tg(), 1, 1);
 
     enc.dispatch_thread_groups(grid, tg);
     enc.end_encoding();
@@ -4838,12 +4853,7 @@ pub fn matmul_into_cb(
         }
     };
 
-    // MlxArch/MlxArchSmall/NaxArch use function constants for alignment specialization
-    let pipeline = if tile.variant == TileVariant::MlxArch
-        || tile.variant == TileVariant::MlxArchSmall
-        || tile.variant == TileVariant::MlxArchMicro
-        || tile.variant == TileVariant::NaxArch
-    {
+    let pipeline = if tile.variant.uses_function_constants() {
         let constants = matmul_align_constants(m, n, k, tile.bm, tile.bn, tile.bk);
         registry.get_pipeline_with_constants(kernel_name, a.dtype(), &constants)?
     } else {
@@ -4915,35 +4925,13 @@ fn encode_gemm_core(
         super::checked_u32(batch_stride_c, "batch_stride_c")?,
     );
 
-    // Pass swizzle_log for Full, Skinny, MlxArch, MlxArchSmall, NaxArch variants
-    match tile.variant {
-        TileVariant::Full
-        | TileVariant::Skinny
-        | TileVariant::MlxArch
-        | TileVariant::MlxArchSmall
-        | TileVariant::MlxArchMicro
-        | TileVariant::NaxArch => {
-            let swizzle_log = compute_swizzle_log(m, n, tile.bm, tile.bn);
-            set_u32(enc, gemm::SWIZZLE_LOG, swizzle_log);
-        }
-        _ => {}
-    };
+    if tile.variant.has_swizzle() {
+        let swizzle_log = compute_swizzle_log(m, n, tile.bm, tile.bn);
+        set_u32(enc, gemm::SWIZZLE_LOG, swizzle_log);
+    }
 
-    let grid_x = ceil_div(n, tile.bn) as u64;
-    let grid_y = ceil_div(m, tile.bm) as u64;
-    let grid = MTLSize::new(grid_x, grid_y, 1); // batch=1
-
-    // Thread count per threadgroup depends on variant
-    let tg_threads = match tile.variant {
-        TileVariant::Small => 256_u64,
-        TileVariant::Medium | TileVariant::Simd => 1024_u64,
-        TileVariant::Skinny => 256_u64,
-        TileVariant::Full => 256_u64,
-        TileVariant::MlxArch => 128_u64,
-        TileVariant::MlxArchSmall | TileVariant::MlxArchMicro => 64_u64,
-        TileVariant::NaxArch => 512_u64,
-    };
-    let tg = MTLSize::new(tg_threads, 1, 1);
+    let grid = MTLSize::new(ceil_div(n, tile.bn) as u64, ceil_div(m, tile.bm) as u64, 1);
+    let tg = MTLSize::new(tile.variant.threads_per_tg(), 1, 1);
 
     enc.dispatch_thread_groups(grid, tg);
 
@@ -5056,11 +5044,7 @@ pub fn matmul_encode(
         }
     };
 
-    let pipeline = if tile.variant == TileVariant::MlxArch
-        || tile.variant == TileVariant::MlxArchSmall
-        || tile.variant == TileVariant::MlxArchMicro
-        || tile.variant == TileVariant::NaxArch
-    {
+    let pipeline = if tile.variant.uses_function_constants() {
         let constants = matmul_align_constants(m, n, k, tile.bm, tile.bn, tile.bk);
         registry.get_pipeline_with_constants(kernel_name, a.dtype(), &constants)?
     } else {
@@ -5260,12 +5244,7 @@ pub fn matmul_add_residual_into_cb(
     let grid_x = ceil_div(n, tile.bn) as u64;
     let grid_y = ceil_div(m, tile.bm) as u64;
     let grid = MTLSize::new(grid_x, grid_y, 1);
-    let tg_threads = if tile.variant == TileVariant::NaxArch {
-        512_u64
-    } else {
-        128_u64
-    };
-    let tg = MTLSize::new(tg_threads, 1, 1);
+    let tg = MTLSize::new(tile.variant.threads_per_tg(), 1, 1);
     enc.dispatch_thread_groups(grid, tg);
     enc.end_encoding();
 
@@ -5444,12 +5423,7 @@ pub fn matmul_add_residual_encode(
     let grid_x = ceil_div(n, tile.bn) as u64;
     let grid_y = ceil_div(m, tile.bm) as u64;
     let grid = MTLSize::new(grid_x, grid_y, 1);
-    let tg_threads = if tile.variant == TileVariant::NaxArch {
-        512_u64
-    } else {
-        128_u64
-    };
-    let tg = MTLSize::new(tg_threads, 1, 1);
+    let tg = MTLSize::new(tile.variant.threads_per_tg(), 1, 1);
     encoder.dispatch_thread_groups(grid, tg);
 
     Ok(out)
@@ -5595,7 +5569,7 @@ pub fn matmul_norm_gemm_into_cb(
     let grid_x = ceil_div(n, tile.bn) as u64;
     let grid_y = ceil_div(m, tile.bm) as u64;
     let grid = MTLSize::new(grid_x, grid_y, 1);
-    let tg = MTLSize::new(128, 1, 1); // MlxArch = 128 threads (4 SG)
+    let tg = MTLSize::new(tile.variant.threads_per_tg(), 1, 1);
     enc.dispatch_thread_groups(grid, tg);
     enc.end_encoding();
 
@@ -5714,7 +5688,7 @@ pub fn matmul_swiglu_gemm_into_cb(
     let grid_x = ceil_div(n, tile.bn) as u64;
     let grid_y = ceil_div(m, tile.bm) as u64;
     let grid = MTLSize::new(grid_x, grid_y, 1);
-    let tg = MTLSize::new(128, 1, 1); // MlxArch = 128 threads (4 SG)
+    let tg = MTLSize::new(tile.variant.threads_per_tg(), 1, 1);
     enc.dispatch_thread_groups(grid, tg);
     enc.end_encoding();
 
