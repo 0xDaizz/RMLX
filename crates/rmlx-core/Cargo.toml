@@ -90,3 +90,7 @@ harness = false
 [[bench]]
 name = "skinny_diagnostic_bench"
 harness = false
+
+[[bench]]
+name = "rust_opt_bench"
+harness = false
