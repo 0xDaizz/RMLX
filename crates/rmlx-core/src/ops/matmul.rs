@@ -6816,9 +6816,9 @@ pub fn matmul(
             let n_splits = optimal_splitk_nsplits(m, n, k);
             return dispatch_split_k_f16(registry, a, b, queue, m, n, k, n_splits);
         }
-        // M=65~128: use Split-K only when N is not much larger than K
-        if (65..=128).contains(&m) && n <= k * 2 {
-            let n_splits = if k > n * 2 { 4 } else { 3 };
+        // M=65~128: use Split-K for all shapes (benchmark-validated)
+        if (65..=128).contains(&m) {
+            let n_splits = optimal_splitk_nsplits(m, n, k);
             return dispatch_split_k_f16(registry, a, b, queue, m, n, k, n_splits);
         }
     }

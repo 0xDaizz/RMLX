@@ -59,3 +59,7 @@ harness = false
 [[bench]]
 name = "dispatch_gpu_time_bench"
 harness = false
+
+[[bench]]
+name = "e2e_prefill_bench"
+harness = false
