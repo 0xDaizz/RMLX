@@ -1,3 +1,7 @@
+//! ⚠️ NON-PRODUCTION PATH — Q4 QMM low-M kernel tuning with direct kernel encoding.
+//! Per-op sync CB overhead included. Development/tuning only.
+//! For production throughput, use e2e_prefill_bench (prefill) or pipeline_bench (decode).
+//!
 //! Low-M Q4 QMM Benchmark — comprehensive kernel comparison for MoE expert inference.
 //!
 //! Tests all available Q4 QMM kernel approaches at low-M (M=1,4,8,16,32)
@@ -329,7 +333,7 @@ fn bench_nax(
     let x_f16 = rand_f16_array(device, &[m, k], 99);
 
     for _ in 0..WARMUP_ITERS {
-        let cb = queue.new_command_buffer();
+        let cb = queue.new_command_buffer_with_unretained_references();
         let _ = ops::quantized::affine_qmm_nax_q4_into_cb(registry, &x_f16, &qw, cb)
             .expect("NAX warmup failed");
         cb.commit();
@@ -338,7 +342,7 @@ fn bench_nax(
 
     let mut times = Vec::with_capacity(BENCH_ITERS);
     for _ in 0..BENCH_ITERS {
-        let cb = queue.new_command_buffer();
+        let cb = queue.new_command_buffer_with_unretained_references();
         let start = Instant::now();
         let _ = ops::quantized::affine_qmm_nax_q4_into_cb(registry, &x_f16, &qw, cb)
             .expect("NAX bench failed");

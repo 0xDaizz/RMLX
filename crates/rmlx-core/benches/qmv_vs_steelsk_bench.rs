@@ -1,3 +1,7 @@
+//! ⚠️ NON-PRODUCTION PATH — QMV kernel comparison with direct encoding.
+//! Development/tuning only. Bypasses production dispatch.
+//! For production throughput, use e2e_prefill_bench (prefill) or pipeline_bench (decode).
+//!
 //! QMV-batch vs Steel Split-K diagnostic benchmark
 //!
 //! Compares the two dispatch paths at MoE-critical low-M dimensions:

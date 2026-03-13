@@ -162,7 +162,7 @@ impl StreamManager {
         let state = self.streams.get(&stream_id).ok_or_else(|| {
             MetalError::KernelNotFound(format!("stream {stream_id} does not exist"))
         })?;
-        Ok(state.queue.new_command_buffer().to_owned())
+        Ok(crate::queue::fast_command_buffer_owned(&state.queue))
     }
 
     /// Create a [`CommandBufferManager`] for the given stream.

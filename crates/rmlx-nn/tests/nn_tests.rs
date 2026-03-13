@@ -907,8 +907,9 @@ fn test_transformer_model_forward() {
         },
     };
 
-    let model = TransformerModel::from_parts(config, embedding, vec![block], final_norm, lm_head)
-        .expect("TransformerModel::from_parts failed");
+    let mut model =
+        TransformerModel::from_parts(config, embedding, vec![block], final_norm, lm_head)
+            .expect("TransformerModel::from_parts failed");
 
     // Forward pass with 3 tokens
     let token_ids = [0u32, 1, 2];

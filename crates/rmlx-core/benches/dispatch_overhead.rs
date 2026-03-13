@@ -1,3 +1,7 @@
+//! ⚠️ NON-PRODUCTION PATH — Metal dispatch overhead profiling (CB create/commit/wait costs).
+//! Diagnostic only; does not test production forward path.
+//! For production throughput, use e2e_prefill_bench (prefill) or pipeline_bench (decode).
+//!
 //! F-1: Metal dispatch overhead profiling benchmark.
 //!
 //! Quantifies CB (Command Buffer) creation/commit/wait costs:
@@ -144,7 +148,7 @@ fn bench_empty_dispatch(queue: &metal::CommandQueue) {
 
     // Warmup
     for _ in 0..WARMUP_ITERS {
-        let cb = queue.new_command_buffer();
+        let cb = queue.new_command_buffer_with_unretained_references();
         cb.commit();
         cb.wait_until_completed();
     }
@@ -153,7 +157,7 @@ fn bench_empty_dispatch(queue: &metal::CommandQueue) {
     let mut times = Vec::with_capacity(BENCH_ITERS);
     for _ in 0..BENCH_ITERS {
         let start = Instant::now();
-        let cb = queue.new_command_buffer();
+        let cb = queue.new_command_buffer_with_unretained_references();
         cb.commit();
         cb.wait_until_completed();
         times.push(start.elapsed());
@@ -163,7 +167,7 @@ fn bench_empty_dispatch(queue: &metal::CommandQueue) {
 
     // Bench: CB with empty compute encoder
     for _ in 0..WARMUP_ITERS {
-        let cb = queue.new_command_buffer();
+        let cb = queue.new_command_buffer_with_unretained_references();
         let enc = cb.new_compute_command_encoder();
         enc.end_encoding();
         cb.commit();
@@ -173,7 +177,7 @@ fn bench_empty_dispatch(queue: &metal::CommandQueue) {
     let mut times = Vec::with_capacity(BENCH_ITERS);
     for _ in 0..BENCH_ITERS {
         let start = Instant::now();
-        let cb = queue.new_command_buffer();
+        let cb = queue.new_command_buffer_with_unretained_references();
         let enc = cb.new_compute_command_encoder();
         enc.end_encoding();
         cb.commit();
@@ -230,7 +234,7 @@ fn bench_cb_vs_encoder(
         // --- NCB-1encoder: N separate command buffers, each with 1 matmul ---
         for _ in 0..WARMUP_ITERS {
             for _ in 0..n {
-                let cb = queue.new_command_buffer();
+                let cb = queue.new_command_buffer_with_unretained_references();
                 let _ = ops::matmul::matmul_into_cb(registry, &a, &b, cb).unwrap();
                 cb.commit();
                 cb.wait_until_completed();
@@ -241,7 +245,7 @@ fn bench_cb_vs_encoder(
         for _ in 0..BENCH_ITERS {
             let start = Instant::now();
             for _ in 0..n {
-                let cb = queue.new_command_buffer();
+                let cb = queue.new_command_buffer_with_unretained_references();
                 let _ = ops::matmul::matmul_into_cb(registry, &a, &b, cb).unwrap();
                 cb.commit();
                 cb.wait_until_completed();
@@ -252,7 +256,7 @@ fn bench_cb_vs_encoder(
 
         // --- 1CB-N encoder: 1 command buffer, N matmuls encoded sequentially ---
         for _ in 0..WARMUP_ITERS {
-            let cb = queue.new_command_buffer();
+            let cb = queue.new_command_buffer_with_unretained_references();
             for _ in 0..n {
                 let _ = ops::matmul::matmul_into_cb(registry, &a, &b, cb).unwrap();
             }
@@ -263,7 +267,7 @@ fn bench_cb_vs_encoder(
         let mut times_1cb = Vec::with_capacity(BENCH_ITERS);
         for _ in 0..BENCH_ITERS {
             let start = Instant::now();
-            let cb = queue.new_command_buffer();
+            let cb = queue.new_command_buffer_with_unretained_references();
             for _ in 0..n {
                 let _ = ops::matmul::matmul_into_cb(registry, &a, &b, cb).unwrap();
             }
@@ -360,7 +364,7 @@ fn bench_moe_expert_layer_ops(
 
             // Individual CB per op
             for _ in 0..WARMUP_ITERS {
-                let cb = queue.new_command_buffer();
+                let cb = queue.new_command_buffer_with_unretained_references();
                 op_fn(registry, cb);
                 cb.commit();
                 cb.wait_until_completed();
@@ -368,7 +372,7 @@ fn bench_moe_expert_layer_ops(
             let mut times_ind = Vec::with_capacity(BENCH_ITERS);
             for _ in 0..BENCH_ITERS {
                 let start = Instant::now();
-                let cb = queue.new_command_buffer();
+                let cb = queue.new_command_buffer_with_unretained_references();
                 op_fn(registry, cb);
                 cb.commit();
                 cb.wait_until_completed();
@@ -378,7 +382,7 @@ fn bench_moe_expert_layer_ops(
             // Batched: 16 of same op in one CB, divide time by 16
             let batch_n: u32 = 16;
             for _ in 0..WARMUP_ITERS {
-                let cb = queue.new_command_buffer();
+                let cb = queue.new_command_buffer_with_unretained_references();
                 for _ in 0..batch_n {
                     op_fn(registry, cb);
                 }
@@ -388,7 +392,7 @@ fn bench_moe_expert_layer_ops(
             let mut times_bat = Vec::with_capacity(BENCH_ITERS);
             for _ in 0..BENCH_ITERS {
                 let start = Instant::now();
-                let cb = queue.new_command_buffer();
+                let cb = queue.new_command_buffer_with_unretained_references();
                 for _ in 0..batch_n {
                     op_fn(registry, cb);
                 }
@@ -613,7 +617,7 @@ fn bench_moe_expert_layer_ops(
             }),
         ];
         for op_fn in &ops_list {
-            let cb = queue.new_command_buffer();
+            let cb = queue.new_command_buffer_with_unretained_references();
             op_fn(registry, cb);
             cb.commit();
             cb.wait_until_completed();
@@ -621,7 +625,7 @@ fn bench_moe_expert_layer_ops(
     };
 
     let do_layer_batched = || {
-        let cb = queue.new_command_buffer();
+        let cb = queue.new_command_buffer_with_unretained_references();
         let _ = ops::rms_norm::rms_norm_into_cb(registry, &x, Some(&norm_w), RMS_NORM_EPS, cb);
         let _ = ops::matmul::matmul_into_cb(registry, &x, &wq, cb);
         let _ = ops::matmul::matmul_into_cb(registry, &x, &wk, cb);

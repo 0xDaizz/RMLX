@@ -1,3 +1,7 @@
+//! ⚠️ NON-PRODUCTION PATH — pipelined QMM encoding (96 QMMs in 1 CB) measures kernel
+//! throughput with amortized CB overhead, but bypasses TransformerModel dispatch logic.
+//! For production throughput, use e2e_prefill_bench (prefill) or pipeline_bench (decode).
+//!
 //! Q4 Pipeline Benchmark — per-op vs pipeline (96 QMMs, 1 sync) comparison.
 //!
 //! Measures the dispatch overhead amortization benefit of encoding 32 layers × 3 QMMs
@@ -238,7 +242,7 @@ fn bench_pipeline(
 
     // Warmup
     for _ in 0..WARMUP_ITERS {
-        let cb = queue.new_command_buffer();
+        let cb = queue.new_command_buffer_with_unretained_references();
         for _ in 0..N_LAYERS {
             let _ =
                 ops::quantized::affine_quantized_matmul_batched_into_cb(registry, &x, &qw_gate, cb)
@@ -258,7 +262,7 @@ fn bench_pipeline(
     // Measure
     let mut times = Vec::with_capacity(BENCH_ITERS);
     for _ in 0..BENCH_ITERS {
-        let cb = queue.new_command_buffer();
+        let cb = queue.new_command_buffer_with_unretained_references();
         let start = Instant::now();
         for _ in 0..N_LAYERS {
             let _ =

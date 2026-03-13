@@ -1,3 +1,7 @@
+//! ⚠️ NON-PRODUCTION PATH — GPU timestamp per-op profiling. Diagnostic only;
+//! measures pure GPU execution time per op, not production TransformerModel forward path.
+//! For production throughput, use e2e_prefill_bench (prefill) or pipeline_bench (decode).
+//!
 //! GPU-timestamp-based per-operation profiling benchmark for RMLX prefill.
 //!
 //! Unlike `op_profile_bench.rs` which uses `Instant::now()` (wall-clock),
@@ -237,7 +241,7 @@ where
     F: FnOnce(&metal::CommandBufferRef),
 {
     let _pool = ScopedPool::new();
-    let cb = queue.new_command_buffer();
+    let cb = queue.new_command_buffer_with_unretained_references();
     let wall_start = Instant::now();
     f(cb);
     cb.commit();
@@ -426,7 +430,7 @@ fn main() {
                 DType::Float16,
             );
             let _ = block
-                .forward_prefill_single_cb(
+                .forward_prefill_into_cb(
                     &input,
                     Some(&cos_freqs),
                     Some(&sin_freqs),
@@ -451,7 +455,7 @@ fn main() {
             );
             let encoder = cb.new_compute_command_encoder();
             let _ = block
-                .forward_prefill_single_encoder(
+                .forward_prefill_into_encoder(
                     &input,
                     Some(&cos_freqs),
                     Some(&sin_freqs),
@@ -469,7 +473,7 @@ fn main() {
         // 1. RMSNorm -> normed
         let normed = {
             let _pool = ScopedPool::new();
-            let cb = queue.new_command_buffer();
+            let cb = queue.new_command_buffer_with_unretained_references();
             let r = ops::rms_norm::rms_norm_into_cb(
                 &registry,
                 &input,
@@ -487,7 +491,7 @@ fn main() {
         // 2. QKV GEMM -> qkv
         let qkv = {
             let _pool = ScopedPool::new();
-            let cb = queue.new_command_buffer();
+            let cb = queue.new_command_buffer_with_unretained_references();
             let r = ops::matmul::matmul_into_cb(&registry, &normed_2d, &qkv_wt, cb)
                 .expect("qkv matmul");
             cb.commit();
@@ -522,7 +526,7 @@ fn main() {
         // 4. RoPE + Deinterleave
         let (q_batched, k_batched, v_batched) = {
             let _pool = ScopedPool::new();
-            let cb = queue.new_command_buffer();
+            let cb = queue.new_command_buffer_with_unretained_references();
             let qb = ops::rope::rope_multihead_into_cb(
                 &registry,
                 &q_view,
@@ -569,7 +573,7 @@ fn main() {
 
         let attn_slab = {
             let _pool = ScopedPool::new();
-            let cb = queue.new_command_buffer();
+            let cb = queue.new_command_buffer_with_unretained_references();
             let r = if use_nax {
                 ops::sdpa::sdpa_prefill_nax_f16_into_cb(
                     &registry,
@@ -650,7 +654,7 @@ fn main() {
             );
             let interleaved = {
                 let _pool = ScopedPool::new();
-                let cb = queue.new_command_buffer();
+                let cb = queue.new_command_buffer_with_unretained_references();
                 let r =
                     ops::rope::interleave_heads_into_cb(&registry, &packed, NUM_HEADS, seq_len, cb)
                         .expect("interleave_heads");
@@ -664,7 +668,7 @@ fn main() {
         // 7. O projection
         let o_out = {
             let _pool = ScopedPool::new();
-            let cb = queue.new_command_buffer();
+            let cb = queue.new_command_buffer_with_unretained_references();
             let r =
                 ops::matmul::matmul_into_cb(&registry, &attn_concat, &w_o_t, cb).expect("o_proj");
             cb.commit();
@@ -675,7 +679,7 @@ fn main() {
         // 8. Fused residual + RMSNorm
         let (normed2, h) = {
             let _pool = ScopedPool::new();
-            let cb = queue.new_command_buffer();
+            let cb = queue.new_command_buffer_with_unretained_references();
             let r = ops::rms_norm::rms_norm_residual_add_into_cb(
                 &registry,
                 &o_out,
@@ -696,7 +700,7 @@ fn main() {
         // 9. Gate+Up GEMM
         let gate_up_out = {
             let _pool = ScopedPool::new();
-            let cb = queue.new_command_buffer();
+            let cb = queue.new_command_buffer_with_unretained_references();
             let r = ops::matmul::matmul_into_cb(&registry, &normed2_2d, &gate_up_wt, cb)
                 .expect("gate_up");
             cb.commit();
@@ -707,7 +711,7 @@ fn main() {
         // 10. SiLU*mul (strided)
         let hidden_act = {
             let _pool = ScopedPool::new();
-            let cb = queue.new_command_buffer();
+            let cb = queue.new_command_buffer_with_unretained_references();
             let r = ops::fused::fused_silu_mul_strided_into_cb(
                 &registry,
                 &gate_up_out,
@@ -723,7 +727,7 @@ fn main() {
         // 11. Down proj
         let ffn_out = {
             let _pool = ScopedPool::new();
-            let cb = queue.new_command_buffer();
+            let cb = queue.new_command_buffer_with_unretained_references();
             let r = ops::matmul::matmul_into_cb(&registry, &hidden_act, &w_down_t, cb)
                 .expect("down_proj");
             cb.commit();

@@ -1,3 +1,7 @@
+//! ⚠️ NON-PRODUCTION PATH — Q4 QMM dispatch through quantized_matmul() sync path.
+//! Per-op CB overhead included; throughput not representative of production pipelining.
+//! For production throughput, use e2e_prefill_bench (prefill) or pipeline_bench (decode).
+//!
 //! QMM Dispatch Benchmark — Steel vs NAX vs Auto at multiple M values.
 //!
 //! Tests Q4 QMM across M = {1, 4, 8, 16, 32, 64, 128, 256, 512, 1024}
@@ -325,7 +329,7 @@ fn bench_nax(
     let x_f16 = rand_f16_array(device, &[m, k], 99);
 
     for _ in 0..WARMUP_ITERS {
-        let cb = queue.new_command_buffer();
+        let cb = queue.new_command_buffer_with_unretained_references();
         let _ = ops::quantized::affine_qmm_nax_q4_into_cb(registry, &x_f16, &qw, cb)
             .expect("NAX warmup failed");
         cb.commit();
@@ -334,7 +338,7 @@ fn bench_nax(
 
     let mut times = Vec::with_capacity(BENCH_ITERS);
     for _ in 0..BENCH_ITERS {
-        let cb = queue.new_command_buffer();
+        let cb = queue.new_command_buffer_with_unretained_references();
         let start = Instant::now();
         let _ = ops::quantized::affine_qmm_nax_q4_into_cb(registry, &x_f16, &qw, cb)
             .expect("NAX bench failed");

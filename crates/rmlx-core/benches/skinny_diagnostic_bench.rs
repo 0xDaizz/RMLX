@@ -1,3 +1,7 @@
+//! ⚠️ NON-PRODUCTION PATH — skinny GEMM diagnostic with direct kernel encoding.
+//! Development only; compares Skinny-SK/Steel/NAX dispatch paths at MoE dimensions.
+//! For production throughput, use e2e_prefill_bench (prefill) or pipeline_bench (decode).
+//!
 //! Skinny Split-K Diagnostic Benchmark
 //!
 //! Isolates Skinny Split-K performance components at MoE-critical dimensions.
@@ -332,7 +336,7 @@ fn bench_nax(
     let x = rand_f16_array(device, &[m, k], 99);
 
     for _ in 0..WARMUP_ITERS {
-        let cb = queue.new_command_buffer();
+        let cb = queue.new_command_buffer_with_unretained_references();
         let _ = ops::quantized::affine_qmm_nax_q4_into_cb(registry, &x, &qw, cb)
             .expect("nax warmup failed");
         cb.commit();
@@ -341,7 +345,7 @@ fn bench_nax(
 
     let mut times = Vec::with_capacity(BENCH_ITERS);
     for _ in 0..BENCH_ITERS {
-        let cb = queue.new_command_buffer();
+        let cb = queue.new_command_buffer_with_unretained_references();
         let start = Instant::now();
         let _ = ops::quantized::affine_qmm_nax_q4_into_cb(registry, &x, &qw, cb)
             .expect("nax bench failed");

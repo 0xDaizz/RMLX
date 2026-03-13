@@ -1,3 +1,7 @@
+//! ⚠️ NON-PRODUCTION PATH — residual fusion (GEMM+add) testing with per-op sync CB.
+//! Tests fused vs unfused epilogue dispatch, not the full TransformerModel forward path.
+//! For production throughput, use e2e_prefill_bench (prefill) or pipeline_bench (decode).
+//!
 //! GEMM + residual epilogue fusion benchmark (Phase H-2).
 //!
 //! Compares two approaches:
@@ -155,7 +159,7 @@ fn bench_separate(
 
     // Warmup
     for _ in 0..WARMUP_ITERS {
-        let cb = queue.new_command_buffer();
+        let cb = queue.new_command_buffer_with_unretained_references();
         let c = ops::matmul::matmul_into_cb(registry, &a, &b, cb).unwrap();
         let _ = ops::binary::add_into_cb(registry, &c, &residual, cb).unwrap();
         cb.commit();
@@ -164,7 +168,7 @@ fn bench_separate(
     let mut times = Vec::with_capacity(BENCH_ITERS);
     for _ in 0..BENCH_ITERS {
         let start = Instant::now();
-        let cb = queue.new_command_buffer();
+        let cb = queue.new_command_buffer_with_unretained_references();
         let c = ops::matmul::matmul_into_cb(registry, &a, &b, cb).unwrap();
         let _ = ops::binary::add_into_cb(registry, &c, &residual, cb).unwrap();
         cb.commit();
@@ -201,7 +205,7 @@ fn bench_fused(
 
     // Probe: try one fused dispatch; if unsupported, skip gracefully.
     {
-        let cb = queue.new_command_buffer();
+        let cb = queue.new_command_buffer_with_unretained_references();
         match ops::matmul::matmul_add_residual_into_cb(registry, &a, &b, &residual, cb) {
             Ok(_) => {
                 cb.commit();
@@ -217,7 +221,7 @@ fn bench_fused(
 
     // Warmup (first probe already served as one warmup iter)
     for _ in 1..WARMUP_ITERS {
-        let cb = queue.new_command_buffer();
+        let cb = queue.new_command_buffer_with_unretained_references();
         let _ = ops::matmul::matmul_add_residual_into_cb(registry, &a, &b, &residual, cb).unwrap();
         cb.commit();
         cb.wait_until_completed();
@@ -225,7 +229,7 @@ fn bench_fused(
     let mut times = Vec::with_capacity(BENCH_ITERS);
     for _ in 0..BENCH_ITERS {
         let start = Instant::now();
-        let cb = queue.new_command_buffer();
+        let cb = queue.new_command_buffer_with_unretained_references();
         let _ = ops::matmul::matmul_add_residual_into_cb(registry, &a, &b, &residual, cb).unwrap();
         cb.commit();
         cb.wait_until_completed();

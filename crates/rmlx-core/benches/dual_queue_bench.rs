@@ -1,3 +1,7 @@
+//! ⚠️ NON-PRODUCTION PATH — dual-queue concurrency experiment. Not production dispatch;
+//! tests whether two MTLCommandQueues provide wall-time overlap.
+//! For production throughput, use e2e_prefill_bench (prefill) or pipeline_bench (decode).
+//!
 //! Dual-queue concurrent execution benchmark for Apple Silicon Metal.
 //!
 //! Tests whether running two independent GPU workloads on separate

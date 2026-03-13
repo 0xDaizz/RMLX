@@ -18,6 +18,7 @@
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
+use crate::ops::buffer_slots::{inv_rms, rms_norm as rms_slots, rms_norm_residual};
 use metal::MTLSize;
 
 pub const RMS_NORM_SHADER_SOURCE: &str = r#"
@@ -1070,17 +1071,37 @@ pub fn rms_norm_into_cb(
 
     let encoder = cb.new_compute_command_encoder();
     encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
+    encoder.set_buffer(
+        rms_slots::INPUT,
+        Some(input.metal_buffer()),
+        input.offset() as u64,
+    );
     if let Some(w) = weight {
-        encoder.set_buffer(1, Some(w.metal_buffer()), w.offset() as u64);
+        encoder.set_buffer(rms_slots::WEIGHT, Some(w.metal_buffer()), w.offset() as u64);
     } else {
-        encoder.set_buffer(1, Some(input.metal_buffer()), 0);
+        encoder.set_buffer(rms_slots::WEIGHT, Some(input.metal_buffer()), 0);
     }
-    encoder.set_buffer(2, Some(out.metal_buffer()), 0);
-    encoder.set_bytes(3, 4, &axis_size as *const u32 as *const std::ffi::c_void);
-    encoder.set_bytes(4, 4, &eps as *const f32 as *const std::ffi::c_void);
-    encoder.set_bytes(5, 4, &w_stride as *const u32 as *const std::ffi::c_void);
-    encoder.set_bytes(6, 4, &has_w as *const u32 as *const std::ffi::c_void);
+    encoder.set_buffer(rms_slots::OUT, Some(out.metal_buffer()), 0);
+    encoder.set_bytes(
+        rms_slots::AXIS_SIZE,
+        4,
+        &axis_size as *const u32 as *const std::ffi::c_void,
+    );
+    encoder.set_bytes(
+        rms_slots::EPS,
+        4,
+        &eps as *const f32 as *const std::ffi::c_void,
+    );
+    encoder.set_bytes(
+        rms_slots::W_STRIDE,
+        4,
+        &w_stride as *const u32 as *const std::ffi::c_void,
+    );
+    encoder.set_bytes(
+        rms_slots::HAS_W,
+        4,
+        &has_w as *const u32 as *const std::ffi::c_void,
+    );
 
     let tg_size = std::cmp::min(1024, pipeline.max_total_threads_per_threadgroup());
     encoder.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), MTLSize::new(tg_size, 1, 1));
@@ -1136,17 +1157,37 @@ pub fn rms_norm_into_encoder(
     let out = Array::uninit(registry.device().raw(), input.shape(), input.dtype());
 
     encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
+    encoder.set_buffer(
+        rms_slots::INPUT,
+        Some(input.metal_buffer()),
+        input.offset() as u64,
+    );
     if let Some(w) = weight {
-        encoder.set_buffer(1, Some(w.metal_buffer()), w.offset() as u64);
+        encoder.set_buffer(rms_slots::WEIGHT, Some(w.metal_buffer()), w.offset() as u64);
     } else {
-        encoder.set_buffer(1, Some(input.metal_buffer()), 0);
+        encoder.set_buffer(rms_slots::WEIGHT, Some(input.metal_buffer()), 0);
     }
-    encoder.set_buffer(2, Some(out.metal_buffer()), 0);
-    encoder.set_bytes(3, 4, &axis_size as *const u32 as *const std::ffi::c_void);
-    encoder.set_bytes(4, 4, &eps as *const f32 as *const std::ffi::c_void);
-    encoder.set_bytes(5, 4, &w_stride as *const u32 as *const std::ffi::c_void);
-    encoder.set_bytes(6, 4, &has_w as *const u32 as *const std::ffi::c_void);
+    encoder.set_buffer(rms_slots::OUT, Some(out.metal_buffer()), 0);
+    encoder.set_bytes(
+        rms_slots::AXIS_SIZE,
+        4,
+        &axis_size as *const u32 as *const std::ffi::c_void,
+    );
+    encoder.set_bytes(
+        rms_slots::EPS,
+        4,
+        &eps as *const f32 as *const std::ffi::c_void,
+    );
+    encoder.set_bytes(
+        rms_slots::W_STRIDE,
+        4,
+        &w_stride as *const u32 as *const std::ffi::c_void,
+    );
+    encoder.set_bytes(
+        rms_slots::HAS_W,
+        4,
+        &has_w as *const u32 as *const std::ffi::c_void,
+    );
 
     let tg_size = std::cmp::min(1024, pipeline.max_total_threads_per_threadgroup());
     encoder.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), MTLSize::new(tg_size, 1, 1));
@@ -1177,13 +1218,29 @@ pub fn rms_norm_preresolved_into_encoder(
     encoder: &metal::ComputeCommandEncoderRef,
 ) {
     encoder.set_compute_pipeline_state(pso);
-    encoder.set_buffer(0, Some(input_buf), input_offset);
-    encoder.set_buffer(1, Some(weight_buf), weight_offset);
-    encoder.set_buffer(2, Some(out_buf), out_offset);
-    encoder.set_bytes(3, 4, &axis_size as *const u32 as *const std::ffi::c_void);
-    encoder.set_bytes(4, 4, &eps as *const f32 as *const std::ffi::c_void);
-    encoder.set_bytes(5, 4, &w_stride as *const u32 as *const std::ffi::c_void);
-    encoder.set_bytes(6, 4, &has_w as *const u32 as *const std::ffi::c_void);
+    encoder.set_buffer(rms_slots::INPUT, Some(input_buf), input_offset);
+    encoder.set_buffer(rms_slots::WEIGHT, Some(weight_buf), weight_offset);
+    encoder.set_buffer(rms_slots::OUT, Some(out_buf), out_offset);
+    encoder.set_bytes(
+        rms_slots::AXIS_SIZE,
+        4,
+        &axis_size as *const u32 as *const std::ffi::c_void,
+    );
+    encoder.set_bytes(
+        rms_slots::EPS,
+        4,
+        &eps as *const f32 as *const std::ffi::c_void,
+    );
+    encoder.set_bytes(
+        rms_slots::W_STRIDE,
+        4,
+        &w_stride as *const u32 as *const std::ffi::c_void,
+    );
+    encoder.set_bytes(
+        rms_slots::HAS_W,
+        4,
+        &has_w as *const u32 as *const std::ffi::c_void,
+    );
     let tg_size = std::cmp::min(1024, pso.max_total_threads_per_threadgroup());
     encoder.dispatch_thread_groups(MTLSize::new(rows, 1, 1), MTLSize::new(tg_size, 1, 1));
 }
@@ -1240,10 +1297,22 @@ pub fn compute_inv_rms(
 
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
-    enc.set_buffer(1, Some(out.metal_buffer()), 0);
-    enc.set_bytes(2, 4, &axis_size as *const u32 as *const std::ffi::c_void);
-    enc.set_bytes(3, 4, &eps as *const f32 as *const std::ffi::c_void);
+    enc.set_buffer(
+        inv_rms::INPUT,
+        Some(input.metal_buffer()),
+        input.offset() as u64,
+    );
+    enc.set_buffer(inv_rms::OUT, Some(out.metal_buffer()), 0);
+    enc.set_bytes(
+        inv_rms::AXIS_SIZE,
+        4,
+        &axis_size as *const u32 as *const std::ffi::c_void,
+    );
+    enc.set_bytes(
+        inv_rms::EPS,
+        4,
+        &eps as *const f32 as *const std::ffi::c_void,
+    );
 
     let tg_size = std::cmp::min(1024, pipeline.max_total_threads_per_threadgroup());
     enc.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), MTLSize::new(tg_size, 1, 1));
@@ -1353,18 +1422,42 @@ pub fn rms_norm_residual_add(
     let command_buffer = queue.new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();
     encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
     encoder.set_buffer(
-        1,
+        rms_norm_residual::INPUT,
+        Some(input.metal_buffer()),
+        input.offset() as u64,
+    );
+    encoder.set_buffer(
+        rms_norm_residual::RESIDUAL,
         Some(residual_buf.metal_buffer()),
         residual_buf.offset() as u64,
     );
-    encoder.set_buffer(2, Some(weight.metal_buffer()), weight.offset() as u64);
-    encoder.set_buffer(3, Some(out.metal_buffer()), 0);
-    encoder.set_bytes(4, 4, &axis_size as *const u32 as *const std::ffi::c_void);
-    encoder.set_bytes(5, 4, &eps as *const f32 as *const std::ffi::c_void);
-    encoder.set_bytes(6, 4, &w_stride as *const u32 as *const std::ffi::c_void);
-    encoder.set_bytes(7, 4, &has_w as *const u32 as *const std::ffi::c_void);
+    encoder.set_buffer(
+        rms_norm_residual::WEIGHT,
+        Some(weight.metal_buffer()),
+        weight.offset() as u64,
+    );
+    encoder.set_buffer(rms_norm_residual::OUT, Some(out.metal_buffer()), 0);
+    encoder.set_bytes(
+        rms_norm_residual::AXIS_SIZE,
+        4,
+        &axis_size as *const u32 as *const std::ffi::c_void,
+    );
+    encoder.set_bytes(
+        rms_norm_residual::EPS,
+        4,
+        &eps as *const f32 as *const std::ffi::c_void,
+    );
+    encoder.set_bytes(
+        rms_norm_residual::W_STRIDE,
+        4,
+        &w_stride as *const u32 as *const std::ffi::c_void,
+    );
+    encoder.set_bytes(
+        rms_norm_residual::HAS_W,
+        4,
+        &has_w as *const u32 as *const std::ffi::c_void,
+    );
 
     let tg_size = std::cmp::min(1024, pipeline.max_total_threads_per_threadgroup());
     encoder.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), MTLSize::new(tg_size, 1, 1));
@@ -1462,18 +1555,42 @@ pub fn rms_norm_residual_add_into_cb(
 
     let encoder = cb.new_compute_command_encoder();
     encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
     encoder.set_buffer(
-        1,
+        rms_norm_residual::INPUT,
+        Some(input.metal_buffer()),
+        input.offset() as u64,
+    );
+    encoder.set_buffer(
+        rms_norm_residual::RESIDUAL,
         Some(residual_buf.metal_buffer()),
         residual_buf.offset() as u64,
     );
-    encoder.set_buffer(2, Some(weight.metal_buffer()), weight.offset() as u64);
-    encoder.set_buffer(3, Some(out.metal_buffer()), 0);
-    encoder.set_bytes(4, 4, &axis_size as *const u32 as *const std::ffi::c_void);
-    encoder.set_bytes(5, 4, &eps as *const f32 as *const std::ffi::c_void);
-    encoder.set_bytes(6, 4, &w_stride as *const u32 as *const std::ffi::c_void);
-    encoder.set_bytes(7, 4, &has_w as *const u32 as *const std::ffi::c_void);
+    encoder.set_buffer(
+        rms_norm_residual::WEIGHT,
+        Some(weight.metal_buffer()),
+        weight.offset() as u64,
+    );
+    encoder.set_buffer(rms_norm_residual::OUT, Some(out.metal_buffer()), 0);
+    encoder.set_bytes(
+        rms_norm_residual::AXIS_SIZE,
+        4,
+        &axis_size as *const u32 as *const std::ffi::c_void,
+    );
+    encoder.set_bytes(
+        rms_norm_residual::EPS,
+        4,
+        &eps as *const f32 as *const std::ffi::c_void,
+    );
+    encoder.set_bytes(
+        rms_norm_residual::W_STRIDE,
+        4,
+        &w_stride as *const u32 as *const std::ffi::c_void,
+    );
+    encoder.set_bytes(
+        rms_norm_residual::HAS_W,
+        4,
+        &has_w as *const u32 as *const std::ffi::c_void,
+    );
 
     let tg_size = std::cmp::min(1024, pipeline.max_total_threads_per_threadgroup());
     encoder.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), MTLSize::new(tg_size, 1, 1));
@@ -1579,21 +1696,98 @@ pub fn rms_norm_residual_add_encode(
     let out = Array::uninit(registry.device().raw(), input.shape(), input.dtype());
 
     encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
     encoder.set_buffer(
-        1,
+        rms_norm_residual::INPUT,
+        Some(input.metal_buffer()),
+        input.offset() as u64,
+    );
+    encoder.set_buffer(
+        rms_norm_residual::RESIDUAL,
         Some(residual_buf.metal_buffer()),
         residual_buf.offset() as u64,
     );
-    encoder.set_buffer(2, Some(weight.metal_buffer()), weight.offset() as u64);
-    encoder.set_buffer(3, Some(out.metal_buffer()), 0);
-    encoder.set_bytes(4, 4, &axis_size as *const u32 as *const std::ffi::c_void);
-    encoder.set_bytes(5, 4, &eps as *const f32 as *const std::ffi::c_void);
-    encoder.set_bytes(6, 4, &w_stride as *const u32 as *const std::ffi::c_void);
-    encoder.set_bytes(7, 4, &has_w as *const u32 as *const std::ffi::c_void);
+    encoder.set_buffer(
+        rms_norm_residual::WEIGHT,
+        Some(weight.metal_buffer()),
+        weight.offset() as u64,
+    );
+    encoder.set_buffer(rms_norm_residual::OUT, Some(out.metal_buffer()), 0);
+    encoder.set_bytes(
+        rms_norm_residual::AXIS_SIZE,
+        4,
+        &axis_size as *const u32 as *const std::ffi::c_void,
+    );
+    encoder.set_bytes(
+        rms_norm_residual::EPS,
+        4,
+        &eps as *const f32 as *const std::ffi::c_void,
+    );
+    encoder.set_bytes(
+        rms_norm_residual::W_STRIDE,
+        4,
+        &w_stride as *const u32 as *const std::ffi::c_void,
+    );
+    encoder.set_bytes(
+        rms_norm_residual::HAS_W,
+        4,
+        &has_w as *const u32 as *const std::ffi::c_void,
+    );
 
     let tg_size = std::cmp::min(1024, pipeline.max_total_threads_per_threadgroup());
     encoder.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), MTLSize::new(tg_size, 1, 1));
 
     Ok((out, residual_buf))
+}
+
+/// Encode inv_rms computation into an existing compute command encoder.
+///
+/// Same as [`compute_inv_rms`] but dispatches into a caller-provided encoder
+/// instead of creating its own.  The caller is responsible for memory barriers
+/// and encoder lifecycle.
+///
+/// Returns a 1-D f32 array of shape `[rows]`.
+pub fn compute_inv_rms_encode(
+    registry: &KernelRegistry,
+    input: &Array,
+    eps: f32,
+    encoder: &metal::ComputeCommandEncoderRef,
+) -> Result<Array, KernelError> {
+    if input.ndim() != 2 {
+        return Err(KernelError::InvalidShape(format!(
+            "compute_inv_rms_encode requires 2D input, got {}D",
+            input.ndim()
+        )));
+    }
+
+    let rows = input.shape()[0];
+    let axis_size = super::checked_u32(input.shape()[1], "axis_size")?;
+
+    let kernel_name = inv_rms_kernel_name(input.dtype())?;
+    let pipeline = registry.get_pipeline(kernel_name, input.dtype())?;
+
+    let dev = registry.device().raw();
+    let out = Array::uninit(dev, &[rows], DType::Float32);
+
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(
+        inv_rms::INPUT,
+        Some(input.metal_buffer()),
+        input.offset() as u64,
+    );
+    encoder.set_buffer(inv_rms::OUT, Some(out.metal_buffer()), 0);
+    encoder.set_bytes(
+        inv_rms::AXIS_SIZE,
+        4,
+        &axis_size as *const u32 as *const std::ffi::c_void,
+    );
+    encoder.set_bytes(
+        inv_rms::EPS,
+        4,
+        &eps as *const f32 as *const std::ffi::c_void,
+    );
+
+    let tg_size = std::cmp::min(1024, pipeline.max_total_threads_per_threadgroup());
+    encoder.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), MTLSize::new(tg_size, 1, 1));
+
+    Ok(out)
 }

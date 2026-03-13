@@ -3,11 +3,14 @@
 //! Uses RwLock for concurrent read access to pipeline/JIT caches.
 //! Supports Metal function constants for type specialization.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::RwLock;
 
 use metal::{CompileOptions, FunctionConstantValues, MTLDataType};
+use smallvec::SmallVec;
 
 use rmlx_metal::device::GpuDevice;
 use rmlx_metal::pipeline_cache::DiskPipelineCache;
@@ -71,12 +74,17 @@ impl std::hash::Hash for FunctionConstantValue {
 }
 
 /// Cache key for compiled pipelines.
+///
+/// Uses `Cow<'static, str>` for kernel names — zero-cost `Borrowed` for the
+/// common case (string literals) while still supporting dynamically built
+/// names (e.g. `format!`).  Constants use `SmallVec<[...; 4]>` to avoid heap
+/// allocation when there are ≤4 function constants.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct PipelineKey {
-    pub kernel_name: String,
+    pub kernel_name: Cow<'static, str>,
     pub dtype: DType,
     /// Optional function constants for specialization.
-    pub constants: Vec<(u32, FunctionConstantValue)>,
+    pub constants: SmallVec<[(u32, FunctionConstantValue); 4]>,
 }
 
 /// Kernel registry managing AOT libraries and JIT compilation with pipeline caching.
@@ -97,6 +105,15 @@ pub struct KernelRegistry {
     /// Persistent disk-backed pipeline cache.  `None` only when explicitly
     /// disabled (e.g., in tests via `new_without_disk_cache`).
     disk_cache: Option<DiskPipelineCache>,
+    /// Frozen snapshot of pipelines for lock-free reads.
+    ///
+    /// After calling [`freeze()`](Self::freeze), this points to a heap-allocated
+    /// `HashMap` clone of `pipelines`. Pipeline lookups check this pointer first
+    /// (lock-free `Acquire` load) before falling back to the `RwLock`.
+    ///
+    /// Pipelines added after `freeze()` (e.g., JIT compilation of new kernels)
+    /// go into the `RwLock` map; call `freeze()` again to capture them.
+    frozen_pipelines: AtomicPtr<HashMap<PipelineKey, metal::ComputePipelineState>>,
 }
 
 /// A JIT-compiled library together with the source text it was compiled from.
@@ -131,6 +148,7 @@ impl KernelRegistry {
             jit_cache: RwLock::new(HashMap::new()),
             pipelines: RwLock::new(HashMap::new()),
             disk_cache,
+            frozen_pipelines: AtomicPtr::new(std::ptr::null_mut()),
         }
     }
 
@@ -157,6 +175,7 @@ impl KernelRegistry {
             jit_cache: RwLock::new(HashMap::new()),
             pipelines: RwLock::new(HashMap::new()),
             disk_cache: None,
+            frozen_pipelines: AtomicPtr::new(std::ptr::null_mut()),
         }
     }
 
@@ -169,22 +188,41 @@ impl KernelRegistry {
         kernel_name: &str,
         dtype: DType,
     ) -> Result<metal::ComputePipelineState, KernelError> {
-        let key = PipelineKey {
-            kernel_name: kernel_name.to_string(),
+        // Fast path: build a Borrowed key for the cache lookup (no allocation).
+        let lookup_key = PipelineKey {
+            kernel_name: Cow::Borrowed(
+                // SAFETY: the borrow only lives for the cache lookup below;
+                // we never store this key.  The transmute extends the lifetime
+                // to 'static so it fits into Cow<'static, str>, which is
+                // required by PipelineKey.
+                unsafe { &*(kernel_name as *const str) },
+            ),
             dtype,
-            constants: vec![],
+            constants: SmallVec::new(),
         };
 
-        // 1. Check in-memory pipeline cache (read lock)
+        // 1a. Check frozen snapshot (lock-free)
+        if let Some(pipeline) = self.frozen_lookup(&lookup_key) {
+            return Ok(pipeline);
+        }
+
+        // 1b. Check in-memory pipeline cache (read lock)
         {
             let cache = self
                 .pipelines
                 .read()
                 .map_err(|_| KernelError::Internal("pipeline cache lock poisoned".into()))?;
-            if let Some(pipeline) = cache.get(&key) {
+            if let Some(pipeline) = cache.get(&lookup_key) {
                 return Ok(pipeline.clone());
             }
         }
+
+        // Slow path: allocate an owned key for insertion.
+        let key = PipelineKey {
+            kernel_name: Cow::Owned(kernel_name.to_string()),
+            dtype,
+            constants: SmallVec::new(),
+        };
 
         // 2. Try disk pipeline cache — needs JIT source for the cache key.
         if let Some(ref disk) = self.disk_cache {
@@ -338,22 +376,35 @@ impl KernelRegistry {
         dtype: DType,
         constants: &[(u32, FunctionConstantValue)],
     ) -> Result<metal::ComputePipelineState, KernelError> {
-        let key = PipelineKey {
-            kernel_name: kernel_name.to_string(),
+        // Fast path: build a Borrowed key for the cache lookup (no allocation).
+        let lookup_key = PipelineKey {
+            kernel_name: Cow::Borrowed(unsafe { &*(kernel_name as *const str) }),
             dtype,
-            constants: constants.to_vec(),
+            constants: constants.iter().cloned().collect(),
         };
 
-        // 1. Check in-memory pipeline cache (read lock)
+        // 1a. Check frozen snapshot (lock-free)
+        if let Some(pipeline) = self.frozen_lookup(&lookup_key) {
+            return Ok(pipeline);
+        }
+
+        // 1b. Check in-memory pipeline cache (read lock)
         {
             let cache = self
                 .pipelines
                 .read()
                 .map_err(|_| KernelError::Internal("pipeline cache lock poisoned".into()))?;
-            if let Some(pipeline) = cache.get(&key) {
+            if let Some(pipeline) = cache.get(&lookup_key) {
                 return Ok(pipeline.clone());
             }
         }
+
+        // Slow path: allocate an owned key for insertion.
+        let key = PipelineKey {
+            kernel_name: Cow::Owned(kernel_name.to_string()),
+            dtype,
+            constants: lookup_key.constants,
+        };
 
         // 2. Try disk pipeline cache with function constants.
         if let Some(ref disk) = self.disk_cache {
@@ -574,11 +625,22 @@ impl KernelRegistry {
         key
     }
 
-    /// Invalidate all cached pipelines.
+    /// Invalidate all cached pipelines (including any frozen snapshot).
     ///
     /// Useful after registering new specialized sources to force recompilation
     /// on next access.
     pub fn clear_pipeline_cache(&self) -> Result<(), KernelError> {
+        // Drop the frozen snapshot first so stale entries aren't served.
+        let old = self
+            .frozen_pipelines
+            .swap(std::ptr::null_mut(), Ordering::AcqRel);
+        if !old.is_null() {
+            // SAFETY: `old` was created by `freeze()` via `Box::into_raw`.
+            unsafe {
+                drop(Box::from_raw(old));
+            }
+        }
+
         let mut cache = self
             .pipelines
             .write()
@@ -592,9 +654,58 @@ impl KernelRegistry {
         self.disk_cache.as_ref()
     }
 
+    /// Snapshot the current pipeline cache for lock-free reads.
+    ///
+    /// After this call, [`get_pipeline`](Self::get_pipeline) and
+    /// [`get_pipeline_with_constants`](Self::get_pipeline_with_constants) will
+    /// first probe the frozen snapshot via an `Acquire` atomic load — no `RwLock`
+    /// contention on the hot path.
+    ///
+    /// Call this once after model warm-up (i.e., after all kernels have been
+    /// compiled at least once). Pipelines JIT-compiled after `freeze()` will
+    /// still be found via the `RwLock` fallback; call `freeze()` again to
+    /// capture them in the snapshot.
+    pub fn freeze(&self) {
+        let snap = Box::new(
+            self.pipelines
+                .read()
+                .expect("pipeline cache lock poisoned during freeze")
+                .clone(),
+        );
+        let old = self
+            .frozen_pipelines
+            .swap(Box::into_raw(snap), Ordering::AcqRel);
+        if !old.is_null() {
+            // SAFETY: `old` was created by a prior `freeze()` call via
+            // `Box::into_raw` and is no longer accessible through the atomic.
+            unsafe {
+                drop(Box::from_raw(old));
+            }
+        }
+    }
+
+    /// Returns `true` if the registry has a frozen pipeline snapshot.
+    pub fn is_frozen(&self) -> bool {
+        !self.frozen_pipelines.load(Ordering::Acquire).is_null()
+    }
+
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
+
+    /// Lock-free lookup in the frozen snapshot. Returns `None` if no snapshot
+    /// exists or the key is not found.
+    fn frozen_lookup(&self, key: &PipelineKey) -> Option<metal::ComputePipelineState> {
+        let ptr = self.frozen_pipelines.load(Ordering::Acquire);
+        if ptr.is_null() {
+            return None;
+        }
+        // SAFETY: `ptr` was created by `freeze()` via `Box::into_raw` and remains
+        // valid until the next `freeze()` or `Drop`. The `Acquire` ordering
+        // ensures we see the fully initialized `HashMap`.
+        let map = unsafe { &*ptr };
+        map.get(key).cloned()
+    }
 
     /// Find the MSL source string for a kernel by scanning the JIT cache.
     ///
@@ -626,6 +737,19 @@ impl KernelRegistry {
                 (*idx, fc)
             })
             .collect()
+    }
+}
+
+impl Drop for KernelRegistry {
+    fn drop(&mut self) {
+        let ptr = self.frozen_pipelines.load(Ordering::Acquire);
+        if !ptr.is_null() {
+            // SAFETY: `ptr` was created by `freeze()` via `Box::into_raw`.
+            // We hold `&mut self`, so no concurrent access is possible.
+            unsafe {
+                drop(Box::from_raw(ptr));
+            }
+        }
     }
 }
 

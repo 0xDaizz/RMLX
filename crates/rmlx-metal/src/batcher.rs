@@ -30,6 +30,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use metal::{CommandBuffer, CommandQueue};
 
 use crate::event::GpuEvent;
+use crate::queue::fast_command_buffer_owned;
 
 /// Tracks how many command buffers and encoders are created (for benchmarking).
 static TOTAL_CBS_CREATED: AtomicU64 = AtomicU64::new(0);
@@ -116,7 +117,7 @@ impl<'q> CommandBatcher<'q> {
 
         // Create CB if needed
         if self.current_cb.is_none() {
-            self.current_cb = Some(self.queue.new_command_buffer().to_owned());
+            self.current_cb = Some(fast_command_buffer_owned(self.queue));
             self.total_cbs += 1;
             TOTAL_CBS_CREATED.fetch_add(1, Ordering::Relaxed);
         }
@@ -158,7 +159,7 @@ impl<'q> CommandBatcher<'q> {
     /// direct access to the command buffer (e.g., for blit encoders).
     pub fn command_buffer(&mut self) -> &metal::CommandBufferRef {
         if self.current_cb.is_none() {
-            self.current_cb = Some(self.queue.new_command_buffer().to_owned());
+            self.current_cb = Some(fast_command_buffer_owned(self.queue));
             self.total_cbs += 1;
             TOTAL_CBS_CREATED.fetch_add(1, Ordering::Relaxed);
         }
@@ -216,7 +217,7 @@ impl<'q> CommandBatcher<'q> {
         if self.current_cb.is_some() {
             self.flush_async();
         }
-        let cb = self.queue.new_command_buffer().to_owned();
+        let cb = fast_command_buffer_owned(self.queue);
         event.wait_from_command_buffer(&cb, value);
         self.current_cb = Some(cb);
         self.total_cbs += 1;

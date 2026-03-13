@@ -18,6 +18,7 @@ serde_json = "1"
 objc = { workspace = true }
 
 [features]
+bench = ["rmlx-core/bench"]
 distributed = ["rmlx-distributed"]
 
 [[bench]]
@@ -27,6 +28,7 @@ harness = false
 [[bench]]
 name = "prefill_bench"
 harness = false
+required-features = ["bench"]
 
 [[bench]]
 name = "distributed_bench"
@@ -51,3 +53,16 @@ harness = false
 [[bench]]
 name = "gpu_profile_bench"
 harness = false
+
+[[bench]]
+name = "matmul_micro_bench"
+harness = false
+
+[[bench]]
+name = "dispatch_gpu_time_bench"
+harness = false
+
+[[bench]]
+name = "e2e_prefill_bench"
+harness = false
+required-features = ["bench"]

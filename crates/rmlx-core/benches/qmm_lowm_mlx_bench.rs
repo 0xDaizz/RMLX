@@ -1,3 +1,7 @@
+//! ⚠️ NON-PRODUCTION PATH — MLX Q4 parity comparison with direct kernel encoding.
+//! Per-op sync CB overhead included. Development/tuning only.
+//! For production throughput, use e2e_prefill_bench (prefill) or pipeline_bench (decode).
+//!
 //! QMM Low-M MLX Parity Benchmark
 //!
 //! Fair comparison between rmlx and MLX at MoE-critical low-M dimensions.
@@ -499,7 +503,7 @@ fn bench_kernel(
     let x = rand_f16_array(device, &[m, k], 99);
 
     for _ in 0..WARMUP_ITERS {
-        let cb = queue.new_command_buffer();
+        let cb = queue.new_command_buffer_with_unretained_references();
         let _ = ops::quantized::affine_quantized_matmul_batched_into_cb(registry, &x, &qw, cb)
             .expect("kernel warmup failed");
         cb.commit();
@@ -508,7 +512,7 @@ fn bench_kernel(
 
     let mut times = Vec::with_capacity(BENCH_ITERS);
     for _ in 0..BENCH_ITERS {
-        let cb = queue.new_command_buffer();
+        let cb = queue.new_command_buffer_with_unretained_references();
         let start = Instant::now();
         let _ = ops::quantized::affine_quantized_matmul_batched_into_cb(registry, &x, &qw, cb)
             .expect("kernel bench failed");

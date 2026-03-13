@@ -1,3 +1,7 @@
+//! ⚠️ NON-PRODUCTION PATH — GEMM parameter sweep (variant 2). Direct kernel encoding,
+//! development only. Bypasses matmul() dispatch.
+//! For production throughput, use e2e_prefill_bench (prefill) or pipeline_bench (decode).
+//!
 //! Parameterized GEMM sweep2 benchmark — tests 9 kernel configurations.
 //!
 //! All configs use BM=64, BN=64, double-buffered, varying BK and SG layouts.
@@ -549,7 +553,7 @@ fn bench_config(
 
     // Warmup
     for _ in 0..WARMUP_ITERS {
-        let cb = queue.new_command_buffer();
+        let cb = queue.new_command_buffer_with_unretained_references();
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&pipeline);
         enc.set_buffer(0, Some(a.metal_buffer()), 0);
@@ -572,7 +576,7 @@ fn bench_config(
     let mut times = Vec::with_capacity(BENCH_ITERS);
     for _ in 0..BENCH_ITERS {
         let start = Instant::now();
-        let cb = queue.new_command_buffer();
+        let cb = queue.new_command_buffer_with_unretained_references();
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&pipeline);
         enc.set_buffer(0, Some(a.metal_buffer()), 0);

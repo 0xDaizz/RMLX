@@ -1,3 +1,8 @@
+//! ⚠️ NON-PRODUCTION PATH — expert parallelism component benchmark.
+//! Tests MoE layer components (router, expert FFN, all_to_all) individually, not
+//! full TransformerModel forward path.
+//! For production throughput, use e2e_prefill_bench (prefill) or pipeline_bench (decode).
+//!
 //! Expert Parallelism (EP) Benchmark
 //!
 //! Measures MoE layer components at Mixtral 8x7B-like configuration:

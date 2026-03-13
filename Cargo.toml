@@ -8,6 +8,7 @@ members = [
     "crates/rmlx-distributed",
     "crates/rmlx-nn",
     "crates/rmlx-cli",
+    "crates/rmlx-macros",
 ]
 
 [workspace.package]
@@ -30,3 +31,5 @@ half = "2"
 sha2 = "0.10"
 dirs = "5"
 tracing = "0.1"
+smallvec = { version = "1", features = ["const_generics"] }
+bumpalo = "3"

@@ -32,6 +32,7 @@
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
+use crate::ops::buffer_slots::{gemm, grouped_gemm, grouped_splitk, splitk, splitk_reduce};
 use metal::MTLSize;
 
 // ---------------------------------------------------------------------------
@@ -109,6 +110,7 @@ kernel void gemm_tiled_f32(
     uint2 swizzled = swizzle_threadgroup(uint2(group_id.x, group_id.y), swizzle_log);
     const uint row_start = swizzled.y * as_uniform(BM);
     const uint col_start = swizzled.x * as_uniform(BN);
+    if (row_start >= M || col_start >= N) return;  // Guard against swizzle OOB
 
     device const float* A_batch = A + batch_idx * as_uniform(batch_stride_a);
     device const float* B_batch = B + batch_idx * as_uniform(batch_stride_b);
@@ -262,6 +264,7 @@ kernel void gemm_tiled_f16(
     uint2 swizzled = swizzle_threadgroup(uint2(group_id.x, group_id.y), swizzle_log);
     const uint row_start = swizzled.y * as_uniform(BM);
     const uint col_start = swizzled.x * as_uniform(BN);
+    if (row_start >= M || col_start >= N) return;  // Guard against swizzle OOB
 
     device const half* A_batch = A + batch_idx * as_uniform(batch_stride_a);
     device const half* B_batch = B + batch_idx * as_uniform(batch_stride_b);
@@ -471,6 +474,7 @@ kernel void gemm_tiled_bf16(
     uint2 swizzled = swizzle_threadgroup(uint2(group_id.x, group_id.y), swizzle_log);
     const uint row_start = swizzled.y * as_uniform(BM);
     const uint col_start = swizzled.x * as_uniform(BN);
+    if (row_start >= M || col_start >= N) return;  // Guard against swizzle OOB
 
     device const bfloat* A_batch = A + batch_idx * as_uniform(batch_stride_a);
     device const bfloat* B_batch = B + batch_idx * as_uniform(batch_stride_b);
@@ -939,6 +943,7 @@ kernel void gemm_hiperf_f16(
     uint2 swizzled = hp_swizzle_threadgroup(uint2(group_id.x, group_id.y), swizzle_log);
     const uint row_start = swizzled.y * hp_as_uniform(HP_BM);
     const uint col_start = swizzled.x * hp_as_uniform(HP_BN);
+    if (row_start >= M || col_start >= N) return;  // Guard against swizzle OOB
 
     device const half* A_batch = A + batch_idx * hp_as_uniform(batch_stride_a);
     device const half* B_batch = B + batch_idx * hp_as_uniform(batch_stride_b);
@@ -1136,6 +1141,7 @@ kernel void gemm_skinny_f32(
     uint2 swizzled = swizzle_threadgroup(uint2(group_id.x, group_id.y), swizzle_log);
     const uint row_start = swizzled.y * as_uniform(SBM);
     const uint col_start = swizzled.x * as_uniform(SBN);
+    if (row_start >= M || col_start >= N) return;  // Guard against swizzle OOB
 
     device const float* A_batch = A + batch_idx * as_uniform(batch_stride_a);
     device const float* B_batch = B + batch_idx * as_uniform(batch_stride_b);
@@ -1247,6 +1253,7 @@ kernel void gemm_skinny_f16(
     uint2 swizzled = swizzle_threadgroup(uint2(group_id.x, group_id.y), swizzle_log);
     const uint row_start = swizzled.y * as_uniform(SBM);
     const uint col_start = swizzled.x * as_uniform(SBN);
+    if (row_start >= M || col_start >= N) return;  // Guard against swizzle OOB
 
     device const half* A_batch = A + batch_idx * as_uniform(batch_stride_a);
     device const half* B_batch = B + batch_idx * as_uniform(batch_stride_b);
@@ -1356,6 +1363,7 @@ kernel void gemm_skinny_bf16(
     uint2 swizzled = swizzle_threadgroup(uint2(group_id.x, group_id.y), swizzle_log);
     const uint row_start = swizzled.y * as_uniform(SBM);
     const uint col_start = swizzled.x * as_uniform(SBN);
+    if (row_start >= M || col_start >= N) return;  // Guard against swizzle OOB
 
     device const bfloat* A_batch = A + batch_idx * as_uniform(batch_stride_a);
     device const bfloat* B_batch = B + batch_idx * as_uniform(batch_stride_b);
@@ -1769,6 +1777,7 @@ kernel void splitk_pass1_mlx_f16(
     uint2 swizzled = sk2_swizzle_tg(uint2(group_id.x, group_id.y), swizzle_log);
     const uint row_start = swizzled.y * sk2_as_uniform(SK2_BM);
     const uint col_start = swizzled.x * sk2_as_uniform(SK2_BN);
+    if (row_start >= M || col_start >= N) return;  // Guard against swizzle OOB
 
     // SG grid: 1x2 -- sg_row always 0, sg_col = sgid (0 or 1)
     const uint base_n = sgid * 32;
@@ -1932,6 +1941,7 @@ kernel void splitk_small_pass1_f16(
     uint2 swizzled = sk2_swizzle_tg(uint2(group_id.x, group_id.y), swizzle_log);
     const uint row_start = swizzled.y * sk2_as_uniform(SK3_BM);
     const uint col_start = swizzled.x * sk2_as_uniform(SK3_BN);
+    if (row_start >= M || col_start >= N) return;  // Guard against swizzle OOB
 
     // SG grid: 1x2 -- each SG covers 16 cols
     const uint base_n = sgid * 16;
@@ -2173,6 +2183,7 @@ kernel void gemm_mlx_f16(
     uint2 swizzled = mlx_swizzle_tg(uint2(group_id.x, group_id.y), swizzle_log);
     const uint row_start = swizzled.y * mlx_as_uniform(MLX_BM);
     const uint col_start = swizzled.x * mlx_as_uniform(MLX_BN);
+    if (row_start >= M || col_start >= N) return;  // Guard against swizzle OOB
 
     device const half* A_batch = A + batch_idx * mlx_as_uniform(batch_stride_a);
     device const half* B_batch = B + batch_idx * mlx_as_uniform(batch_stride_b);
@@ -2389,6 +2400,7 @@ kernel void gemm_mlx_f32(
     uint2 swizzled = mlx_swizzle_tg(uint2(group_id.x, group_id.y), swizzle_log);
     const uint row_start = swizzled.y * mlx_as_uniform(MLX_BM);
     const uint col_start = swizzled.x * mlx_as_uniform(MLX_BN);
+    if (row_start >= M || col_start >= N) return;  // Guard against swizzle OOB
 
     device const float* A_batch = A + batch_idx * mlx_as_uniform(batch_stride_a);
     device const float* B_batch = B + batch_idx * mlx_as_uniform(batch_stride_b);
@@ -2605,6 +2617,7 @@ kernel void gemm_mlx_small_f16(
     uint2 swizzled = mlx_swizzle_tg(uint2(group_id.x, group_id.y), swizzle_log);
     const uint row_start = swizzled.y * mlx_as_uniform(SM_BM);
     const uint col_start = swizzled.x * mlx_as_uniform(SM_BN);
+    if (row_start >= M || col_start >= N) return;  // Guard against swizzle OOB
 
     device const half* A_batch = A + batch_idx * mlx_as_uniform(batch_stride_a);
     device const half* B_batch = B + batch_idx * mlx_as_uniform(batch_stride_b);
@@ -2763,6 +2776,7 @@ kernel void gemm_mlx_m16_f16(
     uint2 swizzled = mlx_swizzle_tg(uint2(group_id.x, group_id.y), swizzle_log);
     const uint row_start = swizzled.y * mlx_as_uniform(MT_BM);
     const uint col_start = swizzled.x * mlx_as_uniform(MT_BN);
+    if (row_start >= M || col_start >= N) return;  // Guard against swizzle OOB
 
     device const half* A_batch = A + batch_idx * mlx_as_uniform(batch_stride_a);
     device const half* B_batch = B + batch_idx * mlx_as_uniform(batch_stride_b);
@@ -2918,6 +2932,7 @@ kernel void gemm_mlx_bf16(
     uint2 swizzled = mlx_swizzle_tg(uint2(group_id.x, group_id.y), swizzle_log);
     const uint row_start = swizzled.y * mlx_as_uniform(MLX_BM);
     const uint col_start = swizzled.x * mlx_as_uniform(MLX_BN);
+    if (row_start >= M || col_start >= N) return;  // Guard against swizzle OOB
 
     device const bfloat* A_batch = A + batch_idx * mlx_as_uniform(batch_stride_a);
     device const bfloat* B_batch = B + batch_idx * mlx_as_uniform(batch_stride_b);
@@ -3256,7 +3271,7 @@ METAL_FUNC void nax_store_16x16_residual_unsafe(device half* dst,
 //
 // Each SG computes a 32×32 output tile as 2 stacked 16×32 subtiles.
 // MMA descriptor is (16, 32, 16): B fragment is 16×32 (16 elems/lane).
-// K dimension is iterated in outer blocks of BK=32, with inner steps of FK=16.
+// K dimension is iterated in steps of FK=16.
 
 [[kernel, max_total_threads_per_threadgroup(512)]]
 void gemm_nax_f16(
@@ -3313,150 +3328,2585 @@ void gemm_nax_f16(
     const short fn = nax_fn(slid);
 
     // MPP matmul2d descriptor: MMA(16, 32, 16, A=normal, B=normal, accumulate)
-    // At least one of M, N, K must be 32 for cooperative tensors.
-    // A fragment: 16×16 (8 elems/lane), B fragment: 16×32 (16 elems/lane)
-    // C fragment: 16×32 (16 elems/lane)
     constexpr auto nax_desc = mpp::tensor_ops::matmul2d_descriptor(
         16, 32, 16, false, false, true,
         mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
 
-    // Accumulator: 2 row-blocks of 16×32 subtiles (32×32 output per SG)
-    // Each 16×32 subtile has 16 elements per lane (two 16×16 fragments)
-    // acc[fm_idx][0..7] = cols 0-15, acc[fm_idx][8..15] = cols 16-31
-    float acc[2][16];
-    for (int i = 0; i < 2; i++)
-        for (int j = 0; j < 16; j++)
-            acc[i][j] = 0.0f;
+    // ── Zero-copy cooperative tensor pattern ──
+    // Persistent gemm_op instances — one per row block (fm_idx=0, fm_idx=1).
+    // ct_c accumulators live in cooperative tensors for the entire K-loop,
+    // eliminating 40 register copies per MMA (acc↔ct_c + A_frag→ct_a).
+    mpp::tensor_ops::matmul2d<nax_desc, metal::execution_simdgroup> gemm_op_0;
+    mpp::tensor_ops::matmul2d<nax_desc, metal::execution_simdgroup> gemm_op_1;
 
-    // K-loop: iterate in outer blocks of BK=32
-    const uint k_iters = align_K ? (K / BK) : ((K + BK - 1) / BK);
+    auto ct_c0 = gemm_op_0.template get_destination_cooperative_tensor<
+        decltype(gemm_op_0.template get_left_input_cooperative_tensor<half, half, float>()),
+        decltype(gemm_op_0.template get_right_input_cooperative_tensor<half, half, float>()),
+        float>();
+    auto ct_c1 = gemm_op_1.template get_destination_cooperative_tensor<
+        decltype(gemm_op_1.template get_left_input_cooperative_tensor<half, half, float>()),
+        decltype(gemm_op_1.template get_right_input_cooperative_tensor<half, half, float>()),
+        float>();
+    for (int e = 0; e < 16; e++) { ct_c0[e] = 0.0f; ct_c1[e] = 0.0f; }
 
-    for (uint kk = 0; kk < k_iters; kk++) {
-        const uint gk = kk * BK;
-        const int k_remaining = align_K ? int(BK) : min(int(K) - int(gk), int(BK));
+    // ── Flat K-loop: iterate in steps of FK=16 ──
+    const uint k_total_steps = align_K ? (K / FK) : ((K + FK - 1) / FK);
 
-        // Inner K loop in steps of FK=16
-        for (int sk = 0; sk < k_remaining; sk += int(FK)) {
-            const int fk_valid = min(int(FK), k_remaining - sk);
-            const bool k_aligned = align_K || (fk_valid == int(FK));
+    #pragma clang loop unroll_count(2)
+    for (uint sk_abs = 0; sk_abs < k_total_steps; sk_abs++) {
+        const uint sk_offset = sk_abs * FK;
+        const int fk_valid = align_K ? int(FK) : min(int(FK), int(K) - int(sk_offset));
+        const bool k_aligned = align_K || (fk_valid == int(FK));
 
-            // Load B fragment ONCE (16×32 = 16 elems/thread)
-            // ct_b[0..7] = B[gk+sk : gk+sk+16, gn : gn+16]     (first 16×16 block)
-            // ct_b[8..15] = B[gk+sk : gk+sk+16, gn+16 : gn+32] (second 16×16 block)
-            half B_frag[16];
-            {
-                // First 16×16 block (cols 0-15)
-                const device half* B_ptr0 = B_batch + (gk + uint(sk)) * N + gn;
-                int b_cols0 = align_N ? 16 : min(16, sg_valid_n);
-                if (b_cols0 <= 0) {
-                    for (int e = 0; e < 8; e++) B_frag[e] = half(0);
-                } else if (k_aligned && b_cols0 == 16) {
-                    nax_load_16x16_unsafe(B_frag, B_ptr0, int(N), fm, fn);
-                } else {
-                    nax_load_16x16(B_frag, B_ptr0, int(N), fm, fn,
-                                  k_aligned ? 16 : fk_valid, b_cols0);
-                }
-
-                // Second 16×16 block (cols 16-31)
-                const device half* B_ptr1 = B_ptr0 + 16;
-                int b_cols1 = align_N ? 16 : min(16, sg_valid_n - 16);
-                if (b_cols1 <= 0) {
-                    for (int e = 0; e < 8; e++) B_frag[8 + e] = half(0);
-                } else if (k_aligned && b_cols1 == 16) {
-                    nax_load_16x16_unsafe(B_frag + 8, B_ptr1, int(N), fm, fn);
-                } else {
-                    nax_load_16x16(B_frag + 8, B_ptr1, int(N), fm, fn,
-                                  k_aligned ? 16 : fk_valid, b_cols1);
-                }
+        // Load B fragment ONCE (16×32) — shared between both row blocks
+        half B_frag[16];
+        {
+            const device half* B_ptr0 = B_batch + sk_offset * N + gn;
+            int b_cols0 = align_N ? 16 : min(16, sg_valid_n);
+            if (b_cols0 <= 0) {
+                for (int e = 0; e < 8; e++) B_frag[e] = half(0);
+            } else if (k_aligned && b_cols0 == 16) {
+                nax_load_16x16_unsafe(B_frag, B_ptr0, int(N), fm, fn);
+            } else {
+                nax_load_16x16(B_frag, B_ptr0, int(N), fm, fn,
+                              k_aligned ? 16 : fk_valid, b_cols0);
             }
 
-            // For each row block (2 blocks of 16 rows = 32 rows total)
-            for (uint fm_idx = 0; fm_idx < 2; fm_idx++) {
-                // Load A fragment (16×16 = 8 elems/thread)
-                half A_frag[8];
-                {
-                    const device half* A_ptr = A_batch + (gm + fm_idx * 16) * K + gk + uint(sk);
-                    int a_rows = align_M ? 16 : min(16, sg_valid_m - int(fm_idx * 16));
-                    if (a_rows <= 0) {
-                        for (int e = 0; e < 8; e++) A_frag[e] = half(0);
-                    } else if (k_aligned && a_rows == 16) {
-                        nax_load_16x16_unsafe(A_frag, A_ptr, int(K), fm, fn);
-                    } else {
-                        nax_load_16x16(A_frag, A_ptr, int(K), fm, fn,
-                                      a_rows, k_aligned ? 16 : fk_valid);
+            const device half* B_ptr1 = B_ptr0 + 16;
+            int b_cols1 = align_N ? 16 : min(16, sg_valid_n - 16);
+            if (b_cols1 <= 0) {
+                for (int e = 0; e < 8; e++) B_frag[8 + e] = half(0);
+            } else if (k_aligned && b_cols1 == 16) {
+                nax_load_16x16_unsafe(B_frag + 8, B_ptr1, int(N), fm, fn);
+            } else {
+                nax_load_16x16(B_frag + 8, B_ptr1, int(N), fm, fn,
+                              k_aligned ? 16 : fk_valid, b_cols1);
+            }
+        }
+
+        // Row block 0: load A directly into ct_a, copy B → ct_b, run MMA
+        {
+            auto ct_a0 = gemm_op_0.template get_left_input_cooperative_tensor<half, half, float>();
+            auto ct_b0 = gemm_op_0.template get_right_input_cooperative_tensor<half, half, float>();
+            {
+                const device half* A_ptr = A_batch + gm * K + sk_offset;
+                int a_rows = align_M ? 16 : min(16, sg_valid_m);
+                if (a_rows <= 0) {
+                    for (int e = 0; e < 8; e++) ct_a0[e] = half(0);
+                } else if (k_aligned && a_rows == 16) {
+                    const device half* r0 = A_ptr + fm * int(K) + fn;
+                    const device half* r1 = A_ptr + (fm + 8) * int(K) + fn;
+                    ct_a0[0] = r0[0]; ct_a0[1] = r0[1]; ct_a0[2] = r0[2]; ct_a0[3] = r0[3];
+                    ct_a0[4] = r1[0]; ct_a0[5] = r1[1]; ct_a0[6] = r1[2]; ct_a0[7] = r1[3];
+                } else {
+                    for (short c = 0; c < 4; c++) {
+                        bool ok = (fm < a_rows) && (fn + c < (k_aligned ? 16 : fk_valid));
+                        ct_a0[c] = ok ? A_ptr[fm * int(K) + fn + c] : half(0);
+                    }
+                    for (short c = 0; c < 4; c++) {
+                        bool ok = (fm + 8 < a_rows) && (fn + c < (k_aligned ? 16 : fk_valid));
+                        ct_a0[4 + c] = ok ? A_ptr[(fm + 8) * int(K) + fn + c] : half(0);
                     }
                 }
+            }
+            for (int e = 0; e < 16; e++) ct_b0[e] = B_frag[e];
+            gemm_op_0.run(ct_a0, ct_b0, ct_c0);
+        }
 
-                // MMA(16, 32, 16): acc[fm_idx] += A_frag @ B_frag
-                {
-                    mpp::tensor_ops::matmul2d<nax_desc, metal::execution_simdgroup> gemm_op;
-                    auto ct_a = gemm_op.template get_left_input_cooperative_tensor<half, half, float>();
-                    auto ct_b = gemm_op.template get_right_input_cooperative_tensor<half, half, float>();
-                    auto ct_c = gemm_op.template get_destination_cooperative_tensor<decltype(ct_a), decltype(ct_b), float>();
-                    for (int e = 0; e < 8; e++) ct_a[e] = A_frag[e];
-                    for (int e = 0; e < 16; e++) ct_b[e] = B_frag[e];
-                    for (int e = 0; e < 16; e++) ct_c[e] = acc[fm_idx][e];
-                    gemm_op.run(ct_a, ct_b, ct_c);
-                    for (int e = 0; e < 16; e++) acc[fm_idx][e] = ct_c[e];
+        // Row block 1: same pattern
+        {
+            auto ct_a1 = gemm_op_1.template get_left_input_cooperative_tensor<half, half, float>();
+            auto ct_b1 = gemm_op_1.template get_right_input_cooperative_tensor<half, half, float>();
+            {
+                const device half* A_ptr = A_batch + (gm + 16) * K + sk_offset;
+                int a_rows = align_M ? 16 : min(16, sg_valid_m - 16);
+                if (a_rows <= 0) {
+                    for (int e = 0; e < 8; e++) ct_a1[e] = half(0);
+                } else if (k_aligned && a_rows == 16) {
+                    const device half* r0 = A_ptr + fm * int(K) + fn;
+                    const device half* r1 = A_ptr + (fm + 8) * int(K) + fn;
+                    ct_a1[0] = r0[0]; ct_a1[1] = r0[1]; ct_a1[2] = r0[2]; ct_a1[3] = r0[3];
+                    ct_a1[4] = r1[0]; ct_a1[5] = r1[1]; ct_a1[6] = r1[2]; ct_a1[7] = r1[3];
+                } else {
+                    for (short c = 0; c < 4; c++) {
+                        bool ok = (fm < a_rows) && (fn + c < (k_aligned ? 16 : fk_valid));
+                        ct_a1[c] = ok ? A_ptr[fm * int(K) + fn + c] : half(0);
+                    }
+                    for (short c = 0; c < 4; c++) {
+                        bool ok = (fm + 8 < a_rows) && (fn + c < (k_aligned ? 16 : fk_valid));
+                        ct_a1[4 + c] = ok ? A_ptr[(fm + 8) * int(K) + fn + c] : half(0);
+                    }
+                }
+            }
+            for (int e = 0; e < 16; e++) ct_b1[e] = B_frag[e];
+            gemm_op_1.run(ct_a1, ct_b1, ct_c1);
+        }
+    }
+
+    // ─── Store results (read from persistent ct_c) ──────────────────────────
+    float store_c0[16], store_c1[16];
+    for (int e = 0; e < 16; e++) { store_c0[e] = ct_c0[e]; store_c1[e] = ct_c1[e]; }
+
+    const bool full_m = align_M || (sg_valid_m >= int(SM));
+    const bool full_n = align_N || (sg_valid_n >= int(SN));
+
+    // Row block 0
+    {
+        const uint out_row = gm;
+        int m_valid = full_m ? 16 : min(16, sg_valid_m);
+
+        {
+            device half* C_ptr = C_batch + out_row * N + gn;
+            int n_valid = full_n ? 16 : min(16, sg_valid_n);
+            if (m_valid > 0 && n_valid > 0) {
+                if (has_residual) {
+                    const device half* res_ptr = residual + out_row * N + gn;
+                    if (m_valid == 16 && n_valid == 16) {
+                        nax_store_16x16_residual_unsafe(C_ptr, res_ptr, int(N), store_c0, fm, fn);
+                    } else {
+                        nax_store_16x16_residual(C_ptr, res_ptr, int(N), store_c0, fm, fn, m_valid, n_valid);
+                    }
+                } else {
+                    if (m_valid == 16 && n_valid == 16) {
+                        nax_store_16x16_unsafe(C_ptr, int(N), store_c0, fm, fn);
+                    } else {
+                        nax_store_16x16(C_ptr, int(N), store_c0, fm, fn, m_valid, n_valid);
+                    }
+                }
+            }
+        }
+
+        {
+            device half* C_ptr = C_batch + out_row * N + gn + 16;
+            int n_valid = full_n ? 16 : min(16, sg_valid_n - 16);
+            if (m_valid > 0 && n_valid > 0) {
+                if (has_residual) {
+                    const device half* res_ptr = residual + out_row * N + gn + 16;
+                    if (m_valid == 16 && n_valid == 16) {
+                        nax_store_16x16_residual_unsafe(C_ptr, res_ptr, int(N), store_c0 + 8, fm, fn);
+                    } else {
+                        nax_store_16x16_residual(C_ptr, res_ptr, int(N), store_c0 + 8, fm, fn, m_valid, n_valid);
+                    }
+                } else {
+                    if (m_valid == 16 && n_valid == 16) {
+                        nax_store_16x16_unsafe(C_ptr, int(N), store_c0 + 8, fm, fn);
+                    } else {
+                        nax_store_16x16(C_ptr, int(N), store_c0 + 8, fm, fn, m_valid, n_valid);
+                    }
                 }
             }
         }
     }
 
-    // ─── Store results ──────────────────────────────────────────────────────
-    const bool full_m = align_M || (sg_valid_m >= int(SM));
-    const bool full_n = align_N || (sg_valid_n >= int(SN));
-
-    for (uint fm_idx = 0; fm_idx < 2; fm_idx++) {
-        const uint out_row = gm + fm_idx * 16;
-        int m_valid = full_m ? 16 : min(16, sg_valid_m - int(fm_idx * 16));
-        if (m_valid <= 0) continue;
-
-        // First 16×16 block (cols 0-15)
-        {
-            device half* C_ptr = C_batch + out_row * N + gn;
-            int n_valid = full_n ? 16 : min(16, sg_valid_n);
-            if (n_valid > 0) {
-                if (has_residual) {
-                    const device half* res_ptr = residual + out_row * N + gn;
-                    if (m_valid == 16 && n_valid == 16) {
-                        nax_store_16x16_residual_unsafe(C_ptr, res_ptr, int(N), acc[fm_idx], fm, fn);
+    // Row block 1
+    {
+        const uint out_row = gm + 16;
+        int m_valid = full_m ? 16 : min(16, sg_valid_m - 16);
+        if (m_valid > 0) {
+            {
+                device half* C_ptr = C_batch + out_row * N + gn;
+                int n_valid = full_n ? 16 : min(16, sg_valid_n);
+                if (n_valid > 0) {
+                    if (has_residual) {
+                        const device half* res_ptr = residual + out_row * N + gn;
+                        if (m_valid == 16 && n_valid == 16) {
+                            nax_store_16x16_residual_unsafe(C_ptr, res_ptr, int(N), store_c1, fm, fn);
+                        } else {
+                            nax_store_16x16_residual(C_ptr, res_ptr, int(N), store_c1, fm, fn, m_valid, n_valid);
+                        }
                     } else {
-                        nax_store_16x16_residual(C_ptr, res_ptr, int(N), acc[fm_idx], fm, fn, m_valid, n_valid);
-                    }
-                } else {
-                    if (m_valid == 16 && n_valid == 16) {
-                        nax_store_16x16_unsafe(C_ptr, int(N), acc[fm_idx], fm, fn);
-                    } else {
-                        nax_store_16x16(C_ptr, int(N), acc[fm_idx], fm, fn, m_valid, n_valid);
+                        if (m_valid == 16 && n_valid == 16) {
+                            nax_store_16x16_unsafe(C_ptr, int(N), store_c1, fm, fn);
+                        } else {
+                            nax_store_16x16(C_ptr, int(N), store_c1, fm, fn, m_valid, n_valid);
+                        }
                     }
                 }
             }
-        }
 
-        // Second 16×16 block (cols 16-31)
-        {
-            device half* C_ptr = C_batch + out_row * N + gn + 16;
-            int n_valid = full_n ? 16 : min(16, sg_valid_n - 16);
-            if (n_valid > 0) {
-                if (has_residual) {
-                    const device half* res_ptr = residual + out_row * N + gn + 16;
-                    if (m_valid == 16 && n_valid == 16) {
-                        nax_store_16x16_residual_unsafe(C_ptr, res_ptr, int(N), acc[fm_idx] + 8, fm, fn);
+            {
+                device half* C_ptr = C_batch + out_row * N + gn + 16;
+                int n_valid = full_n ? 16 : min(16, sg_valid_n - 16);
+                if (n_valid > 0) {
+                    if (has_residual) {
+                        const device half* res_ptr = residual + out_row * N + gn + 16;
+                        if (m_valid == 16 && n_valid == 16) {
+                            nax_store_16x16_residual_unsafe(C_ptr, res_ptr, int(N), store_c1 + 8, fm, fn);
+                        } else {
+                            nax_store_16x16_residual(C_ptr, res_ptr, int(N), store_c1 + 8, fm, fn, m_valid, n_valid);
+                        }
                     } else {
-                        nax_store_16x16_residual(C_ptr, res_ptr, int(N), acc[fm_idx] + 8, fm, fn, m_valid, n_valid);
-                    }
-                } else {
-                    if (m_valid == 16 && n_valid == 16) {
-                        nax_store_16x16_unsafe(C_ptr, int(N), acc[fm_idx] + 8, fm, fn);
-                    } else {
-                        nax_store_16x16(C_ptr, int(N), acc[fm_idx] + 8, fm, fn, m_valid, n_valid);
+                        if (m_valid == 16 && n_valid == 16) {
+                            nax_store_16x16_unsafe(C_ptr, int(N), store_c1 + 8, fm, fn);
+                        } else {
+                            nax_store_16x16(C_ptr, int(N), store_c1 + 8, fm, fn, m_valid, n_valid);
+                        }
                     }
                 }
             }
         }
     }
 }
+
+"#;
+
+// ---------------------------------------------------------------------------
+// NAX GEMM 64×128 — smaller BM for better occupancy on M3 Ultra.
+// BM=64, BN=128, BK=32, WM=2, WN=4, 8 SGs, 256 threads.
+// Same per-SG computation (32×32 output) but fewer SGs → more concurrent TGs.
+// Preferred for M ≤ 192 where occupancy matters more than tile reuse.
+// ---------------------------------------------------------------------------
+
+pub const GEMM_NAX_64X128_SHADER_SOURCE: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup>
+using namespace metal;
+
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+
+// Function constants (same IDs as existing kernels)
+constant bool align_M [[function_constant(200)]];
+constant bool align_N [[function_constant(201)]];
+constant bool has_residual [[function_constant(202)]];
+constant bool align_K [[function_constant(205)]];
+
+// Tile dimensions — 64×128 variant
+constant constexpr uint BM = 64;
+constant constexpr uint BN = 128;
+constant constexpr uint BK = 32;   // Outer K-tile
+constant constexpr uint WM = 2;    // SGs along M
+constant constexpr uint WN = 4;    // SGs along N
+constant constexpr uint SM = 32;   // Per-SG output M (BM/WM)
+constant constexpr uint SN = 32;   // Per-SG output N (BN/WN)
+constant constexpr uint FK = 16;   // Inner K-step for mpp (fragment K dim)
+constant constexpr uint N_THREADS = 256;
+
+// NAX coordinate helpers (same as SDPA NAX kernel)
+// Each lane in a 16×16 fragment holds 8 elements: 2 rows × 4 cols
+// Row indices: fm, fm+8
+// Col indices: fn, fn+1, fn+2, fn+3
+inline short nax_fm(uint slid) {
+    short qid = short(slid) >> 2;
+    return ((qid & 4) | ((short(slid) >> 1) & 3));
+}
+
+inline short nax_fn(uint slid) {
+    short qid = short(slid) >> 2;
+    return ((qid & 2) | (short(slid) & 1)) * 4;
+}
+
+// Load a 16×16 block from device memory into a NAX fragment register array.
+METAL_FUNC void nax_load_16x16(thread half* frag,
+                                 const device half* src, int src_ld,
+                                 short fm, short fn,
+                                 int valid_rows, int valid_cols) {
+    for (short c = 0; c < 4; c++) {
+        bool ok = (fm < valid_rows) && (fn + c < valid_cols);
+        frag[c] = ok ? src[fm * src_ld + fn + c] : half(0);
+    }
+    for (short c = 0; c < 4; c++) {
+        bool ok = (fm + 8 < valid_rows) && (fn + c < valid_cols);
+        frag[4 + c] = ok ? src[(fm + 8) * src_ld + fn + c] : half(0);
+    }
+}
+
+METAL_FUNC void nax_load_16x16_unsafe(thread half* frag,
+                                        const device half* src, int src_ld,
+                                        short fm, short fn) {
+    for (short c = 0; c < 4; c++) {
+        frag[c] = src[fm * src_ld + fn + c];
+    }
+    for (short c = 0; c < 4; c++) {
+        frag[4 + c] = src[(fm + 8) * src_ld + fn + c];
+    }
+}
+
+// Store a 16×16 block from float accumulator to device half memory.
+METAL_FUNC void nax_store_16x16(device half* dst, int dst_ld,
+                                  thread const float* frag,
+                                  short fm, short fn,
+                                  int valid_rows, int valid_cols) {
+    for (short c = 0; c < 4; c++) {
+        if (fm < valid_rows && fn + c < valid_cols) {
+            dst[fm * dst_ld + fn + c] = half(frag[c]);
+        }
+    }
+    for (short c = 0; c < 4; c++) {
+        if (fm + 8 < valid_rows && fn + c < valid_cols) {
+            dst[(fm + 8) * dst_ld + fn + c] = half(frag[4 + c]);
+        }
+    }
+}
+
+METAL_FUNC void nax_store_16x16_unsafe(device half* dst, int dst_ld,
+                                         thread const float* frag,
+                                         short fm, short fn) {
+    for (short c = 0; c < 4; c++) {
+        dst[fm * dst_ld + fn + c] = half(frag[c]);
+    }
+    for (short c = 0; c < 4; c++) {
+        dst[(fm + 8) * dst_ld + fn + c] = half(frag[4 + c]);
+    }
+}
+
+// Store with residual add
+METAL_FUNC void nax_store_16x16_residual(device half* dst,
+                                           const device half* res,
+                                           int dst_ld,
+                                           thread const float* frag,
+                                           short fm, short fn,
+                                           int valid_rows, int valid_cols) {
+    for (short c = 0; c < 4; c++) {
+        if (fm < valid_rows && fn + c < valid_cols) {
+            dst[fm * dst_ld + fn + c] = half(frag[c]) + res[fm * dst_ld + fn + c];
+        }
+    }
+    for (short c = 0; c < 4; c++) {
+        if (fm + 8 < valid_rows && fn + c < valid_cols) {
+            dst[(fm + 8) * dst_ld + fn + c] = half(frag[4 + c]) + res[(fm + 8) * dst_ld + fn + c];
+        }
+    }
+}
+
+METAL_FUNC void nax_store_16x16_residual_unsafe(device half* dst,
+                                                   const device half* res,
+                                                   int dst_ld,
+                                                   thread const float* frag,
+                                                   short fm, short fn) {
+    for (short c = 0; c < 4; c++) {
+        dst[fm * dst_ld + fn + c] = half(frag[c]) + res[fm * dst_ld + fn + c];
+    }
+    for (short c = 0; c < 4; c++) {
+        dst[(fm + 8) * dst_ld + fn + c] = half(frag[4 + c]) + res[(fm + 8) * dst_ld + fn + c];
+    }
+}
+
+// ─── NAX GEMM 64×128 kernel ────────────────────────────────────────────────
+//
+// A: [M, K] row-major, B: [K, N] row-major → C: [M, N]
+//
+// Grid: (ceildiv(N, BN), ceildiv(M, BM), batch)
+// Threadgroup: (256, 1, 1) — 8 simdgroups × 32 lanes
+//
+// Each SG computes a 32×32 output tile as 2 stacked 16×32 subtiles.
+// MMA descriptor is (16, 32, 16): B fragment is 16×32 (16 elems/lane).
+// K dimension is iterated in steps of FK=16.
+
+[[kernel, max_total_threads_per_threadgroup(256)]]
+void gemm_nax_64x128_f16(
+    device const half* A [[buffer(0)]],
+    device const half* B [[buffer(1)]],
+    device half* C [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    constant uint& K [[buffer(5)]],
+    constant uint& batch_stride_a [[buffer(6)]],
+    constant uint& batch_stride_b [[buffer(7)]],
+    constant uint& batch_stride_c [[buffer(8)]],
+    constant uint& swizzle_log [[buffer(9)]],
+    device const half* residual [[buffer(10)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint slid [[thread_index_in_simdgroup]])
+{
+    // Batch offset
+    const uint batch_idx = tid.z;
+    const device half* A_batch = A + batch_idx * batch_stride_a;
+    const device half* B_batch = B + batch_idx * batch_stride_b;
+    device half* C_batch = C + batch_idx * batch_stride_c;
+
+    // Threadblock swizzle
+    uint2 tg_pos = uint2(tid.x, tid.y);
+    if (swizzle_log > 0) {
+        tg_pos = uint2(
+            tg_pos.x >> swizzle_log,
+            (tg_pos.y << swizzle_log) | (tg_pos.x & ((1u << swizzle_log) - 1u))
+        );
+    }
+
+    // SG position within threadgroup: 2×4 grid
+    const uint sg_m = sgid / WN;  // 0..1
+    const uint sg_n = sgid % WN;  // 0..3
+
+    // Global output position for this SG
+    const uint gm = tg_pos.y * BM + sg_m * SM;  // Start row
+    const uint gn = tg_pos.x * BN + sg_n * SN;  // Start col
+
+    // Early exit for out-of-bounds SGs
+    if (!align_M && gm >= M) return;
+    if (!align_N && gn >= N) return;
+
+    // Valid rows/cols for this SG
+    const int sg_valid_m = align_M ? int(SM) : min(int(M) - int(gm), int(SM));
+    const int sg_valid_n = align_N ? int(SN) : min(int(N) - int(gn), int(SN));
+
+    if (sg_valid_m <= 0 || sg_valid_n <= 0) return;
+
+    // Per-lane fragment coordinates within a 16×16 fragment
+    const short fm = nax_fm(slid);
+    const short fn = nax_fn(slid);
+
+    // MPP matmul2d descriptor: MMA(16, 32, 16, A=normal, B=normal, accumulate)
+    constexpr auto nax_desc = mpp::tensor_ops::matmul2d_descriptor(
+        16, 32, 16, false, false, true,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+
+    // ── Zero-copy cooperative tensor pattern ──
+    mpp::tensor_ops::matmul2d<nax_desc, metal::execution_simdgroup> gemm_op_0;
+    mpp::tensor_ops::matmul2d<nax_desc, metal::execution_simdgroup> gemm_op_1;
+
+    auto ct_c0 = gemm_op_0.template get_destination_cooperative_tensor<
+        decltype(gemm_op_0.template get_left_input_cooperative_tensor<half, half, float>()),
+        decltype(gemm_op_0.template get_right_input_cooperative_tensor<half, half, float>()),
+        float>();
+    auto ct_c1 = gemm_op_1.template get_destination_cooperative_tensor<
+        decltype(gemm_op_1.template get_left_input_cooperative_tensor<half, half, float>()),
+        decltype(gemm_op_1.template get_right_input_cooperative_tensor<half, half, float>()),
+        float>();
+    for (int e = 0; e < 16; e++) { ct_c0[e] = 0.0f; ct_c1[e] = 0.0f; }
+
+    // ── Flat K-loop: iterate in steps of FK=16 ──
+    const uint k_total_steps = align_K ? (K / FK) : ((K + FK - 1) / FK);
+
+    #pragma clang loop unroll_count(2)
+    for (uint sk_abs = 0; sk_abs < k_total_steps; sk_abs++) {
+        const uint sk_offset = sk_abs * FK;
+        const int fk_valid = align_K ? int(FK) : min(int(FK), int(K) - int(sk_offset));
+        const bool k_aligned = align_K || (fk_valid == int(FK));
+
+        // Load B fragment ONCE (16×32) — shared between both row blocks
+        half B_frag[16];
+        {
+            const device half* B_ptr0 = B_batch + sk_offset * N + gn;
+            int b_cols0 = align_N ? 16 : min(16, sg_valid_n);
+            if (b_cols0 <= 0) {
+                for (int e = 0; e < 8; e++) B_frag[e] = half(0);
+            } else if (k_aligned && b_cols0 == 16) {
+                nax_load_16x16_unsafe(B_frag, B_ptr0, int(N), fm, fn);
+            } else {
+                nax_load_16x16(B_frag, B_ptr0, int(N), fm, fn,
+                              k_aligned ? 16 : fk_valid, b_cols0);
+            }
+
+            const device half* B_ptr1 = B_ptr0 + 16;
+            int b_cols1 = align_N ? 16 : min(16, sg_valid_n - 16);
+            if (b_cols1 <= 0) {
+                for (int e = 0; e < 8; e++) B_frag[8 + e] = half(0);
+            } else if (k_aligned && b_cols1 == 16) {
+                nax_load_16x16_unsafe(B_frag + 8, B_ptr1, int(N), fm, fn);
+            } else {
+                nax_load_16x16(B_frag + 8, B_ptr1, int(N), fm, fn,
+                              k_aligned ? 16 : fk_valid, b_cols1);
+            }
+        }
+
+        // Row block 0
+        {
+            auto ct_a0 = gemm_op_0.template get_left_input_cooperative_tensor<half, half, float>();
+            auto ct_b0 = gemm_op_0.template get_right_input_cooperative_tensor<half, half, float>();
+            {
+                const device half* A_ptr = A_batch + gm * K + sk_offset;
+                int a_rows = align_M ? 16 : min(16, sg_valid_m);
+                if (a_rows <= 0) {
+                    for (int e = 0; e < 8; e++) ct_a0[e] = half(0);
+                } else if (k_aligned && a_rows == 16) {
+                    const device half* r0 = A_ptr + fm * int(K) + fn;
+                    const device half* r1 = A_ptr + (fm + 8) * int(K) + fn;
+                    ct_a0[0] = r0[0]; ct_a0[1] = r0[1]; ct_a0[2] = r0[2]; ct_a0[3] = r0[3];
+                    ct_a0[4] = r1[0]; ct_a0[5] = r1[1]; ct_a0[6] = r1[2]; ct_a0[7] = r1[3];
+                } else {
+                    for (short c = 0; c < 4; c++) {
+                        bool ok = (fm < a_rows) && (fn + c < (k_aligned ? 16 : fk_valid));
+                        ct_a0[c] = ok ? A_ptr[fm * int(K) + fn + c] : half(0);
+                    }
+                    for (short c = 0; c < 4; c++) {
+                        bool ok = (fm + 8 < a_rows) && (fn + c < (k_aligned ? 16 : fk_valid));
+                        ct_a0[4 + c] = ok ? A_ptr[(fm + 8) * int(K) + fn + c] : half(0);
+                    }
+                }
+            }
+            for (int e = 0; e < 16; e++) ct_b0[e] = B_frag[e];
+            gemm_op_0.run(ct_a0, ct_b0, ct_c0);
+        }
+
+        // Row block 1
+        {
+            auto ct_a1 = gemm_op_1.template get_left_input_cooperative_tensor<half, half, float>();
+            auto ct_b1 = gemm_op_1.template get_right_input_cooperative_tensor<half, half, float>();
+            {
+                const device half* A_ptr = A_batch + (gm + 16) * K + sk_offset;
+                int a_rows = align_M ? 16 : min(16, sg_valid_m - 16);
+                if (a_rows <= 0) {
+                    for (int e = 0; e < 8; e++) ct_a1[e] = half(0);
+                } else if (k_aligned && a_rows == 16) {
+                    const device half* r0 = A_ptr + fm * int(K) + fn;
+                    const device half* r1 = A_ptr + (fm + 8) * int(K) + fn;
+                    ct_a1[0] = r0[0]; ct_a1[1] = r0[1]; ct_a1[2] = r0[2]; ct_a1[3] = r0[3];
+                    ct_a1[4] = r1[0]; ct_a1[5] = r1[1]; ct_a1[6] = r1[2]; ct_a1[7] = r1[3];
+                } else {
+                    for (short c = 0; c < 4; c++) {
+                        bool ok = (fm < a_rows) && (fn + c < (k_aligned ? 16 : fk_valid));
+                        ct_a1[c] = ok ? A_ptr[fm * int(K) + fn + c] : half(0);
+                    }
+                    for (short c = 0; c < 4; c++) {
+                        bool ok = (fm + 8 < a_rows) && (fn + c < (k_aligned ? 16 : fk_valid));
+                        ct_a1[4 + c] = ok ? A_ptr[(fm + 8) * int(K) + fn + c] : half(0);
+                    }
+                }
+            }
+            for (int e = 0; e < 16; e++) ct_b1[e] = B_frag[e];
+            gemm_op_1.run(ct_a1, ct_b1, ct_c1);
+        }
+    }
+
+    // ─── Store results (read from persistent ct_c) ──────────────────────────
+    float store_c0[16], store_c1[16];
+    for (int e = 0; e < 16; e++) { store_c0[e] = ct_c0[e]; store_c1[e] = ct_c1[e]; }
+
+    const bool full_m = align_M || (sg_valid_m >= int(SM));
+    const bool full_n = align_N || (sg_valid_n >= int(SN));
+
+    // Row block 0
+    {
+        const uint out_row = gm;
+        int m_valid = full_m ? 16 : min(16, sg_valid_m);
+
+        {
+            device half* C_ptr = C_batch + out_row * N + gn;
+            int n_valid = full_n ? 16 : min(16, sg_valid_n);
+            if (m_valid > 0 && n_valid > 0) {
+                if (has_residual) {
+                    const device half* res_ptr = residual + out_row * N + gn;
+                    if (m_valid == 16 && n_valid == 16) {
+                        nax_store_16x16_residual_unsafe(C_ptr, res_ptr, int(N), store_c0, fm, fn);
+                    } else {
+                        nax_store_16x16_residual(C_ptr, res_ptr, int(N), store_c0, fm, fn, m_valid, n_valid);
+                    }
+                } else {
+                    if (m_valid == 16 && n_valid == 16) {
+                        nax_store_16x16_unsafe(C_ptr, int(N), store_c0, fm, fn);
+                    } else {
+                        nax_store_16x16(C_ptr, int(N), store_c0, fm, fn, m_valid, n_valid);
+                    }
+                }
+            }
+        }
+
+        {
+            device half* C_ptr = C_batch + out_row * N + gn + 16;
+            int n_valid = full_n ? 16 : min(16, sg_valid_n - 16);
+            if (m_valid > 0 && n_valid > 0) {
+                if (has_residual) {
+                    const device half* res_ptr = residual + out_row * N + gn + 16;
+                    if (m_valid == 16 && n_valid == 16) {
+                        nax_store_16x16_residual_unsafe(C_ptr, res_ptr, int(N), store_c0 + 8, fm, fn);
+                    } else {
+                        nax_store_16x16_residual(C_ptr, res_ptr, int(N), store_c0 + 8, fm, fn, m_valid, n_valid);
+                    }
+                } else {
+                    if (m_valid == 16 && n_valid == 16) {
+                        nax_store_16x16_unsafe(C_ptr, int(N), store_c0 + 8, fm, fn);
+                    } else {
+                        nax_store_16x16(C_ptr, int(N), store_c0 + 8, fm, fn, m_valid, n_valid);
+                    }
+                }
+            }
+        }
+    }
+
+    // Row block 1
+    {
+        const uint out_row = gm + 16;
+        int m_valid = full_m ? 16 : min(16, sg_valid_m - 16);
+        if (m_valid > 0) {
+            {
+                device half* C_ptr = C_batch + out_row * N + gn;
+                int n_valid = full_n ? 16 : min(16, sg_valid_n);
+                if (n_valid > 0) {
+                    if (has_residual) {
+                        const device half* res_ptr = residual + out_row * N + gn;
+                        if (m_valid == 16 && n_valid == 16) {
+                            nax_store_16x16_residual_unsafe(C_ptr, res_ptr, int(N), store_c1, fm, fn);
+                        } else {
+                            nax_store_16x16_residual(C_ptr, res_ptr, int(N), store_c1, fm, fn, m_valid, n_valid);
+                        }
+                    } else {
+                        if (m_valid == 16 && n_valid == 16) {
+                            nax_store_16x16_unsafe(C_ptr, int(N), store_c1, fm, fn);
+                        } else {
+                            nax_store_16x16(C_ptr, int(N), store_c1, fm, fn, m_valid, n_valid);
+                        }
+                    }
+                }
+            }
+
+            {
+                device half* C_ptr = C_batch + out_row * N + gn + 16;
+                int n_valid = full_n ? 16 : min(16, sg_valid_n - 16);
+                if (n_valid > 0) {
+                    if (has_residual) {
+                        const device half* res_ptr = residual + out_row * N + gn + 16;
+                        if (m_valid == 16 && n_valid == 16) {
+                            nax_store_16x16_residual_unsafe(C_ptr, res_ptr, int(N), store_c1 + 8, fm, fn);
+                        } else {
+                            nax_store_16x16_residual(C_ptr, res_ptr, int(N), store_c1 + 8, fm, fn, m_valid, n_valid);
+                        }
+                    } else {
+                        if (m_valid == 16 && n_valid == 16) {
+                            nax_store_16x16_unsafe(C_ptr, int(N), store_c1 + 8, fm, fn);
+                        } else {
+                            nax_store_16x16(C_ptr, int(N), store_c1 + 8, fm, fn, m_valid, n_valid);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+"#;
+
+pub const GEMM_NAX_64X128_U4_SHADER_SOURCE: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup>
+using namespace metal;
+
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+
+// Function constants (same IDs as existing kernels)
+constant bool align_M [[function_constant(200)]];
+constant bool align_N [[function_constant(201)]];
+constant bool has_residual [[function_constant(202)]];
+constant bool align_K [[function_constant(205)]];
+
+// Tile dimensions — 64×128 variant (unroll_count=4)
+constant constexpr uint BM = 64;
+constant constexpr uint BN = 128;
+constant constexpr uint BK = 32;   // Outer K-tile
+constant constexpr uint WM = 2;    // SGs along M
+constant constexpr uint WN = 4;    // SGs along N
+constant constexpr uint SM = 32;   // Per-SG output M (BM/WM)
+constant constexpr uint SN = 32;   // Per-SG output N (BN/WN)
+constant constexpr uint FK = 16;   // Inner K-step for mpp (fragment K dim)
+constant constexpr uint N_THREADS = 256;
+
+// NAX coordinate helpers (same as SDPA NAX kernel)
+// Each lane in a 16×16 fragment holds 8 elements: 2 rows × 4 cols
+// Row indices: fm, fm+8
+// Col indices: fn, fn+1, fn+2, fn+3
+inline short nax_fm(uint slid) {
+    short qid = short(slid) >> 2;
+    return ((qid & 4) | ((short(slid) >> 1) & 3));
+}
+
+inline short nax_fn(uint slid) {
+    short qid = short(slid) >> 2;
+    return ((qid & 2) | (short(slid) & 1)) * 4;
+}
+
+// Load a 16×16 block from device memory into a NAX fragment register array.
+METAL_FUNC void nax_load_16x16(thread half* frag,
+                                 const device half* src, int src_ld,
+                                 short fm, short fn,
+                                 int valid_rows, int valid_cols) {
+    for (short c = 0; c < 4; c++) {
+        bool ok = (fm < valid_rows) && (fn + c < valid_cols);
+        frag[c] = ok ? src[fm * src_ld + fn + c] : half(0);
+    }
+    for (short c = 0; c < 4; c++) {
+        bool ok = (fm + 8 < valid_rows) && (fn + c < valid_cols);
+        frag[4 + c] = ok ? src[(fm + 8) * src_ld + fn + c] : half(0);
+    }
+}
+
+METAL_FUNC void nax_load_16x16_unsafe(thread half* frag,
+                                        const device half* src, int src_ld,
+                                        short fm, short fn) {
+    for (short c = 0; c < 4; c++) {
+        frag[c] = src[fm * src_ld + fn + c];
+    }
+    for (short c = 0; c < 4; c++) {
+        frag[4 + c] = src[(fm + 8) * src_ld + fn + c];
+    }
+}
+
+// Store a 16×16 block from float accumulator to device half memory.
+METAL_FUNC void nax_store_16x16(device half* dst, int dst_ld,
+                                  thread const float* frag,
+                                  short fm, short fn,
+                                  int valid_rows, int valid_cols) {
+    for (short c = 0; c < 4; c++) {
+        if (fm < valid_rows && fn + c < valid_cols) {
+            dst[fm * dst_ld + fn + c] = half(frag[c]);
+        }
+    }
+    for (short c = 0; c < 4; c++) {
+        if (fm + 8 < valid_rows && fn + c < valid_cols) {
+            dst[(fm + 8) * dst_ld + fn + c] = half(frag[4 + c]);
+        }
+    }
+}
+
+METAL_FUNC void nax_store_16x16_unsafe(device half* dst, int dst_ld,
+                                         thread const float* frag,
+                                         short fm, short fn) {
+    for (short c = 0; c < 4; c++) {
+        dst[fm * dst_ld + fn + c] = half(frag[c]);
+    }
+    for (short c = 0; c < 4; c++) {
+        dst[(fm + 8) * dst_ld + fn + c] = half(frag[4 + c]);
+    }
+}
+
+// Store with residual add
+METAL_FUNC void nax_store_16x16_residual(device half* dst,
+                                           const device half* res,
+                                           int dst_ld,
+                                           thread const float* frag,
+                                           short fm, short fn,
+                                           int valid_rows, int valid_cols) {
+    for (short c = 0; c < 4; c++) {
+        if (fm < valid_rows && fn + c < valid_cols) {
+            dst[fm * dst_ld + fn + c] = half(frag[c]) + res[fm * dst_ld + fn + c];
+        }
+    }
+    for (short c = 0; c < 4; c++) {
+        if (fm + 8 < valid_rows && fn + c < valid_cols) {
+            dst[(fm + 8) * dst_ld + fn + c] = half(frag[4 + c]) + res[(fm + 8) * dst_ld + fn + c];
+        }
+    }
+}
+
+METAL_FUNC void nax_store_16x16_residual_unsafe(device half* dst,
+                                                   const device half* res,
+                                                   int dst_ld,
+                                                   thread const float* frag,
+                                                   short fm, short fn) {
+    for (short c = 0; c < 4; c++) {
+        dst[fm * dst_ld + fn + c] = half(frag[c]) + res[fm * dst_ld + fn + c];
+    }
+    for (short c = 0; c < 4; c++) {
+        dst[(fm + 8) * dst_ld + fn + c] = half(frag[4 + c]) + res[(fm + 8) * dst_ld + fn + c];
+    }
+}
+
+// ─── NAX GEMM 64×128 kernel ────────────────────────────────────────────────
+//
+// A: [M, K] row-major, B: [K, N] row-major → C: [M, N]
+//
+// Grid: (ceildiv(N, BN), ceildiv(M, BM), batch)
+// Threadgroup: (256, 1, 1) — 8 simdgroups × 32 lanes
+//
+// Each SG computes a 32×32 output tile as 2 stacked 16×32 subtiles.
+// MMA descriptor is (16, 32, 16): B fragment is 16×32 (16 elems/lane).
+// K dimension is iterated in steps of FK=16.
+
+[[kernel, max_total_threads_per_threadgroup(256)]]
+void gemm_nax_64x128_u4_f16(
+    device const half* A [[buffer(0)]],
+    device const half* B [[buffer(1)]],
+    device half* C [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    constant uint& K [[buffer(5)]],
+    constant uint& batch_stride_a [[buffer(6)]],
+    constant uint& batch_stride_b [[buffer(7)]],
+    constant uint& batch_stride_c [[buffer(8)]],
+    constant uint& swizzle_log [[buffer(9)]],
+    device const half* residual [[buffer(10)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint slid [[thread_index_in_simdgroup]])
+{
+    // Batch offset
+    const uint batch_idx = tid.z;
+    const device half* A_batch = A + batch_idx * batch_stride_a;
+    const device half* B_batch = B + batch_idx * batch_stride_b;
+    device half* C_batch = C + batch_idx * batch_stride_c;
+
+    // Threadblock swizzle
+    uint2 tg_pos = uint2(tid.x, tid.y);
+    if (swizzle_log > 0) {
+        tg_pos = uint2(
+            tg_pos.x >> swizzle_log,
+            (tg_pos.y << swizzle_log) | (tg_pos.x & ((1u << swizzle_log) - 1u))
+        );
+    }
+
+    // SG position within threadgroup: 2×4 grid
+    const uint sg_m = sgid / WN;  // 0..1
+    const uint sg_n = sgid % WN;  // 0..3
+
+    // Global output position for this SG
+    const uint gm = tg_pos.y * BM + sg_m * SM;  // Start row
+    const uint gn = tg_pos.x * BN + sg_n * SN;  // Start col
+
+    // Early exit for out-of-bounds SGs
+    if (!align_M && gm >= M) return;
+    if (!align_N && gn >= N) return;
+
+    // Valid rows/cols for this SG
+    const int sg_valid_m = align_M ? int(SM) : min(int(M) - int(gm), int(SM));
+    const int sg_valid_n = align_N ? int(SN) : min(int(N) - int(gn), int(SN));
+
+    if (sg_valid_m <= 0 || sg_valid_n <= 0) return;
+
+    // Per-lane fragment coordinates within a 16×16 fragment
+    const short fm = nax_fm(slid);
+    const short fn = nax_fn(slid);
+
+    // MPP matmul2d descriptor: MMA(16, 32, 16, A=normal, B=normal, accumulate)
+    constexpr auto nax_desc = mpp::tensor_ops::matmul2d_descriptor(
+        16, 32, 16, false, false, true,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+
+    // ── Zero-copy cooperative tensor pattern ──
+    mpp::tensor_ops::matmul2d<nax_desc, metal::execution_simdgroup> gemm_op_0;
+    mpp::tensor_ops::matmul2d<nax_desc, metal::execution_simdgroup> gemm_op_1;
+
+    auto ct_c0 = gemm_op_0.template get_destination_cooperative_tensor<
+        decltype(gemm_op_0.template get_left_input_cooperative_tensor<half, half, float>()),
+        decltype(gemm_op_0.template get_right_input_cooperative_tensor<half, half, float>()),
+        float>();
+    auto ct_c1 = gemm_op_1.template get_destination_cooperative_tensor<
+        decltype(gemm_op_1.template get_left_input_cooperative_tensor<half, half, float>()),
+        decltype(gemm_op_1.template get_right_input_cooperative_tensor<half, half, float>()),
+        float>();
+    for (int e = 0; e < 16; e++) { ct_c0[e] = 0.0f; ct_c1[e] = 0.0f; }
+
+    // ── Flat K-loop: iterate in steps of FK=16 ──
+    const uint k_total_steps = align_K ? (K / FK) : ((K + FK - 1) / FK);
+
+    #pragma clang loop unroll_count(4)
+    for (uint sk_abs = 0; sk_abs < k_total_steps; sk_abs++) {
+        const uint sk_offset = sk_abs * FK;
+        const int fk_valid = align_K ? int(FK) : min(int(FK), int(K) - int(sk_offset));
+        const bool k_aligned = align_K || (fk_valid == int(FK));
+
+        // Load B fragment ONCE (16×32) — shared between both row blocks
+        half B_frag[16];
+        {
+            const device half* B_ptr0 = B_batch + sk_offset * N + gn;
+            int b_cols0 = align_N ? 16 : min(16, sg_valid_n);
+            if (b_cols0 <= 0) {
+                for (int e = 0; e < 8; e++) B_frag[e] = half(0);
+            } else if (k_aligned && b_cols0 == 16) {
+                nax_load_16x16_unsafe(B_frag, B_ptr0, int(N), fm, fn);
+            } else {
+                nax_load_16x16(B_frag, B_ptr0, int(N), fm, fn,
+                              k_aligned ? 16 : fk_valid, b_cols0);
+            }
+
+            const device half* B_ptr1 = B_ptr0 + 16;
+            int b_cols1 = align_N ? 16 : min(16, sg_valid_n - 16);
+            if (b_cols1 <= 0) {
+                for (int e = 0; e < 8; e++) B_frag[8 + e] = half(0);
+            } else if (k_aligned && b_cols1 == 16) {
+                nax_load_16x16_unsafe(B_frag + 8, B_ptr1, int(N), fm, fn);
+            } else {
+                nax_load_16x16(B_frag + 8, B_ptr1, int(N), fm, fn,
+                              k_aligned ? 16 : fk_valid, b_cols1);
+            }
+        }
+
+        // Row block 0
+        {
+            auto ct_a0 = gemm_op_0.template get_left_input_cooperative_tensor<half, half, float>();
+            auto ct_b0 = gemm_op_0.template get_right_input_cooperative_tensor<half, half, float>();
+            {
+                const device half* A_ptr = A_batch + gm * K + sk_offset;
+                int a_rows = align_M ? 16 : min(16, sg_valid_m);
+                if (a_rows <= 0) {
+                    for (int e = 0; e < 8; e++) ct_a0[e] = half(0);
+                } else if (k_aligned && a_rows == 16) {
+                    const device half* r0 = A_ptr + fm * int(K) + fn;
+                    const device half* r1 = A_ptr + (fm + 8) * int(K) + fn;
+                    ct_a0[0] = r0[0]; ct_a0[1] = r0[1]; ct_a0[2] = r0[2]; ct_a0[3] = r0[3];
+                    ct_a0[4] = r1[0]; ct_a0[5] = r1[1]; ct_a0[6] = r1[2]; ct_a0[7] = r1[3];
+                } else {
+                    for (short c = 0; c < 4; c++) {
+                        bool ok = (fm < a_rows) && (fn + c < (k_aligned ? 16 : fk_valid));
+                        ct_a0[c] = ok ? A_ptr[fm * int(K) + fn + c] : half(0);
+                    }
+                    for (short c = 0; c < 4; c++) {
+                        bool ok = (fm + 8 < a_rows) && (fn + c < (k_aligned ? 16 : fk_valid));
+                        ct_a0[4 + c] = ok ? A_ptr[(fm + 8) * int(K) + fn + c] : half(0);
+                    }
+                }
+            }
+            for (int e = 0; e < 16; e++) ct_b0[e] = B_frag[e];
+            gemm_op_0.run(ct_a0, ct_b0, ct_c0);
+        }
+
+        // Row block 1
+        {
+            auto ct_a1 = gemm_op_1.template get_left_input_cooperative_tensor<half, half, float>();
+            auto ct_b1 = gemm_op_1.template get_right_input_cooperative_tensor<half, half, float>();
+            {
+                const device half* A_ptr = A_batch + (gm + 16) * K + sk_offset;
+                int a_rows = align_M ? 16 : min(16, sg_valid_m - 16);
+                if (a_rows <= 0) {
+                    for (int e = 0; e < 8; e++) ct_a1[e] = half(0);
+                } else if (k_aligned && a_rows == 16) {
+                    const device half* r0 = A_ptr + fm * int(K) + fn;
+                    const device half* r1 = A_ptr + (fm + 8) * int(K) + fn;
+                    ct_a1[0] = r0[0]; ct_a1[1] = r0[1]; ct_a1[2] = r0[2]; ct_a1[3] = r0[3];
+                    ct_a1[4] = r1[0]; ct_a1[5] = r1[1]; ct_a1[6] = r1[2]; ct_a1[7] = r1[3];
+                } else {
+                    for (short c = 0; c < 4; c++) {
+                        bool ok = (fm < a_rows) && (fn + c < (k_aligned ? 16 : fk_valid));
+                        ct_a1[c] = ok ? A_ptr[fm * int(K) + fn + c] : half(0);
+                    }
+                    for (short c = 0; c < 4; c++) {
+                        bool ok = (fm + 8 < a_rows) && (fn + c < (k_aligned ? 16 : fk_valid));
+                        ct_a1[4 + c] = ok ? A_ptr[(fm + 8) * int(K) + fn + c] : half(0);
+                    }
+                }
+            }
+            for (int e = 0; e < 16; e++) ct_b1[e] = B_frag[e];
+            gemm_op_1.run(ct_a1, ct_b1, ct_c1);
+        }
+    }
+
+    // ─── Store results (read from persistent ct_c) ──────────────────────────
+    float store_c0[16], store_c1[16];
+    for (int e = 0; e < 16; e++) { store_c0[e] = ct_c0[e]; store_c1[e] = ct_c1[e]; }
+
+    const bool full_m = align_M || (sg_valid_m >= int(SM));
+    const bool full_n = align_N || (sg_valid_n >= int(SN));
+
+    // Row block 0
+    {
+        const uint out_row = gm;
+        int m_valid = full_m ? 16 : min(16, sg_valid_m);
+
+        {
+            device half* C_ptr = C_batch + out_row * N + gn;
+            int n_valid = full_n ? 16 : min(16, sg_valid_n);
+            if (m_valid > 0 && n_valid > 0) {
+                if (has_residual) {
+                    const device half* res_ptr = residual + out_row * N + gn;
+                    if (m_valid == 16 && n_valid == 16) {
+                        nax_store_16x16_residual_unsafe(C_ptr, res_ptr, int(N), store_c0, fm, fn);
+                    } else {
+                        nax_store_16x16_residual(C_ptr, res_ptr, int(N), store_c0, fm, fn, m_valid, n_valid);
+                    }
+                } else {
+                    if (m_valid == 16 && n_valid == 16) {
+                        nax_store_16x16_unsafe(C_ptr, int(N), store_c0, fm, fn);
+                    } else {
+                        nax_store_16x16(C_ptr, int(N), store_c0, fm, fn, m_valid, n_valid);
+                    }
+                }
+            }
+        }
+
+        {
+            device half* C_ptr = C_batch + out_row * N + gn + 16;
+            int n_valid = full_n ? 16 : min(16, sg_valid_n - 16);
+            if (m_valid > 0 && n_valid > 0) {
+                if (has_residual) {
+                    const device half* res_ptr = residual + out_row * N + gn + 16;
+                    if (m_valid == 16 && n_valid == 16) {
+                        nax_store_16x16_residual_unsafe(C_ptr, res_ptr, int(N), store_c0 + 8, fm, fn);
+                    } else {
+                        nax_store_16x16_residual(C_ptr, res_ptr, int(N), store_c0 + 8, fm, fn, m_valid, n_valid);
+                    }
+                } else {
+                    if (m_valid == 16 && n_valid == 16) {
+                        nax_store_16x16_unsafe(C_ptr, int(N), store_c0 + 8, fm, fn);
+                    } else {
+                        nax_store_16x16(C_ptr, int(N), store_c0 + 8, fm, fn, m_valid, n_valid);
+                    }
+                }
+            }
+        }
+    }
+
+    // Row block 1
+    {
+        const uint out_row = gm + 16;
+        int m_valid = full_m ? 16 : min(16, sg_valid_m - 16);
+        if (m_valid > 0) {
+            {
+                device half* C_ptr = C_batch + out_row * N + gn;
+                int n_valid = full_n ? 16 : min(16, sg_valid_n);
+                if (n_valid > 0) {
+                    if (has_residual) {
+                        const device half* res_ptr = residual + out_row * N + gn;
+                        if (m_valid == 16 && n_valid == 16) {
+                            nax_store_16x16_residual_unsafe(C_ptr, res_ptr, int(N), store_c1, fm, fn);
+                        } else {
+                            nax_store_16x16_residual(C_ptr, res_ptr, int(N), store_c1, fm, fn, m_valid, n_valid);
+                        }
+                    } else {
+                        if (m_valid == 16 && n_valid == 16) {
+                            nax_store_16x16_unsafe(C_ptr, int(N), store_c1, fm, fn);
+                        } else {
+                            nax_store_16x16(C_ptr, int(N), store_c1, fm, fn, m_valid, n_valid);
+                        }
+                    }
+                }
+            }
+
+            {
+                device half* C_ptr = C_batch + out_row * N + gn + 16;
+                int n_valid = full_n ? 16 : min(16, sg_valid_n - 16);
+                if (n_valid > 0) {
+                    if (has_residual) {
+                        const device half* res_ptr = residual + out_row * N + gn + 16;
+                        if (m_valid == 16 && n_valid == 16) {
+                            nax_store_16x16_residual_unsafe(C_ptr, res_ptr, int(N), store_c1 + 8, fm, fn);
+                        } else {
+                            nax_store_16x16_residual(C_ptr, res_ptr, int(N), store_c1 + 8, fm, fn, m_valid, n_valid);
+                        }
+                    } else {
+                        if (m_valid == 16 && n_valid == 16) {
+                            nax_store_16x16_unsafe(C_ptr, int(N), store_c1 + 8, fm, fn);
+                        } else {
+                            nax_store_16x16(C_ptr, int(N), store_c1 + 8, fm, fn, m_valid, n_valid);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+"#;
+
+pub const GEMM_NAX_64X128_U8_SHADER_SOURCE: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup>
+using namespace metal;
+
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+
+// Function constants (same IDs as existing kernels)
+constant bool align_M [[function_constant(200)]];
+constant bool align_N [[function_constant(201)]];
+constant bool has_residual [[function_constant(202)]];
+constant bool align_K [[function_constant(205)]];
+
+// Tile dimensions — 64×128 variant (unroll_count=8)
+constant constexpr uint BM = 64;
+constant constexpr uint BN = 128;
+constant constexpr uint BK = 32;   // Outer K-tile
+constant constexpr uint WM = 2;    // SGs along M
+constant constexpr uint WN = 4;    // SGs along N
+constant constexpr uint SM = 32;   // Per-SG output M (BM/WM)
+constant constexpr uint SN = 32;   // Per-SG output N (BN/WN)
+constant constexpr uint FK = 16;   // Inner K-step for mpp (fragment K dim)
+constant constexpr uint N_THREADS = 256;
+
+// NAX coordinate helpers (same as SDPA NAX kernel)
+// Each lane in a 16×16 fragment holds 8 elements: 2 rows × 4 cols
+// Row indices: fm, fm+8
+// Col indices: fn, fn+1, fn+2, fn+3
+inline short nax_fm(uint slid) {
+    short qid = short(slid) >> 2;
+    return ((qid & 4) | ((short(slid) >> 1) & 3));
+}
+
+inline short nax_fn(uint slid) {
+    short qid = short(slid) >> 2;
+    return ((qid & 2) | (short(slid) & 1)) * 4;
+}
+
+// Load a 16×16 block from device memory into a NAX fragment register array.
+METAL_FUNC void nax_load_16x16(thread half* frag,
+                                 const device half* src, int src_ld,
+                                 short fm, short fn,
+                                 int valid_rows, int valid_cols) {
+    for (short c = 0; c < 4; c++) {
+        bool ok = (fm < valid_rows) && (fn + c < valid_cols);
+        frag[c] = ok ? src[fm * src_ld + fn + c] : half(0);
+    }
+    for (short c = 0; c < 4; c++) {
+        bool ok = (fm + 8 < valid_rows) && (fn + c < valid_cols);
+        frag[4 + c] = ok ? src[(fm + 8) * src_ld + fn + c] : half(0);
+    }
+}
+
+METAL_FUNC void nax_load_16x16_unsafe(thread half* frag,
+                                        const device half* src, int src_ld,
+                                        short fm, short fn) {
+    for (short c = 0; c < 4; c++) {
+        frag[c] = src[fm * src_ld + fn + c];
+    }
+    for (short c = 0; c < 4; c++) {
+        frag[4 + c] = src[(fm + 8) * src_ld + fn + c];
+    }
+}
+
+// Store a 16×16 block from float accumulator to device half memory.
+METAL_FUNC void nax_store_16x16(device half* dst, int dst_ld,
+                                  thread const float* frag,
+                                  short fm, short fn,
+                                  int valid_rows, int valid_cols) {
+    for (short c = 0; c < 4; c++) {
+        if (fm < valid_rows && fn + c < valid_cols) {
+            dst[fm * dst_ld + fn + c] = half(frag[c]);
+        }
+    }
+    for (short c = 0; c < 4; c++) {
+        if (fm + 8 < valid_rows && fn + c < valid_cols) {
+            dst[(fm + 8) * dst_ld + fn + c] = half(frag[4 + c]);
+        }
+    }
+}
+
+METAL_FUNC void nax_store_16x16_unsafe(device half* dst, int dst_ld,
+                                         thread const float* frag,
+                                         short fm, short fn) {
+    for (short c = 0; c < 4; c++) {
+        dst[fm * dst_ld + fn + c] = half(frag[c]);
+    }
+    for (short c = 0; c < 4; c++) {
+        dst[(fm + 8) * dst_ld + fn + c] = half(frag[4 + c]);
+    }
+}
+
+// Store with residual add
+METAL_FUNC void nax_store_16x16_residual(device half* dst,
+                                           const device half* res,
+                                           int dst_ld,
+                                           thread const float* frag,
+                                           short fm, short fn,
+                                           int valid_rows, int valid_cols) {
+    for (short c = 0; c < 4; c++) {
+        if (fm < valid_rows && fn + c < valid_cols) {
+            dst[fm * dst_ld + fn + c] = half(frag[c]) + res[fm * dst_ld + fn + c];
+        }
+    }
+    for (short c = 0; c < 4; c++) {
+        if (fm + 8 < valid_rows && fn + c < valid_cols) {
+            dst[(fm + 8) * dst_ld + fn + c] = half(frag[4 + c]) + res[(fm + 8) * dst_ld + fn + c];
+        }
+    }
+}
+
+METAL_FUNC void nax_store_16x16_residual_unsafe(device half* dst,
+                                                   const device half* res,
+                                                   int dst_ld,
+                                                   thread const float* frag,
+                                                   short fm, short fn) {
+    for (short c = 0; c < 4; c++) {
+        dst[fm * dst_ld + fn + c] = half(frag[c]) + res[fm * dst_ld + fn + c];
+    }
+    for (short c = 0; c < 4; c++) {
+        dst[(fm + 8) * dst_ld + fn + c] = half(frag[4 + c]) + res[(fm + 8) * dst_ld + fn + c];
+    }
+}
+
+// ─── NAX GEMM 64×128 kernel ────────────────────────────────────────────────
+//
+// A: [M, K] row-major, B: [K, N] row-major → C: [M, N]
+//
+// Grid: (ceildiv(N, BN), ceildiv(M, BM), batch)
+// Threadgroup: (256, 1, 1) — 8 simdgroups × 32 lanes
+//
+// Each SG computes a 32×32 output tile as 2 stacked 16×32 subtiles.
+// MMA descriptor is (16, 32, 16): B fragment is 16×32 (16 elems/lane).
+// K dimension is iterated in steps of FK=16.
+
+[[kernel, max_total_threads_per_threadgroup(256)]]
+void gemm_nax_64x128_u8_f16(
+    device const half* A [[buffer(0)]],
+    device const half* B [[buffer(1)]],
+    device half* C [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    constant uint& K [[buffer(5)]],
+    constant uint& batch_stride_a [[buffer(6)]],
+    constant uint& batch_stride_b [[buffer(7)]],
+    constant uint& batch_stride_c [[buffer(8)]],
+    constant uint& swizzle_log [[buffer(9)]],
+    device const half* residual [[buffer(10)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint slid [[thread_index_in_simdgroup]])
+{
+    // Batch offset
+    const uint batch_idx = tid.z;
+    const device half* A_batch = A + batch_idx * batch_stride_a;
+    const device half* B_batch = B + batch_idx * batch_stride_b;
+    device half* C_batch = C + batch_idx * batch_stride_c;
+
+    // Threadblock swizzle
+    uint2 tg_pos = uint2(tid.x, tid.y);
+    if (swizzle_log > 0) {
+        tg_pos = uint2(
+            tg_pos.x >> swizzle_log,
+            (tg_pos.y << swizzle_log) | (tg_pos.x & ((1u << swizzle_log) - 1u))
+        );
+    }
+
+    // SG position within threadgroup: 2×4 grid
+    const uint sg_m = sgid / WN;  // 0..1
+    const uint sg_n = sgid % WN;  // 0..3
+
+    // Global output position for this SG
+    const uint gm = tg_pos.y * BM + sg_m * SM;  // Start row
+    const uint gn = tg_pos.x * BN + sg_n * SN;  // Start col
+
+    // Early exit for out-of-bounds SGs
+    if (!align_M && gm >= M) return;
+    if (!align_N && gn >= N) return;
+
+    // Valid rows/cols for this SG
+    const int sg_valid_m = align_M ? int(SM) : min(int(M) - int(gm), int(SM));
+    const int sg_valid_n = align_N ? int(SN) : min(int(N) - int(gn), int(SN));
+
+    if (sg_valid_m <= 0 || sg_valid_n <= 0) return;
+
+    // Per-lane fragment coordinates within a 16×16 fragment
+    const short fm = nax_fm(slid);
+    const short fn = nax_fn(slid);
+
+    // MPP matmul2d descriptor: MMA(16, 32, 16, A=normal, B=normal, accumulate)
+    constexpr auto nax_desc = mpp::tensor_ops::matmul2d_descriptor(
+        16, 32, 16, false, false, true,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+
+    // ── Zero-copy cooperative tensor pattern ──
+    mpp::tensor_ops::matmul2d<nax_desc, metal::execution_simdgroup> gemm_op_0;
+    mpp::tensor_ops::matmul2d<nax_desc, metal::execution_simdgroup> gemm_op_1;
+
+    auto ct_c0 = gemm_op_0.template get_destination_cooperative_tensor<
+        decltype(gemm_op_0.template get_left_input_cooperative_tensor<half, half, float>()),
+        decltype(gemm_op_0.template get_right_input_cooperative_tensor<half, half, float>()),
+        float>();
+    auto ct_c1 = gemm_op_1.template get_destination_cooperative_tensor<
+        decltype(gemm_op_1.template get_left_input_cooperative_tensor<half, half, float>()),
+        decltype(gemm_op_1.template get_right_input_cooperative_tensor<half, half, float>()),
+        float>();
+    for (int e = 0; e < 16; e++) { ct_c0[e] = 0.0f; ct_c1[e] = 0.0f; }
+
+    // ── Flat K-loop: iterate in steps of FK=16 ──
+    const uint k_total_steps = align_K ? (K / FK) : ((K + FK - 1) / FK);
+
+    #pragma clang loop unroll_count(8)
+    for (uint sk_abs = 0; sk_abs < k_total_steps; sk_abs++) {
+        const uint sk_offset = sk_abs * FK;
+        const int fk_valid = align_K ? int(FK) : min(int(FK), int(K) - int(sk_offset));
+        const bool k_aligned = align_K || (fk_valid == int(FK));
+
+        // Load B fragment ONCE (16×32) — shared between both row blocks
+        half B_frag[16];
+        {
+            const device half* B_ptr0 = B_batch + sk_offset * N + gn;
+            int b_cols0 = align_N ? 16 : min(16, sg_valid_n);
+            if (b_cols0 <= 0) {
+                for (int e = 0; e < 8; e++) B_frag[e] = half(0);
+            } else if (k_aligned && b_cols0 == 16) {
+                nax_load_16x16_unsafe(B_frag, B_ptr0, int(N), fm, fn);
+            } else {
+                nax_load_16x16(B_frag, B_ptr0, int(N), fm, fn,
+                              k_aligned ? 16 : fk_valid, b_cols0);
+            }
+
+            const device half* B_ptr1 = B_ptr0 + 16;
+            int b_cols1 = align_N ? 16 : min(16, sg_valid_n - 16);
+            if (b_cols1 <= 0) {
+                for (int e = 0; e < 8; e++) B_frag[8 + e] = half(0);
+            } else if (k_aligned && b_cols1 == 16) {
+                nax_load_16x16_unsafe(B_frag + 8, B_ptr1, int(N), fm, fn);
+            } else {
+                nax_load_16x16(B_frag + 8, B_ptr1, int(N), fm, fn,
+                              k_aligned ? 16 : fk_valid, b_cols1);
+            }
+        }
+
+        // Row block 0
+        {
+            auto ct_a0 = gemm_op_0.template get_left_input_cooperative_tensor<half, half, float>();
+            auto ct_b0 = gemm_op_0.template get_right_input_cooperative_tensor<half, half, float>();
+            {
+                const device half* A_ptr = A_batch + gm * K + sk_offset;
+                int a_rows = align_M ? 16 : min(16, sg_valid_m);
+                if (a_rows <= 0) {
+                    for (int e = 0; e < 8; e++) ct_a0[e] = half(0);
+                } else if (k_aligned && a_rows == 16) {
+                    const device half* r0 = A_ptr + fm * int(K) + fn;
+                    const device half* r1 = A_ptr + (fm + 8) * int(K) + fn;
+                    ct_a0[0] = r0[0]; ct_a0[1] = r0[1]; ct_a0[2] = r0[2]; ct_a0[3] = r0[3];
+                    ct_a0[4] = r1[0]; ct_a0[5] = r1[1]; ct_a0[6] = r1[2]; ct_a0[7] = r1[3];
+                } else {
+                    for (short c = 0; c < 4; c++) {
+                        bool ok = (fm < a_rows) && (fn + c < (k_aligned ? 16 : fk_valid));
+                        ct_a0[c] = ok ? A_ptr[fm * int(K) + fn + c] : half(0);
+                    }
+                    for (short c = 0; c < 4; c++) {
+                        bool ok = (fm + 8 < a_rows) && (fn + c < (k_aligned ? 16 : fk_valid));
+                        ct_a0[4 + c] = ok ? A_ptr[(fm + 8) * int(K) + fn + c] : half(0);
+                    }
+                }
+            }
+            for (int e = 0; e < 16; e++) ct_b0[e] = B_frag[e];
+            gemm_op_0.run(ct_a0, ct_b0, ct_c0);
+        }
+
+        // Row block 1
+        {
+            auto ct_a1 = gemm_op_1.template get_left_input_cooperative_tensor<half, half, float>();
+            auto ct_b1 = gemm_op_1.template get_right_input_cooperative_tensor<half, half, float>();
+            {
+                const device half* A_ptr = A_batch + (gm + 16) * K + sk_offset;
+                int a_rows = align_M ? 16 : min(16, sg_valid_m - 16);
+                if (a_rows <= 0) {
+                    for (int e = 0; e < 8; e++) ct_a1[e] = half(0);
+                } else if (k_aligned && a_rows == 16) {
+                    const device half* r0 = A_ptr + fm * int(K) + fn;
+                    const device half* r1 = A_ptr + (fm + 8) * int(K) + fn;
+                    ct_a1[0] = r0[0]; ct_a1[1] = r0[1]; ct_a1[2] = r0[2]; ct_a1[3] = r0[3];
+                    ct_a1[4] = r1[0]; ct_a1[5] = r1[1]; ct_a1[6] = r1[2]; ct_a1[7] = r1[3];
+                } else {
+                    for (short c = 0; c < 4; c++) {
+                        bool ok = (fm < a_rows) && (fn + c < (k_aligned ? 16 : fk_valid));
+                        ct_a1[c] = ok ? A_ptr[fm * int(K) + fn + c] : half(0);
+                    }
+                    for (short c = 0; c < 4; c++) {
+                        bool ok = (fm + 8 < a_rows) && (fn + c < (k_aligned ? 16 : fk_valid));
+                        ct_a1[4 + c] = ok ? A_ptr[(fm + 8) * int(K) + fn + c] : half(0);
+                    }
+                }
+            }
+            for (int e = 0; e < 16; e++) ct_b1[e] = B_frag[e];
+            gemm_op_1.run(ct_a1, ct_b1, ct_c1);
+        }
+    }
+
+    // ─── Store results (read from persistent ct_c) ──────────────────────────
+    float store_c0[16], store_c1[16];
+    for (int e = 0; e < 16; e++) { store_c0[e] = ct_c0[e]; store_c1[e] = ct_c1[e]; }
+
+    const bool full_m = align_M || (sg_valid_m >= int(SM));
+    const bool full_n = align_N || (sg_valid_n >= int(SN));
+
+    // Row block 0
+    {
+        const uint out_row = gm;
+        int m_valid = full_m ? 16 : min(16, sg_valid_m);
+
+        {
+            device half* C_ptr = C_batch + out_row * N + gn;
+            int n_valid = full_n ? 16 : min(16, sg_valid_n);
+            if (m_valid > 0 && n_valid > 0) {
+                if (has_residual) {
+                    const device half* res_ptr = residual + out_row * N + gn;
+                    if (m_valid == 16 && n_valid == 16) {
+                        nax_store_16x16_residual_unsafe(C_ptr, res_ptr, int(N), store_c0, fm, fn);
+                    } else {
+                        nax_store_16x16_residual(C_ptr, res_ptr, int(N), store_c0, fm, fn, m_valid, n_valid);
+                    }
+                } else {
+                    if (m_valid == 16 && n_valid == 16) {
+                        nax_store_16x16_unsafe(C_ptr, int(N), store_c0, fm, fn);
+                    } else {
+                        nax_store_16x16(C_ptr, int(N), store_c0, fm, fn, m_valid, n_valid);
+                    }
+                }
+            }
+        }
+
+        {
+            device half* C_ptr = C_batch + out_row * N + gn + 16;
+            int n_valid = full_n ? 16 : min(16, sg_valid_n - 16);
+            if (m_valid > 0 && n_valid > 0) {
+                if (has_residual) {
+                    const device half* res_ptr = residual + out_row * N + gn + 16;
+                    if (m_valid == 16 && n_valid == 16) {
+                        nax_store_16x16_residual_unsafe(C_ptr, res_ptr, int(N), store_c0 + 8, fm, fn);
+                    } else {
+                        nax_store_16x16_residual(C_ptr, res_ptr, int(N), store_c0 + 8, fm, fn, m_valid, n_valid);
+                    }
+                } else {
+                    if (m_valid == 16 && n_valid == 16) {
+                        nax_store_16x16_unsafe(C_ptr, int(N), store_c0 + 8, fm, fn);
+                    } else {
+                        nax_store_16x16(C_ptr, int(N), store_c0 + 8, fm, fn, m_valid, n_valid);
+                    }
+                }
+            }
+        }
+    }
+
+    // Row block 1
+    {
+        const uint out_row = gm + 16;
+        int m_valid = full_m ? 16 : min(16, sg_valid_m - 16);
+        if (m_valid > 0) {
+            {
+                device half* C_ptr = C_batch + out_row * N + gn;
+                int n_valid = full_n ? 16 : min(16, sg_valid_n);
+                if (n_valid > 0) {
+                    if (has_residual) {
+                        const device half* res_ptr = residual + out_row * N + gn;
+                        if (m_valid == 16 && n_valid == 16) {
+                            nax_store_16x16_residual_unsafe(C_ptr, res_ptr, int(N), store_c1, fm, fn);
+                        } else {
+                            nax_store_16x16_residual(C_ptr, res_ptr, int(N), store_c1, fm, fn, m_valid, n_valid);
+                        }
+                    } else {
+                        if (m_valid == 16 && n_valid == 16) {
+                            nax_store_16x16_unsafe(C_ptr, int(N), store_c1, fm, fn);
+                        } else {
+                            nax_store_16x16(C_ptr, int(N), store_c1, fm, fn, m_valid, n_valid);
+                        }
+                    }
+                }
+            }
+
+            {
+                device half* C_ptr = C_batch + out_row * N + gn + 16;
+                int n_valid = full_n ? 16 : min(16, sg_valid_n - 16);
+                if (n_valid > 0) {
+                    if (has_residual) {
+                        const device half* res_ptr = residual + out_row * N + gn + 16;
+                        if (m_valid == 16 && n_valid == 16) {
+                            nax_store_16x16_residual_unsafe(C_ptr, res_ptr, int(N), store_c1 + 8, fm, fn);
+                        } else {
+                            nax_store_16x16_residual(C_ptr, res_ptr, int(N), store_c1 + 8, fm, fn, m_valid, n_valid);
+                        }
+                    } else {
+                        if (m_valid == 16 && n_valid == 16) {
+                            nax_store_16x16_unsafe(C_ptr, int(N), store_c1 + 8, fm, fn);
+                        } else {
+                            nax_store_16x16(C_ptr, int(N), store_c1 + 8, fm, fn, m_valid, n_valid);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+"#;
+
+pub const GEMM_NAX_64X128_U16_SHADER_SOURCE: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup>
+using namespace metal;
+
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+
+// Function constants (same IDs as existing kernels)
+constant bool align_M [[function_constant(200)]];
+constant bool align_N [[function_constant(201)]];
+constant bool has_residual [[function_constant(202)]];
+constant bool align_K [[function_constant(205)]];
+
+// Tile dimensions — 64×128 variant (unroll_count=16)
+constant constexpr uint BM = 64;
+constant constexpr uint BN = 128;
+constant constexpr uint BK = 32;   // Outer K-tile
+constant constexpr uint WM = 2;    // SGs along M
+constant constexpr uint WN = 4;    // SGs along N
+constant constexpr uint SM = 32;   // Per-SG output M (BM/WM)
+constant constexpr uint SN = 32;   // Per-SG output N (BN/WN)
+constant constexpr uint FK = 16;   // Inner K-step for mpp (fragment K dim)
+constant constexpr uint N_THREADS = 256;
+
+// NAX coordinate helpers (same as SDPA NAX kernel)
+// Each lane in a 16×16 fragment holds 8 elements: 2 rows × 4 cols
+// Row indices: fm, fm+8
+// Col indices: fn, fn+1, fn+2, fn+3
+inline short nax_fm(uint slid) {
+    short qid = short(slid) >> 2;
+    return ((qid & 4) | ((short(slid) >> 1) & 3));
+}
+
+inline short nax_fn(uint slid) {
+    short qid = short(slid) >> 2;
+    return ((qid & 2) | (short(slid) & 1)) * 4;
+}
+
+// Load a 16×16 block from device memory into a NAX fragment register array.
+METAL_FUNC void nax_load_16x16(thread half* frag,
+                                 const device half* src, int src_ld,
+                                 short fm, short fn,
+                                 int valid_rows, int valid_cols) {
+    for (short c = 0; c < 4; c++) {
+        bool ok = (fm < valid_rows) && (fn + c < valid_cols);
+        frag[c] = ok ? src[fm * src_ld + fn + c] : half(0);
+    }
+    for (short c = 0; c < 4; c++) {
+        bool ok = (fm + 8 < valid_rows) && (fn + c < valid_cols);
+        frag[4 + c] = ok ? src[(fm + 8) * src_ld + fn + c] : half(0);
+    }
+}
+
+METAL_FUNC void nax_load_16x16_unsafe(thread half* frag,
+                                        const device half* src, int src_ld,
+                                        short fm, short fn) {
+    for (short c = 0; c < 4; c++) {
+        frag[c] = src[fm * src_ld + fn + c];
+    }
+    for (short c = 0; c < 4; c++) {
+        frag[4 + c] = src[(fm + 8) * src_ld + fn + c];
+    }
+}
+
+// Store a 16×16 block from float accumulator to device half memory.
+METAL_FUNC void nax_store_16x16(device half* dst, int dst_ld,
+                                  thread const float* frag,
+                                  short fm, short fn,
+                                  int valid_rows, int valid_cols) {
+    for (short c = 0; c < 4; c++) {
+        if (fm < valid_rows && fn + c < valid_cols) {
+            dst[fm * dst_ld + fn + c] = half(frag[c]);
+        }
+    }
+    for (short c = 0; c < 4; c++) {
+        if (fm + 8 < valid_rows && fn + c < valid_cols) {
+            dst[(fm + 8) * dst_ld + fn + c] = half(frag[4 + c]);
+        }
+    }
+}
+
+METAL_FUNC void nax_store_16x16_unsafe(device half* dst, int dst_ld,
+                                         thread const float* frag,
+                                         short fm, short fn) {
+    for (short c = 0; c < 4; c++) {
+        dst[fm * dst_ld + fn + c] = half(frag[c]);
+    }
+    for (short c = 0; c < 4; c++) {
+        dst[(fm + 8) * dst_ld + fn + c] = half(frag[4 + c]);
+    }
+}
+
+// Store with residual add
+METAL_FUNC void nax_store_16x16_residual(device half* dst,
+                                           const device half* res,
+                                           int dst_ld,
+                                           thread const float* frag,
+                                           short fm, short fn,
+                                           int valid_rows, int valid_cols) {
+    for (short c = 0; c < 4; c++) {
+        if (fm < valid_rows && fn + c < valid_cols) {
+            dst[fm * dst_ld + fn + c] = half(frag[c]) + res[fm * dst_ld + fn + c];
+        }
+    }
+    for (short c = 0; c < 4; c++) {
+        if (fm + 8 < valid_rows && fn + c < valid_cols) {
+            dst[(fm + 8) * dst_ld + fn + c] = half(frag[4 + c]) + res[(fm + 8) * dst_ld + fn + c];
+        }
+    }
+}
+
+METAL_FUNC void nax_store_16x16_residual_unsafe(device half* dst,
+                                                   const device half* res,
+                                                   int dst_ld,
+                                                   thread const float* frag,
+                                                   short fm, short fn) {
+    for (short c = 0; c < 4; c++) {
+        dst[fm * dst_ld + fn + c] = half(frag[c]) + res[fm * dst_ld + fn + c];
+    }
+    for (short c = 0; c < 4; c++) {
+        dst[(fm + 8) * dst_ld + fn + c] = half(frag[4 + c]) + res[(fm + 8) * dst_ld + fn + c];
+    }
+}
+
+// ─── NAX GEMM 64×128 kernel ────────────────────────────────────────────────
+//
+// A: [M, K] row-major, B: [K, N] row-major → C: [M, N]
+//
+// Grid: (ceildiv(N, BN), ceildiv(M, BM), batch)
+// Threadgroup: (256, 1, 1) — 8 simdgroups × 32 lanes
+//
+// Each SG computes a 32×32 output tile as 2 stacked 16×32 subtiles.
+// MMA descriptor is (16, 32, 16): B fragment is 16×32 (16 elems/lane).
+// K dimension is iterated in steps of FK=16.
+
+[[kernel, max_total_threads_per_threadgroup(256)]]
+void gemm_nax_64x128_u16_f16(
+    device const half* A [[buffer(0)]],
+    device const half* B [[buffer(1)]],
+    device half* C [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    constant uint& K [[buffer(5)]],
+    constant uint& batch_stride_a [[buffer(6)]],
+    constant uint& batch_stride_b [[buffer(7)]],
+    constant uint& batch_stride_c [[buffer(8)]],
+    constant uint& swizzle_log [[buffer(9)]],
+    device const half* residual [[buffer(10)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint slid [[thread_index_in_simdgroup]])
+{
+    // Batch offset
+    const uint batch_idx = tid.z;
+    const device half* A_batch = A + batch_idx * batch_stride_a;
+    const device half* B_batch = B + batch_idx * batch_stride_b;
+    device half* C_batch = C + batch_idx * batch_stride_c;
+
+    // Threadblock swizzle
+    uint2 tg_pos = uint2(tid.x, tid.y);
+    if (swizzle_log > 0) {
+        tg_pos = uint2(
+            tg_pos.x >> swizzle_log,
+            (tg_pos.y << swizzle_log) | (tg_pos.x & ((1u << swizzle_log) - 1u))
+        );
+    }
+
+    // SG position within threadgroup: 2×4 grid
+    const uint sg_m = sgid / WN;  // 0..1
+    const uint sg_n = sgid % WN;  // 0..3
+
+    // Global output position for this SG
+    const uint gm = tg_pos.y * BM + sg_m * SM;  // Start row
+    const uint gn = tg_pos.x * BN + sg_n * SN;  // Start col
+
+    // Early exit for out-of-bounds SGs
+    if (!align_M && gm >= M) return;
+    if (!align_N && gn >= N) return;
+
+    // Valid rows/cols for this SG
+    const int sg_valid_m = align_M ? int(SM) : min(int(M) - int(gm), int(SM));
+    const int sg_valid_n = align_N ? int(SN) : min(int(N) - int(gn), int(SN));
+
+    if (sg_valid_m <= 0 || sg_valid_n <= 0) return;
+
+    // Per-lane fragment coordinates within a 16×16 fragment
+    const short fm = nax_fm(slid);
+    const short fn = nax_fn(slid);
+
+    // MPP matmul2d descriptor: MMA(16, 32, 16, A=normal, B=normal, accumulate)
+    constexpr auto nax_desc = mpp::tensor_ops::matmul2d_descriptor(
+        16, 32, 16, false, false, true,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+
+    // ── Zero-copy cooperative tensor pattern ──
+    mpp::tensor_ops::matmul2d<nax_desc, metal::execution_simdgroup> gemm_op_0;
+    mpp::tensor_ops::matmul2d<nax_desc, metal::execution_simdgroup> gemm_op_1;
+
+    auto ct_c0 = gemm_op_0.template get_destination_cooperative_tensor<
+        decltype(gemm_op_0.template get_left_input_cooperative_tensor<half, half, float>()),
+        decltype(gemm_op_0.template get_right_input_cooperative_tensor<half, half, float>()),
+        float>();
+    auto ct_c1 = gemm_op_1.template get_destination_cooperative_tensor<
+        decltype(gemm_op_1.template get_left_input_cooperative_tensor<half, half, float>()),
+        decltype(gemm_op_1.template get_right_input_cooperative_tensor<half, half, float>()),
+        float>();
+    for (int e = 0; e < 16; e++) { ct_c0[e] = 0.0f; ct_c1[e] = 0.0f; }
+
+    // ── Flat K-loop: iterate in steps of FK=16 ──
+    const uint k_total_steps = align_K ? (K / FK) : ((K + FK - 1) / FK);
+
+    #pragma clang loop unroll_count(16)
+    for (uint sk_abs = 0; sk_abs < k_total_steps; sk_abs++) {
+        const uint sk_offset = sk_abs * FK;
+        const int fk_valid = align_K ? int(FK) : min(int(FK), int(K) - int(sk_offset));
+        const bool k_aligned = align_K || (fk_valid == int(FK));
+
+        // Load B fragment ONCE (16×32) — shared between both row blocks
+        half B_frag[16];
+        {
+            const device half* B_ptr0 = B_batch + sk_offset * N + gn;
+            int b_cols0 = align_N ? 16 : min(16, sg_valid_n);
+            if (b_cols0 <= 0) {
+                for (int e = 0; e < 8; e++) B_frag[e] = half(0);
+            } else if (k_aligned && b_cols0 == 16) {
+                nax_load_16x16_unsafe(B_frag, B_ptr0, int(N), fm, fn);
+            } else {
+                nax_load_16x16(B_frag, B_ptr0, int(N), fm, fn,
+                              k_aligned ? 16 : fk_valid, b_cols0);
+            }
+
+            const device half* B_ptr1 = B_ptr0 + 16;
+            int b_cols1 = align_N ? 16 : min(16, sg_valid_n - 16);
+            if (b_cols1 <= 0) {
+                for (int e = 0; e < 8; e++) B_frag[8 + e] = half(0);
+            } else if (k_aligned && b_cols1 == 16) {
+                nax_load_16x16_unsafe(B_frag + 8, B_ptr1, int(N), fm, fn);
+            } else {
+                nax_load_16x16(B_frag + 8, B_ptr1, int(N), fm, fn,
+                              k_aligned ? 16 : fk_valid, b_cols1);
+            }
+        }
+
+        // Row block 0
+        {
+            auto ct_a0 = gemm_op_0.template get_left_input_cooperative_tensor<half, half, float>();
+            auto ct_b0 = gemm_op_0.template get_right_input_cooperative_tensor<half, half, float>();
+            {
+                const device half* A_ptr = A_batch + gm * K + sk_offset;
+                int a_rows = align_M ? 16 : min(16, sg_valid_m);
+                if (a_rows <= 0) {
+                    for (int e = 0; e < 8; e++) ct_a0[e] = half(0);
+                } else if (k_aligned && a_rows == 16) {
+                    const device half* r0 = A_ptr + fm * int(K) + fn;
+                    const device half* r1 = A_ptr + (fm + 8) * int(K) + fn;
+                    ct_a0[0] = r0[0]; ct_a0[1] = r0[1]; ct_a0[2] = r0[2]; ct_a0[3] = r0[3];
+                    ct_a0[4] = r1[0]; ct_a0[5] = r1[1]; ct_a0[6] = r1[2]; ct_a0[7] = r1[3];
+                } else {
+                    for (short c = 0; c < 4; c++) {
+                        bool ok = (fm < a_rows) && (fn + c < (k_aligned ? 16 : fk_valid));
+                        ct_a0[c] = ok ? A_ptr[fm * int(K) + fn + c] : half(0);
+                    }
+                    for (short c = 0; c < 4; c++) {
+                        bool ok = (fm + 8 < a_rows) && (fn + c < (k_aligned ? 16 : fk_valid));
+                        ct_a0[4 + c] = ok ? A_ptr[(fm + 8) * int(K) + fn + c] : half(0);
+                    }
+                }
+            }
+            for (int e = 0; e < 16; e++) ct_b0[e] = B_frag[e];
+            gemm_op_0.run(ct_a0, ct_b0, ct_c0);
+        }
+
+        // Row block 1
+        {
+            auto ct_a1 = gemm_op_1.template get_left_input_cooperative_tensor<half, half, float>();
+            auto ct_b1 = gemm_op_1.template get_right_input_cooperative_tensor<half, half, float>();
+            {
+                const device half* A_ptr = A_batch + (gm + 16) * K + sk_offset;
+                int a_rows = align_M ? 16 : min(16, sg_valid_m - 16);
+                if (a_rows <= 0) {
+                    for (int e = 0; e < 8; e++) ct_a1[e] = half(0);
+                } else if (k_aligned && a_rows == 16) {
+                    const device half* r0 = A_ptr + fm * int(K) + fn;
+                    const device half* r1 = A_ptr + (fm + 8) * int(K) + fn;
+                    ct_a1[0] = r0[0]; ct_a1[1] = r0[1]; ct_a1[2] = r0[2]; ct_a1[3] = r0[3];
+                    ct_a1[4] = r1[0]; ct_a1[5] = r1[1]; ct_a1[6] = r1[2]; ct_a1[7] = r1[3];
+                } else {
+                    for (short c = 0; c < 4; c++) {
+                        bool ok = (fm < a_rows) && (fn + c < (k_aligned ? 16 : fk_valid));
+                        ct_a1[c] = ok ? A_ptr[fm * int(K) + fn + c] : half(0);
+                    }
+                    for (short c = 0; c < 4; c++) {
+                        bool ok = (fm + 8 < a_rows) && (fn + c < (k_aligned ? 16 : fk_valid));
+                        ct_a1[4 + c] = ok ? A_ptr[(fm + 8) * int(K) + fn + c] : half(0);
+                    }
+                }
+            }
+            for (int e = 0; e < 16; e++) ct_b1[e] = B_frag[e];
+            gemm_op_1.run(ct_a1, ct_b1, ct_c1);
+        }
+    }
+
+    // ─── Store results (read from persistent ct_c) ──────────────────────────
+    float store_c0[16], store_c1[16];
+    for (int e = 0; e < 16; e++) { store_c0[e] = ct_c0[e]; store_c1[e] = ct_c1[e]; }
+
+    const bool full_m = align_M || (sg_valid_m >= int(SM));
+    const bool full_n = align_N || (sg_valid_n >= int(SN));
+
+    // Row block 0
+    {
+        const uint out_row = gm;
+        int m_valid = full_m ? 16 : min(16, sg_valid_m);
+
+        {
+            device half* C_ptr = C_batch + out_row * N + gn;
+            int n_valid = full_n ? 16 : min(16, sg_valid_n);
+            if (m_valid > 0 && n_valid > 0) {
+                if (has_residual) {
+                    const device half* res_ptr = residual + out_row * N + gn;
+                    if (m_valid == 16 && n_valid == 16) {
+                        nax_store_16x16_residual_unsafe(C_ptr, res_ptr, int(N), store_c0, fm, fn);
+                    } else {
+                        nax_store_16x16_residual(C_ptr, res_ptr, int(N), store_c0, fm, fn, m_valid, n_valid);
+                    }
+                } else {
+                    if (m_valid == 16 && n_valid == 16) {
+                        nax_store_16x16_unsafe(C_ptr, int(N), store_c0, fm, fn);
+                    } else {
+                        nax_store_16x16(C_ptr, int(N), store_c0, fm, fn, m_valid, n_valid);
+                    }
+                }
+            }
+        }
+
+        {
+            device half* C_ptr = C_batch + out_row * N + gn + 16;
+            int n_valid = full_n ? 16 : min(16, sg_valid_n - 16);
+            if (m_valid > 0 && n_valid > 0) {
+                if (has_residual) {
+                    const device half* res_ptr = residual + out_row * N + gn + 16;
+                    if (m_valid == 16 && n_valid == 16) {
+                        nax_store_16x16_residual_unsafe(C_ptr, res_ptr, int(N), store_c0 + 8, fm, fn);
+                    } else {
+                        nax_store_16x16_residual(C_ptr, res_ptr, int(N), store_c0 + 8, fm, fn, m_valid, n_valid);
+                    }
+                } else {
+                    if (m_valid == 16 && n_valid == 16) {
+                        nax_store_16x16_unsafe(C_ptr, int(N), store_c0 + 8, fm, fn);
+                    } else {
+                        nax_store_16x16(C_ptr, int(N), store_c0 + 8, fm, fn, m_valid, n_valid);
+                    }
+                }
+            }
+        }
+    }
+
+    // Row block 1
+    {
+        const uint out_row = gm + 16;
+        int m_valid = full_m ? 16 : min(16, sg_valid_m - 16);
+        if (m_valid > 0) {
+            {
+                device half* C_ptr = C_batch + out_row * N + gn;
+                int n_valid = full_n ? 16 : min(16, sg_valid_n);
+                if (n_valid > 0) {
+                    if (has_residual) {
+                        const device half* res_ptr = residual + out_row * N + gn;
+                        if (m_valid == 16 && n_valid == 16) {
+                            nax_store_16x16_residual_unsafe(C_ptr, res_ptr, int(N), store_c1, fm, fn);
+                        } else {
+                            nax_store_16x16_residual(C_ptr, res_ptr, int(N), store_c1, fm, fn, m_valid, n_valid);
+                        }
+                    } else {
+                        if (m_valid == 16 && n_valid == 16) {
+                            nax_store_16x16_unsafe(C_ptr, int(N), store_c1, fm, fn);
+                        } else {
+                            nax_store_16x16(C_ptr, int(N), store_c1, fm, fn, m_valid, n_valid);
+                        }
+                    }
+                }
+            }
+
+            {
+                device half* C_ptr = C_batch + out_row * N + gn + 16;
+                int n_valid = full_n ? 16 : min(16, sg_valid_n - 16);
+                if (n_valid > 0) {
+                    if (has_residual) {
+                        const device half* res_ptr = residual + out_row * N + gn + 16;
+                        if (m_valid == 16 && n_valid == 16) {
+                            nax_store_16x16_residual_unsafe(C_ptr, res_ptr, int(N), store_c1 + 8, fm, fn);
+                        } else {
+                            nax_store_16x16_residual(C_ptr, res_ptr, int(N), store_c1 + 8, fm, fn, m_valid, n_valid);
+                        }
+                    } else {
+                        if (m_valid == 16 && n_valid == 16) {
+                            nax_store_16x16_unsafe(C_ptr, int(N), store_c1 + 8, fm, fn);
+                        } else {
+                            nax_store_16x16(C_ptr, int(N), store_c1 + 8, fm, fn, m_valid, n_valid);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+"#;
+
+// ---------------------------------------------------------------------------
+// NAX GEMM 64×64 — matches MLX threadgroup geometry exactly.
+// BM=64, BN=64, BK=32, WM=2, WN=2, 4 SGs, 128 threads.
+// Same per-SG computation (32×32 output) but only 4 SGs → maximum occupancy.
+// Uses zero-copy cooperative tensor pattern.
+// ---------------------------------------------------------------------------
+
+pub const GEMM_NAX_64X64_SHADER_SOURCE: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup>
+using namespace metal;
+
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+
+// Function constants (same IDs as existing kernels)
+constant bool align_M [[function_constant(200)]];
+constant bool align_N [[function_constant(201)]];
+constant bool has_residual [[function_constant(202)]];
+constant bool align_K [[function_constant(205)]];
+
+// Tile dimensions — 64×64 variant
+constant constexpr uint BM = 64;
+constant constexpr uint BN = 64;
+constant constexpr uint BK = 32;   // Outer K-tile
+constant constexpr uint WM = 2;    // SGs along M
+constant constexpr uint WN = 2;    // SGs along N
+constant constexpr uint SM = 32;   // Per-SG output M (BM/WM)
+constant constexpr uint SN = 32;   // Per-SG output N (BN/WN)
+constant constexpr uint FK = 16;   // Inner K-step for mpp (fragment K dim)
+constant constexpr uint N_THREADS = 128;
+
+// NAX coordinate helpers
+inline short nax_fm(uint slid) {
+    short qid = short(slid) >> 2;
+    return ((qid & 4) | ((short(slid) >> 1) & 3));
+}
+
+inline short nax_fn(uint slid) {
+    short qid = short(slid) >> 2;
+    return ((qid & 2) | (short(slid) & 1)) * 4;
+}
+
+METAL_FUNC void nax_load_16x16(thread half* frag,
+                                 const device half* src, int src_ld,
+                                 short fm, short fn,
+                                 int valid_rows, int valid_cols) {
+    for (short c = 0; c < 4; c++) {
+        bool ok = (fm < valid_rows) && (fn + c < valid_cols);
+        frag[c] = ok ? src[fm * src_ld + fn + c] : half(0);
+    }
+    for (short c = 0; c < 4; c++) {
+        bool ok = (fm + 8 < valid_rows) && (fn + c < valid_cols);
+        frag[4 + c] = ok ? src[(fm + 8) * src_ld + fn + c] : half(0);
+    }
+}
+
+METAL_FUNC void nax_load_16x16_unsafe(thread half* frag,
+                                        const device half* src, int src_ld,
+                                        short fm, short fn) {
+    for (short c = 0; c < 4; c++) {
+        frag[c] = src[fm * src_ld + fn + c];
+    }
+    for (short c = 0; c < 4; c++) {
+        frag[4 + c] = src[(fm + 8) * src_ld + fn + c];
+    }
+}
+
+METAL_FUNC void nax_store_16x16(device half* dst, int dst_ld,
+                                  thread const float* frag,
+                                  short fm, short fn,
+                                  int valid_rows, int valid_cols) {
+    for (short c = 0; c < 4; c++) {
+        if (fm < valid_rows && fn + c < valid_cols)
+            dst[fm * dst_ld + fn + c] = half(frag[c]);
+    }
+    for (short c = 0; c < 4; c++) {
+        if (fm + 8 < valid_rows && fn + c < valid_cols)
+            dst[(fm + 8) * dst_ld + fn + c] = half(frag[4 + c]);
+    }
+}
+
+METAL_FUNC void nax_store_16x16_unsafe(device half* dst, int dst_ld,
+                                         thread const float* frag,
+                                         short fm, short fn) {
+    for (short c = 0; c < 4; c++)
+        dst[fm * dst_ld + fn + c] = half(frag[c]);
+    for (short c = 0; c < 4; c++)
+        dst[(fm + 8) * dst_ld + fn + c] = half(frag[4 + c]);
+}
+
+METAL_FUNC void nax_store_16x16_residual(device half* dst,
+                                           const device half* res,
+                                           int dst_ld,
+                                           thread const float* frag,
+                                           short fm, short fn,
+                                           int valid_rows, int valid_cols) {
+    for (short c = 0; c < 4; c++) {
+        if (fm < valid_rows && fn + c < valid_cols)
+            dst[fm * dst_ld + fn + c] = half(frag[c]) + res[fm * dst_ld + fn + c];
+    }
+    for (short c = 0; c < 4; c++) {
+        if (fm + 8 < valid_rows && fn + c < valid_cols)
+            dst[(fm + 8) * dst_ld + fn + c] = half(frag[4 + c]) + res[(fm + 8) * dst_ld + fn + c];
+    }
+}
+
+METAL_FUNC void nax_store_16x16_residual_unsafe(device half* dst,
+                                                   const device half* res,
+                                                   int dst_ld,
+                                                   thread const float* frag,
+                                                   short fm, short fn) {
+    for (short c = 0; c < 4; c++)
+        dst[fm * dst_ld + fn + c] = half(frag[c]) + res[fm * dst_ld + fn + c];
+    for (short c = 0; c < 4; c++)
+        dst[(fm + 8) * dst_ld + fn + c] = half(frag[4 + c]) + res[(fm + 8) * dst_ld + fn + c];
+}
+
+// ─── NAX GEMM 64×64 kernel ─────────────────────────────────────────────────
+//
+// A: [M, K] row-major, B: [K, N] row-major → C: [M, N]
+//
+// Grid: (ceildiv(N, BN), ceildiv(M, BM), batch)
+// Threadgroup: (128, 1, 1) — 4 simdgroups × 32 lanes
+//
+// Each SG computes a 32×32 output tile as 2 stacked 16×32 subtiles.
+// Uses zero-copy cooperative tensor pattern with persistent ct_c accumulators.
+
+[[kernel, max_total_threads_per_threadgroup(128)]]
+void gemm_nax_64x64_f16(
+    device const half* A [[buffer(0)]],
+    device const half* B [[buffer(1)]],
+    device half* C [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    constant uint& K [[buffer(5)]],
+    constant uint& batch_stride_a [[buffer(6)]],
+    constant uint& batch_stride_b [[buffer(7)]],
+    constant uint& batch_stride_c [[buffer(8)]],
+    constant uint& swizzle_log [[buffer(9)]],
+    device const half* residual [[buffer(10)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint slid [[thread_index_in_simdgroup]])
+{
+    // Batch offset
+    const uint batch_idx = tid.z;
+    const device half* A_batch = A + batch_idx * batch_stride_a;
+    const device half* B_batch = B + batch_idx * batch_stride_b;
+    device half* C_batch = C + batch_idx * batch_stride_c;
+
+    // Threadblock swizzle
+    uint2 tg_pos = uint2(tid.x, tid.y);
+    if (swizzle_log > 0) {
+        tg_pos = uint2(
+            tg_pos.x >> swizzle_log,
+            (tg_pos.y << swizzle_log) | (tg_pos.x & ((1u << swizzle_log) - 1u))
+        );
+    }
+
+    // SG position within threadgroup: 2×2 grid
+    const uint sg_m = sgid / WN;  // 0..1
+    const uint sg_n = sgid % WN;  // 0..1
+
+    // Global output position for this SG
+    const uint gm = tg_pos.y * BM + sg_m * SM;  // Start row
+    const uint gn = tg_pos.x * BN + sg_n * SN;  // Start col
+
+    // Early exit for out-of-bounds SGs
+    if (!align_M && gm >= M) return;
+    if (!align_N && gn >= N) return;
+
+    // Valid rows/cols for this SG
+    const int sg_valid_m = align_M ? int(SM) : min(int(M) - int(gm), int(SM));
+    const int sg_valid_n = align_N ? int(SN) : min(int(N) - int(gn), int(SN));
+
+    if (sg_valid_m <= 0 || sg_valid_n <= 0) return;
+
+    // Per-lane fragment coordinates within a 16×16 fragment
+    const short fm = nax_fm(slid);
+    const short fn = nax_fn(slid);
+
+    // MPP matmul2d descriptor: MMA(16, 32, 16, A=normal, B=normal, accumulate)
+    constexpr auto nax_desc = mpp::tensor_ops::matmul2d_descriptor(
+        16, 32, 16, false, false, true,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+
+    // ── Zero-copy cooperative tensor pattern ──
+    mpp::tensor_ops::matmul2d<nax_desc, metal::execution_simdgroup> gemm_op_0;
+    mpp::tensor_ops::matmul2d<nax_desc, metal::execution_simdgroup> gemm_op_1;
+
+    auto ct_c0 = gemm_op_0.template get_destination_cooperative_tensor<
+        decltype(gemm_op_0.template get_left_input_cooperative_tensor<half, half, float>()),
+        decltype(gemm_op_0.template get_right_input_cooperative_tensor<half, half, float>()),
+        float>();
+    auto ct_c1 = gemm_op_1.template get_destination_cooperative_tensor<
+        decltype(gemm_op_1.template get_left_input_cooperative_tensor<half, half, float>()),
+        decltype(gemm_op_1.template get_right_input_cooperative_tensor<half, half, float>()),
+        float>();
+    for (int e = 0; e < 16; e++) { ct_c0[e] = 0.0f; ct_c1[e] = 0.0f; }
+
+    // ── Flat K-loop: iterate in steps of FK=16 ──
+    const uint k_total_steps = align_K ? (K / FK) : ((K + FK - 1) / FK);
+
+    #pragma clang loop unroll_count(2)
+    for (uint sk_abs = 0; sk_abs < k_total_steps; sk_abs++) {
+        const uint sk_offset = sk_abs * FK;
+        const int fk_valid = align_K ? int(FK) : min(int(FK), int(K) - int(sk_offset));
+        const bool k_aligned = align_K || (fk_valid == int(FK));
+
+        // Load B fragment ONCE (16×32) — shared between both row blocks
+        half B_frag[16];
+        {
+            const device half* B_ptr0 = B_batch + sk_offset * N + gn;
+            int b_cols0 = align_N ? 16 : min(16, sg_valid_n);
+            if (b_cols0 <= 0) {
+                for (int e = 0; e < 8; e++) B_frag[e] = half(0);
+            } else if (k_aligned && b_cols0 == 16) {
+                nax_load_16x16_unsafe(B_frag, B_ptr0, int(N), fm, fn);
+            } else {
+                nax_load_16x16(B_frag, B_ptr0, int(N), fm, fn,
+                              k_aligned ? 16 : fk_valid, b_cols0);
+            }
+
+            const device half* B_ptr1 = B_ptr0 + 16;
+            int b_cols1 = align_N ? 16 : min(16, sg_valid_n - 16);
+            if (b_cols1 <= 0) {
+                for (int e = 0; e < 8; e++) B_frag[8 + e] = half(0);
+            } else if (k_aligned && b_cols1 == 16) {
+                nax_load_16x16_unsafe(B_frag + 8, B_ptr1, int(N), fm, fn);
+            } else {
+                nax_load_16x16(B_frag + 8, B_ptr1, int(N), fm, fn,
+                              k_aligned ? 16 : fk_valid, b_cols1);
+            }
+        }
+
+        // Row block 0
+        {
+            auto ct_a0 = gemm_op_0.template get_left_input_cooperative_tensor<half, half, float>();
+            auto ct_b0 = gemm_op_0.template get_right_input_cooperative_tensor<half, half, float>();
+            {
+                const device half* A_ptr = A_batch + gm * K + sk_offset;
+                int a_rows = align_M ? 16 : min(16, sg_valid_m);
+                if (a_rows <= 0) {
+                    for (int e = 0; e < 8; e++) ct_a0[e] = half(0);
+                } else if (k_aligned && a_rows == 16) {
+                    const device half* r0 = A_ptr + fm * int(K) + fn;
+                    const device half* r1 = A_ptr + (fm + 8) * int(K) + fn;
+                    ct_a0[0] = r0[0]; ct_a0[1] = r0[1]; ct_a0[2] = r0[2]; ct_a0[3] = r0[3];
+                    ct_a0[4] = r1[0]; ct_a0[5] = r1[1]; ct_a0[6] = r1[2]; ct_a0[7] = r1[3];
+                } else {
+                    for (short c = 0; c < 4; c++) {
+                        bool ok = (fm < a_rows) && (fn + c < (k_aligned ? 16 : fk_valid));
+                        ct_a0[c] = ok ? A_ptr[fm * int(K) + fn + c] : half(0);
+                    }
+                    for (short c = 0; c < 4; c++) {
+                        bool ok = (fm + 8 < a_rows) && (fn + c < (k_aligned ? 16 : fk_valid));
+                        ct_a0[4 + c] = ok ? A_ptr[(fm + 8) * int(K) + fn + c] : half(0);
+                    }
+                }
+            }
+            for (int e = 0; e < 16; e++) ct_b0[e] = B_frag[e];
+            gemm_op_0.run(ct_a0, ct_b0, ct_c0);
+        }
+
+        // Row block 1
+        {
+            auto ct_a1 = gemm_op_1.template get_left_input_cooperative_tensor<half, half, float>();
+            auto ct_b1 = gemm_op_1.template get_right_input_cooperative_tensor<half, half, float>();
+            {
+                const device half* A_ptr = A_batch + (gm + 16) * K + sk_offset;
+                int a_rows = align_M ? 16 : min(16, sg_valid_m - 16);
+                if (a_rows <= 0) {
+                    for (int e = 0; e < 8; e++) ct_a1[e] = half(0);
+                } else if (k_aligned && a_rows == 16) {
+                    const device half* r0 = A_ptr + fm * int(K) + fn;
+                    const device half* r1 = A_ptr + (fm + 8) * int(K) + fn;
+                    ct_a1[0] = r0[0]; ct_a1[1] = r0[1]; ct_a1[2] = r0[2]; ct_a1[3] = r0[3];
+                    ct_a1[4] = r1[0]; ct_a1[5] = r1[1]; ct_a1[6] = r1[2]; ct_a1[7] = r1[3];
+                } else {
+                    for (short c = 0; c < 4; c++) {
+                        bool ok = (fm < a_rows) && (fn + c < (k_aligned ? 16 : fk_valid));
+                        ct_a1[c] = ok ? A_ptr[fm * int(K) + fn + c] : half(0);
+                    }
+                    for (short c = 0; c < 4; c++) {
+                        bool ok = (fm + 8 < a_rows) && (fn + c < (k_aligned ? 16 : fk_valid));
+                        ct_a1[4 + c] = ok ? A_ptr[(fm + 8) * int(K) + fn + c] : half(0);
+                    }
+                }
+            }
+            for (int e = 0; e < 16; e++) ct_b1[e] = B_frag[e];
+            gemm_op_1.run(ct_a1, ct_b1, ct_c1);
+        }
+    }
+
+    // ─── Store results (read from persistent ct_c) ──────────────────────────
+    float store_c0[16], store_c1[16];
+    for (int e = 0; e < 16; e++) { store_c0[e] = ct_c0[e]; store_c1[e] = ct_c1[e]; }
+
+    const bool full_m = align_M || (sg_valid_m >= int(SM));
+    const bool full_n = align_N || (sg_valid_n >= int(SN));
+
+    // Row block 0
+    {
+        const uint out_row = gm;
+        int m_valid = full_m ? 16 : min(16, sg_valid_m);
+
+        {
+            device half* C_ptr = C_batch + out_row * N + gn;
+            int n_valid = full_n ? 16 : min(16, sg_valid_n);
+            if (m_valid > 0 && n_valid > 0) {
+                if (has_residual) {
+                    const device half* res_ptr = residual + out_row * N + gn;
+                    if (m_valid == 16 && n_valid == 16) {
+                        nax_store_16x16_residual_unsafe(C_ptr, res_ptr, int(N), store_c0, fm, fn);
+                    } else {
+                        nax_store_16x16_residual(C_ptr, res_ptr, int(N), store_c0, fm, fn, m_valid, n_valid);
+                    }
+                } else {
+                    if (m_valid == 16 && n_valid == 16) {
+                        nax_store_16x16_unsafe(C_ptr, int(N), store_c0, fm, fn);
+                    } else {
+                        nax_store_16x16(C_ptr, int(N), store_c0, fm, fn, m_valid, n_valid);
+                    }
+                }
+            }
+        }
+
+        {
+            device half* C_ptr = C_batch + out_row * N + gn + 16;
+            int n_valid = full_n ? 16 : min(16, sg_valid_n - 16);
+            if (m_valid > 0 && n_valid > 0) {
+                if (has_residual) {
+                    const device half* res_ptr = residual + out_row * N + gn + 16;
+                    if (m_valid == 16 && n_valid == 16) {
+                        nax_store_16x16_residual_unsafe(C_ptr, res_ptr, int(N), store_c0 + 8, fm, fn);
+                    } else {
+                        nax_store_16x16_residual(C_ptr, res_ptr, int(N), store_c0 + 8, fm, fn, m_valid, n_valid);
+                    }
+                } else {
+                    if (m_valid == 16 && n_valid == 16) {
+                        nax_store_16x16_unsafe(C_ptr, int(N), store_c0 + 8, fm, fn);
+                    } else {
+                        nax_store_16x16(C_ptr, int(N), store_c0 + 8, fm, fn, m_valid, n_valid);
+                    }
+                }
+            }
+        }
+    }
+
+    // Row block 1
+    {
+        const uint out_row = gm + 16;
+        int m_valid = full_m ? 16 : min(16, sg_valid_m - 16);
+        if (m_valid > 0) {
+            {
+                device half* C_ptr = C_batch + out_row * N + gn;
+                int n_valid = full_n ? 16 : min(16, sg_valid_n);
+                if (n_valid > 0) {
+                    if (has_residual) {
+                        const device half* res_ptr = residual + out_row * N + gn;
+                        if (m_valid == 16 && n_valid == 16) {
+                            nax_store_16x16_residual_unsafe(C_ptr, res_ptr, int(N), store_c1, fm, fn);
+                        } else {
+                            nax_store_16x16_residual(C_ptr, res_ptr, int(N), store_c1, fm, fn, m_valid, n_valid);
+                        }
+                    } else {
+                        if (m_valid == 16 && n_valid == 16) {
+                            nax_store_16x16_unsafe(C_ptr, int(N), store_c1, fm, fn);
+                        } else {
+                            nax_store_16x16(C_ptr, int(N), store_c1, fm, fn, m_valid, n_valid);
+                        }
+                    }
+                }
+            }
+
+            {
+                device half* C_ptr = C_batch + out_row * N + gn + 16;
+                int n_valid = full_n ? 16 : min(16, sg_valid_n - 16);
+                if (n_valid > 0) {
+                    if (has_residual) {
+                        const device half* res_ptr = residual + out_row * N + gn + 16;
+                        if (m_valid == 16 && n_valid == 16) {
+                            nax_store_16x16_residual_unsafe(C_ptr, res_ptr, int(N), store_c1 + 8, fm, fn);
+                        } else {
+                            nax_store_16x16_residual(C_ptr, res_ptr, int(N), store_c1 + 8, fm, fn, m_valid, n_valid);
+                        }
+                    } else {
+                        if (m_valid == 16 && n_valid == 16) {
+                            nax_store_16x16_unsafe(C_ptr, int(N), store_c1 + 8, fm, fn);
+                        } else {
+                            nax_store_16x16(C_ptr, int(N), store_c1 + 8, fm, fn, m_valid, n_valid);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+"#;
+
+// ---------------------------------------------------------------------------
+// NAX GEMM V2 — vectorized half4 loads + direct cooperative tensor population
+// Two kernel variants:
+//   gemm_nax_v2_f16: vectorized loads + unroll_count(2)
+//   gemm_nax_v3_f16: vectorized loads + no unroll (compiler decides)
+// ---------------------------------------------------------------------------
+
+pub const GEMM_NAX_V2_SHADER_SOURCE: &str = r#"
+#include <metal_stdlib>
+#include <metal_simdgroup>
+using namespace metal;
+
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+
+// Function constants (same IDs as existing kernels)
+constant bool align_M [[function_constant(200)]];
+constant bool align_N [[function_constant(201)]];
+constant bool has_residual [[function_constant(202)]];
+constant bool align_K [[function_constant(205)]];
+
+// Tile dimensions (same as v1)
+constant constexpr uint BM = 128;
+constant constexpr uint BN = 128;
+constant constexpr uint BK = 32;
+constant constexpr uint WM = 4;
+constant constexpr uint WN = 4;
+constant constexpr uint SM = 32;
+constant constexpr uint SN = 32;
+constant constexpr uint FK = 16;
+constant constexpr uint N_THREADS = 512;
+
+// NAX coordinate helpers
+inline short nax_fm(uint slid) {
+    short qid = short(slid) >> 2;
+    return ((qid & 4) | ((short(slid) >> 1) & 3));
+}
+
+inline short nax_fn(uint slid) {
+    short qid = short(slid) >> 2;
+    return ((qid & 2) | (short(slid) & 1)) * 4;
+}
+
+// ─── Vectorized load helpers ───────────────────────────────────────────────
+
+// Unsafe vectorized load: 2x half4 instead of 8 scalar loads
+METAL_FUNC void nax_load_16x16_v4_unsafe(thread half* frag,
+                                           const device half* src, int src_ld,
+                                           short fm, short fn) {
+    // fn gives stride-4 consecutive addresses within a row
+    *reinterpret_cast<thread half4*>(frag) =
+        *reinterpret_cast<device const half4*>(&src[fm * src_ld + fn]);
+    *reinterpret_cast<thread half4*>(frag + 4) =
+        *reinterpret_cast<device const half4*>(&src[(fm + 8) * src_ld + fn]);
+}
+
+// Safe vectorized load with bounds checking
+METAL_FUNC void nax_load_16x16_v4(thread half* frag,
+                                    const device half* src, int src_ld,
+                                    short fm, short fn,
+                                    int valid_rows, int valid_cols) {
+    // Row 0: check if full half4 is in bounds
+    if (fm < valid_rows && fn + 3 < valid_cols) {
+        *reinterpret_cast<thread half4*>(frag) =
+            *reinterpret_cast<device const half4*>(&src[fm * src_ld + fn]);
+    } else {
+        for (short c = 0; c < 4; c++) {
+            bool ok = (fm < valid_rows) && (fn + c < valid_cols);
+            frag[c] = ok ? src[fm * src_ld + fn + c] : half(0);
+        }
+    }
+    // Row 1 (fm+8)
+    if (fm + 8 < valid_rows && fn + 3 < valid_cols) {
+        *reinterpret_cast<thread half4*>(frag + 4) =
+            *reinterpret_cast<device const half4*>(&src[(fm + 8) * src_ld + fn]);
+    } else {
+        for (short c = 0; c < 4; c++) {
+            bool ok = (fm + 8 < valid_rows) && (fn + c < valid_cols);
+            frag[4 + c] = ok ? src[(fm + 8) * src_ld + fn + c] : half(0);
+        }
+    }
+}
+
+// Store helpers (same as v1 — store is not the bottleneck)
+METAL_FUNC void nax_store_v2(device half* dst, int dst_ld,
+                               thread const float* frag,
+                               short fm, short fn,
+                               int valid_rows, int valid_cols) {
+    for (short c = 0; c < 4; c++) {
+        if (fm < valid_rows && fn + c < valid_cols)
+            dst[fm * dst_ld + fn + c] = half(frag[c]);
+    }
+    for (short c = 0; c < 4; c++) {
+        if (fm + 8 < valid_rows && fn + c < valid_cols)
+            dst[(fm + 8) * dst_ld + fn + c] = half(frag[4 + c]);
+    }
+}
+
+METAL_FUNC void nax_store_v2_unsafe(device half* dst, int dst_ld,
+                                      thread const float* frag,
+                                      short fm, short fn) {
+    for (short c = 0; c < 4; c++)
+        dst[fm * dst_ld + fn + c] = half(frag[c]);
+    for (short c = 0; c < 4; c++)
+        dst[(fm + 8) * dst_ld + fn + c] = half(frag[4 + c]);
+}
+
+METAL_FUNC void nax_store_v2_residual(device half* dst,
+                                        const device half* res,
+                                        int dst_ld,
+                                        thread const float* frag,
+                                        short fm, short fn,
+                                        int valid_rows, int valid_cols) {
+    for (short c = 0; c < 4; c++) {
+        if (fm < valid_rows && fn + c < valid_cols)
+            dst[fm * dst_ld + fn + c] = half(frag[c]) + res[fm * dst_ld + fn + c];
+    }
+    for (short c = 0; c < 4; c++) {
+        if (fm + 8 < valid_rows && fn + c < valid_cols)
+            dst[(fm + 8) * dst_ld + fn + c] = half(frag[4 + c]) + res[(fm + 8) * dst_ld + fn + c];
+    }
+}
+
+METAL_FUNC void nax_store_v2_residual_unsafe(device half* dst,
+                                               const device half* res,
+                                               int dst_ld,
+                                               thread const float* frag,
+                                               short fm, short fn) {
+    for (short c = 0; c < 4; c++)
+        dst[fm * dst_ld + fn + c] = half(frag[c]) + res[fm * dst_ld + fn + c];
+    for (short c = 0; c < 4; c++)
+        dst[(fm + 8) * dst_ld + fn + c] = half(frag[4 + c]) + res[(fm + 8) * dst_ld + fn + c];
+}
+
+// ─── V2 kernel body (shared between v2 and v3 via macro) ──────────────────
+
+#define NAX_V2_KERNEL_BODY(KERNEL_NAME, UNROLL_PRAGMA)                        \
+[[kernel, max_total_threads_per_threadgroup(512)]]                            \
+void KERNEL_NAME(                                                             \
+    device const half* A [[buffer(0)]],                                       \
+    device const half* B [[buffer(1)]],                                       \
+    device half* C [[buffer(2)]],                                             \
+    constant uint& M [[buffer(3)]],                                           \
+    constant uint& N [[buffer(4)]],                                           \
+    constant uint& K [[buffer(5)]],                                           \
+    constant uint& batch_stride_a [[buffer(6)]],                              \
+    constant uint& batch_stride_b [[buffer(7)]],                              \
+    constant uint& batch_stride_c [[buffer(8)]],                              \
+    constant uint& swizzle_log [[buffer(9)]],                                 \
+    device const half* residual [[buffer(10)]],                               \
+    uint3 tid [[threadgroup_position_in_grid]],                               \
+    uint sgid [[simdgroup_index_in_threadgroup]],                             \
+    uint slid [[thread_index_in_simdgroup]])                                  \
+{                                                                             \
+    const uint batch_idx = tid.z;                                             \
+    const device half* A_batch = A + batch_idx * batch_stride_a;              \
+    const device half* B_batch = B + batch_idx * batch_stride_b;              \
+    device half* C_batch = C + batch_idx * batch_stride_c;                    \
+                                                                              \
+    uint2 tg_pos = uint2(tid.x, tid.y);                                      \
+    if (swizzle_log > 0) {                                                    \
+        tg_pos = uint2(                                                       \
+            tg_pos.x >> swizzle_log,                                          \
+            (tg_pos.y << swizzle_log) | (tg_pos.x & ((1u << swizzle_log) - 1u)) \
+        );                                                                    \
+    }                                                                         \
+                                                                              \
+    const uint sg_m = sgid / WN;                                              \
+    const uint sg_n = sgid % WN;                                              \
+    const uint gm = tg_pos.y * BM + sg_m * SM;                               \
+    const uint gn = tg_pos.x * BN + sg_n * SN;                               \
+                                                                              \
+    if (!align_M && gm >= M) return;                                          \
+    if (!align_N && gn >= N) return;                                          \
+                                                                              \
+    const int sg_valid_m = align_M ? int(SM) : min(int(M) - int(gm), int(SM)); \
+    const int sg_valid_n = align_N ? int(SN) : min(int(N) - int(gn), int(SN)); \
+    if (sg_valid_m <= 0 || sg_valid_n <= 0) return;                           \
+                                                                              \
+    const short fm = nax_fm(slid);                                            \
+    const short fn = nax_fn(slid);                                            \
+                                                                              \
+    constexpr auto nax_desc = mpp::tensor_ops::matmul2d_descriptor(           \
+        16, 32, 16, false, false, true,                                       \
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);     \
+                                                                              \
+    float acc[2][16];                                                         \
+    for (int i = 0; i < 2; i++)                                               \
+        for (int j = 0; j < 16; j++)                                          \
+            acc[i][j] = 0.0f;                                                 \
+                                                                              \
+    const uint k_total_steps = align_K ? (K / FK) : ((K + FK - 1) / FK);     \
+                                                                              \
+    UNROLL_PRAGMA                                                             \
+    for (uint sk_abs = 0; sk_abs < k_total_steps; sk_abs++) {                 \
+        const uint sk_offset = sk_abs * FK;                                   \
+        const int fk_valid = align_K ? int(FK) : min(int(FK), int(K) - int(sk_offset)); \
+        const bool k_aligned = align_K || (fk_valid == int(FK));              \
+                                                                              \
+        /* Load B fragment: 16x32 = two 16x16 blocks */                       \
+        half B_frag[16];                                                      \
+        {                                                                     \
+            const device half* B_ptr0 = B_batch + sk_offset * N + gn;         \
+            int b_cols0 = align_N ? 16 : min(16, sg_valid_n);                 \
+            if (b_cols0 <= 0) {                                               \
+                for (int e = 0; e < 8; e++) B_frag[e] = half(0);             \
+            } else if (k_aligned && b_cols0 == 16) {                          \
+                nax_load_16x16_v4_unsafe(B_frag, B_ptr0, int(N), fm, fn);    \
+            } else {                                                          \
+                nax_load_16x16_v4(B_frag, B_ptr0, int(N), fm, fn,            \
+                                  k_aligned ? 16 : fk_valid, b_cols0);        \
+            }                                                                 \
+                                                                              \
+            const device half* B_ptr1 = B_ptr0 + 16;                          \
+            int b_cols1 = align_N ? 16 : min(16, sg_valid_n - 16);            \
+            if (b_cols1 <= 0) {                                               \
+                for (int e = 0; e < 8; e++) B_frag[8 + e] = half(0);         \
+            } else if (k_aligned && b_cols1 == 16) {                          \
+                nax_load_16x16_v4_unsafe(B_frag + 8, B_ptr1, int(N), fm, fn); \
+            } else {                                                          \
+                nax_load_16x16_v4(B_frag + 8, B_ptr1, int(N), fm, fn,        \
+                                  k_aligned ? 16 : fk_valid, b_cols1);        \
+            }                                                                 \
+        }                                                                     \
+                                                                              \
+        for (uint fm_idx = 0; fm_idx < 2; fm_idx++) {                         \
+            /* Load A directly into ct_a — eliminate intermediate array */    \
+            mpp::tensor_ops::matmul2d<nax_desc, metal::execution_simdgroup> gemm_op; \
+            auto ct_a = gemm_op.template get_left_input_cooperative_tensor<half, half, float>(); \
+            auto ct_b = gemm_op.template get_right_input_cooperative_tensor<half, half, float>(); \
+            auto ct_c = gemm_op.template get_destination_cooperative_tensor<decltype(ct_a), decltype(ct_b), float>(); \
+            {                                                                 \
+                const device half* A_ptr = A_batch + (gm + fm_idx * 16) * K + sk_offset; \
+                int a_rows = align_M ? 16 : min(16, sg_valid_m - int(fm_idx * 16)); \
+                if (a_rows <= 0) {                                            \
+                    for (int e = 0; e < 8; e++) ct_a[e] = half(0);           \
+                } else if (k_aligned && a_rows == 16) {                       \
+                    /* Direct half4 load into cooperative tensor */           \
+                    auto p0 = *reinterpret_cast<device const half4*>(         \
+                        &A_ptr[fm * int(K) + fn]);                            \
+                    auto p1 = *reinterpret_cast<device const half4*>(         \
+                        &A_ptr[(fm + 8) * int(K) + fn]);                      \
+                    ct_a[0] = p0[0]; ct_a[1] = p0[1];                        \
+                    ct_a[2] = p0[2]; ct_a[3] = p0[3];                        \
+                    ct_a[4] = p1[0]; ct_a[5] = p1[1];                        \
+                    ct_a[6] = p1[2]; ct_a[7] = p1[3];                        \
+                } else {                                                      \
+                    half tmp[8];                                              \
+                    nax_load_16x16_v4(tmp, A_ptr, int(K), fm, fn,            \
+                                      a_rows, k_aligned ? 16 : fk_valid);     \
+                    for (int e = 0; e < 8; e++) ct_a[e] = tmp[e];            \
+                }                                                             \
+            }                                                                 \
+            for (int e = 0; e < 16; e++) ct_b[e] = B_frag[e];                \
+            for (int e = 0; e < 16; e++) ct_c[e] = acc[fm_idx][e];           \
+            gemm_op.run(ct_a, ct_b, ct_c);                                   \
+            for (int e = 0; e < 16; e++) acc[fm_idx][e] = ct_c[e];           \
+        }                                                                     \
+    }                                                                         \
+                                                                              \
+    /* Store results */                                                       \
+    const bool full_m = align_M || (sg_valid_m >= int(SM));                   \
+    const bool full_n = align_N || (sg_valid_n >= int(SN));                   \
+                                                                              \
+    for (uint fm_idx = 0; fm_idx < 2; fm_idx++) {                             \
+        const uint out_row = gm + fm_idx * 16;                                \
+        int m_valid = full_m ? 16 : min(16, sg_valid_m - int(fm_idx * 16));   \
+        if (m_valid <= 0) continue;                                           \
+                                                                              \
+        {                                                                     \
+            device half* C_ptr = C_batch + out_row * N + gn;                  \
+            int n_valid = full_n ? 16 : min(16, sg_valid_n);                  \
+            if (n_valid > 0) {                                                \
+                if (has_residual) {                                            \
+                    const device half* res_ptr = residual + out_row * N + gn; \
+                    if (m_valid == 16 && n_valid == 16)                       \
+                        nax_store_v2_residual_unsafe(C_ptr, res_ptr, int(N), acc[fm_idx], fm, fn); \
+                    else                                                      \
+                        nax_store_v2_residual(C_ptr, res_ptr, int(N), acc[fm_idx], fm, fn, m_valid, n_valid); \
+                } else {                                                      \
+                    if (m_valid == 16 && n_valid == 16)                       \
+                        nax_store_v2_unsafe(C_ptr, int(N), acc[fm_idx], fm, fn); \
+                    else                                                      \
+                        nax_store_v2(C_ptr, int(N), acc[fm_idx], fm, fn, m_valid, n_valid); \
+                }                                                             \
+            }                                                                 \
+        }                                                                     \
+                                                                              \
+        {                                                                     \
+            device half* C_ptr = C_batch + out_row * N + gn + 16;             \
+            int n_valid = full_n ? 16 : min(16, sg_valid_n - 16);             \
+            if (n_valid > 0) {                                                \
+                if (has_residual) {                                            \
+                    const device half* res_ptr = residual + out_row * N + gn + 16; \
+                    if (m_valid == 16 && n_valid == 16)                       \
+                        nax_store_v2_residual_unsafe(C_ptr, res_ptr, int(N), acc[fm_idx] + 8, fm, fn); \
+                    else                                                      \
+                        nax_store_v2_residual(C_ptr, res_ptr, int(N), acc[fm_idx] + 8, fm, fn, m_valid, n_valid); \
+                } else {                                                      \
+                    if (m_valid == 16 && n_valid == 16)                       \
+                        nax_store_v2_unsafe(C_ptr, int(N), acc[fm_idx] + 8, fm, fn); \
+                    else                                                      \
+                        nax_store_v2(C_ptr, int(N), acc[fm_idx] + 8, fm, fn, m_valid, n_valid); \
+                }                                                             \
+            }                                                                 \
+        }                                                                     \
+    }                                                                         \
+}
+
+// V2: vectorized loads + unroll_count(2)
+NAX_V2_KERNEL_BODY(gemm_nax_v2_f16, _Pragma("clang loop unroll_count(2)"))
+
+// V3: vectorized loads + no unroll (compiler decides)
+NAX_V2_KERNEL_BODY(gemm_nax_v3_f16, )
 
 "#;
 
@@ -3853,6 +6303,61 @@ pub enum TileVariant {
     /// f16-only, M3+ hardware MMA with 16×16 fragments. Used when supports_nax
     /// is true and M >= 64, N >= 64, K >= 64.
     NaxArch,
+    /// 64x128x32 NAX kernel: 8 SG (2×4), 256 threads, mpp::tensor_ops::matmul2d.
+    /// f16-only, better occupancy variant for M ≤ 192. Same per-SG computation
+    /// as NaxArch but fewer SGs → more concurrent TGs on M3 Ultra.
+    NaxArch64x128,
+    /// 64x64x32 NAX kernel: 4 SG (2×2), 128 threads, mpp::tensor_ops::matmul2d.
+    /// f16-only, matches MLX threadgroup geometry exactly. Maximum occupancy.
+    NaxArch64x64,
+}
+
+impl TileVariant {
+    /// Threads per threadgroup for each variant.
+    #[inline(always)]
+    pub const fn threads_per_tg(self) -> u64 {
+        match self {
+            Self::Small => 256,
+            Self::Medium | Self::Simd => 1024,
+            Self::Skinny => 256,
+            Self::Full => 256,
+            Self::MlxArch => 128,
+            Self::MlxArchSmall | Self::MlxArchMicro => 64,
+            Self::NaxArch => 512,
+            Self::NaxArch64x128 => 256,
+            Self::NaxArch64x64 => 128,
+        }
+    }
+
+    /// Whether this variant uses tile-swizzle (buffer index 9).
+    #[inline(always)]
+    pub const fn has_swizzle(self) -> bool {
+        match self {
+            Self::Full
+            | Self::Skinny
+            | Self::MlxArch
+            | Self::MlxArchSmall
+            | Self::MlxArchMicro
+            | Self::NaxArch
+            | Self::NaxArch64x128
+            | Self::NaxArch64x64 => true,
+            Self::Small | Self::Medium | Self::Simd => false,
+        }
+    }
+
+    /// Whether this variant uses function constants for alignment specialization.
+    #[inline(always)]
+    pub const fn uses_function_constants(self) -> bool {
+        match self {
+            Self::MlxArch
+            | Self::MlxArchSmall
+            | Self::MlxArchMicro
+            | Self::NaxArch
+            | Self::NaxArch64x128
+            | Self::NaxArch64x64 => true,
+            Self::Small | Self::Medium | Self::Simd | Self::Skinny | Self::Full => false,
+        }
+    }
 }
 
 /// Select the best tile configuration based on matrix dimensions.
@@ -3901,22 +6406,16 @@ pub fn select_tile_config(m: usize, n: usize, _k: usize) -> TileConfig {
 
 /// Select the best tile configuration considering dtype.
 ///
-/// For f16 Skinny (M=5..32): N-aware dispatch —
-///   N > 4096 (compute-bound) → MlxArchSmall (BM=32, BN=32),
-///   N ≤ 4096 (memory-bound)  → MlxArchMicro (BM=16, BN=32).
-/// For f16/f32 Full (M>=33): MlxArch (BM=64, BN=64).
+/// For f16: benchmark-driven dispatch (N=3584, K=3584, M3 Ultra 80-core):
+///   M=5..128:  MlxArchMicro (BM=16, BN=32) — 8.58T at M=128
+///   M=129+:    MlxArchSmall (BM=32, BN=32) — 12.32T at M=256
+/// For f32/bf16 Full (M>=33): MlxArch (BM=64, BN=64).
 pub fn select_tile_config_with_dtype(m: usize, n: usize, k: usize, dtype: DType) -> TileConfig {
     let base = select_tile_config(m, n, k);
-    // MlxArchMicro/MlxArchSmall for f16 small-M (Skinny range), N-aware
-    if dtype == DType::Float16 && base.variant == TileVariant::Skinny {
-        if n > 4096 {
-            return TileConfig {
-                bm: 32,
-                bn: 32,
-                bk: 16,
-                variant: TileVariant::MlxArchSmall,
-            };
-        } else {
+    // f16 dispatch: Micro (M<=128), Small (M=129+) beat MlxArch 64x64 at all M
+    if dtype == DType::Float16 {
+        if base.variant == TileVariant::Skinny || (base.variant == TileVariant::Full && m <= 128) {
+            // M=5..128: MlxArchMicro (16x32) — best at low-to-mid M on 80-core GPU
             return TileConfig {
                 bm: 16,
                 bn: 32,
@@ -3924,11 +6423,18 @@ pub fn select_tile_config_with_dtype(m: usize, n: usize, k: usize, dtype: DType)
                 variant: TileVariant::MlxArchMicro,
             };
         }
+        if base.variant == TileVariant::Full {
+            // M=129+: MlxArchSmall (32x32) — beats MlxArch 64x64 by ~6% at M=256
+            return TileConfig {
+                bm: 32,
+                bn: 32,
+                bk: 16,
+                variant: TileVariant::MlxArchSmall,
+            };
+        }
     }
-    // MLX-arch kernel for f16/f32/bf16: covers Full (M>=33) range
-    if (dtype == DType::Float16 || dtype == DType::Float32 || dtype == DType::Bfloat16)
-        && base.variant == TileVariant::Full
-    {
+    // f32/bf16: MLX-arch 64x64 for Full range
+    if (dtype == DType::Float32 || dtype == DType::Bfloat16) && base.variant == TileVariant::Full {
         TileConfig {
             bm: 64,
             bn: 64,
@@ -3942,9 +6448,11 @@ pub fn select_tile_config_with_dtype(m: usize, n: usize, k: usize, dtype: DType)
 
 /// Select the best tile configuration considering dtype and NAX hardware support.
 ///
-/// When `supports_nax` is true and the problem is f16 with M >= 64, N >= 64, K >= 64,
-/// the NAX (M3+ hardware MMA) path is selected with BM=128, BN=128, BK=32.
-/// Otherwise falls back to `select_tile_config_with_dtype`.
+/// NAX cooperative tensor only wins at M>=512 where compute density is high enough
+/// to offset register copy overhead. For M<512, simdgroup MMA kernels are faster:
+///   - M=5..128:  MlxArchMicro (16x32) — best wave utilization on 80-core GPU
+///   - M=129..511: MlxArchSmall (32x32) — balanced tile for medium M
+///   - M>=512:    NaxArch64x128 — cooperative tensor wins by ~3%
 pub fn select_tile_config_with_nax(
     m: usize,
     n: usize,
@@ -3952,25 +6460,40 @@ pub fn select_tile_config_with_nax(
     dtype: DType,
     supports_nax: bool,
 ) -> TileConfig {
-    // NAX path: M3+ hardware MMA, f16 only, large enough problem
-    if supports_nax && dtype == DType::Float16 && m >= 64 && n >= 64 && k >= 64 {
+    // NAX only wins at M>=512 (benchmark: NAX 64x128 16.34T vs MLX Small 15.82T).
+    // M<512: simdgroup MMA kernels (Micro/Small) have lower register overhead.
+    if supports_nax && dtype == DType::Float16 && m >= 512 && n >= 64 && k >= 64 {
         return TileConfig {
-            bm: 128,
+            bm: 64,
             bn: 128,
             bk: 32,
-            variant: TileVariant::NaxArch,
+            variant: TileVariant::NaxArch64x128,
         };
     }
     select_tile_config_with_dtype(m, n, k, dtype)
 }
 
 /// Compute swizzle_log for threadblock swizzle.
+///
+/// The kernel's `mlx_swizzle_tg(gx, gy, s)` maps grid coordinates to:
+///   `new_x = gx >> s`, `new_y = (gy << s) | (gx & mask)`
+///
+/// When s > 0, the dispatch grid must be reshaped inversely so that the
+/// swizzled coordinates exactly cover (0..tiles_n, 0..tiles_m):
+///   `grid_x = tiles_n << s`, `grid_y = tiles_m >> s`
+///
+/// The kernel's bounds guard (`if row_start >= M || col_start >= N return`)
+/// handles any extra tiles from rounding.
 pub fn compute_swizzle_log(m: usize, n: usize, bm: usize, bn: usize) -> u32 {
     let tiles_m = m.div_ceil(bm);
     let tiles_n = n.div_ceil(bn);
-    if tiles_n >= 4 * tiles_m {
+    // Swizzle remaps grid (gx, gy) → (gx>>s, (gy<<s)|(gx&mask)).
+    // The dispatch grid must be reshaped to (tiles_n << s, tiles_m >> s) so
+    // the bijection covers all (0..tiles_n, 0..tiles_m) output tiles.
+    // Guard: tiles_m >> s must be >= 1 (i.e., tiles_m >= 2^s).
+    if tiles_n >= 4 * tiles_m && tiles_m >= 4 {
         2
-    } else if tiles_m > 3 {
+    } else if tiles_n >= 2 * tiles_m && tiles_m >= 2 {
         1
     } else {
         0
@@ -4140,6 +6663,30 @@ pub fn register(registry: &KernelRegistry) -> Result<(), KernelError> {
     if let Err(e) = registry.register_jit_source("gemm_nax", GEMM_NAX_SHADER_SOURCE) {
         eprintln!("warning: gemm_nax registration skipped (MPP unavailable): {e}");
     }
+    if let Err(e) = registry.register_jit_source("gemm_nax_64x128", GEMM_NAX_64X128_SHADER_SOURCE) {
+        eprintln!("warning: gemm_nax_64x128 registration skipped (MPP unavailable): {e}");
+    }
+    if let Err(e) =
+        registry.register_jit_source("gemm_nax_64x128_u4", GEMM_NAX_64X128_U4_SHADER_SOURCE)
+    {
+        eprintln!("warning: gemm_nax_64x128_u4 registration skipped (MPP unavailable): {e}");
+    }
+    if let Err(e) =
+        registry.register_jit_source("gemm_nax_64x128_u8", GEMM_NAX_64X128_U8_SHADER_SOURCE)
+    {
+        eprintln!("warning: gemm_nax_64x128_u8 registration skipped (MPP unavailable): {e}");
+    }
+    if let Err(e) =
+        registry.register_jit_source("gemm_nax_64x128_u16", GEMM_NAX_64X128_U16_SHADER_SOURCE)
+    {
+        eprintln!("warning: gemm_nax_64x128_u16 registration skipped (MPP unavailable): {e}");
+    }
+    if let Err(e) = registry.register_jit_source("gemm_nax_64x64", GEMM_NAX_64X64_SHADER_SOURCE) {
+        eprintln!("warning: gemm_nax_64x64 registration skipped (MPP unavailable): {e}");
+    }
+    if let Err(e) = registry.register_jit_source("gemm_nax_v2", GEMM_NAX_V2_SHADER_SOURCE) {
+        eprintln!("warning: gemm_nax_v2 registration skipped (MPP unavailable): {e}");
+    }
     Ok(())
 }
 
@@ -4256,6 +6803,28 @@ pub fn matmul(
             result.dtype(),
             result.offset(),
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Split-K f16: data shows Split-K helps at small M (K-loop bottleneck)
+    // but hurts at M>=33 where tiled GEMM has enough tile parallelism.
+    // M=2~8: always Split-K (K-loop dominates at tiny M regardless of shape)
+    // M=9~32: Split-K only when K >= N (K-dominant or balanced shapes)
+    // M>=33: never Split-K (tiled GEMM wins across all shapes)
+    // -----------------------------------------------------------------------
+    if a.dtype() == DType::Float16 && k >= 256 {
+        let use_splitk = if (2..=8).contains(&m) {
+            true
+        } else if (9..=32).contains(&m) {
+            k >= n
+        } else {
+            false
+        };
+
+        if use_splitk {
+            let n_splits = optimal_splitk_nsplits(m, n, k);
+            return dispatch_split_k_f16(registry, a, b, queue, m, n, k, n_splits);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -4429,6 +6998,8 @@ fn dispatch_tiled_gemm(
         (TileVariant::MlxArchSmall, DType::Float16) => "gemm_mlx_small_f16",
         (TileVariant::MlxArchMicro, DType::Float16) => "gemm_mlx_m16_f16",
         (TileVariant::NaxArch, DType::Float16) => "gemm_nax_f16",
+        (TileVariant::NaxArch64x128, DType::Float16) => "gemm_nax_64x128_f16",
+        (TileVariant::NaxArch64x64, DType::Float16) => "gemm_nax_64x64_f16",
         _ => {
             return Err(KernelError::NotFound(format!(
                 "matmul not supported for {:?}",
@@ -4437,12 +7008,7 @@ fn dispatch_tiled_gemm(
         }
     };
 
-    // MlxArch/MlxArchSmall/NaxArch use function constants for alignment specialization
-    let pipeline = if tile.variant == TileVariant::MlxArch
-        || tile.variant == TileVariant::MlxArchSmall
-        || tile.variant == TileVariant::MlxArchMicro
-        || tile.variant == TileVariant::NaxArch
-    {
+    let pipeline = if tile.variant.uses_function_constants() {
         let constants = matmul_align_constants(m, n, k, tile.bm, tile.bn, tile.bk);
         registry.get_pipeline_with_constants(kernel_name, a.dtype(), &constants)?
     } else {
@@ -4453,58 +7019,52 @@ fn dispatch_tiled_gemm(
     let cb = queue.new_command_buffer();
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(a.metal_buffer()), a.offset() as u64);
-    enc.set_buffer(1, Some(b.metal_buffer()), b.offset() as u64);
-    enc.set_buffer(2, Some(out.metal_buffer()), 0);
-    set_u32(enc, 3, super::checked_u32(m, "M")?);
-    set_u32(enc, 4, super::checked_u32(n, "N")?);
-    set_u32(enc, 5, super::checked_u32(k, "K")?);
+    enc.set_buffer(gemm::A, Some(a.metal_buffer()), a.offset() as u64);
+    enc.set_buffer(gemm::B, Some(b.metal_buffer()), b.offset() as u64);
+    enc.set_buffer(gemm::OUT, Some(out.metal_buffer()), 0);
+    set_u32(enc, gemm::M, super::checked_u32(m, "M")?);
+    set_u32(enc, gemm::N, super::checked_u32(n, "N")?);
+    set_u32(enc, gemm::K, super::checked_u32(k, "K")?);
     set_u32(
         enc,
-        6,
+        gemm::BATCH_STRIDE_A,
         super::checked_u32(batch_stride_a, "batch_stride_a")?,
     );
     set_u32(
         enc,
-        7,
+        gemm::BATCH_STRIDE_B,
         super::checked_u32(batch_stride_b, "batch_stride_b")?,
     );
     set_u32(
         enc,
-        8,
+        gemm::BATCH_STRIDE_C,
         super::checked_u32(batch_stride_c, "batch_stride_c")?,
     );
 
-    // Pass swizzle_log for Full, Skinny, MlxArch, MlxArchSmall, NaxArch variants (buffer 9)
-    match tile.variant {
-        TileVariant::Full
-        | TileVariant::Skinny
-        | TileVariant::MlxArch
-        | TileVariant::MlxArchSmall
-        | TileVariant::MlxArchMicro
-        | TileVariant::NaxArch => {
-            let swizzle_log = compute_swizzle_log(m, n, tile.bm, tile.bn);
-            set_u32(enc, 9, swizzle_log);
-        }
-        _ => {}
+    let swizzle_log = if tile.variant.has_swizzle() {
+        let s = compute_swizzle_log(m, n, tile.bm, tile.bn);
+        set_u32(enc, gemm::SWIZZLE_LOG, s);
+        s
+    } else {
+        0
     };
 
-    let grid_x = ceil_div(n, tile.bn) as u64;
-    let grid_y = ceil_div(m, tile.bm) as u64;
-    let grid_z = batch as u64;
-    let grid = MTLSize::new(grid_x, grid_y, grid_z);
+    // MLX-architecture kernels declare buffer(10)..buffer(13) for fused
+    // epilogues. Bind dummies so Metal validation passes (function constants
+    // ensure the kernel never actually reads them).
+    if tile.variant.uses_function_constants() {
+        enc.set_buffer(gemm::RESIDUAL, Some(out.metal_buffer()), 0);
+        enc.set_buffer(gemm::NORM_WEIGHT, Some(out.metal_buffer()), 0);
+        enc.set_buffer(gemm::INV_RMS, Some(out.metal_buffer()), 0);
+        enc.set_buffer(gemm::GATE_RESULT, Some(out.metal_buffer()), 0);
+    }
 
-    // Thread count per threadgroup depends on variant
-    let tg_threads = match tile.variant {
-        TileVariant::Small => 256_u64,
-        TileVariant::Medium | TileVariant::Simd => 1024_u64,
-        TileVariant::Skinny => 256_u64,
-        TileVariant::Full => 256_u64,
-        TileVariant::MlxArch => 128_u64,
-        TileVariant::MlxArchSmall | TileVariant::MlxArchMicro => 64_u64,
-        TileVariant::NaxArch => 512_u64,
-    };
-    let tg = MTLSize::new(tg_threads, 1, 1);
+    let grid = MTLSize::new(
+        (ceil_div(n, tile.bn) << swizzle_log) as u64,
+        (ceil_div(m, tile.bm) >> swizzle_log) as u64,
+        batch as u64,
+    );
+    let tg = MTLSize::new(tile.variant.threads_per_tg(), 1, 1);
 
     enc.dispatch_thread_groups(grid, tg);
     enc.end_encoding();
@@ -4546,13 +7106,13 @@ fn dispatch_split_k(
     {
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&pass1_pipeline);
-        enc.set_buffer(0, Some(a.metal_buffer()), a.offset() as u64);
-        enc.set_buffer(1, Some(b.metal_buffer()), b.offset() as u64);
-        enc.set_buffer(2, Some(partial.metal_buffer()), 0);
-        set_u32(enc, 3, m_u32);
-        set_u32(enc, 4, n_u32);
-        set_u32(enc, 5, k_u32);
-        set_u32(enc, 6, splits_u32);
+        enc.set_buffer(splitk::A, Some(a.metal_buffer()), a.offset() as u64);
+        enc.set_buffer(splitk::B, Some(b.metal_buffer()), b.offset() as u64);
+        enc.set_buffer(splitk::PARTIAL, Some(partial.metal_buffer()), 0);
+        set_u32(enc, splitk::M, m_u32);
+        set_u32(enc, splitk::N, n_u32);
+        set_u32(enc, splitk::K, k_u32);
+        set_u32(enc, splitk::N_SPLITS, splits_u32);
 
         let grid = MTLSize::new(
             ceil_div(n, BN) as u64,
@@ -4569,11 +7129,11 @@ fn dispatch_split_k(
         let pass2_pipeline = registry.get_pipeline("splitk_reduce_f32", DType::Float32)?;
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&pass2_pipeline);
-        enc.set_buffer(0, Some(partial.metal_buffer()), 0);
-        enc.set_buffer(1, Some(out.metal_buffer()), 0);
-        set_u32(enc, 2, m_u32);
-        set_u32(enc, 3, n_u32);
-        set_u32(enc, 4, splits_u32);
+        enc.set_buffer(splitk_reduce::PARTIAL, Some(partial.metal_buffer()), 0);
+        enc.set_buffer(splitk_reduce::OUT, Some(out.metal_buffer()), 0);
+        set_u32(enc, splitk_reduce::M, m_u32);
+        set_u32(enc, splitk_reduce::N, n_u32);
+        set_u32(enc, splitk_reduce::N_SPLITS, splits_u32);
 
         let total = m * n;
         let tg_size = 256u64;
@@ -4585,6 +7145,34 @@ fn dispatch_split_k(
     super::commit_with_mode(cb, super::ExecMode::Sync);
 
     Ok(out)
+}
+
+/// Choose optimal n_splits for Split-K f16 based on benchmark data.
+///
+/// Pattern: N>>K (wide output) needs fewer splits (enough tile parallelism),
+/// K>>N (tall K) needs more splits, N≈K (balanced) uses 4-8 depending on M.
+fn optimal_splitk_nsplits(m: usize, n: usize, k: usize) -> usize {
+    // N >> K: enough tile parallelism from wide output, minimal splits
+    if n > k * 2 {
+        if m <= 8 {
+            return 3;
+        }
+        return 2;
+    }
+
+    // K >> N: need more splits to parallelize the long K-axis
+    if k > n * 2 {
+        if m <= 32 {
+            return 8;
+        }
+        return 4; // M=33~64
+    }
+
+    // Balanced (N ≈ K, e.g., 3584², 4096²)
+    if m <= 32 {
+        return 8;
+    }
+    4 // M=33~64
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4627,18 +7215,18 @@ fn dispatch_split_k_f16(
     {
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&pass1_pipeline);
-        enc.set_buffer(0, Some(a.metal_buffer()), a.offset() as u64);
-        enc.set_buffer(1, Some(b.metal_buffer()), b.offset() as u64);
-        enc.set_buffer(2, Some(partial.metal_buffer()), 0);
-        set_u32(enc, 3, m_u32);
-        set_u32(enc, 4, n_u32);
-        set_u32(enc, 5, k_u32);
-        set_u32(enc, 6, splits_u32);
-        set_u32(enc, 7, swizzle_log);
+        enc.set_buffer(splitk::A, Some(a.metal_buffer()), a.offset() as u64);
+        enc.set_buffer(splitk::B, Some(b.metal_buffer()), b.offset() as u64);
+        enc.set_buffer(splitk::PARTIAL, Some(partial.metal_buffer()), 0);
+        set_u32(enc, splitk::M, m_u32);
+        set_u32(enc, splitk::N, n_u32);
+        set_u32(enc, splitk::K, k_u32);
+        set_u32(enc, splitk::N_SPLITS, splits_u32);
+        set_u32(enc, 7, swizzle_log); // f16 split-K adds swizzle_log after n_splits
 
         let grid = MTLSize::new(
-            ceil_div(n, bn) as u64,
-            ceil_div(m, bm) as u64,
+            (ceil_div(n, bn) << swizzle_log) as u64,
+            (ceil_div(m, bm) >> swizzle_log) as u64,
             n_splits as u64,
         );
         let tg = MTLSize::new(64, 1, 1);
@@ -4651,11 +7239,11 @@ fn dispatch_split_k_f16(
         let pass2_pipeline = registry.get_pipeline("splitk_reduce_f16", DType::Float16)?;
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&pass2_pipeline);
-        enc.set_buffer(0, Some(partial.metal_buffer()), 0);
-        enc.set_buffer(1, Some(out.metal_buffer()), 0);
-        set_u32(enc, 2, m_u32);
-        set_u32(enc, 3, n_u32);
-        set_u32(enc, 4, splits_u32);
+        enc.set_buffer(splitk_reduce::PARTIAL, Some(partial.metal_buffer()), 0);
+        enc.set_buffer(splitk_reduce::OUT, Some(out.metal_buffer()), 0);
+        set_u32(enc, splitk_reduce::M, m_u32);
+        set_u32(enc, splitk_reduce::N, n_u32);
+        set_u32(enc, splitk_reduce::N_SPLITS, splits_u32);
 
         let total = m * n;
         let tg_size = 256u64;
@@ -4665,6 +7253,171 @@ fn dispatch_split_k_f16(
     }
 
     super::commit_with_mode(cb, super::ExecMode::Sync);
+    Ok(out)
+}
+
+/// Split-K f16 variant that encodes into an externally-provided command buffer.
+///
+/// Both pass-1 (split-K accumulate) and pass-2 (reduce) are encoded into `cb`.
+/// The caller is responsible for committing the command buffer.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_split_k_f16_into_cb(
+    registry: &KernelRegistry,
+    a: &Array,
+    b: &Array,
+    cb: &metal::CommandBufferRef,
+    m: usize,
+    n: usize,
+    k: usize,
+    n_splits: usize,
+) -> Result<Array, KernelError> {
+    let dev = registry.device().raw();
+    let partial = Array::uninit(dev, &[n_splits * m * n], DType::Float32);
+    let out = Array::uninit(dev, &[m, n], DType::Float16);
+
+    // Select tile size: BM=32 for small M, BM=64 otherwise
+    let (bm, bn, kernel_name) = if m <= 32 {
+        (32usize, 32usize, "splitk_small_pass1_f16")
+    } else {
+        (64usize, 64usize, "splitk_pass1_mlx_f16")
+    };
+
+    // Pass 1: MLX-arch split-k (align_K unused by split-K shaders, safe to pass)
+    let bk = 16usize;
+    let constants = matmul_align_constants(m, n, k, bm, bn, bk);
+    let pass1_pipeline =
+        registry.get_pipeline_with_constants(kernel_name, DType::Float16, &constants)?;
+
+    let m_u32 = super::checked_u32(m, "M")?;
+    let n_u32 = super::checked_u32(n, "N")?;
+    let k_u32 = super::checked_u32(k, "K")?;
+    let splits_u32 = super::checked_u32(n_splits, "n_splits")?;
+    let swizzle_log = compute_swizzle_log(m, n, bm, bn);
+
+    // Pass 1
+    {
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pass1_pipeline);
+        enc.set_buffer(splitk::A, Some(a.metal_buffer()), a.offset() as u64);
+        enc.set_buffer(splitk::B, Some(b.metal_buffer()), b.offset() as u64);
+        enc.set_buffer(splitk::PARTIAL, Some(partial.metal_buffer()), 0);
+        set_u32(enc, splitk::M, m_u32);
+        set_u32(enc, splitk::N, n_u32);
+        set_u32(enc, splitk::K, k_u32);
+        set_u32(enc, splitk::N_SPLITS, splits_u32);
+        set_u32(enc, 7, swizzle_log); // f16 split-K adds swizzle_log after n_splits
+
+        let grid = MTLSize::new(
+            (ceil_div(n, bn) << swizzle_log) as u64,
+            (ceil_div(m, bm) >> swizzle_log) as u64,
+            n_splits as u64,
+        );
+        let tg = MTLSize::new(64, 1, 1);
+        enc.dispatch_thread_groups(grid, tg);
+        enc.end_encoding();
+    }
+
+    // Pass 2: reduce
+    {
+        let pass2_pipeline = registry.get_pipeline("splitk_reduce_f16", DType::Float16)?;
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pass2_pipeline);
+        enc.set_buffer(splitk_reduce::PARTIAL, Some(partial.metal_buffer()), 0);
+        enc.set_buffer(splitk_reduce::OUT, Some(out.metal_buffer()), 0);
+        set_u32(enc, splitk_reduce::M, m_u32);
+        set_u32(enc, splitk_reduce::N, n_u32);
+        set_u32(enc, splitk_reduce::N_SPLITS, splits_u32);
+
+        let total = m * n;
+        let tg_size = 256u64;
+        let n_groups = ceil_div(total, tg_size as usize) as u64;
+        enc.dispatch_thread_groups(MTLSize::new(n_groups, 1, 1), MTLSize::new(tg_size, 1, 1));
+        enc.end_encoding();
+    }
+
+    Ok(out)
+}
+
+/// Split-K f16 variant that encodes into an existing compute command encoder.
+///
+/// Both pass-1 (split-K accumulate) and pass-2 (reduce) are dispatched within
+/// the same encoder. A memory barrier between passes ensures the partial sums
+/// written by pass-1 are visible to the reduce kernel in pass-2.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_split_k_f16_encode(
+    registry: &KernelRegistry,
+    a: &Array,
+    b: &Array,
+    encoder: &metal::ComputeCommandEncoderRef,
+    m: usize,
+    n: usize,
+    k: usize,
+    n_splits: usize,
+) -> Result<Array, KernelError> {
+    let dev = registry.device().raw();
+    let partial = Array::uninit(dev, &[n_splits * m * n], DType::Float32);
+    let out = Array::uninit(dev, &[m, n], DType::Float16);
+
+    // Select tile size: BM=32 for small M, BM=64 otherwise
+    let (bm, bn, kernel_name) = if m <= 32 {
+        (32usize, 32usize, "splitk_small_pass1_f16")
+    } else {
+        (64usize, 64usize, "splitk_pass1_mlx_f16")
+    };
+
+    // Pass 1: MLX-arch split-k (align_K unused by split-K shaders, safe to pass)
+    let bk = 16usize;
+    let constants = matmul_align_constants(m, n, k, bm, bn, bk);
+    let pass1_pipeline =
+        registry.get_pipeline_with_constants(kernel_name, DType::Float16, &constants)?;
+
+    let m_u32 = super::checked_u32(m, "M")?;
+    let n_u32 = super::checked_u32(n, "N")?;
+    let k_u32 = super::checked_u32(k, "K")?;
+    let splits_u32 = super::checked_u32(n_splits, "n_splits")?;
+    let swizzle_log = compute_swizzle_log(m, n, bm, bn);
+
+    // Pass 1: split-K accumulate into partial buffer
+    encoder.set_compute_pipeline_state(&pass1_pipeline);
+    encoder.set_buffer(splitk::A, Some(a.metal_buffer()), a.offset() as u64);
+    encoder.set_buffer(splitk::B, Some(b.metal_buffer()), b.offset() as u64);
+    encoder.set_buffer(splitk::PARTIAL, Some(partial.metal_buffer()), 0);
+    set_u32(encoder, splitk::M, m_u32);
+    set_u32(encoder, splitk::N, n_u32);
+    set_u32(encoder, splitk::K, k_u32);
+    set_u32(encoder, splitk::N_SPLITS, splits_u32);
+    set_u32(encoder, 7, swizzle_log); // f16 split-K adds swizzle_log after n_splits
+
+    let grid = MTLSize::new(
+        (ceil_div(n, bn) << swizzle_log) as u64,
+        (ceil_div(m, bm) >> swizzle_log) as u64,
+        n_splits as u64,
+    );
+    let tg = MTLSize::new(64, 1, 1);
+    encoder.dispatch_thread_groups(grid, tg);
+
+    // Memory barrier: ensure pass-1 writes to partial buffer are visible
+    {
+        let buf_ref: &metal::BufferRef = partial.metal_buffer();
+        encoder.memory_barrier_with_resources(&[unsafe {
+            &*(buf_ref as *const metal::BufferRef as *const metal::ResourceRef)
+        }]);
+    }
+
+    // Pass 2: reduce partial sums into final output
+    let pass2_pipeline = registry.get_pipeline("splitk_reduce_f16", DType::Float16)?;
+    encoder.set_compute_pipeline_state(&pass2_pipeline);
+    encoder.set_buffer(splitk_reduce::PARTIAL, Some(partial.metal_buffer()), 0);
+    encoder.set_buffer(splitk_reduce::OUT, Some(out.metal_buffer()), 0);
+    set_u32(encoder, splitk_reduce::M, m_u32);
+    set_u32(encoder, splitk_reduce::N, n_u32);
+    set_u32(encoder, splitk_reduce::N_SPLITS, splits_u32);
+
+    let total = m * n;
+    let tg_size = 256u64;
+    let n_groups = ceil_div(total, tg_size as usize) as u64;
+    encoder.dispatch_thread_groups(MTLSize::new(n_groups, 1, 1), MTLSize::new(tg_size, 1, 1));
+
     Ok(out)
 }
 
@@ -4704,11 +7457,8 @@ pub fn matmul_align_constants(
 /// Supports the same dispatch hierarchy as `matmul`:
 /// - M=1 → GEMV via `gemv_into_cb` (B^T @ a_vec)
 /// - N=1 → GEMV via `gemv_into_cb` (A @ b_vec)
+/// - M=2..128, f16, K>=256 → Split-K (two-pass encode into same CB)
 /// - M>=5 → tiled GEMM (Small / Skinny / Simd / Medium / Full)
-///
-/// Split-K is **not** supported in this path (it requires a two-pass
-/// encode with an intermediate buffer; the caller should use `matmul()` for
-/// K-dominated problems).
 pub fn matmul_into_cb(
     registry: &KernelRegistry,
     a: &Array,
@@ -4757,49 +7507,50 @@ pub fn matmul_into_cb(
     let k = a.shape()[1];
     let n = b.shape()[1];
 
-    // -------------------------------------------------------------------
-    // GEMV fast-paths (same logic as matmul)
-    // -------------------------------------------------------------------
+    // M=1 and N=1: DO NOT use GEMV path in matmul_into_cb().
+    // The GEMV path requires copy_into_cb() (transpose B), which is O(NK) and
+    // extremely expensive when batched in a single CB.  The tiled GEMM with
+    // BM=16 handles M=1 efficiently via padding, avoiding the transpose.
+    // Note: matmul() keeps the GEMV path because it creates its own CB where
+    // the transpose overhead is amortized differently.
 
-    // Case 1: M=1 — [1,K] @ [K,N] → transpose B to [N,K], GEMV → [N], reshape [1,N]
-    if m == 1 {
-        let a_vec = Array::new(
-            a.metal_buffer().to_owned(),
-            vec![k],
-            vec![1],
-            a.dtype(),
-            a.offset(),
-        );
-        // B is [K,N] row-major. We need B^T = [N,K] contiguous for GEMV.
-        let b_t_view = b.view(vec![n, k], vec![1, n], b.offset());
-        let b_t = super::copy::copy_into_cb(registry, &b_t_view, cb)?;
-        let result = super::gemv::gemv_into_cb(registry, &b_t, &a_vec, cb)?;
-        return Ok(Array::new(
-            result.metal_buffer().to_owned(),
-            vec![1, n],
-            vec![n, 1],
-            result.dtype(),
-            result.offset(),
-        ));
+    // -------------------------------------------------------------------
+    // Split-K f16: data shows Split-K helps at small M (K-loop bottleneck)
+    // but hurts at M>=33 where tiled GEMM has enough tile parallelism.
+    // M=2~8: always Split-K (K-loop dominates at tiny M regardless of shape)
+    // M=9~32: Split-K only when K >= N (K-dominant or balanced shapes)
+    // M>=33: never Split-K (tiled GEMM wins across all shapes)
+    // -------------------------------------------------------------------
+    if a.dtype() == DType::Float16 && k >= 256 {
+        let use_splitk = if (2..=8).contains(&m) {
+            true
+        } else if (9..=32).contains(&m) {
+            k >= n
+        } else {
+            false
+        };
+
+        if use_splitk {
+            let n_splits = optimal_splitk_nsplits(m, n, k);
+            return dispatch_split_k_f16_into_cb(registry, a, b, cb, m, n, k, n_splits);
+        }
     }
 
-    // Case 2: N=1 — [M,K] @ [K,1] → GEMV A @ b_vec → [M], reshape [M,1]
-    if n == 1 {
-        let b_vec = Array::new(
-            b.metal_buffer().to_owned(),
-            vec![k],
-            vec![1],
-            b.dtype(),
-            b.offset(),
-        );
-        let result = super::gemv::gemv_into_cb(registry, a, &b_vec, cb)?;
-        return Ok(Array::new(
-            result.metal_buffer().to_owned(),
-            vec![m, 1],
-            vec![1, 1],
-            result.dtype(),
-            result.offset(),
-        ));
+    // Split-K f16 for under-occupied problems
+    if a.dtype() == DType::Float16 {
+        let gpu_cores = registry.device().tuning().gpu_cores;
+        let tile = select_tile_config_with_dtype(m, n, k, DType::Float16);
+        let non_splitk_tgs = m.div_ceil(tile.bm) * n.div_ceil(tile.bn);
+        let target_tgs = gpu_cores * 4;
+        if non_splitk_tgs < target_tgs && k >= m.max(n) && k >= 256 {
+            let (splitk_bm, splitk_bn) = if m <= 32 { (32, 32) } else { (64, 64) };
+            let splitk_tgs = m.div_ceil(splitk_bm) * n.div_ceil(splitk_bn);
+            let k_tiles = k / 16;
+            let splits = (target_tgs / splitk_tgs.max(1)).clamp(2, k_tiles.min(32));
+            if splits > 1 {
+                return dispatch_split_k_f16_into_cb(registry, a, b, cb, m, n, k, splits);
+            }
+        }
     }
 
     // -------------------------------------------------------------------
@@ -4833,6 +7584,8 @@ pub fn matmul_into_cb(
         (TileVariant::MlxArchSmall, DType::Float16) => "gemm_mlx_small_f16",
         (TileVariant::MlxArchMicro, DType::Float16) => "gemm_mlx_m16_f16",
         (TileVariant::NaxArch, DType::Float16) => "gemm_nax_f16",
+        (TileVariant::NaxArch64x128, DType::Float16) => "gemm_nax_64x128_f16",
+        (TileVariant::NaxArch64x64, DType::Float16) => "gemm_nax_64x64_f16",
         _ => {
             return Err(KernelError::NotFound(format!(
                 "matmul_into_cb: unsupported dtype {:?}",
@@ -4841,12 +7594,7 @@ pub fn matmul_into_cb(
         }
     };
 
-    // MlxArch/MlxArchSmall/NaxArch use function constants for alignment specialization
-    let pipeline = if tile.variant == TileVariant::MlxArch
-        || tile.variant == TileVariant::MlxArchSmall
-        || tile.variant == TileVariant::MlxArchMicro
-        || tile.variant == TileVariant::NaxArch
-    {
+    let pipeline = if tile.variant.uses_function_constants() {
         let constants = matmul_align_constants(m, n, k, tile.bm, tile.bn, tile.bk);
         registry.get_pipeline_with_constants(kernel_name, a.dtype(), &constants)?
     } else {
@@ -4896,57 +7644,54 @@ fn encode_gemm_core(
     batch_stride_c: usize,
 ) -> Result<(), KernelError> {
     enc.set_compute_pipeline_state(pipeline);
-    enc.set_buffer(0, Some(a.metal_buffer()), a.offset() as u64);
-    enc.set_buffer(1, Some(b.metal_buffer()), b.offset() as u64);
-    enc.set_buffer(2, Some(out.metal_buffer()), 0);
-    set_u32(enc, 3, super::checked_u32(m, "M")?);
-    set_u32(enc, 4, super::checked_u32(n, "N")?);
-    set_u32(enc, 5, super::checked_u32(k, "K")?);
+    enc.set_buffer(gemm::A, Some(a.metal_buffer()), a.offset() as u64);
+    enc.set_buffer(gemm::B, Some(b.metal_buffer()), b.offset() as u64);
+    enc.set_buffer(gemm::OUT, Some(out.metal_buffer()), 0);
+    set_u32(enc, gemm::M, super::checked_u32(m, "M")?);
+    set_u32(enc, gemm::N, super::checked_u32(n, "N")?);
+    set_u32(enc, gemm::K, super::checked_u32(k, "K")?);
     set_u32(
         enc,
-        6,
+        gemm::BATCH_STRIDE_A,
         super::checked_u32(batch_stride_a, "batch_stride_a")?,
     );
     set_u32(
         enc,
-        7,
+        gemm::BATCH_STRIDE_B,
         super::checked_u32(batch_stride_b, "batch_stride_b")?,
     );
     set_u32(
         enc,
-        8,
+        gemm::BATCH_STRIDE_C,
         super::checked_u32(batch_stride_c, "batch_stride_c")?,
     );
 
-    // Pass swizzle_log for Full, Skinny, MlxArch, MlxArchSmall, NaxArch variants (buffer 9)
-    match tile.variant {
-        TileVariant::Full
-        | TileVariant::Skinny
-        | TileVariant::MlxArch
-        | TileVariant::MlxArchSmall
-        | TileVariant::MlxArchMicro
-        | TileVariant::NaxArch => {
-            let swizzle_log = compute_swizzle_log(m, n, tile.bm, tile.bn);
-            set_u32(enc, 9, swizzle_log);
-        }
-        _ => {}
+    let swizzle_log = if tile.variant.has_swizzle() {
+        let s = compute_swizzle_log(m, n, tile.bm, tile.bn);
+        set_u32(enc, gemm::SWIZZLE_LOG, s);
+        s
+    } else {
+        0
     };
 
-    let grid_x = ceil_div(n, tile.bn) as u64;
-    let grid_y = ceil_div(m, tile.bm) as u64;
-    let grid = MTLSize::new(grid_x, grid_y, 1); // batch=1
+    let grid = MTLSize::new(
+        (ceil_div(n, tile.bn) << swizzle_log) as u64,
+        (ceil_div(m, tile.bm) >> swizzle_log) as u64,
+        1,
+    );
+    let tg = MTLSize::new(tile.variant.threads_per_tg(), 1, 1);
 
-    // Thread count per threadgroup depends on variant
-    let tg_threads = match tile.variant {
-        TileVariant::Small => 256_u64,
-        TileVariant::Medium | TileVariant::Simd => 1024_u64,
-        TileVariant::Skinny => 256_u64,
-        TileVariant::Full => 256_u64,
-        TileVariant::MlxArch => 128_u64,
-        TileVariant::MlxArchSmall | TileVariant::MlxArchMicro => 64_u64,
-        TileVariant::NaxArch => 512_u64,
-    };
-    let tg = MTLSize::new(tg_threads, 1, 1);
+    // MLX-architecture kernels (gemm_mlx_*) declare buffer(10)..buffer(13)
+    // for fused residual/norm/gate epilogues. When called from a plain GEMM
+    // path the function constants (has_residual=false etc.) guarantee the
+    // kernel never reads these, but Metal validation still requires every
+    // declared buffer slot to be bound. Use the output buffer as a dummy.
+    if tile.variant.uses_function_constants() {
+        enc.set_buffer(gemm::RESIDUAL, Some(out.metal_buffer()), 0);
+        enc.set_buffer(gemm::NORM_WEIGHT, Some(out.metal_buffer()), 0);
+        enc.set_buffer(gemm::INV_RMS, Some(out.metal_buffer()), 0);
+        enc.set_buffer(gemm::GATE_RESULT, Some(out.metal_buffer()), 0);
+    }
 
     enc.dispatch_thread_groups(grid, tg);
 
@@ -4967,7 +7712,10 @@ fn encode_gemm_core(
 /// encoder.
 ///
 /// **Constraints:** same as `matmul_into_cb` — inputs must be 2D, contiguous,
-/// matching dtypes, and Split-K is not supported.
+/// matching dtypes.
+///
+/// Supports Split-K for f16 K-dominant problems (two dispatches within the same
+/// encoder separated by a memory barrier).
 pub fn matmul_encode(
     registry: &KernelRegistry,
     a: &Array,
@@ -5024,6 +7772,42 @@ pub fn matmul_encode(
         ));
     }
 
+    // -------------------------------------------------------------------
+    // Split-K f16: same dispatch logic as matmul_into_cb, but using the
+    // encoder variant (two dispatches + memory barrier in same encoder).
+    // -------------------------------------------------------------------
+    if a.dtype() == DType::Float16 && k >= 256 {
+        let use_splitk = if (2..=8).contains(&m) {
+            true
+        } else if (9..=32).contains(&m) {
+            k >= n
+        } else {
+            false
+        };
+
+        if use_splitk {
+            let n_splits = optimal_splitk_nsplits(m, n, k);
+            return dispatch_split_k_f16_encode(registry, a, b, encoder, m, n, k, n_splits);
+        }
+    }
+
+    // Split-K f16 for under-occupied problems
+    if a.dtype() == DType::Float16 {
+        let gpu_cores = registry.device().tuning().gpu_cores;
+        let tile = select_tile_config_with_dtype(m, n, k, DType::Float16);
+        let non_splitk_tgs = m.div_ceil(tile.bm) * n.div_ceil(tile.bn);
+        let target_tgs = gpu_cores * 4;
+        if non_splitk_tgs < target_tgs && k >= m.max(n) && k >= 256 {
+            let (splitk_bm, splitk_bn) = if m <= 32 { (32, 32) } else { (64, 64) };
+            let splitk_tgs = m.div_ceil(splitk_bm) * n.div_ceil(splitk_bn);
+            let k_tiles = k / 16;
+            let splits = (target_tgs / splitk_tgs.max(1)).clamp(2, k_tiles.min(32));
+            if splits > 1 {
+                return dispatch_split_k_f16_encode(registry, a, b, encoder, m, n, k, splits);
+            }
+        }
+    }
+
     let supports_nax = registry.device().tuning().supports_nax;
     let tile = select_tile_config_with_nax(m, n, k, a.dtype(), supports_nax);
     let kernel_name = match (tile.variant, a.dtype()) {
@@ -5051,6 +7835,8 @@ pub fn matmul_encode(
         (TileVariant::MlxArchSmall, DType::Float16) => "gemm_mlx_small_f16",
         (TileVariant::MlxArchMicro, DType::Float16) => "gemm_mlx_m16_f16",
         (TileVariant::NaxArch, DType::Float16) => "gemm_nax_f16",
+        (TileVariant::NaxArch64x128, DType::Float16) => "gemm_nax_64x128_f16",
+        (TileVariant::NaxArch64x64, DType::Float16) => "gemm_nax_64x64_f16",
         _ => {
             return Err(KernelError::NotFound(format!(
                 "matmul_encode: unsupported dtype {:?}",
@@ -5059,11 +7845,7 @@ pub fn matmul_encode(
         }
     };
 
-    let pipeline = if tile.variant == TileVariant::MlxArch
-        || tile.variant == TileVariant::MlxArchSmall
-        || tile.variant == TileVariant::MlxArchMicro
-        || tile.variant == TileVariant::NaxArch
-    {
+    let pipeline = if tile.variant.uses_function_constants() {
         let constants = matmul_align_constants(m, n, k, tile.bm, tile.bn, tile.bk);
         registry.get_pipeline_with_constants(kernel_name, a.dtype(), &constants)?
     } else {
@@ -5180,18 +7962,27 @@ pub fn matmul_add_residual_into_cb(
 
     // MlxArch and NaxArch kernels support the residual epilogue
     let supports_nax = registry.device().tuning().supports_nax;
-    let tile = select_tile_config_with_nax(m, n, k, a.dtype(), supports_nax);
-    if tile.variant != TileVariant::MlxArch && tile.variant != TileVariant::NaxArch {
-        return Err(KernelError::NotFound(format!(
-            "matmul_add_residual_into_cb: only MlxArch/NaxArch tile supported, got {:?} (M={}, N={})",
-            tile.variant, m, n
-        )));
-    }
+    let tile = {
+        let default = select_tile_config_with_nax(m, n, k, a.dtype(), supports_nax);
+        match default.variant {
+            TileVariant::MlxArch
+            | TileVariant::NaxArch
+            | TileVariant::NaxArch64x128
+            | TileVariant::NaxArch64x64 => default,
+            _ => TileConfig {
+                bm: 64,
+                bn: 64,
+                bk: 16,
+                variant: TileVariant::MlxArch,
+            },
+        }
+    };
 
-    let kernel_name = if tile.variant == TileVariant::NaxArch {
-        "gemm_nax_f16"
-    } else {
-        match a.dtype() {
+    let kernel_name = match tile.variant {
+        TileVariant::NaxArch => "gemm_nax_f16",
+        TileVariant::NaxArch64x128 => "gemm_nax_64x128_f16",
+        TileVariant::NaxArch64x64 => "gemm_nax_64x64_f16",
+        _ => match a.dtype() {
             DType::Float16 => "gemm_mlx_f16",
             DType::Float32 => "gemm_mlx_f32",
             DType::Bfloat16 => "gemm_mlx_bf16",
@@ -5201,12 +7992,15 @@ pub fn matmul_add_residual_into_cb(
                     a.dtype()
                 )))
             }
-        }
+        },
     };
 
     // Function constants: align_M (200), align_N (201), has_residual (202), has_norm (203), has_swiglu (204)
     use crate::kernels::FunctionConstantValue;
-    let constants = if tile.variant == TileVariant::NaxArch {
+    let constants = if tile.variant == TileVariant::NaxArch
+        || tile.variant == TileVariant::NaxArch64x128
+        || tile.variant == TileVariant::NaxArch64x64
+    {
         vec![
             (200, FunctionConstantValue::Bool(m % tile.bm == 0)),
             (201, FunctionConstantValue::Bool(n % tile.bn == 0)),
@@ -5229,31 +8023,41 @@ pub fn matmul_add_residual_into_cb(
 
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(a.metal_buffer()), a.offset() as u64);
-    enc.set_buffer(1, Some(b.metal_buffer()), b.offset() as u64);
-    enc.set_buffer(2, Some(out.metal_buffer()), 0);
-    set_u32(enc, 3, super::checked_u32(m, "M")?);
-    set_u32(enc, 4, super::checked_u32(n, "N")?);
-    set_u32(enc, 5, super::checked_u32(k, "K")?);
-    set_u32(enc, 6, super::checked_u32(m * k, "batch_stride_a")?);
-    set_u32(enc, 7, super::checked_u32(k * n, "batch_stride_b")?);
-    set_u32(enc, 8, super::checked_u32(m * n, "batch_stride_c")?);
+    enc.set_buffer(gemm::A, Some(a.metal_buffer()), a.offset() as u64);
+    enc.set_buffer(gemm::B, Some(b.metal_buffer()), b.offset() as u64);
+    enc.set_buffer(gemm::OUT, Some(out.metal_buffer()), 0);
+    set_u32(enc, gemm::M, super::checked_u32(m, "M")?);
+    set_u32(enc, gemm::N, super::checked_u32(n, "N")?);
+    set_u32(enc, gemm::K, super::checked_u32(k, "K")?);
+    set_u32(
+        enc,
+        gemm::BATCH_STRIDE_A,
+        super::checked_u32(m * k, "batch_stride_a")?,
+    );
+    set_u32(
+        enc,
+        gemm::BATCH_STRIDE_B,
+        super::checked_u32(k * n, "batch_stride_b")?,
+    );
+    set_u32(
+        enc,
+        gemm::BATCH_STRIDE_C,
+        super::checked_u32(m * n, "batch_stride_c")?,
+    );
 
     let swizzle_log = compute_swizzle_log(m, n, tile.bm, tile.bn);
-    set_u32(enc, 9, swizzle_log);
+    set_u32(enc, gemm::SWIZZLE_LOG, swizzle_log);
 
-    // Residual buffer at index 10
-    enc.set_buffer(10, Some(residual.metal_buffer()), residual.offset() as u64);
+    enc.set_buffer(
+        gemm::RESIDUAL,
+        Some(residual.metal_buffer()),
+        residual.offset() as u64,
+    );
 
-    let grid_x = ceil_div(n, tile.bn) as u64;
-    let grid_y = ceil_div(m, tile.bm) as u64;
+    let grid_x = (ceil_div(n, tile.bn) << swizzle_log) as u64;
+    let grid_y = (ceil_div(m, tile.bm) >> swizzle_log) as u64;
     let grid = MTLSize::new(grid_x, grid_y, 1);
-    let tg_threads = if tile.variant == TileVariant::NaxArch {
-        512_u64
-    } else {
-        128_u64
-    };
-    let tg = MTLSize::new(tg_threads, 1, 1);
+    let tg = MTLSize::new(tile.variant.threads_per_tg(), 1, 1);
     enc.dispatch_thread_groups(grid, tg);
     enc.end_encoding();
 
@@ -5349,18 +8153,27 @@ pub fn matmul_add_residual_encode(
 
     // MlxArch and NaxArch kernels support the residual epilogue
     let supports_nax = registry.device().tuning().supports_nax;
-    let tile = select_tile_config_with_nax(m, n, k, a.dtype(), supports_nax);
-    if tile.variant != TileVariant::MlxArch && tile.variant != TileVariant::NaxArch {
-        return Err(KernelError::NotFound(format!(
-            "matmul_add_residual_encode: only MlxArch/NaxArch tile supported, got {:?} (M={}, N={})",
-            tile.variant, m, n
-        )));
-    }
+    let tile = {
+        let default = select_tile_config_with_nax(m, n, k, a.dtype(), supports_nax);
+        match default.variant {
+            TileVariant::MlxArch
+            | TileVariant::NaxArch
+            | TileVariant::NaxArch64x128
+            | TileVariant::NaxArch64x64 => default,
+            _ => TileConfig {
+                bm: 64,
+                bn: 64,
+                bk: 16,
+                variant: TileVariant::MlxArch,
+            },
+        }
+    };
 
-    let kernel_name = if tile.variant == TileVariant::NaxArch {
-        "gemm_nax_f16"
-    } else {
-        match a.dtype() {
+    let kernel_name = match tile.variant {
+        TileVariant::NaxArch => "gemm_nax_f16",
+        TileVariant::NaxArch64x128 => "gemm_nax_64x128_f16",
+        TileVariant::NaxArch64x64 => "gemm_nax_64x64_f16",
+        _ => match a.dtype() {
             DType::Float16 => "gemm_mlx_f16",
             DType::Float32 => "gemm_mlx_f32",
             DType::Bfloat16 => "gemm_mlx_bf16",
@@ -5370,12 +8183,15 @@ pub fn matmul_add_residual_encode(
                     a.dtype()
                 )))
             }
-        }
+        },
     };
 
     // Function constants: align_M (200), align_N (201), has_residual (202)
     use crate::kernels::FunctionConstantValue;
-    let constants = if tile.variant == TileVariant::NaxArch {
+    let constants = if tile.variant == TileVariant::NaxArch
+        || tile.variant == TileVariant::NaxArch64x128
+        || tile.variant == TileVariant::NaxArch64x64
+    {
         vec![
             (200, FunctionConstantValue::Bool(m % tile.bm == 0)),
             (201, FunctionConstantValue::Bool(n % tile.bn == 0)),
@@ -5398,31 +8214,41 @@ pub fn matmul_add_residual_encode(
 
     // Encode into the provided encoder — do NOT call end_encoding()
     encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(a.metal_buffer()), a.offset() as u64);
-    encoder.set_buffer(1, Some(b.metal_buffer()), b.offset() as u64);
-    encoder.set_buffer(2, Some(out.metal_buffer()), 0);
-    set_u32(encoder, 3, super::checked_u32(m, "M")?);
-    set_u32(encoder, 4, super::checked_u32(n, "N")?);
-    set_u32(encoder, 5, super::checked_u32(k, "K")?);
-    set_u32(encoder, 6, super::checked_u32(m * k, "batch_stride_a")?);
-    set_u32(encoder, 7, super::checked_u32(k * n, "batch_stride_b")?);
-    set_u32(encoder, 8, super::checked_u32(m * n, "batch_stride_c")?);
+    encoder.set_buffer(gemm::A, Some(a.metal_buffer()), a.offset() as u64);
+    encoder.set_buffer(gemm::B, Some(b.metal_buffer()), b.offset() as u64);
+    encoder.set_buffer(gemm::OUT, Some(out.metal_buffer()), 0);
+    set_u32(encoder, gemm::M, super::checked_u32(m, "M")?);
+    set_u32(encoder, gemm::N, super::checked_u32(n, "N")?);
+    set_u32(encoder, gemm::K, super::checked_u32(k, "K")?);
+    set_u32(
+        encoder,
+        gemm::BATCH_STRIDE_A,
+        super::checked_u32(m * k, "batch_stride_a")?,
+    );
+    set_u32(
+        encoder,
+        gemm::BATCH_STRIDE_B,
+        super::checked_u32(k * n, "batch_stride_b")?,
+    );
+    set_u32(
+        encoder,
+        gemm::BATCH_STRIDE_C,
+        super::checked_u32(m * n, "batch_stride_c")?,
+    );
 
     let swizzle_log = compute_swizzle_log(m, n, tile.bm, tile.bn);
-    set_u32(encoder, 9, swizzle_log);
+    set_u32(encoder, gemm::SWIZZLE_LOG, swizzle_log);
 
-    // Residual buffer at index 10
-    encoder.set_buffer(10, Some(residual.metal_buffer()), residual.offset() as u64);
+    encoder.set_buffer(
+        gemm::RESIDUAL,
+        Some(residual.metal_buffer()),
+        residual.offset() as u64,
+    );
 
-    let grid_x = ceil_div(n, tile.bn) as u64;
-    let grid_y = ceil_div(m, tile.bm) as u64;
+    let grid_x = (ceil_div(n, tile.bn) << swizzle_log) as u64;
+    let grid_y = (ceil_div(m, tile.bm) >> swizzle_log) as u64;
     let grid = MTLSize::new(grid_x, grid_y, 1);
-    let tg_threads = if tile.variant == TileVariant::NaxArch {
-        512_u64
-    } else {
-        128_u64
-    };
-    let tg = MTLSize::new(tg_threads, 1, 1);
+    let tg = MTLSize::new(tile.variant.threads_per_tg(), 1, 1);
     encoder.dispatch_thread_groups(grid, tg);
 
     Ok(out)
@@ -5488,14 +8314,25 @@ pub fn matmul_norm_gemm_into_cb(
     let k = a.shape()[1];
     let n = b.shape()[1];
 
-    // Only MlxArch kernels support the norm prologue
-    let tile = select_tile_config_with_dtype(m, n, k, a.dtype());
-    if tile.variant != TileVariant::MlxArch {
-        return Err(KernelError::NotFound(format!(
-            "matmul_norm_gemm_into_cb: only MlxArch tile supported, got {:?} (M={}, N={})",
-            tile.variant, m, n
-        )));
-    }
+    // Only MlxArch (64x64x16) kernels support the has_norm prologue.
+    // For f16, select_tile_config_with_dtype prefers MlxArchSmall/Micro, but those
+    // lack norm buffer bindings.  Force MlxArch here — the bandwidth saved by
+    // eliminating the intermediate [M,K] normalized tensor more than compensates
+    // for the slightly less-optimal tile choice.
+    let tile = {
+        let default = select_tile_config_with_dtype(m, n, k, a.dtype());
+        if default.variant == TileVariant::MlxArch {
+            default
+        } else {
+            // Force MlxArch 64×64×16 for norm-GEMM fusion
+            TileConfig {
+                bm: 64,
+                bn: 64,
+                bk: 16,
+                variant: TileVariant::MlxArch,
+            }
+        }
+    };
 
     // --- Pass 1: compute inv_rms[M] ---
     let inv_rms = super::rms_norm::compute_inv_rms(registry, a, eps, cb)?;
@@ -5529,36 +8366,199 @@ pub fn matmul_norm_gemm_into_cb(
 
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(a.metal_buffer()), a.offset() as u64);
-    enc.set_buffer(1, Some(b.metal_buffer()), b.offset() as u64);
-    enc.set_buffer(2, Some(out.metal_buffer()), 0);
-    set_u32(enc, 3, super::checked_u32(m, "M")?);
-    set_u32(enc, 4, super::checked_u32(n, "N")?);
-    set_u32(enc, 5, super::checked_u32(k, "K")?);
-    set_u32(enc, 6, super::checked_u32(m * k, "batch_stride_a")?);
-    set_u32(enc, 7, super::checked_u32(k * n, "batch_stride_b")?);
-    set_u32(enc, 8, super::checked_u32(m * n, "batch_stride_c")?);
+    enc.set_buffer(gemm::A, Some(a.metal_buffer()), a.offset() as u64);
+    enc.set_buffer(gemm::B, Some(b.metal_buffer()), b.offset() as u64);
+    enc.set_buffer(gemm::OUT, Some(out.metal_buffer()), 0);
+    set_u32(enc, gemm::M, super::checked_u32(m, "M")?);
+    set_u32(enc, gemm::N, super::checked_u32(n, "N")?);
+    set_u32(enc, gemm::K, super::checked_u32(k, "K")?);
+    set_u32(
+        enc,
+        gemm::BATCH_STRIDE_A,
+        super::checked_u32(m * k, "batch_stride_a")?,
+    );
+    set_u32(
+        enc,
+        gemm::BATCH_STRIDE_B,
+        super::checked_u32(k * n, "batch_stride_b")?,
+    );
+    set_u32(
+        enc,
+        gemm::BATCH_STRIDE_C,
+        super::checked_u32(m * n, "batch_stride_c")?,
+    );
 
     let swizzle_log = compute_swizzle_log(m, n, tile.bm, tile.bn);
-    set_u32(enc, 9, swizzle_log);
+    set_u32(enc, gemm::SWIZZLE_LOG, swizzle_log);
 
-    // Buffer 10: residual (dummy, not used when has_residual=false)
-    enc.set_buffer(10, Some(out.metal_buffer()), 0);
-    // Buffer 11: norm_weight [K]
+    // Residual (dummy, not used when has_residual=false)
+    enc.set_buffer(gemm::RESIDUAL, Some(out.metal_buffer()), 0);
+    // norm_weight [K]
     enc.set_buffer(
-        11,
+        gemm::NORM_WEIGHT,
         Some(norm_weight.metal_buffer()),
         norm_weight.offset() as u64,
     );
-    // Buffer 12: inv_rms [M]
-    enc.set_buffer(12, Some(inv_rms.metal_buffer()), 0);
+    // inv_rms [M]
+    enc.set_buffer(gemm::INV_RMS, Some(inv_rms.metal_buffer()), 0);
 
-    let grid_x = ceil_div(n, tile.bn) as u64;
-    let grid_y = ceil_div(m, tile.bm) as u64;
+    let grid_x = (ceil_div(n, tile.bn) << swizzle_log) as u64;
+    let grid_y = (ceil_div(m, tile.bm) >> swizzle_log) as u64;
     let grid = MTLSize::new(grid_x, grid_y, 1);
-    let tg = MTLSize::new(128, 1, 1); // MlxArch = 128 threads (4 SG)
+    let tg = MTLSize::new(tile.variant.threads_per_tg(), 1, 1);
     enc.dispatch_thread_groups(grid, tg);
     enc.end_encoding();
+
+    Ok(out)
+}
+
+/// Fused RMSNorm + GEMM into an existing compute command encoder.
+///
+/// Same semantics as [`matmul_norm_gemm_into_cb`] but dispatches both the
+/// `inv_rms` kernel and the norm-GEMM kernel into the caller's encoder,
+/// with a memory barrier between them.  The caller manages encoder lifecycle.
+///
+/// Returns `[M, N]` output.
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_norm_gemm_encode(
+    registry: &KernelRegistry,
+    a: &Array,
+    b: &Array,
+    norm_weight: &Array,
+    eps: f32,
+    encoder: &metal::ComputeCommandEncoderRef,
+) -> Result<Array, KernelError> {
+    // --- Validation ---
+    if a.ndim() != 2 || b.ndim() != 2 {
+        return Err(KernelError::InvalidShape(
+            "matmul_norm_gemm_encode requires 2D arrays".to_string(),
+        ));
+    }
+    if a.shape()[1] != b.shape()[0] {
+        return Err(KernelError::InvalidShape(format!(
+            "inner dimensions must match: {} vs {}",
+            a.shape()[1],
+            b.shape()[0]
+        )));
+    }
+    if a.dtype() != b.dtype() || a.dtype() != norm_weight.dtype() {
+        return Err(KernelError::InvalidShape(format!(
+            "dtypes must match: a={:?}, b={:?}, norm_weight={:?}",
+            a.dtype(),
+            b.dtype(),
+            norm_weight.dtype()
+        )));
+    }
+    if norm_weight.ndim() != 1 || norm_weight.shape()[0] != a.shape()[1] {
+        return Err(KernelError::InvalidShape(format!(
+            "norm_weight must be 1D of length K={}, got shape {:?}",
+            a.shape()[1],
+            norm_weight.shape()
+        )));
+    }
+    if !a.is_contiguous() || !b.is_contiguous() {
+        return Err(KernelError::InvalidShape(
+            "matmul_norm_gemm_encode: inputs must be contiguous".to_string(),
+        ));
+    }
+
+    let m = a.shape()[0];
+    let k = a.shape()[1];
+    let n = b.shape()[1];
+
+    let tile = {
+        let default = select_tile_config_with_dtype(m, n, k, a.dtype());
+        if default.variant == TileVariant::MlxArch {
+            default
+        } else {
+            TileConfig {
+                bm: 64,
+                bn: 64,
+                bk: 16,
+                variant: TileVariant::MlxArch,
+            }
+        }
+    };
+
+    // --- Pass 1: compute inv_rms[M] ---
+    let inv_rms = super::rms_norm::compute_inv_rms_encode(registry, a, eps, encoder)?;
+
+    // Memory barrier: inv_rms must be visible before the GEMM reads it.
+    {
+        let buf_ref: &metal::BufferRef = inv_rms.metal_buffer();
+        encoder.memory_barrier_with_resources(&[unsafe {
+            &*(buf_ref as *const metal::BufferRef as *const metal::ResourceRef)
+        }]);
+    }
+
+    // --- Pass 2: GEMM with has_norm=true ---
+    let kernel_name = match a.dtype() {
+        DType::Float16 => "gemm_mlx_f16",
+        DType::Float32 => "gemm_mlx_f32",
+        DType::Bfloat16 => "gemm_mlx_bf16",
+        _ => {
+            return Err(KernelError::NotFound(format!(
+                "matmul_norm_gemm_encode: unsupported dtype {:?}",
+                a.dtype()
+            )))
+        }
+    };
+
+    use crate::kernels::FunctionConstantValue;
+    let constants = vec![
+        (200, FunctionConstantValue::Bool(m % tile.bm == 0)),
+        (201, FunctionConstantValue::Bool(n % tile.bn == 0)),
+        (202, FunctionConstantValue::Bool(false)), // no residual
+        (203, FunctionConstantValue::Bool(true)),  // has_norm = true
+        (204, FunctionConstantValue::Bool(false)), // no swiglu
+    ];
+    let pipeline = registry.get_pipeline_with_constants(kernel_name, a.dtype(), &constants)?;
+
+    let dev = registry.device().raw();
+    let out = Array::uninit(dev, &[m, n], a.dtype());
+
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(gemm::A, Some(a.metal_buffer()), a.offset() as u64);
+    encoder.set_buffer(gemm::B, Some(b.metal_buffer()), b.offset() as u64);
+    encoder.set_buffer(gemm::OUT, Some(out.metal_buffer()), 0);
+    set_u32(encoder, gemm::M, super::checked_u32(m, "M")?);
+    set_u32(encoder, gemm::N, super::checked_u32(n, "N")?);
+    set_u32(encoder, gemm::K, super::checked_u32(k, "K")?);
+    set_u32(
+        encoder,
+        gemm::BATCH_STRIDE_A,
+        super::checked_u32(m * k, "batch_stride_a")?,
+    );
+    set_u32(
+        encoder,
+        gemm::BATCH_STRIDE_B,
+        super::checked_u32(k * n, "batch_stride_b")?,
+    );
+    set_u32(
+        encoder,
+        gemm::BATCH_STRIDE_C,
+        super::checked_u32(m * n, "batch_stride_c")?,
+    );
+
+    let swizzle_log = compute_swizzle_log(m, n, tile.bm, tile.bn);
+    set_u32(encoder, gemm::SWIZZLE_LOG, swizzle_log);
+
+    // Residual (dummy, not used when has_residual=false)
+    encoder.set_buffer(gemm::RESIDUAL, Some(out.metal_buffer()), 0);
+    // norm_weight [K]
+    encoder.set_buffer(
+        gemm::NORM_WEIGHT,
+        Some(norm_weight.metal_buffer()),
+        norm_weight.offset() as u64,
+    );
+    // inv_rms [M]
+    encoder.set_buffer(gemm::INV_RMS, Some(inv_rms.metal_buffer()), 0);
+
+    let grid_x = (ceil_div(n, tile.bn) << swizzle_log) as u64;
+    let grid_y = (ceil_div(m, tile.bm) >> swizzle_log) as u64;
+    let grid = MTLSize::new(grid_x, grid_y, 1);
+    let tg = MTLSize::new(tile.variant.threads_per_tg(), 1, 1);
+    encoder.dispatch_thread_groups(grid, tg);
 
     Ok(out)
 }
@@ -5641,30 +8641,41 @@ pub fn matmul_swiglu_gemm_into_cb(
 
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(a.metal_buffer()), a.offset() as u64);
-    enc.set_buffer(1, Some(b.metal_buffer()), b.offset() as u64);
-    enc.set_buffer(2, Some(out.metal_buffer()), 0);
-    set_u32(enc, 3, super::checked_u32(m, "M")?);
-    set_u32(enc, 4, super::checked_u32(n, "N")?);
-    set_u32(enc, 5, super::checked_u32(k, "K")?);
-    set_u32(enc, 6, super::checked_u32(m * k, "batch_stride_a")?);
-    set_u32(enc, 7, super::checked_u32(k * n, "batch_stride_b")?);
-    set_u32(enc, 8, super::checked_u32(m * n, "batch_stride_c")?);
+    enc.set_buffer(gemm::A, Some(a.metal_buffer()), a.offset() as u64);
+    enc.set_buffer(gemm::B, Some(b.metal_buffer()), b.offset() as u64);
+    enc.set_buffer(gemm::OUT, Some(out.metal_buffer()), 0);
+    set_u32(enc, gemm::M, super::checked_u32(m, "M")?);
+    set_u32(enc, gemm::N, super::checked_u32(n, "N")?);
+    set_u32(enc, gemm::K, super::checked_u32(k, "K")?);
+    set_u32(
+        enc,
+        gemm::BATCH_STRIDE_A,
+        super::checked_u32(m * k, "batch_stride_a")?,
+    );
+    set_u32(
+        enc,
+        gemm::BATCH_STRIDE_B,
+        super::checked_u32(k * n, "batch_stride_b")?,
+    );
+    set_u32(
+        enc,
+        gemm::BATCH_STRIDE_C,
+        super::checked_u32(m * n, "batch_stride_c")?,
+    );
 
     let swizzle_log = compute_swizzle_log(m, n, tile.bm, tile.bn);
-    set_u32(enc, 9, swizzle_log);
+    set_u32(enc, gemm::SWIZZLE_LOG, swizzle_log);
 
-    // Buffer 13: gate_result [M, N]
     enc.set_buffer(
-        13,
+        gemm::GATE_RESULT,
         Some(gate_result.metal_buffer()),
         gate_result.offset() as u64,
     );
 
-    let grid_x = ceil_div(n, tile.bn) as u64;
-    let grid_y = ceil_div(m, tile.bm) as u64;
+    let grid_x = (ceil_div(n, tile.bn) << swizzle_log) as u64;
+    let grid_y = (ceil_div(m, tile.bm) >> swizzle_log) as u64;
     let grid = MTLSize::new(grid_x, grid_y, 1);
-    let tg = MTLSize::new(128, 1, 1); // MlxArch = 128 threads (4 SG)
+    let tg = MTLSize::new(tile.variant.threads_per_tg(), 1, 1);
     enc.dispatch_thread_groups(grid, tg);
     enc.end_encoding();
 
@@ -5746,14 +8757,22 @@ pub fn dispatch_grouped_gemm(
     let cb = queue.new_command_buffer();
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(a_stacked.metal_buffer()), a_stacked.offset() as u64);
-    enc.set_buffer(1, Some(b_stacked.metal_buffer()), b_stacked.offset() as u64);
-    enc.set_buffer(2, Some(out.metal_buffer()), 0);
-    enc.set_buffer(3, Some(&offsets_buf), 0);
-    enc.set_buffer(4, Some(&tile_map_buf), 0);
-    enc.set_buffer(5, Some(&tile_off_buf), 0);
-    set_u32(enc, 6, super::checked_u32(k, "K")?);
-    set_u32(enc, 7, super::checked_u32(n, "N")?);
+    enc.set_buffer(
+        grouped_gemm::A_STACKED,
+        Some(a_stacked.metal_buffer()),
+        a_stacked.offset() as u64,
+    );
+    enc.set_buffer(
+        grouped_gemm::B_STACKED,
+        Some(b_stacked.metal_buffer()),
+        b_stacked.offset() as u64,
+    );
+    enc.set_buffer(grouped_gemm::OUT, Some(out.metal_buffer()), 0);
+    enc.set_buffer(grouped_gemm::OFFSETS, Some(&offsets_buf), 0);
+    enc.set_buffer(grouped_gemm::TILE_MAP, Some(&tile_map_buf), 0);
+    enc.set_buffer(grouped_gemm::TILE_OFF, Some(&tile_off_buf), 0);
+    set_u32(enc, grouped_gemm::K, super::checked_u32(k, "K")?);
+    set_u32(enc, grouped_gemm::N, super::checked_u32(n, "N")?);
 
     // 1D grid: total_tiles threadgroups, 64 threads each
     let grid = MTLSize::new(total_tiles as u64, 1, 1);
@@ -5880,16 +8899,24 @@ pub fn dispatch_grouped_splitk(
     {
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&pass1_pipeline);
-        enc.set_buffer(0, Some(a_stacked.metal_buffer()), a_stacked.offset() as u64);
-        enc.set_buffer(1, Some(b_stacked.metal_buffer()), b_stacked.offset() as u64);
-        enc.set_buffer(2, Some(partial.metal_buffer()), 0);
-        enc.set_buffer(3, Some(&offsets_buf), 0);
-        enc.set_buffer(4, Some(&tile_map_buf), 0);
-        enc.set_buffer(5, Some(&tile_off_buf), 0);
-        set_u32(enc, 6, k_u32);
-        set_u32(enc, 7, n_u32);
-        set_u32(enc, 8, total_m_u32);
-        set_u32(enc, 9, splits_u32);
+        enc.set_buffer(
+            grouped_splitk::A_STACKED,
+            Some(a_stacked.metal_buffer()),
+            a_stacked.offset() as u64,
+        );
+        enc.set_buffer(
+            grouped_splitk::B_STACKED,
+            Some(b_stacked.metal_buffer()),
+            b_stacked.offset() as u64,
+        );
+        enc.set_buffer(grouped_splitk::PARTIAL, Some(partial.metal_buffer()), 0);
+        enc.set_buffer(grouped_splitk::OFFSETS, Some(&offsets_buf), 0);
+        enc.set_buffer(grouped_splitk::TILE_MAP, Some(&tile_map_buf), 0);
+        enc.set_buffer(grouped_splitk::TILE_OFF, Some(&tile_off_buf), 0);
+        set_u32(enc, grouped_splitk::K, k_u32);
+        set_u32(enc, grouped_splitk::N, n_u32);
+        set_u32(enc, grouped_splitk::TOTAL_M, total_m_u32);
+        set_u32(enc, grouped_splitk::N_SPLITS, splits_u32);
 
         // Grid: (total_tiles, 1, n_splits)
         let grid = MTLSize::new(total_tiles as u64, 1, n_splits as u64);
@@ -5904,11 +8931,11 @@ pub fn dispatch_grouped_splitk(
         let pass2_pipeline = registry.get_pipeline("splitk_reduce_f16", DType::Float16)?;
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&pass2_pipeline);
-        enc.set_buffer(0, Some(partial.metal_buffer()), 0);
-        enc.set_buffer(1, Some(out.metal_buffer()), 0);
-        set_u32(enc, 2, total_m_u32);
-        set_u32(enc, 3, n_u32);
-        set_u32(enc, 4, splits_u32);
+        enc.set_buffer(splitk_reduce::PARTIAL, Some(partial.metal_buffer()), 0);
+        enc.set_buffer(splitk_reduce::OUT, Some(out.metal_buffer()), 0);
+        set_u32(enc, splitk_reduce::M, total_m_u32);
+        set_u32(enc, splitk_reduce::N, n_u32);
+        set_u32(enc, splitk_reduce::N_SPLITS, splits_u32);
 
         let total_elems = total_m * n;
         let tg_size = 256u64;
@@ -6067,14 +9094,67 @@ mod tests {
 
     #[test]
     fn test_compute_swizzle_log() {
+        // Small/square: no swizzle
         assert_eq!(compute_swizzle_log(32, 32, 32, 32), 0); // 1x1 tiles
-        assert_eq!(compute_swizzle_log(96, 128, 32, 32), 0); // 3 tiles M
-        assert_eq!(compute_swizzle_log(128, 128, 32, 32), 1); // 4 tiles M
-        assert_eq!(compute_swizzle_log(4096, 4096, 32, 32), 1);
-        // N-asymmetric cases
-        assert_eq!(compute_swizzle_log(64, 4096, 64, 64), 2); // tiles_n=64, tiles_m=1
-        assert_eq!(compute_swizzle_log(128, 4096, 64, 64), 2); // tiles_n=64, tiles_m=2
-        assert_eq!(compute_swizzle_log(256, 4096, 64, 64), 2); // tiles_n=64, tiles_m=4, 64>=16
+        assert_eq!(compute_swizzle_log(96, 128, 32, 32), 0); // 3x4, not 2x ratio
+        assert_eq!(compute_swizzle_log(128, 128, 32, 32), 0); // 4x4, equal
+                                                              // Large square: no swizzle
+        assert_eq!(compute_swizzle_log(4096, 4096, 32, 32), 0); // 128x128, equal
+
+        // m=64, n=4096, bm=64, bn=64 -> tiles_m=1, tiles_n=64
+        // tiles_m=1 < 2, so no swizzle despite high ratio
+        assert_eq!(compute_swizzle_log(64, 4096, 64, 64), 0);
+
+        // m=128, n=4096, bm=64, bn=64 -> tiles_m=2, tiles_n=64
+        // tiles_n >= 2*tiles_m (64 >= 4) YES, tiles_m >= 2 YES -> 1
+        assert_eq!(compute_swizzle_log(128, 4096, 64, 64), 1);
+
+        // m=256, n=4096, bm=64, bn=64 -> tiles_m=4, tiles_n=64
+        // tiles_n >= 4*tiles_m (64 >= 16) YES, tiles_m >= 4 YES -> 2
+        assert_eq!(compute_swizzle_log(256, 4096, 64, 64), 2);
+
+        // m=512, n=4096, bm=64, bn=64 -> tiles_m=8, tiles_n=64
+        // tiles_n >= 4*tiles_m (64 >= 32) YES, tiles_m >= 4 YES -> 2
+        assert_eq!(compute_swizzle_log(512, 4096, 64, 64), 2);
+    }
+
+    #[test]
+    fn test_swizzle_grid_covers_all_tiles() {
+        // Verify that reshaping (tiles_n << s, tiles_m >> s) with swizzle
+        // bijection covers all (0..tiles_n, 0..tiles_m) output coordinates.
+        for &(m, n, bm, bn) in &[
+            (256usize, 4096usize, 64usize, 64usize),
+            (128, 4096, 64, 64),
+            (512, 4096, 64, 64),
+            (128, 2048, 32, 32),
+        ] {
+            let tiles_m = m.div_ceil(bm);
+            let tiles_n = n.div_ceil(bn);
+            let s = compute_swizzle_log(m, n, bm, bn) as usize;
+            if s == 0 {
+                continue;
+            }
+
+            let grid_x = tiles_n << s;
+            let grid_y = tiles_m >> s;
+            let mask = (1 << s) - 1;
+
+            let mut covered = std::collections::HashSet::new();
+            for gy in 0..grid_y {
+                for gx in 0..grid_x {
+                    let out_x = gx >> s;
+                    let out_y = (gy << s) | (gx & mask);
+                    if out_x < tiles_n && out_y < tiles_m {
+                        covered.insert((out_x, out_y));
+                    }
+                }
+            }
+            assert_eq!(
+                covered.len(),
+                tiles_m * tiles_n,
+                "swizzle s={s} must cover all {tiles_m}x{tiles_n} tiles for m={m},n={n}"
+            );
+        }
     }
 
     #[test]
@@ -6273,10 +9353,10 @@ mod tests {
 
     #[test]
     fn test_mlx_arch_tile_selected_for_large_m_n() {
-        // M>=33, N>=33 with f16 should select MlxArch
+        // f16 M<=128 -> MlxArchMicro (bm=16, bn=32)
         let tile = select_tile_config_with_dtype(64, 4096, 4096, DType::Float16);
-        assert_eq!(tile.variant, TileVariant::MlxArch);
-        assert_eq!(tile.bm, 64);
-        assert_eq!(tile.bn, 64);
+        assert_eq!(tile.variant, TileVariant::MlxArchMicro);
+        assert_eq!(tile.bm, 16);
+        assert_eq!(tile.bn, 32);
     }
 }

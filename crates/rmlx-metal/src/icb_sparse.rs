@@ -397,7 +397,7 @@ pub fn grouped_forward_icb(
 
     // Encode only active experts into a single command buffer via the plan's
     // replay_sparse method, which already skips empty experts.
-    let cb = queue.new_command_buffer();
+    let cb = queue.new_command_buffer_with_unretained_references();
     let dispatched = plan.replay_sparse(
         expert_counts,
         expert_input_buf,

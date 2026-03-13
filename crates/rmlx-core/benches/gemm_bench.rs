@@ -1,3 +1,7 @@
+//! ⚠️ NON-PRODUCTION PATH — per-op sync matmul(): creates+commits+waits a new CB per call.
+//! ~300us/call overhead makes throughput numbers meaningless for production comparison.
+//! For kernel-level comparison use gemm_fair_bench pipelined mode; for production, pipeline_bench.
+//!
 //! Standalone GEMM kernel benchmark — per-op latency and TFLOPS.
 //!
 //! Tests matmul [M, K] @ [K, N] for various M, K, N combinations using f16 dtype.
@@ -149,7 +153,7 @@ fn bench_gemm(
             // Fallback to matmul_into_cb for non-full variants
             // (not the focus of this benchmark)
             for _ in 0..WARMUP_ITERS {
-                let cb = queue.new_command_buffer();
+                let cb = queue.new_command_buffer_with_unretained_references();
                 let _ = ops::matmul::matmul_into_cb(registry, a, b, cb).unwrap();
                 cb.commit();
                 cb.wait_until_completed();
@@ -157,7 +161,7 @@ fn bench_gemm(
             let mut times = Vec::with_capacity(BENCH_ITERS);
             for _ in 0..BENCH_ITERS {
                 let start = Instant::now();
-                let cb = queue.new_command_buffer();
+                let cb = queue.new_command_buffer_with_unretained_references();
                 let _ = ops::matmul::matmul_into_cb(registry, a, b, cb).unwrap();
                 cb.commit();
                 cb.wait_until_completed();
@@ -210,7 +214,7 @@ fn bench_gemm(
 
     // Warmup
     for _ in 0..WARMUP_ITERS {
-        let cb = queue.new_command_buffer();
+        let cb = queue.new_command_buffer_with_unretained_references();
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&pipeline);
         enc.set_buffer(0, Some(a.metal_buffer()), 0);
@@ -233,7 +237,7 @@ fn bench_gemm(
     let mut times = Vec::with_capacity(BENCH_ITERS);
     for _ in 0..BENCH_ITERS {
         let start = Instant::now();
-        let cb = queue.new_command_buffer();
+        let cb = queue.new_command_buffer_with_unretained_references();
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&pipeline);
         enc.set_buffer(0, Some(a.metal_buffer()), 0);
@@ -305,7 +309,7 @@ fn bench_grouped_gemm(
             // Warmup
             for _ in 0..WARMUP_ITERS {
                 for (a_exp, b_exp) in &experts {
-                    let cb = queue.new_command_buffer();
+                    let cb = queue.new_command_buffer_with_unretained_references();
                     let _ = ops::matmul::matmul_into_cb(registry, a_exp, b_exp, cb);
                     cb.commit();
                     cb.wait_until_completed();
@@ -315,7 +319,7 @@ fn bench_grouped_gemm(
             for _ in 0..BENCH_ITERS {
                 let start = Instant::now();
                 for (a_exp, b_exp) in &experts {
-                    let cb = queue.new_command_buffer();
+                    let cb = queue.new_command_buffer_with_unretained_references();
                     let _ = ops::matmul::matmul_into_cb(registry, a_exp, b_exp, cb);
                     cb.commit();
                     cb.wait_until_completed();
@@ -380,7 +384,7 @@ fn bench_grouped_gemm(
 
             // Warmup
             for _ in 0..WARMUP_ITERS {
-                let cb = queue.new_command_buffer();
+                let cb = queue.new_command_buffer_with_unretained_references();
                 for (a_exp, b_exp) in &experts {
                     let _ = ops::matmul::matmul_into_cb(registry, a_exp, b_exp, cb);
                 }
@@ -390,7 +394,7 @@ fn bench_grouped_gemm(
             let mut times = Vec::with_capacity(BENCH_ITERS);
             for _ in 0..BENCH_ITERS {
                 let start = Instant::now();
-                let cb = queue.new_command_buffer();
+                let cb = queue.new_command_buffer_with_unretained_references();
                 for (a_exp, b_exp) in &experts {
                     let _ = ops::matmul::matmul_into_cb(registry, a_exp, b_exp, cb);
                 }
@@ -454,7 +458,7 @@ fn bench_with_tile(
 
     // Warmup
     for _ in 0..WARMUP_ITERS {
-        let cb = queue.new_command_buffer();
+        let cb = queue.new_command_buffer_with_unretained_references();
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&pipeline);
         enc.set_buffer(0, Some(a.metal_buffer()), 0);
@@ -477,7 +481,7 @@ fn bench_with_tile(
     let mut times = Vec::with_capacity(BENCH_ITERS);
     for _ in 0..BENCH_ITERS {
         let start = Instant::now();
-        let cb = queue.new_command_buffer();
+        let cb = queue.new_command_buffer_with_unretained_references();
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&pipeline);
         enc.set_buffer(0, Some(a.metal_buffer()), 0);
@@ -653,7 +657,7 @@ fn main() {
 
                 // GEMM
                 for _ in 0..WARMUP_ITERS {
-                    let cb = queue.new_command_buffer();
+                    let cb = queue.new_command_buffer_with_unretained_references();
                     let _ = ops::matmul::matmul_into_cb(&registry, &a, &b, cb);
                     cb.commit();
                     cb.wait_until_completed();
@@ -661,7 +665,7 @@ fn main() {
                 let mut gemm_times = Vec::with_capacity(BENCH_ITERS);
                 for _ in 0..BENCH_ITERS {
                     let start = Instant::now();
-                    let cb = queue.new_command_buffer();
+                    let cb = queue.new_command_buffer_with_unretained_references();
                     let _ = ops::matmul::matmul_into_cb(&registry, &a, &b, cb);
                     cb.commit();
                     cb.wait_until_completed();
@@ -675,7 +679,7 @@ fn main() {
                     .collect();
 
                 for _ in 0..WARMUP_ITERS {
-                    let cb = queue.new_command_buffer();
+                    let cb = queue.new_command_buffer_with_unretained_references();
                     for a_row in &a_rows {
                         let _ = ops::matmul::matmul_into_cb(&registry, a_row, &b, cb);
                     }
@@ -685,7 +689,7 @@ fn main() {
                 let mut gemv_times = Vec::with_capacity(BENCH_ITERS);
                 for _ in 0..BENCH_ITERS {
                     let start = Instant::now();
-                    let cb = queue.new_command_buffer();
+                    let cb = queue.new_command_buffer_with_unretained_references();
                     for a_row in &a_rows {
                         let _ = ops::matmul::matmul_into_cb(&registry, a_row, &b, cb);
                     }

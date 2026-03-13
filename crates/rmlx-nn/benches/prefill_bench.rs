@@ -1,17 +1,16 @@
-//! GPU Prefill Benchmark (MoE Expert Layer, Qwen 3.5-style dimensions, seq_len > 1)
+//! DIAGNOSTIC — single-layer MoE expert prefill (Qwen 3.5-style dimensions).
 //!
-//! Measures single-layer TransformerBlock forward pass latency across
-//! multiple sequence lengths to profile prefill performance.
+//! Tests `forward_prefill_into_cb` (production single-layer path) and
+//! `forward_prefill_into_encoder` at the TransformerBlock level.
+//! For full 32-layer production prefill, use `e2e_prefill_bench`.
+//! For production decode, use `pipeline_bench`.
 //!
-//! Only benchmarks single_cb and ExecGraph paths — the per-op forward()
-//! baseline has been removed because it uses a different code path and
-//! can silently poison the shared command queue, invalidating subsequent
-//! measurements.
+//! Includes per-dispatch GPU timing breakdown (9-CB and cumulative subtraction).
 //!
 //! Each seq_len gets a **fresh command queue** to prevent cross-contamination.
 //!
 //! Run with:
-//!   cargo bench -p rmlx-nn --bench prefill_bench
+//!   cargo bench -p rmlx-nn --bench prefill_bench --features bench
 
 use std::time::{Duration, Instant};
 
@@ -389,7 +388,7 @@ fn main() {
             // Input: [seq_len, HIDDEN_SIZE]
             let input = rand_array(device, &[seq_len, HIDDEN_SIZE], 42);
 
-            // ==== Benchmark 1: forward_prefill_single_cb() ====
+            // ==== Benchmark 1: forward_prefill_into_cb() ====
             // Fresh queue for this seq_len to prevent cross-contamination
             let queue_cb = device.new_command_queue();
             let stats_cb = {
@@ -409,9 +408,9 @@ fn main() {
                     let _pool = ScopedPool::new();
                     for _ in 0..WARMUP_ITERS {
                         cache_cb.seq_len = 0;
-                        let cb = queue_cb.new_command_buffer();
+                        let cb = queue_cb.new_command_buffer_with_unretained_references();
                         let out = block_cb
-                            .forward_prefill_single_cb(
+                            .forward_prefill_into_cb(
                                 &input,
                                 Some(&cos_freqs),
                                 Some(&sin_freqs),
@@ -447,10 +446,10 @@ fn main() {
                     let _pool = ScopedPool::new();
                     for _ in 0..BENCH_ITERS {
                         cache_cb.seq_len = 0;
-                        let cb = queue_cb.new_command_buffer();
+                        let cb = queue_cb.new_command_buffer_with_unretained_references();
                         let start = Instant::now();
                         let _ = block_cb
-                            .forward_prefill_single_cb(
+                            .forward_prefill_into_cb(
                                 &input,
                                 Some(&cos_freqs),
                                 Some(&sin_freqs),
@@ -459,7 +458,7 @@ fn main() {
                                 &registry,
                                 cb,
                             )
-                            .expect("forward_prefill_single_cb failed");
+                            .expect("forward_prefill_into_cb failed");
                         cb.commit();
                         cb.wait_until_completed();
                         assert_cb_ok(cb, "single_cb bench");
@@ -479,7 +478,7 @@ fn main() {
                 tflops_cb
             );
 
-            // ==== Benchmark 2: forward_prefill_graph() (ExecGraph) ====
+            // ==== Benchmark 2: forward_prefill_into_cb via ExecGraph ====
             // Fresh queue for graph path
             let queue_graph = device.new_command_queue();
             let stats_graph = {
@@ -501,17 +500,19 @@ fn main() {
                     for _ in 0..WARMUP_ITERS {
                         cache_graph.seq_len = 0;
                         let mut graph = ExecGraph::new(&queue_graph, &event, 64);
+                        let cb = graph.command_buffer();
                         let out = block_graph
-                            .forward_prefill_graph(
+                            .forward_prefill_into_cb(
                                 &input,
                                 Some(&cos_freqs),
                                 Some(&sin_freqs),
                                 None,
                                 &mut cache_graph,
                                 &registry,
-                                &mut graph,
+                                cb,
                             )
                             .expect("graph warmup failed");
+                        graph.submit_batch();
                         graph.sync().expect("graph warmup sync failed");
                         graph.reset();
                         last_output = Some(out);
@@ -539,17 +540,19 @@ fn main() {
                         cache_graph.seq_len = 0;
                         let mut graph = ExecGraph::new(&queue_graph, &event, 64);
                         let start = Instant::now();
+                        let cb = graph.command_buffer();
                         let _ = block_graph
-                            .forward_prefill_graph(
+                            .forward_prefill_into_cb(
                                 &input,
                                 Some(&cos_freqs),
                                 Some(&sin_freqs),
                                 None,
                                 &mut cache_graph,
                                 &registry,
-                                &mut graph,
+                                cb,
                             )
-                            .expect("forward_prefill_graph failed");
+                            .expect("forward_prefill_into_cb failed");
+                        graph.submit_batch();
                         graph.sync().expect("graph sync failed");
                         latencies.push(start.elapsed());
                         graph.reset();
@@ -572,7 +575,7 @@ fn main() {
                 tflops_graph
             );
 
-            // ==== Benchmark 3: forward_prefill_single_encoder() ====
+            // ==== Benchmark 3: forward_prefill_into_encoder() ====
             // All dispatches share ONE compute command encoder per CB,
             // eliminating per-op encoder create/destroy overhead.
             let queue_enc = device.new_command_queue();
@@ -591,10 +594,10 @@ fn main() {
                     let _pool = ScopedPool::new();
                     for _ in 0..WARMUP_ITERS {
                         cache_enc.seq_len = 0;
-                        let cb = queue_enc.new_command_buffer();
+                        let cb = queue_enc.new_command_buffer_with_unretained_references();
                         let encoder = cb.new_compute_command_encoder();
                         let out = block_enc
-                            .forward_prefill_single_encoder(
+                            .forward_prefill_into_encoder(
                                 &input,
                                 Some(&cos_freqs),
                                 Some(&sin_freqs),
@@ -631,11 +634,11 @@ fn main() {
                     let _pool = ScopedPool::new();
                     for _ in 0..BENCH_ITERS {
                         cache_enc.seq_len = 0;
-                        let cb = queue_enc.new_command_buffer();
+                        let cb = queue_enc.new_command_buffer_with_unretained_references();
                         let encoder = cb.new_compute_command_encoder();
                         let start = Instant::now();
                         let _ = block_enc
-                            .forward_prefill_single_encoder(
+                            .forward_prefill_into_encoder(
                                 &input,
                                 Some(&cos_freqs),
                                 Some(&sin_freqs),
@@ -644,7 +647,7 @@ fn main() {
                                 &registry,
                                 encoder,
                             )
-                            .expect("forward_prefill_single_encoder failed");
+                            .expect("forward_prefill_into_encoder failed");
                         encoder.end_encoding();
                         cb.commit();
                         cb.wait_until_completed();
@@ -848,10 +851,10 @@ fn bench_dispatch_breakdown(
                     MAX_SEQ_LEN,
                     DType::Float16,
                 );
-                let cb = queue.new_command_buffer();
+                let cb = queue.new_command_buffer_with_unretained_references();
                 let start = Instant::now();
                 let _ = block
-                    .forward_prefill_single_cb(
+                    .forward_prefill_into_cb(
                         &input,
                         Some(&cos_freqs),
                         Some(&sin_freqs),
@@ -1013,10 +1016,10 @@ fn bench_cumulative_breakdown(
                 MAX_SEQ_LEN,
                 DType::Float16,
             );
-            let cb = queue.new_command_buffer();
+            let cb = queue.new_command_buffer_with_unretained_references();
             let encoder = cb.new_compute_command_encoder();
             let _ = block
-                .forward_prefill_single_encoder(
+                .forward_prefill_into_encoder(
                     &input,
                     Some(&cos_freqs),
                     Some(&sin_freqs),
@@ -1039,11 +1042,11 @@ fn bench_cumulative_breakdown(
                 MAX_SEQ_LEN,
                 DType::Float16,
             );
-            let cb = queue.new_command_buffer();
+            let cb = queue.new_command_buffer_with_unretained_references();
             let encoder = cb.new_compute_command_encoder();
             let start = std::time::Instant::now();
             let _ = block
-                .forward_prefill_single_encoder(
+                .forward_prefill_into_encoder(
                     &input,
                     Some(&cos_freqs),
                     Some(&sin_freqs),

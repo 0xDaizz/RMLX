@@ -55,7 +55,7 @@ pub use managed_buffer::{BufferAllocator, ManagedBuffer};
 pub use msl_version::{DeviceInfo, MslVersion};
 pub use pipeline::{FunctionConstant, PipelineCache};
 pub use pipeline_cache::DiskPipelineCache;
-pub use queue::GpuQueue;
+pub use queue::{fast_command_buffer, fast_command_buffer_owned, GpuQueue};
 pub use stream::{StreamManager, StreamSync, STREAM_COMPUTE, STREAM_COPY, STREAM_DEFAULT};
 
 /// Errors from Metal operations

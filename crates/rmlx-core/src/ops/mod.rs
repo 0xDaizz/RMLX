@@ -1,6 +1,7 @@
 //! GPU kernel operations for RMLX arrays.
 
 pub mod binary;
+pub mod buffer_slots;
 pub mod concat;
 pub mod conv;
 pub mod conv_tiled;

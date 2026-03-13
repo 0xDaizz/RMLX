@@ -1,3 +1,7 @@
+//! ⚠️ NON-PRODUCTION PATH — distributed TP benchmark with single-layer forward.
+//! Tests TP sharding/allreduce overhead, not full 32-layer TransformerModel pipeline.
+//! For production throughput, use e2e_prefill_bench (prefill) or pipeline_bench (decode).
+//!
 //! Distributed Tensor Parallel Benchmark (Phase I-1 / J-7)
 //!
 //! Measures single-layer transformer forward pass with and without TP overhead,
@@ -5,7 +9,7 @@
 //!
 //! All benchmarks use **f16** dtype (realistic inference precision) and include:
 //! 1. **Baseline sync forward**: `forward()` — per-op dispatch (slow, for reference only)
-//! 2. **Optimized single-CB forward**: `forward_single_cb()` — all ops in one command buffer
+//! 2. **Optimized single-CB forward**: `forward_decode_into_cb()` — all ops in one command buffer
 //! 3. **TP-sharded compute**: half-size weights (no communication)
 //! 4. **Weight sharding**: time to shard 7 weight matrices for TP=2
 //! 5. **Allreduce stub**: overhead of 2x allreduce_sum calls (single-rank identity)
@@ -307,11 +311,11 @@ fn bench_optimized_single_cb(
     registry: &KernelRegistry,
     queue: &metal::CommandQueue,
 ) -> Stats {
-    println!("\n=== Optimized: forward_single_cb() — all ops in one command buffer ===");
+    println!("\n=== Optimized: forward_decode_into_cb() — all ops in one command buffer ===");
     run_bench("optimized_single_cb", || {
-        let cb = queue.new_command_buffer();
+        let cb = queue.new_command_buffer_with_unretained_references();
         let _ = block
-            .forward_single_cb(input, None, None, None, None, registry, cb)
+            .forward_decode_into_cb(input, None, None, None, None, registry, cb)
             .expect("single_cb forward");
         cb.commit();
         cb.wait_until_completed();
@@ -331,9 +335,9 @@ fn bench_sharded_compute(
     println!("\n=== TP-sharded compute (half-size weights, single-CB, no allreduce) ===");
     println!("  Simulates rank 0 of TP=2: Q/K/V/gate/up halved, O/down halved.");
     run_bench("sharded_single_cb (TP=2 rank0)", || {
-        let cb = queue.new_command_buffer();
+        let cb = queue.new_command_buffer_with_unretained_references();
         let _ = block
-            .forward_single_cb(input, None, None, None, None, registry, cb)
+            .forward_decode_into_cb(input, None, None, None, None, registry, cb)
             .expect("sharded forward");
         cb.commit();
         cb.wait_until_completed();
@@ -689,7 +693,7 @@ fn main() {
     let input = rand_array(device, &[SEQ_LEN, HIDDEN_SIZE], 42);
     let baseline_stats = bench_baseline_sync(&block, &input, &registry, &queue);
 
-    // ── 2. Optimized: forward_single_cb (all ops in one CB) ──
+    // ── 2. Optimized: forward_decode_into_cb (all ops in one CB) ──
     let optimized_stats = bench_optimized_single_cb(&block, &input, &registry, &queue);
 
     // ── 3. TP-sharded compute (half-size weights, single-CB) ──
