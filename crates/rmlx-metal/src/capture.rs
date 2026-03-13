@@ -9,18 +9,22 @@
 //! use rmlx_metal::capture::{CaptureScope, CaptureDestination};
 //!
 //! // Capture to a GPU trace file (viewable in Xcode):
-//! let scope = CaptureScope::begin(device, CaptureDestination::GpuTraceFile("trace.gputrace"))?;
+//! let scope = CaptureScope::begin(&device, CaptureDestination::GpuTraceFile("trace.gputrace"))?;
 //! // ... Metal work ...
 //! scope.end();
 //!
 //! // Capture to Xcode debugger (must be attached):
-//! let scope = CaptureScope::begin(device, CaptureDestination::DeveloperTools)?;
+//! let scope = CaptureScope::begin(&device, CaptureDestination::DeveloperTools)?;
 //! // ... Metal work ...
 //! scope.end();
 //! ```
 //!
 //! Note: Requires the `MetalCaptureEnabled` Info.plist key or the
 //! `METAL_CAPTURE_ENABLED=1` environment variable to be set.
+
+use objc2::runtime::ProtocolObject;
+use objc2_foundation::NSURL;
+use objc2_metal::*;
 
 use crate::MetalError;
 
@@ -50,7 +54,7 @@ impl CaptureScope {
     /// Returns `MetalError::PipelineCreate` if capture cannot be started
     /// (e.g., capture is already active, or the environment does not support it).
     pub fn begin(
-        device: &metal::Device,
+        device: &ProtocolObject<dyn MTLDevice>,
         destination: CaptureDestination,
     ) -> Result<Self, MetalError> {
         start_capture(device, &destination).map(|()| Self { active: true })
@@ -84,50 +88,52 @@ impl Drop for CaptureScope {
 /// Returns `true` if `MTLCaptureManager.sharedCaptureManager.supportsDestination`
 /// indicates at least one destination is available.
 pub fn is_capture_supported() -> bool {
-    let manager = metal::CaptureManager::shared();
-    manager.supports_destination(metal::MTLCaptureDestination::DeveloperTools)
+    let manager = unsafe { MTLCaptureManager::sharedCaptureManager() };
+    manager.supportsDestination(MTLCaptureDestination::DeveloperTools)
 }
 
 // ---------------------------------------------------------------------------
-// Implementation helpers using the `metal` crate's safe(r) bindings
+// Implementation helpers using the objc2-metal bindings
 // ---------------------------------------------------------------------------
 
-/// Start a Metal GPU capture via the `metal` crate's CaptureManager API.
-///
-/// Uses `metal::CaptureManager`, `metal::CaptureDescriptor`, etc. instead of
-/// raw `objc` FFI calls, avoiding pointer-cast and C-string memory corruption
-/// bugs that existed in the previous implementation.
+/// Start a Metal GPU capture via the objc2-metal CaptureManager API.
 fn start_capture(
-    device: &metal::Device,
+    device: &ProtocolObject<dyn MTLDevice>,
     destination: &CaptureDestination,
 ) -> Result<(), MetalError> {
-    let manager = metal::CaptureManager::shared();
+    let manager = unsafe { MTLCaptureManager::sharedCaptureManager() };
 
-    let descriptor = metal::CaptureDescriptor::new();
+    let descriptor = MTLCaptureDescriptor::new();
     descriptor.set_capture_device(device);
 
     match destination {
         CaptureDestination::DeveloperTools => {
-            descriptor.set_destination(metal::MTLCaptureDestination::DeveloperTools);
+            descriptor.setDestination(MTLCaptureDestination::DeveloperTools);
         }
         CaptureDestination::GpuTraceFile(path) => {
-            descriptor.set_destination(metal::MTLCaptureDestination::GpuTraceDocument);
-            descriptor.set_output_url(path);
+            descriptor.setDestination(MTLCaptureDestination::GPUTraceDocument);
+            let ns_path = objc2_foundation::NSString::from_str(path);
+            let url = unsafe { NSURL::fileURLWithPath(&ns_path) };
+            unsafe { descriptor.setOutputURL(Some(&url)) };
         }
     }
 
-    manager.start_capture(&descriptor).map_err(|e| {
-        MetalError::PipelineCreate(format!(
-            "failed to start GPU capture ({destination:?}): {e}; \
-             ensure METAL_CAPTURE_ENABLED=1 is set"
-        ))
-    })
+    unsafe {
+        manager
+            .startCaptureWithDescriptor_error(&descriptor)
+            .map_err(|e| {
+                MetalError::PipelineCreate(format!(
+                    "failed to start GPU capture ({destination:?}): {e}; \
+                     ensure METAL_CAPTURE_ENABLED=1 is set"
+                ))
+            })
+    }
 }
 
 /// Stop the active Metal GPU capture.
 fn stop_capture() {
-    let manager = metal::CaptureManager::shared();
-    manager.stop_capture();
+    let manager = unsafe { MTLCaptureManager::sharedCaptureManager() };
+    manager.stopCapture();
 }
 
 #[cfg(test)]

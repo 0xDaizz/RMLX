@@ -12,30 +12,45 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::RwLock;
 
-use metal::{CompileOptions, Library};
+use objc2::rc::Retained;
+use objc2::Message;
+use objc2::runtime::ProtocolObject;
+use objc2_foundation::NSString;
+use objc2_metal::*;
 
+use crate::types::*;
 use crate::MetalError;
+
+/// Retain an unsized protocol-object reference into an owned `Retained`.
+///
+/// `Retained::retain()` requires `T: Sized` (it lives in `impl<T: Message>`),
+/// but `ProtocolObject<dyn MTLFoo>` is unsized.  We work around this by
+/// calling `objc_retain` directly and wrapping the result with `from_raw`,
+/// which *is* available for `T: ?Sized + Message`.
+fn retain_proto<T: ?Sized + Message>(r: &T) -> Retained<T> {
+    let ptr = r as *const T as *mut T;
+    // SAFETY: `ptr` originates from a valid reference.  `objc_retain` increments
+    // the refcount; `from_raw` then wraps the +1 pointer without retaining again.
+    unsafe {
+        objc2::ffi::objc_retain(ptr as *mut _);
+        Retained::from_raw(ptr).unwrap_unchecked()
+    }
+}
 
 /// Thread-safe cache for compiled Metal shader libraries, keyed by
 /// a 64-bit hash of the MSL source string.
 ///
 /// Uses `RwLock<HashMap>` so concurrent cache hits only take a read lock.
 pub struct LibraryCache {
-    device: metal::Device,
-    cache: RwLock<HashMap<u64, Library>>,
+    device: MtlDevice,
+    cache: RwLock<HashMap<u64, MtlLibrary>>,
 }
-
-// SAFETY: `metal::Device` and `Library` are Objective-C objects that are
-// internally reference-counted and thread-safe. The `RwLock` provides
-// Rust-side synchronization.
-unsafe impl Send for LibraryCache {}
-unsafe impl Sync for LibraryCache {}
 
 impl LibraryCache {
     /// Create a new empty library cache for the given device.
-    pub fn new(device: &metal::Device) -> Self {
+    pub fn new(device: &ProtocolObject<dyn MTLDevice>) -> Self {
         Self {
-            device: device.clone(),
+            device: retain_proto(device),
             cache: RwLock::new(HashMap::new()),
         }
     }
@@ -45,7 +60,7 @@ impl LibraryCache {
     /// If a library for this source was already compiled, returns a clone
     /// (cheap Obj-C retain). Otherwise, compiles the source, caches the
     /// result, and returns it.
-    pub fn get_or_compile(&self, source: &str) -> Result<Library, MetalError> {
+    pub fn get_or_compile(&self, source: &str) -> Result<MtlLibrary, MetalError> {
         let key = hash_source(source);
 
         // Fast path: read lock for cache hit.
@@ -55,7 +70,7 @@ impl LibraryCache {
                 .read()
                 .map_err(|_| MetalError::LibraryLoad("library cache lock poisoned".to_string()))?;
             if let Some(lib) = cache.get(&key) {
-                return Ok(lib.clone());
+                return Ok(retain_proto(&**lib));
             }
         }
 
@@ -67,16 +82,16 @@ impl LibraryCache {
 
         // Double-check after acquiring write lock.
         if let Some(lib) = cache.get(&key) {
-            return Ok(lib.clone());
+            return Ok(retain_proto(&**lib));
         }
 
-        let options = CompileOptions::new();
+        let options = MTLCompileOptions::new();
         let library = self
             .device
-            .new_library_with_source(source, &options)
-            .map_err(|e| MetalError::ShaderCompile(e.to_string()))?;
+            .newLibraryWithSource_options_error(&NSString::from_str(source), Some(&options))
+            .map_err(|e| MetalError::ShaderCompile(e.localizedDescription().to_string()))?;
 
-        let cloned = library.clone();
+        let cloned = retain_proto(&*library);
         cache.insert(key, library);
         Ok(cloned)
     }
@@ -84,9 +99,12 @@ impl LibraryCache {
     /// Get a cached library by its source hash, without compiling.
     ///
     /// Returns `None` if the source has not been compiled yet.
-    pub fn get(&self, source: &str) -> Option<Library> {
+    pub fn get(&self, source: &str) -> Option<MtlLibrary> {
         let key = hash_source(source);
-        self.cache.read().ok().and_then(|c| c.get(&key).cloned())
+        self.cache
+            .read()
+            .ok()
+            .and_then(|c| c.get(&key).map(|lib| retain_proto(&**lib)))
     }
 
     /// Whether a library for the given source is cached.
@@ -126,10 +144,11 @@ fn hash_source(source: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use objc2_metal::MTLCreateSystemDefaultDevice;
 
     #[test]
     fn test_library_cache_new_empty() {
-        let device = metal::Device::system_default().unwrap();
+        let device = MTLCreateSystemDefaultDevice().unwrap();
         let cache = LibraryCache::new(&device);
         assert!(cache.is_empty());
         assert_eq!(cache.len(), 0);
@@ -137,7 +156,7 @@ mod tests {
 
     #[test]
     fn test_library_cache_compile_and_retrieve() {
-        let device = metal::Device::system_default().unwrap();
+        let device = MTLCreateSystemDefaultDevice().unwrap();
         let cache = LibraryCache::new(&device);
 
         let source = r#"
@@ -158,13 +177,17 @@ mod tests {
         // Second call should hit the cache.
         let lib2 = cache.get_or_compile(source).unwrap();
         // Both should be usable.
-        let _ = lib.get_function("test_kernel", None).unwrap();
-        let _ = lib2.get_function("test_kernel", None).unwrap();
+        let _ = lib
+            .newFunctionWithName(&NSString::from_str("test_kernel"))
+            .unwrap();
+        let _ = lib2
+            .newFunctionWithName(&NSString::from_str("test_kernel"))
+            .unwrap();
     }
 
     #[test]
     fn test_library_cache_different_sources() {
-        let device = metal::Device::system_default().unwrap();
+        let device = MTLCreateSystemDefaultDevice().unwrap();
         let cache = LibraryCache::new(&device);
 
         let source1 = r#"
@@ -189,7 +212,7 @@ mod tests {
 
     #[test]
     fn test_library_cache_invalid_source() {
-        let device = metal::Device::system_default().unwrap();
+        let device = MTLCreateSystemDefaultDevice().unwrap();
         let cache = LibraryCache::new(&device);
 
         let result = cache.get_or_compile("this is not valid MSL");
@@ -199,7 +222,7 @@ mod tests {
 
     #[test]
     fn test_library_cache_clear() {
-        let device = metal::Device::system_default().unwrap();
+        let device = MTLCreateSystemDefaultDevice().unwrap();
         let cache = LibraryCache::new(&device);
 
         let source = r#"

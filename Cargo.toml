@@ -18,9 +18,11 @@ rust-version = "1.80"
 license = "MIT"
 
 [workspace.dependencies]
-metal = "0.31"
-objc = "0.2"
-block = "0.1"
+objc2 = "0.6"
+objc2-metal = "0.3"
+objc2-foundation = "0.3"
+block2 = "0.6"
+bytemuck = { version = "1", features = ["derive"] }
 libc = "0.2"
 libloading = "0.8"
 clap = { version = "4", features = ["derive"] }

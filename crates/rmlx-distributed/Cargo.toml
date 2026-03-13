@@ -10,7 +10,7 @@ rmlx-alloc = { path = "../rmlx-alloc" }
 rmlx-core = { path = "../rmlx-core" }
 rmlx-metal = { path = "../rmlx-metal" }
 rmlx-rdma = { path = "../rmlx-rdma" }
-metal = { workspace = true }
+objc2-metal = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 

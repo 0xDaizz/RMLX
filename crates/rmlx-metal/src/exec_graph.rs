@@ -51,10 +51,13 @@
 
 use std::time::Duration;
 
-use metal::{CommandBuffer, CommandQueue};
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::*;
 
 use crate::batcher::CommandBatcher;
 use crate::event::{EventError, GpuEvent};
+use crate::types::*;
 
 /// Configuration for GPU memory backpressure in ExecGraph.
 ///
@@ -109,7 +112,7 @@ pub struct ExecGraph<'q, 'e> {
     /// `MTLSharedEvent.signaledValue` polling is unreliable on Apple Silicon when
     /// multiple command buffers are in flight across iterations; using the CB's own
     /// completion mechanism is more robust.
-    last_cb: Option<CommandBuffer>,
+    last_cb: Option<MtlCB>,
     /// Memory backpressure configuration.
     memory_config: MemoryConfig,
     /// Caller-reported GPU allocation total in bytes. Updated via
@@ -133,7 +136,7 @@ impl<'q, 'e> ExecGraph<'q, 'e> {
     /// - `event`: Shared event for GPU-side synchronization
     /// - `max_encoders_per_batch`: Max encoders per command buffer
     pub fn new(
-        queue: &'q CommandQueue,
+        queue: &'q ProtocolObject<dyn MTLCommandQueue>,
         event: &'e GpuEvent,
         max_encoders_per_batch: usize,
     ) -> Self {
@@ -243,7 +246,7 @@ impl<'q, 'e> ExecGraph<'q, 'e> {
     ///
     /// The encoder is created on the current command buffer. Call
     /// `end_encoder()` after encoding.
-    pub fn encoder(&mut self) -> &metal::ComputeCommandEncoderRef {
+    pub fn encoder(&mut self) -> Retained<ProtocolObject<dyn MTLComputeCommandEncoder>> {
         self.batcher.encoder()
     }
 
@@ -253,7 +256,7 @@ impl<'q, 'e> ExecGraph<'q, 'e> {
     }
 
     /// Get the current command buffer for direct encoding.
-    pub fn command_buffer(&mut self) -> &metal::CommandBufferRef {
+    pub fn command_buffer(&mut self) -> &ProtocolObject<dyn MTLCommandBuffer> {
         self.batcher.command_buffer()
     }
 
@@ -341,7 +344,7 @@ impl<'q, 'e> ExecGraph<'q, 'e> {
         // when GPU has prior in-flight work from previous iterations.
         let start = std::time::Instant::now();
         if let Some(ref cb) = self.last_cb {
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
         }
         self.last_cb = None;
         Ok(start.elapsed())
@@ -382,7 +385,7 @@ impl<'q, 'e> ExecGraph<'q, 'e> {
     }
 
     /// Access the underlying queue.
-    pub fn queue(&self) -> &CommandQueue {
+    pub fn queue(&self) -> &ProtocolObject<dyn MTLCommandQueue> {
         self.batcher.queue()
     }
 
@@ -419,8 +422,8 @@ mod tests {
 
     #[test]
     fn exec_graph_basic_lifecycle() {
-        let device = metal::Device::system_default().expect("Metal device required");
-        let queue = device.new_command_queue();
+        let device = unsafe { MTLCreateSystemDefaultDevice() }.expect("Metal device required");
+        let queue = device.newCommandQueue().unwrap();
         let event = GpuEvent::new(&device);
         let graph = ExecGraph::new(&queue, &event, 32);
 
@@ -430,14 +433,14 @@ mod tests {
 
     #[test]
     fn exec_graph_submit_batch() {
-        let device = metal::Device::system_default().expect("Metal device required");
-        let queue = device.new_command_queue();
+        let device = unsafe { MTLCreateSystemDefaultDevice() }.expect("Metal device required");
+        let queue = device.newCommandQueue().unwrap();
         let event = GpuEvent::new(&device);
         let mut graph = ExecGraph::new(&queue, &event, 32);
 
         // Encode a no-op and submit
         let enc = graph.encoder();
-        enc.end_encoding();
+        enc.endEncoding();
         graph.end_encoder();
         let t1 = graph.submit_batch();
 
@@ -448,28 +451,28 @@ mod tests {
 
     #[test]
     fn exec_graph_chained_batches() {
-        let device = metal::Device::system_default().expect("Metal device required");
-        let queue = device.new_command_queue();
+        let device = unsafe { MTLCreateSystemDefaultDevice() }.expect("Metal device required");
+        let queue = device.newCommandQueue().unwrap();
         let event = GpuEvent::new(&device);
         let mut graph = ExecGraph::new(&queue, &event, 32);
 
         // Batch 1
         let enc = graph.encoder();
-        enc.end_encoding();
+        enc.endEncoding();
         graph.end_encoder();
         let t1 = graph.submit_batch();
 
         // Batch 2 waits for batch 1
         graph.wait_for(t1);
         let enc = graph.encoder();
-        enc.end_encoding();
+        enc.endEncoding();
         graph.end_encoder();
         let t2 = graph.submit_batch();
 
         // Batch 3 waits for batch 2
         graph.wait_for(t2);
         let enc = graph.encoder();
-        enc.end_encoding();
+        enc.endEncoding();
         graph.end_encoder();
         let _t3 = graph.submit_batch();
 
@@ -482,13 +485,13 @@ mod tests {
 
     #[test]
     fn exec_graph_sync_and_reset() {
-        let device = metal::Device::system_default().expect("Metal device required");
-        let queue = device.new_command_queue();
+        let device = unsafe { MTLCreateSystemDefaultDevice() }.expect("Metal device required");
+        let queue = device.newCommandQueue().unwrap();
         let event = GpuEvent::new(&device);
         let mut graph = ExecGraph::new(&queue, &event, 32);
 
         let enc = graph.encoder();
-        enc.end_encoding();
+        enc.endEncoding();
         graph.end_encoder();
         let _token = graph.submit_batch();
 
@@ -499,8 +502,8 @@ mod tests {
 
     #[test]
     fn exec_graph_sync_empty() {
-        let device = metal::Device::system_default().expect("Metal device required");
-        let queue = device.new_command_queue();
+        let device = unsafe { MTLCreateSystemDefaultDevice() }.expect("Metal device required");
+        let queue = device.newCommandQueue().unwrap();
         let event = GpuEvent::new(&device);
         let mut graph = ExecGraph::new(&queue, &event, 32);
 
@@ -511,8 +514,8 @@ mod tests {
 
     #[test]
     fn submit_batch_no_pending_returns_previous_token() {
-        let device = metal::Device::system_default().expect("Metal device required");
-        let queue = device.new_command_queue();
+        let device = unsafe { MTLCreateSystemDefaultDevice() }.expect("Metal device required");
+        let queue = device.newCommandQueue().unwrap();
         let event = GpuEvent::new(&device);
         let mut graph = ExecGraph::new(&queue, &event, 32);
 
@@ -525,7 +528,7 @@ mod tests {
 
         // Now do real work and submit
         let enc = graph.encoder();
-        enc.end_encoding();
+        enc.endEncoding();
         graph.end_encoder();
         let t1 = graph.submit_batch();
         assert_eq!(t1.value(), 1);
@@ -540,8 +543,8 @@ mod tests {
 
     #[test]
     fn wait_for_empty_submit_completes_immediately() {
-        let device = metal::Device::system_default().expect("Metal device required");
-        let queue = device.new_command_queue();
+        let device = unsafe { MTLCreateSystemDefaultDevice() }.expect("Metal device required");
+        let queue = device.newCommandQueue().unwrap();
         let event = GpuEvent::new(&device);
         let mut graph = ExecGraph::new(&queue, &event, 32);
 
@@ -556,15 +559,15 @@ mod tests {
 
     #[test]
     fn exec_graph_stats() {
-        let device = metal::Device::system_default().expect("Metal device required");
-        let queue = device.new_command_queue();
+        let device = unsafe { MTLCreateSystemDefaultDevice() }.expect("Metal device required");
+        let queue = device.newCommandQueue().unwrap();
         let event = GpuEvent::new(&device);
         let mut graph = ExecGraph::new(&queue, &event, 32);
 
         // Batch 1: 3 encoders
         for _ in 0..3 {
             let enc = graph.encoder();
-            enc.end_encoding();
+            enc.endEncoding();
             graph.end_encoder();
         }
         let _ = graph.submit_batch();
@@ -572,7 +575,7 @@ mod tests {
         // Batch 2: 2 encoders
         for _ in 0..2 {
             let enc = graph.encoder();
-            enc.end_encoding();
+            enc.endEncoding();
             graph.end_encoder();
         }
         let _ = graph.submit_batch();
@@ -586,8 +589,8 @@ mod tests {
 
     #[test]
     fn chunked_pipeline_defers_submit() {
-        let device = metal::Device::system_default().expect("Metal device required");
-        let queue = device.new_command_queue();
+        let device = unsafe { MTLCreateSystemDefaultDevice() }.expect("Metal device required");
+        let queue = device.newCommandQueue().unwrap();
         let event = GpuEvent::new(&device);
         // Set max_ops_per_batch to 20 — submit_batch() won't commit until 20 ops
         let mut graph = ExecGraph::new(&queue, &event, 64).with_max_ops_per_batch(20);
@@ -595,7 +598,7 @@ mod tests {
         // Simulate 2 "layers" of 9 ops each (total 18 < 20)
         for _ in 0..2 {
             let enc = graph.encoder();
-            enc.end_encoding();
+            enc.endEncoding();
             graph.end_encoder();
             // submit_batch should be a no-op (below threshold)
             let t = graph.submit_batch();
@@ -608,7 +611,7 @@ mod tests {
 
         // One more "layer" (9 ops) — record_ops should auto-submit at 27 >= 20
         let enc = graph.encoder();
-        enc.end_encoding();
+        enc.endEncoding();
         graph.end_encoder();
         let auto_token = graph.record_ops(9);
         assert!(auto_token.is_some()); // auto-submit triggered
@@ -620,13 +623,13 @@ mod tests {
 
     #[test]
     fn chunked_pipeline_force_submit_ignores_threshold() {
-        let device = metal::Device::system_default().expect("Metal device required");
-        let queue = device.new_command_queue();
+        let device = unsafe { MTLCreateSystemDefaultDevice() }.expect("Metal device required");
+        let queue = device.newCommandQueue().unwrap();
         let event = GpuEvent::new(&device);
         let mut graph = ExecGraph::new(&queue, &event, 64).with_max_ops_per_batch(50);
 
         let enc = graph.encoder();
-        enc.end_encoding();
+        enc.endEncoding();
         graph.end_encoder();
 
         // submit_batch is a no-op (0 ops < 50)
@@ -644,15 +647,15 @@ mod tests {
 
     #[test]
     fn chunked_pipeline_sync_flushes_remaining() {
-        let device = metal::Device::system_default().expect("Metal device required");
-        let queue = device.new_command_queue();
+        let device = unsafe { MTLCreateSystemDefaultDevice() }.expect("Metal device required");
+        let queue = device.newCommandQueue().unwrap();
         let event = GpuEvent::new(&device);
         let mut graph = ExecGraph::new(&queue, &event, 64).with_max_ops_per_batch(100);
 
         // Encode work but never hit threshold
         for _ in 0..5 {
             let enc = graph.encoder();
-            enc.end_encoding();
+            enc.endEncoding();
             graph.end_encoder();
             graph.record_ops(9);
         }

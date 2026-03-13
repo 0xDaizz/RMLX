@@ -1,5 +1,7 @@
 //! Startup self-check for Metal GPU capabilities.
 
+use objc2_metal::*;
+
 /// Result of running the Metal self-check.
 #[derive(Debug, Clone)]
 pub struct SelfCheckResult {
@@ -52,15 +54,15 @@ pub fn run_self_check() -> SelfCheckResult {
 
 /// Check if Metal is available by trying to get the default device.
 pub fn check_metal_support() -> bool {
-    metal::Device::system_default().is_some()
+    unsafe { MTLCreateSystemDefaultDevice() }.is_some()
 }
 
 /// Query max buffer length and max threadgroup memory from the default device.
 pub fn check_memory_limits() -> (u64, u64) {
-    match metal::Device::system_default() {
+    match unsafe { MTLCreateSystemDefaultDevice() } {
         Some(device) => {
-            let max_buf = device.max_buffer_length();
-            let max_tg = device.max_threadgroup_memory_length();
+            let max_buf = device.maxBufferLength() as u64;
+            let max_tg = device.maxThreadgroupMemoryLength() as u64;
             (max_buf, max_tg)
         }
         None => (0, 0),
@@ -69,10 +71,10 @@ pub fn check_memory_limits() -> (u64, u64) {
 
 /// Query GPU info strings and shared memory size.
 fn query_gpu_info() -> (String, String, u64) {
-    match metal::Device::system_default() {
+    match unsafe { MTLCreateSystemDefaultDevice() } {
         Some(device) => {
             let name = device.name().to_string();
-            let recommended = device.recommended_max_working_set_size();
+            let recommended = device.recommendedMaxWorkingSetSize() as u64;
             // Use device name as a proxy for family/version
             (name.clone(), name, recommended)
         }

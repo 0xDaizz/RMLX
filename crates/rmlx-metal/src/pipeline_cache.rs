@@ -18,15 +18,37 @@
 //! falling back to runtime MSL compilation.
 
 use std::collections::HashMap;
+use std::ffi::c_void;
 use std::fs;
 use std::path::PathBuf;
+use std::ptr::NonNull;
 use std::sync::RwLock;
 
-use metal::{CompileOptions, ComputePipelineState, FunctionConstantValues, Library, MTLDataType};
+use objc2::rc::Retained;
+use objc2::Message;
+use objc2::runtime::{AnyObject, ProtocolObject};
+use objc2::{msg_send, sel};
+use objc2_foundation::{NSString, NSURL};
+use objc2_metal::*;
 use sha2::{Digest, Sha256};
 
 use crate::pipeline::FunctionConstant;
+use crate::types::*;
 use crate::MetalError;
+
+/// Retain an unsized protocol-object reference into an owned `Retained`.
+///
+/// `Retained::retain()` requires `T: Sized` (it lives in `impl<T: Message>`),
+/// but `ProtocolObject<dyn MTLFoo>` is unsized.  We work around this by
+/// calling `objc_retain` directly and wrapping the result with `from_raw`,
+/// which *is* available for `T: ?Sized + Message`.
+fn retain_proto<T: ?Sized + Message>(r: &T) -> Retained<T> {
+    let ptr = r as *const T as *mut T;
+    unsafe {
+        objc2::ffi::objc_retain(ptr as *mut _);
+        Retained::from_raw(ptr).unwrap_unchecked()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // DiskPipelineCache
@@ -42,7 +64,7 @@ use crate::MetalError;
 /// An in-memory layer (`HashMap`) avoids redundant disk reads within the same
 /// process lifetime.
 pub struct DiskPipelineCache {
-    device: metal::Device,
+    device: MtlDevice,
     cache_dir: PathBuf,
     /// In-memory cache: cache-key -> (Library, HashMap<function_name, PSO>)
     memory: RwLock<HashMap<String, CacheEntry>>,
@@ -52,25 +74,19 @@ struct CacheEntry {
     /// Retained so the library (and its functions) stay alive as long as the
     /// PSOs that reference them.
     #[allow(dead_code)]
-    library: Library,
-    pipelines: HashMap<String, ComputePipelineState>,
+    library: MtlLibrary,
+    pipelines: HashMap<String, MtlPipeline>,
 }
-
-// SAFETY: `metal::Device`, `Library`, and `ComputePipelineState` are Obj-C
-// objects that are internally reference-counted and thread-safe.  The `RwLock`
-// provides Rust-side synchronization.
-unsafe impl Send for DiskPipelineCache {}
-unsafe impl Sync for DiskPipelineCache {}
 
 impl DiskPipelineCache {
     /// Create a new disk pipeline cache for the given device.
     ///
     /// The cache directory defaults to `~/.cache/rmlx/pipelines/`.
     /// It is created lazily on the first cache miss.
-    pub fn new(device: &metal::Device) -> Self {
+    pub fn new(device: &ProtocolObject<dyn MTLDevice>) -> Self {
         let cache_dir = default_cache_dir();
         Self {
-            device: device.clone(),
+            device: retain_proto(device),
             cache_dir,
             memory: RwLock::new(HashMap::new()),
         }
@@ -79,9 +95,12 @@ impl DiskPipelineCache {
     /// Create a disk pipeline cache with a custom cache directory.
     ///
     /// Useful for testing or non-standard deployments.
-    pub fn with_cache_dir(device: &metal::Device, cache_dir: PathBuf) -> Self {
+    pub fn with_cache_dir(
+        device: &ProtocolObject<dyn MTLDevice>,
+        cache_dir: PathBuf,
+    ) -> Self {
         Self {
-            device: device.clone(),
+            device: retain_proto(device),
             cache_dir,
             memory: RwLock::new(HashMap::new()),
         }
@@ -104,7 +123,7 @@ impl DiskPipelineCache {
         source: &str,
         function_name: &str,
         constants: &[(u32, FunctionConstant)],
-    ) -> Result<ComputePipelineState, MetalError> {
+    ) -> Result<MtlPipeline, MetalError> {
         let cache_key = compute_cache_key(source, function_name, constants);
 
         // --- In-memory fast path (read lock) ---
@@ -114,7 +133,7 @@ impl DiskPipelineCache {
             })?;
             if let Some(entry) = mem.get(&cache_key) {
                 if let Some(pso) = entry.pipelines.get(function_name) {
-                    return Ok(pso.clone());
+                    return Ok(retain_proto(&**pso));
                 }
             }
         }
@@ -127,7 +146,7 @@ impl DiskPipelineCache {
         // Double-check after acquiring write lock.
         if let Some(entry) = mem.get(&cache_key) {
             if let Some(pso) = entry.pipelines.get(function_name) {
-                return Ok(pso.clone());
+                return Ok(retain_proto(&**pso));
             }
         }
 
@@ -147,7 +166,7 @@ impl DiskPipelineCache {
         // Create PSO from the library.
         let pso = self.create_pso(&library, function_name, constants)?;
 
-        let cloned = pso.clone();
+        let cloned = retain_proto(&*pso);
         let entry = mem.entry(cache_key).or_insert_with(|| CacheEntry {
             library,
             pipelines: HashMap::new(),
@@ -178,17 +197,23 @@ impl DiskPipelineCache {
     // Internal helpers
     // -----------------------------------------------------------------------
 
-    fn compile_source(&self, source: &str) -> Result<Library, MetalError> {
-        let options = CompileOptions::new();
+    fn compile_source(&self, source: &str) -> Result<MtlLibrary, MetalError> {
+        let options = MTLCompileOptions::new();
         self.device
-            .new_library_with_source(source, &options)
-            .map_err(|e| MetalError::ShaderCompile(e.to_string()))
+            .newLibraryWithSource_options_error(&NSString::from_str(source), Some(&options))
+            .map_err(|e| MetalError::ShaderCompile(e.localizedDescription().to_string()))
     }
 
-    fn load_library_from_disk(&self, path: &std::path::Path) -> Result<Library, MetalError> {
+    fn load_library_from_disk(&self, path: &std::path::Path) -> Result<MtlLibrary, MetalError> {
+        let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
         self.device
-            .new_library_with_file(path)
-            .map_err(|e| MetalError::LibraryLoad(format!("failed to load cached metallib: {e}")))
+            .newLibraryWithURL_error(&url)
+            .map_err(|e| {
+                MetalError::LibraryLoad(format!(
+                    "failed to load cached metallib: {}",
+                    e.localizedDescription()
+                ))
+            })
     }
 
     /// Serialize a compiled library to disk using Obj-C
@@ -197,7 +222,7 @@ impl DiskPipelineCache {
     /// Returns `Ok(())` on success or if the API is not available (best-effort).
     fn persist_library_to_disk(
         &self,
-        library: &Library,
+        library: &ProtocolObject<dyn MTLLibrary>,
         path: &std::path::Path,
     ) -> Result<(), MetalError> {
         // Ensure cache directory exists.
@@ -206,51 +231,23 @@ impl DiskPipelineCache {
                 .map_err(|e| MetalError::LibraryLoad(format!("failed to create cache dir: {e}")))?;
         }
 
-        // Call [MTLLibrary serializeToURL:error:] via objc::msg_send!
-        // This API is available on macOS 14.0+ / iOS 17.0+.
-        // We check at runtime via respondsToSelector:.
-        let path_str = path.to_string_lossy();
-        let url_string = format!("file://{path_str}");
+        let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
 
         unsafe {
-            // Create NSString for the URL string.
-            let c_url_string = std::ffi::CString::new(url_string.as_str())
-                .map_err(|e| MetalError::LibraryLoad(format!("invalid URL string: {e}")))?;
-            let nsstring_class = objc::runtime::Class::get("NSString")
-                .ok_or_else(|| MetalError::LibraryLoad("NSString class not found".to_string()))?;
-            let ns_url_string: *mut objc::runtime::Object = msg_send![
-                nsstring_class,
-                stringWithUTF8String: c_url_string.as_ptr()
-            ];
-
-            // Create NSURL from the string.
-            let nsurl_class = objc::runtime::Class::get("NSURL")
-                .ok_or_else(|| MetalError::LibraryLoad("NSURL class not found".to_string()))?;
-            let url: *mut objc::runtime::Object =
-                msg_send![nsurl_class, URLWithString: ns_url_string];
-            if url.is_null() {
-                return Err(MetalError::LibraryLoad(format!(
-                    "failed to create NSURL from: {url_string}"
-                )));
-            }
-
-            // Get a reference to LibraryRef (which implements Message).
-            let lib_ref: &metal::LibraryRef = library;
-
             // Check if the library responds to serializeToURL:error:
-            let sel = objc::runtime::Sel::register("serializeToURL:error:");
-            let responds: bool = msg_send![lib_ref, respondsToSelector: sel];
+            let sel = sel!(serializeToURL:error:);
+            let responds: bool = msg_send![library, respondsToSelector: sel];
             if !responds {
                 // API not available on this macOS version — skip silently.
                 return Ok(());
             }
 
-            let mut err: *mut objc::runtime::Object = std::ptr::null_mut();
-            let _result: bool = msg_send![lib_ref, serializeToURL: url error: &mut err];
+            let mut err: *mut AnyObject = std::ptr::null_mut();
+            let _result: bool = msg_send![library, serializeToURL: &*url, error: &mut err];
 
             if !err.is_null() {
-                let desc: *mut objc::runtime::Object = msg_send![err, localizedDescription];
-                let c_msg: *const std::os::raw::c_char = msg_send![desc, UTF8String];
+                let desc: *mut AnyObject = msg_send![&*err, localizedDescription];
+                let c_msg: *const std::os::raw::c_char = msg_send![&*desc, UTF8String];
                 let message = std::ffi::CStr::from_ptr(c_msg)
                     .to_string_lossy()
                     .into_owned();
@@ -265,50 +262,60 @@ impl DiskPipelineCache {
 
     fn create_pso(
         &self,
-        library: &Library,
+        library: &ProtocolObject<dyn MTLLibrary>,
         function_name: &str,
         constants: &[(u32, FunctionConstant)],
-    ) -> Result<ComputePipelineState, MetalError> {
+    ) -> Result<MtlPipeline, MetalError> {
         let function = if constants.is_empty() {
             library
-                .get_function(function_name, None)
-                .map_err(|_| MetalError::KernelNotFound(function_name.to_string()))?
+                .newFunctionWithName(&NSString::from_str(function_name))
+                .ok_or_else(|| MetalError::KernelNotFound(function_name.to_string()))?
         } else {
-            let fcv = FunctionConstantValues::new();
+            let fcv = MTLFunctionConstantValues::new();
             for (index, constant) in constants {
                 match constant {
                     FunctionConstant::Bool(v) => {
                         let val: u8 = u8::from(*v);
-                        fcv.set_constant_value_at_index(
-                            &val as *const u8 as *const std::ffi::c_void,
-                            MTLDataType::Bool,
-                            *index as u64,
-                        );
+                        unsafe {
+                            fcv.setConstantValue_type_atIndex(
+                                NonNull::new(&val as *const u8 as *mut c_void).unwrap(),
+                                MTLDataType::Bool,
+                                *index as usize,
+                            );
+                        }
                     }
                     FunctionConstant::U32(v) => {
-                        fcv.set_constant_value_at_index(
-                            v as *const u32 as *const std::ffi::c_void,
-                            MTLDataType::UInt,
-                            *index as u64,
-                        );
+                        unsafe {
+                            fcv.setConstantValue_type_atIndex(
+                                NonNull::new(v as *const u32 as *mut c_void).unwrap(),
+                                MTLDataType::UInt,
+                                *index as usize,
+                            );
+                        }
                     }
                     FunctionConstant::F32(v) => {
-                        fcv.set_constant_value_at_index(
-                            v as *const f32 as *const std::ffi::c_void,
-                            MTLDataType::Float,
-                            *index as u64,
-                        );
+                        unsafe {
+                            fcv.setConstantValue_type_atIndex(
+                                NonNull::new(v as *const f32 as *mut c_void).unwrap(),
+                                MTLDataType::Float,
+                                *index as usize,
+                            );
+                        }
                     }
                 }
             }
-            library
-                .get_function(function_name, Some(fcv))
-                .map_err(|_| MetalError::KernelNotFound(function_name.to_string()))?
+            unsafe {
+                library.newFunctionWithName_constantValues_error(
+                    &NSString::from_str(function_name),
+                    &fcv,
+                )
+            }
+            .map_err(|_| MetalError::KernelNotFound(function_name.to_string()))?
         };
 
         self.device
-            .new_compute_pipeline_state_with_function(&function)
-            .map_err(|e| MetalError::PipelineCreate(e.to_string()))
+            .newComputePipelineStateWithFunction_error(&function)
+            .map_err(|e| MetalError::PipelineCreate(e.localizedDescription().to_string()))
     }
 }
 
@@ -370,6 +377,7 @@ fn compute_cache_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use objc2_metal::MTLCreateSystemDefaultDevice;
 
     const TEST_KERNEL_SOURCE: &str = r#"
         #include <metal_stdlib>
@@ -421,7 +429,7 @@ mod tests {
 
     #[test]
     fn test_new_cache_is_empty() {
-        let device = metal::Device::system_default().unwrap();
+        let device = MTLCreateSystemDefaultDevice().unwrap();
         let cache = DiskPipelineCache::new(&device);
         assert!(cache.is_empty());
         assert_eq!(cache.len(), 0);
@@ -429,7 +437,7 @@ mod tests {
 
     #[test]
     fn test_cache_dir_creation() {
-        let device = metal::Device::system_default().unwrap();
+        let device = MTLCreateSystemDefaultDevice().unwrap();
         let tmp = std::env::temp_dir().join(format!("rmlx_test_{}", std::process::id()));
         let cache_dir = tmp.join("rmlx_test_pipelines");
 
@@ -449,7 +457,7 @@ mod tests {
 
     #[test]
     fn test_cold_miss_compiles_and_stores() {
-        let device = metal::Device::system_default().unwrap();
+        let device = MTLCreateSystemDefaultDevice().unwrap();
         let tmp = std::env::temp_dir().join(format!("rmlx_cold_{}", std::process::id()));
         let cache_dir = tmp.join("pipelines");
         let cache = DiskPipelineCache::with_cache_dir(&device, cache_dir.clone());
@@ -472,7 +480,7 @@ mod tests {
         }
 
         // PSO should be usable (non-null max total threads).
-        assert!(pso.max_total_threads_per_threadgroup() > 0);
+        assert!(pso.maxTotalThreadsPerThreadgroup() > 0);
 
         // Cleanup
         let _ = fs::remove_dir_all(&tmp);
@@ -480,7 +488,7 @@ mod tests {
 
     #[test]
     fn test_warm_hit_loads_from_disk() {
-        let device = metal::Device::system_default().unwrap();
+        let device = MTLCreateSystemDefaultDevice().unwrap();
         let tmp = std::env::temp_dir().join(format!("rmlx_warm_{}", std::process::id()));
         let cache_dir = tmp.join("pipelines");
 
@@ -509,7 +517,7 @@ mod tests {
             let pso = cache
                 .get_or_compile(TEST_KERNEL_SOURCE, "test_add", &[])
                 .unwrap();
-            assert!(pso.max_total_threads_per_threadgroup() > 0);
+            assert!(pso.maxTotalThreadsPerThreadgroup() > 0);
             assert_eq!(cache.len(), 1);
         }
 
@@ -519,7 +527,7 @@ mod tests {
 
     #[test]
     fn test_in_memory_hit() {
-        let device = metal::Device::system_default().unwrap();
+        let device = MTLCreateSystemDefaultDevice().unwrap();
         let tmp = std::env::temp_dir().join(format!("rmlx_mem_{}", std::process::id()));
         let cache_dir = tmp.join("pipelines");
         let cache = DiskPipelineCache::with_cache_dir(&device, cache_dir);
@@ -533,7 +541,7 @@ mod tests {
         let pso = cache
             .get_or_compile(TEST_KERNEL_SOURCE, "test_add", &[])
             .unwrap();
-        assert!(pso.max_total_threads_per_threadgroup() > 0);
+        assert!(pso.maxTotalThreadsPerThreadgroup() > 0);
         assert_eq!(cache.len(), 1);
 
         // Cleanup
@@ -542,7 +550,7 @@ mod tests {
 
     #[test]
     fn test_clear_memory() {
-        let device = metal::Device::system_default().unwrap();
+        let device = MTLCreateSystemDefaultDevice().unwrap();
         let tmp = std::env::temp_dir().join(format!("rmlx_clr_{}", std::process::id()));
         let cache = DiskPipelineCache::with_cache_dir(&device, tmp.join("p"));
 
@@ -560,7 +568,7 @@ mod tests {
 
     #[test]
     fn test_invalid_source_returns_error() {
-        let device = metal::Device::system_default().unwrap();
+        let device = MTLCreateSystemDefaultDevice().unwrap();
         let tmp = std::env::temp_dir().join(format!("rmlx_inv_{}", std::process::id()));
         let cache = DiskPipelineCache::with_cache_dir(&device, tmp.join("p"));
 

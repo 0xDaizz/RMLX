@@ -21,6 +21,10 @@
 
 use std::marker::PhantomData;
 
+use objc2::rc::Retained;
+use objc2::runtime::AnyObject;
+use objc2::{class, msg_send};
+
 /// RAII autorelease pool wrapper.
 ///
 /// Creates an `NSAutoreleasePool` on construction and drains it on drop.
@@ -34,8 +38,8 @@ use std::marker::PhantomData;
 /// `NSAutoreleasePool` is a per-thread construct in Objective-C.
 /// The `PhantomData<*mut ()>` marker enforces this at the type level.
 pub struct ScopedPool {
-    // Raw pointer to the NSAutoreleasePool Objective-C object.
-    pool: *mut objc::runtime::Object,
+    // Retained handle to the NSAutoreleasePool Objective-C object.
+    pool: Retained<AnyObject>,
     // Marker to enforce !Send and !Sync (raw pointers are !Send + !Sync).
     _marker: PhantomData<*mut ()>,
 }
@@ -48,14 +52,9 @@ impl ScopedPool {
     /// is dropped.
     pub fn new() -> Self {
         // SAFETY: NSAutoreleasePool is a well-known Foundation class.
-        // `alloc` + `init` is the standard Obj-C construction pattern.
-        let pool: *mut objc::runtime::Object = unsafe {
-            let cls = objc::runtime::Class::get("NSAutoreleasePool")
-                .expect("NSAutoreleasePool class not found");
-            let pool: *mut objc::runtime::Object = objc::msg_send![cls, alloc];
-            let pool: *mut objc::runtime::Object = objc::msg_send![pool, init];
-            pool
-        };
+        // `msg_send_id![class, new]` performs alloc+init and returns a Retained.
+        let pool: Retained<AnyObject> =
+            unsafe { msg_send![class!(NSAutoreleasePool), new] };
         Self {
             pool,
             _marker: PhantomData,
@@ -73,7 +72,7 @@ impl Drop for ScopedPool {
     fn drop(&mut self) {
         // SAFETY: We own the pool and drain it exactly once.
         unsafe {
-            let _: () = objc::msg_send![self.pool, drain];
+            let _: () = msg_send![&*self.pool, drain];
         }
     }
 }
@@ -133,9 +132,11 @@ mod tests {
     fn test_scoped_pool_with_metal_objects() {
         // Create Metal objects inside a pool to verify no crash.
         let _pool = ScopedPool::new();
-        let device = metal::Device::system_default().unwrap();
-        let _queue = device.new_command_queue();
-        let _buf = device.new_buffer(256, metal::MTLResourceOptions::StorageModeShared);
+        let device = unsafe { objc2_metal::MTLCreateSystemDefaultDevice() }.unwrap();
+        let _queue = device.newCommandQueue().unwrap();
+        let _buf = device
+            .newBufferWithLength_options(256, objc2_metal::MTLResourceOptions::StorageModeShared)
+            .unwrap();
         // Pool drains, releasing any autoreleased intermediates.
     }
 }

@@ -12,11 +12,25 @@
 
 use std::collections::HashMap;
 
-use metal::{CommandBuffer, CommandQueue, Device};
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2::Message;
+use objc2_foundation::NSString;
+use objc2_metal::*;
 
 use crate::command::CommandBufferManager;
 use crate::fence::GpuFence;
+use crate::types::*;
 use crate::MetalError;
+
+/// Retain an unsized protocol-object reference into an owned `Retained`.
+fn retain_proto<T: ?Sized + Message>(r: &T) -> Retained<T> {
+    let ptr = r as *const T as *mut T;
+    unsafe {
+        objc2::ffi::objc_retain(ptr as *mut _);
+        Retained::from_raw(ptr).unwrap_unchecked()
+    }
+}
 
 /// Well-known stream IDs.
 pub const STREAM_DEFAULT: u32 = 0;
@@ -25,9 +39,9 @@ pub const STREAM_COPY: u32 = 2;
 
 /// State for a single stream: its command queue and label.
 struct StreamState {
-    queue: CommandQueue,
+    queue: MtlQueue,
     /// Human-readable label for debugging / GPU profiler output.
-    /// Wired to [`CommandQueue::set_label`] so it appears in Metal GPU profiler traces.
+    /// Wired to the queue's label so it appears in Metal GPU profiler traces.
     /// The field itself is not read by Rust code but is kept for diagnostics.
     #[allow(dead_code)]
     label: String,
@@ -36,9 +50,9 @@ struct StreamState {
 impl StreamState {
     /// Create a new stream state, wiring the label to the Metal `CommandQueue`
     /// so it shows up in GPU profiler / capture traces.
-    fn new(device: &Device, label: &str) -> Self {
-        let queue = device.new_command_queue();
-        queue.set_label(label);
+    fn new(device: &ProtocolObject<dyn MTLDevice>, label: &str) -> Self {
+        let queue = device.newCommandQueue().unwrap();
+        queue.setLabel(Some(&NSString::from_str(label)));
         Self {
             queue,
             label: label.to_string(),
@@ -49,18 +63,11 @@ impl StreamState {
 /// Multi-stream manager supporting N named command queues with
 /// cross-stream synchronization via [`GpuFence`].
 pub struct StreamManager {
-    device: Device,
+    device: MtlDevice,
     streams: HashMap<u32, StreamState>,
     /// Shared fence used for `synchronize()` calls between streams.
     sync_fence: GpuFence,
 }
-
-// SAFETY: Metal CommandQueue and Device are Objective-C objects that are
-// internally reference-counted and thread-safe. HashMap is only accessed
-// via &self or &mut self which Rust enforces at compile time.
-// GpuFence is already Send + Sync.
-unsafe impl Send for StreamManager {}
-unsafe impl Sync for StreamManager {}
 
 /// Cross-stream synchronization helper.
 ///
@@ -73,7 +80,7 @@ pub struct StreamSync {
 
 impl StreamSync {
     /// Create a new stream synchronization primitive on `device`.
-    pub fn new(device: &metal::Device) -> Self {
+    pub fn new(device: &ProtocolObject<dyn MTLDevice>) -> Self {
         Self {
             fence: GpuFence::new(device),
         }
@@ -82,28 +89,42 @@ impl StreamSync {
     /// Signal from a compute command buffer after compute work completes.
     ///
     /// Returns the signal value that the copy stream should wait on.
-    pub fn signal_from_compute(&self, compute_cb: &metal::CommandBufferRef) -> u64 {
+    pub fn signal_from_compute(
+        &self,
+        compute_cb: &ProtocolObject<dyn MTLCommandBuffer>,
+    ) -> u64 {
         let value = self.fence.next_value();
         self.fence.signal(compute_cb, value);
         value
     }
 
     /// Wait on a copy command buffer until compute signals the given value.
-    pub fn wait_on_copy(&self, copy_cb: &metal::CommandBufferRef, value: u64) {
+    pub fn wait_on_copy(
+        &self,
+        copy_cb: &ProtocolObject<dyn MTLCommandBuffer>,
+        value: u64,
+    ) {
         self.fence.wait(copy_cb, value);
     }
 
     /// Signal from a copy command buffer after copy/transfer completes.
     ///
     /// Returns the signal value that the compute stream should wait on.
-    pub fn signal_from_copy(&self, copy_cb: &metal::CommandBufferRef) -> u64 {
+    pub fn signal_from_copy(
+        &self,
+        copy_cb: &ProtocolObject<dyn MTLCommandBuffer>,
+    ) -> u64 {
         let value = self.fence.next_value();
         self.fence.signal(copy_cb, value);
         value
     }
 
     /// Wait on a compute command buffer until copy signals the given value.
-    pub fn wait_on_compute(&self, compute_cb: &metal::CommandBufferRef, value: u64) {
+    pub fn wait_on_compute(
+        &self,
+        compute_cb: &ProtocolObject<dyn MTLCommandBuffer>,
+        value: u64,
+    ) {
         self.fence.wait(compute_cb, value);
     }
 
@@ -118,7 +139,7 @@ impl StreamManager {
     ///
     /// Automatically creates the three predefined streams
     /// (`STREAM_DEFAULT`, `STREAM_COMPUTE`, `STREAM_COPY`).
-    pub fn new(device: &Device) -> Self {
+    pub fn new(device: &ProtocolObject<dyn MTLDevice>) -> Self {
         let mut streams = HashMap::new();
 
         streams.insert(STREAM_DEFAULT, StreamState::new(device, "default"));
@@ -128,7 +149,7 @@ impl StreamManager {
         let sync_fence = GpuFence::new(device);
 
         Self {
-            device: device.clone(),
+            device: retain_proto(device),
             streams,
             sync_fence,
         }
@@ -138,7 +159,10 @@ impl StreamManager {
     ///
     /// If the stream already exists, returns its command queue.
     /// Otherwise, creates a new queue on the device and inserts it.
-    pub fn get_or_create_stream(&mut self, id: u32) -> &CommandQueue {
+    pub fn get_or_create_stream(
+        &mut self,
+        id: u32,
+    ) -> &ProtocolObject<dyn MTLCommandQueue> {
         let device = &self.device;
         let state = self
             .streams
@@ -150,15 +174,15 @@ impl StreamManager {
     /// Get the command queue for an existing stream.
     ///
     /// Returns `None` if the stream has not been created yet.
-    pub fn queue(&self, id: u32) -> Option<&CommandQueue> {
-        self.streams.get(&id).map(|s| &s.queue)
+    pub fn queue(&self, id: u32) -> Option<&ProtocolObject<dyn MTLCommandQueue>> {
+        self.streams.get(&id).map(|s| &*s.queue as &ProtocolObject<dyn MTLCommandQueue>)
     }
 
     /// Create a command buffer on the given stream.
     ///
     /// Returns an error if `stream_id` does not exist (use `get_or_create_stream`
     /// first or stick to the predefined IDs).
-    pub fn command_buffer(&self, stream_id: u32) -> Result<CommandBuffer, MetalError> {
+    pub fn command_buffer(&self, stream_id: u32) -> Result<MtlCB, MetalError> {
         let state = self.streams.get(&stream_id).ok_or_else(|| {
             MetalError::KernelNotFound(format!("stream {stream_id} does not exist"))
         })?;
@@ -190,8 +214,8 @@ impl StreamManager {
     /// encoded on `dst_cb` after this call begin executing.
     pub fn synchronize(
         &self,
-        src_cb: &metal::CommandBufferRef,
-        dst_cb: &metal::CommandBufferRef,
+        src_cb: &ProtocolObject<dyn MTLCommandBuffer>,
+        dst_cb: &ProtocolObject<dyn MTLCommandBuffer>,
     ) -> u64 {
         let value = self.sync_fence.next_value();
         self.sync_fence.signal(src_cb, value);
@@ -205,23 +229,23 @@ impl StreamManager {
     }
 
     /// Convenience: get the compute queue.
-    pub fn compute_queue(&self) -> &CommandQueue {
+    pub fn compute_queue(&self) -> &ProtocolObject<dyn MTLCommandQueue> {
         self.queue(STREAM_COMPUTE)
             .expect("STREAM_COMPUTE not found")
     }
 
     /// Convenience: get the transfer/copy queue.
-    pub fn transfer_queue(&self) -> &CommandQueue {
+    pub fn transfer_queue(&self) -> &ProtocolObject<dyn MTLCommandQueue> {
         self.queue(STREAM_COPY).expect("STREAM_COPY not found")
     }
 
     /// Create a command buffer on the compute stream.
-    pub fn compute_command_buffer(&self) -> Result<CommandBuffer, MetalError> {
+    pub fn compute_command_buffer(&self) -> Result<MtlCB, MetalError> {
         self.command_buffer(STREAM_COMPUTE)
     }
 
     /// Create a command buffer on the copy/transfer stream.
-    pub fn transfer_command_buffer(&self) -> Result<CommandBuffer, MetalError> {
+    pub fn transfer_command_buffer(&self) -> Result<MtlCB, MetalError> {
         self.command_buffer(STREAM_COPY)
     }
 
@@ -229,8 +253,8 @@ impl StreamManager {
     /// Returns the signal value used for synchronization.
     pub fn sync_transfer_after_compute(
         &self,
-        compute_cb: &metal::CommandBufferRef,
-        transfer_cb: &metal::CommandBufferRef,
+        compute_cb: &ProtocolObject<dyn MTLCommandBuffer>,
+        transfer_cb: &ProtocolObject<dyn MTLCommandBuffer>,
     ) -> u64 {
         self.synchronize(compute_cb, transfer_cb)
     }
@@ -238,8 +262,8 @@ impl StreamManager {
     /// Insert a dependency: compute waits for transfer to complete.
     pub fn sync_compute_after_transfer(
         &self,
-        transfer_cb: &metal::CommandBufferRef,
-        compute_cb: &metal::CommandBufferRef,
+        transfer_cb: &ProtocolObject<dyn MTLCommandBuffer>,
+        compute_cb: &ProtocolObject<dyn MTLCommandBuffer>,
     ) -> u64 {
         self.synchronize(transfer_cb, compute_cb)
     }
@@ -261,7 +285,7 @@ mod tests {
 
     #[test]
     fn test_predefined_streams_created() {
-        let device = metal::Device::system_default().unwrap();
+        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
         let mgr = StreamManager::new(&device);
 
         assert!(mgr.has_stream(STREAM_DEFAULT));
@@ -272,7 +296,7 @@ mod tests {
 
     #[test]
     fn test_get_or_create_new_stream() {
-        let device = metal::Device::system_default().unwrap();
+        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
         let mut mgr = StreamManager::new(&device);
 
         assert!(!mgr.has_stream(42));
@@ -283,7 +307,7 @@ mod tests {
 
     #[test]
     fn test_get_or_create_existing_stream() {
-        let device = metal::Device::system_default().unwrap();
+        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
         let mut mgr = StreamManager::new(&device);
 
         let _ = mgr.get_or_create_stream(STREAM_COMPUTE);
@@ -293,7 +317,7 @@ mod tests {
 
     #[test]
     fn test_command_buffer_creation() {
-        let device = metal::Device::system_default().unwrap();
+        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
         let mgr = StreamManager::new(&device);
 
         // Should not fail for predefined streams.
@@ -304,7 +328,7 @@ mod tests {
 
     #[test]
     fn test_synchronize_returns_monotonic_values() {
-        let device = metal::Device::system_default().unwrap();
+        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
         let mgr = StreamManager::new(&device);
 
         let cb1 = mgr.compute_command_buffer().unwrap();
@@ -321,7 +345,7 @@ mod tests {
 
     #[test]
     fn test_convenience_sync_methods() {
-        let device = metal::Device::system_default().unwrap();
+        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
         let mgr = StreamManager::new(&device);
 
         let compute_cb = mgr.compute_command_buffer().unwrap();
@@ -333,7 +357,7 @@ mod tests {
 
     #[test]
     fn test_compute_copy_queue_independence() {
-        let device = metal::Device::system_default().unwrap();
+        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
         let mgr = StreamManager::new(&device);
 
         // Compute and copy queues should be distinct objects.
@@ -341,25 +365,25 @@ mod tests {
         let copy_q = mgr.transfer_queue();
 
         // Create command buffers on each — both should succeed independently.
-        let compute_cb = compute_q.new_command_buffer().to_owned();
-        let copy_cb = copy_q.new_command_buffer().to_owned();
+        let compute_cb = compute_q.commandBuffer().unwrap();
+        let copy_cb = copy_q.commandBuffer().unwrap();
 
         // Encode no-ops on both and commit independently.
-        let enc1 = compute_cb.new_compute_command_encoder();
-        enc1.end_encoding();
+        let enc1 = compute_cb.computeCommandEncoder().unwrap();
+        enc1.endEncoding();
         compute_cb.commit();
 
-        let enc2 = copy_cb.new_blit_command_encoder();
-        enc2.end_encoding();
+        let enc2 = copy_cb.blitCommandEncoder().unwrap();
+        enc2.endEncoding();
         copy_cb.commit();
 
-        compute_cb.wait_until_completed();
-        copy_cb.wait_until_completed();
+        compute_cb.waitUntilCompleted();
+        copy_cb.waitUntilCompleted();
     }
 
     #[test]
     fn test_stream_sync_signal_wait() {
-        let device = metal::Device::system_default().unwrap();
+        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
         let mgr = StreamManager::new(&device);
         let sync = super::StreamSync::new(&device);
 
@@ -367,21 +391,21 @@ mod tests {
         let copy_cb = mgr.transfer_command_buffer().unwrap();
 
         // Encode a no-op compute, then signal.
-        let enc = compute_cb.new_compute_command_encoder();
-        enc.end_encoding();
+        let enc = compute_cb.computeCommandEncoder().unwrap();
+        enc.endEncoding();
         let value = sync.signal_from_compute(&compute_cb);
 
         // Copy waits for compute.
         sync.wait_on_copy(&copy_cb, value);
-        let enc2 = copy_cb.new_blit_command_encoder();
-        enc2.end_encoding();
+        let enc2 = copy_cb.blitCommandEncoder().unwrap();
+        enc2.endEncoding();
 
         // Commit both — copy should wait for compute signal.
         compute_cb.commit();
         copy_cb.commit();
 
-        compute_cb.wait_until_completed();
-        copy_cb.wait_until_completed();
+        compute_cb.waitUntilCompleted();
+        copy_cb.waitUntilCompleted();
 
         // Verify signal value was set.
         assert!(sync.fence().signaled_value() >= value);
@@ -398,7 +422,7 @@ mod tests {
 
     #[test]
     fn test_command_buffer_nonexistent_stream_fails() {
-        let device = metal::Device::system_default().unwrap();
+        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
         let mgr = StreamManager::new(&device);
 
         // Stream 999 was never created.
@@ -408,7 +432,7 @@ mod tests {
 
     #[test]
     fn test_queue_returns_none_for_missing_stream() {
-        let device = metal::Device::system_default().unwrap();
+        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
         let mgr = StreamManager::new(&device);
 
         assert!(mgr.queue(999).is_none());
@@ -424,7 +448,7 @@ mod tests {
 
     #[test]
     fn test_create_buffer_manager_success() {
-        let device = metal::Device::system_default().unwrap();
+        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
         let mgr = StreamManager::new(&device);
 
         let _bm = mgr.create_buffer_manager(STREAM_COMPUTE).unwrap();
@@ -433,7 +457,7 @@ mod tests {
 
     #[test]
     fn test_create_buffer_manager_nonexistent_stream() {
-        let device = metal::Device::system_default().unwrap();
+        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
         let mgr = StreamManager::new(&device);
 
         let result = mgr.create_buffer_manager(999);
@@ -442,7 +466,7 @@ mod tests {
 
     #[test]
     fn test_sync_fence_accessible() {
-        let device = metal::Device::system_default().unwrap();
+        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
         let mgr = StreamManager::new(&device);
 
         let fence = mgr.sync_fence();
@@ -452,7 +476,7 @@ mod tests {
 
     #[test]
     fn test_stream_sync_fence_accessor() {
-        let device = metal::Device::system_default().unwrap();
+        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
         let sync = StreamSync::new(&device);
         let fence = sync.fence();
         assert_eq!(fence.signaled_value(), 0);

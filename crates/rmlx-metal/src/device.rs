@@ -1,8 +1,9 @@
 //! Metal device abstraction
 
-use metal::Device as MTLDevice;
-use metal::{CommandBuffer, CommandQueue, MTLGPUFamily, MTLResourceOptions};
+use objc2::runtime::ProtocolObject;
+use objc2_metal::*;
 
+use crate::types::*;
 use crate::MetalError;
 
 /// Safe default: StorageModeShared only. Metal performs automatic hazard
@@ -15,9 +16,9 @@ pub const TRACKED_BUFFER_OPTIONS: MTLResourceOptions = MTLResourceOptions::Stora
 /// the RMLX barrier tracker (command-buffer ordering / MTLSharedEvent /
 /// MTLFence). Using this for buffers that bypass the barrier tracker
 /// will cause data races.
-pub const UNTRACKED_BUFFER_OPTIONS: MTLResourceOptions = MTLResourceOptions::from_bits_truncate(
-    MTLResourceOptions::StorageModeShared.bits()
-        | MTLResourceOptions::HazardTrackingModeUntracked.bits(),
+pub const UNTRACKED_BUFFER_OPTIONS: MTLResourceOptions = MTLResourceOptions(
+    MTLResourceOptions::StorageModeShared.0
+        | MTLResourceOptions::HazardTrackingModeUntracked.0,
 );
 
 /// Default buffer options — untracked for performance (MLX-compatible).
@@ -72,26 +73,27 @@ pub struct ChipTuning {
 }
 
 impl ChipTuning {
-    /// Detect chip capabilities from a `metal::Device` and return tuned values.
+    /// Detect chip capabilities from a Metal device and return tuned values.
     ///
     /// * M1 (Apple7): simd 32, TG mem 32 KB, no unretained refs
     /// * M2 (Apple8) / M3 (Apple9) / M4+: simd 32, TG mem 32 KB, unretained refs (Metal 3+)
     /// * Unknown: conservative defaults (simd 32, TG mem 16 KB, no unretained refs)
-    pub fn for_device(device: &metal::Device) -> Self {
-        let supports_metal3 = device.supports_family(MTLGPUFamily::Metal3);
+    pub fn for_device(device: &ProtocolObject<dyn MTLDevice>) -> Self {
+        let supports_metal3 = device.supportsFamily(MTLGPUFamily::Metal3);
 
         // Apple Silicon always has 32-wide SIMD and 32 KB TG memory.
         // For unknown/non-Apple devices we fall back to conservative values.
-        let is_apple = device.supports_family(MTLGPUFamily::Apple7)
-            || device.supports_family(MTLGPUFamily::Apple8)
-            || device.supports_family(MTLGPUFamily::Apple9);
+        let is_apple = device.supportsFamily(MTLGPUFamily::Apple7)
+            || device.supportsFamily(MTLGPUFamily::Apple8)
+            || device.supportsFamily(MTLGPUFamily::Apple9);
 
-        let arch = detect_architecture(device.name());
+        let device_name = device.name().to_string();
+        let arch = detect_architecture(&device_name);
         let generation = match arch {
             Architecture::Apple { generation } => generation,
             Architecture::Unknown => 0,
         };
-        let arch_class = detect_arch_class(device.name());
+        let arch_class = detect_arch_class(&device_name);
         let supports_nax =
             generation >= 17 && arch_class != ArchClass::Phone && arch_class != ArchClass::Unknown;
         let (max_ops, max_mb) = match arch_class {
@@ -139,7 +141,7 @@ impl ChipTuning {
     }
 
     /// Build a `ChipTuning` from a device-name string (for unit tests that
-    /// cannot instantiate a real `metal::Device`).
+    /// cannot instantiate a real Metal device).
     ///
     /// This is intentionally conservative: it mirrors the name-based
     /// `detect_architecture` heuristic and does *not* query the driver.
@@ -260,7 +262,7 @@ pub enum ArchClass {
 
 /// Thin wrapper around a Metal device that caches capability queries.
 pub struct GpuDevice {
-    device: MTLDevice,
+    device: MtlDevice,
     arch: Architecture,
     tuning: ChipTuning,
     max_buffer_length: u64,
@@ -271,12 +273,14 @@ pub struct GpuDevice {
 impl GpuDevice {
     /// Acquire the system default Metal device.
     pub fn system_default() -> Result<Self, MetalError> {
-        let device = MTLDevice::system_default().ok_or(MetalError::NoDevice)?;
-        let arch = detect_architecture(device.name());
+        let device = unsafe { MTLCreateSystemDefaultDevice() }.ok_or(MetalError::NoDevice)?;
+        let device_name = device.name().to_string();
+        let arch = detect_architecture(&device_name);
         let tuning = ChipTuning::for_device(&device);
+        // TODO: update StreamManager::new once stream.rs is converted to objc2-metal
         let stream_manager = crate::stream::StreamManager::new(&device);
-        let max_buffer_length = device.max_buffer_length();
-        let max_threadgroup_memory = device.max_threadgroup_memory_length();
+        let max_buffer_length = device.maxBufferLength() as u64;
+        let max_threadgroup_memory = device.maxThreadgroupMemoryLength() as u64;
 
         Ok(Self {
             device,
@@ -288,14 +292,14 @@ impl GpuDevice {
         })
     }
 
-    /// Access the underlying `metal::Device`.
-    pub fn raw(&self) -> &MTLDevice {
+    /// Access the underlying Metal device.
+    pub fn raw(&self) -> &ProtocolObject<dyn MTLDevice> {
         &self.device
     }
 
     /// Human-readable device name (e.g. "Apple M2 Max").
-    pub fn name(&self) -> &str {
-        self.device.name()
+    pub fn name(&self) -> String {
+        self.device.name().to_string()
     }
 
     /// Detected GPU architecture.
@@ -305,7 +309,7 @@ impl GpuDevice {
 
     /// Whether the device has unified memory (always true on Apple Silicon).
     pub fn has_unified_memory(&self) -> bool {
-        self.device.has_unified_memory()
+        self.device.hasUnifiedMemory()
     }
 
     /// Maximum single-buffer allocation size in bytes.
@@ -332,41 +336,47 @@ impl GpuDevice {
     /// this chip class.
     ///
     /// When `ChipTuning::supports_unretained_refs` is true (Metal 3+ / M2+),
-    /// uses `new_command_buffer_with_unretained_references()` which avoids
+    /// uses `commandBufferWithUnretainedReferences()` which avoids
     /// the retain/release overhead for every resource referenced by the CB.
-    /// Otherwise falls back to the standard `new_command_buffer()`.
+    /// Otherwise falls back to the standard `commandBuffer()`.
     ///
-    /// The returned `CommandBuffer` is *owned* (`.to_owned()`) so it is not
-    /// reclaimed by the autorelease pool before the caller commits it.
-    pub fn create_command_buffer(&self, queue: &CommandQueue) -> CommandBuffer {
+    /// The returned `MtlCB` is already owned (`Retained`).
+    pub fn create_command_buffer(&self, queue: &ProtocolObject<dyn MTLCommandQueue>) -> MtlCB {
         if self.tuning.supports_unretained_refs {
-            queue
-                .new_command_buffer_with_unretained_references()
-                .to_owned()
+            queue.commandBufferWithUnretainedReferences().unwrap()
         } else {
-            queue.new_command_buffer().to_owned()
+            queue.commandBuffer().unwrap()
         }
     }
 
     /// Create a new command queue on this device.
-    pub fn new_command_queue(&self) -> CommandQueue {
-        self.device.new_command_queue()
+    pub fn new_command_queue(&self) -> MtlQueue {
+        self.device.newCommandQueue().unwrap()
     }
 
     /// Allocate an uninitialized buffer of `size` bytes.
-    pub fn new_buffer(&self, size: u64, options: MTLResourceOptions) -> metal::Buffer {
-        self.device.new_buffer(size, options)
+    pub fn new_buffer(&self, size: u64, options: MTLResourceOptions) -> MtlBuffer {
+        self.device
+            .newBufferWithLength_options(size as usize, options)
+            .unwrap()
     }
 
     /// Allocate a buffer and initialize it from a typed slice.
     ///
     /// Uses the safe default [`DEFAULT_BUFFER_OPTIONS`] (`StorageModeShared`)
     /// so the buffer is CPU+GPU visible with Metal hazard tracking enabled.
-    pub fn new_buffer_with_data<T>(&self, data: &[T]) -> metal::Buffer {
-        let size = std::mem::size_of_val(data) as u64;
-        let ptr = data.as_ptr() as *const std::ffi::c_void;
-        self.device
-            .new_buffer_with_data(ptr, size, DEFAULT_BUFFER_OPTIONS)
+    pub fn new_buffer_with_data<T>(&self, data: &[T]) -> MtlBuffer {
+        let size = std::mem::size_of_val(data);
+        let ptr = data.as_ptr() as *mut std::ffi::c_void;
+        unsafe {
+            self.device
+                .newBufferWithBytes_length_options(
+                    std::ptr::NonNull::new(ptr).unwrap(),
+                    size,
+                    DEFAULT_BUFFER_OPTIONS,
+                )
+                .unwrap()
+        }
     }
 }
 
@@ -480,7 +490,7 @@ mod tests {
 
     #[test]
     fn test_chip_tuning_for_device_runs() {
-        let device = metal::Device::system_default().unwrap();
+        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
         let tuning = ChipTuning::for_device(&device);
         // On any Apple Silicon these should hold:
         assert!(tuning.max_threadgroup_memory >= 16 * 1024);
@@ -511,59 +521,57 @@ mod tests {
         let queue = gpu.new_command_queue();
         let cb = gpu.create_command_buffer(&queue);
         // Encode a no-op and commit to prove the CB is valid.
-        let enc = cb.new_compute_command_encoder();
-        enc.end_encoding();
+        let enc = cb.computeCommandEncoder().unwrap();
+        enc.endEncoding();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
     }
 
     #[test]
     fn test_create_command_buffer_both_paths() {
         // Verify that both the unretained and retained paths produce valid CBs.
-        let device = metal::Device::system_default().unwrap();
-        let queue = device.new_command_queue();
+        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
+        let queue = device.newCommandQueue().unwrap();
 
         // Retained path (standard)
-        let cb_retained = queue.new_command_buffer().to_owned();
-        let enc = cb_retained.new_compute_command_encoder();
-        enc.end_encoding();
+        let cb_retained = queue.commandBuffer().unwrap();
+        let enc = cb_retained.computeCommandEncoder().unwrap();
+        enc.endEncoding();
         cb_retained.commit();
-        cb_retained.wait_until_completed();
+        cb_retained.waitUntilCompleted();
 
         // Unretained path
-        let cb_unretained = queue
-            .new_command_buffer_with_unretained_references()
-            .to_owned();
-        let enc = cb_unretained.new_compute_command_encoder();
-        enc.end_encoding();
+        let cb_unretained = queue.commandBufferWithUnretainedReferences().unwrap();
+        let enc = cb_unretained.computeCommandEncoder().unwrap();
+        enc.endEncoding();
         cb_unretained.commit();
-        cb_unretained.wait_until_completed();
+        cb_unretained.waitUntilCompleted();
     }
 
     #[test]
     fn test_tracked_buffer_options() {
-        assert!(TRACKED_BUFFER_OPTIONS.contains(MTLResourceOptions::StorageModeShared));
-        assert!(!TRACKED_BUFFER_OPTIONS.contains(MTLResourceOptions::HazardTrackingModeUntracked));
+        assert!((TRACKED_BUFFER_OPTIONS.0 & MTLResourceOptions::StorageModeShared.0) != 0);
+        assert!((TRACKED_BUFFER_OPTIONS.0 & MTLResourceOptions::HazardTrackingModeUntracked.0) == 0);
     }
 
     #[test]
     fn test_untracked_buffer_options() {
-        assert!(UNTRACKED_BUFFER_OPTIONS.contains(MTLResourceOptions::StorageModeShared));
-        assert!(UNTRACKED_BUFFER_OPTIONS.contains(MTLResourceOptions::HazardTrackingModeUntracked));
+        assert!((UNTRACKED_BUFFER_OPTIONS.0 & MTLResourceOptions::StorageModeShared.0) != 0);
+        assert!((UNTRACKED_BUFFER_OPTIONS.0 & MTLResourceOptions::HazardTrackingModeUntracked.0) != 0);
     }
 
     #[test]
     #[cfg(not(feature = "tracked_hazards"))]
     fn test_default_buffer_options_is_untracked() {
-        assert_eq!(DEFAULT_BUFFER_OPTIONS, UNTRACKED_BUFFER_OPTIONS);
-        assert!(DEFAULT_BUFFER_OPTIONS.contains(MTLResourceOptions::HazardTrackingModeUntracked));
+        assert_eq!(DEFAULT_BUFFER_OPTIONS.0, UNTRACKED_BUFFER_OPTIONS.0);
+        assert!((DEFAULT_BUFFER_OPTIONS.0 & MTLResourceOptions::HazardTrackingModeUntracked.0) != 0);
     }
 
     #[test]
     #[cfg(feature = "tracked_hazards")]
     fn test_default_buffer_options_is_tracked() {
-        assert_eq!(DEFAULT_BUFFER_OPTIONS, TRACKED_BUFFER_OPTIONS);
-        assert!(!DEFAULT_BUFFER_OPTIONS.contains(MTLResourceOptions::HazardTrackingModeUntracked));
+        assert_eq!(DEFAULT_BUFFER_OPTIONS.0, TRACKED_BUFFER_OPTIONS.0);
+        assert!((DEFAULT_BUFFER_OPTIONS.0 & MTLResourceOptions::HazardTrackingModeUntracked.0) == 0);
     }
 
     #[test]
@@ -578,10 +586,10 @@ mod tests {
 
         let data: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
         let buf = device.new_buffer_with_data(&data);
-        assert!(buf.length() >= 16); // 4 * f32
+        assert!(buf.length() as u64 >= 16); // 4 * f32
 
         // Verify buffer contents are readable (StorageModeShared).
-        let ptr = buf.contents() as *const f32;
+        let ptr = buf.contents().as_ptr() as *const f32;
         let slice = unsafe { std::slice::from_raw_parts(ptr, 4) };
         assert_eq!(slice, &data);
     }
@@ -597,9 +605,9 @@ mod tests {
         };
 
         let buf = device.new_buffer(256, UNTRACKED_BUFFER_OPTIONS);
-        assert!(buf.length() >= 256);
+        assert!(buf.length() as u64 >= 256);
         // Write and read back to confirm the buffer is functional.
-        let ptr = buf.contents() as *mut u8;
+        let ptr = buf.contents().as_ptr() as *mut u8;
         unsafe {
             std::ptr::write_bytes(ptr, 0xAB, 256);
             let slice = std::slice::from_raw_parts(ptr, 256);
@@ -687,7 +695,7 @@ mod tests {
         };
         let raw = gpu.raw();
         // Should be able to call methods on the raw device.
-        assert!(!raw.name().is_empty());
+        assert!(!raw.name().to_string().is_empty());
     }
 
     #[test]

@@ -1,17 +1,13 @@
 //! rmlx-metal — Metal GPU abstraction layer for RMLX
 
 #![deny(unsafe_op_in_unsafe_fn)]
-#![allow(unexpected_cfgs)] // objc crate uses deprecated cfg(feature = "cargo-clippy")
-
-// Required for objc::msg_send! macro in autorelease and capture modules.
-#[macro_use]
-extern crate objc;
 
 pub mod autorelease;
 pub mod batcher;
 pub mod buffer;
 pub mod capture;
 pub mod command;
+pub mod compute_pass;
 pub mod device;
 pub mod event;
 pub mod exec_graph;
@@ -27,9 +23,15 @@ pub mod pipeline_cache;
 pub mod queue;
 pub mod self_check;
 pub mod stream;
+pub mod types;
 
-// Re-export metal crate for downstream users
-pub use metal;
+// Re-export objc2-metal essentials for downstream users
+pub use objc2_metal::MTLResourceOptions;
+pub use objc2_metal::MTLSize;
+
+// Re-export type aliases and ComputePass
+pub use compute_pass::ComputePass;
+pub use types::*;
 
 // Re-export core types for convenience
 pub use autorelease::ScopedPool;

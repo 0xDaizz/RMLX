@@ -9,9 +9,11 @@ license.workspace = true
 tracked_hazards = []
 
 [dependencies]
-metal = { workspace = true }
-objc = { workspace = true }
-block = { workspace = true }
+objc2 = { workspace = true }
+objc2-metal = { workspace = true }
+objc2-foundation = { workspace = true }
+block2 = { workspace = true }
+bytemuck = { workspace = true }
 libc = { workspace = true }
 sha2 = { workspace = true }
 dirs = { workspace = true }
