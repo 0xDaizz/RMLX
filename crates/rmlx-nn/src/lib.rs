@@ -60,7 +60,7 @@ pub use quantized_linear::{
 pub use rms_norm::{RMSNorm, RMSNormConfig};
 pub use rope::{RotaryPositionEmbedding, RotaryPositionEmbeddingConfig};
 pub use safetensors_loader::{QuantizationConfig, SafetensorsLoadError, SafetensorsWeightMap};
-pub use sampler::{Sampler, SamplerConfig};
+pub use sampler::{greedy_verify, rejection_sample, Sampler, SamplerConfig, SpecDecodeResult};
 pub use scheduler::{Scheduler, SchedulerConfig, SchedulerError, SchedulerOutput, SeqMeta};
 pub use sliding_window::{SlidingWindowAttention, SlidingWindowAttentionConfig};
 pub use transformer::{

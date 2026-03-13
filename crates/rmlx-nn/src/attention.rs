@@ -125,6 +125,18 @@ impl LayerKvCache {
         self.seq_len
     }
 
+    /// Remove the last `n` tokens from the cache.
+    ///
+    /// This is an O(1) metadata-only operation: the pre-allocated buffers
+    /// are unchanged; only the logical cursor (`seq_len`) is rewound.
+    /// Used by speculative decoding to roll back rejected draft tokens.
+    ///
+    /// Returns the new sequence length after trimming.
+    pub fn trim(&mut self, n: usize) -> usize {
+        self.seq_len = self.seq_len.saturating_sub(n);
+        self.seq_len
+    }
+
     /// Validate consistency among input tensors when the cache is empty (first append).
     /// Checks that all tensors are 2D, have the same dtype, the same head_dim, and
     /// seq dimension matches new_tokens.
@@ -5776,5 +5788,34 @@ mod tests {
                 .expect("append failed");
             assert_eq!(cache.current_len(), std::cmp::min(t + 1, 4));
         }
+    }
+
+    #[test]
+    fn test_layer_kv_cache_trim() {
+        if metal::Device::system_default().is_none() {
+            return;
+        }
+        let device = metal::Device::system_default().unwrap();
+        let mut cache = LayerKvCache::preallocated(&device, 2, 4, 32, DType::Float32);
+
+        // Simulate appending 10 tokens by setting seq_len directly.
+        cache.seq_len = 10;
+        assert_eq!(cache.position_offset(), 10);
+
+        // Trim 3 tokens.
+        let new_len = cache.trim(3);
+        assert_eq!(new_len, 7);
+        assert_eq!(cache.seq_len, 7);
+
+        // Trim 5 more tokens.
+        let new_len = cache.trim(5);
+        assert_eq!(new_len, 2);
+        assert_eq!(cache.seq_len, 2);
+
+        // Trim more than remaining — saturates to 0.
+        let new_len = cache.trim(100);
+        assert_eq!(new_len, 0);
+        assert_eq!(cache.seq_len, 0);
+        assert!(cache.is_empty());
     }
 }

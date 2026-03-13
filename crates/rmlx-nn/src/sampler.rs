@@ -39,6 +39,23 @@ impl Default for SamplerConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Speculative decoding helpers
+// ---------------------------------------------------------------------------
+
+/// Result of speculative decoding verification.
+#[derive(Debug, Clone)]
+pub struct SpecDecodeResult {
+    /// Number of draft tokens accepted (0..=num_draft).
+    pub num_accepted: usize,
+    /// Accepted token IDs (length = num_accepted).
+    pub accepted_tokens: Vec<u32>,
+    /// Correction token sampled from the target distribution at the
+    /// first rejected position (or bonus token if all accepted).
+    /// The serving layer appends this after the accepted tokens.
+    pub correction_token: u32,
+}
+
+// ---------------------------------------------------------------------------
 // Sampler struct
 // ---------------------------------------------------------------------------
 
@@ -118,6 +135,229 @@ impl Sampler {
         let logits_arr = Array::from_slice(device, &data, vec![vocab_size]);
         sample(&logits_arr, registry, queue)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Speculative decoding functions (public API)
+// ---------------------------------------------------------------------------
+
+/// Greedy verification for speculative decoding.
+///
+/// Compares target model argmax with draft tokens at each position.
+/// Accepts as long as `argmax(target_logits[i]) == draft_tokens[i]`.
+///
+/// `target_logits` must be a 2-D f32 array of shape `[num_draft + 1, vocab_size]`.
+/// The extra position is for the bonus/correction token.
+/// `draft_tokens` has length `num_draft`.
+///
+/// Returns `SpecDecodeResult` with accepted count and correction token.
+pub fn greedy_verify(
+    target_logits: &Array,
+    draft_tokens: &[u32],
+) -> Result<SpecDecodeResult, KernelError> {
+    if target_logits.ndim() != 2 {
+        return Err(KernelError::InvalidShape(format!(
+            "greedy_verify: expected 2D target_logits, got {}D",
+            target_logits.ndim()
+        )));
+    }
+    if target_logits.dtype() != DType::Float32 {
+        return Err(KernelError::InvalidShape(format!(
+            "greedy_verify: expected Float32, got {:?}",
+            target_logits.dtype()
+        )));
+    }
+
+    let num_positions = target_logits.shape()[0];
+    let vocab_size = target_logits.shape()[1];
+    let num_draft = draft_tokens.len();
+
+    if num_positions < num_draft + 1 {
+        return Err(KernelError::InvalidShape(format!(
+            "greedy_verify: target_logits has {} rows but need {} (num_draft={} + 1)",
+            num_positions,
+            num_draft + 1,
+            num_draft
+        )));
+    }
+
+    // Read all logits to CPU once
+    let data = target_logits.to_vec_checked::<f32>();
+
+    let mut num_accepted = 0;
+    let mut accepted_tokens = Vec::with_capacity(num_draft);
+
+    // Check each draft position
+    for (i, &draft_tok) in draft_tokens.iter().enumerate() {
+        let row_start = i * vocab_size;
+        let row = &data[row_start..row_start + vocab_size];
+        let target_token = argmax_cpu(row) as u32;
+
+        if target_token == draft_tok {
+            num_accepted += 1;
+            accepted_tokens.push(draft_tok);
+        } else {
+            // Reject: correction token is target's choice at this position
+            return Ok(SpecDecodeResult {
+                num_accepted,
+                accepted_tokens,
+                correction_token: target_token,
+            });
+        }
+    }
+
+    // All accepted: bonus token from the last position (num_draft)
+    let bonus_row_start = num_draft * vocab_size;
+    let bonus_row = &data[bonus_row_start..bonus_row_start + vocab_size];
+    let bonus_token = argmax_cpu(bonus_row) as u32;
+
+    Ok(SpecDecodeResult {
+        num_accepted,
+        accepted_tokens,
+        correction_token: bonus_token,
+    })
+}
+
+/// Rejection sampling for speculative decoding (Leviathan et al., 2023).
+///
+/// For each draft position, accepts with probability
+/// `min(1, target_prob[token] / draft_prob[token])`.
+/// On rejection, samples a correction token from
+/// `max(0, target_prob - draft_prob)` (the residual distribution).
+/// If all draft tokens are accepted, samples a bonus token from the
+/// target distribution at position `num_draft`.
+///
+/// `target_logits`: `[num_draft + 1, vocab_size]` f32 — raw logits from target model.
+/// `draft_probs`: `[num_draft, vocab_size]` f32 — softmax probabilities from draft model.
+/// `draft_tokens`: `[num_draft]` — tokens chosen by the draft model.
+///
+/// Uses the target model's softmax for probability computation.
+pub fn rejection_sample(
+    target_logits: &Array,
+    draft_probs: &Array,
+    draft_tokens: &[u32],
+    registry: &KernelRegistry,
+    queue: &metal::CommandQueue,
+) -> Result<SpecDecodeResult, KernelError> {
+    if target_logits.ndim() != 2 || draft_probs.ndim() != 2 {
+        return Err(KernelError::InvalidShape(
+            "rejection_sample: target_logits and draft_probs must be 2D".to_string(),
+        ));
+    }
+
+    let num_draft = draft_tokens.len();
+    let vocab_size = target_logits.shape()[1];
+
+    if target_logits.shape()[0] < num_draft + 1 {
+        return Err(KernelError::InvalidShape(format!(
+            "rejection_sample: target_logits needs {} rows, got {}",
+            num_draft + 1,
+            target_logits.shape()[0]
+        )));
+    }
+    if draft_probs.shape()[0] < num_draft || draft_probs.shape()[1] != vocab_size {
+        return Err(KernelError::InvalidShape(format!(
+            "rejection_sample: draft_probs shape mismatch, expected [{}, {}], got {:?}",
+            num_draft,
+            vocab_size,
+            draft_probs.shape()
+        )));
+    }
+
+    // Compute target probabilities via GPU softmax (row-wise)
+    let target_probs = ops::softmax::softmax(registry, target_logits, queue)?;
+    let target_data = target_probs.to_vec_checked::<f32>();
+    let draft_data = draft_probs.to_vec_checked::<f32>();
+
+    let mut num_accepted = 0;
+    let mut accepted_tokens = Vec::with_capacity(num_draft);
+
+    for (i, &draft_tok) in draft_tokens.iter().enumerate() {
+        let tok = draft_tok as usize;
+        if tok >= vocab_size {
+            return Err(KernelError::InvalidShape(format!(
+                "rejection_sample: draft_token {} out of vocab range {}",
+                tok, vocab_size
+            )));
+        }
+
+        let t_row_start = i * vocab_size;
+        let d_row_start = i * vocab_size;
+
+        let target_p = target_data[t_row_start + tok];
+        let draft_p = draft_data[d_row_start + tok];
+
+        // Accept with probability min(1, target_p / draft_p)
+        let accept_prob = if draft_p > 0.0 {
+            (target_p / draft_p).min(1.0)
+        } else if target_p > 0.0 {
+            1.0 // draft assigned 0 prob but target likes it — accept
+        } else {
+            0.0 // both 0 — reject
+        };
+
+        let r = simple_random_f32();
+        if r < accept_prob {
+            num_accepted += 1;
+            accepted_tokens.push(draft_tok);
+        } else {
+            // Sample correction token from residual distribution:
+            // p_residual[j] = max(0, target_p[j] - draft_p[j])
+            let mut residual = Vec::with_capacity(vocab_size);
+            let mut residual_sum = 0.0f32;
+            for j in 0..vocab_size {
+                let r_j = (target_data[t_row_start + j] - draft_data[d_row_start + j]).max(0.0);
+                residual.push(r_j);
+                residual_sum += r_j;
+            }
+
+            let correction = if residual_sum > 0.0 {
+                // Weighted sample from residual distribution
+                let r2 = simple_random_f32() * residual_sum;
+                let mut cumulative = 0.0f32;
+                let mut chosen = vocab_size - 1;
+                for (j, &rj) in residual.iter().enumerate() {
+                    cumulative += rj;
+                    if r2 < cumulative {
+                        chosen = j;
+                        break;
+                    }
+                }
+                chosen as u32
+            } else {
+                // Fallback: argmax of target distribution
+                let t_row = &target_data[t_row_start..t_row_start + vocab_size];
+                argmax_cpu(t_row) as u32
+            };
+
+            return Ok(SpecDecodeResult {
+                num_accepted,
+                accepted_tokens,
+                correction_token: correction,
+            });
+        }
+    }
+
+    // All accepted: sample bonus token from target distribution at position num_draft
+    let bonus_row_start = num_draft * vocab_size;
+    let bonus_row = &target_data[bonus_row_start..bonus_row_start + vocab_size];
+    // Sample from target distribution (not argmax)
+    let r3 = simple_random_f32();
+    let mut cumulative = 0.0f32;
+    let mut bonus_token = (vocab_size - 1) as u32;
+    for (j, &p) in bonus_row.iter().enumerate() {
+        cumulative += p;
+        if r3 < cumulative {
+            bonus_token = j as u32;
+            break;
+        }
+    }
+
+    Ok(SpecDecodeResult {
+        num_accepted,
+        accepted_tokens,
+        correction_token: bonus_token,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -579,5 +819,66 @@ mod tests {
         assert_eq!(config.top_k, 0);
         assert!((config.top_p - 1.0).abs() < f32::EPSILON);
         assert!((config.repetition_penalty - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_greedy_verify_all_accepted() {
+        let (device, _queue, _registry) = setup();
+        // 3 draft tokens, target logits agree with all + bonus position
+        // draft_tokens = [2, 0, 1]
+        // target argmax at each position: 2, 0, 1, 3(bonus)
+        let logits_data: Vec<f32> = vec![
+            // pos 0: token 2 is max
+            0.1, 0.2, 10.0, 0.3, 0.1, // pos 1: token 0 is max
+            10.0, 0.2, 0.1, 0.3, 0.1, // pos 2: token 1 is max
+            0.1, 10.0, 0.2, 0.3, 0.1, // pos 3 (bonus): token 3 is max
+            0.1, 0.2, 0.3, 10.0, 0.1,
+        ];
+        let target_logits = Array::from_slice(&device, &logits_data, vec![4, 5]);
+        let draft_tokens = vec![2u32, 0, 1];
+
+        let result = greedy_verify(&target_logits, &draft_tokens).expect("greedy_verify");
+        assert_eq!(result.num_accepted, 3);
+        assert_eq!(result.accepted_tokens, vec![2, 0, 1]);
+        assert_eq!(result.correction_token, 3); // bonus token
+    }
+
+    #[test]
+    fn test_greedy_verify_partial_reject() {
+        let (device, _queue, _registry) = setup();
+        // draft_tokens = [2, 0, 1], but target disagrees at position 1
+        let logits_data: Vec<f32> = vec![
+            // pos 0: token 2 is max (agrees)
+            0.1, 0.2, 10.0, 0.3, 0.1,
+            // pos 1: token 3 is max (disagrees with draft token 0)
+            0.1, 0.2, 0.1, 10.0, 0.1, // pos 2: doesn't matter
+            0.1, 10.0, 0.2, 0.3, 0.1, // pos 3: doesn't matter
+            0.1, 0.2, 0.3, 10.0, 0.1,
+        ];
+        let target_logits = Array::from_slice(&device, &logits_data, vec![4, 5]);
+        let draft_tokens = vec![2u32, 0, 1];
+
+        let result = greedy_verify(&target_logits, &draft_tokens).expect("greedy_verify");
+        assert_eq!(result.num_accepted, 1); // only first accepted
+        assert_eq!(result.accepted_tokens, vec![2]);
+        assert_eq!(result.correction_token, 3); // target's choice at rejected pos
+    }
+
+    #[test]
+    fn test_greedy_verify_none_accepted() {
+        let (device, _queue, _registry) = setup();
+        // draft_tokens = [0], but target picks token 4
+        let logits_data: Vec<f32> = vec![
+            // pos 0: token 4 is max (disagrees with draft token 0)
+            0.1, 0.2, 0.1, 0.3, 10.0, // pos 1 (bonus): doesn't matter
+            10.0, 0.2, 0.3, 0.1, 0.1,
+        ];
+        let target_logits = Array::from_slice(&device, &logits_data, vec![2, 5]);
+        let draft_tokens = vec![0u32];
+
+        let result = greedy_verify(&target_logits, &draft_tokens).expect("greedy_verify");
+        assert_eq!(result.num_accepted, 0);
+        assert!(result.accepted_tokens.is_empty());
+        assert_eq!(result.correction_token, 4);
     }
 }
