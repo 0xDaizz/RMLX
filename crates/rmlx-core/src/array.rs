@@ -6,9 +6,118 @@ use rmlx_metal::metal;
 
 use rmlx_alloc::MetalAllocator;
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fmt;
+use std::mem::ManuallyDrop;
+
+#[cfg(feature = "bench")]
+use std::cell::Cell;
+#[cfg(feature = "bench")]
+use std::time::Instant;
 
 use crate::dtype::{DType, HasDType};
+
+// Thread-local allocation statistics for profiling.
+// Tracks count and cumulative time of Array::uninit() / Array::zeros() calls.
+#[cfg(feature = "bench")]
+thread_local! {
+    static ALLOC_COUNT: Cell<u64> = Cell::new(0);
+    static ALLOC_NANOS: Cell<u64> = Cell::new(0);
+    static ALLOC_BYTES: Cell<u64> = Cell::new(0);
+}
+
+// ---------------------------------------------------------------------------
+// Thread-local buffer pool for recycling Metal buffers
+// ---------------------------------------------------------------------------
+
+/// Thread-local buffer pool for recycling Metal buffers.
+/// Eliminates ~3ms/iter of `device.new_buffer()` overhead during forward passes.
+struct ArrayPool {
+    /// Free buffers keyed by allocation size (bytes).
+    free: HashMap<u64, Vec<MTLBuffer>>,
+    enabled: bool,
+    /// Stats
+    hits: u64,
+    misses: u64,
+}
+
+impl ArrayPool {
+    fn new() -> Self {
+        Self {
+            free: HashMap::new(),
+            enabled: false,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    fn acquire(&mut self, device: &metal::Device, size: u64) -> MTLBuffer {
+        if self.enabled {
+            if let Some(bufs) = self.free.get_mut(&size) {
+                if let Some(buf) = bufs.pop() {
+                    self.hits += 1;
+                    return buf;
+                }
+            }
+            self.misses += 1;
+        }
+        device.new_buffer(size, MTLResourceOptions::StorageModeShared)
+    }
+
+    fn recycle(&mut self, buf: MTLBuffer) {
+        if self.enabled {
+            let size = buf.length();
+            self.free.entry(size).or_default().push(buf);
+        }
+        // If not enabled, buffer is simply dropped (normal Metal ARC dealloc)
+    }
+}
+
+thread_local! {
+    static ARRAY_POOL: RefCell<ArrayPool> = RefCell::new(ArrayPool::new());
+}
+
+/// Enable the thread-local buffer pool. Subsequent `Array::uninit()` calls
+/// will reuse buffers, and dropped Arrays will return buffers to the pool.
+pub fn enable_array_pool() {
+    ARRAY_POOL.with(|p| p.borrow_mut().enabled = true);
+}
+
+/// Disable the pool and drain all cached buffers (freeing Metal memory).
+pub fn disable_array_pool() {
+    ARRAY_POOL.with(|p| {
+        let mut pool = p.borrow_mut();
+        pool.enabled = false;
+        pool.free.clear();
+        pool.hits = 0;
+        pool.misses = 0;
+    });
+}
+
+/// Get pool statistics: (hits, misses, cached_buffer_count).
+pub fn array_pool_stats() -> (u64, u64, usize) {
+    ARRAY_POOL.with(|p| {
+        let pool = p.borrow();
+        let cached: usize = pool.free.values().map(|v| v.len()).sum();
+        (pool.hits, pool.misses, cached)
+    })
+}
+
+#[cfg(feature = "bench")]
+pub fn reset_alloc_stats() {
+    ALLOC_COUNT.with(|c| c.set(0));
+    ALLOC_NANOS.with(|c| c.set(0));
+    ALLOC_BYTES.with(|c| c.set(0));
+}
+
+#[cfg(feature = "bench")]
+pub fn get_alloc_stats() -> (u64, u64, u64) {
+    let count = ALLOC_COUNT.with(|c| c.get());
+    let nanos = ALLOC_NANOS.with(|c| c.get());
+    let bytes = ALLOC_BYTES.with(|c| c.get());
+    (count, nanos, bytes)
+}
 
 /// An N-dimensional array stored in a Metal GPU buffer.
 ///
@@ -17,7 +126,7 @@ use crate::dtype::{DType, HasDType};
 ///
 /// `Debug` prints shape, strides, and dtype (not buffer contents).
 pub struct Array {
-    buffer: MTLBuffer,
+    buffer: ManuallyDrop<MTLBuffer>,
     shape: Vec<usize>,
     strides: Vec<usize>,
     dtype: DType,
@@ -36,6 +145,22 @@ impl fmt::Debug for Array {
     }
 }
 
+impl Drop for Array {
+    fn drop(&mut self) {
+        // SAFETY: We take ownership of the buffer via ManuallyDrop::take.
+        // This is the only place the buffer is consumed; after drop() returns,
+        // Rust will not drop the ManuallyDrop field (that's the whole point).
+        let buf = unsafe { ManuallyDrop::take(&mut self.buffer) };
+        // Only recycle buffers that own the full allocation (offset == 0).
+        // Views (offset > 0) share a buffer with a parent array and must
+        // not be recycled — the parent will handle it.
+        if self.offset == 0 {
+            ARRAY_POOL.with(|p| p.borrow_mut().recycle(buf));
+        }
+        // else: buf is dropped normally here (Metal ARC decrements refcount)
+    }
+}
+
 impl Array {
     /// Create an array wrapping an existing Metal buffer.
     pub fn new(
@@ -46,7 +171,7 @@ impl Array {
         offset: usize,
     ) -> Self {
         Self {
-            buffer,
+            buffer: ManuallyDrop::new(buffer),
             shape,
             strides,
             dtype,
@@ -77,7 +202,7 @@ impl Array {
 
         let strides = compute_contiguous_strides(&shape);
         Self {
-            buffer,
+            buffer: ManuallyDrop::new(buffer),
             shape,
             strides,
             dtype,
@@ -95,11 +220,23 @@ impl Array {
             as u64;
         // Metal returns null for zero-length buffers; allocate at least 1 byte.
         let alloc_size = byte_size.max(1);
-        let buffer = device.new_buffer(alloc_size, MTLResourceOptions::StorageModeShared);
+
+        #[cfg(feature = "bench")]
+        let t0 = Instant::now();
+
+        let buffer = ARRAY_POOL.with(|p| p.borrow_mut().acquire(device, alloc_size));
+
+        #[cfg(feature = "bench")]
+        {
+            let elapsed = t0.elapsed().as_nanos() as u64;
+            ALLOC_COUNT.with(|c| c.set(c.get() + 1));
+            ALLOC_NANOS.with(|c| c.set(c.get() + elapsed));
+            ALLOC_BYTES.with(|c| c.set(c.get() + alloc_size));
+        }
 
         let strides = compute_contiguous_strides(shape);
         Self {
-            buffer,
+            buffer: ManuallyDrop::new(buffer),
             shape: shape.to_vec(),
             strides,
             dtype,
@@ -119,11 +256,22 @@ impl Array {
             as u64;
         // Metal returns null for zero-length buffers; allocate at least 1 byte.
         let alloc_size = byte_size.max(1);
-        let buffer = device.new_buffer(alloc_size, MTLResourceOptions::StorageModeShared);
 
-        // Explicitly zero the buffer. While Apple Silicon may zero-initialize
-        // StorageModeShared buffers in practice, this is not guaranteed by the
-        // Metal API spec, so we zero unconditionally for correctness.
+        #[cfg(feature = "bench")]
+        let t0 = Instant::now();
+
+        let buffer = ARRAY_POOL.with(|p| p.borrow_mut().acquire(device, alloc_size));
+
+        #[cfg(feature = "bench")]
+        {
+            let elapsed = t0.elapsed().as_nanos() as u64;
+            ALLOC_COUNT.with(|c| c.set(c.get() + 1));
+            ALLOC_NANOS.with(|c| c.set(c.get() + elapsed));
+            ALLOC_BYTES.with(|c| c.set(c.get() + alloc_size));
+        }
+
+        // Explicitly zero the buffer. Recycled buffers may contain stale data,
+        // and even fresh buffers are not guaranteed to be zeroed by Metal.
         // SAFETY: SharedMode buffer contents() is CPU-accessible and valid
         // for buffer.length() bytes.
         unsafe {
@@ -132,7 +280,7 @@ impl Array {
 
         let strides = compute_contiguous_strides(shape);
         Self {
-            buffer,
+            buffer: ManuallyDrop::new(buffer),
             shape: shape.to_vec(),
             strides,
             dtype,
@@ -166,7 +314,7 @@ impl Array {
 
         let strides = compute_contiguous_strides(shape);
         Ok(Self {
-            buffer,
+            buffer: ManuallyDrop::new(buffer),
             shape: shape.to_vec(),
             strides,
             dtype,
@@ -413,7 +561,7 @@ impl Array {
         );
         let strides = compute_contiguous_strides(&shape);
         Self {
-            buffer,
+            buffer: ManuallyDrop::new(buffer),
             shape,
             strides,
             dtype,
@@ -446,7 +594,7 @@ impl Array {
         let elem_bytes = self.dtype.size_of();
         let new_offset = self.offset + start * elem_bytes;
         Self {
-            buffer: self.buffer.clone(),
+            buffer: ManuallyDrop::new((*self.buffer).clone()),
             shape: vec![self.shape[0], end - start],
             strides: self.strides.clone(),
             dtype: self.dtype,
@@ -490,7 +638,7 @@ impl Array {
         // Strides remain unchanged: the view simply starts at a different
         // offset and has a smaller extent along `axis`.
         Ok(Self {
-            buffer: self.buffer.clone(),
+            buffer: ManuallyDrop::new((*self.buffer).clone()),
             shape: new_shape,
             strides: self.strides.clone(),
             dtype: self.dtype,
@@ -521,7 +669,7 @@ impl Array {
         }
         let new_strides = compute_contiguous_strides(&new_shape);
         Ok(Self {
-            buffer: self.buffer.clone(),
+            buffer: ManuallyDrop::new((*self.buffer).clone()),
             shape: new_shape,
             strides: new_strides,
             dtype: self.dtype,
@@ -532,7 +680,7 @@ impl Array {
     /// Create a view with custom strides and offset (same buffer, zero-copy).
     pub fn view(&self, shape: Vec<usize>, strides: Vec<usize>, offset: usize) -> Self {
         Self {
-            buffer: self.buffer.clone(),
+            buffer: ManuallyDrop::new((*self.buffer).clone()),
             shape,
             strides,
             dtype: self.dtype,
@@ -559,7 +707,7 @@ impl Array {
             new_strides.push(1);
         }
         Self {
-            buffer: self.buffer.clone(),
+            buffer: ManuallyDrop::new((*self.buffer).clone()),
             shape: new_shape,
             strides: new_strides,
             dtype: self.dtype,
@@ -602,7 +750,7 @@ impl Array {
         new_strides.insert(axis, stride_val);
 
         Ok(Self {
-            buffer: self.buffer.clone(),
+            buffer: ManuallyDrop::new((*self.buffer).clone()),
             shape: new_shape,
             strides: new_strides,
             dtype: self.dtype,
@@ -635,7 +783,7 @@ impl Array {
         new_shape.swap(dim0, dim1);
         new_strides.swap(dim0, dim1);
         Ok(Self {
-            buffer: self.buffer.clone(),
+            buffer: ManuallyDrop::new((*self.buffer).clone()),
             shape: new_shape,
             strides: new_strides,
             dtype: self.dtype,
@@ -673,7 +821,7 @@ impl Array {
             new_strides.push(1);
         }
         Ok(Self {
-            buffer: self.buffer.clone(),
+            buffer: ManuallyDrop::new((*self.buffer).clone()),
             shape: new_shape,
             strides: new_strides,
             dtype: self.dtype,
@@ -795,9 +943,9 @@ mod tests {
     fn test_transpose_2d() {
         // Simulate a [3, 4] array with contiguous strides [4, 1]
         let arr = Array {
-            buffer: metal::Device::system_default()
+            buffer: ManuallyDrop::new(metal::Device::system_default()
                 .unwrap()
-                .new_buffer(48, MTLResourceOptions::StorageModeShared),
+                .new_buffer(48, MTLResourceOptions::StorageModeShared)),
             shape: vec![3, 4],
             strides: vec![4, 1],
             dtype: DType::Float32,
@@ -811,9 +959,9 @@ mod tests {
     #[test]
     fn test_transpose_3d() {
         let arr = Array {
-            buffer: metal::Device::system_default()
+            buffer: ManuallyDrop::new(metal::Device::system_default()
                 .unwrap()
-                .new_buffer(96, MTLResourceOptions::StorageModeShared),
+                .new_buffer(96, MTLResourceOptions::StorageModeShared)),
             shape: vec![2, 3, 4],
             strides: vec![12, 4, 1],
             dtype: DType::Float32,
@@ -827,9 +975,9 @@ mod tests {
     #[test]
     fn test_transpose_same_dim_is_noop() {
         let arr = Array {
-            buffer: metal::Device::system_default()
+            buffer: ManuallyDrop::new(metal::Device::system_default()
                 .unwrap()
-                .new_buffer(48, MTLResourceOptions::StorageModeShared),
+                .new_buffer(48, MTLResourceOptions::StorageModeShared)),
             shape: vec![3, 4],
             strides: vec![4, 1],
             dtype: DType::Float32,
@@ -843,9 +991,9 @@ mod tests {
     #[test]
     fn test_transpose_out_of_range() {
         let arr = Array {
-            buffer: metal::Device::system_default()
+            buffer: ManuallyDrop::new(metal::Device::system_default()
                 .unwrap()
-                .new_buffer(48, MTLResourceOptions::StorageModeShared),
+                .new_buffer(48, MTLResourceOptions::StorageModeShared)),
             shape: vec![3, 4],
             strides: vec![4, 1],
             dtype: DType::Float32,
@@ -858,9 +1006,9 @@ mod tests {
     #[test]
     fn test_squeeze_dim() {
         let arr = Array {
-            buffer: metal::Device::system_default()
+            buffer: ManuallyDrop::new(metal::Device::system_default()
                 .unwrap()
-                .new_buffer(48, MTLResourceOptions::StorageModeShared),
+                .new_buffer(48, MTLResourceOptions::StorageModeShared)),
             shape: vec![1, 3, 4],
             strides: vec![12, 4, 1],
             dtype: DType::Float32,
@@ -874,9 +1022,9 @@ mod tests {
     #[test]
     fn test_squeeze_dim_middle() {
         let arr = Array {
-            buffer: metal::Device::system_default()
+            buffer: ManuallyDrop::new(metal::Device::system_default()
                 .unwrap()
-                .new_buffer(48, MTLResourceOptions::StorageModeShared),
+                .new_buffer(48, MTLResourceOptions::StorageModeShared)),
             shape: vec![3, 1, 4],
             strides: vec![4, 4, 1],
             dtype: DType::Float32,
@@ -890,9 +1038,9 @@ mod tests {
     #[test]
     fn test_squeeze_dim_non_one_fails() {
         let arr = Array {
-            buffer: metal::Device::system_default()
+            buffer: ManuallyDrop::new(metal::Device::system_default()
                 .unwrap()
-                .new_buffer(48, MTLResourceOptions::StorageModeShared),
+                .new_buffer(48, MTLResourceOptions::StorageModeShared)),
             shape: vec![3, 4],
             strides: vec![4, 1],
             dtype: DType::Float32,

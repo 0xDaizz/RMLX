@@ -15,6 +15,7 @@ smallvec = { workspace = true }
 bumpalo = { workspace = true }
 
 [features]
+bench = []
 ## Forward tracked_hazards through to rmlx-metal.
 tracked_hazards = ["rmlx-metal/tracked_hazards"]
 

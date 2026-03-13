@@ -342,6 +342,10 @@ fn main() {
         FLOPS_PER_TOKEN_PER_LAYER * NUM_LAYERS as f64
     );
 
+    // Enable thread-local buffer pool to eliminate Metal allocation overhead
+    rmlx_core::array::enable_array_pool();
+    println!("Array buffer pool: ENABLED");
+
     // Build model with random weights
     let mut model = build_model(device);
     println!("Model built. Preparing weights...");
@@ -353,6 +357,13 @@ fn main() {
             .prepare_weights_for_graph(&registry, &setup_queue)
             .expect("prepare_weights_for_graph failed");
     }
+    // Merge QKV and gate+up weights for CompiledPrefill (into_encoder) path
+    for block in model.layers_mut() {
+        block
+            .prepare_weights_9dispatch(device)
+            .expect("prepare_weights_9dispatch failed");
+    }
+
     // Let Metal driver fully drain GPU resources from weight preparation
     std::thread::sleep(std::time::Duration::from_millis(100));
     println!("Weights prepared.");
@@ -546,7 +557,7 @@ fn main() {
         // ==== Benchmark 3: forward_graph_unified(CompiledPrefill) (single CB + single encoder) ====
         let queue_compiled = device.new_command_queue();
         let event_compiled = GpuEvent::new(device);
-        let stats_compiled = {
+        let (stats_compiled, alloc_count, alloc_nanos, alloc_bytes) = {
             let mut caches = make_caches(device);
 
             // Warmup
@@ -575,6 +586,7 @@ fn main() {
 
             // Benchmark
             let mut latencies = Vec::with_capacity(BENCH_ITERS);
+            rmlx_core::array::reset_alloc_stats();
             {
                 let _pool = ScopedPool::new();
                 for _ in 0..BENCH_ITERS {
@@ -599,13 +611,117 @@ fn main() {
                     latencies.push(start.elapsed());
                 }
             }
+            let (alloc_count, alloc_nanos, alloc_bytes) = rmlx_core::array::get_alloc_stats();
 
-            Stats::from_durations(&latencies)
+            (Stats::from_durations(&latencies), alloc_count, alloc_nanos, alloc_bytes)
         };
 
         let tflops_compiled = compute_tflops(seq_len, stats_compiled.mean);
         println!("  compiled_prefill : {}", stats_compiled);
         println!("    estimated TFLOPS: {:.2}", tflops_compiled);
+        {
+            let alloc_us_total = alloc_nanos as f64 / 1000.0;
+            let alloc_us_per_iter = alloc_us_total / BENCH_ITERS as f64;
+            let alloc_count_per_iter = alloc_count / BENCH_ITERS as u64;
+            let alloc_mb_per_iter = (alloc_bytes / BENCH_ITERS as u64) as f64 / 1024.0 / 1024.0;
+            println!("  alloc stats (compiled_prefill, per iter):");
+            println!("    count: {} allocations", alloc_count_per_iter);
+            println!(
+                "    time:  {:.0}us ({:.1}% of total)",
+                alloc_us_per_iter,
+                alloc_us_per_iter / stats_compiled.mean * 100.0
+            );
+            println!("    bytes: {:.1} MB", alloc_mb_per_iter);
+        }
+
+        // ==== Benchmark 4: CB overhead analysis ====
+        // Compare different layers_per_cb values to measure CB creation overhead.
+        // Only run for small seq_lens to keep total bench time manageable.
+        if seq_len == 32 || seq_len == 128 {
+            let queue_oh = device.new_command_queue();
+            let event_oh = GpuEvent::new(device);
+            let n_runs = 10;
+
+            // Test different layers_per_cb to measure CB creation overhead
+            let cb_configs = vec![1, 2, 4, 8, 16, 32];
+            println!(
+                "\n  --- CB overhead analysis (seq_len={}) ---",
+                seq_len
+            );
+            println!(
+                "  | {:>12} | {:>12} | {:>12} |",
+                "layers/CB", "mean (us)", "vs compiled"
+            );
+            println!("  |--------------|--------------|--------------|");
+
+            for &layers_per_cb in &cb_configs {
+                let mut times = Vec::with_capacity(n_runs);
+                let mut caches = make_caches(device);
+
+                // Warmup
+                {
+                    let _pool = ScopedPool::new();
+                    for _ in 0..3 {
+                        reset_caches(&mut caches);
+                        let _ = model
+                            .forward_graph_unified(
+                                tids,
+                                Some(&cos_freqs),
+                                Some(&sin_freqs),
+                                None,
+                                Some(&mut caches[..]),
+                                ForwardMode::Prefill { layers_per_cb },
+                                &registry,
+                                &queue_oh,
+                                &event_oh,
+                            )
+                            .expect("overhead warmup failed");
+                        let sync = queue_oh.new_command_buffer();
+                        sync.commit();
+                        sync.wait_until_completed();
+                    }
+                }
+
+                // Measure
+                {
+                    let _pool = ScopedPool::new();
+                    for _ in 0..n_runs {
+                        reset_caches(&mut caches);
+                        let start = Instant::now();
+                        let _ = model
+                            .forward_graph_unified(
+                                tids,
+                                Some(&cos_freqs),
+                                Some(&sin_freqs),
+                                None,
+                                Some(&mut caches[..]),
+                                ForwardMode::Prefill { layers_per_cb },
+                                &registry,
+                                &queue_oh,
+                                &event_oh,
+                            )
+                            .expect("overhead bench failed");
+                        let sync = queue_oh.new_command_buffer();
+                        sync.commit();
+                        sync.wait_until_completed();
+                        times.push(start.elapsed().as_secs_f64() * 1e6);
+                    }
+                }
+
+                let mean: f64 = times.iter().sum::<f64>() / n_runs as f64;
+                let diff = mean - stats_compiled.mean;
+                println!(
+                    "  | {:>12} | {:>12.0} | {:>+12.0} |",
+                    layers_per_cb, mean, diff
+                );
+            }
+
+            // Also print CompiledPrefill reference
+            println!(
+                "  | {:>12} | {:>12.0} | {:>12} |",
+                "compiled", stats_compiled.mean, "ref"
+            );
+        }
 
         results.push((
             seq_len,
@@ -649,4 +765,18 @@ fn main() {
         );
     }
     println!();
+
+    // Print buffer pool stats
+    let (hits, misses, cached) = rmlx_core::array::array_pool_stats();
+    println!("=== Array Buffer Pool Stats ===");
+    println!("  hits: {}, misses: {}, cached: {}", hits, misses, cached);
+    println!(
+        "  hit rate: {:.1}%",
+        if hits + misses > 0 {
+            hits as f64 / (hits + misses) as f64 * 100.0
+        } else {
+            0.0
+        }
+    );
+    rmlx_core::array::disable_array_pool();
 }

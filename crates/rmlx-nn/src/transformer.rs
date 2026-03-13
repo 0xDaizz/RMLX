@@ -3912,6 +3912,11 @@ impl TransformerModel {
         &self.config
     }
 
+    /// Mutable access to transformer blocks (e.g. for `prepare_weights_9dispatch`).
+    pub fn layers_mut(&mut self) -> &mut [TransformerBlock] {
+        &mut self.layers
+    }
+
     // -------------------------------------------------------------------
     // ExecGraph path
     // -------------------------------------------------------------------
