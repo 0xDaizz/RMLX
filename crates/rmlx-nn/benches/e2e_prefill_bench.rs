@@ -1,13 +1,11 @@
-//! PRODUCTION PATH — tests forward_graph_unified(Prefill), the actual production prefill path.
-//! Results directly reflect production 32-layer prefill throughput.
+//! PRODUCTION PATH — E2E prefill benchmark for 32-layer TransformerModel.
 //!
-//! E2E Prefill Benchmark (32-layer TransformerModel, Qwen 7B-style dimensions)
+//! Measures full 32-layer Qwen 7B-style forward pass latency across multiple
+//! sequence lengths. Three paths are compared:
 //!
-//! Measures full 32-layer TransformerModel forward pass latency across
-//! multiple sequence lengths to profile end-to-end prefill performance.
-//!
-//! Benchmarks `forward()` and `forward_graph_unified(Prefill)`
-//! (single-CB-per-layer production fast path via ExecGraph).
+//!   1. `forward()` — per-op baseline (no graph batching)
+//!   2. `forward_graph_unified(Prefill{layers_per_cb:4})` — production ExecGraph path
+//!   3. `forward_graph_unified(CompiledPrefill)` — single CB + single encoder path
 //!
 //! Each seq_len gets a **fresh command queue** to prevent cross-contamination.
 //!
@@ -376,8 +374,8 @@ fn main() {
         token_ids.push((state >> 33) as u32 % VOCAB_SIZE as u32);
     }
 
-    // Collect results: (seq_len, forward_stats, prefill_graph_stats)
-    let mut results: Vec<(usize, Stats, f64, Stats, f64)> = Vec::new();
+    // Collect results: (seq_len, forward_stats, tflops, prefill_graph_stats, tflops, compiled_stats, tflops)
+    let mut results: Vec<(usize, Stats, f64, Stats, f64, Stats, f64)> = Vec::new();
 
     for &seq_len in SEQ_LENS {
         println!("\n--- seq_len={} ---", seq_len);
@@ -545,7 +543,79 @@ fn main() {
         println!("  prefill_graph    : {}", stats_graph);
         println!("    estimated TFLOPS: {:.2}", tflops_graph);
 
-        results.push((seq_len, stats_fwd, tflops_fwd, stats_graph, tflops_graph));
+        // ==== Benchmark 3: forward_graph_unified(CompiledPrefill) (single CB + single encoder) ====
+        let queue_compiled = device.new_command_queue();
+        let event_compiled = GpuEvent::new(device);
+        let stats_compiled = {
+            let mut caches = make_caches(device);
+
+            // Warmup
+            {
+                let _pool = ScopedPool::new();
+                for _ in 0..WARMUP_ITERS {
+                    reset_caches(&mut caches);
+                    let _out = model
+                        .forward_graph_unified(
+                            tids,
+                            Some(&cos_freqs),
+                            Some(&sin_freqs),
+                            None,
+                            Some(&mut caches[..]),
+                            ForwardMode::CompiledPrefill,
+                            &registry,
+                            &queue_compiled,
+                            &event_compiled,
+                        )
+                        .expect("compiled_prefill warmup failed");
+                    let sync_cb = queue_compiled.new_command_buffer();
+                    sync_cb.commit();
+                    sync_cb.wait_until_completed();
+                }
+            }
+
+            // Benchmark
+            let mut latencies = Vec::with_capacity(BENCH_ITERS);
+            {
+                let _pool = ScopedPool::new();
+                for _ in 0..BENCH_ITERS {
+                    reset_caches(&mut caches);
+                    let start = Instant::now();
+                    let _out = model
+                        .forward_graph_unified(
+                            tids,
+                            Some(&cos_freqs),
+                            Some(&sin_freqs),
+                            None,
+                            Some(&mut caches[..]),
+                            ForwardMode::CompiledPrefill,
+                            &registry,
+                            &queue_compiled,
+                            &event_compiled,
+                        )
+                        .expect("compiled_prefill failed");
+                    let sync_cb = queue_compiled.new_command_buffer();
+                    sync_cb.commit();
+                    sync_cb.wait_until_completed();
+                    latencies.push(start.elapsed());
+                }
+            }
+
+            Stats::from_durations(&latencies)
+        };
+
+        let tflops_compiled = compute_tflops(seq_len, stats_compiled.mean);
+        println!("  compiled_prefill : {}", stats_compiled);
+        println!("    estimated TFLOPS: {:.2}", tflops_compiled);
+
+        results.push((
+            seq_len,
+            stats_fwd,
+            tflops_fwd,
+            stats_graph,
+            tflops_graph,
+            stats_compiled,
+            tflops_compiled,
+        ));
     }
 
     // ---------------------------------------------------------------------------
@@ -554,15 +624,28 @@ fn main() {
 
     println!("\n\n========== E2E Prefill Summary (32-layer, Qwen 7B-style) ==========");
     println!(
-        "| {:>7} | {:>12} | {:>8} | {:>15} | {:>8} | {:>8} |",
-        "seq_len", "forward (us)", "TFLOPS", "prefill_graph", "TFLOPS", "speedup"
+        "| {:>7} | {:>12} | {:>8} | {:>15} | {:>8} | {:>8} | {:>15} | {:>8} | {:>8} |",
+        "seq_len",
+        "forward (us)",
+        "TFLOPS",
+        "prefill_graph",
+        "TFLOPS",
+        "speedup",
+        "compiled_pfill",
+        "TFLOPS",
+        "speedup"
     );
-    println!("|---------|--------------|----------|-----------------|----------|----------|");
-    for &(seq_len, ref s_fwd, t_fwd, ref s_graph, t_graph) in &results {
+    println!(
+        "|---------|--------------|----------|-----------------|----------|----------|-----------------|----------|----------|"
+    );
+    for &(seq_len, ref s_fwd, t_fwd, ref s_graph, t_graph, ref s_compiled, t_compiled) in
+        &results
+    {
         let sp_graph = s_fwd.mean / s_graph.mean;
+        let sp_compiled = s_fwd.mean / s_compiled.mean;
         println!(
-            "| {:>7} | {:>12.1} | {:>8.2} | {:>15.1} | {:>8.2} | {:>6.2}x |",
-            seq_len, s_fwd.mean, t_fwd, s_graph.mean, t_graph, sp_graph
+            "| {:>7} | {:>12.1} | {:>8.2} | {:>15.1} | {:>8.2} | {:>6.2}x | {:>15.1} | {:>8.2} | {:>6.2}x |",
+            seq_len, s_fwd.mean, t_fwd, s_graph.mean, t_graph, sp_graph, s_compiled.mean, t_compiled, sp_compiled
         );
     }
     println!();

@@ -1,21 +1,16 @@
-//! ⚠️ NON-PRODUCTION PATH — single-layer only, M=1 (decode not prefill despite the name).
-//! Does not test 32-layer prefill throughput. Use e2e_prefill_bench for production prefill.
-//! For production decode, use pipeline_bench.
+//! DIAGNOSTIC — single-layer MoE expert prefill (Qwen 3.5-style dimensions).
 //!
-//! GPU Prefill Benchmark (MoE Expert Layer, Qwen 3.5-style dimensions, seq_len > 1)
+//! Tests `forward_prefill_into_cb` (production single-layer path) and
+//! `forward_prefill_into_encoder` at the TransformerBlock level.
+//! For full 32-layer production prefill, use `e2e_prefill_bench`.
+//! For production decode, use `pipeline_bench`.
 //!
-//! Measures single-layer TransformerBlock forward pass latency across
-//! multiple sequence lengths to profile prefill performance.
-//!
-//! Only benchmarks single_cb and ExecGraph paths — the per-op forward()
-//! baseline has been removed because it uses a different code path and
-//! can silently poison the shared command queue, invalidating subsequent
-//! measurements.
+//! Includes per-dispatch GPU timing breakdown (9-CB and cumulative subtraction).
 //!
 //! Each seq_len gets a **fresh command queue** to prevent cross-contamination.
 //!
 //! Run with:
-//!   cargo bench -p rmlx-nn --bench prefill_bench
+//!   cargo bench -p rmlx-nn --bench prefill_bench --features bench
 
 use std::time::{Duration, Instant};
 
