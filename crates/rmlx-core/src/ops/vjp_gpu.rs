@@ -6,14 +6,14 @@
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
-use rmlx_metal::MTLSize;
-use rmlx_metal::ComputePass;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::MTLComputePipelineState as _;
 use objc2_metal::MTLCommandBuffer as _;
 use objc2_metal::MTLCommandQueue as _;
+use objc2_metal::MTLComputePipelineState as _;
 use objc2_metal::MTLDevice as _;
+use rmlx_metal::ComputePass;
 use rmlx_metal::MTLResourceOptions;
+use rmlx_metal::MTLSize;
 
 // ---------------------------------------------------------------------------
 // Metal shader source for VJP backward kernels
@@ -122,8 +122,20 @@ pub fn register(registry: &KernelRegistry) -> Result<(), KernelError> {
 // ---------------------------------------------------------------------------
 
 /// Create a u32 Metal constant buffer.
-fn make_u32_buf(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, val: u32) -> rmlx_metal::MtlBuffer {
-    unsafe { device.newBufferWithBytes_length_options(std::ptr::NonNull::new(&val as *const u32 as *const _ as *mut std::ffi::c_void).unwrap(), std::mem::size_of::<u32>() as u64 as usize, MTLResourceOptions::StorageModeShared).unwrap() }
+fn make_u32_buf(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    val: u32,
+) -> rmlx_metal::MtlBuffer {
+    unsafe {
+        device
+            .newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(&val as *const u32 as *const _ as *mut std::ffi::c_void)
+                    .unwrap(),
+                std::mem::size_of::<u32>() as u64 as usize,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap()
+    }
 }
 
 // --------------------------------------------------------------------------- // Public API // ---------------------------------------------------------------------------
@@ -133,8 +145,11 @@ pub fn vjp_add(
     grad_output: &Array,
     queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<(Array, Array), KernelError> {
-    if grad_output.dtype() != DType::Float32 { return Err(KernelError::InvalidShape(format!( "vjp_add: requires Float32, got {:?}", grad_output.dtype() )));
-
+    if grad_output.dtype() != DType::Float32 {
+        return Err(KernelError::InvalidShape(format!(
+            "vjp_add: requires Float32, got {:?}",
+            grad_output.dtype()
+        )));
     }
 
     let numel = grad_output.numel();
@@ -160,8 +175,16 @@ pub fn vjp_add(
     enc.set_buffer(0, Some(grad_output.metal_buffer()), grad_output.offset());
     enc.set_buffer(1, Some(grad_a.metal_buffer()), 0);
     enc.set_buffer(2, Some(grad_b.metal_buffer()), 0);
-    let grid = MTLSize { width: numel, height: 1, depth: 1 };
-    let tg = MTLSize { width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), numel), height: 1, depth: 1 };
+    let grid = MTLSize {
+        width: numel,
+        height: 1,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), numel),
+        height: 1,
+        depth: 1,
+    };
     enc.dispatch_threads(grid, tg);
     enc.end();
     super::commit_with_mode(&cb, super::ExecMode::Sync);
@@ -213,8 +236,16 @@ pub fn vjp_mul(
     enc.set_buffer(2, Some(b.metal_buffer()), b.offset());
     enc.set_buffer(3, Some(grad_a.metal_buffer()), 0);
     enc.set_buffer(4, Some(grad_b.metal_buffer()), 0);
-    let grid = MTLSize { width: numel, height: 1, depth: 1 };
-    let tg = MTLSize { width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), numel), height: 1, depth: 1 };
+    let grid = MTLSize {
+        width: numel,
+        height: 1,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), numel),
+        height: 1,
+        depth: 1,
+    };
     enc.dispatch_threads(grid, tg);
     enc.end();
     super::commit_with_mode(&cb, super::ExecMode::Sync);
@@ -291,8 +322,16 @@ pub fn vjp_matmul(
         let tg_x = tw.min(k);
         let tg_y = (max_tg / tg_x).max(1).min(m);
 
-        let grid = MTLSize { width: k, height: m, depth: 1 };
-        let tg = MTLSize { width: tg_x, height: tg_y, depth: 1 };
+        let grid = MTLSize {
+            width: k,
+            height: m,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: tg_x,
+            height: tg_y,
+            depth: 1,
+        };
         enc.dispatch_threads(grid, tg);
         enc.end();
         super::commit_with_mode(&cb, super::ExecMode::Sync);
@@ -316,8 +355,16 @@ pub fn vjp_matmul(
         let tg_x = tw.min(n);
         let tg_y = (max_tg / tg_x).max(1).min(k);
 
-        let grid = MTLSize { width: n, height: k, depth: 1 };
-        let tg = MTLSize { width: tg_x, height: tg_y, depth: 1 };
+        let grid = MTLSize {
+            width: n,
+            height: k,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: tg_x,
+            height: tg_y,
+            depth: 1,
+        };
         enc.dispatch_threads(grid, tg);
         enc.end();
         super::commit_with_mode(&cb, super::ExecMode::Sync);

@@ -40,8 +40,7 @@ impl<'a> ComputePass<'a> {
         offset: usize,
     ) {
         unsafe {
-            self.0
-                .setBuffer_offset_atIndex(buf, offset, index as usize);
+            self.0.setBuffer_offset_atIndex(buf, offset, index as usize);
         }
     }
 
@@ -79,7 +78,11 @@ impl<'a> ComputePass<'a> {
         bufs: &[Option<&ProtocolObject<dyn MTLBuffer>>],
         offsets: &[usize],
     ) {
-        debug_assert_eq!(bufs.len(), offsets.len(), "bufs and offsets length mismatch");
+        debug_assert_eq!(
+            bufs.len(),
+            offsets.len(),
+            "bufs and offsets length mismatch"
+        );
         unsafe {
             self.0.setBuffers_offsets_withRange(
                 NonNull::new(bufs.as_ptr() as *mut _).unwrap(),
@@ -98,8 +101,7 @@ impl<'a> ComputePass<'a> {
     /// Dispatch threadgroups (grid is in threadgroup units, not thread units).
     #[inline(always)]
     pub fn dispatch_threadgroups(&self, grid: MTLSize, tg: MTLSize) {
-        self.0
-            .dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        self.0.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
     }
 
     /// Set the active compute pipeline state.

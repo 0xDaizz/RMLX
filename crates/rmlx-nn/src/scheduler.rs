@@ -399,8 +399,7 @@ mod tests {
     use rmlx_metal::MtlDevice;
 
     fn test_device() -> MtlDevice {
-        objc2_metal::MTLCreateSystemDefaultDevice()
-            .expect("no Metal device available")
+        objc2_metal::MTLCreateSystemDefaultDevice().expect("no Metal device available")
     }
 
     /// Helper: create a BlockManager with small parameters for testing.

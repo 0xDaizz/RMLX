@@ -10,14 +10,14 @@
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
-use rmlx_metal::MTLSize;
-use rmlx_metal::ComputePass;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::MTLComputePipelineState as _;
 use objc2_metal::MTLCommandBuffer as _;
 use objc2_metal::MTLCommandQueue as _;
+use objc2_metal::MTLComputePipelineState as _;
 use objc2_metal::MTLDevice as _;
+use rmlx_metal::ComputePass;
 use rmlx_metal::MTLResourceOptions;
+use rmlx_metal::MTLSize;
 
 /// Metal shader source for convolution kernels.
 pub const CONV_SHADER_SOURCE: &str = r#"
@@ -399,12 +399,18 @@ fn conv2d_kernel_name(dtype: DType) -> Result<&'static str, KernelError> {
 }
 
 /// Create a Metal buffer containing a `[u32]` parameter array.
-fn make_params_buf(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, params: &[u32]) -> rmlx_metal::MtlBuffer {
+fn make_params_buf(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    params: &[u32],
+) -> rmlx_metal::MtlBuffer {
     let byte_len = std::mem::size_of_val(params);
     unsafe {
         device
             .newBufferWithBytes_length_options(
-                std::ptr::NonNull::new(params.as_ptr() as *const std::ffi::c_void as *mut std::ffi::c_void).unwrap(),
+                std::ptr::NonNull::new(
+                    params.as_ptr() as *const std::ffi::c_void as *mut std::ffi::c_void
+                )
+                .unwrap(),
                 byte_len,
                 MTLResourceOptions::StorageModeShared,
             )
@@ -414,7 +420,9 @@ fn make_params_buf(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, params: 
 
 /// Create a tiny dummy buffer (4 bytes) for the bias slot when bias is absent.
 fn make_dummy_buf(device: &ProtocolObject<dyn objc2_metal::MTLDevice>) -> rmlx_metal::MtlBuffer {
-    device.newBufferWithLength_options(4_usize, MTLResourceOptions::StorageModeShared).unwrap()
+    device
+        .newBufferWithLength_options(4_usize, MTLResourceOptions::StorageModeShared)
+        .unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -583,13 +591,21 @@ pub fn conv1d(
     encoder.set_buffer(3, Some(out.metal_buffer()), out.offset());
     encoder.set_buffer(4, Some(&params_buf), 0);
     // Grid: (W_out, C_out, B)
-    let grid_size = MTLSize { width: w_out, height: c_out, depth: batch };
+    let grid_size = MTLSize {
+        width: w_out,
+        height: c_out,
+        depth: batch,
+    };
     let max_threads = pipeline.maxTotalThreadsPerThreadgroup();
     // Choose threadgroup dimensions: fit as many spatial threads as possible
     let tg_x = std::cmp::min(w_out, max_threads);
     let tg_y = std::cmp::min(c_out, max_threads / tg_x);
     let tg_z = std::cmp::min(batch, max_threads / (tg_x * tg_y));
-    let threadgroup_size = MTLSize { width: tg_x, height: tg_y, depth: tg_z };
+    let threadgroup_size = MTLSize {
+        width: tg_x,
+        height: tg_y,
+        depth: tg_z,
+    };
 
     encoder.dispatch_threads(grid_size, threadgroup_size);
     encoder.end();
@@ -775,12 +791,20 @@ pub fn conv2d(
     encoder.set_buffer(4, Some(&params_buf), 0);
     // Grid: (H_out * W_out, C_out, B)
     let spatial = h_out * w_out;
-    let grid_size = MTLSize { width: spatial, height: c_out, depth: batch };
+    let grid_size = MTLSize {
+        width: spatial,
+        height: c_out,
+        depth: batch,
+    };
     let max_threads = pipeline.maxTotalThreadsPerThreadgroup();
     let tg_x = std::cmp::min(spatial, max_threads);
     let tg_y = std::cmp::min(c_out, max_threads / tg_x);
     let tg_z = std::cmp::min(batch, max_threads / (tg_x * tg_y));
-    let threadgroup_size = MTLSize { width: tg_x, height: tg_y, depth: tg_z };
+    let threadgroup_size = MTLSize {
+        width: tg_x,
+        height: tg_y,
+        depth: tg_z,
+    };
 
     encoder.dispatch_threads(grid_size, threadgroup_size);
     encoder.end();

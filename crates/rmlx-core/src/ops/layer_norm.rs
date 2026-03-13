@@ -10,14 +10,14 @@
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
-use rmlx_metal::MTLSize;
-use rmlx_metal::ComputePass;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::MTLComputePipelineState as _;
 use objc2_metal::MTLCommandBuffer as _;
 use objc2_metal::MTLCommandQueue as _;
+use objc2_metal::MTLComputePipelineState as _;
 use objc2_metal::MTLDevice as _;
+use rmlx_metal::ComputePass;
 use rmlx_metal::MTLResourceOptions;
+use rmlx_metal::MTLSize;
 
 // ---------------------------------------------------------------------------
 // Metal shader source
@@ -348,9 +348,23 @@ pub fn register(registry: &KernelRegistry) -> Result<(), KernelError> {
 }
 
 /// Create a constant buffer on the device.
-pub(crate) fn make_const_buf<T: Copy>(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, val: T) -> rmlx_metal::MtlBuffer {
+pub(crate) fn make_const_buf<T: Copy>(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    val: T,
+) -> rmlx_metal::MtlBuffer {
     let size = std::mem::size_of::<T>();
-    unsafe { device.newBufferWithBytes_length_options(std::ptr::NonNull::new(&val as *const T as *const std::ffi::c_void as *mut std::ffi::c_void).unwrap(), size, MTLResourceOptions::StorageModeShared).unwrap() }
+    unsafe {
+        device
+            .newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(
+                    &val as *const T as *const std::ffi::c_void as *mut std::ffi::c_void,
+                )
+                .unwrap(),
+                size,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap()
+    }
 }
 
 /// Apply Layer Normalization: `y = (x - mean) / sqrt(var + eps) * weight + bias`. /// /// - `input` shape: `[rows, axis_size]` (2-D). /// - `weight` shape: `[axis_size]` (1-D), or `None` for weight-free normalisation. /// - `bias` shape: `[axis_size]` (1-D), or `None` for bias-free normalisation. /// - `eps`: small constant for numerical stability. pub
@@ -362,8 +376,11 @@ pub fn layer_norm(
     eps: f32,
     queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
-    if input.ndim() != 2 { return Err(KernelError::InvalidShape(format!( "layer_norm requires 2D input, got {}D", input.ndim() )));
-
+    if input.ndim() != 2 {
+        return Err(KernelError::InvalidShape(format!(
+            "layer_norm requires 2D input, got {}D",
+            input.ndim()
+        )));
     }
 
     let axis_size_usize = input.shape()[1];
@@ -463,7 +480,18 @@ pub fn layer_norm(
     encoder.set_buffer(6, Some(&has_w_buf), 0);
     encoder.set_buffer(7, Some(&has_b_buf), 0);
     let tg_size = std::cmp::min(1024, pipeline.maxTotalThreadsPerThreadgroup());
-    encoder.dispatch_threadgroups(MTLSize { width: rows as usize, height: 1, depth: 1 }, MTLSize { width: tg_size, height: 1, depth: 1 });
+    encoder.dispatch_threadgroups(
+        MTLSize {
+            width: rows as usize,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        },
+    );
     encoder.end();
     super::commit_with_mode(&cb, super::ExecMode::Sync);
 

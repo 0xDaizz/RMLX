@@ -21,7 +21,7 @@ use crate::mla::{Mla, MlaConfig, MlaKvCache};
 use crate::moe::{MoeConfig, MoeLayer};
 use crate::transformer::{FeedForward, FeedForwardType, TransformerConfig};
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLCommandQueue};
+use objc2_metal::MTLCommandQueue;
 
 /// DeepSeek-V3 specific configuration fields not captured by `TransformerConfig`.
 ///

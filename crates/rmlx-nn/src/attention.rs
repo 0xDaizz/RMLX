@@ -10,7 +10,10 @@ use rmlx_core::ops;
 use crate::linear::{Linear, LinearConfig};
 
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputePipelineState, MTLDevice, MTLResourceOptions};
+use objc2_metal::{
+    MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+    MTLComputePipelineState, MTLDevice, MTLResourceOptions,
+};
 use rmlx_metal::{ComputePass, MTLSize};
 
 // ---------------------------------------------------------------------------
@@ -338,18 +341,38 @@ impl LayerKvCache {
         enc.set_pipeline(&pipeline);
         let dst_row_offset = self.seq_len * self.head_dim * elem_size;
 
-        let grid = MTLSize { width: (count), height: 1, depth: 1 };
-        let tg = MTLSize { width: (std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), count)), height: 1, depth: 1 };
+        let grid = MTLSize {
+            width: (count),
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: (std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), count)),
+            height: 1,
+            depth: 1,
+        };
 
         for i in 0..self.num_kv_heads {
             // Copy new keys into slot
             enc.set_buffer(0, Some(new_keys[i].metal_buffer()), new_keys[i].offset());
-            enc.set_buffer(1, Some(self.keys[i].metal_buffer()), self.keys[i].offset() + dst_row_offset);
+            enc.set_buffer(
+                1,
+                Some(self.keys[i].metal_buffer()),
+                self.keys[i].offset() + dst_row_offset,
+            );
             enc.dispatch_threads(grid, tg);
 
             // Copy new values into slot
-            enc.set_buffer(0, Some(new_values[i].metal_buffer()), new_values[i].offset());
-            enc.set_buffer(1, Some(self.values[i].metal_buffer()), self.values[i].offset() + dst_row_offset);
+            enc.set_buffer(
+                0,
+                Some(new_values[i].metal_buffer()),
+                new_values[i].offset(),
+            );
+            enc.set_buffer(
+                1,
+                Some(self.values[i].metal_buffer()),
+                self.values[i].offset() + dst_row_offset,
+            );
             enc.dispatch_threads(grid, tg);
         }
         enc.end();
@@ -431,14 +454,34 @@ impl LayerKvCache {
         for i in 0..self.num_kv_heads {
             // Copy new keys into slot
             enc.set_buffer(0, Some(new_keys[i].metal_buffer()), new_keys[i].offset());
-            enc.set_buffer(1, Some(self.keys[i].metal_buffer()), self.keys[i].offset() + dst_row_offset);
-            let grid = MTLSize { width: (count), height: 1, depth: 1 };
-            let tg = MTLSize { width: (std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), count)), height: 1, depth: 1 };
+            enc.set_buffer(
+                1,
+                Some(self.keys[i].metal_buffer()),
+                self.keys[i].offset() + dst_row_offset,
+            );
+            let grid = MTLSize {
+                width: (count),
+                height: 1,
+                depth: 1,
+            };
+            let tg = MTLSize {
+                width: (std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), count)),
+                height: 1,
+                depth: 1,
+            };
             enc.dispatch_threads(grid, tg);
 
             // Copy new values into slot
-            enc.set_buffer(0, Some(new_values[i].metal_buffer()), new_values[i].offset());
-            enc.set_buffer(1, Some(self.values[i].metal_buffer()), self.values[i].offset() + dst_row_offset);
+            enc.set_buffer(
+                0,
+                Some(new_values[i].metal_buffer()),
+                new_values[i].offset(),
+            );
+            enc.set_buffer(
+                1,
+                Some(self.values[i].metal_buffer()),
+                self.values[i].offset() + dst_row_offset,
+            );
             enc.dispatch_threads(grid, tg);
         }
         enc.end();
@@ -653,14 +696,34 @@ impl LayerKvCache {
         for i in 0..self.num_kv_heads {
             // Copy new keys into slot
             encoder.set_buffer(0, Some(new_keys[i].metal_buffer()), new_keys[i].offset());
-            encoder.set_buffer(1, Some(self.keys[i].metal_buffer()), self.keys[i].offset() + dst_row_offset);
-            let grid = MTLSize { width: count, height: 1, depth: 1 };
-            let tg = MTLSize { width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), count), height: 1, depth: 1 };
+            encoder.set_buffer(
+                1,
+                Some(self.keys[i].metal_buffer()),
+                self.keys[i].offset() + dst_row_offset,
+            );
+            let grid = MTLSize {
+                width: count,
+                height: 1,
+                depth: 1,
+            };
+            let tg = MTLSize {
+                width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), count),
+                height: 1,
+                depth: 1,
+            };
             encoder.dispatch_threads(grid, tg);
 
             // Copy new values into slot
-            encoder.set_buffer(0, Some(new_values[i].metal_buffer()), new_values[i].offset());
-            encoder.set_buffer(1, Some(self.values[i].metal_buffer()), self.values[i].offset() + dst_row_offset);
+            encoder.set_buffer(
+                0,
+                Some(new_values[i].metal_buffer()),
+                new_values[i].offset(),
+            );
+            encoder.set_buffer(
+                1,
+                Some(self.values[i].metal_buffer()),
+                self.values[i].offset() + dst_row_offset,
+            );
             encoder.dispatch_threads(grid, tg);
         }
 
@@ -718,13 +781,33 @@ impl LayerKvCache {
 
         for i in 0..self.num_kv_heads {
             encoder.set_buffer(0, Some(new_keys[i].metal_buffer()), new_keys[i].offset());
-            encoder.set_buffer(1, Some(self.keys[i].metal_buffer()), self.keys[i].offset() + dst_row_offset);
-            let grid = MTLSize { width: count, height: 1, depth: 1 };
-            let tg = MTLSize { width: std::cmp::min(copy_pso.maxTotalThreadsPerThreadgroup(), count), height: 1, depth: 1 };
+            encoder.set_buffer(
+                1,
+                Some(self.keys[i].metal_buffer()),
+                self.keys[i].offset() + dst_row_offset,
+            );
+            let grid = MTLSize {
+                width: count,
+                height: 1,
+                depth: 1,
+            };
+            let tg = MTLSize {
+                width: std::cmp::min(copy_pso.maxTotalThreadsPerThreadgroup(), count),
+                height: 1,
+                depth: 1,
+            };
             encoder.dispatch_threads(grid, tg);
 
-            encoder.set_buffer(0, Some(new_values[i].metal_buffer()), new_values[i].offset());
-            encoder.set_buffer(1, Some(self.values[i].metal_buffer()), self.values[i].offset() + dst_row_offset);
+            encoder.set_buffer(
+                0,
+                Some(new_values[i].metal_buffer()),
+                new_values[i].offset(),
+            );
+            encoder.set_buffer(
+                1,
+                Some(self.values[i].metal_buffer()),
+                self.values[i].offset() + dst_row_offset,
+            );
             encoder.dispatch_threads(grid, tg);
         }
 
@@ -778,18 +861,34 @@ impl LayerKvCache {
 
         encoder.set_pipeline(copy_pso);
 
-        let grid = MTLSize { width: count, height: 1, depth: 1 };
-        let tg = MTLSize { width: std::cmp::min(copy_max_tg as usize, count), height: 1, depth: 1 };
+        let grid = MTLSize {
+            width: count,
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: std::cmp::min(copy_max_tg as usize, count),
+            height: 1,
+            depth: 1,
+        };
 
         for i in 0..self.num_kv_heads {
             let src_k_off = k_base_offset as usize + i * head_stride;
             encoder.set_buffer(0, Some(k_buf), src_k_off);
-            encoder.set_buffer(1, Some(self.keys[i].metal_buffer()), self.keys[i].offset() + dst_row_offset);
+            encoder.set_buffer(
+                1,
+                Some(self.keys[i].metal_buffer()),
+                self.keys[i].offset() + dst_row_offset,
+            );
             encoder.dispatch_threads(grid, tg);
 
             let src_v_off = v_base_offset as usize + i * head_stride;
             encoder.set_buffer(0, Some(v_buf), src_v_off);
-            encoder.set_buffer(1, Some(self.values[i].metal_buffer()), self.values[i].offset() + dst_row_offset);
+            encoder.set_buffer(
+                1,
+                Some(self.values[i].metal_buffer()),
+                self.values[i].offset() + dst_row_offset,
+            );
             encoder.dispatch_threads(grid, tg);
         }
 
@@ -1175,8 +1274,16 @@ impl RotatingKvCache {
             enc.set_pipeline(&pipeline);
             enc.set_buffer(0, Some(buf.metal_buffer()), buf.offset());
             enc.set_buffer(1, Some(result.metal_buffer()), result.offset());
-            let grid = MTLSize { width: (count), height: 1, depth: 1 };
-            let tg = MTLSize { width: (std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), count)), height: 1, depth: 1 };
+            let grid = MTLSize {
+                width: (count),
+                height: 1,
+                depth: 1,
+            };
+            let tg = MTLSize {
+                width: (std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), count)),
+                height: 1,
+                depth: 1,
+            };
             enc.dispatch_threads(grid, tg);
             enc.end();
         }
@@ -1191,8 +1298,16 @@ impl RotatingKvCache {
             enc.set_pipeline(&pipeline);
             enc.set_buffer(0, Some(buf.metal_buffer()), src_off);
             enc.set_buffer(1, Some(result.metal_buffer()), dst_off);
-            let grid = MTLSize { width: (count), height: 1, depth: 1 };
-            let tg = MTLSize { width: (std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), count)), height: 1, depth: 1 };
+            let grid = MTLSize {
+                width: (count),
+                height: 1,
+                depth: 1,
+            };
+            let tg = MTLSize {
+                width: (std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), count)),
+                height: 1,
+                depth: 1,
+            };
             enc.dispatch_threads(grid, tg);
             enc.end();
         }
@@ -1201,15 +1316,22 @@ impl RotatingKvCache {
         if part3_len > 0 {
             let count = part3_len * self.head_dim;
             let src_off = buf.offset() + keep * self.head_dim * elem_size;
-            let dst_off =
-                result.offset() + (part1_len + part2_len) * self.head_dim * elem_size;
+            let dst_off = result.offset() + (part1_len + part2_len) * self.head_dim * elem_size;
             let raw_enc = cb.computeCommandEncoder().unwrap();
             let enc = ComputePass::new(&raw_enc);
             enc.set_pipeline(&pipeline);
             enc.set_buffer(0, Some(buf.metal_buffer()), src_off);
             enc.set_buffer(1, Some(result.metal_buffer()), dst_off);
-            let grid = MTLSize { width: (count), height: 1, depth: 1 };
-            let tg = MTLSize { width: (std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), count)), height: 1, depth: 1 };
+            let grid = MTLSize {
+                width: (count),
+                height: 1,
+                depth: 1,
+            };
+            let tg = MTLSize {
+                width: (std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), count)),
+                height: 1,
+                depth: 1,
+            };
             enc.dispatch_threads(grid, tg);
             enc.end();
         }
@@ -1309,9 +1431,21 @@ impl RotatingKvCache {
         let enc = ComputePass::new(&raw_enc);
         enc.set_pipeline(&pipeline);
         enc.set_buffer(0, Some(src.metal_buffer()), src.offset());
-        enc.set_buffer(1, Some(dst.metal_buffer()), dst.offset() + dst_row * self.head_dim * elem_size);
-        let grid = MTLSize { width: (num_elems), height: 1, depth: 1 };
-        let tg = MTLSize { width: (std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), num_elems)), height: 1, depth: 1 };
+        enc.set_buffer(
+            1,
+            Some(dst.metal_buffer()),
+            dst.offset() + dst_row * self.head_dim * elem_size,
+        );
+        let grid = MTLSize {
+            width: (num_elems),
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: (std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), num_elems)),
+            height: 1,
+            depth: 1,
+        };
         enc.dispatch_threads(grid, tg);
         enc.end();
         cb.commit();
@@ -1357,9 +1491,21 @@ impl RotatingKvCache {
             let enc = ComputePass::new(&raw_enc);
             enc.set_pipeline(&pipeline);
             enc.set_buffer(0, Some(new_keys[i].metal_buffer()), new_keys[i].offset());
-            enc.set_buffer(1, Some(self.keys[i].metal_buffer()), self.keys[i].offset() + dst_byte_offset);
-            let grid = MTLSize { width: (count), height: 1, depth: 1 };
-            let tg = MTLSize { width: (std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), count)), height: 1, depth: 1 };
+            enc.set_buffer(
+                1,
+                Some(self.keys[i].metal_buffer()),
+                self.keys[i].offset() + dst_byte_offset,
+            );
+            let grid = MTLSize {
+                width: (count),
+                height: 1,
+                depth: 1,
+            };
+            let tg = MTLSize {
+                width: (std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), count)),
+                height: 1,
+                depth: 1,
+            };
             enc.dispatch_threads(grid, tg);
             enc.end();
 
@@ -1367,8 +1513,16 @@ impl RotatingKvCache {
             let raw_enc = cb.computeCommandEncoder().unwrap();
             let enc = ComputePass::new(&raw_enc);
             enc.set_pipeline(&pipeline);
-            enc.set_buffer(0, Some(new_values[i].metal_buffer()), new_values[i].offset());
-            enc.set_buffer(1, Some(self.values[i].metal_buffer()), self.values[i].offset() + dst_byte_offset);
+            enc.set_buffer(
+                0,
+                Some(new_values[i].metal_buffer()),
+                new_values[i].offset(),
+            );
+            enc.set_buffer(
+                1,
+                Some(self.values[i].metal_buffer()),
+                self.values[i].offset() + dst_byte_offset,
+            );
             enc.dispatch_threads(grid, tg);
             enc.end();
         }
@@ -1586,8 +1740,16 @@ fn concat_seq_dim(
         enc.set_pipeline(&pipeline);
         enc.set_buffer(0, Some(a.metal_buffer()), a.offset());
         enc.set_buffer(1, Some(result.metal_buffer()), result.offset());
-        let grid = MTLSize { width: (a_count), height: 1, depth: 1 };
-        let tg = MTLSize { width: (std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), a_count)), height: 1, depth: 1 };
+        let grid = MTLSize {
+            width: (a_count),
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: (std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), a_count)),
+            height: 1,
+            depth: 1,
+        };
         enc.dispatch_threads(grid, tg);
         enc.end();
     }
@@ -1601,8 +1763,16 @@ fn concat_seq_dim(
         enc.set_pipeline(&pipeline);
         enc.set_buffer(0, Some(b.metal_buffer()), b.offset());
         enc.set_buffer(1, Some(result.metal_buffer()), dst_offset);
-        let grid = MTLSize { width: (b_count), height: 1, depth: 1 };
-        let tg = MTLSize { width: (std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), b_count)), height: 1, depth: 1 };
+        let grid = MTLSize {
+            width: (b_count),
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: (std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), b_count)),
+            height: 1,
+            depth: 1,
+        };
         enc.dispatch_threads(grid, tg);
         enc.end();
     }
@@ -1761,9 +1931,9 @@ impl Attention {
 
         // Project Q, K, V (single command buffer for all 3)
         let proj_cb = queue.commandBuffer().unwrap();
-let q = self.q_proj.forward_into_cb(x, registry, &proj_cb)?;
-let k = self.k_proj.forward_into_cb(x, registry, &proj_cb)?;
-let v = self.v_proj.forward_into_cb(x, registry, &proj_cb)?;
+        let q = self.q_proj.forward_into_cb(x, registry, &proj_cb)?;
+        let k = self.k_proj.forward_into_cb(x, registry, &proj_cb)?;
+        let v = self.v_proj.forward_into_cb(x, registry, &proj_cb)?;
         proj_cb.commit();
         proj_cb.waitUntilCompleted();
 
@@ -1972,8 +2142,16 @@ let v = self.v_proj.forward_into_cb(x, registry, &proj_cb)?;
                 enc.set_buffer(0, Some(head_out.metal_buffer()), head_out.offset());
                 enc.set_buffer(1, Some(concat.metal_buffer()), dst_col_offset);
                 let count = head_dim;
-                let grid = MTLSize { width: (count), height: 1, depth: 1 };
-                let tg = MTLSize { width: (std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), count)), height: 1, depth: 1 };
+                let grid = MTLSize {
+                    width: (count),
+                    height: 1,
+                    depth: 1,
+                };
+                let tg = MTLSize {
+                    width: (std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), count)),
+                    height: 1,
+                    depth: 1,
+                };
                 enc.dispatch_threads(grid, tg);
                 enc.end();
             }
@@ -2008,8 +2186,16 @@ let v = self.v_proj.forward_into_cb(x, registry, &proj_cb)?;
                 enc.set_buffer(0, Some(head_out.metal_buffer()), head_out.offset());
                 enc.set_buffer(1, Some(packed.metal_buffer()), dst_offset);
                 let count = head_elems;
-                let grid = MTLSize { width: (count), height: 1, depth: 1 };
-                let tg = MTLSize { width: (std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), count)), height: 1, depth: 1 };
+                let grid = MTLSize {
+                    width: (count),
+                    height: 1,
+                    depth: 1,
+                };
+                let tg = MTLSize {
+                    width: (std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), count)),
+                    height: 1,
+                    depth: 1,
+                };
                 enc.dispatch_threads(grid, tg);
                 enc.end();
             }
@@ -2239,8 +2425,16 @@ let v = self.v_proj.forward_into_cb(x, registry, &proj_cb)?;
                 enc.set_buffer(0, Some(head_out.metal_buffer()), head_out.offset());
                 enc.set_buffer(1, Some(concat.metal_buffer()), dst_col_offset);
                 let count = head_dim;
-                let grid = MTLSize { width: (count), height: 1, depth: 1 };
-                let tg = MTLSize { width: (std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), count)), height: 1, depth: 1 };
+                let grid = MTLSize {
+                    width: (count),
+                    height: 1,
+                    depth: 1,
+                };
+                let tg = MTLSize {
+                    width: (std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), count)),
+                    height: 1,
+                    depth: 1,
+                };
                 enc.dispatch_threads(grid, tg);
                 enc.end();
             }
@@ -2272,8 +2466,16 @@ let v = self.v_proj.forward_into_cb(x, registry, &proj_cb)?;
                     enc.set_buffer(0, Some(head_out.metal_buffer()), head_out.offset());
                     enc.set_buffer(1, Some(packed.metal_buffer()), dst_offset);
                     let count = head_elems;
-                    let grid = MTLSize { width: (count), height: 1, depth: 1 };
-                    let tg = MTLSize { width: (std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), count)), height: 1, depth: 1 };
+                    let grid = MTLSize {
+                        width: (count),
+                        height: 1,
+                        depth: 1,
+                    };
+                    let tg = MTLSize {
+                        width: (std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), count)),
+                        height: 1,
+                        depth: 1,
+                    };
                     enc.dispatch_threads(grid, tg);
                     enc.end();
                 }
@@ -3280,7 +3482,10 @@ let v = self.v_proj.forward_into_cb(x, registry, &proj_cb)?;
     /// Merge Q/K/V projection weights into a single [q_out+k_out+v_out, in_features] matrix.
     ///
     /// Must be called once after weights are loaded and before `forward_decode_9dispatch`.
-    pub fn prepare_merged_qkv(&mut self, device: &ProtocolObject<dyn MTLDevice>) -> Result<(), KernelError> {
+    pub fn prepare_merged_qkv(
+        &mut self,
+        device: &ProtocolObject<dyn MTLDevice>,
+    ) -> Result<(), KernelError> {
         let q_w = self.q_proj.weight().ok_or_else(|| {
             KernelError::InvalidShape(
                 "Attention::prepare_merged_qkv: q_proj weight not loaded".into(),
@@ -3330,7 +3535,9 @@ let v = self.v_proj.forward_into_cb(x, registry, &proj_cb)?;
         let elem_size = q_w.dtype().size_of();
         let total_bytes = total_rows * cols * elem_size;
 
-        let buf = device.newBufferWithLength_options(total_bytes, MTLResourceOptions::StorageModeShared).unwrap();
+        let buf = device
+            .newBufferWithLength_options(total_bytes, MTLResourceOptions::StorageModeShared)
+            .unwrap();
 
         unsafe {
             let dst = buf.contents().as_ptr() as *mut u8;
@@ -3363,7 +3570,9 @@ let v = self.v_proj.forward_into_cb(x, registry, &proj_cb)?;
 
         // Also create transposed merged weight [cols, total_rows] for prefill GEMM.
         // Column-concatenate the transposed individual weights.
-        let buf_t = device.newBufferWithLength_options(total_bytes, MTLResourceOptions::StorageModeShared).unwrap();
+        let buf_t = device
+            .newBufferWithLength_options(total_bytes, MTLResourceOptions::StorageModeShared)
+            .unwrap();
         unsafe {
             let dst = buf_t.contents().as_ptr() as *mut u8;
             // Transpose: dst[col][row] = src[row][col]
@@ -3373,7 +3582,8 @@ let v = self.v_proj.forward_into_cb(x, registry, &proj_cb)?;
                 .as_ref()
                 .unwrap()
                 .metal_buffer()
-                .contents().as_ptr() as *const u8;
+                .contents()
+                .as_ptr() as *const u8;
             for r in 0..total_rows {
                 for c in 0..cols {
                     let src_idx = (r * cols + c) * elem_size;
@@ -3396,7 +3606,11 @@ let v = self.v_proj.forward_into_cb(x, registry, &proj_cb)?;
     /// Convert all static weights to `StorageModePrivate` (GPU-only).
     ///
     /// Call after loading weights and before the inference loop.
-    pub fn prepare_weights_private(&mut self, device: &ProtocolObject<dyn MTLDevice>, queue: &ProtocolObject<dyn MTLCommandQueue>) {
+    pub fn prepare_weights_private(
+        &mut self,
+        device: &ProtocolObject<dyn MTLDevice>,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
+    ) {
         self.q_proj.convert_weights_private(device, queue);
         self.k_proj.convert_weights_private(device, queue);
         self.v_proj.convert_weights_private(device, queue);
@@ -3472,7 +3686,7 @@ let v = self.v_proj.forward_into_cb(x, registry, &proj_cb)?;
             &x_2d,
             Some(norm_weight),
             rms_norm_eps,
-encoder_a,
+            encoder_a,
         )?;
         // Memory barrier: ensure normed is visible to dispatch 2
         rmlx_metal::memory_barrier_scope_buffers(encoder_a.raw());
@@ -3490,7 +3704,7 @@ encoder_a,
             normed.dtype(),
             normed.offset(),
         );
-let qkv = ops::gemv::gemv_into_encoder(registry, qkv_weight, &normed_vec, encoder_a)?;
+        let qkv = ops::gemv::gemv_into_encoder(registry, qkv_weight, &normed_vec, encoder_a)?;
         let elem_size = qkv.dtype().size_of();
         // qkv is [q_dim + k_dim + v_dim] flat
 
@@ -3524,7 +3738,7 @@ let qkv = ops::gemv::gemv_into_encoder(registry, qkv_weight, &normed_vec, encode
                 1.0,
                 false,
                 true,
-encoder_a,
+                encoder_a,
             )?;
             qk_roped_buf = qk_roped.metal_buffer().to_owned();
             qk_roped_offset = qk_roped.offset();
@@ -3563,7 +3777,7 @@ encoder_a,
                 v_offset + h * head_dim * elem_size,
             ));
         }
-cache.append_into_encoder(k_heads, v_heads, 1, registry, encoder_a)?;
+        cache.append_into_encoder(k_heads, v_heads, 1, registry, encoder_a)?;
 
         // End encoder A after KV append (no separate blit encoder needed)
         encoder_a.end();
@@ -3628,7 +3842,7 @@ cache.append_into_encoder(k_heads, v_heads, 1, registry, encoder_a)?;
             x.offset(),
         );
         let h =
-ops::gemv::gemv_bias_into_encoder(registry, o_weight, &attn_vec, &x_vec, encoder_b)?;
+            ops::gemv::gemv_bias_into_encoder(registry, o_weight, &attn_vec, &x_vec, encoder_b)?;
 
         encoder_b.end();
 
@@ -3697,7 +3911,7 @@ ops::gemv::gemv_bias_into_encoder(registry, o_weight, &attn_vec, &x_vec, encoder
             &x_2d,
             Some(norm_weight),
             rms_norm_eps,
-encoder_a,
+            encoder_a,
         )?;
         rmlx_metal::memory_barrier_scope_buffers(encoder_a.raw());
 
@@ -3713,7 +3927,7 @@ encoder_a,
             normed.dtype(),
             normed.offset(),
         );
-let qkv = ops::gemv::gemv_into_encoder(registry, qkv_weight, &normed_vec, encoder_a)?;
+        let qkv = ops::gemv::gemv_into_encoder(registry, qkv_weight, &normed_vec, encoder_a)?;
         let elem_size = qkv.dtype().size_of();
 
         let q_dim = num_heads * head_dim;
@@ -3740,7 +3954,7 @@ let qkv = ops::gemv::gemv_into_encoder(registry, qkv_weight, &normed_vec, encode
                 1.0,
                 false,
                 true,
-encoder_a,
+                encoder_a,
             )?;
             qk_roped_buf = qk_roped.metal_buffer().to_owned();
             qk_roped_offset = qk_roped.offset();
@@ -3776,7 +3990,7 @@ encoder_a,
                 v_offset + h * head_dim * elem_size,
             ));
         }
-cache.append_into_encoder(k_heads, v_heads, 1, registry, encoder_a)?;
+        cache.append_into_encoder(k_heads, v_heads, 1, registry, encoder_a)?;
 
         encoder_a.end();
 
@@ -3921,10 +4135,10 @@ cache.append_into_encoder(k_heads, v_heads, 1, registry, encoder_a)?;
             &x_2d,
             Some(norm_weight),
             rms_norm_eps,
-encoder_a,
+            encoder_a,
         )?;
         // Memory barrier: ensure normed is visible to dispatch 2
-rmlx_metal::memory_barrier_scope_buffers(encoder_a.raw());
+        rmlx_metal::memory_barrier_scope_buffers(encoder_a.raw());
 
         // Dispatch 2: merged QKV gemv
         let qkv_weight = self.qkv_merged_weight.as_ref().ok_or_else(|| {
@@ -3939,7 +4153,7 @@ rmlx_metal::memory_barrier_scope_buffers(encoder_a.raw());
             normed.dtype(),
             normed.offset(),
         );
-let qkv = ops::gemv::gemv_into_encoder(registry, qkv_weight, &normed_vec, encoder_a)?;
+        let qkv = ops::gemv::gemv_into_encoder(registry, qkv_weight, &normed_vec, encoder_a)?;
         let elem_size = qkv.dtype().size_of();
         // qkv is [q_dim + k_dim + v_dim] flat
 
@@ -3956,7 +4170,7 @@ let qkv = ops::gemv::gemv_into_encoder(registry, qkv_weight, &normed_vec, encode
         let (qk_roped_buf, qk_roped_offset, v_buf, v_offset);
         if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
             // Memory barrier: ensure qkv is visible to dispatch 3
-rmlx_metal::memory_barrier_scope_buffers(encoder_a.raw());
+            rmlx_metal::memory_barrier_scope_buffers(encoder_a.raw());
             let qk_3d = Array::new(
                 qkv.metal_buffer().to_owned(),
                 vec![total_rope_heads, 1, head_dim],
@@ -3973,7 +4187,7 @@ rmlx_metal::memory_barrier_scope_buffers(encoder_a.raw());
                 1.0,
                 false,
                 true,
-encoder_a,
+                encoder_a,
             )?;
             qk_roped_buf = qk_roped.metal_buffer().to_owned();
             qk_roped_offset = qk_roped.offset();
@@ -4074,7 +4288,7 @@ encoder_a,
             x.offset(),
         );
         let h =
-ops::gemv::gemv_bias_into_encoder(registry, o_weight, &attn_vec, &x_vec, encoder_b)?;
+            ops::gemv::gemv_bias_into_encoder(registry, o_weight, &attn_vec, &x_vec, encoder_b)?;
 
         encoder_b.end();
 
@@ -4907,8 +5121,13 @@ impl Attention {
         let normed = {
             let cb = queue.commandBuffer().unwrap();
             let start = Instant::now();
-            let out =
-                ops::rms_norm::rms_norm_into_cb(registry, x, Some(norm_weight), rms_norm_eps, &*cb)?;
+            let out = ops::rms_norm::rms_norm_into_cb(
+                registry,
+                x,
+                Some(norm_weight),
+                rms_norm_eps,
+                &*cb,
+            )?;
             cb.commit();
             cb.waitUntilCompleted();
             timings.push(("RMSNorm (pre-attn)", start.elapsed()));
@@ -5191,7 +5410,11 @@ mod tests {
     use objc2_metal::MTLCreateSystemDefaultDevice;
 
     #[allow(clippy::type_complexity)]
-    fn setup() -> (objc2::rc::Retained<ProtocolObject<dyn MTLDevice>>, KernelRegistry, objc2::rc::Retained<ProtocolObject<dyn MTLCommandQueue>>) {
+    fn setup() -> (
+        objc2::rc::Retained<ProtocolObject<dyn MTLDevice>>,
+        KernelRegistry,
+        objc2::rc::Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    ) {
         let device = MTLCreateSystemDefaultDevice().expect("no Metal device");
         let gpu = rmlx_metal::device::GpuDevice::system_default().expect("no GpuDevice");
         let queue = device.newCommandQueue().unwrap();
@@ -5201,7 +5424,12 @@ mod tests {
     }
 
     /// Helper: create an Array from a flat f32 slice with shape [rows, cols].
-    fn make_array(device: &ProtocolObject<dyn MTLDevice>, data: &[f32], rows: usize, cols: usize) -> Array {
+    fn make_array(
+        device: &ProtocolObject<dyn MTLDevice>,
+        data: &[f32],
+        rows: usize,
+        cols: usize,
+    ) -> Array {
         assert_eq!(data.len(), rows * cols);
         Array::from_slice(device, data, vec![rows, cols])
     }

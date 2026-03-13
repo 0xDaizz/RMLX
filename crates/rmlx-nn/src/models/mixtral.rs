@@ -15,7 +15,7 @@ use crate::moe::{MoeConfig, MoeLayer};
 use crate::sliding_window::{SlidingWindowAttention, SlidingWindowAttentionConfig};
 use crate::transformer::{FeedForward, FeedForwardType, TransformerConfig};
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLCommandQueue};
+use objc2_metal::MTLCommandQueue;
 
 /// Mixtral 8x7B configuration preset.
 pub fn mixtral_8x7b() -> TransformerConfig {

@@ -18,9 +18,7 @@ use crate::types::*;
 /// the regular `commandBuffer()` path would be needed, but RMLX targets
 /// M-series exclusively so we use unretained unconditionally.
 #[inline]
-pub fn fast_command_buffer(
-    queue: &ProtocolObject<dyn MTLCommandQueue>,
-) -> MtlCB {
+pub fn fast_command_buffer(queue: &ProtocolObject<dyn MTLCommandQueue>) -> MtlCB {
     queue.commandBufferWithUnretainedReferences().unwrap()
 }
 
@@ -32,9 +30,7 @@ pub fn fast_command_buffer(
 /// is committed to the GPU, causing use-after-free. Retained CBs hold strong
 /// references to all encoder resources, keeping buffers alive until GPU completion.
 #[inline]
-pub fn fast_command_buffer_owned(
-    queue: &ProtocolObject<dyn MTLCommandQueue>,
-) -> MtlCB {
+pub fn fast_command_buffer_owned(queue: &ProtocolObject<dyn MTLCommandQueue>) -> MtlCB {
     queue.commandBuffer().unwrap()
 }
 

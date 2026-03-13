@@ -2,10 +2,7 @@
 //! Tests require Metal GPU — gracefully skip if unavailable.
 
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{
-    MTLBuffer as _, MTLCommandBuffer as _, MTLCommandQueue as _,
-    MTLDevice as _,
-};
+use objc2_metal::{MTLBuffer as _, MTLCommandBuffer as _, MTLCommandQueue as _, MTLDevice as _};
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::KernelRegistry;
 use rmlx_core::ops;

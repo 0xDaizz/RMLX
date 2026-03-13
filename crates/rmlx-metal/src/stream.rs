@@ -21,6 +21,37 @@ use crate::fence::GpuFence;
 use crate::types::*;
 use crate::MetalError;
 
+// ---------------------------------------------------------------------------
+// Metal 4 state (opt-in via `metal4` feature)
+// ---------------------------------------------------------------------------
+
+/// Lazily-initialized Metal 4 command infrastructure.
+///
+/// Holds a [`CommandAllocator`] for CB memory reuse and a [`CommandQueue4`]
+/// for batch commit. Created on first call to
+/// [`StreamManager::init_metal4`] and only when the device actually
+/// supports Metal 4 (`GpuDevice::supports_metal4()`).
+#[cfg(feature = "metal4")]
+pub struct Metal4State {
+    /// Allocator for Metal 4 command buffers — reset between decode iterations.
+    pub allocator: crate::metal4::CommandAllocator,
+    /// Batch-commit queue (Metal 4).
+    pub queue4: crate::metal4::CommandQueue4,
+}
+
+#[cfg(feature = "metal4")]
+impl Metal4State {
+    /// Try to create Metal 4 state on `device`.
+    ///
+    /// Returns `None` if the device does not support Metal 4 or if
+    /// allocator/queue creation fails.
+    pub fn try_new(device: &ProtocolObject<dyn MTLDevice>) -> Option<Self> {
+        let allocator = crate::metal4::CommandAllocator::new(device)?;
+        let queue4 = crate::metal4::CommandQueue4::new(device)?;
+        Some(Self { allocator, queue4 })
+    }
+}
+
 /// Well-known stream IDs.
 pub const STREAM_DEFAULT: u32 = 0;
 pub const STREAM_COMPUTE: u32 = 1;
@@ -56,6 +87,9 @@ pub struct StreamManager {
     streams: HashMap<u32, StreamState>,
     /// Shared fence used for `synchronize()` calls between streams.
     sync_fence: GpuFence,
+    /// Optional Metal 4 state, lazily initialized via [`init_metal4`].
+    #[cfg(feature = "metal4")]
+    metal4: Option<Metal4State>,
 }
 
 /// Cross-stream synchronization helper.
@@ -78,42 +112,28 @@ impl StreamSync {
     /// Signal from a compute command buffer after compute work completes.
     ///
     /// Returns the signal value that the copy stream should wait on.
-    pub fn signal_from_compute(
-        &self,
-        compute_cb: &ProtocolObject<dyn MTLCommandBuffer>,
-    ) -> u64 {
+    pub fn signal_from_compute(&self, compute_cb: &ProtocolObject<dyn MTLCommandBuffer>) -> u64 {
         let value = self.fence.next_value();
         self.fence.signal(compute_cb, value);
         value
     }
 
     /// Wait on a copy command buffer until compute signals the given value.
-    pub fn wait_on_copy(
-        &self,
-        copy_cb: &ProtocolObject<dyn MTLCommandBuffer>,
-        value: u64,
-    ) {
+    pub fn wait_on_copy(&self, copy_cb: &ProtocolObject<dyn MTLCommandBuffer>, value: u64) {
         self.fence.wait(copy_cb, value);
     }
 
     /// Signal from a copy command buffer after copy/transfer completes.
     ///
     /// Returns the signal value that the compute stream should wait on.
-    pub fn signal_from_copy(
-        &self,
-        copy_cb: &ProtocolObject<dyn MTLCommandBuffer>,
-    ) -> u64 {
+    pub fn signal_from_copy(&self, copy_cb: &ProtocolObject<dyn MTLCommandBuffer>) -> u64 {
         let value = self.fence.next_value();
         self.fence.signal(copy_cb, value);
         value
     }
 
     /// Wait on a compute command buffer until copy signals the given value.
-    pub fn wait_on_compute(
-        &self,
-        compute_cb: &ProtocolObject<dyn MTLCommandBuffer>,
-        value: u64,
-    ) {
+    pub fn wait_on_compute(&self, compute_cb: &ProtocolObject<dyn MTLCommandBuffer>, value: u64) {
         self.fence.wait(compute_cb, value);
     }
 
@@ -141,6 +161,8 @@ impl StreamManager {
             device: retain_proto(device),
             streams,
             sync_fence,
+            #[cfg(feature = "metal4")]
+            metal4: None,
         }
     }
 
@@ -148,10 +170,7 @@ impl StreamManager {
     ///
     /// If the stream already exists, returns its command queue.
     /// Otherwise, creates a new queue on the device and inserts it.
-    pub fn get_or_create_stream(
-        &mut self,
-        id: u32,
-    ) -> &ProtocolObject<dyn MTLCommandQueue> {
+    pub fn get_or_create_stream(&mut self, id: u32) -> &ProtocolObject<dyn MTLCommandQueue> {
         let device = &self.device;
         let state = self
             .streams
@@ -164,7 +183,9 @@ impl StreamManager {
     ///
     /// Returns `None` if the stream has not been created yet.
     pub fn queue(&self, id: u32) -> Option<&ProtocolObject<dyn MTLCommandQueue>> {
-        self.streams.get(&id).map(|s| &*s.queue as &ProtocolObject<dyn MTLCommandQueue>)
+        self.streams
+            .get(&id)
+            .map(|s| &*s.queue as &ProtocolObject<dyn MTLCommandQueue>)
     }
 
     /// Create a command buffer on the given stream.
@@ -265,6 +286,42 @@ impl StreamManager {
     /// Whether a stream with `id` exists.
     pub fn has_stream(&self, id: u32) -> bool {
         self.streams.contains_key(&id)
+    }
+
+    /// Access the underlying device.
+    pub fn device(&self) -> &ProtocolObject<dyn MTLDevice> {
+        &self.device
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Metal 4 extensions on StreamManager
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "metal4")]
+impl StreamManager {
+    /// Initialize Metal 4 state (allocator + batch queue).
+    ///
+    /// This is a no-op if Metal 4 state has already been initialized.
+    /// Returns `true` if Metal 4 state is now available (either freshly
+    /// created or already existed), `false` if the device does not support
+    /// Metal 4.
+    pub fn init_metal4(&mut self) -> bool {
+        if self.metal4.is_some() {
+            return true;
+        }
+        self.metal4 = Metal4State::try_new(&self.device);
+        self.metal4.is_some()
+    }
+
+    /// Access the Metal 4 state, if initialized.
+    pub fn metal4_state(&self) -> Option<&Metal4State> {
+        self.metal4.as_ref()
+    }
+
+    /// Access the Metal 4 state mutably, if initialized.
+    pub fn metal4_state_mut(&mut self) -> Option<&mut Metal4State> {
+        self.metal4.as_mut()
     }
 }
 

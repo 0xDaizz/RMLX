@@ -21,6 +21,8 @@ bumpalo = { workspace = true }
 bench = []
 ## Forward tracked_hazards through to rmlx-metal.
 tracked_hazards = ["rmlx-metal/tracked_hazards"]
+## Forward metal4 through to rmlx-metal.
+metal4 = ["rmlx-metal/metal4"]
 
 [dev-dependencies]
 half = { workspace = true }

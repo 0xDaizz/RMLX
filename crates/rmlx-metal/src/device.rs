@@ -17,8 +17,7 @@ pub const TRACKED_BUFFER_OPTIONS: MTLResourceOptions = MTLResourceOptions::Stora
 /// MTLFence). Using this for buffers that bypass the barrier tracker
 /// will cause data races.
 pub const UNTRACKED_BUFFER_OPTIONS: MTLResourceOptions = MTLResourceOptions(
-    MTLResourceOptions::StorageModeShared.0
-        | MTLResourceOptions::HazardTrackingModeUntracked.0,
+    MTLResourceOptions::StorageModeShared.0 | MTLResourceOptions::HazardTrackingModeUntracked.0,
 );
 
 /// Default buffer options — untracked for performance (MLX-compatible).
@@ -370,6 +369,15 @@ impl GpuDevice {
     }
 }
 
+#[cfg(feature = "metal4")]
+impl GpuDevice {
+    /// Returns true if the device supports Metal 4 (macOS 26+, M1+).
+    pub fn supports_metal4(&self) -> bool {
+        use objc2_metal::MTLGPUFamily;
+        self.device.supportsFamily(MTLGPUFamily::Metal4)
+    }
+}
+
 /// Parse chip class from device name string.
 ///
 /// Only classifies Apple Silicon devices (names containing "M1"/"M2"/etc).
@@ -543,31 +551,49 @@ mod tests {
         // StorageModeShared is 0, so we verify by checking the storage mode bits
         // (bits 4-7) are zero (meaning Shared).
         const STORAGE_MODE_MASK: usize = 0xF0; // bits 4-7
-        assert_eq!(TRACKED_BUFFER_OPTIONS.0 & STORAGE_MODE_MASK, MTLResourceOptions::StorageModeShared.0 & STORAGE_MODE_MASK);
+        assert_eq!(
+            TRACKED_BUFFER_OPTIONS.0 & STORAGE_MODE_MASK,
+            MTLResourceOptions::StorageModeShared.0 & STORAGE_MODE_MASK
+        );
         // Not untracked
-        assert_eq!(TRACKED_BUFFER_OPTIONS.0 & MTLResourceOptions::HazardTrackingModeUntracked.0, 0);
+        assert_eq!(
+            TRACKED_BUFFER_OPTIONS.0 & MTLResourceOptions::HazardTrackingModeUntracked.0,
+            0
+        );
     }
 
     #[test]
     fn test_untracked_buffer_options() {
         const STORAGE_MODE_MASK: usize = 0xF0;
-        assert_eq!(UNTRACKED_BUFFER_OPTIONS.0 & STORAGE_MODE_MASK, MTLResourceOptions::StorageModeShared.0 & STORAGE_MODE_MASK);
+        assert_eq!(
+            UNTRACKED_BUFFER_OPTIONS.0 & STORAGE_MODE_MASK,
+            MTLResourceOptions::StorageModeShared.0 & STORAGE_MODE_MASK
+        );
         // Is untracked
-        assert_ne!(UNTRACKED_BUFFER_OPTIONS.0 & MTLResourceOptions::HazardTrackingModeUntracked.0, 0);
+        assert_ne!(
+            UNTRACKED_BUFFER_OPTIONS.0 & MTLResourceOptions::HazardTrackingModeUntracked.0,
+            0
+        );
     }
 
     #[test]
     #[cfg(not(feature = "tracked_hazards"))]
     fn test_default_buffer_options_is_untracked() {
         assert_eq!(DEFAULT_BUFFER_OPTIONS.0, UNTRACKED_BUFFER_OPTIONS.0);
-        assert_ne!(DEFAULT_BUFFER_OPTIONS.0 & MTLResourceOptions::HazardTrackingModeUntracked.0, 0);
+        assert_ne!(
+            DEFAULT_BUFFER_OPTIONS.0 & MTLResourceOptions::HazardTrackingModeUntracked.0,
+            0
+        );
     }
 
     #[test]
     #[cfg(feature = "tracked_hazards")]
     fn test_default_buffer_options_is_tracked() {
         assert_eq!(DEFAULT_BUFFER_OPTIONS.0, TRACKED_BUFFER_OPTIONS.0);
-        assert_eq!(DEFAULT_BUFFER_OPTIONS.0 & MTLResourceOptions::HazardTrackingModeUntracked.0, 0);
+        assert_eq!(
+            DEFAULT_BUFFER_OPTIONS.0 & MTLResourceOptions::HazardTrackingModeUntracked.0,
+            0
+        );
     }
 
     #[test]

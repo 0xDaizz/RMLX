@@ -30,8 +30,8 @@ use std::time::Duration;
 
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLCommandBuffer, MTLDevice};
-use rmlx_metal::{MTLResourceOptions, MtlBuffer};
 use rmlx_metal::event::{EventError, GpuEvent};
+use rmlx_metal::{MTLResourceOptions, MtlBuffer};
 
 // ── Slab ──
 
@@ -174,7 +174,10 @@ impl SlabRing {
         let mut slabs = Vec::with_capacity(config.depth);
         for i in 0..config.depth {
             let metal_buffer = device
-                .newBufferWithLength_options(config.slab_size, MTLResourceOptions::StorageModeShared)
+                .newBufferWithLength_options(
+                    config.slab_size,
+                    MTLResourceOptions::StorageModeShared,
+                )
                 .unwrap();
             slabs.push(Slab {
                 metal_buffer,
@@ -469,7 +472,7 @@ impl SlabRing {
 #[allow(clippy::arc_with_non_send_sync)]
 mod tests {
     use super::*;
-    use objc2_metal::{MTLCommandQueue as _, MTLBuffer as _};
+    use objc2_metal::{MTLBuffer as _, MTLCommandQueue as _};
     use std::time::Instant;
 
     /// Wrapper to assert Send+Sync for SlabRing in tests.
@@ -481,7 +484,9 @@ mod tests {
     unsafe impl Sync for SendRing {}
     impl std::ops::Deref for SendRing {
         type Target = SlabRing;
-        fn deref(&self) -> &SlabRing { &self.0 }
+        fn deref(&self) -> &SlabRing {
+            &self.0
+        }
     }
 
     /// Helper: get the default Metal device, skip test if unavailable.

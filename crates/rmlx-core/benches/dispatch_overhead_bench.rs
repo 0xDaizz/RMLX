@@ -17,16 +17,19 @@
 use std::time::Instant;
 
 use half::f16;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{
+    MTLCommandBuffer as _, MTLCommandEncoder as _, MTLCommandQueue as _,
+    MTLComputeCommandEncoder as _, MTLDevice as _,
+};
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::KernelRegistry;
 use rmlx_core::ops;
 use rmlx_metal::device::GpuDevice;
-use std::ptr::NonNull;
-use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLDevice as _, MTLCommandQueue as _, MTLCommandBuffer as _, MTLComputeCommandEncoder as _, MTLCommandEncoder as _};
-use rmlx_metal::{MTLSize, MTLResourceOptions};
 use rmlx_metal::types::{MtlBuffer, MtlPipeline};
+use rmlx_metal::{MTLResourceOptions, MTLSize};
+use std::ptr::NonNull;
 
 const WARMUP: usize = 5;
 const ITERS: usize = 20;
@@ -43,7 +46,11 @@ fn lcg_next(state: &mut u64) -> u64 {
     *state
 }
 
-fn rand_f16_array(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, shape: &[usize], seed: u64) -> Array {
+fn rand_f16_array(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    shape: &[usize],
+    seed: u64,
+) -> Array {
     let numel: usize = shape.iter().product();
     let mut state = seed;
     let mut f16_bytes = Vec::with_capacity(numel * 2);
@@ -58,7 +65,15 @@ fn rand_f16_array(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, shape: &[
 
 fn make_u32_buf(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, val: u32) -> MtlBuffer {
     let opts = MTLResourceOptions::StorageModeShared;
-    unsafe { device.newBufferWithBytes_length_options(NonNull::new(&val as *const u32 as *const _ as *mut _).unwrap(), 4_usize, opts).unwrap() }
+    unsafe {
+        device
+            .newBufferWithBytes_length_options(
+                NonNull::new(&val as *const u32 as *const _ as *mut _).unwrap(),
+                4_usize,
+                opts,
+            )
+            .unwrap()
+    }
 }
 
 fn percentile(sorted: &[f64], pct: f64) -> f64 {
@@ -202,8 +217,16 @@ fn main() {
 
         let grid_x = n.div_ceil(bn);
         let grid_y = m.div_ceil(bm);
-        let grid = MTLSize { width: grid_x, height: grid_y, depth: 1_usize };
-        let tg = MTLSize { width: threads as usize, height: 1_usize, depth: 1_usize };
+        let grid = MTLSize {
+            width: grid_x,
+            height: grid_y,
+            depth: 1_usize,
+        };
+        let tg = MTLSize {
+            width: threads as usize,
+            height: 1_usize,
+            depth: 1_usize,
+        };
 
         // --- Warmup (single dispatch) ---
         for _ in 0..WARMUP {
@@ -360,8 +383,16 @@ fn main() {
     let bsb_buf = make_u32_buf(device, (k * n) as u32);
     let bsc_buf = make_u32_buf(device, (128 * n) as u32);
     let swizzle_buf = make_u32_buf(device, 0);
-    let grid = MTLSize { width: n.div_ceil(bn), height: 128usize.div_ceil(bm), depth: 1_usize };
-    let tg = MTLSize { width: threads as usize, height: 1_usize, depth: 1_usize };
+    let grid = MTLSize {
+        width: n.div_ceil(bn),
+        height: 128usize.div_ceil(bm),
+        depth: 1_usize,
+    };
+    let tg = MTLSize {
+        width: threads as usize,
+        height: 1_usize,
+        depth: 1_usize,
+    };
 
     // Measure encoding time separately: create CB + encode + end, then commit+wait
     // We time only the encoding portion.

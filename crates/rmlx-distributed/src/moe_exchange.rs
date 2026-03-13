@@ -22,7 +22,10 @@
 use std::sync::{Arc, Mutex};
 
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLLibrary};
+use objc2_metal::{
+    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+    MTLComputePipelineState, MTLDevice, MTLLibrary,
+};
 
 use rmlx_rdma::shared_buffer::{ConnectionId, SharedBuffer};
 
@@ -83,7 +86,10 @@ impl ExchangeBuffers {
 ///
 /// Returns an error if `n` exceeds the buffer's length or the buffer pointer
 /// is null.
-fn read_buffer_bytes(buf: &ProtocolObject<dyn MTLBuffer>, n: usize) -> Result<Vec<u8>, DistributedError> {
+fn read_buffer_bytes(
+    buf: &ProtocolObject<dyn MTLBuffer>,
+    n: usize,
+) -> Result<Vec<u8>, DistributedError> {
     let buf_len = buf.length();
     if n > buf_len {
         return Err(DistributedError::Protocol(format!(
@@ -101,7 +107,10 @@ fn read_buffer_bytes(buf: &ProtocolObject<dyn MTLBuffer>, n: usize) -> Result<Ve
 ///
 /// Returns an error if `n * size_of::<f32>()` exceeds the buffer's byte length
 /// or the buffer pointer is null.
-fn read_buffer_f32(buf: &ProtocolObject<dyn MTLBuffer>, n: usize) -> Result<Vec<f32>, DistributedError> {
+fn read_buffer_f32(
+    buf: &ProtocolObject<dyn MTLBuffer>,
+    n: usize,
+) -> Result<Vec<f32>, DistributedError> {
     let byte_len = n.checked_mul(std::mem::size_of::<f32>()).ok_or_else(|| {
         DistributedError::Protocol(format!(
             "read_buffer_f32: overflow computing byte length for n={}",
@@ -1240,7 +1249,10 @@ impl MoeDispatchExchange {
                 }
             };
             let options = objc2_metal::MTLCompileOptions::new();
-            let library = match device.newLibraryWithSource_options_error(&objc2_foundation::NSString::from_str(METAL_ROUTE_KERNEL), Some(&options)) {
+            let library = match device.newLibraryWithSource_options_error(
+                &objc2_foundation::NSString::from_str(METAL_ROUTE_KERNEL),
+                Some(&options),
+            ) {
                 Ok(lib) => lib,
                 Err(_) => {
                     drop(cache_guard);
@@ -1253,7 +1265,9 @@ impl MoeDispatchExchange {
                     );
                 }
             };
-            let function = match library.newFunctionWithName(&objc2_foundation::NSString::from_str("moe_gather_scatter")) {
+            let function = match library
+                .newFunctionWithName(&objc2_foundation::NSString::from_str("moe_gather_scatter"))
+            {
                 Some(f) => f,
                 None => {
                     drop(cache_guard);
@@ -1310,15 +1324,18 @@ impl MoeDispatchExchange {
                 token_data.len(),
                 shared,
             )
-        }.unwrap();
+        }
+        .unwrap();
         let indices_buf = unsafe {
             cached.device.newBufferWithBytes_length_options(
                 std::ptr::NonNull::new(expert_indices.as_ptr() as *mut std::ffi::c_void).unwrap(),
                 expert_indices.len() * 4,
                 shared,
             )
-        }.unwrap();
-        let output_buf = cached.device
+        }
+        .unwrap();
+        let output_buf = cached
+            .device
             .newBufferWithLength_options(output_size.max(1), shared)
             .unwrap();
         // Per-rank cursors: local_expert_count * world_size
@@ -1330,7 +1347,8 @@ impl MoeDispatchExchange {
                 (cursor_count * 4).max(4),
                 shared,
             )
-        }.unwrap();
+        }
+        .unwrap();
 
         #[repr(C)]
         struct RouteParams {
@@ -1357,11 +1375,13 @@ impl MoeDispatchExchange {
         };
         let params_buf = unsafe {
             cached.device.newBufferWithBytes_length_options(
-                std::ptr::NonNull::new(&params as *const RouteParams as *mut std::ffi::c_void).unwrap(),
+                std::ptr::NonNull::new(&params as *const RouteParams as *mut std::ffi::c_void)
+                    .unwrap(),
                 std::mem::size_of::<RouteParams>(),
                 shared,
             )
-        }.unwrap();
+        }
+        .unwrap();
 
         // Encode and dispatch using cached queue and pipeline
         let cmd_buf = cached.queue.commandBuffer().unwrap();
@@ -1384,8 +1404,16 @@ impl MoeDispatchExchange {
         let tg_size = total_threads.min(max_tg);
 
         encoder.dispatchThreads_threadsPerThreadgroup(
-            rmlx_metal::MTLSize { width: total_threads, height: 1, depth: 1 },
-            rmlx_metal::MTLSize { width: tg_size, height: 1, depth: 1 },
+            rmlx_metal::MTLSize {
+                width: total_threads,
+                height: 1,
+                depth: 1,
+            },
+            rmlx_metal::MTLSize {
+                width: tg_size,
+                height: 1,
+                depth: 1,
+            },
         );
         encoder.endEncoding();
         cmd_buf.commit();
@@ -2766,7 +2794,10 @@ kernel void moe_combine(
                 }
             };
             let options = objc2_metal::MTLCompileOptions::new();
-            let library = match device.newLibraryWithSource_options_error(&objc2_foundation::NSString::from_str(kernel_src), Some(&options)) {
+            let library = match device.newLibraryWithSource_options_error(
+                &objc2_foundation::NSString::from_str(kernel_src),
+                Some(&options),
+            ) {
                 Ok(lib) => lib,
                 Err(_) => {
                     drop(cache_guard);
@@ -2780,7 +2811,9 @@ kernel void moe_combine(
                     ));
                 }
             };
-            let function = match library.newFunctionWithName(&objc2_foundation::NSString::from_str("moe_combine")) {
+            let function = match library
+                .newFunctionWithName(&objc2_foundation::NSString::from_str("moe_combine"))
+            {
                 Some(f) => f,
                 None => {
                     drop(cache_guard);
@@ -2846,23 +2879,27 @@ kernel void moe_combine(
                 expert_data.len() * 4,
                 shared,
             )
-        }.unwrap();
+        }
+        .unwrap();
         let weights_buf = unsafe {
             cached.device.newBufferWithBytes_length_options(
                 std::ptr::NonNull::new(weights.as_ptr() as *mut std::ffi::c_void).unwrap(),
                 weights.len() * 4,
                 shared,
             )
-        }.unwrap();
+        }
+        .unwrap();
         let indices_buf = unsafe {
             cached.device.newBufferWithBytes_length_options(
                 std::ptr::NonNull::new(indices.as_ptr() as *mut std::ffi::c_void).unwrap(),
                 indices.len() * 4,
                 shared,
             )
-        }.unwrap();
+        }
+        .unwrap();
         let output_size = batch_size * hidden_dim;
-        let output_buf = cached.device
+        let output_buf = cached
+            .device
             .newBufferWithLength_options((output_size * 4).max(4), shared)
             .unwrap();
 
@@ -2883,11 +2920,13 @@ kernel void moe_combine(
         };
         let params_buf = unsafe {
             cached.device.newBufferWithBytes_length_options(
-                std::ptr::NonNull::new(&params as *const CombineParams as *mut std::ffi::c_void).unwrap(),
+                std::ptr::NonNull::new(&params as *const CombineParams as *mut std::ffi::c_void)
+                    .unwrap(),
                 std::mem::size_of::<CombineParams>(),
                 shared,
             )
-        }.unwrap();
+        }
+        .unwrap();
 
         let cmd_buf = cached.queue.commandBuffer().unwrap();
         let encoder = cmd_buf.computeCommandEncoder().unwrap();
@@ -2908,8 +2947,16 @@ kernel void moe_combine(
         let tg_size = total_threads.min(max_tg);
 
         encoder.dispatchThreads_threadsPerThreadgroup(
-            rmlx_metal::MTLSize { width: total_threads, height: 1, depth: 1 },
-            rmlx_metal::MTLSize { width: tg_size, height: 1, depth: 1 },
+            rmlx_metal::MTLSize {
+                width: total_threads,
+                height: 1,
+                depth: 1,
+            },
+            rmlx_metal::MTLSize {
+                width: tg_size,
+                height: 1,
+                depth: 1,
+            },
         );
         encoder.endEncoding();
         cmd_buf.commit();
@@ -3563,7 +3610,9 @@ mod tests {
             Some(d) => d,
             None => return, // skip on CI without Metal
         };
-        let buf = device.newBufferWithLength_options(64, rmlx_metal::MTLResourceOptions::StorageModeShared).unwrap();
+        let buf = device
+            .newBufferWithLength_options(64, rmlx_metal::MTLResourceOptions::StorageModeShared)
+            .unwrap();
         // Requesting more bytes than the buffer holds should return Err.
         let result = read_buffer_bytes(&buf, 128);
         assert!(result.is_err(), "expected error for OOB read");
@@ -3580,7 +3629,9 @@ mod tests {
             Some(d) => d,
             None => return,
         };
-        let buf = device.newBufferWithLength_options(64, rmlx_metal::MTLResourceOptions::StorageModeShared).unwrap();
+        let buf = device
+            .newBufferWithLength_options(64, rmlx_metal::MTLResourceOptions::StorageModeShared)
+            .unwrap();
         // Reading exactly the buffer length should succeed.
         let result = read_buffer_bytes(&buf, 64);
         assert!(result.is_ok(), "exact-length read should succeed");
@@ -3594,7 +3645,9 @@ mod tests {
             None => return,
         };
         // 16 bytes = 4 f32 elements
-        let buf = device.newBufferWithLength_options(16, rmlx_metal::MTLResourceOptions::StorageModeShared).unwrap();
+        let buf = device
+            .newBufferWithLength_options(16, rmlx_metal::MTLResourceOptions::StorageModeShared)
+            .unwrap();
         // Requesting 8 f32s (32 bytes) from a 16-byte buffer should fail.
         let result = read_buffer_f32(&buf, 8);
         assert!(result.is_err(), "expected error for OOB f32 read");
@@ -3612,7 +3665,9 @@ mod tests {
             None => return,
         };
         // 16 bytes = 4 f32 elements
-        let buf = device.newBufferWithLength_options(16, rmlx_metal::MTLResourceOptions::StorageModeShared).unwrap();
+        let buf = device
+            .newBufferWithLength_options(16, rmlx_metal::MTLResourceOptions::StorageModeShared)
+            .unwrap();
         let result = read_buffer_f32(&buf, 4);
         assert!(result.is_ok(), "exact-length f32 read should succeed");
         assert_eq!(result.unwrap().len(), 4);

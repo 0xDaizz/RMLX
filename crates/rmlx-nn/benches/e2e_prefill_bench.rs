@@ -12,17 +12,17 @@
 //! Run with:
 //!   cargo bench -p rmlx-nn --bench e2e_prefill_bench
 
-use std::time::{Duration, Instant};
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLCommandBuffer as _, MTLCommandQueue as _, MTLDevice as _};
+use std::time::{Duration, Instant};
 
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::KernelRegistry;
 use rmlx_core::ops;
+use rmlx_metal::autoreleasepool;
 use rmlx_metal::device::GpuDevice;
 use rmlx_metal::event::GpuEvent;
-use rmlx_metal::autoreleasepool;
 use rmlx_nn::{
     Attention, AttentionConfig, Embedding, EmbeddingConfig, FeedForward, FeedForwardType,
     ForwardMode, LayerKvCache, Linear, LinearConfig, TransformerBlock, TransformerConfig,
@@ -157,7 +157,11 @@ fn f32_to_f16_bits(val: f32) -> u16 {
     ((sign << 15) | (new_exp as u32) << 10 | (frac >> 13)) as u16
 }
 
-fn rand_array(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, shape: &[usize], seed: u64) -> Array {
+fn rand_array(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    shape: &[usize],
+    seed: u64,
+) -> Array {
     let numel: usize = shape.iter().product();
     let mut f16_bytes = Vec::with_capacity(numel * 2);
     let mut state = seed;
@@ -182,7 +186,12 @@ fn ones_f16(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, size: usize) ->
 // Layer construction helpers
 // ---------------------------------------------------------------------------
 
-fn make_linear(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, in_f: usize, out_f: usize, seed: u64) -> Linear {
+fn make_linear(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    in_f: usize,
+    out_f: usize,
+    seed: u64,
+) -> Linear {
     let weight = rand_array(device, &[out_f, in_f], seed);
     Linear::from_arrays(
         LinearConfig {

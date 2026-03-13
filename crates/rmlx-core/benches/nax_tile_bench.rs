@@ -17,16 +17,19 @@
 use std::time::{Duration, Instant};
 
 use half::f16;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{
+    MTLCommandBuffer as _, MTLCommandEncoder as _, MTLCommandQueue as _,
+    MTLComputeCommandEncoder as _, MTLDevice as _,
+};
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::KernelRegistry;
 use rmlx_core::ops;
 use rmlx_metal::device::GpuDevice;
+use rmlx_metal::types::MtlBuffer;
+use rmlx_metal::{MTLResourceOptions, MTLSize};
 use std::ptr::NonNull;
-use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLDevice as _, MTLCommandQueue as _, MTLCommandBuffer as _, MTLComputeCommandEncoder as _, MTLCommandEncoder as _};
-use rmlx_metal::{MTLSize, MTLResourceOptions};
-use rmlx_metal::types::{MtlBuffer};
 
 const WARMUP_ITERS: usize = 5;
 const BENCH_ITERS: usize = 20;
@@ -77,7 +80,11 @@ fn lcg_next(state: &mut u64) -> u64 {
     *state
 }
 
-fn rand_f16_array(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, shape: &[usize], seed: u64) -> Array {
+fn rand_f16_array(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    shape: &[usize],
+    seed: u64,
+) -> Array {
     let numel: usize = shape.iter().product();
     let mut state = seed;
     let mut f16_bytes = Vec::with_capacity(numel * 2);
@@ -92,7 +99,15 @@ fn rand_f16_array(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, shape: &[
 
 fn make_u32_buf(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, val: u32) -> MtlBuffer {
     let opts = MTLResourceOptions::StorageModeShared;
-    unsafe { device.newBufferWithBytes_length_options(NonNull::new(&val as *const u32 as *const _ as *mut _).unwrap(), 4_usize, opts).unwrap() }
+    unsafe {
+        device
+            .newBufferWithBytes_length_options(
+                NonNull::new(&val as *const u32 as *const _ as *mut _).unwrap(),
+                4_usize,
+                opts,
+            )
+            .unwrap()
+    }
 }
 
 fn tflops(m: usize, n: usize, k: usize, latency_us: f64) -> f64 {
@@ -198,8 +213,16 @@ fn bench_kernel(
 
     let grid_x = n.div_ceil(cfg.bn);
     let grid_y = m.div_ceil(cfg.bm);
-    let grid = MTLSize { width: grid_x, height: grid_y, depth: 1_usize };
-    let tg = MTLSize { width: cfg.threads as usize, height: 1_usize, depth: 1_usize };
+    let grid = MTLSize {
+        width: grid_x,
+        height: grid_y,
+        depth: 1_usize,
+    };
+    let tg = MTLSize {
+        width: cfg.threads as usize,
+        height: 1_usize,
+        depth: 1_usize,
+    };
 
     // Warmup
     for _ in 0..WARMUP_ITERS {

@@ -8,7 +8,7 @@ use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
-use rmlx_metal::{MtlBuffer};
+use rmlx_metal::MtlBuffer;
 
 /// Slot indices for scratch buffers in the prefill pipeline.
 ///

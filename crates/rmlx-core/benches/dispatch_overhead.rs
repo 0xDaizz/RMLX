@@ -15,13 +15,15 @@
 
 use std::time::{Duration, Instant};
 
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{
+    MTLCommandBuffer as _, MTLCommandEncoder as _, MTLCommandQueue as _, MTLDevice as _,
+};
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::KernelRegistry;
 use rmlx_core::ops;
 use rmlx_metal::device::GpuDevice;
-use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLDevice as _, MTLCommandQueue as _, MTLCommandBuffer as _, MTLCommandEncoder as _};
 
 // ---------------------------------------------------------------------------
 // MoE Expert Layer parameters (Qwen 3.5-style dimensions)
@@ -124,7 +126,11 @@ fn f32_to_f16_bits(val: f32) -> u16 {
     ((sign << 15) | (new_exp as u32) << 10 | (frac >> 13)) as u16
 }
 
-fn rand_f16_array(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, shape: &[usize], seed: u64) -> Array {
+fn rand_f16_array(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    shape: &[usize],
+    seed: u64,
+) -> Array {
     let numel: usize = shape.iter().product();
     let mut f16_bytes = Vec::with_capacity(numel * 2);
     let mut state = seed;
@@ -413,13 +419,12 @@ fn bench_moe_expert_layer_ops(
     }
 
     // 1. RMS Norm (attention)
-    bench_op!(
-        "rms_norm",
-        "[1,3584] eps=1e-5",
-        |reg: &KernelRegistry, cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>| {
-            let _ = ops::rms_norm::rms_norm_into_cb(reg, &x, Some(&norm_w), RMS_NORM_EPS, cb);
-        }
-    );
+    bench_op!("rms_norm", "[1,3584] eps=1e-5", |reg: &KernelRegistry,
+                                                cb: &ProtocolObject<
+        dyn objc2_metal::MTLCommandBuffer,
+    >| {
+        let _ = ops::rms_norm::rms_norm_into_cb(reg, &x, Some(&norm_w), RMS_NORM_EPS, cb);
+    });
 
     // 2. Q matmul
     bench_op!(
@@ -431,41 +436,38 @@ fn bench_moe_expert_layer_ops(
     );
 
     // 3. K matmul
-    bench_op!(
-        "matmul_k",
-        "[1,3584]@[3584,512]",
-        |reg: &KernelRegistry, cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>| {
-            let _ = ops::matmul::matmul_into_cb(reg, &x, &wk, cb);
-        }
-    );
+    bench_op!("matmul_k", "[1,3584]@[3584,512]", |reg: &KernelRegistry,
+                                                  cb: &ProtocolObject<
+        dyn objc2_metal::MTLCommandBuffer,
+    >| {
+        let _ = ops::matmul::matmul_into_cb(reg, &x, &wk, cb);
+    });
 
     // 4. V matmul
-    bench_op!(
-        "matmul_v",
-        "[1,3584]@[3584,512]",
-        |reg: &KernelRegistry, cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>| {
-            let _ = ops::matmul::matmul_into_cb(reg, &x, &wv, cb);
-        }
-    );
+    bench_op!("matmul_v", "[1,3584]@[3584,512]", |reg: &KernelRegistry,
+                                                  cb: &ProtocolObject<
+        dyn objc2_metal::MTLCommandBuffer,
+    >| {
+        let _ = ops::matmul::matmul_into_cb(reg, &x, &wv, cb);
+    });
 
     // 5. RoPE
-    bench_op!(
-        "rope",
-        "[1,1,128] table",
-        |reg: &KernelRegistry, cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>| {
-            let _ = ops::rope::rope_ext_into_cb(
-                reg,
-                &rope_input,
-                &cos_freqs,
-                &sin_freqs,
-                0,
-                1.0,
-                false,
-                true,
-                cb,
-            );
-        }
-    );
+    bench_op!("rope", "[1,1,128] table", |reg: &KernelRegistry,
+                                          cb: &ProtocolObject<
+        dyn objc2_metal::MTLCommandBuffer,
+    >| {
+        let _ = ops::rope::rope_ext_into_cb(
+            reg,
+            &rope_input,
+            &cos_freqs,
+            &sin_freqs,
+            0,
+            1.0,
+            false,
+            true,
+            cb,
+        );
+    });
 
     // 6. O projection
     bench_op!(
@@ -504,13 +506,12 @@ fn bench_moe_expert_layer_ops(
     );
 
     // 10. Fused SiLU * mul
-    bench_op!(
-        "fused_silu_mul",
-        "[1,2560]",
-        |reg: &KernelRegistry, cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>| {
-            let _ = ops::fused::fused_silu_mul_into_cb(reg, &gate_out, &up_out, cb);
-        }
-    );
+    bench_op!("fused_silu_mul", "[1,2560]", |reg: &KernelRegistry,
+                                             cb: &ProtocolObject<
+        dyn objc2_metal::MTLCommandBuffer,
+    >| {
+        let _ = ops::fused::fused_silu_mul_into_cb(reg, &gate_out, &up_out, cb);
+    });
 
     // 11. Down matmul
     bench_op!(
@@ -573,50 +574,76 @@ fn bench_moe_expert_layer_ops(
 
     let do_layer_individual = || {
         #[allow(clippy::type_complexity)]
-        let ops_list: Vec<Box<dyn Fn(&KernelRegistry, &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>)>> = vec![
-            Box::new(|reg: &KernelRegistry, cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>| {
-                let _ = ops::rms_norm::rms_norm_into_cb(reg, &x, Some(&norm_w), RMS_NORM_EPS, cb);
-            }),
-            Box::new(|reg: &KernelRegistry, cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>| {
-                let _ = ops::matmul::matmul_into_cb(reg, &x, &wq, cb);
-            }),
-            Box::new(|reg: &KernelRegistry, cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>| {
-                let _ = ops::matmul::matmul_into_cb(reg, &x, &wk, cb);
-            }),
-            Box::new(|reg: &KernelRegistry, cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>| {
-                let _ = ops::matmul::matmul_into_cb(reg, &x, &wv, cb);
-            }),
-            Box::new(|reg: &KernelRegistry, cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>| {
-                let _ = ops::rope::rope_ext_into_cb(
-                    reg,
-                    &rope_input,
-                    &cos_freqs,
-                    &sin_freqs,
-                    0,
-                    1.0,
-                    false,
-                    true,
-                    cb,
-                );
-            }),
-            Box::new(|reg: &KernelRegistry, cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>| {
-                let _ = ops::matmul::matmul_into_cb(reg, &x, &wo, cb);
-            }),
-            Box::new(|reg: &KernelRegistry, cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>| {
-                let _ = ops::rms_norm::rms_norm_into_cb(reg, &x, Some(&norm_w), RMS_NORM_EPS, cb);
-            }),
-            Box::new(|reg: &KernelRegistry, cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>| {
-                let _ = ops::matmul::matmul_into_cb(reg, &x, &wgate, cb);
-            }),
-            Box::new(|reg: &KernelRegistry, cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>| {
-                let _ = ops::matmul::matmul_into_cb(reg, &x, &wup, cb);
-            }),
-            Box::new(|reg: &KernelRegistry, cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>| {
-                let _ = ops::fused::fused_silu_mul_into_cb(reg, &gate_out, &up_out, cb);
-            }),
-            Box::new(|reg: &KernelRegistry, cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>| {
-                let _ = ops::matmul::matmul_into_cb(reg, &ffn_mid, &wdown, cb);
-            }),
+        let ops_list: Vec<
+            Box<dyn Fn(&KernelRegistry, &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>)>,
+        > = vec![
+            Box::new(
+                |reg: &KernelRegistry, cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>| {
+                    let _ =
+                        ops::rms_norm::rms_norm_into_cb(reg, &x, Some(&norm_w), RMS_NORM_EPS, cb);
+                },
+            ),
+            Box::new(
+                |reg: &KernelRegistry, cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>| {
+                    let _ = ops::matmul::matmul_into_cb(reg, &x, &wq, cb);
+                },
+            ),
+            Box::new(
+                |reg: &KernelRegistry, cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>| {
+                    let _ = ops::matmul::matmul_into_cb(reg, &x, &wk, cb);
+                },
+            ),
+            Box::new(
+                |reg: &KernelRegistry, cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>| {
+                    let _ = ops::matmul::matmul_into_cb(reg, &x, &wv, cb);
+                },
+            ),
+            Box::new(
+                |reg: &KernelRegistry, cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>| {
+                    let _ = ops::rope::rope_ext_into_cb(
+                        reg,
+                        &rope_input,
+                        &cos_freqs,
+                        &sin_freqs,
+                        0,
+                        1.0,
+                        false,
+                        true,
+                        cb,
+                    );
+                },
+            ),
+            Box::new(
+                |reg: &KernelRegistry, cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>| {
+                    let _ = ops::matmul::matmul_into_cb(reg, &x, &wo, cb);
+                },
+            ),
+            Box::new(
+                |reg: &KernelRegistry, cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>| {
+                    let _ =
+                        ops::rms_norm::rms_norm_into_cb(reg, &x, Some(&norm_w), RMS_NORM_EPS, cb);
+                },
+            ),
+            Box::new(
+                |reg: &KernelRegistry, cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>| {
+                    let _ = ops::matmul::matmul_into_cb(reg, &x, &wgate, cb);
+                },
+            ),
+            Box::new(
+                |reg: &KernelRegistry, cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>| {
+                    let _ = ops::matmul::matmul_into_cb(reg, &x, &wup, cb);
+                },
+            ),
+            Box::new(
+                |reg: &KernelRegistry, cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>| {
+                    let _ = ops::fused::fused_silu_mul_into_cb(reg, &gate_out, &up_out, cb);
+                },
+            ),
+            Box::new(
+                |reg: &KernelRegistry, cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>| {
+                    let _ = ops::matmul::matmul_into_cb(reg, &ffn_mid, &wdown, cb);
+                },
+            ),
         ];
         for op_fn in &ops_list {
             let cb = queue.commandBufferWithUnretainedReferences().unwrap();

@@ -146,7 +146,7 @@ impl MoePipeline {
         // Signal that shared expert is done.
         let v_shared = self.event.next_value();
         let cb_shared = queue.commandBuffer().unwrap();
-self.event.signal_from_command_buffer(&cb_shared, v_shared);
+        self.event.signal_from_command_buffer(&cb_shared, v_shared);
         cb_shared.commit();
 
         // -- Stage 2: Routed expert computation --
@@ -156,7 +156,7 @@ self.event.signal_from_command_buffer(&cb_shared, v_shared);
         // Signal that routed experts are done.
         let v_routed = self.event.next_value();
         let cb_routed = queue.commandBuffer().unwrap();
-self.event.signal_from_command_buffer(&cb_routed, v_routed);
+        self.event.signal_from_command_buffer(&cb_routed, v_routed);
         cb_routed.commit();
 
         // -- Stage 3: Combine shared + routed --
@@ -165,7 +165,7 @@ self.event.signal_from_command_buffer(&cb_routed, v_routed);
         // Final signal.
         let v_final = self.event.next_value();
         let cb_final = queue.commandBuffer().unwrap();
-self.event.signal_from_command_buffer(&cb_final, v_final);
+        self.event.signal_from_command_buffer(&cb_final, v_final);
         cb_final.commit();
 
         // Single CPU wait at the end of the entire pipeline.
@@ -276,7 +276,7 @@ self.event.signal_from_command_buffer(&cb_final, v_final);
             // Signal that dispatch/gather for this batch is done.
             let v_dispatch = self.event.next_value();
             let cb_sig = queue.commandBuffer().unwrap();
-self.event.signal_from_command_buffer(&cb_sig, v_dispatch);
+            self.event.signal_from_command_buffer(&cb_sig, v_dispatch);
             cb_sig.commit();
 
             // Compute: run grouped forward on this batch's experts.
@@ -302,7 +302,8 @@ self.event.signal_from_command_buffer(&cb_sig, v_dispatch);
             // Signal that this batch's combine is done.
             let v_combine = self.event.next_value();
             let cb_combine = queue.commandBuffer().unwrap();
-self.event.signal_from_command_buffer(&cb_combine, v_combine);
+            self.event
+                .signal_from_command_buffer(&cb_combine, v_combine);
             cb_combine.commit();
         }
 
@@ -434,7 +435,7 @@ self.event.signal_from_command_buffer(&cb_combine, v_combine);
 
         let v_shared = self.event.next_value();
         let cb_shared = queue.commandBuffer().unwrap();
-self.event.signal_from_command_buffer(&cb_shared, v_shared);
+        self.event.signal_from_command_buffer(&cb_shared, v_shared);
         cb_shared.commit();
 
         // -- Routed expert computation --
@@ -450,7 +451,7 @@ self.event.signal_from_command_buffer(&cb_shared, v_shared);
 
         let v_routed = self.event.next_value();
         let cb_routed = queue.commandBuffer().unwrap();
-self.event.signal_from_command_buffer(&cb_routed, v_routed);
+        self.event.signal_from_command_buffer(&cb_routed, v_routed);
         cb_routed.commit();
 
         // -- Combine --
@@ -458,7 +459,7 @@ self.event.signal_from_command_buffer(&cb_routed, v_routed);
 
         let v_final = self.event.next_value();
         let cb_final = queue.commandBuffer().unwrap();
-self.event.signal_from_command_buffer(&cb_final, v_final);
+        self.event.signal_from_command_buffer(&cb_final, v_final);
         cb_final.commit();
 
         self.event
@@ -489,7 +490,7 @@ self.event.signal_from_command_buffer(&cb_final, v_final);
 
         let v_shared = self.event.next_value();
         let cb_shared = queue.commandBuffer().unwrap();
-self.event.signal_from_command_buffer(&cb_shared, v_shared);
+        self.event.signal_from_command_buffer(&cb_shared, v_shared);
         cb_shared.commit();
 
         // -- TBO pipeline for routed experts --
@@ -508,7 +509,7 @@ self.event.signal_from_command_buffer(&cb_shared, v_shared);
 
         let v_final = self.event.next_value();
         let cb_final = queue.commandBuffer().unwrap();
-self.event.signal_from_command_buffer(&cb_final, v_final);
+        self.event.signal_from_command_buffer(&cb_final, v_final);
         cb_final.commit();
 
         self.event
@@ -551,7 +552,7 @@ self.event.signal_from_command_buffer(&cb_final, v_final);
         // Final event signal + CPU wait for API consistency.
         let v_final = self.event.next_value();
         let cb_final = queue.commandBuffer().unwrap();
-self.event.signal_from_command_buffer(&cb_final, v_final);
+        self.event.signal_from_command_buffer(&cb_final, v_final);
         cb_final.commit();
 
         self.event
@@ -681,11 +682,16 @@ fn gather_tokens(
         enc.set_pipeline(&pipeline);
         enc.set_buffer(0, Some(x.metal_buffer()), src_offset);
         enc.set_buffer(1, Some(batch_buf.metal_buffer()), dst_offset);
-        let grid = MTLSize { width: hidden_dim, height: 1, depth: 1 };
-        let tg = MTLSize { width: std::cmp::min(
-                pipeline.maxTotalThreadsPerThreadgroup(),
-                hidden_dim,
-            ) as usize, height: 1, depth: 1 };
+        let grid = MTLSize {
+            width: hidden_dim,
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), hidden_dim) as usize,
+            height: 1,
+            depth: 1,
+        };
         enc.dispatch_threads(grid, tg);
         enc.end();
     }
@@ -737,11 +743,16 @@ fn scatter_add_weighted(
             enc.set_pipeline(&pipeline);
             enc.set_buffer(0, Some(summed.metal_buffer()), summed.offset());
             enc.set_buffer(1, Some(output.metal_buffer()), dst_offset);
-            let grid = MTLSize { width: hidden_dim, height: 1, depth: 1 };
-            let tg = MTLSize { width: std::cmp::min(
-                    pipeline.maxTotalThreadsPerThreadgroup(),
-                    hidden_dim,
-                ) as usize, height: 1, depth: 1 };
+            let grid = MTLSize {
+                width: hidden_dim,
+                height: 1,
+                depth: 1,
+            };
+            let tg = MTLSize {
+                width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), hidden_dim) as usize,
+                height: 1,
+                depth: 1,
+            };
             enc.dispatch_threads(grid, tg);
             enc.end();
             cb.commit();

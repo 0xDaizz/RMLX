@@ -122,7 +122,14 @@ fn array_from_raw_bytes(
     dtype: DType,
 ) -> Array {
     let ptr = bytes.as_ptr() as *const std::ffi::c_void;
-    let buffer = unsafe { device.newBufferWithBytes_length_options(std::ptr::NonNull::new_unchecked(ptr as *mut std::ffi::c_void), bytes.len(), MTLResourceOptions::StorageModeShared) }.unwrap();
+    let buffer = unsafe {
+        device.newBufferWithBytes_length_options(
+            std::ptr::NonNull::new_unchecked(ptr as *mut std::ffi::c_void),
+            bytes.len(),
+            MTLResourceOptions::StorageModeShared,
+        )
+    }
+    .unwrap();
     let numel: usize = shape.iter().product();
     let elem_bytes = dtype.size_of();
     assert_eq!(
@@ -634,7 +641,9 @@ mod tests {
     }
 
     #[cfg(feature = "distributed")]
-    fn setup_registry_and_queue(_device: &ProtocolObject<dyn MTLDevice>) -> (KernelRegistry, rmlx_metal::MtlQueue) {
+    fn setup_registry_and_queue(
+        _device: &ProtocolObject<dyn MTLDevice>,
+    ) -> (KernelRegistry, rmlx_metal::MtlQueue) {
         let gpu = rmlx_metal::device::GpuDevice::system_default().expect("Metal device");
         let queue = gpu.new_command_queue();
         let registry = KernelRegistry::new(gpu);

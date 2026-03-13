@@ -33,13 +33,13 @@ use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
 use crate::ops::buffer_slots::{gemm, grouped_gemm, grouped_splitk, splitk, splitk_reduce};
-use rmlx_metal::MTLSize;
-use rmlx_metal::ComputePass;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLCommandBuffer as _;
 use objc2_metal::MTLCommandQueue as _;
-use rmlx_metal::MTLResourceOptions;
 use objc2_metal::MTLDevice as _;
+use rmlx_metal::ComputePass;
+use rmlx_metal::MTLResourceOptions;
+use rmlx_metal::MTLSize;
 
 // ---------------------------------------------------------------------------
 // Metal shader source: optimized GEMM with simdgroup MMA, f16 shmem,
@@ -7066,8 +7066,16 @@ fn dispatch_tiled_gemm(
         enc.set_buffer(gemm::GATE_RESULT as u32, Some(out.metal_buffer()), 0);
     }
 
-    let grid = MTLSize { width: (ceil_div(n, tile.bn) << swizzle_log) as usize, height: (ceil_div(m, tile.bm) >> swizzle_log) as usize, depth: batch };
-    let tg = MTLSize { width: tile.variant.threads_per_tg() as usize, height: 1, depth: 1 };
+    let grid = MTLSize {
+        width: (ceil_div(n, tile.bn) << swizzle_log) as usize,
+        height: (ceil_div(m, tile.bm) >> swizzle_log) as usize,
+        depth: batch,
+    };
+    let tg = MTLSize {
+        width: tile.variant.threads_per_tg() as usize,
+        height: 1,
+        depth: 1,
+    };
 
     enc.dispatch_threadgroups(grid, tg);
     enc.end();
@@ -7118,8 +7126,16 @@ fn dispatch_split_k(
         set_u32(enc, splitk::K, k_u32);
         set_u32(enc, splitk::N_SPLITS, splits_u32);
 
-        let grid = MTLSize { width: ceil_div(n, BN), height: ceil_div(m, BM), depth: n_splits };
-        let tg = MTLSize { width: (BM * BN), height: 1, depth: 1 };
+        let grid = MTLSize {
+            width: ceil_div(n, BN),
+            height: ceil_div(m, BM),
+            depth: n_splits,
+        };
+        let tg = MTLSize {
+            width: (BM * BN),
+            height: 1,
+            depth: 1,
+        };
         enc.dispatch_threadgroups(grid, tg);
         enc.end();
     }
@@ -7130,7 +7146,11 @@ fn dispatch_split_k(
         let raw_enc = cb.computeCommandEncoder().unwrap();
         let enc = ComputePass::new(&raw_enc);
         enc.set_pipeline(&pass2_pipeline);
-        enc.set_buffer(splitk_reduce::PARTIAL as u32, Some(partial.metal_buffer()), 0);
+        enc.set_buffer(
+            splitk_reduce::PARTIAL as u32,
+            Some(partial.metal_buffer()),
+            0,
+        );
         enc.set_buffer(splitk_reduce::OUT as u32, Some(out.metal_buffer()), 0);
         set_u32(enc, splitk_reduce::M, m_u32);
         set_u32(enc, splitk_reduce::N, n_u32);
@@ -7139,7 +7159,18 @@ fn dispatch_split_k(
         let total = m * n;
         let tg_size = 256u64;
         let n_groups = ceil_div(total, tg_size as usize);
-        enc.dispatch_threadgroups(MTLSize { width: n_groups, height: 1, depth: 1 }, MTLSize { width: tg_size as usize, height: 1, depth: 1 });
+        enc.dispatch_threadgroups(
+            MTLSize {
+                width: n_groups,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: tg_size as usize,
+                height: 1,
+                depth: 1,
+            },
+        );
         enc.end();
     }
 
@@ -7226,8 +7257,16 @@ fn dispatch_split_k_f16(
         set_u32(enc, splitk::N_SPLITS, splits_u32);
         set_u32(enc, 7, swizzle_log); // f16 split-K adds swizzle_log after n_splits
 
-        let grid = MTLSize { width: (ceil_div(n, bn) << swizzle_log) as usize, height: (ceil_div(m, bm) >> swizzle_log) as usize, depth: n_splits };
-        let tg = MTLSize { width: 64, height: 1, depth: 1 };
+        let grid = MTLSize {
+            width: (ceil_div(n, bn) << swizzle_log) as usize,
+            height: (ceil_div(m, bm) >> swizzle_log) as usize,
+            depth: n_splits,
+        };
+        let tg = MTLSize {
+            width: 64,
+            height: 1,
+            depth: 1,
+        };
         enc.dispatch_threadgroups(grid, tg);
         enc.end();
     }
@@ -7238,7 +7277,11 @@ fn dispatch_split_k_f16(
         let raw_enc = cb.computeCommandEncoder().unwrap();
         let enc = ComputePass::new(&raw_enc);
         enc.set_pipeline(&pass2_pipeline);
-        enc.set_buffer(splitk_reduce::PARTIAL as u32, Some(partial.metal_buffer()), 0);
+        enc.set_buffer(
+            splitk_reduce::PARTIAL as u32,
+            Some(partial.metal_buffer()),
+            0,
+        );
         enc.set_buffer(splitk_reduce::OUT as u32, Some(out.metal_buffer()), 0);
         set_u32(enc, splitk_reduce::M, m_u32);
         set_u32(enc, splitk_reduce::N, n_u32);
@@ -7247,7 +7290,18 @@ fn dispatch_split_k_f16(
         let total = m * n;
         let tg_size = 256u64;
         let n_groups = ceil_div(total, tg_size as usize);
-        enc.dispatch_threadgroups(MTLSize { width: n_groups, height: 1, depth: 1 }, MTLSize { width: tg_size as usize, height: 1, depth: 1 });
+        enc.dispatch_threadgroups(
+            MTLSize {
+                width: n_groups,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: tg_size as usize,
+                height: 1,
+                depth: 1,
+            },
+        );
         enc.end();
     }
 
@@ -7307,8 +7361,16 @@ fn dispatch_split_k_f16_into_cb(
         set_u32(enc, splitk::N_SPLITS, splits_u32);
         set_u32(enc, 7, swizzle_log); // f16 split-K adds swizzle_log after n_splits
 
-        let grid = MTLSize { width: (ceil_div(n, bn) << swizzle_log) as usize, height: (ceil_div(m, bm) >> swizzle_log) as usize, depth: n_splits };
-        let tg = MTLSize { width: 64, height: 1, depth: 1 };
+        let grid = MTLSize {
+            width: (ceil_div(n, bn) << swizzle_log) as usize,
+            height: (ceil_div(m, bm) >> swizzle_log) as usize,
+            depth: n_splits,
+        };
+        let tg = MTLSize {
+            width: 64,
+            height: 1,
+            depth: 1,
+        };
         enc.dispatch_threadgroups(grid, tg);
         enc.end();
     }
@@ -7319,7 +7381,11 @@ fn dispatch_split_k_f16_into_cb(
         let raw_enc = cb.computeCommandEncoder().unwrap();
         let enc = ComputePass::new(&raw_enc);
         enc.set_pipeline(&pass2_pipeline);
-        enc.set_buffer(splitk_reduce::PARTIAL as u32, Some(partial.metal_buffer()), 0);
+        enc.set_buffer(
+            splitk_reduce::PARTIAL as u32,
+            Some(partial.metal_buffer()),
+            0,
+        );
         enc.set_buffer(splitk_reduce::OUT as u32, Some(out.metal_buffer()), 0);
         set_u32(enc, splitk_reduce::M, m_u32);
         set_u32(enc, splitk_reduce::N, n_u32);
@@ -7328,7 +7394,18 @@ fn dispatch_split_k_f16_into_cb(
         let total = m * n;
         let tg_size = 256u64;
         let n_groups = ceil_div(total, tg_size as usize);
-        enc.dispatch_threadgroups(MTLSize { width: n_groups, height: 1, depth: 1 }, MTLSize { width: tg_size as usize, height: 1, depth: 1 });
+        enc.dispatch_threadgroups(
+            MTLSize {
+                width: n_groups,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: tg_size as usize,
+                height: 1,
+                depth: 1,
+            },
+        );
         enc.end();
     }
 
@@ -7385,8 +7462,16 @@ fn dispatch_split_k_f16_encode(
     set_u32(encoder, splitk::N_SPLITS, splits_u32);
     set_u32(encoder, 7, swizzle_log); // f16 split-K adds swizzle_log after n_splits
 
-    let grid = MTLSize { width: (ceil_div(n, bn) << swizzle_log) as usize, height: (ceil_div(m, bm) >> swizzle_log) as usize, depth: n_splits };
-    let tg = MTLSize { width: 64, height: 1, depth: 1 };
+    let grid = MTLSize {
+        width: (ceil_div(n, bn) << swizzle_log) as usize,
+        height: (ceil_div(m, bm) >> swizzle_log) as usize,
+        depth: n_splits,
+    };
+    let tg = MTLSize {
+        width: 64,
+        height: 1,
+        depth: 1,
+    };
     encoder.dispatch_threadgroups(grid, tg);
 
     // Memory barrier: ensure pass-1 writes to partial buffer are visible
@@ -7398,7 +7483,11 @@ fn dispatch_split_k_f16_encode(
     // Pass 2: reduce partial sums into final output
     let pass2_pipeline = registry.get_pipeline("splitk_reduce_f16", DType::Float16)?;
     encoder.set_pipeline(&pass2_pipeline);
-    encoder.set_buffer(splitk_reduce::PARTIAL as u32, Some(partial.metal_buffer()), 0);
+    encoder.set_buffer(
+        splitk_reduce::PARTIAL as u32,
+        Some(partial.metal_buffer()),
+        0,
+    );
     encoder.set_buffer(splitk_reduce::OUT as u32, Some(out.metal_buffer()), 0);
     set_u32(encoder, splitk_reduce::M, m_u32);
     set_u32(encoder, splitk_reduce::N, n_u32);
@@ -7407,7 +7496,18 @@ fn dispatch_split_k_f16_encode(
     let total = m * n;
     let tg_size = 256u64;
     let n_groups = ceil_div(total, tg_size as usize);
-    encoder.dispatch_threadgroups(MTLSize { width: n_groups, height: 1, depth: 1 }, MTLSize { width: tg_size as usize, height: 1, depth: 1 });
+    encoder.dispatch_threadgroups(
+        MTLSize {
+            width: n_groups,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg_size as usize,
+            height: 1,
+            depth: 1,
+        },
+    );
 
     Ok(out)
 }
@@ -7666,8 +7766,16 @@ fn encode_gemm_core(
         0
     };
 
-    let grid = MTLSize { width: (ceil_div(n, tile.bn) << swizzle_log) as usize, height: (ceil_div(m, tile.bm) >> swizzle_log) as usize, depth: 1 };
-    let tg = MTLSize { width: tile.variant.threads_per_tg() as usize, height: 1, depth: 1 };
+    let grid = MTLSize {
+        width: (ceil_div(n, tile.bn) << swizzle_log) as usize,
+        height: (ceil_div(m, tile.bm) >> swizzle_log) as usize,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: tile.variant.threads_per_tg() as usize,
+        height: 1,
+        depth: 1,
+    };
 
     // MLX-architecture kernels (gemm_mlx_*) declare buffer(10)..buffer(13)
     // for fused residual/norm/gate epilogues. When called from a plain GEMM
@@ -8037,11 +8145,23 @@ pub fn matmul_add_residual_into_cb(
     let swizzle_log = compute_swizzle_log(m, n, tile.bm, tile.bn);
     set_u32(enc, gemm::SWIZZLE_LOG, swizzle_log);
 
-    enc.set_buffer(gemm::RESIDUAL as u32, Some(residual.metal_buffer()), residual.offset());
+    enc.set_buffer(
+        gemm::RESIDUAL as u32,
+        Some(residual.metal_buffer()),
+        residual.offset(),
+    );
     let grid_x = (ceil_div(n, tile.bn) << swizzle_log) as usize;
     let grid_y = (ceil_div(m, tile.bm) >> swizzle_log) as usize;
-    let grid = MTLSize { width: grid_x, height: grid_y, depth: 1 };
-    let tg = MTLSize { width: tile.variant.threads_per_tg() as usize, height: 1, depth: 1 };
+    let grid = MTLSize {
+        width: grid_x,
+        height: grid_y,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: tile.variant.threads_per_tg() as usize,
+        height: 1,
+        depth: 1,
+    };
     enc.dispatch_threadgroups(grid, tg);
     enc.end();
 
@@ -8223,11 +8343,23 @@ pub fn matmul_add_residual_encode(
     let swizzle_log = compute_swizzle_log(m, n, tile.bm, tile.bn);
     set_u32(encoder, gemm::SWIZZLE_LOG, swizzle_log);
 
-    encoder.set_buffer(gemm::RESIDUAL as u32, Some(residual.metal_buffer()), residual.offset());
+    encoder.set_buffer(
+        gemm::RESIDUAL as u32,
+        Some(residual.metal_buffer()),
+        residual.offset(),
+    );
     let grid_x = (ceil_div(n, tile.bn) << swizzle_log) as usize;
     let grid_y = (ceil_div(m, tile.bm) >> swizzle_log) as usize;
-    let grid = MTLSize { width: grid_x, height: grid_y, depth: 1 };
-    let tg = MTLSize { width: tile.variant.threads_per_tg() as usize, height: 1, depth: 1 };
+    let grid = MTLSize {
+        width: grid_x,
+        height: grid_y,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: tile.variant.threads_per_tg() as usize,
+        height: 1,
+        depth: 1,
+    };
     encoder.dispatch_threadgroups(grid, tg);
 
     Ok(out)
@@ -8374,13 +8506,25 @@ pub fn matmul_norm_gemm_into_cb(
     // Residual (dummy, not used when has_residual=false)
     enc.set_buffer(gemm::RESIDUAL as u32, Some(out.metal_buffer()), 0);
     // norm_weight [K]
-    enc.set_buffer(gemm::NORM_WEIGHT as u32, Some(norm_weight.metal_buffer()), norm_weight.offset());
+    enc.set_buffer(
+        gemm::NORM_WEIGHT as u32,
+        Some(norm_weight.metal_buffer()),
+        norm_weight.offset(),
+    );
     // inv_rms [M]
     enc.set_buffer(gemm::INV_RMS as u32, Some(inv_rms.metal_buffer()), 0);
     let grid_x = (ceil_div(n, tile.bn) << swizzle_log) as usize;
     let grid_y = (ceil_div(m, tile.bm) >> swizzle_log) as usize;
-    let grid = MTLSize { width: grid_x, height: grid_y, depth: 1 };
-    let tg = MTLSize { width: tile.variant.threads_per_tg() as usize, height: 1, depth: 1 };
+    let grid = MTLSize {
+        width: grid_x,
+        height: grid_y,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: tile.variant.threads_per_tg() as usize,
+        height: 1,
+        depth: 1,
+    };
     enc.dispatch_threadgroups(grid, tg);
     enc.end();
 
@@ -8519,13 +8663,25 @@ pub fn matmul_norm_gemm_encode(
     // Residual (dummy, not used when has_residual=false)
     encoder.set_buffer(gemm::RESIDUAL as u32, Some(out.metal_buffer()), 0);
     // norm_weight [K]
-    encoder.set_buffer(gemm::NORM_WEIGHT as u32, Some(norm_weight.metal_buffer()), norm_weight.offset());
+    encoder.set_buffer(
+        gemm::NORM_WEIGHT as u32,
+        Some(norm_weight.metal_buffer()),
+        norm_weight.offset(),
+    );
     // inv_rms [M]
     encoder.set_buffer(gemm::INV_RMS as u32, Some(inv_rms.metal_buffer()), 0);
     let grid_x = (ceil_div(n, tile.bn) << swizzle_log) as usize;
     let grid_y = (ceil_div(m, tile.bm) >> swizzle_log) as usize;
-    let grid = MTLSize { width: grid_x, height: grid_y, depth: 1 };
-    let tg = MTLSize { width: tile.variant.threads_per_tg() as usize, height: 1, depth: 1 };
+    let grid = MTLSize {
+        width: grid_x,
+        height: grid_y,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: tile.variant.threads_per_tg() as usize,
+        height: 1,
+        depth: 1,
+    };
     encoder.dispatch_threadgroups(grid, tg);
 
     Ok(out)
@@ -8635,11 +8791,23 @@ pub fn matmul_swiglu_gemm_into_cb(
     let swizzle_log = compute_swizzle_log(m, n, tile.bm, tile.bn);
     set_u32(enc, gemm::SWIZZLE_LOG, swizzle_log);
 
-    enc.set_buffer(gemm::GATE_RESULT as u32, Some(gate_result.metal_buffer()), gate_result.offset());
+    enc.set_buffer(
+        gemm::GATE_RESULT as u32,
+        Some(gate_result.metal_buffer()),
+        gate_result.offset(),
+    );
     let grid_x = (ceil_div(n, tile.bn) << swizzle_log) as usize;
     let grid_y = (ceil_div(m, tile.bm) >> swizzle_log) as usize;
-    let grid = MTLSize { width: grid_x, height: grid_y, depth: 1 };
-    let tg = MTLSize { width: tile.variant.threads_per_tg() as usize, height: 1, depth: 1 };
+    let grid = MTLSize {
+        width: grid_x,
+        height: grid_y,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: tile.variant.threads_per_tg() as usize,
+        height: 1,
+        depth: 1,
+    };
     enc.dispatch_threadgroups(grid, tg);
     enc.end();
 
@@ -8698,9 +8866,33 @@ pub fn dispatch_grouped_gemm(
 
     // Create Metal buffers for metadata
     let opts = MTLResourceOptions::StorageModeShared;
-    let offsets_buf = unsafe { dev.newBufferWithBytes_length_options(std::ptr::NonNull::new(problem_offsets.as_ptr() as *const _ as *mut std::ffi::c_void).unwrap(), (problem_offsets.len() * 4) as u64 as usize, opts).unwrap() };
-    let tile_map_buf = unsafe { dev.newBufferWithBytes_length_options(std::ptr::NonNull::new(tile_to_problem.as_ptr() as *const _ as *mut std::ffi::c_void).unwrap(), (tile_to_problem.len() * 4) as u64 as usize, opts).unwrap() };
-    let tile_off_buf = unsafe { dev.newBufferWithBytes_length_options(std::ptr::NonNull::new(tile_offsets.as_ptr() as *const _ as *mut std::ffi::c_void).unwrap(), (tile_offsets.len() * 4) as u64 as usize, opts).unwrap() };
+    let offsets_buf = unsafe {
+        dev.newBufferWithBytes_length_options(
+            std::ptr::NonNull::new(problem_offsets.as_ptr() as *const _ as *mut std::ffi::c_void)
+                .unwrap(),
+            (problem_offsets.len() * 4) as u64 as usize,
+            opts,
+        )
+        .unwrap()
+    };
+    let tile_map_buf = unsafe {
+        dev.newBufferWithBytes_length_options(
+            std::ptr::NonNull::new(tile_to_problem.as_ptr() as *const _ as *mut std::ffi::c_void)
+                .unwrap(),
+            (tile_to_problem.len() * 4) as u64 as usize,
+            opts,
+        )
+        .unwrap()
+    };
+    let tile_off_buf = unsafe {
+        dev.newBufferWithBytes_length_options(
+            std::ptr::NonNull::new(tile_offsets.as_ptr() as *const _ as *mut std::ffi::c_void)
+                .unwrap(),
+            (tile_offsets.len() * 4) as u64 as usize,
+            opts,
+        )
+        .unwrap()
+    };
 
     let out = Array::uninit(dev, &[total_m, n], DType::Float16);
 
@@ -8710,8 +8902,16 @@ pub fn dispatch_grouped_gemm(
     let raw_enc = cb.computeCommandEncoder().unwrap();
     let enc = ComputePass::new(&raw_enc);
     enc.set_pipeline(&pipeline);
-    enc.set_buffer(grouped_gemm::A_STACKED as u32, Some(a_stacked.metal_buffer()), a_stacked.offset());
-    enc.set_buffer(grouped_gemm::B_STACKED as u32, Some(b_stacked.metal_buffer()), b_stacked.offset());
+    enc.set_buffer(
+        grouped_gemm::A_STACKED as u32,
+        Some(a_stacked.metal_buffer()),
+        a_stacked.offset(),
+    );
+    enc.set_buffer(
+        grouped_gemm::B_STACKED as u32,
+        Some(b_stacked.metal_buffer()),
+        b_stacked.offset(),
+    );
     enc.set_buffer(grouped_gemm::OUT as u32, Some(out.metal_buffer()), 0);
     enc.set_buffer(grouped_gemm::OFFSETS as u32, Some(&offsets_buf), 0);
     enc.set_buffer(grouped_gemm::TILE_MAP as u32, Some(&tile_map_buf), 0);
@@ -8720,8 +8920,16 @@ pub fn dispatch_grouped_gemm(
     set_u32(enc, grouped_gemm::N, super::checked_u32(n, "N")?);
 
     // 1D grid: total_tiles threadgroups, 64 threads each
-    let grid = MTLSize { width: total_tiles, height: 1, depth: 1 };
-    let tg = MTLSize { width: 64, height: 1, depth: 1 };
+    let grid = MTLSize {
+        width: total_tiles,
+        height: 1,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: 64,
+        height: 1,
+        depth: 1,
+    };
     enc.dispatch_threadgroups(grid, tg);
     enc.end();
 
@@ -8817,9 +9025,33 @@ pub fn dispatch_grouped_splitk(
 
     // Create Metal buffers for metadata
     let opts = MTLResourceOptions::StorageModeShared;
-    let offsets_buf = unsafe { dev.newBufferWithBytes_length_options(std::ptr::NonNull::new(problem_offsets.as_ptr() as *const _ as *mut std::ffi::c_void).unwrap(), (problem_offsets.len() * 4) as u64 as usize, opts).unwrap() };
-    let tile_map_buf = unsafe { dev.newBufferWithBytes_length_options(std::ptr::NonNull::new(tile_to_problem.as_ptr() as *const _ as *mut std::ffi::c_void).unwrap(), (tile_to_problem.len() * 4) as u64 as usize, opts).unwrap() };
-    let tile_off_buf = unsafe { dev.newBufferWithBytes_length_options(std::ptr::NonNull::new(tile_offsets.as_ptr() as *const _ as *mut std::ffi::c_void).unwrap(), (tile_offsets.len() * 4) as u64 as usize, opts).unwrap() };
+    let offsets_buf = unsafe {
+        dev.newBufferWithBytes_length_options(
+            std::ptr::NonNull::new(problem_offsets.as_ptr() as *const _ as *mut std::ffi::c_void)
+                .unwrap(),
+            (problem_offsets.len() * 4) as u64 as usize,
+            opts,
+        )
+        .unwrap()
+    };
+    let tile_map_buf = unsafe {
+        dev.newBufferWithBytes_length_options(
+            std::ptr::NonNull::new(tile_to_problem.as_ptr() as *const _ as *mut std::ffi::c_void)
+                .unwrap(),
+            (tile_to_problem.len() * 4) as u64 as usize,
+            opts,
+        )
+        .unwrap()
+    };
+    let tile_off_buf = unsafe {
+        dev.newBufferWithBytes_length_options(
+            std::ptr::NonNull::new(tile_offsets.as_ptr() as *const _ as *mut std::ffi::c_void)
+                .unwrap(),
+            (tile_offsets.len() * 4) as u64 as usize,
+            opts,
+        )
+        .unwrap()
+    };
 
     let k_u32 = super::checked_u32(k, "K")?;
     let n_u32 = super::checked_u32(n, "N")?;
@@ -8833,9 +9065,21 @@ pub fn dispatch_grouped_splitk(
         let raw_enc = cb.computeCommandEncoder().unwrap();
         let enc = ComputePass::new(&raw_enc);
         enc.set_pipeline(&pass1_pipeline);
-        enc.set_buffer(grouped_splitk::A_STACKED as u32, Some(a_stacked.metal_buffer()), a_stacked.offset());
-        enc.set_buffer(grouped_splitk::B_STACKED as u32, Some(b_stacked.metal_buffer()), b_stacked.offset());
-        enc.set_buffer(grouped_splitk::PARTIAL as u32, Some(partial.metal_buffer()), 0);
+        enc.set_buffer(
+            grouped_splitk::A_STACKED as u32,
+            Some(a_stacked.metal_buffer()),
+            a_stacked.offset(),
+        );
+        enc.set_buffer(
+            grouped_splitk::B_STACKED as u32,
+            Some(b_stacked.metal_buffer()),
+            b_stacked.offset(),
+        );
+        enc.set_buffer(
+            grouped_splitk::PARTIAL as u32,
+            Some(partial.metal_buffer()),
+            0,
+        );
         enc.set_buffer(grouped_splitk::OFFSETS as u32, Some(&offsets_buf), 0);
         enc.set_buffer(grouped_splitk::TILE_MAP as u32, Some(&tile_map_buf), 0);
         enc.set_buffer(grouped_splitk::TILE_OFF as u32, Some(&tile_off_buf), 0);
@@ -8845,8 +9089,16 @@ pub fn dispatch_grouped_splitk(
         set_u32(enc, grouped_splitk::N_SPLITS, splits_u32);
 
         // Grid: (total_tiles, 1, n_splits)
-        let grid = MTLSize { width: total_tiles, height: 1, depth: n_splits };
-        let tg = MTLSize { width: 64, height: 1, depth: 1 };
+        let grid = MTLSize {
+            width: total_tiles,
+            height: 1,
+            depth: n_splits,
+        };
+        let tg = MTLSize {
+            width: 64,
+            height: 1,
+            depth: 1,
+        };
         enc.dispatch_threadgroups(grid, tg);
         enc.end();
     }
@@ -8858,7 +9110,11 @@ pub fn dispatch_grouped_splitk(
         let raw_enc = cb.computeCommandEncoder().unwrap();
         let enc = ComputePass::new(&raw_enc);
         enc.set_pipeline(&pass2_pipeline);
-        enc.set_buffer(splitk_reduce::PARTIAL as u32, Some(partial.metal_buffer()), 0);
+        enc.set_buffer(
+            splitk_reduce::PARTIAL as u32,
+            Some(partial.metal_buffer()),
+            0,
+        );
         enc.set_buffer(splitk_reduce::OUT as u32, Some(out.metal_buffer()), 0);
         set_u32(enc, splitk_reduce::M, total_m_u32);
         set_u32(enc, splitk_reduce::N, n_u32);
@@ -8867,7 +9123,18 @@ pub fn dispatch_grouped_splitk(
         let total_elems = total_m * n;
         let tg_size = 256u64;
         let n_groups = ceil_div(total_elems, tg_size as usize);
-        enc.dispatch_threadgroups(MTLSize { width: n_groups, height: 1, depth: 1 }, MTLSize { width: tg_size as usize, height: 1, depth: 1 });
+        enc.dispatch_threadgroups(
+            MTLSize {
+                width: n_groups,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: tg_size as usize,
+                height: 1,
+                depth: 1,
+            },
+        );
         enc.end();
     }
 

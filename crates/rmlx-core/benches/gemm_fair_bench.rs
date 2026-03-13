@@ -29,19 +29,22 @@
 //!
 //! Usage: cargo bench -p rmlx-core --bench gemm_fair_bench
 
-use std::time::Instant;
 use std::ptr::NonNull;
+use std::time::Instant;
 
 use half::f16;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{
+    MTLCommandBuffer as _, MTLCommandEncoder as _, MTLCommandQueue as _,
+    MTLComputeCommandEncoder as _, MTLDevice as _,
+};
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::KernelRegistry;
 use rmlx_core::ops;
 use rmlx_metal::device::GpuDevice;
-use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLDevice as _, MTLCommandQueue as _, MTLCommandBuffer as _, MTLComputeCommandEncoder as _, MTLCommandEncoder as _};
-use rmlx_metal::{MTLSize, MTLResourceOptions};
 use rmlx_metal::types::{MtlBuffer, MtlPipeline};
+use rmlx_metal::{MTLResourceOptions, MTLSize};
 
 const WARMUP_ITERS: usize = 5;
 const BENCH_ITERS: usize = 20;
@@ -67,7 +70,11 @@ fn lcg_next(state: &mut u64) -> u64 {
     *state
 }
 
-fn rand_f16_array(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, shape: &[usize], seed: u64) -> Array {
+fn rand_f16_array(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    shape: &[usize],
+    seed: u64,
+) -> Array {
     let numel: usize = shape.iter().product();
     let mut state = seed;
     let mut f16_bytes = Vec::with_capacity(numel * 2);
@@ -86,8 +93,18 @@ fn rand_f16_array(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, shape: &[
 /// buffer per call. `set_bytes` copies the value into the encoder's argument
 /// buffer inline, avoiding per-dispatch buffer allocation overhead.
 #[inline(always)]
-fn set_u32(enc: &ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>, index: usize, val: u32) {
-    unsafe { enc.setBytes_length_atIndex(NonNull::new(&val as *const u32 as *const std::ffi::c_void as *mut _).unwrap(), 4_usize, index) };
+fn set_u32(
+    enc: &ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
+    index: usize,
+    val: u32,
+) {
+    unsafe {
+        enc.setBytes_length_atIndex(
+            NonNull::new(&val as *const u32 as *const std::ffi::c_void as *mut _).unwrap(),
+            4_usize,
+            index,
+        )
+    };
 }
 
 fn percentile(sorted: &[f64], pct: f64) -> f64 {
@@ -173,7 +190,14 @@ struct GemmBuffers {
 }
 
 impl GemmBuffers {
-    fn new(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, m: usize, n: usize, k: usize, bm: usize, bn: usize) -> Self {
+    fn new(
+        device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+        m: usize,
+        n: usize,
+        k: usize,
+        bm: usize,
+        bn: usize,
+    ) -> Self {
         let a = rand_f16_array(device, &[m, k], 42);
         let b = rand_f16_array(device, &[k, n], 99);
         let c = Array::zeros(device, &[m, n], DType::Float16);
@@ -275,7 +299,11 @@ fn bench_pipelined(
     let opts = MTLResourceOptions::StorageModeShared;
     let out_size = (m * n * 2) as u64; // f16 = 2 bytes
     let out_bufs: Vec<MtlBuffer> = (0..PIPELINE_N)
-        .map(|_| device.newBufferWithLength_options(out_size as usize, opts).unwrap())
+        .map(|_| {
+            device
+                .newBufferWithLength_options(out_size as usize, opts)
+                .unwrap()
+        })
         .collect();
 
     // Warmup: 32 separate CBs, each with 1 dispatch to its own output buffer
@@ -286,8 +314,12 @@ fn bench_pipelined(
                 let cb = queue.commandBufferWithUnretainedReferences().unwrap();
                 let enc = cb.computeCommandEncoder().unwrap();
                 enc.setComputePipelineState(pipeline);
-                unsafe { enc.setBuffer_offset_atIndex(Some(bufs.a.metal_buffer()), 0_usize, 0_usize) };
-                unsafe { enc.setBuffer_offset_atIndex(Some(bufs.b.metal_buffer()), 0_usize, 1_usize) };
+                unsafe {
+                    enc.setBuffer_offset_atIndex(Some(bufs.a.metal_buffer()), 0_usize, 0_usize)
+                };
+                unsafe {
+                    enc.setBuffer_offset_atIndex(Some(bufs.b.metal_buffer()), 0_usize, 1_usize)
+                };
                 unsafe { enc.setBuffer_offset_atIndex(Some(out_buf), 0_usize, 2_usize) };
                 set_u32(&enc, 3, bufs.m_val);
                 set_u32(&enc, 4, bufs.n_val);
@@ -316,8 +348,12 @@ fn bench_pipelined(
                 let cb = queue.commandBufferWithUnretainedReferences().unwrap();
                 let enc = cb.computeCommandEncoder().unwrap();
                 enc.setComputePipelineState(pipeline);
-                unsafe { enc.setBuffer_offset_atIndex(Some(bufs.a.metal_buffer()), 0_usize, 0_usize) };
-                unsafe { enc.setBuffer_offset_atIndex(Some(bufs.b.metal_buffer()), 0_usize, 1_usize) };
+                unsafe {
+                    enc.setBuffer_offset_atIndex(Some(bufs.a.metal_buffer()), 0_usize, 0_usize)
+                };
+                unsafe {
+                    enc.setBuffer_offset_atIndex(Some(bufs.b.metal_buffer()), 0_usize, 1_usize)
+                };
                 unsafe { enc.setBuffer_offset_atIndex(Some(out_buf), 0_usize, 2_usize) };
                 set_u32(&enc, 3, bufs.m_val);
                 set_u32(&enc, 4, bufs.n_val);
@@ -359,7 +395,11 @@ fn bench_multi_encoder(
     let opts = MTLResourceOptions::StorageModeShared;
     let out_size = (m * n * 2) as u64;
     let out_bufs: Vec<MtlBuffer> = (0..PIPELINE_N)
-        .map(|_| device.newBufferWithLength_options(out_size as usize, opts).unwrap())
+        .map(|_| {
+            device
+                .newBufferWithLength_options(out_size as usize, opts)
+                .unwrap()
+        })
         .collect();
 
     // Warmup
@@ -435,7 +475,11 @@ fn bench_single_encoder(
     let opts = MTLResourceOptions::StorageModeShared;
     let out_size = (m * n * 2) as u64;
     let out_bufs: Vec<MtlBuffer> = (0..PIPELINE_N)
-        .map(|_| device.newBufferWithLength_options(out_size as usize, opts).unwrap())
+        .map(|_| {
+            device
+                .newBufferWithLength_options(out_size as usize, opts)
+                .unwrap()
+        })
         .collect();
 
     // Warmup
@@ -597,8 +641,16 @@ fn main() {
             let swizzle = bufs.swizzle_val;
             let grid_x = (tiles_n << swizzle) as u64;
             let grid_y = (tiles_m >> swizzle) as u64;
-            let grid = MTLSize { width: grid_x as usize, height: grid_y as usize, depth: 1_usize };
-            let tg = MTLSize { width: spec.threads as usize, height: 1_usize, depth: 1_usize };
+            let grid = MTLSize {
+                width: grid_x as usize,
+                height: grid_y as usize,
+                depth: 1_usize,
+            };
+            let tg = MTLSize {
+                width: spec.threads as usize,
+                height: 1_usize,
+                depth: 1_usize,
+            };
 
             println!(
                 "  [DEBUG] M={} kernel={} grid=({},{},{}) tg=({},{},{}) bm={} bn={} bk={} swizzle={}",

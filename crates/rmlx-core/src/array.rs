@@ -2,7 +2,7 @@
 
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLBuffer as _;
-use rmlx_metal::{MtlBuffer, MTLResourceOptions};
+use rmlx_metal::{MTLResourceOptions, MtlBuffer};
 
 use rmlx_alloc::MetalAllocator;
 
@@ -55,7 +55,11 @@ impl ArrayPool {
         }
     }
 
-    fn acquire(&mut self, device: &ProtocolObject<dyn objc2_metal::MTLDevice>, size: usize) -> MtlBuffer {
+    fn acquire(
+        &mut self,
+        device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+        size: usize,
+    ) -> MtlBuffer {
         if self.enabled {
             if let Some(bufs) = self.free.get_mut(&size) {
                 if let Some(buf) = bufs.pop() {
@@ -185,7 +189,11 @@ impl Array {
     }
 
     /// Create an array from a typed slice, allocating a new Metal buffer.
-    pub fn from_slice<T: HasDType>(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, data: &[T], shape: Vec<usize>) -> Self {
+    pub fn from_slice<T: HasDType>(
+        device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+        data: &[T],
+        shape: Vec<usize>,
+    ) -> Self {
         let dtype = T::DTYPE;
         let numel: usize = shape.iter().product();
         debug_assert_eq!(
@@ -227,7 +235,11 @@ impl Array {
 
     /// Allocate an uninitialized array. Use ONLY for outputs that will be
     /// fully overwritten by a GPU kernel before any read.
-    pub fn uninit(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, shape: &[usize], dtype: DType) -> Self {
+    pub fn uninit(
+        device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+        shape: &[usize],
+        dtype: DType,
+    ) -> Self {
         let numel: usize = shape.iter().product();
         let byte_size = dtype
             .numel_to_bytes(numel)
@@ -262,7 +274,11 @@ impl Array {
     ///
     /// Explicitly zeroes the buffer after allocation to guarantee correctness
     /// regardless of platform or Metal driver behavior.
-    pub fn zeros(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, shape: &[usize], dtype: DType) -> Self {
+    pub fn zeros(
+        device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+        shape: &[usize],
+        dtype: DType,
+    ) -> Self {
         let numel: usize = shape.iter().product();
         let byte_size = dtype
             .numel_to_bytes(numel)
@@ -495,16 +511,17 @@ impl Array {
     /// The returned array is GPU-only (cannot be read by CPU).
     /// Use for static weights that are loaded once and only read by GPU kernels.
     /// This eliminates CPU page-table mapping overhead for GPU-only buffers.
-    pub fn to_private(&self, device: &ProtocolObject<dyn objc2_metal::MTLDevice>, queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>) -> Self {
+    pub fn to_private(
+        &self,
+        device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+        queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
+    ) -> Self {
         use objc2_metal::MTLBlitCommandEncoder as _;
         use objc2_metal::MTLCommandBuffer as _;
         use objc2_metal::MTLCommandEncoder as _;
         let byte_size = self.byte_size();
         let private_buf = device
-            .newBufferWithLength_options(
-                byte_size.max(4),
-                MTLResourceOptions::StorageModePrivate,
-            )
+            .newBufferWithLength_options(byte_size.max(4), MTLResourceOptions::StorageModePrivate)
             .unwrap();
 
         // Blit copy from shared to private

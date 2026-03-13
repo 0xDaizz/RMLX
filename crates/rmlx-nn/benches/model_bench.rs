@@ -33,12 +33,12 @@
 //! Optionally set `MLX_DECODE_US` and `MLX_PREFILL_US` env vars to embed
 //! MLX reference numbers in the output for direct comparison.
 
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLDevice as _;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLDevice as _};
 
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::KernelRegistry;

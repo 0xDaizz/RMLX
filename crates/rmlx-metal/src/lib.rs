@@ -25,6 +25,9 @@ pub mod self_check;
 pub mod stream;
 pub mod types;
 
+#[cfg(feature = "metal4")]
+pub mod metal4;
+
 // Re-export objc2-metal essentials for downstream users
 pub use objc2_metal::MTLResourceOptions;
 pub use objc2_metal::MTLSize;
@@ -47,6 +50,8 @@ pub use device::{
 };
 pub use event::GpuEvent;
 pub use exec_graph::ExecGraph;
+#[cfg(feature = "metal4")]
+pub use exec_graph::ExecGraph4;
 pub use fence::{FenceError, GpuFence};
 pub use icb_sparse::{
     grouped_forward_icb, CachedSparsityPattern, IcbReplayCache, SparseDispatchResult,
@@ -58,6 +63,8 @@ pub use msl_version::{DeviceInfo, MslVersion};
 pub use pipeline::{FunctionConstant, PipelineCache};
 pub use pipeline_cache::DiskPipelineCache;
 pub use queue::{fast_command_buffer, fast_command_buffer_owned, GpuQueue};
+#[cfg(feature = "metal4")]
+pub use stream::Metal4State;
 pub use stream::{StreamManager, StreamSync, STREAM_COMPUTE, STREAM_COPY, STREAM_DEFAULT};
 
 /// Errors from Metal operations

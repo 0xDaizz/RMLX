@@ -46,7 +46,11 @@ fn setup() -> (KernelRegistry, MtlQueue) {
 /// Create a random-ish f32 array on the Metal device.
 ///
 /// Uses a deterministic pattern (not truly random) so the test is reproducible.
-fn pseudo_random_array(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, shape: &[usize], seed: u32) -> Array {
+fn pseudo_random_array(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    shape: &[usize],
+    seed: u32,
+) -> Array {
     let numel: usize = shape.iter().product();
     let data: Vec<f32> = (0..numel)
         .map(|i| {

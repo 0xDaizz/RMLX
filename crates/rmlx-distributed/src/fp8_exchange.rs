@@ -12,8 +12,11 @@ use rmlx_core::kernels::{KernelError, KernelRegistry};
 use rmlx_core::ops;
 
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice};
-use rmlx_metal::{MTLSize, MTLResourceOptions, MtlBuffer};
+use objc2_metal::{
+    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+    MTLComputePipelineState, MTLDevice,
+};
+use rmlx_metal::{MTLResourceOptions, MTLSize, MtlBuffer};
 
 // ---------------------------------------------------------------------------
 // Fused dequant+scatter Metal shader
@@ -275,11 +278,7 @@ pub fn wire_bytes(num_tokens: usize, hidden_dim: usize, dtype: DType) -> (usize,
 fn make_u32_buf(device: &ProtocolObject<dyn MTLDevice>, val: u32) -> MtlBuffer {
     let ptr = std::ptr::NonNull::new(&val as *const u32 as *mut std::ffi::c_void).unwrap();
     unsafe {
-        device.newBufferWithBytes_length_options(
-            ptr,
-            4,
-            MTLResourceOptions::StorageModeShared,
-        )
+        device.newBufferWithBytes_length_options(ptr, 4, MTLResourceOptions::StorageModeShared)
     }
     .unwrap()
 }
@@ -380,18 +379,27 @@ pub fn dequant_scatter_fp8e4m3(
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(packet_data.metal_buffer()), packet_data.offset(), 0);
         encoder.setBuffer_offset_atIndex(Some(scales.metal_buffer()), scales.offset(), 1);
-        encoder.setBuffer_offset_atIndex(Some(scatter_indices.metal_buffer()), scatter_indices.offset(), 2);
+        encoder.setBuffer_offset_atIndex(
+            Some(scatter_indices.metal_buffer()),
+            scatter_indices.offset(),
+            2,
+        );
         encoder.setBuffer_offset_atIndex(Some(output.metal_buffer()), output.offset(), 3);
         encoder.setBuffer_offset_atIndex(Some(&tokens_buf), 0, 4);
         encoder.setBuffer_offset_atIndex(Some(&dim_buf), 0, 5);
     }
 
-    let grid_size = MTLSize { width: hidden_dim, height: num_tokens, depth: 1 };
-    let tg_w = std::cmp::min(
-        hidden_dim,
-        pipeline.maxTotalThreadsPerThreadgroup(),
-    );
-    let threadgroup_size = MTLSize { width: tg_w, height: 1, depth: 1 };
+    let grid_size = MTLSize {
+        width: hidden_dim,
+        height: num_tokens,
+        depth: 1,
+    };
+    let tg_w = std::cmp::min(hidden_dim, pipeline.maxTotalThreadsPerThreadgroup());
+    let threadgroup_size = MTLSize {
+        width: tg_w,
+        height: 1,
+        depth: 1,
+    };
     encoder.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
     encoder.endEncoding();
     command_buffer.commit();

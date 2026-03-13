@@ -20,9 +20,9 @@
 //! Run (2-node with RDMA):
 //!   cargo bench -p rmlx-nn --bench ep_bench --features distributed
 
-use std::time::{Duration, Instant};
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLDevice as _};
+use objc2_metal::MTLDevice as _;
+use std::time::{Duration, Instant};
 
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
@@ -125,7 +125,11 @@ fn f32_to_f16_bits(val: f32) -> u16 {
     }
 }
 
-fn rand_array(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, shape: &[usize], seed: u64) -> Array {
+fn rand_array(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    shape: &[usize],
+    seed: u64,
+) -> Array {
     let numel: usize = shape.iter().product();
     let mut f16_bytes = Vec::with_capacity(numel * 2);
     let mut state = seed;
@@ -144,7 +148,12 @@ fn rand_array(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, shape: &[usiz
 // Layer construction helpers
 // ---------------------------------------------------------------------------
 
-fn make_linear(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, in_f: usize, out_f: usize, seed: u64) -> Linear {
+fn make_linear(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    in_f: usize,
+    out_f: usize,
+    seed: u64,
+) -> Linear {
     let weight = rand_array(device, &[out_f, in_f], seed);
     Linear::from_arrays(
         LinearConfig {
@@ -158,7 +167,12 @@ fn make_linear(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, in_f: usize,
     .expect("linear from_arrays")
 }
 
-fn make_expert(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, hidden: usize, inter: usize, seed_base: u64) -> Expert {
+fn make_expert(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    hidden: usize,
+    inter: usize,
+    seed_base: u64,
+) -> Expert {
     Expert {
         gate_proj: make_linear(device, hidden, inter, seed_base),
         up_proj: make_linear(device, hidden, inter, seed_base + 1),
@@ -166,7 +180,12 @@ fn make_expert(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, hidden: usiz
     }
 }
 
-fn make_gate(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, hidden: usize, num_experts: usize, seed: u64) -> Linear {
+fn make_gate(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    hidden: usize,
+    num_experts: usize,
+    seed: u64,
+) -> Linear {
     make_linear(device, hidden, num_experts, seed)
 }
 
@@ -219,7 +238,11 @@ where
 // Benchmark: Router (gate) latency
 // ---------------------------------------------------------------------------
 
-fn bench_router(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, registry: &KernelRegistry, queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>) {
+fn bench_router(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    registry: &KernelRegistry,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
+) {
     println!("\n=== Router (gate) latency ===");
 
     let gate = make_gate(device, HIDDEN_DIM, NUM_EXPERTS, 500);

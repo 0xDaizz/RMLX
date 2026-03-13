@@ -15,14 +15,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::sync::{Arc, OnceLock};
 
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{
+    MTLCommandBuffer as _, MTLCommandQueue, MTLComputePipelineState as _, MTLDevice,
+};
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::{KernelError, KernelRegistry};
 use rmlx_core::ops;
 use rmlx_core::MetalAllocator;
 use rmlx_metal::icb_sparse::{IcbReplayCache, SparseExpertPlan};
-use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLCommandBuffer as _, MTLCommandQueue, MTLComputePipelineState as _, MTLDevice};
 use rmlx_metal::{ComputePass, MTLSize};
 // TODO(Phase 6b): use grouped_forward_icb for direct ICB GEMM replay
 // use rmlx_metal::icb_sparse::grouped_forward_icb;
@@ -437,7 +439,7 @@ impl MoeLayer {
         let local_expert_range: (usize, usize) = (0, num_experts);
 
         // Record metrics
-self.metrics.record_forward(seq_len.try_into().unwrap());
+        self.metrics.record_forward(seq_len.try_into().unwrap());
 
         // Gate logits: [seq_len, num_experts]
         let gate_logits = gate.forward(x, registry, queue)?;
@@ -795,11 +797,16 @@ self.metrics.record_forward(seq_len.try_into().unwrap());
                     enc.set_pipeline(&pipeline);
                     enc.set_buffer(0, Some(x.metal_buffer()), src_offset);
                     enc.set_buffer(1, Some(batch_buf.metal_buffer()), dst_offset);
-                    let grid = MTLSize { width: hidden_dim, height: 1, depth: 1 };
-                    let tg = MTLSize { width: std::cmp::min(
-                            pipeline.maxTotalThreadsPerThreadgroup(),
-                            hidden_dim,
-                        ), height: 1, depth: 1 };
+                    let grid = MTLSize {
+                        width: hidden_dim,
+                        height: 1,
+                        depth: 1,
+                    };
+                    let tg = MTLSize {
+                        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), hidden_dim),
+                        height: 1,
+                        depth: 1,
+                    };
                     enc.dispatch_threads(grid, tg);
                     enc.end();
                 }
@@ -844,11 +851,16 @@ self.metrics.record_forward(seq_len.try_into().unwrap());
                 enc.set_pipeline(&pipeline);
                 enc.set_buffer(0, Some(summed.metal_buffer()), summed.offset());
                 enc.set_buffer(1, Some(output.metal_buffer()), dst_offset);
-                let grid = MTLSize { width: hidden_dim, height: 1, depth: 1 };
-                let tg = MTLSize { width: std::cmp::min(
-                        pipeline.maxTotalThreadsPerThreadgroup(),
-                        hidden_dim,
-                    ), height: 1, depth: 1 };
+                let grid = MTLSize {
+                    width: hidden_dim,
+                    height: 1,
+                    depth: 1,
+                };
+                let tg = MTLSize {
+                    width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), hidden_dim),
+                    height: 1,
+                    depth: 1,
+                };
                 enc.dispatch_threads(grid, tg);
                 enc.end();
                 cb.commit();
@@ -1045,8 +1057,10 @@ self.metrics.record_forward(seq_len.try_into().unwrap());
             let counts: Vec<u32> = route_result.expert_counts.to_vec_checked();
             for (eid, &count) in counts.iter().enumerate() {
                 if eid < self.metrics.num_experts && count > 0 {
-                    self.metrics.expert_tokens[eid]
-.fetch_add((count as usize).try_into().unwrap(), std::sync::atomic::Ordering::Relaxed);
+                    self.metrics.expert_tokens[eid].fetch_add(
+                        (count as usize).try_into().unwrap(),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                 }
             }
         }
@@ -1421,11 +1435,16 @@ fn gather_all_experts(
             enc.set_pipeline(&pipeline);
             enc.set_buffer(0, Some(x.metal_buffer()), src_offset);
             enc.set_buffer(1, Some(batch_buf.metal_buffer()), dst_offset);
-            let grid = MTLSize { width: hidden_dim, height: 1, depth: 1 };
-            let tg = MTLSize { width: std::cmp::min(
-                    pipeline.maxTotalThreadsPerThreadgroup(),
-                    hidden_dim,
-                ), height: 1, depth: 1 };
+            let grid = MTLSize {
+                width: hidden_dim,
+                height: 1,
+                depth: 1,
+            };
+            let tg = MTLSize {
+                width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), hidden_dim),
+                height: 1,
+                depth: 1,
+            };
             enc.dispatch_threads(grid, tg);
             enc.end();
         }
@@ -1452,7 +1471,12 @@ fn f32_to_f16_bits(val: f32) -> u16 {
 }
 
 /// Create a scale array filled with `weight` matching the given dtype.
-fn make_scale_array(dev: &ProtocolObject<dyn MTLDevice>, weight: f32, hidden_dim: usize, dtype: DType) -> Array {
+fn make_scale_array(
+    dev: &ProtocolObject<dyn MTLDevice>,
+    weight: f32,
+    hidden_dim: usize,
+    dtype: DType,
+) -> Array {
     match dtype {
         DType::Float32 => {
             let scale_data = vec![weight; hidden_dim];
@@ -1540,11 +1564,16 @@ fn scatter_add_all_experts(
                 enc.set_pipeline(&pipeline);
                 enc.set_buffer(0, Some(summed.metal_buffer()), summed.offset());
                 enc.set_buffer(1, Some(output.metal_buffer()), *dst_offset);
-                let grid = MTLSize { width: hidden_dim, height: 1, depth: 1 };
-                let tg = MTLSize { width: std::cmp::min(
-                        pipeline.maxTotalThreadsPerThreadgroup(),
-                        hidden_dim,
-                    ), height: 1, depth: 1 };
+                let grid = MTLSize {
+                    width: hidden_dim,
+                    height: 1,
+                    depth: 1,
+                };
+                let tg = MTLSize {
+                    width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), hidden_dim),
+                    height: 1,
+                    depth: 1,
+                };
                 enc.dispatch_threads(grid, tg);
                 enc.end();
             }

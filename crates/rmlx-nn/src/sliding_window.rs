@@ -358,8 +358,16 @@ impl SlidingWindowAttention {
                 enc.set_buffer(0, Some(head_out.metal_buffer()), head_out.offset());
                 enc.set_buffer(1, Some(concat.metal_buffer()), dst_col_offset);
                 let count = head_dim;
-                let grid = MTLSize { width: count, height: 1, depth: 1 };
-                let tg = MTLSize { width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), count), height: 1, depth: 1 };
+                let grid = MTLSize {
+                    width: count,
+                    height: 1,
+                    depth: 1,
+                };
+                let tg = MTLSize {
+                    width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), count),
+                    height: 1,
+                    depth: 1,
+                };
                 enc.dispatch_threads(grid, tg);
                 enc.end();
             } else {
@@ -367,13 +375,15 @@ impl SlidingWindowAttention {
                 for row in 0..seq_len {
                     let src_off = head_out.offset() + row * head_bytes;
                     let dst_off = row * hidden_bytes + dst_col_offset;
-                    unsafe { blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
-                        head_out.metal_buffer(),
-                        src_off,
-                        concat.metal_buffer(),
-                        dst_off,
-                        head_bytes,
-                    ) };
+                    unsafe {
+                        blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                            head_out.metal_buffer(),
+                            src_off,
+                            concat.metal_buffer(),
+                            dst_off,
+                            head_bytes,
+                        )
+                    };
                 }
                 blit.endEncoding();
             }

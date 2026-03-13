@@ -6,14 +6,14 @@
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
-use rmlx_metal::MTLSize;
-use rmlx_metal::ComputePass;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::MTLComputePipelineState as _;
 use objc2_metal::MTLCommandBuffer as _;
 use objc2_metal::MTLCommandQueue as _;
+use objc2_metal::MTLComputePipelineState as _;
 use objc2_metal::MTLDevice as _;
+use rmlx_metal::ComputePass;
 use rmlx_metal::MTLResourceOptions;
+use rmlx_metal::MTLSize;
 
 // ---------------------------------------------------------------------------
 // Metal shader source
@@ -210,11 +210,15 @@ fn axis_kernel_name(dtype: DType) -> Result<&'static str, KernelError> {
 }
 
 /// Create a Metal buffer from a single u32 value.
-fn make_u32_buf(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, val: u32) -> rmlx_metal::MtlBuffer {
+fn make_u32_buf(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    val: u32,
+) -> rmlx_metal::MtlBuffer {
     unsafe {
         device
             .newBufferWithBytes_length_options(
-                std::ptr::NonNull::new(&val as *const u32 as *const _ as *mut std::ffi::c_void).unwrap(),
+                std::ptr::NonNull::new(&val as *const u32 as *const _ as *mut std::ffi::c_void)
+                    .unwrap(),
                 std::mem::size_of::<u32>() as u64 as usize,
                 MTLResourceOptions::StorageModeShared,
             )
@@ -331,9 +335,17 @@ pub fn concat(
     encoder.set_buffer(4, Some(&axis_dim_out_buf), 0);
     encoder.set_buffer(5, Some(&outer_buf), 0);
     encoder.set_buffer(6, Some(&inner_buf), 0);
-    let grid_size = MTLSize { width: out_numel, height: 1, depth: 1 };
+    let grid_size = MTLSize {
+        width: out_numel,
+        height: 1,
+        depth: 1,
+    };
     let tg_width = std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), out_numel);
-    let threadgroup_size = MTLSize { width: tg_width, height: 1, depth: 1 };
+    let threadgroup_size = MTLSize {
+        width: tg_width,
+        height: 1,
+        depth: 1,
+    };
     encoder.dispatch_threads(grid_size, threadgroup_size);
     encoder.end();
     super::commit_with_mode(&command_buffer, super::ExecMode::Sync);

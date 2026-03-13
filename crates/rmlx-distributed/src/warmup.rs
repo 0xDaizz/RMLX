@@ -10,7 +10,10 @@ use std::time::{Duration, Instant};
 
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSRange;
-use objc2_metal::{MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice};
+use objc2_metal::{
+    MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+    MTLCreateSystemDefaultDevice, MTLDevice,
+};
 
 use crate::moe_policy::ThresholdCalibration;
 
@@ -268,14 +271,22 @@ fn run_gpu_matmul_proxy_bench(device: Option<&ProtocolObject<dyn MTLDevice>>, di
     ESTIMATED_GPU_MATMUL_GFLOPS
 }
 
-fn timed_gpu_copy_seconds(device: &ProtocolObject<dyn MTLDevice>, dim: usize, iterations: usize) -> Option<f64> {
+fn timed_gpu_copy_seconds(
+    device: &ProtocolObject<dyn MTLDevice>,
+    dim: usize,
+    iterations: usize,
+) -> Option<f64> {
     let element_count = dim.saturating_mul(dim).max(1);
     let byte_len = element_count
         .saturating_mul(size_of::<f32>())
         .max(size_of::<f32>());
     let range = NSRange::new(0, byte_len);
-    let src = device.newBufferWithLength_options(byte_len, rmlx_metal::DEFAULT_BUFFER_OPTIONS).unwrap();
-    let dst = device.newBufferWithLength_options(byte_len, rmlx_metal::DEFAULT_BUFFER_OPTIONS).unwrap();
+    let src = device
+        .newBufferWithLength_options(byte_len, rmlx_metal::DEFAULT_BUFFER_OPTIONS)
+        .unwrap();
+    let dst = device
+        .newBufferWithLength_options(byte_len, rmlx_metal::DEFAULT_BUFFER_OPTIONS)
+        .unwrap();
     let queue = device.newCommandQueue().unwrap();
 
     let init_cb = queue.commandBuffer().unwrap();
@@ -290,7 +301,11 @@ fn timed_gpu_copy_seconds(device: &ProtocolObject<dyn MTLDevice>, dim: usize, it
     for _ in 0..iterations.max(1) {
         let cb = queue.commandBuffer().unwrap();
         let blit = cb.blitCommandEncoder().unwrap();
-        unsafe { blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(&src, 0, &dst, 0, byte_len) };
+        unsafe {
+            blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                &src, 0, &dst, 0, byte_len,
+            )
+        };
         blit.endEncoding();
         cb.commit();
         cb.waitUntilCompleted();

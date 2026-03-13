@@ -13,16 +13,16 @@
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
-use rmlx_metal::ComputePass;
-use objc2::runtime::ProtocolObject;
-use objc2_metal::MTLComputePipelineState as _;
-use objc2_metal::MTLCommandBuffer as _;
-use objc2_metal::MTLCommandQueue as _;
 use crate::ops::buffer_slots::{
     fused_rms_gemv, fused_swiglu_down, gemm, silu_gate, silu_gate_strided,
 };
-use rmlx_metal::MTLSize;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLCommandBuffer as _;
+use objc2_metal::MTLCommandQueue as _;
+use objc2_metal::MTLComputePipelineState as _;
 use rmlx_macros::rmlx_kernel;
+use rmlx_metal::ComputePass;
+use rmlx_metal::MTLSize;
 
 /// Batched Q/K/V projection: single command buffer for 3 matmuls.
 ///
@@ -135,12 +135,35 @@ pub fn fused_silu_mul(
     let raw_enc = cb.computeCommandEncoder().unwrap();
     let enc = ComputePass::new(&raw_enc);
     enc.set_pipeline(&pipeline);
-    enc.set_buffer(silu_gate::GATE_OUT as u32, Some(gate_out.metal_buffer()), gate_out.offset());
-    enc.set_buffer(silu_gate::UP_OUT as u32, Some(up_out.metal_buffer()), up_out.offset());
-    enc.set_buffer(silu_gate::OUT as u32, Some(output.metal_buffer()), output.offset());
+    enc.set_buffer(
+        silu_gate::GATE_OUT as u32,
+        Some(gate_out.metal_buffer()),
+        gate_out.offset(),
+    );
+    enc.set_buffer(
+        silu_gate::UP_OUT as u32,
+        Some(up_out.metal_buffer()),
+        up_out.offset(),
+    );
+    enc.set_buffer(
+        silu_gate::OUT as u32,
+        Some(output.metal_buffer()),
+        output.offset(),
+    );
     enc.set_val(silu_gate::NUMEL as u32, &numel_u32);
     let tg = std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), grid_threads);
-    enc.dispatch_threads(MTLSize { width: grid_threads, height: 1, depth: 1 }, MTLSize { width: tg, height: 1, depth: 1 });
+    enc.dispatch_threads(
+        MTLSize {
+            width: grid_threads,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg,
+            height: 1,
+            depth: 1,
+        },
+    );
     enc.end();
     super::commit_with_mode(&cb, super::ExecMode::Sync);
 
@@ -198,12 +221,35 @@ pub fn fused_silu_mul_into_cb(
     let raw_enc = cb.computeCommandEncoder().unwrap();
     let enc = ComputePass::new(&raw_enc);
     enc.set_pipeline(&pipeline);
-    enc.set_buffer(silu_gate::GATE_OUT as u32, Some(gate_out.metal_buffer()), gate_out.offset());
-    enc.set_buffer(silu_gate::UP_OUT as u32, Some(up_out.metal_buffer()), up_out.offset());
-    enc.set_buffer(silu_gate::OUT as u32, Some(output.metal_buffer()), output.offset());
+    enc.set_buffer(
+        silu_gate::GATE_OUT as u32,
+        Some(gate_out.metal_buffer()),
+        gate_out.offset(),
+    );
+    enc.set_buffer(
+        silu_gate::UP_OUT as u32,
+        Some(up_out.metal_buffer()),
+        up_out.offset(),
+    );
+    enc.set_buffer(
+        silu_gate::OUT as u32,
+        Some(output.metal_buffer()),
+        output.offset(),
+    );
     enc.set_val(silu_gate::NUMEL as u32, &numel_u32);
     let tg = std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), grid_threads);
-    enc.dispatch_threads(MTLSize { width: grid_threads, height: 1, depth: 1 }, MTLSize { width: tg, height: 1, depth: 1 });
+    enc.dispatch_threads(
+        MTLSize {
+            width: grid_threads,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg,
+            height: 1,
+            depth: 1,
+        },
+    );
     enc.end();
 
     Ok(output)
@@ -257,12 +303,35 @@ pub fn fused_silu_mul_into_encoder(
     let grid_threads = numel.div_ceil(elems_per_thread);
 
     encoder.set_pipeline(&pipeline);
-    encoder.set_buffer(silu_gate::GATE_OUT as u32, Some(gate_out.metal_buffer()), gate_out.offset());
-    encoder.set_buffer(silu_gate::UP_OUT as u32, Some(up_out.metal_buffer()), up_out.offset());
-    encoder.set_buffer(silu_gate::OUT as u32, Some(output.metal_buffer()), output.offset());
+    encoder.set_buffer(
+        silu_gate::GATE_OUT as u32,
+        Some(gate_out.metal_buffer()),
+        gate_out.offset(),
+    );
+    encoder.set_buffer(
+        silu_gate::UP_OUT as u32,
+        Some(up_out.metal_buffer()),
+        up_out.offset(),
+    );
+    encoder.set_buffer(
+        silu_gate::OUT as u32,
+        Some(output.metal_buffer()),
+        output.offset(),
+    );
     encoder.set_val(silu_gate::NUMEL as u32, &numel_u32);
     let tg = std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), grid_threads);
-    encoder.dispatch_threads(MTLSize { width: grid_threads, height: 1, depth: 1 }, MTLSize { width: tg, height: 1, depth: 1 });
+    encoder.dispatch_threads(
+        MTLSize {
+            width: grid_threads,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg,
+            height: 1,
+            depth: 1,
+        },
+    );
 
     Ok(output)
 }
@@ -292,7 +361,18 @@ pub fn fused_silu_mul_preresolved_into_encoder(
     encoder.set_buffer(silu_gate::OUT as u32, Some(out_buf), out_offset);
     encoder.set_val(silu_gate::NUMEL as u32, &numel);
     let tg = std::cmp::min(pso.maxTotalThreadsPerThreadgroup(), grid_threads);
-    encoder.dispatch_threads(MTLSize { width: grid_threads, height: 1, depth: 1 }, MTLSize { width: tg, height: 1, depth: 1 });
+    encoder.dispatch_threads(
+        MTLSize {
+            width: grid_threads,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg,
+            height: 1,
+            depth: 1,
+        },
+    );
 }
 
 /// Get the silu_gate kernel name for a dtype.
@@ -362,15 +442,31 @@ pub fn fused_silu_mul_strided_into_cb(
     let raw_enc = cb.computeCommandEncoder().unwrap();
     let enc = ComputePass::new(&raw_enc);
     enc.set_pipeline(&pipeline);
-    enc.set_buffer(silu_gate_strided::MERGED as u32, Some(merged.metal_buffer()), merged.offset());
-    enc.set_buffer(silu_gate_strided::OUT as u32, Some(output.metal_buffer()), output.offset());
+    enc.set_buffer(
+        silu_gate_strided::MERGED as u32,
+        Some(merged.metal_buffer()),
+        merged.offset(),
+    );
+    enc.set_buffer(
+        silu_gate_strided::OUT as u32,
+        Some(output.metal_buffer()),
+        output.offset(),
+    );
     enc.set_val(silu_gate_strided::GATE_DIM as u32, &gate_dim_u32);
     enc.set_val(silu_gate_strided::TOTAL_DIM as u32, &total_dim_u32);
     enc.set_val(silu_gate_strided::SEQ_LEN as u32, &seq_len_u32);
-    let grid_size = MTLSize { width: grid_x, height: grid_y, depth: 1 };
+    let grid_size = MTLSize {
+        width: grid_x,
+        height: grid_y,
+        depth: 1,
+    };
     let max_tg = pipeline.maxTotalThreadsPerThreadgroup();
     let tg_x = std::cmp::min(max_tg, grid_x);
-    let threadgroup_size = MTLSize { width: tg_x, height: 1, depth: 1 };
+    let threadgroup_size = MTLSize {
+        width: tg_x,
+        height: 1,
+        depth: 1,
+    };
     enc.dispatch_threads(grid_size, threadgroup_size);
     enc.end();
 
@@ -585,15 +681,31 @@ pub fn fused_silu_mul_strided_encode(
     let grid_y = seq_len;
 
     encoder.set_pipeline(&pipeline);
-    encoder.set_buffer(silu_gate_strided::MERGED as u32, Some(merged.metal_buffer()), merged.offset());
-    encoder.set_buffer(silu_gate_strided::OUT as u32, Some(output.metal_buffer()), output.offset());
+    encoder.set_buffer(
+        silu_gate_strided::MERGED as u32,
+        Some(merged.metal_buffer()),
+        merged.offset(),
+    );
+    encoder.set_buffer(
+        silu_gate_strided::OUT as u32,
+        Some(output.metal_buffer()),
+        output.offset(),
+    );
     encoder.set_val(silu_gate_strided::GATE_DIM as u32, &gate_dim_u32);
     encoder.set_val(silu_gate_strided::TOTAL_DIM as u32, &total_dim_u32);
     encoder.set_val(silu_gate_strided::SEQ_LEN as u32, &seq_len_u32);
-    let grid_size = MTLSize { width: grid_x, height: grid_y, depth: 1 };
+    let grid_size = MTLSize {
+        width: grid_x,
+        height: grid_y,
+        depth: 1,
+    };
     let max_tg = pipeline.maxTotalThreadsPerThreadgroup();
     let tg_x = std::cmp::min(max_tg, grid_x);
-    let threadgroup_size = MTLSize { width: tg_x, height: 1, depth: 1 };
+    let threadgroup_size = MTLSize {
+        width: tg_x,
+        height: 1,
+        depth: 1,
+    };
     encoder.dispatch_threads(grid_size, threadgroup_size);
 
     Ok(output)
@@ -756,8 +868,16 @@ fn encode_gemm(
 
     let grid_x = ((n as usize).div_ceil(bn)) << swizzle_log;
     let grid_y = ((m as usize).div_ceil(bm)) >> swizzle_log;
-    let grid = MTLSize { width: grid_x, height: grid_y, depth: 1 };
-    let tg = MTLSize { width: tg_threads as usize, height: 1, depth: 1 };
+    let grid = MTLSize {
+        width: grid_x,
+        height: grid_y,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: tg_threads as usize,
+        height: 1,
+        depth: 1,
+    };
     enc.dispatch_threadgroups(grid, tg);
     enc.end();
 
@@ -1280,15 +1400,30 @@ pub fn fused_swiglu_down_dispatch_sizes(
         fused_ceil_div(m as usize, FUSED_TM)
     };
     let tg_dim = if use_bm8 {
-        MTLSize { width: 32, height: 1, depth: FUSED_BM8 }
+        MTLSize {
+            width: 32,
+            height: 1,
+            depth: FUSED_BM8,
+        }
     } else {
         let tg_size = std::cmp::min(
             FUSED_SWIGLU_DOWN_TG_SIZE,
             pso.maxTotalThreadsPerThreadgroup(),
         );
-        MTLSize { width: tg_size, height: 1, depth: 1 }
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        }
     };
-    (MTLSize { width: num_threadgroups, height: 1, depth: 1 }, tg_dim)
+    (
+        MTLSize {
+            width: num_threadgroups,
+            height: 1,
+            depth: 1,
+        },
+        tg_dim,
+    )
 }
 
 /// Encode fused SwiGLU+down using a pre-resolved PSO and pre-allocated buffers.
@@ -1319,7 +1454,11 @@ pub fn fused_swiglu_down_preresolved_into_encoder(
 ) {
     encoder.set_pipeline(pso);
     encoder.set_buffer(fused_swiglu_down::MAT as u32, Some(mat_buf), mat_offset);
-    encoder.set_buffer(fused_swiglu_down::GATE_UP as u32, Some(gate_up_buf), gate_up_offset);
+    encoder.set_buffer(
+        fused_swiglu_down::GATE_UP as u32,
+        Some(gate_up_buf),
+        gate_up_offset,
+    );
     encoder.set_buffer(fused_swiglu_down::OUT as u32, Some(out_buf), out_offset);
     encoder.set_val(fused_swiglu_down::M as u32, &m);
     encoder.set_val(fused_swiglu_down::K as u32, &k);
@@ -2002,10 +2141,7 @@ pub fn fused_rms_gemv_kernel_name(dtype: DType, m: u32) -> Result<&'static str, 
 }
 
 /// Compute dispatch grid and threadgroup sizes for fused RMS-norm + GEMV.
-pub fn fused_rms_gemv_dispatch_sizes(
-    m: u32,
-    pso: &rmlx_metal::MtlPipeline,
-) -> (MTLSize, MTLSize) {
+pub fn fused_rms_gemv_dispatch_sizes(m: u32, pso: &rmlx_metal::MtlPipeline) -> (MTLSize, MTLSize) {
     let use_bm8 = (m as usize) >= FUSED_BM8_THRESHOLD;
     let num_threadgroups = if use_bm8 {
         fused_ceil_div(m as usize, FUSED_BM8_ROWS)
@@ -2013,15 +2149,27 @@ pub fn fused_rms_gemv_dispatch_sizes(
         fused_ceil_div(m as usize, FUSED_TM)
     };
     let tg_dim = if use_bm8 {
-        MTLSize { width: 32, height: 1, depth: FUSED_BM8 }
+        MTLSize {
+            width: 32,
+            height: 1,
+            depth: FUSED_BM8,
+        }
     } else {
-        let tg_size = std::cmp::min(
-            FUSED_RMS_GEMV_TG_SIZE,
-            pso.maxTotalThreadsPerThreadgroup(),
-        );
-        MTLSize { width: tg_size, height: 1, depth: 1 }
+        let tg_size = std::cmp::min(FUSED_RMS_GEMV_TG_SIZE, pso.maxTotalThreadsPerThreadgroup());
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        }
     };
-    (MTLSize { width: num_threadgroups, height: 1, depth: 1 }, tg_dim)
+    (
+        MTLSize {
+            width: num_threadgroups,
+            height: 1,
+            depth: 1,
+        },
+        tg_dim,
+    )
 }
 
 /// Encode fused RMS-norm + GEMV using a pre-resolved PSO and pre-allocated buffers.
@@ -2056,7 +2204,11 @@ pub fn fused_rms_gemv_preresolved_into_encoder(
 ) {
     encoder.set_pipeline(pso);
     encoder.set_buffer(fused_rms_gemv::INPUT as u32, Some(input_buf), input_offset);
-    encoder.set_buffer(fused_rms_gemv::NORM_W as u32, Some(norm_w_buf), norm_w_offset);
+    encoder.set_buffer(
+        fused_rms_gemv::NORM_W as u32,
+        Some(norm_w_buf),
+        norm_w_offset,
+    );
     encoder.set_buffer(fused_rms_gemv::MAT as u32, Some(mat_buf), mat_offset);
     encoder.set_buffer(fused_rms_gemv::OUT as u32, Some(out_buf), out_offset);
     encoder.set_val(fused_rms_gemv::M as u32, &m);

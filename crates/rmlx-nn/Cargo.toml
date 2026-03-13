@@ -20,6 +20,8 @@ serde_json = "1"
 [features]
 bench = ["rmlx-core/bench"]
 distributed = ["rmlx-distributed"]
+## Forward metal4 through to rmlx-core and rmlx-metal.
+metal4 = ["rmlx-core/metal4", "rmlx-metal/metal4"]
 
 [[bench]]
 name = "pipeline_bench"

@@ -11,8 +11,8 @@
 //! Supported group sizes: 32, 64, 128
 
 use objc2_metal::MTLBuffer as _;
-use rmlx_metal::MtlBuffer;
 use rmlx_metal::ComputePass;
+use rmlx_metal::MtlBuffer;
 
 use crate::array::Array;
 use crate::dtype::DType;
@@ -25,12 +25,12 @@ use objc2_metal::MTLCommandBuffer as _;
 use objc2_metal::MTLCommandQueue as _;
 use objc2_metal::MTLDevice as _;
 // MTLResource trait import removed (unused after objc2 migration)
-use rmlx_metal::MTLResourceOptions;
-use rmlx_metal::MTLSize;
 use crate::ops::buffer_slots::{
     awq, awq_gidx, gather_qmm, gather_qmv, qmm_legacy, qmm_mma, qmm_nax, qmm_skinny,
     qmm_splitk_reduce, qmm_steel, qmm_steel_splitk, qmm_tiny_reduce, qmv,
 };
+use rmlx_metal::MTLResourceOptions;
+use rmlx_metal::MTLSize;
 
 // ---------------------------------------------------------------------------
 // Deprecated GGML-format block structs (kept for backward compatibility)
@@ -1373,9 +1373,17 @@ pub fn affine_quantized_matmul(
     enc.set_buffer(qmv::WEIGHTS as u32, Some(&qw.weights_buf), 0);
     enc.set_buffer(qmv::SCALES as u32, Some(&qw.scales_buf), 0);
     enc.set_buffer(qmv::BIASES as u32, Some(&qw.biases_buf), 0);
-    enc.set_buffer(qmv::INPUT as u32, Some(vec_for_kernel.metal_buffer()), vec_for_kernel.offset());
+    enc.set_buffer(
+        qmv::INPUT as u32,
+        Some(vec_for_kernel.metal_buffer()),
+        vec_for_kernel.offset(),
+    );
     enc.set_buffer(qmv::OUTPUT as u32, Some(out.metal_buffer()), 0);
-    enc.set_bytes(qmv::PARAMS as u32, params.as_ptr() as *const std::ffi::c_void, 16);
+    enc.set_bytes(
+        qmv::PARAMS as u32,
+        params.as_ptr() as *const std::ffi::c_void,
+        16,
+    );
     // MLX qmv_fast layout: 2 simdgroups × 4 rows = 8 rows per threadgroup.
     // Threadgroup size = 2 × 32 = 64 threads.
     // Grid: (1, ceil(out_features / 8), 1)
@@ -1384,8 +1392,16 @@ pub fn affine_quantized_matmul(
     let tg_size: usize = 64; // 2 simdgroups × 32
 
     enc.dispatch_threadgroups(
-        MTLSize { width: 1, height: num_tgs_y, depth: 1 },
-        MTLSize { width: tg_size, height: 1, depth: 1 },
+        MTLSize {
+            width: 1,
+            height: num_tgs_y,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        },
     );
     enc.end();
     super::commit_with_mode(&cb, super::ExecMode::Sync);
@@ -1486,15 +1502,27 @@ pub fn affine_qmv_batched_q4(
     enc.set_buffer(qmv::BIASES as u32, Some(&qw.biases_buf), 0);
     enc.set_buffer(qmv::INPUT as u32, Some(x.metal_buffer()), x.offset());
     enc.set_buffer(qmv::OUTPUT as u32, Some(out.metal_buffer()), 0);
-    enc.set_bytes(qmv::PARAMS as u32, params.as_ptr() as *const std::ffi::c_void, 16);
+    enc.set_bytes(
+        qmv::PARAMS as u32,
+        params.as_ptr() as *const std::ffi::c_void,
+        16,
+    );
     // Grid: (M, ceil(N / 8), 1) — M batches × N-tile groups
     let rows_per_tg: usize = 8; // NUM_SIMDGROUPS(2) * RESULTS_PER_SG(4)
     let num_tgs_y = n.div_ceil(rows_per_tg);
     let tg_size: usize = 64; // 2 simdgroups × 32
 
     enc.dispatch_threadgroups(
-        MTLSize { width: m, height: num_tgs_y, depth: 1 },
-        MTLSize { width: tg_size, height: 1, depth: 1 },
+        MTLSize {
+            width: m,
+            height: num_tgs_y,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        },
     );
     enc.end();
     super::commit_with_mode(&cb, super::ExecMode::Sync);
@@ -1604,14 +1632,26 @@ pub fn affine_qmv_fast_f16_q4(
     enc.set_buffer(qmv::BIASES as u32, Some(&qw.biases_buf), 0);
     enc.set_buffer(qmv::INPUT as u32, Some(vec.metal_buffer()), vec.offset());
     enc.set_buffer(qmv::OUTPUT as u32, Some(out.metal_buffer()), 0);
-    enc.set_bytes(qmv::PARAMS as u32, params.as_ptr() as *const std::ffi::c_void, 16);
+    enc.set_bytes(
+        qmv::PARAMS as u32,
+        params.as_ptr() as *const std::ffi::c_void,
+        16,
+    );
     let rows_per_tg: usize = 8;
     let num_tgs_y = qw.out_features.div_ceil(rows_per_tg);
     let tg_size: usize = 64;
 
     enc.dispatch_threadgroups(
-        MTLSize { width: 1, height: num_tgs_y, depth: 1 },
-        MTLSize { width: tg_size, height: 1, depth: 1 },
+        MTLSize {
+            width: 1,
+            height: num_tgs_y,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        },
     );
     enc.end();
     super::commit_with_mode(&cb, super::ExecMode::Sync);
@@ -1703,14 +1743,26 @@ pub fn affine_qmv_batched_f16_q4(
     enc.set_buffer(qmv::BIASES as u32, Some(&qw.biases_buf), 0);
     enc.set_buffer(qmv::INPUT as u32, Some(x.metal_buffer()), x.offset());
     enc.set_buffer(qmv::OUTPUT as u32, Some(out.metal_buffer()), 0);
-    enc.set_bytes(qmv::PARAMS as u32, params.as_ptr() as *const std::ffi::c_void, 16);
+    enc.set_bytes(
+        qmv::PARAMS as u32,
+        params.as_ptr() as *const std::ffi::c_void,
+        16,
+    );
     let rows_per_tg: usize = 8;
     let num_tgs_y = n.div_ceil(rows_per_tg);
     let tg_size: usize = 64;
 
     enc.dispatch_threadgroups(
-        MTLSize { width: m, height: num_tgs_y, depth: 1 },
-        MTLSize { width: tg_size, height: 1, depth: 1 },
+        MTLSize {
+            width: m,
+            height: num_tgs_y,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        },
     );
     enc.end();
     super::commit_with_mode(&cb, super::ExecMode::Sync);
@@ -1829,15 +1881,31 @@ pub fn affine_qmv_batched_splitk_f16_q4(
     enc.set_buffer(qmv::BIASES as u32, Some(&qw.biases_buf), 0);
     enc.set_buffer(qmv::INPUT as u32, Some(x.metal_buffer()), x.offset());
     enc.set_buffer(qmv::OUTPUT as u32, Some(&c_split_buf), 0);
-    enc.set_bytes(qmv::PARAMS as u32, params.as_ptr() as *const std::ffi::c_void, 16);
-    enc.set_bytes(qmv::SPLITK_PARAMS as u32, splitk_p.as_ptr() as *const std::ffi::c_void, 8);
+    enc.set_bytes(
+        qmv::PARAMS as u32,
+        params.as_ptr() as *const std::ffi::c_void,
+        16,
+    );
+    enc.set_bytes(
+        qmv::SPLITK_PARAMS as u32,
+        splitk_p.as_ptr() as *const std::ffi::c_void,
+        8,
+    );
     let rows_per_tg: usize = 8;
     let num_tgs_y = n.div_ceil(rows_per_tg);
     let tg_size: usize = 64;
 
     enc.dispatch_threadgroups(
-        MTLSize { width: m, height: num_tgs_y, depth: k_partitions },
-        MTLSize { width: tg_size, height: 1, depth: 1 },
+        MTLSize {
+            width: m,
+            height: num_tgs_y,
+            depth: k_partitions,
+        },
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        },
     );
     enc.end();
 
@@ -1855,10 +1923,22 @@ pub fn affine_qmv_batched_splitk_f16_q4(
     enc2.set_pipeline(&reduce_pipeline);
     enc2.set_buffer(qmm_splitk_reduce::PARTIAL as u32, Some(&c_split_buf), 0);
     enc2.set_buffer(qmm_splitk_reduce::OUT as u32, Some(out.metal_buffer()), 0);
-    enc2.set_bytes(qmm_splitk_reduce::PARAMS as u32, acc_params.as_ptr() as *const std::ffi::c_void, 12);
+    enc2.set_bytes(
+        qmm_splitk_reduce::PARAMS as u32,
+        acc_params.as_ptr() as *const std::ffi::c_void,
+        12,
+    );
     enc2.dispatch_threads(
-        MTLSize { width: n, height: m, depth: 1 },
-        MTLSize { width: n.min(256), height: 1, depth: 1 },
+        MTLSize {
+            width: n,
+            height: m,
+            depth: 1,
+        },
+        MTLSize {
+            width: n.min(256),
+            height: 1,
+            depth: 1,
+        },
     );
     enc2.end();
 
@@ -1958,15 +2038,31 @@ pub fn affine_qmv_splitk_f16_q4(
     enc.set_buffer(qmv::BIASES as u32, Some(&qw.biases_buf), 0);
     enc.set_buffer(qmv::INPUT as u32, Some(vec.metal_buffer()), vec.offset());
     enc.set_buffer(qmv::OUTPUT as u32, Some(&c_split_buf), 0);
-    enc.set_bytes(qmv::PARAMS as u32, params.as_ptr() as *const std::ffi::c_void, 16);
-    enc.set_bytes(qmv::SPLITK_PARAMS as u32, splitk_p.as_ptr() as *const std::ffi::c_void, 8);
+    enc.set_bytes(
+        qmv::PARAMS as u32,
+        params.as_ptr() as *const std::ffi::c_void,
+        16,
+    );
+    enc.set_bytes(
+        qmv::SPLITK_PARAMS as u32,
+        splitk_p.as_ptr() as *const std::ffi::c_void,
+        8,
+    );
     let rows_per_tg: usize = 8;
     let num_tgs_y = n.div_ceil(rows_per_tg);
     let tg_size: usize = 64;
 
     enc.dispatch_threadgroups(
-        MTLSize { width: 1, height: num_tgs_y, depth: k_partitions },
-        MTLSize { width: tg_size, height: 1, depth: 1 },
+        MTLSize {
+            width: 1,
+            height: num_tgs_y,
+            depth: k_partitions,
+        },
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        },
     );
     enc.end();
 
@@ -1985,11 +2081,23 @@ pub fn affine_qmv_splitk_f16_q4(
     enc2.set_pipeline(&reduce_pipeline);
     enc2.set_buffer(qmm_splitk_reduce::PARTIAL as u32, Some(&c_split_buf), 0);
     enc2.set_buffer(qmm_splitk_reduce::OUT as u32, Some(out.metal_buffer()), 0);
-    enc2.set_bytes(qmm_splitk_reduce::PARAMS as u32, acc_params.as_ptr() as *const std::ffi::c_void, 12);
+    enc2.set_bytes(
+        qmm_splitk_reduce::PARAMS as u32,
+        acc_params.as_ptr() as *const std::ffi::c_void,
+        12,
+    );
     // dispatch_threads for 1-D reduce: N threads, M=1 so gid.y=0
     enc2.dispatch_threads(
-        MTLSize { width: n, height: 1, depth: 1 },
-        MTLSize { width: n.min(256), height: 1, depth: 1 },
+        MTLSize {
+            width: n,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: n.min(256),
+            height: 1,
+            depth: 1,
+        },
     );
     enc2.end();
 
@@ -2072,15 +2180,31 @@ pub fn affine_qmv_splitk_f16_q4_into_cb(
     enc.set_buffer(qmv::BIASES as u32, Some(&qw.biases_buf), 0);
     enc.set_buffer(qmv::INPUT as u32, Some(vec.metal_buffer()), vec.offset());
     enc.set_buffer(qmv::OUTPUT as u32, Some(&c_split_buf), 0);
-    enc.set_bytes(qmv::PARAMS as u32, params.as_ptr() as *const std::ffi::c_void, 16);
-    enc.set_bytes(qmv::SPLITK_PARAMS as u32, splitk_p.as_ptr() as *const std::ffi::c_void, 8);
+    enc.set_bytes(
+        qmv::PARAMS as u32,
+        params.as_ptr() as *const std::ffi::c_void,
+        16,
+    );
+    enc.set_bytes(
+        qmv::SPLITK_PARAMS as u32,
+        splitk_p.as_ptr() as *const std::ffi::c_void,
+        8,
+    );
     let rows_per_tg: usize = 8;
     let num_tgs_y = n.div_ceil(rows_per_tg);
     let tg_size: usize = 64;
 
     enc.dispatch_threadgroups(
-        MTLSize { width: 1, height: num_tgs_y, depth: k_partitions },
-        MTLSize { width: tg_size, height: 1, depth: 1 },
+        MTLSize {
+            width: 1,
+            height: num_tgs_y,
+            depth: k_partitions,
+        },
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        },
     );
     enc.end();
 
@@ -2098,10 +2222,22 @@ pub fn affine_qmv_splitk_f16_q4_into_cb(
     enc2.set_pipeline(&reduce_pipeline);
     enc2.set_buffer(qmm_splitk_reduce::PARTIAL as u32, Some(&c_split_buf), 0);
     enc2.set_buffer(qmm_splitk_reduce::OUT as u32, Some(out.metal_buffer()), 0);
-    enc2.set_bytes(qmm_splitk_reduce::PARAMS as u32, acc_params.as_ptr() as *const std::ffi::c_void, 12);
+    enc2.set_bytes(
+        qmm_splitk_reduce::PARAMS as u32,
+        acc_params.as_ptr() as *const std::ffi::c_void,
+        12,
+    );
     enc2.dispatch_threads(
-        MTLSize { width: n, height: 1, depth: 1 },
-        MTLSize { width: n.min(256), height: 1, depth: 1 },
+        MTLSize {
+            width: n,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: n.min(256),
+            height: 1,
+            depth: 1,
+        },
     );
     enc2.end();
 
@@ -2200,11 +2336,27 @@ pub fn awq_dequant(
     let raw_enc = cb.computeCommandEncoder().unwrap();
     let enc = ComputePass::new(&raw_enc);
     enc.set_pipeline(&pipeline);
-    enc.set_buffer(awq::QWEIGHT as u32, Some(qweight.metal_buffer()), qweight.offset());
-    enc.set_buffer(awq::QZEROS as u32, Some(qzeros.metal_buffer()), qzeros.offset());
-    enc.set_buffer(awq::SCALES as u32, Some(scales.metal_buffer()), scales.offset());
+    enc.set_buffer(
+        awq::QWEIGHT as u32,
+        Some(qweight.metal_buffer()),
+        qweight.offset(),
+    );
+    enc.set_buffer(
+        awq::QZEROS as u32,
+        Some(qzeros.metal_buffer()),
+        qzeros.offset(),
+    );
+    enc.set_buffer(
+        awq::SCALES as u32,
+        Some(scales.metal_buffer()),
+        scales.offset(),
+    );
     enc.set_buffer(awq::OUT as u32, Some(out.metal_buffer()), 0);
-    enc.set_bytes(awq::PARAMS as u32, params.as_ptr() as *const std::ffi::c_void, 16);
+    enc.set_bytes(
+        awq::PARAMS as u32,
+        params.as_ptr() as *const std::ffi::c_void,
+        16,
+    );
     // 2D grid: (cols, rows, 1) — each thread handles one output element.
     let max_tg = pipeline.maxTotalThreadsPerThreadgroup();
     let tw = pipeline.threadExecutionWidth();
@@ -2212,8 +2364,16 @@ pub fn awq_dequant(
     let tg_x = tw.min(cols);
     let tg_y = (max_tg / tg_x).max(1).min(rows);
 
-    let grid = MTLSize { width: cols, height: rows, depth: 1 };
-    let tg = MTLSize { width: tg_x, height: tg_y, depth: 1 };
+    let grid = MTLSize {
+        width: cols,
+        height: rows,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: tg_x,
+        height: tg_y,
+        depth: 1,
+    };
     enc.dispatch_threads(grid, tg);
     enc.end();
     super::commit_with_mode(&cb, super::ExecMode::Sync);
@@ -2348,7 +2508,18 @@ pub fn gptq_dequant(
         Some(idx) => idx.metal_buffer(),
         None => {
             let dummy_val: [i32; 1] = [0];
-            unsafe { dummy_buf = dev.newBufferWithBytes_length_options(std::ptr::NonNull::new(dummy_val.as_ptr() as *const _ as *mut std::ffi::c_void).unwrap(), std::mem::size_of::<i32>() as u64 as usize, opts).unwrap() };
+            unsafe {
+                dummy_buf = dev
+                    .newBufferWithBytes_length_options(
+                        std::ptr::NonNull::new(
+                            dummy_val.as_ptr() as *const _ as *mut std::ffi::c_void
+                        )
+                        .unwrap(),
+                        std::mem::size_of::<i32>() as u64 as usize,
+                        opts,
+                    )
+                    .unwrap()
+            };
             &dummy_buf
         }
     };
@@ -2358,20 +2529,44 @@ pub fn gptq_dequant(
     let raw_enc = cb.computeCommandEncoder().unwrap();
     let enc = ComputePass::new(&raw_enc);
     enc.set_pipeline(&pipeline);
-    enc.set_buffer(awq_gidx::QWEIGHT as u32, Some(qweight.metal_buffer()), qweight.offset());
-    enc.set_buffer(awq_gidx::QZEROS as u32, Some(qzeros.metal_buffer()), qzeros.offset());
-    enc.set_buffer(awq_gidx::SCALES as u32, Some(scales.metal_buffer()), scales.offset());
+    enc.set_buffer(
+        awq_gidx::QWEIGHT as u32,
+        Some(qweight.metal_buffer()),
+        qweight.offset(),
+    );
+    enc.set_buffer(
+        awq_gidx::QZEROS as u32,
+        Some(qzeros.metal_buffer()),
+        qzeros.offset(),
+    );
+    enc.set_buffer(
+        awq_gidx::SCALES as u32,
+        Some(scales.metal_buffer()),
+        scales.offset(),
+    );
     enc.set_buffer(awq_gidx::G_IDX as u32, Some(g_idx_buf), g_idx_offset);
     enc.set_buffer(awq_gidx::OUT as u32, Some(out.metal_buffer()), 0);
-    enc.set_bytes(awq_gidx::PARAMS as u32, params.as_ptr() as *const std::ffi::c_void, 16);
+    enc.set_bytes(
+        awq_gidx::PARAMS as u32,
+        params.as_ptr() as *const std::ffi::c_void,
+        16,
+    );
     // 2D grid: (out_features, in_features, 1) — each thread handles one output element.
     let max_tg = pipeline.maxTotalThreadsPerThreadgroup();
     let tw = pipeline.threadExecutionWidth();
     let tg_x = tw.min(out_features);
     let tg_y = (max_tg / tg_x).max(1).min(in_features);
 
-    let grid = MTLSize { width: out_features, height: in_features, depth: 1 };
-    let tg = MTLSize { width: tg_x, height: tg_y, depth: 1 };
+    let grid = MTLSize {
+        width: out_features,
+        height: in_features,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: tg_x,
+        height: tg_y,
+        depth: 1,
+    };
     enc.dispatch_threads(grid, tg);
     enc.end();
     super::commit_with_mode(&cb, super::ExecMode::Sync);
@@ -6420,16 +6615,36 @@ pub fn affine_qmm_steel_splitk_q4(
         let raw_enc = cb.computeCommandEncoder().unwrap();
         let enc = ComputePass::new(&raw_enc);
         enc.set_pipeline(&pipeline);
-        enc.set_buffer(qmm_steel_splitk::X as u32, Some(x.metal_buffer()), x.offset());
+        enc.set_buffer(
+            qmm_steel_splitk::X as u32,
+            Some(x.metal_buffer()),
+            x.offset(),
+        );
         enc.set_buffer(qmm_steel_splitk::WEIGHTS as u32, Some(&qw.weights_buf), 0);
         enc.set_buffer(qmm_steel_splitk::SCALES as u32, Some(&qw.scales_buf), 0);
         enc.set_buffer(qmm_steel_splitk::BIASES as u32, Some(&qw.biases_buf), 0);
         enc.set_buffer(qmm_steel_splitk::PARTIAL as u32, Some(&dummy_buf), 0);
         enc.set_buffer(qmm_steel_splitk::OUT as u32, Some(out.metal_buffer()), 0);
-        enc.set_bytes(qmm_steel_splitk::PARAMS as u32, params.as_ptr() as *const std::ffi::c_void, 12);
-        enc.set_bytes(qmm_steel_splitk::SPLIT_PARAMS as u32, split_params.as_ptr() as *const std::ffi::c_void, 8);
-        let grid = MTLSize { width: n_tiles, height: m_tiles, depth: 1 };
-        let tg = MTLSize { width: 64, height: 1, depth: 1 };
+        enc.set_bytes(
+            qmm_steel_splitk::PARAMS as u32,
+            params.as_ptr() as *const std::ffi::c_void,
+            12,
+        );
+        enc.set_bytes(
+            qmm_steel_splitk::SPLIT_PARAMS as u32,
+            split_params.as_ptr() as *const std::ffi::c_void,
+            8,
+        );
+        let grid = MTLSize {
+            width: n_tiles,
+            height: m_tiles,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 64,
+            height: 1,
+            depth: 1,
+        };
         enc.dispatch_threadgroups(grid, tg);
         enc.end();
         super::commit_with_mode(&cb, super::ExecMode::Sync);
@@ -6447,16 +6662,36 @@ pub fn affine_qmm_steel_splitk_q4(
         let raw_enc = cb.computeCommandEncoder().unwrap();
         let enc = ComputePass::new(&raw_enc);
         enc.set_pipeline(&pipeline);
-        enc.set_buffer(qmm_steel_splitk::X as u32, Some(x.metal_buffer()), x.offset());
+        enc.set_buffer(
+            qmm_steel_splitk::X as u32,
+            Some(x.metal_buffer()),
+            x.offset(),
+        );
         enc.set_buffer(qmm_steel_splitk::WEIGHTS as u32, Some(&qw.weights_buf), 0);
         enc.set_buffer(qmm_steel_splitk::SCALES as u32, Some(&qw.scales_buf), 0);
         enc.set_buffer(qmm_steel_splitk::BIASES as u32, Some(&qw.biases_buf), 0);
         enc.set_buffer(qmm_steel_splitk::PARTIAL as u32, Some(&c_split_buf), 0);
         enc.set_buffer(qmm_steel_splitk::OUT as u32, Some(out.metal_buffer()), 0);
-        enc.set_bytes(qmm_steel_splitk::PARAMS as u32, params.as_ptr() as *const std::ffi::c_void, 12);
-        enc.set_bytes(qmm_steel_splitk::SPLIT_PARAMS as u32, split_params.as_ptr() as *const std::ffi::c_void, 8);
-        let grid = MTLSize { width: n_tiles, height: m_tiles, depth: k_partitions };
-        let tg = MTLSize { width: 64, height: 1, depth: 1 };
+        enc.set_bytes(
+            qmm_steel_splitk::PARAMS as u32,
+            params.as_ptr() as *const std::ffi::c_void,
+            12,
+        );
+        enc.set_bytes(
+            qmm_steel_splitk::SPLIT_PARAMS as u32,
+            split_params.as_ptr() as *const std::ffi::c_void,
+            8,
+        );
+        let grid = MTLSize {
+            width: n_tiles,
+            height: m_tiles,
+            depth: k_partitions,
+        };
+        let tg = MTLSize {
+            width: 64,
+            height: 1,
+            depth: 1,
+        };
         enc.dispatch_threadgroups(grid, tg);
         enc.end();
 
@@ -6476,9 +6711,21 @@ pub fn affine_qmm_steel_splitk_q4(
         enc2.set_pipeline(&reduce_pipeline);
         enc2.set_buffer(qmm_splitk_reduce::PARTIAL as u32, Some(&c_split_buf), 0);
         enc2.set_buffer(qmm_splitk_reduce::OUT as u32, Some(out.metal_buffer()), 0);
-        enc2.set_bytes(qmm_splitk_reduce::PARAMS as u32, reduce_params.as_ptr() as *const std::ffi::c_void, 12);
-        let reduce_grid = MTLSize { width: n, height: m, depth: 1 };
-        let reduce_tg = MTLSize { width: n.min(256), height: 1, depth: 1 };
+        enc2.set_bytes(
+            qmm_splitk_reduce::PARAMS as u32,
+            reduce_params.as_ptr() as *const std::ffi::c_void,
+            12,
+        );
+        let reduce_grid = MTLSize {
+            width: n,
+            height: m,
+            depth: 1,
+        };
+        let reduce_tg = MTLSize {
+            width: n.min(256),
+            height: 1,
+            depth: 1,
+        };
         enc2.dispatch_threads(reduce_grid, reduce_tg);
         enc2.end();
 
@@ -6557,16 +6804,36 @@ pub fn affine_qmm_steel_splitk_q4_into_cb(
 
         let enc = ComputePass::new(&raw_enc);
         enc.set_pipeline(&pipeline);
-        enc.set_buffer(qmm_steel_splitk::X as u32, Some(x.metal_buffer()), x.offset());
+        enc.set_buffer(
+            qmm_steel_splitk::X as u32,
+            Some(x.metal_buffer()),
+            x.offset(),
+        );
         enc.set_buffer(qmm_steel_splitk::WEIGHTS as u32, Some(&qw.weights_buf), 0);
         enc.set_buffer(qmm_steel_splitk::SCALES as u32, Some(&qw.scales_buf), 0);
         enc.set_buffer(qmm_steel_splitk::BIASES as u32, Some(&qw.biases_buf), 0);
         enc.set_buffer(qmm_steel_splitk::PARTIAL as u32, Some(&dummy_buf), 0);
         enc.set_buffer(qmm_steel_splitk::OUT as u32, Some(out.metal_buffer()), 0);
-        enc.set_bytes(qmm_steel_splitk::PARAMS as u32, params.as_ptr() as *const std::ffi::c_void, 12);
-        enc.set_bytes(qmm_steel_splitk::SPLIT_PARAMS as u32, split_params.as_ptr() as *const std::ffi::c_void, 8);
-        let grid = MTLSize { width: n_tiles, height: m_tiles, depth: 1 };
-        let tg = MTLSize { width: 64, height: 1, depth: 1 };
+        enc.set_bytes(
+            qmm_steel_splitk::PARAMS as u32,
+            params.as_ptr() as *const std::ffi::c_void,
+            12,
+        );
+        enc.set_bytes(
+            qmm_steel_splitk::SPLIT_PARAMS as u32,
+            split_params.as_ptr() as *const std::ffi::c_void,
+            8,
+        );
+        let grid = MTLSize {
+            width: n_tiles,
+            height: m_tiles,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 64,
+            height: 1,
+            depth: 1,
+        };
         enc.dispatch_threadgroups(grid, tg);
         enc.end();
 
@@ -6580,16 +6847,36 @@ pub fn affine_qmm_steel_splitk_q4_into_cb(
 
         let enc = ComputePass::new(&raw_enc);
         enc.set_pipeline(&pipeline);
-        enc.set_buffer(qmm_steel_splitk::X as u32, Some(x.metal_buffer()), x.offset());
+        enc.set_buffer(
+            qmm_steel_splitk::X as u32,
+            Some(x.metal_buffer()),
+            x.offset(),
+        );
         enc.set_buffer(qmm_steel_splitk::WEIGHTS as u32, Some(&qw.weights_buf), 0);
         enc.set_buffer(qmm_steel_splitk::SCALES as u32, Some(&qw.scales_buf), 0);
         enc.set_buffer(qmm_steel_splitk::BIASES as u32, Some(&qw.biases_buf), 0);
         enc.set_buffer(qmm_steel_splitk::PARTIAL as u32, Some(&c_split_buf), 0);
         enc.set_buffer(qmm_steel_splitk::OUT as u32, Some(out.metal_buffer()), 0);
-        enc.set_bytes(qmm_steel_splitk::PARAMS as u32, params.as_ptr() as *const std::ffi::c_void, 12);
-        enc.set_bytes(qmm_steel_splitk::SPLIT_PARAMS as u32, split_params.as_ptr() as *const std::ffi::c_void, 8);
-        let grid = MTLSize { width: n_tiles, height: m_tiles, depth: k_partitions };
-        let tg = MTLSize { width: 64, height: 1, depth: 1 };
+        enc.set_bytes(
+            qmm_steel_splitk::PARAMS as u32,
+            params.as_ptr() as *const std::ffi::c_void,
+            12,
+        );
+        enc.set_bytes(
+            qmm_steel_splitk::SPLIT_PARAMS as u32,
+            split_params.as_ptr() as *const std::ffi::c_void,
+            8,
+        );
+        let grid = MTLSize {
+            width: n_tiles,
+            height: m_tiles,
+            depth: k_partitions,
+        };
+        let tg = MTLSize {
+            width: 64,
+            height: 1,
+            depth: 1,
+        };
         enc.dispatch_threadgroups(grid, tg);
         enc.end();
 
@@ -6608,9 +6895,21 @@ pub fn affine_qmm_steel_splitk_q4_into_cb(
         enc2.set_pipeline(&reduce_pipeline);
         enc2.set_buffer(qmm_splitk_reduce::PARTIAL as u32, Some(&c_split_buf), 0);
         enc2.set_buffer(qmm_splitk_reduce::OUT as u32, Some(out.metal_buffer()), 0);
-        enc2.set_bytes(qmm_splitk_reduce::PARAMS as u32, reduce_params.as_ptr() as *const std::ffi::c_void, 12);
-        let reduce_grid = MTLSize { width: n, height: m, depth: 1 };
-        let reduce_tg = MTLSize { width: n.min(256), height: 1, depth: 1 };
+        enc2.set_bytes(
+            qmm_splitk_reduce::PARAMS as u32,
+            reduce_params.as_ptr() as *const std::ffi::c_void,
+            12,
+        );
+        let reduce_grid = MTLSize {
+            width: n,
+            height: m,
+            depth: 1,
+        };
+        let reduce_tg = MTLSize {
+            width: n.min(256),
+            height: 1,
+            depth: 1,
+        };
         enc2.dispatch_threads(reduce_grid, reduce_tg);
         enc2.end();
 
@@ -6690,16 +6989,36 @@ pub fn affine_qmm_steel4sg_splitk_q4_into_cb(
 
         let enc = ComputePass::new(&raw_enc);
         enc.set_pipeline(&pipeline);
-        enc.set_buffer(qmm_steel_splitk::X as u32, Some(x.metal_buffer()), x.offset());
+        enc.set_buffer(
+            qmm_steel_splitk::X as u32,
+            Some(x.metal_buffer()),
+            x.offset(),
+        );
         enc.set_buffer(qmm_steel_splitk::WEIGHTS as u32, Some(&qw.weights_buf), 0);
         enc.set_buffer(qmm_steel_splitk::SCALES as u32, Some(&qw.scales_buf), 0);
         enc.set_buffer(qmm_steel_splitk::BIASES as u32, Some(&qw.biases_buf), 0);
         enc.set_buffer(qmm_steel_splitk::PARTIAL as u32, Some(&dummy_buf), 0);
         enc.set_buffer(qmm_steel_splitk::OUT as u32, Some(out.metal_buffer()), 0);
-        enc.set_bytes(qmm_steel_splitk::PARAMS as u32, params.as_ptr() as *const std::ffi::c_void, 12);
-        enc.set_bytes(qmm_steel_splitk::SPLIT_PARAMS as u32, split_params.as_ptr() as *const std::ffi::c_void, 8);
-        let grid = MTLSize { width: n_tiles, height: m_tiles, depth: 1 };
-        let tg = MTLSize { width: 128, height: 1, depth: 1 };
+        enc.set_bytes(
+            qmm_steel_splitk::PARAMS as u32,
+            params.as_ptr() as *const std::ffi::c_void,
+            12,
+        );
+        enc.set_bytes(
+            qmm_steel_splitk::SPLIT_PARAMS as u32,
+            split_params.as_ptr() as *const std::ffi::c_void,
+            8,
+        );
+        let grid = MTLSize {
+            width: n_tiles,
+            height: m_tiles,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 128,
+            height: 1,
+            depth: 1,
+        };
         enc.dispatch_threadgroups(grid, tg);
         enc.end();
 
@@ -6713,16 +7032,36 @@ pub fn affine_qmm_steel4sg_splitk_q4_into_cb(
 
         let enc = ComputePass::new(&raw_enc);
         enc.set_pipeline(&pipeline);
-        enc.set_buffer(qmm_steel_splitk::X as u32, Some(x.metal_buffer()), x.offset());
+        enc.set_buffer(
+            qmm_steel_splitk::X as u32,
+            Some(x.metal_buffer()),
+            x.offset(),
+        );
         enc.set_buffer(qmm_steel_splitk::WEIGHTS as u32, Some(&qw.weights_buf), 0);
         enc.set_buffer(qmm_steel_splitk::SCALES as u32, Some(&qw.scales_buf), 0);
         enc.set_buffer(qmm_steel_splitk::BIASES as u32, Some(&qw.biases_buf), 0);
         enc.set_buffer(qmm_steel_splitk::PARTIAL as u32, Some(&c_split_buf), 0);
         enc.set_buffer(qmm_steel_splitk::OUT as u32, Some(out.metal_buffer()), 0);
-        enc.set_bytes(qmm_steel_splitk::PARAMS as u32, params.as_ptr() as *const std::ffi::c_void, 12);
-        enc.set_bytes(qmm_steel_splitk::SPLIT_PARAMS as u32, split_params.as_ptr() as *const std::ffi::c_void, 8);
-        let grid = MTLSize { width: n_tiles, height: m_tiles, depth: k_partitions };
-        let tg = MTLSize { width: 128, height: 1, depth: 1 };
+        enc.set_bytes(
+            qmm_steel_splitk::PARAMS as u32,
+            params.as_ptr() as *const std::ffi::c_void,
+            12,
+        );
+        enc.set_bytes(
+            qmm_steel_splitk::SPLIT_PARAMS as u32,
+            split_params.as_ptr() as *const std::ffi::c_void,
+            8,
+        );
+        let grid = MTLSize {
+            width: n_tiles,
+            height: m_tiles,
+            depth: k_partitions,
+        };
+        let tg = MTLSize {
+            width: 128,
+            height: 1,
+            depth: 1,
+        };
         enc.dispatch_threadgroups(grid, tg);
         enc.end();
 
@@ -6741,9 +7080,21 @@ pub fn affine_qmm_steel4sg_splitk_q4_into_cb(
         enc2.set_pipeline(&reduce_pipeline);
         enc2.set_buffer(qmm_splitk_reduce::PARTIAL as u32, Some(&c_split_buf), 0);
         enc2.set_buffer(qmm_splitk_reduce::OUT as u32, Some(out.metal_buffer()), 0);
-        enc2.set_bytes(qmm_splitk_reduce::PARAMS as u32, reduce_params.as_ptr() as *const std::ffi::c_void, 12);
-        let reduce_grid = MTLSize { width: n, height: m, depth: 1 };
-        let reduce_tg = MTLSize { width: n.min(256), height: 1, depth: 1 };
+        enc2.set_bytes(
+            qmm_splitk_reduce::PARAMS as u32,
+            reduce_params.as_ptr() as *const std::ffi::c_void,
+            12,
+        );
+        let reduce_grid = MTLSize {
+            width: n,
+            height: m,
+            depth: 1,
+        };
+        let reduce_tg = MTLSize {
+            width: n.min(256),
+            height: 1,
+            depth: 1,
+        };
         enc2.dispatch_threads(reduce_grid, reduce_tg);
         enc2.end();
 
@@ -6967,12 +7318,36 @@ pub fn affine_quantized_matmul_batched(
                 enc.set_buffer(qmm_mma::SCALES as u32, Some(&qw.scales_buf), 0);
                 enc.set_buffer(qmm_mma::BIASES as u32, Some(&qw.biases_buf), 0);
                 enc.set_buffer(qmm_mma::OUT as u32, Some(out.metal_buffer()), 0);
-                enc.set_bytes(qmm_mma::M as u32, &m_u32 as *const u32 as *const std::ffi::c_void, 4);
-                enc.set_bytes(qmm_mma::N as u32, &n_u32 as *const u32 as *const std::ffi::c_void, 4);
-                enc.set_bytes(qmm_mma::K as u32, &k_u32 as *const u32 as *const std::ffi::c_void, 4);
-                enc.set_bytes(qmm_mma::SWIZZLE_LOG as u32, &kp_u32 as *const u32 as *const std::ffi::c_void, 4);
-                let grid = MTLSize { width: tn_tiles, height: tm_tiles, depth: 1 };
-                let tg = MTLSize { width: 64, height: 1, depth: 1 };
+                enc.set_bytes(
+                    qmm_mma::M as u32,
+                    &m_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
+                );
+                enc.set_bytes(
+                    qmm_mma::N as u32,
+                    &n_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
+                );
+                enc.set_bytes(
+                    qmm_mma::K as u32,
+                    &k_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
+                );
+                enc.set_bytes(
+                    qmm_mma::SWIZZLE_LOG as u32,
+                    &kp_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
+                );
+                let grid = MTLSize {
+                    width: tn_tiles,
+                    height: tm_tiles,
+                    depth: 1,
+                };
+                let tg = MTLSize {
+                    width: 64,
+                    height: 1,
+                    depth: 1,
+                };
                 enc.dispatch_threadgroups(grid, tg);
                 enc.end();
                 super::commit_with_mode(&cb, super::ExecMode::Sync);
@@ -6981,8 +7356,7 @@ pub fn affine_quantized_matmul_batched(
             } else {
                 // Split-K: partial sums → reduce
                 let partition_stride = m * n;
-                let c_split_size =
-                    k_partitions * partition_stride * std::mem::size_of::<f32>();
+                let c_split_size = k_partitions * partition_stride * std::mem::size_of::<f32>();
                 let c_split_buf = dev.newBufferWithLength_options(c_split_size, opts).unwrap();
                 let out = Array::uninit(dev, &[m, n], DType::Float32);
 
@@ -6997,13 +7371,36 @@ pub fn affine_quantized_matmul_batched(
                 enc.set_buffer(qmm_mma::SCALES as u32, Some(&qw.scales_buf), 0);
                 enc.set_buffer(qmm_mma::BIASES as u32, Some(&qw.biases_buf), 0);
                 enc.set_buffer(qmm_mma::OUT as u32, Some(&c_split_buf), 0);
-                enc.set_bytes(qmm_mma::M as u32, &m_u32 as *const u32 as *const std::ffi::c_void, 4);
-                enc.set_bytes(qmm_mma::N as u32, &n_u32 as *const u32 as *const std::ffi::c_void, 4);
-                enc.set_bytes(qmm_mma::K as u32, &k_u32 as *const u32 as *const std::ffi::c_void, 4);
-                enc.set_bytes(qmm_mma::SWIZZLE_LOG as u32, &kp_u32 as *const u32 as *const std::ffi::c_void, 4);
-                let grid =
-                    MTLSize { width: tn_tiles, height: tm_tiles, depth: k_partitions };
-                let tg = MTLSize { width: 64, height: 1, depth: 1 };
+                enc.set_bytes(
+                    qmm_mma::M as u32,
+                    &m_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
+                );
+                enc.set_bytes(
+                    qmm_mma::N as u32,
+                    &n_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
+                );
+                enc.set_bytes(
+                    qmm_mma::K as u32,
+                    &k_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
+                );
+                enc.set_bytes(
+                    qmm_mma::SWIZZLE_LOG as u32,
+                    &kp_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
+                );
+                let grid = MTLSize {
+                    width: tn_tiles,
+                    height: tm_tiles,
+                    depth: k_partitions,
+                };
+                let tg = MTLSize {
+                    width: 64,
+                    height: 1,
+                    depth: 1,
+                };
                 enc.dispatch_threadgroups(grid, tg);
                 enc.end();
 
@@ -7018,11 +7415,31 @@ pub fn affine_quantized_matmul_batched(
                 enc2.set_pipeline(&reduce_pipeline);
                 enc2.set_buffer(qmm_tiny_reduce::PARTIAL as u32, Some(&c_split_buf), 0);
                 enc2.set_buffer(qmm_tiny_reduce::OUT as u32, Some(out.metal_buffer()), 0);
-                enc2.set_bytes(qmm_tiny_reduce::N as u32, &n_u32 as *const u32 as *const std::ffi::c_void, 4);
-                enc2.set_bytes(qmm_tiny_reduce::K_PARTITIONS as u32, &kp_u32 as *const u32 as *const std::ffi::c_void, 4);
-                enc2.set_bytes(qmm_tiny_reduce::MN_TOTAL as u32, &mn_total_u32 as *const u32 as *const std::ffi::c_void, 4);
-                let reduce_grid = MTLSize { width: partition_stride, height: 1, depth: 1 };
-                let reduce_tg = MTLSize { width: partition_stride.min(256), height: 1, depth: 1 };
+                enc2.set_bytes(
+                    qmm_tiny_reduce::N as u32,
+                    &n_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
+                );
+                enc2.set_bytes(
+                    qmm_tiny_reduce::K_PARTITIONS as u32,
+                    &kp_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
+                );
+                enc2.set_bytes(
+                    qmm_tiny_reduce::MN_TOTAL as u32,
+                    &mn_total_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
+                );
+                let reduce_grid = MTLSize {
+                    width: partition_stride,
+                    height: 1,
+                    depth: 1,
+                };
+                let reduce_tg = MTLSize {
+                    width: partition_stride.min(256),
+                    height: 1,
+                    depth: 1,
+                };
                 enc2.dispatch_threads(reduce_grid, reduce_tg);
                 enc2.end();
 
@@ -7089,14 +7506,38 @@ pub fn affine_quantized_matmul_batched(
                     enc.set_buffer(qmm_skinny::SCALES as u32, Some(&qw.scales_buf), 0);
                     enc.set_buffer(qmm_skinny::BIASES as u32, Some(&qw.biases_buf), 0);
                     enc.set_buffer(qmm_skinny::OUT as u32, Some(out.metal_buffer()), 0);
-                    enc.set_bytes(qmm_skinny::M as u32, &m_u32 as *const u32 as *const std::ffi::c_void, 4);
-                    enc.set_bytes(qmm_skinny::N as u32, &n_u32 as *const u32 as *const std::ffi::c_void, 4);
-                    enc.set_bytes(qmm_skinny::K as u32, &k_u32 as *const u32 as *const std::ffi::c_void, 4);
-                    enc.set_bytes(qmm_skinny::K_PARTITIONS as u32, &kp_u32 as *const u32 as *const std::ffi::c_void, 4);
+                    enc.set_bytes(
+                        qmm_skinny::M as u32,
+                        &m_u32 as *const u32 as *const std::ffi::c_void,
+                        4,
+                    );
+                    enc.set_bytes(
+                        qmm_skinny::N as u32,
+                        &n_u32 as *const u32 as *const std::ffi::c_void,
+                        4,
+                    );
+                    enc.set_bytes(
+                        qmm_skinny::K as u32,
+                        &k_u32 as *const u32 as *const std::ffi::c_void,
+                        4,
+                    );
+                    enc.set_bytes(
+                        qmm_skinny::K_PARTITIONS as u32,
+                        &kp_u32 as *const u32 as *const std::ffi::c_void,
+                        4,
+                    );
                     // f16 kernel has buffer(9) for c_split (unused when k_partitions==1)
                     enc.set_buffer(qmm_skinny::PARTIAL as u32, Some(&dummy_buf), 0);
-                    let grid = MTLSize { width: sn_tiles, height: sm_tiles, depth: 1 };
-                    let tg = MTLSize { width: 64, height: 1, depth: 1 };
+                    let grid = MTLSize {
+                        width: sn_tiles,
+                        height: sm_tiles,
+                        depth: 1,
+                    };
+                    let tg = MTLSize {
+                        width: 64,
+                        height: 1,
+                        depth: 1,
+                    };
                     enc.dispatch_threadgroups(grid, tg);
                     enc.end();
                     super::commit_with_mode(&cb, super::ExecMode::Sync);
@@ -7105,8 +7546,7 @@ pub fn affine_quantized_matmul_batched(
                 } else {
                     // Split-K: partial sums (always float) → f16 reduce → f16 output
                     let partition_stride = m * n;
-                    let c_split_size =
-                        k_partitions * partition_stride * std::mem::size_of::<f32>();
+                    let c_split_size = k_partitions * partition_stride * std::mem::size_of::<f32>();
                     let c_split_buf = dev.newBufferWithLength_options(c_split_size, opts).unwrap();
                     let out = Array::uninit(dev, &[m, n], DType::Float16);
 
@@ -7122,14 +7562,37 @@ pub fn affine_quantized_matmul_batched(
                     enc.set_buffer(qmm_skinny::BIASES as u32, Some(&qw.biases_buf), 0);
                     // buffer(4) = output (unused for split-K, but must be bound)
                     enc.set_buffer(qmm_skinny::OUT as u32, Some(out.metal_buffer()), 0);
-                    enc.set_bytes(qmm_skinny::M as u32, &m_u32 as *const u32 as *const std::ffi::c_void, 4);
-                    enc.set_bytes(qmm_skinny::N as u32, &n_u32 as *const u32 as *const std::ffi::c_void, 4);
-                    enc.set_bytes(qmm_skinny::K as u32, &k_u32 as *const u32 as *const std::ffi::c_void, 4);
-                    enc.set_bytes(qmm_skinny::K_PARTITIONS as u32, &kp_u32 as *const u32 as *const std::ffi::c_void, 4);
+                    enc.set_bytes(
+                        qmm_skinny::M as u32,
+                        &m_u32 as *const u32 as *const std::ffi::c_void,
+                        4,
+                    );
+                    enc.set_bytes(
+                        qmm_skinny::N as u32,
+                        &n_u32 as *const u32 as *const std::ffi::c_void,
+                        4,
+                    );
+                    enc.set_bytes(
+                        qmm_skinny::K as u32,
+                        &k_u32 as *const u32 as *const std::ffi::c_void,
+                        4,
+                    );
+                    enc.set_bytes(
+                        qmm_skinny::K_PARTITIONS as u32,
+                        &kp_u32 as *const u32 as *const std::ffi::c_void,
+                        4,
+                    );
                     enc.set_buffer(qmm_skinny::PARTIAL as u32, Some(&c_split_buf), 0);
-                    let grid =
-                        MTLSize { width: sn_tiles, height: sm_tiles, depth: k_partitions };
-                    let tg = MTLSize { width: 64, height: 1, depth: 1 };
+                    let grid = MTLSize {
+                        width: sn_tiles,
+                        height: sm_tiles,
+                        depth: k_partitions,
+                    };
+                    let tg = MTLSize {
+                        width: 64,
+                        height: 1,
+                        depth: 1,
+                    };
                     enc.dispatch_threadgroups(grid, tg);
                     enc.end();
 
@@ -7147,11 +7610,31 @@ pub fn affine_quantized_matmul_batched(
                     enc2.set_pipeline(&reduce_pipeline);
                     enc2.set_buffer(qmm_tiny_reduce::PARTIAL as u32, Some(&c_split_buf), 0);
                     enc2.set_buffer(qmm_tiny_reduce::OUT as u32, Some(out.metal_buffer()), 0);
-                    enc2.set_bytes(qmm_tiny_reduce::N as u32, &n_u32 as *const u32 as *const std::ffi::c_void, 4);
-                    enc2.set_bytes(qmm_tiny_reduce::K_PARTITIONS as u32, &kp_u32 as *const u32 as *const std::ffi::c_void, 4);
-                    enc2.set_bytes(qmm_tiny_reduce::MN_TOTAL as u32, &mn_total_u32 as *const u32 as *const std::ffi::c_void, 4);
-                    let reduce_grid = MTLSize { width: partition_stride, height: 1, depth: 1 };
-                    let reduce_tg = MTLSize { width: partition_stride.min(256), height: 1, depth: 1 };
+                    enc2.set_bytes(
+                        qmm_tiny_reduce::N as u32,
+                        &n_u32 as *const u32 as *const std::ffi::c_void,
+                        4,
+                    );
+                    enc2.set_bytes(
+                        qmm_tiny_reduce::K_PARTITIONS as u32,
+                        &kp_u32 as *const u32 as *const std::ffi::c_void,
+                        4,
+                    );
+                    enc2.set_bytes(
+                        qmm_tiny_reduce::MN_TOTAL as u32,
+                        &mn_total_u32 as *const u32 as *const std::ffi::c_void,
+                        4,
+                    );
+                    let reduce_grid = MTLSize {
+                        width: partition_stride,
+                        height: 1,
+                        depth: 1,
+                    };
+                    let reduce_tg = MTLSize {
+                        width: partition_stride.min(256),
+                        height: 1,
+                        depth: 1,
+                    };
                     enc2.dispatch_threads(reduce_grid, reduce_tg);
                     enc2.end();
 
@@ -7194,12 +7677,36 @@ pub fn affine_quantized_matmul_batched(
             enc.set_buffer(qmm_mma::SCALES as u32, Some(&qw.scales_buf), 0);
             enc.set_buffer(qmm_mma::BIASES as u32, Some(&qw.biases_buf), 0);
             enc.set_buffer(qmm_mma::OUT as u32, Some(out.metal_buffer()), 0);
-            enc.set_bytes(qmm_mma::M as u32, &m_u32 as *const u32 as *const std::ffi::c_void, 4);
-            enc.set_bytes(qmm_mma::N as u32, &n_u32 as *const u32 as *const std::ffi::c_void, 4);
-            enc.set_bytes(qmm_mma::K as u32, &k_u32 as *const u32 as *const std::ffi::c_void, 4);
-            enc.set_bytes(qmm_mma::SWIZZLE_LOG as u32, &swizzle_log as *const u32 as *const std::ffi::c_void, 4);
-            let grid = MTLSize { width: n_tiles, height: m_tiles, depth: 1 };
-            let tg = MTLSize { width: 64, height: 1, depth: 1 };
+            enc.set_bytes(
+                qmm_mma::M as u32,
+                &m_u32 as *const u32 as *const std::ffi::c_void,
+                4,
+            );
+            enc.set_bytes(
+                qmm_mma::N as u32,
+                &n_u32 as *const u32 as *const std::ffi::c_void,
+                4,
+            );
+            enc.set_bytes(
+                qmm_mma::K as u32,
+                &k_u32 as *const u32 as *const std::ffi::c_void,
+                4,
+            );
+            enc.set_bytes(
+                qmm_mma::SWIZZLE_LOG as u32,
+                &swizzle_log as *const u32 as *const std::ffi::c_void,
+                4,
+            );
+            let grid = MTLSize {
+                width: n_tiles,
+                height: m_tiles,
+                depth: 1,
+            };
+            let tg = MTLSize {
+                width: 64,
+                height: 1,
+                depth: 1,
+            };
 
             enc.dispatch_threadgroups(grid, tg);
             enc.end();
@@ -7243,11 +7750,23 @@ pub fn affine_quantized_matmul_batched(
         enc.set_buffer(qmm_legacy::SCALES as u32, Some(&qw.scales_buf), 0);
         enc.set_buffer(qmm_legacy::BIASES as u32, Some(&qw.biases_buf), 0);
         enc.set_buffer(qmm_legacy::OUT as u32, Some(out.metal_buffer()), 0);
-        enc.set_bytes(qmm_legacy::PARAMS as u32, params.as_ptr() as *const std::ffi::c_void, 16);
+        enc.set_bytes(
+            qmm_legacy::PARAMS as u32,
+            params.as_ptr() as *const std::ffi::c_void,
+            16,
+        );
         let q8_m_tiles = m.div_ceil(q8_bm);
         let q8_n_tiles = n.div_ceil(q8_bn);
-        let grid = MTLSize { width: q8_n_tiles, height: q8_m_tiles, depth: 1 };
-        let tg = MTLSize { width: 64, height: 1, depth: 1 };
+        let grid = MTLSize {
+            width: q8_n_tiles,
+            height: q8_m_tiles,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 64,
+            height: 1,
+            depth: 1,
+        };
 
         enc.dispatch_threadgroups(grid, tg);
         enc.end();
@@ -7374,14 +7893,30 @@ pub fn affine_quantized_matmul_batched_into_cb(
             enc.set_buffer(qmv::WEIGHTS as u32, Some(&qw.weights_buf), 0);
             enc.set_buffer(qmv::SCALES as u32, Some(&qw.scales_buf), 0);
             enc.set_buffer(qmv::BIASES as u32, Some(&qw.biases_buf), 0);
-            enc.set_buffer(qmv::INPUT as u32, Some(vec_1d.metal_buffer()), vec_1d.offset());
+            enc.set_buffer(
+                qmv::INPUT as u32,
+                Some(vec_1d.metal_buffer()),
+                vec_1d.offset(),
+            );
             enc.set_buffer(qmv::OUTPUT as u32, Some(out.metal_buffer()), 0);
-            enc.set_bytes(qmv::PARAMS as u32, params.as_ptr() as *const std::ffi::c_void, 16);
+            enc.set_bytes(
+                qmv::PARAMS as u32,
+                params.as_ptr() as *const std::ffi::c_void,
+                16,
+            );
             let rows_per_tg: usize = 8;
             let num_tgs_y = qw.out_features.div_ceil(rows_per_tg);
             enc.dispatch_threadgroups(
-                MTLSize { width: 1, height: num_tgs_y, depth: 1 },
-                MTLSize { width: 64, height: 1, depth: 1 },
+                MTLSize {
+                    width: 1,
+                    height: num_tgs_y,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 64,
+                    height: 1,
+                    depth: 1,
+                },
             );
             enc.end();
 
@@ -7407,12 +7942,24 @@ pub fn affine_quantized_matmul_batched_into_cb(
             enc.set_buffer(qmv::BIASES as u32, Some(&qw.biases_buf), 0);
             enc.set_buffer(qmv::INPUT as u32, Some(x.metal_buffer()), x.offset());
             enc.set_buffer(qmv::OUTPUT as u32, Some(out.metal_buffer()), 0);
-            enc.set_bytes(qmv::PARAMS as u32, params.as_ptr() as *const std::ffi::c_void, 16);
+            enc.set_bytes(
+                qmv::PARAMS as u32,
+                params.as_ptr() as *const std::ffi::c_void,
+                16,
+            );
             let rows_per_tg: usize = 8;
             let num_tgs_y = n.div_ceil(rows_per_tg);
             enc.dispatch_threadgroups(
-                MTLSize { width: m, height: num_tgs_y, depth: 1 },
-                MTLSize { width: 64, height: 1, depth: 1 },
+                MTLSize {
+                    width: m,
+                    height: num_tgs_y,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 64,
+                    height: 1,
+                    depth: 1,
+                },
             );
             enc.end();
 
@@ -7479,13 +8026,37 @@ pub fn affine_quantized_matmul_batched_into_cb(
                 enc.set_buffer(qmm_mma::SCALES as u32, Some(&qw.scales_buf), 0);
                 enc.set_buffer(qmm_mma::BIASES as u32, Some(&qw.biases_buf), 0);
                 enc.set_buffer(qmm_mma::OUT as u32, Some(out.metal_buffer()), 0);
-                enc.set_bytes(qmm_mma::M as u32, &m_u32 as *const u32 as *const std::ffi::c_void, 4);
-                enc.set_bytes(qmm_mma::N as u32, &n_u32 as *const u32 as *const std::ffi::c_void, 4);
-                enc.set_bytes(qmm_mma::K as u32, &k_u32 as *const u32 as *const std::ffi::c_void, 4);
-                enc.set_bytes(qmm_mma::SWIZZLE_LOG as u32, &kp_u32 as *const u32 as *const std::ffi::c_void, 4);
+                enc.set_bytes(
+                    qmm_mma::M as u32,
+                    &m_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
+                );
+                enc.set_bytes(
+                    qmm_mma::N as u32,
+                    &n_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
+                );
+                enc.set_bytes(
+                    qmm_mma::K as u32,
+                    &k_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
+                );
+                enc.set_bytes(
+                    qmm_mma::SWIZZLE_LOG as u32,
+                    &kp_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
+                );
                 enc.set_buffer(qmm_skinny::PARTIAL as u32, Some(&dummy_buf), 0);
-                let grid = MTLSize { width: sn_tiles, height: sm_tiles, depth: 1 };
-                let tg = MTLSize { width: 64, height: 1, depth: 1 };
+                let grid = MTLSize {
+                    width: sn_tiles,
+                    height: sm_tiles,
+                    depth: 1,
+                };
+                let tg = MTLSize {
+                    width: 64,
+                    height: 1,
+                    depth: 1,
+                };
                 enc.dispatch_threadgroups(grid, tg);
                 enc.end();
 
@@ -7493,9 +8064,10 @@ pub fn affine_quantized_matmul_batched_into_cb(
             } else {
                 // Split-K: partial sums → reduce, both in same CB
                 let partition_stride = m * n;
-                let c_split_size =
-                    k_partitions * partition_stride * std::mem::size_of::<f32>();
-                let c_split_buf = dev.newBufferWithLength_options(c_split_size, _opts).unwrap();
+                let c_split_size = k_partitions * partition_stride * std::mem::size_of::<f32>();
+                let c_split_buf = dev
+                    .newBufferWithLength_options(c_split_size, _opts)
+                    .unwrap();
                 let out = Array::uninit(dev, &[m, n], DType::Float16);
 
                 let raw_enc = cb.computeCommandEncoder().unwrap();
@@ -7507,14 +8079,37 @@ pub fn affine_quantized_matmul_batched_into_cb(
                 enc.set_buffer(qmm_mma::SCALES as u32, Some(&qw.scales_buf), 0);
                 enc.set_buffer(qmm_mma::BIASES as u32, Some(&qw.biases_buf), 0);
                 enc.set_buffer(qmm_mma::OUT as u32, Some(out.metal_buffer()), 0);
-                enc.set_bytes(qmm_mma::M as u32, &m_u32 as *const u32 as *const std::ffi::c_void, 4);
-                enc.set_bytes(qmm_mma::N as u32, &n_u32 as *const u32 as *const std::ffi::c_void, 4);
-                enc.set_bytes(qmm_mma::K as u32, &k_u32 as *const u32 as *const std::ffi::c_void, 4);
-                enc.set_bytes(qmm_mma::SWIZZLE_LOG as u32, &kp_u32 as *const u32 as *const std::ffi::c_void, 4);
+                enc.set_bytes(
+                    qmm_mma::M as u32,
+                    &m_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
+                );
+                enc.set_bytes(
+                    qmm_mma::N as u32,
+                    &n_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
+                );
+                enc.set_bytes(
+                    qmm_mma::K as u32,
+                    &k_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
+                );
+                enc.set_bytes(
+                    qmm_mma::SWIZZLE_LOG as u32,
+                    &kp_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
+                );
                 enc.set_buffer(qmm_skinny::PARTIAL as u32, Some(&c_split_buf), 0);
-                let grid =
-                    MTLSize { width: sn_tiles, height: sm_tiles, depth: k_partitions };
-                let tg = MTLSize { width: 64, height: 1, depth: 1 };
+                let grid = MTLSize {
+                    width: sn_tiles,
+                    height: sm_tiles,
+                    depth: k_partitions,
+                };
+                let tg = MTLSize {
+                    width: 64,
+                    height: 1,
+                    depth: 1,
+                };
                 enc.dispatch_threadgroups(grid, tg);
                 enc.end();
 
@@ -7532,11 +8127,31 @@ pub fn affine_quantized_matmul_batched_into_cb(
                 enc2.set_pipeline(&reduce_pipeline);
                 enc2.set_buffer(qmm_tiny_reduce::PARTIAL as u32, Some(&c_split_buf), 0);
                 enc2.set_buffer(qmm_tiny_reduce::OUT as u32, Some(out.metal_buffer()), 0);
-                enc2.set_bytes(qmm_tiny_reduce::N as u32, &n_u32 as *const u32 as *const std::ffi::c_void, 4);
-                enc2.set_bytes(qmm_tiny_reduce::K_PARTITIONS as u32, &kp_u32 as *const u32 as *const std::ffi::c_void, 4);
-                enc2.set_bytes(qmm_tiny_reduce::MN_TOTAL as u32, &mn_total_u32 as *const u32 as *const std::ffi::c_void, 4);
-                let reduce_grid = MTLSize { width: partition_stride, height: 1, depth: 1 };
-                let reduce_tg = MTLSize { width: partition_stride.min(256), height: 1, depth: 1 };
+                enc2.set_bytes(
+                    qmm_tiny_reduce::N as u32,
+                    &n_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
+                );
+                enc2.set_bytes(
+                    qmm_tiny_reduce::K_PARTITIONS as u32,
+                    &kp_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
+                );
+                enc2.set_bytes(
+                    qmm_tiny_reduce::MN_TOTAL as u32,
+                    &mn_total_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
+                );
+                let reduce_grid = MTLSize {
+                    width: partition_stride,
+                    height: 1,
+                    depth: 1,
+                };
+                let reduce_tg = MTLSize {
+                    width: partition_stride.min(256),
+                    height: 1,
+                    depth: 1,
+                };
                 enc2.dispatch_threads(reduce_grid, reduce_tg);
                 enc2.end();
 
@@ -7573,12 +8188,36 @@ pub fn affine_quantized_matmul_batched_into_cb(
     enc.set_buffer(qmm_mma::SCALES as u32, Some(&qw.scales_buf), 0);
     enc.set_buffer(qmm_mma::BIASES as u32, Some(&qw.biases_buf), 0);
     enc.set_buffer(qmm_mma::OUT as u32, Some(out.metal_buffer()), 0);
-    enc.set_bytes(qmm_mma::M as u32, &m_u32 as *const u32 as *const std::ffi::c_void, 4);
-    enc.set_bytes(qmm_mma::N as u32, &n_u32 as *const u32 as *const std::ffi::c_void, 4);
-    enc.set_bytes(qmm_mma::K as u32, &k_u32 as *const u32 as *const std::ffi::c_void, 4);
-    enc.set_bytes(qmm_mma::SWIZZLE_LOG as u32, &swizzle_log as *const u32 as *const std::ffi::c_void, 4);
-    let grid = MTLSize { width: n_tiles, height: m_tiles, depth: 1 };
-    let tg = MTLSize { width: 64, height: 1, depth: 1 };
+    enc.set_bytes(
+        qmm_mma::M as u32,
+        &m_u32 as *const u32 as *const std::ffi::c_void,
+        4,
+    );
+    enc.set_bytes(
+        qmm_mma::N as u32,
+        &n_u32 as *const u32 as *const std::ffi::c_void,
+        4,
+    );
+    enc.set_bytes(
+        qmm_mma::K as u32,
+        &k_u32 as *const u32 as *const std::ffi::c_void,
+        4,
+    );
+    enc.set_bytes(
+        qmm_mma::SWIZZLE_LOG as u32,
+        &swizzle_log as *const u32 as *const std::ffi::c_void,
+        4,
+    );
+    let grid = MTLSize {
+        width: n_tiles,
+        height: m_tiles,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: 64,
+        height: 1,
+        depth: 1,
+    };
     enc.dispatch_threadgroups(grid, tg);
     enc.end();
 
@@ -7658,17 +8297,45 @@ pub fn qmm_add_residual_into_cb(
     enc.set_buffer(qmm_mma::SCALES as u32, Some(&qw.scales_buf), 0);
     enc.set_buffer(qmm_mma::BIASES as u32, Some(&qw.biases_buf), 0);
     enc.set_buffer(qmm_mma::OUT as u32, Some(out.metal_buffer()), 0);
-    enc.set_bytes(qmm_mma::M as u32, &m_u32 as *const u32 as *const std::ffi::c_void, 4);
-    enc.set_bytes(qmm_mma::N as u32, &n_u32 as *const u32 as *const std::ffi::c_void, 4);
-    enc.set_bytes(qmm_mma::K as u32, &k_u32 as *const u32 as *const std::ffi::c_void, 4);
-    enc.set_bytes(qmm_mma::SWIZZLE_LOG as u32, &swizzle_log as *const u32 as *const std::ffi::c_void, 4);
+    enc.set_bytes(
+        qmm_mma::M as u32,
+        &m_u32 as *const u32 as *const std::ffi::c_void,
+        4,
+    );
+    enc.set_bytes(
+        qmm_mma::N as u32,
+        &n_u32 as *const u32 as *const std::ffi::c_void,
+        4,
+    );
+    enc.set_bytes(
+        qmm_mma::K as u32,
+        &k_u32 as *const u32 as *const std::ffi::c_void,
+        4,
+    );
+    enc.set_bytes(
+        qmm_mma::SWIZZLE_LOG as u32,
+        &swizzle_log as *const u32 as *const std::ffi::c_void,
+        4,
+    );
     enc.set_buffer(qmm_mma::NORM_WEIGHT as u32, Some(&dummy_buf), 0); // norm_weight (unused)
     enc.set_buffer(qmm_mma::INV_RMS as u32, Some(&dummy_buf), 0); // inv_rms (unused)
-    enc.set_buffer(qmm_mma::RESIDUAL as u32, Some(residual.metal_buffer()), residual.offset());
+    enc.set_buffer(
+        qmm_mma::RESIDUAL as u32,
+        Some(residual.metal_buffer()),
+        residual.offset(),
+    );
     enc.set_buffer(qmm_mma::GATE_RESULT as u32, Some(&dummy_buf), 0); // gate_result (unused)
 
-    let grid = MTLSize { width: n_tiles, height: m_tiles, depth: 1 };
-    let tg = MTLSize { width: 64, height: 1, depth: 1 };
+    let grid = MTLSize {
+        width: n_tiles,
+        height: m_tiles,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: 64,
+        height: 1,
+        depth: 1,
+    };
     enc.dispatch_threadgroups(grid, tg);
     enc.end();
 
@@ -7740,16 +8407,44 @@ pub fn qmm_swiglu_into_cb(
     enc.set_buffer(qmm_mma::SCALES as u32, Some(&qw.scales_buf), 0);
     enc.set_buffer(qmm_mma::BIASES as u32, Some(&qw.biases_buf), 0);
     enc.set_buffer(qmm_mma::OUT as u32, Some(out.metal_buffer()), 0);
-    enc.set_bytes(qmm_mma::M as u32, &m_u32 as *const u32 as *const std::ffi::c_void, 4);
-    enc.set_bytes(qmm_mma::N as u32, &n_u32 as *const u32 as *const std::ffi::c_void, 4);
-    enc.set_bytes(qmm_mma::K as u32, &k_u32 as *const u32 as *const std::ffi::c_void, 4);
-    enc.set_bytes(qmm_mma::SWIZZLE_LOG as u32, &swizzle_log as *const u32 as *const std::ffi::c_void, 4);
+    enc.set_bytes(
+        qmm_mma::M as u32,
+        &m_u32 as *const u32 as *const std::ffi::c_void,
+        4,
+    );
+    enc.set_bytes(
+        qmm_mma::N as u32,
+        &n_u32 as *const u32 as *const std::ffi::c_void,
+        4,
+    );
+    enc.set_bytes(
+        qmm_mma::K as u32,
+        &k_u32 as *const u32 as *const std::ffi::c_void,
+        4,
+    );
+    enc.set_bytes(
+        qmm_mma::SWIZZLE_LOG as u32,
+        &swizzle_log as *const u32 as *const std::ffi::c_void,
+        4,
+    );
     enc.set_buffer(qmm_mma::NORM_WEIGHT as u32, Some(&dummy_buf), 0); // norm_weight (unused)
     enc.set_buffer(qmm_mma::INV_RMS as u32, Some(&dummy_buf), 0); // inv_rms (unused)
     enc.set_buffer(qmm_mma::RESIDUAL as u32, Some(&dummy_buf), 0); // residual (unused)
-    enc.set_buffer(qmm_mma::GATE_RESULT as u32, Some(gate_result.metal_buffer()), gate_result.offset());
-    let grid = MTLSize { width: n_tiles, height: m_tiles, depth: 1 };
-    let tg = MTLSize { width: 64, height: 1, depth: 1 };
+    enc.set_buffer(
+        qmm_mma::GATE_RESULT as u32,
+        Some(gate_result.metal_buffer()),
+        gate_result.offset(),
+    );
+    let grid = MTLSize {
+        width: n_tiles,
+        height: m_tiles,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: 64,
+        height: 1,
+        depth: 1,
+    };
     enc.dispatch_threadgroups(grid, tg);
     enc.end();
 
@@ -7923,14 +8618,34 @@ pub fn affine_qmm_nax_q4_into_cb(
     enc.set_buffer(qmm_nax::SCALES as u32, Some(&qw.scales_buf), 0);
     enc.set_buffer(qmm_nax::BIASES as u32, Some(&qw.biases_buf), 0);
     enc.set_buffer(qmm_nax::OUT as u32, Some(out.metal_buffer()), 0);
-    enc.set_bytes(qmm_nax::M as u32, &m_u32 as *const u32 as *const std::ffi::c_void, 4);
-    enc.set_bytes(qmm_nax::N as u32, &n_u32 as *const u32 as *const std::ffi::c_void, 4);
-    enc.set_bytes(qmm_nax::K as u32, &k_u32 as *const u32 as *const std::ffi::c_void, 4);
+    enc.set_bytes(
+        qmm_nax::M as u32,
+        &m_u32 as *const u32 as *const std::ffi::c_void,
+        4,
+    );
+    enc.set_bytes(
+        qmm_nax::N as u32,
+        &n_u32 as *const u32 as *const std::ffi::c_void,
+        4,
+    );
+    enc.set_bytes(
+        qmm_nax::K as u32,
+        &k_u32 as *const u32 as *const std::ffi::c_void,
+        4,
+    );
     // TG memory is statically allocated in the shader (threadgroup half Ws[BN * BK_PAD])
     // No dynamic allocation needed.
 
-    let grid = MTLSize { width: n_tiles, height: m_tiles, depth: 1 };
-    let tg = MTLSize { width: 128, height: 1, depth: 1 };
+    let grid = MTLSize {
+        width: n_tiles,
+        height: m_tiles,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: 128,
+        height: 1,
+        depth: 1,
+    };
     enc.dispatch_threadgroups(grid, tg);
     enc.end();
 
@@ -8023,11 +8738,31 @@ pub fn affine_qmm_nax_v2_q4_into_cb(
     enc.set_buffer(qmm_nax::SCALES as u32, Some(&qw.scales_buf), 0);
     enc.set_buffer(qmm_nax::BIASES as u32, Some(&qw.biases_buf), 0);
     enc.set_buffer(qmm_nax::OUT as u32, Some(out.metal_buffer()), 0);
-    enc.set_bytes(qmm_nax::M as u32, &m_u32 as *const u32 as *const std::ffi::c_void, 4);
-    enc.set_bytes(qmm_nax::N as u32, &n_u32 as *const u32 as *const std::ffi::c_void, 4);
-    enc.set_bytes(qmm_nax::K as u32, &k_u32 as *const u32 as *const std::ffi::c_void, 4);
-    let grid = MTLSize { width: n_tiles, height: m_tiles, depth: 1 };
-    let tg = MTLSize { width: 128, height: 1, depth: 1 };
+    enc.set_bytes(
+        qmm_nax::M as u32,
+        &m_u32 as *const u32 as *const std::ffi::c_void,
+        4,
+    );
+    enc.set_bytes(
+        qmm_nax::N as u32,
+        &n_u32 as *const u32 as *const std::ffi::c_void,
+        4,
+    );
+    enc.set_bytes(
+        qmm_nax::K as u32,
+        &k_u32 as *const u32 as *const std::ffi::c_void,
+        4,
+    );
+    let grid = MTLSize {
+        width: n_tiles,
+        height: m_tiles,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: 128,
+        height: 1,
+        depth: 1,
+    };
     enc.dispatch_threadgroups(grid, tg);
     enc.end();
 
@@ -8130,20 +8865,48 @@ pub fn affine_quantized_matmul_steel(
     let raw_enc = cb.computeCommandEncoder().unwrap();
     let enc = ComputePass::new(&raw_enc);
     enc.set_pipeline(&pipeline);
-    enc.set_buffer(qmm_steel::X as u32, Some(x_half.metal_buffer()), x_half.offset());
+    enc.set_buffer(
+        qmm_steel::X as u32,
+        Some(x_half.metal_buffer()),
+        x_half.offset(),
+    );
     enc.set_buffer(qmm_steel::WEIGHTS as u32, Some(&qw.weights_buf), 0);
     enc.set_buffer(qmm_steel::SCALES as u32, Some(&qw.scales_buf), 0);
     enc.set_buffer(qmm_steel::BIASES as u32, Some(&qw.biases_buf), 0);
     enc.set_buffer(qmm_steel::OUT as u32, Some(out.metal_buffer()), 0);
-    enc.set_bytes(qmm_steel::M as u32, &m_u32 as *const u32 as *const std::ffi::c_void, 4);
-    enc.set_bytes(qmm_steel::N as u32, &n_u32 as *const u32 as *const std::ffi::c_void, 4);
-    enc.set_bytes(qmm_steel::K as u32, &k_u32 as *const u32 as *const std::ffi::c_void, 4);
-    enc.set_bytes(qmm_steel::SWIZZLE_LOG as u32, &swizzle_log as *const u32 as *const std::ffi::c_void, 4);
+    enc.set_bytes(
+        qmm_steel::M as u32,
+        &m_u32 as *const u32 as *const std::ffi::c_void,
+        4,
+    );
+    enc.set_bytes(
+        qmm_steel::N as u32,
+        &n_u32 as *const u32 as *const std::ffi::c_void,
+        4,
+    );
+    enc.set_bytes(
+        qmm_steel::K as u32,
+        &k_u32 as *const u32 as *const std::ffi::c_void,
+        4,
+    );
+    enc.set_bytes(
+        qmm_steel::SWIZZLE_LOG as u32,
+        &swizzle_log as *const u32 as *const std::ffi::c_void,
+        4,
+    );
     enc.set_buffer(qmm_steel::RESIDUAL as u32, Some(&dummy_buf), 0); // residual (unused)
     enc.set_buffer(qmm_steel::GATE_RESULT as u32, Some(&dummy_buf), 0); // gate_result (unused)
 
-    let grid = MTLSize { width: n_tiles, height: m_tiles, depth: 1 };
-    let tg = MTLSize { width: 64, height: 1, depth: 1 };
+    let grid = MTLSize {
+        width: n_tiles,
+        height: m_tiles,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: 64,
+        height: 1,
+        depth: 1,
+    };
     enc.dispatch_threadgroups(grid, tg);
     enc.end();
     super::commit_with_mode(&cb, super::ExecMode::Sync);
@@ -8239,15 +9002,39 @@ pub fn affine_qmm_steel_q4_into_cb(
     enc.set_buffer(qmm_steel::SCALES as u32, Some(&qw.scales_buf), 0);
     enc.set_buffer(qmm_steel::BIASES as u32, Some(&qw.biases_buf), 0);
     enc.set_buffer(qmm_steel::OUT as u32, Some(out.metal_buffer()), 0);
-    enc.set_bytes(qmm_steel::M as u32, &m_u32 as *const u32 as *const std::ffi::c_void, 4);
-    enc.set_bytes(qmm_steel::N as u32, &n_u32 as *const u32 as *const std::ffi::c_void, 4);
-    enc.set_bytes(qmm_steel::K as u32, &k_u32 as *const u32 as *const std::ffi::c_void, 4);
-    enc.set_bytes(qmm_steel::SWIZZLE_LOG as u32, &swizzle_log as *const u32 as *const std::ffi::c_void, 4);
+    enc.set_bytes(
+        qmm_steel::M as u32,
+        &m_u32 as *const u32 as *const std::ffi::c_void,
+        4,
+    );
+    enc.set_bytes(
+        qmm_steel::N as u32,
+        &n_u32 as *const u32 as *const std::ffi::c_void,
+        4,
+    );
+    enc.set_bytes(
+        qmm_steel::K as u32,
+        &k_u32 as *const u32 as *const std::ffi::c_void,
+        4,
+    );
+    enc.set_bytes(
+        qmm_steel::SWIZZLE_LOG as u32,
+        &swizzle_log as *const u32 as *const std::ffi::c_void,
+        4,
+    );
     enc.set_buffer(qmm_steel::RESIDUAL as u32, Some(&dummy_buf), 0); // residual (unused)
     enc.set_buffer(qmm_steel::GATE_RESULT as u32, Some(&dummy_buf), 0); // gate_result (unused)
 
-    let grid = MTLSize { width: n_tiles, height: m_tiles, depth: 1 };
-    let tg = MTLSize { width: 64, height: 1, depth: 1 };
+    let grid = MTLSize {
+        width: n_tiles,
+        height: m_tiles,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: 64,
+        height: 1,
+        depth: 1,
+    };
     enc.dispatch_threadgroups(grid, tg);
     enc.end();
 
@@ -8346,19 +9133,47 @@ pub fn affine_quantized_matmul_qldr(
     let raw_enc = cb.computeCommandEncoder().unwrap();
     let enc = ComputePass::new(&raw_enc);
     enc.set_pipeline(&pipeline);
-    enc.set_buffer(qmm_steel::X as u32, Some(x_half.metal_buffer()), x_half.offset());
+    enc.set_buffer(
+        qmm_steel::X as u32,
+        Some(x_half.metal_buffer()),
+        x_half.offset(),
+    );
     enc.set_buffer(qmm_steel::WEIGHTS as u32, Some(&qw.weights_buf), 0);
     enc.set_buffer(qmm_steel::SCALES as u32, Some(&qw.scales_buf), 0);
     enc.set_buffer(qmm_steel::BIASES as u32, Some(&qw.biases_buf), 0);
     enc.set_buffer(qmm_steel::OUT as u32, Some(out.metal_buffer()), 0);
-    enc.set_bytes(qmm_steel::M as u32, &m_u32 as *const u32 as *const std::ffi::c_void, 4);
-    enc.set_bytes(qmm_steel::N as u32, &n_u32 as *const u32 as *const std::ffi::c_void, 4);
-    enc.set_bytes(qmm_steel::K as u32, &k_u32 as *const u32 as *const std::ffi::c_void, 4);
-    enc.set_bytes(qmm_steel::SWIZZLE_LOG as u32, &swizzle_log as *const u32 as *const std::ffi::c_void, 4);
+    enc.set_bytes(
+        qmm_steel::M as u32,
+        &m_u32 as *const u32 as *const std::ffi::c_void,
+        4,
+    );
+    enc.set_bytes(
+        qmm_steel::N as u32,
+        &n_u32 as *const u32 as *const std::ffi::c_void,
+        4,
+    );
+    enc.set_bytes(
+        qmm_steel::K as u32,
+        &k_u32 as *const u32 as *const std::ffi::c_void,
+        4,
+    );
+    enc.set_bytes(
+        qmm_steel::SWIZZLE_LOG as u32,
+        &swizzle_log as *const u32 as *const std::ffi::c_void,
+        4,
+    );
     enc.set_buffer(qmm_steel::RESIDUAL as u32, Some(&dummy_buf), 0); // residual (unused)
 
-    let grid = MTLSize { width: n_tiles, height: m_tiles, depth: 1 };
-    let tg = MTLSize { width: 64, height: 1, depth: 1 };
+    let grid = MTLSize {
+        width: n_tiles,
+        height: m_tiles,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: 64,
+        height: 1,
+        depth: 1,
+    };
     enc.dispatch_threadgroups(grid, tg);
     enc.end();
     super::commit_with_mode(&cb, super::ExecMode::Sync);
@@ -8428,15 +9243,27 @@ pub fn affine_quantized_matmul_batched_scalar(
     enc.set_buffer(qmm_legacy::SCALES as u32, Some(&qw.scales_buf), 0);
     enc.set_buffer(qmm_legacy::BIASES as u32, Some(&qw.biases_buf), 0);
     enc.set_buffer(qmm_legacy::OUT as u32, Some(out.metal_buffer()), 0);
-    enc.set_bytes(qmm_legacy::PARAMS as u32, params.as_ptr() as *const std::ffi::c_void, 16);
+    enc.set_bytes(
+        qmm_legacy::PARAMS as u32,
+        params.as_ptr() as *const std::ffi::c_void,
+        16,
+    );
     // Legacy tile sizes
     const BM_Q: usize = 16;
     const BN_Q: usize = 16;
 
     let grid_x = n.div_ceil(BN_Q);
     let grid_y = m.div_ceil(BM_Q);
-    let grid = MTLSize { width: grid_x, height: grid_y, depth: 1 };
-    let tg = MTLSize { width: (BM_Q * BN_Q), height: 1, depth: 1 };
+    let grid = MTLSize {
+        width: grid_x,
+        height: grid_y,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: (BM_Q * BN_Q),
+        height: 1,
+        depth: 1,
+    };
 
     enc.dispatch_threadgroups(grid, tg);
     enc.end();
@@ -8555,9 +9382,21 @@ pub(crate) fn gather_qmm_ceil_div(a: usize, b: usize) -> usize {
 /// Replaced by inline `set_bytes()` in dispatch functions — kept for potential
 /// external callers.
 #[allow(dead_code)]
-fn gather_qmm_u32_buf(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, val: u32) -> rmlx_metal::MtlBuffer {
+fn gather_qmm_u32_buf(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    val: u32,
+) -> rmlx_metal::MtlBuffer {
     let opts = MTLResourceOptions::StorageModeShared;
-    unsafe { device.newBufferWithBytes_length_options(std::ptr::NonNull::new(&val as *const u32 as *const _ as *mut std::ffi::c_void).unwrap(), 4_usize, opts).unwrap() }
+    unsafe {
+        device
+            .newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(&val as *const u32 as *const _ as *mut std::ffi::c_void)
+                    .unwrap(),
+                4_usize,
+                opts,
+            )
+            .unwrap()
+    }
 }
 
 /// Index-based quantized matmul for MoE expert dispatch (GatherQMM). /// /// Combines GatherMM (index-based expert selection) with Q4 dequantization. /// Each batch element selects an expert's Q4-packed weight matrix via `indices`, /// and computes the dequantized matmul in a single fused kernel. /// /// # Arguments /// - `x`: f32 input activations `[batch, m_per_batch, k]` /// - `qw`: Q4 quantized expert weights (n_experts sets of weights) /// - `indices`: expert index per batch element `[batch]` (UInt32) /// - `n_experts`: number of expert weight sets /// - `m_per_batch`: rows per batch element /// - `n`: output columns per expert /// - `k`: inner dimension (input features) /// /// # Returns /// f32 output `[batch, m_per_batch, n]`.
@@ -8702,19 +9541,55 @@ pub fn gather_qmm(
     enc.set_buffer(gather_qmm::WEIGHTS as u32, Some(w_packed_buf), 0);
     enc.set_buffer(gather_qmm::SCALES as u32, Some(scales_buf), 0);
     enc.set_buffer(gather_qmm::BIASES as u32, Some(biases_buf), 0);
-    enc.set_buffer(gather_qmm::INDICES as u32, Some(indices.metal_buffer()), indices.offset());
+    enc.set_buffer(
+        gather_qmm::INDICES as u32,
+        Some(indices.metal_buffer()),
+        indices.offset(),
+    );
     enc.set_buffer(gather_qmm::OUT as u32, Some(out.metal_buffer()), 0);
-    enc.set_bytes(gather_qmm::BATCH as u32, &batch_u32 as *const u32 as *const std::ffi::c_void, 4);
-    enc.set_bytes(gather_qmm::M as u32, &m_u32 as *const u32 as *const std::ffi::c_void, 4);
-    enc.set_bytes(gather_qmm::N as u32, &n_u32 as *const u32 as *const std::ffi::c_void, 4);
-    enc.set_bytes(gather_qmm::K as u32, &k_u32 as *const u32 as *const std::ffi::c_void, 4);
-    enc.set_bytes(gather_qmm::GROUP_SIZE as u32, &group_size as *const u32 as *const std::ffi::c_void, 4);
-    enc.set_bytes(gather_qmm::N_EXPERTS as u32, &ne_u32 as *const u32 as *const std::ffi::c_void, 4);
+    enc.set_bytes(
+        gather_qmm::BATCH as u32,
+        &batch_u32 as *const u32 as *const std::ffi::c_void,
+        4,
+    );
+    enc.set_bytes(
+        gather_qmm::M as u32,
+        &m_u32 as *const u32 as *const std::ffi::c_void,
+        4,
+    );
+    enc.set_bytes(
+        gather_qmm::N as u32,
+        &n_u32 as *const u32 as *const std::ffi::c_void,
+        4,
+    );
+    enc.set_bytes(
+        gather_qmm::K as u32,
+        &k_u32 as *const u32 as *const std::ffi::c_void,
+        4,
+    );
+    enc.set_bytes(
+        gather_qmm::GROUP_SIZE as u32,
+        &group_size as *const u32 as *const std::ffi::c_void,
+        4,
+    );
+    enc.set_bytes(
+        gather_qmm::N_EXPERTS as u32,
+        &ne_u32 as *const u32 as *const std::ffi::c_void,
+        4,
+    );
     const BM_GQ: usize = 16;
     const BN_GQ: usize = 16;
 
-    let grid = MTLSize { width: gather_qmm_ceil_div(n, BN_GQ), height: gather_qmm_ceil_div(m_per_batch, BM_GQ), depth: batch };
-    let tg = MTLSize { width: (BM_GQ * BN_GQ), height: 1, depth: 1 };
+    let grid = MTLSize {
+        width: gather_qmm_ceil_div(n, BN_GQ),
+        height: gather_qmm_ceil_div(m_per_batch, BM_GQ),
+        depth: batch,
+    };
+    let tg = MTLSize {
+        width: (BM_GQ * BN_GQ),
+        height: 1,
+        depth: 1,
+    };
 
     enc.dispatch_threadgroups(grid, tg);
     enc.end();
@@ -9143,16 +10018,32 @@ pub fn gather_qmv_fast_q4(
     enc.set_buffer(gather_qmv::WEIGHTS as u32, Some(w_packed_buf), 0);
     enc.set_buffer(gather_qmv::SCALES as u32, Some(scales_buf), 0);
     enc.set_buffer(gather_qmv::BIASES as u32, Some(biases_buf), 0);
-    enc.set_buffer(gather_qmv::INDICES as u32, Some(indices.metal_buffer()), indices.offset());
+    enc.set_buffer(
+        gather_qmv::INDICES as u32,
+        Some(indices.metal_buffer()),
+        indices.offset(),
+    );
     enc.set_buffer(gather_qmv::OUT as u32, Some(out.metal_buffer()), 0);
-    enc.set_bytes(gather_qmv::PARAMS as u32, params.as_ptr() as *const std::ffi::c_void, 16);
+    enc.set_bytes(
+        gather_qmv::PARAMS as u32,
+        params.as_ptr() as *const std::ffi::c_void,
+        16,
+    );
     // Grid: (batch, ceil(N/8), 1) — one TG per batch element x output-row tile
     let rows_per_tg: usize = 8; // NUM_SIMDGROUPS(2) * RESULTS_PER_SG(4)
     let num_tgs_y = n.div_ceil(rows_per_tg);
     let tg_size: usize = 64; // 2 simdgroups x 32 lanes
 
-    let grid = MTLSize { width: batch, height: num_tgs_y, depth: 1 };
-    let tg = MTLSize { width: tg_size, height: 1, depth: 1 };
+    let grid = MTLSize {
+        width: batch,
+        height: num_tgs_y,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: tg_size,
+        height: 1,
+        depth: 1,
+    };
 
     enc.dispatch_threadgroups(grid, tg);
     enc.end();
@@ -9311,15 +10202,31 @@ pub fn gather_qmv_fast_f16_q4(
     enc.set_buffer(gather_qmv::WEIGHTS as u32, Some(w_packed_buf), 0);
     enc.set_buffer(gather_qmv::SCALES as u32, Some(scales_buf), 0);
     enc.set_buffer(gather_qmv::BIASES as u32, Some(biases_buf), 0);
-    enc.set_buffer(gather_qmv::INDICES as u32, Some(indices.metal_buffer()), indices.offset());
+    enc.set_buffer(
+        gather_qmv::INDICES as u32,
+        Some(indices.metal_buffer()),
+        indices.offset(),
+    );
     enc.set_buffer(gather_qmv::OUT as u32, Some(out.metal_buffer()), 0);
-    enc.set_bytes(gather_qmv::PARAMS as u32, params.as_ptr() as *const std::ffi::c_void, 16);
+    enc.set_bytes(
+        gather_qmv::PARAMS as u32,
+        params.as_ptr() as *const std::ffi::c_void,
+        16,
+    );
     let rows_per_tg: usize = 8; // NUM_SIMDGROUPS(2) * RESULTS_PER_SG(4)
     let num_tgs_y = n.div_ceil(rows_per_tg);
     let tg_size: usize = 64; // 2 simdgroups x 32 lanes
 
-    let grid = MTLSize { width: batch, height: num_tgs_y, depth: 1 };
-    let tg = MTLSize { width: tg_size, height: 1, depth: 1 };
+    let grid = MTLSize {
+        width: batch,
+        height: num_tgs_y,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: tg_size,
+        height: 1,
+        depth: 1,
+    };
 
     enc.dispatch_threadgroups(grid, tg);
     enc.end();
@@ -9404,9 +10311,15 @@ pub fn moe_expert_matmul_q4(
     let total_w_bytes = n_experts * w_bytes_per_expert;
     let total_s_bytes = n_experts * s_bytes_per_expert;
 
-    let packed_w = dev.newBufferWithLength_options(total_w_bytes as u64 as usize, opts).unwrap();
-    let packed_s = dev.newBufferWithLength_options(total_s_bytes as u64 as usize, opts).unwrap();
-    let packed_b = dev.newBufferWithLength_options(total_s_bytes as u64 as usize, opts).unwrap();
+    let packed_w = dev
+        .newBufferWithLength_options(total_w_bytes as u64 as usize, opts)
+        .unwrap();
+    let packed_s = dev
+        .newBufferWithLength_options(total_s_bytes as u64 as usize, opts)
+        .unwrap();
+    let packed_b = dev
+        .newBufferWithLength_options(total_s_bytes as u64 as usize, opts)
+        .unwrap();
 
     // Copy each expert's buffers into the packed contiguous buffers.
     //
@@ -10124,18 +11037,39 @@ mod tests {
         let w_bytes = n_experts * n * half_k;
         let w_data = vec![0x77u8; w_bytes];
         let opts = MTLResourceOptions::StorageModeShared;
-        let w_packed_buf =
-            unsafe { dev.newBufferWithBytes_length_options(std::ptr::NonNull::new(w_data.as_ptr() as *const _ as *mut std::ffi::c_void).unwrap(), w_bytes as u64 as usize, opts).unwrap() };
+        let w_packed_buf = unsafe {
+            dev.newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(w_data.as_ptr() as *const _ as *mut std::ffi::c_void)
+                    .unwrap(),
+                w_bytes as u64 as usize,
+                opts,
+            )
+            .unwrap()
+        };
 
         // scales & biases: n_experts * n * groups_per_row as f16
         let sb_elems = n_experts * n * groups_per_row;
         let scales_f16: Vec<u16> = vec![f32_to_f16_bits(1.0); sb_elems];
         let biases_f16: Vec<u16> = vec![f32_to_f16_bits(0.0); sb_elems];
         let sb_bytes = sb_elems * 2; // f16 = 2 bytes
-        let scales_buf =
-            unsafe { dev.newBufferWithBytes_length_options(std::ptr::NonNull::new(scales_f16.as_ptr() as *const _ as *mut std::ffi::c_void).unwrap(), sb_bytes as u64 as usize, opts).unwrap() };
-        let biases_buf =
-            unsafe { dev.newBufferWithBytes_length_options(std::ptr::NonNull::new(biases_f16.as_ptr() as *const _ as *mut std::ffi::c_void).unwrap(), sb_bytes as u64 as usize, opts).unwrap() };
+        let scales_buf = unsafe {
+            dev.newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(scales_f16.as_ptr() as *const _ as *mut std::ffi::c_void)
+                    .unwrap(),
+                sb_bytes as u64 as usize,
+                opts,
+            )
+            .unwrap()
+        };
+        let biases_buf = unsafe {
+            dev.newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(biases_f16.as_ptr() as *const _ as *mut std::ffi::c_void)
+                    .unwrap(),
+                sb_bytes as u64 as usize,
+                opts,
+            )
+            .unwrap()
+        };
 
         let idx_data = vec![0u32, 1];
         let indices = Array::from_slice(dev, &idx_data, vec![batch]);
@@ -10355,7 +11289,15 @@ mod tests {
         let dev = registry.device().raw();
         // Valid w_packed needs 2*4*16 = 128 bytes, provide only 10
         let opts = MTLResourceOptions::StorageModeShared;
-        let small_w = unsafe { dev.newBufferWithBytes_length_options(std::ptr::NonNull::new([0u8; 10].as_ptr() as *const _ as *mut std::ffi::c_void).unwrap(), 10_usize, opts).unwrap() };
+        let small_w = unsafe {
+            dev.newBufferWithBytes_length_options(
+                std::ptr::NonNull::new([0u8; 10].as_ptr() as *const _ as *mut std::ffi::c_void)
+                    .unwrap(),
+                10_usize,
+                opts,
+            )
+            .unwrap()
+        };
         let result = gather_qmm(
             &registry,
             &x,
@@ -10386,7 +11328,15 @@ mod tests {
         let dev = registry.device().raw();
         let opts = MTLResourceOptions::StorageModeShared;
         // Valid scales needs 2*4*1*4 = 32 bytes, provide only 4
-        let small_s = unsafe { dev.newBufferWithBytes_length_options(std::ptr::NonNull::new([0u8; 4].as_ptr() as *const _ as *mut std::ffi::c_void).unwrap(), 4_usize, opts).unwrap() };
+        let small_s = unsafe {
+            dev.newBufferWithBytes_length_options(
+                std::ptr::NonNull::new([0u8; 4].as_ptr() as *const _ as *mut std::ffi::c_void)
+                    .unwrap(),
+                4_usize,
+                opts,
+            )
+            .unwrap()
+        };
         let result = gather_qmm(
             &registry,
             &x,
@@ -10416,7 +11366,15 @@ mod tests {
             setup_gather_qmm_valid();
         let dev = registry.device().raw();
         let opts = MTLResourceOptions::StorageModeShared;
-        let small_b = unsafe { dev.newBufferWithBytes_length_options(std::ptr::NonNull::new([0u8; 4].as_ptr() as *const _ as *mut std::ffi::c_void).unwrap(), 4_usize, opts).unwrap() };
+        let small_b = unsafe {
+            dev.newBufferWithBytes_length_options(
+                std::ptr::NonNull::new([0u8; 4].as_ptr() as *const _ as *mut std::ffi::c_void)
+                    .unwrap(),
+                4_usize,
+                opts,
+            )
+            .unwrap()
+        };
         let result = gather_qmm(
             &registry,
             &x,
@@ -11428,12 +12386,18 @@ mod tests {
         );
 
         // Build Metal QuantizedWeight with f16 scales (native format)
-        let weights_buf = unsafe { device.newBufferWithBytes_length_options(std::ptr::NonNull::new(all_packed.as_ptr() as *const _ as *mut std::ffi::c_void).unwrap(), all_packed.len() as u64 as usize, opts).unwrap() };
+        let weights_buf = unsafe {
+            device.newBufferWithBytes_length_options(std::ptr::NonNull::new(all_packed.as_ptr() as *const _ as *mut std::ffi::c_void).unwrap(), all_packed.len() as u64 as usize, opts).unwrap()
+        };
         let num_groups = n * k / group_size;
         let scales_f16: Vec<u16> = all_scales.iter().map(|&v| f32_to_f16_bits(v)).collect();
         let biases_f16: Vec<u16> = all_biases.iter().map(|&v| f32_to_f16_bits(v)).collect();
-        let scales_buf = unsafe { device.newBufferWithBytes_length_options(std::ptr::NonNull::new(scales_f16.as_ptr() as *const _ as *mut std::ffi::c_void).unwrap(), (num_groups * 2) as u64 as usize, opts).unwrap() };
-        let biases_buf = unsafe { device.newBufferWithBytes_length_options(std::ptr::NonNull::new(biases_f16.as_ptr() as *const _ as *mut std::ffi::c_void).unwrap(), (num_groups * 2) as u64 as usize, opts).unwrap() };
+        let scales_buf = unsafe {
+            device.newBufferWithBytes_length_options(std::ptr::NonNull::new(scales_f16.as_ptr() as *const _ as *mut std::ffi::c_void).unwrap(), (num_groups * 2) as u64 as usize, opts).unwrap()
+        };
+        let biases_buf = unsafe {
+            device.newBufferWithBytes_length_options(std::ptr::NonNull::new(biases_f16.as_ptr() as *const _ as *mut std::ffi::c_void).unwrap(), (num_groups * 2) as u64 as usize, opts).unwrap()
+        };
 
         let qw = QuantizedWeight::new(
             weights_buf,

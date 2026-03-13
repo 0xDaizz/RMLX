@@ -18,16 +18,16 @@
 //! Run with:
 //!   cargo bench -p rmlx-nn --bench op_profile_bench
 
-use std::time::{Duration, Instant};
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer as _, MTLCommandBuffer as _, MTLCommandQueue as _, MTLDevice as _};
+use std::time::{Duration, Instant};
 
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::KernelRegistry;
 use rmlx_core::ops;
-use rmlx_metal::device::GpuDevice;
 use rmlx_metal::autoreleasepool;
+use rmlx_metal::device::GpuDevice;
 use rmlx_nn::{
     Attention, AttentionConfig, FeedForward, LayerKvCache, Linear, LinearConfig, TransformerBlock,
 };
@@ -93,7 +93,11 @@ fn rand_f16_bytes(numel: usize, seed: u64) -> Vec<u8> {
     f16_bytes
 }
 
-fn rand_array(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, shape: &[usize], seed: u64) -> Array {
+fn rand_array(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    shape: &[usize],
+    seed: u64,
+) -> Array {
     let numel: usize = shape.iter().product();
     let f16_bytes = rand_f16_bytes(numel, seed);
     Array::from_bytes(device, &f16_bytes, shape.to_vec(), DType::Float16)
@@ -109,7 +113,12 @@ fn ones_f16(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, size: usize) ->
 // Layer construction helpers (for full-pipeline baseline only)
 // ---------------------------------------------------------------------------
 
-fn make_linear(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, in_f: usize, out_f: usize, seed: u64) -> Linear {
+fn make_linear(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    in_f: usize,
+    out_f: usize,
+    seed: u64,
+) -> Linear {
     let weight = rand_array(device, &[out_f, in_f], seed);
     Linear::from_arrays(
         LinearConfig {
@@ -123,7 +132,9 @@ fn make_linear(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, in_f: usize,
     .expect("linear from_arrays")
 }
 
-fn build_transformer_block(device: &ProtocolObject<dyn objc2_metal::MTLDevice>) -> TransformerBlock {
+fn build_transformer_block(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+) -> TransformerBlock {
     let kv_size = NUM_KV_HEADS * HEAD_DIM;
     let q_proj = make_linear(device, HIDDEN_SIZE, HIDDEN_SIZE, 1);
     let k_proj = make_linear(device, HIDDEN_SIZE, kv_size, 2);
@@ -204,7 +215,12 @@ fn build_merged_weight_t(
 }
 
 /// Build a single transposed weight: [out, in] -> [in, out]
-fn transpose_weight_cpu(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, bytes: &[u8], rows: usize, cols: usize) -> Array {
+fn transpose_weight_cpu(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    bytes: &[u8],
+    rows: usize,
+    cols: usize,
+) -> Array {
     let mut result = vec![0u8; rows * cols * 2];
     for r in 0..rows {
         for c in 0..cols {
@@ -261,7 +277,11 @@ struct OpResult {
     max_us: f64,
 }
 
-fn bench_op<F>(name: &'static str, queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>, mut f: F) -> OpResult
+fn bench_op<F>(
+    name: &'static str,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
+    mut f: F,
+) -> OpResult
 where
     F: FnMut(&ProtocolObject<dyn objc2_metal::MTLCommandBuffer>),
 {
@@ -742,12 +762,13 @@ fn main() {
                 vec![HEAD_DIM, 1],
                 attn_slab.offset(),
             );
-            
+
             autoreleasepool(|_| {
                 let cb = queue.commandBufferWithUnretainedReferences().unwrap();
-                let r =
-                    ops::rope::interleave_heads_into_cb(&registry, &packed, NUM_HEADS, seq_len, &cb)
-                        .expect("interleave_heads");
+                let r = ops::rope::interleave_heads_into_cb(
+                    &registry, &packed, NUM_HEADS, seq_len, &cb,
+                )
+                .expect("interleave_heads");
                 cb.commit();
                 cb.waitUntilCompleted();
                 r

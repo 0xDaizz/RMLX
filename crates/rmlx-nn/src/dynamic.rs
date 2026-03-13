@@ -3,11 +3,11 @@
 //! Pre-allocates buffers at maximum size and dispatches with actual dimensions.
 //! This avoids buffer reallocation for varying input sizes.
 
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLDevice;
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::KernelError;
-use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLDevice};
 
 /// Context for executing with dynamic shapes.
 ///

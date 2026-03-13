@@ -12,13 +12,13 @@ use crate::kernels::{KernelError, KernelRegistry};
 use super::codegen::FusionCodegen;
 use super::graph::FusionGraph;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::MTLComputePipelineState as _;
 use objc2_metal::MTLCommandBuffer as _;
 use objc2_metal::MTLCommandQueue as _;
-use rmlx_metal::MTLResourceOptions;
+use objc2_metal::MTLComputePipelineState as _;
 use objc2_metal::MTLDevice as _;
-use rmlx_metal::MTLSize;
 use rmlx_metal::ComputePass;
+use rmlx_metal::MTLResourceOptions;
+use rmlx_metal::MTLSize;
 
 /// Kernel function name for a fused element-wise kernel, derived from
 /// the graph's cache key and dtype.
@@ -114,14 +114,31 @@ pub fn dispatch_fused(
 
     // Bind N (element count)
     let n = n_elements as u32;
-    let params_buf = unsafe { device.newBufferWithBytes_length_options(std::ptr::NonNull::new(&n as *const u32 as *const _ as *mut std::ffi::c_void).unwrap(), std::mem::size_of::<u32>(), MTLResourceOptions::StorageModeShared).unwrap() };
+    let params_buf = unsafe {
+        device
+            .newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(&n as *const u32 as *const _ as *mut std::ffi::c_void)
+                    .unwrap(),
+                std::mem::size_of::<u32>(),
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap()
+    };
     let params_idx = (inputs.len() + outputs.len()) as u32;
     enc.set_buffer(params_idx, Some(&params_buf), 0);
     // Dispatch
     let max_tg = pipeline.maxTotalThreadsPerThreadgroup();
     let tg_size = std::cmp::min(max_tg, n_elements);
-    let grid = MTLSize { width: n_elements, height: 1, depth: 1 };
-    let tg = MTLSize { width: tg_size, height: 1, depth: 1 };
+    let grid = MTLSize {
+        width: n_elements,
+        height: 1,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: tg_size,
+        height: 1,
+        depth: 1,
+    };
     enc.dispatch_threads(grid, tg);
     enc.end();
 
@@ -174,13 +191,30 @@ pub fn dispatch_fused_into_cb(
     }
 
     let n = n_elements as u32;
-    let params_buf = unsafe { device.newBufferWithBytes_length_options(std::ptr::NonNull::new(&n as *const u32 as *const _ as *mut std::ffi::c_void).unwrap(), std::mem::size_of::<u32>(), MTLResourceOptions::StorageModeShared).unwrap() };
+    let params_buf = unsafe {
+        device
+            .newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(&n as *const u32 as *const _ as *mut std::ffi::c_void)
+                    .unwrap(),
+                std::mem::size_of::<u32>(),
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap()
+    };
     let params_idx = (inputs.len() + outputs.len()) as u32;
     enc.set_buffer(params_idx, Some(&params_buf), 0);
     let max_tg = pipeline.maxTotalThreadsPerThreadgroup();
     let tg_size = std::cmp::min(max_tg, n_elements);
-    let grid = MTLSize { width: n_elements, height: 1, depth: 1 };
-    let tg = MTLSize { width: tg_size, height: 1, depth: 1 };
+    let grid = MTLSize {
+        width: n_elements,
+        height: 1,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: tg_size,
+        height: 1,
+        depth: 1,
+    };
     enc.dispatch_threads(grid, tg);
     enc.end();
 

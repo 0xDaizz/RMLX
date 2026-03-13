@@ -10,14 +10,14 @@
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
-use rmlx_metal::MTLSize;
-use rmlx_metal::ComputePass;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::MTLComputePipelineState as _;
 use objc2_metal::MTLCommandBuffer as _;
 use objc2_metal::MTLCommandQueue as _;
-use rmlx_metal::MTLResourceOptions;
+use objc2_metal::MTLComputePipelineState as _;
 use objc2_metal::MTLDevice as _;
+use rmlx_metal::ComputePass;
+use rmlx_metal::MTLResourceOptions;
+use rmlx_metal::MTLSize;
 
 // ---------------------------------------------------------------------------
 // Metal shader source
@@ -261,8 +261,23 @@ pub fn sdpa_backward(
         super::checked_u32(d, "D")?,
     ];
     let opts = MTLResourceOptions::StorageModeShared;
-    let params_buf = unsafe { dev.newBufferWithBytes_length_options(std::ptr::NonNull::new(params.as_ptr() as *const _ as *mut std::ffi::c_void).unwrap(), std::mem::size_of_val(&params), opts).unwrap() };
-    let scale_buf = unsafe { dev.newBufferWithBytes_length_options(std::ptr::NonNull::new(&scale as *const f32 as *const _ as *mut std::ffi::c_void).unwrap(), std::mem::size_of::<f32>(), opts).unwrap() };
+    let params_buf = unsafe {
+        dev.newBufferWithBytes_length_options(
+            std::ptr::NonNull::new(params.as_ptr() as *const _ as *mut std::ffi::c_void).unwrap(),
+            std::mem::size_of_val(&params),
+            opts,
+        )
+        .unwrap()
+    };
+    let scale_buf = unsafe {
+        dev.newBufferWithBytes_length_options(
+            std::ptr::NonNull::new(&scale as *const f32 as *const _ as *mut std::ffi::c_void)
+                .unwrap(),
+            std::mem::size_of::<f32>(),
+            opts,
+        )
+        .unwrap()
+    };
 
     let cb = queue.commandBuffer().unwrap();
     let raw_enc = cb.computeCommandEncoder().unwrap();
@@ -279,8 +294,16 @@ pub fn sdpa_backward(
     enc.set_buffer(8, Some(&scale_buf), 0);
     // One thread per query row. For small N this is fine;
     // for large N we'd want a tiled approach.
-    let grid = MTLSize { width: n, height: 1, depth: 1 };
-    let tg = MTLSize { width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), n).max(1), height: 1, depth: 1 };
+    let grid = MTLSize {
+        width: n,
+        height: 1,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), n).max(1),
+        height: 1,
+        depth: 1,
+    };
     enc.dispatch_threads(grid, tg);
     enc.end();
     super::commit_with_mode(&cb, super::ExecMode::Sync);

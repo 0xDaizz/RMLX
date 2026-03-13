@@ -180,7 +180,11 @@ impl SparseExpertPlan {
                     // input buffer placeholder at index 0 (overridden at replay)
                     // output buffer placeholder at index 1 (overridden at replay)
                     // weight buffer at index 2
-                    (2, retain_proto(gate_weights), (eid * gate_expert_stride) as u64),
+                    (
+                        2,
+                        retain_proto(gate_weights),
+                        (eid * gate_expert_stride) as u64,
+                    ),
                 ],
                 input_indices: vec![0],
                 output_indices: vec![0],
@@ -225,7 +229,11 @@ impl SparseExpertPlan {
             // Down GEMM: [tokens, inter] x [inter, D] -> [tokens, D]
             let down_dispatch = CapturedDispatch {
                 pipeline: retain_proto(down_pipeline),
-                buffers: vec![(2, retain_proto(down_weights), (eid * down_expert_stride) as u64)],
+                buffers: vec![(
+                    2,
+                    retain_proto(down_weights),
+                    (eid * down_expert_stride) as u64,
+                )],
                 input_indices: vec![0],
                 output_indices: vec![0],
                 grid_size: MTLSize {
@@ -1275,13 +1283,9 @@ mod tests {
         let down_size = num_experts * intermediate_dim * hidden_dim * elem_size;
 
         let opts = MTLResourceOptions::StorageModeShared;
-        let gate_weights = device
-            .newBufferWithLength_options(gate_size, opts)
-            .unwrap();
+        let gate_weights = device.newBufferWithLength_options(gate_size, opts).unwrap();
         let up_weights = device.newBufferWithLength_options(up_size, opts).unwrap();
-        let down_weights = device
-            .newBufferWithLength_options(down_size, opts)
-            .unwrap();
+        let down_weights = device.newBufferWithLength_options(down_size, opts).unwrap();
 
         // Create a trivial compute pipeline for testing.
         let pipeline = create_noop_pipeline(device);

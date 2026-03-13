@@ -9,14 +9,14 @@
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
-use rmlx_metal::MTLSize;
-use rmlx_metal::ComputePass;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::MTLComputePipelineState as _;
 use objc2_metal::MTLCommandBuffer as _;
 use objc2_metal::MTLCommandQueue as _;
+use objc2_metal::MTLComputePipelineState as _;
 use objc2_metal::MTLDevice as _;
+use rmlx_metal::ComputePass;
 use rmlx_metal::MTLResourceOptions;
+use rmlx_metal::MTLSize;
 
 // ---------------------------------------------------------------------------
 // Metal shader source
@@ -201,7 +201,18 @@ pub fn uniform(
     // Each thread handles 4 elements.
     let n_threads = numel.div_ceil(4);
     let tg = std::cmp::min(256usize, pipeline.maxTotalThreadsPerThreadgroup());
-    enc.dispatch_threads(MTLSize { width: n_threads, height: 1, depth: 1 }, MTLSize { width: tg, height: 1, depth: 1 });
+    enc.dispatch_threads(
+        MTLSize {
+            width: n_threads,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg,
+            height: 1,
+            depth: 1,
+        },
+    );
     enc.end();
     super::commit_with_mode(&cb, super::ExecMode::Sync);
 
@@ -256,7 +267,18 @@ pub fn normal(
     enc.set_buffer(4, Some(&std_buf), 0);
     let n_threads = numel.div_ceil(4);
     let tg = std::cmp::min(256usize, pipeline.maxTotalThreadsPerThreadgroup());
-    enc.dispatch_threads(MTLSize { width: n_threads, height: 1, depth: 1 }, MTLSize { width: tg, height: 1, depth: 1 });
+    enc.dispatch_threads(
+        MTLSize {
+            width: n_threads,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg,
+            height: 1,
+            depth: 1,
+        },
+    );
     enc.end();
     super::commit_with_mode(&cb, super::ExecMode::Sync);
 
@@ -267,11 +289,27 @@ pub fn normal(
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn make_scalar_buf<T>(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, val: &T) -> rmlx_metal::MtlBuffer {
-    unsafe { device.newBufferWithBytes_length_options(std::ptr::NonNull::new(val as *const T as *const std::ffi::c_void as *mut std::ffi::c_void).unwrap(), std::mem::size_of::<T>(), MTLResourceOptions::StorageModeShared).unwrap() }
+fn make_scalar_buf<T>(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    val: &T,
+) -> rmlx_metal::MtlBuffer {
+    unsafe {
+        device
+            .newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(
+                    val as *const T as *const std::ffi::c_void as *mut std::ffi::c_void,
+                )
+                .unwrap(),
+                std::mem::size_of::<T>(),
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap()
+    }
 }
 
-#[cfg(test)] mod tests { use super::*;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
     fn setup() -> (KernelRegistry, rmlx_metal::MtlQueue) {
         let device = rmlx_metal::device::GpuDevice::system_default().expect("Metal device");

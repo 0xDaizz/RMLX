@@ -16,16 +16,16 @@
 //! Run with:
 //!   cargo bench -p rmlx-nn --bench matmul_micro_bench
 
-use std::time::{Duration, Instant};
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLCommandBuffer as _, MTLCommandQueue as _, MTLDevice as _};
+use std::time::{Duration, Instant};
 
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::KernelRegistry;
 use rmlx_core::ops;
-use rmlx_metal::device::GpuDevice;
 use rmlx_metal::autoreleasepool;
+use rmlx_metal::device::GpuDevice;
 
 const WARMUP_ITERS: usize = 5;
 const BENCH_ITERS: usize = 20;
@@ -100,7 +100,11 @@ fn rand_f16_bytes(numel: usize, seed: u64) -> Vec<u8> {
     f16_bytes
 }
 
-fn rand_array(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, shape: &[usize], seed: u64) -> Array {
+fn rand_array(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    shape: &[usize],
+    seed: u64,
+) -> Array {
     let numel: usize = shape.iter().product();
     let f16_bytes = rand_f16_bytes(numel, seed);
     Array::from_bytes(device, &f16_bytes, shape.to_vec(), DType::Float16)
@@ -215,7 +219,9 @@ fn main() {
             for shape in SHAPES {
                 let a = rand_array(device, &[*m, shape.k], 42);
                 let b = rand_array(device, &[shape.k, shape.n], 43);
-                let cb = warmup_queue.commandBufferWithUnretainedReferences().unwrap();
+                let cb = warmup_queue
+                    .commandBufferWithUnretainedReferences()
+                    .unwrap();
                 let _ =
                     ops::matmul::matmul_into_cb(&registry, &a, &b, &cb).expect("jit warmup matmul");
                 cb.commit();

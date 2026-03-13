@@ -21,17 +21,17 @@
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
-use objc2::runtime::ProtocolObject;
-use objc2_metal::MTLComputePipelineState as _;
-use objc2_metal::MTLCommandBuffer as _;
-use objc2_metal::MTLCommandQueue as _;
-use objc2_metal::MTLBuffer as _;
-use objc2_metal::MTLDevice as _;
-use rmlx_metal::MTLResourceOptions;
-use rmlx_metal::ComputePass;
 use crate::ops::buffer_slots::{
     sdpa as sdpa_slot, sdpa_diag_qkt, sdpa_diag_single_mma, sdpa_mma, sdpa_nax,
 };
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLBuffer as _;
+use objc2_metal::MTLCommandBuffer as _;
+use objc2_metal::MTLCommandQueue as _;
+use objc2_metal::MTLComputePipelineState as _;
+use objc2_metal::MTLDevice as _;
+use rmlx_metal::ComputePass;
+use rmlx_metal::MTLResourceOptions;
 use rmlx_metal::MTLSize;
 
 // Tiling parameters — must match the Metal shader constants.
@@ -3494,7 +3494,10 @@ pub fn sdpa(
     let params: [u32; 5] = [n as u32, s as u32, d as u32, has_mask, is_causal_u32];
     let params_buf = unsafe {
         dev.newBufferWithBytes_length_options(
-            std::ptr::NonNull::new(params.as_ptr() as *const std::ffi::c_void as *mut std::ffi::c_void).unwrap(),
+            std::ptr::NonNull::new(
+                params.as_ptr() as *const std::ffi::c_void as *mut std::ffi::c_void
+            )
+            .unwrap(),
             20_usize, // 5 * 4 bytes
             MTLResourceOptions::StorageModeShared,
         )
@@ -3502,14 +3505,26 @@ pub fn sdpa(
     };
 
     // Scale buffer
-    let scale_buf = unsafe { dev.newBufferWithBytes_length_options(std::ptr::NonNull::new(&scale as *const f32 as *const std::ffi::c_void as *mut std::ffi::c_void).unwrap(), 4_usize, MTLResourceOptions::StorageModeShared).unwrap() };
+    let scale_buf = unsafe {
+        dev.newBufferWithBytes_length_options(
+            std::ptr::NonNull::new(
+                &scale as *const f32 as *const std::ffi::c_void as *mut std::ffi::c_void,
+            )
+            .unwrap(),
+            4_usize,
+            MTLResourceOptions::StorageModeShared,
+        )
+        .unwrap()
+    };
 
     // Dummy mask buffer if no mask
     let dummy_buf;
     let mask_buf = if let Some(m) = mask_ref {
         m.metal_buffer()
     } else {
-        dummy_buf = dev.newBufferWithLength_options(4_usize, MTLResourceOptions::StorageModeShared).unwrap();
+        dummy_buf = dev
+            .newBufferWithLength_options(4_usize, MTLResourceOptions::StorageModeShared)
+            .unwrap();
         &dummy_buf
     };
     let mask_offset = mask_ref.map_or(0, |m| m.offset()) as usize;
@@ -3528,14 +3543,33 @@ pub fn sdpa(
     if use_decode {
         // Decode kernel: single threadgroup
         let tg_size = std::cmp::min(DECODE_THREADS, pipeline.maxTotalThreadsPerThreadgroup());
-        encoder.dispatch_threadgroups(MTLSize { width: 1, height: 1, depth: 1 }, MTLSize { width: tg_size, height: 1, depth: 1 });
+        encoder.dispatch_threadgroups(
+            MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: tg_size,
+                height: 1,
+                depth: 1,
+            },
+        );
     } else {
         // General kernel: one threadgroup per Q block
         let n_threadgroups = n.div_ceil(BR);
         let tg_size = std::cmp::min(THREADS_PER_TG, pipeline.maxTotalThreadsPerThreadgroup());
         encoder.dispatch_threadgroups(
-            MTLSize { width: n_threadgroups, height: 1, depth: 1 },
-            MTLSize { width: tg_size, height: 1, depth: 1 },
+            MTLSize {
+                width: n_threadgroups,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: tg_size,
+                height: 1,
+                depth: 1,
+            },
         );
     }
 
@@ -3723,7 +3757,9 @@ fn sdpa_encode_impl(
     let mask_buf = if let Some(m) = mask {
         m.metal_buffer()
     } else {
-        dummy_buf = dev.newBufferWithLength_options(4_usize, MTLResourceOptions::StorageModeShared).unwrap();
+        dummy_buf = dev
+            .newBufferWithLength_options(4_usize, MTLResourceOptions::StorageModeShared)
+            .unwrap();
         &dummy_buf
     };
     let mask_offset = mask.map_or(0, |m| m.offset());
@@ -3734,19 +3770,46 @@ fn sdpa_encode_impl(
     encoder.set_buffer(sdpa_slot::V as u32, Some(v.metal_buffer()), v.offset());
     encoder.set_buffer(sdpa_slot::OUT as u32, Some(out.metal_buffer()), 0);
     encoder.set_buffer(sdpa_slot::MASK as u32, Some(mask_buf), mask_offset);
-    encoder.set_bytes(sdpa_slot::PARAMS as u32, params.as_ptr() as *const std::ffi::c_void, 20);
-    encoder.set_bytes(sdpa_slot::SCALE as u32, &scale as *const f32 as *const std::ffi::c_void, 4);
+    encoder.set_bytes(
+        sdpa_slot::PARAMS as u32,
+        params.as_ptr() as *const std::ffi::c_void,
+        20,
+    );
+    encoder.set_bytes(
+        sdpa_slot::SCALE as u32,
+        &scale as *const f32 as *const std::ffi::c_void,
+        4,
+    );
     if use_decode {
         // Decode kernel: single threadgroup
         let tg_size = std::cmp::min(DECODE_THREADS, pipeline.maxTotalThreadsPerThreadgroup());
-        encoder.dispatch_threadgroups(MTLSize { width: 1, height: 1, depth: 1 }, MTLSize { width: tg_size, height: 1, depth: 1 });
+        encoder.dispatch_threadgroups(
+            MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: tg_size,
+                height: 1,
+                depth: 1,
+            },
+        );
     } else {
         // General kernel: one threadgroup per Q block
         let n_threadgroups = n.div_ceil(BR);
         let tg_size = std::cmp::min(THREADS_PER_TG, pipeline.maxTotalThreadsPerThreadgroup());
         encoder.dispatch_threadgroups(
-            MTLSize { width: n_threadgroups, height: 1, depth: 1 },
-            MTLSize { width: tg_size, height: 1, depth: 1 },
+            MTLSize {
+                width: n_threadgroups,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: tg_size,
+                height: 1,
+                depth: 1,
+            },
         );
     }
 
@@ -3916,7 +3979,9 @@ pub fn sdpa_prefill_gqa_slab_into_cb(
     let mask_buf = if let Some(m) = mask {
         m.metal_buffer()
     } else {
-        dummy_buf = dev.newBufferWithLength_options(4_usize, MTLResourceOptions::StorageModeShared).unwrap();
+        dummy_buf = dev
+            .newBufferWithLength_options(4_usize, MTLResourceOptions::StorageModeShared)
+            .unwrap();
         &dummy_buf
     };
     let mask_offset = mask.map_or(0, |m| m.offset());
@@ -3924,17 +3989,48 @@ pub fn sdpa_prefill_gqa_slab_into_cb(
     let raw_enc = cb.computeCommandEncoder().unwrap();
     let encoder = ComputePass::new(&raw_enc);
     encoder.set_pipeline(&pipeline);
-    encoder.set_buffer(sdpa_slot::Q as u32, Some(q_slab.metal_buffer()), q_slab.offset());
-    encoder.set_buffer(sdpa_slot::K as u32, Some(k_slab.metal_buffer()), k_slab.offset());
-    encoder.set_buffer(sdpa_slot::V as u32, Some(v_slab.metal_buffer()), v_slab.offset());
+    encoder.set_buffer(
+        sdpa_slot::Q as u32,
+        Some(q_slab.metal_buffer()),
+        q_slab.offset(),
+    );
+    encoder.set_buffer(
+        sdpa_slot::K as u32,
+        Some(k_slab.metal_buffer()),
+        k_slab.offset(),
+    );
+    encoder.set_buffer(
+        sdpa_slot::V as u32,
+        Some(v_slab.metal_buffer()),
+        v_slab.offset(),
+    );
     encoder.set_buffer(sdpa_slot::OUT as u32, Some(out.metal_buffer()), 0);
     encoder.set_buffer(sdpa_slot::MASK as u32, Some(mask_buf), mask_offset);
-    encoder.set_bytes(sdpa_slot::PARAMS as u32, params.as_ptr() as *const std::ffi::c_void, std::mem::size_of::<[u32; 10]>());
-    encoder.set_bytes(sdpa_slot::SCALE as u32, &scale as *const f32 as *const std::ffi::c_void, 4);
+    encoder.set_bytes(
+        sdpa_slot::PARAMS as u32,
+        params.as_ptr() as *const std::ffi::c_void,
+        std::mem::size_of::<[u32; 10]>(),
+    );
+    encoder.set_bytes(
+        sdpa_slot::SCALE as u32,
+        &scale as *const f32 as *const std::ffi::c_void,
+        4,
+    );
     // Grid: 1D, n_q_blocks * num_kv_heads threadgroups
     let total_tgs = n_q_blocks * num_kv_heads;
     let tg_size = std::cmp::min(THREADS_PER_TG, pipeline.maxTotalThreadsPerThreadgroup());
-    encoder.dispatch_threadgroups(MTLSize { width: total_tgs, height: 1, depth: 1 }, MTLSize { width: tg_size, height: 1, depth: 1 });
+    encoder.dispatch_threadgroups(
+        MTLSize {
+            width: total_tgs,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        },
+    );
     encoder.end();
 
     Ok(out)
@@ -4020,7 +4116,9 @@ pub fn sdpa_prefill_mma_f16_into_cb(
     let mask_metal_buf = if let Some(m) = mask {
         m.metal_buffer()
     } else {
-        dummy_buf = dev.newBufferWithLength_options(4_usize, MTLResourceOptions::StorageModeShared).unwrap();
+        dummy_buf = dev
+            .newBufferWithLength_options(4_usize, MTLResourceOptions::StorageModeShared)
+            .unwrap();
         &dummy_buf
     };
     let mask_offset = mask.map_or(0, |m| m.offset());
@@ -4028,9 +4126,21 @@ pub fn sdpa_prefill_mma_f16_into_cb(
     let raw_enc = cb.computeCommandEncoder().unwrap();
     let encoder = ComputePass::new(&raw_enc);
     encoder.set_pipeline(&pipeline);
-    encoder.set_buffer(sdpa_mma::Q as u32, Some(q_slab.metal_buffer()), q_slab.offset());
-    encoder.set_buffer(sdpa_mma::K as u32, Some(k_slab.metal_buffer()), k_slab.offset());
-    encoder.set_buffer(sdpa_mma::V as u32, Some(v_slab.metal_buffer()), v_slab.offset());
+    encoder.set_buffer(
+        sdpa_mma::Q as u32,
+        Some(q_slab.metal_buffer()),
+        q_slab.offset(),
+    );
+    encoder.set_buffer(
+        sdpa_mma::K as u32,
+        Some(k_slab.metal_buffer()),
+        k_slab.offset(),
+    );
+    encoder.set_buffer(
+        sdpa_mma::V as u32,
+        Some(v_slab.metal_buffer()),
+        v_slab.offset(),
+    );
     encoder.set_buffer(sdpa_mma::OUT as u32, Some(out.metal_buffer()), 0);
     encoder.set_buffer(sdpa_mma::MASK as u32, Some(mask_metal_buf), mask_offset);
     encoder.set_val(sdpa_mma::N as u32, &n_val);
@@ -4050,8 +4160,16 @@ pub fn sdpa_prefill_mma_f16_into_cb(
     let n_q_blocks = seq_len.div_ceil(MMA_BQ);
     let tg_size = std::cmp::min(MMA_THREADS, pipeline.maxTotalThreadsPerThreadgroup());
     encoder.dispatch_threadgroups(
-        MTLSize { width: n_q_blocks, height: num_heads, depth: 1 },
-        MTLSize { width: tg_size, height: 1, depth: 1 },
+        MTLSize {
+            width: n_q_blocks,
+            height: num_heads,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        },
     );
     encoder.end();
 
@@ -4163,7 +4281,9 @@ pub fn sdpa_prefill_mma_bk32_f16_into_cb(
     let mask_metal_buf = if let Some(m) = mask {
         m.metal_buffer()
     } else {
-        dummy_buf = dev.newBufferWithLength_options(4_usize, MTLResourceOptions::StorageModeShared).unwrap();
+        dummy_buf = dev
+            .newBufferWithLength_options(4_usize, MTLResourceOptions::StorageModeShared)
+            .unwrap();
         &dummy_buf
     };
     let mask_offset = mask.map_or(0, |m| m.offset());
@@ -4171,9 +4291,21 @@ pub fn sdpa_prefill_mma_bk32_f16_into_cb(
     let raw_enc = cb.computeCommandEncoder().unwrap();
     let encoder = ComputePass::new(&raw_enc);
     encoder.set_pipeline(&pipeline);
-    encoder.set_buffer(sdpa_mma::Q as u32, Some(q_slab.metal_buffer()), q_slab.offset());
-    encoder.set_buffer(sdpa_mma::K as u32, Some(k_slab.metal_buffer()), k_slab.offset());
-    encoder.set_buffer(sdpa_mma::V as u32, Some(v_slab.metal_buffer()), v_slab.offset());
+    encoder.set_buffer(
+        sdpa_mma::Q as u32,
+        Some(q_slab.metal_buffer()),
+        q_slab.offset(),
+    );
+    encoder.set_buffer(
+        sdpa_mma::K as u32,
+        Some(k_slab.metal_buffer()),
+        k_slab.offset(),
+    );
+    encoder.set_buffer(
+        sdpa_mma::V as u32,
+        Some(v_slab.metal_buffer()),
+        v_slab.offset(),
+    );
     encoder.set_buffer(sdpa_mma::OUT as u32, Some(out.metal_buffer()), 0);
     encoder.set_buffer(sdpa_mma::MASK as u32, Some(mask_metal_buf), mask_offset);
     encoder.set_val(sdpa_mma::N as u32, &n_val);
@@ -4192,8 +4324,16 @@ pub fn sdpa_prefill_mma_bk32_f16_into_cb(
     let n_q_blocks = seq_len.div_ceil(MMA_BQ);
     let tg_size = MMA_THREADS;
     encoder.dispatch_threadgroups(
-        MTLSize { width: n_q_blocks, height: num_heads, depth: 1 },
-        MTLSize { width: tg_size, height: 1, depth: 1 },
+        MTLSize {
+            width: n_q_blocks,
+            height: num_heads,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        },
     );
     encoder.end();
 
@@ -4268,9 +4408,21 @@ pub fn sdpa_prefill_nax_f16_into_cb(
     let raw_enc = cb.computeCommandEncoder().unwrap();
     let encoder = ComputePass::new(&raw_enc);
     encoder.set_pipeline(&pipeline);
-    encoder.set_buffer(sdpa_nax::Q as u32, Some(q_slab.metal_buffer()), q_slab.offset());
-    encoder.set_buffer(sdpa_nax::K as u32, Some(k_slab.metal_buffer()), k_slab.offset());
-    encoder.set_buffer(sdpa_nax::V as u32, Some(v_slab.metal_buffer()), v_slab.offset());
+    encoder.set_buffer(
+        sdpa_nax::Q as u32,
+        Some(q_slab.metal_buffer()),
+        q_slab.offset(),
+    );
+    encoder.set_buffer(
+        sdpa_nax::K as u32,
+        Some(k_slab.metal_buffer()),
+        k_slab.offset(),
+    );
+    encoder.set_buffer(
+        sdpa_nax::V as u32,
+        Some(v_slab.metal_buffer()),
+        v_slab.offset(),
+    );
     encoder.set_buffer(sdpa_nax::OUT as u32, Some(out.metal_buffer()), 0);
     encoder.set_val(sdpa_nax::N as u32, &n_val);
     encoder.set_val(sdpa_nax::S as u32, &s_val);
@@ -4289,8 +4441,16 @@ pub fn sdpa_prefill_nax_f16_into_cb(
     let n_q_blocks = seq_len.div_ceil(NAX_BQ);
     let tg_size = std::cmp::min(NAX_THREADS, pipeline.maxTotalThreadsPerThreadgroup());
     encoder.dispatch_threadgroups(
-        MTLSize { width: n_q_blocks, height: num_heads, depth: 1 },
-        MTLSize { width: tg_size, height: 1, depth: 1 },
+        MTLSize {
+            width: n_q_blocks,
+            height: num_heads,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        },
     );
     encoder.end();
 
@@ -4373,22 +4533,55 @@ pub fn sdpa_prefill_gqa_slab_encode(
     let mask_buf = if let Some(m) = mask {
         m.metal_buffer()
     } else {
-        dummy_buf = dev.newBufferWithLength_options(4_usize, MTLResourceOptions::StorageModeShared).unwrap();
+        dummy_buf = dev
+            .newBufferWithLength_options(4_usize, MTLResourceOptions::StorageModeShared)
+            .unwrap();
         &dummy_buf
     };
     let mask_offset = mask.map_or(0, |m| m.offset());
 
     encoder.set_pipeline(&pipeline);
-    encoder.set_buffer(sdpa_slot::Q as u32, Some(q_slab.metal_buffer()), q_slab.offset());
-    encoder.set_buffer(sdpa_slot::K as u32, Some(k_slab.metal_buffer()), k_slab.offset());
-    encoder.set_buffer(sdpa_slot::V as u32, Some(v_slab.metal_buffer()), v_slab.offset());
+    encoder.set_buffer(
+        sdpa_slot::Q as u32,
+        Some(q_slab.metal_buffer()),
+        q_slab.offset(),
+    );
+    encoder.set_buffer(
+        sdpa_slot::K as u32,
+        Some(k_slab.metal_buffer()),
+        k_slab.offset(),
+    );
+    encoder.set_buffer(
+        sdpa_slot::V as u32,
+        Some(v_slab.metal_buffer()),
+        v_slab.offset(),
+    );
     encoder.set_buffer(sdpa_slot::OUT as u32, Some(out.metal_buffer()), 0);
     encoder.set_buffer(sdpa_slot::MASK as u32, Some(mask_buf), mask_offset);
-    encoder.set_bytes(sdpa_slot::PARAMS as u32, params.as_ptr() as *const std::ffi::c_void, std::mem::size_of::<[u32; 10]>());
-    encoder.set_bytes(sdpa_slot::SCALE as u32, &scale as *const f32 as *const std::ffi::c_void, 4);
+    encoder.set_bytes(
+        sdpa_slot::PARAMS as u32,
+        params.as_ptr() as *const std::ffi::c_void,
+        std::mem::size_of::<[u32; 10]>(),
+    );
+    encoder.set_bytes(
+        sdpa_slot::SCALE as u32,
+        &scale as *const f32 as *const std::ffi::c_void,
+        4,
+    );
     let total_tgs = n_q_blocks * num_kv_heads;
     let tg_size = std::cmp::min(THREADS_PER_TG, pipeline.maxTotalThreadsPerThreadgroup());
-    encoder.dispatch_threadgroups(MTLSize { width: total_tgs, height: 1, depth: 1 }, MTLSize { width: tg_size, height: 1, depth: 1 });
+    encoder.dispatch_threadgroups(
+        MTLSize {
+            width: total_tgs,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        },
+    );
 
     Ok(out)
 }
@@ -4460,15 +4653,29 @@ pub fn sdpa_prefill_mma_f16_encode(
     let mask_metal_buf = if let Some(m) = mask {
         m.metal_buffer()
     } else {
-        dummy_buf = dev.newBufferWithLength_options(4_usize, MTLResourceOptions::StorageModeShared).unwrap();
+        dummy_buf = dev
+            .newBufferWithLength_options(4_usize, MTLResourceOptions::StorageModeShared)
+            .unwrap();
         &dummy_buf
     };
     let mask_offset = mask.map_or(0, |m| m.offset());
 
     encoder.set_pipeline(&pipeline);
-    encoder.set_buffer(sdpa_mma::Q as u32, Some(q_slab.metal_buffer()), q_slab.offset());
-    encoder.set_buffer(sdpa_mma::K as u32, Some(k_slab.metal_buffer()), k_slab.offset());
-    encoder.set_buffer(sdpa_mma::V as u32, Some(v_slab.metal_buffer()), v_slab.offset());
+    encoder.set_buffer(
+        sdpa_mma::Q as u32,
+        Some(q_slab.metal_buffer()),
+        q_slab.offset(),
+    );
+    encoder.set_buffer(
+        sdpa_mma::K as u32,
+        Some(k_slab.metal_buffer()),
+        k_slab.offset(),
+    );
+    encoder.set_buffer(
+        sdpa_mma::V as u32,
+        Some(v_slab.metal_buffer()),
+        v_slab.offset(),
+    );
     encoder.set_buffer(sdpa_mma::OUT as u32, Some(out.metal_buffer()), 0);
     encoder.set_buffer(sdpa_mma::MASK as u32, Some(mask_metal_buf), mask_offset);
     encoder.set_val(sdpa_mma::N as u32, &n_val);
@@ -4487,8 +4694,16 @@ pub fn sdpa_prefill_mma_f16_encode(
     let n_q_blocks = seq_len.div_ceil(MMA_BQ);
     let tg_size = std::cmp::min(MMA_THREADS, pipeline.maxTotalThreadsPerThreadgroup());
     encoder.dispatch_threadgroups(
-        MTLSize { width: n_q_blocks, height: num_heads, depth: 1 },
-        MTLSize { width: tg_size, height: 1, depth: 1 },
+        MTLSize {
+            width: n_q_blocks,
+            height: num_heads,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        },
     );
 
     Ok(out)
@@ -4587,15 +4802,29 @@ pub fn sdpa_prefill_mma_bk32_f16_encode(
     let mask_metal_buf = if let Some(m) = mask {
         m.metal_buffer()
     } else {
-        dummy_buf = dev.newBufferWithLength_options(4_usize, MTLResourceOptions::StorageModeShared).unwrap();
+        dummy_buf = dev
+            .newBufferWithLength_options(4_usize, MTLResourceOptions::StorageModeShared)
+            .unwrap();
         &dummy_buf
     };
     let mask_offset = mask.map_or(0, |m| m.offset());
 
     encoder.set_pipeline(&pipeline);
-    encoder.set_buffer(sdpa_mma::Q as u32, Some(q_slab.metal_buffer()), q_slab.offset());
-    encoder.set_buffer(sdpa_mma::K as u32, Some(k_slab.metal_buffer()), k_slab.offset());
-    encoder.set_buffer(sdpa_mma::V as u32, Some(v_slab.metal_buffer()), v_slab.offset());
+    encoder.set_buffer(
+        sdpa_mma::Q as u32,
+        Some(q_slab.metal_buffer()),
+        q_slab.offset(),
+    );
+    encoder.set_buffer(
+        sdpa_mma::K as u32,
+        Some(k_slab.metal_buffer()),
+        k_slab.offset(),
+    );
+    encoder.set_buffer(
+        sdpa_mma::V as u32,
+        Some(v_slab.metal_buffer()),
+        v_slab.offset(),
+    );
     encoder.set_buffer(sdpa_mma::OUT as u32, Some(out.metal_buffer()), 0);
     encoder.set_buffer(sdpa_mma::MASK as u32, Some(mask_metal_buf), mask_offset);
     encoder.set_val(sdpa_mma::N as u32, &n_val);
@@ -4614,8 +4843,16 @@ pub fn sdpa_prefill_mma_bk32_f16_encode(
     let n_q_blocks = seq_len.div_ceil(MMA_BQ);
     let tg_size = MMA_THREADS;
     encoder.dispatch_threadgroups(
-        MTLSize { width: n_q_blocks, height: num_heads, depth: 1 },
-        MTLSize { width: tg_size, height: 1, depth: 1 },
+        MTLSize {
+            width: n_q_blocks,
+            height: num_heads,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        },
     );
 
     Ok(out)
@@ -4682,9 +4919,21 @@ pub fn sdpa_prefill_nax_f16_encode(
     let d_val = head_dim as u32;
 
     encoder.set_pipeline(&pipeline);
-    encoder.set_buffer(sdpa_nax::Q as u32, Some(q_slab.metal_buffer()), q_slab.offset());
-    encoder.set_buffer(sdpa_nax::K as u32, Some(k_slab.metal_buffer()), k_slab.offset());
-    encoder.set_buffer(sdpa_nax::V as u32, Some(v_slab.metal_buffer()), v_slab.offset());
+    encoder.set_buffer(
+        sdpa_nax::Q as u32,
+        Some(q_slab.metal_buffer()),
+        q_slab.offset(),
+    );
+    encoder.set_buffer(
+        sdpa_nax::K as u32,
+        Some(k_slab.metal_buffer()),
+        k_slab.offset(),
+    );
+    encoder.set_buffer(
+        sdpa_nax::V as u32,
+        Some(v_slab.metal_buffer()),
+        v_slab.offset(),
+    );
     encoder.set_buffer(sdpa_nax::OUT as u32, Some(out.metal_buffer()), 0);
     encoder.set_val(sdpa_nax::N as u32, &n_val);
     encoder.set_val(sdpa_nax::S as u32, &s_val);
@@ -4702,8 +4951,16 @@ pub fn sdpa_prefill_nax_f16_encode(
     let n_q_blocks = seq_len.div_ceil(NAX_BQ);
     let tg_size = std::cmp::min(NAX_THREADS, pipeline.maxTotalThreadsPerThreadgroup());
     encoder.dispatch_threadgroups(
-        MTLSize { width: n_q_blocks, height: num_heads, depth: 1 },
-        MTLSize { width: tg_size, height: 1, depth: 1 },
+        MTLSize {
+            width: n_q_blocks,
+            height: num_heads,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        },
     );
 
     Ok(out)
@@ -4742,7 +4999,18 @@ pub fn sdpa_nax_diag_qkt_into_cb(
     encoder.set_val(sdpa_diag_qkt::D as u32, &d_val);
     encoder.set_val(sdpa_diag_qkt::SCALE as u32, &scale);
     // Single threadgroup: 128 threads (4 SG), processes up to 64 Q rows
-    encoder.dispatch_threadgroups(MTLSize { width: 1, height: 1, depth: 1 }, MTLSize { width: 128, height: 1, depth: 1 });
+    encoder.dispatch_threadgroups(
+        MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 128,
+            height: 1,
+            depth: 1,
+        },
+    );
     encoder.end();
 
     Ok(out)
@@ -4764,10 +5032,33 @@ pub fn sdpa_nax_diag_single_mma_into_cb(
     let raw_enc = cb.computeCommandEncoder().unwrap();
     let encoder = ComputePass::new(&raw_enc);
     encoder.set_pipeline(&pipeline);
-    encoder.set_buffer(sdpa_diag_single_mma::Q as u32, Some(q.metal_buffer()), q.offset());
-    encoder.set_buffer(sdpa_diag_single_mma::K as u32, Some(k.metal_buffer()), k.offset());
-    encoder.set_buffer(sdpa_diag_single_mma::OUT as u32, Some(out.metal_buffer()), 0);
-    encoder.dispatch_threadgroups(MTLSize { width: 1, height: 1, depth: 1 }, MTLSize { width: 128, height: 1, depth: 1 });
+    encoder.set_buffer(
+        sdpa_diag_single_mma::Q as u32,
+        Some(q.metal_buffer()),
+        q.offset(),
+    );
+    encoder.set_buffer(
+        sdpa_diag_single_mma::K as u32,
+        Some(k.metal_buffer()),
+        k.offset(),
+    );
+    encoder.set_buffer(
+        sdpa_diag_single_mma::OUT as u32,
+        Some(out.metal_buffer()),
+        0,
+    );
+    encoder.dispatch_threadgroups(
+        MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 128,
+            height: 1,
+            depth: 1,
+        },
+    );
     encoder.end();
 
     Ok(out)
@@ -4946,7 +5237,9 @@ pub fn sdpa_decode_batched_slab_stride_into_cb(
     let mask_buf = if let Some(m) = mask {
         m.metal_buffer()
     } else {
-        dummy_buf = dev.newBufferWithLength_options(4_usize, MTLResourceOptions::StorageModeShared).unwrap();
+        dummy_buf = dev
+            .newBufferWithLength_options(4_usize, MTLResourceOptions::StorageModeShared)
+            .unwrap();
         &dummy_buf
     };
     let mask_offset = mask.map_or(0, |m| m.offset());
@@ -4954,18 +5247,46 @@ pub fn sdpa_decode_batched_slab_stride_into_cb(
     let raw_enc = cb.computeCommandEncoder().unwrap();
     let encoder = ComputePass::new(&raw_enc);
     encoder.set_pipeline(&pipeline);
-    encoder.set_buffer(sdpa_slot::Q as u32, Some(q_slab.metal_buffer()), q_slab.offset());
-    encoder.set_buffer(sdpa_slot::K as u32, Some(k_slab.metal_buffer()), k_slab.offset());
-    encoder.set_buffer(sdpa_slot::V as u32, Some(v_slab.metal_buffer()), v_slab.offset());
+    encoder.set_buffer(
+        sdpa_slot::Q as u32,
+        Some(q_slab.metal_buffer()),
+        q_slab.offset(),
+    );
+    encoder.set_buffer(
+        sdpa_slot::K as u32,
+        Some(k_slab.metal_buffer()),
+        k_slab.offset(),
+    );
+    encoder.set_buffer(
+        sdpa_slot::V as u32,
+        Some(v_slab.metal_buffer()),
+        v_slab.offset(),
+    );
     encoder.set_buffer(sdpa_slot::OUT as u32, Some(out.metal_buffer()), 0);
     encoder.set_buffer(sdpa_slot::MASK as u32, Some(mask_buf), mask_offset);
-    encoder.set_bytes(sdpa_slot::PARAMS as u32, params.as_ptr() as *const std::ffi::c_void, std::mem::size_of::<[u32; 6]>());
-    encoder.set_bytes(sdpa_slot::SCALE as u32, &scale as *const f32 as *const std::ffi::c_void, 4);
+    encoder.set_bytes(
+        sdpa_slot::PARAMS as u32,
+        params.as_ptr() as *const std::ffi::c_void,
+        std::mem::size_of::<[u32; 6]>(),
+    );
+    encoder.set_bytes(
+        sdpa_slot::SCALE as u32,
+        &scale as *const f32 as *const std::ffi::c_void,
+        4,
+    );
     // One threadgroup per Q head, 256 threads each
     let tg_size = std::cmp::min(DECODE_THREADS, pipeline.maxTotalThreadsPerThreadgroup());
     encoder.dispatch_threadgroups(
-        MTLSize { width: num_heads, height: 1, depth: 1 },
-        MTLSize { width: tg_size, height: 1, depth: 1 },
+        MTLSize {
+            width: num_heads,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        },
     );
     encoder.end();
 
@@ -5098,24 +5419,54 @@ pub fn sdpa_decode_batched_slab_stride_into_encoder(
     let mask_buf = if let Some(m) = mask {
         m.metal_buffer()
     } else {
-        dummy_buf = dev.newBufferWithLength_options(4_usize, MTLResourceOptions::StorageModeShared).unwrap();
+        dummy_buf = dev
+            .newBufferWithLength_options(4_usize, MTLResourceOptions::StorageModeShared)
+            .unwrap();
         &dummy_buf
     };
     let mask_offset = mask.map_or(0, |m| m.offset());
 
     encoder.set_pipeline(&pipeline);
-    encoder.set_buffer(sdpa_slot::Q as u32, Some(q_slab.metal_buffer()), q_slab.offset());
-    encoder.set_buffer(sdpa_slot::K as u32, Some(k_slab.metal_buffer()), k_slab.offset());
-    encoder.set_buffer(sdpa_slot::V as u32, Some(v_slab.metal_buffer()), v_slab.offset());
+    encoder.set_buffer(
+        sdpa_slot::Q as u32,
+        Some(q_slab.metal_buffer()),
+        q_slab.offset(),
+    );
+    encoder.set_buffer(
+        sdpa_slot::K as u32,
+        Some(k_slab.metal_buffer()),
+        k_slab.offset(),
+    );
+    encoder.set_buffer(
+        sdpa_slot::V as u32,
+        Some(v_slab.metal_buffer()),
+        v_slab.offset(),
+    );
     encoder.set_buffer(sdpa_slot::OUT as u32, Some(out.metal_buffer()), 0);
     encoder.set_buffer(sdpa_slot::MASK as u32, Some(mask_buf), mask_offset);
-    encoder.set_bytes(sdpa_slot::PARAMS as u32, params.as_ptr() as *const std::ffi::c_void, std::mem::size_of::<[u32; 6]>());
-    encoder.set_bytes(sdpa_slot::SCALE as u32, &scale as *const f32 as *const std::ffi::c_void, 4);
+    encoder.set_bytes(
+        sdpa_slot::PARAMS as u32,
+        params.as_ptr() as *const std::ffi::c_void,
+        std::mem::size_of::<[u32; 6]>(),
+    );
+    encoder.set_bytes(
+        sdpa_slot::SCALE as u32,
+        &scale as *const f32 as *const std::ffi::c_void,
+        4,
+    );
     // One threadgroup per Q head, 256 threads each
     let tg_size = std::cmp::min(DECODE_THREADS, pipeline.maxTotalThreadsPerThreadgroup());
     encoder.dispatch_threadgroups(
-        MTLSize { width: num_heads, height: 1, depth: 1 },
-        MTLSize { width: tg_size, height: 1, depth: 1 },
+        MTLSize {
+            width: num_heads,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        },
     );
 
     Ok(out)
@@ -5164,12 +5515,28 @@ pub fn sdpa_decode_preresolved_into_encoder(
     encoder.set_buffer(sdpa_slot::V as u32, Some(v_buf), v_offset);
     encoder.set_buffer(sdpa_slot::OUT as u32, Some(out_buf), out_offset);
     encoder.set_buffer(sdpa_slot::MASK as u32, Some(mask_buf), mask_offset);
-    encoder.set_bytes(sdpa_slot::PARAMS as u32, params.as_ptr() as *const std::ffi::c_void, std::mem::size_of::<[u32; 6]>());
-    encoder.set_bytes(sdpa_slot::SCALE as u32, &scale as *const f32 as *const std::ffi::c_void, 4);
+    encoder.set_bytes(
+        sdpa_slot::PARAMS as u32,
+        params.as_ptr() as *const std::ffi::c_void,
+        std::mem::size_of::<[u32; 6]>(),
+    );
+    encoder.set_bytes(
+        sdpa_slot::SCALE as u32,
+        &scale as *const f32 as *const std::ffi::c_void,
+        4,
+    );
     let tg_size = std::cmp::min(DECODE_THREADS, pso.maxTotalThreadsPerThreadgroup());
     encoder.dispatch_threadgroups(
-        MTLSize { width: num_heads as usize, height: 1, depth: 1 },
-        MTLSize { width: tg_size, height: 1, depth: 1 },
+        MTLSize {
+            width: num_heads as usize,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        },
     );
 }
 

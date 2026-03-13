@@ -6,12 +6,12 @@
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
-use rmlx_metal::MTLSize;
-use rmlx_metal::ComputePass;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::MTLComputePipelineState as _;
 use objc2_metal::MTLCommandBuffer as _;
 use objc2_metal::MTLCommandQueue as _;
+use objc2_metal::MTLComputePipelineState as _;
+use rmlx_metal::ComputePass;
+use rmlx_metal::MTLSize;
 
 // ---------------------------------------------------------------------------
 // Metal shader source
@@ -133,8 +133,16 @@ pub fn select(
     encoder.set_buffer(1, Some(a.metal_buffer()), a.offset());
     encoder.set_buffer(2, Some(b.metal_buffer()), b.offset());
     encoder.set_buffer(3, Some(out.metal_buffer()), out.offset());
-    let grid_size = MTLSize { width: numel, height: 1, depth: 1 };
-    let threadgroup_size = MTLSize { width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), numel), height: 1, depth: 1 };
+    let grid_size = MTLSize {
+        width: numel,
+        height: 1,
+        depth: 1,
+    };
+    let threadgroup_size = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), numel),
+        height: 1,
+        depth: 1,
+    };
     encoder.dispatch_threads(grid_size, threadgroup_size);
     encoder.end();
     super::commit_with_mode(&command_buffer, super::ExecMode::Sync);

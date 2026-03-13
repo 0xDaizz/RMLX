@@ -15,13 +15,13 @@
 
 use std::time::{Duration, Instant};
 
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLCommandBuffer as _, MTLCommandQueue as _, MTLDevice as _};
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::KernelRegistry;
 use rmlx_core::ops;
 use rmlx_metal::device::GpuDevice;
-use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLDevice as _, MTLCommandQueue as _, MTLCommandBuffer as _};
 
 const WARMUP_ITERS: usize = 5;
 const BENCH_ITERS: usize = 20;
@@ -92,7 +92,11 @@ fn f32_to_f16_bits(val: f32) -> u16 {
     ((sign << 15) | (new_exp as u32) << 10 | (frac >> 13)) as u16
 }
 
-fn rand_array(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, shape: &[usize], seed: u64) -> Array {
+fn rand_array(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    shape: &[usize],
+    seed: u64,
+) -> Array {
     let numel: usize = shape.iter().product();
     let mut f16_bytes = Vec::with_capacity(numel * 2);
     let mut state = seed;

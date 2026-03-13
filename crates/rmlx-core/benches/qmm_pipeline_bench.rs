@@ -20,16 +20,16 @@
 use std::time::{Duration, Instant};
 
 use half::f16;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLCommandBuffer as _, MTLCommandQueue as _, MTLDevice as _};
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::KernelRegistry;
 use rmlx_core::ops;
 use rmlx_core::ops::quantized::QuantizedWeight;
 use rmlx_metal::device::GpuDevice;
+use rmlx_metal::MTLResourceOptions;
 use std::ptr::NonNull;
-use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLDevice as _, MTLCommandQueue as _, MTLCommandBuffer as _};
-use rmlx_metal::{MTLResourceOptions};
 
 const WARMUP_ITERS: usize = 5;
 const BENCH_ITERS: usize = 20;
@@ -99,7 +99,11 @@ fn lcg_next(state: &mut u64) -> u64 {
     *state
 }
 
-fn rand_f16_array(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, shape: &[usize], seed: u64) -> Array {
+fn rand_f16_array(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    shape: &[usize],
+    seed: u64,
+) -> Array {
     let numel: usize = shape.iter().product();
     let mut state = seed;
     let mut f16_bytes = Vec::with_capacity(numel * 2);
@@ -132,8 +136,15 @@ fn make_quantized_weight(
             v as u32
         })
         .collect();
-    let weights_buf =
-        unsafe { device.newBufferWithBytes_length_options(NonNull::new(w_data.as_ptr() as *const _ as *mut _).unwrap(), (num_u32s * 4) as u64 as usize, opts).unwrap() };
+    let weights_buf = unsafe {
+        device
+            .newBufferWithBytes_length_options(
+                NonNull::new(w_data.as_ptr() as *const _ as *mut _).unwrap(),
+                (num_u32s * 4) as u64 as usize,
+                opts,
+            )
+            .unwrap()
+    };
 
     let num_groups = total_elements / group_size as usize;
     let scales_f32: Vec<f32> = (0..num_groups)
@@ -159,8 +170,24 @@ fn make_quantized_weight(
         .map(|&v| rmlx_core::ops::quantized::f32_to_f16_bits(v))
         .collect();
 
-    let scales_buf = unsafe { device.newBufferWithBytes_length_options(NonNull::new(scales_data.as_ptr() as *const _ as *mut _).unwrap(), (num_groups * 2) as u64 as usize, opts).unwrap() };
-    let biases_buf = unsafe { device.newBufferWithBytes_length_options(NonNull::new(biases_data.as_ptr() as *const _ as *mut _).unwrap(), (num_groups * 2) as u64 as usize, opts).unwrap() };
+    let scales_buf = unsafe {
+        device
+            .newBufferWithBytes_length_options(
+                NonNull::new(scales_data.as_ptr() as *const _ as *mut _).unwrap(),
+                (num_groups * 2) as u64 as usize,
+                opts,
+            )
+            .unwrap()
+    };
+    let biases_buf = unsafe {
+        device
+            .newBufferWithBytes_length_options(
+                NonNull::new(biases_data.as_ptr() as *const _ as *mut _).unwrap(),
+                (num_groups * 2) as u64 as usize,
+                opts,
+            )
+            .unwrap()
+    };
 
     QuantizedWeight::new(
         weights_buf,
@@ -240,9 +267,10 @@ fn bench_pipeline(
     for _ in 0..WARMUP_ITERS {
         let cb = queue.commandBufferWithUnretainedReferences().unwrap();
         for _ in 0..N_LAYERS {
-            let _ =
-                ops::quantized::affine_quantized_matmul_batched_into_cb(registry, &x, &qw_gate, &cb)
-                    .expect("Pipeline warmup gate failed");
+            let _ = ops::quantized::affine_quantized_matmul_batched_into_cb(
+                registry, &x, &qw_gate, &cb,
+            )
+            .expect("Pipeline warmup gate failed");
             let _ =
                 ops::quantized::affine_quantized_matmul_batched_into_cb(registry, &x, &qw_up, &cb)
                     .expect("Pipeline warmup up failed");
@@ -261,9 +289,10 @@ fn bench_pipeline(
         let cb = queue.commandBufferWithUnretainedReferences().unwrap();
         let start = Instant::now();
         for _ in 0..N_LAYERS {
-            let _ =
-                ops::quantized::affine_quantized_matmul_batched_into_cb(registry, &x, &qw_gate, &cb)
-                    .expect("Pipeline bench gate failed");
+            let _ = ops::quantized::affine_quantized_matmul_batched_into_cb(
+                registry, &x, &qw_gate, &cb,
+            )
+            .expect("Pipeline bench gate failed");
             let _ =
                 ops::quantized::affine_quantized_matmul_batched_into_cb(registry, &x, &qw_up, &cb)
                     .expect("Pipeline bench up failed");

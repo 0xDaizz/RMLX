@@ -30,7 +30,7 @@ use rmlx_core::formats::gguf::{self, GgmlType, GgufError, GgufFile, GgufTensorIn
 
 use crate::quantized_linear::KQuantType;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLDevice};
+use objc2_metal::MTLDevice;
 
 /// Error type for GGUF weight loading.
 #[derive(Debug)]

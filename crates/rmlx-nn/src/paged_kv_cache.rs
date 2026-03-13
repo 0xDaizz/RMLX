@@ -8,9 +8,9 @@
 use std::collections::HashMap;
 
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
-use rmlx_metal::{MtlBuffer, MtlDevice};
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
+use rmlx_metal::{MtlBuffer, MtlDevice};
 
 // ---------------------------------------------------------------------------
 // BlockId
@@ -499,7 +499,8 @@ impl PagedKvCache {
         let total_bytes = seq_len * token_row_bytes;
 
         // Allocate output buffer.
-        let out_buffer = bm.device
+        let out_buffer = bm
+            .device
             .newBufferWithLength_options(total_bytes.max(1), MTLResourceOptions::StorageModeShared)
             .expect("failed to allocate output buffer");
 
@@ -680,8 +681,7 @@ mod tests {
     use super::*;
 
     fn test_device() -> MtlDevice {
-        objc2_metal::MTLCreateSystemDefaultDevice()
-            .expect("no Metal device available")
+        objc2_metal::MTLCreateSystemDefaultDevice().expect("no Metal device available")
     }
 
     // Helper: create a block manager with small parameters for testing.

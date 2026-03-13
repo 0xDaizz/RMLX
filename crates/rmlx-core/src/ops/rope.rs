@@ -19,13 +19,13 @@
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
-use rmlx_metal::MTLSize;
-use rmlx_metal::ComputePass;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLBuffer;
-use objc2_metal::MTLComputePipelineState as _;
 use objc2_metal::MTLCommandBuffer as _;
 use objc2_metal::MTLCommandQueue as _;
+use objc2_metal::MTLComputePipelineState as _;
+use rmlx_metal::ComputePass;
+use rmlx_metal::MTLSize;
 
 // ---------------------------------------------------------------------------
 // Metal shader source
@@ -1204,8 +1204,10 @@ pub fn rope_ext(
     encoder.set_pipeline(&pipeline);
     {
         let bufs: [Option<&ProtocolObject<dyn MTLBuffer>>; 4] = [
-            Some(input.metal_buffer()), Some(cos_freqs.metal_buffer()),
-            Some(sin_freqs.metal_buffer()), Some(out.metal_buffer()),
+            Some(input.metal_buffer()),
+            Some(cos_freqs.metal_buffer()),
+            Some(sin_freqs.metal_buffer()),
+            Some(out.metal_buffer()),
         ];
         let offsets: [usize; 4] = [input.offset(), cos_freqs.offset(), sin_freqs.offset(), 0];
         encoder.set_buffers(0, &bufs, &offsets);
@@ -1216,8 +1218,16 @@ pub fn rope_ext(
     encoder.set_bytes(7, &scale as *const f32 as *const std::ffi::c_void, 4);
     encoder.set_bytes(8, &trad_u32 as *const u32 as *const std::ffi::c_void, 4);
     encoder.set_bytes(9, &fwd_u32 as *const u32 as *const std::ffi::c_void, 4);
-    let grid = MTLSize { width: half_dim, height: seq_len, depth: n_batch };
-    let tg = MTLSize { width: std::cmp::min(64, half_dim), height: std::cmp::min(16, seq_len), depth: 1 };
+    let grid = MTLSize {
+        width: half_dim,
+        height: seq_len,
+        depth: n_batch,
+    };
+    let tg = MTLSize {
+        width: std::cmp::min(64, half_dim),
+        height: std::cmp::min(16, seq_len),
+        depth: 1,
+    };
     encoder.dispatch_threads(grid, tg);
     encoder.end();
     super::commit_with_mode(&command_buffer, super::ExecMode::Sync);
@@ -1284,9 +1294,8 @@ pub fn rope_otf(
     let encoder = ComputePass::new(&raw_enc);
     encoder.set_pipeline(&pipeline);
     {
-        let bufs: [Option<&ProtocolObject<dyn MTLBuffer>>; 2] = [
-            Some(input.metal_buffer()), Some(out.metal_buffer()),
-        ];
+        let bufs: [Option<&ProtocolObject<dyn MTLBuffer>>; 2] =
+            [Some(input.metal_buffer()), Some(out.metal_buffer())];
         let offsets: [usize; 2] = [input.offset(), 0];
         encoder.set_buffers(0, &bufs, &offsets);
     }
@@ -1298,8 +1307,16 @@ pub fn rope_otf(
     encoder.set_bytes(7, &trad_u32 as *const u32 as *const std::ffi::c_void, 4);
     encoder.set_bytes(8, &fwd_u32 as *const u32 as *const std::ffi::c_void, 4);
     let half_dim = head_dim / 2;
-    let grid = MTLSize { width: half_dim, height: seq_len, depth: n_batch };
-    let tg = MTLSize { width: std::cmp::min(64, half_dim), height: std::cmp::min(16, seq_len), depth: 1 };
+    let grid = MTLSize {
+        width: half_dim,
+        height: seq_len,
+        depth: n_batch,
+    };
+    let tg = MTLSize {
+        width: std::cmp::min(64, half_dim),
+        height: std::cmp::min(16, seq_len),
+        depth: 1,
+    };
     encoder.dispatch_threads(grid, tg);
     encoder.end();
     super::commit_with_mode(&command_buffer, super::ExecMode::Sync);
@@ -1469,8 +1486,10 @@ pub fn rope_ext_into_cb(
     encoder.set_pipeline(&pipeline);
     {
         let bufs: [Option<&ProtocolObject<dyn MTLBuffer>>; 4] = [
-            Some(input.metal_buffer()), Some(cos_freqs.metal_buffer()),
-            Some(sin_freqs.metal_buffer()), Some(out.metal_buffer()),
+            Some(input.metal_buffer()),
+            Some(cos_freqs.metal_buffer()),
+            Some(sin_freqs.metal_buffer()),
+            Some(out.metal_buffer()),
         ];
         let offsets: [usize; 4] = [input.offset(), cos_freqs.offset(), sin_freqs.offset(), 0];
         encoder.set_buffers(0, &bufs, &offsets);
@@ -1481,8 +1500,16 @@ pub fn rope_ext_into_cb(
     encoder.set_bytes(7, &scale as *const f32 as *const std::ffi::c_void, 4);
     encoder.set_bytes(8, &trad_u32 as *const u32 as *const std::ffi::c_void, 4);
     encoder.set_bytes(9, &fwd_u32 as *const u32 as *const std::ffi::c_void, 4);
-    let grid = MTLSize { width: half_dim, height: seq_len, depth: n_batch };
-    let tg = MTLSize { width: std::cmp::min(64, half_dim), height: std::cmp::min(16, seq_len), depth: 1 };
+    let grid = MTLSize {
+        width: half_dim,
+        height: seq_len,
+        depth: n_batch,
+    };
+    let tg = MTLSize {
+        width: std::cmp::min(64, half_dim),
+        height: std::cmp::min(16, seq_len),
+        depth: 1,
+    };
     encoder.dispatch_threads(grid, tg);
     encoder.end();
 
@@ -1565,8 +1592,10 @@ pub fn rope_ext_into_encoder(
     encoder.set_pipeline(&pipeline);
     {
         let bufs: [Option<&ProtocolObject<dyn MTLBuffer>>; 4] = [
-            Some(input.metal_buffer()), Some(cos_freqs.metal_buffer()),
-            Some(sin_freqs.metal_buffer()), Some(out.metal_buffer()),
+            Some(input.metal_buffer()),
+            Some(cos_freqs.metal_buffer()),
+            Some(sin_freqs.metal_buffer()),
+            Some(out.metal_buffer()),
         ];
         let offsets: [usize; 4] = [input.offset(), cos_freqs.offset(), sin_freqs.offset(), 0];
         encoder.set_buffers(0, &bufs, &offsets);
@@ -1577,8 +1606,16 @@ pub fn rope_ext_into_encoder(
     encoder.set_bytes(7, &scale as *const f32 as *const std::ffi::c_void, 4);
     encoder.set_bytes(8, &trad_u32 as *const u32 as *const std::ffi::c_void, 4);
     encoder.set_bytes(9, &fwd_u32 as *const u32 as *const std::ffi::c_void, 4);
-    let grid = MTLSize { width: half_dim, height: seq_len, depth: n_batch };
-    let tg = MTLSize { width: std::cmp::min(64, half_dim), height: std::cmp::min(16, seq_len), depth: 1 };
+    let grid = MTLSize {
+        width: half_dim,
+        height: seq_len,
+        depth: n_batch,
+    };
+    let tg = MTLSize {
+        width: std::cmp::min(64, half_dim),
+        height: std::cmp::min(16, seq_len),
+        depth: 1,
+    };
     encoder.dispatch_threads(grid, tg);
 
     Ok(out)
@@ -1613,9 +1650,8 @@ pub fn rope_ext_preresolved_into_encoder(
     let half_dim = head_dim / 2;
     encoder.set_pipeline(pso);
     {
-        let bufs: [Option<&ProtocolObject<dyn MTLBuffer>>; 4] = [
-            Some(input_buf), Some(cos_buf), Some(sin_buf), Some(out_buf),
-        ];
+        let bufs: [Option<&ProtocolObject<dyn MTLBuffer>>; 4] =
+            [Some(input_buf), Some(cos_buf), Some(sin_buf), Some(out_buf)];
         let offsets: [usize; 4] = [input_offset, cos_offset, sin_offset, out_offset];
         encoder.set_buffers(0, &bufs, &offsets);
     }
@@ -1625,8 +1661,16 @@ pub fn rope_ext_preresolved_into_encoder(
     encoder.set_bytes(7, &scale as *const f32 as *const std::ffi::c_void, 4);
     encoder.set_bytes(8, &traditional as *const u32 as *const std::ffi::c_void, 4);
     encoder.set_bytes(9, &forward as *const u32 as *const std::ffi::c_void, 4);
-    let grid = MTLSize { width: half_dim as usize, height: seq_len as usize, depth: n_batch as usize };
-    let tg = MTLSize { width: std::cmp::min(64, half_dim as usize), height: std::cmp::min(16, seq_len as usize), depth: 1 };
+    let grid = MTLSize {
+        width: half_dim as usize,
+        height: seq_len as usize,
+        depth: n_batch as usize,
+    };
+    let tg = MTLSize {
+        width: std::cmp::min(64, half_dim as usize),
+        height: std::cmp::min(16, seq_len as usize),
+        depth: 1,
+    };
     encoder.dispatch_threads(grid, tg);
 }
 
@@ -1728,8 +1772,10 @@ pub fn rope_multihead(
     encoder.set_pipeline(&pipeline);
     {
         let bufs: [Option<&ProtocolObject<dyn MTLBuffer>>; 4] = [
-            Some(input.metal_buffer()), Some(cos_freqs.metal_buffer()),
-            Some(sin_freqs.metal_buffer()), Some(out.metal_buffer()),
+            Some(input.metal_buffer()),
+            Some(cos_freqs.metal_buffer()),
+            Some(sin_freqs.metal_buffer()),
+            Some(out.metal_buffer()),
         ];
         let offsets: [usize; 4] = [input.offset(), cos_freqs.offset(), sin_freqs.offset(), 0];
         encoder.set_buffers(0, &bufs, &offsets);
@@ -1745,8 +1791,16 @@ pub fn rope_multihead(
     let max_tg = pipeline.maxTotalThreadsPerThreadgroup();
     let tg_x = std::cmp::min(64, half_dim).min(max_tg);
     let tg_y = std::cmp::min(16, seq_len).min(max_tg / tg_x);
-    let tg = MTLSize { width: tg_x, height: tg_y, depth: 1 };
-    let grid = MTLSize { width: half_dim, height: seq_len, depth: num_heads };
+    let tg = MTLSize {
+        width: tg_x,
+        height: tg_y,
+        depth: 1,
+    };
+    let grid = MTLSize {
+        width: half_dim,
+        height: seq_len,
+        depth: num_heads,
+    };
     encoder.dispatch_threads(grid, tg);
     encoder.end();
     super::commit_with_mode(&cb, super::ExecMode::Sync);
@@ -1791,8 +1845,10 @@ pub fn rope_multihead_into_cb(
     encoder.set_pipeline(&pipeline);
     {
         let bufs: [Option<&ProtocolObject<dyn MTLBuffer>>; 4] = [
-            Some(input.metal_buffer()), Some(cos_freqs.metal_buffer()),
-            Some(sin_freqs.metal_buffer()), Some(out.metal_buffer()),
+            Some(input.metal_buffer()),
+            Some(cos_freqs.metal_buffer()),
+            Some(sin_freqs.metal_buffer()),
+            Some(out.metal_buffer()),
         ];
         let offsets: [usize; 4] = [input.offset(), cos_freqs.offset(), sin_freqs.offset(), 0];
         encoder.set_buffers(0, &bufs, &offsets);
@@ -1808,8 +1864,16 @@ pub fn rope_multihead_into_cb(
     let max_tg = pipeline.maxTotalThreadsPerThreadgroup();
     let tg_x = std::cmp::min(64, half_dim).min(max_tg);
     let tg_y = std::cmp::min(16, seq_len).min(max_tg / tg_x);
-    let tg = MTLSize { width: tg_x, height: tg_y, depth: 1 };
-    let grid = MTLSize { width: half_dim, height: seq_len, depth: num_heads };
+    let tg = MTLSize {
+        width: tg_x,
+        height: tg_y,
+        depth: 1,
+    };
+    let grid = MTLSize {
+        width: half_dim,
+        height: seq_len,
+        depth: num_heads,
+    };
     encoder.dispatch_threads(grid, tg);
     encoder.end();
 
@@ -1849,9 +1913,8 @@ pub fn deinterleave_heads(
     let encoder = ComputePass::new(&raw_enc);
     encoder.set_pipeline(&pipeline);
     {
-        let bufs: [Option<&ProtocolObject<dyn MTLBuffer>>; 2] = [
-            Some(input.metal_buffer()), Some(out.metal_buffer()),
-        ];
+        let bufs: [Option<&ProtocolObject<dyn MTLBuffer>>; 2] =
+            [Some(input.metal_buffer()), Some(out.metal_buffer())];
         let offsets: [usize; 2] = [input.offset(), 0];
         encoder.set_buffers(0, &bufs, &offsets);
     }
@@ -1863,8 +1926,16 @@ pub fn deinterleave_heads(
     let max_tg = pipeline.maxTotalThreadsPerThreadgroup();
     let tg_x = std::cmp::min(64, head_dim).min(max_tg);
     let tg_y = std::cmp::min(4, seq_len).min(max_tg / tg_x);
-    let tg = MTLSize { width: tg_x, height: tg_y, depth: 1 };
-    let grid = MTLSize { width: head_dim, height: seq_len, depth: num_heads };
+    let tg = MTLSize {
+        width: tg_x,
+        height: tg_y,
+        depth: 1,
+    };
+    let grid = MTLSize {
+        width: head_dim,
+        height: seq_len,
+        depth: num_heads,
+    };
     encoder.dispatch_threads(grid, tg);
     encoder.end();
     super::commit_with_mode(&cb, super::ExecMode::Sync);
@@ -1901,9 +1972,8 @@ pub fn deinterleave_heads_into_cb(
     let encoder = ComputePass::new(&raw_enc);
     encoder.set_pipeline(&pipeline);
     {
-        let bufs: [Option<&ProtocolObject<dyn MTLBuffer>>; 2] = [
-            Some(input.metal_buffer()), Some(out.metal_buffer()),
-        ];
+        let bufs: [Option<&ProtocolObject<dyn MTLBuffer>>; 2] =
+            [Some(input.metal_buffer()), Some(out.metal_buffer())];
         let offsets: [usize; 2] = [input.offset(), 0];
         encoder.set_buffers(0, &bufs, &offsets);
     }
@@ -1915,8 +1985,16 @@ pub fn deinterleave_heads_into_cb(
     let max_tg = pipeline.maxTotalThreadsPerThreadgroup();
     let tg_x = std::cmp::min(64, head_dim).min(max_tg);
     let tg_y = std::cmp::min(4, seq_len).min(max_tg / tg_x);
-    let tg = MTLSize { width: tg_x, height: tg_y, depth: 1 };
-    let grid = MTLSize { width: head_dim, height: seq_len, depth: num_heads };
+    let tg = MTLSize {
+        width: tg_x,
+        height: tg_y,
+        depth: 1,
+    };
+    let grid = MTLSize {
+        width: head_dim,
+        height: seq_len,
+        depth: num_heads,
+    };
     encoder.dispatch_threads(grid, tg);
     encoder.end();
 
@@ -1951,17 +2029,24 @@ pub fn interleave_heads(
     let encoder = ComputePass::new(&raw_enc);
     encoder.set_pipeline(&pipeline);
     {
-        let bufs: [Option<&ProtocolObject<dyn MTLBuffer>>; 2] = [
-            Some(input.metal_buffer()), Some(out.metal_buffer()),
-        ];
+        let bufs: [Option<&ProtocolObject<dyn MTLBuffer>>; 2] =
+            [Some(input.metal_buffer()), Some(out.metal_buffer())];
         let offsets: [usize; 2] = [input.offset(), 0];
         encoder.set_buffers(0, &bufs, &offsets);
     }
     encoder.set_bytes(2, &seq_u32 as *const u32 as *const std::ffi::c_void, 4);
     encoder.set_bytes(3, &dim_u32 as *const u32 as *const std::ffi::c_void, 4);
     encoder.set_bytes(4, &heads_u32 as *const u32 as *const std::ffi::c_void, 4);
-    let grid = MTLSize { width: head_dim, height: seq_len, depth: num_heads };
-    let tg = MTLSize { width: std::cmp::min(head_dim, 64), height: std::cmp::min(seq_len, 4), depth: 1 };
+    let grid = MTLSize {
+        width: head_dim,
+        height: seq_len,
+        depth: num_heads,
+    };
+    let tg = MTLSize {
+        width: std::cmp::min(head_dim, 64),
+        height: std::cmp::min(seq_len, 4),
+        depth: 1,
+    };
     encoder.dispatch_threads(grid, tg);
     encoder.end();
     super::commit_with_mode(&cb, super::ExecMode::Sync);
@@ -1996,17 +2081,24 @@ pub fn interleave_heads_into_cb(
     let encoder = ComputePass::new(&raw_enc);
     encoder.set_pipeline(&pipeline);
     {
-        let bufs: [Option<&ProtocolObject<dyn MTLBuffer>>; 2] = [
-            Some(input.metal_buffer()), Some(out.metal_buffer()),
-        ];
+        let bufs: [Option<&ProtocolObject<dyn MTLBuffer>>; 2] =
+            [Some(input.metal_buffer()), Some(out.metal_buffer())];
         let offsets: [usize; 2] = [input.offset(), 0];
         encoder.set_buffers(0, &bufs, &offsets);
     }
     encoder.set_bytes(2, &seq_u32 as *const u32 as *const std::ffi::c_void, 4);
     encoder.set_bytes(3, &dim_u32 as *const u32 as *const std::ffi::c_void, 4);
     encoder.set_bytes(4, &heads_u32 as *const u32 as *const std::ffi::c_void, 4);
-    let grid = MTLSize { width: head_dim, height: seq_len, depth: num_heads };
-    let tg = MTLSize { width: std::cmp::min(head_dim, 64), height: std::cmp::min(seq_len, 4), depth: 1 };
+    let grid = MTLSize {
+        width: head_dim,
+        height: seq_len,
+        depth: num_heads,
+    };
+    let tg = MTLSize {
+        width: std::cmp::min(head_dim, 64),
+        height: std::cmp::min(seq_len, 4),
+        depth: 1,
+    };
     encoder.dispatch_threads(grid, tg);
     encoder.end();
 
@@ -2052,8 +2144,10 @@ pub fn rope_multihead_encode(
     encoder.set_pipeline(&pipeline);
     {
         let bufs: [Option<&ProtocolObject<dyn MTLBuffer>>; 4] = [
-            Some(input.metal_buffer()), Some(cos_freqs.metal_buffer()),
-            Some(sin_freqs.metal_buffer()), Some(out.metal_buffer()),
+            Some(input.metal_buffer()),
+            Some(cos_freqs.metal_buffer()),
+            Some(sin_freqs.metal_buffer()),
+            Some(out.metal_buffer()),
         ];
         let offsets: [usize; 4] = [input.offset(), cos_freqs.offset(), sin_freqs.offset(), 0];
         encoder.set_buffers(0, &bufs, &offsets);
@@ -2069,8 +2163,16 @@ pub fn rope_multihead_encode(
     let max_tg = pipeline.maxTotalThreadsPerThreadgroup();
     let tg_x = std::cmp::min(64, half_dim).min(max_tg);
     let tg_y = std::cmp::min(16, seq_len).min(max_tg / tg_x);
-    let tg = MTLSize { width: tg_x, height: tg_y, depth: 1 };
-    let grid = MTLSize { width: half_dim, height: seq_len, depth: num_heads };
+    let tg = MTLSize {
+        width: tg_x,
+        height: tg_y,
+        depth: 1,
+    };
+    let grid = MTLSize {
+        width: half_dim,
+        height: seq_len,
+        depth: num_heads,
+    };
     encoder.dispatch_threads(grid, tg);
 
     Ok(out)
@@ -2103,9 +2205,8 @@ pub fn deinterleave_heads_encode(
 
     encoder.set_pipeline(&pipeline);
     {
-        let bufs: [Option<&ProtocolObject<dyn MTLBuffer>>; 2] = [
-            Some(input.metal_buffer()), Some(out.metal_buffer()),
-        ];
+        let bufs: [Option<&ProtocolObject<dyn MTLBuffer>>; 2] =
+            [Some(input.metal_buffer()), Some(out.metal_buffer())];
         let offsets: [usize; 2] = [input.offset(), 0];
         encoder.set_buffers(0, &bufs, &offsets);
     }
@@ -2117,8 +2218,16 @@ pub fn deinterleave_heads_encode(
     let max_tg = pipeline.maxTotalThreadsPerThreadgroup();
     let tg_x = std::cmp::min(64, head_dim).min(max_tg);
     let tg_y = std::cmp::min(4, seq_len).min(max_tg / tg_x);
-    let tg = MTLSize { width: tg_x, height: tg_y, depth: 1 };
-    let grid = MTLSize { width: head_dim, height: seq_len, depth: num_heads };
+    let tg = MTLSize {
+        width: tg_x,
+        height: tg_y,
+        depth: 1,
+    };
+    let grid = MTLSize {
+        width: head_dim,
+        height: seq_len,
+        depth: num_heads,
+    };
     encoder.dispatch_threads(grid, tg);
 
     Ok(out)
@@ -2149,17 +2258,24 @@ pub fn interleave_heads_encode(
 
     encoder.set_pipeline(&pipeline);
     {
-        let bufs: [Option<&ProtocolObject<dyn MTLBuffer>>; 2] = [
-            Some(input.metal_buffer()), Some(out.metal_buffer()),
-        ];
+        let bufs: [Option<&ProtocolObject<dyn MTLBuffer>>; 2] =
+            [Some(input.metal_buffer()), Some(out.metal_buffer())];
         let offsets: [usize; 2] = [input.offset(), 0];
         encoder.set_buffers(0, &bufs, &offsets);
     }
     encoder.set_bytes(2, &seq_u32 as *const u32 as *const std::ffi::c_void, 4);
     encoder.set_bytes(3, &dim_u32 as *const u32 as *const std::ffi::c_void, 4);
     encoder.set_bytes(4, &heads_u32 as *const u32 as *const std::ffi::c_void, 4);
-    let grid = MTLSize { width: head_dim, height: seq_len, depth: num_heads };
-    let tg = MTLSize { width: std::cmp::min(head_dim, 64), height: std::cmp::min(seq_len, 4), depth: 1 };
+    let grid = MTLSize {
+        width: head_dim,
+        height: seq_len,
+        depth: num_heads,
+    };
+    let tg = MTLSize {
+        width: std::cmp::min(head_dim, 64),
+        height: std::cmp::min(seq_len, 4),
+        depth: 1,
+    };
     encoder.dispatch_threads(grid, tg);
 
     Ok(out)
@@ -2242,8 +2358,10 @@ pub fn rope_qk_batch_into_cb(
     encoder.set_pipeline(&pipeline);
     {
         let bufs: [Option<&ProtocolObject<dyn MTLBuffer>>; 5] = [
-            Some(input.metal_buffer()), Some(cos_freqs.metal_buffer()),
-            Some(sin_freqs.metal_buffer()), Some(out_q.metal_buffer()),
+            Some(input.metal_buffer()),
+            Some(cos_freqs.metal_buffer()),
+            Some(sin_freqs.metal_buffer()),
+            Some(out_q.metal_buffer()),
             Some(out_k.metal_buffer()),
         ];
         let offsets: [usize; 5] = [input.offset(), cos_freqs.offset(), sin_freqs.offset(), 0, 0];
@@ -2258,8 +2376,16 @@ pub fn rope_qk_batch_into_cb(
     let max_tg = pipeline.maxTotalThreadsPerThreadgroup();
     let tg_x = std::cmp::min(64, half_dim).min(max_tg);
     let tg_y = std::cmp::min(16, seq_len).min(max_tg / tg_x);
-    let tg = MTLSize { width: tg_x, height: tg_y, depth: 1 };
-    let grid = MTLSize { width: half_dim, height: seq_len, depth: total_heads };
+    let tg = MTLSize {
+        width: tg_x,
+        height: tg_y,
+        depth: 1,
+    };
+    let grid = MTLSize {
+        width: half_dim,
+        height: seq_len,
+        depth: total_heads,
+    };
     encoder.dispatch_threads(grid, tg);
     encoder.end();
 
@@ -2314,8 +2440,10 @@ pub fn rope_qk_batch_encode(
     encoder.set_pipeline(&pipeline);
     {
         let bufs: [Option<&ProtocolObject<dyn MTLBuffer>>; 5] = [
-            Some(input.metal_buffer()), Some(cos_freqs.metal_buffer()),
-            Some(sin_freqs.metal_buffer()), Some(out_q.metal_buffer()),
+            Some(input.metal_buffer()),
+            Some(cos_freqs.metal_buffer()),
+            Some(sin_freqs.metal_buffer()),
+            Some(out_q.metal_buffer()),
             Some(out_k.metal_buffer()),
         ];
         let offsets: [usize; 5] = [input.offset(), cos_freqs.offset(), sin_freqs.offset(), 0, 0];
@@ -2330,8 +2458,16 @@ pub fn rope_qk_batch_encode(
     let max_tg = pipeline.maxTotalThreadsPerThreadgroup();
     let tg_x = std::cmp::min(64, half_dim).min(max_tg);
     let tg_y = std::cmp::min(16, seq_len).min(max_tg / tg_x);
-    let tg = MTLSize { width: tg_x, height: tg_y, depth: 1 };
-    let grid = MTLSize { width: half_dim, height: seq_len, depth: total_heads };
+    let tg = MTLSize {
+        width: tg_x,
+        height: tg_y,
+        depth: 1,
+    };
+    let grid = MTLSize {
+        width: half_dim,
+        height: seq_len,
+        depth: total_heads,
+    };
     encoder.dispatch_threads(grid, tg);
 
     Ok((out_q, out_k))
@@ -2418,11 +2554,21 @@ pub fn rope_qkv_batch_into_cb(
     encoder.set_pipeline(&pipeline);
     {
         let bufs: [Option<&ProtocolObject<dyn MTLBuffer>>; 6] = [
-            Some(input.metal_buffer()), Some(cos_freqs.metal_buffer()),
-            Some(sin_freqs.metal_buffer()), Some(out_q.metal_buffer()),
-            Some(out_k.metal_buffer()), Some(out_v.metal_buffer()),
+            Some(input.metal_buffer()),
+            Some(cos_freqs.metal_buffer()),
+            Some(sin_freqs.metal_buffer()),
+            Some(out_q.metal_buffer()),
+            Some(out_k.metal_buffer()),
+            Some(out_v.metal_buffer()),
         ];
-        let offsets: [usize; 6] = [input.offset(), cos_freqs.offset(), sin_freqs.offset(), 0, 0, 0];
+        let offsets: [usize; 6] = [
+            input.offset(),
+            cos_freqs.offset(),
+            sin_freqs.offset(),
+            0,
+            0,
+            0,
+        ];
         encoder.set_buffers(0, &bufs, &offsets);
     }
     encoder.set_bytes(6, &seq_u32 as *const u32 as *const std::ffi::c_void, 4);
@@ -2434,8 +2580,16 @@ pub fn rope_qkv_batch_into_cb(
     let max_tg = pipeline.maxTotalThreadsPerThreadgroup();
     let tg_x = std::cmp::min(64, half_dim).min(max_tg);
     let tg_y = std::cmp::min(16, seq_len).min(max_tg / tg_x);
-    let tg = MTLSize { width: tg_x, height: tg_y, depth: 1 };
-    let grid = MTLSize { width: half_dim, height: seq_len, depth: total_heads };
+    let tg = MTLSize {
+        width: tg_x,
+        height: tg_y,
+        depth: 1,
+    };
+    let grid = MTLSize {
+        width: half_dim,
+        height: seq_len,
+        depth: total_heads,
+    };
     encoder.dispatch_threads(grid, tg);
     encoder.end();
 

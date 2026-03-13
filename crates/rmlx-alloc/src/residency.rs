@@ -64,9 +64,7 @@ mod inner {
     ///
     /// MTLBuffer inherits MTLResource which inherits MTLAllocation, so this
     /// is a safe protocol upcast via pointer identity.
-    fn as_allocation(
-        buf: &ProtocolObject<dyn MTLBuffer>,
-    ) -> &ProtocolObject<dyn MTLAllocation> {
+    fn as_allocation(buf: &ProtocolObject<dyn MTLBuffer>) -> &ProtocolObject<dyn MTLAllocation> {
         let ptr: *const ProtocolObject<dyn MTLBuffer> = buf;
         // SAFETY: MTLBuffer : MTLResource : MTLAllocation — the ObjC object
         // behind the protocol pointer implements MTLAllocation. The pointer
@@ -87,11 +85,10 @@ mod inner {
         /// support Metal 3 residency sets.
         pub fn new(device: &ProtocolObject<dyn MTLDevice>) -> Result<Self, ResidencyError> {
             let desc = MTLResidencySetDescriptor::new();
-            let residency_set =
-                device.newResidencySetWithDescriptor_error(&desc).map_err(|e| {
-                    ResidencyError::CreationFailed(format!(
-                        "device may not support Metal 3: {e}"
-                    ))
+            let residency_set = device
+                .newResidencySetWithDescriptor_error(&desc)
+                .map_err(|e| {
+                    ResidencyError::CreationFailed(format!("device may not support Metal 3: {e}"))
                 })?;
 
             Ok(Self {

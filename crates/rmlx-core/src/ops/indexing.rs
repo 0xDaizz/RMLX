@@ -11,14 +11,14 @@ use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
 use objc2::runtime::ProtocolObject;
-use objc2_metal::MTLComputePipelineState as _;
+use objc2_metal::MTLBuffer as _;
 use objc2_metal::MTLCommandBuffer as _;
 use objc2_metal::MTLCommandQueue as _;
+use objc2_metal::MTLComputePipelineState as _;
 use objc2_metal::MTLDevice as _;
-use objc2_metal::MTLBuffer as _;
+use rmlx_metal::ComputePass;
 use rmlx_metal::MTLResourceOptions;
 use rmlx_metal::MTLSize;
-use rmlx_metal::ComputePass;
 
 // ---------------------------------------------------------------------------
 // ScatterOp enum
@@ -372,12 +372,28 @@ kernel void scatter_add_bf16(
 // Rust helper: create a small constant buffer
 // ---------------------------------------------------------------------------
 
-fn make_u32_buf(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, val: u32) -> rmlx_metal::MtlBuffer {
-    unsafe { device.newBufferWithBytes_length_options(std::ptr::NonNull::new(&val as *const u32 as *const std::ffi::c_void as *mut std::ffi::c_void).unwrap(), 4_usize, MTLResourceOptions::StorageModeShared).unwrap() }
+fn make_u32_buf(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    val: u32,
+) -> rmlx_metal::MtlBuffer {
+    unsafe {
+        device
+            .newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(
+                    &val as *const u32 as *const std::ffi::c_void as *mut std::ffi::c_void,
+                )
+                .unwrap(),
+                4_usize,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap()
+    }
 }
 
 // --------------------------------------------------------------------------- // Registration // ---------------------------------------------------------------------------
-pub fn register(registry: &KernelRegistry) -> Result<(), KernelError> { registry.register_jit_source("indexing", INDEXING_SHADER_SOURCE) }
+pub fn register(registry: &KernelRegistry) -> Result<(), KernelError> {
+    registry.register_jit_source("indexing", INDEXING_SHADER_SOURCE)
+}
 // --------------------------------------------------------------------------- // Gather (backward-compatible API) // ---------------------------------------------------------------------------
 /// Gather elements from `src` at the positions given by `indices`. /// /// `output[i] = src[indices[i]]` /// /// * `src`     - 1-D source array (Float32, Float16, or Bfloat16). /// * `indices` - 1-D index array (UInt32). Out-of-bounds indices produce 0. /// /// All bounds checking happens on the GPU -- no host-side readback of indices. pub
 pub fn gather(
@@ -385,8 +401,18 @@ pub fn gather(
     src: &Array,
     indices: &Array,
     queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
-) -> Result<Array, KernelError> { let kernel_name = match src.dtype() { DType::Float32 => "gather_f32", DType::Float16 => "gather_f16", DType::Bfloat16 => "gather_bf16", _ => {
-    return Err(KernelError::NotFound(format!( "gather not supported for {:?}", src.dtype() ))) } };
+) -> Result<Array, KernelError> {
+    let kernel_name = match src.dtype() {
+        DType::Float32 => "gather_f32",
+        DType::Float16 => "gather_f16",
+        DType::Bfloat16 => "gather_bf16",
+        _ => {
+            return Err(KernelError::NotFound(format!(
+                "gather not supported for {:?}",
+                src.dtype()
+            )))
+        }
+    };
 
     if indices.dtype() != DType::UInt32 {
         return Err(KernelError::InvalidShape(format!(
@@ -413,8 +439,16 @@ pub fn gather(
     enc.set_buffer(1, Some(indices.metal_buffer()), indices.offset());
     enc.set_buffer(2, Some(out.metal_buffer()), 0);
     enc.set_buffer(3, Some(&src_size_buf), 0);
-    let grid = MTLSize { width: numel, height: 1, depth: 1 };
-    let tg = MTLSize { width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), numel), height: 1, depth: 1 };
+    let grid = MTLSize {
+        width: numel,
+        height: 1,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), numel),
+        height: 1,
+        depth: 1,
+    };
     enc.dispatch_threads(grid, tg);
     enc.end();
     super::commit_with_mode(&cb, super::ExecMode::Sync);
@@ -476,8 +510,16 @@ pub fn gather_signed(
     enc.set_buffer(1, Some(indices.metal_buffer()), indices.offset());
     enc.set_buffer(2, Some(out.metal_buffer()), 0);
     enc.set_buffer(3, Some(&src_size_buf), 0);
-    let grid = MTLSize { width: numel, height: 1, depth: 1 };
-    let tg = MTLSize { width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), numel), height: 1, depth: 1 };
+    let grid = MTLSize {
+        width: numel,
+        height: 1,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), numel),
+        height: 1,
+        depth: 1,
+    };
     enc.dispatch_threads(grid, tg);
     enc.end();
     super::commit_with_mode(&cb, super::ExecMode::Sync);
@@ -563,10 +605,11 @@ pub fn gather_axis(
     enc.set_buffer(3, Some(&src_dim_buf), 0);
     enc.set_buffer(4, Some(&inner_buf), 0);
     let threads_per_outer = num_indices * inner_size;
-    let tg = MTLSize { width: std::cmp::min(
-            pipeline.maxTotalThreadsPerThreadgroup(),
-            threads_per_outer,
-        ), height: 1, depth: 1 };
+    let tg = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), threads_per_outer),
+        height: 1,
+        depth: 1,
+    };
 
     for o in 0..outer_size {
         let src_offset = (src.offset() + o * src_axis_stride * elem_bytes) as u64;
@@ -574,7 +617,11 @@ pub fn gather_axis(
         enc.set_buffer(0, Some(src.metal_buffer()), src_offset as usize);
         enc.set_buffer(1, Some(indices.metal_buffer()), indices.offset());
         enc.set_buffer(2, Some(out.metal_buffer()), out_offset as usize);
-        let grid = MTLSize { width: threads_per_outer, height: 1, depth: 1 };
+        let grid = MTLSize {
+            width: threads_per_outer,
+            height: 1,
+            depth: 1,
+        };
         enc.dispatch_threads(grid, tg);
     }
 
@@ -691,8 +738,16 @@ pub fn scatter(
     enc.set_buffer(1, Some(indices.metal_buffer()), indices.offset());
     enc.set_buffer(2, Some(out.metal_buffer()), 0);
     enc.set_buffer(3, Some(&out_size_buf), 0);
-    let grid = MTLSize { width: numel, height: 1, depth: 1 };
-    let tg = MTLSize { width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), numel), height: 1, depth: 1 };
+    let grid = MTLSize {
+        width: numel,
+        height: 1,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), numel),
+        height: 1,
+        depth: 1,
+    };
     enc.dispatch_threads(grid, tg);
     enc.end();
     super::commit_with_mode(&cb, super::ExecMode::Sync);

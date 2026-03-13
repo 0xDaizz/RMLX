@@ -18,19 +18,22 @@
 //!
 //! Usage: cargo bench -p rmlx-core --bench lowm_kernel_bench
 
-use std::time::Instant;
 use std::ptr::NonNull;
+use std::time::Instant;
 
 use half::f16;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{
+    MTLCommandBuffer as _, MTLCommandEncoder as _, MTLCommandQueue as _,
+    MTLComputeCommandEncoder as _, MTLDevice as _,
+};
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::KernelRegistry;
 use rmlx_core::ops;
 use rmlx_metal::device::GpuDevice;
-use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLDevice as _, MTLCommandQueue as _, MTLCommandBuffer as _, MTLComputeCommandEncoder as _, MTLCommandEncoder as _};
-use rmlx_metal::{MTLSize, MTLResourceOptions};
 use rmlx_metal::types::{MtlBuffer, MtlPipeline};
+use rmlx_metal::{MTLResourceOptions, MTLSize};
 
 const WARMUP_ITERS: usize = 5;
 const BENCH_ITERS: usize = 20;
@@ -50,7 +53,11 @@ fn lcg_next(state: &mut u64) -> u64 {
     *state
 }
 
-fn rand_f16_array(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, shape: &[usize], seed: u64) -> Array {
+fn rand_f16_array(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    shape: &[usize],
+    seed: u64,
+) -> Array {
     let numel: usize = shape.iter().product();
     let mut state = seed;
     let mut f16_bytes = Vec::with_capacity(numel * 2);
@@ -64,8 +71,18 @@ fn rand_f16_array(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, shape: &[
 }
 
 #[inline(always)]
-fn set_u32(enc: &ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>, index: usize, val: u32) {
-    unsafe { enc.setBytes_length_atIndex(NonNull::new(&val as *const u32 as *const std::ffi::c_void as *mut _).unwrap(), 4_usize, index) };
+fn set_u32(
+    enc: &ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
+    index: usize,
+    val: u32,
+) {
+    unsafe {
+        enc.setBytes_length_atIndex(
+            NonNull::new(&val as *const u32 as *const std::ffi::c_void as *mut _).unwrap(),
+            4_usize,
+            index,
+        )
+    };
 }
 
 fn percentile(sorted: &[f64], pct: f64) -> f64 {
@@ -150,7 +167,11 @@ fn bench_pipelined_gemm(
     let opts = MTLResourceOptions::StorageModeShared;
     let out_size = (m * n * 2) as u64; // f16 = 2 bytes
     let out_bufs: Vec<MtlBuffer> = (0..PIPELINE_N)
-        .map(|_| device.newBufferWithLength_options(out_size as usize, opts).unwrap())
+        .map(|_| {
+            device
+                .newBufferWithLength_options(out_size as usize, opts)
+                .unwrap()
+        })
         .collect();
 
     let m_u32 = m as u32;
@@ -166,8 +187,16 @@ fn bench_pipelined_gemm(
         0
     };
 
-    let grid = MTLSize { width: (n.div_ceil(spec.bn) << swizzle_log) as usize, height: (m.div_ceil(spec.bm) >> swizzle_log) as usize, depth: 1_usize };
-    let tg = MTLSize { width: spec.threads as usize, height: 1_usize, depth: 1_usize };
+    let grid = MTLSize {
+        width: (n.div_ceil(spec.bn) << swizzle_log) as usize,
+        height: (m.div_ceil(spec.bm) >> swizzle_log) as usize,
+        depth: 1_usize,
+    };
+    let tg = MTLSize {
+        width: spec.threads as usize,
+        height: 1_usize,
+        depth: 1_usize,
+    };
 
     // Warmup
     for _ in 0..WARMUP_ITERS {
@@ -256,10 +285,18 @@ fn bench_pipelined_splitk(
     let partial_size = (n_splits * m * n * 4) as u64; // f32
 
     let out_bufs: Vec<MtlBuffer> = (0..PIPELINE_N)
-        .map(|_| device.newBufferWithLength_options(out_size as usize, opts).unwrap())
+        .map(|_| {
+            device
+                .newBufferWithLength_options(out_size as usize, opts)
+                .unwrap()
+        })
         .collect();
     let partial_bufs: Vec<MtlBuffer> = (0..PIPELINE_N)
-        .map(|_| device.newBufferWithLength_options(partial_size as usize, opts).unwrap())
+        .map(|_| {
+            device
+                .newBufferWithLength_options(partial_size as usize, opts)
+                .unwrap()
+        })
         .collect();
 
     let bk = 16usize;
@@ -277,14 +314,30 @@ fn bench_pipelined_splitk(
     let splits_u32 = n_splits as u32;
     let swizzle_log = ops::matmul::compute_swizzle_log(m, n, splitk_bm, splitk_bn);
 
-    let pass1_grid = MTLSize { width: (n.div_ceil(splitk_bn) << swizzle_log) as usize, height: (m.div_ceil(splitk_bm) >> swizzle_log) as usize, depth: n_splits };
-    let pass1_tg = MTLSize { width: 64_usize, height: 1_usize, depth: 1_usize };
+    let pass1_grid = MTLSize {
+        width: (n.div_ceil(splitk_bn) << swizzle_log) as usize,
+        height: (m.div_ceil(splitk_bm) >> swizzle_log) as usize,
+        depth: n_splits,
+    };
+    let pass1_tg = MTLSize {
+        width: 64_usize,
+        height: 1_usize,
+        depth: 1_usize,
+    };
 
     let total_elems = m * n;
     let reduce_tg_size = 256u64;
     let reduce_groups = total_elems.div_ceil(reduce_tg_size as usize) as u64;
-    let reduce_grid = MTLSize { width: reduce_groups as usize, height: 1_usize, depth: 1_usize };
-    let reduce_tg = MTLSize { width: reduce_tg_size as usize, height: 1_usize, depth: 1_usize };
+    let reduce_grid = MTLSize {
+        width: reduce_groups as usize,
+        height: 1_usize,
+        depth: 1_usize,
+    };
+    let reduce_tg = MTLSize {
+        width: reduce_tg_size as usize,
+        height: 1_usize,
+        depth: 1_usize,
+    };
 
     // Warmup
     for _ in 0..WARMUP_ITERS {
@@ -297,8 +350,12 @@ fn bench_pipelined_splitk(
                 {
                     let enc = cb.computeCommandEncoder().unwrap();
                     enc.setComputePipelineState(&pass1_pipeline);
-                    unsafe { enc.setBuffer_offset_atIndex(Some(a.metal_buffer()), 0_usize, 0_usize) };
-                    unsafe { enc.setBuffer_offset_atIndex(Some(b.metal_buffer()), 0_usize, 1_usize) };
+                    unsafe {
+                        enc.setBuffer_offset_atIndex(Some(a.metal_buffer()), 0_usize, 0_usize)
+                    };
+                    unsafe {
+                        enc.setBuffer_offset_atIndex(Some(b.metal_buffer()), 0_usize, 1_usize)
+                    };
                     unsafe { enc.setBuffer_offset_atIndex(Some(partial_buf), 0_usize, 2_usize) };
                     set_u32(&enc, 3, m_u32);
                     set_u32(&enc, 4, n_u32);
@@ -340,8 +397,12 @@ fn bench_pipelined_splitk(
                 {
                     let enc = cb.computeCommandEncoder().unwrap();
                     enc.setComputePipelineState(&pass1_pipeline);
-                    unsafe { enc.setBuffer_offset_atIndex(Some(a.metal_buffer()), 0_usize, 0_usize) };
-                    unsafe { enc.setBuffer_offset_atIndex(Some(b.metal_buffer()), 0_usize, 1_usize) };
+                    unsafe {
+                        enc.setBuffer_offset_atIndex(Some(a.metal_buffer()), 0_usize, 0_usize)
+                    };
+                    unsafe {
+                        enc.setBuffer_offset_atIndex(Some(b.metal_buffer()), 0_usize, 1_usize)
+                    };
                     unsafe { enc.setBuffer_offset_atIndex(Some(partial_buf), 0_usize, 2_usize) };
                     set_u32(&enc, 3, m_u32);
                     set_u32(&enc, 4, n_u32);
@@ -389,8 +450,8 @@ fn bench_pipelined_auto(registry: &KernelRegistry, a: &Array, b: &Array) -> f64 
         let cbs: Vec<_> = (0..PIPELINE_N)
             .map(|_| {
                 let cb = queue.commandBufferWithUnretainedReferences().unwrap();
-                let _out =
-                    ops::matmul::matmul_into_cb(registry, a, b, &cb).expect("matmul_into_cb failed");
+                let _out = ops::matmul::matmul_into_cb(registry, a, b, &cb)
+                    .expect("matmul_into_cb failed");
                 cb.commit();
                 cb
             })
@@ -405,8 +466,8 @@ fn bench_pipelined_auto(registry: &KernelRegistry, a: &Array, b: &Array) -> f64 
         let cbs: Vec<_> = (0..PIPELINE_N)
             .map(|_| {
                 let cb = queue.commandBufferWithUnretainedReferences().unwrap();
-                let _out =
-                    ops::matmul::matmul_into_cb(registry, a, b, &cb).expect("matmul_into_cb failed");
+                let _out = ops::matmul::matmul_into_cb(registry, a, b, &cb)
+                    .expect("matmul_into_cb failed");
                 cb.commit();
                 cb
             })

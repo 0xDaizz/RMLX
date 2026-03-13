@@ -12,9 +12,9 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr::NonNull;
 
-use rmlx_metal::{MTLResourceOptions, MtlBuffer};
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLDevice;
+use rmlx_metal::{MTLResourceOptions, MtlBuffer};
 
 use rmlx_alloc::zero_copy::CompletionTicket;
 use rmlx_alloc::AllocError;
@@ -56,7 +56,11 @@ impl SharedBuffer {
     /// The Metal device reference must remain valid for the lifetime of
     /// the Metal buffer created here. In practice, the device is held by
     /// the caller for the entire session.
-    pub fn new(device: &ProtocolObject<dyn MTLDevice>, size: usize, slot_index: u8) -> Result<Self, AllocError> {
+    pub fn new(
+        device: &ProtocolObject<dyn MTLDevice>,
+        size: usize,
+        slot_index: u8,
+    ) -> Result<Self, AllocError> {
         let alignment: usize = 16384; // Apple Silicon page size
         let aligned_size = align_up(size, alignment);
 
@@ -80,12 +84,14 @@ impl SharedBuffer {
         // SAFETY: raw_ptr is valid for aligned_size bytes from posix_memalign above.
         // The Metal buffer does not take ownership of the memory (NoCopy with None deallocator).
         let metal_buffer = unsafe {
-            device.newBufferWithBytesNoCopy_length_options_deallocator(
-                std::ptr::NonNull::new(raw_ptr.as_ptr() as *mut c_void).unwrap(),
-                aligned_size,
-                MTLResourceOptions::StorageModeShared,
-                None,
-            ).unwrap()
+            device
+                .newBufferWithBytesNoCopy_length_options_deallocator(
+                    std::ptr::NonNull::new(raw_ptr.as_ptr() as *mut c_void).unwrap(),
+                    aligned_size,
+                    MTLResourceOptions::StorageModeShared,
+                    None,
+                )
+                .unwrap()
         };
 
         Ok(Self {
@@ -186,7 +192,10 @@ impl SharedBufferPool {
     ///
     /// The Metal device reference must remain valid for the lifetime of
     /// all Metal buffers created in this pool.
-    pub fn new(device: &ProtocolObject<dyn MTLDevice>, tier_sizes: &[usize]) -> Result<Self, AllocError> {
+    pub fn new(
+        device: &ProtocolObject<dyn MTLDevice>,
+        tier_sizes: &[usize],
+    ) -> Result<Self, AllocError> {
         let mut tiers = Vec::with_capacity(tier_sizes.len());
         for (tier_idx, &size) in tier_sizes.iter().enumerate() {
             let mut buffers = Vec::with_capacity(PIPELINE);

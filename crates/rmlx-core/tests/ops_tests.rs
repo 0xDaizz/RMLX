@@ -276,11 +276,8 @@ fn test_quantized_matmul_vec_size_mismatch() {
         .numel_to_bytes(out_features * in_features)
         .unwrap();
     let weights = Array::new(
-        dev.newBufferWithLength_options(
-            weight_bytes,
-            MTLResourceOptions::StorageModeShared,
-        )
-        .unwrap(),
+        dev.newBufferWithLength_options(weight_bytes, MTLResourceOptions::StorageModeShared)
+            .unwrap(),
         vec![out_features * in_features],
         vec![1],
         DType::Q8_0,
@@ -313,11 +310,8 @@ fn test_quantized_matmul_weights_buffer_too_small() {
         .numel_to_bytes((out_features / 2) * in_features)
         .unwrap();
     let weights = Array::new(
-        dev.newBufferWithLength_options(
-            small_bytes,
-            MTLResourceOptions::StorageModeShared,
-        )
-        .unwrap(),
+        dev.newBufferWithLength_options(small_bytes, MTLResourceOptions::StorageModeShared)
+            .unwrap(),
         vec![(out_features / 2) * in_features],
         vec![1],
         DType::Q8_0,

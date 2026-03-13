@@ -28,7 +28,9 @@ use rmlx_core::ops::buffer_slots::{gemm as gslot, silu_gate as sslot};
 
 use crate::moe::Expert;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLCommandBuffer, MTLCommandQueue, MTLComputePipelineState, MTLDevice, MTLResourceOptions};
+use objc2_metal::{
+    MTLCommandBuffer, MTLCommandQueue, MTLComputePipelineState, MTLDevice, MTLResourceOptions,
+};
 use rmlx_metal::{ComputePass, MTLSize, MtlBuffer};
 
 /// Manages stacked expert weights and provides grouped forward pass.
@@ -207,10 +209,22 @@ impl ExpertGroup {
             let raw_enc = cb.computeCommandEncoder().unwrap();
             let enc = ComputePass::new(&raw_enc);
             enc.set_pipeline(&pipeline);
-            enc.set_buffer(0, Some(gate_t_contig.metal_buffer()), gate_t_contig.offset());
+            enc.set_buffer(
+                0,
+                Some(gate_t_contig.metal_buffer()),
+                gate_t_contig.offset(),
+            );
             enc.set_buffer(1, Some(gate_stacked.metal_buffer()), gate_dst_offset);
-            let grid = MTLSize { width: numel_gate, height: 1, depth: 1 };
-            let tg = MTLSize { width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), numel_gate), height: 1, depth: 1 };
+            let grid = MTLSize {
+                width: numel_gate,
+                height: 1,
+                depth: 1,
+            };
+            let tg = MTLSize {
+                width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), numel_gate),
+                height: 1,
+                depth: 1,
+            };
             enc.dispatch_threads(grid, tg);
             enc.end();
 
@@ -220,8 +234,16 @@ impl ExpertGroup {
             enc.set_pipeline(&pipeline);
             enc.set_buffer(0, Some(up_t_contig.metal_buffer()), up_t_contig.offset());
             enc.set_buffer(1, Some(up_stacked.metal_buffer()), up_dst_offset);
-            let grid = MTLSize { width: numel_up, height: 1, depth: 1 };
-            let tg = MTLSize { width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), numel_up), height: 1, depth: 1 };
+            let grid = MTLSize {
+                width: numel_up,
+                height: 1,
+                depth: 1,
+            };
+            let tg = MTLSize {
+                width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), numel_up),
+                height: 1,
+                depth: 1,
+            };
             enc.dispatch_threads(grid, tg);
             enc.end();
 
@@ -229,10 +251,22 @@ impl ExpertGroup {
             let raw_enc = cb.computeCommandEncoder().unwrap();
             let enc = ComputePass::new(&raw_enc);
             enc.set_pipeline(&pipeline);
-            enc.set_buffer(0, Some(down_t_contig.metal_buffer()), down_t_contig.offset());
+            enc.set_buffer(
+                0,
+                Some(down_t_contig.metal_buffer()),
+                down_t_contig.offset(),
+            );
             enc.set_buffer(1, Some(down_stacked.metal_buffer()), down_dst_offset);
-            let grid = MTLSize { width: numel_down, height: 1, depth: 1 };
-            let tg = MTLSize { width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), numel_down), height: 1, depth: 1 };
+            let grid = MTLSize {
+                width: numel_down,
+                height: 1,
+                depth: 1,
+            };
+            let tg = MTLSize {
+                width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), numel_down),
+                height: 1,
+                depth: 1,
+            };
             enc.dispatch_threads(grid, tg);
             enc.end();
         }
@@ -400,7 +434,7 @@ impl ExpertGroup {
 
             // 1. Gate GEMM: [batch, D] @ [D, inter] -> [batch, inter]
             encode_gemm(
-&cb,
+                &cb,
                 &item.input,
                 &gate_w,
                 &item.gate_out,
@@ -413,7 +447,7 @@ impl ExpertGroup {
 
             // 2. Up GEMM: [batch, D] @ [D, inter] -> [batch, inter]
             encode_gemm(
-&cb,
+                &cb,
                 &item.input,
                 &up_w,
                 &item.up_out,
@@ -426,7 +460,7 @@ impl ExpertGroup {
 
             // 3. Fused SwiGLU: silu(gate_out) * up_out -> silu_out
             encode_silu_gate(
-&cb,
+                &cb,
                 &silu_pipeline,
                 &item.gate_out,
                 &item.up_out,
@@ -436,7 +470,7 @@ impl ExpertGroup {
 
             // 4. Down GEMM: [batch, inter] @ [inter, D] -> [batch, D]
             encode_gemm(
-&cb,
+                &cb,
                 &item.silu_out,
                 &down_w,
                 &item.output,
@@ -605,8 +639,16 @@ fn encode_gemm(
 
     let grid_x = ((n as usize).div_ceil(bn)) << swizzle_log;
     let grid_y = ((m as usize).div_ceil(bm)) >> swizzle_log;
-    let grid = MTLSize { width: grid_x, height: grid_y, depth: 1 };
-    let tg = MTLSize { width: tg_threads, height: 1, depth: 1 };
+    let grid = MTLSize {
+        width: grid_x,
+        height: grid_y,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: tg_threads,
+        height: 1,
+        depth: 1,
+    };
     enc.dispatch_threadgroups(grid, tg);
     enc.end();
     drop(swizzle_log_buf);
@@ -636,15 +678,35 @@ fn encode_silu_gate(
     let raw_enc = cb.computeCommandEncoder().unwrap();
     let enc = ComputePass::new(&raw_enc);
     enc.set_pipeline(pipeline);
-    enc.set_buffer(sslot::GATE_OUT as u32, Some(gate_out.metal_buffer()), gate_out.offset());
-    enc.set_buffer(sslot::UP_OUT as u32, Some(up_out.metal_buffer()), up_out.offset());
-    enc.set_buffer(sslot::OUT as u32, Some(output.metal_buffer()), output.offset());
+    enc.set_buffer(
+        sslot::GATE_OUT as u32,
+        Some(gate_out.metal_buffer()),
+        gate_out.offset(),
+    );
+    enc.set_buffer(
+        sslot::UP_OUT as u32,
+        Some(up_out.metal_buffer()),
+        up_out.offset(),
+    );
+    enc.set_buffer(
+        sslot::OUT as u32,
+        Some(output.metal_buffer()),
+        output.offset(),
+    );
     enc.set_buffer(sslot::NUMEL as u32, Some(&numel_buf), 0);
 
     let tg = std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), grid_threads);
     enc.dispatch_threads(
-        MTLSize { width: grid_threads, height: 1, depth: 1 },
-        MTLSize { width: tg, height: 1, depth: 1 },
+        MTLSize {
+            width: grid_threads,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg,
+            height: 1,
+            depth: 1,
+        },
     );
     enc.end();
 
@@ -653,7 +715,14 @@ fn encode_silu_gate(
 
 /// Create a constant `u32` Metal buffer.
 fn make_u32_buf(device: &ProtocolObject<dyn MTLDevice>, val: u32) -> MtlBuffer {
-    unsafe { device.newBufferWithBytes_length_options(std::ptr::NonNull::new_unchecked(&val as *const u32 as *mut std::ffi::c_void), 4, MTLResourceOptions::StorageModeShared) }.unwrap()
+    unsafe {
+        device.newBufferWithBytes_length_options(
+            std::ptr::NonNull::new_unchecked(&val as *const u32 as *mut std::ffi::c_void),
+            4,
+            MTLResourceOptions::StorageModeShared,
+        )
+    }
+    .unwrap()
 }
 
 #[cfg(test)]

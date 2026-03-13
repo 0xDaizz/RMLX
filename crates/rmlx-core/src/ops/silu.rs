@@ -12,13 +12,13 @@
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
-use rmlx_metal::MTLSize;
-use rmlx_metal::ComputePass;
-use rmlx_macros::rmlx_kernel;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::MTLComputePipelineState as _;
 use objc2_metal::MTLCommandBuffer as _;
 use objc2_metal::MTLCommandQueue as _;
+use objc2_metal::MTLComputePipelineState as _;
+use rmlx_macros::rmlx_kernel;
+use rmlx_metal::ComputePass;
+use rmlx_metal::MTLSize;
 
 /// Metal shader source for SiLU kernels.
 pub const SILU_SHADER_SOURCE: &str = r#"
@@ -365,8 +365,16 @@ pub fn silu(
     encoder.set_val(2, &numel_u32);
     // Grid = ceil(numel / elems_per_thread) threads
     let grid_threads = (numel as usize).div_ceil(elems_per_thread as usize);
-    let grid_size = MTLSize { width: grid_threads, height: 1, depth: 1 };
-    let threadgroup_size = MTLSize { width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), grid_threads), height: 1, depth: 1 };
+    let grid_size = MTLSize {
+        width: grid_threads,
+        height: 1,
+        depth: 1,
+    };
+    let threadgroup_size = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), grid_threads),
+        height: 1,
+        depth: 1,
+    };
     encoder.dispatch_threads(grid_size, threadgroup_size);
     encoder.end();
     super::commit_with_mode(&command_buffer, super::ExecMode::Sync);
@@ -420,8 +428,16 @@ pub fn silu_gate(
     encoder.set_buffer(2, Some(out.metal_buffer()), out.offset());
     encoder.set_val(3, &numel_u32);
     let grid_threads = (numel as usize).div_ceil(elems_per_thread as usize);
-    let grid_size = MTLSize { width: grid_threads, height: 1, depth: 1 };
-    let threadgroup_size = MTLSize { width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), grid_threads), height: 1, depth: 1 };
+    let grid_size = MTLSize {
+        width: grid_threads,
+        height: 1,
+        depth: 1,
+    };
+    let threadgroup_size = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), grid_threads),
+        height: 1,
+        depth: 1,
+    };
     encoder.dispatch_threads(grid_size, threadgroup_size);
     encoder.end();
     super::commit_with_mode(&command_buffer, super::ExecMode::Sync);
@@ -452,8 +468,19 @@ fn silu_encode_impl(
     encoder.set_buffer(0, Some(input.metal_buffer()), input.offset());
     encoder.set_buffer(1, Some(out.metal_buffer()), out.offset());
     encoder.set_val(2, &numel_u32);
-    let threadgroup_size = MTLSize { width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), grid_threads), height: 1, depth: 1 };
-    encoder.dispatch_threads(MTLSize { width: grid_threads, height: 1, depth: 1 }, threadgroup_size);
+    let threadgroup_size = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), grid_threads),
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_threads(
+        MTLSize {
+            width: grid_threads,
+            height: 1,
+            depth: 1,
+        },
+        threadgroup_size,
+    );
 
     Ok(out)
 }

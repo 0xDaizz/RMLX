@@ -28,9 +28,9 @@ use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::KernelRegistry;
 use rmlx_core::ops;
+use rmlx_metal::device::GpuDevice;
 use rmlx_metal::types::{MtlBuffer, MtlPipeline};
 use rmlx_metal::{MTLResourceOptions, MTLSize};
-use rmlx_metal::device::GpuDevice;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -60,10 +60,7 @@ fn rand_f16_array(
     Array::from_bytes(device, &f16_bytes, shape.to_vec(), DType::Float16)
 }
 
-fn make_u32_buf(
-    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
-    val: u32,
-) -> MtlBuffer {
+fn make_u32_buf(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, val: u32) -> MtlBuffer {
     let opts = MTLResourceOptions::StorageModeShared;
     unsafe {
         device

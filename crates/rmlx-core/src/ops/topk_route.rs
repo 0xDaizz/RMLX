@@ -17,14 +17,14 @@ use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
 use crate::ops;
-use rmlx_metal::MTLSize;
-use rmlx_metal::ComputePass;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::MTLComputePipelineState as _;
 use objc2_metal::MTLCommandBuffer as _;
 use objc2_metal::MTLCommandQueue as _;
+use objc2_metal::MTLComputePipelineState as _;
 use objc2_metal::MTLDevice as _;
+use rmlx_metal::ComputePass;
 use rmlx_metal::MTLResourceOptions;
+use rmlx_metal::MTLSize;
 
 // ---------------------------------------------------------------------------
 // Metal shader source
@@ -412,9 +412,21 @@ pub fn register(registry: &KernelRegistry) -> Result<(), KernelError> {
 }
 
 /// Create a u32 Metal constant buffer.
-fn make_u32_buf(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, val: u32) -> rmlx_metal::MtlBuffer {
+fn make_u32_buf(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    val: u32,
+) -> rmlx_metal::MtlBuffer {
     let opts = MTLResourceOptions::StorageModeShared;
-    unsafe { device.newBufferWithBytes_length_options(std::ptr::NonNull::new(&val as *const u32 as *const _ as *mut std::ffi::c_void).unwrap(), 4_usize, opts).unwrap() }
+    unsafe {
+        device
+            .newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(&val as *const u32 as *const _ as *mut std::ffi::c_void)
+                    .unwrap(),
+                4_usize,
+                opts,
+            )
+            .unwrap()
+    }
 }
 
 /// GPU top-k routing: softmax -> top-k -> normalize -> histogram -> prefix scan. /// /// All computation stays on the GPU with zero CPU synchronization. /// /// # Arguments /// - `gate_logits`: Raw gate logits `[N, E]`, Float16 or Float32 (NOT pre-softmaxed). /// - `top_k`: Number of experts to select per token (typically 2 or 8, max 8). /// - `expert_bias`: Optional `[E]` bias added to logits before softmax (adaptive routing). /// - `queue`: Metal command queue for dispatch. /// /// # Returns /// `TopkRouteResult` with expert_indices, expert_weights, expert_counts, and dispatch_offsets. pub
@@ -548,7 +560,9 @@ pub fn gpu_topk_route_into_cb(
         bias_buffer = bias.metal_buffer();
         bias_offset = bias.offset();
     } else {
-        dummy_bias_buf = dev.newBufferWithLength_options(4_usize, MTLResourceOptions::StorageModeShared).unwrap();
+        dummy_bias_buf = dev
+            .newBufferWithLength_options(4_usize, MTLResourceOptions::StorageModeShared)
+            .unwrap();
         bias_buffer = &dummy_bias_buf;
         bias_offset = 0;
     }
@@ -569,7 +583,11 @@ pub fn gpu_topk_route_into_cb(
         let raw_enc = cb.computeCommandEncoder().unwrap();
         let enc = ComputePass::new(&raw_enc);
         enc.set_pipeline(&pipeline);
-        enc.set_buffer(0, Some(gate_logits_f32.metal_buffer()), gate_logits_f32.offset());
+        enc.set_buffer(
+            0,
+            Some(gate_logits_f32.metal_buffer()),
+            gate_logits_f32.offset(),
+        );
         enc.set_buffer(1, Some(bias_buffer), bias_offset);
         enc.set_buffer(2, Some(expert_indices.metal_buffer()), 0);
         enc.set_buffer(3, Some(expert_weights.metal_buffer()), 0);
@@ -577,13 +595,20 @@ pub fn gpu_topk_route_into_cb(
         enc.set_buffer(5, Some(&ne_buf), 0);
         enc.set_buffer(6, Some(&k_buf), 0);
         enc.set_buffer(7, Some(&has_bias_buf), 0);
-        let tg_size =
-            std::cmp::min(256, pipeline.maxTotalThreadsPerThreadgroup());
+        let tg_size = std::cmp::min(256, pipeline.maxTotalThreadsPerThreadgroup());
 
         if seq_len > 0 {
             enc.dispatch_threadgroups(
-                MTLSize { width: seq_len_u32 as usize, height: 1, depth: 1 },
-                MTLSize { width: tg_size, height: 1, depth: 1 },
+                MTLSize {
+                    width: seq_len_u32 as usize,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: tg_size,
+                    height: 1,
+                    depth: 1,
+                },
             );
         }
         enc.end();
@@ -601,7 +626,18 @@ pub fn gpu_topk_route_into_cb(
         enc.set_buffer(0, Some(expert_counts.metal_buffer()), 0);
         enc.set_buffer(1, Some(dispatch_offsets.metal_buffer()), 0);
         enc.set_buffer(2, Some(&ne_buf), 0);
-        enc.dispatch_threadgroups(MTLSize { width: 1, height: 1, depth: 1 }, MTLSize { width: 1, height: 1, depth: 1 });
+        enc.dispatch_threadgroups(
+            MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+        );
         enc.end();
     }
 

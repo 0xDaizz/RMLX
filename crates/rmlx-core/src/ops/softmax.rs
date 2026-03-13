@@ -14,14 +14,14 @@
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
-use rmlx_metal::MTLSize;
-use rmlx_metal::ComputePass;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::MTLComputePipelineState as _;
 use objc2_metal::MTLCommandBuffer as _;
 use objc2_metal::MTLCommandQueue as _;
-use rmlx_metal::MTLResourceOptions;
+use objc2_metal::MTLComputePipelineState as _;
 use objc2_metal::MTLDevice as _;
+use rmlx_metal::ComputePass;
+use rmlx_metal::MTLResourceOptions;
+use rmlx_metal::MTLSize;
 
 /// N_READS: each thread processes 4 consecutive elements per iteration for
 /// better memory coalescing.
@@ -758,7 +758,21 @@ pub fn softmax(
 
     let out = Array::zeros(registry.device().raw(), shape, input.dtype());
 
-    let axis_buf = unsafe { registry.device().raw().newBufferWithBytes_length_options(std::ptr::NonNull::new(&axis_size_u32 as *const u32 as *const std::ffi::c_void as *mut std::ffi::c_void).unwrap(), 4_usize, MTLResourceOptions::StorageModeShared).unwrap() };
+    let axis_buf = unsafe {
+        registry
+            .device()
+            .raw()
+            .newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(
+                    &axis_size_u32 as *const u32 as *const std::ffi::c_void
+                        as *mut std::ffi::c_void,
+                )
+                .unwrap(),
+                4_usize,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap()
+    };
 
     let command_buffer = queue.commandBuffer().unwrap();
     let raw_enc = command_buffer.computeCommandEncoder().unwrap();
@@ -769,8 +783,16 @@ pub fn softmax(
     encoder.set_buffer(2, Some(&axis_buf), 0);
     let tg_size = std::cmp::min(tg_size_hint, pipeline.maxTotalThreadsPerThreadgroup());
     encoder.dispatch_threadgroups(
-        MTLSize { width: num_rows as usize, height: 1, depth: 1 },
-        MTLSize { width: tg_size, height: 1, depth: 1 },
+        MTLSize {
+            width: num_rows as usize,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        },
     );
     encoder.end();
     super::commit_with_mode(&command_buffer, super::ExecMode::Sync);

@@ -13,9 +13,11 @@
 //! Run with:
 //!   cargo bench -p rmlx-nn --bench pipeline_bench
 
-use std::time::{Duration, Instant};
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLCommandBuffer as _, MTLCommandEncoder as _, MTLCommandQueue as _, MTLDevice as _};
+use objc2_metal::{
+    MTLCommandBuffer as _, MTLCommandEncoder as _, MTLCommandQueue as _, MTLDevice as _,
+};
+use std::time::{Duration, Instant};
 
 use rmlx_core::array::Array;
 use rmlx_core::kernels::KernelRegistry;
@@ -112,7 +114,11 @@ impl std::fmt::Display for Stats {
 // ---------------------------------------------------------------------------
 
 #[allow(dead_code)]
-fn rand_array_f32(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, shape: &[usize], seed: u64) -> Array {
+fn rand_array_f32(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    shape: &[usize],
+    seed: u64,
+) -> Array {
     let numel: usize = shape.iter().product();
     let mut data = Vec::with_capacity(numel);
     let mut state = seed;
@@ -155,7 +161,11 @@ fn f32_to_f16_bits(val: f32) -> u16 {
     ((sign << 15) | (new_exp as u32) << 10 | (frac >> 13)) as u16
 }
 
-fn rand_array(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, shape: &[usize], seed: u64) -> Array {
+fn rand_array(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    shape: &[usize],
+    seed: u64,
+) -> Array {
     use rmlx_core::dtype::DType;
     let numel: usize = shape.iter().product();
     let mut f16_bytes = Vec::with_capacity(numel * 2);
@@ -176,7 +186,12 @@ fn rand_array(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, shape: &[usiz
 // ---------------------------------------------------------------------------
 
 #[allow(dead_code)]
-fn make_linear_f32(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, in_f: usize, out_f: usize, seed: u64) -> Linear {
+fn make_linear_f32(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    in_f: usize,
+    out_f: usize,
+    seed: u64,
+) -> Linear {
     let weight = rand_array_f32(device, &[out_f, in_f], seed);
     Linear::from_arrays(
         LinearConfig {
@@ -191,7 +206,9 @@ fn make_linear_f32(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, in_f: us
 }
 
 #[allow(dead_code)]
-fn build_transformer_block_f32(device: &ProtocolObject<dyn objc2_metal::MTLDevice>) -> TransformerBlock {
+fn build_transformer_block_f32(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+) -> TransformerBlock {
     let kv_size = NUM_KV_HEADS * HEAD_DIM;
 
     let q_proj = make_linear_f32(device, HIDDEN_SIZE, HIDDEN_SIZE, 1);
@@ -226,7 +243,12 @@ fn build_transformer_block_f32(device: &ProtocolObject<dyn objc2_metal::MTLDevic
     TransformerBlock::from_parts(0, attention, ffn, norm1_weight, norm2_weight, RMS_NORM_EPS)
 }
 
-fn make_linear(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, in_f: usize, out_f: usize, seed: u64) -> Linear {
+fn make_linear(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    in_f: usize,
+    out_f: usize,
+    seed: u64,
+) -> Linear {
     let weight = rand_array(device, &[out_f, in_f], seed);
     Linear::from_arrays(
         LinearConfig {
@@ -240,7 +262,9 @@ fn make_linear(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, in_f: usize,
     .expect("linear from_arrays")
 }
 
-fn build_transformer_block(device: &ProtocolObject<dyn objc2_metal::MTLDevice>) -> TransformerBlock {
+fn build_transformer_block(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+) -> TransformerBlock {
     use rmlx_core::dtype::DType;
 
     let kv_size = NUM_KV_HEADS * HEAD_DIM;
@@ -292,7 +316,11 @@ fn build_transformer_block(device: &ProtocolObject<dyn objc2_metal::MTLDevice>) 
 /// Time a single operation: warm up `WARMUP_ITERS` times, then measure
 /// `BENCH_ITERS` iterations, each with its own command buffer commit+wait
 /// to capture accurate GPU timing per dispatch.
-fn profile_op<F>(label: &str, queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>, mut op: F) -> Stats
+fn profile_op<F>(
+    label: &str,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
+    mut op: F,
+) -> Stats
 where
     F: FnMut(&ProtocolObject<dyn objc2_metal::MTLCommandBuffer>),
 {
@@ -1889,10 +1917,22 @@ fn main() {
     let eg_fused_per_layer = eg_fused_60_stats.mean / num_layers_60 as f64;
     println!();
     println!("  --- Measured per-layer ---");
-    println!("  ExecGraph 9-dispatch:       {:.1} us/layer", eg_9d_per_layer);
-    println!("  ExecGraph Cached 2-enc:     {:.1} us/layer", eg_cached2_per_layer);
-    println!("  ExecGraph Cached 1-enc:     {:.1} us/layer", eg_cached1_per_layer);
-    println!("  ExecGraph Fused 7-dispatch: {:.1} us/layer", eg_fused_per_layer);
+    println!(
+        "  ExecGraph 9-dispatch:       {:.1} us/layer",
+        eg_9d_per_layer
+    );
+    println!(
+        "  ExecGraph Cached 2-enc:     {:.1} us/layer",
+        eg_cached2_per_layer
+    );
+    println!(
+        "  ExecGraph Cached 1-enc:     {:.1} us/layer",
+        eg_cached1_per_layer
+    );
+    println!(
+        "  ExecGraph Fused 7-dispatch: {:.1} us/layer",
+        eg_fused_per_layer
+    );
     println!("=====================================================");
 
     // ---- Summary comparison ----

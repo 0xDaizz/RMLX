@@ -37,7 +37,10 @@ use rmlx_core::ops;
 
 use crate::linear::{Linear, LinearConfig};
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputePipelineState, MTLDevice};
+use objc2_metal::{
+    MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+    MTLComputePipelineState, MTLDevice,
+};
 use rmlx_metal::{ComputePass, MTLSize};
 
 /// Configuration for Multi-head Latent Attention (MLA).
@@ -609,8 +612,16 @@ impl Mla {
                 enc.set_buffer(0, Some(head_out.metal_buffer()), head_out.offset());
                 enc.set_buffer(1, Some(concat_out.metal_buffer()), dst_col_offset);
                 let count = v_dim;
-                let grid = MTLSize { width: count, height: 1, depth: 1 };
-                let tg = MTLSize { width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), count), height: 1, depth: 1 };
+                let grid = MTLSize {
+                    width: count,
+                    height: 1,
+                    depth: 1,
+                };
+                let tg = MTLSize {
+                    width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), count),
+                    height: 1,
+                    depth: 1,
+                };
                 enc.dispatch_threads(grid, tg);
                 enc.end();
             } else {
@@ -618,13 +629,15 @@ impl Mla {
                 for row in 0..seq_len {
                     let src_off = head_out.offset() + row * head_bytes;
                     let dst_off = row * hidden_bytes + dst_col_offset;
-                    unsafe { blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
-                        head_out.metal_buffer(),
-                        src_off,
-                        concat_out.metal_buffer(),
-                        dst_off,
-                        head_bytes,
-                    ) };
+                    unsafe {
+                        blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                            head_out.metal_buffer(),
+                            src_off,
+                            concat_out.metal_buffer(),
+                            dst_off,
+                            head_bytes,
+                        )
+                    };
                 }
                 blit.endEncoding();
             }
@@ -670,9 +683,21 @@ impl Mla {
         let enc = ComputePass::new(&raw_enc);
         enc.set_pipeline(&pipeline);
         enc.set_buffer(0, Some(src.metal_buffer()), src.offset());
-        enc.set_buffer(1, Some(cache_buf.metal_buffer()), cache_buf.offset() + dst_byte_offset);
-        let grid = MTLSize { width: count, height: 1, depth: 1 };
-        let tg = MTLSize { width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), count), height: 1, depth: 1 };
+        enc.set_buffer(
+            1,
+            Some(cache_buf.metal_buffer()),
+            cache_buf.offset() + dst_byte_offset,
+        );
+        let grid = MTLSize {
+            width: count,
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), count),
+            height: 1,
+            depth: 1,
+        };
         enc.dispatch_threads(grid, tg);
         enc.end();
         cb.commit();

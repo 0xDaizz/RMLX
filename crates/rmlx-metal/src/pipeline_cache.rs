@@ -32,6 +32,12 @@ use crate::pipeline::{apply_function_constants, FunctionConstant};
 use crate::types::*;
 use crate::MetalError;
 
+#[cfg(feature = "metal4")]
+use std::sync::OnceLock;
+
+#[cfg(feature = "metal4")]
+use crate::metal4::compiler::AsyncCompiler;
+
 // ---------------------------------------------------------------------------
 // Typed binding for MTLLibrary.serializeToURL:error: (macOS 14+)
 // ---------------------------------------------------------------------------
@@ -47,20 +53,12 @@ trait MtlLibrarySerializeExt {
     /// # Safety
     /// Caller must ensure the selector exists on this object (check with
     /// `respondsToSelector:` first on older macOS).
-    unsafe fn serializeToURL_error(
-        &self,
-        url: &NSURL,
-        error: Option<&mut *mut NSError>,
-    ) -> bool;
+    unsafe fn serializeToURL_error(&self, url: &NSURL, error: Option<&mut *mut NSError>) -> bool;
 }
 
 #[allow(non_snake_case)]
 impl MtlLibrarySerializeExt for ProtocolObject<dyn MTLLibrary> {
-    unsafe fn serializeToURL_error(
-        &self,
-        url: &NSURL,
-        error: Option<&mut *mut NSError>,
-    ) -> bool {
+    unsafe fn serializeToURL_error(&self, url: &NSURL, error: Option<&mut *mut NSError>) -> bool {
         let err_ptr: *mut *mut NSError = match error {
             Some(p) => p,
             None => std::ptr::null_mut(),
@@ -87,6 +85,9 @@ pub struct DiskPipelineCache {
     cache_dir: PathBuf,
     /// In-memory cache: cache-key -> (Library, HashMap<function_name, PSO>)
     memory: RwLock<HashMap<String, CacheEntry>>,
+    /// Metal 4 async compiler, lazily initialized on first Metal 4 call.
+    #[cfg(feature = "metal4")]
+    mtl4_compiler: OnceLock<AsyncCompiler>,
 }
 
 struct CacheEntry {
@@ -108,20 +109,21 @@ impl DiskPipelineCache {
             device: retain_proto(device),
             cache_dir,
             memory: RwLock::new(HashMap::new()),
+            #[cfg(feature = "metal4")]
+            mtl4_compiler: OnceLock::new(),
         }
     }
 
     /// Create a disk pipeline cache with a custom cache directory.
     ///
     /// Useful for testing or non-standard deployments.
-    pub fn with_cache_dir(
-        device: &ProtocolObject<dyn MTLDevice>,
-        cache_dir: PathBuf,
-    ) -> Self {
+    pub fn with_cache_dir(device: &ProtocolObject<dyn MTLDevice>, cache_dir: PathBuf) -> Self {
         Self {
             device: retain_proto(device),
             cache_dir,
             memory: RwLock::new(HashMap::new()),
+            #[cfg(feature = "metal4")]
+            mtl4_compiler: OnceLock::new(),
         }
     }
 
@@ -225,14 +227,12 @@ impl DiskPipelineCache {
 
     fn load_library_from_disk(&self, path: &std::path::Path) -> Result<MtlLibrary, MetalError> {
         let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
-        self.device
-            .newLibraryWithURL_error(&url)
-            .map_err(|e| {
-                MetalError::LibraryLoad(format!(
-                    "failed to load cached metallib: {}",
-                    e.localizedDescription()
-                ))
-            })
+        self.device.newLibraryWithURL_error(&url).map_err(|e| {
+            MetalError::LibraryLoad(format!(
+                "failed to load cached metallib: {}",
+                e.localizedDescription()
+            ))
+        })
     }
 
     /// Serialize a compiled library to disk using Obj-C
@@ -290,16 +290,146 @@ impl DiskPipelineCache {
             let fcv = MTLFunctionConstantValues::new();
             apply_function_constants(&fcv, constants);
             library
-                .newFunctionWithName_constantValues_error(
-                    &NSString::from_str(function_name),
-                    &fcv,
-                )
+                .newFunctionWithName_constantValues_error(&NSString::from_str(function_name), &fcv)
                 .map_err(|_| MetalError::KernelNotFound(function_name.to_string()))?
         };
 
         self.device
             .newComputePipelineStateWithFunction_error(&function)
             .map_err(|e| MetalError::PipelineCreate(e.localizedDescription().to_string()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Metal 4 async compilation path
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "metal4")]
+impl DiskPipelineCache {
+    /// Lazily obtain or initialize the Metal 4 `AsyncCompiler`.
+    fn mtl4_compiler(&self) -> Result<&AsyncCompiler, MetalError> {
+        if let Some(c) = self.mtl4_compiler.get() {
+            return Ok(c);
+        }
+        let c = AsyncCompiler::new(&self.device)?;
+        // If another thread raced us, just drop our instance and return theirs.
+        let _ = self.mtl4_compiler.set(c);
+        Ok(self.mtl4_compiler.get().unwrap())
+    }
+
+    /// Start PSO compilation via the Metal 4 `MTL4Compiler` and return a
+    /// [`CompileTask`] handle.
+    ///
+    /// The compiled library is persisted to the disk cache and the resulting
+    /// PSO is stored in the in-memory cache before the task handle is
+    /// returned. The `CompileTask` is returned as a "completed" sentinel so
+    /// callers that batch many compilations can use a uniform poll/wait loop.
+    ///
+    /// True non-blocking async dispatch will be added when `objc2-metal`
+    /// exposes the callback-based `MTL4Compiler` API.
+    pub fn compile_pipeline_async(
+        &self,
+        source: &str,
+        fn_name: &str,
+    ) -> Result<crate::metal4::compiler::CompileTask, MetalError> {
+        let compiler = self.mtl4_compiler()?;
+        let library = compiler.compile_library(source)?;
+        let pso = compiler.compile_pipeline(&library, fn_name)?;
+
+        // Persist to disk cache (best-effort).
+        let cache_key = compute_cache_key(source, fn_name, &[]);
+        let metallib_path = self.cache_dir.join(format!("{cache_key}.metallib"));
+        if !metallib_path.exists() {
+            let _ = self.persist_library_to_disk(&library, &metallib_path);
+        }
+
+        // Store in memory cache.
+        if let Ok(mut mem) = self.memory.write() {
+            let pso_clone = retain_proto(&*pso);
+            let entry = mem.entry(cache_key).or_insert_with(|| CacheEntry {
+                library,
+                pipelines: HashMap::new(),
+            });
+            entry.pipelines.insert(fn_name.to_string(), pso_clone);
+        }
+
+        Ok(crate::metal4::compiler::CompileTask::new_completed(pso))
+    }
+
+    /// Get or compile a compute PSO using the Metal 4 compiler, with full
+    /// disk + memory caching.
+    ///
+    /// This is the Metal 4 equivalent of [`get_or_compile`].  Compilation
+    /// goes through `MTL4Compiler` instead of the Metal 3
+    /// `[MTLDevice newLibraryWithSource:options:error:]`, which reduces
+    /// compiler overhead and enables future async compilation support.
+    ///
+    /// Function constants are supported: when `constants` is non-empty, PSO
+    /// creation falls back to the Metal 3 specialization API (the MTL4
+    /// compiler does not change constant specialization semantics).
+    pub fn get_or_compile_metal4(
+        &self,
+        source: &str,
+        fn_name: &str,
+        constants: &[(u32, FunctionConstant)],
+    ) -> Result<MtlPipeline, MetalError> {
+        let cache_key = compute_cache_key(source, fn_name, constants);
+
+        // --- In-memory fast path (read lock) ---
+        {
+            let mem = self.memory.read().map_err(|_| {
+                MetalError::PipelineCreate("disk pipeline cache lock poisoned".to_string())
+            })?;
+            if let Some(entry) = mem.get(&cache_key) {
+                if let Some(pso) = entry.pipelines.get(fn_name) {
+                    return Ok(retain_proto(&**pso));
+                }
+            }
+        }
+
+        // --- Disk / compile path (write lock) ---
+        let mut mem = self.memory.write().map_err(|_| {
+            MetalError::PipelineCreate("disk pipeline cache lock poisoned".to_string())
+        })?;
+
+        // Double-check after acquiring write lock.
+        if let Some(entry) = mem.get(&cache_key) {
+            if let Some(pso) = entry.pipelines.get(fn_name) {
+                return Ok(retain_proto(&**pso));
+            }
+        }
+
+        let metallib_path = self.cache_dir.join(format!("{cache_key}.metallib"));
+
+        // Try loading from disk first (shared with Metal 3 path).
+        let library = if metallib_path.exists() {
+            self.load_library_from_disk(&metallib_path)?
+        } else {
+            // Full miss: compile via MTL4Compiler.
+            let compiler = self.mtl4_compiler()?;
+            let lib = compiler.compile_library(source)?;
+            // Best-effort persist to disk.
+            let _ = self.persist_library_to_disk(&lib, &metallib_path);
+            lib
+        };
+
+        // Create PSO. Without constants, use the MTL4 compiler path;
+        // with constants, fall back to Metal 3 function constants API.
+        let pso = if constants.is_empty() {
+            let compiler = self.mtl4_compiler()?;
+            compiler.compile_pipeline(&library, fn_name)?
+        } else {
+            self.create_pso(&library, fn_name, constants)?
+        };
+
+        let cloned = retain_proto(&*pso);
+        let entry = mem.entry(cache_key).or_insert_with(|| CacheEntry {
+            library,
+            pipelines: HashMap::new(),
+        });
+        entry.pipelines.insert(fn_name.to_string(), pso);
+
+        Ok(cloned)
     }
 }
 

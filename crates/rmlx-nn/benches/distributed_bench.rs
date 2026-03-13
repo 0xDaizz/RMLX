@@ -137,7 +137,11 @@ fn f32_to_f16_bits(val: f32) -> u16 {
     ((sign << 15) | (new_exp as u32) << 10 | (frac >> 13)) as u16
 }
 
-fn rand_array(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, shape: &[usize], seed: u64) -> Array {
+fn rand_array(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    shape: &[usize],
+    seed: u64,
+) -> Array {
     let numel: usize = shape.iter().product();
     let mut f16_bytes = Vec::with_capacity(numel * 2);
     let mut state = seed;
@@ -166,7 +170,12 @@ fn rand_array_ones(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, shape: &
 // Layer construction helpers
 // ---------------------------------------------------------------------------
 
-fn make_linear(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, in_f: usize, out_f: usize, seed: u64) -> Linear {
+fn make_linear(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    in_f: usize,
+    out_f: usize,
+    seed: u64,
+) -> Linear {
     let weight = rand_array(device, &[out_f, in_f], seed);
     Linear::from_arrays(
         LinearConfig {
@@ -181,7 +190,9 @@ fn make_linear(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, in_f: usize,
 }
 
 /// Build a full-size (unsharded) transformer block for baseline measurement.
-fn build_transformer_block(device: &ProtocolObject<dyn objc2_metal::MTLDevice>) -> TransformerBlock {
+fn build_transformer_block(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+) -> TransformerBlock {
     let kv_size = NUM_KV_HEADS * HEAD_DIM;
 
     let q_proj = make_linear(device, HIDDEN_SIZE, HIDDEN_SIZE, 1);
@@ -223,7 +234,10 @@ fn build_transformer_block(device: &ProtocolObject<dyn objc2_metal::MTLDevice>) 
 /// - O: row-parallel (input cols halved)
 /// - gate/up: column-parallel (output rows halved)
 /// - down: row-parallel (input cols halved)
-fn build_sharded_transformer_block(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, rank: u32) -> TransformerBlock {
+fn build_sharded_transformer_block(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    rank: u32,
+) -> TransformerBlock {
     let kv_size = NUM_KV_HEADS * HEAD_DIM;
     let seed_offset = rank as u64 * 100;
 
@@ -471,7 +485,10 @@ fn init_distributed() -> BenchDistCtx {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "distributed")]
-fn bench_allreduce(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, dist: &BenchDistCtx) -> Stats {
+fn bench_allreduce(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    dist: &BenchDistCtx,
+) -> Stats {
     if dist.is_multi_rank {
         println!(
             "\n=== Real RDMA allreduce (rank={}, world_size={}) ===",

@@ -17,14 +17,14 @@
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
-use rmlx_metal::MTLSize;
-use rmlx_metal::ComputePass;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::MTLComputePipelineState as _;
 use objc2_metal::MTLCommandBuffer as _;
 use objc2_metal::MTLCommandQueue as _;
+use objc2_metal::MTLComputePipelineState as _;
 use objc2_metal::MTLDevice as _;
+use rmlx_metal::ComputePass;
 use rmlx_metal::MTLResourceOptions;
+use rmlx_metal::MTLSize;
 
 /// Metal shader source for GELU kernels.
 pub const GELU_SHADER_SOURCE: &str = r#"
@@ -240,8 +240,22 @@ fn gelu_kernel_info(dtype: DType, fast: bool) -> Result<(&'static str, u64), Ker
 }
 
 /// Create a constant `uint` buffer on the device.
-fn make_u32_buf(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, val: u32) -> rmlx_metal::MtlBuffer {
-    unsafe { device.newBufferWithBytes_length_options(std::ptr::NonNull::new(&val as *const u32 as *const std::ffi::c_void as *mut std::ffi::c_void).unwrap(), 4_usize, MTLResourceOptions::StorageModeShared).unwrap() }
+fn make_u32_buf(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    val: u32,
+) -> rmlx_metal::MtlBuffer {
+    unsafe {
+        device
+            .newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(
+                    &val as *const u32 as *const std::ffi::c_void as *mut std::ffi::c_void,
+                )
+                .unwrap(),
+                4_usize,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap()
+    }
 }
 
 // --------------------------------------------------------------------------- // Public API // ---------------------------------------------------------------------------
@@ -271,8 +285,16 @@ pub fn gelu(
     encoder.set_buffer(2, Some(&numel_buf), 0);
     // Grid = ceil(numel / elems_per_thread) threads
     let grid_threads = (numel as usize).div_ceil(elems_per_thread as usize);
-    let grid_size = MTLSize { width: grid_threads, height: 1, depth: 1 };
-    let threadgroup_size = MTLSize { width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), grid_threads), height: 1, depth: 1 };
+    let grid_size = MTLSize {
+        width: grid_threads,
+        height: 1,
+        depth: 1,
+    };
+    let threadgroup_size = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), grid_threads),
+        height: 1,
+        depth: 1,
+    };
     encoder.dispatch_threads(grid_size, threadgroup_size);
     encoder.end();
     super::commit_with_mode(&command_buffer, super::ExecMode::Sync);
@@ -306,8 +328,16 @@ pub fn gelu_fast(
     encoder.set_buffer(2, Some(&numel_buf), 0);
     // Grid = ceil(numel / elems_per_thread) threads
     let grid_threads = (numel as usize).div_ceil(elems_per_thread as usize);
-    let grid_size = MTLSize { width: grid_threads, height: 1, depth: 1 };
-    let threadgroup_size = MTLSize { width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), grid_threads), height: 1, depth: 1 };
+    let grid_size = MTLSize {
+        width: grid_threads,
+        height: 1,
+        depth: 1,
+    };
+    let threadgroup_size = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), grid_threads),
+        height: 1,
+        depth: 1,
+    };
     encoder.dispatch_threads(grid_size, threadgroup_size);
     encoder.end();
     super::commit_with_mode(&command_buffer, super::ExecMode::Sync);

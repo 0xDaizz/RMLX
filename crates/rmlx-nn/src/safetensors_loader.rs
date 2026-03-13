@@ -37,7 +37,7 @@ use safetensors::SafeTensors;
 
 use crate::quantized_linear::{QuantBits, QuantizedLinear};
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLDevice};
+use objc2_metal::MTLDevice;
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -919,8 +919,8 @@ mod tests {
         let path = dir.join("model.safetensors");
         std::fs::write(&path, &serialized).unwrap();
 
-        let device = objc2_metal::MTLCreateSystemDefaultDevice()
-            .expect("system_default Metal device");
+        let device =
+            objc2_metal::MTLCreateSystemDefaultDevice().expect("system_default Metal device");
 
         let wmap = load_safetensors_weights(&device, &path, None).unwrap();
         assert_eq!(wmap.len(), 1);
@@ -950,8 +950,8 @@ mod tests {
         let path = dir.join("model.safetensors");
         std::fs::write(&path, &serialized).unwrap();
 
-        let device = objc2_metal::MTLCreateSystemDefaultDevice()
-            .expect("system_default Metal device");
+        let device =
+            objc2_metal::MTLCreateSystemDefaultDevice().expect("system_default Metal device");
 
         let wmap = load_safetensors_weights(&device, &path, None).unwrap();
         let arr = wmap.get("embed").unwrap();
@@ -1009,8 +1009,8 @@ mod tests {
         let path = dir.join("model.safetensors");
         std::fs::write(&path, &serialized).unwrap();
 
-        let device = objc2_metal::MTLCreateSystemDefaultDevice()
-            .expect("system_default Metal device");
+        let device =
+            objc2_metal::MTLCreateSystemDefaultDevice().expect("system_default Metal device");
 
         let qc = QuantizationConfig {
             bits: 4,

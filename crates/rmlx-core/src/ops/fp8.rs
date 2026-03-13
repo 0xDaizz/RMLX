@@ -31,14 +31,14 @@
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
-use rmlx_metal::MTLSize;
-use rmlx_metal::ComputePass;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::MTLComputePipelineState as _;
 use objc2_metal::MTLCommandBuffer as _;
 use objc2_metal::MTLCommandQueue as _;
+use objc2_metal::MTLComputePipelineState as _;
 use objc2_metal::MTLDevice as _;
+use rmlx_metal::ComputePass;
 use rmlx_metal::MTLResourceOptions;
+use rmlx_metal::MTLSize;
 
 /// Metal shader source for FP8 dequant/quant kernels.
 pub const FP8_SHADER_SOURCE: &str = r#"
@@ -456,11 +456,17 @@ fn validate_2d_fp8e4m3(input: &Array, fn_name: &str) -> Result<(usize, usize), K
 // ---------------------------------------------------------------------------
 
 /// Create a constant `uint` buffer on the device.
-fn make_u32_buf(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, val: u32) -> rmlx_metal::MtlBuffer {
+fn make_u32_buf(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    val: u32,
+) -> rmlx_metal::MtlBuffer {
     unsafe {
         device
             .newBufferWithBytes_length_options(
-                std::ptr::NonNull::new(&val as *const u32 as *const std::ffi::c_void as *mut std::ffi::c_void).unwrap(),
+                std::ptr::NonNull::new(
+                    &val as *const u32 as *const std::ffi::c_void as *mut std::ffi::c_void,
+                )
+                .unwrap(),
                 4_usize,
                 MTLResourceOptions::StorageModeShared,
             )
@@ -469,11 +475,17 @@ fn make_u32_buf(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, val: u32) -
 }
 
 /// Create a constant `float` buffer on the device.
-fn make_f32_buf(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, val: f32) -> rmlx_metal::MtlBuffer {
+fn make_f32_buf(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    val: f32,
+) -> rmlx_metal::MtlBuffer {
     unsafe {
         device
             .newBufferWithBytes_length_options(
-                std::ptr::NonNull::new(&val as *const f32 as *const std::ffi::c_void as *mut std::ffi::c_void).unwrap(),
+                std::ptr::NonNull::new(
+                    &val as *const f32 as *const std::ffi::c_void as *mut std::ffi::c_void,
+                )
+                .unwrap(),
                 4_usize,
                 MTLResourceOptions::StorageModeShared,
             )
@@ -523,8 +535,16 @@ pub fn dequant_fp8e4m3_to_f16(
     enc.set_buffer(1, Some(out.metal_buffer()), out.offset());
     enc.set_buffer(2, Some(&numel_buf), 0);
     let grid_threads = numel.div_ceil(ELEMS_PER_THREAD);
-    let grid_size = MTLSize { width: grid_threads, height: 1, depth: 1 };
-    let threadgroup_size = MTLSize { width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), grid_threads), height: 1, depth: 1 };
+    let grid_size = MTLSize {
+        width: grid_threads,
+        height: 1,
+        depth: 1,
+    };
+    let threadgroup_size = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), grid_threads),
+        height: 1,
+        depth: 1,
+    };
     enc.dispatch_threads(grid_size, threadgroup_size);
     enc.end();
     super::commit_with_mode(&command_buffer, super::ExecMode::Sync);
@@ -567,8 +587,16 @@ pub fn dequant_fp8e5m2_to_f16(
     enc.set_buffer(1, Some(out.metal_buffer()), out.offset());
     enc.set_buffer(2, Some(&numel_buf), 0);
     let grid_threads = numel.div_ceil(ELEMS_PER_THREAD);
-    let grid_size = MTLSize { width: grid_threads, height: 1, depth: 1 };
-    let threadgroup_size = MTLSize { width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), grid_threads), height: 1, depth: 1 };
+    let grid_size = MTLSize {
+        width: grid_threads,
+        height: 1,
+        depth: 1,
+    };
+    let threadgroup_size = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), grid_threads),
+        height: 1,
+        depth: 1,
+    };
     enc.dispatch_threads(grid_size, threadgroup_size);
     enc.end();
     super::commit_with_mode(&command_buffer, super::ExecMode::Sync);
@@ -614,8 +642,16 @@ pub fn quant_f16_to_fp8e4m3(
     enc.set_buffer(2, Some(&numel_buf), 0);
     enc.set_buffer(3, Some(&scale_buf), 0);
     let grid_threads = (numel as usize).div_ceil(ELEMS_PER_THREAD);
-    let grid_size = MTLSize { width: grid_threads, height: 1, depth: 1 };
-    let threadgroup_size = MTLSize { width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), grid_threads), height: 1, depth: 1 };
+    let grid_size = MTLSize {
+        width: grid_threads,
+        height: 1,
+        depth: 1,
+    };
+    let threadgroup_size = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), grid_threads),
+        height: 1,
+        depth: 1,
+    };
     enc.dispatch_threads(grid_size, threadgroup_size);
     enc.end();
     super::commit_with_mode(&command_buffer, super::ExecMode::Sync);
@@ -661,8 +697,16 @@ pub fn quant_f16_to_fp8e5m2(
     enc.set_buffer(2, Some(&numel_buf), 0);
     enc.set_buffer(3, Some(&scale_buf), 0);
     let grid_threads = (numel as usize).div_ceil(ELEMS_PER_THREAD);
-    let grid_size = MTLSize { width: grid_threads, height: 1, depth: 1 };
-    let threadgroup_size = MTLSize { width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), grid_threads), height: 1, depth: 1 };
+    let grid_size = MTLSize {
+        width: grid_threads,
+        height: 1,
+        depth: 1,
+    };
+    let threadgroup_size = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), grid_threads),
+        height: 1,
+        depth: 1,
+    };
     enc.dispatch_threads(grid_size, threadgroup_size);
     enc.end();
     super::commit_with_mode(&command_buffer, super::ExecMode::Sync);
@@ -709,12 +753,17 @@ fn encode_quant_per_token(
         enc.set_buffer(1, Some(scales_out.metal_buffer()), scales_out.offset());
         enc.set_buffer(2, Some(&tokens_buf), 0);
         enc.set_buffer(3, Some(&dim_buf), 0);
-        let grid_size = MTLSize { width: num_tokens, height: 1, depth: 1 };
-        let tg_w = std::cmp::min(
-            num_tokens,
-            scales_pipeline.maxTotalThreadsPerThreadgroup(),
-        );
-        let threadgroup_size = MTLSize { width: tg_w, height: 1, depth: 1 };
+        let grid_size = MTLSize {
+            width: num_tokens,
+            height: 1,
+            depth: 1,
+        };
+        let tg_w = std::cmp::min(num_tokens, scales_pipeline.maxTotalThreadsPerThreadgroup());
+        let threadgroup_size = MTLSize {
+            width: tg_w,
+            height: 1,
+            depth: 1,
+        };
         enc.dispatch_threads(grid_size, threadgroup_size);
         enc.end();
     }
@@ -730,12 +779,17 @@ fn encode_quant_per_token(
         enc.set_buffer(2, Some(scales_out.metal_buffer()), scales_out.offset());
         enc.set_buffer(3, Some(&tokens_buf), 0);
         enc.set_buffer(4, Some(&dim_buf), 0);
-        let grid_size = MTLSize { width: hidden_dim, height: num_tokens, depth: 1 };
-        let tg_w = std::cmp::min(
-            hidden_dim,
-            quant_pipeline.maxTotalThreadsPerThreadgroup(),
-        );
-        let threadgroup_size = MTLSize { width: tg_w, height: 1, depth: 1 };
+        let grid_size = MTLSize {
+            width: hidden_dim,
+            height: num_tokens,
+            depth: 1,
+        };
+        let tg_w = std::cmp::min(hidden_dim, quant_pipeline.maxTotalThreadsPerThreadgroup());
+        let threadgroup_size = MTLSize {
+            width: tg_w,
+            height: 1,
+            depth: 1,
+        };
         enc.dispatch_threads(grid_size, threadgroup_size);
         enc.end();
     }
@@ -789,12 +843,17 @@ fn encode_dequant_per_token(
     enc.set_buffer(2, Some(scales.metal_buffer()), scales.offset());
     enc.set_buffer(3, Some(&tokens_buf), 0);
     enc.set_buffer(4, Some(&dim_buf), 0);
-    let grid_size = MTLSize { width: hidden_dim, height: num_tokens, depth: 1 };
-    let tg_w = std::cmp::min(
-        hidden_dim,
-        pipeline.maxTotalThreadsPerThreadgroup(),
-    );
-    let threadgroup_size = MTLSize { width: tg_w, height: 1, depth: 1 };
+    let grid_size = MTLSize {
+        width: hidden_dim,
+        height: num_tokens,
+        depth: 1,
+    };
+    let tg_w = std::cmp::min(hidden_dim, pipeline.maxTotalThreadsPerThreadgroup());
+    let threadgroup_size = MTLSize {
+        width: tg_w,
+        height: 1,
+        depth: 1,
+    };
     enc.dispatch_threads(grid_size, threadgroup_size);
     enc.end();
 
@@ -903,7 +962,11 @@ mod tests {
         }
     }
 
-    fn make_f16_array(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, data: &[f32], shape: Vec<usize>) -> Array {
+    fn make_f16_array(
+        device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+        data: &[f32],
+        shape: Vec<usize>,
+    ) -> Array {
         let f16_bytes: Vec<u8> = data
             .iter()
             .flat_map(|&v| f32_to_f16_bits(v).to_le_bytes())

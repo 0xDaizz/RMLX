@@ -1,11 +1,11 @@
 //! Linear (fully connected) layer: y = x @ W^T + bias
 
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLCommandBuffer, MTLCommandQueue, MTLComputePipelineState, MTLDevice};
 use rmlx_core::array::Array;
 use rmlx_core::kernels::{KernelError, KernelRegistry};
 use rmlx_core::ops;
 use rmlx_core::ops::buffer_slots::gemm as slot;
-use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLCommandBuffer, MTLCommandQueue, MTLComputePipelineState, MTLDevice};
 use rmlx_metal::{ComputePass, MTLSize};
 
 /// Linear layer configuration.
@@ -167,8 +167,16 @@ impl Linear {
                 enc.set_pipeline(&pipeline);
                 enc.set_buffer(0, Some(bias.metal_buffer()), bias.offset());
                 enc.set_buffer(1, Some(dst_view.metal_buffer()), dst_view.offset());
-                let grid = MTLSize { width: out_f, height: 1, depth: 1 };
-                let tg = MTLSize { width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), out_f), height: 1, depth: 1 };
+                let grid = MTLSize {
+                    width: out_f,
+                    height: 1,
+                    depth: 1,
+                };
+                let tg = MTLSize {
+                    width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), out_f),
+                    height: 1,
+                    depth: 1,
+                };
                 enc.dispatch_threads(grid, tg);
                 enc.end();
             }
@@ -214,7 +222,11 @@ impl Linear {
     /// Call after loading weights and before the inference loop. Weights
     /// become inaccessible to the CPU but may benefit from reduced memory
     /// pressure and faster GPU access.
-    pub fn convert_weights_private(&mut self, device: &ProtocolObject<dyn MTLDevice>, queue: &ProtocolObject<dyn MTLCommandQueue>) {
+    pub fn convert_weights_private(
+        &mut self,
+        device: &ProtocolObject<dyn MTLDevice>,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
+    ) {
         if let Some(w) = self.weight.take() {
             self.weight = Some(w.to_private(device, queue));
         }
@@ -461,9 +473,17 @@ impl Linear {
         let raw_enc = cb.computeCommandEncoder().unwrap();
         let enc = ComputePass::new(&raw_enc);
         enc.set_pipeline(&pipeline);
-        enc.set_buffer(slot::A as u32, Some(input_2d.metal_buffer()), input_2d.offset());
+        enc.set_buffer(
+            slot::A as u32,
+            Some(input_2d.metal_buffer()),
+            input_2d.offset(),
+        );
         enc.set_buffer(slot::B as u32, Some(w_t.metal_buffer()), w_t.offset());
-        enc.set_buffer(slot::OUT as u32, Some(output.metal_buffer()), output.offset());
+        enc.set_buffer(
+            slot::OUT as u32,
+            Some(output.metal_buffer()),
+            output.offset(),
+        );
         enc.set_val(slot::M as u32, &m_u32);
         enc.set_val(slot::N as u32, &n_u32);
         enc.set_val(slot::K as u32, &k_u32);
@@ -505,8 +525,16 @@ impl Linear {
 
         let grid_x = (n.div_ceil(bn)) << swizzle_log;
         let grid_y = (m.div_ceil(bm)) >> swizzle_log;
-        let grid = MTLSize { width: grid_x, height: grid_y, depth: 1 };
-        let tg = MTLSize { width: tg_threads, height: 1, depth: 1 };
+        let grid = MTLSize {
+            width: grid_x,
+            height: grid_y,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: tg_threads,
+            height: 1,
+            depth: 1,
+        };
         enc.dispatch_threadgroups(grid, tg);
         enc.end();
 

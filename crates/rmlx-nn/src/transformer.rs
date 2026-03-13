@@ -12,7 +12,10 @@ use rmlx_metal::exec_graph::ExecGraph;
 
 use crate::attention::{Attention, LayerKvCache};
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandQueue, MTLComputePipelineState, MTLDevice, MTLResourceOptions};
+use objc2_metal::{
+    MTLBuffer, MTLCommandBuffer, MTLCommandQueue, MTLComputePipelineState, MTLDevice,
+    MTLResourceOptions,
+};
 use rmlx_metal::{ComputePass, MTLSize, MtlBuffer, MtlPipeline};
 
 /// Fused norm GEMM is bypassed (separate RMSNorm + matmul) when M <= this threshold.
@@ -445,7 +448,7 @@ impl FeedForward {
                     };
                     let gate_dim = guw_t.shape()[1] / 2;
                     // Memory barrier: GEMM output must be visible
-                        rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
+                    rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
                     ops::fused::fused_silu_mul_strided_encode(registry, &merged, gate_dim, encoder)?
                 } else {
                     // Fallback: separate norm + 2 GEMMs
@@ -456,7 +459,7 @@ impl FeedForward {
                         eps,
                         encoder,
                     )?;
-                        rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
+                    rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
                     let wgate_t = gate_proj.weight_transposed_contiguous()?;
                     let wup_t = up_proj.weight_transposed_contiguous()?;
                     let (gate_out, up_out) = ops::fused::batched_gate_up_encode(
@@ -485,7 +488,10 @@ impl FeedForward {
     /// Merge gate and up projection weights into a single [gate_dim+up_dim, in_features] matrix.
     ///
     /// Must be called once after weights are loaded and before `forward_single_cb_9dispatch`.
-    pub fn prepare_merged_gate_up(&mut self, device: &ProtocolObject<dyn MTLDevice>) -> Result<(), KernelError> {
+    pub fn prepare_merged_gate_up(
+        &mut self,
+        device: &ProtocolObject<dyn MTLDevice>,
+    ) -> Result<(), KernelError> {
         match self {
             FeedForward::Gated {
                 gate_proj,
@@ -543,17 +549,17 @@ impl FeedForward {
                 let elem_size = gate_w.dtype().size_of();
                 let total_bytes = total_rows * cols * elem_size;
 
-                let buf = device.newBufferWithLength_options(
-                    total_bytes,
-                    MTLResourceOptions::StorageModeShared,
-                ).unwrap();
+                let buf = device
+                    .newBufferWithLength_options(total_bytes, MTLResourceOptions::StorageModeShared)
+                    .unwrap();
 
                 unsafe {
                     let dst = buf.contents().as_ptr() as *mut u8;
-                    let gate_src =
-                        (gate_w.metal_buffer().contents().as_ptr() as *const u8).add(gate_w.offset());
+                    let gate_src = (gate_w.metal_buffer().contents().as_ptr() as *const u8)
+                        .add(gate_w.offset());
                     std::ptr::copy_nonoverlapping(gate_src, dst, gate_rows * cols * elem_size);
-                    let up_src = (up_w.metal_buffer().contents().as_ptr() as *const u8).add(up_w.offset());
+                    let up_src =
+                        (up_w.metal_buffer().contents().as_ptr() as *const u8).add(up_w.offset());
                     std::ptr::copy_nonoverlapping(
                         up_src,
                         dst.add(gate_rows * cols * elem_size),
@@ -570,10 +576,9 @@ impl FeedForward {
                 ));
 
                 // Also create transposed merged weight [cols, total_rows] for prefill GEMM.
-                let buf_t = device.newBufferWithLength_options(
-                    total_bytes,
-                    MTLResourceOptions::StorageModeShared,
-                ).unwrap();
+                let buf_t = device
+                    .newBufferWithLength_options(total_bytes, MTLResourceOptions::StorageModeShared)
+                    .unwrap();
                 unsafe {
                     let src = buf.contents().as_ptr() as *const u8;
                     let dst = buf_t.contents().as_ptr() as *mut u8;
@@ -608,7 +613,11 @@ impl FeedForward {
     /// Convert all static weights to `StorageModePrivate` (GPU-only).
     ///
     /// Call after loading weights and before the inference loop.
-    pub fn prepare_weights_private(&mut self, device: &ProtocolObject<dyn MTLDevice>, queue: &ProtocolObject<dyn MTLCommandQueue>) {
+    pub fn prepare_weights_private(
+        &mut self,
+        device: &ProtocolObject<dyn MTLDevice>,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
+    ) {
         match self {
             FeedForward::Gated {
                 gate_proj,
@@ -817,7 +826,7 @@ impl FeedForward {
                     )
                 })?;
                 let gate_up =
-ops::gemv::gemv_into_encoder(registry, gate_up_w, &normed_vec, encoder)?;
+                    ops::gemv::gemv_into_encoder(registry, gate_up_w, &normed_vec, encoder)?;
                 // gate_up is [gate_dim + up_dim] flat
                 let gate_dim = gate_up_w.shape()[0] / 2;
                 let elem_size = gate_up.dtype().size_of();
@@ -843,7 +852,7 @@ ops::gemv::gemv_into_encoder(registry, gate_up_w, &normed_vec, encoder)?;
 
                 // Dispatch 8: silu_mul
                 let hidden =
-ops::fused::fused_silu_mul_into_encoder(registry, &gate, &up, encoder)?;
+                    ops::fused::fused_silu_mul_into_encoder(registry, &gate, &up, encoder)?;
 
                 // Memory barrier: ensure hidden is visible to dispatch 9
                 rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
@@ -871,7 +880,7 @@ ops::fused::fused_silu_mul_into_encoder(registry, &gate, &up, encoder)?;
                     down_w,
                     &hidden_vec,
                     &res_vec,
-encoder,
+                    encoder,
                 )?;
 
                 encoder.end();
@@ -1059,13 +1068,13 @@ encoder,
                     )
                 })?;
                 let gate_up =
-ops::gemv::gemv_into_encoder(registry, gate_up_w, &normed_vec, encoder)?;
+                    ops::gemv::gemv_into_encoder(registry, gate_up_w, &normed_vec, encoder)?;
                 // gate_up is [gate_dim + up_dim] flat
                 let gate_dim = gate_up_w.shape()[0] / 2;
                 let elem_size = gate_up.dtype().size_of();
 
                 // Memory barrier: ensure gate_up is visible to dispatch 8
-rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
+                rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
 
                 // Split into gate and up views
                 let gate = Array::new(
@@ -1085,10 +1094,10 @@ rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
 
                 // Dispatch 8: silu_mul
                 let hidden =
-ops::fused::fused_silu_mul_into_encoder(registry, &gate, &up, encoder)?;
+                    ops::fused::fused_silu_mul_into_encoder(registry, &gate, &up, encoder)?;
 
                 // Memory barrier: ensure hidden is visible to dispatch 9
-rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
+                rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
 
                 // Dispatch 9: gemv_bias(W_down, hidden, residual) — down + residual fused
                 let down_w = down_proj.weight().ok_or_else(|| {
@@ -1113,7 +1122,7 @@ rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
                     down_w,
                     &hidden_vec,
                     &res_vec,
-encoder,
+                    encoder,
                 )?;
 
                 encoder.end();
@@ -1316,7 +1325,10 @@ impl TransformerBlock {
     ///
     /// Merges Q/K/V weights and gate/up weights into single matrices.
     /// Must be called once after weights are loaded.
-    pub fn prepare_weights_9dispatch(&mut self, device: &ProtocolObject<dyn MTLDevice>) -> Result<(), KernelError> {
+    pub fn prepare_weights_9dispatch(
+        &mut self,
+        device: &ProtocolObject<dyn MTLDevice>,
+    ) -> Result<(), KernelError> {
         self.attention.prepare_merged_qkv(device)?;
         self.ffn.prepare_merged_gate_up(device)?;
         Ok(())
@@ -1328,7 +1340,11 @@ impl TransformerBlock {
     /// Weights cannot be read by CPU after this call. Call after loading
     /// weights (and after `prepare_weights_9dispatch` if using that path)
     /// and before the inference loop.
-    pub fn prepare_weights_private(&mut self, device: &ProtocolObject<dyn MTLDevice>, queue: &ProtocolObject<dyn MTLCommandQueue>) {
+    pub fn prepare_weights_private(
+        &mut self,
+        device: &ProtocolObject<dyn MTLDevice>,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
+    ) {
         self.attention.prepare_weights_private(device, queue);
         self.ffn.prepare_weights_private(device, queue);
         if let Some(w) = self.norm1_weight.take() {
@@ -1403,7 +1419,7 @@ impl TransformerBlock {
             &h,
             Some(norm2_w),
             self.rms_norm_eps,
-enc6,
+            enc6,
         )?;
         enc6.end();
 
@@ -1468,7 +1484,7 @@ enc6,
         // D4-D5: SDPA + O_proj+residual
         let h = self
             .attention
-.encode_phase2_into(&phase1, cache, registry, encoder_b)?;
+            .encode_phase2_into(&phase1, cache, registry, encoder_b)?;
 
         // D5→D6 barrier: ensure h is visible before rms_norm reads it
         rmlx_metal::memory_barrier_scope_buffers(encoder_b.raw());
@@ -1479,7 +1495,7 @@ enc6,
             &h,
             Some(norm2_w),
             self.rms_norm_eps,
-encoder_b,
+            encoder_b,
         )?;
 
         // D6→D7 barrier: ensure normed2 is visible before FFN reads it
@@ -1488,7 +1504,7 @@ encoder_b,
         // D7-D9: FFN (gate+up, silu_mul, down+residual)
         let out = self
             .ffn
-.forward_into_encoder_9dispatch(&normed2, &h, registry, encoder_b)?;
+            .forward_into_encoder_9dispatch(&normed2, &h, registry, encoder_b)?;
 
         encoder_b.end();
 
@@ -1580,7 +1596,7 @@ encoder_b,
             cached.norm1_w_stride, // w_stride
             1,                     // has_w
             1,                     // rows
-encoder_a,
+            encoder_a,
         );
         rmlx_metal::memory_barrier_scope_buffers(encoder_a.raw());
 
@@ -1597,7 +1613,7 @@ encoder_a,
             cached.gemv_qkv_k,
             cached.gemv_qkv_grid,
             cached.gemv_qkv_tg,
-encoder_a,
+            encoder_a,
         );
 
         // D3: rope → rope_buf (or use qkv_buf directly if no RoPE)
@@ -1606,12 +1622,7 @@ encoder_a,
         let total_rope_heads = num_heads + num_kv_heads;
         let rope_offset = cache.seq_len as u32;
 
-        let (qk_buf_ref, qk_offset, v_buf_ref, v_offset): (
-            &MtlBuffer,
-            usize,
-            &MtlBuffer,
-            usize,
-        );
+        let (qk_buf_ref, qk_offset, v_buf_ref, v_offset): (&MtlBuffer, usize, &MtlBuffer, usize);
 
         if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
             rmlx_metal::memory_barrier_scope_buffers(encoder_a.raw());
@@ -1629,10 +1640,10 @@ encoder_a,
                 head_dim as u32,
                 rope_offset,
                 1.0,
-                0,                       // traditional = false
-                1,                       // forward = true
-total_rope_heads.try_into().unwrap(), // n_batch
-encoder_a,
+                0,                                    // traditional = false
+                1,                                    // forward = true
+                total_rope_heads.try_into().unwrap(), // n_batch
+                encoder_a,
             );
             qk_buf_ref = &cached.rope_buf;
             qk_offset = 0;
@@ -1668,7 +1679,7 @@ encoder_a,
                 v_offset + h * head_dim * elem_size,
             ));
         }
-cache.append_preresolved_into_encoder(k_heads, v_heads, 1, &cached.copy_pso, encoder_a)?;
+        cache.append_preresolved_into_encoder(k_heads, v_heads, 1, &cached.copy_pso, encoder_a)?;
 
         encoder_a.end();
 
@@ -1692,7 +1703,7 @@ cache.append_preresolved_into_encoder(k_heads, v_heads, 1, &cached.copy_pso, enc
         ops::sdpa::sdpa_decode_preresolved_into_encoder(
             &cached.sdpa_pso,
             qk_buf_ref, // Q from rope output
-qk_offset,
+            qk_offset,
             k_slab.metal_buffer(),
             k_slab.offset(),
             v_slab.metal_buffer(),
@@ -1727,7 +1738,7 @@ qk_offset,
             x.offset(),
             cached.gemv_bias_oproj_grid,
             cached.gemv_bias_oproj_tg,
-encoder_b,
+            encoder_b,
         );
         rmlx_metal::memory_barrier_scope_buffers(encoder_b.raw());
 
@@ -1745,7 +1756,7 @@ encoder_b,
             cached.norm2_w_stride, // w_stride
             1,                     // has_w
             1,                     // rows
-encoder_b,
+            encoder_b,
         );
         rmlx_metal::memory_barrier_scope_buffers(encoder_b.raw());
 
@@ -1762,7 +1773,7 @@ encoder_b,
             cached.gemv_gate_up_k,
             cached.gemv_gate_up_grid,
             cached.gemv_gate_up_tg,
-encoder_b,
+            encoder_b,
         );
         rmlx_metal::memory_barrier_scope_buffers(encoder_b.raw());
 
@@ -1777,8 +1788,8 @@ encoder_b,
             &cached.silu_buf,
             0,
             cached.silu_numel,
-cached.silu_elems_per_thread.try_into().unwrap(),
-encoder_b,
+            cached.silu_elems_per_thread.try_into().unwrap(),
+            encoder_b,
         );
         rmlx_metal::memory_barrier_scope_buffers(encoder_b.raw());
 
@@ -1797,7 +1808,7 @@ encoder_b,
             0,
             cached.gemv_bias_down_grid,
             cached.gemv_bias_down_tg,
-encoder_b,
+            encoder_b,
         );
 
         encoder_b.end();
@@ -1892,7 +1903,7 @@ encoder_b,
             cached.norm1_w_stride,
             1,
             1,
-encoder,
+            encoder,
         );
         rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
 
@@ -1909,7 +1920,7 @@ encoder,
             cached.gemv_qkv_k,
             cached.gemv_qkv_grid,
             cached.gemv_qkv_tg,
-encoder,
+            encoder,
         );
 
         // D3: rope -> rope_buf (or use qkv_buf directly if no RoPE)
@@ -1918,12 +1929,7 @@ encoder,
         let total_rope_heads = num_heads + num_kv_heads;
         let rope_offset = cache.seq_len as u32;
 
-        let (qk_buf_ref, qk_offset, v_buf_ref, v_offset): (
-            &MtlBuffer,
-            usize,
-            &MtlBuffer,
-            usize,
-        );
+        let (qk_buf_ref, qk_offset, v_buf_ref, v_offset): (&MtlBuffer, usize, &MtlBuffer, usize);
 
         if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
             rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
@@ -1943,8 +1949,8 @@ encoder,
                 1.0,
                 0,
                 1,
-total_rope_heads.try_into().unwrap(),
-encoder,
+                total_rope_heads.try_into().unwrap(),
+                encoder,
             );
             qk_buf_ref = &cached.rope_buf;
             qk_offset = 0;
@@ -1970,7 +1976,7 @@ encoder,
             1,
             &cached.copy_pso,
             cached.copy_max_tg,
-encoder,
+            encoder,
         )?;
 
         // Memory barrier on KV slab buffers: KV copy -> SDPA read dependency
@@ -1990,7 +1996,7 @@ encoder,
         ops::sdpa::sdpa_decode_preresolved_into_encoder(
             &cached.sdpa_pso,
             qk_buf_ref,
-qk_offset,
+            qk_offset,
             k_slab.metal_buffer(),
             k_slab.offset(),
             v_slab.metal_buffer(),
@@ -2025,7 +2031,7 @@ qk_offset,
             x.offset(),
             cached.gemv_bias_oproj_grid,
             cached.gemv_bias_oproj_tg,
-encoder,
+            encoder,
         );
         rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
 
@@ -2043,7 +2049,7 @@ encoder,
             cached.norm2_w_stride,
             1,
             1,
-encoder,
+            encoder,
         );
         rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
 
@@ -2060,7 +2066,7 @@ encoder,
             cached.gemv_gate_up_k,
             cached.gemv_gate_up_grid,
             cached.gemv_gate_up_tg,
-encoder,
+            encoder,
         );
         rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
 
@@ -2075,8 +2081,8 @@ encoder,
             &cached.silu_buf,
             0,
             cached.silu_numel,
-cached.silu_elems_per_thread.try_into().unwrap(),
-encoder,
+            cached.silu_elems_per_thread.try_into().unwrap(),
+            encoder,
         );
         rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
 
@@ -2095,7 +2101,7 @@ encoder,
             0,
             cached.gemv_bias_down_grid,
             cached.gemv_bias_down_tg,
-encoder,
+            encoder,
         );
 
         encoder.end();
@@ -2205,7 +2211,7 @@ encoder,
             cached.norm1_w_stride,
             cached.fused_rms_gemv_qkv_grid,
             cached.fused_rms_gemv_qkv_tg,
-encoder,
+            encoder,
         );
 
         // D2: rope → rope_buf
@@ -2214,12 +2220,7 @@ encoder,
         let total_rope_heads = num_heads + num_kv_heads;
         let rope_offset = cache.seq_len as u32;
 
-        let (qk_buf_ref, qk_offset, v_buf_ref, v_offset): (
-            &MtlBuffer,
-            usize,
-            &MtlBuffer,
-            usize,
-        );
+        let (qk_buf_ref, qk_offset, v_buf_ref, v_offset): (&MtlBuffer, usize, &MtlBuffer, usize);
 
         if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
             rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
@@ -2239,8 +2240,8 @@ encoder,
                 1.0,
                 0,
                 1,
-total_rope_heads.try_into().unwrap(),
-encoder,
+                total_rope_heads.try_into().unwrap(),
+                encoder,
             );
             qk_buf_ref = &cached.rope_buf;
             qk_offset = 0;
@@ -2265,7 +2266,7 @@ encoder,
             1,
             &cached.copy_pso,
             cached.copy_max_tg,
-encoder,
+            encoder,
         )?;
 
         // Memory barrier on KV slab buffers
@@ -2284,7 +2285,7 @@ encoder,
         ops::sdpa::sdpa_decode_preresolved_into_encoder(
             &cached.sdpa_pso,
             qk_buf_ref,
-qk_offset,
+            qk_offset,
             k_slab.metal_buffer(),
             k_slab.offset(),
             v_slab.metal_buffer(),
@@ -2319,7 +2320,7 @@ qk_offset,
             x.offset(),
             cached.gemv_bias_oproj_grid,
             cached.gemv_bias_oproj_tg,
-encoder,
+            encoder,
         );
         rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
 
@@ -2341,7 +2342,7 @@ encoder,
             cached.norm2_w_stride,
             cached.fused_rms_gemv_gate_up_grid,
             cached.fused_rms_gemv_gate_up_tg,
-encoder,
+            encoder,
         );
         rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
 
@@ -2361,7 +2362,7 @@ encoder,
             0,
             cached.fused_swiglu_down_grid,
             cached.fused_swiglu_down_tg,
-encoder,
+            encoder,
         );
 
         encoder.end();
@@ -2459,7 +2460,7 @@ encoder,
                     cached.norm1_w_stride,
                     cached.fused_rms_gemv_qkv_grid,
                     cached.fused_rms_gemv_qkv_tg,
-encoder,
+                    encoder,
                 );
             } else {
                 // Fallback: unfused
@@ -2476,7 +2477,7 @@ encoder,
                     cached.norm1_w_stride,
                     1,
                     1,
-encoder,
+                    encoder,
                 );
                 rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
                 ops::gemv::gemv_preresolved_into_encoder(
@@ -2491,7 +2492,7 @@ encoder,
                     cached.gemv_qkv_k,
                     cached.gemv_qkv_grid,
                     cached.gemv_qkv_tg,
-encoder,
+                    encoder,
                 );
             }
         } else {
@@ -2509,7 +2510,7 @@ encoder,
                 cached.norm1_w_stride,
                 1,
                 1,
-encoder,
+                encoder,
             );
             rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
             ops::gemv::gemv_preresolved_into_encoder(
@@ -2524,7 +2525,7 @@ encoder,
                 cached.gemv_qkv_k,
                 cached.gemv_qkv_grid,
                 cached.gemv_qkv_tg,
-encoder,
+                encoder,
             );
         }
 
@@ -2534,12 +2535,7 @@ encoder,
         let total_rope_heads = num_heads + num_kv_heads;
         let rope_offset = cache.seq_len as u32;
 
-        let (qk_buf_ref, qk_offset, v_buf_ref, v_offset): (
-            &MtlBuffer,
-            usize,
-            &MtlBuffer,
-            usize,
-        );
+        let (qk_buf_ref, qk_offset, v_buf_ref, v_offset): (&MtlBuffer, usize, &MtlBuffer, usize);
 
         if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
             rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
@@ -2559,8 +2555,8 @@ encoder,
                 1.0,
                 0,
                 1,
-total_rope_heads.try_into().unwrap(),
-encoder,
+                total_rope_heads.try_into().unwrap(),
+                encoder,
             );
             qk_buf_ref = &cached.rope_buf;
             qk_offset = 0;
@@ -2586,7 +2582,7 @@ encoder,
             1,
             &cached.copy_pso,
             cached.copy_max_tg,
-encoder,
+            encoder,
         )?;
 
         // Memory barrier on KV slab buffers: KV copy -> SDPA read dependency
@@ -2606,7 +2602,7 @@ encoder,
         ops::sdpa::sdpa_decode_preresolved_into_encoder(
             &cached.sdpa_pso,
             qk_buf_ref,
-qk_offset,
+            qk_offset,
             k_slab.metal_buffer(),
             k_slab.offset(),
             v_slab.metal_buffer(),
@@ -2641,7 +2637,7 @@ qk_offset,
             x.offset(),
             cached.gemv_bias_oproj_grid,
             cached.gemv_bias_oproj_tg,
-encoder,
+            encoder,
         );
         rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
 
@@ -2664,7 +2660,7 @@ encoder,
                     cached.norm2_w_stride,
                     cached.fused_rms_gemv_gate_up_grid,
                     cached.fused_rms_gemv_gate_up_tg,
-encoder,
+                    encoder,
                 );
             } else {
                 // Fallback: unfused
@@ -2681,7 +2677,7 @@ encoder,
                     cached.norm2_w_stride,
                     1,
                     1,
-encoder,
+                    encoder,
                 );
                 rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
                 ops::gemv::gemv_preresolved_into_encoder(
@@ -2696,7 +2692,7 @@ encoder,
                     cached.gemv_gate_up_k,
                     cached.gemv_gate_up_grid,
                     cached.gemv_gate_up_tg,
-encoder,
+                    encoder,
                 );
             }
         } else {
@@ -2714,7 +2710,7 @@ encoder,
                 cached.norm2_w_stride,
                 1,
                 1,
-encoder,
+                encoder,
             );
             rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
             ops::gemv::gemv_preresolved_into_encoder(
@@ -2729,7 +2725,7 @@ encoder,
                 cached.gemv_gate_up_k,
                 cached.gemv_gate_up_grid,
                 cached.gemv_gate_up_tg,
-encoder,
+                encoder,
             );
         }
         rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
@@ -2751,7 +2747,7 @@ encoder,
                     0,
                     cached.fused_swiglu_down_grid,
                     cached.fused_swiglu_down_tg,
-encoder,
+                    encoder,
                 );
             } else {
                 // Fallback: unfused
@@ -2765,8 +2761,8 @@ encoder,
                     &cached.silu_buf,
                     0,
                     cached.silu_numel,
-cached.silu_elems_per_thread.try_into().unwrap(),
-encoder,
+                    cached.silu_elems_per_thread.try_into().unwrap(),
+                    encoder,
                 );
                 rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
                 ops::gemv::gemv_bias_preresolved_into_encoder(
@@ -2783,7 +2779,7 @@ encoder,
                     0,
                     cached.gemv_bias_down_grid,
                     cached.gemv_bias_down_tg,
-encoder,
+                    encoder,
                 );
             }
         } else {
@@ -2798,8 +2794,8 @@ encoder,
                 &cached.silu_buf,
                 0,
                 cached.silu_numel,
-cached.silu_elems_per_thread.try_into().unwrap(),
-encoder,
+                cached.silu_elems_per_thread.try_into().unwrap(),
+                encoder,
             );
             rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
             ops::gemv::gemv_bias_preresolved_into_encoder(
@@ -2816,7 +2812,7 @@ encoder,
                 0,
                 cached.gemv_bias_down_grid,
                 cached.gemv_bias_down_tg,
-encoder,
+                encoder,
             );
         }
 
@@ -2880,7 +2876,7 @@ encoder,
             &h,
             Some(norm2_w),
             self.rms_norm_eps,
-enc6,
+            enc6,
         )?;
         enc6.end();
 
@@ -3686,63 +3682,127 @@ impl CachedDecode {
         let (fused_rms_gemv_qkv_grid, fused_rms_gemv_qkv_tg) = fused_rms_gemv_qkv_pso
             .as_ref()
             .map(|pso| ops::fused::fused_rms_gemv_dispatch_sizes(qkv_dim as u32, pso))
-            .unwrap_or((MTLSize { width: 1, height: 1, depth: 1 }, MTLSize { width: 1, height: 1, depth: 1 }));
+            .unwrap_or((
+                MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+            ));
         let (fused_rms_gemv_gate_up_grid, fused_rms_gemv_gate_up_tg) = fused_rms_gemv_gate_up_pso
             .as_ref()
             .map(|pso| ops::fused::fused_rms_gemv_dispatch_sizes(gate_up_total as u32, pso))
-            .unwrap_or((MTLSize { width: 1, height: 1, depth: 1 }, MTLSize { width: 1, height: 1, depth: 1 }));
+            .unwrap_or((
+                MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+            ));
         let (fused_swiglu_down_grid, fused_swiglu_down_tg) = fused_swiglu_down_pso
             .as_ref()
             .map(|pso| ops::fused::fused_swiglu_down_dispatch_sizes(hidden_size as u32, pso))
-            .unwrap_or((MTLSize { width: 1, height: 1, depth: 1 }, MTLSize { width: 1, height: 1, depth: 1 }));
+            .unwrap_or((
+                MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+            ));
 
         // --- Pre-allocate scratch buffers ---
-        let normed_buf = dev.newBufferWithLength_options(
-            hidden_size * elem_size,
-            MTLResourceOptions::StorageModePrivate,
-        ).unwrap();
-        let qkv_buf = dev.newBufferWithLength_options(
-            qkv_dim * elem_size,
-            MTLResourceOptions::StorageModePrivate,
-        ).unwrap();
+        let normed_buf = dev
+            .newBufferWithLength_options(
+                hidden_size * elem_size,
+                MTLResourceOptions::StorageModePrivate,
+            )
+            .unwrap();
+        let qkv_buf = dev
+            .newBufferWithLength_options(
+                qkv_dim * elem_size,
+                MTLResourceOptions::StorageModePrivate,
+            )
+            .unwrap();
         let total_rope_heads = num_heads + num_kv_heads;
-        let rope_buf = dev.newBufferWithLength_options(
-            total_rope_heads * head_dim * elem_size,
-            MTLResourceOptions::StorageModePrivate,
-        ).unwrap();
-        let attn_out_buf = dev.newBufferWithLength_options(
-            num_heads * head_dim * elem_size,
-            MTLResourceOptions::StorageModePrivate,
-        ).unwrap();
-        let h_buf = dev.newBufferWithLength_options(
-            hidden_size * elem_size,
-            MTLResourceOptions::StorageModePrivate,
-        ).unwrap();
-        let normed2_buf = dev.newBufferWithLength_options(
-            hidden_size * elem_size,
-            MTLResourceOptions::StorageModePrivate,
-        ).unwrap();
-        let gate_up_buf = dev.newBufferWithLength_options(
-            gate_up_total * elem_size,
-            MTLResourceOptions::StorageModePrivate,
-        ).unwrap();
-        let silu_buf = dev.newBufferWithLength_options(
-            intermediate_dim * elem_size,
-            MTLResourceOptions::StorageModePrivate,
-        ).unwrap();
-        let out_buf = dev.newBufferWithLength_options(
-            hidden_size * elem_size,
-            MTLResourceOptions::StorageModePrivate,
-        ).unwrap();
-        let dummy_mask_buf = dev.newBufferWithLength_options(4, MTLResourceOptions::StorageModeShared).unwrap();
+        let rope_buf = dev
+            .newBufferWithLength_options(
+                total_rope_heads * head_dim * elem_size,
+                MTLResourceOptions::StorageModePrivate,
+            )
+            .unwrap();
+        let attn_out_buf = dev
+            .newBufferWithLength_options(
+                num_heads * head_dim * elem_size,
+                MTLResourceOptions::StorageModePrivate,
+            )
+            .unwrap();
+        let h_buf = dev
+            .newBufferWithLength_options(
+                hidden_size * elem_size,
+                MTLResourceOptions::StorageModePrivate,
+            )
+            .unwrap();
+        let normed2_buf = dev
+            .newBufferWithLength_options(
+                hidden_size * elem_size,
+                MTLResourceOptions::StorageModePrivate,
+            )
+            .unwrap();
+        let gate_up_buf = dev
+            .newBufferWithLength_options(
+                gate_up_total * elem_size,
+                MTLResourceOptions::StorageModePrivate,
+            )
+            .unwrap();
+        let silu_buf = dev
+            .newBufferWithLength_options(
+                intermediate_dim * elem_size,
+                MTLResourceOptions::StorageModePrivate,
+            )
+            .unwrap();
+        let out_buf = dev
+            .newBufferWithLength_options(
+                hidden_size * elem_size,
+                MTLResourceOptions::StorageModePrivate,
+            )
+            .unwrap();
+        let dummy_mask_buf = dev
+            .newBufferWithLength_options(4, MTLResourceOptions::StorageModeShared)
+            .unwrap();
 
         let scale = 1.0 / (head_dim as f32).sqrt();
 
         // Pre-cache threadgroup sizes (Optimization C)
         let sdpa_tg_size = std::cmp::min(256usize, sdpa_pso.maxTotalThreadsPerThreadgroup());
-let rms_tg_size = std::cmp::min(1024u64, rms_norm_pso.maxTotalThreadsPerThreadgroup().try_into().unwrap());
-        let rms2_tg_size =
-std::cmp::min(1024u64, rms_norm2_pso.maxTotalThreadsPerThreadgroup().try_into().unwrap());
+        let rms_tg_size = std::cmp::min(
+            1024u64,
+            rms_norm_pso
+                .maxTotalThreadsPerThreadgroup()
+                .try_into()
+                .unwrap(),
+        );
+        let rms2_tg_size = std::cmp::min(
+            1024u64,
+            rms_norm2_pso
+                .maxTotalThreadsPerThreadgroup()
+                .try_into()
+                .unwrap(),
+        );
         let copy_max_tg = copy_pso.maxTotalThreadsPerThreadgroup();
 
         Ok(Self {
@@ -3795,10 +3855,10 @@ std::cmp::min(1024u64, rms_norm2_pso.maxTotalThreadsPerThreadgroup().try_into().
             scale,
             norm1_w_stride,
             norm2_w_stride,
-sdpa_tg_size: sdpa_tg_size.try_into().unwrap(),
+            sdpa_tg_size: sdpa_tg_size.try_into().unwrap(),
             rms_tg_size,
             rms2_tg_size,
-copy_max_tg: copy_max_tg.try_into().unwrap(),
+            copy_max_tg: copy_max_tg.try_into().unwrap(),
             fused_rms_gemv_qkv_pso,
             fused_rms_gemv_gate_up_pso,
             fused_swiglu_down_pso,
@@ -4042,7 +4102,7 @@ impl TransformerModel {
                     mask,
                     &mut cache[i],
                     registry,
-encoder,
+                    encoder,
                 )?;
             }
             // Final norm + LM head in same encoder
@@ -4051,9 +4111,9 @@ encoder,
                 &x,
                 Some(final_norm),
                 self.config.rms_norm_eps,
-encoder,
+                encoder,
             )?;
-x = lm_head.forward_into_encoder(&x, registry, encoder)?;
+            x = lm_head.forward_into_encoder(&x, registry, encoder)?;
             encoder.end();
             cb.commit();
             cb.waitUntilCompleted();

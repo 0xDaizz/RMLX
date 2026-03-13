@@ -5,12 +5,12 @@
 //!
 //! v1: CPU-side fallback for sort/sample operations. GPU sort path is a TODO.
 
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLCommandQueue, MTLDevice};
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::{KernelError, KernelRegistry};
 use rmlx_core::ops;
-use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLCommandQueue, MTLDevice};
 
 // ---------------------------------------------------------------------------
 // SamplerConfig
@@ -392,7 +392,11 @@ pub fn temperature(
 /// masks everything below it.
 ///
 /// TODO: Replace with GPU sort path when a Metal bitonic/radix sort kernel is available.
-pub fn top_k(logits: &Array, k: usize, device: &ProtocolObject<dyn MTLDevice>) -> Result<Array, KernelError> {
+pub fn top_k(
+    logits: &Array,
+    k: usize,
+    device: &ProtocolObject<dyn MTLDevice>,
+) -> Result<Array, KernelError> {
     validate_1d_f32(logits, "top_k")?;
     let mut data = logits.to_vec_checked::<f32>();
     let vocab_size = data.len();

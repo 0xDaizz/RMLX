@@ -256,9 +256,11 @@ impl KernelRegistry {
                     .jit_cache
                     .read()
                     .map_err(|_| KernelError::Internal("JIT cache lock poisoned".into()))?;
-                let jit_fn = jit
-                    .values()
-                    .find_map(|entry| entry.library.newFunctionWithName(&NSString::from_str(kernel_name)));
+                let jit_fn = jit.values().find_map(|entry| {
+                    entry
+                        .library
+                        .newFunctionWithName(&NSString::from_str(kernel_name))
+                });
                 match jit_fn {
                     Some(f) => f,
                     None => {
@@ -324,7 +326,7 @@ impl KernelRegistry {
                     // The function exists; now apply constants. Any error here
                     // is a real specialization failure from Metal.
                     lib.newFunctionWithName_constantValues_error(&ns_name, constants)
-                    .map_err(|e| Some(e.localizedDescription().to_string()))
+                        .map_err(|e| Some(e.localizedDescription().to_string()))
                 }
             }
         };
@@ -723,7 +725,11 @@ impl KernelRegistry {
     fn find_jit_source_for_kernel(&self, kernel_name: &str) -> Option<String> {
         let jit = self.jit_cache.read().ok()?;
         for entry in jit.values() {
-            if entry.library.newFunctionWithName(&NSString::from_str(kernel_name)).is_some() {
+            if entry
+                .library
+                .newFunctionWithName(&NSString::from_str(kernel_name))
+                .is_some()
+            {
                 return Some(entry.source.clone());
             }
         }

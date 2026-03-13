@@ -12,14 +12,14 @@
 use crate::array::{broadcast_shape, Array};
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
-use rmlx_metal::MTLSize;
-use rmlx_metal::ComputePass;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::MTLComputePipelineState as _;
 use objc2_metal::MTLCommandBuffer as _;
 use objc2_metal::MTLCommandQueue as _;
-use rmlx_metal::MTLResourceOptions;
+use objc2_metal::MTLComputePipelineState as _;
 use objc2_metal::MTLDevice as _;
+use rmlx_metal::ComputePass;
+use rmlx_metal::MTLResourceOptions;
+use rmlx_metal::MTLSize;
 
 // ---------------------------------------------------------------------------
 // Metal shader source
@@ -507,11 +507,55 @@ pub fn binary_op_with_mode(
 
             let buf_size = |v: &[u32]| std::mem::size_of_val(v);
 
-            let shape_buf = unsafe { device.newBufferWithBytes_length_options(std::ptr::NonNull::new(shape_u32.as_ptr() as *const _ as *mut std::ffi::c_void).unwrap(), buf_size(&shape_u32) as usize, MTLResourceOptions::StorageModeShared).unwrap() };
-            let a_stride_buf = unsafe { device.newBufferWithBytes_length_options(std::ptr::NonNull::new(a_strides_u32.as_ptr() as *const _ as *mut std::ffi::c_void).unwrap(), buf_size(&a_strides_u32) as usize, MTLResourceOptions::StorageModeShared).unwrap() };
-            let b_stride_buf = unsafe { device.newBufferWithBytes_length_options(std::ptr::NonNull::new(b_strides_u32.as_ptr() as *const _ as *mut std::ffi::c_void).unwrap(), buf_size(&b_strides_u32) as usize, MTLResourceOptions::StorageModeShared).unwrap() };
+            let shape_buf = unsafe {
+                device
+                    .newBufferWithBytes_length_options(
+                        std::ptr::NonNull::new(
+                            shape_u32.as_ptr() as *const _ as *mut std::ffi::c_void
+                        )
+                        .unwrap(),
+                        buf_size(&shape_u32) as usize,
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                    .unwrap()
+            };
+            let a_stride_buf = unsafe {
+                device
+                    .newBufferWithBytes_length_options(
+                        std::ptr::NonNull::new(
+                            a_strides_u32.as_ptr() as *const _ as *mut std::ffi::c_void
+                        )
+                        .unwrap(),
+                        buf_size(&a_strides_u32) as usize,
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                    .unwrap()
+            };
+            let b_stride_buf = unsafe {
+                device
+                    .newBufferWithBytes_length_options(
+                        std::ptr::NonNull::new(
+                            b_strides_u32.as_ptr() as *const _ as *mut std::ffi::c_void
+                        )
+                        .unwrap(),
+                        buf_size(&b_strides_u32) as usize,
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                    .unwrap()
+            };
             let ndim_val = super::checked_u32(ndim, "ndim")?;
-            let ndim_buf = unsafe { device.newBufferWithBytes_length_options(std::ptr::NonNull::new(&ndim_val as *const u32 as *const _ as *mut std::ffi::c_void).unwrap(), std::mem::size_of::<u32>(), MTLResourceOptions::StorageModeShared).unwrap() };
+            let ndim_buf = unsafe {
+                device
+                    .newBufferWithBytes_length_options(
+                        std::ptr::NonNull::new(
+                            &ndim_val as *const u32 as *const _ as *mut std::ffi::c_void,
+                        )
+                        .unwrap(),
+                        std::mem::size_of::<u32>(),
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                    .unwrap()
+            };
 
             encoder.set_buffer(3, Some(&shape_buf), 0);
             encoder.set_buffer(4, Some(&a_stride_buf), 0);
@@ -523,11 +567,16 @@ pub fn binary_op_with_mode(
         }
     }
 
-    let grid_size = MTLSize { width: out_numel as usize, height: 1, depth: 1 };
-    let threadgroup_size = MTLSize { width: std::cmp::min(
-            pipeline.maxTotalThreadsPerThreadgroup(),
-            out_numel as usize,
-        ), height: 1, depth: 1 };
+    let grid_size = MTLSize {
+        width: out_numel as usize,
+        height: 1,
+        depth: 1,
+    };
+    let threadgroup_size = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), out_numel as usize),
+        height: 1,
+        depth: 1,
+    };
     encoder.dispatch_threads(grid_size, threadgroup_size);
     encoder.end();
     super::commit_with_mode(&command_buffer, mode);
@@ -619,11 +668,53 @@ pub fn binary_op_async(
 
         let buf_size = |v: &[u32]| std::mem::size_of_val(v);
 
-        let shape_buf = unsafe { device.newBufferWithBytes_length_options(std::ptr::NonNull::new(shape_u32.as_ptr() as *const _ as *mut std::ffi::c_void).unwrap(), buf_size(&shape_u32) as usize, MTLResourceOptions::StorageModeShared).unwrap() };
-        let a_stride_buf = unsafe { device.newBufferWithBytes_length_options(std::ptr::NonNull::new(a_strides_u32.as_ptr() as *const _ as *mut std::ffi::c_void).unwrap(), buf_size(&a_strides_u32) as usize, MTLResourceOptions::StorageModeShared).unwrap() };
-        let b_stride_buf = unsafe { device.newBufferWithBytes_length_options(std::ptr::NonNull::new(b_strides_u32.as_ptr() as *const _ as *mut std::ffi::c_void).unwrap(), buf_size(&b_strides_u32) as usize, MTLResourceOptions::StorageModeShared).unwrap() };
+        let shape_buf = unsafe {
+            device
+                .newBufferWithBytes_length_options(
+                    std::ptr::NonNull::new(shape_u32.as_ptr() as *const _ as *mut std::ffi::c_void)
+                        .unwrap(),
+                    buf_size(&shape_u32) as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .unwrap()
+        };
+        let a_stride_buf = unsafe {
+            device
+                .newBufferWithBytes_length_options(
+                    std::ptr::NonNull::new(
+                        a_strides_u32.as_ptr() as *const _ as *mut std::ffi::c_void
+                    )
+                    .unwrap(),
+                    buf_size(&a_strides_u32) as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .unwrap()
+        };
+        let b_stride_buf = unsafe {
+            device
+                .newBufferWithBytes_length_options(
+                    std::ptr::NonNull::new(
+                        b_strides_u32.as_ptr() as *const _ as *mut std::ffi::c_void
+                    )
+                    .unwrap(),
+                    buf_size(&b_strides_u32) as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .unwrap()
+        };
         let ndim_val = super::checked_u32(ndim, "ndim")?;
-        let ndim_buf = unsafe { device.newBufferWithBytes_length_options(std::ptr::NonNull::new(&ndim_val as *const u32 as *const _ as *mut std::ffi::c_void).unwrap(), std::mem::size_of::<u32>(), MTLResourceOptions::StorageModeShared).unwrap() };
+        let ndim_buf = unsafe {
+            device
+                .newBufferWithBytes_length_options(
+                    std::ptr::NonNull::new(
+                        &ndim_val as *const u32 as *const _ as *mut std::ffi::c_void,
+                    )
+                    .unwrap(),
+                    std::mem::size_of::<u32>(),
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .unwrap()
+        };
 
         encoder.set_buffer(3, Some(&shape_buf), 0);
         encoder.set_buffer(4, Some(&a_stride_buf), 0);
@@ -631,11 +722,16 @@ pub fn binary_op_async(
         encoder.set_buffer(6, Some(&ndim_buf), 0);
     }
 
-    let grid_size = MTLSize { width: out_numel as usize, height: 1, depth: 1 };
-    let threadgroup_size = MTLSize { width: std::cmp::min(
-            pipeline.maxTotalThreadsPerThreadgroup(),
-            out_numel as usize,
-        ), height: 1, depth: 1 };
+    let grid_size = MTLSize {
+        width: out_numel as usize,
+        height: 1,
+        depth: 1,
+    };
+    let threadgroup_size = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), out_numel as usize),
+        height: 1,
+        depth: 1,
+    };
     encoder.dispatch_threads(grid_size, threadgroup_size);
     encoder.end();
 
@@ -825,17 +921,34 @@ fn binary_op_encode_impl(
         let buf_size = |v: &[u32]| std::mem::size_of_val(v);
         let ndim_val = super::checked_u32(ndim, "ndim")?;
 
-        encoder.set_bytes(3, shape_u32.as_ptr() as *const std::ffi::c_void, buf_size(&shape_u32));
-        encoder.set_bytes(4, a_strides_u32.as_ptr() as *const std::ffi::c_void, buf_size(&a_strides_u32));
-        encoder.set_bytes(5, b_strides_u32.as_ptr() as *const std::ffi::c_void, buf_size(&b_strides_u32));
+        encoder.set_bytes(
+            3,
+            shape_u32.as_ptr() as *const std::ffi::c_void,
+            buf_size(&shape_u32),
+        );
+        encoder.set_bytes(
+            4,
+            a_strides_u32.as_ptr() as *const std::ffi::c_void,
+            buf_size(&a_strides_u32),
+        );
+        encoder.set_bytes(
+            5,
+            b_strides_u32.as_ptr() as *const std::ffi::c_void,
+            buf_size(&b_strides_u32),
+        );
         encoder.set_bytes(6, &ndim_val as *const u32 as *const std::ffi::c_void, 4);
     }
 
-    let grid_size = MTLSize { width: out_numel as usize, height: 1, depth: 1 };
-    let threadgroup_size = MTLSize { width: std::cmp::min(
-            pipeline.maxTotalThreadsPerThreadgroup(),
-            out_numel as usize,
-        ), height: 1, depth: 1 };
+    let grid_size = MTLSize {
+        width: out_numel as usize,
+        height: 1,
+        depth: 1,
+    };
+    let threadgroup_size = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), out_numel as usize),
+        height: 1,
+        depth: 1,
+    };
     encoder.dispatch_threads(grid_size, threadgroup_size);
 
     Ok(out)

@@ -15,15 +15,15 @@
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
-use rmlx_metal::MTLSize;
-use rmlx_metal::ComputePass;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::MTLComputePipelineState as _;
+use objc2_metal::MTLBuffer;
 use objc2_metal::MTLCommandBuffer as _;
 use objc2_metal::MTLCommandQueue as _;
-use objc2_metal::MTLBuffer;
-use rmlx_metal::MTLResourceOptions;
+use objc2_metal::MTLComputePipelineState as _;
 use objc2_metal::MTLDevice as _;
+use rmlx_metal::ComputePass;
+use rmlx_metal::MTLResourceOptions;
+use rmlx_metal::MTLSize;
 
 // ---------------------------------------------------------------------------
 // GEMV tuning — dimension-adaptive parameter selection
@@ -1116,8 +1116,22 @@ pub fn gemv(
 
     let dev = registry.device().raw();
     let opts = MTLResourceOptions::StorageModeShared;
-    let m_buf = unsafe { dev.newBufferWithBytes_length_options(std::ptr::NonNull::new(&m as *const u32 as *const _ as *mut std::ffi::c_void).unwrap(), 4_usize, opts).unwrap() };
-    let k_buf = unsafe { dev.newBufferWithBytes_length_options(std::ptr::NonNull::new(&k as *const u32 as *const _ as *mut std::ffi::c_void).unwrap(), 4_usize, opts).unwrap() };
+    let m_buf = unsafe {
+        dev.newBufferWithBytes_length_options(
+            std::ptr::NonNull::new(&m as *const u32 as *const _ as *mut std::ffi::c_void).unwrap(),
+            4_usize,
+            opts,
+        )
+        .unwrap()
+    };
+    let k_buf = unsafe {
+        dev.newBufferWithBytes_length_options(
+            std::ptr::NonNull::new(&k as *const u32 as *const _ as *mut std::ffi::c_void).unwrap(),
+            4_usize,
+            opts,
+        )
+        .unwrap()
+    };
 
     let command_buffer = queue.commandBuffer().unwrap();
     let raw_enc = command_buffer.computeCommandEncoder().unwrap();
@@ -1144,11 +1158,26 @@ pub fn gemv(
         ceil_div(m as usize, TM)
     };
     let tg_dim = if use_bm8 {
-        MTLSize { width: 32, height: 1, depth: BM8 }
+        MTLSize {
+            width: 32,
+            height: 1,
+            depth: BM8,
+        }
     } else {
-        MTLSize { width: tg_size, height: 1, depth: 1 }
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        }
     };
-    encoder.dispatch_threadgroups(MTLSize { width: num_threadgroups, height: 1, depth: 1 }, tg_dim);
+    encoder.dispatch_threadgroups(
+        MTLSize {
+            width: num_threadgroups,
+            height: 1,
+            depth: 1,
+        },
+        tg_dim,
+    );
     encoder.end();
     super::commit_with_mode(&command_buffer, super::ExecMode::Sync);
 
@@ -1230,11 +1259,26 @@ pub fn gemv_into_cb(
         ceil_div(m as usize, TM)
     };
     let tg_dim = if use_bm8 {
-        MTLSize { width: 32, height: 1, depth: BM8 }
+        MTLSize {
+            width: 32,
+            height: 1,
+            depth: BM8,
+        }
     } else {
-        MTLSize { width: tg_size, height: 1, depth: 1 }
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        }
     };
-    encoder.dispatch_threadgroups(MTLSize { width: num_threadgroups, height: 1, depth: 1 }, tg_dim);
+    encoder.dispatch_threadgroups(
+        MTLSize {
+            width: num_threadgroups,
+            height: 1,
+            depth: 1,
+        },
+        tg_dim,
+    );
     encoder.end();
 
     Ok(out)
@@ -1314,11 +1358,26 @@ pub fn gemv_into_encoder(
         ceil_div(m as usize, TM)
     };
     let tg_dim = if use_bm8 {
-        MTLSize { width: 32, height: 1, depth: BM8 }
+        MTLSize {
+            width: 32,
+            height: 1,
+            depth: BM8,
+        }
     } else {
-        MTLSize { width: tg_size, height: 1, depth: 1 }
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        }
     };
-    encoder.dispatch_threadgroups(MTLSize { width: num_threadgroups, height: 1, depth: 1 }, tg_dim);
+    encoder.dispatch_threadgroups(
+        MTLSize {
+            width: num_threadgroups,
+            height: 1,
+            depth: 1,
+        },
+        tg_dim,
+    );
 
     Ok(out)
 }
@@ -1428,11 +1487,26 @@ pub fn gemv_bias_into_cb(
         ceil_div(m as usize, TM)
     };
     let tg_dim = if use_bm8 {
-        MTLSize { width: 32, height: 1, depth: BM8 }
+        MTLSize {
+            width: 32,
+            height: 1,
+            depth: BM8,
+        }
     } else {
-        MTLSize { width: tg_size, height: 1, depth: 1 }
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        }
     };
-    encoder.dispatch_threadgroups(MTLSize { width: num_threadgroups, height: 1, depth: 1 }, tg_dim);
+    encoder.dispatch_threadgroups(
+        MTLSize {
+            width: num_threadgroups,
+            height: 1,
+            depth: 1,
+        },
+        tg_dim,
+    );
     encoder.end();
 
     Ok(out)
@@ -1541,11 +1615,26 @@ pub fn gemv_bias_into_encoder(
         ceil_div(m as usize, TM)
     };
     let tg_dim = if use_bm8 {
-        MTLSize { width: 32, height: 1, depth: BM8 }
+        MTLSize {
+            width: 32,
+            height: 1,
+            depth: BM8,
+        }
     } else {
-        MTLSize { width: tg_size, height: 1, depth: 1 }
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        }
     };
-    encoder.dispatch_threadgroups(MTLSize { width: num_threadgroups, height: 1, depth: 1 }, tg_dim);
+    encoder.dispatch_threadgroups(
+        MTLSize {
+            width: num_threadgroups,
+            height: 1,
+            depth: 1,
+        },
+        tg_dim,
+    );
 
     Ok(out)
 }
@@ -1641,8 +1730,22 @@ pub fn gemv_bias(
 
     let dev = registry.device().raw();
     let opts = MTLResourceOptions::StorageModeShared;
-    let m_buf = unsafe { dev.newBufferWithBytes_length_options(std::ptr::NonNull::new(&m as *const u32 as *const _ as *mut std::ffi::c_void).unwrap(), 4_usize, opts).unwrap() };
-    let k_buf = unsafe { dev.newBufferWithBytes_length_options(std::ptr::NonNull::new(&k as *const u32 as *const _ as *mut std::ffi::c_void).unwrap(), 4_usize, opts).unwrap() };
+    let m_buf = unsafe {
+        dev.newBufferWithBytes_length_options(
+            std::ptr::NonNull::new(&m as *const u32 as *const _ as *mut std::ffi::c_void).unwrap(),
+            4_usize,
+            opts,
+        )
+        .unwrap()
+    };
+    let k_buf = unsafe {
+        dev.newBufferWithBytes_length_options(
+            std::ptr::NonNull::new(&k as *const u32 as *const _ as *mut std::ffi::c_void).unwrap(),
+            4_usize,
+            opts,
+        )
+        .unwrap()
+    };
 
     let command_buffer = queue.commandBuffer().unwrap();
     let raw_enc = command_buffer.computeCommandEncoder().unwrap();
@@ -1670,11 +1773,26 @@ pub fn gemv_bias(
         ceil_div(m as usize, TM)
     };
     let tg_dim = if use_bm8 {
-        MTLSize { width: 32, height: 1, depth: BM8 }
+        MTLSize {
+            width: 32,
+            height: 1,
+            depth: BM8,
+        }
     } else {
-        MTLSize { width: tg_size, height: 1, depth: 1 }
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        }
     };
-    encoder.dispatch_threadgroups(MTLSize { width: num_threadgroups, height: 1, depth: 1 }, tg_dim);
+    encoder.dispatch_threadgroups(
+        MTLSize {
+            width: num_threadgroups,
+            height: 1,
+            depth: 1,
+        },
+        tg_dim,
+    );
     encoder.end();
     super::commit_with_mode(&command_buffer, super::ExecMode::Sync);
 
@@ -1750,9 +1868,33 @@ pub fn gemv_t(
 
     let dev = registry.device().raw();
     let opts = MTLResourceOptions::StorageModeShared;
-    let n_buf = unsafe { dev.newBufferWithBytes_length_options(std::ptr::NonNull::new(&n_out as *const u32 as *const _ as *mut std::ffi::c_void).unwrap(), 4_usize, opts).unwrap() };
-    let k_buf = unsafe { dev.newBufferWithBytes_length_options(std::ptr::NonNull::new(&k_red as *const u32 as *const _ as *mut std::ffi::c_void).unwrap(), 4_usize, opts).unwrap() };
-    let lda_buf = unsafe { dev.newBufferWithBytes_length_options(std::ptr::NonNull::new(&lda as *const u32 as *const _ as *mut std::ffi::c_void).unwrap(), 4_usize, opts).unwrap() };
+    let n_buf = unsafe {
+        dev.newBufferWithBytes_length_options(
+            std::ptr::NonNull::new(&n_out as *const u32 as *const _ as *mut std::ffi::c_void)
+                .unwrap(),
+            4_usize,
+            opts,
+        )
+        .unwrap()
+    };
+    let k_buf = unsafe {
+        dev.newBufferWithBytes_length_options(
+            std::ptr::NonNull::new(&k_red as *const u32 as *const _ as *mut std::ffi::c_void)
+                .unwrap(),
+            4_usize,
+            opts,
+        )
+        .unwrap()
+    };
+    let lda_buf = unsafe {
+        dev.newBufferWithBytes_length_options(
+            std::ptr::NonNull::new(&lda as *const u32 as *const _ as *mut std::ffi::c_void)
+                .unwrap(),
+            4_usize,
+            opts,
+        )
+        .unwrap()
+    };
 
     let command_buffer = queue.commandBuffer().unwrap();
     let raw_enc = command_buffer.computeCommandEncoder().unwrap();
@@ -1776,8 +1918,16 @@ pub fn gemv_t(
     );
     let num_threadgroups = ceil_div(n_out as usize, TM);
     encoder.dispatch_threadgroups(
-        MTLSize { width: num_threadgroups, height: 1, depth: 1 },
-        MTLSize { width: tg_size, height: 1, depth: 1 },
+        MTLSize {
+            width: num_threadgroups,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        },
     );
     encoder.end();
     super::commit_with_mode(&command_buffer, super::ExecMode::Sync);
@@ -1866,8 +2016,16 @@ pub fn gemv_t_into_cb(
     );
     let num_threadgroups = ceil_div(n_out as usize, TM);
     encoder.dispatch_threadgroups(
-        MTLSize { width: num_threadgroups, height: 1, depth: 1 },
-        MTLSize { width: tg_size, height: 1, depth: 1 },
+        MTLSize {
+            width: num_threadgroups,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        },
     );
     encoder.end();
 
@@ -1904,11 +2062,8 @@ pub fn gemv_preresolved_into_encoder(
 ) {
     encoder.set_pipeline(pso);
     {
-        let bufs: [Option<&ProtocolObject<dyn MTLBuffer>>; 3] = [
-            Some(mat_buf),
-            Some(vec_buf),
-            Some(out_buf),
-        ];
+        let bufs: [Option<&ProtocolObject<dyn MTLBuffer>>; 3] =
+            [Some(mat_buf), Some(vec_buf), Some(out_buf)];
         let offsets: [usize; 3] = [mat_offset, vec_offset, out_offset];
         encoder.set_buffers(0, &bufs, &offsets);
     }
@@ -1937,11 +2092,8 @@ pub fn gemv_bias_preresolved_into_encoder(
 ) {
     encoder.set_pipeline(pso);
     {
-        let bufs: [Option<&ProtocolObject<dyn MTLBuffer>>; 3] = [
-            Some(mat_buf),
-            Some(vec_buf),
-            Some(out_buf),
-        ];
+        let bufs: [Option<&ProtocolObject<dyn MTLBuffer>>; 3] =
+            [Some(mat_buf), Some(vec_buf), Some(out_buf)];
         let offsets: [usize; 3] = [mat_offset, vec_offset, out_offset];
         encoder.set_buffers(0, &bufs, &offsets);
     }
@@ -1952,10 +2104,7 @@ pub fn gemv_bias_preresolved_into_encoder(
 }
 
 /// Compute dispatch grid and threadgroup sizes for GEMV with given M.
-pub fn gemv_dispatch_sizes(
-    m: u32,
-    pso: &rmlx_metal::MtlPipeline,
-) -> (MTLSize, MTLSize) {
+pub fn gemv_dispatch_sizes(m: u32, pso: &rmlx_metal::MtlPipeline) -> (MTLSize, MTLSize) {
     let use_bm8 = (m as usize) >= BM8_THRESHOLD;
     let num_threadgroups = if use_bm8 {
         ceil_div(m as usize, BM8_ROWS)
@@ -1963,15 +2112,27 @@ pub fn gemv_dispatch_sizes(
         ceil_div(m as usize, TM)
     };
     let tg_dim = if use_bm8 {
-        MTLSize { width: 32, height: 1, depth: BM8 }
+        MTLSize {
+            width: 32,
+            height: 1,
+            depth: BM8,
+        }
     } else {
-        let tg_size = std::cmp::min(
-            GEMV_THREADGROUP_SIZE,
-            pso.maxTotalThreadsPerThreadgroup(),
-        );
-        MTLSize { width: tg_size, height: 1, depth: 1 }
+        let tg_size = std::cmp::min(GEMV_THREADGROUP_SIZE, pso.maxTotalThreadsPerThreadgroup());
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        }
     };
-    (MTLSize { width: num_threadgroups, height: 1, depth: 1 }, tg_dim)
+    (
+        MTLSize {
+            width: num_threadgroups,
+            height: 1,
+            depth: 1,
+        },
+        tg_dim,
+    )
 }
 
 /// Get the GEMV kernel name for a given dtype and M dimension.

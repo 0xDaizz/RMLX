@@ -9,13 +9,13 @@
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
-use rmlx_metal::MTLSize;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLCommandBuffer as _;
 use objc2_metal::MTLCommandQueue as _;
 use objc2_metal::MTLDevice as _;
-use rmlx_metal::MTLResourceOptions;
 use rmlx_metal::ComputePass;
+use rmlx_metal::MTLResourceOptions;
+use rmlx_metal::MTLSize;
 
 // ---------------------------------------------------------------------------
 // Metal shader source for GatherMM
@@ -467,9 +467,21 @@ fn ceil_div(a: usize, b: usize) -> usize {
 }
 
 /// Create a u32 Metal constant buffer.
-fn make_u32_buf(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, val: u32) -> rmlx_metal::MtlBuffer {
+fn make_u32_buf(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    val: u32,
+) -> rmlx_metal::MtlBuffer {
     let opts = MTLResourceOptions::StorageModeShared;
-    unsafe { device.newBufferWithBytes_length_options(std::ptr::NonNull::new(&val as *const u32 as *const _ as *mut std::ffi::c_void).unwrap(), 4_usize, opts).unwrap() }
+    unsafe {
+        device
+            .newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(&val as *const u32 as *const _ as *mut std::ffi::c_void)
+                    .unwrap(),
+                4_usize,
+                opts,
+            )
+            .unwrap()
+    }
 }
 
 /// Index-based batched GEMM for MoE expert dispatch.
@@ -487,8 +499,7 @@ fn make_u32_buf(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, val: u32) -
 /// # Returns
 /// Output matrix `[batch, m_per_batch, n]`.
 #[allow(clippy::too_many_arguments)]
-pub
-fn gather_mm(
+pub fn gather_mm(
     registry: &KernelRegistry,
     x: &Array,
     weights: &Array,
@@ -599,8 +610,16 @@ fn gather_mm(
     const BN: usize = 32;
     const N_THREADS: usize = 64; // 2 simdgroups × 32 threads
 
-    let grid = MTLSize { width: ceil_div(n, BN), height: ceil_div(m_per_batch, BM), depth: batch };
-    let tg = MTLSize { width: N_THREADS, height: 1, depth: 1 };
+    let grid = MTLSize {
+        width: ceil_div(n, BN),
+        height: ceil_div(m_per_batch, BM),
+        depth: batch,
+    };
+    let tg = MTLSize {
+        width: N_THREADS,
+        height: 1,
+        depth: 1,
+    };
 
     enc.dispatch_threadgroups(grid, tg);
     enc.end();
@@ -730,8 +749,16 @@ pub fn gather_mm_into_cb(
     const BN: usize = 32;
     const N_THREADS: usize = 64; // 2 simdgroups × 32 threads
 
-    let grid = MTLSize { width: ceil_div(n, BN), height: ceil_div(m_per_batch, BM), depth: batch };
-    let tg = MTLSize { width: N_THREADS, height: 1, depth: 1 };
+    let grid = MTLSize {
+        width: ceil_div(n, BN),
+        height: ceil_div(m_per_batch, BM),
+        depth: batch,
+    };
+    let tg = MTLSize {
+        width: N_THREADS,
+        height: 1,
+        depth: 1,
+    };
 
     enc.dispatch_threadgroups(grid, tg);
     enc.end();

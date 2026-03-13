@@ -3,12 +3,12 @@
 //! Wraps `rmlx_core::ops::rms_norm` as an nn module with a learnable
 //! weight (scale) parameter.
 
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLCommandQueue, MTLDevice};
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::{KernelError, KernelRegistry};
 use rmlx_core::ops;
-use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLCommandQueue, MTLDevice};
 
 /// RMS Normalization configuration.
 pub struct RMSNormConfig {
@@ -47,7 +47,11 @@ impl RMSNorm {
     /// The weight is created as f32 on the given device. The `_dtype` parameter
     /// is accepted for API consistency but currently only f32 weights are
     /// supported (the core kernel handles f16/bf16 inputs with f32 accumulation).
-    pub fn new(config: &RMSNormConfig, device: &ProtocolObject<dyn MTLDevice>, _dtype: DType) -> Self {
+    pub fn new(
+        config: &RMSNormConfig,
+        device: &ProtocolObject<dyn MTLDevice>,
+        _dtype: DType,
+    ) -> Self {
         let weight = Array::ones(device, &[config.normalized_shape]);
         Self {
             weight,

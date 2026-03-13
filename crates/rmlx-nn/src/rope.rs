@@ -4,12 +4,12 @@
 //! cos/sin frequency tables. Supports NTK-aware scaling via the
 //! `scale` config parameter which adjusts the effective base frequency.
 
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLCommandQueue, MTLDevice};
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::{KernelError, KernelRegistry};
 use rmlx_core::ops;
-use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLCommandQueue, MTLDevice};
 
 /// Configuration for [`RotaryPositionEmbedding`].
 pub struct RotaryPositionEmbeddingConfig {

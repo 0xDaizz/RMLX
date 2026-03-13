@@ -7,14 +7,14 @@
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
-use rmlx_metal::MTLSize;
-use rmlx_metal::ComputePass;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::MTLComputePipelineState as _;
 use objc2_metal::MTLCommandBuffer as _;
 use objc2_metal::MTLCommandQueue as _;
+use objc2_metal::MTLComputePipelineState as _;
 use objc2_metal::MTLDevice as _;
+use rmlx_metal::ComputePass;
 use rmlx_metal::MTLResourceOptions;
+use rmlx_metal::MTLSize;
 
 // ---------------------------------------------------------------------------
 // Metal shader source
@@ -126,8 +126,22 @@ pub fn register(registry: &KernelRegistry) -> Result<(), KernelError> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn make_u32_buf(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, val: u32) -> rmlx_metal::MtlBuffer {
-    unsafe { device.newBufferWithBytes_length_options(std::ptr::NonNull::new(&val as *const u32 as *const std::ffi::c_void as *mut std::ffi::c_void).unwrap(), 4_usize, MTLResourceOptions::StorageModeShared).unwrap() }
+fn make_u32_buf(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    val: u32,
+) -> rmlx_metal::MtlBuffer {
+    unsafe {
+        device
+            .newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(
+                    &val as *const u32 as *const std::ffi::c_void as *mut std::ffi::c_void,
+                )
+                .unwrap(),
+                4_usize,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap()
+    }
 }
 
 fn make_u32_vec_buf(
@@ -135,15 +149,23 @@ fn make_u32_vec_buf(
     vals: &[u32],
 ) -> rmlx_metal::MtlBuffer {
     if vals.is_empty() { // Metal needs at least 1 byte. return device.newBufferWithLength_options(4 as usize, MTLResourceOptions::StorageModeShared).unwrap();
-
     }
-    unsafe { device.newBufferWithBytes_length_options(std::ptr::NonNull::new(vals.as_ptr() as *const std::ffi::c_void as *mut std::ffi::c_void).unwrap(), (vals.len() * 4) as u64 as usize, MTLResourceOptions::StorageModeShared).unwrap() }
+    unsafe {
+        device
+            .newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(
+                    vals.as_ptr() as *const std::ffi::c_void as *mut std::ffi::c_void
+                )
+                .unwrap(),
+                (vals.len() * 4) as u64 as usize,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap()
+    }
 }
 
 /// Compute contiguous strides for a shape (in elements).
-fn contiguous_strides(
-    shape: &[usize],
-) -> Vec<usize> {
+fn contiguous_strides(shape: &[usize]) -> Vec<usize> {
     let ndim = shape.len();
 
     if ndim == 0 {
@@ -274,8 +296,16 @@ pub fn slice(
     enc.set_buffer(6, Some(&starts_buf), 0);
     enc.set_buffer(7, Some(&slice_strides_buf), 0);
     enc.set_buffer(8, Some(&numel_buf), 0);
-    let grid = MTLSize { width: out_numel, height: 1, depth: 1 };
-    let tg = MTLSize { width: std::cmp::min(256usize, pipeline.maxTotalThreadsPerThreadgroup()), height: 1, depth: 1 };
+    let grid = MTLSize {
+        width: out_numel,
+        height: 1,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: std::cmp::min(256usize, pipeline.maxTotalThreadsPerThreadgroup()),
+        height: 1,
+        depth: 1,
+    };
     enc.dispatch_threads(grid, tg);
     enc.end();
     super::commit_with_mode(&cb, super::ExecMode::Sync);

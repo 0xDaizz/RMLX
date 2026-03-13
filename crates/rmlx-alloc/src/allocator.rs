@@ -534,7 +534,9 @@ const DEFAULT_BLOCK_LIMIT: usize = 8 * 1024 * 1024 * 1024;
 ///
 /// Strategy: `min(1.5 * recommended_max_working_set_size, 0.95 * total_memory)`.
 /// Falls back to [`DEFAULT_BLOCK_LIMIT`] (8 GiB) if the device reports 0.
-fn auto_detect_block_limit(device: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>) -> usize {
+fn auto_detect_block_limit(
+    device: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>,
+) -> usize {
     let recommended = device.recommendedMaxWorkingSetSize();
     if recommended == 0 {
         return DEFAULT_BLOCK_LIMIT;
@@ -591,7 +593,9 @@ mod tests {
     unsafe impl Sync for SendAllocator {}
     impl std::ops::Deref for SendAllocator {
         type Target = MetalAllocator;
-        fn deref(&self) -> &MetalAllocator { &self.0 }
+        fn deref(&self) -> &MetalAllocator {
+            &self.0
+        }
     }
 
     /// Helper: create a MetalAllocator or skip the test if no Metal device.
@@ -784,10 +788,7 @@ mod tests {
         let poison_target = SendAllocator(Arc::clone(&allocator));
         let handle = std::thread::spawn(move || {
             let pt = poison_target; // capture whole SendAllocator (Send+Sync)
-            let _guard = pt.0
-                .cache
-                .lock()
-                .expect("lock cache for poisoning");
+            let _guard = pt.0.cache.lock().expect("lock cache for poisoning");
             panic!("poison cache mutex");
         });
         let _ = handle.join();

@@ -11,14 +11,14 @@
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
-use rmlx_metal::MTLSize;
-use rmlx_metal::ComputePass;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::MTLComputePipelineState as _;
 use objc2_metal::MTLCommandBuffer as _;
 use objc2_metal::MTLCommandQueue as _;
-use rmlx_metal::MTLResourceOptions;
+use objc2_metal::MTLComputePipelineState as _;
 use objc2_metal::MTLDevice as _;
+use rmlx_metal::ComputePass;
+use rmlx_metal::MTLResourceOptions;
+use rmlx_metal::MTLSize;
 
 // ---------------------------------------------------------------------------
 // Metal shader source
@@ -184,7 +184,17 @@ fn dispatch_unary(
     let out = Array::zeros(dev, input.shape(), input.dtype());
 
     let numel = input.numel();
-    let numel_buf = unsafe { dev.newBufferWithBytes_length_options(std::ptr::NonNull::new(&(numel as u32) as *const u32 as *const std::ffi::c_void as *mut std::ffi::c_void).unwrap(), 4_usize, MTLResourceOptions::StorageModeShared).unwrap() };
+    let numel_buf = unsafe {
+        dev.newBufferWithBytes_length_options(
+            std::ptr::NonNull::new(
+                &(numel as u32) as *const u32 as *const std::ffi::c_void as *mut std::ffi::c_void,
+            )
+            .unwrap(),
+            4_usize,
+            MTLResourceOptions::StorageModeShared,
+        )
+        .unwrap()
+    };
 
     let cb = queue.commandBuffer().unwrap();
     let raw_enc = cb.computeCommandEncoder().unwrap();
@@ -197,7 +207,18 @@ fn dispatch_unary(
     let tg_size = std::cmp::min(256usize, pipeline.maxTotalThreadsPerThreadgroup());
     let n_groups = (n_threads as usize).div_ceil(tg_size);
 
-    enc.dispatch_threadgroups(MTLSize { width: n_groups, height: 1, depth: 1 }, MTLSize { width: tg_size, height: 1, depth: 1 });
+    enc.dispatch_threadgroups(
+        MTLSize {
+            width: n_groups,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        },
+    );
     enc.end();
     super::commit_with_mode(&cb, super::ExecMode::Sync);
 

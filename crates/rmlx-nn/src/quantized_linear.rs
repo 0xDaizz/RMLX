@@ -6,13 +6,13 @@
 //! - `affine_quantized_matmul_batched` (QMM) for batched inputs (batch>1, Q4 only)
 //! - CPU `affine_qmm` fallback for Q4 batched when Metal QMM is unavailable
 
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLCommandQueue, MTLDevice, MTLResourceOptions};
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::{KernelError, KernelRegistry};
 use rmlx_core::ops::copy::copy_cast;
 use rmlx_core::ops::quantized::{self, QuantizedWeight};
-use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLCommandQueue, MTLDevice, MTLResourceOptions};
 
 /// Supported quantization bit widths for `QuantizedLinear`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,10 +202,22 @@ impl QuantizedLinear {
     /// Build a `QuantizedWeight` by uploading CPU buffers to Metal.
     ///
     /// Converts f32 scales/biases to f16 at upload time (one-time cost).
-    fn make_quantized_weight(&self, dev: &ProtocolObject<dyn MTLDevice>) -> Result<QuantizedWeight, KernelError> {
+    fn make_quantized_weight(
+        &self,
+        dev: &ProtocolObject<dyn MTLDevice>,
+    ) -> Result<QuantizedWeight, KernelError> {
         let opts = MTLResourceOptions::StorageModeShared;
 
-        let weights_buf = unsafe { dev.newBufferWithBytes_length_options(std::ptr::NonNull::new_unchecked(self.w_packed.as_ptr() as *const _ as *mut std::ffi::c_void), self.w_packed.len(), opts) }.unwrap();
+        let weights_buf = unsafe {
+            dev.newBufferWithBytes_length_options(
+                std::ptr::NonNull::new_unchecked(
+                    self.w_packed.as_ptr() as *const _ as *mut std::ffi::c_void
+                ),
+                self.w_packed.len(),
+                opts,
+            )
+        }
+        .unwrap();
 
         // Convert f32 scales to f16 at upload time (industry standard format)
         let scales_f16: Vec<u16> = self
@@ -213,14 +225,32 @@ impl QuantizedLinear {
             .iter()
             .map(|&v| quantized::f32_to_f16_bits(v))
             .collect();
-        let scales_buf = unsafe { dev.newBufferWithBytes_length_options(std::ptr::NonNull::new_unchecked(scales_f16.as_ptr() as *const _ as *mut std::ffi::c_void), scales_f16.len() * 2, opts) }.unwrap();
+        let scales_buf = unsafe {
+            dev.newBufferWithBytes_length_options(
+                std::ptr::NonNull::new_unchecked(
+                    scales_f16.as_ptr() as *const _ as *mut std::ffi::c_void
+                ),
+                scales_f16.len() * 2,
+                opts,
+            )
+        }
+        .unwrap();
 
         let biases_f16: Vec<u16> = self
             .biases
             .iter()
             .map(|&v| quantized::f32_to_f16_bits(v))
             .collect();
-        let biases_buf = unsafe { dev.newBufferWithBytes_length_options(std::ptr::NonNull::new_unchecked(biases_f16.as_ptr() as *const _ as *mut std::ffi::c_void), biases_f16.len() * 2, opts) }.unwrap();
+        let biases_buf = unsafe {
+            dev.newBufferWithBytes_length_options(
+                std::ptr::NonNull::new_unchecked(
+                    biases_f16.as_ptr() as *const _ as *mut std::ffi::c_void
+                ),
+                biases_f16.len() * 2,
+                opts,
+            )
+        }
+        .unwrap();
 
         QuantizedWeight::new(
             weights_buf,
@@ -871,8 +901,7 @@ mod tests {
     use super::*;
 
     fn test_device() -> rmlx_metal::MtlDevice {
-        objc2_metal::MTLCreateSystemDefaultDevice()
-            .expect("system_default Metal device")
+        objc2_metal::MTLCreateSystemDefaultDevice().expect("system_default Metal device")
     }
 
     fn invalid_shape_message(err: KernelError) -> String {

@@ -77,10 +77,7 @@ fn test_buffer_cache_acquire_release() {
     assert!(cached.is_none(), "empty cache should return None");
 
     // Allocate a real Metal buffer via the device, then release into cache
-    let buf = device.new_buffer(
-        4096,
-        rmlx_metal::MTLResourceOptions::StorageModeShared,
-    );
+    let buf = device.new_buffer(4096, rmlx_metal::MTLResourceOptions::StorageModeShared);
     let buf_len = buf.length();
     assert!(buf_len >= 4096);
     cache.release(buf);

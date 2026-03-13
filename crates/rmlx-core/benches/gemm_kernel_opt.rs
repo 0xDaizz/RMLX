@@ -13,16 +13,19 @@
 
 use std::time::{Duration, Instant};
 
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{
+    MTLBuffer as _, MTLCommandBuffer as _, MTLCommandEncoder as _, MTLCommandQueue as _,
+    MTLComputeCommandEncoder as _, MTLDevice as _,
+};
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::KernelRegistry;
 use rmlx_core::ops;
 use rmlx_metal::device::GpuDevice;
+use rmlx_metal::types::MtlBuffer;
+use rmlx_metal::{MTLResourceOptions, MTLSize};
 use std::ptr::NonNull;
-use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLDevice as _, MTLCommandQueue as _, MTLCommandBuffer as _, MTLComputeCommandEncoder as _, MTLCommandEncoder as _, MTLBuffer as _};
-use rmlx_metal::{MTLSize, MTLResourceOptions};
-use rmlx_metal::types::{MtlBuffer};
 
 const WARMUP_ITERS: usize = 5;
 const BENCH_ITERS: usize = 20;
@@ -837,7 +840,11 @@ fn f32_to_f16_bits(val: f32) -> u16 {
     ((sign << 15) | (new_exp as u32) << 10 | (frac >> 13)) as u16
 }
 
-fn rand_array(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, shape: &[usize], seed: u64) -> Array {
+fn rand_array(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    shape: &[usize],
+    seed: u64,
+) -> Array {
     let numel: usize = shape.iter().product();
     let mut f16_bytes = Vec::with_capacity(numel * 2);
     let mut state = seed;
@@ -854,7 +861,15 @@ fn rand_array(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, shape: &[usiz
 
 fn make_u32_buf(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, val: u32) -> MtlBuffer {
     let opts = MTLResourceOptions::StorageModeShared;
-    unsafe { device.newBufferWithBytes_length_options(NonNull::new(&val as *const u32 as *const _ as *mut _).unwrap(), 4_usize, opts).unwrap() }
+    unsafe {
+        device
+            .newBufferWithBytes_length_options(
+                NonNull::new(&val as *const u32 as *const _ as *mut _).unwrap(),
+                4_usize,
+                opts,
+            )
+            .unwrap()
+    }
 }
 
 fn ceil_div(a: usize, b: usize) -> usize {
@@ -903,14 +918,22 @@ fn bench_config(
 
     let grid_x = ceil_div(n, BN as usize) as u64;
     let grid_y = ceil_div(m, BM as usize) as u64;
-    let grid = MTLSize { width: grid_x as usize, height: grid_y as usize, depth: 1_usize };
+    let grid = MTLSize {
+        width: grid_x as usize,
+        height: grid_y as usize,
+        depth: 1_usize,
+    };
     // mlx_arch uses 64 threads; all other variants use N_THREADS (256)
     let n_threads = if cfg.label == "mlx_arch" {
         64u64
     } else {
         N_THREADS as u64
     };
-    let tg = MTLSize { width: n_threads as usize, height: 1_usize, depth: 1_usize };
+    let tg = MTLSize {
+        width: n_threads as usize,
+        height: 1_usize,
+        depth: 1_usize,
+    };
 
     // Warmup
     for _ in 0..WARMUP_ITERS {
@@ -1014,8 +1037,16 @@ fn main() {
         let bsb_buf = make_u32_buf(device, (vk * vn) as u32);
         let bsc_buf = make_u32_buf(device, (vm * vn) as u32);
         let sw_buf = make_u32_buf(device, 0u32);
-        let grid = MTLSize { width: ceil_div(vn, BN as usize), height: ceil_div(vm, BM as usize), depth: 1_usize };
-        let tg = MTLSize { width: N_THREADS as usize, height: 1_usize, depth: 1_usize };
+        let grid = MTLSize {
+            width: ceil_div(vn, BN as usize),
+            height: ceil_div(vm, BM as usize),
+            depth: 1_usize,
+        };
+        let tg = MTLSize {
+            width: N_THREADS as usize,
+            height: 1_usize,
+            depth: 1_usize,
+        };
 
         let cb = queue.commandBufferWithUnretainedReferences().unwrap();
         let enc = cb.computeCommandEncoder().unwrap();
@@ -1048,7 +1079,11 @@ fn main() {
 
             // mlx_arch uses 64 threads; all other variants use N_THREADS (256)
             let verify_tg = if cfg.label == "mlx_arch" {
-                MTLSize { width: 64_usize, height: 1_usize, depth: 1_usize }
+                MTLSize {
+                    width: 64_usize,
+                    height: 1_usize,
+                    depth: 1_usize,
+                }
             } else {
                 tg
             };

@@ -3,11 +3,11 @@
 //! Supports config-only construction for deferred weight loading (e.g., from safetensors)
 //! as well as direct construction via `from_arrays()`.
 
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLCommandQueue;
 use rmlx_core::array::Array;
 use rmlx_core::kernels::{KernelError, KernelRegistry};
 use rmlx_core::ops;
-use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLCommandQueue};
 
 // ============================================================================
 // Conv1d

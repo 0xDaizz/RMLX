@@ -656,8 +656,16 @@ fn dispatch_activation_simple(
     let n_threads = numel.div_ceil(elems_per_thread);
     let tg_size = std::cmp::min(256usize, pipeline.maxTotalThreadsPerThreadgroup());
     enc.dispatch_threads(
-        MTLSize { width: n_threads, height: 1, depth: 1 },
-        MTLSize { width: tg_size, height: 1, depth: 1 },
+        MTLSize {
+            width: n_threads,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        },
     );
     enc.end();
     cb.commit();
@@ -699,8 +707,16 @@ fn dispatch_activation_param(
     let n_threads = numel.div_ceil(elems_per_thread);
     let tg_size = std::cmp::min(256usize, pipeline.maxTotalThreadsPerThreadgroup());
     enc.dispatch_threads(
-        MTLSize { width: n_threads, height: 1, depth: 1 },
-        MTLSize { width: tg_size, height: 1, depth: 1 },
+        MTLSize {
+            width: n_threads,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        },
     );
     enc.end();
     cb.commit();
@@ -724,12 +740,26 @@ fn dtype_info(dtype: DType) -> Result<(&'static str, usize), KernelError> {
 
 /// Create a constant `uint` buffer on the device.
 fn make_u32_buf(device: &ProtocolObject<dyn MTLDevice>, val: u32) -> MtlBuffer {
-    unsafe { device.newBufferWithBytes_length_options(std::ptr::NonNull::new_unchecked(&val as *const u32 as *mut std::ffi::c_void), 4, MTLResourceOptions::StorageModeShared) }.unwrap()
+    unsafe {
+        device.newBufferWithBytes_length_options(
+            std::ptr::NonNull::new_unchecked(&val as *const u32 as *mut std::ffi::c_void),
+            4,
+            MTLResourceOptions::StorageModeShared,
+        )
+    }
+    .unwrap()
 }
 
 /// Create a constant `float` buffer on the device.
 fn make_f32_buf(device: &ProtocolObject<dyn MTLDevice>, val: f32) -> MtlBuffer {
-    unsafe { device.newBufferWithBytes_length_options(std::ptr::NonNull::new_unchecked(&val as *const f32 as *mut std::ffi::c_void), 4, MTLResourceOptions::StorageModeShared) }.unwrap()
+    unsafe {
+        device.newBufferWithBytes_length_options(
+            std::ptr::NonNull::new_unchecked(&val as *const f32 as *mut std::ffi::c_void),
+            4,
+            MTLResourceOptions::StorageModeShared,
+        )
+    }
+    .unwrap()
 }
 
 // ===========================================================================

@@ -13,13 +13,13 @@ use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
 use objc2::runtime::ProtocolObject;
-use objc2_metal::MTLComputePipelineState as _;
 use objc2_metal::MTLCommandBuffer as _;
 use objc2_metal::MTLCommandQueue as _;
+use objc2_metal::MTLComputePipelineState as _;
 use objc2_metal::MTLDevice as _;
+use rmlx_metal::ComputePass;
 use rmlx_metal::MTLResourceOptions;
 use rmlx_metal::MTLSize;
-use rmlx_metal::ComputePass;
 
 // ---------------------------------------------------------------------------
 // Metal shader sources
@@ -269,12 +269,24 @@ pub fn index_gather(
     enc.set_pipeline(&pipeline);
     enc.set_buffer(0, Some(src.metal_buffer()), src.offset());
     enc.set_buffer(1, Some(out.metal_buffer()), 0);
-    enc.set_buffer(2, Some(token_indices.metal_buffer()), token_indices.offset());
+    enc.set_buffer(
+        2,
+        Some(token_indices.metal_buffer()),
+        token_indices.offset(),
+    );
     enc.set_buffer(3, Some(&d_buf), 0);
     let tg_size = std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), d);
     // One threadgroup per assignment row
-    let grid = MTLSize { width: n_assign, height: 1, depth: 1 };
-    let tg = MTLSize { width: tg_size, height: 1, depth: 1 };
+    let grid = MTLSize {
+        width: n_assign,
+        height: 1,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: tg_size,
+        height: 1,
+        depth: 1,
+    };
     enc.dispatch_threadgroups(grid, tg);
     enc.end();
     super::commit_with_mode(&cb, super::ExecMode::Sync);
@@ -324,13 +336,25 @@ pub fn scatter_weighted_add(
     enc.set_pipeline(&pipeline);
     enc.set_buffer(0, Some(src.metal_buffer()), src.offset());
     enc.set_buffer(1, Some(output.metal_buffer()), output.offset());
-    enc.set_buffer(2, Some(token_indices.metal_buffer()), token_indices.offset());
+    enc.set_buffer(
+        2,
+        Some(token_indices.metal_buffer()),
+        token_indices.offset(),
+    );
     enc.set_buffer(3, Some(weights.metal_buffer()), weights.offset());
     enc.set_buffer(4, Some(&d_buf), 0);
     let tg_size = std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), d);
     // One threadgroup per assignment row
-    let grid = MTLSize { width: n_assign, height: 1, depth: 1 };
-    let tg = MTLSize { width: tg_size, height: 1, depth: 1 };
+    let grid = MTLSize {
+        width: n_assign,
+        height: 1,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: tg_size,
+        height: 1,
+        depth: 1,
+    };
     enc.dispatch_threadgroups(grid, tg);
     enc.end();
     super::commit_with_mode(&cb, super::ExecMode::Sync);
@@ -339,12 +363,26 @@ pub fn scatter_weighted_add(
 }
 
 /// Create a u32 Metal constant buffer.
-fn make_u32_buf(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, val: u32) -> rmlx_metal::MtlBuffer {
+fn make_u32_buf(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    val: u32,
+) -> rmlx_metal::MtlBuffer {
     let opts = MTLResourceOptions::StorageModeShared;
-    unsafe { device.newBufferWithBytes_length_options(std::ptr::NonNull::new(&val as *const u32 as *const _ as *mut std::ffi::c_void).unwrap(), 4_usize, opts).unwrap() }
+    unsafe {
+        device
+            .newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(&val as *const u32 as *const _ as *mut std::ffi::c_void)
+                    .unwrap(),
+                4_usize,
+                opts,
+            )
+            .unwrap()
+    }
 }
 
-#[cfg(test)] mod tests { use super::*;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
     fn setup() -> (KernelRegistry, rmlx_metal::MtlQueue) {
         let gpu = rmlx_metal::device::GpuDevice::system_default().unwrap();

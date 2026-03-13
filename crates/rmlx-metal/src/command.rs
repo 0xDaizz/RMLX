@@ -503,9 +503,7 @@ pub fn encode_compute_1d_tracked(
 /// The caller must ensure all data dependencies between dispatches are
 /// covered by explicit `memory_barrier_scope_buffers()` calls. Without
 /// proper barriers, concurrent dispatches may read stale data.
-pub fn new_concurrent_encoder(
-    cb: &ProtocolObject<dyn MTLCommandBuffer>,
-) -> MtlEncoder {
+pub fn new_concurrent_encoder(cb: &ProtocolObject<dyn MTLCommandBuffer>) -> MtlEncoder {
     let desc = MTLComputePassDescriptor::new();
     desc.setDispatchType(MTLDispatchType::Concurrent);
     cb.computeCommandEncoderWithDescriptor(&desc).unwrap()
