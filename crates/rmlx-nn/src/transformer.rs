@@ -188,60 +188,6 @@ impl FeedForward {
         }
     }
 
-    /// ExecGraph-based FFN forward using 2 command buffers.
-    ///
-    /// For gated SwiGLU:
-    /// - CB5 (current): gate + up + fused silu*mul
-    /// - CB6: down_proj + residual add
-    ///
-    /// For dense and MoE: falls back to sync path (graph sync + reset).
-    pub fn forward_graph(
-        &self,
-        normed: &Array,
-        residual: &Array,
-        registry: &KernelRegistry,
-        graph: &mut ExecGraph<'_, '_>,
-        queue: &metal::CommandQueue,
-    ) -> Result<Array, KernelError> {
-        match self {
-            FeedForward::Dense { .. } => {
-                graph
-                    .sync()
-                    .map_err(|e| KernelError::InvalidShape(format!("Dense graph sync: {e}")))?;
-                graph.reset();
-                let ffn_out = self.forward(normed, registry, queue)?;
-                ops::binary::add(registry, residual, &ffn_out, queue)
-            }
-            FeedForward::Gated {
-                gate_proj,
-                up_proj,
-                down_proj,
-                ..
-            } => {
-                // CB5 (current): gate + up + fused silu*mul
-                let cb5 = graph.command_buffer();
-                let gate_out = gate_proj.forward_into_cb(normed, registry, cb5)?;
-                let up_out = up_proj.forward_into_cb(normed, registry, cb5)?;
-                let hidden = ops::fused::fused_silu_mul_into_cb(registry, &gate_out, &up_out, cb5)?;
-                let _t5 = graph.submit_batch();
-
-                // CB6: down_proj + residual
-                let cb6 = graph.command_buffer();
-                let ffn_out = down_proj.forward_into_cb(&hidden, registry, cb6)?;
-                ops::binary::add_into_cb(registry, residual, &ffn_out, cb6)
-            }
-            FeedForward::MoE(moe) => {
-                // MoE: sync, reset, run synchronously
-                graph
-                    .sync()
-                    .map_err(|e| KernelError::InvalidShape(format!("MoE graph sync: {e}")))?;
-                graph.reset();
-                let ffn_out = moe.forward(normed, registry, queue)?;
-                ops::binary::add(registry, residual, &ffn_out, queue)
-            }
-        }
-    }
-
     /// Single-CB FFN forward: entire SwiGLU + residual in a provided CB.
     ///
     /// Does NOT commit or wait — the caller manages the CB lifecycle.
@@ -500,64 +446,6 @@ impl FeedForward {
             _ => Err(KernelError::InvalidShape(
                 "forward_norm_single_encoder only supports Gated FFN".into(),
             )),
-        }
-    }
-
-    /// Fused FFN: entire SwiGLU in 1 CB (gate + up + silu_mul + down + residual).
-    pub fn forward_graph_fused(
-        &self,
-        normed: &Array,
-        residual: &Array,
-        registry: &KernelRegistry,
-        graph: &mut ExecGraph<'_, '_>,
-        queue: &metal::CommandQueue,
-    ) -> Result<Array, KernelError> {
-        match self {
-            FeedForward::Dense { .. } => {
-                graph
-                    .sync()
-                    .map_err(|e| KernelError::InvalidShape(format!("Dense graph sync: {e}")))?;
-                graph.reset();
-                let ffn_out = self.forward(normed, registry, queue)?;
-                ops::binary::add(registry, residual, &ffn_out, queue)
-            }
-            FeedForward::Gated {
-                gate_proj,
-                up_proj,
-                down_proj,
-                gate_up_merged_weight_t,
-                ..
-            } => {
-                let cb = graph.command_buffer();
-                let normed_2d = if normed.ndim() == 1 {
-                    normed.reshape(vec![1, normed.shape()[0]])?
-                } else {
-                    normed.reshape(vec![normed.shape()[0], normed.shape()[1]])?
-                };
-                let hidden = if let Some(ref guw_t) = gate_up_merged_weight_t {
-                    let merged = ops::matmul::matmul_into_cb(registry, &normed_2d, guw_t, cb)?;
-                    let gate_dim = guw_t.shape()[1] / 2;
-                    // Strided SiLU*mul reads gate+up directly from merged buffer (no copy)
-                    ops::fused::fused_silu_mul_strided_into_cb(registry, &merged, gate_dim, cb)?
-                } else {
-                    let wgate_t = gate_proj.weight_transposed_contiguous()?;
-                    let wup_t = up_proj.weight_transposed_contiguous()?;
-                    let (gate_out, up_out) = ops::fused::batched_gate_up_into_cb(
-                        registry, &normed_2d, &wgate_t, &wup_t, cb,
-                    )?;
-                    ops::fused::fused_silu_mul_into_cb(registry, &gate_out, &up_out, cb)?
-                };
-                let ffn_out = down_proj.forward_into_cb(&hidden, registry, cb)?;
-                ops::binary::add_into_cb(registry, residual, &ffn_out, cb)
-            }
-            FeedForward::MoE(moe) => {
-                graph
-                    .sync()
-                    .map_err(|e| KernelError::InvalidShape(format!("MoE graph sync: {e}")))?;
-                graph.reset();
-                let ffn_out = moe.forward(normed, registry, queue)?;
-                ops::binary::add(registry, residual, &ffn_out, queue)
-            }
         }
     }
 
@@ -1354,150 +1242,6 @@ impl TransformerBlock {
 
         // Residual connection: h + ffn_out
         ops::binary::add(registry, &h, &ffn_out, queue)
-    }
-
-    /// Forward pass with automatic fusion of elementwise ops.
-    ///
-    /// Builds a lazy DAG per block. Non-fusable ops (RMSNorm, Attention,
-    /// Linear/MatMul) are computed eagerly and inserted as leaf nodes.
-    /// Fusable elementwise ops (residual add, gate*up mul) are recorded
-    /// as lazy ops and dispatched through `eval_fused()` for JIT fusion.
-    ///
-    /// `x`: [seq_len, hidden_size]
-    /// Returns: [seq_len, hidden_size]
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward_auto(
-        &self,
-        x: &Array,
-        cos_freqs: Option<&Array>,
-        sin_freqs: Option<&Array>,
-        mask: Option<&Array>,
-        cache: Option<&mut LayerKvCache>,
-        ctx: &mut rmlx_core::lazy::EvalContext<'_, '_, '_>,
-    ) -> Result<Array, KernelError> {
-        use rmlx_core::lazy::{LazyArray, LazyEvalError, LazyGraph, LazyOp};
-
-        let norm1_w = self.norm1_weight.as_ref().ok_or_else(|| {
-            KernelError::InvalidShape("TransformerBlock: norm1_weight not loaded".into())
-        })?;
-        let norm2_w = self.norm2_weight.as_ref().ok_or_else(|| {
-            KernelError::InvalidShape("TransformerBlock: norm2_weight not loaded".into())
-        })?;
-
-        let graph = LazyGraph::new();
-
-        // --- Pre-attention RMSNorm (standalone, eager) ---
-        let normed =
-            ops::rms_norm::rms_norm(ctx.registry, x, norm1_w, self.rms_norm_eps, ctx.queue)?;
-
-        // --- Attention (standalone, eager — needs mutable cache) ---
-        let attn_out = self.attention.forward(
-            &normed,
-            cos_freqs,
-            sin_freqs,
-            mask,
-            cache,
-            ctx.registry,
-            ctx.queue,
-        )?;
-
-        // --- Residual add: x + attn_out (fusable) ---
-        let lazy_x = LazyArray::from_array(
-            &graph,
-            x.view(x.shape().to_vec(), x.strides().to_vec(), x.offset()),
-        );
-        let lazy_attn = LazyArray::from_array(&graph, attn_out);
-        let lazy_h = lazy_x
-            .add(&lazy_attn)
-            .map_err(|e| KernelError::InvalidShape(format!("forward_auto residual1 add: {e}")))?;
-
-        // --- Pre-FFN RMSNorm (standalone) ---
-        // We need h materialized first. Record RMSNorm as standalone via Custom op.
-        let h_shape = lazy_h.shape();
-        let h_dtype = lazy_h.dtype();
-        let lazy_rmsnorm2 = LazyArray::from_op(
-            &graph,
-            LazyOp::RmsNorm(lazy_h.node_id()),
-            h_shape.clone(),
-            h_dtype,
-        );
-
-        // --- FFN (standalone matmuls + fusable gate*up) ---
-        // Record the FFN as a Custom op since it contains internal matmuls.
-        // We need the normed2 result to pass to FFN, so we mark the entire
-        // FFN output (including down_proj) as a Custom standalone.
-        let lazy_ffn = LazyArray::from_op(
-            &graph,
-            LazyOp::Custom("ffn".to_string(), vec![lazy_rmsnorm2.node_id()]),
-            h_shape.clone(),
-            h_dtype,
-        );
-
-        // --- Residual add: h + ffn_out (fusable) ---
-        let lazy_out = lazy_h
-            .add(&lazy_ffn)
-            .map_err(|e| KernelError::InvalidShape(format!("forward_auto residual2 add: {e}")))?;
-
-        // --- Evaluate the lazy graph with fusion ---
-        let eps = self.rms_norm_eps;
-        let norm2_w_ref = norm2_w;
-        let ffn_ref = &self.ffn;
-
-        let standalone_fn = |op: &LazyOp,
-                             inputs: Vec<&Array>,
-                             eval_ctx: &mut rmlx_core::lazy::EvalContext<'_, '_, '_>|
-         -> Result<Array, LazyEvalError> {
-            match op {
-                LazyOp::Add(_, _) => {
-                    ops::binary::add(eval_ctx.registry, inputs[0], inputs[1], eval_ctx.queue)
-                        .map_err(|e| LazyEvalError::EvalFailed(format!("add: {e}")))
-                }
-                LazyOp::Mul(_, _) => {
-                    ops::binary::mul(eval_ctx.registry, inputs[0], inputs[1], eval_ctx.queue)
-                        .map_err(|e| LazyEvalError::EvalFailed(format!("mul: {e}")))
-                }
-                LazyOp::Sub(_, _) => {
-                    ops::binary::sub(eval_ctx.registry, inputs[0], inputs[1], eval_ctx.queue)
-                        .map_err(|e| LazyEvalError::EvalFailed(format!("sub: {e}")))
-                }
-                LazyOp::RmsNorm(_) => ops::rms_norm::rms_norm(
-                    eval_ctx.registry,
-                    inputs[0],
-                    norm2_w_ref,
-                    eps,
-                    eval_ctx.queue,
-                )
-                .map_err(|e| LazyEvalError::EvalFailed(format!("rms_norm: {e}"))),
-                LazyOp::Custom(name, _) if name == "ffn" => ffn_ref
-                    .forward(inputs[0], eval_ctx.registry, eval_ctx.queue)
-                    .map_err(|e| LazyEvalError::EvalFailed(format!("ffn: {e}"))),
-                LazyOp::MatMul(_, _) => {
-                    ops::matmul::matmul(eval_ctx.registry, inputs[0], inputs[1], eval_ctx.queue)
-                        .map_err(|e| LazyEvalError::EvalFailed(format!("matmul: {e}")))
-                }
-                LazyOp::Neg(_) => ops::unary::neg(eval_ctx.registry, inputs[0], eval_ctx.queue)
-                    .map_err(|e| LazyEvalError::EvalFailed(format!("neg: {e}"))),
-                LazyOp::Softmax(_) => {
-                    ops::softmax::softmax(eval_ctx.registry, inputs[0], eval_ctx.queue)
-                        .map_err(|e| LazyEvalError::EvalFailed(format!("softmax: {e}")))
-                }
-                _ => Err(LazyEvalError::EvalFailed(format!(
-                    "unsupported standalone op: {:?}",
-                    op
-                ))),
-            }
-        };
-
-        lazy_out
-            .eval_fused(ctx, &standalone_fn)
-            .map_err(|e| KernelError::InvalidShape(format!("forward_auto eval_fused: {e}")))?;
-
-        let result_ref = lazy_out.try_get().ok_or_else(|| {
-            KernelError::InvalidShape("forward_auto: output not materialized".into())
-        })?;
-        let result = result_ref
-            .with(|arr| arr.view(arr.shape().to_vec(), arr.strides().to_vec(), arr.offset()));
-        Ok(result)
     }
 
     pub fn layer_idx(&self) -> usize {
@@ -3114,69 +2858,12 @@ impl TransformerBlock {
             .forward_concurrent_9dispatch(&normed2, &h, registry, cb)
     }
 
-    /// Pipelined forward pass using fused SwiGLU for the FFN.
-    ///
-    /// Same structure as `forward` but uses `ops::fused::fused_silu_mul`
-    /// instead of separate silu + mul.
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward_pipelined(
-        &self,
-        x: &Array,
-        cos_freqs: Option<&Array>,
-        sin_freqs: Option<&Array>,
-        mask: Option<&Array>,
-        cache: Option<&mut LayerKvCache>,
-        registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
-    ) -> Result<Array, KernelError> {
-        let norm1_w = self.norm1_weight.as_ref().ok_or_else(|| {
-            KernelError::InvalidShape("TransformerBlock: norm1_weight not loaded".into())
-        })?;
-        let norm2_w = self.norm2_weight.as_ref().ok_or_else(|| {
-            KernelError::InvalidShape("TransformerBlock: norm2_weight not loaded".into())
-        })?;
-
-        // Pre-attention norm
-        let normed = ops::rms_norm::rms_norm(registry, x, norm1_w, self.rms_norm_eps, queue)?;
-
-        // Attention
-        let attn_out = self
-            .attention
-            .forward(&normed, cos_freqs, sin_freqs, mask, cache, registry, queue)?;
-
-        // Residual connection: x + attn_out
-        let h = ops::binary::add(registry, x, &attn_out, queue)?;
-
-        // Pre-FFN norm
-        let normed2 = ops::rms_norm::rms_norm(registry, &h, norm2_w, self.rms_norm_eps, queue)?;
-
-        // FFN: dense uses generic path; gated uses fused SwiGLU
-        let ffn_out = match &self.ffn {
-            FeedForward::Dense { .. } => self.ffn.forward(&normed2, registry, queue)?,
-            FeedForward::Gated {
-                gate_proj,
-                up_proj,
-                down_proj,
-                ..
-            } => {
-                let gate_out = gate_proj.forward(&normed2, registry, queue)?;
-                let up_out = up_proj.forward(&normed2, registry, queue)?;
-                let hidden = ops::fused::fused_silu_mul(registry, &gate_out, &up_out, queue)?;
-                down_proj.forward(&hidden, registry, queue)?
-            }
-            FeedForward::MoE(moe) => moe.forward(&normed2, registry, queue)?,
-        };
-
-        // Residual connection: h + ffn_out
-        ops::binary::add(registry, &h, &ffn_out, queue)
-    }
-
     /// Single-CB forward pass for seq_len=1 decode.
     ///
     /// Encodes the entire transformer block (attention + FFN) into one
     /// command buffer with minimal dispatches. Does NOT commit or wait.
     #[allow(clippy::too_many_arguments)]
-    pub fn forward_single_cb(
+    pub fn forward_decode_into_cb(
         &self,
         x: &Array,
         cos_freqs: Option<&Array>,
@@ -3227,7 +2914,7 @@ impl TransformerBlock {
     ///
     /// Does NOT commit or wait on the CB — the caller manages its lifecycle.
     #[allow(clippy::too_many_arguments)]
-    pub fn forward_prefill_single_cb(
+    pub fn forward_prefill_into_cb(
         &self,
         x: &Array,
         cos_freqs: Option<&Array>,
@@ -3246,7 +2933,7 @@ impl TransformerBlock {
 
         // Attention (all in same CB — norm + Q/K/V + deinterleave/RoPE
         //   + cache append + SDPA + head concat + O_proj)
-        let attn_out = self.attention.forward_prefill_single_cb(
+        let attn_out = self.attention.forward_prefill_into_cb(
             x,
             norm1_w,
             self.rms_norm_eps,
@@ -3278,7 +2965,7 @@ impl TransformerBlock {
     /// - The KV cache must be pre-allocated.
     /// - The caller manages the encoder lifecycle (creation and `end_encoding()`).
     #[allow(clippy::too_many_arguments)]
-    pub fn forward_prefill_single_encoder(
+    pub fn forward_prefill_into_encoder(
         &self,
         x: &Array,
         cos_freqs: Option<&Array>,
@@ -3296,7 +2983,7 @@ impl TransformerBlock {
         })?;
 
         // Attention (all ops share the same encoder)
-        let attn_out = self.attention.forward_prefill_single_encoder(
+        let attn_out = self.attention.forward_prefill_into_encoder(
             x,
             norm1_w,
             self.rms_norm_eps,
@@ -3314,7 +3001,14 @@ impl TransformerBlock {
         self.ffn
             .forward_norm_single_encoder(&h, norm2_w, self.rms_norm_eps, &h, registry, encoder)
     }
+}
 
+// ---------------------------------------------------------------------------
+// Diagnostic / benchmark-only methods for TransformerBlock
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "bench")]
+impl TransformerBlock {
     /// Per-dispatch GPU timing breakdown: runs each of the 9 prefill dispatches
     /// in its own command buffer and returns wall-clock timing for each.
     ///
@@ -3329,7 +3023,7 @@ impl TransformerBlock {
     ///   8. SiLU×Mul (strided)
     ///   9. Down Proj + Residual
     ///
-    /// **Prerequisites:** same as `forward_prefill_single_cb`.
+    /// **Prerequisites:** same as `forward_prefill_into_cb`.
     #[allow(clippy::too_many_arguments)]
     pub fn forward_prefill_breakdown(
         &self,
@@ -3455,7 +3149,7 @@ impl TransformerBlock {
     ///
     /// Returns: `Vec<(&str, f64)>` — 9 entries of (dispatch_name, isolated_time_us).
     ///
-    /// **Prerequisites:** same as `forward_prefill_single_encoder`.
+    /// **Prerequisites:** same as `forward_prefill_into_encoder`.
     #[allow(clippy::too_many_arguments)]
     pub fn forward_prefill_cumulative_breakdown(
         &self,
@@ -3685,85 +3379,6 @@ impl TransformerBlock {
             .collect();
 
         Ok(result)
-    }
-
-    /// ExecGraph-based prefill forward: 1 CB per block, GPU-side chaining.
-    ///
-    /// Like `forward_prefill_single_cb` but uses ExecGraph to submit
-    /// the CB with GPU-side event signaling, enabling inter-layer
-    /// overlap when the GPU has spare execution bandwidth.
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward_prefill_graph(
-        &self,
-        x: &Array,
-        cos_freqs: Option<&Array>,
-        sin_freqs: Option<&Array>,
-        mask: Option<&Array>,
-        cache: &mut LayerKvCache,
-        registry: &KernelRegistry,
-        graph: &mut ExecGraph<'_, '_>,
-    ) -> Result<Array, KernelError> {
-        let cb = graph.command_buffer();
-        let result =
-            self.forward_prefill_single_cb(x, cos_freqs, sin_freqs, mask, cache, registry, cb)?;
-        // Submit the batch — GPU FIFO ordering on a single queue ensures
-        // the next layer's CB executes after this one completes. No
-        // explicit wait_for needed between layers.
-        let _t = graph.submit_batch();
-        Ok(result)
-    }
-
-    /// Full ExecGraph forward pass (5 CBs total).
-    ///
-    /// CB1: RMS norm + Q/K/V projections (fused)
-    /// CB2: head split + RoPE + cache append
-    /// CB3: SDPA + head concat + O_proj
-    /// CB4: residual + pre-FFN norm
-    /// CB5: gate + up + silu_mul + down + residual (entire FFN)
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward_graph(
-        &self,
-        x: &Array,
-        cos_freqs: Option<&Array>,
-        sin_freqs: Option<&Array>,
-        mask: Option<&Array>,
-        cache: Option<&mut LayerKvCache>,
-        registry: &KernelRegistry,
-        graph: &mut ExecGraph<'_, '_>,
-        queue: &metal::CommandQueue,
-    ) -> Result<Array, KernelError> {
-        let norm1_w = self.norm1_weight.as_ref().ok_or_else(|| {
-            KernelError::InvalidShape("TransformerBlock: norm1_weight not loaded".into())
-        })?;
-        let norm2_w = self.norm2_weight.as_ref().ok_or_else(|| {
-            KernelError::InvalidShape("TransformerBlock: norm2_weight not loaded".into())
-        })?;
-
-        // ---- CB1-3: norm + Q/K/V projections + RoPE + SDPA + O_proj ----
-        // Attention manages its own internal GPU-side event chains.
-        let attn_out = self.attention.forward_graph_fused(
-            x,
-            norm1_w,
-            self.rms_norm_eps,
-            cos_freqs,
-            sin_freqs,
-            mask,
-            cache,
-            registry,
-            graph,
-        )?;
-
-        // ---- CB4: residual + pre-FFN norm ----
-        // GPU FIFO ordering ensures attention output is ready.
-        let cb4 = graph.command_buffer();
-        let h = ops::binary::add_into_cb(registry, x, &attn_out, cb4)?;
-        let normed2 =
-            ops::rms_norm::rms_norm_into_cb(registry, &h, Some(norm2_w), self.rms_norm_eps, cb4)?;
-        let _t4 = graph.submit_batch();
-
-        // ---- CB5: entire FFN (gate + up + silu_mul + down + residual) ----
-        self.ffn
-            .forward_graph_fused(&normed2, &h, registry, graph, queue)
     }
 }
 
@@ -4166,7 +3781,7 @@ pub enum ForwardMode {
         /// Number of transformer layers encoded per command buffer.
         layers_per_cb: usize,
     },
-    /// Decode mode: multiple CBs per layer (existing forward_graph behavior).
+    /// Decode mode: single CB per layer via forward_decode_into_cb.
     #[default]
     Decode,
     /// Chunked decode: ops-based auto-submit batches ~N layers per CB.
@@ -4180,6 +3795,10 @@ pub enum ForwardMode {
         /// Recommended: 50 (matches MLX's strategy on M3 Ultra).
         max_ops_per_cb: usize,
     },
+    /// All layers in a single CB + single encoder. Most efficient prefill path.
+    /// Eliminates per-layer CB/encoder overhead entirely.
+    /// **Requires** `prepare_weights_for_graph()`.
+    CompiledPrefill,
 }
 
 pub struct TransformerModel {
@@ -4285,68 +3904,6 @@ impl TransformerModel {
         lm_head.forward(&x, registry, queue)
     }
 
-    /// Forward pass with automatic fusion of elementwise ops.
-    ///
-    /// Uses `LazyGraph` + `eval_fused()` to automatically fuse consecutive
-    /// elementwise ops (residual adds, gate*up multiplications) within each
-    /// transformer block. Non-fusable ops (RMSNorm, Attention, Linear) run
-    /// eagerly.
-    ///
-    /// Requires a `FusionCodegen` to be attached to the `EvalContext` for JIT
-    /// kernel generation.
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward_auto(
-        &self,
-        token_ids: &[u32],
-        cos_freqs: Option<&Array>,
-        sin_freqs: Option<&Array>,
-        mask: Option<&Array>,
-        mut cache: Option<&mut Vec<LayerKvCache>>,
-        ctx: &mut rmlx_core::lazy::EvalContext<'_, '_, '_>,
-    ) -> Result<Array, KernelError> {
-        let embedding = self.embedding.as_ref().ok_or_else(|| {
-            KernelError::InvalidShape("TransformerModel: embedding not loaded".into())
-        })?;
-        let final_norm = self.final_norm_weight.as_ref().ok_or_else(|| {
-            KernelError::InvalidShape("TransformerModel: final_norm not loaded".into())
-        })?;
-        let lm_head = self.lm_head.as_ref().ok_or_else(|| {
-            KernelError::InvalidShape("TransformerModel: lm_head not loaded".into())
-        })?;
-
-        // Embedding lookup (eager)
-        let mut x = embedding.forward(token_ids, ctx.registry, ctx.queue)?;
-
-        // Validate cache
-        if let Some(ref c) = cache {
-            if c.len() != self.layers.len() {
-                return Err(KernelError::InvalidShape(format!(
-                    "TransformerModel: cache has {} entries but model has {} layers",
-                    c.len(),
-                    self.layers.len()
-                )));
-            }
-        }
-
-        // Transformer layers with auto-fusion
-        for (i, layer) in self.layers.iter().enumerate() {
-            let layer_cache = cache.as_mut().map(|c| &mut c[i]);
-            x = layer.forward_auto(&x, cos_freqs, sin_freqs, mask, layer_cache, ctx)?;
-        }
-
-        // Final norm (eager)
-        x = ops::rms_norm::rms_norm(
-            ctx.registry,
-            &x,
-            final_norm,
-            self.config.rms_norm_eps,
-            ctx.queue,
-        )?;
-
-        // LM head (eager)
-        lm_head.forward(&x, ctx.registry, ctx.queue)
-    }
-
     pub fn num_layers(&self) -> usize {
         self.num_layers
     }
@@ -4374,63 +3931,10 @@ impl TransformerModel {
         Ok(())
     }
 
-    /// Pipelined model forward: uses fused SwiGLU within each block.
-    ///
-    /// Same as `forward` but each block uses `forward_pipelined`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward_pipelined(
-        &self,
-        token_ids: &[u32],
-        cos_freqs: Option<&Array>,
-        sin_freqs: Option<&Array>,
-        mask: Option<&Array>,
-        mut cache: Option<&mut Vec<LayerKvCache>>,
-        registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
-    ) -> Result<Array, KernelError> {
-        let embedding = self.embedding.as_ref().ok_or_else(|| {
-            KernelError::InvalidShape("TransformerModel: embedding not loaded".into())
-        })?;
-        let final_norm = self.final_norm_weight.as_ref().ok_or_else(|| {
-            KernelError::InvalidShape("TransformerModel: final_norm not loaded".into())
-        })?;
-        let lm_head = self.lm_head.as_ref().ok_or_else(|| {
-            KernelError::InvalidShape("TransformerModel: lm_head not loaded".into())
-        })?;
-
-        let mut x = embedding.forward(token_ids, registry, queue)?;
-
-        if let Some(ref c) = cache {
-            if c.len() != self.layers.len() {
-                return Err(KernelError::InvalidShape(format!(
-                    "TransformerModel: cache has {} entries but model has {} layers",
-                    c.len(),
-                    self.layers.len()
-                )));
-            }
-        }
-
-        for (i, layer) in self.layers.iter().enumerate() {
-            let layer_cache = cache.as_mut().map(|c| &mut c[i]);
-            x = layer.forward_pipelined(
-                &x,
-                cos_freqs,
-                sin_freqs,
-                mask,
-                layer_cache,
-                registry,
-                queue,
-            )?;
-        }
-
-        x = ops::rms_norm::rms_norm(registry, &x, final_norm, self.config.rms_norm_eps, queue)?;
-        lm_head.forward(&x, registry, queue)
-    }
-
     /// Full ExecGraph model forward: token IDs -> logits.
     ///
     /// Creates an ExecGraph per forward pass, running each transformer block
-    /// through `forward_graph` (6 CBs per block), then a final norm + LM head.
+    /// through `forward_decode_into_cb` (1 CB per block), then a final norm + LM head.
     /// The CPU blocks only once at the very end.
     /// Unified ExecGraph forward: token IDs -> logits.
     ///
@@ -4475,11 +3979,48 @@ impl TransformerModel {
             }
         }
 
+        // CompiledPrefill: single CB + single encoder, no ExecGraph needed.
+        // Handle before ExecGraph creation to avoid unnecessary allocation.
+        if matches!(mode, ForwardMode::CompiledPrefill) {
+            let cache = cache.ok_or_else(|| {
+                KernelError::InvalidShape(
+                    "TransformerModel: CompiledPrefill mode requires cache".into(),
+                )
+            })?;
+            let cb = queue.new_command_buffer();
+            let encoder = cb.new_compute_command_encoder();
+            for (i, layer) in self.layers.iter().enumerate() {
+                x = layer.forward_prefill_into_encoder(
+                    &x,
+                    cos_freqs,
+                    sin_freqs,
+                    mask,
+                    &mut cache[i],
+                    registry,
+                    encoder,
+                )?;
+            }
+            // Final norm + LM head in same encoder
+            x = ops::rms_norm::rms_norm_encode(
+                registry,
+                &x,
+                Some(final_norm),
+                self.config.rms_norm_eps,
+                encoder,
+            )?;
+            x = lm_head.forward_into_encoder(&x, registry, encoder)?;
+            encoder.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            return Ok(x);
+        }
+
         let encoder_limit = match mode {
             ForwardMode::Decode => 32,
             ForwardMode::Prefill { .. } => 64,
             // Chunked decode: raise encoder limit to accommodate ~50 ops/CB
             ForwardMode::ChunkedDecode { max_ops_per_cb } => max_ops_per_cb.max(64),
+            ForwardMode::CompiledPrefill => unreachable!("handled above"),
         };
         let mut graph = ExecGraph::new(queue, event, encoder_limit);
 
@@ -4493,38 +4034,36 @@ impl TransformerModel {
                 let mut cache = cache;
                 for (i, layer) in self.layers.iter().enumerate() {
                     let layer_cache = cache.as_mut().map(|c| &mut c[i]);
-                    x = layer.forward_graph(
+                    let cb = graph.command_buffer();
+                    x = layer.forward_decode_into_cb(
                         &x,
                         cos_freqs,
                         sin_freqs,
                         mask,
                         layer_cache,
                         registry,
-                        &mut graph,
-                        queue,
+                        cb,
                     )?;
-                    let _t = graph.submit_batch();
+                    graph.submit_batch();
                 }
             }
             ForwardMode::ChunkedDecode { .. } => {
-                // Chunked decode: same layer forward as Decode, but submit_batch()
-                // calls inside forward_graph + this loop are soft hints — the CB is
-                // only committed when accumulated ops reach max_ops_per_cb.
-                // After each layer, record ~9 dispatches (the typical count for a
-                // decode layer: norm, QKV proj, RoPE×2, deinterleave, SDPA, copy,
+                // Chunked decode: single CB per layer via forward_decode_into_cb,
+                // with ops-based auto-submit. After each layer, record ~9 dispatches
+                // (norm, QKV proj, RoPE×2, deinterleave, SDPA, copy,
                 // O_proj+residual, norm2, gate+up+silu, down+residual).
                 let mut cache = cache;
                 for (i, layer) in self.layers.iter().enumerate() {
                     let layer_cache = cache.as_mut().map(|c| &mut c[i]);
-                    x = layer.forward_graph(
+                    let cb = graph.command_buffer();
+                    x = layer.forward_decode_into_cb(
                         &x,
                         cos_freqs,
                         sin_freqs,
                         mask,
                         layer_cache,
                         registry,
-                        &mut graph,
-                        queue,
+                        cb,
                     )?;
                     // Record ~9 ops per decode layer; auto-submits when threshold reached
                     graph.record_ops(9);
@@ -4538,7 +4077,7 @@ impl TransformerModel {
                 })?;
                 for (i, layer) in self.layers.iter().enumerate() {
                     let cb = graph.command_buffer();
-                    x = layer.forward_prefill_single_cb(
+                    x = layer.forward_prefill_into_cb(
                         &x,
                         cos_freqs,
                         sin_freqs,
@@ -4552,6 +4091,7 @@ impl TransformerModel {
                     }
                 }
             }
+            ForwardMode::CompiledPrefill => unreachable!("handled before ExecGraph creation"),
         }
 
         // Final norm + LM head (encode into graph)
@@ -4569,176 +4109,11 @@ impl TransformerModel {
             ForwardMode::Decode => "TransformerModel graph sync",
             ForwardMode::ChunkedDecode { .. } => "chunked decode graph sync",
             ForwardMode::Prefill { .. } => "prefill graph sync",
+            ForwardMode::CompiledPrefill => unreachable!("handled before ExecGraph creation"),
         };
         graph
             .sync()
             .map_err(|e| KernelError::InvalidShape(format!("{sync_label}: {e}")))?;
-
-        Ok(x)
-    }
-
-    /// ExecGraph decode forward. Delegates to [`forward_graph_unified`].
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward_graph(
-        &self,
-        token_ids: &[u32],
-        cos_freqs: Option<&Array>,
-        sin_freqs: Option<&Array>,
-        mask: Option<&Array>,
-        cache: Option<&mut Vec<LayerKvCache>>,
-        registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
-        event: &GpuEvent,
-    ) -> Result<Array, KernelError> {
-        let cache_slice = cache.map(|v| v.as_mut_slice());
-        self.forward_graph_unified(
-            token_ids,
-            cos_freqs,
-            sin_freqs,
-            mask,
-            cache_slice,
-            ForwardMode::Decode,
-            registry,
-            queue,
-            event,
-        )
-    }
-
-    /// ExecGraph prefill forward. Delegates to [`forward_graph_unified`].
-    ///
-    /// **Requires** `prepare_weights_for_graph()` to have been called.
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward_prefill_graph(
-        &self,
-        token_ids: &[u32],
-        cos_freqs: Option<&Array>,
-        sin_freqs: Option<&Array>,
-        mask: Option<&Array>,
-        cache: &mut [LayerKvCache],
-        registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
-        event: &GpuEvent,
-    ) -> Result<Array, KernelError> {
-        self.forward_graph_unified(
-            token_ids,
-            cos_freqs,
-            sin_freqs,
-            mask,
-            Some(cache),
-            ForwardMode::Prefill { layers_per_cb: 4 },
-            registry,
-            queue,
-            event,
-        )
-    }
-
-    /// Chunked decode forward: batches ~50 ops per CB for reduced overhead.
-    ///
-    /// Instead of 4+ CBs per layer (the `Decode` default), this path accumulates
-    /// dispatch ops and only commits a CB when the threshold is reached. With 32
-    /// layers at ~9 ops/layer, this reduces total CBs from ~128 to ~6.
-    ///
-    /// Delegates to [`forward_graph_unified`] with `ChunkedDecode` mode.
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward_graph_chunked(
-        &self,
-        token_ids: &[u32],
-        cos_freqs: Option<&Array>,
-        sin_freqs: Option<&Array>,
-        mask: Option<&Array>,
-        cache: Option<&mut Vec<LayerKvCache>>,
-        registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
-        event: &GpuEvent,
-    ) -> Result<Array, KernelError> {
-        let cache_slice = cache.map(|v| v.as_mut_slice());
-        self.forward_graph_unified(
-            token_ids,
-            cos_freqs,
-            sin_freqs,
-            mask,
-            cache_slice,
-            ForwardMode::ChunkedDecode { max_ops_per_cb: 50 },
-            registry,
-            queue,
-            event,
-        )
-    }
-
-    /// Compiled prefill forward: all layers in a single CB + single encoder.
-    ///
-    /// This is the most efficient prefill path, eliminating:
-    /// - Per-layer command buffer creation
-    /// - Per-layer encoder creation/destruction
-    /// - Inter-layer GPU idle time from CB boundaries
-    ///
-    /// All 32+ layers share one `ComputeCommandEncoder` within one `CommandBuffer`.
-    /// Metal's sequential dispatch ordering within a single encoder guarantees
-    /// correct inter-layer dependencies without explicit barriers.
-    ///
-    /// **Requires** `prepare_weights_for_graph()` to have been called on all layers.
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward_prefill_compiled(
-        &self,
-        token_ids: &[u32],
-        cos_freqs: Option<&Array>,
-        sin_freqs: Option<&Array>,
-        mask: Option<&Array>,
-        cache: &mut [LayerKvCache],
-        registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
-    ) -> Result<Array, KernelError> {
-        let embedding = self.embedding.as_ref().ok_or_else(|| {
-            KernelError::InvalidShape("TransformerModel: embedding not loaded".into())
-        })?;
-        let final_norm = self.final_norm_weight.as_ref().ok_or_else(|| {
-            KernelError::InvalidShape("TransformerModel: final_norm not loaded".into())
-        })?;
-        let lm_head = self.lm_head.as_ref().ok_or_else(|| {
-            KernelError::InvalidShape("TransformerModel: lm_head not loaded".into())
-        })?;
-
-        // Validate cache
-        if cache.len() != self.layers.len() {
-            return Err(KernelError::InvalidShape(format!(
-                "TransformerModel: cache has {} entries but model has {} layers",
-                cache.len(),
-                self.layers.len()
-            )));
-        }
-
-        // Embedding lookup (sync — small, fast)
-        let mut x = embedding.forward(token_ids, registry, queue)?;
-
-        // Single CB + single encoder for ALL transformer layers
-        let cb = queue.new_command_buffer();
-        let encoder = cb.new_compute_command_encoder();
-
-        for (i, layer) in self.layers.iter().enumerate() {
-            x = layer.forward_prefill_single_encoder(
-                &x,
-                cos_freqs,
-                sin_freqs,
-                mask,
-                &mut cache[i],
-                registry,
-                encoder,
-            )?;
-        }
-
-        // Final norm + LM head in same encoder
-        x = ops::rms_norm::rms_norm_encode(
-            registry,
-            &x,
-            Some(final_norm),
-            self.config.rms_norm_eps,
-            encoder,
-        )?;
-        x = lm_head.forward_into_encoder(&x, registry, encoder)?;
-
-        encoder.end_encoding();
-        cb.commit();
-        cb.wait_until_completed();
 
         Ok(x)
     }
@@ -5013,213 +4388,5 @@ mod tests {
             }
             _ => panic!("Expected Dense FFN variant"),
         }
-    }
-
-    /// Test that forward_auto() produces the same result as forward().
-    ///
-    /// Uses a minimal 1-layer model with ones weights. Compares outputs
-    /// element-wise with tolerance for floating point variance.
-    #[test]
-    fn test_forward_auto_matches_forward() {
-        use rmlx_core::lazy::EvalContext;
-
-        let device = match metal::Device::system_default() {
-            Some(d) => d,
-            None => return, // skip on CI without Metal
-        };
-
-        let gpu = match rmlx_metal::device::GpuDevice::system_default() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-        let queue = device.new_command_queue();
-        let registry = KernelRegistry::new(gpu);
-
-        // Register all required kernels — skip test if Metal compiler unavailable
-        if ops::register_all(&registry).is_err() {
-            return;
-        }
-
-        let hidden_size = 64;
-        let num_heads = 4;
-        let num_kv_heads = 4;
-        let head_dim = 16;
-        let intermediate_dim = 128;
-        let vocab_size = 100;
-
-        // Build attention with ones weights
-        let attn_config = crate::attention::AttentionConfig {
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            max_seq_len: 128,
-            rope_theta: 10000.0,
-        };
-        let q_proj = Linear::from_arrays(
-            crate::linear::LinearConfig {
-                in_features: hidden_size,
-                out_features: num_heads * head_dim,
-                has_bias: false,
-            },
-            Array::ones(&device, &[num_heads * head_dim, hidden_size]),
-            None,
-        )
-        .unwrap();
-        let k_proj = Linear::from_arrays(
-            crate::linear::LinearConfig {
-                in_features: hidden_size,
-                out_features: num_kv_heads * head_dim,
-                has_bias: false,
-            },
-            Array::ones(&device, &[num_kv_heads * head_dim, hidden_size]),
-            None,
-        )
-        .unwrap();
-        let v_proj = Linear::from_arrays(
-            crate::linear::LinearConfig {
-                in_features: hidden_size,
-                out_features: num_kv_heads * head_dim,
-                has_bias: false,
-            },
-            Array::ones(&device, &[num_kv_heads * head_dim, hidden_size]),
-            None,
-        )
-        .unwrap();
-        let o_proj = Linear::from_arrays(
-            crate::linear::LinearConfig {
-                in_features: num_heads * head_dim,
-                out_features: hidden_size,
-                has_bias: false,
-            },
-            Array::ones(&device, &[hidden_size, num_heads * head_dim]),
-            None,
-        )
-        .unwrap();
-        let attn =
-            crate::attention::Attention::from_layers(attn_config, q_proj, k_proj, v_proj, o_proj)
-                .unwrap();
-
-        let gate_proj = Linear::from_arrays(
-            crate::linear::LinearConfig {
-                in_features: hidden_size,
-                out_features: intermediate_dim,
-                has_bias: false,
-            },
-            Array::ones(&device, &[intermediate_dim, hidden_size]),
-            None,
-        )
-        .unwrap();
-        let up_proj = Linear::from_arrays(
-            crate::linear::LinearConfig {
-                in_features: hidden_size,
-                out_features: intermediate_dim,
-                has_bias: false,
-            },
-            Array::ones(&device, &[intermediate_dim, hidden_size]),
-            None,
-        )
-        .unwrap();
-        let down_proj = Linear::from_arrays(
-            crate::linear::LinearConfig {
-                in_features: intermediate_dim,
-                out_features: hidden_size,
-                has_bias: false,
-            },
-            Array::ones(&device, &[hidden_size, intermediate_dim]),
-            None,
-        )
-        .unwrap();
-
-        let ffn = FeedForward::Gated {
-            gate_proj,
-            up_proj,
-            down_proj,
-            gate_up_merged_weight: None,
-            gate_up_merged_weight_t: None,
-        };
-
-        let norm1 = Array::ones(&device, &[hidden_size]);
-        let norm2 = Array::ones(&device, &[hidden_size]);
-
-        let block = TransformerBlock::from_parts(0, attn, ffn, norm1, norm2, 1e-5);
-
-        // Build model
-        let embed_config = crate::embedding::EmbeddingConfig {
-            vocab_size,
-            embed_dim: hidden_size,
-        };
-        let embed = crate::embedding::Embedding::from_array(
-            embed_config,
-            Array::ones(&device, &[vocab_size, hidden_size]),
-        )
-        .unwrap();
-        let lm_head = Linear::from_arrays(
-            crate::linear::LinearConfig {
-                in_features: hidden_size,
-                out_features: vocab_size,
-                has_bias: false,
-            },
-            Array::ones(&device, &[vocab_size, hidden_size]),
-            None,
-        )
-        .unwrap();
-        let final_norm = Array::ones(&device, &[hidden_size]);
-
-        let config = TransformerConfig {
-            hidden_size,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            num_layers: 1,
-            vocab_size,
-            max_seq_len: 128,
-            rope_theta: 10000.0,
-            rms_norm_eps: 1e-5,
-            ff_type: FeedForwardType::Gated { intermediate_dim },
-        };
-
-        let mut model =
-            TransformerModel::from_parts(config, embed, vec![block], final_norm, lm_head).unwrap();
-
-        let token_ids = [1u32, 2, 3];
-
-        // forward() baseline
-        let out_baseline = model
-            .forward(&token_ids, None, None, None, None, &registry, &queue)
-            .unwrap();
-
-        // forward_auto()
-        let codegen = rmlx_core::fusion::FusionCodegen::new();
-        let mut ctx = EvalContext::new(&device, &registry, &queue).with_codegen(&codegen);
-        let out_auto = model
-            .forward_auto(&token_ids, None, None, None, None, &mut ctx)
-            .unwrap();
-
-        // Compare shapes
-        assert_eq!(out_baseline.shape(), out_auto.shape());
-        assert_eq!(out_baseline.dtype(), out_auto.dtype());
-
-        // Compare values (read both to CPU and check element-wise)
-        let n = out_baseline.numel();
-        let baseline_data: Vec<f32> = out_baseline.to_vec_checked();
-        let auto_data: Vec<f32> = out_auto.to_vec_checked();
-
-        assert_eq!(baseline_data.len(), n);
-        assert_eq!(auto_data.len(), n);
-
-        let mut max_diff = 0.0f32;
-        for i in 0..n {
-            let diff = (baseline_data[i] - auto_data[i]).abs();
-            if diff > max_diff {
-                max_diff = diff;
-            }
-        }
-
-        // Allow small tolerance for floating point differences
-        assert!(
-            max_diff < 1e-3,
-            "forward vs forward_auto max diff: {} (tolerance: 1e-3)",
-            max_diff
-        );
     }
 }

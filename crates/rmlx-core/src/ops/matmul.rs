@@ -6806,18 +6806,22 @@ pub fn matmul(
     }
 
     // -----------------------------------------------------------------------
-    // Data-driven Split-K f16 for M=2..128
-    // Benchmark: SplitK-Small with optimal n_splits beats all other kernels
-    // at M=2~64 (1.5-2.7x over MLX), and wins 3/4 shapes at M=65~128.
-    // For M=65~128 with N>>K, NAX/tiled GEMM wins — skip Split-K there.
+    // Split-K f16: data shows Split-K helps at small M (K-loop bottleneck)
+    // but hurts at M>=33 where tiled GEMM has enough tile parallelism.
+    // M=2~8: always Split-K (K-loop dominates at tiny M regardless of shape)
+    // M=9~32: Split-K only when K >= N (K-dominant or balanced shapes)
+    // M>=33: never Split-K (tiled GEMM wins across all shapes)
     // -----------------------------------------------------------------------
     if a.dtype() == DType::Float16 && k >= 256 {
-        if (2..=64).contains(&m) {
-            let n_splits = optimal_splitk_nsplits(m, n, k);
-            return dispatch_split_k_f16(registry, a, b, queue, m, n, k, n_splits);
-        }
-        // M=65~128: use Split-K for all shapes (benchmark-validated)
-        if (65..=128).contains(&m) {
+        let use_splitk = if m >= 2 && m <= 8 {
+            true
+        } else if m >= 9 && m <= 32 {
+            k >= n
+        } else {
+            false
+        };
+
+        if use_splitk {
             let n_splits = optimal_splitk_nsplits(m, n, k);
             return dispatch_split_k_f16(registry, a, b, queue, m, n, k, n_splits);
         }
@@ -7420,60 +7424,30 @@ pub fn matmul_into_cb(
     let k = a.shape()[1];
     let n = b.shape()[1];
 
-    // -------------------------------------------------------------------
-    // GEMV fast-paths (same logic as matmul)
-    // -------------------------------------------------------------------
-
-    // Case 1: M=1 — [1,K] @ [K,N] → transpose B to [N,K], GEMV → [N], reshape [1,N]
-    if m == 1 {
-        let a_vec = Array::new(
-            a.metal_buffer().to_owned(),
-            vec![k],
-            vec![1],
-            a.dtype(),
-            a.offset(),
-        );
-        // B is [K,N] row-major. We need B^T = [N,K] contiguous for GEMV.
-        let b_t_view = b.view(vec![n, k], vec![1, n], b.offset());
-        let b_t = super::copy::copy_into_cb(registry, &b_t_view, cb)?;
-        let result = super::gemv::gemv_into_cb(registry, &b_t, &a_vec, cb)?;
-        return Ok(Array::new(
-            result.metal_buffer().to_owned(),
-            vec![1, n],
-            vec![n, 1],
-            result.dtype(),
-            result.offset(),
-        ));
-    }
-
-    // Case 2: N=1 — [M,K] @ [K,1] → GEMV A @ b_vec → [M], reshape [M,1]
-    if n == 1 {
-        let b_vec = Array::new(
-            b.metal_buffer().to_owned(),
-            vec![k],
-            vec![1],
-            b.dtype(),
-            b.offset(),
-        );
-        let result = super::gemv::gemv_into_cb(registry, a, &b_vec, cb)?;
-        return Ok(Array::new(
-            result.metal_buffer().to_owned(),
-            vec![m, 1],
-            vec![1, 1],
-            result.dtype(),
-            result.offset(),
-        ));
-    }
+    // M=1 and N=1: DO NOT use GEMV path in matmul_into_cb().
+    // The GEMV path requires copy_into_cb() (transpose B), which is O(NK) and
+    // extremely expensive when batched in a single CB.  The tiled GEMM with
+    // BM=16 handles M=1 efficiently via padding, avoiding the transpose.
+    // Note: matmul() keeps the GEMV path because it creates its own CB where
+    // the transpose overhead is amortized differently.
 
     // -------------------------------------------------------------------
-    // Split-K f16 for M=2..128 (same routing as matmul())
+    // Split-K f16: data shows Split-K helps at small M (K-loop bottleneck)
+    // but hurts at M>=33 where tiled GEMM has enough tile parallelism.
+    // M=2~8: always Split-K (K-loop dominates at tiny M regardless of shape)
+    // M=9~32: Split-K only when K >= N (K-dominant or balanced shapes)
+    // M>=33: never Split-K (tiled GEMM wins across all shapes)
     // -------------------------------------------------------------------
     if a.dtype() == DType::Float16 && k >= 256 {
-        if (2..=64).contains(&m) {
-            let n_splits = optimal_splitk_nsplits(m, n, k);
-            return dispatch_split_k_f16_into_cb(registry, a, b, cb, m, n, k, n_splits);
-        }
-        if (65..=128).contains(&m) {
+        let use_splitk = if m >= 2 && m <= 8 {
+            true
+        } else if m >= 9 && m <= 32 {
+            k >= n
+        } else {
+            false
+        };
+
+        if use_splitk {
             let n_splits = optimal_splitk_nsplits(m, n, k);
             return dispatch_split_k_f16_into_cb(registry, a, b, cb, m, n, k, n_splits);
         }

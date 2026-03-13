@@ -17,7 +17,7 @@
 //!      output buffer via set_buffer + dispatch_thread_groups), commit once,
 //!      wait once — measures absolute minimum dispatch overhead
 //!   5. **Production**: 1 CB, 32 × `matmul_into_cb()` encodes, commit once, wait once
-//!      — matches `forward_prefill_graph()` ExecGraph batch pattern.
+//!      — matches `forward_graph_unified(Prefill)` ExecGraph batch pattern.
 //!      Tests production kernel selection (tile config, GEMV, function constants).
 //!
 //! Kernel selection per M (matching optimal dispatch):
@@ -495,7 +495,7 @@ fn bench_single_encoder(
 // ---------------------------------------------------------------------------
 
 /// Production dispatch benchmark: matmul_into_cb() × 32 in 1 CB.
-/// Matches forward_prefill_graph() ExecGraph pattern where multiple
+/// Matches forward_graph_unified(Prefill) ExecGraph pattern where multiple
 /// matmuls share a single command buffer.
 fn bench_production(
     registry: &KernelRegistry,
@@ -653,7 +653,13 @@ fn main() {
         );
         println!(
             "| {:>5} | {:>22} | {:>12} | {:>12} | {:>14} | {:>16} | {:>12} |",
-            "M", "Kernel", "Sync (us/T)", "Pipe (us/T)", "Multi-enc (us/T)", "Single-enc (us/T)", "Prod (us/T)"
+            "M",
+            "Kernel",
+            "Sync (us/T)",
+            "Pipe (us/T)",
+            "Multi-enc (us/T)",
+            "Single-enc (us/T)",
+            "Prod (us/T)"
         );
         println!(
             "|{:-<7}|{:-<24}|{:-<14}|{:-<14}|{:-<16}|{:-<18}|{:-<14}|",
@@ -717,7 +723,10 @@ fn main() {
     // Combined Production Summary Table (all shapes × all M values)
     // -----------------------------------------------------------------------
     println!();
-    println!("=== Production Dispatch Summary ({}x matmul_into_cb() batched, p50) ===", PIPELINE_N);
+    println!(
+        "=== Production Dispatch Summary ({}x matmul_into_cb() batched, p50) ===",
+        PIPELINE_N
+    );
     println!();
     print!("| {:>5} |", "M");
     for &(shape_n, shape_k, label) in NK_SHAPES {

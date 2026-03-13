@@ -430,7 +430,7 @@ fn main() {
                 DType::Float16,
             );
             let _ = block
-                .forward_prefill_single_cb(
+                .forward_prefill_into_cb(
                     &input,
                     Some(&cos_freqs),
                     Some(&sin_freqs),
@@ -455,7 +455,7 @@ fn main() {
             );
             let encoder = cb.new_compute_command_encoder();
             let _ = block
-                .forward_prefill_single_encoder(
+                .forward_prefill_into_encoder(
                     &input,
                     Some(&cos_freqs),
                     Some(&sin_freqs),

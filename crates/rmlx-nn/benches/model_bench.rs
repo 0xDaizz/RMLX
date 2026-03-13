@@ -1,6 +1,6 @@
-//! ✅ PRODUCTION PATH — tests forward_graph() and forward_prefill_graph() with real
-//! safetensors weights on a full 32-layer TransformerModel. Results directly reflect
-//! production decode and prefill throughput.
+//! PRODUCTION PATH — tests forward_graph_unified() with real safetensors weights
+//! on a full 32-layer TransformerModel. Results directly reflect production
+//! decode and prefill throughput.
 //!
 //! 32-Layer Full Model Benchmark: RMLX vs MLX
 //!
@@ -8,8 +8,8 @@
 //!
 //! **RMLX paths measured:**
 //! - `forward()` — baseline per-layer submit+wait
-//! - `forward_graph()` — ExecGraph, submit-only + 1 sync (J-3)
-//! - `forward_prefill_graph()` — prefill ExecGraph variant
+//! - `forward_graph_unified(Decode)` — ExecGraph decode, submit-only + 1 sync
+//! - `forward_graph_unified(Prefill)` — ExecGraph prefill variant
 //!
 //! **MLX reference:**
 //! Run the companion script `benchmarks/mlx_model_bench.py` on the same machine
@@ -50,7 +50,8 @@ use rmlx_nn::safetensors_loader::{
     load_safetensors_sharded, load_safetensors_weights, parse_quantization_config,
 };
 use rmlx_nn::transformer::{
-    FeedForward, FeedForwardType, TransformerBlock, TransformerConfig, TransformerModel,
+    FeedForward, FeedForwardType, ForwardMode, TransformerBlock, TransformerConfig,
+    TransformerModel,
 };
 use rmlx_nn::Attention;
 
@@ -490,8 +491,8 @@ fn main() {
     let baseline_stats = Stats::from_durations(&baseline_latencies);
     println!("  Baseline: {}", baseline_stats);
 
-    // --- ExecGraph: forward_graph() ---
-    println!("\n--- RMLX ExecGraph: forward_graph() [submit-only, 1 sync] ---");
+    // --- ExecGraph: forward_graph_unified(Decode) ---
+    println!("\n--- RMLX ExecGraph: forward_graph_unified(Decode) [submit-only, 1 sync] ---");
 
     println!("Preparing weights for ExecGraph (pre-transposing)...");
     model
@@ -509,12 +510,13 @@ fn main() {
         }
         let event = GpuEvent::new(device);
         let _ = model
-            .forward_graph(
+            .forward_graph_unified(
                 &decode_tokens,
                 None,
                 None,
                 None,
                 Some(&mut cache_graph),
+                ForwardMode::Decode,
                 &registry,
                 &queue,
                 &event,
@@ -531,12 +533,13 @@ fn main() {
         let event = GpuEvent::new(device);
         let start = Instant::now();
         let _ = model
-            .forward_graph(
+            .forward_graph_unified(
                 &decode_tokens,
                 None,
                 None,
                 None,
                 Some(&mut cache_graph),
+                ForwardMode::Decode,
                 &registry,
                 &queue,
                 &event,
@@ -602,8 +605,8 @@ fn main() {
     let prefill_baseline_stats = Stats::from_durations(&prefill_baseline_latencies);
     println!("  Prefill Baseline: {}", prefill_baseline_stats);
 
-    // --- ExecGraph: forward_prefill_graph() ---
-    println!("\n--- RMLX ExecGraph: forward_prefill_graph() [submit-only, 1 sync] ---");
+    // --- ExecGraph: forward_graph_unified(Prefill) ---
+    println!("\n--- RMLX ExecGraph: forward_graph_unified(Prefill) [submit-only, 1 sync] ---");
     let mut cache_prefill_graph: Vec<LayerKvCache> = (0..num_layers)
         .map(|_| LayerKvCache::preallocated(device, num_kv_heads, head_dim, 2048, DType::Float16))
         .collect();
@@ -615,12 +618,13 @@ fn main() {
         }
         let event = GpuEvent::new(device);
         let _ = model
-            .forward_prefill_graph(
+            .forward_graph_unified(
                 &prefill_tokens,
                 None,
                 None,
                 None,
-                &mut cache_prefill_graph,
+                Some(&mut cache_prefill_graph[..]),
+                ForwardMode::Prefill { layers_per_cb: 4 },
                 &registry,
                 &queue,
                 &event,
@@ -637,12 +641,13 @@ fn main() {
         let event = GpuEvent::new(device);
         let start = Instant::now();
         let _ = model
-            .forward_prefill_graph(
+            .forward_graph_unified(
                 &prefill_tokens,
                 None,
                 None,
                 None,
-                &mut cache_prefill_graph,
+                Some(&mut cache_prefill_graph[..]),
+                ForwardMode::Prefill { layers_per_cb: 4 },
                 &registry,
                 &queue,
                 &event,

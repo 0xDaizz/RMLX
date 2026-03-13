@@ -7,7 +7,6 @@ use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::{KernelError, KernelRegistry};
 use rmlx_core::ops;
-use rmlx_metal::exec_graph::ExecGraph;
 
 use crate::linear::{Linear, LinearConfig};
 
@@ -2579,489 +2578,6 @@ impl Attention {
         Ok(())
     }
 
-    /// ExecGraph-based attention forward pass using 4 command buffers.
-    ///
-    /// Architecture:
-    /// - CB1 (current): Q/K/V projections
-    /// - CB2: head split + contiguous copy + RoPE + cache append
-    /// - CB3: SDPA
-    /// - CB4: head concat (interleave) + O_proj
-    ///
-    /// Returns the output array.
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward_graph(
-        &self,
-        x: &Array,
-        cos_freqs: Option<&Array>,
-        sin_freqs: Option<&Array>,
-        mask: Option<&Array>,
-        mut cache: Option<&mut LayerKvCache>,
-        registry: &KernelRegistry,
-        graph: &mut ExecGraph<'_, '_>,
-    ) -> Result<Array, KernelError> {
-        let seq_len = x.shape()[0];
-        let num_heads = self.config.num_heads;
-        let num_kv_heads = self.config.num_kv_heads;
-        let head_dim = self.config.head_dim;
-
-        // ---- CB1: Q/K/V projections ----
-        let cb1 = graph.command_buffer();
-        let q = self.q_proj.forward_into_cb(x, registry, cb1)?;
-        let k = self.k_proj.forward_into_cb(x, registry, cb1)?;
-        let v = self.v_proj.forward_into_cb(x, registry, cb1)?;
-        let _t1 = graph.submit_batch();
-
-        // ---- CB2: head split, contiguous copy, RoPE, cache append ----
-        // GPU FIFO ordering on a single queue guarantees CB1 completes first.
-        let cb2 = graph.command_buffer();
-
-        let dev = registry.device().raw();
-        let elem_size = q.dtype().size_of();
-        let rope_offset = cache.as_ref().map_or(0u32, |c| c.seq_len as u32);
-
-        // Fused deinterleave + RoPE: 1 dispatch per projection (Q, K, V)
-        let q_heads: Vec<Array>;
-        let k_heads: Vec<Array>;
-        let v_heads: Vec<Array>;
-
-        let head_elems = seq_len * head_dim;
-        if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
-            let q_batched = ops::rope::rope_multihead_into_cb(
-                registry,
-                &q,
-                cos,
-                sin,
-                num_heads,
-                rope_offset,
-                q.strides()[0],
-                cb2,
-            )?;
-            let k_batched = ops::rope::rope_multihead_into_cb(
-                registry,
-                &k,
-                cos,
-                sin,
-                num_kv_heads,
-                rope_offset,
-                k.strides()[0],
-                cb2,
-            )?;
-            let v_batched = ops::rope::deinterleave_heads_into_cb(
-                registry,
-                &v,
-                num_kv_heads,
-                v.strides()[0],
-                cb2,
-            )?;
-
-            q_heads = (0..num_heads)
-                .map(|h| {
-                    q_batched.view(
-                        vec![seq_len, head_dim],
-                        vec![head_dim, 1],
-                        q_batched.offset() + h * head_elems * elem_size,
-                    )
-                })
-                .collect();
-            k_heads = (0..num_kv_heads)
-                .map(|h| {
-                    k_batched.view(
-                        vec![seq_len, head_dim],
-                        vec![head_dim, 1],
-                        k_batched.offset() + h * head_elems * elem_size,
-                    )
-                })
-                .collect();
-            v_heads = (0..num_kv_heads)
-                .map(|h| {
-                    v_batched.view(
-                        vec![seq_len, head_dim],
-                        vec![head_dim, 1],
-                        v_batched.offset() + h * head_elems * elem_size,
-                    )
-                })
-                .collect();
-        } else {
-            let q_batched = ops::rope::deinterleave_heads_into_cb(
-                registry,
-                &q,
-                num_heads,
-                q.strides()[0],
-                cb2,
-            )?;
-            let k_batched = ops::rope::deinterleave_heads_into_cb(
-                registry,
-                &k,
-                num_kv_heads,
-                k.strides()[0],
-                cb2,
-            )?;
-            let v_batched = ops::rope::deinterleave_heads_into_cb(
-                registry,
-                &v,
-                num_kv_heads,
-                v.strides()[0],
-                cb2,
-            )?;
-
-            q_heads = (0..num_heads)
-                .map(|h| {
-                    q_batched.view(
-                        vec![seq_len, head_dim],
-                        vec![head_dim, 1],
-                        q_batched.offset() + h * head_elems * elem_size,
-                    )
-                })
-                .collect();
-            k_heads = (0..num_kv_heads)
-                .map(|h| {
-                    k_batched.view(
-                        vec![seq_len, head_dim],
-                        vec![head_dim, 1],
-                        k_batched.offset() + h * head_elems * elem_size,
-                    )
-                })
-                .collect();
-            v_heads = (0..num_kv_heads)
-                .map(|h| {
-                    v_batched.view(
-                        vec![seq_len, head_dim],
-                        vec![head_dim, 1],
-                        v_batched.offset() + h * head_elems * elem_size,
-                    )
-                })
-                .collect();
-        }
-
-        // Cache append (into same CB)
-        let (k_final, v_final) = match cache {
-            Some(ref mut c) => {
-                c.append_into_cb(k_heads, v_heads, seq_len, registry, cb2)?;
-                let kf: Vec<Array> = (0..num_kv_heads).map(|h| c.cached_keys(h)).collect();
-                let vf: Vec<Array> = (0..num_kv_heads).map(|h| c.cached_values(h)).collect();
-                (kf, vf)
-            }
-            None => (k_heads, v_heads),
-        };
-
-        let _t2 = graph.submit_batch();
-
-        // ---- CB3: SDPA ----
-        let cb3 = graph.command_buffer();
-        let scale = 1.0 / (head_dim as f32).sqrt();
-        let attn_outputs = ops::sdpa::sdpa_batched_into_cb(
-            registry, &q_heads, &k_final, &v_final, mask, scale, cb3,
-        )?;
-        let _t3 = graph.submit_batch();
-
-        // ---- CB4: head concat + O_proj ----
-        let cb4 = graph.command_buffer();
-
-        let hidden_size = num_heads * head_dim;
-        let head_bytes = head_dim * elem_size;
-
-        // Pack SDPA outputs into batch-major buffer, then interleave
-        let copy_kernel = match q.dtype() {
-            DType::Float32 => "copy_f32",
-            DType::Float16 => "copy_f16",
-            DType::Bfloat16 => "copy_bf16",
-            _ => {
-                return Err(KernelError::InvalidShape(format!(
-                    "attention concat: unsupported dtype {:?}",
-                    q.dtype()
-                )));
-            }
-        };
-        let pipeline = registry.get_pipeline(copy_kernel, q.dtype())?;
-
-        if seq_len == 1 {
-            // Decode: direct flat copy
-            let concat = Array::zeros(dev, &[1, hidden_size], q.dtype());
-            for (h, head_out) in attn_outputs.iter().enumerate() {
-                let enc = cb4.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&pipeline);
-                enc.set_buffer(0, Some(head_out.metal_buffer()), head_out.offset() as u64);
-                enc.set_buffer(1, Some(concat.metal_buffer()), (h * head_bytes) as u64);
-                let count = head_dim as u64;
-                let grid = metal::MTLSize::new(count, 1, 1);
-                let tg = metal::MTLSize::new(
-                    std::cmp::min(pipeline.max_total_threads_per_threadgroup(), count),
-                    1,
-                    1,
-                );
-                enc.dispatch_threads(grid, tg);
-                enc.end_encoding();
-            }
-            let output = self.o_proj.forward_into_cb(&concat, registry, cb4)?;
-            let _t4 = graph.submit_batch();
-            Ok(output)
-        } else {
-            // Prefill: pack into batch-major, then interleave
-            let head_elems_graph = seq_len * head_dim;
-            let packed = Array::zeros(dev, &[num_heads * seq_len, head_dim], q.dtype());
-            for (h, head_out) in attn_outputs.iter().enumerate() {
-                let dst_offset = h * head_elems_graph * elem_size;
-                let enc = cb4.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&pipeline);
-                enc.set_buffer(0, Some(head_out.metal_buffer()), head_out.offset() as u64);
-                enc.set_buffer(1, Some(packed.metal_buffer()), dst_offset as u64);
-                let count = head_elems_graph as u64;
-                let grid = metal::MTLSize::new(count, 1, 1);
-                let tg = metal::MTLSize::new(
-                    std::cmp::min(pipeline.max_total_threads_per_threadgroup(), count),
-                    1,
-                    1,
-                );
-                enc.dispatch_threads(grid, tg);
-                enc.end_encoding();
-            }
-            let concat =
-                ops::rope::interleave_heads_into_cb(registry, &packed, num_heads, seq_len, cb4)?;
-            let output = self.o_proj.forward_into_cb(&concat, registry, cb4)?;
-            let _t4 = graph.submit_batch();
-            Ok(output)
-        }
-    }
-
-    /// Fused ExecGraph attention: norm + projections in CB1 (3 CBs total).
-    ///
-    /// Architecture (saves 1 CB vs `forward_graph`):
-    /// - CB1: RMS norm + Q/K/V projections (fused)
-    /// - CB2: head split + RoPE + cache append
-    /// - CB3: SDPA + head concat + O_proj
-    ///
-    /// Returns the output array. GPU-side event dependencies are managed
-    /// internally; callers rely on single-queue FIFO ordering between layers.
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward_graph_fused(
-        &self,
-        x: &Array,
-        norm_weight: &Array,
-        rms_norm_eps: f32,
-        cos_freqs: Option<&Array>,
-        sin_freqs: Option<&Array>,
-        mask: Option<&Array>,
-        mut cache: Option<&mut LayerKvCache>,
-        registry: &KernelRegistry,
-        graph: &mut ExecGraph<'_, '_>,
-    ) -> Result<Array, KernelError> {
-        let seq_len = x.shape()[0];
-        let num_heads = self.config.num_heads;
-        let num_kv_heads = self.config.num_kv_heads;
-        let head_dim = self.config.head_dim;
-
-        // ---- CB1: norm + Q/K/V projections (fused) ----
-        let cb1 = graph.command_buffer();
-        let normed =
-            ops::rms_norm::rms_norm_into_cb(registry, x, Some(norm_weight), rms_norm_eps, cb1)?;
-        let q = self.q_proj.forward_into_cb(&normed, registry, cb1)?;
-        let k = self.k_proj.forward_into_cb(&normed, registry, cb1)?;
-        let v = self.v_proj.forward_into_cb(&normed, registry, cb1)?;
-        let _t1 = graph.submit_batch();
-
-        // ---- CB2: head split + RoPE + cache append ----
-        // GPU FIFO ordering on a single queue guarantees CB1 completes first.
-        let cb2 = graph.command_buffer();
-
-        let dev = registry.device().raw();
-        let elem_size = q.dtype().size_of();
-        let rope_offset = cache.as_ref().map_or(0u32, |c| c.seq_len as u32);
-
-        // Fused deinterleave + RoPE: 1 dispatch per projection
-        let q_heads: Vec<Array>;
-        let k_heads: Vec<Array>;
-        let v_heads: Vec<Array>;
-
-        let head_elems_fused = seq_len * head_dim;
-        if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
-            let q_batched = ops::rope::rope_multihead_into_cb(
-                registry,
-                &q,
-                cos,
-                sin,
-                num_heads,
-                rope_offset,
-                q.strides()[0],
-                cb2,
-            )?;
-            let k_batched = ops::rope::rope_multihead_into_cb(
-                registry,
-                &k,
-                cos,
-                sin,
-                num_kv_heads,
-                rope_offset,
-                k.strides()[0],
-                cb2,
-            )?;
-            let v_batched = ops::rope::deinterleave_heads_into_cb(
-                registry,
-                &v,
-                num_kv_heads,
-                v.strides()[0],
-                cb2,
-            )?;
-
-            q_heads = (0..num_heads)
-                .map(|h| {
-                    q_batched.view(
-                        vec![seq_len, head_dim],
-                        vec![head_dim, 1],
-                        q_batched.offset() + h * head_elems_fused * elem_size,
-                    )
-                })
-                .collect();
-            k_heads = (0..num_kv_heads)
-                .map(|h| {
-                    k_batched.view(
-                        vec![seq_len, head_dim],
-                        vec![head_dim, 1],
-                        k_batched.offset() + h * head_elems_fused * elem_size,
-                    )
-                })
-                .collect();
-            v_heads = (0..num_kv_heads)
-                .map(|h| {
-                    v_batched.view(
-                        vec![seq_len, head_dim],
-                        vec![head_dim, 1],
-                        v_batched.offset() + h * head_elems_fused * elem_size,
-                    )
-                })
-                .collect();
-        } else {
-            let q_batched = ops::rope::deinterleave_heads_into_cb(
-                registry,
-                &q,
-                num_heads,
-                q.strides()[0],
-                cb2,
-            )?;
-            let k_batched = ops::rope::deinterleave_heads_into_cb(
-                registry,
-                &k,
-                num_kv_heads,
-                k.strides()[0],
-                cb2,
-            )?;
-            let v_batched = ops::rope::deinterleave_heads_into_cb(
-                registry,
-                &v,
-                num_kv_heads,
-                v.strides()[0],
-                cb2,
-            )?;
-
-            q_heads = (0..num_heads)
-                .map(|h| {
-                    q_batched.view(
-                        vec![seq_len, head_dim],
-                        vec![head_dim, 1],
-                        q_batched.offset() + h * head_elems_fused * elem_size,
-                    )
-                })
-                .collect();
-            k_heads = (0..num_kv_heads)
-                .map(|h| {
-                    k_batched.view(
-                        vec![seq_len, head_dim],
-                        vec![head_dim, 1],
-                        k_batched.offset() + h * head_elems_fused * elem_size,
-                    )
-                })
-                .collect();
-            v_heads = (0..num_kv_heads)
-                .map(|h| {
-                    v_batched.view(
-                        vec![seq_len, head_dim],
-                        vec![head_dim, 1],
-                        v_batched.offset() + h * head_elems_fused * elem_size,
-                    )
-                })
-                .collect();
-        }
-
-        let (k_final, v_final) = match cache {
-            Some(ref mut c) => {
-                c.append_into_cb(k_heads, v_heads, seq_len, registry, cb2)?;
-                let kf: Vec<Array> = (0..num_kv_heads).map(|h| c.cached_keys(h)).collect();
-                let vf: Vec<Array> = (0..num_kv_heads).map(|h| c.cached_values(h)).collect();
-                (kf, vf)
-            }
-            None => (k_heads, v_heads),
-        };
-
-        let _t2 = graph.submit_batch();
-
-        // ---- CB3: SDPA + head concat + O_proj ----
-        let cb3 = graph.command_buffer();
-        let scale = 1.0 / (head_dim as f32).sqrt();
-        let attn_outputs = ops::sdpa::sdpa_batched_into_cb(
-            registry, &q_heads, &k_final, &v_final, mask, scale, cb3,
-        )?;
-
-        let hidden_size = num_heads * head_dim;
-        let head_bytes = head_dim * elem_size;
-        let copy_kernel = match q.dtype() {
-            DType::Float32 => "copy_f32",
-            DType::Float16 => "copy_f16",
-            DType::Bfloat16 => "copy_bf16",
-            _ => {
-                return Err(KernelError::InvalidShape(format!(
-                    "attention concat: unsupported dtype {:?}",
-                    q.dtype()
-                )));
-            }
-        };
-        let pipeline = registry.get_pipeline(copy_kernel, q.dtype())?;
-
-        if seq_len == 1 {
-            let concat = Array::zeros(dev, &[1, hidden_size], q.dtype());
-            for (h, head_out) in attn_outputs.iter().enumerate() {
-                let enc = cb3.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&pipeline);
-                enc.set_buffer(0, Some(head_out.metal_buffer()), head_out.offset() as u64);
-                enc.set_buffer(1, Some(concat.metal_buffer()), (h * head_bytes) as u64);
-                let count = head_dim as u64;
-                let grid = metal::MTLSize::new(count, 1, 1);
-                let tg = metal::MTLSize::new(
-                    std::cmp::min(pipeline.max_total_threads_per_threadgroup(), count),
-                    1,
-                    1,
-                );
-                enc.dispatch_threads(grid, tg);
-                enc.end_encoding();
-            }
-            let output = self.o_proj.forward_into_cb(&concat, registry, cb3)?;
-            let _t3 = graph.submit_batch();
-            Ok(output)
-        } else {
-            let head_elems_c = seq_len * head_dim;
-            let packed = Array::zeros(dev, &[num_heads * seq_len, head_dim], q.dtype());
-            for (h, head_out) in attn_outputs.iter().enumerate() {
-                let dst_offset = h * head_elems_c * elem_size;
-                let enc = cb3.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&pipeline);
-                enc.set_buffer(0, Some(head_out.metal_buffer()), head_out.offset() as u64);
-                enc.set_buffer(1, Some(packed.metal_buffer()), dst_offset as u64);
-                let count = head_elems_c as u64;
-                let grid = metal::MTLSize::new(count, 1, 1);
-                let tg = metal::MTLSize::new(
-                    std::cmp::min(pipeline.max_total_threads_per_threadgroup(), count),
-                    1,
-                    1,
-                );
-                enc.dispatch_threads(grid, tg);
-                enc.end_encoding();
-            }
-            let concat =
-                ops::rope::interleave_heads_into_cb(registry, &packed, num_heads, seq_len, cb3)?;
-            let output = self.o_proj.forward_into_cb(&concat, registry, cb3)?;
-            let _t3 = graph.submit_batch();
-            Ok(output)
-        }
-    }
-
     /// Single-CB decode path for seq_len=1.
     ///
     /// Encodes ALL attention ops into one command buffer with minimal dispatches:
@@ -3255,7 +2771,7 @@ impl Attention {
     ///
     /// Does NOT commit or wait — the caller manages the CB lifecycle.
     #[allow(clippy::too_many_arguments)]
-    pub fn forward_prefill_single_cb(
+    pub fn forward_prefill_into_cb(
         &self,
         x: &Array,
         norm_weight: &Array,
@@ -3441,13 +2957,13 @@ impl Attention {
             let total_seq = cache.seq_len;
             let k_slab = cache.keys_slab_view().ok_or_else(|| {
                 KernelError::InvalidShape(
-                    "forward_prefill_single_cb: cache has no slab layout (use preallocated cache)"
+                    "forward_prefill_into_cb: cache has no slab layout (use preallocated cache)"
                         .into(),
                 )
             })?;
             let v_slab = cache.values_slab_view().ok_or_else(|| {
                 KernelError::InvalidShape(
-                    "forward_prefill_single_cb: cache has no slab layout (use preallocated cache)"
+                    "forward_prefill_into_cb: cache has no slab layout (use preallocated cache)"
                         .into(),
                 )
             })?;
@@ -3600,7 +3116,7 @@ impl Attention {
 
     /// Forward pass using a single pre-existing compute command encoder.
     ///
-    /// Identical logic to `forward_prefill_single_cb` but dispatches all kernels
+    /// Identical logic to `forward_prefill_into_cb` but dispatches all kernels
     /// via a shared encoder, eliminating per-op encoder create/destroy overhead
     /// (~300-500us/layer).
     ///
@@ -3609,7 +3125,7 @@ impl Attention {
     /// - `o_proj` must have pre-cached transposed weight.
     /// - The caller manages the encoder lifecycle (creation and `end_encoding()`).
     #[allow(clippy::too_many_arguments)]
-    pub fn forward_prefill_single_encoder(
+    pub fn forward_prefill_into_encoder(
         &self,
         x: &Array,
         norm_weight: &Array,
@@ -3668,7 +3184,7 @@ impl Attention {
                 (q_view, k_view, v_view)
             } else {
                 return Err(KernelError::InvalidShape(
-                    "forward_prefill_single_encoder requires merged QKV weight \
+                    "forward_prefill_into_encoder requires merged QKV weight \
                      (call prepare_merged_qkv_transposed first)"
                         .into(),
                 ));
@@ -3754,12 +3270,12 @@ impl Attention {
             let total_seq = cache.seq_len;
             let k_slab = cache.keys_slab_view().ok_or_else(|| {
                 KernelError::InvalidShape(
-                    "forward_prefill_single_encoder: cache has no slab layout".into(),
+                    "forward_prefill_into_encoder: cache has no slab layout".into(),
                 )
             })?;
             let v_slab = cache.values_slab_view().ok_or_else(|| {
                 KernelError::InvalidShape(
-                    "forward_prefill_single_encoder: cache has no slab layout".into(),
+                    "forward_prefill_into_encoder: cache has no slab layout".into(),
                 )
             })?;
             let kv_stride = if cache.max_seq_len() != total_seq {
@@ -3881,599 +3397,6 @@ impl Attention {
 
         // O projection
         self.o_proj.forward_into_encoder(&concat, registry, encoder)
-    }
-
-    // -----------------------------------------------------------------------
-    // Cumulative partial encode: encode dispatches 1..stop_after into one encoder
-    // -----------------------------------------------------------------------
-
-    /// Encode attention dispatches 1..`stop_after` into the given compute encoder.
-    ///
-    /// `stop_after` is 1-indexed and clamped to 1..=5:
-    ///   1 → RMSNorm only
-    ///   2 → RMSNorm + QKV GEMM
-    ///   3 → RMSNorm + QKV + RoPE Q+K + V deinterleave
-    ///   4 → RMSNorm + QKV + RoPE + SDPA
-    ///   5 → RMSNorm + QKV + RoPE + SDPA + O Projection (full attention)
-    ///
-    /// Returns the output array of the last dispatch encoded.
-    /// For stop_after < 5, the output is an intermediate and should be discarded.
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward_prefill_encode_partial(
-        &self,
-        x: &Array,
-        norm_weight: &Array,
-        rms_norm_eps: f32,
-        cos_freqs: Option<&Array>,
-        sin_freqs: Option<&Array>,
-        cache: &mut LayerKvCache,
-        registry: &KernelRegistry,
-        encoder: &metal::ComputeCommandEncoderRef,
-        stop_after: usize,
-    ) -> Result<Array, KernelError> {
-        let num_heads = self.config.num_heads;
-        let num_kv_heads = self.config.num_kv_heads;
-        let head_dim = self.config.head_dim;
-        let hidden_size = num_heads * head_dim;
-        let seq_len = x.shape()[0];
-
-        // ---- Dispatch 1: RMSNorm (pre-attention) ----
-        let normed =
-            ops::rms_norm::rms_norm_encode(registry, x, Some(norm_weight), rms_norm_eps, encoder)?;
-        if stop_after <= 1 {
-            return Ok(normed);
-        }
-
-        // ---- Dispatch 2: QKV merged GEMM ----
-        let q_dim = num_heads * head_dim;
-        let k_dim = num_kv_heads * head_dim;
-        let v_dim = num_kv_heads * head_dim;
-
-        let normed_2d = if normed.ndim() == 1 {
-            normed.reshape(vec![1, normed.shape()[0]])?
-        } else {
-            normed.reshape(vec![normed.shape()[0], normed.shape()[1]])?
-        };
-
-        let qkv_wt = self.qkv_merged_weight_t.as_ref().ok_or_else(|| {
-            KernelError::InvalidShape(
-                "forward_prefill_encode_partial requires merged QKV weight".into(),
-            )
-        })?;
-        let qkv = ops::matmul::matmul_encode(registry, &normed_2d, qkv_wt, encoder)?;
-        if stop_after <= 2 {
-            return Ok(qkv);
-        }
-
-        let total_out = q_dim + k_dim + v_dim;
-        let elem_size = qkv.dtype().size_of();
-        let q = Array::new(
-            qkv.metal_buffer().to_owned(),
-            vec![seq_len, q_dim],
-            vec![total_out, 1],
-            qkv.dtype(),
-            qkv.offset(),
-        );
-        let k = Array::new(
-            qkv.metal_buffer().to_owned(),
-            vec![seq_len, k_dim],
-            vec![total_out, 1],
-            qkv.dtype(),
-            qkv.offset() + q_dim * elem_size,
-        );
-        let v = Array::new(
-            qkv.metal_buffer().to_owned(),
-            vec![seq_len, v_dim],
-            vec![total_out, 1],
-            qkv.dtype(),
-            qkv.offset() + (q_dim + k_dim) * elem_size,
-        );
-
-        // ---- Dispatch 3: RoPE Q+K + V deinterleave ----
-        let rope_offset = cache.seq_len as u32;
-        let q_row_stride = q.strides()[0];
-        let k_row_stride = k.strides()[0];
-        let v_row_stride = v.strides()[0];
-
-        let (q_batched, k_batched) = if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
-            let q_b = ops::rope::rope_multihead_encode(
-                registry,
-                &q,
-                cos,
-                sin,
-                num_heads,
-                rope_offset,
-                q_row_stride,
-                encoder,
-            )?;
-            let k_b = ops::rope::rope_multihead_encode(
-                registry,
-                &k,
-                cos,
-                sin,
-                num_kv_heads,
-                rope_offset,
-                k_row_stride,
-                encoder,
-            )?;
-            (q_b, k_b)
-        } else {
-            let q_b = ops::rope::deinterleave_heads_encode(
-                registry,
-                &q,
-                num_heads,
-                q_row_stride,
-                encoder,
-            )?;
-            let k_b = ops::rope::deinterleave_heads_encode(
-                registry,
-                &k,
-                num_kv_heads,
-                k_row_stride,
-                encoder,
-            )?;
-            (q_b, k_b)
-        };
-        let v_batched = ops::rope::deinterleave_heads_encode(
-            registry,
-            &v,
-            num_kv_heads,
-            v_row_stride,
-            encoder,
-        )?;
-
-        if stop_after <= 3 {
-            return Ok(q_batched);
-        }
-
-        // ---- Dispatch 4: SDPA ----
-        let needs_initial_append = cache.seq_len == 0;
-        let (k_for_sdpa, v_for_sdpa, kv_stride, total_seq) = if needs_initial_append {
-            let k_view = k_batched.view(
-                k_batched.shape().to_vec(),
-                k_batched.strides().to_vec(),
-                k_batched.offset(),
-            );
-            let v_view = v_batched.view(
-                v_batched.shape().to_vec(),
-                v_batched.strides().to_vec(),
-                v_batched.offset(),
-            );
-            (k_view, v_view, None, seq_len)
-        } else {
-            cache.append_batched_encode(&k_batched, &v_batched, seq_len, registry, encoder)?;
-            let total_seq = cache.seq_len;
-            let k_slab = cache.keys_slab_view().ok_or_else(|| {
-                KernelError::InvalidShape("encode_partial: cache has no slab layout".into())
-            })?;
-            let v_slab = cache.values_slab_view().ok_or_else(|| {
-                KernelError::InvalidShape("encode_partial: cache has no slab layout".into())
-            })?;
-            let kv_stride = if cache.max_seq_len() != total_seq {
-                Some(cache.max_seq_len())
-            } else {
-                None
-            };
-            (k_slab, v_slab, kv_stride, total_seq)
-        };
-
-        let scale = 1.0 / (head_dim as f32).sqrt();
-        let is_f16_d128 = q_batched.dtype() == DType::Float16 && head_dim == 128 && seq_len > 1;
-        let use_nax = is_f16_d128 && registry.device().tuning().supports_nax;
-        let use_mma_bk32 = is_f16_d128 && !use_nax && total_seq >= 256;
-
-        let attn_slab = if use_nax {
-            ops::sdpa::sdpa_prefill_nax_f16_encode(
-                registry,
-                &q_batched,
-                &k_for_sdpa,
-                &v_for_sdpa,
-                num_heads,
-                num_kv_heads,
-                head_dim,
-                seq_len,
-                total_seq,
-                kv_stride,
-                scale,
-                true,
-                None,
-                None,
-                encoder,
-            )?
-        } else if use_mma_bk32 {
-            ops::sdpa::sdpa_prefill_mma_bk32_f16_encode(
-                registry,
-                &q_batched,
-                &k_for_sdpa,
-                &v_for_sdpa,
-                num_heads,
-                num_kv_heads,
-                head_dim,
-                seq_len,
-                total_seq,
-                kv_stride,
-                None,
-                scale,
-                true,
-                None,
-                None,
-                encoder,
-            )?
-        } else if is_f16_d128 {
-            ops::sdpa::sdpa_prefill_mma_f16_encode(
-                registry,
-                &q_batched,
-                &k_for_sdpa,
-                &v_for_sdpa,
-                num_heads,
-                num_kv_heads,
-                head_dim,
-                seq_len,
-                total_seq,
-                kv_stride,
-                None,
-                scale,
-                true,
-                None,
-                None,
-                encoder,
-            )?
-        } else {
-            ops::sdpa::sdpa_prefill_gqa_slab_encode(
-                registry,
-                &q_batched,
-                &k_for_sdpa,
-                &v_for_sdpa,
-                num_heads,
-                num_kv_heads,
-                head_dim,
-                seq_len,
-                total_seq,
-                kv_stride,
-                None,
-                scale,
-                true,
-                encoder,
-            )?
-        };
-
-        if needs_initial_append {
-            cache.append_batched_encode(&k_batched, &v_batched, seq_len, registry, encoder)?;
-        }
-
-        if stop_after <= 4 {
-            return Ok(attn_slab);
-        }
-
-        // ---- Dispatch 5: O Projection ----
-        let concat = attn_slab.view(
-            vec![seq_len, hidden_size],
-            vec![hidden_size, 1],
-            attn_slab.offset(),
-        );
-        self.o_proj.forward_into_encoder(&concat, registry, encoder)
-    }
-
-    // -----------------------------------------------------------------------
-    // Per-dispatch breakdown: measure each dispatch in its own CB
-    // -----------------------------------------------------------------------
-
-    /// Run attention dispatches 1-5 individually, each in its own command buffer,
-    /// returning per-dispatch wall-clock timings and the final O-projection output.
-    ///
-    /// Dispatches:
-    ///   1. RMSNorm (pre-attention)
-    ///   2. QKV merged GEMM
-    ///   3. RoPE Q+K + V deinterleave (fused)
-    ///   4. SDPA
-    ///   5. O Projection
-    ///
-    /// Each dispatch is encoded into a fresh CB, committed, and waited on.
-    /// This adds CB overhead but gives exact per-dispatch GPU timing.
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward_prefill_breakdown(
-        &self,
-        x: &Array,
-        norm_weight: &Array,
-        rms_norm_eps: f32,
-        cos_freqs: Option<&Array>,
-        sin_freqs: Option<&Array>,
-        cache: &mut LayerKvCache,
-        registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
-    ) -> Result<(Array, Vec<(&'static str, std::time::Duration)>), KernelError> {
-        use std::time::Instant;
-
-        let num_heads = self.config.num_heads;
-        let num_kv_heads = self.config.num_kv_heads;
-        let head_dim = self.config.head_dim;
-        let hidden_size = num_heads * head_dim;
-        let seq_len = x.shape()[0];
-        let mut timings: Vec<(&'static str, std::time::Duration)> = Vec::with_capacity(5);
-
-        let q_dim = num_heads * head_dim;
-        let k_dim = num_kv_heads * head_dim;
-        let v_dim = num_kv_heads * head_dim;
-
-        let qkv_wt = self.qkv_merged_weight_t.as_ref().ok_or_else(|| {
-            KernelError::InvalidShape("forward_prefill_breakdown requires merged QKV weight".into())
-        })?;
-
-        // ---- Dispatch 1: RMSNorm (pre-attention) ----
-        let normed = {
-            let cb = queue.new_command_buffer();
-            let start = Instant::now();
-            let out =
-                ops::rms_norm::rms_norm_into_cb(registry, x, Some(norm_weight), rms_norm_eps, cb)?;
-            cb.commit();
-            cb.wait_until_completed();
-            timings.push(("RMSNorm (pre-attn)", start.elapsed()));
-            out
-        };
-
-        // ---- Dispatch 2: QKV merged GEMM ----
-        let normed_2d = if normed.ndim() == 1 {
-            normed.reshape(vec![1, normed.shape()[0]])?
-        } else {
-            normed.reshape(vec![normed.shape()[0], normed.shape()[1]])?
-        };
-
-        let (q, k, v) = {
-            let cb = queue.new_command_buffer();
-            let start = Instant::now();
-            let qkv = ops::matmul::matmul_into_cb(registry, &normed_2d, qkv_wt, cb)?;
-            cb.commit();
-            cb.wait_until_completed();
-            timings.push(("QKV Merged GEMM", start.elapsed()));
-            let total_out = q_dim + k_dim + v_dim;
-            let elem_size = qkv.dtype().size_of();
-            let q_view = Array::new(
-                qkv.metal_buffer().to_owned(),
-                vec![seq_len, q_dim],
-                vec![total_out, 1],
-                qkv.dtype(),
-                qkv.offset(),
-            );
-            let k_view = Array::new(
-                qkv.metal_buffer().to_owned(),
-                vec![seq_len, k_dim],
-                vec![total_out, 1],
-                qkv.dtype(),
-                qkv.offset() + q_dim * elem_size,
-            );
-            let v_view = Array::new(
-                qkv.metal_buffer().to_owned(),
-                vec![seq_len, v_dim],
-                vec![total_out, 1],
-                qkv.dtype(),
-                qkv.offset() + (q_dim + k_dim) * elem_size,
-            );
-            (q_view, k_view, v_view)
-        };
-
-        // ---- Dispatch 3: RoPE Q+K + V deinterleave (fused) ----
-        let rope_offset = cache.seq_len as u32;
-        let q_row_stride = q.strides()[0];
-
-        let (q_batched, k_batched, v_batched) = {
-            let cb = queue.new_command_buffer();
-            let start = Instant::now();
-            let result = if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
-                if q.metal_buffer().as_ptr() == k.metal_buffer().as_ptr()
-                    && k.metal_buffer().as_ptr() == v.metal_buffer().as_ptr()
-                {
-                    ops::rope::rope_qkv_batch_into_cb(
-                        registry,
-                        &q,
-                        cos,
-                        sin,
-                        num_heads,
-                        num_kv_heads,
-                        head_dim,
-                        rope_offset,
-                        q_row_stride,
-                        cb,
-                    )?
-                } else {
-                    let q_b = ops::rope::rope_multihead_into_cb(
-                        registry,
-                        &q,
-                        cos,
-                        sin,
-                        num_heads,
-                        rope_offset,
-                        q.strides()[0],
-                        cb,
-                    )?;
-                    let k_b = ops::rope::rope_multihead_into_cb(
-                        registry,
-                        &k,
-                        cos,
-                        sin,
-                        num_kv_heads,
-                        rope_offset,
-                        k.strides()[0],
-                        cb,
-                    )?;
-                    let v_b = ops::rope::deinterleave_heads_into_cb(
-                        registry,
-                        &v,
-                        num_kv_heads,
-                        v.strides()[0],
-                        cb,
-                    )?;
-                    (q_b, k_b, v_b)
-                }
-            } else {
-                let q_b = ops::rope::deinterleave_heads_into_cb(
-                    registry,
-                    &q,
-                    num_heads,
-                    q.strides()[0],
-                    cb,
-                )?;
-                let k_b = ops::rope::deinterleave_heads_into_cb(
-                    registry,
-                    &k,
-                    num_kv_heads,
-                    k.strides()[0],
-                    cb,
-                )?;
-                let v_b = ops::rope::deinterleave_heads_into_cb(
-                    registry,
-                    &v,
-                    num_kv_heads,
-                    v.strides()[0],
-                    cb,
-                )?;
-                (q_b, k_b, v_b)
-            };
-            cb.commit();
-            cb.wait_until_completed();
-            timings.push(("RoPE Q+K + V deinterleave", start.elapsed()));
-            result
-        };
-
-        // ---- Dispatch 4: SDPA ----
-        let needs_initial_append = cache.seq_len == 0;
-        let (k_for_sdpa, v_for_sdpa, kv_stride, total_seq) = if needs_initial_append {
-            let k_view = k_batched.view(
-                k_batched.shape().to_vec(),
-                k_batched.strides().to_vec(),
-                k_batched.offset(),
-            );
-            let v_view = v_batched.view(
-                v_batched.shape().to_vec(),
-                v_batched.strides().to_vec(),
-                v_batched.offset(),
-            );
-            (k_view, v_view, None, seq_len)
-        } else {
-            let cache_cb = queue.new_command_buffer();
-            cache.append_batched_into_cb(&k_batched, &v_batched, seq_len, registry, cache_cb)?;
-            cache_cb.commit();
-            cache_cb.wait_until_completed();
-            let total_seq = cache.seq_len;
-            let k_slab = cache.keys_slab_view().ok_or_else(|| {
-                KernelError::InvalidShape("breakdown: cache has no slab layout".into())
-            })?;
-            let v_slab = cache.values_slab_view().ok_or_else(|| {
-                KernelError::InvalidShape("breakdown: cache has no slab layout".into())
-            })?;
-            let kv_stride = if cache.max_seq_len() != total_seq {
-                Some(cache.max_seq_len())
-            } else {
-                None
-            };
-            (k_slab, v_slab, kv_stride, total_seq)
-        };
-
-        let scale = 1.0 / (head_dim as f32).sqrt();
-        let is_f16_d128 = q_batched.dtype() == DType::Float16 && head_dim == 128 && seq_len > 1;
-        let use_nax = is_f16_d128 && registry.device().tuning().supports_nax;
-        let use_mma_bk32 = is_f16_d128 && !use_nax && total_seq >= 256;
-
-        let attn_slab = {
-            let cb = queue.new_command_buffer();
-            let start = Instant::now();
-            let slab = if use_nax {
-                ops::sdpa::sdpa_prefill_nax_f16_into_cb(
-                    registry,
-                    &q_batched,
-                    &k_for_sdpa,
-                    &v_for_sdpa,
-                    num_heads,
-                    num_kv_heads,
-                    head_dim,
-                    seq_len,
-                    total_seq,
-                    kv_stride,
-                    scale,
-                    true,
-                    None,
-                    None,
-                    cb,
-                )?
-            } else if use_mma_bk32 {
-                ops::sdpa::sdpa_prefill_mma_bk32_f16_into_cb(
-                    registry,
-                    &q_batched,
-                    &k_for_sdpa,
-                    &v_for_sdpa,
-                    num_heads,
-                    num_kv_heads,
-                    head_dim,
-                    seq_len,
-                    total_seq,
-                    kv_stride,
-                    None,
-                    scale,
-                    true,
-                    None,
-                    None,
-                    cb,
-                )?
-            } else if is_f16_d128 {
-                ops::sdpa::sdpa_prefill_mma_f16_into_cb(
-                    registry,
-                    &q_batched,
-                    &k_for_sdpa,
-                    &v_for_sdpa,
-                    num_heads,
-                    num_kv_heads,
-                    head_dim,
-                    seq_len,
-                    total_seq,
-                    kv_stride,
-                    None,
-                    scale,
-                    true,
-                    None,
-                    None,
-                    cb,
-                )?
-            } else {
-                ops::sdpa::sdpa_prefill_gqa_slab_into_cb(
-                    registry,
-                    &q_batched,
-                    &k_for_sdpa,
-                    &v_for_sdpa,
-                    num_heads,
-                    num_kv_heads,
-                    head_dim,
-                    seq_len,
-                    total_seq,
-                    kv_stride,
-                    None,
-                    scale,
-                    true,
-                    cb,
-                )?
-            };
-            cb.commit();
-            cb.wait_until_completed();
-            timings.push(("SDPA", start.elapsed()));
-            slab
-        };
-
-        let concat = attn_slab.view(
-            vec![seq_len, hidden_size],
-            vec![hidden_size, 1],
-            attn_slab.offset(),
-        );
-
-        // ---- Dispatch 5: O Projection ----
-        let o_out = {
-            let cb = queue.new_command_buffer();
-            let start = Instant::now();
-            let out = self.o_proj.forward_into_cb(&concat, registry, cb)?;
-            cb.commit();
-            cb.wait_until_completed();
-            timings.push(("O Projection", start.elapsed()));
-            out
-        };
-
-        Ok((o_out, timings))
     }
 
     // -----------------------------------------------------------------------
@@ -5782,6 +4705,606 @@ fn scale_scores(
             let scale_full = Array::from_slice(dev, &data, scores.shape().to_vec());
             ops::binary::mul(registry, scores, &scale_full, queue)
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostic / benchmark-only methods for Attention
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "bench")]
+impl Attention {
+    // -----------------------------------------------------------------------
+    // Cumulative partial encode: encode dispatches 1..stop_after into one encoder
+    // -----------------------------------------------------------------------
+
+    /// Encode attention dispatches 1..`stop_after` into the given compute encoder.
+    ///
+    /// `stop_after` is 1-indexed and clamped to 1..=5:
+    ///   1 → RMSNorm only
+    ///   2 → RMSNorm + QKV GEMM
+    ///   3 → RMSNorm + QKV + RoPE Q+K + V deinterleave
+    ///   4 → RMSNorm + QKV + RoPE + SDPA
+    ///   5 → RMSNorm + QKV + RoPE + SDPA + O Projection (full attention)
+    ///
+    /// Returns the output array of the last dispatch encoded.
+    /// For stop_after < 5, the output is an intermediate and should be discarded.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_prefill_encode_partial(
+        &self,
+        x: &Array,
+        norm_weight: &Array,
+        rms_norm_eps: f32,
+        cos_freqs: Option<&Array>,
+        sin_freqs: Option<&Array>,
+        cache: &mut LayerKvCache,
+        registry: &KernelRegistry,
+        encoder: &metal::ComputeCommandEncoderRef,
+        stop_after: usize,
+    ) -> Result<Array, KernelError> {
+        let num_heads = self.config.num_heads;
+        let num_kv_heads = self.config.num_kv_heads;
+        let head_dim = self.config.head_dim;
+        let hidden_size = num_heads * head_dim;
+        let seq_len = x.shape()[0];
+
+        // ---- Dispatch 1: RMSNorm (pre-attention) ----
+        let normed =
+            ops::rms_norm::rms_norm_encode(registry, x, Some(norm_weight), rms_norm_eps, encoder)?;
+        if stop_after <= 1 {
+            return Ok(normed);
+        }
+
+        // ---- Dispatch 2: QKV merged GEMM ----
+        let q_dim = num_heads * head_dim;
+        let k_dim = num_kv_heads * head_dim;
+        let v_dim = num_kv_heads * head_dim;
+
+        let normed_2d = if normed.ndim() == 1 {
+            normed.reshape(vec![1, normed.shape()[0]])?
+        } else {
+            normed.reshape(vec![normed.shape()[0], normed.shape()[1]])?
+        };
+
+        let qkv_wt = self.qkv_merged_weight_t.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape(
+                "forward_prefill_encode_partial requires merged QKV weight".into(),
+            )
+        })?;
+        let qkv = ops::matmul::matmul_encode(registry, &normed_2d, qkv_wt, encoder)?;
+        if stop_after <= 2 {
+            return Ok(qkv);
+        }
+
+        let total_out = q_dim + k_dim + v_dim;
+        let elem_size = qkv.dtype().size_of();
+        let q = Array::new(
+            qkv.metal_buffer().to_owned(),
+            vec![seq_len, q_dim],
+            vec![total_out, 1],
+            qkv.dtype(),
+            qkv.offset(),
+        );
+        let k = Array::new(
+            qkv.metal_buffer().to_owned(),
+            vec![seq_len, k_dim],
+            vec![total_out, 1],
+            qkv.dtype(),
+            qkv.offset() + q_dim * elem_size,
+        );
+        let v = Array::new(
+            qkv.metal_buffer().to_owned(),
+            vec![seq_len, v_dim],
+            vec![total_out, 1],
+            qkv.dtype(),
+            qkv.offset() + (q_dim + k_dim) * elem_size,
+        );
+
+        // ---- Dispatch 3: RoPE Q+K + V deinterleave ----
+        let rope_offset = cache.seq_len as u32;
+        let q_row_stride = q.strides()[0];
+        let k_row_stride = k.strides()[0];
+        let v_row_stride = v.strides()[0];
+
+        let (q_batched, k_batched) = if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
+            let q_b = ops::rope::rope_multihead_encode(
+                registry,
+                &q,
+                cos,
+                sin,
+                num_heads,
+                rope_offset,
+                q_row_stride,
+                encoder,
+            )?;
+            let k_b = ops::rope::rope_multihead_encode(
+                registry,
+                &k,
+                cos,
+                sin,
+                num_kv_heads,
+                rope_offset,
+                k_row_stride,
+                encoder,
+            )?;
+            (q_b, k_b)
+        } else {
+            let q_b = ops::rope::deinterleave_heads_encode(
+                registry,
+                &q,
+                num_heads,
+                q_row_stride,
+                encoder,
+            )?;
+            let k_b = ops::rope::deinterleave_heads_encode(
+                registry,
+                &k,
+                num_kv_heads,
+                k_row_stride,
+                encoder,
+            )?;
+            (q_b, k_b)
+        };
+        let v_batched = ops::rope::deinterleave_heads_encode(
+            registry,
+            &v,
+            num_kv_heads,
+            v_row_stride,
+            encoder,
+        )?;
+
+        if stop_after <= 3 {
+            return Ok(q_batched);
+        }
+
+        // ---- Dispatch 4: SDPA ----
+        let needs_initial_append = cache.seq_len == 0;
+        let (k_for_sdpa, v_for_sdpa, kv_stride, total_seq) = if needs_initial_append {
+            let k_view = k_batched.view(
+                k_batched.shape().to_vec(),
+                k_batched.strides().to_vec(),
+                k_batched.offset(),
+            );
+            let v_view = v_batched.view(
+                v_batched.shape().to_vec(),
+                v_batched.strides().to_vec(),
+                v_batched.offset(),
+            );
+            (k_view, v_view, None, seq_len)
+        } else {
+            cache.append_batched_encode(&k_batched, &v_batched, seq_len, registry, encoder)?;
+            let total_seq = cache.seq_len;
+            let k_slab = cache.keys_slab_view().ok_or_else(|| {
+                KernelError::InvalidShape("encode_partial: cache has no slab layout".into())
+            })?;
+            let v_slab = cache.values_slab_view().ok_or_else(|| {
+                KernelError::InvalidShape("encode_partial: cache has no slab layout".into())
+            })?;
+            let kv_stride = if cache.max_seq_len() != total_seq {
+                Some(cache.max_seq_len())
+            } else {
+                None
+            };
+            (k_slab, v_slab, kv_stride, total_seq)
+        };
+
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let is_f16_d128 = q_batched.dtype() == DType::Float16 && head_dim == 128 && seq_len > 1;
+        let use_nax = is_f16_d128 && registry.device().tuning().supports_nax;
+        let use_mma_bk32 = is_f16_d128 && !use_nax && total_seq >= 256;
+
+        let attn_slab = if use_nax {
+            ops::sdpa::sdpa_prefill_nax_f16_encode(
+                registry,
+                &q_batched,
+                &k_for_sdpa,
+                &v_for_sdpa,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                seq_len,
+                total_seq,
+                kv_stride,
+                scale,
+                true,
+                None,
+                None,
+                encoder,
+            )?
+        } else if use_mma_bk32 {
+            ops::sdpa::sdpa_prefill_mma_bk32_f16_encode(
+                registry,
+                &q_batched,
+                &k_for_sdpa,
+                &v_for_sdpa,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                seq_len,
+                total_seq,
+                kv_stride,
+                None,
+                scale,
+                true,
+                None,
+                None,
+                encoder,
+            )?
+        } else if is_f16_d128 {
+            ops::sdpa::sdpa_prefill_mma_f16_encode(
+                registry,
+                &q_batched,
+                &k_for_sdpa,
+                &v_for_sdpa,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                seq_len,
+                total_seq,
+                kv_stride,
+                None,
+                scale,
+                true,
+                None,
+                None,
+                encoder,
+            )?
+        } else {
+            ops::sdpa::sdpa_prefill_gqa_slab_encode(
+                registry,
+                &q_batched,
+                &k_for_sdpa,
+                &v_for_sdpa,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                seq_len,
+                total_seq,
+                kv_stride,
+                None,
+                scale,
+                true,
+                encoder,
+            )?
+        };
+
+        if needs_initial_append {
+            cache.append_batched_encode(&k_batched, &v_batched, seq_len, registry, encoder)?;
+        }
+
+        if stop_after <= 4 {
+            return Ok(attn_slab);
+        }
+
+        // ---- Dispatch 5: O Projection ----
+        let concat = attn_slab.view(
+            vec![seq_len, hidden_size],
+            vec![hidden_size, 1],
+            attn_slab.offset(),
+        );
+        self.o_proj.forward_into_encoder(&concat, registry, encoder)
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-dispatch breakdown: measure each dispatch in its own CB
+    // -----------------------------------------------------------------------
+
+    /// Run attention dispatches 1-5 individually, each in its own command buffer,
+    /// returning per-dispatch wall-clock timings and the final O-projection output.
+    ///
+    /// Dispatches:
+    ///   1. RMSNorm (pre-attention)
+    ///   2. QKV merged GEMM
+    ///   3. RoPE Q+K + V deinterleave (fused)
+    ///   4. SDPA
+    ///   5. O Projection
+    ///
+    /// Each dispatch is encoded into a fresh CB, committed, and waited on.
+    /// This adds CB overhead but gives exact per-dispatch GPU timing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_prefill_breakdown(
+        &self,
+        x: &Array,
+        norm_weight: &Array,
+        rms_norm_eps: f32,
+        cos_freqs: Option<&Array>,
+        sin_freqs: Option<&Array>,
+        cache: &mut LayerKvCache,
+        registry: &KernelRegistry,
+        queue: &metal::CommandQueue,
+    ) -> Result<(Array, Vec<(&'static str, std::time::Duration)>), KernelError> {
+        use std::time::Instant;
+
+        let num_heads = self.config.num_heads;
+        let num_kv_heads = self.config.num_kv_heads;
+        let head_dim = self.config.head_dim;
+        let hidden_size = num_heads * head_dim;
+        let seq_len = x.shape()[0];
+        let mut timings: Vec<(&'static str, std::time::Duration)> = Vec::with_capacity(5);
+
+        let q_dim = num_heads * head_dim;
+        let k_dim = num_kv_heads * head_dim;
+        let v_dim = num_kv_heads * head_dim;
+
+        let qkv_wt = self.qkv_merged_weight_t.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape("forward_prefill_breakdown requires merged QKV weight".into())
+        })?;
+
+        // ---- Dispatch 1: RMSNorm (pre-attention) ----
+        let normed = {
+            let cb = queue.new_command_buffer();
+            let start = Instant::now();
+            let out =
+                ops::rms_norm::rms_norm_into_cb(registry, x, Some(norm_weight), rms_norm_eps, cb)?;
+            cb.commit();
+            cb.wait_until_completed();
+            timings.push(("RMSNorm (pre-attn)", start.elapsed()));
+            out
+        };
+
+        // ---- Dispatch 2: QKV merged GEMM ----
+        let normed_2d = if normed.ndim() == 1 {
+            normed.reshape(vec![1, normed.shape()[0]])?
+        } else {
+            normed.reshape(vec![normed.shape()[0], normed.shape()[1]])?
+        };
+
+        let (q, k, v) = {
+            let cb = queue.new_command_buffer();
+            let start = Instant::now();
+            let qkv = ops::matmul::matmul_into_cb(registry, &normed_2d, qkv_wt, cb)?;
+            cb.commit();
+            cb.wait_until_completed();
+            timings.push(("QKV Merged GEMM", start.elapsed()));
+            let total_out = q_dim + k_dim + v_dim;
+            let elem_size = qkv.dtype().size_of();
+            let q_view = Array::new(
+                qkv.metal_buffer().to_owned(),
+                vec![seq_len, q_dim],
+                vec![total_out, 1],
+                qkv.dtype(),
+                qkv.offset(),
+            );
+            let k_view = Array::new(
+                qkv.metal_buffer().to_owned(),
+                vec![seq_len, k_dim],
+                vec![total_out, 1],
+                qkv.dtype(),
+                qkv.offset() + q_dim * elem_size,
+            );
+            let v_view = Array::new(
+                qkv.metal_buffer().to_owned(),
+                vec![seq_len, v_dim],
+                vec![total_out, 1],
+                qkv.dtype(),
+                qkv.offset() + (q_dim + k_dim) * elem_size,
+            );
+            (q_view, k_view, v_view)
+        };
+
+        // ---- Dispatch 3: RoPE Q+K + V deinterleave (fused) ----
+        let rope_offset = cache.seq_len as u32;
+        let q_row_stride = q.strides()[0];
+
+        let (q_batched, k_batched, v_batched) = {
+            let cb = queue.new_command_buffer();
+            let start = Instant::now();
+            let result = if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
+                if q.metal_buffer().as_ptr() == k.metal_buffer().as_ptr()
+                    && k.metal_buffer().as_ptr() == v.metal_buffer().as_ptr()
+                {
+                    ops::rope::rope_qkv_batch_into_cb(
+                        registry,
+                        &q,
+                        cos,
+                        sin,
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                        rope_offset,
+                        q_row_stride,
+                        cb,
+                    )?
+                } else {
+                    let q_b = ops::rope::rope_multihead_into_cb(
+                        registry,
+                        &q,
+                        cos,
+                        sin,
+                        num_heads,
+                        rope_offset,
+                        q.strides()[0],
+                        cb,
+                    )?;
+                    let k_b = ops::rope::rope_multihead_into_cb(
+                        registry,
+                        &k,
+                        cos,
+                        sin,
+                        num_kv_heads,
+                        rope_offset,
+                        k.strides()[0],
+                        cb,
+                    )?;
+                    let v_b = ops::rope::deinterleave_heads_into_cb(
+                        registry,
+                        &v,
+                        num_kv_heads,
+                        v.strides()[0],
+                        cb,
+                    )?;
+                    (q_b, k_b, v_b)
+                }
+            } else {
+                let q_b = ops::rope::deinterleave_heads_into_cb(
+                    registry,
+                    &q,
+                    num_heads,
+                    q.strides()[0],
+                    cb,
+                )?;
+                let k_b = ops::rope::deinterleave_heads_into_cb(
+                    registry,
+                    &k,
+                    num_kv_heads,
+                    k.strides()[0],
+                    cb,
+                )?;
+                let v_b = ops::rope::deinterleave_heads_into_cb(
+                    registry,
+                    &v,
+                    num_kv_heads,
+                    v.strides()[0],
+                    cb,
+                )?;
+                (q_b, k_b, v_b)
+            };
+            cb.commit();
+            cb.wait_until_completed();
+            timings.push(("RoPE Q+K + V deinterleave", start.elapsed()));
+            result
+        };
+
+        // ---- Dispatch 4: SDPA ----
+        let needs_initial_append = cache.seq_len == 0;
+        let (k_for_sdpa, v_for_sdpa, kv_stride, total_seq) = if needs_initial_append {
+            let k_view = k_batched.view(
+                k_batched.shape().to_vec(),
+                k_batched.strides().to_vec(),
+                k_batched.offset(),
+            );
+            let v_view = v_batched.view(
+                v_batched.shape().to_vec(),
+                v_batched.strides().to_vec(),
+                v_batched.offset(),
+            );
+            (k_view, v_view, None, seq_len)
+        } else {
+            let cache_cb = queue.new_command_buffer();
+            cache.append_batched_into_cb(&k_batched, &v_batched, seq_len, registry, cache_cb)?;
+            cache_cb.commit();
+            cache_cb.wait_until_completed();
+            let total_seq = cache.seq_len;
+            let k_slab = cache.keys_slab_view().ok_or_else(|| {
+                KernelError::InvalidShape("breakdown: cache has no slab layout".into())
+            })?;
+            let v_slab = cache.values_slab_view().ok_or_else(|| {
+                KernelError::InvalidShape("breakdown: cache has no slab layout".into())
+            })?;
+            let kv_stride = if cache.max_seq_len() != total_seq {
+                Some(cache.max_seq_len())
+            } else {
+                None
+            };
+            (k_slab, v_slab, kv_stride, total_seq)
+        };
+
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let is_f16_d128 = q_batched.dtype() == DType::Float16 && head_dim == 128 && seq_len > 1;
+        let use_nax = is_f16_d128 && registry.device().tuning().supports_nax;
+        let use_mma_bk32 = is_f16_d128 && !use_nax && total_seq >= 256;
+
+        let attn_slab = {
+            let cb = queue.new_command_buffer();
+            let start = Instant::now();
+            let slab = if use_nax {
+                ops::sdpa::sdpa_prefill_nax_f16_into_cb(
+                    registry,
+                    &q_batched,
+                    &k_for_sdpa,
+                    &v_for_sdpa,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    seq_len,
+                    total_seq,
+                    kv_stride,
+                    scale,
+                    true,
+                    None,
+                    None,
+                    cb,
+                )?
+            } else if use_mma_bk32 {
+                ops::sdpa::sdpa_prefill_mma_bk32_f16_into_cb(
+                    registry,
+                    &q_batched,
+                    &k_for_sdpa,
+                    &v_for_sdpa,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    seq_len,
+                    total_seq,
+                    kv_stride,
+                    None,
+                    scale,
+                    true,
+                    None,
+                    None,
+                    cb,
+                )?
+            } else if is_f16_d128 {
+                ops::sdpa::sdpa_prefill_mma_f16_into_cb(
+                    registry,
+                    &q_batched,
+                    &k_for_sdpa,
+                    &v_for_sdpa,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    seq_len,
+                    total_seq,
+                    kv_stride,
+                    None,
+                    scale,
+                    true,
+                    None,
+                    None,
+                    cb,
+                )?
+            } else {
+                ops::sdpa::sdpa_prefill_gqa_slab_into_cb(
+                    registry,
+                    &q_batched,
+                    &k_for_sdpa,
+                    &v_for_sdpa,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    seq_len,
+                    total_seq,
+                    kv_stride,
+                    None,
+                    scale,
+                    true,
+                    cb,
+                )?
+            };
+            cb.commit();
+            cb.wait_until_completed();
+            timings.push(("SDPA", start.elapsed()));
+            slab
+        };
+
+        let concat = attn_slab.view(
+            vec![seq_len, hidden_size],
+            vec![hidden_size, 1],
+            attn_slab.offset(),
+        );
+
+        // ---- Dispatch 5: O Projection ----
+        let o_out = {
+            let cb = queue.new_command_buffer();
+            let start = Instant::now();
+            let out = self.o_proj.forward_into_cb(&concat, registry, cb)?;
+            cb.commit();
+            cb.wait_until_completed();
+            timings.push(("O Projection", start.elapsed()));
+            out
+        };
+
+        Ok((o_out, timings))
     }
 }
 

@@ -4,7 +4,7 @@
 //!
 //! Per-operation profiling benchmark for RMLX single-layer prefill pipeline.
 //!
-//! Breaks down the MoE Expert Layer TransformerBlock `forward_prefill_single_cb`
+//! Breaks down the MoE Expert Layer TransformerBlock `forward_prefill_into_cb`
 //! into individual operations, each measured with its own CommandBuffer +
 //! commit + wait_until_completed() for accurate per-op timing.
 //!
@@ -544,7 +544,7 @@ fn main() {
                 DType::Float16,
             );
             let _ = block
-                .forward_prefill_single_cb(
+                .forward_prefill_into_cb(
                     &input,
                     Some(&cos_freqs),
                     Some(&sin_freqs),
@@ -650,7 +650,7 @@ fn main() {
             (qb, kb, vb)
         };
 
-        // 5. SDPA — use same dispatch logic as attention.rs forward_prefill_single_cb
+        // 5. SDPA — use same dispatch logic as attention.rs forward_prefill_into_cb
         //    On initial prefill (cache empty), RoPE output goes directly to SDPA.
         let total_seq = seq_len; // initial prefill: no prior cache
         let scale = 1.0 / (HEAD_DIM as f32).sqrt();
@@ -768,7 +768,7 @@ fn main() {
             r
         };
 
-        // 8. Fused residual + RMSNorm (matches forward_prefill_single_cb)
+        // 8. Fused residual + RMSNorm (matches forward_prefill_into_cb)
         let (normed2, h) = {
             let _pool = ScopedPool::new();
             let cb = queue.new_command_buffer_with_unretained_references();

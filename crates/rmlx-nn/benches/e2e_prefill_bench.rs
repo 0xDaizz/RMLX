@@ -1,4 +1,4 @@
-//! ✅ PRODUCTION PATH — tests forward_prefill_graph(), the actual production prefill path.
+//! PRODUCTION PATH — tests forward_graph_unified(Prefill), the actual production prefill path.
 //! Results directly reflect production 32-layer prefill throughput.
 //!
 //! E2E Prefill Benchmark (32-layer TransformerModel, Qwen 7B-style dimensions)
@@ -6,7 +6,7 @@
 //! Measures full 32-layer TransformerModel forward pass latency across
 //! multiple sequence lengths to profile end-to-end prefill performance.
 //!
-//! Benchmarks `forward()`, `forward_pipelined()`, and `forward_prefill_graph()`
+//! Benchmarks `forward()` and `forward_graph_unified(Prefill)`
 //! (single-CB-per-layer production fast path via ExecGraph).
 //!
 //! Each seq_len gets a **fresh command queue** to prevent cross-contamination.
@@ -25,7 +25,8 @@ use rmlx_metal::event::GpuEvent;
 use rmlx_metal::ScopedPool;
 use rmlx_nn::{
     Attention, AttentionConfig, Embedding, EmbeddingConfig, FeedForward, FeedForwardType,
-    LayerKvCache, Linear, LinearConfig, TransformerBlock, TransformerConfig, TransformerModel,
+    ForwardMode, LayerKvCache, Linear, LinearConfig, TransformerBlock, TransformerConfig,
+    TransformerModel,
 };
 
 // ---------------------------------------------------------------------------
@@ -375,8 +376,8 @@ fn main() {
         token_ids.push((state >> 33) as u32 % VOCAB_SIZE as u32);
     }
 
-    // Collect results: (seq_len, forward_stats, pipelined_stats, prefill_graph_stats)
-    let mut results: Vec<(usize, Stats, f64, Stats, f64, Stats, f64)> = Vec::new();
+    // Collect results: (seq_len, forward_stats, prefill_graph_stats)
+    let mut results: Vec<(usize, Stats, f64, Stats, f64)> = Vec::new();
 
     for &seq_len in SEQ_LENS {
         println!("\n--- seq_len={} ---", seq_len);
@@ -440,60 +441,7 @@ fn main() {
         println!("  forward          : {}", stats_fwd);
         println!("    estimated TFLOPS: {:.2}", tflops_fwd);
 
-        // ==== Benchmark 2: forward_pipelined() ====
-        let queue_pipe = device.new_command_queue();
-        let stats_pipe = {
-            let mut caches = make_caches(device);
-
-            // Warmup
-            {
-                let _pool = ScopedPool::new();
-                for _ in 0..WARMUP_ITERS {
-                    reset_caches(&mut caches);
-                    let _out = model
-                        .forward_pipelined(
-                            tids,
-                            Some(&cos_freqs),
-                            Some(&sin_freqs),
-                            None,
-                            Some(&mut caches),
-                            &registry,
-                            &queue_pipe,
-                        )
-                        .expect("forward_pipelined warmup failed");
-                }
-            }
-
-            // Benchmark
-            let mut latencies = Vec::with_capacity(BENCH_ITERS);
-            {
-                let _pool = ScopedPool::new();
-                for _ in 0..BENCH_ITERS {
-                    reset_caches(&mut caches);
-                    let start = Instant::now();
-                    let _out = model
-                        .forward_pipelined(
-                            tids,
-                            Some(&cos_freqs),
-                            Some(&sin_freqs),
-                            None,
-                            Some(&mut caches),
-                            &registry,
-                            &queue_pipe,
-                        )
-                        .expect("forward_pipelined failed");
-                    latencies.push(start.elapsed());
-                }
-            }
-
-            Stats::from_durations(&latencies)
-        };
-
-        let tflops_pipe = compute_tflops(seq_len, stats_pipe.mean);
-        println!("  forward_pipelined: {}", stats_pipe);
-        println!("    estimated TFLOPS: {:.2}", tflops_pipe);
-
-        // ==== Benchmark 3: forward_prefill_graph() (single CB per layer, production path) ====
+        // ==== Benchmark 2: forward_graph_unified(Prefill) (single CB per layer, production path) ====
         let queue_graph = device.new_command_queue();
         let event = GpuEvent::new(device);
         let stats_graph = {
@@ -505,17 +453,18 @@ fn main() {
                 for _ in 0..WARMUP_ITERS {
                     reset_caches(&mut caches);
                     let _out = model
-                        .forward_prefill_graph(
+                        .forward_graph_unified(
                             tids,
                             Some(&cos_freqs),
                             Some(&sin_freqs),
                             None,
-                            &mut caches,
+                            Some(&mut caches[..]),
+                            ForwardMode::Prefill { layers_per_cb: 4 },
                             &registry,
                             &queue_graph,
                             &event,
                         )
-                        .expect("forward_prefill_graph warmup failed");
+                        .expect("forward_graph_unified warmup failed");
                     // Force GPU completion by submitting an empty CB and waiting
                     let sync_cb = queue_graph.new_command_buffer();
                     sync_cb.commit();
@@ -529,12 +478,13 @@ fn main() {
                 reset_caches(&mut caches);
                 let debug_start = Instant::now();
                 let debug_out = model
-                    .forward_prefill_graph(
+                    .forward_graph_unified(
                         tids,
                         Some(&cos_freqs),
                         Some(&sin_freqs),
                         None,
-                        &mut caches,
+                        Some(&mut caches[..]),
+                        ForwardMode::Prefill { layers_per_cb: 4 },
                         &registry,
                         &queue_graph,
                         &event,
@@ -568,17 +518,18 @@ fn main() {
                     reset_caches(&mut caches);
                     let start = Instant::now();
                     let _out = model
-                        .forward_prefill_graph(
+                        .forward_graph_unified(
                             tids,
                             Some(&cos_freqs),
                             Some(&sin_freqs),
                             None,
-                            &mut caches,
+                            Some(&mut caches[..]),
+                            ForwardMode::Prefill { layers_per_cb: 4 },
                             &registry,
                             &queue_graph,
                             &event,
                         )
-                        .expect("forward_prefill_graph failed");
+                        .expect("forward_graph_unified failed");
                     // Force GPU completion by submitting an empty CB and waiting
                     let sync_cb = queue_graph.new_command_buffer();
                     sync_cb.commit();
@@ -594,15 +545,7 @@ fn main() {
         println!("  prefill_graph    : {}", stats_graph);
         println!("    estimated TFLOPS: {:.2}", tflops_graph);
 
-        results.push((
-            seq_len,
-            stats_fwd,
-            tflops_fwd,
-            stats_pipe,
-            tflops_pipe,
-            stats_graph,
-            tflops_graph,
-        ));
+        results.push((seq_len, stats_fwd, tflops_fwd, stats_graph, tflops_graph));
     }
 
     // ---------------------------------------------------------------------------
@@ -611,24 +554,15 @@ fn main() {
 
     println!("\n\n========== E2E Prefill Summary (32-layer, Qwen 7B-style) ==========");
     println!(
-        "| {:>7} | {:>12} | {:>8} | {:>14} | {:>8} | {:>15} | {:>8} | {:>7} | {:>7} |",
-        "seq_len",
-        "forward (us)",
-        "TFLOPS",
-        "pipelined (us)",
-        "TFLOPS",
-        "prefill_graph",
-        "TFLOPS",
-        "sp_pipe",
-        "sp_graph"
+        "| {:>7} | {:>12} | {:>8} | {:>15} | {:>8} | {:>8} |",
+        "seq_len", "forward (us)", "TFLOPS", "prefill_graph", "TFLOPS", "speedup"
     );
-    println!("|---------|--------------|----------|----------------|----------|-----------------|----------|---------|---------|");
-    for &(seq_len, ref s_fwd, t_fwd, ref s_pipe, t_pipe, ref s_graph, t_graph) in &results {
-        let sp_pipe = s_fwd.mean / s_pipe.mean;
+    println!("|---------|--------------|----------|-----------------|----------|----------|");
+    for &(seq_len, ref s_fwd, t_fwd, ref s_graph, t_graph) in &results {
         let sp_graph = s_fwd.mean / s_graph.mean;
         println!(
-            "| {:>7} | {:>12.1} | {:>8.2} | {:>14.1} | {:>8.2} | {:>15.1} | {:>8.2} | {:>6.2}x | {:>6.2}x |",
-            seq_len, s_fwd.mean, t_fwd, s_pipe.mean, t_pipe, s_graph.mean, t_graph, sp_pipe, sp_graph
+            "| {:>7} | {:>12.1} | {:>8.2} | {:>15.1} | {:>8.2} | {:>6.2}x |",
+            seq_len, s_fwd.mean, t_fwd, s_graph.mean, t_graph, sp_graph
         );
     }
     println!();

@@ -1,12 +1,11 @@
-//! ✅ PRODUCTION PATH — tests forward_graph() (ExecGraph with event chaining) and
-//! forward_single_cb / 9-dispatch paths, the actual decode production paths.
+//! PRODUCTION PATH — tests forward_decode_into_cb (single-CB decode) and
+//! 9-dispatch paths, the actual decode production paths.
 //!
 //! GPU Pipeline Performance Benchmark (MoE expert layer / Mixtral-style GQA)
 //!
 //! Apples-to-apples comparison of single-layer transformer forward pass:
 //! - **Baseline**: `forward()` — per-op dispatch, each op commits+waits its own CB
-//! - **ExecGraph**: `forward_graph()` — same compute, batched into 6 CBs with
-//!   GPU-side event chaining (single CPU sync at the end)
+//! - **ExecGraph**: `forward_decode_into_cb()` via ExecGraph CB — single CB per layer
 //!
 //! Both paths execute identical operations (norm, Q/K/V matmul, RoPE, SDPA,
 //! O_proj, residual, FFN). The only difference is dispatch strategy.
@@ -376,18 +375,18 @@ fn main() {
         .prepare_weights_for_graph(&registry, &queue)
         .expect("prepare_weights_for_graph failed");
 
-    // ---- Warmup ExecGraph ----
+    // ---- Warmup ExecGraph (decode_into_cb via graph CB) ----
     println!("Warming up ExecGraph ({} iterations)...", WARMUP_ITERS);
     for _ in 0..WARMUP_ITERS {
         let event = GpuEvent::new(device);
         let mut graph = ExecGraph::new(&queue, &event, 32);
-        let _ = block.forward_graph(
-            &input, None, None, None, None, &registry, &mut graph, &queue,
-        );
+        let cb = graph.command_buffer();
+        let _ = block.forward_decode_into_cb(&input, None, None, None, None, &registry, cb);
+        graph.submit_batch();
         let _ = graph.sync_and_reset();
     }
 
-    // ---- Benchmark ExecGraph: forward_graph() with batched CBs ----
+    // ---- Benchmark ExecGraph: forward_decode_into_cb via graph CB ----
     println!("Benchmarking ExecGraph ({} iterations)...", BENCH_ITERS);
     let mut graph_latencies = Vec::with_capacity(BENCH_ITERS);
     let mut graph_total_batches = 0usize;
@@ -399,11 +398,11 @@ fn main() {
         let mut graph = ExecGraph::new(&queue, &event, 32);
 
         let start = Instant::now();
+        let cb = graph.command_buffer();
         let _ = block
-            .forward_graph(
-                &input, None, None, None, None, &registry, &mut graph, &queue,
-            )
-            .expect("forward_graph failed");
+            .forward_decode_into_cb(&input, None, None, None, None, &registry, cb)
+            .expect("forward_decode_into_cb failed");
+        graph.submit_batch();
         let _ = graph.sync_and_reset().expect("sync failed");
         graph_latencies.push(start.elapsed());
 
@@ -411,16 +410,9 @@ fn main() {
             // Re-run once more to capture stats before reset
             let event2 = GpuEvent::new(device);
             let mut graph2 = ExecGraph::new(&queue, &event2, 32);
-            let _ = block.forward_graph(
-                &input,
-                None,
-                None,
-                None,
-                None,
-                &registry,
-                &mut graph2,
-                &queue,
-            );
+            let cb2 = graph2.command_buffer();
+            let _ = block.forward_decode_into_cb(&input, None, None, None, None, &registry, cb2);
+            graph2.submit_batch();
             let stats2 = ExecGraphStats::from_graph(&graph2);
             graph_total_batches = stats2.total_batches;
             graph_total_cbs = stats2.total_cbs;
@@ -429,12 +421,12 @@ fn main() {
         }
     }
 
-    // ---- Benchmark Single-CB: forward_single_cb() ----
+    // ---- Benchmark Single-CB: forward_decode_into_cb() ----
     println!("\nWarming up Single-CB ({} iterations)...", WARMUP_ITERS);
     for _ in 0..WARMUP_ITERS {
         let cb = queue.new_command_buffer_with_unretained_references();
         let _ = block
-            .forward_single_cb(&input, None, None, None, None, &registry, cb)
+            .forward_decode_into_cb(&input, None, None, None, None, &registry, cb)
             .unwrap();
         cb.commit();
         cb.wait_until_completed();
@@ -445,7 +437,7 @@ fn main() {
         let start = Instant::now();
         let cb = queue.new_command_buffer_with_unretained_references();
         let _ = block
-            .forward_single_cb(&input, None, None, None, None, &registry, cb)
+            .forward_decode_into_cb(&input, None, None, None, None, &registry, cb)
             .unwrap();
         cb.commit();
         cb.wait_until_completed();
@@ -566,14 +558,14 @@ fn main() {
     println!("  {}", baseline_stats);
     println!("  Command buffers per forward: {}", baseline_cbs);
     println!();
-    println!("ExecGraph (forward_graph):");
+    println!("ExecGraph (forward_decode_into_cb via graph):");
     println!("  {}", graph_stats);
     println!(
         "  Batches: {}, CBs: {}, Encoders: {}",
         graph_total_batches, graph_total_cbs, graph_total_encoders
     );
     println!();
-    println!("Single-CB (forward_single_cb):");
+    println!("Single-CB (forward_decode_into_cb):");
     println!("  {}", single_cb_stats);
     println!("  Command buffers per forward: 1");
     println!();
