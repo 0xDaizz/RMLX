@@ -209,6 +209,19 @@ impl BlockManager {
         Ok(())
     }
 
+    /// Remove and return the last block from a sequence's block table.
+    /// Used by trim operations to free trailing empty blocks.
+    pub fn pop_last_block(&mut self, seq_id: u64) -> Option<BlockId> {
+        self.block_tables
+            .get_mut(&seq_id)
+            .and_then(|table| table.pop())
+    }
+
+    /// Check whether a sequence has an entry in the block tables.
+    pub fn has_sequence(&self, seq_id: u64) -> bool {
+        self.block_tables.contains_key(&seq_id)
+    }
+
     /// Free all blocks owned by a sequence and remove its block table.
     pub fn free_sequence(&mut self, sequence_id: u64) {
         if let Some(blocks) = self.block_tables.remove(&sequence_id) {
@@ -529,6 +542,63 @@ impl PagedKvCache {
 
         let strides = vec![num_kv_heads * head_dim, head_dim, 1];
         Ok(Array::new(out_buffer, shape.to_vec(), strides, dtype, 0))
+    }
+
+    /// Remove the last `n` tokens from a sequence's cache across all layers.
+    ///
+    /// Frees any blocks that become completely empty after trimming.
+    /// Partially-occupied blocks are kept but their logical length is reduced.
+    /// This is used by speculative decoding to roll back rejected draft tokens.
+    ///
+    /// Returns the new sequence length after trimming, or `PagedKvError::SequenceNotFound`
+    /// if the sequence doesn't exist.
+    pub fn trim(&mut self, seq_id: u64, n: usize) -> Result<usize, PagedKvError> {
+        // Check sequence exists
+        if !self.block_manager.has_sequence(seq_id) {
+            return Err(PagedKvError::SequenceNotFound(seq_id));
+        }
+
+        let block_size = self.block_manager.block_size();
+        let old_seq_len = self.seq_len(seq_id);
+        let new_seq_len = old_seq_len.saturating_sub(n);
+
+        // Update all layer lengths for this sequence
+        let layer_keys: Vec<(u64, usize)> = self
+            .layer_lengths
+            .keys()
+            .filter(|(sid, _)| *sid == seq_id)
+            .cloned()
+            .collect();
+
+        for key in &layer_keys {
+            if let Some(len) = self.layer_lengths.get_mut(key) {
+                *len = (*len).saturating_sub(n);
+            }
+        }
+
+        // Calculate how many blocks are needed before and after trimming
+        let old_num_blocks = old_seq_len.div_ceil(block_size);
+        let new_num_blocks = if new_seq_len == 0 {
+            0
+        } else {
+            new_seq_len.div_ceil(block_size)
+        };
+
+        // Free trailing blocks that are no longer needed
+        let blocks_to_free = old_num_blocks.saturating_sub(new_num_blocks);
+        for _ in 0..blocks_to_free {
+            if let Some(block_id) = self.block_manager.pop_last_block(seq_id) {
+                self.block_manager.free(block_id);
+            }
+        }
+
+        // If new_seq_len is 0, clean up completely
+        if new_seq_len == 0 {
+            self.free_sequence(seq_id);
+            return Ok(0);
+        }
+
+        Ok(new_seq_len)
     }
 
     /// Free all blocks for a sequence and remove its metadata.
@@ -865,5 +935,89 @@ mod tests {
         bm.free_sequence(1);
         assert_eq!(bm.num_free_blocks(), initial_free);
         assert!(bm.block_table(1).is_empty());
+    }
+
+    #[test]
+    fn test_trim_partial() {
+        let device = test_device();
+        // block_size=4, so 6 tokens spans 2 blocks.
+        let bm = BlockManager::new(&device, 8, 4, 2, 2, 4, DType::Float32);
+        let mut cache = PagedKvCache::new(bm);
+
+        let seq_id = 1;
+        let key = test_array(&device, 6, 1.0);
+        let value = test_array(&device, 6, 100.0);
+        cache.append(0, seq_id, &key, &value).unwrap();
+        cache.append(1, seq_id, &key, &value).unwrap();
+        assert_eq!(cache.seq_len(seq_id), 6);
+        assert_eq!(cache.block_manager().block_table(seq_id).len(), 2);
+
+        // Trim 1 token — still need 2 blocks (5 tokens, block_size=4).
+        let new_len = cache.trim(seq_id, 1).unwrap();
+        assert_eq!(new_len, 5);
+        assert_eq!(cache.layer_len(seq_id, 0), 5);
+        assert_eq!(cache.layer_len(seq_id, 1), 5);
+        assert_eq!(cache.block_manager().block_table(seq_id).len(), 2);
+    }
+
+    #[test]
+    fn test_trim_frees_block() {
+        let device = test_device();
+        // block_size=4, so 6 tokens spans 2 blocks.
+        let bm = BlockManager::new(&device, 8, 4, 2, 2, 4, DType::Float32);
+        let mut cache = PagedKvCache::new(bm);
+
+        let seq_id = 1;
+        let key = test_array(&device, 6, 1.0);
+        let value = test_array(&device, 6, 100.0);
+        cache.append(0, seq_id, &key, &value).unwrap();
+        assert_eq!(cache.block_manager().block_table(seq_id).len(), 2);
+        let free_before = cache.block_manager().num_free_blocks();
+
+        // Trim 3 tokens: 6 -> 3, which fits in 1 block. Should free 1 block.
+        let new_len = cache.trim(seq_id, 3).unwrap();
+        assert_eq!(new_len, 3);
+        assert_eq!(cache.block_manager().block_table(seq_id).len(), 1);
+        assert_eq!(cache.block_manager().num_free_blocks(), free_before + 1);
+
+        // Data in the remaining block should still be valid.
+        let got_keys = cache.get_keys(0, seq_id).unwrap();
+        assert_eq!(got_keys.shape(), &[3, 2, 4]);
+    }
+
+    #[test]
+    fn test_trim_to_zero() {
+        let device = test_device();
+        let bm = BlockManager::new(&device, 8, 4, 2, 2, 4, DType::Float32);
+        let mut cache = PagedKvCache::new(bm);
+
+        let seq_id = 1;
+        let key = test_array(&device, 3, 1.0);
+        let value = test_array(&device, 3, 100.0);
+        cache.append(0, seq_id, &key, &value).unwrap();
+        let free_before_append = cache.block_manager().num_free_blocks();
+
+        // Trim all tokens.
+        let new_len = cache.trim(seq_id, 10).unwrap();
+        assert_eq!(new_len, 0);
+        // All blocks freed — 1 block was used.
+        assert_eq!(
+            cache.block_manager().num_free_blocks(),
+            free_before_append + 1
+        );
+        // Sequence should be fully cleaned up.
+        assert_eq!(cache.seq_len(seq_id), 0);
+    }
+
+    #[test]
+    fn test_trim_nonexistent_sequence() {
+        let device = test_device();
+        let bm = BlockManager::new(&device, 8, 4, 2, 2, 4, DType::Float32);
+        let mut cache = PagedKvCache::new(bm);
+
+        match cache.trim(999, 1) {
+            Err(PagedKvError::SequenceNotFound(999)) => {} // expected
+            other => panic!("expected SequenceNotFound, got {other:?}"),
+        }
     }
 }
