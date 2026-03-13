@@ -5,32 +5,14 @@
 //! functions specialized with Metal function constants.
 
 use std::collections::HashMap;
-use std::ffi::c_void;
-use std::ptr::NonNull;
 use std::sync::RwLock;
 
-use objc2::rc::Retained;
-use objc2::Message;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::*;
 
 use crate::types::*;
 use crate::MetalError;
-
-/// Retain an unsized protocol-object reference into an owned `Retained`.
-///
-/// `Retained::retain()` requires `T: Sized` (it lives in `impl<T: Message>`),
-/// but `ProtocolObject<dyn MTLFoo>` is unsized.  We work around this by
-/// calling `objc_retain` directly and wrapping the result with `from_raw`,
-/// which *is* available for `T: ?Sized + Message`.
-fn retain_proto<T: ?Sized + Message>(r: &T) -> Retained<T> {
-    let ptr = r as *const T as *mut T;
-    unsafe {
-        objc2::ffi::objc_retain(ptr as *mut _);
-        Retained::from_raw(ptr).unwrap_unchecked()
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Function constant value type
@@ -192,43 +174,11 @@ impl PipelineCache {
         }
 
         let fcv = MTLFunctionConstantValues::new();
-        for (index, constant) in constants {
-            match constant {
-                FunctionConstant::Bool(v) => {
-                    let val: u8 = u8::from(*v);
-                    unsafe {
-                        fcv.setConstantValue_type_atIndex(
-                            NonNull::new(&val as *const u8 as *mut c_void).unwrap(),
-                            MTLDataType::Bool,
-                            *index as usize,
-                        );
-                    }
-                }
-                FunctionConstant::U32(v) => {
-                    unsafe {
-                        fcv.setConstantValue_type_atIndex(
-                            NonNull::new(v as *const u32 as *mut c_void).unwrap(),
-                            MTLDataType::UInt,
-                            *index as usize,
-                        );
-                    }
-                }
-                FunctionConstant::F32(v) => {
-                    unsafe {
-                        fcv.setConstantValue_type_atIndex(
-                            NonNull::new(v as *const f32 as *mut c_void).unwrap(),
-                            MTLDataType::Float,
-                            *index as usize,
-                        );
-                    }
-                }
-            }
-        }
+        apply_function_constants(&fcv, constants);
 
-        let function = unsafe {
-            library.newFunctionWithName_constantValues_error(&NSString::from_str(name), &fcv)
-        }
-        .map_err(|_| MetalError::KernelNotFound(name.to_string()))?;
+        let function = library
+            .newFunctionWithName_constantValues_error(&NSString::from_str(name), &fcv)
+            .map_err(|_| MetalError::KernelNotFound(name.to_string()))?;
 
         let pipeline = self
             .device
@@ -258,6 +208,64 @@ impl PipelineCache {
     /// Whether the cache is empty.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared helper: apply function constants to MTLFunctionConstantValues
+// ---------------------------------------------------------------------------
+
+/// Apply a slice of `(index, FunctionConstant)` to a
+/// `MTLFunctionConstantValues` object.
+///
+/// Encapsulates the `unsafe` calls to `setConstantValue_type_atIndex` which
+/// require a raw `NonNull<c_void>` pointer.  The pointer is always derived
+/// from a local stack value whose lifetime covers the FFI call, so this is
+/// safe to call from safe Rust.
+pub(crate) fn apply_function_constants(
+    fcv: &MTLFunctionConstantValues,
+    constants: &[(u32, FunctionConstant)],
+) {
+    use std::ffi::c_void;
+    use std::ptr::NonNull;
+
+    for (index, constant) in constants {
+        match constant {
+            FunctionConstant::Bool(v) => {
+                let val: u8 = u8::from(*v);
+                // SAFETY: `&val` is a valid, aligned pointer to a stack-local u8.
+                // The Obj-C method copies the value immediately.
+                unsafe {
+                    fcv.setConstantValue_type_atIndex(
+                        NonNull::new(&val as *const u8 as *mut c_void).unwrap(),
+                        MTLDataType::Bool,
+                        *index as usize,
+                    );
+                }
+            }
+            FunctionConstant::U32(v) => {
+                // SAFETY: `v` is a valid reference to a u32 from the slice.
+                // The Obj-C method copies the value immediately.
+                unsafe {
+                    fcv.setConstantValue_type_atIndex(
+                        NonNull::new(v as *const u32 as *mut c_void).unwrap(),
+                        MTLDataType::UInt,
+                        *index as usize,
+                    );
+                }
+            }
+            FunctionConstant::F32(v) => {
+                // SAFETY: `v` is a valid reference to a f32 from the slice.
+                // The Obj-C method copies the value immediately.
+                unsafe {
+                    fcv.setConstantValue_type_atIndex(
+                        NonNull::new(v as *const f32 as *mut c_void).unwrap(),
+                        MTLDataType::Float,
+                        *index as usize,
+                    );
+                }
+            }
+        }
     }
 }
 

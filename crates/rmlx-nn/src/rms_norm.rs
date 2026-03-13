@@ -7,6 +7,8 @@ use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::{KernelError, KernelRegistry};
 use rmlx_core::ops;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLCommandQueue, MTLDevice};
 
 /// RMS Normalization configuration.
 pub struct RMSNormConfig {
@@ -45,7 +47,7 @@ impl RMSNorm {
     /// The weight is created as f32 on the given device. The `_dtype` parameter
     /// is accepted for API consistency but currently only f32 weights are
     /// supported (the core kernel handles f16/bf16 inputs with f32 accumulation).
-    pub fn new(config: &RMSNormConfig, device: &metal::Device, _dtype: DType) -> Self {
+    pub fn new(config: &RMSNormConfig, device: &ProtocolObject<dyn MTLDevice>, _dtype: DType) -> Self {
         let weight = Array::ones(device, &[config.normalized_shape]);
         Self {
             weight,
@@ -72,7 +74,7 @@ impl RMSNorm {
         &self,
         registry: &KernelRegistry,
         input: &Array,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         if input.ndim() != 2 {
             return Err(KernelError::InvalidShape(format!(
@@ -112,10 +114,10 @@ impl RMSNorm {
 mod tests {
     use super::*;
 
-    fn setup() -> (metal::Device, KernelRegistry, metal::CommandQueue) {
-        let device = metal::Device::system_default().expect("no Metal device");
+    fn setup() -> (rmlx_metal::MtlDevice, KernelRegistry, rmlx_metal::MtlQueue) {
+        let device = objc2_metal::MTLCreateSystemDefaultDevice().expect("no Metal device");
         let gpu = rmlx_metal::device::GpuDevice::system_default().expect("no GpuDevice");
-        let queue = device.new_command_queue();
+        let queue = gpu.new_command_queue();
         let registry = KernelRegistry::new(gpu);
         ops::rms_norm::register(&registry).expect("failed to register rms_norm kernels");
         (device, registry, queue)
@@ -123,7 +125,7 @@ mod tests {
 
     #[test]
     fn test_rms_norm_construction() {
-        let device = metal::Device::system_default().expect("no Metal device");
+        let device = objc2_metal::MTLCreateSystemDefaultDevice().expect("no Metal device");
         let config = RMSNormConfig::new(64);
 
         let norm = RMSNorm::new(&config, &device, DType::Float32);

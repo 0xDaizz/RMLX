@@ -22,11 +22,24 @@
 //! Note: Requires the `MetalCaptureEnabled` Info.plist key or the
 //! `METAL_CAPTURE_ENABLED=1` environment variable to be set.
 
+use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSURL;
 use objc2_metal::*;
 
 use crate::MetalError;
+
+/// Return the shared singleton `MTLCaptureManager`.
+///
+/// Centralises the single `unsafe` call so that callers don't need to repeat
+/// the safety justification.
+fn shared_capture_manager() -> Retained<MTLCaptureManager> {
+    // SAFETY: `sharedCaptureManager` is a class-method singleton accessor.
+    // There are no preconditions; the call is always valid on any macOS with
+    // Metal support. Marked `unsafe` in objc2-metal only because it is an
+    // Objective-C class method.
+    unsafe { MTLCaptureManager::sharedCaptureManager() }
+}
 
 /// Destination for GPU trace capture.
 #[derive(Debug, Clone)]
@@ -88,7 +101,7 @@ impl Drop for CaptureScope {
 /// Returns `true` if `MTLCaptureManager.sharedCaptureManager.supportsDestination`
 /// indicates at least one destination is available.
 pub fn is_capture_supported() -> bool {
-    let manager = unsafe { MTLCaptureManager::sharedCaptureManager() };
+    let manager = shared_capture_manager();
     manager.supportsDestination(MTLCaptureDestination::DeveloperTools)
 }
 
@@ -101,7 +114,7 @@ fn start_capture(
     device: &ProtocolObject<dyn MTLDevice>,
     destination: &CaptureDestination,
 ) -> Result<(), MetalError> {
-    let manager = unsafe { MTLCaptureManager::sharedCaptureManager() };
+    let manager = shared_capture_manager();
 
     let descriptor = MTLCaptureDescriptor::new();
     descriptor.set_capture_device(device);
@@ -113,26 +126,24 @@ fn start_capture(
         CaptureDestination::GpuTraceFile(path) => {
             descriptor.setDestination(MTLCaptureDestination::GPUTraceDocument);
             let ns_path = objc2_foundation::NSString::from_str(path);
-            let url = unsafe { NSURL::fileURLWithPath(&ns_path) };
-            unsafe { descriptor.setOutputURL(Some(&url)) };
+            let url = NSURL::fileURLWithPath(&ns_path);
+            descriptor.setOutputURL(Some(&url));
         }
     }
 
-    unsafe {
-        manager
-            .startCaptureWithDescriptor_error(&descriptor)
-            .map_err(|e| {
-                MetalError::PipelineCreate(format!(
-                    "failed to start GPU capture ({destination:?}): {e}; \
-                     ensure METAL_CAPTURE_ENABLED=1 is set"
-                ))
-            })
-    }
+    manager
+        .startCaptureWithDescriptor_error(&descriptor)
+        .map_err(|e| {
+            MetalError::PipelineCreate(format!(
+                "failed to start GPU capture ({destination:?}): {e}; \
+                 ensure METAL_CAPTURE_ENABLED=1 is set"
+            ))
+        })
 }
 
 /// Stop the active Metal GPU capture.
 fn stop_capture() {
-    let manager = unsafe { MTLCaptureManager::sharedCaptureManager() };
+    let manager = shared_capture_manager();
     manager.stopCapture();
 }
 

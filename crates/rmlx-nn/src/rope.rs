@@ -8,6 +8,8 @@ use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::{KernelError, KernelRegistry};
 use rmlx_core::ops;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLCommandQueue, MTLDevice};
 
 /// Configuration for [`RotaryPositionEmbedding`].
 pub struct RotaryPositionEmbeddingConfig {
@@ -72,7 +74,7 @@ impl RotaryPositionEmbedding {
     /// Returns an error if `head_dim` is zero, odd, or if `max_seq_len` is zero.
     pub fn new(
         config: RotaryPositionEmbeddingConfig,
-        device: &metal::Device,
+        device: &ProtocolObject<dyn MTLDevice>,
         _dtype: DType,
     ) -> Result<Self, KernelError> {
         if config.head_dim == 0 {
@@ -130,7 +132,7 @@ impl RotaryPositionEmbedding {
         registry: &KernelRegistry,
         input: &Array,
         offset: u32,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         ops::rope::rope_ext(
             registry,

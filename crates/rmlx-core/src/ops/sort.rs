@@ -7,7 +7,14 @@
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
-use metal::MTLSize;
+use rmlx_metal::MTLSize;
+use rmlx_metal::ComputePass;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLComputePipelineState as _;
+use objc2_metal::MTLCommandBuffer as _;
+use objc2_metal::MTLCommandQueue as _;
+use objc2_metal::MTLDevice as _;
+use rmlx_metal::MTLResourceOptions;
 
 // ---------------------------------------------------------------------------
 // Metal shader source
@@ -140,12 +147,8 @@ pub fn register(registry: &KernelRegistry) -> Result<(), KernelError> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn make_u32_buf(device: &metal::Device, val: u32) -> metal::Buffer {
-    device.new_buffer_with_data(
-        &val as *const u32 as *const std::ffi::c_void,
-        4,
-        metal::MTLResourceOptions::StorageModeShared,
-    )
+fn make_u32_buf(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, val: u32) -> rmlx_metal::MtlBuffer {
+    unsafe { device.newBufferWithBytes_length_options(std::ptr::NonNull::new(&val as *const u32 as *const std::ffi::c_void as *mut std::ffi::c_void).unwrap(), 4_usize, MTLResourceOptions::StorageModeShared).unwrap() }
 }
 
 /// Next power of 2 >= n (capped at 2048 for threadgroup memory).
@@ -173,7 +176,7 @@ pub fn sort(
     input: &Array,
     axis: usize,
     descending: bool,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     if input.dtype() != DType::Float32 {
         return Err(KernelError::NotFound(format!(
@@ -218,22 +221,22 @@ pub fn sort(
     let padded_buf = make_u32_buf(dev, padded_len as u32);
     let desc_buf = make_u32_buf(dev, if descending { 1 } else { 0 });
 
-    let cb = queue.new_command_buffer();
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(work_2d.metal_buffer()), work_2d.offset() as u64);
+    let cb = queue.commandBuffer().unwrap();
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
+    enc.set_buffer(0, Some(work_2d.metal_buffer()), work_2d.offset());
     enc.set_buffer(1, Some(out.metal_buffer()), 0);
     enc.set_buffer(2, Some(&cols_buf), 0);
     enc.set_buffer(3, Some(&padded_buf), 0);
     enc.set_buffer(4, Some(&desc_buf), 0);
-
     let tg_size = std::cmp::min(
-        padded_len as u64,
-        pipeline.max_total_threads_per_threadgroup(),
+        padded_len,
+        pipeline.maxTotalThreadsPerThreadgroup(),
     );
-    enc.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), MTLSize::new(tg_size, 1, 1));
-    enc.end_encoding();
-    super::commit_with_mode(cb, super::ExecMode::Sync);
+    enc.dispatch_threadgroups(MTLSize { width: rows, height: 1, depth: 1 }, MTLSize { width: tg_size, height: 1, depth: 1 });
+    enc.end();
+    super::commit_with_mode(&cb, super::ExecMode::Sync);
 
     // Reshape back to original shape if needed.
     if axis == ndim - 1 {
@@ -255,7 +258,7 @@ pub fn argsort(
     input: &Array,
     axis: usize,
     descending: bool,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     if input.dtype() != DType::Float32 {
         return Err(KernelError::NotFound(format!(
@@ -304,22 +307,22 @@ pub fn argsort(
     let padded_buf = make_u32_buf(dev, padded_len as u32);
     let desc_buf = make_u32_buf(dev, if descending { 1 } else { 0 });
 
-    let cb = queue.new_command_buffer();
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(work_2d.metal_buffer()), work_2d.offset() as u64);
+    let cb = queue.commandBuffer().unwrap();
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
+    enc.set_buffer(0, Some(work_2d.metal_buffer()), work_2d.offset());
     enc.set_buffer(1, Some(out_2d.metal_buffer()), 0);
     enc.set_buffer(2, Some(&cols_buf), 0);
     enc.set_buffer(3, Some(&padded_buf), 0);
     enc.set_buffer(4, Some(&desc_buf), 0);
-
     let tg_size = std::cmp::min(
-        padded_len as u64,
-        pipeline.max_total_threads_per_threadgroup(),
+        padded_len,
+        pipeline.maxTotalThreadsPerThreadgroup(),
     );
-    enc.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), MTLSize::new(tg_size, 1, 1));
-    enc.end_encoding();
-    super::commit_with_mode(cb, super::ExecMode::Sync);
+    enc.dispatch_threadgroups(MTLSize { width: rows, height: 1, depth: 1 }, MTLSize { width: tg_size, height: 1, depth: 1 });
+    enc.end();
+    super::commit_with_mode(&cb, super::ExecMode::Sync);
 
     out_2d.reshape(shape.to_vec())
 }
@@ -334,7 +337,7 @@ fn reshape_for_axis_last(
     input: &Array,
     axis: usize,
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<(Array, Vec<usize>), KernelError> {
     let shape = input.shape();
     let ndim = shape.len();
@@ -404,9 +407,9 @@ fn unpermute_view(input: &Array, axis: usize, original_shape: &[usize]) -> Array
 mod tests {
     use super::*;
 
-    fn setup() -> (KernelRegistry, metal::CommandQueue) {
+    fn setup() -> (KernelRegistry, rmlx_metal::MtlQueue) {
         let device = rmlx_metal::device::GpuDevice::system_default().expect("Metal device");
-        let queue = device.raw().new_command_queue();
+        let queue = device.new_command_queue();
         let registry = KernelRegistry::new(device);
         register(&registry).expect("register sort kernels");
         crate::ops::copy::register(&registry).expect("register copy kernels");

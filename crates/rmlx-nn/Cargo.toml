@@ -9,13 +9,13 @@ license.workspace = true
 rmlx-core = { path = "../rmlx-core" }
 rmlx-metal = { path = "../rmlx-metal" }
 rmlx-distributed = { path = "../rmlx-distributed", optional = true }
-objc2-metal = { workspace = true }
+objc2 = { workspace = true }
+objc2-metal = { workspace = true, features = ["objc2-core-foundation"] }
 safetensors = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [dev-dependencies]
-objc2 = { workspace = true }
 
 [features]
 bench = ["rmlx-core/bench"]
@@ -60,6 +60,10 @@ harness = false
 
 [[bench]]
 name = "dispatch_gpu_time_bench"
+harness = false
+
+[[bench]]
+name = "decode_7dispatch_trace_bench"
 harness = false
 
 [[bench]]

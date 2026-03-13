@@ -11,6 +11,9 @@ use rmlx_metal::event::GpuEvent;
 use rmlx_metal::exec_graph::ExecGraph;
 
 use crate::attention::{Attention, LayerKvCache};
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandQueue, MTLComputePipelineState, MTLDevice, MTLResourceOptions};
+use rmlx_metal::{ComputePass, MTLSize, MtlBuffer, MtlPipeline};
 
 /// Fused norm GEMM is bypassed (separate RMSNorm + matmul) when M <= this threshold.
 /// Default: 0 (always use fused). Set via [`set_fused_norm_threshold()`].
@@ -28,12 +31,6 @@ pub fn fused_norm_threshold() -> usize {
 use crate::embedding::Embedding;
 use crate::linear::Linear;
 use crate::moe::MoeLayer;
-
-/// Cast a BufferRef to a ResourceRef for use with memory_barrier_with_resources.
-/// Safe because MTLBuffer inherits from MTLResource in ObjC.
-fn buf_as_resource(buf: &metal::BufferRef) -> &metal::ResourceRef {
-    unsafe { &*(buf as *const metal::BufferRef as *const metal::ResourceRef) }
-}
 
 pub enum FeedForwardType {
     /// Simple dense FFN: linear1 -> activation -> linear2
@@ -140,7 +137,7 @@ impl FeedForward {
         &self,
         x: &Array,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         match self {
             FeedForward::Dense {
@@ -179,7 +176,7 @@ impl FeedForward {
     pub fn prepare_weights_for_graph(
         &mut self,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<(), KernelError> {
         match self {
             FeedForward::Dense {
@@ -212,7 +209,7 @@ impl FeedForward {
         normed: &Array,
         residual: &Array,
         registry: &KernelRegistry,
-        cb: &metal::CommandBufferRef,
+        cb: &ProtocolObject<dyn MTLCommandBuffer>,
     ) -> Result<Array, KernelError> {
         match self {
             FeedForward::Gated {
@@ -269,7 +266,7 @@ impl FeedForward {
         normed: &Array,
         residual: &Array,
         registry: &KernelRegistry,
-        encoder: &metal::ComputeCommandEncoderRef,
+        encoder: ComputePass<'_>,
     ) -> Result<Array, KernelError> {
         match self {
             FeedForward::Gated {
@@ -335,7 +332,7 @@ impl FeedForward {
         eps: f32,
         residual: &Array,
         registry: &KernelRegistry,
-        cb: &metal::CommandBufferRef,
+        cb: &ProtocolObject<dyn MTLCommandBuffer>,
     ) -> Result<Array, KernelError> {
         match self {
             FeedForward::Gated {
@@ -403,7 +400,7 @@ impl FeedForward {
         eps: f32,
         residual: &Array,
         registry: &KernelRegistry,
-        encoder: &metal::ComputeCommandEncoderRef,
+        encoder: ComputePass<'_>,
     ) -> Result<Array, KernelError> {
         match self {
             FeedForward::Gated {
@@ -433,9 +430,7 @@ impl FeedForward {
                             eps,
                             encoder,
                         )?;
-                        encoder.memory_barrier_with_resources(&[buf_as_resource(
-                            normed.metal_buffer(),
-                        )]);
+                        rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
                         ops::matmul::matmul_encode(registry, &normed, guw_t, encoder)?
                     } else {
                         // Fused RMSNorm + merged gate+up GEMM (inv_rms + norm-GEMM)
@@ -450,8 +445,7 @@ impl FeedForward {
                     };
                     let gate_dim = guw_t.shape()[1] / 2;
                     // Memory barrier: GEMM output must be visible
-                    encoder
-                        .memory_barrier_with_resources(&[buf_as_resource(merged.metal_buffer())]);
+                        rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
                     ops::fused::fused_silu_mul_strided_encode(registry, &merged, gate_dim, encoder)?
                 } else {
                     // Fallback: separate norm + 2 GEMMs
@@ -462,8 +456,7 @@ impl FeedForward {
                         eps,
                         encoder,
                     )?;
-                    encoder
-                        .memory_barrier_with_resources(&[buf_as_resource(normed.metal_buffer())]);
+                        rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
                     let wgate_t = gate_proj.weight_transposed_contiguous()?;
                     let wup_t = up_proj.weight_transposed_contiguous()?;
                     let (gate_out, up_out) = ops::fused::batched_gate_up_encode(
@@ -492,7 +485,7 @@ impl FeedForward {
     /// Merge gate and up projection weights into a single [gate_dim+up_dim, in_features] matrix.
     ///
     /// Must be called once after weights are loaded and before `forward_single_cb_9dispatch`.
-    pub fn prepare_merged_gate_up(&mut self, device: &metal::Device) -> Result<(), KernelError> {
+    pub fn prepare_merged_gate_up(&mut self, device: &ProtocolObject<dyn MTLDevice>) -> Result<(), KernelError> {
         match self {
             FeedForward::Gated {
                 gate_proj,
@@ -550,17 +543,17 @@ impl FeedForward {
                 let elem_size = gate_w.dtype().size_of();
                 let total_bytes = total_rows * cols * elem_size;
 
-                let buf = device.new_buffer(
-                    total_bytes as u64,
-                    metal::MTLResourceOptions::StorageModeShared,
-                );
+                let buf = device.newBufferWithLength_options(
+                    total_bytes,
+                    MTLResourceOptions::StorageModeShared,
+                ).unwrap();
 
                 unsafe {
-                    let dst = buf.contents() as *mut u8;
+                    let dst = buf.contents().as_ptr() as *mut u8;
                     let gate_src =
-                        (gate_w.metal_buffer().contents() as *const u8).add(gate_w.offset());
+                        (gate_w.metal_buffer().contents().as_ptr() as *const u8).add(gate_w.offset());
                     std::ptr::copy_nonoverlapping(gate_src, dst, gate_rows * cols * elem_size);
-                    let up_src = (up_w.metal_buffer().contents() as *const u8).add(up_w.offset());
+                    let up_src = (up_w.metal_buffer().contents().as_ptr() as *const u8).add(up_w.offset());
                     std::ptr::copy_nonoverlapping(
                         up_src,
                         dst.add(gate_rows * cols * elem_size),
@@ -577,13 +570,13 @@ impl FeedForward {
                 ));
 
                 // Also create transposed merged weight [cols, total_rows] for prefill GEMM.
-                let buf_t = device.new_buffer(
-                    total_bytes as u64,
-                    metal::MTLResourceOptions::StorageModeShared,
-                );
+                let buf_t = device.newBufferWithLength_options(
+                    total_bytes,
+                    MTLResourceOptions::StorageModeShared,
+                ).unwrap();
                 unsafe {
-                    let src = buf.contents() as *const u8;
-                    let dst = buf_t.contents() as *mut u8;
+                    let src = buf.contents().as_ptr() as *const u8;
+                    let dst = buf_t.contents().as_ptr() as *mut u8;
                     for r in 0..total_rows {
                         for c in 0..cols {
                             let src_idx = (r * cols + c) * elem_size;
@@ -615,7 +608,7 @@ impl FeedForward {
     /// Convert all static weights to `StorageModePrivate` (GPU-only).
     ///
     /// Call after loading weights and before the inference loop.
-    pub fn prepare_weights_private(&mut self, device: &metal::Device, queue: &metal::CommandQueue) {
+    pub fn prepare_weights_private(&mut self, device: &ProtocolObject<dyn MTLDevice>, queue: &ProtocolObject<dyn MTLCommandQueue>) {
         match self {
             FeedForward::Gated {
                 gate_proj,
@@ -779,7 +772,7 @@ impl FeedForward {
         normed: &Array,
         residual: &Array,
         registry: &KernelRegistry,
-        cb: &metal::CommandBufferRef,
+        cb: &ProtocolObject<dyn MTLCommandBuffer>,
     ) -> Result<Array, KernelError> {
         match self {
             FeedForward::Gated {
@@ -814,7 +807,8 @@ impl FeedForward {
                 );
 
                 // --- Single encoder for dispatches 7-9 (gate+up, silu_mul, down+residual) ---
-                let encoder = cb.new_compute_command_encoder();
+                let raw_encoder = cb.computeCommandEncoder().unwrap();
+                let encoder = ComputePass::new(&raw_encoder);
 
                 // Dispatch 7: merged gate+up gemv
                 let gate_up_w = gate_up_merged_weight.as_ref().ok_or_else(|| {
@@ -823,13 +817,13 @@ impl FeedForward {
                     )
                 })?;
                 let gate_up =
-                    ops::gemv::gemv_into_encoder(registry, gate_up_w, &normed_vec, encoder)?;
+ops::gemv::gemv_into_encoder(registry, gate_up_w, &normed_vec, encoder)?;
                 // gate_up is [gate_dim + up_dim] flat
                 let gate_dim = gate_up_w.shape()[0] / 2;
                 let elem_size = gate_up.dtype().size_of();
 
                 // Memory barrier: ensure gate_up is visible to dispatch 8
-                encoder.memory_barrier_with_resources(&[buf_as_resource(gate_up.metal_buffer())]);
+                rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
 
                 // Split into gate and up views
                 let gate = Array::new(
@@ -849,10 +843,10 @@ impl FeedForward {
 
                 // Dispatch 8: silu_mul
                 let hidden =
-                    ops::fused::fused_silu_mul_into_encoder(registry, &gate, &up, encoder)?;
+ops::fused::fused_silu_mul_into_encoder(registry, &gate, &up, encoder)?;
 
                 // Memory barrier: ensure hidden is visible to dispatch 9
-                encoder.memory_barrier_with_resources(&[buf_as_resource(hidden.metal_buffer())]);
+                rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
 
                 // Dispatch 9: gemv_bias(W_down, hidden, residual) — down + residual fused
                 let down_w = down_proj.weight().ok_or_else(|| {
@@ -877,10 +871,10 @@ impl FeedForward {
                     down_w,
                     &hidden_vec,
                     &res_vec,
-                    encoder,
+encoder,
                 )?;
 
-                encoder.end_encoding();
+                encoder.end();
 
                 Ok(Array::new(
                     out.metal_buffer().to_owned(),
@@ -906,7 +900,7 @@ impl FeedForward {
         normed: &Array,
         residual: &Array,
         registry: &KernelRegistry,
-        encoder: &metal::ComputeCommandEncoderRef,
+        encoder: ComputePass<'_>,
     ) -> Result<Array, KernelError> {
         match self {
             FeedForward::Gated {
@@ -951,7 +945,7 @@ impl FeedForward {
                 let gate_dim = gate_up_w.shape()[0] / 2;
                 let elem_size = gate_up.dtype().size_of();
 
-                encoder.memory_barrier_with_resources(&[buf_as_resource(gate_up.metal_buffer())]);
+                rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
 
                 let gate = Array::new(
                     gate_up.metal_buffer().to_owned(),
@@ -972,7 +966,7 @@ impl FeedForward {
                 let hidden =
                     ops::fused::fused_silu_mul_into_encoder(registry, &gate, &up, encoder)?;
 
-                encoder.memory_barrier_with_resources(&[buf_as_resource(hidden.metal_buffer())]);
+                rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
 
                 // Dispatch 9: gemv_bias(W_down, hidden, residual)
                 let down_w = down_proj.weight().ok_or_else(|| {
@@ -1020,7 +1014,7 @@ impl FeedForward {
         normed: &Array,
         residual: &Array,
         registry: &KernelRegistry,
-        cb: &metal::CommandBufferRef,
+        cb: &ProtocolObject<dyn MTLCommandBuffer>,
     ) -> Result<Array, KernelError> {
         match self {
             FeedForward::Gated {
@@ -1055,7 +1049,8 @@ impl FeedForward {
                 );
 
                 // --- Single encoder for dispatches 7-9 (gate+up, silu_mul, down+residual) ---
-                let encoder = rmlx_metal::new_concurrent_encoder(cb);
+                let raw_enc = rmlx_metal::new_concurrent_encoder(cb);
+                let encoder = ComputePass::new(&raw_enc);
 
                 // Dispatch 7: merged gate+up gemv
                 let gate_up_w = gate_up_merged_weight.as_ref().ok_or_else(|| {
@@ -1064,13 +1059,13 @@ impl FeedForward {
                     )
                 })?;
                 let gate_up =
-                    ops::gemv::gemv_into_encoder(registry, gate_up_w, &normed_vec, encoder)?;
+ops::gemv::gemv_into_encoder(registry, gate_up_w, &normed_vec, encoder)?;
                 // gate_up is [gate_dim + up_dim] flat
                 let gate_dim = gate_up_w.shape()[0] / 2;
                 let elem_size = gate_up.dtype().size_of();
 
                 // Memory barrier: ensure gate_up is visible to dispatch 8
-                rmlx_metal::memory_barrier_scope_buffers(encoder);
+rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
 
                 // Split into gate and up views
                 let gate = Array::new(
@@ -1090,10 +1085,10 @@ impl FeedForward {
 
                 // Dispatch 8: silu_mul
                 let hidden =
-                    ops::fused::fused_silu_mul_into_encoder(registry, &gate, &up, encoder)?;
+ops::fused::fused_silu_mul_into_encoder(registry, &gate, &up, encoder)?;
 
                 // Memory barrier: ensure hidden is visible to dispatch 9
-                rmlx_metal::memory_barrier_scope_buffers(encoder);
+rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
 
                 // Dispatch 9: gemv_bias(W_down, hidden, residual) — down + residual fused
                 let down_w = down_proj.weight().ok_or_else(|| {
@@ -1118,10 +1113,10 @@ impl FeedForward {
                     down_w,
                     &hidden_vec,
                     &res_vec,
-                    encoder,
+encoder,
                 )?;
 
-                encoder.end_encoding();
+                encoder.end();
 
                 Ok(Array::new(
                     out.metal_buffer().to_owned(),
@@ -1250,7 +1245,7 @@ impl TransformerBlock {
         mask: Option<&Array>,
         cache: Option<&mut LayerKvCache>,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         let norm1_w = self.norm1_weight.as_ref().ok_or_else(|| {
             KernelError::InvalidShape("TransformerBlock: norm1_weight not loaded".into())
@@ -1296,7 +1291,7 @@ impl TransformerBlock {
     pub fn prepare_weights_for_graph(
         &mut self,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<(), KernelError> {
         self.attention.prepare_weights_for_graph(registry, queue)?;
         self.ffn.prepare_weights_for_graph(registry, queue)?;
@@ -1321,7 +1316,7 @@ impl TransformerBlock {
     ///
     /// Merges Q/K/V weights and gate/up weights into single matrices.
     /// Must be called once after weights are loaded.
-    pub fn prepare_weights_9dispatch(&mut self, device: &metal::Device) -> Result<(), KernelError> {
+    pub fn prepare_weights_9dispatch(&mut self, device: &ProtocolObject<dyn MTLDevice>) -> Result<(), KernelError> {
         self.attention.prepare_merged_qkv(device)?;
         self.ffn.prepare_merged_gate_up(device)?;
         Ok(())
@@ -1333,7 +1328,7 @@ impl TransformerBlock {
     /// Weights cannot be read by CPU after this call. Call after loading
     /// weights (and after `prepare_weights_9dispatch` if using that path)
     /// and before the inference loop.
-    pub fn prepare_weights_private(&mut self, device: &metal::Device, queue: &metal::CommandQueue) {
+    pub fn prepare_weights_private(&mut self, device: &ProtocolObject<dyn MTLDevice>, queue: &ProtocolObject<dyn MTLCommandQueue>) {
         self.attention.prepare_weights_private(device, queue);
         self.ffn.prepare_weights_private(device, queue);
         if let Some(w) = self.norm1_weight.take() {
@@ -1369,7 +1364,7 @@ impl TransformerBlock {
         mask: Option<&Array>,
         cache: &mut LayerKvCache,
         registry: &KernelRegistry,
-        cb: &metal::CommandBufferRef,
+        cb: &ProtocolObject<dyn MTLCommandBuffer>,
     ) -> Result<Array, KernelError> {
         let norm1_w = self.norm1_weight.as_ref().ok_or_else(|| {
             KernelError::InvalidShape("TransformerBlock: norm1_weight not loaded".into())
@@ -1401,15 +1396,16 @@ impl TransformerBlock {
         )?;
 
         // Dispatch 6: rms_norm (single encoder)
-        let enc6 = cb.new_compute_command_encoder();
+        let raw_enc6 = cb.computeCommandEncoder().unwrap();
+        let enc6 = ComputePass::new(&raw_enc6);
         let normed2 = ops::rms_norm::rms_norm_into_encoder(
             registry,
             &h,
             Some(norm2_w),
             self.rms_norm_eps,
-            enc6,
+enc6,
         )?;
-        enc6.end_encoding();
+        enc6.end();
 
         // Dispatches 7-9: FFN (gate_up + silu_mul + down+residual)
         self.ffn
@@ -1435,7 +1431,7 @@ impl TransformerBlock {
         mask: Option<&Array>,
         cache: &mut LayerKvCache,
         registry: &KernelRegistry,
-        cb: &metal::CommandBufferRef,
+        cb: &ProtocolObject<dyn MTLCommandBuffer>,
     ) -> Result<Array, KernelError> {
         let norm1_w = self.norm1_weight.as_ref().ok_or_else(|| {
             KernelError::InvalidShape("TransformerBlock: norm1_weight not loaded".into())
@@ -1466,15 +1462,16 @@ impl TransformerBlock {
         )?;
 
         // --- Single encoder B for D4-D9 ---
-        let encoder_b = cb.new_compute_command_encoder();
+        let raw_encoder_b = cb.computeCommandEncoder().unwrap();
+        let encoder_b = ComputePass::new(&raw_encoder_b);
 
         // D4-D5: SDPA + O_proj+residual
         let h = self
             .attention
-            .encode_phase2_into(&phase1, cache, registry, encoder_b)?;
+.encode_phase2_into(&phase1, cache, registry, encoder_b)?;
 
         // D5→D6 barrier: ensure h is visible before rms_norm reads it
-        encoder_b.memory_barrier_with_resources(&[buf_as_resource(h.metal_buffer())]);
+        rmlx_metal::memory_barrier_scope_buffers(encoder_b.raw());
 
         // D6: rms_norm
         let normed2 = ops::rms_norm::rms_norm_into_encoder(
@@ -1482,18 +1479,18 @@ impl TransformerBlock {
             &h,
             Some(norm2_w),
             self.rms_norm_eps,
-            encoder_b,
+encoder_b,
         )?;
 
         // D6→D7 barrier: ensure normed2 is visible before FFN reads it
-        encoder_b.memory_barrier_with_resources(&[buf_as_resource(normed2.metal_buffer())]);
+        rmlx_metal::memory_barrier_scope_buffers(encoder_b.raw());
 
         // D7-D9: FFN (gate+up, silu_mul, down+residual)
         let out = self
             .ffn
-            .forward_into_encoder_9dispatch(&normed2, &h, registry, encoder_b)?;
+.forward_into_encoder_9dispatch(&normed2, &h, registry, encoder_b)?;
 
-        encoder_b.end_encoding();
+        encoder_b.end();
 
         Ok(out)
     }
@@ -1520,7 +1517,7 @@ impl TransformerBlock {
         sin_freqs: Option<&Array>,
         cache: &mut LayerKvCache,
         cached: &CachedDecode,
-        cb: &metal::CommandBufferRef,
+        cb: &ProtocolObject<dyn MTLCommandBuffer>,
     ) -> Result<Array, KernelError> {
         let hidden_size = cached.hidden_size;
         let num_heads = cached.num_heads;
@@ -1566,15 +1563,16 @@ impl TransformerBlock {
         // =====================================================================
         // Encoder A: D1 (rms_norm), D2 (QKV gemv), D3 (rope), KV copy
         // =====================================================================
-        let encoder_a = cb.new_compute_command_encoder();
+        let raw_encoder_a = cb.computeCommandEncoder().unwrap();
+        let encoder_a = ComputePass::new(&raw_encoder_a);
 
         // D1: rms_norm → normed_buf
         ops::rms_norm::rms_norm_preresolved_into_encoder(
             &cached.rms_norm_pso,
             x.metal_buffer(),
-            x.offset() as u64,
+            x.offset(),
             norm1_w.metal_buffer(),
-            norm1_w.offset() as u64,
+            norm1_w.offset(),
             &cached.normed_buf,
             0,
             cached.rms_axis_size,
@@ -1582,15 +1580,15 @@ impl TransformerBlock {
             cached.norm1_w_stride, // w_stride
             1,                     // has_w
             1,                     // rows
-            encoder_a,
+encoder_a,
         );
-        encoder_a.memory_barrier_with_resources(&[buf_as_resource(&cached.normed_buf)]);
+        rmlx_metal::memory_barrier_scope_buffers(encoder_a.raw());
 
         // D2: QKV gemv → qkv_buf
         ops::gemv::gemv_preresolved_into_encoder(
             &cached.gemv_qkv_pso,
             qkv_weight.metal_buffer(),
-            qkv_weight.offset() as u64,
+            qkv_weight.offset(),
             &cached.normed_buf,
             0,
             &cached.qkv_buf,
@@ -1599,7 +1597,7 @@ impl TransformerBlock {
             cached.gemv_qkv_k,
             cached.gemv_qkv_grid,
             cached.gemv_qkv_tg,
-            encoder_a,
+encoder_a,
         );
 
         // D3: rope → rope_buf (or use qkv_buf directly if no RoPE)
@@ -1609,22 +1607,22 @@ impl TransformerBlock {
         let rope_offset = cache.seq_len as u32;
 
         let (qk_buf_ref, qk_offset, v_buf_ref, v_offset): (
-            &metal::BufferRef,
-            u64,
-            &metal::BufferRef,
-            u64,
+            &MtlBuffer,
+            usize,
+            &MtlBuffer,
+            usize,
         );
 
         if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
-            encoder_a.memory_barrier_with_resources(&[buf_as_resource(&cached.qkv_buf)]);
+            rmlx_metal::memory_barrier_scope_buffers(encoder_a.raw());
             ops::rope::rope_ext_preresolved_into_encoder(
                 &cached.rope_pso,
                 &cached.qkv_buf,
                 0,
                 cos.metal_buffer(),
-                cos.offset() as u64,
+                cos.offset(),
                 sin.metal_buffer(),
-                sin.offset() as u64,
+                sin.offset(),
                 &cached.rope_buf,
                 0,
                 1, // seq_len = 1
@@ -1633,25 +1631,25 @@ impl TransformerBlock {
                 1.0,
                 0,                       // traditional = false
                 1,                       // forward = true
-                total_rope_heads as u64, // n_batch
-                encoder_a,
+total_rope_heads.try_into().unwrap(), // n_batch
+encoder_a,
             );
             qk_buf_ref = &cached.rope_buf;
             qk_offset = 0;
             v_buf_ref = &cached.qkv_buf;
-            v_offset = ((q_dim + k_dim) * elem_size) as u64;
+            v_offset = (q_dim + k_dim) * elem_size;
         } else {
             qk_buf_ref = &cached.qkv_buf;
             qk_offset = 0;
             v_buf_ref = &cached.qkv_buf;
-            v_offset = ((q_dim + k_dim) * elem_size) as u64;
+            v_offset = (q_dim + k_dim) * elem_size;
         }
 
         // Memory barrier: ensure rope/qkv output visible to KV copy
-        encoder_a.memory_barrier_with_resources(&[buf_as_resource(qk_buf_ref)]);
+        rmlx_metal::memory_barrier_scope_buffers(encoder_a.raw());
 
         // KV cache append using pre-resolved copy PSO
-        let k_roped_flat_offset = qk_offset + (q_dim * elem_size) as u64;
+        let k_roped_flat_offset = qk_offset + (q_dim * elem_size);
         let mut k_heads = Vec::with_capacity(num_kv_heads);
         let mut v_heads = Vec::with_capacity(num_kv_heads);
         for h in 0..num_kv_heads {
@@ -1660,25 +1658,26 @@ impl TransformerBlock {
                 vec![1, head_dim],
                 vec![head_dim, 1],
                 cached.dtype,
-                k_roped_flat_offset as usize + h * head_dim * elem_size,
+                k_roped_flat_offset + h * head_dim * elem_size,
             ));
             v_heads.push(Array::new(
                 v_buf_ref.to_owned(),
                 vec![1, head_dim],
                 vec![head_dim, 1],
                 cached.dtype,
-                v_offset as usize + h * head_dim * elem_size,
+                v_offset + h * head_dim * elem_size,
             ));
         }
-        cache.append_preresolved_into_encoder(k_heads, v_heads, 1, &cached.copy_pso, encoder_a)?;
+cache.append_preresolved_into_encoder(k_heads, v_heads, 1, &cached.copy_pso, encoder_a)?;
 
-        encoder_a.end_encoding();
+        encoder_a.end();
 
         // =====================================================================
         // Encoder B: D4 (SDPA), D5 (O_proj+res), D6 (rms_norm2), D7 (gate_up),
         //            D8 (silu_mul), D9 (down_proj+res)
         // =====================================================================
-        let encoder_b = cb.new_compute_command_encoder();
+        let raw_encoder_b = cb.computeCommandEncoder().unwrap();
+        let encoder_b = ComputePass::new(&raw_encoder_b);
 
         // D4: SDPA decode → attn_out_buf
         let k_slab = cache.keys_slab_view().ok_or_else(|| {
@@ -1693,11 +1692,11 @@ impl TransformerBlock {
         ops::sdpa::sdpa_decode_preresolved_into_encoder(
             &cached.sdpa_pso,
             qk_buf_ref, // Q from rope output
-            qk_offset,
+qk_offset,
             k_slab.metal_buffer(),
-            k_slab.offset() as u64,
+            k_slab.offset(),
             v_slab.metal_buffer(),
-            v_slab.offset() as u64,
+            v_slab.offset(),
             &cached.attn_out_buf,
             0,
             &cached.dummy_mask_buf,
@@ -1711,13 +1710,13 @@ impl TransformerBlock {
             cached.scale,
             encoder_b,
         );
-        encoder_b.memory_barrier_with_resources(&[buf_as_resource(&cached.attn_out_buf)]);
+        rmlx_metal::memory_barrier_scope_buffers(encoder_b.raw());
 
         // D5: gemv_bias(W_o, attn, x) → h_buf (O_proj + residual add)
         ops::gemv::gemv_bias_preresolved_into_encoder(
             &cached.gemv_bias_oproj_pso,
             o_weight.metal_buffer(),
-            o_weight.offset() as u64,
+            o_weight.offset(),
             &cached.attn_out_buf,
             0,
             &cached.h_buf,
@@ -1725,12 +1724,12 @@ impl TransformerBlock {
             cached.gemv_bias_oproj_m,
             cached.gemv_bias_oproj_k,
             x.metal_buffer(), // bias = input x (residual)
-            x.offset() as u64,
+            x.offset(),
             cached.gemv_bias_oproj_grid,
             cached.gemv_bias_oproj_tg,
-            encoder_b,
+encoder_b,
         );
-        encoder_b.memory_barrier_with_resources(&[buf_as_resource(&cached.h_buf)]);
+        rmlx_metal::memory_barrier_scope_buffers(encoder_b.raw());
 
         // D6: rms_norm → normed2_buf
         ops::rms_norm::rms_norm_preresolved_into_encoder(
@@ -1738,7 +1737,7 @@ impl TransformerBlock {
             &cached.h_buf,
             0,
             norm2_w.metal_buffer(),
-            norm2_w.offset() as u64,
+            norm2_w.offset(),
             &cached.normed2_buf,
             0,
             cached.rms_axis_size,
@@ -1746,15 +1745,15 @@ impl TransformerBlock {
             cached.norm2_w_stride, // w_stride
             1,                     // has_w
             1,                     // rows
-            encoder_b,
+encoder_b,
         );
-        encoder_b.memory_barrier_with_resources(&[buf_as_resource(&cached.normed2_buf)]);
+        rmlx_metal::memory_barrier_scope_buffers(encoder_b.raw());
 
         // D7: gate_up gemv → gate_up_buf
         ops::gemv::gemv_preresolved_into_encoder(
             &cached.gemv_gate_up_pso,
             gate_up_w.metal_buffer(),
-            gate_up_w.offset() as u64,
+            gate_up_w.offset(),
             &cached.normed2_buf,
             0,
             &cached.gate_up_buf,
@@ -1763,9 +1762,9 @@ impl TransformerBlock {
             cached.gemv_gate_up_k,
             cached.gemv_gate_up_grid,
             cached.gemv_gate_up_tg,
-            encoder_b,
+encoder_b,
         );
-        encoder_b.memory_barrier_with_resources(&[buf_as_resource(&cached.gate_up_buf)]);
+        rmlx_metal::memory_barrier_scope_buffers(encoder_b.raw());
 
         // D8: silu_mul → silu_buf
         let gate_dim = cached.intermediate_dim;
@@ -1774,20 +1773,20 @@ impl TransformerBlock {
             &cached.gate_up_buf,
             0,
             &cached.gate_up_buf,
-            (gate_dim * elem_size) as u64,
+            gate_dim * elem_size,
             &cached.silu_buf,
             0,
             cached.silu_numel,
-            cached.silu_elems_per_thread,
-            encoder_b,
+cached.silu_elems_per_thread.try_into().unwrap(),
+encoder_b,
         );
-        encoder_b.memory_barrier_with_resources(&[buf_as_resource(&cached.silu_buf)]);
+        rmlx_metal::memory_barrier_scope_buffers(encoder_b.raw());
 
         // D9: gemv_bias(W_down, silu, h) → out_buf (down_proj + residual add)
         ops::gemv::gemv_bias_preresolved_into_encoder(
             &cached.gemv_bias_down_pso,
             down_w.metal_buffer(),
-            down_w.offset() as u64,
+            down_w.offset(),
             &cached.silu_buf,
             0,
             &cached.out_buf,
@@ -1798,10 +1797,10 @@ impl TransformerBlock {
             0,
             cached.gemv_bias_down_grid,
             cached.gemv_bias_down_tg,
-            encoder_b,
+encoder_b,
         );
 
-        encoder_b.end_encoding();
+        encoder_b.end();
 
         // Return as [1, hidden_size]
         Ok(Array::new(
@@ -1830,7 +1829,7 @@ impl TransformerBlock {
         sin_freqs: Option<&Array>,
         cache: &mut LayerKvCache,
         cached: &CachedDecode,
-        cb: &metal::CommandBufferRef,
+        cb: &ProtocolObject<dyn MTLCommandBuffer>,
     ) -> Result<Array, KernelError> {
         let hidden_size = cached.hidden_size;
         let num_heads = cached.num_heads;
@@ -1876,15 +1875,16 @@ impl TransformerBlock {
         // =====================================================================
         // Single Encoder: all 9 dispatches + KV copy
         // =====================================================================
-        let encoder = cb.new_compute_command_encoder();
+        let raw_encoder = cb.computeCommandEncoder().unwrap();
+        let encoder = ComputePass::new(&raw_encoder);
 
         // D1: rms_norm -> normed_buf
         ops::rms_norm::rms_norm_preresolved_into_encoder(
             &cached.rms_norm_pso,
             x.metal_buffer(),
-            x.offset() as u64,
+            x.offset(),
             norm1_w.metal_buffer(),
-            norm1_w.offset() as u64,
+            norm1_w.offset(),
             &cached.normed_buf,
             0,
             cached.rms_axis_size,
@@ -1892,15 +1892,15 @@ impl TransformerBlock {
             cached.norm1_w_stride,
             1,
             1,
-            encoder,
+encoder,
         );
-        encoder.memory_barrier_with_resources(&[buf_as_resource(&cached.normed_buf)]);
+        rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
 
         // D2: QKV gemv -> qkv_buf
         ops::gemv::gemv_preresolved_into_encoder(
             &cached.gemv_qkv_pso,
             qkv_weight.metal_buffer(),
-            qkv_weight.offset() as u64,
+            qkv_weight.offset(),
             &cached.normed_buf,
             0,
             &cached.qkv_buf,
@@ -1909,7 +1909,7 @@ impl TransformerBlock {
             cached.gemv_qkv_k,
             cached.gemv_qkv_grid,
             cached.gemv_qkv_tg,
-            encoder,
+encoder,
         );
 
         // D3: rope -> rope_buf (or use qkv_buf directly if no RoPE)
@@ -1919,22 +1919,22 @@ impl TransformerBlock {
         let rope_offset = cache.seq_len as u32;
 
         let (qk_buf_ref, qk_offset, v_buf_ref, v_offset): (
-            &metal::BufferRef,
-            u64,
-            &metal::BufferRef,
-            u64,
+            &MtlBuffer,
+            usize,
+            &MtlBuffer,
+            usize,
         );
 
         if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
-            encoder.memory_barrier_with_resources(&[buf_as_resource(&cached.qkv_buf)]);
+            rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
             ops::rope::rope_ext_preresolved_into_encoder(
                 &cached.rope_pso,
                 &cached.qkv_buf,
                 0,
                 cos.metal_buffer(),
-                cos.offset() as u64,
+                cos.offset(),
                 sin.metal_buffer(),
-                sin.offset() as u64,
+                sin.offset(),
                 &cached.rope_buf,
                 0,
                 1,
@@ -1943,34 +1943,34 @@ impl TransformerBlock {
                 1.0,
                 0,
                 1,
-                total_rope_heads as u64,
-                encoder,
+total_rope_heads.try_into().unwrap(),
+encoder,
             );
             qk_buf_ref = &cached.rope_buf;
             qk_offset = 0;
             v_buf_ref = &cached.qkv_buf;
-            v_offset = ((q_dim + k_dim) * elem_size) as u64;
+            v_offset = (q_dim + k_dim) * elem_size;
         } else {
             qk_buf_ref = &cached.qkv_buf;
             qk_offset = 0;
             v_buf_ref = &cached.qkv_buf;
-            v_offset = ((q_dim + k_dim) * elem_size) as u64;
+            v_offset = (q_dim + k_dim) * elem_size;
         }
 
         // Memory barrier: ensure rope/qkv output visible to KV copy
-        encoder.memory_barrier_with_resources(&[buf_as_resource(qk_buf_ref)]);
+        rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
 
         // KV cache append using direct buffer refs (Optimization B)
-        let k_roped_flat_offset = qk_offset + (q_dim * elem_size) as u64;
+        let k_roped_flat_offset = qk_offset + (q_dim * elem_size);
         cache.append_direct_into_encoder(
             qk_buf_ref,
-            k_roped_flat_offset,
+            k_roped_flat_offset as u64,
             v_buf_ref,
-            v_offset,
+            v_offset as u64,
             1,
             &cached.copy_pso,
             cached.copy_max_tg,
-            encoder,
+encoder,
         )?;
 
         // Memory barrier on KV slab buffers: KV copy -> SDPA read dependency
@@ -1981,10 +1981,7 @@ impl TransformerBlock {
         let v_slab = cache.values_slab_view().ok_or_else(|| {
             KernelError::InvalidShape("forward_cached: no values slab after append".into())
         })?;
-        encoder.memory_barrier_with_resources(&[
-            buf_as_resource(k_slab.metal_buffer()),
-            buf_as_resource(v_slab.metal_buffer()),
-        ]);
+        rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
 
         let seq_len = cache.seq_len;
         let max_seq = cache.max_seq_len();
@@ -1993,11 +1990,11 @@ impl TransformerBlock {
         ops::sdpa::sdpa_decode_preresolved_into_encoder(
             &cached.sdpa_pso,
             qk_buf_ref,
-            qk_offset,
+qk_offset,
             k_slab.metal_buffer(),
-            k_slab.offset() as u64,
+            k_slab.offset(),
             v_slab.metal_buffer(),
-            v_slab.offset() as u64,
+            v_slab.offset(),
             &cached.attn_out_buf,
             0,
             &cached.dummy_mask_buf,
@@ -2011,13 +2008,13 @@ impl TransformerBlock {
             cached.scale,
             encoder,
         );
-        encoder.memory_barrier_with_resources(&[buf_as_resource(&cached.attn_out_buf)]);
+        rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
 
         // D5: gemv_bias(W_o, attn, x) -> h_buf (O_proj + residual add)
         ops::gemv::gemv_bias_preresolved_into_encoder(
             &cached.gemv_bias_oproj_pso,
             o_weight.metal_buffer(),
-            o_weight.offset() as u64,
+            o_weight.offset(),
             &cached.attn_out_buf,
             0,
             &cached.h_buf,
@@ -2025,12 +2022,12 @@ impl TransformerBlock {
             cached.gemv_bias_oproj_m,
             cached.gemv_bias_oproj_k,
             x.metal_buffer(),
-            x.offset() as u64,
+            x.offset(),
             cached.gemv_bias_oproj_grid,
             cached.gemv_bias_oproj_tg,
-            encoder,
+encoder,
         );
-        encoder.memory_barrier_with_resources(&[buf_as_resource(&cached.h_buf)]);
+        rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
 
         // D6: rms_norm -> normed2_buf
         ops::rms_norm::rms_norm_preresolved_into_encoder(
@@ -2038,7 +2035,7 @@ impl TransformerBlock {
             &cached.h_buf,
             0,
             norm2_w.metal_buffer(),
-            norm2_w.offset() as u64,
+            norm2_w.offset(),
             &cached.normed2_buf,
             0,
             cached.rms_axis_size,
@@ -2046,15 +2043,15 @@ impl TransformerBlock {
             cached.norm2_w_stride,
             1,
             1,
-            encoder,
+encoder,
         );
-        encoder.memory_barrier_with_resources(&[buf_as_resource(&cached.normed2_buf)]);
+        rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
 
         // D7: gate_up gemv -> gate_up_buf
         ops::gemv::gemv_preresolved_into_encoder(
             &cached.gemv_gate_up_pso,
             gate_up_w.metal_buffer(),
-            gate_up_w.offset() as u64,
+            gate_up_w.offset(),
             &cached.normed2_buf,
             0,
             &cached.gate_up_buf,
@@ -2063,9 +2060,9 @@ impl TransformerBlock {
             cached.gemv_gate_up_k,
             cached.gemv_gate_up_grid,
             cached.gemv_gate_up_tg,
-            encoder,
+encoder,
         );
-        encoder.memory_barrier_with_resources(&[buf_as_resource(&cached.gate_up_buf)]);
+        rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
 
         // D8: silu_mul -> silu_buf
         let gate_dim = cached.intermediate_dim;
@@ -2074,20 +2071,20 @@ impl TransformerBlock {
             &cached.gate_up_buf,
             0,
             &cached.gate_up_buf,
-            (gate_dim * elem_size) as u64,
+            gate_dim * elem_size,
             &cached.silu_buf,
             0,
             cached.silu_numel,
-            cached.silu_elems_per_thread,
-            encoder,
+cached.silu_elems_per_thread.try_into().unwrap(),
+encoder,
         );
-        encoder.memory_barrier_with_resources(&[buf_as_resource(&cached.silu_buf)]);
+        rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
 
         // D9: gemv_bias(W_down, silu, h) -> out_buf (down_proj + residual add)
         ops::gemv::gemv_bias_preresolved_into_encoder(
             &cached.gemv_bias_down_pso,
             down_w.metal_buffer(),
-            down_w.offset() as u64,
+            down_w.offset(),
             &cached.silu_buf,
             0,
             &cached.out_buf,
@@ -2098,10 +2095,10 @@ impl TransformerBlock {
             0,
             cached.gemv_bias_down_grid,
             cached.gemv_bias_down_tg,
-            encoder,
+encoder,
         );
 
-        encoder.end_encoding();
+        encoder.end();
 
         // Return as [1, hidden_size]
         Ok(Array::new(
@@ -2129,7 +2126,7 @@ impl TransformerBlock {
         sin_freqs: Option<&Array>,
         cache: &mut LayerKvCache,
         cached: &CachedDecode,
-        cb: &metal::CommandBufferRef,
+        cb: &ProtocolObject<dyn MTLCommandBuffer>,
     ) -> Result<Array, KernelError> {
         // Check fused PSOs available — fallback to 9-dispatch if not
         let (rms_gemv_qkv_pso, rms_gemv_gate_up_pso, swiglu_down_pso) = match (
@@ -2186,18 +2183,20 @@ impl TransformerBlock {
             }
         };
 
-        let encoder = cb.new_compute_command_encoder();
+        let raw_encoder = cb.computeCommandEncoder().unwrap();
+
+        let encoder = ComputePass::new(&raw_encoder);
 
         // D1: fused_rms_gemv(x, norm1_w, qkv_w) → qkv_buf
         // Replaces D1 (rms_norm) + D2 (gemv QKV) from 9-dispatch
         ops::fused::fused_rms_gemv_preresolved_into_encoder(
             rms_gemv_qkv_pso,
             x.metal_buffer(),
-            x.offset() as u64,
+            x.offset(),
             norm1_w.metal_buffer(),
-            norm1_w.offset() as u64,
+            norm1_w.offset(),
             qkv_weight.metal_buffer(),
-            qkv_weight.offset() as u64,
+            qkv_weight.offset(),
             &cached.qkv_buf,
             0,
             cached.gemv_qkv_m,
@@ -2206,7 +2205,7 @@ impl TransformerBlock {
             cached.norm1_w_stride,
             cached.fused_rms_gemv_qkv_grid,
             cached.fused_rms_gemv_qkv_tg,
-            encoder,
+encoder,
         );
 
         // D2: rope → rope_buf
@@ -2216,22 +2215,22 @@ impl TransformerBlock {
         let rope_offset = cache.seq_len as u32;
 
         let (qk_buf_ref, qk_offset, v_buf_ref, v_offset): (
-            &metal::BufferRef,
-            u64,
-            &metal::BufferRef,
-            u64,
+            &MtlBuffer,
+            usize,
+            &MtlBuffer,
+            usize,
         );
 
         if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
-            encoder.memory_barrier_with_resources(&[buf_as_resource(&cached.qkv_buf)]);
+            rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
             ops::rope::rope_ext_preresolved_into_encoder(
                 &cached.rope_pso,
                 &cached.qkv_buf,
                 0,
                 cos.metal_buffer(),
-                cos.offset() as u64,
+                cos.offset(),
                 sin.metal_buffer(),
-                sin.offset() as u64,
+                sin.offset(),
                 &cached.rope_buf,
                 0,
                 1,
@@ -2240,33 +2239,33 @@ impl TransformerBlock {
                 1.0,
                 0,
                 1,
-                total_rope_heads as u64,
-                encoder,
+total_rope_heads.try_into().unwrap(),
+encoder,
             );
             qk_buf_ref = &cached.rope_buf;
             qk_offset = 0;
             v_buf_ref = &cached.qkv_buf;
-            v_offset = ((q_dim + k_dim) * elem_size) as u64;
+            v_offset = (q_dim + k_dim) * elem_size;
         } else {
             qk_buf_ref = &cached.qkv_buf;
             qk_offset = 0;
             v_buf_ref = &cached.qkv_buf;
-            v_offset = ((q_dim + k_dim) * elem_size) as u64;
+            v_offset = (q_dim + k_dim) * elem_size;
         }
 
-        encoder.memory_barrier_with_resources(&[buf_as_resource(qk_buf_ref)]);
+        rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
 
         // KV cache append
-        let k_roped_flat_offset = qk_offset + (q_dim * elem_size) as u64;
+        let k_roped_flat_offset = qk_offset + (q_dim * elem_size);
         cache.append_direct_into_encoder(
             qk_buf_ref,
-            k_roped_flat_offset,
+            k_roped_flat_offset as u64,
             v_buf_ref,
-            v_offset,
+            v_offset as u64,
             1,
             &cached.copy_pso,
             cached.copy_max_tg,
-            encoder,
+encoder,
         )?;
 
         // Memory barrier on KV slab buffers
@@ -2276,10 +2275,7 @@ impl TransformerBlock {
         let v_slab = cache.values_slab_view().ok_or_else(|| {
             KernelError::InvalidShape("forward_cached: no values slab after append".into())
         })?;
-        encoder.memory_barrier_with_resources(&[
-            buf_as_resource(k_slab.metal_buffer()),
-            buf_as_resource(v_slab.metal_buffer()),
-        ]);
+        rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
 
         let seq_len = cache.seq_len;
         let max_seq = cache.max_seq_len();
@@ -2288,11 +2284,11 @@ impl TransformerBlock {
         ops::sdpa::sdpa_decode_preresolved_into_encoder(
             &cached.sdpa_pso,
             qk_buf_ref,
-            qk_offset,
+qk_offset,
             k_slab.metal_buffer(),
-            k_slab.offset() as u64,
+            k_slab.offset(),
             v_slab.metal_buffer(),
-            v_slab.offset() as u64,
+            v_slab.offset(),
             &cached.attn_out_buf,
             0,
             &cached.dummy_mask_buf,
@@ -2306,13 +2302,13 @@ impl TransformerBlock {
             cached.scale,
             encoder,
         );
-        encoder.memory_barrier_with_resources(&[buf_as_resource(&cached.attn_out_buf)]);
+        rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
 
         // D4: gemv_bias(W_o, attn, x) → h_buf (O_proj + residual add)
         ops::gemv::gemv_bias_preresolved_into_encoder(
             &cached.gemv_bias_oproj_pso,
             o_weight.metal_buffer(),
-            o_weight.offset() as u64,
+            o_weight.offset(),
             &cached.attn_out_buf,
             0,
             &cached.h_buf,
@@ -2320,12 +2316,12 @@ impl TransformerBlock {
             cached.gemv_bias_oproj_m,
             cached.gemv_bias_oproj_k,
             x.metal_buffer(),
-            x.offset() as u64,
+            x.offset(),
             cached.gemv_bias_oproj_grid,
             cached.gemv_bias_oproj_tg,
-            encoder,
+encoder,
         );
-        encoder.memory_barrier_with_resources(&[buf_as_resource(&cached.h_buf)]);
+        rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
 
         // D5: fused_rms_gemv(h, norm2_w, gate_up_w) → gate_up_buf
         // Replaces D6 (rms_norm) + D7 (gemv gate_up) from 9-dispatch
@@ -2334,9 +2330,9 @@ impl TransformerBlock {
             &cached.h_buf,
             0,
             norm2_w.metal_buffer(),
-            norm2_w.offset() as u64,
+            norm2_w.offset(),
             gate_up_w.metal_buffer(),
-            gate_up_w.offset() as u64,
+            gate_up_w.offset(),
             &cached.gate_up_buf,
             0,
             cached.gemv_gate_up_m,
@@ -2345,16 +2341,16 @@ impl TransformerBlock {
             cached.norm2_w_stride,
             cached.fused_rms_gemv_gate_up_grid,
             cached.fused_rms_gemv_gate_up_tg,
-            encoder,
+encoder,
         );
-        encoder.memory_barrier_with_resources(&[buf_as_resource(&cached.gate_up_buf)]);
+        rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
 
         // D6: fused_swiglu_down(down_w, gate_up, h) → out_buf
         // Replaces D8 (silu_mul) + D9 (gemv_bias down) from 9-dispatch
         ops::fused::fused_swiglu_down_preresolved_into_encoder(
             swiglu_down_pso,
             down_w.metal_buffer(),
-            down_w.offset() as u64,
+            down_w.offset(),
             &cached.gate_up_buf,
             0,
             &cached.out_buf,
@@ -2365,10 +2361,10 @@ impl TransformerBlock {
             0,
             cached.fused_swiglu_down_grid,
             cached.fused_swiglu_down_tg,
-            encoder,
+encoder,
         );
 
-        encoder.end_encoding();
+        encoder.end();
 
         Ok(Array::new(
             cached.out_buf.clone(),
@@ -2392,7 +2388,7 @@ impl TransformerBlock {
         sin_freqs: Option<&Array>,
         cache: &mut LayerKvCache,
         cached: &CachedDecode,
-        cb: &metal::CommandBufferRef,
+        cb: &ProtocolObject<dyn MTLCommandBuffer>,
         fuse_rms_qkv: bool,
         fuse_rms_gate_up: bool,
         fuse_swiglu_down: bool,
@@ -2441,7 +2437,8 @@ impl TransformerBlock {
         // =====================================================================
         // Single Encoder: all 9 dispatches + KV copy
         // =====================================================================
-        let encoder = cb.new_compute_command_encoder();
+        let raw_encoder = cb.computeCommandEncoder().unwrap();
+        let encoder = ComputePass::new(&raw_encoder);
 
         // D1+D2: rms_norm + QKV GEMV (conditionally fused)
         if fuse_rms_qkv {
@@ -2449,11 +2446,11 @@ impl TransformerBlock {
                 ops::fused::fused_rms_gemv_preresolved_into_encoder(
                     pso,
                     x.metal_buffer(),
-                    x.offset() as u64,
+                    x.offset(),
                     norm1_w.metal_buffer(),
-                    norm1_w.offset() as u64,
+                    norm1_w.offset(),
                     qkv_weight.metal_buffer(),
-                    qkv_weight.offset() as u64,
+                    qkv_weight.offset(),
                     &cached.qkv_buf,
                     0,
                     cached.gemv_qkv_m,
@@ -2462,16 +2459,16 @@ impl TransformerBlock {
                     cached.norm1_w_stride,
                     cached.fused_rms_gemv_qkv_grid,
                     cached.fused_rms_gemv_qkv_tg,
-                    encoder,
+encoder,
                 );
             } else {
                 // Fallback: unfused
                 ops::rms_norm::rms_norm_preresolved_into_encoder(
                     &cached.rms_norm_pso,
                     x.metal_buffer(),
-                    x.offset() as u64,
+                    x.offset(),
                     norm1_w.metal_buffer(),
-                    norm1_w.offset() as u64,
+                    norm1_w.offset(),
                     &cached.normed_buf,
                     0,
                     cached.rms_axis_size,
@@ -2479,13 +2476,13 @@ impl TransformerBlock {
                     cached.norm1_w_stride,
                     1,
                     1,
-                    encoder,
+encoder,
                 );
-                encoder.memory_barrier_with_resources(&[buf_as_resource(&cached.normed_buf)]);
+                rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
                 ops::gemv::gemv_preresolved_into_encoder(
                     &cached.gemv_qkv_pso,
                     qkv_weight.metal_buffer(),
-                    qkv_weight.offset() as u64,
+                    qkv_weight.offset(),
                     &cached.normed_buf,
                     0,
                     &cached.qkv_buf,
@@ -2494,7 +2491,7 @@ impl TransformerBlock {
                     cached.gemv_qkv_k,
                     cached.gemv_qkv_grid,
                     cached.gemv_qkv_tg,
-                    encoder,
+encoder,
                 );
             }
         } else {
@@ -2502,9 +2499,9 @@ impl TransformerBlock {
             ops::rms_norm::rms_norm_preresolved_into_encoder(
                 &cached.rms_norm_pso,
                 x.metal_buffer(),
-                x.offset() as u64,
+                x.offset(),
                 norm1_w.metal_buffer(),
-                norm1_w.offset() as u64,
+                norm1_w.offset(),
                 &cached.normed_buf,
                 0,
                 cached.rms_axis_size,
@@ -2512,13 +2509,13 @@ impl TransformerBlock {
                 cached.norm1_w_stride,
                 1,
                 1,
-                encoder,
+encoder,
             );
-            encoder.memory_barrier_with_resources(&[buf_as_resource(&cached.normed_buf)]);
+            rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
             ops::gemv::gemv_preresolved_into_encoder(
                 &cached.gemv_qkv_pso,
                 qkv_weight.metal_buffer(),
-                qkv_weight.offset() as u64,
+                qkv_weight.offset(),
                 &cached.normed_buf,
                 0,
                 &cached.qkv_buf,
@@ -2527,7 +2524,7 @@ impl TransformerBlock {
                 cached.gemv_qkv_k,
                 cached.gemv_qkv_grid,
                 cached.gemv_qkv_tg,
-                encoder,
+encoder,
             );
         }
 
@@ -2538,22 +2535,22 @@ impl TransformerBlock {
         let rope_offset = cache.seq_len as u32;
 
         let (qk_buf_ref, qk_offset, v_buf_ref, v_offset): (
-            &metal::BufferRef,
-            u64,
-            &metal::BufferRef,
-            u64,
+            &MtlBuffer,
+            usize,
+            &MtlBuffer,
+            usize,
         );
 
         if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
-            encoder.memory_barrier_with_resources(&[buf_as_resource(&cached.qkv_buf)]);
+            rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
             ops::rope::rope_ext_preresolved_into_encoder(
                 &cached.rope_pso,
                 &cached.qkv_buf,
                 0,
                 cos.metal_buffer(),
-                cos.offset() as u64,
+                cos.offset(),
                 sin.metal_buffer(),
-                sin.offset() as u64,
+                sin.offset(),
                 &cached.rope_buf,
                 0,
                 1,
@@ -2562,34 +2559,34 @@ impl TransformerBlock {
                 1.0,
                 0,
                 1,
-                total_rope_heads as u64,
-                encoder,
+total_rope_heads.try_into().unwrap(),
+encoder,
             );
             qk_buf_ref = &cached.rope_buf;
             qk_offset = 0;
             v_buf_ref = &cached.qkv_buf;
-            v_offset = ((q_dim + k_dim) * elem_size) as u64;
+            v_offset = (q_dim + k_dim) * elem_size;
         } else {
             qk_buf_ref = &cached.qkv_buf;
             qk_offset = 0;
             v_buf_ref = &cached.qkv_buf;
-            v_offset = ((q_dim + k_dim) * elem_size) as u64;
+            v_offset = (q_dim + k_dim) * elem_size;
         }
 
         // Memory barrier: ensure rope/qkv output visible to KV copy
-        encoder.memory_barrier_with_resources(&[buf_as_resource(qk_buf_ref)]);
+        rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
 
         // KV cache append using direct buffer refs (Optimization B)
-        let k_roped_flat_offset = qk_offset + (q_dim * elem_size) as u64;
+        let k_roped_flat_offset = qk_offset + (q_dim * elem_size);
         cache.append_direct_into_encoder(
             qk_buf_ref,
-            k_roped_flat_offset,
+            k_roped_flat_offset as u64,
             v_buf_ref,
-            v_offset,
+            v_offset as u64,
             1,
             &cached.copy_pso,
             cached.copy_max_tg,
-            encoder,
+encoder,
         )?;
 
         // Memory barrier on KV slab buffers: KV copy -> SDPA read dependency
@@ -2600,10 +2597,7 @@ impl TransformerBlock {
         let v_slab = cache.values_slab_view().ok_or_else(|| {
             KernelError::InvalidShape("forward_cached: no values slab after append".into())
         })?;
-        encoder.memory_barrier_with_resources(&[
-            buf_as_resource(k_slab.metal_buffer()),
-            buf_as_resource(v_slab.metal_buffer()),
-        ]);
+        rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
 
         let seq_len = cache.seq_len;
         let max_seq = cache.max_seq_len();
@@ -2612,11 +2606,11 @@ impl TransformerBlock {
         ops::sdpa::sdpa_decode_preresolved_into_encoder(
             &cached.sdpa_pso,
             qk_buf_ref,
-            qk_offset,
+qk_offset,
             k_slab.metal_buffer(),
-            k_slab.offset() as u64,
+            k_slab.offset(),
             v_slab.metal_buffer(),
-            v_slab.offset() as u64,
+            v_slab.offset(),
             &cached.attn_out_buf,
             0,
             &cached.dummy_mask_buf,
@@ -2630,13 +2624,13 @@ impl TransformerBlock {
             cached.scale,
             encoder,
         );
-        encoder.memory_barrier_with_resources(&[buf_as_resource(&cached.attn_out_buf)]);
+        rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
 
         // D5: gemv_bias(W_o, attn, x) -> h_buf (O_proj + residual add)
         ops::gemv::gemv_bias_preresolved_into_encoder(
             &cached.gemv_bias_oproj_pso,
             o_weight.metal_buffer(),
-            o_weight.offset() as u64,
+            o_weight.offset(),
             &cached.attn_out_buf,
             0,
             &cached.h_buf,
@@ -2644,12 +2638,12 @@ impl TransformerBlock {
             cached.gemv_bias_oproj_m,
             cached.gemv_bias_oproj_k,
             x.metal_buffer(),
-            x.offset() as u64,
+            x.offset(),
             cached.gemv_bias_oproj_grid,
             cached.gemv_bias_oproj_tg,
-            encoder,
+encoder,
         );
-        encoder.memory_barrier_with_resources(&[buf_as_resource(&cached.h_buf)]);
+        rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
 
         // D6+D7: rms_norm + gate_up GEMV (conditionally fused)
         if fuse_rms_gate_up {
@@ -2659,9 +2653,9 @@ impl TransformerBlock {
                     &cached.h_buf,
                     0,
                     norm2_w.metal_buffer(),
-                    norm2_w.offset() as u64,
+                    norm2_w.offset(),
                     gate_up_w.metal_buffer(),
-                    gate_up_w.offset() as u64,
+                    gate_up_w.offset(),
                     &cached.gate_up_buf,
                     0,
                     cached.gemv_gate_up_m,
@@ -2670,7 +2664,7 @@ impl TransformerBlock {
                     cached.norm2_w_stride,
                     cached.fused_rms_gemv_gate_up_grid,
                     cached.fused_rms_gemv_gate_up_tg,
-                    encoder,
+encoder,
                 );
             } else {
                 // Fallback: unfused
@@ -2679,7 +2673,7 @@ impl TransformerBlock {
                     &cached.h_buf,
                     0,
                     norm2_w.metal_buffer(),
-                    norm2_w.offset() as u64,
+                    norm2_w.offset(),
                     &cached.normed2_buf,
                     0,
                     cached.rms_axis_size,
@@ -2687,13 +2681,13 @@ impl TransformerBlock {
                     cached.norm2_w_stride,
                     1,
                     1,
-                    encoder,
+encoder,
                 );
-                encoder.memory_barrier_with_resources(&[buf_as_resource(&cached.normed2_buf)]);
+                rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
                 ops::gemv::gemv_preresolved_into_encoder(
                     &cached.gemv_gate_up_pso,
                     gate_up_w.metal_buffer(),
-                    gate_up_w.offset() as u64,
+                    gate_up_w.offset(),
                     &cached.normed2_buf,
                     0,
                     &cached.gate_up_buf,
@@ -2702,7 +2696,7 @@ impl TransformerBlock {
                     cached.gemv_gate_up_k,
                     cached.gemv_gate_up_grid,
                     cached.gemv_gate_up_tg,
-                    encoder,
+encoder,
                 );
             }
         } else {
@@ -2712,7 +2706,7 @@ impl TransformerBlock {
                 &cached.h_buf,
                 0,
                 norm2_w.metal_buffer(),
-                norm2_w.offset() as u64,
+                norm2_w.offset(),
                 &cached.normed2_buf,
                 0,
                 cached.rms_axis_size,
@@ -2720,13 +2714,13 @@ impl TransformerBlock {
                 cached.norm2_w_stride,
                 1,
                 1,
-                encoder,
+encoder,
             );
-            encoder.memory_barrier_with_resources(&[buf_as_resource(&cached.normed2_buf)]);
+            rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
             ops::gemv::gemv_preresolved_into_encoder(
                 &cached.gemv_gate_up_pso,
                 gate_up_w.metal_buffer(),
-                gate_up_w.offset() as u64,
+                gate_up_w.offset(),
                 &cached.normed2_buf,
                 0,
                 &cached.gate_up_buf,
@@ -2735,10 +2729,10 @@ impl TransformerBlock {
                 cached.gemv_gate_up_k,
                 cached.gemv_gate_up_grid,
                 cached.gemv_gate_up_tg,
-                encoder,
+encoder,
             );
         }
-        encoder.memory_barrier_with_resources(&[buf_as_resource(&cached.gate_up_buf)]);
+        rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
 
         // D8+D9: SwiGLU + down GEMV (conditionally fused)
         if fuse_swiglu_down {
@@ -2746,7 +2740,7 @@ impl TransformerBlock {
                 ops::fused::fused_swiglu_down_preresolved_into_encoder(
                     pso,
                     down_w.metal_buffer(),
-                    down_w.offset() as u64,
+                    down_w.offset(),
                     &cached.gate_up_buf,
                     0,
                     &cached.out_buf,
@@ -2757,7 +2751,7 @@ impl TransformerBlock {
                     0,
                     cached.fused_swiglu_down_grid,
                     cached.fused_swiglu_down_tg,
-                    encoder,
+encoder,
                 );
             } else {
                 // Fallback: unfused
@@ -2767,18 +2761,18 @@ impl TransformerBlock {
                     &cached.gate_up_buf,
                     0,
                     &cached.gate_up_buf,
-                    (gate_dim * elem_size) as u64,
+                    gate_dim * elem_size,
                     &cached.silu_buf,
                     0,
                     cached.silu_numel,
-                    cached.silu_elems_per_thread,
-                    encoder,
+cached.silu_elems_per_thread.try_into().unwrap(),
+encoder,
                 );
-                encoder.memory_barrier_with_resources(&[buf_as_resource(&cached.silu_buf)]);
+                rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
                 ops::gemv::gemv_bias_preresolved_into_encoder(
                     &cached.gemv_bias_down_pso,
                     down_w.metal_buffer(),
-                    down_w.offset() as u64,
+                    down_w.offset(),
                     &cached.silu_buf,
                     0,
                     &cached.out_buf,
@@ -2789,7 +2783,7 @@ impl TransformerBlock {
                     0,
                     cached.gemv_bias_down_grid,
                     cached.gemv_bias_down_tg,
-                    encoder,
+encoder,
                 );
             }
         } else {
@@ -2800,18 +2794,18 @@ impl TransformerBlock {
                 &cached.gate_up_buf,
                 0,
                 &cached.gate_up_buf,
-                (gate_dim * elem_size) as u64,
+                gate_dim * elem_size,
                 &cached.silu_buf,
                 0,
                 cached.silu_numel,
-                cached.silu_elems_per_thread,
-                encoder,
+cached.silu_elems_per_thread.try_into().unwrap(),
+encoder,
             );
-            encoder.memory_barrier_with_resources(&[buf_as_resource(&cached.silu_buf)]);
+            rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
             ops::gemv::gemv_bias_preresolved_into_encoder(
                 &cached.gemv_bias_down_pso,
                 down_w.metal_buffer(),
-                down_w.offset() as u64,
+                down_w.offset(),
                 &cached.silu_buf,
                 0,
                 &cached.out_buf,
@@ -2822,11 +2816,11 @@ impl TransformerBlock {
                 0,
                 cached.gemv_bias_down_grid,
                 cached.gemv_bias_down_tg,
-                encoder,
+encoder,
             );
         }
 
-        encoder.end_encoding();
+        encoder.end();
 
         Ok(Array::new(
             cached.out_buf.clone(),
@@ -2847,7 +2841,7 @@ impl TransformerBlock {
         mask: Option<&Array>,
         cache: &mut LayerKvCache,
         registry: &KernelRegistry,
-        cb: &metal::CommandBufferRef,
+        cb: &ProtocolObject<dyn MTLCommandBuffer>,
     ) -> Result<Array, KernelError> {
         let norm1_w = self.norm1_weight.as_ref().ok_or_else(|| {
             KernelError::InvalidShape("TransformerBlock: norm1_weight not loaded".into())
@@ -2879,15 +2873,16 @@ impl TransformerBlock {
         )?;
 
         // Dispatch 6: rms_norm (single encoder)
-        let enc6 = rmlx_metal::new_concurrent_encoder(cb);
+        let raw_enc6 = rmlx_metal::new_concurrent_encoder(cb);
+        let enc6 = ComputePass::new(&raw_enc6);
         let normed2 = ops::rms_norm::rms_norm_into_encoder(
             registry,
             &h,
             Some(norm2_w),
             self.rms_norm_eps,
-            enc6,
+enc6,
         )?;
-        enc6.end_encoding();
+        enc6.end();
 
         // Dispatches 7-9: FFN (gate_up + silu_mul + down+residual)
         self.ffn
@@ -2907,7 +2902,7 @@ impl TransformerBlock {
         mask: Option<&Array>,
         cache: Option<&mut LayerKvCache>,
         registry: &KernelRegistry,
-        cb: &metal::CommandBufferRef,
+        cb: &ProtocolObject<dyn MTLCommandBuffer>,
     ) -> Result<Array, KernelError> {
         let norm1_w = self.norm1_weight.as_ref().ok_or_else(|| {
             KernelError::InvalidShape("TransformerBlock: norm1_weight not loaded".into())
@@ -2958,7 +2953,7 @@ impl TransformerBlock {
         mask: Option<&Array>,
         cache: &mut LayerKvCache,
         registry: &KernelRegistry,
-        cb: &metal::CommandBufferRef,
+        cb: &ProtocolObject<dyn MTLCommandBuffer>,
     ) -> Result<Array, KernelError> {
         let norm1_w = self.norm1_weight.as_ref().ok_or_else(|| {
             KernelError::InvalidShape("TransformerBlock: norm1_weight not loaded".into())
@@ -3009,7 +3004,7 @@ impl TransformerBlock {
         mask: Option<&Array>,
         cache: &mut LayerKvCache,
         registry: &KernelRegistry,
-        encoder: &metal::ComputeCommandEncoderRef,
+        encoder: ComputePass<'_>,
     ) -> Result<Array, KernelError> {
         let norm1_w = self.norm1_weight.as_ref().ok_or_else(|| {
             KernelError::InvalidShape("TransformerBlock: norm1_weight not loaded".into())
@@ -3032,7 +3027,7 @@ impl TransformerBlock {
         )?;
         // Residual connection: h = x + attn_out
         let h = ops::binary::add_encode(registry, x, &attn_out, encoder)?;
-        encoder.memory_barrier_with_resources(&[buf_as_resource(h.metal_buffer())]);
+        rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
         // FFN with fused norm2 + gate/up GEMM (eliminates intermediate normed2 tensor)
         self.ffn
             .forward_norm_single_encoder(&h, norm2_w, self.rms_norm_eps, &h, registry, encoder)
@@ -3068,7 +3063,7 @@ impl TransformerBlock {
         sin_freqs: Option<&Array>,
         cache: &mut LayerKvCache,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<(Array, Vec<(&'static str, std::time::Duration)>), KernelError> {
         use std::time::Instant;
 
@@ -3093,7 +3088,7 @@ impl TransformerBlock {
 
         // ---- Dispatch 6: RMSNorm + Residual add (fused) ----
         let (normed2, h) = {
-            let cb = queue.new_command_buffer();
+            let cb = queue.commandBuffer().unwrap();
             let start = Instant::now();
             let result = ops::rms_norm::rms_norm_residual_add_into_cb(
                 registry,
@@ -3101,10 +3096,10 @@ impl TransformerBlock {
                 x,
                 norm2_w,
                 self.rms_norm_eps,
-                cb,
+                &*cb,
             )?;
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
             timings.push(("RMSNorm + Residual", start.elapsed()));
             result
         };
@@ -3130,11 +3125,11 @@ impl TransformerBlock {
 
                 // ---- Dispatch 7: Gate+Up merged GEMM ----
                 let merged = {
-                    let cb = queue.new_command_buffer();
+                    let cb = queue.commandBuffer().unwrap();
                     let start = Instant::now();
-                    let out = ops::matmul::matmul_into_cb(registry, &normed_2d, guw_t, cb)?;
+                    let out = ops::matmul::matmul_into_cb(registry, &normed_2d, guw_t, &*cb)?;
                     cb.commit();
-                    cb.wait_until_completed();
+                    cb.waitUntilCompleted();
                     timings.push(("Gate+Up Merged GEMM", start.elapsed()));
                     out
                 };
@@ -3142,29 +3137,29 @@ impl TransformerBlock {
                 // ---- Dispatch 8: SiLU×Mul (strided) ----
                 let gate_dim = guw_t.shape()[1] / 2;
                 let hidden = {
-                    let cb = queue.new_command_buffer();
+                    let cb = queue.commandBuffer().unwrap();
                     let start = Instant::now();
                     let out = ops::fused::fused_silu_mul_strided_into_cb(
-                        registry, &merged, gate_dim, cb,
+                        registry, &merged, gate_dim, &*cb,
                     )?;
                     cb.commit();
-                    cb.wait_until_completed();
+                    cb.waitUntilCompleted();
                     timings.push(("SiLU*Mul (strided)", start.elapsed()));
                     out
                 };
 
                 // ---- Dispatch 9: Down Proj + Residual ----
                 let final_out = {
-                    let cb = queue.new_command_buffer();
+                    let cb = queue.commandBuffer().unwrap();
                     let start = Instant::now();
                     let out = if hidden.shape()[0] >= 33 {
-                        down_proj.forward_with_residual_into_cb(&hidden, &h, registry, cb)?
+                        down_proj.forward_with_residual_into_cb(&hidden, &h, registry, &*cb)?
                     } else {
-                        let ffn_out = down_proj.forward_into_cb(&hidden, registry, cb)?;
-                        ops::binary::add_into_cb(registry, &h, &ffn_out, cb)?
+                        let ffn_out = down_proj.forward_into_cb(&hidden, registry, &*cb)?;
+                        ops::binary::add_into_cb(registry, &h, &ffn_out, &*cb)?
                     };
                     cb.commit();
-                    cb.wait_until_completed();
+                    cb.waitUntilCompleted();
                     timings.push(("Down Proj + Residual", start.elapsed()));
                     out
                 };
@@ -3193,8 +3188,8 @@ impl TransformerBlock {
         cos_freqs: Option<&Array>,
         sin_freqs: Option<&Array>,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
-        device: &metal::Device,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
+        device: &ProtocolObject<dyn MTLDevice>,
         max_seq_len: usize,
         warmup_iters: usize,
         bench_iters: usize,
@@ -3247,154 +3242,162 @@ impl TransformerBlock {
         for group in 1..=num_groups {
             // Warmup
             for _ in 0..warmup_iters {
-                let _pool = rmlx_metal::ScopedPool::new();
-                let mut cache = LayerKvCache::preallocated(
-                    device,
-                    self.attention.config().num_kv_heads,
-                    self.attention.config().head_dim,
-                    max_seq_len,
-                    rmlx_core::dtype::DType::Float16,
-                );
-                let cb = queue.new_command_buffer();
-                let encoder = cb.new_compute_command_encoder();
+                rmlx_metal::autoreleasepool(|_| -> Result<(), _> {
+                    let mut cache = LayerKvCache::preallocated(
+                        device,
+                        self.attention.config().num_kv_heads,
+                        self.attention.config().head_dim,
+                        max_seq_len,
+                        rmlx_core::dtype::DType::Float16,
+                    );
+                    let cb = queue.commandBuffer().unwrap();
+                    let raw_encoder = cb.computeCommandEncoder().unwrap();
+                    let encoder = ComputePass::new(&raw_encoder);
 
-                // Attention dispatches 1..min(group,5)
-                let attn_stop = group.min(5);
-                let attn_out = self.attention.forward_prefill_encode_partial(
-                    x,
-                    norm1_w,
-                    self.rms_norm_eps,
-                    cos_freqs,
-                    sin_freqs,
-                    &mut cache,
-                    registry,
-                    encoder,
-                    attn_stop,
-                )?;
-
-                if group >= 6 {
-                    // Dispatch 6: RMSNorm + Residual
-                    let (normed2, h) = ops::rms_norm::rms_norm_residual_add_encode(
-                        registry,
-                        &attn_out,
+                    // Attention dispatches 1..min(group,5)
+                    let attn_stop = group.min(5);
+                    let attn_out = self.attention.forward_prefill_encode_partial(
                         x,
-                        norm2_w,
+                        norm1_w,
                         self.rms_norm_eps,
-                        encoder,
+                        cos_freqs,
+                        sin_freqs,
+                        &mut cache,
+                        registry,
+                        &*encoder,
+                        attn_stop,
                     )?;
 
-                    if group >= 7 {
-                        // Dispatch 7: Gate+Up Merged GEMM
-                        let normed_2d = if normed2.ndim() == 1 {
-                            normed2.reshape(vec![1, normed2.shape()[0]])?
-                        } else {
-                            normed2.reshape(vec![normed2.shape()[0], normed2.shape()[1]])?
-                        };
-                        let merged =
-                            ops::matmul::matmul_encode(registry, &normed_2d, guw_t, encoder)?;
+                    if group >= 6 {
+                        // Dispatch 6: RMSNorm + Residual
+                        let (normed2, h) = ops::rms_norm::rms_norm_residual_add_encode(
+                            registry,
+                            &attn_out,
+                            x,
+                            norm2_w,
+                            self.rms_norm_eps,
+                            &*encoder,
+                        )?;
 
-                        if group >= 8 {
-                            // Dispatch 8: SiLU*Mul (strided)
-                            let gate_dim = guw_t.shape()[1] / 2;
-                            let hidden = ops::fused::fused_silu_mul_strided_encode(
-                                registry, &merged, gate_dim, encoder,
-                            )?;
+                        if group >= 7 {
+                            // Dispatch 7: Gate+Up Merged GEMM
+                            let normed_2d = if normed2.ndim() == 1 {
+                                normed2.reshape(vec![1, normed2.shape()[0]])?
+                            } else {
+                                normed2.reshape(vec![normed2.shape()[0], normed2.shape()[1]])?
+                            };
+                            let merged =
+                                ops::matmul::matmul_encode(registry, &normed_2d, guw_t, encoder)?;
 
-                            if group >= 9 {
-                                // Dispatch 9: Down Proj + Residual
-                                if hidden.shape()[0] >= 33 {
-                                    let _ = down_proj.forward_with_residual_into_encoder(
-                                        &hidden, &h, registry, encoder,
-                                    )?;
-                                } else {
-                                    let ffn_out = down_proj
-                                        .forward_into_encoder(&hidden, registry, encoder)?;
-                                    let _ =
-                                        ops::binary::add_encode(registry, &h, &ffn_out, encoder)?;
+                            if group >= 8 {
+                                // Dispatch 8: SiLU*Mul (strided)
+                                let gate_dim = guw_t.shape()[1] / 2;
+                                let hidden = ops::fused::fused_silu_mul_strided_encode(
+                                    registry, &merged, gate_dim, encoder,
+                                )?;
+
+                                if group >= 9 {
+                                    // Dispatch 9: Down Proj + Residual
+                                    if hidden.shape()[0] >= 33 {
+                                        let _ = down_proj.forward_with_residual_into_encoder(
+                                            &hidden, &h, registry, &*encoder,
+                                        )?;
+                                    } else {
+                                        let ffn_out = down_proj
+                                            .forward_into_encoder(&hidden, registry, &*encoder)?;
+                                        let _ = ops::binary::add_encode(
+                                            registry, &h, &ffn_out, &*encoder,
+                                        )?;
+                                    }
                                 }
                             }
                         }
                     }
-                }
 
-                encoder.end_encoding();
-                cb.commit();
-                cb.wait_until_completed();
+                    encoder.end();
+                    cb.commit();
+                    cb.waitUntilCompleted();
+                    Ok(())
+                })?;
             }
 
             // Benchmark
             let mut latencies = Vec::with_capacity(bench_iters);
             for _ in 0..bench_iters {
-                let _pool = rmlx_metal::ScopedPool::new();
-                let mut cache = LayerKvCache::preallocated(
-                    device,
-                    self.attention.config().num_kv_heads,
-                    self.attention.config().head_dim,
-                    max_seq_len,
-                    rmlx_core::dtype::DType::Float16,
-                );
-                let cb = queue.new_command_buffer();
-                let encoder = cb.new_compute_command_encoder();
-                let start = Instant::now();
+                rmlx_metal::autoreleasepool(|_| -> Result<(), _> {
+                    let mut cache = LayerKvCache::preallocated(
+                        device,
+                        self.attention.config().num_kv_heads,
+                        self.attention.config().head_dim,
+                        max_seq_len,
+                        rmlx_core::dtype::DType::Float16,
+                    );
+                    let cb = queue.commandBuffer().unwrap();
+                    let raw_encoder = cb.computeCommandEncoder().unwrap();
+                    let encoder = ComputePass::new(&raw_encoder);
+                    let start = Instant::now();
 
-                let attn_stop = group.min(5);
-                let attn_out = self.attention.forward_prefill_encode_partial(
-                    x,
-                    norm1_w,
-                    self.rms_norm_eps,
-                    cos_freqs,
-                    sin_freqs,
-                    &mut cache,
-                    registry,
-                    encoder,
-                    attn_stop,
-                )?;
-
-                if group >= 6 {
-                    let (normed2, h) = ops::rms_norm::rms_norm_residual_add_encode(
-                        registry,
-                        &attn_out,
+                    let attn_stop = group.min(5);
+                    let attn_out = self.attention.forward_prefill_encode_partial(
                         x,
-                        norm2_w,
+                        norm1_w,
                         self.rms_norm_eps,
-                        encoder,
+                        cos_freqs,
+                        sin_freqs,
+                        &mut cache,
+                        registry,
+                        &*encoder,
+                        attn_stop,
                     )?;
 
-                    if group >= 7 {
-                        let normed_2d = if normed2.ndim() == 1 {
-                            normed2.reshape(vec![1, normed2.shape()[0]])?
-                        } else {
-                            normed2.reshape(vec![normed2.shape()[0], normed2.shape()[1]])?
-                        };
-                        let merged =
-                            ops::matmul::matmul_encode(registry, &normed_2d, guw_t, encoder)?;
+                    if group >= 6 {
+                        let (normed2, h) = ops::rms_norm::rms_norm_residual_add_encode(
+                            registry,
+                            &attn_out,
+                            x,
+                            norm2_w,
+                            self.rms_norm_eps,
+                            &*encoder,
+                        )?;
 
-                        if group >= 8 {
-                            let gate_dim = guw_t.shape()[1] / 2;
-                            let hidden = ops::fused::fused_silu_mul_strided_encode(
-                                registry, &merged, gate_dim, encoder,
-                            )?;
+                        if group >= 7 {
+                            let normed_2d = if normed2.ndim() == 1 {
+                                normed2.reshape(vec![1, normed2.shape()[0]])?
+                            } else {
+                                normed2.reshape(vec![normed2.shape()[0], normed2.shape()[1]])?
+                            };
+                            let merged =
+                                ops::matmul::matmul_encode(registry, &normed_2d, guw_t, encoder)?;
 
-                            if group >= 9 {
-                                if hidden.shape()[0] >= 33 {
-                                    let _ = down_proj.forward_with_residual_into_encoder(
-                                        &hidden, &h, registry, encoder,
-                                    )?;
-                                } else {
-                                    let ffn_out = down_proj
-                                        .forward_into_encoder(&hidden, registry, encoder)?;
-                                    let _ =
-                                        ops::binary::add_encode(registry, &h, &ffn_out, encoder)?;
+                            if group >= 8 {
+                                let gate_dim = guw_t.shape()[1] / 2;
+                                let hidden = ops::fused::fused_silu_mul_strided_encode(
+                                    registry, &merged, gate_dim, encoder,
+                                )?;
+
+                                if group >= 9 {
+                                    if hidden.shape()[0] >= 33 {
+                                        let _ = down_proj.forward_with_residual_into_encoder(
+                                            &hidden, &h, registry, &*encoder,
+                                        )?;
+                                    } else {
+                                        let ffn_out = down_proj
+                                            .forward_into_encoder(&hidden, registry, &*encoder)?;
+                                        let _ = ops::binary::add_encode(
+                                            registry, &h, &ffn_out, &*encoder,
+                                        )?;
+                                    }
                                 }
                             }
                         }
                     }
-                }
 
-                encoder.end_encoding();
-                cb.commit();
-                cb.wait_until_completed();
-                latencies.push(start.elapsed());
+                    encoder.end();
+                    cb.commit();
+                    cb.waitUntilCompleted();
+                    latencies.push(start.elapsed());
+                    Ok(())
+                })?;
             }
 
             let sum_us: f64 = latencies.iter().map(|d| d.as_secs_f64() * 1e6).sum();
@@ -3435,38 +3438,38 @@ impl TransformerBlock {
 /// again on the same `CachedDecode`. This is always the case in serial decode.
 pub struct CachedDecode {
     // --- Pre-resolved PSOs ---
-    pub rms_norm_pso: metal::ComputePipelineState,
-    pub gemv_qkv_pso: metal::ComputePipelineState,
-    pub rope_pso: metal::ComputePipelineState,
-    pub copy_pso: metal::ComputePipelineState,
-    pub sdpa_pso: metal::ComputePipelineState,
-    pub gemv_bias_oproj_pso: metal::ComputePipelineState,
-    pub rms_norm2_pso: metal::ComputePipelineState,
-    pub gemv_gate_up_pso: metal::ComputePipelineState,
-    pub silu_mul_pso: metal::ComputePipelineState,
-    pub gemv_bias_down_pso: metal::ComputePipelineState,
+    pub rms_norm_pso: MtlPipeline,
+    pub gemv_qkv_pso: MtlPipeline,
+    pub rope_pso: MtlPipeline,
+    pub copy_pso: MtlPipeline,
+    pub sdpa_pso: MtlPipeline,
+    pub gemv_bias_oproj_pso: MtlPipeline,
+    pub rms_norm2_pso: MtlPipeline,
+    pub gemv_gate_up_pso: MtlPipeline,
+    pub silu_mul_pso: MtlPipeline,
+    pub gemv_bias_down_pso: MtlPipeline,
 
     // --- Pre-allocated scratch buffers ---
     /// D1 output: rms_norm result [1, hidden_size]
-    pub normed_buf: metal::Buffer,
+    pub normed_buf: MtlBuffer,
     /// D2 output: QKV result [qkv_dim]
-    pub qkv_buf: metal::Buffer,
+    pub qkv_buf: MtlBuffer,
     /// D3 output: rope result [total_rope_heads * head_dim]
-    pub rope_buf: metal::Buffer,
+    pub rope_buf: MtlBuffer,
     /// D4 output: SDPA result [num_heads * head_dim]
-    pub attn_out_buf: metal::Buffer,
+    pub attn_out_buf: MtlBuffer,
     /// D5 output: O_proj+residual result [hidden_size]
-    pub h_buf: metal::Buffer,
+    pub h_buf: MtlBuffer,
     /// D6 output: rms_norm2 result [1, hidden_size]
-    pub normed2_buf: metal::Buffer,
+    pub normed2_buf: MtlBuffer,
     /// D7 output: gate_up result [2 * intermediate_dim]
-    pub gate_up_buf: metal::Buffer,
+    pub gate_up_buf: MtlBuffer,
     /// D8 output: silu_mul result [intermediate_dim]
-    pub silu_buf: metal::Buffer,
+    pub silu_buf: MtlBuffer,
     /// D9 output: down_proj+residual result [hidden_size]
-    pub out_buf: metal::Buffer,
+    pub out_buf: MtlBuffer,
     /// Dummy buffer for SDPA when no mask is provided
-    pub dummy_mask_buf: metal::Buffer,
+    pub dummy_mask_buf: MtlBuffer,
 
     // --- Cached dimensions ---
     pub hidden_size: usize,
@@ -3478,20 +3481,20 @@ pub struct CachedDecode {
     pub rms_norm_eps: f32,
 
     // --- Pre-computed dispatch geometries ---
-    pub gemv_qkv_grid: metal::MTLSize,
-    pub gemv_qkv_tg: metal::MTLSize,
+    pub gemv_qkv_grid: MTLSize,
+    pub gemv_qkv_tg: MTLSize,
     pub gemv_qkv_m: u32,
     pub gemv_qkv_k: u32,
-    pub gemv_bias_oproj_grid: metal::MTLSize,
-    pub gemv_bias_oproj_tg: metal::MTLSize,
+    pub gemv_bias_oproj_grid: MTLSize,
+    pub gemv_bias_oproj_tg: MTLSize,
     pub gemv_bias_oproj_m: u32,
     pub gemv_bias_oproj_k: u32,
-    pub gemv_gate_up_grid: metal::MTLSize,
-    pub gemv_gate_up_tg: metal::MTLSize,
+    pub gemv_gate_up_grid: MTLSize,
+    pub gemv_gate_up_tg: MTLSize,
     pub gemv_gate_up_m: u32,
     pub gemv_gate_up_k: u32,
-    pub gemv_bias_down_grid: metal::MTLSize,
-    pub gemv_bias_down_tg: metal::MTLSize,
+    pub gemv_bias_down_grid: MTLSize,
+    pub gemv_bias_down_tg: MTLSize,
     pub gemv_bias_down_m: u32,
     pub gemv_bias_down_k: u32,
     pub silu_numel: u32,
@@ -3512,17 +3515,17 @@ pub struct CachedDecode {
     pub copy_max_tg: u64,
 
     // --- Fused PSOs (Phase 10) ---
-    pub fused_rms_gemv_qkv_pso: Option<metal::ComputePipelineState>,
-    pub fused_rms_gemv_gate_up_pso: Option<metal::ComputePipelineState>,
-    pub fused_swiglu_down_pso: Option<metal::ComputePipelineState>,
+    pub fused_rms_gemv_qkv_pso: Option<MtlPipeline>,
+    pub fused_rms_gemv_gate_up_pso: Option<MtlPipeline>,
+    pub fused_swiglu_down_pso: Option<MtlPipeline>,
 
     // --- Fused dispatch geometries ---
-    pub fused_rms_gemv_qkv_grid: metal::MTLSize,
-    pub fused_rms_gemv_qkv_tg: metal::MTLSize,
-    pub fused_rms_gemv_gate_up_grid: metal::MTLSize,
-    pub fused_rms_gemv_gate_up_tg: metal::MTLSize,
-    pub fused_swiglu_down_grid: metal::MTLSize,
-    pub fused_swiglu_down_tg: metal::MTLSize,
+    pub fused_rms_gemv_qkv_grid: MTLSize,
+    pub fused_rms_gemv_qkv_tg: MTLSize,
+    pub fused_rms_gemv_gate_up_grid: MTLSize,
+    pub fused_rms_gemv_gate_up_tg: MTLSize,
+    pub fused_swiglu_down_grid: MTLSize,
+    pub fused_swiglu_down_tg: MTLSize,
 }
 
 impl CachedDecode {
@@ -3683,64 +3686,64 @@ impl CachedDecode {
         let (fused_rms_gemv_qkv_grid, fused_rms_gemv_qkv_tg) = fused_rms_gemv_qkv_pso
             .as_ref()
             .map(|pso| ops::fused::fused_rms_gemv_dispatch_sizes(qkv_dim as u32, pso))
-            .unwrap_or((metal::MTLSize::new(1, 1, 1), metal::MTLSize::new(1, 1, 1)));
+            .unwrap_or((MTLSize { width: 1, height: 1, depth: 1 }, MTLSize { width: 1, height: 1, depth: 1 }));
         let (fused_rms_gemv_gate_up_grid, fused_rms_gemv_gate_up_tg) = fused_rms_gemv_gate_up_pso
             .as_ref()
             .map(|pso| ops::fused::fused_rms_gemv_dispatch_sizes(gate_up_total as u32, pso))
-            .unwrap_or((metal::MTLSize::new(1, 1, 1), metal::MTLSize::new(1, 1, 1)));
+            .unwrap_or((MTLSize { width: 1, height: 1, depth: 1 }, MTLSize { width: 1, height: 1, depth: 1 }));
         let (fused_swiglu_down_grid, fused_swiglu_down_tg) = fused_swiglu_down_pso
             .as_ref()
             .map(|pso| ops::fused::fused_swiglu_down_dispatch_sizes(hidden_size as u32, pso))
-            .unwrap_or((metal::MTLSize::new(1, 1, 1), metal::MTLSize::new(1, 1, 1)));
+            .unwrap_or((MTLSize { width: 1, height: 1, depth: 1 }, MTLSize { width: 1, height: 1, depth: 1 }));
 
         // --- Pre-allocate scratch buffers ---
-        let normed_buf = dev.new_buffer(
-            (hidden_size * elem_size) as u64,
-            metal::MTLResourceOptions::StorageModePrivate,
-        );
-        let qkv_buf = dev.new_buffer(
-            (qkv_dim * elem_size) as u64,
-            metal::MTLResourceOptions::StorageModePrivate,
-        );
+        let normed_buf = dev.newBufferWithLength_options(
+            hidden_size * elem_size,
+            MTLResourceOptions::StorageModePrivate,
+        ).unwrap();
+        let qkv_buf = dev.newBufferWithLength_options(
+            qkv_dim * elem_size,
+            MTLResourceOptions::StorageModePrivate,
+        ).unwrap();
         let total_rope_heads = num_heads + num_kv_heads;
-        let rope_buf = dev.new_buffer(
-            (total_rope_heads * head_dim * elem_size) as u64,
-            metal::MTLResourceOptions::StorageModePrivate,
-        );
-        let attn_out_buf = dev.new_buffer(
-            (num_heads * head_dim * elem_size) as u64,
-            metal::MTLResourceOptions::StorageModePrivate,
-        );
-        let h_buf = dev.new_buffer(
-            (hidden_size * elem_size) as u64,
-            metal::MTLResourceOptions::StorageModePrivate,
-        );
-        let normed2_buf = dev.new_buffer(
-            (hidden_size * elem_size) as u64,
-            metal::MTLResourceOptions::StorageModePrivate,
-        );
-        let gate_up_buf = dev.new_buffer(
-            (gate_up_total * elem_size) as u64,
-            metal::MTLResourceOptions::StorageModePrivate,
-        );
-        let silu_buf = dev.new_buffer(
-            (intermediate_dim * elem_size) as u64,
-            metal::MTLResourceOptions::StorageModePrivate,
-        );
-        let out_buf = dev.new_buffer(
-            (hidden_size * elem_size) as u64,
-            metal::MTLResourceOptions::StorageModePrivate,
-        );
-        let dummy_mask_buf = dev.new_buffer(4, metal::MTLResourceOptions::StorageModeShared);
+        let rope_buf = dev.newBufferWithLength_options(
+            total_rope_heads * head_dim * elem_size,
+            MTLResourceOptions::StorageModePrivate,
+        ).unwrap();
+        let attn_out_buf = dev.newBufferWithLength_options(
+            num_heads * head_dim * elem_size,
+            MTLResourceOptions::StorageModePrivate,
+        ).unwrap();
+        let h_buf = dev.newBufferWithLength_options(
+            hidden_size * elem_size,
+            MTLResourceOptions::StorageModePrivate,
+        ).unwrap();
+        let normed2_buf = dev.newBufferWithLength_options(
+            hidden_size * elem_size,
+            MTLResourceOptions::StorageModePrivate,
+        ).unwrap();
+        let gate_up_buf = dev.newBufferWithLength_options(
+            gate_up_total * elem_size,
+            MTLResourceOptions::StorageModePrivate,
+        ).unwrap();
+        let silu_buf = dev.newBufferWithLength_options(
+            intermediate_dim * elem_size,
+            MTLResourceOptions::StorageModePrivate,
+        ).unwrap();
+        let out_buf = dev.newBufferWithLength_options(
+            hidden_size * elem_size,
+            MTLResourceOptions::StorageModePrivate,
+        ).unwrap();
+        let dummy_mask_buf = dev.newBufferWithLength_options(4, MTLResourceOptions::StorageModeShared).unwrap();
 
         let scale = 1.0 / (head_dim as f32).sqrt();
 
         // Pre-cache threadgroup sizes (Optimization C)
-        let sdpa_tg_size = std::cmp::min(256u64, sdpa_pso.max_total_threads_per_threadgroup());
-        let rms_tg_size = std::cmp::min(1024u64, rms_norm_pso.max_total_threads_per_threadgroup());
+        let sdpa_tg_size = std::cmp::min(256usize, sdpa_pso.maxTotalThreadsPerThreadgroup());
+let rms_tg_size = std::cmp::min(1024u64, rms_norm_pso.maxTotalThreadsPerThreadgroup().try_into().unwrap());
         let rms2_tg_size =
-            std::cmp::min(1024u64, rms_norm2_pso.max_total_threads_per_threadgroup());
-        let copy_max_tg = copy_pso.max_total_threads_per_threadgroup();
+std::cmp::min(1024u64, rms_norm2_pso.maxTotalThreadsPerThreadgroup().try_into().unwrap());
+        let copy_max_tg = copy_pso.maxTotalThreadsPerThreadgroup();
 
         Ok(Self {
             rms_norm_pso,
@@ -3792,10 +3795,10 @@ impl CachedDecode {
             scale,
             norm1_w_stride,
             norm2_w_stride,
-            sdpa_tg_size,
+sdpa_tg_size: sdpa_tg_size.try_into().unwrap(),
             rms_tg_size,
             rms2_tg_size,
-            copy_max_tg,
+copy_max_tg: copy_max_tg.try_into().unwrap(),
             fused_rms_gemv_qkv_pso,
             fused_rms_gemv_gate_up_pso,
             fused_swiglu_down_pso,
@@ -3900,7 +3903,7 @@ impl TransformerModel {
         mask: Option<&Array>,
         mut cache: Option<&mut Vec<LayerKvCache>>,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         self.arena.reset();
         let embedding = self.embedding.as_ref().ok_or_else(|| {
@@ -3961,7 +3964,7 @@ impl TransformerModel {
     pub fn prepare_weights_for_graph(
         &mut self,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<(), KernelError> {
         for layer in &mut self.layers {
             layer.prepare_weights_for_graph(registry, queue)?;
@@ -3993,7 +3996,7 @@ impl TransformerModel {
         cache: Option<&mut [LayerKvCache]>,
         mode: ForwardMode,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
         event: &GpuEvent,
     ) -> Result<Array, KernelError> {
         let embedding = self.embedding.as_ref().ok_or_else(|| {
@@ -4028,8 +4031,9 @@ impl TransformerModel {
                     "TransformerModel: CompiledPrefill mode requires cache".into(),
                 )
             })?;
-            let cb = queue.new_command_buffer();
-            let encoder = cb.new_compute_command_encoder();
+            let cb = queue.commandBuffer().unwrap();
+            let raw_encoder = cb.computeCommandEncoder().unwrap();
+            let encoder = ComputePass::new(&raw_encoder);
             for (i, layer) in self.layers.iter().enumerate() {
                 x = layer.forward_prefill_into_encoder(
                     &x,
@@ -4038,7 +4042,7 @@ impl TransformerModel {
                     mask,
                     &mut cache[i],
                     registry,
-                    encoder,
+encoder,
                 )?;
             }
             // Final norm + LM head in same encoder
@@ -4047,12 +4051,12 @@ impl TransformerModel {
                 &x,
                 Some(final_norm),
                 self.config.rms_norm_eps,
-                encoder,
+encoder,
             )?;
-            x = lm_head.forward_into_encoder(&x, registry, encoder)?;
-            encoder.end_encoding();
+x = lm_head.forward_into_encoder(&x, registry, encoder)?;
+            encoder.end();
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
             return Ok(x);
         }
 
@@ -4189,9 +4193,9 @@ impl TransformerBlock {
         mask: Option<&Array>,
         cache: Option<&mut LayerKvCache>,
         group: &rmlx_distributed::group::Group,
-        device: &metal::Device,
+        device: &ProtocolObject<dyn MTLDevice>,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         let norm1_w = self.norm1_weight.as_ref().ok_or_else(|| {
             KernelError::InvalidShape("TransformerBlock: norm1_weight not loaded".into())
@@ -4292,9 +4296,9 @@ impl TransformerModel {
         mask: Option<&Array>,
         mut cache: Option<&mut Vec<LayerKvCache>>,
         group: &rmlx_distributed::group::Group,
-        device: &metal::Device,
+        device: &ProtocolObject<dyn MTLDevice>,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         let embedding = self.embedding.as_ref().ok_or_else(|| {
             KernelError::InvalidShape("TransformerModel: embedding not loaded".into())

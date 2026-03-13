@@ -21,6 +21,8 @@
 //!   cargo bench -p rmlx-nn --bench ep_bench --features distributed
 
 use std::time::{Duration, Instant};
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLDevice as _};
 
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
@@ -123,7 +125,7 @@ fn f32_to_f16_bits(val: f32) -> u16 {
     }
 }
 
-fn rand_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
+fn rand_array(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, shape: &[usize], seed: u64) -> Array {
     let numel: usize = shape.iter().product();
     let mut f16_bytes = Vec::with_capacity(numel * 2);
     let mut state = seed;
@@ -142,7 +144,7 @@ fn rand_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
 // Layer construction helpers
 // ---------------------------------------------------------------------------
 
-fn make_linear(device: &metal::Device, in_f: usize, out_f: usize, seed: u64) -> Linear {
+fn make_linear(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, in_f: usize, out_f: usize, seed: u64) -> Linear {
     let weight = rand_array(device, &[out_f, in_f], seed);
     Linear::from_arrays(
         LinearConfig {
@@ -156,7 +158,7 @@ fn make_linear(device: &metal::Device, in_f: usize, out_f: usize, seed: u64) -> 
     .expect("linear from_arrays")
 }
 
-fn make_expert(device: &metal::Device, hidden: usize, inter: usize, seed_base: u64) -> Expert {
+fn make_expert(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, hidden: usize, inter: usize, seed_base: u64) -> Expert {
     Expert {
         gate_proj: make_linear(device, hidden, inter, seed_base),
         up_proj: make_linear(device, hidden, inter, seed_base + 1),
@@ -164,12 +166,12 @@ fn make_expert(device: &metal::Device, hidden: usize, inter: usize, seed_base: u
     }
 }
 
-fn make_gate(device: &metal::Device, hidden: usize, num_experts: usize, seed: u64) -> Linear {
+fn make_gate(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, hidden: usize, num_experts: usize, seed: u64) -> Linear {
     make_linear(device, hidden, num_experts, seed)
 }
 
 fn build_moe_layer(
-    device: &metal::Device,
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
     num_experts: usize,
     hidden: usize,
     inter: usize,
@@ -217,7 +219,7 @@ where
 // Benchmark: Router (gate) latency
 // ---------------------------------------------------------------------------
 
-fn bench_router(device: &metal::Device, registry: &KernelRegistry, queue: &metal::CommandQueue) {
+fn bench_router(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, registry: &KernelRegistry, queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>) {
     println!("\n=== Router (gate) latency ===");
 
     let gate = make_gate(device, HIDDEN_DIM, NUM_EXPERTS, 500);
@@ -243,9 +245,9 @@ fn bench_router(device: &metal::Device, registry: &KernelRegistry, queue: &metal
 // ---------------------------------------------------------------------------
 
 fn bench_single_expert_ffn(
-    device: &metal::Device,
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) {
     println!("\n=== Single expert FFN (SwiGLU: gate*up -> silu -> down) ===");
 
@@ -265,9 +267,9 @@ fn bench_single_expert_ffn(
 // ---------------------------------------------------------------------------
 
 fn bench_moe_per_expert(
-    device: &metal::Device,
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) {
     println!("\n=== MoE PerExpert strategy (sequential dispatch, 8 experts) ===");
 
@@ -294,9 +296,9 @@ fn bench_moe_per_expert(
 // ---------------------------------------------------------------------------
 
 fn bench_moe_gather_mm(
-    device: &metal::Device,
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) {
     println!("\n=== MoE GatherMM strategy (batched GEMM, 8 experts) ===");
 
@@ -323,9 +325,9 @@ fn bench_moe_gather_mm(
 // ---------------------------------------------------------------------------
 
 fn bench_gather_mm_raw(
-    device: &metal::Device,
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) {
     println!("\n=== Raw gather_mm kernel (no routing overhead) ===");
 
@@ -354,9 +356,9 @@ fn bench_gather_mm_raw(
 // ---------------------------------------------------------------------------
 
 fn bench_ep2_simulation(
-    device: &metal::Device,
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) {
     println!("\n=== EP-2 simulation: 4 experts per rank (half compute) ===");
     println!("  Simulates rank 0 of EP=2: only experts 0..4 are local.");
@@ -411,9 +413,9 @@ fn bench_ep2_simulation(
 #[cfg(feature = "distributed")]
 fn bench_ep2_real_exchange(
     group: &rmlx_distributed::group::Group,
-    device: &metal::Device,
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) {
     println!("\n=== EP-2 real RDMA token exchange (all_to_all) ===");
     println!(
@@ -490,7 +492,7 @@ fn main() {
     let registry = KernelRegistry::new(gpu);
     ops::register_all(&registry).expect("kernel registration failed");
     let device = registry.device().raw();
-    let queue = device.new_command_queue();
+    let queue = device.newCommandQueue().unwrap();
 
     // ── Distributed init ──
     #[cfg(feature = "distributed")]

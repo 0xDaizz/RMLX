@@ -28,6 +28,11 @@ use rmlx_core::dtype::DType;
 use rmlx_core::kernels::{KernelError, KernelRegistry};
 use rmlx_core::ops;
 
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLCommandBuffer as _;
+use objc2_metal::MTLComputePipelineState as _;
+use objc2_metal::{MTLCommandQueue, MTLDevice, MTLResourceOptions};
+use rmlx_metal::{ComputePass, MTLSize, MtlBuffer};
 /// Trait for activation function modules.
 ///
 /// All activations take an input array and return an output of the same shape.
@@ -37,7 +42,7 @@ pub trait Activation {
         &self,
         input: &Array,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError>;
 
     /// Human-readable name for debugging/logging.
@@ -613,7 +618,7 @@ pub fn register(registry: &KernelRegistry) -> Result<(), KernelError> {
 fn ensure_contiguous(
     array: &Array,
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
 ) -> Result<Option<Array>, KernelError> {
     if array.is_contiguous() {
         Ok(None)
@@ -627,7 +632,7 @@ fn dispatch_activation_simple(
     registry: &KernelRegistry,
     input: &Array,
     kernel_base: &str,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     let input_c = ensure_contiguous(input, registry, queue)?;
     let input = input_c.as_ref().unwrap_or(input);
@@ -640,22 +645,23 @@ fn dispatch_activation_simple(
     let out = Array::zeros(registry.device().raw(), input.shape(), input.dtype());
     let numel_buf = make_u32_buf(registry.device().raw(), numel as u32);
 
-    let cb = queue.new_command_buffer();
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
+    let cb = queue.commandBuffer().unwrap();
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
+    enc.set_buffer(0, Some(input.metal_buffer()), input.offset());
     enc.set_buffer(1, Some(out.metal_buffer()), 0);
     enc.set_buffer(2, Some(&numel_buf), 0);
 
-    let n_threads = (numel as u64).div_ceil(elems_per_thread);
-    let tg_size = std::cmp::min(256u64, pipeline.max_total_threads_per_threadgroup());
+    let n_threads = numel.div_ceil(elems_per_thread);
+    let tg_size = std::cmp::min(256usize, pipeline.maxTotalThreadsPerThreadgroup());
     enc.dispatch_threads(
-        metal::MTLSize::new(n_threads, 1, 1),
-        metal::MTLSize::new(tg_size, 1, 1),
+        MTLSize { width: n_threads, height: 1, depth: 1 },
+        MTLSize { width: tg_size, height: 1, depth: 1 },
     );
-    enc.end_encoding();
+    enc.end();
     cb.commit();
-    cb.wait_until_completed();
+    cb.waitUntilCompleted();
 
     Ok(out)
 }
@@ -667,7 +673,7 @@ fn dispatch_activation_param(
     input: &Array,
     kernel_base: &str,
     param: f32,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     let input_c = ensure_contiguous(input, registry, queue)?;
     let input = input_c.as_ref().unwrap_or(input);
@@ -681,29 +687,30 @@ fn dispatch_activation_param(
     let numel_buf = make_u32_buf(registry.device().raw(), numel as u32);
     let param_buf = make_f32_buf(registry.device().raw(), param);
 
-    let cb = queue.new_command_buffer();
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
+    let cb = queue.commandBuffer().unwrap();
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
+    enc.set_buffer(0, Some(input.metal_buffer()), input.offset());
     enc.set_buffer(1, Some(out.metal_buffer()), 0);
     enc.set_buffer(2, Some(&numel_buf), 0);
     enc.set_buffer(3, Some(&param_buf), 0);
 
-    let n_threads = (numel as u64).div_ceil(elems_per_thread);
-    let tg_size = std::cmp::min(256u64, pipeline.max_total_threads_per_threadgroup());
+    let n_threads = numel.div_ceil(elems_per_thread);
+    let tg_size = std::cmp::min(256usize, pipeline.maxTotalThreadsPerThreadgroup());
     enc.dispatch_threads(
-        metal::MTLSize::new(n_threads, 1, 1),
-        metal::MTLSize::new(tg_size, 1, 1),
+        MTLSize { width: n_threads, height: 1, depth: 1 },
+        MTLSize { width: tg_size, height: 1, depth: 1 },
     );
-    enc.end_encoding();
+    enc.end();
     cb.commit();
-    cb.wait_until_completed();
+    cb.waitUntilCompleted();
 
     Ok(out)
 }
 
 /// Return (dtype_suffix, elements_per_thread) for a given dtype.
-fn dtype_info(dtype: DType) -> Result<(&'static str, u64), KernelError> {
+fn dtype_info(dtype: DType) -> Result<(&'static str, usize), KernelError> {
     match dtype {
         DType::Float32 => Ok(("f32", 2)),
         DType::Float16 => Ok(("f16", 4)),
@@ -716,21 +723,13 @@ fn dtype_info(dtype: DType) -> Result<(&'static str, u64), KernelError> {
 }
 
 /// Create a constant `uint` buffer on the device.
-fn make_u32_buf(device: &metal::DeviceRef, val: u32) -> metal::Buffer {
-    device.new_buffer_with_data(
-        &val as *const u32 as *const std::ffi::c_void,
-        4,
-        metal::MTLResourceOptions::StorageModeShared,
-    )
+fn make_u32_buf(device: &ProtocolObject<dyn MTLDevice>, val: u32) -> MtlBuffer {
+    unsafe { device.newBufferWithBytes_length_options(std::ptr::NonNull::new_unchecked(&val as *const u32 as *mut std::ffi::c_void), 4, MTLResourceOptions::StorageModeShared) }.unwrap()
 }
 
 /// Create a constant `float` buffer on the device.
-fn make_f32_buf(device: &metal::DeviceRef, val: f32) -> metal::Buffer {
-    device.new_buffer_with_data(
-        &val as *const f32 as *const std::ffi::c_void,
-        4,
-        metal::MTLResourceOptions::StorageModeShared,
-    )
+fn make_f32_buf(device: &ProtocolObject<dyn MTLDevice>, val: f32) -> MtlBuffer {
+    unsafe { device.newBufferWithBytes_length_options(std::ptr::NonNull::new_unchecked(&val as *const f32 as *mut std::ffi::c_void), 4, MTLResourceOptions::StorageModeShared) }.unwrap()
 }
 
 // ===========================================================================
@@ -747,7 +746,7 @@ impl Activation for SiLU {
         &self,
         input: &Array,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         ops::silu::silu(registry, input, queue)
     }
@@ -766,7 +765,7 @@ impl Activation for GELU {
         &self,
         input: &Array,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         ops::gelu::gelu(registry, input, queue)
     }
@@ -787,7 +786,7 @@ impl Activation for GELUFast {
         &self,
         input: &Array,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         ops::gelu::gelu_fast(registry, input, queue)
     }
@@ -811,7 +810,7 @@ impl Activation for Sigmoid {
         &self,
         input: &Array,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         ops::unary::sigmoid(registry, input, queue)
     }
@@ -829,7 +828,7 @@ impl Activation for Tanh {
         &self,
         input: &Array,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         ops::unary::tanh_op(registry, input, queue)
     }
@@ -851,7 +850,7 @@ impl Activation for ReLU {
         &self,
         input: &Array,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         dispatch_activation_simple(registry, input, "relu", queue)
     }
@@ -891,7 +890,7 @@ impl Activation for LeakyReLU {
         &self,
         input: &Array,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         dispatch_activation_param(registry, input, "leaky_relu", self.alpha, queue)
     }
@@ -931,7 +930,7 @@ impl Activation for ELU {
         &self,
         input: &Array,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         dispatch_activation_param(registry, input, "elu", self.alpha, queue)
     }
@@ -953,7 +952,7 @@ impl Activation for SELU {
         &self,
         input: &Array,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         dispatch_activation_simple(registry, input, "selu", queue)
     }
@@ -971,7 +970,7 @@ impl Activation for Mish {
         &self,
         input: &Array,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         dispatch_activation_simple(registry, input, "mish", queue)
     }
@@ -991,7 +990,7 @@ impl Activation for QuickGELU {
         &self,
         input: &Array,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         ops::gelu::gelu_fast(registry, input, queue)
     }
@@ -1009,7 +1008,7 @@ impl Activation for HardSwish {
         &self,
         input: &Array,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         dispatch_activation_simple(registry, input, "hard_swish", queue)
     }
@@ -1027,7 +1026,7 @@ impl Activation for HardSigmoid {
         &self,
         input: &Array,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         dispatch_activation_simple(registry, input, "hard_sigmoid", queue)
     }
@@ -1067,7 +1066,7 @@ impl Activation for Softplus {
         &self,
         input: &Array,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         dispatch_activation_param(registry, input, "softplus", self.beta, queue)
     }
@@ -1085,7 +1084,7 @@ impl Activation for Softsign {
         &self,
         input: &Array,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         dispatch_activation_simple(registry, input, "softsign", queue)
     }
@@ -1108,7 +1107,7 @@ impl Activation for GLU {
         &self,
         input: &Array,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         let ndim = input.shape().len();
         if ndim == 0 {
@@ -1181,7 +1180,7 @@ impl ActivationType {
         &self,
         input: &Array,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         match self {
             ActivationType::SiLU => SiLU.forward(input, registry, queue),

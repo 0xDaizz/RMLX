@@ -3,9 +3,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use objc2_metal::MTLSharedEvent as _;
 use rmlx_metal::device::GpuDevice;
 use rmlx_metal::event::{EventError, GpuEvent};
-use rmlx_metal::metal::Buffer as MetalBuffer;
+use rmlx_metal::MtlBuffer;
 
 use crate::AllocError;
 
@@ -66,7 +67,7 @@ impl CompletionTicket {
         let gpu_done = if let Some(ref event) = self.gpu_event {
             let target = self.gpu_event_value.load(Ordering::Acquire);
             target == 0
-                || event.raw().signaled_value() >= target
+                || event.raw().signaledValue() >= target
                 || self.gpu_complete.load(Ordering::Acquire)
         } else {
             self.gpu_complete.load(Ordering::Acquire)
@@ -124,7 +125,7 @@ impl CompletionTicket {
         if let Some(ref event) = self.gpu_event {
             let target = self.gpu_event_value.load(Ordering::Acquire);
             target == 0
-                || event.raw().signaled_value() >= target
+                || event.raw().signaledValue() >= target
                 || self.gpu_complete.load(Ordering::Acquire)
         } else {
             self.gpu_complete.load(Ordering::Acquire)
@@ -169,7 +170,7 @@ impl Default for CompletionTicket {
 /// to create a GPU-visible view without any data copy.
 pub struct ZeroCopyBuffer {
     raw_ptr: NonNull<u8>,
-    metal_buffer: MetalBuffer,
+    metal_buffer: MtlBuffer,
     in_flight: Arc<()>,
     size: usize,
     _alignment: usize,
@@ -237,7 +238,7 @@ impl ZeroCopyBuffer {
 
     /// The underlying Metal buffer (for GPU operations).
     #[inline]
-    pub fn metal_buffer(&self) -> &MetalBuffer {
+    pub fn metal_buffer(&self) -> &MtlBuffer {
         &self.metal_buffer
     }
 

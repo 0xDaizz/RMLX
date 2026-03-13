@@ -26,24 +26,24 @@
 /// 13 gate_result [M, N]  (fused SwiGLU epilogue)
 /// ```
 pub mod gemm {
-    pub const A: u64 = 0;
-    pub const B: u64 = 1;
-    pub const OUT: u64 = 2;
-    pub const M: u64 = 3;
-    pub const N: u64 = 4;
-    pub const K: u64 = 5;
-    pub const BATCH_STRIDE_A: u64 = 6;
-    pub const BATCH_STRIDE_B: u64 = 7;
-    pub const BATCH_STRIDE_C: u64 = 8;
-    pub const SWIZZLE_LOG: u64 = 9;
+    pub const A: usize = 0;
+    pub const B: usize = 1;
+    pub const OUT: usize = 2;
+    pub const M: usize = 3;
+    pub const N: usize = 4;
+    pub const K: usize = 5;
+    pub const BATCH_STRIDE_A: usize = 6;
+    pub const BATCH_STRIDE_B: usize = 7;
+    pub const BATCH_STRIDE_C: usize = 8;
+    pub const SWIZZLE_LOG: usize = 9;
     /// Residual tensor for fused GEMM + residual-add epilogue.
-    pub const RESIDUAL: u64 = 10;
+    pub const RESIDUAL: usize = 10;
     /// RMSNorm weight vector for fused norm-GEMM.
-    pub const NORM_WEIGHT: u64 = 11;
+    pub const NORM_WEIGHT: usize = 11;
     /// Pre-computed inverse-RMS values for fused norm-GEMM.
-    pub const INV_RMS: u64 = 12;
+    pub const INV_RMS: usize = 12;
     /// Gate result for fused SwiGLU epilogue.
-    pub const GATE_RESULT: u64 = 13;
+    pub const GATE_RESULT: usize = 13;
 }
 
 /// Split-K GEMM pass-1 kernel.
@@ -59,13 +59,13 @@ pub mod gemm {
 /// 6  N_SPLITS  (u32)
 /// ```
 pub mod splitk {
-    pub const A: u64 = 0;
-    pub const B: u64 = 1;
-    pub const PARTIAL: u64 = 2;
-    pub const M: u64 = 3;
-    pub const N: u64 = 4;
-    pub const K: u64 = 5;
-    pub const N_SPLITS: u64 = 6;
+    pub const A: usize = 0;
+    pub const B: usize = 1;
+    pub const PARTIAL: usize = 2;
+    pub const M: usize = 3;
+    pub const N: usize = 4;
+    pub const K: usize = 5;
+    pub const N_SPLITS: usize = 6;
 }
 
 /// Split-K reduce (pass-2) kernel.
@@ -79,11 +79,11 @@ pub mod splitk {
 /// 4  N_SPLITS  (u32)
 /// ```
 pub mod splitk_reduce {
-    pub const PARTIAL: u64 = 0;
-    pub const OUT: u64 = 1;
-    pub const M: u64 = 2;
-    pub const N: u64 = 3;
-    pub const N_SPLITS: u64 = 4;
+    pub const PARTIAL: usize = 0;
+    pub const OUT: usize = 1;
+    pub const M: usize = 2;
+    pub const N: usize = 3;
+    pub const N_SPLITS: usize = 4;
 }
 
 /// Grouped GEMM for MoE (single-pass, no Split-K).
@@ -100,14 +100,14 @@ pub mod splitk_reduce {
 /// 7  N           (u32)
 /// ```
 pub mod grouped_gemm {
-    pub const A_STACKED: u64 = 0;
-    pub const B_STACKED: u64 = 1;
-    pub const OUT: u64 = 2;
-    pub const OFFSETS: u64 = 3;
-    pub const TILE_MAP: u64 = 4;
-    pub const TILE_OFF: u64 = 5;
-    pub const K: u64 = 6;
-    pub const N: u64 = 7;
+    pub const A_STACKED: usize = 0;
+    pub const B_STACKED: usize = 1;
+    pub const OUT: usize = 2;
+    pub const OFFSETS: usize = 3;
+    pub const TILE_MAP: usize = 4;
+    pub const TILE_OFF: usize = 5;
+    pub const K: usize = 6;
+    pub const N: usize = 7;
 }
 
 /// Grouped Split-K GEMM pass-1 (MoE with K-splitting).
@@ -128,16 +128,16 @@ pub mod grouped_gemm {
 /// 9  N_SPLITS    (u32)
 /// ```
 pub mod grouped_splitk {
-    pub const A_STACKED: u64 = 0;
-    pub const B_STACKED: u64 = 1;
-    pub const PARTIAL: u64 = 2;
-    pub const OFFSETS: u64 = 3;
-    pub const TILE_MAP: u64 = 4;
-    pub const TILE_OFF: u64 = 5;
-    pub const K: u64 = 6;
-    pub const N: u64 = 7;
-    pub const TOTAL_M: u64 = 8;
-    pub const N_SPLITS: u64 = 9;
+    pub const A_STACKED: usize = 0;
+    pub const B_STACKED: usize = 1;
+    pub const PARTIAL: usize = 2;
+    pub const OFFSETS: usize = 3;
+    pub const TILE_MAP: usize = 4;
+    pub const TILE_OFF: usize = 5;
+    pub const K: usize = 6;
+    pub const N: usize = 7;
+    pub const TOTAL_M: usize = 8;
+    pub const N_SPLITS: usize = 9;
 }
 
 /// RMS normalization kernel (standard 3-buffer layout).
@@ -153,13 +153,13 @@ pub mod grouped_splitk {
 /// 6  HAS_W      (u32, 0 or 1)
 /// ```
 pub mod rms_norm {
-    pub const INPUT: u64 = 0;
-    pub const WEIGHT: u64 = 1;
-    pub const OUT: u64 = 2;
-    pub const AXIS_SIZE: u64 = 3;
-    pub const EPS: u64 = 4;
-    pub const W_STRIDE: u64 = 5;
-    pub const HAS_W: u64 = 6;
+    pub const INPUT: usize = 0;
+    pub const WEIGHT: usize = 1;
+    pub const OUT: usize = 2;
+    pub const AXIS_SIZE: usize = 3;
+    pub const EPS: usize = 4;
+    pub const W_STRIDE: usize = 5;
+    pub const HAS_W: usize = 6;
 }
 
 /// Fused RMSNorm + residual-add kernel.
@@ -176,14 +176,14 @@ pub mod rms_norm {
 /// 7  HAS_W      (u32)
 /// ```
 pub mod rms_norm_residual {
-    pub const INPUT: u64 = 0;
-    pub const RESIDUAL: u64 = 1;
-    pub const WEIGHT: u64 = 2;
-    pub const OUT: u64 = 3;
-    pub const AXIS_SIZE: u64 = 4;
-    pub const EPS: u64 = 5;
-    pub const W_STRIDE: u64 = 6;
-    pub const HAS_W: u64 = 7;
+    pub const INPUT: usize = 0;
+    pub const RESIDUAL: usize = 1;
+    pub const WEIGHT: usize = 2;
+    pub const OUT: usize = 3;
+    pub const AXIS_SIZE: usize = 4;
+    pub const EPS: usize = 5;
+    pub const W_STRIDE: usize = 6;
+    pub const HAS_W: usize = 7;
 }
 
 /// Inverse-RMS kernel (used by fused norm-GEMM).
@@ -196,10 +196,10 @@ pub mod rms_norm_residual {
 /// 3  EPS        (f32)
 /// ```
 pub mod inv_rms {
-    pub const INPUT: u64 = 0;
-    pub const OUT: u64 = 1;
-    pub const AXIS_SIZE: u64 = 2;
-    pub const EPS: u64 = 3;
+    pub const INPUT: usize = 0;
+    pub const OUT: usize = 1;
+    pub const AXIS_SIZE: usize = 2;
+    pub const EPS: usize = 3;
 }
 
 /// Fused SiLU-gate (element-wise `silu(gate) * up`).
@@ -212,10 +212,10 @@ pub mod inv_rms {
 /// 3  NUMEL      (u32)
 /// ```
 pub mod silu_gate {
-    pub const GATE_OUT: u64 = 0;
-    pub const UP_OUT: u64 = 1;
-    pub const OUT: u64 = 2;
-    pub const NUMEL: u64 = 3;
+    pub const GATE_OUT: usize = 0;
+    pub const UP_OUT: usize = 1;
+    pub const OUT: usize = 2;
+    pub const NUMEL: usize = 3;
 }
 
 /// Fused SiLU-gate strided (merged gate+up tensor).
@@ -229,11 +229,11 @@ pub mod silu_gate {
 /// 4  SEQ_LEN    (u32)
 /// ```
 pub mod silu_gate_strided {
-    pub const MERGED: u64 = 0;
-    pub const OUT: u64 = 1;
-    pub const GATE_DIM: u64 = 2;
-    pub const TOTAL_DIM: u64 = 3;
-    pub const SEQ_LEN: u64 = 4;
+    pub const MERGED: usize = 0;
+    pub const OUT: usize = 1;
+    pub const GATE_DIM: usize = 2;
+    pub const TOTAL_DIM: usize = 3;
+    pub const SEQ_LEN: usize = 4;
 }
 
 /// Fused SwiGLU down-projection GEMV.
@@ -248,12 +248,12 @@ pub mod silu_gate_strided {
 /// 5  BIAS       residual / h_buf
 /// ```
 pub mod fused_swiglu_down {
-    pub const MAT: u64 = 0;
-    pub const GATE_UP: u64 = 1;
-    pub const OUT: u64 = 2;
-    pub const M: u64 = 3;
-    pub const K: u64 = 4;
-    pub const BIAS: u64 = 5;
+    pub const MAT: usize = 0;
+    pub const GATE_UP: usize = 1;
+    pub const OUT: usize = 2;
+    pub const M: usize = 3;
+    pub const K: usize = 4;
+    pub const BIAS: usize = 5;
 }
 
 /// Fused RMSNorm + GEMV kernel.
@@ -270,14 +270,14 @@ pub mod fused_swiglu_down {
 /// 7  W_STRIDE   (u32)
 /// ```
 pub mod fused_rms_gemv {
-    pub const INPUT: u64 = 0;
-    pub const NORM_W: u64 = 1;
-    pub const MAT: u64 = 2;
-    pub const OUT: u64 = 3;
-    pub const M: u64 = 4;
-    pub const K: u64 = 5;
-    pub const EPS: u64 = 6;
-    pub const W_STRIDE: u64 = 7;
+    pub const INPUT: usize = 0;
+    pub const NORM_W: usize = 1;
+    pub const MAT: usize = 2;
+    pub const OUT: usize = 3;
+    pub const M: usize = 4;
+    pub const K: usize = 5;
+    pub const EPS: usize = 6;
+    pub const W_STRIDE: usize = 7;
 }
 
 // =========================================================================
@@ -300,14 +300,14 @@ pub mod fused_rms_gemv {
 /// 6  SPLITK_PARAMS (split-K only) (k_partitions, k_per_part)
 /// ```
 pub mod qmv {
-    pub const WEIGHTS: u64 = 0;
-    pub const SCALES: u64 = 1;
-    pub const BIASES: u64 = 2;
-    pub const INPUT: u64 = 3;
-    pub const OUTPUT: u64 = 4;
-    pub const PARAMS: u64 = 5;
+    pub const WEIGHTS: usize = 0;
+    pub const SCALES: usize = 1;
+    pub const BIASES: usize = 2;
+    pub const INPUT: usize = 3;
+    pub const OUTPUT: usize = 4;
+    pub const PARAMS: usize = 5;
     /// Split-K phase 1 only: (k_partitions, k_per_part).
-    pub const SPLITK_PARAMS: u64 = 6;
+    pub const SPLITK_PARAMS: usize = 6;
 }
 
 /// QMM MMA kernels (affine_qmm_mma_q4, affine_qmm_mma_f16_q4, etc.).
@@ -331,24 +331,24 @@ pub mod qmv {
 /// 12 GATE_RESULT   [M, N] (fused SwiGLU, unused → dummy)
 /// ```
 pub mod qmm_mma {
-    pub const X: u64 = 0;
-    pub const WEIGHTS: u64 = 1;
-    pub const SCALES: u64 = 2;
-    pub const BIASES: u64 = 3;
-    pub const OUT: u64 = 4;
-    pub const M: u64 = 5;
-    pub const N: u64 = 6;
-    pub const K: u64 = 7;
+    pub const X: usize = 0;
+    pub const WEIGHTS: usize = 1;
+    pub const SCALES: usize = 2;
+    pub const BIASES: usize = 3;
+    pub const OUT: usize = 4;
+    pub const M: usize = 5;
+    pub const N: usize = 6;
+    pub const K: usize = 7;
     /// Swizzle log (standard MMA) or k_partitions (tiny/skinny).
-    pub const SWIZZLE_LOG: u64 = 8;
+    pub const SWIZZLE_LOG: usize = 8;
     /// RMSNorm weight (fused norm-QMM, else dummy).
-    pub const NORM_WEIGHT: u64 = 9;
+    pub const NORM_WEIGHT: usize = 9;
     /// Pre-computed inverse-RMS (fused norm-QMM, else dummy).
-    pub const INV_RMS: u64 = 10;
+    pub const INV_RMS: usize = 10;
     /// Residual tensor (fused residual-add, else dummy).
-    pub const RESIDUAL: u64 = 11;
+    pub const RESIDUAL: usize = 11;
     /// Gate result for fused SwiGLU (else dummy).
-    pub const GATE_RESULT: u64 = 12;
+    pub const GATE_RESULT: usize = 12;
 }
 
 /// QMM Steel Split-K kernels (affine_qmm_steel_splitk_q4, steel4sg).
@@ -365,14 +365,14 @@ pub mod qmm_mma {
 /// 7  SPLIT_PARAMS  (k_partition_size, k_partitions) as [u32; 2]
 /// ```
 pub mod qmm_steel_splitk {
-    pub const X: u64 = 0;
-    pub const WEIGHTS: u64 = 1;
-    pub const SCALES: u64 = 2;
-    pub const BIASES: u64 = 3;
-    pub const PARTIAL: u64 = 4;
-    pub const OUT: u64 = 5;
-    pub const PARAMS: u64 = 6;
-    pub const SPLIT_PARAMS: u64 = 7;
+    pub const X: usize = 0;
+    pub const WEIGHTS: usize = 1;
+    pub const SCALES: usize = 2;
+    pub const BIASES: usize = 3;
+    pub const PARTIAL: usize = 4;
+    pub const OUT: usize = 5;
+    pub const PARAMS: usize = 6;
+    pub const SPLIT_PARAMS: usize = 7;
 }
 
 /// QMM Steel kernels (affine_qmm_steel_q4) — non-split-K variant.
@@ -392,19 +392,19 @@ pub mod qmm_steel_splitk {
 /// 10 GATE_RESULT   [M, N] (fused SwiGLU, else dummy)
 /// ```
 pub mod qmm_steel {
-    pub const X: u64 = 0;
-    pub const WEIGHTS: u64 = 1;
-    pub const SCALES: u64 = 2;
-    pub const BIASES: u64 = 3;
-    pub const OUT: u64 = 4;
-    pub const M: u64 = 5;
-    pub const N: u64 = 6;
-    pub const K: u64 = 7;
-    pub const SWIZZLE_LOG: u64 = 8;
+    pub const X: usize = 0;
+    pub const WEIGHTS: usize = 1;
+    pub const SCALES: usize = 2;
+    pub const BIASES: usize = 3;
+    pub const OUT: usize = 4;
+    pub const M: usize = 5;
+    pub const N: usize = 6;
+    pub const K: usize = 7;
+    pub const SWIZZLE_LOG: usize = 8;
     /// Residual tensor (fused residual-add, else dummy).
-    pub const RESIDUAL: u64 = 9;
+    pub const RESIDUAL: usize = 9;
     /// Gate result for fused SwiGLU (else dummy).
-    pub const GATE_RESULT: u64 = 10;
+    pub const GATE_RESULT: usize = 10;
 }
 
 /// QMM NAX kernels (affine_qmm_nax_q4, affine_qmm_nax_v2_q4).
@@ -421,14 +421,14 @@ pub mod qmm_steel {
 /// 7  K             (u32)
 /// ```
 pub mod qmm_nax {
-    pub const X: u64 = 0;
-    pub const WEIGHTS: u64 = 1;
-    pub const SCALES: u64 = 2;
-    pub const BIASES: u64 = 3;
-    pub const OUT: u64 = 4;
-    pub const M: u64 = 5;
-    pub const N: u64 = 6;
-    pub const K: u64 = 7;
+    pub const X: usize = 0;
+    pub const WEIGHTS: usize = 1;
+    pub const SCALES: usize = 2;
+    pub const BIASES: usize = 3;
+    pub const OUT: usize = 4;
+    pub const M: usize = 5;
+    pub const N: usize = 6;
+    pub const K: usize = 7;
 }
 
 /// QMM Skinny f16 kernels (affine_qmm_skinny_f16_q4).
@@ -447,16 +447,16 @@ pub mod qmm_nax {
 /// 9  PARTIAL       partial sums buffer (or dummy when k_partitions==1)
 /// ```
 pub mod qmm_skinny {
-    pub const X: u64 = 0;
-    pub const WEIGHTS: u64 = 1;
-    pub const SCALES: u64 = 2;
-    pub const BIASES: u64 = 3;
-    pub const OUT: u64 = 4;
-    pub const M: u64 = 5;
-    pub const N: u64 = 6;
-    pub const K: u64 = 7;
-    pub const K_PARTITIONS: u64 = 8;
-    pub const PARTIAL: u64 = 9;
+    pub const X: usize = 0;
+    pub const WEIGHTS: usize = 1;
+    pub const SCALES: usize = 2;
+    pub const BIASES: usize = 3;
+    pub const OUT: usize = 4;
+    pub const M: usize = 5;
+    pub const N: usize = 6;
+    pub const K: usize = 7;
+    pub const K_PARTITIONS: usize = 8;
+    pub const PARTIAL: usize = 9;
 }
 
 /// QMM Legacy scalar kernel (affine_qmm, affine_qmm_mma_q8).
@@ -471,12 +471,12 @@ pub mod qmm_skinny {
 /// 5  PARAMS        packed params (M, N, K, group_size)
 /// ```
 pub mod qmm_legacy {
-    pub const X: u64 = 0;
-    pub const WEIGHTS: u64 = 1;
-    pub const SCALES: u64 = 2;
-    pub const BIASES: u64 = 3;
-    pub const OUT: u64 = 4;
-    pub const PARAMS: u64 = 5;
+    pub const X: usize = 0;
+    pub const WEIGHTS: usize = 1;
+    pub const SCALES: usize = 2;
+    pub const BIASES: usize = 3;
+    pub const OUT: usize = 4;
+    pub const PARAMS: usize = 5;
 }
 
 /// QMM Split-K reduce kernels (qmm_splitk_accum, steel_splitk_reduce).
@@ -488,9 +488,9 @@ pub mod qmm_legacy {
 /// 2  PARAMS        (N, k_partitions, partition_stride)
 /// ```
 pub mod qmm_splitk_reduce {
-    pub const PARTIAL: u64 = 0;
-    pub const OUT: u64 = 1;
-    pub const PARAMS: u64 = 2;
+    pub const PARTIAL: usize = 0;
+    pub const OUT: usize = 1;
+    pub const PARAMS: usize = 2;
 }
 
 /// Tiny/Skinny QMM reduce kernels (tiny_qmm_reduce, skinny_qmm_f16_reduce).
@@ -504,11 +504,11 @@ pub mod qmm_splitk_reduce {
 /// 4  MN_TOTAL      (u32) = M * N
 /// ```
 pub mod qmm_tiny_reduce {
-    pub const PARTIAL: u64 = 0;
-    pub const OUT: u64 = 1;
-    pub const N: u64 = 2;
-    pub const K_PARTITIONS: u64 = 3;
-    pub const MN_TOTAL: u64 = 4;
+    pub const PARTIAL: usize = 0;
+    pub const OUT: usize = 1;
+    pub const N: usize = 2;
+    pub const K_PARTITIONS: usize = 3;
+    pub const MN_TOTAL: usize = 4;
 }
 
 /// GatherQMM scalar kernel (index-based QMM for MoE).
@@ -529,18 +529,18 @@ pub mod qmm_tiny_reduce {
 /// 11 N_EXPERTS     (u32)
 /// ```
 pub mod gather_qmm {
-    pub const X: u64 = 0;
-    pub const WEIGHTS: u64 = 1;
-    pub const SCALES: u64 = 2;
-    pub const BIASES: u64 = 3;
-    pub const INDICES: u64 = 4;
-    pub const OUT: u64 = 5;
-    pub const BATCH: u64 = 6;
-    pub const M: u64 = 7;
-    pub const N: u64 = 8;
-    pub const K: u64 = 9;
-    pub const GROUP_SIZE: u64 = 10;
-    pub const N_EXPERTS: u64 = 11;
+    pub const X: usize = 0;
+    pub const WEIGHTS: usize = 1;
+    pub const SCALES: usize = 2;
+    pub const BIASES: usize = 3;
+    pub const INDICES: usize = 4;
+    pub const OUT: usize = 5;
+    pub const BATCH: usize = 6;
+    pub const M: usize = 7;
+    pub const N: usize = 8;
+    pub const K: usize = 9;
+    pub const GROUP_SIZE: usize = 10;
+    pub const N_EXPERTS: usize = 11;
 }
 
 /// GatherQMV fast kernels (gather_qmv_fast_q4, gather_qmv_fast_f16_q4).
@@ -556,13 +556,13 @@ pub mod gather_qmm {
 /// 6  PARAMS        (N, K, group_size, batch)
 /// ```
 pub mod gather_qmv {
-    pub const X: u64 = 0;
-    pub const WEIGHTS: u64 = 1;
-    pub const SCALES: u64 = 2;
-    pub const BIASES: u64 = 3;
-    pub const INDICES: u64 = 4;
-    pub const OUT: u64 = 5;
-    pub const PARAMS: u64 = 6;
+    pub const X: usize = 0;
+    pub const WEIGHTS: usize = 1;
+    pub const SCALES: usize = 2;
+    pub const BIASES: usize = 3;
+    pub const INDICES: usize = 4;
+    pub const OUT: usize = 5;
+    pub const PARAMS: usize = 6;
 }
 
 /// AWQ dequantization kernel (awq_dequant_q4).
@@ -576,11 +576,11 @@ pub mod gather_qmv {
 /// 4  PARAMS        (rows, cols, group_size, cols_div8)
 /// ```
 pub mod awq {
-    pub const QWEIGHT: u64 = 0;
-    pub const QZEROS: u64 = 1;
-    pub const SCALES: u64 = 2;
-    pub const OUT: u64 = 3;
-    pub const PARAMS: u64 = 4;
+    pub const QWEIGHT: usize = 0;
+    pub const QZEROS: usize = 1;
+    pub const SCALES: usize = 2;
+    pub const OUT: usize = 3;
+    pub const PARAMS: usize = 4;
 }
 
 /// AWQ dequantization with g_idx reorder.
@@ -595,12 +595,12 @@ pub mod awq {
 /// 5  PARAMS        (rows, cols, group_size, cols_div8)
 /// ```
 pub mod awq_gidx {
-    pub const QWEIGHT: u64 = 0;
-    pub const QZEROS: u64 = 1;
-    pub const SCALES: u64 = 2;
-    pub const G_IDX: u64 = 3;
-    pub const OUT: u64 = 4;
-    pub const PARAMS: u64 = 5;
+    pub const QWEIGHT: usize = 0;
+    pub const QZEROS: usize = 1;
+    pub const SCALES: usize = 2;
+    pub const G_IDX: usize = 3;
+    pub const OUT: usize = 4;
+    pub const PARAMS: usize = 5;
 }
 
 // =========================================================================
@@ -623,13 +623,13 @@ pub mod awq_gidx {
 /// 6  SCALE         softmax scale factor (f32)
 /// ```
 pub mod sdpa {
-    pub const Q: u64 = 0;
-    pub const K: u64 = 1;
-    pub const V: u64 = 2;
-    pub const OUT: u64 = 3;
-    pub const MASK: u64 = 4;
-    pub const PARAMS: u64 = 5;
-    pub const SCALE: u64 = 6;
+    pub const Q: usize = 0;
+    pub const K: usize = 1;
+    pub const V: usize = 2;
+    pub const OUT: usize = 3;
+    pub const MASK: usize = 4;
+    pub const PARAMS: usize = 5;
+    pub const SCALE: usize = 6;
 }
 
 /// SDPA MMA prefill kernels (sdpa_prefill_mma_f16, sdpa_prefill_mma_bk32_f16).
@@ -652,20 +652,20 @@ pub mod sdpa {
 /// 13 V_ROW_STRIDE  V row stride (u32)
 /// ```
 pub mod sdpa_mma {
-    pub const Q: u64 = 0;
-    pub const K: u64 = 1;
-    pub const V: u64 = 2;
-    pub const OUT: u64 = 3;
-    pub const MASK: u64 = 4;
-    pub const N: u64 = 5;
-    pub const S: u64 = 6;
-    pub const D: u64 = 7;
-    pub const GQA_FACTOR: u64 = 8;
-    pub const SCALE: u64 = 9;
-    pub const STRIDE_S: u64 = 10;
-    pub const NUM_Q_HEADS: u64 = 11;
-    pub const V_HEAD_STRIDE: u64 = 12;
-    pub const V_ROW_STRIDE: u64 = 13;
+    pub const Q: usize = 0;
+    pub const K: usize = 1;
+    pub const V: usize = 2;
+    pub const OUT: usize = 3;
+    pub const MASK: usize = 4;
+    pub const N: usize = 5;
+    pub const S: usize = 6;
+    pub const D: usize = 7;
+    pub const GQA_FACTOR: usize = 8;
+    pub const SCALE: usize = 9;
+    pub const STRIDE_S: usize = 10;
+    pub const NUM_Q_HEADS: usize = 11;
+    pub const V_HEAD_STRIDE: usize = 12;
+    pub const V_ROW_STRIDE: usize = 13;
 }
 
 /// SDPA NAX prefill kernels (sdpa_prefill_nax_f16) — no mask buffer.
@@ -687,19 +687,19 @@ pub mod sdpa_mma {
 /// 12 V_ROW_STRIDE  V row stride (u32)
 /// ```
 pub mod sdpa_nax {
-    pub const Q: u64 = 0;
-    pub const K: u64 = 1;
-    pub const V: u64 = 2;
-    pub const OUT: u64 = 3;
-    pub const N: u64 = 4;
-    pub const S: u64 = 5;
-    pub const D: u64 = 6;
-    pub const GQA_FACTOR: u64 = 7;
-    pub const SCALE: u64 = 8;
-    pub const STRIDE_S: u64 = 9;
-    pub const NUM_Q_HEADS: u64 = 10;
-    pub const V_HEAD_STRIDE: u64 = 11;
-    pub const V_ROW_STRIDE: u64 = 12;
+    pub const Q: usize = 0;
+    pub const K: usize = 1;
+    pub const V: usize = 2;
+    pub const OUT: usize = 3;
+    pub const N: usize = 4;
+    pub const S: usize = 5;
+    pub const D: usize = 6;
+    pub const GQA_FACTOR: usize = 7;
+    pub const SCALE: usize = 8;
+    pub const STRIDE_S: usize = 9;
+    pub const NUM_Q_HEADS: usize = 10;
+    pub const V_HEAD_STRIDE: usize = 11;
+    pub const V_ROW_STRIDE: usize = 12;
 }
 
 /// SDPA diagnostic QKT kernel (sdpa_nax_diag_qkt_f16).
@@ -715,13 +715,13 @@ pub mod sdpa_nax {
 /// 6  SCALE         softmax scale (f32)
 /// ```
 pub mod sdpa_diag_qkt {
-    pub const Q: u64 = 0;
-    pub const K: u64 = 1;
-    pub const OUT: u64 = 2;
-    pub const N: u64 = 3;
-    pub const S: u64 = 4;
-    pub const D: u64 = 5;
-    pub const SCALE: u64 = 6;
+    pub const Q: usize = 0;
+    pub const K: usize = 1;
+    pub const OUT: usize = 2;
+    pub const N: usize = 3;
+    pub const S: usize = 4;
+    pub const D: usize = 5;
+    pub const SCALE: usize = 6;
 }
 
 /// SDPA diagnostic single-MMA kernel (sdpa_nax_diag_single_mma).
@@ -733,7 +733,7 @@ pub mod sdpa_diag_qkt {
 /// 2  OUT           [16, 32] f32
 /// ```
 pub mod sdpa_diag_single_mma {
-    pub const Q: u64 = 0;
-    pub const K: u64 = 1;
-    pub const OUT: u64 = 2;
+    pub const Q: usize = 0;
+    pub const K: usize = 1;
+    pub const OUT: usize = 2;
 }

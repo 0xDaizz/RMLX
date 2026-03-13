@@ -6,6 +6,8 @@
 use rmlx_core::array::Array;
 use rmlx_core::kernels::{KernelError, KernelRegistry};
 use rmlx_core::ops;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLCommandQueue};
 
 // ============================================================================
 // Conv1d
@@ -136,7 +138,7 @@ impl Conv1d {
         &self,
         input: &Array,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         let weight = self
             .weight
@@ -313,7 +315,7 @@ impl Conv2d {
         &self,
         input: &Array,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         let weight = self
             .weight

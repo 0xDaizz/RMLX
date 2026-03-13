@@ -10,7 +10,14 @@
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
-use metal::MTLSize;
+use rmlx_metal::MTLSize;
+use rmlx_metal::ComputePass;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLComputePipelineState as _;
+use objc2_metal::MTLCommandBuffer as _;
+use objc2_metal::MTLCommandQueue as _;
+use objc2_metal::MTLDevice as _;
+use rmlx_metal::MTLResourceOptions;
 
 // ---------------------------------------------------------------------------
 // Metal shader source
@@ -341,34 +348,22 @@ pub fn register(registry: &KernelRegistry) -> Result<(), KernelError> {
 }
 
 /// Create a constant buffer on the device.
-fn make_const_buf<T: Copy>(device: &metal::DeviceRef, val: T) -> metal::Buffer {
-    let size = std::mem::size_of::<T>() as u64;
-    device.new_buffer_with_data(
-        &val as *const T as *const std::ffi::c_void,
-        size,
-        metal::MTLResourceOptions::StorageModeShared,
-    )
+pub(crate) fn make_const_buf<T: Copy>(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, val: T) -> rmlx_metal::MtlBuffer {
+    let size = std::mem::size_of::<T>();
+    unsafe { device.newBufferWithBytes_length_options(std::ptr::NonNull::new(&val as *const T as *const std::ffi::c_void as *mut std::ffi::c_void).unwrap(), size, MTLResourceOptions::StorageModeShared).unwrap() }
 }
 
-/// Apply Layer Normalization: `y = (x - mean) / sqrt(var + eps) * weight + bias`.
-///
-/// - `input` shape: `[rows, axis_size]` (2-D).
-/// - `weight` shape: `[axis_size]` (1-D), or `None` for weight-free normalisation.
-/// - `bias` shape: `[axis_size]` (1-D), or `None` for bias-free normalisation.
-/// - `eps`: small constant for numerical stability.
+/// Apply Layer Normalization: `y = (x - mean) / sqrt(var + eps) * weight + bias`. /// /// - `input` shape: `[rows, axis_size]` (2-D). /// - `weight` shape: `[axis_size]` (1-D), or `None` for weight-free normalisation. /// - `bias` shape: `[axis_size]` (1-D), or `None` for bias-free normalisation. /// - `eps`: small constant for numerical stability. pub
 pub fn layer_norm(
     registry: &KernelRegistry,
     input: &Array,
     weight: Option<&Array>,
     bias: Option<&Array>,
     eps: f32,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
-    if input.ndim() != 2 {
-        return Err(KernelError::InvalidShape(format!(
-            "layer_norm requires 2D input, got {}D",
-            input.ndim()
-        )));
+    if input.ndim() != 2 { return Err(KernelError::InvalidShape(format!( "layer_norm requires 2D input, got {}D", input.ndim() )));
+
     }
 
     let axis_size_usize = input.shape()[1];
@@ -443,21 +438,21 @@ pub fn layer_norm(
     let has_w_buf = make_const_buf(dev, has_w);
     let has_b_buf = make_const_buf(dev, has_b);
 
-    let cb = queue.new_command_buffer();
-    let encoder = cb.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
-
+    let cb = queue.commandBuffer().unwrap();
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let encoder = ComputePass::new(&raw_enc);
+    encoder.set_pipeline(&pipeline);
+    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset());
     // Weight buffer (dummy if not present)
     if let Some(w) = weight_resolved {
-        encoder.set_buffer(1, Some(w.metal_buffer()), w.offset() as u64);
+        encoder.set_buffer(1, Some(w.metal_buffer()), w.offset());
     } else {
         encoder.set_buffer(1, Some(input.metal_buffer()), 0);
     }
 
     // Bias buffer (dummy if not present)
     if let Some(b) = bias_resolved {
-        encoder.set_buffer(2, Some(b.metal_buffer()), b.offset() as u64);
+        encoder.set_buffer(2, Some(b.metal_buffer()), b.offset());
     } else {
         encoder.set_buffer(2, Some(input.metal_buffer()), 0);
     }
@@ -467,11 +462,10 @@ pub fn layer_norm(
     encoder.set_buffer(5, Some(&eps_buf), 0);
     encoder.set_buffer(6, Some(&has_w_buf), 0);
     encoder.set_buffer(7, Some(&has_b_buf), 0);
-
-    let tg_size = std::cmp::min(1024, pipeline.max_total_threads_per_threadgroup());
-    encoder.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), MTLSize::new(tg_size, 1, 1));
-    encoder.end_encoding();
-    super::commit_with_mode(cb, super::ExecMode::Sync);
+    let tg_size = std::cmp::min(1024, pipeline.maxTotalThreadsPerThreadgroup());
+    encoder.dispatch_threadgroups(MTLSize { width: rows as usize, height: 1, depth: 1 }, MTLSize { width: tg_size, height: 1, depth: 1 });
+    encoder.end();
+    super::commit_with_mode(&cb, super::ExecMode::Sync);
 
     Ok(out)
 }

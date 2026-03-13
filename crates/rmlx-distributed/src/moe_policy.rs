@@ -80,7 +80,7 @@ impl MoePolicy {
     /// - `RMLX_MOE_GPU_N_MIN`: override GPU min batch size threshold
     /// - `RMLX_MOE_GPU_SWITCH_BYTES`: override byte threshold for GPU switching
     pub fn new() -> Self {
-        let metal_available = metal::Device::system_default().is_some();
+        let metal_available = objc2_metal::MTLCreateSystemDefaultDevice().is_some();
 
         let mut cpu_max: u32 = 64;
         let mut gpu_min: u32 = 320;

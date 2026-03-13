@@ -11,7 +11,9 @@ use rmlx_core::dtype::DType;
 use rmlx_core::kernels::{KernelError, KernelRegistry};
 use rmlx_core::ops;
 
-use metal::MTLSize;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice};
+use rmlx_metal::{MTLSize, MTLResourceOptions, MtlBuffer};
 
 // ---------------------------------------------------------------------------
 // Fused dequant+scatter Metal shader
@@ -176,7 +178,7 @@ pub fn register(registry: &KernelRegistry) -> Result<(), KernelError> {
 pub fn quantize_for_dispatch(
     registry: &KernelRegistry,
     tokens: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
 ) -> Result<Fp8DispatchPayload, KernelError> {
     if tokens.dtype() != DType::Float16 {
         return Err(KernelError::InvalidShape(format!(
@@ -214,7 +216,7 @@ pub fn dequantize_received(
     fp8_data: &Array,
     scales: &Array,
     hidden_dim: usize,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     if fp8_data.dtype() != DType::Float8E4M3 {
         return Err(KernelError::InvalidShape(format!(
@@ -270,12 +272,16 @@ pub fn wire_bytes(num_tokens: usize, hidden_dim: usize, dtype: DType) -> (usize,
 // ---------------------------------------------------------------------------
 
 /// Create a constant `uint` buffer on the device.
-fn make_u32_buf(device: &metal::DeviceRef, val: u32) -> metal::Buffer {
-    device.new_buffer_with_data(
-        &val as *const u32 as *const std::ffi::c_void,
-        4,
-        metal::MTLResourceOptions::StorageModeShared,
-    )
+fn make_u32_buf(device: &ProtocolObject<dyn MTLDevice>, val: u32) -> MtlBuffer {
+    let ptr = std::ptr::NonNull::new(&val as *const u32 as *mut std::ffi::c_void).unwrap();
+    unsafe {
+        device.newBufferWithBytes_length_options(
+            ptr,
+            4,
+            MTLResourceOptions::StorageModeShared,
+        )
+    }
+    .unwrap()
 }
 
 /// Fused receive kernel: dequant + scatter in one pass.
@@ -297,7 +303,7 @@ pub fn dequant_scatter_fp8e4m3(
     scatter_indices: &Array,
     hidden_dim: usize,
     output: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
 ) -> Result<(), KernelError> {
     // Validate packet_data
     if packet_data.dtype() != DType::Float8E4M3 {
@@ -368,34 +374,28 @@ pub fn dequant_scatter_fp8e4m3(
     let tokens_buf = make_u32_buf(device, num_tokens as u32);
     let dim_buf = make_u32_buf(device, hidden_dim as u32);
 
-    let command_buffer = queue.new_command_buffer();
-    let encoder = command_buffer.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(
-        0,
-        Some(packet_data.metal_buffer()),
-        packet_data.offset() as u64,
-    );
-    encoder.set_buffer(1, Some(scales.metal_buffer()), scales.offset() as u64);
-    encoder.set_buffer(
-        2,
-        Some(scatter_indices.metal_buffer()),
-        scatter_indices.offset() as u64,
-    );
-    encoder.set_buffer(3, Some(output.metal_buffer()), output.offset() as u64);
-    encoder.set_buffer(4, Some(&tokens_buf), 0);
-    encoder.set_buffer(5, Some(&dim_buf), 0);
+    let command_buffer = queue.commandBuffer().unwrap();
+    let encoder = command_buffer.computeCommandEncoder().unwrap();
+    encoder.setComputePipelineState(&pipeline);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(packet_data.metal_buffer()), packet_data.offset(), 0);
+        encoder.setBuffer_offset_atIndex(Some(scales.metal_buffer()), scales.offset(), 1);
+        encoder.setBuffer_offset_atIndex(Some(scatter_indices.metal_buffer()), scatter_indices.offset(), 2);
+        encoder.setBuffer_offset_atIndex(Some(output.metal_buffer()), output.offset(), 3);
+        encoder.setBuffer_offset_atIndex(Some(&tokens_buf), 0, 4);
+        encoder.setBuffer_offset_atIndex(Some(&dim_buf), 0, 5);
+    }
 
-    let grid_size = MTLSize::new(hidden_dim as u64, num_tokens as u64, 1);
+    let grid_size = MTLSize { width: hidden_dim, height: num_tokens, depth: 1 };
     let tg_w = std::cmp::min(
-        hidden_dim as u64,
-        pipeline.max_total_threads_per_threadgroup(),
+        hidden_dim,
+        pipeline.maxTotalThreadsPerThreadgroup(),
     );
-    let threadgroup_size = MTLSize::new(tg_w, 1, 1);
-    encoder.dispatch_threads(grid_size, threadgroup_size);
-    encoder.end_encoding();
+    let threadgroup_size = MTLSize { width: tg_w, height: 1, depth: 1 };
+    encoder.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
+    encoder.endEncoding();
     command_buffer.commit();
-    command_buffer.wait_until_completed();
+    command_buffer.waitUntilCompleted();
 
     Ok(())
 }

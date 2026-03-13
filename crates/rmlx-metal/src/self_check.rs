@@ -54,12 +54,12 @@ pub fn run_self_check() -> SelfCheckResult {
 
 /// Check if Metal is available by trying to get the default device.
 pub fn check_metal_support() -> bool {
-    unsafe { MTLCreateSystemDefaultDevice() }.is_some()
+    MTLCreateSystemDefaultDevice().is_some()
 }
 
 /// Query max buffer length and max threadgroup memory from the default device.
 pub fn check_memory_limits() -> (u64, u64) {
-    match unsafe { MTLCreateSystemDefaultDevice() } {
+    match MTLCreateSystemDefaultDevice() {
         Some(device) => {
             let max_buf = device.maxBufferLength() as u64;
             let max_tg = device.maxThreadgroupMemoryLength() as u64;
@@ -71,10 +71,10 @@ pub fn check_memory_limits() -> (u64, u64) {
 
 /// Query GPU info strings and shared memory size.
 fn query_gpu_info() -> (String, String, u64) {
-    match unsafe { MTLCreateSystemDefaultDevice() } {
+    match MTLCreateSystemDefaultDevice() {
         Some(device) => {
             let name = device.name().to_string();
-            let recommended = device.recommendedMaxWorkingSetSize() as u64;
+            let recommended = device.recommendedMaxWorkingSetSize();
             // Use device name as a proxy for family/version
             (name.clone(), name, recommended)
         }

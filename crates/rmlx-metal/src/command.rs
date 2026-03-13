@@ -7,10 +7,10 @@
 use std::collections::HashSet;
 use std::ptr::NonNull;
 
-use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::*;
 
+use crate::compute_pass::ComputePass;
 use crate::types::*;
 
 // ---------------------------------------------------------------------------
@@ -64,8 +64,9 @@ impl<'q> CommandBufferManager<'q> {
 
     /// Create a compute command encoder on the current (or new) command buffer.
     ///
-    /// Returns an owned `Retained` encoder. The caller must call `endEncoding()`
-    /// on it when done. The `Retained` keeps the encoder alive for the caller's
+    /// Returns an owned `Retained` encoder. The caller must end it (via
+    /// `ComputePass::end()` or raw `endEncoding()`) before the command buffer
+    /// is committed. The `Retained` keeps the encoder alive for the caller's
     /// scope.
     pub fn get_or_create_encoder(&mut self) -> MtlEncoder {
         let cb = self.get_or_create_buffer();
@@ -384,7 +385,7 @@ impl Default for GpuErrorStore {
 
 /// Register a completion handler on `cb` that checks the command buffer status
 /// after GPU execution and stores any error in `error_store`.
-fn register_completion_handler(
+pub(crate) fn register_completion_handler(
     cb: &ProtocolObject<dyn MTLCommandBuffer>,
     error_store: &std::sync::Arc<GpuErrorStore>,
 ) {
@@ -402,7 +403,7 @@ fn register_completion_handler(
             }
         },
     );
-    unsafe { cb.addCompletedHandler(&*handler as *const _ as *mut _) };
+    unsafe { cb.addCompletedHandler(block2::RcBlock::as_ptr(&handler)) };
 }
 
 // ---------------------------------------------------------------------------
@@ -421,13 +422,12 @@ pub fn encode_compute_1d(
     num_threads: u64,
 ) {
     let encoder = cmd_buf.computeCommandEncoder().unwrap();
+    let pass = ComputePass::new(&encoder);
 
-    encoder.setComputePipelineState(pipeline);
+    pass.set_pipeline(pipeline);
 
     for (index, (buffer, offset)) in buffers.iter().enumerate() {
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(*buffer), *offset as usize, index);
-        }
+        pass.set_buffer(index as u32, Some(*buffer), *offset as usize);
     }
 
     let max_threads = pipeline.maxTotalThreadsPerThreadgroup();
@@ -444,8 +444,8 @@ pub fn encode_compute_1d(
         depth: 1,
     };
 
-    encoder.dispatchThreads_threadsPerThreadgroup(grid_size, group_size);
-    encoder.endEncoding();
+    pass.dispatch_threads(grid_size, group_size);
+    pass.end();
 }
 
 /// Encode a 1D compute dispatch with barrier tracking.
@@ -558,7 +558,7 @@ mod tests {
     use super::*;
 
     fn system_device() -> Option<MtlDevice> {
-        unsafe { MTLCreateSystemDefaultDevice() }
+        MTLCreateSystemDefaultDevice()
     }
 
     #[test]
@@ -766,7 +766,7 @@ mod tests {
 
     #[test]
     fn test_command_buffer_manager_thresholds() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
+        let device = MTLCreateSystemDefaultDevice().unwrap();
         let queue = device.newCommandQueue().unwrap();
         let mut mgr = CommandBufferManager::new(&queue);
 
@@ -787,7 +787,7 @@ mod tests {
 
     #[test]
     fn test_command_buffer_manager_auto_commit_ops() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
+        let device = MTLCreateSystemDefaultDevice().unwrap();
         let queue = device.newCommandQueue().unwrap();
         let mut mgr = CommandBufferManager::new(&queue);
 
@@ -805,7 +805,7 @@ mod tests {
 
     #[test]
     fn test_command_buffer_manager_auto_commit_bytes() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
+        let device = MTLCreateSystemDefaultDevice().unwrap();
         let queue = device.newCommandQueue().unwrap();
         let mut mgr = CommandBufferManager::new(&queue);
 
@@ -818,7 +818,7 @@ mod tests {
 
     #[test]
     fn test_command_buffer_manager_completion_handler() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
+        let device = MTLCreateSystemDefaultDevice().unwrap();
         let queue = device.newCommandQueue().unwrap();
         let mut mgr = CommandBufferManager::new(&queue);
 
@@ -842,7 +842,7 @@ mod tests {
 
     #[test]
     fn test_probe_concurrent_dispatch() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
+        let device = MTLCreateSystemDefaultDevice().unwrap();
         let supported = probe_concurrent_dispatch(&device);
         // Apple Silicon always supports concurrent dispatch
         assert!(
@@ -853,7 +853,7 @@ mod tests {
 
     #[test]
     fn test_concurrent_encoder_creation() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
+        let device = MTLCreateSystemDefaultDevice().unwrap();
         let queue = device.newCommandQueue().unwrap();
         let cb = queue.commandBuffer().unwrap();
 
@@ -866,7 +866,7 @@ mod tests {
 
     #[test]
     fn test_memory_barrier_scope() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
+        let device = MTLCreateSystemDefaultDevice().unwrap();
         let queue = device.newCommandQueue().unwrap();
         let cb = queue.commandBuffer().unwrap();
 
@@ -880,7 +880,7 @@ mod tests {
 
     #[test]
     fn test_barrier_tracker_concurrent_mode() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
+        let device = MTLCreateSystemDefaultDevice().unwrap();
         let a = device
             .newBufferWithLength_options(256, MTLResourceOptions::StorageModeShared)
             .unwrap();

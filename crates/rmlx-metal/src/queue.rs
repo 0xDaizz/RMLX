@@ -1,11 +1,9 @@
 //! Metal command queue management
 
-use std::ptr::NonNull;
-
 use objc2::runtime::ProtocolObject;
 use objc2_metal::*;
 
-use crate::command::{CommandBufferManager, GpuError, GpuErrorStore};
+use crate::command::{register_completion_handler, CommandBufferManager, GpuError, GpuErrorStore};
 use crate::device::GpuDevice;
 use crate::types::*;
 
@@ -71,21 +69,7 @@ impl GpuQueue {
     /// checks for GPU errors after execution (M4).
     pub fn new_checked_command_buffer(&self) -> MtlCB {
         let cb = fast_command_buffer(&self.queue);
-        let store = std::sync::Arc::clone(&self.error_store);
-        let handler = block2::RcBlock::new(
-            move |cmd_buf: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
-                let cmd_buf = unsafe { cmd_buf.as_ref() };
-                let status = cmd_buf.status();
-                if status == MTLCommandBufferStatus::Error {
-                    let msg = format!("command buffer completed with error status: {status:?}");
-                    store.push(GpuError {
-                        status,
-                        message: msg,
-                    });
-                }
-            },
-        );
-        unsafe { cb.addCompletedHandler(&*handler as *const _ as *mut _) };
+        register_completion_handler(&cb, &self.error_store);
         cb
     }
 

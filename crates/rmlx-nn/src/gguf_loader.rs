@@ -29,6 +29,8 @@ use rmlx_core::array::Array;
 use rmlx_core::formats::gguf::{self, GgmlType, GgufError, GgufFile, GgufTensorInfo};
 
 use crate::quantized_linear::KQuantType;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLDevice};
 
 /// Error type for GGUF weight loading.
 #[derive(Debug)]
@@ -213,7 +215,7 @@ pub fn parse_gguf_header<P: AsRef<Path>>(path: P) -> Result<GgufFile, GgufLoadEr
 ///
 /// Returns `GgufLoadError` on parse errors, I/O errors, or unsupported types.
 pub fn load_gguf_weights<P: AsRef<Path>>(
-    device: &metal::Device,
+    device: &ProtocolObject<dyn MTLDevice>,
     path: P,
 ) -> Result<GgufWeightMap, GgufLoadError> {
     let path = path.as_ref();
@@ -267,7 +269,7 @@ pub fn load_gguf_weights<P: AsRef<Path>>(
 /// Only tensors whose name starts with one of the given prefixes are loaded.
 /// This is useful for loading only specific layers (e.g., "blk.0." for layer 0).
 pub fn load_gguf_weights_filtered<P: AsRef<Path>>(
-    device: &metal::Device,
+    device: &ProtocolObject<dyn MTLDevice>,
     path: P,
     prefixes: &[&str],
 ) -> Result<GgufWeightMap, GgufLoadError> {

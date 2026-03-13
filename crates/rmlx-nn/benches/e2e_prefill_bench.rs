@@ -13,6 +13,8 @@
 //!   cargo bench -p rmlx-nn --bench e2e_prefill_bench
 
 use std::time::{Duration, Instant};
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLCommandBuffer as _, MTLCommandQueue as _, MTLDevice as _};
 
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
@@ -20,7 +22,7 @@ use rmlx_core::kernels::KernelRegistry;
 use rmlx_core::ops;
 use rmlx_metal::device::GpuDevice;
 use rmlx_metal::event::GpuEvent;
-use rmlx_metal::ScopedPool;
+use rmlx_metal::autoreleasepool;
 use rmlx_nn::{
     Attention, AttentionConfig, Embedding, EmbeddingConfig, FeedForward, FeedForwardType,
     ForwardMode, LayerKvCache, Linear, LinearConfig, TransformerBlock, TransformerConfig,
@@ -155,7 +157,7 @@ fn f32_to_f16_bits(val: f32) -> u16 {
     ((sign << 15) | (new_exp as u32) << 10 | (frac >> 13)) as u16
 }
 
-fn rand_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
+fn rand_array(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, shape: &[usize], seed: u64) -> Array {
     let numel: usize = shape.iter().product();
     let mut f16_bytes = Vec::with_capacity(numel * 2);
     let mut state = seed;
@@ -170,7 +172,7 @@ fn rand_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
     Array::from_bytes(device, &f16_bytes, shape.to_vec(), DType::Float16)
 }
 
-fn ones_f16(device: &metal::Device, size: usize) -> Array {
+fn ones_f16(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, size: usize) -> Array {
     let ones: Vec<u16> = vec![0x3C00u16; size]; // f16 1.0
     let bytes: Vec<u8> = ones.iter().flat_map(|h| h.to_le_bytes()).collect();
     Array::from_bytes(device, &bytes, vec![size], DType::Float16)
@@ -180,7 +182,7 @@ fn ones_f16(device: &metal::Device, size: usize) -> Array {
 // Layer construction helpers
 // ---------------------------------------------------------------------------
 
-fn make_linear(device: &metal::Device, in_f: usize, out_f: usize, seed: u64) -> Linear {
+fn make_linear(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, in_f: usize, out_f: usize, seed: u64) -> Linear {
     let weight = rand_array(device, &[out_f, in_f], seed);
     Linear::from_arrays(
         LinearConfig {
@@ -195,7 +197,7 @@ fn make_linear(device: &metal::Device, in_f: usize, out_f: usize, seed: u64) -> 
 }
 
 fn build_transformer_block(
-    device: &metal::Device,
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
     layer_idx: usize,
     seed_base: u64,
 ) -> TransformerBlock {
@@ -241,7 +243,7 @@ fn build_transformer_block(
     )
 }
 
-fn build_model(device: &metal::Device) -> TransformerModel {
+fn build_model(device: &ProtocolObject<dyn objc2_metal::MTLDevice>) -> TransformerModel {
     println!("Building 32-layer TransformerModel with random weights...");
     let mut layers = Vec::with_capacity(NUM_LAYERS);
     for i in 0..NUM_LAYERS {
@@ -287,7 +289,7 @@ fn build_model(device: &metal::Device) -> TransformerModel {
         .expect("TransformerModel::from_parts")
 }
 
-fn make_caches(device: &metal::Device) -> Vec<LayerKvCache> {
+fn make_caches(device: &ProtocolObject<dyn objc2_metal::MTLDevice>) -> Vec<LayerKvCache> {
     (0..NUM_LAYERS)
         .map(|_| {
             LayerKvCache::preallocated(device, NUM_KV_HEADS, HEAD_DIM, MAX_SEQ_LEN, DType::Float16)
@@ -352,7 +354,7 @@ fn main() {
 
     // Pre-transpose weights for GEMM paths
     {
-        let setup_queue = device.new_command_queue();
+        let setup_queue = device.newCommandQueue().unwrap();
         model
             .prepare_weights_for_graph(&registry, &setup_queue)
             .expect("prepare_weights_for_graph failed");
@@ -398,13 +400,12 @@ fn main() {
         let tids = &token_ids[..seq_len];
 
         // ==== Benchmark 1: forward() ====
-        let queue_fwd = device.new_command_queue();
+        let queue_fwd = device.newCommandQueue().unwrap();
         let stats_fwd = {
             let mut caches = make_caches(device);
 
             // Warmup
-            {
-                let _pool = ScopedPool::new();
+            autoreleasepool(|_| {
                 for _ in 0..WARMUP_ITERS {
                     reset_caches(&mut caches);
                     let _out = model
@@ -419,12 +420,11 @@ fn main() {
                         )
                         .expect("forward warmup failed");
                 }
-            }
+            });
 
             // Benchmark
             let mut latencies = Vec::with_capacity(BENCH_ITERS);
-            {
-                let _pool = ScopedPool::new();
+            autoreleasepool(|_| {
                 for _ in 0..BENCH_ITERS {
                     reset_caches(&mut caches);
                     let start = Instant::now();
@@ -441,7 +441,7 @@ fn main() {
                         .expect("forward failed");
                     latencies.push(start.elapsed());
                 }
-            }
+            });
 
             Stats::from_durations(&latencies)
         };
@@ -451,14 +451,13 @@ fn main() {
         println!("    estimated TFLOPS: {:.2}", tflops_fwd);
 
         // ==== Benchmark 2: forward_graph_unified(Prefill) (single CB per layer, production path) ====
-        let queue_graph = device.new_command_queue();
+        let queue_graph = device.newCommandQueue().unwrap();
         let event = GpuEvent::new(device);
         let stats_graph = {
             let mut caches = make_caches(device);
 
             // Warmup
-            {
-                let _pool = ScopedPool::new();
+            autoreleasepool(|_| {
                 for _ in 0..WARMUP_ITERS {
                     reset_caches(&mut caches);
                     let _out = model
@@ -475,15 +474,14 @@ fn main() {
                         )
                         .expect("forward_graph_unified warmup failed");
                     // Force GPU completion by submitting an empty CB and waiting
-                    let sync_cb = queue_graph.new_command_buffer();
+                    let sync_cb = queue_graph.commandBuffer().unwrap();
                     sync_cb.commit();
-                    sync_cb.wait_until_completed();
+                    sync_cb.waitUntilCompleted();
                 }
-            }
+            });
 
             // Debug: single timed call with output validation
-            {
-                let _pool = ScopedPool::new();
+            autoreleasepool(|_| {
                 reset_caches(&mut caches);
                 let debug_start = Instant::now();
                 let debug_out = model
@@ -500,9 +498,9 @@ fn main() {
                     )
                     .expect("debug forward failed");
                 // Force GPU sync
-                let sync_cb = queue_graph.new_command_buffer();
+                let sync_cb = queue_graph.commandBuffer().unwrap();
                 sync_cb.commit();
-                sync_cb.wait_until_completed();
+                sync_cb.waitUntilCompleted();
                 let debug_elapsed = debug_start.elapsed();
                 println!(
                     "  [DEBUG] prefill_graph single call: {:.1}ms",
@@ -517,12 +515,11 @@ fn main() {
                     show_len,
                     &first_bytes[..show_len]
                 );
-            }
+            });
 
             // Benchmark
             let mut latencies = Vec::with_capacity(BENCH_ITERS);
-            {
-                let _pool = ScopedPool::new();
+            autoreleasepool(|_| {
                 for _ in 0..BENCH_ITERS {
                     reset_caches(&mut caches);
                     let start = Instant::now();
@@ -540,12 +537,12 @@ fn main() {
                         )
                         .expect("forward_graph_unified failed");
                     // Force GPU completion by submitting an empty CB and waiting
-                    let sync_cb = queue_graph.new_command_buffer();
+                    let sync_cb = queue_graph.commandBuffer().unwrap();
                     sync_cb.commit();
-                    sync_cb.wait_until_completed();
+                    sync_cb.waitUntilCompleted();
                     latencies.push(start.elapsed());
                 }
-            }
+            });
 
             Stats::from_durations(&latencies)
         };
@@ -555,14 +552,13 @@ fn main() {
         println!("    estimated TFLOPS: {:.2}", tflops_graph);
 
         // ==== Benchmark 3: forward_graph_unified(CompiledPrefill) (single CB + single encoder) ====
-        let queue_compiled = device.new_command_queue();
+        let queue_compiled = device.newCommandQueue().unwrap();
         let event_compiled = GpuEvent::new(device);
         let (stats_compiled, alloc_count, alloc_nanos, alloc_bytes) = {
             let mut caches = make_caches(device);
 
             // Warmup
-            {
-                let _pool = ScopedPool::new();
+            autoreleasepool(|_| {
                 for _ in 0..WARMUP_ITERS {
                     reset_caches(&mut caches);
                     let _out = model
@@ -578,17 +574,16 @@ fn main() {
                             &event_compiled,
                         )
                         .expect("compiled_prefill warmup failed");
-                    let sync_cb = queue_compiled.new_command_buffer();
+                    let sync_cb = queue_compiled.commandBuffer().unwrap();
                     sync_cb.commit();
-                    sync_cb.wait_until_completed();
+                    sync_cb.waitUntilCompleted();
                 }
-            }
+            });
 
             // Benchmark
             let mut latencies = Vec::with_capacity(BENCH_ITERS);
             rmlx_core::array::reset_alloc_stats();
-            {
-                let _pool = ScopedPool::new();
+            autoreleasepool(|_| {
                 for _ in 0..BENCH_ITERS {
                     reset_caches(&mut caches);
                     let start = Instant::now();
@@ -605,12 +600,12 @@ fn main() {
                             &event_compiled,
                         )
                         .expect("compiled_prefill failed");
-                    let sync_cb = queue_compiled.new_command_buffer();
+                    let sync_cb = queue_compiled.commandBuffer().unwrap();
                     sync_cb.commit();
-                    sync_cb.wait_until_completed();
+                    sync_cb.waitUntilCompleted();
                     latencies.push(start.elapsed());
                 }
-            }
+            });
             let (alloc_count, alloc_nanos, alloc_bytes) = rmlx_core::array::get_alloc_stats();
 
             (
@@ -643,7 +638,7 @@ fn main() {
         // Compare different layers_per_cb values to measure CB creation overhead.
         // Only run for small seq_lens to keep total bench time manageable.
         if seq_len == 32 || seq_len == 64 || seq_len == 128 {
-            let queue_oh = device.new_command_queue();
+            let queue_oh = device.newCommandQueue().unwrap();
             let event_oh = GpuEvent::new(device);
             let n_runs = 10;
 
@@ -661,8 +656,7 @@ fn main() {
                 let mut caches = make_caches(device);
 
                 // Warmup
-                {
-                    let _pool = ScopedPool::new();
+                autoreleasepool(|_| {
                     for _ in 0..3 {
                         reset_caches(&mut caches);
                         let _ = model
@@ -678,15 +672,14 @@ fn main() {
                                 &event_oh,
                             )
                             .expect("overhead warmup failed");
-                        let sync = queue_oh.new_command_buffer();
+                        let sync = queue_oh.commandBuffer().unwrap();
                         sync.commit();
-                        sync.wait_until_completed();
+                        sync.waitUntilCompleted();
                     }
-                }
+                });
 
                 // Measure
-                {
-                    let _pool = ScopedPool::new();
+                autoreleasepool(|_| {
                     for _ in 0..n_runs {
                         reset_caches(&mut caches);
                         let start = Instant::now();
@@ -703,12 +696,12 @@ fn main() {
                                 &event_oh,
                             )
                             .expect("overhead bench failed");
-                        let sync = queue_oh.new_command_buffer();
+                        let sync = queue_oh.commandBuffer().unwrap();
                         sync.commit();
-                        sync.wait_until_completed();
+                        sync.waitUntilCompleted();
                         times.push(start.elapsed().as_secs_f64() * 1e6);
                     }
-                }
+                });
 
                 let mean: f64 = times.iter().sum::<f64>() / n_runs as f64;
                 let diff = mean - stats_compiled.mean;
@@ -783,7 +776,7 @@ fn main() {
         let cos_freqs = cos_full.slice(0, 0, seq_len).expect("cos slice failed");
         let sin_freqs = sin_full.slice(0, 0, seq_len).expect("sin slice failed");
         let tids = &token_ids[..seq_len];
-        let queue_sweep = device.new_command_queue();
+        let queue_sweep = device.newCommandQueue().unwrap();
         let event_sweep = GpuEvent::new(device);
 
         let mut row_values: Vec<f64> = Vec::new();
@@ -794,8 +787,7 @@ fn main() {
             let mut caches = make_caches(device);
 
             // Warmup
-            {
-                let _pool = ScopedPool::new();
+            autoreleasepool(|_| {
                 for _ in 0..3 {
                     reset_caches(&mut caches);
                     let _ = model
@@ -811,16 +803,15 @@ fn main() {
                             &event_sweep,
                         )
                         .expect("sweep warmup failed");
-                    let sync = queue_sweep.new_command_buffer();
+                    let sync = queue_sweep.commandBuffer().unwrap();
                     sync.commit();
-                    sync.wait_until_completed();
+                    sync.waitUntilCompleted();
                 }
-            }
+            });
 
             // Measure
             let mut times = Vec::with_capacity(5);
-            {
-                let _pool = ScopedPool::new();
+            autoreleasepool(|_| {
                 for _ in 0..5 {
                     reset_caches(&mut caches);
                     let start = Instant::now();
@@ -837,12 +828,12 @@ fn main() {
                             &event_sweep,
                         )
                         .expect("sweep failed");
-                    let sync = queue_sweep.new_command_buffer();
+                    let sync = queue_sweep.commandBuffer().unwrap();
                     sync.commit();
-                    sync.wait_until_completed();
+                    sync.waitUntilCompleted();
                     times.push(start.elapsed().as_secs_f64() * 1e6);
                 }
-            }
+            });
 
             let mean: f64 = times.iter().sum::<f64>() / times.len() as f64;
             row_values.push(mean);

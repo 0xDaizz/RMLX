@@ -5,10 +5,10 @@
 //! At runtime, `execute()` replays the plan in a tight loop with minimal CPU overhead.
 
 use std::collections::HashMap;
-use std::ffi::c_void;
-
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLBuffer;
 use rmlx_metal::memory_barrier_scope_buffers;
-use rmlx_metal::metal;
+use rmlx_metal::{ComputePass, MTLSize, MtlBuffer, MtlPipeline};
 
 use crate::prefill_pool::{PrefillBufferPool, Slot};
 
@@ -66,9 +66,9 @@ pub enum PlanStep {
 pub struct PrefillPlan {
     steps: Vec<PlanStep>,
     /// Pre-resolved pipeline states, indexed by SetPipeline.
-    pipelines: Vec<metal::ComputePipelineState>,
+    pipelines: Vec<MtlPipeline>,
     /// Weight buffer references, indexed by BindWeight.
-    weights: Vec<metal::Buffer>,
+    weights: Vec<MtlBuffer>,
     /// The seq_len this plan was compiled for.
     seq_len: usize,
 }
@@ -85,14 +85,14 @@ impl PrefillPlan {
     }
 
     /// Add a pre-resolved pipeline state, returns its index.
-    pub fn add_pipeline(&mut self, pso: metal::ComputePipelineState) -> usize {
+    pub fn add_pipeline(&mut self, pso: MtlPipeline) -> usize {
         let idx = self.pipelines.len();
         self.pipelines.push(pso);
         idx
     }
 
     /// Add a weight buffer reference, returns its index.
-    pub fn add_weight(&mut self, buffer: metal::Buffer) -> usize {
+    pub fn add_weight(&mut self, buffer: MtlBuffer) -> usize {
         let idx = self.weights.len();
         self.weights.push(buffer);
         idx
@@ -141,35 +141,39 @@ impl PrefillPlan {
     /// calls with minimal branching.
     pub fn execute(
         &self,
-        encoder: &metal::ComputeCommandEncoderRef,
+        encoder: ComputePass<'_>,
         pool: &PrefillBufferPool,
-        input: &metal::BufferRef,
+        input: &ProtocolObject<dyn MTLBuffer>,
     ) {
         for step in &self.steps {
             match step {
                 PlanStep::SetPipeline(idx) => {
-                    encoder.set_compute_pipeline_state(&self.pipelines[*idx]);
+                    encoder.set_pipeline(&self.pipelines[*idx]);
                 }
                 PlanStep::BindPoolBuffer {
                     index,
                     slot,
                     offset,
                 } => {
-                    encoder.set_buffer(*index, Some(pool.buffer(*slot)), *offset);
-                }
+                    encoder.set_buffer(*index as u32, Some(pool.buffer(*slot)), *offset as usize);
+                },
                 PlanStep::BindWeight { index, weight_idx } => {
-                    encoder.set_buffer(*index, Some(&self.weights[*weight_idx]), 0);
-                }
+                    encoder.set_buffer(*index as u32, Some(&self.weights[*weight_idx]), 0);
+                },
                 PlanStep::BindInput { index, offset } => {
-                    encoder.set_buffer(*index, Some(input), *offset);
-                }
+                    encoder.set_buffer(*index as u32, Some(input), *offset as usize);
+                },
                 PlanStep::BindBytes { index, value, len } => {
-                    encoder.set_bytes(*index, *len, value.as_ptr() as *const c_void);
-                }
+                    encoder.set_bytes(
+                        *index as u32,
+                        value.as_ptr() as *const std::ffi::c_void,
+                        *len as usize,
+                    );
+                },
                 PlanStep::Dispatch { grid, threadgroup } => {
-                    encoder.dispatch_thread_groups(
-                        metal::MTLSize::new(grid[0], grid[1], grid[2]),
-                        metal::MTLSize::new(threadgroup[0], threadgroup[1], threadgroup[2]),
+                    encoder.dispatch_threadgroups(
+                        MTLSize { width: grid[0] as usize, height: grid[1] as usize, depth: grid[2] as usize },
+                        MTLSize { width: threadgroup[0] as usize, height: threadgroup[1] as usize, depth: threadgroup[2] as usize },
                     );
                 }
                 PlanStep::DispatchThreads {
@@ -177,12 +181,12 @@ impl PrefillPlan {
                     threadgroup,
                 } => {
                     encoder.dispatch_threads(
-                        metal::MTLSize::new(threads[0], threads[1], threads[2]),
-                        metal::MTLSize::new(threadgroup[0], threadgroup[1], threadgroup[2]),
+                        MTLSize { width: threads[0] as usize, height: threads[1] as usize, depth: threads[2] as usize },
+                        MTLSize { width: threadgroup[0] as usize, height: threadgroup[1] as usize, depth: threadgroup[2] as usize },
                     );
                 }
                 PlanStep::Barrier => {
-                    memory_barrier_scope_buffers(encoder);
+                    memory_barrier_scope_buffers(encoder.raw());
                 }
             }
         }

@@ -1,15 +1,19 @@
 //! Integration tests for rmlx-core ops.
 //! Tests require Metal GPU — gracefully skip if unavailable.
 
+use objc2_metal::{MTLBuffer as _, MTLCommandQueue as _, MTLDevice as _};
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::KernelRegistry;
 use rmlx_core::ops;
 use rmlx_metal::device::GpuDevice;
+use rmlx_metal::types::MtlQueue;
+use rmlx_metal::MTLResourceOptions;
+use std::ptr::NonNull;
 
-fn setup() -> Option<(KernelRegistry, metal::CommandQueue)> {
+fn setup() -> Option<(KernelRegistry, MtlQueue)> {
     let device = GpuDevice::system_default().ok()?;
-    let queue = device.raw().new_command_queue();
+    let queue = device.new_command_queue();
     let registry = KernelRegistry::new(device);
     ops::register_all(&registry).ok()?;
     Some((registry, queue))
@@ -272,10 +276,11 @@ fn test_quantized_matmul_vec_size_mismatch() {
         .numel_to_bytes(out_features * in_features)
         .unwrap();
     let weights = Array::new(
-        dev.new_buffer(
-            weight_bytes as u64,
-            metal::MTLResourceOptions::StorageModeShared,
-        ),
+        dev.newBufferWithLength_options(
+            weight_bytes,
+            MTLResourceOptions::StorageModeShared,
+        )
+        .unwrap(),
         vec![out_features * in_features],
         vec![1],
         DType::Q8_0,
@@ -308,10 +313,11 @@ fn test_quantized_matmul_weights_buffer_too_small() {
         .numel_to_bytes((out_features / 2) * in_features)
         .unwrap();
     let weights = Array::new(
-        dev.new_buffer(
-            small_bytes as u64,
-            metal::MTLResourceOptions::StorageModeShared,
-        ),
+        dev.newBufferWithLength_options(
+            small_bytes,
+            MTLResourceOptions::StorageModeShared,
+        )
+        .unwrap(),
         vec![(out_features / 2) * in_features],
         vec![1],
         DType::Q8_0,
@@ -428,23 +434,29 @@ fn test_add_bf16() {
     // bf16 values as raw u16 (IEEE bf16): 1.0=0x3F80, 2.0=0x4000, 3.0=0x4040, 4.0=0x4080
     let a_data: Vec<u16> = vec![0x3F80, 0x4000, 0x4040, 0x4080];
     let b_data: Vec<u16> = vec![0x3F80, 0x3F80, 0x3F80, 0x3F80]; // all 1.0
-    let a_buf = dev.new_buffer_with_data(
-        a_data.as_ptr() as *const std::ffi::c_void,
-        (a_data.len() * 2) as u64,
-        metal::MTLResourceOptions::StorageModeShared,
-    );
-    let b_buf = dev.new_buffer_with_data(
-        b_data.as_ptr() as *const std::ffi::c_void,
-        (b_data.len() * 2) as u64,
-        metal::MTLResourceOptions::StorageModeShared,
-    );
+    let a_buf = unsafe {
+        dev.newBufferWithBytes_length_options(
+            NonNull::new(a_data.as_ptr() as *mut _).unwrap(),
+            a_data.len() * 2,
+            MTLResourceOptions::StorageModeShared,
+        )
+        .unwrap()
+    };
+    let b_buf = unsafe {
+        dev.newBufferWithBytes_length_options(
+            NonNull::new(b_data.as_ptr() as *mut _).unwrap(),
+            b_data.len() * 2,
+            MTLResourceOptions::StorageModeShared,
+        )
+        .unwrap()
+    };
     let a = Array::new(a_buf, vec![4], vec![1], DType::Bfloat16, 0);
     let b = Array::new(b_buf, vec![4], vec![1], DType::Bfloat16, 0);
     let c = ops::binary::add(&registry, &a, &b, &queue).expect("bf16 add failed");
     assert_eq!(c.dtype(), DType::Bfloat16);
     assert_eq!(c.shape(), &[4]);
     // Read raw bf16 output
-    let out_ptr = c.metal_buffer().contents() as *const u16;
+    let out_ptr = c.metal_buffer().contents().as_ptr() as *const u16;
     let out_raw: Vec<u16> = unsafe { std::slice::from_raw_parts(out_ptr, 4).to_vec() };
     // 1+1=2.0=0x4000, 2+1=3.0=0x4040, 3+1=4.0=0x4080, 4+1=5.0=0x40A0
     assert_eq!(out_raw[0], 0x4000, "1.0+1.0 should be 2.0 (bf16 0x4000)");
@@ -463,20 +475,26 @@ fn test_mul_bf16() {
     // 2.0=0x4000, 3.0=0x4040
     let a_data: Vec<u16> = vec![0x4000, 0x4040]; // [2.0, 3.0]
     let b_data: Vec<u16> = vec![0x4000, 0x4000]; // [2.0, 2.0]
-    let a_buf = dev.new_buffer_with_data(
-        a_data.as_ptr() as *const std::ffi::c_void,
-        (a_data.len() * 2) as u64,
-        metal::MTLResourceOptions::StorageModeShared,
-    );
-    let b_buf = dev.new_buffer_with_data(
-        b_data.as_ptr() as *const std::ffi::c_void,
-        (b_data.len() * 2) as u64,
-        metal::MTLResourceOptions::StorageModeShared,
-    );
+    let a_buf = unsafe {
+        dev.newBufferWithBytes_length_options(
+            NonNull::new(a_data.as_ptr() as *mut _).unwrap(),
+            a_data.len() * 2,
+            MTLResourceOptions::StorageModeShared,
+        )
+        .unwrap()
+    };
+    let b_buf = unsafe {
+        dev.newBufferWithBytes_length_options(
+            NonNull::new(b_data.as_ptr() as *mut _).unwrap(),
+            b_data.len() * 2,
+            MTLResourceOptions::StorageModeShared,
+        )
+        .unwrap()
+    };
     let a = Array::new(a_buf, vec![2], vec![1], DType::Bfloat16, 0);
     let b = Array::new(b_buf, vec![2], vec![1], DType::Bfloat16, 0);
     let c = ops::binary::mul(&registry, &a, &b, &queue).expect("bf16 mul failed");
-    let out_ptr = c.metal_buffer().contents() as *const u16;
+    let out_ptr = c.metal_buffer().contents().as_ptr() as *const u16;
     let out_raw: Vec<u16> = unsafe { std::slice::from_raw_parts(out_ptr, 2).to_vec() };
     // 2*2=4.0=0x4080, 3*2=6.0=0x40C0
     assert_eq!(out_raw[0], 0x4080, "2.0*2.0 should be 4.0");
@@ -493,20 +511,26 @@ fn test_sub_bf16() {
     // 4.0=0x4080, 2.0=0x4000
     let a_data: Vec<u16> = vec![0x4080, 0x4040]; // [4.0, 3.0]
     let b_data: Vec<u16> = vec![0x3F80, 0x3F80]; // [1.0, 1.0]
-    let a_buf = dev.new_buffer_with_data(
-        a_data.as_ptr() as *const std::ffi::c_void,
-        (a_data.len() * 2) as u64,
-        metal::MTLResourceOptions::StorageModeShared,
-    );
-    let b_buf = dev.new_buffer_with_data(
-        b_data.as_ptr() as *const std::ffi::c_void,
-        (b_data.len() * 2) as u64,
-        metal::MTLResourceOptions::StorageModeShared,
-    );
+    let a_buf = unsafe {
+        dev.newBufferWithBytes_length_options(
+            NonNull::new(a_data.as_ptr() as *mut _).unwrap(),
+            a_data.len() * 2,
+            MTLResourceOptions::StorageModeShared,
+        )
+        .unwrap()
+    };
+    let b_buf = unsafe {
+        dev.newBufferWithBytes_length_options(
+            NonNull::new(b_data.as_ptr() as *mut _).unwrap(),
+            b_data.len() * 2,
+            MTLResourceOptions::StorageModeShared,
+        )
+        .unwrap()
+    };
     let a = Array::new(a_buf, vec![2], vec![1], DType::Bfloat16, 0);
     let b = Array::new(b_buf, vec![2], vec![1], DType::Bfloat16, 0);
     let c = ops::binary::sub(&registry, &a, &b, &queue).expect("bf16 sub failed");
-    let out_ptr = c.metal_buffer().contents() as *const u16;
+    let out_ptr = c.metal_buffer().contents().as_ptr() as *const u16;
     let out_raw: Vec<u16> = unsafe { std::slice::from_raw_parts(out_ptr, 2).to_vec() };
     // 4-1=3.0=0x4040, 3-1=2.0=0x4000
     assert_eq!(out_raw[0], 0x4040, "4.0-1.0 should be 3.0");
@@ -523,20 +547,26 @@ fn test_div_bf16() {
     // 6.0=0x40C0, 4.0=0x4080
     let a_data: Vec<u16> = vec![0x40C0, 0x4080]; // [6.0, 4.0]
     let b_data: Vec<u16> = vec![0x4000, 0x4000]; // [2.0, 2.0]
-    let a_buf = dev.new_buffer_with_data(
-        a_data.as_ptr() as *const std::ffi::c_void,
-        (a_data.len() * 2) as u64,
-        metal::MTLResourceOptions::StorageModeShared,
-    );
-    let b_buf = dev.new_buffer_with_data(
-        b_data.as_ptr() as *const std::ffi::c_void,
-        (b_data.len() * 2) as u64,
-        metal::MTLResourceOptions::StorageModeShared,
-    );
+    let a_buf = unsafe {
+        dev.newBufferWithBytes_length_options(
+            NonNull::new(a_data.as_ptr() as *mut _).unwrap(),
+            a_data.len() * 2,
+            MTLResourceOptions::StorageModeShared,
+        )
+        .unwrap()
+    };
+    let b_buf = unsafe {
+        dev.newBufferWithBytes_length_options(
+            NonNull::new(b_data.as_ptr() as *mut _).unwrap(),
+            b_data.len() * 2,
+            MTLResourceOptions::StorageModeShared,
+        )
+        .unwrap()
+    };
     let a = Array::new(a_buf, vec![2], vec![1], DType::Bfloat16, 0);
     let b = Array::new(b_buf, vec![2], vec![1], DType::Bfloat16, 0);
     let c = ops::binary::div(&registry, &a, &b, &queue).expect("bf16 div failed");
-    let out_ptr = c.metal_buffer().contents() as *const u16;
+    let out_ptr = c.metal_buffer().contents().as_ptr() as *const u16;
     let out_raw: Vec<u16> = unsafe { std::slice::from_raw_parts(out_ptr, 2).to_vec() };
     // 6/2=3.0=0x4040, 4/2=2.0=0x4000
     assert_eq!(out_raw[0], 0x4040, "6.0/2.0 should be 3.0");
@@ -553,15 +583,18 @@ fn test_copy_bf16() {
     };
     let dev = registry.device().raw();
     let data: Vec<u16> = vec![0x3F80, 0x4000, 0x4040, 0x4080]; // [1.0, 2.0, 3.0, 4.0]
-    let buf = dev.new_buffer_with_data(
-        data.as_ptr() as *const std::ffi::c_void,
-        (data.len() * 2) as u64,
-        metal::MTLResourceOptions::StorageModeShared,
-    );
+    let buf = unsafe {
+        dev.newBufferWithBytes_length_options(
+            NonNull::new(data.as_ptr() as *mut _).unwrap(),
+            data.len() * 2,
+            MTLResourceOptions::StorageModeShared,
+        )
+        .unwrap()
+    };
     let src = Array::new(buf, vec![4], vec![1], DType::Bfloat16, 0);
     let dst = ops::copy::copy(&registry, &src, &queue).expect("bf16 copy failed");
     assert_eq!(dst.dtype(), DType::Bfloat16);
-    let out_ptr = dst.metal_buffer().contents() as *const u16;
+    let out_ptr = dst.metal_buffer().contents().as_ptr() as *const u16;
     let out_raw: Vec<u16> = unsafe { std::slice::from_raw_parts(out_ptr, 4).to_vec() };
     assert_eq!(out_raw, data, "bf16 copy should be exact");
 }
@@ -1515,9 +1548,9 @@ fn test_rope_ext_into_cb_freq_validation() {
     // 1-D freq tensors should be rejected by rope_ext_into_cb too
     let cos_f = Array::from_slice(dev, &[1.0f32, 1.0], vec![2]);
     let sin_f = Array::from_slice(dev, &[0.0f32, 0.0], vec![2]);
-    let cb = queue.new_command_buffer();
+    let cb = queue.commandBuffer().unwrap();
     let result =
-        ops::rope::rope_ext_into_cb(&registry, &input, &cos_f, &sin_f, 0, 1.0, true, true, cb);
+        ops::rope::rope_ext_into_cb(&registry, &input, &cos_f, &sin_f, 0, 1.0, true, true, &cb);
     assert!(
         result.is_err(),
         "rope_ext_into_cb should validate freq tensor dims"
@@ -1528,7 +1561,7 @@ fn test_rope_ext_into_cb_freq_validation() {
 
 /// Helper: build interleaved [seq_len, num_heads * head_dim] from random f32 data
 fn make_interleaved(
-    dev: &metal::Device,
+    dev: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>,
     seq_len: usize,
     num_heads: usize,
     head_dim: usize,
@@ -1553,7 +1586,7 @@ fn per_head_rope_reference(
     sin_freqs: &Array,
     num_heads: usize,
     offset: u32,
-    queue: &metal::CommandQueue,
+    queue: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Vec<Vec<f32>> {
     let seq_len = input.shape()[0];
     let head_dim = input.shape()[1] / num_heads;

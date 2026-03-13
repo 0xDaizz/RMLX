@@ -1284,7 +1284,7 @@ mod tests {
         use rmlx_rdma::progress::ProgressEngine;
         use rmlx_rdma::shared_buffer::SharedBuffer;
 
-        let device = match metal::Device::system_default() {
+        let device = match objc2_metal::MTLCreateSystemDefaultDevice() {
             Some(d) => d,
             None => return, // skip on headless CI without Metal
         };
@@ -1327,7 +1327,7 @@ mod tests {
         use rmlx_rdma::progress::ProgressEngine;
         use rmlx_rdma::shared_buffer::SharedBuffer;
 
-        let device = match metal::Device::system_default() {
+        let device = match objc2_metal::MTLCreateSystemDefaultDevice() {
             Some(d) => d,
             None => return,
         };

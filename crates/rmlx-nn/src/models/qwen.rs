@@ -9,6 +9,8 @@ use rmlx_core::kernels::{KernelError, KernelRegistry};
 
 use crate::attention::LayerKvCache;
 use crate::transformer::{FeedForwardType, TransformerConfig, TransformerModel};
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLCommandQueue};
 
 /// Qwen2-7B configuration preset.
 pub fn qwen2_7b() -> TransformerConfig {
@@ -70,7 +72,7 @@ impl Qwen2Model {
         mask: Option<&Array>,
         cache: Option<&mut Vec<LayerKvCache>>,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         self.inner.forward(
             token_ids, cos_freqs, sin_freqs, mask, cache, registry, queue,

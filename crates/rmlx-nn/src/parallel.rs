@@ -73,7 +73,7 @@ fn read_f32_strided(arr: &Array) -> Vec<f32> {
     let cols = arr.shape()[1];
     let stride0 = arr.strides()[0]; // in elements
     let stride1 = arr.strides()[1]; // in elements
-    let base = arr.metal_buffer().contents() as *const u8;
+    let base = arr.metal_buffer().contents().as_ptr() as *const u8;
     let offset = arr.offset();
     let mut out = Vec::with_capacity(rows * cols);
     for r in 0..rows {
@@ -116,18 +116,13 @@ fn cpu_matmul_f32(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32
 /// obtained from `buffer.device()`.
 #[cfg(feature = "distributed")]
 fn array_from_raw_bytes(
-    device: &metal::DeviceRef,
+    device: &ProtocolObject<dyn MTLDevice>,
     bytes: &[u8],
     shape: Vec<usize>,
     dtype: DType,
 ) -> Array {
-    use metal::MTLResourceOptions;
     let ptr = bytes.as_ptr() as *const std::ffi::c_void;
-    let buffer = device.new_buffer_with_data(
-        ptr,
-        bytes.len() as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
+    let buffer = unsafe { device.newBufferWithBytes_length_options(std::ptr::NonNull::new_unchecked(ptr as *mut std::ffi::c_void), bytes.len(), MTLResourceOptions::StorageModeShared) }.unwrap();
     let numel: usize = shape.iter().product();
     let elem_bytes = dtype.size_of();
     assert_eq!(
@@ -369,7 +364,7 @@ impl ColumnParallelLinear {
         input: &Array,
         group: &Group,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, DistributedError> {
         assert_eq!(input.ndim(), 2, "input must be 2D [batch, in_features]");
         let dtype = input.dtype();
@@ -565,7 +560,7 @@ impl RowParallelLinear {
         input: &Array,
         group: &Group,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, DistributedError> {
         assert_eq!(
             input.ndim(),
@@ -634,14 +629,14 @@ mod tests {
     use super::*;
     use rmlx_core::dtype::DType;
 
-    fn test_device() -> Option<metal::Device> {
-        metal::Device::system_default()
+    fn test_device() -> Option<rmlx_metal::MtlDevice> {
+        objc2_metal::MTLCreateSystemDefaultDevice()
     }
 
     #[cfg(feature = "distributed")]
-    fn setup_registry_and_queue(device: &metal::Device) -> (KernelRegistry, metal::CommandQueue) {
+    fn setup_registry_and_queue(_device: &ProtocolObject<dyn MTLDevice>) -> (KernelRegistry, rmlx_metal::MtlQueue) {
         let gpu = rmlx_metal::device::GpuDevice::system_default().expect("Metal device");
-        let queue = device.new_command_queue();
+        let queue = gpu.new_command_queue();
         let registry = KernelRegistry::new(gpu);
         rmlx_core::ops::register_all(&registry).expect("register kernels");
         (registry, queue)

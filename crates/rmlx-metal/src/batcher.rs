@@ -11,16 +11,18 @@
 //!
 //! // Op 1: encode into current CB
 //! let enc = batcher.encoder();
-//! enc.setComputePipelineState(&pipeline);
-//! unsafe { enc.setBuffer_offset_atIndex(Some(buf), 0, 0) };
-//! enc.dispatchThreads_threadsPerThreadgroup(grid, tg);
-//! enc.endEncoding();
+//! let pass = ComputePass::new(&enc);
+//! pass.set_pipeline(&pipeline);
+//! pass.set_buffer(0, Some(buf), 0);
+//! pass.dispatch_threads(grid, tg);
+//! pass.end();
 //! batcher.end_encoder();
 //!
 //! // Op 2: same CB
 //! let enc = batcher.encoder();
+//! let pass = ComputePass::new(&enc);
 //! // ... encode more work ...
-//! enc.endEncoding();
+//! pass.end();
 //! batcher.end_encoder();
 //!
 //! // Commit all at once
@@ -97,21 +99,22 @@ impl<'q> CommandBatcher<'q> {
     ///
     /// # Encoder lifecycle contract
     ///
-    /// The caller **MUST** call `endEncoding()` on the returned encoder
+    /// The caller **MUST** end the returned encoder (via [`ComputePass::end()`])
     /// *before* calling [`end_encoder()`](Self::end_encoder).
     /// After `end_encoder()` is called, the encoder reference must not be used again.
     /// The typical pattern is:
     ///
     /// ```rust,ignore
     /// let enc = batcher.encoder();
+    /// let pass = ComputePass::new(&enc);
     /// // ... set pipeline, buffers, dispatch ...
-    /// enc.endEncoding();        // Metal-level: finalize the encoder
+    /// pass.end();               // Metal-level: finalize the encoder
     /// batcher.end_encoder();    // Batcher-level: mark encoder as inactive
     /// ```
     ///
     /// Calling `encoder()` again without first calling `end_encoder()` is
     /// tolerated (the batcher resets its internal flag), but the caller is
-    /// still responsible for calling `endEncoding()` on the Metal encoder
+    /// still responsible for ending the encoder (via `ComputePass::end()`)
     /// to avoid Metal validation errors.
     pub fn encoder(&mut self) -> MtlEncoder {
         // End any active encoder first
@@ -142,7 +145,7 @@ impl<'q> CommandBatcher<'q> {
     ///
     /// Must be called after each `encoder()` call before the next `encoder()`
     /// or `flush()` call. The caller **MUST** have already called
-    /// `endEncoding()` on the Metal encoder before calling this method.
+    /// `ComputePass::end()` on the encoder before calling this method.
     /// The encoder ref returned by `encoder()` must not be used after this call.
     ///
     /// # Panics (debug builds)
@@ -295,7 +298,7 @@ mod tests {
 
     #[test]
     fn batcher_stats_tracking() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.expect("Metal device required");
+        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
         let queue = device.newCommandQueue().unwrap();
         let batcher = CommandBatcher::new(&queue, 32);
         assert_eq!(batcher.stats_cbs(), 0);
@@ -305,7 +308,7 @@ mod tests {
 
     #[test]
     fn batcher_creates_cb_on_first_encoder() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.expect("Metal device required");
+        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
         let queue = device.newCommandQueue().unwrap();
         let mut batcher = CommandBatcher::new(&queue, 32);
 
@@ -322,7 +325,7 @@ mod tests {
 
     #[test]
     fn batcher_multiple_encoders_same_cb() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.expect("Metal device required");
+        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
         let queue = device.newCommandQueue().unwrap();
         let mut batcher = CommandBatcher::new(&queue, 32);
 
@@ -339,7 +342,7 @@ mod tests {
 
     #[test]
     fn batcher_flush_resets() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.expect("Metal device required");
+        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
         let queue = device.newCommandQueue().unwrap();
         let mut batcher = CommandBatcher::new(&queue, 32);
 
@@ -355,7 +358,7 @@ mod tests {
 
     #[test]
     fn batcher_flush_async_returns_cb() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.expect("Metal device required");
+        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
         let queue = device.newCommandQueue().unwrap();
         let mut batcher = CommandBatcher::new(&queue, 32);
 
@@ -373,7 +376,7 @@ mod tests {
 
     #[test]
     fn batcher_should_flush_at_max() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.expect("Metal device required");
+        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
         let queue = device.newCommandQueue().unwrap();
         let mut batcher = CommandBatcher::new(&queue, 3);
 
@@ -388,7 +391,7 @@ mod tests {
 
     #[test]
     fn batcher_stats_snapshot() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.expect("Metal device required");
+        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
         let queue = device.newCommandQueue().unwrap();
         let mut batcher = CommandBatcher::new(&queue, 32);
 
@@ -417,7 +420,7 @@ mod tests {
         let before_cbs = total_cbs_created();
         let before_encs = total_encoders_created();
 
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.expect("Metal device required");
+        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
         let queue = device.newCommandQueue().unwrap();
         let mut batcher = CommandBatcher::new(&queue, 32);
 

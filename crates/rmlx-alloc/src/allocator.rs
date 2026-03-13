@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use objc2_metal::{MTLBuffer as _, MTLDevice as _, MTLResource as _};
 use rmlx_metal::device::GpuDevice;
 
 use crate::cache::BufferCache;
@@ -221,9 +222,9 @@ impl MetalAllocator {
     }
 
     /// Track a buffer's GPU address in the ownership set (PR 4.2).
-    fn track_buffer(&self, buf: &rmlx_metal::metal::Buffer) {
+    fn track_buffer(&self, buf: &rmlx_metal::MtlBuffer) {
         if let Ok(mut set) = self.owned_ptrs.lock() {
-            set.insert(buf.gpu_address());
+            set.insert(buf.gpuAddress());
         }
     }
 
@@ -240,7 +241,7 @@ impl MetalAllocator {
     /// normal cache / device path.
     ///
     /// Returns `Err(AllocError::ZeroSize)` for zero-size requests.
-    pub fn alloc(&self, size: usize) -> Result<(rmlx_metal::metal::Buffer, usize), AllocError> {
+    pub fn alloc(&self, size: usize) -> Result<(rmlx_metal::MtlBuffer, usize), AllocError> {
         // Reject zero-size allocations to prevent cache poisoning (A-P0-1).
         if size == 0 {
             return Err(AllocError::ZeroSize);
@@ -271,7 +272,7 @@ impl MetalAllocator {
                 }
                 self.stats.record_alloc(alloc_size);
                 self.leak_detector.record_alloc(alloc_size as u64);
-                let addr = buf.gpu_address();
+                let addr = buf.gpuAddress();
                 // Track the backing buffer address in owned_ptrs (idempotent
                 // for sub-allocation — all slots share the same address).
                 self.track_buffer(&buf);
@@ -301,7 +302,7 @@ impl MetalAllocator {
             .map_err(|_| AllocError::MutexPoisoned)?
             .acquire(size);
         if let Some(buf) = cached {
-            let actual = buf.length() as usize;
+            let actual = buf.length();
             // Adjust reservation if the cached buffer differs in size.
             if actual > size {
                 // Reserve the extra bytes (best-effort; the memory is already
@@ -348,7 +349,7 @@ impl MetalAllocator {
         let buf = self
             .device
             .new_buffer(size as u64, rmlx_metal::device::DEFAULT_BUFFER_OPTIONS);
-        let alloc_size = buf.length() as usize;
+        let alloc_size = buf.length();
 
         // Adjust reservation if Metal rounded up the buffer size.
         if alloc_size > size {
@@ -392,19 +393,19 @@ impl MetalAllocator {
     ///
     /// Returns `Err(AllocError::InvalidFreeBuffer(_))` if the buffer was not
     /// allocated by this allocator or has already been freed (PR 4.2).
-    pub fn free(&self, buffer: rmlx_metal::metal::Buffer) -> Result<(), AllocError> {
+    pub fn free(&self, buffer: rmlx_metal::MtlBuffer) -> Result<(), AllocError> {
         // Device mismatch check (#98): verify the buffer belongs to the same
         // Metal device as this allocator before mutating any state.
         {
-            let buf_device_name = buffer.device().name();
+            let buf_device_name = buffer.device().name().to_string();
             let our_device_name = self.device.name();
             if buf_device_name != our_device_name {
                 return Err(AllocError::DeviceMismatch);
             }
         }
 
-        let addr = buffer.gpu_address();
-        let size = buffer.length() as usize;
+        let addr = buffer.gpuAddress();
+        let size = buffer.length();
 
         // Check if this buffer came from the small-buffer pool FIRST (P7-10).
         // With sub-allocation all small allocs share the same gpu_address, so
@@ -533,8 +534,8 @@ const DEFAULT_BLOCK_LIMIT: usize = 8 * 1024 * 1024 * 1024;
 ///
 /// Strategy: `min(1.5 * recommended_max_working_set_size, 0.95 * total_memory)`.
 /// Falls back to [`DEFAULT_BLOCK_LIMIT`] (8 GiB) if the device reports 0.
-fn auto_detect_block_limit(device: &rmlx_metal::metal::Device) -> usize {
-    let recommended = device.recommended_max_working_set_size();
+fn auto_detect_block_limit(device: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>) -> usize {
+    let recommended = device.recommendedMaxWorkingSetSize();
     if recommended == 0 {
         return DEFAULT_BLOCK_LIMIT;
     }
@@ -578,8 +579,20 @@ fn total_physical_memory() -> usize {
 }
 
 #[cfg(test)]
+#[allow(clippy::arc_with_non_send_sync)]
 mod tests {
     use super::*;
+
+    /// Wrapper to assert Send+Sync for MetalAllocator in tests.
+    /// Metal objects are thread-safe on Apple platforms; objc2-metal
+    /// conservatively omits Send/Sync but the underlying API is safe.
+    struct SendAllocator(Arc<MetalAllocator>);
+    unsafe impl Send for SendAllocator {}
+    unsafe impl Sync for SendAllocator {}
+    impl std::ops::Deref for SendAllocator {
+        type Target = MetalAllocator;
+        fn deref(&self) -> &MetalAllocator { &self.0 }
+    }
 
     /// Helper: create a MetalAllocator or skip the test if no Metal device.
     fn make_allocator(cache_size: usize) -> Option<Arc<MetalAllocator>> {
@@ -628,9 +641,10 @@ mod tests {
         let barrier = Arc::new(std::sync::Barrier::new(num_threads));
         let success_count = Arc::new(AtomicUsize::new(0));
 
+        let send_alloc = Arc::new(SendAllocator(Arc::clone(&allocator)));
         let handles: Vec<_> = (0..num_threads)
             .map(|_| {
-                let alloc = Arc::clone(&allocator);
+                let alloc = Arc::clone(&send_alloc);
                 let bar = Arc::clone(&barrier);
                 let cnt = Arc::clone(&success_count);
                 std::thread::spawn(move || {
@@ -745,13 +759,13 @@ mod tests {
         let allocator_b = Arc::new(MetalAllocator::new(device, 0));
 
         let (buf, _offset) = allocator_b.alloc(4096).expect("alloc from B failed");
-        let original_addr = buf.gpu_address();
+        let original_addr = buf.gpuAddress();
         let returned_buf = match allocator_a.free(buf) {
             Err(AllocError::InvalidFreeBuffer(buf)) => buf,
             other => panic!("expected InvalidFreeBuffer, got {other:?}"),
         };
 
-        assert_eq!(returned_buf.gpu_address(), original_addr);
+        assert_eq!(returned_buf.gpuAddress(), original_addr);
         allocator_b
             .free(returned_buf)
             .expect("allocator B should free returned buffer");
@@ -767,9 +781,10 @@ mod tests {
             }
         };
 
-        let poison_target = Arc::clone(&allocator);
+        let poison_target = SendAllocator(Arc::clone(&allocator));
         let handle = std::thread::spawn(move || {
-            let _guard = poison_target
+            let pt = poison_target; // capture whole SendAllocator (Send+Sync)
+            let _guard = pt.0
                 .cache
                 .lock()
                 .expect("lock cache for poisoning");

@@ -12,30 +12,12 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::RwLock;
 
-use objc2::rc::Retained;
-use objc2::Message;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::*;
 
 use crate::types::*;
 use crate::MetalError;
-
-/// Retain an unsized protocol-object reference into an owned `Retained`.
-///
-/// `Retained::retain()` requires `T: Sized` (it lives in `impl<T: Message>`),
-/// but `ProtocolObject<dyn MTLFoo>` is unsized.  We work around this by
-/// calling `objc_retain` directly and wrapping the result with `from_raw`,
-/// which *is* available for `T: ?Sized + Message`.
-fn retain_proto<T: ?Sized + Message>(r: &T) -> Retained<T> {
-    let ptr = r as *const T as *mut T;
-    // SAFETY: `ptr` originates from a valid reference.  `objc_retain` increments
-    // the refcount; `from_raw` then wraps the +1 pointer without retaining again.
-    unsafe {
-        objc2::ffi::objc_retain(ptr as *mut _);
-        Retained::from_raw(ptr).unwrap_unchecked()
-    }
-}
 
 /// Thread-safe cache for compiled Metal shader libraries, keyed by
 /// a 64-bit hash of the MSL source string.

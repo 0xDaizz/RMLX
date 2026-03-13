@@ -1,5 +1,6 @@
 //! Tests for GPU event and stream manager.
 
+use objc2_metal::MTLCommandQueue as _;
 use rmlx_metal::device::GpuDevice;
 use rmlx_metal::event::{EventError, GpuEvent};
 use rmlx_metal::stream::StreamManager;
@@ -78,6 +79,6 @@ fn test_stream_manager_dual_queue() {
     };
     let streams = StreamManager::new(device.raw());
     // Both queues should be usable
-    let _cb1 = streams.compute_queue().new_command_buffer();
-    let _cb2 = streams.transfer_queue().new_command_buffer();
+    let _cb1 = streams.compute_queue().commandBuffer().unwrap();
+    let _cb2 = streams.transfer_queue().commandBuffer().unwrap();
 }

@@ -6,6 +6,8 @@
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::KernelError;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLDevice};
 
 /// Context for executing with dynamic shapes.
 ///
@@ -27,7 +29,7 @@ impl DynamicExecContext {
     ///
     /// Pre-allocates `num_intermediates` buffers of shape `[max_seq_len, hidden_dim]`.
     pub fn new(
-        device: &metal::Device,
+        device: &ProtocolObject<dyn MTLDevice>,
         max_seq_len: usize,
         hidden_dim: usize,
         dtype: DType,

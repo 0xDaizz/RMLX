@@ -12,12 +12,16 @@
 
 use std::time::{Duration, Instant};
 
-use metal::MTLSize;
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::KernelRegistry;
 use rmlx_core::ops;
 use rmlx_metal::device::GpuDevice;
+use std::ptr::NonNull;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLDevice as _, MTLCommandQueue as _, MTLCommandBuffer as _, MTLComputeCommandEncoder as _, MTLCommandEncoder as _, MTLBuffer as _};
+use rmlx_metal::{MTLSize, MTLResourceOptions};
+use rmlx_metal::types::{MtlBuffer};
 
 const WARMUP_ITERS: usize = 5;
 const BENCH_ITERS: usize = 20;
@@ -99,7 +103,7 @@ fn f32_to_f16_bits(val: f32) -> u16 {
     ((sign << 15) | (new_exp as u32) << 10 | (frac >> 13)) as u16
 }
 
-fn rand_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
+fn rand_array(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, shape: &[usize], seed: u64) -> Array {
     let numel: usize = shape.iter().product();
     let mut f16_bytes = Vec::with_capacity(numel * 2);
     let mut state = seed;
@@ -118,9 +122,9 @@ fn rand_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn make_u32_buf(device: &metal::Device, val: u32) -> metal::Buffer {
-    let opts = metal::MTLResourceOptions::StorageModeShared;
-    device.new_buffer_with_data(&val as *const u32 as *const _, 4, opts)
+fn make_u32_buf(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, val: u32) -> MtlBuffer {
+    let opts = MTLResourceOptions::StorageModeShared;
+    unsafe { device.newBufferWithBytes_length_options(NonNull::new(&val as *const u32 as *const _ as *mut _).unwrap(), 4_usize, opts).unwrap() }
 }
 
 fn ceil_div(a: usize, b: usize) -> usize {
@@ -134,8 +138,8 @@ fn ceil_div(a: usize, b: usize) -> usize {
 #[allow(clippy::too_many_arguments)]
 fn bench_gemm(
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
-    device: &metal::Device,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
     a: &Array,
     b: &Array,
     m: usize,
@@ -153,18 +157,18 @@ fn bench_gemm(
             // Fallback to matmul_into_cb for non-full variants
             // (not the focus of this benchmark)
             for _ in 0..WARMUP_ITERS {
-                let cb = queue.new_command_buffer_with_unretained_references();
-                let _ = ops::matmul::matmul_into_cb(registry, a, b, cb).unwrap();
+                let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+                let _ = ops::matmul::matmul_into_cb(registry, a, b, &cb).unwrap();
                 cb.commit();
-                cb.wait_until_completed();
+                cb.waitUntilCompleted();
             }
             let mut times = Vec::with_capacity(BENCH_ITERS);
             for _ in 0..BENCH_ITERS {
                 let start = Instant::now();
-                let cb = queue.new_command_buffer_with_unretained_references();
-                let _ = ops::matmul::matmul_into_cb(registry, a, b, cb).unwrap();
+                let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+                let _ = ops::matmul::matmul_into_cb(registry, a, b, &cb).unwrap();
                 cb.commit();
-                cb.wait_until_completed();
+                cb.waitUntilCompleted();
                 times.push(start.elapsed());
             }
             let stats = Stats::from_durations(&times);
@@ -205,55 +209,55 @@ fn bench_gemm(
 
     let grid_x = ceil_div(n, tile.bn) as u64;
     let grid_y = ceil_div(m, tile.bm) as u64;
-    let grid = MTLSize::new(grid_x, grid_y, 1);
+    let grid = MTLSize { width: grid_x as usize, height: grid_y as usize, depth: 1_usize };
     let tg_threads = match tile.variant {
         ops::matmul::TileVariant::MlxArch => 64_u64,
         _ => 256_u64,
     };
-    let tg = MTLSize::new(tg_threads, 1, 1);
+    let tg = MTLSize { width: tg_threads as usize, height: 1_usize, depth: 1_usize };
 
     // Warmup
     for _ in 0..WARMUP_ITERS {
-        let cb = queue.new_command_buffer_with_unretained_references();
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pipeline);
-        enc.set_buffer(0, Some(a.metal_buffer()), 0);
-        enc.set_buffer(1, Some(b.metal_buffer()), 0);
-        enc.set_buffer(2, Some(c.metal_buffer()), 0);
-        enc.set_buffer(3, Some(&m_buf), 0);
-        enc.set_buffer(4, Some(&n_buf), 0);
-        enc.set_buffer(5, Some(&k_buf), 0);
-        enc.set_buffer(6, Some(&bsa_buf), 0);
-        enc.set_buffer(7, Some(&bsb_buf), 0);
-        enc.set_buffer(8, Some(&bsc_buf), 0);
-        enc.set_buffer(9, Some(&swizzle_buf), 0);
-        enc.dispatch_thread_groups(grid, tg);
-        enc.end_encoding();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+        let enc = cb.computeCommandEncoder().unwrap();
+        enc.setComputePipelineState(&pipeline);
+        unsafe { enc.setBuffer_offset_atIndex(Some(a.metal_buffer()), 0_usize, 0_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(b.metal_buffer()), 0_usize, 1_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(c.metal_buffer()), 0_usize, 2_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&m_buf), 0_usize, 3_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&n_buf), 0_usize, 4_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&k_buf), 0_usize, 5_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&bsa_buf), 0_usize, 6_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&bsb_buf), 0_usize, 7_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&bsc_buf), 0_usize, 8_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&swizzle_buf), 0_usize, 9_usize) };
+        enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        enc.endEncoding();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
     }
 
     // Bench
     let mut times = Vec::with_capacity(BENCH_ITERS);
     for _ in 0..BENCH_ITERS {
         let start = Instant::now();
-        let cb = queue.new_command_buffer_with_unretained_references();
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pipeline);
-        enc.set_buffer(0, Some(a.metal_buffer()), 0);
-        enc.set_buffer(1, Some(b.metal_buffer()), 0);
-        enc.set_buffer(2, Some(c.metal_buffer()), 0);
-        enc.set_buffer(3, Some(&m_buf), 0);
-        enc.set_buffer(4, Some(&n_buf), 0);
-        enc.set_buffer(5, Some(&k_buf), 0);
-        enc.set_buffer(6, Some(&bsa_buf), 0);
-        enc.set_buffer(7, Some(&bsb_buf), 0);
-        enc.set_buffer(8, Some(&bsc_buf), 0);
-        enc.set_buffer(9, Some(&swizzle_buf), 0);
-        enc.dispatch_thread_groups(grid, tg);
-        enc.end_encoding();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+        let enc = cb.computeCommandEncoder().unwrap();
+        enc.setComputePipelineState(&pipeline);
+        unsafe { enc.setBuffer_offset_atIndex(Some(a.metal_buffer()), 0_usize, 0_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(b.metal_buffer()), 0_usize, 1_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(c.metal_buffer()), 0_usize, 2_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&m_buf), 0_usize, 3_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&n_buf), 0_usize, 4_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&k_buf), 0_usize, 5_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&bsa_buf), 0_usize, 6_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&bsb_buf), 0_usize, 7_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&bsc_buf), 0_usize, 8_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&swizzle_buf), 0_usize, 9_usize) };
+        enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        enc.endEncoding();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
         times.push(start.elapsed());
     }
 
@@ -270,8 +274,8 @@ fn bench_gemm(
 
 fn bench_grouped_gemm(
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
-    device: &metal::Device,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
 ) {
     let k = 4096;
 
@@ -309,20 +313,20 @@ fn bench_grouped_gemm(
             // Warmup
             for _ in 0..WARMUP_ITERS {
                 for (a_exp, b_exp) in &experts {
-                    let cb = queue.new_command_buffer_with_unretained_references();
-                    let _ = ops::matmul::matmul_into_cb(registry, a_exp, b_exp, cb);
+                    let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+                    let _ = ops::matmul::matmul_into_cb(registry, a_exp, b_exp, &cb);
                     cb.commit();
-                    cb.wait_until_completed();
+                    cb.waitUntilCompleted();
                 }
             }
             let mut times = Vec::with_capacity(BENCH_ITERS);
             for _ in 0..BENCH_ITERS {
                 let start = Instant::now();
                 for (a_exp, b_exp) in &experts {
-                    let cb = queue.new_command_buffer_with_unretained_references();
-                    let _ = ops::matmul::matmul_into_cb(registry, a_exp, b_exp, cb);
+                    let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+                    let _ = ops::matmul::matmul_into_cb(registry, a_exp, b_exp, &cb);
                     cb.commit();
-                    cb.wait_until_completed();
+                    cb.waitUntilCompleted();
                 }
                 times.push(start.elapsed());
             }
@@ -340,7 +344,7 @@ fn bench_grouped_gemm(
                 device,
                 unsafe {
                     std::slice::from_raw_parts(
-                        b_stacked.metal_buffer().contents() as *const u8,
+                        b_stacked.metal_buffer().contents().as_ptr() as *const u8,
                         num_experts * k * *n * 2, // f16
                     )
                 },
@@ -384,22 +388,22 @@ fn bench_grouped_gemm(
 
             // Warmup
             for _ in 0..WARMUP_ITERS {
-                let cb = queue.new_command_buffer_with_unretained_references();
+                let cb = queue.commandBufferWithUnretainedReferences().unwrap();
                 for (a_exp, b_exp) in &experts {
-                    let _ = ops::matmul::matmul_into_cb(registry, a_exp, b_exp, cb);
+                    let _ = ops::matmul::matmul_into_cb(registry, a_exp, b_exp, &cb);
                 }
                 cb.commit();
-                cb.wait_until_completed();
+                cb.waitUntilCompleted();
             }
             let mut times = Vec::with_capacity(BENCH_ITERS);
             for _ in 0..BENCH_ITERS {
                 let start = Instant::now();
-                let cb = queue.new_command_buffer_with_unretained_references();
+                let cb = queue.commandBufferWithUnretainedReferences().unwrap();
                 for (a_exp, b_exp) in &experts {
-                    let _ = ops::matmul::matmul_into_cb(registry, a_exp, b_exp, cb);
+                    let _ = ops::matmul::matmul_into_cb(registry, a_exp, b_exp, &cb);
                 }
                 cb.commit();
-                cb.wait_until_completed();
+                cb.waitUntilCompleted();
                 times.push(start.elapsed());
             }
             let stats = Stats::from_durations(&times);
@@ -418,8 +422,8 @@ fn bench_grouped_gemm(
 #[allow(clippy::too_many_arguments)]
 fn bench_with_tile(
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
-    device: &metal::Device,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
     a: &Array,
     b: &Array,
     m: usize,
@@ -453,51 +457,51 @@ fn bench_with_tile(
 
     let grid_x = ceil_div(n, tile.bn) as u64;
     let grid_y = ceil_div(m, tile.bm) as u64;
-    let grid = MTLSize::new(grid_x, grid_y, 1);
-    let tg = MTLSize::new(64, 1, 1);
+    let grid = MTLSize { width: grid_x as usize, height: grid_y as usize, depth: 1_usize };
+    let tg = MTLSize { width: 64_usize, height: 1_usize, depth: 1_usize };
 
     // Warmup
     for _ in 0..WARMUP_ITERS {
-        let cb = queue.new_command_buffer_with_unretained_references();
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pipeline);
-        enc.set_buffer(0, Some(a.metal_buffer()), 0);
-        enc.set_buffer(1, Some(b.metal_buffer()), 0);
-        enc.set_buffer(2, Some(c.metal_buffer()), 0);
-        enc.set_buffer(3, Some(&m_buf), 0);
-        enc.set_buffer(4, Some(&n_buf), 0);
-        enc.set_buffer(5, Some(&k_buf), 0);
-        enc.set_buffer(6, Some(&bsa_buf), 0);
-        enc.set_buffer(7, Some(&bsb_buf), 0);
-        enc.set_buffer(8, Some(&bsc_buf), 0);
-        enc.set_buffer(9, Some(&swizzle_buf), 0);
-        enc.dispatch_thread_groups(grid, tg);
-        enc.end_encoding();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+        let enc = cb.computeCommandEncoder().unwrap();
+        enc.setComputePipelineState(&pipeline);
+        unsafe { enc.setBuffer_offset_atIndex(Some(a.metal_buffer()), 0_usize, 0_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(b.metal_buffer()), 0_usize, 1_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(c.metal_buffer()), 0_usize, 2_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&m_buf), 0_usize, 3_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&n_buf), 0_usize, 4_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&k_buf), 0_usize, 5_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&bsa_buf), 0_usize, 6_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&bsb_buf), 0_usize, 7_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&bsc_buf), 0_usize, 8_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&swizzle_buf), 0_usize, 9_usize) };
+        enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        enc.endEncoding();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
     }
 
     // Bench
     let mut times = Vec::with_capacity(BENCH_ITERS);
     for _ in 0..BENCH_ITERS {
         let start = Instant::now();
-        let cb = queue.new_command_buffer_with_unretained_references();
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pipeline);
-        enc.set_buffer(0, Some(a.metal_buffer()), 0);
-        enc.set_buffer(1, Some(b.metal_buffer()), 0);
-        enc.set_buffer(2, Some(c.metal_buffer()), 0);
-        enc.set_buffer(3, Some(&m_buf), 0);
-        enc.set_buffer(4, Some(&n_buf), 0);
-        enc.set_buffer(5, Some(&k_buf), 0);
-        enc.set_buffer(6, Some(&bsa_buf), 0);
-        enc.set_buffer(7, Some(&bsb_buf), 0);
-        enc.set_buffer(8, Some(&bsc_buf), 0);
-        enc.set_buffer(9, Some(&swizzle_buf), 0);
-        enc.dispatch_thread_groups(grid, tg);
-        enc.end_encoding();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+        let enc = cb.computeCommandEncoder().unwrap();
+        enc.setComputePipelineState(&pipeline);
+        unsafe { enc.setBuffer_offset_atIndex(Some(a.metal_buffer()), 0_usize, 0_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(b.metal_buffer()), 0_usize, 1_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(c.metal_buffer()), 0_usize, 2_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&m_buf), 0_usize, 3_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&n_buf), 0_usize, 4_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&k_buf), 0_usize, 5_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&bsa_buf), 0_usize, 6_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&bsb_buf), 0_usize, 7_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&bsc_buf), 0_usize, 8_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&swizzle_buf), 0_usize, 9_usize) };
+        enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        enc.endEncoding();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
         times.push(start.elapsed());
     }
 
@@ -510,7 +514,7 @@ fn main() {
     let registry = KernelRegistry::new(gpu);
     ops::register_all(&registry).expect("Failed to register kernels");
     let device = registry.device().raw();
-    let queue = device.new_command_queue();
+    let queue = device.newCommandQueue().unwrap();
 
     let k = 4096;
     let n_values = [14336, 4096, 2048, 1536, 768];
@@ -579,7 +583,7 @@ fn main() {
                     device,
                     unsafe {
                         std::slice::from_raw_parts(
-                            b_flat.metal_buffer().contents() as *const u8,
+                            b_flat.metal_buffer().contents().as_ptr() as *const u8,
                             num_experts * splitk_k * *n * 2,
                         )
                     },
@@ -657,18 +661,18 @@ fn main() {
 
                 // GEMM
                 for _ in 0..WARMUP_ITERS {
-                    let cb = queue.new_command_buffer_with_unretained_references();
-                    let _ = ops::matmul::matmul_into_cb(&registry, &a, &b, cb);
+                    let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+                    let _ = ops::matmul::matmul_into_cb(&registry, &a, &b, &cb);
                     cb.commit();
-                    cb.wait_until_completed();
+                    cb.waitUntilCompleted();
                 }
                 let mut gemm_times = Vec::with_capacity(BENCH_ITERS);
                 for _ in 0..BENCH_ITERS {
                     let start = Instant::now();
-                    let cb = queue.new_command_buffer_with_unretained_references();
-                    let _ = ops::matmul::matmul_into_cb(&registry, &a, &b, cb);
+                    let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+                    let _ = ops::matmul::matmul_into_cb(&registry, &a, &b, &cb);
                     cb.commit();
-                    cb.wait_until_completed();
+                    cb.waitUntilCompleted();
                     gemm_times.push(start.elapsed());
                 }
                 let gemm_stats = Stats::from_durations(&gemm_times);
@@ -679,22 +683,22 @@ fn main() {
                     .collect();
 
                 for _ in 0..WARMUP_ITERS {
-                    let cb = queue.new_command_buffer_with_unretained_references();
+                    let cb = queue.commandBufferWithUnretainedReferences().unwrap();
                     for a_row in &a_rows {
-                        let _ = ops::matmul::matmul_into_cb(&registry, a_row, &b, cb);
+                        let _ = ops::matmul::matmul_into_cb(&registry, a_row, &b, &cb);
                     }
                     cb.commit();
-                    cb.wait_until_completed();
+                    cb.waitUntilCompleted();
                 }
                 let mut gemv_times = Vec::with_capacity(BENCH_ITERS);
                 for _ in 0..BENCH_ITERS {
                     let start = Instant::now();
-                    let cb = queue.new_command_buffer_with_unretained_references();
+                    let cb = queue.commandBufferWithUnretainedReferences().unwrap();
                     for a_row in &a_rows {
-                        let _ = ops::matmul::matmul_into_cb(&registry, a_row, &b, cb);
+                        let _ = ops::matmul::matmul_into_cb(&registry, a_row, &b, &cb);
                     }
                     cb.commit();
-                    cb.wait_until_completed();
+                    cb.waitUntilCompleted();
                     gemv_times.push(start.elapsed());
                 }
                 let gemv_stats = Stats::from_durations(&gemv_times);

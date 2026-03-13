@@ -422,6 +422,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "objc2",
+ "objc2-metal",
  "rmlx-metal",
  "tracing",
 ]
@@ -440,9 +441,11 @@ dependencies = [
 name = "rmlx-core"
 version = "0.1.0"
 dependencies = [
+ "block2",
  "bumpalo",
  "half",
  "objc2",
+ "objc2-foundation",
  "objc2-metal",
  "rmlx-alloc",
  "rmlx-macros",
@@ -455,6 +458,8 @@ dependencies = [
 name = "rmlx-distributed"
 version = "0.1.0"
 dependencies = [
+ "objc2",
+ "objc2-foundation",
  "objc2-metal",
  "rmlx-alloc",
  "rmlx-core",
@@ -510,6 +515,7 @@ dependencies = [
  "half",
  "libc",
  "libloading",
+ "objc2",
  "objc2-metal",
  "rmlx-alloc",
  "rmlx-metal",

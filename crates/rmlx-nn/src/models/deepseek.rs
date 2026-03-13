@@ -20,6 +20,8 @@ use crate::linear::{Linear, LinearConfig};
 use crate::mla::{Mla, MlaConfig, MlaKvCache};
 use crate::moe::{MoeConfig, MoeLayer};
 use crate::transformer::{FeedForward, FeedForwardType, TransformerConfig};
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLCommandQueue};
 
 /// DeepSeek-V3 specific configuration fields not captured by `TransformerConfig`.
 ///
@@ -223,7 +225,7 @@ impl DeepSeekV3Block {
         sin_freqs: Option<&Array>,
         cache: Option<&mut MlaKvCache>,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         let norm1_w = self.norm1_weight.as_ref().ok_or_else(|| {
             KernelError::InvalidShape("DeepSeekV3Block: norm1_weight not loaded".into())
@@ -409,7 +411,7 @@ impl DeepSeekV3Model {
         _mask: Option<&Array>,
         mut cache: Option<&mut Vec<MlaKvCache>>,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         let embedding = self.embedding.as_ref().ok_or_else(|| {
             KernelError::InvalidShape("DeepSeekV3Model: embedding not loaded".into())

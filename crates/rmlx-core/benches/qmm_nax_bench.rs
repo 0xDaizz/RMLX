@@ -21,6 +21,10 @@ use rmlx_core::kernels::KernelRegistry;
 use rmlx_core::ops;
 use rmlx_core::ops::quantized::QuantizedWeight;
 use rmlx_metal::device::GpuDevice;
+use std::ptr::NonNull;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLDevice as _, MTLCommandQueue as _, MTLCommandBuffer as _};
+use rmlx_metal::{MTLResourceOptions};
 
 const WARMUP_ITERS: usize = 5;
 const BENCH_ITERS: usize = 20;
@@ -69,7 +73,7 @@ fn lcg_next(state: &mut u64) -> u64 {
     *state
 }
 
-fn rand_f16_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
+fn rand_f16_array(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, shape: &[usize], seed: u64) -> Array {
     let numel: usize = shape.iter().product();
     let mut state = seed;
     let mut f16_bytes = Vec::with_capacity(numel * 2);
@@ -83,7 +87,7 @@ fn rand_f16_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
 }
 
 fn make_quantized_weight(
-    device: &metal::Device,
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
     out_features: usize,
     in_features: usize,
     bits: u32,
@@ -91,7 +95,7 @@ fn make_quantized_weight(
     seed: u64,
 ) -> QuantizedWeight {
     let mut state = seed;
-    let opts = metal::MTLResourceOptions::StorageModeShared;
+    let opts = MTLResourceOptions::StorageModeShared;
 
     let elems_per_u32 = 32 / bits as usize;
     let total_elements = out_features * in_features;
@@ -103,7 +107,7 @@ fn make_quantized_weight(
         })
         .collect();
     let weights_buf =
-        device.new_buffer_with_data(w_data.as_ptr() as *const _, (num_u32s * 4) as u64, opts);
+        unsafe { device.newBufferWithBytes_length_options(NonNull::new(w_data.as_ptr() as *const _ as *mut _).unwrap(), (num_u32s * 4) as u64 as usize, opts).unwrap() };
 
     let num_groups = total_elements / group_size as usize;
     let scales_f32: Vec<f32> = (0..num_groups)
@@ -128,16 +132,8 @@ fn make_quantized_weight(
         .map(|&v| rmlx_core::ops::quantized::f32_to_f16_bits(v))
         .collect();
 
-    let scales_buf = device.new_buffer_with_data(
-        scales_data.as_ptr() as *const _,
-        (num_groups * 2) as u64,
-        opts,
-    );
-    let biases_buf = device.new_buffer_with_data(
-        biases_data.as_ptr() as *const _,
-        (num_groups * 2) as u64,
-        opts,
-    );
+    let scales_buf = unsafe { device.newBufferWithBytes_length_options(NonNull::new(scales_data.as_ptr() as *const _ as *mut _).unwrap(), (num_groups * 2) as u64 as usize, opts).unwrap() };
+    let biases_buf = unsafe { device.newBufferWithBytes_length_options(NonNull::new(biases_data.as_ptr() as *const _ as *mut _).unwrap(), (num_groups * 2) as u64 as usize, opts).unwrap() };
 
     QuantizedWeight::new(
         weights_buf,
@@ -166,8 +162,8 @@ fn tflops(m: usize, n: usize, k: usize, latency_us: f64) -> f64 {
 
 fn bench_nax_v1(
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
-    device: &metal::Device,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
     m: usize,
     n: usize,
     k: usize,
@@ -177,21 +173,21 @@ fn bench_nax_v1(
     let x = rand_f16_array(device, &[m, k], 99);
 
     for _ in 0..WARMUP_ITERS {
-        let cb = queue.new_command_buffer_with_unretained_references();
-        let _ = ops::quantized::affine_qmm_nax_q4_into_cb(registry, &x, &qw, cb)
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+        let _ = ops::quantized::affine_qmm_nax_q4_into_cb(registry, &x, &qw, &cb)
             .expect("NAX v1 warmup failed");
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
     }
 
     let mut times = Vec::with_capacity(BENCH_ITERS);
     for _ in 0..BENCH_ITERS {
-        let cb = queue.new_command_buffer_with_unretained_references();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
         let start = Instant::now();
-        let _ = ops::quantized::affine_qmm_nax_q4_into_cb(registry, &x, &qw, cb)
+        let _ = ops::quantized::affine_qmm_nax_q4_into_cb(registry, &x, &qw, &cb)
             .expect("NAX v1 bench failed");
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
         times.push(start.elapsed());
     }
     Stats::from_durations(&times)
@@ -199,8 +195,8 @@ fn bench_nax_v1(
 
 fn bench_nax_v2(
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
-    device: &metal::Device,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
     m: usize,
     n: usize,
     k: usize,
@@ -210,21 +206,21 @@ fn bench_nax_v2(
     let x = rand_f16_array(device, &[m, k], 99);
 
     for _ in 0..WARMUP_ITERS {
-        let cb = queue.new_command_buffer_with_unretained_references();
-        let _ = ops::quantized::affine_qmm_nax_v2_q4_into_cb(registry, &x, &qw, cb)
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+        let _ = ops::quantized::affine_qmm_nax_v2_q4_into_cb(registry, &x, &qw, &cb)
             .expect("NAX v2 warmup failed");
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
     }
 
     let mut times = Vec::with_capacity(BENCH_ITERS);
     for _ in 0..BENCH_ITERS {
-        let cb = queue.new_command_buffer_with_unretained_references();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
         let start = Instant::now();
-        let _ = ops::quantized::affine_qmm_nax_v2_q4_into_cb(registry, &x, &qw, cb)
+        let _ = ops::quantized::affine_qmm_nax_v2_q4_into_cb(registry, &x, &qw, &cb)
             .expect("NAX v2 bench failed");
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
         times.push(start.elapsed());
     }
     Stats::from_durations(&times)
@@ -239,7 +235,7 @@ fn main() {
     let registry = KernelRegistry::new(gpu);
     ops::register_all(&registry).expect("Failed to register kernels");
     let device = registry.device().raw();
-    let queue = device.new_command_queue();
+    let queue = device.newCommandQueue().unwrap();
 
     let n: usize = 14336;
     let k: usize = 3584;

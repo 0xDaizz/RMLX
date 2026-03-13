@@ -1,5 +1,6 @@
 //! Integration tests for rmlx-alloc
 
+use objc2_metal::MTLBuffer as _;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -78,7 +79,7 @@ fn test_buffer_cache_acquire_release() {
     // Allocate a real Metal buffer via the device, then release into cache
     let buf = device.new_buffer(
         4096,
-        rmlx_metal::metal::MTLResourceOptions::StorageModeShared,
+        rmlx_metal::MTLResourceOptions::StorageModeShared,
     );
     let buf_len = buf.length();
     assert!(buf_len >= 4096);
@@ -347,7 +348,7 @@ fn test_small_alloc_uses_pool() {
     assert!(buf.length() > 0);
     // Sub-allocation offset must be within the backing buffer.
     assert!(
-        sub_offset + 64 <= buf.length() as usize,
+        sub_offset + 64 <= buf.length(),
         "sub_offset ({sub_offset}) + size (64) must fit within backing buffer length ({})",
         buf.length()
     );

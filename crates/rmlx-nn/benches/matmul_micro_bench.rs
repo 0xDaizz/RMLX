@@ -17,13 +17,15 @@
 //!   cargo bench -p rmlx-nn --bench matmul_micro_bench
 
 use std::time::{Duration, Instant};
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLCommandBuffer as _, MTLCommandQueue as _, MTLDevice as _};
 
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::KernelRegistry;
 use rmlx_core::ops;
 use rmlx_metal::device::GpuDevice;
-use rmlx_metal::ScopedPool;
+use rmlx_metal::autoreleasepool;
 
 const WARMUP_ITERS: usize = 5;
 const BENCH_ITERS: usize = 20;
@@ -98,7 +100,7 @@ fn rand_f16_bytes(numel: usize, seed: u64) -> Vec<u8> {
     f16_bytes
 }
 
-fn rand_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
+fn rand_array(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, shape: &[usize], seed: u64) -> Array {
     let numel: usize = shape.iter().product();
     let f16_bytes = rand_f16_bytes(numel, seed);
     Array::from_bytes(device, &f16_bytes, shape.to_vec(), DType::Float16)
@@ -108,10 +110,10 @@ fn rand_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
 // CB status validation
 // ---------------------------------------------------------------------------
 
-fn assert_cb_ok(cb: &metal::CommandBufferRef, context: &str) {
+fn assert_cb_ok(cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>, context: &str) {
     let status = cb.status();
     assert!(
-        status != metal::MTLCommandBufferStatus::Error,
+        status != objc2_metal::MTLCommandBufferStatus::Error,
         "GPU command buffer error in {context}: status={status:?}"
     );
 }
@@ -120,19 +122,20 @@ fn assert_cb_ok(cb: &metal::CommandBufferRef, context: &str) {
 // Timing helper
 // ---------------------------------------------------------------------------
 
-fn time_op<F>(queue: &metal::CommandQueue, f: F) -> Duration
+fn time_op<F>(queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>, f: F) -> Duration
 where
-    F: FnOnce(&metal::CommandBufferRef),
+    F: FnOnce(&ProtocolObject<dyn objc2_metal::MTLCommandBuffer>),
 {
-    let _pool = ScopedPool::new();
-    let cb = queue.new_command_buffer_with_unretained_references();
-    let start = Instant::now();
-    f(cb);
-    cb.commit();
-    cb.wait_until_completed();
-    let elapsed = start.elapsed();
-    assert_cb_ok(cb, "time_op");
-    elapsed
+    autoreleasepool(|_| {
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+        let start = Instant::now();
+        f(&cb);
+        cb.commit();
+        cb.waitUntilCompleted();
+        let elapsed = start.elapsed();
+        assert_cb_ok(&cb, "time_op");
+        elapsed
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -204,24 +207,23 @@ fn main() {
     println!();
 
     // ── JIT Warmup: pre-compile PSOs for all shapes ──
-    {
+    autoreleasepool(|_| {
         println!("[JIT Warmup] Pre-compiling matmul kernels for all shape variants...");
-        let _pool = ScopedPool::new();
-        let warmup_queue = device.new_command_queue();
+        let warmup_queue = device.newCommandQueue().unwrap();
 
         for m in M_VALUES {
             for shape in SHAPES {
                 let a = rand_array(device, &[*m, shape.k], 42);
                 let b = rand_array(device, &[shape.k, shape.n], 43);
-                let cb = warmup_queue.new_command_buffer_with_unretained_references();
+                let cb = warmup_queue.commandBufferWithUnretainedReferences().unwrap();
                 let _ =
-                    ops::matmul::matmul_into_cb(&registry, &a, &b, cb).expect("jit warmup matmul");
+                    ops::matmul::matmul_into_cb(&registry, &a, &b, &cb).expect("jit warmup matmul");
                 cb.commit();
-                cb.wait_until_completed();
+                cb.waitUntilCompleted();
             }
         }
         println!("[JIT Warmup] Done.\n");
-    }
+    });
 
     // Let Metal driver settle
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -230,7 +232,7 @@ fn main() {
     let mut results: Vec<BenchResult> = Vec::new();
 
     for &m in M_VALUES {
-        let queue = device.new_command_queue();
+        let queue = device.newCommandQueue().unwrap();
 
         for shape in SHAPES {
             let a = rand_array(device, &[m, shape.k], 100 + m as u64);

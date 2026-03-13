@@ -36,6 +36,8 @@ use rmlx_core::dtype::DType;
 use safetensors::SafeTensors;
 
 use crate::quantized_linear::{QuantBits, QuantizedLinear};
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLDevice};
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -345,7 +347,7 @@ impl SafetensorsWeightMap {
 /// For quantized models, pass a `QuantizationConfig` to automatically
 /// detect weight/scales/biases triplets and create `QuantizedLinear` layers.
 pub fn load_safetensors_weights<P: AsRef<Path>>(
-    device: &metal::Device,
+    device: &ProtocolObject<dyn MTLDevice>,
     path: P,
     quant_config: Option<&QuantizationConfig>,
 ) -> Result<SafetensorsWeightMap, SafetensorsLoadError> {
@@ -364,7 +366,7 @@ pub fn load_safetensors_weights<P: AsRef<Path>>(
 ///
 /// Files like `model-00001-of-00003.safetensors`, etc.
 pub fn load_safetensors_sharded<P: AsRef<Path>>(
-    device: &metal::Device,
+    device: &ProtocolObject<dyn MTLDevice>,
     paths: &[P],
     quant_config: Option<&QuantizationConfig>,
 ) -> Result<SafetensorsWeightMap, SafetensorsLoadError> {
@@ -385,7 +387,7 @@ pub fn load_safetensors_sharded<P: AsRef<Path>>(
 
 /// Load non-quantized tensors.
 fn load_plain(
-    device: &metal::Device,
+    device: &ProtocolObject<dyn MTLDevice>,
     st: &SafeTensors,
 ) -> Result<SafetensorsWeightMap, SafetensorsLoadError> {
     let mut tensors = HashMap::new();
@@ -416,7 +418,7 @@ fn load_plain(
 /// `.biases` tensors exist. If so, assembles a `QuantizedLinear`. Otherwise,
 /// loads as a regular Array.
 fn load_quantized(
-    device: &metal::Device,
+    device: &ProtocolObject<dyn MTLDevice>,
     st: &SafeTensors,
     qc: &QuantizationConfig,
 ) -> Result<SafetensorsWeightMap, SafetensorsLoadError> {
@@ -917,10 +919,8 @@ mod tests {
         let path = dir.join("model.safetensors");
         std::fs::write(&path, &serialized).unwrap();
 
-        let device = rmlx_metal::device::GpuDevice::system_default()
-            .expect("system_default Metal device")
-            .raw()
-            .clone();
+        let device = objc2_metal::MTLCreateSystemDefaultDevice()
+            .expect("system_default Metal device");
 
         let wmap = load_safetensors_weights(&device, &path, None).unwrap();
         assert_eq!(wmap.len(), 1);
@@ -950,10 +950,8 @@ mod tests {
         let path = dir.join("model.safetensors");
         std::fs::write(&path, &serialized).unwrap();
 
-        let device = rmlx_metal::device::GpuDevice::system_default()
-            .expect("system_default Metal device")
-            .raw()
-            .clone();
+        let device = objc2_metal::MTLCreateSystemDefaultDevice()
+            .expect("system_default Metal device");
 
         let wmap = load_safetensors_weights(&device, &path, None).unwrap();
         let arr = wmap.get("embed").unwrap();
@@ -1011,10 +1009,8 @@ mod tests {
         let path = dir.join("model.safetensors");
         std::fs::write(&path, &serialized).unwrap();
 
-        let device = rmlx_metal::device::GpuDevice::system_default()
-            .expect("system_default Metal device")
-            .raw()
-            .clone();
+        let device = objc2_metal::MTLCreateSystemDefaultDevice()
+            .expect("system_default Metal device");
 
         let qc = QuantizationConfig {
             bits: 4,

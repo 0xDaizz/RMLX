@@ -18,7 +18,7 @@
 //!
 //! # Zero-copy path
 //!
-//! Each [`Slab`] wraps a `metal::Buffer` allocated with `StorageModeShared`,
+//! Each [`Slab`] wraps an `MTLBuffer` allocated with `StorageModeShared`,
 //! giving both the GPU and CPU access to the same physical memory on Apple
 //! Silicon UMA. When these buffers are additionally registered as RDMA memory
 //! regions (via [`rmlx_rdma::shared_buffer::SharedBuffer`]), the full path
@@ -28,6 +28,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLCommandBuffer, MTLDevice};
+use rmlx_metal::{MTLResourceOptions, MtlBuffer};
 use rmlx_metal::event::{EventError, GpuEvent};
 
 // ── Slab ──
@@ -39,10 +42,10 @@ use rmlx_metal::event::{EventError, GpuEvent};
 /// RDMA memory region (done externally), the GPU can write directly into
 /// wire-ready memory.
 ///
-/// `Debug` is manually implemented because `metal::Buffer` does not derive it.
+/// `Debug` is manually implemented because `MtlBuffer` does not derive it.
 pub struct Slab {
     /// Metal buffer (`storageModeShared` for UMA CPU/GPU access).
-    pub metal_buffer: metal::Buffer,
+    pub metal_buffer: MtlBuffer,
     /// Size in bytes.
     pub size: usize,
     /// Slab index in the ring.
@@ -164,16 +167,15 @@ impl SlabRing {
     /// Each slab is allocated as `storageModeShared` for UMA GPU/CPU access.
     /// The caller is responsible for additionally registering these buffers as
     /// RDMA memory regions if zero-copy RDMA transfer is desired.
-    pub fn new(device: &metal::Device, config: SlabRingConfig) -> Self {
+    pub fn new(device: &ProtocolObject<dyn MTLDevice>, config: SlabRingConfig) -> Self {
         assert!(config.depth > 0, "slab ring depth must be > 0");
         assert!(config.slab_size > 0, "slab ring slab_size must be > 0");
 
         let mut slabs = Vec::with_capacity(config.depth);
         for i in 0..config.depth {
-            let metal_buffer = device.new_buffer(
-                config.slab_size as u64,
-                metal::MTLResourceOptions::StorageModeShared,
-            );
+            let metal_buffer = device
+                .newBufferWithLength_options(config.slab_size, MTLResourceOptions::StorageModeShared)
+                .unwrap();
             slabs.push(Slab {
                 metal_buffer,
                 size: config.slab_size,
@@ -303,7 +305,7 @@ impl SlabRing {
     /// producer position (which is the value that `acquire_for_write` claimed).
     ///
     /// [`acquire_for_write()`]: Self::acquire_for_write
-    pub fn produce(&self, cb: &metal::CommandBufferRef) {
+    pub fn produce(&self, cb: &ProtocolObject<dyn MTLCommandBuffer>) {
         // producer_pos was already advanced by acquire_for_write via CAS.
         // Signal the event at the current producer_pos value so consumers
         // can observe that the slab is ready.
@@ -464,13 +466,27 @@ impl SlabRing {
 // ── Tests ──
 
 #[cfg(test)]
+#[allow(clippy::arc_with_non_send_sync)]
 mod tests {
     use super::*;
+    use objc2_metal::{MTLCommandQueue as _, MTLBuffer as _};
     use std::time::Instant;
 
+    /// Wrapper to assert Send+Sync for SlabRing in tests.
+    /// Metal objects are thread-safe on Apple platforms; objc2-metal
+    /// conservatively omits Send/Sync but the underlying API is safe.
+    #[derive(Clone)]
+    struct SendRing(Arc<SlabRing>);
+    unsafe impl Send for SendRing {}
+    unsafe impl Sync for SendRing {}
+    impl std::ops::Deref for SendRing {
+        type Target = SlabRing;
+        fn deref(&self) -> &SlabRing { &self.0 }
+    }
+
     /// Helper: get the default Metal device, skip test if unavailable.
-    fn require_device() -> metal::Device {
-        match metal::Device::system_default() {
+    fn require_device() -> rmlx_metal::MtlDevice {
+        match objc2_metal::MTLCreateSystemDefaultDevice() {
             Some(d) => d,
             None => {
                 eprintln!("skipping test: no Metal device available");
@@ -675,7 +691,7 @@ mod tests {
     fn test_produce_and_blocking_consume() {
         // Test the real produce() + consume() path with a Metal command buffer.
         let device = require_device();
-        let queue = device.new_command_queue();
+        let queue = device.newCommandQueue().unwrap();
         let config = SlabRingConfig {
             depth: 2,
             slab_size: 1024,
@@ -687,10 +703,10 @@ mod tests {
         assert_eq!(slab.index, 0);
 
         // Create a command buffer, encode the event signal, and commit.
-        let cb = queue.new_command_buffer();
-        ring.produce(cb);
+        let cb = queue.commandBuffer().unwrap();
+        ring.produce(&cb);
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
 
         // Now blocking consume should succeed immediately.
         let consumed = ring.consume(Duration::from_secs(1)).unwrap();
@@ -705,7 +721,7 @@ mod tests {
         // Simulates a 3-deep pipeline: produce slab 0, produce slab 1,
         // consume slab 0, produce slab 2, consume slab 1, consume slab 2.
         let device = require_device();
-        let queue = device.new_command_queue();
+        let queue = device.newCommandQueue().unwrap();
         let config = SlabRingConfig {
             depth: 3,
             slab_size: 512,
@@ -714,18 +730,18 @@ mod tests {
 
         // Produce slab 0.
         let _ = ring.acquire_for_write().unwrap();
-        let cb = queue.new_command_buffer();
-        ring.produce(cb);
+        let cb = queue.commandBuffer().unwrap();
+        ring.produce(&cb);
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
         assert_eq!(ring.in_flight(), 1);
 
         // Produce slab 1.
         let _ = ring.acquire_for_write().unwrap();
-        let cb = queue.new_command_buffer();
-        ring.produce(cb);
+        let cb = queue.commandBuffer().unwrap();
+        ring.produce(&cb);
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
         assert_eq!(ring.in_flight(), 2);
 
         // Consume slab 0.
@@ -736,10 +752,10 @@ mod tests {
 
         // Produce slab 2.
         let _ = ring.acquire_for_write().unwrap();
-        let cb = queue.new_command_buffer();
-        ring.produce(cb);
+        let cb = queue.commandBuffer().unwrap();
+        ring.produce(&cb);
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
         assert_eq!(ring.in_flight(), 2);
 
         // Consume slab 1.
@@ -766,7 +782,7 @@ mod tests {
         let ring = SlabRing::new(&device, config);
 
         let slab = ring.slab(0);
-        let ptr = slab.metal_buffer.contents() as *mut u8;
+        let ptr = slab.metal_buffer.contents().as_ptr() as *mut u8;
         assert!(!ptr.is_null());
 
         // Write a pattern and read it back (StorageModeShared = CPU-accessible).
@@ -797,7 +813,7 @@ mod tests {
         // Producers: each tries to acquire slabs
         let mut handles = vec![];
         for _ in 0..num_producers {
-            let ring = Arc::clone(&ring);
+            let ring = SendRing(Arc::clone(&ring));
             let produced = Arc::clone(&total_produced);
             let h = std::thread::spawn(move || {
                 for _ in 0..iterations {
@@ -817,7 +833,7 @@ mod tests {
         }
 
         // Consumer: drains the ring
-        let ring_c = Arc::clone(&ring);
+        let ring_c = SendRing(Arc::clone(&ring));
         let consumed = Arc::clone(&total_consumed);
         let consumer = std::thread::spawn(move || {
             // Keep consuming until we have consumed everything producers produced.
@@ -869,7 +885,7 @@ mod tests {
         let _s1 = ring.acquire_for_write().unwrap();
         assert!(ring.is_full());
 
-        let ring_prod = Arc::clone(&ring);
+        let ring_prod = SendRing(Arc::clone(&ring));
         let produced = Arc::new(AtomicU64::new(0));
         let produced_c = Arc::clone(&produced);
 
@@ -934,7 +950,7 @@ mod tests {
         let _s = ring.acquire_for_write().unwrap();
         assert!(ring.is_full());
 
-        let ring_prod = Arc::clone(&ring);
+        let ring_prod = SendRing(Arc::clone(&ring));
         let producer = std::thread::spawn(move || {
             ring_prod
                 .acquire_for_write_timeout(Duration::from_secs(2))
@@ -990,7 +1006,7 @@ mod tests {
         let ring = Arc::new(SlabRing::new(&device, config));
         let total_items = 20u64;
 
-        let ring_prod = Arc::clone(&ring);
+        let ring_prod = SendRing(Arc::clone(&ring));
         let producer = std::thread::spawn(move || {
             for _ in 0..total_items {
                 // acquire_for_write blocks if ring is full — no data loss.
@@ -998,7 +1014,7 @@ mod tests {
             }
         });
 
-        let ring_cons = Arc::clone(&ring);
+        let ring_cons = SendRing(Arc::clone(&ring));
         let consumer = std::thread::spawn(move || {
             let mut consumed = 0u64;
             let mut retries = 0u64;
@@ -1052,7 +1068,7 @@ mod tests {
         // Spawn producers that all use blocking acquire_for_write.
         let mut handles = vec![];
         for _ in 0..num_producers {
-            let ring = Arc::clone(&ring);
+            let ring = SendRing(Arc::clone(&ring));
             let produced = Arc::clone(&produced);
             let h = std::thread::spawn(move || {
                 for _ in 0..total_per_producer {
@@ -1064,7 +1080,7 @@ mod tests {
         }
 
         // Consumer: drain until all items consumed.
-        let ring_c = Arc::clone(&ring);
+        let ring_c = SendRing(Arc::clone(&ring));
         let consumed_c = Arc::clone(&consumed);
         let consumer = std::thread::spawn(move || {
             let mut count = 0u64;

@@ -7,7 +7,14 @@
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
-use metal::MTLSize;
+use rmlx_metal::MTLSize;
+use rmlx_metal::ComputePass;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLComputePipelineState as _;
+use objc2_metal::MTLCommandBuffer as _;
+use objc2_metal::MTLCommandQueue as _;
+use objc2_metal::MTLDevice as _;
+use rmlx_metal::MTLResourceOptions;
 
 // ---------------------------------------------------------------------------
 // Metal shader source
@@ -119,29 +126,26 @@ pub fn register(registry: &KernelRegistry) -> Result<(), KernelError> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn make_u32_buf(device: &metal::Device, val: u32) -> metal::Buffer {
-    device.new_buffer_with_data(
-        &val as *const u32 as *const std::ffi::c_void,
-        4,
-        metal::MTLResourceOptions::StorageModeShared,
-    )
+fn make_u32_buf(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, val: u32) -> rmlx_metal::MtlBuffer {
+    unsafe { device.newBufferWithBytes_length_options(std::ptr::NonNull::new(&val as *const u32 as *const std::ffi::c_void as *mut std::ffi::c_void).unwrap(), 4_usize, MTLResourceOptions::StorageModeShared).unwrap() }
 }
 
-fn make_u32_vec_buf(device: &metal::Device, vals: &[u32]) -> metal::Buffer {
-    if vals.is_empty() {
-        // Metal needs at least 1 byte.
-        return device.new_buffer(4, metal::MTLResourceOptions::StorageModeShared);
+fn make_u32_vec_buf(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    vals: &[u32],
+) -> rmlx_metal::MtlBuffer {
+    if vals.is_empty() { // Metal needs at least 1 byte. return device.newBufferWithLength_options(4 as usize, MTLResourceOptions::StorageModeShared).unwrap();
+
     }
-    device.new_buffer_with_data(
-        vals.as_ptr() as *const std::ffi::c_void,
-        (vals.len() * 4) as u64,
-        metal::MTLResourceOptions::StorageModeShared,
-    )
+    unsafe { device.newBufferWithBytes_length_options(std::ptr::NonNull::new(vals.as_ptr() as *const std::ffi::c_void as *mut std::ffi::c_void).unwrap(), (vals.len() * 4) as u64 as usize, MTLResourceOptions::StorageModeShared).unwrap() }
 }
 
 /// Compute contiguous strides for a shape (in elements).
-fn contiguous_strides(shape: &[usize]) -> Vec<usize> {
+fn contiguous_strides(
+    shape: &[usize],
+) -> Vec<usize> {
     let ndim = shape.len();
+
     if ndim == 0 {
         return vec![];
     }
@@ -171,7 +175,7 @@ pub fn slice(
     starts: &[usize],
     ends: &[usize],
     strides: &[usize],
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     let ndim = input.ndim();
     if starts.len() != ndim || ends.len() != ndim || strides.len() != ndim {
@@ -257,10 +261,11 @@ pub fn slice(
     let slice_strides_buf = make_u32_vec_buf(dev, &slice_strides_u32);
     let numel_buf = make_u32_buf(dev, numel_u32);
 
-    let cb = queue.new_command_buffer();
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
+    let cb = queue.commandBuffer().unwrap();
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
+    enc.set_buffer(0, Some(input.metal_buffer()), input.offset());
     enc.set_buffer(1, Some(out.metal_buffer()), 0);
     enc.set_buffer(2, Some(&ndim_buf), 0);
     enc.set_buffer(3, Some(&out_shape_buf), 0);
@@ -269,16 +274,11 @@ pub fn slice(
     enc.set_buffer(6, Some(&starts_buf), 0);
     enc.set_buffer(7, Some(&slice_strides_buf), 0);
     enc.set_buffer(8, Some(&numel_buf), 0);
-
-    let grid = MTLSize::new(out_numel as u64, 1, 1);
-    let tg = MTLSize::new(
-        std::cmp::min(256u64, pipeline.max_total_threads_per_threadgroup()),
-        1,
-        1,
-    );
+    let grid = MTLSize { width: out_numel, height: 1, depth: 1 };
+    let tg = MTLSize { width: std::cmp::min(256usize, pipeline.maxTotalThreadsPerThreadgroup()), height: 1, depth: 1 };
     enc.dispatch_threads(grid, tg);
-    enc.end_encoding();
-    super::commit_with_mode(cb, super::ExecMode::Sync);
+    enc.end();
+    super::commit_with_mode(&cb, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -287,9 +287,9 @@ pub fn slice(
 mod tests {
     use super::*;
 
-    fn setup() -> (KernelRegistry, metal::CommandQueue) {
+    fn setup() -> (KernelRegistry, rmlx_metal::MtlQueue) {
         let device = rmlx_metal::device::GpuDevice::system_default().expect("Metal device");
-        let queue = device.raw().new_command_queue();
+        let queue = device.new_command_queue();
         let registry = KernelRegistry::new(device);
         register(&registry).expect("register slice kernels");
         (registry, queue)

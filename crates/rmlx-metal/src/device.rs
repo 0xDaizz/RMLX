@@ -273,7 +273,7 @@ pub struct GpuDevice {
 impl GpuDevice {
     /// Acquire the system default Metal device.
     pub fn system_default() -> Result<Self, MetalError> {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.ok_or(MetalError::NoDevice)?;
+        let device = MTLCreateSystemDefaultDevice().ok_or(MetalError::NoDevice)?;
         let device_name = device.name().to_string();
         let arch = detect_architecture(&device_name);
         let tuning = ChipTuning::for_device(&device);
@@ -366,17 +366,7 @@ impl GpuDevice {
     /// Uses the safe default [`DEFAULT_BUFFER_OPTIONS`] (`StorageModeShared`)
     /// so the buffer is CPU+GPU visible with Metal hazard tracking enabled.
     pub fn new_buffer_with_data<T>(&self, data: &[T]) -> MtlBuffer {
-        let size = std::mem::size_of_val(data);
-        let ptr = data.as_ptr() as *mut std::ffi::c_void;
-        unsafe {
-            self.device
-                .newBufferWithBytes_length_options(
-                    std::ptr::NonNull::new(ptr).unwrap(),
-                    size,
-                    DEFAULT_BUFFER_OPTIONS,
-                )
-                .unwrap()
-        }
+        crate::buffer::new_buffer_with_data(&self.device, data)
     }
 }
 
@@ -490,7 +480,7 @@ mod tests {
 
     #[test]
     fn test_chip_tuning_for_device_runs() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
+        let device = MTLCreateSystemDefaultDevice().unwrap();
         let tuning = ChipTuning::for_device(&device);
         // On any Apple Silicon these should hold:
         assert!(tuning.max_threadgroup_memory >= 16 * 1024);
@@ -530,7 +520,7 @@ mod tests {
     #[test]
     fn test_create_command_buffer_both_paths() {
         // Verify that both the unretained and retained paths produce valid CBs.
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
+        let device = MTLCreateSystemDefaultDevice().unwrap();
         let queue = device.newCommandQueue().unwrap();
 
         // Retained path (standard)
@@ -550,28 +540,34 @@ mod tests {
 
     #[test]
     fn test_tracked_buffer_options() {
-        assert!((TRACKED_BUFFER_OPTIONS.0 & MTLResourceOptions::StorageModeShared.0) != 0);
-        assert!((TRACKED_BUFFER_OPTIONS.0 & MTLResourceOptions::HazardTrackingModeUntracked.0) == 0);
+        // StorageModeShared is 0, so we verify by checking the storage mode bits
+        // (bits 4-7) are zero (meaning Shared).
+        const STORAGE_MODE_MASK: usize = 0xF0; // bits 4-7
+        assert_eq!(TRACKED_BUFFER_OPTIONS.0 & STORAGE_MODE_MASK, MTLResourceOptions::StorageModeShared.0 & STORAGE_MODE_MASK);
+        // Not untracked
+        assert_eq!(TRACKED_BUFFER_OPTIONS.0 & MTLResourceOptions::HazardTrackingModeUntracked.0, 0);
     }
 
     #[test]
     fn test_untracked_buffer_options() {
-        assert!((UNTRACKED_BUFFER_OPTIONS.0 & MTLResourceOptions::StorageModeShared.0) != 0);
-        assert!((UNTRACKED_BUFFER_OPTIONS.0 & MTLResourceOptions::HazardTrackingModeUntracked.0) != 0);
+        const STORAGE_MODE_MASK: usize = 0xF0;
+        assert_eq!(UNTRACKED_BUFFER_OPTIONS.0 & STORAGE_MODE_MASK, MTLResourceOptions::StorageModeShared.0 & STORAGE_MODE_MASK);
+        // Is untracked
+        assert_ne!(UNTRACKED_BUFFER_OPTIONS.0 & MTLResourceOptions::HazardTrackingModeUntracked.0, 0);
     }
 
     #[test]
     #[cfg(not(feature = "tracked_hazards"))]
     fn test_default_buffer_options_is_untracked() {
         assert_eq!(DEFAULT_BUFFER_OPTIONS.0, UNTRACKED_BUFFER_OPTIONS.0);
-        assert!((DEFAULT_BUFFER_OPTIONS.0 & MTLResourceOptions::HazardTrackingModeUntracked.0) != 0);
+        assert_ne!(DEFAULT_BUFFER_OPTIONS.0 & MTLResourceOptions::HazardTrackingModeUntracked.0, 0);
     }
 
     #[test]
     #[cfg(feature = "tracked_hazards")]
     fn test_default_buffer_options_is_tracked() {
         assert_eq!(DEFAULT_BUFFER_OPTIONS.0, TRACKED_BUFFER_OPTIONS.0);
-        assert!((DEFAULT_BUFFER_OPTIONS.0 & MTLResourceOptions::HazardTrackingModeUntracked.0) == 0);
+        assert_eq!(DEFAULT_BUFFER_OPTIONS.0 & MTLResourceOptions::HazardTrackingModeUntracked.0, 0);
     }
 
     #[test]

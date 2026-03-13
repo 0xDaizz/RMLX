@@ -8,7 +8,14 @@
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
-use metal::MTLSize;
+use rmlx_metal::MTLSize;
+use rmlx_metal::ComputePass;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLComputePipelineState as _;
+use objc2_metal::MTLCommandBuffer as _;
+use objc2_metal::MTLCommandQueue as _;
+use objc2_metal::MTLDevice as _;
+use rmlx_metal::MTLResourceOptions;
 
 // ---------------------------------------------------------------------------
 // Metal shader source
@@ -142,18 +149,24 @@ pub fn register(registry: &KernelRegistry) -> Result<(), KernelError> {
 // ---------------------------------------------------------------------------
 
 /// Create a Metal buffer containing a `[u32]` parameter array.
-fn make_params_buf(device: &metal::DeviceRef, params: &[u32]) -> metal::Buffer {
-    let byte_len = std::mem::size_of_val(params) as u64;
-    device.new_buffer_with_data(
-        params.as_ptr() as *const std::ffi::c_void,
-        byte_len,
-        metal::MTLResourceOptions::StorageModeShared,
-    )
+fn make_params_buf(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, params: &[u32]) -> rmlx_metal::MtlBuffer {
+    let byte_len = std::mem::size_of_val(params);
+    unsafe {
+        device
+            .newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(params.as_ptr() as *const std::ffi::c_void as *mut std::ffi::c_void).unwrap(),
+                byte_len,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap()
+    }
 }
 
 /// Create a tiny dummy buffer for bias when absent.
-fn make_dummy_buf(device: &metal::DeviceRef) -> metal::Buffer {
-    device.new_buffer(4, metal::MTLResourceOptions::StorageModeShared)
+fn make_dummy_buf(device: &ProtocolObject<dyn objc2_metal::MTLDevice>) -> rmlx_metal::MtlBuffer {
+    device
+        .newBufferWithLength_options(4_usize, MTLResourceOptions::StorageModeShared)
+        .unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -177,7 +190,7 @@ pub fn conv2d_tiled(
     padding: (usize, usize),
     dilation: (usize, usize),
     groups: usize,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     // Validate shapes (same as conv::conv2d)
     if input.ndim() != 4 {
@@ -294,40 +307,39 @@ pub fn conv2d_tiled(
     let params_buf = make_params_buf(registry.device().raw(), &params);
     let dummy_buf = make_dummy_buf(registry.device().raw());
 
-    let command_buffer = queue.new_command_buffer();
-    let encoder = command_buffer.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
-    encoder.set_buffer(1, Some(weight.metal_buffer()), weight.offset() as u64);
+    let command_buffer = queue.commandBuffer().unwrap();
+    let raw_enc = command_buffer.computeCommandEncoder().unwrap();
+    let encoder = ComputePass::new(&raw_enc);
+    encoder.set_pipeline(&pipeline);
+    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset());
+    encoder.set_buffer(1, Some(weight.metal_buffer()), weight.offset());
     match bias {
         Some(b) => {
             let bias_contig = super::make_contiguous(b, registry, queue)?;
             let b = bias_contig.as_ref().unwrap_or(b);
-            encoder.set_buffer(2, Some(b.metal_buffer()), b.offset() as u64);
+            encoder.set_buffer(2, Some(b.metal_buffer()), b.offset());
         }
         None => {
             encoder.set_buffer(2, Some(&dummy_buf), 0);
         }
     }
-    encoder.set_buffer(3, Some(out.metal_buffer()), out.offset() as u64);
+    encoder.set_buffer(3, Some(out.metal_buffer()), out.offset());
     encoder.set_buffer(4, Some(&params_buf), 0);
-
     // Allocate dynamic threadgroup memory for weight_tile: TILE_CI * kH * kW floats
     let tile_ci: usize = 16; // must match TILE_CI in the shader
-    let tg_mem_bytes = (tile_ci * kh * kw * std::mem::size_of::<f32>()) as u64;
-    encoder.set_threadgroup_memory_length(0, tg_mem_bytes);
-
+    let tg_mem_bytes = tile_ci * kh * kw * std::mem::size_of::<f32>();
+    encoder.set_threadgroup_memory_length(0, tg_mem_bytes as u64);
     // Grid: (W_out, C_out, B * H_out)
-    let grid_size = MTLSize::new(w_out as u64, c_out as u64, (batch * h_out) as u64);
-    let max_threads = pipeline.max_total_threads_per_threadgroup();
-    let tg_x = std::cmp::min(w_out as u64, max_threads);
-    let tg_y = std::cmp::min(c_out as u64, max_threads / tg_x);
-    let tg_z = std::cmp::min((batch * h_out) as u64, max_threads / (tg_x * tg_y));
-    let threadgroup_size = MTLSize::new(tg_x, tg_y, tg_z);
+    let grid_size = MTLSize { width: w_out, height: c_out, depth: (batch * h_out) };
+    let max_threads = pipeline.maxTotalThreadsPerThreadgroup();
+    let tg_x = std::cmp::min(w_out, max_threads);
+    let tg_y = std::cmp::min(c_out, max_threads / tg_x);
+    let tg_z = std::cmp::min(batch * h_out, max_threads / (tg_x * tg_y));
+    let threadgroup_size = MTLSize { width: tg_x, height: tg_y, depth: tg_z };
 
     encoder.dispatch_threads(grid_size, threadgroup_size);
-    encoder.end_encoding();
-    super::commit_with_mode(command_buffer, super::ExecMode::Sync);
+    encoder.end();
+    super::commit_with_mode(&command_buffer, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -340,9 +352,9 @@ pub fn conv2d_tiled(
 mod tests {
     use super::*;
 
-    fn setup() -> (KernelRegistry, metal::CommandQueue) {
+    fn setup() -> (KernelRegistry, rmlx_metal::MtlQueue) {
         let gpu_dev = rmlx_metal::device::GpuDevice::system_default().unwrap();
-        let queue = gpu_dev.raw().new_command_queue();
+        let queue = gpu_dev.new_command_queue();
         let registry = KernelRegistry::new(gpu_dev);
         register(&registry).unwrap();
         crate::ops::copy::register(&registry).unwrap();

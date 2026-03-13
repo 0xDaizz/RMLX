@@ -1,27 +1,34 @@
 //! Integration tests for fused kernels (SwiGLU+Down and RMS+GEMV).
 //! Tests require Metal GPU — gracefully skip if unavailable.
 
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{
+    MTLBuffer as _, MTLCommandBuffer as _, MTLCommandQueue as _,
+    MTLDevice as _,
+};
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::KernelRegistry;
 use rmlx_core::ops;
 use rmlx_core::ops::fused;
+use rmlx_metal::types::{MtlBuffer, MtlQueue};
+use rmlx_metal::MTLResourceOptions;
+use std::ptr::NonNull;
 
-fn setup() -> Option<(metal::Device, metal::CommandQueue, KernelRegistry)> {
+fn setup() -> Option<(MtlQueue, KernelRegistry)> {
     let gpu = rmlx_metal::device::GpuDevice::system_default().ok()?;
-    let dev = gpu.raw().clone();
-    let queue = dev.new_command_queue();
+    let queue = gpu.new_command_queue();
     let registry = KernelRegistry::new(gpu);
     ops::register_all(&registry).ok()?;
     fused::register_fused_kernels(&registry).ok()?;
-    Some((dev, queue, registry))
+    Some((queue, registry))
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn read_f16_buf(buf: &metal::Buffer, count: usize) -> Vec<f32> {
-    let ptr = buf.contents() as *const u16;
+fn read_f16_buf(buf: &ProtocolObject<dyn objc2_metal::MTLBuffer>, count: usize) -> Vec<f32> {
+    let ptr = buf.contents().as_ptr() as *const u16;
     let slice = unsafe { std::slice::from_raw_parts(ptr, count) };
     slice
         .iter()
@@ -29,8 +36,8 @@ fn read_f16_buf(buf: &metal::Buffer, count: usize) -> Vec<f32> {
         .collect()
 }
 
-fn read_f32_buf(buf: &metal::Buffer, count: usize) -> Vec<f32> {
-    let ptr = buf.contents() as *const f32;
+fn read_f32_buf(buf: &ProtocolObject<dyn objc2_metal::MTLBuffer>, count: usize) -> Vec<f32> {
+    let ptr = buf.contents().as_ptr() as *const f32;
     unsafe { std::slice::from_raw_parts(ptr, count) }.to_vec()
 }
 
@@ -47,38 +54,40 @@ fn rand_vec(n: usize, seed: u64) -> Vec<f32> {
     v
 }
 
-fn make_f16_buf(dev: &metal::Device, data: &[f32]) -> metal::Buffer {
+fn make_f16_buf(dev: &ProtocolObject<dyn objc2_metal::MTLDevice>, data: &[f32]) -> MtlBuffer {
     let f16_data: Vec<u16> = data
         .iter()
         .map(|&f| half::f16::from_f32(f).to_bits())
         .collect();
-    dev.new_buffer_with_data(
-        f16_data.as_ptr() as *const std::ffi::c_void,
-        (f16_data.len() * 2) as u64,
-        metal::MTLResourceOptions::StorageModeShared,
-    )
+    unsafe {
+        dev.newBufferWithBytes_length_options(
+            NonNull::new(f16_data.as_ptr() as *mut _).unwrap(),
+            f16_data.len() * 2,
+            MTLResourceOptions::StorageModeShared,
+        )
+        .unwrap()
+    }
 }
 
-fn make_f32_buf(dev: &metal::Device, data: &[f32]) -> metal::Buffer {
-    dev.new_buffer_with_data(
-        data.as_ptr() as *const std::ffi::c_void,
-        (data.len() * 4) as u64,
-        metal::MTLResourceOptions::StorageModeShared,
-    )
+fn make_f32_buf(dev: &ProtocolObject<dyn objc2_metal::MTLDevice>, data: &[f32]) -> MtlBuffer {
+    unsafe {
+        dev.newBufferWithBytes_length_options(
+            NonNull::new(data.as_ptr() as *mut _).unwrap(),
+            data.len() * 4,
+            MTLResourceOptions::StorageModeShared,
+        )
+        .unwrap()
+    }
 }
 
-fn alloc_f16_out(dev: &metal::Device, count: usize) -> metal::Buffer {
-    dev.new_buffer(
-        (count * 2) as u64,
-        metal::MTLResourceOptions::StorageModeShared,
-    )
+fn alloc_f16_out(dev: &ProtocolObject<dyn objc2_metal::MTLDevice>, count: usize) -> MtlBuffer {
+    dev.newBufferWithLength_options(count * 2, MTLResourceOptions::StorageModeShared)
+        .unwrap()
 }
 
-fn alloc_f32_out(dev: &metal::Device, count: usize) -> metal::Buffer {
-    dev.new_buffer(
-        (count * 4) as u64,
-        metal::MTLResourceOptions::StorageModeShared,
-    )
+fn alloc_f32_out(dev: &ProtocolObject<dyn objc2_metal::MTLDevice>, count: usize) -> MtlBuffer {
+    dev.newBufferWithLength_options(count * 4, MTLResourceOptions::StorageModeShared)
+        .unwrap()
 }
 
 /// CPU reference: SwiGLU(gate_up) then GEMV with bias.
@@ -155,8 +164,8 @@ fn assert_close(expected: &[f32], actual: &[f32], tol: f32, label: &str) {
 
 #[allow(clippy::too_many_arguments)]
 fn run_fused_swiglu_down(
-    dev: &metal::Device,
-    queue: &metal::CommandQueue,
+    dev: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
     registry: &KernelRegistry,
     m: usize,
     k: usize,
@@ -182,8 +191,9 @@ fn run_fused_swiglu_down(
             let pso = registry.get_pipeline(kernel_name, dtype).expect("get PSO");
             let (grid, tg) = fused::fused_swiglu_down_dispatch_sizes(m as u32, &pso);
 
-            let cb = queue.new_command_buffer();
-            let encoder = cb.new_compute_command_encoder();
+            let cb = queue.commandBuffer().unwrap();
+            let raw_enc = cb.computeCommandEncoder().unwrap();
+            let encoder = rmlx_metal::ComputePass::new(&raw_enc);
             fused::fused_swiglu_down_preresolved_into_encoder(
                 &pso,
                 &mat_buf,
@@ -200,9 +210,9 @@ fn run_fused_swiglu_down(
                 tg,
                 encoder,
             );
-            encoder.end_encoding();
+            encoder.end();
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
 
             let actual = read_f16_buf(&out_buf, m);
             assert_close(&expected, &actual, tol, label);
@@ -218,8 +228,9 @@ fn run_fused_swiglu_down(
             let pso = registry.get_pipeline(kernel_name, dtype).expect("get PSO");
             let (grid, tg) = fused::fused_swiglu_down_dispatch_sizes(m as u32, &pso);
 
-            let cb = queue.new_command_buffer();
-            let encoder = cb.new_compute_command_encoder();
+            let cb = queue.commandBuffer().unwrap();
+            let raw_enc = cb.computeCommandEncoder().unwrap();
+            let encoder = rmlx_metal::ComputePass::new(&raw_enc);
             fused::fused_swiglu_down_preresolved_into_encoder(
                 &pso,
                 &mat_buf,
@@ -236,9 +247,9 @@ fn run_fused_swiglu_down(
                 tg,
                 encoder,
             );
-            encoder.end_encoding();
+            encoder.end();
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
 
             let actual = read_f32_buf(&out_buf, m);
             assert_close(&expected, &actual, tol, label);
@@ -249,12 +260,12 @@ fn run_fused_swiglu_down(
 
 #[test]
 fn test_fused_swiglu_down_f16_matches_sequential() {
-    let Some((dev, queue, registry)) = setup() else {
+    let Some((queue, registry)) = setup() else {
         eprintln!("skipping: no Metal device");
         return;
     };
     run_fused_swiglu_down(
-        &dev,
+        registry.device().raw(),
         &queue,
         &registry,
         4096,
@@ -267,12 +278,12 @@ fn test_fused_swiglu_down_f16_matches_sequential() {
 
 #[test]
 fn test_fused_swiglu_down_f32_matches_sequential() {
-    let Some((dev, queue, registry)) = setup() else {
+    let Some((queue, registry)) = setup() else {
         eprintln!("skipping: no Metal device");
         return;
     };
     run_fused_swiglu_down(
-        &dev,
+        registry.device().raw(),
         &queue,
         &registry,
         4096,
@@ -285,12 +296,12 @@ fn test_fused_swiglu_down_f32_matches_sequential() {
 
 #[test]
 fn test_fused_swiglu_down_small_m() {
-    let Some((dev, queue, registry)) = setup() else {
+    let Some((queue, registry)) = setup() else {
         eprintln!("skipping: no Metal device");
         return;
     };
     run_fused_swiglu_down(
-        &dev,
+        registry.device().raw(),
         &queue,
         &registry,
         64,
@@ -303,12 +314,12 @@ fn test_fused_swiglu_down_small_m() {
 
 #[test]
 fn test_fused_swiglu_down_edge_k_not_multiple_of_4() {
-    let Some((dev, queue, registry)) = setup() else {
+    let Some((queue, registry)) = setup() else {
         eprintln!("skipping: no Metal device");
         return;
     };
     run_fused_swiglu_down(
-        &dev,
+        registry.device().raw(),
         &queue,
         &registry,
         256,
@@ -325,8 +336,8 @@ fn test_fused_swiglu_down_edge_k_not_multiple_of_4() {
 
 #[allow(clippy::too_many_arguments)]
 fn run_fused_rms_gemv(
-    dev: &metal::Device,
-    queue: &metal::CommandQueue,
+    dev: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
     registry: &KernelRegistry,
     m: usize,
     k: usize,
@@ -355,8 +366,9 @@ fn run_fused_rms_gemv(
             let pso = registry.get_pipeline(kernel_name, dtype).expect("get PSO");
             let (grid, tg) = fused::fused_rms_gemv_dispatch_sizes(m as u32, &pso);
 
-            let cb = queue.new_command_buffer();
-            let encoder = cb.new_compute_command_encoder();
+            let cb = queue.commandBuffer().unwrap();
+            let raw_enc = cb.computeCommandEncoder().unwrap();
+            let encoder = rmlx_metal::ComputePass::new(&raw_enc);
             fused::fused_rms_gemv_preresolved_into_encoder(
                 &pso,
                 &input_buf,
@@ -375,9 +387,9 @@ fn run_fused_rms_gemv(
                 tg,
                 encoder,
             );
-            encoder.end_encoding();
+            encoder.end();
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
 
             let actual = read_f16_buf(&out_buf, m);
             assert_close(&expected, &actual, tol, label);
@@ -393,8 +405,9 @@ fn run_fused_rms_gemv(
             let pso = registry.get_pipeline(kernel_name, dtype).expect("get PSO");
             let (grid, tg) = fused::fused_rms_gemv_dispatch_sizes(m as u32, &pso);
 
-            let cb = queue.new_command_buffer();
-            let encoder = cb.new_compute_command_encoder();
+            let cb = queue.commandBuffer().unwrap();
+            let raw_enc = cb.computeCommandEncoder().unwrap();
+            let encoder = rmlx_metal::ComputePass::new(&raw_enc);
             fused::fused_rms_gemv_preresolved_into_encoder(
                 &pso,
                 &input_buf,
@@ -413,9 +426,9 @@ fn run_fused_rms_gemv(
                 tg,
                 encoder,
             );
-            encoder.end_encoding();
+            encoder.end();
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
 
             let actual = read_f32_buf(&out_buf, m);
             assert_close(&expected, &actual, tol, label);
@@ -426,12 +439,12 @@ fn run_fused_rms_gemv(
 
 #[test]
 fn test_fused_rms_gemv_f16_qkv_shape() {
-    let Some((dev, queue, registry)) = setup() else {
+    let Some((queue, registry)) = setup() else {
         eprintln!("skipping: no Metal device");
         return;
     };
     run_fused_rms_gemv(
-        &dev,
+        registry.device().raw(),
         &queue,
         &registry,
         6144,
@@ -444,12 +457,12 @@ fn test_fused_rms_gemv_f16_qkv_shape() {
 
 #[test]
 fn test_fused_rms_gemv_f16_gateup_shape() {
-    let Some((dev, queue, registry)) = setup() else {
+    let Some((queue, registry)) = setup() else {
         eprintln!("skipping: no Metal device");
         return;
     };
     run_fused_rms_gemv(
-        &dev,
+        registry.device().raw(),
         &queue,
         &registry,
         22016,
@@ -462,12 +475,12 @@ fn test_fused_rms_gemv_f16_gateup_shape() {
 
 #[test]
 fn test_fused_rms_gemv_f32_matches_sequential() {
-    let Some((dev, queue, registry)) = setup() else {
+    let Some((queue, registry)) = setup() else {
         eprintln!("skipping: no Metal device");
         return;
     };
     run_fused_rms_gemv(
-        &dev,
+        registry.device().raw(),
         &queue,
         &registry,
         6144,
@@ -480,12 +493,12 @@ fn test_fused_rms_gemv_f32_matches_sequential() {
 
 #[test]
 fn test_fused_rms_gemv_small_m() {
-    let Some((dev, queue, registry)) = setup() else {
+    let Some((queue, registry)) = setup() else {
         eprintln!("skipping: no Metal device");
         return;
     };
     run_fused_rms_gemv(
-        &dev,
+        registry.device().raw(),
         &queue,
         &registry,
         64,
@@ -498,12 +511,12 @@ fn test_fused_rms_gemv_small_m() {
 
 #[test]
 fn test_fused_rms_gemv_edge_cases() {
-    let Some((dev, queue, registry)) = setup() else {
+    let Some((queue, registry)) = setup() else {
         eprintln!("skipping: no Metal device");
         return;
     };
     run_fused_rms_gemv(
-        &dev,
+        registry.device().raw(),
         &queue,
         &registry,
         256,

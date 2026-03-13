@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::array::Array;
 use crate::dtype::DType;
+use objc2::runtime::ProtocolObject;
 
 // ---------------------------------------------------------------------------
 // LazyOp — the operation variants recorded in the graph
@@ -105,6 +106,7 @@ impl Default for LazyGraph {
 
 impl LazyGraph {
     /// Create an empty graph.
+    #[allow(clippy::arc_with_non_send_sync)]
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(Vec::new())),
@@ -736,11 +738,11 @@ impl std::error::Error for LazyEvalError {}
 /// - `'r`: lifetime of the `KernelRegistry`
 pub struct EvalContext<'q, 'e, 'r> {
     /// Metal device reference.
-    pub device: &'q metal::Device,
+    pub device: &'q ProtocolObject<dyn objc2_metal::MTLDevice>,
     /// Kernel registry for pipeline state lookups.
     pub registry: &'r crate::kernels::KernelRegistry,
     /// Command queue for dispatch.
-    pub queue: &'q metal::CommandQueue,
+    pub queue: &'q rmlx_metal::MtlQueue,
     /// Optional ExecGraph for batched GPU-side execution.
     /// When `Some`, ops should encode into the graph's command buffers
     /// instead of creating standalone CBs. When `None`, ops use
@@ -753,9 +755,9 @@ pub struct EvalContext<'q, 'e, 'r> {
 impl<'q, 'e, 'r> EvalContext<'q, 'e, 'r> {
     /// Create a minimal context without ExecGraph or fusion.
     pub fn new(
-        device: &'q metal::Device,
+        device: &'q ProtocolObject<dyn objc2_metal::MTLDevice>,
         registry: &'r crate::kernels::KernelRegistry,
-        queue: &'q metal::CommandQueue,
+        queue: &'q rmlx_metal::MtlQueue,
     ) -> Self {
         Self {
             device,
@@ -768,9 +770,9 @@ impl<'q, 'e, 'r> EvalContext<'q, 'e, 'r> {
 
     /// Create a context with ExecGraph for batched execution.
     pub fn with_exec_graph(
-        device: &'q metal::Device,
+        device: &'q ProtocolObject<dyn objc2_metal::MTLDevice>,
         registry: &'r crate::kernels::KernelRegistry,
-        queue: &'q metal::CommandQueue,
+        queue: &'q rmlx_metal::MtlQueue,
         graph: &'e mut rmlx_metal::exec_graph::ExecGraph<'q, 'e>,
     ) -> Self {
         Self {
@@ -896,7 +898,7 @@ mod tests {
     /// arrays of the correct shape. For Add/Mul/Sub it creates a zeros array
     /// (we only test the graph machinery, not GPU correctness).
     fn test_eval_fn(op: &LazyOp, inputs: Vec<&Array>) -> Result<Array, LazyEvalError> {
-        let dev = metal::Device::system_default()
+        let dev = objc2_metal::MTLCreateSystemDefaultDevice()
             .ok_or_else(|| LazyEvalError::EvalFailed("no Metal device".into()))?;
 
         match op {
@@ -930,7 +932,7 @@ mod tests {
 
     #[test]
     fn test_materialized_leaf() {
-        let dev = metal::Device::system_default().unwrap();
+        let dev = objc2_metal::MTLCreateSystemDefaultDevice().unwrap();
         let graph = LazyGraph::new();
         let arr = Array::zeros(&dev, &[2, 3], DType::Float32);
         let lazy = LazyArray::from_array(&graph, arr);
@@ -946,7 +948,7 @@ mod tests {
 
     #[test]
     fn test_lazy_add_eval() {
-        let dev = metal::Device::system_default().unwrap();
+        let dev = objc2_metal::MTLCreateSystemDefaultDevice().unwrap();
         let graph = LazyGraph::new();
 
         let a = LazyArray::from_array(&graph, Array::zeros(&dev, &[4], DType::Float32));
@@ -967,7 +969,7 @@ mod tests {
     #[test]
     fn test_chained_operations() {
         // a + b -> c, c * d -> e, eval(e) should materialize everything
-        let dev = metal::Device::system_default().unwrap();
+        let dev = objc2_metal::MTLCreateSystemDefaultDevice().unwrap();
         let graph = LazyGraph::new();
 
         let a = LazyArray::from_array(&graph, Array::zeros(&dev, &[3], DType::Float32));
@@ -991,7 +993,7 @@ mod tests {
     fn test_diamond_dag() {
         // a -> b = neg(a), c = neg(a), d = b + c
         // Tests that shared inputs are evaluated only once.
-        let dev = metal::Device::system_default().unwrap();
+        let dev = objc2_metal::MTLCreateSystemDefaultDevice().unwrap();
         let graph = LazyGraph::new();
 
         let a = LazyArray::from_array(&graph, Array::zeros(&dev, &[5], DType::Float32));
@@ -1007,7 +1009,7 @@ mod tests {
 
     #[test]
     fn test_already_materialized_passthrough() {
-        let dev = metal::Device::system_default().unwrap();
+        let dev = objc2_metal::MTLCreateSystemDefaultDevice().unwrap();
         let graph = LazyGraph::new();
         let arr = Array::zeros(&dev, &[2, 2], DType::Float32);
         let lazy = LazyArray::from_array(&graph, arr);
@@ -1021,7 +1023,7 @@ mod tests {
 
     #[test]
     fn test_shape_mismatch_error() {
-        let dev = metal::Device::system_default().unwrap();
+        let dev = objc2_metal::MTLCreateSystemDefaultDevice().unwrap();
         let graph = LazyGraph::new();
 
         let a = LazyArray::from_array(&graph, Array::zeros(&dev, &[3], DType::Float32));
@@ -1037,7 +1039,7 @@ mod tests {
 
     #[test]
     fn test_matmul_shape_validation() {
-        let dev = metal::Device::system_default().unwrap();
+        let dev = objc2_metal::MTLCreateSystemDefaultDevice().unwrap();
         let graph = LazyGraph::new();
 
         let a = LazyArray::from_array(&graph, Array::zeros(&dev, &[2, 3], DType::Float32));
@@ -1056,7 +1058,7 @@ mod tests {
 
     #[test]
     fn test_eval_error_propagation() {
-        let dev = metal::Device::system_default().unwrap();
+        let dev = objc2_metal::MTLCreateSystemDefaultDevice().unwrap();
         let graph = LazyGraph::new();
 
         let a = LazyArray::from_array(&graph, Array::zeros(&dev, &[4], DType::Float32));
@@ -1078,7 +1080,7 @@ mod tests {
 
     #[test]
     fn test_graph_node_count() {
-        let dev = metal::Device::system_default().unwrap();
+        let dev = objc2_metal::MTLCreateSystemDefaultDevice().unwrap();
         let graph = LazyGraph::new();
 
         assert!(graph.is_empty());
@@ -1096,7 +1098,7 @@ mod tests {
 
     #[test]
     fn test_debug_format() {
-        let dev = metal::Device::system_default().unwrap();
+        let dev = objc2_metal::MTLCreateSystemDefaultDevice().unwrap();
         let graph = LazyGraph::new();
         let lazy = LazyArray::from_array(&graph, Array::zeros(&dev, &[2], DType::Float32));
         let dbg = format!("{:?}", lazy);

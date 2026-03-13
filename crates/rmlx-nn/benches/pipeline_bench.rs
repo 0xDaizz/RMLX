@@ -14,6 +14,8 @@
 //!   cargo bench -p rmlx-nn --bench pipeline_bench
 
 use std::time::{Duration, Instant};
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLCommandBuffer as _, MTLCommandEncoder as _, MTLCommandQueue as _, MTLDevice as _};
 
 use rmlx_core::array::Array;
 use rmlx_core::kernels::KernelRegistry;
@@ -110,7 +112,7 @@ impl std::fmt::Display for Stats {
 // ---------------------------------------------------------------------------
 
 #[allow(dead_code)]
-fn rand_array_f32(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
+fn rand_array_f32(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, shape: &[usize], seed: u64) -> Array {
     let numel: usize = shape.iter().product();
     let mut data = Vec::with_capacity(numel);
     let mut state = seed;
@@ -153,7 +155,7 @@ fn f32_to_f16_bits(val: f32) -> u16 {
     ((sign << 15) | (new_exp as u32) << 10 | (frac >> 13)) as u16
 }
 
-fn rand_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
+fn rand_array(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, shape: &[usize], seed: u64) -> Array {
     use rmlx_core::dtype::DType;
     let numel: usize = shape.iter().product();
     let mut f16_bytes = Vec::with_capacity(numel * 2);
@@ -174,7 +176,7 @@ fn rand_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
 // ---------------------------------------------------------------------------
 
 #[allow(dead_code)]
-fn make_linear_f32(device: &metal::Device, in_f: usize, out_f: usize, seed: u64) -> Linear {
+fn make_linear_f32(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, in_f: usize, out_f: usize, seed: u64) -> Linear {
     let weight = rand_array_f32(device, &[out_f, in_f], seed);
     Linear::from_arrays(
         LinearConfig {
@@ -189,7 +191,7 @@ fn make_linear_f32(device: &metal::Device, in_f: usize, out_f: usize, seed: u64)
 }
 
 #[allow(dead_code)]
-fn build_transformer_block_f32(device: &metal::Device) -> TransformerBlock {
+fn build_transformer_block_f32(device: &ProtocolObject<dyn objc2_metal::MTLDevice>) -> TransformerBlock {
     let kv_size = NUM_KV_HEADS * HEAD_DIM;
 
     let q_proj = make_linear_f32(device, HIDDEN_SIZE, HIDDEN_SIZE, 1);
@@ -224,7 +226,7 @@ fn build_transformer_block_f32(device: &metal::Device) -> TransformerBlock {
     TransformerBlock::from_parts(0, attention, ffn, norm1_weight, norm2_weight, RMS_NORM_EPS)
 }
 
-fn make_linear(device: &metal::Device, in_f: usize, out_f: usize, seed: u64) -> Linear {
+fn make_linear(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, in_f: usize, out_f: usize, seed: u64) -> Linear {
     let weight = rand_array(device, &[out_f, in_f], seed);
     Linear::from_arrays(
         LinearConfig {
@@ -238,7 +240,7 @@ fn make_linear(device: &metal::Device, in_f: usize, out_f: usize, seed: u64) -> 
     .expect("linear from_arrays")
 }
 
-fn build_transformer_block(device: &metal::Device) -> TransformerBlock {
+fn build_transformer_block(device: &ProtocolObject<dyn objc2_metal::MTLDevice>) -> TransformerBlock {
     use rmlx_core::dtype::DType;
 
     let kv_size = NUM_KV_HEADS * HEAD_DIM;
@@ -290,26 +292,26 @@ fn build_transformer_block(device: &metal::Device) -> TransformerBlock {
 /// Time a single operation: warm up `WARMUP_ITERS` times, then measure
 /// `BENCH_ITERS` iterations, each with its own command buffer commit+wait
 /// to capture accurate GPU timing per dispatch.
-fn profile_op<F>(label: &str, queue: &metal::CommandQueue, mut op: F) -> Stats
+fn profile_op<F>(label: &str, queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>, mut op: F) -> Stats
 where
-    F: FnMut(&metal::CommandBufferRef),
+    F: FnMut(&ProtocolObject<dyn objc2_metal::MTLCommandBuffer>),
 {
     // Warmup
     for _ in 0..WARMUP_ITERS {
-        let cb = queue.new_command_buffer_with_unretained_references();
-        op(cb);
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+        op(&cb);
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
     }
 
     // Benchmark
     let mut latencies = Vec::with_capacity(BENCH_ITERS);
     for _ in 0..BENCH_ITERS {
         let start = Instant::now();
-        let cb = queue.new_command_buffer_with_unretained_references();
-        op(cb);
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+        op(&cb);
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
         latencies.push(start.elapsed());
     }
 
@@ -335,7 +337,7 @@ fn main() {
     let registry = KernelRegistry::new(gpu);
     ops::register_all(&registry).expect("kernel registration failed");
     let device = registry.device().raw();
-    let queue = device.new_command_queue();
+    let queue = device.newCommandQueue().unwrap();
 
     println!(
         "Config: hidden={}, heads={}/{}, head_dim={}, intermediate={}, seq_len={}",
@@ -424,23 +426,23 @@ fn main() {
     // ---- Benchmark Single-CB: forward_decode_into_cb() ----
     println!("\nWarming up Single-CB ({} iterations)...", WARMUP_ITERS);
     for _ in 0..WARMUP_ITERS {
-        let cb = queue.new_command_buffer_with_unretained_references();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
         let _ = block
-            .forward_decode_into_cb(&input, None, None, None, None, &registry, cb)
+            .forward_decode_into_cb(&input, None, None, None, None, &registry, &cb)
             .unwrap();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
     }
     println!("Benchmarking Single-CB ({} iterations)...", BENCH_ITERS);
     let mut single_cb_latencies = Vec::with_capacity(BENCH_ITERS);
     for _ in 0..BENCH_ITERS {
         let start = Instant::now();
-        let cb = queue.new_command_buffer_with_unretained_references();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
         let _ = block
-            .forward_decode_into_cb(&input, None, None, None, None, &registry, cb)
+            .forward_decode_into_cb(&input, None, None, None, None, &registry, &cb)
             .unwrap();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
         single_cb_latencies.push(start.elapsed());
     }
 
@@ -463,12 +465,12 @@ fn main() {
     );
     for _ in 0..WARMUP_ITERS {
         cache_9d.seq_len = 0;
-        let cb = queue.new_command_buffer_with_unretained_references();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
         let _ = block
-            .forward_single_cb_9dispatch(&input, None, None, None, &mut cache_9d, &registry, cb)
+            .forward_single_cb_9dispatch(&input, None, None, None, &mut cache_9d, &registry, &cb)
             .unwrap();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
     }
 
     // ---- Benchmark 9-dispatch ----
@@ -477,12 +479,12 @@ fn main() {
     for _ in 0..BENCH_ITERS {
         cache_9d.seq_len = 0; // Reset position instead of reallocating
         let start = Instant::now();
-        let cb = queue.new_command_buffer_with_unretained_references();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
         let _ = block
-            .forward_single_cb_9dispatch(&input, None, None, None, &mut cache_9d, &registry, cb)
+            .forward_single_cb_9dispatch(&input, None, None, None, &mut cache_9d, &registry, &cb)
             .unwrap();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
         nine_dispatch_latencies.push(start.elapsed());
     }
 
@@ -500,12 +502,12 @@ fn main() {
     );
     for _ in 0..WARMUP_ITERS {
         cache_c9d.seq_len = 0;
-        let cb = queue.new_command_buffer_with_unretained_references();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
         let _ = block
-            .forward_concurrent_9dispatch(&input, None, None, None, &mut cache_c9d, &registry, cb)
+            .forward_concurrent_9dispatch(&input, None, None, None, &mut cache_c9d, &registry, &cb)
             .unwrap();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
     }
 
     // ---- Benchmark Concurrent-9-dispatch ----
@@ -517,12 +519,12 @@ fn main() {
     for _ in 0..BENCH_ITERS {
         cache_c9d.seq_len = 0;
         let start = Instant::now();
-        let cb = queue.new_command_buffer_with_unretained_references();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
         let _ = block
-            .forward_concurrent_9dispatch(&input, None, None, None, &mut cache_c9d, &registry, cb)
+            .forward_concurrent_9dispatch(&input, None, None, None, &mut cache_c9d, &registry, &cb)
             .unwrap();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
         concurrent_9d_latencies.push(start.elapsed());
     }
 
@@ -786,24 +788,25 @@ fn main() {
         let fsd_output = rand_array(device, &[HIDDEN_SIZE], 203);
 
         let s = profile_op("F1. fused_swiglu_down [4096,14336]", &queue, |cb| {
-            let enc = cb.new_compute_command_encoder();
+            let raw_enc = cb.computeCommandEncoder().unwrap();
+            let enc = rmlx_metal::ComputePass::new(&raw_enc);
             ops::fused::fused_swiglu_down_preresolved_into_encoder(
                 &fused_pso,
                 fsd_down_w.metal_buffer(),
-                fsd_down_w.offset() as u64,
+                fsd_down_w.offset() as usize,
                 fsd_gate_up.metal_buffer(),
-                fsd_gate_up.offset() as u64,
+                fsd_gate_up.offset() as usize,
                 fsd_output.metal_buffer(),
-                fsd_output.offset() as u64,
+                fsd_output.offset() as usize,
                 fused_m,
                 fused_k,
                 fsd_bias.metal_buffer(),
-                fsd_bias.offset() as u64,
+                fsd_bias.offset() as usize,
                 grid,
                 tg,
                 enc,
             );
-            enc.end_encoding();
+            enc.end();
         });
         fused_stats.push(("F1. fused_swiglu_down", s));
     }
@@ -824,17 +827,18 @@ fn main() {
         let frg_output = rand_array(device, &[qkv_m as usize], 213);
 
         let s = profile_op("F2. fused_rms_gemv QKV [6144,4096]", &queue, |cb| {
-            let enc = cb.new_compute_command_encoder();
+            let raw_enc = cb.computeCommandEncoder().unwrap();
+            let enc = rmlx_metal::ComputePass::new(&raw_enc);
             ops::fused::fused_rms_gemv_preresolved_into_encoder(
                 &fused_pso,
                 frg_input.metal_buffer(),
-                frg_input.offset() as u64,
+                frg_input.offset() as usize,
                 frg_norm_w.metal_buffer(),
-                frg_norm_w.offset() as u64,
+                frg_norm_w.offset() as usize,
                 frg_qkv_w.metal_buffer(),
-                frg_qkv_w.offset() as u64,
+                frg_qkv_w.offset() as usize,
                 frg_output.metal_buffer(),
-                frg_output.offset() as u64,
+                frg_output.offset() as usize,
                 qkv_m,
                 qkv_k,
                 RMS_NORM_EPS,
@@ -843,7 +847,7 @@ fn main() {
                 tg,
                 enc,
             );
-            enc.end_encoding();
+            enc.end();
         });
         fused_stats.push(("F2. fused_rms_gemv QKV", s));
     }
@@ -864,17 +868,18 @@ fn main() {
         let frg2_output = rand_array(device, &[gu_m as usize], 223);
 
         let s = profile_op("F3. fused_rms_gemv gate_up [28672,4096]", &queue, |cb| {
-            let enc = cb.new_compute_command_encoder();
+            let raw_enc = cb.computeCommandEncoder().unwrap();
+            let enc = rmlx_metal::ComputePass::new(&raw_enc);
             ops::fused::fused_rms_gemv_preresolved_into_encoder(
                 &fused_pso,
                 frg2_input.metal_buffer(),
-                frg2_input.offset() as u64,
+                frg2_input.offset() as usize,
                 frg2_norm_w.metal_buffer(),
-                frg2_norm_w.offset() as u64,
+                frg2_norm_w.offset() as usize,
                 frg2_gu_w.metal_buffer(),
-                frg2_gu_w.offset() as u64,
+                frg2_gu_w.offset() as usize,
                 frg2_output.metal_buffer(),
-                frg2_output.offset() as u64,
+                frg2_output.offset() as usize,
                 gu_m,
                 gu_k,
                 RMS_NORM_EPS,
@@ -883,7 +888,7 @@ fn main() {
                 tg,
                 enc,
             );
-            enc.end_encoding();
+            enc.end();
         });
         fused_stats.push(("F3. fused_rms_gemv gate_up", s));
     }
@@ -1130,7 +1135,7 @@ fn main() {
         // Warmup
         for _ in 0..WARMUP_ITERS {
             cache_pre.seq_len = 0; // reset position
-            let cb = queue.new_command_buffer_with_unretained_references();
+            let cb = queue.commandBufferWithUnretainedReferences().unwrap();
             let _ = block
                 .forward_single_cb_9dispatch(
                     &input,
@@ -1139,18 +1144,18 @@ fn main() {
                     None,
                     &mut cache_pre,
                     &registry,
-                    cb,
+                    &cb,
                 )
                 .unwrap();
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
         }
         // Bench
         let mut pre_alloc_times = Vec::with_capacity(BENCH_ITERS);
         for _ in 0..BENCH_ITERS {
             cache_pre.seq_len = 0; // reset position
             let start = Instant::now();
-            let cb = queue.new_command_buffer_with_unretained_references();
+            let cb = queue.commandBufferWithUnretainedReferences().unwrap();
             let _ = block
                 .forward_single_cb_9dispatch(
                     &input,
@@ -1159,11 +1164,11 @@ fn main() {
                     None,
                     &mut cache_pre,
                     &registry,
-                    cb,
+                    &cb,
                 )
                 .unwrap();
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
             pre_alloc_times.push(start.elapsed());
         }
         let stats = Stats::from_durations(&pre_alloc_times);
@@ -1214,15 +1219,15 @@ fn main() {
         for cache in ml_kv_caches.iter_mut() {
             cache.seq_len = 0;
         }
-        let cb = queue.new_command_buffer_with_unretained_references();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
         let mut x = rand_array(device, &[SEQ_LEN, HIDDEN_SIZE], 200);
         for (layer, cache) in blocks.iter().zip(ml_kv_caches.iter_mut()) {
             x = layer
-                .forward_single_cb_9dispatch(&x, None, None, None, cache, &registry, cb)
+                .forward_single_cb_9dispatch(&x, None, None, None, cache, &registry, &cb)
                 .expect("serial multi-layer warmup failed");
         }
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
     }
 
     // ---- Benchmark serial 9-dispatch (4 layers) ----
@@ -1236,15 +1241,15 @@ fn main() {
             cache.seq_len = 0;
         }
         let start = Instant::now();
-        let cb = queue.new_command_buffer_with_unretained_references();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
         let mut x = rand_array(device, &[SEQ_LEN, HIDDEN_SIZE], 200);
         for (layer, cache) in blocks.iter().zip(ml_kv_caches.iter_mut()) {
             x = layer
-                .forward_single_cb_9dispatch(&x, None, None, None, cache, &registry, cb)
+                .forward_single_cb_9dispatch(&x, None, None, None, cache, &registry, &cb)
                 .expect("serial multi-layer bench failed");
         }
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
         ml_serial_latencies.push(start.elapsed());
     }
 
@@ -1257,15 +1262,15 @@ fn main() {
         for cache in ml_kv_caches.iter_mut() {
             cache.seq_len = 0;
         }
-        let cb = queue.new_command_buffer_with_unretained_references();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
         let mut x = rand_array(device, &[SEQ_LEN, HIDDEN_SIZE], 200);
         for (layer, cache) in blocks.iter().zip(ml_kv_caches.iter_mut()) {
             x = layer
-                .forward_concurrent_9dispatch(&x, None, None, None, cache, &registry, cb)
+                .forward_concurrent_9dispatch(&x, None, None, None, cache, &registry, &cb)
                 .expect("concurrent multi-layer warmup failed");
         }
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
     }
 
     // ---- Benchmark concurrent 9-dispatch (4 layers) ----
@@ -1279,15 +1284,15 @@ fn main() {
             cache.seq_len = 0;
         }
         let start = Instant::now();
-        let cb = queue.new_command_buffer_with_unretained_references();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
         let mut x = rand_array(device, &[SEQ_LEN, HIDDEN_SIZE], 200);
         for (layer, cache) in blocks.iter().zip(ml_kv_caches.iter_mut()) {
             x = layer
-                .forward_concurrent_9dispatch(&x, None, None, None, cache, &registry, cb)
+                .forward_concurrent_9dispatch(&x, None, None, None, cache, &registry, &cb)
                 .expect("concurrent multi-layer bench failed");
         }
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
         ml_concurrent_latencies.push(start.elapsed());
     }
 
@@ -1305,12 +1310,12 @@ fn main() {
     );
     for _ in 0..WARMUP_ITERS {
         cache_2enc.seq_len = 0;
-        let cb = queue.new_command_buffer_with_unretained_references();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
         let _ = block
-            .forward_2encoder_9dispatch(&input, None, None, None, &mut cache_2enc, &registry, cb)
+            .forward_2encoder_9dispatch(&input, None, None, None, &mut cache_2enc, &registry, &cb)
             .unwrap();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
     }
     println!(
         "Benchmarking 2-encoder 9-dispatch ({} iterations)...",
@@ -1320,12 +1325,12 @@ fn main() {
     for _ in 0..BENCH_ITERS {
         cache_2enc.seq_len = 0;
         let start = Instant::now();
-        let cb = queue.new_command_buffer_with_unretained_references();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
         let _ = block
-            .forward_2encoder_9dispatch(&input, None, None, None, &mut cache_2enc, &registry, cb)
+            .forward_2encoder_9dispatch(&input, None, None, None, &mut cache_2enc, &registry, &cb)
             .unwrap();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
         times_2enc.push(start.elapsed());
     }
     let two_enc_stats = Stats::from_durations(&times_2enc);
@@ -1340,15 +1345,15 @@ fn main() {
         for c in &mut ml_kv_caches {
             c.seq_len = 0;
         }
-        let cb = queue.new_command_buffer_with_unretained_references();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
         let mut h = rand_array(device, &[SEQ_LEN, HIDDEN_SIZE], 200);
         for (i, c) in ml_kv_caches.iter_mut().enumerate() {
             h = blocks[i]
-                .forward_2encoder_9dispatch(&h, None, None, None, c, &registry, cb)
+                .forward_2encoder_9dispatch(&h, None, None, None, c, &registry, &cb)
                 .unwrap();
         }
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
     }
     println!(
         "Benchmarking 2-encoder 9-dispatch x{} ({} iterations)...",
@@ -1360,15 +1365,15 @@ fn main() {
             c.seq_len = 0;
         }
         let start = Instant::now();
-        let cb = queue.new_command_buffer_with_unretained_references();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
         let mut h = rand_array(device, &[SEQ_LEN, HIDDEN_SIZE], 200);
         for (i, c) in ml_kv_caches.iter_mut().enumerate() {
             h = blocks[i]
-                .forward_2encoder_9dispatch(&h, None, None, None, c, &registry, cb)
+                .forward_2encoder_9dispatch(&h, None, None, None, c, &registry, &cb)
                 .unwrap();
         }
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
         times_2enc_4l.push(start.elapsed());
     }
     let stats_2enc_4l = Stats::from_durations(&times_2enc_4l);
@@ -1728,23 +1733,23 @@ fn main() {
         // warmup
         for _ in 0..WARMUP_ITERS {
             for _ in 0..n_cbs {
-                let cb = queue.new_command_buffer_with_unretained_references();
+                let cb = queue.commandBufferWithUnretainedReferences().unwrap();
                 cb.commit();
             }
             // wait for last one
-            let cb = queue.new_command_buffer_with_unretained_references();
+            let cb = queue.commandBufferWithUnretainedReferences().unwrap();
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
         }
         for _ in 0..BENCH_ITERS {
             let start = Instant::now();
             for _ in 0..n_cbs {
-                let cb = queue.new_command_buffer_with_unretained_references();
+                let cb = queue.commandBufferWithUnretainedReferences().unwrap();
                 cb.commit();
             }
-            let fence = queue.new_command_buffer_with_unretained_references();
+            let fence = queue.commandBufferWithUnretainedReferences().unwrap();
             fence.commit();
-            fence.wait_until_completed();
+            fence.waitUntilCompleted();
             times.push(start.elapsed());
         }
         let stats = Stats::from_durations(&times);
@@ -1763,11 +1768,11 @@ fn main() {
         for _ in 0..WARMUP_ITERS {
             let ev = GpuEvent::new(device);
             for i in 0..n_cbs {
-                let cb = queue.new_command_buffer_with_unretained_references();
+                let cb = queue.commandBufferWithUnretainedReferences().unwrap();
                 if i > 0 {
-                    ev.wait_from_command_buffer(cb, i as u64);
+                    ev.wait_from_command_buffer(&cb, i as u64);
                 }
-                ev.signal_from_command_buffer(cb, (i + 1) as u64);
+                ev.signal_from_command_buffer(&cb, (i + 1) as u64);
                 cb.commit();
             }
             ev.cpu_wait(n_cbs as u64, Duration::from_secs(10))
@@ -1777,11 +1782,11 @@ fn main() {
             let ev = GpuEvent::new(device);
             let start = Instant::now();
             for i in 0..n_cbs {
-                let cb = queue.new_command_buffer_with_unretained_references();
+                let cb = queue.commandBufferWithUnretainedReferences().unwrap();
                 if i > 0 {
-                    ev.wait_from_command_buffer(cb, i as u64);
+                    ev.wait_from_command_buffer(&cb, i as u64);
                 }
-                ev.signal_from_command_buffer(cb, (i + 1) as u64);
+                ev.signal_from_command_buffer(&cb, (i + 1) as u64);
                 cb.commit();
             }
             ev.cpu_wait(n_cbs as u64, Duration::from_secs(10))
@@ -1801,23 +1806,23 @@ fn main() {
         let mut times = Vec::with_capacity(BENCH_ITERS);
         let n_encoders = 360usize;
         for _ in 0..WARMUP_ITERS {
-            let cb = queue.new_command_buffer_with_unretained_references();
+            let cb = queue.commandBufferWithUnretainedReferences().unwrap();
             for _ in 0..n_encoders {
-                let enc = cb.new_compute_command_encoder();
-                enc.end_encoding();
+                let enc = cb.computeCommandEncoder().unwrap();
+                enc.endEncoding();
             }
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
         }
         for _ in 0..BENCH_ITERS {
             let start = Instant::now();
-            let cb = queue.new_command_buffer_with_unretained_references();
+            let cb = queue.commandBufferWithUnretainedReferences().unwrap();
             for _ in 0..n_encoders {
-                let enc = cb.new_compute_command_encoder();
-                enc.end_encoding();
+                let enc = cb.computeCommandEncoder().unwrap();
+                enc.endEncoding();
             }
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
             times.push(start.elapsed());
         }
         let stats = Stats::from_durations(&times);
@@ -1836,15 +1841,15 @@ fn main() {
         for _ in 0..WARMUP_ITERS {
             let ev = GpuEvent::new(device);
             for i in 0..n_cbs {
-                let cb = queue.new_command_buffer_with_unretained_references();
+                let cb = queue.commandBufferWithUnretainedReferences().unwrap();
                 if i > 0 {
-                    ev.wait_from_command_buffer(cb, i as u64);
+                    ev.wait_from_command_buffer(&cb, i as u64);
                 }
                 for _ in 0..enc_per_cb {
-                    let enc = cb.new_compute_command_encoder();
-                    enc.end_encoding();
+                    let enc = cb.computeCommandEncoder().unwrap();
+                    enc.endEncoding();
                 }
-                ev.signal_from_command_buffer(cb, (i + 1) as u64);
+                ev.signal_from_command_buffer(&cb, (i + 1) as u64);
                 cb.commit();
             }
             ev.cpu_wait(n_cbs as u64, Duration::from_secs(10))
@@ -1854,15 +1859,15 @@ fn main() {
             let ev = GpuEvent::new(device);
             let start = Instant::now();
             for i in 0..n_cbs {
-                let cb = queue.new_command_buffer_with_unretained_references();
+                let cb = queue.commandBufferWithUnretainedReferences().unwrap();
                 if i > 0 {
-                    ev.wait_from_command_buffer(cb, i as u64);
+                    ev.wait_from_command_buffer(&cb, i as u64);
                 }
                 for _ in 0..enc_per_cb {
-                    let enc = cb.new_compute_command_encoder();
-                    enc.end_encoding();
+                    let enc = cb.computeCommandEncoder().unwrap();
+                    enc.endEncoding();
                 }
-                ev.signal_from_command_buffer(cb, (i + 1) as u64);
+                ev.signal_from_command_buffer(&cb, (i + 1) as u64);
                 cb.commit();
             }
             ev.cpu_wait(n_cbs as u64, Duration::from_secs(10))
@@ -1884,22 +1889,10 @@ fn main() {
     let eg_fused_per_layer = eg_fused_60_stats.mean / num_layers_60 as f64;
     println!();
     println!("  --- Measured per-layer ---");
-    println!(
-        "  ExecGraph 9-dispatch:       {:.1} us/layer",
-        eg_9d_per_layer
-    );
-    println!(
-        "  ExecGraph Cached 2-enc:     {:.1} us/layer",
-        eg_cached2_per_layer
-    );
-    println!(
-        "  ExecGraph Cached 1-enc:     {:.1} us/layer",
-        eg_cached1_per_layer
-    );
-    println!(
-        "  ExecGraph Fused 7-dispatch: {:.1} us/layer",
-        eg_fused_per_layer
-    );
+    println!("  ExecGraph 9-dispatch:       {:.1} us/layer", eg_9d_per_layer);
+    println!("  ExecGraph Cached 2-enc:     {:.1} us/layer", eg_cached2_per_layer);
+    println!("  ExecGraph Cached 1-enc:     {:.1} us/layer", eg_cached1_per_layer);
+    println!("  ExecGraph Fused 7-dispatch: {:.1} us/layer", eg_fused_per_layer);
     println!("=====================================================");
 
     // ---- Summary comparison ----
@@ -1975,4 +1968,100 @@ fn main() {
         eg_fused_60_stats.mean / num_layers_60 as f64
     );
     println!("  -----------------");
+
+    // ========================================================================
+    // Sampling Overhead: CPU vs GPU Greedy (vocab=128256)
+    // ========================================================================
+    println!("\n=== Sampling Overhead: CPU vs GPU Greedy (vocab=128256) ===");
+
+    const VOCAB_SIZE: usize = 128256;
+    const SAMPLING_WARMUP: usize = 5;
+    const SAMPLING_ITERS: usize = 100;
+
+    // Create a realistic logits array: [1, 128256] Float32 with pseudo-random values
+    let logits = rand_array_f32(device, &[VOCAB_SIZE], 42);
+    let logits_2d = logits
+        .reshape(vec![1, VOCAB_SIZE])
+        .expect("reshape logits to [1, 128256]");
+
+    // ---- Path A: CPU Greedy (baseline) ----
+    // Warmup
+    for _ in 0..SAMPLING_WARMUP {
+        let data = logits.to_vec_checked::<f32>();
+        let mut best_idx = 0usize;
+        let mut best_val = f32::NEG_INFINITY;
+        for (i, &v) in data.iter().enumerate() {
+            if v > best_val {
+                best_val = v;
+                best_idx = i;
+            }
+        }
+        std::hint::black_box(best_idx);
+    }
+    // Bench
+    let mut cpu_greedy_times = Vec::with_capacity(SAMPLING_ITERS);
+    for _ in 0..SAMPLING_ITERS {
+        let start = Instant::now();
+        let data = logits.to_vec_checked::<f32>();
+        let mut best_idx = 0usize;
+        let mut best_val = f32::NEG_INFINITY;
+        for (i, &v) in data.iter().enumerate() {
+            if v > best_val {
+                best_val = v;
+                best_idx = i;
+            }
+        }
+        std::hint::black_box(best_idx);
+        cpu_greedy_times.push(start.elapsed());
+    }
+    let cpu_greedy_stats = Stats::from_durations(&cpu_greedy_times);
+
+    // ---- Path B: GPU Argmax (standalone) ----
+    // Warmup
+    for _ in 0..SAMPLING_WARMUP {
+        let result = ops::argreduce::argmax(&registry, &logits_2d, 1, &queue).unwrap();
+        let ids = result.to_vec_checked::<u32>();
+        std::hint::black_box(ids[0]);
+    }
+    // Bench
+    let mut gpu_argmax_times = Vec::with_capacity(SAMPLING_ITERS);
+    for _ in 0..SAMPLING_ITERS {
+        let start = Instant::now();
+        let result = ops::argreduce::argmax(&registry, &logits_2d, 1, &queue).unwrap();
+        let ids = result.to_vec_checked::<u32>();
+        std::hint::black_box(ids[0]);
+        gpu_argmax_times.push(start.elapsed());
+    }
+    let gpu_argmax_stats = Stats::from_durations(&gpu_argmax_times);
+
+    // ---- Path C: GPU Argmax (into_cb - simulating ExecGraph fusion) ----
+    // TODO: argmax_into_cb not yet available; using standalone argmax via
+    // manual CB submit as a placeholder until the _into_cb API is added.
+    // Warmup
+    for _ in 0..SAMPLING_WARMUP {
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+        let token_arr = ops::argreduce::argmax(&registry, &logits_2d, 1, &queue).unwrap();
+        cb.commit();
+        cb.waitUntilCompleted();
+        let ids = token_arr.to_vec_checked::<u32>();
+        std::hint::black_box(ids[0]);
+    }
+    // Bench
+    let mut gpu_argmax_cb_times = Vec::with_capacity(SAMPLING_ITERS);
+    for _ in 0..SAMPLING_ITERS {
+        let start = Instant::now();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+        let token_arr = ops::argreduce::argmax(&registry, &logits_2d, 1, &queue).unwrap();
+        cb.commit();
+        cb.waitUntilCompleted();
+        let ids = token_arr.to_vec_checked::<u32>();
+        std::hint::black_box(ids[0]);
+        gpu_argmax_cb_times.push(start.elapsed());
+    }
+    let gpu_argmax_cb_stats = Stats::from_durations(&gpu_argmax_cb_times);
+
+    println!("CPU greedy (to_vec + argmax):   {}", cpu_greedy_stats);
+    println!("GPU argmax (standalone):         {}", gpu_argmax_stats);
+    println!("GPU argmax (into_cb fused):      {}", gpu_argmax_cb_stats);
+    println!("=====================================================");
 }

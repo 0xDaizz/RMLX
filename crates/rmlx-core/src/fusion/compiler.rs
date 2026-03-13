@@ -11,6 +11,14 @@ use crate::kernels::{KernelError, KernelRegistry};
 
 use super::codegen::FusionCodegen;
 use super::graph::FusionGraph;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLComputePipelineState as _;
+use objc2_metal::MTLCommandBuffer as _;
+use objc2_metal::MTLCommandQueue as _;
+use rmlx_metal::MTLResourceOptions;
+use objc2_metal::MTLDevice as _;
+use rmlx_metal::MTLSize;
+use rmlx_metal::ComputePass;
 
 /// Kernel function name for a fused element-wise kernel, derived from
 /// the graph's cache key and dtype.
@@ -60,7 +68,7 @@ pub fn dispatch_fused(
     codegen: &FusionCodegen,
     registry: &KernelRegistry,
     inputs: &[&Array],
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Vec<Array>, KernelError> {
     if graph.n_inputs() != inputs.len() {
         return Err(KernelError::InvalidShape(format!(
@@ -88,41 +96,37 @@ pub fn dispatch_fused(
         .collect();
 
     // Create CB and encode
-    let cb = queue.new_command_buffer();
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
+    let cb = queue.commandBuffer().unwrap();
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
 
     // Bind input buffers
     for (i, input) in inputs.iter().enumerate() {
-        enc.set_buffer(i as u64, Some(input.metal_buffer()), input.offset() as u64);
+        enc.set_buffer(i as u32, Some(input.metal_buffer()), input.offset());
     }
 
     // Bind output buffers
     for (o, output) in outputs.iter().enumerate() {
-        let buf_idx = (inputs.len() + o) as u64;
-        enc.set_buffer(buf_idx, Some(output.metal_buffer()), output.offset() as u64);
+        let buf_idx = (inputs.len() + o) as u32;
+        enc.set_buffer(buf_idx, Some(output.metal_buffer()), output.offset());
     }
 
     // Bind N (element count)
     let n = n_elements as u32;
-    let n_buf = device.new_buffer_with_data(
-        &n as *const u32 as *const _,
-        std::mem::size_of::<u32>() as u64,
-        metal::MTLResourceOptions::StorageModeShared,
-    );
-    let params_idx = (inputs.len() + outputs.len()) as u64;
-    enc.set_buffer(params_idx, Some(&n_buf), 0);
-
+    let params_buf = unsafe { device.newBufferWithBytes_length_options(std::ptr::NonNull::new(&n as *const u32 as *const _ as *mut std::ffi::c_void).unwrap(), std::mem::size_of::<u32>(), MTLResourceOptions::StorageModeShared).unwrap() };
+    let params_idx = (inputs.len() + outputs.len()) as u32;
+    enc.set_buffer(params_idx, Some(&params_buf), 0);
     // Dispatch
-    let max_tg = pipeline.max_total_threads_per_threadgroup();
-    let tg_size = std::cmp::min(max_tg, n_elements as u64);
-    let grid = metal::MTLSize::new(n_elements as u64, 1, 1);
-    let tg = metal::MTLSize::new(tg_size, 1, 1);
+    let max_tg = pipeline.maxTotalThreadsPerThreadgroup();
+    let tg_size = std::cmp::min(max_tg, n_elements);
+    let grid = MTLSize { width: n_elements, height: 1, depth: 1 };
+    let tg = MTLSize { width: tg_size, height: 1, depth: 1 };
     enc.dispatch_threads(grid, tg);
-    enc.end_encoding();
+    enc.end();
 
     cb.commit();
-    cb.wait_until_completed();
+    cb.waitUntilCompleted();
 
     Ok(outputs)
 }
@@ -135,7 +139,7 @@ pub fn dispatch_fused_into_cb(
     codegen: &FusionCodegen,
     registry: &KernelRegistry,
     inputs: &[&Array],
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
 ) -> Result<Vec<Array>, KernelError> {
     if graph.n_inputs() != inputs.len() {
         return Err(KernelError::InvalidShape(format!(
@@ -157,32 +161,28 @@ pub fn dispatch_fused_into_cb(
         .map(|_| Array::zeros(device, inputs[0].shape(), inputs[0].dtype()))
         .collect();
 
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
 
     for (i, input) in inputs.iter().enumerate() {
-        enc.set_buffer(i as u64, Some(input.metal_buffer()), input.offset() as u64);
+        enc.set_buffer(i as u32, Some(input.metal_buffer()), input.offset());
     }
     for (o, output) in outputs.iter().enumerate() {
-        let buf_idx = (inputs.len() + o) as u64;
-        enc.set_buffer(buf_idx, Some(output.metal_buffer()), output.offset() as u64);
+        let buf_idx = (inputs.len() + o) as u32;
+        enc.set_buffer(buf_idx, Some(output.metal_buffer()), output.offset());
     }
 
     let n = n_elements as u32;
-    let n_buf = device.new_buffer_with_data(
-        &n as *const u32 as *const _,
-        std::mem::size_of::<u32>() as u64,
-        metal::MTLResourceOptions::StorageModeShared,
-    );
-    let params_idx = (inputs.len() + outputs.len()) as u64;
-    enc.set_buffer(params_idx, Some(&n_buf), 0);
-
-    let max_tg = pipeline.max_total_threads_per_threadgroup();
-    let tg_size = std::cmp::min(max_tg, n_elements as u64);
-    let grid = metal::MTLSize::new(n_elements as u64, 1, 1);
-    let tg = metal::MTLSize::new(tg_size, 1, 1);
+    let params_buf = unsafe { device.newBufferWithBytes_length_options(std::ptr::NonNull::new(&n as *const u32 as *const _ as *mut std::ffi::c_void).unwrap(), std::mem::size_of::<u32>(), MTLResourceOptions::StorageModeShared).unwrap() };
+    let params_idx = (inputs.len() + outputs.len()) as u32;
+    enc.set_buffer(params_idx, Some(&params_buf), 0);
+    let max_tg = pipeline.maxTotalThreadsPerThreadgroup();
+    let tg_size = std::cmp::min(max_tg, n_elements);
+    let grid = MTLSize { width: n_elements, height: 1, depth: 1 };
+    let tg = MTLSize { width: tg_size, height: 1, depth: 1 };
     enc.dispatch_threads(grid, tg);
-    enc.end_encoding();
+    enc.end();
 
     Ok(outputs)
 }

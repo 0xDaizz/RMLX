@@ -27,6 +27,8 @@
 
 use std::time::{Duration, Instant};
 
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLCommandBuffer as _, MTLCommandQueue as _, MTLDevice as _};
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::KernelRegistry;
@@ -135,7 +137,7 @@ fn f32_to_f16_bits(val: f32) -> u16 {
     ((sign << 15) | (new_exp as u32) << 10 | (frac >> 13)) as u16
 }
 
-fn rand_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
+fn rand_array(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, shape: &[usize], seed: u64) -> Array {
     let numel: usize = shape.iter().product();
     let mut f16_bytes = Vec::with_capacity(numel * 2);
     let mut state = seed;
@@ -150,7 +152,7 @@ fn rand_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
     Array::from_bytes(device, &f16_bytes, shape.to_vec(), DType::Float16)
 }
 
-fn rand_array_ones(device: &metal::Device, shape: &[usize]) -> Array {
+fn rand_array_ones(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, shape: &[usize]) -> Array {
     let numel: usize = shape.iter().product();
     let one_f16 = f32_to_f16_bits(1.0);
     let mut f16_bytes = Vec::with_capacity(numel * 2);
@@ -164,7 +166,7 @@ fn rand_array_ones(device: &metal::Device, shape: &[usize]) -> Array {
 // Layer construction helpers
 // ---------------------------------------------------------------------------
 
-fn make_linear(device: &metal::Device, in_f: usize, out_f: usize, seed: u64) -> Linear {
+fn make_linear(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, in_f: usize, out_f: usize, seed: u64) -> Linear {
     let weight = rand_array(device, &[out_f, in_f], seed);
     Linear::from_arrays(
         LinearConfig {
@@ -179,7 +181,7 @@ fn make_linear(device: &metal::Device, in_f: usize, out_f: usize, seed: u64) -> 
 }
 
 /// Build a full-size (unsharded) transformer block for baseline measurement.
-fn build_transformer_block(device: &metal::Device) -> TransformerBlock {
+fn build_transformer_block(device: &ProtocolObject<dyn objc2_metal::MTLDevice>) -> TransformerBlock {
     let kv_size = NUM_KV_HEADS * HEAD_DIM;
 
     let q_proj = make_linear(device, HIDDEN_SIZE, HIDDEN_SIZE, 1);
@@ -221,7 +223,7 @@ fn build_transformer_block(device: &metal::Device) -> TransformerBlock {
 /// - O: row-parallel (input cols halved)
 /// - gate/up: column-parallel (output rows halved)
 /// - down: row-parallel (input cols halved)
-fn build_sharded_transformer_block(device: &metal::Device, rank: u32) -> TransformerBlock {
+fn build_sharded_transformer_block(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, rank: u32) -> TransformerBlock {
     let kv_size = NUM_KV_HEADS * HEAD_DIM;
     let seed_offset = rank as u64 * 100;
 
@@ -295,7 +297,7 @@ fn bench_baseline_sync(
     block: &TransformerBlock,
     input: &Array,
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Stats {
     println!("\n=== Baseline sync: single-layer forward() — per-op dispatch (slow) ===");
     run_bench("baseline_sync_forward", || {
@@ -309,16 +311,16 @@ fn bench_optimized_single_cb(
     block: &TransformerBlock,
     input: &Array,
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Stats {
     println!("\n=== Optimized: forward_decode_into_cb() — all ops in one command buffer ===");
     run_bench("optimized_single_cb", || {
-        let cb = queue.new_command_buffer_with_unretained_references();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
         let _ = block
-            .forward_decode_into_cb(input, None, None, None, None, registry, cb)
+            .forward_decode_into_cb(input, None, None, None, None, registry, &cb)
             .expect("single_cb forward");
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
     })
 }
 
@@ -330,17 +332,17 @@ fn bench_sharded_compute(
     block: &TransformerBlock,
     input: &Array,
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Stats {
     println!("\n=== TP-sharded compute (half-size weights, single-CB, no allreduce) ===");
     println!("  Simulates rank 0 of TP=2: Q/K/V/gate/up halved, O/down halved.");
     run_bench("sharded_single_cb (TP=2 rank0)", || {
-        let cb = queue.new_command_buffer_with_unretained_references();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
         let _ = block
-            .forward_decode_into_cb(input, None, None, None, None, registry, cb)
+            .forward_decode_into_cb(input, None, None, None, None, registry, &cb)
             .expect("sharded forward");
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
     })
 }
 
@@ -348,7 +350,7 @@ fn bench_sharded_compute(
 // Benchmark: weight sharding overhead
 // ---------------------------------------------------------------------------
 
-fn bench_weight_sharding(device: &metal::Device) -> Stats {
+fn bench_weight_sharding(device: &ProtocolObject<dyn objc2_metal::MTLDevice>) -> Stats {
     use rmlx_nn::{ColumnParallelLinear, RowParallelLinear};
 
     println!("\n=== Weight sharding overhead (Mixtral-like, TP=2) ===");
@@ -469,7 +471,7 @@ fn init_distributed() -> BenchDistCtx {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "distributed")]
-fn bench_allreduce(device: &metal::Device, dist: &BenchDistCtx) -> Stats {
+fn bench_allreduce(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, dist: &BenchDistCtx) -> Stats {
     if dist.is_multi_rank {
         println!(
             "\n=== Real RDMA allreduce (rank={}, world_size={}) ===",
@@ -529,9 +531,9 @@ fn bench_allreduce(device: &metal::Device, dist: &BenchDistCtx) -> Stats {
 
 #[cfg(feature = "distributed")]
 fn bench_parallel_linear(
-    device: &metal::Device,
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
     dist: &BenchDistCtx,
 ) -> (Stats, Stats) {
     use rmlx_nn::{ColumnParallelLinear, RowParallelLinear};
@@ -629,9 +631,9 @@ fn bench_parallel_linear(
 fn bench_tp_forward_with_group(
     block: &TransformerBlock,
     input: &Array,
-    device: &metal::Device,
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
     dist: &BenchDistCtx,
 ) -> Stats {
     println!(
@@ -672,7 +674,7 @@ fn main() {
     let registry = KernelRegistry::new(gpu);
     ops::register_all(&registry).expect("kernel registration failed");
     let device = registry.device().raw();
-    let queue = device.new_command_queue();
+    let queue = device.newCommandQueue().unwrap();
 
     // ── Distributed init (env-based RDMA or single-node fallback) ──
     #[cfg(feature = "distributed")]

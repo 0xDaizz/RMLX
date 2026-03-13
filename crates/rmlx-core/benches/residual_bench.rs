@@ -20,6 +20,8 @@ use rmlx_core::dtype::DType;
 use rmlx_core::kernels::KernelRegistry;
 use rmlx_core::ops;
 use rmlx_metal::device::GpuDevice;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLDevice as _, MTLCommandQueue as _, MTLCommandBuffer as _};
 
 const WARMUP_ITERS: usize = 5;
 const BENCH_ITERS: usize = 20;
@@ -90,7 +92,7 @@ fn f32_to_f16_bits(val: f32) -> u16 {
     ((sign << 15) | (new_exp as u32) << 10 | (frac >> 13)) as u16
 }
 
-fn rand_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
+fn rand_array(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, shape: &[usize], seed: u64) -> Array {
     let numel: usize = shape.iter().product();
     let mut f16_bytes = Vec::with_capacity(numel * 2);
     let mut state = seed;
@@ -145,8 +147,8 @@ fn scenarios() -> Vec<Scenario> {
 /// Benchmark the separate (matmul + add) path for a given M.
 fn bench_separate(
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
-    device: &metal::Device,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
     scenario: &Scenario,
     m: usize,
 ) -> Stats {
@@ -159,20 +161,20 @@ fn bench_separate(
 
     // Warmup
     for _ in 0..WARMUP_ITERS {
-        let cb = queue.new_command_buffer_with_unretained_references();
-        let c = ops::matmul::matmul_into_cb(registry, &a, &b, cb).unwrap();
-        let _ = ops::binary::add_into_cb(registry, &c, &residual, cb).unwrap();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+        let c = ops::matmul::matmul_into_cb(registry, &a, &b, &cb).unwrap();
+        let _ = ops::binary::add_into_cb(registry, &c, &residual, &cb).unwrap();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
     }
     let mut times = Vec::with_capacity(BENCH_ITERS);
     for _ in 0..BENCH_ITERS {
         let start = Instant::now();
-        let cb = queue.new_command_buffer_with_unretained_references();
-        let c = ops::matmul::matmul_into_cb(registry, &a, &b, cb).unwrap();
-        let _ = ops::binary::add_into_cb(registry, &c, &residual, cb).unwrap();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+        let c = ops::matmul::matmul_into_cb(registry, &a, &b, &cb).unwrap();
+        let _ = ops::binary::add_into_cb(registry, &c, &residual, &cb).unwrap();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
         times.push(start.elapsed());
     }
     let stats = Stats::from_durations(&times);
@@ -190,8 +192,8 @@ fn bench_separate(
 /// Returns `None` if the fused kernel is not supported for this config (e.g. non-MlxArch tile).
 fn bench_fused(
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
-    device: &metal::Device,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
     scenario: &Scenario,
     m: usize,
     sep_stats: &Stats,
@@ -205,11 +207,11 @@ fn bench_fused(
 
     // Probe: try one fused dispatch; if unsupported, skip gracefully.
     {
-        let cb = queue.new_command_buffer_with_unretained_references();
-        match ops::matmul::matmul_add_residual_into_cb(registry, &a, &b, &residual, cb) {
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+        match ops::matmul::matmul_add_residual_into_cb(registry, &a, &b, &residual, &cb) {
             Ok(_) => {
                 cb.commit();
-                cb.wait_until_completed();
+                cb.waitUntilCompleted();
             }
             Err(e) => {
                 // Don't commit a partially-encoded CB — just drop it.
@@ -221,18 +223,18 @@ fn bench_fused(
 
     // Warmup (first probe already served as one warmup iter)
     for _ in 1..WARMUP_ITERS {
-        let cb = queue.new_command_buffer_with_unretained_references();
-        let _ = ops::matmul::matmul_add_residual_into_cb(registry, &a, &b, &residual, cb).unwrap();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+        let _ = ops::matmul::matmul_add_residual_into_cb(registry, &a, &b, &residual, &cb).unwrap();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
     }
     let mut times = Vec::with_capacity(BENCH_ITERS);
     for _ in 0..BENCH_ITERS {
         let start = Instant::now();
-        let cb = queue.new_command_buffer_with_unretained_references();
-        let _ = ops::matmul::matmul_add_residual_into_cb(registry, &a, &b, &residual, cb).unwrap();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+        let _ = ops::matmul::matmul_add_residual_into_cb(registry, &a, &b, &residual, &cb).unwrap();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
         times.push(start.elapsed());
     }
     let stats = Stats::from_durations(&times);
@@ -251,7 +253,7 @@ fn main() {
     let registry = KernelRegistry::new(gpu);
     ops::register_all(&registry).expect("Failed to register kernels");
     let device = registry.device().raw();
-    let queue = device.new_command_queue();
+    let queue = device.newCommandQueue().unwrap();
 
     // M values for the separate (matmul + add) baseline — includes M=1 for context.
     let m_values_separate = [1, 8, 32, 128, 256, 512];

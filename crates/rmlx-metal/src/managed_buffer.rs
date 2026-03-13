@@ -168,7 +168,7 @@ mod tests {
 
     #[test]
     fn test_managed_buffer_returns_on_drop() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
+        let device = MTLCreateSystemDefaultDevice().unwrap();
         let allocator = Arc::new(TestAllocator::new(device));
 
         {
@@ -188,7 +188,7 @@ mod tests {
 
     #[test]
     fn test_managed_buffer_take_prevents_free() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
+        let device = MTLCreateSystemDefaultDevice().unwrap();
         let allocator = Arc::new(TestAllocator::new(device));
 
         let buf = ManagedBuffer::alloc(
@@ -205,7 +205,7 @@ mod tests {
 
     #[test]
     fn test_managed_buffer_untracked() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
+        let device = MTLCreateSystemDefaultDevice().unwrap();
         let allocator = Arc::new(TestAllocator::new(device));
 
         let buf =
@@ -218,7 +218,7 @@ mod tests {
 
     #[test]
     fn test_managed_buffer_deref() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
+        let device = MTLCreateSystemDefaultDevice().unwrap();
         let allocator = Arc::new(TestAllocator::new(device));
 
         let buf = ManagedBuffer::alloc(

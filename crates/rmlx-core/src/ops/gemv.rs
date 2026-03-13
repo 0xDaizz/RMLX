@@ -15,7 +15,15 @@
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
-use metal::MTLSize;
+use rmlx_metal::MTLSize;
+use rmlx_metal::ComputePass;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLComputePipelineState as _;
+use objc2_metal::MTLCommandBuffer as _;
+use objc2_metal::MTLCommandQueue as _;
+use objc2_metal::MTLBuffer;
+use rmlx_metal::MTLResourceOptions;
+use objc2_metal::MTLDevice as _;
 
 // ---------------------------------------------------------------------------
 // GEMV tuning — dimension-adaptive parameter selection
@@ -63,17 +71,17 @@ impl GemvTuning {
 }
 
 /// Threadgroup size used for GEMV dispatch.
-const GEMV_THREADGROUP_SIZE: u64 = 256;
+const GEMV_THREADGROUP_SIZE: usize = 256;
 
 /// Number of rows processed per threadgroup (tile-M).
-const TM: u64 = 4;
+const TM: usize = 4;
 
 /// Number of simdgroups per threadgroup for the BM=8 variant.
-const BM8: u64 = 8;
+const BM8: usize = 8;
 /// Rows per threadgroup in BM=8 mode: BM8 * TM = 32.
-const BM8_ROWS: u64 = BM8 * TM;
+const BM8_ROWS: usize = BM8 * TM;
 /// Minimum M to use BM=8 variant (need enough rows to fill threadgroups).
-const BM8_THRESHOLD: u64 = 256;
+const BM8_THRESHOLD: usize = 256;
 
 pub const GEMV_SHADER_SOURCE: &str = r#"
 #include <metal_stdlib>
@@ -1034,7 +1042,7 @@ pub fn register(registry: &KernelRegistry) -> Result<(), KernelError> {
 
 /// Compute ceil(a / b) for unsigned integers.
 #[allow(clippy::manual_div_ceil)]
-fn ceil_div(a: u64, b: u64) -> u64 {
+fn ceil_div(a: usize, b: usize) -> usize {
     (a + b - 1) / b
 }
 
@@ -1049,7 +1057,7 @@ pub fn gemv(
     registry: &KernelRegistry,
     mat: &Array,
     vec: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     if mat.ndim() != 2 {
         return Err(KernelError::InvalidShape(format!(
@@ -1084,7 +1092,7 @@ pub fn gemv(
     let vec = vec_contig.as_ref().unwrap_or(vec);
 
     let m = super::checked_u32(mat.shape()[0], "M")?;
-    let use_bm8 = (m as u64) >= BM8_THRESHOLD;
+    let use_bm8 = (m as usize) >= BM8_THRESHOLD;
 
     let kernel_name = match (mat.dtype(), use_bm8) {
         (DType::Float32, true) => "gemv_bm8_f32",
@@ -1107,36 +1115,42 @@ pub fn gemv(
     let out = Array::zeros(registry.device().raw(), &[m as usize], mat.dtype());
 
     let dev = registry.device().raw();
-    let opts = metal::MTLResourceOptions::StorageModeShared;
-    let m_buf = dev.new_buffer_with_data(&m as *const u32 as *const _, 4, opts);
-    let k_buf = dev.new_buffer_with_data(&k as *const u32 as *const _, 4, opts);
+    let opts = MTLResourceOptions::StorageModeShared;
+    let m_buf = unsafe { dev.newBufferWithBytes_length_options(std::ptr::NonNull::new(&m as *const u32 as *const _ as *mut std::ffi::c_void).unwrap(), 4_usize, opts).unwrap() };
+    let k_buf = unsafe { dev.newBufferWithBytes_length_options(std::ptr::NonNull::new(&k as *const u32 as *const _ as *mut std::ffi::c_void).unwrap(), 4_usize, opts).unwrap() };
 
-    let command_buffer = queue.new_command_buffer();
-    let encoder = command_buffer.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(mat.metal_buffer()), mat.offset() as u64);
-    encoder.set_buffer(1, Some(vec.metal_buffer()), vec.offset() as u64);
-    encoder.set_buffer(2, Some(out.metal_buffer()), 0);
-    encoder.set_buffer(3, Some(&m_buf), 0);
-    encoder.set_buffer(4, Some(&k_buf), 0);
-
+    let command_buffer = queue.commandBuffer().unwrap();
+    let raw_enc = command_buffer.computeCommandEncoder().unwrap();
+    let encoder = ComputePass::new(&raw_enc);
+    encoder.set_pipeline(&pipeline);
+    {
+        let bufs: [Option<&ProtocolObject<dyn MTLBuffer>>; 5] = [
+            Some(mat.metal_buffer()),
+            Some(vec.metal_buffer()),
+            Some(out.metal_buffer()),
+            Some(&m_buf),
+            Some(&k_buf),
+        ];
+        let offsets: [usize; 5] = [mat.offset(), vec.offset(), 0, 0, 0];
+        encoder.set_buffers(0, &bufs, &offsets);
+    }
     let tg_size = std::cmp::min(
         GEMV_THREADGROUP_SIZE,
-        pipeline.max_total_threads_per_threadgroup(),
+        pipeline.maxTotalThreadsPerThreadgroup(),
     );
     let num_threadgroups = if use_bm8 {
-        ceil_div(m as u64, BM8_ROWS)
+        ceil_div(m as usize, BM8_ROWS)
     } else {
-        ceil_div(m as u64, TM)
+        ceil_div(m as usize, TM)
     };
     let tg_dim = if use_bm8 {
-        MTLSize::new(32, 1, BM8)
+        MTLSize { width: 32, height: 1, depth: BM8 }
     } else {
-        MTLSize::new(tg_size, 1, 1)
+        MTLSize { width: tg_size, height: 1, depth: 1 }
     };
-    encoder.dispatch_thread_groups(MTLSize::new(num_threadgroups, 1, 1), tg_dim);
-    encoder.end_encoding();
-    super::commit_with_mode(command_buffer, super::ExecMode::Sync);
+    encoder.dispatch_threadgroups(MTLSize { width: num_threadgroups, height: 1, depth: 1 }, tg_dim);
+    encoder.end();
+    super::commit_with_mode(&command_buffer, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -1147,7 +1161,7 @@ pub fn gemv_into_cb(
     registry: &KernelRegistry,
     mat: &Array,
     vec: &Array,
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
 ) -> Result<Array, KernelError> {
     if mat.ndim() != 2 {
         return Err(KernelError::InvalidShape(format!(
@@ -1170,7 +1184,7 @@ pub fn gemv_into_cb(
     }
 
     let m = super::checked_u32(mat.shape()[0], "M")?;
-    let use_bm8 = (m as u64) >= BM8_THRESHOLD;
+    let use_bm8 = (m as usize) >= BM8_THRESHOLD;
 
     let kernel_name = match (mat.dtype(), use_bm8) {
         (DType::Float32, true) => "gemv_bm8_f32",
@@ -1192,30 +1206,36 @@ pub fn gemv_into_cb(
 
     let out = Array::uninit(registry.device().raw(), &[m as usize], mat.dtype());
 
-    let encoder = cb.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(mat.metal_buffer()), mat.offset() as u64);
-    encoder.set_buffer(1, Some(vec.metal_buffer()), vec.offset() as u64);
-    encoder.set_buffer(2, Some(out.metal_buffer()), 0);
-    encoder.set_bytes(3, 4, &m as *const u32 as *const std::ffi::c_void);
-    encoder.set_bytes(4, 4, &k as *const u32 as *const std::ffi::c_void);
-
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let encoder = ComputePass::new(&raw_enc);
+    encoder.set_pipeline(&pipeline);
+    {
+        let bufs: [Option<&ProtocolObject<dyn MTLBuffer>>; 3] = [
+            Some(mat.metal_buffer()),
+            Some(vec.metal_buffer()),
+            Some(out.metal_buffer()),
+        ];
+        let offsets: [usize; 3] = [mat.offset(), vec.offset(), 0];
+        encoder.set_buffers(0, &bufs, &offsets);
+    }
+    encoder.set_bytes(3, &m as *const u32 as *const std::ffi::c_void, 4);
+    encoder.set_bytes(4, &k as *const u32 as *const std::ffi::c_void, 4);
     let tg_size = std::cmp::min(
         GEMV_THREADGROUP_SIZE,
-        pipeline.max_total_threads_per_threadgroup(),
+        pipeline.maxTotalThreadsPerThreadgroup(),
     );
     let num_threadgroups = if use_bm8 {
-        ceil_div(m as u64, BM8_ROWS)
+        ceil_div(m as usize, BM8_ROWS)
     } else {
-        ceil_div(m as u64, TM)
+        ceil_div(m as usize, TM)
     };
     let tg_dim = if use_bm8 {
-        MTLSize::new(32, 1, BM8)
+        MTLSize { width: 32, height: 1, depth: BM8 }
     } else {
-        MTLSize::new(tg_size, 1, 1)
+        MTLSize { width: tg_size, height: 1, depth: 1 }
     };
-    encoder.dispatch_thread_groups(MTLSize::new(num_threadgroups, 1, 1), tg_dim);
-    encoder.end_encoding();
+    encoder.dispatch_threadgroups(MTLSize { width: num_threadgroups, height: 1, depth: 1 }, tg_dim);
+    encoder.end();
 
     Ok(out)
 }
@@ -1227,7 +1247,7 @@ pub fn gemv_into_encoder(
     registry: &KernelRegistry,
     mat: &Array,
     vec: &Array,
-    encoder: &metal::ComputeCommandEncoderRef,
+    encoder: ComputePass<'_>,
 ) -> Result<Array, KernelError> {
     if mat.ndim() != 2 {
         return Err(KernelError::InvalidShape(format!(
@@ -1250,7 +1270,7 @@ pub fn gemv_into_encoder(
     }
 
     let m = super::checked_u32(mat.shape()[0], "M")?;
-    let use_bm8 = (m as u64) >= BM8_THRESHOLD;
+    let use_bm8 = (m as usize) >= BM8_THRESHOLD;
 
     let kernel_name = match (mat.dtype(), use_bm8) {
         (DType::Float32, true) => "gemv_bm8_f32",
@@ -1272,28 +1292,33 @@ pub fn gemv_into_encoder(
 
     let out = Array::uninit(registry.device().raw(), &[m as usize], mat.dtype());
 
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(mat.metal_buffer()), mat.offset() as u64);
-    encoder.set_buffer(1, Some(vec.metal_buffer()), vec.offset() as u64);
-    encoder.set_buffer(2, Some(out.metal_buffer()), 0);
-    encoder.set_bytes(3, 4, &m as *const u32 as *const std::ffi::c_void);
-    encoder.set_bytes(4, 4, &k as *const u32 as *const std::ffi::c_void);
-
+    encoder.set_pipeline(&pipeline);
+    {
+        let bufs: [Option<&ProtocolObject<dyn MTLBuffer>>; 3] = [
+            Some(mat.metal_buffer()),
+            Some(vec.metal_buffer()),
+            Some(out.metal_buffer()),
+        ];
+        let offsets: [usize; 3] = [mat.offset(), vec.offset(), 0];
+        encoder.set_buffers(0, &bufs, &offsets);
+    }
+    encoder.set_bytes(3, &m as *const u32 as *const std::ffi::c_void, 4);
+    encoder.set_bytes(4, &k as *const u32 as *const std::ffi::c_void, 4);
     let tg_size = std::cmp::min(
         GEMV_THREADGROUP_SIZE,
-        pipeline.max_total_threads_per_threadgroup(),
+        pipeline.maxTotalThreadsPerThreadgroup(),
     );
     let num_threadgroups = if use_bm8 {
-        ceil_div(m as u64, BM8_ROWS)
+        ceil_div(m as usize, BM8_ROWS)
     } else {
-        ceil_div(m as u64, TM)
+        ceil_div(m as usize, TM)
     };
     let tg_dim = if use_bm8 {
-        MTLSize::new(32, 1, BM8)
+        MTLSize { width: 32, height: 1, depth: BM8 }
     } else {
-        MTLSize::new(tg_size, 1, 1)
+        MTLSize { width: tg_size, height: 1, depth: 1 }
     };
-    encoder.dispatch_thread_groups(MTLSize::new(num_threadgroups, 1, 1), tg_dim);
+    encoder.dispatch_threadgroups(MTLSize { width: num_threadgroups, height: 1, depth: 1 }, tg_dim);
 
     Ok(out)
 }
@@ -1306,7 +1331,7 @@ pub fn gemv_bias_into_cb(
     mat: &Array,
     vec: &Array,
     bias: &Array,
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
 ) -> Result<Array, KernelError> {
     if mat.ndim() != 2 {
         return Err(KernelError::InvalidShape(format!(
@@ -1356,7 +1381,7 @@ pub fn gemv_bias_into_cb(
     }
 
     let m = super::checked_u32(mat.shape()[0], "M")?;
-    let use_bm8 = (m as u64) >= BM8_THRESHOLD;
+    let use_bm8 = (m as usize) >= BM8_THRESHOLD;
 
     let kernel_name = match (mat.dtype(), use_bm8) {
         (DType::Float32, true) => "gemv_bias_bm8_f32",
@@ -1378,31 +1403,37 @@ pub fn gemv_bias_into_cb(
 
     let out = Array::uninit(registry.device().raw(), &[m as usize], mat.dtype());
 
-    let encoder = cb.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(mat.metal_buffer()), mat.offset() as u64);
-    encoder.set_buffer(1, Some(vec.metal_buffer()), vec.offset() as u64);
-    encoder.set_buffer(2, Some(out.metal_buffer()), 0);
-    encoder.set_bytes(3, 4, &m as *const u32 as *const std::ffi::c_void);
-    encoder.set_bytes(4, 4, &k as *const u32 as *const std::ffi::c_void);
-    encoder.set_buffer(5, Some(bias.metal_buffer()), bias.offset() as u64);
-
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let encoder = ComputePass::new(&raw_enc);
+    encoder.set_pipeline(&pipeline);
+    {
+        let bufs: [Option<&ProtocolObject<dyn MTLBuffer>>; 3] = [
+            Some(mat.metal_buffer()),
+            Some(vec.metal_buffer()),
+            Some(out.metal_buffer()),
+        ];
+        let offsets: [usize; 3] = [mat.offset(), vec.offset(), 0];
+        encoder.set_buffers(0, &bufs, &offsets);
+    }
+    encoder.set_bytes(3, &m as *const u32 as *const std::ffi::c_void, 4);
+    encoder.set_bytes(4, &k as *const u32 as *const std::ffi::c_void, 4);
+    encoder.set_buffer(5, Some(bias.metal_buffer()), bias.offset());
     let tg_size = std::cmp::min(
         GEMV_THREADGROUP_SIZE,
-        pipeline.max_total_threads_per_threadgroup(),
+        pipeline.maxTotalThreadsPerThreadgroup(),
     );
     let num_threadgroups = if use_bm8 {
-        ceil_div(m as u64, BM8_ROWS)
+        ceil_div(m as usize, BM8_ROWS)
     } else {
-        ceil_div(m as u64, TM)
+        ceil_div(m as usize, TM)
     };
     let tg_dim = if use_bm8 {
-        MTLSize::new(32, 1, BM8)
+        MTLSize { width: 32, height: 1, depth: BM8 }
     } else {
-        MTLSize::new(tg_size, 1, 1)
+        MTLSize { width: tg_size, height: 1, depth: 1 }
     };
-    encoder.dispatch_thread_groups(MTLSize::new(num_threadgroups, 1, 1), tg_dim);
-    encoder.end_encoding();
+    encoder.dispatch_threadgroups(MTLSize { width: num_threadgroups, height: 1, depth: 1 }, tg_dim);
+    encoder.end();
 
     Ok(out)
 }
@@ -1415,7 +1446,7 @@ pub fn gemv_bias_into_encoder(
     mat: &Array,
     vec: &Array,
     bias: &Array,
-    encoder: &metal::ComputeCommandEncoderRef,
+    encoder: ComputePass<'_>,
 ) -> Result<Array, KernelError> {
     if mat.ndim() != 2 {
         return Err(KernelError::InvalidShape(format!(
@@ -1465,7 +1496,7 @@ pub fn gemv_bias_into_encoder(
     }
 
     let m = super::checked_u32(mat.shape()[0], "M")?;
-    let use_bm8 = (m as u64) >= BM8_THRESHOLD;
+    let use_bm8 = (m as usize) >= BM8_THRESHOLD;
 
     let kernel_name = match (mat.dtype(), use_bm8) {
         (DType::Float32, true) => "gemv_bias_bm8_f32",
@@ -1487,29 +1518,34 @@ pub fn gemv_bias_into_encoder(
 
     let out = Array::uninit(registry.device().raw(), &[m as usize], mat.dtype());
 
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(mat.metal_buffer()), mat.offset() as u64);
-    encoder.set_buffer(1, Some(vec.metal_buffer()), vec.offset() as u64);
-    encoder.set_buffer(2, Some(out.metal_buffer()), 0);
-    encoder.set_bytes(3, 4, &m as *const u32 as *const std::ffi::c_void);
-    encoder.set_bytes(4, 4, &k as *const u32 as *const std::ffi::c_void);
-    encoder.set_buffer(5, Some(bias.metal_buffer()), bias.offset() as u64);
-
+    encoder.set_pipeline(&pipeline);
+    {
+        let bufs: [Option<&ProtocolObject<dyn MTLBuffer>>; 3] = [
+            Some(mat.metal_buffer()),
+            Some(vec.metal_buffer()),
+            Some(out.metal_buffer()),
+        ];
+        let offsets: [usize; 3] = [mat.offset(), vec.offset(), 0];
+        encoder.set_buffers(0, &bufs, &offsets);
+    }
+    encoder.set_bytes(3, &m as *const u32 as *const std::ffi::c_void, 4);
+    encoder.set_bytes(4, &k as *const u32 as *const std::ffi::c_void, 4);
+    encoder.set_buffer(5, Some(bias.metal_buffer()), bias.offset());
     let tg_size = std::cmp::min(
         GEMV_THREADGROUP_SIZE,
-        pipeline.max_total_threads_per_threadgroup(),
+        pipeline.maxTotalThreadsPerThreadgroup(),
     );
     let num_threadgroups = if use_bm8 {
-        ceil_div(m as u64, BM8_ROWS)
+        ceil_div(m as usize, BM8_ROWS)
     } else {
-        ceil_div(m as u64, TM)
+        ceil_div(m as usize, TM)
     };
     let tg_dim = if use_bm8 {
-        MTLSize::new(32, 1, BM8)
+        MTLSize { width: 32, height: 1, depth: BM8 }
     } else {
-        MTLSize::new(tg_size, 1, 1)
+        MTLSize { width: tg_size, height: 1, depth: 1 }
     };
-    encoder.dispatch_thread_groups(MTLSize::new(num_threadgroups, 1, 1), tg_dim);
+    encoder.dispatch_threadgroups(MTLSize { width: num_threadgroups, height: 1, depth: 1 }, tg_dim);
 
     Ok(out)
 }
@@ -1524,7 +1560,7 @@ pub fn gemv_bias(
     mat: &Array,
     vec: &Array,
     bias: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     if mat.ndim() != 2 {
         return Err(KernelError::InvalidShape(format!(
@@ -1581,7 +1617,7 @@ pub fn gemv_bias(
     let bias = bias_contig.as_ref().unwrap_or(bias);
 
     let m = super::checked_u32(mat.shape()[0], "M")?;
-    let use_bm8 = (m as u64) >= BM8_THRESHOLD;
+    let use_bm8 = (m as usize) >= BM8_THRESHOLD;
 
     let kernel_name = match (mat.dtype(), use_bm8) {
         (DType::Float32, true) => "gemv_bias_bm8_f32",
@@ -1604,37 +1640,43 @@ pub fn gemv_bias(
     let out = Array::zeros(registry.device().raw(), &[m as usize], mat.dtype());
 
     let dev = registry.device().raw();
-    let opts = metal::MTLResourceOptions::StorageModeShared;
-    let m_buf = dev.new_buffer_with_data(&m as *const u32 as *const _, 4, opts);
-    let k_buf = dev.new_buffer_with_data(&k as *const u32 as *const _, 4, opts);
+    let opts = MTLResourceOptions::StorageModeShared;
+    let m_buf = unsafe { dev.newBufferWithBytes_length_options(std::ptr::NonNull::new(&m as *const u32 as *const _ as *mut std::ffi::c_void).unwrap(), 4_usize, opts).unwrap() };
+    let k_buf = unsafe { dev.newBufferWithBytes_length_options(std::ptr::NonNull::new(&k as *const u32 as *const _ as *mut std::ffi::c_void).unwrap(), 4_usize, opts).unwrap() };
 
-    let command_buffer = queue.new_command_buffer();
-    let encoder = command_buffer.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(mat.metal_buffer()), mat.offset() as u64);
-    encoder.set_buffer(1, Some(vec.metal_buffer()), vec.offset() as u64);
-    encoder.set_buffer(2, Some(out.metal_buffer()), 0);
-    encoder.set_buffer(3, Some(&m_buf), 0);
-    encoder.set_buffer(4, Some(&k_buf), 0);
-    encoder.set_buffer(5, Some(bias.metal_buffer()), bias.offset() as u64);
-
+    let command_buffer = queue.commandBuffer().unwrap();
+    let raw_enc = command_buffer.computeCommandEncoder().unwrap();
+    let encoder = ComputePass::new(&raw_enc);
+    encoder.set_pipeline(&pipeline);
+    {
+        let bufs: [Option<&ProtocolObject<dyn MTLBuffer>>; 6] = [
+            Some(mat.metal_buffer()),
+            Some(vec.metal_buffer()),
+            Some(out.metal_buffer()),
+            Some(&m_buf),
+            Some(&k_buf),
+            Some(bias.metal_buffer()),
+        ];
+        let offsets: [usize; 6] = [mat.offset(), vec.offset(), 0, 0, 0, bias.offset()];
+        encoder.set_buffers(0, &bufs, &offsets);
+    }
     let tg_size = std::cmp::min(
         GEMV_THREADGROUP_SIZE,
-        pipeline.max_total_threads_per_threadgroup(),
+        pipeline.maxTotalThreadsPerThreadgroup(),
     );
     let num_threadgroups = if use_bm8 {
-        ceil_div(m as u64, BM8_ROWS)
+        ceil_div(m as usize, BM8_ROWS)
     } else {
-        ceil_div(m as u64, TM)
+        ceil_div(m as usize, TM)
     };
     let tg_dim = if use_bm8 {
-        MTLSize::new(32, 1, BM8)
+        MTLSize { width: 32, height: 1, depth: BM8 }
     } else {
-        MTLSize::new(tg_size, 1, 1)
+        MTLSize { width: tg_size, height: 1, depth: 1 }
     };
-    encoder.dispatch_thread_groups(MTLSize::new(num_threadgroups, 1, 1), tg_dim);
-    encoder.end_encoding();
-    super::commit_with_mode(command_buffer, super::ExecMode::Sync);
+    encoder.dispatch_threadgroups(MTLSize { width: num_threadgroups, height: 1, depth: 1 }, tg_dim);
+    encoder.end();
+    super::commit_with_mode(&command_buffer, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -1649,7 +1691,7 @@ pub fn gemv_t(
     registry: &KernelRegistry,
     mat: &Array,
     vec: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     if mat.ndim() != 2 {
         return Err(KernelError::InvalidShape(format!(
@@ -1707,32 +1749,38 @@ pub fn gemv_t(
     let out = Array::zeros(registry.device().raw(), &[cols], mat.dtype());
 
     let dev = registry.device().raw();
-    let opts = metal::MTLResourceOptions::StorageModeShared;
-    let n_buf = dev.new_buffer_with_data(&n_out as *const u32 as *const _, 4, opts);
-    let k_buf = dev.new_buffer_with_data(&k_red as *const u32 as *const _, 4, opts);
-    let lda_buf = dev.new_buffer_with_data(&lda as *const u32 as *const _, 4, opts);
+    let opts = MTLResourceOptions::StorageModeShared;
+    let n_buf = unsafe { dev.newBufferWithBytes_length_options(std::ptr::NonNull::new(&n_out as *const u32 as *const _ as *mut std::ffi::c_void).unwrap(), 4_usize, opts).unwrap() };
+    let k_buf = unsafe { dev.newBufferWithBytes_length_options(std::ptr::NonNull::new(&k_red as *const u32 as *const _ as *mut std::ffi::c_void).unwrap(), 4_usize, opts).unwrap() };
+    let lda_buf = unsafe { dev.newBufferWithBytes_length_options(std::ptr::NonNull::new(&lda as *const u32 as *const _ as *mut std::ffi::c_void).unwrap(), 4_usize, opts).unwrap() };
 
-    let command_buffer = queue.new_command_buffer();
-    let encoder = command_buffer.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(mat.metal_buffer()), mat.offset() as u64);
-    encoder.set_buffer(1, Some(vec.metal_buffer()), vec.offset() as u64);
-    encoder.set_buffer(2, Some(out.metal_buffer()), 0);
-    encoder.set_buffer(3, Some(&n_buf), 0);
-    encoder.set_buffer(4, Some(&k_buf), 0);
-    encoder.set_buffer(5, Some(&lda_buf), 0);
-
+    let command_buffer = queue.commandBuffer().unwrap();
+    let raw_enc = command_buffer.computeCommandEncoder().unwrap();
+    let encoder = ComputePass::new(&raw_enc);
+    encoder.set_pipeline(&pipeline);
+    {
+        let bufs: [Option<&ProtocolObject<dyn MTLBuffer>>; 6] = [
+            Some(mat.metal_buffer()),
+            Some(vec.metal_buffer()),
+            Some(out.metal_buffer()),
+            Some(&n_buf),
+            Some(&k_buf),
+            Some(&lda_buf),
+        ];
+        let offsets: [usize; 6] = [mat.offset(), vec.offset(), 0, 0, 0, 0];
+        encoder.set_buffers(0, &bufs, &offsets);
+    }
     let tg_size = std::cmp::min(
         GEMV_THREADGROUP_SIZE,
-        pipeline.max_total_threads_per_threadgroup(),
+        pipeline.maxTotalThreadsPerThreadgroup(),
     );
-    let num_threadgroups = ceil_div(n_out as u64, TM);
-    encoder.dispatch_thread_groups(
-        MTLSize::new(num_threadgroups, 1, 1),
-        MTLSize::new(tg_size, 1, 1),
+    let num_threadgroups = ceil_div(n_out as usize, TM);
+    encoder.dispatch_threadgroups(
+        MTLSize { width: num_threadgroups, height: 1, depth: 1 },
+        MTLSize { width: tg_size, height: 1, depth: 1 },
     );
-    encoder.end_encoding();
-    super::commit_with_mode(command_buffer, super::ExecMode::Sync);
+    encoder.end();
+    super::commit_with_mode(&command_buffer, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -1745,7 +1793,7 @@ pub fn gemv_t_into_cb(
     registry: &KernelRegistry,
     mat: &Array,
     vec: &Array,
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
 ) -> Result<Array, KernelError> {
     if mat.ndim() != 2 {
         return Err(KernelError::InvalidShape(format!(
@@ -1797,25 +1845,31 @@ pub fn gemv_t_into_cb(
 
     let out = Array::uninit(registry.device().raw(), &[cols], mat.dtype());
 
-    let encoder = cb.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(mat.metal_buffer()), mat.offset() as u64);
-    encoder.set_buffer(1, Some(vec.metal_buffer()), vec.offset() as u64);
-    encoder.set_buffer(2, Some(out.metal_buffer()), 0);
-    encoder.set_bytes(3, 4, &n_out as *const u32 as *const std::ffi::c_void);
-    encoder.set_bytes(4, 4, &k_red as *const u32 as *const std::ffi::c_void);
-    encoder.set_bytes(5, 4, &lda as *const u32 as *const std::ffi::c_void);
-
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let encoder = ComputePass::new(&raw_enc);
+    encoder.set_pipeline(&pipeline);
+    {
+        let bufs: [Option<&ProtocolObject<dyn MTLBuffer>>; 3] = [
+            Some(mat.metal_buffer()),
+            Some(vec.metal_buffer()),
+            Some(out.metal_buffer()),
+        ];
+        let offsets: [usize; 3] = [mat.offset(), vec.offset(), 0];
+        encoder.set_buffers(0, &bufs, &offsets);
+    }
+    encoder.set_bytes(3, &n_out as *const u32 as *const std::ffi::c_void, 4);
+    encoder.set_bytes(4, &k_red as *const u32 as *const std::ffi::c_void, 4);
+    encoder.set_bytes(5, &lda as *const u32 as *const std::ffi::c_void, 4);
     let tg_size = std::cmp::min(
         GEMV_THREADGROUP_SIZE,
-        pipeline.max_total_threads_per_threadgroup(),
+        pipeline.maxTotalThreadsPerThreadgroup(),
     );
-    let num_threadgroups = ceil_div(n_out as u64, TM);
-    encoder.dispatch_thread_groups(
-        MTLSize::new(num_threadgroups, 1, 1),
-        MTLSize::new(tg_size, 1, 1),
+    let num_threadgroups = ceil_div(n_out as usize, TM);
+    encoder.dispatch_threadgroups(
+        MTLSize { width: num_threadgroups, height: 1, depth: 1 },
+        MTLSize { width: tg_size, height: 1, depth: 1 },
     );
-    encoder.end_encoding();
+    encoder.end();
 
     Ok(out)
 }
@@ -1835,82 +1889,94 @@ pub fn gemv_constants(use_bias: bool) -> Vec<(u32, crate::kernels::FunctionConst
 /// mat: [M, K], vec: [K] → writes into out_buf at out_offset
 #[allow(clippy::too_many_arguments)]
 pub fn gemv_preresolved_into_encoder(
-    pso: &metal::ComputePipelineState,
-    mat_buf: &metal::BufferRef,
-    mat_offset: u64,
-    vec_buf: &metal::BufferRef,
-    vec_offset: u64,
-    out_buf: &metal::BufferRef,
-    out_offset: u64,
+    pso: &rmlx_metal::MtlPipeline,
+    mat_buf: &rmlx_metal::MtlBuffer,
+    mat_offset: usize,
+    vec_buf: &rmlx_metal::MtlBuffer,
+    vec_offset: usize,
+    out_buf: &rmlx_metal::MtlBuffer,
+    out_offset: usize,
     m: u32,
     k: u32,
-    grid: metal::MTLSize,
-    tg: metal::MTLSize,
-    encoder: &metal::ComputeCommandEncoderRef,
+    grid: MTLSize,
+    tg: MTLSize,
+    encoder: ComputePass<'_>,
 ) {
-    encoder.set_compute_pipeline_state(pso);
-    encoder.set_buffer(0, Some(mat_buf), mat_offset);
-    encoder.set_buffer(1, Some(vec_buf), vec_offset);
-    encoder.set_buffer(2, Some(out_buf), out_offset);
-    encoder.set_bytes(3, 4, &m as *const u32 as *const std::ffi::c_void);
-    encoder.set_bytes(4, 4, &k as *const u32 as *const std::ffi::c_void);
-    encoder.dispatch_thread_groups(grid, tg);
+    encoder.set_pipeline(pso);
+    {
+        let bufs: [Option<&ProtocolObject<dyn MTLBuffer>>; 3] = [
+            Some(mat_buf),
+            Some(vec_buf),
+            Some(out_buf),
+        ];
+        let offsets: [usize; 3] = [mat_offset, vec_offset, out_offset];
+        encoder.set_buffers(0, &bufs, &offsets);
+    }
+    encoder.set_bytes(3, &m as *const u32 as *const std::ffi::c_void, 4);
+    encoder.set_bytes(4, &k as *const u32 as *const std::ffi::c_void, 4);
+    encoder.dispatch_threadgroups(grid, tg);
 }
 
 /// Encode GEMV+bias using a pre-resolved PSO and pre-allocated output buffer.
 #[allow(clippy::too_many_arguments)]
 pub fn gemv_bias_preresolved_into_encoder(
-    pso: &metal::ComputePipelineState,
-    mat_buf: &metal::BufferRef,
-    mat_offset: u64,
-    vec_buf: &metal::BufferRef,
-    vec_offset: u64,
-    out_buf: &metal::BufferRef,
-    out_offset: u64,
+    pso: &rmlx_metal::MtlPipeline,
+    mat_buf: &rmlx_metal::MtlBuffer,
+    mat_offset: usize,
+    vec_buf: &rmlx_metal::MtlBuffer,
+    vec_offset: usize,
+    out_buf: &rmlx_metal::MtlBuffer,
+    out_offset: usize,
     m: u32,
     k: u32,
-    bias_buf: &metal::BufferRef,
-    bias_offset: u64,
-    grid: metal::MTLSize,
-    tg: metal::MTLSize,
-    encoder: &metal::ComputeCommandEncoderRef,
+    bias_buf: &rmlx_metal::MtlBuffer,
+    bias_offset: usize,
+    grid: MTLSize,
+    tg: MTLSize,
+    encoder: ComputePass<'_>,
 ) {
-    encoder.set_compute_pipeline_state(pso);
-    encoder.set_buffer(0, Some(mat_buf), mat_offset);
-    encoder.set_buffer(1, Some(vec_buf), vec_offset);
-    encoder.set_buffer(2, Some(out_buf), out_offset);
-    encoder.set_bytes(3, 4, &m as *const u32 as *const std::ffi::c_void);
-    encoder.set_bytes(4, 4, &k as *const u32 as *const std::ffi::c_void);
+    encoder.set_pipeline(pso);
+    {
+        let bufs: [Option<&ProtocolObject<dyn MTLBuffer>>; 3] = [
+            Some(mat_buf),
+            Some(vec_buf),
+            Some(out_buf),
+        ];
+        let offsets: [usize; 3] = [mat_offset, vec_offset, out_offset];
+        encoder.set_buffers(0, &bufs, &offsets);
+    }
+    encoder.set_bytes(3, &m as *const u32 as *const std::ffi::c_void, 4);
+    encoder.set_bytes(4, &k as *const u32 as *const std::ffi::c_void, 4);
     encoder.set_buffer(5, Some(bias_buf), bias_offset);
-    encoder.dispatch_thread_groups(grid, tg);
+    encoder.dispatch_threadgroups(grid, tg);
 }
 
 /// Compute dispatch grid and threadgroup sizes for GEMV with given M.
 pub fn gemv_dispatch_sizes(
     m: u32,
-    pso: &metal::ComputePipelineState,
-) -> (metal::MTLSize, metal::MTLSize) {
-    let use_bm8 = (m as u64) >= BM8_THRESHOLD;
+    pso: &rmlx_metal::MtlPipeline,
+) -> (MTLSize, MTLSize) {
+    let use_bm8 = (m as usize) >= BM8_THRESHOLD;
     let num_threadgroups = if use_bm8 {
-        ceil_div(m as u64, BM8_ROWS)
+        ceil_div(m as usize, BM8_ROWS)
     } else {
-        ceil_div(m as u64, TM)
+        ceil_div(m as usize, TM)
     };
     let tg_dim = if use_bm8 {
-        MTLSize::new(32, 1, BM8)
+        MTLSize { width: 32, height: 1, depth: BM8 }
     } else {
         let tg_size = std::cmp::min(
             GEMV_THREADGROUP_SIZE,
-            pso.max_total_threads_per_threadgroup(),
+            pso.maxTotalThreadsPerThreadgroup(),
         );
-        MTLSize::new(tg_size, 1, 1)
+        MTLSize { width: tg_size, height: 1, depth: 1 }
     };
-    (MTLSize::new(num_threadgroups, 1, 1), tg_dim)
+    (MTLSize { width: num_threadgroups, height: 1, depth: 1 }, tg_dim)
 }
 
 /// Get the GEMV kernel name for a given dtype and M dimension.
 pub fn gemv_kernel_name(dtype: DType, m: u32) -> Result<&'static str, KernelError> {
-    let use_bm8 = (m as u64) >= BM8_THRESHOLD;
+    let use_bm8 = (m as usize) >= BM8_THRESHOLD;
     match (dtype, use_bm8) {
         (DType::Float32, true) => Ok("gemv_bm8_f32"),
         (DType::Float32, false) => Ok("gemv_f32"),
@@ -1927,7 +1993,7 @@ pub fn gemv_kernel_name(dtype: DType, m: u32) -> Result<&'static str, KernelErro
 
 /// Get the GEMV+bias kernel name for a given dtype and M dimension.
 pub fn gemv_bias_kernel_name(dtype: DType, m: u32) -> Result<&'static str, KernelError> {
-    let use_bm8 = (m as u64) >= BM8_THRESHOLD;
+    let use_bm8 = (m as usize) >= BM8_THRESHOLD;
     match (dtype, use_bm8) {
         (DType::Float32, true) => Ok("gemv_bias_bm8_f32"),
         (DType::Float32, false) => Ok("gemv_bias_f32"),

@@ -2,6 +2,8 @@
 
 use std::sync::{Arc, Mutex};
 
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLDevice;
 use rmlx_alloc::zero_copy::CompletionTicket;
 use rmlx_metal::event::GpuEvent;
 use rmlx_rdma::gpu_doorbell::{DescriptorProxy, DescriptorRing};
@@ -114,7 +116,7 @@ impl EpRuntimeContext {
         progress: Arc<ProgressEngine>,
         shared_pool: Arc<Mutex<SharedBufferPool>>,
         conn_ids: Vec<ConnectionId>,
-        device: &metal::Device,
+        device: &ProtocolObject<dyn MTLDevice>,
     ) -> Self {
         let compute_event = Arc::new(GpuEvent::new(device));
         let transfer_event = Arc::new(GpuEvent::new(device));
@@ -354,7 +356,7 @@ mod tests {
 
     /// Helper: create a pool with the given tier sizes. Skips if no Metal device.
     fn make_pool(tier_sizes: &[usize]) -> Option<SharedBufferPool> {
-        let device = metal::Device::system_default()?;
+        let device = objc2_metal::MTLCreateSystemDefaultDevice()?;
         SharedBufferPool::new(&device, tier_sizes).ok()
     }
 
@@ -365,7 +367,7 @@ mod tests {
             None => return, // skip on CI without Metal
         };
         let pool = Arc::new(Mutex::new(pool));
-        let device = metal::Device::system_default().unwrap();
+        let device = objc2_metal::MTLCreateSystemDefaultDevice().unwrap();
         let progress = Arc::new(rmlx_rdma::progress::ProgressEngine::new());
         let transport = Arc::new(crate::transport::RdmaConnectionTransport::new(vec![], 0));
 
@@ -418,7 +420,7 @@ mod tests {
             None => return,
         };
         let pool = Arc::new(Mutex::new(pool));
-        let device = metal::Device::system_default().unwrap();
+        let device = objc2_metal::MTLCreateSystemDefaultDevice().unwrap();
         let progress = Arc::new(rmlx_rdma::progress::ProgressEngine::new());
         let transport = Arc::new(crate::transport::RdmaConnectionTransport::new(vec![], 0));
 
@@ -462,7 +464,7 @@ mod tests {
             None => return,
         };
         let pool = Arc::new(Mutex::new(pool));
-        let device = metal::Device::system_default().unwrap();
+        let device = objc2_metal::MTLCreateSystemDefaultDevice().unwrap();
         let progress = Arc::new(rmlx_rdma::progress::ProgressEngine::new());
         let transport = Arc::new(crate::transport::RdmaConnectionTransport::new(vec![], 0));
 
@@ -486,7 +488,7 @@ mod tests {
             None => return,
         };
         let pool = Arc::new(Mutex::new(pool));
-        let device = metal::Device::system_default().unwrap();
+        let device = objc2_metal::MTLCreateSystemDefaultDevice().unwrap();
         let progress = Arc::new(rmlx_rdma::progress::ProgressEngine::new());
         let transport = Arc::new(crate::transport::RdmaConnectionTransport::new(vec![], 0));
 

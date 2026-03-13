@@ -396,10 +396,11 @@ impl std::error::Error for SchedulerError {}
 mod tests {
     use super::*;
     use rmlx_core::dtype::DType;
-    use rmlx_metal::metal;
+    use rmlx_metal::MtlDevice;
 
-    fn test_device() -> metal::Device {
-        metal::Device::system_default().expect("no Metal device available")
+    fn test_device() -> MtlDevice {
+        objc2_metal::MTLCreateSystemDefaultDevice()
+            .expect("no Metal device available")
     }
 
     /// Helper: create a BlockManager with small parameters for testing.

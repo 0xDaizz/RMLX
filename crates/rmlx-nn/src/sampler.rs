@@ -9,6 +9,8 @@ use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::{KernelError, KernelRegistry};
 use rmlx_core::ops;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLCommandQueue, MTLDevice};
 
 // ---------------------------------------------------------------------------
 // SamplerConfig
@@ -71,7 +73,7 @@ impl Sampler {
         past_tokens: &[u32],
         config: &SamplerConfig,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<u32, KernelError> {
         validate_1d_f32(logits, "sample_token")?;
 
@@ -237,7 +239,7 @@ pub fn rejection_sample(
     draft_probs: &Array,
     draft_tokens: &[u32],
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
 ) -> Result<SpecDecodeResult, KernelError> {
     if target_logits.ndim() != 2 || draft_probs.ndim() != 2 {
         return Err(KernelError::InvalidShape(
@@ -370,7 +372,7 @@ pub fn rejection_sample(
 pub fn temperature(
     logits: &Array,
     temp: f32,
-    device: &metal::Device,
+    device: &ProtocolObject<dyn MTLDevice>,
 ) -> Result<Array, KernelError> {
     validate_1d_f32(logits, "temperature")?;
     if temp <= 0.0 {
@@ -390,7 +392,7 @@ pub fn temperature(
 /// masks everything below it.
 ///
 /// TODO: Replace with GPU sort path when a Metal bitonic/radix sort kernel is available.
-pub fn top_k(logits: &Array, k: usize, device: &metal::Device) -> Result<Array, KernelError> {
+pub fn top_k(logits: &Array, k: usize, device: &ProtocolObject<dyn MTLDevice>) -> Result<Array, KernelError> {
     validate_1d_f32(logits, "top_k")?;
     let mut data = logits.to_vec_checked::<f32>();
     let vocab_size = data.len();
@@ -414,9 +416,9 @@ pub fn top_k(logits: &Array, k: usize, device: &metal::Device) -> Result<Array, 
 pub fn top_p(
     logits: &Array,
     p: f32,
-    device: &metal::Device,
+    device: &ProtocolObject<dyn MTLDevice>,
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     validate_1d_f32(logits, "top_p")?;
     if p <= 0.0 || p > 1.0 {
@@ -471,7 +473,7 @@ pub fn top_p(
 pub fn sample(
     logits: &Array,
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
 ) -> Result<u32, KernelError> {
     validate_1d_f32(logits, "sample")?;
 
@@ -510,7 +512,7 @@ pub fn repetition_penalty(
     logits: &Array,
     past_tokens: &[u32],
     penalty: f32,
-    device: &metal::Device,
+    device: &ProtocolObject<dyn MTLDevice>,
 ) -> Result<Array, KernelError> {
     validate_1d_f32(logits, "repetition_penalty")?;
     if penalty <= 0.0 {
@@ -676,10 +678,10 @@ fn simple_random_f32() -> f32 {
 mod tests {
     use super::*;
 
-    fn setup() -> (metal::Device, metal::CommandQueue, KernelRegistry) {
+    fn setup() -> (rmlx_metal::MtlDevice, rmlx_metal::MtlQueue, KernelRegistry) {
         let gpu = rmlx_metal::device::GpuDevice::system_default().expect("GPU device");
-        let device = gpu.raw().clone();
-        let queue = device.new_command_queue();
+        let device = objc2_metal::MTLCreateSystemDefaultDevice().unwrap();
+        let queue = gpu.new_command_queue();
         let registry = KernelRegistry::new(gpu);
         ops::softmax::register(&registry).expect("register softmax");
         ops::register_all(&registry).unwrap_or(()); // register binary ops etc.

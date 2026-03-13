@@ -1,7 +1,9 @@
+use objc2::runtime::ProtocolObject;
 use rmlx_core::array::Array;
 use rmlx_core::kernels::KernelRegistry;
 use rmlx_core::ops;
 use rmlx_metal::device::GpuDevice;
+use rmlx_metal::types::MtlQueue;
 use rmlx_nn::attention::*;
 use rmlx_nn::embedding::*;
 use rmlx_nn::gguf_loader::{ggml_type_to_kquant, is_kquant_type, kquant_load_info};
@@ -108,9 +110,9 @@ fn test_weight_shape_validation() {
     assert!(l.has_bias());
 }
 
-fn setup() -> Option<(KernelRegistry, metal::CommandQueue)> {
+fn setup() -> Option<(KernelRegistry, MtlQueue)> {
     let device = GpuDevice::system_default().ok()?;
-    let queue = device.raw().new_command_queue();
+    let queue = device.new_command_queue();
     let registry = KernelRegistry::new(device);
     ops::register_all(&registry).ok()?;
     rmlx_nn::activations::register(&registry).ok()?;
@@ -354,7 +356,7 @@ fn test_embedding_no_weights_errors() {
 
 // ===== NEW TESTS: Attention forward =====
 
-fn make_identity_linear(dev: &metal::Device, size: usize) -> Linear {
+fn make_identity_linear(dev: &ProtocolObject<dyn objc2_metal::MTLDevice>, size: usize) -> Linear {
     // Create an identity-like weight matrix [size, size]
     let mut data = vec![0.0f32; size * size];
     for i in 0..size {
@@ -2758,7 +2760,7 @@ fn test_chunked_prefill_splits_long_prompt() {
     use rmlx_nn::scheduler::*;
     use std::collections::HashMap;
 
-    let device = rmlx_metal::metal::Device::system_default().expect("no Metal device available");
+    let device = objc2_metal::MTLCreateSystemDefaultDevice().expect("no Metal device available");
 
     let config = SchedulerConfig {
         max_batch_size: 4,
@@ -2804,7 +2806,7 @@ fn test_chunked_prefill_interleaves_decode() {
     use rmlx_nn::scheduler::*;
     use std::collections::HashMap;
 
-    let device = rmlx_metal::metal::Device::system_default().expect("no Metal device available");
+    let device = objc2_metal::MTLCreateSystemDefaultDevice().expect("no Metal device available");
 
     let config = SchedulerConfig {
         max_batch_size: 4,
@@ -2853,7 +2855,7 @@ fn test_short_prompt_not_chunked() {
     use rmlx_nn::scheduler::*;
     use std::collections::HashMap;
 
-    let device = rmlx_metal::metal::Device::system_default().expect("no Metal device available");
+    let device = objc2_metal::MTLCreateSystemDefaultDevice().expect("no Metal device available");
 
     let config = SchedulerConfig {
         max_batch_size: 4,
@@ -2893,7 +2895,7 @@ fn run_activation(
     act: &dyn Activation,
     input: &[f32],
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Vec<f32> {
     let dev = registry.device().raw();
     let arr = Array::from_slice(dev, input, vec![input.len()]);

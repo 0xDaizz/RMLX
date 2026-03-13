@@ -6,7 +6,14 @@
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
-use metal::MTLSize;
+use rmlx_metal::MTLSize;
+use rmlx_metal::ComputePass;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLComputePipelineState as _;
+use objc2_metal::MTLCommandBuffer as _;
+use objc2_metal::MTLCommandQueue as _;
+use objc2_metal::MTLDevice as _;
+use rmlx_metal::MTLResourceOptions;
 
 // ---------------------------------------------------------------------------
 // Metal shader source
@@ -203,12 +210,16 @@ fn axis_kernel_name(dtype: DType) -> Result<&'static str, KernelError> {
 }
 
 /// Create a Metal buffer from a single u32 value.
-fn make_u32_buf(device: &metal::DeviceRef, val: u32) -> metal::Buffer {
-    device.new_buffer_with_data(
-        &val as *const u32 as *const _,
-        std::mem::size_of::<u32>() as u64,
-        metal::MTLResourceOptions::StorageModeShared,
-    )
+fn make_u32_buf(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, val: u32) -> rmlx_metal::MtlBuffer {
+    unsafe {
+        device
+            .newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(&val as *const u32 as *const _ as *mut std::ffi::c_void).unwrap(),
+                std::mem::size_of::<u32>() as u64 as usize,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -231,7 +242,7 @@ pub fn concat(
     a: &Array,
     b: &Array,
     axis: usize,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     // Validate dtypes match
     if a.dtype() != b.dtype() {
@@ -309,29 +320,23 @@ pub fn concat(
     let outer_buf = make_u32_buf(device, super::checked_u32(outer_size, "outer_size")?);
     let inner_buf = make_u32_buf(device, super::checked_u32(inner_size, "inner_size")?);
 
-    let command_buffer = queue.new_command_buffer();
-    let encoder = command_buffer.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(a.metal_buffer()), a.offset() as u64);
-    encoder.set_buffer(1, Some(b.metal_buffer()), b.offset() as u64);
-    encoder.set_buffer(2, Some(out.metal_buffer()), out.offset() as u64);
+    let command_buffer = queue.commandBuffer().unwrap();
+    let raw_enc = command_buffer.computeCommandEncoder().unwrap();
+    let encoder = ComputePass::new(&raw_enc);
+    encoder.set_pipeline(&pipeline);
+    encoder.set_buffer(0, Some(a.metal_buffer()), a.offset());
+    encoder.set_buffer(1, Some(b.metal_buffer()), b.offset());
+    encoder.set_buffer(2, Some(out.metal_buffer()), out.offset());
     encoder.set_buffer(3, Some(&axis_dim_a_buf), 0);
     encoder.set_buffer(4, Some(&axis_dim_out_buf), 0);
     encoder.set_buffer(5, Some(&outer_buf), 0);
     encoder.set_buffer(6, Some(&inner_buf), 0);
-
-    let grid_size = MTLSize::new(out_numel as u64, 1, 1);
-    let threadgroup_size = MTLSize::new(
-        std::cmp::min(
-            pipeline.max_total_threads_per_threadgroup(),
-            out_numel as u64,
-        ),
-        1,
-        1,
-    );
+    let grid_size = MTLSize { width: out_numel, height: 1, depth: 1 };
+    let tg_width = std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), out_numel);
+    let threadgroup_size = MTLSize { width: tg_width, height: 1, depth: 1 };
     encoder.dispatch_threads(grid_size, threadgroup_size);
-    encoder.end_encoding();
-    super::commit_with_mode(command_buffer, super::ExecMode::Sync);
+    encoder.end();
+    super::commit_with_mode(&command_buffer, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -344,7 +349,7 @@ pub fn concat_many(
     registry: &KernelRegistry,
     arrays: &[&Array],
     axis: usize,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     if arrays.is_empty() {
         return Err(KernelError::InvalidShape(
@@ -371,9 +376,9 @@ pub fn concat_many(
 mod tests {
     use super::*;
 
-    fn setup() -> (KernelRegistry, metal::CommandQueue) {
+    fn setup() -> (KernelRegistry, rmlx_metal::MtlQueue) {
         let gpu_dev = rmlx_metal::device::GpuDevice::system_default().unwrap();
-        let queue = gpu_dev.raw().new_command_queue();
+        let queue = gpu_dev.new_command_queue();
         let registry = KernelRegistry::new(gpu_dev);
         register(&registry).unwrap();
         crate::ops::copy::register(&registry).unwrap();

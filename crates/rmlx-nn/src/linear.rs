@@ -4,6 +4,9 @@ use rmlx_core::array::Array;
 use rmlx_core::kernels::{KernelError, KernelRegistry};
 use rmlx_core::ops;
 use rmlx_core::ops::buffer_slots::gemm as slot;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLCommandBuffer, MTLCommandQueue, MTLComputePipelineState, MTLDevice};
+use rmlx_metal::{ComputePass, MTLSize};
 
 /// Linear layer configuration.
 pub struct LinearConfig {
@@ -96,7 +99,7 @@ impl Linear {
         &self,
         input: &Array,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         let weight = self
             .weight
@@ -155,25 +158,22 @@ impl Linear {
                 }
             };
             let pipeline = registry.get_pipeline(copy_kernel, output.dtype())?;
-            let cb = queue.new_command_buffer();
+            let cb = queue.commandBuffer().unwrap();
             for row in 0..batch {
                 let dst_offset = row * out_f * elem_size;
                 let dst_view = bias_tiled.view(vec![out_f], vec![1], dst_offset);
-                let enc = cb.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&pipeline);
-                enc.set_buffer(0, Some(bias.metal_buffer()), bias.offset() as u64);
-                enc.set_buffer(1, Some(dst_view.metal_buffer()), dst_view.offset() as u64);
-                let grid = metal::MTLSize::new(out_f as u64, 1, 1);
-                let tg = metal::MTLSize::new(
-                    std::cmp::min(pipeline.max_total_threads_per_threadgroup(), out_f as u64),
-                    1,
-                    1,
-                );
+                let raw_enc = cb.computeCommandEncoder().unwrap();
+                let enc = ComputePass::new(&raw_enc);
+                enc.set_pipeline(&pipeline);
+                enc.set_buffer(0, Some(bias.metal_buffer()), bias.offset());
+                enc.set_buffer(1, Some(dst_view.metal_buffer()), dst_view.offset());
+                let grid = MTLSize { width: out_f, height: 1, depth: 1 };
+                let tg = MTLSize { width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), out_f), height: 1, depth: 1 };
                 enc.dispatch_threads(grid, tg);
-                enc.end_encoding();
+                enc.end();
             }
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
 
             // Single fused add: [batch, out_f] + [batch, out_f]
             output = ops::binary::add(registry, &output, &bias_tiled, queue)?;
@@ -214,7 +214,7 @@ impl Linear {
     /// Call after loading weights and before the inference loop. Weights
     /// become inaccessible to the CPU but may benefit from reduced memory
     /// pressure and faster GPU access.
-    pub fn convert_weights_private(&mut self, device: &metal::Device, queue: &metal::CommandQueue) {
+    pub fn convert_weights_private(&mut self, device: &ProtocolObject<dyn MTLDevice>, queue: &ProtocolObject<dyn MTLCommandQueue>) {
         if let Some(w) = self.weight.take() {
             self.weight = Some(w.to_private(device, queue));
         }
@@ -253,7 +253,7 @@ impl Linear {
     pub fn prepare_weight_t(
         &mut self,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<(), KernelError> {
         let weight = self
             .weight
@@ -289,7 +289,7 @@ impl Linear {
         &self,
         input: &Array,
         registry: &KernelRegistry,
-        cb: &metal::CommandBufferRef,
+        cb: &ProtocolObject<dyn MTLCommandBuffer>,
     ) -> Result<Array, KernelError> {
         let weight = self
             .weight
@@ -455,43 +455,24 @@ impl Linear {
         let dev = registry.device().raw();
         let output = Array::uninit(dev, &[m, n], input_2d.dtype());
 
-        let bm = tile.bm as u64;
-        let bn = tile.bn as u64;
+        let bm = tile.bm as usize;
+        let bn = tile.bn as usize;
 
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pipeline);
-        enc.set_buffer(
-            slot::A,
-            Some(input_2d.metal_buffer()),
-            input_2d.offset() as u64,
-        );
-        enc.set_buffer(slot::B, Some(w_t.metal_buffer()), w_t.offset() as u64);
-        enc.set_buffer(
-            slot::OUT,
-            Some(output.metal_buffer()),
-            output.offset() as u64,
-        );
-        enc.set_bytes(slot::M, 4, &m_u32 as *const u32 as *const std::ffi::c_void);
-        enc.set_bytes(slot::N, 4, &n_u32 as *const u32 as *const std::ffi::c_void);
-        enc.set_bytes(slot::K, 4, &k_u32 as *const u32 as *const std::ffi::c_void);
+        let raw_enc = cb.computeCommandEncoder().unwrap();
+        let enc = ComputePass::new(&raw_enc);
+        enc.set_pipeline(&pipeline);
+        enc.set_buffer(slot::A as u32, Some(input_2d.metal_buffer()), input_2d.offset());
+        enc.set_buffer(slot::B as u32, Some(w_t.metal_buffer()), w_t.offset());
+        enc.set_buffer(slot::OUT as u32, Some(output.metal_buffer()), output.offset());
+        enc.set_val(slot::M as u32, &m_u32);
+        enc.set_val(slot::N as u32, &n_u32);
+        enc.set_val(slot::K as u32, &k_u32);
         let bsa_val = m_u32 * k_u32;
         let bsb_val = k_u32 * n_u32;
         let bsc_val = m_u32 * n_u32;
-        enc.set_bytes(
-            slot::BATCH_STRIDE_A,
-            4,
-            &bsa_val as *const u32 as *const std::ffi::c_void,
-        );
-        enc.set_bytes(
-            slot::BATCH_STRIDE_B,
-            4,
-            &bsb_val as *const u32 as *const std::ffi::c_void,
-        );
-        enc.set_bytes(
-            slot::BATCH_STRIDE_C,
-            4,
-            &bsc_val as *const u32 as *const std::ffi::c_void,
-        );
+        enc.set_val(slot::BATCH_STRIDE_A as u32, &bsa_val);
+        enc.set_val(slot::BATCH_STRIDE_B as u32, &bsb_val);
+        enc.set_val(slot::BATCH_STRIDE_C as u32, &bsc_val);
 
         // Steel, Full/Skinny/MlxArch kernels require swizzle_log (buffer 9)
         let swizzle_log = if matches!(
@@ -505,35 +486,29 @@ impl Linear {
                 | ops::matmul::TileVariant::NaxArch64x128
         ) {
             let s = ops::matmul::compute_swizzle_log(m, n, tile.bm, tile.bn);
-            enc.set_bytes(
-                slot::SWIZZLE_LOG,
-                4,
-                &s as *const u32 as *const std::ffi::c_void,
-            );
+            enc.set_val(slot::SWIZZLE_LOG as u32, &s);
             s
         } else {
             0
         };
 
-        let tg_threads = match tile.variant {
-            ops::matmul::TileVariant::Small => 256_u64,
-            ops::matmul::TileVariant::Medium | ops::matmul::TileVariant::Simd => 1024_u64,
-            ops::matmul::TileVariant::Skinny | ops::matmul::TileVariant::Full => 256_u64,
-            ops::matmul::TileVariant::MlxArch => 128_u64,
-            ops::matmul::TileVariant::MlxArchSmall | ops::matmul::TileVariant::MlxArchMicro => {
-                64_u64
-            }
-            ops::matmul::TileVariant::NaxArch => 512_u64,
-            ops::matmul::TileVariant::NaxArch64x128 => 256_u64,
-            ops::matmul::TileVariant::NaxArch64x64 => 128_u64,
+        let tg_threads: usize = match tile.variant {
+            ops::matmul::TileVariant::Small => 256,
+            ops::matmul::TileVariant::Medium | ops::matmul::TileVariant::Simd => 1024,
+            ops::matmul::TileVariant::Skinny | ops::matmul::TileVariant::Full => 256,
+            ops::matmul::TileVariant::MlxArch => 128,
+            ops::matmul::TileVariant::MlxArchSmall | ops::matmul::TileVariant::MlxArchMicro => 64,
+            ops::matmul::TileVariant::NaxArch => 512,
+            ops::matmul::TileVariant::NaxArch64x128 => 256,
+            ops::matmul::TileVariant::NaxArch64x64 => 128,
         };
 
-        let grid_x = ((n_u32 as u64).div_ceil(bn)) << swizzle_log;
-        let grid_y = ((m_u32 as u64).div_ceil(bm)) >> swizzle_log;
-        let grid = metal::MTLSize::new(grid_x, grid_y, 1);
-        let tg = metal::MTLSize::new(tg_threads, 1, 1);
-        enc.dispatch_thread_groups(grid, tg);
-        enc.end_encoding();
+        let grid_x = (n.div_ceil(bn)) << swizzle_log;
+        let grid_y = (m.div_ceil(bm)) >> swizzle_log;
+        let grid = MTLSize { width: grid_x, height: grid_y, depth: 1 };
+        let tg = MTLSize { width: tg_threads, height: 1, depth: 1 };
+        enc.dispatch_threadgroups(grid, tg);
+        enc.end();
 
         Ok(output)
     }
@@ -550,7 +525,7 @@ impl Linear {
         &self,
         input: &Array,
         registry: &KernelRegistry,
-        encoder: &metal::ComputeCommandEncoderRef,
+        encoder: ComputePass<'_>,
     ) -> Result<Array, KernelError> {
         let w_t = self.weight_t_cached.as_ref().ok_or_else(|| {
             KernelError::InvalidShape(
@@ -602,7 +577,7 @@ impl Linear {
         input: &Array,
         residual: &Array,
         registry: &KernelRegistry,
-        cb: &metal::CommandBufferRef,
+        cb: &ProtocolObject<dyn MTLCommandBuffer>,
     ) -> Result<Array, KernelError> {
         let w_t = self.weight_t_cached.as_ref().ok_or_else(|| {
             KernelError::InvalidShape(
@@ -646,7 +621,7 @@ impl Linear {
         input: &Array,
         residual: &Array,
         registry: &KernelRegistry,
-        encoder: &metal::ComputeCommandEncoderRef,
+        encoder: ComputePass<'_>,
     ) -> Result<Array, KernelError> {
         let w_t = self.weight_t_cached.as_ref().ok_or_else(|| {
             KernelError::InvalidShape(

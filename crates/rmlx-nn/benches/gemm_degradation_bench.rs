@@ -19,6 +19,8 @@
 //!   cargo bench -p rmlx-nn --bench gemm_degradation_bench
 
 use std::time::{Duration, Instant};
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLCommandBuffer as _, MTLCommandQueue as _, MTLDevice as _};
 
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
@@ -79,7 +81,7 @@ fn f32_to_f16_bits(val: f32) -> u16 {
     ((sign << 15) | (new_exp as u32) << 10 | (frac >> 13)) as u16
 }
 
-fn rand_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
+fn rand_array(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, shape: &[usize], seed: u64) -> Array {
     let numel: usize = shape.iter().product();
     let mut f16_bytes = Vec::with_capacity(numel * 2);
     let mut state = seed;
@@ -100,25 +102,25 @@ fn rand_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
 
 fn bench_gemm(
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
     a: &Array,
     b: &Array,
     warmup: usize,
     iters: usize,
 ) -> Stats {
     for _ in 0..warmup {
-        let cb = queue.new_command_buffer_with_unretained_references();
-        let _ = ops::matmul::matmul_into_cb(registry, a, b, cb).unwrap();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+        let _ = ops::matmul::matmul_into_cb(registry, a, b, &cb).unwrap();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
     }
     let mut times = Vec::with_capacity(iters);
     for _ in 0..iters {
         let start = Instant::now();
-        let cb = queue.new_command_buffer_with_unretained_references();
-        let _ = ops::matmul::matmul_into_cb(registry, a, b, cb).unwrap();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+        let _ = ops::matmul::matmul_into_cb(registry, a, b, &cb).unwrap();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
         times.push(start.elapsed());
     }
     Stats::from_durations(&times)
@@ -130,17 +132,17 @@ fn bench_gemm(
 
 fn bench_rms_norm(
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
     input: &Array,
     iters: usize,
 ) -> Stats {
     let mut times = Vec::with_capacity(iters);
     for _ in 0..iters {
         let start = Instant::now();
-        let cb = queue.new_command_buffer_with_unretained_references();
-        let _ = ops::rms_norm::rms_norm_into_cb(registry, input, None, 1e-5, cb);
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+        let _ = ops::rms_norm::rms_norm_into_cb(registry, input, None, 1e-5, &cb);
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
         times.push(start.elapsed());
     }
     Stats::from_durations(&times)
@@ -151,7 +153,7 @@ fn main() {
     let registry = KernelRegistry::new(gpu);
     ops::register_all(&registry).expect("Failed to register kernels");
     let device = registry.device().raw();
-    let queue = device.new_command_queue();
+    let queue = device.newCommandQueue().unwrap();
 
     let sizes: Vec<(&str, usize, usize, usize)> =
         vec![("O_proj", 1024, 4096, 4096), ("Down", 1024, 14336, 4096)];
@@ -211,10 +213,10 @@ fn main() {
         {
             let norm_input = rand_array(device, &[1024, 4096], 200);
             for _ in 0..10 {
-                let cb = queue.new_command_buffer_with_unretained_references();
-                let _ = ops::rms_norm::rms_norm_into_cb(&registry, &norm_input, None, 1e-5, cb);
+                let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+                let _ = ops::rms_norm::rms_norm_into_cb(&registry, &norm_input, None, 1e-5, &cb);
                 cb.commit();
-                cb.wait_until_completed();
+                cb.waitUntilCompleted();
             }
         }
         let stats = bench_gemm(&registry, &queue, &a, &b, WARMUP, ITERS);
@@ -235,22 +237,22 @@ fn main() {
 
             // Warmup combo
             for _ in 0..WARMUP {
-                let cb = queue.new_command_buffer_with_unretained_references();
-                let _ = ops::rms_norm::rms_norm_into_cb(&registry, &norm_input, None, 1e-5, cb);
-                let _ = ops::matmul::matmul_into_cb(&registry, &a, &b, cb).unwrap();
+                let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+                let _ = ops::rms_norm::rms_norm_into_cb(&registry, &norm_input, None, 1e-5, &cb);
+                let _ = ops::matmul::matmul_into_cb(&registry, &a, &b, &cb).unwrap();
                 cb.commit();
-                cb.wait_until_completed();
+                cb.waitUntilCompleted();
             }
 
             // Measure combo
             let mut combo_times = Vec::with_capacity(ITERS);
             for _ in 0..ITERS {
                 let start = Instant::now();
-                let cb = queue.new_command_buffer_with_unretained_references();
-                let _ = ops::rms_norm::rms_norm_into_cb(&registry, &norm_input, None, 1e-5, cb);
-                let _ = ops::matmul::matmul_into_cb(&registry, &a, &b, cb).unwrap();
+                let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+                let _ = ops::rms_norm::rms_norm_into_cb(&registry, &norm_input, None, 1e-5, &cb);
+                let _ = ops::matmul::matmul_into_cb(&registry, &a, &b, &cb).unwrap();
                 cb.commit();
-                cb.wait_until_completed();
+                cb.waitUntilCompleted();
                 combo_times.push(start.elapsed());
             }
             let combo_stats = Stats::from_durations(&combo_times);
@@ -266,7 +268,7 @@ fn main() {
         // Test 5: Fresh queue / PSO cache warm-up test
         // ---------------------------------------------------------------
         {
-            let fresh_queue = device.new_command_queue();
+            let fresh_queue = device.newCommandQueue().unwrap();
             // First call (cold for this queue — PSO is per-device so should be warm)
             let first = bench_gemm(&registry, &fresh_queue, &a, &b, 0, 1);
             let second = bench_gemm(&registry, &fresh_queue, &a, &b, 0, 1);
@@ -284,10 +286,10 @@ fn main() {
         {
             let polluter = rand_array(device, &[8192, 8192], 400); // ~128MB f16
                                                                    // Run a dummy op on polluter to push GEMM data out of caches
-            let cb = queue.new_command_buffer_with_unretained_references();
-            let _ = ops::rms_norm::rms_norm_into_cb(&registry, &polluter, None, 1e-5, cb);
+            let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+            let _ = ops::rms_norm::rms_norm_into_cb(&registry, &polluter, None, 1e-5, &cb);
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
 
             // Now measure GEMM (fewer warmup — we want to capture pollution effect)
             let stats = bench_gemm(&registry, &queue, &a, &b, 2, ITERS);

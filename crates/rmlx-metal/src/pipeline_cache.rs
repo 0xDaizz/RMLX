@@ -18,35 +18,54 @@
 //! falling back to runtime MSL compilation.
 
 use std::collections::HashMap;
-use std::ffi::c_void;
 use std::fs;
 use std::path::PathBuf;
-use std::ptr::NonNull;
 use std::sync::RwLock;
 
-use objc2::rc::Retained;
-use objc2::Message;
-use objc2::runtime::{AnyObject, ProtocolObject};
-use objc2::{msg_send, sel};
-use objc2_foundation::{NSString, NSURL};
+use objc2::runtime::{NSObjectProtocol, ProtocolObject};
+use objc2::sel;
+use objc2_foundation::{NSError, NSString, NSURL};
 use objc2_metal::*;
 use sha2::{Digest, Sha256};
 
-use crate::pipeline::FunctionConstant;
+use crate::pipeline::{apply_function_constants, FunctionConstant};
 use crate::types::*;
 use crate::MetalError;
 
-/// Retain an unsized protocol-object reference into an owned `Retained`.
+// ---------------------------------------------------------------------------
+// Typed binding for MTLLibrary.serializeToURL:error: (macOS 14+)
+// ---------------------------------------------------------------------------
+
+/// Extension trait providing `serializeToURL:error:` for `MTLLibrary` protocol objects.
 ///
-/// `Retained::retain()` requires `T: Sized` (it lives in `impl<T: Message>`),
-/// but `ProtocolObject<dyn MTLFoo>` is unsized.  We work around this by
-/// calling `objc_retain` directly and wrapping the result with `from_raw`,
-/// which *is* available for `T: ?Sized + Message`.
-fn retain_proto<T: ?Sized + Message>(r: &T) -> Retained<T> {
-    let ptr = r as *const T as *mut T;
-    unsafe {
-        objc2::ffi::objc_retain(ptr as *mut _);
-        Retained::from_raw(ptr).unwrap_unchecked()
+/// This method is available on macOS 14+ but not yet exposed by `objc2-metal`.
+/// We use `msg_send!` internally so the call-site gets a typed interface.
+#[allow(non_snake_case)]
+trait MtlLibrarySerializeExt {
+    /// Serialize the compiled library to the given file URL.
+    ///
+    /// # Safety
+    /// Caller must ensure the selector exists on this object (check with
+    /// `respondsToSelector:` first on older macOS).
+    unsafe fn serializeToURL_error(
+        &self,
+        url: &NSURL,
+        error: Option<&mut *mut NSError>,
+    ) -> bool;
+}
+
+#[allow(non_snake_case)]
+impl MtlLibrarySerializeExt for ProtocolObject<dyn MTLLibrary> {
+    unsafe fn serializeToURL_error(
+        &self,
+        url: &NSURL,
+        error: Option<&mut *mut NSError>,
+    ) -> bool {
+        let err_ptr: *mut *mut NSError = match error {
+            Some(p) => p,
+            None => std::ptr::null_mut(),
+        };
+        objc2::msg_send![self, serializeToURL: url, error: err_ptr]
     }
 }
 
@@ -236,21 +255,18 @@ impl DiskPipelineCache {
         unsafe {
             // Check if the library responds to serializeToURL:error:
             let sel = sel!(serializeToURL:error:);
-            let responds: bool = msg_send![library, respondsToSelector: sel];
+            let responds = library.respondsToSelector(sel);
             if !responds {
                 // API not available on this macOS version — skip silently.
                 return Ok(());
             }
 
-            let mut err: *mut AnyObject = std::ptr::null_mut();
-            let _result: bool = msg_send![library, serializeToURL: &*url, error: &mut err];
+            let mut err: *mut NSError = std::ptr::null_mut();
+            let _result: bool = library.serializeToURL_error(&url, Some(&mut err));
 
             if !err.is_null() {
-                let desc: *mut AnyObject = msg_send![&*err, localizedDescription];
-                let c_msg: *const std::os::raw::c_char = msg_send![&*desc, UTF8String];
-                let message = std::ffi::CStr::from_ptr(c_msg)
-                    .to_string_lossy()
-                    .into_owned();
+                let ns_err: &NSError = &*err;
+                let message = ns_err.localizedDescription().to_string();
                 return Err(MetalError::LibraryLoad(format!(
                     "serializeToURL failed: {message}"
                 )));
@@ -272,45 +288,13 @@ impl DiskPipelineCache {
                 .ok_or_else(|| MetalError::KernelNotFound(function_name.to_string()))?
         } else {
             let fcv = MTLFunctionConstantValues::new();
-            for (index, constant) in constants {
-                match constant {
-                    FunctionConstant::Bool(v) => {
-                        let val: u8 = u8::from(*v);
-                        unsafe {
-                            fcv.setConstantValue_type_atIndex(
-                                NonNull::new(&val as *const u8 as *mut c_void).unwrap(),
-                                MTLDataType::Bool,
-                                *index as usize,
-                            );
-                        }
-                    }
-                    FunctionConstant::U32(v) => {
-                        unsafe {
-                            fcv.setConstantValue_type_atIndex(
-                                NonNull::new(v as *const u32 as *mut c_void).unwrap(),
-                                MTLDataType::UInt,
-                                *index as usize,
-                            );
-                        }
-                    }
-                    FunctionConstant::F32(v) => {
-                        unsafe {
-                            fcv.setConstantValue_type_atIndex(
-                                NonNull::new(v as *const f32 as *mut c_void).unwrap(),
-                                MTLDataType::Float,
-                                *index as usize,
-                            );
-                        }
-                    }
-                }
-            }
-            unsafe {
-                library.newFunctionWithName_constantValues_error(
+            apply_function_constants(&fcv, constants);
+            library
+                .newFunctionWithName_constantValues_error(
                     &NSString::from_str(function_name),
                     &fcv,
                 )
-            }
-            .map_err(|_| MetalError::KernelNotFound(function_name.to_string()))?
+                .map_err(|_| MetalError::KernelNotFound(function_name.to_string()))?
         };
 
         self.device

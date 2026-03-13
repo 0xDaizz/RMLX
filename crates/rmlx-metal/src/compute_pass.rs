@@ -20,21 +20,28 @@ use objc2_metal::*;
 ///
 /// The `'a` lifetime ties this to the command buffer that created the encoder.
 /// The encoder must be ended (via [`end`]) before the command buffer is committed.
+#[derive(Clone, Copy)]
 #[repr(transparent)]
 pub struct ComputePass<'a>(pub(crate) &'a ProtocolObject<dyn MTLComputeCommandEncoder>);
 
 impl<'a> ComputePass<'a> {
+    /// Create a new `ComputePass` wrapping a borrowed compute command encoder.
+    #[inline(always)]
+    pub fn new(encoder: &'a ProtocolObject<dyn MTLComputeCommandEncoder>) -> Self {
+        Self(encoder)
+    }
+
     /// Bind a Metal buffer at the given index with an offset.
     #[inline(always)]
     pub fn set_buffer(
         &self,
         index: u32,
         buf: Option<&ProtocolObject<dyn MTLBuffer>>,
-        offset: u64,
+        offset: usize,
     ) {
         unsafe {
             self.0
-                .setBuffer_offset_atIndex(buf, offset as usize, index as usize);
+                .setBuffer_offset_atIndex(buf, offset, index as usize);
         }
     }
 

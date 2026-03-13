@@ -45,11 +45,7 @@ impl GpuEvent {
         command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
         value: u64,
     ) {
-        // MTLSharedEvent extends MTLEvent; upcast via pointer cast.
-        let event: &ProtocolObject<dyn MTLEvent> = unsafe {
-            &*(&*self.event as *const ProtocolObject<dyn MTLSharedEvent>
-                as *const ProtocolObject<dyn MTLEvent>)
-        };
+        let event: &ProtocolObject<dyn MTLEvent> = ProtocolObject::from_ref(&*self.event);
         command_buffer.encodeSignalEvent_value(event, value);
     }
 
@@ -59,10 +55,7 @@ impl GpuEvent {
         command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
         value: u64,
     ) {
-        let event: &ProtocolObject<dyn MTLEvent> = unsafe {
-            &*(&*self.event as *const ProtocolObject<dyn MTLSharedEvent>
-                as *const ProtocolObject<dyn MTLEvent>)
-        };
+        let event: &ProtocolObject<dyn MTLEvent> = ProtocolObject::from_ref(&*self.event);
         command_buffer.encodeWaitForEvent_value(event, value);
     }
 
@@ -114,7 +107,7 @@ impl GpuEvent {
     /// Call this when reusing the event for a new pipeline iteration.
     pub fn reset(&self) {
         self.counter.store(0, Ordering::SeqCst);
-        unsafe { self.event.setSignaledValue(0) };
+        self.event.setSignaledValue(0);
     }
 
     /// Raw shared event reference.

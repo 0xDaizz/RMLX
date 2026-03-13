@@ -17,7 +17,14 @@
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
-use metal::MTLSize;
+use rmlx_metal::MTLSize;
+use rmlx_metal::ComputePass;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLComputePipelineState as _;
+use objc2_metal::MTLCommandBuffer as _;
+use objc2_metal::MTLCommandQueue as _;
+use objc2_metal::MTLDevice as _;
+use rmlx_metal::MTLResourceOptions;
 
 /// Metal shader source for GELU kernels.
 pub const GELU_SHADER_SOURCE: &str = r#"
@@ -233,26 +240,19 @@ fn gelu_kernel_info(dtype: DType, fast: bool) -> Result<(&'static str, u64), Ker
 }
 
 /// Create a constant `uint` buffer on the device.
-fn make_u32_buf(device: &metal::DeviceRef, val: u32) -> metal::Buffer {
-    device.new_buffer_with_data(
-        &val as *const u32 as *const std::ffi::c_void,
-        4,
-        metal::MTLResourceOptions::StorageModeShared,
-    )
+fn make_u32_buf(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, val: u32) -> rmlx_metal::MtlBuffer {
+    unsafe { device.newBufferWithBytes_length_options(std::ptr::NonNull::new(&val as *const u32 as *const std::ffi::c_void as *mut std::ffi::c_void).unwrap(), 4_usize, MTLResourceOptions::StorageModeShared).unwrap() }
 }
 
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
-/// Apply GELU activation element-wise using the tanh approximation (GPT-2, BERT, Gemma):
-/// `gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))`.
+// --------------------------------------------------------------------------- // Public API // ---------------------------------------------------------------------------
+/// Apply GELU activation element-wise using the tanh approximation (GPT-2, BERT, Gemma): /// `gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))`. pub
 pub fn gelu(
     registry: &KernelRegistry,
     input: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     let input_contig = super::make_contiguous(input, registry, queue)?;
+
     let input = input_contig.as_ref().unwrap_or(input);
 
     let (kernel_name, elems_per_thread) = gelu_kernel_info(input.dtype(), false)?;
@@ -262,24 +262,20 @@ pub fn gelu(
     let out = Array::zeros(registry.device().raw(), input.shape(), input.dtype());
     let numel_buf = make_u32_buf(registry.device().raw(), numel as u32);
 
-    let command_buffer = queue.new_command_buffer();
-    let encoder = command_buffer.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
-    encoder.set_buffer(1, Some(out.metal_buffer()), out.offset() as u64);
+    let command_buffer = queue.commandBuffer().unwrap();
+    let raw_enc = command_buffer.computeCommandEncoder().unwrap();
+    let encoder = ComputePass::new(&raw_enc);
+    encoder.set_pipeline(&pipeline);
+    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset());
+    encoder.set_buffer(1, Some(out.metal_buffer()), out.offset());
     encoder.set_buffer(2, Some(&numel_buf), 0);
-
     // Grid = ceil(numel / elems_per_thread) threads
-    let grid_threads = (numel as u64).div_ceil(elems_per_thread);
-    let grid_size = MTLSize::new(grid_threads, 1, 1);
-    let threadgroup_size = MTLSize::new(
-        std::cmp::min(pipeline.max_total_threads_per_threadgroup(), grid_threads),
-        1,
-        1,
-    );
+    let grid_threads = (numel as usize).div_ceil(elems_per_thread as usize);
+    let grid_size = MTLSize { width: grid_threads, height: 1, depth: 1 };
+    let threadgroup_size = MTLSize { width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), grid_threads), height: 1, depth: 1 };
     encoder.dispatch_threads(grid_size, threadgroup_size);
-    encoder.end_encoding();
-    super::commit_with_mode(command_buffer, super::ExecMode::Sync);
+    encoder.end();
+    super::commit_with_mode(&command_buffer, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -289,7 +285,7 @@ pub fn gelu(
 pub fn gelu_fast(
     registry: &KernelRegistry,
     input: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     let input_contig = super::make_contiguous(input, registry, queue)?;
     let input = input_contig.as_ref().unwrap_or(input);
@@ -301,24 +297,20 @@ pub fn gelu_fast(
     let out = Array::zeros(registry.device().raw(), input.shape(), input.dtype());
     let numel_buf = make_u32_buf(registry.device().raw(), numel as u32);
 
-    let command_buffer = queue.new_command_buffer();
-    let encoder = command_buffer.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
-    encoder.set_buffer(1, Some(out.metal_buffer()), out.offset() as u64);
+    let command_buffer = queue.commandBuffer().unwrap();
+    let raw_enc = command_buffer.computeCommandEncoder().unwrap();
+    let encoder = ComputePass::new(&raw_enc);
+    encoder.set_pipeline(&pipeline);
+    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset());
+    encoder.set_buffer(1, Some(out.metal_buffer()), out.offset());
     encoder.set_buffer(2, Some(&numel_buf), 0);
-
     // Grid = ceil(numel / elems_per_thread) threads
-    let grid_threads = (numel as u64).div_ceil(elems_per_thread);
-    let grid_size = MTLSize::new(grid_threads, 1, 1);
-    let threadgroup_size = MTLSize::new(
-        std::cmp::min(pipeline.max_total_threads_per_threadgroup(), grid_threads),
-        1,
-        1,
-    );
+    let grid_threads = (numel as usize).div_ceil(elems_per_thread as usize);
+    let grid_size = MTLSize { width: grid_threads, height: 1, depth: 1 };
+    let threadgroup_size = MTLSize { width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), grid_threads), height: 1, depth: 1 };
     encoder.dispatch_threads(grid_size, threadgroup_size);
-    encoder.end_encoding();
-    super::commit_with_mode(command_buffer, super::ExecMode::Sync);
+    encoder.end();
+    super::commit_with_mode(&command_buffer, super::ExecMode::Sync);
 
     Ok(out)
 }

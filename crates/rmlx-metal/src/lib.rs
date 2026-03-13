@@ -34,7 +34,7 @@ pub use compute_pass::ComputePass;
 pub use types::*;
 
 // Re-export core types for convenience
-pub use autorelease::ScopedPool;
+pub use autorelease::autoreleasepool;
 pub use batcher::CommandBatcher;
 pub use capture::{CaptureDestination, CaptureScope};
 pub use command::{

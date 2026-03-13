@@ -6,6 +6,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use objc2_metal::{MTLDevice, MTLSharedEvent};
 use rmlx_alloc::zero_copy::{CompletionError, CompletionTicket};
 use rmlx_metal::event::GpuEvent;
 use rmlx_rdma::progress::PendingOp;
@@ -330,7 +331,7 @@ impl LayerPipeline {
         // Signal transfer_event so downstream GPU compute can proceed
         if let Some(ref event) = self.transfer_event {
             let val = event.next_value();
-            event.raw().set_signaled_value(val);
+            event.raw().setSignaledValue(val);
         }
 
         // Clear the transfer state
@@ -360,7 +361,7 @@ impl LayerPipeline {
                 }
                 if let Some(ref event) = self.transfer_event {
                     let val = event.next_value();
-                    event.raw().set_signaled_value(val);
+                    event.raw().setSignaledValue(val);
                 }
                 self.transfer_states[layer] = None;
                 completed += 1;
@@ -496,7 +497,7 @@ impl LayerPipeline {
                     } else if let Some(ref event) = self.transfer_event {
                         // Check if previous layer signaled transfer_event.
                         // The signaled value >= layer means layer-1's transfer is done.
-                        event.raw().signaled_value() >= layer as u64
+                        event.raw().signaledValue() >= layer as u64
                     } else {
                         // No event chain — allow immediate start
                         self.stages[layer.saturating_sub(1)] == PipelineStage::Complete
@@ -514,7 +515,7 @@ impl LayerPipeline {
                     // The GPU command buffer should have encoded
                     // compute_event.signal(layer+1) on completion.
                     let compute_done = if let Some(ref event) = self.compute_event {
-                        event.raw().signaled_value() > layer as u64
+                        event.raw().signaledValue() > layer as u64
                     } else {
                         // No event — check ticket's GPU phase
                         self.tickets[layer]
@@ -543,7 +544,7 @@ impl LayerPipeline {
                         // Signal transfer_event so the next layer can start
                         if let Some(ref event) = self.transfer_event {
                             let val = (layer + 1) as u64;
-                            event.raw().set_signaled_value(val);
+                            event.raw().setSignaledValue(val);
                         }
                         self.transfer_states[layer] = None;
                         advanced += 1;
@@ -581,9 +582,9 @@ impl LayerPipeline {
 
         // Create Metal queues (if available) outside the timed section
         // to avoid inflating pipeline_time with device/queue setup cost.
-        let metal_queues = metal::Device::system_default().map(|device| {
-            let compute_queue = device.new_command_queue();
-            let transfer_queue = device.new_command_queue();
+        let metal_queues = objc2_metal::MTLCreateSystemDefaultDevice().map(|device| {
+            let compute_queue = device.newCommandQueue().unwrap();
+            let transfer_queue = device.newCommandQueue().unwrap();
             (compute_queue, transfer_queue)
         });
 

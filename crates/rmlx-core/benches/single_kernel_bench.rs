@@ -15,14 +15,21 @@
 //!
 //! Usage: cargo bench -p rmlx-core --bench single_kernel_bench
 
+use std::ptr::NonNull;
 use std::time::Instant;
 
 use half::f16;
-use metal::MTLSize;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{
+    MTLCommandBuffer as _, MTLCommandEncoder as _, MTLCommandQueue as _,
+    MTLComputeCommandEncoder as _, MTLDevice as _,
+};
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::KernelRegistry;
 use rmlx_core::ops;
+use rmlx_metal::types::{MtlBuffer, MtlPipeline};
+use rmlx_metal::{MTLResourceOptions, MTLSize};
 use rmlx_metal::device::GpuDevice;
 
 // ---------------------------------------------------------------------------
@@ -36,7 +43,11 @@ fn lcg_next(state: &mut u64) -> u64 {
     *state
 }
 
-fn rand_f16_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
+fn rand_f16_array(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    shape: &[usize],
+    seed: u64,
+) -> Array {
     let numel: usize = shape.iter().product();
     let mut state = seed;
     let mut f16_bytes = Vec::with_capacity(numel * 2);
@@ -49,9 +60,20 @@ fn rand_f16_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
     Array::from_bytes(device, &f16_bytes, shape.to_vec(), DType::Float16)
 }
 
-fn make_u32_buf(device: &metal::Device, val: u32) -> metal::Buffer {
-    let opts = metal::MTLResourceOptions::StorageModeShared;
-    device.new_buffer_with_data(&val as *const u32 as *const _, 4, opts)
+fn make_u32_buf(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    val: u32,
+) -> MtlBuffer {
+    let opts = MTLResourceOptions::StorageModeShared;
+    unsafe {
+        device
+            .newBufferWithBytes_length_options(
+                NonNull::new(&val as *const u32 as *mut _).unwrap(),
+                4_usize,
+                opts,
+            )
+            .unwrap()
+    }
 }
 
 fn percentile(sorted: &[f64], pct: f64) -> f64 {
@@ -82,18 +104,25 @@ struct GemmBuffers {
     a: Array,
     b: Array,
     c: Array,
-    m_buf: metal::Buffer,
-    n_buf: metal::Buffer,
-    k_buf: metal::Buffer,
-    bsa_buf: metal::Buffer,
-    bsb_buf: metal::Buffer,
-    bsc_buf: metal::Buffer,
-    swizzle_buf: metal::Buffer,
-    residual_buf: metal::Buffer,
+    m_buf: MtlBuffer,
+    n_buf: MtlBuffer,
+    k_buf: MtlBuffer,
+    bsa_buf: MtlBuffer,
+    bsb_buf: MtlBuffer,
+    bsc_buf: MtlBuffer,
+    swizzle_buf: MtlBuffer,
+    residual_buf: MtlBuffer,
 }
 
 impl GemmBuffers {
-    fn new(device: &metal::Device, m: usize, n: usize, k: usize, bm: usize, bn: usize) -> Self {
+    fn new(
+        device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+        m: usize,
+        n: usize,
+        k: usize,
+        bm: usize,
+        bn: usize,
+    ) -> Self {
         let a = rand_f16_array(device, &[m, k], 42);
         let b = rand_f16_array(device, &[k, n], 99);
         let c = Array::zeros(device, &[m, n], DType::Float16);
@@ -125,24 +154,26 @@ impl GemmBuffers {
     /// nax_lowm_bench.
     fn encode(
         &self,
-        enc: &metal::ComputeCommandEncoderRef,
-        pipeline: &metal::ComputePipelineState,
+        enc: &ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
+        pipeline: &MtlPipeline,
         grid: MTLSize,
         tg: MTLSize,
     ) {
-        enc.set_compute_pipeline_state(pipeline);
-        enc.set_buffer(0, Some(self.a.metal_buffer()), 0);
-        enc.set_buffer(1, Some(self.b.metal_buffer()), 0);
-        enc.set_buffer(2, Some(self.c.metal_buffer()), 0);
-        enc.set_buffer(3, Some(&self.m_buf), 0);
-        enc.set_buffer(4, Some(&self.n_buf), 0);
-        enc.set_buffer(5, Some(&self.k_buf), 0);
-        enc.set_buffer(6, Some(&self.bsa_buf), 0);
-        enc.set_buffer(7, Some(&self.bsb_buf), 0);
-        enc.set_buffer(8, Some(&self.bsc_buf), 0);
-        enc.set_buffer(9, Some(&self.swizzle_buf), 0);
-        enc.set_buffer(10, Some(&self.residual_buf), 0);
-        enc.dispatch_thread_groups(grid, tg);
+        enc.setComputePipelineState(pipeline);
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(self.a.metal_buffer()), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(self.b.metal_buffer()), 0, 1);
+            enc.setBuffer_offset_atIndex(Some(self.c.metal_buffer()), 0, 2);
+            enc.setBuffer_offset_atIndex(Some(&self.m_buf), 0, 3);
+            enc.setBuffer_offset_atIndex(Some(&self.n_buf), 0, 4);
+            enc.setBuffer_offset_atIndex(Some(&self.k_buf), 0, 5);
+            enc.setBuffer_offset_atIndex(Some(&self.bsa_buf), 0, 6);
+            enc.setBuffer_offset_atIndex(Some(&self.bsb_buf), 0, 7);
+            enc.setBuffer_offset_atIndex(Some(&self.bsc_buf), 0, 8);
+            enc.setBuffer_offset_atIndex(Some(&self.swizzle_buf), 0, 9);
+            enc.setBuffer_offset_atIndex(Some(&self.residual_buf), 0, 10);
+        }
+        enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
     }
 }
 
@@ -154,8 +185,8 @@ impl GemmBuffers {
 /// Each iteration creates a new CB, encodes one dispatch, commits, and waits.
 /// Returns p50 latency in microseconds.
 fn bench_standard(
-    queue: &metal::CommandQueue,
-    pipeline: &metal::ComputePipelineState,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
+    pipeline: &MtlPipeline,
     bufs: &GemmBuffers,
     grid: MTLSize,
     tg: MTLSize,
@@ -164,24 +195,24 @@ fn bench_standard(
 ) -> f64 {
     // Warmup
     for _ in 0..warmup {
-        let cb = queue.new_command_buffer_with_unretained_references();
-        let enc = cb.new_compute_command_encoder();
-        bufs.encode(enc, pipeline, grid, tg);
-        enc.end_encoding();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+        let enc = cb.computeCommandEncoder().unwrap();
+        bufs.encode(&enc, pipeline, grid, tg);
+        enc.endEncoding();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
     }
 
     // Measure
     let mut times = Vec::with_capacity(iters);
     for _ in 0..iters {
         let start = Instant::now();
-        let cb = queue.new_command_buffer_with_unretained_references();
-        let enc = cb.new_compute_command_encoder();
-        bufs.encode(enc, pipeline, grid, tg);
-        enc.end_encoding();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+        let enc = cb.computeCommandEncoder().unwrap();
+        bufs.encode(&enc, pipeline, grid, tg);
+        enc.endEncoding();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
         times.push(start.elapsed().as_secs_f64() * 1e6);
     }
 
@@ -197,14 +228,14 @@ fn main() {
     let registry = KernelRegistry::new(gpu);
     ops::register_all(&registry).expect("Failed to register kernels");
     let device = registry.device().raw();
-    let queue = device.new_command_queue();
+    let queue = device.newCommandQueue().unwrap();
 
     let n = 3584usize;
     let k = 3584usize;
     let bm = 16usize;
     let bn = 32usize;
     let bk = 16usize;
-    let threads = 64u64;
+    let threads = 64usize;
     let kernel_name = "gemm_mlx_m16_f16";
     let m_values: &[usize] = &[1, 4, 8, 16, 32, 48, 64, 96, 128, 256, 512];
 
@@ -239,8 +270,16 @@ fn main() {
 
         let grid_x = n.div_ceil(bn);
         let grid_y = m.div_ceil(bm);
-        let grid = MTLSize::new(grid_x as u64, grid_y as u64, 1);
-        let tg = MTLSize::new(threads, 1, 1);
+        let grid = MTLSize {
+            width: grid_x,
+            height: grid_y,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: threads,
+            height: 1,
+            depth: 1,
+        };
 
         // Mode A: standard (5 warmup + 20 bench) — matches nax_lowm_bench
         let mode_a = bench_standard(&queue, &pipeline, &bufs, grid, tg, 5, 20);

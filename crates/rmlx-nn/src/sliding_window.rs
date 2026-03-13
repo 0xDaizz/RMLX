@@ -14,6 +14,12 @@ use rmlx_core::ops;
 
 use crate::attention::{AttentionConfig, LayerKvCache};
 use crate::linear::{Linear, LinearConfig};
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{
+    MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+    MTLComputePipelineState as _, MTLDevice,
+};
+use rmlx_metal::{ComputePass, MTLSize};
 
 /// Sliding window attention configuration.
 pub struct SlidingWindowAttentionConfig {
@@ -115,7 +121,7 @@ impl SlidingWindowAttention {
     /// position `j` iff `j <= i + offset` and `j >= i + offset - window_size + 1`.
     pub fn build_sliding_window_mask(
         &self,
-        device: &metal::Device,
+        device: &ProtocolObject<dyn MTLDevice>,
         seq_len: usize,
         total_seq: usize,
         position_offset: usize,
@@ -151,7 +157,7 @@ impl SlidingWindowAttention {
         sin_freqs: Option<&Array>,
         mut cache: Option<&mut LayerKvCache>,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         let seq_len = x.shape()[0];
         let position_offset = cache.as_ref().map_or(0, |c| c.position_offset());
@@ -341,42 +347,39 @@ impl SlidingWindowAttention {
         let head_bytes = head_dim * elem_size;
         let hidden_bytes = hidden_size * elem_size;
 
-        let cb = queue.new_command_buffer();
+        let cb = queue.commandBuffer().unwrap();
         for (h, head_out) in attn_outputs.iter().enumerate() {
             let dst_col_offset = h * head_bytes;
 
             if seq_len == 1 {
-                let enc = cb.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&pipeline);
-                enc.set_buffer(0, Some(head_out.metal_buffer()), head_out.offset() as u64);
-                enc.set_buffer(1, Some(concat.metal_buffer()), dst_col_offset as u64);
-                let count = head_dim as u64;
-                let grid = metal::MTLSize::new(count, 1, 1);
-                let tg = metal::MTLSize::new(
-                    std::cmp::min(pipeline.max_total_threads_per_threadgroup(), count),
-                    1,
-                    1,
-                );
+                let raw_enc = cb.computeCommandEncoder().unwrap();
+                let enc = ComputePass::new(&raw_enc);
+                enc.set_pipeline(&pipeline);
+                enc.set_buffer(0, Some(head_out.metal_buffer()), head_out.offset());
+                enc.set_buffer(1, Some(concat.metal_buffer()), dst_col_offset);
+                let count = head_dim;
+                let grid = MTLSize { width: count, height: 1, depth: 1 };
+                let tg = MTLSize { width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), count), height: 1, depth: 1 };
                 enc.dispatch_threads(grid, tg);
-                enc.end_encoding();
+                enc.end();
             } else {
-                let blit = cb.new_blit_command_encoder();
+                let blit = cb.blitCommandEncoder().unwrap();
                 for row in 0..seq_len {
-                    let src_off = (head_out.offset() + row * head_bytes) as u64;
-                    let dst_off = (row * hidden_bytes + dst_col_offset) as u64;
-                    blit.copy_from_buffer(
+                    let src_off = head_out.offset() + row * head_bytes;
+                    let dst_off = row * hidden_bytes + dst_col_offset;
+                    unsafe { blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
                         head_out.metal_buffer(),
                         src_off,
                         concat.metal_buffer(),
                         dst_off,
-                        head_bytes as u64,
-                    );
+                        head_bytes,
+                    ) };
                 }
-                blit.end_encoding();
+                blit.endEncoding();
             }
         }
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
 
         // Output projection
         self.o_proj.forward(&concat, registry, queue)

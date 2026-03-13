@@ -21,16 +21,24 @@
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLComputePipelineState as _;
+use objc2_metal::MTLCommandBuffer as _;
+use objc2_metal::MTLCommandQueue as _;
+use objc2_metal::MTLBuffer as _;
+use objc2_metal::MTLDevice as _;
+use rmlx_metal::MTLResourceOptions;
+use rmlx_metal::ComputePass;
 use crate::ops::buffer_slots::{
     sdpa as sdpa_slot, sdpa_diag_qkt, sdpa_diag_single_mma, sdpa_mma, sdpa_nax,
 };
-use metal::MTLSize;
+use rmlx_metal::MTLSize;
 
 // Tiling parameters — must match the Metal shader constants.
 const BR: usize = 16; // Query block rows
 const _BC: usize = 64; // Key/Value block columns (used in shader only)
-const THREADS_PER_TG: u64 = 128; // Threads per threadgroup
-const DECODE_THREADS: u64 = 256; // Threads for decode kernel
+const THREADS_PER_TG: usize = 128; // Threads per threadgroup
+const DECODE_THREADS: usize = 256; // Threads for decode kernel
 
 /// Metal shader for fused SDPA — Flash Attention 2 implementation.
 ///
@@ -1648,7 +1656,7 @@ kernel void sdpa_decode_batched_bf16(
 /// MMA tile sizes — must match the Metal shader constants.
 const MMA_BQ: usize = 32;
 const MMA_BK: usize = 16;
-const MMA_THREADS: u64 = 128;
+const MMA_THREADS: usize = 128;
 
 pub const SDPA_MMA_SHADER_SOURCE: &str = r#"
 #include <metal_stdlib>
@@ -2656,7 +2664,7 @@ kernel void sdpa_prefill_mma_bk32_f16(
 // ---------------------------------------------------------------------------
 const NAX_BQ: usize = 64;
 const NAX_BK: usize = 32;
-const NAX_THREADS: u64 = 128;
+const NAX_THREADS: usize = 128;
 
 pub const SDPA_NAX_SHADER_SOURCE: &str = r#"
 #include <metal_stdlib>
@@ -3331,7 +3339,7 @@ pub fn sdpa(
     mask: Option<&Array>,
     scale: f32,
     is_causal: bool,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     // Validate dtypes: Q, K, V must all share the same dtype
     if q.dtype() != k.dtype() || q.dtype() != v.dtype() {
@@ -3411,8 +3419,8 @@ pub fn sdpa(
             let m = m_c.as_ref().unwrap_or(m);
             let dev = registry.device().raw();
             let expanded = Array::uninit(dev, &[n, s], m.dtype());
-            let src = m.metal_buffer().contents() as *const u8;
-            let dst = expanded.metal_buffer().contents() as *mut u8;
+            let src = m.metal_buffer().contents().as_ptr() as *const u8;
+            let dst = expanded.metal_buffer().contents().as_ptr() as *mut u8;
             let row_bytes = m
                 .dtype()
                 .numel_to_bytes(s)
@@ -3484,56 +3492,55 @@ pub fn sdpa(
     let has_mask: u32 = if mask_ref.is_some() { 1 } else { 0 };
     let is_causal_u32: u32 = if is_causal { 1 } else { 0 };
     let params: [u32; 5] = [n as u32, s as u32, d as u32, has_mask, is_causal_u32];
-    let params_buf = dev.new_buffer_with_data(
-        params.as_ptr() as *const std::ffi::c_void,
-        20, // 5 * 4 bytes
-        metal::MTLResourceOptions::StorageModeShared,
-    );
+    let params_buf = unsafe {
+        dev.newBufferWithBytes_length_options(
+            std::ptr::NonNull::new(params.as_ptr() as *const std::ffi::c_void as *mut std::ffi::c_void).unwrap(),
+            20_usize, // 5 * 4 bytes
+            MTLResourceOptions::StorageModeShared,
+        )
+        .unwrap()
+    };
 
     // Scale buffer
-    let scale_buf = dev.new_buffer_with_data(
-        &scale as *const f32 as *const std::ffi::c_void,
-        4,
-        metal::MTLResourceOptions::StorageModeShared,
-    );
+    let scale_buf = unsafe { dev.newBufferWithBytes_length_options(std::ptr::NonNull::new(&scale as *const f32 as *const std::ffi::c_void as *mut std::ffi::c_void).unwrap(), 4_usize, MTLResourceOptions::StorageModeShared).unwrap() };
 
     // Dummy mask buffer if no mask
     let dummy_buf;
     let mask_buf = if let Some(m) = mask_ref {
         m.metal_buffer()
     } else {
-        dummy_buf = dev.new_buffer(4, metal::MTLResourceOptions::StorageModeShared);
+        dummy_buf = dev.newBufferWithLength_options(4_usize, MTLResourceOptions::StorageModeShared).unwrap();
         &dummy_buf
     };
-    let mask_offset = mask_ref.map_or(0, |m| m.offset()) as u64;
+    let mask_offset = mask_ref.map_or(0, |m| m.offset()) as usize;
 
-    let cb = queue.new_command_buffer();
-    let encoder = cb.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(sdpa_slot::Q, Some(q.metal_buffer()), q.offset() as u64);
-    encoder.set_buffer(sdpa_slot::K, Some(k.metal_buffer()), k.offset() as u64);
-    encoder.set_buffer(sdpa_slot::V, Some(v.metal_buffer()), v.offset() as u64);
-    encoder.set_buffer(sdpa_slot::OUT, Some(out.metal_buffer()), 0);
-    encoder.set_buffer(sdpa_slot::MASK, Some(mask_buf), mask_offset);
-    encoder.set_buffer(sdpa_slot::PARAMS, Some(&params_buf), 0);
-    encoder.set_buffer(sdpa_slot::SCALE, Some(&scale_buf), 0);
-
+    let cb = queue.commandBuffer().unwrap();
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let encoder = ComputePass::new(&raw_enc);
+    encoder.set_pipeline(&pipeline);
+    encoder.set_buffer(sdpa_slot::Q as u32, Some(q.metal_buffer()), q.offset());
+    encoder.set_buffer(sdpa_slot::K as u32, Some(k.metal_buffer()), k.offset());
+    encoder.set_buffer(sdpa_slot::V as u32, Some(v.metal_buffer()), v.offset());
+    encoder.set_buffer(sdpa_slot::OUT as u32, Some(out.metal_buffer()), 0);
+    encoder.set_buffer(sdpa_slot::MASK as u32, Some(mask_buf), mask_offset);
+    encoder.set_buffer(sdpa_slot::PARAMS as u32, Some(&params_buf), 0);
+    encoder.set_buffer(sdpa_slot::SCALE as u32, Some(&scale_buf), 0);
     if use_decode {
         // Decode kernel: single threadgroup
-        let tg_size = std::cmp::min(DECODE_THREADS, pipeline.max_total_threads_per_threadgroup());
-        encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(tg_size, 1, 1));
+        let tg_size = std::cmp::min(DECODE_THREADS, pipeline.maxTotalThreadsPerThreadgroup());
+        encoder.dispatch_threadgroups(MTLSize { width: 1, height: 1, depth: 1 }, MTLSize { width: tg_size, height: 1, depth: 1 });
     } else {
         // General kernel: one threadgroup per Q block
-        let n_threadgroups = n.div_ceil(BR) as u64;
-        let tg_size = std::cmp::min(THREADS_PER_TG, pipeline.max_total_threads_per_threadgroup());
-        encoder.dispatch_thread_groups(
-            MTLSize::new(n_threadgroups, 1, 1),
-            MTLSize::new(tg_size, 1, 1),
+        let n_threadgroups = n.div_ceil(BR);
+        let tg_size = std::cmp::min(THREADS_PER_TG, pipeline.maxTotalThreadsPerThreadgroup());
+        encoder.dispatch_threadgroups(
+            MTLSize { width: n_threadgroups, height: 1, depth: 1 },
+            MTLSize { width: tg_size, height: 1, depth: 1 },
         );
     }
 
-    encoder.end_encoding();
-    super::commit_with_mode(cb, super::ExecMode::Sync);
+    encoder.end();
+    super::commit_with_mode(&cb, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -3562,7 +3569,7 @@ pub fn sdpa_batched(
     mask: Option<&Array>,
     scale: f32,
     is_causal: bool,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Vec<Array>, KernelError> {
     let num_heads = q_heads.len();
     let num_kv_heads = k_heads.len();
@@ -3603,7 +3610,7 @@ fn sdpa_encode_impl(
     v: &Array,
     mask: Option<&Array>,
     scale: f32,
-    encoder: &metal::ComputeCommandEncoderRef,
+    encoder: ComputePass<'_>,
 ) -> Result<Array, KernelError> {
     // Validate dtypes: Q, K, V must all share the same dtype
     if q.dtype() != k.dtype() || q.dtype() != v.dtype() {
@@ -3716,39 +3723,30 @@ fn sdpa_encode_impl(
     let mask_buf = if let Some(m) = mask {
         m.metal_buffer()
     } else {
-        dummy_buf = dev.new_buffer(4, metal::MTLResourceOptions::StorageModeShared);
+        dummy_buf = dev.newBufferWithLength_options(4_usize, MTLResourceOptions::StorageModeShared).unwrap();
         &dummy_buf
     };
-    let mask_offset = mask.map_or(0, |m| m.offset()) as u64;
+    let mask_offset = mask.map_or(0, |m| m.offset());
 
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(sdpa_slot::Q, Some(q.metal_buffer()), q.offset() as u64);
-    encoder.set_buffer(sdpa_slot::K, Some(k.metal_buffer()), k.offset() as u64);
-    encoder.set_buffer(sdpa_slot::V, Some(v.metal_buffer()), v.offset() as u64);
-    encoder.set_buffer(sdpa_slot::OUT, Some(out.metal_buffer()), 0);
-    encoder.set_buffer(sdpa_slot::MASK, Some(mask_buf), mask_offset);
-    encoder.set_bytes(
-        sdpa_slot::PARAMS,
-        20,
-        params.as_ptr() as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        sdpa_slot::SCALE,
-        4,
-        &scale as *const f32 as *const std::ffi::c_void,
-    );
-
+    encoder.set_pipeline(&pipeline);
+    encoder.set_buffer(sdpa_slot::Q as u32, Some(q.metal_buffer()), q.offset());
+    encoder.set_buffer(sdpa_slot::K as u32, Some(k.metal_buffer()), k.offset());
+    encoder.set_buffer(sdpa_slot::V as u32, Some(v.metal_buffer()), v.offset());
+    encoder.set_buffer(sdpa_slot::OUT as u32, Some(out.metal_buffer()), 0);
+    encoder.set_buffer(sdpa_slot::MASK as u32, Some(mask_buf), mask_offset);
+    encoder.set_bytes(sdpa_slot::PARAMS as u32, params.as_ptr() as *const std::ffi::c_void, 20);
+    encoder.set_bytes(sdpa_slot::SCALE as u32, &scale as *const f32 as *const std::ffi::c_void, 4);
     if use_decode {
         // Decode kernel: single threadgroup
-        let tg_size = std::cmp::min(DECODE_THREADS, pipeline.max_total_threads_per_threadgroup());
-        encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(tg_size, 1, 1));
+        let tg_size = std::cmp::min(DECODE_THREADS, pipeline.maxTotalThreadsPerThreadgroup());
+        encoder.dispatch_threadgroups(MTLSize { width: 1, height: 1, depth: 1 }, MTLSize { width: tg_size, height: 1, depth: 1 });
     } else {
         // General kernel: one threadgroup per Q block
-        let n_threadgroups = n.div_ceil(BR) as u64;
-        let tg_size = std::cmp::min(THREADS_PER_TG, pipeline.max_total_threads_per_threadgroup());
-        encoder.dispatch_thread_groups(
-            MTLSize::new(n_threadgroups, 1, 1),
-            MTLSize::new(tg_size, 1, 1),
+        let n_threadgroups = n.div_ceil(BR);
+        let tg_size = std::cmp::min(THREADS_PER_TG, pipeline.maxTotalThreadsPerThreadgroup());
+        encoder.dispatch_threadgroups(
+            MTLSize { width: n_threadgroups, height: 1, depth: 1 },
+            MTLSize { width: tg_size, height: 1, depth: 1 },
         );
     }
 
@@ -3763,15 +3761,16 @@ pub fn sdpa_into_cb(
     v: &Array,
     mask: Option<&Array>,
     scale: f32,
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
 ) -> Result<Array, KernelError> {
-    let encoder = cb.new_compute_command_encoder();
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let encoder = ComputePass::new(&raw_enc);
     let result = sdpa_encode_impl(registry, q, k, v, mask, scale, encoder);
     if result.is_err() {
-        encoder.end_encoding();
+        encoder.end();
         return result;
     }
-    encoder.end_encoding();
+    encoder.end();
     result
 }
 
@@ -3785,7 +3784,7 @@ pub fn sdpa_encode(
     v: &Array,
     mask: Option<&Array>,
     scale: f32,
-    encoder: &metal::ComputeCommandEncoderRef,
+    encoder: ComputePass<'_>,
 ) -> Result<Array, KernelError> {
     sdpa_encode_impl(registry, q, k, v, mask, scale, encoder)
 }
@@ -3798,7 +3797,7 @@ pub fn sdpa_batched_into_cb(
     v_heads: &[Array],
     mask: Option<&Array>,
     scale: f32,
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
 ) -> Result<Vec<Array>, KernelError> {
     let num_heads = q_heads.len();
     let num_kv_heads = k_heads.len();
@@ -3860,7 +3859,7 @@ pub fn sdpa_prefill_gqa_slab_into_cb(
     mask: Option<&Array>,
     scale: f32,
     is_causal: bool,
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
 ) -> Result<Array, KernelError> {
     let dtype = q_slab.dtype();
 
@@ -3917,46 +3916,26 @@ pub fn sdpa_prefill_gqa_slab_into_cb(
     let mask_buf = if let Some(m) = mask {
         m.metal_buffer()
     } else {
-        dummy_buf = dev.new_buffer(4, metal::MTLResourceOptions::StorageModeShared);
+        dummy_buf = dev.newBufferWithLength_options(4_usize, MTLResourceOptions::StorageModeShared).unwrap();
         &dummy_buf
     };
-    let mask_offset = mask.map_or(0, |m| m.offset()) as u64;
+    let mask_offset = mask.map_or(0, |m| m.offset());
 
-    let encoder = cb.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(
-        sdpa_slot::Q,
-        Some(q_slab.metal_buffer()),
-        q_slab.offset() as u64,
-    );
-    encoder.set_buffer(
-        sdpa_slot::K,
-        Some(k_slab.metal_buffer()),
-        k_slab.offset() as u64,
-    );
-    encoder.set_buffer(
-        sdpa_slot::V,
-        Some(v_slab.metal_buffer()),
-        v_slab.offset() as u64,
-    );
-    encoder.set_buffer(sdpa_slot::OUT, Some(out.metal_buffer()), 0);
-    encoder.set_buffer(sdpa_slot::MASK, Some(mask_buf), mask_offset);
-    encoder.set_bytes(
-        sdpa_slot::PARAMS,
-        std::mem::size_of::<[u32; 10]>() as u64,
-        params.as_ptr() as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        sdpa_slot::SCALE,
-        4,
-        &scale as *const f32 as *const std::ffi::c_void,
-    );
-
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let encoder = ComputePass::new(&raw_enc);
+    encoder.set_pipeline(&pipeline);
+    encoder.set_buffer(sdpa_slot::Q as u32, Some(q_slab.metal_buffer()), q_slab.offset());
+    encoder.set_buffer(sdpa_slot::K as u32, Some(k_slab.metal_buffer()), k_slab.offset());
+    encoder.set_buffer(sdpa_slot::V as u32, Some(v_slab.metal_buffer()), v_slab.offset());
+    encoder.set_buffer(sdpa_slot::OUT as u32, Some(out.metal_buffer()), 0);
+    encoder.set_buffer(sdpa_slot::MASK as u32, Some(mask_buf), mask_offset);
+    encoder.set_bytes(sdpa_slot::PARAMS as u32, params.as_ptr() as *const std::ffi::c_void, std::mem::size_of::<[u32; 10]>());
+    encoder.set_bytes(sdpa_slot::SCALE as u32, &scale as *const f32 as *const std::ffi::c_void, 4);
     // Grid: 1D, n_q_blocks * num_kv_heads threadgroups
-    let total_tgs = (n_q_blocks * num_kv_heads) as u64;
-    let tg_size = std::cmp::min(THREADS_PER_TG, pipeline.max_total_threads_per_threadgroup());
-    encoder.dispatch_thread_groups(MTLSize::new(total_tgs, 1, 1), MTLSize::new(tg_size, 1, 1));
-    encoder.end_encoding();
+    let total_tgs = n_q_blocks * num_kv_heads;
+    let tg_size = std::cmp::min(THREADS_PER_TG, pipeline.maxTotalThreadsPerThreadgroup());
+    encoder.dispatch_threadgroups(MTLSize { width: total_tgs, height: 1, depth: 1 }, MTLSize { width: tg_size, height: 1, depth: 1 });
+    encoder.end();
 
     Ok(out)
 }
@@ -3991,7 +3970,7 @@ pub fn sdpa_prefill_mma_f16_into_cb(
     is_causal: bool,
     v_head_stride: Option<usize>,
     v_row_stride: Option<usize>,
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
 ) -> Result<Array, KernelError> {
     use crate::kernels::FunctionConstantValue;
 
@@ -4041,88 +4020,40 @@ pub fn sdpa_prefill_mma_f16_into_cb(
     let mask_metal_buf = if let Some(m) = mask {
         m.metal_buffer()
     } else {
-        dummy_buf = dev.new_buffer(4, metal::MTLResourceOptions::StorageModeShared);
+        dummy_buf = dev.newBufferWithLength_options(4_usize, MTLResourceOptions::StorageModeShared).unwrap();
         &dummy_buf
     };
-    let mask_offset = mask.map_or(0, |m| m.offset()) as u64;
+    let mask_offset = mask.map_or(0, |m| m.offset());
 
-    let encoder = cb.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(
-        sdpa_mma::Q,
-        Some(q_slab.metal_buffer()),
-        q_slab.offset() as u64,
-    );
-    encoder.set_buffer(
-        sdpa_mma::K,
-        Some(k_slab.metal_buffer()),
-        k_slab.offset() as u64,
-    );
-    encoder.set_buffer(
-        sdpa_mma::V,
-        Some(v_slab.metal_buffer()),
-        v_slab.offset() as u64,
-    );
-    encoder.set_buffer(sdpa_mma::OUT, Some(out.metal_buffer()), 0);
-    encoder.set_buffer(sdpa_mma::MASK, Some(mask_metal_buf), mask_offset);
-    encoder.set_bytes(
-        sdpa_mma::N,
-        4,
-        &n_val as *const u32 as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        sdpa_mma::S,
-        4,
-        &s_val as *const u32 as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        sdpa_mma::D,
-        4,
-        &d_val as *const u32 as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        sdpa_mma::GQA_FACTOR,
-        4,
-        &gqa_factor as *const u32 as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        sdpa_mma::SCALE,
-        4,
-        &scale as *const f32 as *const std::ffi::c_void,
-    );
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let encoder = ComputePass::new(&raw_enc);
+    encoder.set_pipeline(&pipeline);
+    encoder.set_buffer(sdpa_mma::Q as u32, Some(q_slab.metal_buffer()), q_slab.offset());
+    encoder.set_buffer(sdpa_mma::K as u32, Some(k_slab.metal_buffer()), k_slab.offset());
+    encoder.set_buffer(sdpa_mma::V as u32, Some(v_slab.metal_buffer()), v_slab.offset());
+    encoder.set_buffer(sdpa_mma::OUT as u32, Some(out.metal_buffer()), 0);
+    encoder.set_buffer(sdpa_mma::MASK as u32, Some(mask_metal_buf), mask_offset);
+    encoder.set_val(sdpa_mma::N as u32, &n_val);
+    encoder.set_val(sdpa_mma::S as u32, &s_val);
+    encoder.set_val(sdpa_mma::D as u32, &d_val);
+    encoder.set_val(sdpa_mma::GQA_FACTOR as u32, &gqa_factor);
+    encoder.set_val(sdpa_mma::SCALE as u32, &scale);
     let stride_s_val = kv_seq_stride.unwrap_or(kv_len) as u32;
-    encoder.set_bytes(
-        sdpa_mma::STRIDE_S,
-        4,
-        &stride_s_val as *const u32 as *const std::ffi::c_void,
-    );
+    encoder.set_val(sdpa_mma::STRIDE_S as u32, &stride_s_val);
     let num_q_heads_val = num_heads as u32;
-    encoder.set_bytes(
-        sdpa_mma::NUM_Q_HEADS,
-        4,
-        &num_q_heads_val as *const u32 as *const std::ffi::c_void,
-    );
+    encoder.set_val(sdpa_mma::NUM_Q_HEADS as u32, &num_q_heads_val);
     let v_hs = v_head_stride.unwrap_or(stride_s_val as usize * head_dim) as u32;
     let v_rs = v_row_stride.unwrap_or(head_dim) as u32;
-    encoder.set_bytes(
-        sdpa_mma::V_HEAD_STRIDE,
-        4,
-        &v_hs as *const u32 as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        sdpa_mma::V_ROW_STRIDE,
-        4,
-        &v_rs as *const u32 as *const std::ffi::c_void,
-    );
-
+    encoder.set_val(sdpa_mma::V_HEAD_STRIDE as u32, &v_hs);
+    encoder.set_val(sdpa_mma::V_ROW_STRIDE as u32, &v_rs);
     // Grid: (ceildiv(seq_len, BQ), num_heads, 1)
-    let n_q_blocks = seq_len.div_ceil(MMA_BQ) as u64;
-    let tg_size = std::cmp::min(MMA_THREADS, pipeline.max_total_threads_per_threadgroup());
-    encoder.dispatch_thread_groups(
-        MTLSize::new(n_q_blocks, num_heads as u64, 1),
-        MTLSize::new(tg_size, 1, 1),
+    let n_q_blocks = seq_len.div_ceil(MMA_BQ);
+    let tg_size = std::cmp::min(MMA_THREADS, pipeline.maxTotalThreadsPerThreadgroup());
+    encoder.dispatch_threadgroups(
+        MTLSize { width: n_q_blocks, height: num_heads, depth: 1 },
+        MTLSize { width: tg_size, height: 1, depth: 1 },
     );
-    encoder.end_encoding();
+    encoder.end();
 
     Ok(out)
 }
@@ -4155,7 +4086,7 @@ pub fn sdpa_prefill_mma_bk32_f16_into_cb(
     is_causal: bool,
     v_head_stride: Option<usize>,
     v_row_stride: Option<usize>,
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
 ) -> Result<Array, KernelError> {
     use crate::kernels::FunctionConstantValue;
 
@@ -4194,7 +4125,7 @@ pub fn sdpa_prefill_mma_bk32_f16_into_cb(
 
     // BK=32 cooperative loaders require exactly 128 threads.
     // If Metal compiler reduced max_threads (register pressure), fall back to BK=16.
-    let max_threads = pipeline.max_total_threads_per_threadgroup();
+    let max_threads = pipeline.maxTotalThreadsPerThreadgroup();
     if max_threads < MMA_THREADS {
         eprintln!(
             "sdpa_prefill_mma_bk32: max_threads={max_threads} < {MMA_THREADS}, falling back to BK=16"
@@ -4232,87 +4163,39 @@ pub fn sdpa_prefill_mma_bk32_f16_into_cb(
     let mask_metal_buf = if let Some(m) = mask {
         m.metal_buffer()
     } else {
-        dummy_buf = dev.new_buffer(4, metal::MTLResourceOptions::StorageModeShared);
+        dummy_buf = dev.newBufferWithLength_options(4_usize, MTLResourceOptions::StorageModeShared).unwrap();
         &dummy_buf
     };
-    let mask_offset = mask.map_or(0, |m| m.offset()) as u64;
+    let mask_offset = mask.map_or(0, |m| m.offset());
 
-    let encoder = cb.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(
-        sdpa_mma::Q,
-        Some(q_slab.metal_buffer()),
-        q_slab.offset() as u64,
-    );
-    encoder.set_buffer(
-        sdpa_mma::K,
-        Some(k_slab.metal_buffer()),
-        k_slab.offset() as u64,
-    );
-    encoder.set_buffer(
-        sdpa_mma::V,
-        Some(v_slab.metal_buffer()),
-        v_slab.offset() as u64,
-    );
-    encoder.set_buffer(sdpa_mma::OUT, Some(out.metal_buffer()), 0);
-    encoder.set_buffer(sdpa_mma::MASK, Some(mask_metal_buf), mask_offset);
-    encoder.set_bytes(
-        sdpa_mma::N,
-        4,
-        &n_val as *const u32 as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        sdpa_mma::S,
-        4,
-        &s_val as *const u32 as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        sdpa_mma::D,
-        4,
-        &d_val as *const u32 as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        sdpa_mma::GQA_FACTOR,
-        4,
-        &gqa_factor as *const u32 as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        sdpa_mma::SCALE,
-        4,
-        &scale as *const f32 as *const std::ffi::c_void,
-    );
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let encoder = ComputePass::new(&raw_enc);
+    encoder.set_pipeline(&pipeline);
+    encoder.set_buffer(sdpa_mma::Q as u32, Some(q_slab.metal_buffer()), q_slab.offset());
+    encoder.set_buffer(sdpa_mma::K as u32, Some(k_slab.metal_buffer()), k_slab.offset());
+    encoder.set_buffer(sdpa_mma::V as u32, Some(v_slab.metal_buffer()), v_slab.offset());
+    encoder.set_buffer(sdpa_mma::OUT as u32, Some(out.metal_buffer()), 0);
+    encoder.set_buffer(sdpa_mma::MASK as u32, Some(mask_metal_buf), mask_offset);
+    encoder.set_val(sdpa_mma::N as u32, &n_val);
+    encoder.set_val(sdpa_mma::S as u32, &s_val);
+    encoder.set_val(sdpa_mma::D as u32, &d_val);
+    encoder.set_val(sdpa_mma::GQA_FACTOR as u32, &gqa_factor);
+    encoder.set_val(sdpa_mma::SCALE as u32, &scale);
     let stride_s_val = kv_seq_stride.unwrap_or(kv_len) as u32;
-    encoder.set_bytes(
-        sdpa_mma::STRIDE_S,
-        4,
-        &stride_s_val as *const u32 as *const std::ffi::c_void,
-    );
+    encoder.set_val(sdpa_mma::STRIDE_S as u32, &stride_s_val);
     let num_q_heads_val = num_heads as u32;
-    encoder.set_bytes(
-        sdpa_mma::NUM_Q_HEADS,
-        4,
-        &num_q_heads_val as *const u32 as *const std::ffi::c_void,
-    );
+    encoder.set_val(sdpa_mma::NUM_Q_HEADS as u32, &num_q_heads_val);
     let v_hs = v_head_stride.unwrap_or(stride_s_val as usize * head_dim) as u32;
     let v_rs = v_row_stride.unwrap_or(head_dim) as u32;
-    encoder.set_bytes(
-        sdpa_mma::V_HEAD_STRIDE,
-        4,
-        &v_hs as *const u32 as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        sdpa_mma::V_ROW_STRIDE,
-        4,
-        &v_rs as *const u32 as *const std::ffi::c_void,
-    );
-
-    let n_q_blocks = seq_len.div_ceil(MMA_BQ) as u64;
+    encoder.set_val(sdpa_mma::V_HEAD_STRIDE as u32, &v_hs);
+    encoder.set_val(sdpa_mma::V_ROW_STRIDE as u32, &v_rs);
+    let n_q_blocks = seq_len.div_ceil(MMA_BQ);
     let tg_size = MMA_THREADS;
-    encoder.dispatch_thread_groups(
-        MTLSize::new(n_q_blocks, num_heads as u64, 1),
-        MTLSize::new(tg_size, 1, 1),
+    encoder.dispatch_threadgroups(
+        MTLSize { width: n_q_blocks, height: num_heads, depth: 1 },
+        MTLSize { width: tg_size, height: 1, depth: 1 },
     );
-    encoder.end_encoding();
+    encoder.end();
 
     Ok(out)
 }
@@ -4339,7 +4222,7 @@ pub fn sdpa_prefill_nax_f16_into_cb(
     is_causal: bool,
     v_head_stride: Option<usize>,
     v_row_stride: Option<usize>,
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
 ) -> Result<Array, KernelError> {
     use crate::kernels::FunctionConstantValue;
 
@@ -4382,82 +4265,34 @@ pub fn sdpa_prefill_nax_f16_into_cb(
     let s_val = kv_len as u32;
     let d_val = head_dim as u32;
 
-    let encoder = cb.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(
-        sdpa_nax::Q,
-        Some(q_slab.metal_buffer()),
-        q_slab.offset() as u64,
-    );
-    encoder.set_buffer(
-        sdpa_nax::K,
-        Some(k_slab.metal_buffer()),
-        k_slab.offset() as u64,
-    );
-    encoder.set_buffer(
-        sdpa_nax::V,
-        Some(v_slab.metal_buffer()),
-        v_slab.offset() as u64,
-    );
-    encoder.set_buffer(sdpa_nax::OUT, Some(out.metal_buffer()), 0);
-    encoder.set_bytes(
-        sdpa_nax::N,
-        4,
-        &n_val as *const u32 as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        sdpa_nax::S,
-        4,
-        &s_val as *const u32 as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        sdpa_nax::D,
-        4,
-        &d_val as *const u32 as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        sdpa_nax::GQA_FACTOR,
-        4,
-        &gqa_factor as *const u32 as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        sdpa_nax::SCALE,
-        4,
-        &scale as *const f32 as *const std::ffi::c_void,
-    );
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let encoder = ComputePass::new(&raw_enc);
+    encoder.set_pipeline(&pipeline);
+    encoder.set_buffer(sdpa_nax::Q as u32, Some(q_slab.metal_buffer()), q_slab.offset());
+    encoder.set_buffer(sdpa_nax::K as u32, Some(k_slab.metal_buffer()), k_slab.offset());
+    encoder.set_buffer(sdpa_nax::V as u32, Some(v_slab.metal_buffer()), v_slab.offset());
+    encoder.set_buffer(sdpa_nax::OUT as u32, Some(out.metal_buffer()), 0);
+    encoder.set_val(sdpa_nax::N as u32, &n_val);
+    encoder.set_val(sdpa_nax::S as u32, &s_val);
+    encoder.set_val(sdpa_nax::D as u32, &d_val);
+    encoder.set_val(sdpa_nax::GQA_FACTOR as u32, &gqa_factor);
+    encoder.set_val(sdpa_nax::SCALE as u32, &scale);
     let stride_s_val = kv_seq_stride.unwrap_or(kv_len) as u32;
-    encoder.set_bytes(
-        sdpa_nax::STRIDE_S,
-        4,
-        &stride_s_val as *const u32 as *const std::ffi::c_void,
-    );
+    encoder.set_val(sdpa_nax::STRIDE_S as u32, &stride_s_val);
     let num_q_heads_val = num_heads as u32;
-    encoder.set_bytes(
-        sdpa_nax::NUM_Q_HEADS,
-        4,
-        &num_q_heads_val as *const u32 as *const std::ffi::c_void,
-    );
+    encoder.set_val(sdpa_nax::NUM_Q_HEADS as u32, &num_q_heads_val);
     let v_hs = v_head_stride.unwrap_or(stride_s_val as usize * head_dim) as u32;
     let v_rs = v_row_stride.unwrap_or(head_dim) as u32;
-    encoder.set_bytes(
-        sdpa_nax::V_HEAD_STRIDE,
-        4,
-        &v_hs as *const u32 as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        sdpa_nax::V_ROW_STRIDE,
-        4,
-        &v_rs as *const u32 as *const std::ffi::c_void,
-    );
-
+    encoder.set_val(sdpa_nax::V_HEAD_STRIDE as u32, &v_hs);
+    encoder.set_val(sdpa_nax::V_ROW_STRIDE as u32, &v_rs);
     // Grid: (ceildiv(seq_len, BQ=64), num_heads, 1)
-    let n_q_blocks = seq_len.div_ceil(NAX_BQ) as u64;
-    let tg_size = std::cmp::min(NAX_THREADS, pipeline.max_total_threads_per_threadgroup());
-    encoder.dispatch_thread_groups(
-        MTLSize::new(n_q_blocks, num_heads as u64, 1),
-        MTLSize::new(tg_size, 1, 1),
+    let n_q_blocks = seq_len.div_ceil(NAX_BQ);
+    let tg_size = std::cmp::min(NAX_THREADS, pipeline.maxTotalThreadsPerThreadgroup());
+    encoder.dispatch_threadgroups(
+        MTLSize { width: n_q_blocks, height: num_heads, depth: 1 },
+        MTLSize { width: tg_size, height: 1, depth: 1 },
     );
-    encoder.end_encoding();
+    encoder.end();
 
     Ok(out)
 }
@@ -4482,7 +4317,7 @@ pub fn sdpa_prefill_gqa_slab_encode(
     mask: Option<&Array>,
     scale: f32,
     is_causal: bool,
-    encoder: &metal::ComputeCommandEncoderRef,
+    encoder: ComputePass<'_>,
 ) -> Result<Array, KernelError> {
     let dtype = q_slab.dtype();
 
@@ -4538,43 +4373,22 @@ pub fn sdpa_prefill_gqa_slab_encode(
     let mask_buf = if let Some(m) = mask {
         m.metal_buffer()
     } else {
-        dummy_buf = dev.new_buffer(4, metal::MTLResourceOptions::StorageModeShared);
+        dummy_buf = dev.newBufferWithLength_options(4_usize, MTLResourceOptions::StorageModeShared).unwrap();
         &dummy_buf
     };
-    let mask_offset = mask.map_or(0, |m| m.offset()) as u64;
+    let mask_offset = mask.map_or(0, |m| m.offset());
 
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(
-        sdpa_slot::Q,
-        Some(q_slab.metal_buffer()),
-        q_slab.offset() as u64,
-    );
-    encoder.set_buffer(
-        sdpa_slot::K,
-        Some(k_slab.metal_buffer()),
-        k_slab.offset() as u64,
-    );
-    encoder.set_buffer(
-        sdpa_slot::V,
-        Some(v_slab.metal_buffer()),
-        v_slab.offset() as u64,
-    );
-    encoder.set_buffer(sdpa_slot::OUT, Some(out.metal_buffer()), 0);
-    encoder.set_buffer(sdpa_slot::MASK, Some(mask_buf), mask_offset);
-    encoder.set_bytes(
-        sdpa_slot::PARAMS,
-        std::mem::size_of::<[u32; 10]>() as u64,
-        params.as_ptr() as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        sdpa_slot::SCALE,
-        4,
-        &scale as *const f32 as *const std::ffi::c_void,
-    );
-
-    let total_tgs = (n_q_blocks * num_kv_heads) as u64;
-    let tg_size = std::cmp::min(THREADS_PER_TG, pipeline.max_total_threads_per_threadgroup());
-    encoder.dispatch_thread_groups(MTLSize::new(total_tgs, 1, 1), MTLSize::new(tg_size, 1, 1));
+    encoder.set_pipeline(&pipeline);
+    encoder.set_buffer(sdpa_slot::Q as u32, Some(q_slab.metal_buffer()), q_slab.offset());
+    encoder.set_buffer(sdpa_slot::K as u32, Some(k_slab.metal_buffer()), k_slab.offset());
+    encoder.set_buffer(sdpa_slot::V as u32, Some(v_slab.metal_buffer()), v_slab.offset());
+    encoder.set_buffer(sdpa_slot::OUT as u32, Some(out.metal_buffer()), 0);
+    encoder.set_buffer(sdpa_slot::MASK as u32, Some(mask_buf), mask_offset);
+    encoder.set_bytes(sdpa_slot::PARAMS as u32, params.as_ptr() as *const std::ffi::c_void, std::mem::size_of::<[u32; 10]>());
+    encoder.set_bytes(sdpa_slot::SCALE as u32, &scale as *const f32 as *const std::ffi::c_void, 4);
+    let total_tgs = n_q_blocks * num_kv_heads;
+    let tg_size = std::cmp::min(THREADS_PER_TG, pipeline.maxTotalThreadsPerThreadgroup());
+    encoder.dispatch_threadgroups(MTLSize { width: total_tgs, height: 1, depth: 1 }, MTLSize { width: tg_size, height: 1, depth: 1 });
 
     Ok(out)
 }
@@ -4597,7 +4411,7 @@ pub fn sdpa_prefill_mma_f16_encode(
     is_causal: bool,
     v_head_stride: Option<usize>,
     v_row_stride: Option<usize>,
-    encoder: &metal::ComputeCommandEncoderRef,
+    encoder: ComputePass<'_>,
 ) -> Result<Array, KernelError> {
     use crate::kernels::FunctionConstantValue;
 
@@ -4646,84 +4460,35 @@ pub fn sdpa_prefill_mma_f16_encode(
     let mask_metal_buf = if let Some(m) = mask {
         m.metal_buffer()
     } else {
-        dummy_buf = dev.new_buffer(4, metal::MTLResourceOptions::StorageModeShared);
+        dummy_buf = dev.newBufferWithLength_options(4_usize, MTLResourceOptions::StorageModeShared).unwrap();
         &dummy_buf
     };
-    let mask_offset = mask.map_or(0, |m| m.offset()) as u64;
+    let mask_offset = mask.map_or(0, |m| m.offset());
 
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(
-        sdpa_mma::Q,
-        Some(q_slab.metal_buffer()),
-        q_slab.offset() as u64,
-    );
-    encoder.set_buffer(
-        sdpa_mma::K,
-        Some(k_slab.metal_buffer()),
-        k_slab.offset() as u64,
-    );
-    encoder.set_buffer(
-        sdpa_mma::V,
-        Some(v_slab.metal_buffer()),
-        v_slab.offset() as u64,
-    );
-    encoder.set_buffer(sdpa_mma::OUT, Some(out.metal_buffer()), 0);
-    encoder.set_buffer(sdpa_mma::MASK, Some(mask_metal_buf), mask_offset);
-    encoder.set_bytes(
-        sdpa_mma::N,
-        4,
-        &n_val as *const u32 as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        sdpa_mma::S,
-        4,
-        &s_val as *const u32 as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        sdpa_mma::D,
-        4,
-        &d_val as *const u32 as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        sdpa_mma::GQA_FACTOR,
-        4,
-        &gqa_factor as *const u32 as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        sdpa_mma::SCALE,
-        4,
-        &scale as *const f32 as *const std::ffi::c_void,
-    );
+    encoder.set_pipeline(&pipeline);
+    encoder.set_buffer(sdpa_mma::Q as u32, Some(q_slab.metal_buffer()), q_slab.offset());
+    encoder.set_buffer(sdpa_mma::K as u32, Some(k_slab.metal_buffer()), k_slab.offset());
+    encoder.set_buffer(sdpa_mma::V as u32, Some(v_slab.metal_buffer()), v_slab.offset());
+    encoder.set_buffer(sdpa_mma::OUT as u32, Some(out.metal_buffer()), 0);
+    encoder.set_buffer(sdpa_mma::MASK as u32, Some(mask_metal_buf), mask_offset);
+    encoder.set_val(sdpa_mma::N as u32, &n_val);
+    encoder.set_val(sdpa_mma::S as u32, &s_val);
+    encoder.set_val(sdpa_mma::D as u32, &d_val);
+    encoder.set_val(sdpa_mma::GQA_FACTOR as u32, &gqa_factor);
+    encoder.set_val(sdpa_mma::SCALE as u32, &scale);
     let stride_s_val = kv_seq_stride.unwrap_or(kv_len) as u32;
-    encoder.set_bytes(
-        sdpa_mma::STRIDE_S,
-        4,
-        &stride_s_val as *const u32 as *const std::ffi::c_void,
-    );
+    encoder.set_val(sdpa_mma::STRIDE_S as u32, &stride_s_val);
     let num_q_heads_val = num_heads as u32;
-    encoder.set_bytes(
-        sdpa_mma::NUM_Q_HEADS,
-        4,
-        &num_q_heads_val as *const u32 as *const std::ffi::c_void,
-    );
+    encoder.set_val(sdpa_mma::NUM_Q_HEADS as u32, &num_q_heads_val);
     let v_hs = v_head_stride.unwrap_or(stride_s_val as usize * head_dim) as u32;
     let v_rs = v_row_stride.unwrap_or(head_dim) as u32;
-    encoder.set_bytes(
-        sdpa_mma::V_HEAD_STRIDE,
-        4,
-        &v_hs as *const u32 as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        sdpa_mma::V_ROW_STRIDE,
-        4,
-        &v_rs as *const u32 as *const std::ffi::c_void,
-    );
-
-    let n_q_blocks = seq_len.div_ceil(MMA_BQ) as u64;
-    let tg_size = std::cmp::min(MMA_THREADS, pipeline.max_total_threads_per_threadgroup());
-    encoder.dispatch_thread_groups(
-        MTLSize::new(n_q_blocks, num_heads as u64, 1),
-        MTLSize::new(tg_size, 1, 1),
+    encoder.set_val(sdpa_mma::V_HEAD_STRIDE as u32, &v_hs);
+    encoder.set_val(sdpa_mma::V_ROW_STRIDE as u32, &v_rs);
+    let n_q_blocks = seq_len.div_ceil(MMA_BQ);
+    let tg_size = std::cmp::min(MMA_THREADS, pipeline.maxTotalThreadsPerThreadgroup());
+    encoder.dispatch_threadgroups(
+        MTLSize { width: n_q_blocks, height: num_heads, depth: 1 },
+        MTLSize { width: tg_size, height: 1, depth: 1 },
     );
 
     Ok(out)
@@ -4747,7 +4512,7 @@ pub fn sdpa_prefill_mma_bk32_f16_encode(
     is_causal: bool,
     v_head_stride: Option<usize>,
     v_row_stride: Option<usize>,
-    encoder: &metal::ComputeCommandEncoderRef,
+    encoder: ComputePass<'_>,
 ) -> Result<Array, KernelError> {
     use crate::kernels::FunctionConstantValue;
 
@@ -4784,7 +4549,7 @@ pub fn sdpa_prefill_mma_bk32_f16_encode(
     let pipeline =
         registry.get_pipeline_with_constants("sdpa_prefill_mma_bk32_f16", dtype, &constants)?;
 
-    let max_threads = pipeline.max_total_threads_per_threadgroup();
+    let max_threads = pipeline.maxTotalThreadsPerThreadgroup();
     if max_threads < MMA_THREADS {
         eprintln!(
             "sdpa_prefill_mma_bk32: max_threads={max_threads} < {MMA_THREADS}, falling back to BK=16"
@@ -4822,84 +4587,35 @@ pub fn sdpa_prefill_mma_bk32_f16_encode(
     let mask_metal_buf = if let Some(m) = mask {
         m.metal_buffer()
     } else {
-        dummy_buf = dev.new_buffer(4, metal::MTLResourceOptions::StorageModeShared);
+        dummy_buf = dev.newBufferWithLength_options(4_usize, MTLResourceOptions::StorageModeShared).unwrap();
         &dummy_buf
     };
-    let mask_offset = mask.map_or(0, |m| m.offset()) as u64;
+    let mask_offset = mask.map_or(0, |m| m.offset());
 
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(
-        sdpa_mma::Q,
-        Some(q_slab.metal_buffer()),
-        q_slab.offset() as u64,
-    );
-    encoder.set_buffer(
-        sdpa_mma::K,
-        Some(k_slab.metal_buffer()),
-        k_slab.offset() as u64,
-    );
-    encoder.set_buffer(
-        sdpa_mma::V,
-        Some(v_slab.metal_buffer()),
-        v_slab.offset() as u64,
-    );
-    encoder.set_buffer(sdpa_mma::OUT, Some(out.metal_buffer()), 0);
-    encoder.set_buffer(sdpa_mma::MASK, Some(mask_metal_buf), mask_offset);
-    encoder.set_bytes(
-        sdpa_mma::N,
-        4,
-        &n_val as *const u32 as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        sdpa_mma::S,
-        4,
-        &s_val as *const u32 as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        sdpa_mma::D,
-        4,
-        &d_val as *const u32 as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        sdpa_mma::GQA_FACTOR,
-        4,
-        &gqa_factor as *const u32 as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        sdpa_mma::SCALE,
-        4,
-        &scale as *const f32 as *const std::ffi::c_void,
-    );
+    encoder.set_pipeline(&pipeline);
+    encoder.set_buffer(sdpa_mma::Q as u32, Some(q_slab.metal_buffer()), q_slab.offset());
+    encoder.set_buffer(sdpa_mma::K as u32, Some(k_slab.metal_buffer()), k_slab.offset());
+    encoder.set_buffer(sdpa_mma::V as u32, Some(v_slab.metal_buffer()), v_slab.offset());
+    encoder.set_buffer(sdpa_mma::OUT as u32, Some(out.metal_buffer()), 0);
+    encoder.set_buffer(sdpa_mma::MASK as u32, Some(mask_metal_buf), mask_offset);
+    encoder.set_val(sdpa_mma::N as u32, &n_val);
+    encoder.set_val(sdpa_mma::S as u32, &s_val);
+    encoder.set_val(sdpa_mma::D as u32, &d_val);
+    encoder.set_val(sdpa_mma::GQA_FACTOR as u32, &gqa_factor);
+    encoder.set_val(sdpa_mma::SCALE as u32, &scale);
     let stride_s_val = kv_seq_stride.unwrap_or(kv_len) as u32;
-    encoder.set_bytes(
-        sdpa_mma::STRIDE_S,
-        4,
-        &stride_s_val as *const u32 as *const std::ffi::c_void,
-    );
+    encoder.set_val(sdpa_mma::STRIDE_S as u32, &stride_s_val);
     let num_q_heads_val = num_heads as u32;
-    encoder.set_bytes(
-        sdpa_mma::NUM_Q_HEADS,
-        4,
-        &num_q_heads_val as *const u32 as *const std::ffi::c_void,
-    );
+    encoder.set_val(sdpa_mma::NUM_Q_HEADS as u32, &num_q_heads_val);
     let v_hs = v_head_stride.unwrap_or(stride_s_val as usize * head_dim) as u32;
     let v_rs = v_row_stride.unwrap_or(head_dim) as u32;
-    encoder.set_bytes(
-        sdpa_mma::V_HEAD_STRIDE,
-        4,
-        &v_hs as *const u32 as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        sdpa_mma::V_ROW_STRIDE,
-        4,
-        &v_rs as *const u32 as *const std::ffi::c_void,
-    );
-
-    let n_q_blocks = seq_len.div_ceil(MMA_BQ) as u64;
+    encoder.set_val(sdpa_mma::V_HEAD_STRIDE as u32, &v_hs);
+    encoder.set_val(sdpa_mma::V_ROW_STRIDE as u32, &v_rs);
+    let n_q_blocks = seq_len.div_ceil(MMA_BQ);
     let tg_size = MMA_THREADS;
-    encoder.dispatch_thread_groups(
-        MTLSize::new(n_q_blocks, num_heads as u64, 1),
-        MTLSize::new(tg_size, 1, 1),
+    encoder.dispatch_threadgroups(
+        MTLSize { width: n_q_blocks, height: num_heads, depth: 1 },
+        MTLSize { width: tg_size, height: 1, depth: 1 },
     );
 
     Ok(out)
@@ -4922,7 +4638,7 @@ pub fn sdpa_prefill_nax_f16_encode(
     is_causal: bool,
     v_head_stride: Option<usize>,
     v_row_stride: Option<usize>,
-    encoder: &metal::ComputeCommandEncoderRef,
+    encoder: ComputePass<'_>,
 ) -> Result<Array, KernelError> {
     use crate::kernels::FunctionConstantValue;
 
@@ -4965,78 +4681,29 @@ pub fn sdpa_prefill_nax_f16_encode(
     let s_val = kv_len as u32;
     let d_val = head_dim as u32;
 
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(
-        sdpa_nax::Q,
-        Some(q_slab.metal_buffer()),
-        q_slab.offset() as u64,
-    );
-    encoder.set_buffer(
-        sdpa_nax::K,
-        Some(k_slab.metal_buffer()),
-        k_slab.offset() as u64,
-    );
-    encoder.set_buffer(
-        sdpa_nax::V,
-        Some(v_slab.metal_buffer()),
-        v_slab.offset() as u64,
-    );
-    encoder.set_buffer(sdpa_nax::OUT, Some(out.metal_buffer()), 0);
-    encoder.set_bytes(
-        sdpa_nax::N,
-        4,
-        &n_val as *const u32 as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        sdpa_nax::S,
-        4,
-        &s_val as *const u32 as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        sdpa_nax::D,
-        4,
-        &d_val as *const u32 as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        sdpa_nax::GQA_FACTOR,
-        4,
-        &gqa_factor as *const u32 as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        sdpa_nax::SCALE,
-        4,
-        &scale as *const f32 as *const std::ffi::c_void,
-    );
+    encoder.set_pipeline(&pipeline);
+    encoder.set_buffer(sdpa_nax::Q as u32, Some(q_slab.metal_buffer()), q_slab.offset());
+    encoder.set_buffer(sdpa_nax::K as u32, Some(k_slab.metal_buffer()), k_slab.offset());
+    encoder.set_buffer(sdpa_nax::V as u32, Some(v_slab.metal_buffer()), v_slab.offset());
+    encoder.set_buffer(sdpa_nax::OUT as u32, Some(out.metal_buffer()), 0);
+    encoder.set_val(sdpa_nax::N as u32, &n_val);
+    encoder.set_val(sdpa_nax::S as u32, &s_val);
+    encoder.set_val(sdpa_nax::D as u32, &d_val);
+    encoder.set_val(sdpa_nax::GQA_FACTOR as u32, &gqa_factor);
+    encoder.set_val(sdpa_nax::SCALE as u32, &scale);
     let stride_s_val = kv_seq_stride.unwrap_or(kv_len) as u32;
-    encoder.set_bytes(
-        sdpa_nax::STRIDE_S,
-        4,
-        &stride_s_val as *const u32 as *const std::ffi::c_void,
-    );
+    encoder.set_val(sdpa_nax::STRIDE_S as u32, &stride_s_val);
     let num_q_heads_val = num_heads as u32;
-    encoder.set_bytes(
-        sdpa_nax::NUM_Q_HEADS,
-        4,
-        &num_q_heads_val as *const u32 as *const std::ffi::c_void,
-    );
+    encoder.set_val(sdpa_nax::NUM_Q_HEADS as u32, &num_q_heads_val);
     let v_hs = v_head_stride.unwrap_or(stride_s_val as usize * head_dim) as u32;
     let v_rs = v_row_stride.unwrap_or(head_dim) as u32;
-    encoder.set_bytes(
-        sdpa_nax::V_HEAD_STRIDE,
-        4,
-        &v_hs as *const u32 as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        sdpa_nax::V_ROW_STRIDE,
-        4,
-        &v_rs as *const u32 as *const std::ffi::c_void,
-    );
-
-    let n_q_blocks = seq_len.div_ceil(NAX_BQ) as u64;
-    let tg_size = std::cmp::min(NAX_THREADS, pipeline.max_total_threads_per_threadgroup());
-    encoder.dispatch_thread_groups(
-        MTLSize::new(n_q_blocks, num_heads as u64, 1),
-        MTLSize::new(tg_size, 1, 1),
+    encoder.set_val(sdpa_nax::V_HEAD_STRIDE as u32, &v_hs);
+    encoder.set_val(sdpa_nax::V_ROW_STRIDE as u32, &v_rs);
+    let n_q_blocks = seq_len.div_ceil(NAX_BQ);
+    let tg_size = std::cmp::min(NAX_THREADS, pipeline.maxTotalThreadsPerThreadgroup());
+    encoder.dispatch_threadgroups(
+        MTLSize { width: n_q_blocks, height: num_heads, depth: 1 },
+        MTLSize { width: tg_size, height: 1, depth: 1 },
     );
 
     Ok(out)
@@ -5053,7 +4720,7 @@ pub fn sdpa_nax_diag_qkt_into_cb(
     kv_len: usize,
     head_dim: usize,
     scale: f32,
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
 ) -> Result<Array, KernelError> {
     let pipeline = registry.get_pipeline("sdpa_nax_diag_qkt_f16", DType::Float16)?;
     let dev = registry.device().raw();
@@ -5064,35 +4731,19 @@ pub fn sdpa_nax_diag_qkt_into_cb(
     let s_val = kv_len as u32;
     let d_val = head_dim as u32;
 
-    let encoder = cb.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(sdpa_diag_qkt::Q, Some(q.metal_buffer()), q.offset() as u64);
-    encoder.set_buffer(sdpa_diag_qkt::K, Some(k.metal_buffer()), k.offset() as u64);
-    encoder.set_buffer(sdpa_diag_qkt::OUT, Some(out.metal_buffer()), 0);
-    encoder.set_bytes(
-        sdpa_diag_qkt::N,
-        4,
-        &n_val as *const u32 as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        sdpa_diag_qkt::S,
-        4,
-        &s_val as *const u32 as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        sdpa_diag_qkt::D,
-        4,
-        &d_val as *const u32 as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        sdpa_diag_qkt::SCALE,
-        4,
-        &scale as *const f32 as *const std::ffi::c_void,
-    );
-
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let encoder = ComputePass::new(&raw_enc);
+    encoder.set_pipeline(&pipeline);
+    encoder.set_buffer(sdpa_diag_qkt::Q as u32, Some(q.metal_buffer()), q.offset());
+    encoder.set_buffer(sdpa_diag_qkt::K as u32, Some(k.metal_buffer()), k.offset());
+    encoder.set_buffer(sdpa_diag_qkt::OUT as u32, Some(out.metal_buffer()), 0);
+    encoder.set_val(sdpa_diag_qkt::N as u32, &n_val);
+    encoder.set_val(sdpa_diag_qkt::S as u32, &s_val);
+    encoder.set_val(sdpa_diag_qkt::D as u32, &d_val);
+    encoder.set_val(sdpa_diag_qkt::SCALE as u32, &scale);
     // Single threadgroup: 128 threads (4 SG), processes up to 64 Q rows
-    encoder.dispatch_thread_groups(metal::MTLSize::new(1, 1, 1), metal::MTLSize::new(128, 1, 1));
-    encoder.end_encoding();
+    encoder.dispatch_threadgroups(MTLSize { width: 1, height: 1, depth: 1 }, MTLSize { width: 128, height: 1, depth: 1 });
+    encoder.end();
 
     Ok(out)
 }
@@ -5103,29 +4754,21 @@ pub fn sdpa_nax_diag_single_mma_into_cb(
     registry: &KernelRegistry,
     q: &Array, // [16*16] f16
     k: &Array, // [32*16] f16
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
 ) -> Result<Array, KernelError> {
     let pipeline = registry.get_pipeline("sdpa_nax_diag_single_mma", DType::Float16)?;
     let dev = registry.device().raw();
 
     let out = Array::uninit(dev, &[16 * 32], DType::Float32);
 
-    let encoder = cb.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(
-        sdpa_diag_single_mma::Q,
-        Some(q.metal_buffer()),
-        q.offset() as u64,
-    );
-    encoder.set_buffer(
-        sdpa_diag_single_mma::K,
-        Some(k.metal_buffer()),
-        k.offset() as u64,
-    );
-    encoder.set_buffer(sdpa_diag_single_mma::OUT, Some(out.metal_buffer()), 0);
-
-    encoder.dispatch_thread_groups(metal::MTLSize::new(1, 1, 1), metal::MTLSize::new(128, 1, 1));
-    encoder.end_encoding();
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let encoder = ComputePass::new(&raw_enc);
+    encoder.set_pipeline(&pipeline);
+    encoder.set_buffer(sdpa_diag_single_mma::Q as u32, Some(q.metal_buffer()), q.offset());
+    encoder.set_buffer(sdpa_diag_single_mma::K as u32, Some(k.metal_buffer()), k.offset());
+    encoder.set_buffer(sdpa_diag_single_mma::OUT as u32, Some(out.metal_buffer()), 0);
+    encoder.dispatch_threadgroups(MTLSize { width: 1, height: 1, depth: 1 }, MTLSize { width: 128, height: 1, depth: 1 });
+    encoder.end();
 
     Ok(out)
 }
@@ -5155,7 +4798,7 @@ pub fn sdpa_decode_batched_slab_into_cb(
     seq_len: usize,
     mask: Option<&Array>,
     scale: f32,
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
 ) -> Result<Array, KernelError> {
     sdpa_decode_batched_slab_stride_into_cb(
         registry,
@@ -5192,7 +4835,7 @@ pub fn sdpa_decode_batched_slab_stride_into_cb(
     stride_seq_len: Option<usize>,
     mask: Option<&Array>,
     scale: f32,
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
 ) -> Result<Array, KernelError> {
     // Validate dtypes
     let dtype = q_slab.dtype();
@@ -5303,48 +4946,28 @@ pub fn sdpa_decode_batched_slab_stride_into_cb(
     let mask_buf = if let Some(m) = mask {
         m.metal_buffer()
     } else {
-        dummy_buf = dev.new_buffer(4, metal::MTLResourceOptions::StorageModeShared);
+        dummy_buf = dev.newBufferWithLength_options(4_usize, MTLResourceOptions::StorageModeShared).unwrap();
         &dummy_buf
     };
-    let mask_offset = mask.map_or(0, |m| m.offset()) as u64;
+    let mask_offset = mask.map_or(0, |m| m.offset());
 
-    let encoder = cb.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(
-        sdpa_slot::Q,
-        Some(q_slab.metal_buffer()),
-        q_slab.offset() as u64,
-    );
-    encoder.set_buffer(
-        sdpa_slot::K,
-        Some(k_slab.metal_buffer()),
-        k_slab.offset() as u64,
-    );
-    encoder.set_buffer(
-        sdpa_slot::V,
-        Some(v_slab.metal_buffer()),
-        v_slab.offset() as u64,
-    );
-    encoder.set_buffer(sdpa_slot::OUT, Some(out.metal_buffer()), 0);
-    encoder.set_buffer(sdpa_slot::MASK, Some(mask_buf), mask_offset);
-    encoder.set_bytes(
-        sdpa_slot::PARAMS,
-        std::mem::size_of::<[u32; 6]>() as u64,
-        params.as_ptr() as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        sdpa_slot::SCALE,
-        4,
-        &scale as *const f32 as *const std::ffi::c_void,
-    );
-
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let encoder = ComputePass::new(&raw_enc);
+    encoder.set_pipeline(&pipeline);
+    encoder.set_buffer(sdpa_slot::Q as u32, Some(q_slab.metal_buffer()), q_slab.offset());
+    encoder.set_buffer(sdpa_slot::K as u32, Some(k_slab.metal_buffer()), k_slab.offset());
+    encoder.set_buffer(sdpa_slot::V as u32, Some(v_slab.metal_buffer()), v_slab.offset());
+    encoder.set_buffer(sdpa_slot::OUT as u32, Some(out.metal_buffer()), 0);
+    encoder.set_buffer(sdpa_slot::MASK as u32, Some(mask_buf), mask_offset);
+    encoder.set_bytes(sdpa_slot::PARAMS as u32, params.as_ptr() as *const std::ffi::c_void, std::mem::size_of::<[u32; 6]>());
+    encoder.set_bytes(sdpa_slot::SCALE as u32, &scale as *const f32 as *const std::ffi::c_void, 4);
     // One threadgroup per Q head, 256 threads each
-    let tg_size = std::cmp::min(DECODE_THREADS, pipeline.max_total_threads_per_threadgroup());
-    encoder.dispatch_thread_groups(
-        MTLSize::new(num_heads as u64, 1, 1),
-        MTLSize::new(tg_size, 1, 1),
+    let tg_size = std::cmp::min(DECODE_THREADS, pipeline.maxTotalThreadsPerThreadgroup());
+    encoder.dispatch_threadgroups(
+        MTLSize { width: num_heads, height: 1, depth: 1 },
+        MTLSize { width: tg_size, height: 1, depth: 1 },
     );
-    encoder.end_encoding();
+    encoder.end();
 
     Ok(out)
 }
@@ -5364,7 +4987,7 @@ pub fn sdpa_decode_batched_slab_stride_into_encoder(
     stride_seq_len: Option<usize>,
     mask: Option<&Array>,
     scale: f32,
-    encoder: &metal::ComputeCommandEncoderRef,
+    encoder: ComputePass<'_>,
 ) -> Result<Array, KernelError> {
     // Validate dtypes
     let dtype = q_slab.dtype();
@@ -5475,45 +5098,24 @@ pub fn sdpa_decode_batched_slab_stride_into_encoder(
     let mask_buf = if let Some(m) = mask {
         m.metal_buffer()
     } else {
-        dummy_buf = dev.new_buffer(4, metal::MTLResourceOptions::StorageModeShared);
+        dummy_buf = dev.newBufferWithLength_options(4_usize, MTLResourceOptions::StorageModeShared).unwrap();
         &dummy_buf
     };
-    let mask_offset = mask.map_or(0, |m| m.offset()) as u64;
+    let mask_offset = mask.map_or(0, |m| m.offset());
 
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(
-        sdpa_slot::Q,
-        Some(q_slab.metal_buffer()),
-        q_slab.offset() as u64,
-    );
-    encoder.set_buffer(
-        sdpa_slot::K,
-        Some(k_slab.metal_buffer()),
-        k_slab.offset() as u64,
-    );
-    encoder.set_buffer(
-        sdpa_slot::V,
-        Some(v_slab.metal_buffer()),
-        v_slab.offset() as u64,
-    );
-    encoder.set_buffer(sdpa_slot::OUT, Some(out.metal_buffer()), 0);
-    encoder.set_buffer(sdpa_slot::MASK, Some(mask_buf), mask_offset);
-    encoder.set_bytes(
-        sdpa_slot::PARAMS,
-        std::mem::size_of::<[u32; 6]>() as u64,
-        params.as_ptr() as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        sdpa_slot::SCALE,
-        4,
-        &scale as *const f32 as *const std::ffi::c_void,
-    );
-
+    encoder.set_pipeline(&pipeline);
+    encoder.set_buffer(sdpa_slot::Q as u32, Some(q_slab.metal_buffer()), q_slab.offset());
+    encoder.set_buffer(sdpa_slot::K as u32, Some(k_slab.metal_buffer()), k_slab.offset());
+    encoder.set_buffer(sdpa_slot::V as u32, Some(v_slab.metal_buffer()), v_slab.offset());
+    encoder.set_buffer(sdpa_slot::OUT as u32, Some(out.metal_buffer()), 0);
+    encoder.set_buffer(sdpa_slot::MASK as u32, Some(mask_buf), mask_offset);
+    encoder.set_bytes(sdpa_slot::PARAMS as u32, params.as_ptr() as *const std::ffi::c_void, std::mem::size_of::<[u32; 6]>());
+    encoder.set_bytes(sdpa_slot::SCALE as u32, &scale as *const f32 as *const std::ffi::c_void, 4);
     // One threadgroup per Q head, 256 threads each
-    let tg_size = std::cmp::min(DECODE_THREADS, pipeline.max_total_threads_per_threadgroup());
-    encoder.dispatch_thread_groups(
-        MTLSize::new(num_heads as u64, 1, 1),
-        MTLSize::new(tg_size, 1, 1),
+    let tg_size = std::cmp::min(DECODE_THREADS, pipeline.maxTotalThreadsPerThreadgroup());
+    encoder.dispatch_threadgroups(
+        MTLSize { width: num_heads, height: 1, depth: 1 },
+        MTLSize { width: tg_size, height: 1, depth: 1 },
     );
 
     Ok(out)
@@ -5527,17 +5129,17 @@ pub fn sdpa_decode_batched_slab_stride_into_encoder(
 /// Skips all validation — caller must ensure correctness.
 #[allow(clippy::too_many_arguments)]
 pub fn sdpa_decode_preresolved_into_encoder(
-    pso: &metal::ComputePipelineState,
-    q_buf: &metal::BufferRef,
-    q_offset: u64,
-    k_buf: &metal::BufferRef,
-    k_offset: u64,
-    v_buf: &metal::BufferRef,
-    v_offset: u64,
-    out_buf: &metal::BufferRef,
-    out_offset: u64,
-    mask_buf: &metal::BufferRef,
-    mask_offset: u64,
+    pso: &rmlx_metal::MtlPipeline,
+    q_buf: &rmlx_metal::MtlBuffer,
+    q_offset: usize,
+    k_buf: &rmlx_metal::MtlBuffer,
+    k_offset: usize,
+    v_buf: &rmlx_metal::MtlBuffer,
+    v_offset: usize,
+    out_buf: &rmlx_metal::MtlBuffer,
+    out_offset: usize,
+    mask_buf: &rmlx_metal::MtlBuffer,
+    mask_offset: usize,
     num_heads: u32,
     num_kv_heads: u32,
     seq_len: u32,
@@ -5545,7 +5147,7 @@ pub fn sdpa_decode_preresolved_into_encoder(
     has_mask: u32,
     stride_s: u32,
     scale: f32,
-    encoder: &metal::ComputeCommandEncoderRef,
+    encoder: ComputePass<'_>,
 ) {
     let params: [u32; 6] = [
         num_heads,
@@ -5556,27 +5158,18 @@ pub fn sdpa_decode_preresolved_into_encoder(
         stride_s,
     ];
 
-    encoder.set_compute_pipeline_state(pso);
-    encoder.set_buffer(sdpa_slot::Q, Some(q_buf), q_offset);
-    encoder.set_buffer(sdpa_slot::K, Some(k_buf), k_offset);
-    encoder.set_buffer(sdpa_slot::V, Some(v_buf), v_offset);
-    encoder.set_buffer(sdpa_slot::OUT, Some(out_buf), out_offset);
-    encoder.set_buffer(sdpa_slot::MASK, Some(mask_buf), mask_offset);
-    encoder.set_bytes(
-        sdpa_slot::PARAMS,
-        std::mem::size_of::<[u32; 6]>() as u64,
-        params.as_ptr() as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        sdpa_slot::SCALE,
-        4,
-        &scale as *const f32 as *const std::ffi::c_void,
-    );
-
-    let tg_size = std::cmp::min(DECODE_THREADS, pso.max_total_threads_per_threadgroup());
-    encoder.dispatch_thread_groups(
-        metal::MTLSize::new(num_heads as u64, 1, 1),
-        metal::MTLSize::new(tg_size, 1, 1),
+    encoder.set_pipeline(pso);
+    encoder.set_buffer(sdpa_slot::Q as u32, Some(q_buf), q_offset);
+    encoder.set_buffer(sdpa_slot::K as u32, Some(k_buf), k_offset);
+    encoder.set_buffer(sdpa_slot::V as u32, Some(v_buf), v_offset);
+    encoder.set_buffer(sdpa_slot::OUT as u32, Some(out_buf), out_offset);
+    encoder.set_buffer(sdpa_slot::MASK as u32, Some(mask_buf), mask_offset);
+    encoder.set_bytes(sdpa_slot::PARAMS as u32, params.as_ptr() as *const std::ffi::c_void, std::mem::size_of::<[u32; 6]>());
+    encoder.set_bytes(sdpa_slot::SCALE as u32, &scale as *const f32 as *const std::ffi::c_void, 4);
+    let tg_size = std::cmp::min(DECODE_THREADS, pso.maxTotalThreadsPerThreadgroup());
+    encoder.dispatch_threadgroups(
+        MTLSize { width: num_heads as usize, height: 1, depth: 1 },
+        MTLSize { width: tg_size, height: 1, depth: 1 },
     );
 }
 
@@ -5615,9 +5208,9 @@ pub fn sdpa_decode_constants(
 mod tests {
     use super::*;
 
-    fn setup() -> (KernelRegistry, metal::CommandQueue) {
+    fn setup() -> (KernelRegistry, rmlx_metal::MtlQueue) {
         let gpu_dev = rmlx_metal::device::GpuDevice::system_default().unwrap();
-        let queue = gpu_dev.raw().new_command_queue();
+        let queue = gpu_dev.new_command_queue();
         let registry = KernelRegistry::new(gpu_dev);
         register(&registry).unwrap();
         crate::ops::copy::register(&registry).unwrap();
@@ -5692,9 +5285,9 @@ mod tests {
         let k = Array::zeros(dev, &[6, 8], DType::Float16);
         let v = Array::zeros(dev, &[6, 8], DType::Float32);
 
-        let queue = dev.new_command_queue();
-        let cb = queue.new_command_buffer();
-        let result = sdpa_into_cb(&registry, &q, &k, &v, None, 0.125, cb);
+        let queue = dev.newCommandQueue().unwrap();
+        let cb = queue.commandBuffer().unwrap();
+        let result = sdpa_into_cb(&registry, &q, &k, &v, None, 0.125, &cb);
         let err = result.expect_err("expected error");
         let msg = format!("{err}");
         assert!(
@@ -5723,7 +5316,7 @@ mod tests {
     /// Create an f16 array from f32 data using GPU copy_cast.
     fn make_f16_array(
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
         data: &[f32],
         shape: Vec<usize>,
     ) -> Array {
@@ -5735,16 +5328,16 @@ mod tests {
     /// Read f16 array back as f32 via GPU copy_cast.
     fn read_f16_as_f32(
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
         arr: &Array,
     ) -> Vec<f32> {
         let f32_arr = crate::ops::copy::copy_cast(registry, arr, DType::Float32, queue).unwrap();
         f32_arr.to_vec_checked()
     }
 
-    fn setup_with_copy() -> (KernelRegistry, metal::CommandQueue) {
+    fn setup_with_copy() -> (KernelRegistry, rmlx_metal::MtlQueue) {
         let gpu_dev = rmlx_metal::device::GpuDevice::system_default().unwrap();
-        let queue = gpu_dev.raw().new_command_queue();
+        let queue = gpu_dev.new_command_queue();
         let registry = KernelRegistry::new(gpu_dev);
         register(&registry).unwrap();
         crate::ops::copy::register(&registry).unwrap();
@@ -5755,7 +5348,7 @@ mod tests {
     #[allow(clippy::too_many_arguments)]
     fn run_gqa_vs_reference(
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
         num_heads: usize,
         num_kv_heads: usize,
         seq_len: usize,
@@ -5792,7 +5385,7 @@ mod tests {
         );
 
         // --- GQA prefill path ---
-        let cb = queue.new_command_buffer();
+        let cb = queue.commandBuffer().unwrap();
         let gqa_out = sdpa_prefill_gqa_slab_into_cb(
             registry,
             &q_slab,
@@ -5807,11 +5400,11 @@ mod tests {
             None,
             scale,
             is_causal,
-            cb,
+            &cb,
         )
         .unwrap();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
         let gqa_f32 = read_f16_as_f32(registry, queue, &gqa_out);
 
         // --- Reference: per-head sdpa path ---
@@ -5887,7 +5480,7 @@ mod tests {
     }
 
     fn read_f32_array(arr: &Array) -> Vec<f32> {
-        let ptr = arr.metal_buffer().contents() as *const f32;
+        let ptr = arr.metal_buffer().contents().as_ptr() as *const f32;
         let len = arr.numel();
         unsafe { std::slice::from_raw_parts(ptr, len).to_vec() }
     }
@@ -5987,7 +5580,7 @@ mod tests {
     #[allow(clippy::too_many_arguments)]
     fn run_mma_vs_scalar(
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
         num_heads: usize,
         num_kv_heads: usize,
         seq_len: usize,
@@ -6022,7 +5615,7 @@ mod tests {
         );
 
         // --- Scalar kernel ---
-        let cb_scalar = queue.new_command_buffer();
+        let cb_scalar = queue.commandBuffer().unwrap();
         let scalar_out = sdpa_prefill_gqa_slab_into_cb(
             registry,
             &q_slab,
@@ -6037,17 +5630,17 @@ mod tests {
             None,          // mask
             scale,
             true, // is_causal
-            cb_scalar,
+            &cb_scalar,
         )
         .unwrap();
         cb_scalar.commit();
-        cb_scalar.wait_until_completed();
+        cb_scalar.waitUntilCompleted();
         let scalar_f32_raw = read_f16_as_f32(registry, queue, &scalar_out);
         // Convert scalar head-major output to seq-major for comparison with MMA
         let scalar_f32 = head_major_to_seq_major(&scalar_f32_raw, num_heads, seq_len, head_dim);
 
         // --- MMA kernel (outputs seq-major) ---
-        let cb_mma = queue.new_command_buffer();
+        let cb_mma = queue.commandBuffer().unwrap();
         let mma_out = sdpa_prefill_mma_f16_into_cb(
             registry,
             &q_slab,
@@ -6064,11 +5657,11 @@ mod tests {
             true, // is_causal
             None, // v_head_stride (default)
             None, // v_row_stride (default)
-            cb_mma,
+            &cb_mma,
         )
         .unwrap();
         cb_mma.commit();
-        cb_mma.wait_until_completed();
+        cb_mma.waitUntilCompleted();
         let mma_f32 = read_f16_as_f32(registry, queue, &mma_out);
 
         (scalar_f32, mma_f32)
@@ -6197,7 +5790,7 @@ kernel void metal32_probe(device float* out [[buffer(0)]], uint tid [[thread_pos
             );
 
             // --- Scalar kernel ---
-            let cb_scalar = queue.new_command_buffer();
+            let cb_scalar = queue.commandBuffer().unwrap();
             let scalar_out = sdpa_prefill_gqa_slab_into_cb(
                 &registry,
                 &q_slab,
@@ -6212,17 +5805,17 @@ kernel void metal32_probe(device float* out [[buffer(0)]], uint tid [[thread_pos
                 None,
                 scale,
                 true,
-                cb_scalar,
+                &cb_scalar,
             )
             .unwrap();
             cb_scalar.commit();
-            cb_scalar.wait_until_completed();
+            cb_scalar.waitUntilCompleted();
             let scalar_f32_raw = read_f16_as_f32(&registry, &queue, &scalar_out);
             // Convert scalar head-major output to seq-major for comparison with MMA
             let scalar_f32 = head_major_to_seq_major(&scalar_f32_raw, num_heads, seq_len, head_dim);
 
             // --- MMA BK=32 kernel (outputs seq-major) ---
-            let cb_mma = queue.new_command_buffer();
+            let cb_mma = queue.commandBuffer().unwrap();
             let mma_out = sdpa_prefill_mma_bk32_f16_into_cb(
                 &registry,
                 &q_slab,
@@ -6239,11 +5832,11 @@ kernel void metal32_probe(device float* out [[buffer(0)]], uint tid [[thread_pos
                 true,
                 None, // v_head_stride
                 None, // v_row_stride
-                cb_mma,
+                &cb_mma,
             )
             .unwrap();
             cb_mma.commit();
-            cb_mma.wait_until_completed();
+            cb_mma.waitUntilCompleted();
             let mma_f32 = read_f16_as_f32(&registry, &queue, &mma_out);
 
             let diff = max_abs_diff(&scalar_f32, &mma_f32);
@@ -6269,10 +5862,10 @@ kernel void metal32_probe(device float* out [[buffer(0)]], uint tid [[thread_pos
         let k = make_f16_array(&registry, &queue, &k_data, vec![32 * 16]);
 
         // GPU
-        let cb = queue.new_command_buffer();
-        let s_out = sdpa_nax_diag_single_mma_into_cb(&registry, &q, &k, cb).unwrap();
+        let cb = queue.commandBuffer().unwrap();
+        let s_out = sdpa_nax_diag_single_mma_into_cb(&registry, &q, &k, &cb).unwrap();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
         let s_gpu = read_f32_array(&s_out);
 
         // CPU reference: S = Q @ K^T where Q=[16,16], K=[32,16]
@@ -6309,11 +5902,11 @@ kernel void metal32_probe(device float* out [[buffer(0)]], uint tid [[thread_pos
             let q_ones = make_f16_array(&registry, &queue, &ones_q, vec![16 * 16]);
             let k_ones = make_f16_array(&registry, &queue, &ones_k, vec![32 * 16]);
 
-            let cb2 = queue.new_command_buffer();
+            let cb2 = queue.commandBuffer().unwrap();
             let s_ones =
-                sdpa_nax_diag_single_mma_into_cb(&registry, &q_ones, &k_ones, cb2).unwrap();
+                sdpa_nax_diag_single_mma_into_cb(&registry, &q_ones, &k_ones, &cb2).unwrap();
             cb2.commit();
-            cb2.wait_until_completed();
+            cb2.waitUntilCompleted();
             let s_ones_gpu = read_f32_array(&s_ones);
 
             eprintln!("\n=== All-ones test (expect 16.0 everywhere) ===");
@@ -6348,10 +5941,10 @@ kernel void metal32_probe(device float* out [[buffer(0)]], uint tid [[thread_pos
             let q_pos = make_f16_array(&registry, &queue, &pos_q, vec![16 * 16]);
             let k_id = make_f16_array(&registry, &queue, &id_k, vec![32 * 16]);
 
-            let cb3 = queue.new_command_buffer();
-            let s_id = sdpa_nax_diag_single_mma_into_cb(&registry, &q_pos, &k_id, cb3).unwrap();
+            let cb3 = queue.commandBuffer().unwrap();
+            let s_id = sdpa_nax_diag_single_mma_into_cb(&registry, &q_pos, &k_id, &cb3).unwrap();
             cb3.commit();
-            cb3.wait_until_completed();
+            cb3.waitUntilCompleted();
             let s_id_gpu = read_f32_array(&s_id);
 
             eprintln!("\n=== Identity K test (S[:,:16] should equal Q, S[:,16:]=0) ===");
@@ -6422,7 +6015,7 @@ kernel void metal32_probe(device float* out [[buffer(0)]], uint tid [[thread_pos
             );
 
             // --- Scalar kernel ---
-            let cb_scalar = queue.new_command_buffer();
+            let cb_scalar = queue.commandBuffer().unwrap();
             let scalar_out = sdpa_prefill_gqa_slab_into_cb(
                 &registry,
                 &q_slab,
@@ -6437,17 +6030,17 @@ kernel void metal32_probe(device float* out [[buffer(0)]], uint tid [[thread_pos
                 None,
                 scale,
                 true,
-                cb_scalar,
+                &cb_scalar,
             )
             .unwrap();
             cb_scalar.commit();
-            cb_scalar.wait_until_completed();
+            cb_scalar.waitUntilCompleted();
             let scalar_f32_raw = read_f16_as_f32(&registry, &queue, &scalar_out);
             // Convert scalar head-major output to seq-major for comparison with NAX
             let scalar_f32 = head_major_to_seq_major(&scalar_f32_raw, num_heads, seq_len, head_dim);
 
             // --- NAX kernel ---
-            let cb_nax = queue.new_command_buffer();
+            let cb_nax = queue.commandBuffer().unwrap();
             let nax_out = sdpa_prefill_nax_f16_into_cb(
                 &registry,
                 &q_slab,
@@ -6463,11 +6056,11 @@ kernel void metal32_probe(device float* out [[buffer(0)]], uint tid [[thread_pos
                 true,
                 None, // v_head_stride
                 None, // v_row_stride
-                cb_nax,
+                &cb_nax,
             )
             .unwrap();
             cb_nax.commit();
-            cb_nax.wait_until_completed();
+            cb_nax.waitUntilCompleted();
             let nax_f32 = read_f16_as_f32(&registry, &queue, &nax_out);
 
             let diff = max_abs_diff(&scalar_f32, &nax_f32);

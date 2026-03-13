@@ -20,24 +20,11 @@
 
 use std::collections::HashMap;
 
-use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2::Message;
 use objc2_metal::*;
 
+use crate::compute_pass::ComputePass;
 use crate::types::*;
-
-/// Retain an unsized protocol-object reference into an owned `Retained`.
-///
-/// `Retained::retain()` requires `T: Sized`, but `ProtocolObject<dyn MTLFoo>`
-/// is unsized.  Work around by calling `objc_retain` directly + `from_raw`.
-fn retain_proto<T: ?Sized + Message>(r: &T) -> Retained<T> {
-    let ptr = r as *const T as *mut T;
-    unsafe {
-        objc2::ffi::objc_retain(ptr as *mut _);
-        Retained::from_raw(ptr).unwrap_unchecked()
-    }
-}
 
 /// A captured compute dispatch for replay via ICB.
 #[derive(Clone)]
@@ -148,20 +135,15 @@ impl IcbReplay {
 
         for dispatch in &self.dispatches {
             let enc = cb.computeCommandEncoder().unwrap();
-            enc.setComputePipelineState(&dispatch.pipeline);
+            let pass = ComputePass::new(&enc);
+            pass.set_pipeline(&dispatch.pipeline);
 
             for (index, buffer, offset) in &dispatch.buffers {
-                unsafe {
-                    enc.setBuffer_offset_atIndex(
-                        Some(buffer),
-                        *offset as usize,
-                        *index as usize,
-                    );
-                }
+                pass.set_buffer(*index as u32, Some(buffer), *offset as usize);
             }
 
-            enc.dispatchThreads_threadsPerThreadgroup(dispatch.grid_size, dispatch.threadgroup_size);
-            enc.endEncoding();
+            pass.dispatch_threads(dispatch.grid_size, dispatch.threadgroup_size);
+            pass.end();
         }
 
         cb.commit();
@@ -172,20 +154,15 @@ impl IcbReplay {
     pub fn replay_into(&self, cb: &ProtocolObject<dyn MTLCommandBuffer>) {
         for dispatch in &self.dispatches {
             let enc = cb.computeCommandEncoder().unwrap();
-            enc.setComputePipelineState(&dispatch.pipeline);
+            let pass = ComputePass::new(&enc);
+            pass.set_pipeline(&dispatch.pipeline);
 
             for (index, buffer, offset) in &dispatch.buffers {
-                unsafe {
-                    enc.setBuffer_offset_atIndex(
-                        Some(buffer),
-                        *offset as usize,
-                        *index as usize,
-                    );
-                }
+                pass.set_buffer(*index as u32, Some(buffer), *offset as usize);
             }
 
-            enc.dispatchThreads_threadsPerThreadgroup(dispatch.grid_size, dispatch.threadgroup_size);
-            enc.endEncoding();
+            pass.dispatch_threads(dispatch.grid_size, dispatch.threadgroup_size);
+            pass.end();
         }
     }
 
@@ -256,23 +233,16 @@ impl IcbReplay {
                 crate::command::memory_barrier_scope_buffers(&encoder);
             }
 
-            encoder.setComputePipelineState(&dispatch.pipeline);
+            let pass = ComputePass::new(&encoder);
+            pass.set_pipeline(&dispatch.pipeline);
             for (index, buffer, offset) in &dispatch.buffers {
-                unsafe {
-                    encoder.setBuffer_offset_atIndex(
-                        Some(buffer),
-                        *offset as usize,
-                        *index as usize,
-                    );
-                }
+                pass.set_buffer(*index as u32, Some(buffer), *offset as usize);
             }
-            encoder.dispatchThreads_threadsPerThreadgroup(
-                dispatch.grid_size,
-                dispatch.threadgroup_size,
-            );
+            pass.dispatch_threads(dispatch.grid_size, dispatch.threadgroup_size);
         }
 
-        encoder.endEncoding();
+        let pass = ComputePass::new(&encoder);
+        pass.end();
     }
 
     /// Replay with dynamic parameter updates for decode tokens.
@@ -324,15 +294,10 @@ impl IcbReplay {
                 crate::command::memory_barrier_scope_buffers(&encoder);
             }
 
-            encoder.setComputePipelineState(&dispatch.pipeline);
+            let pass = ComputePass::new(&encoder);
+            pass.set_pipeline(&dispatch.pipeline);
             for (index, buffer, offset) in &dispatch.buffers {
-                unsafe {
-                    encoder.setBuffer_offset_atIndex(
-                        Some(buffer),
-                        *offset as usize,
-                        *index as usize,
-                    );
-                }
+                pass.set_buffer(*index as u32, Some(buffer), *offset as usize);
             }
 
             // Dynamic params: set position and seq_len as bytes
@@ -340,13 +305,10 @@ impl IcbReplay {
             // Only set if the dispatch uses these indices
             // (This is a no-op for dispatches that don't need them)
 
-            encoder.dispatchThreads_threadsPerThreadgroup(
-                dispatch.grid_size,
-                dispatch.threadgroup_size,
-            );
+            pass.dispatch_threads(dispatch.grid_size, dispatch.threadgroup_size);
         }
 
-        encoder.endEncoding();
+        ComputePass::new(&encoder).end();
         true
     }
 }
@@ -501,7 +463,7 @@ mod tests {
 
     #[test]
     fn icb_replay_empty() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.expect("Metal device required");
+        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
         let queue = device.newCommandQueue().unwrap();
 
         let replay = IcbReplay {
@@ -516,7 +478,7 @@ mod tests {
 
     #[test]
     fn test_icb_concurrent_replay_empty() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.expect("Metal device required");
+        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
         let queue = device.newCommandQueue().unwrap();
         let cb = queue.commandBuffer().unwrap();
 
@@ -534,7 +496,7 @@ mod tests {
 
     #[test]
     fn test_icb_validity() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.expect("Metal device required");
+        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
         let buf_k = device
             .newBufferWithLength_options(4096, MTLResourceOptions::StorageModeShared)
             .unwrap();
@@ -554,7 +516,7 @@ mod tests {
 
     #[test]
     fn test_icb_replay_decode_empty() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.expect("Metal device required");
+        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
         let queue = device.newCommandQueue().unwrap();
         let cb = queue.commandBuffer().unwrap();
 
@@ -572,7 +534,7 @@ mod tests {
 
     #[test]
     fn test_icb_cache_get_valid() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.expect("Metal device required");
+        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
         let buf_k = device
             .newBufferWithLength_options(4096, MTLResourceOptions::StorageModeShared)
             .unwrap();

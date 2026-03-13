@@ -5,7 +5,24 @@
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
+use objc2::Message;
 use objc2_metal::*;
+
+/// Retain an unsized protocol-object reference into an owned `Retained`.
+///
+/// `Retained::retain()` requires `T: Sized` (it lives in `impl<T: Message>`),
+/// but `ProtocolObject<dyn MTLFoo>` is unsized.  We work around this by
+/// calling `objc_retain` directly and wrapping the result with `from_raw`,
+/// which *is* available for `T: ?Sized + Message`.
+pub(crate) fn retain_proto<T: ?Sized + Message>(r: &T) -> Retained<T> {
+    let ptr = r as *const T as *mut T;
+    // SAFETY: `ptr` originates from a valid reference.  `objc_retain` increments
+    // the refcount; `from_raw` then wraps the +1 pointer without retaining again.
+    unsafe {
+        objc2::ffi::objc_retain(ptr as *mut _);
+        Retained::from_raw(ptr).unwrap_unchecked()
+    }
+}
 
 /// Owned Metal device handle.
 pub type MtlDevice = Retained<ProtocolObject<dyn MTLDevice>>;

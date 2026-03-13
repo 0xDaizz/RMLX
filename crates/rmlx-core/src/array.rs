@@ -1,8 +1,8 @@
 //! N-dimensional array backed by a Metal buffer.
 
-use metal::Buffer as MTLBuffer;
-use metal::MTLResourceOptions;
-use rmlx_metal::metal;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLBuffer as _;
+use rmlx_metal::{MtlBuffer, MTLResourceOptions};
 
 use rmlx_alloc::MetalAllocator;
 
@@ -10,6 +10,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::mem::ManuallyDrop;
+use std::ptr::NonNull;
 
 #[cfg(feature = "bench")]
 use std::cell::Cell;
@@ -17,6 +18,8 @@ use std::cell::Cell;
 use std::time::Instant;
 
 use crate::dtype::{DType, HasDType};
+use objc2_metal::MTLCommandQueue as _;
+use objc2_metal::MTLDevice as _;
 
 // Thread-local allocation statistics for profiling.
 // Tracks count and cumulative time of Array::uninit() / Array::zeros() calls.
@@ -35,7 +38,7 @@ thread_local! {
 /// Eliminates ~3ms/iter of `device.new_buffer()` overhead during forward passes.
 struct ArrayPool {
     /// Free buffers keyed by allocation size (bytes).
-    free: HashMap<u64, Vec<MTLBuffer>>,
+    free: HashMap<usize, Vec<MtlBuffer>>,
     enabled: bool,
     /// Stats
     hits: u64,
@@ -52,7 +55,7 @@ impl ArrayPool {
         }
     }
 
-    fn acquire(&mut self, device: &metal::Device, size: u64) -> MTLBuffer {
+    fn acquire(&mut self, device: &ProtocolObject<dyn objc2_metal::MTLDevice>, size: usize) -> MtlBuffer {
         if self.enabled {
             if let Some(bufs) = self.free.get_mut(&size) {
                 if let Some(buf) = bufs.pop() {
@@ -62,10 +65,12 @@ impl ArrayPool {
             }
             self.misses += 1;
         }
-        device.new_buffer(size, MTLResourceOptions::StorageModeShared)
+        device
+            .newBufferWithLength_options(size, MTLResourceOptions::StorageModeShared)
+            .unwrap()
     }
 
-    fn recycle(&mut self, buf: MTLBuffer) {
+    fn recycle(&mut self, buf: MtlBuffer) {
         if self.enabled {
             let size = buf.length();
             self.free.entry(size).or_default().push(buf);
@@ -126,7 +131,7 @@ pub fn get_alloc_stats() -> (u64, u64, u64) {
 ///
 /// `Debug` prints shape, strides, and dtype (not buffer contents).
 pub struct Array {
-    buffer: ManuallyDrop<MTLBuffer>,
+    buffer: ManuallyDrop<MtlBuffer>,
     shape: Vec<usize>,
     strides: Vec<usize>,
     dtype: DType,
@@ -164,7 +169,7 @@ impl Drop for Array {
 impl Array {
     /// Create an array wrapping an existing Metal buffer.
     pub fn new(
-        buffer: MTLBuffer,
+        buffer: MtlBuffer,
         shape: Vec<usize>,
         strides: Vec<usize>,
         dtype: DType,
@@ -180,7 +185,7 @@ impl Array {
     }
 
     /// Create an array from a typed slice, allocating a new Metal buffer.
-    pub fn from_slice<T: HasDType>(device: &metal::Device, data: &[T], shape: Vec<usize>) -> Self {
+    pub fn from_slice<T: HasDType>(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, data: &[T], shape: Vec<usize>) -> Self {
         let dtype = T::DTYPE;
         let numel: usize = shape.iter().product();
         debug_assert_eq!(
@@ -191,13 +196,23 @@ impl Array {
             numel
         );
 
-        let size = std::mem::size_of_val(data) as u64;
+        let size = std::mem::size_of_val(data);
         // Metal returns null for zero-length buffers; allocate at least 1 byte.
         let buffer = if size == 0 {
-            device.new_buffer(1, MTLResourceOptions::StorageModeShared)
+            device
+                .newBufferWithLength_options(1, MTLResourceOptions::StorageModeShared)
+                .unwrap()
         } else {
-            let ptr = data.as_ptr() as *const std::ffi::c_void;
-            device.new_buffer_with_data(ptr, size, MTLResourceOptions::StorageModeShared)
+            let ptr = NonNull::new(data.as_ptr() as *mut std::ffi::c_void).unwrap();
+            unsafe {
+                device
+                    .newBufferWithBytes_length_options(
+                        ptr,
+                        size,
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                    .unwrap()
+            }
         };
 
         let strides = compute_contiguous_strides(&shape);
@@ -212,12 +227,11 @@ impl Array {
 
     /// Allocate an uninitialized array. Use ONLY for outputs that will be
     /// fully overwritten by a GPU kernel before any read.
-    pub fn uninit(device: &metal::Device, shape: &[usize], dtype: DType) -> Self {
+    pub fn uninit(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, shape: &[usize], dtype: DType) -> Self {
         let numel: usize = shape.iter().product();
         let byte_size = dtype
             .numel_to_bytes(numel)
-            .expect("numel must be block-aligned for quantized dtypes")
-            as u64;
+            .expect("numel must be block-aligned for quantized dtypes");
         // Metal returns null for zero-length buffers; allocate at least 1 byte.
         let alloc_size = byte_size.max(1);
 
@@ -231,7 +245,7 @@ impl Array {
             let elapsed = t0.elapsed().as_nanos() as u64;
             ALLOC_COUNT.with(|c| c.set(c.get() + 1));
             ALLOC_NANOS.with(|c| c.set(c.get() + elapsed));
-            ALLOC_BYTES.with(|c| c.set(c.get() + alloc_size));
+            ALLOC_BYTES.with(|c| c.set(c.get() + alloc_size as u64));
         }
 
         let strides = compute_contiguous_strides(shape);
@@ -248,12 +262,11 @@ impl Array {
     ///
     /// Explicitly zeroes the buffer after allocation to guarantee correctness
     /// regardless of platform or Metal driver behavior.
-    pub fn zeros(device: &metal::Device, shape: &[usize], dtype: DType) -> Self {
+    pub fn zeros(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, shape: &[usize], dtype: DType) -> Self {
         let numel: usize = shape.iter().product();
         let byte_size = dtype
             .numel_to_bytes(numel)
-            .expect("numel must be block-aligned for quantized dtypes")
-            as u64;
+            .expect("numel must be block-aligned for quantized dtypes");
         // Metal returns null for zero-length buffers; allocate at least 1 byte.
         let alloc_size = byte_size.max(1);
 
@@ -267,7 +280,7 @@ impl Array {
             let elapsed = t0.elapsed().as_nanos() as u64;
             ALLOC_COUNT.with(|c| c.set(c.get() + 1));
             ALLOC_NANOS.with(|c| c.set(c.get() + elapsed));
-            ALLOC_BYTES.with(|c| c.set(c.get() + alloc_size));
+            ALLOC_BYTES.with(|c| c.set(c.get() + alloc_size as u64));
         }
 
         // Explicitly zero the buffer. Recycled buffers may contain stale data,
@@ -275,7 +288,7 @@ impl Array {
         // SAFETY: SharedMode buffer contents() is CPU-accessible and valid
         // for buffer.length() bytes.
         unsafe {
-            std::ptr::write_bytes(buffer.contents() as *mut u8, 0, alloc_size as usize);
+            std::ptr::write_bytes(buffer.contents().as_ptr() as *mut u8, 0, alloc_size);
         }
 
         let strides = compute_contiguous_strides(shape);
@@ -308,7 +321,7 @@ impl Array {
         // SAFETY: SharedMode buffer contents() is CPU-accessible and valid
         // for buffer.length() bytes. We zero only our sub-allocation region.
         unsafe {
-            let base = (buffer.contents() as *mut u8).add(sub_offset);
+            let base = (buffer.contents().as_ptr() as *mut u8).add(sub_offset);
             std::ptr::write_bytes(base, 0, byte_size);
         }
 
@@ -323,7 +336,7 @@ impl Array {
     }
 
     /// Create an array filled with ones (f32 only).
-    pub fn ones(device: &metal::Device, shape: &[usize]) -> Self {
+    pub fn ones(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, shape: &[usize]) -> Self {
         let numel: usize = shape.iter().product();
         let data: Vec<f32> = vec![1.0; numel];
         Self::from_slice(device, &data, shape.to_vec())
@@ -353,13 +366,13 @@ impl Array {
             // Fast path: data is laid out contiguously, single memcpy.
             let byte_size = numel * elem_size;
             assert!(
-                self.offset + byte_size <= self.buffer.length() as usize,
+                self.offset + byte_size <= self.buffer.length(),
                 "to_vec_checked: offset({}) + data({}) exceeds buffer({})",
                 self.offset,
                 byte_size,
                 self.buffer.length()
             );
-            let base = self.buffer.contents() as *const u8;
+            let base = self.buffer.contents().as_ptr() as *const u8;
             // SAFETY: bounds checked above; contents() returns valid CPU-accessible
             // pointer for StorageModeShared buffers.
             unsafe {
@@ -384,7 +397,7 @@ impl Array {
 
         if self.is_contiguous() {
             // Fast path: data is laid out contiguously, single memcpy.
-            let base = self.buffer.contents() as *const u8;
+            let base = self.buffer.contents().as_ptr() as *const u8;
             // SAFETY: caller guarantees bounds and GPU completion (see fn-level doc).
             unsafe {
                 let ptr = base.add(self.offset) as *const T;
@@ -402,7 +415,7 @@ impl Array {
     /// Iterates over all multi-dimensional indices, computes the physical
     /// element offset using `strides`, and reads each element individually.
     fn gather_strided<T: Clone>(&self, numel: usize) -> Vec<T> {
-        let base = self.buffer.contents() as *const u8;
+        let base = self.buffer.contents().as_ptr() as *const u8;
         let elem_size = std::mem::size_of::<T>();
         let ndim = self.shape.len();
         let mut result = Vec::with_capacity(numel);
@@ -436,7 +449,7 @@ impl Array {
     }
 
     /// Reference to the underlying Metal buffer.
-    pub fn metal_buffer(&self) -> &MTLBuffer {
+    pub fn metal_buffer(&self) -> &MtlBuffer {
         &self.buffer
     }
 
@@ -482,26 +495,33 @@ impl Array {
     /// The returned array is GPU-only (cannot be read by CPU).
     /// Use for static weights that are loaded once and only read by GPU kernels.
     /// This eliminates CPU page-table mapping overhead for GPU-only buffers.
-    pub fn to_private(&self, device: &metal::Device, queue: &metal::CommandQueue) -> Self {
+    pub fn to_private(&self, device: &ProtocolObject<dyn objc2_metal::MTLDevice>, queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>) -> Self {
+        use objc2_metal::MTLBlitCommandEncoder as _;
+        use objc2_metal::MTLCommandBuffer as _;
+        use objc2_metal::MTLCommandEncoder as _;
         let byte_size = self.byte_size();
-        let private_buf = device.new_buffer(
-            byte_size.max(4) as u64,
-            MTLResourceOptions::StorageModePrivate,
-        );
+        let private_buf = device
+            .newBufferWithLength_options(
+                byte_size.max(4),
+                MTLResourceOptions::StorageModePrivate,
+            )
+            .unwrap();
 
         // Blit copy from shared to private
-        let cb = queue.new_command_buffer();
-        let blit = cb.new_blit_command_encoder();
-        blit.copy_from_buffer(
-            self.metal_buffer(),
-            self.offset() as u64,
-            &private_buf,
-            0,
-            byte_size as u64,
-        );
-        blit.end_encoding();
+        let cb = queue.commandBuffer().unwrap();
+        let blit = cb.blitCommandEncoder().unwrap();
+        unsafe {
+            blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                self.metal_buffer(),
+                self.offset(),
+                &private_buf,
+                0,
+                byte_size,
+            )
+        };
+        blit.endEncoding();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
 
         Self::new(
             private_buf,
@@ -519,13 +539,13 @@ impl Array {
     pub fn to_bytes(&self) -> &[u8] {
         let len = self.byte_size();
         assert!(
-            self.offset + len <= self.buffer.length() as usize,
+            self.offset + len <= self.buffer.length(),
             "to_bytes: offset({}) + len({}) exceeds buffer({})",
             self.offset,
             len,
             self.buffer.length()
         );
-        let base = self.buffer.contents() as *const u8;
+        let base = self.buffer.contents().as_ptr() as *const u8;
         // SAFETY: bounds checked above; contents() returns valid CPU-accessible
         // pointer for StorageModeShared buffers.
         unsafe { std::slice::from_raw_parts(base.add(self.offset), len) }
@@ -535,7 +555,7 @@ impl Array {
     ///
     /// `bytes.len()` must equal the exact buffer size for the given shape and dtype.
     pub fn from_bytes(
-        device: &metal::Device,
+        device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
         bytes: &[u8],
         shape: Vec<usize>,
         dtype: DType,
@@ -553,12 +573,17 @@ impl Array {
             shape,
             dtype
         );
-        let ptr = bytes.as_ptr() as *const std::ffi::c_void;
-        let buffer = device.new_buffer_with_data(
-            ptr,
-            bytes.len() as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+        let ptr = NonNull::new(bytes.as_ptr() as *mut std::ffi::c_void).unwrap();
+        let buffer = unsafe {
+            device
+                .newBufferWithBytes_length_options(
+                    ptr,
+                    bytes.len(),
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .unwrap()
+        };
+
         let strides = compute_contiguous_strides(&shape);
         Self {
             buffer: ManuallyDrop::new(buffer),
@@ -944,9 +969,10 @@ mod tests {
         // Simulate a [3, 4] array with contiguous strides [4, 1]
         let arr = Array {
             buffer: ManuallyDrop::new(
-                metal::Device::system_default()
+                objc2_metal::MTLCreateSystemDefaultDevice()
                     .unwrap()
-                    .new_buffer(48, MTLResourceOptions::StorageModeShared),
+                    .newBufferWithLength_options(48, MTLResourceOptions::StorageModeShared)
+                    .unwrap(),
             ),
             shape: vec![3, 4],
             strides: vec![4, 1],
@@ -962,9 +988,10 @@ mod tests {
     fn test_transpose_3d() {
         let arr = Array {
             buffer: ManuallyDrop::new(
-                metal::Device::system_default()
+                objc2_metal::MTLCreateSystemDefaultDevice()
                     .unwrap()
-                    .new_buffer(96, MTLResourceOptions::StorageModeShared),
+                    .newBufferWithLength_options(96, MTLResourceOptions::StorageModeShared)
+                    .unwrap(),
             ),
             shape: vec![2, 3, 4],
             strides: vec![12, 4, 1],
@@ -980,9 +1007,10 @@ mod tests {
     fn test_transpose_same_dim_is_noop() {
         let arr = Array {
             buffer: ManuallyDrop::new(
-                metal::Device::system_default()
+                objc2_metal::MTLCreateSystemDefaultDevice()
                     .unwrap()
-                    .new_buffer(48, MTLResourceOptions::StorageModeShared),
+                    .newBufferWithLength_options(48, MTLResourceOptions::StorageModeShared)
+                    .unwrap(),
             ),
             shape: vec![3, 4],
             strides: vec![4, 1],
@@ -998,9 +1026,10 @@ mod tests {
     fn test_transpose_out_of_range() {
         let arr = Array {
             buffer: ManuallyDrop::new(
-                metal::Device::system_default()
+                objc2_metal::MTLCreateSystemDefaultDevice()
                     .unwrap()
-                    .new_buffer(48, MTLResourceOptions::StorageModeShared),
+                    .newBufferWithLength_options(48, MTLResourceOptions::StorageModeShared)
+                    .unwrap(),
             ),
             shape: vec![3, 4],
             strides: vec![4, 1],
@@ -1015,9 +1044,10 @@ mod tests {
     fn test_squeeze_dim() {
         let arr = Array {
             buffer: ManuallyDrop::new(
-                metal::Device::system_default()
+                objc2_metal::MTLCreateSystemDefaultDevice()
                     .unwrap()
-                    .new_buffer(48, MTLResourceOptions::StorageModeShared),
+                    .newBufferWithLength_options(48, MTLResourceOptions::StorageModeShared)
+                    .unwrap(),
             ),
             shape: vec![1, 3, 4],
             strides: vec![12, 4, 1],
@@ -1033,9 +1063,10 @@ mod tests {
     fn test_squeeze_dim_middle() {
         let arr = Array {
             buffer: ManuallyDrop::new(
-                metal::Device::system_default()
+                objc2_metal::MTLCreateSystemDefaultDevice()
                     .unwrap()
-                    .new_buffer(48, MTLResourceOptions::StorageModeShared),
+                    .newBufferWithLength_options(48, MTLResourceOptions::StorageModeShared)
+                    .unwrap(),
             ),
             shape: vec![3, 1, 4],
             strides: vec![4, 4, 1],
@@ -1051,9 +1082,10 @@ mod tests {
     fn test_squeeze_dim_non_one_fails() {
         let arr = Array {
             buffer: ManuallyDrop::new(
-                metal::Device::system_default()
+                objc2_metal::MTLCreateSystemDefaultDevice()
                     .unwrap()
-                    .new_buffer(48, MTLResourceOptions::StorageModeShared),
+                    .newBufferWithLength_options(48, MTLResourceOptions::StorageModeShared)
+                    .unwrap(),
             ),
             shape: vec![3, 4],
             strides: vec![4, 1],
@@ -1066,33 +1098,33 @@ mod tests {
     #[test]
     fn test_view_ops_zero_copy() {
         // All view operations should share the same buffer
-        let dev = metal::Device::system_default().unwrap();
+        let dev = objc2_metal::MTLCreateSystemDefaultDevice().unwrap();
         let arr = Array::from_slice(&dev, &[1.0f32; 12], vec![3, 4]);
 
         let reshaped = arr.reshape(vec![4, 3]).unwrap();
         assert_eq!(
-            arr.metal_buffer().gpu_address(),
-            reshaped.metal_buffer().gpu_address()
+            arr.metal_buffer().gpuAddress(),
+            reshaped.metal_buffer().gpuAddress()
         );
 
         let unsqueezed = arr.unsqueeze(0).unwrap();
         assert_eq!(
-            arr.metal_buffer().gpu_address(),
-            unsqueezed.metal_buffer().gpu_address()
+            arr.metal_buffer().gpuAddress(),
+            unsqueezed.metal_buffer().gpuAddress()
         );
         assert_eq!(unsqueezed.shape(), &[1, 3, 4]);
 
         let squeezed = unsqueezed.squeeze_dim(0).unwrap();
         assert_eq!(
-            arr.metal_buffer().gpu_address(),
-            squeezed.metal_buffer().gpu_address()
+            arr.metal_buffer().gpuAddress(),
+            squeezed.metal_buffer().gpuAddress()
         );
         assert_eq!(squeezed.shape(), &[3, 4]);
 
         let transposed = arr.transpose(0, 1).unwrap();
         assert_eq!(
-            arr.metal_buffer().gpu_address(),
-            transposed.metal_buffer().gpu_address()
+            arr.metal_buffer().gpuAddress(),
+            transposed.metal_buffer().gpuAddress()
         );
         assert_eq!(transposed.shape(), &[4, 3]);
     }

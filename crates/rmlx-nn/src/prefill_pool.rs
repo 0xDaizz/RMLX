@@ -4,9 +4,11 @@
 //! tensors in a single transformer layer. Every layer reuses the same buffers,
 //! eliminating per-dispatch allocation overhead during prefill.
 
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
-use rmlx_metal::metal;
+use rmlx_metal::{MtlBuffer};
 
 /// Slot indices for scratch buffers in the prefill pipeline.
 ///
@@ -40,7 +42,7 @@ pub const NUM_SLOTS: usize = 4;
 /// A pool of 4 pre-allocated Metal buffers that transformer layers reuse
 /// during prefill to avoid per-dispatch allocation.
 pub struct PrefillBufferPool {
-    slots: [metal::Buffer; NUM_SLOTS],
+    slots: [MtlBuffer; NUM_SLOTS],
     slot_sizes: [usize; NUM_SLOTS],
     dtype: DType,
 }
@@ -55,7 +57,7 @@ impl PrefillBufferPool {
     /// - D: `max(s * num_kv_heads * head_dim, s * i) * elem`  (v_batched, hidden)
     #[allow(clippy::too_many_arguments)]
     pub fn allocate(
-        device: &metal::DeviceRef,
+        device: &ProtocolObject<dyn MTLDevice>,
         max_seq_len: usize,
         hidden_size: usize,
         num_heads: usize,
@@ -77,13 +79,13 @@ impl PrefillBufferPool {
 
         let slot_sizes = [size_a, size_b, size_c, size_d];
 
-        let options = metal::MTLResourceOptions::StorageModeShared;
-        let slots = [
-            device.new_buffer(size_a.max(1) as u64, options),
-            device.new_buffer(size_b.max(1) as u64, options),
-            device.new_buffer(size_c.max(1) as u64, options),
-            device.new_buffer(size_d.max(1) as u64, options),
-        ];
+        let options = MTLResourceOptions::StorageModeShared;
+        let alloc = |sz: usize| {
+            device
+                .newBufferWithLength_options(sz.max(1), options)
+                .expect("failed to allocate prefill pool buffer")
+        };
+        let slots = [alloc(size_a), alloc(size_b), alloc(size_c), alloc(size_d)];
 
         Self {
             slots,
@@ -94,7 +96,7 @@ impl PrefillBufferPool {
 
     /// Get a buffer reference for the given slot.
     #[inline]
-    pub fn buffer(&self, slot: Slot) -> &metal::BufferRef {
+    pub fn buffer(&self, slot: Slot) -> &ProtocolObject<dyn MTLBuffer> {
         &self.slots[slot as usize]
     }
 

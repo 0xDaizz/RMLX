@@ -31,15 +31,17 @@
 //!
 //! // Batch 1: encode ops, then submit
 //! let enc = graph.encoder();
+//! let pass = ComputePass::new(&enc);
 //! // ... encode norm + projections ...
-//! enc.end_encoding();
+//! pass.end();
 //! graph.end_encoder();
 //! let _t1 = graph.submit_batch();
 //!
 //! // Batch 2: GPU FIFO ensures batch 1 completes first
 //! let enc = graph.encoder();
+//! let pass = ComputePass::new(&enc);
 //! // ... encode RoPE ...
-//! enc.end_encoding();
+//! pass.end();
 //! graph.end_encoder();
 //! let _t2 = graph.submit_batch();
 //!
@@ -422,7 +424,7 @@ mod tests {
 
     #[test]
     fn exec_graph_basic_lifecycle() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.expect("Metal device required");
+        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
         let queue = device.newCommandQueue().unwrap();
         let event = GpuEvent::new(&device);
         let graph = ExecGraph::new(&queue, &event, 32);
@@ -433,7 +435,7 @@ mod tests {
 
     #[test]
     fn exec_graph_submit_batch() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.expect("Metal device required");
+        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
         let queue = device.newCommandQueue().unwrap();
         let event = GpuEvent::new(&device);
         let mut graph = ExecGraph::new(&queue, &event, 32);
@@ -451,7 +453,7 @@ mod tests {
 
     #[test]
     fn exec_graph_chained_batches() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.expect("Metal device required");
+        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
         let queue = device.newCommandQueue().unwrap();
         let event = GpuEvent::new(&device);
         let mut graph = ExecGraph::new(&queue, &event, 32);
@@ -485,7 +487,7 @@ mod tests {
 
     #[test]
     fn exec_graph_sync_and_reset() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.expect("Metal device required");
+        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
         let queue = device.newCommandQueue().unwrap();
         let event = GpuEvent::new(&device);
         let mut graph = ExecGraph::new(&queue, &event, 32);
@@ -502,7 +504,7 @@ mod tests {
 
     #[test]
     fn exec_graph_sync_empty() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.expect("Metal device required");
+        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
         let queue = device.newCommandQueue().unwrap();
         let event = GpuEvent::new(&device);
         let mut graph = ExecGraph::new(&queue, &event, 32);
@@ -514,7 +516,7 @@ mod tests {
 
     #[test]
     fn submit_batch_no_pending_returns_previous_token() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.expect("Metal device required");
+        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
         let queue = device.newCommandQueue().unwrap();
         let event = GpuEvent::new(&device);
         let mut graph = ExecGraph::new(&queue, &event, 32);
@@ -543,7 +545,7 @@ mod tests {
 
     #[test]
     fn wait_for_empty_submit_completes_immediately() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.expect("Metal device required");
+        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
         let queue = device.newCommandQueue().unwrap();
         let event = GpuEvent::new(&device);
         let mut graph = ExecGraph::new(&queue, &event, 32);
@@ -559,7 +561,7 @@ mod tests {
 
     #[test]
     fn exec_graph_stats() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.expect("Metal device required");
+        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
         let queue = device.newCommandQueue().unwrap();
         let event = GpuEvent::new(&device);
         let mut graph = ExecGraph::new(&queue, &event, 32);
@@ -589,7 +591,7 @@ mod tests {
 
     #[test]
     fn chunked_pipeline_defers_submit() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.expect("Metal device required");
+        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
         let queue = device.newCommandQueue().unwrap();
         let event = GpuEvent::new(&device);
         // Set max_ops_per_batch to 20 — submit_batch() won't commit until 20 ops
@@ -623,7 +625,7 @@ mod tests {
 
     #[test]
     fn chunked_pipeline_force_submit_ignores_threshold() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.expect("Metal device required");
+        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
         let queue = device.newCommandQueue().unwrap();
         let event = GpuEvent::new(&device);
         let mut graph = ExecGraph::new(&queue, &event, 64).with_max_ops_per_batch(50);
@@ -647,7 +649,7 @@ mod tests {
 
     #[test]
     fn chunked_pipeline_sync_flushes_remaining() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.expect("Metal device required");
+        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
         let queue = device.newCommandQueue().unwrap();
         let event = GpuEvent::new(&device);
         let mut graph = ExecGraph::new(&queue, &event, 64).with_max_ops_per_batch(100);

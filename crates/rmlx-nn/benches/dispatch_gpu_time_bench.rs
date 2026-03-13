@@ -15,18 +15,21 @@
 
 #![allow(unexpected_cfgs)]
 
-#[macro_use]
-extern crate objc;
-
 use std::time::Instant;
 
-use metal::MTLSize;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{
+    MTLCommandBuffer as _, MTLCommandEncoder as _, MTLCommandQueue as _,
+    MTLComputeCommandEncoder as _, MTLDevice as _,
+};
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::KernelRegistry;
 use rmlx_core::ops;
 use rmlx_metal::device::GpuDevice;
-use rmlx_metal::ScopedPool;
+use rmlx_metal::types::{MtlBuffer, MtlPipeline};
+use rmlx_metal::{MTLResourceOptions, MTLSize, autoreleasepool};
+use std::ptr::NonNull;
 
 const N: usize = 3584;
 const K: usize = 3584;
@@ -79,15 +82,30 @@ fn rand_f16_bytes(numel: usize, seed: u64) -> Vec<u8> {
     f16_bytes
 }
 
-fn rand_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
+fn rand_array(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    shape: &[usize],
+    seed: u64,
+) -> Array {
     let numel: usize = shape.iter().product();
     let f16_bytes = rand_f16_bytes(numel, seed);
     Array::from_bytes(device, &f16_bytes, shape.to_vec(), DType::Float16)
 }
 
-fn make_u32_buf(device: &metal::Device, val: u32) -> metal::Buffer {
-    let opts = metal::MTLResourceOptions::StorageModeShared;
-    device.new_buffer_with_data(&val as *const u32 as *const _, 4, opts)
+fn make_u32_buf(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    val: u32,
+) -> MtlBuffer {
+    let opts = MTLResourceOptions::StorageModeShared;
+    unsafe {
+        device
+            .newBufferWithBytes_length_options(
+                NonNull::new(&val as *const u32 as *mut _).unwrap(),
+                4_usize,
+                opts,
+            )
+            .unwrap()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -96,20 +114,17 @@ fn make_u32_buf(device: &metal::Device, val: u32) -> metal::Buffer {
 
 /// Extract pure GPU execution time from a completed CommandBuffer.
 /// Uses Metal's GPUStartTime/GPUEndTime properties (seconds, f64).
-/// Only valid after wait_until_completed().
-fn gpu_time_us(cb: &metal::CommandBufferRef) -> f64 {
-    unsafe {
-        let obj: *const objc::runtime::Object = cb as *const metal::CommandBufferRef as *const _;
-        let start: f64 = msg_send![obj, GPUStartTime];
-        let end: f64 = msg_send![obj, GPUEndTime];
-        (end - start) * 1_000_000.0
-    }
+/// Only valid after waitUntilCompleted().
+fn gpu_time_us(cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>) -> f64 {
+    let start = cb.GPUStartTime();
+    let end = cb.GPUEndTime();
+    (end - start) * 1_000_000.0
 }
 
-fn assert_cb_ok(cb: &metal::CommandBufferRef, context: &str) {
+fn assert_cb_ok(cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>, context: &str) {
     let status = cb.status();
     assert!(
-        status != metal::MTLCommandBufferStatus::Error,
+        status != objc2_metal::MTLCommandBufferStatus::Error,
         "GPU command buffer error in {context}: status={status:?}"
     );
 }
@@ -144,35 +159,37 @@ fn p50(times: &mut [f64]) -> f64 {
 
 #[allow(clippy::too_many_arguments)]
 fn encode_gemm(
-    enc: &metal::ComputeCommandEncoderRef,
-    pipeline: &metal::ComputePipelineState,
+    enc: &ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
+    pipeline: &MtlPipeline,
     a: &Array,
     b: &Array,
     c: &Array,
-    m_buf: &metal::Buffer,
-    n_buf: &metal::Buffer,
-    k_buf: &metal::Buffer,
-    bsa_buf: &metal::Buffer,
-    bsb_buf: &metal::Buffer,
-    bsc_buf: &metal::Buffer,
-    swizzle_buf: &metal::Buffer,
+    m_buf: &MtlBuffer,
+    n_buf: &MtlBuffer,
+    k_buf: &MtlBuffer,
+    bsa_buf: &MtlBuffer,
+    bsb_buf: &MtlBuffer,
+    bsc_buf: &MtlBuffer,
+    swizzle_buf: &MtlBuffer,
     residual: &Array,
     grid: MTLSize,
     tg: MTLSize,
 ) {
-    enc.set_compute_pipeline_state(pipeline);
-    enc.set_buffer(0, Some(a.metal_buffer()), a.offset() as u64);
-    enc.set_buffer(1, Some(b.metal_buffer()), b.offset() as u64);
-    enc.set_buffer(2, Some(c.metal_buffer()), c.offset() as u64);
-    enc.set_buffer(3, Some(m_buf), 0);
-    enc.set_buffer(4, Some(n_buf), 0);
-    enc.set_buffer(5, Some(k_buf), 0);
-    enc.set_buffer(6, Some(bsa_buf), 0);
-    enc.set_buffer(7, Some(bsb_buf), 0);
-    enc.set_buffer(8, Some(bsc_buf), 0);
-    enc.set_buffer(9, Some(swizzle_buf), 0);
-    enc.set_buffer(10, Some(residual.metal_buffer()), residual.offset() as u64);
-    enc.dispatch_thread_groups(grid, tg);
+    enc.setComputePipelineState(pipeline);
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(a.metal_buffer()), a.offset(), 0);
+        enc.setBuffer_offset_atIndex(Some(b.metal_buffer()), b.offset(), 1);
+        enc.setBuffer_offset_atIndex(Some(c.metal_buffer()), c.offset(), 2);
+        enc.setBuffer_offset_atIndex(Some(m_buf), 0, 3);
+        enc.setBuffer_offset_atIndex(Some(n_buf), 0, 4);
+        enc.setBuffer_offset_atIndex(Some(k_buf), 0, 5);
+        enc.setBuffer_offset_atIndex(Some(bsa_buf), 0, 6);
+        enc.setBuffer_offset_atIndex(Some(bsb_buf), 0, 7);
+        enc.setBuffer_offset_atIndex(Some(bsc_buf), 0, 8);
+        enc.setBuffer_offset_atIndex(Some(swizzle_buf), 0, 9);
+        enc.setBuffer_offset_atIndex(Some(residual.metal_buffer()), residual.offset(), 10);
+    }
+    enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
 }
 
 // ---------------------------------------------------------------------------
@@ -190,7 +207,7 @@ fn main() {
     let registry = KernelRegistry::new(gpu);
     ops::register_all(&registry).expect("kernel registration failed");
     let device = registry.device().raw();
-    let queue = device.new_command_queue();
+    let queue = device.newCommandQueue().unwrap();
 
     println!(
         "Kernel: {} (BM={}, BN={}, BK={}, {} threads)",
@@ -210,25 +227,27 @@ fn main() {
     {
         // Warmup
         for _ in 0..WARMUP_ITERS {
-            let _pool = ScopedPool::new();
-            let cb = queue.new_command_buffer_with_unretained_references();
-            cb.commit();
-            cb.wait_until_completed();
+            autoreleasepool(|_| {
+                let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+                cb.commit();
+                cb.waitUntilCompleted();
+            });
         }
 
         let mut bare_wall = Vec::with_capacity(BENCH_ITERS);
         let mut bare_gpu = Vec::with_capacity(BENCH_ITERS);
         for _ in 0..BENCH_ITERS {
-            let _pool = ScopedPool::new();
-            let start = Instant::now();
-            let cb = queue.new_command_buffer_with_unretained_references();
-            cb.commit();
-            cb.wait_until_completed();
-            let wall_us = start.elapsed().as_secs_f64() * 1_000_000.0;
-            assert_cb_ok(cb, "bare CB");
-            let gpu_us = gpu_time_us(cb);
-            bare_wall.push(wall_us);
-            bare_gpu.push(gpu_us);
+            autoreleasepool(|_| {
+                let start = Instant::now();
+                let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+                cb.commit();
+                cb.waitUntilCompleted();
+                let wall_us = start.elapsed().as_secs_f64() * 1_000_000.0;
+                assert_cb_ok(&cb, "bare CB");
+                let gpu_us = gpu_time_us(&cb);
+                bare_wall.push(wall_us);
+                bare_gpu.push(gpu_us);
+            });
         }
 
         let wall_p50 = p50(&mut bare_wall);
@@ -275,70 +294,80 @@ fn main() {
 
         let grid_x = N.div_ceil(BN);
         let grid_y = m.div_ceil(BM);
-        let grid = MTLSize::new(grid_x as u64, grid_y as u64, 1);
-        let tg = MTLSize::new(THREADS, 1, 1);
+        let grid = MTLSize {
+            width: grid_x,
+            height: grid_y,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: THREADS as usize,
+            height: 1,
+            depth: 1,
+        };
 
         // Warmup
         for _ in 0..WARMUP_ITERS {
-            let _pool = ScopedPool::new();
-            let cb = queue.new_command_buffer_with_unretained_references();
-            let enc = cb.new_compute_command_encoder();
-            encode_gemm(
-                enc,
-                &pipeline,
-                &a,
-                &b,
-                &c,
-                &m_buf,
-                &n_buf,
-                &k_buf,
-                &bsa_buf,
-                &bsb_buf,
-                &bsc_buf,
-                &swizzle_buf,
-                &residual,
-                grid,
-                tg,
-            );
-            enc.end_encoding();
-            cb.commit();
-            cb.wait_until_completed();
-            assert_cb_ok(cb, "warmup");
+            autoreleasepool(|_| {
+                let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+                let enc = cb.computeCommandEncoder().unwrap();
+                encode_gemm(
+                    &enc,
+                    &pipeline,
+                    &a,
+                    &b,
+                    &c,
+                    &m_buf,
+                    &n_buf,
+                    &k_buf,
+                    &bsa_buf,
+                    &bsb_buf,
+                    &bsc_buf,
+                    &swizzle_buf,
+                    &residual,
+                    grid,
+                    tg,
+                );
+                enc.endEncoding();
+                cb.commit();
+                cb.waitUntilCompleted();
+                assert_cb_ok(&cb, "warmup");
+            });
         }
 
         // Bench
         let mut wall_times = Vec::with_capacity(BENCH_ITERS);
         let mut gpu_times = Vec::with_capacity(BENCH_ITERS);
         for _ in 0..BENCH_ITERS {
-            let _pool = ScopedPool::new();
-            let start = Instant::now();
-            let cb = queue.new_command_buffer_with_unretained_references();
-            let enc = cb.new_compute_command_encoder();
-            encode_gemm(
-                enc,
-                &pipeline,
-                &a,
-                &b,
-                &c,
-                &m_buf,
-                &n_buf,
-                &k_buf,
-                &bsa_buf,
-                &bsb_buf,
-                &bsc_buf,
-                &swizzle_buf,
-                &residual,
-                grid,
-                tg,
-            );
-            enc.end_encoding();
-            cb.commit();
-            cb.wait_until_completed();
-            let wall_us = start.elapsed().as_secs_f64() * 1_000_000.0;
-            assert_cb_ok(cb, &format!("bench M={m}"));
-            let gpu_us = gpu_time_us(cb);
-            wall_times.push(wall_us);
-            gpu_times.push(gpu_us);
+            autoreleasepool(|_| {
+                let start = Instant::now();
+                let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+                let enc = cb.computeCommandEncoder().unwrap();
+                encode_gemm(
+                    &enc,
+                    &pipeline,
+                    &a,
+                    &b,
+                    &c,
+                    &m_buf,
+                    &n_buf,
+                    &k_buf,
+                    &bsa_buf,
+                    &bsb_buf,
+                    &bsc_buf,
+                    &swizzle_buf,
+                    &residual,
+                    grid,
+                    tg,
+                );
+                enc.endEncoding();
+                cb.commit();
+                cb.waitUntilCompleted();
+                let wall_us = start.elapsed().as_secs_f64() * 1_000_000.0;
+                assert_cb_ok(&cb, &format!("bench M={m}"));
+                let gpu_us = gpu_time_us(&cb);
+                wall_times.push(wall_us);
+                gpu_times.push(gpu_us);
+            });
         }
 
         let wall_p50 = p50(&mut wall_times);

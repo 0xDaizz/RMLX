@@ -6,6 +6,8 @@
 use rmlx_core::array::Array;
 use rmlx_core::kernels::{KernelError, KernelRegistry};
 use rmlx_core::ops;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLCommandQueue};
 
 /// Layer Normalization configuration.
 pub struct LayerNormConfig {
@@ -97,7 +99,7 @@ impl LayerNorm {
         &self,
         input: &Array,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         if input.ndim() != 2 {
             return Err(KernelError::InvalidShape(format!(

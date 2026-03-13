@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
 
-use rmlx_metal::metal::Buffer as MetalBuffer;
+use objc2_metal::MTLBuffer as _;
+use rmlx_metal::MtlBuffer;
 
 use crate::zero_copy::page_size;
 
@@ -15,7 +16,7 @@ use crate::zero_copy::page_size;
 /// The cache is always accessed behind a `Mutex`, so interior fields use
 /// plain `usize` rather than `AtomicUsize` (A9).
 pub struct BufferCache {
-    bins: BTreeMap<usize, VecDeque<MetalBuffer>>,
+    bins: BTreeMap<usize, VecDeque<MtlBuffer>>,
     /// LRU list tracking insertion order: oldest at front, newest at back.
     /// Each entry is `(aligned_size, gpu_address)` identifying the buffer.
     lru: VecDeque<(usize, u64)>,
@@ -39,7 +40,7 @@ impl BufferCache {
     /// Returns the smallest cached buffer that fits, bounded by an upper limit
     /// of `min(2 * aligned_size, aligned_size + 2 * page_size)` to prevent
     /// a small request from consuming a disproportionately large buffer.
-    pub fn acquire(&mut self, size: usize) -> Option<MetalBuffer> {
+    pub fn acquire(&mut self, size: usize) -> Option<MtlBuffer> {
         let key = align_size(size);
         let ps = page_size();
         // Upper bound: at most 2x the request or request + 2 pages, whichever is smaller.
@@ -56,10 +57,10 @@ impl BufferCache {
                 // Validate the buffer is large enough to satisfy the request.
                 // This guards against cache poisoning from zero-size or
                 // undersized buffers that were cached under an aligned key.
-                if (buf.length() as usize) < size {
+                if buf.length() < size {
                     // Discard the undersized buffer rather than returning it.
                     self.cache_size = self.cache_size.saturating_sub(k);
-                    let addr = buf.gpu_address();
+                    let addr = buf.gpuAddress();
                     self.lru_remove(k, addr);
                     if let Some(deque) = self.bins.get(&k) {
                         if deque.is_empty() {
@@ -71,7 +72,7 @@ impl BufferCache {
                 }
                 self.cache_size = self.cache_size.saturating_sub(k);
                 // Remove this buffer from the LRU list by gpu_address.
-                let addr = buf.gpu_address();
+                let addr = buf.gpuAddress();
                 self.lru_remove(k, addr);
                 if let Some(deque) = self.bins.get(&k) {
                     if deque.is_empty() {
@@ -85,8 +86,8 @@ impl BufferCache {
     }
 
     /// Return a buffer to the cache for future reuse.
-    pub fn release(&mut self, buffer: MetalBuffer) {
-        let size = buffer.length() as usize;
+    pub fn release(&mut self, buffer: MtlBuffer) {
+        let size = buffer.length();
 
         // Don't cache zero-size buffers — they would poison size bins.
         if size == 0 {
@@ -109,7 +110,7 @@ impl BufferCache {
 
         self.cache_size += key;
         // Track in LRU (newest at back).
-        let addr = buffer.gpu_address();
+        let addr = buffer.gpuAddress();
         self.lru.push_back((key, addr));
         self.bins.entry(key).or_default().push_back(buffer);
     }
@@ -151,7 +152,7 @@ impl BufferCache {
                 // Remove the corresponding entry from the bin.
                 let mut removed = false;
                 if let Some(deque) = self.bins.get_mut(&key) {
-                    if let Some(pos) = deque.iter().position(|b| b.gpu_address() == addr) {
+                    if let Some(pos) = deque.iter().position(|b| b.gpuAddress() == addr) {
                         deque.remove(pos);
                         removed = true;
                     }
@@ -198,7 +199,7 @@ fn align_size(size: usize) -> usize {
 mod tests {
     use super::*;
     use rmlx_metal::device::GpuDevice;
-    use rmlx_metal::metal::MTLResourceOptions;
+    use rmlx_metal::MTLResourceOptions;
 
     #[test]
     fn test_release_rejects_zero_size_guard() {
@@ -228,7 +229,7 @@ mod tests {
         // Insert a small buffer (e.g., 4 bytes) into the cache.
         // align_size(4) == 16, so it will land in the 16-byte bin.
         let buf = device.new_buffer(4, MTLResourceOptions::StorageModeShared);
-        let actual_len = buf.length() as usize;
+        let actual_len = buf.length();
         cache.release(buf);
 
         // If the device actually allocated >= 16 bytes (Metal may round up),
@@ -266,7 +267,7 @@ mod tests {
         assert!(result.is_some(), "should acquire a cached 1024-byte buffer");
         let acquired = result.unwrap();
         assert!(
-            acquired.length() as usize >= 1024,
+            acquired.length() >= 1024,
             "acquired buffer length {} must be >= 1024",
             acquired.length()
         );

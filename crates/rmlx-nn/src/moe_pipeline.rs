@@ -31,6 +31,11 @@ use rmlx_metal::event::GpuEvent;
 
 use crate::expert_group::ExpertGroup;
 use crate::moe::Expert;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLCommandBuffer as _;
+use objc2_metal::MTLComputePipelineState as _;
+use objc2_metal::{MTLCommandQueue, MTLDevice};
+use rmlx_metal::{ComputePass, MTLSize};
 
 /// Per-expert dispatch entry: `(expert_idx, expert_input_array, dispatch_list)`.
 /// The dispatch list maps each row in the expert input to `(token_idx, weight)`.
@@ -83,7 +88,7 @@ impl MoePipeline {
     }
 
     /// Create a pipeline with default configuration.
-    pub fn with_defaults(device: &metal::Device) -> Self {
+    pub fn with_defaults(device: &ProtocolObject<dyn MTLDevice>) -> Self {
         let event = Arc::new(GpuEvent::new(device));
         Self::new(event, MoePipelineConfig::default())
     }
@@ -129,7 +134,7 @@ impl MoePipeline {
         shared_expert: &Expert,
         routed_expert_fn: impl FnOnce(&Array) -> Result<Array, KernelError>,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         // Reset event for fresh pipeline run.
         self.event.reset();
@@ -140,8 +145,8 @@ impl MoePipeline {
 
         // Signal that shared expert is done.
         let v_shared = self.event.next_value();
-        let cb_shared = queue.new_command_buffer();
-        self.event.signal_from_command_buffer(cb_shared, v_shared);
+        let cb_shared = queue.commandBuffer().unwrap();
+self.event.signal_from_command_buffer(&cb_shared, v_shared);
         cb_shared.commit();
 
         // -- Stage 2: Routed expert computation --
@@ -150,8 +155,8 @@ impl MoePipeline {
 
         // Signal that routed experts are done.
         let v_routed = self.event.next_value();
-        let cb_routed = queue.new_command_buffer();
-        self.event.signal_from_command_buffer(cb_routed, v_routed);
+        let cb_routed = queue.commandBuffer().unwrap();
+self.event.signal_from_command_buffer(&cb_routed, v_routed);
         cb_routed.commit();
 
         // -- Stage 3: Combine shared + routed --
@@ -159,8 +164,8 @@ impl MoePipeline {
 
         // Final signal.
         let v_final = self.event.next_value();
-        let cb_final = queue.new_command_buffer();
-        self.event.signal_from_command_buffer(cb_final, v_final);
+        let cb_final = queue.commandBuffer().unwrap();
+self.event.signal_from_command_buffer(&cb_final, v_final);
         cb_final.commit();
 
         // Single CPU wait at the end of the entire pipeline.
@@ -193,7 +198,7 @@ impl MoePipeline {
         top_k: usize,
         local_expert_range: (usize, usize),
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         let seq_len = x.shape()[0];
         let hidden_dim = x.shape()[1];
@@ -270,8 +275,8 @@ impl MoePipeline {
 
             // Signal that dispatch/gather for this batch is done.
             let v_dispatch = self.event.next_value();
-            let cb_sig = queue.new_command_buffer();
-            self.event.signal_from_command_buffer(cb_sig, v_dispatch);
+            let cb_sig = queue.commandBuffer().unwrap();
+self.event.signal_from_command_buffer(&cb_sig, v_dispatch);
             cb_sig.commit();
 
             // Compute: run grouped forward on this batch's experts.
@@ -296,8 +301,8 @@ impl MoePipeline {
 
             // Signal that this batch's combine is done.
             let v_combine = self.event.next_value();
-            let cb_combine = queue.new_command_buffer();
-            self.event.signal_from_command_buffer(cb_combine, v_combine);
+            let cb_combine = queue.commandBuffer().unwrap();
+self.event.signal_from_command_buffer(&cb_combine, v_combine);
             cb_combine.commit();
         }
 
@@ -319,7 +324,7 @@ impl MoePipeline {
     /// - If num_tbo_batches > 1: run TBO
     /// - Otherwise: fall back to sequential forward
     ///
-    /// Zero `cb.wait_until_completed()` in the pipeline body.
+    /// Zero `cb.waitUntilCompleted()` in the pipeline body.
     /// Single `GpuEvent::cpu_wait()` at the very end.
     #[allow(clippy::too_many_arguments)]
     pub fn forward_overlapped(
@@ -332,7 +337,7 @@ impl MoePipeline {
         top_k: usize,
         local_expert_range: (usize, usize),
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         // Reset event for fresh pipeline run.
         self.event.reset();
@@ -419,7 +424,7 @@ impl MoePipeline {
         top_k: usize,
         local_expert_range: (usize, usize),
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         self.event.reset();
         self.event.reset_cancel();
@@ -428,8 +433,8 @@ impl MoePipeline {
         let shared_out = shared_expert.forward(x, registry, queue)?;
 
         let v_shared = self.event.next_value();
-        let cb_shared = queue.new_command_buffer();
-        self.event.signal_from_command_buffer(cb_shared, v_shared);
+        let cb_shared = queue.commandBuffer().unwrap();
+self.event.signal_from_command_buffer(&cb_shared, v_shared);
         cb_shared.commit();
 
         // -- Routed expert computation --
@@ -444,16 +449,16 @@ impl MoePipeline {
         )?;
 
         let v_routed = self.event.next_value();
-        let cb_routed = queue.new_command_buffer();
-        self.event.signal_from_command_buffer(cb_routed, v_routed);
+        let cb_routed = queue.commandBuffer().unwrap();
+self.event.signal_from_command_buffer(&cb_routed, v_routed);
         cb_routed.commit();
 
         // -- Combine --
         let output = ops::binary::add(registry, &shared_out, &routed_out, queue)?;
 
         let v_final = self.event.next_value();
-        let cb_final = queue.new_command_buffer();
-        self.event.signal_from_command_buffer(cb_final, v_final);
+        let cb_final = queue.commandBuffer().unwrap();
+self.event.signal_from_command_buffer(&cb_final, v_final);
         cb_final.commit();
 
         self.event
@@ -474,7 +479,7 @@ impl MoePipeline {
         top_k: usize,
         local_expert_range: (usize, usize),
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         self.event.reset();
         self.event.reset_cancel();
@@ -483,8 +488,8 @@ impl MoePipeline {
         let shared_out = shared_expert.forward(x, registry, queue)?;
 
         let v_shared = self.event.next_value();
-        let cb_shared = queue.new_command_buffer();
-        self.event.signal_from_command_buffer(cb_shared, v_shared);
+        let cb_shared = queue.commandBuffer().unwrap();
+self.event.signal_from_command_buffer(&cb_shared, v_shared);
         cb_shared.commit();
 
         // -- TBO pipeline for routed experts --
@@ -502,8 +507,8 @@ impl MoePipeline {
         let output = ops::binary::add(registry, &shared_out, &routed_out, queue)?;
 
         let v_final = self.event.next_value();
-        let cb_final = queue.new_command_buffer();
-        self.event.signal_from_command_buffer(cb_final, v_final);
+        let cb_final = queue.commandBuffer().unwrap();
+self.event.signal_from_command_buffer(&cb_final, v_final);
         cb_final.commit();
 
         self.event
@@ -524,7 +529,7 @@ impl MoePipeline {
         top_k: usize,
         local_expert_range: (usize, usize),
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         let routed_out = self.run_routed_experts(
             x,
@@ -545,8 +550,8 @@ impl MoePipeline {
 
         // Final event signal + CPU wait for API consistency.
         let v_final = self.event.next_value();
-        let cb_final = queue.new_command_buffer();
-        self.event.signal_from_command_buffer(cb_final, v_final);
+        let cb_final = queue.commandBuffer().unwrap();
+self.event.signal_from_command_buffer(&cb_final, v_final);
         cb_final.commit();
 
         self.event
@@ -568,7 +573,7 @@ impl MoePipeline {
         top_k: usize,
         local_expert_range: (usize, usize),
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         let seq_len = x.shape()[0];
         let hidden_dim = x.shape()[1];
@@ -650,9 +655,9 @@ fn gather_tokens(
     dispatch: &[(usize, f32)],
     hidden_dim: usize,
     elem_size: usize,
-    dev: &metal::Device,
+    dev: &ProtocolObject<dyn MTLDevice>,
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     let batch_size = dispatch.len();
 
@@ -666,30 +671,27 @@ fn gather_tokens(
     let batch_buf = Array::zeros(dev, &[batch_size, hidden_dim], x.dtype());
     let copy_kernel = copy_kernel_name(x.dtype())?;
     let pipeline = registry.get_pipeline(copy_kernel, x.dtype())?;
-    let cb = queue.new_command_buffer();
+    let cb = queue.commandBuffer().unwrap();
 
     for (i, &(tok, _)) in dispatch.iter().enumerate() {
         let src_offset = x.offset() + tok * hidden_dim * elem_size;
         let dst_offset = i * hidden_dim * elem_size;
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pipeline);
-        enc.set_buffer(0, Some(x.metal_buffer()), src_offset as u64);
-        enc.set_buffer(1, Some(batch_buf.metal_buffer()), dst_offset as u64);
-        let grid = metal::MTLSize::new(hidden_dim as u64, 1, 1);
-        let tg = metal::MTLSize::new(
-            std::cmp::min(
-                pipeline.max_total_threads_per_threadgroup(),
-                hidden_dim as u64,
-            ),
-            1,
-            1,
-        );
+        let raw_enc = cb.computeCommandEncoder().unwrap();
+        let enc = ComputePass::new(&raw_enc);
+        enc.set_pipeline(&pipeline);
+        enc.set_buffer(0, Some(x.metal_buffer()), src_offset);
+        enc.set_buffer(1, Some(batch_buf.metal_buffer()), dst_offset);
+        let grid = MTLSize { width: hidden_dim, height: 1, depth: 1 };
+        let tg = MTLSize { width: std::cmp::min(
+                pipeline.maxTotalThreadsPerThreadgroup(),
+                hidden_dim,
+            ) as usize, height: 1, depth: 1 };
         enc.dispatch_threads(grid, tg);
-        enc.end_encoding();
+        enc.end();
     }
 
     cb.commit();
-    cb.wait_until_completed();
+    cb.waitUntilCompleted();
     Ok(batch_buf)
 }
 
@@ -704,9 +706,9 @@ fn scatter_add_weighted(
     output: &Array,
     hidden_dim: usize,
     elem_size: usize,
-    dev: &metal::Device,
+    dev: &ProtocolObject<dyn MTLDevice>,
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
 ) -> Result<(), KernelError> {
     let copy_kernel = copy_kernel_name(output.dtype())?;
     let pipeline = registry.get_pipeline(copy_kernel, output.dtype())?;
@@ -729,24 +731,21 @@ fn scatter_add_weighted(
 
             let summed = ops::binary::add(registry, &dst_view, &scaled, queue)?;
 
-            let cb = queue.new_command_buffer();
-            let enc = cb.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&pipeline);
-            enc.set_buffer(0, Some(summed.metal_buffer()), summed.offset() as u64);
-            enc.set_buffer(1, Some(output.metal_buffer()), dst_offset as u64);
-            let grid = metal::MTLSize::new(hidden_dim as u64, 1, 1);
-            let tg = metal::MTLSize::new(
-                std::cmp::min(
-                    pipeline.max_total_threads_per_threadgroup(),
-                    hidden_dim as u64,
-                ),
-                1,
-                1,
-            );
+            let cb = queue.commandBuffer().unwrap();
+            let raw_enc = cb.computeCommandEncoder().unwrap();
+            let enc = ComputePass::new(&raw_enc);
+            enc.set_pipeline(&pipeline);
+            enc.set_buffer(0, Some(summed.metal_buffer()), summed.offset());
+            enc.set_buffer(1, Some(output.metal_buffer()), dst_offset);
+            let grid = MTLSize { width: hidden_dim, height: 1, depth: 1 };
+            let tg = MTLSize { width: std::cmp::min(
+                    pipeline.maxTotalThreadsPerThreadgroup(),
+                    hidden_dim,
+                ) as usize, height: 1, depth: 1 };
             enc.dispatch_threads(grid, tg);
-            enc.end_encoding();
+            enc.end();
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
         }
     }
 
@@ -773,10 +772,10 @@ mod tests {
     use crate::moe::Expert;
 
     /// Create a test `KernelRegistry` with all kernels registered.
-    fn test_registry() -> (metal::Device, metal::CommandQueue, KernelRegistry) {
-        let device = metal::Device::system_default().expect("Metal device required");
-        let queue = device.new_command_queue();
+    fn test_registry() -> (rmlx_metal::MtlDevice, rmlx_metal::MtlQueue, KernelRegistry) {
+        let device = objc2_metal::MTLCreateSystemDefaultDevice().expect("Metal device required");
         let gpu = rmlx_metal::device::GpuDevice::system_default().expect("GPU device required");
+        let queue = gpu.new_command_queue();
         let registry = KernelRegistry::new(gpu);
         rmlx_core::ops::register_all(&registry).expect("register kernels");
         (device, queue, registry)
@@ -784,7 +783,7 @@ mod tests {
 
     /// Create a test expert with known weight values.
     fn make_expert(
-        device: &metal::Device,
+        device: &ProtocolObject<dyn MTLDevice>,
         hidden_dim: usize,
         intermediate_dim: usize,
         val: f32,
@@ -845,7 +844,7 @@ mod tests {
 
     #[test]
     fn test_pipeline_creation() {
-        let device = metal::Device::system_default().expect("Metal device required");
+        let device = objc2_metal::MTLCreateSystemDefaultDevice().expect("Metal device required");
         let pipeline = MoePipeline::with_defaults(&device);
         assert_eq!(pipeline.num_batches(), 1);
         assert!(pipeline.sbo_enabled());
@@ -853,7 +852,7 @@ mod tests {
 
     #[test]
     fn test_pipeline_custom_config() {
-        let device = metal::Device::system_default().expect("Metal device required");
+        let device = objc2_metal::MTLCreateSystemDefaultDevice().expect("Metal device required");
         let event = Arc::new(GpuEvent::new(&device));
         let config = MoePipelineConfig {
             num_tbo_batches: 4,

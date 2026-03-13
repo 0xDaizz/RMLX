@@ -11,7 +11,14 @@
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
-use metal::MTLSize;
+use rmlx_metal::MTLSize;
+use rmlx_metal::ComputePass;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLComputePipelineState as _;
+use objc2_metal::MTLCommandBuffer as _;
+use objc2_metal::MTLCommandQueue as _;
+use rmlx_metal::MTLResourceOptions;
+use objc2_metal::MTLDevice as _;
 
 // ---------------------------------------------------------------------------
 // Metal shader source
@@ -155,7 +162,7 @@ fn dispatch_unary(
     registry: &KernelRegistry,
     input: &Array,
     op_name: &str,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     let input_c = super::make_contiguous(input, registry, queue)?;
     let input = input_c.as_ref().unwrap_or(input);
@@ -177,26 +184,22 @@ fn dispatch_unary(
     let out = Array::zeros(dev, input.shape(), input.dtype());
 
     let numel = input.numel();
-    let numel_buf = dev.new_buffer_with_data(
-        &(numel as u32) as *const u32 as *const std::ffi::c_void,
-        4,
-        metal::MTLResourceOptions::StorageModeShared,
-    );
+    let numel_buf = unsafe { dev.newBufferWithBytes_length_options(std::ptr::NonNull::new(&(numel as u32) as *const u32 as *const std::ffi::c_void as *mut std::ffi::c_void).unwrap(), 4_usize, MTLResourceOptions::StorageModeShared).unwrap() };
 
-    let cb = queue.new_command_buffer();
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
+    let cb = queue.commandBuffer().unwrap();
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
+    enc.set_buffer(0, Some(input.metal_buffer()), input.offset());
     enc.set_buffer(1, Some(out.metal_buffer()), 0);
     enc.set_buffer(2, Some(&numel_buf), 0);
-
     let n_threads = numel.div_ceil(elems_per_thread);
-    let tg_size = std::cmp::min(256u64, pipeline.max_total_threads_per_threadgroup());
-    let n_groups = (n_threads as u64).div_ceil(tg_size);
+    let tg_size = std::cmp::min(256usize, pipeline.maxTotalThreadsPerThreadgroup());
+    let n_groups = (n_threads as usize).div_ceil(tg_size);
 
-    enc.dispatch_thread_groups(MTLSize::new(n_groups, 1, 1), MTLSize::new(tg_size, 1, 1));
-    enc.end_encoding();
-    super::commit_with_mode(cb, super::ExecMode::Sync);
+    enc.dispatch_threadgroups(MTLSize { width: n_groups, height: 1, depth: 1 }, MTLSize { width: tg_size, height: 1, depth: 1 });
+    enc.end();
+    super::commit_with_mode(&cb, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -209,7 +212,7 @@ fn dispatch_unary(
 pub fn exp(
     registry: &KernelRegistry,
     input: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     dispatch_unary(registry, input, "exp", queue)
 }
@@ -218,7 +221,7 @@ pub fn exp(
 pub fn log(
     registry: &KernelRegistry,
     input: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     dispatch_unary(registry, input, "log", queue)
 }
@@ -227,7 +230,7 @@ pub fn log(
 pub fn sqrt(
     registry: &KernelRegistry,
     input: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     dispatch_unary(registry, input, "sqrt", queue)
 }
@@ -236,7 +239,7 @@ pub fn sqrt(
 pub fn rsqrt(
     registry: &KernelRegistry,
     input: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     dispatch_unary(registry, input, "rsqrt", queue)
 }
@@ -245,7 +248,7 @@ pub fn rsqrt(
 pub fn sigmoid(
     registry: &KernelRegistry,
     input: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     dispatch_unary(registry, input, "sigmoid", queue)
 }
@@ -254,7 +257,7 @@ pub fn sigmoid(
 pub fn abs(
     registry: &KernelRegistry,
     input: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     dispatch_unary(registry, input, "abs", queue)
 }
@@ -263,7 +266,7 @@ pub fn abs(
 pub fn neg(
     registry: &KernelRegistry,
     input: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     dispatch_unary(registry, input, "neg", queue)
 }
@@ -272,7 +275,7 @@ pub fn neg(
 pub fn tanh_op(
     registry: &KernelRegistry,
     input: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     dispatch_unary(registry, input, "tanh", queue)
 }

@@ -51,11 +51,7 @@ impl GpuFence {
     /// The GPU will set the shared event to `value` once all preceding
     /// commands in this command buffer have finished executing.
     pub fn signal(&self, command_buffer: &ProtocolObject<dyn MTLCommandBuffer>, value: u64) {
-        // MTLSharedEvent extends MTLEvent; upcast via pointer cast.
-        let event: &ProtocolObject<dyn MTLEvent> = unsafe {
-            &*(&*self.event as *const ProtocolObject<dyn MTLSharedEvent>
-                as *const ProtocolObject<dyn MTLEvent>)
-        };
+        let event: &ProtocolObject<dyn MTLEvent> = ProtocolObject::from_ref(&*self.event);
         command_buffer.encodeSignalEvent_value(event, value);
     }
 
@@ -64,10 +60,7 @@ impl GpuFence {
     /// The GPU will stall this command buffer until the event's signaled
     /// value is >= `value`.
     pub fn wait(&self, command_buffer: &ProtocolObject<dyn MTLCommandBuffer>, value: u64) {
-        let event: &ProtocolObject<dyn MTLEvent> = unsafe {
-            &*(&*self.event as *const ProtocolObject<dyn MTLSharedEvent>
-                as *const ProtocolObject<dyn MTLEvent>)
-        };
+        let event: &ProtocolObject<dyn MTLEvent> = ProtocolObject::from_ref(&*self.event);
         command_buffer.encodeWaitForEvent_value(event, value);
     }
 
@@ -115,7 +108,7 @@ impl GpuFence {
     /// Reset the fence to value 0 (for reuse across pipeline iterations).
     pub fn reset(&self) {
         self.counter.store(0, Ordering::SeqCst);
-        unsafe { self.event.setSignaledValue(0) };
+        self.event.setSignaledValue(0);
     }
 
     /// Access the underlying `MTLSharedEvent`.
@@ -158,7 +151,7 @@ mod tests {
 
     #[test]
     fn test_fence_counter_monotonic() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
+        let device = MTLCreateSystemDefaultDevice().unwrap();
         let fence = GpuFence::new(&device);
 
         assert_eq!(fence.current_value(), 0);
@@ -170,7 +163,7 @@ mod tests {
 
     #[test]
     fn test_fence_reset() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
+        let device = MTLCreateSystemDefaultDevice().unwrap();
         let fence = GpuFence::new(&device);
 
         fence.next_value();
@@ -184,7 +177,7 @@ mod tests {
 
     #[test]
     fn test_fence_signal_wait_roundtrip() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
+        let device = MTLCreateSystemDefaultDevice().unwrap();
         let queue = device.newCommandQueue().unwrap();
         let fence = GpuFence::new(&device);
 
@@ -204,7 +197,7 @@ mod tests {
 
     #[test]
     fn test_fence_cpu_wait_already_signaled() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
+        let device = MTLCreateSystemDefaultDevice().unwrap();
         let fence = GpuFence::new(&device);
 
         // Value 0 is the initial signaled value, so waiting for 0 should return immediately.

@@ -12,9 +12,7 @@
 
 use std::collections::HashMap;
 
-use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2::Message;
 use objc2_foundation::NSString;
 use objc2_metal::*;
 
@@ -22,15 +20,6 @@ use crate::command::CommandBufferManager;
 use crate::fence::GpuFence;
 use crate::types::*;
 use crate::MetalError;
-
-/// Retain an unsized protocol-object reference into an owned `Retained`.
-fn retain_proto<T: ?Sized + Message>(r: &T) -> Retained<T> {
-    let ptr = r as *const T as *mut T;
-    unsafe {
-        objc2::ffi::objc_retain(ptr as *mut _);
-        Retained::from_raw(ptr).unwrap_unchecked()
-    }
-}
 
 /// Well-known stream IDs.
 pub const STREAM_DEFAULT: u32 = 0;
@@ -285,7 +274,7 @@ mod tests {
 
     #[test]
     fn test_predefined_streams_created() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
+        let device = MTLCreateSystemDefaultDevice().unwrap();
         let mgr = StreamManager::new(&device);
 
         assert!(mgr.has_stream(STREAM_DEFAULT));
@@ -296,7 +285,7 @@ mod tests {
 
     #[test]
     fn test_get_or_create_new_stream() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
+        let device = MTLCreateSystemDefaultDevice().unwrap();
         let mut mgr = StreamManager::new(&device);
 
         assert!(!mgr.has_stream(42));
@@ -307,7 +296,7 @@ mod tests {
 
     #[test]
     fn test_get_or_create_existing_stream() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
+        let device = MTLCreateSystemDefaultDevice().unwrap();
         let mut mgr = StreamManager::new(&device);
 
         let _ = mgr.get_or_create_stream(STREAM_COMPUTE);
@@ -317,7 +306,7 @@ mod tests {
 
     #[test]
     fn test_command_buffer_creation() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
+        let device = MTLCreateSystemDefaultDevice().unwrap();
         let mgr = StreamManager::new(&device);
 
         // Should not fail for predefined streams.
@@ -328,7 +317,7 @@ mod tests {
 
     #[test]
     fn test_synchronize_returns_monotonic_values() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
+        let device = MTLCreateSystemDefaultDevice().unwrap();
         let mgr = StreamManager::new(&device);
 
         let cb1 = mgr.compute_command_buffer().unwrap();
@@ -345,7 +334,7 @@ mod tests {
 
     #[test]
     fn test_convenience_sync_methods() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
+        let device = MTLCreateSystemDefaultDevice().unwrap();
         let mgr = StreamManager::new(&device);
 
         let compute_cb = mgr.compute_command_buffer().unwrap();
@@ -357,7 +346,7 @@ mod tests {
 
     #[test]
     fn test_compute_copy_queue_independence() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
+        let device = MTLCreateSystemDefaultDevice().unwrap();
         let mgr = StreamManager::new(&device);
 
         // Compute and copy queues should be distinct objects.
@@ -383,7 +372,7 @@ mod tests {
 
     #[test]
     fn test_stream_sync_signal_wait() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
+        let device = MTLCreateSystemDefaultDevice().unwrap();
         let mgr = StreamManager::new(&device);
         let sync = super::StreamSync::new(&device);
 
@@ -422,7 +411,7 @@ mod tests {
 
     #[test]
     fn test_command_buffer_nonexistent_stream_fails() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
+        let device = MTLCreateSystemDefaultDevice().unwrap();
         let mgr = StreamManager::new(&device);
 
         // Stream 999 was never created.
@@ -432,7 +421,7 @@ mod tests {
 
     #[test]
     fn test_queue_returns_none_for_missing_stream() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
+        let device = MTLCreateSystemDefaultDevice().unwrap();
         let mgr = StreamManager::new(&device);
 
         assert!(mgr.queue(999).is_none());
@@ -448,7 +437,7 @@ mod tests {
 
     #[test]
     fn test_create_buffer_manager_success() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
+        let device = MTLCreateSystemDefaultDevice().unwrap();
         let mgr = StreamManager::new(&device);
 
         let _bm = mgr.create_buffer_manager(STREAM_COMPUTE).unwrap();
@@ -457,7 +446,7 @@ mod tests {
 
     #[test]
     fn test_create_buffer_manager_nonexistent_stream() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
+        let device = MTLCreateSystemDefaultDevice().unwrap();
         let mgr = StreamManager::new(&device);
 
         let result = mgr.create_buffer_manager(999);
@@ -466,7 +455,7 @@ mod tests {
 
     #[test]
     fn test_sync_fence_accessible() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
+        let device = MTLCreateSystemDefaultDevice().unwrap();
         let mgr = StreamManager::new(&device);
 
         let fence = mgr.sync_fence();
@@ -476,7 +465,7 @@ mod tests {
 
     #[test]
     fn test_stream_sync_fence_accessor() {
-        let device = unsafe { MTLCreateSystemDefaultDevice() }.unwrap();
+        let device = MTLCreateSystemDefaultDevice().unwrap();
         let sync = StreamSync::new(&device);
         let fence = sync.fence();
         assert_eq!(fence.signaled_value(), 0);

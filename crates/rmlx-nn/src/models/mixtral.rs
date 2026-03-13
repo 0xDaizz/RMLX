@@ -14,6 +14,8 @@ use crate::linear::Linear;
 use crate::moe::{MoeConfig, MoeLayer};
 use crate::sliding_window::{SlidingWindowAttention, SlidingWindowAttentionConfig};
 use crate::transformer::{FeedForward, FeedForwardType, TransformerConfig};
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLCommandQueue};
 
 /// Mixtral 8x7B configuration preset.
 pub fn mixtral_8x7b() -> TransformerConfig {
@@ -140,7 +142,7 @@ impl MixtralBlock {
         sin_freqs: Option<&Array>,
         cache: Option<&mut LayerKvCache>,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         let norm1_w = self.norm1_weight.as_ref().ok_or_else(|| {
             KernelError::InvalidShape("MixtralBlock: norm1_weight not loaded".into())
@@ -259,7 +261,7 @@ impl MixtralModel {
         _mask: Option<&Array>,
         mut cache: Option<&mut Vec<LayerKvCache>>,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         let embedding = self.embedding.as_ref().ok_or_else(|| {
             KernelError::InvalidShape("MixtralModel: embedding not loaded".into())
