@@ -1,3 +1,7 @@
+//! ⚠️ NON-PRODUCTION PATH — Q4 QMM low-M kernel tuning with direct kernel encoding.
+//! Per-op sync CB overhead included. Development/tuning only.
+//! For production throughput, use e2e_prefill_bench (prefill) or pipeline_bench (decode).
+//!
 //! Low-M Q4 QMM Benchmark — comprehensive kernel comparison for MoE expert inference.
 //!
 //! Tests all available Q4 QMM kernel approaches at low-M (M=1,4,8,16,32)

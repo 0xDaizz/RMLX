@@ -1,3 +1,7 @@
+//! ⚠️ NON-PRODUCTION PATH — individual op benchmarks with per-op sync CB.
+//! Each op creates+commits+waits its own CB; overhead not representative of production.
+//! For production throughput, use e2e_prefill_bench (prefill) or pipeline_bench (decode).
+//!
 //! GPU Ops Performance Benchmark
 //!
 //! Benchmarks all major RMLX GPU operations with sizes matching MLX benchmarks

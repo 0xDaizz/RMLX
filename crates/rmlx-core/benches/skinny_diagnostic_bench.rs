@@ -1,3 +1,7 @@
+//! ⚠️ NON-PRODUCTION PATH — skinny GEMM diagnostic with direct kernel encoding.
+//! Development only; compares Skinny-SK/Steel/NAX dispatch paths at MoE dimensions.
+//! For production throughput, use e2e_prefill_bench (prefill) or pipeline_bench (decode).
+//!
 //! Skinny Split-K Diagnostic Benchmark
 //!
 //! Isolates Skinny Split-K performance components at MoE-critical dimensions.

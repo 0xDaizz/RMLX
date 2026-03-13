@@ -29,9 +29,7 @@ pub fn fast_command_buffer(queue: &CommandQueue) -> &CommandBufferRef {
 /// references to all encoder resources, keeping buffers alive until GPU completion.
 #[inline]
 pub fn fast_command_buffer_owned(queue: &CommandQueue) -> CommandBuffer {
-    queue
-        .new_command_buffer()
-        .to_owned()
+    queue.new_command_buffer().to_owned()
 }
 
 /// Thin wrapper around a Metal command queue.

@@ -1,3 +1,6 @@
+//! ✅ PRODUCTION PATH — tests forward_prefill_graph(), the actual production prefill path.
+//! Results directly reflect production 32-layer prefill throughput.
+//!
 //! E2E Prefill Benchmark (32-layer TransformerModel, Qwen 7B-style dimensions)
 //!
 //! Measures full 32-layer TransformerModel forward pass latency across

@@ -1,3 +1,7 @@
+//! ⚠️ NON-PRODUCTION PATH — matmul micro-benchmark with per-op sync CB via matmul_into_cb().
+//! Isolates GEMM from other ops but includes CB overhead. Not production dispatch path.
+//! For production throughput, use e2e_prefill_bench (prefill) or pipeline_bench (decode).
+//!
 //! Pure matmul microbenchmark for RMLX.
 //!
 //! Tests `ops::matmul::matmul_into_cb()` with Qwen 3.5 MoE shapes,

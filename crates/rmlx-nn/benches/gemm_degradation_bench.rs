@@ -1,3 +1,7 @@
+//! ⚠️ NON-PRODUCTION PATH — thermal throttling / GEMM degradation diagnostic.
+//! Isolates memory pressure, CB overhead, cache pollution effects on GEMM throughput.
+//! For production throughput, use e2e_prefill_bench (prefill) or pipeline_bench (decode).
+//!
 //! GEMM pipeline degradation diagnostic benchmark.
 //!
 //! Isolates potential causes of 2-3x GEMM throughput drop when running inside

@@ -1,3 +1,7 @@
+//! ⚠️ NON-PRODUCTION PATH — Q4 QMM dispatch through quantized_matmul() sync path.
+//! Per-op CB overhead included; throughput not representative of production pipelining.
+//! For production throughput, use e2e_prefill_bench (prefill) or pipeline_bench (decode).
+//!
 //! QMM Dispatch Benchmark — Steel vs NAX vs Auto at multiple M values.
 //!
 //! Tests Q4 QMM across M = {1, 4, 8, 16, 32, 64, 128, 256, 512, 1024}

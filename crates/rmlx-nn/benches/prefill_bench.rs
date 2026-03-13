@@ -1,3 +1,7 @@
+//! ⚠️ NON-PRODUCTION PATH — single-layer only, M=1 (decode not prefill despite the name).
+//! Does not test 32-layer prefill throughput. Use e2e_prefill_bench for production prefill.
+//! For production decode, use pipeline_bench.
+//!
 //! GPU Prefill Benchmark (MoE Expert Layer, Qwen 3.5-style dimensions, seq_len > 1)
 //!
 //! Measures single-layer TransformerBlock forward pass latency across

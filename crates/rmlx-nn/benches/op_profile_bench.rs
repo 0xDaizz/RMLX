@@ -1,3 +1,7 @@
+//! ⚠️ NON-PRODUCTION PATH — per-op profiling with individual CB per op (commit+wait each).
+//! Diagnostic only; breaks down single-layer costs but not production 32-layer pipeline.
+//! For production throughput, use e2e_prefill_bench (prefill) or pipeline_bench (decode).
+//!
 //! Per-operation profiling benchmark for RMLX single-layer prefill pipeline.
 //!
 //! Breaks down the MoE Expert Layer TransformerBlock `forward_prefill_single_cb`

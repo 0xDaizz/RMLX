@@ -1,3 +1,7 @@
+//! ⚠️ NON-PRODUCTION PATH — Metal dispatch overhead profiling (CB create/commit/wait costs).
+//! Diagnostic only; does not test production forward path.
+//! For production throughput, use e2e_prefill_bench (prefill) or pipeline_bench (decode).
+//!
 //! F-1: Metal dispatch overhead profiling benchmark.
 //!
 //! Quantifies CB (Command Buffer) creation/commit/wait costs:

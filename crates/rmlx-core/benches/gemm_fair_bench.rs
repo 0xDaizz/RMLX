@@ -1,6 +1,11 @@
 //! RMLX vs MLX fair GEMM comparison benchmark.
 //!
-//! Four dispatch modes:
+//! Includes both direct kernel encoding (for GPU-level comparison) and a **production
+//! dispatch mode** that calls `ops::matmul::matmul()` with full Split-K routing, GEMV
+//! dispatch, kernel selection, and per-op CB overhead — matching what the real inference
+//! path executes.
+//!
+//! Five dispatch modes:
 //!   1. **Sync**: 1 dispatch per CB, `wait_until_completed` every time (unfair overhead)
 //!   2. **Pipelined**: 32 separate CBs each with 1 dispatch to its own output
 //!      buffer (avoids WAW hazards), committed without waiting (simulating
@@ -11,13 +16,16 @@
 //!   4. **Single-encoder**: 1 CB, 1 encoder, 32 dispatches (each to its own
 //!      output buffer via set_buffer + dispatch_thread_groups), commit once,
 //!      wait once — measures absolute minimum dispatch overhead
+//!   5. **Production**: 1 CB, 32 × `matmul_into_cb()` encodes, commit once, wait once
+//!      — matches `forward_prefill_graph()` ExecGraph batch pattern.
+//!      Tests production kernel selection (tile config, GEMV, function constants).
 //!
 //! Kernel selection per M (matching optimal dispatch):
 //!   - M=1..128:  gemm_mlx_m16_f16    (BM=16, BN=32, BK=16, 64 threads)
 //!   - M=256:     gemm_mlx_small_f16  (BM=32, BN=32, BK=16, 64 threads)
 //!   - M=512:     gemm_nax_64x128_f16 (BM=64, BN=128, BK=32, 256 threads)
 //!
-//! N=3584, K=3584, f16, 5 warmup + 20 bench, largest M first (thermal).
+//! All 4 NK shapes (Qwen 7B), f16, 5 warmup + 20 bench, largest M first (thermal).
 //!
 //! Usage: cargo bench -p rmlx-core --bench gemm_fair_bench
 
@@ -34,9 +42,15 @@ use rmlx_metal::device::GpuDevice;
 const WARMUP_ITERS: usize = 5;
 const BENCH_ITERS: usize = 20;
 const PIPELINE_N: usize = 32;
-const N: usize = 3584;
-const K: usize = 3584;
 const M_VALUES: &[usize] = &[1, 4, 8, 16, 32, 48, 64, 96, 128, 256, 512];
+
+/// (N, K, label) shapes for Qwen 7B benchmark.
+const NK_SHAPES: &[(usize, usize, &str)] = &[
+    (3584, 3584, "attn_proj"),
+    (4096, 4096, "standard"),
+    (14336, 4096, "ffn_up"),
+    (4096, 14336, "ffn_down"),
+];
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -109,7 +123,7 @@ struct KernelSpec {
     threads: u64,
 }
 
-fn select_kernel_for_m(m: usize) -> KernelSpec {
+fn select_kernel_for_m(m: usize, _n: usize, _k: usize) -> KernelSpec {
     if m >= 512 {
         KernelSpec {
             name: "gemm_nax_64x128_f16",
@@ -477,16 +491,61 @@ fn bench_single_encoder(
 }
 
 // ---------------------------------------------------------------------------
+// Production benchmark: matmul_into_cb() × 32 in 1 CB (ExecGraph pattern)
+// ---------------------------------------------------------------------------
+
+/// Production dispatch benchmark: matmul_into_cb() × 32 in 1 CB.
+/// Matches forward_prefill_graph() ExecGraph pattern where multiple
+/// matmuls share a single command buffer.
+fn bench_production(
+    registry: &KernelRegistry,
+    device: &metal::Device,
+    a: &Array,
+    b: &Array,
+) -> f64 {
+    let queue = device.new_command_queue();
+
+    // Warmup
+    for _ in 0..WARMUP_ITERS {
+        let cb = queue.new_command_buffer().to_owned();
+        for _ in 0..PIPELINE_N {
+            let _ = ops::matmul::matmul_into_cb(registry, a, b, &cb).unwrap();
+        }
+        cb.commit();
+        cb.wait_until_completed();
+    }
+
+    // Measure
+    let mut times = Vec::with_capacity(BENCH_ITERS);
+    for _ in 0..BENCH_ITERS {
+        let start = Instant::now();
+        let cb = queue.new_command_buffer().to_owned();
+        for _ in 0..PIPELINE_N {
+            let _ = ops::matmul::matmul_into_cb(registry, a, b, &cb).unwrap();
+        }
+        cb.commit();
+        cb.wait_until_completed();
+        let total_us = start.elapsed().as_secs_f64() * 1e6;
+        times.push(total_us / PIPELINE_N as f64);
+    }
+    p50(&mut times)
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
 struct BenchResult {
     m: usize,
+    n: usize,
+    k: usize,
+    shape_name: &'static str,
     kernel: &'static str,
     sync_us: f64,
     pipe_us: f64,
     multi_enc_us: f64,
     single_enc_us: f64,
+    prod_us: f64,
 }
 
 fn main() {
@@ -497,137 +556,241 @@ fn main() {
 
     println!("=== RMLX GEMM Fair Benchmark (Dispatch Overhead Analysis) ===");
     println!(
-        "N={}, K={}, dtype=f16, Warmup={}, Bench={} iters",
-        N, K, WARMUP_ITERS, BENCH_ITERS
+        "dtype=f16, Warmup={}, Bench={} iters",
+        WARMUP_ITERS, BENCH_ITERS
     );
     println!(
         "Pipeline depth: {} dispatches (simulating 32-layer transformer)",
         PIPELINE_N
     );
-    println!("Modes: Sync (1 CB/wait), Pipe (32 CBs/1 wait), Multi-enc (1 CB/32 enc), Single-enc (1 CB/1 enc/32 disp)");
-    println!();
+    println!("Modes: Sync (1 CB/wait), Pipe (32 CBs/1 wait), Multi-enc (1 CB/32 enc), Single-enc (1 CB/1 enc/32 disp), Prod (1 CB/32 matmul_into_cb)");
 
-    // Collect results (run largest M first for thermal fairness)
-    let mut results: Vec<BenchResult> = Vec::new();
+    // Collect results across all shapes
+    let mut all_results: Vec<BenchResult> = Vec::new();
 
-    for &m in M_VALUES.iter().rev() {
-        let spec = select_kernel_for_m(m);
-        let constants = ops::matmul::matmul_align_constants(m, N, K, spec.bm, spec.bn, spec.bk);
-        let pipeline = registry
-            .get_pipeline_with_constants(spec.name, DType::Float16, &constants)
-            .unwrap_or_else(|e| panic!("Failed to get pipeline for {}: {e}", spec.name));
-
-        let bufs = GemmBuffers::new(device, m, N, K, spec.bm, spec.bn);
-
-        let grid_x = N.div_ceil(spec.bn);
-        let grid_y = m.div_ceil(spec.bm);
-        let grid = MTLSize::new(grid_x as u64, grid_y as u64, 1);
-        let tg = MTLSize::new(spec.threads, 1, 1);
-
+    for &(shape_n, shape_k, shape_name) in NK_SHAPES {
+        println!();
         println!(
-            "  [DEBUG] M={} kernel={} grid=({},{},{}) tg=({},{},{}) bm={} bn={} bk={}",
-            m,
-            spec.name,
-            grid.width,
-            grid.height,
-            grid.depth,
-            tg.width,
-            tg.height,
-            tg.depth,
-            spec.bm,
-            spec.bn,
-            spec.bk
+            "=== Shape: {} (N={}, K={}) ===",
+            shape_name, shape_n, shape_k
         );
 
-        let sync_us = bench_sync(device, &pipeline, &bufs, grid, tg);
-        let pipe_us = bench_pipelined(device, &pipeline, &bufs, m, N, grid, tg);
-        let multi_enc_us = bench_multi_encoder(device, &pipeline, &bufs, m, N, grid, tg);
-        let single_enc_us = bench_single_encoder(device, &pipeline, &bufs, m, N, grid, tg);
+        // Run largest M first for thermal fairness
+        let mut shape_results: Vec<BenchResult> = Vec::new();
 
+        for &m in M_VALUES.iter().rev() {
+            let spec = select_kernel_for_m(m, shape_n, shape_k);
+            let constants =
+                ops::matmul::matmul_align_constants(m, shape_n, shape_k, spec.bm, spec.bn, spec.bk);
+            let pipeline = registry
+                .get_pipeline_with_constants(spec.name, DType::Float16, &constants)
+                .unwrap_or_else(|e| panic!("Failed to get pipeline for {}: {e}", spec.name));
+
+            let bufs = GemmBuffers::new(device, m, shape_n, shape_k, spec.bm, spec.bn);
+
+            let tiles_n = shape_n.div_ceil(spec.bn);
+            let tiles_m = m.div_ceil(spec.bm);
+            let swizzle = bufs.swizzle_val;
+            let grid_x = (tiles_n << swizzle) as u64;
+            let grid_y = (tiles_m >> swizzle) as u64;
+            let grid = MTLSize::new(grid_x, grid_y, 1);
+            let tg = MTLSize::new(spec.threads, 1, 1);
+
+            println!(
+                "  [DEBUG] M={} kernel={} grid=({},{},{}) tg=({},{},{}) bm={} bn={} bk={} swizzle={}",
+                m,
+                spec.name,
+                grid.width,
+                grid.height,
+                grid.depth,
+                tg.width,
+                tg.height,
+                tg.depth,
+                spec.bm,
+                spec.bn,
+                spec.bk,
+                swizzle
+            );
+
+            let sync_us = bench_sync(device, &pipeline, &bufs, grid, tg);
+            let pipe_us = bench_pipelined(device, &pipeline, &bufs, m, shape_n, grid, tg);
+            let multi_enc_us = bench_multi_encoder(device, &pipeline, &bufs, m, shape_n, grid, tg);
+            let single_enc_us =
+                bench_single_encoder(device, &pipeline, &bufs, m, shape_n, grid, tg);
+
+            // Production dispatch: uses ops::matmul::matmul() with full routing
+            let prod_a = rand_f16_array(device, &[m, shape_k], 42);
+            let prod_b = rand_f16_array(device, &[shape_k, shape_n], 99);
+            let prod_us = bench_production(&registry, device, &prod_a, &prod_b);
+
+            println!(
+                "  M={:>4}: {} sync={:.1}us pipe={:.1}us multi_enc={:.1}us single_enc={:.1}us prod={:.1}us",
+                m, spec.name, sync_us, pipe_us, multi_enc_us, single_enc_us, prod_us
+            );
+
+            shape_results.push(BenchResult {
+                m,
+                n: shape_n,
+                k: shape_k,
+                shape_name,
+                kernel: spec.name,
+                sync_us,
+                pipe_us,
+                multi_enc_us,
+                single_enc_us,
+                prod_us,
+            });
+        }
+
+        // Sort ascending by M for display
+        shape_results.sort_by_key(|r| r.m);
+
+        // Per-shape results table
+        println!();
         println!(
-            "  M={:>4}: {} sync={:.1}us pipe={:.1}us multi_enc={:.1}us single_enc={:.1}us",
-            m, spec.name, sync_us, pipe_us, multi_enc_us, single_enc_us
+            "--- {} (N={}, K={}) Results ---",
+            shape_name, shape_n, shape_k
+        );
+        println!(
+            "| {:>5} | {:>22} | {:>12} | {:>12} | {:>14} | {:>16} | {:>12} |",
+            "M", "Kernel", "Sync (us/T)", "Pipe (us/T)", "Multi-enc (us/T)", "Single-enc (us/T)", "Prod (us/T)"
+        );
+        println!(
+            "|{:-<7}|{:-<24}|{:-<14}|{:-<14}|{:-<16}|{:-<18}|{:-<14}|",
+            "", "", "", "", "", "", ""
         );
 
-        results.push(BenchResult {
-            m,
-            kernel: spec.name,
-            sync_us,
-            pipe_us,
-            multi_enc_us,
-            single_enc_us,
-        });
+        for r in &shape_results {
+            let sync_t = tflops(r.m, r.n, r.k, r.sync_us);
+            let pipe_t = tflops(r.m, r.n, r.k, r.pipe_us);
+            let menc_t = tflops(r.m, r.n, r.k, r.multi_enc_us);
+            let senc_t = tflops(r.m, r.n, r.k, r.single_enc_us);
+            let prod_t = tflops(r.m, r.n, r.k, r.prod_us);
+            println!(
+                "| {:>5} | {:>22} | {:>5.1}/{:<5.2} | {:>5.1}/{:<5.2} | {:>7.1}/{:<5.2} | {:>9.1}/{:<5.2} | {:>5.1}/{:<5.2} |",
+                r.m, r.kernel,
+                r.sync_us, sync_t,
+                r.pipe_us, pipe_t,
+                r.multi_enc_us, menc_t,
+                r.single_enc_us, senc_t,
+                r.prod_us, prod_t,
+            );
+        }
+
+        all_results.extend(shape_results);
     }
 
-    // Sort ascending by M for display
-    results.sort_by_key(|r| r.m);
-
-    // --- Main results table ---
+    // -----------------------------------------------------------------------
+    // Combined Pipelined Summary Table (all shapes × all M values)
+    // -----------------------------------------------------------------------
     println!();
-    println!("=== Results ===");
+    println!("=== Pipelined Summary ({}x, p50) ===", PIPELINE_N);
     println!();
-    println!(
-        "| {:>5} | {:>22} | {:>12} | {:>12} | {:>14} | {:>16} |",
-        "M", "Kernel", "Sync (us/T)", "Pipe (us/T)", "Multi-enc (us/T)", "Single-enc (us/T)"
-    );
-    println!(
-        "|{:-<7}|{:-<24}|{:-<14}|{:-<14}|{:-<16}|{:-<18}|",
-        "", "", "", "", "", ""
-    );
+    print!("| {:>5} |", "M");
+    for &(shape_n, shape_k, label) in NK_SHAPES {
+        let col_label = format!("{} {}x{}", label, shape_n, shape_k);
+        print!(" {:>18} |", col_label);
+    }
+    println!();
+    print!("|-------|");
+    for _ in NK_SHAPES {
+        print!("--------------------|");
+    }
+    println!();
 
-    for r in &results {
-        let sync_t = tflops(r.m, N, K, r.sync_us);
-        let pipe_t = tflops(r.m, N, K, r.pipe_us);
-        let menc_t = tflops(r.m, N, K, r.multi_enc_us);
-        let senc_t = tflops(r.m, N, K, r.single_enc_us);
-        println!(
-            "| {:>5} | {:>22} | {:>5.1}/{:<5.2} | {:>5.1}/{:<5.2} | {:>7.1}/{:<5.2} | {:>9.1}/{:<5.2} |",
-            r.m, r.kernel,
-            r.sync_us, sync_t,
-            r.pipe_us, pipe_t,
-            r.multi_enc_us, menc_t,
-            r.single_enc_us, senc_t,
-        );
+    for &m in M_VALUES {
+        print!("| {:>5} |", m);
+        for &(shape_n, shape_k, shape_name) in NK_SHAPES {
+            if let Some(r) = all_results.iter().find(|r| {
+                r.m == m && r.n == shape_n && r.k == shape_k && r.shape_name == shape_name
+            }) {
+                let tf = tflops(m, shape_n, shape_k, r.pipe_us);
+                print!(" {:>11.1}us/{:.2}T |", r.pipe_us, tf);
+            } else {
+                print!(" {:>18} |", "N/A");
+            }
+        }
+        println!();
     }
 
-    // --- Overhead analysis table ---
+    // -----------------------------------------------------------------------
+    // Combined Production Summary Table (all shapes × all M values)
+    // -----------------------------------------------------------------------
     println!();
-    println!(
-        "=== Dispatch Overhead Analysis (us per dispatch, amortized over {}) ===",
-        PIPELINE_N
-    );
+    println!("=== Production Dispatch Summary ({}x matmul_into_cb() batched, p50) ===", PIPELINE_N);
     println!();
-    println!(
-        "| {:>5} | {:>22} | {:>12} | {:>12} | {:>12} | {:>12} |",
-        "M", "Kernel", "CB overhead", "Enc overhead", "GPU pure", "Sync total"
-    );
-    println!(
-        "|{:-<7}|{:-<24}|{:-<14}|{:-<14}|{:-<14}|{:-<14}|",
-        "", "", "", "", "", ""
-    );
+    print!("| {:>5} |", "M");
+    for &(shape_n, shape_k, label) in NK_SHAPES {
+        let col_label = format!("{} {}x{}", label, shape_n, shape_k);
+        print!(" {:>18} |", col_label);
+    }
+    println!();
+    print!("|-------|");
+    for _ in NK_SHAPES {
+        print!("--------------------|");
+    }
+    println!();
 
-    for r in &results {
-        // CB overhead = Pipe - Multi-enc (isolates per-CB creation cost)
-        let cb_overhead = r.pipe_us - r.multi_enc_us;
-        // Enc overhead = Multi-enc - Single-enc (isolates per-encoder creation cost)
-        let enc_overhead = r.multi_enc_us - r.single_enc_us;
-        // GPU pure = Single-enc (minimum achievable per dispatch)
-        let gpu_pure = r.single_enc_us;
-        // Sync total overhead = Sync - Single-enc
-        let sync_total = r.sync_us - r.single_enc_us;
-
-        println!(
-            "| {:>5} | {:>22} | {:>9.1} us | {:>9.1} us | {:>9.1} us | {:>9.1} us |",
-            r.m, r.kernel, cb_overhead, enc_overhead, gpu_pure, sync_total,
-        );
+    for &m in M_VALUES {
+        print!("| {:>5} |", m);
+        for &(shape_n, shape_k, shape_name) in NK_SHAPES {
+            if let Some(r) = all_results.iter().find(|r| {
+                r.m == m && r.n == shape_n && r.k == shape_k && r.shape_name == shape_name
+            }) {
+                let tf = tflops(m, shape_n, shape_k, r.prod_us);
+                print!(" {:>11.1}us/{:.2}T |", r.prod_us, tf);
+            } else {
+                print!(" {:>18} |", "N/A");
+            }
+        }
+        println!();
     }
 
-    println!();
-    println!("Legend:");
-    println!("  CB overhead   = Pipe - Multi-enc   (per-CB creation + commit cost)");
-    println!("  Enc overhead  = Multi-enc - Single-enc (per-encoder creation cost)");
-    println!("  GPU pure      = Single-enc          (minimum achievable dispatch time)");
-    println!("  Sync total    = Sync - Single-enc   (total CPU overhead in sync mode)");
+    // -----------------------------------------------------------------------
+    // Dispatch Overhead Analysis (first shape only, representative)
+    // -----------------------------------------------------------------------
+    let first_shape = NK_SHAPES[0];
+    let first_results: Vec<&BenchResult> = all_results
+        .iter()
+        .filter(|r| r.n == first_shape.0 && r.k == first_shape.1)
+        .collect();
+
+    if !first_results.is_empty() {
+        println!();
+        println!(
+            "=== Dispatch Overhead Analysis — {} (N={}, K={}) ===",
+            first_shape.2, first_shape.0, first_shape.1
+        );
+        println!("(us per dispatch, amortized over {})", PIPELINE_N);
+        println!();
+        println!(
+            "| {:>5} | {:>22} | {:>12} | {:>12} | {:>12} | {:>12} |",
+            "M", "Kernel", "CB overhead", "Enc overhead", "GPU pure", "Sync total"
+        );
+        println!(
+            "|{:-<7}|{:-<24}|{:-<14}|{:-<14}|{:-<14}|{:-<14}|",
+            "", "", "", "", "", ""
+        );
+
+        for r in &first_results {
+            let cb_overhead = r.pipe_us - r.multi_enc_us;
+            let enc_overhead = r.multi_enc_us - r.single_enc_us;
+            let gpu_pure = r.single_enc_us;
+            let sync_total = r.sync_us - r.single_enc_us;
+
+            println!(
+                "| {:>5} | {:>22} | {:>9.1} us | {:>9.1} us | {:>9.1} us | {:>9.1} us |",
+                r.m, r.kernel, cb_overhead, enc_overhead, gpu_pure, sync_total,
+            );
+        }
+
+        println!();
+        println!("Legend:");
+        println!("  CB overhead   = Pipe - Multi-enc   (per-CB creation + commit cost)");
+        println!("  Enc overhead  = Multi-enc - Single-enc (per-encoder creation cost)");
+        println!("  GPU pure      = Single-enc          (minimum achievable dispatch time)");
+        println!("  Sync total    = Sync - Single-enc   (total CPU overhead in sync mode)");
+    }
 
     println!();
     println!("Done.");

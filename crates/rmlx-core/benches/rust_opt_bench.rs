@@ -1,3 +1,8 @@
+//! ⚠️ NON-PRODUCTION PATH — Rust-side optimization micro-benchmarks (P0-P4).
+//! Measures pipeline lookup, PipelineKey creation, dispatch calculation overhead.
+//! Diagnostic only; does not test full TransformerModel forward path.
+//! For production throughput, use e2e_prefill_bench (prefill) or pipeline_bench (decode).
+//!
 //! Benchmark for Rust-side optimizations (P0-P4).
 //!
 //! Measures:

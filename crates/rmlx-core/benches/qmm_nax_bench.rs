@@ -1,3 +1,7 @@
+//! ⚠️ NON-PRODUCTION PATH — QMM NAX kernel development benchmark. Direct encoding,
+//! bypasses quantized_matmul() dispatch. Development/tuning only.
+//! For production throughput, use e2e_prefill_bench (prefill) or pipeline_bench (decode).
+//!
 //! QMM NAX V1 vs V2 Benchmark — vectorized dequant comparison.
 //!
 //! Compares `affine_qmm_nax_q4` (scalar dequant) vs `affine_qmm_nax_v2_q4`

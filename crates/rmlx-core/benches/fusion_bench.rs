@@ -1,3 +1,7 @@
+//! ⚠️ NON-PRODUCTION PATH — kernel fusion (RMSNorm+GEMM) testing with per-op sync CB.
+//! Tests fused vs unfused kernel dispatch, not the full TransformerModel forward path.
+//! For production throughput, use e2e_prefill_bench (prefill) or pipeline_bench (decode).
+//!
 //! RMSNorm + GEMM Fusion Benchmark (J-5).
 //!
 //! Compares three configurations:

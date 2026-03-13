@@ -1,3 +1,7 @@
+//! ⚠️ NON-PRODUCTION PATH — MLX Q4 parity comparison with direct kernel encoding.
+//! Per-op sync CB overhead included. Development/tuning only.
+//! For production throughput, use e2e_prefill_bench (prefill) or pipeline_bench (decode).
+//!
 //! QMM Low-M MLX Parity Benchmark
 //!
 //! Fair comparison between rmlx and MLX at MoE-critical low-M dimensions.

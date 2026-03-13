@@ -1,3 +1,7 @@
+//! ⚠️ NON-PRODUCTION PATH — direct kernel encoding for kernel selection tuning.
+//! Bypasses matmul() dispatch (Split-K, GEMV routing, contiguity checks).
+//! For production throughput, use e2e_prefill_bench (prefill) or pipeline_bench (decode).
+//!
 //! Comprehensive f16 GEMM kernel heatmap benchmark.
 //!
 //! Tests ALL available f16 GEMM kernel implementations across a wide range of
@@ -256,30 +260,29 @@ fn bench_pipelined_gemm(
     };
 
     // Helper closure to encode one dispatch
-    let encode_dispatch =
-        |enc: &metal::ComputeCommandEncoderRef, out_buf: &metal::Buffer| {
-            enc.set_compute_pipeline_state(pipeline);
-            enc.set_buffer(0, Some(a.metal_buffer()), 0);
-            enc.set_buffer(1, Some(b.metal_buffer()), 0);
-            enc.set_buffer(2, Some(out_buf), 0);
-            set_u32(enc, 3, m_u32);
-            set_u32(enc, 4, n_u32);
-            set_u32(enc, 5, k_u32);
-            set_u32(enc, 6, bsa);
-            set_u32(enc, 7, bsb);
-            set_u32(enc, 8, bsc);
-            set_u32(enc, 9, swizzle_log);
-            if let Some(ref dummy) = dummy_buf {
-                enc.set_buffer(10, Some(dummy), 0);
-                enc.set_buffer(11, Some(dummy), 0);
-                enc.set_buffer(12, Some(dummy), 0);
-                enc.set_buffer(13, Some(dummy), 0);
-            } else {
-                set_u32(enc, 10, 0u32); // residual flag (non-FC kernels)
-            }
-            enc.dispatch_thread_groups(grid, tg);
-            enc.end_encoding();
-        };
+    let encode_dispatch = |enc: &metal::ComputeCommandEncoderRef, out_buf: &metal::Buffer| {
+        enc.set_compute_pipeline_state(pipeline);
+        enc.set_buffer(0, Some(a.metal_buffer()), 0);
+        enc.set_buffer(1, Some(b.metal_buffer()), 0);
+        enc.set_buffer(2, Some(out_buf), 0);
+        set_u32(enc, 3, m_u32);
+        set_u32(enc, 4, n_u32);
+        set_u32(enc, 5, k_u32);
+        set_u32(enc, 6, bsa);
+        set_u32(enc, 7, bsb);
+        set_u32(enc, 8, bsc);
+        set_u32(enc, 9, swizzle_log);
+        if let Some(ref dummy) = dummy_buf {
+            enc.set_buffer(10, Some(dummy), 0);
+            enc.set_buffer(11, Some(dummy), 0);
+            enc.set_buffer(12, Some(dummy), 0);
+            enc.set_buffer(13, Some(dummy), 0);
+        } else {
+            set_u32(enc, 10, 0u32); // residual flag (non-FC kernels)
+        }
+        enc.dispatch_thread_groups(grid, tg);
+        enc.end_encoding();
+    };
 
     // Warmup
     for _ in 0..WARMUP_ITERS {

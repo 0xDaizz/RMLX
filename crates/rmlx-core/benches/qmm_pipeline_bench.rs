@@ -1,3 +1,7 @@
+//! ⚠️ NON-PRODUCTION PATH — pipelined QMM encoding (96 QMMs in 1 CB) measures kernel
+//! throughput with amortized CB overhead, but bypasses TransformerModel dispatch logic.
+//! For production throughput, use e2e_prefill_bench (prefill) or pipeline_bench (decode).
+//!
 //! Q4 Pipeline Benchmark — per-op vs pipeline (96 QMMs, 1 sync) comparison.
 //!
 //! Measures the dispatch overhead amortization benefit of encoding 32 layers × 3 QMMs

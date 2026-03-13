@@ -1,3 +1,7 @@
+//! ✅ PRODUCTION PATH — tests forward_graph() and forward_prefill_graph() with real
+//! safetensors weights on a full 32-layer TransformerModel. Results directly reflect
+//! production decode and prefill throughput.
+//!
 //! 32-Layer Full Model Benchmark: RMLX vs MLX
 //!
 //! End-to-end TransformerModel forward latency with real safetensors weights.

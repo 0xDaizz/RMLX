@@ -7252,6 +7252,88 @@ fn dispatch_split_k_f16(
     Ok(out)
 }
 
+/// Split-K f16 variant that encodes into an externally-provided command buffer.
+///
+/// Both pass-1 (split-K accumulate) and pass-2 (reduce) are encoded into `cb`.
+/// The caller is responsible for committing the command buffer.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_split_k_f16_into_cb(
+    registry: &KernelRegistry,
+    a: &Array,
+    b: &Array,
+    cb: &metal::CommandBufferRef,
+    m: usize,
+    n: usize,
+    k: usize,
+    n_splits: usize,
+) -> Result<Array, KernelError> {
+    let dev = registry.device().raw();
+    let partial = Array::uninit(dev, &[n_splits * m * n], DType::Float32);
+    let out = Array::uninit(dev, &[m, n], DType::Float16);
+
+    // Select tile size: BM=32 for small M, BM=64 otherwise
+    let (bm, bn, kernel_name) = if m <= 32 {
+        (32usize, 32usize, "splitk_small_pass1_f16")
+    } else {
+        (64usize, 64usize, "splitk_pass1_mlx_f16")
+    };
+
+    // Pass 1: MLX-arch split-k (align_K unused by split-K shaders, safe to pass)
+    let bk = 16usize;
+    let constants = matmul_align_constants(m, n, k, bm, bn, bk);
+    let pass1_pipeline =
+        registry.get_pipeline_with_constants(kernel_name, DType::Float16, &constants)?;
+
+    let m_u32 = super::checked_u32(m, "M")?;
+    let n_u32 = super::checked_u32(n, "N")?;
+    let k_u32 = super::checked_u32(k, "K")?;
+    let splits_u32 = super::checked_u32(n_splits, "n_splits")?;
+    let swizzle_log = compute_swizzle_log(m, n, bm, bn);
+
+    // Pass 1
+    {
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pass1_pipeline);
+        enc.set_buffer(splitk::A, Some(a.metal_buffer()), a.offset() as u64);
+        enc.set_buffer(splitk::B, Some(b.metal_buffer()), b.offset() as u64);
+        enc.set_buffer(splitk::PARTIAL, Some(partial.metal_buffer()), 0);
+        set_u32(enc, splitk::M, m_u32);
+        set_u32(enc, splitk::N, n_u32);
+        set_u32(enc, splitk::K, k_u32);
+        set_u32(enc, splitk::N_SPLITS, splits_u32);
+        set_u32(enc, 7, swizzle_log); // f16 split-K adds swizzle_log after n_splits
+
+        let grid = MTLSize::new(
+            (ceil_div(n, bn) << swizzle_log) as u64,
+            (ceil_div(m, bm) >> swizzle_log) as u64,
+            n_splits as u64,
+        );
+        let tg = MTLSize::new(64, 1, 1);
+        enc.dispatch_thread_groups(grid, tg);
+        enc.end_encoding();
+    }
+
+    // Pass 2: reduce
+    {
+        let pass2_pipeline = registry.get_pipeline("splitk_reduce_f16", DType::Float16)?;
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pass2_pipeline);
+        enc.set_buffer(splitk_reduce::PARTIAL, Some(partial.metal_buffer()), 0);
+        enc.set_buffer(splitk_reduce::OUT, Some(out.metal_buffer()), 0);
+        set_u32(enc, splitk_reduce::M, m_u32);
+        set_u32(enc, splitk_reduce::N, n_u32);
+        set_u32(enc, splitk_reduce::N_SPLITS, splits_u32);
+
+        let total = m * n;
+        let tg_size = 256u64;
+        let n_groups = ceil_div(total, tg_size as usize) as u64;
+        enc.dispatch_thread_groups(MTLSize::new(n_groups, 1, 1), MTLSize::new(tg_size, 1, 1));
+        enc.end_encoding();
+    }
+
+    Ok(out)
+}
+
 /// Build function constants for matmul alignment specialization.
 pub fn matmul_align_constants(
     m: usize,
@@ -7288,11 +7370,8 @@ pub fn matmul_align_constants(
 /// Supports the same dispatch hierarchy as `matmul`:
 /// - M=1 → GEMV via `gemv_into_cb` (B^T @ a_vec)
 /// - N=1 → GEMV via `gemv_into_cb` (A @ b_vec)
+/// - M=2..128, f16, K>=256 → Split-K (two-pass encode into same CB)
 /// - M>=5 → tiled GEMM (Small / Skinny / Simd / Medium / Full)
-///
-/// Split-K is **not** supported in this path (it requires a two-pass
-/// encode with an intermediate buffer; the caller should use `matmul()` for
-/// K-dominated problems).
 pub fn matmul_into_cb(
     registry: &KernelRegistry,
     a: &Array,
@@ -7384,6 +7463,37 @@ pub fn matmul_into_cb(
             result.dtype(),
             result.offset(),
         ));
+    }
+
+    // -------------------------------------------------------------------
+    // Split-K f16 for M=2..128 (same routing as matmul())
+    // -------------------------------------------------------------------
+    if a.dtype() == DType::Float16 && k >= 256 {
+        if (2..=64).contains(&m) {
+            let n_splits = optimal_splitk_nsplits(m, n, k);
+            return dispatch_split_k_f16_into_cb(registry, a, b, cb, m, n, k, n_splits);
+        }
+        if (65..=128).contains(&m) {
+            let n_splits = optimal_splitk_nsplits(m, n, k);
+            return dispatch_split_k_f16_into_cb(registry, a, b, cb, m, n, k, n_splits);
+        }
+    }
+
+    // Split-K f16 for under-occupied problems
+    if a.dtype() == DType::Float16 {
+        let gpu_cores = registry.device().tuning().gpu_cores;
+        let tile = select_tile_config_with_dtype(m, n, k, DType::Float16);
+        let non_splitk_tgs = m.div_ceil(tile.bm) * n.div_ceil(tile.bn);
+        let target_tgs = gpu_cores * 4;
+        if non_splitk_tgs < target_tgs && k >= m.max(n) && k >= 256 {
+            let (splitk_bm, splitk_bn) = if m <= 32 { (32, 32) } else { (64, 64) };
+            let splitk_tgs = m.div_ceil(splitk_bm) * n.div_ceil(splitk_bn);
+            let k_tiles = k / 16;
+            let splits = (target_tgs / splitk_tgs.max(1)).clamp(2, k_tiles.min(32));
+            if splits > 1 {
+                return dispatch_split_k_f16_into_cb(registry, a, b, cb, m, n, k, splits);
+            }
+        }
     }
 
     // -------------------------------------------------------------------

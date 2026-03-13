@@ -1,3 +1,7 @@
+//! ⚠️ NON-PRODUCTION PATH — old kernel optimization benchmark. Direct kernel encoding,
+//! development only. Bypasses matmul() dispatch.
+//! For production throughput, use e2e_prefill_bench (prefill) or pipeline_bench (decode).
+//!
 //! GEMM kernel-level optimization benchmark — tests 6 variants measuring
 //! independent contributions of 3 optimizations: direct store, wide load, aligned.
 //!

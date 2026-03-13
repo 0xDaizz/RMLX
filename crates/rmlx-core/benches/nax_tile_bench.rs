@@ -1,3 +1,7 @@
+//! ⚠️ NON-PRODUCTION PATH — direct kernel encoding for NAX tile parameter sweep.
+//! Development/tuning only. Bypasses matmul() dispatch.
+//! For production throughput, use e2e_prefill_bench (prefill) or pipeline_bench (decode).
+//!
 //! NAX GEMM tile variant A/B benchmark.
 //!
 //! Compares four GEMM kernel variants across multiple M sizes:

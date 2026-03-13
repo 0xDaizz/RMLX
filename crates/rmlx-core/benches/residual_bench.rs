@@ -1,3 +1,7 @@
+//! ⚠️ NON-PRODUCTION PATH — residual fusion (GEMM+add) testing with per-op sync CB.
+//! Tests fused vs unfused epilogue dispatch, not the full TransformerModel forward path.
+//! For production throughput, use e2e_prefill_bench (prefill) or pipeline_bench (decode).
+//!
 //! GEMM + residual epilogue fusion benchmark (Phase H-2).
 //!
 //! Compares two approaches:

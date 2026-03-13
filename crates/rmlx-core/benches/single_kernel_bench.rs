@@ -1,3 +1,7 @@
+//! ⚠️ NON-PRODUCTION PATH — single kernel isolation for dispatch overhead investigation.
+//! Direct kernel encoding, development only. Bypasses matmul() dispatch.
+//! For production throughput, use e2e_prefill_bench (prefill) or pipeline_bench (decode).
+//!
 //! Single-kernel isolation benchmark.
 //! Tests only MLX Micro to find where the ~320us overhead in nax_lowm_bench comes from.
 //!

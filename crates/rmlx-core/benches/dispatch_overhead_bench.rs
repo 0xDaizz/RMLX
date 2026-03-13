@@ -1,3 +1,7 @@
+//! ⚠️ NON-PRODUCTION PATH — dispatch overhead measurement via batch amortization.
+//! Diagnostic only; measures CB creation/commit/wait costs, not production throughput.
+//! For production throughput, use e2e_prefill_bench (prefill) or pipeline_bench (decode).
+//!
 //! Dispatch overhead analysis benchmark.
 //! Separates CPU dispatch overhead from GPU kernel execution time using
 //! batch amortization (no GPU timestamps needed).

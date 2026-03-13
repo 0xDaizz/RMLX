@@ -1,3 +1,7 @@
+//! ⚠️ NON-PRODUCTION PATH — GPU timestamp profiling for dispatch overhead analysis.
+//! Diagnostic only; measures CB creation/commit/wait costs via GPUStartTime/GPUEndTime.
+//! For production throughput, use e2e_prefill_bench (prefill) or pipeline_bench (decode).
+//!
 //! GEMM dispatch overhead benchmark using Metal GPU timestamps.
 //!
 //! Separates wall time into GPU time (actual kernel execution) and

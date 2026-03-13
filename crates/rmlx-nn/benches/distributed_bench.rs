@@ -1,3 +1,7 @@
+//! ⚠️ NON-PRODUCTION PATH — distributed TP benchmark with single-layer forward.
+//! Tests TP sharding/allreduce overhead, not full 32-layer TransformerModel pipeline.
+//! For production throughput, use e2e_prefill_bench (prefill) or pipeline_bench (decode).
+//!
 //! Distributed Tensor Parallel Benchmark (Phase I-1 / J-7)
 //!
 //! Measures single-layer transformer forward pass with and without TP overhead,

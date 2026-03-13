@@ -1,3 +1,7 @@
+//! ⚠️ NON-PRODUCTION PATH — GEMM parameter sweep (variant 2). Direct kernel encoding,
+//! development only. Bypasses matmul() dispatch.
+//! For production throughput, use e2e_prefill_bench (prefill) or pipeline_bench (decode).
+//!
 //! Parameterized GEMM sweep2 benchmark — tests 9 kernel configurations.
 //!
 //! All configs use BM=64, BN=64, double-buffered, varying BK and SG layouts.

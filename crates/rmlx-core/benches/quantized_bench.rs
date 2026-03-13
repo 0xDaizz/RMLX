@@ -1,3 +1,7 @@
+//! ⚠️ NON-PRODUCTION PATH — per-op sync quantized_matmul(): creates+commits+waits a new
+//! CB per call. Per-op CB overhead included. Useful for kernel comparison only.
+//! For production throughput, use e2e_prefill_bench (prefill) or pipeline_bench (decode).
+//!
 //! Quantized matmul benchmark — QMV (M=1 decode) and QMM (batched prefill).
 //!
 //! MoE-focused dimensions (Mixtral-like, DeepSeek-V2):

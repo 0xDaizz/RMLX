@@ -1,3 +1,6 @@
+//! ✅ PRODUCTION PATH — tests forward_graph() (ExecGraph with event chaining) and
+//! forward_single_cb / 9-dispatch paths, the actual decode production paths.
+//!
 //! GPU Pipeline Performance Benchmark (MoE expert layer / Mixtral-style GQA)
 //!
 //! Apples-to-apples comparison of single-layer transformer forward pass:

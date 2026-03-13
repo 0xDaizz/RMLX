@@ -1,3 +1,7 @@
+//! ⚠️ NON-PRODUCTION PATH — NAX vs Steel kernel transition point analysis.
+//! Direct kernel encoding, development only. Bypasses quantized_matmul() dispatch.
+//! For production throughput, use e2e_prefill_bench (prefill) or pipeline_bench (decode).
+//!
 //! NAX vs Steel Q4 QMM Transition Benchmark
 //!
 //! Systematically compares NAX (4SG, BK=64) vs Steel (2SG, BK=32)

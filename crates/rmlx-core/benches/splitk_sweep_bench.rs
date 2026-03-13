@@ -1,3 +1,7 @@
+//! ⚠️ NON-PRODUCTION PATH — tests Split-K through direct dispatch, not through matmul().
+//! Useful for n_splits tuning only.
+//! For production throughput, use e2e_prefill_bench (prefill) or pipeline_bench (decode).
+//!
 //! Split-K n_splits sweep benchmark.
 //!
 //! For each (M, N, K) combination, sweeps n_splits values for both
@@ -24,12 +28,7 @@ const PIPELINE_N: usize = 32;
 const M_VALUES: &[usize] = &[128, 64, 32, 16, 8, 4, 2];
 
 // (N, K) shape pairs
-const SHAPES: &[(usize, usize)] = &[
-    (3584, 3584),
-    (4096, 4096),
-    (14336, 4096),
-    (4096, 14336),
-];
+const SHAPES: &[(usize, usize)] = &[(3584, 3584), (4096, 4096), (14336, 4096), (4096, 14336)];
 
 // n_splits for SplitK-Small (BM=32, BN=32, BK=16)
 const SMALL_SPLITS: &[usize] = &[2, 3, 4, 6, 8, 12, 16];
@@ -128,14 +127,12 @@ fn bench_pipelined_splitk(
         .map(|_| device.new_buffer(partial_size, opts))
         .collect();
 
-    let constants =
-        ops::matmul::matmul_align_constants(m, n, k, splitk_bm, splitk_bn, splitk_bk);
-    let pass1_pipeline = match registry
-        .get_pipeline_with_constants(pass1_kernel, DType::Float16, &constants)
-    {
-        Ok(p) => p,
-        Err(_) => return None,
-    };
+    let constants = ops::matmul::matmul_align_constants(m, n, k, splitk_bm, splitk_bn, splitk_bk);
+    let pass1_pipeline =
+        match registry.get_pipeline_with_constants(pass1_kernel, DType::Float16, &constants) {
+            Ok(p) => p,
+            Err(_) => return None,
+        };
     let pass2_pipeline = match registry.get_pipeline("splitk_reduce_f16", DType::Float16) {
         Ok(p) => p,
         Err(_) => return None,
@@ -160,37 +157,36 @@ fn bench_pipelined_splitk(
     let reduce_grid = MTLSize::new(reduce_groups, 1, 1);
     let reduce_tg = MTLSize::new(reduce_tg_size, 1, 1);
 
-    let encode_dispatch = |cb: &metal::CommandBufferRef,
-                           out_buf: &metal::Buffer,
-                           partial_buf: &metal::Buffer| {
-        // Pass 1
-        {
-            let enc = cb.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&pass1_pipeline);
-            enc.set_buffer(0, Some(a.metal_buffer()), 0);
-            enc.set_buffer(1, Some(b.metal_buffer()), 0);
-            enc.set_buffer(2, Some(partial_buf), 0);
-            set_u32(enc, 3, m_u32);
-            set_u32(enc, 4, n_u32);
-            set_u32(enc, 5, k_u32);
-            set_u32(enc, 6, splits_u32);
-            set_u32(enc, 7, swizzle_log);
-            enc.dispatch_thread_groups(pass1_grid, pass1_tg);
-            enc.end_encoding();
-        }
-        // Pass 2 (reduce)
-        {
-            let enc = cb.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&pass2_pipeline);
-            enc.set_buffer(0, Some(partial_buf), 0);
-            enc.set_buffer(1, Some(out_buf), 0);
-            set_u32(enc, 2, m_u32);
-            set_u32(enc, 3, n_u32);
-            set_u32(enc, 4, splits_u32);
-            enc.dispatch_thread_groups(reduce_grid, reduce_tg);
-            enc.end_encoding();
-        }
-    };
+    let encode_dispatch =
+        |cb: &metal::CommandBufferRef, out_buf: &metal::Buffer, partial_buf: &metal::Buffer| {
+            // Pass 1
+            {
+                let enc = cb.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&pass1_pipeline);
+                enc.set_buffer(0, Some(a.metal_buffer()), 0);
+                enc.set_buffer(1, Some(b.metal_buffer()), 0);
+                enc.set_buffer(2, Some(partial_buf), 0);
+                set_u32(enc, 3, m_u32);
+                set_u32(enc, 4, n_u32);
+                set_u32(enc, 5, k_u32);
+                set_u32(enc, 6, splits_u32);
+                set_u32(enc, 7, swizzle_log);
+                enc.dispatch_thread_groups(pass1_grid, pass1_tg);
+                enc.end_encoding();
+            }
+            // Pass 2 (reduce)
+            {
+                let enc = cb.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&pass2_pipeline);
+                enc.set_buffer(0, Some(partial_buf), 0);
+                enc.set_buffer(1, Some(out_buf), 0);
+                set_u32(enc, 2, m_u32);
+                set_u32(enc, 3, n_u32);
+                set_u32(enc, 4, splits_u32);
+                enc.dispatch_thread_groups(reduce_grid, reduce_tg);
+                enc.end_encoding();
+            }
+        };
 
     // Warmup
     for _ in 0..WARMUP_ITERS {
@@ -283,8 +279,7 @@ fn main() {
     let mut best_results: Vec<BestResult> = Vec::new();
 
     // Total combos for progress
-    let total_combos =
-        M_VALUES.len() * SHAPES.len() * (SMALL_SPLITS.len() + MLX_SPLITS.len());
+    let total_combos = M_VALUES.len() * SHAPES.len() * (SMALL_SPLITS.len() + MLX_SPLITS.len());
     let mut done = 0usize;
 
     // Run largest M first (already ordered in M_VALUES)
@@ -428,10 +423,7 @@ fn main() {
     println!();
     println!("=== Detailed Results: SplitK-Small (BM=32, BN=32, BK=16) ===");
     println!();
-    print!(
-        "| {:>3} | {:>10} |",
-        "M", "NxK"
-    );
+    print!("| {:>3} | {:>10} |", "M", "NxK");
     for &ns in SMALL_SPLITS {
         print!(" {:>7} |", format!("n={}", ns));
     }
@@ -477,10 +469,7 @@ fn main() {
     println!();
     println!("=== Detailed Results: SplitK-MLX (BM=64, BN=64, BK=16) ===");
     println!();
-    print!(
-        "| {:>3} | {:>10} |",
-        "M", "NxK"
-    );
+    print!("| {:>3} | {:>10} |", "M", "NxK");
     for &ns in MLX_SPLITS {
         print!(" {:>7} |", format!("n={}", ns));
     }
@@ -547,9 +536,9 @@ fn main() {
         for &m in M_VALUES {
             print!("| {:>5} |", m);
             for &(n, k) in SHAPES {
-                let best = best_results.iter().find(|r| {
-                    r.m == m && r.n == n && r.k == k && r.kernel_label == *kernel_label
-                });
+                let best = best_results
+                    .iter()
+                    .find(|r| r.m == m && r.n == n && r.k == k && r.kernel_label == *kernel_label);
                 if let Some(b) = best {
                     let t = tflops(m, n, k, b.best_us);
                     print!(" n={:<2} {:>5.1}us {:>4.2}T |", b.best_n, b.best_us, t);

@@ -1,3 +1,7 @@
+//! ⚠️ NON-PRODUCTION PATH — per-op sync matmul(): creates+commits+waits a new CB per call.
+//! ~300us/call overhead makes throughput numbers meaningless for production comparison.
+//! For kernel-level comparison use gemm_fair_bench pipelined mode; for production, pipeline_bench.
+//!
 //! Standalone GEMM kernel benchmark — per-op latency and TFLOPS.
 //!
 //! Tests matmul [M, K] @ [K, N] for various M, K, N combinations using f16 dtype.

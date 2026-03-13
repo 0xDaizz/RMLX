@@ -1,3 +1,7 @@
+//! ⚠️ NON-PRODUCTION PATH — old GEMM optimization parameter sweep. Direct kernel encoding,
+//! development only. Bypasses matmul() dispatch.
+//! For production throughput, use e2e_prefill_bench (prefill) or pipeline_bench (decode).
+//!
 //! Parameterized GEMM optimization benchmark — tests 11 kernel variants with
 //! serpentine MMA ordering, threadgroup memory padding, and single/double buffering.
 //!

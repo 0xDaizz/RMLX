@@ -1,3 +1,7 @@
+//! ⚠️ NON-PRODUCTION PATH — direct kernel encoding for NAX low-M investigation.
+//! Development only. Bypasses matmul() dispatch.
+//! For production throughput, use e2e_prefill_bench (prefill) or pipeline_bench (decode).
+//!
 //! NAX GEMM low-M comprehensive benchmark.
 //!
 //! Tests ALL kernel variants at ALL M values (no restrictions):

@@ -1,3 +1,7 @@
+//! ⚠️ NON-PRODUCTION PATH — low-M kernel comparison with direct kernel encoding.
+//! Development only; pipelined mode simulates 32-layer but bypasses TransformerModel.
+//! For production throughput, use e2e_prefill_bench (prefill) or pipeline_bench (decode).
+//!
 //! Low-M kernel comparison benchmark (M=2..8).
 //!
 //! Compares all viable kernel dispatch strategies for small M values

@@ -1,3 +1,7 @@
+//! ⚠️ NON-PRODUCTION PATH — GEMM parameter sweep. Direct kernel encoding, development only.
+//! Bypasses matmul() dispatch.
+//! For production throughput, use e2e_prefill_bench (prefill) or pipeline_bench (decode).
+//!
 //! Parameterized GEMM sweep benchmark — tests 7 kernel configurations.
 //!
 //! Generates Metal shader variants with different tile/SG/buffering parameters,

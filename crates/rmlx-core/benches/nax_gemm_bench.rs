@@ -1,3 +1,7 @@
+//! ⚠️ NON-PRODUCTION PATH — direct kernel encoding for NAX GEMM variant comparison.
+//! Bypasses matmul() dispatch. Development/tuning only.
+//! For production throughput, use e2e_prefill_bench (prefill) or pipeline_bench (decode).
+//!
 //! NAX GEMM v1/v2/v3 A/B test benchmark.
 //!
 //! Compares three NAX kernel variants for f16 GEMM:

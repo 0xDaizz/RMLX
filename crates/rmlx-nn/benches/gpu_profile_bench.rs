@@ -1,3 +1,7 @@
+//! ⚠️ NON-PRODUCTION PATH — GPU timestamp per-op profiling. Diagnostic only;
+//! measures pure GPU execution time per op, not production TransformerModel forward path.
+//! For production throughput, use e2e_prefill_bench (prefill) or pipeline_bench (decode).
+//!
 //! GPU-timestamp-based per-operation profiling benchmark for RMLX prefill.
 //!
 //! Unlike `op_profile_bench.rs` which uses `Instant::now()` (wall-clock),
