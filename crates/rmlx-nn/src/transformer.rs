@@ -1,5 +1,7 @@
 //! Transformer block: attention + MLP (or MoE).
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use rmlx_core::arena::ForwardArena;
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
@@ -9,6 +11,20 @@ use rmlx_metal::event::GpuEvent;
 use rmlx_metal::exec_graph::ExecGraph;
 
 use crate::attention::{Attention, LayerKvCache};
+
+/// Fused norm GEMM is bypassed (separate RMSNorm + matmul) when M <= this threshold.
+/// Default: 0 (always use fused). Set via [`set_fused_norm_threshold()`].
+static FUSED_NORM_THRESHOLD: AtomicUsize = AtomicUsize::new(0);
+
+/// Set the M threshold below which fused norm GEMM falls back to separate ops.
+pub fn set_fused_norm_threshold(threshold: usize) {
+    FUSED_NORM_THRESHOLD.store(threshold, Ordering::Relaxed);
+}
+
+/// Get the current fused norm threshold.
+pub fn fused_norm_threshold() -> usize {
+    FUSED_NORM_THRESHOLD.load(Ordering::Relaxed)
+}
 use crate::embedding::Embedding;
 use crate::linear::Linear;
 use crate::moe::MoeLayer;
@@ -403,17 +419,35 @@ impl FeedForward {
                     h.reshape(vec![h.shape()[0], h.shape()[1]])?
                 };
                 let hidden = if let Some(ref guw_t) = gate_up_merged_weight_t {
-                    // Fused RMSNorm + merged gate+up GEMM (inv_rms + norm-GEMM)
-                    let merged = ops::matmul::matmul_norm_gemm_encode(
-                        registry,
-                        &h_2d,
-                        guw_t,
-                        norm_weight,
-                        eps,
-                        encoder,
-                    )?;
+                    let m = h_2d.shape()[0];
+                    let threshold = FUSED_NORM_THRESHOLD.load(Ordering::Relaxed);
+                    let merged = if threshold > 0 && m <= threshold {
+                        // For small M, separate RMSNorm + optimal-tile matmul is faster
+                        // because matmul_norm_gemm forces MlxArch 64x64, while regular
+                        // matmul can use MlxArchMicro 16x32 which is better for M<=32.
+                        // M=64 is 47% slower with separate path; M=32 showed -10ms improvement.
+                        let normed = ops::rms_norm::rms_norm_encode(
+                            registry,
+                            &h_2d,
+                            Some(norm_weight),
+                            eps,
+                            encoder,
+                        )?;
+                        encoder.memory_barrier_with_resources(&[buf_as_resource(normed.metal_buffer())]);
+                        ops::matmul::matmul_encode(registry, &normed, guw_t, encoder)?
+                    } else {
+                        // Fused RMSNorm + merged gate+up GEMM (inv_rms + norm-GEMM)
+                        ops::matmul::matmul_norm_gemm_encode(
+                            registry,
+                            &h_2d,
+                            guw_t,
+                            norm_weight,
+                            eps,
+                            encoder,
+                        )?
+                    };
                     let gate_dim = guw_t.shape()[1] / 2;
-                    // Memory barrier: norm-GEMM output must be visible
+                    // Memory barrier: GEMM output must be visible
                     encoder
                         .memory_barrier_with_resources(&[buf_as_resource(merged.metal_buffer())]);
                     ops::fused::fused_silu_mul_strided_encode(registry, &merged, gate_dim, encoder)?

@@ -59,7 +59,7 @@ const NUM_LAYERS: usize = 32;
 ///                 = 2*M * 214_695_936
 const FLOPS_PER_TOKEN_PER_LAYER: f64 = 2.0 * 214_695_936.0;
 
-const SEQ_LENS: &[usize] = &[32, 128, 256, 512, 1024];
+const SEQ_LENS: &[usize] = &[32, 64, 128, 256, 512, 1024];
 const WARMUP_ITERS: usize = 3;
 const BENCH_ITERS: usize = 10;
 
@@ -637,7 +637,7 @@ fn main() {
         // ==== Benchmark 4: CB overhead analysis ====
         // Compare different layers_per_cb values to measure CB creation overhead.
         // Only run for small seq_lens to keep total bench time manageable.
-        if seq_len == 32 || seq_len == 128 {
+        if seq_len == 32 || seq_len == 64 || seq_len == 128 {
             let queue_oh = device.new_command_queue();
             let event_oh = GpuEvent::new(device);
             let n_runs = 10;
@@ -765,6 +765,111 @@ fn main() {
         );
     }
     println!();
+
+    // ---------------------------------------------------------------------------
+    // Fused Norm Threshold Sweep (CompiledPrefill only)
+    // ---------------------------------------------------------------------------
+
+    println!("\n\n========== Fused Norm Threshold Sweep ==========");
+    println!(
+        "| {:>7} | {:>12} | {:>12} | {:>12} | {:>12} |",
+        "seq_len", "fused_all", "m<=32", "m<=64", "m<=128"
+    );
+    println!("|---------|--------------|--------------|--------------|--------------|");
+
+    let thresholds = [0usize, 32, 64, 128];
+
+    for &seq_len in SEQ_LENS {
+        let cos_freqs = cos_full.slice(0, 0, seq_len).expect("cos slice failed");
+        let sin_freqs = sin_full.slice(0, 0, seq_len).expect("sin slice failed");
+        let tids = &token_ids[..seq_len];
+        let queue_sweep = device.new_command_queue();
+        let event_sweep = GpuEvent::new(device);
+
+        let mut row_values: Vec<f64> = Vec::new();
+
+        for &threshold in &thresholds {
+            rmlx_nn::set_fused_norm_threshold(threshold);
+
+            let mut caches = make_caches(device);
+
+            // Warmup
+            {
+                let _pool = ScopedPool::new();
+                for _ in 0..3 {
+                    reset_caches(&mut caches);
+                    let _ = model
+                        .forward_graph_unified(
+                            tids,
+                            Some(&cos_freqs),
+                            Some(&sin_freqs),
+                            None,
+                            Some(&mut caches[..]),
+                            ForwardMode::CompiledPrefill,
+                            &registry,
+                            &queue_sweep,
+                            &event_sweep,
+                        )
+                        .expect("sweep warmup failed");
+                    let sync = queue_sweep.new_command_buffer();
+                    sync.commit();
+                    sync.wait_until_completed();
+                }
+            }
+
+            // Measure
+            let mut times = Vec::with_capacity(5);
+            {
+                let _pool = ScopedPool::new();
+                for _ in 0..5 {
+                    reset_caches(&mut caches);
+                    let start = Instant::now();
+                    let _ = model
+                        .forward_graph_unified(
+                            tids,
+                            Some(&cos_freqs),
+                            Some(&sin_freqs),
+                            None,
+                            Some(&mut caches[..]),
+                            ForwardMode::CompiledPrefill,
+                            &registry,
+                            &queue_sweep,
+                            &event_sweep,
+                        )
+                        .expect("sweep failed");
+                    let sync = queue_sweep.new_command_buffer();
+                    sync.commit();
+                    sync.wait_until_completed();
+                    times.push(start.elapsed().as_secs_f64() * 1e6);
+                }
+            }
+
+            let mean: f64 = times.iter().sum::<f64>() / times.len() as f64;
+            row_values.push(mean);
+        }
+
+        // Find best
+        let best_idx = row_values
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+
+        print!("| {:>7} |", seq_len);
+        for (i, val) in row_values.iter().enumerate() {
+            if i == best_idx {
+                print!(" {:>10.0}* |", val);
+            } else {
+                print!(" {:>11.0} |", val);
+            }
+        }
+        println!();
+    }
+
+    // Reset to default
+    rmlx_nn::set_fused_norm_threshold(0);
+    println!("(* = best for this seq_len)");
 
     // Print buffer pool stats
     let (hits, misses, cached) = rmlx_core::array::array_pool_stats();
