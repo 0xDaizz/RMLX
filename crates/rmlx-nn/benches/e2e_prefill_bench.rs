@@ -613,7 +613,12 @@ fn main() {
             }
             let (alloc_count, alloc_nanos, alloc_bytes) = rmlx_core::array::get_alloc_stats();
 
-            (Stats::from_durations(&latencies), alloc_count, alloc_nanos, alloc_bytes)
+            (
+                Stats::from_durations(&latencies),
+                alloc_count,
+                alloc_nanos,
+                alloc_bytes,
+            )
         };
 
         let tflops_compiled = compute_tflops(seq_len, stats_compiled.mean);
@@ -644,10 +649,7 @@ fn main() {
 
             // Test different layers_per_cb to measure CB creation overhead
             let cb_configs = vec![1, 2, 4, 8, 16, 32];
-            println!(
-                "\n  --- CB overhead analysis (seq_len={}) ---",
-                seq_len
-            );
+            println!("\n  --- CB overhead analysis (seq_len={}) ---", seq_len);
             println!(
                 "  | {:>12} | {:>12} | {:>12} |",
                 "layers/CB", "mean (us)", "vs compiled"
@@ -754,9 +756,7 @@ fn main() {
     println!(
         "|---------|--------------|----------|-----------------|----------|----------|-----------------|----------|----------|"
     );
-    for &(seq_len, ref s_fwd, t_fwd, ref s_graph, t_graph, ref s_compiled, t_compiled) in
-        &results
-    {
+    for &(seq_len, ref s_fwd, t_fwd, ref s_graph, t_graph, ref s_compiled, t_compiled) in &results {
         let sp_graph = s_fwd.mean / s_graph.mean;
         let sp_compiled = s_fwd.mean / s_compiled.mean;
         println!(

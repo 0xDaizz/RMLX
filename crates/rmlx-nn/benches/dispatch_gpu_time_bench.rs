@@ -133,7 +133,7 @@ fn percentile_sorted(sorted: &[f64], pct: f64) -> f64 {
     }
 }
 
-fn p50(times: &mut Vec<f64>) -> f64 {
+fn p50(times: &mut [f64]) -> f64 {
     times.sort_by(|a, b| a.partial_cmp(b).unwrap());
     percentile_sorted(times, 50.0)
 }

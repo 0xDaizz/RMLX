@@ -943,9 +943,11 @@ mod tests {
     fn test_transpose_2d() {
         // Simulate a [3, 4] array with contiguous strides [4, 1]
         let arr = Array {
-            buffer: ManuallyDrop::new(metal::Device::system_default()
-                .unwrap()
-                .new_buffer(48, MTLResourceOptions::StorageModeShared)),
+            buffer: ManuallyDrop::new(
+                metal::Device::system_default()
+                    .unwrap()
+                    .new_buffer(48, MTLResourceOptions::StorageModeShared),
+            ),
             shape: vec![3, 4],
             strides: vec![4, 1],
             dtype: DType::Float32,
@@ -959,9 +961,11 @@ mod tests {
     #[test]
     fn test_transpose_3d() {
         let arr = Array {
-            buffer: ManuallyDrop::new(metal::Device::system_default()
-                .unwrap()
-                .new_buffer(96, MTLResourceOptions::StorageModeShared)),
+            buffer: ManuallyDrop::new(
+                metal::Device::system_default()
+                    .unwrap()
+                    .new_buffer(96, MTLResourceOptions::StorageModeShared),
+            ),
             shape: vec![2, 3, 4],
             strides: vec![12, 4, 1],
             dtype: DType::Float32,
@@ -975,9 +979,11 @@ mod tests {
     #[test]
     fn test_transpose_same_dim_is_noop() {
         let arr = Array {
-            buffer: ManuallyDrop::new(metal::Device::system_default()
-                .unwrap()
-                .new_buffer(48, MTLResourceOptions::StorageModeShared)),
+            buffer: ManuallyDrop::new(
+                metal::Device::system_default()
+                    .unwrap()
+                    .new_buffer(48, MTLResourceOptions::StorageModeShared),
+            ),
             shape: vec![3, 4],
             strides: vec![4, 1],
             dtype: DType::Float32,
@@ -991,9 +997,11 @@ mod tests {
     #[test]
     fn test_transpose_out_of_range() {
         let arr = Array {
-            buffer: ManuallyDrop::new(metal::Device::system_default()
-                .unwrap()
-                .new_buffer(48, MTLResourceOptions::StorageModeShared)),
+            buffer: ManuallyDrop::new(
+                metal::Device::system_default()
+                    .unwrap()
+                    .new_buffer(48, MTLResourceOptions::StorageModeShared),
+            ),
             shape: vec![3, 4],
             strides: vec![4, 1],
             dtype: DType::Float32,
@@ -1006,9 +1014,11 @@ mod tests {
     #[test]
     fn test_squeeze_dim() {
         let arr = Array {
-            buffer: ManuallyDrop::new(metal::Device::system_default()
-                .unwrap()
-                .new_buffer(48, MTLResourceOptions::StorageModeShared)),
+            buffer: ManuallyDrop::new(
+                metal::Device::system_default()
+                    .unwrap()
+                    .new_buffer(48, MTLResourceOptions::StorageModeShared),
+            ),
             shape: vec![1, 3, 4],
             strides: vec![12, 4, 1],
             dtype: DType::Float32,
@@ -1022,9 +1032,11 @@ mod tests {
     #[test]
     fn test_squeeze_dim_middle() {
         let arr = Array {
-            buffer: ManuallyDrop::new(metal::Device::system_default()
-                .unwrap()
-                .new_buffer(48, MTLResourceOptions::StorageModeShared)),
+            buffer: ManuallyDrop::new(
+                metal::Device::system_default()
+                    .unwrap()
+                    .new_buffer(48, MTLResourceOptions::StorageModeShared),
+            ),
             shape: vec![3, 1, 4],
             strides: vec![4, 4, 1],
             dtype: DType::Float32,
@@ -1038,9 +1050,11 @@ mod tests {
     #[test]
     fn test_squeeze_dim_non_one_fails() {
         let arr = Array {
-            buffer: ManuallyDrop::new(metal::Device::system_default()
-                .unwrap()
-                .new_buffer(48, MTLResourceOptions::StorageModeShared)),
+            buffer: ManuallyDrop::new(
+                metal::Device::system_default()
+                    .unwrap()
+                    .new_buffer(48, MTLResourceOptions::StorageModeShared),
+            ),
             shape: vec![3, 4],
             strides: vec![4, 1],
             dtype: DType::Float32,

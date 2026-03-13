@@ -253,8 +253,8 @@ fn main() {
 
         let tflops_a = 2.0 * m as f64 * n as f64 * k as f64 / (mode_a * 1e-6) / 1e12;
 
-        print!(
-            "  M={}: A={:.1}us B={:.1}us C={:.1}us ({:.2}T)\n",
+        println!(
+            "  M={}: A={:.1}us B={:.1}us C={:.1}us ({:.2}T)",
             m, mode_a, mode_b, mode_c, tflops_a
         );
 

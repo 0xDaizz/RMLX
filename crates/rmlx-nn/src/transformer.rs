@@ -433,7 +433,9 @@ impl FeedForward {
                             eps,
                             encoder,
                         )?;
-                        encoder.memory_barrier_with_resources(&[buf_as_resource(normed.metal_buffer())]);
+                        encoder.memory_barrier_with_resources(&[buf_as_resource(
+                            normed.metal_buffer(),
+                        )]);
                         ops::matmul::matmul_encode(registry, &normed, guw_t, encoder)?
                     } else {
                         // Fused RMSNorm + merged gate+up GEMM (inv_rms + norm-GEMM)

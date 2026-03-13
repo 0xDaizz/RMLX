@@ -6813,9 +6813,9 @@ pub fn matmul(
     // M>=33: never Split-K (tiled GEMM wins across all shapes)
     // -----------------------------------------------------------------------
     if a.dtype() == DType::Float16 && k >= 256 {
-        let use_splitk = if m >= 2 && m <= 8 {
+        let use_splitk = if (2..=8).contains(&m) {
             true
-        } else if m >= 9 && m <= 32 {
+        } else if (9..=32).contains(&m) {
             k >= n
         } else {
             false
@@ -7522,9 +7522,9 @@ pub fn matmul_into_cb(
     // M>=33: never Split-K (tiled GEMM wins across all shapes)
     // -------------------------------------------------------------------
     if a.dtype() == DType::Float16 && k >= 256 {
-        let use_splitk = if m >= 2 && m <= 8 {
+        let use_splitk = if (2..=8).contains(&m) {
             true
-        } else if m >= 9 && m <= 32 {
+        } else if (9..=32).contains(&m) {
             k >= n
         } else {
             false

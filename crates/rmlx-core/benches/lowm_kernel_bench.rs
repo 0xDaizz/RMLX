@@ -383,6 +383,7 @@ fn bench_pipelined_splitk(
 // Pipelined auto-dispatch benchmark (uses matmul_into_cb)
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 fn bench_pipelined_auto(registry: &KernelRegistry, a: &Array, b: &Array) -> f64 {
     let device = registry.device().raw();
     let queue = device.new_command_queue();

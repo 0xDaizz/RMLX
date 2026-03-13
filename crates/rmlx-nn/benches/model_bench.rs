@@ -386,7 +386,7 @@ fn load_model_from_safetensors(
         None,
     )?;
 
-    let mut model =
+    let model =
         TransformerModel::from_parts(transformer_config, embedding, layers, final_norm, lm_head)?;
     println!(
         "  Model ready: {} layers, total load time {:.1}s",
