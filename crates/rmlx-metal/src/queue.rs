@@ -20,12 +20,17 @@ pub fn fast_command_buffer(queue: &CommandQueue) -> &CommandBufferRef {
     queue.new_command_buffer_with_unretained_references()
 }
 
-/// Owned variant: creates an unretained-references command buffer and calls
-/// `.to_owned()` so it survives the autorelease pool.
+/// Owned variant: creates a **retained-references** command buffer.
+///
+/// Uses `new_command_buffer()` (retained) instead of `new_command_buffer_with_unretained_references()`
+/// because ExecGraph batches multiple operations into a single CB. Intermediate
+/// Arrays (norm outputs, attention intermediates) may be dropped before the CB
+/// is committed to the GPU, causing use-after-free. Retained CBs hold strong
+/// references to all encoder resources, keeping buffers alive until GPU completion.
 #[inline]
 pub fn fast_command_buffer_owned(queue: &CommandQueue) -> CommandBuffer {
     queue
-        .new_command_buffer_with_unretained_references()
+        .new_command_buffer()
         .to_owned()
 }
 

@@ -3,7 +3,8 @@
 //! Measures full 32-layer TransformerModel forward pass latency across
 //! multiple sequence lengths to profile end-to-end prefill performance.
 //!
-//! Benchmarks both `forward()` and `forward_pipelined()` paths.
+//! Benchmarks `forward()`, `forward_pipelined()`, and `forward_prefill_graph()`
+//! (single-CB-per-layer production fast path via ExecGraph).
 //!
 //! Each seq_len gets a **fresh command queue** to prevent cross-contamination.
 //!
@@ -17,6 +18,7 @@ use rmlx_core::dtype::DType;
 use rmlx_core::kernels::KernelRegistry;
 use rmlx_core::ops;
 use rmlx_metal::device::GpuDevice;
+use rmlx_metal::event::GpuEvent;
 use rmlx_metal::ScopedPool;
 use rmlx_nn::{
     Attention, AttentionConfig, Embedding, EmbeddingConfig, FeedForward, FeedForwardType,
@@ -190,7 +192,11 @@ fn make_linear(device: &metal::Device, in_f: usize, out_f: usize, seed: u64) -> 
     .expect("linear from_arrays")
 }
 
-fn build_transformer_block(device: &metal::Device, layer_idx: usize, seed_base: u64) -> TransformerBlock {
+fn build_transformer_block(
+    device: &metal::Device,
+    layer_idx: usize,
+    seed_base: u64,
+) -> TransformerBlock {
     let kv_size = NUM_KV_HEADS * HEAD_DIM;
     let s = seed_base;
 
@@ -223,7 +229,14 @@ fn build_transformer_block(device: &metal::Device, layer_idx: usize, seed_base: 
     let norm1_weight = ones_f16(device, HIDDEN_SIZE);
     let norm2_weight = ones_f16(device, HIDDEN_SIZE);
 
-    TransformerBlock::from_parts(layer_idx, attention, ffn, norm1_weight, norm2_weight, RMS_NORM_EPS)
+    TransformerBlock::from_parts(
+        layer_idx,
+        attention,
+        ffn,
+        norm1_weight,
+        norm2_weight,
+        RMS_NORM_EPS,
+    )
 }
 
 fn build_model(device: &metal::Device) -> TransformerModel {
@@ -343,9 +356,8 @@ fn main() {
     println!("Weights prepared.");
 
     // Precompute RoPE cos/sin tables: shape [MAX_SEQ_LEN, HEAD_DIM/2]
-    let (cos_vec, sin_vec) =
-        ops::rope::precompute_freqs(MAX_SEQ_LEN, HEAD_DIM, ROPE_THETA, 1.0)
-            .expect("precompute_freqs failed");
+    let (cos_vec, sin_vec) = ops::rope::precompute_freqs(MAX_SEQ_LEN, HEAD_DIM, ROPE_THETA, 1.0)
+        .expect("precompute_freqs failed");
     let cos_full = Array::from_slice(device, &cos_vec, vec![MAX_SEQ_LEN, HEAD_DIM / 2]);
     let sin_full = Array::from_slice(device, &sin_vec, vec![MAX_SEQ_LEN, HEAD_DIM / 2]);
 
@@ -360,8 +372,8 @@ fn main() {
         token_ids.push((state >> 33) as u32 % VOCAB_SIZE as u32);
     }
 
-    // Collect results: (seq_len, forward_stats, pipelined_stats)
-    let mut results: Vec<(usize, Stats, f64, Stats, f64)> = Vec::new();
+    // Collect results: (seq_len, forward_stats, pipelined_stats, prefill_graph_stats)
+    let mut results: Vec<(usize, Stats, f64, Stats, f64, Stats, f64)> = Vec::new();
 
     for &seq_len in SEQ_LENS {
         println!("\n--- seq_len={} ---", seq_len);
@@ -478,7 +490,116 @@ fn main() {
         println!("  forward_pipelined: {}", stats_pipe);
         println!("    estimated TFLOPS: {:.2}", tflops_pipe);
 
-        results.push((seq_len, stats_fwd, tflops_fwd, stats_pipe, tflops_pipe));
+        // ==== Benchmark 3: forward_prefill_graph() (single CB per layer, production path) ====
+        let queue_graph = device.new_command_queue();
+        let event = GpuEvent::new(device);
+        let stats_graph = {
+            let mut caches = make_caches(device);
+
+            // Warmup
+            {
+                let _pool = ScopedPool::new();
+                for _ in 0..WARMUP_ITERS {
+                    reset_caches(&mut caches);
+                    let _out = model
+                        .forward_prefill_graph(
+                            tids,
+                            Some(&cos_freqs),
+                            Some(&sin_freqs),
+                            None,
+                            &mut caches,
+                            &registry,
+                            &queue_graph,
+                            &event,
+                        )
+                        .expect("forward_prefill_graph warmup failed");
+                    // Force GPU completion by submitting an empty CB and waiting
+                    let sync_cb = queue_graph.new_command_buffer();
+                    sync_cb.commit();
+                    sync_cb.wait_until_completed();
+                }
+            }
+
+            // Debug: single timed call with output validation
+            {
+                let _pool = ScopedPool::new();
+                reset_caches(&mut caches);
+                let debug_start = Instant::now();
+                let debug_out = model
+                    .forward_prefill_graph(
+                        tids,
+                        Some(&cos_freqs),
+                        Some(&sin_freqs),
+                        None,
+                        &mut caches,
+                        &registry,
+                        &queue_graph,
+                        &event,
+                    )
+                    .expect("debug forward failed");
+                // Force GPU sync
+                let sync_cb = queue_graph.new_command_buffer();
+                sync_cb.commit();
+                sync_cb.wait_until_completed();
+                let debug_elapsed = debug_start.elapsed();
+                println!(
+                    "  [DEBUG] prefill_graph single call: {:.1}ms",
+                    debug_elapsed.as_secs_f64() * 1000.0
+                );
+                println!("  [DEBUG] output shape: {:?}", debug_out.shape());
+                // Read first bytes to verify non-zero computation
+                let first_bytes = debug_out.to_bytes();
+                let show_len = 8.min(first_bytes.len());
+                println!(
+                    "  [DEBUG] output bytes[0..{}]: {:?}",
+                    show_len,
+                    &first_bytes[..show_len]
+                );
+            }
+
+            // Benchmark
+            let mut latencies = Vec::with_capacity(BENCH_ITERS);
+            {
+                let _pool = ScopedPool::new();
+                for _ in 0..BENCH_ITERS {
+                    reset_caches(&mut caches);
+                    let start = Instant::now();
+                    let _out = model
+                        .forward_prefill_graph(
+                            tids,
+                            Some(&cos_freqs),
+                            Some(&sin_freqs),
+                            None,
+                            &mut caches,
+                            &registry,
+                            &queue_graph,
+                            &event,
+                        )
+                        .expect("forward_prefill_graph failed");
+                    // Force GPU completion by submitting an empty CB and waiting
+                    let sync_cb = queue_graph.new_command_buffer();
+                    sync_cb.commit();
+                    sync_cb.wait_until_completed();
+                    latencies.push(start.elapsed());
+                }
+            }
+
+            Stats::from_durations(&latencies)
+        };
+
+        let tflops_graph = compute_tflops(seq_len, stats_graph.mean);
+        println!("  prefill_graph    : {}", stats_graph);
+        println!("    estimated TFLOPS: {:.2}", tflops_graph);
+
+        results.push((
+            seq_len,
+            stats_fwd,
+            tflops_fwd,
+            stats_pipe,
+            tflops_pipe,
+            stats_graph,
+            tflops_graph,
+        ));
     }
 
     // ---------------------------------------------------------------------------
@@ -486,14 +607,25 @@ fn main() {
     // ---------------------------------------------------------------------------
 
     println!("\n\n========== E2E Prefill Summary (32-layer, Qwen 7B-style) ==========");
-    println!("| {:>7} | {:>12} | {:>8} | {:>12} | {:>8} | {:>6} |",
-        "seq_len", "forward (us)", "TFLOPS", "pipelined (us)", "TFLOPS", "speedup");
-    println!("|---------|--------------|----------|----------------|----------|--------|");
-    for &(seq_len, ref s_fwd, t_fwd, ref s_pipe, t_pipe) in &results {
-        let speedup = s_fwd.mean / s_pipe.mean;
+    println!(
+        "| {:>7} | {:>12} | {:>8} | {:>14} | {:>8} | {:>15} | {:>8} | {:>7} | {:>7} |",
+        "seq_len",
+        "forward (us)",
+        "TFLOPS",
+        "pipelined (us)",
+        "TFLOPS",
+        "prefill_graph",
+        "TFLOPS",
+        "sp_pipe",
+        "sp_graph"
+    );
+    println!("|---------|--------------|----------|----------------|----------|-----------------|----------|---------|---------|");
+    for &(seq_len, ref s_fwd, t_fwd, ref s_pipe, t_pipe, ref s_graph, t_graph) in &results {
+        let sp_pipe = s_fwd.mean / s_pipe.mean;
+        let sp_graph = s_fwd.mean / s_graph.mean;
         println!(
-            "| {:>7} | {:>12.1} | {:>8.2} | {:>14.1} | {:>8.2} | {:>5.2}x |",
-            seq_len, s_fwd.mean, t_fwd, s_pipe.mean, t_pipe, speedup
+            "| {:>7} | {:>12.1} | {:>8.2} | {:>14.1} | {:>8.2} | {:>15.1} | {:>8.2} | {:>6.2}x | {:>6.2}x |",
+            seq_len, s_fwd.mean, t_fwd, s_pipe.mean, t_pipe, s_graph.mean, t_graph, sp_pipe, sp_graph
         );
     }
     println!();
