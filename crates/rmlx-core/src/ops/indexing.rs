@@ -785,17 +785,20 @@ mod tests {
     use super::*;
 
     /// Helper: set up device, queue, and kernel registry for tests.
-    fn setup() -> (KernelRegistry, rmlx_metal::MtlQueue) {
-        let device = crate::test_utils::test_gpu();
+    fn setup() -> Option<(KernelRegistry, rmlx_metal::MtlQueue)> {
+        let device = crate::test_utils::test_gpu()?;
         let queue = device.new_command_queue();
         let registry = KernelRegistry::new(device);
         register(&registry).expect("register indexing kernels");
-        (registry, queue)
+        Some((registry, queue))
     }
 
     #[test]
     fn test_gather_basic() {
-        let (reg, q) = setup();
+        let Some((reg, q)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = reg.device().raw();
         let src = Array::from_slice(dev, &[10.0f32, 20.0, 30.0, 40.0, 50.0], vec![5]);
         let idx = Array::from_slice(dev, &[4u32, 0, 2], vec![3]);
@@ -806,7 +809,10 @@ mod tests {
 
     #[test]
     fn test_gather_oob_produces_zero() {
-        let (reg, q) = setup();
+        let Some((reg, q)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = reg.device().raw();
         let src = Array::from_slice(dev, &[1.0f32, 2.0, 3.0], vec![3]);
         let idx = Array::from_slice(dev, &[0u32, 99, 2], vec![3]);
@@ -817,7 +823,10 @@ mod tests {
 
     #[test]
     fn test_gather_signed_negative_wrap() {
-        let (reg, q) = setup();
+        let Some((reg, q)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = reg.device().raw();
         let src = Array::from_slice(dev, &[10.0f32, 20.0, 30.0, 40.0], vec![4]);
         // -1i32 as u32 bits, -2i32 as u32 bits
@@ -830,7 +839,10 @@ mod tests {
 
     #[test]
     fn test_scatter_overwrite() {
-        let (reg, q) = setup();
+        let Some((reg, q)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = reg.device().raw();
         let src = Array::from_slice(dev, &[100.0f32, 200.0, 300.0], vec![3]);
         let idx = Array::from_slice(dev, &[1u32, 3, 0], vec![3]);
@@ -841,7 +853,10 @@ mod tests {
 
     #[test]
     fn test_scatter_add_accumulates() {
-        let (reg, q) = setup();
+        let Some((reg, q)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = reg.device().raw();
         let src = Array::from_slice(dev, &[1.0f32, 2.0, 3.0, 4.0], vec![4]);
         let idx = Array::from_slice(dev, &[0u32, 1, 0, 1], vec![4]);
@@ -855,7 +870,10 @@ mod tests {
 
     #[test]
     fn test_scatter_oob_skipped() {
-        let (reg, q) = setup();
+        let Some((reg, q)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = reg.device().raw();
         let src = Array::from_slice(dev, &[10.0f32, 20.0, 30.0], vec![3]);
         let idx = Array::from_slice(dev, &[0u32, 999, 2], vec![3]);
@@ -867,7 +885,10 @@ mod tests {
 
     #[test]
     fn test_scatter_add_convenience() {
-        let (reg, q) = setup();
+        let Some((reg, q)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = reg.device().raw();
         let src = Array::from_slice(dev, &[5.0f32, 5.0], vec![2]);
         let idx = Array::from_slice(dev, &[0u32, 0], vec![2]);
@@ -878,7 +899,10 @@ mod tests {
 
     #[test]
     fn test_scatter_max() {
-        let (reg, q) = setup();
+        let Some((reg, q)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = reg.device().raw();
         let src = Array::from_slice(dev, &[3.0f32, 1.0, 5.0, 2.0], vec![4]);
         let idx = Array::from_slice(dev, &[0u32, 0, 1, 1], vec![4]);
@@ -891,7 +915,10 @@ mod tests {
 
     #[test]
     fn test_scatter_min() {
-        let (reg, q) = setup();
+        let Some((reg, q)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = reg.device().raw();
         let src = Array::from_slice(dev, &[3.0f32, 1.0, 5.0, 2.0], vec![4]);
         let idx = Array::from_slice(dev, &[0u32, 0, 1, 1], vec![4]);
@@ -904,7 +931,10 @@ mod tests {
 
     #[test]
     fn test_gather_empty_indices() {
-        let (reg, q) = setup();
+        let Some((reg, q)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = reg.device().raw();
         let src = Array::from_slice(dev, &[1.0f32, 2.0], vec![2]);
         let idx = Array::from_slice(dev, &[] as &[u32], vec![0]);
@@ -914,7 +944,10 @@ mod tests {
 
     #[test]
     fn test_scatter_empty_src() {
-        let (reg, q) = setup();
+        let Some((reg, q)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = reg.device().raw();
         let src = Array::from_slice(dev, &[] as &[f32], vec![0]);
         let idx = Array::from_slice(dev, &[] as &[u32], vec![0]);

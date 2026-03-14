@@ -388,18 +388,21 @@ pub fn concat_many(
 mod tests {
     use super::*;
 
-    fn setup() -> (KernelRegistry, rmlx_metal::MtlQueue) {
-        let gpu_dev = crate::test_utils::test_gpu();
+    fn setup() -> Option<(KernelRegistry, rmlx_metal::MtlQueue)> {
+        let gpu_dev = crate::test_utils::test_gpu()?;
         let queue = gpu_dev.new_command_queue();
         let registry = KernelRegistry::new(gpu_dev);
         register(&registry).unwrap();
         crate::ops::copy::register(&registry).unwrap();
-        (registry, queue)
+        Some((registry, queue))
     }
 
     #[test]
     fn test_concat_axis0_1d() {
-        let (registry, queue) = setup();
+        let Some((registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let device = registry.device().raw();
 
         let a = Array::from_slice(device, &[1.0f32, 2.0, 3.0], vec![3]);
@@ -413,7 +416,10 @@ mod tests {
 
     #[test]
     fn test_concat_axis1_2d() {
-        let (registry, queue) = setup();
+        let Some((registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let device = registry.device().raw();
 
         // a: [[1,2],[3,4]] shape [2, 2]
@@ -429,7 +435,10 @@ mod tests {
 
     #[test]
     fn test_concat_shape_mismatch() {
-        let (registry, queue) = setup();
+        let Some((registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let device = registry.device().raw();
 
         let a = Array::from_slice(device, &[1.0f32, 2.0], vec![2]);

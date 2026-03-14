@@ -339,18 +339,21 @@ pub fn argmax(
 mod tests {
     use super::*;
 
-    fn setup() -> (KernelRegistry, rmlx_metal::MtlQueue) {
-        let device = crate::test_utils::test_gpu();
+    fn setup() -> Option<(KernelRegistry, rmlx_metal::MtlQueue)> {
+        let device = crate::test_utils::test_gpu()?;
         let queue = device.new_command_queue();
         let registry = KernelRegistry::new(device);
         register(&registry).expect("register argreduce kernels");
         crate::ops::copy::register(&registry).expect("register copy kernels");
-        (registry, queue)
+        Some((registry, queue))
     }
 
     #[test]
     fn test_argmax_1d() {
-        let (reg, q) = setup();
+        let Some((reg, q)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = reg.device().raw();
         let input = Array::from_slice(dev, &[3.0f32, 1.0, 5.0, 2.0, 4.0], vec![5]);
         let out = argmax(&reg, &input, 0, &q).unwrap();
@@ -360,7 +363,10 @@ mod tests {
 
     #[test]
     fn test_argmin_1d() {
-        let (reg, q) = setup();
+        let Some((reg, q)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = reg.device().raw();
         let input = Array::from_slice(dev, &[3.0f32, 1.0, 5.0, 2.0, 4.0], vec![5]);
         let out = argmin(&reg, &input, 0, &q).unwrap();
@@ -370,7 +376,10 @@ mod tests {
 
     #[test]
     fn test_argmax_2d_axis1() {
-        let (reg, q) = setup();
+        let Some((reg, q)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = reg.device().raw();
         // [[1, 5, 3], [9, 2, 7]]
         let input = Array::from_slice(dev, &[1.0f32, 5.0, 3.0, 9.0, 2.0, 7.0], vec![2, 3]);
@@ -382,7 +391,10 @@ mod tests {
 
     #[test]
     fn test_argmin_2d_axis0() {
-        let (reg, q) = setup();
+        let Some((reg, q)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = reg.device().raw();
         // [[10, 20], [5, 25]]
         let input = Array::from_slice(dev, &[10.0f32, 20.0, 5.0, 25.0], vec![2, 2]);

@@ -806,7 +806,7 @@ kernel void test_plain_kernel(
 
     /// Helper: create a GpuDevice from the shared Metal device.
     fn try_gpu_device() -> Option<GpuDevice> {
-        Some(crate::test_utils::test_gpu())
+        crate::test_utils::test_gpu()
     }
 
     #[test]

@@ -339,18 +339,21 @@ fn validate_scan_input(input: &Array, axis: usize) -> Result<(), KernelError> {
 mod tests {
     use super::*;
 
-    fn setup() -> (KernelRegistry, rmlx_metal::MtlQueue) {
-        let device = crate::test_utils::test_gpu();
+    fn setup() -> Option<(KernelRegistry, rmlx_metal::MtlQueue)> {
+        let device = crate::test_utils::test_gpu()?;
         let queue = device.new_command_queue();
         let registry = KernelRegistry::new(device);
         register(&registry).expect("register scan kernels");
         crate::ops::copy::register(&registry).expect("register copy kernels");
-        (registry, queue)
+        Some((registry, queue))
     }
 
     #[test]
     fn test_cumsum_1d() {
-        let (reg, q) = setup();
+        let Some((reg, q)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = reg.device().raw();
         let input = Array::from_slice(dev, &[1.0f32, 2.0, 3.0, 4.0, 5.0], vec![5]);
         let out = cumsum(&reg, &input, 0, &q).unwrap();
@@ -360,7 +363,10 @@ mod tests {
 
     #[test]
     fn test_cumprod_1d() {
-        let (reg, q) = setup();
+        let Some((reg, q)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = reg.device().raw();
         let input = Array::from_slice(dev, &[1.0f32, 2.0, 3.0, 4.0], vec![4]);
         let out = cumprod(&reg, &input, 0, &q).unwrap();
@@ -370,7 +376,10 @@ mod tests {
 
     #[test]
     fn test_cumsum_2d_axis1() {
-        let (reg, q) = setup();
+        let Some((reg, q)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = reg.device().raw();
         // [[1, 2, 3], [4, 5, 6]]
         let input = Array::from_slice(dev, &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]);

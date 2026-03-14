@@ -11004,7 +11004,7 @@ mod tests {
     /// Helper: set up Metal device, registry, queue, and valid gather_qmm inputs.
     /// Returns (registry, x, w_packed_buf, scales_buf, biases_buf, indices, queue)
     /// with valid dimensions: batch=2, m_per_batch=1, n=4, k=32, n_experts=2, group_size=32.
-    fn setup_gather_qmm_valid() -> (
+    fn setup_gather_qmm_valid() -> Option<(
         KernelRegistry,
         Array,
         rmlx_metal::MtlBuffer,
@@ -11012,8 +11012,8 @@ mod tests {
         rmlx_metal::MtlBuffer,
         Array,
         rmlx_metal::MtlQueue,
-    ) {
-        let gpu_dev = crate::test_utils::test_gpu();
+    )> {
+        let gpu_dev = crate::test_utils::test_gpu()?;
         let queue = gpu_dev.new_command_queue();
         let registry = KernelRegistry::new(gpu_dev);
         register_gather_qmm(&registry).unwrap();
@@ -11074,7 +11074,7 @@ mod tests {
         let idx_data = vec![0u32, 1];
         let indices = Array::from_slice(dev, &idx_data, vec![batch]);
 
-        (
+        Some((
             registry,
             x,
             w_packed_buf,
@@ -11082,13 +11082,17 @@ mod tests {
             biases_buf,
             indices,
             queue,
-        )
+        ))
     }
 
     #[test]
     fn test_gather_qmm_valid_inputs() {
-        let (registry, x, w_packed_buf, scales_buf, biases_buf, indices, queue) =
-            setup_gather_qmm_valid();
+        let Some((registry, x, w_packed_buf, scales_buf, biases_buf, indices, queue)) =
+            setup_gather_qmm_valid()
+        else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let result = gather_qmm(
             &registry,
             &x,
@@ -11113,8 +11117,12 @@ mod tests {
 
     #[test]
     fn test_gather_qmm_zero_k() {
-        let (registry, _x, w_packed_buf, scales_buf, biases_buf, indices, queue) =
-            setup_gather_qmm_valid();
+        let Some((registry, _x, w_packed_buf, scales_buf, biases_buf, indices, queue)) =
+            setup_gather_qmm_valid()
+        else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = registry.device().raw();
         let x = Array::from_slice(dev, &[0.0f32; 0], vec![2, 1, 0]);
         let result = gather_qmm(
@@ -11142,8 +11150,12 @@ mod tests {
 
     #[test]
     fn test_gather_qmm_zero_n() {
-        let (registry, x, w_packed_buf, scales_buf, biases_buf, indices, queue) =
-            setup_gather_qmm_valid();
+        let Some((registry, x, w_packed_buf, scales_buf, biases_buf, indices, queue)) =
+            setup_gather_qmm_valid()
+        else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let result = gather_qmm(
             &registry,
             &x,
@@ -11169,8 +11181,12 @@ mod tests {
 
     #[test]
     fn test_gather_qmm_zero_n_experts() {
-        let (registry, x, w_packed_buf, scales_buf, biases_buf, indices, queue) =
-            setup_gather_qmm_valid();
+        let Some((registry, x, w_packed_buf, scales_buf, biases_buf, indices, queue)) =
+            setup_gather_qmm_valid()
+        else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let result = gather_qmm(
             &registry,
             &x,
@@ -11196,8 +11212,12 @@ mod tests {
 
     #[test]
     fn test_gather_qmm_x_shape_mismatch() {
-        let (registry, _x, w_packed_buf, scales_buf, biases_buf, indices, queue) =
-            setup_gather_qmm_valid();
+        let Some((registry, _x, w_packed_buf, scales_buf, biases_buf, indices, queue)) =
+            setup_gather_qmm_valid()
+        else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = registry.device().raw();
         // x has 10 elements but batch*m*k = 2*1*32 = 64
         let x_bad = Array::from_slice(dev, &[1.0f32; 10], vec![10]);
@@ -11226,8 +11246,12 @@ mod tests {
 
     #[test]
     fn test_gather_qmm_odd_k() {
-        let (registry, _x, w_packed_buf, scales_buf, biases_buf, _indices, queue) =
-            setup_gather_qmm_valid();
+        let Some((registry, _x, w_packed_buf, scales_buf, biases_buf, _indices, queue)) =
+            setup_gather_qmm_valid()
+        else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = registry.device().raw();
         let x = Array::from_slice(dev, &[1.0f32; 6], vec![2, 1, 3]);
         let indices = Array::from_slice(dev, &[0u32, 1], vec![2]);
@@ -11253,8 +11277,12 @@ mod tests {
 
     #[test]
     fn test_gather_qmm_k_not_multiple_of_group_size() {
-        let (registry, _x, w_packed_buf, scales_buf, biases_buf, _indices, queue) =
-            setup_gather_qmm_valid();
+        let Some((registry, _x, w_packed_buf, scales_buf, biases_buf, _indices, queue)) =
+            setup_gather_qmm_valid()
+        else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = registry.device().raw();
         // k=32, group_size=64 => 32 % 64 != 0
         let x = Array::from_slice(dev, &[1.0f32; 64], vec![2, 1, 32]);
@@ -11284,8 +11312,12 @@ mod tests {
 
     #[test]
     fn test_gather_qmm_w_packed_buf_too_small() {
-        let (registry, x, _w_packed_buf, scales_buf, biases_buf, indices, queue) =
-            setup_gather_qmm_valid();
+        let Some((registry, x, _w_packed_buf, scales_buf, biases_buf, indices, queue)) =
+            setup_gather_qmm_valid()
+        else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = registry.device().raw();
         // Valid w_packed needs 2*4*16 = 128 bytes, provide only 10
         let opts = MTLResourceOptions::StorageModeShared;
@@ -11323,8 +11355,12 @@ mod tests {
 
     #[test]
     fn test_gather_qmm_scales_buf_too_small() {
-        let (registry, x, w_packed_buf, _scales_buf, biases_buf, indices, queue) =
-            setup_gather_qmm_valid();
+        let Some((registry, x, w_packed_buf, _scales_buf, biases_buf, indices, queue)) =
+            setup_gather_qmm_valid()
+        else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = registry.device().raw();
         let opts = MTLResourceOptions::StorageModeShared;
         // Valid scales needs 2*4*1*4 = 32 bytes, provide only 4
@@ -11362,8 +11398,12 @@ mod tests {
 
     #[test]
     fn test_gather_qmm_biases_buf_too_small() {
-        let (registry, x, w_packed_buf, scales_buf, _biases_buf, indices, queue) =
-            setup_gather_qmm_valid();
+        let Some((registry, x, w_packed_buf, scales_buf, _biases_buf, indices, queue)) =
+            setup_gather_qmm_valid()
+        else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = registry.device().raw();
         let opts = MTLResourceOptions::StorageModeShared;
         let small_b = unsafe {
@@ -11400,8 +11440,12 @@ mod tests {
 
     #[test]
     fn test_gather_qmm_index_out_of_range() {
-        let (registry, x, w_packed_buf, scales_buf, biases_buf, _indices, queue) =
-            setup_gather_qmm_valid();
+        let Some((registry, x, w_packed_buf, scales_buf, biases_buf, _indices, queue)) =
+            setup_gather_qmm_valid()
+        else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = registry.device().raw();
         // n_experts=2, but index=5 is out of range
         let bad_indices = Array::from_slice(dev, &[0u32, 5], vec![2]);
@@ -11431,8 +11475,12 @@ mod tests {
     #[test]
     fn test_gather_qmm_wrong_x_dtype() {
         // This test doesn't need a full setup since dtype check is first
-        let (registry, _x, w_packed_buf, scales_buf, biases_buf, _indices, queue) =
-            setup_gather_qmm_valid();
+        let Some((registry, _x, w_packed_buf, scales_buf, biases_buf, _indices, queue)) =
+            setup_gather_qmm_valid()
+        else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = registry.device().raw();
         let x_u32 = Array::from_slice(dev, &[1u32; 64], vec![2, 1, 32]);
         let indices = Array::from_slice(dev, &[0u32, 1], vec![2]);
@@ -11458,8 +11506,12 @@ mod tests {
 
     #[test]
     fn test_gather_qmm_indices_length_mismatch() {
-        let (registry, x, w_packed_buf, scales_buf, biases_buf, _indices, queue) =
-            setup_gather_qmm_valid();
+        let Some((registry, x, w_packed_buf, scales_buf, biases_buf, _indices, queue)) =
+            setup_gather_qmm_valid()
+        else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = registry.device().raw();
         // batch=2 but indices has 3 elements
         let bad_indices = Array::from_slice(dev, &[0u32, 1, 0], vec![3]);
@@ -12316,7 +12368,7 @@ mod tests {
     #[test]
     fn test_nax_vs_cpu_reference_gpu_correctness() {
         // Skip if no GPU available
-        let gpu = crate::test_utils::test_gpu();
+        let gpu = crate::test_utils::require_gpu!();
         let registry = KernelRegistry::new(gpu);
         crate::ops::register_all(&registry).expect("register_all");
         let device = registry.device().raw();

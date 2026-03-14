@@ -138,7 +138,11 @@ mod tests {
 
     fn test_device() -> &'static MtlDevice {
         static DEVICE: OnceLock<MtlDevice> = OnceLock::new();
-        DEVICE.get_or_init(|| MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests"))
+        DEVICE.get_or_init(|| {
+            objc2::rc::autoreleasepool(|_| {
+                MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests")
+            })
+        })
     }
 
     /// A simple test allocator that tracks alloc/free counts.

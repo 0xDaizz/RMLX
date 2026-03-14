@@ -5575,18 +5575,21 @@ pub fn sdpa_decode_constants(
 mod tests {
     use super::*;
 
-    fn setup() -> (KernelRegistry, rmlx_metal::MtlQueue) {
-        let gpu_dev = crate::test_utils::test_gpu();
+    fn setup() -> Option<(KernelRegistry, rmlx_metal::MtlQueue)> {
+        let gpu_dev = crate::test_utils::test_gpu()?;
         let queue = gpu_dev.new_command_queue();
         let registry = KernelRegistry::new(gpu_dev);
         register(&registry).unwrap();
         crate::ops::copy::register(&registry).unwrap();
-        (registry, queue)
+        Some((registry, queue))
     }
 
     #[test]
     fn test_sdpa_dtype_mismatch_qk_returns_error() {
-        let (registry, queue) = setup();
+        let Some((registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = registry.device().raw();
 
         let q = Array::zeros(dev, &[4, 8], DType::Float32);
@@ -5604,7 +5607,10 @@ mod tests {
 
     #[test]
     fn test_sdpa_dtype_mismatch_qv_returns_error() {
-        let (registry, queue) = setup();
+        let Some((registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = registry.device().raw();
 
         let q = Array::zeros(dev, &[4, 8], DType::Float16);
@@ -5622,7 +5628,10 @@ mod tests {
 
     #[test]
     fn test_sdpa_non_contiguous_mask_returns_error() {
-        let (registry, queue) = setup();
+        let Some((registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = registry.device().raw();
 
         let q = Array::zeros(dev, &[4, 8], DType::Float32);
@@ -5645,7 +5654,10 @@ mod tests {
 
     #[test]
     fn test_sdpa_into_cb_dtype_mismatch_returns_error() {
-        let (registry, _queue) = setup();
+        let Some((registry, _queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = registry.device().raw();
 
         let q = Array::zeros(dev, &[4, 8], DType::Float32);
@@ -5702,13 +5714,13 @@ mod tests {
         f32_arr.to_vec_checked()
     }
 
-    fn setup_with_copy() -> (KernelRegistry, rmlx_metal::MtlQueue) {
-        let gpu_dev = crate::test_utils::test_gpu();
+    fn setup_with_copy() -> Option<(KernelRegistry, rmlx_metal::MtlQueue)> {
+        let gpu_dev = crate::test_utils::test_gpu()?;
         let queue = gpu_dev.new_command_queue();
         let registry = KernelRegistry::new(gpu_dev);
         register(&registry).unwrap();
         crate::ops::copy::register(&registry).unwrap();
-        (registry, queue)
+        Some((registry, queue))
     }
 
     /// Helper: run GQA prefill and reference sdpa_batched, return (gqa_f32, ref_f32).
@@ -5854,7 +5866,10 @@ mod tests {
 
     #[test]
     fn test_gqa_prefill_ratio4_seq64() {
-        let (registry, queue) = setup_with_copy();
+        let Some((registry, queue)) = setup_with_copy() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let (gqa, reference) = run_gqa_vs_reference(
             &registry, &queue, 32,  // num_heads
             8,   // num_kv_heads (ratio=4)
@@ -5872,7 +5887,10 @@ mod tests {
 
     #[test]
     fn test_gqa_prefill_ratio1_seq64() {
-        let (registry, queue) = setup_with_copy();
+        let Some((registry, queue)) = setup_with_copy() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let (gqa, reference) = run_gqa_vs_reference(
             &registry, &queue, 8,   // num_heads
             8,   // num_kv_heads (ratio=1, non-GQA)
@@ -5890,7 +5908,10 @@ mod tests {
 
     #[test]
     fn test_gqa_prefill_ratio4_seq33_unaligned() {
-        let (registry, queue) = setup_with_copy();
+        let Some((registry, queue)) = setup_with_copy() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let (gqa, reference) = run_gqa_vs_reference(
             &registry, &queue, 32, 8, 33, // seq_len — not aligned to BR=16
             33, 128, false,
@@ -5904,7 +5925,10 @@ mod tests {
 
     #[test]
     fn test_gqa_prefill_ratio4_seq128() {
-        let (registry, queue) = setup_with_copy();
+        let Some((registry, queue)) = setup_with_copy() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let (gqa, reference) = run_gqa_vs_reference(&registry, &queue, 32, 8, 128, 128, 128, false);
         let diff = max_abs_diff(&gqa, &reference);
         assert!(
@@ -5915,7 +5939,10 @@ mod tests {
 
     #[test]
     fn test_gqa_prefill_ratio4_seq257_unaligned() {
-        let (registry, queue) = setup_with_copy();
+        let Some((registry, queue)) = setup_with_copy() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let (gqa, reference) = run_gqa_vs_reference(
             &registry, &queue, 32, 8, 257, // seq_len — not aligned to BR=16 or BC=128
             257, 128, false,
@@ -5929,7 +5956,10 @@ mod tests {
 
     #[test]
     fn test_gqa_prefill_ratio4_causal() {
-        let (registry, queue) = setup_with_copy();
+        let Some((registry, queue)) = setup_with_copy() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let (gqa, reference) = run_gqa_vs_reference(
             &registry, &queue, 32, 8, 64, 64, 128, true, // causal
         );
@@ -6036,7 +6066,10 @@ mod tests {
 
     #[test]
     fn test_sdpa_mma_vs_scalar_correctness() {
-        let (registry, queue) = setup_with_copy();
+        let Some((registry, queue)) = setup_with_copy() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
 
         let num_heads = 4;
         let num_kv_heads = 2;
@@ -6070,7 +6103,7 @@ mod tests {
     /// This test never panics — it prints the result for diagnostic purposes.
     #[test]
     fn test_mpp_jit_availability() {
-        let gpu_dev = crate::test_utils::test_gpu();
+        let gpu_dev = crate::test_utils::require_gpu!();
         let registry = KernelRegistry::new(gpu_dev);
 
         // --- Probe 1: MPP header inclusion ---
@@ -6124,7 +6157,10 @@ kernel void metal32_probe(device float* out [[buffer(0)]], uint tid [[thread_pos
 
     #[test]
     fn test_sdpa_mma_bk32_vs_scalar_correctness() {
-        let (registry, queue) = setup_with_copy();
+        let Some((registry, queue)) = setup_with_copy() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
 
         let num_heads = 4;
         let num_kv_heads = 2;
@@ -6219,7 +6255,10 @@ kernel void metal32_probe(device float* out [[buffer(0)]], uint tid [[thread_pos
     #[test]
     #[ignore] // NAX ct_c element mapping not yet resolved
     fn test_sdpa_nax_diag_qkt() {
-        let (registry, queue) = setup_with_copy();
+        let Some((registry, queue)) = setup_with_copy() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
 
         // Minimal: Q=[16,16], K=[32,16], S=[16,32]
         let q_data = pseudo_random(16 * 16, 42);
@@ -6349,7 +6388,10 @@ kernel void metal32_probe(device float* out [[buffer(0)]], uint tid [[thread_pos
     #[test]
     #[ignore] // NAX ct_c element mapping not yet resolved
     fn test_sdpa_nax_vs_scalar_correctness() {
-        let (registry, queue) = setup_with_copy();
+        let Some((registry, queue)) = setup_with_copy() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
 
         let num_heads = 4;
         let num_kv_heads = 2;

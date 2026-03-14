@@ -166,18 +166,21 @@ mod tests {
         assert!(select_kernel_name(DType::UInt32).is_err());
     }
 
-    fn setup() -> (KernelRegistry, rmlx_metal::MtlQueue) {
-        let gpu_dev = crate::test_utils::test_gpu();
+    fn setup() -> Option<(KernelRegistry, rmlx_metal::MtlQueue)> {
+        let gpu_dev = crate::test_utils::test_gpu()?;
         let queue = gpu_dev.new_command_queue();
         let registry = KernelRegistry::new(gpu_dev);
         register(&registry).unwrap();
         crate::ops::copy::register(&registry).unwrap();
-        (registry, queue)
+        Some((registry, queue))
     }
 
     #[test]
     fn test_select_dtype_validation() {
-        let (registry, queue) = setup();
+        let Some((registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let device = registry.device().raw();
 
         // Mismatched a/b dtypes should fail
@@ -197,7 +200,10 @@ mod tests {
 
     #[test]
     fn test_select_basic() {
-        let (registry, queue) = setup();
+        let Some((registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let device = registry.device().raw();
 
         // cond = [1, 0, 1, 0]

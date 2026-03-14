@@ -2224,7 +2224,7 @@ mod tests {
 
     #[test]
     fn test_fused_silu_mul_shape_validation() {
-        let gpu = crate::test_utils::test_gpu();
+        let gpu = crate::test_utils::require_gpu!();
         let queue = gpu.new_command_queue();
         let registry = KernelRegistry::new(gpu);
         super::super::silu::register(&registry).ok();

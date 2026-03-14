@@ -939,7 +939,9 @@ mod tests {
     fn test_device() -> &'static objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice> {
         use std::sync::OnceLock;
         static DEVICE: OnceLock<rmlx_metal::MtlDevice> = OnceLock::new();
-        DEVICE.get_or_init(crate::test_utils::shared_metal_device)
+        DEVICE.get_or_init(|| {
+            crate::test_utils::shared_metal_device().expect("Metal GPU required for tests")
+        })
     }
 
     #[test]

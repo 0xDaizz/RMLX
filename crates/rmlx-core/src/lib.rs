@@ -46,11 +46,12 @@ pub(crate) mod test_utils {
     use std::sync::OnceLock;
 
     /// Returns a shared raw Metal device, created exactly once across all tests.
-    pub fn shared_metal_device() -> MtlDevice {
-        static DEVICE: OnceLock<MtlDevice> = OnceLock::new();
+    /// Returns `None` when no Metal GPU is available (e.g. headless CI runners).
+    pub fn shared_metal_device() -> Option<MtlDevice> {
+        static DEVICE: OnceLock<Option<MtlDevice>> = OnceLock::new();
         DEVICE
             .get_or_init(|| {
-                objc2_metal::MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests")
+                objc2::rc::autoreleasepool(|_| objc2_metal::MTLCreateSystemDefaultDevice())
             })
             .clone()
     }
@@ -60,7 +61,28 @@ pub(crate) mod test_utils {
     /// Each call creates a new `GpuDevice` (with its own `StreamManager` etc.)
     /// but they all share the same underlying `MTLDevice`, avoiding the
     /// concurrent-creation crash.
-    pub fn test_gpu() -> GpuDevice {
-        GpuDevice::from_raw_device(shared_metal_device())
+    ///
+    /// Returns `None` when no Metal GPU is available.
+    pub fn test_gpu() -> Option<GpuDevice> {
+        shared_metal_device().map(GpuDevice::from_raw_device)
     }
+
+    /// Macro: obtain a `GpuDevice` or skip the test when no Metal GPU is available.
+    ///
+    /// Usage inside `#[test]` functions:
+    /// ```ignore
+    /// let gpu = require_gpu!();
+    /// ```
+    macro_rules! require_gpu {
+        () => {
+            match $crate::test_utils::test_gpu() {
+                Some(gpu) => gpu,
+                None => {
+                    eprintln!("Skipping test: no Metal GPU available");
+                    return;
+                }
+            }
+        };
+    }
+    pub(crate) use require_gpu;
 }

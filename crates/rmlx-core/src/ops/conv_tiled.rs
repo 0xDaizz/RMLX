@@ -366,18 +366,21 @@ pub fn conv2d_tiled(
 mod tests {
     use super::*;
 
-    fn setup() -> (KernelRegistry, rmlx_metal::MtlQueue) {
-        let gpu_dev = crate::test_utils::test_gpu();
+    fn setup() -> Option<(KernelRegistry, rmlx_metal::MtlQueue)> {
+        let gpu_dev = crate::test_utils::test_gpu()?;
         let queue = gpu_dev.new_command_queue();
         let registry = KernelRegistry::new(gpu_dev);
         register(&registry).unwrap();
         crate::ops::copy::register(&registry).unwrap();
-        (registry, queue)
+        Some((registry, queue))
     }
 
     #[test]
     fn test_conv2d_tiled_identity_kernel() {
-        let (registry, queue) = setup();
+        let Some((registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = registry.device().raw();
 
         // Input: [1, 1, 3, 3], Weight: [1, 1, 1, 1] (identity kernel)
@@ -408,7 +411,10 @@ mod tests {
 
     #[test]
     fn test_conv2d_tiled_matches_naive() {
-        let (registry, queue) = setup();
+        let Some((registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = registry.device().raw();
 
         // Also register the non-tiled conv for comparison
@@ -469,7 +475,10 @@ mod tests {
     /// the old hardcoded `TILE_CI * 9` threadgroup allocation).
     #[test]
     fn test_conv2d_tiled_5x5_kernel() {
-        let (registry, queue) = setup();
+        let Some((registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = registry.device().raw();
 
         // Also register non-tiled conv for reference comparison
@@ -531,7 +540,10 @@ mod tests {
     /// the old hardcoded `TILE_CI * 9` threadgroup allocation).
     #[test]
     fn test_conv2d_tiled_7x7_kernel() {
-        let (registry, queue) = setup();
+        let Some((registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = registry.device().raw();
 
         // Also register non-tiled conv for reference comparison

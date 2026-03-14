@@ -311,17 +311,20 @@ fn make_scalar_buf<T>(
 mod tests {
     use super::*;
 
-    fn setup() -> (KernelRegistry, rmlx_metal::MtlQueue) {
-        let device = crate::test_utils::test_gpu();
+    fn setup() -> Option<(KernelRegistry, rmlx_metal::MtlQueue)> {
+        let device = crate::test_utils::test_gpu()?;
         let queue = device.raw().newCommandQueue().unwrap();
         let registry = KernelRegistry::new(device);
         register(&registry).expect("register random kernels");
-        (registry, queue)
+        Some((registry, queue))
     }
 
     #[test]
     fn test_uniform_shape() {
-        let (reg, q) = setup();
+        let Some((reg, q)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let out = uniform(&reg, &[3, 4], 0.0, 1.0, 42, &q).unwrap();
         assert_eq!(out.shape(), &[3, 4]);
         assert_eq!(out.dtype(), DType::Float32);
@@ -329,7 +332,10 @@ mod tests {
 
     #[test]
     fn test_uniform_range() {
-        let (reg, q) = setup();
+        let Some((reg, q)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let out = uniform(&reg, &[1000], 2.0, 5.0, 42, &q).unwrap();
         let vals: Vec<f32> = out.to_vec_checked();
         for &v in &vals {
@@ -339,7 +345,10 @@ mod tests {
 
     #[test]
     fn test_uniform_deterministic() {
-        let (reg, q) = setup();
+        let Some((reg, q)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let a = uniform(&reg, &[100], 0.0, 1.0, 123, &q).unwrap();
         let b = uniform(&reg, &[100], 0.0, 1.0, 123, &q).unwrap();
         let va: Vec<f32> = a.to_vec_checked();
@@ -349,7 +358,10 @@ mod tests {
 
     #[test]
     fn test_normal_shape() {
-        let (reg, q) = setup();
+        let Some((reg, q)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let out = normal(&reg, &[5, 6], 0.0, 1.0, 42, &q).unwrap();
         assert_eq!(out.shape(), &[5, 6]);
         assert_eq!(out.dtype(), DType::Float32);
@@ -357,7 +369,10 @@ mod tests {
 
     #[test]
     fn test_normal_statistics() {
-        let (reg, q) = setup();
+        let Some((reg, q)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let n = 10000;
         let target_mean = 3.0f32;
         let target_std = 2.0f32;

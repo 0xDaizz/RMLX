@@ -978,18 +978,21 @@ mod tests {
         arr.to_vec_checked::<f32>()
     }
 
-    fn setup() -> (KernelRegistry, rmlx_metal::MtlQueue) {
-        let gpu_dev = crate::test_utils::test_gpu();
+    fn setup() -> Option<(KernelRegistry, rmlx_metal::MtlQueue)> {
+        let gpu_dev = crate::test_utils::test_gpu()?;
         let queue = gpu_dev.new_command_queue();
         let registry = KernelRegistry::new(gpu_dev);
         register(&registry).expect("register fp8 kernels");
-        (registry, queue)
+        Some((registry, queue))
     }
 
     #[test]
     fn test_per_token_quant_small_dim() {
         // Basic correctness: small hidden_dim that fits in one threadgroup.
-        let (registry, queue) = setup();
+        let Some((registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let device = registry.device().raw();
 
         // 2 tokens, hidden_dim=4, values in a known range
@@ -1054,7 +1057,10 @@ mod tests {
     fn test_per_token_quant_large_hidden_dim() {
         // Regression test for the cross-threadgroup race on scales.
         // Use hidden_dim = 2048 which exceeds typical max_threadgroup_size (1024).
-        let (registry, queue) = setup();
+        let Some((registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let device = registry.device().raw();
 
         let num_tokens = 4usize;
@@ -1116,7 +1122,10 @@ mod tests {
     #[test]
     fn test_per_token_quant_zero_row() {
         // A row of all zeros should produce scale = 1.0 and all-zero FP8 output.
-        let (registry, queue) = setup();
+        let Some((registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let device = registry.device().raw();
 
         let data = vec![0.0f32; 8];

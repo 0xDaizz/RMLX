@@ -384,17 +384,20 @@ fn make_u32_buf(
 mod tests {
     use super::*;
 
-    fn setup() -> (KernelRegistry, rmlx_metal::MtlQueue) {
-        let gpu = crate::test_utils::test_gpu();
+    fn setup() -> Option<(KernelRegistry, rmlx_metal::MtlQueue)> {
+        let gpu = crate::test_utils::test_gpu()?;
         let queue = gpu.raw().newCommandQueue().unwrap();
         let registry = KernelRegistry::new(gpu);
         register(&registry).unwrap();
-        (registry, queue)
+        Some((registry, queue))
     }
 
     #[test]
     fn test_index_gather_f32() {
-        let (registry, queue) = setup();
+        let Some((registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = registry.device().raw();
 
         // src: 4 rows × 3 cols
@@ -415,7 +418,10 @@ mod tests {
 
     #[test]
     fn test_scatter_weighted_add_f32() {
-        let (registry, queue) = setup();
+        let Some((registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = registry.device().raw();
 
         // src: 3 assignments × 2 cols

@@ -303,7 +303,7 @@ mod tests {
         use crate::array::Array;
         use crate::dtype::DType;
 
-        let gpu = crate::test_utils::test_gpu();
+        let gpu = crate::test_utils::require_gpu!();
         let queue = gpu.new_command_queue();
         let registry = KernelRegistry::new(gpu);
 

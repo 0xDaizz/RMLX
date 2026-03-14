@@ -317,17 +317,20 @@ pub fn slice(
 mod tests {
     use super::*;
 
-    fn setup() -> (KernelRegistry, rmlx_metal::MtlQueue) {
-        let device = crate::test_utils::test_gpu();
+    fn setup() -> Option<(KernelRegistry, rmlx_metal::MtlQueue)> {
+        let device = crate::test_utils::test_gpu()?;
         let queue = device.new_command_queue();
         let registry = KernelRegistry::new(device);
         register(&registry).expect("register slice kernels");
-        (registry, queue)
+        Some((registry, queue))
     }
 
     #[test]
     fn test_slice_1d_basic() {
-        let (reg, q) = setup();
+        let Some((reg, q)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = reg.device().raw();
         let input = Array::from_slice(dev, &[10.0f32, 20.0, 30.0, 40.0, 50.0], vec![5]);
         let out = slice(&reg, &input, &[1], &[4], &[1], &q).unwrap();
@@ -337,7 +340,10 @@ mod tests {
 
     #[test]
     fn test_slice_1d_strided() {
-        let (reg, q) = setup();
+        let Some((reg, q)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = reg.device().raw();
         let input = Array::from_slice(dev, &[0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0], vec![6]);
         let out = slice(&reg, &input, &[0], &[6], &[2], &q).unwrap();
@@ -347,7 +353,10 @@ mod tests {
 
     #[test]
     fn test_slice_2d() {
-        let (reg, q) = setup();
+        let Some((reg, q)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = reg.device().raw();
         // [[0,1,2,3],[4,5,6,7],[8,9,10,11]]
         let data: Vec<f32> = (0..12).map(|i| i as f32).collect();

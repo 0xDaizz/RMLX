@@ -685,7 +685,9 @@ mod tests {
     fn test_device() -> &'static MtlDevice {
         static DEVICE: OnceLock<MtlDevice> = OnceLock::new();
         DEVICE.get_or_init(|| {
-            objc2_metal::MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests")
+            objc2::rc::autoreleasepool(|_| {
+                objc2_metal::MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests")
+            })
         })
     }
 

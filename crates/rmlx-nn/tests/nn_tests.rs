@@ -20,7 +20,9 @@ fn test_device() -> &'static rmlx_metal::MtlDevice {
     use std::sync::OnceLock;
     static DEVICE: OnceLock<rmlx_metal::MtlDevice> = OnceLock::new();
     DEVICE.get_or_init(|| {
-        objc2_metal::MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests")
+        objc2::rc::autoreleasepool(|_| {
+            objc2_metal::MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests")
+        })
     })
 }
 

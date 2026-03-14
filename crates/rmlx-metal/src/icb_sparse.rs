@@ -628,7 +628,11 @@ mod tests {
 
     fn test_device() -> &'static crate::MtlDevice {
         static DEVICE: OnceLock<crate::MtlDevice> = OnceLock::new();
-        DEVICE.get_or_init(|| MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests"))
+        DEVICE.get_or_init(|| {
+            objc2::rc::autoreleasepool(|_| {
+                MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests")
+            })
+        })
     }
 
     // ── Cache tests (no GPU needed) ──────────────────────────────────────

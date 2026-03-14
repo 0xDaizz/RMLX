@@ -652,18 +652,21 @@ pub fn gpu_topk_route_into_cb(
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn setup() -> (rmlx_metal::MtlDevice, rmlx_metal::MtlQueue, KernelRegistry) {
-        let gpu = crate::test_utils::test_gpu();
-        let device: rmlx_metal::MtlDevice = crate::test_utils::shared_metal_device();
+    fn setup() -> Option<(rmlx_metal::MtlDevice, rmlx_metal::MtlQueue, KernelRegistry)> {
+        let gpu = crate::test_utils::test_gpu()?;
+        let device: rmlx_metal::MtlDevice = crate::test_utils::shared_metal_device()?;
         let queue = gpu.new_command_queue();
         let registry = KernelRegistry::new(gpu);
         register(&registry).expect("register topk_route kernels");
-        (device, queue, registry)
+        Some((device, queue, registry))
     }
 
     #[test]
     fn test_topk_route_basic() {
-        let (device, queue, registry) = setup();
+        let Some((device, queue, registry)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
 
         // 4 tokens, 8 experts, top-2
         // Gate logits: each row has one dominant expert
@@ -750,7 +753,10 @@ mod tests {
 
     #[test]
     fn test_topk_route_with_bias() {
-        let (device, queue, registry) = setup();
+        let Some((device, queue, registry)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
 
         // 2 tokens, 4 experts, top-1
         // Without bias: token 0 selects expert 0 (logit 3.0)
@@ -778,7 +784,10 @@ mod tests {
 
     #[test]
     fn test_topk_route_validation() {
-        let (device, queue, registry) = setup();
+        let Some((device, queue, registry)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
 
         // 1D input should fail
         let bad = Array::from_slice(&device, &[1.0f32, 2.0, 3.0], vec![3]);
@@ -797,7 +806,10 @@ mod tests {
 
     #[test]
     fn test_topk_route_single_token() {
-        let (device, queue, registry) = setup();
+        let Some((device, queue, registry)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
 
         // 1 token, 4 experts, top-2
         let logits_data: Vec<f32> = vec![1.0, 5.0, 0.5, 4.0];
@@ -830,7 +842,10 @@ mod tests {
 
     #[test]
     fn test_topk_route_f16_input() {
-        let (device, queue, registry) = setup();
+        let Some((device, queue, registry)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         crate::ops::copy::register(&registry).expect("register copy kernels");
 
         // 2 tokens, 4 experts, top-1

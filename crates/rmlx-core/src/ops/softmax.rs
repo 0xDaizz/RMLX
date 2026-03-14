@@ -806,7 +806,7 @@ mod tests {
 
     #[test]
     fn test_softmax_zero_rank_returns_error() {
-        let gpu_dev = crate::test_utils::test_gpu();
+        let gpu_dev = crate::test_utils::require_gpu!();
         let queue = gpu_dev.new_command_queue();
         let registry = KernelRegistry::new(gpu_dev);
         super::register(&registry).expect("register softmax kernels");

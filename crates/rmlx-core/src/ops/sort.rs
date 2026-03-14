@@ -437,18 +437,21 @@ fn unpermute_view(input: &Array, axis: usize, original_shape: &[usize]) -> Array
 mod tests {
     use super::*;
 
-    fn setup() -> (KernelRegistry, rmlx_metal::MtlQueue) {
-        let device = crate::test_utils::test_gpu();
+    fn setup() -> Option<(KernelRegistry, rmlx_metal::MtlQueue)> {
+        let device = crate::test_utils::test_gpu()?;
         let queue = device.new_command_queue();
         let registry = KernelRegistry::new(device);
         register(&registry).expect("register sort kernels");
         crate::ops::copy::register(&registry).expect("register copy kernels");
-        (registry, queue)
+        Some((registry, queue))
     }
 
     #[test]
     fn test_sort_ascending() {
-        let (reg, q) = setup();
+        let Some((reg, q)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = reg.device().raw();
         let input = Array::from_slice(dev, &[3.0f32, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0, 6.0], vec![8]);
         let out = sort(&reg, &input, 0, false, &q).unwrap();
@@ -458,7 +461,10 @@ mod tests {
 
     #[test]
     fn test_sort_descending() {
-        let (reg, q) = setup();
+        let Some((reg, q)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = reg.device().raw();
         let input = Array::from_slice(dev, &[3.0f32, 1.0, 4.0, 1.0, 5.0], vec![5]);
         let out = sort(&reg, &input, 0, true, &q).unwrap();
@@ -468,7 +474,10 @@ mod tests {
 
     #[test]
     fn test_argsort_ascending() {
-        let (reg, q) = setup();
+        let Some((reg, q)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = reg.device().raw();
         let input = Array::from_slice(dev, &[30.0f32, 10.0, 20.0], vec![3]);
         let out = argsort(&reg, &input, 0, false, &q).unwrap();
