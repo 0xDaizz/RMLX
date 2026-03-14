@@ -1849,6 +1849,15 @@ pub struct Attention {
     qkv_merged_weight: Option<Array>,
     /// Transposed merged QKV weight [in_features, q_out + k_out + v_out] for prefill GEMM.
     qkv_merged_weight_t: Option<Array>,
+    // -- Quantized projection weights (optional; used when model is quantized) --
+    /// Quantized Q projection. When `Some`, overrides `q_proj` in forward.
+    q_proj_quantized: Option<crate::quantized_linear::QuantizedLinear>,
+    /// Quantized K projection.
+    k_proj_quantized: Option<crate::quantized_linear::QuantizedLinear>,
+    /// Quantized V projection.
+    v_proj_quantized: Option<crate::quantized_linear::QuantizedLinear>,
+    /// Quantized O projection.
+    o_proj_quantized: Option<crate::quantized_linear::QuantizedLinear>,
 }
 
 impl Attention {
@@ -1881,6 +1890,10 @@ impl Attention {
             config,
             qkv_merged_weight: None,
             qkv_merged_weight_t: None,
+            q_proj_quantized: None,
+            k_proj_quantized: None,
+            v_proj_quantized: None,
+            o_proj_quantized: None,
         })
     }
 
@@ -1901,7 +1914,33 @@ impl Attention {
             o_proj,
             qkv_merged_weight: None,
             qkv_merged_weight_t: None,
+            q_proj_quantized: None,
+            k_proj_quantized: None,
+            v_proj_quantized: None,
+            o_proj_quantized: None,
         })
+    }
+
+    /// Set quantized projection weights (Q, K, V, O).
+    ///
+    /// When set, quantized projections override the float `Linear` projections
+    /// in the forward pass.
+    pub fn set_quantized_projections(
+        &mut self,
+        q: crate::quantized_linear::QuantizedLinear,
+        k: crate::quantized_linear::QuantizedLinear,
+        v: crate::quantized_linear::QuantizedLinear,
+        o: crate::quantized_linear::QuantizedLinear,
+    ) {
+        self.q_proj_quantized = Some(q);
+        self.k_proj_quantized = Some(k);
+        self.v_proj_quantized = Some(v);
+        self.o_proj_quantized = Some(o);
+    }
+
+    /// Returns `true` if this attention layer uses quantized projections.
+    pub fn is_quantized(&self) -> bool {
+        self.q_proj_quantized.is_some()
     }
 
     /// Forward pass for multi-head attention.
@@ -1929,13 +1968,27 @@ impl Attention {
         let head_dim = self.config.head_dim;
         let repeats = num_heads / num_kv_heads;
 
-        // Project Q, K, V (single command buffer for all 3)
-        let proj_cb = queue.commandBuffer().unwrap();
-        let q = self.q_proj.forward_into_cb(x, registry, &proj_cb)?;
-        let k = self.k_proj.forward_into_cb(x, registry, &proj_cb)?;
-        let v = self.v_proj.forward_into_cb(x, registry, &proj_cb)?;
-        proj_cb.commit();
-        proj_cb.waitUntilCompleted();
+        // Project Q, K, V — quantized path or float path
+        let (q, k, v) = if let (Some(qq), Some(qk), Some(qv)) = (
+            self.q_proj_quantized.as_ref(),
+            self.k_proj_quantized.as_ref(),
+            self.v_proj_quantized.as_ref(),
+        ) {
+            // Quantized projections (QMV/QMM kernels)
+            let q = qq.forward(x, registry, queue)?;
+            let k = qk.forward(x, registry, queue)?;
+            let v = qv.forward(x, registry, queue)?;
+            (q, k, v)
+        } else {
+            // Float projections (single command buffer for all 3)
+            let proj_cb = queue.commandBuffer().unwrap();
+            let q = self.q_proj.forward_into_cb(x, registry, &proj_cb)?;
+            let k = self.k_proj.forward_into_cb(x, registry, &proj_cb)?;
+            let v = self.v_proj.forward_into_cb(x, registry, &proj_cb)?;
+            proj_cb.commit();
+            proj_cb.waitUntilCompleted();
+            (q, k, v)
+        };
 
         let expected_q_width = num_heads * head_dim;
         let expected_kv_width = num_kv_heads * head_dim;
@@ -2158,7 +2211,11 @@ impl Attention {
             cb.commit();
             cb.waitUntilCompleted();
 
-            return self.o_proj.forward(&concat, registry, queue);
+            return if let Some(qo) = self.o_proj_quantized.as_ref() {
+                qo.forward(&concat, registry, queue)
+            } else {
+                self.o_proj.forward(&concat, registry, queue)
+            };
         }
 
         // Prefill path (seq_len > 1): pack into batch-major, then interleave
@@ -2205,8 +2262,12 @@ impl Attention {
         // Single interleave dispatch: [num_heads, seq_len, head_dim] → [seq_len, hidden_size]
         let concat = ops::rope::interleave_heads(registry, &packed, num_heads, seq_len, queue)?;
 
-        // Output projection
-        self.o_proj.forward(&concat, registry, queue)
+        // Output projection — quantized or float
+        if let Some(qo) = self.o_proj_quantized.as_ref() {
+            qo.forward(&concat, registry, queue)
+        } else {
+            self.o_proj.forward(&concat, registry, queue)
+        }
     }
 
     /// Forward pass from pre-projected Q, K, V tensors (no QKV projection, no O projection).
@@ -2557,69 +2618,113 @@ impl Attention {
         let local_num_kv_heads = self.config.num_kv_heads / (world_size as usize);
         let head_dim = self.config.head_dim;
         let hidden_size = self.config.num_heads * head_dim;
-        let local_q_out = local_num_heads * head_dim;
-        let local_kv_out = local_num_kv_heads * head_dim;
 
-        // Shard Q weight: [full_q_out, hidden] → [local_q_out, hidden]
-        let q_w = self.q_proj.weight().ok_or_else(|| {
-            KernelError::InvalidShape("shard_for_tp: q_proj weight not loaded".into())
-        })?;
-        let q_shard = ColumnParallelLinear::shard_weight(q_w, rank, world_size);
-        self.q_proj = Linear::from_arrays(
-            LinearConfig {
-                in_features: hidden_size,
-                out_features: local_q_out,
-                has_bias: false,
-            },
-            q_shard,
-            None,
-        )?;
+        if self.is_quantized() {
+            // ── Quantized TP sharding ──
+            use crate::parallel::{shard_quantized_column, shard_quantized_row};
 
-        // Shard K weight
-        let k_w = self.k_proj.weight().ok_or_else(|| {
-            KernelError::InvalidShape("shard_for_tp: k_proj weight not loaded".into())
-        })?;
-        let k_shard = ColumnParallelLinear::shard_weight(k_w, rank, world_size);
-        self.k_proj = Linear::from_arrays(
-            LinearConfig {
-                in_features: hidden_size,
-                out_features: local_kv_out,
-                has_bias: false,
-            },
-            k_shard,
-            None,
-        )?;
+            let qq = self.q_proj_quantized.as_ref().ok_or_else(|| {
+                KernelError::InvalidShape("shard_for_tp: q_proj_quantized not loaded".into())
+            })?;
+            let qk = self.k_proj_quantized.as_ref().ok_or_else(|| {
+                KernelError::InvalidShape("shard_for_tp: k_proj_quantized not loaded".into())
+            })?;
+            let qv = self.v_proj_quantized.as_ref().ok_or_else(|| {
+                KernelError::InvalidShape("shard_for_tp: v_proj_quantized not loaded".into())
+            })?;
+            let qo = self.o_proj_quantized.as_ref().ok_or_else(|| {
+                KernelError::InvalidShape("shard_for_tp: o_proj_quantized not loaded".into())
+            })?;
 
-        // Shard V weight
-        let v_w = self.v_proj.weight().ok_or_else(|| {
-            KernelError::InvalidShape("shard_for_tp: v_proj weight not loaded".into())
-        })?;
-        let v_shard = ColumnParallelLinear::shard_weight(v_w, rank, world_size);
-        self.v_proj = Linear::from_arrays(
-            LinearConfig {
-                in_features: hidden_size,
-                out_features: local_kv_out,
-                has_bias: false,
-            },
-            v_shard,
-            None,
-        )?;
+            // Q: column-parallel
+            let q_shard = shard_quantized_column(qq, rank, world_size).map_err(|e| {
+                KernelError::InvalidShape(format!("shard_for_tp quantized q_proj: {e}"))
+            })?;
+            self.q_proj_quantized = Some(q_shard);
 
-        // Shard O weight: row-parallel — [hidden, hidden] → [hidden, local_hidden]
-        let o_w = self.o_proj.weight().ok_or_else(|| {
-            KernelError::InvalidShape("shard_for_tp: o_proj weight not loaded".into())
-        })?;
-        let o_shard = RowParallelLinear::shard_weight(o_w, rank, world_size);
-        let local_o_in = hidden_size / (world_size as usize);
-        self.o_proj = Linear::from_arrays(
-            LinearConfig {
-                in_features: local_o_in,
-                out_features: hidden_size,
-                has_bias: false,
-            },
-            o_shard,
-            None,
-        )?;
+            // K: column-parallel
+            let k_shard = shard_quantized_column(qk, rank, world_size).map_err(|e| {
+                KernelError::InvalidShape(format!("shard_for_tp quantized k_proj: {e}"))
+            })?;
+            self.k_proj_quantized = Some(k_shard);
+
+            // V: column-parallel
+            let v_shard = shard_quantized_column(qv, rank, world_size).map_err(|e| {
+                KernelError::InvalidShape(format!("shard_for_tp quantized v_proj: {e}"))
+            })?;
+            self.v_proj_quantized = Some(v_shard);
+
+            // O: row-parallel
+            let o_shard = shard_quantized_row(qo, rank, world_size).map_err(|e| {
+                KernelError::InvalidShape(format!("shard_for_tp quantized o_proj: {e}"))
+            })?;
+            self.o_proj_quantized = Some(o_shard);
+        } else {
+            // ── Float TP sharding (existing path) ──
+            let local_q_out = local_num_heads * head_dim;
+            let local_kv_out = local_num_kv_heads * head_dim;
+
+            // Shard Q weight: [full_q_out, hidden] → [local_q_out, hidden]
+            let q_w = self.q_proj.weight().ok_or_else(|| {
+                KernelError::InvalidShape("shard_for_tp: q_proj weight not loaded".into())
+            })?;
+            let q_shard = ColumnParallelLinear::shard_weight(q_w, rank, world_size);
+            self.q_proj = Linear::from_arrays(
+                LinearConfig {
+                    in_features: hidden_size,
+                    out_features: local_q_out,
+                    has_bias: false,
+                },
+                q_shard,
+                None,
+            )?;
+
+            // Shard K weight
+            let k_w = self.k_proj.weight().ok_or_else(|| {
+                KernelError::InvalidShape("shard_for_tp: k_proj weight not loaded".into())
+            })?;
+            let k_shard = ColumnParallelLinear::shard_weight(k_w, rank, world_size);
+            self.k_proj = Linear::from_arrays(
+                LinearConfig {
+                    in_features: hidden_size,
+                    out_features: local_kv_out,
+                    has_bias: false,
+                },
+                k_shard,
+                None,
+            )?;
+
+            // Shard V weight
+            let v_w = self.v_proj.weight().ok_or_else(|| {
+                KernelError::InvalidShape("shard_for_tp: v_proj weight not loaded".into())
+            })?;
+            let v_shard = ColumnParallelLinear::shard_weight(v_w, rank, world_size);
+            self.v_proj = Linear::from_arrays(
+                LinearConfig {
+                    in_features: hidden_size,
+                    out_features: local_kv_out,
+                    has_bias: false,
+                },
+                v_shard,
+                None,
+            )?;
+
+            // Shard O weight: row-parallel — [hidden, hidden] → [hidden, local_hidden]
+            let o_w = self.o_proj.weight().ok_or_else(|| {
+                KernelError::InvalidShape("shard_for_tp: o_proj weight not loaded".into())
+            })?;
+            let o_shard = RowParallelLinear::shard_weight(o_w, rank, world_size);
+            let local_o_in = hidden_size / (world_size as usize);
+            self.o_proj = Linear::from_arrays(
+                LinearConfig {
+                    in_features: local_o_in,
+                    out_features: hidden_size,
+                    has_bias: false,
+                },
+                o_shard,
+                None,
+            )?;
+        }
 
         // Update config to local head counts
         self.config.num_heads = local_num_heads;

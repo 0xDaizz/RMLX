@@ -16,6 +16,13 @@ use rmlx_core::ops;
 #[cfg(feature = "distributed")]
 use rmlx_distributed::group::{DistributedError, Group};
 
+#[cfg(feature = "distributed")]
+use objc2::runtime::ProtocolObject;
+#[cfg(feature = "distributed")]
+use objc2_metal::{MTLBuffer, MTLCommandQueue, MTLDevice, MTLResource, MTLResourceOptions};
+
+use crate::quantized_linear::{QuantBits, QuantizedLinear};
+
 /// Column-parallel linear layer (Megatron-LM style).
 ///
 /// Weight shape per rank: `[out_features / world_size, in_features]`
@@ -249,6 +256,15 @@ impl std::fmt::Display for TpError {
 
 impl std::error::Error for TpError {}
 
+/// Sharding mode for quantized tensor-parallel layers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShardMode {
+    /// Column-parallel: shard output dimension, allgather.
+    ColumnParallel,
+    /// Row-parallel: shard input dimension, allreduce.
+    RowParallel,
+}
+
 impl ColumnParallelLinear {
     /// Create a new column-parallel linear layer from a pre-sharded weight.
     ///
@@ -444,7 +460,7 @@ impl ColumnParallelLinear {
 
         // Reconstruct Array from interleaved bytes
         let result = array_from_raw_bytes(
-            input.metal_buffer().device(),
+            &*input.metal_buffer().device(),
             &interleaved,
             vec![batch, self.out_features],
             dtype,
@@ -605,16 +621,41 @@ impl RowParallelLinear {
         let local_out_arr = ops::matmul::matmul(registry, input, &w_t, queue)
             .map_err(|e| DistributedError::Protocol(format!("GPU matmul failed: {e}")))?;
 
-        let local_bytes = local_out_arr.to_bytes().to_vec();
+        // allreduce operates on f32 internally (add_f32_inplace) — cast f16→f32 if needed
+        // to avoid misinterpreting two f16 values as one f32.
+        let (local_for_reduce, reduce_dtype) = if dtype == DType::Float16 {
+            let f32_out = ops::copy::copy_cast(registry, &local_out_arr, DType::Float32, queue)
+                .map_err(|e| {
+                    DistributedError::Protocol(format!("f16→f32 cast for allreduce: {e}"))
+                })?;
+            (f32_out.to_bytes().to_vec(), DType::Float32)
+        } else {
+            (local_out_arr.to_bytes().to_vec(), dtype)
+        };
 
         // Allreduce sum across ranks → [batch, out_features]
-        let mut reduced = group.allreduce(&local_bytes)?;
+        let mut reduced = group.allreduce(&local_for_reduce)?;
 
         // Add bias after allreduce (all ranks have the same summed result)
+        // Bias is always added in the reduce dtype (f32 if we cast).
         if let Some(ref bias) = self.bias {
             let bias_data = bias.to_bytes();
-            match dtype {
-                DType::Float32 => add_bias_f32(&mut reduced, bias_data, batch, n),
+            match reduce_dtype {
+                DType::Float32 => {
+                    // If original was f16, bias is f16 — convert bias to f32 for addition
+                    if dtype == DType::Float16 {
+                        let bias_f32: Vec<u8> = bias_data
+                            .chunks_exact(2)
+                            .flat_map(|chunk| {
+                                let bits = u16::from_ne_bytes([chunk[0], chunk[1]]);
+                                f16_to_f32(bits).to_ne_bytes()
+                            })
+                            .collect();
+                        add_bias_f32(&mut reduced, &bias_f32, batch, n);
+                    } else {
+                        add_bias_f32(&mut reduced, bias_data, batch, n);
+                    }
+                }
                 DType::Float16 => add_bias_f16(&mut reduced, bias_data, batch, n),
                 _ => unreachable!(),
             }
@@ -622,12 +663,466 @@ impl RowParallelLinear {
 
         // Reconstruct Array from reduced bytes
         let result = array_from_raw_bytes(
-            input.metal_buffer().device(),
+            &*input.metal_buffer().device(),
             &reduced,
             vec![batch, n],
+            reduce_dtype,
+        );
+
+        // Cast back to f16 if needed
+        if dtype == DType::Float16 && reduce_dtype == DType::Float32 {
+            ops::copy::copy_cast(registry, &result, DType::Float16, queue).map_err(|e| {
+                DistributedError::Protocol(format!("f32→f16 cast after allreduce: {e}"))
+            })
+        } else {
+            Ok(result)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Quantized Tensor-Parallel Layers
+// ---------------------------------------------------------------------------
+
+/// Column-parallel quantized linear: shards output dimension across ranks.
+///
+/// Each rank holds `w_packed[out_features/world_size, in_features]` with matching
+/// scales/biases. Forward: local QMV/QMM -> allgather output across ranks.
+#[cfg(feature = "distributed")]
+pub struct QuantizedColumnParallelLinear {
+    /// Sharded quantized weights for this rank.
+    pub ql: QuantizedLinear,
+    /// This rank's index in the TP group.
+    pub rank: u32,
+    /// Total number of ranks in TP group.
+    pub world_size: u32,
+}
+
+/// Row-parallel quantized linear: shards input dimension across ranks.
+///
+/// Each rank holds `w_packed[out_features, in_features/world_size]` with matching
+/// scales/biases. Forward: local QMV/QMM on sharded input -> allreduce sum.
+#[cfg(feature = "distributed")]
+pub struct QuantizedRowParallelLinear {
+    /// Sharded quantized weights for this rank.
+    pub ql: QuantizedLinear,
+    /// This rank's index in the TP group.
+    pub rank: u32,
+    /// Total number of ranks in TP group.
+    pub world_size: u32,
+}
+
+/// Trait for quantized parallel forward pass.
+#[cfg(feature = "distributed")]
+pub trait QuantizedParallelForward {
+    /// Forward pass: quantized matmul + collective communication.
+    fn forward(
+        &self,
+        x: &Array,
+        group: &Group,
+        registry: &KernelRegistry,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
+    ) -> Result<Array, TpError>;
+}
+
+#[cfg(feature = "distributed")]
+impl QuantizedColumnParallelLinear {
+    /// Create from a pre-sharded `QuantizedLinear`.
+    pub fn new(ql: QuantizedLinear, rank: u32, world_size: u32) -> Self {
+        Self {
+            ql,
+            rank,
+            world_size,
+        }
+    }
+
+    /// Forward: local quantized matmul -> allgather across ranks.
+    pub fn forward(
+        &self,
+        x: &Array,
+        group: &Group,
+        registry: &KernelRegistry,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
+    ) -> Result<Array, TpError> {
+        // 1. Local QMV/QMM
+        let local_out = self
+            .ql
+            .forward(x, registry, queue)
+            .map_err(|e| TpError(format!("quantized forward failed: {e}")))?;
+
+        // 2. Allgather output across ranks
+        let local_bytes = local_out.to_bytes().to_vec();
+        let gathered = group
+            .allgather(&local_bytes)
+            .map_err(|e| TpError(format!("allgather failed: {e}")))?;
+
+        let dtype = local_out.dtype();
+        let elem_bytes = dtype.size_of();
+        let batch = local_out.shape()[0];
+        let shard_out = self.ql.out_features();
+        let full_out = shard_out * self.world_size as usize;
+        let world = self.world_size as usize;
+
+        // Interleave: gathered is rank-major [rank0_all_rows][rank1_all_rows]...
+        // We need batch-major: [row0_rank0_shard ++ row0_rank1_shard ++ ...]
+        let shard_bytes = shard_out * elem_bytes;
+        let row_bytes = full_out * elem_bytes;
+        let mut interleaved = vec![0u8; batch * row_bytes];
+        for r in 0..batch {
+            for rank in 0..world {
+                let src_offset = rank * batch * shard_bytes + r * shard_bytes;
+                let dst_offset = r * row_bytes + rank * shard_bytes;
+                interleaved[dst_offset..dst_offset + shard_bytes]
+                    .copy_from_slice(&gathered[src_offset..src_offset + shard_bytes]);
+            }
+        }
+
+        let result = array_from_raw_bytes(
+            &*x.metal_buffer().device(),
+            &interleaved,
+            vec![batch, full_out],
             dtype,
         );
         Ok(result)
+    }
+}
+
+#[cfg(feature = "distributed")]
+impl QuantizedRowParallelLinear {
+    /// Create from a pre-sharded `QuantizedLinear`.
+    pub fn new(ql: QuantizedLinear, rank: u32, world_size: u32) -> Self {
+        Self {
+            ql,
+            rank,
+            world_size,
+        }
+    }
+
+    /// Forward: slice input for this rank -> local quantized matmul -> allreduce sum.
+    pub fn forward(
+        &self,
+        x: &Array,
+        group: &Group,
+        registry: &KernelRegistry,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
+    ) -> Result<Array, TpError> {
+        // 1. Slice input to get this rank's shard
+        let shard_in = self.ql.in_features();
+        let start = self.rank as usize * shard_in;
+        let end = start + shard_in;
+
+        // x is [batch, full_in_features], slice columns [start..end]
+        let x_shard = x.slice_columns(start, end);
+        // QMM kernels assume contiguous input — slice_columns produces a strided
+        // view (strides [full_in, 1]) which is non-contiguous for batch > 1.
+        let x_shard = ops::copy::copy(registry, &x_shard, queue)
+            .map_err(|e| TpError(format!("contiguous copy failed: {e}")))?;
+
+        // 2. Local QMV/QMM on sharded input
+        let local_out = self
+            .ql
+            .forward(&x_shard, registry, queue)
+            .map_err(|e| TpError(format!("quantized forward failed: {e}")))?;
+
+        // 3. Allreduce sum across ranks
+        // allreduce operates on f32 internally (add_f32_inplace) — cast f16→f32 if needed
+        // to avoid misinterpreting two f16 values as one f32.
+        let dtype = local_out.dtype();
+        let batch = local_out.shape()[0];
+        let out_features = self.ql.out_features();
+
+        let (local_for_reduce, reduce_dtype) = if dtype == DType::Float16 {
+            let f32_out = ops::copy::copy_cast(registry, &local_out, DType::Float32, queue)
+                .map_err(|e| TpError(format!("f16→f32 cast for allreduce: {e}")))?;
+            (f32_out.to_bytes().to_vec(), DType::Float32)
+        } else {
+            (local_out.to_bytes().to_vec(), dtype)
+        };
+
+        let reduced = group
+            .allreduce(&local_for_reduce)
+            .map_err(|e| TpError(format!("allreduce failed: {e}")))?;
+
+        // Reconstruct and cast back to f16 if needed
+        let result = array_from_raw_bytes(
+            &*x.metal_buffer().device(),
+            &reduced,
+            vec![batch, out_features],
+            reduce_dtype,
+        );
+        if dtype == DType::Float16 && reduce_dtype == DType::Float32 {
+            ops::copy::copy_cast(registry, &result, DType::Float16, queue)
+                .map_err(|e| TpError(format!("f32→f16 cast after allreduce: {e}")))
+        } else {
+            Ok(result)
+        }
+    }
+}
+
+#[cfg(feature = "distributed")]
+impl QuantizedParallelForward for QuantizedColumnParallelLinear {
+    fn forward(
+        &self,
+        x: &Array,
+        group: &Group,
+        registry: &KernelRegistry,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
+    ) -> Result<Array, TpError> {
+        self.forward(x, group, registry, queue)
+    }
+}
+
+#[cfg(feature = "distributed")]
+impl QuantizedParallelForward for QuantizedRowParallelLinear {
+    fn forward(
+        &self,
+        x: &Array,
+        group: &Group,
+        registry: &KernelRegistry,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
+    ) -> Result<Array, TpError> {
+        self.forward(x, group, registry, queue)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Quantized weight sharding helpers
+// ---------------------------------------------------------------------------
+
+/// Shard a `QuantizedLinear` along the output dimension (column-parallel).
+///
+/// Each rank gets rows `[rank * shard_out .. (rank+1) * shard_out]` of the
+/// packed weights, scales, and biases.
+pub fn shard_quantized_column(
+    ql: &QuantizedLinear,
+    rank: u32,
+    world_size: u32,
+) -> Result<QuantizedLinear, TpError> {
+    let out = ql.out_features();
+    let ws = world_size as usize;
+    if out % ws != 0 {
+        return Err(TpError(format!(
+            "out_features ({out}) must be divisible by world_size ({world_size})"
+        )));
+    }
+    let shard_out = out / ws;
+    let start = rank as usize * shard_out;
+    let end = start + shard_out;
+    let in_f = ql.in_features();
+
+    // w_packed: [out, in_f/pack_factor] row-major
+    let pack_factor = match ql.bits() {
+        QuantBits::Q4 => 2usize,
+        QuantBits::Q8 => 1usize,
+    };
+    let row_packed = in_f / pack_factor;
+    let w_shard: Vec<u8> = ql.w_packed()[start * row_packed..end * row_packed].to_vec();
+
+    // scales/biases: [out, in_f/group_size] row-major
+    let scale_cols = in_f / ql.group_size();
+    let s_shard: Vec<f32> = ql.scales()[start * scale_cols..end * scale_cols].to_vec();
+    let b_shard: Vec<f32> = ql.biases()[start * scale_cols..end * scale_cols].to_vec();
+
+    QuantizedLinear::new(
+        w_shard,
+        s_shard,
+        b_shard,
+        in_f,
+        shard_out,
+        ql.group_size(),
+        ql.bits(),
+    )
+    .map_err(|e| TpError(format!("shard_quantized_column: {e}")))
+}
+
+/// Shard a `QuantizedLinear` along the input dimension (row-parallel).
+///
+/// Each rank gets columns `[rank * shard_in .. (rank+1) * shard_in]` of the
+/// packed weights, and the corresponding scale/bias columns.
+///
+/// `shard_in` must be divisible by `group_size` to maintain quantization group
+/// boundaries.
+pub fn shard_quantized_row(
+    ql: &QuantizedLinear,
+    rank: u32,
+    world_size: u32,
+) -> Result<QuantizedLinear, TpError> {
+    let in_f = ql.in_features();
+    let ws = world_size as usize;
+    if in_f % ws != 0 {
+        return Err(TpError(format!(
+            "in_features ({in_f}) must be divisible by world_size ({world_size})"
+        )));
+    }
+    let shard_in = in_f / ws;
+    if shard_in % ql.group_size() != 0 {
+        return Err(TpError(format!(
+            "shard_in ({shard_in}) must be divisible by group_size ({})",
+            ql.group_size()
+        )));
+    }
+    let start = rank as usize * shard_in;
+
+    let pack_factor = match ql.bits() {
+        QuantBits::Q4 => 2usize,
+        QuantBits::Q8 => 1usize,
+    };
+    let full_row = in_f / pack_factor;
+    let shard_row = shard_in / pack_factor;
+    let col_start = start / pack_factor;
+
+    let out = ql.out_features();
+    let mut w_shard = Vec::with_capacity(out * shard_row);
+    for r in 0..out {
+        let row_offset = r * full_row;
+        w_shard.extend_from_slice(
+            &ql.w_packed()[row_offset + col_start..row_offset + col_start + shard_row],
+        );
+    }
+
+    // scales/biases: extract columns for this shard's groups
+    let full_scale_cols = in_f / ql.group_size();
+    let shard_scale_cols = shard_in / ql.group_size();
+    let scale_col_start = start / ql.group_size();
+
+    let mut s_shard = Vec::with_capacity(out * shard_scale_cols);
+    let mut b_shard = Vec::with_capacity(out * shard_scale_cols);
+    for r in 0..out {
+        let row_offset = r * full_scale_cols;
+        s_shard.extend_from_slice(
+            &ql.scales()
+                [row_offset + scale_col_start..row_offset + scale_col_start + shard_scale_cols],
+        );
+        b_shard.extend_from_slice(
+            &ql.biases()
+                [row_offset + scale_col_start..row_offset + scale_col_start + shard_scale_cols],
+        );
+    }
+
+    QuantizedLinear::new(
+        w_shard,
+        s_shard,
+        b_shard,
+        shard_in,
+        out,
+        ql.group_size(),
+        ql.bits(),
+    )
+    .map_err(|e| TpError(format!("shard_quantized_row: {e}")))
+}
+
+/// Shard a fused QKV `QuantizedLinear` by segments along the output dimension.
+///
+/// For fused QKV weights like `[q_out + k_out + v_out, in_features]`, each segment
+/// is independently sharded by `world_size`, then the sharded segments are
+/// concatenated.
+///
+/// # Arguments
+/// * `segments` -- sizes of each output segment (e.g.,
+///   `[q_heads * head_dim, kv_heads * head_dim, kv_heads * head_dim]`).
+///   Must sum to `ql.out_features()`.
+pub fn shard_quantized_column_segments(
+    ql: &QuantizedLinear,
+    rank: u32,
+    world_size: u32,
+    segments: &[usize],
+) -> Result<QuantizedLinear, TpError> {
+    let total_out: usize = segments.iter().sum();
+    if total_out != ql.out_features() {
+        return Err(TpError(format!(
+            "segments sum ({total_out}) != out_features ({})",
+            ql.out_features()
+        )));
+    }
+    let ws = world_size as usize;
+    for (i, &seg) in segments.iter().enumerate() {
+        if seg % ws != 0 {
+            return Err(TpError(format!(
+                "segment[{i}] ({seg}) must be divisible by world_size ({world_size})"
+            )));
+        }
+    }
+
+    let in_f = ql.in_features();
+    let pack_factor = match ql.bits() {
+        QuantBits::Q4 => 2usize,
+        QuantBits::Q8 => 1usize,
+    };
+    let row_packed = in_f / pack_factor;
+    let scale_cols = in_f / ql.group_size();
+
+    let mut w_shard = Vec::new();
+    let mut s_shard = Vec::new();
+    let mut b_shard = Vec::new();
+    let mut shard_out_total = 0usize;
+
+    let mut row_cursor = 0usize; // tracks starting row in the full weight
+    for &seg_size in segments {
+        let seg_shard = seg_size / ws;
+        let seg_start = row_cursor + rank as usize * seg_shard;
+        let seg_end = seg_start + seg_shard;
+
+        // Extract packed weight rows for this segment shard
+        w_shard.extend_from_slice(&ql.w_packed()[seg_start * row_packed..seg_end * row_packed]);
+
+        // Extract scales/biases rows for this segment shard
+        s_shard.extend_from_slice(&ql.scales()[seg_start * scale_cols..seg_end * scale_cols]);
+        b_shard.extend_from_slice(&ql.biases()[seg_start * scale_cols..seg_end * scale_cols]);
+
+        shard_out_total += seg_shard;
+        row_cursor += seg_size;
+    }
+
+    QuantizedLinear::new(
+        w_shard,
+        s_shard,
+        b_shard,
+        in_f,
+        shard_out_total,
+        ql.group_size(),
+        ql.bits(),
+    )
+    .map_err(|e| TpError(format!("shard_quantized_column_segments: {e}")))
+}
+
+/// Factory: shard a `QuantizedLinear` and wrap in a parallel layer.
+///
+/// # Arguments
+/// * `ql` -- Full (un-sharded) quantized linear layer.
+/// * `rank` -- This rank's index.
+/// * `world_size` -- Total number of TP ranks.
+/// * `mode` -- Column or row parallel.
+/// * `segments` -- Optional segment sizes for fused QKV column sharding.
+#[cfg(feature = "distributed")]
+pub fn shard_quantized_linear(
+    ql: QuantizedLinear,
+    rank: u32,
+    world_size: u32,
+    mode: ShardMode,
+    segments: Option<&[usize]>,
+) -> Result<Box<dyn QuantizedParallelForward>, TpError> {
+    match mode {
+        ShardMode::ColumnParallel => {
+            let sharded = if let Some(segs) = segments {
+                shard_quantized_column_segments(&ql, rank, world_size, segs)?
+            } else {
+                shard_quantized_column(&ql, rank, world_size)?
+            };
+            Ok(Box::new(QuantizedColumnParallelLinear::new(
+                sharded, rank, world_size,
+            )))
+        }
+        ShardMode::RowParallel => {
+            if segments.is_some() {
+                return Err(TpError(
+                    "segments not supported for RowParallel sharding".into(),
+                ));
+            }
+            let sharded = shard_quantized_row(&ql, rank, world_size)?;
+            Ok(Box::new(QuantizedRowParallelLinear::new(
+                sharded, rank, world_size,
+            )))
+        }
     }
 }
 
@@ -1215,5 +1710,326 @@ mod tests {
         let result = RowParallelLinear::new(weight, None, 2, 4, 0, 2);
         assert!(result.is_err());
         assert!(result.unwrap_err().0.contains("in_features/world_size"));
+    }
+
+    // ─── Quantized tensor-parallel sharding tests ───
+
+    #[test]
+    fn test_shard_quantized_column_basic() {
+        // 64x64 Q4 with group_size=32
+        let in_f = 64;
+        let out_f = 64;
+        let group_size = 32;
+        let groups_per_row = in_f / group_size; // 2
+        let packed_per_row = in_f / 2; // 32
+
+        // Fill w_packed with sequential bytes for verification
+        let w_packed: Vec<u8> = (0..out_f * packed_per_row)
+            .map(|i| (i % 256) as u8)
+            .collect();
+        let scales: Vec<f32> = (0..out_f * groups_per_row).map(|i| i as f32).collect();
+        let biases: Vec<f32> = (0..out_f * groups_per_row)
+            .map(|i| i as f32 * 0.1)
+            .collect();
+
+        let ql = QuantizedLinear::new(
+            w_packed.clone(),
+            scales.clone(),
+            biases.clone(),
+            in_f,
+            out_f,
+            group_size,
+            QuantBits::Q4,
+        )
+        .unwrap();
+
+        // Shard into 2 ranks
+        let shard_0 = super::shard_quantized_column(&ql, 0, 2).unwrap();
+        let shard_1 = super::shard_quantized_column(&ql, 1, 2).unwrap();
+
+        // Each shard should have out_features/2 = 32
+        assert_eq!(shard_0.out_features(), 32);
+        assert_eq!(shard_0.in_features(), 64);
+        assert_eq!(shard_1.out_features(), 32);
+        assert_eq!(shard_1.in_features(), 64);
+
+        // Verify packed weights: shard_0 gets first 32 rows, shard_1 gets last 32 rows
+        assert_eq!(shard_0.w_packed().len(), 32 * packed_per_row);
+        assert_eq!(shard_0.w_packed(), &w_packed[..32 * packed_per_row]);
+        assert_eq!(shard_1.w_packed(), &w_packed[32 * packed_per_row..]);
+
+        // Verify scales
+        assert_eq!(shard_0.scales().len(), 32 * groups_per_row);
+        assert_eq!(shard_0.scales(), &scales[..32 * groups_per_row]);
+        assert_eq!(shard_1.scales(), &scales[32 * groups_per_row..]);
+
+        // Verify biases
+        assert_eq!(shard_0.biases(), &biases[..32 * groups_per_row]);
+        assert_eq!(shard_1.biases(), &biases[32 * groups_per_row..]);
+    }
+
+    #[test]
+    fn test_shard_quantized_row_basic() {
+        // 64x64 Q4 with group_size=32
+        let in_f = 64;
+        let out_f = 64;
+        let group_size = 32;
+        let groups_per_row = in_f / group_size; // 2
+        let packed_per_row = in_f / 2; // 32
+
+        let w_packed: Vec<u8> = (0..out_f * packed_per_row)
+            .map(|i| (i % 256) as u8)
+            .collect();
+        let scales: Vec<f32> = (0..out_f * groups_per_row).map(|i| i as f32).collect();
+        let biases: Vec<f32> = (0..out_f * groups_per_row)
+            .map(|i| i as f32 * 0.1)
+            .collect();
+
+        let ql = QuantizedLinear::new(
+            w_packed.clone(),
+            scales.clone(),
+            biases.clone(),
+            in_f,
+            out_f,
+            group_size,
+            QuantBits::Q4,
+        )
+        .unwrap();
+
+        // Shard into 2 ranks (split input dim)
+        let shard_0 = super::shard_quantized_row(&ql, 0, 2).unwrap();
+        let shard_1 = super::shard_quantized_row(&ql, 1, 2).unwrap();
+
+        // Each shard: full out_features, half in_features
+        assert_eq!(shard_0.out_features(), 64);
+        assert_eq!(shard_0.in_features(), 32);
+        assert_eq!(shard_1.out_features(), 64);
+        assert_eq!(shard_1.in_features(), 32);
+
+        // Verify packed weight dimensions
+        let shard_packed_per_row = 32 / 2; // 16 bytes per row
+        assert_eq!(shard_0.w_packed().len(), 64 * shard_packed_per_row);
+
+        // Verify first row of shard_0 is first half of first row of original
+        assert_eq!(
+            &shard_0.w_packed()[..shard_packed_per_row],
+            &w_packed[..shard_packed_per_row]
+        );
+        // First row of shard_1 is second half of first row of original
+        assert_eq!(
+            &shard_1.w_packed()[..shard_packed_per_row],
+            &w_packed[shard_packed_per_row..packed_per_row]
+        );
+
+        // Verify scales: shard_0 gets first group of each row, shard_1 gets second
+        // shard_in=32, group_size=32 => 1 scale column per row per shard
+        assert_eq!(shard_0.scales().len(), 64); // 64 rows * 1 group
+        assert_eq!(shard_1.scales().len(), 64);
+
+        // For row 0: scales[0..2] in original => shard_0 gets scales[0], shard_1 gets scales[1]
+        assert_eq!(shard_0.scales()[0], scales[0]);
+        assert_eq!(shard_1.scales()[0], scales[1]);
+    }
+
+    #[test]
+    fn test_shard_quantized_row_group_size_boundary() {
+        // shard_in not divisible by group_size should error
+        let in_f = 128;
+        let out_f = 32;
+        let group_size = 64;
+        let packed_per_row = in_f / 2;
+        let groups_per_row = in_f / group_size;
+
+        let ql = QuantizedLinear::new(
+            vec![0u8; out_f * packed_per_row],
+            vec![1.0f32; out_f * groups_per_row],
+            vec![0.0f32; out_f * groups_per_row],
+            in_f,
+            out_f,
+            group_size,
+            QuantBits::Q4,
+        )
+        .unwrap();
+
+        // world_size=4 => shard_in=32, but group_size=64 => error
+        let result = super::shard_quantized_row(&ql, 0, 4);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().0.contains("divisible by group_size"));
+    }
+
+    #[test]
+    fn test_shard_quantized_column_not_divisible() {
+        // out_features not divisible by world_size
+        let in_f = 64;
+        let out_f = 48; // not divisible by 5
+        let group_size = 32;
+        let packed_per_row = in_f / 2;
+        let groups_per_row = in_f / group_size;
+
+        let ql = QuantizedLinear::new(
+            vec![0u8; out_f * packed_per_row],
+            vec![1.0f32; out_f * groups_per_row],
+            vec![0.0f32; out_f * groups_per_row],
+            in_f,
+            out_f,
+            group_size,
+            QuantBits::Q4,
+        )
+        .unwrap();
+
+        let result = super::shard_quantized_column(&ql, 0, 5);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().0.contains("divisible by world_size"));
+    }
+
+    #[test]
+    fn test_shard_quantized_column_segments() {
+        // Fused QKV: [96, 64] with segments [32, 32, 32]
+        let in_f = 64;
+        let out_f = 96; // 32 + 32 + 32
+        let group_size = 32;
+        let packed_per_row = in_f / 2; // 32
+        let groups_per_row = in_f / group_size; // 2
+
+        let w_packed: Vec<u8> = (0..out_f * packed_per_row)
+            .map(|i| (i % 256) as u8)
+            .collect();
+        let scales: Vec<f32> = (0..out_f * groups_per_row).map(|i| i as f32).collect();
+        let biases: Vec<f32> = (0..out_f * groups_per_row)
+            .map(|i| i as f32 * 0.1)
+            .collect();
+
+        let ql = QuantizedLinear::new(
+            w_packed.clone(),
+            scales.clone(),
+            biases.clone(),
+            in_f,
+            out_f,
+            group_size,
+            QuantBits::Q4,
+        )
+        .unwrap();
+
+        let segments = [32, 32, 32];
+
+        let shard_0 = super::shard_quantized_column_segments(&ql, 0, 2, &segments).unwrap();
+        let shard_1 = super::shard_quantized_column_segments(&ql, 1, 2, &segments).unwrap();
+
+        // Each shard: 3 segments * 16 = 48 output features
+        assert_eq!(shard_0.out_features(), 48);
+        assert_eq!(shard_0.in_features(), 64);
+        assert_eq!(shard_1.out_features(), 48);
+
+        // Verify shard_0 has rows: [0..16] from seg0 ++ [32..48] from seg1 ++ [64..80] from seg2
+        let expected_rows_0: Vec<usize> = (0..16).chain(32..48).chain(64..80).collect();
+        for (shard_row, &orig_row) in expected_rows_0.iter().enumerate() {
+            let shard_slice =
+                &shard_0.w_packed()[shard_row * packed_per_row..(shard_row + 1) * packed_per_row];
+            let orig_slice = &w_packed[orig_row * packed_per_row..(orig_row + 1) * packed_per_row];
+            assert_eq!(shard_slice, orig_slice, "mismatch at shard_row {shard_row}");
+        }
+
+        // Verify shard_1 has rows: [16..32] from seg0 ++ [48..64] from seg1 ++ [80..96] from seg2
+        let expected_rows_1: Vec<usize> = (16..32).chain(48..64).chain(80..96).collect();
+        for (shard_row, &orig_row) in expected_rows_1.iter().enumerate() {
+            let shard_slice =
+                &shard_1.w_packed()[shard_row * packed_per_row..(shard_row + 1) * packed_per_row];
+            let orig_slice = &w_packed[orig_row * packed_per_row..(orig_row + 1) * packed_per_row];
+            assert_eq!(shard_slice, orig_slice, "mismatch at shard_row {shard_row}");
+        }
+    }
+
+    #[test]
+    fn test_shard_quantized_column_segments_sum_mismatch() {
+        let in_f = 64;
+        let out_f = 96;
+        let group_size = 32;
+        let packed_per_row = in_f / 2;
+        let groups_per_row = in_f / group_size;
+
+        let ql = QuantizedLinear::new(
+            vec![0u8; out_f * packed_per_row],
+            vec![1.0f32; out_f * groups_per_row],
+            vec![0.0f32; out_f * groups_per_row],
+            in_f,
+            out_f,
+            group_size,
+            QuantBits::Q4,
+        )
+        .unwrap();
+
+        // segments sum != out_features
+        let result = super::shard_quantized_column_segments(&ql, 0, 2, &[32, 32]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().0.contains("segments sum"));
+    }
+
+    #[test]
+    fn test_shard_quantized_column_segments_not_divisible() {
+        let in_f = 64;
+        let out_f = 96;
+        let group_size = 32;
+        let packed_per_row = in_f / 2;
+        let groups_per_row = in_f / group_size;
+
+        let ql = QuantizedLinear::new(
+            vec![0u8; out_f * packed_per_row],
+            vec![1.0f32; out_f * groups_per_row],
+            vec![0.0f32; out_f * groups_per_row],
+            in_f,
+            out_f,
+            group_size,
+            QuantBits::Q4,
+        )
+        .unwrap();
+
+        // segment 48 not divisible by world_size 5
+        let result = super::shard_quantized_column_segments(&ql, 0, 5, &[48, 24, 24]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().0.contains("divisible by world_size"));
+    }
+
+    #[test]
+    fn test_shard_quantized_q8_column() {
+        // Test Q8 sharding too
+        let in_f = 64;
+        let out_f = 32;
+        let group_size = 32;
+        let groups_per_row = in_f / group_size;
+        // Q8: each byte holds 1 value, packed_per_row = in_f
+        let packed_per_row = in_f;
+
+        let w_packed: Vec<u8> = (0..out_f * packed_per_row)
+            .map(|i| (i % 256) as u8)
+            .collect();
+        let scales: Vec<f32> = (0..out_f * groups_per_row).map(|i| i as f32).collect();
+        let biases: Vec<f32> = (0..out_f * groups_per_row)
+            .map(|i| i as f32 * 0.1)
+            .collect();
+
+        let ql = QuantizedLinear::new(
+            w_packed.clone(),
+            scales.clone(),
+            biases.clone(),
+            in_f,
+            out_f,
+            group_size,
+            QuantBits::Q8,
+        )
+        .unwrap();
+
+        let shard_0 = super::shard_quantized_column(&ql, 0, 2).unwrap();
+        assert_eq!(shard_0.out_features(), 16);
+        assert_eq!(shard_0.in_features(), 64);
+        assert_eq!(shard_0.bits(), QuantBits::Q8);
+        assert_eq!(shard_0.w_packed().len(), 16 * packed_per_row);
+        assert_eq!(shard_0.w_packed(), &w_packed[..16 * packed_per_row]);
+    }
+
+    #[test]
+    fn test_shard_mode_enum() {
+        assert_ne!(ShardMode::ColumnParallel, ShardMode::RowParallel);
+        let mode = ShardMode::ColumnParallel;
+        assert_eq!(mode, ShardMode::ColumnParallel);
     }
 }

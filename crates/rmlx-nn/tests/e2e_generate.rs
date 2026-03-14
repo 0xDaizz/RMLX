@@ -194,6 +194,9 @@ fn build_tiny_model(device: &ProtocolObject<dyn objc2_metal::MTLDevice>) -> Tran
             down_proj,
             gate_up_merged_weight: None,
             gate_up_merged_weight_t: None,
+            gate_proj_quantized: None,
+            up_proj_quantized: None,
+            down_proj_quantized: None,
         };
 
         // Norm weights: [HIDDEN], initialized to 1.0 (like a real RMSNorm init)

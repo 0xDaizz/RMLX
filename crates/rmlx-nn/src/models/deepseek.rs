@@ -336,6 +336,9 @@ impl DeepSeekV3Model {
             }),
             gate_up_merged_weight: None,
             gate_up_merged_weight_t: None,
+            gate_proj_quantized: None,
+            up_proj_quantized: None,
+            down_proj_quantized: None,
         };
 
         let mut layers = Vec::with_capacity(num_layers);
@@ -372,6 +375,9 @@ impl DeepSeekV3Model {
                     }),
                     gate_up_merged_weight: None,
                     gate_up_merged_weight_t: None,
+                    gate_proj_quantized: None,
+                    up_proj_quantized: None,
+                    down_proj_quantized: None,
                 }
             } else {
                 // MoE FFN for remaining layers (config-only, experts loaded later)

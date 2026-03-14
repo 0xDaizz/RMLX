@@ -116,6 +116,11 @@ pub enum FeedForward {
         linear1: Linear,
         linear2: Linear,
         activation: crate::activations::ActivationType,
+        // -- Quantized weights (optional; override float when present) --
+        /// Quantized linear1 projection.
+        linear1_quantized: Option<crate::quantized_linear::QuantizedLinear>,
+        /// Quantized linear2 projection.
+        linear2_quantized: Option<crate::quantized_linear::QuantizedLinear>,
     },
     /// Gated FFN (SwiGLU): silu(gate(x)) * up(x) -> down(x)
     Gated {
@@ -126,6 +131,13 @@ pub enum FeedForward {
         gate_up_merged_weight: Option<Array>,
         /// Transposed merged gate+up weight [in_features, gate_dim + up_dim] for prefill GEMM.
         gate_up_merged_weight_t: Option<Array>,
+        // -- Quantized weights (optional; override float when present) --
+        /// Quantized gate projection.
+        gate_proj_quantized: Option<crate::quantized_linear::QuantizedLinear>,
+        /// Quantized up projection.
+        up_proj_quantized: Option<crate::quantized_linear::QuantizedLinear>,
+        /// Quantized down projection.
+        down_proj_quantized: Option<crate::quantized_linear::QuantizedLinear>,
     },
     /// Mixture of Experts
     MoE(MoeLayer),
@@ -147,23 +159,48 @@ impl FeedForward {
                 linear1,
                 linear2,
                 activation,
-            } => linear2.forward(
-                &activation.forward(&linear1.forward(x, registry, queue)?, registry, queue)?,
-                registry,
-                queue,
-            ),
+                linear1_quantized,
+                linear2_quantized,
+            } => {
+                let h = if let Some(ql1) = linear1_quantized.as_ref() {
+                    ql1.forward(x, registry, queue)?
+                } else {
+                    linear1.forward(x, registry, queue)?
+                };
+                let activated = activation.forward(&h, registry, queue)?;
+                if let Some(ql2) = linear2_quantized.as_ref() {
+                    ql2.forward(&activated, registry, queue)
+                } else {
+                    linear2.forward(&activated, registry, queue)
+                }
+            }
             FeedForward::Gated {
                 gate_proj,
                 up_proj,
                 down_proj,
+                gate_proj_quantized,
+                up_proj_quantized,
+                down_proj_quantized,
                 ..
             } => {
                 // SwiGLU: down(silu(gate(x)) * up(x))
-                let gate_out = gate_proj.forward(x, registry, queue)?;
-                let up_out = up_proj.forward(x, registry, queue)?;
+                let gate_out = if let Some(qg) = gate_proj_quantized.as_ref() {
+                    qg.forward(x, registry, queue)?
+                } else {
+                    gate_proj.forward(x, registry, queue)?
+                };
+                let up_out = if let Some(qu) = up_proj_quantized.as_ref() {
+                    qu.forward(x, registry, queue)?
+                } else {
+                    up_proj.forward(x, registry, queue)?
+                };
                 let gate_activated = ops::silu::silu(registry, &gate_out, queue)?;
                 let hidden = ops::binary::mul(registry, &gate_activated, &up_out, queue)?;
-                down_proj.forward(&hidden, registry, queue)
+                if let Some(qd) = down_proj_quantized.as_ref() {
+                    qd.forward(&hidden, registry, queue)
+                } else {
+                    down_proj.forward(&hidden, registry, queue)
+                }
             }
             FeedForward::MoE(moe) => moe.forward(x, registry, queue),
         }
@@ -625,6 +662,7 @@ impl FeedForward {
                 down_proj,
                 gate_up_merged_weight,
                 gate_up_merged_weight_t,
+                ..
             } => {
                 gate_proj.convert_weights_private(device, queue);
                 up_proj.convert_weights_private(device, queue);
@@ -667,56 +705,99 @@ impl FeedForward {
                 down_proj,
                 gate_up_merged_weight,
                 gate_up_merged_weight_t,
+                gate_proj_quantized,
+                up_proj_quantized,
+                down_proj_quantized,
             } => {
-                let gate_w = gate_proj.weight().ok_or_else(|| {
-                    KernelError::InvalidShape("shard_for_tp: gate_proj weight not loaded".into())
-                })?;
-                let up_w = up_proj.weight().ok_or_else(|| {
-                    KernelError::InvalidShape("shard_for_tp: up_proj weight not loaded".into())
-                })?;
-                let down_w = down_proj.weight().ok_or_else(|| {
-                    KernelError::InvalidShape("shard_for_tp: down_proj weight not loaded".into())
-                })?;
+                if gate_proj_quantized.is_some() {
+                    // ── Quantized TP sharding ──
+                    use crate::parallel::{shard_quantized_column, shard_quantized_row};
 
-                let inter_dim = gate_w.shape()[0];
-                let hidden_size = gate_w.shape()[1];
-                let local_inter = inter_dim / (world_size as usize);
+                    let qg = gate_proj_quantized.as_ref().unwrap();
+                    let qu = up_proj_quantized.as_ref().ok_or_else(|| {
+                        KernelError::InvalidShape(
+                            "shard_for_tp: up_proj_quantized not loaded".into(),
+                        )
+                    })?;
+                    let qd = down_proj_quantized.as_ref().ok_or_else(|| {
+                        KernelError::InvalidShape(
+                            "shard_for_tp: down_proj_quantized not loaded".into(),
+                        )
+                    })?;
 
-                // Gate: column-parallel (shard output)
-                let gate_shard = ColumnParallelLinear::shard_weight(gate_w, rank, world_size);
-                *gate_proj = Linear::from_arrays(
-                    crate::linear::LinearConfig {
-                        in_features: hidden_size,
-                        out_features: local_inter,
-                        has_bias: false,
-                    },
-                    gate_shard,
-                    None,
-                )?;
+                    // Gate: column-parallel
+                    let g_shard = shard_quantized_column(qg, rank, world_size).map_err(|e| {
+                        KernelError::InvalidShape(format!("shard_for_tp quantized gate_proj: {e}"))
+                    })?;
+                    *gate_proj_quantized = Some(g_shard);
 
-                // Up: column-parallel
-                let up_shard = ColumnParallelLinear::shard_weight(up_w, rank, world_size);
-                *up_proj = Linear::from_arrays(
-                    crate::linear::LinearConfig {
-                        in_features: hidden_size,
-                        out_features: local_inter,
-                        has_bias: false,
-                    },
-                    up_shard,
-                    None,
-                )?;
+                    // Up: column-parallel
+                    let u_shard = shard_quantized_column(qu, rank, world_size).map_err(|e| {
+                        KernelError::InvalidShape(format!("shard_for_tp quantized up_proj: {e}"))
+                    })?;
+                    *up_proj_quantized = Some(u_shard);
 
-                // Down: row-parallel (shard input columns)
-                let down_shard = RowParallelLinear::shard_weight(down_w, rank, world_size);
-                *down_proj = Linear::from_arrays(
-                    crate::linear::LinearConfig {
-                        in_features: local_inter,
-                        out_features: hidden_size,
-                        has_bias: false,
-                    },
-                    down_shard,
-                    None,
-                )?;
+                    // Down: row-parallel
+                    let d_shard = shard_quantized_row(qd, rank, world_size).map_err(|e| {
+                        KernelError::InvalidShape(format!("shard_for_tp quantized down_proj: {e}"))
+                    })?;
+                    *down_proj_quantized = Some(d_shard);
+                } else {
+                    // ── Float TP sharding (existing path) ──
+                    let gate_w = gate_proj.weight().ok_or_else(|| {
+                        KernelError::InvalidShape(
+                            "shard_for_tp: gate_proj weight not loaded".into(),
+                        )
+                    })?;
+                    let up_w = up_proj.weight().ok_or_else(|| {
+                        KernelError::InvalidShape("shard_for_tp: up_proj weight not loaded".into())
+                    })?;
+                    let down_w = down_proj.weight().ok_or_else(|| {
+                        KernelError::InvalidShape(
+                            "shard_for_tp: down_proj weight not loaded".into(),
+                        )
+                    })?;
+
+                    let inter_dim = gate_w.shape()[0];
+                    let hidden_size = gate_w.shape()[1];
+                    let local_inter = inter_dim / (world_size as usize);
+
+                    // Gate: column-parallel (shard output)
+                    let gate_shard = ColumnParallelLinear::shard_weight(gate_w, rank, world_size);
+                    *gate_proj = Linear::from_arrays(
+                        crate::linear::LinearConfig {
+                            in_features: hidden_size,
+                            out_features: local_inter,
+                            has_bias: false,
+                        },
+                        gate_shard,
+                        None,
+                    )?;
+
+                    // Up: column-parallel
+                    let up_shard = ColumnParallelLinear::shard_weight(up_w, rank, world_size);
+                    *up_proj = Linear::from_arrays(
+                        crate::linear::LinearConfig {
+                            in_features: hidden_size,
+                            out_features: local_inter,
+                            has_bias: false,
+                        },
+                        up_shard,
+                        None,
+                    )?;
+
+                    // Down: row-parallel (shard input columns)
+                    let down_shard = RowParallelLinear::shard_weight(down_w, rank, world_size);
+                    *down_proj = Linear::from_arrays(
+                        crate::linear::LinearConfig {
+                            in_features: local_inter,
+                            out_features: hidden_size,
+                            has_bias: false,
+                        },
+                        down_shard,
+                        None,
+                    )?;
+                }
 
                 // Invalidate merged weights
                 *gate_up_merged_weight = None;
@@ -725,48 +806,140 @@ impl FeedForward {
                 Ok(())
             }
             FeedForward::Dense {
-                linear1, linear2, ..
+                linear1,
+                linear2,
+                linear1_quantized,
+                linear2_quantized,
+                ..
             } => {
-                let w1 = linear1.weight().ok_or_else(|| {
-                    KernelError::InvalidShape("shard_for_tp: linear1 weight not loaded".into())
-                })?;
-                let w2 = linear2.weight().ok_or_else(|| {
-                    KernelError::InvalidShape("shard_for_tp: linear2 weight not loaded".into())
-                })?;
+                if linear1_quantized.is_some() {
+                    // ── Quantized TP sharding ──
+                    use crate::parallel::{shard_quantized_column, shard_quantized_row};
 
-                let inter_dim = w1.shape()[0];
-                let hidden_size = w1.shape()[1];
-                let local_inter = inter_dim / (world_size as usize);
+                    let ql1 = linear1_quantized.as_ref().unwrap();
+                    let ql2 = linear2_quantized.as_ref().ok_or_else(|| {
+                        KernelError::InvalidShape(
+                            "shard_for_tp: linear2_quantized not loaded".into(),
+                        )
+                    })?;
 
-                // linear1: column-parallel
-                let w1_shard = ColumnParallelLinear::shard_weight(w1, rank, world_size);
-                *linear1 = Linear::from_arrays(
-                    crate::linear::LinearConfig {
-                        in_features: hidden_size,
-                        out_features: local_inter,
-                        has_bias: false,
-                    },
-                    w1_shard,
-                    None,
-                )?;
+                    // linear1: column-parallel
+                    let l1_shard = shard_quantized_column(ql1, rank, world_size).map_err(|e| {
+                        KernelError::InvalidShape(format!("shard_for_tp quantized linear1: {e}"))
+                    })?;
+                    *linear1_quantized = Some(l1_shard);
 
-                // linear2: row-parallel
-                let w2_shard = RowParallelLinear::shard_weight(w2, rank, world_size);
-                *linear2 = Linear::from_arrays(
-                    crate::linear::LinearConfig {
-                        in_features: local_inter,
-                        out_features: hidden_size,
-                        has_bias: false,
-                    },
-                    w2_shard,
-                    None,
-                )?;
+                    // linear2: row-parallel
+                    let l2_shard = shard_quantized_row(ql2, rank, world_size).map_err(|e| {
+                        KernelError::InvalidShape(format!("shard_for_tp quantized linear2: {e}"))
+                    })?;
+                    *linear2_quantized = Some(l2_shard);
 
-                Ok(())
+                    Ok(())
+                } else {
+                    // ── Float TP sharding (existing path) ──
+                    let w1 = linear1.weight().ok_or_else(|| {
+                        KernelError::InvalidShape("shard_for_tp: linear1 weight not loaded".into())
+                    })?;
+                    let w2 = linear2.weight().ok_or_else(|| {
+                        KernelError::InvalidShape("shard_for_tp: linear2 weight not loaded".into())
+                    })?;
+
+                    let inter_dim = w1.shape()[0];
+                    let hidden_size = w1.shape()[1];
+                    let local_inter = inter_dim / (world_size as usize);
+
+                    // linear1: column-parallel
+                    let w1_shard = ColumnParallelLinear::shard_weight(w1, rank, world_size);
+                    *linear1 = Linear::from_arrays(
+                        crate::linear::LinearConfig {
+                            in_features: hidden_size,
+                            out_features: local_inter,
+                            has_bias: false,
+                        },
+                        w1_shard,
+                        None,
+                    )?;
+
+                    // linear2: row-parallel
+                    let w2_shard = RowParallelLinear::shard_weight(w2, rank, world_size);
+                    *linear2 = Linear::from_arrays(
+                        crate::linear::LinearConfig {
+                            in_features: local_inter,
+                            out_features: hidden_size,
+                            has_bias: false,
+                        },
+                        w2_shard,
+                        None,
+                    )?;
+
+                    Ok(())
+                }
             }
             FeedForward::MoE(_) => Err(KernelError::InvalidShape(
                 "shard_for_tp: MoE not supported for TP".into(),
             )),
+        }
+    }
+
+    /// Returns `true` if this FFN uses quantized weights.
+    pub fn is_quantized(&self) -> bool {
+        match self {
+            FeedForward::Gated {
+                gate_proj_quantized,
+                ..
+            } => gate_proj_quantized.is_some(),
+            FeedForward::Dense {
+                linear1_quantized, ..
+            } => linear1_quantized.is_some(),
+            FeedForward::MoE(_) => false,
+        }
+    }
+
+    /// Set quantized weights for a Gated (SwiGLU) FFN.
+    ///
+    /// # Panics
+    /// Panics if `self` is not `FeedForward::Gated`.
+    pub fn set_quantized_gated(
+        &mut self,
+        gate: crate::quantized_linear::QuantizedLinear,
+        up: crate::quantized_linear::QuantizedLinear,
+        down: crate::quantized_linear::QuantizedLinear,
+    ) {
+        match self {
+            FeedForward::Gated {
+                gate_proj_quantized,
+                up_proj_quantized,
+                down_proj_quantized,
+                ..
+            } => {
+                *gate_proj_quantized = Some(gate);
+                *up_proj_quantized = Some(up);
+                *down_proj_quantized = Some(down);
+            }
+            _ => panic!("set_quantized_gated called on non-Gated FeedForward"),
+        }
+    }
+
+    /// Set quantized weights for a Dense FFN.
+    ///
+    /// # Panics
+    /// Panics if `self` is not `FeedForward::Dense`.
+    pub fn set_quantized_dense(
+        &mut self,
+        l1: crate::quantized_linear::QuantizedLinear,
+        l2: crate::quantized_linear::QuantizedLinear,
+    ) {
+        match self {
+            FeedForward::Dense {
+                linear1_quantized,
+                linear2_quantized,
+                ..
+            } => {
+                *linear1_quantized = Some(l1);
+                *linear2_quantized = Some(l2);
+            }
+            _ => panic!("set_quantized_dense called on non-Dense FeedForward"),
         }
     }
 
@@ -1180,6 +1353,8 @@ impl TransformerBlock {
                     has_bias: false,
                 }),
                 activation,
+                linear1_quantized: None,
+                linear2_quantized: None,
             },
             FeedForwardType::Gated { intermediate_dim } => FeedForward::Gated {
                 gate_proj: Linear::new(crate::linear::LinearConfig {
@@ -1199,6 +1374,9 @@ impl TransformerBlock {
                 }),
                 gate_up_merged_weight: None,
                 gate_up_merged_weight_t: None,
+                gate_proj_quantized: None,
+                up_proj_quantized: None,
+                down_proj_quantized: None,
             },
             FeedForwardType::MoE { .. } => {
                 return Err(KernelError::InvalidShape(
@@ -4484,6 +4662,7 @@ mod tests {
                 linear1,
                 linear2,
                 activation,
+                ..
             } => {
                 assert_eq!(linear1.in_features(), 64);
                 assert_eq!(linear1.out_features(), 256);
