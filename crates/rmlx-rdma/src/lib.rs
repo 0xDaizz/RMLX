@@ -2,6 +2,7 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod auto_setup;
 pub mod collectives;
 pub mod connection;
 pub mod connection_manager;

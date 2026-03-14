@@ -261,8 +261,30 @@ fn try_rdma_init(
         .or_else(|| parse_env_u32("RMLX_COORDINATOR_PORT").and_then(|p| u16::try_from(p).ok()))
         .unwrap_or(rmlx_rdma::coordinator::COORDINATOR_PORT);
 
-    // Load device file for per-peer device selection
+    // Load device file for per-peer device selection.
+    // If no device file is provided, attempt automatic TB discovery and network setup.
     let device_map = load_device_map(config);
+    let device_map = if device_map.is_none() {
+        match rmlx_rdma::auto_setup::try_auto_setup(rank, world_size, &coordinator_addr) {
+            Ok(dm) => {
+                tracing::info!(
+                    target: "rmlx_distributed",
+                    "RDMA auto-setup completed — device map generated from TB discovery",
+                );
+                Some(dm)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "rmlx_distributed",
+                    %e,
+                    "RDMA auto-setup failed, continuing without device map",
+                );
+                None
+            }
+        }
+    } else {
+        device_map
+    };
     if let Some(ref dm) = device_map {
         if dm.world_size() != world_size as usize {
             return Err(DistributedError::Config(format!(

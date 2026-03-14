@@ -96,6 +96,33 @@ impl DeviceMap {
         })
     }
 
+    /// Create a `DeviceMap` directly from a pre-built matrix.
+    ///
+    /// Each entry `entries[i][j]` is the device name for rank i → rank j,
+    /// or `None` for same-rank / no connection.
+    pub fn from_matrix(entries: Vec<Vec<Option<String>>>) -> Result<Self, DeviceFileError> {
+        if entries.is_empty() {
+            return Err(DeviceFileError::InvalidDimensions(
+                "device map must not be empty".into(),
+            ));
+        }
+
+        let world_size = entries.len();
+        for (i, row) in entries.iter().enumerate() {
+            if row.len() != world_size {
+                return Err(DeviceFileError::InvalidDimensions(format!(
+                    "row {i} has {} columns, expected {world_size} (matrix must be square)",
+                    row.len()
+                )));
+            }
+        }
+
+        Ok(Self {
+            entries,
+            world_size,
+        })
+    }
+
     /// Read a device file from disk and parse it.
     pub fn from_file(path: &Path) -> Result<Self, DeviceFileError> {
         let contents = std::fs::read_to_string(path)?;
@@ -413,5 +440,27 @@ mod tests {
         // A raw tab (0x09) inside a JSON string is invalid
         let json = "[[null, \"mlx5\t0\"], [\"x\", null]]";
         assert!(DeviceMap::from_json(json).is_err());
+    }
+
+    #[test]
+    fn test_device_map_from_matrix() {
+        let matrix = vec![
+            vec![None, Some("rdma_en5".to_string())],
+            vec![Some("rdma_en5".to_string()), None],
+        ];
+        let map = DeviceMap::from_matrix(matrix).unwrap();
+        assert_eq!(map.world_size(), 2);
+        assert_eq!(map.device_for(0, 1), Some("rdma_en5"));
+        assert_eq!(map.device_for(1, 0), Some("rdma_en5"));
+        assert_eq!(map.device_for(0, 0), None);
+    }
+
+    #[test]
+    fn test_device_map_from_matrix_validation() {
+        // Empty
+        assert!(DeviceMap::from_matrix(vec![]).is_err());
+        // Non-square
+        let matrix = vec![vec![None], vec![None, None]];
+        assert!(DeviceMap::from_matrix(matrix).is_err());
     }
 }
