@@ -48,6 +48,7 @@ pub struct QuantizedLinearConfig {
 /// - **batch=1**: `affine_quantized_matmul` (single-vector QMV kernel)
 /// - **batch>1**: `affine_quantized_matmul_batched` (tiled QMM kernel, Q4 only)
 ///   or CPU `affine_qmm` fallback for Q8.
+#[derive(Debug)]
 pub struct QuantizedLinear {
     /// Packed quantized weight data.
     /// For Q4: each byte holds 2 values (nibbles). Length = out_features * (in_features / 2).

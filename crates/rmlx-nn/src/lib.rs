@@ -49,7 +49,15 @@ pub use mla::{Mla, MlaConfig, MlaKvCache};
 pub use moe::{load_balance_loss, Expert, MoeConfig, MoeForwardMetrics, MoeLayer, MoeStrategy};
 pub use moe_pipeline::{MoePipeline, MoePipelineConfig};
 pub use paged_kv_cache::{BlockId, BlockManager, PagedKvCache, PagedKvError};
-pub use parallel::{ColumnParallelLinear, RowParallelLinear, TpError};
+pub use parallel::{
+    shard_quantized_column, shard_quantized_column_segments, shard_quantized_row,
+    ColumnParallelLinear, RowParallelLinear, ShardMode, TpError,
+};
+#[cfg(feature = "distributed")]
+pub use parallel::{
+    shard_quantized_linear, QuantizedColumnParallelLinear, QuantizedParallelForward,
+    QuantizedRowParallelLinear,
+};
 pub use prefill_plan::{PlanCache, PlanStep, PrefillPlan};
 pub use prefill_pool::{PrefillBufferPool, Slot as PrefillSlot, NUM_SLOTS as PREFILL_NUM_SLOTS};
 pub use prefix_cache::{PrefixCache, PrefixMatch};
