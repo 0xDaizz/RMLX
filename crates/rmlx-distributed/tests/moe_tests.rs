@@ -8,6 +8,11 @@ use rmlx_distributed::warmup::WarmupState;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+/// Returns true if Metal GPU is available on this machine.
+fn has_metal_gpu() -> bool {
+    objc2_metal::MTLCreateSystemDefaultDevice().is_some()
+}
+
 #[test]
 fn test_group_world() {
     let g = Group::world(4, 1).unwrap();
@@ -20,6 +25,10 @@ fn test_group_world() {
 
 #[test]
 fn test_moe_policy_zones() {
+    if !has_metal_gpu() {
+        eprintln!("Skipping: no Metal GPU");
+        return;
+    }
     let policy = MoePolicy::new();
     policy.set_hysteresis_band(0); // disable hysteresis for clean zone testing
 
@@ -36,6 +45,10 @@ fn test_moe_policy_zones() {
 
 #[test]
 fn test_moe_policy_cooldown() {
+    if !has_metal_gpu() {
+        eprintln!("Skipping: no Metal GPU");
+        return;
+    }
     let policy = MoePolicy::new();
     policy.switch_backend(MoeBackend::Cpu);
     // During cooldown, should keep Cpu
@@ -135,6 +148,10 @@ fn test_moe_metrics() {
 
 #[test]
 fn test_3zone_boundary() {
+    if !has_metal_gpu() {
+        eprintln!("Skipping: no Metal GPU");
+        return;
+    }
     let policy = MoePolicy::with_thresholds(64, 320, 4096);
     // Default backend is Metal, hysteresis_band=16
     // cpu_thresh = 64-16 = 48, gpu_thresh = 320+16 = 336
@@ -175,6 +192,10 @@ fn test_group_display() {
 
 #[test]
 fn test_moe_policy_rdma_zone_multinode() {
+    if !has_metal_gpu() {
+        eprintln!("Skipping: no Metal GPU");
+        return;
+    }
     let policy = MoePolicy::new();
     policy.set_world_size(2);
     policy.set_hysteresis_band(0); // disable hysteresis for clean threshold testing
@@ -193,6 +214,10 @@ fn test_moe_policy_rdma_zone_multinode() {
 
 #[test]
 fn test_moe_policy_no_rdma_single_node() {
+    if !has_metal_gpu() {
+        eprintln!("Skipping: no Metal GPU");
+        return;
+    }
     let policy = MoePolicy::new();
     policy.set_world_size(1);
     policy.set_hysteresis_band(0);
@@ -204,6 +229,10 @@ fn test_moe_policy_no_rdma_single_node() {
 
 #[test]
 fn test_moe_policy_hysteresis() {
+    if !has_metal_gpu() {
+        eprintln!("Skipping: no Metal GPU");
+        return;
+    }
     let policy = MoePolicy::with_thresholds(64, 320, 4096);
     policy.set_world_size(2);
     // Default hysteresis_band = 16
@@ -227,6 +256,10 @@ fn test_moe_policy_hysteresis() {
 
 #[test]
 fn test_moe_dispatch_rdma_routing() {
+    if !has_metal_gpu() {
+        eprintln!("Skipping: no Metal GPU");
+        return;
+    }
     let (t0, _t1) = LoopbackTransport::new_pair();
     let group = Group::with_transport(vec![0, 1], 0, 2, t0).unwrap();
     let config = MoeDispatchConfig {
@@ -734,6 +767,10 @@ impl RdmaTransport for LoopbackTransport {
 
 #[test]
 fn test_rdma_size_exchange_roundtrip() {
+    if !has_metal_gpu() {
+        eprintln!("Skipping: no Metal GPU");
+        return;
+    }
     // Two ranks. Rank 0 sends tokens for experts 4-7 (rank 1).
     // We run dispatch on rank 0 and verify that size headers are sent.
     let (t0, _t1) = LoopbackTransport::new_pair();
@@ -787,6 +824,10 @@ fn test_rdma_size_exchange_roundtrip() {
 
 #[test]
 fn test_rdma_expert_id_preserved_in_merge() {
+    if !has_metal_gpu() {
+        eprintln!("Skipping: no Metal GPU");
+        return;
+    }
     // Simulate rank 1 receiving tokens from rank 0 for its local experts (4-7).
     // Rank 0 sends tokens tagged with expert_id=4 and expert_id=6.
     // Rank 1 should place them in the correct expert slots, not first-fit.
@@ -909,6 +950,10 @@ fn test_rdma_expert_id_preserved_in_merge() {
 
 #[test]
 fn test_rdma_wire_format_expert_id_prefix() {
+    if !has_metal_gpu() {
+        eprintln!("Skipping: no Metal GPU");
+        return;
+    }
     // Rank 0 dispatches a single token to expert 5 (on rank 1).
     // Verify the payload wire format: [expert_id: u32 LE | token_data...]
     let (t0, _t1) = LoopbackTransport::new_pair();
@@ -948,6 +993,10 @@ fn test_rdma_wire_format_expert_id_prefix() {
 
 #[test]
 fn test_rdma_size_exchange_zero_payload() {
+    if !has_metal_gpu() {
+        eprintln!("Skipping: no Metal GPU");
+        return;
+    }
     // Rank 0 sends all tokens to local experts (0-3), nothing to rank 1.
     // Size header to rank 1 should be 0.
     let (t0, _t1) = LoopbackTransport::new_pair();
@@ -1169,6 +1218,10 @@ fn test_guard_action_dense_fallback() {
 
 #[test]
 fn test_guard_action_reset_after_recovery() {
+    if !has_metal_gpu() {
+        eprintln!("Skipping: no Metal GPU");
+        return;
+    }
     let mut exchange = make_exchange_with_guard(1);
 
     // First: trigger DenseFallback (same as dense_fallback test — 5 rounds needed)
