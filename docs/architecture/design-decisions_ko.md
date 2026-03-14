@@ -23,27 +23,41 @@ MLX는 C++로 작성되어 있지만, RMLX는 Rust를 선택했습니다.
 
 GPU 인퍼런스 엔진은 `unsafe` 블록(Metal FFI, RDMA FFI)이 불가피하지만, Rust의 소유권 시스템은 `unsafe` 경계를 **명시적으로 격리**할 수 있습니다. 안전한 코드(`ZeroCopyBuffer` 외부 API)와 위험한 코드(`posix_memalign`, `ibv_post_send` 호출부)가 타입 시스템 레벨에서 구분되므로, C++보다 안전하면서도 동일한 성능을 유지할 수 있습니다.
 
-또한 Cargo workspace는 7개 크레이트의 의존성, 버전, 빌드 설정을 단일 `Cargo.toml`로 관리합니다. CMake + setuptools 조합 대비 빌드 복잡도가 현저히 낮습니다.
+또한 Cargo workspace는 8개 크레이트의 의존성, 버전, 빌드 설정을 단일 `Cargo.toml`로 관리합니다. CMake + setuptools 조합 대비 빌드 복잡도가 현저히 낮습니다. `rmlx-metal` 크레이트는 메인 코드베이스에 18개의 `unsafe` 블록만 포함하며, 모두 `ComputePass` zero-cost 래퍼와 `types.rs` 별칭 레이어를 통해 안전한 public API 뒤에 100% 캡슐화되어 있습니다.
 
 ---
 
-## 2. metal-rs 0.31을 선택한 이유
+## 2. objc2-metal 0.3을 선택한 이유
 
-Metal API 바인딩으로 metal-rs 0.31을 사용합니다.
+Metal API 바인딩으로 `objc2-metal` 0.3 (`objc2` 생태계)을 사용합니다. 기존 `metal-rs` 0.31에서 마이그레이션했습니다.
 
 ### 근거
 
-- **PoC Phase 4에서 완전 검증**: `posix_memalign` → `newBufferWithBytesNoCopy` → `ibv_reg_mr` → RDMA 전송 → Metal compute 전체 파이프라인을 metal-rs 0.31로 성공적으로 재현했습니다.
-- **직접 MTLDevice/MTLBuffer 접근**: Objective-C++ 브릿지 없이 Rust에서 Metal 객체에 직접 접근할 수 있습니다.
-- **타입 안전한 API**: `Device`, `CommandQueue`, `Buffer`, `ComputePipelineState` 등이 Rust 타입으로 래핑되어 있어 misuse를 컴파일 타임에 방지합니다.
-- **Metal 3 기능 지원**: `MTLSharedEvent`, `ResidencySet` 등 M3 이상에서 필요한 API를 지원합니다.
+- **PoC Phase 4에서 완전 검증**: `posix_memalign` → `newBufferWithBytesNoCopy` → `ibv_reg_mr` → RDMA 전송 → Metal compute 전체 파이프라인을 성공적으로 재현했습니다.
+- **직접 MTLDevice/MTLBuffer 접근**: Objective-C++ 브릿지 없이 Rust에서 프로토콜 객체(`ProtocolObject<dyn MTLCommandBuffer>` 등)를 통해 Metal 객체에 직접 접근할 수 있습니다.
+- **타입 안전한 API**: 타입 별칭(`MtlDevice`, `MtlBuffer`, `MtlPipeline`)과 `ComputePass` 뉴타입 래퍼가 인체공학적이고 컴파일 타임에 안전한 Metal 타입 접근을 제공합니다.
+- **Metal 3+ 기능 지원**: `MTLSharedEvent`, `ResidencySet` 등 M3 이상에서 필요한 API를 지원합니다. `metal4` feature flag로 macOS 26+ Metal 4 API도 지원합니다 (`MTL4CommandAllocator`, `MTL4ComputePipeline`, `MTL4Counters` 등).
+- **내장 Send+Sync**: `objc2` 타입은 본질적으로 `Send + Sync`이므로, `unsafe impl Send/Sync` 보일러플레이트가 불필요합니다(unsafe 블록 ~166개 → ~18개, msg_send! 호출 30개 → 2개로 감소).
+- **추가 의존성**: Foundation 타입을 위한 `objc2-foundation` 0.3과 안전한 바이트 레벨 타입 캐스팅을 위한 `bytemuck`.
+
+### metal-rs로부터의 마이그레이션
+
+`metal-rs` 0.31에서 `objc2-metal` 0.3으로의 마이그레이션에서 다음이 변경되었습니다:
+- `CommandBufferRef` → `ProtocolObject<dyn MTLCommandBuffer>` (`MTLCommandBuffer`로 별칭)
+- `ComputeCommandEncoderRef` → `ComputePass` (zero-cost 뉴타입 래퍼)
+- `metal::MTLSize` → `MTLSize` (rmlx-metal에서 재내보내기)
+- `metal::Buffer` / `metal::Device` → `MtlBuffer` / `MtlDevice` 타입 별칭
+- `ConcreteBlock` → `block2::RcBlock`
+- `ForeignType` 트레이트 사용 (제거, objc2에서 불필요)
+- `encoder.set_compute_pipeline_state(p)` → `pass.set_pipeline(p)`
+- `encoder.end_encoding()` → `pass.end()`
 
 ### 대안 분석
 
 | 대안 | 미채택 사유 |
 |------|------------|
 | metal-cpp (C++) | Objective-C++ 브릿지 필요, Rust 프로젝트와 빌드 통합 복잡 |
-| objc2 직접 사용 | 모든 Metal API를 수동 바인딩해야 하므로 개발 속도 저하 |
+| metal-rs 0.31 | 업스트림 지원 중단, Metal 4 미지원, 수동 unsafe impl Send/Sync 필요 |
 | wgpu | Metal 전용 최적화(SharedEvent, NoCopy buffer) 접근 불가 |
 
 ---
@@ -213,8 +227,9 @@ Metal에는 동등한 capture-replay 메커니즘이 없습니다. 대신 ExecGr
 
 1. Transformer layer의 연산 시퀀스를 사전 분석합니다
 2. 연산을 5개 command buffer로 그룹화합니다 (기존 65개에서 감소)
-3. 매 forward pass마다 동일한 결정론적 시퀀스를 re-encode합니다
+3. 매 forward pass마다 동일한 결정론적 시퀀스를 re-encode합니다. ICB (Indirect Command Buffer) replay를 지원하여 CPU re-encoding 비용이 거의 제로입니다
 4. CB 간 동기화에 MTLSharedEvent를 사용합니다
+5. Sparse ICB (`icb_sparse.rs`)로 MoE 가변 디스패치 패턴을 지원합니다
 
 ### 왜 5개의 Command Buffer인가?
 
@@ -274,3 +289,32 @@ f16 가중치를 사용하는 7B 파라미터 모델 기준:
 
 크리티컬 패스에서 per-layer 전치 + 복사 오버헤드를 완전히 제거합니다.
 ExecGraph와 결합하여 17.4x 속도 향상에 기여합니다.
+
+---
+
+## 10. Shape-Aware GEMM 디스패치
+
+M 차원에 따라 최적의 GEMM 커널 변형을 선택하는 shape-aware 디스패치 테이블을 사용합니다.
+
+### 근거
+
+단일 GEMM 커널이 모든 행렬 크기에서 최적일 수 없습니다. 작은 M 값(디코드, M=1-8)은 큰 M 값(프리필, M=512+)과는 다른 타일링 전략이 유리합니다. 모든 크기에 하나의 커널을 적용하는 대신, RMLX는 런타임에 최적 커널 변형을 선택하는 디스패치 테이블을 사용합니다.
+
+### 디스패치 테이블
+
+| M 범위 | 전략 | 세부사항 |
+|--------|------|----------|
+| M=1 | Tiled GEMM (BM=16 pad) | GEMV 경로 제거, 통합 타일 경로 사용 |
+| M=2-8 | Split-K (무조건, K>=256) | 매우 작은 M에서 병렬성 극대화 |
+| M=9-32 | Split-K (K>=N만), else Tiled | 중간 M에서 조건부 split |
+| M=33-128 | Tiled GEMM (MlxMicro 16x32) | 표준 타일 경로 |
+| M=256 | MlxSmall 32x32 | 중간 타일 크기 |
+| M=512+ | NAX 64x128 | 최대 처리량을 위한 대형 타일 |
+
+### 성능 결과
+
+| 지표 | 값 |
+|------|-----|
+| FP16 GEMM 최대 처리량 | 24.05 TFLOPS |
+| QMM Q4 처리량 | 17.43 TFLOPS |
+| 디코드 레이턴시 (최적) | 699.3 us/layer |

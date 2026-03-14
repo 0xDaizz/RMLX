@@ -1,6 +1,15 @@
 # 아키텍처 개요
 
-RMLX는 4개의 레이어로 구성된 계층형 아키텍처이며, 전 Phase(0~9B-opt + S1-S5 + Audit Remediation + EP-1~EP-6)가 완료되어 1,298+ 테스트와 함께 완전히 구현된 상태입니다. 각 레이어는 명확한 책임 경계를 가지며, Cargo 크레이트 단위로 분리되어 있습니다. Phase 7에서 추가된 VJP autodiff, LoRA fine-tuning, 프로덕션 하드닝(structured logging, metrics, precision guard, graceful shutdown)이 포함됩니다. Phase 9에서는 ExecGraph (5 CBs/layer, 92.3% 감소), CommandBatcher, Indirect Command Buffer, 가중치 사전 캐싱이 추가되어 17.4x 속도 향상을 달성했습니다. 서빙 지원 Phase(S1-S5)에서 Flash Attention 2, GELU, FP8/GGUF/AWQ/GPTQ, KV 캐시 변형, Conv1d/Conv2d, 동적 shape가 추가되었습니다. 전 크레이트 감사 수정(76개 항목)과 EP 최적화(EP-1~EP-6)에서 GPU-native top-k 라우팅, 그룹형 expert GEMM, 가변 길이 v3 교환, TBO/SBO 오버랩, FP8 와이어 교환, sparse ICB + slab 링 실행이 추가되었습니다. Phase 8c는 CachedDecode (사전 해석 PSO + 사전 할당 스크래치 버퍼), 2-인코더 디코드 경로, 토큰별 CPU 오버헤드 제로를 위한 `_preresolved_into_encoder` 패턴을 추가합니다. Phase A는 프리필(seq_len=N) 단일 레이어 최적화를 추가합니다: 단일 CB 파이프라인(54개 동기화 지점 → 1개), GQA slab SDPA(32개 per-head 디스패치 → 1개), GEMM threadgroup swizzle, 새로운 `_into_cb` ops — 베이스라인 대비 3.5-7.3x 속도 향상을 달성합니다.
+RMLX는 4개의 레이어로 구성된 계층형 아키텍처이며, 8개의 Cargo 크레이트(rmlx-metal, rmlx-alloc, rmlx-rdma, rmlx-core, rmlx-distributed, rmlx-nn, rmlx-cli, rmlx-macros)로 구성됩니다. 전 Phase(0~9B-opt + S1-S5 + Audit Remediation + EP-1~EP-6)가 완료되어 1,298+ 테스트와 함께 완전히 구현된 상태입니다. 각 레이어는 명확한 책임 경계를 가지며, Cargo 크레이트 단위로 분리되어 있습니다. Phase 7에서 추가된 VJP autodiff, LoRA fine-tuning, 프로덕션 하드닝(structured logging, metrics, precision guard, graceful shutdown)이 포함됩니다. Phase 9에서는 ExecGraph (5 CBs/layer + ICB replay, 92.3% 감소), CommandBatcher, Indirect Command Buffer(sparse ICB 포함), 가중치 사전 캐싱이 추가되어 17.4x 속도 향상을 달성했습니다. 서빙 지원 Phase(S1-S5)에서 Flash Attention 2, GELU, FP8/GGUF/AWQ/GPTQ, KV 캐시 변형, Conv1d/Conv2d, 동적 shape가 추가되었습니다. 전 크레이트 감사 수정(76개 항목)과 EP 최적화(EP-1~EP-6)에서 GPU-native top-k 라우팅, 그룹형 expert GEMM, 가변 길이 v3 교환, TBO/SBO 오버랩, FP8 와이어 교환, sparse ICB + slab 링 실행이 추가되었습니다. Phase 8c는 CachedDecode (사전 해석 PSO + 사전 할당 스크래치 버퍼), 2-인코더 디코드 경로, 토큰별 CPU 오버헤드 제로를 위한 `_preresolved_into_encoder` 패턴을 추가합니다. Phase A는 프리필(seq_len=N) 단일 레이어 최적화를 추가합니다: 단일 CB 파이프라인(54개 동기화 지점 → 1개), GQA slab SDPA(32개 per-head 디스패치 → 1개), GEMM threadgroup swizzle, 새로운 `_into_cb` ops — 베이스라인 대비 3.5-7.3x 속도 향상을 달성합니다. objc2-metal 마이그레이션(metal-rs에서 이전)으로 rmlx-metal의 unsafe 표면이 18개 블록으로 축소되었으며, 100% 안전한 API 뒤에 캡슐화되어 있습니다. `ComputePass` zero-cost 뉴타입 래퍼와 `types.rs` 별칭 레이어가 인체공학적 접근을 제공합니다.
+
+### 성능 마일스톤
+
+| 지표 | 값 |
+|------|-----|
+| FP16 GEMM 처리량 | 24.05 TFLOPS |
+| QMM Q4 처리량 | 17.43 TFLOPS |
+| 디코드 레이턴시 | 699.3 us/layer |
+| Shape-aware GEMM 디스패치 | M 차원 기반 Tiled/Split-K/NAX 자동 선택 |
 
 ---
 
@@ -11,7 +20,7 @@ RMLX는 4개의 레이어로 구성된 계층형 아키텍처이며, 전 Phase(0
 │  ~/rmlx/ (이 리포지토리 — ML 프레임워크)                                      │
 │                        rmlx-core (연산 엔진)                                │
 │  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │                      Compute Graph / Op Registry (27 op modules)     │   │
+│  │                      Compute Graph / Op Registry (32 op modules)     │   │
 │  │  matmul · softmax · rms_norm · rope · quantized_matmul · moe_gate   │   │
 │  │  sdpa(FA2) · silu · gelu · fp8 · conv · binary · reduce · copy    │   │
 │  │  indexing · formats/gguf · ...                                     │   │
@@ -74,7 +83,8 @@ RMLX는 4개의 레이어로 구성된 계층형 아키텍처이며, 전 Phase(0
 
 | 컴포넌트 | 역할 |
 |----------|------|
-| **Op Registry** | matmul, softmax, rms_norm, rope, topk_route, quantized_matmul(AWQ/GPTQ), moe_gate, sdpa(FA2), silu, gelu, fp8, conv, gather_mm 등 27개 op 모듈 등록 |
+| **Op Registry** | matmul, gemv, softmax, rms_norm, rope, topk_route, quantized(AWQ/GPTQ), moe_kernels, sdpa(FA2+backward), silu, gelu, fp8, conv, conv_tiled, gather_mm, layer_norm, unary, binary, reduce, copy, indexing, concat, select, slice, sort, scan, random, argreduce, fused, buffer_slots, vjp_gpu 등 32개 op 모듈 등록 |
+| **Shape-aware Dispatch** | M 차원 기반 GEMM 디스패치 테이블: Tiled (M=1, BM=16 pad), Split-K (M=2-32), Tiled MlxMicro 16x32 (M=33-128), MlxSmall 32x32 (M=256), NAX 64x128 (M=512+) |
 | **Compute Graph** | 선택적 tracing 기반 연산 그래프 (eager-first, prefill 시 tracing) |
 | **Kernel Dispatch** | Op → Metal 커널 매핑 및 실행, dtype/shape 기반 최적 커널 선택 |
 
@@ -88,9 +98,9 @@ rmlx-core는 rmlx-metal과 rmlx-alloc에 의존하며, 상위 레이어(rmlx-nn,
 
 | 컴포넌트 | 역할 |
 |----------|------|
-| **ExecGraph** | 결정론적 op 시퀀스를 5개 CB/layer로 재생하는 사전 빌드 실행 그래프 (65개에서 92.3% 감소) |
+| **ExecGraph** | 결정론적 op 시퀀스를 5개 CB/layer로 재생하는 사전 빌드 실행 그래프 (65개에서 92.3% 감소), ICB replay로 CPU re-encoding 비용 거의 제로 |
 | **CommandBatcher** | 인코더 작업을 공유 command buffer로 그룹화하여 per-op CB 생성 제거 |
-| **ICB** | 사전 인코딩된 커맨드 시퀀스를 CPU 오버헤드 없이 재생하는 Indirect Command Buffer |
+| **ICB / ICB Sparse** | 사전 인코딩된 커맨드 시퀀스를 CPU 오버헤드 없이 재생하는 Indirect Command Buffer; sparse 변형은 MoE 가변 디스패치 패턴용 |
 
 ---
 
@@ -114,9 +124,10 @@ Metal GPU 실행 파이프라인을 관리합니다. rmlx-metal 크레이트가 
 
 | 컴포넌트 | 역할 |
 |----------|------|
-| **Kernel Manager** | `.metallib` AOT 로드 및 소스 문자열 JIT 컴파일, ComputePipelineState 캐싱 |
-| **CommandEncoder** | CommandBuffer/Encoder 수명 관리, barrier/fence 삽입, concurrent dispatch context |
+| **Kernel Manager** | `.metallib` AOT 로드 및 소스 문자열 JIT 컴파일, `PipelineCache`를 통한 ComputePipelineState 캐싱 |
+| **ComputePass** | Raw Metal compute encoder 위의 zero-cost 뉴타입 래퍼; `types.rs`에서 타입 별칭(`MtlDevice`, `MtlBuffer`, `MtlPipeline`) 정의 |
 | **Pipeline Scheduler** | 듀얼 `MTLCommandQueue` 관리 — compute 큐와 transfer 큐를 분리하여 GPU 레벨 오버랩 |
+| **Metal 4 지원** | Feature-gated (`metal4`) macOS 26+ API 지원: `MTL4CommandAllocator`, `MTL4ComputePipeline`, `MTL4Counters` 등 |
 
 듀얼 큐 아키텍처는 PoC Phase 3.6에서 검증되었습니다. Compute 연산과 RDMA 데이터 전송 준비를 동시에 실행하여 파이프라인 효율을 극대화합니다.
 
@@ -169,12 +180,17 @@ Thunderbolt 5 RDMA를 통한 노드 간 통신을 담당합니다.
 
 | 크레이트 | 의존하는 크레이트 |
 |----------|-------------------|
-| `rmlx-metal` | (외부: metal-rs 0.31, objc2, block2) |
+| `rmlx-metal` | (외부: objc2-metal 0.3, objc2 0.6, block2 0.6, objc2-foundation 0.3, bytemuck) |
 | `rmlx-alloc` | `rmlx-metal`, libc |
 | `rmlx-rdma` | `rmlx-alloc`, libc (ibverbs FFI) |
 | `rmlx-core` | `rmlx-metal`, `rmlx-alloc` |
 | `rmlx-distributed` | `rmlx-core`, `rmlx-rdma` |
 | `rmlx-nn` | `rmlx-core` |
+| `rmlx-macros` | (proc-macro 크레이트: syn, quote, proc-macro2) |
+
+### Unsafe 표면
+
+`rmlx-metal` 크레이트에는 메인(non-metal4) 코드베이스에 18개의 `unsafe` 블록이 있으며, 모두 100% 안전한 public API 뒤에 캡슐화되어 있습니다. `ComputePass` 래퍼와 `types.rs` 별칭 레이어로 인해 하위 크레이트(rmlx-core, rmlx-nn)는 raw Metal 포인터에 직접 접근하지 않습니다.
 
 **의존성 원칙**: 하위 레이어(rmlx-metal, rmlx-alloc)는 상위 레이어(rmlx-core, rmlx-nn)에 대해 무지합니다. 모든 의존성은 단방향이며 순환 의존은 허용되지 않습니다.
 

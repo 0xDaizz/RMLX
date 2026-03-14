@@ -2,7 +2,7 @@
 
 > **A Rust-based Metal GPU ML framework optimized for Apple Silicon**
 >
-> Status: All Phases complete (0-9B-opt + S1-S5 + Phase KO + Phase 8c + Phase 9 + Phase 10 + Phase 11 + Phase A) (1,298 tests, 0 failures) | License: MIT | Rust 1.80+ | macOS (Apple Silicon)
+> Status: All Phases complete (0-11 + S1-S5 + KO + 8c + A-D + F-J + objc2-metal migration) (1,298+ tests, 0 failures) | License: MIT | Rust 1.80+ | macOS (Apple Silicon)
 
 ---
 
@@ -35,12 +35,14 @@ MLX is an excellent framework, but it carries the following software overheads i
 2-node EP decode: 64ms/step -> 33ms/step (~30 tok/s)
 Achieve near-parity with single-node 32ms/step
 
-Phase 10 result: 703.4 us/layer (fused 7-dispatch, 64x speedup, 6.34x faster than MLX at 60L depth)
-Phase 11 conclusion: kernel-level optimization CONCLUDED — 73.6% bandwidth efficiency is the practical floor
+Decode: 699.3 us/layer (fused 7-dispatch, 64x speedup, 6.34x faster than MLX at 60L)
+BW efficiency: 73.6% — kernel-level optimization CONCLUDED
 
-Phase A prefill: single-CB pipeline (54 sync points -> 1), GQA slab SDPA (32 dispatches -> 1)
-3.5-7.3x speedup over baseline, MLX parity within 1.2-3.4x
-GEMM: rmlx 13 TFLOPS vs MLX 24 TFLOPS (remaining gap)
+GEMM: 24.05T TFLOPS (pipe parity with MLX 23.97T)
+QMM Q4 M=512: 17.43T (+28% vs MLX 13.6T)
+QMM Q4 low-M: 86.3% parity
+Prefill GPU-only: 29.2T
+Fair bench M=32~256: 1.24~2.83x faster than MLX
 ```
 
 The ultimate goal is to connect two Mac Studio M3 Ultras via Thunderbolt 5 RDMA and achieve inference performance nearly identical to a single node.
@@ -65,12 +67,12 @@ The ultimate goal is to connect two Mac Studio M3 Ultras via Thunderbolt 5 RDMA 
    Pre-allocates dual Metal + RDMA registered buffers, eliminating runtime registration overhead.
 
 6. **ExecGraph CB batching**
-   Phase 10 fused 7-dispatch pipeline achieves 703.4 us/layer at 60L depth (64x speedup
-   vs baseline, 6.34x faster than MLX). Phase 11 confirmed this as the practical floor
-   for f16 decode on Apple Silicon (73.6% bandwidth efficiency).
+   Fused 7-dispatch pipeline achieves 699.3 us/layer at 60L depth (64x speedup
+   vs baseline, 6.34x faster than MLX). Kernel-level optimization concluded at
+   73.6% bandwidth efficiency -- the practical floor for f16 decode on Apple Silicon.
 
-7. **Phase A prefill optimization**
-   Single-CB pipeline eliminates 54 sync points down to 1. GQA slab SDPA reduces 32 per-head dispatches to 1. GEMM threadgroup swizzle enabled. New ops: `matmul_into_cb`, `silu_into_cb`. Results: 3.5-7.3x speedup over baseline, MLX parity within 1.2-3.4x. Benchmarks: `prefill_bench.rs`, `gemm_bench.rs`.
+7. **Prefill optimization**
+   Single-CB pipeline eliminates 54 sync points down to 1. GQA slab SDPA reduces 32 per-head dispatches to 1. GEMM throughput reaches 24.05T (pipe parity with MLX). Prefill GPU-only throughput: 29.2T. Results: 3.5-7.3x speedup over baseline.
 
 7. **Expert Parallelism (EP)**
    MLX has no built-in EP support. RMLX provides a complete EP stack: 3-zone auto backend policy (CPU/Metal/RDMA) that selects the optimal path by data size, 7 dedicated MoE Metal kernels, SparseGuard overflow monitoring with capacity auto-tuning, and compute-RDMA pipeline overlap for distributed MoE inference on models like Mixtral and DeepSeek-V3. Six post-audit EP optimization phases (EP-1 through EP-6) further eliminate CPU sync points with GPU-native top-k routing, replace per-expert loops with grouped GEMM, reduce wire bytes via variable-length v3 protocol + FP8 quantization, and overlap compute/communication with TBO/SBO pipelines.
@@ -82,10 +84,10 @@ The ultimate goal is to connect two Mac Studio M3 Ultras via Thunderbolt 5 RDMA 
 | Area | Technology |
 |------|-----------|
 | Language | Rust 1.80+ (edition 2021) |
-| GPU | metal-rs 0.31 (Apple Metal API) |
+| GPU | objc2-metal 0.3 (Apple Metal API) |
 | RDMA | ibverbs FFI (Thunderbolt 5 UC QP) |
 | Hardware | Apple Silicon UMA (M3 Ultra, 80-core GPU, 512GB) |
-| Build | Cargo workspace (7 crates) |
+| Build | Cargo workspace (8 crates) |
 
 ---
 
