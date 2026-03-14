@@ -385,28 +385,60 @@ impl RdmaDeviceProbe {
         })
     }
 
-    /// Find a valid GID index by probing. Prefers index 1 (RoCE on TB5).
+    /// Find a valid GID index by probing.
+    ///
+    /// Prefers a non-link-local IPv4-mapped GID (e.g. `10.254.0.x` set by
+    /// `auto_setup`) over a link-local one (`169.254.x.x`).  Falls back to
+    /// index 1 → 0 if no such GID exists.
     fn probe_gid_index(ctx: &RdmaContext, port: u8, gid_tbl_len: u32) -> Result<u32, RdmaError> {
+        use std::os::raw::c_int;
         let lib = ctx.lib();
 
-        // Try index 1 first (TB5 RoCE convention)
+        // Phase 1: Find a non-link-local IPv4-mapped GID (preferred for RDMA over TB5)
+        for idx in 0..gid_tbl_len {
+            let mut gid: crate::ffi::IbvGid = unsafe { std::mem::zeroed() };
+            let ret = unsafe { (lib.query_gid)(ctx.raw(), port, idx as c_int, &mut gid) };
+            if ret != 0 {
+                continue;
+            }
+            let raw = unsafe { gid.raw };
+            // Check IPv4-mapped format: ::ffff:x.x.x.x
+            let is_ipv4_mapped =
+                raw[..10] == [0u8; 10] && raw[10] == 0xff && raw[11] == 0xff;
+            if !is_ipv4_mapped {
+                continue;
+            }
+            // Skip link-local (169.254.x.x)
+            if raw[12] == 0xa9 && raw[13] == 0xfe {
+                continue;
+            }
+            // Found a non-link-local IPv4 GID
+            eprintln!(
+                "[rdma] probe_gid_index: selected index {idx} (IP={}.{}.{}.{})",
+                raw[12], raw[13], raw[14], raw[15]
+            );
+            return Ok(idx);
+        }
+
+        // Phase 2: Fall back to any non-zero GID (try index 1 first for TB5 convention)
         if gid_tbl_len > 1 {
             let mut gid: crate::ffi::IbvGid = unsafe { std::mem::zeroed() };
             let ret = unsafe { (lib.query_gid)(ctx.raw(), port, 1, &mut gid) };
             if ret == 0 {
-                // Verify it's not all-zeros
                 let raw = unsafe { gid.raw };
                 if raw.iter().any(|&b| b != 0) {
+                    eprintln!("[rdma] probe_gid_index: fallback to index 1");
                     return Ok(1);
                 }
             }
         }
 
-        // Fall back to index 0
+        // Phase 3: Fall back to index 0
         if gid_tbl_len > 0 {
             let mut gid: crate::ffi::IbvGid = unsafe { std::mem::zeroed() };
             let ret = unsafe { (lib.query_gid)(ctx.raw(), port, 0, &mut gid) };
             if ret == 0 {
+                eprintln!("[rdma] probe_gid_index: fallback to index 0");
                 return Ok(0);
             }
         }

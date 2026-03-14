@@ -264,9 +264,12 @@ fn try_rdma_init(
     // Load device file for per-peer device selection.
     // If no device file is provided, attempt automatic TB discovery and network setup.
     let device_map = load_device_map(config);
+    eprintln!("[rdma-init] device_map loaded: {}", device_map.is_some());
     let device_map = if device_map.is_none() {
+        eprintln!("[rdma-init] No device file — attempting auto_setup...");
         match rmlx_rdma::auto_setup::try_auto_setup(rank, world_size, &coordinator_addr) {
             Ok(dm) => {
+                eprintln!("[rdma-init] auto_setup OK — device map generated");
                 tracing::info!(
                     target: "rmlx_distributed",
                     "RDMA auto-setup completed — device map generated from TB discovery",
@@ -274,6 +277,7 @@ fn try_rdma_init(
                 Some(dm)
             }
             Err(e) => {
+                eprintln!("[rdma-init] auto_setup FAILED: {e}");
                 tracing::warn!(
                     target: "rmlx_distributed",
                     %e,
@@ -332,6 +336,7 @@ fn try_rdma_init(
         let device_name = device_map
             .as_ref()
             .and_then(|dm| dm.device_for(rank as usize, peer as usize));
+        eprintln!("[rdma-init] open_ctx peer={peer}: device_name={device_name:?}");
         let ctx = match device_name {
             Some(name) => RdmaContext::open_by_name(name),
             None => RdmaContext::open_default(),
@@ -360,6 +365,15 @@ fn try_rdma_init(
         world_size as usize
     ];
 
+    eprintln!("[rdma-init] sizeof: IbvSendWr={} IbvRecvWr={} IbvWc={} IbvSge={} IbvContextOps={} IbvContext={}",
+        std::mem::size_of::<rmlx_rdma::ffi::IbvSendWr>(),
+        std::mem::size_of::<rmlx_rdma::ffi::IbvRecvWr>(),
+        std::mem::size_of::<rmlx_rdma::ffi::IbvWc>(),
+        std::mem::size_of::<rmlx_rdma::ffi::IbvSge>(),
+        std::mem::size_of::<rmlx_rdma::ffi::IbvContextOps>(),
+        std::mem::size_of::<rmlx_rdma::ffi::IbvContext>(),
+    );
+    eprintln!("[rdma-init] Phase 1a: creating QPs...");
     for peer in 0..world_size {
         if peer == rank {
             // Self-slot: no RDMA context needed.  Opening the same RDMA device
@@ -368,12 +382,16 @@ fn try_rdma_init(
             continue;
         }
 
+        eprintln!("[rdma-init] peer={peer}: opening context...");
         let ctx = open_ctx(peer)?;
+        eprintln!("[rdma-init] peer={peer}: context opened, allocating PD...");
         let pd = ctx
             .alloc_pd()
             .map_err(|e| DistributedError::Transport(e.to_string()))?;
+        eprintln!("[rdma-init] peer={peer}: PD allocated, creating CQ...");
         let cq =
             CompletionQueue::new(&ctx).map_err(|e| DistributedError::Transport(e.to_string()))?;
+        eprintln!("[rdma-init] peer={peer}: CQ created, creating QP...");
         let mut qp = QueuePair::create_uc(&pd, &cq, &ctx)
             .map_err(|e| DistributedError::Transport(e.to_string()))?;
 
@@ -383,7 +401,9 @@ fn try_rdma_init(
         local_infos[peer as usize] = qp.local_info().clone();
 
         slots[peer as usize] = Some(QpSlot { ctx, pd, cq, qp });
+        eprintln!("[rdma-init] peer={peer}: QP created");
     }
+    eprintln!("[rdma-init] Phase 1a complete, starting coordinator exchange...");
 
     // Phase 1b: Pack local QP infos and all_gather via coordinator.
     // Wire format: world_size * 26 bytes (lid:2 + qpn:4 + psn:4 + gid:16).
@@ -397,6 +417,7 @@ fn try_rdma_init(
         local_buf[off + 10..off + 26].copy_from_slice(&info.gid);
     }
 
+    eprintln!("[rdma-init] Phase 1b: coordinator exchange...");
     let hub_host = if rank == 0 { "" } else { &coordinator_addr };
     let gathered_bytes = rmlx_rdma::coordinator::all_gather_bytes(
         rank, world_size, &local_buf, hub_host, &coord_cfg,
@@ -488,6 +509,15 @@ fn try_rdma_init(
         ));
     }
 
+    // Debug: dump QP info before/after connect
+    for peer in 0..world_size {
+        if peer == rank { continue; }
+        let local = &local_infos[peer as usize];
+        let remote = &remote_for_me[peer as usize];
+        eprintln!("[rdma-init] peer={peer}: local QP qpn={} psn={} gid={:02x?}", local.qpn, local.psn, &local.gid[..4]);
+        eprintln!("[rdma-init] peer={peer}: remote QP qpn={} psn={} gid={:02x?}", remote.qpn, remote.psn, &remote.gid[..4]);
+    }
+
     // connections[rank] is None (self-slot); all others are Some.
     let transport = RdmaConnectionTransport::new(connections, rank);
     let all_ranks: Vec<u32> = (0..world_size).collect();
@@ -511,9 +541,34 @@ fn try_rdma_init(
         let warmup_config = WarmupConfig::default();
         match state.run_warmup(
             &warmup_config,
-            // RDMA warmup: no-op for now (connection is already established;
-            // a real warmup would send small test messages to verify paths).
-            || Ok(()),
+            // RDMA warmup: run barrier rounds to verify all QP paths are hot.
+            // In UC mode, if one side sends before the other has posted recv,
+            // data is silently dropped.  Barrier uses ring sendrecv internally,
+            // ensuring every peer pair exchanges at least one message.
+            || {
+                const WARMUP_ROUNDS: usize = 3;
+                for round in 0..WARMUP_ROUNDS {
+                    eprintln!("[rdma-init] barrier round {round}...");
+                    group.barrier().map_err(|e| {
+                        format!("RDMA warmup barrier round {round} failed: {e}")
+                    })?;
+                    eprintln!("[rdma-init] barrier round {round} OK");
+                }
+                eprintln!("[rdma-init] warmup barriers done, testing larger sendrecv...");
+                // Test with progressively larger payloads
+                for size in [1, 2, 4, 8, 16] {
+                    let test_data = vec![0xABu8; size];
+                    match group.allgather(&test_data) {
+                        Ok(result) => eprintln!("[rdma-init] sendrecv {}B OK (got {}B)", size, result.len()),
+                        Err(e) => {
+                            eprintln!("[rdma-init] sendrecv {}B FAILED: {}", size, e);
+                            return Err(format!("warmup sendrecv {size}B failed: {e}"));
+                        }
+                    }
+                }
+                eprintln!("[rdma-init] all warmup sizes passed!");
+                Ok(())
+            },
             // JIT warmup: no-op (kernel registry is not available at init time;
             // JIT pre-compilation happens when the kernel registry is first used).
             || Ok(()),

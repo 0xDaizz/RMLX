@@ -1000,6 +1000,9 @@ impl RdmaTransport for RdmaConnectionTransport {
             rdma_to_distributed_enhanced(e, wr_id)
         })?;
 
+        // Copy received data from aligned MR buffer back to recv buffer
+        reg.copy_back();
+
         self.metrics.record_recv(len as u64);
         Ok(buf)
     }
@@ -1024,6 +1027,7 @@ impl RdmaTransport for RdmaConnectionTransport {
             let mut recv_buf = vec![0u8; recv_len];
             let recv_wr_id = self.next_wr_id(src_rank, ExchangeTag::Data, 0);
             global_counters().record_mr_reg();
+            eprintln!("[sendrecv] rank={} registering recv MR...", self.local_rank);
             let recv_reg = conn.register_recv_slice(&mut recv_buf).map_err(|e| {
                 self.metrics.record_recv_error();
                 rdma_to_distributed_enhanced(e, recv_wr_id)
@@ -1031,12 +1035,14 @@ impl RdmaTransport for RdmaConnectionTransport {
 
             // Post recv FIRST (UC mode: must be ready before remote send)
             global_counters().record_rdma_transfer(recv_len as u64);
+            eprintln!("[sendrecv] rank={} posting recv (wr_id={})...", self.local_rank, recv_wr_id);
             let recv_op = conn
                 .post_recv(recv_reg.mr(), 0, recv_len as u32, recv_wr_id)
                 .map_err(|e| {
                     self.metrics.record_recv_error();
                     rdma_to_distributed_enhanced(e, recv_wr_id)
                 })?;
+            eprintln!("[sendrecv] rank={} recv posted, registering send MR...", self.local_rank);
 
             // Prepare send MR
             let send_wr_id = self.next_wr_id(dst_rank, ExchangeTag::Data, 0);
@@ -1048,12 +1054,14 @@ impl RdmaTransport for RdmaConnectionTransport {
 
             // Post send
             global_counters().record_rdma_transfer(send_data.len() as u64);
+            eprintln!("[sendrecv] rank={} posting send (wr_id={})...", self.local_rank, send_wr_id);
             let send_op = conn
                 .post_send(send_reg.mr(), 0, send_data.len() as u32, send_wr_id)
                 .map_err(|e| {
                     self.metrics.record_send_error();
                     rdma_to_distributed_enhanced(e, send_wr_id)
                 })?;
+            eprintln!("[sendrecv] rank={} send posted, waiting completions...", self.local_rank);
 
             // Wait for both completions
             conn.wait_posted(&[recv_op, send_op]).map_err(|e| {
@@ -1061,6 +1069,10 @@ impl RdmaTransport for RdmaConnectionTransport {
                 self.metrics.record_recv_error();
                 rdma_to_distributed(e)
             })?;
+            eprintln!("[sendrecv] rank={} completions done!", self.local_rank);
+
+            // Copy received data from aligned MR buffer back to recv buffer
+            recv_reg.copy_back();
 
             // Drop registrations before moving recv_buf
             drop(recv_reg);
@@ -1125,6 +1137,9 @@ impl RdmaTransport for RdmaConnectionTransport {
                 self.metrics.record_send_error();
                 rdma_to_distributed_enhanced(e, send_wr_id)
             })?;
+
+            // Copy received data from aligned MR buffer back to recv buffer
+            recv_reg.copy_back();
 
             // Drop registrations before moving recv_buf
             drop(recv_reg);

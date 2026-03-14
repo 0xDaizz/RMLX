@@ -9,22 +9,16 @@ use crate::RdmaError;
 /// Default TB5 maximum MR size (16 MB hardware limit, used when probe is unavailable).
 pub const DEFAULT_MAX_MR_SIZE: usize = 16 * 1024 * 1024;
 
-/// Get the system page size. Apple Silicon uses 16KB pages.
-fn page_size() -> usize {
-    // SAFETY: sysconf is always safe to call with _SC_PAGESIZE.
-    let ps = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    if ps > 0 {
-        ps as usize
-    } else {
-        16384 // Apple Silicon default
-    }
-}
-
 /// RDMA memory region — wraps ibv_mr.
-/// Deregisters the MR on drop.
+/// Deregisters the MR on drop and frees the page-aligned buffer.
 pub struct MemoryRegion {
     mr: *mut IbvMr,
     lib: &'static IbverbsLib,
+    /// Page-aligned buffer allocated via posix_memalign.
+    /// Data is copied here for MR registration.
+    /// Freed on drop.
+    aligned_buf: *mut c_void,
+    aligned_size: usize,
 }
 
 impl MemoryRegion {
@@ -59,27 +53,50 @@ impl MemoryRegion {
             )));
         }
 
-        // Apple Silicon uses 16KB pages. TB5 RDMA requires page-aligned MR
-        // registration. Round the pointer down and size up to page boundaries.
+        // JACCL compatible: allocate page-aligned buffer and copy data.
+        // macOS librdma requires page-aligned pointers for ibv_reg_mr.
         let page_size = page_size();
-        let ptr_addr = ptr as usize;
-        let aligned_addr = ptr_addr & !(page_size - 1);
-        let aligned_ptr = aligned_addr as *mut c_void;
-        let aligned_size = (ptr_addr - aligned_addr + size + page_size - 1) & !(page_size - 1);
+        let aligned_size = (size + page_size - 1) & !(page_size - 1);
+        let aligned_size = aligned_size.max(page_size); // at least one page
 
-        let reg_size = aligned_size.min(max_mr_size);
-        let flags =
-            access_flags::LOCAL_WRITE | access_flags::REMOTE_WRITE | access_flags::REMOTE_READ;
-        // SAFETY: pd.raw() is valid, aligned_ptr..aligned_ptr+reg_size covers
-        // the original ptr..ptr+size range (caller guarantees ptr validity).
-        let mr = unsafe { (pd.lib().reg_mr)(pd.raw(), aligned_ptr, reg_size, flags) };
-        if mr.is_null() {
+        let mut aligned_buf: *mut c_void = std::ptr::null_mut();
+        // SAFETY: posix_memalign is called with valid alignment (power of 2)
+        // and returns a valid heap pointer on success.
+        let ret = unsafe { libc::posix_memalign(&mut aligned_buf, page_size, aligned_size) };
+        if ret != 0 || aligned_buf.is_null() {
             return Err(RdmaError::MrReg(format!(
-                "ibv_reg_mr failed for ptr={ptr:?}, size={size} \
-                 (aligned to {aligned_ptr:?}, size={reg_size})"
+                "posix_memalign failed: ret={ret}, size={aligned_size}"
             )));
         }
-        Ok(Self { mr, lib: pd.lib() })
+
+        // SAFETY: aligned_buf is valid for aligned_size bytes from posix_memalign.
+        // ptr is valid for size bytes (caller guarantee).
+        unsafe {
+            // Copy data to aligned buffer
+            std::ptr::copy_nonoverlapping(ptr as *const u8, aligned_buf as *mut u8, size);
+            // Zero remaining bytes
+            if aligned_size > size {
+                std::ptr::write_bytes((aligned_buf as *mut u8).add(size), 0, aligned_size - size);
+            }
+        }
+
+        let flags =
+            access_flags::LOCAL_WRITE | access_flags::REMOTE_WRITE | access_flags::REMOTE_READ;
+        // SAFETY: pd.raw() is valid, aligned_buf is valid for aligned_size bytes.
+        let mr = unsafe { (pd.lib().reg_mr)(pd.raw(), aligned_buf, aligned_size, flags) };
+        if mr.is_null() {
+            // SAFETY: aligned_buf was allocated by posix_memalign.
+            unsafe { libc::free(aligned_buf) };
+            return Err(RdmaError::MrReg(format!(
+                "ibv_reg_mr failed for aligned_buf={aligned_buf:?}, size={aligned_size}"
+            )));
+        }
+        Ok(Self {
+            mr,
+            lib: pd.lib(),
+            aligned_buf,
+            aligned_size,
+        })
     }
 
     /// Local key for this memory region.
@@ -94,27 +111,32 @@ impl MemoryRegion {
         unsafe { (*self.mr).rkey }
     }
 
-    /// Registered address.
+    /// Registered address (page-aligned buffer used for ibv_reg_mr).
     pub fn addr(&self) -> *mut c_void {
-        // SAFETY: mr is a valid ibv_mr pointer.
-        unsafe { (*self.mr).addr }
+        self.aligned_buf
     }
 
-    /// Registered length.
+    /// Registered length (page-aligned size).
     pub fn length(&self) -> usize {
-        // SAFETY: mr is a valid ibv_mr pointer.
-        unsafe { (*self.mr).length }
+        self.aligned_size
     }
 }
 
 impl Drop for MemoryRegion {
     fn drop(&mut self) {
         // SAFETY: mr was obtained from ibv_reg_mr and is valid.
+        // aligned_buf was obtained from posix_memalign and must be freed.
         unsafe {
             (self.lib.dereg_mr)(self.mr);
+            libc::free(self.aligned_buf);
         }
     }
 }
 
 // SAFETY: MR handle is safe to share across threads.
 unsafe impl Send for MemoryRegion {}
+
+fn page_size() -> usize {
+    let ps = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if ps > 0 { ps as usize } else { 16384 }
+}

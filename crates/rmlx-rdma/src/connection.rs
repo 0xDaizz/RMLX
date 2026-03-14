@@ -119,10 +119,11 @@ impl CompletionTracker {
         // Check backlog first
         if let Some(pos) = self.backlog.iter().position(|wc| wc.wr_id == wr_id) {
             let wc = self.backlog.swap_remove(pos);
-            if wc.status != wc_status::SUCCESS {
+            let is_recv = wc.opcode >= 128;
+            if !is_recv && wc.status != wc_status::SUCCESS {
                 return Err(RdmaError::CqPoll(format!(
-                    "wc status={} for wr_id={wr_id}",
-                    wc.status
+                    "wc status={} ({}) for wr_id={wr_id}",
+                    wc.status, wc_status_str(wc.status)
                 )));
             }
             self.completed.push(wr_id);
@@ -137,10 +138,11 @@ impl CompletionTracker {
             let count = cq.poll(&mut wc_buf)?;
             for wc in &wc_buf[..count] {
                 if wc.wr_id == wr_id {
-                    if wc.status != wc_status::SUCCESS {
+                    let is_recv = wc.opcode >= 128;
+                    if !is_recv && wc.status != wc_status::SUCCESS {
                         return Err(RdmaError::CqPoll(format!(
-                            "wc status={} for wr_id={wr_id}",
-                            wc.status
+                            "wc status={} ({}) for wr_id={wr_id}",
+                            wc.status, wc_status_str(wc.status)
                         )));
                     }
                     self.completed.push(wr_id);
@@ -223,6 +225,8 @@ impl<'a> RegisteredSend<'a> {
 /// it was registered from.
 pub struct RegisteredRecv<'a> {
     mr: MemoryRegion,
+    original_ptr: *mut u8,
+    original_size: usize,
     _lt: PhantomData<&'a mut [u8]>,
 }
 
@@ -230,6 +234,18 @@ impl<'a> RegisteredRecv<'a> {
     /// Access the underlying `MemoryRegion`.
     pub fn mr(&self) -> &MemoryRegion {
         &self.mr
+    }
+
+    /// Copy received data from the aligned MR buffer back to the original recv buffer.
+    /// Must be called after recv completion to retrieve data written by the remote peer.
+    pub fn copy_back(&self) {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.mr.addr() as *const u8,
+                self.original_ptr,
+                self.original_size,
+            );
+        }
     }
 }
 
@@ -379,10 +395,14 @@ impl RdmaConnection {
         &self,
         data: &'a mut [u8],
     ) -> Result<RegisteredRecv<'a>, RdmaError> {
+        let original_ptr = data.as_mut_ptr();
+        let original_size = data.len();
         // SAFETY: data is a valid &mut [u8]; lifetime 'a outlives RegisteredRecv<'a>.
         let mr = unsafe { self.register_mr(data.as_mut_ptr() as *mut c_void, data.len())? };
         Ok(RegisteredRecv {
             mr,
+            original_ptr,
+            original_size,
             _lt: PhantomData,
         })
     }
@@ -413,10 +433,15 @@ impl RdmaConnection {
             lkey: mr.lkey(),
         };
 
+        eprintln!("[post_send] sge: addr=0x{:x} length={} lkey=0x{:x} | mr: addr=0x{:x} length={} lkey=0x{:x}",
+            sge.addr, sge.length, sge.lkey,
+            mr.addr() as u64, mr.length(), mr.lkey());
+
         // SAFETY: sge is valid and points into the registered MR.
         // wr is zero-initialized and all required fields are set.
         let mut wr: IbvSendWr = unsafe { std::mem::zeroed() };
         wr.wr_id = wr_id;
+        wr.next = std::ptr::null_mut();
         wr.sg_list = &mut sge;
         wr.num_sge = 1;
         wr.opcode = wr_opcode::SEND;
@@ -455,6 +480,10 @@ impl RdmaConnection {
             length,
             lkey: mr.lkey(),
         };
+
+        eprintln!("[post_recv] sge: addr=0x{:x} length={} lkey=0x{:x} | mr: addr=0x{:x} length={} lkey=0x{:x}",
+            sge.addr, sge.length, sge.lkey,
+            mr.addr() as u64, mr.length(), mr.lkey());
 
         let mut wr = IbvRecvWr {
             wr_id,
@@ -515,10 +544,14 @@ impl RdmaConnection {
             remaining.retain(|&wr_id| {
                 if let Some(pos) = backlog.iter().position(|wc| wc.wr_id == wr_id) {
                     let wc = backlog.swap_remove(pos);
-                    if wc.status != wc_status::SUCCESS {
+                    // UC recv completions (opcode >= 128) always report status=4
+                    // (LOC_PROT_ERR) on macOS TB5, but data arrives correctly.
+                    // Match JACCL behavior: ignore status for recv completions.
+                    let is_recv = wc.opcode >= 128;
+                    if !is_recv && wc.status != wc_status::SUCCESS {
                         backlog_error = Some(RdmaError::CqPoll(format!(
-                            "backlog: wr_id {} failed with status {}",
-                            wr_id, wc.status
+                            "backlog: wr_id {} failed with status {} ({})",
+                            wr_id, wc.status, wc_status_str(wc.status)
                         )));
                     }
                     false // found, remove from remaining
@@ -531,14 +564,34 @@ impl RdmaConnection {
             }
         }
 
+        let mut empty_polls: u64 = 0;
         while !remaining.is_empty() {
             let count = self.cq.poll(&mut wc_buf)?;
+            if count == 0 {
+                empty_polls += 1;
+                if empty_polls % 100_000 == 0 {
+                    eprintln!(
+                        "[cq] poll_cq: no completions after {} polls (waiting for wr_ids {:?})",
+                        empty_polls, remaining
+                    );
+                }
+            } else {
+                empty_polls = 0;
+            }
             for wc in &wc_buf[..count] {
+                eprintln!(
+                    "[cq] wc: wr_id={} status={} opcode={}",
+                    wc.wr_id, wc.status, wc.opcode
+                );
                 if let Some(pos) = remaining.iter().position(|&id| id == wc.wr_id) {
-                    if wc.status != wc_status::SUCCESS {
+                    // UC recv completions (opcode >= 128) always report status=4
+                    // (LOC_PROT_ERR) on macOS TB5, but data arrives correctly.
+                    // Match JACCL behavior: ignore status for recv completions.
+                    let is_recv = wc.opcode >= 128;
+                    if !is_recv && wc.status != wc_status::SUCCESS {
                         return Err(RdmaError::CqPoll(format!(
-                            "wc status={} for wr_id={}",
-                            wc.status, wc.wr_id,
+                            "wc status={} ({}) for wr_id={}",
+                            wc.status, wc_status_str(wc.status), wc.wr_id,
                         )));
                     }
                     remaining.swap_remove(pos);

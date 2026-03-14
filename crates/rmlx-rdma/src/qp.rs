@@ -11,12 +11,13 @@ use crate::context::{ProtectionDomain, RdmaContext};
 use crate::ffi::*;
 use crate::RdmaError;
 
-/// TB5-specific default constants (used as fallback when probe is unavailable)
+/// TB5-specific default constants (used as fallback when probe is unavailable).
+/// CQ/WR depths are aligned with JACCL defaults for interoperability.
 pub const IB_PORT: u8 = 1;
 pub const DEFAULT_GID_INDEX: c_int = 1;
-pub const DEFAULT_CQ_DEPTH: c_int = 8192;
-pub const DEFAULT_MAX_SEND_WR: u32 = 8192;
-pub const DEFAULT_MAX_RECV_WR: u32 = 8192;
+pub const DEFAULT_CQ_DEPTH: c_int = 64; // send(32) + recv(32), matches JACCL
+pub const DEFAULT_MAX_SEND_WR: u32 = 32; // JACCL compatible
+pub const DEFAULT_MAX_RECV_WR: u32 = 32; // JACCL compatible
 pub const MAX_SEND_SGE: u32 = 1;
 pub const MAX_RECV_SGE: u32 = 1;
 
@@ -168,7 +169,8 @@ impl QueuePair {
         init_attr.send_cq = cq.raw();
         init_attr.recv_cq = cq.raw();
         init_attr.qp_type = qp_type::UC;
-        init_attr.sq_sig_all = 1;
+        // JACCL 호환 — 각 WR에서 개별적으로 SIGNALED 설정
+        init_attr.sq_sig_all = 0;
         init_attr.cap.max_send_wr = max_send_wr;
         init_attr.cap.max_recv_wr = max_recv_wr;
         init_attr.cap.max_send_sge = MAX_SEND_SGE;
@@ -194,14 +196,9 @@ impl QueuePair {
                 );
                 DEFAULT_GID_INDEX
             });
-        let mtu = ctx.probe().map(|p| p.mtu).unwrap_or_else(|| {
-            tracing::warn!(
-                target: "rmlx_rdma",
-                default = mtu::MTU_1024,
-                "probe unavailable, using MTU_1024",
-            );
-            mtu::MTU_1024
-        });
+        // Always use MTU_1024 for TB5 compatibility (matches JACCL).
+        // macOS reports active_mtu=4096 but TB5 UC mode is unreliable at larger MTUs.
+        let mtu = mtu::MTU_1024;
 
         Ok(Self {
             qp,
@@ -256,6 +253,7 @@ impl QueuePair {
         self.local_info.psn = rank * 1000 + 42;
         // SAFETY: IbvGid union's raw field is always valid to read.
         self.local_info.gid = unsafe { gid.raw };
+        eprintln!("[qp] query_local_info: gid_index={gid_index}, lid={}, psn={}, qpn={}, gid={:02x?}", self.local_info.lid, self.local_info.psn, self.local_info.qpn, &self.local_info.gid);
 
         Ok(())
     }
@@ -269,8 +267,17 @@ impl QueuePair {
     /// RESET → INIT → RTR → RTS.
     pub fn connect(&self, remote: &QpInfo) -> Result<(), RdmaError> {
         self.modify_to_init()?;
+        eprintln!("[qp] connect: RESET→INIT OK");
         self.modify_to_rtr(remote)?;
+        eprintln!(
+            "[qp] connect: INIT→RTR OK (remote qpn={}, psn={}, gid={:02x?})",
+            remote.qpn, remote.psn, &remote.gid[..4]
+        );
         self.modify_to_rts()?;
+        eprintln!(
+            "[qp] connect: RTR→RTS OK (local psn={})",
+            self.local_info.psn
+        );
         Ok(())
     }
 
@@ -307,22 +314,28 @@ impl QueuePair {
         attr.dest_qp_num = remote.qpn;
         attr.rq_psn = remote.psn;
 
-        // Address Handle with GRH (required for RoCE over TB5)
-        attr.ah_attr.is_global = 1;
+        // Address Handle
         attr.ah_attr.dlid = remote.lid;
         attr.ah_attr.sl = 0;
         attr.ah_attr.src_path_bits = 0;
         attr.ah_attr.port_num = IB_PORT;
 
-        // SAFETY: Constructing IbvGid union from raw bytes is safe.
-        attr.ah_attr.grh.dgid = unsafe {
-            let mut gid: IbvGid = std::mem::zeroed();
-            gid.raw = remote.gid;
-            gid
-        };
-        attr.ah_attr.grh.sgid_index = self.gid_index as u8;
-        attr.ah_attr.grh.hop_limit = 1;
-        attr.ah_attr.grh.traffic_class = 0;
+        // JACCL 호환: only set is_global when remote GID has non-zero interface_id
+        // JACCL: if (dst.global_identifier.global.interface_id) { is_global=1; ... }
+        let has_interface_id = remote.gid[8..16].iter().any(|&b| b != 0);
+        if has_interface_id {
+            attr.ah_attr.is_global = 1;
+            // SAFETY: Constructing IbvGid union from raw bytes is safe.
+            attr.ah_attr.grh.dgid = unsafe {
+                let mut gid: IbvGid = std::mem::zeroed();
+                gid.raw = remote.gid;
+                gid
+            };
+            attr.ah_attr.grh.sgid_index = self.gid_index as u8;
+            // JACCL 호환: hop_limit = 1
+            attr.ah_attr.grh.hop_limit = 1;
+            attr.ah_attr.grh.traffic_class = 0;
+        }
 
         let mask = qp_attr_mask::STATE
             | qp_attr_mask::AV
@@ -331,7 +344,12 @@ impl QueuePair {
             | qp_attr_mask::RQ_PSN;
 
         // SAFETY: self.qp is valid, attr is fully initialized for RTR transition.
+        eprintln!("[qp] modify_to_rtr: sizeof(IbvQpAttr)={}, calling modify_qp (qp={:?}, mask=0x{:x})...",
+            std::mem::size_of::<IbvQpAttr>(), self.qp, mask);
+        eprintln!("[qp] modify_to_rtr: dest_qpn={}, rq_psn={}, path_mtu={}, is_global={}, gid_index={}",
+            attr.dest_qp_num, attr.rq_psn, attr.path_mtu, attr.ah_attr.is_global, attr.ah_attr.grh.sgid_index);
         let ret = unsafe { (self.lib.modify_qp)(self.qp, &mut attr, mask) };
+        eprintln!("[qp] modify_to_rtr: modify_qp returned {ret}");
         if ret != 0 {
             return Err(RdmaError::QpModify(format!("INIT→RTR failed: {ret}")));
         }

@@ -296,7 +296,8 @@ impl Group {
             return Ok(data.to_vec());
         }
         let transport = self.require_transport("allreduce")?;
-        ring_allreduce(data, &self.ranks, self.local_rank, transport)
+        let (result, _algo) = allreduce_auto(data, &self.ranks, self.local_rank, transport)?;
+        Ok(result)
     }
 
     /// All-reduce with configurable reduction operation and dtype.
@@ -317,7 +318,15 @@ impl Group {
             return Ok(data.to_vec());
         }
         let transport = self.require_transport("allreduce_op")?;
-        ring_allreduce_op(data, &self.ranks, self.local_rank, transport, op, dtype)
+        let bf16_threshold = match dtype {
+            ReduceDtype::Bf16 => MESH_RING_THRESHOLD_BF16,
+            _ => MESH_RING_THRESHOLD,
+        };
+        if self.ranks.len() > 2 && data.len() >= bf16_threshold {
+            ring_allreduce_op(data, &self.ranks, self.local_rank, transport, op, dtype)
+        } else {
+            mesh_allreduce_op(data, &self.ranks, self.local_rank, transport, op, dtype)
+        }
     }
 
     /// All-gather: gather data from all ranks into every rank.
@@ -333,7 +342,11 @@ impl Group {
             return Ok(data.to_vec());
         }
         let transport = self.require_transport("allgather")?;
-        ring_allgather(data, &self.ranks, self.local_rank, transport)
+        if self.ranks.len() <= 2 || data.len() < MESH_RING_THRESHOLD {
+            mesh_allgather(data, &self.ranks, self.local_rank, transport)
+        } else {
+            ring_allgather(data, &self.ranks, self.local_rank, transport)
+        }
     }
 
     /// Broadcast: root rank sends data to all other ranks.
@@ -557,7 +570,11 @@ impl Group {
             )));
         }
         let transport = self.require_transport("reduce_scatter")?;
-        ring_reduce_scatter(data, &self.ranks, self.local_rank, transport)
+        if self.ranks.len() <= 2 || data.len() < MESH_RING_THRESHOLD {
+            mesh_reduce_scatter(data, &self.ranks, self.local_rank, transport)
+        } else {
+            ring_reduce_scatter(data, &self.ranks, self.local_rank, transport)
+        }
     }
 
     /// Barrier: block until all ranks in the group have reached this point.
@@ -938,6 +955,198 @@ fn ring_reduce_scatter(
     Ok(buf[chunk_start..chunk_start + chunk_size].to_vec())
 }
 
+/// Mesh allreduce: each rank exchanges full data with every other rank,
+/// then reduces locally. O(1) communication steps but O(N * data_size) volume.
+/// Best for small messages where latency dominates.
+fn mesh_allreduce(
+    data: &[u8],
+    ranks: &[u32],
+    local_rank: u32,
+    transport: &Arc<dyn RdmaTransport>,
+) -> Result<Vec<u8>, DistributedError> {
+    let my_idx = ranks.iter().position(|&r| r == local_rank).ok_or_else(|| {
+        DistributedError::Transport(format!(
+            "local_rank {} not found in ranks {:?}",
+            local_rank, ranks
+        ))
+    })?;
+
+    // Ensure f32 alignment
+    let aligned_len = (data.len() + 3) & !3;
+    let mut buf = data.to_vec();
+    buf.resize(aligned_len, 0);
+
+    // Exchange with every peer and reduce in-place
+    for (peer_idx, &peer_rank) in ranks.iter().enumerate() {
+        if peer_idx == my_idx {
+            continue;
+        }
+        let received = transport.sendrecv(&buf, peer_rank, aligned_len, peer_rank)?;
+        add_f32_inplace(&mut buf, &received);
+    }
+
+    buf.truncate(data.len());
+    Ok(buf)
+}
+
+/// Mesh allreduce with configurable ReduceOp (f32 only).
+fn mesh_allreduce_op_f32(
+    data: &[u8],
+    ranks: &[u32],
+    local_rank: u32,
+    transport: &Arc<dyn RdmaTransport>,
+    op: ReduceOp,
+) -> Result<Vec<u8>, DistributedError> {
+    let my_idx = ranks.iter().position(|&r| r == local_rank).ok_or_else(|| {
+        DistributedError::Transport(format!(
+            "local_rank {} not found in ranks {:?}",
+            local_rank, ranks
+        ))
+    })?;
+
+    let aligned_len = (data.len() + 3) & !3;
+    let mut buf = data.to_vec();
+    buf.resize(aligned_len, 0);
+
+    for (peer_idx, &peer_rank) in ranks.iter().enumerate() {
+        if peer_idx == my_idx {
+            continue;
+        }
+        let received = transport.sendrecv(&buf, peer_rank, aligned_len, peer_rank)?;
+        reduce_f32_inplace(&mut buf, &received, op);
+    }
+
+    buf.truncate(data.len());
+    Ok(buf)
+}
+
+/// Mesh allreduce with configurable ReduceOp and dtype support.
+fn mesh_allreduce_op(
+    data: &[u8],
+    ranks: &[u32],
+    local_rank: u32,
+    transport: &Arc<dyn RdmaTransport>,
+    op: ReduceOp,
+    dtype: ReduceDtype,
+) -> Result<Vec<u8>, DistributedError> {
+    match dtype {
+        ReduceDtype::F32 => mesh_allreduce_op_f32(data, ranks, local_rank, transport, op),
+        ReduceDtype::F16 => {
+            if data.len() % 2 != 0 {
+                return Err(DistributedError::Protocol(format!(
+                    "mesh_allreduce_op(f16): data length ({}) must be a multiple of 2",
+                    data.len()
+                )));
+            }
+            let n_elems = data.len() / 2;
+            let mut f32_data = vec![0u8; n_elems * 4];
+            for i in 0..n_elems {
+                let bits = u16::from_ne_bytes([data[i * 2], data[i * 2 + 1]]);
+                let val = f16_to_f32(bits);
+                f32_data[i * 4..i * 4 + 4].copy_from_slice(&val.to_ne_bytes());
+            }
+            let result = mesh_allreduce_op_f32(&f32_data, ranks, local_rank, transport, op)?;
+            let mut out = vec![0u8; n_elems * 2];
+            for i in 0..n_elems {
+                let val = f32::from_ne_bytes([
+                    result[i * 4],
+                    result[i * 4 + 1],
+                    result[i * 4 + 2],
+                    result[i * 4 + 3],
+                ]);
+                let bits = f32_to_f16(val);
+                out[i * 2..i * 2 + 2].copy_from_slice(&bits.to_ne_bytes());
+            }
+            Ok(out)
+        }
+        ReduceDtype::Bf16 => {
+            if data.len() % 2 != 0 {
+                return Err(DistributedError::Protocol(format!(
+                    "mesh_allreduce_op(bf16): data length ({}) must be a multiple of 2",
+                    data.len()
+                )));
+            }
+            let n_elems = data.len() / 2;
+            let mut f32_data = vec![0u8; n_elems * 4];
+            for i in 0..n_elems {
+                let bits = u16::from_ne_bytes([data[i * 2], data[i * 2 + 1]]);
+                let val = bf16_to_f32(bits);
+                f32_data[i * 4..i * 4 + 4].copy_from_slice(&val.to_ne_bytes());
+            }
+            let result = mesh_allreduce_op_f32(&f32_data, ranks, local_rank, transport, op)?;
+            let mut out = vec![0u8; n_elems * 2];
+            for i in 0..n_elems {
+                let val = f32::from_ne_bytes([
+                    result[i * 4],
+                    result[i * 4 + 1],
+                    result[i * 4 + 2],
+                    result[i * 4 + 3],
+                ]);
+                let bits = f32_to_bf16(val);
+                out[i * 2..i * 2 + 2].copy_from_slice(&bits.to_ne_bytes());
+            }
+            Ok(out)
+        }
+    }
+}
+
+/// Mesh allgather: each rank broadcasts its data to all peers.
+/// Result is concatenation of all ranks' data in rank order.
+fn mesh_allgather(
+    data: &[u8],
+    ranks: &[u32],
+    local_rank: u32,
+    transport: &Arc<dyn RdmaTransport>,
+) -> Result<Vec<u8>, DistributedError> {
+    let n = ranks.len();
+    let my_idx = ranks.iter().position(|&r| r == local_rank).ok_or_else(|| {
+        DistributedError::Transport(format!(
+            "local_rank {} not found in ranks {:?}",
+            local_rank, ranks
+        ))
+    })?;
+
+    let chunk_size = data.len();
+    let mut result = vec![0u8; chunk_size * n];
+
+    // Place own data
+    result[my_idx * chunk_size..(my_idx + 1) * chunk_size].copy_from_slice(data);
+
+    // Exchange with every peer
+    for (peer_idx, &peer_rank) in ranks.iter().enumerate() {
+        if peer_idx == my_idx {
+            continue;
+        }
+        let received = transport.sendrecv(data, peer_rank, chunk_size, peer_rank)?;
+        result[peer_idx * chunk_size..(peer_idx + 1) * chunk_size]
+            .copy_from_slice(&received[..chunk_size]);
+    }
+
+    Ok(result)
+}
+
+/// Mesh reduce-scatter: mesh allreduce then extract own chunk.
+fn mesh_reduce_scatter(
+    data: &[u8],
+    ranks: &[u32],
+    local_rank: u32,
+    transport: &Arc<dyn RdmaTransport>,
+) -> Result<Vec<u8>, DistributedError> {
+    let n = ranks.len();
+    let my_idx = ranks.iter().position(|&r| r == local_rank).ok_or_else(|| {
+        DistributedError::Transport(format!(
+            "local_rank {} not found in ranks {:?}",
+            local_rank, ranks
+        ))
+    })?;
+
+    let reduced = mesh_allreduce(data, ranks, local_rank, transport)?;
+    let chunk_size = reduced.len().div_ceil(n);
+    let start = my_idx * chunk_size;
+    let end = (start + chunk_size).min(reduced.len());
+    Ok(reduced[start..end].to_vec())
+}
+
 /// Ring allreduce with configurable reduction operation and dtype.
 fn ring_allreduce_op(
     data: &[u8],
@@ -1169,6 +1378,13 @@ fn bf16_to_f32(bits: u16) -> f32 {
 /// For data at or above this, ring allreduce (higher bandwidth) is preferred.
 pub const TREE_ALLREDUCE_THRESHOLD: usize = 1024 * 1024; // 1 MB
 
+/// JACCL-compatible threshold: mesh → ring fallback for large messages.
+/// Groups with size > 2 and data >= this threshold use ring instead of mesh.
+pub const MESH_RING_THRESHOLD: usize = 8 * 1024 * 1024; // 8 MB
+
+/// Lower threshold for bf16 (JACCL: 65536 elements = 128KB).
+pub const MESH_RING_THRESHOLD_BF16: usize = 65536 * 2; // 128 KB
+
 /// Tree allreduce on f32 data (byte slices).
 ///
 /// For small tensors (<1MB default), tree allreduce has lower latency than ring
@@ -1302,6 +1518,11 @@ pub fn allreduce_auto(
 }
 
 /// Auto-selecting allreduce with a configurable threshold.
+///
+/// Three-tier dispatch:
+/// 1. Large data + large group (>2 ranks, >= MESH_RING_THRESHOLD): ring (bandwidth optimal)
+/// 2. Small data (< threshold): tree (log N steps, low latency)
+/// 3. Otherwise (medium data or small group): mesh (O(1) steps)
 pub fn allreduce_auto_with_threshold(
     data: &[u8],
     ranks: &[u32],
@@ -1309,12 +1530,21 @@ pub fn allreduce_auto_with_threshold(
     transport: &Arc<dyn RdmaTransport>,
     threshold: usize,
 ) -> Result<(Vec<u8>, AllreduceAlgorithm), DistributedError> {
-    if data.len() < threshold {
+    let n = ranks.len();
+    let data_len = data.len();
+
+    if n > 2 && data_len >= MESH_RING_THRESHOLD {
+        // Large data, large group: ring (bandwidth optimal)
+        let result = ring_allreduce(data, ranks, local_rank, transport)?;
+        Ok((result, AllreduceAlgorithm::Ring))
+    } else if data_len < threshold {
+        // Small data: tree (log N steps)
         let result = tree_allreduce(data, ranks, local_rank, transport)?;
         Ok((result, AllreduceAlgorithm::Tree))
     } else {
-        let result = ring_allreduce(data, ranks, local_rank, transport)?;
-        Ok((result, AllreduceAlgorithm::Ring))
+        // Medium data or small group: mesh
+        let result = mesh_allreduce(data, ranks, local_rank, transport)?;
+        Ok((result, AllreduceAlgorithm::Mesh))
     }
 }
 
@@ -1325,6 +1555,8 @@ pub enum AllreduceAlgorithm {
     Tree,
     /// Ring allreduce (higher bandwidth, better for large data).
     Ring,
+    /// Mesh allreduce (O(1) steps, best for small messages where latency dominates).
+    Mesh,
 }
 
 // ─── Topology-aware ring ordering ───
