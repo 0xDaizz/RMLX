@@ -21,6 +21,7 @@ pub mod rdma_metrics;
 pub mod shared_buffer;
 
 // ── Re-exports of core types ──
+#[allow(deprecated)]
 pub use collectives::{
     apply_reduce_op, apply_reduce_op_typed, chunk_boundaries, pipelined_ring_allreduce,
     ring_allgather, ring_allreduce, ring_allreduce_typed, ring_reduce_scatter,
@@ -32,6 +33,7 @@ pub use connection::{
     CompletionTracker, PostedOp, PostedOpKind, RdmaConfig, RdmaConnection, RegisteredRecv,
     RegisteredSend,
 };
+#[allow(deprecated)]
 pub use connection_manager::ConnectionManager;
 pub use context::{ProtectionDomain, RdmaContext, RdmaDeviceProbe};
 pub use coordinator::{all_gather_bytes, all_gather_qp_info, barrier, CoordinatorConfig};

@@ -14,6 +14,7 @@ use crate::RdmaError;
 ///
 /// Provides topology-aware peer selection and connection lifecycle
 /// management for N-peer clusters.
+#[deprecated(note = "use rmlx_distributed::group instead")]
 pub struct ConnectionManager {
     /// This node's rank.
     rank: u32,
@@ -25,6 +26,7 @@ pub struct ConnectionManager {
     connections: FxHashMap<u32, RdmaConnection>,
 }
 
+#[allow(deprecated)]
 impl ConnectionManager {
     /// Create a new ConnectionManager for the given rank and topology.
     pub fn new(rank: u32, world_size: u32, topology: Topology) -> Self {
@@ -179,6 +181,7 @@ impl ConnectionManager {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 
