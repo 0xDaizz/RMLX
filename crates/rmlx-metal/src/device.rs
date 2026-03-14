@@ -531,7 +531,10 @@ mod tests {
 
     #[test]
     fn test_gpu_device_has_tuning() {
-        let gpu = GpuDevice::system_default().unwrap();
+        let Ok(gpu) = GpuDevice::system_default() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let t = gpu.tuning();
         assert!(t.max_threadgroup_memory >= 16 * 1024);
         assert_eq!(t.preferred_simd_width, 32);
@@ -539,7 +542,10 @@ mod tests {
 
     #[test]
     fn test_gpu_device_stream_manager() {
-        let gpu = GpuDevice::system_default().unwrap();
+        let Ok(gpu) = GpuDevice::system_default() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let mgr = gpu.stream_manager();
         assert!(mgr.has_stream(crate::stream::STREAM_COMPUTE));
         assert!(mgr.has_stream(crate::stream::STREAM_COPY));
@@ -548,7 +554,10 @@ mod tests {
 
     #[test]
     fn test_create_command_buffer_succeeds() {
-        let gpu = GpuDevice::system_default().unwrap();
+        let Ok(gpu) = GpuDevice::system_default() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let queue = gpu.new_command_queue();
         let cb = gpu.create_command_buffer(&queue);
         // Encode a no-op and commit to prove the CB is valid.
