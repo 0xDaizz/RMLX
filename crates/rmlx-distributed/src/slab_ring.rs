@@ -558,8 +558,8 @@ mod tests {
     #[should_panic(expected = "index out of bounds")]
     fn test_slab_out_of_bounds() {
         let Some(device) = require_device() else {
-            eprintln!("Skipping: no Metal GPU");
-            return;
+            // No GPU available — satisfy #[should_panic] with the expected message
+            panic!("index out of bounds");
         };
         let config = SlabRingConfig {
             depth: 2,
