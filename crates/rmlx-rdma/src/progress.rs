@@ -213,10 +213,6 @@ impl Default for ProgressConfig {
 /// Thread-safe: the pending map is protected by a Mutex, but the lock is
 /// only held briefly to insert/remove entries — never during CQ polling
 /// or busy-waiting.
-///
-/// If a mutex becomes poisoned (due to a panic in a thread holding the
-/// lock), the engine recovers by accepting the poisoned guard. The
-/// `healthy` flag is set to `false` to indicate degraded state.
 pub struct ProgressEngine {
     /// Map from wr_id to the shared completion slot.
     pending: Arc<Mutex<FxHashMap<u64, Arc<OpSlot>>>>,
@@ -224,18 +220,6 @@ pub struct ProgressEngine {
     shutdown: Arc<AtomicBool>,
     /// Background thread join handle.
     bg_handle: Option<std::thread::JoinHandle<()>>,
-    /// `false` after any mutex-poison event has been observed.
-    healthy: Arc<AtomicBool>,
-}
-
-/// Lock a mutex. With parking_lot, mutexes cannot be poisoned, so this
-/// always succeeds. The `healthy` flag is retained for API compatibility
-/// but will never be set to `false` by lock operations.
-fn lock_or_recover<'a, T>(
-    mutex: &'a Mutex<T>,
-    _healthy: &AtomicBool,
-) -> parking_lot::MutexGuard<'a, T> {
-    mutex.lock()
 }
 
 impl ProgressEngine {
@@ -245,19 +229,13 @@ impl ProgressEngine {
             pending: Arc::new(Mutex::new(FxHashMap::default())),
             shutdown: Arc::new(AtomicBool::new(false)),
             bg_handle: None,
-            healthy: Arc::new(AtomicBool::new(true)),
         }
-    }
-
-    /// Returns `true` if no mutex-poison event has been observed.
-    pub fn is_healthy(&self) -> bool {
-        self.healthy.load(Ordering::Acquire)
     }
 
     /// Cancel a pending operation, removing it from the tracking map.
     /// Use this when an operation was registered but the WR was never actually posted.
     pub fn cancel_op(&self, wr_id: u64) {
-        lock_or_recover(&self.pending, &self.healthy).remove(&wr_id);
+        self.pending.lock().remove(&wr_id);
     }
 
     /// Register a wr_id for completion tracking.
@@ -270,7 +248,7 @@ impl ProgressEngine {
             result: OnceLock::new(),
             notify: (Mutex::new(()), Condvar::new()),
         });
-        lock_or_recover(&self.pending, &self.healthy).insert(wr_id, Arc::clone(&slot));
+        self.pending.lock().insert(wr_id, Arc::clone(&slot));
         PendingOp { slot, wr_id }
     }
 
@@ -300,7 +278,7 @@ impl ProgressEngine {
         }
 
         // Resolve completions — lock held only for HashMap lookups
-        let mut pending = lock_or_recover(&self.pending, &self.healthy);
+        let mut pending = self.pending.lock();
         for wc in &wc_buf[..count] {
             if let Some(slot) = pending.remove(&wc.wr_id) {
                 Self::resolve_slot(&slot, wc);
@@ -338,7 +316,6 @@ impl ProgressEngine {
 
         let pending = Arc::clone(&self.pending);
         let shutdown = Arc::clone(&self.shutdown);
-        let healthy = Arc::clone(&self.healthy);
         self.shutdown.store(false, Ordering::Release);
 
         let handle = std::thread::Builder::new()
@@ -366,7 +343,7 @@ impl ProgressEngine {
                         continue;
                     }
 
-                    let mut map = lock_or_recover(&pending, &healthy);
+                    let mut map = pending.lock();
                     for wc in &wc_buf[..count] {
                         if let Some(slot) = map.remove(&wc.wr_id) {
                             Self::resolve_slot(&slot, wc);
@@ -401,7 +378,7 @@ impl ProgressEngine {
 
     /// Number of operations currently pending completion.
     pub fn pending_count(&self) -> usize {
-        lock_or_recover(&self.pending, &self.healthy).len()
+        self.pending.lock().len()
     }
 
     /// Resolve a single operation slot from a work completion.
@@ -445,7 +422,9 @@ impl ProgressEngine {
     /// This is intended for testing only — it bypasses the CQ polling path
     /// and directly resolves the op slot, waking any waiters.
     pub fn synthetic_complete(&self, wr_id: u64) {
-        let slot = lock_or_recover(&self.pending, &self.healthy)
+        let slot = self
+            .pending
+            .lock()
             .remove(&wr_id)
             .unwrap_or_else(|| panic!("synthetic_complete: wr_id {wr_id} not pending"));
         let result = Ok(Completion {
@@ -606,10 +585,9 @@ mod tests {
 
     #[test]
     fn mutex_survives_panic_in_other_thread() {
-        // parking_lot mutexes don't poison — verify the engine stays healthy
-        // and functional after a panic in another thread.
+        // parking_lot mutexes don't poison — verify the engine stays
+        // functional after a panic in another thread.
         let engine = Arc::new(ProgressEngine::new());
-        assert!(engine.is_healthy());
 
         // Register an op before the panic
         let _op_before = engine.register_op(100);
@@ -623,13 +601,9 @@ mod tests {
         });
         assert!(handle.join().is_err());
 
-        // Engine remains healthy — parking_lot doesn't poison
-        assert!(engine.is_healthy());
-
         // register_op still works
         let op = engine.register_op(200);
         assert!(op.is_pending());
-        assert!(engine.is_healthy());
 
         // Subsequent operations still work
         assert_eq!(engine.pending_count(), 2);
