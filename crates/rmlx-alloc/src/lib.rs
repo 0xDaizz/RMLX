@@ -1,12 +1,6 @@
 //! rmlx-alloc — GPU memory allocator for RMLX
 
 #![deny(unsafe_op_in_unsafe_fn)]
-#![allow(unexpected_cfgs)] // objc crate uses deprecated cfg(feature = "cargo-clippy")
-
-// Required for objc::msg_send! macro in residency module (metal3 feature).
-#[cfg(feature = "metal3")]
-#[macro_use]
-extern crate objc;
 
 pub mod allocator;
 pub mod bfc;
@@ -53,7 +47,7 @@ pub enum AllocError {
     InvalidFree,
     /// Attempted to free a buffer not owned by this allocator, returning the
     /// buffer to the caller.
-    InvalidFreeBuffer(rmlx_metal::metal::Buffer),
+    InvalidFreeBuffer(rmlx_metal::MtlBuffer),
     /// The buffer's Metal device does not match this allocator's device.
     DeviceMismatch,
 }

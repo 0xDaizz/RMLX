@@ -1,4 +1,6 @@
 //! GPU kernel operations for RMLX arrays.
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLCommandBuffer as _;
 
 pub mod binary;
 pub mod buffer_slots;
@@ -35,6 +37,7 @@ pub mod scan;
 pub mod slice;
 pub mod sort;
 
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -74,7 +77,7 @@ pub(crate) fn checked_u32(val: usize, name: &str) -> Result<u32, KernelError> {
 pub(crate) fn make_contiguous(
     array: &Array,
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Option<Array>, KernelError> {
     if array.is_contiguous() {
         Ok(None)
@@ -177,29 +180,29 @@ impl CommandBufferHandle {
 /// In `Async` mode, returns `Some(CommandBufferHandle)` that the caller
 /// can use to poll or wait for completion.
 pub fn commit_with_mode(
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
     mode: ExecMode,
 ) -> Option<CommandBufferHandle> {
-    cb.commit();
-    increment_op_cbs();
-    match mode {
-        ExecMode::Sync => {
-            cb.wait_until_completed();
-            None
-        }
+    let handle = match mode {
+        ExecMode::Sync => None,
         ExecMode::Async => {
             let completed = Arc::new(AtomicBool::new(false));
             let flag = Arc::clone(&completed);
-            // Retain the command buffer (increments Obj-C refcount) so we
-            // can safely wait on it from a background thread.
-            let owned_cb = cb.to_owned();
-            std::thread::spawn(move || {
-                owned_cb.wait_until_completed();
-                flag.store(true, Ordering::Release);
-            });
+            let handler = block2::RcBlock::new(
+                move |_cmd_buf: NonNull<ProtocolObject<dyn objc2_metal::MTLCommandBuffer>>| {
+                    flag.store(true, Ordering::Release);
+                },
+            );
+            unsafe { cb.addCompletedHandler(block2::RcBlock::as_ptr(&handler)) };
             Some(CommandBufferHandle { completed })
         }
+    };
+    cb.commit();
+    increment_op_cbs();
+    if matches!(mode, ExecMode::Sync) {
+        cb.waitUntilCompleted();
     }
+    handle
 }
 
 /// Result of an async kernel launch.
@@ -300,8 +303,8 @@ mod tests {
         use crate::array::Array;
         use crate::dtype::DType;
 
-        let gpu = rmlx_metal::device::GpuDevice::system_default().unwrap();
-        let queue = gpu.raw().new_command_queue();
+        let gpu = crate::test_utils::require_gpu!();
+        let queue = gpu.new_command_queue();
         let registry = KernelRegistry::new(gpu);
 
         // Register the kernels we will exercise.

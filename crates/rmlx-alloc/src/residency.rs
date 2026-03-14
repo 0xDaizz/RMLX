@@ -9,9 +9,8 @@
 //!
 //! # Implementation
 //!
-//! When the `metal3` feature is enabled, this module uses `objc::msg_send!`
-//! to call the Metal 3 `MTLResidencySet` API directly, since the `metal`
-//! Rust crate does not yet expose these bindings.
+//! When the `metal3` feature is enabled, this module uses the objc2-metal
+//! `MTLResidencySet` bindings to manage residency sets via typed APIs.
 //!
 //! When `metal3` is not enabled, a no-op stub is provided that only tracks
 //! buffer counts for diagnostics.
@@ -36,29 +35,41 @@ impl fmt::Display for ResidencyError {
 impl std::error::Error for ResidencyError {}
 
 // ---------------------------------------------------------------------------
-// metal3-enabled implementation: real MTLResidencySet via objc runtime
+// metal3-enabled implementation: real MTLResidencySet via objc2-metal bindings
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "metal3")]
 mod inner {
-    use objc::runtime::Object;
-    use rmlx_metal::metal;
-    use rmlx_metal::metal::foreign_types::ForeignType;
+    use objc2::runtime::ProtocolObject;
+    use objc2_metal::{
+        MTLAllocation, MTLBuffer, MTLDevice, MTLResidencySet, MTLResidencySetDescriptor,
+    };
 
     use super::ResidencyError;
 
     /// Manages a set of Metal buffers that should be made resident on the GPU.
     ///
     /// On Metal 3+ devices, this uses `MTLResidencySet` to batch residency
-    /// operations. The underlying Objective-C object is created from the
-    /// device and released on drop.
+    /// operations. The `Retained` handle is automatically released on drop.
     pub struct ResidencyManager {
-        /// Raw pointer to the `MTLResidencySet` Objective-C object.
-        residency_set: *mut Object,
+        /// Typed handle to the `MTLResidencySet` Objective-C object.
+        residency_set: objc2::rc::Retained<ProtocolObject<dyn MTLResidencySet>>,
         /// Number of buffers tracked (for diagnostics).
         buffer_count: usize,
         /// Whether changes have been made since the last commit.
         dirty: bool,
+    }
+
+    /// Upcast a `&ProtocolObject<dyn MTLBuffer>` to `&ProtocolObject<dyn MTLAllocation>`.
+    ///
+    /// MTLBuffer inherits MTLResource which inherits MTLAllocation, so this
+    /// is a safe protocol upcast via pointer identity.
+    fn as_allocation(buf: &ProtocolObject<dyn MTLBuffer>) -> &ProtocolObject<dyn MTLAllocation> {
+        let ptr: *const ProtocolObject<dyn MTLBuffer> = buf;
+        // SAFETY: MTLBuffer : MTLResource : MTLAllocation — the ObjC object
+        // behind the protocol pointer implements MTLAllocation. The pointer
+        // representation is identical (thin pointer to the same ObjC object).
+        unsafe { &*(ptr as *const ProtocolObject<dyn MTLAllocation>) }
     }
 
     impl ResidencyManager {
@@ -71,35 +82,14 @@ mod inner {
         /// # Errors
         ///
         /// Returns `ResidencyError::CreationFailed` if the device does not
-        /// support Metal 3 residency sets (i.e., the returned object is null).
-        pub fn new(device: &metal::Device) -> Result<Self, ResidencyError> {
-            // SAFETY: We are calling well-known Metal 3 Objective-C APIs.
-            // MTLResidencySetDescriptor is a simple descriptor class, and
-            // newResidencySetWithDescriptor:error: is the standard factory.
-            // We use device.as_ptr() (from ForeignType) to get the real
-            // ObjC pointer, rather than casting the Rust wrapper address.
-            let residency_set: *mut Object = unsafe {
-                let desc: *mut Object = msg_send![class!(MTLResidencySetDescriptor), new];
-
-                let raw_device: *mut Object = device.as_ptr() as *mut Object;
-                let null_ptr: *mut Object = std::ptr::null_mut();
-                let set: *mut Object = msg_send![
-                    raw_device,
-                    newResidencySetWithDescriptor: desc
-                    error: null_ptr
-                ];
-
-                // Release the descriptor; the residency set retains what it needs.
-                let _: () = msg_send![desc, release];
-
-                set
-            };
-
-            if residency_set.is_null() {
-                return Err(ResidencyError::CreationFailed(
-                    "device may not support Metal 3".to_string(),
-                ));
-            }
+        /// support Metal 3 residency sets.
+        pub fn new(device: &ProtocolObject<dyn MTLDevice>) -> Result<Self, ResidencyError> {
+            let desc = MTLResidencySetDescriptor::new();
+            let residency_set = device
+                .newResidencySetWithDescriptor_error(&desc)
+                .map_err(|e| {
+                    ResidencyError::CreationFailed(format!("device may not support Metal 3: {e}"))
+                })?;
 
             Ok(Self {
                 residency_set,
@@ -110,28 +100,18 @@ mod inner {
 
         /// Add a buffer to the residency set.
         ///
-        /// Calls `[residencySet addAllocation:]` with the raw buffer pointer.
-        pub fn add_buffer(&mut self, buffer: &metal::Buffer) {
-            // SAFETY: addAllocation: is a Metal 3 MTLResidencySet method.
-            // We use buffer.as_ptr() (from ForeignType) to get the real
-            // ObjC pointer.
-            unsafe {
-                let raw_buf: *mut Object = buffer.as_ptr() as *mut Object;
-                let _: () = msg_send![self.residency_set, addAllocation: raw_buf];
-            }
+        /// Calls `[residencySet addAllocation:]` on the buffer.
+        pub fn add_buffer(&mut self, buffer: &ProtocolObject<dyn MTLBuffer>) {
+            self.residency_set.addAllocation(as_allocation(buffer));
             self.buffer_count += 1;
             self.dirty = true;
         }
 
         /// Remove a buffer from the residency set.
         ///
-        /// Calls `[residencySet removeAllocation:]` with the raw buffer pointer.
-        pub fn remove_buffer(&mut self, buffer: &metal::Buffer) {
-            // SAFETY: removeAllocation: is a Metal 3 MTLResidencySet method.
-            unsafe {
-                let raw_buf: *mut Object = buffer.as_ptr() as *mut Object;
-                let _: () = msg_send![self.residency_set, removeAllocation: raw_buf];
-            }
+        /// Calls `[residencySet removeAllocation:]` on the buffer.
+        pub fn remove_buffer(&mut self, buffer: &ProtocolObject<dyn MTLBuffer>) {
+            self.residency_set.removeAllocation(as_allocation(buffer));
             self.buffer_count = self.buffer_count.saturating_sub(1);
             self.dirty = true;
         }
@@ -141,10 +121,7 @@ mod inner {
         /// Calls `[residencySet commit]` to apply additions and removals
         /// to the GPU's residency table.
         pub fn commit(&mut self) {
-            // SAFETY: commit is a Metal 3 MTLResidencySet method.
-            unsafe {
-                let _: () = msg_send![self.residency_set, commit];
-            }
+            self.residency_set.commit();
             self.dirty = false;
         }
 
@@ -162,7 +139,7 @@ mod inner {
         ///
         /// Convenience method for ensuring a set of weight and KV cache
         /// buffers are resident before starting a decode loop.
-        pub fn ensure_resident(&mut self, buffers: &[&metal::Buffer]) {
+        pub fn ensure_resident(&mut self, buffers: &[&ProtocolObject<dyn MTLBuffer>]) {
             for buf in buffers {
                 self.add_buffer(buf);
             }
@@ -172,16 +149,8 @@ mod inner {
         }
     }
 
-    impl Drop for ResidencyManager {
-        fn drop(&mut self) {
-            // SAFETY: We own the residency set and release it exactly once.
-            if !self.residency_set.is_null() {
-                unsafe {
-                    let _: () = msg_send![self.residency_set, release];
-                }
-            }
-        }
-    }
+    // Retained<ProtocolObject<dyn MTLResidencySet>> is automatically released
+    // on drop — no manual Drop impl needed.
 
     // The residency set is an Objective-C object that is not thread-safe.
     // We explicitly do NOT impl Send or Sync.
@@ -193,7 +162,8 @@ mod inner {
 
 #[cfg(not(feature = "metal3"))]
 mod inner {
-    use rmlx_metal::metal;
+    use objc2::runtime::ProtocolObject;
+    use objc2_metal::{MTLBuffer, MTLDevice};
 
     use super::ResidencyError;
 
@@ -218,7 +188,7 @@ mod inner {
         ///
         /// This stub never fails, but returns `Result` for API consistency
         /// with the `metal3` path.
-        pub fn new(_device: &metal::Device) -> Result<Self, ResidencyError> {
+        pub fn new(_device: &ProtocolObject<dyn MTLDevice>) -> Result<Self, ResidencyError> {
             Ok(Self {
                 buffer_count: 0,
                 dirty: false,
@@ -226,13 +196,13 @@ mod inner {
         }
 
         /// Add a buffer to the residency set (no-op, tracks count only).
-        pub fn add_buffer(&mut self, _buffer: &metal::Buffer) {
+        pub fn add_buffer(&mut self, _buffer: &ProtocolObject<dyn MTLBuffer>) {
             self.buffer_count += 1;
             self.dirty = true;
         }
 
         /// Remove a buffer from the residency set (no-op, tracks count only).
-        pub fn remove_buffer(&mut self, _buffer: &metal::Buffer) {
+        pub fn remove_buffer(&mut self, _buffer: &ProtocolObject<dyn MTLBuffer>) {
             self.buffer_count = self.buffer_count.saturating_sub(1);
             self.dirty = true;
         }
@@ -256,7 +226,7 @@ mod inner {
         ///
         /// Convenience method for ensuring a set of weight and KV cache
         /// buffers are resident before starting a decode loop.
-        pub fn ensure_resident(&mut self, buffers: &[&metal::Buffer]) {
+        pub fn ensure_resident(&mut self, buffers: &[&ProtocolObject<dyn MTLBuffer>]) {
             for buf in buffers {
                 self.add_buffer(buf);
             }
@@ -281,7 +251,7 @@ mod tests {
     #[test]
     fn test_residency_metal3_stub() {
         use rmlx_metal::device::GpuDevice;
-        use rmlx_metal::metal::MTLResourceOptions;
+        use rmlx_metal::MTLResourceOptions;
 
         let device = match GpuDevice::system_default() {
             Ok(d) => d,
@@ -325,7 +295,7 @@ mod tests {
     #[test]
     fn test_residency_manager_stub_lifecycle() {
         use rmlx_metal::device::GpuDevice;
-        use rmlx_metal::metal::MTLResourceOptions;
+        use rmlx_metal::MTLResourceOptions;
 
         let device = match GpuDevice::system_default() {
             Ok(d) => d,
@@ -355,7 +325,7 @@ mod tests {
     #[test]
     fn test_residency_manager_with_device() {
         use rmlx_metal::device::GpuDevice;
-        use rmlx_metal::metal::MTLResourceOptions;
+        use rmlx_metal::MTLResourceOptions;
 
         let device = match GpuDevice::system_default() {
             Ok(d) => d,
@@ -394,7 +364,7 @@ mod tests {
     #[test]
     fn test_residency_batch_ensure_resident() {
         use rmlx_metal::device::GpuDevice;
-        use rmlx_metal::metal::MTLResourceOptions;
+        use rmlx_metal::MTLResourceOptions;
 
         let device = match GpuDevice::system_default() {
             Ok(d) => d,

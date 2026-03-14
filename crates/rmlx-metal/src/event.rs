@@ -3,22 +3,25 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use metal::{Device, SharedEvent};
+use objc2::runtime::ProtocolObject;
+use objc2_metal::*;
+
+use crate::types::*;
 
 /// GPU synchronization event wrapping MTLSharedEvent.
 ///
 /// Provides CPU-side waiting with a spin→yield→sleep escalation strategy
 /// for low-latency synchronization with GPU command buffer completion.
 pub struct GpuEvent {
-    event: SharedEvent,
+    event: MtlEvent,
     counter: AtomicU64,
     cancelled: AtomicBool,
 }
 
 impl GpuEvent {
     /// Create a new GPU event on the given device.
-    pub fn new(device: &Device) -> Self {
-        let event = device.new_shared_event();
+    pub fn new(device: &ProtocolObject<dyn MTLDevice>) -> Self {
+        let event = device.newSharedEvent().unwrap();
         Self {
             event,
             counter: AtomicU64::new(0),
@@ -37,13 +40,23 @@ impl GpuEvent {
     }
 
     /// Signal this event from a command buffer at the given value.
-    pub fn signal_from_command_buffer(&self, command_buffer: &metal::CommandBufferRef, value: u64) {
-        command_buffer.encode_signal_event(&self.event, value);
+    pub fn signal_from_command_buffer(
+        &self,
+        command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
+        value: u64,
+    ) {
+        let event: &ProtocolObject<dyn MTLEvent> = ProtocolObject::from_ref(&*self.event);
+        command_buffer.encodeSignalEvent_value(event, value);
     }
 
     /// Wait on the event from a command buffer.
-    pub fn wait_from_command_buffer(&self, command_buffer: &metal::CommandBufferRef, value: u64) {
-        command_buffer.encode_wait_for_event(&self.event, value);
+    pub fn wait_from_command_buffer(
+        &self,
+        command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
+        value: u64,
+    ) {
+        let event: &ProtocolObject<dyn MTLEvent> = ProtocolObject::from_ref(&*self.event);
+        command_buffer.encodeWaitForEvent_value(event, value);
     }
 
     /// CPU-side wait for the event to reach the given value.
@@ -59,7 +72,7 @@ impl GpuEvent {
                 return Err(EventError::Cancelled);
             }
 
-            let current = self.event.signaled_value();
+            let current = self.event.signaledValue();
             if current >= value {
                 return Ok(start.elapsed());
             }
@@ -94,11 +107,11 @@ impl GpuEvent {
     /// Call this when reusing the event for a new pipeline iteration.
     pub fn reset(&self) {
         self.counter.store(0, Ordering::SeqCst);
-        self.event.set_signaled_value(0);
+        self.event.setSignaledValue(0);
     }
 
     /// Raw shared event reference.
-    pub fn raw(&self) -> &SharedEvent {
+    pub fn raw(&self) -> &ProtocolObject<dyn MTLSharedEvent> {
         &self.event
     }
 }

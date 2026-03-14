@@ -2,6 +2,7 @@
 
 use crate::array::Array;
 use crate::kernels::{KernelError, KernelRegistry};
+use objc2::runtime::ProtocolObject;
 
 /// Configuration for LoRA adapters.
 #[derive(Debug, Clone)]
@@ -188,7 +189,7 @@ impl LoraLayer {
         base_output: &Array,
         input: &Array,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         let dev = registry.device().raw();
         let batch_size = input.shape()[0];

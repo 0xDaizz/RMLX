@@ -427,13 +427,13 @@ pub fn parse_gguf<R: Read + Seek>(reader: &mut R) -> Result<GgufFile, GgufError>
     for t in &tensors {
         // Compute number of elements from shape (product of dims, minimum 1 for scalars).
         let n_elements: u64 = t.shape.iter().copied().product::<u64>().max(1);
-        let block_size = t.ggml_type.block_size() as u64;
-        let type_size = t.ggml_type.type_size() as u64;
+        let block_size = t.ggml_type.block_size();
+        let type_size = t.ggml_type.type_size();
         // Number of blocks = ceil(n_elements / block_size)
-        let n_blocks = n_elements.div_ceil(block_size);
+        let n_blocks = n_elements.div_ceil(block_size as u64);
         let tensor_byte_size =
             n_blocks
-                .checked_mul(type_size)
+                .checked_mul(type_size as u64)
                 .ok_or_else(|| GgufError::OffsetOutOfBounds {
                     tensor: t.name.clone(),
                     offset: t.offset,

@@ -4,7 +4,7 @@
 
 `rmlx-metal` is a safe and ergonomic Rust wrapper layer over the Apple Metal GPU API. It abstracts Metal devices, command queues, buffers, compute pipelines, and shader libraries to enable concise GPU computation.
 
-Built on the `metal-rs` 0.31 crate, it takes design cues from MLX's Metal abstraction structure and remodels them into idiomatic Rust APIs. The basic wrappers were completed in Phase 0, with event synchronization (`event.rs`), self-check (`self_check.rs`), and the dual queue stream manager (`stream.rs`) added subsequently. EP-6 adds `icb_sparse.rs` for sparse expert launch via indirect command buffers. **Phase 4 additions:** `ChipTuning` per-generation GPU tuning (M1/M2/M3/M4) integrated into GpuDevice; `DiskPipelineCache` with sha2-hashed pipeline binary archive at `~/.cache/rmlx/pipelines/`; `HazardTrackingModeUntracked` (bit 0x10) for manual hazard tracking in buffer creation; ICB sparse expert dispatch improvements (`grouped_forward_icb()`, `IcbReplay` per-sparsity-pattern cache).
+Built on `objc2-metal` 0.3 (part of the `objc2` ecosystem), it takes design cues from MLX's Metal abstraction structure and remodels them into idiomatic Rust APIs. The `ComputePass` newtype wrapper (`#[repr(transparent)]`) provides a zero-cost abstraction over the raw Metal encoder with ergonomic methods (`set_buffer`, `set_val`, `dispatch_threads`, `end`). The `types.rs` module defines type aliases (`MtlDevice`, `MtlBuffer`, `MtlPipeline`, `MtlCB`, `MtlQueue`, `MtlEvent`, `MtlEncoder`, `MtlLibrary`, `MtlFunction`, `MtlFunctionConstants`, `MtlCompileOptions`) for concise call-sites. The `metal4` feature flag enables macOS 26+ Metal 4 API support with `CommandAllocator`, `CounterHeap`, `ComputePass4`, and `AsyncCompiler`. The basic wrappers were completed in Phase 0, with event synchronization (`event.rs`), self-check (`self_check.rs`), and the dual queue stream manager (`stream.rs`) added subsequently. EP-6 adds `icb_sparse.rs` for sparse expert launch via indirect command buffers. **Phase 4 additions:** `ChipTuning` per-generation GPU tuning (M1/M2/M3/M4) integrated into GpuDevice; `DiskPipelineCache` with sha2-hashed pipeline binary archive at `~/.cache/rmlx/pipelines/`; `HazardTrackingModeUntracked` (bit 0x10) for manual hazard tracking in buffer creation; ICB sparse expert dispatch improvements (`grouped_forward_icb()`, `IcbReplay` per-sparsity-pattern cache). **objc2-metal migration:** Reduced unsafe blocks from ~166 to 18 (all behind safe wrappers), reduced `msg_send!` calls from 30 to 2 (both in `pipeline_cache.rs` for binary archive serialization).
 
 ---
 
@@ -28,6 +28,9 @@ graph TD
     A --> O[icb_sparse.rs — Sparse Expert ICB]
     A --> P[chip_tuning.rs — ChipTuning]
     A --> Q[pipeline_cache.rs — DiskPipelineCache]
+    A --> R[compute_pass.rs — ComputePass]
+    A --> S[types.rs — Type Aliases]
+    A --> T[metal4/ — Metal 4 API]
 ```
 
 ### `lib.rs` — Top-Level Re-exports
@@ -59,7 +62,7 @@ Provides Metal device acquisition, architecture detection, and buffer/queue fact
 | `new_command_queue()` | Creates a new command queue |
 | `new_buffer()` | Allocates an uninitialized buffer |
 | `new_buffer_with_data<T>()` | Creates a `StorageModeShared` buffer initialized from a slice |
-| `raw()` | Returns a reference to the inner `metal::Device` |
+| `raw()` | Returns a reference to the inner `MtlDevice` |
 
 **Architecture detection:**
 
@@ -105,7 +108,7 @@ A thin wrapper around a Metal command queue.
 |--------|-------------|
 | `new(device)` | Creates a new command queue on the specified device |
 | `new_command_buffer()` | Creates a new command buffer from this queue |
-| `raw()` | Returns a reference to the inner `metal::CommandQueue` |
+| `raw()` | Returns a reference to the inner MTLCommandQueue |
 
 ```rust
 pub struct GpuQueue {
@@ -119,7 +122,7 @@ impl GpuQueue {
         }
     }
 
-    pub fn new_command_buffer(&self) -> &CommandBufferRef {
+    pub fn new_command_buffer(&self) -> &ProtocolObject<dyn MTLCommandBuffer> {
         self.queue.new_command_buffer()
     }
 }
@@ -140,16 +143,16 @@ A convenience function for 1D compute dispatch. Handles the entire process from 
 
 ```rust
 pub fn encode_compute_1d(
-    cmd_buf: &CommandBufferRef,
-    pipeline: &ComputePipelineState,
-    buffers: &[(&Buffer, u64)],    // array of (buffer, offset) pairs
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    pipeline: &MtlPipeline,
+    buffers: &[(&MtlBuffer, u64)],    // array of (buffer, offset) pairs
     num_threads: u64,
 ) {
-    let encoder = cmd_buf.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(pipeline);
+    let pass = ComputePass::new(cmd_buf);
+    pass.set_pipeline(pipeline);
 
     for (index, (buffer, offset)) in buffers.iter().enumerate() {
-        encoder.set_buffer(index as u64, Some(buffer), *offset);
+        pass.set_buffer(index as u64, buffer, *offset);
     }
 
     let max_threads = pipeline.max_total_threads_per_threadgroup();
@@ -158,8 +161,8 @@ pub fn encode_compute_1d(
     let grid_size = MTLSize::new(num_threads, 1, 1);
     let group_size = MTLSize::new(threadgroup_size, 1, 1);
 
-    encoder.dispatch_threads(grid_size, group_size);
-    encoder.end_encoding();
+    pass.dispatch_threads(grid_size, group_size);
+    pass.end();
 }
 ```
 
@@ -177,7 +180,7 @@ Provides utility functions for GPU buffer creation and reading.
 
 ```rust
 // Create a buffer initialized with data
-pub fn new_buffer_with_data<T>(device: &metal::Device, data: &[T]) -> MTLBuffer {
+pub fn new_buffer_with_data<T>(device: &MtlDevice, data: &[T]) -> MtlBuffer {
     let size = std::mem::size_of_val(data) as u64;
     let ptr = data.as_ptr() as *const c_void;
     device.new_buffer_with_data(ptr, size, MTLResourceOptions::StorageModeShared)
@@ -185,13 +188,13 @@ pub fn new_buffer_with_data<T>(device: &metal::Device, data: &[T]) -> MTLBuffer 
 
 // Zero-copy buffer creation (wrapping externally allocated memory)
 pub unsafe fn new_buffer_no_copy(
-    device: &metal::Device,
+    device: &MtlDevice,
     ptr: *mut c_void,
     size: u64,
-) -> MTLBuffer { ... }
+) -> MtlBuffer { ... }
 
 // Read GPU -> CPU results
-pub unsafe fn read_buffer<T>(buffer: &MTLBuffer, count: usize) -> &[T] {
+pub unsafe fn read_buffer<T>(buffer: &MtlBuffer, count: usize) -> &[T] {
     let ptr = buffer.contents() as *const T;
     std::slice::from_raw_parts(ptr, count)
 }
@@ -210,8 +213,8 @@ A `HashMap`-based compute pipeline cache keyed by kernel function name. Prevents
 
 ```rust
 pub struct PipelineCache {
-    device: metal::Device,
-    cache: HashMap<String, ComputePipelineState>,
+    device: MtlDevice,
+    cache: HashMap<String, MtlPipeline>,
 }
 
 impl PipelineCache {
@@ -219,7 +222,7 @@ impl PipelineCache {
         &mut self,
         name: &str,
         library: &Library,
-    ) -> Result<&ComputePipelineState, MetalError> {
+    ) -> Result<&MtlPipeline, MetalError> {
         if !self.cache.contains_key(name) {
             let function = library
                 .get_function(name, None)
@@ -247,13 +250,13 @@ Supports loading AOT-compiled `.metallib` files and JIT compilation of MSL sourc
 
 ```rust
 // AOT: load pre-compiled .metallib
-pub fn load_metallib(device: &metal::Device, path: &Path) -> Result<Library, MetalError> {
+pub fn load_metallib(device: &MtlDevice, path: &Path) -> Result<Library, MetalError> {
     device.new_library_with_file(path)
         .map_err(|e| MetalError::LibraryLoad(e.to_string()))
 }
 
 // JIT: runtime compilation of MSL source string
-pub fn compile_source(device: &metal::Device, source: &str) -> Result<Library, MetalError> {
+pub fn compile_source(device: &MtlDevice, source: &str) -> Result<Library, MetalError> {
     let options = CompileOptions::new();
     device.new_library_with_source(source, &options)
         .map_err(|e| MetalError::ShaderCompile(e.to_string()))
@@ -524,6 +527,72 @@ This eliminates redundant shader compilation across process restarts, significan
 
 ---
 
+### `compute_pass.rs` — `ComputePass` (Zero-Cost Encoder Wrapper)
+
+A zero-cost `#[repr(transparent)]` newtype over `&ProtocolObject<dyn MTLComputeCommandEncoder>`. All methods are `#[inline(always)]` for zero overhead.
+
+```rust
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+pub struct ComputePass<'a>(pub(crate) &'a ProtocolObject<dyn MTLComputeCommandEncoder>);
+```
+
+| Method | Description |
+|--------|-------------|
+| `new(encoder)` | Wraps a borrowed compute command encoder |
+| `set_pipeline(pso)` | Sets the compute pipeline state |
+| `set_buffer(index, buffer, offset)` | Binds a buffer at the given index |
+| `set_val<T>(index, value)` | Sets a scalar value as bytes at the given index |
+| `set_threadgroup_memory(index, length)` | Allocates threadgroup memory at the given index |
+| `dispatch_threads(grid, group)` | Dispatches threads with explicit grid and group sizes |
+| `dispatch_threadgroups(groups, group)` | Dispatches threadgroups |
+| `memory_barrier_with_scope(scope)` | Inserts a memory barrier |
+| `end()` | Ends encoding |
+
+---
+
+### `types.rs` — Type Aliases
+
+Concise type aliases for the verbose `Retained<ProtocolObject<dyn MTLFoo>>` types used throughout the crate.
+
+| Alias | Underlying Type |
+|-------|----------------|
+| `MtlDevice` | `Retained<ProtocolObject<dyn MTLDevice>>` |
+| `MtlQueue` | `Retained<ProtocolObject<dyn MTLCommandQueue>>` |
+| `MtlBuffer` | `Retained<ProtocolObject<dyn MTLBuffer>>` |
+| `MtlPipeline` | `Retained<ProtocolObject<dyn MTLComputePipelineState>>` |
+| `MtlLibrary` | `Retained<ProtocolObject<dyn MTLLibrary>>` |
+| `MtlCB` | `Retained<ProtocolObject<dyn MTLCommandBuffer>>` |
+| `MtlEvent` | `Retained<ProtocolObject<dyn MTLSharedEvent>>` |
+| `MtlEncoder` | `Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>` |
+| `MtlFunction` | `Retained<ProtocolObject<dyn MTLFunction>>` |
+| `MtlFunctionConstants` | `Retained<MTLFunctionConstantValues>` |
+| `MtlCompileOptions` | `Retained<MTLCompileOptions>` |
+| `MtlCaptureManager` | `Retained<MTLCaptureManager>` |
+| `MtlCaptureDescriptor` | `Retained<MTLCaptureDescriptor>` |
+
+Also provides `retain_proto<T>()` for retaining unsized protocol-object references (works around `Retained::retain()` requiring `T: Sized`).
+
+---
+
+### `metal4/` — Metal 4 API (Feature-Gated)
+
+> Requires `metal4` feature flag and macOS 26+ runtime.
+
+Metal 4 API wrappers providing explicit command buffer lifecycle, GPU-side timestamping, and async shader compilation.
+
+| Module | Type | Description |
+|--------|------|-------------|
+| `command.rs` | `CommandAllocator` | Manages encoding memory for Metal 4 command buffers |
+| `command.rs` | `Mtl4CommandBuffer` | Explicit begin/end command buffer lifecycle |
+| `command.rs` | `CommandQueue4` | Batch commit of multiple command buffers |
+| `counter_heap.rs` | `CounterHeap` | GPU-side timestamp counter heap |
+| `counter_heap.rs` | `GpuTimestamp` | Resolved GPU timestamp pair (start/end) |
+| `compute.rs` | `ComputePass4` | Metal 4 compute pass with explicit resource usage |
+| `compiler.rs` | `AsyncCompiler` | Background shader compilation with completion callback |
+
+---
+
 ### HazardTrackingModeUntracked (Phase 4)
 
 Phase 4 adds `HazardTrackingModeUntracked` (bit 0x10) as a buffer creation option for manual hazard tracking. When set, Metal does not automatically track read/write hazards on the buffer, allowing the application to manage synchronization explicitly via `GpuEvent` or fences. This reduces driver overhead for buffers with known access patterns (e.g., slab ring buffers, expert weight tensors).
@@ -588,7 +657,7 @@ fn main() {
     let buffer_b = device.new_buffer_with_data(&[5.0f32, 6.0, 7.0, 8.0]);
     let buffer_out = device.new_buffer(
         16, // 4 floats x 4 bytes
-        rmlx_metal::metal::MTLResourceOptions::StorageModeShared,
+        rmlx_metal::MTLResourceOptions::StorageModeShared,
     );
 
     // 3. JIT compile shader + pipeline cache
@@ -644,16 +713,16 @@ sequenceDiagram
 
 ## Safety
 
-This crate contains two `unsafe` functions.
+This crate contains 18 `unsafe` blocks (down from ~166 before the objc2-metal migration), all behind safe wrapper APIs. The `objc2` types are inherently `Send + Sync`, eliminating the need for `unsafe impl Send/Sync` blocks. Only 2 `msg_send!` calls remain (down from 30), both in `pipeline_cache.rs` for binary archive serialization where no typed binding exists yet.
 
 ### `new_buffer_no_copy()`
 
 ```rust
 pub unsafe fn new_buffer_no_copy(
-    device: &metal::Device,
+    device: &MtlDevice,
     ptr: *mut c_void,
     size: u64,
-) -> MTLBuffer
+) -> MtlBuffer
 ```
 
 **Safety requirements:**
@@ -665,7 +734,7 @@ pub unsafe fn new_buffer_no_copy(
 ### `read_buffer<T>()`
 
 ```rust
-pub unsafe fn read_buffer<T>(buffer: &MTLBuffer, count: usize) -> &[T]
+pub unsafe fn read_buffer<T>(buffer: &MtlBuffer, count: usize) -> &[T]
 ```
 
 **Safety requirements:**
@@ -696,7 +765,7 @@ Additionally, command pipeline safety, stream improvements, and buffer cache opt
 
 ```toml
 [dependencies]
-metal = "0.31"
-objc2 = "..."
-block2 = "..."
+objc2-metal = "0.3"
+objc2 = "0.6"
+block2 = "0.6"
 ```

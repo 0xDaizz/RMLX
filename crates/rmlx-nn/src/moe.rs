@@ -15,12 +15,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::sync::{Arc, OnceLock};
 
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{
+    MTLCommandBuffer as _, MTLCommandQueue, MTLComputePipelineState as _, MTLDevice,
+};
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::{KernelError, KernelRegistry};
 use rmlx_core::ops;
 use rmlx_core::MetalAllocator;
 use rmlx_metal::icb_sparse::{IcbReplayCache, SparseExpertPlan};
+use rmlx_metal::{ComputePass, MTLSize};
 // TODO(Phase 6b): use grouped_forward_icb for direct ICB GEMM replay
 // use rmlx_metal::icb_sparse::grouped_forward_icb;
 
@@ -173,7 +178,7 @@ impl Expert {
         &self,
         x: &Array,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         // SwiGLU: down(silu(gate(x)) * up(x))
         let gate_out = self.gate_proj.forward(x, registry, queue)?;
@@ -342,7 +347,7 @@ impl MoeLayer {
     }
 
     /// Initialize zero expert bias on the given device.
-    pub fn init_expert_bias(&mut self, device: &metal::Device) {
+    pub fn init_expert_bias(&mut self, device: &ProtocolObject<dyn MTLDevice>) {
         let bias = Array::zeros(device, &[self.config.num_experts], DType::Float32);
         self.expert_bias = Some(bias);
     }
@@ -358,7 +363,7 @@ impl MoeLayer {
         expert_counts: &Array,
         lr: f32,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<(), KernelError> {
         let bias = match self.expert_bias.as_ref() {
             Some(b) => b,
@@ -403,7 +408,7 @@ impl MoeLayer {
         &self,
         x: &Array,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         let gate = self
             .gate
@@ -434,7 +439,7 @@ impl MoeLayer {
         let local_expert_range: (usize, usize) = (0, num_experts);
 
         // Record metrics
-        self.metrics.record_forward(seq_len as u64);
+        self.metrics.record_forward(seq_len.try_into().unwrap());
 
         // Gate logits: [seq_len, num_experts]
         let gate_logits = gate.forward(x, registry, queue)?;
@@ -563,7 +568,7 @@ impl MoeLayer {
         route_result: &ops::topk_route::TopkRouteResult,
         _local_expert_range: (usize, usize),
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         let input_dtype = x.dtype();
         let seq_len = x.shape()[0];
@@ -714,7 +719,7 @@ impl MoeLayer {
         route_result: &ops::topk_route::TopkRouteResult,
         local_expert_range: (usize, usize),
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         let seq_len = x.shape()[0];
         let hidden_dim = self.config.hidden_dim;
@@ -783,28 +788,30 @@ impl MoeLayer {
                     }
                 };
                 let pipeline = registry.get_pipeline(copy_kernel, x.dtype())?;
-                let cb = queue.new_command_buffer();
+                let cb = queue.commandBuffer().unwrap();
                 for (i, &(tok, _)) in dispatch.iter().enumerate() {
                     let src_offset = x.offset() + tok * hidden_dim * elem_size;
                     let dst_offset = i * hidden_dim * elem_size;
-                    let enc = cb.new_compute_command_encoder();
-                    enc.set_compute_pipeline_state(&pipeline);
-                    enc.set_buffer(0, Some(x.metal_buffer()), src_offset as u64);
-                    enc.set_buffer(1, Some(batch_buf.metal_buffer()), dst_offset as u64);
-                    let grid = metal::MTLSize::new(hidden_dim as u64, 1, 1);
-                    let tg = metal::MTLSize::new(
-                        std::cmp::min(
-                            pipeline.max_total_threads_per_threadgroup(),
-                            hidden_dim as u64,
-                        ),
-                        1,
-                        1,
-                    );
+                    let raw_enc = cb.computeCommandEncoder().unwrap();
+                    let enc = ComputePass::new(&raw_enc);
+                    enc.set_pipeline(&pipeline);
+                    enc.set_buffer(0, Some(x.metal_buffer()), src_offset);
+                    enc.set_buffer(1, Some(batch_buf.metal_buffer()), dst_offset);
+                    let grid = MTLSize {
+                        width: hidden_dim,
+                        height: 1,
+                        depth: 1,
+                    };
+                    let tg = MTLSize {
+                        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), hidden_dim),
+                        height: 1,
+                        depth: 1,
+                    };
                     enc.dispatch_threads(grid, tg);
-                    enc.end_encoding();
+                    enc.end();
                 }
                 cb.commit();
-                cb.wait_until_completed();
+                cb.waitUntilCompleted();
                 batch_buf
             };
 
@@ -838,24 +845,26 @@ impl MoeLayer {
 
                 let summed = ops::binary::add(registry, &dst_view, &scaled, queue)?;
 
-                let cb = queue.new_command_buffer();
-                let enc = cb.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&pipeline);
-                enc.set_buffer(0, Some(summed.metal_buffer()), summed.offset() as u64);
-                enc.set_buffer(1, Some(output.metal_buffer()), dst_offset as u64);
-                let grid = metal::MTLSize::new(hidden_dim as u64, 1, 1);
-                let tg = metal::MTLSize::new(
-                    std::cmp::min(
-                        pipeline.max_total_threads_per_threadgroup(),
-                        hidden_dim as u64,
-                    ),
-                    1,
-                    1,
-                );
+                let cb = queue.commandBuffer().unwrap();
+                let raw_enc = cb.computeCommandEncoder().unwrap();
+                let enc = ComputePass::new(&raw_enc);
+                enc.set_pipeline(&pipeline);
+                enc.set_buffer(0, Some(summed.metal_buffer()), summed.offset());
+                enc.set_buffer(1, Some(output.metal_buffer()), dst_offset);
+                let grid = MTLSize {
+                    width: hidden_dim,
+                    height: 1,
+                    depth: 1,
+                };
+                let tg = MTLSize {
+                    width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), hidden_dim),
+                    height: 1,
+                    depth: 1,
+                };
                 enc.dispatch_threads(grid, tg);
-                enc.end_encoding();
+                enc.end();
                 cb.commit();
-                cb.wait_until_completed();
+                cb.waitUntilCompleted();
             }
         }
 
@@ -878,7 +887,7 @@ impl MoeLayer {
         route_result: &ops::topk_route::TopkRouteResult,
         local_expert_range: (usize, usize),
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         let expert_group = self.ensure_expert_group(registry, queue)?;
 
@@ -1039,7 +1048,7 @@ impl MoeLayer {
         route_result: &ops::topk_route::TopkRouteResult,
         local_expert_range: (usize, usize),
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         let expert_group = self.ensure_expert_group(registry, queue)?;
 
@@ -1048,8 +1057,10 @@ impl MoeLayer {
             let counts: Vec<u32> = route_result.expert_counts.to_vec_checked();
             for (eid, &count) in counts.iter().enumerate() {
                 if eid < self.metrics.num_experts && count > 0 {
-                    self.metrics.expert_tokens[eid]
-                        .fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed);
+                    self.metrics.expert_tokens[eid].fetch_add(
+                        (count as usize).try_into().unwrap(),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                 }
             }
         }
@@ -1154,7 +1165,7 @@ impl MoeLayer {
     fn ensure_expert_group(
         &self,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<&ExpertGroup, KernelError> {
         if let Some(group) = self.expert_group.get() {
             return Ok(group);
@@ -1175,7 +1186,7 @@ impl MoeLayer {
         pipeline: &MoePipeline,
         local_expert_range: (usize, usize),
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         let top_k = self.config.num_experts_per_token;
 
@@ -1233,7 +1244,7 @@ impl MoeLayer {
         expert_dispatch: &[Vec<(usize, f32)>],
         local_expert_range: (usize, usize),
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         let seq_len = x.shape()[0];
         let hidden_dim = self.config.hidden_dim;
@@ -1368,9 +1379,9 @@ fn gather_all_experts(
     local_expert_range: (usize, usize),
     hidden_dim: usize,
     elem_size: usize,
-    dev: &metal::Device,
+    dev: &ProtocolObject<dyn MTLDevice>,
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
     allocator: Option<&Arc<MetalAllocator>>,
 ) -> Result<Vec<(usize, Array)>, KernelError> {
     let (local_start, local_end) = local_expert_range;
@@ -1413,31 +1424,33 @@ fn gather_all_experts(
     }
 
     // Encode all copies into ONE command buffer
-    let cb = queue.new_command_buffer();
+    let cb = queue.commandBuffer().unwrap();
     for (ri, &(_, dispatch)) in active.iter().enumerate() {
         let batch_buf = &results[ri].1;
         for (i, &(tok, _)) in dispatch.iter().enumerate() {
             let src_offset = x.offset() + tok * hidden_dim * elem_size;
             let dst_offset = i * hidden_dim * elem_size;
-            let enc = cb.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&pipeline);
-            enc.set_buffer(0, Some(x.metal_buffer()), src_offset as u64);
-            enc.set_buffer(1, Some(batch_buf.metal_buffer()), dst_offset as u64);
-            let grid = metal::MTLSize::new(hidden_dim as u64, 1, 1);
-            let tg = metal::MTLSize::new(
-                std::cmp::min(
-                    pipeline.max_total_threads_per_threadgroup(),
-                    hidden_dim as u64,
-                ),
-                1,
-                1,
-            );
+            let raw_enc = cb.computeCommandEncoder().unwrap();
+            let enc = ComputePass::new(&raw_enc);
+            enc.set_pipeline(&pipeline);
+            enc.set_buffer(0, Some(x.metal_buffer()), src_offset);
+            enc.set_buffer(1, Some(batch_buf.metal_buffer()), dst_offset);
+            let grid = MTLSize {
+                width: hidden_dim,
+                height: 1,
+                depth: 1,
+            };
+            let tg = MTLSize {
+                width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), hidden_dim),
+                height: 1,
+                depth: 1,
+            };
             enc.dispatch_threads(grid, tg);
-            enc.end_encoding();
+            enc.end();
         }
     }
     cb.commit();
-    cb.wait_until_completed();
+    cb.waitUntilCompleted();
 
     Ok(results)
 }
@@ -1458,7 +1471,12 @@ fn f32_to_f16_bits(val: f32) -> u16 {
 }
 
 /// Create a scale array filled with `weight` matching the given dtype.
-fn make_scale_array(dev: &metal::Device, weight: f32, hidden_dim: usize, dtype: DType) -> Array {
+fn make_scale_array(
+    dev: &ProtocolObject<dyn MTLDevice>,
+    weight: f32,
+    hidden_dim: usize,
+    dtype: DType,
+) -> Array {
     match dtype {
         DType::Float32 => {
             let scale_data = vec![weight; hidden_dim];
@@ -1490,9 +1508,9 @@ fn scatter_add_all_experts(
     output: &Array,
     hidden_dim: usize,
     elem_size: usize,
-    dev: &metal::Device,
+    dev: &ProtocolObject<dyn MTLDevice>,
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
 ) -> Result<(), KernelError> {
     if expert_outputs.is_empty() {
         return Ok(());
@@ -1539,26 +1557,28 @@ fn scatter_add_all_experts(
 
         // ONE CB for all copy-back operations in this expert
         if !copy_tasks.is_empty() {
-            let cb = queue.new_command_buffer();
+            let cb = queue.commandBuffer().unwrap();
             for (summed, dst_offset) in &copy_tasks {
-                let enc = cb.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&pipeline);
-                enc.set_buffer(0, Some(summed.metal_buffer()), summed.offset() as u64);
-                enc.set_buffer(1, Some(output.metal_buffer()), *dst_offset as u64);
-                let grid = metal::MTLSize::new(hidden_dim as u64, 1, 1);
-                let tg = metal::MTLSize::new(
-                    std::cmp::min(
-                        pipeline.max_total_threads_per_threadgroup(),
-                        hidden_dim as u64,
-                    ),
-                    1,
-                    1,
-                );
+                let raw_enc = cb.computeCommandEncoder().unwrap();
+                let enc = ComputePass::new(&raw_enc);
+                enc.set_pipeline(&pipeline);
+                enc.set_buffer(0, Some(summed.metal_buffer()), summed.offset());
+                enc.set_buffer(1, Some(output.metal_buffer()), *dst_offset);
+                let grid = MTLSize {
+                    width: hidden_dim,
+                    height: 1,
+                    depth: 1,
+                };
+                let tg = MTLSize {
+                    width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), hidden_dim),
+                    height: 1,
+                    depth: 1,
+                };
                 enc.dispatch_threads(grid, tg);
-                enc.end_encoding();
+                enc.end();
             }
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
         }
     }
 

@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use objc2_metal::MTLSharedEvent as _;
 use rmlx_metal::event::GpuEvent;
 
 use crate::exchange_tag::{encode_wr_id, ExchangeTag};
@@ -184,7 +185,7 @@ impl DescriptorRing {
     }
 
     /// The ring's Metal buffer, for binding to GPU compute kernels.
-    pub fn metal_buffer(&self) -> &metal::Buffer {
+    pub fn metal_buffer(&self) -> &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer> {
         self.ring.metal_buffer()
     }
 
@@ -213,7 +214,7 @@ impl DescriptorRing {
     /// Updates `head` from the event's signaled value. Returns the number
     /// of new descriptors available.
     pub fn poll_submissions(&mut self) -> u32 {
-        let signaled = self.submit_event.raw().signaled_value();
+        let signaled = self.submit_event.raw().signaledValue();
         let new_head = signaled as u32;
         if new_head != self.head {
             self.head = new_head;
@@ -250,7 +251,7 @@ impl DescriptorRing {
     ///
     /// The value should be the tail position after processing.
     pub fn signal_completion(&self, value: u64) {
-        self.complete_event.raw().set_signaled_value(value);
+        self.complete_event.raw().setSignaledValue(value);
     }
 
     /// Current tail position (CPU consumer).

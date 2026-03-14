@@ -221,6 +221,9 @@ impl Default for FusionCodegen {
 mod tests {
     use super::*;
     use crate::fusion::graph::{FusableOp, FusionGraph};
+    fn test_device() -> Option<rmlx_metal::MtlDevice> {
+        crate::test_utils::shared_metal_device()
+    }
 
     #[test]
     fn test_codegen_simple_add() {
@@ -395,13 +398,11 @@ mod tests {
 
     #[test]
     fn test_codegen_compiles() {
+        use objc2_metal::MTLDevice as _;
         // Verify the generated source actually compiles with Metal
-        let device = match metal::Device::system_default() {
-            Some(d) => d,
-            None => {
-                eprintln!("skipping test: no Metal device");
-                return;
-            }
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
         };
 
         let mut g = FusionGraph::new(2);
@@ -414,8 +415,9 @@ mod tests {
         let source = codegen
             .generate(&g, DType::Float32)
             .expect("generate failed");
-        let options = metal::CompileOptions::new();
-        let result = device.new_library_with_source(&source, &options);
+        let options = objc2_metal::MTLCompileOptions::new();
+        let ns_source = objc2_foundation::NSString::from_str(&source);
+        let result = device.newLibraryWithSource_options_error(&ns_source, Some(&options));
         assert!(
             result.is_ok(),
             "f32 source should compile: {:?}",
@@ -426,7 +428,8 @@ mod tests {
         let source_f16 = codegen
             .generate(&g, DType::Float16)
             .expect("generate failed");
-        let result_f16 = device.new_library_with_source(&source_f16, &options);
+        let ns_source_f16 = objc2_foundation::NSString::from_str(&source_f16);
+        let result_f16 = device.newLibraryWithSource_options_error(&ns_source_f16, Some(&options));
         assert!(
             result_f16.is_ok(),
             "f16 source should compile: {:?}",

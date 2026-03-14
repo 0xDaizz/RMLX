@@ -27,6 +27,11 @@ use rmlx_core::ops;
 use rmlx_core::ops::buffer_slots::{gemm as gslot, silu_gate as sslot};
 
 use crate::moe::Expert;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{
+    MTLCommandBuffer, MTLCommandQueue, MTLComputePipelineState, MTLDevice, MTLResourceOptions,
+};
+use rmlx_metal::{ComputePass, MTLSize, MtlBuffer};
 
 /// Manages stacked expert weights and provides grouped forward pass.
 ///
@@ -67,7 +72,7 @@ impl ExpertGroup {
     pub fn from_experts(
         experts: &[Expert],
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Self, KernelError> {
         if experts.is_empty() {
             return Err(KernelError::InvalidShape(
@@ -153,7 +158,7 @@ impl ExpertGroup {
         let up_slice_size = hidden_dim * intermediate_dim;
         let down_slice_size = intermediate_dim * hidden_dim;
 
-        let cb = queue.new_command_buffer();
+        let cb = queue.commandBuffer().unwrap();
 
         for (e, expert) in experts.iter().enumerate() {
             let gate_w = expert.gate_proj.weight().unwrap();
@@ -200,63 +205,74 @@ impl ExpertGroup {
             let down_t_contig = ops::copy::copy(registry, &down_t, queue)?;
 
             // Blit contiguous transposed data into the stacked buffer slices
-            let numel_gate = gate_slice_size as u64;
-            let enc = cb.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&pipeline);
+            let numel_gate = gate_slice_size;
+            let raw_enc = cb.computeCommandEncoder().unwrap();
+            let enc = ComputePass::new(&raw_enc);
+            enc.set_pipeline(&pipeline);
             enc.set_buffer(
                 0,
                 Some(gate_t_contig.metal_buffer()),
-                gate_t_contig.offset() as u64,
+                gate_t_contig.offset(),
             );
-            enc.set_buffer(1, Some(gate_stacked.metal_buffer()), gate_dst_offset as u64);
-            let grid = metal::MTLSize::new(numel_gate, 1, 1);
-            let tg = metal::MTLSize::new(
-                std::cmp::min(pipeline.max_total_threads_per_threadgroup(), numel_gate),
-                1,
-                1,
-            );
+            enc.set_buffer(1, Some(gate_stacked.metal_buffer()), gate_dst_offset);
+            let grid = MTLSize {
+                width: numel_gate,
+                height: 1,
+                depth: 1,
+            };
+            let tg = MTLSize {
+                width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), numel_gate),
+                height: 1,
+                depth: 1,
+            };
             enc.dispatch_threads(grid, tg);
-            enc.end_encoding();
+            enc.end();
 
-            let numel_up = up_slice_size as u64;
-            let enc = cb.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&pipeline);
-            enc.set_buffer(
-                0,
-                Some(up_t_contig.metal_buffer()),
-                up_t_contig.offset() as u64,
-            );
-            enc.set_buffer(1, Some(up_stacked.metal_buffer()), up_dst_offset as u64);
-            let grid = metal::MTLSize::new(numel_up, 1, 1);
-            let tg = metal::MTLSize::new(
-                std::cmp::min(pipeline.max_total_threads_per_threadgroup(), numel_up),
-                1,
-                1,
-            );
+            let numel_up = up_slice_size;
+            let raw_enc = cb.computeCommandEncoder().unwrap();
+            let enc = ComputePass::new(&raw_enc);
+            enc.set_pipeline(&pipeline);
+            enc.set_buffer(0, Some(up_t_contig.metal_buffer()), up_t_contig.offset());
+            enc.set_buffer(1, Some(up_stacked.metal_buffer()), up_dst_offset);
+            let grid = MTLSize {
+                width: numel_up,
+                height: 1,
+                depth: 1,
+            };
+            let tg = MTLSize {
+                width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), numel_up),
+                height: 1,
+                depth: 1,
+            };
             enc.dispatch_threads(grid, tg);
-            enc.end_encoding();
+            enc.end();
 
-            let numel_down = down_slice_size as u64;
-            let enc = cb.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&pipeline);
+            let numel_down = down_slice_size;
+            let raw_enc = cb.computeCommandEncoder().unwrap();
+            let enc = ComputePass::new(&raw_enc);
+            enc.set_pipeline(&pipeline);
             enc.set_buffer(
                 0,
                 Some(down_t_contig.metal_buffer()),
-                down_t_contig.offset() as u64,
+                down_t_contig.offset(),
             );
-            enc.set_buffer(1, Some(down_stacked.metal_buffer()), down_dst_offset as u64);
-            let grid = metal::MTLSize::new(numel_down, 1, 1);
-            let tg = metal::MTLSize::new(
-                std::cmp::min(pipeline.max_total_threads_per_threadgroup(), numel_down),
-                1,
-                1,
-            );
+            enc.set_buffer(1, Some(down_stacked.metal_buffer()), down_dst_offset);
+            let grid = MTLSize {
+                width: numel_down,
+                height: 1,
+                depth: 1,
+            };
+            let tg = MTLSize {
+                width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), numel_down),
+                height: 1,
+                depth: 1,
+            };
             enc.dispatch_threads(grid, tg);
-            enc.end_encoding();
+            enc.end();
         }
 
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
 
         Ok(Self {
             gate_weights: gate_stacked,
@@ -293,7 +309,7 @@ impl ExpertGroup {
         &self,
         expert_inputs: &[(usize, &Array)],
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Vec<(usize, Array)>, KernelError> {
         if expert_inputs.is_empty() {
             return Ok(Vec::new());
@@ -386,7 +402,7 @@ impl ExpertGroup {
         }
 
         // ── Single command buffer for ALL experts ──
-        let cb = queue.new_command_buffer();
+        let cb = queue.commandBuffer().unwrap();
 
         for item in &work_items {
             let m = item.batch_size as u32;
@@ -418,7 +434,7 @@ impl ExpertGroup {
 
             // 1. Gate GEMM: [batch, D] @ [D, inter] -> [batch, inter]
             encode_gemm(
-                cb,
+                &cb,
                 &item.input,
                 &gate_w,
                 &item.gate_out,
@@ -431,7 +447,7 @@ impl ExpertGroup {
 
             // 2. Up GEMM: [batch, D] @ [D, inter] -> [batch, inter]
             encode_gemm(
-                cb,
+                &cb,
                 &item.input,
                 &up_w,
                 &item.up_out,
@@ -444,7 +460,7 @@ impl ExpertGroup {
 
             // 3. Fused SwiGLU: silu(gate_out) * up_out -> silu_out
             encode_silu_gate(
-                cb,
+                &cb,
                 &silu_pipeline,
                 &item.gate_out,
                 &item.up_out,
@@ -454,7 +470,7 @@ impl ExpertGroup {
 
             // 4. Down GEMM: [batch, inter] @ [inter, D] -> [batch, D]
             encode_gemm(
-                cb,
+                &cb,
                 &item.silu_out,
                 &down_w,
                 &item.output,
@@ -467,7 +483,7 @@ impl ExpertGroup {
         }
 
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
 
         // Collect results
         let results: Vec<(usize, Array)> = work_items
@@ -506,7 +522,7 @@ impl ExpertGroup {
 /// dimensions via `ops::matmul::select_tile_config`.
 #[allow(clippy::too_many_arguments)]
 fn encode_gemm(
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn MTLCommandBuffer>,
     a: &Array,
     b: &Array,
     c: &Array,
@@ -574,20 +590,21 @@ fn encode_gemm(
     let bsb_buf = make_u32_buf(dev, batch_stride_b);
     let bsc_buf = make_u32_buf(dev, batch_stride_c);
 
-    let bm = tile.bm as u64;
-    let bn = tile.bn as u64;
+    let bm = tile.bm as usize;
+    let bn = tile.bn as usize;
 
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(gslot::A, Some(a.metal_buffer()), a.offset() as u64);
-    enc.set_buffer(gslot::B, Some(b.metal_buffer()), b.offset() as u64);
-    enc.set_buffer(gslot::OUT, Some(c.metal_buffer()), c.offset() as u64);
-    enc.set_buffer(gslot::M, Some(&m_buf), 0);
-    enc.set_buffer(gslot::N, Some(&n_buf), 0);
-    enc.set_buffer(gslot::K, Some(&k_buf), 0);
-    enc.set_buffer(gslot::BATCH_STRIDE_A, Some(&bsa_buf), 0);
-    enc.set_buffer(gslot::BATCH_STRIDE_B, Some(&bsb_buf), 0);
-    enc.set_buffer(gslot::BATCH_STRIDE_C, Some(&bsc_buf), 0);
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
+    enc.set_buffer(gslot::A as u32, Some(a.metal_buffer()), a.offset());
+    enc.set_buffer(gslot::B as u32, Some(b.metal_buffer()), b.offset());
+    enc.set_buffer(gslot::OUT as u32, Some(c.metal_buffer()), c.offset());
+    enc.set_buffer(gslot::M as u32, Some(&m_buf), 0);
+    enc.set_buffer(gslot::N as u32, Some(&n_buf), 0);
+    enc.set_buffer(gslot::K as u32, Some(&k_buf), 0);
+    enc.set_buffer(gslot::BATCH_STRIDE_A as u32, Some(&bsa_buf), 0);
+    enc.set_buffer(gslot::BATCH_STRIDE_B as u32, Some(&bsb_buf), 0);
+    enc.set_buffer(gslot::BATCH_STRIDE_C as u32, Some(&bsc_buf), 0);
 
     // Full, Skinny, and MlxArch kernels require swizzle_log (buffer 9)
     let (swizzle_log, swizzle_log_buf) = if matches!(
@@ -602,30 +619,38 @@ fn encode_gemm(
     ) {
         let s = ops::matmul::compute_swizzle_log(m as usize, n as usize, tile.bm, tile.bn);
         let buf = make_u32_buf(dev, s);
-        enc.set_buffer(gslot::SWIZZLE_LOG, Some(&buf), 0);
+        enc.set_buffer(gslot::SWIZZLE_LOG as u32, Some(&buf), 0);
         (s, Some(buf))
     } else {
         (0, None)
     };
 
     let tg_threads = match tile.variant {
-        ops::matmul::TileVariant::Small => 256_u64,
-        ops::matmul::TileVariant::Medium | ops::matmul::TileVariant::Simd => 1024_u64,
-        ops::matmul::TileVariant::Skinny | ops::matmul::TileVariant::Full => 256_u64,
+        ops::matmul::TileVariant::Small => 256_usize,
+        ops::matmul::TileVariant::Medium | ops::matmul::TileVariant::Simd => 1024_usize,
+        ops::matmul::TileVariant::Skinny | ops::matmul::TileVariant::Full => 256_usize,
         ops::matmul::TileVariant::MlxArch
         | ops::matmul::TileVariant::MlxArchSmall
-        | ops::matmul::TileVariant::MlxArchMicro => 64_u64,
-        ops::matmul::TileVariant::NaxArch => 512_u64,
-        ops::matmul::TileVariant::NaxArch64x128 => 256_u64,
-        ops::matmul::TileVariant::NaxArch64x64 => 128_u64,
+        | ops::matmul::TileVariant::MlxArchMicro => 64_usize,
+        ops::matmul::TileVariant::NaxArch => 512_usize,
+        ops::matmul::TileVariant::NaxArch64x128 => 256_usize,
+        ops::matmul::TileVariant::NaxArch64x64 => 128_usize,
     };
 
-    let grid_x = ((n as u64).div_ceil(bn)) << swizzle_log;
-    let grid_y = ((m as u64).div_ceil(bm)) >> swizzle_log;
-    let grid = metal::MTLSize::new(grid_x, grid_y, 1);
-    let tg = metal::MTLSize::new(tg_threads, 1, 1);
-    enc.dispatch_thread_groups(grid, tg);
-    enc.end_encoding();
+    let grid_x = ((n as usize).div_ceil(bn)) << swizzle_log;
+    let grid_y = ((m as usize).div_ceil(bm)) >> swizzle_log;
+    let grid = MTLSize {
+        width: grid_x,
+        height: grid_y,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: tg_threads,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threadgroups(grid, tg);
+    enc.end();
     drop(swizzle_log_buf);
 
     Ok(())
@@ -633,8 +658,8 @@ fn encode_gemm(
 
 /// Encode fused SwiGLU (silu(gate) * up -> output) into an existing CB.
 fn encode_silu_gate(
-    cb: &metal::CommandBufferRef,
-    pipeline: &metal::ComputePipelineState,
+    cb: &ProtocolObject<dyn MTLCommandBuffer>,
+    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
     gate_out: &Array,
     up_out: &Array,
     output: &Array,
@@ -644,48 +669,60 @@ fn encode_silu_gate(
     let numel = gate_out.numel();
     let numel_buf = make_u32_buf(dev, numel as u32);
 
-    let elems_per_thread: u64 = match gate_out.dtype() {
+    let elems_per_thread: usize = match gate_out.dtype() {
         DType::Float32 => 2,
         _ => 4,
     };
-    let grid_threads = (numel as u64).div_ceil(elems_per_thread);
+    let grid_threads = numel.div_ceil(elems_per_thread);
 
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(pipeline);
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(pipeline);
     enc.set_buffer(
-        sslot::GATE_OUT,
+        sslot::GATE_OUT as u32,
         Some(gate_out.metal_buffer()),
-        gate_out.offset() as u64,
+        gate_out.offset(),
     );
     enc.set_buffer(
-        sslot::UP_OUT,
+        sslot::UP_OUT as u32,
         Some(up_out.metal_buffer()),
-        up_out.offset() as u64,
+        up_out.offset(),
     );
     enc.set_buffer(
-        sslot::OUT,
+        sslot::OUT as u32,
         Some(output.metal_buffer()),
-        output.offset() as u64,
+        output.offset(),
     );
-    enc.set_buffer(sslot::NUMEL, Some(&numel_buf), 0);
+    enc.set_buffer(sslot::NUMEL as u32, Some(&numel_buf), 0);
 
-    let tg = std::cmp::min(pipeline.max_total_threads_per_threadgroup(), grid_threads);
+    let tg = std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), grid_threads);
     enc.dispatch_threads(
-        metal::MTLSize::new(grid_threads, 1, 1),
-        metal::MTLSize::new(tg, 1, 1),
+        MTLSize {
+            width: grid_threads,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg,
+            height: 1,
+            depth: 1,
+        },
     );
-    enc.end_encoding();
+    enc.end();
 
     Ok(())
 }
 
 /// Create a constant `u32` Metal buffer.
-fn make_u32_buf(device: &metal::DeviceRef, val: u32) -> metal::Buffer {
-    device.new_buffer_with_data(
-        &val as *const u32 as *const std::ffi::c_void,
-        4,
-        metal::MTLResourceOptions::StorageModeShared,
-    )
+fn make_u32_buf(device: &ProtocolObject<dyn MTLDevice>, val: u32) -> MtlBuffer {
+    unsafe {
+        device.newBufferWithBytes_length_options(
+            std::ptr::NonNull::new_unchecked(&val as *const u32 as *mut std::ffi::c_void),
+            4,
+            MTLResourceOptions::StorageModeShared,
+        )
+    }
+    .unwrap()
 }
 
 #[cfg(test)]
@@ -694,19 +731,34 @@ mod tests {
     use crate::linear::{Linear, LinearConfig};
     use crate::moe::Expert;
 
+    use std::sync::OnceLock;
+
+    fn test_device() -> Option<&'static rmlx_metal::MtlDevice> {
+        static DEVICE: OnceLock<Option<rmlx_metal::MtlDevice>> = OnceLock::new();
+        DEVICE
+            .get_or_init(|| {
+                objc2::rc::autoreleasepool(|_| objc2_metal::MTLCreateSystemDefaultDevice())
+            })
+            .as_ref()
+    }
+
     /// Create a test `KernelRegistry` with all kernels registered.
-    fn test_registry() -> (metal::Device, metal::CommandQueue, KernelRegistry) {
-        let device = metal::Device::system_default().expect("Metal device required");
-        let queue = device.new_command_queue();
-        let gpu = rmlx_metal::device::GpuDevice::system_default().expect("GPU device required");
+    fn test_registry() -> Option<(
+        &'static rmlx_metal::MtlDevice,
+        rmlx_metal::MtlQueue,
+        KernelRegistry,
+    )> {
+        let device = test_device()?;
+        let gpu = rmlx_metal::device::GpuDevice::system_default().ok()?;
+        let queue = gpu.new_command_queue();
         let registry = KernelRegistry::new(gpu);
         rmlx_core::ops::register_all(&registry).expect("register kernels");
-        (device, queue, registry)
+        Some((device, queue, registry))
     }
 
     /// Create a test expert with known weight values.
     fn make_expert(
-        device: &metal::Device,
+        device: &ProtocolObject<dyn MTLDevice>,
         hidden_dim: usize,
         intermediate_dim: usize,
         val: f32,
@@ -762,13 +814,16 @@ mod tests {
 
     #[test]
     fn test_from_experts_basic() {
-        let (device, queue, registry) = test_registry();
+        let Some((device, queue, registry)) = test_registry() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let hidden_dim = 8;
         let intermediate_dim = 4;
 
         let experts = vec![
-            make_expert(&device, hidden_dim, intermediate_dim, 0.1),
-            make_expert(&device, hidden_dim, intermediate_dim, 0.2),
+            make_expert(device, hidden_dim, intermediate_dim, 0.1),
+            make_expert(device, hidden_dim, intermediate_dim, 0.2),
         ];
 
         let group = ExpertGroup::from_experts(&experts, &registry, &queue);
@@ -791,7 +846,10 @@ mod tests {
 
     #[test]
     fn test_from_experts_empty() {
-        let (_device, queue, registry) = test_registry();
+        let Some((_device, queue, registry)) = test_registry() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let experts: Vec<Expert> = vec![];
         let result = ExpertGroup::from_experts(&experts, &registry, &queue);
         assert!(result.is_err());
@@ -799,10 +857,13 @@ mod tests {
 
     #[test]
     fn test_grouped_forward_empty_inputs() {
-        let (device, queue, registry) = test_registry();
+        let Some((device, queue, registry)) = test_registry() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let experts = vec![
-            make_expert(&device, 8, 4, 0.1),
-            make_expert(&device, 8, 4, 0.2),
+            make_expert(device, 8, 4, 0.1),
+            make_expert(device, 8, 4, 0.2),
         ];
         let group = ExpertGroup::from_experts(&experts, &registry, &queue).unwrap();
 
@@ -813,18 +874,21 @@ mod tests {
 
     #[test]
     fn test_grouped_forward_single_expert() {
-        let (device, queue, registry) = test_registry();
+        let Some((device, queue, registry)) = test_registry() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let hidden_dim = 8;
         let intermediate_dim = 4;
 
         let experts = vec![
-            make_expert(&device, hidden_dim, intermediate_dim, 0.1),
-            make_expert(&device, hidden_dim, intermediate_dim, 0.2),
+            make_expert(device, hidden_dim, intermediate_dim, 0.1),
+            make_expert(device, hidden_dim, intermediate_dim, 0.2),
         ];
         let group = ExpertGroup::from_experts(&experts, &registry, &queue).unwrap();
 
         // Single token to expert 0
-        let input = Array::from_slice(&device, &vec![1.0f32; hidden_dim], vec![1, hidden_dim]);
+        let input = Array::from_slice(device, &vec![1.0f32; hidden_dim], vec![1, hidden_dim]);
 
         let result = group.grouped_forward(&[(0, &input)], &registry, &queue);
         assert!(result.is_ok(), "grouped_forward failed: {:?}", result.err());
@@ -836,20 +900,23 @@ mod tests {
 
     #[test]
     fn test_grouped_forward_multiple_experts() {
-        let (device, queue, registry) = test_registry();
+        let Some((device, queue, registry)) = test_registry() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let hidden_dim = 8;
         let intermediate_dim = 4;
 
         let experts = vec![
-            make_expert(&device, hidden_dim, intermediate_dim, 0.1),
-            make_expert(&device, hidden_dim, intermediate_dim, 0.2),
-            make_expert(&device, hidden_dim, intermediate_dim, 0.3),
+            make_expert(device, hidden_dim, intermediate_dim, 0.1),
+            make_expert(device, hidden_dim, intermediate_dim, 0.2),
+            make_expert(device, hidden_dim, intermediate_dim, 0.3),
         ];
         let group = ExpertGroup::from_experts(&experts, &registry, &queue).unwrap();
 
         // Different batch sizes per expert
-        let input0 = Array::from_slice(&device, &vec![1.0f32; 2 * hidden_dim], vec![2, hidden_dim]);
-        let input2 = Array::from_slice(&device, &vec![0.5f32; 3 * hidden_dim], vec![3, hidden_dim]);
+        let input0 = Array::from_slice(device, &vec![1.0f32; 2 * hidden_dim], vec![2, hidden_dim]);
+        let input2 = Array::from_slice(device, &vec![0.5f32; 3 * hidden_dim], vec![3, hidden_dim]);
 
         let expert_inputs: Vec<(usize, &Array)> = vec![(0, &input0), (2, &input2)];
         let result = group.grouped_forward(&expert_inputs, &registry, &queue);
@@ -865,17 +932,20 @@ mod tests {
 
     #[test]
     fn test_grouped_forward_matches_individual() {
-        let (device, queue, registry) = test_registry();
+        let Some((device, queue, registry)) = test_registry() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let hidden_dim = 8;
         let intermediate_dim = 4;
 
         let experts = vec![
-            make_expert(&device, hidden_dim, intermediate_dim, 0.1),
-            make_expert(&device, hidden_dim, intermediate_dim, 0.2),
+            make_expert(device, hidden_dim, intermediate_dim, 0.1),
+            make_expert(device, hidden_dim, intermediate_dim, 0.2),
         ];
 
         // Run individual expert forward for reference
-        let input = Array::from_slice(&device, &vec![1.0f32; hidden_dim], vec![1, hidden_dim]);
+        let input = Array::from_slice(device, &vec![1.0f32; hidden_dim], vec![1, hidden_dim]);
         let ref_out_0 = experts[0].forward(&input, &registry, &queue).unwrap();
         let ref_out_1 = experts[1].forward(&input, &registry, &queue).unwrap();
         let ref_vals_0: Vec<f32> = ref_out_0.to_vec_checked();
@@ -912,11 +982,14 @@ mod tests {
 
     #[test]
     fn test_grouped_forward_invalid_expert_idx() {
-        let (device, queue, registry) = test_registry();
-        let experts = vec![make_expert(&device, 8, 4, 0.1)];
+        let Some((device, queue, registry)) = test_registry() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let experts = vec![make_expert(device, 8, 4, 0.1)];
         let group = ExpertGroup::from_experts(&experts, &registry, &queue).unwrap();
 
-        let input = Array::from_slice(&device, &[1.0f32; 8], vec![1, 8]);
+        let input = Array::from_slice(device, &[1.0f32; 8], vec![1, 8]);
         // Expert index 5 is out of range (only 1 expert)
         let result = group.grouped_forward(&[(5, &input)], &registry, &queue);
         assert!(result.is_err());
@@ -924,26 +997,32 @@ mod tests {
 
     #[test]
     fn test_grouped_forward_dimension_mismatch() {
-        let (device, queue, registry) = test_registry();
-        let experts = vec![make_expert(&device, 8, 4, 0.1)];
+        let Some((device, queue, registry)) = test_registry() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let experts = vec![make_expert(device, 8, 4, 0.1)];
         let group = ExpertGroup::from_experts(&experts, &registry, &queue).unwrap();
 
         // Wrong hidden dim (16 instead of 8)
-        let input = Array::from_slice(&device, &[1.0f32; 16], vec![1, 16]);
+        let input = Array::from_slice(device, &[1.0f32; 16], vec![1, 16]);
         let result = group.grouped_forward(&[(0, &input)], &registry, &queue);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_weight_stacking_values() {
-        let (device, queue, registry) = test_registry();
+        let Some((device, queue, registry)) = test_registry() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let hidden_dim = 4;
         let intermediate_dim = 2;
 
         // Expert 0: all weights = 0.1, Expert 1: all weights = 0.5
         let experts = vec![
-            make_expert(&device, hidden_dim, intermediate_dim, 0.1),
-            make_expert(&device, hidden_dim, intermediate_dim, 0.5),
+            make_expert(device, hidden_dim, intermediate_dim, 0.1),
+            make_expert(device, hidden_dim, intermediate_dim, 0.5),
         ];
 
         let group = ExpertGroup::from_experts(&experts, &registry, &queue).unwrap();

@@ -21,6 +21,12 @@
 
 use std::sync::{Arc, Mutex};
 
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{
+    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+    MTLComputePipelineState, MTLDevice, MTLLibrary,
+};
+
 use rmlx_rdma::shared_buffer::{ConnectionId, SharedBuffer};
 
 use crate::ep_runtime::{AcquiredBuffer, EpRuntimeContext};
@@ -80,20 +86,18 @@ impl ExchangeBuffers {
 ///
 /// Returns an error if `n` exceeds the buffer's length or the buffer pointer
 /// is null.
-fn read_buffer_bytes(buf: &metal::Buffer, n: usize) -> Result<Vec<u8>, DistributedError> {
-    let buf_len = buf.length() as usize;
+fn read_buffer_bytes(
+    buf: &ProtocolObject<dyn MTLBuffer>,
+    n: usize,
+) -> Result<Vec<u8>, DistributedError> {
+    let buf_len = buf.length();
     if n > buf_len {
         return Err(DistributedError::Protocol(format!(
             "read_buffer_bytes: n={} exceeds buffer length={}",
             n, buf_len
         )));
     }
-    let ptr = buf.contents() as *const u8;
-    if ptr.is_null() {
-        return Err(DistributedError::Protocol(
-            "read_buffer_bytes: buffer contents pointer is null".to_string(),
-        ));
-    }
+    let ptr = buf.contents().as_ptr() as *const u8;
     // SAFETY: bounds checked above; contents() returns a valid CPU-accessible
     // pointer for StorageModeShared buffers, and the command buffer has completed.
     Ok(unsafe { std::slice::from_raw_parts(ptr, n) }.to_vec())
@@ -103,26 +107,24 @@ fn read_buffer_bytes(buf: &metal::Buffer, n: usize) -> Result<Vec<u8>, Distribut
 ///
 /// Returns an error if `n * size_of::<f32>()` exceeds the buffer's byte length
 /// or the buffer pointer is null.
-fn read_buffer_f32(buf: &metal::Buffer, n: usize) -> Result<Vec<f32>, DistributedError> {
+fn read_buffer_f32(
+    buf: &ProtocolObject<dyn MTLBuffer>,
+    n: usize,
+) -> Result<Vec<f32>, DistributedError> {
     let byte_len = n.checked_mul(std::mem::size_of::<f32>()).ok_or_else(|| {
         DistributedError::Protocol(format!(
             "read_buffer_f32: overflow computing byte length for n={}",
             n
         ))
     })?;
-    let buf_len = buf.length() as usize;
+    let buf_len = buf.length();
     if byte_len > buf_len {
         return Err(DistributedError::Protocol(format!(
             "read_buffer_f32: {} bytes (n={}) exceeds buffer length={}",
             byte_len, n, buf_len
         )));
     }
-    let ptr = buf.contents() as *const f32;
-    if ptr.is_null() {
-        return Err(DistributedError::Protocol(
-            "read_buffer_f32: buffer contents pointer is null".to_string(),
-        ));
-    }
+    let ptr = buf.contents().as_ptr() as *const f32;
     // SAFETY: bounds checked above; contents() returns a valid CPU-accessible
     // pointer for StorageModeShared buffers, and the command buffer has completed.
     Ok(unsafe { std::slice::from_raw_parts(ptr, n) }.to_vec())
@@ -735,9 +737,9 @@ impl MoeDispatchConfig {
 
 /// Cached Metal pipeline for route_metal to avoid per-dispatch JIT compilation.
 struct CachedMetalPipeline {
-    device: metal::Device,
-    pipeline: metal::ComputePipelineState,
-    queue: metal::CommandQueue,
+    device: rmlx_metal::MtlDevice,
+    pipeline: rmlx_metal::MtlPipeline,
+    queue: rmlx_metal::MtlQueue,
 }
 
 /// MoE dispatch exchange: routes tokens to the correct expert rank.
@@ -1099,7 +1101,7 @@ impl MoeDispatchExchange {
         expert_weights: &[f32],
         tokens: &rmlx_core::array::Array,
         registry: &rmlx_core::kernels::KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
     ) -> Result<DispatchResult, DistributedError> {
         if !self.config.enable_fp8 {
             return Err(DistributedError::Protocol(
@@ -1233,7 +1235,7 @@ impl MoeDispatchExchange {
             .lock()
             .map_err(|_| DistributedError::Protocol("metal cache mutex poisoned".into()))?;
         if cache_guard.is_none() {
-            let device = match metal::Device::system_default() {
+            let device = match objc2_metal::MTLCreateSystemDefaultDevice() {
                 Some(d) => d,
                 None => {
                     drop(cache_guard);
@@ -1246,8 +1248,11 @@ impl MoeDispatchExchange {
                     );
                 }
             };
-            let options = metal::CompileOptions::new();
-            let library = match device.new_library_with_source(METAL_ROUTE_KERNEL, &options) {
+            let options = objc2_metal::MTLCompileOptions::new();
+            let library = match device.newLibraryWithSource_options_error(
+                &objc2_foundation::NSString::from_str(METAL_ROUTE_KERNEL),
+                Some(&options),
+            ) {
                 Ok(lib) => lib,
                 Err(_) => {
                     drop(cache_guard);
@@ -1260,9 +1265,11 @@ impl MoeDispatchExchange {
                     );
                 }
             };
-            let function = match library.get_function("moe_gather_scatter", None) {
-                Ok(f) => f,
-                Err(_) => {
+            let function = match library
+                .newFunctionWithName(&objc2_foundation::NSString::from_str("moe_gather_scatter"))
+            {
+                Some(f) => f,
+                None => {
                     drop(cache_guard);
                     return self.route_cpu(
                         token_data,
@@ -1273,7 +1280,7 @@ impl MoeDispatchExchange {
                     );
                 }
             };
-            let pipeline = match device.new_compute_pipeline_state_with_function(&function) {
+            let pipeline = match device.newComputePipelineStateWithFunction_error(&function) {
                 Ok(p) => p,
                 Err(_) => {
                     drop(cache_guard);
@@ -1286,7 +1293,7 @@ impl MoeDispatchExchange {
                     );
                 }
             };
-            let queue = device.new_command_queue();
+            let queue = device.newCommandQueue().unwrap();
             *cache_guard = Some(CachedMetalPipeline {
                 device,
                 pipeline,
@@ -1310,26 +1317,38 @@ impl MoeDispatchExchange {
         let src_rank = self.config.group.local_rank() as usize;
 
         // Create buffers using cached device
-        let shared = metal::MTLResourceOptions::StorageModeShared;
-        let token_buf = cached.device.new_buffer_with_data(
-            token_data.as_ptr() as *const std::ffi::c_void,
-            token_data.len() as u64,
-            shared,
-        );
-        let indices_buf = cached.device.new_buffer_with_data(
-            expert_indices.as_ptr() as *const std::ffi::c_void,
-            (expert_indices.len() * 4) as u64,
-            shared,
-        );
-        let output_buf = cached.device.new_buffer(output_size.max(1) as u64, shared);
+        let shared = rmlx_metal::MTLResourceOptions::StorageModeShared;
+        let token_buf = unsafe {
+            cached.device.newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(token_data.as_ptr() as *mut std::ffi::c_void).unwrap(),
+                token_data.len(),
+                shared,
+            )
+        }
+        .unwrap();
+        let indices_buf = unsafe {
+            cached.device.newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(expert_indices.as_ptr() as *mut std::ffi::c_void).unwrap(),
+                expert_indices.len() * 4,
+                shared,
+            )
+        }
+        .unwrap();
+        let output_buf = cached
+            .device
+            .newBufferWithLength_options(output_size.max(1), shared)
+            .unwrap();
         // Per-rank cursors: local_expert_count * world_size
         let cursor_count = local_expert_count * world_size;
         let cursor_data = vec![0u32; cursor_count];
-        let cursor_buf = cached.device.new_buffer_with_data(
-            cursor_data.as_ptr() as *const std::ffi::c_void,
-            (cursor_count * 4).max(4) as u64,
-            shared,
-        );
+        let cursor_buf = unsafe {
+            cached.device.newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(cursor_data.as_ptr() as *mut std::ffi::c_void).unwrap(),
+                (cursor_count * 4).max(4),
+                shared,
+            )
+        }
+        .unwrap();
 
         #[repr(C)]
         struct RouteParams {
@@ -1354,38 +1373,52 @@ impl MoeDispatchExchange {
             world_size: world_size as u32,
             src_rank: src_rank as u32,
         };
-        let params_buf = cached.device.new_buffer_with_data(
-            &params as *const RouteParams as *const std::ffi::c_void,
-            std::mem::size_of::<RouteParams>() as u64,
-            shared,
-        );
+        let params_buf = unsafe {
+            cached.device.newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(&params as *const RouteParams as *mut std::ffi::c_void)
+                    .unwrap(),
+                std::mem::size_of::<RouteParams>(),
+                shared,
+            )
+        }
+        .unwrap();
 
         // Encode and dispatch using cached queue and pipeline
-        let cmd_buf = cached.queue.new_command_buffer();
-        let encoder = cmd_buf.new_compute_command_encoder();
-        encoder.set_compute_pipeline_state(&cached.pipeline);
-        encoder.set_buffer(0, Some(&token_buf), 0);
-        encoder.set_buffer(1, Some(&indices_buf), 0);
-        encoder.set_buffer(2, Some(&output_buf), 0);
-        encoder.set_buffer(3, Some(&cursor_buf), 0);
-        encoder.set_buffer(4, Some(&params_buf), 0);
+        let cmd_buf = cached.queue.commandBuffer().unwrap();
+        let encoder = cmd_buf.computeCommandEncoder().unwrap();
+        encoder.setComputePipelineState(&cached.pipeline);
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(&token_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(&indices_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(&output_buf), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(&cursor_buf), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(&params_buf), 0, 4);
+        }
 
         // D17: 2D grid dispatch (token_stride, batch*top_k, 1) for better GPU
         // utilization. Note: the existing moe_gather_scatter kernel uses 1D tid
         // internally, so we keep grid_y=1 for the legacy kernel but size grid_x
         // to batch*top_k. New D14 kernels use 2D natively.
-        let total_threads = (batch_size * self.config.top_k) as u64;
-        let max_tg = cached.pipeline.max_total_threads_per_threadgroup();
+        let total_threads = batch_size * self.config.top_k;
+        let max_tg = cached.pipeline.maxTotalThreadsPerThreadgroup();
         let tg_size = total_threads.min(max_tg);
 
-        encoder.dispatch_threads(
-            metal::MTLSize::new(total_threads, 1, 1),
-            metal::MTLSize::new(tg_size, 1, 1),
+        encoder.dispatchThreads_threadsPerThreadgroup(
+            rmlx_metal::MTLSize {
+                width: total_threads,
+                height: 1,
+                depth: 1,
+            },
+            rmlx_metal::MTLSize {
+                width: tg_size,
+                height: 1,
+                depth: 1,
+            },
         );
-        encoder.end_encoding();
+        encoder.endEncoding();
         cmd_buf.commit();
         global_counters().record_gpu_sync();
-        cmd_buf.wait_until_completed();
+        cmd_buf.waitUntilCompleted();
 
         // Read output
         if output_size == 0 {
@@ -1476,7 +1509,7 @@ impl MoeDispatchExchange {
         let local_output_ptr = if let Some(ref ring) = self.slab_ring {
             let slab = ring.slab(0);
             if slab.size >= local_buf_size && local_buf_size > 0 {
-                let ptr = slab.metal_buffer.contents() as *mut u8;
+                let ptr = slab.metal_buffer.contents().as_ptr() as *mut u8;
                 // SAFETY: ptr is valid for slab.size bytes (StorageModeShared Metal buffer),
                 // and we checked slab.size >= local_buf_size above.
                 unsafe {
@@ -2746,7 +2779,7 @@ kernel void moe_combine(
             }
         };
         if cache_guard.is_none() {
-            let device = match metal::Device::system_default() {
+            let device = match objc2_metal::MTLCreateSystemDefaultDevice() {
                 Some(d) => d,
                 None => {
                     drop(cache_guard);
@@ -2760,8 +2793,11 @@ kernel void moe_combine(
                     ));
                 }
             };
-            let options = metal::CompileOptions::new();
-            let library = match device.new_library_with_source(kernel_src, &options) {
+            let options = objc2_metal::MTLCompileOptions::new();
+            let library = match device.newLibraryWithSource_options_error(
+                &objc2_foundation::NSString::from_str(kernel_src),
+                Some(&options),
+            ) {
                 Ok(lib) => lib,
                 Err(_) => {
                     drop(cache_guard);
@@ -2775,9 +2811,11 @@ kernel void moe_combine(
                     ));
                 }
             };
-            let function = match library.get_function("moe_combine", None) {
-                Ok(f) => f,
-                Err(_) => {
+            let function = match library
+                .newFunctionWithName(&objc2_foundation::NSString::from_str("moe_combine"))
+            {
+                Some(f) => f,
+                None => {
                     drop(cache_guard);
                     return Ok(self.combine_cpu(
                         expert_outputs,
@@ -2789,7 +2827,7 @@ kernel void moe_combine(
                     ));
                 }
             };
-            let pipeline = match device.new_compute_pipeline_state_with_function(&function) {
+            let pipeline = match device.newComputePipelineStateWithFunction_error(&function) {
                 Ok(p) => p,
                 Err(_) => {
                     drop(cache_guard);
@@ -2803,7 +2841,7 @@ kernel void moe_combine(
                     ));
                 }
             };
-            let queue = device.new_command_queue();
+            let queue = device.newCommandQueue().unwrap();
             *cache_guard = Some(CachedMetalPipeline {
                 device,
                 pipeline,
@@ -2834,26 +2872,36 @@ kernel void moe_combine(
                 .copy_from_slice(&expert_out[..copy_len]);
         }
 
-        let shared = metal::MTLResourceOptions::StorageModeShared;
-        let expert_buf = cached.device.new_buffer_with_data(
-            expert_data.as_ptr() as *const std::ffi::c_void,
-            (expert_data.len() * 4) as u64,
-            shared,
-        );
-        let weights_buf = cached.device.new_buffer_with_data(
-            weights.as_ptr() as *const std::ffi::c_void,
-            (weights.len() * 4) as u64,
-            shared,
-        );
-        let indices_buf = cached.device.new_buffer_with_data(
-            indices.as_ptr() as *const std::ffi::c_void,
-            (indices.len() * 4) as u64,
-            shared,
-        );
+        let shared = rmlx_metal::MTLResourceOptions::StorageModeShared;
+        let expert_buf = unsafe {
+            cached.device.newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(expert_data.as_ptr() as *mut std::ffi::c_void).unwrap(),
+                expert_data.len() * 4,
+                shared,
+            )
+        }
+        .unwrap();
+        let weights_buf = unsafe {
+            cached.device.newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(weights.as_ptr() as *mut std::ffi::c_void).unwrap(),
+                weights.len() * 4,
+                shared,
+            )
+        }
+        .unwrap();
+        let indices_buf = unsafe {
+            cached.device.newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(indices.as_ptr() as *mut std::ffi::c_void).unwrap(),
+                indices.len() * 4,
+                shared,
+            )
+        }
+        .unwrap();
         let output_size = batch_size * hidden_dim;
         let output_buf = cached
             .device
-            .new_buffer((output_size * 4).max(4) as u64, shared);
+            .newBufferWithLength_options((output_size * 4).max(4), shared)
+            .unwrap();
 
         #[repr(C)]
         struct CombineParams {
@@ -2870,36 +2918,50 @@ kernel void moe_combine(
             num_experts: num_experts as u32,
             expert_stride: expert_stride as u32,
         };
-        let params_buf = cached.device.new_buffer_with_data(
-            &params as *const CombineParams as *const std::ffi::c_void,
-            std::mem::size_of::<CombineParams>() as u64,
-            shared,
-        );
+        let params_buf = unsafe {
+            cached.device.newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(&params as *const CombineParams as *mut std::ffi::c_void)
+                    .unwrap(),
+                std::mem::size_of::<CombineParams>(),
+                shared,
+            )
+        }
+        .unwrap();
 
-        let cmd_buf = cached.queue.new_command_buffer();
-        let encoder = cmd_buf.new_compute_command_encoder();
-        encoder.set_compute_pipeline_state(&cached.pipeline);
-        encoder.set_buffer(0, Some(&expert_buf), 0);
-        encoder.set_buffer(1, Some(&weights_buf), 0);
-        encoder.set_buffer(2, Some(&indices_buf), 0);
-        encoder.set_buffer(3, Some(&output_buf), 0);
-        encoder.set_buffer(4, Some(&params_buf), 0);
+        let cmd_buf = cached.queue.commandBuffer().unwrap();
+        let encoder = cmd_buf.computeCommandEncoder().unwrap();
+        encoder.setComputePipelineState(&cached.pipeline);
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(&expert_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(&weights_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(&indices_buf), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(&output_buf), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(&params_buf), 0, 4);
+        }
 
         // D17: The legacy moe_combine kernel uses 1D tid, so we dispatch
         // 1D here for backward compatibility. The new D14/D15/D16 kernels use
         // uint2 tid and are dispatched with 2D grids (D, batch*top_k, 1).
-        let total_threads = output_size as u64;
-        let max_tg = cached.pipeline.max_total_threads_per_threadgroup();
+        let total_threads = output_size;
+        let max_tg = cached.pipeline.maxTotalThreadsPerThreadgroup();
         let tg_size = total_threads.min(max_tg);
 
-        encoder.dispatch_threads(
-            metal::MTLSize::new(total_threads, 1, 1),
-            metal::MTLSize::new(tg_size, 1, 1),
+        encoder.dispatchThreads_threadsPerThreadgroup(
+            rmlx_metal::MTLSize {
+                width: total_threads,
+                height: 1,
+                depth: 1,
+            },
+            rmlx_metal::MTLSize {
+                width: tg_size,
+                height: 1,
+                depth: 1,
+            },
         );
-        encoder.end_encoding();
+        encoder.endEncoding();
         cmd_buf.commit();
         global_counters().record_gpu_sync();
-        cmd_buf.wait_until_completed();
+        cmd_buf.waitUntilCompleted();
 
         read_buffer_f32(&output_buf, output_size)
     }
@@ -3541,14 +3603,26 @@ impl AsyncCombineHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::OnceLock;
+
+    fn test_device() -> Option<&'static rmlx_metal::MtlDevice> {
+        static DEVICE: OnceLock<Option<rmlx_metal::MtlDevice>> = OnceLock::new();
+        DEVICE
+            .get_or_init(|| {
+                objc2::rc::autoreleasepool(|_| objc2_metal::MTLCreateSystemDefaultDevice())
+            })
+            .as_ref()
+    }
 
     #[test]
     fn read_buffer_bytes_oob_returns_error() {
-        let device = match metal::Device::system_default() {
-            Some(d) => d,
-            None => return, // skip on CI without Metal
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
         };
-        let buf = device.new_buffer(64, metal::MTLResourceOptions::StorageModeShared);
+        let buf = device
+            .newBufferWithLength_options(64, rmlx_metal::MTLResourceOptions::StorageModeShared)
+            .unwrap();
         // Requesting more bytes than the buffer holds should return Err.
         let result = read_buffer_bytes(&buf, 128);
         assert!(result.is_err(), "expected error for OOB read");
@@ -3561,11 +3635,13 @@ mod tests {
 
     #[test]
     fn read_buffer_bytes_exact_len_succeeds() {
-        let device = match metal::Device::system_default() {
-            Some(d) => d,
-            None => return,
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
         };
-        let buf = device.new_buffer(64, metal::MTLResourceOptions::StorageModeShared);
+        let buf = device
+            .newBufferWithLength_options(64, rmlx_metal::MTLResourceOptions::StorageModeShared)
+            .unwrap();
         // Reading exactly the buffer length should succeed.
         let result = read_buffer_bytes(&buf, 64);
         assert!(result.is_ok(), "exact-length read should succeed");
@@ -3574,12 +3650,14 @@ mod tests {
 
     #[test]
     fn read_buffer_f32_oob_returns_error() {
-        let device = match metal::Device::system_default() {
-            Some(d) => d,
-            None => return,
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
         };
         // 16 bytes = 4 f32 elements
-        let buf = device.new_buffer(16, metal::MTLResourceOptions::StorageModeShared);
+        let buf = device
+            .newBufferWithLength_options(16, rmlx_metal::MTLResourceOptions::StorageModeShared)
+            .unwrap();
         // Requesting 8 f32s (32 bytes) from a 16-byte buffer should fail.
         let result = read_buffer_f32(&buf, 8);
         assert!(result.is_err(), "expected error for OOB f32 read");
@@ -3592,12 +3670,14 @@ mod tests {
 
     #[test]
     fn read_buffer_f32_exact_len_succeeds() {
-        let device = match metal::Device::system_default() {
-            Some(d) => d,
-            None => return,
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
         };
         // 16 bytes = 4 f32 elements
-        let buf = device.new_buffer(16, metal::MTLResourceOptions::StorageModeShared);
+        let buf = device
+            .newBufferWithLength_options(16, rmlx_metal::MTLResourceOptions::StorageModeShared)
+            .unwrap();
         let result = read_buffer_f32(&buf, 4);
         assert!(result.is_ok(), "exact-length f32 read should succeed");
         assert_eq!(result.unwrap().len(), 4);
@@ -3605,11 +3685,11 @@ mod tests {
 
     #[test]
     fn read_shared_buffer_bytes_oob_returns_error() {
-        let device = match metal::Device::system_default() {
-            Some(d) => d,
-            None => return,
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
         };
-        let shared_buf = match SharedBuffer::new(&device, 64, 0) {
+        let shared_buf = match SharedBuffer::new(device, 64, 0) {
             Ok(b) => b,
             Err(_) => return, // skip if SharedBuffer allocation fails
         };

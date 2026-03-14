@@ -22,6 +22,8 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLCommandBuffer as _, MTLCommandQueue as _, MTLDevice as _};
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::KernelRegistry;
@@ -102,7 +104,11 @@ fn f32_to_f16_bits(val: f32) -> u16 {
     ((sign << 15) | (new_exp as u32) << 10 | (frac >> 13)) as u16
 }
 
-fn rand_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
+fn rand_array(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    shape: &[usize],
+    seed: u64,
+) -> Array {
     let numel: usize = shape.iter().product();
     let mut f16_bytes = Vec::with_capacity(numel * 2);
     let mut state = seed;
@@ -246,8 +252,8 @@ fn scenarios() -> Vec<Scenario> {
 
 fn bench_baseline(
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
-    device: &metal::Device,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
     k: usize,
     n: usize,
     m: usize,
@@ -258,21 +264,21 @@ fn bench_baseline(
     let eps: f32 = 1e-5;
 
     for _ in 0..WARMUP_ITERS {
-        let cb = queue.new_command_buffer_with_unretained_references();
-        let normed = ops::rms_norm::rms_norm_into_cb(registry, &a, Some(&w), eps, cb).unwrap();
-        let _ = ops::matmul::matmul_into_cb(registry, &normed, &b, cb).unwrap();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+        let normed = ops::rms_norm::rms_norm_into_cb(registry, &a, Some(&w), eps, &cb).unwrap();
+        let _ = ops::matmul::matmul_into_cb(registry, &normed, &b, &cb).unwrap();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
     }
 
     let mut times = Vec::with_capacity(BENCH_ITERS);
     for _ in 0..BENCH_ITERS {
         let start = Instant::now();
-        let cb = queue.new_command_buffer_with_unretained_references();
-        let normed = ops::rms_norm::rms_norm_into_cb(registry, &a, Some(&w), eps, cb).unwrap();
-        let _ = ops::matmul::matmul_into_cb(registry, &normed, &b, cb).unwrap();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+        let normed = ops::rms_norm::rms_norm_into_cb(registry, &a, Some(&w), eps, &cb).unwrap();
+        let _ = ops::matmul::matmul_into_cb(registry, &normed, &b, &cb).unwrap();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
         times.push(start.elapsed());
     }
 
@@ -285,8 +291,8 @@ fn bench_baseline(
 
 fn bench_fused(
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
-    device: &metal::Device,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
     k: usize,
     n: usize,
     m: usize,
@@ -298,30 +304,30 @@ fn bench_fused(
 
     // Probe: skip gracefully if unsupported (non-MlxArch tile)
     {
-        let cb = queue.new_command_buffer_with_unretained_references();
-        match ops::matmul::matmul_norm_gemm_into_cb(registry, &a, &b, &w, eps, cb) {
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+        match ops::matmul::matmul_norm_gemm_into_cb(registry, &a, &b, &w, eps, &cb) {
             Ok(_) => {
                 cb.commit();
-                cb.wait_until_completed();
+                cb.waitUntilCompleted();
             }
             Err(_) => return None,
         }
     }
 
     for _ in 1..WARMUP_ITERS {
-        let cb = queue.new_command_buffer_with_unretained_references();
-        let _ = ops::matmul::matmul_norm_gemm_into_cb(registry, &a, &b, &w, eps, cb).unwrap();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+        let _ = ops::matmul::matmul_norm_gemm_into_cb(registry, &a, &b, &w, eps, &cb).unwrap();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
     }
 
     let mut times = Vec::with_capacity(BENCH_ITERS);
     for _ in 0..BENCH_ITERS {
         let start = Instant::now();
-        let cb = queue.new_command_buffer_with_unretained_references();
-        let _ = ops::matmul::matmul_norm_gemm_into_cb(registry, &a, &b, &w, eps, cb).unwrap();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+        let _ = ops::matmul::matmul_norm_gemm_into_cb(registry, &a, &b, &w, eps, &cb).unwrap();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
         times.push(start.elapsed());
     }
 
@@ -426,7 +432,7 @@ fn main() {
     let registry = KernelRegistry::new(gpu);
     ops::register_all(&registry).expect("Failed to register kernels");
     let device = registry.device().raw();
-    let queue = device.new_command_queue();
+    let queue = device.newCommandQueue().unwrap();
 
     let mlx_refs = load_mlx_refs();
     let has_mlx = !mlx_refs.is_empty();

@@ -2,7 +2,6 @@
 //!
 //! KV cache uses pre-allocated buffers with O(1) append (no full-history copy).
 
-use metal::foreign_types::ForeignType;
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::{KernelError, KernelRegistry};
@@ -10,11 +9,12 @@ use rmlx_core::ops;
 
 use crate::linear::{Linear, LinearConfig};
 
-/// Cast a BufferRef to a ResourceRef for use with memory_barrier_with_resources.
-/// Safe because MTLBuffer inherits from MTLResource in ObjC.
-fn buf_as_resource(buf: &metal::BufferRef) -> &metal::ResourceRef {
-    unsafe { &*(buf as *const metal::BufferRef as *const metal::ResourceRef) }
-}
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{
+    MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+    MTLComputePipelineState, MTLDevice, MTLResourceOptions,
+};
+use rmlx_metal::{ComputePass, MTLSize};
 
 // ---------------------------------------------------------------------------
 // KV Cache — pre-allocated, O(1) append
@@ -64,7 +64,7 @@ impl LayerKvCache {
     /// Each KV head gets a single [max_seq_len, head_dim] buffer up-front.
     /// Subsequent `append` calls write into the next slot(s) with no reallocation.
     pub fn preallocated(
-        device: &metal::Device,
+        device: &ProtocolObject<dyn MTLDevice>,
         num_kv_heads: usize,
         head_dim: usize,
         max_seq_len: usize,
@@ -249,7 +249,7 @@ impl LayerKvCache {
         new_values: Vec<Array>,
         new_tokens: usize,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<(), KernelError> {
         if new_keys.len() != self.num_kv_heads || new_values.len() != self.num_kv_heads {
             return Err(KernelError::InvalidShape(format!(
@@ -308,7 +308,7 @@ impl LayerKvCache {
         new_values: Vec<Array>,
         new_tokens: usize,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<(), KernelError> {
         self.validate_cached_inputs(
             &new_keys,
@@ -329,35 +329,36 @@ impl LayerKvCache {
             }
         };
         let pipeline = registry.get_pipeline(copy_kernel, self.keys[0].dtype())?;
-        let count = (new_tokens * self.head_dim) as u64;
+        let count = new_tokens * self.head_dim;
         if count == 0 {
             return Ok(());
         }
 
         // Single command buffer + single encoder for all heads
-        let cb = queue.new_command_buffer();
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pipeline);
+        let cb = queue.commandBuffer().unwrap();
+        let raw_enc = cb.computeCommandEncoder().unwrap();
+        let enc = ComputePass::new(&raw_enc);
+        enc.set_pipeline(&pipeline);
         let dst_row_offset = self.seq_len * self.head_dim * elem_size;
 
-        let grid = metal::MTLSize::new(count, 1, 1);
-        let tg = metal::MTLSize::new(
-            std::cmp::min(pipeline.max_total_threads_per_threadgroup(), count),
-            1,
-            1,
-        );
+        let grid = MTLSize {
+            width: (count),
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: (std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), count)),
+            height: 1,
+            depth: 1,
+        };
 
         for i in 0..self.num_kv_heads {
             // Copy new keys into slot
-            enc.set_buffer(
-                0,
-                Some(new_keys[i].metal_buffer()),
-                new_keys[i].offset() as u64,
-            );
+            enc.set_buffer(0, Some(new_keys[i].metal_buffer()), new_keys[i].offset());
             enc.set_buffer(
                 1,
                 Some(self.keys[i].metal_buffer()),
-                (self.keys[i].offset() + dst_row_offset) as u64,
+                self.keys[i].offset() + dst_row_offset,
             );
             enc.dispatch_threads(grid, tg);
 
@@ -365,19 +366,19 @@ impl LayerKvCache {
             enc.set_buffer(
                 0,
                 Some(new_values[i].metal_buffer()),
-                new_values[i].offset() as u64,
+                new_values[i].offset(),
             );
             enc.set_buffer(
                 1,
                 Some(self.values[i].metal_buffer()),
-                (self.values[i].offset() + dst_row_offset) as u64,
+                self.values[i].offset() + dst_row_offset,
             );
             enc.dispatch_threads(grid, tg);
         }
-        enc.end_encoding();
+        enc.end();
 
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
         Ok(())
     }
 
@@ -394,7 +395,7 @@ impl LayerKvCache {
         new_values: Vec<Array>,
         new_tokens: usize,
         registry: &KernelRegistry,
-        cb: &metal::CommandBufferRef,
+        cb: &ProtocolObject<dyn MTLCommandBuffer>,
     ) -> Result<(), KernelError> {
         if new_keys.len() != self.num_kv_heads || new_values.len() != self.num_kv_heads {
             return Err(KernelError::InvalidShape(format!(
@@ -437,7 +438,7 @@ impl LayerKvCache {
             }
         };
         let pipeline = registry.get_pipeline(copy_kernel, self.keys[0].dtype())?;
-        let count = (new_tokens * self.head_dim) as u64;
+        let count = new_tokens * self.head_dim;
         if count == 0 {
             self.seq_len += new_tokens;
             return Ok(());
@@ -445,43 +446,45 @@ impl LayerKvCache {
 
         let dst_row_offset = self.seq_len * self.head_dim * elem_size;
 
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pipeline);
+        let raw_enc = cb.computeCommandEncoder().unwrap();
+
+        let enc = ComputePass::new(&raw_enc);
+        enc.set_pipeline(&pipeline);
 
         for i in 0..self.num_kv_heads {
             // Copy new keys into slot
-            enc.set_buffer(
-                0,
-                Some(new_keys[i].metal_buffer()),
-                new_keys[i].offset() as u64,
-            );
+            enc.set_buffer(0, Some(new_keys[i].metal_buffer()), new_keys[i].offset());
             enc.set_buffer(
                 1,
                 Some(self.keys[i].metal_buffer()),
-                (self.keys[i].offset() + dst_row_offset) as u64,
+                self.keys[i].offset() + dst_row_offset,
             );
-            let grid = metal::MTLSize::new(count, 1, 1);
-            let tg = metal::MTLSize::new(
-                std::cmp::min(pipeline.max_total_threads_per_threadgroup(), count),
-                1,
-                1,
-            );
+            let grid = MTLSize {
+                width: (count),
+                height: 1,
+                depth: 1,
+            };
+            let tg = MTLSize {
+                width: (std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), count)),
+                height: 1,
+                depth: 1,
+            };
             enc.dispatch_threads(grid, tg);
 
             // Copy new values into slot
             enc.set_buffer(
                 0,
                 Some(new_values[i].metal_buffer()),
-                new_values[i].offset() as u64,
+                new_values[i].offset(),
             );
             enc.set_buffer(
                 1,
                 Some(self.values[i].metal_buffer()),
-                (self.values[i].offset() + dst_row_offset) as u64,
+                self.values[i].offset() + dst_row_offset,
             );
             enc.dispatch_threads(grid, tg);
         }
-        enc.end_encoding();
+        enc.end();
 
         self.seq_len += new_tokens;
         Ok(())
@@ -503,7 +506,7 @@ impl LayerKvCache {
         src_v: &Array,
         new_tokens: usize,
         registry: &KernelRegistry,
-        cb: &metal::CommandBufferRef,
+        cb: &ProtocolObject<dyn MTLCommandBuffer>,
     ) -> Result<(), KernelError> {
         // Check preconditions for the batched path
         let has_slab = self.keys_slab.is_some() && self.values_slab.is_some();
@@ -572,7 +575,7 @@ impl LayerKvCache {
         src_v: &Array,
         new_tokens: usize,
         registry: &KernelRegistry,
-        encoder: &metal::ComputeCommandEncoderRef,
+        encoder: ComputePass<'_>,
     ) -> Result<(), KernelError> {
         let has_slab = self.keys_slab.is_some() && self.values_slab.is_some();
         let is_f16 = !self.keys.is_empty() && self.keys[0].dtype() == DType::Float16;
@@ -637,7 +640,7 @@ impl LayerKvCache {
         new_values: Vec<Array>,
         new_tokens: usize,
         registry: &KernelRegistry,
-        encoder: &metal::ComputeCommandEncoderRef,
+        encoder: ComputePass<'_>,
     ) -> Result<(), KernelError> {
         if new_keys.len() != self.num_kv_heads || new_values.len() != self.num_kv_heads {
             return Err(KernelError::InvalidShape(format!(
@@ -680,7 +683,7 @@ impl LayerKvCache {
             }
         };
         let pipeline = registry.get_pipeline(copy_kernel, self.keys[0].dtype())?;
-        let count = (new_tokens * self.head_dim) as u64;
+        let count = new_tokens * self.head_dim;
         if count == 0 {
             self.seq_len += new_tokens;
             return Ok(());
@@ -688,38 +691,38 @@ impl LayerKvCache {
 
         let dst_row_offset = self.seq_len * self.head_dim * elem_size;
 
-        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_pipeline(&pipeline);
 
         for i in 0..self.num_kv_heads {
             // Copy new keys into slot
-            encoder.set_buffer(
-                0,
-                Some(new_keys[i].metal_buffer()),
-                new_keys[i].offset() as u64,
-            );
+            encoder.set_buffer(0, Some(new_keys[i].metal_buffer()), new_keys[i].offset());
             encoder.set_buffer(
                 1,
                 Some(self.keys[i].metal_buffer()),
-                (self.keys[i].offset() + dst_row_offset) as u64,
+                self.keys[i].offset() + dst_row_offset,
             );
-            let grid = metal::MTLSize::new(count, 1, 1);
-            let tg = metal::MTLSize::new(
-                std::cmp::min(pipeline.max_total_threads_per_threadgroup(), count),
-                1,
-                1,
-            );
+            let grid = MTLSize {
+                width: count,
+                height: 1,
+                depth: 1,
+            };
+            let tg = MTLSize {
+                width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), count),
+                height: 1,
+                depth: 1,
+            };
             encoder.dispatch_threads(grid, tg);
 
             // Copy new values into slot
             encoder.set_buffer(
                 0,
                 Some(new_values[i].metal_buffer()),
-                new_values[i].offset() as u64,
+                new_values[i].offset(),
             );
             encoder.set_buffer(
                 1,
                 Some(self.values[i].metal_buffer()),
-                (self.values[i].offset() + dst_row_offset) as u64,
+                self.values[i].offset() + dst_row_offset,
             );
             encoder.dispatch_threads(grid, tg);
         }
@@ -740,8 +743,8 @@ impl LayerKvCache {
         new_keys: Vec<Array>,
         new_values: Vec<Array>,
         new_tokens: usize,
-        copy_pso: &metal::ComputePipelineState,
-        encoder: &metal::ComputeCommandEncoderRef,
+        copy_pso: &ProtocolObject<dyn MTLComputePipelineState>,
+        encoder: ComputePass<'_>,
     ) -> Result<(), KernelError> {
         if new_keys.len() != self.num_kv_heads || new_values.len() != self.num_kv_heads {
             return Err(KernelError::InvalidShape(format!(
@@ -766,7 +769,7 @@ impl LayerKvCache {
         }
 
         let elem_size = self.keys[0].dtype().size_of();
-        let count = (new_tokens * self.head_dim) as u64;
+        let count = new_tokens * self.head_dim;
         if count == 0 {
             self.seq_len += new_tokens;
             return Ok(());
@@ -774,36 +777,36 @@ impl LayerKvCache {
 
         let dst_row_offset = self.seq_len * self.head_dim * elem_size;
 
-        encoder.set_compute_pipeline_state(copy_pso);
+        encoder.set_pipeline(copy_pso);
 
         for i in 0..self.num_kv_heads {
-            encoder.set_buffer(
-                0,
-                Some(new_keys[i].metal_buffer()),
-                new_keys[i].offset() as u64,
-            );
+            encoder.set_buffer(0, Some(new_keys[i].metal_buffer()), new_keys[i].offset());
             encoder.set_buffer(
                 1,
                 Some(self.keys[i].metal_buffer()),
-                (self.keys[i].offset() + dst_row_offset) as u64,
+                self.keys[i].offset() + dst_row_offset,
             );
-            let grid = metal::MTLSize::new(count, 1, 1);
-            let tg = metal::MTLSize::new(
-                std::cmp::min(copy_pso.max_total_threads_per_threadgroup(), count),
-                1,
-                1,
-            );
+            let grid = MTLSize {
+                width: count,
+                height: 1,
+                depth: 1,
+            };
+            let tg = MTLSize {
+                width: std::cmp::min(copy_pso.maxTotalThreadsPerThreadgroup(), count),
+                height: 1,
+                depth: 1,
+            };
             encoder.dispatch_threads(grid, tg);
 
             encoder.set_buffer(
                 0,
                 Some(new_values[i].metal_buffer()),
-                new_values[i].offset() as u64,
+                new_values[i].offset(),
             );
             encoder.set_buffer(
                 1,
                 Some(self.values[i].metal_buffer()),
-                (self.values[i].offset() + dst_row_offset) as u64,
+                self.values[i].offset() + dst_row_offset,
             );
             encoder.dispatch_threads(grid, tg);
         }
@@ -824,14 +827,14 @@ impl LayerKvCache {
     #[allow(clippy::too_many_arguments)]
     pub fn append_direct_into_encoder(
         &mut self,
-        k_buf: &metal::BufferRef,
+        k_buf: &ProtocolObject<dyn MTLBuffer>,
         k_base_offset: u64,
-        v_buf: &metal::BufferRef,
+        v_buf: &ProtocolObject<dyn MTLBuffer>,
         v_base_offset: u64,
         new_tokens: usize,
-        copy_pso: &metal::ComputePipelineState,
+        copy_pso: &ProtocolObject<dyn MTLComputePipelineState>,
         copy_max_tg: u64,
-        encoder: &metal::ComputeCommandEncoderRef,
+        encoder: ComputePass<'_>,
     ) -> Result<(), KernelError> {
         if self.max_seq_len == 0 {
             return Err(KernelError::InvalidShape(
@@ -847,36 +850,44 @@ impl LayerKvCache {
         }
 
         let elem_size = self.keys[0].dtype().size_of();
-        let count = (new_tokens * self.head_dim) as u64;
+        let count = new_tokens * self.head_dim;
         if count == 0 {
             self.seq_len += new_tokens;
             return Ok(());
         }
 
         let dst_row_offset = self.seq_len * self.head_dim * elem_size;
-        let head_stride = (self.head_dim * elem_size) as u64;
+        let head_stride = self.head_dim * elem_size;
 
-        encoder.set_compute_pipeline_state(copy_pso);
+        encoder.set_pipeline(copy_pso);
 
-        let grid = metal::MTLSize::new(count, 1, 1);
-        let tg = metal::MTLSize::new(std::cmp::min(copy_max_tg, count), 1, 1);
+        let grid = MTLSize {
+            width: count,
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: std::cmp::min(copy_max_tg as usize, count),
+            height: 1,
+            depth: 1,
+        };
 
         for i in 0..self.num_kv_heads {
-            let src_k_off = k_base_offset + (i as u64) * head_stride;
+            let src_k_off = k_base_offset as usize + i * head_stride;
             encoder.set_buffer(0, Some(k_buf), src_k_off);
             encoder.set_buffer(
                 1,
                 Some(self.keys[i].metal_buffer()),
-                (self.keys[i].offset() + dst_row_offset) as u64,
+                self.keys[i].offset() + dst_row_offset,
             );
             encoder.dispatch_threads(grid, tg);
 
-            let src_v_off = v_base_offset + (i as u64) * head_stride;
+            let src_v_off = v_base_offset as usize + i * head_stride;
             encoder.set_buffer(0, Some(v_buf), src_v_off);
             encoder.set_buffer(
                 1,
                 Some(self.values[i].metal_buffer()),
-                (self.values[i].offset() + dst_row_offset) as u64,
+                self.values[i].offset() + dst_row_offset,
             );
             encoder.dispatch_threads(grid, tg);
         }
@@ -981,7 +992,7 @@ impl RotatingKvCache {
     /// `max_size`: total ring-buffer capacity (including the `keep` region).
     /// `keep`: number of initial positions that are never overwritten.
     pub fn new(
-        device: &metal::Device,
+        device: &ProtocolObject<dyn MTLDevice>,
         num_kv_heads: usize,
         head_dim: usize,
         max_size: usize,
@@ -1072,7 +1083,7 @@ impl RotatingKvCache {
         new_values: Vec<Array>,
         new_tokens: usize,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<(), KernelError> {
         if new_keys.len() != self.num_kv_heads || new_values.len() != self.num_kv_heads {
             return Err(KernelError::InvalidShape(format!(
@@ -1140,7 +1151,7 @@ impl RotatingKvCache {
         new_values: Vec<Array>,
         new_tokens: usize,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<(), KernelError> {
         let (keep, ring_start, ring_end) = self._temporal_order();
         let current_len = self.current_len();
@@ -1218,7 +1229,7 @@ impl RotatingKvCache {
         ring_end: usize,
         current_len: usize,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         let dev = registry.device().raw();
         let dtype = buf.dtype();
@@ -1253,66 +1264,80 @@ impl RotatingKvCache {
             }
         };
         let pipeline = registry.get_pipeline(copy_kernel, dtype)?;
-        let cb = queue.new_command_buffer();
+        let cb = queue.commandBuffer().unwrap();
 
         // Part 1: keep region [0..keep]
         if part1_len > 0 {
-            let count = (part1_len * self.head_dim) as u64;
-            let enc = cb.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&pipeline);
-            enc.set_buffer(0, Some(buf.metal_buffer()), buf.offset() as u64);
-            enc.set_buffer(1, Some(result.metal_buffer()), result.offset() as u64);
-            let grid = metal::MTLSize::new(count, 1, 1);
-            let tg = metal::MTLSize::new(
-                std::cmp::min(pipeline.max_total_threads_per_threadgroup(), count),
-                1,
-                1,
-            );
+            let count = part1_len * self.head_dim;
+            let raw_enc = cb.computeCommandEncoder().unwrap();
+            let enc = ComputePass::new(&raw_enc);
+            enc.set_pipeline(&pipeline);
+            enc.set_buffer(0, Some(buf.metal_buffer()), buf.offset());
+            enc.set_buffer(1, Some(result.metal_buffer()), result.offset());
+            let grid = MTLSize {
+                width: (count),
+                height: 1,
+                depth: 1,
+            };
+            let tg = MTLSize {
+                width: (std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), count)),
+                height: 1,
+                depth: 1,
+            };
             enc.dispatch_threads(grid, tg);
-            enc.end_encoding();
+            enc.end();
         }
 
         // Part 2: oldest ring portion [ring_start..ring_end]
         if part2_len > 0 {
-            let count = (part2_len * self.head_dim) as u64;
-            let src_off = (buf.offset() + ring_start * self.head_dim * elem_size) as u64;
-            let dst_off = (result.offset() + part1_len * self.head_dim * elem_size) as u64;
-            let enc = cb.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&pipeline);
+            let count = part2_len * self.head_dim;
+            let src_off = buf.offset() + ring_start * self.head_dim * elem_size;
+            let dst_off = result.offset() + part1_len * self.head_dim * elem_size;
+            let raw_enc = cb.computeCommandEncoder().unwrap();
+            let enc = ComputePass::new(&raw_enc);
+            enc.set_pipeline(&pipeline);
             enc.set_buffer(0, Some(buf.metal_buffer()), src_off);
             enc.set_buffer(1, Some(result.metal_buffer()), dst_off);
-            let grid = metal::MTLSize::new(count, 1, 1);
-            let tg = metal::MTLSize::new(
-                std::cmp::min(pipeline.max_total_threads_per_threadgroup(), count),
-                1,
-                1,
-            );
+            let grid = MTLSize {
+                width: (count),
+                height: 1,
+                depth: 1,
+            };
+            let tg = MTLSize {
+                width: (std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), count)),
+                height: 1,
+                depth: 1,
+            };
             enc.dispatch_threads(grid, tg);
-            enc.end_encoding();
+            enc.end();
         }
 
         // Part 3: newest ring portion [keep..ring_start]
         if part3_len > 0 {
-            let count = (part3_len * self.head_dim) as u64;
-            let src_off = (buf.offset() + keep * self.head_dim * elem_size) as u64;
-            let dst_off =
-                (result.offset() + (part1_len + part2_len) * self.head_dim * elem_size) as u64;
-            let enc = cb.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&pipeline);
+            let count = part3_len * self.head_dim;
+            let src_off = buf.offset() + keep * self.head_dim * elem_size;
+            let dst_off = result.offset() + (part1_len + part2_len) * self.head_dim * elem_size;
+            let raw_enc = cb.computeCommandEncoder().unwrap();
+            let enc = ComputePass::new(&raw_enc);
+            enc.set_pipeline(&pipeline);
             enc.set_buffer(0, Some(buf.metal_buffer()), src_off);
             enc.set_buffer(1, Some(result.metal_buffer()), dst_off);
-            let grid = metal::MTLSize::new(count, 1, 1);
-            let tg = metal::MTLSize::new(
-                std::cmp::min(pipeline.max_total_threads_per_threadgroup(), count),
-                1,
-                1,
-            );
+            let grid = MTLSize {
+                width: (count),
+                height: 1,
+                depth: 1,
+            };
+            let tg = MTLSize {
+                width: (std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), count)),
+                height: 1,
+                depth: 1,
+            };
             enc.dispatch_threads(grid, tg);
-            enc.end_encoding();
+            enc.end();
         }
 
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
         Ok(result)
     }
 
@@ -1326,7 +1351,7 @@ impl RotatingKvCache {
         arr: &Array,
         total: usize,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         let dev = registry.device().raw();
         let dtype = arr.dtype();
@@ -1382,7 +1407,7 @@ impl RotatingKvCache {
         dst_row: usize,
         count: usize,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<(), KernelError> {
         if count == 0 {
             return Ok(());
@@ -1400,26 +1425,31 @@ impl RotatingKvCache {
             }
         };
         let pipeline = registry.get_pipeline(copy_kernel, dst.dtype())?;
-        let num_elems = (count * self.head_dim) as u64;
-        let cb = queue.new_command_buffer();
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pipeline);
-        enc.set_buffer(0, Some(src.metal_buffer()), src.offset() as u64);
+        let num_elems = count * self.head_dim;
+        let cb = queue.commandBuffer().unwrap();
+        let raw_enc = cb.computeCommandEncoder().unwrap();
+        let enc = ComputePass::new(&raw_enc);
+        enc.set_pipeline(&pipeline);
+        enc.set_buffer(0, Some(src.metal_buffer()), src.offset());
         enc.set_buffer(
             1,
             Some(dst.metal_buffer()),
-            (dst.offset() + dst_row * self.head_dim * elem_size) as u64,
+            dst.offset() + dst_row * self.head_dim * elem_size,
         );
-        let grid = metal::MTLSize::new(num_elems, 1, 1);
-        let tg = metal::MTLSize::new(
-            std::cmp::min(pipeline.max_total_threads_per_threadgroup(), num_elems),
-            1,
-            1,
-        );
+        let grid = MTLSize {
+            width: (num_elems),
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: (std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), num_elems)),
+            height: 1,
+            depth: 1,
+        };
         enc.dispatch_threads(grid, tg);
-        enc.end_encoding();
+        enc.end();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
         Ok(())
     }
 
@@ -1431,7 +1461,7 @@ impl RotatingKvCache {
         dst_row: usize,
         new_tokens: usize,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<(), KernelError> {
         self.validate_copy_inputs(new_keys, new_values, "RotatingKvCache::copy_at_index")?;
         let elem_size = self.keys[0].dtype().size_of();
@@ -1447,56 +1477,58 @@ impl RotatingKvCache {
             }
         };
         let pipeline = registry.get_pipeline(copy_kernel, self.keys[0].dtype())?;
-        let count = (new_tokens * self.head_dim) as u64;
+        let count = new_tokens * self.head_dim;
         if count == 0 {
             return Ok(());
         }
 
-        let cb = queue.new_command_buffer();
+        let cb = queue.commandBuffer().unwrap();
         let dst_byte_offset = dst_row * self.head_dim * elem_size;
 
         for i in 0..self.num_kv_heads {
             // Keys
-            let enc = cb.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&pipeline);
-            enc.set_buffer(
-                0,
-                Some(new_keys[i].metal_buffer()),
-                new_keys[i].offset() as u64,
-            );
+            let raw_enc = cb.computeCommandEncoder().unwrap();
+            let enc = ComputePass::new(&raw_enc);
+            enc.set_pipeline(&pipeline);
+            enc.set_buffer(0, Some(new_keys[i].metal_buffer()), new_keys[i].offset());
             enc.set_buffer(
                 1,
                 Some(self.keys[i].metal_buffer()),
-                (self.keys[i].offset() + dst_byte_offset) as u64,
+                self.keys[i].offset() + dst_byte_offset,
             );
-            let grid = metal::MTLSize::new(count, 1, 1);
-            let tg = metal::MTLSize::new(
-                std::cmp::min(pipeline.max_total_threads_per_threadgroup(), count),
-                1,
-                1,
-            );
+            let grid = MTLSize {
+                width: (count),
+                height: 1,
+                depth: 1,
+            };
+            let tg = MTLSize {
+                width: (std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), count)),
+                height: 1,
+                depth: 1,
+            };
             enc.dispatch_threads(grid, tg);
-            enc.end_encoding();
+            enc.end();
 
             // Values
-            let enc = cb.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&pipeline);
+            let raw_enc = cb.computeCommandEncoder().unwrap();
+            let enc = ComputePass::new(&raw_enc);
+            enc.set_pipeline(&pipeline);
             enc.set_buffer(
                 0,
                 Some(new_values[i].metal_buffer()),
-                new_values[i].offset() as u64,
+                new_values[i].offset(),
             );
             enc.set_buffer(
                 1,
                 Some(self.values[i].metal_buffer()),
-                (self.values[i].offset() + dst_byte_offset) as u64,
+                self.values[i].offset() + dst_byte_offset,
             );
             enc.dispatch_threads(grid, tg);
-            enc.end_encoding();
+            enc.end();
         }
 
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
         Ok(())
     }
 
@@ -1509,7 +1541,7 @@ impl RotatingKvCache {
         &self,
         head: usize,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         let (keep, ring_start, ring_end) = self._temporal_order();
         let current_len = self.current_len();
@@ -1533,7 +1565,7 @@ impl RotatingKvCache {
         &self,
         head: usize,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         let (keep, ring_start, ring_end) = self._temporal_order();
         let current_len = self.current_len();
@@ -1574,7 +1606,7 @@ impl BatchKvCache {
         head_dim: usize,
         max_seq_len: usize,
         dtype: DType,
-        device: &metal::Device,
+        device: &ProtocolObject<dyn MTLDevice>,
     ) -> Self {
         let mut caches = Vec::with_capacity(batch_size);
         let offsets = vec![0usize; batch_size];
@@ -1613,7 +1645,7 @@ impl BatchKvCache {
     pub fn reset(
         &mut self,
         batch_idx: usize,
-        device: &metal::Device,
+        device: &ProtocolObject<dyn MTLDevice>,
         num_kv_heads: usize,
         head_dim: usize,
         max_seq_len: usize,
@@ -1667,7 +1699,7 @@ fn concat_seq_dim(
     registry: &KernelRegistry,
     a: &Array,
     b: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     let seq_a = a.shape()[0];
     let seq_b = b.shape()[0];
@@ -1698,45 +1730,55 @@ fn concat_seq_dim(
     };
     let pipeline = registry.get_pipeline(copy_kernel, a.dtype())?;
 
-    let cb = queue.new_command_buffer();
+    let cb = queue.commandBuffer().unwrap();
 
     // Copy a into result[0..seq_a]
-    let a_count = (seq_a * dim) as u64;
+    let a_count = seq_a * dim;
     if a_count > 0 {
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pipeline);
-        enc.set_buffer(0, Some(a.metal_buffer()), a.offset() as u64);
-        enc.set_buffer(1, Some(result.metal_buffer()), result.offset() as u64);
-        let grid = metal::MTLSize::new(a_count, 1, 1);
-        let tg = metal::MTLSize::new(
-            std::cmp::min(pipeline.max_total_threads_per_threadgroup(), a_count),
-            1,
-            1,
-        );
+        let raw_enc = cb.computeCommandEncoder().unwrap();
+        let enc = ComputePass::new(&raw_enc);
+        enc.set_pipeline(&pipeline);
+        enc.set_buffer(0, Some(a.metal_buffer()), a.offset());
+        enc.set_buffer(1, Some(result.metal_buffer()), result.offset());
+        let grid = MTLSize {
+            width: (a_count),
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: (std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), a_count)),
+            height: 1,
+            depth: 1,
+        };
         enc.dispatch_threads(grid, tg);
-        enc.end_encoding();
+        enc.end();
     }
 
     // Copy b into result[seq_a..total_seq]
-    let b_count = (seq_b * dim) as u64;
+    let b_count = seq_b * dim;
     if b_count > 0 {
-        let dst_offset = (result.offset() + seq_a * dim * elem_size) as u64;
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pipeline);
-        enc.set_buffer(0, Some(b.metal_buffer()), b.offset() as u64);
+        let dst_offset = result.offset() + seq_a * dim * elem_size;
+        let raw_enc = cb.computeCommandEncoder().unwrap();
+        let enc = ComputePass::new(&raw_enc);
+        enc.set_pipeline(&pipeline);
+        enc.set_buffer(0, Some(b.metal_buffer()), b.offset());
         enc.set_buffer(1, Some(result.metal_buffer()), dst_offset);
-        let grid = metal::MTLSize::new(b_count, 1, 1);
-        let tg = metal::MTLSize::new(
-            std::cmp::min(pipeline.max_total_threads_per_threadgroup(), b_count),
-            1,
-            1,
-        );
+        let grid = MTLSize {
+            width: (b_count),
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: (std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), b_count)),
+            height: 1,
+            depth: 1,
+        };
         enc.dispatch_threads(grid, tg);
-        enc.end_encoding();
+        enc.end();
     }
 
     cb.commit();
-    cb.wait_until_completed();
+    cb.waitUntilCompleted();
 
     Ok(result)
 }
@@ -1786,7 +1828,7 @@ impl AttentionConfig {
 /// D4-D5 into a caller-supplied encoder without a full GPU barrier.
 pub struct DecodePhase1 {
     /// Roped Q+K buffer (Q portion used for SDPA).
-    pub qk_roped_buf: metal::Buffer,
+    pub qk_roped_buf: rmlx_metal::MtlBuffer,
     /// Byte offset into `qk_roped_buf` where Q starts.
     pub qk_roped_offset: usize,
     /// Q dimension (num_heads * head_dim).
@@ -1879,7 +1921,7 @@ impl Attention {
         mask: Option<&Array>,
         mut cache: Option<&mut LayerKvCache>,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         let seq_len = x.shape()[0];
         let num_heads = self.config.num_heads;
@@ -1888,12 +1930,12 @@ impl Attention {
         let repeats = num_heads / num_kv_heads;
 
         // Project Q, K, V (single command buffer for all 3)
-        let proj_cb = queue.new_command_buffer();
-        let q = self.q_proj.forward_into_cb(x, registry, proj_cb)?;
-        let k = self.k_proj.forward_into_cb(x, registry, proj_cb)?;
-        let v = self.v_proj.forward_into_cb(x, registry, proj_cb)?;
+        let proj_cb = queue.commandBuffer().unwrap();
+        let q = self.q_proj.forward_into_cb(x, registry, &proj_cb)?;
+        let k = self.k_proj.forward_into_cb(x, registry, &proj_cb)?;
+        let v = self.v_proj.forward_into_cb(x, registry, &proj_cb)?;
         proj_cb.commit();
-        proj_cb.wait_until_completed();
+        proj_cb.waitUntilCompleted();
 
         let expected_q_width = num_heads * head_dim;
         let expected_kv_width = num_kv_heads * head_dim;
@@ -2091,25 +2133,30 @@ impl Attention {
             let pipeline = registry.get_pipeline(copy_kernel, q.dtype())?;
             let head_bytes = head_dim * elem_size;
 
-            let cb = queue.new_command_buffer();
+            let cb = queue.commandBuffer().unwrap();
             for (h, head_out) in attn_outputs.iter().enumerate() {
                 let dst_col_offset = h * head_bytes;
-                let enc = cb.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&pipeline);
-                enc.set_buffer(0, Some(head_out.metal_buffer()), head_out.offset() as u64);
-                enc.set_buffer(1, Some(concat.metal_buffer()), dst_col_offset as u64);
-                let count = head_dim as u64;
-                let grid = metal::MTLSize::new(count, 1, 1);
-                let tg = metal::MTLSize::new(
-                    std::cmp::min(pipeline.max_total_threads_per_threadgroup(), count),
-                    1,
-                    1,
-                );
+                let raw_enc = cb.computeCommandEncoder().unwrap();
+                let enc = ComputePass::new(&raw_enc);
+                enc.set_pipeline(&pipeline);
+                enc.set_buffer(0, Some(head_out.metal_buffer()), head_out.offset());
+                enc.set_buffer(1, Some(concat.metal_buffer()), dst_col_offset);
+                let count = head_dim;
+                let grid = MTLSize {
+                    width: (count),
+                    height: 1,
+                    depth: 1,
+                };
+                let tg = MTLSize {
+                    width: (std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), count)),
+                    height: 1,
+                    depth: 1,
+                };
                 enc.dispatch_threads(grid, tg);
-                enc.end_encoding();
+                enc.end();
             }
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
 
             return self.o_proj.forward(&concat, registry, queue);
         }
@@ -2130,25 +2177,30 @@ impl Attention {
                 }
             };
             let pipeline = registry.get_pipeline(copy_kernel, q.dtype())?;
-            let cb = queue.new_command_buffer();
+            let cb = queue.commandBuffer().unwrap();
             for (h, head_out) in attn_outputs.iter().enumerate() {
                 let dst_offset = h * head_elems * elem_size;
-                let enc = cb.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&pipeline);
-                enc.set_buffer(0, Some(head_out.metal_buffer()), head_out.offset() as u64);
-                enc.set_buffer(1, Some(packed.metal_buffer()), dst_offset as u64);
-                let count = head_elems as u64;
-                let grid = metal::MTLSize::new(count, 1, 1);
-                let tg = metal::MTLSize::new(
-                    std::cmp::min(pipeline.max_total_threads_per_threadgroup(), count),
-                    1,
-                    1,
-                );
+                let raw_enc = cb.computeCommandEncoder().unwrap();
+                let enc = ComputePass::new(&raw_enc);
+                enc.set_pipeline(&pipeline);
+                enc.set_buffer(0, Some(head_out.metal_buffer()), head_out.offset());
+                enc.set_buffer(1, Some(packed.metal_buffer()), dst_offset);
+                let count = head_elems;
+                let grid = MTLSize {
+                    width: (count),
+                    height: 1,
+                    depth: 1,
+                };
+                let tg = MTLSize {
+                    width: (std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), count)),
+                    height: 1,
+                    depth: 1,
+                };
                 enc.dispatch_threads(grid, tg);
-                enc.end_encoding();
+                enc.end();
             }
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
         }
         // Single interleave dispatch: [num_heads, seq_len, head_dim] → [seq_len, hidden_size]
         let concat = ops::rope::interleave_heads(registry, &packed, num_heads, seq_len, queue)?;
@@ -2183,7 +2235,7 @@ impl Attention {
         mask: Option<&Array>,
         mut cache: Option<&mut LayerKvCache>,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         let head_dim = self.config.head_dim;
         let seq_len = q.shape()[0];
@@ -2364,25 +2416,30 @@ impl Attention {
             };
             let pipeline = registry.get_pipeline(copy_kernel, q.dtype())?;
             let head_bytes = head_dim * elem_size;
-            let cb = queue.new_command_buffer();
+            let cb = queue.commandBuffer().unwrap();
             for (h, head_out) in attn_outputs.iter().enumerate() {
                 let dst_col_offset = h * head_bytes;
-                let enc = cb.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&pipeline);
-                enc.set_buffer(0, Some(head_out.metal_buffer()), head_out.offset() as u64);
-                enc.set_buffer(1, Some(concat.metal_buffer()), dst_col_offset as u64);
-                let count = head_dim as u64;
-                let grid = metal::MTLSize::new(count, 1, 1);
-                let tg = metal::MTLSize::new(
-                    std::cmp::min(pipeline.max_total_threads_per_threadgroup(), count),
-                    1,
-                    1,
-                );
+                let raw_enc = cb.computeCommandEncoder().unwrap();
+                let enc = ComputePass::new(&raw_enc);
+                enc.set_pipeline(&pipeline);
+                enc.set_buffer(0, Some(head_out.metal_buffer()), head_out.offset());
+                enc.set_buffer(1, Some(concat.metal_buffer()), dst_col_offset);
+                let count = head_dim;
+                let grid = MTLSize {
+                    width: (count),
+                    height: 1,
+                    depth: 1,
+                };
+                let tg = MTLSize {
+                    width: (std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), count)),
+                    height: 1,
+                    depth: 1,
+                };
                 enc.dispatch_threads(grid, tg);
-                enc.end_encoding();
+                enc.end();
             }
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
             Ok(concat)
         } else {
             let head_elems = seq_len * head_dim;
@@ -2400,25 +2457,30 @@ impl Attention {
                     }
                 };
                 let pipeline = registry.get_pipeline(copy_kernel, q.dtype())?;
-                let cb = queue.new_command_buffer();
+                let cb = queue.commandBuffer().unwrap();
                 for (h, head_out) in attn_outputs.iter().enumerate() {
                     let dst_offset = h * head_elems * elem_size;
-                    let enc = cb.new_compute_command_encoder();
-                    enc.set_compute_pipeline_state(&pipeline);
-                    enc.set_buffer(0, Some(head_out.metal_buffer()), head_out.offset() as u64);
-                    enc.set_buffer(1, Some(packed.metal_buffer()), dst_offset as u64);
-                    let count = head_elems as u64;
-                    let grid = metal::MTLSize::new(count, 1, 1);
-                    let tg = metal::MTLSize::new(
-                        std::cmp::min(pipeline.max_total_threads_per_threadgroup(), count),
-                        1,
-                        1,
-                    );
+                    let raw_enc = cb.computeCommandEncoder().unwrap();
+                    let enc = ComputePass::new(&raw_enc);
+                    enc.set_pipeline(&pipeline);
+                    enc.set_buffer(0, Some(head_out.metal_buffer()), head_out.offset());
+                    enc.set_buffer(1, Some(packed.metal_buffer()), dst_offset);
+                    let count = head_elems;
+                    let grid = MTLSize {
+                        width: (count),
+                        height: 1,
+                        depth: 1,
+                    };
+                    let tg = MTLSize {
+                        width: (std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), count)),
+                        height: 1,
+                        depth: 1,
+                    };
                     enc.dispatch_threads(grid, tg);
-                    enc.end_encoding();
+                    enc.end();
                 }
                 cb.commit();
-                cb.wait_until_completed();
+                cb.waitUntilCompleted();
             }
             let concat =
                 ops::rope::interleave_heads(registry, &packed, local_num_heads, seq_len, queue)?;
@@ -2581,7 +2643,7 @@ impl Attention {
     pub fn prepare_weights_for_graph(
         &mut self,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<(), KernelError> {
         self.q_proj.prepare_weight_t(registry, queue)?;
         self.k_proj.prepare_weight_t(registry, queue)?;
@@ -2609,7 +2671,7 @@ impl Attention {
         mask: Option<&Array>,
         mut cache: Option<&mut LayerKvCache>,
         registry: &KernelRegistry,
-        cb: &metal::CommandBufferRef,
+        cb: &ProtocolObject<dyn MTLCommandBuffer>,
     ) -> Result<Array, KernelError> {
         let num_heads = self.config.num_heads;
         let num_kv_heads = self.config.num_kv_heads;
@@ -2751,19 +2813,21 @@ impl Attention {
         let dev = registry.device().raw();
         let concat = Array::zeros(dev, &[1, hidden_size], q.dtype());
         let head_bytes = head_dim * elem_size;
-        let blit = cb.new_blit_command_encoder();
+        let blit = cb.blitCommandEncoder().unwrap();
         for (h, head_out) in attn_outputs.iter().enumerate() {
-            let src_offset = head_out.offset() as u64;
-            let dst_offset = (h * head_bytes) as u64;
-            blit.copy_from_buffer(
-                head_out.metal_buffer(),
-                src_offset,
-                concat.metal_buffer(),
-                dst_offset,
-                head_bytes as u64,
-            );
+            let src_offset = head_out.offset();
+            let dst_offset = h * head_bytes;
+            unsafe {
+                blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                    head_out.metal_buffer(),
+                    src_offset,
+                    concat.metal_buffer(),
+                    dst_offset,
+                    head_bytes,
+                );
+            }
         }
-        blit.end_encoding();
+        blit.endEncoding();
 
         // O projection
         self.o_proj.forward_into_cb(&concat, registry, cb)
@@ -2793,7 +2857,7 @@ impl Attention {
         _mask: Option<&Array>, // unused: all kernels handle causal masking via is_causal FC
         cache: &mut LayerKvCache,
         registry: &KernelRegistry,
-        cb: &metal::CommandBufferRef,
+        cb: &ProtocolObject<dyn MTLCommandBuffer>,
     ) -> Result<Array, KernelError> {
         let num_heads = self.config.num_heads;
         let num_kv_heads = self.config.num_kv_heads;
@@ -2879,8 +2943,8 @@ impl Attention {
 
         if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
             // Check if Q, K, V share the same buffer (merged QKV path)
-            if q.metal_buffer().as_ptr() == k.metal_buffer().as_ptr()
-                && k.metal_buffer().as_ptr() == v.metal_buffer().as_ptr()
+            if std::ptr::eq(q.metal_buffer(), k.metal_buffer())
+                && std::ptr::eq(k.metal_buffer(), v.metal_buffer())
             {
                 // Fused Q+K RoPE + V deinterleave in a single dispatch
                 let qkv_result = ops::rope::rope_qkv_batch_into_cb(
@@ -3147,7 +3211,7 @@ impl Attention {
         _mask: Option<&Array>,
         cache: &mut LayerKvCache,
         registry: &KernelRegistry,
-        encoder: &metal::ComputeCommandEncoderRef,
+        encoder: ComputePass<'_>,
     ) -> Result<Array, KernelError> {
         let num_heads = self.config.num_heads;
         let num_kv_heads = self.config.num_kv_heads;
@@ -3418,7 +3482,10 @@ impl Attention {
     /// Merge Q/K/V projection weights into a single [q_out+k_out+v_out, in_features] matrix.
     ///
     /// Must be called once after weights are loaded and before `forward_decode_9dispatch`.
-    pub fn prepare_merged_qkv(&mut self, device: &metal::Device) -> Result<(), KernelError> {
+    pub fn prepare_merged_qkv(
+        &mut self,
+        device: &ProtocolObject<dyn MTLDevice>,
+    ) -> Result<(), KernelError> {
         let q_w = self.q_proj.weight().ok_or_else(|| {
             KernelError::InvalidShape(
                 "Attention::prepare_merged_qkv: q_proj weight not loaded".into(),
@@ -3468,25 +3535,24 @@ impl Attention {
         let elem_size = q_w.dtype().size_of();
         let total_bytes = total_rows * cols * elem_size;
 
-        let buf = device.new_buffer(
-            total_bytes as u64,
-            metal::MTLResourceOptions::StorageModeShared,
-        );
+        let buf = device
+            .newBufferWithLength_options(total_bytes, MTLResourceOptions::StorageModeShared)
+            .unwrap();
 
         unsafe {
-            let dst = buf.contents() as *mut u8;
+            let dst = buf.contents().as_ptr() as *mut u8;
             // Copy Q weight
-            let q_src = (q_w.metal_buffer().contents() as *const u8).add(q_w.offset());
+            let q_src = (q_w.metal_buffer().contents().as_ptr() as *const u8).add(q_w.offset());
             std::ptr::copy_nonoverlapping(q_src, dst, q_rows * cols * elem_size);
             // Copy K weight
-            let k_src = (k_w.metal_buffer().contents() as *const u8).add(k_w.offset());
+            let k_src = (k_w.metal_buffer().contents().as_ptr() as *const u8).add(k_w.offset());
             std::ptr::copy_nonoverlapping(
                 k_src,
                 dst.add(q_rows * cols * elem_size),
                 k_rows * cols * elem_size,
             );
             // Copy V weight
-            let v_src = (v_w.metal_buffer().contents() as *const u8).add(v_w.offset());
+            let v_src = (v_w.metal_buffer().contents().as_ptr() as *const u8).add(v_w.offset());
             std::ptr::copy_nonoverlapping(
                 v_src,
                 dst.add((q_rows + k_rows) * cols * elem_size),
@@ -3504,12 +3570,11 @@ impl Attention {
 
         // Also create transposed merged weight [cols, total_rows] for prefill GEMM.
         // Column-concatenate the transposed individual weights.
-        let buf_t = device.new_buffer(
-            total_bytes as u64,
-            metal::MTLResourceOptions::StorageModeShared,
-        );
+        let buf_t = device
+            .newBufferWithLength_options(total_bytes, MTLResourceOptions::StorageModeShared)
+            .unwrap();
         unsafe {
-            let dst = buf_t.contents() as *mut u8;
+            let dst = buf_t.contents().as_ptr() as *mut u8;
             // Transpose: dst[col][row] = src[row][col]
             // src is [total_rows, cols], dst is [cols, total_rows]
             let src = self
@@ -3517,7 +3582,8 @@ impl Attention {
                 .as_ref()
                 .unwrap()
                 .metal_buffer()
-                .contents() as *const u8;
+                .contents()
+                .as_ptr() as *const u8;
             for r in 0..total_rows {
                 for c in 0..cols {
                     let src_idx = (r * cols + c) * elem_size;
@@ -3540,7 +3606,11 @@ impl Attention {
     /// Convert all static weights to `StorageModePrivate` (GPU-only).
     ///
     /// Call after loading weights and before the inference loop.
-    pub fn prepare_weights_private(&mut self, device: &metal::Device, queue: &metal::CommandQueue) {
+    pub fn prepare_weights_private(
+        &mut self,
+        device: &ProtocolObject<dyn MTLDevice>,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
+    ) {
         self.q_proj.convert_weights_private(device, queue);
         self.k_proj.convert_weights_private(device, queue);
         self.v_proj.convert_weights_private(device, queue);
@@ -3574,7 +3644,7 @@ impl Attention {
         _mask: Option<&Array>,
         cache: &mut LayerKvCache,
         registry: &KernelRegistry,
-        cb: &metal::CommandBufferRef,
+        cb: &ProtocolObject<dyn MTLCommandBuffer>,
     ) -> Result<Array, KernelError> {
         let num_heads = self.config.num_heads;
         let num_kv_heads = self.config.num_kv_heads;
@@ -3590,7 +3660,8 @@ impl Attention {
         }
 
         // --- Single encoder for dispatches 1-3 (rms_norm, QKV gemv, rope) ---
-        let encoder_a = cb.new_compute_command_encoder();
+        let raw_encoder_a = cb.computeCommandEncoder().unwrap();
+        let encoder_a = ComputePass::new(&raw_encoder_a);
 
         // Dispatch 1: rms_norm
         let x_2d = if x.ndim() == 1 {
@@ -3618,7 +3689,7 @@ impl Attention {
             encoder_a,
         )?;
         // Memory barrier: ensure normed is visible to dispatch 2
-        encoder_a.memory_barrier_with_resources(&[buf_as_resource(normed.metal_buffer())]);
+        rmlx_metal::memory_barrier_scope_buffers(encoder_a.raw());
 
         // Dispatch 2: merged QKV gemv
         let qkv_weight = self.qkv_merged_weight.as_ref().ok_or_else(|| {
@@ -3650,7 +3721,7 @@ impl Attention {
         let (qk_roped_buf, qk_roped_offset, v_buf, v_offset);
         if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
             // Memory barrier: ensure qkv is visible to dispatch 3
-            encoder_a.memory_barrier_with_resources(&[buf_as_resource(qkv.metal_buffer())]);
+            rmlx_metal::memory_barrier_scope_buffers(encoder_a.raw());
             let qk_3d = Array::new(
                 qkv.metal_buffer().to_owned(),
                 vec![total_rope_heads, 1, head_dim],
@@ -3683,7 +3754,7 @@ impl Attention {
         }
 
         // Memory barrier: ensure rope output visible to KV copy
-        encoder_a.memory_barrier_with_resources(&[buf_as_resource(&qk_roped_buf)]);
+        rmlx_metal::memory_barrier_scope_buffers(encoder_a.raw());
 
         let k_roped_flat_offset = qk_roped_offset + q_dim * elem_size;
 
@@ -3709,10 +3780,11 @@ impl Attention {
         cache.append_into_encoder(k_heads, v_heads, 1, registry, encoder_a)?;
 
         // End encoder A after KV append (no separate blit encoder needed)
-        encoder_a.end_encoding();
+        encoder_a.end();
 
         // --- Single encoder for dispatches 4-5 (SDPA, O_proj+residual) ---
-        let encoder_b = cb.new_compute_command_encoder();
+        let raw_encoder_b = cb.computeCommandEncoder().unwrap();
+        let encoder_b = ComputePass::new(&raw_encoder_b);
 
         // Dispatch 4: batched SDPA decode (all heads, 1 dispatch)
         let k_slab = cache.keys_slab_view().ok_or_else(|| {
@@ -3749,7 +3821,7 @@ impl Attention {
         )?;
         // attn_out is [num_heads * head_dim] = [hidden_size] flat
         // Memory barrier: ensure attn_out is visible to dispatch 5
-        encoder_b.memory_barrier_with_resources(&[buf_as_resource(attn_out.metal_buffer())]);
+        rmlx_metal::memory_barrier_scope_buffers(encoder_b.raw());
 
         // Dispatch 5: gemv_bias(W_o, attn, x) — O_proj + residual add fused
         let o_weight = self.o_proj.weight().ok_or_else(|| {
@@ -3772,7 +3844,7 @@ impl Attention {
         let h =
             ops::gemv::gemv_bias_into_encoder(registry, o_weight, &attn_vec, &x_vec, encoder_b)?;
 
-        encoder_b.end_encoding();
+        encoder_b.end();
 
         // Return as [1, hidden_size]
         Ok(Array::new(
@@ -3799,7 +3871,7 @@ impl Attention {
         _mask: Option<&Array>,
         cache: &mut LayerKvCache,
         registry: &KernelRegistry,
-        cb: &metal::CommandBufferRef,
+        cb: &ProtocolObject<dyn MTLCommandBuffer>,
     ) -> Result<DecodePhase1, KernelError> {
         let num_heads = self.config.num_heads;
         let num_kv_heads = self.config.num_kv_heads;
@@ -3814,7 +3886,8 @@ impl Attention {
         }
 
         // --- Encoder A: dispatches 1-3 (rms_norm, QKV gemv, rope) ---
-        let encoder_a = cb.new_compute_command_encoder();
+        let raw_encoder_a = cb.computeCommandEncoder().unwrap();
+        let encoder_a = ComputePass::new(&raw_encoder_a);
 
         let x_2d = if x.ndim() == 1 {
             Array::new(
@@ -3840,7 +3913,7 @@ impl Attention {
             rms_norm_eps,
             encoder_a,
         )?;
-        encoder_a.memory_barrier_with_resources(&[buf_as_resource(normed.metal_buffer())]);
+        rmlx_metal::memory_barrier_scope_buffers(encoder_a.raw());
 
         let qkv_weight = self.qkv_merged_weight.as_ref().ok_or_else(|| {
             KernelError::InvalidShape(
@@ -3864,7 +3937,7 @@ impl Attention {
 
         let (qk_roped_buf, qk_roped_offset, v_buf, v_offset);
         if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
-            encoder_a.memory_barrier_with_resources(&[buf_as_resource(qkv.metal_buffer())]);
+            rmlx_metal::memory_barrier_scope_buffers(encoder_a.raw());
             let qk_3d = Array::new(
                 qkv.metal_buffer().to_owned(),
                 vec![total_rope_heads, 1, head_dim],
@@ -3895,7 +3968,7 @@ impl Attention {
         }
 
         // Memory barrier: ensure rope output visible to KV copy
-        encoder_a.memory_barrier_with_resources(&[buf_as_resource(&qk_roped_buf)]);
+        rmlx_metal::memory_barrier_scope_buffers(encoder_a.raw());
 
         // KV cache blit
         let k_roped_flat_offset = qk_roped_offset + q_dim * elem_size;
@@ -3919,7 +3992,7 @@ impl Attention {
         }
         cache.append_into_encoder(k_heads, v_heads, 1, registry, encoder_a)?;
 
-        encoder_a.end_encoding();
+        encoder_a.end();
 
         Ok(DecodePhase1 {
             qk_roped_buf,
@@ -3944,7 +4017,7 @@ impl Attention {
         phase1: &DecodePhase1,
         cache: &LayerKvCache,
         registry: &KernelRegistry,
-        encoder: &metal::ComputeCommandEncoderRef,
+        encoder: ComputePass<'_>,
     ) -> Result<Array, KernelError> {
         let num_heads = self.config.num_heads;
         let num_kv_heads = self.config.num_kv_heads;
@@ -3983,7 +4056,7 @@ impl Attention {
             scale,
             encoder,
         )?;
-        encoder.memory_barrier_with_resources(&[buf_as_resource(attn_out.metal_buffer())]);
+        rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
 
         // D5: gemv_bias(W_o, attn, x) — O_proj + residual
         let o_weight = self.o_proj.weight().ok_or_else(|| {
@@ -4020,7 +4093,7 @@ impl Attention {
         _mask: Option<&Array>,
         cache: &mut LayerKvCache,
         registry: &KernelRegistry,
-        cb: &metal::CommandBufferRef,
+        cb: &ProtocolObject<dyn MTLCommandBuffer>,
     ) -> Result<Array, KernelError> {
         let num_heads = self.config.num_heads;
         let num_kv_heads = self.config.num_kv_heads;
@@ -4036,7 +4109,8 @@ impl Attention {
         }
 
         // --- Single encoder for dispatches 1-3 (rms_norm, QKV gemv, rope) ---
-        let encoder_a = rmlx_metal::new_concurrent_encoder(cb);
+        let raw_encoder_a = rmlx_metal::new_concurrent_encoder(cb);
+        let encoder_a = ComputePass::new(&raw_encoder_a);
 
         // Dispatch 1: rms_norm
         let x_2d = if x.ndim() == 1 {
@@ -4064,7 +4138,7 @@ impl Attention {
             encoder_a,
         )?;
         // Memory barrier: ensure normed is visible to dispatch 2
-        rmlx_metal::memory_barrier_scope_buffers(encoder_a);
+        rmlx_metal::memory_barrier_scope_buffers(encoder_a.raw());
 
         // Dispatch 2: merged QKV gemv
         let qkv_weight = self.qkv_merged_weight.as_ref().ok_or_else(|| {
@@ -4096,7 +4170,7 @@ impl Attention {
         let (qk_roped_buf, qk_roped_offset, v_buf, v_offset);
         if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
             // Memory barrier: ensure qkv is visible to dispatch 3
-            rmlx_metal::memory_barrier_scope_buffers(encoder_a);
+            rmlx_metal::memory_barrier_scope_buffers(encoder_a.raw());
             let qk_3d = Array::new(
                 qkv.metal_buffer().to_owned(),
                 vec![total_rope_heads, 1, head_dim],
@@ -4129,7 +4203,7 @@ impl Attention {
         }
 
         // End encoder A before cache append (which creates its own encoders)
-        encoder_a.end_encoding();
+        encoder_a.end();
 
         let k_roped_flat_offset = qk_roped_offset + q_dim * elem_size;
 
@@ -4155,7 +4229,8 @@ impl Attention {
         cache.append_into_cb(k_heads, v_heads, 1, registry, cb)?;
 
         // --- Single encoder for dispatches 4-5 (SDPA, O_proj+residual) ---
-        let encoder_b = rmlx_metal::new_concurrent_encoder(cb);
+        let raw_encoder_b = rmlx_metal::new_concurrent_encoder(cb);
+        let encoder_b = ComputePass::new(&raw_encoder_b);
 
         // Dispatch 4: batched SDPA decode (all heads, 1 dispatch)
         let k_slab = cache.keys_slab_view().ok_or_else(|| {
@@ -4192,7 +4267,7 @@ impl Attention {
         )?;
         // attn_out is [num_heads * head_dim] = [hidden_size] flat
         // Memory barrier: ensure attn_out is visible to dispatch 5
-        rmlx_metal::memory_barrier_scope_buffers(encoder_b);
+        rmlx_metal::memory_barrier_scope_buffers(encoder_b.raw());
 
         // Dispatch 5: gemv_bias(W_o, attn, x) — O_proj + residual add fused
         let o_weight = self.o_proj.weight().ok_or_else(|| {
@@ -4215,7 +4290,7 @@ impl Attention {
         let h =
             ops::gemv::gemv_bias_into_encoder(registry, o_weight, &attn_vec, &x_vec, encoder_b)?;
 
-        encoder_b.end_encoding();
+        encoder_b.end();
 
         // Return as [1, hidden_size]
         Ok(Array::new(
@@ -4381,7 +4456,7 @@ impl QuantizedKvCache {
         new_values: Vec<Array>,
         new_tokens: usize,
         registry: &KernelRegistry,
-        _queue: &metal::CommandQueue,
+        _queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<(), KernelError> {
         self.validate_layer(layer, "QuantizedKvCache::append")?;
         if new_keys.len() != self.num_kv_heads || new_values.len() != self.num_kv_heads {
@@ -4594,7 +4669,7 @@ fn quantize_to_affine(
     input: &Array,
     group_size: u32,
     bits: u32,
-    device: &metal::Device,
+    device: &ProtocolObject<dyn MTLDevice>,
 ) -> Result<QuantizedArray, KernelError> {
     let shape = input.shape();
     if shape.len() != 2 {
@@ -4703,7 +4778,7 @@ fn scale_scores(
     scores: &Array,
     scale: f32,
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     let dev = registry.device().raw();
     // Try scalar broadcast: create [1] scalar and rely on broadcasting
@@ -4751,7 +4826,7 @@ impl Attention {
         sin_freqs: Option<&Array>,
         cache: &mut LayerKvCache,
         registry: &KernelRegistry,
-        encoder: &metal::ComputeCommandEncoderRef,
+        encoder: ComputePass<'_>,
         stop_after: usize,
     ) -> Result<Array, KernelError> {
         let num_heads = self.config.num_heads;
@@ -5023,7 +5098,7 @@ impl Attention {
         sin_freqs: Option<&Array>,
         cache: &mut LayerKvCache,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<(Array, Vec<(&'static str, std::time::Duration)>), KernelError> {
         use std::time::Instant;
 
@@ -5044,12 +5119,17 @@ impl Attention {
 
         // ---- Dispatch 1: RMSNorm (pre-attention) ----
         let normed = {
-            let cb = queue.new_command_buffer();
+            let cb = queue.commandBuffer().unwrap();
             let start = Instant::now();
-            let out =
-                ops::rms_norm::rms_norm_into_cb(registry, x, Some(norm_weight), rms_norm_eps, cb)?;
+            let out = ops::rms_norm::rms_norm_into_cb(
+                registry,
+                x,
+                Some(norm_weight),
+                rms_norm_eps,
+                &*cb,
+            )?;
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
             timings.push(("RMSNorm (pre-attn)", start.elapsed()));
             out
         };
@@ -5062,11 +5142,11 @@ impl Attention {
         };
 
         let (q, k, v) = {
-            let cb = queue.new_command_buffer();
+            let cb = queue.commandBuffer().unwrap();
             let start = Instant::now();
-            let qkv = ops::matmul::matmul_into_cb(registry, &normed_2d, qkv_wt, cb)?;
+            let qkv = ops::matmul::matmul_into_cb(registry, &normed_2d, qkv_wt, &*cb)?;
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
             timings.push(("QKV Merged GEMM", start.elapsed()));
             let total_out = q_dim + k_dim + v_dim;
             let elem_size = qkv.dtype().size_of();
@@ -5099,11 +5179,11 @@ impl Attention {
         let q_row_stride = q.strides()[0];
 
         let (q_batched, k_batched, v_batched) = {
-            let cb = queue.new_command_buffer();
+            let cb = queue.commandBuffer().unwrap();
             let start = Instant::now();
             let result = if let (Some(cos), Some(sin)) = (cos_freqs, sin_freqs) {
-                if q.metal_buffer().as_ptr() == k.metal_buffer().as_ptr()
-                    && k.metal_buffer().as_ptr() == v.metal_buffer().as_ptr()
+                if std::ptr::eq(q.metal_buffer(), k.metal_buffer())
+                    && std::ptr::eq(k.metal_buffer(), v.metal_buffer())
                 {
                     ops::rope::rope_qkv_batch_into_cb(
                         registry,
@@ -5115,7 +5195,7 @@ impl Attention {
                         head_dim,
                         rope_offset,
                         q_row_stride,
-                        cb,
+                        &*cb,
                     )?
                 } else {
                     let q_b = ops::rope::rope_multihead_into_cb(
@@ -5126,7 +5206,7 @@ impl Attention {
                         num_heads,
                         rope_offset,
                         q.strides()[0],
-                        cb,
+                        &*cb,
                     )?;
                     let k_b = ops::rope::rope_multihead_into_cb(
                         registry,
@@ -5136,14 +5216,14 @@ impl Attention {
                         num_kv_heads,
                         rope_offset,
                         k.strides()[0],
-                        cb,
+                        &*cb,
                     )?;
                     let v_b = ops::rope::deinterleave_heads_into_cb(
                         registry,
                         &v,
                         num_kv_heads,
                         v.strides()[0],
-                        cb,
+                        &*cb,
                     )?;
                     (q_b, k_b, v_b)
                 }
@@ -5153,26 +5233,26 @@ impl Attention {
                     &q,
                     num_heads,
                     q.strides()[0],
-                    cb,
+                    &*cb,
                 )?;
                 let k_b = ops::rope::deinterleave_heads_into_cb(
                     registry,
                     &k,
                     num_kv_heads,
                     k.strides()[0],
-                    cb,
+                    &*cb,
                 )?;
                 let v_b = ops::rope::deinterleave_heads_into_cb(
                     registry,
                     &v,
                     num_kv_heads,
                     v.strides()[0],
-                    cb,
+                    &*cb,
                 )?;
                 (q_b, k_b, v_b)
             };
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
             timings.push(("RoPE Q+K + V deinterleave", start.elapsed()));
             result
         };
@@ -5192,10 +5272,10 @@ impl Attention {
             );
             (k_view, v_view, None, seq_len)
         } else {
-            let cache_cb = queue.new_command_buffer();
-            cache.append_batched_into_cb(&k_batched, &v_batched, seq_len, registry, cache_cb)?;
+            let cache_cb = queue.commandBuffer().unwrap();
+            cache.append_batched_into_cb(&k_batched, &v_batched, seq_len, registry, &*cache_cb)?;
             cache_cb.commit();
-            cache_cb.wait_until_completed();
+            cache_cb.waitUntilCompleted();
             let total_seq = cache.seq_len;
             let k_slab = cache.keys_slab_view().ok_or_else(|| {
                 KernelError::InvalidShape("breakdown: cache has no slab layout".into())
@@ -5217,7 +5297,7 @@ impl Attention {
         let use_mma_bk32 = is_f16_d128 && !use_nax && total_seq >= 256;
 
         let attn_slab = {
-            let cb = queue.new_command_buffer();
+            let cb = queue.commandBuffer().unwrap();
             let start = Instant::now();
             let slab = if use_nax {
                 ops::sdpa::sdpa_prefill_nax_f16_into_cb(
@@ -5235,7 +5315,7 @@ impl Attention {
                     true,
                     None,
                     None,
-                    cb,
+                    &*cb,
                 )?
             } else if use_mma_bk32 {
                 ops::sdpa::sdpa_prefill_mma_bk32_f16_into_cb(
@@ -5254,7 +5334,7 @@ impl Attention {
                     true,
                     None,
                     None,
-                    cb,
+                    &*cb,
                 )?
             } else if is_f16_d128 {
                 ops::sdpa::sdpa_prefill_mma_f16_into_cb(
@@ -5273,7 +5353,7 @@ impl Attention {
                     true,
                     None,
                     None,
-                    cb,
+                    &*cb,
                 )?
             } else {
                 ops::sdpa::sdpa_prefill_gqa_slab_into_cb(
@@ -5290,11 +5370,11 @@ impl Attention {
                     None,
                     scale,
                     true,
-                    cb,
+                    &*cb,
                 )?
             };
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
             timings.push(("SDPA", start.elapsed()));
             slab
         };
@@ -5307,11 +5387,11 @@ impl Attention {
 
         // ---- Dispatch 5: O Projection ----
         let o_out = {
-            let cb = queue.new_command_buffer();
+            let cb = queue.commandBuffer().unwrap();
             let start = Instant::now();
-            let out = self.o_proj.forward_into_cb(&concat, registry, cb)?;
+            let out = self.o_proj.forward_into_cb(&concat, registry, &*cb)?;
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
             timings.push(("O Projection", start.elapsed()));
             out
         };
@@ -5327,18 +5407,37 @@ impl Attention {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use objc2_metal::MTLCreateSystemDefaultDevice;
+    use std::sync::OnceLock;
 
-    fn setup() -> (metal::Device, KernelRegistry, metal::CommandQueue) {
-        let device = metal::Device::system_default().expect("no Metal device");
-        let gpu = rmlx_metal::device::GpuDevice::system_default().expect("no GpuDevice");
-        let queue = device.new_command_queue();
+    fn test_device() -> Option<&'static rmlx_metal::MtlDevice> {
+        static DEVICE: OnceLock<Option<rmlx_metal::MtlDevice>> = OnceLock::new();
+        DEVICE
+            .get_or_init(|| objc2::rc::autoreleasepool(|_| MTLCreateSystemDefaultDevice()))
+            .as_ref()
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn setup() -> Option<(
+        &'static rmlx_metal::MtlDevice,
+        KernelRegistry,
+        objc2::rc::Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    )> {
+        let device = test_device()?;
+        let gpu = rmlx_metal::device::GpuDevice::system_default().ok()?;
+        let queue = device.newCommandQueue()?;
         let registry = KernelRegistry::new(gpu);
         ops::copy::register(&registry).expect("failed to register copy kernels");
-        (device, registry, queue)
+        Some((device, registry, queue))
     }
 
     /// Helper: create an Array from a flat f32 slice with shape [rows, cols].
-    fn make_array(device: &metal::Device, data: &[f32], rows: usize, cols: usize) -> Array {
+    fn make_array(
+        device: &ProtocolObject<dyn MTLDevice>,
+        data: &[f32],
+        rows: usize,
+        cols: usize,
+    ) -> Array {
         assert_eq!(data.len(), rows * cols);
         Array::from_slice(device, data, vec![rows, cols])
     }
@@ -5350,13 +5449,17 @@ mod tests {
 
     #[test]
     fn test_kv_cache_dtype_mismatch() {
-        if metal::Device::system_default().is_none() {
+        let Some(_) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
             return;
-        }
-        let (device, registry, queue) = setup();
-        let mut cache = LayerKvCache::preallocated(&device, 1, 4, 8, DType::Float32);
-        let bad_k = Array::zeros(&device, &[1, 4], DType::Float16);
-        let good_v = Array::zeros(&device, &[1, 4], DType::Float32);
+        };
+        let Some((device, registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let mut cache = LayerKvCache::preallocated(device, 1, 4, 8, DType::Float32);
+        let bad_k = Array::zeros(device, &[1, 4], DType::Float16);
+        let good_v = Array::zeros(device, &[1, 4], DType::Float32);
         let result = cache.append(vec![bad_k], vec![good_v], 1, &registry, &queue);
         assert!(result.is_err());
         assert!(format!("{:?}", result.unwrap_err()).contains("dtype"));
@@ -5364,13 +5467,17 @@ mod tests {
 
     #[test]
     fn test_kv_cache_head_dim_mismatch() {
-        if metal::Device::system_default().is_none() {
+        let Some(_) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
             return;
-        }
-        let (device, registry, queue) = setup();
-        let mut cache = LayerKvCache::preallocated(&device, 1, 4, 8, DType::Float32);
-        let bad_k = Array::zeros(&device, &[1, 8], DType::Float32);
-        let good_v = Array::zeros(&device, &[1, 4], DType::Float32);
+        };
+        let Some((device, registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let mut cache = LayerKvCache::preallocated(device, 1, 4, 8, DType::Float32);
+        let bad_k = Array::zeros(device, &[1, 8], DType::Float32);
+        let good_v = Array::zeros(device, &[1, 4], DType::Float32);
         let result = cache.append(vec![bad_k], vec![good_v], 1, &registry, &queue);
         assert!(result.is_err());
         assert!(format!("{:?}", result.unwrap_err()).contains("head_dim"));
@@ -5378,13 +5485,17 @@ mod tests {
 
     #[test]
     fn test_kv_cache_seq_dim_mismatch() {
-        if metal::Device::system_default().is_none() {
+        let Some(_) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
             return;
-        }
-        let (device, registry, queue) = setup();
-        let mut cache = LayerKvCache::preallocated(&device, 1, 4, 8, DType::Float32);
-        let bad_k = Array::zeros(&device, &[2, 4], DType::Float32);
-        let bad_v = Array::zeros(&device, &[2, 4], DType::Float32);
+        };
+        let Some((device, registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let mut cache = LayerKvCache::preallocated(device, 1, 4, 8, DType::Float32);
+        let bad_k = Array::zeros(device, &[2, 4], DType::Float32);
+        let bad_v = Array::zeros(device, &[2, 4], DType::Float32);
         let result = cache.append(vec![bad_k], vec![bad_v], 1, &registry, &queue);
         assert!(result.is_err());
         assert!(format!("{:?}", result.unwrap_err()).contains("seq"));
@@ -5406,15 +5517,19 @@ mod tests {
 
     #[test]
     fn test_quantized_kv_cache_head_out_of_bounds() {
-        if metal::Device::system_default().is_none() {
+        let Some(_) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
             return;
-        }
-        let (device, registry, queue) = setup();
+        };
+        let Some((device, registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let mut cache = QuantizedKvCache::new(2, 2, 128, 64, 8);
-        let k0 = Array::zeros(&device, &[1, 128], DType::Float32);
-        let k1 = Array::zeros(&device, &[1, 128], DType::Float32);
-        let v0 = Array::zeros(&device, &[1, 128], DType::Float32);
-        let v1 = Array::zeros(&device, &[1, 128], DType::Float32);
+        let k0 = Array::zeros(device, &[1, 128], DType::Float32);
+        let k1 = Array::zeros(device, &[1, 128], DType::Float32);
+        let v0 = Array::zeros(device, &[1, 128], DType::Float32);
+        let v1 = Array::zeros(device, &[1, 128], DType::Float32);
         cache
             .append(0, vec![k0, k1], vec![v0, v1], 1, &registry, &queue)
             .unwrap();
@@ -5426,12 +5541,15 @@ mod tests {
 
     #[test]
     fn test_legacy_first_append_dtype_mismatch() {
-        let (device, registry, queue) = setup();
+        let Some((device, registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let mut cache = LayerKvCache::new(2);
-        let k0 = Array::zeros(&device, &[1, 4], DType::Float32);
-        let k1 = Array::zeros(&device, &[1, 4], DType::Float16);
-        let v0 = Array::zeros(&device, &[1, 4], DType::Float32);
-        let v1 = Array::zeros(&device, &[1, 4], DType::Float32);
+        let k0 = Array::zeros(device, &[1, 4], DType::Float32);
+        let k1 = Array::zeros(device, &[1, 4], DType::Float16);
+        let v0 = Array::zeros(device, &[1, 4], DType::Float32);
+        let v1 = Array::zeros(device, &[1, 4], DType::Float32);
         let result = cache.append(vec![k0, k1], vec![v0, v1], 1, &registry, &queue);
         assert!(result.is_err());
         assert!(format!("{:?}", result.unwrap_err()).contains("dtype"));
@@ -5439,12 +5557,15 @@ mod tests {
 
     #[test]
     fn test_legacy_first_append_head_dim_mismatch() {
-        let (device, registry, queue) = setup();
+        let Some((device, registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let mut cache = LayerKvCache::new(2);
-        let k0 = Array::zeros(&device, &[1, 4], DType::Float32);
-        let k1 = Array::zeros(&device, &[1, 8], DType::Float32);
-        let v0 = Array::zeros(&device, &[1, 4], DType::Float32);
-        let v1 = Array::zeros(&device, &[1, 4], DType::Float32);
+        let k0 = Array::zeros(device, &[1, 4], DType::Float32);
+        let k1 = Array::zeros(device, &[1, 8], DType::Float32);
+        let v0 = Array::zeros(device, &[1, 4], DType::Float32);
+        let v1 = Array::zeros(device, &[1, 4], DType::Float32);
         let result = cache.append(vec![k0, k1], vec![v0, v1], 1, &registry, &queue);
         assert!(result.is_err());
         assert!(format!("{:?}", result.unwrap_err()).contains("head_dim"));
@@ -5452,10 +5573,13 @@ mod tests {
 
     #[test]
     fn test_legacy_first_append_not_2d() {
-        let (device, registry, queue) = setup();
+        let Some((device, registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let mut cache = LayerKvCache::new(1);
-        let k = Array::from_slice(&device, &[1.0f32, 2.0, 3.0, 4.0], vec![4]);
-        let v = Array::zeros(&device, &[1, 4], DType::Float32);
+        let k = Array::from_slice(device, &[1.0f32, 2.0, 3.0, 4.0], vec![4]);
+        let v = Array::zeros(device, &[1, 4], DType::Float32);
         let result = cache.append(vec![k], vec![v], 1, &registry, &queue);
         assert!(result.is_err());
         assert!(format!("{:?}", result.unwrap_err()).contains("2D"));
@@ -5463,10 +5587,13 @@ mod tests {
 
     #[test]
     fn test_legacy_first_append_seq_mismatch() {
-        let (device, registry, queue) = setup();
+        let Some((device, registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let mut cache = LayerKvCache::new(1);
-        let k = Array::zeros(&device, &[3, 4], DType::Float32);
-        let v = Array::zeros(&device, &[3, 4], DType::Float32);
+        let k = Array::zeros(device, &[3, 4], DType::Float32);
+        let v = Array::zeros(device, &[3, 4], DType::Float32);
         let result = cache.append(vec![k], vec![v], 1, &registry, &queue);
         assert!(result.is_err());
         assert!(format!("{:?}", result.unwrap_err()).contains("seq"));
@@ -5476,14 +5603,18 @@ mod tests {
 
     #[test]
     fn test_quantized_kv_cache_head_dim_mismatch() {
-        if metal::Device::system_default().is_none() {
+        let Some(_) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
             return;
-        }
-        let (device, registry, queue) = setup();
+        };
+        let Some((device, registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let mut cache = QuantizedKvCache::new(2, 1, 128, 64, 8);
         // Wrong head_dim: 64 instead of 128
-        let k = Array::zeros(&device, &[1, 64], DType::Float32);
-        let v = Array::zeros(&device, &[1, 128], DType::Float32);
+        let k = Array::zeros(device, &[1, 64], DType::Float32);
+        let v = Array::zeros(device, &[1, 128], DType::Float32);
         let result = cache.append(0, vec![k], vec![v], 1, &registry, &queue);
         assert!(result.is_err());
         assert!(format!("{:?}", result.unwrap_err()).contains("head_dim"));
@@ -5491,13 +5622,17 @@ mod tests {
 
     #[test]
     fn test_quantized_kv_cache_not_2d() {
-        if metal::Device::system_default().is_none() {
+        let Some(_) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
             return;
-        }
-        let (device, registry, queue) = setup();
+        };
+        let Some((device, registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let mut cache = QuantizedKvCache::new(2, 1, 128, 64, 8);
-        let k = Array::from_slice(&device, &vec![0.0f32; 128], vec![128]);
-        let v = Array::zeros(&device, &[1, 128], DType::Float32);
+        let k = Array::from_slice(device, &vec![0.0f32; 128], vec![128]);
+        let v = Array::zeros(device, &[1, 128], DType::Float32);
         let result = cache.append(0, vec![k], vec![v], 1, &registry, &queue);
         assert!(result.is_err());
         assert!(format!("{:?}", result.unwrap_err()).contains("2D"));
@@ -5505,14 +5640,18 @@ mod tests {
 
     #[test]
     fn test_quantized_kv_cache_seq_mismatch() {
-        if metal::Device::system_default().is_none() {
+        let Some(_) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
             return;
-        }
-        let (device, registry, queue) = setup();
+        };
+        let Some((device, registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let mut cache = QuantizedKvCache::new(2, 1, 128, 64, 8);
         // Say 3 tokens but array has 2 rows
-        let k = Array::zeros(&device, &[2, 128], DType::Float32);
-        let v = Array::zeros(&device, &[2, 128], DType::Float32);
+        let k = Array::zeros(device, &[2, 128], DType::Float32);
+        let v = Array::zeros(device, &[2, 128], DType::Float32);
         let result = cache.append(0, vec![k], vec![v], 3, &registry, &queue);
         assert!(result.is_err());
         assert!(format!("{:?}", result.unwrap_err()).contains("seq"));
@@ -5524,11 +5663,14 @@ mod tests {
     /// For keep=0: expected = last min(N, M) tokens
     /// For keep>0: expected = first `keep` tokens + last min(N-keep, M-keep) ring tokens
     fn check_rotating_cache(max_size: usize, keep: usize, total_tokens: usize, head_dim: usize) {
-        let (device, registry, queue) = setup();
+        let Some((device, registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let num_kv_heads = 1;
 
         let mut cache = RotatingKvCache::new(
-            &device,
+            device,
             num_kv_heads,
             head_dim,
             max_size,
@@ -5543,8 +5685,8 @@ mod tests {
             let token_data: Vec<f32> = vec![val; head_dim];
             all_tokens.push(token_data.clone());
 
-            let k_arr = make_array(&device, &token_data, 1, head_dim);
-            let v_arr = make_array(&device, &token_data, 1, head_dim);
+            let k_arr = make_array(device, &token_data, 1, head_dim);
+            let v_arr = make_array(device, &token_data, 1, head_dim);
             cache
                 .append(vec![k_arr], vec![v_arr], 1, &registry, &queue)
                 .expect("append failed");
@@ -5701,15 +5843,18 @@ mod tests {
 
     #[test]
     fn test_rotating_cache_multi_token_no_wrap() {
-        let (device, registry, queue) = setup();
+        let Some((device, registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let max_size = 8;
         let head_dim = 4;
-        let mut cache = RotatingKvCache::new(&device, 1, head_dim, max_size, 0, DType::Float32);
+        let mut cache = RotatingKvCache::new(device, 1, head_dim, max_size, 0, DType::Float32);
 
         // Append 3 tokens at once
         let data: Vec<f32> = (1..=12).map(|x| x as f32).collect();
-        let k = make_array(&device, &data, 3, head_dim);
-        let v = make_array(&device, &data, 3, head_dim);
+        let k = make_array(device, &data, 3, head_dim);
+        let v = make_array(device, &data, 3, head_dim);
         cache
             .append(vec![k], vec![v], 3, &registry, &queue)
             .expect("append failed");
@@ -5724,17 +5869,20 @@ mod tests {
 
     #[test]
     fn test_rotating_cache_multi_token_wrapping() {
-        let (device, registry, queue) = setup();
+        let Some((device, registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let max_size = 4;
         let head_dim = 2;
-        let mut cache = RotatingKvCache::new(&device, 1, head_dim, max_size, 0, DType::Float32);
+        let mut cache = RotatingKvCache::new(device, 1, head_dim, max_size, 0, DType::Float32);
 
         // Fill to capacity with single tokens
         for t in 0..4 {
             let val = (t + 1) as f32;
             let data = vec![val; head_dim];
-            let k = make_array(&device, &data, 1, head_dim);
-            let v = make_array(&device, &data, 1, head_dim);
+            let k = make_array(device, &data, 1, head_dim);
+            let v = make_array(device, &data, 1, head_dim);
             cache
                 .append(vec![k], vec![v], 1, &registry, &queue)
                 .expect("append failed");
@@ -5742,8 +5890,8 @@ mod tests {
 
         // Now append 3 more tokens (wraps via linearize_and_append)
         let new_data: Vec<f32> = vec![5.0, 5.0, 6.0, 6.0, 7.0, 7.0];
-        let k = make_array(&device, &new_data, 3, head_dim);
-        let v = make_array(&device, &new_data, 3, head_dim);
+        let k = make_array(device, &new_data, 3, head_dim);
+        let v = make_array(device, &new_data, 3, head_dim);
         cache
             .append(vec![k], vec![v], 3, &registry, &queue)
             .expect("append failed");
@@ -5760,13 +5908,16 @@ mod tests {
 
     #[test]
     fn test_rotating_cache_offset_monotonic() {
-        let (device, registry, queue) = setup();
-        let mut cache = RotatingKvCache::new(&device, 1, 2, 4, 0, DType::Float32);
+        let Some((device, registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let mut cache = RotatingKvCache::new(device, 1, 2, 4, 0, DType::Float32);
 
         for t in 0..10 {
             let data = vec![(t + 1) as f32; 2];
-            let k = make_array(&device, &data, 1, 2);
-            let v = make_array(&device, &data, 1, 2);
+            let k = make_array(device, &data, 1, 2);
+            let v = make_array(device, &data, 1, 2);
             cache
                 .append(vec![k], vec![v], 1, &registry, &queue)
                 .expect("append failed");
@@ -5776,13 +5927,16 @@ mod tests {
 
     #[test]
     fn test_rotating_cache_current_len() {
-        let (device, registry, queue) = setup();
-        let mut cache = RotatingKvCache::new(&device, 1, 2, 4, 0, DType::Float32);
+        let Some((device, registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let mut cache = RotatingKvCache::new(device, 1, 2, 4, 0, DType::Float32);
 
         for t in 0..10 {
             let data = vec![(t + 1) as f32; 2];
-            let k = make_array(&device, &data, 1, 2);
-            let v = make_array(&device, &data, 1, 2);
+            let k = make_array(device, &data, 1, 2);
+            let v = make_array(device, &data, 1, 2);
             cache
                 .append(vec![k], vec![v], 1, &registry, &queue)
                 .expect("append failed");
@@ -5792,11 +5946,11 @@ mod tests {
 
     #[test]
     fn test_layer_kv_cache_trim() {
-        if metal::Device::system_default().is_none() {
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
             return;
-        }
-        let device = metal::Device::system_default().unwrap();
-        let mut cache = LayerKvCache::preallocated(&device, 2, 4, 32, DType::Float32);
+        };
+        let mut cache = LayerKvCache::preallocated(device, 2, 4, 32, DType::Float32);
 
         // Simulate appending 10 tokens by setting seq_len directly.
         cache.seq_len = 10;

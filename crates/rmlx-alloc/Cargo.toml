@@ -7,8 +7,8 @@ license.workspace = true
 
 [features]
 ## Enable Metal 3 residency set management (M3+ devices).
-## Uses objc msg_send! to call MTLResidencySet APIs directly.
-metal3 = ["dep:objc"]
+## Uses objc2-metal MTLResidencySet bindings.
+metal3 = []
 ## Forward tracked_hazards to rmlx-metal so all allocator buffers use
 ## Metal's automatic hazard tracking instead of untracked mode.
 tracked_hazards = ["rmlx-metal/tracked_hazards"]
@@ -16,5 +16,6 @@ tracked_hazards = ["rmlx-metal/tracked_hazards"]
 [dependencies]
 rmlx-metal = { path = "../rmlx-metal" }
 libc = { workspace = true }
-objc = { workspace = true, optional = true }
+objc2 = { workspace = true }
+objc2-metal = { workspace = true, features = ["MTLAllocation", "MTLResidencySet"] }
 tracing = { workspace = true }

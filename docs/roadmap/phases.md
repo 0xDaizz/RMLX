@@ -1,6 +1,6 @@
 # Implementation Roadmap — Phases 0-9B + S1-S5 + Audit Remediation + Phase 3 + Phase 4 + Phase 5 Complete + Phase KO + Phase 8c + Phase 9 + Phase 10 + Phase 11 + Phase A + Phase B + Phase C + Phase D + Phase F + Phase G + Phase H + Phase I + Phase J
 
-The rmlx project implementation roadmap. All phases through 9B-opt and serving support phases S1-S5 are complete. A full-crate audit (Phases 0, 1, 2) has been completed with 76 remediation items resolved across all 6 crates. Phase 3 adds FlashAttention-2 Metal kernel, paged KV cache, continuous batching scheduler, centralized CB commit, f16/bf16 RDMA collectives, ring allreduce chunk rounding fix, MoePolicy thread safety, and CLI signal forwarding. Phase 4 adds performance and allocator improvements: atomic CAS allocation limits, pointer ownership validation, SmallBufferPool/LeakDetector/ResidencyManager wiring, ChipTuning per-generation GPU tuning, DiskPipelineCache with sha2 hashing, HazardTrackingModeUntracked, fused RMSNorm+residual add kernel, gather_mm batched MoE strategy, SlabRing condvar backpressure, ProgressEngine EP dispatch wiring, ICB sparse expert dispatch, and BFC-style allocator. Phase 5 (Feature Breadth) adds 5 new core ops (slice, sort, scan, argreduce, random), 11 new activations (16 total), full MLA and SlidingWindowAttention forward implementations, AWQ/GPTQ/K-quant quantization layers, prefix cache, chunked prefill, 3 full model architectures (Qwen2Model, DeepSeekV3Model, MixtralModel), tree allreduce with auto selection, pipelined ring buffer, and topology-aware CLI backend selection. Current test count: 1,142+. Phase 8c adds CachedDecode with pre-resolved PSOs and pre-allocated scratch buffers, 2-encoder decode path, `_preresolved_into_encoder` pattern, and GEMV BM8 optimizations (barrier removal + widened f32 loads), achieving 714 us/layer at 60L depth (f16, 6x lower variance). Phase 10 (Kernel Fusion) adds fused_rms_gemv and fused_swiglu_down kernels, reducing the decode pipeline from 9 to 7 dispatches, achieving 703.4 us/layer. Phase 11 (GEMV Kernel Optimization Experiments) concluded that all kernel-level optimization attempts failed (col-major +84%, interleaved +2.2%, SRAM+f16+funcconst +3.6%); row-major BM8 GEMV with f32 accumulation at 705 us/layer is the practical floor for f16 decode on Apple Silicon (73.6% bandwidth efficiency). Phase A (Prefill Optimization) adds single-CB prefill pipeline (54 sync points to 1), GQA slab SDPA (32 per-head dispatches to 1), GEMM threadgroup swizzle, new ops matmul_into_cb and silu_into_cb, achieving 3.5-7.3x speedup over baseline with MLX parity within 1.2-3.4x. Current test count: 1,298. Phase B (GEMM Config Sweep) systematically tests 27 kernel variants across 3 sweeps, confirming bk32_2x4 (BM=64, BN=64, BK=32, SG=2x4, 256 threads) as optimal — 21.54T TFLOPS vs MLX 23.97T (-10.1% gap). Phase C (GEMM Kernel-Level Optimization) applies wide_load and SG=2x4 layout to production kernels, reaching 21.21T (-11.5% gap). Phase D2 (MLX-Architecture Kernel) achieves **23.82T TFLOPS** (MLX gap: -0.6%) via BK=16, 2 SG, 64 threads, single buffer, 4xhalf4 wide loads, direct store, serpentine MMA. Phase F (Infrastructure Optimization) adds dispatch overhead benchmark (176us/CB, 12.4%), DiskPipelineCache wiring, and GatherMM MMA upgrade (4-12x for MoE). Phase G (Quantized Kernel Optimization) upgrades QMM to MMA (Q4/Q8), QMV to qdot pattern, and removes CPU fallback. Phase H-2 (GEMM+Residual Epilogue Fusion) achieves 5-12% improvement for large N via function constant 202. Phase I-1 (Distributed TP) adds DistributedTransformerModel with forward_with_group and shard_for_tp, achieving 1.94x estimated speedup at TP=2. Phase J (Quantized Parity + Infrastructure) closes QMM gap from 4.78x to 2.55x (+73%), QMV gap to 1.15x (+37%), removes 32 ExecGraph inter-layer stalls, adds FusionCompiler (lazy.rs -> FusionAnalyzer -> codegen -> Metal JIT), RMSNorm+GEMM fusion (function constant 203, -40.5%), Split-K QMM, MoE fused kernels, and forward_auto() for eager+lazy hybrid dispatch.
+The rmlx project implementation roadmap. All phases through 9B-opt and serving support phases S1-S5 are complete. A full-crate audit (Phases 0, 1, 2) has been completed with 76 remediation items resolved across all 6 crates. Phase 3 adds FlashAttention-2 Metal kernel, paged KV cache, continuous batching scheduler, centralized CB commit, f16/bf16 RDMA collectives, ring allreduce chunk rounding fix, MoePolicy thread safety, and CLI signal forwarding. Phase 4 adds performance and allocator improvements: atomic CAS allocation limits, pointer ownership validation, SmallBufferPool/LeakDetector/ResidencyManager wiring, ChipTuning per-generation GPU tuning, DiskPipelineCache with sha2 hashing, HazardTrackingModeUntracked, fused RMSNorm+residual add kernel, gather_mm batched MoE strategy, SlabRing condvar backpressure, ProgressEngine EP dispatch wiring, ICB sparse expert dispatch, and BFC-style allocator. Phase 5 (Feature Breadth) adds 5 new core ops (slice, sort, scan, argreduce, random), 11 new activations (16 total), full MLA and SlidingWindowAttention forward implementations, AWQ/GPTQ/K-quant quantization layers, prefix cache, chunked prefill, 3 full model architectures (Qwen2Model, DeepSeekV3Model, MixtralModel), tree allreduce with auto selection, pipelined ring buffer, and topology-aware CLI backend selection. Current test count: 1,142+. Phase 8c adds CachedDecode with pre-resolved PSOs and pre-allocated scratch buffers, 2-encoder decode path, `_preresolved_into_encoder` pattern, and GEMV BM8 optimizations (barrier removal + widened f32 loads), achieving 714 us/layer at 60L depth (f16, 6x lower variance). Phase 10 (Kernel Fusion) adds fused_rms_gemv and fused_swiglu_down kernels, reducing the decode pipeline from 9 to 7 dispatches, achieving 699.3 us/layer. Phase 11 (GEMV Kernel Optimization Experiments) concluded that all kernel-level optimization attempts failed (col-major +84%, interleaved +2.2%, SRAM+f16+funcconst +3.6%); row-major BM8 GEMV with f32 accumulation at 705 us/layer is the practical floor for f16 decode on Apple Silicon (73.6% bandwidth efficiency). Phase A (Prefill Optimization) adds single-CB prefill pipeline (54 sync points to 1), GQA slab SDPA (32 per-head dispatches to 1), GEMM threadgroup swizzle, new ops matmul_into_cb and silu_into_cb, achieving 3.5-7.3x speedup over baseline with MLX parity within 1.2-3.4x. Current test count: 1,298. Phase B (GEMM Config Sweep) systematically tests 27 kernel variants across 3 sweeps, confirming bk32_2x4 (BM=64, BN=64, BK=32, SG=2x4, 256 threads) as optimal — 21.54T TFLOPS vs MLX 23.97T (-10.1% gap). Phase C (GEMM Kernel-Level Optimization) applies wide_load and SG=2x4 layout to production kernels, reaching 21.21T (-11.5% gap). Phase D2 (MLX-Architecture Kernel) achieves **24.05T TFLOPS** (MLX parity surpassed: +0.3%) via BK=16, 2 SG, 64 threads, single buffer, 4xhalf4 wide loads, direct store, serpentine MMA. PR#77-79 further optimize prefill SDPA parity (QMM Q4 M=512: 17.43T, +28% vs MLX), NAX GEMM, and Rust dispatch overhead, culminating in FP16 GEMM 24.05T and decode 699.3 us/layer. PR#80 adds speculative decoding framework primitives. The objc2-metal migration (M-1) replaces metal-rs with the objc2-metal ecosystem, and Metal 4 API integration (M-2) adds feature-gated Metal 4 support. Phase F (Infrastructure Optimization) adds dispatch overhead benchmark (176us/CB, 12.4%), DiskPipelineCache wiring, and GatherMM MMA upgrade (4-12x for MoE). Phase G (Quantized Kernel Optimization) upgrades QMM to MMA (Q4/Q8), QMV to qdot pattern, and removes CPU fallback. Phase H-2 (GEMM+Residual Epilogue Fusion) achieves 5-12% improvement for large N via function constant 202. Phase I-1 (Distributed TP) adds DistributedTransformerModel with forward_with_group and shard_for_tp, achieving 1.94x estimated speedup at TP=2. Phase J (Quantized Parity + Infrastructure) closes QMM gap from 4.78x to 2.55x (+73%), QMV gap to 1.15x (+37%), removes 32 ExecGraph inter-layer stalls, adds FusionCompiler (lazy.rs -> FusionAnalyzer -> codegen -> Metal JIT), RMSNorm+GEMM fusion (function constant 203, -40.5%), Split-K QMM, MoE fused kernels, and forward_auto() for eager+lazy hybrid dispatch.
 
 ---
 
@@ -8,7 +8,7 @@ The rmlx project implementation roadmap. All phases through 9B-opt and serving s
 
 | Phase | Name | Key Content | Prerequisites | Status |
 |:-----:|------|------------|:------------:|:------:|
-| 0 | Scaffolding | Workspace, metal-rs wrappers, CI | -- | Complete |
+| 0 | Scaffolding | Workspace, objc2-metal wrappers, CI | -- | Complete |
 | 1 | Zero-Copy + RDMA | ZeroCopyBuffer, DualRegPool, ibverbs FFI, blocking_exchange | Phase 0 | Complete |
 | 1-hotfix | IbvSendWr FFI Layout Fix | FFI layout fix | Phase 1 | Complete |
 | 2A | Metal Compute Foundation | Shader vendoring, DType/Array, KernelRegistry | Phase 0 | Complete |
@@ -58,12 +58,12 @@ The rmlx project implementation roadmap. All phases through 9B-opt and serving s
 | KO | Kernel Optimization | 9-dispatch decode, per-kernel efficiency, 64x speedup, 6.34x faster than MLX | Phase 6 (Infra) | Track 1 mostly complete, Track 2 partial |
 | 8c | Serial Decode Opts B-E | CachedDecode (pre-resolved PSOs + scratch buffers), 2-encoder decode, _preresolved pattern, GEMV BM8 barrier removal + f32 4×float4 loads | KO | Complete |
 | 9 | f16 Default + Framework Optimization | f16 default dtype, single-encoder decode, direct KV append, pre-cached threadgroup sizes | 8c | Complete |
-| 10 | Kernel Fusion | fused_rms_gemv (Fusion A), fused_swiglu_down (Fusion B), 9→7 dispatch pipeline, auto fallback — **703.4 us/layer** | 9 | Complete |
+| 10 | Kernel Fusion | fused_rms_gemv (Fusion A), fused_swiglu_down (Fusion B), 9→7 dispatch pipeline, auto fallback — **699.3 us/layer** | 9 | Complete |
 | 11 | GEMV Kernel Optimization Experiments | Col-major GEMV (+84%), interleaved GEMV (+2.2%), SRAM prefetch + f16 acc + function constants (+3.6%) — all failed; 705 us/layer practical floor confirmed | 10 | Complete (concluded) |
 | A | Prefill Optimization | Single-CB pipeline (54→1 sync), GQA slab SDPA (32→1), GEMM swizzle, matmul_into_cb, silu_into_cb | 11 | Complete |
 | B | GEMM Config Sweep | bk32_2x4 optimal config, 27 kernel variants, 21.54T TFLOPS (MLX -10.1%) | A | Complete |
 | C | GEMM Kernel-Level Optimization | wide_load + SG=2x4 production, 21.21T TFLOPS (MLX -11.5%) | B | Complete |
-| D | GEMM Kernel Architecture | D2: MLX-arch kernel — **23.82T** (MLX -0.6%), D3: function constants, D5: bf16 barrier fix | C | D2 Complete |
+| D | GEMM Kernel Architecture | D2: MLX-arch kernel — **24.05T** (MLX +0.3%), D3: function constants, D5: bf16 barrier fix | C | D2 Complete |
 | F-1 | Dispatch Overhead Bench | 176us/CB, 12.4% of layer time | D | Complete |
 | F-2 | DiskPipelineCache | SHA-256 disk pipeline cache wired into KernelRegistry | D | Complete |
 | F-3 | Grouped GEMM MMA | GatherMM scalar→simdgroup MMA, 4-12x MoE improvement | D | Complete |
@@ -74,10 +74,14 @@ The rmlx project implementation roadmap. All phases through 9B-opt and serving s
 | I-1 | Distributed TP | DistributedTransformerModel, forward_with_group, shard_for_tp, TP=2 1.94x | H | Complete |
 | J | Quantized Parity + Infra | QMM +73%, QMV +37% (MLX 1.15x), ExecGraph stall removal, lazy.rs FusionCompiler, RMSNorm+GEMM fusion, Split-K, MoE fuse, forward_auto() | I | Complete (J-3c/J-8 pending) |
 | DQ | Dual-Queue MoE Overlap Research | Metal 2-queue Attn∥MoE concurrent dispatch, benchmark validation | J | 🔬 Research Complete |
+| PR#77 | Prefill SDPA Parity | Q4 QMM/QMV to 94% MLX throughput, QMM Q4 M=512 **17.43T** (+28% vs MLX) | J | ✅ Complete |
+| PR#78 | NAX GEMM + SDPA 4D | NAX 64x128 GEMM, SDPA strided 4D, prefill dispatch 12→9 | PR#77 | ✅ Complete |
+| PR#79 | Rust Dispatch Optimization | P0-P6 dispatch opts, ArrayPool, fused norm fallback, FP16 GEMM **24.05T** | PR#78 | ✅ Complete |
+| PR#80 | Speculative Decoding Primitives | Draft/verify/accept framework, tree attention, multi-candidate scoring | PR#79 | ✅ Complete |
+| M-1 | objc2-metal Migration | Migrate rmlx-metal from metal-rs to objc2-metal ecosystem, minimize unsafe/msg_send | PR#80 | ✅ Complete |
+| M-2 | Metal 4 API Integration | Feature-gated Metal 4 API (`metal4` feature flag), mesh shaders, raytracing stubs | M-1 | ✅ Complete |
 | KO-2 | Decode Scratch Allocator | Pre-allocated workspace, bump alloc, StorageModePrivate | KO | Planned |
 | KO-3 | ICB Decode Replay | Record/replay 9-dispatch via Metal ICB, dynamic setBytes | KO + KO-2 | Planned |
-| A | Prefill Optimization | Single-CB pipeline (54 sync→1), GQA slab SDPA (32→1), GEMM swizzle, matmul_into_cb, silu_into_cb | 10 | Complete |
-| B | GEMM Config Sweep | bk32_2x4 optimal config, 27 kernel variants, 21.54T TFLOPS (-10.1% vs MLX) | A | Complete |
 | EP-7 | ICB Full Metal Indirect Dispatch | Wire SparseExpertPlan into ExpertGroup GEMM encoding via Metal ICB indirect dispatch; skip empty experts at GPU command level | EP-6 | Planned |
 
 ---
@@ -146,7 +150,7 @@ The rmlx project implementation roadmap. All phases through 9B-opt and serving s
 | Phase A: Prefill Optimization | main | 1,298 tests | Complete |
 | Phase B: GEMM Config Sweep | gemm-sweep | 1,298 tests | Complete |
 | Phase C: GEMM Kernel-Level Optimization (21.21T, -11.5% vs MLX) | main | 1,298 tests | Complete |
-| Phase D2: MLX-Architecture Kernel (23.82T, -0.6% vs MLX) | gemm-kernel-d2 | 1,298+ tests | Complete |
+| Phase D2: MLX-Architecture Kernel (24.05T, +0.3% vs MLX) | gemm-kernel-d2 | 1,298+ tests | Complete |
 | Phase F-1: Dispatch Overhead Bench (176us/CB, 12.4%) | main (PR #65) | 1,298+ tests | Complete |
 | Phase F-2: DiskPipelineCache Wiring | main (PR #65) | 1,298+ tests | Complete |
 | Phase F-3: GatherMM MMA (4-12x MoE) | main (PR #65) | 1,298+ tests | Complete |
@@ -164,6 +168,12 @@ The rmlx project implementation roadmap. All phases through 9B-opt and serving s
 | Phase J-6: Split-K QMM (+20% at M=128) | main | 1,298+ tests | Complete |
 | Phase J-7: Distributed bench RDMA 2-node | main | 1,298+ tests | Complete |
 | Phase J-8: MoE fused kernels | -- | -- | In Review |
+| PR#77: Prefill SDPA Parity (QMM Q4 17.43T, +28% vs MLX) | main (PR #77) | 1,298+ tests | ✅ Complete |
+| PR#78: NAX GEMM + SDPA strided 4D + prefill dispatch 12→9 | main (PR #78) | 1,298+ tests | ✅ Complete |
+| PR#79: Rust Dispatch Optimization P0-P6 + ArrayPool (FP16 GEMM 24.05T) | main (PR #79) | 1,298+ tests | ✅ Complete |
+| PR#80: Speculative Decoding Framework Primitives | main (PR #80) | 1,298+ tests | ✅ Complete |
+| M-1: objc2-metal Migration (metal-rs → objc2-metal ecosystem) | feat/objc2-metal-migration | 1,298+ tests | ✅ Complete |
+| M-2: Metal 4 API Integration (feature-gated) | feat/objc2-metal-migration | 1,298+ tests | ✅ Complete |
 | Phase KO-2: Decode Scratch Allocator | -- | -- | Planned |
 | Phase KO-3: ICB Decode Replay | -- | -- | Planned |
 | EP-7: ICB Full Metal Indirect Dispatch | -- | -- | Planned |
@@ -234,7 +244,7 @@ graph LR
 
 ### Goal
 
-Establish the Cargo workspace structure, validate metal-rs basic operations, and set up CI.
+Establish the Cargo workspace structure, validate objc2-metal basic operations, and set up CI.
 
 ### Key Deliverables
 
@@ -646,7 +656,7 @@ Reduce inter-kernel dispatch overhead by fusing adjacent operations in the decod
 | Metric | Before (Phase 9) | After (Phase 10) |
 |--------|------------------:|------------------:|
 | Dispatches per layer | 9 | **7** |
-| Actual latency (60L) | 714 us/L | **703.4 us/L** (M3 Ultra, f16, 60L) |
+| Actual latency (60L) | 714 us/L | **699.3 us/L** (M3 Ultra, f16, 60L) |
 | Tests | 1,142 | **1,151** |
 
 ### Definition of Done (DoD)
@@ -1134,7 +1144,7 @@ Optimize the prefill (seq_len=N) single-layer path. While decode (seq_len=1) is 
 | SDPA dispatch reduction (GQA) | 32 → 1 (96.9%) |
 | Single-layer speedup vs baseline | 3.5-7.3x (sequence-length dependent) |
 | vs MLX (single-layer prefill) | within 1.2-3.4x |
-| GEMM TFLOPS | rmlx 21.54T vs MLX 23.97T (Phase B) |
+| GEMM TFLOPS | rmlx 24.05T vs MLX 23.97T (Phase B) |
 | Tests | 1,298 |
 
 ### Completion Criteria (DoD)

@@ -4,7 +4,7 @@
 
 `rmlx-core` is the Metal GPU compute engine, providing data types, N-dimensional arrays, a kernel registry, GPU compute kernels, automatic differentiation, LoRA fine-tuning, runtime metrics, structured logging, numerical stability monitoring, and graceful shutdown.
 
-> **Status:** DType (with FP8), Array, KernelRegistry, **32+ op modules** (including SDPA/FA2 with bf16 + backward, SiLU/SwiGLU, GELU, FP8 dequant/quant, Conv1d/Conv2d, tiled conv, GatherMM, LayerNorm, unary ops, concat, select, VJP GPU), GGUF format parser, AWQ/GPTQ dequant, VJP autodiff, LoRA, logging, metrics, PrecisionGuard, and ShutdownSignal are all implemented. Phase 0+1+2 audit remediation complete (items C1-C9). **Phase 3 additions:** All ops routed through centralized `commit_with_mode()` with sync/async `ExecMode` and `CommandBufferHandle` for async tracking. **Phase 4 addition:** Fused `rms_norm_residual_add` JIT Metal kernel combining input+residual add and RMSNorm in a single GPU dispatch. **Phase 5 additions:** 5 new op modules -- `slice.rs` (multi-dimensional slice with per-dimension start/end/stride, Metal kernel up to 8D, f32/f16/bf16), `sort.rs` (bitonic sort on Metal: sort/argsort, ascending/descending, any axis, up to 2048 elements), `scan.rs` (parallel prefix scan via Hillis-Steele: cumsum/cumprod along any axis), `argreduce.rs` (argmin/argmax reduction along any axis, SIMD reductions, UInt32 output), `random.rs` (Philox 4x32-10 PRNG: uniform/normal with deterministic seeding). **Phase KO additions:** GEMV BM=8 variant with dynamic tile selection, `_into_encoder` API pattern for single-encoder dispatch, Array::uninit and Array::to_private, batched SDPA decode kernel, layer_norm single-pass optimization, softmax N_READS coalescing. **Phase 8c additions:** `_preresolved_into_encoder` variants for GEMV, RMS norm, RoPE, SDPA decode, and fused SiLU*mul; GEMV BM8 barrier removal (6 spurious threadgroup barriers removed); f32 BM8 load widening from 2×float4 to 4×float4 (64B/thread); public kernel name helpers (`gemv_kernel_name`, `rms_norm_kernel_name_for`, `rope_table_kernel_name`, `sdpa_decode_kernel_name`, `silu_gate_kernel_name`). **Phase 10 additions:** `fused_rms_gemv` (RMS norm + GEMV in single dispatch) and `fused_swiglu_down` (SiLU*gate + down GEMV in single dispatch), reducing decode pipeline from 9 to 7 dispatches, achieving 703.4 us/layer. **Phase 11 conclusion:** All kernel-level optimization experiments failed (col-major +84%, interleaved +2.2%, SRAM+f16+funcconst +3.6%); 73.6% bandwidth efficiency confirmed as practical floor for f16 decode on Apple Silicon. **Phase A additions:** `matmul_into_cb` (GEMM encoding into caller-provided CB for single-CB prefill pipeline), `silu_into_cb` (SiLU encoding into caller-provided CB), GEMM threadgroup swizzle, GQA slab SDPA for prefill (32 per-head dispatches reduced to 1). **Phase B additions:** GEMM config sweep benchmarks (`gemm_sweep.rs`, `gemm_sweep2.rs`, `gemm_opt.rs`) with 27 kernel variants; bk32_2x4 confirmed as optimal GEMM config (21.54T TFLOPS, -10.1% vs MLX 23.97T). **Phase D2:** MLX-architecture GEMM kernel (`gemm_mlx_f16`: BK=16, 2 SG, 64 threads, single buffer, 4xhalf4 wide loads, direct store, serpentine MMA) achieving **23.82T TFLOPS** (-0.6% vs MLX 23.97T). **Phase F additions:** F-1 dispatch overhead bench (176us/CB, 12.4%); F-2 DiskPipelineCache wired into KernelRegistry; F-3 GatherMM upgraded to simdgroup MMA (4-12x for MoE). **Phase G additions:** G-1 QMM MMA Q4 (BM=32, BN=32, BK=32, dequant-in-loader); G-2 QMV qdot Q4/Q8 (MLX mask pattern, uchar4 vectorized); G-3 Q8 QMM MMA + CPU fallback removed. **Phase H-2:** GEMM+residual epilogue fusion via function constant 202 (`has_residual`), residual buffer at `[[buffer(10)]]`, 5-12% for large N.
+> **Status:** DType (with FP8), Array, KernelRegistry, **32+ op modules** (including SDPA/FA2 with bf16 + backward, SiLU/SwiGLU, GELU, FP8 dequant/quant, Conv1d/Conv2d, tiled conv, GatherMM, LayerNorm, unary ops, concat, select, VJP GPU), GGUF format parser, AWQ/GPTQ dequant, VJP autodiff, LoRA, logging, metrics, PrecisionGuard, and ShutdownSignal are all implemented. Phase 0+1+2 audit remediation complete (items C1-C9). **Phase 3 additions:** All ops routed through centralized `commit_with_mode()` with sync/async `ExecMode` and `CommandBufferHandle` for async tracking. **Phase 4 addition:** Fused `rms_norm_residual_add` JIT Metal kernel combining input+residual add and RMSNorm in a single GPU dispatch. **Phase 5 additions:** 5 new op modules -- `slice.rs` (multi-dimensional slice with per-dimension start/end/stride, Metal kernel up to 8D, f32/f16/bf16), `sort.rs` (bitonic sort on Metal: sort/argsort, ascending/descending, any axis, up to 2048 elements), `scan.rs` (parallel prefix scan via Hillis-Steele: cumsum/cumprod along any axis), `argreduce.rs` (argmin/argmax reduction along any axis, SIMD reductions, UInt32 output), `random.rs` (Philox 4x32-10 PRNG: uniform/normal with deterministic seeding). **Phase KO additions:** GEMV BM=8 variant with dynamic tile selection, `_into_encoder` API pattern for single-encoder dispatch, Array::uninit and Array::to_private, batched SDPA decode kernel, layer_norm single-pass optimization, softmax N_READS coalescing. **Phase 8c additions:** `_preresolved_into_encoder` variants for GEMV, RMS norm, RoPE, SDPA decode, and fused SiLU*mul; GEMV BM8 barrier removal (6 spurious threadgroup barriers removed); f32 BM8 load widening from 2×float4 to 4×float4 (64B/thread); public kernel name helpers (`gemv_kernel_name`, `rms_norm_kernel_name_for`, `rope_table_kernel_name`, `sdpa_decode_kernel_name`, `silu_gate_kernel_name`). **Phase 10 additions:** `fused_rms_gemv` (RMS norm + GEMV in single dispatch) and `fused_swiglu_down` (SiLU*gate + down GEMV in single dispatch), reducing decode pipeline from 9 to 7 dispatches, achieving 699.3 us/layer. **Phase 11 conclusion:** All kernel-level optimization experiments failed (col-major +84%, interleaved +2.2%, SRAM+f16+funcconst +3.6%); 73.6% bandwidth efficiency confirmed as practical floor for f16 decode on Apple Silicon. **Phase A additions:** `matmul_into_cb` (GEMM encoding into caller-provided CB for single-CB prefill pipeline), `silu_into_cb` (SiLU encoding into caller-provided CB), GEMM threadgroup swizzle, GQA slab SDPA for prefill (32 per-head dispatches reduced to 1). **Phase B additions:** GEMM config sweep benchmarks (`gemm_sweep.rs`, `gemm_sweep2.rs`, `gemm_opt.rs`) with 27 kernel variants; bk32_2x4 confirmed as optimal GEMM config (21.54T TFLOPS, -10.1% vs MLX 23.97T). **Phase D2+:** MLX-architecture GEMM kernel (`gemm_mlx_f16`: BK=16, 2 SG, 64 threads, single buffer, 4xhalf4 wide loads, direct store, serpentine MMA) achieving **24.05T TFLOPS** (pipe parity with MLX). **Phase F additions:** F-1 dispatch overhead bench (176us/CB, 12.4%); F-2 DiskPipelineCache wired into KernelRegistry; F-3 GatherMM upgraded to simdgroup MMA (4-12x for MoE). **Phase G additions:** G-1 QMM MMA Q4 (BM=32, BN=32, BK=32, dequant-in-loader); G-2 QMV qdot Q4/Q8 (MLX mask pattern, uchar4 vectorized); G-3 Q8 QMM MMA + CPU fallback removed. **Phase H-2:** GEMM+residual epilogue fusion via function constant 202 (`has_residual`), residual buffer at `[[buffer(10)]]`, 5-12% for large N.
 
 ---
 
@@ -185,7 +185,7 @@ pub fn register_all(registry: &KernelRegistry) -> Result<(), KernelError> {
 | `rms_norm` | RMS Normalization | RMS normalization with `_into_encoder()` dispatch support |
 | `rope` | RoPE | Rotary Position Embedding with `rope_ext_into_encoder()` dispatch support |
 | `gemv` | GEMV, GEMV+Bias | Matrix-vector product with BM=8 variant, dynamic tile selection, and `_into_encoder()` / fused bias dispatch paths |
-| `matmul` | GEMM | General matrix multiplication with MLX-architecture kernel (Phase D2: BK=16, 2 SG, 64 threads, 4xhalf4 wide loads, serpentine MMA — **23.82T TFLOPS**, MLX -0.6%), `TileVariant::Simd` SIMD group MMA path, threadgroup swizzle, `matmul_into_cb` for single-CB prefill pipeline, and **GEMM+residual epilogue fusion** (Phase H-2: function constant 202 `has_residual`, residual buffer at `[[buffer(10)]]`, 5-12% for large N) |
+| `matmul` | GEMM | General matrix multiplication with MLX-architecture kernel (Phase D2+: BK=16, 2 SG, 64 threads, 4xhalf4 wide loads, serpentine MMA — **24.05T TFLOPS**, pipe parity with MLX), `TileVariant::Simd` SIMD group MMA path, threadgroup swizzle, `matmul_into_cb` for single-CB prefill pipeline, and **GEMM+residual epilogue fusion** (Phase H-2: function constant 202 `has_residual`, residual buffer at `[[buffer(10)]]`, 5-12% for large N) |
 | `quantized` | QMM MMA, QMV qdot, AWQ dequant, GPTQ dequant | **Phase G**: QMM upgraded to simdgroup MMA for Q4 (G-1) and Q8 (G-3) with BM=32/BN=32/BK=32 and dequant-in-loader; QMV upgraded to MLX qdot pattern (G-2) with mask multiplication and uchar4 vectorized loads; CPU fallback fully removed; AWQ/GPTQ INT4 unpacking |
 | `indexing` | Gather, Scatter | Indexing operations |
 | `silu` | SiLU, SiLU+Gate (SwiGLU) | Sigmoid Linear Unit activation + fused SwiGLU gate, including `_into_encoder()` fused SiLU * gate dispatch and `silu_into_cb` for single-CB prefill pipeline |
@@ -388,7 +388,7 @@ New SDPA decode kernels optimized for the slab KV cache layout used in the 9-dis
 
 ### Phase 10: Fused Decode Kernels
 
-Phase 10 introduces two fused Metal kernels that reduce the decode pipeline from 9 dispatches to 7, achieving 703.4 us/layer at 60L depth (M3 Ultra, f16).
+Phase 10 introduces two fused Metal kernels that reduce the decode pipeline from 9 dispatches to 7, achieving 699.3 us/layer at 60L depth (M3 Ultra, f16).
 
 | Kernel | Description |
 |--------|-------------|
@@ -399,7 +399,7 @@ Both fused kernels include automatic fallback: if the fused PSO fails to compile
 
 ### Phase 11: GEMV Kernel Optimization Experiments — CONCLUDED
 
-Phase 11 investigated three alternative GEMV kernel strategies to push below the 703.4 us/layer floor. All three failed:
+Phase 11 investigated three alternative GEMV kernel strategies to push below the 699.3 us/layer floor. All three failed:
 
 | Experiment | Result |
 |-----------|--------|
@@ -433,8 +433,8 @@ Phase D2 achieves near-parity with MLX through an MLX-architecture kernel design
 
 | Metric | Before (Phase C) | After (Phase D2) |
 |--------|------------------:|------------------:|
-| GEMM TFLOPS | 21.21T | **23.82T** |
-| vs MLX (23.97T) | -11.5% | **-0.6%** |
+| GEMM TFLOPS | 21.21T | **24.05T** |
+| vs MLX (23.97T) | -11.5% | **+0.3% (pipe parity)** |
 
 Key design: BK=16, 2 SG (WM=1, WN=2), 64 threads, single buffer, 4xhalf4 wide loads (ReadVector pattern), direct register-to-device store, serpentine MMA ordering. TG memory ~4KB enables 7-8 TG/core (vs 18KB = 1 TG/core for the old kernel). Occupancy was the dominant factor.
 
@@ -455,6 +455,26 @@ MLX gap: QMV 1.58x, QMM 4.78x (due to MLX's more mature per-group dequant fusion
 Fuses residual addition into GEMM epilogue via function constant 202 (`has_residual`). Residual buffer at `[[buffer(10)]]`. Impact: 5-12% for large N (>=4096), 0-2% for small N.
 
 ---
+
+### GEMM Dispatch Table (f16 — `matmul_into_cb` Production Path)
+
+| M | Dispatch | Notes |
+|---|----------|-------|
+| 1 | Tiled GEMM (BM=16 pad) | GEMV path removed |
+| 2-8 | Split-K (unconditional, K>=256) | Always Split-K for tiny M |
+| 9-32 | Split-K (K>=N only), else Tiled | Conditional Split-K |
+| 33-128 | Tiled GEMM (MlxMicro 16x32) | Standard tiled path |
+| 256 | MlxSmall 32x32 | Intermediate tile |
+| 512+ | NAX 64x128 | Large-M optimized |
+
+### Performance Summary
+
+| Metric | Value | Notes |
+|--------|------:|-------|
+| FP16 GEMM | 24.05T | Pipe parity with MLX |
+| QMM Q4 M=512 | 17.43T | MLX 13.6T, +28% |
+| Decode best | 699.3 us/layer | Phase 10, 7-dispatch fused |
+| BW efficiency | 73.6% | Practical floor for f16 on Apple Silicon |
 
 ---
 
@@ -601,9 +621,9 @@ A kernel registry supporting 3-level fallback: AOT `.metallib` -> JIT compilatio
 ```rust
 pub struct KernelRegistry {
     device: GpuDevice,
-    aot_lib: Option<metal::Library>,
-    jit_cache: Mutex<HashMap<String, metal::Library>>,
-    pipelines: Mutex<HashMap<PipelineKey, metal::ComputePipelineState>>,
+    aot_lib: Option<MtlLibrary>,
+    jit_cache: Mutex<HashMap<String, MtlLibrary>>,
+    pipelines: Mutex<HashMap<PipelineKey, MtlPipeline>>,
 }
 ```
 

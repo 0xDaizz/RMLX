@@ -136,7 +136,10 @@ mod tests {
 
     #[test]
     fn test_build_device_info() {
-        let dev = crate::device::GpuDevice::system_default().unwrap();
+        let Ok(dev) = crate::device::GpuDevice::system_default() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let info = build_device_info(&dev);
         assert!(info.fast_math_disabled);
         assert!(!info.device_name.is_empty());

@@ -12,6 +12,8 @@
 
 use std::time::{Duration, Instant};
 
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLDevice as _;
 use rmlx_core::array::Array;
 use rmlx_core::kernels::KernelRegistry;
 use rmlx_core::ops;
@@ -91,7 +93,11 @@ impl std::fmt::Display for Stats {
 // Random array generation (deterministic PRNG)
 // ---------------------------------------------------------------------------
 
-fn rand_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
+fn rand_array(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    shape: &[usize],
+    seed: u64,
+) -> Array {
     let numel: usize = shape.iter().product();
     let mut data = Vec::with_capacity(numel);
     let mut state = seed;
@@ -150,7 +156,7 @@ fn main() {
     let registry = KernelRegistry::new(gpu);
     ops::register_all(&registry).expect("kernel registration failed");
     let device = registry.device().raw();
-    let queue = device.new_command_queue();
+    let queue = device.newCommandQueue().unwrap();
 
     println!(
         "Config: warmup={}, bench_iters={}\n",

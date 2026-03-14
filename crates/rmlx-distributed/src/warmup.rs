@@ -8,7 +8,12 @@ use std::hint::black_box;
 use std::mem::size_of;
 use std::time::{Duration, Instant};
 
-use rmlx_metal::metal::{Device as MTLDevice, NSRange};
+use objc2::runtime::ProtocolObject;
+use objc2_foundation::NSRange;
+use objc2_metal::{
+    MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+    MTLCreateSystemDefaultDevice, MTLDevice,
+};
 
 use crate::moe_policy::ThresholdCalibration;
 
@@ -180,11 +185,11 @@ impl WarmupState {
         // D18: Threshold calibration — auto-tune CPU/GPU crossover point.
         let mut cal_dur = Duration::ZERO;
         if config.run_calibration && !self.calibration.calibrated {
-            let calibration_gpu = MTLDevice::system_default();
+            let calibration_gpu = MTLCreateSystemDefaultDevice();
             let cal_start = Instant::now();
             self.calibration.calibrate(
                 run_cpu_calibration_bench,
-                |n| run_gpu_calibration_bench(calibration_gpu.as_ref(), n), // closure needed: captures calibration_gpu
+                |n| run_gpu_calibration_bench(calibration_gpu.as_deref(), n), // closure needed: captures calibration_gpu
             );
             cal_dur = cal_start.elapsed();
         }
@@ -213,11 +218,11 @@ impl Default for WarmupState {
 /// Run the warmup benchmark suite and return measured or estimated values.
 pub fn run_warmup_bench(device: Option<&rmlx_metal::GpuDevice>) -> WarmupBenchResult {
     let owned_gpu = if device.is_none() {
-        MTLDevice::system_default()
+        MTLCreateSystemDefaultDevice()
     } else {
         None
     };
-    let metal_device = device.map(|gpu| gpu.raw()).or(owned_gpu.as_ref());
+    let metal_device = device.map(|gpu| gpu.raw()).or(owned_gpu.as_deref());
 
     WarmupBenchResult {
         gpu_matmul_gflops: run_gpu_matmul_proxy_bench(metal_device, GPU_PROXY_DIM),
@@ -243,7 +248,7 @@ fn run_cpu_calibration_bench(n: usize) -> f64 {
     start.elapsed().as_secs_f64().max(f64::EPSILON)
 }
 
-fn run_gpu_calibration_bench(device: Option<&MTLDevice>, n: usize) -> f64 {
+fn run_gpu_calibration_bench(device: Option<&ProtocolObject<dyn MTLDevice>>, n: usize) -> f64 {
     let dim = n.max(1);
     if let Some(device) = device {
         if let Some(seconds) = timed_gpu_copy_seconds(device, dim, 1) {
@@ -254,7 +259,7 @@ fn run_gpu_calibration_bench(device: Option<&MTLDevice>, n: usize) -> f64 {
     estimated_gpu_seconds(dim)
 }
 
-fn run_gpu_matmul_proxy_bench(device: Option<&MTLDevice>, dim: usize) -> f64 {
+fn run_gpu_matmul_proxy_bench(device: Option<&ProtocolObject<dyn MTLDevice>>, dim: usize) -> f64 {
     let dim = dim.max(1);
     if let Some(device) = device {
         if let Some(seconds) = timed_gpu_copy_seconds(device, dim, GPU_PROXY_COPY_ITERS) {
@@ -266,32 +271,44 @@ fn run_gpu_matmul_proxy_bench(device: Option<&MTLDevice>, dim: usize) -> f64 {
     ESTIMATED_GPU_MATMUL_GFLOPS
 }
 
-fn timed_gpu_copy_seconds(device: &MTLDevice, dim: usize, iterations: usize) -> Option<f64> {
+fn timed_gpu_copy_seconds(
+    device: &ProtocolObject<dyn MTLDevice>,
+    dim: usize,
+    iterations: usize,
+) -> Option<f64> {
     let element_count = dim.saturating_mul(dim).max(1);
     let byte_len = element_count
         .saturating_mul(size_of::<f32>())
         .max(size_of::<f32>());
-    let range = NSRange::new(0, byte_len as u64);
-    let src = device.new_buffer(byte_len as u64, rmlx_metal::DEFAULT_BUFFER_OPTIONS);
-    let dst = device.new_buffer(byte_len as u64, rmlx_metal::DEFAULT_BUFFER_OPTIONS);
-    let queue = device.new_command_queue();
+    let range = NSRange::new(0, byte_len);
+    let src = device
+        .newBufferWithLength_options(byte_len, rmlx_metal::DEFAULT_BUFFER_OPTIONS)
+        .unwrap();
+    let dst = device
+        .newBufferWithLength_options(byte_len, rmlx_metal::DEFAULT_BUFFER_OPTIONS)
+        .unwrap();
+    let queue = device.newCommandQueue().unwrap();
 
-    let init_cb = queue.new_command_buffer();
-    let init_blit = init_cb.new_blit_command_encoder();
-    init_blit.fill_buffer(&src, range, 0x11);
-    init_blit.fill_buffer(&dst, range, 0x00);
-    init_blit.end_encoding();
+    let init_cb = queue.commandBuffer().unwrap();
+    let init_blit = init_cb.blitCommandEncoder().unwrap();
+    init_blit.fillBuffer_range_value(&src, range, 0x11);
+    init_blit.fillBuffer_range_value(&dst, range, 0x00);
+    init_blit.endEncoding();
     init_cb.commit();
-    init_cb.wait_until_completed();
+    init_cb.waitUntilCompleted();
 
     let start = Instant::now();
     for _ in 0..iterations.max(1) {
-        let cb = queue.new_command_buffer();
-        let blit = cb.new_blit_command_encoder();
-        blit.copy_from_buffer(&src, 0, &dst, 0, byte_len as u64);
-        blit.end_encoding();
+        let cb = queue.commandBuffer().unwrap();
+        let blit = cb.blitCommandEncoder().unwrap();
+        unsafe {
+            blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                &src, 0, &dst, 0, byte_len,
+            )
+        };
+        blit.endEncoding();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
     }
     let seconds = start.elapsed().as_secs_f64();
 

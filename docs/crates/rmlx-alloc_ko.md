@@ -4,7 +4,7 @@
 
 `rmlx-alloc`은 GPU 메모리 할당 및 zero-copy 버퍼 관리를 담당하는 크레이트입니다. `posix_memalign`으로 할당한 페이지 정렬 메모리에 Metal `newBufferWithBytesNoCopy`를 등록하여, 단일 물리 메모리에 대해 CPU/GPU 동시 접근을 제공합니다. MLX의 MetalAllocator 패턴을 따르며, 크기별 비닝 캐시와 할당 통계 추적 기능을 포함합니다.
 
-> **상태:** Phase 1 구현 완료. `ZeroCopyBuffer`, `MetalAllocator`, `BufferCache`, `AllocStats`, `LeakDetector` 모두 구현되었습니다. `ResidencyManager` API는 존재하지만, Metal `MTLResidencySet` 백엔드는 `metal-rs` 바인딩 지원 전까지 문서화된 스텁입니다. `metal3` feature가 켜진 경우 현재 구현은 조용한 no-op 대신 `todo!("TODO(A6)...")`로 fail-fast 하도록 의도되어 있습니다.
+> **상태:** Phase 1 구현 완료. `ZeroCopyBuffer`, `MetalAllocator`, `BufferCache`, `AllocStats`, `LeakDetector` 모두 구현되었습니다. `ResidencyManager`는 `objc2-metal`의 `MTLResidencySet` 지원으로 백엔드가 완성되었습니다.
 
 ---
 
@@ -88,7 +88,7 @@ pub struct ZeroCopyBuffer {
 | `acquire_fence(op_tag)` | 하드웨어 완료 검증이 필요한 `CompletionFence`를 획득합니다 |
 | `in_flight_count()` | 현재 in-flight 참조 수를 반환합니다 (self 포함, 외부 참조 없으면 1) |
 
-`Send`와 `Sync`가 수동으로 구현되어 있습니다 (UMA 기반 Apple Silicon에서 Metal `StorageModeShared` 버퍼의 스레드 안전성 보장).
+`objc2-metal` 타입은 본질적으로 `Send + Sync`이므로, 별도의 수동 구현이 필요하지 않습니다 (UMA 기반 Apple Silicon에서 Metal `StorageModeShared` 버퍼의 스레드 안전성 보장). 버퍼 타입은 `rmlx-metal`의 `types.rs`에서 정의된 `MtlBuffer` 별칭을 사용합니다.
 
 **안전한 해제 (Drop):**
 

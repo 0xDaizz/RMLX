@@ -33,7 +33,13 @@ use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
 use crate::ops::buffer_slots::{gemm, grouped_gemm, grouped_splitk, splitk, splitk_reduce};
-use metal::MTLSize;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLCommandBuffer as _;
+use objc2_metal::MTLCommandQueue as _;
+use objc2_metal::MTLDevice as _;
+use rmlx_metal::ComputePass;
+use rmlx_metal::MTLResourceOptions;
+use rmlx_metal::MTLSize;
 
 // ---------------------------------------------------------------------------
 // Metal shader source: optimized GEMM with simdgroup MMA, f16 shmem,
@@ -6706,8 +6712,8 @@ fn ceil_div(a: usize, b: usize) -> usize {
 /// buffer per call. `set_bytes` copies the value into the encoder's argument
 /// buffer inline, avoiding per-dispatch buffer allocation overhead.
 #[inline(always)]
-fn set_u32(enc: &metal::ComputeCommandEncoderRef, index: u64, val: u32) {
-    enc.set_bytes(index, 4, &val as *const u32 as *const std::ffi::c_void);
+fn set_u32(enc: ComputePass<'_>, index: usize, val: u32) {
+    enc.set_val(index as u32, &val);
 }
 
 // ---------------------------------------------------------------------------
@@ -6722,7 +6728,7 @@ pub fn matmul(
     registry: &KernelRegistry,
     a: &Array,
     b: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     if a.ndim() != 2 {
         return Err(KernelError::InvalidShape(format!(
@@ -6887,7 +6893,7 @@ pub fn batched_matmul(
     registry: &KernelRegistry,
     a: &Array,
     b: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     if a.ndim() != 3 {
         return Err(KernelError::InvalidShape(format!(
@@ -6963,7 +6969,7 @@ fn dispatch_tiled_gemm(
     registry: &KernelRegistry,
     a: &Array,
     b: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
     m: usize,
     n: usize,
     k: usize,
@@ -7016,12 +7022,13 @@ fn dispatch_tiled_gemm(
     };
     let out = Array::uninit(registry.device().raw(), output_shape, a.dtype());
 
-    let cb = queue.new_command_buffer();
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(gemm::A, Some(a.metal_buffer()), a.offset() as u64);
-    enc.set_buffer(gemm::B, Some(b.metal_buffer()), b.offset() as u64);
-    enc.set_buffer(gemm::OUT, Some(out.metal_buffer()), 0);
+    let cb = queue.commandBuffer().unwrap();
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
+    enc.set_buffer(gemm::A as u32, Some(a.metal_buffer()), a.offset());
+    enc.set_buffer(gemm::B as u32, Some(b.metal_buffer()), b.offset());
+    enc.set_buffer(gemm::OUT as u32, Some(out.metal_buffer()), 0);
     set_u32(enc, gemm::M, super::checked_u32(m, "M")?);
     set_u32(enc, gemm::N, super::checked_u32(n, "N")?);
     set_u32(enc, gemm::K, super::checked_u32(k, "K")?);
@@ -7053,22 +7060,26 @@ fn dispatch_tiled_gemm(
     // epilogues. Bind dummies so Metal validation passes (function constants
     // ensure the kernel never actually reads them).
     if tile.variant.uses_function_constants() {
-        enc.set_buffer(gemm::RESIDUAL, Some(out.metal_buffer()), 0);
-        enc.set_buffer(gemm::NORM_WEIGHT, Some(out.metal_buffer()), 0);
-        enc.set_buffer(gemm::INV_RMS, Some(out.metal_buffer()), 0);
-        enc.set_buffer(gemm::GATE_RESULT, Some(out.metal_buffer()), 0);
+        enc.set_buffer(gemm::RESIDUAL as u32, Some(out.metal_buffer()), 0);
+        enc.set_buffer(gemm::NORM_WEIGHT as u32, Some(out.metal_buffer()), 0);
+        enc.set_buffer(gemm::INV_RMS as u32, Some(out.metal_buffer()), 0);
+        enc.set_buffer(gemm::GATE_RESULT as u32, Some(out.metal_buffer()), 0);
     }
 
-    let grid = MTLSize::new(
-        (ceil_div(n, tile.bn) << swizzle_log) as u64,
-        (ceil_div(m, tile.bm) >> swizzle_log) as u64,
-        batch as u64,
-    );
-    let tg = MTLSize::new(tile.variant.threads_per_tg(), 1, 1);
+    let grid = MTLSize {
+        width: (ceil_div(n, tile.bn) << swizzle_log) as usize,
+        height: (ceil_div(m, tile.bm) >> swizzle_log) as usize,
+        depth: batch,
+    };
+    let tg = MTLSize {
+        width: tile.variant.threads_per_tg() as usize,
+        height: 1,
+        depth: 1,
+    };
 
-    enc.dispatch_thread_groups(grid, tg);
-    enc.end_encoding();
-    super::commit_with_mode(cb, super::ExecMode::Sync);
+    enc.dispatch_threadgroups(grid, tg);
+    enc.end();
+    super::commit_with_mode(&cb, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -7082,7 +7093,7 @@ fn dispatch_split_k(
     registry: &KernelRegistry,
     a: &Array,
     b: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
     m: usize,
     n: usize,
     k: usize,
@@ -7100,49 +7111,70 @@ fn dispatch_split_k(
     let k_u32 = super::checked_u32(k, "K")?;
     let splits_u32 = super::checked_u32(n_splits, "n_splits")?;
 
-    let cb = queue.new_command_buffer();
+    let cb = queue.commandBuffer().unwrap();
 
     // Pass 1 encoder
     {
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pass1_pipeline);
-        enc.set_buffer(splitk::A, Some(a.metal_buffer()), a.offset() as u64);
-        enc.set_buffer(splitk::B, Some(b.metal_buffer()), b.offset() as u64);
-        enc.set_buffer(splitk::PARTIAL, Some(partial.metal_buffer()), 0);
+        let raw_enc = cb.computeCommandEncoder().unwrap();
+        let enc = ComputePass::new(&raw_enc);
+        enc.set_pipeline(&pass1_pipeline);
+        enc.set_buffer(splitk::A as u32, Some(a.metal_buffer()), a.offset());
+        enc.set_buffer(splitk::B as u32, Some(b.metal_buffer()), b.offset());
+        enc.set_buffer(splitk::PARTIAL as u32, Some(partial.metal_buffer()), 0);
         set_u32(enc, splitk::M, m_u32);
         set_u32(enc, splitk::N, n_u32);
         set_u32(enc, splitk::K, k_u32);
         set_u32(enc, splitk::N_SPLITS, splits_u32);
 
-        let grid = MTLSize::new(
-            ceil_div(n, BN) as u64,
-            ceil_div(m, BM) as u64,
-            n_splits as u64,
-        );
-        let tg = MTLSize::new((BM * BN) as u64, 1, 1);
-        enc.dispatch_thread_groups(grid, tg);
-        enc.end_encoding();
+        let grid = MTLSize {
+            width: ceil_div(n, BN),
+            height: ceil_div(m, BM),
+            depth: n_splits,
+        };
+        let tg = MTLSize {
+            width: (BM * BN),
+            height: 1,
+            depth: 1,
+        };
+        enc.dispatch_threadgroups(grid, tg);
+        enc.end();
     }
 
     // Pass 2: reduce
     {
         let pass2_pipeline = registry.get_pipeline("splitk_reduce_f32", DType::Float32)?;
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pass2_pipeline);
-        enc.set_buffer(splitk_reduce::PARTIAL, Some(partial.metal_buffer()), 0);
-        enc.set_buffer(splitk_reduce::OUT, Some(out.metal_buffer()), 0);
+        let raw_enc = cb.computeCommandEncoder().unwrap();
+        let enc = ComputePass::new(&raw_enc);
+        enc.set_pipeline(&pass2_pipeline);
+        enc.set_buffer(
+            splitk_reduce::PARTIAL as u32,
+            Some(partial.metal_buffer()),
+            0,
+        );
+        enc.set_buffer(splitk_reduce::OUT as u32, Some(out.metal_buffer()), 0);
         set_u32(enc, splitk_reduce::M, m_u32);
         set_u32(enc, splitk_reduce::N, n_u32);
         set_u32(enc, splitk_reduce::N_SPLITS, splits_u32);
 
         let total = m * n;
         let tg_size = 256u64;
-        let n_groups = ceil_div(total, tg_size as usize) as u64;
-        enc.dispatch_thread_groups(MTLSize::new(n_groups, 1, 1), MTLSize::new(tg_size, 1, 1));
-        enc.end_encoding();
+        let n_groups = ceil_div(total, tg_size as usize);
+        enc.dispatch_threadgroups(
+            MTLSize {
+                width: n_groups,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: tg_size as usize,
+                height: 1,
+                depth: 1,
+            },
+        );
+        enc.end();
     }
 
-    super::commit_with_mode(cb, super::ExecMode::Sync);
+    super::commit_with_mode(&cb, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -7180,7 +7212,7 @@ fn dispatch_split_k_f16(
     registry: &KernelRegistry,
     a: &Array,
     b: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
     m: usize,
     n: usize,
     k: usize,
@@ -7209,50 +7241,71 @@ fn dispatch_split_k_f16(
     let splits_u32 = super::checked_u32(n_splits, "n_splits")?;
     let swizzle_log = compute_swizzle_log(m, n, bm, bn);
 
-    let cb = queue.new_command_buffer();
+    let cb = queue.commandBuffer().unwrap();
 
     // Pass 1
     {
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pass1_pipeline);
-        enc.set_buffer(splitk::A, Some(a.metal_buffer()), a.offset() as u64);
-        enc.set_buffer(splitk::B, Some(b.metal_buffer()), b.offset() as u64);
-        enc.set_buffer(splitk::PARTIAL, Some(partial.metal_buffer()), 0);
+        let raw_enc = cb.computeCommandEncoder().unwrap();
+        let enc = ComputePass::new(&raw_enc);
+        enc.set_pipeline(&pass1_pipeline);
+        enc.set_buffer(splitk::A as u32, Some(a.metal_buffer()), a.offset());
+        enc.set_buffer(splitk::B as u32, Some(b.metal_buffer()), b.offset());
+        enc.set_buffer(splitk::PARTIAL as u32, Some(partial.metal_buffer()), 0);
         set_u32(enc, splitk::M, m_u32);
         set_u32(enc, splitk::N, n_u32);
         set_u32(enc, splitk::K, k_u32);
         set_u32(enc, splitk::N_SPLITS, splits_u32);
         set_u32(enc, 7, swizzle_log); // f16 split-K adds swizzle_log after n_splits
 
-        let grid = MTLSize::new(
-            (ceil_div(n, bn) << swizzle_log) as u64,
-            (ceil_div(m, bm) >> swizzle_log) as u64,
-            n_splits as u64,
-        );
-        let tg = MTLSize::new(64, 1, 1);
-        enc.dispatch_thread_groups(grid, tg);
-        enc.end_encoding();
+        let grid = MTLSize {
+            width: (ceil_div(n, bn) << swizzle_log) as usize,
+            height: (ceil_div(m, bm) >> swizzle_log) as usize,
+            depth: n_splits,
+        };
+        let tg = MTLSize {
+            width: 64,
+            height: 1,
+            depth: 1,
+        };
+        enc.dispatch_threadgroups(grid, tg);
+        enc.end();
     }
 
     // Pass 2: reduce
     {
         let pass2_pipeline = registry.get_pipeline("splitk_reduce_f16", DType::Float16)?;
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pass2_pipeline);
-        enc.set_buffer(splitk_reduce::PARTIAL, Some(partial.metal_buffer()), 0);
-        enc.set_buffer(splitk_reduce::OUT, Some(out.metal_buffer()), 0);
+        let raw_enc = cb.computeCommandEncoder().unwrap();
+        let enc = ComputePass::new(&raw_enc);
+        enc.set_pipeline(&pass2_pipeline);
+        enc.set_buffer(
+            splitk_reduce::PARTIAL as u32,
+            Some(partial.metal_buffer()),
+            0,
+        );
+        enc.set_buffer(splitk_reduce::OUT as u32, Some(out.metal_buffer()), 0);
         set_u32(enc, splitk_reduce::M, m_u32);
         set_u32(enc, splitk_reduce::N, n_u32);
         set_u32(enc, splitk_reduce::N_SPLITS, splits_u32);
 
         let total = m * n;
         let tg_size = 256u64;
-        let n_groups = ceil_div(total, tg_size as usize) as u64;
-        enc.dispatch_thread_groups(MTLSize::new(n_groups, 1, 1), MTLSize::new(tg_size, 1, 1));
-        enc.end_encoding();
+        let n_groups = ceil_div(total, tg_size as usize);
+        enc.dispatch_threadgroups(
+            MTLSize {
+                width: n_groups,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: tg_size as usize,
+                height: 1,
+                depth: 1,
+            },
+        );
+        enc.end();
     }
 
-    super::commit_with_mode(cb, super::ExecMode::Sync);
+    super::commit_with_mode(&cb, super::ExecMode::Sync);
     Ok(out)
 }
 
@@ -7265,7 +7318,7 @@ fn dispatch_split_k_f16_into_cb(
     registry: &KernelRegistry,
     a: &Array,
     b: &Array,
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
     m: usize,
     n: usize,
     k: usize,
@@ -7296,43 +7349,64 @@ fn dispatch_split_k_f16_into_cb(
 
     // Pass 1
     {
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pass1_pipeline);
-        enc.set_buffer(splitk::A, Some(a.metal_buffer()), a.offset() as u64);
-        enc.set_buffer(splitk::B, Some(b.metal_buffer()), b.offset() as u64);
-        enc.set_buffer(splitk::PARTIAL, Some(partial.metal_buffer()), 0);
+        let raw_enc = cb.computeCommandEncoder().unwrap();
+        let enc = ComputePass::new(&raw_enc);
+        enc.set_pipeline(&pass1_pipeline);
+        enc.set_buffer(splitk::A as u32, Some(a.metal_buffer()), a.offset());
+        enc.set_buffer(splitk::B as u32, Some(b.metal_buffer()), b.offset());
+        enc.set_buffer(splitk::PARTIAL as u32, Some(partial.metal_buffer()), 0);
         set_u32(enc, splitk::M, m_u32);
         set_u32(enc, splitk::N, n_u32);
         set_u32(enc, splitk::K, k_u32);
         set_u32(enc, splitk::N_SPLITS, splits_u32);
         set_u32(enc, 7, swizzle_log); // f16 split-K adds swizzle_log after n_splits
 
-        let grid = MTLSize::new(
-            (ceil_div(n, bn) << swizzle_log) as u64,
-            (ceil_div(m, bm) >> swizzle_log) as u64,
-            n_splits as u64,
-        );
-        let tg = MTLSize::new(64, 1, 1);
-        enc.dispatch_thread_groups(grid, tg);
-        enc.end_encoding();
+        let grid = MTLSize {
+            width: (ceil_div(n, bn) << swizzle_log) as usize,
+            height: (ceil_div(m, bm) >> swizzle_log) as usize,
+            depth: n_splits,
+        };
+        let tg = MTLSize {
+            width: 64,
+            height: 1,
+            depth: 1,
+        };
+        enc.dispatch_threadgroups(grid, tg);
+        enc.end();
     }
 
     // Pass 2: reduce
     {
         let pass2_pipeline = registry.get_pipeline("splitk_reduce_f16", DType::Float16)?;
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pass2_pipeline);
-        enc.set_buffer(splitk_reduce::PARTIAL, Some(partial.metal_buffer()), 0);
-        enc.set_buffer(splitk_reduce::OUT, Some(out.metal_buffer()), 0);
+        let raw_enc = cb.computeCommandEncoder().unwrap();
+        let enc = ComputePass::new(&raw_enc);
+        enc.set_pipeline(&pass2_pipeline);
+        enc.set_buffer(
+            splitk_reduce::PARTIAL as u32,
+            Some(partial.metal_buffer()),
+            0,
+        );
+        enc.set_buffer(splitk_reduce::OUT as u32, Some(out.metal_buffer()), 0);
         set_u32(enc, splitk_reduce::M, m_u32);
         set_u32(enc, splitk_reduce::N, n_u32);
         set_u32(enc, splitk_reduce::N_SPLITS, splits_u32);
 
         let total = m * n;
         let tg_size = 256u64;
-        let n_groups = ceil_div(total, tg_size as usize) as u64;
-        enc.dispatch_thread_groups(MTLSize::new(n_groups, 1, 1), MTLSize::new(tg_size, 1, 1));
-        enc.end_encoding();
+        let n_groups = ceil_div(total, tg_size as usize);
+        enc.dispatch_threadgroups(
+            MTLSize {
+                width: n_groups,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: tg_size as usize,
+                height: 1,
+                depth: 1,
+            },
+        );
+        enc.end();
     }
 
     Ok(out)
@@ -7348,7 +7422,7 @@ fn dispatch_split_k_f16_encode(
     registry: &KernelRegistry,
     a: &Array,
     b: &Array,
-    encoder: &metal::ComputeCommandEncoderRef,
+    encoder: ComputePass<'_>,
     m: usize,
     n: usize,
     k: usize,
@@ -7378,45 +7452,62 @@ fn dispatch_split_k_f16_encode(
     let swizzle_log = compute_swizzle_log(m, n, bm, bn);
 
     // Pass 1: split-K accumulate into partial buffer
-    encoder.set_compute_pipeline_state(&pass1_pipeline);
-    encoder.set_buffer(splitk::A, Some(a.metal_buffer()), a.offset() as u64);
-    encoder.set_buffer(splitk::B, Some(b.metal_buffer()), b.offset() as u64);
-    encoder.set_buffer(splitk::PARTIAL, Some(partial.metal_buffer()), 0);
+    encoder.set_pipeline(&pass1_pipeline);
+    encoder.set_buffer(splitk::A as u32, Some(a.metal_buffer()), a.offset());
+    encoder.set_buffer(splitk::B as u32, Some(b.metal_buffer()), b.offset());
+    encoder.set_buffer(splitk::PARTIAL as u32, Some(partial.metal_buffer()), 0);
     set_u32(encoder, splitk::M, m_u32);
     set_u32(encoder, splitk::N, n_u32);
     set_u32(encoder, splitk::K, k_u32);
     set_u32(encoder, splitk::N_SPLITS, splits_u32);
     set_u32(encoder, 7, swizzle_log); // f16 split-K adds swizzle_log after n_splits
 
-    let grid = MTLSize::new(
-        (ceil_div(n, bn) << swizzle_log) as u64,
-        (ceil_div(m, bm) >> swizzle_log) as u64,
-        n_splits as u64,
-    );
-    let tg = MTLSize::new(64, 1, 1);
-    encoder.dispatch_thread_groups(grid, tg);
+    let grid = MTLSize {
+        width: (ceil_div(n, bn) << swizzle_log) as usize,
+        height: (ceil_div(m, bm) >> swizzle_log) as usize,
+        depth: n_splits,
+    };
+    let tg = MTLSize {
+        width: 64,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_threadgroups(grid, tg);
 
     // Memory barrier: ensure pass-1 writes to partial buffer are visible
     {
-        let buf_ref: &metal::BufferRef = partial.metal_buffer();
-        encoder.memory_barrier_with_resources(&[unsafe {
-            &*(buf_ref as *const metal::BufferRef as *const metal::ResourceRef)
-        }]);
+        let _buf_ref: &rmlx_metal::MtlBuffer = partial.metal_buffer();
+        rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
     }
 
     // Pass 2: reduce partial sums into final output
     let pass2_pipeline = registry.get_pipeline("splitk_reduce_f16", DType::Float16)?;
-    encoder.set_compute_pipeline_state(&pass2_pipeline);
-    encoder.set_buffer(splitk_reduce::PARTIAL, Some(partial.metal_buffer()), 0);
-    encoder.set_buffer(splitk_reduce::OUT, Some(out.metal_buffer()), 0);
+    encoder.set_pipeline(&pass2_pipeline);
+    encoder.set_buffer(
+        splitk_reduce::PARTIAL as u32,
+        Some(partial.metal_buffer()),
+        0,
+    );
+    encoder.set_buffer(splitk_reduce::OUT as u32, Some(out.metal_buffer()), 0);
     set_u32(encoder, splitk_reduce::M, m_u32);
     set_u32(encoder, splitk_reduce::N, n_u32);
     set_u32(encoder, splitk_reduce::N_SPLITS, splits_u32);
 
     let total = m * n;
     let tg_size = 256u64;
-    let n_groups = ceil_div(total, tg_size as usize) as u64;
-    encoder.dispatch_thread_groups(MTLSize::new(n_groups, 1, 1), MTLSize::new(tg_size, 1, 1));
+    let n_groups = ceil_div(total, tg_size as usize);
+    encoder.dispatch_threadgroups(
+        MTLSize {
+            width: n_groups,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg_size as usize,
+            height: 1,
+            depth: 1,
+        },
+    );
 
     Ok(out)
 }
@@ -7463,7 +7554,7 @@ pub fn matmul_into_cb(
     registry: &KernelRegistry,
     a: &Array,
     b: &Array,
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
 ) -> Result<Array, KernelError> {
     // --- Validation ---
     if a.ndim() != 2 {
@@ -7603,7 +7694,8 @@ pub fn matmul_into_cb(
     let dev = registry.device().raw();
     let out = Array::uninit(dev, &[m, n], a.dtype());
 
-    let enc = cb.new_compute_command_encoder();
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
     encode_gemm_core(
         enc,
         &pipeline,
@@ -7618,7 +7710,7 @@ pub fn matmul_into_cb(
         k * n,
         m * n,
     )?;
-    enc.end_encoding();
+    enc.end();
 
     Ok(out)
 }
@@ -7630,8 +7722,8 @@ pub fn matmul_into_cb(
 /// responsible for ending the encoder.
 #[allow(clippy::too_many_arguments)]
 fn encode_gemm_core(
-    enc: &metal::ComputeCommandEncoderRef,
-    pipeline: &metal::ComputePipelineState,
+    enc: ComputePass<'_>,
+    pipeline: &rmlx_metal::MtlPipeline,
     a: &Array,
     b: &Array,
     out: &Array,
@@ -7643,10 +7735,10 @@ fn encode_gemm_core(
     batch_stride_b: usize,
     batch_stride_c: usize,
 ) -> Result<(), KernelError> {
-    enc.set_compute_pipeline_state(pipeline);
-    enc.set_buffer(gemm::A, Some(a.metal_buffer()), a.offset() as u64);
-    enc.set_buffer(gemm::B, Some(b.metal_buffer()), b.offset() as u64);
-    enc.set_buffer(gemm::OUT, Some(out.metal_buffer()), 0);
+    enc.set_pipeline(pipeline);
+    enc.set_buffer(gemm::A as u32, Some(a.metal_buffer()), a.offset());
+    enc.set_buffer(gemm::B as u32, Some(b.metal_buffer()), b.offset());
+    enc.set_buffer(gemm::OUT as u32, Some(out.metal_buffer()), 0);
     set_u32(enc, gemm::M, super::checked_u32(m, "M")?);
     set_u32(enc, gemm::N, super::checked_u32(n, "N")?);
     set_u32(enc, gemm::K, super::checked_u32(k, "K")?);
@@ -7674,12 +7766,16 @@ fn encode_gemm_core(
         0
     };
 
-    let grid = MTLSize::new(
-        (ceil_div(n, tile.bn) << swizzle_log) as u64,
-        (ceil_div(m, tile.bm) >> swizzle_log) as u64,
-        1,
-    );
-    let tg = MTLSize::new(tile.variant.threads_per_tg(), 1, 1);
+    let grid = MTLSize {
+        width: (ceil_div(n, tile.bn) << swizzle_log) as usize,
+        height: (ceil_div(m, tile.bm) >> swizzle_log) as usize,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: tile.variant.threads_per_tg() as usize,
+        height: 1,
+        depth: 1,
+    };
 
     // MLX-architecture kernels (gemm_mlx_*) declare buffer(10)..buffer(13)
     // for fused residual/norm/gate epilogues. When called from a plain GEMM
@@ -7687,13 +7783,13 @@ fn encode_gemm_core(
     // kernel never reads these, but Metal validation still requires every
     // declared buffer slot to be bound. Use the output buffer as a dummy.
     if tile.variant.uses_function_constants() {
-        enc.set_buffer(gemm::RESIDUAL, Some(out.metal_buffer()), 0);
-        enc.set_buffer(gemm::NORM_WEIGHT, Some(out.metal_buffer()), 0);
-        enc.set_buffer(gemm::INV_RMS, Some(out.metal_buffer()), 0);
-        enc.set_buffer(gemm::GATE_RESULT, Some(out.metal_buffer()), 0);
+        enc.set_buffer(gemm::RESIDUAL as u32, Some(out.metal_buffer()), 0);
+        enc.set_buffer(gemm::NORM_WEIGHT as u32, Some(out.metal_buffer()), 0);
+        enc.set_buffer(gemm::INV_RMS as u32, Some(out.metal_buffer()), 0);
+        enc.set_buffer(gemm::GATE_RESULT as u32, Some(out.metal_buffer()), 0);
     }
 
-    enc.dispatch_thread_groups(grid, tg);
+    enc.dispatch_threadgroups(grid, tg);
 
     Ok(())
 }
@@ -7720,7 +7816,7 @@ pub fn matmul_encode(
     registry: &KernelRegistry,
     a: &Array,
     b: &Array,
-    encoder: &metal::ComputeCommandEncoderRef,
+    encoder: ComputePass<'_>,
 ) -> Result<Array, KernelError> {
     // --- Validation ---
     if a.ndim() != 2 {
@@ -7894,7 +7990,7 @@ pub fn matmul_add_residual_into_cb(
     a: &Array,
     b: &Array,
     residual: &Array,
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
 ) -> Result<Array, KernelError> {
     // --- Validation ---
     if a.ndim() != 2 {
@@ -8021,11 +8117,12 @@ pub fn matmul_add_residual_into_cb(
     let dev = registry.device().raw();
     let out = Array::uninit(dev, &[m, n], a.dtype());
 
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(gemm::A, Some(a.metal_buffer()), a.offset() as u64);
-    enc.set_buffer(gemm::B, Some(b.metal_buffer()), b.offset() as u64);
-    enc.set_buffer(gemm::OUT, Some(out.metal_buffer()), 0);
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
+    enc.set_buffer(gemm::A as u32, Some(a.metal_buffer()), a.offset());
+    enc.set_buffer(gemm::B as u32, Some(b.metal_buffer()), b.offset());
+    enc.set_buffer(gemm::OUT as u32, Some(out.metal_buffer()), 0);
     set_u32(enc, gemm::M, super::checked_u32(m, "M")?);
     set_u32(enc, gemm::N, super::checked_u32(n, "N")?);
     set_u32(enc, gemm::K, super::checked_u32(k, "K")?);
@@ -8049,17 +8146,24 @@ pub fn matmul_add_residual_into_cb(
     set_u32(enc, gemm::SWIZZLE_LOG, swizzle_log);
 
     enc.set_buffer(
-        gemm::RESIDUAL,
+        gemm::RESIDUAL as u32,
         Some(residual.metal_buffer()),
-        residual.offset() as u64,
+        residual.offset(),
     );
-
-    let grid_x = (ceil_div(n, tile.bn) << swizzle_log) as u64;
-    let grid_y = (ceil_div(m, tile.bm) >> swizzle_log) as u64;
-    let grid = MTLSize::new(grid_x, grid_y, 1);
-    let tg = MTLSize::new(tile.variant.threads_per_tg(), 1, 1);
-    enc.dispatch_thread_groups(grid, tg);
-    enc.end_encoding();
+    let grid_x = (ceil_div(n, tile.bn) << swizzle_log) as usize;
+    let grid_y = (ceil_div(m, tile.bm) >> swizzle_log) as usize;
+    let grid = MTLSize {
+        width: grid_x,
+        height: grid_y,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: tile.variant.threads_per_tg() as usize,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threadgroups(grid, tg);
+    enc.end();
 
     Ok(out)
 }
@@ -8085,7 +8189,7 @@ pub fn matmul_add_residual_encode(
     a: &Array,
     b: &Array,
     residual: &Array,
-    encoder: &metal::ComputeCommandEncoderRef,
+    encoder: ComputePass<'_>,
 ) -> Result<Array, KernelError> {
     // --- Validation ---
     if a.ndim() != 2 {
@@ -8213,10 +8317,10 @@ pub fn matmul_add_residual_encode(
     let out = Array::uninit(dev, &[m, n], a.dtype());
 
     // Encode into the provided encoder — do NOT call end_encoding()
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(gemm::A, Some(a.metal_buffer()), a.offset() as u64);
-    encoder.set_buffer(gemm::B, Some(b.metal_buffer()), b.offset() as u64);
-    encoder.set_buffer(gemm::OUT, Some(out.metal_buffer()), 0);
+    encoder.set_pipeline(&pipeline);
+    encoder.set_buffer(gemm::A as u32, Some(a.metal_buffer()), a.offset());
+    encoder.set_buffer(gemm::B as u32, Some(b.metal_buffer()), b.offset());
+    encoder.set_buffer(gemm::OUT as u32, Some(out.metal_buffer()), 0);
     set_u32(encoder, gemm::M, super::checked_u32(m, "M")?);
     set_u32(encoder, gemm::N, super::checked_u32(n, "N")?);
     set_u32(encoder, gemm::K, super::checked_u32(k, "K")?);
@@ -8240,16 +8344,23 @@ pub fn matmul_add_residual_encode(
     set_u32(encoder, gemm::SWIZZLE_LOG, swizzle_log);
 
     encoder.set_buffer(
-        gemm::RESIDUAL,
+        gemm::RESIDUAL as u32,
         Some(residual.metal_buffer()),
-        residual.offset() as u64,
+        residual.offset(),
     );
-
-    let grid_x = (ceil_div(n, tile.bn) << swizzle_log) as u64;
-    let grid_y = (ceil_div(m, tile.bm) >> swizzle_log) as u64;
-    let grid = MTLSize::new(grid_x, grid_y, 1);
-    let tg = MTLSize::new(tile.variant.threads_per_tg(), 1, 1);
-    encoder.dispatch_thread_groups(grid, tg);
+    let grid_x = (ceil_div(n, tile.bn) << swizzle_log) as usize;
+    let grid_y = (ceil_div(m, tile.bm) >> swizzle_log) as usize;
+    let grid = MTLSize {
+        width: grid_x,
+        height: grid_y,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: tile.variant.threads_per_tg() as usize,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_threadgroups(grid, tg);
 
     Ok(out)
 }
@@ -8274,7 +8385,7 @@ pub fn matmul_norm_gemm_into_cb(
     b: &Array,
     norm_weight: &Array,
     eps: f32,
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
 ) -> Result<Array, KernelError> {
     // --- Validation ---
     if a.ndim() != 2 || b.ndim() != 2 {
@@ -8364,11 +8475,12 @@ pub fn matmul_norm_gemm_into_cb(
     let dev = registry.device().raw();
     let out = Array::uninit(dev, &[m, n], a.dtype());
 
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(gemm::A, Some(a.metal_buffer()), a.offset() as u64);
-    enc.set_buffer(gemm::B, Some(b.metal_buffer()), b.offset() as u64);
-    enc.set_buffer(gemm::OUT, Some(out.metal_buffer()), 0);
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
+    enc.set_buffer(gemm::A as u32, Some(a.metal_buffer()), a.offset());
+    enc.set_buffer(gemm::B as u32, Some(b.metal_buffer()), b.offset());
+    enc.set_buffer(gemm::OUT as u32, Some(out.metal_buffer()), 0);
     set_u32(enc, gemm::M, super::checked_u32(m, "M")?);
     set_u32(enc, gemm::N, super::checked_u32(n, "N")?);
     set_u32(enc, gemm::K, super::checked_u32(k, "K")?);
@@ -8392,22 +8504,29 @@ pub fn matmul_norm_gemm_into_cb(
     set_u32(enc, gemm::SWIZZLE_LOG, swizzle_log);
 
     // Residual (dummy, not used when has_residual=false)
-    enc.set_buffer(gemm::RESIDUAL, Some(out.metal_buffer()), 0);
+    enc.set_buffer(gemm::RESIDUAL as u32, Some(out.metal_buffer()), 0);
     // norm_weight [K]
     enc.set_buffer(
-        gemm::NORM_WEIGHT,
+        gemm::NORM_WEIGHT as u32,
         Some(norm_weight.metal_buffer()),
-        norm_weight.offset() as u64,
+        norm_weight.offset(),
     );
     // inv_rms [M]
-    enc.set_buffer(gemm::INV_RMS, Some(inv_rms.metal_buffer()), 0);
-
-    let grid_x = (ceil_div(n, tile.bn) << swizzle_log) as u64;
-    let grid_y = (ceil_div(m, tile.bm) >> swizzle_log) as u64;
-    let grid = MTLSize::new(grid_x, grid_y, 1);
-    let tg = MTLSize::new(tile.variant.threads_per_tg(), 1, 1);
-    enc.dispatch_thread_groups(grid, tg);
-    enc.end_encoding();
+    enc.set_buffer(gemm::INV_RMS as u32, Some(inv_rms.metal_buffer()), 0);
+    let grid_x = (ceil_div(n, tile.bn) << swizzle_log) as usize;
+    let grid_y = (ceil_div(m, tile.bm) >> swizzle_log) as usize;
+    let grid = MTLSize {
+        width: grid_x,
+        height: grid_y,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: tile.variant.threads_per_tg() as usize,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threadgroups(grid, tg);
+    enc.end();
 
     Ok(out)
 }
@@ -8426,7 +8545,7 @@ pub fn matmul_norm_gemm_encode(
     b: &Array,
     norm_weight: &Array,
     eps: f32,
-    encoder: &metal::ComputeCommandEncoderRef,
+    encoder: ComputePass<'_>,
 ) -> Result<Array, KernelError> {
     // --- Validation ---
     if a.ndim() != 2 || b.ndim() != 2 {
@@ -8485,10 +8604,8 @@ pub fn matmul_norm_gemm_encode(
 
     // Memory barrier: inv_rms must be visible before the GEMM reads it.
     {
-        let buf_ref: &metal::BufferRef = inv_rms.metal_buffer();
-        encoder.memory_barrier_with_resources(&[unsafe {
-            &*(buf_ref as *const metal::BufferRef as *const metal::ResourceRef)
-        }]);
+        let _buf_ref: &rmlx_metal::MtlBuffer = inv_rms.metal_buffer();
+        rmlx_metal::memory_barrier_scope_buffers(encoder.raw());
     }
 
     // --- Pass 2: GEMM with has_norm=true ---
@@ -8517,10 +8634,10 @@ pub fn matmul_norm_gemm_encode(
     let dev = registry.device().raw();
     let out = Array::uninit(dev, &[m, n], a.dtype());
 
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(gemm::A, Some(a.metal_buffer()), a.offset() as u64);
-    encoder.set_buffer(gemm::B, Some(b.metal_buffer()), b.offset() as u64);
-    encoder.set_buffer(gemm::OUT, Some(out.metal_buffer()), 0);
+    encoder.set_pipeline(&pipeline);
+    encoder.set_buffer(gemm::A as u32, Some(a.metal_buffer()), a.offset());
+    encoder.set_buffer(gemm::B as u32, Some(b.metal_buffer()), b.offset());
+    encoder.set_buffer(gemm::OUT as u32, Some(out.metal_buffer()), 0);
     set_u32(encoder, gemm::M, super::checked_u32(m, "M")?);
     set_u32(encoder, gemm::N, super::checked_u32(n, "N")?);
     set_u32(encoder, gemm::K, super::checked_u32(k, "K")?);
@@ -8544,21 +8661,28 @@ pub fn matmul_norm_gemm_encode(
     set_u32(encoder, gemm::SWIZZLE_LOG, swizzle_log);
 
     // Residual (dummy, not used when has_residual=false)
-    encoder.set_buffer(gemm::RESIDUAL, Some(out.metal_buffer()), 0);
+    encoder.set_buffer(gemm::RESIDUAL as u32, Some(out.metal_buffer()), 0);
     // norm_weight [K]
     encoder.set_buffer(
-        gemm::NORM_WEIGHT,
+        gemm::NORM_WEIGHT as u32,
         Some(norm_weight.metal_buffer()),
-        norm_weight.offset() as u64,
+        norm_weight.offset(),
     );
     // inv_rms [M]
-    encoder.set_buffer(gemm::INV_RMS, Some(inv_rms.metal_buffer()), 0);
-
-    let grid_x = (ceil_div(n, tile.bn) << swizzle_log) as u64;
-    let grid_y = (ceil_div(m, tile.bm) >> swizzle_log) as u64;
-    let grid = MTLSize::new(grid_x, grid_y, 1);
-    let tg = MTLSize::new(tile.variant.threads_per_tg(), 1, 1);
-    encoder.dispatch_thread_groups(grid, tg);
+    encoder.set_buffer(gemm::INV_RMS as u32, Some(inv_rms.metal_buffer()), 0);
+    let grid_x = (ceil_div(n, tile.bn) << swizzle_log) as usize;
+    let grid_y = (ceil_div(m, tile.bm) >> swizzle_log) as usize;
+    let grid = MTLSize {
+        width: grid_x,
+        height: grid_y,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: tile.variant.threads_per_tg() as usize,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_threadgroups(grid, tg);
 
     Ok(out)
 }
@@ -8578,7 +8702,7 @@ pub fn matmul_swiglu_gemm_into_cb(
     a: &Array,
     b: &Array,
     gate_result: &Array,
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
 ) -> Result<Array, KernelError> {
     if a.ndim() != 2 || b.ndim() != 2 {
         return Err(KernelError::InvalidShape(
@@ -8639,11 +8763,12 @@ pub fn matmul_swiglu_gemm_into_cb(
     let dev = registry.device().raw();
     let out = Array::uninit(dev, &[m, n], a.dtype());
 
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(gemm::A, Some(a.metal_buffer()), a.offset() as u64);
-    enc.set_buffer(gemm::B, Some(b.metal_buffer()), b.offset() as u64);
-    enc.set_buffer(gemm::OUT, Some(out.metal_buffer()), 0);
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
+    enc.set_buffer(gemm::A as u32, Some(a.metal_buffer()), a.offset());
+    enc.set_buffer(gemm::B as u32, Some(b.metal_buffer()), b.offset());
+    enc.set_buffer(gemm::OUT as u32, Some(out.metal_buffer()), 0);
     set_u32(enc, gemm::M, super::checked_u32(m, "M")?);
     set_u32(enc, gemm::N, super::checked_u32(n, "N")?);
     set_u32(enc, gemm::K, super::checked_u32(k, "K")?);
@@ -8667,17 +8792,24 @@ pub fn matmul_swiglu_gemm_into_cb(
     set_u32(enc, gemm::SWIZZLE_LOG, swizzle_log);
 
     enc.set_buffer(
-        gemm::GATE_RESULT,
+        gemm::GATE_RESULT as u32,
         Some(gate_result.metal_buffer()),
-        gate_result.offset() as u64,
+        gate_result.offset(),
     );
-
-    let grid_x = (ceil_div(n, tile.bn) << swizzle_log) as u64;
-    let grid_y = (ceil_div(m, tile.bm) >> swizzle_log) as u64;
-    let grid = MTLSize::new(grid_x, grid_y, 1);
-    let tg = MTLSize::new(tile.variant.threads_per_tg(), 1, 1);
-    enc.dispatch_thread_groups(grid, tg);
-    enc.end_encoding();
+    let grid_x = (ceil_div(n, tile.bn) << swizzle_log) as usize;
+    let grid_y = (ceil_div(m, tile.bm) >> swizzle_log) as usize;
+    let grid = MTLSize {
+        width: grid_x,
+        height: grid_y,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: tile.variant.threads_per_tg() as usize,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threadgroups(grid, tg);
+    enc.end();
 
     Ok(out)
 }
@@ -8692,7 +8824,7 @@ pub fn dispatch_grouped_gemm(
     registry: &KernelRegistry,
     a_stacked: &Array,
     b_stacked: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
     expert_ms: &[usize],
     k: usize,
     n: usize,
@@ -8733,54 +8865,75 @@ pub fn dispatch_grouped_gemm(
     }
 
     // Create Metal buffers for metadata
-    let opts = metal::MTLResourceOptions::StorageModeShared;
-    let offsets_buf = dev.new_buffer_with_data(
-        problem_offsets.as_ptr() as *const _,
-        (problem_offsets.len() * 4) as u64,
-        opts,
-    );
-    let tile_map_buf = dev.new_buffer_with_data(
-        tile_to_problem.as_ptr() as *const _,
-        (tile_to_problem.len() * 4) as u64,
-        opts,
-    );
-    let tile_off_buf = dev.new_buffer_with_data(
-        tile_offsets.as_ptr() as *const _,
-        (tile_offsets.len() * 4) as u64,
-        opts,
-    );
+    let opts = MTLResourceOptions::StorageModeShared;
+    let offsets_buf = unsafe {
+        dev.newBufferWithBytes_length_options(
+            std::ptr::NonNull::new(problem_offsets.as_ptr() as *const _ as *mut std::ffi::c_void)
+                .unwrap(),
+            (problem_offsets.len() * 4) as u64 as usize,
+            opts,
+        )
+        .unwrap()
+    };
+    let tile_map_buf = unsafe {
+        dev.newBufferWithBytes_length_options(
+            std::ptr::NonNull::new(tile_to_problem.as_ptr() as *const _ as *mut std::ffi::c_void)
+                .unwrap(),
+            (tile_to_problem.len() * 4) as u64 as usize,
+            opts,
+        )
+        .unwrap()
+    };
+    let tile_off_buf = unsafe {
+        dev.newBufferWithBytes_length_options(
+            std::ptr::NonNull::new(tile_offsets.as_ptr() as *const _ as *mut std::ffi::c_void)
+                .unwrap(),
+            (tile_offsets.len() * 4) as u64 as usize,
+            opts,
+        )
+        .unwrap()
+    };
 
     let out = Array::uninit(dev, &[total_m, n], DType::Float16);
 
     let pipeline = registry.get_pipeline("grouped_gemm_mlx_f16", DType::Float16)?;
 
-    let cb = queue.new_command_buffer();
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
+    let cb = queue.commandBuffer().unwrap();
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
     enc.set_buffer(
-        grouped_gemm::A_STACKED,
+        grouped_gemm::A_STACKED as u32,
         Some(a_stacked.metal_buffer()),
-        a_stacked.offset() as u64,
+        a_stacked.offset(),
     );
     enc.set_buffer(
-        grouped_gemm::B_STACKED,
+        grouped_gemm::B_STACKED as u32,
         Some(b_stacked.metal_buffer()),
-        b_stacked.offset() as u64,
+        b_stacked.offset(),
     );
-    enc.set_buffer(grouped_gemm::OUT, Some(out.metal_buffer()), 0);
-    enc.set_buffer(grouped_gemm::OFFSETS, Some(&offsets_buf), 0);
-    enc.set_buffer(grouped_gemm::TILE_MAP, Some(&tile_map_buf), 0);
-    enc.set_buffer(grouped_gemm::TILE_OFF, Some(&tile_off_buf), 0);
+    enc.set_buffer(grouped_gemm::OUT as u32, Some(out.metal_buffer()), 0);
+    enc.set_buffer(grouped_gemm::OFFSETS as u32, Some(&offsets_buf), 0);
+    enc.set_buffer(grouped_gemm::TILE_MAP as u32, Some(&tile_map_buf), 0);
+    enc.set_buffer(grouped_gemm::TILE_OFF as u32, Some(&tile_off_buf), 0);
     set_u32(enc, grouped_gemm::K, super::checked_u32(k, "K")?);
     set_u32(enc, grouped_gemm::N, super::checked_u32(n, "N")?);
 
     // 1D grid: total_tiles threadgroups, 64 threads each
-    let grid = MTLSize::new(total_tiles as u64, 1, 1);
-    let tg = MTLSize::new(64, 1, 1);
-    enc.dispatch_thread_groups(grid, tg);
-    enc.end_encoding();
+    let grid = MTLSize {
+        width: total_tiles,
+        height: 1,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: 64,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threadgroups(grid, tg);
+    enc.end();
 
-    super::commit_with_mode(cb, super::ExecMode::Sync);
+    super::commit_with_mode(&cb, super::ExecMode::Sync);
     Ok(out)
 }
 
@@ -8797,7 +8950,7 @@ pub fn dispatch_grouped_gemm(
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_grouped_splitk(
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
     a_stacked: &Array,
     b_stacked: &Array,
     expert_ms: &[usize],
@@ -8871,80 +9024,121 @@ pub fn dispatch_grouped_splitk(
     )?;
 
     // Create Metal buffers for metadata
-    let opts = metal::MTLResourceOptions::StorageModeShared;
-    let offsets_buf = dev.new_buffer_with_data(
-        problem_offsets.as_ptr() as *const _,
-        (problem_offsets.len() * 4) as u64,
-        opts,
-    );
-    let tile_map_buf = dev.new_buffer_with_data(
-        tile_to_problem.as_ptr() as *const _,
-        (tile_to_problem.len() * 4) as u64,
-        opts,
-    );
-    let tile_off_buf = dev.new_buffer_with_data(
-        tile_offsets.as_ptr() as *const _,
-        (tile_offsets.len() * 4) as u64,
-        opts,
-    );
+    let opts = MTLResourceOptions::StorageModeShared;
+    let offsets_buf = unsafe {
+        dev.newBufferWithBytes_length_options(
+            std::ptr::NonNull::new(problem_offsets.as_ptr() as *const _ as *mut std::ffi::c_void)
+                .unwrap(),
+            (problem_offsets.len() * 4) as u64 as usize,
+            opts,
+        )
+        .unwrap()
+    };
+    let tile_map_buf = unsafe {
+        dev.newBufferWithBytes_length_options(
+            std::ptr::NonNull::new(tile_to_problem.as_ptr() as *const _ as *mut std::ffi::c_void)
+                .unwrap(),
+            (tile_to_problem.len() * 4) as u64 as usize,
+            opts,
+        )
+        .unwrap()
+    };
+    let tile_off_buf = unsafe {
+        dev.newBufferWithBytes_length_options(
+            std::ptr::NonNull::new(tile_offsets.as_ptr() as *const _ as *mut std::ffi::c_void)
+                .unwrap(),
+            (tile_offsets.len() * 4) as u64 as usize,
+            opts,
+        )
+        .unwrap()
+    };
 
     let k_u32 = super::checked_u32(k, "K")?;
     let n_u32 = super::checked_u32(n, "N")?;
     let total_m_u32 = super::checked_u32(total_m, "total_M")?;
     let splits_u32 = super::checked_u32(n_splits, "n_splits")?;
 
-    let cb = queue.new_command_buffer();
+    let cb = queue.commandBuffer().unwrap();
 
     // Pass 1: grouped split-K
     {
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pass1_pipeline);
+        let raw_enc = cb.computeCommandEncoder().unwrap();
+        let enc = ComputePass::new(&raw_enc);
+        enc.set_pipeline(&pass1_pipeline);
         enc.set_buffer(
-            grouped_splitk::A_STACKED,
+            grouped_splitk::A_STACKED as u32,
             Some(a_stacked.metal_buffer()),
-            a_stacked.offset() as u64,
+            a_stacked.offset(),
         );
         enc.set_buffer(
-            grouped_splitk::B_STACKED,
+            grouped_splitk::B_STACKED as u32,
             Some(b_stacked.metal_buffer()),
-            b_stacked.offset() as u64,
+            b_stacked.offset(),
         );
-        enc.set_buffer(grouped_splitk::PARTIAL, Some(partial.metal_buffer()), 0);
-        enc.set_buffer(grouped_splitk::OFFSETS, Some(&offsets_buf), 0);
-        enc.set_buffer(grouped_splitk::TILE_MAP, Some(&tile_map_buf), 0);
-        enc.set_buffer(grouped_splitk::TILE_OFF, Some(&tile_off_buf), 0);
+        enc.set_buffer(
+            grouped_splitk::PARTIAL as u32,
+            Some(partial.metal_buffer()),
+            0,
+        );
+        enc.set_buffer(grouped_splitk::OFFSETS as u32, Some(&offsets_buf), 0);
+        enc.set_buffer(grouped_splitk::TILE_MAP as u32, Some(&tile_map_buf), 0);
+        enc.set_buffer(grouped_splitk::TILE_OFF as u32, Some(&tile_off_buf), 0);
         set_u32(enc, grouped_splitk::K, k_u32);
         set_u32(enc, grouped_splitk::N, n_u32);
         set_u32(enc, grouped_splitk::TOTAL_M, total_m_u32);
         set_u32(enc, grouped_splitk::N_SPLITS, splits_u32);
 
         // Grid: (total_tiles, 1, n_splits)
-        let grid = MTLSize::new(total_tiles as u64, 1, n_splits as u64);
-        let tg = MTLSize::new(64, 1, 1);
-        enc.dispatch_thread_groups(grid, tg);
-        enc.end_encoding();
+        let grid = MTLSize {
+            width: total_tiles,
+            height: 1,
+            depth: n_splits,
+        };
+        let tg = MTLSize {
+            width: 64,
+            height: 1,
+            depth: 1,
+        };
+        enc.dispatch_threadgroups(grid, tg);
+        enc.end();
     }
 
     // Pass 2: reduce f32 partials → f16 output
     // Reuse splitk_reduce_f16: it sums n_splits planes of size total_M * N
     {
         let pass2_pipeline = registry.get_pipeline("splitk_reduce_f16", DType::Float16)?;
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pass2_pipeline);
-        enc.set_buffer(splitk_reduce::PARTIAL, Some(partial.metal_buffer()), 0);
-        enc.set_buffer(splitk_reduce::OUT, Some(out.metal_buffer()), 0);
+        let raw_enc = cb.computeCommandEncoder().unwrap();
+        let enc = ComputePass::new(&raw_enc);
+        enc.set_pipeline(&pass2_pipeline);
+        enc.set_buffer(
+            splitk_reduce::PARTIAL as u32,
+            Some(partial.metal_buffer()),
+            0,
+        );
+        enc.set_buffer(splitk_reduce::OUT as u32, Some(out.metal_buffer()), 0);
         set_u32(enc, splitk_reduce::M, total_m_u32);
         set_u32(enc, splitk_reduce::N, n_u32);
         set_u32(enc, splitk_reduce::N_SPLITS, splits_u32);
 
         let total_elems = total_m * n;
         let tg_size = 256u64;
-        let n_groups = ceil_div(total_elems, tg_size as usize) as u64;
-        enc.dispatch_thread_groups(MTLSize::new(n_groups, 1, 1), MTLSize::new(tg_size, 1, 1));
-        enc.end_encoding();
+        let n_groups = ceil_div(total_elems, tg_size as usize);
+        enc.dispatch_threadgroups(
+            MTLSize {
+                width: n_groups,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: tg_size as usize,
+                height: 1,
+                depth: 1,
+            },
+        );
+        enc.end();
     }
 
-    super::commit_with_mode(cb, super::ExecMode::Sync);
+    super::commit_with_mode(&cb, super::ExecMode::Sync);
     Ok(out)
 }
 

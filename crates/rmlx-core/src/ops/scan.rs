@@ -7,7 +7,14 @@
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
-use metal::MTLSize;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLCommandBuffer as _;
+use objc2_metal::MTLCommandQueue as _;
+use objc2_metal::MTLComputePipelineState as _;
+use objc2_metal::MTLDevice as _;
+use rmlx_metal::ComputePass;
+use rmlx_metal::MTLResourceOptions;
+use rmlx_metal::MTLSize;
 
 // ---------------------------------------------------------------------------
 // Metal shader source
@@ -125,25 +132,33 @@ pub fn register(registry: &KernelRegistry) -> Result<(), KernelError> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn make_u32_buf(device: &metal::Device, val: u32) -> metal::Buffer {
-    device.new_buffer_with_data(
-        &val as *const u32 as *const std::ffi::c_void,
-        4,
-        metal::MTLResourceOptions::StorageModeShared,
-    )
+fn make_u32_buf(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    val: u32,
+) -> rmlx_metal::MtlBuffer {
+    unsafe {
+        device
+            .newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(
+                    &val as *const u32 as *const std::ffi::c_void as *mut std::ffi::c_void,
+                )
+                .unwrap(),
+                4_usize,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap()
+    }
 }
 
-// ---------------------------------------------------------------------------
-// Internal: dispatch a scan kernel along the last axis of a 2D array.
-// ---------------------------------------------------------------------------
-
+// --------------------------------------------------------------------------- // Internal: dispatch a scan kernel along the last axis of a 2D array. // ---------------------------------------------------------------------------
 fn dispatch_scan_2d(
     registry: &KernelRegistry,
     input_2d: &Array,
     kernel_name: &str,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     let rows = input_2d.shape()[0];
+
     let cols = input_2d.shape()[1];
 
     let pipeline = registry.get_pipeline(kernel_name, DType::Float32)?;
@@ -152,18 +167,29 @@ fn dispatch_scan_2d(
 
     let cols_buf = make_u32_buf(dev, cols as u32);
 
-    let cb = queue.new_command_buffer();
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(input_2d.metal_buffer()), input_2d.offset() as u64);
+    let cb = queue.commandBuffer().unwrap();
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
+    enc.set_buffer(0, Some(input_2d.metal_buffer()), input_2d.offset());
     enc.set_buffer(1, Some(out.metal_buffer()), 0);
     enc.set_buffer(2, Some(&cols_buf), 0);
-
-    let tg_size = std::cmp::min(cols as u64, pipeline.max_total_threads_per_threadgroup());
+    let tg_size = std::cmp::min(cols, pipeline.maxTotalThreadsPerThreadgroup());
     let tg_size = std::cmp::min(tg_size, 1024);
-    enc.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), MTLSize::new(tg_size, 1, 1));
-    enc.end_encoding();
-    super::commit_with_mode(cb, super::ExecMode::Sync);
+    enc.dispatch_threadgroups(
+        MTLSize {
+            width: rows,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        },
+    );
+    enc.end();
+    super::commit_with_mode(&cb, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -176,7 +202,7 @@ fn prepare_2d(
     input: &Array,
     axis: usize,
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<(Array, Vec<usize>), KernelError> {
     let ndim = input.ndim();
     let shape = input.shape();
@@ -208,7 +234,7 @@ fn restore_shape(
     axis: usize,
     original_shape: &[usize],
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     let ndim = original_shape.len();
     if axis == ndim - 1 {
@@ -252,7 +278,7 @@ pub fn cumsum(
     registry: &KernelRegistry,
     input: &Array,
     axis: usize,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     validate_scan_input(input, axis)?;
 
@@ -273,7 +299,7 @@ pub fn cumprod(
     registry: &KernelRegistry,
     input: &Array,
     axis: usize,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     validate_scan_input(input, axis)?;
 
@@ -313,18 +339,21 @@ fn validate_scan_input(input: &Array, axis: usize) -> Result<(), KernelError> {
 mod tests {
     use super::*;
 
-    fn setup() -> (KernelRegistry, metal::CommandQueue) {
-        let device = rmlx_metal::device::GpuDevice::system_default().expect("Metal device");
-        let queue = device.raw().new_command_queue();
+    fn setup() -> Option<(KernelRegistry, rmlx_metal::MtlQueue)> {
+        let device = crate::test_utils::test_gpu()?;
+        let queue = device.new_command_queue();
         let registry = KernelRegistry::new(device);
         register(&registry).expect("register scan kernels");
         crate::ops::copy::register(&registry).expect("register copy kernels");
-        (registry, queue)
+        Some((registry, queue))
     }
 
     #[test]
     fn test_cumsum_1d() {
-        let (reg, q) = setup();
+        let Some((reg, q)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = reg.device().raw();
         let input = Array::from_slice(dev, &[1.0f32, 2.0, 3.0, 4.0, 5.0], vec![5]);
         let out = cumsum(&reg, &input, 0, &q).unwrap();
@@ -334,7 +363,10 @@ mod tests {
 
     #[test]
     fn test_cumprod_1d() {
-        let (reg, q) = setup();
+        let Some((reg, q)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = reg.device().raw();
         let input = Array::from_slice(dev, &[1.0f32, 2.0, 3.0, 4.0], vec![4]);
         let out = cumprod(&reg, &input, 0, &q).unwrap();
@@ -344,7 +376,10 @@ mod tests {
 
     #[test]
     fn test_cumsum_2d_axis1() {
-        let (reg, q) = setup();
+        let Some((reg, q)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = reg.device().raw();
         // [[1, 2, 3], [4, 5, 6]]
         let input = Array::from_slice(dev, &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]);

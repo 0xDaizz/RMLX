@@ -13,7 +13,7 @@
 | Feature | RMLX | MLX | CUDA (PyTorch / vLLM) |
 |---------|------|-----|-----------------------|
 | **Language** | Rust 1.80+ | C++ / Python (nanobind) | C++ / Python (pybind11) |
-| **GPU API** | Apple Metal (metal-rs 0.31) | Apple Metal (metal-cpp) | NVIDIA CUDA |
+| **GPU API** | Apple Metal (objc2-metal 0.3) | Apple Metal (metal-cpp) | NVIDIA CUDA |
 | **Memory model** | Unified Memory (UMA) | Unified Memory (UMA) | Discrete VRAM + host RAM |
 | **Execution model** | Eager-first (selective tracing for prefill) | Lazy evaluation (graph-level fusion) | Eager (PyTorch) / Graph (CUDA Graphs) |
 | **CB management** | ExecGraph + 9-dispatch: 65 CBs/layer -> 1 CB with 9 dispatches (64x speedup vs per-op baseline, 6.34x faster than MLX at 60L) | 1 CB per eval() batch | Stream-ordered, CUDA Graphs capture-replay |
@@ -34,11 +34,11 @@
 | **GGUF model loading** | Yes | Yes | Yes |
 | **Test suite** | 1,298+ tests | Extensive | Extensive |
 | **Prefill optimization** | Phase A: single-CB pipeline, GQA slab SDPA, 3.5-7.3x speedup | Lazy eval graph fusion | CUDA Graphs + cuBLAS |
-| **GEMM TFLOPS** | 23.82T (Phase D2, -0.6% vs MLX) | 23.97T | cuBLAS |
+| **GEMM TFLOPS** | 24.05T (pipe parity) | 23.97T | cuBLAS |
 | **Quantized inference** | QMM MMA Q4/Q8, QMV qdot, no CPU fallback | Yes | Yes |
-| **QMV vs MLX** | Q4 1.15x, Q8 1.08x (Phase J near-parity) | -- | -- |
-| **QMM vs MLX** | Q4 2.55x gap (Phase J, was 4.78x) | -- | -- |
-| **Phases complete** | 0-9B-opt + S1-S5 + Phase KO + 8c + 9-11 + A-D + F-J | N/A (stable release) | N/A (stable release) |
+| **QMV vs MLX** | Q4 near-parity, Q8 near-parity | -- | -- |
+| **QMM vs MLX** | Q4 M=512: 17.43T (+28% vs MLX 13.6T) | -- | -- |
+| **Phases complete** | 0-9B-opt + S1-S5 + Phase KO + 8c + 9-11 + A-D + F-J + objc2-metal migration | N/A (stable release) | N/A (stable release) |
 
 ---
 
@@ -82,7 +82,9 @@ Numerical parity is maintained: max_diff = 6.4e-6 between baseline and ExecGraph
 | Speedup vs baseline | 17.4x | 64x |
 | vs MLX compiled (60L) | ~4.8x slower | **6.34x faster** |
 | Latency (Cached 2-enc, 60L) | — | 714 us/L (6x lower σ) |
-| Latency (Fused 7-dispatch, 60L) | — | **703.4 us/L** (Phase 10 best) |
+| Latency (Fused 7-dispatch, 60L) | — | **699.3 us/L** (7-dispatch fused) |
+
+**Fair benchmark (M=32~256)**: RMLX achieves 1.24-2.83x faster throughput than MLX across medium batch sizes due to lower dispatch overhead.
 
 The 9-dispatch path is 6.34x faster than MLX's compiled execution at 60-layer depth through merged QKV/gate_up weight projections, batched RoPE, slab-layout SDPA decode, fused GEMV+bias, StorageModePrivate weights, and Array::uninit for output buffers. Multi-layer CB amortization reduces per-layer overhead from 1,739 us (single) to 751 us/L (60L).
 
@@ -263,14 +265,14 @@ CUDA has decades of optimization across compilers (NVCC, Triton), libraries (cuB
 | **CB reduction** | 65 -> 1 per layer (98.5%) | Full coalescing into single graph |
 | **Sync model** | MTLSharedEvent (non-blocking) | CUDA events (stream-ordered) |
 | **Shape dynamism** | Re-encode handles shape changes naturally | Must re-capture or use CUDA Graph updates |
-| **Latency** | ~0.70ms per layer at 60L (fused 7-dispatch) | Sub-millisecond replay |
+| **Latency** | ~0.70ms per layer at 60L (7-dispatch fused) | Sub-millisecond replay |
 | **Speedup over baseline** | 64x | Typically 2-5x (already from efficient baseline) |
 | **Implementation complexity** | Moderate (deterministic sequencing) | Low (capture API is straightforward) |
 | **Memory overhead** | Minimal (re-encode reuses buffers) | Graph storage (captured operations) |
 
 **Key insight**: ExecGraph's 64x speedup comes from collapsing the decode path into 9 dispatches in a single command buffer. CUDA's baseline is already more efficient due to stream-ordered execution, so CUDA Graphs provides a smaller relative improvement from a stronger starting point.
 
-**Phase A/B/C/D update**: The prefill path now also uses a single-CB pipeline (54 sync points reduced to 1), GQA slab SDPA (32 per-head dispatches reduced to 1), and GEMM threadgroup swizzle. Single-layer prefill achieves 3.5-7.3x speedup over baseline, with MLX parity within 1.2-3.4x. GEMM throughput has been optimized from 13T to 23.82T TFLOPS through config sweep (Phase B), kernel-level optimization (Phase C), and MLX-architecture kernel (Phase D2), narrowing the gap vs MLX (23.97T) to **-0.6%**. Phase F adds GatherMM MMA (4-12x for MoE). Phase G upgrades QMM/QMV to MMA/qdot. Phase H-2 adds GEMM+residual fusion (5-12%). Phase I-1 adds distributed TP (1.94x at TP=2).
+**Phase A/B/C/D update**: The prefill path now also uses a single-CB pipeline (54 sync points reduced to 1), GQA slab SDPA (32 per-head dispatches reduced to 1), and GEMM threadgroup swizzle. Single-layer prefill achieves 3.5-7.3x speedup over baseline, with MLX parity within 1.2-3.4x. GEMM throughput has been optimized from 13T to 24.05T TFLOPS through config sweep (Phase B), kernel-level optimization (Phase C), MLX-architecture kernel (Phase D2), and production pipeline integration, reaching pipe parity with MLX (23.97T). Phase F adds GatherMM MMA (4-12x for MoE). Phase G upgrades QMM/QMV to MMA/qdot. Phase H-2 adds GEMM+residual fusion (5-12%). Phase I-1 adds distributed TP (1.94x at TP=2).
 
 ---
 
@@ -356,16 +358,16 @@ The following gaps identified in earlier versions have been closed:
 | **Phase S2** | Advanced Quantization | GGUF loader, AWQ/GPTQ dequant, FP8 dtypes | Section 4.4 (closed) |
 | **Phase A** | Prefill Optimization | Single-CB pipeline, GQA slab SDPA, GEMM swizzle, 3.5-7.3x speedup | Prefill performance gap narrowed |
 | **Phase B+C** | GEMM Optimization | Config sweep (27 variants), kernel-level opt (wide_load, SG=2x4 layout), gemm_bench fix | GEMM throughput gap narrowed to 11.5% |
-| **Phase D2** | MLX-Architecture GEMM Kernel | BK=16, 2 SG, 64 threads, 4xhalf4 wide loads, serpentine MMA — 23.82T TFLOPS | GEMM gap closed to **-0.6%** vs MLX |
+| **Phase D2** | MLX-Architecture GEMM Kernel | BK=16, 2 SG, 64 threads, 4xhalf4 wide loads, serpentine MMA — 24.05T TFLOPS | GEMM at pipe parity vs MLX |
 | **Phase F** | Infrastructure Optimization | Dispatch overhead bench (176us/CB), DiskPipelineCache, GatherMM MMA (4-12x for MoE) | MoE compute and dispatch efficiency |
 | **Phase G** | Quantized Kernel Optimization | QMM MMA Q4/Q8, QMV qdot pattern, CPU fallback removed | Quantized inference fully GPU-resident |
 | **Phase H-2** | GEMM+Residual Fusion | Function constant 202, residual epilogue, 5-12% for large N | Reduced dispatch count and memory round-trips |
 | **Phase I-1** | Distributed TP | DistributedTransformerModel, forward_with_group, shard_for_tp | TP=2 estimated 1.94x speedup |
-| **Phase J** | Quantized Parity + Infrastructure | QMM +73% (5.34T), QMV +37% (MLX 1.15x), ExecGraph stall removal, lazy.rs fusion, RMSNorm+GEMM fusion, Split-K, MoE fuse | QMV near-parity, QMM gap 4.78x -> 2.55x |
+| **Phase J** | Quantized Parity + Infrastructure | QMM Q4 M=512: 17.43T (+28% vs MLX), QMV near-parity, ExecGraph stall removal, lazy.rs fusion, RMSNorm+GEMM fusion, Split-K, MoE fuse | QMM leads MLX at M=512, QMM low-M 86.3% parity |
 
 The Phase 0+1+2 full-crate audit added 76 items including GatherMM, LayerNorm, unary ops, QuantizedLinear, MLA, sliding window attention, GGUF loading, 14 activation functions, ring/allreduce collectives, connection manager, and coordinator.
 
-Remaining gaps: Python API, speculative decoding, NVIDIA-specific quantization formats (INT4/INT8), QMM gap vs MLX (2.55x, reduced from 4.78x in Phase J), and MoE framework overhead (19.9x geomean gap, kernel parity achieved).
+Remaining gaps: Python API, NVIDIA-specific quantization formats (INT4/INT8), and MoE framework overhead. QMM Q4 now leads MLX at M=512 (17.43T vs 13.6T, +28%). QMM low-M at 86.3% parity. Speculative decoding primitives added.
 
 ---
 

@@ -4,11 +4,14 @@
 //! via `Arc<PipelineCache>`.  Supports both plain kernel functions and
 //! functions specialized with Metal function constants.
 
-use metal::{ComputePipelineState, FunctionConstantValues, Library, MTLDataType};
 use std::collections::HashMap;
-use std::ffi::c_void;
 use std::sync::RwLock;
 
+use objc2::runtime::ProtocolObject;
+use objc2_foundation::NSString;
+use objc2_metal::*;
+
+use crate::types::*;
 use crate::MetalError;
 
 // ---------------------------------------------------------------------------
@@ -64,22 +67,16 @@ struct SpecializedKey {
 /// All public methods take `&self`, making it safe to share across threads
 /// via `Arc<PipelineCache>`.
 pub struct PipelineCache {
-    device: metal::Device,
-    cache: RwLock<HashMap<String, ComputePipelineState>>,
-    specialized_cache: RwLock<HashMap<SpecializedKey, ComputePipelineState>>,
+    device: MtlDevice,
+    cache: RwLock<HashMap<String, MtlPipeline>>,
+    specialized_cache: RwLock<HashMap<SpecializedKey, MtlPipeline>>,
 }
-
-// SAFETY: `metal::Device` and `ComputePipelineState` are Objective-C objects
-// that are internally reference-counted and thread-safe.  The `RwLock`
-// provides the Rust-side synchronization guarantees.
-unsafe impl Send for PipelineCache {}
-unsafe impl Sync for PipelineCache {}
 
 impl PipelineCache {
     /// Create a new empty pipeline cache for the given device.
-    pub fn new(device: &metal::Device) -> Self {
+    pub fn new(device: &ProtocolObject<dyn MTLDevice>) -> Self {
         Self {
-            device: device.clone(),
+            device: retain_proto(device),
             cache: RwLock::new(HashMap::new()),
             specialized_cache: RwLock::new(HashMap::new()),
         }
@@ -95,15 +92,15 @@ impl PipelineCache {
     pub fn get_or_create(
         &self,
         name: &str,
-        library: &Library,
-    ) -> Result<ComputePipelineState, MetalError> {
+        library: &ProtocolObject<dyn MTLLibrary>,
+    ) -> Result<MtlPipeline, MetalError> {
         // Fast path: read lock for cache hit.
         {
             let cache = self.cache.read().map_err(|_| {
                 MetalError::PipelineCreate("pipeline cache lock poisoned".to_string())
             })?;
             if let Some(pipeline) = cache.get(name) {
-                return Ok(pipeline.clone());
+                return Ok(retain_proto(&**pipeline));
             }
         }
 
@@ -115,19 +112,19 @@ impl PipelineCache {
 
         // Double-check: another thread may have inserted while we waited.
         if let Some(pipeline) = cache.get(name) {
-            return Ok(pipeline.clone());
+            return Ok(retain_proto(&**pipeline));
         }
 
         let function = library
-            .get_function(name, None)
-            .map_err(|_| MetalError::KernelNotFound(name.to_string()))?;
+            .newFunctionWithName(&NSString::from_str(name))
+            .ok_or_else(|| MetalError::KernelNotFound(name.to_string()))?;
 
         let pipeline = self
             .device
-            .new_compute_pipeline_state_with_function(&function)
-            .map_err(|err| MetalError::PipelineCreate(err.to_string()))?;
+            .newComputePipelineStateWithFunction_error(&function)
+            .map_err(|err| MetalError::PipelineCreate(err.localizedDescription().to_string()))?;
 
-        let cloned = pipeline.clone();
+        let cloned = retain_proto(&*pipeline);
         cache.insert(name.to_string(), pipeline);
         Ok(cloned)
     }
@@ -143,9 +140,9 @@ impl PipelineCache {
     pub fn get_or_create_specialized(
         &self,
         name: &str,
-        library: &Library,
+        library: &ProtocolObject<dyn MTLLibrary>,
         constants: &[(u32, FunctionConstant)],
-    ) -> Result<ComputePipelineState, MetalError> {
+    ) -> Result<MtlPipeline, MetalError> {
         // Fast path: no constants -> use the plain cache.
         if constants.is_empty() {
             return self.get_or_create(name, library);
@@ -162,7 +159,7 @@ impl PipelineCache {
                 MetalError::PipelineCreate("specialized cache lock poisoned".to_string())
             })?;
             if let Some(pipeline) = cache.get(&key) {
-                return Ok(pipeline.clone());
+                return Ok(retain_proto(&**pipeline));
             }
         }
 
@@ -173,47 +170,22 @@ impl PipelineCache {
 
         // Double-check after acquiring write lock.
         if let Some(pipeline) = cache.get(&key) {
-            return Ok(pipeline.clone());
+            return Ok(retain_proto(&**pipeline));
         }
 
-        let fcv = FunctionConstantValues::new();
-        for (index, constant) in constants {
-            match constant {
-                FunctionConstant::Bool(v) => {
-                    let val: u8 = u8::from(*v);
-                    fcv.set_constant_value_at_index(
-                        &val as *const u8 as *const c_void,
-                        MTLDataType::Bool,
-                        *index as u64,
-                    );
-                }
-                FunctionConstant::U32(v) => {
-                    fcv.set_constant_value_at_index(
-                        v as *const u32 as *const c_void,
-                        MTLDataType::UInt,
-                        *index as u64,
-                    );
-                }
-                FunctionConstant::F32(v) => {
-                    fcv.set_constant_value_at_index(
-                        v as *const f32 as *const c_void,
-                        MTLDataType::Float,
-                        *index as u64,
-                    );
-                }
-            }
-        }
+        let fcv = MTLFunctionConstantValues::new();
+        apply_function_constants(&fcv, constants);
 
         let function = library
-            .get_function(name, Some(fcv))
+            .newFunctionWithName_constantValues_error(&NSString::from_str(name), &fcv)
             .map_err(|_| MetalError::KernelNotFound(name.to_string()))?;
 
         let pipeline = self
             .device
-            .new_compute_pipeline_state_with_function(&function)
-            .map_err(|err| MetalError::PipelineCreate(err.to_string()))?;
+            .newComputePipelineStateWithFunction_error(&function)
+            .map_err(|err| MetalError::PipelineCreate(err.localizedDescription().to_string()))?;
 
-        let cloned = pipeline.clone();
+        let cloned = retain_proto(&*pipeline);
         cache.insert(key, pipeline);
         Ok(cloned)
     }
@@ -239,9 +211,76 @@ impl PipelineCache {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Shared helper: apply function constants to MTLFunctionConstantValues
+// ---------------------------------------------------------------------------
+
+/// Apply a slice of `(index, FunctionConstant)` to a
+/// `MTLFunctionConstantValues` object.
+///
+/// Encapsulates the `unsafe` calls to `setConstantValue_type_atIndex` which
+/// require a raw `NonNull<c_void>` pointer.  The pointer is always derived
+/// from a local stack value whose lifetime covers the FFI call, so this is
+/// safe to call from safe Rust.
+pub(crate) fn apply_function_constants(
+    fcv: &MTLFunctionConstantValues,
+    constants: &[(u32, FunctionConstant)],
+) {
+    use std::ffi::c_void;
+    use std::ptr::NonNull;
+
+    for (index, constant) in constants {
+        match constant {
+            FunctionConstant::Bool(v) => {
+                let val: u8 = u8::from(*v);
+                // SAFETY: `&val` is a valid, aligned pointer to a stack-local u8.
+                // The Obj-C method copies the value immediately.
+                unsafe {
+                    fcv.setConstantValue_type_atIndex(
+                        NonNull::new(&val as *const u8 as *mut c_void).unwrap(),
+                        MTLDataType::Bool,
+                        *index as usize,
+                    );
+                }
+            }
+            FunctionConstant::U32(v) => {
+                // SAFETY: `v` is a valid reference to a u32 from the slice.
+                // The Obj-C method copies the value immediately.
+                unsafe {
+                    fcv.setConstantValue_type_atIndex(
+                        NonNull::new(v as *const u32 as *mut c_void).unwrap(),
+                        MTLDataType::UInt,
+                        *index as usize,
+                    );
+                }
+            }
+            FunctionConstant::F32(v) => {
+                // SAFETY: `v` is a valid reference to a f32 from the slice.
+                // The Obj-C method copies the value immediately.
+                unsafe {
+                    fcv.setConstantValue_type_atIndex(
+                        NonNull::new(v as *const f32 as *mut c_void).unwrap(),
+                        MTLDataType::Float,
+                        *index as usize,
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use objc2_metal::MTLCreateSystemDefaultDevice;
+    use std::sync::OnceLock;
+
+    fn test_device() -> Option<&'static MtlDevice> {
+        static DEVICE: OnceLock<Option<MtlDevice>> = OnceLock::new();
+        DEVICE
+            .get_or_init(|| objc2::rc::autoreleasepool(|_| MTLCreateSystemDefaultDevice()))
+            .as_ref()
+    }
 
     #[test]
     fn test_function_constant_hash_equality() {
@@ -300,8 +339,11 @@ mod tests {
 
     #[test]
     fn test_pipeline_cache_new_empty() {
-        let device = metal::Device::system_default().unwrap();
-        let cache = PipelineCache::new(&device);
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let cache = PipelineCache::new(device);
         assert!(cache.is_empty());
         assert_eq!(cache.len(), 0);
     }

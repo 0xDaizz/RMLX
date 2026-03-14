@@ -6,6 +6,8 @@
 //! - `affine_quantized_matmul_batched` (QMM) for batched inputs (batch>1, Q4 only)
 //! - CPU `affine_qmm` fallback for Q4 batched when Metal QMM is unavailable
 
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLCommandQueue, MTLDevice, MTLResourceOptions};
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::{KernelError, KernelRegistry};
@@ -151,7 +153,7 @@ impl QuantizedLinear {
         &self,
         x: &Array,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         // Normalize input to 2D
         let (batch, x_2d) = if x.ndim() == 1 {
@@ -200,14 +202,22 @@ impl QuantizedLinear {
     /// Build a `QuantizedWeight` by uploading CPU buffers to Metal.
     ///
     /// Converts f32 scales/biases to f16 at upload time (one-time cost).
-    fn make_quantized_weight(&self, dev: &metal::Device) -> Result<QuantizedWeight, KernelError> {
-        let opts = metal::MTLResourceOptions::StorageModeShared;
+    fn make_quantized_weight(
+        &self,
+        dev: &ProtocolObject<dyn MTLDevice>,
+    ) -> Result<QuantizedWeight, KernelError> {
+        let opts = MTLResourceOptions::StorageModeShared;
 
-        let weights_buf = dev.new_buffer_with_data(
-            self.w_packed.as_ptr() as *const _,
-            self.w_packed.len() as u64,
-            opts,
-        );
+        let weights_buf = unsafe {
+            dev.newBufferWithBytes_length_options(
+                std::ptr::NonNull::new_unchecked(
+                    self.w_packed.as_ptr() as *const _ as *mut std::ffi::c_void
+                ),
+                self.w_packed.len(),
+                opts,
+            )
+        }
+        .unwrap();
 
         // Convert f32 scales to f16 at upload time (industry standard format)
         let scales_f16: Vec<u16> = self
@@ -215,22 +225,32 @@ impl QuantizedLinear {
             .iter()
             .map(|&v| quantized::f32_to_f16_bits(v))
             .collect();
-        let scales_buf = dev.new_buffer_with_data(
-            scales_f16.as_ptr() as *const _,
-            (scales_f16.len() * 2) as u64,
-            opts,
-        );
+        let scales_buf = unsafe {
+            dev.newBufferWithBytes_length_options(
+                std::ptr::NonNull::new_unchecked(
+                    scales_f16.as_ptr() as *const _ as *mut std::ffi::c_void
+                ),
+                scales_f16.len() * 2,
+                opts,
+            )
+        }
+        .unwrap();
 
         let biases_f16: Vec<u16> = self
             .biases
             .iter()
             .map(|&v| quantized::f32_to_f16_bits(v))
             .collect();
-        let biases_buf = dev.new_buffer_with_data(
-            biases_f16.as_ptr() as *const _,
-            (biases_f16.len() * 2) as u64,
-            opts,
-        );
+        let biases_buf = unsafe {
+            dev.newBufferWithBytes_length_options(
+                std::ptr::NonNull::new_unchecked(
+                    biases_f16.as_ptr() as *const _ as *mut std::ffi::c_void
+                ),
+                biases_f16.len() * 2,
+                opts,
+            )
+        }
+        .unwrap();
 
         QuantizedWeight::new(
             weights_buf,
@@ -428,7 +448,7 @@ impl AwqLinear {
         &self,
         x: &Array,
         _registry: &KernelRegistry,
-        _queue: &metal::CommandQueue,
+        _queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         let (batch, x_flat) = self.normalize_input(x)?;
         let x_vec: Vec<f32> = x_flat.to_vec_checked();
@@ -626,7 +646,7 @@ impl GptqLinear {
         &self,
         x: &Array,
         _registry: &KernelRegistry,
-        _queue: &metal::CommandQueue,
+        _queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         let (batch, x_flat) = self.normalize_input(x)?;
         let x_vec: Vec<f32> = x_flat.to_vec_checked();
@@ -880,11 +900,15 @@ impl KQuantConfig {
 mod tests {
     use super::*;
 
-    fn test_device() -> metal::Device {
-        rmlx_metal::device::GpuDevice::system_default()
-            .expect("system_default Metal device")
-            .raw()
-            .clone()
+    use std::sync::OnceLock;
+
+    fn test_device() -> Option<&'static rmlx_metal::MtlDevice> {
+        static DEVICE: OnceLock<Option<rmlx_metal::MtlDevice>> = OnceLock::new();
+        DEVICE
+            .get_or_init(|| {
+                objc2::rc::autoreleasepool(|_| objc2_metal::MTLCreateSystemDefaultDevice())
+            })
+            .as_ref()
     }
 
     fn invalid_shape_message(err: KernelError) -> String {
@@ -1028,8 +1052,11 @@ mod tests {
     #[test]
     fn test_awq_normalize_input_rejects_non_f32() {
         let awq = AwqLinear::new(vec![0u32; 64], vec![1.0; 8], vec![0.0; 8], 64, 8, 64).unwrap();
-        let device = test_device();
-        let x = Array::zeros(&device, &[1, 64], DType::Float16);
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let x = Array::zeros(device, &[1, 64], DType::Float16);
 
         let err = awq.normalize_input(&x).unwrap_err();
         assert_eq!(
@@ -1041,8 +1068,11 @@ mod tests {
     #[test]
     fn test_gptq_normalize_input_rejects_non_f32() {
         let gptq = GptqLinear::new(vec![0u32; 64], vec![1.0; 8], vec![0.0; 8], 64, 8, 64).unwrap();
-        let device = test_device();
-        let x = Array::zeros(&device, &[1, 64], DType::Float16);
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let x = Array::zeros(device, &[1, 64], DType::Float16);
 
         let err = gptq.normalize_input(&x).unwrap_err();
         assert_eq!(

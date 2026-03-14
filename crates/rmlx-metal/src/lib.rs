@@ -1,17 +1,13 @@
 //! rmlx-metal — Metal GPU abstraction layer for RMLX
 
 #![deny(unsafe_op_in_unsafe_fn)]
-#![allow(unexpected_cfgs)] // objc crate uses deprecated cfg(feature = "cargo-clippy")
-
-// Required for objc::msg_send! macro in autorelease and capture modules.
-#[macro_use]
-extern crate objc;
 
 pub mod autorelease;
 pub mod batcher;
 pub mod buffer;
 pub mod capture;
 pub mod command;
+pub mod compute_pass;
 pub mod device;
 pub mod event;
 pub mod exec_graph;
@@ -27,12 +23,21 @@ pub mod pipeline_cache;
 pub mod queue;
 pub mod self_check;
 pub mod stream;
+pub mod types;
 
-// Re-export metal crate for downstream users
-pub use metal;
+#[cfg(feature = "metal4")]
+pub mod metal4;
+
+// Re-export objc2-metal essentials for downstream users
+pub use objc2_metal::MTLResourceOptions;
+pub use objc2_metal::MTLSize;
+
+// Re-export type aliases and ComputePass
+pub use compute_pass::ComputePass;
+pub use types::*;
 
 // Re-export core types for convenience
-pub use autorelease::ScopedPool;
+pub use autorelease::autoreleasepool;
 pub use batcher::CommandBatcher;
 pub use capture::{CaptureDestination, CaptureScope};
 pub use command::{
@@ -45,6 +50,8 @@ pub use device::{
 };
 pub use event::GpuEvent;
 pub use exec_graph::ExecGraph;
+#[cfg(feature = "metal4")]
+pub use exec_graph::ExecGraph4;
 pub use fence::{FenceError, GpuFence};
 pub use icb_sparse::{
     grouped_forward_icb, CachedSparsityPattern, IcbReplayCache, SparseDispatchResult,
@@ -56,6 +63,8 @@ pub use msl_version::{DeviceInfo, MslVersion};
 pub use pipeline::{FunctionConstant, PipelineCache};
 pub use pipeline_cache::DiskPipelineCache;
 pub use queue::{fast_command_buffer, fast_command_buffer_owned, GpuQueue};
+#[cfg(feature = "metal4")]
+pub use stream::Metal4State;
 pub use stream::{StreamManager, StreamSync, STREAM_COMPUTE, STREAM_COPY, STREAM_DEFAULT};
 
 /// Errors from Metal operations

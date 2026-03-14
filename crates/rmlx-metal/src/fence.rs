@@ -8,7 +8,10 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use metal::{Device, SharedEvent};
+use objc2::runtime::ProtocolObject;
+use objc2_metal::*;
+
+use crate::types::*;
 
 /// Cross-queue GPU synchronization fence backed by `MTLSharedEvent`.
 ///
@@ -19,19 +22,14 @@ use metal::{Device, SharedEvent};
 ///
 /// A CPU-side `cpu_wait` is also provided for host synchronization.
 pub struct GpuFence {
-    event: SharedEvent,
+    event: MtlEvent,
     counter: AtomicU64,
 }
 
-// SAFETY: `SharedEvent` is an Objective-C object that is internally
-// reference-counted and thread-safe.  The `AtomicU64` is trivially `Send + Sync`.
-unsafe impl Send for GpuFence {}
-unsafe impl Sync for GpuFence {}
-
 impl GpuFence {
     /// Create a new fence on `device` with initial signal value 0.
-    pub fn new(device: &Device) -> Self {
-        let event = device.new_shared_event();
+    pub fn new(device: &ProtocolObject<dyn MTLDevice>) -> Self {
+        let event = device.newSharedEvent().unwrap();
         Self {
             event,
             counter: AtomicU64::new(0),
@@ -52,16 +50,18 @@ impl GpuFence {
     ///
     /// The GPU will set the shared event to `value` once all preceding
     /// commands in this command buffer have finished executing.
-    pub fn signal(&self, command_buffer: &metal::CommandBufferRef, value: u64) {
-        command_buffer.encode_signal_event(&self.event, value);
+    pub fn signal(&self, command_buffer: &ProtocolObject<dyn MTLCommandBuffer>, value: u64) {
+        let event: &ProtocolObject<dyn MTLEvent> = ProtocolObject::from_ref(&*self.event);
+        command_buffer.encodeSignalEvent_value(event, value);
     }
 
     /// Encode a wait on `command_buffer` until the shared event reaches `value`.
     ///
     /// The GPU will stall this command buffer until the event's signaled
     /// value is >= `value`.
-    pub fn wait(&self, command_buffer: &metal::CommandBufferRef, value: u64) {
-        command_buffer.encode_wait_for_event(&self.event, value);
+    pub fn wait(&self, command_buffer: &ProtocolObject<dyn MTLCommandBuffer>, value: u64) {
+        let event: &ProtocolObject<dyn MTLEvent> = ProtocolObject::from_ref(&*self.event);
+        command_buffer.encodeWaitForEvent_value(event, value);
     }
 
     /// Block the CPU until the shared event reaches `value` or `timeout` elapses.
@@ -76,7 +76,7 @@ impl GpuFence {
         let yield_threshold = Duration::from_micros(100);
 
         loop {
-            let current = self.event.signaled_value();
+            let current = self.event.signaledValue();
             if current >= value {
                 return Ok(start.elapsed());
             }
@@ -85,7 +85,7 @@ impl GpuFence {
             if elapsed >= timeout {
                 return Err(FenceError::Timeout {
                     expected: value,
-                    actual: self.event.signaled_value(),
+                    actual: self.event.signaledValue(),
                     elapsed,
                 });
             }
@@ -102,17 +102,17 @@ impl GpuFence {
 
     /// Read the current GPU-side signaled value.
     pub fn signaled_value(&self) -> u64 {
-        self.event.signaled_value()
+        self.event.signaledValue()
     }
 
     /// Reset the fence to value 0 (for reuse across pipeline iterations).
     pub fn reset(&self) {
         self.counter.store(0, Ordering::SeqCst);
-        self.event.set_signaled_value(0);
+        self.event.setSignaledValue(0);
     }
 
     /// Access the underlying `MTLSharedEvent`.
-    pub fn raw(&self) -> &SharedEvent {
+    pub fn raw(&self) -> &ProtocolObject<dyn MTLSharedEvent> {
         &self.event
     }
 }
@@ -148,11 +148,22 @@ impl std::error::Error for FenceError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::OnceLock;
+
+    fn test_device() -> Option<&'static MtlDevice> {
+        static DEVICE: OnceLock<Option<MtlDevice>> = OnceLock::new();
+        DEVICE
+            .get_or_init(|| objc2::rc::autoreleasepool(|_| MTLCreateSystemDefaultDevice()))
+            .as_ref()
+    }
 
     #[test]
     fn test_fence_counter_monotonic() {
-        let device = metal::Device::system_default().unwrap();
-        let fence = GpuFence::new(&device);
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let fence = GpuFence::new(device);
 
         assert_eq!(fence.current_value(), 0);
         assert_eq!(fence.next_value(), 1);
@@ -163,8 +174,11 @@ mod tests {
 
     #[test]
     fn test_fence_reset() {
-        let device = metal::Device::system_default().unwrap();
-        let fence = GpuFence::new(&device);
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let fence = GpuFence::new(device);
 
         fence.next_value();
         fence.next_value();
@@ -177,17 +191,20 @@ mod tests {
 
     #[test]
     fn test_fence_signal_wait_roundtrip() {
-        let device = metal::Device::system_default().unwrap();
-        let queue = device.new_command_queue();
-        let fence = GpuFence::new(&device);
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let queue = device.newCommandQueue().unwrap();
+        let fence = GpuFence::new(device);
 
         let value = fence.next_value();
 
         // Create a command buffer that signals the fence.
-        let cb = queue.new_command_buffer();
-        let encoder = cb.new_compute_command_encoder();
-        encoder.end_encoding();
-        fence.signal(cb, value);
+        let cb = queue.commandBuffer().unwrap();
+        let encoder = cb.computeCommandEncoder().unwrap();
+        encoder.endEncoding();
+        fence.signal(&cb, value);
         cb.commit();
 
         // CPU-wait should succeed quickly.
@@ -197,8 +214,11 @@ mod tests {
 
     #[test]
     fn test_fence_cpu_wait_already_signaled() {
-        let device = metal::Device::system_default().unwrap();
-        let fence = GpuFence::new(&device);
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let fence = GpuFence::new(device);
 
         // Value 0 is the initial signaled value, so waiting for 0 should return immediately.
         let result = fence.cpu_wait(0, Duration::from_millis(10));

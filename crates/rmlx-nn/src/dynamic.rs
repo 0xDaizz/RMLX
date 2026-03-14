@@ -3,6 +3,8 @@
 //! Pre-allocates buffers at maximum size and dispatches with actual dimensions.
 //! This avoids buffer reallocation for varying input sizes.
 
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLDevice;
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::KernelError;
@@ -27,7 +29,7 @@ impl DynamicExecContext {
     ///
     /// Pre-allocates `num_intermediates` buffers of shape `[max_seq_len, hidden_dim]`.
     pub fn new(
-        device: &metal::Device,
+        device: &ProtocolObject<dyn MTLDevice>,
         max_seq_len: usize,
         hidden_dim: usize,
         dtype: DType,

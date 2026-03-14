@@ -19,15 +19,25 @@
 use std::time::{Duration, Instant};
 
 use half::f16;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLDevice as _;
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::KernelRegistry;
 use rmlx_core::ops;
 use rmlx_core::ops::quantized::QuantizedWeight;
 use rmlx_metal::device::GpuDevice;
+use rmlx_metal::MTLResourceOptions;
+use std::ptr::NonNull;
 
 const WARMUP_ITERS: usize = 5;
 const BENCH_ITERS: usize = 25;
+
+/// Metal objects are thread-safe at the API level (Apple guarantees this).
+/// objc2-metal doesn't add Send/Sync, so we use an unsafe wrapper for bench threads.
+struct UnsafeSendSync<T>(T);
+unsafe impl<T> Send for UnsafeSendSync<T> {}
+unsafe impl<T> Sync for UnsafeSendSync<T> {}
 
 // ---------------------------------------------------------------------------
 // Model profiles
@@ -183,7 +193,11 @@ fn lcg_next(state: &mut u64) -> u64 {
     *state
 }
 
-fn rand_f16_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
+fn rand_f16_array(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    shape: &[usize],
+    seed: u64,
+) -> Array {
     let numel: usize = shape.iter().product();
     let mut state = seed;
     let mut f16_bytes = Vec::with_capacity(numel * 2);
@@ -196,7 +210,11 @@ fn rand_f16_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
     Array::from_bytes(device, &f16_bytes, shape.to_vec(), DType::Float16)
 }
 
-fn rand_f32_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
+fn rand_f32_array(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    shape: &[usize],
+    seed: u64,
+) -> Array {
     let numel: usize = shape.iter().product();
     let mut state = seed;
     let data: Vec<f32> = (0..numel)
@@ -210,7 +228,7 @@ fn rand_f32_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
 }
 
 fn make_quantized_weight(
-    device: &metal::Device,
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
     out_features: usize,
     in_features: usize,
     bits: u32,
@@ -218,7 +236,7 @@ fn make_quantized_weight(
     seed: u64,
 ) -> QuantizedWeight {
     let mut state = seed;
-    let opts = metal::MTLResourceOptions::StorageModeShared;
+    let opts = MTLResourceOptions::StorageModeShared;
 
     let elems_per_u32 = 32 / bits as usize;
     let total_elements = out_features * in_features;
@@ -229,8 +247,15 @@ fn make_quantized_weight(
             v as u32
         })
         .collect();
-    let weights_buf =
-        device.new_buffer_with_data(w_data.as_ptr() as *const _, (num_u32s * 4) as u64, opts);
+    let weights_buf = unsafe {
+        device
+            .newBufferWithBytes_length_options(
+                NonNull::new(w_data.as_ptr() as *const _ as *mut _).unwrap(),
+                (num_u32s * 4) as u64 as usize,
+                opts,
+            )
+            .unwrap()
+    };
 
     let num_groups = total_elements / group_size as usize;
     let scales_f32: Vec<f32> = (0..num_groups)
@@ -256,16 +281,24 @@ fn make_quantized_weight(
         .map(|&v| rmlx_core::ops::quantized::f32_to_f16_bits(v))
         .collect();
 
-    let scales_buf = device.new_buffer_with_data(
-        scales_data.as_ptr() as *const _,
-        (num_groups * 2) as u64,
-        opts,
-    );
-    let biases_buf = device.new_buffer_with_data(
-        biases_data.as_ptr() as *const _,
-        (num_groups * 2) as u64,
-        opts,
-    );
+    let scales_buf = unsafe {
+        device
+            .newBufferWithBytes_length_options(
+                NonNull::new(scales_data.as_ptr() as *const _ as *mut _).unwrap(),
+                (num_groups * 2) as u64 as usize,
+                opts,
+            )
+            .unwrap()
+    };
+    let biases_buf = unsafe {
+        device
+            .newBufferWithBytes_length_options(
+                NonNull::new(biases_data.as_ptr() as *const _ as *mut _).unwrap(),
+                (num_groups * 2) as u64 as usize,
+                opts,
+            )
+            .unwrap()
+    };
 
     QuantizedWeight::new(
         weights_buf,
@@ -285,7 +318,7 @@ fn make_quantized_weight(
 
 fn run_bw_bound(
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
     qw: &QuantizedWeight,
     x: &Array,
 ) {
@@ -293,7 +326,12 @@ fn run_bw_bound(
         .expect("QMM (BW-bound) failed");
 }
 
-fn run_compute_bound(registry: &KernelRegistry, queue: &metal::CommandQueue, a: &Array, b: &Array) {
+fn run_compute_bound(
+    registry: &KernelRegistry,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
+    a: &Array,
+    b: &Array,
+) {
     let _ = ops::matmul::matmul(registry, a, b, queue).expect("GEMM (compute-bound) failed");
 }
 
@@ -303,7 +341,7 @@ fn run_compute_bound(registry: &KernelRegistry, queue: &metal::CommandQueue, a: 
 
 fn bench_sequential(
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
     qw: &QuantizedWeight,
     qmm_x: &Array,
     gemm_a: &Array,
@@ -317,7 +355,7 @@ fn bench_sequential(
 
 fn bench_sequential_reversed(
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
     qw: &QuantizedWeight,
     qmm_x: &Array,
     gemm_a: &Array,
@@ -331,20 +369,47 @@ fn bench_sequential_reversed(
 
 fn bench_concurrent(
     registry: &KernelRegistry,
-    queue_bw: &metal::CommandQueue,
-    queue_compute: &metal::CommandQueue,
+    queue_bw: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
+    queue_compute: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
     qw: &QuantizedWeight,
     qmm_x: &Array,
     gemm_a: &Array,
     gemm_b: &Array,
 ) -> Duration {
     let start = Instant::now();
+    // Metal API is thread-safe; objc2-metal just doesn't declare Send/Sync.
+    // Wrap all captured state in UnsafeSendSync to satisfy thread::scope Send bounds.
+    // Safety: Metal objects are thread-safe, scoped threads ensure lifetimes.
+    struct Args<'a> {
+        registry: &'a KernelRegistry,
+        queue_bw: &'a ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
+        queue_compute: &'a ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
+        qw: &'a QuantizedWeight,
+        qmm_x: &'a Array,
+        gemm_a: &'a Array,
+        gemm_b: &'a Array,
+    }
+    let args = UnsafeSendSync(Args {
+        registry,
+        queue_bw,
+        queue_compute,
+        qw,
+        qmm_x,
+        gemm_a,
+        gemm_b,
+    });
+    // UnsafeSendSync<Args> is Send+Sync, so &UnsafeSendSync<Args> is Send.
+    // Force closures to capture `&args` (which is Send because UnsafeSendSync is Sync),
+    // not individual fields from args.0 which would bypass the wrapper.
+    let args_ref = &args;
     std::thread::scope(|s| {
         let bw_handle = s.spawn(|| {
-            run_bw_bound(registry, queue_bw, qw, qmm_x);
+            let a = &args_ref.0;
+            run_bw_bound(a.registry, a.queue_bw, a.qw, a.qmm_x);
         });
         let compute_handle = s.spawn(|| {
-            run_compute_bound(registry, queue_compute, gemm_a, gemm_b);
+            let a = &args_ref.0;
+            run_compute_bound(a.registry, a.queue_compute, a.gemm_a, a.gemm_b);
         });
         bw_handle.join().expect("BW-bound thread panicked");
         compute_handle
@@ -356,7 +421,7 @@ fn bench_concurrent(
 
 fn bench_bw_only(
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
     qw: &QuantizedWeight,
     qmm_x: &Array,
 ) -> Duration {
@@ -367,7 +432,7 @@ fn bench_bw_only(
 
 fn bench_compute_only(
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
     gemm_a: &Array,
     gemm_b: &Array,
 ) -> Duration {
@@ -380,10 +445,14 @@ fn bench_compute_only(
 // Run one profile
 // ---------------------------------------------------------------------------
 
-fn run_profile(registry: &KernelRegistry, device: &metal::Device, profile: &ModelProfile) {
-    let queue_shared = device.new_command_queue();
-    let queue_bw = device.new_command_queue();
-    let queue_compute = device.new_command_queue();
+fn run_profile(
+    registry: &KernelRegistry,
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    profile: &ModelProfile,
+) {
+    let queue_shared = device.newCommandQueue().unwrap();
+    let queue_bw = device.newCommandQueue().unwrap();
+    let queue_compute = device.newCommandQueue().unwrap();
 
     // Prepare BW-bound data (Q4 expert GEMM)
     let group_size: u32 = 32;

@@ -4,11 +4,14 @@
 //! single command buffer, and [`BarrierTracker`] for inserting memory barriers
 //! between dependent kernel dispatches.
 
-use metal::{
-    Buffer, CommandBuffer, CommandBufferRef, ComputeCommandEncoderRef, ComputePipelineState,
-    MTLSize,
-};
 use std::collections::HashSet;
+use std::ptr::NonNull;
+
+use objc2::runtime::ProtocolObject;
+use objc2_metal::*;
+
+use crate::compute_pass::ComputePass;
+use crate::types::*;
 
 // ---------------------------------------------------------------------------
 // M1 — auto-commit thresholds
@@ -26,10 +29,9 @@ const MAX_BYTES_PER_BATCH: u64 = 16 * 1024 * 1024; // 16 MB
 /// and the cumulative bytes dispatched.  It auto-commits when either threshold
 /// is reached.
 pub struct CommandBufferManager<'q> {
-    queue: &'q metal::CommandQueue,
-    /// Owned command buffer — retained via `to_owned()` to prevent the
-    /// autorelease pool from reclaiming it before we commit.
-    current_cb: Option<CommandBuffer>,
+    queue: &'q ProtocolObject<dyn MTLCommandQueue>,
+    /// Owned command buffer — `Retained` keeps it alive until we commit.
+    current_cb: Option<MtlCB>,
     ops_batched: usize,
     bytes_dispatched: u64,
     /// Track GPU errors reported via completion handlers.
@@ -38,7 +40,7 @@ pub struct CommandBufferManager<'q> {
 
 impl<'q> CommandBufferManager<'q> {
     /// Create a new manager that draws command buffers from `queue`.
-    pub fn new(queue: &'q metal::CommandQueue) -> Self {
+    pub fn new(queue: &'q ProtocolObject<dyn MTLCommandQueue>) -> Self {
         Self {
             queue,
             current_cb: None,
@@ -50,9 +52,9 @@ impl<'q> CommandBufferManager<'q> {
 
     /// Return the current command buffer, creating one if necessary.
     ///
-    /// The command buffer is retained (owned) to prevent the autorelease pool
-    /// from reclaiming it before commit.
-    pub fn get_or_create_buffer(&mut self) -> &CommandBufferRef {
+    /// The command buffer is retained (owned) to prevent deallocation
+    /// before commit.
+    pub fn get_or_create_buffer(&mut self) -> &ProtocolObject<dyn MTLCommandBuffer> {
         if self.current_cb.is_none() {
             let cb = crate::queue::fast_command_buffer_owned(self.queue);
             self.current_cb = Some(cb);
@@ -61,9 +63,14 @@ impl<'q> CommandBufferManager<'q> {
     }
 
     /// Create a compute command encoder on the current (or new) command buffer.
-    pub fn get_or_create_encoder(&mut self) -> &ComputeCommandEncoderRef {
+    ///
+    /// Returns an owned `Retained` encoder. The caller must end it (via
+    /// `ComputePass::end()` or raw `endEncoding()`) before the command buffer
+    /// is committed. The `Retained` keeps the encoder alive for the caller's
+    /// scope.
+    pub fn get_or_create_encoder(&mut self) -> MtlEncoder {
         let cb = self.get_or_create_buffer();
-        cb.new_compute_command_encoder()
+        cb.computeCommandEncoder().unwrap()
     }
 
     /// Record that one dispatch of `bytes` was encoded.
@@ -119,11 +126,7 @@ impl Drop for CommandBufferManager<'_> {
 /// consecutive dispatches on the same compute command encoder.
 ///
 /// When a buffer written by one dispatch is read (or written) by the next,
-/// the tracker signals that a memory barrier is required.  Because the
-/// `metal` crate (v0.31) only exposes `memory_barrier_with_resources` on
-/// `ComputeCommandEncoderRef` (not a scope-based barrier), we use
-/// the end-encoder / new-encoder strategy as an encoder-level barrier
-/// when the resource-based API is not available.
+/// the tracker signals that a memory barrier is required.
 pub struct BarrierTracker {
     /// Buffers that were bound as *output* (write) in the previous dispatch.
     previous_outputs: HashSet<u64>,
@@ -160,8 +163,8 @@ impl BarrierTracker {
     /// address for a different allocation. Failing to do so may cause
     /// a later, unrelated buffer at the same address to be incorrectly
     /// exempted from barrier tracking.
-    pub fn mark_temporary(&mut self, buf: &Buffer) {
-        self.temporaries.insert(buf.gpu_address());
+    pub fn mark_temporary(&mut self, buf: &ProtocolObject<dyn MTLBuffer>) {
+        self.temporaries.insert(buf.gpuAddress());
     }
 
     /// Clear all temporary buffer markings.
@@ -186,12 +189,16 @@ impl BarrierTracker {
     ///
     /// After the call, the tracker's state is updated so the *current*
     /// `outputs` become the "previous outputs" for the next dispatch.
-    pub fn needs_barrier(&mut self, inputs: &[&Buffer], outputs: &[&Buffer]) -> bool {
+    pub fn needs_barrier(
+        &mut self,
+        inputs: &[&ProtocolObject<dyn MTLBuffer>],
+        outputs: &[&ProtocolObject<dyn MTLBuffer>],
+    ) -> bool {
         let mut needs = false;
 
         // Check if any current input was written in the previous dispatch.
         for buf in inputs {
-            let addr = buf.gpu_address();
+            let addr = buf.gpuAddress();
             if self.temporaries.contains(&addr) {
                 continue;
             }
@@ -204,7 +211,7 @@ impl BarrierTracker {
         // Also check output-after-output (WAW hazard).
         if !needs {
             for buf in outputs {
-                let addr = buf.gpu_address();
+                let addr = buf.gpuAddress();
                 if self.temporaries.contains(&addr) {
                     continue;
                 }
@@ -218,7 +225,7 @@ impl BarrierTracker {
         // Update state: current outputs become previous outputs.
         self.previous_outputs.clear();
         for buf in outputs {
-            self.previous_outputs.insert(buf.gpu_address());
+            self.previous_outputs.insert(buf.gpuAddress());
         }
 
         needs
@@ -230,12 +237,16 @@ impl BarrierTracker {
     /// this method accumulates outputs across dispatches that don't need
     /// barriers, and only rotates when a barrier IS needed. This correctly
     /// tracks multi-dispatch dependency chains on a concurrent encoder.
-    pub fn check_concurrent(&mut self, inputs: &[&Buffer], outputs: &[&Buffer]) -> bool {
+    pub fn check_concurrent(
+        &mut self,
+        inputs: &[&ProtocolObject<dyn MTLBuffer>],
+        outputs: &[&ProtocolObject<dyn MTLBuffer>],
+    ) -> bool {
         let mut needs = false;
 
         // RAW check: current inputs vs previous outputs
         for buf in inputs {
-            let addr = buf.gpu_address();
+            let addr = buf.gpuAddress();
             if self.temporaries.contains(&addr) {
                 continue;
             }
@@ -248,7 +259,7 @@ impl BarrierTracker {
         // WAW check: current outputs vs previous outputs
         if !needs {
             for buf in outputs {
-                let addr = buf.gpu_address();
+                let addr = buf.gpuAddress();
                 if self.temporaries.contains(&addr) {
                     continue;
                 }
@@ -262,7 +273,7 @@ impl BarrierTracker {
         // WAR check: current outputs vs previous inputs
         if !needs {
             for buf in outputs {
-                let addr = buf.gpu_address();
+                let addr = buf.gpuAddress();
                 if self.temporaries.contains(&addr) {
                     continue;
                 }
@@ -282,10 +293,10 @@ impl BarrierTracker {
 
         // Track current outputs and inputs (accumulate)
         for buf in outputs {
-            self.previous_outputs.insert(buf.gpu_address());
+            self.previous_outputs.insert(buf.gpuAddress());
         }
         for buf in inputs {
-            self.previous_inputs.insert(buf.gpu_address());
+            self.previous_inputs.insert(buf.gpuAddress());
         }
 
         needs
@@ -318,7 +329,7 @@ pub struct GpuErrorStore {
 /// A GPU execution error captured from a completed command buffer.
 #[derive(Debug, Clone)]
 pub struct GpuError {
-    pub status: metal::MTLCommandBufferStatus,
+    pub status: MTLCommandBufferStatus,
     pub message: String,
 }
 
@@ -374,20 +385,25 @@ impl Default for GpuErrorStore {
 
 /// Register a completion handler on `cb` that checks the command buffer status
 /// after GPU execution and stores any error in `error_store`.
-fn register_completion_handler(cb: &CommandBufferRef, error_store: &std::sync::Arc<GpuErrorStore>) {
+pub(crate) fn register_completion_handler(
+    cb: &ProtocolObject<dyn MTLCommandBuffer>,
+    error_store: &std::sync::Arc<GpuErrorStore>,
+) {
     let store = std::sync::Arc::clone(error_store);
-    let handler = block::ConcreteBlock::new(move |cmd_buf: &CommandBufferRef| {
-        let status = cmd_buf.status();
-        if status == metal::MTLCommandBufferStatus::Error {
-            let msg = format!("command buffer completed with error status: {status:?}");
-            store.push(GpuError {
-                status,
-                message: msg,
-            });
-        }
-    });
-    let handler = handler.copy();
-    cb.add_completed_handler(&handler);
+    let handler = block2::RcBlock::new(
+        move |cmd_buf: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+            let cmd_buf = unsafe { cmd_buf.as_ref() };
+            let status = cmd_buf.status();
+            if status == MTLCommandBufferStatus::Error {
+                let msg = format!("command buffer completed with error status: {status:?}");
+                store.push(GpuError {
+                    status,
+                    message: msg,
+                });
+            }
+        },
+    );
+    unsafe { cb.addCompletedHandler(block2::RcBlock::as_ptr(&handler)) };
 }
 
 // ---------------------------------------------------------------------------
@@ -400,27 +416,36 @@ fn register_completion_handler(cb: &CommandBufferRef, error_store: &std::sync::A
 /// binds each buffer at consecutive indices (0, 1, 2, ...) with the given
 /// offsets, dispatches `num_threads` threads in a 1D grid, and ends encoding.
 pub fn encode_compute_1d(
-    cmd_buf: &CommandBufferRef,
-    pipeline: &ComputePipelineState,
-    buffers: &[(&Buffer, u64)],
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+    buffers: &[(&ProtocolObject<dyn MTLBuffer>, u64)],
     num_threads: u64,
 ) {
-    let encoder = cmd_buf.new_compute_command_encoder();
+    let encoder = cmd_buf.computeCommandEncoder().unwrap();
+    let pass = ComputePass::new(&encoder);
 
-    encoder.set_compute_pipeline_state(pipeline);
+    pass.set_pipeline(pipeline);
 
     for (index, (buffer, offset)) in buffers.iter().enumerate() {
-        encoder.set_buffer(index as u64, Some(buffer), *offset);
+        pass.set_buffer(index as u32, Some(*buffer), *offset as usize);
     }
 
-    let max_threads = pipeline.max_total_threads_per_threadgroup();
-    let threadgroup_size = std::cmp::min(max_threads, num_threads);
+    let max_threads = pipeline.maxTotalThreadsPerThreadgroup();
+    let threadgroup_size = std::cmp::min(max_threads, num_threads as usize);
 
-    let grid_size = MTLSize::new(num_threads, 1, 1);
-    let group_size = MTLSize::new(threadgroup_size, 1, 1);
+    let grid_size = MTLSize {
+        width: num_threads as usize,
+        height: 1,
+        depth: 1,
+    };
+    let group_size = MTLSize {
+        width: threadgroup_size,
+        height: 1,
+        depth: 1,
+    };
 
-    encoder.dispatch_threads(grid_size, group_size);
-    encoder.end_encoding();
+    pass.dispatch_threads(grid_size, group_size);
+    pass.end();
 }
 
 /// Encode a 1D compute dispatch with barrier tracking.
@@ -435,24 +460,26 @@ pub fn encode_compute_1d(
 /// When a barrier is needed, the current encoder is ended and a new one is
 /// created, which acts as a full memory barrier on Metal.
 pub fn encode_compute_1d_tracked(
-    cmd_buf: &CommandBufferRef,
-    pipeline: &ComputePipelineState,
-    buffers: &[(&Buffer, u64)],
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+    buffers: &[(&ProtocolObject<dyn MTLBuffer>, u64)],
     input_indices: &[usize],
     output_indices: &[usize],
     num_threads: u64,
     tracker: &mut BarrierTracker,
 ) {
-    let inputs: Vec<&Buffer> = input_indices.iter().map(|&i| buffers[i].0).collect();
-    let outputs: Vec<&Buffer> = output_indices.iter().map(|&i| buffers[i].0).collect();
+    let inputs: Vec<&ProtocolObject<dyn MTLBuffer>> =
+        input_indices.iter().map(|&i| buffers[i].0).collect();
+    let outputs: Vec<&ProtocolObject<dyn MTLBuffer>> =
+        output_indices.iter().map(|&i| buffers[i].0).collect();
 
     if tracker.needs_barrier(&inputs, &outputs) {
         // Insert a barrier by ending and creating a new encoder.
         // The encoder created here acts as a fresh synchronization point.
         // (We create a no-op encoder just to force the barrier, then create
         // the real one below.)
-        let barrier_encoder = cmd_buf.new_compute_command_encoder();
-        barrier_encoder.end_encoding();
+        let barrier_encoder = cmd_buf.computeCommandEncoder().unwrap();
+        barrier_encoder.endEncoding();
     }
 
     encode_compute_1d(cmd_buf, pipeline, buffers, num_threads);
@@ -476,41 +503,21 @@ pub fn encode_compute_1d_tracked(
 /// The caller must ensure all data dependencies between dispatches are
 /// covered by explicit `memory_barrier_scope_buffers()` calls. Without
 /// proper barriers, concurrent dispatches may read stale data.
-pub fn new_concurrent_encoder(cb: &CommandBufferRef) -> &ComputeCommandEncoderRef {
-    unsafe {
-        // MTLComputePassDescriptor
-        let desc_class = objc::runtime::Class::get("MTLComputePassDescriptor")
-            .expect("MTLComputePassDescriptor class not found");
-        let desc: *mut objc::runtime::Object = msg_send![desc_class, new];
-
-        // Set dispatch type to concurrent (1)
-        // MTLDispatchTypeConcurrent = 1
-        let _: () = msg_send![desc, setDispatchType: 1u64];
-
-        // Create encoder with descriptor
-        let encoder: &ComputeCommandEncoderRef =
-            msg_send![cb, computeCommandEncoderWithDescriptor: desc];
-
-        // Release descriptor (encoder retains what it needs)
-        let _: () = msg_send![desc, release];
-
-        encoder
-    }
+pub fn new_concurrent_encoder(cb: &ProtocolObject<dyn MTLCommandBuffer>) -> MtlEncoder {
+    let desc = MTLComputePassDescriptor::new();
+    desc.setDispatchType(MTLDispatchType::Concurrent);
+    cb.computeCommandEncoderWithDescriptor(&desc).unwrap()
 }
 
 /// Insert a scope-level memory barrier on a compute command encoder.
 ///
-/// This is equivalent to `[encoder memoryBarrierWithScope:MTLBarrierScopeBuffers]`
-/// and ensures all buffer writes from previous dispatches on this encoder
+/// This ensures all buffer writes from previous dispatches on this encoder
 /// are visible to subsequent dispatches.
 ///
 /// Use this between dependent dispatches on a concurrent encoder to
 /// prevent data races.
-pub fn memory_barrier_scope_buffers(encoder: &ComputeCommandEncoderRef) {
-    unsafe {
-        // MTLBarrierScope::Buffers = 1
-        let _: () = msg_send![encoder, memoryBarrierWithScope: 1u64];
-    }
+pub fn memory_barrier_scope_buffers(encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>) {
+    encoder.memoryBarrierWithScope(MTLBarrierScope::Buffers);
 }
 
 /// Check if concurrent dispatch is available by attempting to create
@@ -518,33 +525,26 @@ pub fn memory_barrier_scope_buffers(encoder: &ComputeCommandEncoderRef) {
 ///
 /// Called once at init to determine if the concurrent dispatch path
 /// can be used. If not, falls back to serial encoders.
-pub fn probe_concurrent_dispatch(device: &metal::Device) -> bool {
-    let queue = device.new_command_queue();
-    let cb = queue.new_command_buffer();
+pub fn probe_concurrent_dispatch(device: &ProtocolObject<dyn MTLDevice>) -> bool {
+    let queue = device.newCommandQueue();
+    let Some(queue) = queue else {
+        return false;
+    };
+    let Some(cb) = queue.commandBuffer() else {
+        return false;
+    };
 
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-        let desc_class = objc::runtime::Class::get("MTLComputePassDescriptor");
-        if desc_class.is_none() {
-            return false;
-        }
-        let desc: *mut objc::runtime::Object = msg_send![desc_class.unwrap(), new];
-        if desc.is_null() {
-            return false;
-        }
-        let _: () = msg_send![desc, setDispatchType: 1u64];
-        let encoder: *mut objc::runtime::Object =
-            msg_send![cb, computeCommandEncoderWithDescriptor: desc];
-        let _: () = msg_send![desc, release];
-        if encoder.is_null() {
-            return false;
-        }
-        // End the encoder so we don't leak
-        let _: () = msg_send![encoder, endEncoding];
-        true
-    }));
+    let desc = MTLComputePassDescriptor::new();
+    desc.setDispatchType(MTLDispatchType::Concurrent);
 
-    // Don't commit — just discard the command buffer
-    result.unwrap_or(false)
+    let encoder = cb.computeCommandEncoderWithDescriptor(&desc);
+    match encoder {
+        Some(enc) => {
+            enc.endEncoding();
+            true
+        }
+        None => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -555,8 +555,17 @@ pub fn probe_concurrent_dispatch(device: &metal::Device) -> bool {
 mod tests {
     use super::*;
 
-    fn system_device() -> Option<metal::Device> {
-        metal::Device::system_default()
+    use std::sync::OnceLock;
+
+    fn test_device() -> Option<&'static MtlDevice> {
+        static DEVICE: OnceLock<Option<MtlDevice>> = OnceLock::new();
+        DEVICE
+            .get_or_init(|| objc2::rc::autoreleasepool(|_| MTLCreateSystemDefaultDevice()))
+            .as_ref()
+    }
+
+    fn system_device() -> Option<&'static MtlDevice> {
+        test_device()
     }
 
     #[test]
@@ -564,8 +573,12 @@ mod tests {
         let Some(device) = system_device() else {
             return;
         };
-        let a = device.new_buffer(256, metal::MTLResourceOptions::StorageModeShared);
-        let b = device.new_buffer(256, metal::MTLResourceOptions::StorageModeShared);
+        let a = device
+            .newBufferWithLength_options(256, MTLResourceOptions::StorageModeShared)
+            .unwrap();
+        let b = device
+            .newBufferWithLength_options(256, MTLResourceOptions::StorageModeShared)
+            .unwrap();
 
         let mut tracker = BarrierTracker::new();
         // First dispatch: write to A
@@ -582,7 +595,9 @@ mod tests {
         let Some(device) = system_device() else {
             return;
         };
-        let a = device.new_buffer(256, metal::MTLResourceOptions::StorageModeShared);
+        let a = device
+            .newBufferWithLength_options(256, MTLResourceOptions::StorageModeShared)
+            .unwrap();
 
         let mut tracker = BarrierTracker::new();
         // Dispatch 1: write A
@@ -599,7 +614,9 @@ mod tests {
         let Some(device) = system_device() else {
             return;
         };
-        let a = device.new_buffer(256, metal::MTLResourceOptions::StorageModeShared);
+        let a = device
+            .newBufferWithLength_options(256, MTLResourceOptions::StorageModeShared)
+            .unwrap();
 
         let mut tracker = BarrierTracker::new();
         // Dispatch 1: write A
@@ -616,7 +633,9 @@ mod tests {
         let Some(device) = system_device() else {
             return;
         };
-        let a = device.new_buffer(256, metal::MTLResourceOptions::StorageModeShared);
+        let a = device
+            .newBufferWithLength_options(256, MTLResourceOptions::StorageModeShared)
+            .unwrap();
 
         let mut tracker = BarrierTracker::new();
         let _ = tracker.needs_barrier(&[], &[&a]);
@@ -632,8 +651,12 @@ mod tests {
         let Some(device) = system_device() else {
             return;
         };
-        let a = device.new_buffer(256, metal::MTLResourceOptions::StorageModeShared);
-        let temp = device.new_buffer(256, metal::MTLResourceOptions::StorageModeShared);
+        let a = device
+            .newBufferWithLength_options(256, MTLResourceOptions::StorageModeShared)
+            .unwrap();
+        let temp = device
+            .newBufferWithLength_options(256, MTLResourceOptions::StorageModeShared)
+            .unwrap();
 
         let mut tracker = BarrierTracker::new();
         tracker.mark_temporary(&temp);
@@ -652,7 +675,9 @@ mod tests {
         let Some(device) = system_device() else {
             return;
         };
-        let temp = device.new_buffer(256, metal::MTLResourceOptions::StorageModeShared);
+        let temp = device
+            .newBufferWithLength_options(256, MTLResourceOptions::StorageModeShared)
+            .unwrap();
 
         let mut tracker = BarrierTracker::new();
         tracker.mark_temporary(&temp);
@@ -670,7 +695,9 @@ mod tests {
         let Some(device) = system_device() else {
             return;
         };
-        let temp = device.new_buffer(256, metal::MTLResourceOptions::StorageModeShared);
+        let temp = device
+            .newBufferWithLength_options(256, MTLResourceOptions::StorageModeShared)
+            .unwrap();
 
         let mut tracker = BarrierTracker::new();
         tracker.mark_temporary(&temp);
@@ -692,8 +719,12 @@ mod tests {
         let Some(device) = system_device() else {
             return;
         };
-        let regular = device.new_buffer(256, metal::MTLResourceOptions::StorageModeShared);
-        let temp = device.new_buffer(256, metal::MTLResourceOptions::StorageModeShared);
+        let regular = device
+            .newBufferWithLength_options(256, MTLResourceOptions::StorageModeShared)
+            .unwrap();
+        let temp = device
+            .newBufferWithLength_options(256, MTLResourceOptions::StorageModeShared)
+            .unwrap();
 
         let mut tracker = BarrierTracker::new();
         tracker.mark_temporary(&temp);
@@ -712,7 +743,9 @@ mod tests {
         let Some(device) = system_device() else {
             return;
         };
-        let temp = device.new_buffer(256, metal::MTLResourceOptions::StorageModeShared);
+        let temp = device
+            .newBufferWithLength_options(256, MTLResourceOptions::StorageModeShared)
+            .unwrap();
 
         let mut tracker = BarrierTracker::new();
         tracker.mark_temporary(&temp);
@@ -728,7 +761,7 @@ mod tests {
         assert!(!store.has_errors());
 
         store.push(GpuError {
-            status: metal::MTLCommandBufferStatus::Error,
+            status: MTLCommandBufferStatus::Error,
             message: "test error".to_string(),
         });
         assert!(store.has_errors());
@@ -740,8 +773,11 @@ mod tests {
 
     #[test]
     fn test_command_buffer_manager_thresholds() {
-        let device = metal::Device::system_default().unwrap();
-        let queue = device.new_command_queue();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let queue = device.newCommandQueue().unwrap();
         let mut mgr = CommandBufferManager::new(&queue);
 
         assert_eq!(mgr.ops_batched(), 0);
@@ -761,8 +797,11 @@ mod tests {
 
     #[test]
     fn test_command_buffer_manager_auto_commit_ops() {
-        let device = metal::Device::system_default().unwrap();
-        let queue = device.new_command_queue();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let queue = device.newCommandQueue().unwrap();
         let mut mgr = CommandBufferManager::new(&queue);
 
         // Batch MAX_OPS_PER_BATCH dispatches — should auto-commit.
@@ -779,8 +818,11 @@ mod tests {
 
     #[test]
     fn test_command_buffer_manager_auto_commit_bytes() {
-        let device = metal::Device::system_default().unwrap();
-        let queue = device.new_command_queue();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let queue = device.newCommandQueue().unwrap();
         let mut mgr = CommandBufferManager::new(&queue);
 
         mgr.get_or_create_buffer();
@@ -792,8 +834,11 @@ mod tests {
 
     #[test]
     fn test_command_buffer_manager_completion_handler() {
-        let device = metal::Device::system_default().unwrap();
-        let queue = device.new_command_queue();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let queue = device.newCommandQueue().unwrap();
         let mut mgr = CommandBufferManager::new(&queue);
 
         let store = std::sync::Arc::clone(mgr.error_store());
@@ -801,8 +846,8 @@ mod tests {
         // Create a buffer, commit, and wait — should complete without error.
         let cb = mgr.get_or_create_buffer();
         // Encode a trivial no-op so the command buffer isn't empty.
-        let encoder = cb.new_compute_command_encoder();
-        encoder.end_encoding();
+        let encoder = cb.computeCommandEncoder().unwrap();
+        encoder.endEncoding();
         mgr.force_commit();
 
         // Give the GPU a moment to complete.
@@ -816,8 +861,11 @@ mod tests {
 
     #[test]
     fn test_probe_concurrent_dispatch() {
-        let device = metal::Device::system_default().unwrap();
-        let supported = probe_concurrent_dispatch(&device);
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let supported = probe_concurrent_dispatch(device);
         // Apple Silicon always supports concurrent dispatch
         assert!(
             supported,
@@ -827,36 +875,49 @@ mod tests {
 
     #[test]
     fn test_concurrent_encoder_creation() {
-        let device = metal::Device::system_default().unwrap();
-        let queue = device.new_command_queue();
-        let cb = queue.new_command_buffer();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let queue = device.newCommandQueue().unwrap();
+        let cb = queue.commandBuffer().unwrap();
 
-        let encoder = new_concurrent_encoder(cb);
+        let encoder = new_concurrent_encoder(&cb);
         // Should be able to end encoding without crash
-        encoder.end_encoding();
+        encoder.endEncoding();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
     }
 
     #[test]
     fn test_memory_barrier_scope() {
-        let device = metal::Device::system_default().unwrap();
-        let queue = device.new_command_queue();
-        let cb = queue.new_command_buffer();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let queue = device.newCommandQueue().unwrap();
+        let cb = queue.commandBuffer().unwrap();
 
-        let encoder = new_concurrent_encoder(cb);
+        let encoder = new_concurrent_encoder(&cb);
         // Should be able to insert barrier without crash
-        memory_barrier_scope_buffers(encoder);
-        encoder.end_encoding();
+        memory_barrier_scope_buffers(&encoder);
+        encoder.endEncoding();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
     }
 
     #[test]
     fn test_barrier_tracker_concurrent_mode() {
-        let device = metal::Device::system_default().unwrap();
-        let a = device.new_buffer(256, metal::MTLResourceOptions::StorageModeShared);
-        let b = device.new_buffer(256, metal::MTLResourceOptions::StorageModeShared);
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let a = device
+            .newBufferWithLength_options(256, MTLResourceOptions::StorageModeShared)
+            .unwrap();
+        let b = device
+            .newBufferWithLength_options(256, MTLResourceOptions::StorageModeShared)
+            .unwrap();
 
         let mut tracker = BarrierTracker::new();
 

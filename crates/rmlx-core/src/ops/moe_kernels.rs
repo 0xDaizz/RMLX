@@ -12,6 +12,14 @@
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLCommandBuffer as _;
+use objc2_metal::MTLCommandQueue as _;
+use objc2_metal::MTLComputePipelineState as _;
+use objc2_metal::MTLDevice as _;
+use rmlx_metal::ComputePass;
+use rmlx_metal::MTLResourceOptions;
+use rmlx_metal::MTLSize;
 
 // ---------------------------------------------------------------------------
 // Metal shader sources
@@ -232,7 +240,7 @@ pub fn index_gather(
     registry: &KernelRegistry,
     src: &Array,
     token_indices: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     let n_assign = token_indices.shape()[0];
     let d = src.shape()[src.shape().len() - 1];
@@ -255,25 +263,33 @@ pub fn index_gather(
 
     let d_buf = make_u32_buf(dev, super::checked_u32(d, "D")?);
 
-    let cb = queue.new_command_buffer();
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(src.metal_buffer()), src.offset() as u64);
+    let cb = queue.commandBuffer().unwrap();
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
+    enc.set_buffer(0, Some(src.metal_buffer()), src.offset());
     enc.set_buffer(1, Some(out.metal_buffer()), 0);
     enc.set_buffer(
         2,
         Some(token_indices.metal_buffer()),
-        token_indices.offset() as u64,
+        token_indices.offset(),
     );
     enc.set_buffer(3, Some(&d_buf), 0);
-
-    let tg_size = std::cmp::min(pipeline.max_total_threads_per_threadgroup(), d as u64);
+    let tg_size = std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), d);
     // One threadgroup per assignment row
-    let grid = metal::MTLSize::new(n_assign as u64, 1, 1);
-    let tg = metal::MTLSize::new(tg_size, 1, 1);
-    enc.dispatch_thread_groups(grid, tg);
-    enc.end_encoding();
-    super::commit_with_mode(cb, super::ExecMode::Sync);
+    let grid = MTLSize {
+        width: n_assign,
+        height: 1,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: tg_size,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threadgroups(grid, tg);
+    enc.end();
+    super::commit_with_mode(&cb, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -293,7 +309,7 @@ pub fn scatter_weighted_add(
     output: &Array,
     token_indices: &Array,
     weights: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<(), KernelError> {
     let n_assign = token_indices.shape()[0];
     let d = src.shape()[src.shape().len() - 1];
@@ -314,51 +330,74 @@ pub fn scatter_weighted_add(
     let dev = registry.device().raw();
     let d_buf = make_u32_buf(dev, super::checked_u32(d, "D")?);
 
-    let cb = queue.new_command_buffer();
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(src.metal_buffer()), src.offset() as u64);
-    enc.set_buffer(1, Some(output.metal_buffer()), output.offset() as u64);
+    let cb = queue.commandBuffer().unwrap();
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
+    enc.set_buffer(0, Some(src.metal_buffer()), src.offset());
+    enc.set_buffer(1, Some(output.metal_buffer()), output.offset());
     enc.set_buffer(
         2,
         Some(token_indices.metal_buffer()),
-        token_indices.offset() as u64,
+        token_indices.offset(),
     );
-    enc.set_buffer(3, Some(weights.metal_buffer()), weights.offset() as u64);
+    enc.set_buffer(3, Some(weights.metal_buffer()), weights.offset());
     enc.set_buffer(4, Some(&d_buf), 0);
-
-    let tg_size = std::cmp::min(pipeline.max_total_threads_per_threadgroup(), d as u64);
+    let tg_size = std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), d);
     // One threadgroup per assignment row
-    let grid = metal::MTLSize::new(n_assign as u64, 1, 1);
-    let tg = metal::MTLSize::new(tg_size, 1, 1);
-    enc.dispatch_thread_groups(grid, tg);
-    enc.end_encoding();
-    super::commit_with_mode(cb, super::ExecMode::Sync);
+    let grid = MTLSize {
+        width: n_assign,
+        height: 1,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: tg_size,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threadgroups(grid, tg);
+    enc.end();
+    super::commit_with_mode(&cb, super::ExecMode::Sync);
 
     Ok(())
 }
 
 /// Create a u32 Metal constant buffer.
-fn make_u32_buf(device: &metal::DeviceRef, val: u32) -> metal::Buffer {
-    let opts = metal::MTLResourceOptions::StorageModeShared;
-    device.new_buffer_with_data(&val as *const u32 as *const _, 4, opts)
+fn make_u32_buf(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    val: u32,
+) -> rmlx_metal::MtlBuffer {
+    let opts = MTLResourceOptions::StorageModeShared;
+    unsafe {
+        device
+            .newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(&val as *const u32 as *const _ as *mut std::ffi::c_void)
+                    .unwrap(),
+                4_usize,
+                opts,
+            )
+            .unwrap()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn setup() -> (KernelRegistry, metal::CommandQueue) {
-        let gpu = rmlx_metal::device::GpuDevice::system_default().unwrap();
-        let queue = gpu.raw().new_command_queue();
+    fn setup() -> Option<(KernelRegistry, rmlx_metal::MtlQueue)> {
+        let gpu = crate::test_utils::test_gpu()?;
+        let queue = gpu.raw().newCommandQueue().unwrap();
         let registry = KernelRegistry::new(gpu);
         register(&registry).unwrap();
-        (registry, queue)
+        Some((registry, queue))
     }
 
     #[test]
     fn test_index_gather_f32() {
-        let (registry, queue) = setup();
+        let Some((registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = registry.device().raw();
 
         // src: 4 rows × 3 cols
@@ -379,7 +418,10 @@ mod tests {
 
     #[test]
     fn test_scatter_weighted_add_f32() {
-        let (registry, queue) = setup();
+        let Some((registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = registry.device().raw();
 
         // src: 3 assignments × 2 cols

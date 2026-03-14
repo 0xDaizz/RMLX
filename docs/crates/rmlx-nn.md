@@ -4,7 +4,7 @@
 
 `rmlx-nn` is a crate that implements neural network layers for GPU-accelerated inference. It builds core Transformer architecture components (Linear, Embedding, Attention, TransformerBlock, MoE) on top of `rmlx-core` compute kernels, and includes built-in model configurations for Qwen 3.5, DeepSeek-V3, Mixtral, and Kimi K2.5.
 
-> **Status (Phase 0-9B-opt + S1-S5 + Audit + EP-2~EP-6 + Prod Phase 2 + Phase 3 + Phase 4 + Phase 5 + Phase KO + Phase 8c + Phase 9 + Phase 10 + Phase 11):** Linear, QuantizedLinear (+ AwqLinear, GptqLinear, KQuantType/KQuantConfig), Embedding, Attention (with LayerKvCache, RotatingKvCache, BatchKvCache, QuantizedKvCache, **PagedKvCache**), MLA (full forward: DeepSeek-V3 9-step pipeline with latent KV compression), SlidingWindowAttention (full forward: Mistral-style RoPE + SDPA + KV cache), TransformerBlock, MoE (with shared expert + EP integration + GPU routing + `MoeStrategy` dispatch), `ExpertGroup` (stacked expert GEMM path), `MoePipeline` (TBO/SBO overlap), LayerNorm, **16 activation functions**, Parallel (TP), Conv1d/Conv2d, DynamicExecContext, GGUF model loader (+ K-quant type mapping), **prefix cache** (radix-tree with LRU eviction), **chunked prefill** scheduler, **continuous batching scheduler**, and **3 full model architectures** (Qwen2Model, DeepSeekV3Model, MixtralModel) are implemented. Phase 0+1+2 audit remediation complete (items N1-N8). EP Phases 2-6 forward path integration complete. **Phase 5 additions:** 11 new activations (ReLU, LeakyReLU, ELU, SELU, Mish, QuickGELU, HardSwish, HardSigmoid, Softplus, Softsign, GLU -- 16 total); full MLA forward implementation; full SlidingWindowAttention forward; AwqLinear/GptqLinear/KQuantType/KQuantConfig in quantized\_linear.rs; K-quant GGUF mapping in gguf\_loader.rs; radix-tree prefix cache (prefix\_cache.rs); chunked prefill in scheduler.rs; 4 full model architectures in models/. **Phase KO additions:** 9-dispatch decode path (forward_decode_9dispatch, forward_single_cb_9dispatch), merged QKV and gate_up weight preparation, slab-layout KV cache (LayerKvCache::preallocated with slab), prepare_weights_private() pipeline for StorageModePrivate weights. **Phase 8c additions:** `CachedDecode` struct with pre-resolved PSOs and pre-allocated scratch buffers, `forward_cached_2encoder_9dispatch` method, `append_into_encoder` and `append_preresolved_into_encoder` for KV cache, `_preresolved_into_encoder` pattern across all ops. **Phase 9 additions:** f16 default dtype, single-encoder decode path, direct KV append, pre-cached threadgroup sizes — 714 us/layer at 60L. **Phase 10 additions:** `fused_rms_gemv` and `fused_swiglu_down` fused kernels, 7-dispatch decode pipeline — 703.4 us/layer at 60L. **Phase 11 conclusion:** All kernel-level GEMV optimization experiments failed; 703.4 us/layer is the practical floor for f16 decode on Apple Silicon (73.6% bandwidth efficiency). **Phase I-1:** `DistributedTransformerModel` with `forward_with_group()` (tensor-parallel forward using ColumnParallelLinear/RowParallelLinear) and `shard_for_tp()` (automatic weight partitioning across TP ranks). Estimated 1.94x speedup at TP=2.
+> **Status (Phase 0-9B-opt + S1-S5 + Audit + EP-2~EP-6 + Prod Phase 2 + Phase 3 + Phase 4 + Phase 5 + Phase KO + Phase 8c + Phase 9 + Phase 10 + Phase 11):** Linear, QuantizedLinear (+ AwqLinear, GptqLinear, KQuantType/KQuantConfig), Embedding, Attention (with LayerKvCache, RotatingKvCache, BatchKvCache, QuantizedKvCache, **PagedKvCache**), MLA (full forward: DeepSeek-V3 9-step pipeline with latent KV compression), SlidingWindowAttention (full forward: Mistral-style RoPE + SDPA + KV cache), TransformerBlock, MoE (with shared expert + EP integration + GPU routing + `MoeStrategy` dispatch), `ExpertGroup` (stacked expert GEMM path), `MoePipeline` (TBO/SBO overlap), LayerNorm, **16 activation functions**, Parallel (TP), Conv1d/Conv2d, DynamicExecContext, GGUF model loader (+ K-quant type mapping), **prefix cache** (radix-tree with LRU eviction), **chunked prefill** scheduler, **continuous batching scheduler**, and **3 full model architectures** (Qwen2Model, DeepSeekV3Model, MixtralModel) are implemented. Phase 0+1+2 audit remediation complete (items N1-N8). EP Phases 2-6 forward path integration complete. **Phase 5 additions:** 11 new activations (ReLU, LeakyReLU, ELU, SELU, Mish, QuickGELU, HardSwish, HardSigmoid, Softplus, Softsign, GLU -- 16 total); full MLA forward implementation; full SlidingWindowAttention forward; AwqLinear/GptqLinear/KQuantType/KQuantConfig in quantized\_linear.rs; K-quant GGUF mapping in gguf\_loader.rs; radix-tree prefix cache (prefix\_cache.rs); chunked prefill in scheduler.rs; 4 full model architectures in models/. **Phase KO additions:** 9-dispatch decode path (forward_decode_9dispatch, forward_single_cb_9dispatch), merged QKV and gate_up weight preparation, slab-layout KV cache (LayerKvCache::preallocated with slab), prepare_weights_private() pipeline for StorageModePrivate weights. **Phase 8c additions:** `CachedDecode` struct with pre-resolved PSOs and pre-allocated scratch buffers, `forward_cached_2encoder_9dispatch` method, `append_into_encoder` and `append_preresolved_into_encoder` for KV cache, `_preresolved_into_encoder` pattern across all ops. **Phase 9 additions:** f16 default dtype, single-encoder decode path, direct KV append, pre-cached threadgroup sizes — 714 us/layer at 60L. **Phase 10 additions:** `fused_rms_gemv` and `fused_swiglu_down` fused kernels, 7-dispatch decode pipeline — 699.3 us/layer at 60L. **Phase 11 conclusion:** All kernel-level GEMV optimization experiments failed; 699.3 us/layer is the practical floor for f16 decode on Apple Silicon (73.6% bandwidth efficiency). **Phase I-1:** `DistributedTransformerModel` with `forward_with_group()` (tensor-parallel forward using ColumnParallelLinear/RowParallelLinear) and `shard_for_tp()` (automatic weight partitioning across TP ranks). Estimated 1.94x speedup at TP=2.
 
 ---
 
@@ -883,7 +883,7 @@ Phase A optimizes the prefill (seq_len=N) single-layer path, extending the GPU p
 | SDPA dispatches (GQA) | 32 | 1 | 96.9% |
 | Single-layer speedup | 1x | 3.5-7.3x | sequence-length dependent |
 | vs MLX (single-layer) | — | within 1.2-3.4x | |
-| GEMM TFLOPS | — | 13T (rmlx) vs 24T (MLX) | remaining gap |
+| GEMM TFLOPS | — | 24.05T (rmlx) vs 24T (MLX) | pipe parity achieved |
 
 Key enablers: single-CB prefill pipeline, GQA slab SDPA, GEMM threadgroup swizzle, `matmul_into_cb`, `silu_into_cb`. Benchmarks: `prefill_bench.rs`, `gemm_bench.rs`.
 
@@ -900,11 +900,31 @@ Phase KO closes the per-layer decode performance gap with MLX:
 | Single-CB (44 enc) | 2,049 | 53x | 44 |
 | 9-Dispatch (4 enc) | 1,739 | 64x | 9 |
 | Cached 2-encoder (60L) | 714 us/L | 6x lower σ | 9 (2 encoders) |
-| **Fused 7-dispatch (60L)** | **703.4 us/L** | **Phase 10 best** | **7 (fused)** |
+| **Fused 7-dispatch (60L)** | **699.3 us/L** | **Current best** | **7 (fused)** |
 | MLX compiled (60L) | 4,525 us/L | -- | -- |
 | vs MLX (60L) | | 6.34x faster | |
 
-**Phase 11 conclusion:** All kernel-level optimization experiments (col-major GEMV, interleaved GEMV, SRAM prefetch + f16 accumulation + function constants) failed to improve beyond 703.4 us/layer. Row-major BM8 GEMV with f32 accumulation achieves 73.6% bandwidth efficiency, which is the practical floor for f16 decode on Apple Silicon. No further kernel-level improvements are expected without quantization (INT4/INT8) or a hardware change.
+**Phase 11 conclusion:** All kernel-level optimization experiments (col-major GEMV, interleaved GEMV, SRAM prefetch + f16 accumulation + function constants) failed to improve beyond 699.3 us/layer. Row-major BM8 GEMV with f32 accumulation achieves 73.6% bandwidth efficiency, which is the practical floor for f16 decode on Apple Silicon. No further kernel-level improvements are expected without quantization (INT4/INT8) or a hardware change.
+
+### Current Performance Numbers
+
+| Metric | Value | Notes |
+|--------|------:|-------|
+| FP16 GEMM | 24.05T | Pipe parity with MLX |
+| QMM Q4 M=512 | 17.43T | MLX 13.6T, +28% |
+| Decode best | 699.3 us/layer | 7-dispatch fused, 60L |
+| BW efficiency | 73.6% | Practical floor for f16 on Apple Silicon |
+
+### GEMM Dispatch Table (f16 — `matmul_into_cb` Production Path)
+
+| M | Dispatch | Notes |
+|---|----------|-------|
+| 1 | Tiled GEMM (BM=16 pad) | GEMV path removed |
+| 2-8 | Split-K (unconditional, K>=256) | Always Split-K for tiny M |
+| 9-32 | Split-K (K>=N only), else Tiled | Conditional Split-K |
+| 33-128 | Tiled GEMM (MlxMicro 16x32) | Standard tiled path |
+| 256 | MlxSmall 32x32 | Intermediate tile |
+| 512+ | NAX 64x128 | Large-M optimized |
 
 ---
 

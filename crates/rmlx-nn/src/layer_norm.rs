@@ -3,6 +3,8 @@
 //! Wraps `rmlx_core::ops::layer_norm` as an nn module with learnable
 //! weight and bias parameters.
 
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLCommandQueue;
 use rmlx_core::array::Array;
 use rmlx_core::kernels::{KernelError, KernelRegistry};
 use rmlx_core::ops;
@@ -97,7 +99,7 @@ impl LayerNorm {
         &self,
         input: &Array,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         if input.ndim() != 2 {
             return Err(KernelError::InvalidShape(format!(

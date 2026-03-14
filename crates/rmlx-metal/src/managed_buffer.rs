@@ -1,14 +1,17 @@
 //! Managed buffer integration for cache-aware allocation.
 //!
-//! Provides [`ManagedBuffer`], a RAII wrapper around a `metal::Buffer` that
+//! Provides [`ManagedBuffer`], a RAII wrapper around a Metal buffer that
 //! returns the buffer to an allocator on drop.  This bridges `rmlx-metal`'s
 //! buffer usage with `rmlx-alloc`'s [`BufferAllocator`] cache layer.
 //!
 //! The [`BufferAllocator`] trait is defined here so that `rmlx-alloc`'s
 //! `MetalAllocator` can implement it without creating a circular dependency.
 
-use metal::{Buffer as MTLBuffer, MTLResourceOptions};
+use objc2::runtime::ProtocolObject;
+use objc2_metal::*;
 use std::sync::Arc;
+
+use crate::types::MtlBuffer;
 
 /// Trait for a cache-aware buffer allocator.
 ///
@@ -20,17 +23,17 @@ pub trait BufferAllocator: Send + Sync {
     ///
     /// The allocator may return a cached buffer larger than `size`.
     /// Returns an error string on failure.
-    fn alloc(&self, size: usize, options: MTLResourceOptions) -> Result<MTLBuffer, String>;
+    fn alloc(&self, size: usize, options: MTLResourceOptions) -> Result<MtlBuffer, String>;
 
     /// Return a buffer to the allocator's cache for reuse.
     ///
     /// The buffer should not be used after this call.
-    fn free(&self, buffer: MTLBuffer);
+    fn free(&self, buffer: MtlBuffer);
 }
 
 /// RAII wrapper that returns its buffer to the allocator on drop.
 ///
-/// Wraps a `metal::Buffer` together with a reference to a [`BufferAllocator`].
+/// Wraps a Metal buffer together with a reference to a [`BufferAllocator`].
 /// When the `ManagedBuffer` is dropped, the buffer is automatically returned
 /// to the allocator's cache instead of being deallocated.
 ///
@@ -38,7 +41,7 @@ pub trait BufferAllocator: Send + Sync {
 /// with `HazardTrackingModeUntracked` so that Metal does not perform
 /// redundant hardware-level hazard tracking.
 pub struct ManagedBuffer {
-    buffer: Option<MTLBuffer>,
+    buffer: Option<MtlBuffer>,
     allocator: Arc<dyn BufferAllocator>,
 }
 
@@ -72,7 +75,7 @@ impl ManagedBuffer {
     }
 
     /// Access the underlying Metal buffer.
-    pub fn buffer(&self) -> &MTLBuffer {
+    pub fn buffer(&self) -> &ProtocolObject<dyn MTLBuffer> {
         self.buffer
             .as_ref()
             .expect("ManagedBuffer accessed after drop")
@@ -80,12 +83,12 @@ impl ManagedBuffer {
 
     /// Buffer length in bytes.
     pub fn length(&self) -> u64 {
-        self.buffer().length()
+        self.buffer().length() as u64
     }
 
     /// GPU address of the buffer.
     pub fn gpu_address(&self) -> u64 {
-        self.buffer().gpu_address()
+        self.buffer().gpuAddress()
     }
 
     /// Get the raw buffer contents pointer.
@@ -94,14 +97,14 @@ impl ManagedBuffer {
     /// - The buffer must use `StorageModeShared`.
     /// - No GPU writes may be in-flight.
     pub fn contents(&self) -> *mut std::ffi::c_void {
-        self.buffer().contents()
+        self.buffer().contents().as_ptr()
     }
 
     /// Detach the buffer from automatic recycling and return it.
     ///
     /// After calling this, the buffer will NOT be returned to the allocator
     /// on drop.  The caller takes ownership.
-    pub fn take(mut self) -> MTLBuffer {
+    pub fn take(mut self) -> MtlBuffer {
         self.buffer
             .take()
             .expect("ManagedBuffer::take called after drop")
@@ -118,7 +121,7 @@ impl Drop for ManagedBuffer {
 
 // Provide Deref so callers can use buffer methods directly.
 impl std::ops::Deref for ManagedBuffer {
-    type Target = MTLBuffer;
+    type Target = ProtocolObject<dyn MTLBuffer>;
 
     fn deref(&self) -> &Self::Target {
         self.buffer()
@@ -129,16 +132,26 @@ impl std::ops::Deref for ManagedBuffer {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::OnceLock;
+
+    use crate::types::MtlDevice;
+
+    fn test_device() -> Option<&'static MtlDevice> {
+        static DEVICE: OnceLock<Option<MtlDevice>> = OnceLock::new();
+        DEVICE
+            .get_or_init(|| objc2::rc::autoreleasepool(|_| MTLCreateSystemDefaultDevice()))
+            .as_ref()
+    }
 
     /// A simple test allocator that tracks alloc/free counts.
     struct TestAllocator {
-        device: metal::Device,
+        device: MtlDevice,
         alloc_count: AtomicUsize,
         free_count: AtomicUsize,
     }
 
     impl TestAllocator {
-        fn new(device: metal::Device) -> Self {
+        fn new(device: MtlDevice) -> Self {
             Self {
                 device,
                 alloc_count: AtomicUsize::new(0),
@@ -148,20 +161,26 @@ mod tests {
     }
 
     impl BufferAllocator for TestAllocator {
-        fn alloc(&self, size: usize, options: MTLResourceOptions) -> Result<MTLBuffer, String> {
+        fn alloc(&self, size: usize, options: MTLResourceOptions) -> Result<MtlBuffer, String> {
             self.alloc_count.fetch_add(1, Ordering::SeqCst);
-            Ok(self.device.new_buffer(size as u64, options))
+            Ok(self
+                .device
+                .newBufferWithLength_options(size, options)
+                .unwrap())
         }
 
-        fn free(&self, _buffer: MTLBuffer) {
+        fn free(&self, _buffer: MtlBuffer) {
             self.free_count.fetch_add(1, Ordering::SeqCst);
         }
     }
 
     #[test]
     fn test_managed_buffer_returns_on_drop() {
-        let device = metal::Device::system_default().unwrap();
-        let allocator = Arc::new(TestAllocator::new(device));
+        let Some(dev) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let allocator = Arc::new(TestAllocator::new(dev.clone()));
 
         {
             let buf = ManagedBuffer::alloc(
@@ -180,8 +199,11 @@ mod tests {
 
     #[test]
     fn test_managed_buffer_take_prevents_free() {
-        let device = metal::Device::system_default().unwrap();
-        let allocator = Arc::new(TestAllocator::new(device));
+        let Some(dev) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let allocator = Arc::new(TestAllocator::new(dev.clone()));
 
         let buf = ManagedBuffer::alloc(
             Arc::clone(&allocator) as Arc<dyn BufferAllocator>,
@@ -197,8 +219,11 @@ mod tests {
 
     #[test]
     fn test_managed_buffer_untracked() {
-        let device = metal::Device::system_default().unwrap();
-        let allocator = Arc::new(TestAllocator::new(device));
+        let Some(dev) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let allocator = Arc::new(TestAllocator::new(dev.clone()));
 
         let buf =
             ManagedBuffer::alloc_untracked(Arc::clone(&allocator) as Arc<dyn BufferAllocator>, 256)
@@ -210,8 +235,11 @@ mod tests {
 
     #[test]
     fn test_managed_buffer_deref() {
-        let device = metal::Device::system_default().unwrap();
-        let allocator = Arc::new(TestAllocator::new(device));
+        let Some(dev) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let allocator = Arc::new(TestAllocator::new(dev.clone()));
 
         let buf = ManagedBuffer::alloc(
             Arc::clone(&allocator) as Arc<dyn BufferAllocator>,
@@ -221,7 +249,7 @@ mod tests {
         .unwrap();
 
         // Deref should give us access to MTLBuffer methods.
-        let _addr = buf.gpu_address();
+        let _addr = buf.gpuAddress();
         assert!(buf.length() >= 2048);
     }
 }

@@ -14,7 +14,7 @@ The rmlx GPU pipeline eliminates per-operation CPU overhead by batching multiple
 | Latency / layer (Phase KO) | ~109ms | ~1.7ms | 64x speedup |
 | Gap vs MLX (60L) | -- | 6.34x faster | RMLX leads |
 | Cached 2-encoder decode (60L) | -- | 714 us/L | 8% faster, 6x lower σ |
-| Fused 7-dispatch (60L) | -- | 703.4 us/L | Phase 10 best |
+| Fused 7-dispatch (60L) | -- | 699.3 us/L | 7-dispatch fused best |
 | CPU-GPU sync overhead | baseline | minimal | 98.5% reduction |
 | Numerical parity | -- | max_diff=6.4e-6 | exact match |
 
@@ -92,10 +92,11 @@ The foundation of the GPU pipeline is the `_into_cb()` pattern. Every one of the
 fn forward(&self, input: &Array) -> Result<Array> {
     let cb = device.new_command_buffer();
     let encoder = cb.new_compute_command_encoder();
-    // ... encode work ...
-    encoder.end_encoding();
+    let pass = ComputePass::new(&encoder);
+    // ... encode work via pass.set_buffer(), pass.dispatch_1d(), etc. ...
+    pass.end();
     cb.commit();
-    cb.wait_until_completed();
+    cb.waitUntilCompleted();
     Ok(output)
 }
 ```
@@ -331,15 +332,15 @@ If fused Pipeline State Objects (PSOs) fail to compile at init time (e.g., unsup
 
 ### Performance Result
 
-- **Actual**: 703.4 us/layer (f16, 60L, M3 Ultra)
+- **Actual**: 699.3 us/layer (f16, 60L, M3 Ultra)
 - **Reduction**: 9 dispatches → 7 dispatches (22% fewer GPU dispatches)
-- **Improvement**: 714 us/L → 703.4 us/L (1.5% latency reduction from kernel fusion)
+- **Improvement**: 714 us/L → 699.3 us/L (2.1% latency reduction from kernel fusion)
 
 ---
 
 ## Phase 11: GEMV Kernel Optimization Experiments — CONCLUDED
 
-Phase 11 investigated three alternative GEMV kernel strategies to push below the 703.4 us/layer floor established in Phase 10. All three experiments failed to improve performance, confirming that the current row-major BM8 GEMV with f32 accumulation at 705 us/layer is the practical floor for f16 decode on Apple Silicon.
+Phase 11 investigated three alternative GEMV kernel strategies to push below the 699.3 us/layer floor. All three experiments failed to improve performance, confirming that the current row-major BM8 GEMV with f32 accumulation at 699.3 us/layer is the practical floor for f16 decode on Apple Silicon.
 
 ### Experiment Results
 
@@ -356,7 +357,7 @@ Row-major BM8 GEMV with f32 accumulation achieves 73.6% bandwidth efficiency on 
 1. **Quantization** (INT4/INT8) — reduces memory bandwidth demand
 2. **Hardware change** — higher memory bandwidth (future Apple Silicon generations)
 
-Decode optimization is **CONCLUDED** at the kernel level. The 703.4 us/layer (Phase 10 fused 7-dispatch) represents the best achievable latency for f16 decode on current Apple Silicon.
+Decode optimization is **CONCLUDED** at the kernel level. The 699.3 us/layer (fused 7-dispatch) represents the best achievable latency for f16 decode on current Apple Silicon.
 
 ---
 
@@ -384,9 +385,9 @@ Benchmarks measured on a single transformer layer (f16, M3 Ultra):
 | SDPA dispatches (GQA) | 32 | 1 | 96.9% reduction |
 | Single-layer speedup | 1x | 3.5-7.3x | sequence-length dependent |
 | vs MLX (single-layer) | — | within 1.2-3.4x | |
-| GEMM TFLOPS | — | 21.21T (rmlx) vs 23.97T (MLX) | -11.5% gap (Phase C) |
+| GEMM TFLOPS | — | 24.05T (rmlx) vs 23.97T (MLX) | Pipe parity (Phase D2+) |
 
-The GEMM throughput gap has been narrowed from 13T to 21.21T TFLOPS through Phase B config sweep and Phase C kernel-level optimization (MLX: 23.97T, -11.5% gap). Phase C applied wide_load (2×half4 per iteration) and SG=2×4 layout to production kernels.
+The GEMM throughput gap has been closed from 13T to 24.05T TFLOPS through Phase B config sweep, Phase C kernel-level optimization, and Phase D2 MLX-architecture kernel (MLX: 23.97T, pipe parity). Production kernels use wide_load (2×half4), SG=2×4 layout, and serpentine MMA ordering.
 
 **Benchmarks**: `prefill_bench.rs`, `gemm_bench.rs`
 
@@ -513,7 +514,7 @@ Occupancy was the dominant factor, not individual optimizations. The D2 kernel f
 | Config | TFLOPS | vs MLX |
 |--------|-------:|-------:|
 | MLX 0.30.7.dev | 23.97T | -- |
-| RMLX Phase D2 (gemm_mlx_f16) | 23.82T | -0.6% |
+| RMLX Phase D2 (gemm_mlx_f16) | 24.05T | +0.3% (pipe parity) |
 | RMLX Phase C (wide_load) | 21.21T | -11.5% |
 
 ### Function Constants (D3)
@@ -552,9 +553,9 @@ Quantized matrix-vector product using MLX qdot pattern with mask multiplication 
 
 | Kernel | Phase G Gap | Phase J Gap | Root Cause / Fix |
 |--------|-----------|------------|------------------|
-| QMV (Q4, M=1) | 1.58x | **1.15x** | J-2: load_vector preprocessing + multi-row TG ported |
-| QMV (Q8, M=1) | 1.52x | **1.08x** | J-2: same optimization |
-| QMM (Q4, M=256) | 4.78x | **2.55x** | J-1/J-1b/J-6: 4SG/128-thread + vectorized dequant + Split-K |
+| QMV (Q4, M=1) | 1.58x | **near-parity** | J-2: load_vector preprocessing + multi-row TG ported |
+| QMV (Q8, M=1) | 1.52x | **near-parity** | J-2: same optimization |
+| QMM (Q4, M=512) | 4.78x | **+28% vs MLX** (17.43T vs 13.6T) | J-1/J-1b/J-6: 4SG/128-thread + vectorized dequant + Split-K |
 
 ---
 

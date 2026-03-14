@@ -3,6 +3,7 @@
 //! Verifies the full rmlx-metal pipeline: device acquisition, buffer creation,
 //! JIT shader compilation, pipeline caching, compute dispatch, and result readback.
 
+use objc2_metal::MTLCommandBuffer as _;
 use rmlx_metal::buffer::read_buffer;
 use rmlx_metal::command::encode_compute_1d;
 use rmlx_metal::device::GpuDevice;
@@ -42,7 +43,7 @@ fn test_basic_metal_compute() {
     let buffer_b = device.new_buffer_with_data(&[5.0f32, 6.0, 7.0, 8.0]);
     let buffer_out = device.new_buffer(
         16, // 4 floats * 4 bytes
-        rmlx_metal::metal::MTLResourceOptions::StorageModeShared,
+        rmlx_metal::MTLResourceOptions::StorageModeShared,
     );
 
     // 3. Compile shader from source (JIT) and get pipeline
@@ -55,7 +56,7 @@ fn test_basic_metal_compute() {
     // 4. Encode and dispatch
     let cmd_buf = queue.new_command_buffer();
     encode_compute_1d(
-        cmd_buf,
+        &cmd_buf,
         &pipeline,
         &[(&buffer_a, 0), (&buffer_b, 0), (&buffer_out, 0)],
         4,
@@ -63,7 +64,7 @@ fn test_basic_metal_compute() {
 
     // 5. Execute and wait
     cmd_buf.commit();
-    cmd_buf.wait_until_completed();
+    cmd_buf.waitUntilCompleted();
 
     // 6. Verify results
     // SAFETY: buffer_out uses StorageModeShared and GPU work has completed

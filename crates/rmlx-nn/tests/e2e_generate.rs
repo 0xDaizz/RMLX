@@ -6,11 +6,13 @@
 //! outputs. The goal is to verify the full wiring:
 //!   Embedding -> N x TransformerBlock -> RMSNorm -> LM Head -> Sampler
 
+use objc2::runtime::ProtocolObject;
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::KernelRegistry;
 use rmlx_core::ops;
 use rmlx_metal::device::GpuDevice;
+use rmlx_metal::types::MtlQueue;
 use rmlx_nn::attention::{Attention, AttentionConfig};
 use rmlx_nn::embedding::{Embedding, EmbeddingConfig};
 use rmlx_nn::linear::{Linear, LinearConfig};
@@ -33,19 +35,22 @@ const VOCAB: usize = 256;
 const INTERMEDIATE: usize = 128;
 const MAX_SEQ: usize = 64;
 
-fn setup() -> (metal::Device, metal::CommandQueue, KernelRegistry) {
-    let gpu = GpuDevice::system_default().expect("need Metal GPU");
-    let device = gpu.raw().clone();
-    let queue = device.new_command_queue();
+fn setup() -> Option<(KernelRegistry, MtlQueue)> {
+    let gpu = GpuDevice::system_default().ok()?;
+    let queue = gpu.new_command_queue();
     let registry = KernelRegistry::new(gpu);
     ops::register_all(&registry).expect("register ops");
-    (device, queue, registry)
+    Some((registry, queue))
 }
 
 /// Create a random-ish f32 array on the Metal device.
 ///
 /// Uses a deterministic pattern (not truly random) so the test is reproducible.
-fn pseudo_random_array(device: &metal::Device, shape: &[usize], seed: u32) -> Array {
+fn pseudo_random_array(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    shape: &[usize],
+    seed: u32,
+) -> Array {
     let numel: usize = shape.iter().product();
     let data: Vec<f32> = (0..numel)
         .map(|i| {
@@ -58,7 +63,7 @@ fn pseudo_random_array(device: &metal::Device, shape: &[usize], seed: u32) -> Ar
 }
 
 /// Build a tiny TransformerModel with random weights suitable for smoke testing.
-fn build_tiny_model(device: &metal::Device) -> TransformerModel {
+fn build_tiny_model(device: &ProtocolObject<dyn objc2_metal::MTLDevice>) -> TransformerModel {
     let config = TransformerConfig {
         hidden_size: HIDDEN,
         num_heads: HEADS,
@@ -234,8 +239,12 @@ fn build_tiny_model(device: &metal::Device) -> TransformerModel {
 
 #[test]
 fn e2e_forward_produces_valid_logits_shape() {
-    let (device, queue, registry) = setup();
-    let mut model = build_tiny_model(&device);
+    let Some((registry, queue)) = setup() else {
+        eprintln!("Skipping: no Metal GPU");
+        return;
+    };
+    let device = registry.device().raw();
+    let mut model = build_tiny_model(device);
 
     let input_tokens: Vec<u32> = vec![1, 42, 100, 7]; // 4 tokens
     let seq_len = input_tokens.len();
@@ -253,8 +262,12 @@ fn e2e_forward_produces_valid_logits_shape() {
 
 #[test]
 fn e2e_forward_then_sample_produces_valid_token() {
-    let (device, queue, registry) = setup();
-    let mut model = build_tiny_model(&device);
+    let Some((registry, queue)) = setup() else {
+        eprintln!("Skipping: no Metal GPU");
+        return;
+    };
+    let device = registry.device().raw();
+    let mut model = build_tiny_model(device);
 
     let input_tokens: Vec<u32> = vec![1, 42, 100];
 
@@ -286,8 +299,12 @@ fn e2e_forward_then_sample_produces_valid_token() {
 
 #[test]
 fn e2e_greedy_decode_multi_step() {
-    let (device, queue, registry) = setup();
-    let mut model = build_tiny_model(&device);
+    let Some((registry, queue)) = setup() else {
+        eprintln!("Skipping: no Metal GPU");
+        return;
+    };
+    let device = registry.device().raw();
+    let mut model = build_tiny_model(device);
 
     let config = SamplerConfig {
         temperature: 0.0,
@@ -345,8 +362,12 @@ fn e2e_greedy_decode_multi_step() {
 
 #[test]
 fn e2e_stochastic_sample_tokens_in_range() {
-    let (device, queue, registry) = setup();
-    let mut model = build_tiny_model(&device);
+    let Some((registry, queue)) = setup() else {
+        eprintln!("Skipping: no Metal GPU");
+        return;
+    };
+    let device = registry.device().raw();
+    let mut model = build_tiny_model(device);
 
     let input_tokens: Vec<u32> = vec![5, 10, 20];
 
@@ -378,8 +399,12 @@ fn e2e_stochastic_sample_tokens_in_range() {
 
 #[test]
 fn e2e_model_config_accessible() {
-    let (device, _queue, _registry) = setup();
-    let model = build_tiny_model(&device);
+    let Some((registry, _queue)) = setup() else {
+        eprintln!("Skipping: no Metal GPU");
+        return;
+    };
+    let device = registry.device().raw();
+    let model = build_tiny_model(device);
 
     assert_eq!(model.config().hidden_size, HIDDEN);
     assert_eq!(model.config().num_heads, HEADS);

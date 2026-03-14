@@ -396,24 +396,30 @@ impl std::error::Error for SchedulerError {}
 mod tests {
     use super::*;
     use rmlx_core::dtype::DType;
-    use rmlx_metal::metal;
+    use rmlx_metal::MtlDevice;
 
-    fn test_device() -> metal::Device {
-        metal::Device::system_default().expect("no Metal device available")
+    use std::sync::OnceLock;
+
+    fn test_device() -> Option<&'static MtlDevice> {
+        static DEVICE: OnceLock<Option<MtlDevice>> = OnceLock::new();
+        DEVICE
+            .get_or_init(|| {
+                objc2::rc::autoreleasepool(|_| objc2_metal::MTLCreateSystemDefaultDevice())
+            })
+            .as_ref()
     }
 
     /// Helper: create a BlockManager with small parameters for testing.
-    fn test_block_manager(num_blocks: usize) -> BlockManager {
-        let device = test_device();
-        BlockManager::new(
-            &device,
+    fn test_block_manager(num_blocks: usize) -> Option<BlockManager> {
+        Some(BlockManager::new(
+            test_device()?,
             num_blocks,
             4, // block_size: 4 tokens per block
             2, // num_layers
             2, // num_kv_heads
             4, // head_dim
             DType::Float32,
-        )
+        ))
     }
 
     fn test_config() -> SchedulerConfig {
@@ -436,7 +442,10 @@ mod tests {
     #[test]
     fn test_add_request_and_schedule() {
         let mut scheduler = Scheduler::new(test_config());
-        let mut bm = test_block_manager(32);
+        let Some(mut bm) = test_block_manager(32) else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
 
         scheduler.add_request(make_request(1, 8, 10));
         scheduler.add_request(make_request(2, 4, 5));
@@ -465,7 +474,10 @@ mod tests {
     #[test]
     fn test_prefill_then_decode() {
         let mut scheduler = Scheduler::new(test_config());
-        let mut bm = test_block_manager(32);
+        let Some(mut bm) = test_block_manager(32) else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
 
         scheduler.add_request(make_request(1, 4, 10));
 
@@ -493,7 +505,10 @@ mod tests {
             max_prefill_chunk: 512,
         };
         let mut scheduler = Scheduler::new(config);
-        let mut bm = test_block_manager(32);
+        let Some(mut bm) = test_block_manager(32) else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
 
         // Add 3 requests, batch size is 2.
         scheduler.add_request(make_request(1, 4, 10));
@@ -516,7 +531,10 @@ mod tests {
     #[test]
     fn test_sequence_completion_by_max_len() {
         let mut scheduler = Scheduler::new(test_config());
-        let mut bm = test_block_manager(32);
+        let Some(mut bm) = test_block_manager(32) else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
 
         // Request with max_output_len = 2.
         scheduler.add_request(make_request(1, 4, 2));
@@ -537,7 +555,10 @@ mod tests {
     #[test]
     fn test_sequence_completion_by_eos() {
         let mut scheduler = Scheduler::new(test_config());
-        let mut bm = test_block_manager(32);
+        let Some(mut bm) = test_block_manager(32) else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
 
         scheduler.add_request(make_request(1, 4, 100));
 
@@ -559,7 +580,10 @@ mod tests {
     #[test]
     fn test_eviction_frees_blocks() {
         let mut scheduler = Scheduler::new(test_config());
-        let mut bm = test_block_manager(8);
+        let Some(mut bm) = test_block_manager(8) else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
 
         let free_before = bm.num_free_blocks();
 
@@ -587,7 +611,10 @@ mod tests {
         };
         let mut scheduler = Scheduler::new(config);
         // Only 2 blocks available total.
-        let mut bm = test_block_manager(2);
+        let Some(mut bm) = test_block_manager(2) else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
 
         // First request: 8 tokens = 2 blocks -> exhausts pool.
         scheduler.add_request(make_request(1, 8, 10));
@@ -613,7 +640,10 @@ mod tests {
             max_prefill_chunk: 512,
         };
         let mut scheduler = Scheduler::new(config);
-        let mut bm = test_block_manager(8);
+        let Some(mut bm) = test_block_manager(8) else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
 
         scheduler.add_request(make_request(1, 4, 1));
         scheduler.add_request(make_request(2, 4, 10));
@@ -638,7 +668,10 @@ mod tests {
     #[test]
     fn test_mark_finished() {
         let mut scheduler = Scheduler::new(test_config());
-        let mut bm = test_block_manager(32);
+        let Some(mut bm) = test_block_manager(32) else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
 
         scheduler.add_request(make_request(1, 4, 100));
         scheduler.schedule(&mut bm, &HashMap::new());
@@ -652,7 +685,10 @@ mod tests {
     #[test]
     fn test_is_idle() {
         let mut scheduler = Scheduler::new(test_config());
-        let mut bm = test_block_manager(32);
+        let Some(mut bm) = test_block_manager(32) else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
 
         assert!(scheduler.is_idle());
 
@@ -670,7 +706,10 @@ mod tests {
     #[test]
     fn test_block_table_grows_during_decode() {
         let mut scheduler = Scheduler::new(test_config());
-        let mut bm = test_block_manager(32);
+        let Some(mut bm) = test_block_manager(32) else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
 
         // Prompt exactly fills 1 block (4 tokens, block_size=4).
         scheduler.add_request(make_request(1, 4, 10));
@@ -697,7 +736,10 @@ mod tests {
         };
         let mut scheduler = Scheduler::new(config);
         // Need enough blocks: 2048 tokens / 4 block_size = 512 blocks.
-        let mut bm = test_block_manager(1024);
+        let Some(mut bm) = test_block_manager(1024) else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
 
         scheduler.add_request(make_request(1, 2048, 10));
 
@@ -750,7 +792,10 @@ mod tests {
             max_prefill_chunk: 512,
         };
         let mut scheduler = Scheduler::new(config);
-        let mut bm = test_block_manager(1024);
+        let Some(mut bm) = test_block_manager(1024) else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
 
         // Add and prefill a short sequence first so it enters decode.
         scheduler.add_request(make_request(10, 8, 100));
@@ -797,7 +842,10 @@ mod tests {
             max_prefill_chunk: 512,
         };
         let mut scheduler = Scheduler::new(config);
-        let mut bm = test_block_manager(256);
+        let Some(mut bm) = test_block_manager(256) else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
 
         scheduler.add_request(make_request(1, 256, 10));
 

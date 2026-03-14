@@ -23,27 +23,41 @@ MLX is written in C++, but RMLX chose Rust.
 
 A GPU inference engine inevitably requires `unsafe` blocks (Metal FFI, RDMA FFI), but Rust's ownership system can **explicitly isolate** `unsafe` boundaries. Safe code (the `ZeroCopyBuffer` public API) and unsafe code (`posix_memalign`, `ibv_post_send` call sites) are distinguished at the type system level, maintaining the same performance as C++ while being safer.
 
-Additionally, the Cargo workspace manages dependencies, versions, and build settings for 7 crates through a single `Cargo.toml`. This is significantly less complex than a CMake + setuptools combination.
+Additionally, the Cargo workspace manages dependencies, versions, and build settings for 8 crates through a single `Cargo.toml`. This is significantly less complex than a CMake + setuptools combination. The `rmlx-metal` crate contains only 18 `unsafe` blocks in the main codebase, all 100% encapsulated behind safe public APIs via the `ComputePass` zero-cost wrapper and `types.rs` alias layer.
 
 ---
 
-## 2. Why metal-rs 0.31
+## 2. Why objc2-metal 0.3
 
-metal-rs 0.31 is used as the Metal API binding.
+`objc2-metal` 0.3 (part of the `objc2` ecosystem) is used as the Metal API binding, replacing the earlier `metal-rs` 0.31.
 
 ### Rationale
 
-- **Fully validated in PoC Phase 4**: The entire pipeline — `posix_memalign` -> `newBufferWithBytesNoCopy` -> `ibv_reg_mr` -> RDMA transfer -> Metal compute — was successfully reproduced using metal-rs 0.31.
-- **Direct MTLDevice/MTLBuffer access**: Metal objects can be accessed directly from Rust without an Objective-C++ bridge.
-- **Type-safe API**: `Device`, `CommandQueue`, `Buffer`, `ComputePipelineState`, and other types are wrapped in Rust types, preventing misuse at compile time.
-- **Metal 3 feature support**: Supports APIs required for M3 and later, including `MTLSharedEvent` and `ResidencySet`.
+- **Fully validated in PoC Phase 4**: The entire pipeline — `posix_memalign` -> `newBufferWithBytesNoCopy` -> `ibv_reg_mr` -> RDMA transfer -> Metal compute — was successfully reproduced.
+- **Direct MTLDevice/MTLBuffer access**: Metal objects can be accessed directly from Rust without an Objective-C++ bridge, using protocol objects (`ProtocolObject<dyn MTLCommandBuffer>`, etc.).
+- **Type-safe API**: Type aliases (`MtlDevice`, `MtlBuffer`, `MtlPipeline`) and the `ComputePass` newtype wrapper provide ergonomic, compile-time-safe access to Metal types.
+- **Metal 3+ feature support**: Supports APIs required for M3 and later, including `MTLSharedEvent` and `ResidencySet`. The `metal4` feature flag enables macOS 26+ Metal 4 API support (`MTL4CommandAllocator`, `MTL4ComputePipeline`, `MTL4Counters`, etc.).
+- **Inherent Send+Sync**: `objc2` types are inherently `Send + Sync`, eliminating the need for `unsafe impl Send/Sync` boilerplate (reduced from ~166 unsafe blocks to ~18, and msg_send! calls from 30 to 2).
+- **Additional dependencies**: `objc2-foundation` 0.3 for Foundation types and `bytemuck` for safe byte-level type casting.
+
+### Migration from metal-rs
+
+The migration from `metal-rs` 0.31 to `objc2-metal` 0.3 replaced:
+- `CommandBufferRef` with `ProtocolObject<dyn MTLCommandBuffer>` (aliased as `MTLCommandBuffer`)
+- `ComputeCommandEncoderRef` with `ComputePass` (zero-cost newtype wrapper)
+- `metal::MTLSize` with `MTLSize` (re-exported from rmlx-metal)
+- `metal::Buffer` / `metal::Device` with `MtlBuffer` / `MtlDevice` type aliases
+- `ConcreteBlock` with `block2::RcBlock`
+- `ForeignType` trait usage (removed, not needed with objc2)
+- `encoder.set_compute_pipeline_state(p)` with `pass.set_pipeline(p)`
+- `encoder.end_encoding()` with `pass.end()`
 
 ### Alternatives Considered
 
 | Alternative | Reason for Rejection |
 |-------------|---------------------|
 | metal-cpp (C++) | Requires Objective-C++ bridge; complex build integration with Rust projects |
-| Direct objc2 usage | All Metal APIs must be manually bound, slowing development |
+| metal-rs 0.31 | Deprecated upstream; lacks Metal 4 support; requires manual unsafe impl Send/Sync |
 | wgpu | Cannot access Metal-specific optimizations (SharedEvent, NoCopy buffer) |
 
 ---
@@ -213,8 +227,9 @@ Metal does not have an equivalent capture-replay mechanism. Instead, ExecGraph:
 
 1. Pre-analyzes the transformer layer's operation sequence
 2. Groups operations into 5 command buffers (down from 65)
-3. Re-encodes the same deterministic sequence each forward pass
+3. Re-encodes the same deterministic sequence each forward pass, with ICB (Indirect Command Buffer) replay support for near-zero CPU re-encoding cost
 4. Uses MTLSharedEvent for inter-CB synchronization
+5. Supports sparse ICB (`icb_sparse.rs`) for MoE variable-dispatch patterns
 
 ### Why 5 Command Buffers?
 
@@ -274,3 +289,32 @@ For a 7B parameter model with f16 weights:
 
 Eliminates the per-layer transpose + copy overhead from the critical path.
 Combined with ExecGraph, this contributes to the 17.4x speedup.
+
+---
+
+## 10. Shape-Aware GEMM Dispatch
+
+A shape-aware dispatch table selects the optimal GEMM kernel variant based on the M dimension.
+
+### Rationale
+
+A single GEMM kernel cannot be optimal across all matrix sizes. Small M values (decode, M=1-8) benefit from different tiling strategies than large M values (prefill, M=512+). Rather than a one-size-fits-all approach, RMLX uses a dispatch table that selects the best kernel variant at runtime.
+
+### Dispatch Table
+
+| M Range | Strategy | Details |
+|---------|----------|---------|
+| M=1 | Tiled GEMM (BM=16 pad) | GEMV path removed in favor of unified tiled path |
+| M=2-8 | Split-K (unconditional, K>=256) | Maximizes parallelism for very small M |
+| M=9-32 | Split-K (K>=N only), else Tiled | Conditional split for moderate M |
+| M=33-128 | Tiled GEMM (MlxMicro 16x32) | Standard tiled path |
+| M=256 | MlxSmall 32x32 | Intermediate tile size |
+| M=512+ | NAX 64x128 | Large tile for maximum throughput |
+
+### Performance Results
+
+| Metric | Value |
+|--------|-------|
+| FP16 GEMM peak throughput | 24.05 TFLOPS |
+| QMM Q4 throughput | 17.43 TFLOPS |
+| Decode latency (best) | 699.3 us/layer |

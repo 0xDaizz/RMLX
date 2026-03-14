@@ -36,3 +36,53 @@ pub use vjp::{AddGrad, GradFn, MatMulGrad, MulGrad, Operation, Tape, TapedValue,
 /// Set by build.rs at compile time.
 /// Empty string if Metal compiler was not available during build.
 pub const METALLIB_PATH: &str = env!("RMLX_METALLIB_PATH");
+
+/// Shared test utilities — provides a single Metal device via `OnceLock`
+/// to prevent concurrent `MTLCreateSystemDefaultDevice()` failures.
+#[cfg(test)]
+pub(crate) mod test_utils {
+    use rmlx_metal::device::GpuDevice;
+    use rmlx_metal::MtlDevice;
+    use std::sync::OnceLock;
+
+    /// Returns a shared raw Metal device, created exactly once across all tests.
+    /// Returns `None` when no Metal GPU is available (e.g. headless CI runners).
+    pub fn shared_metal_device() -> Option<MtlDevice> {
+        static DEVICE: OnceLock<Option<MtlDevice>> = OnceLock::new();
+        DEVICE
+            .get_or_init(|| {
+                objc2::rc::autoreleasepool(|_| objc2_metal::MTLCreateSystemDefaultDevice())
+            })
+            .clone()
+    }
+
+    /// Returns a fresh `GpuDevice` wrapper backed by the shared Metal device.
+    ///
+    /// Each call creates a new `GpuDevice` (with its own `StreamManager` etc.)
+    /// but they all share the same underlying `MTLDevice`, avoiding the
+    /// concurrent-creation crash.
+    ///
+    /// Returns `None` when no Metal GPU is available.
+    pub fn test_gpu() -> Option<GpuDevice> {
+        shared_metal_device().map(GpuDevice::from_raw_device)
+    }
+
+    /// Macro: obtain a `GpuDevice` or skip the test when no Metal GPU is available.
+    ///
+    /// Usage inside `#[test]` functions:
+    /// ```ignore
+    /// let gpu = require_gpu!();
+    /// ```
+    macro_rules! require_gpu {
+        () => {
+            match $crate::test_utils::test_gpu() {
+                Some(gpu) => gpu,
+                None => {
+                    eprintln!("Skipping test: no Metal GPU available");
+                    return;
+                }
+            }
+        };
+    }
+    pub(crate) use require_gpu;
+}

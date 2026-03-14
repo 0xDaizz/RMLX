@@ -13,7 +13,8 @@ test-utils = []
 [dependencies]
 rmlx-alloc = { path = "../rmlx-alloc" }
 rmlx-metal = { path = "../rmlx-metal" }
-metal = { workspace = true }
+objc2 = { workspace = true }
+objc2-metal = { workspace = true }
 libc = { workspace = true }
 libloading = { workspace = true }
 crc32fast = { workspace = true }

@@ -14,7 +14,14 @@
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
-use metal::MTLSize;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLCommandBuffer as _;
+use objc2_metal::MTLCommandQueue as _;
+use objc2_metal::MTLComputePipelineState as _;
+use objc2_metal::MTLDevice as _;
+use rmlx_metal::ComputePass;
+use rmlx_metal::MTLResourceOptions;
+use rmlx_metal::MTLSize;
 
 // ---------------------------------------------------------------------------
 // Metal shader source
@@ -677,21 +684,36 @@ fn compute_out_strides(shape: &[usize]) -> Vec<u32> {
 }
 
 /// Create a small Metal buffer from a `u32` value.
-fn u32_buffer(device: &metal::Device, val: u32) -> metal::Buffer {
-    device.new_buffer_with_data(
-        &val as *const u32 as *const _,
-        std::mem::size_of::<u32>() as u64,
-        metal::MTLResourceOptions::StorageModeShared,
-    )
+fn u32_buffer(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    val: u32,
+) -> rmlx_metal::MtlBuffer {
+    unsafe {
+        device
+            .newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(&val as *const u32 as *const _ as *mut std::ffi::c_void)
+                    .unwrap(),
+                std::mem::size_of::<u32>() as u64 as usize,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap()
+    }
 }
 
 /// Create a Metal buffer from a `&[u32]` slice.
-fn u32_slice_buffer(device: &metal::Device, data: &[u32]) -> metal::Buffer {
-    device.new_buffer_with_data(
-        data.as_ptr() as *const _,
-        std::mem::size_of_val(data) as u64,
-        metal::MTLResourceOptions::StorageModeShared,
-    )
+fn u32_slice_buffer(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    data: &[u32],
+) -> rmlx_metal::MtlBuffer {
+    unsafe {
+        device
+            .newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(data.as_ptr() as *const _ as *mut std::ffi::c_void).unwrap(),
+                std::mem::size_of_val(data) as u64 as usize,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -705,10 +727,11 @@ fn u32_slice_buffer(device: &metal::Device, data: &[u32]) -> metal::Buffer {
 fn encode_strided(
     registry: &KernelRegistry,
     src: &Array,
-    encoder: &metal::ComputeCommandEncoderRef,
+    encoder: ComputePass<'_>,
     out: &Array,
-) -> Result<metal::ComputePipelineState, KernelError> {
+) -> Result<rmlx_metal::MtlPipeline, KernelError> {
     let device = registry.device().raw();
+
     let ndim = src.ndim();
     let suffix = type_suffix(src.dtype())?;
 
@@ -725,14 +748,13 @@ fn encode_strided(
         .map(|(i, &s)| super::checked_u32(s, &format!("stride[{i}]")))
         .collect::<Result<Vec<u32>, _>>()?;
 
-    encoder.set_buffer(0, Some(src.metal_buffer()), src.offset() as u64);
-    encoder.set_buffer(1, Some(out.metal_buffer()), out.offset() as u64);
-
+    encoder.set_buffer(0, Some(src.metal_buffer()), src.offset());
+    encoder.set_buffer(1, Some(out.metal_buffer()), out.offset());
     match ndim {
         1 => {
             let kernel_name = format!("copy_g_nd1_{suffix}");
             let pipeline = registry.get_pipeline(&kernel_name, src.dtype())?;
-            encoder.set_compute_pipeline_state(&pipeline);
+            encoder.set_pipeline(&pipeline);
             let stride_buf = u32_buffer(device, stride_data[0]);
             encoder.set_buffer(2, Some(&stride_buf), 0);
             Ok(pipeline)
@@ -740,7 +762,7 @@ fn encode_strided(
         2 => {
             let kernel_name = format!("copy_g_nd2_{suffix}");
             let pipeline = registry.get_pipeline(&kernel_name, src.dtype())?;
-            encoder.set_compute_pipeline_state(&pipeline);
+            encoder.set_pipeline(&pipeline);
             let dim0_buf = u32_buffer(device, shape_data[0]);
             let dim1_buf = u32_buffer(device, shape_data[1]);
             let s0_buf = u32_buffer(device, stride_data[0]);
@@ -754,7 +776,7 @@ fn encode_strided(
         3 => {
             let kernel_name = format!("copy_g_nd3_{suffix}");
             let pipeline = registry.get_pipeline(&kernel_name, src.dtype())?;
-            encoder.set_compute_pipeline_state(&pipeline);
+            encoder.set_pipeline(&pipeline);
             let dim0_buf = u32_buffer(device, shape_data[0]);
             let dim1_buf = u32_buffer(device, shape_data[1]);
             let dim2_buf = u32_buffer(device, shape_data[2]);
@@ -773,7 +795,7 @@ fn encode_strided(
             // General N-dim with host-precomputed output strides.
             let kernel_name = format!("copy_g_{suffix}");
             let pipeline = registry.get_pipeline(&kernel_name, src.dtype())?;
-            encoder.set_compute_pipeline_state(&pipeline);
+            encoder.set_pipeline(&pipeline);
 
             let out_strides = compute_out_strides(src.shape());
 
@@ -800,7 +822,7 @@ fn encode_strided(
 pub fn copy(
     registry: &KernelRegistry,
     src: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     copy_with_mode(registry, src, queue, super::ExecMode::Sync)
 }
@@ -816,7 +838,7 @@ pub fn copy(
 pub fn copy_with_mode(
     registry: &KernelRegistry,
     src: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
     mode: super::ExecMode,
 ) -> Result<Array, KernelError> {
     reject_quantized(src.dtype())?;
@@ -824,18 +846,19 @@ pub fn copy_with_mode(
     let numel = src.numel();
     let out = Array::uninit(registry.device().raw(), src.shape(), src.dtype());
 
-    let command_buffer = queue.new_command_buffer();
-    let encoder = command_buffer.new_compute_command_encoder();
+    let command_buffer = queue.commandBuffer().unwrap();
+    let raw_enc = command_buffer.computeCommandEncoder().unwrap();
+    let encoder = ComputePass::new(&raw_enc);
 
     let pipeline = if src.is_contiguous() {
         // Vectorized contiguous path
         let kname = vectorized_kernel_name(src.dtype())?;
         let pipeline = registry.get_pipeline(kname, src.dtype())?;
-        encoder.set_compute_pipeline_state(&pipeline);
-        encoder.set_buffer(0, Some(src.metal_buffer()), src.offset() as u64);
-        encoder.set_buffer(1, Some(out.metal_buffer()), out.offset() as u64);
+        encoder.set_pipeline(&pipeline);
+        encoder.set_buffer(0, Some(src.metal_buffer()), src.offset());
+        encoder.set_buffer(1, Some(out.metal_buffer()), out.offset());
         let size_val = super::checked_u32(numel, "numel")?;
-        encoder.set_bytes(2, 4, &size_val as *const u32 as *const std::ffi::c_void);
+        encoder.set_val(2, &size_val);
         pipeline
     } else {
         // Strided path — encode_strided selects the best kernel variant
@@ -845,20 +868,24 @@ pub fn copy_with_mode(
     // Compute grid size: for contiguous, divide by WPT; for strided, 1 per element.
     let threads = if src.is_contiguous() {
         let w = wpt(src.dtype());
-        (numel as u64).div_ceil(w)
+        numel.div_ceil(w as usize)
     } else {
-        numel as u64
+        numel
     };
 
-    let grid_size = MTLSize::new(threads, 1, 1);
-    let threadgroup_size = MTLSize::new(
-        std::cmp::min(pipeline.max_total_threads_per_threadgroup(), threads),
-        1,
-        1,
-    );
+    let grid_size = MTLSize {
+        width: threads,
+        height: 1,
+        depth: 1,
+    };
+    let threadgroup_size = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), threads),
+        height: 1,
+        depth: 1,
+    };
     encoder.dispatch_threads(grid_size, threadgroup_size);
-    encoder.end_encoding();
-    super::commit_with_mode(command_buffer, mode);
+    encoder.end();
+    super::commit_with_mode(&command_buffer, mode);
 
     Ok(out)
 }
@@ -870,24 +897,25 @@ pub fn copy_with_mode(
 pub fn copy_async(
     registry: &KernelRegistry,
     src: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<super::LaunchResult, KernelError> {
     reject_quantized(src.dtype())?;
 
     let numel = src.numel();
     let out = Array::uninit(registry.device().raw(), src.shape(), src.dtype());
 
-    let command_buffer = queue.new_command_buffer();
-    let encoder = command_buffer.new_compute_command_encoder();
+    let command_buffer = queue.commandBuffer().unwrap();
+    let raw_enc = command_buffer.computeCommandEncoder().unwrap();
+    let encoder = ComputePass::new(&raw_enc);
 
     let pipeline = if src.is_contiguous() {
         let kname = vectorized_kernel_name(src.dtype())?;
         let pipeline = registry.get_pipeline(kname, src.dtype())?;
-        encoder.set_compute_pipeline_state(&pipeline);
-        encoder.set_buffer(0, Some(src.metal_buffer()), src.offset() as u64);
-        encoder.set_buffer(1, Some(out.metal_buffer()), out.offset() as u64);
+        encoder.set_pipeline(&pipeline);
+        encoder.set_buffer(0, Some(src.metal_buffer()), src.offset());
+        encoder.set_buffer(1, Some(out.metal_buffer()), out.offset());
         let size_val = super::checked_u32(numel, "numel")?;
-        encoder.set_bytes(2, 4, &size_val as *const u32 as *const std::ffi::c_void);
+        encoder.set_val(2, &size_val);
         pipeline
     } else {
         encode_strided(registry, src, encoder, &out)?
@@ -895,21 +923,25 @@ pub fn copy_async(
 
     let threads = if src.is_contiguous() {
         let w = wpt(src.dtype());
-        (numel as u64).div_ceil(w)
+        numel.div_ceil(w as usize)
     } else {
-        numel as u64
+        numel
     };
 
-    let grid_size = MTLSize::new(threads, 1, 1);
-    let threadgroup_size = MTLSize::new(
-        std::cmp::min(pipeline.max_total_threads_per_threadgroup(), threads),
-        1,
-        1,
-    );
+    let grid_size = MTLSize {
+        width: threads,
+        height: 1,
+        depth: 1,
+    };
+    let threadgroup_size = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), threads),
+        height: 1,
+        depth: 1,
+    };
     encoder.dispatch_threads(grid_size, threadgroup_size);
-    encoder.end_encoding();
+    encoder.end();
 
-    let handle = super::commit_with_mode(command_buffer, super::ExecMode::Async)
+    let handle = super::commit_with_mode(&command_buffer, super::ExecMode::Async)
         .expect("async mode always returns a handle");
 
     Ok(super::LaunchResult::new(out, handle))
@@ -927,7 +959,7 @@ pub fn copy_cast(
     registry: &KernelRegistry,
     src: &Array,
     dst_dtype: DType,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     copy_cast_with_mode(registry, src, dst_dtype, queue, super::ExecMode::Sync)
 }
@@ -937,7 +969,7 @@ pub fn copy_cast_with_mode(
     registry: &KernelRegistry,
     src: &Array,
     dst_dtype: DType,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
     mode: super::ExecMode,
 ) -> Result<Array, KernelError> {
     reject_quantized(src.dtype())?;
@@ -960,21 +992,25 @@ pub fn copy_cast_with_mode(
 
     let out = Array::uninit(registry.device().raw(), src.shape(), dst_dtype);
 
-    let command_buffer = queue.new_command_buffer();
-    let encoder = command_buffer.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(src.metal_buffer()), src.offset() as u64);
-    encoder.set_buffer(1, Some(out.metal_buffer()), out.offset() as u64);
-
-    let grid_size = MTLSize::new(numel as u64, 1, 1);
-    let threadgroup_size = MTLSize::new(
-        std::cmp::min(pipeline.max_total_threads_per_threadgroup(), numel as u64),
-        1,
-        1,
-    );
+    let command_buffer = queue.commandBuffer().unwrap();
+    let raw_enc = command_buffer.computeCommandEncoder().unwrap();
+    let encoder = ComputePass::new(&raw_enc);
+    encoder.set_pipeline(&pipeline);
+    encoder.set_buffer(0, Some(src.metal_buffer()), src.offset());
+    encoder.set_buffer(1, Some(out.metal_buffer()), out.offset());
+    let grid_size = MTLSize {
+        width: numel,
+        height: 1,
+        depth: 1,
+    };
+    let threadgroup_size = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), numel),
+        height: 1,
+        depth: 1,
+    };
     encoder.dispatch_threads(grid_size, threadgroup_size);
-    encoder.end_encoding();
-    super::commit_with_mode(command_buffer, mode);
+    encoder.end();
+    super::commit_with_mode(&command_buffer, mode);
 
     Ok(out)
 }
@@ -988,7 +1024,7 @@ pub fn copy_cast_into_cb(
     registry: &KernelRegistry,
     src: &Array,
     dst_dtype: DType,
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
 ) -> Result<Array, KernelError> {
     reject_quantized(src.dtype())?;
     reject_quantized(dst_dtype)?;
@@ -1009,19 +1045,23 @@ pub fn copy_cast_into_cb(
 
     let out = Array::uninit(registry.device().raw(), src.shape(), dst_dtype);
 
-    let encoder = cb.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(src.metal_buffer()), src.offset() as u64);
-    encoder.set_buffer(1, Some(out.metal_buffer()), out.offset() as u64);
-
-    let grid_size = MTLSize::new(numel as u64, 1, 1);
-    let threadgroup_size = MTLSize::new(
-        std::cmp::min(pipeline.max_total_threads_per_threadgroup(), numel as u64),
-        1,
-        1,
-    );
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let encoder = ComputePass::new(&raw_enc);
+    encoder.set_pipeline(&pipeline);
+    encoder.set_buffer(0, Some(src.metal_buffer()), src.offset());
+    encoder.set_buffer(1, Some(out.metal_buffer()), out.offset());
+    let grid_size = MTLSize {
+        width: numel,
+        height: 1,
+        depth: 1,
+    };
+    let threadgroup_size = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), numel),
+        height: 1,
+        depth: 1,
+    };
     encoder.dispatch_threads(grid_size, threadgroup_size);
-    encoder.end_encoding();
+    encoder.end();
 
     Ok(out)
 }
@@ -1043,7 +1083,7 @@ pub fn fill(
     shape: &[usize],
     value: &[u8],
     dtype: DType,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     fill_with_mode(registry, shape, value, dtype, queue, super::ExecMode::Sync)
 }
@@ -1054,7 +1094,7 @@ pub fn fill_with_mode(
     shape: &[usize],
     value: &[u8],
     dtype: DType,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
     mode: super::ExecMode,
 ) -> Result<Array, KernelError> {
     reject_quantized(dtype)?;
@@ -1079,29 +1119,38 @@ pub fn fill_with_mode(
     let device = registry.device().raw();
 
     // Create a 1-element source buffer with the fill value.
-    let src_buf = device.new_buffer_with_data(
-        value.as_ptr() as *const _,
-        elem_size as u64,
-        metal::MTLResourceOptions::StorageModeShared,
-    );
+    let src_buf = unsafe {
+        device
+            .newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(value.as_ptr() as *const _ as *mut std::ffi::c_void)
+                    .unwrap(),
+                elem_size as u64 as usize,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap()
+    };
 
     let out = Array::uninit(device, shape, dtype);
 
-    let command_buffer = queue.new_command_buffer();
-    let encoder = command_buffer.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
+    let command_buffer = queue.commandBuffer().unwrap();
+    let raw_enc = command_buffer.computeCommandEncoder().unwrap();
+    let encoder = ComputePass::new(&raw_enc);
+    encoder.set_pipeline(&pipeline);
     encoder.set_buffer(0, Some(&src_buf), 0);
-    encoder.set_buffer(1, Some(out.metal_buffer()), out.offset() as u64);
-
-    let grid_size = MTLSize::new(numel as u64, 1, 1);
-    let threadgroup_size = MTLSize::new(
-        std::cmp::min(pipeline.max_total_threads_per_threadgroup(), numel as u64),
-        1,
-        1,
-    );
+    encoder.set_buffer(1, Some(out.metal_buffer()), out.offset());
+    let grid_size = MTLSize {
+        width: numel,
+        height: 1,
+        depth: 1,
+    };
+    let threadgroup_size = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), numel),
+        height: 1,
+        depth: 1,
+    };
     encoder.dispatch_threads(grid_size, threadgroup_size);
-    encoder.end_encoding();
-    super::commit_with_mode(command_buffer, mode);
+    encoder.end();
+    super::commit_with_mode(&command_buffer, mode);
 
     Ok(out)
 }
@@ -1111,7 +1160,7 @@ pub fn fill_f32(
     registry: &KernelRegistry,
     shape: &[usize],
     value: f32,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     fill(registry, shape, &value.to_ne_bytes(), DType::Float32, queue)
 }
@@ -1124,23 +1173,24 @@ pub fn fill_f32(
 pub fn copy_into_cb(
     registry: &KernelRegistry,
     src: &Array,
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
 ) -> Result<Array, KernelError> {
     reject_quantized(src.dtype())?;
 
     let numel = src.numel();
     let out = Array::uninit(registry.device().raw(), src.shape(), src.dtype());
 
-    let encoder = cb.new_compute_command_encoder();
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let encoder = ComputePass::new(&raw_enc);
 
     let pipeline = if src.is_contiguous() {
         let kname = vectorized_kernel_name(src.dtype())?;
         let pipeline = registry.get_pipeline(kname, src.dtype())?;
-        encoder.set_compute_pipeline_state(&pipeline);
-        encoder.set_buffer(0, Some(src.metal_buffer()), src.offset() as u64);
-        encoder.set_buffer(1, Some(out.metal_buffer()), out.offset() as u64);
+        encoder.set_pipeline(&pipeline);
+        encoder.set_buffer(0, Some(src.metal_buffer()), src.offset());
+        encoder.set_buffer(1, Some(out.metal_buffer()), out.offset());
         let size_val = super::checked_u32(numel, "numel")?;
-        encoder.set_bytes(2, 4, &size_val as *const u32 as *const std::ffi::c_void);
+        encoder.set_val(2, &size_val);
         pipeline
     } else {
         encode_strided(registry, src, encoder, &out)?
@@ -1148,19 +1198,23 @@ pub fn copy_into_cb(
 
     let threads = if src.is_contiguous() {
         let w = wpt(src.dtype());
-        (numel as u64).div_ceil(w)
+        numel.div_ceil(w as usize)
     } else {
-        numel as u64
+        numel
     };
 
-    let grid_size = MTLSize::new(threads, 1, 1);
-    let threadgroup_size = MTLSize::new(
-        std::cmp::min(pipeline.max_total_threads_per_threadgroup(), threads),
-        1,
-        1,
-    );
+    let grid_size = MTLSize {
+        width: threads,
+        height: 1,
+        depth: 1,
+    };
+    let threadgroup_size = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), threads),
+        height: 1,
+        depth: 1,
+    };
     encoder.dispatch_threads(grid_size, threadgroup_size);
-    encoder.end_encoding();
+    encoder.end();
 
     Ok(out)
 }
@@ -1178,7 +1232,7 @@ pub fn interleave_heads_into_cb(
     head_dim: usize,
     num_heads: usize,
     head_idx: usize,
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
 ) -> Result<(), KernelError> {
     let kernel_name = match src.dtype() {
         DType::Float32 => "interleave_heads_f32",
@@ -1198,28 +1252,28 @@ pub fn interleave_heads_into_cb(
     let num_heads_u32 = num_heads as u32;
     let head_idx_u32 = head_idx as u32;
 
-    let encoder = cb.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(src.metal_buffer()), src.offset() as u64);
-    encoder.set_buffer(1, Some(dst.metal_buffer()), dst.offset() as u64);
-    encoder.set_bytes(2, 4, &seq_len_u32 as *const u32 as *const std::ffi::c_void);
-    encoder.set_bytes(3, 4, &head_dim_u32 as *const u32 as *const std::ffi::c_void);
-    encoder.set_bytes(
-        4,
-        4,
-        &num_heads_u32 as *const u32 as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(5, 4, &head_idx_u32 as *const u32 as *const std::ffi::c_void);
-
-    let total_threads = (seq_len * head_dim) as u64;
-    let grid_size = MTLSize::new(total_threads, 1, 1);
-    let threadgroup_size = MTLSize::new(
-        std::cmp::min(pipeline.max_total_threads_per_threadgroup(), total_threads),
-        1,
-        1,
-    );
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let encoder = ComputePass::new(&raw_enc);
+    encoder.set_pipeline(&pipeline);
+    encoder.set_buffer(0, Some(src.metal_buffer()), src.offset());
+    encoder.set_buffer(1, Some(dst.metal_buffer()), dst.offset());
+    encoder.set_val(2, &seq_len_u32);
+    encoder.set_val(3, &head_dim_u32);
+    encoder.set_val(4, &num_heads_u32);
+    encoder.set_val(5, &head_idx_u32);
+    let total_threads = seq_len * head_dim;
+    let grid_size = MTLSize {
+        width: total_threads,
+        height: 1,
+        depth: 1,
+    };
+    let threadgroup_size = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), total_threads),
+        height: 1,
+        depth: 1,
+    };
     encoder.dispatch_threads(grid_size, threadgroup_size);
-    encoder.end_encoding();
+    encoder.end();
 
     Ok(())
 }
@@ -1248,7 +1302,7 @@ pub fn kv_cache_copy_batched_f16_into_cb(
     max_seq_len: usize,
     offset: usize,
     registry: &KernelRegistry,
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
 ) -> Result<(), KernelError> {
     if new_tokens == 0 {
         return Ok(());
@@ -1262,38 +1316,30 @@ pub fn kv_cache_copy_batched_f16_into_cb(
     let max_seq_len_u32 = super::checked_u32(max_seq_len, "max_seq_len")?;
     let offset_u32 = super::checked_u32(offset, "offset")?;
 
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(src_k.metal_buffer()), src_k.offset() as u64);
-    enc.set_buffer(1, Some(src_v.metal_buffer()), src_v.offset() as u64);
-    enc.set_buffer(2, Some(dst_k.metal_buffer()), dst_k.offset() as u64);
-    enc.set_buffer(3, Some(dst_v.metal_buffer()), dst_v.offset() as u64);
-    enc.set_bytes(
-        4,
-        4,
-        &num_kv_heads_u32 as *const u32 as *const std::ffi::c_void,
-    );
-    enc.set_bytes(
-        5,
-        4,
-        &new_tokens_u32 as *const u32 as *const std::ffi::c_void,
-    );
-    enc.set_bytes(6, 4, &head_dim_u32 as *const u32 as *const std::ffi::c_void);
-    enc.set_bytes(
-        7,
-        4,
-        &max_seq_len_u32 as *const u32 as *const std::ffi::c_void,
-    );
-    enc.set_bytes(8, 4, &offset_u32 as *const u32 as *const std::ffi::c_void);
-
-    let grid = MTLSize::new(head_dim as u64, new_tokens as u64, num_kv_heads as u64);
-    let tg = MTLSize::new(
-        std::cmp::min(64, head_dim as u64),
-        std::cmp::min(4, new_tokens as u64),
-        1,
-    );
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
+    enc.set_buffer(0, Some(src_k.metal_buffer()), src_k.offset());
+    enc.set_buffer(1, Some(src_v.metal_buffer()), src_v.offset());
+    enc.set_buffer(2, Some(dst_k.metal_buffer()), dst_k.offset());
+    enc.set_buffer(3, Some(dst_v.metal_buffer()), dst_v.offset());
+    enc.set_val(4, &num_kv_heads_u32);
+    enc.set_val(5, &new_tokens_u32);
+    enc.set_val(6, &head_dim_u32);
+    enc.set_val(7, &max_seq_len_u32);
+    enc.set_val(8, &offset_u32);
+    let grid = MTLSize {
+        width: head_dim,
+        height: new_tokens,
+        depth: num_kv_heads,
+    };
+    let tg = MTLSize {
+        width: std::cmp::min(64, head_dim),
+        height: std::cmp::min(4, new_tokens),
+        depth: 1,
+    };
     enc.dispatch_threads(grid, tg);
-    enc.end_encoding();
+    enc.end();
 
     Ok(())
 }
@@ -1306,7 +1352,7 @@ pub fn kv_cache_copy_batched_f16_into_cb(
 pub fn copy_encode(
     registry: &KernelRegistry,
     src: &Array,
-    encoder: &metal::ComputeCommandEncoderRef,
+    encoder: ComputePass<'_>,
 ) -> Result<Array, KernelError> {
     reject_quantized(src.dtype())?;
 
@@ -1316,11 +1362,11 @@ pub fn copy_encode(
     let pipeline = if src.is_contiguous() {
         let kname = vectorized_kernel_name(src.dtype())?;
         let pipeline = registry.get_pipeline(kname, src.dtype())?;
-        encoder.set_compute_pipeline_state(&pipeline);
-        encoder.set_buffer(0, Some(src.metal_buffer()), src.offset() as u64);
-        encoder.set_buffer(1, Some(out.metal_buffer()), out.offset() as u64);
+        encoder.set_pipeline(&pipeline);
+        encoder.set_buffer(0, Some(src.metal_buffer()), src.offset());
+        encoder.set_buffer(1, Some(out.metal_buffer()), out.offset());
         let size_val = super::checked_u32(numel, "numel")?;
-        encoder.set_bytes(2, 4, &size_val as *const u32 as *const std::ffi::c_void);
+        encoder.set_val(2, &size_val);
         pipeline
     } else {
         encode_strided(registry, src, encoder, &out)?
@@ -1328,17 +1374,21 @@ pub fn copy_encode(
 
     let threads = if src.is_contiguous() {
         let w = wpt(src.dtype());
-        (numel as u64).div_ceil(w)
+        numel.div_ceil(w as usize)
     } else {
-        numel as u64
+        numel
     };
 
-    let grid_size = MTLSize::new(threads, 1, 1);
-    let threadgroup_size = MTLSize::new(
-        std::cmp::min(pipeline.max_total_threads_per_threadgroup(), threads),
-        1,
-        1,
-    );
+    let grid_size = MTLSize {
+        width: threads,
+        height: 1,
+        depth: 1,
+    };
+    let threadgroup_size = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), threads),
+        height: 1,
+        depth: 1,
+    };
     encoder.dispatch_threads(grid_size, threadgroup_size);
 
     Ok(out)
@@ -1357,7 +1407,7 @@ pub fn kv_cache_copy_batched_f16_encode(
     max_seq_len: usize,
     offset: usize,
     registry: &KernelRegistry,
-    encoder: &metal::ComputeCommandEncoderRef,
+    encoder: ComputePass<'_>,
 ) -> Result<(), KernelError> {
     if new_tokens == 0 {
         return Ok(());
@@ -1371,36 +1421,244 @@ pub fn kv_cache_copy_batched_f16_encode(
     let max_seq_len_u32 = super::checked_u32(max_seq_len, "max_seq_len")?;
     let offset_u32 = super::checked_u32(offset, "offset")?;
 
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(src_k.metal_buffer()), src_k.offset() as u64);
-    encoder.set_buffer(1, Some(src_v.metal_buffer()), src_v.offset() as u64);
-    encoder.set_buffer(2, Some(dst_k.metal_buffer()), dst_k.offset() as u64);
-    encoder.set_buffer(3, Some(dst_v.metal_buffer()), dst_v.offset() as u64);
-    encoder.set_bytes(
-        4,
-        4,
-        &num_kv_heads_u32 as *const u32 as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        5,
-        4,
-        &new_tokens_u32 as *const u32 as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(6, 4, &head_dim_u32 as *const u32 as *const std::ffi::c_void);
-    encoder.set_bytes(
-        7,
-        4,
-        &max_seq_len_u32 as *const u32 as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(8, 4, &offset_u32 as *const u32 as *const std::ffi::c_void);
-
-    let grid = MTLSize::new(head_dim as u64, new_tokens as u64, num_kv_heads as u64);
-    let tg = MTLSize::new(
-        std::cmp::min(64, head_dim as u64),
-        std::cmp::min(4, new_tokens as u64),
-        1,
-    );
+    encoder.set_pipeline(&pipeline);
+    encoder.set_buffer(0, Some(src_k.metal_buffer()), src_k.offset());
+    encoder.set_buffer(1, Some(src_v.metal_buffer()), src_v.offset());
+    encoder.set_buffer(2, Some(dst_k.metal_buffer()), dst_k.offset());
+    encoder.set_buffer(3, Some(dst_v.metal_buffer()), dst_v.offset());
+    encoder.set_val(4, &num_kv_heads_u32);
+    encoder.set_val(5, &new_tokens_u32);
+    encoder.set_val(6, &head_dim_u32);
+    encoder.set_val(7, &max_seq_len_u32);
+    encoder.set_val(8, &offset_u32);
+    let grid = MTLSize {
+        width: head_dim,
+        height: new_tokens,
+        depth: num_kv_heads,
+    };
+    let tg = MTLSize {
+        width: std::cmp::min(64, head_dim),
+        height: std::cmp::min(4, new_tokens),
+        depth: 1,
+    };
     encoder.dispatch_threads(grid, tg);
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Metal 4 blit-integrated paths (ComputePass4)
+// ---------------------------------------------------------------------------
+//
+// Metal 4 unifies compute and blit operations in a single encoder. These
+// variants use `ComputePass4::copy_buffer()` for contiguous same-type copies
+// and `ComputePass4::fill_buffer()` for zero-fills, eliminating the need to
+// switch between compute and blit encoders.
+//
+// Note: Metal 4 uses argument tables for compute buffer bindings (rather than
+// the Metal 3 `setBuffer_offset_atIndex` API), so strided copies that require
+// compute kernels are not handled here. Use the Metal 3 `copy_encode` for
+// strided data.
+
+#[cfg(feature = "metal4")]
+use rmlx_metal::metal4::compute::ComputePass4;
+
+/// Encode a contiguous same-type copy as a hardware blit in a Metal 4 compute pass.
+///
+/// Uses `ComputePass4::copy_buffer()` which is a DMA operation — no compute
+/// pipeline setup, no shader invocation. This is the optimal path for
+/// contiguous same-type copies when already in a Metal 4 encoder.
+///
+/// Returns `Err` if the source is not contiguous (use `copy_encode` for strided data).
+///
+/// The caller is responsible for encoder lifecycle (`end()` / command buffer commit).
+#[cfg(feature = "metal4")]
+pub fn copy_blit_m4(
+    registry: &KernelRegistry,
+    src: &Array,
+    encoder: ComputePass4<'_>,
+) -> Result<Array, KernelError> {
+    reject_quantized(src.dtype())?;
+
+    if !src.is_contiguous() {
+        return Err(KernelError::InvalidShape(
+            "copy_blit_m4 requires a contiguous source array; use copy_encode for strided data"
+                .to_string(),
+        ));
+    }
+
+    let numel = src.numel();
+    let out = Array::uninit(registry.device().raw(), src.shape(), src.dtype());
+
+    let byte_size = numel * src.dtype().size_of();
+    encoder.copy_buffer(
+        src.metal_buffer(),
+        src.offset(),
+        out.metal_buffer(),
+        out.offset(),
+        byte_size,
+    );
+
+    Ok(out)
+}
+
+/// Encode a contiguous buffer-to-buffer copy as a hardware blit in a Metal 4
+/// compute pass, writing into a pre-allocated destination.
+///
+/// Unlike [`copy_blit_m4`] which allocates a new output, this writes into
+/// `dst` at `dst.offset()`. Both `src` and `dst` must be contiguous and have
+/// the same byte size.
+#[cfg(feature = "metal4")]
+pub fn copy_blit_into_m4(
+    src: &Array,
+    dst: &Array,
+    encoder: ComputePass4<'_>,
+) -> Result<(), KernelError> {
+    reject_quantized(src.dtype())?;
+
+    if !src.is_contiguous() {
+        return Err(KernelError::InvalidShape(
+            "copy_blit_into_m4 requires a contiguous source array".to_string(),
+        ));
+    }
+
+    let byte_size = src.numel() * src.dtype().size_of();
+    encoder.copy_buffer(
+        src.metal_buffer(),
+        src.offset(),
+        dst.metal_buffer(),
+        dst.offset(),
+        byte_size,
+    );
+
+    Ok(())
+}
+
+/// Fill a buffer region with zeros using the Metal 4 blit path.
+///
+/// Uses `ComputePass4::fill_buffer()` which is a hardware DMA zero-fill —
+/// no compute pipeline, no shader invocation. Significantly faster than
+/// dispatching the `copy_s_*` kernel for zero initialization.
+///
+/// Returns `Err` if `value` is non-zero (use the compute `fill_*` functions
+/// for non-zero fills).
+#[cfg(feature = "metal4")]
+pub fn fill_zero_blit_m4(
+    shape: &[usize],
+    dtype: DType,
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    encoder: ComputePass4<'_>,
+) -> Result<Array, KernelError> {
+    reject_quantized(dtype)?;
+
+    let numel: usize = shape.iter().product();
+    if numel == 0 {
+        return Ok(Array::zeros(device, shape, dtype));
+    }
+
+    let out = Array::uninit(device, shape, dtype);
+    let byte_size = numel * dtype.size_of();
+
+    encoder.fill_buffer(
+        out.metal_buffer(),
+        out.offset()..out.offset() + byte_size,
+        0,
+    );
+
+    Ok(out)
+}
+
+/// Fill a buffer with a constant byte pattern using the Metal 4 blit path.
+///
+/// Uses `ComputePass4::fill_buffer()` to set every byte in the output to
+/// `byte_value`. This is suitable for memset-style fills (e.g., zero-fill
+/// with `byte_value = 0`, or 0xFF-fill for sentinel values).
+///
+/// Note: this fills at byte granularity, not element granularity. For
+/// element-wise fills with arbitrary values, use the compute `fill_*` functions.
+#[cfg(feature = "metal4")]
+pub fn fill_bytes_blit_m4(
+    shape: &[usize],
+    dtype: DType,
+    byte_value: u8,
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    encoder: ComputePass4<'_>,
+) -> Result<Array, KernelError> {
+    reject_quantized(dtype)?;
+
+    let numel: usize = shape.iter().product();
+    if numel == 0 {
+        return Ok(Array::zeros(device, shape, dtype));
+    }
+
+    let out = Array::uninit(device, shape, dtype);
+    let byte_size = numel * dtype.size_of();
+
+    encoder.fill_buffer(
+        out.metal_buffer(),
+        out.offset()..out.offset() + byte_size,
+        byte_value,
+    );
+
+    Ok(out)
+}
+
+/// Encode batched KV cache copy as hardware blits in a Metal 4 compute pass.
+///
+/// Uses per-head `copy_buffer()` blit operations instead of dispatching a
+/// compute kernel. Since the source is contiguous
+/// `[num_kv_heads, new_tokens, head_dim]` and the destination is a slab
+/// `[num_kv_heads, max_seq_len, head_dim]`, each head's data is a contiguous
+/// region that can be copied via DMA.
+///
+/// This replaces `2 * num_kv_heads` potential encoder switches (Metal 3 blit)
+/// or one compute kernel dispatch with inline blit operations in the same
+/// compute pass.
+#[cfg(feature = "metal4")]
+#[allow(clippy::too_many_arguments)]
+pub fn kv_cache_copy_batched_f16_blit_m4(
+    src_k: &Array,
+    src_v: &Array,
+    dst_k: &Array,
+    dst_v: &Array,
+    num_kv_heads: usize,
+    new_tokens: usize,
+    head_dim: usize,
+    max_seq_len: usize,
+    offset: usize,
+    encoder: ComputePass4<'_>,
+) -> Result<(), KernelError> {
+    if new_tokens == 0 {
+        return Ok(());
+    }
+
+    let bytes_per_elem = DType::Float16.size_of();
+    let head_copy_bytes = new_tokens * head_dim * bytes_per_elem;
+    let src_head_stride = new_tokens * head_dim * bytes_per_elem;
+    let dst_head_stride = max_seq_len * head_dim * bytes_per_elem;
+    let dst_row_offset = offset * head_dim * bytes_per_elem;
+
+    for h in 0..num_kv_heads {
+        let src_k_off = src_k.offset() + h * src_head_stride;
+        let dst_k_off = dst_k.offset() + h * dst_head_stride + dst_row_offset;
+        encoder.copy_buffer(
+            src_k.metal_buffer(),
+            src_k_off,
+            dst_k.metal_buffer(),
+            dst_k_off,
+            head_copy_bytes,
+        );
+
+        let src_v_off = src_v.offset() + h * src_head_stride;
+        let dst_v_off = dst_v.offset() + h * dst_head_stride + dst_row_offset;
+        encoder.copy_buffer(
+            src_v.metal_buffer(),
+            src_v_off,
+            dst_v.metal_buffer(),
+            dst_v_off,
+            head_copy_bytes,
+        );
+    }
 
     Ok(())
 }

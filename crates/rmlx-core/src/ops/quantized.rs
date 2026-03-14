@@ -10,15 +10,27 @@
 //! Supported bit widths: 2, 3, 4, 6, 8
 //! Supported group sizes: 32, 64, 128
 
-use metal::Buffer as MTLBuffer;
+use objc2_metal::MTLBuffer as _;
+use rmlx_metal::ComputePass;
+use rmlx_metal::MtlBuffer;
 
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{FunctionConstantValue, KernelError, KernelRegistry};
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLComputePipelineState as _;
+// MTLComputeCommandEncoder import removed (using ComputePass wrapper)
+// MTLCommandEncoder import removed (using ComputePass wrapper)
+use objc2_metal::MTLCommandBuffer as _;
+use objc2_metal::MTLCommandQueue as _;
+use objc2_metal::MTLDevice as _;
+// MTLResource trait import removed (unused after objc2 migration)
 use crate::ops::buffer_slots::{
     awq, awq_gidx, gather_qmm, gather_qmv, qmm_legacy, qmm_mma, qmm_nax, qmm_skinny,
     qmm_splitk_reduce, qmm_steel, qmm_steel_splitk, qmm_tiny_reduce, qmv,
 };
+use rmlx_metal::MTLResourceOptions;
+use rmlx_metal::MTLSize;
 
 // ---------------------------------------------------------------------------
 // Deprecated GGML-format block structs (kept for backward compatibility)
@@ -65,11 +77,11 @@ const VALID_GROUP_SIZES: &[u32] = &[32, 64, 128];
 /// where `g = i / group_size`.
 pub struct QuantizedWeight {
     /// Packed uint32 weight data.
-    pub weights_buf: MTLBuffer,
+    pub weights_buf: MtlBuffer,
     /// Per-group scale factors (float16).
-    pub scales_buf: MTLBuffer,
+    pub scales_buf: MtlBuffer,
     /// Per-group bias terms (float16).
-    pub biases_buf: MTLBuffer,
+    pub biases_buf: MtlBuffer,
     /// Number of elements per quantization group (32, 64, or 128).
     pub group_size: u32,
     /// Bit width of each quantized value (2, 3, 4, 6, or 8).
@@ -83,9 +95,9 @@ pub struct QuantizedWeight {
 impl QuantizedWeight {
     /// Create a new `QuantizedWeight` with validation.
     pub fn new(
-        weights_buf: MTLBuffer,
-        scales_buf: MTLBuffer,
-        biases_buf: MTLBuffer,
+        weights_buf: MtlBuffer,
+        scales_buf: MtlBuffer,
+        biases_buf: MtlBuffer,
         group_size: u32,
         bits: u32,
         out_features: usize,
@@ -111,7 +123,7 @@ impl QuantizedWeight {
         let elems_per_u32 = 32 / bits as usize;
         let expected_weight_u32s = total_elements.div_ceil(elems_per_u32);
         let expected_weight_bytes = expected_weight_u32s * 4;
-        if (weights_buf.length() as usize) < expected_weight_bytes {
+        if weights_buf.length() < expected_weight_bytes {
             return Err(KernelError::InvalidShape(format!(
                 "weights_buf too small: {} bytes < expected {} bytes for [{out_features}, {in_features}] at {bits} bits",
                 weights_buf.length(),
@@ -121,14 +133,14 @@ impl QuantizedWeight {
 
         let num_groups = total_elements / (group_size as usize);
         let expected_scales_bytes = num_groups * 2; // float16
-        if (scales_buf.length() as usize) < expected_scales_bytes {
+        if scales_buf.length() < expected_scales_bytes {
             return Err(KernelError::InvalidShape(format!(
                 "scales_buf too small: {} bytes < expected {} bytes ({num_groups} groups)",
                 scales_buf.length(),
                 expected_scales_bytes,
             )));
         }
-        if (biases_buf.length() as usize) < expected_scales_bytes {
+        if biases_buf.length() < expected_scales_bytes {
             return Err(KernelError::InvalidShape(format!(
                 "biases_buf too small: {} bytes < expected {} bytes ({num_groups} groups)",
                 biases_buf.length(),
@@ -1246,7 +1258,7 @@ pub fn register(registry: &KernelRegistry) -> Result<(), KernelError> {
 fn ensure_f16(
     registry: &KernelRegistry,
     x: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     if x.dtype() == DType::Float16 {
         // Already f16 — return a zero-cost view sharing the same buffer
@@ -1261,7 +1273,7 @@ fn ensure_f16(
 fn ensure_f32_legacy(
     registry: &KernelRegistry,
     x: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     if x.dtype() == DType::Float32 {
         super::copy::copy(registry, x, queue)
@@ -1298,7 +1310,7 @@ pub fn affine_quantized_matmul(
     registry: &KernelRegistry,
     qw: &QuantizedWeight,
     vec: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     // --- Validate input vector ---
     if vec.dtype() != DType::Float32 && vec.dtype() != DType::Float16 {
@@ -1354,33 +1366,45 @@ pub fn affine_quantized_matmul(
         qw.bits,
     ];
 
-    let cb = queue.new_command_buffer();
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(qmv::WEIGHTS, Some(&qw.weights_buf), 0);
-    enc.set_buffer(qmv::SCALES, Some(&qw.scales_buf), 0);
-    enc.set_buffer(qmv::BIASES, Some(&qw.biases_buf), 0);
+    let cb = queue.commandBuffer().unwrap();
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
+    enc.set_buffer(qmv::WEIGHTS as u32, Some(&qw.weights_buf), 0);
+    enc.set_buffer(qmv::SCALES as u32, Some(&qw.scales_buf), 0);
+    enc.set_buffer(qmv::BIASES as u32, Some(&qw.biases_buf), 0);
     enc.set_buffer(
-        qmv::INPUT,
+        qmv::INPUT as u32,
         Some(vec_for_kernel.metal_buffer()),
-        vec_for_kernel.offset() as u64,
+        vec_for_kernel.offset(),
     );
-    enc.set_buffer(qmv::OUTPUT, Some(out.metal_buffer()), 0);
-    enc.set_bytes(qmv::PARAMS, 16, params.as_ptr() as *const std::ffi::c_void);
-
+    enc.set_buffer(qmv::OUTPUT as u32, Some(out.metal_buffer()), 0);
+    enc.set_bytes(
+        qmv::PARAMS as u32,
+        params.as_ptr() as *const std::ffi::c_void,
+        16,
+    );
     // MLX qmv_fast layout: 2 simdgroups × 4 rows = 8 rows per threadgroup.
     // Threadgroup size = 2 × 32 = 64 threads.
     // Grid: (1, ceil(out_features / 8), 1)
-    let rows_per_tg: u64 = 8; // NUM_SIMDGROUPS(2) * RESULTS_PER_SG(4)
-    let num_tgs_y = (qw.out_features as u64).div_ceil(rows_per_tg);
-    let tg_size: u64 = 64; // 2 simdgroups × 32
+    let rows_per_tg: usize = 8; // NUM_SIMDGROUPS(2) * RESULTS_PER_SG(4)
+    let num_tgs_y = qw.out_features.div_ceil(rows_per_tg);
+    let tg_size: usize = 64; // 2 simdgroups × 32
 
-    enc.dispatch_thread_groups(
-        metal::MTLSize::new(1, num_tgs_y, 1),
-        metal::MTLSize::new(tg_size, 1, 1),
+    enc.dispatch_threadgroups(
+        MTLSize {
+            width: 1,
+            height: num_tgs_y,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        },
     );
-    enc.end_encoding();
-    super::commit_with_mode(cb, super::ExecMode::Sync);
+    enc.end();
+    super::commit_with_mode(&cb, super::ExecMode::Sync);
 
     // Output is already in the native kernel dtype (f16 for Q4, f32 for Q8).
     Ok(out)
@@ -1405,7 +1429,7 @@ pub fn affine_qmv_batched_q4(
     registry: &KernelRegistry,
     qw: &QuantizedWeight,
     x: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     // --- Validate bit width ---
     if qw.bits != 4 {
@@ -1469,27 +1493,39 @@ pub fn affine_qmv_batched_q4(
         super::checked_u32(m, "M")?,
     ];
 
-    let cb = queue.new_command_buffer();
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(qmv::WEIGHTS, Some(&qw.weights_buf), 0);
-    enc.set_buffer(qmv::SCALES, Some(&qw.scales_buf), 0);
-    enc.set_buffer(qmv::BIASES, Some(&qw.biases_buf), 0);
-    enc.set_buffer(qmv::INPUT, Some(x.metal_buffer()), x.offset() as u64);
-    enc.set_buffer(qmv::OUTPUT, Some(out.metal_buffer()), 0);
-    enc.set_bytes(qmv::PARAMS, 16, params.as_ptr() as *const std::ffi::c_void);
-
-    // Grid: (M, ceil(N / 8), 1) — M batches × N-tile groups
-    let rows_per_tg: u64 = 8; // NUM_SIMDGROUPS(2) * RESULTS_PER_SG(4)
-    let num_tgs_y = (n as u64).div_ceil(rows_per_tg);
-    let tg_size: u64 = 64; // 2 simdgroups × 32
-
-    enc.dispatch_thread_groups(
-        metal::MTLSize::new(m as u64, num_tgs_y, 1),
-        metal::MTLSize::new(tg_size, 1, 1),
+    let cb = queue.commandBuffer().unwrap();
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
+    enc.set_buffer(qmv::WEIGHTS as u32, Some(&qw.weights_buf), 0);
+    enc.set_buffer(qmv::SCALES as u32, Some(&qw.scales_buf), 0);
+    enc.set_buffer(qmv::BIASES as u32, Some(&qw.biases_buf), 0);
+    enc.set_buffer(qmv::INPUT as u32, Some(x.metal_buffer()), x.offset());
+    enc.set_buffer(qmv::OUTPUT as u32, Some(out.metal_buffer()), 0);
+    enc.set_bytes(
+        qmv::PARAMS as u32,
+        params.as_ptr() as *const std::ffi::c_void,
+        16,
     );
-    enc.end_encoding();
-    super::commit_with_mode(cb, super::ExecMode::Sync);
+    // Grid: (M, ceil(N / 8), 1) — M batches × N-tile groups
+    let rows_per_tg: usize = 8; // NUM_SIMDGROUPS(2) * RESULTS_PER_SG(4)
+    let num_tgs_y = n.div_ceil(rows_per_tg);
+    let tg_size: usize = 64; // 2 simdgroups × 32
+
+    enc.dispatch_threadgroups(
+        MTLSize {
+            width: m,
+            height: num_tgs_y,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        },
+    );
+    enc.end();
+    super::commit_with_mode(&cb, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -1542,7 +1578,7 @@ pub fn affine_qmv_fast_f16_q4(
     registry: &KernelRegistry,
     qw: &QuantizedWeight,
     vec: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     if qw.bits != 4 {
         return Err(KernelError::InvalidShape(format!(
@@ -1587,26 +1623,38 @@ pub fn affine_qmv_fast_f16_q4(
         qw.bits,
     ];
 
-    let cb = queue.new_command_buffer();
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(qmv::WEIGHTS, Some(&qw.weights_buf), 0);
-    enc.set_buffer(qmv::SCALES, Some(&qw.scales_buf), 0);
-    enc.set_buffer(qmv::BIASES, Some(&qw.biases_buf), 0);
-    enc.set_buffer(qmv::INPUT, Some(vec.metal_buffer()), vec.offset() as u64);
-    enc.set_buffer(qmv::OUTPUT, Some(out.metal_buffer()), 0);
-    enc.set_bytes(qmv::PARAMS, 16, params.as_ptr() as *const std::ffi::c_void);
-
-    let rows_per_tg: u64 = 8;
-    let num_tgs_y = (qw.out_features as u64).div_ceil(rows_per_tg);
-    let tg_size: u64 = 64;
-
-    enc.dispatch_thread_groups(
-        metal::MTLSize::new(1, num_tgs_y, 1),
-        metal::MTLSize::new(tg_size, 1, 1),
+    let cb = queue.commandBuffer().unwrap();
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
+    enc.set_buffer(qmv::WEIGHTS as u32, Some(&qw.weights_buf), 0);
+    enc.set_buffer(qmv::SCALES as u32, Some(&qw.scales_buf), 0);
+    enc.set_buffer(qmv::BIASES as u32, Some(&qw.biases_buf), 0);
+    enc.set_buffer(qmv::INPUT as u32, Some(vec.metal_buffer()), vec.offset());
+    enc.set_buffer(qmv::OUTPUT as u32, Some(out.metal_buffer()), 0);
+    enc.set_bytes(
+        qmv::PARAMS as u32,
+        params.as_ptr() as *const std::ffi::c_void,
+        16,
     );
-    enc.end_encoding();
-    super::commit_with_mode(cb, super::ExecMode::Sync);
+    let rows_per_tg: usize = 8;
+    let num_tgs_y = qw.out_features.div_ceil(rows_per_tg);
+    let tg_size: usize = 64;
+
+    enc.dispatch_threadgroups(
+        MTLSize {
+            width: 1,
+            height: num_tgs_y,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        },
+    );
+    enc.end();
+    super::commit_with_mode(&cb, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -1628,7 +1676,7 @@ pub fn affine_qmv_batched_f16_q4(
     registry: &KernelRegistry,
     qw: &QuantizedWeight,
     x: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     if qw.bits != 4 {
         return Err(KernelError::InvalidShape(format!(
@@ -1686,26 +1734,38 @@ pub fn affine_qmv_batched_f16_q4(
         super::checked_u32(m, "M")?,
     ];
 
-    let cb = queue.new_command_buffer();
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(qmv::WEIGHTS, Some(&qw.weights_buf), 0);
-    enc.set_buffer(qmv::SCALES, Some(&qw.scales_buf), 0);
-    enc.set_buffer(qmv::BIASES, Some(&qw.biases_buf), 0);
-    enc.set_buffer(qmv::INPUT, Some(x.metal_buffer()), x.offset() as u64);
-    enc.set_buffer(qmv::OUTPUT, Some(out.metal_buffer()), 0);
-    enc.set_bytes(qmv::PARAMS, 16, params.as_ptr() as *const std::ffi::c_void);
-
-    let rows_per_tg: u64 = 8;
-    let num_tgs_y = (n as u64).div_ceil(rows_per_tg);
-    let tg_size: u64 = 64;
-
-    enc.dispatch_thread_groups(
-        metal::MTLSize::new(m as u64, num_tgs_y, 1),
-        metal::MTLSize::new(tg_size, 1, 1),
+    let cb = queue.commandBuffer().unwrap();
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
+    enc.set_buffer(qmv::WEIGHTS as u32, Some(&qw.weights_buf), 0);
+    enc.set_buffer(qmv::SCALES as u32, Some(&qw.scales_buf), 0);
+    enc.set_buffer(qmv::BIASES as u32, Some(&qw.biases_buf), 0);
+    enc.set_buffer(qmv::INPUT as u32, Some(x.metal_buffer()), x.offset());
+    enc.set_buffer(qmv::OUTPUT as u32, Some(out.metal_buffer()), 0);
+    enc.set_bytes(
+        qmv::PARAMS as u32,
+        params.as_ptr() as *const std::ffi::c_void,
+        16,
     );
-    enc.end_encoding();
-    super::commit_with_mode(cb, super::ExecMode::Sync);
+    let rows_per_tg: usize = 8;
+    let num_tgs_y = n.div_ceil(rows_per_tg);
+    let tg_size: usize = 64;
+
+    enc.dispatch_threadgroups(
+        MTLSize {
+            width: m,
+            height: num_tgs_y,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        },
+    );
+    enc.end();
+    super::commit_with_mode(&cb, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -1729,7 +1789,7 @@ pub fn affine_qmv_batched_splitk_f16_q4(
     registry: &KernelRegistry,
     qw: &QuantizedWeight,
     x: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
     k_partitions: usize,
 ) -> Result<Array, KernelError> {
     if qw.bits != 4 {
@@ -1784,7 +1844,7 @@ pub fn affine_qmv_batched_splitk_f16_q4(
 
     let n = qw.out_features;
     let dev = registry.device().raw();
-    let opts = metal::MTLResourceOptions::StorageModeShared;
+    let opts = MTLResourceOptions::StorageModeShared;
 
     // k_per_part aligned to BLOCK_SIZE boundary
     let k_per_part = (k / k_partitions).div_ceil(QMV_Q4_BLOCK_SIZE) * QMV_Q4_BLOCK_SIZE;
@@ -1794,8 +1854,8 @@ pub fn affine_qmv_batched_splitk_f16_q4(
         registry.get_pipeline("affine_qmv_batched_splitk_f16_q4", DType::Float16)?;
 
     let partition_stride = m * n;
-    let c_split_size = (k_partitions * partition_stride * std::mem::size_of::<f32>()) as u64;
-    let c_split_buf = dev.new_buffer(c_split_size, opts);
+    let c_split_size = k_partitions * partition_stride * std::mem::size_of::<f32>();
+    let c_split_buf = dev.newBufferWithLength_options(c_split_size, opts).unwrap();
 
     let out = Array::uninit(dev, &[m, n], DType::Float16);
 
@@ -1810,32 +1870,44 @@ pub fn affine_qmv_batched_splitk_f16_q4(
         super::checked_u32(k_per_part, "k_per_part")?,
     ];
 
-    let cb = queue.new_command_buffer();
+    let cb = queue.commandBuffer().unwrap();
 
     // Encode split-K kernel
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&splitk_pipeline);
-    enc.set_buffer(qmv::WEIGHTS, Some(&qw.weights_buf), 0);
-    enc.set_buffer(qmv::SCALES, Some(&qw.scales_buf), 0);
-    enc.set_buffer(qmv::BIASES, Some(&qw.biases_buf), 0);
-    enc.set_buffer(qmv::INPUT, Some(x.metal_buffer()), x.offset() as u64);
-    enc.set_buffer(qmv::OUTPUT, Some(&c_split_buf), 0);
-    enc.set_bytes(qmv::PARAMS, 16, params.as_ptr() as *const std::ffi::c_void);
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&splitk_pipeline);
+    enc.set_buffer(qmv::WEIGHTS as u32, Some(&qw.weights_buf), 0);
+    enc.set_buffer(qmv::SCALES as u32, Some(&qw.scales_buf), 0);
+    enc.set_buffer(qmv::BIASES as u32, Some(&qw.biases_buf), 0);
+    enc.set_buffer(qmv::INPUT as u32, Some(x.metal_buffer()), x.offset());
+    enc.set_buffer(qmv::OUTPUT as u32, Some(&c_split_buf), 0);
     enc.set_bytes(
-        qmv::SPLITK_PARAMS,
-        8,
+        qmv::PARAMS as u32,
+        params.as_ptr() as *const std::ffi::c_void,
+        16,
+    );
+    enc.set_bytes(
+        qmv::SPLITK_PARAMS as u32,
         splitk_p.as_ptr() as *const std::ffi::c_void,
+        8,
     );
+    let rows_per_tg: usize = 8;
+    let num_tgs_y = n.div_ceil(rows_per_tg);
+    let tg_size: usize = 64;
 
-    let rows_per_tg: u64 = 8;
-    let num_tgs_y = (n as u64).div_ceil(rows_per_tg);
-    let tg_size: u64 = 64;
-
-    enc.dispatch_thread_groups(
-        metal::MTLSize::new(m as u64, num_tgs_y, k_partitions as u64),
-        metal::MTLSize::new(tg_size, 1, 1),
+    enc.dispatch_threadgroups(
+        MTLSize {
+            width: m,
+            height: num_tgs_y,
+            depth: k_partitions,
+        },
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        },
     );
-    enc.end_encoding();
+    enc.end();
 
     // Phase 2: Reduce partial sums -> f16 output
     let reduce_pipeline = registry.get_pipeline("qmm_splitk_accum_f16", DType::Float16)?;
@@ -1845,23 +1917,32 @@ pub fn affine_qmv_batched_splitk_f16_q4(
         super::checked_u32(partition_stride, "partition_stride")?,
     ];
 
-    let enc2 = cb.new_compute_command_encoder();
-    enc2.set_compute_pipeline_state(&reduce_pipeline);
-    enc2.set_buffer(qmm_splitk_reduce::PARTIAL, Some(&c_split_buf), 0);
-    enc2.set_buffer(qmm_splitk_reduce::OUT, Some(out.metal_buffer()), 0);
+    let raw_enc2 = cb.computeCommandEncoder().unwrap();
+
+    let enc2 = ComputePass::new(&raw_enc2);
+    enc2.set_pipeline(&reduce_pipeline);
+    enc2.set_buffer(qmm_splitk_reduce::PARTIAL as u32, Some(&c_split_buf), 0);
+    enc2.set_buffer(qmm_splitk_reduce::OUT as u32, Some(out.metal_buffer()), 0);
     enc2.set_bytes(
-        qmm_splitk_reduce::PARAMS,
-        12,
+        qmm_splitk_reduce::PARAMS as u32,
         acc_params.as_ptr() as *const std::ffi::c_void,
+        12,
     );
-
     enc2.dispatch_threads(
-        metal::MTLSize::new(n as u64, m as u64, 1),
-        metal::MTLSize::new(n.min(256) as u64, 1, 1),
+        MTLSize {
+            width: n,
+            height: m,
+            depth: 1,
+        },
+        MTLSize {
+            width: n.min(256),
+            height: 1,
+            depth: 1,
+        },
     );
-    enc2.end_encoding();
+    enc2.end();
 
-    super::commit_with_mode(cb, super::ExecMode::Sync);
+    super::commit_with_mode(&cb, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -1885,7 +1966,7 @@ pub fn affine_qmv_splitk_f16_q4(
     registry: &KernelRegistry,
     qw: &QuantizedWeight,
     vec: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
     k_partitions: usize,
 ) -> Result<Array, KernelError> {
     if qw.bits != 4 {
@@ -1922,7 +2003,7 @@ pub fn affine_qmv_splitk_f16_q4(
 
     let n = qw.out_features;
     let dev = registry.device().raw();
-    let opts = metal::MTLResourceOptions::StorageModeShared;
+    let opts = MTLResourceOptions::StorageModeShared;
 
     // k_per_part aligned to BLOCK_SIZE boundary
     let k_per_part = (k / k_partitions).div_ceil(QMV_Q4_BLOCK_SIZE) * QMV_Q4_BLOCK_SIZE;
@@ -1930,8 +2011,8 @@ pub fn affine_qmv_splitk_f16_q4(
     // Phase 1: Split-K partial sums (f32)
     let splitk_pipeline = registry.get_pipeline("affine_qmv_splitk_f16_q4", DType::Float16)?;
 
-    let c_split_size = (k_partitions * n * std::mem::size_of::<f32>()) as u64;
-    let c_split_buf = dev.new_buffer(c_split_size, opts);
+    let c_split_size = k_partitions * n * std::mem::size_of::<f32>();
+    let c_split_buf = dev.newBufferWithLength_options(c_split_size, opts).unwrap();
 
     let out = Array::uninit(dev, &[n], DType::Float16);
 
@@ -1946,32 +2027,44 @@ pub fn affine_qmv_splitk_f16_q4(
         super::checked_u32(k_per_part, "k_per_part")?,
     ];
 
-    let cb = queue.new_command_buffer();
+    let cb = queue.commandBuffer().unwrap();
 
     // Encode split-K kernel
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&splitk_pipeline);
-    enc.set_buffer(qmv::WEIGHTS, Some(&qw.weights_buf), 0);
-    enc.set_buffer(qmv::SCALES, Some(&qw.scales_buf), 0);
-    enc.set_buffer(qmv::BIASES, Some(&qw.biases_buf), 0);
-    enc.set_buffer(qmv::INPUT, Some(vec.metal_buffer()), vec.offset() as u64);
-    enc.set_buffer(qmv::OUTPUT, Some(&c_split_buf), 0);
-    enc.set_bytes(qmv::PARAMS, 16, params.as_ptr() as *const std::ffi::c_void);
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&splitk_pipeline);
+    enc.set_buffer(qmv::WEIGHTS as u32, Some(&qw.weights_buf), 0);
+    enc.set_buffer(qmv::SCALES as u32, Some(&qw.scales_buf), 0);
+    enc.set_buffer(qmv::BIASES as u32, Some(&qw.biases_buf), 0);
+    enc.set_buffer(qmv::INPUT as u32, Some(vec.metal_buffer()), vec.offset());
+    enc.set_buffer(qmv::OUTPUT as u32, Some(&c_split_buf), 0);
     enc.set_bytes(
-        qmv::SPLITK_PARAMS,
-        8,
+        qmv::PARAMS as u32,
+        params.as_ptr() as *const std::ffi::c_void,
+        16,
+    );
+    enc.set_bytes(
+        qmv::SPLITK_PARAMS as u32,
         splitk_p.as_ptr() as *const std::ffi::c_void,
+        8,
     );
+    let rows_per_tg: usize = 8;
+    let num_tgs_y = n.div_ceil(rows_per_tg);
+    let tg_size: usize = 64;
 
-    let rows_per_tg: u64 = 8;
-    let num_tgs_y = (n as u64).div_ceil(rows_per_tg);
-    let tg_size: u64 = 64;
-
-    enc.dispatch_thread_groups(
-        metal::MTLSize::new(1, num_tgs_y, k_partitions as u64),
-        metal::MTLSize::new(tg_size, 1, 1),
+    enc.dispatch_threadgroups(
+        MTLSize {
+            width: 1,
+            height: num_tgs_y,
+            depth: k_partitions,
+        },
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        },
     );
-    enc.end_encoding();
+    enc.end();
 
     // Phase 2: Reduce partial sums -> f16 output
     // Reuse qmm_splitk_accum_f16 with partition_stride = N (since M=1)
@@ -1982,24 +2075,33 @@ pub fn affine_qmv_splitk_f16_q4(
         super::checked_u32(n, "partition_stride")?, // M=1 so stride = N
     ];
 
-    let enc2 = cb.new_compute_command_encoder();
-    enc2.set_compute_pipeline_state(&reduce_pipeline);
-    enc2.set_buffer(qmm_splitk_reduce::PARTIAL, Some(&c_split_buf), 0);
-    enc2.set_buffer(qmm_splitk_reduce::OUT, Some(out.metal_buffer()), 0);
-    enc2.set_bytes(
-        qmm_splitk_reduce::PARAMS,
-        12,
-        acc_params.as_ptr() as *const std::ffi::c_void,
-    );
+    let raw_enc2 = cb.computeCommandEncoder().unwrap();
 
+    let enc2 = ComputePass::new(&raw_enc2);
+    enc2.set_pipeline(&reduce_pipeline);
+    enc2.set_buffer(qmm_splitk_reduce::PARTIAL as u32, Some(&c_split_buf), 0);
+    enc2.set_buffer(qmm_splitk_reduce::OUT as u32, Some(out.metal_buffer()), 0);
+    enc2.set_bytes(
+        qmm_splitk_reduce::PARAMS as u32,
+        acc_params.as_ptr() as *const std::ffi::c_void,
+        12,
+    );
     // dispatch_threads for 1-D reduce: N threads, M=1 so gid.y=0
     enc2.dispatch_threads(
-        metal::MTLSize::new(n as u64, 1, 1),
-        metal::MTLSize::new(n.min(256) as u64, 1, 1),
+        MTLSize {
+            width: n,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: n.min(256),
+            height: 1,
+            depth: 1,
+        },
     );
-    enc2.end_encoding();
+    enc2.end();
 
-    super::commit_with_mode(cb, super::ExecMode::Sync);
+    super::commit_with_mode(&cb, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -2011,7 +2113,7 @@ pub fn affine_qmv_splitk_f16_q4_into_cb(
     qw: &QuantizedWeight,
     vec: &Array,
     k_partitions: usize,
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
 ) -> Result<Array, KernelError> {
     if qw.bits != 4 {
         return Err(KernelError::InvalidShape(format!(
@@ -2047,14 +2149,14 @@ pub fn affine_qmv_splitk_f16_q4_into_cb(
 
     let n = qw.out_features;
     let dev = registry.device().raw();
-    let opts = metal::MTLResourceOptions::StorageModeShared;
+    let opts = MTLResourceOptions::StorageModeShared;
 
     let k_per_part = (k / k_partitions).div_ceil(QMV_Q4_BLOCK_SIZE) * QMV_Q4_BLOCK_SIZE;
 
     let splitk_pipeline = registry.get_pipeline("affine_qmv_splitk_f16_q4", DType::Float16)?;
 
-    let c_split_size = (k_partitions * n * std::mem::size_of::<f32>()) as u64;
-    let c_split_buf = dev.new_buffer(c_split_size, opts);
+    let c_split_size = k_partitions * n * std::mem::size_of::<f32>();
+    let c_split_buf = dev.newBufferWithLength_options(c_split_size, opts).unwrap();
 
     let out = Array::uninit(dev, &[n], DType::Float16);
 
@@ -2070,29 +2172,41 @@ pub fn affine_qmv_splitk_f16_q4_into_cb(
     ];
 
     // Encode split-K kernel
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&splitk_pipeline);
-    enc.set_buffer(qmv::WEIGHTS, Some(&qw.weights_buf), 0);
-    enc.set_buffer(qmv::SCALES, Some(&qw.scales_buf), 0);
-    enc.set_buffer(qmv::BIASES, Some(&qw.biases_buf), 0);
-    enc.set_buffer(qmv::INPUT, Some(vec.metal_buffer()), vec.offset() as u64);
-    enc.set_buffer(qmv::OUTPUT, Some(&c_split_buf), 0);
-    enc.set_bytes(qmv::PARAMS, 16, params.as_ptr() as *const std::ffi::c_void);
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&splitk_pipeline);
+    enc.set_buffer(qmv::WEIGHTS as u32, Some(&qw.weights_buf), 0);
+    enc.set_buffer(qmv::SCALES as u32, Some(&qw.scales_buf), 0);
+    enc.set_buffer(qmv::BIASES as u32, Some(&qw.biases_buf), 0);
+    enc.set_buffer(qmv::INPUT as u32, Some(vec.metal_buffer()), vec.offset());
+    enc.set_buffer(qmv::OUTPUT as u32, Some(&c_split_buf), 0);
     enc.set_bytes(
-        qmv::SPLITK_PARAMS,
-        8,
+        qmv::PARAMS as u32,
+        params.as_ptr() as *const std::ffi::c_void,
+        16,
+    );
+    enc.set_bytes(
+        qmv::SPLITK_PARAMS as u32,
         splitk_p.as_ptr() as *const std::ffi::c_void,
+        8,
     );
+    let rows_per_tg: usize = 8;
+    let num_tgs_y = n.div_ceil(rows_per_tg);
+    let tg_size: usize = 64;
 
-    let rows_per_tg: u64 = 8;
-    let num_tgs_y = (n as u64).div_ceil(rows_per_tg);
-    let tg_size: u64 = 64;
-
-    enc.dispatch_thread_groups(
-        metal::MTLSize::new(1, num_tgs_y, k_partitions as u64),
-        metal::MTLSize::new(tg_size, 1, 1),
+    enc.dispatch_threadgroups(
+        MTLSize {
+            width: 1,
+            height: num_tgs_y,
+            depth: k_partitions,
+        },
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        },
     );
-    enc.end_encoding();
+    enc.end();
 
     // Phase 2: Reduce
     let reduce_pipeline = registry.get_pipeline("qmm_splitk_accum_f16", DType::Float16)?;
@@ -2102,21 +2216,30 @@ pub fn affine_qmv_splitk_f16_q4_into_cb(
         super::checked_u32(n, "partition_stride")?,
     ];
 
-    let enc2 = cb.new_compute_command_encoder();
-    enc2.set_compute_pipeline_state(&reduce_pipeline);
-    enc2.set_buffer(qmm_splitk_reduce::PARTIAL, Some(&c_split_buf), 0);
-    enc2.set_buffer(qmm_splitk_reduce::OUT, Some(out.metal_buffer()), 0);
-    enc2.set_bytes(
-        qmm_splitk_reduce::PARAMS,
-        12,
-        acc_params.as_ptr() as *const std::ffi::c_void,
-    );
+    let raw_enc2 = cb.computeCommandEncoder().unwrap();
 
-    enc2.dispatch_threads(
-        metal::MTLSize::new(n as u64, 1, 1),
-        metal::MTLSize::new(n.min(256) as u64, 1, 1),
+    let enc2 = ComputePass::new(&raw_enc2);
+    enc2.set_pipeline(&reduce_pipeline);
+    enc2.set_buffer(qmm_splitk_reduce::PARTIAL as u32, Some(&c_split_buf), 0);
+    enc2.set_buffer(qmm_splitk_reduce::OUT as u32, Some(out.metal_buffer()), 0);
+    enc2.set_bytes(
+        qmm_splitk_reduce::PARAMS as u32,
+        acc_params.as_ptr() as *const std::ffi::c_void,
+        12,
     );
-    enc2.end_encoding();
+    enc2.dispatch_threads(
+        MTLSize {
+            width: n,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: n.min(256),
+            height: 1,
+            depth: 1,
+        },
+    );
+    enc2.end();
 
     Ok(out)
 }
@@ -2151,7 +2274,7 @@ pub fn awq_dequant(
     rows: usize,
     cols: usize,
     group_size: usize,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     // --- Validate dimensions ---
     if cols % 8 != 0 {
@@ -2175,7 +2298,7 @@ pub fn awq_dequant(
 
     // --- Validate buffer sizes ---
     let expected_qweight_bytes = rows * cols_packed * 4; // uint32
-    let available_qweight = qweight.metal_buffer().length() as usize;
+    let available_qweight = qweight.metal_buffer().length();
     if available_qweight < expected_qweight_bytes {
         return Err(KernelError::InvalidShape(format!(
             "awq_dequant: qweight buffer too small: {available_qweight} bytes < expected {expected_qweight_bytes} bytes for [{rows}, {cols_packed}]"
@@ -2183,7 +2306,7 @@ pub fn awq_dequant(
     }
 
     let expected_qzeros_bytes = num_groups * cols_packed * 4; // uint32
-    let available_qzeros = qzeros.metal_buffer().length() as usize;
+    let available_qzeros = qzeros.metal_buffer().length();
     if available_qzeros < expected_qzeros_bytes {
         return Err(KernelError::InvalidShape(format!(
             "awq_dequant: qzeros buffer too small: {available_qzeros} bytes < expected {expected_qzeros_bytes} bytes for [{num_groups}, {cols_packed}]"
@@ -2191,7 +2314,7 @@ pub fn awq_dequant(
     }
 
     let expected_scales_bytes = num_groups * cols * 4; // float32
-    let available_scales = scales.metal_buffer().length() as usize;
+    let available_scales = scales.metal_buffer().length();
     if available_scales < expected_scales_bytes {
         return Err(KernelError::InvalidShape(format!(
             "awq_dequant: scales buffer too small: {available_scales} bytes < expected {expected_scales_bytes} bytes for [{num_groups}, {cols}]"
@@ -2209,39 +2332,51 @@ pub fn awq_dequant(
         super::checked_u32(num_groups, "num_groups")?,
     ];
 
-    let cb = queue.new_command_buffer();
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
+    let cb = queue.commandBuffer().unwrap();
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
     enc.set_buffer(
-        awq::QWEIGHT,
+        awq::QWEIGHT as u32,
         Some(qweight.metal_buffer()),
-        qweight.offset() as u64,
+        qweight.offset(),
     );
     enc.set_buffer(
-        awq::QZEROS,
+        awq::QZEROS as u32,
         Some(qzeros.metal_buffer()),
-        qzeros.offset() as u64,
+        qzeros.offset(),
     );
     enc.set_buffer(
-        awq::SCALES,
+        awq::SCALES as u32,
         Some(scales.metal_buffer()),
-        scales.offset() as u64,
+        scales.offset(),
     );
-    enc.set_buffer(awq::OUT, Some(out.metal_buffer()), 0);
-    enc.set_bytes(awq::PARAMS, 16, params.as_ptr() as *const std::ffi::c_void);
-
+    enc.set_buffer(awq::OUT as u32, Some(out.metal_buffer()), 0);
+    enc.set_bytes(
+        awq::PARAMS as u32,
+        params.as_ptr() as *const std::ffi::c_void,
+        16,
+    );
     // 2D grid: (cols, rows, 1) — each thread handles one output element.
-    let max_tg = pipeline.max_total_threads_per_threadgroup();
-    let tw = pipeline.thread_execution_width();
+    let max_tg = pipeline.maxTotalThreadsPerThreadgroup();
+    let tw = pipeline.threadExecutionWidth();
     // Use a 2D threadgroup: (tw, max_tg / tw) up to grid bounds.
-    let tg_x = tw.min(cols as u64);
-    let tg_y = (max_tg / tg_x).max(1).min(rows as u64);
+    let tg_x = tw.min(cols);
+    let tg_y = (max_tg / tg_x).max(1).min(rows);
 
-    let grid = metal::MTLSize::new(cols as u64, rows as u64, 1);
-    let tg = metal::MTLSize::new(tg_x, tg_y, 1);
+    let grid = MTLSize {
+        width: cols,
+        height: rows,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: tg_x,
+        height: tg_y,
+        depth: 1,
+    };
     enc.dispatch_threads(grid, tg);
-    enc.end_encoding();
-    super::commit_with_mode(cb, super::ExecMode::Sync);
+    enc.end();
+    super::commit_with_mode(&cb, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -2278,7 +2413,7 @@ pub fn gptq_dequant(
     in_features: usize,
     out_features: usize,
     group_size: usize,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     // --- Validate dimensions ---
     if in_features % 8 != 0 {
@@ -2307,7 +2442,7 @@ pub fn gptq_dequant(
     let num_groups = if g_idx.is_some() {
         // When g_idx is provided, infer num_groups from the scales buffer.
         // scales shape is [num_groups, out_features], so total floats / out_features.
-        let scales_elems = scales.metal_buffer().length() as usize / 4;
+        let scales_elems = scales.metal_buffer().length() / 4;
         scales_elems / out_features
     } else {
         in_features / group_size
@@ -2315,7 +2450,7 @@ pub fn gptq_dequant(
 
     // --- Validate buffer sizes ---
     let expected_qweight_bytes = rows_packed * out_features * 4;
-    let available_qweight = qweight.metal_buffer().length() as usize;
+    let available_qweight = qweight.metal_buffer().length();
     if available_qweight < expected_qweight_bytes {
         return Err(KernelError::InvalidShape(format!(
             "gptq_dequant: qweight buffer too small: {available_qweight} bytes < expected {expected_qweight_bytes} bytes for [{rows_packed}, {out_features}]"
@@ -2323,7 +2458,7 @@ pub fn gptq_dequant(
     }
 
     let expected_qzeros_bytes = num_groups * cols_packed * 4;
-    let available_qzeros = qzeros.metal_buffer().length() as usize;
+    let available_qzeros = qzeros.metal_buffer().length();
     if available_qzeros < expected_qzeros_bytes {
         return Err(KernelError::InvalidShape(format!(
             "gptq_dequant: qzeros buffer too small: {available_qzeros} bytes < expected {expected_qzeros_bytes} bytes for [{num_groups}, {cols_packed}]"
@@ -2331,7 +2466,7 @@ pub fn gptq_dequant(
     }
 
     let expected_scales_bytes = num_groups * out_features * 4;
-    let available_scales = scales.metal_buffer().length() as usize;
+    let available_scales = scales.metal_buffer().length();
     if available_scales < expected_scales_bytes {
         return Err(KernelError::InvalidShape(format!(
             "gptq_dequant: scales buffer too small: {available_scales} bytes < expected {expected_scales_bytes} bytes for [{num_groups}, {out_features}]"
@@ -2340,7 +2475,7 @@ pub fn gptq_dequant(
 
     if let Some(idx) = g_idx {
         let expected_gidx_bytes = in_features * 4; // int32
-        let available_gidx = idx.metal_buffer().length() as usize;
+        let available_gidx = idx.metal_buffer().length();
         if available_gidx < expected_gidx_bytes {
             return Err(KernelError::InvalidShape(format!(
                 "gptq_dequant: g_idx buffer too small: {available_gidx} bytes < expected {expected_gidx_bytes} bytes for [{in_features}]"
@@ -2365,7 +2500,7 @@ pub fn gptq_dequant(
     ];
 
     let dev = registry.device().raw();
-    let opts = metal::MTLResourceOptions::StorageModeShared;
+    let opts = MTLResourceOptions::StorageModeShared;
 
     // For GPTQ without g_idx, create a dummy single-element buffer.
     let dummy_buf;
@@ -2373,53 +2508,68 @@ pub fn gptq_dequant(
         Some(idx) => idx.metal_buffer(),
         None => {
             let dummy_val: [i32; 1] = [0];
-            dummy_buf = dev.new_buffer_with_data(
-                dummy_val.as_ptr() as *const _,
-                std::mem::size_of::<i32>() as u64,
-                opts,
-            );
+            unsafe {
+                dummy_buf = dev
+                    .newBufferWithBytes_length_options(
+                        std::ptr::NonNull::new(
+                            dummy_val.as_ptr() as *const _ as *mut std::ffi::c_void
+                        )
+                        .unwrap(),
+                        std::mem::size_of::<i32>() as u64 as usize,
+                        opts,
+                    )
+                    .unwrap()
+            };
             &dummy_buf
         }
     };
-    let g_idx_offset: u64 = g_idx.map_or(0, |idx| idx.offset() as u64);
+    let g_idx_offset: usize = g_idx.map_or(0, |idx| idx.offset());
 
-    let cb = queue.new_command_buffer();
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
+    let cb = queue.commandBuffer().unwrap();
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
     enc.set_buffer(
-        awq_gidx::QWEIGHT,
+        awq_gidx::QWEIGHT as u32,
         Some(qweight.metal_buffer()),
-        qweight.offset() as u64,
+        qweight.offset(),
     );
     enc.set_buffer(
-        awq_gidx::QZEROS,
+        awq_gidx::QZEROS as u32,
         Some(qzeros.metal_buffer()),
-        qzeros.offset() as u64,
+        qzeros.offset(),
     );
     enc.set_buffer(
-        awq_gidx::SCALES,
+        awq_gidx::SCALES as u32,
         Some(scales.metal_buffer()),
-        scales.offset() as u64,
+        scales.offset(),
     );
-    enc.set_buffer(awq_gidx::G_IDX, Some(g_idx_buf), g_idx_offset);
-    enc.set_buffer(awq_gidx::OUT, Some(out.metal_buffer()), 0);
+    enc.set_buffer(awq_gidx::G_IDX as u32, Some(g_idx_buf), g_idx_offset);
+    enc.set_buffer(awq_gidx::OUT as u32, Some(out.metal_buffer()), 0);
     enc.set_bytes(
-        awq_gidx::PARAMS,
-        16,
+        awq_gidx::PARAMS as u32,
         params.as_ptr() as *const std::ffi::c_void,
+        16,
     );
-
     // 2D grid: (out_features, in_features, 1) — each thread handles one output element.
-    let max_tg = pipeline.max_total_threads_per_threadgroup();
-    let tw = pipeline.thread_execution_width();
-    let tg_x = tw.min(out_features as u64);
-    let tg_y = (max_tg / tg_x).max(1).min(in_features as u64);
+    let max_tg = pipeline.maxTotalThreadsPerThreadgroup();
+    let tw = pipeline.threadExecutionWidth();
+    let tg_x = tw.min(out_features);
+    let tg_y = (max_tg / tg_x).max(1).min(in_features);
 
-    let grid = metal::MTLSize::new(out_features as u64, in_features as u64, 1);
-    let tg = metal::MTLSize::new(tg_x, tg_y, 1);
+    let grid = MTLSize {
+        width: out_features,
+        height: in_features,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: tg_x,
+        height: tg_y,
+        depth: 1,
+    };
     enc.dispatch_threads(grid, tg);
-    enc.end_encoding();
-    super::commit_with_mode(cb, super::ExecMode::Sync);
+    enc.end();
+    super::commit_with_mode(&cb, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -6402,13 +6552,13 @@ pub fn affine_qmm_steel_splitk_q4(
     registry: &KernelRegistry,
     x: &Array,
     qw: &QuantizedWeight,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     let m = x.shape()[0];
     let n = qw.out_features;
     let k = qw.in_features;
     let dev = registry.device().raw();
-    let opts = metal::MTLResourceOptions::StorageModeShared;
+    let opts = MTLResourceOptions::StorageModeShared;
 
     const ST_BM: usize = 32;
     const ST_BN: usize = 32;
@@ -6459,75 +6609,91 @@ pub fn affine_qmm_steel_splitk_q4(
 
     if k_partitions == 1 {
         // Single pass: no c_split needed. Bind dummy at buffer(4).
-        let dummy_buf = dev.new_buffer(4, opts);
+        let dummy_buf = dev.newBufferWithLength_options(4_usize, opts).unwrap();
 
-        let cb = queue.new_command_buffer();
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pipeline);
+        let cb = queue.commandBuffer().unwrap();
+        let raw_enc = cb.computeCommandEncoder().unwrap();
+        let enc = ComputePass::new(&raw_enc);
+        enc.set_pipeline(&pipeline);
         enc.set_buffer(
-            qmm_steel_splitk::X,
+            qmm_steel_splitk::X as u32,
             Some(x.metal_buffer()),
-            x.offset() as u64,
+            x.offset(),
         );
-        enc.set_buffer(qmm_steel_splitk::WEIGHTS, Some(&qw.weights_buf), 0);
-        enc.set_buffer(qmm_steel_splitk::SCALES, Some(&qw.scales_buf), 0);
-        enc.set_buffer(qmm_steel_splitk::BIASES, Some(&qw.biases_buf), 0);
-        enc.set_buffer(qmm_steel_splitk::PARTIAL, Some(&dummy_buf), 0);
-        enc.set_buffer(qmm_steel_splitk::OUT, Some(out.metal_buffer()), 0);
+        enc.set_buffer(qmm_steel_splitk::WEIGHTS as u32, Some(&qw.weights_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::SCALES as u32, Some(&qw.scales_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::BIASES as u32, Some(&qw.biases_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::PARTIAL as u32, Some(&dummy_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::OUT as u32, Some(out.metal_buffer()), 0);
         enc.set_bytes(
-            qmm_steel_splitk::PARAMS,
-            12,
+            qmm_steel_splitk::PARAMS as u32,
             params.as_ptr() as *const std::ffi::c_void,
+            12,
         );
         enc.set_bytes(
-            qmm_steel_splitk::SPLIT_PARAMS,
-            8,
+            qmm_steel_splitk::SPLIT_PARAMS as u32,
             split_params.as_ptr() as *const std::ffi::c_void,
+            8,
         );
-
-        let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
-        let tg = metal::MTLSize::new(64, 1, 1);
-        enc.dispatch_thread_groups(grid, tg);
-        enc.end_encoding();
-        super::commit_with_mode(cb, super::ExecMode::Sync);
+        let grid = MTLSize {
+            width: n_tiles,
+            height: m_tiles,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 64,
+            height: 1,
+            depth: 1,
+        };
+        enc.dispatch_threadgroups(grid, tg);
+        enc.end();
+        super::commit_with_mode(&cb, super::ExecMode::Sync);
 
         Ok(out)
     } else {
         // Split-K: partial sums (f32) → reduce → f16
         let partition_stride = m * n;
-        let c_split_size = (k_partitions * partition_stride * std::mem::size_of::<f32>()) as u64;
-        let c_split_buf = dev.new_buffer(c_split_size, opts);
+        let c_split_size = k_partitions * partition_stride * std::mem::size_of::<f32>();
+        let c_split_buf = dev.newBufferWithLength_options(c_split_size, opts).unwrap();
 
-        let cb = queue.new_command_buffer();
+        let cb = queue.commandBuffer().unwrap();
 
         // Phase 1: Split-K partial GEMM
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pipeline);
+        let raw_enc = cb.computeCommandEncoder().unwrap();
+        let enc = ComputePass::new(&raw_enc);
+        enc.set_pipeline(&pipeline);
         enc.set_buffer(
-            qmm_steel_splitk::X,
+            qmm_steel_splitk::X as u32,
             Some(x.metal_buffer()),
-            x.offset() as u64,
+            x.offset(),
         );
-        enc.set_buffer(qmm_steel_splitk::WEIGHTS, Some(&qw.weights_buf), 0);
-        enc.set_buffer(qmm_steel_splitk::SCALES, Some(&qw.scales_buf), 0);
-        enc.set_buffer(qmm_steel_splitk::BIASES, Some(&qw.biases_buf), 0);
-        enc.set_buffer(qmm_steel_splitk::PARTIAL, Some(&c_split_buf), 0);
-        enc.set_buffer(qmm_steel_splitk::OUT, Some(out.metal_buffer()), 0);
+        enc.set_buffer(qmm_steel_splitk::WEIGHTS as u32, Some(&qw.weights_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::SCALES as u32, Some(&qw.scales_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::BIASES as u32, Some(&qw.biases_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::PARTIAL as u32, Some(&c_split_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::OUT as u32, Some(out.metal_buffer()), 0);
         enc.set_bytes(
-            qmm_steel_splitk::PARAMS,
-            12,
+            qmm_steel_splitk::PARAMS as u32,
             params.as_ptr() as *const std::ffi::c_void,
+            12,
         );
         enc.set_bytes(
-            qmm_steel_splitk::SPLIT_PARAMS,
-            8,
+            qmm_steel_splitk::SPLIT_PARAMS as u32,
             split_params.as_ptr() as *const std::ffi::c_void,
+            8,
         );
-
-        let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, k_partitions as u64);
-        let tg = metal::MTLSize::new(64, 1, 1);
-        enc.dispatch_thread_groups(grid, tg);
-        enc.end_encoding();
+        let grid = MTLSize {
+            width: n_tiles,
+            height: m_tiles,
+            depth: k_partitions,
+        };
+        let tg = MTLSize {
+            width: 64,
+            height: 1,
+            depth: 1,
+        };
+        enc.dispatch_threadgroups(grid, tg);
+        enc.end();
 
         // Phase 2: Reduce float partials → half output
         let reduce_pipeline =
@@ -6539,22 +6705,31 @@ pub fn affine_qmm_steel_splitk_q4(
             super::checked_u32(partition_stride, "partition_stride")?,
         ];
 
-        let enc2 = cb.new_compute_command_encoder();
-        enc2.set_compute_pipeline_state(&reduce_pipeline);
-        enc2.set_buffer(qmm_splitk_reduce::PARTIAL, Some(&c_split_buf), 0);
-        enc2.set_buffer(qmm_splitk_reduce::OUT, Some(out.metal_buffer()), 0);
+        let raw_enc2 = cb.computeCommandEncoder().unwrap();
+
+        let enc2 = ComputePass::new(&raw_enc2);
+        enc2.set_pipeline(&reduce_pipeline);
+        enc2.set_buffer(qmm_splitk_reduce::PARTIAL as u32, Some(&c_split_buf), 0);
+        enc2.set_buffer(qmm_splitk_reduce::OUT as u32, Some(out.metal_buffer()), 0);
         enc2.set_bytes(
-            qmm_splitk_reduce::PARAMS,
-            12,
+            qmm_splitk_reduce::PARAMS as u32,
             reduce_params.as_ptr() as *const std::ffi::c_void,
+            12,
         );
-
-        let reduce_grid = metal::MTLSize::new(n as u64, m as u64, 1);
-        let reduce_tg = metal::MTLSize::new(n.min(256) as u64, 1, 1);
+        let reduce_grid = MTLSize {
+            width: n,
+            height: m,
+            depth: 1,
+        };
+        let reduce_tg = MTLSize {
+            width: n.min(256),
+            height: 1,
+            depth: 1,
+        };
         enc2.dispatch_threads(reduce_grid, reduce_tg);
-        enc2.end_encoding();
+        enc2.end();
 
-        super::commit_with_mode(cb, super::ExecMode::Sync);
+        super::commit_with_mode(&cb, super::ExecMode::Sync);
 
         Ok(out)
     }
@@ -6568,13 +6743,13 @@ pub fn affine_qmm_steel_splitk_q4_into_cb(
     registry: &KernelRegistry,
     x: &Array,
     qw: &QuantizedWeight,
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
 ) -> Result<Array, KernelError> {
     let m = x.shape()[0];
     let n = qw.out_features;
     let k = qw.in_features;
     let dev = registry.device().raw();
-    let opts = metal::MTLResourceOptions::StorageModeShared;
+    let opts = MTLResourceOptions::StorageModeShared;
 
     const ST_BM: usize = 32;
     const ST_BN: usize = 32;
@@ -6623,69 +6798,87 @@ pub fn affine_qmm_steel_splitk_q4_into_cb(
     let out = Array::uninit(dev, &[m, n], DType::Float16);
 
     if k_partitions == 1 {
-        let dummy_buf = dev.new_buffer(4, opts);
+        let dummy_buf = dev.newBufferWithLength_options(4_usize, opts).unwrap();
 
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pipeline);
+        let raw_enc = cb.computeCommandEncoder().unwrap();
+
+        let enc = ComputePass::new(&raw_enc);
+        enc.set_pipeline(&pipeline);
         enc.set_buffer(
-            qmm_steel_splitk::X,
+            qmm_steel_splitk::X as u32,
             Some(x.metal_buffer()),
-            x.offset() as u64,
+            x.offset(),
         );
-        enc.set_buffer(qmm_steel_splitk::WEIGHTS, Some(&qw.weights_buf), 0);
-        enc.set_buffer(qmm_steel_splitk::SCALES, Some(&qw.scales_buf), 0);
-        enc.set_buffer(qmm_steel_splitk::BIASES, Some(&qw.biases_buf), 0);
-        enc.set_buffer(qmm_steel_splitk::PARTIAL, Some(&dummy_buf), 0);
-        enc.set_buffer(qmm_steel_splitk::OUT, Some(out.metal_buffer()), 0);
+        enc.set_buffer(qmm_steel_splitk::WEIGHTS as u32, Some(&qw.weights_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::SCALES as u32, Some(&qw.scales_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::BIASES as u32, Some(&qw.biases_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::PARTIAL as u32, Some(&dummy_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::OUT as u32, Some(out.metal_buffer()), 0);
         enc.set_bytes(
-            qmm_steel_splitk::PARAMS,
-            12,
+            qmm_steel_splitk::PARAMS as u32,
             params.as_ptr() as *const std::ffi::c_void,
+            12,
         );
         enc.set_bytes(
-            qmm_steel_splitk::SPLIT_PARAMS,
-            8,
+            qmm_steel_splitk::SPLIT_PARAMS as u32,
             split_params.as_ptr() as *const std::ffi::c_void,
+            8,
         );
-
-        let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
-        let tg = metal::MTLSize::new(64, 1, 1);
-        enc.dispatch_thread_groups(grid, tg);
-        enc.end_encoding();
+        let grid = MTLSize {
+            width: n_tiles,
+            height: m_tiles,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 64,
+            height: 1,
+            depth: 1,
+        };
+        enc.dispatch_threadgroups(grid, tg);
+        enc.end();
 
         Ok(out)
     } else {
         let partition_stride = m * n;
-        let c_split_size = (k_partitions * partition_stride * std::mem::size_of::<f32>()) as u64;
-        let c_split_buf = dev.new_buffer(c_split_size, opts);
+        let c_split_size = k_partitions * partition_stride * std::mem::size_of::<f32>();
+        let c_split_buf = dev.newBufferWithLength_options(c_split_size, opts).unwrap();
 
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pipeline);
+        let raw_enc = cb.computeCommandEncoder().unwrap();
+
+        let enc = ComputePass::new(&raw_enc);
+        enc.set_pipeline(&pipeline);
         enc.set_buffer(
-            qmm_steel_splitk::X,
+            qmm_steel_splitk::X as u32,
             Some(x.metal_buffer()),
-            x.offset() as u64,
+            x.offset(),
         );
-        enc.set_buffer(qmm_steel_splitk::WEIGHTS, Some(&qw.weights_buf), 0);
-        enc.set_buffer(qmm_steel_splitk::SCALES, Some(&qw.scales_buf), 0);
-        enc.set_buffer(qmm_steel_splitk::BIASES, Some(&qw.biases_buf), 0);
-        enc.set_buffer(qmm_steel_splitk::PARTIAL, Some(&c_split_buf), 0);
-        enc.set_buffer(qmm_steel_splitk::OUT, Some(out.metal_buffer()), 0);
+        enc.set_buffer(qmm_steel_splitk::WEIGHTS as u32, Some(&qw.weights_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::SCALES as u32, Some(&qw.scales_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::BIASES as u32, Some(&qw.biases_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::PARTIAL as u32, Some(&c_split_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::OUT as u32, Some(out.metal_buffer()), 0);
         enc.set_bytes(
-            qmm_steel_splitk::PARAMS,
-            12,
+            qmm_steel_splitk::PARAMS as u32,
             params.as_ptr() as *const std::ffi::c_void,
+            12,
         );
         enc.set_bytes(
-            qmm_steel_splitk::SPLIT_PARAMS,
-            8,
+            qmm_steel_splitk::SPLIT_PARAMS as u32,
             split_params.as_ptr() as *const std::ffi::c_void,
+            8,
         );
-
-        let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, k_partitions as u64);
-        let tg = metal::MTLSize::new(64, 1, 1);
-        enc.dispatch_thread_groups(grid, tg);
-        enc.end_encoding();
+        let grid = MTLSize {
+            width: n_tiles,
+            height: m_tiles,
+            depth: k_partitions,
+        };
+        let tg = MTLSize {
+            width: 64,
+            height: 1,
+            depth: 1,
+        };
+        enc.dispatch_threadgroups(grid, tg);
+        enc.end();
 
         let reduce_pipeline =
             registry.get_pipeline_with_constants("steel_splitk_reduce", DType::Float16, &[])?;
@@ -6696,20 +6889,29 @@ pub fn affine_qmm_steel_splitk_q4_into_cb(
             super::checked_u32(partition_stride, "partition_stride")?,
         ];
 
-        let enc2 = cb.new_compute_command_encoder();
-        enc2.set_compute_pipeline_state(&reduce_pipeline);
-        enc2.set_buffer(qmm_splitk_reduce::PARTIAL, Some(&c_split_buf), 0);
-        enc2.set_buffer(qmm_splitk_reduce::OUT, Some(out.metal_buffer()), 0);
-        enc2.set_bytes(
-            qmm_splitk_reduce::PARAMS,
-            12,
-            reduce_params.as_ptr() as *const std::ffi::c_void,
-        );
+        let raw_enc2 = cb.computeCommandEncoder().unwrap();
 
-        let reduce_grid = metal::MTLSize::new(n as u64, m as u64, 1);
-        let reduce_tg = metal::MTLSize::new(n.min(256) as u64, 1, 1);
+        let enc2 = ComputePass::new(&raw_enc2);
+        enc2.set_pipeline(&reduce_pipeline);
+        enc2.set_buffer(qmm_splitk_reduce::PARTIAL as u32, Some(&c_split_buf), 0);
+        enc2.set_buffer(qmm_splitk_reduce::OUT as u32, Some(out.metal_buffer()), 0);
+        enc2.set_bytes(
+            qmm_splitk_reduce::PARAMS as u32,
+            reduce_params.as_ptr() as *const std::ffi::c_void,
+            12,
+        );
+        let reduce_grid = MTLSize {
+            width: n,
+            height: m,
+            depth: 1,
+        };
+        let reduce_tg = MTLSize {
+            width: n.min(256),
+            height: 1,
+            depth: 1,
+        };
         enc2.dispatch_threads(reduce_grid, reduce_tg);
-        enc2.end_encoding();
+        enc2.end();
 
         Ok(out)
     }
@@ -6726,13 +6928,13 @@ pub fn affine_qmm_steel4sg_splitk_q4_into_cb(
     registry: &KernelRegistry,
     x: &Array,
     qw: &QuantizedWeight,
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
 ) -> Result<Array, KernelError> {
     let m = x.shape()[0];
     let n = qw.out_features;
     let k = qw.in_features;
     let dev = registry.device().raw();
-    let opts = metal::MTLResourceOptions::StorageModeShared;
+    let opts = MTLResourceOptions::StorageModeShared;
 
     const ST_BM: usize = 32;
     const ST_BN: usize = 32;
@@ -6781,69 +6983,87 @@ pub fn affine_qmm_steel4sg_splitk_q4_into_cb(
     let out = Array::uninit(dev, &[m, n], DType::Float16);
 
     if k_partitions == 1 {
-        let dummy_buf = dev.new_buffer(4, opts);
+        let dummy_buf = dev.newBufferWithLength_options(4_usize, opts).unwrap();
 
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pipeline);
+        let raw_enc = cb.computeCommandEncoder().unwrap();
+
+        let enc = ComputePass::new(&raw_enc);
+        enc.set_pipeline(&pipeline);
         enc.set_buffer(
-            qmm_steel_splitk::X,
+            qmm_steel_splitk::X as u32,
             Some(x.metal_buffer()),
-            x.offset() as u64,
+            x.offset(),
         );
-        enc.set_buffer(qmm_steel_splitk::WEIGHTS, Some(&qw.weights_buf), 0);
-        enc.set_buffer(qmm_steel_splitk::SCALES, Some(&qw.scales_buf), 0);
-        enc.set_buffer(qmm_steel_splitk::BIASES, Some(&qw.biases_buf), 0);
-        enc.set_buffer(qmm_steel_splitk::PARTIAL, Some(&dummy_buf), 0);
-        enc.set_buffer(qmm_steel_splitk::OUT, Some(out.metal_buffer()), 0);
+        enc.set_buffer(qmm_steel_splitk::WEIGHTS as u32, Some(&qw.weights_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::SCALES as u32, Some(&qw.scales_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::BIASES as u32, Some(&qw.biases_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::PARTIAL as u32, Some(&dummy_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::OUT as u32, Some(out.metal_buffer()), 0);
         enc.set_bytes(
-            qmm_steel_splitk::PARAMS,
-            12,
+            qmm_steel_splitk::PARAMS as u32,
             params.as_ptr() as *const std::ffi::c_void,
+            12,
         );
         enc.set_bytes(
-            qmm_steel_splitk::SPLIT_PARAMS,
-            8,
+            qmm_steel_splitk::SPLIT_PARAMS as u32,
             split_params.as_ptr() as *const std::ffi::c_void,
+            8,
         );
-
-        let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
-        let tg = metal::MTLSize::new(128, 1, 1);
-        enc.dispatch_thread_groups(grid, tg);
-        enc.end_encoding();
+        let grid = MTLSize {
+            width: n_tiles,
+            height: m_tiles,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 128,
+            height: 1,
+            depth: 1,
+        };
+        enc.dispatch_threadgroups(grid, tg);
+        enc.end();
 
         Ok(out)
     } else {
         let partition_stride = m * n;
-        let c_split_size = (k_partitions * partition_stride * std::mem::size_of::<f32>()) as u64;
-        let c_split_buf = dev.new_buffer(c_split_size, opts);
+        let c_split_size = k_partitions * partition_stride * std::mem::size_of::<f32>();
+        let c_split_buf = dev.newBufferWithLength_options(c_split_size, opts).unwrap();
 
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pipeline);
+        let raw_enc = cb.computeCommandEncoder().unwrap();
+
+        let enc = ComputePass::new(&raw_enc);
+        enc.set_pipeline(&pipeline);
         enc.set_buffer(
-            qmm_steel_splitk::X,
+            qmm_steel_splitk::X as u32,
             Some(x.metal_buffer()),
-            x.offset() as u64,
+            x.offset(),
         );
-        enc.set_buffer(qmm_steel_splitk::WEIGHTS, Some(&qw.weights_buf), 0);
-        enc.set_buffer(qmm_steel_splitk::SCALES, Some(&qw.scales_buf), 0);
-        enc.set_buffer(qmm_steel_splitk::BIASES, Some(&qw.biases_buf), 0);
-        enc.set_buffer(qmm_steel_splitk::PARTIAL, Some(&c_split_buf), 0);
-        enc.set_buffer(qmm_steel_splitk::OUT, Some(out.metal_buffer()), 0);
+        enc.set_buffer(qmm_steel_splitk::WEIGHTS as u32, Some(&qw.weights_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::SCALES as u32, Some(&qw.scales_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::BIASES as u32, Some(&qw.biases_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::PARTIAL as u32, Some(&c_split_buf), 0);
+        enc.set_buffer(qmm_steel_splitk::OUT as u32, Some(out.metal_buffer()), 0);
         enc.set_bytes(
-            qmm_steel_splitk::PARAMS,
-            12,
+            qmm_steel_splitk::PARAMS as u32,
             params.as_ptr() as *const std::ffi::c_void,
+            12,
         );
         enc.set_bytes(
-            qmm_steel_splitk::SPLIT_PARAMS,
-            8,
+            qmm_steel_splitk::SPLIT_PARAMS as u32,
             split_params.as_ptr() as *const std::ffi::c_void,
+            8,
         );
-
-        let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, k_partitions as u64);
-        let tg = metal::MTLSize::new(128, 1, 1);
-        enc.dispatch_thread_groups(grid, tg);
-        enc.end_encoding();
+        let grid = MTLSize {
+            width: n_tiles,
+            height: m_tiles,
+            depth: k_partitions,
+        };
+        let tg = MTLSize {
+            width: 128,
+            height: 1,
+            depth: 1,
+        };
+        enc.dispatch_threadgroups(grid, tg);
+        enc.end();
 
         let reduce_pipeline =
             registry.get_pipeline_with_constants("steel_splitk_reduce", DType::Float16, &[])?;
@@ -6854,20 +7074,29 @@ pub fn affine_qmm_steel4sg_splitk_q4_into_cb(
             super::checked_u32(partition_stride, "partition_stride")?,
         ];
 
-        let enc2 = cb.new_compute_command_encoder();
-        enc2.set_compute_pipeline_state(&reduce_pipeline);
-        enc2.set_buffer(qmm_splitk_reduce::PARTIAL, Some(&c_split_buf), 0);
-        enc2.set_buffer(qmm_splitk_reduce::OUT, Some(out.metal_buffer()), 0);
-        enc2.set_bytes(
-            qmm_splitk_reduce::PARAMS,
-            12,
-            reduce_params.as_ptr() as *const std::ffi::c_void,
-        );
+        let raw_enc2 = cb.computeCommandEncoder().unwrap();
 
-        let reduce_grid = metal::MTLSize::new(n as u64, m as u64, 1);
-        let reduce_tg = metal::MTLSize::new(n.min(256) as u64, 1, 1);
+        let enc2 = ComputePass::new(&raw_enc2);
+        enc2.set_pipeline(&reduce_pipeline);
+        enc2.set_buffer(qmm_splitk_reduce::PARTIAL as u32, Some(&c_split_buf), 0);
+        enc2.set_buffer(qmm_splitk_reduce::OUT as u32, Some(out.metal_buffer()), 0);
+        enc2.set_bytes(
+            qmm_splitk_reduce::PARAMS as u32,
+            reduce_params.as_ptr() as *const std::ffi::c_void,
+            12,
+        );
+        let reduce_grid = MTLSize {
+            width: n,
+            height: m,
+            depth: 1,
+        };
+        let reduce_tg = MTLSize {
+            width: n.min(256),
+            height: 1,
+            depth: 1,
+        };
         enc2.dispatch_threads(reduce_grid, reduce_tg);
-        enc2.end_encoding();
+        enc2.end();
 
         Ok(out)
     }
@@ -6881,7 +7110,7 @@ pub fn affine_quantized_matmul_steel4sg_splitk(
     registry: &KernelRegistry,
     x: &Array,
     qw: &QuantizedWeight,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     let x_native;
     let x = if x.dtype() == DType::Float32 {
@@ -6891,10 +7120,10 @@ pub fn affine_quantized_matmul_steel4sg_splitk(
         x
     };
 
-    let cb = queue.new_command_buffer();
-    let out = affine_qmm_steel4sg_splitk_q4_into_cb(registry, x, qw, cb)?;
+    let cb = queue.commandBuffer().unwrap();
+    let out = affine_qmm_steel4sg_splitk_q4_into_cb(registry, x, qw, &cb)?;
     cb.commit();
-    cb.wait_until_completed();
+    cb.waitUntilCompleted();
     Ok(out)
 }
 
@@ -6921,7 +7150,7 @@ pub fn affine_quantized_matmul_batched(
     registry: &KernelRegistry,
     x: &Array,
     qw: &QuantizedWeight,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     // Validate input
     if x.dtype() != DType::Float32 && x.dtype() != DType::Float16 {
@@ -6955,7 +7184,7 @@ pub fn affine_quantized_matmul_batched(
     let k = qw.in_features;
 
     let dev = registry.device().raw();
-    let opts = metal::MTLResourceOptions::StorageModeShared;
+    let opts = MTLResourceOptions::StorageModeShared;
 
     // For Q4: f16 is the sole native dtype. Cast f32 input to f16 at entry.
     // For Q8: still requires f32 (legacy, no f16 kernel yet).
@@ -7080,118 +7309,141 @@ pub fn affine_quantized_matmul_batched(
                 // No split-K: write directly to output
                 let out = Array::uninit(dev, &[m, n], DType::Float32);
 
-                let cb = queue.new_command_buffer();
-                let enc = cb.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&pipeline);
-                enc.set_buffer(qmm_mma::X, Some(x.metal_buffer()), x.offset() as u64);
-                enc.set_buffer(qmm_mma::WEIGHTS, Some(&qw.weights_buf), 0);
-                enc.set_buffer(qmm_mma::SCALES, Some(&qw.scales_buf), 0);
-                enc.set_buffer(qmm_mma::BIASES, Some(&qw.biases_buf), 0);
-                enc.set_buffer(qmm_mma::OUT, Some(out.metal_buffer()), 0);
+                let cb = queue.commandBuffer().unwrap();
+                let raw_enc = cb.computeCommandEncoder().unwrap();
+                let enc = ComputePass::new(&raw_enc);
+                enc.set_pipeline(&pipeline);
+                enc.set_buffer(qmm_mma::X as u32, Some(x.metal_buffer()), x.offset());
+                enc.set_buffer(qmm_mma::WEIGHTS as u32, Some(&qw.weights_buf), 0);
+                enc.set_buffer(qmm_mma::SCALES as u32, Some(&qw.scales_buf), 0);
+                enc.set_buffer(qmm_mma::BIASES as u32, Some(&qw.biases_buf), 0);
+                enc.set_buffer(qmm_mma::OUT as u32, Some(out.metal_buffer()), 0);
                 enc.set_bytes(
-                    qmm_mma::M,
-                    4,
+                    qmm_mma::M as u32,
                     &m_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
                 );
                 enc.set_bytes(
-                    qmm_mma::N,
-                    4,
+                    qmm_mma::N as u32,
                     &n_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
                 );
                 enc.set_bytes(
-                    qmm_mma::K,
-                    4,
+                    qmm_mma::K as u32,
                     &k_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
                 );
                 enc.set_bytes(
-                    qmm_mma::SWIZZLE_LOG,
-                    4,
+                    qmm_mma::SWIZZLE_LOG as u32,
                     &kp_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
                 );
-
-                let grid = metal::MTLSize::new(tn_tiles as u64, tm_tiles as u64, 1);
-                let tg = metal::MTLSize::new(64, 1, 1);
-                enc.dispatch_thread_groups(grid, tg);
-                enc.end_encoding();
-                super::commit_with_mode(cb, super::ExecMode::Sync);
+                let grid = MTLSize {
+                    width: tn_tiles,
+                    height: tm_tiles,
+                    depth: 1,
+                };
+                let tg = MTLSize {
+                    width: 64,
+                    height: 1,
+                    depth: 1,
+                };
+                enc.dispatch_threadgroups(grid, tg);
+                enc.end();
+                super::commit_with_mode(&cb, super::ExecMode::Sync);
 
                 Ok(out)
             } else {
                 // Split-K: partial sums → reduce
                 let partition_stride = m * n;
-                let c_split_size =
-                    (k_partitions * partition_stride * std::mem::size_of::<f32>()) as u64;
-                let c_split_buf = dev.new_buffer(c_split_size, opts);
+                let c_split_size = k_partitions * partition_stride * std::mem::size_of::<f32>();
+                let c_split_buf = dev.newBufferWithLength_options(c_split_size, opts).unwrap();
                 let out = Array::uninit(dev, &[m, n], DType::Float32);
 
-                let cb = queue.new_command_buffer();
+                let cb = queue.commandBuffer().unwrap();
 
                 // Phase 1: Split-K partial GEMM
-                let enc = cb.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&pipeline);
-                enc.set_buffer(qmm_mma::X, Some(x.metal_buffer()), x.offset() as u64);
-                enc.set_buffer(qmm_mma::WEIGHTS, Some(&qw.weights_buf), 0);
-                enc.set_buffer(qmm_mma::SCALES, Some(&qw.scales_buf), 0);
-                enc.set_buffer(qmm_mma::BIASES, Some(&qw.biases_buf), 0);
-                enc.set_buffer(qmm_mma::OUT, Some(&c_split_buf), 0);
+                let raw_enc = cb.computeCommandEncoder().unwrap();
+                let enc = ComputePass::new(&raw_enc);
+                enc.set_pipeline(&pipeline);
+                enc.set_buffer(qmm_mma::X as u32, Some(x.metal_buffer()), x.offset());
+                enc.set_buffer(qmm_mma::WEIGHTS as u32, Some(&qw.weights_buf), 0);
+                enc.set_buffer(qmm_mma::SCALES as u32, Some(&qw.scales_buf), 0);
+                enc.set_buffer(qmm_mma::BIASES as u32, Some(&qw.biases_buf), 0);
+                enc.set_buffer(qmm_mma::OUT as u32, Some(&c_split_buf), 0);
                 enc.set_bytes(
-                    qmm_mma::M,
-                    4,
+                    qmm_mma::M as u32,
                     &m_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
                 );
                 enc.set_bytes(
-                    qmm_mma::N,
-                    4,
+                    qmm_mma::N as u32,
                     &n_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
                 );
                 enc.set_bytes(
-                    qmm_mma::K,
-                    4,
+                    qmm_mma::K as u32,
                     &k_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
                 );
                 enc.set_bytes(
-                    qmm_mma::SWIZZLE_LOG,
-                    4,
+                    qmm_mma::SWIZZLE_LOG as u32,
                     &kp_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
                 );
-
-                let grid =
-                    metal::MTLSize::new(tn_tiles as u64, tm_tiles as u64, k_partitions as u64);
-                let tg = metal::MTLSize::new(64, 1, 1);
-                enc.dispatch_thread_groups(grid, tg);
-                enc.end_encoding();
+                let grid = MTLSize {
+                    width: tn_tiles,
+                    height: tm_tiles,
+                    depth: k_partitions,
+                };
+                let tg = MTLSize {
+                    width: 64,
+                    height: 1,
+                    depth: 1,
+                };
+                enc.dispatch_threadgroups(grid, tg);
+                enc.end();
 
                 // Phase 2: Reduce (reuse tiny_qmm_reduce from qmm_tiny source)
                 let reduce_pipeline =
                     registry.get_pipeline_with_constants("tiny_qmm_reduce", DType::Float32, &[])?;
                 let mn_total_u32 = super::checked_u32(partition_stride, "mn_total")?;
 
-                let enc2 = cb.new_compute_command_encoder();
-                enc2.set_compute_pipeline_state(&reduce_pipeline);
-                enc2.set_buffer(qmm_tiny_reduce::PARTIAL, Some(&c_split_buf), 0);
-                enc2.set_buffer(qmm_tiny_reduce::OUT, Some(out.metal_buffer()), 0);
+                let raw_enc2 = cb.computeCommandEncoder().unwrap();
+
+                let enc2 = ComputePass::new(&raw_enc2);
+                enc2.set_pipeline(&reduce_pipeline);
+                enc2.set_buffer(qmm_tiny_reduce::PARTIAL as u32, Some(&c_split_buf), 0);
+                enc2.set_buffer(qmm_tiny_reduce::OUT as u32, Some(out.metal_buffer()), 0);
                 enc2.set_bytes(
-                    qmm_tiny_reduce::N,
-                    4,
+                    qmm_tiny_reduce::N as u32,
                     &n_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
                 );
                 enc2.set_bytes(
-                    qmm_tiny_reduce::K_PARTITIONS,
-                    4,
+                    qmm_tiny_reduce::K_PARTITIONS as u32,
                     &kp_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
                 );
                 enc2.set_bytes(
-                    qmm_tiny_reduce::MN_TOTAL,
-                    4,
+                    qmm_tiny_reduce::MN_TOTAL as u32,
                     &mn_total_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
                 );
-
-                let reduce_grid = metal::MTLSize::new(partition_stride as u64, 1, 1);
-                let reduce_tg = metal::MTLSize::new(partition_stride.min(256) as u64, 1, 1);
+                let reduce_grid = MTLSize {
+                    width: partition_stride,
+                    height: 1,
+                    depth: 1,
+                };
+                let reduce_tg = MTLSize {
+                    width: partition_stride.min(256),
+                    height: 1,
+                    depth: 1,
+                };
                 enc2.dispatch_threads(reduce_grid, reduce_tg);
-                enc2.end_encoding();
+                enc2.end();
 
-                super::commit_with_mode(cb, super::ExecMode::Sync);
+                super::commit_with_mode(&cb, super::ExecMode::Sync);
 
                 Ok(out)
             }
@@ -7243,92 +7495,106 @@ pub fn affine_quantized_matmul_batched(
 
                 if k_partitions == 1 {
                     let out = Array::uninit(dev, &[m, n], DType::Float16);
-                    let dummy_buf = dev.new_buffer(4, opts);
+                    let dummy_buf = dev.newBufferWithLength_options(4_usize, opts).unwrap();
 
-                    let cb = queue.new_command_buffer();
-                    let enc = cb.new_compute_command_encoder();
-                    enc.set_compute_pipeline_state(&pipeline);
-                    enc.set_buffer(qmm_skinny::X, Some(x.metal_buffer()), x.offset() as u64);
-                    enc.set_buffer(qmm_skinny::WEIGHTS, Some(&qw.weights_buf), 0);
-                    enc.set_buffer(qmm_skinny::SCALES, Some(&qw.scales_buf), 0);
-                    enc.set_buffer(qmm_skinny::BIASES, Some(&qw.biases_buf), 0);
-                    enc.set_buffer(qmm_skinny::OUT, Some(out.metal_buffer()), 0);
+                    let cb = queue.commandBuffer().unwrap();
+                    let raw_enc = cb.computeCommandEncoder().unwrap();
+                    let enc = ComputePass::new(&raw_enc);
+                    enc.set_pipeline(&pipeline);
+                    enc.set_buffer(qmm_skinny::X as u32, Some(x.metal_buffer()), x.offset());
+                    enc.set_buffer(qmm_skinny::WEIGHTS as u32, Some(&qw.weights_buf), 0);
+                    enc.set_buffer(qmm_skinny::SCALES as u32, Some(&qw.scales_buf), 0);
+                    enc.set_buffer(qmm_skinny::BIASES as u32, Some(&qw.biases_buf), 0);
+                    enc.set_buffer(qmm_skinny::OUT as u32, Some(out.metal_buffer()), 0);
                     enc.set_bytes(
-                        qmm_skinny::M,
-                        4,
+                        qmm_skinny::M as u32,
                         &m_u32 as *const u32 as *const std::ffi::c_void,
+                        4,
                     );
                     enc.set_bytes(
-                        qmm_skinny::N,
-                        4,
+                        qmm_skinny::N as u32,
                         &n_u32 as *const u32 as *const std::ffi::c_void,
+                        4,
                     );
                     enc.set_bytes(
-                        qmm_skinny::K,
-                        4,
+                        qmm_skinny::K as u32,
                         &k_u32 as *const u32 as *const std::ffi::c_void,
+                        4,
                     );
                     enc.set_bytes(
-                        qmm_skinny::K_PARTITIONS,
-                        4,
+                        qmm_skinny::K_PARTITIONS as u32,
                         &kp_u32 as *const u32 as *const std::ffi::c_void,
+                        4,
                     );
                     // f16 kernel has buffer(9) for c_split (unused when k_partitions==1)
-                    enc.set_buffer(qmm_skinny::PARTIAL, Some(&dummy_buf), 0);
-
-                    let grid = metal::MTLSize::new(sn_tiles as u64, sm_tiles as u64, 1);
-                    let tg = metal::MTLSize::new(64, 1, 1);
-                    enc.dispatch_thread_groups(grid, tg);
-                    enc.end_encoding();
-                    super::commit_with_mode(cb, super::ExecMode::Sync);
+                    enc.set_buffer(qmm_skinny::PARTIAL as u32, Some(&dummy_buf), 0);
+                    let grid = MTLSize {
+                        width: sn_tiles,
+                        height: sm_tiles,
+                        depth: 1,
+                    };
+                    let tg = MTLSize {
+                        width: 64,
+                        height: 1,
+                        depth: 1,
+                    };
+                    enc.dispatch_threadgroups(grid, tg);
+                    enc.end();
+                    super::commit_with_mode(&cb, super::ExecMode::Sync);
 
                     Ok(out)
                 } else {
                     // Split-K: partial sums (always float) → f16 reduce → f16 output
                     let partition_stride = m * n;
-                    let c_split_size =
-                        (k_partitions * partition_stride * std::mem::size_of::<f32>()) as u64;
-                    let c_split_buf = dev.new_buffer(c_split_size, opts);
+                    let c_split_size = k_partitions * partition_stride * std::mem::size_of::<f32>();
+                    let c_split_buf = dev.newBufferWithLength_options(c_split_size, opts).unwrap();
                     let out = Array::uninit(dev, &[m, n], DType::Float16);
 
-                    let cb = queue.new_command_buffer();
+                    let cb = queue.commandBuffer().unwrap();
 
                     // f16 skinny: writes float partials to c_split via buffer(9)
-                    let enc = cb.new_compute_command_encoder();
-                    enc.set_compute_pipeline_state(&pipeline);
-                    enc.set_buffer(qmm_skinny::X, Some(x.metal_buffer()), x.offset() as u64);
-                    enc.set_buffer(qmm_skinny::WEIGHTS, Some(&qw.weights_buf), 0);
-                    enc.set_buffer(qmm_skinny::SCALES, Some(&qw.scales_buf), 0);
-                    enc.set_buffer(qmm_skinny::BIASES, Some(&qw.biases_buf), 0);
+                    let raw_enc = cb.computeCommandEncoder().unwrap();
+                    let enc = ComputePass::new(&raw_enc);
+                    enc.set_pipeline(&pipeline);
+                    enc.set_buffer(qmm_skinny::X as u32, Some(x.metal_buffer()), x.offset());
+                    enc.set_buffer(qmm_skinny::WEIGHTS as u32, Some(&qw.weights_buf), 0);
+                    enc.set_buffer(qmm_skinny::SCALES as u32, Some(&qw.scales_buf), 0);
+                    enc.set_buffer(qmm_skinny::BIASES as u32, Some(&qw.biases_buf), 0);
                     // buffer(4) = output (unused for split-K, but must be bound)
-                    enc.set_buffer(qmm_skinny::OUT, Some(out.metal_buffer()), 0);
+                    enc.set_buffer(qmm_skinny::OUT as u32, Some(out.metal_buffer()), 0);
                     enc.set_bytes(
-                        qmm_skinny::M,
-                        4,
+                        qmm_skinny::M as u32,
                         &m_u32 as *const u32 as *const std::ffi::c_void,
+                        4,
                     );
                     enc.set_bytes(
-                        qmm_skinny::N,
-                        4,
+                        qmm_skinny::N as u32,
                         &n_u32 as *const u32 as *const std::ffi::c_void,
+                        4,
                     );
                     enc.set_bytes(
-                        qmm_skinny::K,
-                        4,
+                        qmm_skinny::K as u32,
                         &k_u32 as *const u32 as *const std::ffi::c_void,
+                        4,
                     );
                     enc.set_bytes(
-                        qmm_skinny::K_PARTITIONS,
-                        4,
+                        qmm_skinny::K_PARTITIONS as u32,
                         &kp_u32 as *const u32 as *const std::ffi::c_void,
+                        4,
                     );
-                    enc.set_buffer(qmm_skinny::PARTIAL, Some(&c_split_buf), 0);
-
-                    let grid =
-                        metal::MTLSize::new(sn_tiles as u64, sm_tiles as u64, k_partitions as u64);
-                    let tg = metal::MTLSize::new(64, 1, 1);
-                    enc.dispatch_thread_groups(grid, tg);
-                    enc.end_encoding();
+                    enc.set_buffer(qmm_skinny::PARTIAL as u32, Some(&c_split_buf), 0);
+                    let grid = MTLSize {
+                        width: sn_tiles,
+                        height: sm_tiles,
+                        depth: k_partitions,
+                    };
+                    let tg = MTLSize {
+                        width: 64,
+                        height: 1,
+                        depth: 1,
+                    };
+                    enc.dispatch_threadgroups(grid, tg);
+                    enc.end();
 
                     // f16 reduce: reads float partials, writes half output
                     let reduce_pipeline = registry.get_pipeline_with_constants(
@@ -7338,32 +7604,41 @@ pub fn affine_quantized_matmul_batched(
                     )?;
                     let mn_total_u32 = super::checked_u32(partition_stride, "mn_total")?;
 
-                    let enc2 = cb.new_compute_command_encoder();
-                    enc2.set_compute_pipeline_state(&reduce_pipeline);
-                    enc2.set_buffer(qmm_tiny_reduce::PARTIAL, Some(&c_split_buf), 0);
-                    enc2.set_buffer(qmm_tiny_reduce::OUT, Some(out.metal_buffer()), 0);
+                    let raw_enc2 = cb.computeCommandEncoder().unwrap();
+
+                    let enc2 = ComputePass::new(&raw_enc2);
+                    enc2.set_pipeline(&reduce_pipeline);
+                    enc2.set_buffer(qmm_tiny_reduce::PARTIAL as u32, Some(&c_split_buf), 0);
+                    enc2.set_buffer(qmm_tiny_reduce::OUT as u32, Some(out.metal_buffer()), 0);
                     enc2.set_bytes(
-                        qmm_tiny_reduce::N,
-                        4,
+                        qmm_tiny_reduce::N as u32,
                         &n_u32 as *const u32 as *const std::ffi::c_void,
+                        4,
                     );
                     enc2.set_bytes(
-                        qmm_tiny_reduce::K_PARTITIONS,
-                        4,
+                        qmm_tiny_reduce::K_PARTITIONS as u32,
                         &kp_u32 as *const u32 as *const std::ffi::c_void,
+                        4,
                     );
                     enc2.set_bytes(
-                        qmm_tiny_reduce::MN_TOTAL,
-                        4,
+                        qmm_tiny_reduce::MN_TOTAL as u32,
                         &mn_total_u32 as *const u32 as *const std::ffi::c_void,
+                        4,
                     );
-
-                    let reduce_grid = metal::MTLSize::new(partition_stride as u64, 1, 1);
-                    let reduce_tg = metal::MTLSize::new(partition_stride.min(256) as u64, 1, 1);
+                    let reduce_grid = MTLSize {
+                        width: partition_stride,
+                        height: 1,
+                        depth: 1,
+                    };
+                    let reduce_tg = MTLSize {
+                        width: partition_stride.min(256),
+                        height: 1,
+                        depth: 1,
+                    };
                     enc2.dispatch_threads(reduce_grid, reduce_tg);
-                    enc2.end_encoding();
+                    enc2.end();
 
-                    super::commit_with_mode(cb, super::ExecMode::Sync);
+                    super::commit_with_mode(&cb, super::ExecMode::Sync);
 
                     Ok(out)
                 }
@@ -7393,41 +7668,49 @@ pub fn affine_quantized_matmul_batched(
             let k_u32 = super::checked_u32(k, "K")?;
             let swizzle_log: u32 = if n_tiles >= 4 { 1 } else { 0 };
 
-            let cb = queue.new_command_buffer();
-            let enc = cb.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&pipeline);
-            enc.set_buffer(qmm_mma::X, Some(x.metal_buffer()), x.offset() as u64);
-            enc.set_buffer(qmm_mma::WEIGHTS, Some(&qw.weights_buf), 0);
-            enc.set_buffer(qmm_mma::SCALES, Some(&qw.scales_buf), 0);
-            enc.set_buffer(qmm_mma::BIASES, Some(&qw.biases_buf), 0);
-            enc.set_buffer(qmm_mma::OUT, Some(out.metal_buffer()), 0);
+            let cb = queue.commandBuffer().unwrap();
+            let raw_enc = cb.computeCommandEncoder().unwrap();
+            let enc = ComputePass::new(&raw_enc);
+            enc.set_pipeline(&pipeline);
+            enc.set_buffer(qmm_mma::X as u32, Some(x.metal_buffer()), x.offset());
+            enc.set_buffer(qmm_mma::WEIGHTS as u32, Some(&qw.weights_buf), 0);
+            enc.set_buffer(qmm_mma::SCALES as u32, Some(&qw.scales_buf), 0);
+            enc.set_buffer(qmm_mma::BIASES as u32, Some(&qw.biases_buf), 0);
+            enc.set_buffer(qmm_mma::OUT as u32, Some(out.metal_buffer()), 0);
             enc.set_bytes(
-                qmm_mma::M,
-                4,
+                qmm_mma::M as u32,
                 &m_u32 as *const u32 as *const std::ffi::c_void,
+                4,
             );
             enc.set_bytes(
-                qmm_mma::N,
-                4,
+                qmm_mma::N as u32,
                 &n_u32 as *const u32 as *const std::ffi::c_void,
+                4,
             );
             enc.set_bytes(
-                qmm_mma::K,
-                4,
+                qmm_mma::K as u32,
                 &k_u32 as *const u32 as *const std::ffi::c_void,
+                4,
             );
             enc.set_bytes(
-                qmm_mma::SWIZZLE_LOG,
-                4,
+                qmm_mma::SWIZZLE_LOG as u32,
                 &swizzle_log as *const u32 as *const std::ffi::c_void,
+                4,
             );
+            let grid = MTLSize {
+                width: n_tiles,
+                height: m_tiles,
+                depth: 1,
+            };
+            let tg = MTLSize {
+                width: 64,
+                height: 1,
+                depth: 1,
+            };
 
-            let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
-            let tg = metal::MTLSize::new(64, 1, 1);
-
-            enc.dispatch_thread_groups(grid, tg);
-            enc.end_encoding();
-            super::commit_with_mode(cb, super::ExecMode::Sync);
+            enc.dispatch_threadgroups(grid, tg);
+            enc.end();
+            super::commit_with_mode(&cb, super::ExecMode::Sync);
 
             Ok(out)
         }
@@ -7458,28 +7741,36 @@ pub fn affine_quantized_matmul_batched(
             qw.group_size,
         ];
 
-        let cb = queue.new_command_buffer();
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pipeline);
-        enc.set_buffer(qmm_legacy::X, Some(x.metal_buffer()), x.offset() as u64);
-        enc.set_buffer(qmm_legacy::WEIGHTS, Some(&qw.weights_buf), 0);
-        enc.set_buffer(qmm_legacy::SCALES, Some(&qw.scales_buf), 0);
-        enc.set_buffer(qmm_legacy::BIASES, Some(&qw.biases_buf), 0);
-        enc.set_buffer(qmm_legacy::OUT, Some(out.metal_buffer()), 0);
+        let cb = queue.commandBuffer().unwrap();
+        let raw_enc = cb.computeCommandEncoder().unwrap();
+        let enc = ComputePass::new(&raw_enc);
+        enc.set_pipeline(&pipeline);
+        enc.set_buffer(qmm_legacy::X as u32, Some(x.metal_buffer()), x.offset());
+        enc.set_buffer(qmm_legacy::WEIGHTS as u32, Some(&qw.weights_buf), 0);
+        enc.set_buffer(qmm_legacy::SCALES as u32, Some(&qw.scales_buf), 0);
+        enc.set_buffer(qmm_legacy::BIASES as u32, Some(&qw.biases_buf), 0);
+        enc.set_buffer(qmm_legacy::OUT as u32, Some(out.metal_buffer()), 0);
         enc.set_bytes(
-            qmm_legacy::PARAMS,
-            16,
+            qmm_legacy::PARAMS as u32,
             params.as_ptr() as *const std::ffi::c_void,
+            16,
         );
-
         let q8_m_tiles = m.div_ceil(q8_bm);
         let q8_n_tiles = n.div_ceil(q8_bn);
-        let grid = metal::MTLSize::new(q8_n_tiles as u64, q8_m_tiles as u64, 1);
-        let tg = metal::MTLSize::new(64, 1, 1);
+        let grid = MTLSize {
+            width: q8_n_tiles,
+            height: q8_m_tiles,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: 64,
+            height: 1,
+            depth: 1,
+        };
 
-        enc.dispatch_thread_groups(grid, tg);
-        enc.end_encoding();
-        super::commit_with_mode(cb, super::ExecMode::Sync);
+        enc.dispatch_threadgroups(grid, tg);
+        enc.end();
+        super::commit_with_mode(&cb, super::ExecMode::Sync);
 
         Ok(out)
     };
@@ -7507,7 +7798,7 @@ pub fn affine_quantized_matmul_batched_into_cb(
     registry: &KernelRegistry,
     x: &Array,
     qw: &QuantizedWeight,
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
 ) -> Result<Array, KernelError> {
     // Validate: Q4, Float16, 2D
     if x.dtype() != DType::Float16 {
@@ -7540,7 +7831,7 @@ pub fn affine_quantized_matmul_batched_into_cb(
     let n = qw.out_features;
     let k = qw.in_features;
     let dev = registry.device().raw();
-    let _opts = metal::MTLResourceOptions::StorageModeShared;
+    let _opts = MTLResourceOptions::StorageModeShared;
 
     // Q4 dispatch priority (mirrors affine_quantized_matmul_batched):
     // 1. Steel-4SG: M=32-127, 4 SG hardware MMA + Split-K occupancy
@@ -7595,26 +7886,39 @@ pub fn affine_quantized_matmul_batched_into_cb(
                 qw.bits,
             ];
 
-            let enc = cb.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&pipeline);
-            enc.set_buffer(qmv::WEIGHTS, Some(&qw.weights_buf), 0);
-            enc.set_buffer(qmv::SCALES, Some(&qw.scales_buf), 0);
-            enc.set_buffer(qmv::BIASES, Some(&qw.biases_buf), 0);
-            enc.set_buffer(
-                qmv::INPUT,
-                Some(vec_1d.metal_buffer()),
-                vec_1d.offset() as u64,
-            );
-            enc.set_buffer(qmv::OUTPUT, Some(out.metal_buffer()), 0);
-            enc.set_bytes(qmv::PARAMS, 16, params.as_ptr() as *const std::ffi::c_void);
+            let raw_enc = cb.computeCommandEncoder().unwrap();
 
-            let rows_per_tg: u64 = 8;
-            let num_tgs_y = (qw.out_features as u64).div_ceil(rows_per_tg);
-            enc.dispatch_thread_groups(
-                metal::MTLSize::new(1, num_tgs_y, 1),
-                metal::MTLSize::new(64, 1, 1),
+            let enc = ComputePass::new(&raw_enc);
+            enc.set_pipeline(&pipeline);
+            enc.set_buffer(qmv::WEIGHTS as u32, Some(&qw.weights_buf), 0);
+            enc.set_buffer(qmv::SCALES as u32, Some(&qw.scales_buf), 0);
+            enc.set_buffer(qmv::BIASES as u32, Some(&qw.biases_buf), 0);
+            enc.set_buffer(
+                qmv::INPUT as u32,
+                Some(vec_1d.metal_buffer()),
+                vec_1d.offset(),
             );
-            enc.end_encoding();
+            enc.set_buffer(qmv::OUTPUT as u32, Some(out.metal_buffer()), 0);
+            enc.set_bytes(
+                qmv::PARAMS as u32,
+                params.as_ptr() as *const std::ffi::c_void,
+                16,
+            );
+            let rows_per_tg: usize = 8;
+            let num_tgs_y = qw.out_features.div_ceil(rows_per_tg);
+            enc.dispatch_threadgroups(
+                MTLSize {
+                    width: 1,
+                    height: num_tgs_y,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 64,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            enc.end();
 
             return out.reshape(vec![1, n]);
         } else {
@@ -7629,22 +7933,35 @@ pub fn affine_quantized_matmul_batched_into_cb(
                 super::checked_u32(m, "M")?,
             ];
 
-            let enc = cb.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&pipeline);
-            enc.set_buffer(qmv::WEIGHTS, Some(&qw.weights_buf), 0);
-            enc.set_buffer(qmv::SCALES, Some(&qw.scales_buf), 0);
-            enc.set_buffer(qmv::BIASES, Some(&qw.biases_buf), 0);
-            enc.set_buffer(qmv::INPUT, Some(x.metal_buffer()), x.offset() as u64);
-            enc.set_buffer(qmv::OUTPUT, Some(out.metal_buffer()), 0);
-            enc.set_bytes(qmv::PARAMS, 16, params.as_ptr() as *const std::ffi::c_void);
+            let raw_enc = cb.computeCommandEncoder().unwrap();
 
-            let rows_per_tg: u64 = 8;
-            let num_tgs_y = (n as u64).div_ceil(rows_per_tg);
-            enc.dispatch_thread_groups(
-                metal::MTLSize::new(m as u64, num_tgs_y, 1),
-                metal::MTLSize::new(64, 1, 1),
+            let enc = ComputePass::new(&raw_enc);
+            enc.set_pipeline(&pipeline);
+            enc.set_buffer(qmv::WEIGHTS as u32, Some(&qw.weights_buf), 0);
+            enc.set_buffer(qmv::SCALES as u32, Some(&qw.scales_buf), 0);
+            enc.set_buffer(qmv::BIASES as u32, Some(&qw.biases_buf), 0);
+            enc.set_buffer(qmv::INPUT as u32, Some(x.metal_buffer()), x.offset());
+            enc.set_buffer(qmv::OUTPUT as u32, Some(out.metal_buffer()), 0);
+            enc.set_bytes(
+                qmv::PARAMS as u32,
+                params.as_ptr() as *const std::ffi::c_void,
+                16,
             );
-            enc.end_encoding();
+            let rows_per_tg: usize = 8;
+            let num_tgs_y = n.div_ceil(rows_per_tg);
+            enc.dispatch_threadgroups(
+                MTLSize {
+                    width: m,
+                    height: num_tgs_y,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 64,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            enc.end();
 
             return Ok(out);
         }
@@ -7698,85 +8015,103 @@ pub fn affine_quantized_matmul_batched_into_cb(
 
             if k_partitions == 1 {
                 let out = Array::uninit(dev, &[m, n], DType::Float16);
-                let dummy_buf = dev.new_buffer(4, _opts);
+                let dummy_buf = dev.newBufferWithLength_options(4_usize, _opts).unwrap();
 
-                let enc = cb.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&pipeline);
-                enc.set_buffer(qmm_mma::X, Some(x.metal_buffer()), x.offset() as u64);
-                enc.set_buffer(qmm_mma::WEIGHTS, Some(&qw.weights_buf), 0);
-                enc.set_buffer(qmm_mma::SCALES, Some(&qw.scales_buf), 0);
-                enc.set_buffer(qmm_mma::BIASES, Some(&qw.biases_buf), 0);
-                enc.set_buffer(qmm_mma::OUT, Some(out.metal_buffer()), 0);
+                let raw_enc = cb.computeCommandEncoder().unwrap();
+
+                let enc = ComputePass::new(&raw_enc);
+                enc.set_pipeline(&pipeline);
+                enc.set_buffer(qmm_mma::X as u32, Some(x.metal_buffer()), x.offset());
+                enc.set_buffer(qmm_mma::WEIGHTS as u32, Some(&qw.weights_buf), 0);
+                enc.set_buffer(qmm_mma::SCALES as u32, Some(&qw.scales_buf), 0);
+                enc.set_buffer(qmm_mma::BIASES as u32, Some(&qw.biases_buf), 0);
+                enc.set_buffer(qmm_mma::OUT as u32, Some(out.metal_buffer()), 0);
                 enc.set_bytes(
-                    qmm_mma::M,
-                    4,
+                    qmm_mma::M as u32,
                     &m_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
                 );
                 enc.set_bytes(
-                    qmm_mma::N,
-                    4,
+                    qmm_mma::N as u32,
                     &n_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
                 );
                 enc.set_bytes(
-                    qmm_mma::K,
-                    4,
+                    qmm_mma::K as u32,
                     &k_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
                 );
                 enc.set_bytes(
-                    qmm_mma::SWIZZLE_LOG,
-                    4,
+                    qmm_mma::SWIZZLE_LOG as u32,
                     &kp_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
                 );
-                enc.set_buffer(qmm_skinny::PARTIAL, Some(&dummy_buf), 0);
-
-                let grid = metal::MTLSize::new(sn_tiles as u64, sm_tiles as u64, 1);
-                let tg = metal::MTLSize::new(64, 1, 1);
-                enc.dispatch_thread_groups(grid, tg);
-                enc.end_encoding();
+                enc.set_buffer(qmm_skinny::PARTIAL as u32, Some(&dummy_buf), 0);
+                let grid = MTLSize {
+                    width: sn_tiles,
+                    height: sm_tiles,
+                    depth: 1,
+                };
+                let tg = MTLSize {
+                    width: 64,
+                    height: 1,
+                    depth: 1,
+                };
+                enc.dispatch_threadgroups(grid, tg);
+                enc.end();
 
                 return Ok(out);
             } else {
                 // Split-K: partial sums → reduce, both in same CB
                 let partition_stride = m * n;
-                let c_split_size =
-                    (k_partitions * partition_stride * std::mem::size_of::<f32>()) as u64;
-                let c_split_buf = dev.new_buffer(c_split_size, _opts);
+                let c_split_size = k_partitions * partition_stride * std::mem::size_of::<f32>();
+                let c_split_buf = dev
+                    .newBufferWithLength_options(c_split_size, _opts)
+                    .unwrap();
                 let out = Array::uninit(dev, &[m, n], DType::Float16);
 
-                let enc = cb.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&pipeline);
-                enc.set_buffer(qmm_mma::X, Some(x.metal_buffer()), x.offset() as u64);
-                enc.set_buffer(qmm_mma::WEIGHTS, Some(&qw.weights_buf), 0);
-                enc.set_buffer(qmm_mma::SCALES, Some(&qw.scales_buf), 0);
-                enc.set_buffer(qmm_mma::BIASES, Some(&qw.biases_buf), 0);
-                enc.set_buffer(qmm_mma::OUT, Some(out.metal_buffer()), 0);
-                enc.set_bytes(
-                    qmm_mma::M,
-                    4,
-                    &m_u32 as *const u32 as *const std::ffi::c_void,
-                );
-                enc.set_bytes(
-                    qmm_mma::N,
-                    4,
-                    &n_u32 as *const u32 as *const std::ffi::c_void,
-                );
-                enc.set_bytes(
-                    qmm_mma::K,
-                    4,
-                    &k_u32 as *const u32 as *const std::ffi::c_void,
-                );
-                enc.set_bytes(
-                    qmm_mma::SWIZZLE_LOG,
-                    4,
-                    &kp_u32 as *const u32 as *const std::ffi::c_void,
-                );
-                enc.set_buffer(qmm_skinny::PARTIAL, Some(&c_split_buf), 0);
+                let raw_enc = cb.computeCommandEncoder().unwrap();
 
-                let grid =
-                    metal::MTLSize::new(sn_tiles as u64, sm_tiles as u64, k_partitions as u64);
-                let tg = metal::MTLSize::new(64, 1, 1);
-                enc.dispatch_thread_groups(grid, tg);
-                enc.end_encoding();
+                let enc = ComputePass::new(&raw_enc);
+                enc.set_pipeline(&pipeline);
+                enc.set_buffer(qmm_mma::X as u32, Some(x.metal_buffer()), x.offset());
+                enc.set_buffer(qmm_mma::WEIGHTS as u32, Some(&qw.weights_buf), 0);
+                enc.set_buffer(qmm_mma::SCALES as u32, Some(&qw.scales_buf), 0);
+                enc.set_buffer(qmm_mma::BIASES as u32, Some(&qw.biases_buf), 0);
+                enc.set_buffer(qmm_mma::OUT as u32, Some(out.metal_buffer()), 0);
+                enc.set_bytes(
+                    qmm_mma::M as u32,
+                    &m_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
+                );
+                enc.set_bytes(
+                    qmm_mma::N as u32,
+                    &n_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
+                );
+                enc.set_bytes(
+                    qmm_mma::K as u32,
+                    &k_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
+                );
+                enc.set_bytes(
+                    qmm_mma::SWIZZLE_LOG as u32,
+                    &kp_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
+                );
+                enc.set_buffer(qmm_skinny::PARTIAL as u32, Some(&c_split_buf), 0);
+                let grid = MTLSize {
+                    width: sn_tiles,
+                    height: sm_tiles,
+                    depth: k_partitions,
+                };
+                let tg = MTLSize {
+                    width: 64,
+                    height: 1,
+                    depth: 1,
+                };
+                enc.dispatch_threadgroups(grid, tg);
+                enc.end();
 
                 // Reduce phase
                 let reduce_pipeline = registry.get_pipeline_with_constants(
@@ -7786,30 +8121,39 @@ pub fn affine_quantized_matmul_batched_into_cb(
                 )?;
                 let mn_total_u32 = super::checked_u32(partition_stride, "mn_total")?;
 
-                let enc2 = cb.new_compute_command_encoder();
-                enc2.set_compute_pipeline_state(&reduce_pipeline);
-                enc2.set_buffer(qmm_tiny_reduce::PARTIAL, Some(&c_split_buf), 0);
-                enc2.set_buffer(qmm_tiny_reduce::OUT, Some(out.metal_buffer()), 0);
-                enc2.set_bytes(
-                    qmm_tiny_reduce::N,
-                    4,
-                    &n_u32 as *const u32 as *const std::ffi::c_void,
-                );
-                enc2.set_bytes(
-                    qmm_tiny_reduce::K_PARTITIONS,
-                    4,
-                    &kp_u32 as *const u32 as *const std::ffi::c_void,
-                );
-                enc2.set_bytes(
-                    qmm_tiny_reduce::MN_TOTAL,
-                    4,
-                    &mn_total_u32 as *const u32 as *const std::ffi::c_void,
-                );
+                let raw_enc2 = cb.computeCommandEncoder().unwrap();
 
-                let reduce_grid = metal::MTLSize::new(partition_stride as u64, 1, 1);
-                let reduce_tg = metal::MTLSize::new(partition_stride.min(256) as u64, 1, 1);
+                let enc2 = ComputePass::new(&raw_enc2);
+                enc2.set_pipeline(&reduce_pipeline);
+                enc2.set_buffer(qmm_tiny_reduce::PARTIAL as u32, Some(&c_split_buf), 0);
+                enc2.set_buffer(qmm_tiny_reduce::OUT as u32, Some(out.metal_buffer()), 0);
+                enc2.set_bytes(
+                    qmm_tiny_reduce::N as u32,
+                    &n_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
+                );
+                enc2.set_bytes(
+                    qmm_tiny_reduce::K_PARTITIONS as u32,
+                    &kp_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
+                );
+                enc2.set_bytes(
+                    qmm_tiny_reduce::MN_TOTAL as u32,
+                    &mn_total_u32 as *const u32 as *const std::ffi::c_void,
+                    4,
+                );
+                let reduce_grid = MTLSize {
+                    width: partition_stride,
+                    height: 1,
+                    depth: 1,
+                };
+                let reduce_tg = MTLSize {
+                    width: partition_stride.min(256),
+                    height: 1,
+                    depth: 1,
+                };
                 enc2.dispatch_threads(reduce_grid, reduce_tg);
-                enc2.end_encoding();
+                enc2.end();
 
                 return Ok(out);
             }
@@ -7835,38 +8179,47 @@ pub fn affine_quantized_matmul_batched_into_cb(
     let k_u32 = super::checked_u32(k, "K")?;
     let swizzle_log: u32 = if n_tiles >= 4 { 1 } else { 0 };
 
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(qmm_mma::X, Some(x.metal_buffer()), x.offset() as u64);
-    enc.set_buffer(qmm_mma::WEIGHTS, Some(&qw.weights_buf), 0);
-    enc.set_buffer(qmm_mma::SCALES, Some(&qw.scales_buf), 0);
-    enc.set_buffer(qmm_mma::BIASES, Some(&qw.biases_buf), 0);
-    enc.set_buffer(qmm_mma::OUT, Some(out.metal_buffer()), 0);
-    enc.set_bytes(
-        qmm_mma::M,
-        4,
-        &m_u32 as *const u32 as *const std::ffi::c_void,
-    );
-    enc.set_bytes(
-        qmm_mma::N,
-        4,
-        &n_u32 as *const u32 as *const std::ffi::c_void,
-    );
-    enc.set_bytes(
-        qmm_mma::K,
-        4,
-        &k_u32 as *const u32 as *const std::ffi::c_void,
-    );
-    enc.set_bytes(
-        qmm_mma::SWIZZLE_LOG,
-        4,
-        &swizzle_log as *const u32 as *const std::ffi::c_void,
-    );
+    let raw_enc = cb.computeCommandEncoder().unwrap();
 
-    let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
-    let tg = metal::MTLSize::new(64, 1, 1);
-    enc.dispatch_thread_groups(grid, tg);
-    enc.end_encoding();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
+    enc.set_buffer(qmm_mma::X as u32, Some(x.metal_buffer()), x.offset());
+    enc.set_buffer(qmm_mma::WEIGHTS as u32, Some(&qw.weights_buf), 0);
+    enc.set_buffer(qmm_mma::SCALES as u32, Some(&qw.scales_buf), 0);
+    enc.set_buffer(qmm_mma::BIASES as u32, Some(&qw.biases_buf), 0);
+    enc.set_buffer(qmm_mma::OUT as u32, Some(out.metal_buffer()), 0);
+    enc.set_bytes(
+        qmm_mma::M as u32,
+        &m_u32 as *const u32 as *const std::ffi::c_void,
+        4,
+    );
+    enc.set_bytes(
+        qmm_mma::N as u32,
+        &n_u32 as *const u32 as *const std::ffi::c_void,
+        4,
+    );
+    enc.set_bytes(
+        qmm_mma::K as u32,
+        &k_u32 as *const u32 as *const std::ffi::c_void,
+        4,
+    );
+    enc.set_bytes(
+        qmm_mma::SWIZZLE_LOG as u32,
+        &swizzle_log as *const u32 as *const std::ffi::c_void,
+        4,
+    );
+    let grid = MTLSize {
+        width: n_tiles,
+        height: m_tiles,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: 64,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threadgroups(grid, tg);
+    enc.end();
 
     Ok(out)
 }
@@ -7886,7 +8239,7 @@ pub fn qmm_add_residual_into_cb(
     x: &Array,
     qw: &QuantizedWeight,
     residual: &Array,
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
 ) -> Result<Array, KernelError> {
     use crate::kernels::FunctionConstantValue;
 
@@ -7904,7 +8257,7 @@ pub fn qmm_add_residual_into_cb(
     }
 
     let dev = registry.device().raw();
-    let opts = metal::MTLResourceOptions::StorageModeShared;
+    let opts = MTLResourceOptions::StorageModeShared;
 
     // QLdr single-buffer underperforms MMA — use MMA with residual fusion.
     // TODO: revisit with QLdr double-buffer (8-B').
@@ -7933,48 +8286,58 @@ pub fn qmm_add_residual_into_cb(
     let k_u32 = super::checked_u32(k, "K")?;
     let swizzle_log: u32 = if n_tiles >= 4 { 1 } else { 0 };
 
-    let dummy_buf = dev.new_buffer(4, opts);
+    let dummy_buf = dev.newBufferWithLength_options(4_usize, opts).unwrap();
 
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(qmm_mma::X, Some(x.metal_buffer()), x.offset() as u64);
-    enc.set_buffer(qmm_mma::WEIGHTS, Some(&qw.weights_buf), 0);
-    enc.set_buffer(qmm_mma::SCALES, Some(&qw.scales_buf), 0);
-    enc.set_buffer(qmm_mma::BIASES, Some(&qw.biases_buf), 0);
-    enc.set_buffer(qmm_mma::OUT, Some(out.metal_buffer()), 0);
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
+    enc.set_buffer(qmm_mma::X as u32, Some(x.metal_buffer()), x.offset());
+    enc.set_buffer(qmm_mma::WEIGHTS as u32, Some(&qw.weights_buf), 0);
+    enc.set_buffer(qmm_mma::SCALES as u32, Some(&qw.scales_buf), 0);
+    enc.set_buffer(qmm_mma::BIASES as u32, Some(&qw.biases_buf), 0);
+    enc.set_buffer(qmm_mma::OUT as u32, Some(out.metal_buffer()), 0);
     enc.set_bytes(
-        qmm_mma::M,
-        4,
+        qmm_mma::M as u32,
         &m_u32 as *const u32 as *const std::ffi::c_void,
+        4,
     );
     enc.set_bytes(
-        qmm_mma::N,
-        4,
+        qmm_mma::N as u32,
         &n_u32 as *const u32 as *const std::ffi::c_void,
+        4,
     );
     enc.set_bytes(
-        qmm_mma::K,
-        4,
+        qmm_mma::K as u32,
         &k_u32 as *const u32 as *const std::ffi::c_void,
+        4,
     );
     enc.set_bytes(
-        qmm_mma::SWIZZLE_LOG,
-        4,
+        qmm_mma::SWIZZLE_LOG as u32,
         &swizzle_log as *const u32 as *const std::ffi::c_void,
+        4,
     );
-    enc.set_buffer(qmm_mma::NORM_WEIGHT, Some(&dummy_buf), 0); // norm_weight (unused)
-    enc.set_buffer(qmm_mma::INV_RMS, Some(&dummy_buf), 0); // inv_rms (unused)
+    enc.set_buffer(qmm_mma::NORM_WEIGHT as u32, Some(&dummy_buf), 0); // norm_weight (unused)
+    enc.set_buffer(qmm_mma::INV_RMS as u32, Some(&dummy_buf), 0); // inv_rms (unused)
     enc.set_buffer(
-        qmm_mma::RESIDUAL,
+        qmm_mma::RESIDUAL as u32,
         Some(residual.metal_buffer()),
-        residual.offset() as u64,
+        residual.offset(),
     );
-    enc.set_buffer(qmm_mma::GATE_RESULT, Some(&dummy_buf), 0); // gate_result (unused)
+    enc.set_buffer(qmm_mma::GATE_RESULT as u32, Some(&dummy_buf), 0); // gate_result (unused)
 
-    let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
-    let tg = metal::MTLSize::new(64, 1, 1);
-    enc.dispatch_thread_groups(grid, tg);
-    enc.end_encoding();
+    let grid = MTLSize {
+        width: n_tiles,
+        height: m_tiles,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: 64,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threadgroups(grid, tg);
+    enc.end();
 
     Ok(out)
 }
@@ -7989,7 +8352,7 @@ pub fn qmm_swiglu_into_cb(
     x: &Array,
     qw: &QuantizedWeight,
     gate_result: &Array,
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
 ) -> Result<Array, KernelError> {
     use crate::kernels::FunctionConstantValue;
 
@@ -8007,7 +8370,7 @@ pub fn qmm_swiglu_into_cb(
     }
 
     let dev = registry.device().raw();
-    let opts = metal::MTLResourceOptions::StorageModeShared;
+    let opts = MTLResourceOptions::StorageModeShared;
 
     let std_bm: usize = 64;
     let std_bn: usize = 64;
@@ -8033,48 +8396,57 @@ pub fn qmm_swiglu_into_cb(
     let k_u32 = super::checked_u32(k, "K")?;
     let swizzle_log: u32 = if n_tiles >= 4 { 1 } else { 0 };
 
-    let dummy_buf = dev.new_buffer(4, opts);
+    let dummy_buf = dev.newBufferWithLength_options(4_usize, opts).unwrap();
 
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(qmm_mma::X, Some(x.metal_buffer()), x.offset() as u64);
-    enc.set_buffer(qmm_mma::WEIGHTS, Some(&qw.weights_buf), 0);
-    enc.set_buffer(qmm_mma::SCALES, Some(&qw.scales_buf), 0);
-    enc.set_buffer(qmm_mma::BIASES, Some(&qw.biases_buf), 0);
-    enc.set_buffer(qmm_mma::OUT, Some(out.metal_buffer()), 0);
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
+    enc.set_buffer(qmm_mma::X as u32, Some(x.metal_buffer()), x.offset());
+    enc.set_buffer(qmm_mma::WEIGHTS as u32, Some(&qw.weights_buf), 0);
+    enc.set_buffer(qmm_mma::SCALES as u32, Some(&qw.scales_buf), 0);
+    enc.set_buffer(qmm_mma::BIASES as u32, Some(&qw.biases_buf), 0);
+    enc.set_buffer(qmm_mma::OUT as u32, Some(out.metal_buffer()), 0);
     enc.set_bytes(
-        qmm_mma::M,
-        4,
+        qmm_mma::M as u32,
         &m_u32 as *const u32 as *const std::ffi::c_void,
+        4,
     );
     enc.set_bytes(
-        qmm_mma::N,
-        4,
+        qmm_mma::N as u32,
         &n_u32 as *const u32 as *const std::ffi::c_void,
+        4,
     );
     enc.set_bytes(
-        qmm_mma::K,
-        4,
+        qmm_mma::K as u32,
         &k_u32 as *const u32 as *const std::ffi::c_void,
+        4,
     );
     enc.set_bytes(
-        qmm_mma::SWIZZLE_LOG,
-        4,
+        qmm_mma::SWIZZLE_LOG as u32,
         &swizzle_log as *const u32 as *const std::ffi::c_void,
+        4,
     );
-    enc.set_buffer(qmm_mma::NORM_WEIGHT, Some(&dummy_buf), 0); // norm_weight (unused)
-    enc.set_buffer(qmm_mma::INV_RMS, Some(&dummy_buf), 0); // inv_rms (unused)
-    enc.set_buffer(qmm_mma::RESIDUAL, Some(&dummy_buf), 0); // residual (unused)
+    enc.set_buffer(qmm_mma::NORM_WEIGHT as u32, Some(&dummy_buf), 0); // norm_weight (unused)
+    enc.set_buffer(qmm_mma::INV_RMS as u32, Some(&dummy_buf), 0); // inv_rms (unused)
+    enc.set_buffer(qmm_mma::RESIDUAL as u32, Some(&dummy_buf), 0); // residual (unused)
     enc.set_buffer(
-        qmm_mma::GATE_RESULT,
+        qmm_mma::GATE_RESULT as u32,
         Some(gate_result.metal_buffer()),
-        gate_result.offset() as u64,
+        gate_result.offset(),
     );
-
-    let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
-    let tg = metal::MTLSize::new(64, 1, 1);
-    enc.dispatch_thread_groups(grid, tg);
-    enc.end_encoding();
+    let grid = MTLSize {
+        width: n_tiles,
+        height: m_tiles,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: 64,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threadgroups(grid, tg);
+    enc.end();
 
     Ok(out)
 }
@@ -8146,7 +8518,7 @@ pub fn affine_quantized_matmul_nax(
     registry: &KernelRegistry,
     x: &Array,
     qw: &QuantizedWeight,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     // Ensure f16 input (Q4 native dtype)
     let x_native;
@@ -8157,10 +8529,10 @@ pub fn affine_quantized_matmul_nax(
         x
     };
 
-    let cb = queue.new_command_buffer();
-    let out = affine_qmm_nax_q4_into_cb(registry, x, qw, cb)?;
+    let cb = queue.commandBuffer().unwrap();
+    let out = affine_qmm_nax_q4_into_cb(registry, x, qw, &cb)?;
     cb.commit();
-    cb.wait_until_completed();
+    cb.waitUntilCompleted();
     Ok(out)
 }
 
@@ -8177,7 +8549,7 @@ pub fn affine_qmm_nax_q4_into_cb(
     registry: &KernelRegistry,
     x: &Array,
     qw: &QuantizedWeight,
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
 ) -> Result<Array, KernelError> {
     if x.dtype() != DType::Float16 {
         return Err(KernelError::InvalidShape(format!(
@@ -8238,36 +8610,44 @@ pub fn affine_qmm_nax_q4_into_cb(
     let k_u32 = super::checked_u32(k, "K")?;
 
     // QuantizedWeight natively stores f16 scales/biases — use directly.
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(qmm_nax::X, Some(x.metal_buffer()), x.offset() as u64);
-    enc.set_buffer(qmm_nax::WEIGHTS, Some(&qw.weights_buf), 0);
-    enc.set_buffer(qmm_nax::SCALES, Some(&qw.scales_buf), 0);
-    enc.set_buffer(qmm_nax::BIASES, Some(&qw.biases_buf), 0);
-    enc.set_buffer(qmm_nax::OUT, Some(out.metal_buffer()), 0);
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
+    enc.set_buffer(qmm_nax::X as u32, Some(x.metal_buffer()), x.offset());
+    enc.set_buffer(qmm_nax::WEIGHTS as u32, Some(&qw.weights_buf), 0);
+    enc.set_buffer(qmm_nax::SCALES as u32, Some(&qw.scales_buf), 0);
+    enc.set_buffer(qmm_nax::BIASES as u32, Some(&qw.biases_buf), 0);
+    enc.set_buffer(qmm_nax::OUT as u32, Some(out.metal_buffer()), 0);
     enc.set_bytes(
-        qmm_nax::M,
-        4,
+        qmm_nax::M as u32,
         &m_u32 as *const u32 as *const std::ffi::c_void,
+        4,
     );
     enc.set_bytes(
-        qmm_nax::N,
-        4,
+        qmm_nax::N as u32,
         &n_u32 as *const u32 as *const std::ffi::c_void,
+        4,
     );
     enc.set_bytes(
-        qmm_nax::K,
-        4,
+        qmm_nax::K as u32,
         &k_u32 as *const u32 as *const std::ffi::c_void,
+        4,
     );
-
     // TG memory is statically allocated in the shader (threadgroup half Ws[BN * BK_PAD])
     // No dynamic allocation needed.
 
-    let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
-    let tg = metal::MTLSize::new(128, 1, 1);
-    enc.dispatch_thread_groups(grid, tg);
-    enc.end_encoding();
+    let grid = MTLSize {
+        width: n_tiles,
+        height: m_tiles,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: 128,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threadgroups(grid, tg);
+    enc.end();
 
     Ok(out)
 }
@@ -8289,7 +8669,7 @@ pub fn affine_qmm_nax_v2_q4_into_cb(
     registry: &KernelRegistry,
     x: &Array,
     qw: &QuantizedWeight,
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
 ) -> Result<Array, KernelError> {
     if x.dtype() != DType::Float16 {
         return Err(KernelError::InvalidShape(format!(
@@ -8349,33 +8729,42 @@ pub fn affine_qmm_nax_v2_q4_into_cb(
     let n_u32 = super::checked_u32(n, "N")?;
     let k_u32 = super::checked_u32(k, "K")?;
 
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(qmm_nax::X, Some(x.metal_buffer()), x.offset() as u64);
-    enc.set_buffer(qmm_nax::WEIGHTS, Some(&qw.weights_buf), 0);
-    enc.set_buffer(qmm_nax::SCALES, Some(&qw.scales_buf), 0);
-    enc.set_buffer(qmm_nax::BIASES, Some(&qw.biases_buf), 0);
-    enc.set_buffer(qmm_nax::OUT, Some(out.metal_buffer()), 0);
-    enc.set_bytes(
-        qmm_nax::M,
-        4,
-        &m_u32 as *const u32 as *const std::ffi::c_void,
-    );
-    enc.set_bytes(
-        qmm_nax::N,
-        4,
-        &n_u32 as *const u32 as *const std::ffi::c_void,
-    );
-    enc.set_bytes(
-        qmm_nax::K,
-        4,
-        &k_u32 as *const u32 as *const std::ffi::c_void,
-    );
+    let raw_enc = cb.computeCommandEncoder().unwrap();
 
-    let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
-    let tg = metal::MTLSize::new(128, 1, 1);
-    enc.dispatch_thread_groups(grid, tg);
-    enc.end_encoding();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
+    enc.set_buffer(qmm_nax::X as u32, Some(x.metal_buffer()), x.offset());
+    enc.set_buffer(qmm_nax::WEIGHTS as u32, Some(&qw.weights_buf), 0);
+    enc.set_buffer(qmm_nax::SCALES as u32, Some(&qw.scales_buf), 0);
+    enc.set_buffer(qmm_nax::BIASES as u32, Some(&qw.biases_buf), 0);
+    enc.set_buffer(qmm_nax::OUT as u32, Some(out.metal_buffer()), 0);
+    enc.set_bytes(
+        qmm_nax::M as u32,
+        &m_u32 as *const u32 as *const std::ffi::c_void,
+        4,
+    );
+    enc.set_bytes(
+        qmm_nax::N as u32,
+        &n_u32 as *const u32 as *const std::ffi::c_void,
+        4,
+    );
+    enc.set_bytes(
+        qmm_nax::K as u32,
+        &k_u32 as *const u32 as *const std::ffi::c_void,
+        4,
+    );
+    let grid = MTLSize {
+        width: n_tiles,
+        height: m_tiles,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: 128,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threadgroups(grid, tg);
+    enc.end();
 
     Ok(out)
 }
@@ -8398,7 +8787,7 @@ pub fn affine_quantized_matmul_steel(
     registry: &KernelRegistry,
     x: &Array,
     qw: &QuantizedWeight,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     if x.dtype() != DType::Float32 && x.dtype() != DType::Float16 {
         return Err(KernelError::InvalidShape(format!(
@@ -8431,7 +8820,7 @@ pub fn affine_quantized_matmul_steel(
     let k = qw.in_features;
 
     let dev = registry.device().raw();
-    let opts = metal::MTLResourceOptions::StorageModeShared;
+    let opts = MTLResourceOptions::StorageModeShared;
 
     // --- Step 1: Convert input to half if not already ---
     let x_half = if x.dtype() == DType::Float16 {
@@ -8470,48 +8859,57 @@ pub fn affine_quantized_matmul_steel(
     let k_u32 = super::checked_u32(k, "K")?;
     let swizzle_log: u32 = if n_tiles >= 4 { 1 } else { 0 };
 
-    let dummy_buf = dev.new_buffer(4, opts);
+    let dummy_buf = dev.newBufferWithLength_options(4_usize, opts).unwrap();
 
-    let cb = queue.new_command_buffer();
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
+    let cb = queue.commandBuffer().unwrap();
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
     enc.set_buffer(
-        qmm_steel::X,
+        qmm_steel::X as u32,
         Some(x_half.metal_buffer()),
-        x_half.offset() as u64,
+        x_half.offset(),
     );
-    enc.set_buffer(qmm_steel::WEIGHTS, Some(&qw.weights_buf), 0);
-    enc.set_buffer(qmm_steel::SCALES, Some(&qw.scales_buf), 0);
-    enc.set_buffer(qmm_steel::BIASES, Some(&qw.biases_buf), 0);
-    enc.set_buffer(qmm_steel::OUT, Some(out.metal_buffer()), 0);
+    enc.set_buffer(qmm_steel::WEIGHTS as u32, Some(&qw.weights_buf), 0);
+    enc.set_buffer(qmm_steel::SCALES as u32, Some(&qw.scales_buf), 0);
+    enc.set_buffer(qmm_steel::BIASES as u32, Some(&qw.biases_buf), 0);
+    enc.set_buffer(qmm_steel::OUT as u32, Some(out.metal_buffer()), 0);
     enc.set_bytes(
-        qmm_steel::M,
-        4,
+        qmm_steel::M as u32,
         &m_u32 as *const u32 as *const std::ffi::c_void,
+        4,
     );
     enc.set_bytes(
-        qmm_steel::N,
-        4,
+        qmm_steel::N as u32,
         &n_u32 as *const u32 as *const std::ffi::c_void,
+        4,
     );
     enc.set_bytes(
-        qmm_steel::K,
-        4,
+        qmm_steel::K as u32,
         &k_u32 as *const u32 as *const std::ffi::c_void,
+        4,
     );
     enc.set_bytes(
-        qmm_steel::SWIZZLE_LOG,
-        4,
+        qmm_steel::SWIZZLE_LOG as u32,
         &swizzle_log as *const u32 as *const std::ffi::c_void,
+        4,
     );
-    enc.set_buffer(qmm_steel::RESIDUAL, Some(&dummy_buf), 0); // residual (unused)
-    enc.set_buffer(qmm_steel::GATE_RESULT, Some(&dummy_buf), 0); // gate_result (unused)
+    enc.set_buffer(qmm_steel::RESIDUAL as u32, Some(&dummy_buf), 0); // residual (unused)
+    enc.set_buffer(qmm_steel::GATE_RESULT as u32, Some(&dummy_buf), 0); // gate_result (unused)
 
-    let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
-    let tg = metal::MTLSize::new(64, 1, 1);
-    enc.dispatch_thread_groups(grid, tg);
-    enc.end_encoding();
-    super::commit_with_mode(cb, super::ExecMode::Sync);
+    let grid = MTLSize {
+        width: n_tiles,
+        height: m_tiles,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: 64,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threadgroups(grid, tg);
+    enc.end();
+    super::commit_with_mode(&cb, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -8528,7 +8926,7 @@ pub fn affine_qmm_steel_q4_into_cb(
     registry: &KernelRegistry,
     x: &Array,
     qw: &QuantizedWeight,
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
 ) -> Result<Array, KernelError> {
     if x.dtype() != DType::Float16 {
         return Err(KernelError::InvalidShape(format!(
@@ -8561,7 +8959,7 @@ pub fn affine_qmm_steel_q4_into_cb(
     let k = qw.in_features;
 
     let dev = registry.device().raw();
-    let opts = metal::MTLResourceOptions::StorageModeShared;
+    let opts = MTLResourceOptions::StorageModeShared;
 
     // --- Dispatch steel kernel ---
     const STEEL_BM: usize = 32;
@@ -8593,42 +8991,52 @@ pub fn affine_qmm_steel_q4_into_cb(
     let k_u32 = super::checked_u32(k, "K")?;
     let swizzle_log: u32 = if n_tiles >= 4 { 1 } else { 0 };
 
-    let dummy_buf = dev.new_buffer(4, opts);
+    let dummy_buf = dev.newBufferWithLength_options(4_usize, opts).unwrap();
 
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(qmm_steel::X, Some(x.metal_buffer()), x.offset() as u64);
-    enc.set_buffer(qmm_steel::WEIGHTS, Some(&qw.weights_buf), 0);
-    enc.set_buffer(qmm_steel::SCALES, Some(&qw.scales_buf), 0);
-    enc.set_buffer(qmm_steel::BIASES, Some(&qw.biases_buf), 0);
-    enc.set_buffer(qmm_steel::OUT, Some(out.metal_buffer()), 0);
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
+    enc.set_buffer(qmm_steel::X as u32, Some(x.metal_buffer()), x.offset());
+    enc.set_buffer(qmm_steel::WEIGHTS as u32, Some(&qw.weights_buf), 0);
+    enc.set_buffer(qmm_steel::SCALES as u32, Some(&qw.scales_buf), 0);
+    enc.set_buffer(qmm_steel::BIASES as u32, Some(&qw.biases_buf), 0);
+    enc.set_buffer(qmm_steel::OUT as u32, Some(out.metal_buffer()), 0);
     enc.set_bytes(
-        qmm_steel::M,
-        4,
+        qmm_steel::M as u32,
         &m_u32 as *const u32 as *const std::ffi::c_void,
+        4,
     );
     enc.set_bytes(
-        qmm_steel::N,
-        4,
+        qmm_steel::N as u32,
         &n_u32 as *const u32 as *const std::ffi::c_void,
+        4,
     );
     enc.set_bytes(
-        qmm_steel::K,
-        4,
+        qmm_steel::K as u32,
         &k_u32 as *const u32 as *const std::ffi::c_void,
+        4,
     );
     enc.set_bytes(
-        qmm_steel::SWIZZLE_LOG,
-        4,
+        qmm_steel::SWIZZLE_LOG as u32,
         &swizzle_log as *const u32 as *const std::ffi::c_void,
+        4,
     );
-    enc.set_buffer(qmm_steel::RESIDUAL, Some(&dummy_buf), 0); // residual (unused)
-    enc.set_buffer(qmm_steel::GATE_RESULT, Some(&dummy_buf), 0); // gate_result (unused)
+    enc.set_buffer(qmm_steel::RESIDUAL as u32, Some(&dummy_buf), 0); // residual (unused)
+    enc.set_buffer(qmm_steel::GATE_RESULT as u32, Some(&dummy_buf), 0); // gate_result (unused)
 
-    let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
-    let tg = metal::MTLSize::new(64, 1, 1);
-    enc.dispatch_thread_groups(grid, tg);
-    enc.end_encoding();
+    let grid = MTLSize {
+        width: n_tiles,
+        height: m_tiles,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: 64,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threadgroups(grid, tg);
+    enc.end();
 
     Ok(out)
 }
@@ -8652,7 +9060,7 @@ pub fn affine_quantized_matmul_qldr(
     registry: &KernelRegistry,
     x: &Array,
     qw: &QuantizedWeight,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     if x.dtype() != DType::Float32 {
         return Err(KernelError::InvalidShape(format!(
@@ -8685,7 +9093,7 @@ pub fn affine_quantized_matmul_qldr(
     let k = qw.in_features;
 
     let dev = registry.device().raw();
-    let opts = metal::MTLResourceOptions::StorageModeShared;
+    let opts = MTLResourceOptions::StorageModeShared;
 
     // --- Step 1: Convert f32 input to half ---
     let x_half = crate::ops::copy::copy_cast(registry, x, DType::Float16, queue)?;
@@ -8719,47 +9127,56 @@ pub fn affine_quantized_matmul_qldr(
     let k_u32 = super::checked_u32(k, "K")?;
     let swizzle_log: u32 = if n_tiles >= 4 { 1 } else { 0 };
 
-    let dummy_buf = dev.new_buffer(4, opts);
+    let dummy_buf = dev.newBufferWithLength_options(4_usize, opts).unwrap();
 
-    let cb = queue.new_command_buffer();
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
+    let cb = queue.commandBuffer().unwrap();
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
     enc.set_buffer(
-        qmm_steel::X,
+        qmm_steel::X as u32,
         Some(x_half.metal_buffer()),
-        x_half.offset() as u64,
+        x_half.offset(),
     );
-    enc.set_buffer(qmm_steel::WEIGHTS, Some(&qw.weights_buf), 0);
-    enc.set_buffer(qmm_steel::SCALES, Some(&qw.scales_buf), 0);
-    enc.set_buffer(qmm_steel::BIASES, Some(&qw.biases_buf), 0);
-    enc.set_buffer(qmm_steel::OUT, Some(out.metal_buffer()), 0);
+    enc.set_buffer(qmm_steel::WEIGHTS as u32, Some(&qw.weights_buf), 0);
+    enc.set_buffer(qmm_steel::SCALES as u32, Some(&qw.scales_buf), 0);
+    enc.set_buffer(qmm_steel::BIASES as u32, Some(&qw.biases_buf), 0);
+    enc.set_buffer(qmm_steel::OUT as u32, Some(out.metal_buffer()), 0);
     enc.set_bytes(
-        qmm_steel::M,
-        4,
+        qmm_steel::M as u32,
         &m_u32 as *const u32 as *const std::ffi::c_void,
+        4,
     );
     enc.set_bytes(
-        qmm_steel::N,
-        4,
+        qmm_steel::N as u32,
         &n_u32 as *const u32 as *const std::ffi::c_void,
+        4,
     );
     enc.set_bytes(
-        qmm_steel::K,
-        4,
+        qmm_steel::K as u32,
         &k_u32 as *const u32 as *const std::ffi::c_void,
+        4,
     );
     enc.set_bytes(
-        qmm_steel::SWIZZLE_LOG,
-        4,
+        qmm_steel::SWIZZLE_LOG as u32,
         &swizzle_log as *const u32 as *const std::ffi::c_void,
+        4,
     );
-    enc.set_buffer(qmm_steel::RESIDUAL, Some(&dummy_buf), 0); // residual (unused)
+    enc.set_buffer(qmm_steel::RESIDUAL as u32, Some(&dummy_buf), 0); // residual (unused)
 
-    let grid = metal::MTLSize::new(n_tiles as u64, m_tiles as u64, 1);
-    let tg = metal::MTLSize::new(64, 1, 1);
-    enc.dispatch_thread_groups(grid, tg);
-    enc.end_encoding();
-    super::commit_with_mode(cb, super::ExecMode::Sync);
+    let grid = MTLSize {
+        width: n_tiles,
+        height: m_tiles,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: 64,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threadgroups(grid, tg);
+    enc.end();
+    super::commit_with_mode(&cb, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -8774,7 +9191,7 @@ pub fn affine_quantized_matmul_batched_scalar(
     registry: &KernelRegistry,
     x: &Array,
     qw: &QuantizedWeight,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     // Validate input
     if x.dtype() != DType::Float32 {
@@ -8817,32 +9234,40 @@ pub fn affine_quantized_matmul_batched_scalar(
         qw.group_size,
     ];
 
-    let cb = queue.new_command_buffer();
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(qmm_legacy::X, Some(x.metal_buffer()), x.offset() as u64);
-    enc.set_buffer(qmm_legacy::WEIGHTS, Some(&qw.weights_buf), 0);
-    enc.set_buffer(qmm_legacy::SCALES, Some(&qw.scales_buf), 0);
-    enc.set_buffer(qmm_legacy::BIASES, Some(&qw.biases_buf), 0);
-    enc.set_buffer(qmm_legacy::OUT, Some(out.metal_buffer()), 0);
+    let cb = queue.commandBuffer().unwrap();
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
+    enc.set_buffer(qmm_legacy::X as u32, Some(x.metal_buffer()), x.offset());
+    enc.set_buffer(qmm_legacy::WEIGHTS as u32, Some(&qw.weights_buf), 0);
+    enc.set_buffer(qmm_legacy::SCALES as u32, Some(&qw.scales_buf), 0);
+    enc.set_buffer(qmm_legacy::BIASES as u32, Some(&qw.biases_buf), 0);
+    enc.set_buffer(qmm_legacy::OUT as u32, Some(out.metal_buffer()), 0);
     enc.set_bytes(
-        qmm_legacy::PARAMS,
-        16,
+        qmm_legacy::PARAMS as u32,
         params.as_ptr() as *const std::ffi::c_void,
+        16,
     );
-
     // Legacy tile sizes
     const BM_Q: usize = 16;
     const BN_Q: usize = 16;
 
-    let grid_x = n.div_ceil(BN_Q) as u64;
-    let grid_y = m.div_ceil(BM_Q) as u64;
-    let grid = metal::MTLSize::new(grid_x, grid_y, 1);
-    let tg = metal::MTLSize::new((BM_Q * BN_Q) as u64, 1, 1);
+    let grid_x = n.div_ceil(BN_Q);
+    let grid_y = m.div_ceil(BM_Q);
+    let grid = MTLSize {
+        width: grid_x,
+        height: grid_y,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: (BM_Q * BN_Q),
+        height: 1,
+        depth: 1,
+    };
 
-    enc.dispatch_thread_groups(grid, tg);
-    enc.end_encoding();
-    super::commit_with_mode(cb, super::ExecMode::Sync);
+    enc.dispatch_threadgroups(grid, tg);
+    enc.end();
+    super::commit_with_mode(&cb, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -8949,7 +9374,7 @@ pub fn register_gather_qmm(registry: &KernelRegistry) -> Result<(), KernelError>
 }
 
 /// Ceiling division helper for GatherQMM dispatch.
-fn gather_qmm_ceil_div(a: usize, b: usize) -> usize {
+pub(crate) fn gather_qmm_ceil_div(a: usize, b: usize) -> usize {
     a.div_ceil(b)
 }
 
@@ -8957,35 +9382,31 @@ fn gather_qmm_ceil_div(a: usize, b: usize) -> usize {
 /// Replaced by inline `set_bytes()` in dispatch functions — kept for potential
 /// external callers.
 #[allow(dead_code)]
-fn gather_qmm_u32_buf(device: &metal::DeviceRef, val: u32) -> metal::Buffer {
-    let opts = metal::MTLResourceOptions::StorageModeShared;
-    device.new_buffer_with_data(&val as *const u32 as *const _, 4, opts)
+fn gather_qmm_u32_buf(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    val: u32,
+) -> rmlx_metal::MtlBuffer {
+    let opts = MTLResourceOptions::StorageModeShared;
+    unsafe {
+        device
+            .newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(&val as *const u32 as *const _ as *mut std::ffi::c_void)
+                    .unwrap(),
+                4_usize,
+                opts,
+            )
+            .unwrap()
+    }
 }
 
-/// Index-based quantized matmul for MoE expert dispatch (GatherQMM).
-///
-/// Combines GatherMM (index-based expert selection) with Q4 dequantization.
-/// Each batch element selects an expert's Q4-packed weight matrix via `indices`,
-/// and computes the dequantized matmul in a single fused kernel.
-///
-/// # Arguments
-/// - `x`: f32 input activations `[batch, m_per_batch, k]`
-/// - `qw`: Q4 quantized expert weights (n_experts sets of weights)
-/// - `indices`: expert index per batch element `[batch]` (UInt32)
-/// - `n_experts`: number of expert weight sets
-/// - `m_per_batch`: rows per batch element
-/// - `n`: output columns per expert
-/// - `k`: inner dimension (input features)
-///
-/// # Returns
-/// f32 output `[batch, m_per_batch, n]`.
+/// Index-based quantized matmul for MoE expert dispatch (GatherQMM). /// /// Combines GatherMM (index-based expert selection) with Q4 dequantization. /// Each batch element selects an expert's Q4-packed weight matrix via `indices`, /// and computes the dequantized matmul in a single fused kernel. /// /// # Arguments /// - `x`: f32 input activations `[batch, m_per_batch, k]` /// - `qw`: Q4 quantized expert weights (n_experts sets of weights) /// - `indices`: expert index per batch element `[batch]` (UInt32) /// - `n_experts`: number of expert weight sets /// - `m_per_batch`: rows per batch element /// - `n`: output columns per expert /// - `k`: inner dimension (input features) /// /// # Returns /// f32 output `[batch, m_per_batch, n]`.
 #[allow(clippy::too_many_arguments)]
 pub fn gather_qmm(
     registry: &KernelRegistry,
     x: &Array,
-    w_packed_buf: &metal::Buffer,
-    scales_buf: &metal::Buffer,
-    biases_buf: &metal::Buffer,
+    w_packed_buf: &rmlx_metal::MtlBuffer,
+    scales_buf: &rmlx_metal::MtlBuffer,
+    biases_buf: &rmlx_metal::MtlBuffer,
     indices: &Array,
     batch: usize,
     m_per_batch: usize,
@@ -8993,10 +9414,10 @@ pub fn gather_qmm(
     k: usize,
     n_experts: usize,
     group_size: u32,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
-    // --- dtype validation ---
-    // TODO: add f16 gather_qmm kernel. Currently f32-only; callers with f16 input
+    // --- dtype validation --- // TODO: add f16 gather_qmm kernel. Currently f32-only; callers with f16 input
+
     // must cast to f32 before calling this function.
     if x.dtype() != DType::Float32 {
         return Err(KernelError::InvalidShape(format!(
@@ -9064,7 +9485,7 @@ pub fn gather_qmm(
     let half_k = k / 2;
     let groups_per_row = k / (group_size as usize);
     let expected_w_bytes = n_experts * n * half_k;
-    if (w_packed_buf.length() as usize) < expected_w_bytes {
+    if w_packed_buf.length() < expected_w_bytes {
         return Err(KernelError::InvalidShape(format!(
             "gather_qmm: w_packed_buf too small: {} bytes < expected {} bytes \
              (n_experts={n_experts}, N={n}, K/2={half_k})",
@@ -9073,7 +9494,7 @@ pub fn gather_qmm(
         )));
     }
     let expected_scales_bytes = n_experts * n * groups_per_row * 2; // float16
-    if (scales_buf.length() as usize) < expected_scales_bytes {
+    if scales_buf.length() < expected_scales_bytes {
         return Err(KernelError::InvalidShape(format!(
             "gather_qmm: scales_buf too small: {} bytes < expected {} bytes \
              (n_experts={n_experts}, N={n}, groups_per_row={groups_per_row})",
@@ -9081,7 +9502,7 @@ pub fn gather_qmm(
             expected_scales_bytes,
         )));
     }
-    if (biases_buf.length() as usize) < expected_scales_bytes {
+    if biases_buf.length() < expected_scales_bytes {
         return Err(KernelError::InvalidShape(format!(
             "gather_qmm: biases_buf too small: {} bytes < expected {} bytes \
              (n_experts={n_experts}, N={n}, groups_per_row={groups_per_row})",
@@ -9112,63 +9533,67 @@ pub fn gather_qmm(
     let k_u32 = super::checked_u32(k, "K")?;
     let ne_u32 = super::checked_u32(n_experts, "n_experts")?;
 
-    let cb = queue.new_command_buffer();
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(gather_qmm::X, Some(x.metal_buffer()), x.offset() as u64);
-    enc.set_buffer(gather_qmm::WEIGHTS, Some(w_packed_buf), 0);
-    enc.set_buffer(gather_qmm::SCALES, Some(scales_buf), 0);
-    enc.set_buffer(gather_qmm::BIASES, Some(biases_buf), 0);
+    let cb = queue.commandBuffer().unwrap();
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
+    enc.set_buffer(gather_qmm::X as u32, Some(x.metal_buffer()), x.offset());
+    enc.set_buffer(gather_qmm::WEIGHTS as u32, Some(w_packed_buf), 0);
+    enc.set_buffer(gather_qmm::SCALES as u32, Some(scales_buf), 0);
+    enc.set_buffer(gather_qmm::BIASES as u32, Some(biases_buf), 0);
     enc.set_buffer(
-        gather_qmm::INDICES,
+        gather_qmm::INDICES as u32,
         Some(indices.metal_buffer()),
-        indices.offset() as u64,
+        indices.offset(),
     );
-    enc.set_buffer(gather_qmm::OUT, Some(out.metal_buffer()), 0);
+    enc.set_buffer(gather_qmm::OUT as u32, Some(out.metal_buffer()), 0);
     enc.set_bytes(
-        gather_qmm::BATCH,
-        4,
+        gather_qmm::BATCH as u32,
         &batch_u32 as *const u32 as *const std::ffi::c_void,
+        4,
     );
     enc.set_bytes(
-        gather_qmm::M,
-        4,
+        gather_qmm::M as u32,
         &m_u32 as *const u32 as *const std::ffi::c_void,
+        4,
     );
     enc.set_bytes(
-        gather_qmm::N,
-        4,
+        gather_qmm::N as u32,
         &n_u32 as *const u32 as *const std::ffi::c_void,
+        4,
     );
     enc.set_bytes(
-        gather_qmm::K,
-        4,
+        gather_qmm::K as u32,
         &k_u32 as *const u32 as *const std::ffi::c_void,
+        4,
     );
     enc.set_bytes(
-        gather_qmm::GROUP_SIZE,
-        4,
+        gather_qmm::GROUP_SIZE as u32,
         &group_size as *const u32 as *const std::ffi::c_void,
+        4,
     );
     enc.set_bytes(
-        gather_qmm::N_EXPERTS,
-        4,
+        gather_qmm::N_EXPERTS as u32,
         &ne_u32 as *const u32 as *const std::ffi::c_void,
+        4,
     );
-
     const BM_GQ: usize = 16;
     const BN_GQ: usize = 16;
 
-    let grid = metal::MTLSize::new(
-        gather_qmm_ceil_div(n, BN_GQ) as u64,
-        gather_qmm_ceil_div(m_per_batch, BM_GQ) as u64,
-        batch as u64,
-    );
-    let tg = metal::MTLSize::new((BM_GQ * BN_GQ) as u64, 1, 1);
+    let grid = MTLSize {
+        width: gather_qmm_ceil_div(n, BN_GQ),
+        height: gather_qmm_ceil_div(m_per_batch, BM_GQ),
+        depth: batch,
+    };
+    let tg = MTLSize {
+        width: (BM_GQ * BN_GQ),
+        height: 1,
+        depth: 1,
+    };
 
-    enc.dispatch_thread_groups(grid, tg);
-    enc.end_encoding();
-    super::commit_with_mode(cb, super::ExecMode::Sync);
+    enc.dispatch_threadgroups(grid, tg);
+    enc.end();
+    super::commit_with_mode(&cb, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -9450,16 +9875,16 @@ pub fn register_gather_qmv(registry: &KernelRegistry) -> Result<(), KernelError>
 pub fn gather_qmv_fast_q4(
     registry: &KernelRegistry,
     x: &Array,
-    w_packed_buf: &metal::Buffer,
-    scales_buf: &metal::Buffer,
-    biases_buf: &metal::Buffer,
+    w_packed_buf: &rmlx_metal::MtlBuffer,
+    scales_buf: &rmlx_metal::MtlBuffer,
+    biases_buf: &rmlx_metal::MtlBuffer,
     indices: &Array,
     batch: usize,
     n: usize,
     k: usize,
     n_experts: usize,
     group_size: u32,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     // --- dtype validation ---
     if x.dtype() != DType::Float32 {
@@ -9535,7 +9960,7 @@ pub fn gather_qmv_fast_q4(
     let k_div_pack = k / pack_factor;
     let groups_per_row = k / (group_size as usize);
     let expected_w_bytes = n_experts * n * k_div_pack * 4; // uint32 per pack
-    if (w_packed_buf.length() as usize) < expected_w_bytes {
+    if w_packed_buf.length() < expected_w_bytes {
         return Err(KernelError::InvalidShape(format!(
             "gather_qmv_fast_q4: w_packed_buf too small: {} bytes < expected {} bytes \
              (n_experts={n_experts}, N={n}, K/8={k_div_pack})",
@@ -9544,7 +9969,7 @@ pub fn gather_qmv_fast_q4(
         )));
     }
     let expected_scales_bytes = n_experts * n * groups_per_row * 2; // float16
-    if (scales_buf.length() as usize) < expected_scales_bytes {
+    if scales_buf.length() < expected_scales_bytes {
         return Err(KernelError::InvalidShape(format!(
             "gather_qmv_fast_q4: scales_buf too small: {} bytes < expected {} bytes \
              (n_experts={n_experts}, N={n}, groups_per_row={groups_per_row})",
@@ -9552,7 +9977,7 @@ pub fn gather_qmv_fast_q4(
             expected_scales_bytes,
         )));
     }
-    if (biases_buf.length() as usize) < expected_scales_bytes {
+    if biases_buf.length() < expected_scales_bytes {
         return Err(KernelError::InvalidShape(format!(
             "gather_qmv_fast_q4: biases_buf too small: {} bytes < expected {} bytes \
              (n_experts={n_experts}, N={n}, groups_per_row={groups_per_row})",
@@ -9585,36 +10010,44 @@ pub fn gather_qmv_fast_q4(
         super::checked_u32(batch, "batch")?,
     ];
 
-    let cb = queue.new_command_buffer();
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(gather_qmv::X, Some(x.metal_buffer()), x.offset() as u64);
-    enc.set_buffer(gather_qmv::WEIGHTS, Some(w_packed_buf), 0);
-    enc.set_buffer(gather_qmv::SCALES, Some(scales_buf), 0);
-    enc.set_buffer(gather_qmv::BIASES, Some(biases_buf), 0);
+    let cb = queue.commandBuffer().unwrap();
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
+    enc.set_buffer(gather_qmv::X as u32, Some(x.metal_buffer()), x.offset());
+    enc.set_buffer(gather_qmv::WEIGHTS as u32, Some(w_packed_buf), 0);
+    enc.set_buffer(gather_qmv::SCALES as u32, Some(scales_buf), 0);
+    enc.set_buffer(gather_qmv::BIASES as u32, Some(biases_buf), 0);
     enc.set_buffer(
-        gather_qmv::INDICES,
+        gather_qmv::INDICES as u32,
         Some(indices.metal_buffer()),
-        indices.offset() as u64,
+        indices.offset(),
     );
-    enc.set_buffer(gather_qmv::OUT, Some(out.metal_buffer()), 0);
+    enc.set_buffer(gather_qmv::OUT as u32, Some(out.metal_buffer()), 0);
     enc.set_bytes(
-        gather_qmv::PARAMS,
-        16,
+        gather_qmv::PARAMS as u32,
         params.as_ptr() as *const std::ffi::c_void,
+        16,
     );
-
     // Grid: (batch, ceil(N/8), 1) — one TG per batch element x output-row tile
     let rows_per_tg: usize = 8; // NUM_SIMDGROUPS(2) * RESULTS_PER_SG(4)
     let num_tgs_y = n.div_ceil(rows_per_tg);
-    let tg_size: u64 = 64; // 2 simdgroups x 32 lanes
+    let tg_size: usize = 64; // 2 simdgroups x 32 lanes
 
-    let grid = metal::MTLSize::new(batch as u64, num_tgs_y as u64, 1);
-    let tg = metal::MTLSize::new(tg_size, 1, 1);
+    let grid = MTLSize {
+        width: batch,
+        height: num_tgs_y,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: tg_size,
+        height: 1,
+        depth: 1,
+    };
 
-    enc.dispatch_thread_groups(grid, tg);
-    enc.end_encoding();
-    super::commit_with_mode(cb, super::ExecMode::Sync);
+    enc.dispatch_threadgroups(grid, tg);
+    enc.end();
+    super::commit_with_mode(&cb, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -9628,16 +10061,16 @@ pub fn gather_qmv_fast_q4(
 pub fn gather_qmv_fast_f16_q4(
     registry: &KernelRegistry,
     x: &Array,
-    w_packed_buf: &metal::Buffer,
-    scales_buf: &metal::Buffer,
-    biases_buf: &metal::Buffer,
+    w_packed_buf: &rmlx_metal::MtlBuffer,
+    scales_buf: &rmlx_metal::MtlBuffer,
+    biases_buf: &rmlx_metal::MtlBuffer,
     indices: &Array,
     batch: usize,
     n: usize,
     k: usize,
     n_experts: usize,
     group_size: u32,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     // --- dtype validation ---
     if x.dtype() != DType::Float16 {
@@ -9712,7 +10145,7 @@ pub fn gather_qmv_fast_f16_q4(
     let k_div_pack = k / pack_factor;
     let groups_per_row = k / (group_size as usize);
     let expected_w_bytes = n_experts * n * k_div_pack * 4;
-    if (w_packed_buf.length() as usize) < expected_w_bytes {
+    if w_packed_buf.length() < expected_w_bytes {
         return Err(KernelError::InvalidShape(format!(
             "gather_qmv_fast_f16_q4: w_packed_buf too small: {} bytes < expected {} bytes \
              (n_experts={n_experts}, N={n}, K/8={k_div_pack})",
@@ -9721,7 +10154,7 @@ pub fn gather_qmv_fast_f16_q4(
         )));
     }
     let expected_scales_bytes = n_experts * n * groups_per_row * 2; // float16
-    if (scales_buf.length() as usize) < expected_scales_bytes {
+    if scales_buf.length() < expected_scales_bytes {
         return Err(KernelError::InvalidShape(format!(
             "gather_qmv_fast_f16_q4: scales_buf too small: {} bytes < expected {} bytes \
              (n_experts={n_experts}, N={n}, groups_per_row={groups_per_row})",
@@ -9729,7 +10162,7 @@ pub fn gather_qmv_fast_f16_q4(
             expected_scales_bytes,
         )));
     }
-    if (biases_buf.length() as usize) < expected_scales_bytes {
+    if biases_buf.length() < expected_scales_bytes {
         return Err(KernelError::InvalidShape(format!(
             "gather_qmv_fast_f16_q4: biases_buf too small: {} bytes < expected {} bytes \
              (n_experts={n_experts}, N={n}, groups_per_row={groups_per_row})",
@@ -9761,35 +10194,43 @@ pub fn gather_qmv_fast_f16_q4(
         super::checked_u32(batch, "batch")?,
     ];
 
-    let cb = queue.new_command_buffer();
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(gather_qmv::X, Some(x.metal_buffer()), x.offset() as u64);
-    enc.set_buffer(gather_qmv::WEIGHTS, Some(w_packed_buf), 0);
-    enc.set_buffer(gather_qmv::SCALES, Some(scales_buf), 0);
-    enc.set_buffer(gather_qmv::BIASES, Some(biases_buf), 0);
+    let cb = queue.commandBuffer().unwrap();
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
+    enc.set_buffer(gather_qmv::X as u32, Some(x.metal_buffer()), x.offset());
+    enc.set_buffer(gather_qmv::WEIGHTS as u32, Some(w_packed_buf), 0);
+    enc.set_buffer(gather_qmv::SCALES as u32, Some(scales_buf), 0);
+    enc.set_buffer(gather_qmv::BIASES as u32, Some(biases_buf), 0);
     enc.set_buffer(
-        gather_qmv::INDICES,
+        gather_qmv::INDICES as u32,
         Some(indices.metal_buffer()),
-        indices.offset() as u64,
+        indices.offset(),
     );
-    enc.set_buffer(gather_qmv::OUT, Some(out.metal_buffer()), 0);
+    enc.set_buffer(gather_qmv::OUT as u32, Some(out.metal_buffer()), 0);
     enc.set_bytes(
-        gather_qmv::PARAMS,
-        16,
+        gather_qmv::PARAMS as u32,
         params.as_ptr() as *const std::ffi::c_void,
+        16,
     );
-
     let rows_per_tg: usize = 8; // NUM_SIMDGROUPS(2) * RESULTS_PER_SG(4)
     let num_tgs_y = n.div_ceil(rows_per_tg);
-    let tg_size: u64 = 64; // 2 simdgroups x 32 lanes
+    let tg_size: usize = 64; // 2 simdgroups x 32 lanes
 
-    let grid = metal::MTLSize::new(batch as u64, num_tgs_y as u64, 1);
-    let tg = metal::MTLSize::new(tg_size, 1, 1);
+    let grid = MTLSize {
+        width: batch,
+        height: num_tgs_y,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: tg_size,
+        height: 1,
+        depth: 1,
+    };
 
-    enc.dispatch_thread_groups(grid, tg);
-    enc.end_encoding();
-    super::commit_with_mode(cb, super::ExecMode::Sync);
+    enc.dispatch_threadgroups(grid, tg);
+    enc.end();
+    super::commit_with_mode(&cb, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -9818,7 +10259,7 @@ pub fn moe_expert_matmul_q4(
     x: &Array,
     expert_weights: &[QuantizedWeight],
     indices: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     if expert_weights.is_empty() {
         return Err(KernelError::InvalidShape(
@@ -9862,7 +10303,7 @@ pub fn moe_expert_matmul_q4(
 
     // Pack all expert weights into contiguous [n_experts, N, K/8] buffer
     let dev = registry.device().raw();
-    let opts = metal::MTLResourceOptions::StorageModeShared;
+    let opts = MTLResourceOptions::StorageModeShared;
 
     let w_bytes_per_expert = n * k_div_pack * 4; // uint32 per pack element
     let s_bytes_per_expert = n * groups_per_row * 2; // float16
@@ -9870,9 +10311,15 @@ pub fn moe_expert_matmul_q4(
     let total_w_bytes = n_experts * w_bytes_per_expert;
     let total_s_bytes = n_experts * s_bytes_per_expert;
 
-    let packed_w = dev.new_buffer(total_w_bytes as u64, opts);
-    let packed_s = dev.new_buffer(total_s_bytes as u64, opts);
-    let packed_b = dev.new_buffer(total_s_bytes as u64, opts);
+    let packed_w = dev
+        .newBufferWithLength_options(total_w_bytes as u64 as usize, opts)
+        .unwrap();
+    let packed_s = dev
+        .newBufferWithLength_options(total_s_bytes as u64 as usize, opts)
+        .unwrap();
+    let packed_b = dev
+        .newBufferWithLength_options(total_s_bytes as u64 as usize, opts)
+        .unwrap();
 
     // Copy each expert's buffers into the packed contiguous buffers.
     //
@@ -9880,14 +10327,14 @@ pub fn moe_expert_matmul_q4(
     // and validated above. The destination buffers are freshly allocated with
     // the exact required size. Pointer arithmetic stays within bounds.
     unsafe {
-        let w_dst = packed_w.contents() as *mut u8;
-        let s_dst = packed_s.contents() as *mut u8;
-        let b_dst = packed_b.contents() as *mut u8;
+        let w_dst = packed_w.contents().as_ptr() as *mut u8;
+        let s_dst = packed_s.contents().as_ptr() as *mut u8;
+        let b_dst = packed_b.contents().as_ptr() as *mut u8;
 
         for (i, ew) in expert_weights.iter().enumerate() {
-            let w_src = ew.weights_buf.contents() as *const u8;
-            let s_src = ew.scales_buf.contents() as *const u8;
-            let b_src = ew.biases_buf.contents() as *const u8;
+            let w_src = ew.weights_buf.contents().as_ptr() as *const u8;
+            let s_src = ew.scales_buf.contents().as_ptr() as *const u8;
+            let b_src = ew.biases_buf.contents().as_ptr() as *const u8;
 
             std::ptr::copy_nonoverlapping(
                 w_src,
@@ -9940,7 +10387,7 @@ pub fn quantized_matmul(
     vec: &Array,
     out_features: usize,
     in_features: usize,
-    _queue: &metal::CommandQueue,
+    _queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     let _kernel_name = match weights.dtype() {
         DType::Q8_0 => "qmv_q8_0_f32",
@@ -9984,7 +10431,7 @@ pub fn quantized_matmul(
         .dtype()
         .numel_to_bytes(out_features * in_features)
         .map_err(|e| KernelError::InvalidShape(e.to_string()))?;
-    let available_bytes = weights.metal_buffer().length() as usize - weights.offset();
+    let available_bytes = weights.metal_buffer().length() - weights.offset();
     if available_bytes < expected_weight_bytes {
         return Err(KernelError::InvalidShape(format!(
             "weights buffer too small: {} available bytes (buffer {} - offset {}) < expected {} bytes for [{out_features}, {in_features}] {:?}",
@@ -9994,7 +10441,7 @@ pub fn quantized_matmul(
 
     // Validate vec buffer has enough space at its offset
     let vec_needed = in_features * DType::Float32.size_of();
-    let vec_available = vec.metal_buffer().length() as usize - vec.offset();
+    let vec_available = vec.metal_buffer().length() - vec.offset();
     if vec_available < vec_needed {
         return Err(KernelError::InvalidShape(format!(
             "vec buffer too small: {} available bytes (buffer {} - offset {}) < expected {} bytes",
@@ -10557,17 +11004,17 @@ mod tests {
     /// Helper: set up Metal device, registry, queue, and valid gather_qmm inputs.
     /// Returns (registry, x, w_packed_buf, scales_buf, biases_buf, indices, queue)
     /// with valid dimensions: batch=2, m_per_batch=1, n=4, k=32, n_experts=2, group_size=32.
-    fn setup_gather_qmm_valid() -> (
+    fn setup_gather_qmm_valid() -> Option<(
         KernelRegistry,
         Array,
-        metal::Buffer,
-        metal::Buffer,
-        metal::Buffer,
+        rmlx_metal::MtlBuffer,
+        rmlx_metal::MtlBuffer,
+        rmlx_metal::MtlBuffer,
         Array,
-        metal::CommandQueue,
-    ) {
-        let gpu_dev = rmlx_metal::device::GpuDevice::system_default().unwrap();
-        let queue = gpu_dev.raw().new_command_queue();
+        rmlx_metal::MtlQueue,
+    )> {
+        let gpu_dev = crate::test_utils::test_gpu()?;
+        let queue = gpu_dev.new_command_queue();
         let registry = KernelRegistry::new(gpu_dev);
         register_gather_qmm(&registry).unwrap();
 
@@ -10589,24 +11036,45 @@ mod tests {
         // w_packed: n_experts * n * half_k bytes
         let w_bytes = n_experts * n * half_k;
         let w_data = vec![0x77u8; w_bytes];
-        let opts = metal::MTLResourceOptions::StorageModeShared;
-        let w_packed_buf =
-            dev.new_buffer_with_data(w_data.as_ptr() as *const _, w_bytes as u64, opts);
+        let opts = MTLResourceOptions::StorageModeShared;
+        let w_packed_buf = unsafe {
+            dev.newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(w_data.as_ptr() as *const _ as *mut std::ffi::c_void)
+                    .unwrap(),
+                w_bytes as u64 as usize,
+                opts,
+            )
+            .unwrap()
+        };
 
         // scales & biases: n_experts * n * groups_per_row as f16
         let sb_elems = n_experts * n * groups_per_row;
         let scales_f16: Vec<u16> = vec![f32_to_f16_bits(1.0); sb_elems];
         let biases_f16: Vec<u16> = vec![f32_to_f16_bits(0.0); sb_elems];
         let sb_bytes = sb_elems * 2; // f16 = 2 bytes
-        let scales_buf =
-            dev.new_buffer_with_data(scales_f16.as_ptr() as *const _, sb_bytes as u64, opts);
-        let biases_buf =
-            dev.new_buffer_with_data(biases_f16.as_ptr() as *const _, sb_bytes as u64, opts);
+        let scales_buf = unsafe {
+            dev.newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(scales_f16.as_ptr() as *const _ as *mut std::ffi::c_void)
+                    .unwrap(),
+                sb_bytes as u64 as usize,
+                opts,
+            )
+            .unwrap()
+        };
+        let biases_buf = unsafe {
+            dev.newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(biases_f16.as_ptr() as *const _ as *mut std::ffi::c_void)
+                    .unwrap(),
+                sb_bytes as u64 as usize,
+                opts,
+            )
+            .unwrap()
+        };
 
         let idx_data = vec![0u32, 1];
         let indices = Array::from_slice(dev, &idx_data, vec![batch]);
 
-        (
+        Some((
             registry,
             x,
             w_packed_buf,
@@ -10614,13 +11082,17 @@ mod tests {
             biases_buf,
             indices,
             queue,
-        )
+        ))
     }
 
     #[test]
     fn test_gather_qmm_valid_inputs() {
-        let (registry, x, w_packed_buf, scales_buf, biases_buf, indices, queue) =
-            setup_gather_qmm_valid();
+        let Some((registry, x, w_packed_buf, scales_buf, biases_buf, indices, queue)) =
+            setup_gather_qmm_valid()
+        else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let result = gather_qmm(
             &registry,
             &x,
@@ -10645,8 +11117,12 @@ mod tests {
 
     #[test]
     fn test_gather_qmm_zero_k() {
-        let (registry, _x, w_packed_buf, scales_buf, biases_buf, indices, queue) =
-            setup_gather_qmm_valid();
+        let Some((registry, _x, w_packed_buf, scales_buf, biases_buf, indices, queue)) =
+            setup_gather_qmm_valid()
+        else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = registry.device().raw();
         let x = Array::from_slice(dev, &[0.0f32; 0], vec![2, 1, 0]);
         let result = gather_qmm(
@@ -10674,8 +11150,12 @@ mod tests {
 
     #[test]
     fn test_gather_qmm_zero_n() {
-        let (registry, x, w_packed_buf, scales_buf, biases_buf, indices, queue) =
-            setup_gather_qmm_valid();
+        let Some((registry, x, w_packed_buf, scales_buf, biases_buf, indices, queue)) =
+            setup_gather_qmm_valid()
+        else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let result = gather_qmm(
             &registry,
             &x,
@@ -10701,8 +11181,12 @@ mod tests {
 
     #[test]
     fn test_gather_qmm_zero_n_experts() {
-        let (registry, x, w_packed_buf, scales_buf, biases_buf, indices, queue) =
-            setup_gather_qmm_valid();
+        let Some((registry, x, w_packed_buf, scales_buf, biases_buf, indices, queue)) =
+            setup_gather_qmm_valid()
+        else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let result = gather_qmm(
             &registry,
             &x,
@@ -10728,8 +11212,12 @@ mod tests {
 
     #[test]
     fn test_gather_qmm_x_shape_mismatch() {
-        let (registry, _x, w_packed_buf, scales_buf, biases_buf, indices, queue) =
-            setup_gather_qmm_valid();
+        let Some((registry, _x, w_packed_buf, scales_buf, biases_buf, indices, queue)) =
+            setup_gather_qmm_valid()
+        else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = registry.device().raw();
         // x has 10 elements but batch*m*k = 2*1*32 = 64
         let x_bad = Array::from_slice(dev, &[1.0f32; 10], vec![10]);
@@ -10758,8 +11246,12 @@ mod tests {
 
     #[test]
     fn test_gather_qmm_odd_k() {
-        let (registry, _x, w_packed_buf, scales_buf, biases_buf, _indices, queue) =
-            setup_gather_qmm_valid();
+        let Some((registry, _x, w_packed_buf, scales_buf, biases_buf, _indices, queue)) =
+            setup_gather_qmm_valid()
+        else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = registry.device().raw();
         let x = Array::from_slice(dev, &[1.0f32; 6], vec![2, 1, 3]);
         let indices = Array::from_slice(dev, &[0u32, 1], vec![2]);
@@ -10785,8 +11277,12 @@ mod tests {
 
     #[test]
     fn test_gather_qmm_k_not_multiple_of_group_size() {
-        let (registry, _x, w_packed_buf, scales_buf, biases_buf, _indices, queue) =
-            setup_gather_qmm_valid();
+        let Some((registry, _x, w_packed_buf, scales_buf, biases_buf, _indices, queue)) =
+            setup_gather_qmm_valid()
+        else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = registry.device().raw();
         // k=32, group_size=64 => 32 % 64 != 0
         let x = Array::from_slice(dev, &[1.0f32; 64], vec![2, 1, 32]);
@@ -10816,12 +11312,24 @@ mod tests {
 
     #[test]
     fn test_gather_qmm_w_packed_buf_too_small() {
-        let (registry, x, _w_packed_buf, scales_buf, biases_buf, indices, queue) =
-            setup_gather_qmm_valid();
+        let Some((registry, x, _w_packed_buf, scales_buf, biases_buf, indices, queue)) =
+            setup_gather_qmm_valid()
+        else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = registry.device().raw();
         // Valid w_packed needs 2*4*16 = 128 bytes, provide only 10
-        let opts = metal::MTLResourceOptions::StorageModeShared;
-        let small_w = dev.new_buffer_with_data([0u8; 10].as_ptr() as *const _, 10, opts);
+        let opts = MTLResourceOptions::StorageModeShared;
+        let small_w = unsafe {
+            dev.newBufferWithBytes_length_options(
+                std::ptr::NonNull::new([0u8; 10].as_ptr() as *const _ as *mut std::ffi::c_void)
+                    .unwrap(),
+                10_usize,
+                opts,
+            )
+            .unwrap()
+        };
         let result = gather_qmm(
             &registry,
             &x,
@@ -10847,12 +11355,24 @@ mod tests {
 
     #[test]
     fn test_gather_qmm_scales_buf_too_small() {
-        let (registry, x, w_packed_buf, _scales_buf, biases_buf, indices, queue) =
-            setup_gather_qmm_valid();
+        let Some((registry, x, w_packed_buf, _scales_buf, biases_buf, indices, queue)) =
+            setup_gather_qmm_valid()
+        else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = registry.device().raw();
-        let opts = metal::MTLResourceOptions::StorageModeShared;
+        let opts = MTLResourceOptions::StorageModeShared;
         // Valid scales needs 2*4*1*4 = 32 bytes, provide only 4
-        let small_s = dev.new_buffer_with_data([0u8; 4].as_ptr() as *const _, 4, opts);
+        let small_s = unsafe {
+            dev.newBufferWithBytes_length_options(
+                std::ptr::NonNull::new([0u8; 4].as_ptr() as *const _ as *mut std::ffi::c_void)
+                    .unwrap(),
+                4_usize,
+                opts,
+            )
+            .unwrap()
+        };
         let result = gather_qmm(
             &registry,
             &x,
@@ -10878,11 +11398,23 @@ mod tests {
 
     #[test]
     fn test_gather_qmm_biases_buf_too_small() {
-        let (registry, x, w_packed_buf, scales_buf, _biases_buf, indices, queue) =
-            setup_gather_qmm_valid();
+        let Some((registry, x, w_packed_buf, scales_buf, _biases_buf, indices, queue)) =
+            setup_gather_qmm_valid()
+        else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = registry.device().raw();
-        let opts = metal::MTLResourceOptions::StorageModeShared;
-        let small_b = dev.new_buffer_with_data([0u8; 4].as_ptr() as *const _, 4, opts);
+        let opts = MTLResourceOptions::StorageModeShared;
+        let small_b = unsafe {
+            dev.newBufferWithBytes_length_options(
+                std::ptr::NonNull::new([0u8; 4].as_ptr() as *const _ as *mut std::ffi::c_void)
+                    .unwrap(),
+                4_usize,
+                opts,
+            )
+            .unwrap()
+        };
         let result = gather_qmm(
             &registry,
             &x,
@@ -10908,8 +11440,12 @@ mod tests {
 
     #[test]
     fn test_gather_qmm_index_out_of_range() {
-        let (registry, x, w_packed_buf, scales_buf, biases_buf, _indices, queue) =
-            setup_gather_qmm_valid();
+        let Some((registry, x, w_packed_buf, scales_buf, biases_buf, _indices, queue)) =
+            setup_gather_qmm_valid()
+        else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = registry.device().raw();
         // n_experts=2, but index=5 is out of range
         let bad_indices = Array::from_slice(dev, &[0u32, 5], vec![2]);
@@ -10939,8 +11475,12 @@ mod tests {
     #[test]
     fn test_gather_qmm_wrong_x_dtype() {
         // This test doesn't need a full setup since dtype check is first
-        let (registry, _x, w_packed_buf, scales_buf, biases_buf, _indices, queue) =
-            setup_gather_qmm_valid();
+        let Some((registry, _x, w_packed_buf, scales_buf, biases_buf, _indices, queue)) =
+            setup_gather_qmm_valid()
+        else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = registry.device().raw();
         let x_u32 = Array::from_slice(dev, &[1u32; 64], vec![2, 1, 32]);
         let indices = Array::from_slice(dev, &[0u32, 1], vec![2]);
@@ -10966,8 +11506,12 @@ mod tests {
 
     #[test]
     fn test_gather_qmm_indices_length_mismatch() {
-        let (registry, x, w_packed_buf, scales_buf, biases_buf, _indices, queue) =
-            setup_gather_qmm_valid();
+        let Some((registry, x, w_packed_buf, scales_buf, biases_buf, _indices, queue)) =
+            setup_gather_qmm_valid()
+        else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = registry.device().raw();
         // batch=2 but indices has 3 elements
         let bad_indices = Array::from_slice(dev, &[0u32, 1, 0], vec![3]);
@@ -11824,24 +12368,18 @@ mod tests {
     #[test]
     fn test_nax_vs_cpu_reference_gpu_correctness() {
         // Skip if no GPU available
-        let gpu = match rmlx_metal::device::GpuDevice::system_default() {
-            Ok(g) => g,
-            Err(_) => {
-                eprintln!("Skipping test_nax_vs_cpu_reference_gpu_correctness: no GPU");
-                return;
-            }
-        };
+        let gpu = crate::test_utils::require_gpu!();
         let registry = KernelRegistry::new(gpu);
         crate::ops::register_all(&registry).expect("register_all");
         let device = registry.device().raw();
-        let queue = device.new_command_queue();
+        let queue = device.newCommandQueue().unwrap();
 
         // Dimensions: NAX requires M>=32, K%64==0
         let m: usize = 64;
         let k: usize = 128; // small but K%64==0
         let n: usize = 64;
         let group_size: usize = 32;
-        let opts = metal::MTLResourceOptions::StorageModeShared;
+        let opts = MTLResourceOptions::StorageModeShared;
 
         // Deterministic PRNG
         let mut seed = 42u64;
@@ -11894,24 +12432,18 @@ mod tests {
         );
 
         // Build Metal QuantizedWeight with f16 scales (native format)
-        let weights_buf = device.new_buffer_with_data(
-            all_packed.as_ptr() as *const _,
-            all_packed.len() as u64,
-            opts,
-        );
+        let weights_buf = unsafe {
+            device.newBufferWithBytes_length_options(std::ptr::NonNull::new(all_packed.as_ptr() as *const _ as *mut std::ffi::c_void).unwrap(), all_packed.len() as u64 as usize, opts).unwrap()
+        };
         let num_groups = n * k / group_size;
         let scales_f16: Vec<u16> = all_scales.iter().map(|&v| f32_to_f16_bits(v)).collect();
         let biases_f16: Vec<u16> = all_biases.iter().map(|&v| f32_to_f16_bits(v)).collect();
-        let scales_buf = device.new_buffer_with_data(
-            scales_f16.as_ptr() as *const _,
-            (num_groups * 2) as u64,
-            opts,
-        );
-        let biases_buf = device.new_buffer_with_data(
-            biases_f16.as_ptr() as *const _,
-            (num_groups * 2) as u64,
-            opts,
-        );
+        let scales_buf = unsafe {
+            device.newBufferWithBytes_length_options(std::ptr::NonNull::new(scales_f16.as_ptr() as *const _ as *mut std::ffi::c_void).unwrap(), (num_groups * 2) as u64 as usize, opts).unwrap()
+        };
+        let biases_buf = unsafe {
+            device.newBufferWithBytes_length_options(std::ptr::NonNull::new(biases_f16.as_ptr() as *const _ as *mut std::ffi::c_void).unwrap(), (num_groups * 2) as u64 as usize, opts).unwrap()
+        };
 
         let qw = QuantizedWeight::new(
             weights_buf,
@@ -11945,7 +12477,7 @@ mod tests {
         };
 
         // Read back NAX output
-        let nax_ptr = nax_out.metal_buffer().contents() as *const u16;
+        let nax_ptr = nax_out.metal_buffer().contents().as_ptr() as *const u16;
         let out_count = m * n;
 
         let mut max_diff: f32 = 0.0;

@@ -11,7 +11,14 @@
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
-use metal::MTLSize;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLCommandBuffer as _;
+use objc2_metal::MTLCommandQueue as _;
+use objc2_metal::MTLComputePipelineState as _;
+use objc2_metal::MTLDevice as _;
+use rmlx_metal::ComputePass;
+use rmlx_metal::MTLResourceOptions;
+use rmlx_metal::MTLSize;
 
 /// Threshold for switching from single-pass to two-pass reduction.
 /// For arrays with <= this many elements, single threadgroup is used.
@@ -1258,30 +1265,50 @@ fn apply_mean_divisor(
     registry: &KernelRegistry,
     output: &Array,
     count: usize,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<(), KernelError> {
     let kernel_name = scalar_div_kernel_name(output.dtype())?;
     let pipeline = registry.get_pipeline(kernel_name, output.dtype())?;
     let divisor = count as f32;
 
-    let div_buf = registry.device().raw().new_buffer_with_data(
-        &divisor as *const f32 as *const std::ffi::c_void,
-        4,
-        metal::MTLResourceOptions::StorageModeShared,
-    );
+    let div_buf = unsafe {
+        registry
+            .device()
+            .raw()
+            .newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(
+                    &divisor as *const f32 as *const std::ffi::c_void as *mut std::ffi::c_void,
+                )
+                .unwrap(),
+                4_usize,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap()
+    };
 
-    let numel = output.numel() as u64;
-    let command_buffer = queue.new_command_buffer();
-    let encoder = command_buffer.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
+    let numel = output.numel();
+    let command_buffer = queue.commandBuffer().unwrap();
+    let raw_enc = command_buffer.computeCommandEncoder().unwrap();
+    let encoder = ComputePass::new(&raw_enc);
+    encoder.set_pipeline(&pipeline);
     encoder.set_buffer(0, Some(output.metal_buffer()), 0);
     encoder.set_buffer(1, Some(&div_buf), 0);
-
-    let tg_size = std::cmp::min(256u64, pipeline.max_total_threads_per_threadgroup());
+    let tg_size = std::cmp::min(256_usize, pipeline.maxTotalThreadsPerThreadgroup());
     let grid = numel.div_ceil(tg_size);
-    encoder.dispatch_thread_groups(MTLSize::new(grid, 1, 1), MTLSize::new(tg_size, 1, 1));
-    encoder.end_encoding();
-    super::commit_with_mode(command_buffer, super::ExecMode::Sync);
+    encoder.dispatch_threadgroups(
+        MTLSize {
+            width: grid,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        },
+    );
+    encoder.end();
+    super::commit_with_mode(&command_buffer, super::ExecMode::Sync);
 
     Ok(())
 }
@@ -1295,7 +1322,7 @@ pub fn reduce_all(
     registry: &KernelRegistry,
     input: &Array,
     op: ReduceOp,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     reduce_all_with_mode(registry, input, op, queue, super::ExecMode::Sync)
 }
@@ -1313,7 +1340,7 @@ pub fn reduce_all_with_mode(
     registry: &KernelRegistry,
     input: &Array,
     op: ReduceOp,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
     mode: super::ExecMode,
 ) -> Result<Array, KernelError> {
     if input.numel() == 0 {
@@ -1346,7 +1373,7 @@ fn reduce_all_single_pass(
     registry: &KernelRegistry,
     input: &Array,
     op: ReduceOp,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
     mode: super::ExecMode,
 ) -> Result<Array, KernelError> {
     let (kernel_name, out_dtype) = global_kernel_name(op, input.dtype())?;
@@ -1356,23 +1383,43 @@ fn reduce_all_single_pass(
 
     let out = Array::zeros(registry.device().raw(), &[1], out_dtype);
 
-    let size_buf = registry.device().raw().new_buffer_with_data(
-        &numel as *const u32 as *const std::ffi::c_void,
-        4,
-        metal::MTLResourceOptions::StorageModeShared,
-    );
+    let size_buf = unsafe {
+        registry
+            .device()
+            .raw()
+            .newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(
+                    &numel as *const u32 as *const std::ffi::c_void as *mut std::ffi::c_void,
+                )
+                .unwrap(),
+                4_usize,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap()
+    };
 
-    let command_buffer = queue.new_command_buffer();
-    let encoder = command_buffer.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
+    let command_buffer = queue.commandBuffer().unwrap();
+    let raw_enc = command_buffer.computeCommandEncoder().unwrap();
+    let encoder = ComputePass::new(&raw_enc);
+    encoder.set_pipeline(&pipeline);
+    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset());
     encoder.set_buffer(1, Some(out.metal_buffer()), 0);
     encoder.set_buffer(2, Some(&size_buf), 0);
-
-    let tg_size = std::cmp::min(1024, pipeline.max_total_threads_per_threadgroup());
-    encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(tg_size, 1, 1));
-    encoder.end_encoding();
-    super::commit_with_mode(command_buffer, mode);
+    let tg_size = std::cmp::min(1024, pipeline.maxTotalThreadsPerThreadgroup());
+    encoder.dispatch_threadgroups(
+        MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        },
+    );
+    encoder.end();
+    super::commit_with_mode(&command_buffer, mode);
 
     Ok(out)
 }
@@ -1382,7 +1429,7 @@ fn reduce_all_two_pass(
     registry: &KernelRegistry,
     input: &Array,
     op: ReduceOp,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
     mode: super::ExecMode,
 ) -> Result<Array, KernelError> {
     let numel = input.numel();
@@ -1391,11 +1438,11 @@ fn reduce_all_two_pass(
     let (pass1_kernel, pass2_kernel) = two_pass_kernel_names(op, input.dtype())?;
 
     let pass1_pipeline = registry.get_pipeline(pass1_kernel, input.dtype())?;
-    let tg_size = std::cmp::min(1024u64, pass1_pipeline.max_total_threads_per_threadgroup());
+    let tg_size = std::cmp::min(1024_usize, pass1_pipeline.maxTotalThreadsPerThreadgroup());
 
     // Number of threadgroups for pass 1: enough to cover all elements with good occupancy.
     // Must be power of 2 because pass 2 uses tree reduction over the partial results.
-    let raw_tg_count = (numel as u64).div_ceil(tg_size).min(256);
+    let raw_tg_count = numel.div_ceil(tg_size).min(256);
     let num_threadgroups = raw_tg_count.next_power_of_two().min(256) as u32;
 
     // Allocate intermediate buffer for partial results
@@ -1406,59 +1453,106 @@ fn reduce_all_two_pass(
     );
 
     // Each threadgroup handles a contiguous chunk
-    let chunk_size = (numel as u64).div_ceil(num_threadgroups as u64) as u32;
+    let chunk_size = numel.div_ceil(num_threadgroups as usize) as u32;
 
-    let size_buf = registry.device().raw().new_buffer_with_data(
-        &numel_u32 as *const u32 as *const std::ffi::c_void,
-        4,
-        metal::MTLResourceOptions::StorageModeShared,
-    );
-    let chunk_buf = registry.device().raw().new_buffer_with_data(
-        &chunk_size as *const u32 as *const std::ffi::c_void,
-        4,
-        metal::MTLResourceOptions::StorageModeShared,
-    );
+    let size_buf = unsafe {
+        registry
+            .device()
+            .raw()
+            .newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(
+                    &numel_u32 as *const u32 as *const std::ffi::c_void as *mut std::ffi::c_void,
+                )
+                .unwrap(),
+                4_usize,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap()
+    };
+    let chunk_buf = unsafe {
+        registry
+            .device()
+            .raw()
+            .newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(
+                    &chunk_size as *const u32 as *const std::ffi::c_void as *mut std::ffi::c_void,
+                )
+                .unwrap(),
+                4_usize,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap()
+    };
 
     // --- Pass 1: reduce input -> partial results ---
-    let cb1 = queue.new_command_buffer();
-    let enc1 = cb1.new_compute_command_encoder();
-    enc1.set_compute_pipeline_state(&pass1_pipeline);
-    enc1.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
+    let cb1 = queue.commandBuffer().unwrap();
+    let raw_enc1 = cb1.computeCommandEncoder().unwrap();
+    let enc1 = ComputePass::new(&raw_enc1);
+    enc1.set_pipeline(&pass1_pipeline);
+    enc1.set_buffer(0, Some(input.metal_buffer()), input.offset());
     enc1.set_buffer(1, Some(partial.metal_buffer()), 0);
     enc1.set_buffer(2, Some(&size_buf), 0);
     enc1.set_buffer(3, Some(&chunk_buf), 0);
-
-    enc1.dispatch_thread_groups(
-        MTLSize::new(num_threadgroups as u64, 1, 1),
-        MTLSize::new(tg_size, 1, 1),
+    enc1.dispatch_threadgroups(
+        MTLSize {
+            width: num_threadgroups as usize,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        },
     );
-    enc1.end_encoding();
-    super::commit_with_mode(cb1, super::ExecMode::Sync);
+    enc1.end();
+    super::commit_with_mode(&cb1, super::ExecMode::Sync);
 
     // --- Pass 2: reduce partial results -> scalar ---
     let pass2_pipeline = registry.get_pipeline(pass2_kernel, DType::Float32)?;
     let out = Array::zeros(registry.device().raw(), &[1], DType::Float32);
 
-    let partial_size_buf = registry.device().raw().new_buffer_with_data(
-        &num_threadgroups as *const u32 as *const std::ffi::c_void,
-        4,
-        metal::MTLResourceOptions::StorageModeShared,
-    );
+    let partial_size_buf = unsafe {
+        registry
+            .device()
+            .raw()
+            .newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(
+                    &num_threadgroups as *const u32 as *const std::ffi::c_void
+                        as *mut std::ffi::c_void,
+                )
+                .unwrap(),
+                4_usize,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap()
+    };
 
-    let cb2 = queue.new_command_buffer();
-    let enc2 = cb2.new_compute_command_encoder();
-    enc2.set_compute_pipeline_state(&pass2_pipeline);
+    let cb2 = queue.commandBuffer().unwrap();
+    let raw_enc2 = cb2.computeCommandEncoder().unwrap();
+    let enc2 = ComputePass::new(&raw_enc2);
+    enc2.set_pipeline(&pass2_pipeline);
     enc2.set_buffer(0, Some(partial.metal_buffer()), 0);
     enc2.set_buffer(1, Some(out.metal_buffer()), 0);
     enc2.set_buffer(2, Some(&partial_size_buf), 0);
-
     // Threadgroup size for pass 2 must be a power of 2 for the tree reduction
-    let tg2_size = (num_threadgroups as u64)
+    let tg2_size = (num_threadgroups as usize)
         .next_power_of_two()
-        .min(pass2_pipeline.max_total_threads_per_threadgroup());
-    enc2.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(tg2_size.max(1), 1, 1));
-    enc2.end_encoding();
-    super::commit_with_mode(cb2, mode);
+        .min(pass2_pipeline.maxTotalThreadsPerThreadgroup());
+    enc2.dispatch_threadgroups(
+        MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg2_size.max(1),
+            height: 1,
+            depth: 1,
+        },
+    );
+    enc2.end();
+    super::commit_with_mode(&cb2, mode);
 
     Ok(out)
 }
@@ -1473,7 +1567,7 @@ pub fn reduce_row(
     registry: &KernelRegistry,
     input: &Array,
     op: ReduceOp,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     if input.ndim() != 2 {
         return Err(KernelError::InvalidShape(format!(
@@ -1498,23 +1592,43 @@ pub fn reduce_row(
     let pipeline = registry.get_pipeline(kernel_name, input.dtype())?;
     let out = Array::zeros(registry.device().raw(), &[rows], input.dtype());
 
-    let cols_buf = registry.device().raw().new_buffer_with_data(
-        &cols_u32 as *const u32 as *const std::ffi::c_void,
-        4,
-        metal::MTLResourceOptions::StorageModeShared,
-    );
+    let cols_buf = unsafe {
+        registry
+            .device()
+            .raw()
+            .newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(
+                    &cols_u32 as *const u32 as *const std::ffi::c_void as *mut std::ffi::c_void,
+                )
+                .unwrap(),
+                4_usize,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap()
+    };
 
-    let command_buffer = queue.new_command_buffer();
-    let encoder = command_buffer.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
+    let command_buffer = queue.commandBuffer().unwrap();
+    let raw_enc = command_buffer.computeCommandEncoder().unwrap();
+    let encoder = ComputePass::new(&raw_enc);
+    encoder.set_pipeline(&pipeline);
+    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset());
     encoder.set_buffer(1, Some(out.metal_buffer()), 0);
     encoder.set_buffer(2, Some(&cols_buf), 0);
-
-    let tg_size = std::cmp::min(1024, pipeline.max_total_threads_per_threadgroup());
-    encoder.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), MTLSize::new(tg_size, 1, 1));
-    encoder.end_encoding();
-    super::commit_with_mode(command_buffer, super::ExecMode::Sync);
+    let tg_size = std::cmp::min(1024, pipeline.maxTotalThreadsPerThreadgroup());
+    encoder.dispatch_threadgroups(
+        MTLSize {
+            width: rows as usize,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        },
+    );
+    encoder.end();
+    super::commit_with_mode(&command_buffer, super::ExecMode::Sync);
 
     if is_mean {
         apply_mean_divisor(registry, &out, cols, queue)?;
@@ -1533,7 +1647,7 @@ pub fn reduce_col(
     registry: &KernelRegistry,
     input: &Array,
     op: ReduceOp,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     if input.ndim() != 2 {
         return Err(KernelError::InvalidShape(format!(
@@ -1559,29 +1673,58 @@ pub fn reduce_col(
     let pipeline = registry.get_pipeline(kernel_name, input.dtype())?;
     let out = Array::zeros(registry.device().raw(), &[cols], input.dtype());
 
-    let rows_buf = registry.device().raw().new_buffer_with_data(
-        &rows_u32 as *const u32 as *const std::ffi::c_void,
-        4,
-        metal::MTLResourceOptions::StorageModeShared,
-    );
-    let cols_buf = registry.device().raw().new_buffer_with_data(
-        &cols_u32 as *const u32 as *const std::ffi::c_void,
-        4,
-        metal::MTLResourceOptions::StorageModeShared,
-    );
+    let rows_buf = unsafe {
+        registry
+            .device()
+            .raw()
+            .newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(
+                    &rows_u32 as *const u32 as *const std::ffi::c_void as *mut std::ffi::c_void,
+                )
+                .unwrap(),
+                4_usize,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap()
+    };
+    let cols_buf = unsafe {
+        registry
+            .device()
+            .raw()
+            .newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(
+                    &cols_u32 as *const u32 as *const std::ffi::c_void as *mut std::ffi::c_void,
+                )
+                .unwrap(),
+                4_usize,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap()
+    };
 
-    let command_buffer = queue.new_command_buffer();
-    let encoder = command_buffer.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
+    let command_buffer = queue.commandBuffer().unwrap();
+    let raw_enc = command_buffer.computeCommandEncoder().unwrap();
+    let encoder = ComputePass::new(&raw_enc);
+    encoder.set_pipeline(&pipeline);
+    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset());
     encoder.set_buffer(1, Some(out.metal_buffer()), 0);
     encoder.set_buffer(2, Some(&rows_buf), 0);
     encoder.set_buffer(3, Some(&cols_buf), 0);
-
-    let tg_size = std::cmp::min(1024, pipeline.max_total_threads_per_threadgroup());
-    encoder.dispatch_thread_groups(MTLSize::new(cols as u64, 1, 1), MTLSize::new(tg_size, 1, 1));
-    encoder.end_encoding();
-    super::commit_with_mode(command_buffer, super::ExecMode::Sync);
+    let tg_size = std::cmp::min(1024, pipeline.maxTotalThreadsPerThreadgroup());
+    encoder.dispatch_threadgroups(
+        MTLSize {
+            width: cols as usize,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        },
+    );
+    encoder.end();
+    super::commit_with_mode(&command_buffer, super::ExecMode::Sync);
 
     if is_mean {
         apply_mean_divisor(registry, &out, rows, queue)?;
@@ -1607,7 +1750,7 @@ pub fn reduce_axis(
     input: &Array,
     op: ReduceOp,
     axis: usize,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     let ndim = input.ndim();
     if axis >= ndim {
@@ -1696,7 +1839,7 @@ pub fn reduce(
     input: &Array,
     op: ReduceOp,
     axis: ReduceAxis,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     match axis {
         ReduceAxis::All => reduce_all(registry, input, op, queue),
@@ -1720,7 +1863,7 @@ pub fn reduce_all_async(
     registry: &KernelRegistry,
     input: &Array,
     op: ReduceOp,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<super::LaunchResult, KernelError> {
     if input.numel() == 0 {
         return Err(KernelError::InvalidShape(
@@ -1743,24 +1886,44 @@ pub fn reduce_all_async(
 
     let out = Array::zeros(registry.device().raw(), &[1], out_dtype);
 
-    let size_buf = registry.device().raw().new_buffer_with_data(
-        &numel_u32 as *const u32 as *const std::ffi::c_void,
-        4,
-        metal::MTLResourceOptions::StorageModeShared,
-    );
+    let size_buf = unsafe {
+        registry
+            .device()
+            .raw()
+            .newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(
+                    &numel_u32 as *const u32 as *const std::ffi::c_void as *mut std::ffi::c_void,
+                )
+                .unwrap(),
+                4_usize,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap()
+    };
 
-    let command_buffer = queue.new_command_buffer();
-    let encoder = command_buffer.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
+    let command_buffer = queue.commandBuffer().unwrap();
+    let raw_enc = command_buffer.computeCommandEncoder().unwrap();
+    let encoder = ComputePass::new(&raw_enc);
+    encoder.set_pipeline(&pipeline);
+    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset());
     encoder.set_buffer(1, Some(out.metal_buffer()), 0);
     encoder.set_buffer(2, Some(&size_buf), 0);
+    let tg_size = std::cmp::min(1024, pipeline.maxTotalThreadsPerThreadgroup());
+    encoder.dispatch_threadgroups(
+        MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        },
+    );
+    encoder.end();
 
-    let tg_size = std::cmp::min(1024, pipeline.max_total_threads_per_threadgroup());
-    encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(tg_size, 1, 1));
-    encoder.end_encoding();
-
-    let handle = super::commit_with_mode(command_buffer, super::ExecMode::Async)
+    let handle = super::commit_with_mode(&command_buffer, super::ExecMode::Async)
         .expect("async mode always returns a handle");
 
     Ok(super::LaunchResult::new(out, handle))
@@ -1774,7 +1937,7 @@ pub fn reduce_all_async(
 pub fn sum(
     registry: &KernelRegistry,
     input: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     reduce_all(registry, input, ReduceOp::Sum, queue)
 }
@@ -1783,7 +1946,7 @@ pub fn sum(
 pub fn max(
     registry: &KernelRegistry,
     input: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     reduce_all(registry, input, ReduceOp::Max, queue)
 }
@@ -1792,7 +1955,7 @@ pub fn max(
 pub fn min(
     registry: &KernelRegistry,
     input: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     reduce_all(registry, input, ReduceOp::Min, queue)
 }
@@ -1801,7 +1964,7 @@ pub fn min(
 pub fn mean(
     registry: &KernelRegistry,
     input: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     reduce_all(registry, input, ReduceOp::Mean, queue)
 }
@@ -1810,7 +1973,7 @@ pub fn mean(
 pub fn argmax(
     registry: &KernelRegistry,
     input: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     reduce_all(registry, input, ReduceOp::ArgMax, queue)
 }

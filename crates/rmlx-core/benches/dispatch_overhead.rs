@@ -15,6 +15,10 @@
 
 use std::time::{Duration, Instant};
 
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{
+    MTLCommandBuffer as _, MTLCommandEncoder as _, MTLCommandQueue as _, MTLDevice as _,
+};
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::KernelRegistry;
@@ -122,7 +126,11 @@ fn f32_to_f16_bits(val: f32) -> u16 {
     ((sign << 15) | (new_exp as u32) << 10 | (frac >> 13)) as u16
 }
 
-fn rand_f16_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
+fn rand_f16_array(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    shape: &[usize],
+    seed: u64,
+) -> Array {
     let numel: usize = shape.iter().product();
     let mut f16_bytes = Vec::with_capacity(numel * 2);
     let mut state = seed;
@@ -141,25 +149,25 @@ fn rand_f16_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
 // Bench 1: Empty kernel single-dispatch latency
 // ===========================================================================
 
-fn bench_empty_dispatch(queue: &metal::CommandQueue) {
+fn bench_empty_dispatch(queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>) {
     println!("=== 1. Empty CB dispatch latency ===");
     println!("  CB create + commit + waitUntilCompleted (no compute encoder)");
     println!();
 
     // Warmup
     for _ in 0..WARMUP_ITERS {
-        let cb = queue.new_command_buffer_with_unretained_references();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
     }
 
     // Bench: empty CB (no encoder at all)
     let mut times = Vec::with_capacity(BENCH_ITERS);
     for _ in 0..BENCH_ITERS {
         let start = Instant::now();
-        let cb = queue.new_command_buffer_with_unretained_references();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
         times.push(start.elapsed());
     }
     let stats = Stats::from_durations(&times);
@@ -167,21 +175,21 @@ fn bench_empty_dispatch(queue: &metal::CommandQueue) {
 
     // Bench: CB with empty compute encoder
     for _ in 0..WARMUP_ITERS {
-        let cb = queue.new_command_buffer_with_unretained_references();
-        let enc = cb.new_compute_command_encoder();
-        enc.end_encoding();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+        let enc = cb.computeCommandEncoder().unwrap();
+        enc.endEncoding();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
     }
 
     let mut times = Vec::with_capacity(BENCH_ITERS);
     for _ in 0..BENCH_ITERS {
         let start = Instant::now();
-        let cb = queue.new_command_buffer_with_unretained_references();
-        let enc = cb.new_compute_command_encoder();
-        enc.end_encoding();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+        let enc = cb.computeCommandEncoder().unwrap();
+        enc.endEncoding();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
         times.push(start.elapsed());
     }
     let stats = Stats::from_durations(&times);
@@ -189,21 +197,21 @@ fn bench_empty_dispatch(queue: &metal::CommandQueue) {
 
     // Bench: CB with unretained references + empty encoder
     for _ in 0..WARMUP_ITERS {
-        let cb = queue.new_command_buffer_with_unretained_references();
-        let enc = cb.new_compute_command_encoder();
-        enc.end_encoding();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+        let enc = cb.computeCommandEncoder().unwrap();
+        enc.endEncoding();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
     }
 
     let mut times = Vec::with_capacity(BENCH_ITERS);
     for _ in 0..BENCH_ITERS {
         let start = Instant::now();
-        let cb = queue.new_command_buffer_with_unretained_references();
-        let enc = cb.new_compute_command_encoder();
-        enc.end_encoding();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+        let enc = cb.computeCommandEncoder().unwrap();
+        enc.endEncoding();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
         times.push(start.elapsed());
     }
     let stats = Stats::from_durations(&times);
@@ -218,8 +226,8 @@ fn bench_empty_dispatch(queue: &metal::CommandQueue) {
 
 fn bench_cb_vs_encoder(
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
-    device: &metal::Device,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
 ) {
     println!("=== 2. 1CB-N encoders vs NCB-1encoder ===");
     println!("  Using matmul [1, 3584] @ [3584, 3584] as the compute work unit");
@@ -234,10 +242,10 @@ fn bench_cb_vs_encoder(
         // --- NCB-1encoder: N separate command buffers, each with 1 matmul ---
         for _ in 0..WARMUP_ITERS {
             for _ in 0..n {
-                let cb = queue.new_command_buffer_with_unretained_references();
-                let _ = ops::matmul::matmul_into_cb(registry, &a, &b, cb).unwrap();
+                let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+                let _ = ops::matmul::matmul_into_cb(registry, &a, &b, &cb).unwrap();
                 cb.commit();
-                cb.wait_until_completed();
+                cb.waitUntilCompleted();
             }
         }
 
@@ -245,10 +253,10 @@ fn bench_cb_vs_encoder(
         for _ in 0..BENCH_ITERS {
             let start = Instant::now();
             for _ in 0..n {
-                let cb = queue.new_command_buffer_with_unretained_references();
-                let _ = ops::matmul::matmul_into_cb(registry, &a, &b, cb).unwrap();
+                let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+                let _ = ops::matmul::matmul_into_cb(registry, &a, &b, &cb).unwrap();
                 cb.commit();
-                cb.wait_until_completed();
+                cb.waitUntilCompleted();
             }
             times_ncb.push(start.elapsed());
         }
@@ -256,23 +264,23 @@ fn bench_cb_vs_encoder(
 
         // --- 1CB-N encoder: 1 command buffer, N matmuls encoded sequentially ---
         for _ in 0..WARMUP_ITERS {
-            let cb = queue.new_command_buffer_with_unretained_references();
+            let cb = queue.commandBufferWithUnretainedReferences().unwrap();
             for _ in 0..n {
-                let _ = ops::matmul::matmul_into_cb(registry, &a, &b, cb).unwrap();
+                let _ = ops::matmul::matmul_into_cb(registry, &a, &b, &cb).unwrap();
             }
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
         }
 
         let mut times_1cb = Vec::with_capacity(BENCH_ITERS);
         for _ in 0..BENCH_ITERS {
             let start = Instant::now();
-            let cb = queue.new_command_buffer_with_unretained_references();
+            let cb = queue.commandBufferWithUnretainedReferences().unwrap();
             for _ in 0..n {
-                let _ = ops::matmul::matmul_into_cb(registry, &a, &b, cb).unwrap();
+                let _ = ops::matmul::matmul_into_cb(registry, &a, &b, &cb).unwrap();
             }
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
             times_1cb.push(start.elapsed());
         }
         let stats_1cb = Stats::from_durations(&times_1cb);
@@ -304,8 +312,8 @@ fn bench_cb_vs_encoder(
 
 fn bench_moe_expert_layer_ops(
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
-    device: &metal::Device,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
 ) {
     println!("=== 3. MoE Expert Layer op breakdown (Qwen 3.5-style, decode M=1, f16) ===");
     println!(
@@ -364,40 +372,40 @@ fn bench_moe_expert_layer_ops(
 
             // Individual CB per op
             for _ in 0..WARMUP_ITERS {
-                let cb = queue.new_command_buffer_with_unretained_references();
-                op_fn(registry, cb);
+                let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+                op_fn(registry, &cb);
                 cb.commit();
-                cb.wait_until_completed();
+                cb.waitUntilCompleted();
             }
             let mut times_ind = Vec::with_capacity(BENCH_ITERS);
             for _ in 0..BENCH_ITERS {
                 let start = Instant::now();
-                let cb = queue.new_command_buffer_with_unretained_references();
-                op_fn(registry, cb);
+                let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+                op_fn(registry, &cb);
                 cb.commit();
-                cb.wait_until_completed();
+                cb.waitUntilCompleted();
                 times_ind.push(start.elapsed());
             }
 
             // Batched: 16 of same op in one CB, divide time by 16
             let batch_n: u32 = 16;
             for _ in 0..WARMUP_ITERS {
-                let cb = queue.new_command_buffer_with_unretained_references();
+                let cb = queue.commandBufferWithUnretainedReferences().unwrap();
                 for _ in 0..batch_n {
-                    op_fn(registry, cb);
+                    op_fn(registry, &cb);
                 }
                 cb.commit();
-                cb.wait_until_completed();
+                cb.waitUntilCompleted();
             }
             let mut times_bat = Vec::with_capacity(BENCH_ITERS);
             for _ in 0..BENCH_ITERS {
                 let start = Instant::now();
-                let cb = queue.new_command_buffer_with_unretained_references();
+                let cb = queue.commandBufferWithUnretainedReferences().unwrap();
                 for _ in 0..batch_n {
-                    op_fn(registry, cb);
+                    op_fn(registry, &cb);
                 }
                 cb.commit();
-                cb.wait_until_completed();
+                cb.waitUntilCompleted();
                 times_bat.push(start.elapsed() / batch_n);
             }
 
@@ -411,65 +419,61 @@ fn bench_moe_expert_layer_ops(
     }
 
     // 1. RMS Norm (attention)
-    bench_op!(
-        "rms_norm",
-        "[1,3584] eps=1e-5",
-        |reg: &KernelRegistry, cb: &metal::CommandBufferRef| {
-            let _ = ops::rms_norm::rms_norm_into_cb(reg, &x, Some(&norm_w), RMS_NORM_EPS, cb);
-        }
-    );
+    bench_op!("rms_norm", "[1,3584] eps=1e-5", |reg: &KernelRegistry,
+                                                cb: &ProtocolObject<
+        dyn objc2_metal::MTLCommandBuffer,
+    >| {
+        let _ = ops::rms_norm::rms_norm_into_cb(reg, &x, Some(&norm_w), RMS_NORM_EPS, cb);
+    });
 
     // 2. Q matmul
     bench_op!(
         "matmul_q",
         "[1,3584]@[3584,3584]",
-        |reg: &KernelRegistry, cb: &metal::CommandBufferRef| {
+        |reg: &KernelRegistry, cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>| {
             let _ = ops::matmul::matmul_into_cb(reg, &x, &wq, cb);
         }
     );
 
     // 3. K matmul
-    bench_op!(
-        "matmul_k",
-        "[1,3584]@[3584,512]",
-        |reg: &KernelRegistry, cb: &metal::CommandBufferRef| {
-            let _ = ops::matmul::matmul_into_cb(reg, &x, &wk, cb);
-        }
-    );
+    bench_op!("matmul_k", "[1,3584]@[3584,512]", |reg: &KernelRegistry,
+                                                  cb: &ProtocolObject<
+        dyn objc2_metal::MTLCommandBuffer,
+    >| {
+        let _ = ops::matmul::matmul_into_cb(reg, &x, &wk, cb);
+    });
 
     // 4. V matmul
-    bench_op!(
-        "matmul_v",
-        "[1,3584]@[3584,512]",
-        |reg: &KernelRegistry, cb: &metal::CommandBufferRef| {
-            let _ = ops::matmul::matmul_into_cb(reg, &x, &wv, cb);
-        }
-    );
+    bench_op!("matmul_v", "[1,3584]@[3584,512]", |reg: &KernelRegistry,
+                                                  cb: &ProtocolObject<
+        dyn objc2_metal::MTLCommandBuffer,
+    >| {
+        let _ = ops::matmul::matmul_into_cb(reg, &x, &wv, cb);
+    });
 
     // 5. RoPE
-    bench_op!(
-        "rope",
-        "[1,1,128] table",
-        |reg: &KernelRegistry, cb: &metal::CommandBufferRef| {
-            let _ = ops::rope::rope_ext_into_cb(
-                reg,
-                &rope_input,
-                &cos_freqs,
-                &sin_freqs,
-                0,
-                1.0,
-                false,
-                true,
-                cb,
-            );
-        }
-    );
+    bench_op!("rope", "[1,1,128] table", |reg: &KernelRegistry,
+                                          cb: &ProtocolObject<
+        dyn objc2_metal::MTLCommandBuffer,
+    >| {
+        let _ = ops::rope::rope_ext_into_cb(
+            reg,
+            &rope_input,
+            &cos_freqs,
+            &sin_freqs,
+            0,
+            1.0,
+            false,
+            true,
+            cb,
+        );
+    });
 
     // 6. O projection
     bench_op!(
         "matmul_o",
         "[1,3584]@[3584,3584]",
-        |reg: &KernelRegistry, cb: &metal::CommandBufferRef| {
+        |reg: &KernelRegistry, cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>| {
             let _ = ops::matmul::matmul_into_cb(reg, &x, &wo, cb);
         }
     );
@@ -478,7 +482,7 @@ fn bench_moe_expert_layer_ops(
     bench_op!(
         "rms_norm_ffn",
         "[1,3584] eps=1e-5",
-        |reg: &KernelRegistry, cb: &metal::CommandBufferRef| {
+        |reg: &KernelRegistry, cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>| {
             let _ = ops::rms_norm::rms_norm_into_cb(reg, &x, Some(&norm_w), RMS_NORM_EPS, cb);
         }
     );
@@ -487,7 +491,7 @@ fn bench_moe_expert_layer_ops(
     bench_op!(
         "matmul_gate",
         "[1,3584]@[3584,2560]",
-        |reg: &KernelRegistry, cb: &metal::CommandBufferRef| {
+        |reg: &KernelRegistry, cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>| {
             let _ = ops::matmul::matmul_into_cb(reg, &x, &wgate, cb);
         }
     );
@@ -496,25 +500,24 @@ fn bench_moe_expert_layer_ops(
     bench_op!(
         "matmul_up",
         "[1,3584]@[3584,2560]",
-        |reg: &KernelRegistry, cb: &metal::CommandBufferRef| {
+        |reg: &KernelRegistry, cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>| {
             let _ = ops::matmul::matmul_into_cb(reg, &x, &wup, cb);
         }
     );
 
     // 10. Fused SiLU * mul
-    bench_op!(
-        "fused_silu_mul",
-        "[1,2560]",
-        |reg: &KernelRegistry, cb: &metal::CommandBufferRef| {
-            let _ = ops::fused::fused_silu_mul_into_cb(reg, &gate_out, &up_out, cb);
-        }
-    );
+    bench_op!("fused_silu_mul", "[1,2560]", |reg: &KernelRegistry,
+                                             cb: &ProtocolObject<
+        dyn objc2_metal::MTLCommandBuffer,
+    >| {
+        let _ = ops::fused::fused_silu_mul_into_cb(reg, &gate_out, &up_out, cb);
+    });
 
     // 11. Down matmul
     bench_op!(
         "matmul_down",
         "[1,2560]@[2560,3584]",
-        |reg: &KernelRegistry, cb: &metal::CommandBufferRef| {
+        |reg: &KernelRegistry, cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>| {
             let _ = ops::matmul::matmul_into_cb(reg, &ffn_mid, &wdown, cb);
         }
     );
@@ -571,65 +574,91 @@ fn bench_moe_expert_layer_ops(
 
     let do_layer_individual = || {
         #[allow(clippy::type_complexity)]
-        let ops_list: Vec<Box<dyn Fn(&KernelRegistry, &metal::CommandBufferRef)>> = vec![
-            Box::new(|reg: &KernelRegistry, cb: &metal::CommandBufferRef| {
-                let _ = ops::rms_norm::rms_norm_into_cb(reg, &x, Some(&norm_w), RMS_NORM_EPS, cb);
-            }),
-            Box::new(|reg: &KernelRegistry, cb: &metal::CommandBufferRef| {
-                let _ = ops::matmul::matmul_into_cb(reg, &x, &wq, cb);
-            }),
-            Box::new(|reg: &KernelRegistry, cb: &metal::CommandBufferRef| {
-                let _ = ops::matmul::matmul_into_cb(reg, &x, &wk, cb);
-            }),
-            Box::new(|reg: &KernelRegistry, cb: &metal::CommandBufferRef| {
-                let _ = ops::matmul::matmul_into_cb(reg, &x, &wv, cb);
-            }),
-            Box::new(|reg: &KernelRegistry, cb: &metal::CommandBufferRef| {
-                let _ = ops::rope::rope_ext_into_cb(
-                    reg,
-                    &rope_input,
-                    &cos_freqs,
-                    &sin_freqs,
-                    0,
-                    1.0,
-                    false,
-                    true,
-                    cb,
-                );
-            }),
-            Box::new(|reg: &KernelRegistry, cb: &metal::CommandBufferRef| {
-                let _ = ops::matmul::matmul_into_cb(reg, &x, &wo, cb);
-            }),
-            Box::new(|reg: &KernelRegistry, cb: &metal::CommandBufferRef| {
-                let _ = ops::rms_norm::rms_norm_into_cb(reg, &x, Some(&norm_w), RMS_NORM_EPS, cb);
-            }),
-            Box::new(|reg: &KernelRegistry, cb: &metal::CommandBufferRef| {
-                let _ = ops::matmul::matmul_into_cb(reg, &x, &wgate, cb);
-            }),
-            Box::new(|reg: &KernelRegistry, cb: &metal::CommandBufferRef| {
-                let _ = ops::matmul::matmul_into_cb(reg, &x, &wup, cb);
-            }),
-            Box::new(|reg: &KernelRegistry, cb: &metal::CommandBufferRef| {
-                let _ = ops::fused::fused_silu_mul_into_cb(reg, &gate_out, &up_out, cb);
-            }),
-            Box::new(|reg: &KernelRegistry, cb: &metal::CommandBufferRef| {
-                let _ = ops::matmul::matmul_into_cb(reg, &ffn_mid, &wdown, cb);
-            }),
+        let ops_list: Vec<
+            Box<dyn Fn(&KernelRegistry, &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>)>,
+        > = vec![
+            Box::new(
+                |reg: &KernelRegistry, cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>| {
+                    let _ =
+                        ops::rms_norm::rms_norm_into_cb(reg, &x, Some(&norm_w), RMS_NORM_EPS, cb);
+                },
+            ),
+            Box::new(
+                |reg: &KernelRegistry, cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>| {
+                    let _ = ops::matmul::matmul_into_cb(reg, &x, &wq, cb);
+                },
+            ),
+            Box::new(
+                |reg: &KernelRegistry, cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>| {
+                    let _ = ops::matmul::matmul_into_cb(reg, &x, &wk, cb);
+                },
+            ),
+            Box::new(
+                |reg: &KernelRegistry, cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>| {
+                    let _ = ops::matmul::matmul_into_cb(reg, &x, &wv, cb);
+                },
+            ),
+            Box::new(
+                |reg: &KernelRegistry, cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>| {
+                    let _ = ops::rope::rope_ext_into_cb(
+                        reg,
+                        &rope_input,
+                        &cos_freqs,
+                        &sin_freqs,
+                        0,
+                        1.0,
+                        false,
+                        true,
+                        cb,
+                    );
+                },
+            ),
+            Box::new(
+                |reg: &KernelRegistry, cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>| {
+                    let _ = ops::matmul::matmul_into_cb(reg, &x, &wo, cb);
+                },
+            ),
+            Box::new(
+                |reg: &KernelRegistry, cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>| {
+                    let _ =
+                        ops::rms_norm::rms_norm_into_cb(reg, &x, Some(&norm_w), RMS_NORM_EPS, cb);
+                },
+            ),
+            Box::new(
+                |reg: &KernelRegistry, cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>| {
+                    let _ = ops::matmul::matmul_into_cb(reg, &x, &wgate, cb);
+                },
+            ),
+            Box::new(
+                |reg: &KernelRegistry, cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>| {
+                    let _ = ops::matmul::matmul_into_cb(reg, &x, &wup, cb);
+                },
+            ),
+            Box::new(
+                |reg: &KernelRegistry, cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>| {
+                    let _ = ops::fused::fused_silu_mul_into_cb(reg, &gate_out, &up_out, cb);
+                },
+            ),
+            Box::new(
+                |reg: &KernelRegistry, cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>| {
+                    let _ = ops::matmul::matmul_into_cb(reg, &ffn_mid, &wdown, cb);
+                },
+            ),
         ];
         for op_fn in &ops_list {
-            let cb = queue.new_command_buffer_with_unretained_references();
-            op_fn(registry, cb);
+            let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+            op_fn(registry, &cb);
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
         }
     };
 
     let do_layer_batched = || {
-        let cb = queue.new_command_buffer_with_unretained_references();
-        let _ = ops::rms_norm::rms_norm_into_cb(registry, &x, Some(&norm_w), RMS_NORM_EPS, cb);
-        let _ = ops::matmul::matmul_into_cb(registry, &x, &wq, cb);
-        let _ = ops::matmul::matmul_into_cb(registry, &x, &wk, cb);
-        let _ = ops::matmul::matmul_into_cb(registry, &x, &wv, cb);
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+        let _ = ops::rms_norm::rms_norm_into_cb(registry, &x, Some(&norm_w), RMS_NORM_EPS, &cb);
+        let _ = ops::matmul::matmul_into_cb(registry, &x, &wq, &cb);
+        let _ = ops::matmul::matmul_into_cb(registry, &x, &wk, &cb);
+        let _ = ops::matmul::matmul_into_cb(registry, &x, &wv, &cb);
         let _ = ops::rope::rope_ext_into_cb(
             registry,
             &rope_input,
@@ -639,16 +668,16 @@ fn bench_moe_expert_layer_ops(
             1.0,
             false,
             true,
-            cb,
+            &cb,
         );
-        let _ = ops::matmul::matmul_into_cb(registry, &x, &wo, cb);
-        let _ = ops::rms_norm::rms_norm_into_cb(registry, &x, Some(&norm_w), RMS_NORM_EPS, cb);
-        let _ = ops::matmul::matmul_into_cb(registry, &x, &wgate, cb);
-        let _ = ops::matmul::matmul_into_cb(registry, &x, &wup, cb);
-        let _ = ops::fused::fused_silu_mul_into_cb(registry, &gate_out, &up_out, cb);
-        let _ = ops::matmul::matmul_into_cb(registry, &ffn_mid, &wdown, cb);
+        let _ = ops::matmul::matmul_into_cb(registry, &x, &wo, &cb);
+        let _ = ops::rms_norm::rms_norm_into_cb(registry, &x, Some(&norm_w), RMS_NORM_EPS, &cb);
+        let _ = ops::matmul::matmul_into_cb(registry, &x, &wgate, &cb);
+        let _ = ops::matmul::matmul_into_cb(registry, &x, &wup, &cb);
+        let _ = ops::fused::fused_silu_mul_into_cb(registry, &gate_out, &up_out, &cb);
+        let _ = ops::matmul::matmul_into_cb(registry, &ffn_mid, &wdown, &cb);
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
     };
 
     for _ in 0..WARMUP_ITERS {
@@ -699,7 +728,7 @@ fn main() {
     let registry = KernelRegistry::new(gpu);
     ops::register_all(&registry).expect("Failed to register kernels");
     let device = registry.device().raw();
-    let queue = device.new_command_queue();
+    let queue = device.newCommandQueue().unwrap();
 
     println!("F-1: Metal Dispatch Overhead Profiling");
     println!("  warmup={WARMUP_ITERS}  iters={BENCH_ITERS}");

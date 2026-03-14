@@ -20,13 +20,17 @@
 
 use std::collections::HashMap;
 
-use metal::{Buffer, CommandQueue, ComputePipelineState, MTLSize};
+use objc2::runtime::ProtocolObject;
+use objc2_metal::*;
+
+use crate::compute_pass::ComputePass;
+use crate::types::*;
 
 /// A captured compute dispatch for replay via ICB.
 #[derive(Clone)]
 pub struct CapturedDispatch {
-    pub pipeline: ComputePipelineState,
-    pub buffers: Vec<(u64, Buffer, u64)>, // (index, buffer, offset)
+    pub pipeline: MtlPipeline,
+    pub buffers: Vec<(u64, MtlBuffer, u64)>, // (index, buffer, offset)
     /// Which buffer indices are read-only inputs.
     pub input_indices: Vec<usize>,
     /// Which buffer indices are written outputs.
@@ -61,24 +65,32 @@ impl IcbBuilder {
     /// Record a simple 1D dispatch with input/output tracking.
     pub fn record_1d(
         &mut self,
-        pipeline: &ComputePipelineState,
-        buffers: &[(u64, &Buffer, u64)],
+        pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+        buffers: &[(u64, &ProtocolObject<dyn MTLBuffer>, u64)],
         input_indices: &[usize],
         output_indices: &[usize],
         num_threads: u64,
     ) {
-        let max_tg = pipeline.max_total_threads_per_threadgroup();
+        let max_tg = pipeline.maxTotalThreadsPerThreadgroup() as u64;
         let tg_size = std::cmp::min(max_tg, num_threads);
         self.dispatches.push(CapturedDispatch {
-            pipeline: pipeline.clone(),
+            pipeline: retain_proto(pipeline),
             buffers: buffers
                 .iter()
-                .map(|(idx, buf, off)| (*idx, (*buf).clone(), *off))
+                .map(|(idx, buf, off)| (*idx, retain_proto(*buf), *off))
                 .collect(),
             input_indices: input_indices.to_vec(),
             output_indices: output_indices.to_vec(),
-            grid_size: MTLSize::new(num_threads, 1, 1),
-            threadgroup_size: MTLSize::new(tg_size, 1, 1),
+            grid_size: MTLSize {
+                width: num_threads as usize,
+                height: 1,
+                depth: 1,
+            },
+            threadgroup_size: MTLSize {
+                width: tg_size as usize,
+                height: 1,
+                depth: 1,
+            },
         });
     }
 
@@ -91,7 +103,7 @@ impl IcbBuilder {
     ///
     /// Returns an `IcbReplay` that can be executed multiple times with
     /// near-zero CPU overhead.
-    pub fn build(self, _device: &metal::Device) -> IcbReplay {
+    pub fn build(self, _device: &ProtocolObject<dyn MTLDevice>) -> IcbReplay {
         IcbReplay {
             dispatches: self.dispatches,
             label: self.label,
@@ -114,41 +126,43 @@ impl IcbReplay {
     /// This re-encodes the dispatches using the captured pipeline states
     /// and buffer bindings. For static decode shapes, the encoding cost
     /// is minimal since pipeline states are already resolved.
-    pub fn replay(&self, queue: &CommandQueue) {
+    pub fn replay(&self, queue: &ProtocolObject<dyn MTLCommandQueue>) {
         if self.dispatches.is_empty() {
             return;
         }
 
-        let cb = queue.new_command_buffer_with_unretained_references();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
 
         for dispatch in &self.dispatches {
-            let enc = cb.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&dispatch.pipeline);
+            let enc = cb.computeCommandEncoder().unwrap();
+            let pass = ComputePass::new(&enc);
+            pass.set_pipeline(&dispatch.pipeline);
 
             for (index, buffer, offset) in &dispatch.buffers {
-                enc.set_buffer(*index, Some(buffer), *offset);
+                pass.set_buffer(*index as u32, Some(buffer), *offset as usize);
             }
 
-            enc.dispatch_threads(dispatch.grid_size, dispatch.threadgroup_size);
-            enc.end_encoding();
+            pass.dispatch_threads(dispatch.grid_size, dispatch.threadgroup_size);
+            pass.end();
         }
 
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
     }
 
     /// Replay into a command buffer without committing (for batching).
-    pub fn replay_into(&self, cb: &metal::CommandBufferRef) {
+    pub fn replay_into(&self, cb: &ProtocolObject<dyn MTLCommandBuffer>) {
         for dispatch in &self.dispatches {
-            let enc = cb.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&dispatch.pipeline);
+            let enc = cb.computeCommandEncoder().unwrap();
+            let pass = ComputePass::new(&enc);
+            pass.set_pipeline(&dispatch.pipeline);
 
             for (index, buffer, offset) in &dispatch.buffers {
-                enc.set_buffer(*index, Some(buffer), *offset);
+                pass.set_buffer(*index as u32, Some(buffer), *offset as usize);
             }
 
-            enc.dispatch_threads(dispatch.grid_size, dispatch.threadgroup_size);
-            enc.end_encoding();
+            pass.dispatch_threads(dispatch.grid_size, dispatch.threadgroup_size);
+            pass.end();
         }
     }
 
@@ -177,7 +191,7 @@ impl IcbReplay {
     /// maintaining correctness for dependent ones.
     pub fn replay_into_concurrent(
         &self,
-        cb: &metal::CommandBufferRef,
+        cb: &ProtocolObject<dyn MTLCommandBuffer>,
         tracker: &mut crate::command::BarrierTracker,
     ) {
         if self.dispatches.is_empty() {
@@ -192,7 +206,7 @@ impl IcbReplay {
             // input_indices/output_indices store Metal binding indices, and
             // the buffers vec stores (binding_index, buffer, offset) tuples
             // which may be sparse or reordered.
-            let inputs: Vec<&metal::Buffer> = dispatch
+            let inputs: Vec<&ProtocolObject<dyn MTLBuffer>> = dispatch
                 .input_indices
                 .iter()
                 .filter_map(|&i| {
@@ -200,10 +214,10 @@ impl IcbReplay {
                         .buffers
                         .iter()
                         .find(|(idx, _, _)| *idx == i as u64)
-                        .map(|(_, buf, _)| buf)
+                        .map(|(_, buf, _)| &**buf)
                 })
                 .collect();
-            let outputs: Vec<&metal::Buffer> = dispatch
+            let outputs: Vec<&ProtocolObject<dyn MTLBuffer>> = dispatch
                 .output_indices
                 .iter()
                 .filter_map(|&i| {
@@ -211,22 +225,24 @@ impl IcbReplay {
                         .buffers
                         .iter()
                         .find(|(idx, _, _)| *idx == i as u64)
-                        .map(|(_, buf, _)| buf)
+                        .map(|(_, buf, _)| &**buf)
                 })
                 .collect();
 
             if tracker.check_concurrent(&inputs, &outputs) {
-                crate::command::memory_barrier_scope_buffers(encoder);
+                crate::command::memory_barrier_scope_buffers(&encoder);
             }
 
-            encoder.set_compute_pipeline_state(&dispatch.pipeline);
+            let pass = ComputePass::new(&encoder);
+            pass.set_pipeline(&dispatch.pipeline);
             for (index, buffer, offset) in &dispatch.buffers {
-                encoder.set_buffer(*index, Some(buffer), *offset);
+                pass.set_buffer(*index as u32, Some(buffer), *offset as usize);
             }
-            encoder.dispatch_threads(dispatch.grid_size, dispatch.threadgroup_size);
+            pass.dispatch_threads(dispatch.grid_size, dispatch.threadgroup_size);
         }
 
-        encoder.end_encoding();
+        let pass = ComputePass::new(&encoder);
+        pass.end();
     }
 
     /// Replay with dynamic parameter updates for decode tokens.
@@ -237,7 +253,7 @@ impl IcbReplay {
     /// Returns false if the replay is invalid (slab moved) and must be re-recorded.
     pub fn replay_decode(
         &self,
-        cb: &metal::CommandBufferRef,
+        cb: &ProtocolObject<dyn MTLCommandBuffer>,
         tracker: &mut crate::command::BarrierTracker,
         _position: u32,
         _kv_seq_len: u32,
@@ -251,7 +267,7 @@ impl IcbReplay {
         for dispatch in &self.dispatches {
             // Look up buffers by binding index, not vec position (same fix
             // as replay_into_concurrent above).
-            let inputs: Vec<&metal::Buffer> = dispatch
+            let inputs: Vec<&ProtocolObject<dyn MTLBuffer>> = dispatch
                 .input_indices
                 .iter()
                 .filter_map(|&i| {
@@ -259,10 +275,10 @@ impl IcbReplay {
                         .buffers
                         .iter()
                         .find(|(idx, _, _)| *idx == i as u64)
-                        .map(|(_, buf, _)| buf)
+                        .map(|(_, buf, _)| &**buf)
                 })
                 .collect();
-            let outputs: Vec<&metal::Buffer> = dispatch
+            let outputs: Vec<&ProtocolObject<dyn MTLBuffer>> = dispatch
                 .output_indices
                 .iter()
                 .filter_map(|&i| {
@@ -270,17 +286,18 @@ impl IcbReplay {
                         .buffers
                         .iter()
                         .find(|(idx, _, _)| *idx == i as u64)
-                        .map(|(_, buf, _)| buf)
+                        .map(|(_, buf, _)| &**buf)
                 })
                 .collect();
 
             if tracker.check_concurrent(&inputs, &outputs) {
-                crate::command::memory_barrier_scope_buffers(encoder);
+                crate::command::memory_barrier_scope_buffers(&encoder);
             }
 
-            encoder.set_compute_pipeline_state(&dispatch.pipeline);
+            let pass = ComputePass::new(&encoder);
+            pass.set_pipeline(&dispatch.pipeline);
             for (index, buffer, offset) in &dispatch.buffers {
-                encoder.set_buffer(*index, Some(buffer), *offset);
+                pass.set_buffer(*index as u32, Some(buffer), *offset as usize);
             }
 
             // Dynamic params: set position and seq_len as bytes
@@ -288,10 +305,10 @@ impl IcbReplay {
             // Only set if the dispatch uses these indices
             // (This is a no-op for dispatches that don't need them)
 
-            encoder.dispatch_threads(dispatch.grid_size, dispatch.threadgroup_size);
+            pass.dispatch_threads(dispatch.grid_size, dispatch.threadgroup_size);
         }
 
-        encoder.end_encoding();
+        ComputePass::new(&encoder).end();
         true
     }
 }
@@ -308,19 +325,28 @@ pub struct IcbValidity {
 
 impl IcbValidity {
     /// Create a new validity state from current cache state.
-    pub fn new(batch_size: usize, k_slab: &Buffer, v_slab: &Buffer) -> Self {
+    pub fn new(
+        batch_size: usize,
+        k_slab: &ProtocolObject<dyn MTLBuffer>,
+        v_slab: &ProtocolObject<dyn MTLBuffer>,
+    ) -> Self {
         Self {
             batch_size,
-            k_slab_addr: k_slab.gpu_address(),
-            v_slab_addr: v_slab.gpu_address(),
+            k_slab_addr: k_slab.gpuAddress(),
+            v_slab_addr: v_slab.gpuAddress(),
         }
     }
 
     /// Check if the ICB is still valid for the current state.
-    pub fn is_valid(&self, batch_size: usize, k_slab: &Buffer, v_slab: &Buffer) -> bool {
+    pub fn is_valid(
+        &self,
+        batch_size: usize,
+        k_slab: &ProtocolObject<dyn MTLBuffer>,
+        v_slab: &ProtocolObject<dyn MTLBuffer>,
+    ) -> bool {
         self.batch_size == batch_size
-            && self.k_slab_addr == k_slab.gpu_address()
-            && self.v_slab_addr == v_slab.gpu_address()
+            && self.k_slab_addr == k_slab.gpuAddress()
+            && self.v_slab_addr == v_slab.gpuAddress()
     }
 }
 
@@ -385,8 +411,8 @@ impl IcbCache {
         key: &IcbKey,
         validity: &IcbValidity,
         batch_size: usize,
-        k_slab: &Buffer,
-        v_slab: &Buffer,
+        k_slab: &ProtocolObject<dyn MTLBuffer>,
+        v_slab: &ProtocolObject<dyn MTLBuffer>,
     ) -> Option<&IcbReplay> {
         if !validity.is_valid(batch_size, k_slab, v_slab) {
             return None;
@@ -404,6 +430,14 @@ impl Default for IcbCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::OnceLock;
+
+    fn test_device() -> Option<&'static MtlDevice> {
+        static DEVICE: OnceLock<Option<MtlDevice>> = OnceLock::new();
+        DEVICE
+            .get_or_init(|| objc2::rc::autoreleasepool(|_| MTLCreateSystemDefaultDevice()))
+            .as_ref()
+    }
 
     #[test]
     fn icb_builder_empty() {
@@ -437,8 +471,11 @@ mod tests {
 
     #[test]
     fn icb_replay_empty() {
-        let device = metal::Device::system_default().expect("Metal device required");
-        let queue = device.new_command_queue();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let queue = device.newCommandQueue().unwrap();
 
         let replay = IcbReplay {
             dispatches: vec![],
@@ -452,9 +489,12 @@ mod tests {
 
     #[test]
     fn test_icb_concurrent_replay_empty() {
-        let device = metal::Device::system_default().expect("Metal device required");
-        let queue = device.new_command_queue();
-        let cb = queue.new_command_buffer();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let queue = device.newCommandQueue().unwrap();
+        let cb = queue.commandBuffer().unwrap();
 
         let replay = IcbReplay {
             dispatches: vec![],
@@ -462,31 +502,43 @@ mod tests {
         };
 
         let mut tracker = crate::command::BarrierTracker::new();
-        replay.replay_into_concurrent(cb, &mut tracker);
+        replay.replay_into_concurrent(&cb, &mut tracker);
         // Empty replay should be a no-op (no encoder created)
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
     }
 
     #[test]
     fn test_icb_validity() {
-        let device = metal::Device::system_default().expect("Metal device required");
-        let buf_k = device.new_buffer(4096, metal::MTLResourceOptions::StorageModeShared);
-        let buf_v = device.new_buffer(4096, metal::MTLResourceOptions::StorageModeShared);
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let buf_k = device
+            .newBufferWithLength_options(4096, MTLResourceOptions::StorageModeShared)
+            .unwrap();
+        let buf_v = device
+            .newBufferWithLength_options(4096, MTLResourceOptions::StorageModeShared)
+            .unwrap();
 
         let validity = IcbValidity::new(1, &buf_k, &buf_v);
         assert!(validity.is_valid(1, &buf_k, &buf_v));
         assert!(!validity.is_valid(2, &buf_k, &buf_v), "batch size changed");
 
-        let buf_k2 = device.new_buffer(4096, metal::MTLResourceOptions::StorageModeShared);
+        let buf_k2 = device
+            .newBufferWithLength_options(4096, MTLResourceOptions::StorageModeShared)
+            .unwrap();
         assert!(!validity.is_valid(1, &buf_k2, &buf_v), "k slab moved");
     }
 
     #[test]
     fn test_icb_replay_decode_empty() {
-        let device = metal::Device::system_default().expect("Metal device required");
-        let queue = device.new_command_queue();
-        let cb = queue.new_command_buffer();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let queue = device.newCommandQueue().unwrap();
+        let cb = queue.commandBuffer().unwrap();
 
         let replay = IcbReplay {
             dispatches: vec![],
@@ -494,17 +546,24 @@ mod tests {
         };
 
         let mut tracker = crate::command::BarrierTracker::new();
-        let valid = replay.replay_decode(cb, &mut tracker, 0, 0);
+        let valid = replay.replay_decode(&cb, &mut tracker, 0, 0);
         assert!(valid, "empty replay should always be valid");
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
     }
 
     #[test]
     fn test_icb_cache_get_valid() {
-        let device = metal::Device::system_default().expect("Metal device required");
-        let buf_k = device.new_buffer(4096, metal::MTLResourceOptions::StorageModeShared);
-        let buf_v = device.new_buffer(4096, metal::MTLResourceOptions::StorageModeShared);
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let buf_k = device
+            .newBufferWithLength_options(4096, MTLResourceOptions::StorageModeShared)
+            .unwrap();
+        let buf_v = device
+            .newBufferWithLength_options(4096, MTLResourceOptions::StorageModeShared)
+            .unwrap();
 
         let mut cache = IcbCache::new();
         let key = IcbKey {
@@ -534,7 +593,9 @@ mod tests {
             .is_none());
 
         // Invalid: k slab moved
-        let buf_k2 = device.new_buffer(4096, metal::MTLResourceOptions::StorageModeShared);
+        let buf_k2 = device
+            .newBufferWithLength_options(4096, MTLResourceOptions::StorageModeShared)
+            .unwrap();
         assert!(cache
             .get_valid(&key, &validity, 1, &buf_k2, &buf_v)
             .is_none());

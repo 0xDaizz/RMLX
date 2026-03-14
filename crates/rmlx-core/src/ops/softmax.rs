@@ -14,7 +14,14 @@
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
-use metal::MTLSize;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLCommandBuffer as _;
+use objc2_metal::MTLCommandQueue as _;
+use objc2_metal::MTLComputePipelineState as _;
+use objc2_metal::MTLDevice as _;
+use rmlx_metal::ComputePass;
+use rmlx_metal::MTLResourceOptions;
+use rmlx_metal::MTLSize;
 
 /// N_READS: each thread processes 4 consecutive elements per iteration for
 /// better memory coalescing.
@@ -697,7 +704,7 @@ pub fn register(registry: &KernelRegistry) -> Result<(), KernelError> {
 pub fn softmax(
     registry: &KernelRegistry,
     input: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     if input.ndim() == 0 {
         return Err(KernelError::InvalidShape(
@@ -729,8 +736,8 @@ pub fn softmax(
     let axis_size_u32 = super::checked_u32(axis_size, "axis_size")?;
 
     // Choose kernel variant based on dtype and row size.
-    let tg_size_hint: u64 = 1024; // will be clamped below
-    let use_single_row = axis_size <= N_READS * (tg_size_hint as usize);
+    let tg_size_hint: usize = 1024; // will be clamped below
+    let use_single_row = axis_size <= N_READS * tg_size_hint;
 
     let kernel_name = match (input.dtype(), use_single_row) {
         (DType::Float32, true) => "softmax_single_row_f32",
@@ -751,26 +758,44 @@ pub fn softmax(
 
     let out = Array::zeros(registry.device().raw(), shape, input.dtype());
 
-    let axis_buf = registry.device().raw().new_buffer_with_data(
-        &axis_size_u32 as *const u32 as *const std::ffi::c_void,
-        4,
-        metal::MTLResourceOptions::StorageModeShared,
-    );
+    let axis_buf = unsafe {
+        registry
+            .device()
+            .raw()
+            .newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(
+                    &axis_size_u32 as *const u32 as *const std::ffi::c_void
+                        as *mut std::ffi::c_void,
+                )
+                .unwrap(),
+                4_usize,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap()
+    };
 
-    let command_buffer = queue.new_command_buffer();
-    let encoder = command_buffer.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
+    let command_buffer = queue.commandBuffer().unwrap();
+    let raw_enc = command_buffer.computeCommandEncoder().unwrap();
+    let encoder = ComputePass::new(&raw_enc);
+    encoder.set_pipeline(&pipeline);
+    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset());
     encoder.set_buffer(1, Some(out.metal_buffer()), 0);
     encoder.set_buffer(2, Some(&axis_buf), 0);
-
-    let tg_size = std::cmp::min(tg_size_hint, pipeline.max_total_threads_per_threadgroup());
-    encoder.dispatch_thread_groups(
-        MTLSize::new(num_rows as u64, 1, 1),
-        MTLSize::new(tg_size, 1, 1),
+    let tg_size = std::cmp::min(tg_size_hint, pipeline.maxTotalThreadsPerThreadgroup());
+    encoder.dispatch_threadgroups(
+        MTLSize {
+            width: num_rows as usize,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        },
     );
-    encoder.end_encoding();
-    super::commit_with_mode(command_buffer, super::ExecMode::Sync);
+    encoder.end();
+    super::commit_with_mode(&command_buffer, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -781,14 +806,14 @@ mod tests {
 
     #[test]
     fn test_softmax_zero_rank_returns_error() {
-        let gpu_dev = rmlx_metal::device::GpuDevice::system_default().unwrap();
-        let device = gpu_dev.raw().clone();
-        let queue = device.new_command_queue();
+        let gpu_dev = crate::test_utils::require_gpu!();
+        let queue = gpu_dev.new_command_queue();
         let registry = KernelRegistry::new(gpu_dev);
         super::register(&registry).expect("register softmax kernels");
+        let device = registry.device().raw();
 
         // Create a 0D (scalar) array
-        let scalar = Array::zeros(&device, &[], DType::Float32);
+        let scalar = Array::zeros(device, &[], DType::Float32);
         assert_eq!(scalar.ndim(), 0);
 
         let result = softmax(&registry, &scalar, &queue);

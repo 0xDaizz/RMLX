@@ -19,7 +19,7 @@ cargo test --workspace
 
 # 4. Check formatting and linting
 cargo fmt --all --check
-cargo clippy --workspace -- -D warnings
+cargo clippy --workspace --all-targets
 ```
 
 > **Note**: The first build may take several minutes to download and compile dependencies.
@@ -34,12 +34,14 @@ rmlx is organized as a Cargo workspace containing the following crates:
 rmlx/
 ├── Cargo.toml              # workspace root
 ├── crates/
-│   ├── rmlx-metal/         # Metal GPU abstractions
+│   ├── rmlx-metal/         # Metal GPU abstractions (objc2-metal 0.3)
 │   ├── rmlx-alloc/         # Zero-copy memory allocation
 │   ├── rmlx-rdma/          # RDMA communication (Thunderbolt 5)
-│   ├── rmlx-core/          # Array type, kernel registry
+│   ├── rmlx-core/          # Array type, kernel registry, ops
 │   ├── rmlx-distributed/   # Distributed inference (EP, pipeline)
-│   └── rmlx-nn/            # Neural network layers (Transformer, etc.)
+│   ├── rmlx-nn/            # Neural network layers (Transformer, MoE)
+│   ├── rmlx-cli/           # Native CLI tooling (rmlx launch, config)
+│   └── rmlx-macros/        # Procedural macros
 ```
 
 ---
@@ -85,6 +87,17 @@ If you have a pre-compiled `.metallib` file available separately, you can specif
 # Pass the AOT metallib path via environment variable
 RMLX_METALLIB_PATH=/path/to/rmlx_kernels.metallib cargo build --workspace
 ```
+
+### Key Dependencies
+
+| Dependency | Version | Purpose |
+|-----------|---------|---------|
+| `objc2` | 0.6 | Objective-C runtime bindings |
+| `objc2-metal` | 0.3 | Apple Metal API bindings |
+| `objc2-foundation` | 0.3 | Foundation framework bindings |
+| `block2` | 0.6 | Objective-C block support |
+| `bytemuck` | 1 | Safe transmutation for GPU buffer data |
+| `half` | 2 | f16/bf16 types |
 
 ---
 
@@ -133,7 +146,7 @@ Before creating a pull request, you can run the same verification locally that C
 # Full CI verification sequence
 cargo build --workspace \
   && cargo fmt --all --check \
-  && cargo clippy --workspace -- -D warnings \
+  && cargo clippy --workspace --all-targets \
   && cargo test --workspace
 ```
 

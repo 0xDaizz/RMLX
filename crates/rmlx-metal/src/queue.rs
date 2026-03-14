@@ -1,9 +1,11 @@
 //! Metal command queue management
 
-use metal::{CommandBuffer, CommandBufferRef, CommandQueue};
+use objc2::runtime::ProtocolObject;
+use objc2_metal::*;
 
-use crate::command::{CommandBufferManager, GpuError, GpuErrorStore};
+use crate::command::{register_completion_handler, CommandBufferManager, GpuError, GpuErrorStore};
 use crate::device::GpuDevice;
+use crate::types::*;
 
 /// Create a command buffer using `commandBufferWithUnretainedReferences`.
 ///
@@ -13,23 +15,23 @@ use crate::device::GpuDevice;
 /// because `Array` storage is `Arc`-wrapped.
 ///
 /// All Apple Silicon (M1+) supports this API.  On hypothetical older hardware
-/// the regular `new_command_buffer()` path would be needed, but RMLX targets
+/// the regular `commandBuffer()` path would be needed, but RMLX targets
 /// M-series exclusively so we use unretained unconditionally.
 #[inline]
-pub fn fast_command_buffer(queue: &CommandQueue) -> &CommandBufferRef {
-    queue.new_command_buffer_with_unretained_references()
+pub fn fast_command_buffer(queue: &ProtocolObject<dyn MTLCommandQueue>) -> MtlCB {
+    queue.commandBufferWithUnretainedReferences().unwrap()
 }
 
 /// Owned variant: creates a **retained-references** command buffer.
 ///
-/// Uses `new_command_buffer()` (retained) instead of `new_command_buffer_with_unretained_references()`
+/// Uses `commandBuffer()` (retained) instead of `commandBufferWithUnretainedReferences()`
 /// because ExecGraph batches multiple operations into a single CB. Intermediate
 /// Arrays (norm outputs, attention intermediates) may be dropped before the CB
 /// is committed to the GPU, causing use-after-free. Retained CBs hold strong
 /// references to all encoder resources, keeping buffers alive until GPU completion.
 #[inline]
-pub fn fast_command_buffer_owned(queue: &CommandQueue) -> CommandBuffer {
-    queue.new_command_buffer().to_owned()
+pub fn fast_command_buffer_owned(queue: &ProtocolObject<dyn MTLCommandQueue>) -> MtlCB {
+    queue.commandBuffer().unwrap()
 }
 
 /// Thin wrapper around a Metal command queue.
@@ -37,7 +39,7 @@ pub fn fast_command_buffer_owned(queue: &CommandQueue) -> CommandBuffer {
 /// For single-queue usage. See [`crate::stream::StreamManager`] for
 /// dual-queue (compute + transfer) scheduling with inter-queue sync.
 pub struct GpuQueue {
-    queue: CommandQueue,
+    queue: MtlQueue,
     /// Shared error store for completion-handler error reporting (M4).
     error_store: std::sync::Arc<GpuErrorStore>,
 }
@@ -55,27 +57,15 @@ impl GpuQueue {
     ///
     /// Uses `commandBufferWithUnretainedReferences` to skip retain/release
     /// overhead on referenced resources.
-    pub fn new_command_buffer(&self) -> &CommandBufferRef {
+    pub fn new_command_buffer(&self) -> MtlCB {
         fast_command_buffer(&self.queue)
     }
 
     /// Create a new command buffer and register a completion handler that
     /// checks for GPU errors after execution (M4).
-    pub fn new_checked_command_buffer(&self) -> &CommandBufferRef {
+    pub fn new_checked_command_buffer(&self) -> MtlCB {
         let cb = fast_command_buffer(&self.queue);
-        let store = std::sync::Arc::clone(&self.error_store);
-        let handler = block::ConcreteBlock::new(move |cmd_buf: &CommandBufferRef| {
-            let status = cmd_buf.status();
-            if status == metal::MTLCommandBufferStatus::Error {
-                let msg = format!("command buffer completed with error status: {status:?}");
-                store.push(GpuError {
-                    status,
-                    message: msg,
-                });
-            }
-        });
-        let handler = handler.copy();
-        cb.add_completed_handler(&handler);
+        register_completion_handler(&cb, &self.error_store);
         cb
     }
 
@@ -96,8 +86,8 @@ impl GpuQueue {
         self.error_store.has_errors()
     }
 
-    /// Access the underlying `metal::CommandQueue`.
-    pub fn raw(&self) -> &CommandQueue {
+    /// Access the underlying command queue.
+    pub fn raw(&self) -> &ProtocolObject<dyn MTLCommandQueue> {
         &self.queue
     }
 }

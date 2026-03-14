@@ -2,6 +2,8 @@
 
 use std::sync::{Arc, Mutex};
 
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLDevice;
 use rmlx_alloc::zero_copy::CompletionTicket;
 use rmlx_metal::event::GpuEvent;
 use rmlx_rdma::gpu_doorbell::{DescriptorProxy, DescriptorRing};
@@ -114,7 +116,7 @@ impl EpRuntimeContext {
         progress: Arc<ProgressEngine>,
         shared_pool: Arc<Mutex<SharedBufferPool>>,
         conn_ids: Vec<ConnectionId>,
-        device: &metal::Device,
+        device: &ProtocolObject<dyn MTLDevice>,
     ) -> Self {
         let compute_event = Arc::new(GpuEvent::new(device));
         let transfer_event = Arc::new(GpuEvent::new(device));
@@ -351,11 +353,20 @@ impl Drop for EpRuntimeContext {
 mod tests {
     use super::*;
     use rmlx_rdma::shared_buffer::SharedBufferPool;
+    use std::sync::OnceLock;
 
-    /// Helper: create a pool with the given tier sizes. Skips if no Metal device.
+    fn test_device() -> Option<&'static rmlx_metal::MtlDevice> {
+        static DEVICE: OnceLock<Option<rmlx_metal::MtlDevice>> = OnceLock::new();
+        DEVICE
+            .get_or_init(|| {
+                objc2::rc::autoreleasepool(|_| objc2_metal::MTLCreateSystemDefaultDevice())
+            })
+            .as_ref()
+    }
+
+    /// Helper: create a pool with the given tier sizes.
     fn make_pool(tier_sizes: &[usize]) -> Option<SharedBufferPool> {
-        let device = metal::Device::system_default()?;
-        SharedBufferPool::new(&device, tier_sizes).ok()
+        SharedBufferPool::new(test_device()?, tier_sizes).ok()
     }
 
     #[test]
@@ -365,11 +376,14 @@ mod tests {
             None => return, // skip on CI without Metal
         };
         let pool = Arc::new(Mutex::new(pool));
-        let device = metal::Device::system_default().unwrap();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let progress = Arc::new(rmlx_rdma::progress::ProgressEngine::new());
         let transport = Arc::new(crate::transport::RdmaConnectionTransport::new(vec![], 0));
 
-        let ctx = EpRuntimeContext::new(transport, progress, pool, vec![], &device);
+        let ctx = EpRuntimeContext::new(transport, progress, pool, vec![], device);
 
         let world_size = 3;
         let local_rank = 1;
@@ -418,11 +432,14 @@ mod tests {
             None => return,
         };
         let pool = Arc::new(Mutex::new(pool));
-        let device = metal::Device::system_default().unwrap();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let progress = Arc::new(rmlx_rdma::progress::ProgressEngine::new());
         let transport = Arc::new(crate::transport::RdmaConnectionTransport::new(vec![], 0));
 
-        let ctx = EpRuntimeContext::new(transport, progress, Arc::clone(&pool), vec![], &device);
+        let ctx = EpRuntimeContext::new(transport, progress, Arc::clone(&pool), vec![], device);
 
         // world_size=2, local_rank=0 => only peer rank 1 needs buffers (1 send + 1 recv = 2).
         // PIPELINE=2, so the pool has exactly 2 buffers in the 4096 tier.
@@ -462,11 +479,14 @@ mod tests {
             None => return,
         };
         let pool = Arc::new(Mutex::new(pool));
-        let device = metal::Device::system_default().unwrap();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let progress = Arc::new(rmlx_rdma::progress::ProgressEngine::new());
         let transport = Arc::new(crate::transport::RdmaConnectionTransport::new(vec![], 0));
 
-        let ctx = EpRuntimeContext::new(transport, progress, pool, vec![], &device);
+        let ctx = EpRuntimeContext::new(transport, progress, pool, vec![], device);
 
         let (send_bufs, recv_bufs) = ctx
             .acquire_send_recv_buffers(0, 4, 0)
@@ -486,11 +506,14 @@ mod tests {
             None => return,
         };
         let pool = Arc::new(Mutex::new(pool));
-        let device = metal::Device::system_default().unwrap();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let progress = Arc::new(rmlx_rdma::progress::ProgressEngine::new());
         let transport = Arc::new(crate::transport::RdmaConnectionTransport::new(vec![], 0));
 
-        let ctx = EpRuntimeContext::new(transport, progress, pool, vec![], &device);
+        let ctx = EpRuntimeContext::new(transport, progress, pool, vec![], device);
 
         let (mut send_bufs, recv_bufs) = ctx
             .acquire_send_recv_buffers(4096, 2, 0)

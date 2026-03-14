@@ -5,6 +5,8 @@
 //!
 //! v1: CPU-side fallback for sort/sample operations. GPU sort path is a TODO.
 
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLCommandQueue, MTLDevice};
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::{KernelError, KernelRegistry};
@@ -71,7 +73,7 @@ impl Sampler {
         past_tokens: &[u32],
         config: &SamplerConfig,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<u32, KernelError> {
         validate_1d_f32(logits, "sample_token")?;
 
@@ -237,7 +239,7 @@ pub fn rejection_sample(
     draft_probs: &Array,
     draft_tokens: &[u32],
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
 ) -> Result<SpecDecodeResult, KernelError> {
     if target_logits.ndim() != 2 || draft_probs.ndim() != 2 {
         return Err(KernelError::InvalidShape(
@@ -370,7 +372,7 @@ pub fn rejection_sample(
 pub fn temperature(
     logits: &Array,
     temp: f32,
-    device: &metal::Device,
+    device: &ProtocolObject<dyn MTLDevice>,
 ) -> Result<Array, KernelError> {
     validate_1d_f32(logits, "temperature")?;
     if temp <= 0.0 {
@@ -390,7 +392,11 @@ pub fn temperature(
 /// masks everything below it.
 ///
 /// TODO: Replace with GPU sort path when a Metal bitonic/radix sort kernel is available.
-pub fn top_k(logits: &Array, k: usize, device: &metal::Device) -> Result<Array, KernelError> {
+pub fn top_k(
+    logits: &Array,
+    k: usize,
+    device: &ProtocolObject<dyn MTLDevice>,
+) -> Result<Array, KernelError> {
     validate_1d_f32(logits, "top_k")?;
     let mut data = logits.to_vec_checked::<f32>();
     let vocab_size = data.len();
@@ -414,9 +420,9 @@ pub fn top_k(logits: &Array, k: usize, device: &metal::Device) -> Result<Array, 
 pub fn top_p(
     logits: &Array,
     p: f32,
-    device: &metal::Device,
+    device: &ProtocolObject<dyn MTLDevice>,
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     validate_1d_f32(logits, "top_p")?;
     if p <= 0.0 || p > 1.0 {
@@ -471,7 +477,7 @@ pub fn top_p(
 pub fn sample(
     logits: &Array,
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
 ) -> Result<u32, KernelError> {
     validate_1d_f32(logits, "sample")?;
 
@@ -510,7 +516,7 @@ pub fn repetition_penalty(
     logits: &Array,
     past_tokens: &[u32],
     penalty: f32,
-    device: &metal::Device,
+    device: &ProtocolObject<dyn MTLDevice>,
 ) -> Result<Array, KernelError> {
     validate_1d_f32(logits, "repetition_penalty")?;
     if penalty <= 0.0 {
@@ -675,23 +681,40 @@ fn simple_random_f32() -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::OnceLock;
 
-    fn setup() -> (metal::Device, metal::CommandQueue, KernelRegistry) {
-        let gpu = rmlx_metal::device::GpuDevice::system_default().expect("GPU device");
-        let device = gpu.raw().clone();
-        let queue = device.new_command_queue();
+    fn test_device() -> Option<&'static rmlx_metal::MtlDevice> {
+        static DEVICE: OnceLock<Option<rmlx_metal::MtlDevice>> = OnceLock::new();
+        DEVICE
+            .get_or_init(|| {
+                objc2::rc::autoreleasepool(|_| objc2_metal::MTLCreateSystemDefaultDevice())
+            })
+            .as_ref()
+    }
+
+    fn setup() -> Option<(
+        &'static rmlx_metal::MtlDevice,
+        rmlx_metal::MtlQueue,
+        KernelRegistry,
+    )> {
+        let gpu = rmlx_metal::device::GpuDevice::system_default().ok()?;
+        let device = test_device()?;
+        let queue = gpu.new_command_queue();
         let registry = KernelRegistry::new(gpu);
         ops::softmax::register(&registry).expect("register softmax");
         ops::register_all(&registry).unwrap_or(()); // register binary ops etc.
-        (device, queue, registry)
+        Some((device, queue, registry))
     }
 
     #[test]
     fn test_temperature_zero_returns_argmax() {
-        let (device, queue, registry) = setup();
+        let Some((device, queue, registry)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
 
         // logits: token 3 has the highest value
-        let logits = Array::from_slice(&device, &[1.0f32, 0.5, 2.0, 10.0, 0.1], vec![5]);
+        let logits = Array::from_slice(device, &[1.0f32, 0.5, 2.0, 10.0, 0.1], vec![5]);
 
         let config = SamplerConfig {
             temperature: 0.0,
@@ -705,10 +728,13 @@ mod tests {
 
     #[test]
     fn test_top_k_1_returns_argmax() {
-        let (device, queue, registry) = setup();
+        let Some((device, queue, registry)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
 
         // logits: token 2 has the highest value
-        let logits = Array::from_slice(&device, &[1.0f32, 0.5, 10.0, 2.0, 0.1], vec![5]);
+        let logits = Array::from_slice(device, &[1.0f32, 0.5, 10.0, 2.0, 0.1], vec![5]);
 
         let config = SamplerConfig {
             temperature: 1.0,
@@ -725,11 +751,14 @@ mod tests {
 
     #[test]
     fn test_sample_produces_valid_token_ids() {
-        let (device, queue, registry) = setup();
+        let Some((device, queue, registry)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
 
         let vocab_size = 100;
         let logits_data: Vec<f32> = (0..vocab_size).map(|i| (i as f32) * 0.01).collect();
-        let logits = Array::from_slice(&device, &logits_data, vec![vocab_size]);
+        let logits = Array::from_slice(device, &logits_data, vec![vocab_size]);
 
         let config = SamplerConfig {
             temperature: 1.0,
@@ -751,10 +780,13 @@ mod tests {
 
     #[test]
     fn test_temperature_scaling() {
-        let (device, _queue, _registry) = setup();
+        let Some((device, _queue, _registry)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
 
-        let logits = Array::from_slice(&device, &[2.0f32, 4.0, 6.0], vec![3]);
-        let scaled = temperature(&logits, 2.0, &device).expect("temperature");
+        let logits = Array::from_slice(device, &[2.0f32, 4.0, 6.0], vec![3]);
+        let scaled = temperature(&logits, 2.0, device).expect("temperature");
         let data = scaled.to_vec_checked::<f32>();
         assert!((data[0] - 1.0).abs() < 1e-6);
         assert!((data[1] - 2.0).abs() < 1e-6);
@@ -763,10 +795,13 @@ mod tests {
 
     #[test]
     fn test_top_k_masking() {
-        let (device, _queue, _registry) = setup();
+        let Some((device, _queue, _registry)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
 
-        let logits = Array::from_slice(&device, &[1.0f32, 5.0, 3.0, 2.0, 4.0], vec![5]);
-        let masked = top_k(&logits, 2, &device).expect("top_k");
+        let logits = Array::from_slice(device, &[1.0f32, 5.0, 3.0, 2.0, 4.0], vec![5]);
+        let masked = top_k(&logits, 2, device).expect("top_k");
         let data = masked.to_vec_checked::<f32>();
 
         // Top-2 values are 5.0 (index 1) and 4.0 (index 4)
@@ -779,11 +814,14 @@ mod tests {
 
     #[test]
     fn test_repetition_penalty_positive_logits() {
-        let (device, _queue, _registry) = setup();
+        let Some((device, _queue, _registry)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
 
-        let logits = Array::from_slice(&device, &[2.0f32, 4.0, 6.0, 1.0], vec![4]);
+        let logits = Array::from_slice(device, &[2.0f32, 4.0, 6.0, 1.0], vec![4]);
         let penalized =
-            repetition_penalty(&logits, &[1, 2], 2.0, &device).expect("repetition_penalty");
+            repetition_penalty(&logits, &[1, 2], 2.0, device).expect("repetition_penalty");
         let data = penalized.to_vec_checked::<f32>();
 
         // Token 0 and 3: unchanged
@@ -797,11 +835,14 @@ mod tests {
 
     #[test]
     fn test_repetition_penalty_negative_logits() {
-        let (device, _queue, _registry) = setup();
+        let Some((device, _queue, _registry)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
 
-        let logits = Array::from_slice(&device, &[-2.0f32, -4.0, 1.0], vec![3]);
+        let logits = Array::from_slice(device, &[-2.0f32, -4.0, 1.0], vec![3]);
         let penalized =
-            repetition_penalty(&logits, &[0, 1], 2.0, &device).expect("repetition_penalty");
+            repetition_penalty(&logits, &[0, 1], 2.0, device).expect("repetition_penalty");
         let data = penalized.to_vec_checked::<f32>();
 
         // Token 0 (negative, -2.0): multiplied by 2.0 -> -4.0
@@ -823,7 +864,10 @@ mod tests {
 
     #[test]
     fn test_greedy_verify_all_accepted() {
-        let (device, _queue, _registry) = setup();
+        let Some((device, _queue, _registry)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         // 3 draft tokens, target logits agree with all + bonus position
         // draft_tokens = [2, 0, 1]
         // target argmax at each position: 2, 0, 1, 3(bonus)
@@ -834,7 +878,7 @@ mod tests {
             0.1, 10.0, 0.2, 0.3, 0.1, // pos 3 (bonus): token 3 is max
             0.1, 0.2, 0.3, 10.0, 0.1,
         ];
-        let target_logits = Array::from_slice(&device, &logits_data, vec![4, 5]);
+        let target_logits = Array::from_slice(device, &logits_data, vec![4, 5]);
         let draft_tokens = vec![2u32, 0, 1];
 
         let result = greedy_verify(&target_logits, &draft_tokens).expect("greedy_verify");
@@ -845,7 +889,10 @@ mod tests {
 
     #[test]
     fn test_greedy_verify_partial_reject() {
-        let (device, _queue, _registry) = setup();
+        let Some((device, _queue, _registry)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         // draft_tokens = [2, 0, 1], but target disagrees at position 1
         let logits_data: Vec<f32> = vec![
             // pos 0: token 2 is max (agrees)
@@ -855,7 +902,7 @@ mod tests {
             0.1, 10.0, 0.2, 0.3, 0.1, // pos 3: doesn't matter
             0.1, 0.2, 0.3, 10.0, 0.1,
         ];
-        let target_logits = Array::from_slice(&device, &logits_data, vec![4, 5]);
+        let target_logits = Array::from_slice(device, &logits_data, vec![4, 5]);
         let draft_tokens = vec![2u32, 0, 1];
 
         let result = greedy_verify(&target_logits, &draft_tokens).expect("greedy_verify");
@@ -866,14 +913,17 @@ mod tests {
 
     #[test]
     fn test_greedy_verify_none_accepted() {
-        let (device, _queue, _registry) = setup();
+        let Some((device, _queue, _registry)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         // draft_tokens = [0], but target picks token 4
         let logits_data: Vec<f32> = vec![
             // pos 0: token 4 is max (disagrees with draft token 0)
             0.1, 0.2, 0.1, 0.3, 10.0, // pos 1 (bonus): doesn't matter
             10.0, 0.2, 0.3, 0.1, 0.1,
         ];
-        let target_logits = Array::from_slice(&device, &logits_data, vec![2, 5]);
+        let target_logits = Array::from_slice(device, &logits_data, vec![2, 5]);
         let draft_tokens = vec![0u32];
 
         let result = greedy_verify(&target_logits, &draft_tokens).expect("greedy_verify");

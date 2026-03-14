@@ -6,7 +6,14 @@
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
-use metal::MTLSize;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLCommandBuffer as _;
+use objc2_metal::MTLCommandQueue as _;
+use objc2_metal::MTLComputePipelineState as _;
+use objc2_metal::MTLDevice as _;
+use rmlx_metal::ComputePass;
+use rmlx_metal::MTLResourceOptions;
+use rmlx_metal::MTLSize;
 
 // ---------------------------------------------------------------------------
 // Metal shader source for VJP backward kernels
@@ -115,26 +122,28 @@ pub fn register(registry: &KernelRegistry) -> Result<(), KernelError> {
 // ---------------------------------------------------------------------------
 
 /// Create a u32 Metal constant buffer.
-fn make_u32_buf(device: &metal::DeviceRef, val: u32) -> metal::Buffer {
-    device.new_buffer_with_data(
-        &val as *const u32 as *const _,
-        std::mem::size_of::<u32>() as u64,
-        metal::MTLResourceOptions::StorageModeShared,
-    )
+fn make_u32_buf(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    val: u32,
+) -> rmlx_metal::MtlBuffer {
+    unsafe {
+        device
+            .newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(&val as *const u32 as *const _ as *mut std::ffi::c_void)
+                    .unwrap(),
+                std::mem::size_of::<u32>() as u64 as usize,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap()
+    }
 }
 
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
-/// GPU backward for elementwise addition.
-///
-/// Given `grad_output`, produces `grad_a = grad_output` and `grad_b = grad_output`.
-/// Returns `(grad_a, grad_b)`.
+// --------------------------------------------------------------------------- // Public API // ---------------------------------------------------------------------------
+/// GPU backward for elementwise addition. /// /// Given `grad_output`, produces `grad_a = grad_output` and `grad_b = grad_output`. /// Returns `(grad_a, grad_b)`. pub
 pub fn vjp_add(
     registry: &KernelRegistry,
     grad_output: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<(Array, Array), KernelError> {
     if grad_output.dtype() != DType::Float32 {
         return Err(KernelError::InvalidShape(format!(
@@ -159,26 +168,26 @@ pub fn vjp_add(
     let grad_a = Array::zeros(dev, grad_output.shape(), DType::Float32);
     let grad_b = Array::zeros(dev, grad_output.shape(), DType::Float32);
 
-    let cb = queue.new_command_buffer();
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(
-        0,
-        Some(grad_output.metal_buffer()),
-        grad_output.offset() as u64,
-    );
+    let cb = queue.commandBuffer().unwrap();
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
+    enc.set_buffer(0, Some(grad_output.metal_buffer()), grad_output.offset());
     enc.set_buffer(1, Some(grad_a.metal_buffer()), 0);
     enc.set_buffer(2, Some(grad_b.metal_buffer()), 0);
-
-    let grid = MTLSize::new(numel as u64, 1, 1);
-    let tg = MTLSize::new(
-        std::cmp::min(pipeline.max_total_threads_per_threadgroup(), numel as u64),
-        1,
-        1,
-    );
+    let grid = MTLSize {
+        width: numel,
+        height: 1,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), numel),
+        height: 1,
+        depth: 1,
+    };
     enc.dispatch_threads(grid, tg);
-    enc.end_encoding();
-    super::commit_with_mode(cb, super::ExecMode::Sync);
+    enc.end();
+    super::commit_with_mode(&cb, super::ExecMode::Sync);
 
     Ok((grad_a, grad_b))
 }
@@ -195,7 +204,7 @@ pub fn vjp_mul(
     grad_output: &Array,
     a: &Array,
     b: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<(Array, Array), KernelError> {
     if grad_output.dtype() != DType::Float32 {
         return Err(KernelError::InvalidShape(format!(
@@ -218,28 +227,28 @@ pub fn vjp_mul(
     let grad_a = Array::zeros(dev, grad_output.shape(), DType::Float32);
     let grad_b = Array::zeros(dev, grad_output.shape(), DType::Float32);
 
-    let cb = queue.new_command_buffer();
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(
-        0,
-        Some(grad_output.metal_buffer()),
-        grad_output.offset() as u64,
-    );
-    enc.set_buffer(1, Some(a.metal_buffer()), a.offset() as u64);
-    enc.set_buffer(2, Some(b.metal_buffer()), b.offset() as u64);
+    let cb = queue.commandBuffer().unwrap();
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
+    enc.set_buffer(0, Some(grad_output.metal_buffer()), grad_output.offset());
+    enc.set_buffer(1, Some(a.metal_buffer()), a.offset());
+    enc.set_buffer(2, Some(b.metal_buffer()), b.offset());
     enc.set_buffer(3, Some(grad_a.metal_buffer()), 0);
     enc.set_buffer(4, Some(grad_b.metal_buffer()), 0);
-
-    let grid = MTLSize::new(numel as u64, 1, 1);
-    let tg = MTLSize::new(
-        std::cmp::min(pipeline.max_total_threads_per_threadgroup(), numel as u64),
-        1,
-        1,
-    );
+    let grid = MTLSize {
+        width: numel,
+        height: 1,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), numel),
+        height: 1,
+        depth: 1,
+    };
     enc.dispatch_threads(grid, tg);
-    enc.end_encoding();
-    super::commit_with_mode(cb, super::ExecMode::Sync);
+    enc.end();
+    super::commit_with_mode(&cb, super::ExecMode::Sync);
 
     Ok((grad_a, grad_b))
 }
@@ -261,7 +270,7 @@ pub fn vjp_matmul(
     grad_c: &Array,
     a: &Array,
     b: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<(Array, Array), KernelError> {
     if grad_c.dtype() != DType::Float32 {
         return Err(KernelError::InvalidShape(format!(
@@ -298,51 +307,67 @@ pub fn vjp_matmul(
     // --- grad_a = grad_c @ B^T ---
     {
         let pipeline = registry.get_pipeline("vjp_matmul_grad_a_f32", DType::Float32)?;
-        let cb = queue.new_command_buffer();
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pipeline);
-        enc.set_buffer(0, Some(grad_c.metal_buffer()), grad_c.offset() as u64);
-        enc.set_buffer(1, Some(b.metal_buffer()), b.offset() as u64);
+        let cb = queue.commandBuffer().unwrap();
+        let raw_enc = cb.computeCommandEncoder().unwrap();
+        let enc = ComputePass::new(&raw_enc);
+        enc.set_pipeline(&pipeline);
+        enc.set_buffer(0, Some(grad_c.metal_buffer()), grad_c.offset());
+        enc.set_buffer(1, Some(b.metal_buffer()), b.offset());
         enc.set_buffer(2, Some(grad_a.metal_buffer()), 0);
         enc.set_buffer(3, Some(&m_buf), 0);
         enc.set_buffer(4, Some(&k_buf), 0);
         enc.set_buffer(5, Some(&n_buf), 0);
+        let max_tg = pipeline.maxTotalThreadsPerThreadgroup();
+        let tw = pipeline.threadExecutionWidth();
+        let tg_x = tw.min(k);
+        let tg_y = (max_tg / tg_x).max(1).min(m);
 
-        let max_tg = pipeline.max_total_threads_per_threadgroup();
-        let tw = pipeline.thread_execution_width();
-        let tg_x = tw.min(k as u64);
-        let tg_y = (max_tg / tg_x).max(1).min(m as u64);
-
-        let grid = MTLSize::new(k as u64, m as u64, 1);
-        let tg = MTLSize::new(tg_x, tg_y, 1);
+        let grid = MTLSize {
+            width: k,
+            height: m,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: tg_x,
+            height: tg_y,
+            depth: 1,
+        };
         enc.dispatch_threads(grid, tg);
-        enc.end_encoding();
-        super::commit_with_mode(cb, super::ExecMode::Sync);
+        enc.end();
+        super::commit_with_mode(&cb, super::ExecMode::Sync);
     }
 
     // --- grad_b = A^T @ grad_c ---
     {
         let pipeline = registry.get_pipeline("vjp_matmul_grad_b_f32", DType::Float32)?;
-        let cb = queue.new_command_buffer();
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pipeline);
-        enc.set_buffer(0, Some(a.metal_buffer()), a.offset() as u64);
-        enc.set_buffer(1, Some(grad_c.metal_buffer()), grad_c.offset() as u64);
+        let cb = queue.commandBuffer().unwrap();
+        let raw_enc = cb.computeCommandEncoder().unwrap();
+        let enc = ComputePass::new(&raw_enc);
+        enc.set_pipeline(&pipeline);
+        enc.set_buffer(0, Some(a.metal_buffer()), a.offset());
+        enc.set_buffer(1, Some(grad_c.metal_buffer()), grad_c.offset());
         enc.set_buffer(2, Some(grad_b.metal_buffer()), 0);
         enc.set_buffer(3, Some(&m_buf), 0);
         enc.set_buffer(4, Some(&k_buf), 0);
         enc.set_buffer(5, Some(&n_buf), 0);
+        let max_tg = pipeline.maxTotalThreadsPerThreadgroup();
+        let tw = pipeline.threadExecutionWidth();
+        let tg_x = tw.min(n);
+        let tg_y = (max_tg / tg_x).max(1).min(k);
 
-        let max_tg = pipeline.max_total_threads_per_threadgroup();
-        let tw = pipeline.thread_execution_width();
-        let tg_x = tw.min(n as u64);
-        let tg_y = (max_tg / tg_x).max(1).min(k as u64);
-
-        let grid = MTLSize::new(n as u64, k as u64, 1);
-        let tg = MTLSize::new(tg_x, tg_y, 1);
+        let grid = MTLSize {
+            width: n,
+            height: k,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: tg_x,
+            height: tg_y,
+            depth: 1,
+        };
         enc.dispatch_threads(grid, tg);
-        enc.end_encoding();
-        super::commit_with_mode(cb, super::ExecMode::Sync);
+        enc.end();
+        super::commit_with_mode(&cb, super::ExecMode::Sync);
     }
 
     Ok((grad_a, grad_b))
@@ -356,18 +381,21 @@ pub fn vjp_matmul(
 mod tests {
     use super::*;
 
-    fn setup() -> (KernelRegistry, metal::CommandQueue) {
-        let gpu_dev = rmlx_metal::device::GpuDevice::system_default().unwrap();
-        let queue = gpu_dev.raw().new_command_queue();
+    fn setup() -> Option<(KernelRegistry, rmlx_metal::MtlQueue)> {
+        let gpu_dev = crate::test_utils::test_gpu()?;
+        let queue = gpu_dev.new_command_queue();
         let registry = KernelRegistry::new(gpu_dev);
         register(&registry).unwrap();
         crate::ops::copy::register(&registry).unwrap();
-        (registry, queue)
+        Some((registry, queue))
     }
 
     #[test]
     fn test_vjp_add_gpu() {
-        let (registry, queue) = setup();
+        let Some((registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = registry.device().raw();
 
         let grad = Array::from_slice(dev, &[1.0f32, 2.0, 3.0, 4.0], vec![4]);
@@ -381,7 +409,10 @@ mod tests {
 
     #[test]
     fn test_vjp_mul_gpu() {
-        let (registry, queue) = setup();
+        let Some((registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = registry.device().raw();
 
         let grad = Array::from_slice(dev, &[1.0f32, 1.0, 1.0, 1.0], vec![4]);
@@ -399,7 +430,10 @@ mod tests {
 
     #[test]
     fn test_vjp_matmul_gpu() {
-        let (registry, queue) = setup();
+        let Some((registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = registry.device().raw();
 
         // A: [2, 3], B: [3, 2], C: [2, 2]

@@ -10,15 +10,22 @@
 //!
 //! Usage: cargo bench -p rmlx-core --bench splitk_sweep_bench
 
+use std::ptr::NonNull;
 use std::time::Instant;
 
 use half::f16;
-use metal::MTLSize;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{
+    MTLCommandBuffer as _, MTLCommandEncoder as _, MTLCommandQueue as _,
+    MTLComputeCommandEncoder as _, MTLDevice as _,
+};
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::KernelRegistry;
 use rmlx_core::ops;
 use rmlx_metal::device::GpuDevice;
+use rmlx_metal::types::MtlBuffer;
+use rmlx_metal::{MTLResourceOptions, MTLSize};
 
 const WARMUP_ITERS: usize = 5;
 const BENCH_ITERS: usize = 20;
@@ -46,7 +53,11 @@ fn lcg_next(state: &mut u64) -> u64 {
     *state
 }
 
-fn rand_f16_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
+fn rand_f16_array(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    shape: &[usize],
+    seed: u64,
+) -> Array {
     let numel: usize = shape.iter().product();
     let mut state = seed;
     let mut f16_bytes = Vec::with_capacity(numel * 2);
@@ -60,8 +71,18 @@ fn rand_f16_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
 }
 
 #[inline(always)]
-fn set_u32(enc: &metal::ComputeCommandEncoderRef, index: u64, val: u32) {
-    enc.set_bytes(index, 4, &val as *const u32 as *const std::ffi::c_void);
+fn set_u32(
+    enc: &ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
+    index: usize,
+    val: u32,
+) {
+    unsafe {
+        enc.setBytes_length_atIndex(
+            NonNull::new(&val as *const u32 as *const std::ffi::c_void as *mut _).unwrap(),
+            4_usize,
+            index,
+        )
+    };
 }
 
 fn percentile(sorted: &[f64], pct: f64) -> f64 {
@@ -95,7 +116,7 @@ fn tflops(m: usize, n: usize, k: usize, latency_us: f64) -> f64 {
 
 #[allow(clippy::too_many_arguments)]
 fn bench_pipelined_splitk(
-    device: &metal::Device,
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
     registry: &KernelRegistry,
     a: &Array,
     b: &Array,
@@ -115,16 +136,24 @@ fn bench_pipelined_splitk(
         return None;
     }
 
-    let queue = device.new_command_queue();
-    let opts = metal::MTLResourceOptions::StorageModeShared;
+    let queue = device.newCommandQueue().unwrap();
+    let opts = MTLResourceOptions::StorageModeShared;
     let out_size = (m * n * 2) as u64; // f16
     let partial_size = (n_splits * m * n * 4) as u64; // f32
 
-    let out_bufs: Vec<metal::Buffer> = (0..PIPELINE_N)
-        .map(|_| device.new_buffer(out_size, opts))
+    let out_bufs: Vec<MtlBuffer> = (0..PIPELINE_N)
+        .map(|_| {
+            device
+                .newBufferWithLength_options(out_size as usize, opts)
+                .unwrap()
+        })
         .collect();
-    let partial_bufs: Vec<metal::Buffer> = (0..PIPELINE_N)
-        .map(|_| device.new_buffer(partial_size, opts))
+    let partial_bufs: Vec<MtlBuffer> = (0..PIPELINE_N)
+        .map(|_| {
+            device
+                .newBufferWithLength_options(partial_size as usize, opts)
+                .unwrap()
+        })
         .collect();
 
     let constants = ops::matmul::matmul_align_constants(m, n, k, splitk_bm, splitk_bn, splitk_bk);
@@ -144,49 +173,62 @@ fn bench_pipelined_splitk(
     let splits_u32 = n_splits as u32;
     let swizzle_log = ops::matmul::compute_swizzle_log(m, n, splitk_bm, splitk_bn);
 
-    let pass1_grid = MTLSize::new(
-        (n.div_ceil(splitk_bn) << swizzle_log) as u64,
-        (m.div_ceil(splitk_bm) >> swizzle_log) as u64,
-        n_splits as u64,
-    );
-    let pass1_tg = MTLSize::new(pass1_threads, 1, 1);
+    let pass1_grid = MTLSize {
+        width: (n.div_ceil(splitk_bn) << swizzle_log) as usize,
+        height: (m.div_ceil(splitk_bm) >> swizzle_log) as usize,
+        depth: n_splits,
+    };
+    let pass1_tg = MTLSize {
+        width: pass1_threads as usize,
+        height: 1_usize,
+        depth: 1_usize,
+    };
 
     let total_elems = m * n;
     let reduce_tg_size = 256u64;
     let reduce_groups = total_elems.div_ceil(reduce_tg_size as usize) as u64;
-    let reduce_grid = MTLSize::new(reduce_groups, 1, 1);
-    let reduce_tg = MTLSize::new(reduce_tg_size, 1, 1);
+    let reduce_grid = MTLSize {
+        width: reduce_groups as usize,
+        height: 1_usize,
+        depth: 1_usize,
+    };
+    let reduce_tg = MTLSize {
+        width: reduce_tg_size as usize,
+        height: 1_usize,
+        depth: 1_usize,
+    };
 
-    let encode_dispatch =
-        |cb: &metal::CommandBufferRef, out_buf: &metal::Buffer, partial_buf: &metal::Buffer| {
-            // Pass 1
-            {
-                let enc = cb.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&pass1_pipeline);
-                enc.set_buffer(0, Some(a.metal_buffer()), 0);
-                enc.set_buffer(1, Some(b.metal_buffer()), 0);
-                enc.set_buffer(2, Some(partial_buf), 0);
-                set_u32(enc, 3, m_u32);
-                set_u32(enc, 4, n_u32);
-                set_u32(enc, 5, k_u32);
-                set_u32(enc, 6, splits_u32);
-                set_u32(enc, 7, swizzle_log);
-                enc.dispatch_thread_groups(pass1_grid, pass1_tg);
-                enc.end_encoding();
-            }
-            // Pass 2 (reduce)
-            {
-                let enc = cb.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&pass2_pipeline);
-                enc.set_buffer(0, Some(partial_buf), 0);
-                enc.set_buffer(1, Some(out_buf), 0);
-                set_u32(enc, 2, m_u32);
-                set_u32(enc, 3, n_u32);
-                set_u32(enc, 4, splits_u32);
-                enc.dispatch_thread_groups(reduce_grid, reduce_tg);
-                enc.end_encoding();
-            }
-        };
+    let encode_dispatch = |cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
+                           out_buf: &MtlBuffer,
+                           partial_buf: &MtlBuffer| {
+        // Pass 1
+        {
+            let enc = cb.computeCommandEncoder().unwrap();
+            enc.setComputePipelineState(&pass1_pipeline);
+            unsafe { enc.setBuffer_offset_atIndex(Some(a.metal_buffer()), 0_usize, 0_usize) };
+            unsafe { enc.setBuffer_offset_atIndex(Some(b.metal_buffer()), 0_usize, 1_usize) };
+            unsafe { enc.setBuffer_offset_atIndex(Some(partial_buf), 0_usize, 2_usize) };
+            set_u32(&enc, 3, m_u32);
+            set_u32(&enc, 4, n_u32);
+            set_u32(&enc, 5, k_u32);
+            set_u32(&enc, 6, splits_u32);
+            set_u32(&enc, 7, swizzle_log);
+            enc.dispatchThreadgroups_threadsPerThreadgroup(pass1_grid, pass1_tg);
+            enc.endEncoding();
+        }
+        // Pass 2 (reduce)
+        {
+            let enc = cb.computeCommandEncoder().unwrap();
+            enc.setComputePipelineState(&pass2_pipeline);
+            unsafe { enc.setBuffer_offset_atIndex(Some(partial_buf), 0_usize, 0_usize) };
+            unsafe { enc.setBuffer_offset_atIndex(Some(out_buf), 0_usize, 1_usize) };
+            set_u32(&enc, 2, m_u32);
+            set_u32(&enc, 3, n_u32);
+            set_u32(&enc, 4, splits_u32);
+            enc.dispatchThreadgroups_threadsPerThreadgroup(reduce_grid, reduce_tg);
+            enc.endEncoding();
+        }
+    };
 
     // Warmup
     for _ in 0..WARMUP_ITERS {
@@ -194,13 +236,13 @@ fn bench_pipelined_splitk(
             .iter()
             .zip(partial_bufs.iter())
             .map(|(out_buf, partial_buf)| {
-                let cb = queue.new_command_buffer_with_unretained_references();
-                encode_dispatch(cb, out_buf, partial_buf);
+                let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+                encode_dispatch(&cb, out_buf, partial_buf);
                 cb.commit();
                 cb
             })
             .collect();
-        cbs.last().unwrap().wait_until_completed();
+        cbs.last().unwrap().waitUntilCompleted();
     }
 
     // Measure
@@ -211,13 +253,13 @@ fn bench_pipelined_splitk(
             .iter()
             .zip(partial_bufs.iter())
             .map(|(out_buf, partial_buf)| {
-                let cb = queue.new_command_buffer_with_unretained_references();
-                encode_dispatch(cb, out_buf, partial_buf);
+                let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+                encode_dispatch(&cb, out_buf, partial_buf);
                 cb.commit();
                 cb
             })
             .collect();
-        cbs.last().unwrap().wait_until_completed();
+        cbs.last().unwrap().waitUntilCompleted();
         let total_us = start.elapsed().as_secs_f64() * 1e6;
         times.push(total_us / PIPELINE_N as f64);
     }

@@ -6,7 +6,12 @@
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
-use metal::MTLSize;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLCommandBuffer as _;
+use objc2_metal::MTLCommandQueue as _;
+use objc2_metal::MTLComputePipelineState as _;
+use rmlx_metal::ComputePass;
+use rmlx_metal::MTLSize;
 
 // ---------------------------------------------------------------------------
 // Metal shader source
@@ -76,7 +81,7 @@ pub fn select(
     cond: &Array,
     a: &Array,
     b: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     // Validate dtypes
     if cond.dtype() != DType::UInt32 {
@@ -120,23 +125,27 @@ pub fn select(
     let pipeline = registry.get_pipeline(kernel_name, a.dtype())?;
     let out = Array::zeros(registry.device().raw(), a.shape(), a.dtype());
 
-    let command_buffer = queue.new_command_buffer();
-    let encoder = command_buffer.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(cond.metal_buffer()), cond.offset() as u64);
-    encoder.set_buffer(1, Some(a.metal_buffer()), a.offset() as u64);
-    encoder.set_buffer(2, Some(b.metal_buffer()), b.offset() as u64);
-    encoder.set_buffer(3, Some(out.metal_buffer()), out.offset() as u64);
-
-    let grid_size = MTLSize::new(numel as u64, 1, 1);
-    let threadgroup_size = MTLSize::new(
-        std::cmp::min(pipeline.max_total_threads_per_threadgroup(), numel as u64),
-        1,
-        1,
-    );
+    let command_buffer = queue.commandBuffer().unwrap();
+    let raw_enc = command_buffer.computeCommandEncoder().unwrap();
+    let encoder = ComputePass::new(&raw_enc);
+    encoder.set_pipeline(&pipeline);
+    encoder.set_buffer(0, Some(cond.metal_buffer()), cond.offset());
+    encoder.set_buffer(1, Some(a.metal_buffer()), a.offset());
+    encoder.set_buffer(2, Some(b.metal_buffer()), b.offset());
+    encoder.set_buffer(3, Some(out.metal_buffer()), out.offset());
+    let grid_size = MTLSize {
+        width: numel,
+        height: 1,
+        depth: 1,
+    };
+    let threadgroup_size = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), numel),
+        height: 1,
+        depth: 1,
+    };
     encoder.dispatch_threads(grid_size, threadgroup_size);
-    encoder.end_encoding();
-    super::commit_with_mode(command_buffer, super::ExecMode::Sync);
+    encoder.end();
+    super::commit_with_mode(&command_buffer, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -157,18 +166,21 @@ mod tests {
         assert!(select_kernel_name(DType::UInt32).is_err());
     }
 
-    fn setup() -> (KernelRegistry, metal::CommandQueue) {
-        let gpu_dev = rmlx_metal::device::GpuDevice::system_default().unwrap();
-        let queue = gpu_dev.raw().new_command_queue();
+    fn setup() -> Option<(KernelRegistry, rmlx_metal::MtlQueue)> {
+        let gpu_dev = crate::test_utils::test_gpu()?;
+        let queue = gpu_dev.new_command_queue();
         let registry = KernelRegistry::new(gpu_dev);
         register(&registry).unwrap();
         crate::ops::copy::register(&registry).unwrap();
-        (registry, queue)
+        Some((registry, queue))
     }
 
     #[test]
     fn test_select_dtype_validation() {
-        let (registry, queue) = setup();
+        let Some((registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let device = registry.device().raw();
 
         // Mismatched a/b dtypes should fail
@@ -188,7 +200,10 @@ mod tests {
 
     #[test]
     fn test_select_basic() {
-        let (registry, queue) = setup();
+        let Some((registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let device = registry.device().raw();
 
         // cond = [1, 0, 1, 0]

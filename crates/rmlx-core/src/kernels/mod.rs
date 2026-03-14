@@ -9,12 +9,17 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::RwLock;
 
-use metal::{CompileOptions, FunctionConstantValues, MTLDataType};
+use objc2_foundation::NSString;
+use objc2_metal::MTLCompileOptions;
+use objc2_metal::MTLDataType;
+use objc2_metal::MTLFunctionConstantValues;
+use objc2_metal::MTLLibrary as _;
 use smallvec::SmallVec;
 
+use objc2_metal::MTLDevice as _;
 use rmlx_metal::device::GpuDevice;
 use rmlx_metal::pipeline_cache::DiskPipelineCache;
-use rmlx_metal::FunctionConstant;
+use rmlx_metal::{FunctionConstant, MtlFunction, MtlLibrary, MtlPipeline};
 
 use crate::dtype::DType;
 
@@ -96,12 +101,12 @@ pub struct PipelineKey {
 /// (the common case — pipeline lookups) without contention.
 pub struct KernelRegistry {
     device: GpuDevice,
-    aot_lib: Option<metal::Library>,
+    aot_lib: Option<MtlLibrary>,
     /// JIT cache: name -> (source text, compiled Library).
     /// The source text is retained so that [`DiskPipelineCache`] can compute a
     /// stable SHA-256 key when a pipeline miss occurs.
     jit_cache: RwLock<HashMap<String, JitEntry>>,
-    pipelines: RwLock<HashMap<PipelineKey, metal::ComputePipelineState>>,
+    pipelines: RwLock<HashMap<PipelineKey, MtlPipeline>>,
     /// Persistent disk-backed pipeline cache.  `None` only when explicitly
     /// disabled (e.g., in tests via `new_without_disk_cache`).
     disk_cache: Option<DiskPipelineCache>,
@@ -113,13 +118,13 @@ pub struct KernelRegistry {
     ///
     /// Pipelines added after `freeze()` (e.g., JIT compilation of new kernels)
     /// go into the `RwLock` map; call `freeze()` again to capture them.
-    frozen_pipelines: AtomicPtr<HashMap<PipelineKey, metal::ComputePipelineState>>,
+    frozen_pipelines: AtomicPtr<HashMap<PipelineKey, MtlPipeline>>,
 }
 
 /// A JIT-compiled library together with the source text it was compiled from.
 struct JitEntry {
     source: String,
-    library: metal::Library,
+    library: MtlLibrary,
 }
 
 impl KernelRegistry {
@@ -134,7 +139,7 @@ impl KernelRegistry {
         } else {
             let path = std::path::Path::new(metallib_path);
             if path.exists() {
-                device.raw().new_library_with_file(path).ok()
+                rmlx_metal::library::load_metallib(device.raw(), path).ok()
             } else {
                 None
             }
@@ -163,7 +168,7 @@ impl KernelRegistry {
         } else {
             let path = std::path::Path::new(metallib_path);
             if path.exists() {
-                device.raw().new_library_with_file(path).ok()
+                rmlx_metal::library::load_metallib(device.raw(), path).ok()
             } else {
                 None
             }
@@ -187,7 +192,7 @@ impl KernelRegistry {
         &self,
         kernel_name: &str,
         dtype: DType,
-    ) -> Result<metal::ComputePipelineState, KernelError> {
+    ) -> Result<MtlPipeline, KernelError> {
         // Fast path: build a Borrowed key for the cache lookup (no allocation).
         let lookup_key = PipelineKey {
             kernel_name: Cow::Borrowed(
@@ -241,7 +246,7 @@ impl KernelRegistry {
         let function = self
             .aot_lib
             .as_ref()
-            .and_then(|lib| lib.get_function(kernel_name, None).ok());
+            .and_then(|lib| lib.newFunctionWithName(&NSString::from_str(kernel_name)));
 
         // 4. If AOT miss, try JIT cache (read lock)
         let function = match function {
@@ -251,9 +256,11 @@ impl KernelRegistry {
                     .jit_cache
                     .read()
                     .map_err(|_| KernelError::Internal("JIT cache lock poisoned".into()))?;
-                let jit_fn = jit
-                    .values()
-                    .find_map(|entry| entry.library.get_function(kernel_name, None).ok());
+                let jit_fn = jit.values().find_map(|entry| {
+                    entry
+                        .library
+                        .newFunctionWithName(&NSString::from_str(kernel_name))
+                });
                 match jit_fn {
                     Some(f) => f,
                     None => {
@@ -269,7 +276,7 @@ impl KernelRegistry {
         let pipeline = self
             .device
             .raw()
-            .new_compute_pipeline_state_with_function(&function)
+            .newComputePipelineStateWithFunction_error(&function)
             .map_err(|e| KernelError::PipelineFailed(e.to_string()))?;
 
         // 6. Cache it (write lock)
@@ -297,34 +304,36 @@ impl KernelRegistry {
     fn lookup_function_with_constants(
         &self,
         kernel_name: &str,
-        fcv: Option<FunctionConstantValues>,
+        fcv: Option<&MTLFunctionConstantValues>,
         dtype: DType,
-    ) -> Result<metal::Function, KernelError> {
+    ) -> Result<MtlFunction, KernelError> {
+        let ns_name = NSString::from_str(kernel_name);
         // Helper: try to get a specialized function from a single library.
         // Returns Ok(function) on success, Err(Some(metal_error)) if the
         // function exists but specialization failed, or Err(None) if the
         // function simply doesn't exist in this library.
-        let try_library = |lib: &metal::Library,
-                           fcv: Option<FunctionConstantValues>|
-         -> Result<metal::Function, Option<String>> {
+        let try_library = |lib: &MtlLibrary,
+                           fcv: Option<&MTLFunctionConstantValues>|
+         -> Result<MtlFunction, Option<String>> {
             match fcv {
-                None => lib.get_function(kernel_name, None).map_err(|_| None),
+                None => lib.newFunctionWithName(&ns_name).ok_or(None),
                 Some(constants) => {
                     // First, check whether the function name exists at all
                     // (plain lookup without constants — cheap, no NSError path).
-                    if lib.get_function(kernel_name, None).is_err() {
+                    if lib.newFunctionWithName(&ns_name).is_none() {
                         return Err(None); // not in this library
                     }
                     // The function exists; now apply constants. Any error here
                     // is a real specialization failure from Metal.
-                    lib.get_function(kernel_name, Some(constants)).map_err(Some)
+                    lib.newFunctionWithName_constantValues_error(&ns_name, constants)
+                        .map_err(|e| Some(e.localizedDescription().to_string()))
                 }
             }
         };
 
         // Try AOT library first.
         if let Some(aot) = self.aot_lib.as_ref() {
-            match try_library(aot, fcv.clone()) {
+            match try_library(aot, fcv) {
                 Ok(f) => return Ok(f),
                 Err(Some(metal_err)) => {
                     return Err(KernelError::Specialization(format!(
@@ -342,7 +351,7 @@ impl KernelRegistry {
             .map_err(|_| KernelError::Internal("JIT cache lock poisoned".into()))?;
 
         for entry in jit.values() {
-            match try_library(&entry.library, fcv.clone()) {
+            match try_library(&entry.library, fcv) {
                 Ok(f) => return Ok(f),
                 Err(Some(metal_err)) => {
                     return Err(KernelError::Specialization(format!(
@@ -375,7 +384,7 @@ impl KernelRegistry {
         kernel_name: &str,
         dtype: DType,
         constants: &[(u32, FunctionConstantValue)],
-    ) -> Result<metal::ComputePipelineState, KernelError> {
+    ) -> Result<MtlPipeline, KernelError> {
         // Fast path: build a Borrowed key for the cache lookup (no allocation).
         let lookup_key = PipelineKey {
             kernel_name: Cow::Borrowed(unsafe { &*(kernel_name as *const str) }),
@@ -423,30 +432,32 @@ impl KernelRegistry {
         let fcv = if constants.is_empty() {
             None
         } else {
-            let values = FunctionConstantValues::new();
+            let values = MTLFunctionConstantValues::new();
             for (index, constant) in constants {
-                match constant {
-                    FunctionConstantValue::Bool(v) => {
-                        let val: u8 = u8::from(*v);
-                        values.set_constant_value_at_index(
-                            &val as *const u8 as *const c_void,
-                            MTLDataType::Bool,
-                            *index as u64,
-                        );
-                    }
-                    FunctionConstantValue::U32(v) => {
-                        values.set_constant_value_at_index(
-                            v as *const u32 as *const c_void,
-                            MTLDataType::UInt,
-                            *index as u64,
-                        );
-                    }
-                    FunctionConstantValue::F32(v) => {
-                        values.set_constant_value_at_index(
-                            v as *const f32 as *const c_void,
-                            MTLDataType::Float,
-                            *index as u64,
-                        );
+                unsafe {
+                    match constant {
+                        FunctionConstantValue::Bool(v) => {
+                            let val: u8 = u8::from(*v);
+                            values.setConstantValue_type_atIndex(
+                                std::ptr::NonNull::new(&val as *const u8 as *mut c_void).unwrap(),
+                                MTLDataType::Bool,
+                                *index as usize,
+                            );
+                        }
+                        FunctionConstantValue::U32(v) => {
+                            values.setConstantValue_type_atIndex(
+                                std::ptr::NonNull::new(v as *const u32 as *mut c_void).unwrap(),
+                                MTLDataType::UInt,
+                                *index as usize,
+                            );
+                        }
+                        FunctionConstantValue::F32(v) => {
+                            values.setConstantValue_type_atIndex(
+                                std::ptr::NonNull::new(v as *const f32 as *mut c_void).unwrap(),
+                                MTLDataType::Float,
+                                *index as usize,
+                            );
+                        }
                     }
                 }
             }
@@ -461,13 +472,13 @@ impl KernelRegistry {
         // Metal's `newFunctionWithName:constantValues:error:` returns an
         // NSError for both cases, so we probe with a plain lookup first to
         // determine whether the function exists, then apply constants.
-        let function = self.lookup_function_with_constants(kernel_name, fcv, dtype)?;
+        let function = self.lookup_function_with_constants(kernel_name, fcv.as_deref(), dtype)?;
 
         // 5. Create pipeline from the (possibly specialized) function
         let pipeline = self
             .device
             .raw()
-            .new_compute_pipeline_state_with_function(&function)
+            .newComputePipelineStateWithFunction_error(&function)
             .map_err(|e| KernelError::PipelineFailed(e.to_string()))?;
 
         // 6. Cache it (write lock)
@@ -484,13 +495,13 @@ impl KernelRegistry {
 
     /// Register a JIT-compiled shader source under the given name.
     pub fn register_jit_source(&self, name: &str, source: &str) -> Result<(), KernelError> {
-        let options = CompileOptions::new();
+        let options = MTLCompileOptions::new();
         // Metal 3.1+ required for bfloat16 support.
-        // metal-rs CompileOptions sets language version automatically based on SDK.
+        // objc2-metal CompileOptions sets language version automatically based on SDK.
         let lib = self
             .device
             .raw()
-            .new_library_with_source(source, &options)
+            .newLibraryWithSource_options_error(&NSString::from_str(source), Some(&options))
             .map_err(|e| KernelError::CompilationFailed(format!("{name}: {e}")))?;
 
         let mut cache = self
@@ -695,7 +706,7 @@ impl KernelRegistry {
 
     /// Lock-free lookup in the frozen snapshot. Returns `None` if no snapshot
     /// exists or the key is not found.
-    fn frozen_lookup(&self, key: &PipelineKey) -> Option<metal::ComputePipelineState> {
+    fn frozen_lookup(&self, key: &PipelineKey) -> Option<MtlPipeline> {
         let ptr = self.frozen_pipelines.load(Ordering::Acquire);
         if ptr.is_null() {
             return None;
@@ -714,7 +725,11 @@ impl KernelRegistry {
     fn find_jit_source_for_kernel(&self, kernel_name: &str) -> Option<String> {
         let jit = self.jit_cache.read().ok()?;
         for entry in jit.values() {
-            if entry.library.get_function(kernel_name, None).is_ok() {
+            if entry
+                .library
+                .newFunctionWithName(&NSString::from_str(kernel_name))
+                .is_some()
+            {
                 return Some(entry.source.clone());
             }
         }
@@ -756,7 +771,7 @@ impl Drop for KernelRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use metal::foreign_types::ForeignType;
+    use objc2::rc::Retained;
 
     /// A minimal Metal shader with a function constant.
     ///
@@ -789,9 +804,9 @@ kernel void test_plain_kernel(
 }
 "#;
 
-    /// Helper: create a GpuDevice, returning None if Metal is unavailable.
+    /// Helper: create a GpuDevice from the shared Metal device.
     fn try_gpu_device() -> Option<GpuDevice> {
-        GpuDevice::system_default().ok()
+        crate::test_utils::test_gpu()
     }
 
     #[test]
@@ -826,8 +841,8 @@ kernel void test_plain_kernel(
         // 3. The two specialized pipelines should be distinct objects.
         //    (Different constant values -> different compiled functions.)
         assert_ne!(
-            specialized_true.as_ptr(),
-            specialized_false.as_ptr(),
+            Retained::as_ptr(&specialized_true),
+            Retained::as_ptr(&specialized_false),
             "pipelines with different constants should be distinct"
         );
 
@@ -837,8 +852,8 @@ kernel void test_plain_kernel(
             .get_pipeline_with_constants("test_fc_kernel", DType::Float32, &constants_true)
             .expect("cached pipeline lookup should succeed");
         assert_eq!(
-            specialized_true.as_ptr(),
-            cached.as_ptr(),
+            Retained::as_ptr(&specialized_true),
+            Retained::as_ptr(&cached),
             "second lookup should return cached pipeline"
         );
 
@@ -877,8 +892,8 @@ kernel void test_plain_kernel(
 
         // Both should produce the same cached pipeline since the key is identical.
         assert_eq!(
-            via_constants.as_ptr(),
-            via_plain.as_ptr(),
+            Retained::as_ptr(&via_constants),
+            Retained::as_ptr(&via_plain),
             "empty constants should produce the same cached pipeline as plain"
         );
     }

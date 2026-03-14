@@ -18,14 +18,16 @@
 //! Run with:
 //!   cargo bench -p rmlx-nn --bench op_profile_bench
 
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLBuffer as _, MTLCommandBuffer as _, MTLCommandQueue as _, MTLDevice as _};
 use std::time::{Duration, Instant};
 
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::KernelRegistry;
 use rmlx_core::ops;
+use rmlx_metal::autoreleasepool;
 use rmlx_metal::device::GpuDevice;
-use rmlx_metal::ScopedPool;
 use rmlx_nn::{
     Attention, AttentionConfig, FeedForward, LayerKvCache, Linear, LinearConfig, TransformerBlock,
 };
@@ -91,13 +93,17 @@ fn rand_f16_bytes(numel: usize, seed: u64) -> Vec<u8> {
     f16_bytes
 }
 
-fn rand_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
+fn rand_array(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    shape: &[usize],
+    seed: u64,
+) -> Array {
     let numel: usize = shape.iter().product();
     let f16_bytes = rand_f16_bytes(numel, seed);
     Array::from_bytes(device, &f16_bytes, shape.to_vec(), DType::Float16)
 }
 
-fn ones_f16(device: &metal::Device, size: usize) -> Array {
+fn ones_f16(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, size: usize) -> Array {
     let ones: Vec<u16> = vec![0x3C00u16; size];
     let bytes: Vec<u8> = ones.iter().flat_map(|h| h.to_le_bytes()).collect();
     Array::from_bytes(device, &bytes, vec![size], DType::Float16)
@@ -107,7 +113,12 @@ fn ones_f16(device: &metal::Device, size: usize) -> Array {
 // Layer construction helpers (for full-pipeline baseline only)
 // ---------------------------------------------------------------------------
 
-fn make_linear(device: &metal::Device, in_f: usize, out_f: usize, seed: u64) -> Linear {
+fn make_linear(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    in_f: usize,
+    out_f: usize,
+    seed: u64,
+) -> Linear {
     let weight = rand_array(device, &[out_f, in_f], seed);
     Linear::from_arrays(
         LinearConfig {
@@ -121,7 +132,9 @@ fn make_linear(device: &metal::Device, in_f: usize, out_f: usize, seed: u64) -> 
     .expect("linear from_arrays")
 }
 
-fn build_transformer_block(device: &metal::Device) -> TransformerBlock {
+fn build_transformer_block(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+) -> TransformerBlock {
     let kv_size = NUM_KV_HEADS * HEAD_DIM;
     let q_proj = make_linear(device, HIDDEN_SIZE, HIDDEN_SIZE, 1);
     let k_proj = make_linear(device, HIDDEN_SIZE, kv_size, 2);
@@ -168,7 +181,7 @@ fn build_transformer_block(device: &metal::Device) -> TransformerBlock {
 ///
 /// We directly produce the transposed layout.
 fn build_merged_weight_t(
-    device: &metal::Device,
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
     weights_row_major: &[(&[u8], usize, usize)], // (bytes, rows=out, cols=in)
 ) -> Array {
     let in_dim = weights_row_major[0].2;
@@ -202,7 +215,12 @@ fn build_merged_weight_t(
 }
 
 /// Build a single transposed weight: [out, in] -> [in, out]
-fn transpose_weight_cpu(device: &metal::Device, bytes: &[u8], rows: usize, cols: usize) -> Array {
+fn transpose_weight_cpu(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    bytes: &[u8],
+    rows: usize,
+    cols: usize,
+) -> Array {
     let mut result = vec![0u8; rows * cols * 2];
     for r in 0..rows {
         for c in 0..cols {
@@ -219,10 +237,10 @@ fn transpose_weight_cpu(device: &metal::Device, bytes: &[u8], rows: usize, cols:
 // CB status validation
 // ---------------------------------------------------------------------------
 
-fn assert_cb_ok(cb: &metal::CommandBufferRef, context: &str) {
+fn assert_cb_ok(cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>, context: &str) {
     let status = cb.status();
     assert!(
-        status != metal::MTLCommandBufferStatus::Error,
+        status != objc2_metal::MTLCommandBufferStatus::Error,
         "GPU command buffer error in {context}: status={status:?}"
     );
 }
@@ -231,19 +249,20 @@ fn assert_cb_ok(cb: &metal::CommandBufferRef, context: &str) {
 // Timing helper
 // ---------------------------------------------------------------------------
 
-fn time_op<F>(queue: &metal::CommandQueue, f: F) -> Duration
+fn time_op<F>(queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>, f: F) -> Duration
 where
-    F: FnOnce(&metal::CommandBufferRef),
+    F: FnOnce(&ProtocolObject<dyn objc2_metal::MTLCommandBuffer>),
 {
-    let _pool = ScopedPool::new();
-    let cb = queue.new_command_buffer_with_unretained_references();
-    let start = Instant::now();
-    f(cb);
-    cb.commit();
-    cb.wait_until_completed();
-    let elapsed = start.elapsed();
-    assert_cb_ok(cb, "time_op");
-    elapsed
+    autoreleasepool(|_| {
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+        let start = Instant::now();
+        f(&cb);
+        cb.commit();
+        cb.waitUntilCompleted();
+        let elapsed = start.elapsed();
+        assert_cb_ok(&cb, "time_op");
+        elapsed
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -258,9 +277,13 @@ struct OpResult {
     max_us: f64,
 }
 
-fn bench_op<F>(name: &'static str, queue: &metal::CommandQueue, mut f: F) -> OpResult
+fn bench_op<F>(
+    name: &'static str,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
+    mut f: F,
+) -> OpResult
 where
-    F: FnMut(&metal::CommandBufferRef),
+    F: FnMut(&ProtocolObject<dyn objc2_metal::MTLCommandBuffer>),
 {
     for _ in 0..WARMUP_ITERS {
         time_op(queue, &mut f);
@@ -320,7 +343,7 @@ fn main() {
     let device = registry.device().raw();
     let supports_nax = registry.device().tuning().supports_nax;
 
-    let setup_queue = device.new_command_queue();
+    let setup_queue = device.newCommandQueue().unwrap();
 
     println!(
         "Config: hidden={}, heads={}/{}, head_dim={}, intermediate={}",
@@ -390,41 +413,40 @@ fn main() {
     std::thread::sleep(std::time::Duration::from_millis(50));
 
     // ── Global JIT warmup: compile all Metal PSOs before timing ──
-    {
+    autoreleasepool(|_| {
         println!("\n[JIT Warmup] Pre-compiling all kernel variants...");
-        let _pool = ScopedPool::new();
 
         // Run a small matmul to trigger NAX/MlxArch GEMM PSO compilation
         let a_warm = rand_array(device, &[64, HIDDEN_SIZE], 999);
         let b_warm = rand_array(device, &[HIDDEN_SIZE, TOTAL_QKV], 998);
-        let cb = setup_queue.new_command_buffer_with_unretained_references();
-        let _ = ops::matmul::matmul_into_cb(&registry, &a_warm, &b_warm, cb).expect("jit matmul");
+        let cb = setup_queue.commandBufferWithUnretainedReferences().unwrap();
+        let _ = ops::matmul::matmul_into_cb(&registry, &a_warm, &b_warm, &cb).expect("jit matmul");
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
 
         // Run RMSNorm
         let x_warm = rand_array(device, &[64, HIDDEN_SIZE], 997);
-        let cb = setup_queue.new_command_buffer_with_unretained_references();
+        let cb = setup_queue.commandBufferWithUnretainedReferences().unwrap();
         let _ =
-            ops::rms_norm::rms_norm_into_cb(&registry, &x_warm, Some(&norm1_w), RMS_NORM_EPS, cb)
+            ops::rms_norm::rms_norm_into_cb(&registry, &x_warm, Some(&norm1_w), RMS_NORM_EPS, &cb)
                 .expect("jit rms_norm");
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
 
         // Run matmul with residual (triggers residual PSO variant)
         let c_warm = rand_array(device, &[64, TOTAL_QKV], 996);
-        let cb = setup_queue.new_command_buffer_with_unretained_references();
-        let _ = ops::matmul::matmul_add_residual_into_cb(&registry, &a_warm, &b_warm, &c_warm, cb)
+        let cb = setup_queue.commandBufferWithUnretainedReferences().unwrap();
+        let _ = ops::matmul::matmul_add_residual_into_cb(&registry, &a_warm, &b_warm, &c_warm, &cb)
             .expect("jit matmul_residual");
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
 
         // Run SDPA NAX (if supported) to trigger that PSO
         if supports_nax {
             let q_warm = rand_array(device, &[1, NUM_HEADS, 64, HEAD_DIM], 995);
             let k_warm = rand_array(device, &[1, NUM_KV_HEADS, 64, HEAD_DIM], 994);
             let v_warm = rand_array(device, &[1, NUM_KV_HEADS, 64, HEAD_DIM], 993);
-            let cb = setup_queue.new_command_buffer_with_unretained_references();
+            let cb = setup_queue.commandBufferWithUnretainedReferences().unwrap();
             let _ = ops::sdpa::sdpa_prefill_nax_f16_into_cb(
                 &registry,
                 &q_warm,
@@ -440,46 +462,46 @@ fn main() {
                 true,
                 None,
                 None,
-                cb,
+                &cb,
             )
             .expect("jit sdpa nax");
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
         }
 
         // Additional sizes to trigger alignment variants
         let a2 = rand_array(device, &[128, HIDDEN_SIZE], 992);
         let b2 = rand_array(device, &[HIDDEN_SIZE, HIDDEN_SIZE], 991);
-        let cb = setup_queue.new_command_buffer_with_unretained_references();
-        let _ = ops::matmul::matmul_into_cb(&registry, &a2, &b2, cb).expect("jit matmul 2");
+        let cb = setup_queue.commandBufferWithUnretainedReferences().unwrap();
+        let _ = ops::matmul::matmul_into_cb(&registry, &a2, &b2, &cb).expect("jit matmul 2");
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
 
         let a3 = rand_array(device, &[128, INTERMEDIATE_DIM], 990);
         let b3 = rand_array(device, &[INTERMEDIATE_DIM, HIDDEN_SIZE], 989);
-        let cb = setup_queue.new_command_buffer_with_unretained_references();
-        let _ = ops::matmul::matmul_into_cb(&registry, &a3, &b3, cb).expect("jit matmul 3");
+        let cb = setup_queue.commandBufferWithUnretainedReferences().unwrap();
+        let _ = ops::matmul::matmul_into_cb(&registry, &a3, &b3, &cb).expect("jit matmul 3");
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
 
         // Fused SiLU*mul PSO
         let gate_up_warm = rand_array(device, &[64, INTERMEDIATE_DIM * 2], 988);
-        let cb = setup_queue.new_command_buffer_with_unretained_references();
+        let cb = setup_queue.commandBufferWithUnretainedReferences().unwrap();
         let _ = ops::fused::fused_silu_mul_strided_into_cb(
             &registry,
             &gate_up_warm,
             INTERMEDIATE_DIM,
-            cb,
+            &cb,
         )
         .expect("jit silu_mul");
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
 
         // RoPE PSO
         let q_rope_warm = rand_array(device, &[64, Q_DIM], 987);
         let cos_w = cos_full.slice(0, 0, 64).expect("cos slice");
         let sin_w = sin_full.slice(0, 0, 64).expect("sin slice");
-        let cb = setup_queue.new_command_buffer_with_unretained_references();
+        let cb = setup_queue.commandBufferWithUnretainedReferences().unwrap();
         let _ = ops::rope::rope_multihead_into_cb(
             &registry,
             &q_rope_warm,
@@ -488,36 +510,36 @@ fn main() {
             NUM_HEADS,
             0,
             TOTAL_QKV,
-            cb,
+            &cb,
         )
         .expect("jit rope");
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
 
         // Residual add PSO
         let r1 = rand_array(device, &[64, HIDDEN_SIZE], 986);
         let r2 = rand_array(device, &[64, HIDDEN_SIZE], 985);
-        let cb = setup_queue.new_command_buffer_with_unretained_references();
-        let _ = ops::binary::add_into_cb(&registry, &r1, &r2, cb).expect("jit add");
+        let cb = setup_queue.commandBufferWithUnretainedReferences().unwrap();
+        let _ = ops::binary::add_into_cb(&registry, &r1, &r2, &cb).expect("jit add");
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
 
         // Fused residual+norm PSO
-        let cb = setup_queue.new_command_buffer_with_unretained_references();
+        let cb = setup_queue.commandBufferWithUnretainedReferences().unwrap();
         let _ = ops::rms_norm::rms_norm_residual_add_into_cb(
             &registry,
             &r1,
             &r2,
             &norm1_w,
             RMS_NORM_EPS,
-            cb,
+            &cb,
         )
         .expect("jit rms_norm_residual");
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
 
         println!("[JIT Warmup] Done.\n");
-    }
+    });
 
     for &seq_len in SEQ_LENS {
         println!("\n{}", "=".repeat(100));
@@ -528,7 +550,7 @@ fn main() {
         );
         println!("{}", "=".repeat(100));
 
-        let queue = device.new_command_queue();
+        let queue = device.newCommandQueue().unwrap();
 
         let cos_freqs = cos_full.slice(0, 0, seq_len).expect("cos slice");
         let sin_freqs = sin_full.slice(0, 0, seq_len).expect("sin slice");
@@ -559,33 +581,31 @@ fn main() {
         // --- Materialize intermediates for downstream ops ---
 
         // 1. RMSNorm -> normed
-        let normed = {
-            let _pool = ScopedPool::new();
-            let cb = queue.new_command_buffer_with_unretained_references();
+        let normed = autoreleasepool(|_| {
+            let cb = queue.commandBufferWithUnretainedReferences().unwrap();
             let r = ops::rms_norm::rms_norm_into_cb(
                 &registry,
                 &input,
                 Some(&norm1_w),
                 RMS_NORM_EPS,
-                cb,
+                &cb,
             )
             .expect("rms_norm");
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
             r
-        };
+        });
         let normed_2d = normed.reshape(vec![seq_len, HIDDEN_SIZE]).expect("reshape");
 
         // 2. QKV GEMM -> qkv
-        let qkv = {
-            let _pool = ScopedPool::new();
-            let cb = queue.new_command_buffer_with_unretained_references();
-            let r = ops::matmul::matmul_into_cb(&registry, &normed_2d, &qkv_wt, cb)
+        let qkv = autoreleasepool(|_| {
+            let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+            let r = ops::matmul::matmul_into_cb(&registry, &normed_2d, &qkv_wt, &cb)
                 .expect("qkv matmul");
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
             r
-        };
+        });
 
         // 3. Q/K/V views from merged QKV
         let elem_size = qkv.dtype().size_of();
@@ -612,9 +632,8 @@ fn main() {
         );
 
         // 4. RoPE + Deinterleave
-        let (q_batched, k_batched, v_batched) = {
-            let _pool = ScopedPool::new();
-            let cb = queue.new_command_buffer_with_unretained_references();
+        let (q_batched, k_batched, v_batched) = autoreleasepool(|_| {
+            let cb = queue.commandBufferWithUnretainedReferences().unwrap();
             let qb = ops::rope::rope_multihead_into_cb(
                 &registry,
                 &q_view,
@@ -623,7 +642,7 @@ fn main() {
                 NUM_HEADS,
                 0,
                 q_view.strides()[0],
-                cb,
+                &cb,
             )
             .expect("rope q");
             let kb = ops::rope::rope_multihead_into_cb(
@@ -634,7 +653,7 @@ fn main() {
                 NUM_KV_HEADS,
                 0,
                 k_view.strides()[0],
-                cb,
+                &cb,
             )
             .expect("rope k");
             let vb = ops::rope::deinterleave_heads_into_cb(
@@ -642,13 +661,13 @@ fn main() {
                 &v_view,
                 NUM_KV_HEADS,
                 v_view.strides()[0],
-                cb,
+                &cb,
             )
             .expect("deinterleave v");
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
             (qb, kb, vb)
-        };
+        });
 
         // 5. SDPA — use same dispatch logic as attention.rs forward_prefill_into_cb
         //    On initial prefill (cache empty), RoPE output goes directly to SDPA.
@@ -662,9 +681,8 @@ fn main() {
         // MMA writes seq-major; NAX writes head-major
         let seq_major_output = is_f16_d128;
 
-        let attn_slab = {
-            let _pool = ScopedPool::new();
-            let cb = queue.new_command_buffer_with_unretained_references();
+        let attn_slab = autoreleasepool(|_| {
+            let cb = queue.commandBufferWithUnretainedReferences().unwrap();
             let r = if use_nax {
                 ops::sdpa::sdpa_prefill_nax_f16_into_cb(
                     &registry,
@@ -681,7 +699,7 @@ fn main() {
                     true, // is_causal
                     None, // v_head_stride
                     None, // v_row_stride
-                    cb,
+                    &cb,
                 )
                 .expect("sdpa nax")
             } else if use_mma_bk32 {
@@ -701,7 +719,7 @@ fn main() {
                     true, // is_causal
                     None, // v_head_stride
                     None, // v_row_stride
-                    cb,
+                    &cb,
                 )
                 .expect("sdpa mma bk32")
             } else {
@@ -721,14 +739,14 @@ fn main() {
                     true, // is_causal
                     None, // v_head_stride
                     None, // v_row_stride
-                    cb,
+                    &cb,
                 )
                 .expect("sdpa mma bk16")
             };
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
             r
-        };
+        });
 
         // 6. Head concat (interleave if NAX, reshape if MMA)
         let attn_concat = if seq_major_output {
@@ -744,88 +762,83 @@ fn main() {
                 vec![HEAD_DIM, 1],
                 attn_slab.offset(),
             );
-            let interleaved = {
-                let _pool = ScopedPool::new();
-                let cb = queue.new_command_buffer_with_unretained_references();
-                let r =
-                    ops::rope::interleave_heads_into_cb(&registry, &packed, NUM_HEADS, seq_len, cb)
-                        .expect("interleave_heads");
+
+            autoreleasepool(|_| {
+                let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+                let r = ops::rope::interleave_heads_into_cb(
+                    &registry, &packed, NUM_HEADS, seq_len, &cb,
+                )
+                .expect("interleave_heads");
                 cb.commit();
-                cb.wait_until_completed();
+                cb.waitUntilCompleted();
                 r
-            };
-            interleaved
+            })
         };
 
         // 7. O projection
-        let o_out = {
-            let _pool = ScopedPool::new();
-            let cb = queue.new_command_buffer_with_unretained_references();
+        let o_out = autoreleasepool(|_| {
+            let cb = queue.commandBufferWithUnretainedReferences().unwrap();
             let r =
-                ops::matmul::matmul_into_cb(&registry, &attn_concat, &w_o_t, cb).expect("o_proj");
+                ops::matmul::matmul_into_cb(&registry, &attn_concat, &w_o_t, &cb).expect("o_proj");
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
             r
-        };
+        });
 
         // 8. Fused residual + RMSNorm (matches forward_prefill_into_cb)
-        let (normed2, h) = {
-            let _pool = ScopedPool::new();
-            let cb = queue.new_command_buffer_with_unretained_references();
+        let (normed2, h) = autoreleasepool(|_| {
+            let cb = queue.commandBufferWithUnretainedReferences().unwrap();
             let r = ops::rms_norm::rms_norm_residual_add_into_cb(
                 &registry,
                 &o_out, // attention output
                 &input, // residual = original input
                 &norm2_w,
                 RMS_NORM_EPS,
-                cb,
+                &cb,
             )
             .expect("fused residual+norm");
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
             r
-        };
+        });
         let normed2_2d = normed2
             .reshape(vec![seq_len, HIDDEN_SIZE])
             .expect("reshape");
 
         // 9. Gate+Up GEMM
-        let gate_up_out = {
-            let _pool = ScopedPool::new();
-            let cb = queue.new_command_buffer_with_unretained_references();
-            let r = ops::matmul::matmul_into_cb(&registry, &normed2_2d, &gate_up_wt, cb)
+        let gate_up_out = autoreleasepool(|_| {
+            let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+            let r = ops::matmul::matmul_into_cb(&registry, &normed2_2d, &gate_up_wt, &cb)
                 .expect("gate_up");
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
             r
-        };
+        });
 
         // 10. SiLU*mul (strided)
-        let hidden_act = {
-            let _pool = ScopedPool::new();
-            let cb = queue.new_command_buffer_with_unretained_references();
+        let hidden_act = autoreleasepool(|_| {
+            let cb = queue.commandBufferWithUnretainedReferences().unwrap();
             let r = ops::fused::fused_silu_mul_strided_into_cb(
                 &registry,
                 &gate_up_out,
                 INTERMEDIATE_DIM,
-                cb,
+                &cb,
             )
             .expect("silu_mul");
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
             r
-        };
+        });
 
         // 11. Down proj
-        let ffn_out = {
-            let _pool = ScopedPool::new();
-            let cb = queue.new_command_buffer_with_unretained_references();
-            let r = ops::matmul::matmul_into_cb(&registry, &hidden_act, &w_down_t, cb)
+        let ffn_out = autoreleasepool(|_| {
+            let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+            let r = ops::matmul::matmul_into_cb(&registry, &hidden_act, &w_down_t, &cb)
                 .expect("down_proj");
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
             r
-        };
+        });
 
         // ====================================================================
         // Benchmark each op in isolation

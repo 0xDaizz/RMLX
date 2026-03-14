@@ -13,15 +13,19 @@
 //!
 //! Usage: cargo bench -p rmlx-core --bench qmv_vs_steelsk_bench
 
+use std::ptr::NonNull;
 use std::time::{Duration, Instant};
 
 use half::f16;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLDevice as _;
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::KernelRegistry;
 use rmlx_core::ops;
 use rmlx_core::ops::quantized::QuantizedWeight;
 use rmlx_metal::device::GpuDevice;
+use rmlx_metal::MTLResourceOptions;
 
 const WARMUP_ITERS: usize = 5;
 const BENCH_ITERS: usize = 20;
@@ -71,7 +75,11 @@ fn lcg_next(state: &mut u64) -> u64 {
     *state
 }
 
-fn rand_f16_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
+fn rand_f16_array(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    shape: &[usize],
+    seed: u64,
+) -> Array {
     let numel: usize = shape.iter().product();
     let mut state = seed;
     let mut f16_bytes = Vec::with_capacity(numel * 2);
@@ -85,14 +93,14 @@ fn rand_f16_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
 }
 
 fn make_quantized_weight(
-    device: &metal::Device,
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
     out_features: usize,
     in_features: usize,
     seed: u64,
 ) -> QuantizedWeight {
     let bits: u32 = 4;
     let mut state = seed;
-    let opts = metal::MTLResourceOptions::StorageModeShared;
+    let opts = MTLResourceOptions::StorageModeShared;
 
     let elems_per_u32 = 32 / bits as usize;
     let total_elements = out_features * in_features;
@@ -103,8 +111,15 @@ fn make_quantized_weight(
             v as u32
         })
         .collect();
-    let weights_buf =
-        device.new_buffer_with_data(w_data.as_ptr() as *const _, (num_u32s * 4) as u64, opts);
+    let weights_buf = unsafe {
+        device
+            .newBufferWithBytes_length_options(
+                NonNull::new(w_data.as_ptr() as *mut _).unwrap(),
+                num_u32s * 4,
+                opts,
+            )
+            .unwrap()
+    };
 
     let num_groups = total_elements / GROUP_SIZE as usize;
     let scales_data: Vec<u16> = (0..num_groups)
@@ -122,16 +137,24 @@ fn make_quantized_weight(
         })
         .collect();
 
-    let scales_buf = device.new_buffer_with_data(
-        scales_data.as_ptr() as *const _,
-        (num_groups * 2) as u64,
-        opts,
-    );
-    let biases_buf = device.new_buffer_with_data(
-        biases_data.as_ptr() as *const _,
-        (num_groups * 2) as u64,
-        opts,
-    );
+    let scales_buf = unsafe {
+        device
+            .newBufferWithBytes_length_options(
+                NonNull::new(scales_data.as_ptr() as *mut _).unwrap(),
+                num_groups * 2,
+                opts,
+            )
+            .unwrap()
+    };
+    let biases_buf = unsafe {
+        device
+            .newBufferWithBytes_length_options(
+                NonNull::new(biases_data.as_ptr() as *mut _).unwrap(),
+                num_groups * 2,
+                opts,
+            )
+            .unwrap()
+    };
 
     QuantizedWeight::new(
         weights_buf,
@@ -161,8 +184,8 @@ fn tflops(m: usize, n: usize, k: usize, latency_us: f64) -> f64 {
 /// QMV-batch path: affine_quantized_matmul_batched (auto-dispatches to QMV-batch for M<=16).
 fn bench_qmv_batch(
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
-    device: &metal::Device,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
     m: usize,
     n: usize,
     k: usize,
@@ -189,8 +212,8 @@ fn bench_qmv_batch(
 /// Steel Split-K path: affine_qmm_steel_splitk_q4 (forces Steel Split-K regardless of M).
 fn bench_steel_splitk(
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
-    device: &metal::Device,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
     m: usize,
     n: usize,
     k: usize,
@@ -223,7 +246,7 @@ fn main() {
     let registry = KernelRegistry::new(gpu);
     ops::register_all(&registry).expect("Failed to register kernels");
     let device = registry.device().raw();
-    let queue = device.new_command_queue();
+    let queue = device.newCommandQueue().unwrap();
 
     // --- GPU warmup: trigger Metal shader JIT compilation before timing ---
     println!("GPU warmup (triggering Metal shader compilation)...");

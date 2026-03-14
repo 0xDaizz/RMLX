@@ -12,7 +12,14 @@
 use crate::array::{broadcast_shape, Array};
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
-use metal::MTLSize;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLCommandBuffer as _;
+use objc2_metal::MTLCommandQueue as _;
+use objc2_metal::MTLComputePipelineState as _;
+use objc2_metal::MTLDevice as _;
+use rmlx_metal::ComputePass;
+use rmlx_metal::MTLResourceOptions;
+use rmlx_metal::MTLSize;
 
 // ---------------------------------------------------------------------------
 // Metal shader source
@@ -411,7 +418,7 @@ pub fn binary_op(
     a: &Array,
     b: &Array,
     op: BinaryOp,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     binary_op_with_mode(registry, a, b, op, queue, super::ExecMode::Sync)
 }
@@ -422,7 +429,7 @@ pub fn binary_op_with_mode(
     a: &Array,
     b: &Array,
     op: BinaryOp,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
     mode: super::ExecMode,
 ) -> Result<Array, KernelError> {
     // Validate dtypes match.
@@ -465,13 +472,13 @@ pub fn binary_op_with_mode(
     };
     let out = Array::uninit(registry.device().raw(), &out_shape, out_dtype);
 
-    let command_buffer = queue.new_command_buffer();
-    let encoder = command_buffer.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(a.metal_buffer()), a.offset() as u64);
-    encoder.set_buffer(1, Some(b.metal_buffer()), b.offset() as u64);
-    encoder.set_buffer(2, Some(out.metal_buffer()), out.offset() as u64);
-
+    let command_buffer = queue.commandBuffer().unwrap();
+    let raw_enc = command_buffer.computeCommandEncoder().unwrap();
+    let encoder = ComputePass::new(&raw_enc);
+    encoder.set_pipeline(&pipeline);
+    encoder.set_buffer(0, Some(a.metal_buffer()), a.offset());
+    encoder.set_buffer(1, Some(b.metal_buffer()), b.offset());
+    encoder.set_buffer(2, Some(out.metal_buffer()), out.offset());
     match variant {
         DispatchVariant::General => {
             // Pass out_shape, a_strides, b_strides, ndim as Metal buffers.
@@ -498,29 +505,57 @@ pub fn binary_op_with_mode(
                 .map(|(i, &s)| super::checked_u32(s, &format!("b_strides[{i}]")))
                 .collect::<Result<Vec<u32>, _>>()?;
 
-            let buf_size = |v: &[u32]| std::mem::size_of_val(v) as u64;
+            let buf_size = |v: &[u32]| std::mem::size_of_val(v);
 
-            let shape_buf = device.new_buffer_with_data(
-                shape_u32.as_ptr() as *const _,
-                buf_size(&shape_u32),
-                metal::MTLResourceOptions::StorageModeShared,
-            );
-            let a_stride_buf = device.new_buffer_with_data(
-                a_strides_u32.as_ptr() as *const _,
-                buf_size(&a_strides_u32),
-                metal::MTLResourceOptions::StorageModeShared,
-            );
-            let b_stride_buf = device.new_buffer_with_data(
-                b_strides_u32.as_ptr() as *const _,
-                buf_size(&b_strides_u32),
-                metal::MTLResourceOptions::StorageModeShared,
-            );
+            let shape_buf = unsafe {
+                device
+                    .newBufferWithBytes_length_options(
+                        std::ptr::NonNull::new(
+                            shape_u32.as_ptr() as *const _ as *mut std::ffi::c_void
+                        )
+                        .unwrap(),
+                        buf_size(&shape_u32) as usize,
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                    .unwrap()
+            };
+            let a_stride_buf = unsafe {
+                device
+                    .newBufferWithBytes_length_options(
+                        std::ptr::NonNull::new(
+                            a_strides_u32.as_ptr() as *const _ as *mut std::ffi::c_void
+                        )
+                        .unwrap(),
+                        buf_size(&a_strides_u32) as usize,
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                    .unwrap()
+            };
+            let b_stride_buf = unsafe {
+                device
+                    .newBufferWithBytes_length_options(
+                        std::ptr::NonNull::new(
+                            b_strides_u32.as_ptr() as *const _ as *mut std::ffi::c_void
+                        )
+                        .unwrap(),
+                        buf_size(&b_strides_u32) as usize,
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                    .unwrap()
+            };
             let ndim_val = super::checked_u32(ndim, "ndim")?;
-            let ndim_buf = device.new_buffer_with_data(
-                &ndim_val as *const u32 as *const _,
-                std::mem::size_of::<u32>() as u64,
-                metal::MTLResourceOptions::StorageModeShared,
-            );
+            let ndim_buf = unsafe {
+                device
+                    .newBufferWithBytes_length_options(
+                        std::ptr::NonNull::new(
+                            &ndim_val as *const u32 as *const _ as *mut std::ffi::c_void,
+                        )
+                        .unwrap(),
+                        std::mem::size_of::<u32>(),
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                    .unwrap()
+            };
 
             encoder.set_buffer(3, Some(&shape_buf), 0);
             encoder.set_buffer(4, Some(&a_stride_buf), 0);
@@ -532,18 +567,19 @@ pub fn binary_op_with_mode(
         }
     }
 
-    let grid_size = MTLSize::new(out_numel as u64, 1, 1);
-    let threadgroup_size = MTLSize::new(
-        std::cmp::min(
-            pipeline.max_total_threads_per_threadgroup(),
-            out_numel as u64,
-        ),
-        1,
-        1,
-    );
+    let grid_size = MTLSize {
+        width: out_numel as usize,
+        height: 1,
+        depth: 1,
+    };
+    let threadgroup_size = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), out_numel as usize),
+        height: 1,
+        depth: 1,
+    };
     encoder.dispatch_threads(grid_size, threadgroup_size);
-    encoder.end_encoding();
-    super::commit_with_mode(command_buffer, mode);
+    encoder.end();
+    super::commit_with_mode(&command_buffer, mode);
 
     Ok(out)
 }
@@ -557,7 +593,7 @@ pub fn binary_op_async(
     a: &Array,
     b: &Array,
     op: BinaryOp,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<super::LaunchResult, KernelError> {
     // Validate dtypes match.
     if a.dtype() != b.dtype() {
@@ -599,13 +635,13 @@ pub fn binary_op_async(
 
     let out = Array::uninit(registry.device().raw(), &out_shape, out_dtype);
 
-    let command_buffer = queue.new_command_buffer();
-    let encoder = command_buffer.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(a.metal_buffer()), a.offset() as u64);
-    encoder.set_buffer(1, Some(b.metal_buffer()), b.offset() as u64);
-    encoder.set_buffer(2, Some(out.metal_buffer()), out.offset() as u64);
-
+    let command_buffer = queue.commandBuffer().unwrap();
+    let raw_enc = command_buffer.computeCommandEncoder().unwrap();
+    let encoder = ComputePass::new(&raw_enc);
+    encoder.set_pipeline(&pipeline);
+    encoder.set_buffer(0, Some(a.metal_buffer()), a.offset());
+    encoder.set_buffer(1, Some(b.metal_buffer()), b.offset());
+    encoder.set_buffer(2, Some(out.metal_buffer()), out.offset());
     if matches!(variant, DispatchVariant::General) {
         let device = registry.device().raw();
         let ndim = out_shape.len();
@@ -630,29 +666,55 @@ pub fn binary_op_async(
             .map(|(i, &s)| super::checked_u32(s, &format!("b_strides[{i}]")))
             .collect::<Result<Vec<u32>, _>>()?;
 
-        let buf_size = |v: &[u32]| std::mem::size_of_val(v) as u64;
+        let buf_size = |v: &[u32]| std::mem::size_of_val(v);
 
-        let shape_buf = device.new_buffer_with_data(
-            shape_u32.as_ptr() as *const _,
-            buf_size(&shape_u32),
-            metal::MTLResourceOptions::StorageModeShared,
-        );
-        let a_stride_buf = device.new_buffer_with_data(
-            a_strides_u32.as_ptr() as *const _,
-            buf_size(&a_strides_u32),
-            metal::MTLResourceOptions::StorageModeShared,
-        );
-        let b_stride_buf = device.new_buffer_with_data(
-            b_strides_u32.as_ptr() as *const _,
-            buf_size(&b_strides_u32),
-            metal::MTLResourceOptions::StorageModeShared,
-        );
+        let shape_buf = unsafe {
+            device
+                .newBufferWithBytes_length_options(
+                    std::ptr::NonNull::new(shape_u32.as_ptr() as *const _ as *mut std::ffi::c_void)
+                        .unwrap(),
+                    buf_size(&shape_u32) as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .unwrap()
+        };
+        let a_stride_buf = unsafe {
+            device
+                .newBufferWithBytes_length_options(
+                    std::ptr::NonNull::new(
+                        a_strides_u32.as_ptr() as *const _ as *mut std::ffi::c_void
+                    )
+                    .unwrap(),
+                    buf_size(&a_strides_u32) as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .unwrap()
+        };
+        let b_stride_buf = unsafe {
+            device
+                .newBufferWithBytes_length_options(
+                    std::ptr::NonNull::new(
+                        b_strides_u32.as_ptr() as *const _ as *mut std::ffi::c_void
+                    )
+                    .unwrap(),
+                    buf_size(&b_strides_u32) as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .unwrap()
+        };
         let ndim_val = super::checked_u32(ndim, "ndim")?;
-        let ndim_buf = device.new_buffer_with_data(
-            &ndim_val as *const u32 as *const _,
-            std::mem::size_of::<u32>() as u64,
-            metal::MTLResourceOptions::StorageModeShared,
-        );
+        let ndim_buf = unsafe {
+            device
+                .newBufferWithBytes_length_options(
+                    std::ptr::NonNull::new(
+                        &ndim_val as *const u32 as *const _ as *mut std::ffi::c_void,
+                    )
+                    .unwrap(),
+                    std::mem::size_of::<u32>(),
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .unwrap()
+        };
 
         encoder.set_buffer(3, Some(&shape_buf), 0);
         encoder.set_buffer(4, Some(&a_stride_buf), 0);
@@ -660,19 +722,20 @@ pub fn binary_op_async(
         encoder.set_buffer(6, Some(&ndim_buf), 0);
     }
 
-    let grid_size = MTLSize::new(out_numel as u64, 1, 1);
-    let threadgroup_size = MTLSize::new(
-        std::cmp::min(
-            pipeline.max_total_threads_per_threadgroup(),
-            out_numel as u64,
-        ),
-        1,
-        1,
-    );
+    let grid_size = MTLSize {
+        width: out_numel as usize,
+        height: 1,
+        depth: 1,
+    };
+    let threadgroup_size = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), out_numel as usize),
+        height: 1,
+        depth: 1,
+    };
     encoder.dispatch_threads(grid_size, threadgroup_size);
-    encoder.end_encoding();
+    encoder.end();
 
-    let handle = super::commit_with_mode(command_buffer, super::ExecMode::Async)
+    let handle = super::commit_with_mode(&command_buffer, super::ExecMode::Async)
         .expect("async mode always returns a handle");
 
     Ok(super::LaunchResult::new(out, handle))
@@ -687,7 +750,7 @@ pub fn add(
     registry: &KernelRegistry,
     a: &Array,
     b: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     binary_op(registry, a, b, BinaryOp::Add, queue)
 }
@@ -697,7 +760,7 @@ pub fn mul(
     registry: &KernelRegistry,
     a: &Array,
     b: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     binary_op(registry, a, b, BinaryOp::Mul, queue)
 }
@@ -707,7 +770,7 @@ pub fn sub(
     registry: &KernelRegistry,
     a: &Array,
     b: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     binary_op(registry, a, b, BinaryOp::Sub, queue)
 }
@@ -717,7 +780,7 @@ pub fn div(
     registry: &KernelRegistry,
     a: &Array,
     b: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     binary_op(registry, a, b, BinaryOp::Div, queue)
 }
@@ -727,7 +790,7 @@ pub fn eq(
     registry: &KernelRegistry,
     a: &Array,
     b: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     binary_op(registry, a, b, BinaryOp::Eq, queue)
 }
@@ -737,7 +800,7 @@ pub fn ne(
     registry: &KernelRegistry,
     a: &Array,
     b: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     binary_op(registry, a, b, BinaryOp::Ne, queue)
 }
@@ -747,7 +810,7 @@ pub fn lt(
     registry: &KernelRegistry,
     a: &Array,
     b: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     binary_op(registry, a, b, BinaryOp::Lt, queue)
 }
@@ -757,7 +820,7 @@ pub fn le(
     registry: &KernelRegistry,
     a: &Array,
     b: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     binary_op(registry, a, b, BinaryOp::Le, queue)
 }
@@ -767,7 +830,7 @@ pub fn gt(
     registry: &KernelRegistry,
     a: &Array,
     b: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     binary_op(registry, a, b, BinaryOp::Gt, queue)
 }
@@ -777,7 +840,7 @@ pub fn ge(
     registry: &KernelRegistry,
     a: &Array,
     b: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     binary_op(registry, a, b, BinaryOp::Ge, queue)
 }
@@ -792,7 +855,7 @@ fn binary_op_encode_impl(
     a: &Array,
     b: &Array,
     op: BinaryOp,
-    encoder: &metal::ComputeCommandEncoderRef,
+    encoder: ComputePass<'_>,
 ) -> Result<Array, KernelError> {
     // Validate dtypes match.
     if a.dtype() != b.dtype() {
@@ -828,11 +891,10 @@ fn binary_op_encode_impl(
     };
     let out = Array::uninit(registry.device().raw(), &out_shape, out_dtype);
 
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(a.metal_buffer()), a.offset() as u64);
-    encoder.set_buffer(1, Some(b.metal_buffer()), b.offset() as u64);
-    encoder.set_buffer(2, Some(out.metal_buffer()), out.offset() as u64);
-
+    encoder.set_pipeline(&pipeline);
+    encoder.set_buffer(0, Some(a.metal_buffer()), a.offset());
+    encoder.set_buffer(1, Some(b.metal_buffer()), b.offset());
+    encoder.set_buffer(2, Some(out.metal_buffer()), out.offset());
     if matches!(variant, DispatchVariant::General) {
         let ndim = out_shape.len();
 
@@ -856,36 +918,37 @@ fn binary_op_encode_impl(
             .map(|(i, &s)| super::checked_u32(s, &format!("b_strides[{i}]")))
             .collect::<Result<Vec<u32>, _>>()?;
 
-        let buf_size = |v: &[u32]| std::mem::size_of_val(v) as u64;
+        let buf_size = |v: &[u32]| std::mem::size_of_val(v);
         let ndim_val = super::checked_u32(ndim, "ndim")?;
 
         encoder.set_bytes(
             3,
-            buf_size(&shape_u32),
             shape_u32.as_ptr() as *const std::ffi::c_void,
+            buf_size(&shape_u32),
         );
         encoder.set_bytes(
             4,
-            buf_size(&a_strides_u32),
             a_strides_u32.as_ptr() as *const std::ffi::c_void,
+            buf_size(&a_strides_u32),
         );
         encoder.set_bytes(
             5,
-            buf_size(&b_strides_u32),
             b_strides_u32.as_ptr() as *const std::ffi::c_void,
+            buf_size(&b_strides_u32),
         );
-        encoder.set_bytes(6, 4, &ndim_val as *const u32 as *const std::ffi::c_void);
+        encoder.set_bytes(6, &ndim_val as *const u32 as *const std::ffi::c_void, 4);
     }
 
-    let grid_size = MTLSize::new(out_numel as u64, 1, 1);
-    let threadgroup_size = MTLSize::new(
-        std::cmp::min(
-            pipeline.max_total_threads_per_threadgroup(),
-            out_numel as u64,
-        ),
-        1,
-        1,
-    );
+    let grid_size = MTLSize {
+        width: out_numel as usize,
+        height: 1,
+        depth: 1,
+    };
+    let threadgroup_size = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), out_numel as usize),
+        height: 1,
+        depth: 1,
+    };
     encoder.dispatch_threads(grid_size, threadgroup_size);
 
     Ok(out)
@@ -897,11 +960,12 @@ pub fn binary_op_into_cb(
     a: &Array,
     b: &Array,
     op: BinaryOp,
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
 ) -> Result<Array, KernelError> {
-    let encoder = cb.new_compute_command_encoder();
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let encoder = ComputePass::new(&raw_enc);
     let result = binary_op_encode_impl(registry, a, b, op, encoder)?;
-    encoder.end_encoding();
+    encoder.end();
     Ok(result)
 }
 
@@ -913,7 +977,7 @@ pub fn binary_op_encode(
     a: &Array,
     b: &Array,
     op: BinaryOp,
-    encoder: &metal::ComputeCommandEncoderRef,
+    encoder: ComputePass<'_>,
 ) -> Result<Array, KernelError> {
     binary_op_encode_impl(registry, a, b, op, encoder)
 }
@@ -923,7 +987,7 @@ pub fn add_into_cb(
     registry: &KernelRegistry,
     a: &Array,
     b: &Array,
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
 ) -> Result<Array, KernelError> {
     binary_op_into_cb(registry, a, b, BinaryOp::Add, cb)
 }
@@ -935,7 +999,7 @@ pub fn add_encode(
     registry: &KernelRegistry,
     a: &Array,
     b: &Array,
-    encoder: &metal::ComputeCommandEncoderRef,
+    encoder: ComputePass<'_>,
 ) -> Result<Array, KernelError> {
     binary_op_encode(registry, a, b, BinaryOp::Add, encoder)
 }
@@ -945,7 +1009,7 @@ pub fn mul_into_cb(
     registry: &KernelRegistry,
     a: &Array,
     b: &Array,
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
 ) -> Result<Array, KernelError> {
     binary_op_into_cb(registry, a, b, BinaryOp::Mul, cb)
 }
@@ -957,7 +1021,7 @@ pub fn mul_encode(
     registry: &KernelRegistry,
     a: &Array,
     b: &Array,
-    encoder: &metal::ComputeCommandEncoderRef,
+    encoder: ComputePass<'_>,
 ) -> Result<Array, KernelError> {
     binary_op_encode(registry, a, b, BinaryOp::Mul, encoder)
 }

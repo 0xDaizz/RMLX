@@ -12,8 +12,13 @@
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
-use metal::MTLSize;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLCommandBuffer as _;
+use objc2_metal::MTLCommandQueue as _;
+use objc2_metal::MTLComputePipelineState as _;
 use rmlx_macros::rmlx_kernel;
+use rmlx_metal::ComputePass;
+use rmlx_metal::MTLSize;
 
 /// Metal shader source for SiLU kernels.
 pub const SILU_SHADER_SOURCE: &str = r#"
@@ -339,7 +344,7 @@ fn silu_kernel_info(dtype: DType, fused_gate: bool) -> Result<(&'static str, u64
 pub fn silu(
     registry: &KernelRegistry,
     input: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     let input_contig = super::make_contiguous(input, registry, queue)?;
     let input = input_contig.as_ref().unwrap_or(input);
@@ -351,24 +356,28 @@ pub fn silu(
     let out = Array::uninit(registry.device().raw(), input.shape(), input.dtype());
     let numel_u32 = numel as u32;
 
-    let command_buffer = queue.new_command_buffer();
-    let encoder = command_buffer.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
-    encoder.set_buffer(1, Some(out.metal_buffer()), out.offset() as u64);
-    encoder.set_bytes(2, 4, &numel_u32 as *const u32 as *const std::ffi::c_void);
-
+    let command_buffer = queue.commandBuffer().unwrap();
+    let raw_enc = command_buffer.computeCommandEncoder().unwrap();
+    let encoder = ComputePass::new(&raw_enc);
+    encoder.set_pipeline(&pipeline);
+    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset());
+    encoder.set_buffer(1, Some(out.metal_buffer()), out.offset());
+    encoder.set_val(2, &numel_u32);
     // Grid = ceil(numel / elems_per_thread) threads
-    let grid_threads = (numel as u64).div_ceil(elems_per_thread);
-    let grid_size = MTLSize::new(grid_threads, 1, 1);
-    let threadgroup_size = MTLSize::new(
-        std::cmp::min(pipeline.max_total_threads_per_threadgroup(), grid_threads),
-        1,
-        1,
-    );
+    let grid_threads = (numel as usize).div_ceil(elems_per_thread as usize);
+    let grid_size = MTLSize {
+        width: grid_threads,
+        height: 1,
+        depth: 1,
+    };
+    let threadgroup_size = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), grid_threads),
+        height: 1,
+        depth: 1,
+    };
     encoder.dispatch_threads(grid_size, threadgroup_size);
-    encoder.end_encoding();
-    super::commit_with_mode(command_buffer, super::ExecMode::Sync);
+    encoder.end();
+    super::commit_with_mode(&command_buffer, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -380,7 +389,7 @@ pub fn silu_gate(
     registry: &KernelRegistry,
     input: &Array,
     gate: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     // Validate shapes match
     if input.shape() != gate.shape() {
@@ -410,24 +419,28 @@ pub fn silu_gate(
     let out = Array::uninit(registry.device().raw(), input.shape(), input.dtype());
     let numel_u32 = numel as u32;
 
-    let command_buffer = queue.new_command_buffer();
-    let encoder = command_buffer.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
-    encoder.set_buffer(1, Some(gate.metal_buffer()), gate.offset() as u64);
-    encoder.set_buffer(2, Some(out.metal_buffer()), out.offset() as u64);
-    encoder.set_bytes(3, 4, &numel_u32 as *const u32 as *const std::ffi::c_void);
-
-    let grid_threads = (numel as u64).div_ceil(elems_per_thread);
-    let grid_size = MTLSize::new(grid_threads, 1, 1);
-    let threadgroup_size = MTLSize::new(
-        std::cmp::min(pipeline.max_total_threads_per_threadgroup(), grid_threads),
-        1,
-        1,
-    );
+    let command_buffer = queue.commandBuffer().unwrap();
+    let raw_enc = command_buffer.computeCommandEncoder().unwrap();
+    let encoder = ComputePass::new(&raw_enc);
+    encoder.set_pipeline(&pipeline);
+    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset());
+    encoder.set_buffer(1, Some(gate.metal_buffer()), gate.offset());
+    encoder.set_buffer(2, Some(out.metal_buffer()), out.offset());
+    encoder.set_val(3, &numel_u32);
+    let grid_threads = (numel as usize).div_ceil(elems_per_thread as usize);
+    let grid_size = MTLSize {
+        width: grid_threads,
+        height: 1,
+        depth: 1,
+    };
+    let threadgroup_size = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), grid_threads),
+        height: 1,
+        depth: 1,
+    };
     encoder.dispatch_threads(grid_size, threadgroup_size);
-    encoder.end_encoding();
-    super::commit_with_mode(command_buffer, super::ExecMode::Sync);
+    encoder.end();
+    super::commit_with_mode(&command_buffer, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -436,11 +449,11 @@ pub fn silu_gate(
 // Into-CB variant (encode into existing command buffer, no commit/wait)
 // ---------------------------------------------------------------------------
 
-/// Private: encode SiLU into an existing compute encoder (does NOT call end_encoding).
+/// Private: encode SiLU into an existing compute encoder (does NOT call end).
 fn silu_encode_impl(
     registry: &KernelRegistry,
     input: &Array,
-    encoder: &metal::ComputeCommandEncoderRef,
+    encoder: ComputePass<'_>,
 ) -> Result<Array, KernelError> {
     let (kernel_name, elems_per_thread) = silu_kernel_info(input.dtype(), false)?;
     let pipeline = registry.get_pipeline(kernel_name, input.dtype())?;
@@ -449,19 +462,25 @@ fn silu_encode_impl(
     let out = Array::uninit(registry.device().raw(), input.shape(), input.dtype());
     let numel_u32 = numel as u32;
 
-    let grid_threads = (numel as u64).div_ceil(elems_per_thread);
+    let grid_threads = numel.div_ceil(elems_per_thread as usize);
 
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
-    encoder.set_buffer(1, Some(out.metal_buffer()), out.offset() as u64);
-    encoder.set_bytes(2, 4, &numel_u32 as *const u32 as *const std::ffi::c_void);
-
-    let threadgroup_size = MTLSize::new(
-        std::cmp::min(pipeline.max_total_threads_per_threadgroup(), grid_threads),
-        1,
-        1,
+    encoder.set_pipeline(&pipeline);
+    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset());
+    encoder.set_buffer(1, Some(out.metal_buffer()), out.offset());
+    encoder.set_val(2, &numel_u32);
+    let threadgroup_size = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), grid_threads),
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_threads(
+        MTLSize {
+            width: grid_threads,
+            height: 1,
+            depth: 1,
+        },
+        threadgroup_size,
     );
-    encoder.dispatch_threads(MTLSize::new(grid_threads, 1, 1), threadgroup_size);
 
     Ok(out)
 }
@@ -472,11 +491,12 @@ fn silu_encode_impl(
 pub fn silu_into_cb(
     registry: &KernelRegistry,
     input: &Array,
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
 ) -> Result<Array, KernelError> {
-    let encoder = cb.new_compute_command_encoder();
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let encoder = ComputePass::new(&raw_enc);
     let result = silu_encode_impl(registry, input, encoder)?;
-    encoder.end_encoding();
+    encoder.end();
     Ok(result)
 }
 
@@ -487,7 +507,7 @@ pub fn silu_into_cb(
 pub fn silu_encode(
     registry: &KernelRegistry,
     input: &Array,
-    encoder: &metal::ComputeCommandEncoderRef,
+    encoder: ComputePass<'_>,
 ) -> Result<Array, KernelError> {
     silu_encode_impl(registry, input, encoder)
 }

@@ -10,6 +10,15 @@
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLBuffer as _;
+use objc2_metal::MTLCommandBuffer as _;
+use objc2_metal::MTLCommandQueue as _;
+use objc2_metal::MTLComputePipelineState as _;
+use objc2_metal::MTLDevice as _;
+use rmlx_metal::ComputePass;
+use rmlx_metal::MTLResourceOptions;
+use rmlx_metal::MTLSize;
 
 // ---------------------------------------------------------------------------
 // ScatterOp enum
@@ -363,39 +372,35 @@ kernel void scatter_add_bf16(
 // Rust helper: create a small constant buffer
 // ---------------------------------------------------------------------------
 
-fn make_u32_buf(device: &metal::Device, val: u32) -> metal::Buffer {
-    device.new_buffer_with_data(
-        &val as *const u32 as *const std::ffi::c_void,
-        4,
-        metal::MTLResourceOptions::StorageModeShared,
-    )
+fn make_u32_buf(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    val: u32,
+) -> rmlx_metal::MtlBuffer {
+    unsafe {
+        device
+            .newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(
+                    &val as *const u32 as *const std::ffi::c_void as *mut std::ffi::c_void,
+                )
+                .unwrap(),
+                4_usize,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap()
+    }
 }
 
-// ---------------------------------------------------------------------------
-// Registration
-// ---------------------------------------------------------------------------
-
+// --------------------------------------------------------------------------- // Registration // ---------------------------------------------------------------------------
 pub fn register(registry: &KernelRegistry) -> Result<(), KernelError> {
     registry.register_jit_source("indexing", INDEXING_SHADER_SOURCE)
 }
-
-// ---------------------------------------------------------------------------
-// Gather (backward-compatible API)
-// ---------------------------------------------------------------------------
-
-/// Gather elements from `src` at the positions given by `indices`.
-///
-/// `output[i] = src[indices[i]]`
-///
-/// * `src`     - 1-D source array (Float32, Float16, or Bfloat16).
-/// * `indices` - 1-D index array (UInt32). Out-of-bounds indices produce 0.
-///
-/// All bounds checking happens on the GPU -- no host-side readback of indices.
+// --------------------------------------------------------------------------- // Gather (backward-compatible API) // ---------------------------------------------------------------------------
+/// Gather elements from `src` at the positions given by `indices`. /// /// `output[i] = src[indices[i]]` /// /// * `src`     - 1-D source array (Float32, Float16, or Bfloat16). /// * `indices` - 1-D index array (UInt32). Out-of-bounds indices produce 0. /// /// All bounds checking happens on the GPU -- no host-side readback of indices. pub
 pub fn gather(
     registry: &KernelRegistry,
     src: &Array,
     indices: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     let kernel_name = match src.dtype() {
         DType::Float32 => "gather_f32",
@@ -426,23 +431,27 @@ pub fn gather(
     let out = Array::zeros(registry.device().raw(), indices.shape(), src.dtype());
     let src_size_buf = make_u32_buf(registry.device().raw(), src_size);
 
-    let cb = queue.new_command_buffer();
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(src.metal_buffer()), src.offset() as u64);
-    enc.set_buffer(1, Some(indices.metal_buffer()), indices.offset() as u64);
+    let cb = queue.commandBuffer().unwrap();
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
+    enc.set_buffer(0, Some(src.metal_buffer()), src.offset());
+    enc.set_buffer(1, Some(indices.metal_buffer()), indices.offset());
     enc.set_buffer(2, Some(out.metal_buffer()), 0);
     enc.set_buffer(3, Some(&src_size_buf), 0);
-
-    let grid = metal::MTLSize::new(numel as u64, 1, 1);
-    let tg = metal::MTLSize::new(
-        std::cmp::min(pipeline.max_total_threads_per_threadgroup(), numel as u64),
-        1,
-        1,
-    );
+    let grid = MTLSize {
+        width: numel,
+        height: 1,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), numel),
+        height: 1,
+        depth: 1,
+    };
     enc.dispatch_threads(grid, tg);
-    enc.end_encoding();
-    super::commit_with_mode(cb, super::ExecMode::Sync);
+    enc.end();
+    super::commit_with_mode(&cb, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -462,7 +471,7 @@ pub fn gather_signed(
     registry: &KernelRegistry,
     src: &Array,
     indices: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     let kernel_name = match src.dtype() {
         DType::Float32 => "gather_signed_f32",
@@ -493,23 +502,27 @@ pub fn gather_signed(
     let out = Array::zeros(registry.device().raw(), indices.shape(), src.dtype());
     let src_size_buf = make_u32_buf(registry.device().raw(), src_size);
 
-    let cb = queue.new_command_buffer();
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(src.metal_buffer()), src.offset() as u64);
-    enc.set_buffer(1, Some(indices.metal_buffer()), indices.offset() as u64);
+    let cb = queue.commandBuffer().unwrap();
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
+    enc.set_buffer(0, Some(src.metal_buffer()), src.offset());
+    enc.set_buffer(1, Some(indices.metal_buffer()), indices.offset());
     enc.set_buffer(2, Some(out.metal_buffer()), 0);
     enc.set_buffer(3, Some(&src_size_buf), 0);
-
-    let grid = metal::MTLSize::new(numel as u64, 1, 1);
-    let tg = metal::MTLSize::new(
-        std::cmp::min(pipeline.max_total_threads_per_threadgroup(), numel as u64),
-        1,
-        1,
-    );
+    let grid = MTLSize {
+        width: numel,
+        height: 1,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), numel),
+        height: 1,
+        depth: 1,
+    };
     enc.dispatch_threads(grid, tg);
-    enc.end_encoding();
-    super::commit_with_mode(cb, super::ExecMode::Sync);
+    enc.end();
+    super::commit_with_mode(&cb, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -533,7 +546,7 @@ pub fn gather_axis(
     src: &Array,
     axis: usize,
     indices: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     if src.dtype() != DType::Float32 {
         return Err(KernelError::NotFound(format!(
@@ -585,35 +598,35 @@ pub fn gather_axis(
     let src_axis_stride = src_shape[axis..].iter().product::<usize>(); // src_dim * inner
     let out_axis_stride = num_indices * inner_size;
 
-    let cb = queue.new_command_buffer();
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
+    let cb = queue.commandBuffer().unwrap();
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
     enc.set_buffer(3, Some(&src_dim_buf), 0);
     enc.set_buffer(4, Some(&inner_buf), 0);
-
-    let threads_per_outer = (num_indices * inner_size) as u64;
-    let tg = metal::MTLSize::new(
-        std::cmp::min(
-            pipeline.max_total_threads_per_threadgroup(),
-            threads_per_outer,
-        ),
-        1,
-        1,
-    );
+    let threads_per_outer = num_indices * inner_size;
+    let tg = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), threads_per_outer),
+        height: 1,
+        depth: 1,
+    };
 
     for o in 0..outer_size {
         let src_offset = (src.offset() + o * src_axis_stride * elem_bytes) as u64;
         let out_offset = (o * out_axis_stride * elem_bytes) as u64;
-        enc.set_buffer(0, Some(src.metal_buffer()), src_offset);
-        enc.set_buffer(1, Some(indices.metal_buffer()), indices.offset() as u64);
-        enc.set_buffer(2, Some(out.metal_buffer()), out_offset);
-
-        let grid = metal::MTLSize::new(threads_per_outer, 1, 1);
+        enc.set_buffer(0, Some(src.metal_buffer()), src_offset as usize);
+        enc.set_buffer(1, Some(indices.metal_buffer()), indices.offset());
+        enc.set_buffer(2, Some(out.metal_buffer()), out_offset as usize);
+        let grid = MTLSize {
+            width: threads_per_outer,
+            height: 1,
+            depth: 1,
+        };
         enc.dispatch_threads(grid, tg);
     }
 
-    enc.end_encoding();
-    super::commit_with_mode(cb, super::ExecMode::Sync);
+    enc.end();
+    super::commit_with_mode(&cb, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -642,7 +655,7 @@ pub fn scatter(
     indices: &Array,
     output_size: usize,
     op: ScatterOp,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     if indices.dtype() != DType::UInt32 {
         return Err(KernelError::InvalidShape(format!(
@@ -702,7 +715,7 @@ pub fn scatter(
         let out = Array::zeros(registry.device().raw(), &[output_size], out_dtype);
         // Fill with +inf by writing f32::INFINITY.
         if out_dtype == DType::Float32 {
-            let ptr = out.metal_buffer().contents() as *mut f32;
+            let ptr = out.metal_buffer().contents().as_ptr() as *mut f32;
             unsafe {
                 for i in 0..output_size {
                     *ptr.add(i) = f32::INFINITY;
@@ -717,23 +730,27 @@ pub fn scatter(
     let pipeline = registry.get_pipeline(kernel_name, src.dtype())?;
     let out_size_buf = make_u32_buf(registry.device().raw(), output_size_u32);
 
-    let cb = queue.new_command_buffer();
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(src.metal_buffer()), src.offset() as u64);
-    enc.set_buffer(1, Some(indices.metal_buffer()), indices.offset() as u64);
+    let cb = queue.commandBuffer().unwrap();
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
+    enc.set_buffer(0, Some(src.metal_buffer()), src.offset());
+    enc.set_buffer(1, Some(indices.metal_buffer()), indices.offset());
     enc.set_buffer(2, Some(out.metal_buffer()), 0);
     enc.set_buffer(3, Some(&out_size_buf), 0);
-
-    let grid = metal::MTLSize::new(numel as u64, 1, 1);
-    let tg = metal::MTLSize::new(
-        std::cmp::min(pipeline.max_total_threads_per_threadgroup(), numel as u64),
-        1,
-        1,
-    );
+    let grid = MTLSize {
+        width: numel,
+        height: 1,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), numel),
+        height: 1,
+        depth: 1,
+    };
     enc.dispatch_threads(grid, tg);
-    enc.end_encoding();
-    super::commit_with_mode(cb, super::ExecMode::Sync);
+    enc.end();
+    super::commit_with_mode(&cb, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -754,7 +771,7 @@ pub fn scatter_add(
     src: &Array,
     indices: &Array,
     output_size: usize,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     scatter(registry, src, indices, output_size, ScatterOp::Add, queue)
 }
@@ -768,17 +785,20 @@ mod tests {
     use super::*;
 
     /// Helper: set up device, queue, and kernel registry for tests.
-    fn setup() -> (KernelRegistry, metal::CommandQueue) {
-        let device = rmlx_metal::device::GpuDevice::system_default().expect("Metal device");
-        let queue = device.raw().new_command_queue();
+    fn setup() -> Option<(KernelRegistry, rmlx_metal::MtlQueue)> {
+        let device = crate::test_utils::test_gpu()?;
+        let queue = device.new_command_queue();
         let registry = KernelRegistry::new(device);
         register(&registry).expect("register indexing kernels");
-        (registry, queue)
+        Some((registry, queue))
     }
 
     #[test]
     fn test_gather_basic() {
-        let (reg, q) = setup();
+        let Some((reg, q)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = reg.device().raw();
         let src = Array::from_slice(dev, &[10.0f32, 20.0, 30.0, 40.0, 50.0], vec![5]);
         let idx = Array::from_slice(dev, &[4u32, 0, 2], vec![3]);
@@ -789,7 +809,10 @@ mod tests {
 
     #[test]
     fn test_gather_oob_produces_zero() {
-        let (reg, q) = setup();
+        let Some((reg, q)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = reg.device().raw();
         let src = Array::from_slice(dev, &[1.0f32, 2.0, 3.0], vec![3]);
         let idx = Array::from_slice(dev, &[0u32, 99, 2], vec![3]);
@@ -800,7 +823,10 @@ mod tests {
 
     #[test]
     fn test_gather_signed_negative_wrap() {
-        let (reg, q) = setup();
+        let Some((reg, q)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = reg.device().raw();
         let src = Array::from_slice(dev, &[10.0f32, 20.0, 30.0, 40.0], vec![4]);
         // -1i32 as u32 bits, -2i32 as u32 bits
@@ -813,7 +839,10 @@ mod tests {
 
     #[test]
     fn test_scatter_overwrite() {
-        let (reg, q) = setup();
+        let Some((reg, q)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = reg.device().raw();
         let src = Array::from_slice(dev, &[100.0f32, 200.0, 300.0], vec![3]);
         let idx = Array::from_slice(dev, &[1u32, 3, 0], vec![3]);
@@ -824,7 +853,10 @@ mod tests {
 
     #[test]
     fn test_scatter_add_accumulates() {
-        let (reg, q) = setup();
+        let Some((reg, q)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = reg.device().raw();
         let src = Array::from_slice(dev, &[1.0f32, 2.0, 3.0, 4.0], vec![4]);
         let idx = Array::from_slice(dev, &[0u32, 1, 0, 1], vec![4]);
@@ -838,7 +870,10 @@ mod tests {
 
     #[test]
     fn test_scatter_oob_skipped() {
-        let (reg, q) = setup();
+        let Some((reg, q)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = reg.device().raw();
         let src = Array::from_slice(dev, &[10.0f32, 20.0, 30.0], vec![3]);
         let idx = Array::from_slice(dev, &[0u32, 999, 2], vec![3]);
@@ -850,7 +885,10 @@ mod tests {
 
     #[test]
     fn test_scatter_add_convenience() {
-        let (reg, q) = setup();
+        let Some((reg, q)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = reg.device().raw();
         let src = Array::from_slice(dev, &[5.0f32, 5.0], vec![2]);
         let idx = Array::from_slice(dev, &[0u32, 0], vec![2]);
@@ -861,7 +899,10 @@ mod tests {
 
     #[test]
     fn test_scatter_max() {
-        let (reg, q) = setup();
+        let Some((reg, q)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = reg.device().raw();
         let src = Array::from_slice(dev, &[3.0f32, 1.0, 5.0, 2.0], vec![4]);
         let idx = Array::from_slice(dev, &[0u32, 0, 1, 1], vec![4]);
@@ -874,7 +915,10 @@ mod tests {
 
     #[test]
     fn test_scatter_min() {
-        let (reg, q) = setup();
+        let Some((reg, q)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = reg.device().raw();
         let src = Array::from_slice(dev, &[3.0f32, 1.0, 5.0, 2.0], vec![4]);
         let idx = Array::from_slice(dev, &[0u32, 0, 1, 1], vec![4]);
@@ -887,7 +931,10 @@ mod tests {
 
     #[test]
     fn test_gather_empty_indices() {
-        let (reg, q) = setup();
+        let Some((reg, q)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = reg.device().raw();
         let src = Array::from_slice(dev, &[1.0f32, 2.0], vec![2]);
         let idx = Array::from_slice(dev, &[] as &[u32], vec![0]);
@@ -897,7 +944,10 @@ mod tests {
 
     #[test]
     fn test_scatter_empty_src() {
-        let (reg, q) = setup();
+        let Some((reg, q)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = reg.device().raw();
         let src = Array::from_slice(dev, &[] as &[f32], vec![0]);
         let idx = Array::from_slice(dev, &[] as &[u32], vec![0]);

@@ -31,6 +31,11 @@ use rmlx_metal::event::GpuEvent;
 
 use crate::expert_group::ExpertGroup;
 use crate::moe::Expert;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLCommandBuffer as _;
+use objc2_metal::MTLComputePipelineState as _;
+use objc2_metal::{MTLCommandQueue, MTLDevice};
+use rmlx_metal::{ComputePass, MTLSize};
 
 /// Per-expert dispatch entry: `(expert_idx, expert_input_array, dispatch_list)`.
 /// The dispatch list maps each row in the expert input to `(token_idx, weight)`.
@@ -83,7 +88,7 @@ impl MoePipeline {
     }
 
     /// Create a pipeline with default configuration.
-    pub fn with_defaults(device: &metal::Device) -> Self {
+    pub fn with_defaults(device: &ProtocolObject<dyn MTLDevice>) -> Self {
         let event = Arc::new(GpuEvent::new(device));
         Self::new(event, MoePipelineConfig::default())
     }
@@ -129,7 +134,7 @@ impl MoePipeline {
         shared_expert: &Expert,
         routed_expert_fn: impl FnOnce(&Array) -> Result<Array, KernelError>,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         // Reset event for fresh pipeline run.
         self.event.reset();
@@ -140,8 +145,8 @@ impl MoePipeline {
 
         // Signal that shared expert is done.
         let v_shared = self.event.next_value();
-        let cb_shared = queue.new_command_buffer();
-        self.event.signal_from_command_buffer(cb_shared, v_shared);
+        let cb_shared = queue.commandBuffer().unwrap();
+        self.event.signal_from_command_buffer(&cb_shared, v_shared);
         cb_shared.commit();
 
         // -- Stage 2: Routed expert computation --
@@ -150,8 +155,8 @@ impl MoePipeline {
 
         // Signal that routed experts are done.
         let v_routed = self.event.next_value();
-        let cb_routed = queue.new_command_buffer();
-        self.event.signal_from_command_buffer(cb_routed, v_routed);
+        let cb_routed = queue.commandBuffer().unwrap();
+        self.event.signal_from_command_buffer(&cb_routed, v_routed);
         cb_routed.commit();
 
         // -- Stage 3: Combine shared + routed --
@@ -159,8 +164,8 @@ impl MoePipeline {
 
         // Final signal.
         let v_final = self.event.next_value();
-        let cb_final = queue.new_command_buffer();
-        self.event.signal_from_command_buffer(cb_final, v_final);
+        let cb_final = queue.commandBuffer().unwrap();
+        self.event.signal_from_command_buffer(&cb_final, v_final);
         cb_final.commit();
 
         // Single CPU wait at the end of the entire pipeline.
@@ -193,7 +198,7 @@ impl MoePipeline {
         top_k: usize,
         local_expert_range: (usize, usize),
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         let seq_len = x.shape()[0];
         let hidden_dim = x.shape()[1];
@@ -270,8 +275,8 @@ impl MoePipeline {
 
             // Signal that dispatch/gather for this batch is done.
             let v_dispatch = self.event.next_value();
-            let cb_sig = queue.new_command_buffer();
-            self.event.signal_from_command_buffer(cb_sig, v_dispatch);
+            let cb_sig = queue.commandBuffer().unwrap();
+            self.event.signal_from_command_buffer(&cb_sig, v_dispatch);
             cb_sig.commit();
 
             // Compute: run grouped forward on this batch's experts.
@@ -296,8 +301,9 @@ impl MoePipeline {
 
             // Signal that this batch's combine is done.
             let v_combine = self.event.next_value();
-            let cb_combine = queue.new_command_buffer();
-            self.event.signal_from_command_buffer(cb_combine, v_combine);
+            let cb_combine = queue.commandBuffer().unwrap();
+            self.event
+                .signal_from_command_buffer(&cb_combine, v_combine);
             cb_combine.commit();
         }
 
@@ -319,7 +325,7 @@ impl MoePipeline {
     /// - If num_tbo_batches > 1: run TBO
     /// - Otherwise: fall back to sequential forward
     ///
-    /// Zero `cb.wait_until_completed()` in the pipeline body.
+    /// Zero `cb.waitUntilCompleted()` in the pipeline body.
     /// Single `GpuEvent::cpu_wait()` at the very end.
     #[allow(clippy::too_many_arguments)]
     pub fn forward_overlapped(
@@ -332,7 +338,7 @@ impl MoePipeline {
         top_k: usize,
         local_expert_range: (usize, usize),
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         // Reset event for fresh pipeline run.
         self.event.reset();
@@ -419,7 +425,7 @@ impl MoePipeline {
         top_k: usize,
         local_expert_range: (usize, usize),
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         self.event.reset();
         self.event.reset_cancel();
@@ -428,8 +434,8 @@ impl MoePipeline {
         let shared_out = shared_expert.forward(x, registry, queue)?;
 
         let v_shared = self.event.next_value();
-        let cb_shared = queue.new_command_buffer();
-        self.event.signal_from_command_buffer(cb_shared, v_shared);
+        let cb_shared = queue.commandBuffer().unwrap();
+        self.event.signal_from_command_buffer(&cb_shared, v_shared);
         cb_shared.commit();
 
         // -- Routed expert computation --
@@ -444,16 +450,16 @@ impl MoePipeline {
         )?;
 
         let v_routed = self.event.next_value();
-        let cb_routed = queue.new_command_buffer();
-        self.event.signal_from_command_buffer(cb_routed, v_routed);
+        let cb_routed = queue.commandBuffer().unwrap();
+        self.event.signal_from_command_buffer(&cb_routed, v_routed);
         cb_routed.commit();
 
         // -- Combine --
         let output = ops::binary::add(registry, &shared_out, &routed_out, queue)?;
 
         let v_final = self.event.next_value();
-        let cb_final = queue.new_command_buffer();
-        self.event.signal_from_command_buffer(cb_final, v_final);
+        let cb_final = queue.commandBuffer().unwrap();
+        self.event.signal_from_command_buffer(&cb_final, v_final);
         cb_final.commit();
 
         self.event
@@ -474,7 +480,7 @@ impl MoePipeline {
         top_k: usize,
         local_expert_range: (usize, usize),
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         self.event.reset();
         self.event.reset_cancel();
@@ -483,8 +489,8 @@ impl MoePipeline {
         let shared_out = shared_expert.forward(x, registry, queue)?;
 
         let v_shared = self.event.next_value();
-        let cb_shared = queue.new_command_buffer();
-        self.event.signal_from_command_buffer(cb_shared, v_shared);
+        let cb_shared = queue.commandBuffer().unwrap();
+        self.event.signal_from_command_buffer(&cb_shared, v_shared);
         cb_shared.commit();
 
         // -- TBO pipeline for routed experts --
@@ -502,8 +508,8 @@ impl MoePipeline {
         let output = ops::binary::add(registry, &shared_out, &routed_out, queue)?;
 
         let v_final = self.event.next_value();
-        let cb_final = queue.new_command_buffer();
-        self.event.signal_from_command_buffer(cb_final, v_final);
+        let cb_final = queue.commandBuffer().unwrap();
+        self.event.signal_from_command_buffer(&cb_final, v_final);
         cb_final.commit();
 
         self.event
@@ -524,7 +530,7 @@ impl MoePipeline {
         top_k: usize,
         local_expert_range: (usize, usize),
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         let routed_out = self.run_routed_experts(
             x,
@@ -545,8 +551,8 @@ impl MoePipeline {
 
         // Final event signal + CPU wait for API consistency.
         let v_final = self.event.next_value();
-        let cb_final = queue.new_command_buffer();
-        self.event.signal_from_command_buffer(cb_final, v_final);
+        let cb_final = queue.commandBuffer().unwrap();
+        self.event.signal_from_command_buffer(&cb_final, v_final);
         cb_final.commit();
 
         self.event
@@ -568,7 +574,7 @@ impl MoePipeline {
         top_k: usize,
         local_expert_range: (usize, usize),
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         let seq_len = x.shape()[0];
         let hidden_dim = x.shape()[1];
@@ -650,9 +656,9 @@ fn gather_tokens(
     dispatch: &[(usize, f32)],
     hidden_dim: usize,
     elem_size: usize,
-    dev: &metal::Device,
+    dev: &ProtocolObject<dyn MTLDevice>,
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     let batch_size = dispatch.len();
 
@@ -666,30 +672,32 @@ fn gather_tokens(
     let batch_buf = Array::zeros(dev, &[batch_size, hidden_dim], x.dtype());
     let copy_kernel = copy_kernel_name(x.dtype())?;
     let pipeline = registry.get_pipeline(copy_kernel, x.dtype())?;
-    let cb = queue.new_command_buffer();
+    let cb = queue.commandBuffer().unwrap();
 
     for (i, &(tok, _)) in dispatch.iter().enumerate() {
         let src_offset = x.offset() + tok * hidden_dim * elem_size;
         let dst_offset = i * hidden_dim * elem_size;
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pipeline);
-        enc.set_buffer(0, Some(x.metal_buffer()), src_offset as u64);
-        enc.set_buffer(1, Some(batch_buf.metal_buffer()), dst_offset as u64);
-        let grid = metal::MTLSize::new(hidden_dim as u64, 1, 1);
-        let tg = metal::MTLSize::new(
-            std::cmp::min(
-                pipeline.max_total_threads_per_threadgroup(),
-                hidden_dim as u64,
-            ),
-            1,
-            1,
-        );
+        let raw_enc = cb.computeCommandEncoder().unwrap();
+        let enc = ComputePass::new(&raw_enc);
+        enc.set_pipeline(&pipeline);
+        enc.set_buffer(0, Some(x.metal_buffer()), src_offset);
+        enc.set_buffer(1, Some(batch_buf.metal_buffer()), dst_offset);
+        let grid = MTLSize {
+            width: hidden_dim,
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), hidden_dim) as usize,
+            height: 1,
+            depth: 1,
+        };
         enc.dispatch_threads(grid, tg);
-        enc.end_encoding();
+        enc.end();
     }
 
     cb.commit();
-    cb.wait_until_completed();
+    cb.waitUntilCompleted();
     Ok(batch_buf)
 }
 
@@ -704,9 +712,9 @@ fn scatter_add_weighted(
     output: &Array,
     hidden_dim: usize,
     elem_size: usize,
-    dev: &metal::Device,
+    dev: &ProtocolObject<dyn MTLDevice>,
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
 ) -> Result<(), KernelError> {
     let copy_kernel = copy_kernel_name(output.dtype())?;
     let pipeline = registry.get_pipeline(copy_kernel, output.dtype())?;
@@ -729,24 +737,26 @@ fn scatter_add_weighted(
 
             let summed = ops::binary::add(registry, &dst_view, &scaled, queue)?;
 
-            let cb = queue.new_command_buffer();
-            let enc = cb.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&pipeline);
-            enc.set_buffer(0, Some(summed.metal_buffer()), summed.offset() as u64);
-            enc.set_buffer(1, Some(output.metal_buffer()), dst_offset as u64);
-            let grid = metal::MTLSize::new(hidden_dim as u64, 1, 1);
-            let tg = metal::MTLSize::new(
-                std::cmp::min(
-                    pipeline.max_total_threads_per_threadgroup(),
-                    hidden_dim as u64,
-                ),
-                1,
-                1,
-            );
+            let cb = queue.commandBuffer().unwrap();
+            let raw_enc = cb.computeCommandEncoder().unwrap();
+            let enc = ComputePass::new(&raw_enc);
+            enc.set_pipeline(&pipeline);
+            enc.set_buffer(0, Some(summed.metal_buffer()), summed.offset());
+            enc.set_buffer(1, Some(output.metal_buffer()), dst_offset);
+            let grid = MTLSize {
+                width: hidden_dim,
+                height: 1,
+                depth: 1,
+            };
+            let tg = MTLSize {
+                width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), hidden_dim) as usize,
+                height: 1,
+                depth: 1,
+            };
             enc.dispatch_threads(grid, tg);
-            enc.end_encoding();
+            enc.end();
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
         }
     }
 
@@ -772,19 +782,34 @@ mod tests {
     use crate::linear::{Linear, LinearConfig};
     use crate::moe::Expert;
 
+    use std::sync::OnceLock;
+
+    fn test_device() -> Option<&'static rmlx_metal::MtlDevice> {
+        static DEVICE: OnceLock<Option<rmlx_metal::MtlDevice>> = OnceLock::new();
+        DEVICE
+            .get_or_init(|| {
+                objc2::rc::autoreleasepool(|_| objc2_metal::MTLCreateSystemDefaultDevice())
+            })
+            .as_ref()
+    }
+
     /// Create a test `KernelRegistry` with all kernels registered.
-    fn test_registry() -> (metal::Device, metal::CommandQueue, KernelRegistry) {
-        let device = metal::Device::system_default().expect("Metal device required");
-        let queue = device.new_command_queue();
-        let gpu = rmlx_metal::device::GpuDevice::system_default().expect("GPU device required");
+    fn test_registry() -> Option<(
+        &'static rmlx_metal::MtlDevice,
+        rmlx_metal::MtlQueue,
+        KernelRegistry,
+    )> {
+        let device = test_device()?;
+        let gpu = rmlx_metal::device::GpuDevice::system_default().ok()?;
+        let queue = gpu.new_command_queue();
         let registry = KernelRegistry::new(gpu);
         rmlx_core::ops::register_all(&registry).expect("register kernels");
-        (device, queue, registry)
+        Some((device, queue, registry))
     }
 
     /// Create a test expert with known weight values.
     fn make_expert(
-        device: &metal::Device,
+        device: &ProtocolObject<dyn MTLDevice>,
         hidden_dim: usize,
         intermediate_dim: usize,
         val: f32,
@@ -845,16 +870,22 @@ mod tests {
 
     #[test]
     fn test_pipeline_creation() {
-        let device = metal::Device::system_default().expect("Metal device required");
-        let pipeline = MoePipeline::with_defaults(&device);
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let pipeline = MoePipeline::with_defaults(device);
         assert_eq!(pipeline.num_batches(), 1);
         assert!(pipeline.sbo_enabled());
     }
 
     #[test]
     fn test_pipeline_custom_config() {
-        let device = metal::Device::system_default().expect("Metal device required");
-        let event = Arc::new(GpuEvent::new(&device));
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let event = Arc::new(GpuEvent::new(device));
         let config = MoePipelineConfig {
             num_tbo_batches: 4,
             enable_sbo: false,
@@ -868,7 +899,10 @@ mod tests {
     #[test]
     fn test_sbo_shared_plus_routed_output() {
         // Verify that SBO produces output = shared_expert(x) + routed_experts(x).
-        let (device, queue, registry) = test_registry();
+        let Some((device, queue, registry)) = test_registry() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let hidden_dim = 8;
         let intermediate_dim = 4;
         let num_experts = 4;
@@ -877,11 +911,11 @@ mod tests {
 
         // Create routed experts.
         let experts: Vec<Expert> = (0..num_experts)
-            .map(|i| make_expert(&device, hidden_dim, intermediate_dim, 0.1 * (i + 1) as f32))
+            .map(|i| make_expert(device, hidden_dim, intermediate_dim, 0.1 * (i + 1) as f32))
             .collect();
 
         // Create shared expert with distinct weights.
-        let shared_expert = make_expert(&device, hidden_dim, intermediate_dim, 0.5);
+        let shared_expert = make_expert(device, hidden_dim, intermediate_dim, 0.5);
 
         // Build expert group for grouped forward.
         let expert_group = ExpertGroup::from_experts(&experts, &registry, &queue).unwrap();
@@ -890,7 +924,7 @@ mod tests {
         let x_data: Vec<f32> = (0..seq_len * hidden_dim)
             .map(|i| (i as f32) * 0.01 + 0.1)
             .collect();
-        let x = Array::from_slice(&device, &x_data, vec![seq_len, hidden_dim]);
+        let x = Array::from_slice(device, &x_data, vec![seq_len, hidden_dim]);
 
         // Create gate logits: [seq_len, num_experts]
         #[rustfmt::skip]
@@ -900,7 +934,7 @@ mod tests {
             1.0, 0.5, 5.0, 1.0,  // token 2: expert 2 strong
             1.0, 1.0, 0.5, 5.0,  // token 3: expert 3 strong
         ];
-        let gate_logits = Array::from_slice(&device, &gate_data, vec![seq_len, num_experts]);
+        let gate_logits = Array::from_slice(device, &gate_data, vec![seq_len, num_experts]);
 
         // -- Compute reference output: sequential shared + routed --
         let shared_ref = shared_expert.forward(&x, &registry, &queue).unwrap();
@@ -908,7 +942,7 @@ mod tests {
         let route_result =
             ops::topk_route::gpu_topk_route(&registry, &gate_logits, top_k, None, &queue).unwrap();
 
-        let pipeline = MoePipeline::with_defaults(&device);
+        let pipeline = MoePipeline::with_defaults(device);
         let routed_ref = pipeline
             .run_routed_experts(
                 &x,
@@ -926,7 +960,7 @@ mod tests {
 
         // -- Compute SBO output via forward_overlapped --
         let pipeline_sbo = MoePipeline::new(
-            Arc::new(GpuEvent::new(&device)),
+            Arc::new(GpuEvent::new(device)),
             MoePipelineConfig {
                 num_tbo_batches: 1,
                 enable_sbo: true,
@@ -966,7 +1000,10 @@ mod tests {
     #[test]
     fn test_sbo_output_nonzero() {
         // Verify that SBO output is not all zeros (sanity check).
-        let (device, queue, registry) = test_registry();
+        let Some((device, queue, registry)) = test_registry() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let hidden_dim = 8;
         let intermediate_dim = 4;
         let num_experts = 2;
@@ -974,19 +1011,19 @@ mod tests {
         let seq_len = 2;
 
         let experts: Vec<Expert> = (0..num_experts)
-            .map(|i| make_expert(&device, hidden_dim, intermediate_dim, 0.1 * (i + 1) as f32))
+            .map(|i| make_expert(device, hidden_dim, intermediate_dim, 0.1 * (i + 1) as f32))
             .collect();
-        let shared_expert = make_expert(&device, hidden_dim, intermediate_dim, 0.3);
+        let shared_expert = make_expert(device, hidden_dim, intermediate_dim, 0.3);
         let expert_group = ExpertGroup::from_experts(&experts, &registry, &queue).unwrap();
 
         let x_data: Vec<f32> = vec![1.0; seq_len * hidden_dim];
-        let x = Array::from_slice(&device, &x_data, vec![seq_len, hidden_dim]);
+        let x = Array::from_slice(device, &x_data, vec![seq_len, hidden_dim]);
 
         let gate_data: Vec<f32> = vec![5.0, 1.0, 1.0, 5.0];
-        let gate_logits = Array::from_slice(&device, &gate_data, vec![seq_len, num_experts]);
+        let gate_logits = Array::from_slice(device, &gate_data, vec![seq_len, num_experts]);
 
         let pipeline = MoePipeline::new(
-            Arc::new(GpuEvent::new(&device)),
+            Arc::new(GpuEvent::new(device)),
             MoePipelineConfig {
                 num_tbo_batches: 1,
                 enable_sbo: true,
@@ -1020,21 +1057,24 @@ mod tests {
     #[test]
     fn test_forward_sbo_standalone() {
         // Test the standalone forward_sbo method directly.
-        let (device, queue, registry) = test_registry();
+        let Some((device, queue, registry)) = test_registry() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let hidden_dim = 8;
         let intermediate_dim = 4;
 
-        let shared_expert = make_expert(&device, hidden_dim, intermediate_dim, 0.2);
+        let shared_expert = make_expert(device, hidden_dim, intermediate_dim, 0.2);
 
         let x_data: Vec<f32> = vec![1.0; 2 * hidden_dim];
-        let x = Array::from_slice(&device, &x_data, vec![2, hidden_dim]);
+        let x = Array::from_slice(device, &x_data, vec![2, hidden_dim]);
 
-        let pipeline = MoePipeline::with_defaults(&device);
+        let pipeline = MoePipeline::with_defaults(device);
 
         // Compute reference: shared_expert(x) + constant routed output
         let shared_ref = shared_expert.forward(&x, &registry, &queue).unwrap();
         let routed_ref =
-            Array::from_slice(&device, &vec![0.5f32; 2 * hidden_dim], vec![2, hidden_dim]);
+            Array::from_slice(device, &vec![0.5f32; 2 * hidden_dim], vec![2, hidden_dim]);
         let ref_output = ops::binary::add(&registry, &shared_ref, &routed_ref, &queue).unwrap();
         let ref_vals: Vec<f32> = ref_output.to_vec_checked();
 
@@ -1045,7 +1085,7 @@ mod tests {
                 &shared_expert,
                 |_x| {
                     Ok(Array::from_slice(
-                        &device,
+                        device,
                         &vec![0.5f32; 2 * hidden_dim],
                         vec![2, hidden_dim],
                     ))
@@ -1072,7 +1112,10 @@ mod tests {
     #[test]
     fn test_sequential_fallback() {
         // Test with SBO disabled and TBO batches=1 -> sequential path.
-        let (device, queue, registry) = test_registry();
+        let Some((device, queue, registry)) = test_registry() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let hidden_dim = 8;
         let intermediate_dim = 4;
         let num_experts = 2;
@@ -1080,18 +1123,18 @@ mod tests {
         let seq_len = 2;
 
         let experts: Vec<Expert> = (0..num_experts)
-            .map(|i| make_expert(&device, hidden_dim, intermediate_dim, 0.1 * (i + 1) as f32))
+            .map(|i| make_expert(device, hidden_dim, intermediate_dim, 0.1 * (i + 1) as f32))
             .collect();
         let expert_group = ExpertGroup::from_experts(&experts, &registry, &queue).unwrap();
 
         let x_data: Vec<f32> = vec![1.0; seq_len * hidden_dim];
-        let x = Array::from_slice(&device, &x_data, vec![seq_len, hidden_dim]);
+        let x = Array::from_slice(device, &x_data, vec![seq_len, hidden_dim]);
 
         let gate_data: Vec<f32> = vec![5.0, 1.0, 1.0, 5.0];
-        let gate_logits = Array::from_slice(&device, &gate_data, vec![seq_len, num_experts]);
+        let gate_logits = Array::from_slice(device, &gate_data, vec![seq_len, num_experts]);
 
         let pipeline = MoePipeline::new(
-            Arc::new(GpuEvent::new(&device)),
+            Arc::new(GpuEvent::new(device)),
             MoePipelineConfig {
                 num_tbo_batches: 1,
                 enable_sbo: false,
@@ -1125,7 +1168,10 @@ mod tests {
     #[test]
     fn test_tbo_two_batches() {
         // Test TBO with 2 batches and verify it matches sequential output.
-        let (device, queue, registry) = test_registry();
+        let Some((device, queue, registry)) = test_registry() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let hidden_dim = 8;
         let intermediate_dim = 4;
         let num_experts = 2;
@@ -1133,14 +1179,14 @@ mod tests {
         let seq_len = 4;
 
         let experts: Vec<Expert> = (0..num_experts)
-            .map(|i| make_expert(&device, hidden_dim, intermediate_dim, 0.1 * (i + 1) as f32))
+            .map(|i| make_expert(device, hidden_dim, intermediate_dim, 0.1 * (i + 1) as f32))
             .collect();
         let expert_group = ExpertGroup::from_experts(&experts, &registry, &queue).unwrap();
 
         let x_data: Vec<f32> = (0..seq_len * hidden_dim)
             .map(|i| (i as f32) * 0.01 + 0.1)
             .collect();
-        let x = Array::from_slice(&device, &x_data, vec![seq_len, hidden_dim]);
+        let x = Array::from_slice(device, &x_data, vec![seq_len, hidden_dim]);
 
         let gate_data: Vec<f32> = vec![
             5.0, 1.0, // token 0
@@ -1148,11 +1194,11 @@ mod tests {
             5.0, 1.0, // token 2
             1.0, 5.0, // token 3
         ];
-        let gate_logits = Array::from_slice(&device, &gate_data, vec![seq_len, num_experts]);
+        let gate_logits = Array::from_slice(device, &gate_data, vec![seq_len, num_experts]);
 
         // Reference: sequential (1 batch).
         let pipeline_seq = MoePipeline::new(
-            Arc::new(GpuEvent::new(&device)),
+            Arc::new(GpuEvent::new(device)),
             MoePipelineConfig {
                 num_tbo_batches: 1,
                 enable_sbo: false,
@@ -1176,7 +1222,7 @@ mod tests {
 
         // TBO: 2 batches.
         let pipeline_tbo = MoePipeline::new(
-            Arc::new(GpuEvent::new(&device)),
+            Arc::new(GpuEvent::new(device)),
             MoePipelineConfig {
                 num_tbo_batches: 2,
                 enable_sbo: false,
@@ -1215,7 +1261,10 @@ mod tests {
     #[test]
     fn test_event_reuse_across_calls() {
         // Verify that the pipeline can be called multiple times with event reset.
-        let (device, queue, registry) = test_registry();
+        let Some((device, queue, registry)) = test_registry() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let hidden_dim = 8;
         let intermediate_dim = 4;
         let num_experts = 2;
@@ -1223,17 +1272,17 @@ mod tests {
         let seq_len = 2;
 
         let experts: Vec<Expert> = (0..num_experts)
-            .map(|i| make_expert(&device, hidden_dim, intermediate_dim, 0.1 * (i + 1) as f32))
+            .map(|i| make_expert(device, hidden_dim, intermediate_dim, 0.1 * (i + 1) as f32))
             .collect();
         let expert_group = ExpertGroup::from_experts(&experts, &registry, &queue).unwrap();
 
         let x_data: Vec<f32> = vec![1.0; seq_len * hidden_dim];
-        let x = Array::from_slice(&device, &x_data, vec![seq_len, hidden_dim]);
+        let x = Array::from_slice(device, &x_data, vec![seq_len, hidden_dim]);
         let gate_data: Vec<f32> = vec![5.0, 1.0, 1.0, 5.0];
-        let gate_logits = Array::from_slice(&device, &gate_data, vec![seq_len, num_experts]);
+        let gate_logits = Array::from_slice(device, &gate_data, vec![seq_len, num_experts]);
 
         let pipeline = MoePipeline::new(
-            Arc::new(GpuEvent::new(&device)),
+            Arc::new(GpuEvent::new(device)),
             MoePipelineConfig {
                 num_tbo_batches: 1,
                 enable_sbo: false,

@@ -3,6 +3,8 @@
 //! Wraps `rmlx_core::ops::rms_norm` as an nn module with a learnable
 //! weight (scale) parameter.
 
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLCommandQueue, MTLDevice};
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::{KernelError, KernelRegistry};
@@ -45,7 +47,11 @@ impl RMSNorm {
     /// The weight is created as f32 on the given device. The `_dtype` parameter
     /// is accepted for API consistency but currently only f32 weights are
     /// supported (the core kernel handles f16/bf16 inputs with f32 accumulation).
-    pub fn new(config: &RMSNormConfig, device: &metal::Device, _dtype: DType) -> Self {
+    pub fn new(
+        config: &RMSNormConfig,
+        device: &ProtocolObject<dyn MTLDevice>,
+        _dtype: DType,
+    ) -> Self {
         let weight = Array::ones(device, &[config.normalized_shape]);
         Self {
             weight,
@@ -72,7 +78,7 @@ impl RMSNorm {
         &self,
         registry: &KernelRegistry,
         input: &Array,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         if input.ndim() != 2 {
             return Err(KernelError::InvalidShape(format!(
@@ -111,22 +117,39 @@ impl RMSNorm {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::OnceLock;
 
-    fn setup() -> (metal::Device, KernelRegistry, metal::CommandQueue) {
-        let device = metal::Device::system_default().expect("no Metal device");
-        let gpu = rmlx_metal::device::GpuDevice::system_default().expect("no GpuDevice");
-        let queue = device.new_command_queue();
+    fn test_device() -> Option<&'static rmlx_metal::MtlDevice> {
+        static DEVICE: OnceLock<Option<rmlx_metal::MtlDevice>> = OnceLock::new();
+        DEVICE
+            .get_or_init(|| {
+                objc2::rc::autoreleasepool(|_| objc2_metal::MTLCreateSystemDefaultDevice())
+            })
+            .as_ref()
+    }
+
+    fn setup() -> Option<(
+        &'static rmlx_metal::MtlDevice,
+        KernelRegistry,
+        rmlx_metal::MtlQueue,
+    )> {
+        let device = test_device()?;
+        let gpu = rmlx_metal::device::GpuDevice::system_default().ok()?;
+        let queue = gpu.new_command_queue();
         let registry = KernelRegistry::new(gpu);
         ops::rms_norm::register(&registry).expect("failed to register rms_norm kernels");
-        (device, registry, queue)
+        Some((device, registry, queue))
     }
 
     #[test]
     fn test_rms_norm_construction() {
-        let device = metal::Device::system_default().expect("no Metal device");
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let config = RMSNormConfig::new(64);
 
-        let norm = RMSNorm::new(&config, &device, DType::Float32);
+        let norm = RMSNorm::new(&config, device, DType::Float32);
 
         assert_eq!(norm.normalized_shape(), 64);
         assert_eq!(norm.eps(), 1e-5);
@@ -136,11 +159,14 @@ mod tests {
 
     #[test]
     fn test_rms_norm_forward_shape() {
-        let (device, registry, queue) = setup();
+        let Some((device, registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let config = RMSNormConfig::new(8);
-        let norm = RMSNorm::new(&config, &device, DType::Float32);
+        let norm = RMSNorm::new(&config, device, DType::Float32);
 
-        let input = Array::ones(&device, &[2, 8]);
+        let input = Array::ones(device, &[2, 8]);
 
         let output = norm
             .forward(&registry, &input, &queue)

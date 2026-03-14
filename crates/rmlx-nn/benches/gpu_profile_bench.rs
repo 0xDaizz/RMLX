@@ -18,9 +18,11 @@
 
 #![allow(unexpected_cfgs)]
 
-#[macro_use]
-extern crate objc;
-
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{
+    MTLBuffer as _, MTLCommandBuffer as _, MTLCommandEncoder as _, MTLCommandQueue as _,
+    MTLDevice as _,
+};
 use std::time::Instant;
 
 use rmlx_core::array::Array;
@@ -28,7 +30,11 @@ use rmlx_core::dtype::DType;
 use rmlx_core::kernels::KernelRegistry;
 use rmlx_core::ops;
 use rmlx_metal::device::GpuDevice;
-use rmlx_metal::ScopedPool;
+#[cfg(feature = "metal4")]
+use rmlx_metal::metal4::compute::ComputePass4;
+#[cfg(feature = "metal4")]
+use rmlx_metal::metal4::{CommandAllocator, CommandQueue4, CounterHeap};
+use rmlx_metal::{autoreleasepool, ComputePass};
 use rmlx_nn::{
     Attention, AttentionConfig, FeedForward, LayerKvCache, Linear, LinearConfig, TransformerBlock,
 };
@@ -94,13 +100,17 @@ fn rand_f16_bytes(numel: usize, seed: u64) -> Vec<u8> {
     f16_bytes
 }
 
-fn rand_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
+fn rand_array(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    shape: &[usize],
+    seed: u64,
+) -> Array {
     let numel: usize = shape.iter().product();
     let f16_bytes = rand_f16_bytes(numel, seed);
     Array::from_bytes(device, &f16_bytes, shape.to_vec(), DType::Float16)
 }
 
-fn ones_f16(device: &metal::Device, size: usize) -> Array {
+fn ones_f16(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, size: usize) -> Array {
     let ones: Vec<u16> = vec![0x3C00u16; size];
     let bytes: Vec<u8> = ones.iter().flat_map(|h| h.to_le_bytes()).collect();
     Array::from_bytes(device, &bytes, vec![size], DType::Float16)
@@ -110,7 +120,12 @@ fn ones_f16(device: &metal::Device, size: usize) -> Array {
 // Layer construction helpers (for full-pipeline baseline only)
 // ---------------------------------------------------------------------------
 
-fn make_linear(device: &metal::Device, in_f: usize, out_f: usize, seed: u64) -> Linear {
+fn make_linear(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    in_f: usize,
+    out_f: usize,
+    seed: u64,
+) -> Linear {
     let weight = rand_array(device, &[out_f, in_f], seed);
     Linear::from_arrays(
         LinearConfig {
@@ -124,7 +139,9 @@ fn make_linear(device: &metal::Device, in_f: usize, out_f: usize, seed: u64) -> 
     .expect("linear from_arrays")
 }
 
-fn build_transformer_block(device: &metal::Device) -> TransformerBlock {
+fn build_transformer_block(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+) -> TransformerBlock {
     let kv_size = NUM_KV_HEADS * HEAD_DIM;
     let q_proj = make_linear(device, HIDDEN_SIZE, HIDDEN_SIZE, 1);
     let k_proj = make_linear(device, HIDDEN_SIZE, kv_size, 2);
@@ -163,7 +180,7 @@ fn build_transformer_block(device: &metal::Device) -> TransformerBlock {
 // ---------------------------------------------------------------------------
 
 fn build_merged_weight_t(
-    device: &metal::Device,
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
     weights_row_major: &[(&[u8], usize, usize)],
 ) -> Array {
     let in_dim = weights_row_major[0].2;
@@ -193,7 +210,12 @@ fn build_merged_weight_t(
     )
 }
 
-fn transpose_weight_cpu(device: &metal::Device, bytes: &[u8], rows: usize, cols: usize) -> Array {
+fn transpose_weight_cpu(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    bytes: &[u8],
+    rows: usize,
+    cols: usize,
+) -> Array {
     let mut result = vec![0u8; rows * cols * 2];
     for r in 0..rows {
         for c in 0..cols {
@@ -210,10 +232,10 @@ fn transpose_weight_cpu(device: &metal::Device, bytes: &[u8], rows: usize, cols:
 // CB status validation
 // ---------------------------------------------------------------------------
 
-fn assert_cb_ok(cb: &metal::CommandBufferRef, context: &str) {
+fn assert_cb_ok(cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>, context: &str) {
     let status = cb.status();
     assert!(
-        status != metal::MTLCommandBufferStatus::Error,
+        status != objc2_metal::MTLCommandBufferStatus::Error,
         "GPU command buffer error in {context}: status={status:?}"
     );
 }
@@ -225,31 +247,29 @@ fn assert_cb_ok(cb: &metal::CommandBufferRef, context: &str) {
 /// Extract pure GPU execution time from a completed CommandBuffer.
 /// Uses Metal's GPUStartTime/GPUEndTime properties (seconds, f64).
 /// Only valid after wait_until_completed().
-fn gpu_time_us(cb: &metal::CommandBufferRef) -> f64 {
-    unsafe {
-        let obj: *const objc::runtime::Object = cb as *const metal::CommandBufferRef as *const _;
-        let start: f64 = msg_send![obj, GPUStartTime];
-        let end: f64 = msg_send![obj, GPUEndTime];
-        (end - start) * 1_000_000.0
-    }
+fn gpu_time_us(cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>) -> f64 {
+    let start = cb.GPUStartTime();
+    let end = cb.GPUEndTime();
+    (end - start) * 1_000_000.0
 }
 
 /// Measure a single op with both GPU timestamp and wall-clock.
 /// Returns (gpu_us, wall_us).
-fn time_op_gpu<F>(queue: &metal::CommandQueue, f: F) -> (f64, f64)
+fn time_op_gpu<F>(queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>, f: F) -> (f64, f64)
 where
-    F: FnOnce(&metal::CommandBufferRef),
+    F: FnOnce(&ProtocolObject<dyn objc2_metal::MTLCommandBuffer>),
 {
-    let _pool = ScopedPool::new();
-    let cb = queue.new_command_buffer_with_unretained_references();
-    let wall_start = Instant::now();
-    f(cb);
-    cb.commit();
-    cb.wait_until_completed();
-    let wall_us = wall_start.elapsed().as_secs_f64() * 1_000_000.0;
-    assert_cb_ok(cb, "time_op_gpu");
-    let gpu_us = gpu_time_us(cb);
-    (gpu_us, wall_us)
+    autoreleasepool(|_| {
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+        let wall_start = Instant::now();
+        f(&cb);
+        cb.commit();
+        cb.waitUntilCompleted();
+        let wall_us = wall_start.elapsed().as_secs_f64() * 1_000_000.0;
+        assert_cb_ok(&cb, "time_op_gpu");
+        let gpu_us = gpu_time_us(&cb);
+        (gpu_us, wall_us)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -278,9 +298,13 @@ fn compute_stats(values: &[f64]) -> (f64, f64, f64) {
     (mean, p50, min)
 }
 
-fn bench_op_gpu<F>(name: &'static str, queue: &metal::CommandQueue, mut f: F) -> OpResult
+fn bench_op_gpu<F>(
+    name: &'static str,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
+    mut f: F,
+) -> OpResult
 where
-    F: FnMut(&metal::CommandBufferRef),
+    F: FnMut(&ProtocolObject<dyn objc2_metal::MTLCommandBuffer>),
 {
     // Warmup
     for _ in 0..WARMUP_ITERS {
@@ -320,6 +344,282 @@ fn sdpa_variant_name(supports_nax: bool, total_seq: usize) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
+// Metal 4 CounterHeap helpers (dispatch-level precision)
+// ---------------------------------------------------------------------------
+
+/// Compute elapsed GPU time in microseconds between two CounterHeap indices.
+#[cfg(feature = "metal4")]
+fn gpu_time_us_metal4(heap: &CounterHeap, start_idx: usize, end_idx: usize) -> f64 {
+    let timestamps = heap.read_timestamps(start_idx..end_idx + 1);
+    timestamps.last().unwrap().microseconds - timestamps.first().unwrap().microseconds
+}
+
+/// Per-dispatch timing result from Metal 4 CounterHeap.
+#[cfg(feature = "metal4")]
+struct Metal4DispatchResult {
+    name: &'static str,
+    gpu_mean_us: f64,
+    gpu_p50_us: f64,
+    gpu_min_us: f64,
+}
+
+/// Run Metal 4 per-dispatch profiling for a single seq_len.
+///
+/// Uses CounterHeap `write_precise_timestamp` around each individual dispatch
+/// within a single encoder, providing dispatch-level granularity that Metal 3's
+/// GPUStartTime/GPUEndTime cannot achieve.
+///
+/// Bridge methods `as_legacy_cb()` and `as_legacy_pass()` allow using existing
+/// ops (which accept Metal 3 types) with Metal 4 command buffers and encoders.
+#[cfg(feature = "metal4")]
+fn metal4_per_dispatch_profile(
+    registry: &KernelRegistry,
+    block: &mut TransformerBlock,
+    input: &Array,
+    cos_freqs: &Array,
+    sin_freqs: &Array,
+    seq_len: usize,
+) {
+    use objc2_metal::{MTL4CommandEncoder as _, MTLCommandBuffer as _, MTLDevice as _};
+
+    let device = registry.device().raw();
+
+    // Check Metal 4 availability at runtime
+    let Some(alloc) = CommandAllocator::new(device) else {
+        println!("\n  [Metal 4] Skipped — device does not support Metal 4 command allocator");
+        return;
+    };
+    let Some(queue4) = CommandQueue4::new(device) else {
+        println!("\n  [Metal 4] Skipped — device does not support Metal 4 command queue");
+        return;
+    };
+
+    // CounterHeap with enough slots for per-dispatch timestamps.
+    // We need 2 timestamps per dispatch point (before + after).
+    // A transformer layer has ~12 dispatch points; allocate 64 for headroom.
+    let heap = match CounterHeap::new(device, 64) {
+        Ok(h) => h,
+        Err(e) => {
+            println!("\n  [Metal 4] Skipped — counter heap creation failed: {e}");
+            return;
+        }
+    };
+    heap.set_label("gpu_profile_bench");
+
+    println!("\n  --- Metal 4 CounterHeap Per-Dispatch Profiling ---");
+    println!("  (dispatch-level precision via write_precise_timestamp)");
+    println!("  tick_frequency: {} Hz", heap.tick_frequency());
+
+    let mut results: Vec<Metal4DispatchResult> = Vec::new();
+
+    // Helper: run a Metal 4 CB, wait via legacy CB waitUntilCompleted bridge
+    // (Metal 4 uses event-based sync; for bench simplicity we bridge to Metal 3)
+    let metal4_bench_op =
+        |heap: &CounterHeap,
+         alloc: &CommandAllocator,
+         queue4: &CommandQueue4,
+         encode_fn: &dyn Fn(&rmlx_metal::metal4::Mtl4CommandBuffer, &CounterHeap)|
+         -> Option<f64> {
+            heap.invalidate(0..4);
+            let cb = alloc.new_command_buffer(device)?;
+            cb.begin(alloc);
+            encode_fn(&cb, heap);
+            cb.end();
+            queue4.commit_batch(&[&cb]);
+            // Wait for GPU completion via legacy CB bridge
+            cb.as_legacy_cb().waitUntilCompleted();
+            let elapsed = gpu_time_us_metal4(heap, 0, 1);
+            alloc.reset();
+            Some(elapsed)
+        };
+
+    // --- 1. Full layer forward via Metal 4 CB + CounterHeap CB-level timestamps ---
+    {
+        let mut gpu_times = Vec::with_capacity(BENCH_ITERS);
+
+        let encode_full = |cb: &rmlx_metal::metal4::Mtl4CommandBuffer, heap: &CounterHeap| {
+            let mut cache = LayerKvCache::preallocated(
+                device,
+                NUM_KV_HEADS,
+                HEAD_DIM,
+                MAX_SEQ_LEN,
+                DType::Float16,
+            );
+            heap.write_timestamp(cb.raw(), 0);
+            if let Some(enc) = cb.compute_encoder() {
+                let pass4 = ComputePass4::new(&enc);
+                let _ = block
+                    .forward_prefill_into_encoder(
+                        input,
+                        Some(cos_freqs),
+                        Some(sin_freqs),
+                        None,
+                        &mut cache,
+                        registry,
+                        pass4.as_legacy_pass(),
+                    )
+                    .expect("metal4 forward");
+                enc.endEncoding();
+            }
+            heap.write_timestamp(cb.raw(), 1);
+        };
+
+        for _ in 0..WARMUP_ITERS {
+            metal4_bench_op(&heap, &alloc, &queue4, &encode_full);
+        }
+        for _ in 0..BENCH_ITERS {
+            if let Some(t) = metal4_bench_op(&heap, &alloc, &queue4, &encode_full) {
+                gpu_times.push(t);
+            }
+        }
+
+        if !gpu_times.is_empty() {
+            let (mean, p50, min) = compute_stats(&gpu_times);
+            results.push(Metal4DispatchResult {
+                name: "TOTAL (Metal4 CB-level)",
+                gpu_mean_us: mean,
+                gpu_p50_us: p50,
+                gpu_min_us: min,
+            });
+        }
+    }
+
+    // --- 2. Per-dispatch: RMSNorm with encoder-level precise timestamps ---
+    {
+        let norm1_w = ones_f16(device, HIDDEN_SIZE);
+        let mut gpu_times = Vec::with_capacity(BENCH_ITERS);
+
+        let encode_rms = |cb: &rmlx_metal::metal4::Mtl4CommandBuffer, heap: &CounterHeap| {
+            if let Some(enc) = cb.compute_encoder() {
+                let pass4 = ComputePass4::new(&enc);
+                heap.write_precise_timestamp(pass4.raw(), 0);
+                let _ = ops::rms_norm::rms_norm_into_encoder(
+                    registry,
+                    input,
+                    Some(&norm1_w),
+                    RMS_NORM_EPS,
+                    pass4.as_legacy_pass(),
+                )
+                .expect("rms_norm metal4");
+                heap.write_precise_timestamp(pass4.raw(), 1);
+                enc.endEncoding();
+            }
+        };
+
+        for _ in 0..WARMUP_ITERS {
+            metal4_bench_op(&heap, &alloc, &queue4, &encode_rms);
+        }
+        for _ in 0..BENCH_ITERS {
+            if let Some(t) = metal4_bench_op(&heap, &alloc, &queue4, &encode_rms) {
+                gpu_times.push(t);
+            }
+        }
+
+        if !gpu_times.is_empty() {
+            let (mean, p50, min) = compute_stats(&gpu_times);
+            results.push(Metal4DispatchResult {
+                name: "RMSNorm (precise)",
+                gpu_mean_us: mean,
+                gpu_p50_us: p50,
+                gpu_min_us: min,
+            });
+        }
+    }
+
+    // --- 3. Per-dispatch: QKV GEMM with CB-level timestamps ---
+    // (matmul_into_cb creates its own encoder internally, so we use CB-level timestamps)
+    {
+        let w_q_bytes = rand_f16_bytes(Q_DIM * HIDDEN_SIZE, 1);
+        let w_k_bytes = rand_f16_bytes(K_DIM * HIDDEN_SIZE, 2);
+        let w_v_bytes = rand_f16_bytes(V_DIM * HIDDEN_SIZE, 3);
+        let qkv_wt = build_merged_weight_t(
+            device,
+            &[
+                (&w_q_bytes, Q_DIM, HIDDEN_SIZE),
+                (&w_k_bytes, K_DIM, HIDDEN_SIZE),
+                (&w_v_bytes, V_DIM, HIDDEN_SIZE),
+            ],
+        );
+
+        // Materialize normed input
+        let normed = autoreleasepool(|_| {
+            let legacy_q = device.newCommandQueue().unwrap();
+            let cb = legacy_q.commandBufferWithUnretainedReferences().unwrap();
+            let r = ops::rms_norm::rms_norm_into_cb(
+                registry,
+                input,
+                Some(&ones_f16(device, HIDDEN_SIZE)),
+                RMS_NORM_EPS,
+                &cb,
+            )
+            .expect("rms_norm");
+            cb.commit();
+            cb.waitUntilCompleted();
+            r
+        });
+        let normed_2d = normed.reshape(vec![seq_len, HIDDEN_SIZE]).expect("reshape");
+
+        let mut gpu_times = Vec::with_capacity(BENCH_ITERS);
+
+        let encode_qkv = |cb: &rmlx_metal::metal4::Mtl4CommandBuffer, heap: &CounterHeap| {
+            heap.write_timestamp(cb.raw(), 0);
+            // Use legacy CB bridge for matmul_into_cb which creates its own encoder
+            let _ = ops::matmul::matmul_into_cb(registry, &normed_2d, &qkv_wt, cb.as_legacy_cb())
+                .expect("qkv metal4");
+            heap.write_timestamp(cb.raw(), 1);
+        };
+
+        for _ in 0..WARMUP_ITERS {
+            metal4_bench_op(&heap, &alloc, &queue4, &encode_qkv);
+        }
+        for _ in 0..BENCH_ITERS {
+            if let Some(t) = metal4_bench_op(&heap, &alloc, &queue4, &encode_qkv) {
+                gpu_times.push(t);
+            }
+        }
+
+        if !gpu_times.is_empty() {
+            let (mean, p50, min) = compute_stats(&gpu_times);
+            results.push(Metal4DispatchResult {
+                name: "QKV GEMM (CB-level)",
+                gpu_mean_us: mean,
+                gpu_p50_us: p50,
+                gpu_min_us: min,
+            });
+        }
+    }
+
+    // Print Metal 4 results table
+    let sum_dispatch: f64 = results.iter().skip(1).map(|r| r.gpu_mean_us).sum();
+
+    println!(
+        "\n  {:<32} {:>12} {:>10} {:>10}",
+        "Operation (Metal4)", "GPU Mean(us)", "GPU P50", "GPU Min"
+    );
+    println!("  {}", "-".repeat(68));
+
+    for r in &results {
+        println!(
+            "  {:<32} {:>12.1} {:>10.1} {:>10.1}",
+            r.name, r.gpu_mean_us, r.gpu_p50_us, r.gpu_min_us
+        );
+    }
+
+    println!("  {}", "-".repeat(68));
+    if !results.is_empty() {
+        println!("  {:<32} {:>12.1}", "Sum of per-dispatch", sum_dispatch);
+        println!(
+            "  {:<32} {:>12.1}",
+            "Metal4 CB-level total", results[0].gpu_mean_us
+        );
+        if results[0].gpu_mean_us > 0.0 && sum_dispatch > 0.0 {
+            let coverage = sum_dispatch / results[0].gpu_mean_us * 100.0;
+            println!("  {:<32} {:>12.1}%", "Coverage (dispatch/total)", coverage);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -336,7 +636,7 @@ fn main() {
     let device = registry.device().raw();
     let supports_nax = registry.device().tuning().supports_nax;
 
-    let setup_queue = device.new_command_queue();
+    let setup_queue = device.newCommandQueue().unwrap();
 
     println!(
         "Config: hidden={}, heads={}/{}, head_dim={}, intermediate={}",
@@ -414,7 +714,7 @@ fn main() {
         );
         println!("{}", "=".repeat(110));
 
-        let queue = device.new_command_queue();
+        let queue = device.newCommandQueue().unwrap();
 
         let cos_freqs = cos_full.slice(0, 0, seq_len).expect("cos slice");
         let sin_freqs = sin_full.slice(0, 0, seq_len).expect("sin slice");
@@ -453,7 +753,7 @@ fn main() {
                 MAX_SEQ_LEN,
                 DType::Float16,
             );
-            let encoder = cb.new_compute_command_encoder();
+            let encoder = cb.computeCommandEncoder().unwrap();
             let _ = block
                 .forward_prefill_into_encoder(
                     &input,
@@ -462,42 +762,40 @@ fn main() {
                     None,
                     &mut cache,
                     &registry,
-                    encoder,
+                    ComputePass::new(&encoder),
                 )
                 .expect("single-encoder pipeline");
-            encoder.end_encoding();
+            encoder.endEncoding();
         });
 
         // --- Materialize intermediates for downstream ops ---
 
         // 1. RMSNorm -> normed
-        let normed = {
-            let _pool = ScopedPool::new();
-            let cb = queue.new_command_buffer_with_unretained_references();
+        let normed = autoreleasepool(|_| {
+            let cb = queue.commandBufferWithUnretainedReferences().unwrap();
             let r = ops::rms_norm::rms_norm_into_cb(
                 &registry,
                 &input,
                 Some(&norm1_w),
                 RMS_NORM_EPS,
-                cb,
+                &cb,
             )
             .expect("rms_norm");
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
             r
-        };
+        });
         let normed_2d = normed.reshape(vec![seq_len, HIDDEN_SIZE]).expect("reshape");
 
         // 2. QKV GEMM -> qkv
-        let qkv = {
-            let _pool = ScopedPool::new();
-            let cb = queue.new_command_buffer_with_unretained_references();
-            let r = ops::matmul::matmul_into_cb(&registry, &normed_2d, &qkv_wt, cb)
+        let qkv = autoreleasepool(|_| {
+            let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+            let r = ops::matmul::matmul_into_cb(&registry, &normed_2d, &qkv_wt, &cb)
                 .expect("qkv matmul");
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
             r
-        };
+        });
 
         // 3. Q/K/V views from merged QKV
         let elem_size = qkv.dtype().size_of();
@@ -524,9 +822,8 @@ fn main() {
         );
 
         // 4. RoPE + Deinterleave
-        let (q_batched, k_batched, v_batched) = {
-            let _pool = ScopedPool::new();
-            let cb = queue.new_command_buffer_with_unretained_references();
+        let (q_batched, k_batched, v_batched) = autoreleasepool(|_| {
+            let cb = queue.commandBufferWithUnretainedReferences().unwrap();
             let qb = ops::rope::rope_multihead_into_cb(
                 &registry,
                 &q_view,
@@ -535,7 +832,7 @@ fn main() {
                 NUM_HEADS,
                 0,
                 q_view.strides()[0],
-                cb,
+                &cb,
             )
             .expect("rope q");
             let kb = ops::rope::rope_multihead_into_cb(
@@ -546,7 +843,7 @@ fn main() {
                 NUM_KV_HEADS,
                 0,
                 k_view.strides()[0],
-                cb,
+                &cb,
             )
             .expect("rope k");
             let vb = ops::rope::deinterleave_heads_into_cb(
@@ -554,13 +851,13 @@ fn main() {
                 &v_view,
                 NUM_KV_HEADS,
                 v_view.strides()[0],
-                cb,
+                &cb,
             )
             .expect("deinterleave v");
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
             (qb, kb, vb)
-        };
+        });
 
         // 5. SDPA
         let total_seq = seq_len;
@@ -571,9 +868,8 @@ fn main() {
         let use_mma_bk32 = is_f16_d128 && !use_nax && total_seq >= 256;
         let seq_major_output = is_f16_d128;
 
-        let attn_slab = {
-            let _pool = ScopedPool::new();
-            let cb = queue.new_command_buffer_with_unretained_references();
+        let attn_slab = autoreleasepool(|_| {
+            let cb = queue.commandBufferWithUnretainedReferences().unwrap();
             let r = if use_nax {
                 ops::sdpa::sdpa_prefill_nax_f16_into_cb(
                     &registry,
@@ -590,7 +886,7 @@ fn main() {
                     true,
                     None,
                     None,
-                    cb,
+                    &cb,
                 )
                 .expect("sdpa nax")
             } else if use_mma_bk32 {
@@ -610,7 +906,7 @@ fn main() {
                     true,
                     None,
                     None,
-                    cb,
+                    &cb,
                 )
                 .expect("sdpa mma bk32")
             } else {
@@ -630,14 +926,14 @@ fn main() {
                     true,
                     None,
                     None,
-                    cb,
+                    &cb,
                 )
                 .expect("sdpa mma bk16")
             };
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
             r
-        };
+        });
 
         // 6. Head concat
         let attn_concat = if seq_major_output {
@@ -652,88 +948,83 @@ fn main() {
                 vec![HEAD_DIM, 1],
                 attn_slab.offset(),
             );
-            let interleaved = {
-                let _pool = ScopedPool::new();
-                let cb = queue.new_command_buffer_with_unretained_references();
-                let r =
-                    ops::rope::interleave_heads_into_cb(&registry, &packed, NUM_HEADS, seq_len, cb)
-                        .expect("interleave_heads");
+
+            autoreleasepool(|_| {
+                let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+                let r = ops::rope::interleave_heads_into_cb(
+                    &registry, &packed, NUM_HEADS, seq_len, &cb,
+                )
+                .expect("interleave_heads");
                 cb.commit();
-                cb.wait_until_completed();
+                cb.waitUntilCompleted();
                 r
-            };
-            interleaved
+            })
         };
 
         // 7. O projection
-        let o_out = {
-            let _pool = ScopedPool::new();
-            let cb = queue.new_command_buffer_with_unretained_references();
+        let o_out = autoreleasepool(|_| {
+            let cb = queue.commandBufferWithUnretainedReferences().unwrap();
             let r =
-                ops::matmul::matmul_into_cb(&registry, &attn_concat, &w_o_t, cb).expect("o_proj");
+                ops::matmul::matmul_into_cb(&registry, &attn_concat, &w_o_t, &cb).expect("o_proj");
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
             r
-        };
+        });
 
         // 8. Fused residual + RMSNorm
-        let (normed2, h) = {
-            let _pool = ScopedPool::new();
-            let cb = queue.new_command_buffer_with_unretained_references();
+        let (normed2, h) = autoreleasepool(|_| {
+            let cb = queue.commandBufferWithUnretainedReferences().unwrap();
             let r = ops::rms_norm::rms_norm_residual_add_into_cb(
                 &registry,
                 &o_out,
                 &input,
                 &norm2_w,
                 RMS_NORM_EPS,
-                cb,
+                &cb,
             )
             .expect("fused residual+norm");
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
             r
-        };
+        });
         let normed2_2d = normed2
             .reshape(vec![seq_len, HIDDEN_SIZE])
             .expect("reshape");
 
         // 9. Gate+Up GEMM
-        let gate_up_out = {
-            let _pool = ScopedPool::new();
-            let cb = queue.new_command_buffer_with_unretained_references();
-            let r = ops::matmul::matmul_into_cb(&registry, &normed2_2d, &gate_up_wt, cb)
+        let gate_up_out = autoreleasepool(|_| {
+            let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+            let r = ops::matmul::matmul_into_cb(&registry, &normed2_2d, &gate_up_wt, &cb)
                 .expect("gate_up");
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
             r
-        };
+        });
 
         // 10. SiLU*mul (strided)
-        let hidden_act = {
-            let _pool = ScopedPool::new();
-            let cb = queue.new_command_buffer_with_unretained_references();
+        let hidden_act = autoreleasepool(|_| {
+            let cb = queue.commandBufferWithUnretainedReferences().unwrap();
             let r = ops::fused::fused_silu_mul_strided_into_cb(
                 &registry,
                 &gate_up_out,
                 INTERMEDIATE_DIM,
-                cb,
+                &cb,
             )
             .expect("silu_mul");
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
             r
-        };
+        });
 
         // 11. Down proj
-        let ffn_out = {
-            let _pool = ScopedPool::new();
-            let cb = queue.new_command_buffer_with_unretained_references();
-            let r = ops::matmul::matmul_into_cb(&registry, &hidden_act, &w_down_t, cb)
+        let ffn_out = autoreleasepool(|_| {
+            let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+            let r = ops::matmul::matmul_into_cb(&registry, &hidden_act, &w_down_t, &cb)
                 .expect("down_proj");
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
             r
-        };
+        });
 
         // ====================================================================
         // Benchmark each op in isolation (GPU timestamps)
@@ -1050,6 +1341,14 @@ fn main() {
                 "Encoder reuse wall savings", wall_savings
             );
         }
+
+        // ====================================================================
+        // Metal 4 CounterHeap per-dispatch profiling (opt-in)
+        // ====================================================================
+        #[cfg(feature = "metal4")]
+        metal4_per_dispatch_profile(
+            &registry, &mut block, &input, &cos_freqs, &sin_freqs, seq_len,
+        );
 
         // Let GPU drain before next seq_len
         std::thread::sleep(std::time::Duration::from_millis(200));

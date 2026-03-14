@@ -1,5 +1,7 @@
 //! Token embedding: lookup table for discrete tokens.
 
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLCommandQueue;
 use rmlx_core::array::Array;
 use rmlx_core::kernels::{KernelError, KernelRegistry};
 
@@ -59,7 +61,7 @@ impl Embedding {
         &self,
         token_ids: &[u32],
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         let weight = self
             .weight
@@ -86,8 +88,8 @@ impl Embedding {
         let mut flat_indices: Vec<u32> = Vec::with_capacity(seq_len * embed_dim);
         for &tid in token_ids {
             for j in 0..embed_dim {
-                let flat_idx = (tid as u64) * (embed_dim as u64) + (j as u64);
-                if flat_idx > u32::MAX as u64 {
+                let flat_idx = (tid as usize) * embed_dim + j;
+                if flat_idx > (u32::MAX as u64).try_into().unwrap() {
                     return Err(KernelError::InvalidShape(format!(
                         "embedding flat index overflow: tid={tid}, embed_dim={embed_dim}"
                     )));

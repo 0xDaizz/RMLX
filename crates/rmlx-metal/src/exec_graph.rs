@@ -31,15 +31,17 @@
 //!
 //! // Batch 1: encode ops, then submit
 //! let enc = graph.encoder();
+//! let pass = ComputePass::new(&enc);
 //! // ... encode norm + projections ...
-//! enc.end_encoding();
+//! pass.end();
 //! graph.end_encoder();
 //! let _t1 = graph.submit_batch();
 //!
 //! // Batch 2: GPU FIFO ensures batch 1 completes first
 //! let enc = graph.encoder();
+//! let pass = ComputePass::new(&enc);
 //! // ... encode RoPE ...
-//! enc.end_encoding();
+//! pass.end();
 //! graph.end_encoder();
 //! let _t2 = graph.submit_batch();
 //!
@@ -51,10 +53,16 @@
 
 use std::time::Duration;
 
-use metal::{CommandBuffer, CommandQueue};
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::*;
 
 use crate::batcher::CommandBatcher;
 use crate::event::{EventError, GpuEvent};
+use crate::types::*;
+
+#[cfg(feature = "metal4")]
+use crate::metal4::{CommandAllocator, CommandQueue4, Mtl4CommandBuffer};
 
 /// Configuration for GPU memory backpressure in ExecGraph.
 ///
@@ -109,7 +117,7 @@ pub struct ExecGraph<'q, 'e> {
     /// `MTLSharedEvent.signaledValue` polling is unreliable on Apple Silicon when
     /// multiple command buffers are in flight across iterations; using the CB's own
     /// completion mechanism is more robust.
-    last_cb: Option<CommandBuffer>,
+    last_cb: Option<MtlCB>,
     /// Memory backpressure configuration.
     memory_config: MemoryConfig,
     /// Caller-reported GPU allocation total in bytes. Updated via
@@ -133,7 +141,7 @@ impl<'q, 'e> ExecGraph<'q, 'e> {
     /// - `event`: Shared event for GPU-side synchronization
     /// - `max_encoders_per_batch`: Max encoders per command buffer
     pub fn new(
-        queue: &'q CommandQueue,
+        queue: &'q ProtocolObject<dyn MTLCommandQueue>,
         event: &'e GpuEvent,
         max_encoders_per_batch: usize,
     ) -> Self {
@@ -243,7 +251,7 @@ impl<'q, 'e> ExecGraph<'q, 'e> {
     ///
     /// The encoder is created on the current command buffer. Call
     /// `end_encoder()` after encoding.
-    pub fn encoder(&mut self) -> &metal::ComputeCommandEncoderRef {
+    pub fn encoder(&mut self) -> Retained<ProtocolObject<dyn MTLComputeCommandEncoder>> {
         self.batcher.encoder()
     }
 
@@ -253,7 +261,7 @@ impl<'q, 'e> ExecGraph<'q, 'e> {
     }
 
     /// Get the current command buffer for direct encoding.
-    pub fn command_buffer(&mut self) -> &metal::CommandBufferRef {
+    pub fn command_buffer(&mut self) -> &ProtocolObject<dyn MTLCommandBuffer> {
         self.batcher.command_buffer()
     }
 
@@ -341,7 +349,7 @@ impl<'q, 'e> ExecGraph<'q, 'e> {
         // when GPU has prior in-flight work from previous iterations.
         let start = std::time::Instant::now();
         if let Some(ref cb) = self.last_cb {
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
         }
         self.last_cb = None;
         Ok(start.elapsed())
@@ -382,7 +390,7 @@ impl<'q, 'e> ExecGraph<'q, 'e> {
     }
 
     /// Access the underlying queue.
-    pub fn queue(&self) -> &CommandQueue {
+    pub fn queue(&self) -> &ProtocolObject<dyn MTLCommandQueue> {
         self.batcher.queue()
     }
 
@@ -413,15 +421,315 @@ impl ExecGraphStats {
     }
 }
 
+// ===========================================================================
+// Metal 4 execution graph
+// ===========================================================================
+
+/// Metal 4 execution graph using explicit command buffer lifecycle.
+///
+/// Instead of creating individual command buffers from the queue and committing
+/// them one by one (Metal 3 path), this graph:
+///
+/// 1. Allocates CBs from a [`CommandAllocator`] (memory reuse via `reset()`).
+/// 2. Uses explicit `begin(allocator)` / `end()` around encoding.
+/// 3. Collects completed CBs and batch-commits them via [`CommandQueue4::commit_batch`].
+/// 4. Calls `allocator.reset()` between decode iterations.
+///
+/// The caller chooses between `ExecGraph` (Metal 3) and `ExecGraph4` (Metal 4)
+/// based on runtime device capability detection.
+#[cfg(feature = "metal4")]
+pub struct ExecGraph4 {
+    allocator: CommandAllocator,
+    queue4: CommandQueue4,
+    event: GpuEvent,
+    /// Device reference for creating new command buffers.
+    device: MtlDevice,
+    /// Command buffers that have been `end()`-ed and are ready for batch commit.
+    pending_cbs: Vec<Mtl4CommandBuffer>,
+    /// The currently encoding command buffer (between `begin()` and `end()`).
+    current_cb: Option<Mtl4CommandBuffer>,
+    /// Last committed command buffer, retained for `waitUntilCompleted` in `sync()`.
+    /// `MTLSharedEvent.signaledValue` polling is unreliable on Apple Silicon when
+    /// multiple command buffers are in flight across iterations; using the CB's own
+    /// completion mechanism is more robust.
+    last_cb: Option<Mtl4CommandBuffer>,
+    counter: u64,
+    total_batches: usize,
+    sync_timeout: Duration,
+    /// Number of ops recorded since the last batch commit.
+    ops_since_submit: usize,
+    /// Maximum ops per command buffer before auto-submit.
+    max_ops_per_batch: usize,
+}
+
+#[cfg(feature = "metal4")]
+impl ExecGraph4 {
+    /// Create a new Metal 4 execution graph.
+    ///
+    /// Returns `None` if the device does not support Metal 4 or if
+    /// allocator/queue creation fails.
+    pub fn new(device: &ProtocolObject<dyn MTLDevice>) -> Option<Self> {
+        let allocator = CommandAllocator::new(device)?;
+        let queue4 = CommandQueue4::new(device)?;
+        let event = GpuEvent::new(device);
+        Some(Self {
+            allocator,
+            queue4,
+            event,
+            device: crate::types::retain_proto(device),
+            pending_cbs: Vec::new(),
+            current_cb: None,
+            last_cb: None,
+            counter: 0,
+            total_batches: 0,
+            sync_timeout: Duration::from_secs(10),
+            ops_since_submit: 0,
+            max_ops_per_batch: usize::MAX,
+        })
+    }
+
+    /// Set the timeout for the final CPU sync.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.sync_timeout = timeout;
+        self
+    }
+
+    /// Set the maximum ops per command buffer for chunked pipeline.
+    pub fn with_max_ops_per_batch(mut self, max_ops: usize) -> Self {
+        self.max_ops_per_batch = max_ops.max(1);
+        self
+    }
+
+    /// Set the max ops per batch (non-builder variant).
+    pub fn set_max_ops_per_batch(&mut self, max_ops: usize) {
+        self.max_ops_per_batch = max_ops.max(1);
+    }
+
+    /// Begin a new command buffer for encoding.
+    ///
+    /// If there is already a current CB in encoding state, this is a no-op
+    /// and returns the existing encoder-ready CB. Otherwise, allocates a new
+    /// CB from the allocator and calls `begin()`.
+    fn ensure_current_cb(&mut self) -> &Mtl4CommandBuffer {
+        if self.current_cb.is_none() {
+            let cb = self
+                .allocator
+                .new_command_buffer(&self.device)
+                .expect("Metal 4: failed to allocate command buffer");
+            cb.begin(&self.allocator);
+            self.current_cb = Some(cb);
+        }
+        self.current_cb.as_ref().unwrap()
+    }
+
+    /// Get a compute command encoder on the current Metal 4 command buffer.
+    ///
+    /// Automatically begins a new CB if none is active.
+    pub fn encoder(&mut self) -> Retained<ProtocolObject<dyn MTL4ComputeCommandEncoder>> {
+        self.ensure_current_cb();
+        self.current_cb
+            .as_ref()
+            .unwrap()
+            .compute_encoder()
+            .expect("Metal 4: failed to create compute encoder")
+    }
+
+    /// End the current compute command encoder.
+    ///
+    /// Note: With Metal 4 explicit encoding, the caller is responsible for
+    /// calling `endEncoding()` on the encoder returned by [`encoder()`].
+    /// This method is provided for API symmetry with `ExecGraph`.
+    pub fn end_encoder(&mut self) {
+        // Metal 4 encoders are ended by the caller via endEncoding().
+        // This is a no-op but maintains API parity with ExecGraph.
+    }
+
+    /// Finalize the current command buffer (call `end()`) and move it to
+    /// the pending list for batch commit.
+    fn finalize_current_cb(&mut self) {
+        if let Some(cb) = self.current_cb.take() {
+            cb.end();
+            self.pending_cbs.push(cb);
+        }
+    }
+
+    /// Record that `count` dispatch ops have been encoded.
+    ///
+    /// If accumulated ops exceed `max_ops_per_batch`, auto-submits.
+    pub fn record_ops(&mut self, count: usize) -> Option<EventToken> {
+        self.ops_since_submit += count;
+        if self.ops_since_submit >= self.max_ops_per_batch {
+            Some(self.force_submit_batch())
+        } else {
+            None
+        }
+    }
+
+    /// Current ops accumulated since last commit.
+    pub fn ops_since_submit(&self) -> usize {
+        self.ops_since_submit
+    }
+
+    /// Submit the current batch of command buffers.
+    ///
+    /// Finalizes the current CB (if any), then batch-commits all pending CBs
+    /// via `CommandQueue4::commit_batch()`.
+    ///
+    /// When `max_ops_per_batch` is set, this is a soft hint that only commits
+    /// when the threshold is reached.
+    pub fn submit_batch(&mut self) -> EventToken {
+        if self.current_cb.is_none() && self.pending_cbs.is_empty() {
+            return EventToken {
+                value: self.counter,
+            };
+        }
+        // Chunked pipeline: skip commit if below ops threshold
+        if self.max_ops_per_batch < usize::MAX && self.ops_since_submit < self.max_ops_per_batch {
+            return EventToken {
+                value: self.counter,
+            };
+        }
+        self.force_submit_batch()
+    }
+
+    /// Unconditionally submit all pending command buffers.
+    pub fn force_submit_batch(&mut self) -> EventToken {
+        self.finalize_current_cb();
+
+        if self.pending_cbs.is_empty() {
+            return EventToken {
+                value: self.counter,
+            };
+        }
+
+        self.counter += 1;
+        let value = self.counter;
+
+        // Batch commit all pending CBs
+        let cb_refs: Vec<&Mtl4CommandBuffer> = self.pending_cbs.iter().collect();
+        self.queue4.commit_batch(&cb_refs);
+
+        // Signal event after commit for cross-queue sync
+        let event: &ProtocolObject<dyn MTLEvent> = ProtocolObject::from_ref(self.event.raw());
+        self.queue4.signal_event(event, value);
+
+        // Save the last committed CB for waitUntilCompleted in sync().
+        self.last_cb = self.pending_cbs.pop();
+        self.pending_cbs.clear();
+        self.total_batches += 1;
+        self.ops_since_submit = 0;
+
+        EventToken { value }
+    }
+
+    /// CPU-side sync: block until all submitted batches complete.
+    ///
+    /// Uses the last committed CB's `waitUntilCompleted` instead of SharedEvent
+    /// polling. `MTLSharedEvent.signaledValue` polling is unreliable on Apple
+    /// Silicon when GPU has prior in-flight work from previous iterations.
+    pub fn sync(&mut self) -> Result<Duration, EventError> {
+        // Flush any pending work
+        if self.current_cb.is_some() || !self.pending_cbs.is_empty() {
+            self.finalize_current_cb();
+            if !self.pending_cbs.is_empty() {
+                self.counter += 1;
+                let cb_refs: Vec<&Mtl4CommandBuffer> = self.pending_cbs.iter().collect();
+                self.queue4.commit_batch(&cb_refs);
+                let event: &ProtocolObject<dyn MTLEvent> =
+                    ProtocolObject::from_ref(self.event.raw());
+                self.queue4.signal_event(event, self.counter);
+                // Save the last committed CB for waitUntilCompleted.
+                self.last_cb = self.pending_cbs.pop();
+                self.pending_cbs.clear();
+                self.total_batches += 1;
+                self.ops_since_submit = 0;
+            }
+        }
+
+        if self.counter == 0 {
+            return Ok(Duration::ZERO);
+        }
+
+        // Use CB's own waitUntilCompleted instead of SharedEvent polling.
+        let start = std::time::Instant::now();
+        if let Some(ref cb) = self.last_cb {
+            cb.as_legacy_cb().waitUntilCompleted();
+        }
+        self.last_cb = None;
+        Ok(start.elapsed())
+    }
+
+    /// Sync and reset for the next forward pass.
+    pub fn sync_and_reset(&mut self) -> Result<Duration, EventError> {
+        let elapsed = self.sync()?;
+        self.reset();
+        Ok(elapsed)
+    }
+
+    /// Reset the graph for a new forward pass.
+    ///
+    /// Resets the allocator (reclaims encoding memory), event counter,
+    /// and all batch state. The caller must ensure all prior GPU work
+    /// has completed before calling this.
+    pub fn reset(&mut self) {
+        // SAFETY: reset() is only called after sync() which waits for all GPU
+        // work to complete via waitUntilCompleted on the last committed CB.
+        unsafe { self.allocator.reset() };
+        self.counter = 0;
+        self.total_batches = 0;
+        self.current_cb = None;
+        self.last_cb = None;
+        self.pending_cbs.clear();
+        self.ops_since_submit = 0;
+        self.event.reset();
+    }
+
+    /// Total batches submitted in this graph.
+    pub fn total_batches(&self) -> usize {
+        self.total_batches
+    }
+
+    /// Current event counter value.
+    pub fn counter(&self) -> u64 {
+        self.counter
+    }
+
+    /// Access the underlying allocator.
+    pub fn allocator(&self) -> &CommandAllocator {
+        &self.allocator
+    }
+
+    /// Access the underlying Metal 4 queue.
+    pub fn queue4(&self) -> &CommandQueue4 {
+        &self.queue4
+    }
+
+    /// Access the event.
+    pub fn event(&self) -> &GpuEvent {
+        &self.event
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::OnceLock;
+
+    fn test_device() -> Option<&'static MtlDevice> {
+        static DEVICE: OnceLock<Option<MtlDevice>> = OnceLock::new();
+        DEVICE
+            .get_or_init(|| objc2::rc::autoreleasepool(|_| MTLCreateSystemDefaultDevice()))
+            .as_ref()
+    }
 
     #[test]
     fn exec_graph_basic_lifecycle() {
-        let device = metal::Device::system_default().expect("Metal device required");
-        let queue = device.new_command_queue();
-        let event = GpuEvent::new(&device);
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let queue = device.newCommandQueue().unwrap();
+        let event = GpuEvent::new(device);
         let graph = ExecGraph::new(&queue, &event, 32);
 
         assert_eq!(graph.total_batches(), 0);
@@ -430,14 +738,17 @@ mod tests {
 
     #[test]
     fn exec_graph_submit_batch() {
-        let device = metal::Device::system_default().expect("Metal device required");
-        let queue = device.new_command_queue();
-        let event = GpuEvent::new(&device);
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let queue = device.newCommandQueue().unwrap();
+        let event = GpuEvent::new(device);
         let mut graph = ExecGraph::new(&queue, &event, 32);
 
         // Encode a no-op and submit
         let enc = graph.encoder();
-        enc.end_encoding();
+        enc.endEncoding();
         graph.end_encoder();
         let t1 = graph.submit_batch();
 
@@ -448,28 +759,31 @@ mod tests {
 
     #[test]
     fn exec_graph_chained_batches() {
-        let device = metal::Device::system_default().expect("Metal device required");
-        let queue = device.new_command_queue();
-        let event = GpuEvent::new(&device);
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let queue = device.newCommandQueue().unwrap();
+        let event = GpuEvent::new(device);
         let mut graph = ExecGraph::new(&queue, &event, 32);
 
         // Batch 1
         let enc = graph.encoder();
-        enc.end_encoding();
+        enc.endEncoding();
         graph.end_encoder();
         let t1 = graph.submit_batch();
 
         // Batch 2 waits for batch 1
         graph.wait_for(t1);
         let enc = graph.encoder();
-        enc.end_encoding();
+        enc.endEncoding();
         graph.end_encoder();
         let t2 = graph.submit_batch();
 
         // Batch 3 waits for batch 2
         graph.wait_for(t2);
         let enc = graph.encoder();
-        enc.end_encoding();
+        enc.endEncoding();
         graph.end_encoder();
         let _t3 = graph.submit_batch();
 
@@ -482,13 +796,16 @@ mod tests {
 
     #[test]
     fn exec_graph_sync_and_reset() {
-        let device = metal::Device::system_default().expect("Metal device required");
-        let queue = device.new_command_queue();
-        let event = GpuEvent::new(&device);
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let queue = device.newCommandQueue().unwrap();
+        let event = GpuEvent::new(device);
         let mut graph = ExecGraph::new(&queue, &event, 32);
 
         let enc = graph.encoder();
-        enc.end_encoding();
+        enc.endEncoding();
         graph.end_encoder();
         let _token = graph.submit_batch();
 
@@ -499,9 +816,12 @@ mod tests {
 
     #[test]
     fn exec_graph_sync_empty() {
-        let device = metal::Device::system_default().expect("Metal device required");
-        let queue = device.new_command_queue();
-        let event = GpuEvent::new(&device);
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let queue = device.newCommandQueue().unwrap();
+        let event = GpuEvent::new(device);
         let mut graph = ExecGraph::new(&queue, &event, 32);
 
         // Sync with nothing submitted should be instant
@@ -511,9 +831,12 @@ mod tests {
 
     #[test]
     fn submit_batch_no_pending_returns_previous_token() {
-        let device = metal::Device::system_default().expect("Metal device required");
-        let queue = device.new_command_queue();
-        let event = GpuEvent::new(&device);
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let queue = device.newCommandQueue().unwrap();
+        let event = GpuEvent::new(device);
         let mut graph = ExecGraph::new(&queue, &event, 32);
 
         // submit_batch with no pending work should return token with value 0
@@ -525,7 +848,7 @@ mod tests {
 
         // Now do real work and submit
         let enc = graph.encoder();
-        enc.end_encoding();
+        enc.endEncoding();
         graph.end_encoder();
         let t1 = graph.submit_batch();
         assert_eq!(t1.value(), 1);
@@ -540,9 +863,12 @@ mod tests {
 
     #[test]
     fn wait_for_empty_submit_completes_immediately() {
-        let device = metal::Device::system_default().expect("Metal device required");
-        let queue = device.new_command_queue();
-        let event = GpuEvent::new(&device);
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let queue = device.newCommandQueue().unwrap();
+        let event = GpuEvent::new(device);
         let mut graph = ExecGraph::new(&queue, &event, 32);
 
         // submit_batch with no pending work
@@ -556,15 +882,18 @@ mod tests {
 
     #[test]
     fn exec_graph_stats() {
-        let device = metal::Device::system_default().expect("Metal device required");
-        let queue = device.new_command_queue();
-        let event = GpuEvent::new(&device);
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let queue = device.newCommandQueue().unwrap();
+        let event = GpuEvent::new(device);
         let mut graph = ExecGraph::new(&queue, &event, 32);
 
         // Batch 1: 3 encoders
         for _ in 0..3 {
             let enc = graph.encoder();
-            enc.end_encoding();
+            enc.endEncoding();
             graph.end_encoder();
         }
         let _ = graph.submit_batch();
@@ -572,7 +901,7 @@ mod tests {
         // Batch 2: 2 encoders
         for _ in 0..2 {
             let enc = graph.encoder();
-            enc.end_encoding();
+            enc.endEncoding();
             graph.end_encoder();
         }
         let _ = graph.submit_batch();
@@ -586,16 +915,19 @@ mod tests {
 
     #[test]
     fn chunked_pipeline_defers_submit() {
-        let device = metal::Device::system_default().expect("Metal device required");
-        let queue = device.new_command_queue();
-        let event = GpuEvent::new(&device);
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let queue = device.newCommandQueue().unwrap();
+        let event = GpuEvent::new(device);
         // Set max_ops_per_batch to 20 — submit_batch() won't commit until 20 ops
         let mut graph = ExecGraph::new(&queue, &event, 64).with_max_ops_per_batch(20);
 
         // Simulate 2 "layers" of 9 ops each (total 18 < 20)
         for _ in 0..2 {
             let enc = graph.encoder();
-            enc.end_encoding();
+            enc.endEncoding();
             graph.end_encoder();
             // submit_batch should be a no-op (below threshold)
             let t = graph.submit_batch();
@@ -608,7 +940,7 @@ mod tests {
 
         // One more "layer" (9 ops) — record_ops should auto-submit at 27 >= 20
         let enc = graph.encoder();
-        enc.end_encoding();
+        enc.endEncoding();
         graph.end_encoder();
         let auto_token = graph.record_ops(9);
         assert!(auto_token.is_some()); // auto-submit triggered
@@ -620,13 +952,16 @@ mod tests {
 
     #[test]
     fn chunked_pipeline_force_submit_ignores_threshold() {
-        let device = metal::Device::system_default().expect("Metal device required");
-        let queue = device.new_command_queue();
-        let event = GpuEvent::new(&device);
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let queue = device.newCommandQueue().unwrap();
+        let event = GpuEvent::new(device);
         let mut graph = ExecGraph::new(&queue, &event, 64).with_max_ops_per_batch(50);
 
         let enc = graph.encoder();
-        enc.end_encoding();
+        enc.endEncoding();
         graph.end_encoder();
 
         // submit_batch is a no-op (0 ops < 50)
@@ -644,15 +979,18 @@ mod tests {
 
     #[test]
     fn chunked_pipeline_sync_flushes_remaining() {
-        let device = metal::Device::system_default().expect("Metal device required");
-        let queue = device.new_command_queue();
-        let event = GpuEvent::new(&device);
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let queue = device.newCommandQueue().unwrap();
+        let event = GpuEvent::new(device);
         let mut graph = ExecGraph::new(&queue, &event, 64).with_max_ops_per_batch(100);
 
         // Encode work but never hit threshold
         for _ in 0..5 {
             let enc = graph.encoder();
-            enc.end_encoding();
+            enc.endEncoding();
             graph.end_encoder();
             graph.record_ops(9);
         }

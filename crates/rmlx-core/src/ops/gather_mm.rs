@@ -9,7 +9,13 @@
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
-use metal::MTLSize;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLCommandBuffer as _;
+use objc2_metal::MTLCommandQueue as _;
+use objc2_metal::MTLDevice as _;
+use rmlx_metal::ComputePass;
+use rmlx_metal::MTLResourceOptions;
+use rmlx_metal::MTLSize;
 
 // ---------------------------------------------------------------------------
 // Metal shader source for GatherMM
@@ -40,7 +46,6 @@ use metal::MTLSize;
 pub const GATHER_MM_SHADER_SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
-
 
 constant constexpr uint BM = 32;
 constant constexpr uint BN = 32;
@@ -462,9 +467,21 @@ fn ceil_div(a: usize, b: usize) -> usize {
 }
 
 /// Create a u32 Metal constant buffer.
-fn make_u32_buf(device: &metal::DeviceRef, val: u32) -> metal::Buffer {
-    let opts = metal::MTLResourceOptions::StorageModeShared;
-    device.new_buffer_with_data(&val as *const u32 as *const _, 4, opts)
+fn make_u32_buf(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    val: u32,
+) -> rmlx_metal::MtlBuffer {
+    let opts = MTLResourceOptions::StorageModeShared;
+    unsafe {
+        device
+            .newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(&val as *const u32 as *const _ as *mut std::ffi::c_void)
+                    .unwrap(),
+                4_usize,
+                opts,
+            )
+            .unwrap()
+    }
 }
 
 /// Index-based batched GEMM for MoE expert dispatch.
@@ -487,7 +504,7 @@ pub fn gather_mm(
     x: &Array,
     weights: &Array,
     indices: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     // Validate shapes
     if x.ndim() != 3 {
@@ -576,33 +593,37 @@ pub fn gather_mm(
     let k_buf = make_u32_buf(dev, super::checked_u32(k, "K")?);
     let ne_buf = make_u32_buf(dev, super::checked_u32(n_experts, "n_experts")?);
 
-    let cb = queue.new_command_buffer();
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
-    enc.set_buffer(1, Some(weights.metal_buffer()), weights.offset() as u64);
-    enc.set_buffer(2, Some(indices.metal_buffer()), indices.offset() as u64);
+    let cb = queue.commandBuffer().unwrap();
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
+    enc.set_buffer(0, Some(x.metal_buffer()), x.offset());
+    enc.set_buffer(1, Some(weights.metal_buffer()), weights.offset());
+    enc.set_buffer(2, Some(indices.metal_buffer()), indices.offset());
     enc.set_buffer(3, Some(out.metal_buffer()), 0);
     enc.set_buffer(4, Some(&batch_buf), 0);
     enc.set_buffer(5, Some(&m_buf), 0);
     enc.set_buffer(6, Some(&n_buf), 0);
     enc.set_buffer(7, Some(&k_buf), 0);
     enc.set_buffer(8, Some(&ne_buf), 0);
-
     const BM: usize = 32;
     const BN: usize = 32;
     const N_THREADS: usize = 64; // 2 simdgroups × 32 threads
 
-    let grid = MTLSize::new(
-        ceil_div(n, BN) as u64,
-        ceil_div(m_per_batch, BM) as u64,
-        batch as u64,
-    );
-    let tg = MTLSize::new(N_THREADS as u64, 1, 1);
+    let grid = MTLSize {
+        width: ceil_div(n, BN),
+        height: ceil_div(m_per_batch, BM),
+        depth: batch,
+    };
+    let tg = MTLSize {
+        width: N_THREADS,
+        height: 1,
+        depth: 1,
+    };
 
-    enc.dispatch_thread_groups(grid, tg);
-    enc.end_encoding();
-    super::commit_with_mode(cb, super::ExecMode::Sync);
+    enc.dispatch_threadgroups(grid, tg);
+    enc.end();
+    super::commit_with_mode(&cb, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -637,7 +658,7 @@ pub fn gather_mm_into_cb(
     x: &Array,
     weights: &Array,
     indices: &Array,
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
 ) -> Result<Array, KernelError> {
     // Validate shapes (same as gather_mm, except no Rust-side index bounds check)
     if x.ndim() != 3 {
@@ -712,31 +733,35 @@ pub fn gather_mm_into_cb(
     let k_buf = make_u32_buf(dev, super::checked_u32(k, "K")?);
     let ne_buf = make_u32_buf(dev, super::checked_u32(n_experts, "n_experts")?);
 
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(x.metal_buffer()), x.offset() as u64);
-    enc.set_buffer(1, Some(weights.metal_buffer()), weights.offset() as u64);
-    enc.set_buffer(2, Some(indices.metal_buffer()), indices.offset() as u64);
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
+    enc.set_buffer(0, Some(x.metal_buffer()), x.offset());
+    enc.set_buffer(1, Some(weights.metal_buffer()), weights.offset());
+    enc.set_buffer(2, Some(indices.metal_buffer()), indices.offset());
     enc.set_buffer(3, Some(out.metal_buffer()), 0);
     enc.set_buffer(4, Some(&batch_buf), 0);
     enc.set_buffer(5, Some(&m_buf), 0);
     enc.set_buffer(6, Some(&n_buf), 0);
     enc.set_buffer(7, Some(&k_buf), 0);
     enc.set_buffer(8, Some(&ne_buf), 0);
-
     const BM: usize = 32;
     const BN: usize = 32;
     const N_THREADS: usize = 64; // 2 simdgroups × 32 threads
 
-    let grid = MTLSize::new(
-        ceil_div(n, BN) as u64,
-        ceil_div(m_per_batch, BM) as u64,
-        batch as u64,
-    );
-    let tg = MTLSize::new(N_THREADS as u64, 1, 1);
+    let grid = MTLSize {
+        width: ceil_div(n, BN),
+        height: ceil_div(m_per_batch, BM),
+        depth: batch,
+    };
+    let tg = MTLSize {
+        width: N_THREADS,
+        height: 1,
+        depth: 1,
+    };
 
-    enc.dispatch_thread_groups(grid, tg);
-    enc.end_encoding();
+    enc.dispatch_threadgroups(grid, tg);
+    enc.end();
 
     Ok(out)
 }

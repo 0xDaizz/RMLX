@@ -7,11 +7,38 @@ license.workspace = true
 
 [features]
 tracked_hazards = []
+metal4 = [
+    "objc2-metal/MTL4CommandAllocator",
+    "objc2-metal/MTL4CommandBuffer",
+    "objc2-metal/MTL4CommandQueue",
+    "objc2-metal/MTL4CommitFeedback",
+    "objc2-metal/MTL4ComputeCommandEncoder",
+    "objc2-metal/MTL4CommandEncoder",
+    "objc2-metal/MTL4Compiler",
+    "objc2-metal/MTL4CompilerTask",
+    "objc2-metal/MTL4ComputePipeline",
+    "objc2-metal/MTL4PipelineState",
+    "objc2-metal/MTL4FunctionDescriptor",
+    "objc2-metal/MTL4LibraryDescriptor",
+    "objc2-metal/MTL4LibraryFunctionDescriptor",
+    "objc2-metal/MTLDevice",
+    "objc2-metal/MTLEvent",
+    "objc2-metal/MTLAllocation",
+    "objc2-metal/MTLBuffer",
+    "objc2-metal/MTLResource",
+    "objc2-metal/MTLComputePipeline",
+    "objc2-metal/MTLCommandEncoder",
+    "objc2-metal/MTLTypes",
+    "objc2-metal/MTLLibrary",
+    "objc2-metal/MTL4Counters",
+]
 
 [dependencies]
-metal = { workspace = true }
-objc = { workspace = true }
-block = { workspace = true }
+objc2 = { workspace = true }
+objc2-metal = { workspace = true }
+objc2-foundation = { workspace = true }
+block2 = { workspace = true }
+bytemuck = { workspace = true }
 libc = { workspace = true }
 sha2 = { workspace = true }
 dirs = { workspace = true }

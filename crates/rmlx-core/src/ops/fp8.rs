@@ -21,7 +21,7 @@
 //! ## `_into_cb` variants
 //!
 //! Functions suffixed with `_into_cb` encode GPU work into a caller-provided
-//! `CommandBufferRef` without committing. This enables batching multiple kernel
+//! `MTLCommandBuffer` without committing. This enables batching multiple kernel
 //! dispatches into a single command buffer for reduced CPU overhead.
 //!
 //! ## Vectorisation
@@ -31,7 +31,14 @@
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
-use metal::MTLSize;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLCommandBuffer as _;
+use objc2_metal::MTLCommandQueue as _;
+use objc2_metal::MTLComputePipelineState as _;
+use objc2_metal::MTLDevice as _;
+use rmlx_metal::ComputePass;
+use rmlx_metal::MTLResourceOptions;
+use rmlx_metal::MTLSize;
 
 /// Metal shader source for FP8 dequant/quant kernels.
 pub const FP8_SHADER_SOURCE: &str = r#"
@@ -449,25 +456,45 @@ fn validate_2d_fp8e4m3(input: &Array, fn_name: &str) -> Result<(usize, usize), K
 // ---------------------------------------------------------------------------
 
 /// Create a constant `uint` buffer on the device.
-fn make_u32_buf(device: &metal::DeviceRef, val: u32) -> metal::Buffer {
-    device.new_buffer_with_data(
-        &val as *const u32 as *const std::ffi::c_void,
-        4,
-        metal::MTLResourceOptions::StorageModeShared,
-    )
+fn make_u32_buf(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    val: u32,
+) -> rmlx_metal::MtlBuffer {
+    unsafe {
+        device
+            .newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(
+                    &val as *const u32 as *const std::ffi::c_void as *mut std::ffi::c_void,
+                )
+                .unwrap(),
+                4_usize,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap()
+    }
 }
 
 /// Create a constant `float` buffer on the device.
-fn make_f32_buf(device: &metal::DeviceRef, val: f32) -> metal::Buffer {
-    device.new_buffer_with_data(
-        &val as *const f32 as *const std::ffi::c_void,
-        4,
-        metal::MTLResourceOptions::StorageModeShared,
-    )
+fn make_f32_buf(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    val: f32,
+) -> rmlx_metal::MtlBuffer {
+    unsafe {
+        device
+            .newBufferWithBytes_length_options(
+                std::ptr::NonNull::new(
+                    &val as *const f32 as *const std::ffi::c_void as *mut std::ffi::c_void,
+                )
+                .unwrap(),
+                4_usize,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .unwrap()
+    }
 }
 
 /// Elements per thread for the FP8 kernels.
-const ELEMS_PER_THREAD: u64 = 4;
+const ELEMS_PER_THREAD: usize = 4;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -480,7 +507,7 @@ const ELEMS_PER_THREAD: u64 = 4;
 pub fn dequant_fp8e4m3_to_f16(
     registry: &KernelRegistry,
     input: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     if input.dtype() != DType::Float8E4M3 {
         return Err(KernelError::InvalidShape(format!(
@@ -500,23 +527,27 @@ pub fn dequant_fp8e4m3_to_f16(
     let out = Array::zeros(registry.device().raw(), input.shape(), DType::Float16);
     let numel_buf = make_u32_buf(registry.device().raw(), numel as u32);
 
-    let command_buffer = queue.new_command_buffer();
-    let encoder = command_buffer.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
-    encoder.set_buffer(1, Some(out.metal_buffer()), out.offset() as u64);
-    encoder.set_buffer(2, Some(&numel_buf), 0);
-
-    let grid_threads = (numel as u64).div_ceil(ELEMS_PER_THREAD);
-    let grid_size = MTLSize::new(grid_threads, 1, 1);
-    let threadgroup_size = MTLSize::new(
-        std::cmp::min(pipeline.max_total_threads_per_threadgroup(), grid_threads),
-        1,
-        1,
-    );
-    encoder.dispatch_threads(grid_size, threadgroup_size);
-    encoder.end_encoding();
-    super::commit_with_mode(command_buffer, super::ExecMode::Sync);
+    let command_buffer = queue.commandBuffer().unwrap();
+    let raw_enc = command_buffer.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
+    enc.set_buffer(0, Some(input.metal_buffer()), input.offset());
+    enc.set_buffer(1, Some(out.metal_buffer()), out.offset());
+    enc.set_buffer(2, Some(&numel_buf), 0);
+    let grid_threads = numel.div_ceil(ELEMS_PER_THREAD);
+    let grid_size = MTLSize {
+        width: grid_threads,
+        height: 1,
+        depth: 1,
+    };
+    let threadgroup_size = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), grid_threads),
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threads(grid_size, threadgroup_size);
+    enc.end();
+    super::commit_with_mode(&command_buffer, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -528,7 +559,7 @@ pub fn dequant_fp8e4m3_to_f16(
 pub fn dequant_fp8e5m2_to_f16(
     registry: &KernelRegistry,
     input: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     if input.dtype() != DType::Float8E5M2 {
         return Err(KernelError::InvalidShape(format!(
@@ -548,23 +579,27 @@ pub fn dequant_fp8e5m2_to_f16(
     let out = Array::zeros(registry.device().raw(), input.shape(), DType::Float16);
     let numel_buf = make_u32_buf(registry.device().raw(), numel as u32);
 
-    let command_buffer = queue.new_command_buffer();
-    let encoder = command_buffer.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
-    encoder.set_buffer(1, Some(out.metal_buffer()), out.offset() as u64);
-    encoder.set_buffer(2, Some(&numel_buf), 0);
-
-    let grid_threads = (numel as u64).div_ceil(ELEMS_PER_THREAD);
-    let grid_size = MTLSize::new(grid_threads, 1, 1);
-    let threadgroup_size = MTLSize::new(
-        std::cmp::min(pipeline.max_total_threads_per_threadgroup(), grid_threads),
-        1,
-        1,
-    );
-    encoder.dispatch_threads(grid_size, threadgroup_size);
-    encoder.end_encoding();
-    super::commit_with_mode(command_buffer, super::ExecMode::Sync);
+    let command_buffer = queue.commandBuffer().unwrap();
+    let raw_enc = command_buffer.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
+    enc.set_buffer(0, Some(input.metal_buffer()), input.offset());
+    enc.set_buffer(1, Some(out.metal_buffer()), out.offset());
+    enc.set_buffer(2, Some(&numel_buf), 0);
+    let grid_threads = numel.div_ceil(ELEMS_PER_THREAD);
+    let grid_size = MTLSize {
+        width: grid_threads,
+        height: 1,
+        depth: 1,
+    };
+    let threadgroup_size = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), grid_threads),
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threads(grid_size, threadgroup_size);
+    enc.end();
+    super::commit_with_mode(&command_buffer, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -579,7 +614,7 @@ pub fn quant_f16_to_fp8e4m3(
     registry: &KernelRegistry,
     input: &Array,
     scale: f32,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     if input.dtype() != DType::Float16 {
         return Err(KernelError::InvalidShape(format!(
@@ -598,24 +633,28 @@ pub fn quant_f16_to_fp8e4m3(
     let numel_buf = make_u32_buf(registry.device().raw(), numel as u32);
     let scale_buf = make_f32_buf(registry.device().raw(), scale);
 
-    let command_buffer = queue.new_command_buffer();
-    let encoder = command_buffer.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
-    encoder.set_buffer(1, Some(out.metal_buffer()), out.offset() as u64);
-    encoder.set_buffer(2, Some(&numel_buf), 0);
-    encoder.set_buffer(3, Some(&scale_buf), 0);
-
-    let grid_threads = (numel as u64).div_ceil(ELEMS_PER_THREAD);
-    let grid_size = MTLSize::new(grid_threads, 1, 1);
-    let threadgroup_size = MTLSize::new(
-        std::cmp::min(pipeline.max_total_threads_per_threadgroup(), grid_threads),
-        1,
-        1,
-    );
-    encoder.dispatch_threads(grid_size, threadgroup_size);
-    encoder.end_encoding();
-    super::commit_with_mode(command_buffer, super::ExecMode::Sync);
+    let command_buffer = queue.commandBuffer().unwrap();
+    let raw_enc = command_buffer.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
+    enc.set_buffer(0, Some(input.metal_buffer()), input.offset());
+    enc.set_buffer(1, Some(out.metal_buffer()), out.offset());
+    enc.set_buffer(2, Some(&numel_buf), 0);
+    enc.set_buffer(3, Some(&scale_buf), 0);
+    let grid_threads = (numel as usize).div_ceil(ELEMS_PER_THREAD);
+    let grid_size = MTLSize {
+        width: grid_threads,
+        height: 1,
+        depth: 1,
+    };
+    let threadgroup_size = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), grid_threads),
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threads(grid_size, threadgroup_size);
+    enc.end();
+    super::commit_with_mode(&command_buffer, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -630,7 +669,7 @@ pub fn quant_f16_to_fp8e5m2(
     registry: &KernelRegistry,
     input: &Array,
     scale: f32,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     if input.dtype() != DType::Float16 {
         return Err(KernelError::InvalidShape(format!(
@@ -649,24 +688,28 @@ pub fn quant_f16_to_fp8e5m2(
     let numel_buf = make_u32_buf(registry.device().raw(), numel as u32);
     let scale_buf = make_f32_buf(registry.device().raw(), scale);
 
-    let command_buffer = queue.new_command_buffer();
-    let encoder = command_buffer.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
-    encoder.set_buffer(1, Some(out.metal_buffer()), out.offset() as u64);
-    encoder.set_buffer(2, Some(&numel_buf), 0);
-    encoder.set_buffer(3, Some(&scale_buf), 0);
-
-    let grid_threads = (numel as u64).div_ceil(ELEMS_PER_THREAD);
-    let grid_size = MTLSize::new(grid_threads, 1, 1);
-    let threadgroup_size = MTLSize::new(
-        std::cmp::min(pipeline.max_total_threads_per_threadgroup(), grid_threads),
-        1,
-        1,
-    );
-    encoder.dispatch_threads(grid_size, threadgroup_size);
-    encoder.end_encoding();
-    super::commit_with_mode(command_buffer, super::ExecMode::Sync);
+    let command_buffer = queue.commandBuffer().unwrap();
+    let raw_enc = command_buffer.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
+    enc.set_buffer(0, Some(input.metal_buffer()), input.offset());
+    enc.set_buffer(1, Some(out.metal_buffer()), out.offset());
+    enc.set_buffer(2, Some(&numel_buf), 0);
+    enc.set_buffer(3, Some(&scale_buf), 0);
+    let grid_threads = (numel as usize).div_ceil(ELEMS_PER_THREAD);
+    let grid_size = MTLSize {
+        width: grid_threads,
+        height: 1,
+        depth: 1,
+    };
+    let threadgroup_size = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), grid_threads),
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threads(grid_size, threadgroup_size);
+    enc.end();
+    super::commit_with_mode(&command_buffer, super::ExecMode::Sync);
 
     Ok(out)
 }
@@ -682,7 +725,7 @@ pub fn quant_f16_to_fp8e5m2(
 fn encode_quant_per_token(
     registry: &KernelRegistry,
     input: &Array,
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
 ) -> Result<(Array, Array), KernelError> {
     let (num_tokens, hidden_dim) = validate_2d_f16(input, "quant_per_token_fp8e4m3")?;
 
@@ -703,50 +746,52 @@ fn encode_quant_per_token(
 
     // Pass 1: compute per-token scales (one thread per row).
     {
-        let encoder = cb.new_compute_command_encoder();
-        encoder.set_compute_pipeline_state(&scales_pipeline);
-        encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
-        encoder.set_buffer(
-            1,
-            Some(scales_out.metal_buffer()),
-            scales_out.offset() as u64,
-        );
-        encoder.set_buffer(2, Some(&tokens_buf), 0);
-        encoder.set_buffer(3, Some(&dim_buf), 0);
-
-        let grid_size = MTLSize::new(num_tokens as u64, 1, 1);
-        let tg_w = std::cmp::min(
-            num_tokens as u64,
-            scales_pipeline.max_total_threads_per_threadgroup(),
-        );
-        let threadgroup_size = MTLSize::new(tg_w, 1, 1);
-        encoder.dispatch_threads(grid_size, threadgroup_size);
-        encoder.end_encoding();
+        let raw_enc = cb.computeCommandEncoder().unwrap();
+        let enc = ComputePass::new(&raw_enc);
+        enc.set_pipeline(&scales_pipeline);
+        enc.set_buffer(0, Some(input.metal_buffer()), input.offset());
+        enc.set_buffer(1, Some(scales_out.metal_buffer()), scales_out.offset());
+        enc.set_buffer(2, Some(&tokens_buf), 0);
+        enc.set_buffer(3, Some(&dim_buf), 0);
+        let grid_size = MTLSize {
+            width: num_tokens,
+            height: 1,
+            depth: 1,
+        };
+        let tg_w = std::cmp::min(num_tokens, scales_pipeline.maxTotalThreadsPerThreadgroup());
+        let threadgroup_size = MTLSize {
+            width: tg_w,
+            height: 1,
+            depth: 1,
+        };
+        enc.dispatch_threads(grid_size, threadgroup_size);
+        enc.end();
     }
 
     // Pass 2: quantize using the pre-computed scales.
     // This is a separate encoder, so all writes from pass 1 are visible.
     {
-        let encoder = cb.new_compute_command_encoder();
-        encoder.set_compute_pipeline_state(&quant_pipeline);
-        encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
-        encoder.set_buffer(1, Some(fp8_out.metal_buffer()), fp8_out.offset() as u64);
-        encoder.set_buffer(
-            2,
-            Some(scales_out.metal_buffer()),
-            scales_out.offset() as u64,
-        );
-        encoder.set_buffer(3, Some(&tokens_buf), 0);
-        encoder.set_buffer(4, Some(&dim_buf), 0);
-
-        let grid_size = MTLSize::new(hidden_dim as u64, num_tokens as u64, 1);
-        let tg_w = std::cmp::min(
-            hidden_dim as u64,
-            quant_pipeline.max_total_threads_per_threadgroup(),
-        );
-        let threadgroup_size = MTLSize::new(tg_w, 1, 1);
-        encoder.dispatch_threads(grid_size, threadgroup_size);
-        encoder.end_encoding();
+        let raw_enc = cb.computeCommandEncoder().unwrap();
+        let enc = ComputePass::new(&raw_enc);
+        enc.set_pipeline(&quant_pipeline);
+        enc.set_buffer(0, Some(input.metal_buffer()), input.offset());
+        enc.set_buffer(1, Some(fp8_out.metal_buffer()), fp8_out.offset());
+        enc.set_buffer(2, Some(scales_out.metal_buffer()), scales_out.offset());
+        enc.set_buffer(3, Some(&tokens_buf), 0);
+        enc.set_buffer(4, Some(&dim_buf), 0);
+        let grid_size = MTLSize {
+            width: hidden_dim,
+            height: num_tokens,
+            depth: 1,
+        };
+        let tg_w = std::cmp::min(hidden_dim, quant_pipeline.maxTotalThreadsPerThreadgroup());
+        let threadgroup_size = MTLSize {
+            width: tg_w,
+            height: 1,
+            depth: 1,
+        };
+        enc.dispatch_threads(grid_size, threadgroup_size);
+        enc.end();
     }
 
     Ok((fp8_out, scales_out))
@@ -760,7 +805,7 @@ fn encode_dequant_per_token(
     registry: &KernelRegistry,
     input: &Array,
     scales: &Array,
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
 ) -> Result<Array, KernelError> {
     let (num_tokens, hidden_dim) = validate_2d_fp8e4m3(input, "dequant_per_token_fp8e4m3")?;
 
@@ -790,22 +835,27 @@ fn encode_dequant_per_token(
     let tokens_buf = make_u32_buf(device, num_tokens as u32);
     let dim_buf = make_u32_buf(device, hidden_dim as u32);
 
-    let encoder = cb.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline);
-    encoder.set_buffer(0, Some(input.metal_buffer()), input.offset() as u64);
-    encoder.set_buffer(1, Some(out.metal_buffer()), out.offset() as u64);
-    encoder.set_buffer(2, Some(scales.metal_buffer()), scales.offset() as u64);
-    encoder.set_buffer(3, Some(&tokens_buf), 0);
-    encoder.set_buffer(4, Some(&dim_buf), 0);
-
-    let grid_size = MTLSize::new(hidden_dim as u64, num_tokens as u64, 1);
-    let tg_w = std::cmp::min(
-        hidden_dim as u64,
-        pipeline.max_total_threads_per_threadgroup(),
-    );
-    let threadgroup_size = MTLSize::new(tg_w, 1, 1);
-    encoder.dispatch_threads(grid_size, threadgroup_size);
-    encoder.end_encoding();
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
+    enc.set_buffer(0, Some(input.metal_buffer()), input.offset());
+    enc.set_buffer(1, Some(out.metal_buffer()), out.offset());
+    enc.set_buffer(2, Some(scales.metal_buffer()), scales.offset());
+    enc.set_buffer(3, Some(&tokens_buf), 0);
+    enc.set_buffer(4, Some(&dim_buf), 0);
+    let grid_size = MTLSize {
+        width: hidden_dim,
+        height: num_tokens,
+        depth: 1,
+    };
+    let tg_w = std::cmp::min(hidden_dim, pipeline.maxTotalThreadsPerThreadgroup());
+    let threadgroup_size = MTLSize {
+        width: tg_w,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threads(grid_size, threadgroup_size);
+    enc.end();
 
     Ok(out)
 }
@@ -820,11 +870,11 @@ fn encode_dequant_per_token(
 pub fn quant_per_token_fp8e4m3(
     registry: &KernelRegistry,
     input: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<(Array, Array), KernelError> {
-    let command_buffer = queue.new_command_buffer();
-    let result = encode_quant_per_token(registry, input, command_buffer)?;
-    super::commit_with_mode(command_buffer, super::ExecMode::Sync);
+    let command_buffer = queue.commandBuffer().unwrap();
+    let result = encode_quant_per_token(registry, input, &command_buffer)?;
+    super::commit_with_mode(&command_buffer, super::ExecMode::Sync);
     Ok(result)
 }
 
@@ -837,11 +887,11 @@ pub fn dequant_per_token_fp8e4m3(
     registry: &KernelRegistry,
     input: &Array,
     scales: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
-    let command_buffer = queue.new_command_buffer();
-    let result = encode_dequant_per_token(registry, input, scales, command_buffer)?;
-    super::commit_with_mode(command_buffer, super::ExecMode::Sync);
+    let command_buffer = queue.commandBuffer().unwrap();
+    let result = encode_dequant_per_token(registry, input, scales, &command_buffer)?;
+    super::commit_with_mode(&command_buffer, super::ExecMode::Sync);
     Ok(result)
 }
 
@@ -856,7 +906,7 @@ pub fn dequant_per_token_fp8e4m3(
 pub fn quant_per_token_fp8e4m3_into_cb(
     registry: &KernelRegistry,
     input: &Array,
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
 ) -> Result<(Array, Array), KernelError> {
     encode_quant_per_token(registry, input, cb)
 }
@@ -874,7 +924,7 @@ pub fn dequant_per_token_fp8e4m3_into_cb(
     registry: &KernelRegistry,
     input: &Array,
     scales: &Array,
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
 ) -> Result<Array, KernelError> {
     encode_dequant_per_token(registry, input, scales, cb)
 }
@@ -882,6 +932,7 @@ pub fn dequant_per_token_fp8e4m3_into_cb(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use objc2_metal::MTLBuffer as _;
 
     /// Helper: create a Float16 array from f32 values by converting to IEEE 754
     /// binary16 format manually (no `half` crate dependency).
@@ -911,7 +962,11 @@ mod tests {
         }
     }
 
-    fn make_f16_array(device: &metal::Device, data: &[f32], shape: Vec<usize>) -> Array {
+    fn make_f16_array(
+        device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+        data: &[f32],
+        shape: Vec<usize>,
+    ) -> Array {
         let f16_bytes: Vec<u8> = data
             .iter()
             .flat_map(|&v| f32_to_f16_bits(v).to_le_bytes())
@@ -923,19 +978,21 @@ mod tests {
         arr.to_vec_checked::<f32>()
     }
 
-    fn setup() -> (KernelRegistry, metal::CommandQueue) {
-        let gpu_dev = rmlx_metal::device::GpuDevice::system_default().unwrap();
-        let device = gpu_dev.raw().clone();
-        let queue = device.new_command_queue();
+    fn setup() -> Option<(KernelRegistry, rmlx_metal::MtlQueue)> {
+        let gpu_dev = crate::test_utils::test_gpu()?;
+        let queue = gpu_dev.new_command_queue();
         let registry = KernelRegistry::new(gpu_dev);
         register(&registry).expect("register fp8 kernels");
-        (registry, queue)
+        Some((registry, queue))
     }
 
     #[test]
     fn test_per_token_quant_small_dim() {
         // Basic correctness: small hidden_dim that fits in one threadgroup.
-        let (registry, queue) = setup();
+        let Some((registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let device = registry.device().raw();
 
         // 2 tokens, hidden_dim=4, values in a known range
@@ -973,7 +1030,7 @@ mod tests {
 
         // Read f16 output as raw bytes and convert back to f32 for comparison
         let numel = 8usize;
-        let raw_ptr = recovered.metal_buffer().contents() as *const u16;
+        let raw_ptr = recovered.metal_buffer().contents().as_ptr() as *const u16;
         let f16_vals: Vec<f32> = (0..numel)
             .map(|i| {
                 let bits = unsafe { *raw_ptr.add(i) };
@@ -1000,7 +1057,10 @@ mod tests {
     fn test_per_token_quant_large_hidden_dim() {
         // Regression test for the cross-threadgroup race on scales.
         // Use hidden_dim = 2048 which exceeds typical max_threadgroup_size (1024).
-        let (registry, queue) = setup();
+        let Some((registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let device = registry.device().raw();
 
         let num_tokens = 4usize;
@@ -1041,7 +1101,7 @@ mod tests {
         let recovered = dequant_per_token_fp8e4m3(&registry, &fp8_out, &scales, &queue)
             .expect("dequant should succeed");
 
-        let raw_ptr = recovered.metal_buffer().contents() as *const u16;
+        let raw_ptr = recovered.metal_buffer().contents().as_ptr() as *const u16;
         for row in 0..num_tokens {
             let peak = (row as f32 + 1.0) * 100.0;
             let idx = row * hidden_dim + hidden_dim - 1;
@@ -1062,7 +1122,10 @@ mod tests {
     #[test]
     fn test_per_token_quant_zero_row() {
         // A row of all zeros should produce scale = 1.0 and all-zero FP8 output.
-        let (registry, queue) = setup();
+        let Some((registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let device = registry.device().raw();
 
         let data = vec![0.0f32; 8];

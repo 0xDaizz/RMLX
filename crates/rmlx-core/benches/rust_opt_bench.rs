@@ -17,6 +17,8 @@ use std::borrow::Cow;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLCommandBuffer as _, MTLCommandQueue as _, MTLDevice as _};
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::{FunctionConstantValue, KernelRegistry, PipelineKey};
@@ -137,7 +139,11 @@ fn f32_to_f16_bits(val: f32) -> u16 {
     ((sign << 15) | (new_exp as u32) << 10 | (frac >> 13)) as u16
 }
 
-fn rand_f16_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
+fn rand_f16_array(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    shape: &[usize],
+    seed: u64,
+) -> Array {
     let numel: usize = shape.iter().product();
     let mut f16_bytes = Vec::with_capacity(numel * 2);
     let mut state = seed;
@@ -537,7 +543,7 @@ fn bench_e2e_matmul(registry: &KernelRegistry) {
     println!();
 
     let device = registry.device().raw();
-    let queue = device.new_command_queue();
+    let queue = device.newCommandQueue().unwrap();
 
     let m = 128;
     let n = 3584;
@@ -585,20 +591,20 @@ fn bench_e2e_matmul(registry: &KernelRegistry) {
 
     // Warmup
     for _ in 0..WARMUP_ITERS {
-        let cb = queue.new_command_buffer_with_unretained_references();
-        let _ = ops::matmul::matmul_into_cb(registry, &a, &b, cb);
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+        let _ = ops::matmul::matmul_into_cb(registry, &a, &b, &cb);
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
     }
 
     let mut times_into_cb = Vec::with_capacity(BENCH_ITERS);
     for _ in 0..BENCH_ITERS {
-        let cb = queue.new_command_buffer_with_unretained_references();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
         let start = Instant::now();
-        let _ = black_box(ops::matmul::matmul_into_cb(registry, &a, &b, cb));
+        let _ = black_box(ops::matmul::matmul_into_cb(registry, &a, &b, &cb));
         let encode_time = start.elapsed();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
         times_into_cb.push(encode_time);
     }
     let stats_into_cb = Stats::from_durations(&times_into_cb);

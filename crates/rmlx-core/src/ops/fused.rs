@@ -16,8 +16,13 @@ use crate::kernels::{KernelError, KernelRegistry};
 use crate::ops::buffer_slots::{
     fused_rms_gemv, fused_swiglu_down, gemm, silu_gate, silu_gate_strided,
 };
-use metal::MTLSize;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLCommandBuffer as _;
+use objc2_metal::MTLCommandQueue as _;
+use objc2_metal::MTLComputePipelineState as _;
 use rmlx_macros::rmlx_kernel;
+use rmlx_metal::ComputePass;
+use rmlx_metal::MTLSize;
 
 /// Batched Q/K/V projection: single command buffer for 3 matmuls.
 ///
@@ -34,7 +39,7 @@ pub fn batched_qkv_proj(
     wq_t: &Array,
     wk_t: &Array,
     wv_t: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<(Array, Array, Array), KernelError> {
     let input = ensure_contiguous(input, registry, queue)?;
 
@@ -56,18 +61,18 @@ pub fn batched_qkv_proj(
     let v_pipeline = gemm_pipeline_for_dims(registry, input.dtype(), m, nv, k)?;
 
     // Single command buffer for all 3 projections
-    let cb = queue.new_command_buffer();
+    let cb = queue.commandBuffer().unwrap();
 
     // Encode Q projection
-    encode_gemm(cb, &q_pipeline, &input, wq_t, &q_out, m, nq, k, registry)?;
+    encode_gemm(&cb, &q_pipeline, &input, wq_t, &q_out, m, nq, k, registry)?;
 
     // Encode K projection
-    encode_gemm(cb, &k_pipeline, &input, wk_t, &k_out, m, nk, k, registry)?;
+    encode_gemm(&cb, &k_pipeline, &input, wk_t, &k_out, m, nk, k, registry)?;
 
     // Encode V projection
-    encode_gemm(cb, &v_pipeline, &input, wv_t, &v_out, m, nv, k, registry)?;
+    encode_gemm(&cb, &v_pipeline, &input, wv_t, &v_out, m, nv, k, registry)?;
 
-    super::commit_with_mode(cb, super::ExecMode::Sync);
+    super::commit_with_mode(&cb, super::ExecMode::Sync);
 
     Ok((q_out, k_out, v_out))
 }
@@ -85,7 +90,7 @@ pub fn fused_silu_mul(
     registry: &KernelRegistry,
     gate_out: &Array,
     up_out: &Array,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     if gate_out.shape() != up_out.shape() {
         return Err(KernelError::InvalidShape(format!(
@@ -120,40 +125,47 @@ pub fn fused_silu_mul(
     let output = Array::uninit(dev, gate_out.shape(), gate_out.dtype());
     let numel_u32 = numel as u32;
 
-    let elems_per_thread: u64 = match gate_out.dtype() {
+    let elems_per_thread: usize = match gate_out.dtype() {
         DType::Float32 => 2,
         _ => 4,
     };
-    let grid_threads = (numel as u64).div_ceil(elems_per_thread);
+    let grid_threads = numel.div_ceil(elems_per_thread);
 
-    let cb = queue.new_command_buffer();
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
+    let cb = queue.commandBuffer().unwrap();
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
     enc.set_buffer(
-        silu_gate::GATE_OUT,
+        silu_gate::GATE_OUT as u32,
         Some(gate_out.metal_buffer()),
-        gate_out.offset() as u64,
+        gate_out.offset(),
     );
     enc.set_buffer(
-        silu_gate::UP_OUT,
+        silu_gate::UP_OUT as u32,
         Some(up_out.metal_buffer()),
-        up_out.offset() as u64,
+        up_out.offset(),
     );
     enc.set_buffer(
-        silu_gate::OUT,
+        silu_gate::OUT as u32,
         Some(output.metal_buffer()),
-        output.offset() as u64,
+        output.offset(),
     );
-    enc.set_bytes(
-        silu_gate::NUMEL,
-        4,
-        &numel_u32 as *const u32 as *const std::ffi::c_void,
+    enc.set_val(silu_gate::NUMEL as u32, &numel_u32);
+    let tg = std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), grid_threads);
+    enc.dispatch_threads(
+        MTLSize {
+            width: grid_threads,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg,
+            height: 1,
+            depth: 1,
+        },
     );
-
-    let tg = std::cmp::min(pipeline.max_total_threads_per_threadgroup(), grid_threads);
-    enc.dispatch_threads(MTLSize::new(grid_threads, 1, 1), MTLSize::new(tg, 1, 1));
-    enc.end_encoding();
-    super::commit_with_mode(cb, super::ExecMode::Sync);
+    enc.end();
+    super::commit_with_mode(&cb, super::ExecMode::Sync);
 
     Ok(output)
 }
@@ -165,7 +177,7 @@ pub fn fused_silu_mul_into_cb(
     registry: &KernelRegistry,
     gate_out: &Array,
     up_out: &Array,
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
 ) -> Result<Array, KernelError> {
     if gate_out.shape() != up_out.shape() {
         return Err(KernelError::InvalidShape(format!(
@@ -200,38 +212,45 @@ pub fn fused_silu_mul_into_cb(
     let output = Array::uninit(dev, gate_out.shape(), gate_out.dtype());
     let numel_u32 = numel as u32;
 
-    let elems_per_thread: u64 = match gate_out.dtype() {
+    let elems_per_thread: usize = match gate_out.dtype() {
         DType::Float32 => 2,
         _ => 4,
     };
-    let grid_threads = (numel as u64).div_ceil(elems_per_thread);
+    let grid_threads = numel.div_ceil(elems_per_thread);
 
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
     enc.set_buffer(
-        silu_gate::GATE_OUT,
+        silu_gate::GATE_OUT as u32,
         Some(gate_out.metal_buffer()),
-        gate_out.offset() as u64,
+        gate_out.offset(),
     );
     enc.set_buffer(
-        silu_gate::UP_OUT,
+        silu_gate::UP_OUT as u32,
         Some(up_out.metal_buffer()),
-        up_out.offset() as u64,
+        up_out.offset(),
     );
     enc.set_buffer(
-        silu_gate::OUT,
+        silu_gate::OUT as u32,
         Some(output.metal_buffer()),
-        output.offset() as u64,
+        output.offset(),
     );
-    enc.set_bytes(
-        silu_gate::NUMEL,
-        4,
-        &numel_u32 as *const u32 as *const std::ffi::c_void,
+    enc.set_val(silu_gate::NUMEL as u32, &numel_u32);
+    let tg = std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), grid_threads);
+    enc.dispatch_threads(
+        MTLSize {
+            width: grid_threads,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg,
+            height: 1,
+            depth: 1,
+        },
     );
-
-    let tg = std::cmp::min(pipeline.max_total_threads_per_threadgroup(), grid_threads);
-    enc.dispatch_threads(MTLSize::new(grid_threads, 1, 1), MTLSize::new(tg, 1, 1));
-    enc.end_encoding();
+    enc.end();
 
     Ok(output)
 }
@@ -242,7 +261,7 @@ pub fn fused_silu_mul_into_encoder(
     registry: &KernelRegistry,
     gate_out: &Array,
     up_out: &Array,
-    encoder: &metal::ComputeCommandEncoderRef,
+    encoder: ComputePass<'_>,
 ) -> Result<Array, KernelError> {
     if gate_out.shape() != up_out.shape() {
         return Err(KernelError::InvalidShape(format!(
@@ -277,36 +296,42 @@ pub fn fused_silu_mul_into_encoder(
     let output = Array::uninit(dev, gate_out.shape(), gate_out.dtype());
     let numel_u32 = numel as u32;
 
-    let elems_per_thread: u64 = match gate_out.dtype() {
+    let elems_per_thread: usize = match gate_out.dtype() {
         DType::Float32 => 2,
         _ => 4,
     };
-    let grid_threads = (numel as u64).div_ceil(elems_per_thread);
+    let grid_threads = numel.div_ceil(elems_per_thread);
 
-    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_pipeline(&pipeline);
     encoder.set_buffer(
-        silu_gate::GATE_OUT,
+        silu_gate::GATE_OUT as u32,
         Some(gate_out.metal_buffer()),
-        gate_out.offset() as u64,
+        gate_out.offset(),
     );
     encoder.set_buffer(
-        silu_gate::UP_OUT,
+        silu_gate::UP_OUT as u32,
         Some(up_out.metal_buffer()),
-        up_out.offset() as u64,
+        up_out.offset(),
     );
     encoder.set_buffer(
-        silu_gate::OUT,
+        silu_gate::OUT as u32,
         Some(output.metal_buffer()),
-        output.offset() as u64,
+        output.offset(),
     );
-    encoder.set_bytes(
-        silu_gate::NUMEL,
-        4,
-        &numel_u32 as *const u32 as *const std::ffi::c_void,
+    encoder.set_val(silu_gate::NUMEL as u32, &numel_u32);
+    let tg = std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), grid_threads);
+    encoder.dispatch_threads(
+        MTLSize {
+            width: grid_threads,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg,
+            height: 1,
+            depth: 1,
+        },
     );
-
-    let tg = std::cmp::min(pipeline.max_total_threads_per_threadgroup(), grid_threads);
-    encoder.dispatch_threads(MTLSize::new(grid_threads, 1, 1), MTLSize::new(tg, 1, 1));
 
     Ok(output)
 }
@@ -318,29 +343,36 @@ pub fn fused_silu_mul_into_encoder(
 /// Encode fused SiLU * mul using a pre-resolved PSO and pre-allocated output buffer.
 #[allow(clippy::too_many_arguments)]
 pub fn fused_silu_mul_preresolved_into_encoder(
-    pso: &metal::ComputePipelineState,
-    gate_buf: &metal::BufferRef,
-    gate_offset: u64,
-    up_buf: &metal::BufferRef,
-    up_offset: u64,
-    out_buf: &metal::BufferRef,
-    out_offset: u64,
+    pso: &rmlx_metal::MtlPipeline,
+    gate_buf: &rmlx_metal::MtlBuffer,
+    gate_offset: usize,
+    up_buf: &rmlx_metal::MtlBuffer,
+    up_offset: usize,
+    out_buf: &rmlx_metal::MtlBuffer,
+    out_offset: usize,
     numel: u32,
-    elems_per_thread: u64,
-    encoder: &metal::ComputeCommandEncoderRef,
+    elems_per_thread: usize,
+    encoder: ComputePass<'_>,
 ) {
-    let grid_threads = (numel as u64).div_ceil(elems_per_thread);
-    encoder.set_compute_pipeline_state(pso);
-    encoder.set_buffer(silu_gate::GATE_OUT, Some(gate_buf), gate_offset);
-    encoder.set_buffer(silu_gate::UP_OUT, Some(up_buf), up_offset);
-    encoder.set_buffer(silu_gate::OUT, Some(out_buf), out_offset);
-    encoder.set_bytes(
-        silu_gate::NUMEL,
-        4,
-        &numel as *const u32 as *const std::ffi::c_void,
+    let grid_threads = (numel as usize).div_ceil(elems_per_thread);
+    encoder.set_pipeline(pso);
+    encoder.set_buffer(silu_gate::GATE_OUT as u32, Some(gate_buf), gate_offset);
+    encoder.set_buffer(silu_gate::UP_OUT as u32, Some(up_buf), up_offset);
+    encoder.set_buffer(silu_gate::OUT as u32, Some(out_buf), out_offset);
+    encoder.set_val(silu_gate::NUMEL as u32, &numel);
+    let tg = std::cmp::min(pso.maxTotalThreadsPerThreadgroup(), grid_threads);
+    encoder.dispatch_threads(
+        MTLSize {
+            width: grid_threads,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: tg,
+            height: 1,
+            depth: 1,
+        },
     );
-    let tg = std::cmp::min(pso.max_total_threads_per_threadgroup(), grid_threads);
-    encoder.dispatch_threads(MTLSize::new(grid_threads, 1, 1), MTLSize::new(tg, 1, 1));
 }
 
 /// Get the silu_gate kernel name for a dtype.
@@ -375,7 +407,7 @@ pub fn fused_silu_mul_strided_into_cb(
     registry: &KernelRegistry,
     merged: &Array,
     gate_dim: usize,
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
 ) -> Result<Array, KernelError> {
     if merged.ndim() != 2 {
         return Err(KernelError::InvalidShape(format!(
@@ -404,43 +436,39 @@ pub fn fused_silu_mul_strided_into_cb(
     let seq_len_u32 = seq_len as u32;
 
     // 2D grid: x = ceil(gate_dim / elems_per_thread), y = seq_len
-    let grid_x = (gate_dim as u64).div_ceil(elems_per_thread);
-    let grid_y = seq_len as u64;
+    let grid_x = gate_dim.div_ceil(elems_per_thread as usize);
+    let grid_y = seq_len;
 
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
     enc.set_buffer(
-        silu_gate_strided::MERGED,
+        silu_gate_strided::MERGED as u32,
         Some(merged.metal_buffer()),
-        merged.offset() as u64,
+        merged.offset(),
     );
     enc.set_buffer(
-        silu_gate_strided::OUT,
+        silu_gate_strided::OUT as u32,
         Some(output.metal_buffer()),
-        output.offset() as u64,
+        output.offset(),
     );
-    enc.set_bytes(
-        silu_gate_strided::GATE_DIM,
-        4,
-        &gate_dim_u32 as *const u32 as *const std::ffi::c_void,
-    );
-    enc.set_bytes(
-        silu_gate_strided::TOTAL_DIM,
-        4,
-        &total_dim_u32 as *const u32 as *const std::ffi::c_void,
-    );
-    enc.set_bytes(
-        silu_gate_strided::SEQ_LEN,
-        4,
-        &seq_len_u32 as *const u32 as *const std::ffi::c_void,
-    );
-
-    let grid_size = MTLSize::new(grid_x, grid_y, 1);
-    let max_tg = pipeline.max_total_threads_per_threadgroup();
+    enc.set_val(silu_gate_strided::GATE_DIM as u32, &gate_dim_u32);
+    enc.set_val(silu_gate_strided::TOTAL_DIM as u32, &total_dim_u32);
+    enc.set_val(silu_gate_strided::SEQ_LEN as u32, &seq_len_u32);
+    let grid_size = MTLSize {
+        width: grid_x,
+        height: grid_y,
+        depth: 1,
+    };
+    let max_tg = pipeline.maxTotalThreadsPerThreadgroup();
     let tg_x = std::cmp::min(max_tg, grid_x);
-    let threadgroup_size = MTLSize::new(tg_x, 1, 1);
+    let threadgroup_size = MTLSize {
+        width: tg_x,
+        height: 1,
+        depth: 1,
+    };
     enc.dispatch_threads(grid_size, threadgroup_size);
-    enc.end_encoding();
+    enc.end();
 
     Ok(output)
 }
@@ -454,7 +482,7 @@ pub fn batched_qkv_proj_into(
     wq_t: &Array,
     wk_t: &Array,
     wv_t: &Array,
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
 ) -> Result<(Array, Array, Array), KernelError> {
     // Ensure all inputs are contiguous for the GEMM kernel
     let input = if input.is_contiguous() {
@@ -532,7 +560,7 @@ pub fn batched_gate_up_into_cb(
     input: &Array,
     wgate_t: &Array,
     wup_t: &Array,
-    cb: &metal::CommandBufferRef,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
 ) -> Result<(Array, Array), KernelError> {
     // Ensure all inputs are contiguous for the GEMM kernel
     let input = if input.is_contiguous() {
@@ -611,7 +639,7 @@ pub fn fused_silu_mul_encode(
     registry: &KernelRegistry,
     gate_out: &Array,
     up_out: &Array,
-    encoder: &metal::ComputeCommandEncoderRef,
+    encoder: ComputePass<'_>,
 ) -> Result<Array, KernelError> {
     fused_silu_mul_into_encoder(registry, gate_out, up_out, encoder)
 }
@@ -621,7 +649,7 @@ pub fn fused_silu_mul_strided_encode(
     registry: &KernelRegistry,
     merged: &Array,
     gate_dim: usize,
-    encoder: &metal::ComputeCommandEncoderRef,
+    encoder: ComputePass<'_>,
 ) -> Result<Array, KernelError> {
     if merged.ndim() != 2 {
         return Err(KernelError::InvalidShape(format!(
@@ -649,40 +677,35 @@ pub fn fused_silu_mul_strided_encode(
     let total_dim_u32 = total_dim as u32;
     let seq_len_u32 = seq_len as u32;
 
-    let grid_x = (gate_dim as u64).div_ceil(elems_per_thread);
-    let grid_y = seq_len as u64;
+    let grid_x = gate_dim.div_ceil(elems_per_thread as usize);
+    let grid_y = seq_len;
 
-    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_pipeline(&pipeline);
     encoder.set_buffer(
-        silu_gate_strided::MERGED,
+        silu_gate_strided::MERGED as u32,
         Some(merged.metal_buffer()),
-        merged.offset() as u64,
+        merged.offset(),
     );
     encoder.set_buffer(
-        silu_gate_strided::OUT,
+        silu_gate_strided::OUT as u32,
         Some(output.metal_buffer()),
-        output.offset() as u64,
+        output.offset(),
     );
-    encoder.set_bytes(
-        silu_gate_strided::GATE_DIM,
-        4,
-        &gate_dim_u32 as *const u32 as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        silu_gate_strided::TOTAL_DIM,
-        4,
-        &total_dim_u32 as *const u32 as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        silu_gate_strided::SEQ_LEN,
-        4,
-        &seq_len_u32 as *const u32 as *const std::ffi::c_void,
-    );
-
-    let grid_size = MTLSize::new(grid_x, grid_y, 1);
-    let max_tg = pipeline.max_total_threads_per_threadgroup();
+    encoder.set_val(silu_gate_strided::GATE_DIM as u32, &gate_dim_u32);
+    encoder.set_val(silu_gate_strided::TOTAL_DIM as u32, &total_dim_u32);
+    encoder.set_val(silu_gate_strided::SEQ_LEN as u32, &seq_len_u32);
+    let grid_size = MTLSize {
+        width: grid_x,
+        height: grid_y,
+        depth: 1,
+    };
+    let max_tg = pipeline.maxTotalThreadsPerThreadgroup();
     let tg_x = std::cmp::min(max_tg, grid_x);
-    let threadgroup_size = MTLSize::new(tg_x, 1, 1);
+    let threadgroup_size = MTLSize {
+        width: tg_x,
+        height: 1,
+        depth: 1,
+    };
     encoder.dispatch_threads(grid_size, threadgroup_size);
 
     Ok(output)
@@ -697,7 +720,7 @@ pub fn batched_gate_up_encode(
     input: &Array,
     wgate_t: &Array,
     wup_t: &Array,
-    encoder: &metal::ComputeCommandEncoderRef,
+    encoder: ComputePass<'_>,
 ) -> Result<(Array, Array), KernelError> {
     // Inputs must be contiguous — the encoder variant does not support copy fallback.
     if !input.is_contiguous() {
@@ -763,7 +786,7 @@ fn gemm_pipeline_for_dims(
     m: u32,
     n: u32,
     k: u32,
-) -> Result<metal::ComputePipelineState, KernelError> {
+) -> Result<rmlx_metal::MtlPipeline, KernelError> {
     let kernel_name = gemm_kernel_name_for_dims(dtype, m, n)?;
     let tile = super::matmul::select_tile_config_with_dtype(m as usize, n as usize, 0, dtype);
     if tile.variant == super::matmul::TileVariant::MlxArch
@@ -784,8 +807,8 @@ fn gemm_pipeline_for_dims(
 /// C[M, N] = A[M, K] @ B[K, N]
 #[allow(clippy::too_many_arguments)]
 fn encode_gemm(
-    cb: &metal::CommandBufferRef,
-    pipeline: &metal::ComputePipelineState,
+    cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
+    pipeline: &rmlx_metal::MtlPipeline,
     a: &Array,
     b: &Array,
     c: &Array,
@@ -800,8 +823,8 @@ fn encode_gemm(
 
     let tile =
         super::matmul::select_tile_config_with_dtype(m as usize, n as usize, k as usize, a.dtype());
-    let bm = tile.bm as u64;
-    let bn = tile.bn as u64;
+    let bm = tile.bm as usize;
+    let bn = tile.bn as usize;
 
     let tg_threads = match tile.variant {
         super::matmul::TileVariant::Small => 256_u64,
@@ -815,30 +838,18 @@ fn encode_gemm(
         super::matmul::TileVariant::NaxArch64x64 => 128_u64,
     };
 
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(pipeline);
-    enc.set_buffer(gemm::A, Some(a.metal_buffer()), a.offset() as u64);
-    enc.set_buffer(gemm::B, Some(b.metal_buffer()), b.offset() as u64);
-    enc.set_buffer(gemm::OUT, Some(c.metal_buffer()), c.offset() as u64);
-    enc.set_bytes(gemm::M, 4, &m as *const u32 as *const std::ffi::c_void);
-    enc.set_bytes(gemm::N, 4, &n as *const u32 as *const std::ffi::c_void);
-    enc.set_bytes(gemm::K, 4, &k as *const u32 as *const std::ffi::c_void);
-    enc.set_bytes(
-        gemm::BATCH_STRIDE_A,
-        4,
-        &batch_stride_a as *const u32 as *const std::ffi::c_void,
-    );
-    enc.set_bytes(
-        gemm::BATCH_STRIDE_B,
-        4,
-        &batch_stride_b as *const u32 as *const std::ffi::c_void,
-    );
-    enc.set_bytes(
-        gemm::BATCH_STRIDE_C,
-        4,
-        &batch_stride_c as *const u32 as *const std::ffi::c_void,
-    );
-
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(pipeline);
+    enc.set_buffer(gemm::A as u32, Some(a.metal_buffer()), a.offset());
+    enc.set_buffer(gemm::B as u32, Some(b.metal_buffer()), b.offset());
+    enc.set_buffer(gemm::OUT as u32, Some(c.metal_buffer()), c.offset());
+    enc.set_val(gemm::M as u32, &m);
+    enc.set_val(gemm::N as u32, &n);
+    enc.set_val(gemm::K as u32, &k);
+    enc.set_val(gemm::BATCH_STRIDE_A as u32, &batch_stride_a);
+    enc.set_val(gemm::BATCH_STRIDE_B as u32, &batch_stride_b);
+    enc.set_val(gemm::BATCH_STRIDE_C as u32, &batch_stride_c);
     // Full, Skinny, and MlxArch kernels require swizzle_log
     let swizzle_log = if matches!(
         tile.variant,
@@ -849,22 +860,26 @@ fn encode_gemm(
             | super::matmul::TileVariant::MlxArchMicro
     ) {
         let s = super::matmul::compute_swizzle_log(m as usize, n as usize, tile.bm, tile.bn);
-        enc.set_bytes(
-            gemm::SWIZZLE_LOG,
-            4,
-            &s as *const u32 as *const std::ffi::c_void,
-        );
+        enc.set_val(gemm::SWIZZLE_LOG as u32, &s);
         s
     } else {
         0
     };
 
-    let grid_x = ((n as u64).div_ceil(bn)) << swizzle_log;
-    let grid_y = ((m as u64).div_ceil(bm)) >> swizzle_log;
-    let grid = MTLSize::new(grid_x, grid_y, 1);
-    let tg = MTLSize::new(tg_threads, 1, 1);
-    enc.dispatch_thread_groups(grid, tg);
-    enc.end_encoding();
+    let grid_x = ((n as usize).div_ceil(bn)) << swizzle_log;
+    let grid_y = ((m as usize).div_ceil(bm)) >> swizzle_log;
+    let grid = MTLSize {
+        width: grid_x,
+        height: grid_y,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: tg_threads as usize,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_threadgroups(grid, tg);
+    enc.end();
 
     Ok(())
 }
@@ -872,7 +887,7 @@ fn encode_gemm(
 fn ensure_contiguous(
     array: &Array,
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<Array, KernelError> {
     if array.is_contiguous() {
         Ok(array.view(
@@ -899,15 +914,15 @@ fn ensure_contiguous(
 //   5: bias [M]         — residual (h_buf)
 
 /// Threadgroup size used for fused SwiGLU+down dispatch.
-const FUSED_SWIGLU_DOWN_TG_SIZE: u64 = 256;
+const FUSED_SWIGLU_DOWN_TG_SIZE: usize = 256;
 /// Number of rows processed per threadgroup (tile-M).
-const FUSED_TM: u64 = 4;
+const FUSED_TM: usize = 4;
 /// Number of simdgroups per threadgroup for the BM=8 variant.
-const FUSED_BM8: u64 = 8;
+const FUSED_BM8: usize = 8;
 /// Rows per threadgroup in BM=8 mode: BM8 * TM = 32.
-const FUSED_BM8_ROWS: u64 = FUSED_BM8 * FUSED_TM;
+const FUSED_BM8_ROWS: usize = FUSED_BM8 * FUSED_TM;
 /// Minimum M to use BM=8 variant.
-const FUSED_BM8_THRESHOLD: u64 = 256;
+const FUSED_BM8_THRESHOLD: usize = 256;
 
 pub const FUSED_SWIGLU_DOWN_SHADER_SOURCE: &str = r#"
 #include <metal_stdlib>
@@ -1358,7 +1373,7 @@ kernel void fused_swiglu_down_bm8_bf16(
 ///
 /// Returns the BM8 variant for M >= 256, regular variant otherwise.
 pub fn fused_swiglu_down_kernel_name(dtype: DType, m: u32) -> Result<&'static str, KernelError> {
-    let use_bm8 = (m as u64) >= FUSED_BM8_THRESHOLD;
+    let use_bm8 = (m as usize) >= FUSED_BM8_THRESHOLD;
     match (dtype, use_bm8) {
         (DType::Float32, true) => Ok("fused_swiglu_down_bm8_f32"),
         (DType::Float32, false) => Ok("fused_swiglu_down_f32"),
@@ -1376,24 +1391,39 @@ pub fn fused_swiglu_down_kernel_name(dtype: DType, m: u32) -> Result<&'static st
 /// Compute dispatch grid and threadgroup sizes for fused SwiGLU+down with given M.
 pub fn fused_swiglu_down_dispatch_sizes(
     m: u32,
-    pso: &metal::ComputePipelineState,
-) -> (metal::MTLSize, metal::MTLSize) {
-    let use_bm8 = (m as u64) >= FUSED_BM8_THRESHOLD;
+    pso: &rmlx_metal::MtlPipeline,
+) -> (MTLSize, MTLSize) {
+    let use_bm8 = (m as usize) >= FUSED_BM8_THRESHOLD;
     let num_threadgroups = if use_bm8 {
-        fused_ceil_div(m as u64, FUSED_BM8_ROWS)
+        fused_ceil_div(m as usize, FUSED_BM8_ROWS)
     } else {
-        fused_ceil_div(m as u64, FUSED_TM)
+        fused_ceil_div(m as usize, FUSED_TM)
     };
     let tg_dim = if use_bm8 {
-        MTLSize::new(32, 1, FUSED_BM8)
+        MTLSize {
+            width: 32,
+            height: 1,
+            depth: FUSED_BM8,
+        }
     } else {
         let tg_size = std::cmp::min(
             FUSED_SWIGLU_DOWN_TG_SIZE,
-            pso.max_total_threads_per_threadgroup(),
+            pso.maxTotalThreadsPerThreadgroup(),
         );
-        MTLSize::new(tg_size, 1, 1)
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        }
     };
-    (MTLSize::new(num_threadgroups, 1, 1), tg_dim)
+    (
+        MTLSize {
+            width: num_threadgroups,
+            height: 1,
+            depth: 1,
+        },
+        tg_dim,
+    )
 }
 
 /// Encode fused SwiGLU+down using a pre-resolved PSO and pre-allocated buffers.
@@ -1407,41 +1437,33 @@ pub fn fused_swiglu_down_dispatch_sizes(
 /// - 5: bias [M]       (residual / h_buf)
 #[allow(clippy::too_many_arguments)]
 pub fn fused_swiglu_down_preresolved_into_encoder(
-    pso: &metal::ComputePipelineState,
-    mat_buf: &metal::BufferRef,
-    mat_offset: u64,
-    gate_up_buf: &metal::BufferRef,
-    gate_up_offset: u64,
-    out_buf: &metal::BufferRef,
-    out_offset: u64,
+    pso: &rmlx_metal::MtlPipeline,
+    mat_buf: &rmlx_metal::MtlBuffer,
+    mat_offset: usize,
+    gate_up_buf: &rmlx_metal::MtlBuffer,
+    gate_up_offset: usize,
+    out_buf: &rmlx_metal::MtlBuffer,
+    out_offset: usize,
     m: u32,
     k: u32,
-    bias_buf: &metal::BufferRef,
-    bias_offset: u64,
-    grid: metal::MTLSize,
-    tg: metal::MTLSize,
-    encoder: &metal::ComputeCommandEncoderRef,
+    bias_buf: &rmlx_metal::MtlBuffer,
+    bias_offset: usize,
+    grid: MTLSize,
+    tg: MTLSize,
+    encoder: ComputePass<'_>,
 ) {
-    encoder.set_compute_pipeline_state(pso);
-    encoder.set_buffer(fused_swiglu_down::MAT, Some(mat_buf), mat_offset);
+    encoder.set_pipeline(pso);
+    encoder.set_buffer(fused_swiglu_down::MAT as u32, Some(mat_buf), mat_offset);
     encoder.set_buffer(
-        fused_swiglu_down::GATE_UP,
+        fused_swiglu_down::GATE_UP as u32,
         Some(gate_up_buf),
         gate_up_offset,
     );
-    encoder.set_buffer(fused_swiglu_down::OUT, Some(out_buf), out_offset);
-    encoder.set_bytes(
-        fused_swiglu_down::M,
-        4,
-        &m as *const u32 as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        fused_swiglu_down::K,
-        4,
-        &k as *const u32 as *const std::ffi::c_void,
-    );
-    encoder.set_buffer(fused_swiglu_down::BIAS, Some(bias_buf), bias_offset);
-    encoder.dispatch_thread_groups(grid, tg);
+    encoder.set_buffer(fused_swiglu_down::OUT as u32, Some(out_buf), out_offset);
+    encoder.set_val(fused_swiglu_down::M as u32, &m);
+    encoder.set_val(fused_swiglu_down::K as u32, &k);
+    encoder.set_buffer(fused_swiglu_down::BIAS as u32, Some(bias_buf), bias_offset);
+    encoder.dispatch_threadgroups(grid, tg);
 }
 
 /// Register all fused kernel shaders with the kernel registry.
@@ -1453,7 +1475,7 @@ pub fn register_fused_kernels(registry: &KernelRegistry) -> Result<(), KernelErr
 
 /// Compute ceil(a / b) for unsigned integers.
 #[allow(clippy::manual_div_ceil)]
-fn fused_ceil_div(a: u64, b: u64) -> u64 {
+fn fused_ceil_div(a: usize, b: usize) -> usize {
     (a + b - 1) / b
 }
 
@@ -1476,7 +1498,7 @@ fn fused_ceil_div(a: u64, b: u64) -> u64 {
 //   7: w_stride (u32)    — norm weight stride (usually 1)
 
 /// Threadgroup size used for fused RMS-norm + GEMV dispatch.
-const FUSED_RMS_GEMV_TG_SIZE: u64 = 256;
+const FUSED_RMS_GEMV_TG_SIZE: usize = 256;
 
 pub const FUSED_RMS_GEMV_SHADER_SOURCE: &str = r#"
 #include <metal_stdlib>
@@ -2103,7 +2125,7 @@ kernel void fused_rms_gemv_bm8_bf16(
 ///
 /// Returns the BM8 variant for M >= 256, regular variant otherwise.
 pub fn fused_rms_gemv_kernel_name(dtype: DType, m: u32) -> Result<&'static str, KernelError> {
-    let use_bm8 = (m as u64) >= FUSED_BM8_THRESHOLD;
+    let use_bm8 = (m as usize) >= FUSED_BM8_THRESHOLD;
     match (dtype, use_bm8) {
         (DType::Float32, true) => Ok("fused_rms_gemv_bm8_f32"),
         (DType::Float32, false) => Ok("fused_rms_gemv_f32"),
@@ -2119,26 +2141,35 @@ pub fn fused_rms_gemv_kernel_name(dtype: DType, m: u32) -> Result<&'static str, 
 }
 
 /// Compute dispatch grid and threadgroup sizes for fused RMS-norm + GEMV.
-pub fn fused_rms_gemv_dispatch_sizes(
-    m: u32,
-    pso: &metal::ComputePipelineState,
-) -> (metal::MTLSize, metal::MTLSize) {
-    let use_bm8 = (m as u64) >= FUSED_BM8_THRESHOLD;
+pub fn fused_rms_gemv_dispatch_sizes(m: u32, pso: &rmlx_metal::MtlPipeline) -> (MTLSize, MTLSize) {
+    let use_bm8 = (m as usize) >= FUSED_BM8_THRESHOLD;
     let num_threadgroups = if use_bm8 {
-        fused_ceil_div(m as u64, FUSED_BM8_ROWS)
+        fused_ceil_div(m as usize, FUSED_BM8_ROWS)
     } else {
-        fused_ceil_div(m as u64, FUSED_TM)
+        fused_ceil_div(m as usize, FUSED_TM)
     };
     let tg_dim = if use_bm8 {
-        MTLSize::new(32, 1, FUSED_BM8)
+        MTLSize {
+            width: 32,
+            height: 1,
+            depth: FUSED_BM8,
+        }
     } else {
-        let tg_size = std::cmp::min(
-            FUSED_RMS_GEMV_TG_SIZE,
-            pso.max_total_threads_per_threadgroup(),
-        );
-        MTLSize::new(tg_size, 1, 1)
+        let tg_size = std::cmp::min(FUSED_RMS_GEMV_TG_SIZE, pso.maxTotalThreadsPerThreadgroup());
+        MTLSize {
+            width: tg_size,
+            height: 1,
+            depth: 1,
+        }
     };
-    (MTLSize::new(num_threadgroups, 1, 1), tg_dim)
+    (
+        MTLSize {
+            width: num_threadgroups,
+            height: 1,
+            depth: 1,
+        },
+        tg_dim,
+    )
 }
 
 /// Encode fused RMS-norm + GEMV using a pre-resolved PSO and pre-allocated buffers.
@@ -2154,49 +2185,37 @@ pub fn fused_rms_gemv_dispatch_sizes(
 /// - 7: w_stride (u32)
 #[allow(clippy::too_many_arguments)]
 pub fn fused_rms_gemv_preresolved_into_encoder(
-    pso: &metal::ComputePipelineState,
-    input_buf: &metal::BufferRef,
-    input_offset: u64,
-    norm_w_buf: &metal::BufferRef,
-    norm_w_offset: u64,
-    mat_buf: &metal::BufferRef,
-    mat_offset: u64,
-    out_buf: &metal::BufferRef,
-    out_offset: u64,
+    pso: &rmlx_metal::MtlPipeline,
+    input_buf: &rmlx_metal::MtlBuffer,
+    input_offset: usize,
+    norm_w_buf: &rmlx_metal::MtlBuffer,
+    norm_w_offset: usize,
+    mat_buf: &rmlx_metal::MtlBuffer,
+    mat_offset: usize,
+    out_buf: &rmlx_metal::MtlBuffer,
+    out_offset: usize,
     m: u32,
     k: u32,
     eps: f32,
     w_stride: u32,
-    grid: metal::MTLSize,
-    tg: metal::MTLSize,
-    encoder: &metal::ComputeCommandEncoderRef,
+    grid: MTLSize,
+    tg: MTLSize,
+    encoder: ComputePass<'_>,
 ) {
-    encoder.set_compute_pipeline_state(pso);
-    encoder.set_buffer(fused_rms_gemv::INPUT, Some(input_buf), input_offset);
-    encoder.set_buffer(fused_rms_gemv::NORM_W, Some(norm_w_buf), norm_w_offset);
-    encoder.set_buffer(fused_rms_gemv::MAT, Some(mat_buf), mat_offset);
-    encoder.set_buffer(fused_rms_gemv::OUT, Some(out_buf), out_offset);
-    encoder.set_bytes(
-        fused_rms_gemv::M,
-        4,
-        &m as *const u32 as *const std::ffi::c_void,
+    encoder.set_pipeline(pso);
+    encoder.set_buffer(fused_rms_gemv::INPUT as u32, Some(input_buf), input_offset);
+    encoder.set_buffer(
+        fused_rms_gemv::NORM_W as u32,
+        Some(norm_w_buf),
+        norm_w_offset,
     );
-    encoder.set_bytes(
-        fused_rms_gemv::K,
-        4,
-        &k as *const u32 as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        fused_rms_gemv::EPS,
-        4,
-        &eps as *const f32 as *const std::ffi::c_void,
-    );
-    encoder.set_bytes(
-        fused_rms_gemv::W_STRIDE,
-        4,
-        &w_stride as *const u32 as *const std::ffi::c_void,
-    );
-    encoder.dispatch_thread_groups(grid, tg);
+    encoder.set_buffer(fused_rms_gemv::MAT as u32, Some(mat_buf), mat_offset);
+    encoder.set_buffer(fused_rms_gemv::OUT as u32, Some(out_buf), out_offset);
+    encoder.set_val(fused_rms_gemv::M as u32, &m);
+    encoder.set_val(fused_rms_gemv::K as u32, &k);
+    encoder.set_val(fused_rms_gemv::EPS as u32, &eps);
+    encoder.set_val(fused_rms_gemv::W_STRIDE as u32, &w_stride);
+    encoder.dispatch_threadgroups(grid, tg);
 }
 
 #[cfg(test)]
@@ -2205,15 +2224,14 @@ mod tests {
 
     #[test]
     fn test_fused_silu_mul_shape_validation() {
-        let device = metal::Device::system_default().expect("Metal device");
-        let queue = device.new_command_queue();
-        let registry = KernelRegistry::new(
-            rmlx_metal::device::GpuDevice::system_default().expect("GPU device"),
-        );
+        let gpu = crate::test_utils::require_gpu!();
+        let queue = gpu.new_command_queue();
+        let registry = KernelRegistry::new(gpu);
         super::super::silu::register(&registry).ok();
+        let device = registry.device().raw();
 
-        let a = Array::from_slice(&device, &[1.0f32, 2.0, 3.0], vec![3]);
-        let b = Array::from_slice(&device, &[1.0f32, 2.0], vec![2]);
+        let a = Array::from_slice(device, &[1.0f32, 2.0, 3.0], vec![3]);
+        let b = Array::from_slice(device, &[1.0f32, 2.0], vec![2]);
 
         let result = fused_silu_mul(&registry, &a, &b, &queue);
         assert!(result.is_err());

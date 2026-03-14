@@ -11,7 +11,7 @@
 use std::sync::Mutex;
 
 use rmlx_metal::device::GpuDevice;
-use rmlx_metal::metal::Buffer as MetalBuffer;
+use rmlx_metal::MtlBuffer;
 
 /// Maximum allocation size served by the small-buffer pool.
 pub const MAX_SMALL_ALLOC: usize = 256;
@@ -29,7 +29,7 @@ pub struct SmallAllocation {
     /// Requested size (may be smaller than slot size).
     pub size: usize,
     /// Clone of the backing buffer (same MTLBuffer, different Rust handle).
-    pub buffer: Option<MetalBuffer>,
+    pub buffer: Option<MtlBuffer>,
 }
 
 impl SmallAllocation {
@@ -53,7 +53,7 @@ struct PoolInner {
 /// less Metal driver overhead.
 pub struct SmallBufferPool {
     /// The single backing Metal buffer.
-    backing_buffer: MetalBuffer,
+    backing_buffer: MtlBuffer,
     /// Slot size in bytes (= `MAX_SMALL_ALLOC`).
     slot_size: usize,
     /// Total number of slots.
@@ -132,7 +132,7 @@ impl SmallBufferPool {
     }
 
     /// The single backing Metal buffer.
-    pub fn buffer(&self) -> &MetalBuffer {
+    pub fn buffer(&self) -> &MtlBuffer {
         &self.backing_buffer
     }
 
@@ -170,6 +170,7 @@ impl SmallBufferPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use objc2_metal::MTLBuffer as _;
 
     #[test]
     fn test_small_buffer_pool_basic() {
@@ -210,8 +211,8 @@ mod tests {
 
         // All allocations share the same backing buffer
         assert_eq!(
-            a1.buffer.as_ref().unwrap().gpu_address(),
-            a4.buffer.as_ref().unwrap().gpu_address(),
+            a1.buffer.as_ref().unwrap().gpuAddress(),
+            a4.buffer.as_ref().unwrap().gpuAddress(),
         );
 
         pool.free(a1);

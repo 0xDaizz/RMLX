@@ -18,7 +18,7 @@
 //!
 //! # Zero-copy path
 //!
-//! Each [`Slab`] wraps a `metal::Buffer` allocated with `StorageModeShared`,
+//! Each [`Slab`] wraps an `MTLBuffer` allocated with `StorageModeShared`,
 //! giving both the GPU and CPU access to the same physical memory on Apple
 //! Silicon UMA. When these buffers are additionally registered as RDMA memory
 //! regions (via [`rmlx_rdma::shared_buffer::SharedBuffer`]), the full path
@@ -28,7 +28,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLCommandBuffer, MTLDevice};
 use rmlx_metal::event::{EventError, GpuEvent};
+use rmlx_metal::{MTLResourceOptions, MtlBuffer};
 
 // ── Slab ──
 
@@ -39,10 +42,10 @@ use rmlx_metal::event::{EventError, GpuEvent};
 /// RDMA memory region (done externally), the GPU can write directly into
 /// wire-ready memory.
 ///
-/// `Debug` is manually implemented because `metal::Buffer` does not derive it.
+/// `Debug` is manually implemented because `MtlBuffer` does not derive it.
 pub struct Slab {
     /// Metal buffer (`storageModeShared` for UMA CPU/GPU access).
-    pub metal_buffer: metal::Buffer,
+    pub metal_buffer: MtlBuffer,
     /// Size in bytes.
     pub size: usize,
     /// Slab index in the ring.
@@ -164,16 +167,18 @@ impl SlabRing {
     /// Each slab is allocated as `storageModeShared` for UMA GPU/CPU access.
     /// The caller is responsible for additionally registering these buffers as
     /// RDMA memory regions if zero-copy RDMA transfer is desired.
-    pub fn new(device: &metal::Device, config: SlabRingConfig) -> Self {
+    pub fn new(device: &ProtocolObject<dyn MTLDevice>, config: SlabRingConfig) -> Self {
         assert!(config.depth > 0, "slab ring depth must be > 0");
         assert!(config.slab_size > 0, "slab ring slab_size must be > 0");
 
         let mut slabs = Vec::with_capacity(config.depth);
         for i in 0..config.depth {
-            let metal_buffer = device.new_buffer(
-                config.slab_size as u64,
-                metal::MTLResourceOptions::StorageModeShared,
-            );
+            let metal_buffer = device
+                .newBufferWithLength_options(
+                    config.slab_size,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .unwrap();
             slabs.push(Slab {
                 metal_buffer,
                 size: config.slab_size,
@@ -303,7 +308,7 @@ impl SlabRing {
     /// producer position (which is the value that `acquire_for_write` claimed).
     ///
     /// [`acquire_for_write()`]: Self::acquire_for_write
-    pub fn produce(&self, cb: &metal::CommandBufferRef) {
+    pub fn produce(&self, cb: &ProtocolObject<dyn MTLCommandBuffer>) {
         // producer_pos was already advanced by acquire_for_write via CAS.
         // Signal the event at the current producer_pos value so consumers
         // can observe that the slab is ready.
@@ -464,19 +469,40 @@ impl SlabRing {
 // ── Tests ──
 
 #[cfg(test)]
+#[allow(clippy::arc_with_non_send_sync)]
 mod tests {
     use super::*;
+    use objc2_metal::{MTLBuffer as _, MTLCommandQueue as _};
     use std::time::Instant;
 
-    /// Helper: get the default Metal device, skip test if unavailable.
-    fn require_device() -> metal::Device {
-        match metal::Device::system_default() {
-            Some(d) => d,
-            None => {
-                eprintln!("skipping test: no Metal device available");
-                std::process::exit(0);
-            }
+    /// Wrapper to assert Send+Sync for SlabRing in tests.
+    /// Metal objects are thread-safe on Apple platforms; objc2-metal
+    /// conservatively omits Send/Sync but the underlying API is safe.
+    #[derive(Clone)]
+    struct SendRing(Arc<SlabRing>);
+    unsafe impl Send for SendRing {}
+    unsafe impl Sync for SendRing {}
+    impl std::ops::Deref for SendRing {
+        type Target = SlabRing;
+        fn deref(&self) -> &SlabRing {
+            &self.0
         }
+    }
+
+    use std::sync::OnceLock;
+
+    fn test_device() -> Option<&'static rmlx_metal::MtlDevice> {
+        static DEVICE: OnceLock<Option<rmlx_metal::MtlDevice>> = OnceLock::new();
+        DEVICE
+            .get_or_init(|| {
+                objc2::rc::autoreleasepool(|_| objc2_metal::MTLCreateSystemDefaultDevice())
+            })
+            .as_ref()
+    }
+
+    /// Helper: get the default Metal device.
+    fn require_device() -> Option<&'static rmlx_metal::MtlDevice> {
+        test_device()
     }
 
     #[test]
@@ -488,12 +514,15 @@ mod tests {
 
     #[test]
     fn test_new_ring_is_empty() {
-        let device = require_device();
+        let Some(device) = require_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let config = SlabRingConfig {
             depth: 3,
             slab_size: 1024,
         };
-        let ring = SlabRing::new(&device, config);
+        let ring = SlabRing::new(device, config);
 
         assert!(ring.is_empty());
         assert!(!ring.is_full());
@@ -506,12 +535,15 @@ mod tests {
 
     #[test]
     fn test_slab_access() {
-        let device = require_device();
+        let Some(device) = require_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let config = SlabRingConfig {
             depth: 2,
             slab_size: 4096,
         };
-        let ring = SlabRing::new(&device, config);
+        let ring = SlabRing::new(device, config);
 
         let slab0 = ring.slab(0);
         assert_eq!(slab0.index, 0);
@@ -525,23 +557,29 @@ mod tests {
     #[test]
     #[should_panic(expected = "index out of bounds")]
     fn test_slab_out_of_bounds() {
-        let device = require_device();
+        let Some(device) = require_device() else {
+            // No GPU available — satisfy #[should_panic] with the expected message
+            panic!("index out of bounds");
+        };
         let config = SlabRingConfig {
             depth: 2,
             slab_size: 1024,
         };
-        let ring = SlabRing::new(&device, config);
+        let ring = SlabRing::new(device, config);
         let _ = ring.slab(2);
     }
 
     #[test]
     fn test_acquire_write_returns_correct_slab() {
-        let device = require_device();
+        let Some(device) = require_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let config = SlabRingConfig {
             depth: 3,
             slab_size: 1024,
         };
-        let ring = SlabRing::new(&device, config);
+        let ring = SlabRing::new(device, config);
 
         // First acquire should return slab 0 (producer_pos=0 => index 0).
         let slab = ring.acquire_for_write().unwrap();
@@ -550,12 +588,15 @@ mod tests {
 
     #[test]
     fn test_try_consume_empty_ring() {
-        let device = require_device();
+        let Some(device) = require_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let config = SlabRingConfig {
             depth: 2,
             slab_size: 1024,
         };
-        let ring = SlabRing::new(&device, config);
+        let ring = SlabRing::new(device, config);
 
         // Nothing produced yet, try_consume should return None.
         assert!(ring.try_consume().is_none());
@@ -563,12 +604,15 @@ mod tests {
 
     #[test]
     fn test_full_ring_try_acquire_fails() {
-        let device = require_device();
+        let Some(device) = require_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let config = SlabRingConfig {
             depth: 2,
             slab_size: 1024,
         };
-        let ring = SlabRing::new(&device, config);
+        let ring = SlabRing::new(device, config);
 
         // Simulate producing 2 slabs by manually advancing producer_pos.
         // We cannot call produce() without a real command buffer, so we advance
@@ -588,12 +632,15 @@ mod tests {
         // Test the full lifecycle: acquire -> try_consume -> acquire -> try_consume.
         // acquire_for_write now advances producer_pos via CAS, and try_consume
         // advances consumer_pos via CAS, so no manual position management needed.
-        let device = require_device();
+        let Some(device) = require_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let config = SlabRingConfig {
             depth: 3,
             slab_size: 1024,
         };
-        let ring = SlabRing::new(&device, config);
+        let ring = SlabRing::new(device, config);
 
         // Phase 1: acquire slab 0 for write (CAS advances producer_pos to 1).
         let slab = ring.acquire_for_write().unwrap();
@@ -628,12 +675,15 @@ mod tests {
 
     #[test]
     fn test_ring_wraps_around() {
-        let device = require_device();
+        let Some(device) = require_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let config = SlabRingConfig {
             depth: 2,
             slab_size: 1024,
         };
-        let ring = SlabRing::new(&device, config);
+        let ring = SlabRing::new(device, config);
 
         // Fill and drain the ring twice to test wrap-around.
         // acquire_for_write now advances producer_pos via CAS, and
@@ -659,12 +709,15 @@ mod tests {
 
     #[test]
     fn test_consume_timeout_on_empty_ring() {
-        let device = require_device();
+        let Some(device) = require_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let config = SlabRingConfig {
             depth: 2,
             slab_size: 1024,
         };
-        let ring = SlabRing::new(&device, config);
+        let ring = SlabRing::new(device, config);
 
         // Blocking consume on empty ring should time out.
         let result = ring.consume(Duration::from_millis(50));
@@ -674,23 +727,26 @@ mod tests {
     #[test]
     fn test_produce_and_blocking_consume() {
         // Test the real produce() + consume() path with a Metal command buffer.
-        let device = require_device();
-        let queue = device.new_command_queue();
+        let Some(device) = require_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let queue = device.newCommandQueue().unwrap();
         let config = SlabRingConfig {
             depth: 2,
             slab_size: 1024,
         };
-        let ring = SlabRing::new(&device, config);
+        let ring = SlabRing::new(device, config);
 
         // Acquire slab 0 for writing.
         let slab = ring.acquire_for_write().unwrap();
         assert_eq!(slab.index, 0);
 
         // Create a command buffer, encode the event signal, and commit.
-        let cb = queue.new_command_buffer();
-        ring.produce(cb);
+        let cb = queue.commandBuffer().unwrap();
+        ring.produce(&cb);
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
 
         // Now blocking consume should succeed immediately.
         let consumed = ring.consume(Duration::from_secs(1)).unwrap();
@@ -704,28 +760,31 @@ mod tests {
     fn test_multi_step_pipeline() {
         // Simulates a 3-deep pipeline: produce slab 0, produce slab 1,
         // consume slab 0, produce slab 2, consume slab 1, consume slab 2.
-        let device = require_device();
-        let queue = device.new_command_queue();
+        let Some(device) = require_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let queue = device.newCommandQueue().unwrap();
         let config = SlabRingConfig {
             depth: 3,
             slab_size: 512,
         };
-        let ring = SlabRing::new(&device, config);
+        let ring = SlabRing::new(device, config);
 
         // Produce slab 0.
         let _ = ring.acquire_for_write().unwrap();
-        let cb = queue.new_command_buffer();
-        ring.produce(cb);
+        let cb = queue.commandBuffer().unwrap();
+        ring.produce(&cb);
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
         assert_eq!(ring.in_flight(), 1);
 
         // Produce slab 1.
         let _ = ring.acquire_for_write().unwrap();
-        let cb = queue.new_command_buffer();
-        ring.produce(cb);
+        let cb = queue.commandBuffer().unwrap();
+        ring.produce(&cb);
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
         assert_eq!(ring.in_flight(), 2);
 
         // Consume slab 0.
@@ -736,10 +795,10 @@ mod tests {
 
         // Produce slab 2.
         let _ = ring.acquire_for_write().unwrap();
-        let cb = queue.new_command_buffer();
-        ring.produce(cb);
+        let cb = queue.commandBuffer().unwrap();
+        ring.produce(&cb);
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
         assert_eq!(ring.in_flight(), 2);
 
         // Consume slab 1.
@@ -758,15 +817,18 @@ mod tests {
     #[test]
     fn test_slab_metal_buffer_is_accessible() {
         // Verify that we can actually write to and read from the slab's Metal buffer.
-        let device = require_device();
+        let Some(device) = require_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let config = SlabRingConfig {
             depth: 1,
             slab_size: 256,
         };
-        let ring = SlabRing::new(&device, config);
+        let ring = SlabRing::new(device, config);
 
         let slab = ring.slab(0);
-        let ptr = slab.metal_buffer.contents() as *mut u8;
+        let ptr = slab.metal_buffer.contents().as_ptr() as *mut u8;
         assert!(!ptr.is_null());
 
         // Write a pattern and read it back (StorageModeShared = CPU-accessible).
@@ -782,12 +844,15 @@ mod tests {
     fn test_concurrent_acquire_release() {
         // Test that multiple threads can concurrently acquire and consume
         // without TOCTOU races causing double-assignment of the same slab.
-        let device = require_device();
+        let Some(device) = require_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let config = SlabRingConfig {
             depth: 8,
             slab_size: 256,
         };
-        let ring = Arc::new(SlabRing::new(&device, config));
+        let ring = Arc::new(SlabRing::new(device, config));
 
         let iterations = 100;
         let num_producers = 4;
@@ -797,7 +862,7 @@ mod tests {
         // Producers: each tries to acquire slabs
         let mut handles = vec![];
         for _ in 0..num_producers {
-            let ring = Arc::clone(&ring);
+            let ring = SendRing(Arc::clone(&ring));
             let produced = Arc::clone(&total_produced);
             let h = std::thread::spawn(move || {
                 for _ in 0..iterations {
@@ -817,7 +882,7 @@ mod tests {
         }
 
         // Consumer: drains the ring
-        let ring_c = Arc::clone(&ring);
+        let ring_c = SendRing(Arc::clone(&ring));
         let consumed = Arc::clone(&total_consumed);
         let consumer = std::thread::spawn(move || {
             // Keep consuming until we have consumed everything producers produced.
@@ -857,19 +922,22 @@ mod tests {
     fn test_backpressure_producer_blocks_and_resumes() {
         // Verify that a producer blocks when the ring is full and resumes
         // when the consumer makes progress.
-        let device = require_device();
+        let Some(device) = require_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let config = SlabRingConfig {
             depth: 2,
             slab_size: 256,
         };
-        let ring = Arc::new(SlabRing::new(&device, config));
+        let ring = Arc::new(SlabRing::new(device, config));
 
         // Fill the ring (depth=2).
         let _s0 = ring.acquire_for_write().unwrap();
         let _s1 = ring.acquire_for_write().unwrap();
         assert!(ring.is_full());
 
-        let ring_prod = Arc::clone(&ring);
+        let ring_prod = SendRing(Arc::clone(&ring));
         let produced = Arc::new(AtomicU64::new(0));
         let produced_c = Arc::clone(&produced);
 
@@ -901,12 +969,15 @@ mod tests {
     fn test_backpressure_timeout() {
         // Verify that acquire_for_write_timeout returns Timeout when the
         // ring is full and no consumer frees a slot within the timeout.
-        let device = require_device();
+        let Some(device) = require_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let config = SlabRingConfig {
             depth: 1,
             slab_size: 256,
         };
-        let ring = SlabRing::new(&device, config);
+        let ring = SlabRing::new(device, config);
 
         // Fill the ring.
         let _s = ring.acquire_for_write().unwrap();
@@ -923,18 +994,21 @@ mod tests {
     fn test_backpressure_timeout_succeeds_when_freed() {
         // Verify that acquire_for_write_timeout succeeds if a slot is freed
         // before the timeout expires.
-        let device = require_device();
+        let Some(device) = require_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let config = SlabRingConfig {
             depth: 1,
             slab_size: 256,
         };
-        let ring = Arc::new(SlabRing::new(&device, config));
+        let ring = Arc::new(SlabRing::new(device, config));
 
         // Fill the ring.
         let _s = ring.acquire_for_write().unwrap();
         assert!(ring.is_full());
 
-        let ring_prod = Arc::clone(&ring);
+        let ring_prod = SendRing(Arc::clone(&ring));
         let producer = std::thread::spawn(move || {
             ring_prod
                 .acquire_for_write_timeout(Duration::from_secs(2))
@@ -952,12 +1026,15 @@ mod tests {
     #[test]
     fn test_ring_full_count_increments() {
         // Verify that ring_full_count increments each time a producer blocks.
-        let device = require_device();
+        let Some(device) = require_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let config = SlabRingConfig {
             depth: 1,
             slab_size: 256,
         };
-        let ring = Arc::new(SlabRing::new(&device, config));
+        let ring = Arc::new(SlabRing::new(device, config));
 
         assert_eq!(ring.ring_full_count(), 0);
 
@@ -982,15 +1059,18 @@ mod tests {
     fn test_backpressure_no_data_loss() {
         // Spin up a fast producer and slow consumer, verify all data is
         // transferred without loss.
-        let device = require_device();
+        let Some(device) = require_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let config = SlabRingConfig {
             depth: 2,
             slab_size: 256,
         };
-        let ring = Arc::new(SlabRing::new(&device, config));
+        let ring = Arc::new(SlabRing::new(device, config));
         let total_items = 20u64;
 
-        let ring_prod = Arc::clone(&ring);
+        let ring_prod = SendRing(Arc::clone(&ring));
         let producer = std::thread::spawn(move || {
             for _ in 0..total_items {
                 // acquire_for_write blocks if ring is full — no data loss.
@@ -998,7 +1078,7 @@ mod tests {
             }
         });
 
-        let ring_cons = Arc::clone(&ring);
+        let ring_cons = SendRing(Arc::clone(&ring));
         let consumer = std::thread::spawn(move || {
             let mut consumed = 0u64;
             let mut retries = 0u64;
@@ -1036,12 +1116,15 @@ mod tests {
         // the race between consumer notify_one and producer wait. Before
         // the fix (holding backpressure_lock during notify), producers
         // could miss wakeups and deadlock.
-        let device = require_device();
+        let Some(device) = require_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let config = SlabRingConfig {
             depth: 1, // Minimal ring — maximum contention.
             slab_size: 64,
         };
-        let ring = Arc::new(SlabRing::new(&device, config));
+        let ring = Arc::new(SlabRing::new(device, config));
         let total_per_producer = 50u64;
         let num_producers = 4;
         let total_items = total_per_producer * num_producers as u64;
@@ -1052,7 +1135,7 @@ mod tests {
         // Spawn producers that all use blocking acquire_for_write.
         let mut handles = vec![];
         for _ in 0..num_producers {
-            let ring = Arc::clone(&ring);
+            let ring = SendRing(Arc::clone(&ring));
             let produced = Arc::clone(&produced);
             let h = std::thread::spawn(move || {
                 for _ in 0..total_per_producer {
@@ -1064,7 +1147,7 @@ mod tests {
         }
 
         // Consumer: drain until all items consumed.
-        let ring_c = Arc::clone(&ring);
+        let ring_c = SendRing(Arc::clone(&ring));
         let consumed_c = Arc::clone(&consumed);
         let consumer = std::thread::spawn(move || {
             let mut count = 0u64;

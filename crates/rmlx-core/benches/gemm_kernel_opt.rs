@@ -13,12 +13,19 @@
 
 use std::time::{Duration, Instant};
 
-use metal::MTLSize;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{
+    MTLBuffer as _, MTLCommandBuffer as _, MTLCommandEncoder as _, MTLCommandQueue as _,
+    MTLComputeCommandEncoder as _, MTLDevice as _,
+};
 use rmlx_core::array::Array;
 use rmlx_core::dtype::DType;
 use rmlx_core::kernels::KernelRegistry;
 use rmlx_core::ops;
 use rmlx_metal::device::GpuDevice;
+use rmlx_metal::types::MtlBuffer;
+use rmlx_metal::{MTLResourceOptions, MTLSize};
+use std::ptr::NonNull;
 
 const WARMUP_ITERS: usize = 5;
 const BENCH_ITERS: usize = 20;
@@ -833,7 +840,11 @@ fn f32_to_f16_bits(val: f32) -> u16 {
     ((sign << 15) | (new_exp as u32) << 10 | (frac >> 13)) as u16
 }
 
-fn rand_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
+fn rand_array(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    shape: &[usize],
+    seed: u64,
+) -> Array {
     let numel: usize = shape.iter().product();
     let mut f16_bytes = Vec::with_capacity(numel * 2);
     let mut state = seed;
@@ -848,9 +859,17 @@ fn rand_array(device: &metal::Device, shape: &[usize], seed: u64) -> Array {
     Array::from_bytes(device, &f16_bytes, shape.to_vec(), DType::Float16)
 }
 
-fn make_u32_buf(device: &metal::Device, val: u32) -> metal::Buffer {
-    let opts = metal::MTLResourceOptions::StorageModeShared;
-    device.new_buffer_with_data(&val as *const u32 as *const _, 4, opts)
+fn make_u32_buf(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, val: u32) -> MtlBuffer {
+    let opts = MTLResourceOptions::StorageModeShared;
+    unsafe {
+        device
+            .newBufferWithBytes_length_options(
+                NonNull::new(&val as *const u32 as *const _ as *mut _).unwrap(),
+                4_usize,
+                opts,
+            )
+            .unwrap()
+    }
 }
 
 fn ceil_div(a: usize, b: usize) -> usize {
@@ -873,8 +892,8 @@ fn compute_swizzle_log(m: usize, bm: usize) -> u32 {
 #[allow(clippy::too_many_arguments)]
 fn bench_config(
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
-    device: &metal::Device,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
     cfg: &GemmKernelOptConfig,
     m: usize,
     k: usize,
@@ -899,57 +918,65 @@ fn bench_config(
 
     let grid_x = ceil_div(n, BN as usize) as u64;
     let grid_y = ceil_div(m, BM as usize) as u64;
-    let grid = MTLSize::new(grid_x, grid_y, 1);
+    let grid = MTLSize {
+        width: grid_x as usize,
+        height: grid_y as usize,
+        depth: 1_usize,
+    };
     // mlx_arch uses 64 threads; all other variants use N_THREADS (256)
     let n_threads = if cfg.label == "mlx_arch" {
         64u64
     } else {
         N_THREADS as u64
     };
-    let tg = MTLSize::new(n_threads, 1, 1);
+    let tg = MTLSize {
+        width: n_threads as usize,
+        height: 1_usize,
+        depth: 1_usize,
+    };
 
     // Warmup
     for _ in 0..WARMUP_ITERS {
-        let cb = queue.new_command_buffer_with_unretained_references();
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pipeline);
-        enc.set_buffer(0, Some(a.metal_buffer()), 0);
-        enc.set_buffer(1, Some(b.metal_buffer()), 0);
-        enc.set_buffer(2, Some(c.metal_buffer()), 0);
-        enc.set_buffer(3, Some(&m_buf), 0);
-        enc.set_buffer(4, Some(&n_buf), 0);
-        enc.set_buffer(5, Some(&k_buf), 0);
-        enc.set_buffer(6, Some(&bsa_buf), 0);
-        enc.set_buffer(7, Some(&bsb_buf), 0);
-        enc.set_buffer(8, Some(&bsc_buf), 0);
-        enc.set_buffer(9, Some(&swizzle_buf), 0);
-        enc.dispatch_thread_groups(grid, tg);
-        enc.end_encoding();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+        let enc = cb.computeCommandEncoder().unwrap();
+        enc.setComputePipelineState(&pipeline);
+        unsafe { enc.setBuffer_offset_atIndex(Some(a.metal_buffer()), 0_usize, 0_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(b.metal_buffer()), 0_usize, 1_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(c.metal_buffer()), 0_usize, 2_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&m_buf), 0_usize, 3_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&n_buf), 0_usize, 4_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&k_buf), 0_usize, 5_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&bsa_buf), 0_usize, 6_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&bsb_buf), 0_usize, 7_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&bsc_buf), 0_usize, 8_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&swizzle_buf), 0_usize, 9_usize) };
+        enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        enc.endEncoding();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
     }
 
     // Bench
     let mut times = Vec::with_capacity(BENCH_ITERS);
     for _ in 0..BENCH_ITERS {
         let start = Instant::now();
-        let cb = queue.new_command_buffer_with_unretained_references();
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pipeline);
-        enc.set_buffer(0, Some(a.metal_buffer()), 0);
-        enc.set_buffer(1, Some(b.metal_buffer()), 0);
-        enc.set_buffer(2, Some(c.metal_buffer()), 0);
-        enc.set_buffer(3, Some(&m_buf), 0);
-        enc.set_buffer(4, Some(&n_buf), 0);
-        enc.set_buffer(5, Some(&k_buf), 0);
-        enc.set_buffer(6, Some(&bsa_buf), 0);
-        enc.set_buffer(7, Some(&bsb_buf), 0);
-        enc.set_buffer(8, Some(&bsc_buf), 0);
-        enc.set_buffer(9, Some(&swizzle_buf), 0);
-        enc.dispatch_thread_groups(grid, tg);
-        enc.end_encoding();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+        let enc = cb.computeCommandEncoder().unwrap();
+        enc.setComputePipelineState(&pipeline);
+        unsafe { enc.setBuffer_offset_atIndex(Some(a.metal_buffer()), 0_usize, 0_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(b.metal_buffer()), 0_usize, 1_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(c.metal_buffer()), 0_usize, 2_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&m_buf), 0_usize, 3_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&n_buf), 0_usize, 4_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&k_buf), 0_usize, 5_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&bsa_buf), 0_usize, 6_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&bsb_buf), 0_usize, 7_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&bsc_buf), 0_usize, 8_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&swizzle_buf), 0_usize, 9_usize) };
+        enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        enc.endEncoding();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
         times.push(start.elapsed());
     }
 
@@ -969,7 +996,7 @@ fn main() {
     let registry = KernelRegistry::new(gpu);
     ops::register_all(&registry).expect("Failed to register kernels");
     let device = registry.device().raw();
-    let queue = device.new_command_queue();
+    let queue = device.newCommandQueue().unwrap();
 
     // Register all optimization kernels via JIT
     for cfg in CONFIGS {
@@ -1010,32 +1037,36 @@ fn main() {
         let bsb_buf = make_u32_buf(device, (vk * vn) as u32);
         let bsc_buf = make_u32_buf(device, (vm * vn) as u32);
         let sw_buf = make_u32_buf(device, 0u32);
-        let grid = MTLSize::new(
-            ceil_div(vn, BN as usize) as u64,
-            ceil_div(vm, BM as usize) as u64,
-            1,
-        );
-        let tg = MTLSize::new(N_THREADS as u64, 1, 1);
+        let grid = MTLSize {
+            width: ceil_div(vn, BN as usize),
+            height: ceil_div(vm, BM as usize),
+            depth: 1_usize,
+        };
+        let tg = MTLSize {
+            width: N_THREADS as usize,
+            height: 1_usize,
+            depth: 1_usize,
+        };
 
-        let cb = queue.new_command_buffer_with_unretained_references();
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&ref_pipeline);
-        enc.set_buffer(0, Some(va.metal_buffer()), 0);
-        enc.set_buffer(1, Some(vb.metal_buffer()), 0);
-        enc.set_buffer(2, Some(c_ref.metal_buffer()), 0);
-        enc.set_buffer(3, Some(&m_buf), 0);
-        enc.set_buffer(4, Some(&n_buf), 0);
-        enc.set_buffer(5, Some(&k_buf), 0);
-        enc.set_buffer(6, Some(&bsa_buf), 0);
-        enc.set_buffer(7, Some(&bsb_buf), 0);
-        enc.set_buffer(8, Some(&bsc_buf), 0);
-        enc.set_buffer(9, Some(&sw_buf), 0);
-        enc.dispatch_thread_groups(grid, tg);
-        enc.end_encoding();
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+        let enc = cb.computeCommandEncoder().unwrap();
+        enc.setComputePipelineState(&ref_pipeline);
+        unsafe { enc.setBuffer_offset_atIndex(Some(va.metal_buffer()), 0_usize, 0_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(vb.metal_buffer()), 0_usize, 1_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(c_ref.metal_buffer()), 0_usize, 2_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&m_buf), 0_usize, 3_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&n_buf), 0_usize, 4_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&k_buf), 0_usize, 5_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&bsa_buf), 0_usize, 6_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&bsb_buf), 0_usize, 7_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&bsc_buf), 0_usize, 8_usize) };
+        unsafe { enc.setBuffer_offset_atIndex(Some(&sw_buf), 0_usize, 9_usize) };
+        enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        enc.endEncoding();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
 
-        let ref_ptr = c_ref.metal_buffer().contents() as *const u16;
+        let ref_ptr = c_ref.metal_buffer().contents().as_ptr() as *const u16;
         let ref_vals: Vec<u16> = unsafe { std::slice::from_raw_parts(ref_ptr, vm * vn) }.to_vec();
 
         // Test each non-ref variant
@@ -1048,30 +1079,34 @@ fn main() {
 
             // mlx_arch uses 64 threads; all other variants use N_THREADS (256)
             let verify_tg = if cfg.label == "mlx_arch" {
-                MTLSize::new(64, 1, 1)
+                MTLSize {
+                    width: 64_usize,
+                    height: 1_usize,
+                    depth: 1_usize,
+                }
             } else {
                 tg
             };
 
-            let cb = queue.new_command_buffer_with_unretained_references();
-            let enc = cb.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&pipeline);
-            enc.set_buffer(0, Some(va.metal_buffer()), 0);
-            enc.set_buffer(1, Some(vb.metal_buffer()), 0);
-            enc.set_buffer(2, Some(c_test.metal_buffer()), 0);
-            enc.set_buffer(3, Some(&m_buf), 0);
-            enc.set_buffer(4, Some(&n_buf), 0);
-            enc.set_buffer(5, Some(&k_buf), 0);
-            enc.set_buffer(6, Some(&bsa_buf), 0);
-            enc.set_buffer(7, Some(&bsb_buf), 0);
-            enc.set_buffer(8, Some(&bsc_buf), 0);
-            enc.set_buffer(9, Some(&sw_buf), 0);
-            enc.dispatch_thread_groups(grid, verify_tg);
-            enc.end_encoding();
+            let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+            let enc = cb.computeCommandEncoder().unwrap();
+            enc.setComputePipelineState(&pipeline);
+            unsafe { enc.setBuffer_offset_atIndex(Some(va.metal_buffer()), 0_usize, 0_usize) };
+            unsafe { enc.setBuffer_offset_atIndex(Some(vb.metal_buffer()), 0_usize, 1_usize) };
+            unsafe { enc.setBuffer_offset_atIndex(Some(c_test.metal_buffer()), 0_usize, 2_usize) };
+            unsafe { enc.setBuffer_offset_atIndex(Some(&m_buf), 0_usize, 3_usize) };
+            unsafe { enc.setBuffer_offset_atIndex(Some(&n_buf), 0_usize, 4_usize) };
+            unsafe { enc.setBuffer_offset_atIndex(Some(&k_buf), 0_usize, 5_usize) };
+            unsafe { enc.setBuffer_offset_atIndex(Some(&bsa_buf), 0_usize, 6_usize) };
+            unsafe { enc.setBuffer_offset_atIndex(Some(&bsb_buf), 0_usize, 7_usize) };
+            unsafe { enc.setBuffer_offset_atIndex(Some(&bsc_buf), 0_usize, 8_usize) };
+            unsafe { enc.setBuffer_offset_atIndex(Some(&sw_buf), 0_usize, 9_usize) };
+            enc.dispatchThreadgroups_threadsPerThreadgroup(grid, verify_tg);
+            enc.endEncoding();
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
 
-            let test_ptr = c_test.metal_buffer().contents() as *const u16;
+            let test_ptr = c_test.metal_buffer().contents().as_ptr() as *const u16;
             let test_vals: Vec<u16> =
                 unsafe { std::slice::from_raw_parts(test_ptr, vm * vn) }.to_vec();
 

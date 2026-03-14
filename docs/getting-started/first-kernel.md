@@ -28,6 +28,7 @@ rmlx-metal = { path = "../rmlx/crates/rmlx-metal" }
 Import the required modules:
 
 ```rust
+use objc2_metal::MTLCommandBuffer as _;
 use rmlx_metal::buffer::read_buffer;
 use rmlx_metal::command::encode_compute_1d;
 use rmlx_metal::device::GpuDevice;
@@ -72,7 +73,7 @@ let buffer_b = device.new_buffer_with_data(&[5.0f32, 6.0, 7.0, 8.0]);
 // Output buffer: empty buffer created with size only
 let buffer_out = device.new_buffer(
     16, // 4 floats * 4 bytes = 16 bytes
-    rmlx_metal::metal::MTLResourceOptions::StorageModeShared,
+    rmlx_metal::MTLResourceOptions::StorageModeShared,
 );
 ```
 
@@ -143,7 +144,7 @@ let library = compile_source(device.raw(), VECTOR_ADD_SOURCE)
 Find the kernel function from the compiled library and create a compute pipeline state:
 
 ```rust
-let mut cache = PipelineCache::new(device.raw());
+let cache = PipelineCache::new(device.raw());
 let pipeline = cache
     .get_or_create("vector_add_float", &library)
     .expect("pipeline creation");
@@ -165,22 +166,22 @@ let cmd_buf = queue.new_command_buffer();
 
 // Encode 1D compute: buffer binding + thread count
 encode_compute_1d(
-    cmd_buf,
-    pipeline,
+    &cmd_buf,
+    &pipeline,
     &[(&buffer_a, 0), (&buffer_b, 0), (&buffer_out, 0)],
     4, // thread count = element count
 );
 
 // Submit to GPU and wait for completion
 cmd_buf.commit();
-cmd_buf.wait_until_completed();
+cmd_buf.waitUntilCompleted();
 ```
 
 - `encode_compute_1d` creates a compute command encoder, binds buffers, and dispatches threads in a single call.
 - In the tuple `(&buffer_a, 0)`, the second value `0` is the offset (in bytes) within the buffer.
 - The thread count `4` matches the number of elements to process. Each thread handles one element.
 - `commit()` submits the command buffer to the GPU queue.
-- `wait_until_completed()` blocks the current thread until GPU execution finishes.
+- `waitUntilCompleted()` blocks the current thread until GPU execution finishes (objc2-metal API).
 
 ---
 
@@ -198,7 +199,7 @@ assert_eq!(result, &[6.0, 8.0, 10.0, 12.0]);
 
 - `read_buffer` is an `unsafe` function. It interprets the GPU buffer contents as a Rust slice.
 - Since `StorageModeShared` is used, the CPU and GPU share the same memory, so no separate data transfer is needed.
-- It must be called after `wait_until_completed()` to ensure the GPU computation results are available.
+- It must be called after `waitUntilCompleted()` to ensure the GPU computation results are available.
 
 **Result**: `[1.0+5.0, 2.0+6.0, 3.0+7.0, 4.0+8.0]` = `[6.0, 8.0, 10.0, 12.0]`
 
@@ -240,13 +241,13 @@ fn main() {
     let buffer_b = device.new_buffer_with_data(&[5.0f32, 6.0, 7.0, 8.0]);
     let buffer_out = device.new_buffer(
         16,
-        rmlx_metal::metal::MTLResourceOptions::StorageModeShared,
+        rmlx_metal::MTLResourceOptions::StorageModeShared,
     );
 
     // 3. JIT compile shader + create pipeline
     let library = compile_source(device.raw(), VECTOR_ADD_SOURCE)
         .expect("shader compilation");
-    let mut cache = PipelineCache::new(device.raw());
+    let cache = PipelineCache::new(device.raw());
     let pipeline = cache
         .get_or_create("vector_add_float", &library)
         .expect("pipeline creation");
@@ -292,7 +293,6 @@ cargo test -p rmlx-metal -- test_basic_metal_compute --nocapture
 This tutorial covered the basics of rmlx's Metal compute pipeline.
 For the full implementation plan, see the [Implementation Roadmap](../roadmap/phases.md).
 
-- **Phase 2** adds 10 core GPU compute kernels including matmul, softmax, and RoPE
-- **Phase 3** implements MTLSharedEvent-based synchronization and the dual queue pipeline
-- **Phase 4** adds MoE kernels for Expert Parallelism
-- [GPU Pipeline](../gpu-pipeline.md) — Learn how ExecGraph batches operations for 17.4x speedup
+- [GPU Pipeline](../gpu-pipeline.md) — Learn how ExecGraph batches operations into 7-dispatch fused decode (699.3 us/layer, 64x speedup)
+- [RMLX vs MLX vs CUDA](../comparison.md) — Architecture comparison with performance data (24.05T GEMM, QMM Q4 +28% vs MLX)
+- 27 op modules with `ComputePass` API, Flash Attention 2, Expert Parallelism (EP-1 through EP-6)

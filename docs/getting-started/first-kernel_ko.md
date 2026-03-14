@@ -28,6 +28,7 @@ rmlx-metal = { path = "../rmlx/crates/rmlx-metal" }
 필요한 모듈을 import합니다.
 
 ```rust
+use objc2_metal::MTLCommandBuffer as _;
 use rmlx_metal::buffer::read_buffer;
 use rmlx_metal::command::encode_compute_1d;
 use rmlx_metal::device::GpuDevice;
@@ -72,7 +73,7 @@ let buffer_b = device.new_buffer_with_data(&[5.0f32, 6.0, 7.0, 8.0]);
 // 출력 버퍼: 크기만 지정하여 빈 버퍼 생성
 let buffer_out = device.new_buffer(
     16, // 4 floats * 4 bytes = 16 bytes
-    rmlx_metal::metal::MTLResourceOptions::StorageModeShared,
+    rmlx_metal::MTLResourceOptions::StorageModeShared,
 );
 ```
 
@@ -143,7 +144,7 @@ let library = compile_source(device.raw(), VECTOR_ADD_SOURCE)
 컴파일된 라이브러리에서 커널 함수를 찾아 compute pipeline state를 생성합니다.
 
 ```rust
-let mut cache = PipelineCache::new(device.raw());
+let cache = PipelineCache::new(device.raw());
 let pipeline = cache
     .get_or_create("vector_add_float", &library)
     .expect("pipeline creation");
@@ -165,22 +166,22 @@ let cmd_buf = queue.new_command_buffer();
 
 // 1D compute 인코딩: 버퍼 바인딩 + 스레드 개수 지정
 encode_compute_1d(
-    cmd_buf,
-    pipeline,
+    &cmd_buf,
+    &pipeline,
     &[(&buffer_a, 0), (&buffer_b, 0), (&buffer_out, 0)],
     4, // 스레드 수 = 원소 수
 );
 
 // GPU에 제출하고 완료 대기
 cmd_buf.commit();
-cmd_buf.wait_until_completed();
+cmd_buf.waitUntilCompleted();
 ```
 
 - `encode_compute_1d`는 compute command encoder를 생성하고, 버퍼를 바인딩하고, 스레드를 디스패치하는 과정을 하나의 호출로 처리합니다.
 - 튜플 `(&buffer_a, 0)`에서 두 번째 값 `0`은 버퍼 내 오프셋(바이트)입니다.
 - 스레드 수 `4`는 처리할 원소 수와 일치합니다. 각 스레드가 하나의 원소를 담당합니다.
 - `commit()`은 커맨드 버퍼를 GPU 큐에 제출합니다.
-- `wait_until_completed()`는 GPU 실행이 완료될 때까지 현재 스레드를 블록합니다.
+- `waitUntilCompleted()`는 GPU 실행이 완료될 때까지 현재 스레드를 블록합니다 (objc2-metal API).
 
 ---
 
@@ -198,7 +199,7 @@ assert_eq!(result, &[6.0, 8.0, 10.0, 12.0]);
 
 - `read_buffer`는 `unsafe` 함수입니다. GPU 버퍼의 내용을 Rust 슬라이스로 해석합니다.
 - `StorageModeShared`를 사용했으므로 CPU와 GPU가 같은 메모리를 공유하여 별도의 데이터 전송이 필요 없습니다.
-- `wait_until_completed()` 이후에 호출해야 GPU 연산 결과가 보장됩니다.
+- `waitUntilCompleted()` 이후에 호출해야 GPU 연산 결과가 보장됩니다.
 
 **결과**: `[1.0+5.0, 2.0+6.0, 3.0+7.0, 4.0+8.0]` = `[6.0, 8.0, 10.0, 12.0]`
 
@@ -240,13 +241,13 @@ fn main() {
     let buffer_b = device.new_buffer_with_data(&[5.0f32, 6.0, 7.0, 8.0]);
     let buffer_out = device.new_buffer(
         16,
-        rmlx_metal::metal::MTLResourceOptions::StorageModeShared,
+        rmlx_metal::MTLResourceOptions::StorageModeShared,
     );
 
     // 3. 셰이더 JIT 컴파일 + 파이프라인 생성
     let library = compile_source(device.raw(), VECTOR_ADD_SOURCE)
         .expect("shader compilation");
-    let mut cache = PipelineCache::new(device.raw());
+    let cache = PipelineCache::new(device.raw());
     let pipeline = cache
         .get_or_create("vector_add_float", &library)
         .expect("pipeline creation");
@@ -254,15 +255,15 @@ fn main() {
     // 4. GPU 디스패치
     let cmd_buf = queue.new_command_buffer();
     encode_compute_1d(
-        cmd_buf,
-        pipeline,
+        &cmd_buf,
+        &pipeline,
         &[(&buffer_a, 0), (&buffer_b, 0), (&buffer_out, 0)],
         4,
     );
 
     // 5. 실행 및 대기
     cmd_buf.commit();
-    cmd_buf.wait_until_completed();
+    cmd_buf.waitUntilCompleted();
 
     // 6. 결과 확인
     // SAFETY: StorageModeShared buffer, GPU work completed, reading 4 f32 = 16 bytes
@@ -292,7 +293,6 @@ cargo test -p rmlx-metal -- test_basic_metal_compute --nocapture
 이 튜토리얼에서 다룬 내용은 rmlx의 Metal compute 파이프라인 기초입니다.
 프로젝트의 전체 구현 계획은 [구현 로드맵](../roadmap/phases.md)을 참고하세요.
 
-- **Phase 2**에서 matmul, softmax, RoPE 등 10종의 GPU 연산 핵심 커널이 추가됩니다
-- **Phase 3**에서 MTLSharedEvent 기반 동기화와 듀얼 큐 파이프라인이 구현됩니다
-- **Phase 4**에서 Expert Parallelism을 위한 MoE 커널이 추가됩니다
-- [GPU Pipeline](../gpu-pipeline.md) — ExecGraph가 연산을 배칭하여 17.4x 속도 향상을 달성하는 방법
+- [GPU Pipeline](../gpu-pipeline.md) — ExecGraph가 연산을 7-dispatch fused 디코드로 배칭하여 699.3 us/layer 달성 (64x 속도 향상)
+- [RMLX vs MLX vs CUDA](../comparison.md) — 성능 데이터 포함 아키텍처 비교 (24.05T GEMM, QMM Q4 +28% vs MLX)
+- 27개 op 모듈의 `ComputePass` API, Flash Attention 2, Expert Parallelism (EP-1~EP-6)

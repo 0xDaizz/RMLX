@@ -1,7 +1,9 @@
+use objc2::runtime::ProtocolObject;
 use rmlx_core::array::Array;
 use rmlx_core::kernels::KernelRegistry;
 use rmlx_core::ops;
 use rmlx_metal::device::GpuDevice;
+use rmlx_metal::types::MtlQueue;
 use rmlx_nn::attention::*;
 use rmlx_nn::embedding::*;
 use rmlx_nn::gguf_loader::{ggml_type_to_kquant, is_kquant_type, kquant_load_info};
@@ -13,6 +15,14 @@ use rmlx_nn::quantized_linear::*;
 use rmlx_nn::rope::*;
 use rmlx_nn::sliding_window::*;
 use rmlx_nn::transformer::*;
+
+fn test_device() -> Option<&'static rmlx_metal::MtlDevice> {
+    use std::sync::OnceLock;
+    static DEVICE: OnceLock<Option<rmlx_metal::MtlDevice>> = OnceLock::new();
+    DEVICE
+        .get_or_init(|| objc2::rc::autoreleasepool(|_| objc2_metal::MTLCreateSystemDefaultDevice()))
+        .as_ref()
+}
 
 #[test]
 fn test_linear_config() {
@@ -108,9 +118,9 @@ fn test_weight_shape_validation() {
     assert!(l.has_bias());
 }
 
-fn setup() -> Option<(KernelRegistry, metal::CommandQueue)> {
+fn setup() -> Option<(KernelRegistry, MtlQueue)> {
     let device = GpuDevice::system_default().ok()?;
-    let queue = device.raw().new_command_queue();
+    let queue = device.new_command_queue();
     let registry = KernelRegistry::new(device);
     ops::register_all(&registry).ok()?;
     rmlx_nn::activations::register(&registry).ok()?;
@@ -354,7 +364,7 @@ fn test_embedding_no_weights_errors() {
 
 // ===== NEW TESTS: Attention forward =====
 
-fn make_identity_linear(dev: &metal::Device, size: usize) -> Linear {
+fn make_identity_linear(dev: &ProtocolObject<dyn objc2_metal::MTLDevice>, size: usize) -> Linear {
     // Create an identity-like weight matrix [size, size]
     let mut data = vec![0.0f32; size * size];
     for i in 0..size {
@@ -2758,7 +2768,10 @@ fn test_chunked_prefill_splits_long_prompt() {
     use rmlx_nn::scheduler::*;
     use std::collections::HashMap;
 
-    let device = rmlx_metal::metal::Device::system_default().expect("no Metal device available");
+    let Some(device) = test_device() else {
+        eprintln!("Skipping: no Metal GPU");
+        return;
+    };
 
     let config = SchedulerConfig {
         max_batch_size: 4,
@@ -2767,7 +2780,7 @@ fn test_chunked_prefill_splits_long_prompt() {
         max_prefill_chunk: 512,
     };
     let mut scheduler = Scheduler::new(config);
-    let mut bm = BlockManager::new(&device, 1024, 4, 2, 2, 4, rmlx_core::dtype::DType::Float32);
+    let mut bm = BlockManager::new(device, 1024, 4, 2, 2, 4, rmlx_core::dtype::DType::Float32);
 
     scheduler.add_request(GenerationRequest {
         seq_id: 1,
@@ -2804,7 +2817,10 @@ fn test_chunked_prefill_interleaves_decode() {
     use rmlx_nn::scheduler::*;
     use std::collections::HashMap;
 
-    let device = rmlx_metal::metal::Device::system_default().expect("no Metal device available");
+    let Some(device) = test_device() else {
+        eprintln!("Skipping: no Metal GPU");
+        return;
+    };
 
     let config = SchedulerConfig {
         max_batch_size: 4,
@@ -2813,7 +2829,7 @@ fn test_chunked_prefill_interleaves_decode() {
         max_prefill_chunk: 512,
     };
     let mut scheduler = Scheduler::new(config);
-    let mut bm = BlockManager::new(&device, 1024, 4, 2, 2, 4, rmlx_core::dtype::DType::Float32);
+    let mut bm = BlockManager::new(device, 1024, 4, 2, 2, 4, rmlx_core::dtype::DType::Float32);
 
     // Add and fully prefill a short sequence.
     scheduler.add_request(GenerationRequest {
@@ -2853,7 +2869,10 @@ fn test_short_prompt_not_chunked() {
     use rmlx_nn::scheduler::*;
     use std::collections::HashMap;
 
-    let device = rmlx_metal::metal::Device::system_default().expect("no Metal device available");
+    let Some(device) = test_device() else {
+        eprintln!("Skipping: no Metal GPU");
+        return;
+    };
 
     let config = SchedulerConfig {
         max_batch_size: 4,
@@ -2862,7 +2881,7 @@ fn test_short_prompt_not_chunked() {
         max_prefill_chunk: 512,
     };
     let mut scheduler = Scheduler::new(config);
-    let mut bm = BlockManager::new(&device, 256, 4, 2, 2, 4, rmlx_core::dtype::DType::Float32);
+    let mut bm = BlockManager::new(device, 256, 4, 2, 2, 4, rmlx_core::dtype::DType::Float32);
 
     scheduler.add_request(GenerationRequest {
         seq_id: 1,
@@ -2893,7 +2912,7 @@ fn run_activation(
     act: &dyn Activation,
     input: &[f32],
     registry: &KernelRegistry,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Vec<f32> {
     let dev = registry.device().raw();
     let arr = Array::from_slice(dev, input, vec![input.len()]);

@@ -3,6 +3,9 @@
 use std::fmt;
 use std::sync::Arc;
 
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLDevice;
+
 /// Error type for distributed operations.
 #[derive(Debug)]
 pub enum DistributedError {
@@ -467,7 +470,7 @@ impl Group {
     pub fn allreduce_sum(
         &self,
         input: &rmlx_core::array::Array,
-        device: &metal::Device,
+        device: &ProtocolObject<dyn MTLDevice>,
     ) -> Result<rmlx_core::array::Array, DistributedError> {
         if self.ranks.len() <= 1 {
             // Identity: return a zero-copy view of the same buffer.
@@ -502,7 +505,7 @@ impl Group {
     pub fn allgather_array(
         &self,
         input: &rmlx_core::array::Array,
-        device: &metal::Device,
+        device: &ProtocolObject<dyn MTLDevice>,
     ) -> Result<rmlx_core::array::Array, DistributedError> {
         if self.ranks.len() <= 1 {
             // Identity: return a zero-copy view of the same buffer.

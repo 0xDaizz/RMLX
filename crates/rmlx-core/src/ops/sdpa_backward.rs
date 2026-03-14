@@ -10,7 +10,14 @@
 use crate::array::Array;
 use crate::dtype::DType;
 use crate::kernels::{KernelError, KernelRegistry};
-use metal::MTLSize;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLCommandBuffer as _;
+use objc2_metal::MTLCommandQueue as _;
+use objc2_metal::MTLComputePipelineState as _;
+use objc2_metal::MTLDevice as _;
+use rmlx_metal::ComputePass;
+use rmlx_metal::MTLResourceOptions;
+use rmlx_metal::MTLSize;
 
 // ---------------------------------------------------------------------------
 // Metal shader source
@@ -197,7 +204,7 @@ pub fn sdpa_backward(
     v: &Array,
     grad_output: &Array,
     scale: f32,
-    queue: &metal::CommandQueue,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Result<(Array, Array, Array), KernelError> {
     // Validate inputs
     if q.dtype() != DType::Float32 {
@@ -253,46 +260,53 @@ pub fn sdpa_backward(
         super::checked_u32(s, "S")?,
         super::checked_u32(d, "D")?,
     ];
-    let opts = metal::MTLResourceOptions::StorageModeShared;
-    let params_buf = dev.new_buffer_with_data(
-        params.as_ptr() as *const _,
-        std::mem::size_of_val(&params) as u64,
-        opts,
-    );
-    let scale_buf = dev.new_buffer_with_data(
-        &scale as *const f32 as *const _,
-        std::mem::size_of::<f32>() as u64,
-        opts,
-    );
+    let opts = MTLResourceOptions::StorageModeShared;
+    let params_buf = unsafe {
+        dev.newBufferWithBytes_length_options(
+            std::ptr::NonNull::new(params.as_ptr() as *const _ as *mut std::ffi::c_void).unwrap(),
+            std::mem::size_of_val(&params),
+            opts,
+        )
+        .unwrap()
+    };
+    let scale_buf = unsafe {
+        dev.newBufferWithBytes_length_options(
+            std::ptr::NonNull::new(&scale as *const f32 as *const _ as *mut std::ffi::c_void)
+                .unwrap(),
+            std::mem::size_of::<f32>(),
+            opts,
+        )
+        .unwrap()
+    };
 
-    let cb = queue.new_command_buffer();
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&pipeline);
-    enc.set_buffer(0, Some(q.metal_buffer()), q.offset() as u64);
-    enc.set_buffer(1, Some(k.metal_buffer()), k.offset() as u64);
-    enc.set_buffer(2, Some(v.metal_buffer()), v.offset() as u64);
-    enc.set_buffer(
-        3,
-        Some(grad_output.metal_buffer()),
-        grad_output.offset() as u64,
-    );
+    let cb = queue.commandBuffer().unwrap();
+    let raw_enc = cb.computeCommandEncoder().unwrap();
+    let enc = ComputePass::new(&raw_enc);
+    enc.set_pipeline(&pipeline);
+    enc.set_buffer(0, Some(q.metal_buffer()), q.offset());
+    enc.set_buffer(1, Some(k.metal_buffer()), k.offset());
+    enc.set_buffer(2, Some(v.metal_buffer()), v.offset());
+    enc.set_buffer(3, Some(grad_output.metal_buffer()), grad_output.offset());
     enc.set_buffer(4, Some(grad_q.metal_buffer()), 0);
     enc.set_buffer(5, Some(grad_k.metal_buffer()), 0);
     enc.set_buffer(6, Some(grad_v.metal_buffer()), 0);
     enc.set_buffer(7, Some(&params_buf), 0);
     enc.set_buffer(8, Some(&scale_buf), 0);
-
     // One thread per query row. For small N this is fine;
     // for large N we'd want a tiled approach.
-    let grid = MTLSize::new(n as u64, 1, 1);
-    let tg = MTLSize::new(
-        std::cmp::min(pipeline.max_total_threads_per_threadgroup(), n as u64).max(1),
-        1,
-        1,
-    );
+    let grid = MTLSize {
+        width: n,
+        height: 1,
+        depth: 1,
+    };
+    let tg = MTLSize {
+        width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), n).max(1),
+        height: 1,
+        depth: 1,
+    };
     enc.dispatch_threads(grid, tg);
-    enc.end_encoding();
-    super::commit_with_mode(cb, super::ExecMode::Sync);
+    enc.end();
+    super::commit_with_mode(&cb, super::ExecMode::Sync);
 
     Ok((grad_q, grad_k, grad_v))
 }
@@ -305,18 +319,21 @@ pub fn sdpa_backward(
 mod tests {
     use super::*;
 
-    fn setup() -> (KernelRegistry, metal::CommandQueue) {
-        let gpu_dev = rmlx_metal::device::GpuDevice::system_default().unwrap();
-        let queue = gpu_dev.raw().new_command_queue();
+    fn setup() -> Option<(KernelRegistry, rmlx_metal::MtlQueue)> {
+        let gpu_dev = crate::test_utils::test_gpu()?;
+        let queue = gpu_dev.new_command_queue();
         let registry = KernelRegistry::new(gpu_dev);
         register(&registry).unwrap();
         crate::ops::copy::register(&registry).unwrap();
-        (registry, queue)
+        Some((registry, queue))
     }
 
     #[test]
     fn test_sdpa_backward_shapes() {
-        let (registry, queue) = setup();
+        let Some((registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = registry.device().raw();
 
         let n = 4;
@@ -337,7 +354,10 @@ mod tests {
 
     #[test]
     fn test_sdpa_backward_grad_v_nonzero() {
-        let (registry, queue) = setup();
+        let Some((registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let dev = registry.device().raw();
 
         let n = 2;

@@ -33,6 +33,8 @@
 //! Optionally set `MLX_DECODE_US` and `MLX_PREFILL_US` env vars to embed
 //! MLX reference numbers in the output for direct comparison.
 
+use objc2::runtime::ProtocolObject;
+use objc2_metal::MTLDevice as _;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -175,7 +177,7 @@ fn parse_model_config(config_path: &Path) -> Result<ModelInfo, Box<dyn std::erro
 // ---------------------------------------------------------------------------
 
 fn load_model_from_safetensors(
-    device: &metal::Device,
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
     model_dir: &Path,
 ) -> Result<(TransformerModel, ModelInfo), Box<dyn std::error::Error>> {
     let load_start = Instant::now();
@@ -422,7 +424,7 @@ fn main() {
     let registry = KernelRegistry::new(gpu);
     ops::register_all(&registry).expect("kernel registration failed");
     let device = registry.device().raw();
-    let queue = device.new_command_queue();
+    let queue = device.newCommandQueue().unwrap();
 
     // Load model from safetensors
     let (mut model, info) = load_model_from_safetensors(device, &model_dir)

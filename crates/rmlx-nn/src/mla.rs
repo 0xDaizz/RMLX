@@ -36,6 +36,12 @@ use rmlx_core::kernels::{KernelError, KernelRegistry};
 use rmlx_core::ops;
 
 use crate::linear::{Linear, LinearConfig};
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{
+    MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+    MTLComputePipelineState, MTLDevice,
+};
+use rmlx_metal::{ComputePass, MTLSize};
 
 /// Configuration for Multi-head Latent Attention (MLA).
 pub struct MlaConfig {
@@ -120,7 +126,7 @@ pub struct MlaKvCache {
 impl MlaKvCache {
     /// Create a pre-allocated MLA KV cache.
     pub fn new(
-        device: &metal::Device,
+        device: &ProtocolObject<dyn MTLDevice>,
         max_seq_len: usize,
         kv_lora_rank: usize,
         rope_head_dim: usize,
@@ -305,7 +311,7 @@ impl Mla {
         &self,
         x: &Array,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         self.w_dkv.forward(x, registry, queue)
     }
@@ -318,7 +324,7 @@ impl Mla {
         &self,
         x: &Array,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         self.w_kr.forward(x, registry, queue)
     }
@@ -333,7 +339,7 @@ impl Mla {
         &self,
         c_kv: &Array,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<(Array, Array), KernelError> {
         let k_nope = self.w_uk.forward(c_kv, registry, queue)?;
         let v = self.w_uv.forward(c_kv, registry, queue)?;
@@ -348,7 +354,7 @@ impl Mla {
         &self,
         x: &Array,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         let c_q = self.w_dq.forward(x, registry, queue)?;
         self.w_uq.forward(&c_q, registry, queue)
@@ -363,7 +369,7 @@ impl Mla {
     /// For single-token decode (`seq_len == 1`), returns `None` since the
     /// single query token can attend to all cached keys.
     fn build_causal_mask(
-        device: &metal::Device,
+        device: &ProtocolObject<dyn MTLDevice>,
         seq_len: usize,
         total_seq: usize,
         position_offset: usize,
@@ -404,7 +410,7 @@ impl Mla {
         sin_freqs: Option<&Array>,
         mut cache: Option<&mut MlaKvCache>,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<Array, KernelError> {
         let seq_len = x.shape()[0];
         let num_heads = self.config.num_heads;
@@ -595,42 +601,49 @@ impl Mla {
         let head_bytes = v_dim * elem_size;
         let hidden_bytes = hidden_out * elem_size;
 
-        let cb = queue.new_command_buffer();
+        let cb = queue.commandBuffer().unwrap();
         for (h, head_out) in attn_outputs.iter().enumerate() {
             let dst_col_offset = h * head_bytes;
 
             if seq_len == 1 {
-                let enc = cb.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&pipeline);
-                enc.set_buffer(0, Some(head_out.metal_buffer()), head_out.offset() as u64);
-                enc.set_buffer(1, Some(concat_out.metal_buffer()), dst_col_offset as u64);
-                let count = v_dim as u64;
-                let grid = metal::MTLSize::new(count, 1, 1);
-                let tg = metal::MTLSize::new(
-                    std::cmp::min(pipeline.max_total_threads_per_threadgroup(), count),
-                    1,
-                    1,
-                );
+                let raw_enc = cb.computeCommandEncoder().unwrap();
+                let enc = ComputePass::new(&raw_enc);
+                enc.set_pipeline(&pipeline);
+                enc.set_buffer(0, Some(head_out.metal_buffer()), head_out.offset());
+                enc.set_buffer(1, Some(concat_out.metal_buffer()), dst_col_offset);
+                let count = v_dim;
+                let grid = MTLSize {
+                    width: count,
+                    height: 1,
+                    depth: 1,
+                };
+                let tg = MTLSize {
+                    width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), count),
+                    height: 1,
+                    depth: 1,
+                };
                 enc.dispatch_threads(grid, tg);
-                enc.end_encoding();
+                enc.end();
             } else {
-                let blit = cb.new_blit_command_encoder();
+                let blit = cb.blitCommandEncoder().unwrap();
                 for row in 0..seq_len {
-                    let src_off = (head_out.offset() + row * head_bytes) as u64;
-                    let dst_off = (row * hidden_bytes + dst_col_offset) as u64;
-                    blit.copy_from_buffer(
-                        head_out.metal_buffer(),
-                        src_off,
-                        concat_out.metal_buffer(),
-                        dst_off,
-                        head_bytes as u64,
-                    );
+                    let src_off = head_out.offset() + row * head_bytes;
+                    let dst_off = row * hidden_bytes + dst_col_offset;
+                    unsafe {
+                        blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                            head_out.metal_buffer(),
+                            src_off,
+                            concat_out.metal_buffer(),
+                            dst_off,
+                            head_bytes,
+                        )
+                    };
                 }
-                blit.end_encoding();
+                blit.endEncoding();
             }
         }
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
 
         // Step 9: Output projection -> [seq_len, hidden_size]
         self.o_proj.forward(&concat_out, registry, queue)
@@ -644,7 +657,7 @@ impl Mla {
         new_tokens: usize,
         width: usize,
         registry: &KernelRegistry,
-        queue: &metal::CommandQueue,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
     ) -> Result<(), KernelError> {
         let elem_size = src.dtype().size_of();
         let copy_kernel = match src.dtype() {
@@ -659,31 +672,36 @@ impl Mla {
             }
         };
         let pipeline = registry.get_pipeline(copy_kernel, src.dtype())?;
-        let count = (new_tokens * width) as u64;
+        let count = new_tokens * width;
         if count == 0 {
             return Ok(());
         }
 
         let dst_byte_offset = row_offset * width * elem_size;
-        let cb = queue.new_command_buffer();
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pipeline);
-        enc.set_buffer(0, Some(src.metal_buffer()), src.offset() as u64);
+        let cb = queue.commandBuffer().unwrap();
+        let raw_enc = cb.computeCommandEncoder().unwrap();
+        let enc = ComputePass::new(&raw_enc);
+        enc.set_pipeline(&pipeline);
+        enc.set_buffer(0, Some(src.metal_buffer()), src.offset());
         enc.set_buffer(
             1,
             Some(cache_buf.metal_buffer()),
-            (cache_buf.offset() + dst_byte_offset) as u64,
+            cache_buf.offset() + dst_byte_offset,
         );
-        let grid = metal::MTLSize::new(count, 1, 1);
-        let tg = metal::MTLSize::new(
-            std::cmp::min(pipeline.max_total_threads_per_threadgroup(), count),
-            1,
-            1,
-        );
+        let grid = MTLSize {
+            width: count,
+            height: 1,
+            depth: 1,
+        };
+        let tg = MTLSize {
+            width: std::cmp::min(pipeline.maxTotalThreadsPerThreadgroup(), count),
+            height: 1,
+            depth: 1,
+        };
         enc.dispatch_threads(grid, tg);
-        enc.end_encoding();
+        enc.end();
         cb.commit();
-        cb.wait_until_completed();
+        cb.waitUntilCompleted();
 
         Ok(())
     }

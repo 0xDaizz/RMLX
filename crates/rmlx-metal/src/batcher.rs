@@ -11,26 +11,32 @@
 //!
 //! // Op 1: encode into current CB
 //! let enc = batcher.encoder();
-//! enc.set_compute_pipeline_state(&pipeline);
-//! enc.set_buffer(0, Some(buf), 0);
-//! enc.dispatch_threads(grid, tg);
+//! let pass = ComputePass::new(&enc);
+//! pass.set_pipeline(&pipeline);
+//! pass.set_buffer(0, Some(buf), 0);
+//! pass.dispatch_threads(grid, tg);
+//! pass.end();
 //! batcher.end_encoder();
 //!
 //! // Op 2: same CB
 //! let enc = batcher.encoder();
+//! let pass = ComputePass::new(&enc);
 //! // ... encode more work ...
+//! pass.end();
 //! batcher.end_encoder();
 //!
 //! // Commit all at once
-//! batcher.flush()?;
+//! batcher.flush();
 //! ```
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use metal::{CommandBuffer, CommandQueue};
+use objc2::runtime::ProtocolObject;
+use objc2_metal::*;
 
 use crate::event::GpuEvent;
 use crate::queue::fast_command_buffer_owned;
+use crate::types::*;
 
 /// Tracks how many command buffers and encoders are created (for benchmarking).
 static TOTAL_CBS_CREATED: AtomicU64 = AtomicU64::new(0);
@@ -59,8 +65,8 @@ pub fn reset_counters() {
 /// command buffer. When the encoder count reaches `max_batch`, the batcher
 /// auto-flushes. The caller can also flush manually.
 pub struct CommandBatcher<'q> {
-    queue: &'q CommandQueue,
-    current_cb: Option<CommandBuffer>,
+    queue: &'q ProtocolObject<dyn MTLCommandQueue>,
+    current_cb: Option<MtlCB>,
     encoder_count: usize,
     max_batch: usize,
     total_cbs: usize,
@@ -74,7 +80,7 @@ impl<'q> CommandBatcher<'q> {
     ///
     /// `max_batch` controls the maximum number of encoders per command buffer.
     /// Typical values: 16-64 for transformer blocks.
-    pub fn new(queue: &'q CommandQueue, max_batch: usize) -> Self {
+    pub fn new(queue: &'q ProtocolObject<dyn MTLCommandQueue>, max_batch: usize) -> Self {
         Self {
             queue,
             current_cb: None,
@@ -93,23 +99,24 @@ impl<'q> CommandBatcher<'q> {
     ///
     /// # Encoder lifecycle contract
     ///
-    /// The caller **MUST** call [`end_encoding()`](metal::ComputeCommandEncoderRef::end_encoding)
-    /// on the returned encoder *before* calling [`end_encoder()`](Self::end_encoder).
+    /// The caller **MUST** end the returned encoder (via [`ComputePass::end()`])
+    /// *before* calling [`end_encoder()`](Self::end_encoder).
     /// After `end_encoder()` is called, the encoder reference must not be used again.
     /// The typical pattern is:
     ///
     /// ```rust,ignore
     /// let enc = batcher.encoder();
+    /// let pass = ComputePass::new(&enc);
     /// // ... set pipeline, buffers, dispatch ...
-    /// enc.end_encoding();      // Metal-level: finalize the encoder
-    /// batcher.end_encoder();   // Batcher-level: mark encoder as inactive
+    /// pass.end();               // Metal-level: finalize the encoder
+    /// batcher.end_encoder();    // Batcher-level: mark encoder as inactive
     /// ```
     ///
     /// Calling `encoder()` again without first calling `end_encoder()` is
     /// tolerated (the batcher resets its internal flag), but the caller is
-    /// still responsible for calling `end_encoding()` on the Metal encoder
+    /// still responsible for ending the encoder (via `ComputePass::end()`)
     /// to avoid Metal validation errors.
-    pub fn encoder(&mut self) -> &metal::ComputeCommandEncoderRef {
+    pub fn encoder(&mut self) -> MtlEncoder {
         // End any active encoder first
         if self.encoder_active {
             self.encoder_active = false;
@@ -130,14 +137,15 @@ impl<'q> CommandBatcher<'q> {
         self.current_cb
             .as_ref()
             .expect("CB just created")
-            .new_compute_command_encoder()
+            .computeCommandEncoder()
+            .unwrap()
     }
 
     /// End the current compute command encoder.
     ///
     /// Must be called after each `encoder()` call before the next `encoder()`
     /// or `flush()` call. The caller **MUST** have already called
-    /// `end_encoding()` on the Metal encoder before calling this method.
+    /// `ComputePass::end()` on the encoder before calling this method.
     /// The encoder ref returned by `encoder()` must not be used after this call.
     ///
     /// # Panics (debug builds)
@@ -157,7 +165,7 @@ impl<'q> CommandBatcher<'q> {
     ///
     /// Creates a new CB if none exists. This is useful when ops need
     /// direct access to the command buffer (e.g., for blit encoders).
-    pub fn command_buffer(&mut self) -> &metal::CommandBufferRef {
+    pub fn command_buffer(&mut self) -> &ProtocolObject<dyn MTLCommandBuffer> {
         if self.current_cb.is_none() {
             self.current_cb = Some(fast_command_buffer_owned(self.queue));
             self.total_cbs += 1;
@@ -177,7 +185,7 @@ impl<'q> CommandBatcher<'q> {
     pub fn flush(&mut self) {
         if let Some(cb) = self.current_cb.take() {
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
         }
         self.encoder_count = 0;
     }
@@ -186,7 +194,7 @@ impl<'q> CommandBatcher<'q> {
     ///
     /// Returns the command buffer for optional later synchronization.
     /// Resets the batcher for the next batch.
-    pub fn flush_async(&mut self) -> Option<CommandBuffer> {
+    pub fn flush_async(&mut self) -> Option<MtlCB> {
         let cb = self.current_cb.take();
         if let Some(ref cb) = cb {
             cb.commit();
@@ -198,7 +206,7 @@ impl<'q> CommandBatcher<'q> {
     /// Commit the current CB and signal a GpuEvent at the given value.
     ///
     /// Used by ExecGraph for event-chained execution.
-    pub fn flush_signal(&mut self, event: &GpuEvent, value: u64) -> Option<CommandBuffer> {
+    pub fn flush_signal(&mut self, event: &GpuEvent, value: u64) -> Option<MtlCB> {
         let cb = self.current_cb.take();
         if let Some(ref cb) = cb {
             event.signal_from_command_buffer(cb, value);
@@ -245,7 +253,7 @@ impl<'q> CommandBatcher<'q> {
     }
 
     /// The underlying queue.
-    pub fn queue(&self) -> &CommandQueue {
+    pub fn queue(&self) -> &ProtocolObject<dyn MTLCommandQueue> {
         self.queue
     }
 }
@@ -287,11 +295,22 @@ impl BatcherStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::OnceLock;
+
+    fn test_device() -> Option<&'static MtlDevice> {
+        static DEVICE: OnceLock<Option<MtlDevice>> = OnceLock::new();
+        DEVICE
+            .get_or_init(|| objc2::rc::autoreleasepool(|_| MTLCreateSystemDefaultDevice()))
+            .as_ref()
+    }
 
     #[test]
     fn batcher_stats_tracking() {
-        let device = metal::Device::system_default().expect("Metal device required");
-        let queue = device.new_command_queue();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let queue = device.newCommandQueue().unwrap();
         let batcher = CommandBatcher::new(&queue, 32);
         assert_eq!(batcher.stats_cbs(), 0);
         assert_eq!(batcher.stats_encoders(), 0);
@@ -300,13 +319,16 @@ mod tests {
 
     #[test]
     fn batcher_creates_cb_on_first_encoder() {
-        let device = metal::Device::system_default().expect("Metal device required");
-        let queue = device.new_command_queue();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let queue = device.newCommandQueue().unwrap();
         let mut batcher = CommandBatcher::new(&queue, 32);
 
         let enc = batcher.encoder();
         // Just end it immediately -- no actual dispatch
-        enc.end_encoding();
+        enc.endEncoding();
         batcher.end_encoder();
 
         assert!(batcher.has_pending());
@@ -317,13 +339,16 @@ mod tests {
 
     #[test]
     fn batcher_multiple_encoders_same_cb() {
-        let device = metal::Device::system_default().expect("Metal device required");
-        let queue = device.new_command_queue();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let queue = device.newCommandQueue().unwrap();
         let mut batcher = CommandBatcher::new(&queue, 32);
 
         for _ in 0..5 {
             let enc = batcher.encoder();
-            enc.end_encoding();
+            enc.endEncoding();
             batcher.end_encoder();
         }
 
@@ -334,12 +359,15 @@ mod tests {
 
     #[test]
     fn batcher_flush_resets() {
-        let device = metal::Device::system_default().expect("Metal device required");
-        let queue = device.new_command_queue();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let queue = device.newCommandQueue().unwrap();
         let mut batcher = CommandBatcher::new(&queue, 32);
 
         let enc = batcher.encoder();
-        enc.end_encoding();
+        enc.endEncoding();
         batcher.end_encoder();
 
         batcher.flush();
@@ -350,12 +378,15 @@ mod tests {
 
     #[test]
     fn batcher_flush_async_returns_cb() {
-        let device = metal::Device::system_default().expect("Metal device required");
-        let queue = device.new_command_queue();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let queue = device.newCommandQueue().unwrap();
         let mut batcher = CommandBatcher::new(&queue, 32);
 
         let enc = batcher.encoder();
-        enc.end_encoding();
+        enc.endEncoding();
         batcher.end_encoder();
 
         let cb = batcher.flush_async();
@@ -363,18 +394,21 @@ mod tests {
         assert!(!batcher.has_pending());
 
         // Wait for it to complete
-        cb.unwrap().wait_until_completed();
+        cb.unwrap().waitUntilCompleted();
     }
 
     #[test]
     fn batcher_should_flush_at_max() {
-        let device = metal::Device::system_default().expect("Metal device required");
-        let queue = device.new_command_queue();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let queue = device.newCommandQueue().unwrap();
         let mut batcher = CommandBatcher::new(&queue, 3);
 
         for _ in 0..3 {
             let enc = batcher.encoder();
-            enc.end_encoding();
+            enc.endEncoding();
             batcher.end_encoder();
         }
 
@@ -383,20 +417,23 @@ mod tests {
 
     #[test]
     fn batcher_stats_snapshot() {
-        let device = metal::Device::system_default().expect("Metal device required");
-        let queue = device.new_command_queue();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let queue = device.newCommandQueue().unwrap();
         let mut batcher = CommandBatcher::new(&queue, 32);
 
         for _ in 0..4 {
             let enc = batcher.encoder();
-            enc.end_encoding();
+            enc.endEncoding();
             batcher.end_encoder();
         }
         batcher.flush();
 
         for _ in 0..2 {
             let enc = batcher.encoder();
-            enc.end_encoding();
+            enc.endEncoding();
             batcher.end_encoder();
         }
         batcher.flush();
@@ -412,12 +449,15 @@ mod tests {
         let before_cbs = total_cbs_created();
         let before_encs = total_encoders_created();
 
-        let device = metal::Device::system_default().expect("Metal device required");
-        let queue = device.new_command_queue();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let queue = device.newCommandQueue().unwrap();
         let mut batcher = CommandBatcher::new(&queue, 32);
 
         let enc = batcher.encoder();
-        enc.end_encoding();
+        enc.endEncoding();
         batcher.end_encoder();
         batcher.flush();
 
