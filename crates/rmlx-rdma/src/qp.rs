@@ -274,6 +274,7 @@ impl QueuePair {
             "[qp] connect: INIT→RTR OK (remote qpn={}, psn={}, gid={:02x?})",
             remote.qpn, remote.psn, &remote.gid[..4]
         );
+        eprintln!("[qp] connect: calling modify_to_rts...");
         self.modify_to_rts()?;
         eprintln!(
             "[qp] connect: RTR→RTS OK (local psn={})",
@@ -367,7 +368,9 @@ impl QueuePair {
         let mask = qp_attr_mask::STATE | qp_attr_mask::SQ_PSN;
 
         // SAFETY: self.qp is valid, attr is set for RTS transition.
+        eprintln!("[qp] modify_to_rts: calling modify_qp (sq_psn={})...", self.local_info.psn);
         let ret = unsafe { (self.lib.modify_qp)(self.qp, &mut attr, mask) };
+        eprintln!("[qp] modify_to_rts: modify_qp returned {ret}");
         if ret != 0 {
             return Err(RdmaError::QpModify(format!("RTR→RTS failed: {ret}")));
         }

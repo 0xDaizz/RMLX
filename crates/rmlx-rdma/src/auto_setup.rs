@@ -251,11 +251,6 @@ pub fn setup_network(iface: &str, local_ip: &str, peer_ip: &str) -> Result<(), A
         "interface configured with static IP",
     );
 
-    // Step 2b: Remove link-local IPs (169.254.x.x) that macOS auto-assigns.
-    // Link-local addresses pollute the GID table — JACCL requires GID index 1
-    // to be the static IP, not a link-local address.
-    remove_link_local(iface);
-
     // Step 3: Add route to peer IP via this interface
     // Try `route change` first (updates existing route), fall back to `route add`
     let route_result = run_sudo_command("route", &["-n", "change", peer_ip, "-interface", iface]);
@@ -455,65 +450,6 @@ pub fn try_auto_setup(
     );
 
     Ok(device_map)
-}
-
-// ---------------------------------------------------------------------------
-// Link-local removal
-// ---------------------------------------------------------------------------
-
-/// Remove any link-local addresses (169.254.x.x) from the given interface.
-///
-/// macOS auto-assigns a link-local address when an interface comes up.
-/// This pollutes the GID table, causing JACCL to pick the wrong GID index
-/// and RTR transitions to fail.  We parse `ifconfig <iface>` output and
-/// remove each link-local address with `sudo ifconfig <iface> -alias <ip>`.
-fn remove_link_local(iface: &str) {
-    let output = match Command::new("ifconfig").arg(iface).output() {
-        Ok(o) => o,
-        Err(e) => {
-            tracing::warn!(
-                target: "rmlx_rdma::auto_setup",
-                iface, %e,
-                "cannot query interface for link-local removal",
-            );
-            return;
-        }
-    };
-
-    let text = String::from_utf8_lossy(&output.stdout);
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if !trimmed.starts_with("inet ") {
-            continue;
-        }
-        // Format: "inet 169.254.x.x netmask ..."
-        if let Some(ip) = trimmed.split_whitespace().nth(1) {
-            if ip.starts_with("169.254.") {
-                tracing::info!(
-                    target: "rmlx_rdma::auto_setup",
-                    iface, ip,
-                    "removing link-local IP from interface",
-                );
-                let result = run_sudo_command("ifconfig", &[iface, "-alias", ip]);
-                match result {
-                    Ok(_) => {
-                        tracing::info!(
-                            target: "rmlx_rdma::auto_setup",
-                            iface, ip,
-                            "link-local IP removed",
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "rmlx_rdma::auto_setup",
-                            iface, ip, %e,
-                            "failed to remove link-local IP (non-fatal)",
-                        );
-                    }
-                }
-            }
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

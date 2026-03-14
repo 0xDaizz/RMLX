@@ -18,8 +18,8 @@ use crate::qp::{CompletionQueue, QueuePair};
 use crate::shared_buffer::{ConnectionId, SharedBuffer};
 use crate::RdmaError;
 
-/// Default size for pre-registered send/recv buffers (1 MB).
-const SHARED_BUF_SIZE: usize = 1024 * 1024;
+/// Default size for pre-registered send/recv buffers (JACCL FRAME_SIZE).
+const SHARED_BUF_SIZE: usize = 4096; // JACCL FRAME_SIZE
 
 /// Pre-registered RDMA buffer (JACCL SharedBuffer equivalent).
 ///
@@ -39,32 +39,41 @@ impl SharedRdmaBuffer {
         let lib = pd.lib();
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         let page_size = if page_size > 0 { page_size as usize } else { 16384 };
-        let aligned_size = (size + page_size - 1) & !(page_size - 1);
-        let aligned_size = aligned_size.max(page_size);
+        // posix_memalign requires size >= alignment, so allocate at least
+        // page_size bytes.  However, ibv_reg_mr should register only the
+        // actually requested size — macOS TB5 limits 16 KB MRs to 1 per PD,
+        // so registering e.g. 4 KB instead of inflating to 16 KB avoids
+        // hitting that limit.
+        let alloc_size = size.max(page_size); // allocation must be >= page_size for memalign
+        let reg_size = size; // register only what was requested
 
         let mut buf: *mut c_void = std::ptr::null_mut();
-        let ret = unsafe { libc::posix_memalign(&mut buf, page_size, aligned_size) };
+        eprintln!("[SharedRdmaBuffer] posix_memalign alloc_size={} reg_size={}...", alloc_size, reg_size);
+        let ret = unsafe { libc::posix_memalign(&mut buf, page_size, alloc_size) };
         if ret != 0 || buf.is_null() {
             return Err(RdmaError::MrReg(format!(
-                "SharedRdmaBuffer posix_memalign failed: ret={ret}, size={aligned_size}"
+                "SharedRdmaBuffer posix_memalign failed: ret={ret}, alloc_size={alloc_size}"
             )));
         }
+        eprintln!("[SharedRdmaBuffer] posix_memalign OK, buf={:?}", buf);
         // Zero-initialize
-        unsafe { std::ptr::write_bytes(buf as *mut u8, 0, aligned_size) };
+        unsafe { std::ptr::write_bytes(buf as *mut u8, 0, alloc_size) };
 
         let flags =
             access_flags::LOCAL_WRITE | access_flags::REMOTE_WRITE | access_flags::REMOTE_READ;
-        let mr = unsafe { (lib.reg_mr)(pd.raw(), buf, aligned_size, flags) };
+        eprintln!("[SharedRdmaBuffer] ibv_reg_mr size={}...", reg_size);
+        let mr = unsafe { (lib.reg_mr)(pd.raw(), buf, reg_size, flags) };
+        eprintln!("[SharedRdmaBuffer] ibv_reg_mr result={}", if mr.is_null() { "FAILED" } else { "OK" });
         if mr.is_null() {
             unsafe { libc::free(buf) };
             return Err(RdmaError::MrReg(format!(
-                "SharedRdmaBuffer ibv_reg_mr failed: buf={buf:?}, size={aligned_size}"
+                "SharedRdmaBuffer ibv_reg_mr failed: buf={buf:?}, reg_size={reg_size}"
             )));
         }
 
         Ok(Self {
             buf,
-            size: aligned_size,
+            size: reg_size,
             mr,
             lib,
         })
@@ -411,15 +420,9 @@ impl RdmaConnection {
         cq: CompletionQueue,
         qp: QueuePair,
         config: RdmaConfig,
+        send_buf: Option<SharedRdmaBuffer>,
+        recv_buf: Option<SharedRdmaBuffer>,
     ) -> Self {
-        // Pre-register send/recv buffers (best-effort; None on failure)
-        let send_buf = SharedRdmaBuffer::new(&pd, SHARED_BUF_SIZE)
-            .inspect_err(|e| eprintln!("[rdma] send_buf alloc failed: {e}"))
-            .ok();
-        let recv_buf = SharedRdmaBuffer::new(&pd, SHARED_BUF_SIZE)
-            .inspect_err(|e| eprintln!("[rdma] recv_buf alloc failed: {e}"))
-            .ok();
-
         Self {
             config,
             completion_backlog: Mutex::new(Vec::new()),
@@ -582,8 +585,12 @@ impl RdmaConnection {
             mr.addr() as u64, mr.length(), mr.lkey());
 
         // SAFETY: sge is valid and points into the registered MR.
-        // wr is zero-initialized and all required fields are set.
-        let mut wr: IbvSendWr = unsafe { std::mem::zeroed() };
+        // JACCL compatible: leave unused fields uninitialized instead of zeroed.
+        // macOS TB5 driver may interpret zero values in imm_data/wr union differently.
+        // All fields read by ibv_post_send (wr_id, next, sg_list, num_sge, opcode,
+        // send_flags) are set immediately below; remaining fields are don't-care for SEND.
+        #[allow(invalid_value)]
+        let mut wr: IbvSendWr = unsafe { std::mem::MaybeUninit::uninit().assume_init() };
         wr.wr_id = wr_id;
         wr.next = std::ptr::null_mut();
         wr.sg_list = &mut sge;
@@ -941,7 +948,10 @@ impl RdmaConnection {
             lkey: sbuf.lkey(),
         };
 
-        let mut wr: IbvSendWr = unsafe { std::mem::zeroed() };
+        // JACCL compatible: leave unused fields uninitialized instead of zeroed.
+        // macOS TB5 driver may interpret zero values in imm_data/wr union differently.
+        #[allow(invalid_value)]
+        let mut wr: IbvSendWr = unsafe { std::mem::MaybeUninit::uninit().assume_init() };
         wr.wr_id = wr_id;
         wr.next = std::ptr::null_mut();
         wr.sg_list = &mut sge;

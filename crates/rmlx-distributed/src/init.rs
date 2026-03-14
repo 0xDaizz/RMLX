@@ -19,7 +19,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use rmlx_rdma::connection::{RdmaConfig, RdmaConnection};
+use rmlx_rdma::connection::{RdmaConfig, RdmaConnection, SharedRdmaBuffer};
 use rmlx_rdma::context::RdmaContext;
 use rmlx_rdma::coordinator::CoordinatorConfig;
 use rmlx_rdma::device_file::DeviceMap;
@@ -28,7 +28,7 @@ use rmlx_rdma::qp::{CompletionQueue, QpInfo, QueuePair};
 
 use crate::group::{DistributedError, Group};
 use crate::transport::RdmaConnectionTransport;
-use crate::warmup::{WarmupConfig, WarmupResult, WarmupState};
+use crate::warmup::WarmupResult;
 
 // ── Public types ──
 
@@ -352,6 +352,8 @@ fn try_rdma_init(
         pd: rmlx_rdma::context::ProtectionDomain,
         cq: CompletionQueue,
         qp: QueuePair,
+        send_buf: Option<SharedRdmaBuffer>,
+        recv_buf: Option<SharedRdmaBuffer>,
     }
 
     let mut slots: Vec<Option<QpSlot>> = (0..world_size).map(|_| None).collect();
@@ -400,7 +402,17 @@ fn try_rdma_init(
             .map_err(|e| DistributedError::Transport(e.to_string()))?;
         local_infos[peer as usize] = qp.local_info().clone();
 
-        slots[peer as usize] = Some(QpSlot { ctx, pd, cq, qp });
+        // JACCL pattern: register MR before QP connect (QP is in RESET state)
+        eprintln!("[rdma-init] peer={peer}: registering SharedRdmaBuffers...");
+        let send_buf = SharedRdmaBuffer::new(&pd, 4096)
+            .inspect_err(|e| eprintln!("[rdma-init] send_buf failed: {e}"))
+            .ok();
+        let recv_buf = SharedRdmaBuffer::new(&pd, 4096)
+            .inspect_err(|e| eprintln!("[rdma-init] recv_buf failed: {e}"))
+            .ok();
+        eprintln!("[rdma-init] peer={peer}: send_buf={} recv_buf={}", send_buf.is_some(), recv_buf.is_some());
+
+        slots[peer as usize] = Some(QpSlot { ctx, pd, cq, qp, send_buf, recv_buf });
         eprintln!("[rdma-init] peer={peer}: QP created");
     }
     eprintln!("[rdma-init] Phase 1a complete, starting coordinator exchange...");
@@ -506,6 +518,8 @@ fn try_rdma_init(
             slot.cq,
             slot.qp,
             peer_config,
+            slot.send_buf,
+            slot.recv_buf,
         ));
     }
 
@@ -533,53 +547,9 @@ fn try_rdma_init(
         "connected to peers",
     );
 
-    // ── Warmup: RDMA ping-pong + JIT shader pre-compilation + calibration ──
-    // Run warmup after connection establishment to ensure RDMA paths are hot
-    // and Metal shaders are JIT-compiled before the first real dispatch.
-    let warmup_result = {
-        let mut state = WarmupState::new();
-        let warmup_config = WarmupConfig::default();
-        match state.run_warmup(
-            &warmup_config,
-            // RDMA warmup: run barrier rounds to verify all QP paths are hot.
-            // In UC mode, if one side sends before the other has posted recv,
-            // data is silently dropped.  Barrier uses ring sendrecv internally,
-            // ensuring every peer pair exchanges at least one message.
-            || {
-                // Multiple barrier rounds to synchronize rank timing (JACCL warmup pattern).
-                // UC mode drops packets if recv WR isn't posted before send arrives;
-                // repeated barriers ensure both sides converge to synchronized timing.
-                const WARMUP_ROUNDS: usize = 5;
-                for round in 0..WARMUP_ROUNDS {
-                    eprintln!("[rdma-init] warmup barrier round {round}/{WARMUP_ROUNDS}...");
-                    group.barrier().map_err(|e| {
-                        format!("RDMA warmup barrier round {round} failed: {e}")
-                    })?;
-                }
-                eprintln!("[rdma-init] warmup barriers done");
-                Ok(())
-            },
-            // JIT warmup: no-op (kernel registry is not available at init time;
-            // JIT pre-compilation happens when the kernel registry is first used).
-            || Ok(()),
-        ) {
-            Ok(result) => {
-                tracing::info!(
-                    target: "rmlx_distributed",
-                    rdma_warmup = ?result.rdma_warmup,
-                    jit_warmup = ?result.jit_warmup,
-                    calibration = ?result.calibration,
-                    total = ?result.total,
-                    "warmup complete",
-                );
-                Some(result)
-            }
-            Err(e) => {
-                tracing::warn!(target: "rmlx_distributed", %e, "warmup failed (non-fatal)");
-                None
-            }
-        }
-    };
+    // No additional warmup needed — QP exchange already synchronized both ranks.
+    // JACCL pattern: TCP all_gather for QP info exchange serves as the barrier.
+    let warmup_result: Option<WarmupResult> = None;
 
     Ok(DistributedContext {
         group,
