@@ -4,7 +4,7 @@
 //! Supports adding/removing peers, topology-aware peer selection,
 //! and iteration over all connections.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use crate::connection::RdmaConnection;
 use crate::multi_port::Topology;
@@ -22,7 +22,7 @@ pub struct ConnectionManager {
     /// Topology used for peer selection.
     topology: Topology,
     /// Active connections, keyed by peer rank.
-    connections: HashMap<u32, RdmaConnection>,
+    connections: FxHashMap<u32, RdmaConnection>,
 }
 
 impl ConnectionManager {
@@ -32,7 +32,7 @@ impl ConnectionManager {
             rank,
             world_size,
             topology,
-            connections: HashMap::new(),
+            connections: FxHashMap::default(),
         }
     }
 

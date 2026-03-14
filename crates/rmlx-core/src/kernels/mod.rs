@@ -4,10 +4,11 @@
 //! Supports Metal function constants for type specialization.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicPtr, Ordering};
-use std::sync::RwLock;
+
+use parking_lot::RwLock;
+use rustc_hash::FxHashMap;
 
 use objc2_foundation::NSString;
 use objc2_metal::MTLCompileOptions;
@@ -105,8 +106,8 @@ pub struct KernelRegistry {
     /// JIT cache: name -> (source text, compiled Library).
     /// The source text is retained so that [`DiskPipelineCache`] can compute a
     /// stable SHA-256 key when a pipeline miss occurs.
-    jit_cache: RwLock<HashMap<String, JitEntry>>,
-    pipelines: RwLock<HashMap<PipelineKey, MtlPipeline>>,
+    jit_cache: RwLock<FxHashMap<String, JitEntry>>,
+    pipelines: RwLock<FxHashMap<PipelineKey, MtlPipeline>>,
     /// Persistent disk-backed pipeline cache.  `None` only when explicitly
     /// disabled (e.g., in tests via `new_without_disk_cache`).
     disk_cache: Option<DiskPipelineCache>,
@@ -118,7 +119,7 @@ pub struct KernelRegistry {
     ///
     /// Pipelines added after `freeze()` (e.g., JIT compilation of new kernels)
     /// go into the `RwLock` map; call `freeze()` again to capture them.
-    frozen_pipelines: AtomicPtr<HashMap<PipelineKey, MtlPipeline>>,
+    frozen_pipelines: AtomicPtr<FxHashMap<PipelineKey, MtlPipeline>>,
 }
 
 /// A JIT-compiled library together with the source text it was compiled from.
@@ -150,8 +151,8 @@ impl KernelRegistry {
         Self {
             device,
             aot_lib,
-            jit_cache: RwLock::new(HashMap::new()),
-            pipelines: RwLock::new(HashMap::new()),
+            jit_cache: RwLock::new(FxHashMap::default()),
+            pipelines: RwLock::new(FxHashMap::default()),
             disk_cache,
             frozen_pipelines: AtomicPtr::new(std::ptr::null_mut()),
         }
@@ -177,8 +178,8 @@ impl KernelRegistry {
         Self {
             device,
             aot_lib,
-            jit_cache: RwLock::new(HashMap::new()),
-            pipelines: RwLock::new(HashMap::new()),
+            jit_cache: RwLock::new(FxHashMap::default()),
+            pipelines: RwLock::new(FxHashMap::default()),
             disk_cache: None,
             frozen_pipelines: AtomicPtr::new(std::ptr::null_mut()),
         }
@@ -213,10 +214,7 @@ impl KernelRegistry {
 
         // 1b. Check in-memory pipeline cache (read lock)
         {
-            let cache = self
-                .pipelines
-                .read()
-                .map_err(|_| KernelError::Internal("pipeline cache lock poisoned".into()))?;
+            let cache = self.pipelines.read();
             if let Some(pipeline) = cache.get(&lookup_key) {
                 return Ok(pipeline.clone());
             }
@@ -234,9 +232,7 @@ impl KernelRegistry {
             if let Some(source) = self.find_jit_source_for_kernel(kernel_name) {
                 if let Ok(pso) = disk.get_or_compile(&source, kernel_name, &[]) {
                     // Store in the in-memory cache for future fast-path hits.
-                    if let Ok(mut cache) = self.pipelines.write() {
-                        cache.insert(key, pso.clone());
-                    }
+                    self.pipelines.write().insert(key, pso.clone());
                     return Ok(pso);
                 }
             }
@@ -252,10 +248,7 @@ impl KernelRegistry {
         let function = match function {
             Some(f) => f,
             None => {
-                let jit = self
-                    .jit_cache
-                    .read()
-                    .map_err(|_| KernelError::Internal("JIT cache lock poisoned".into()))?;
+                let jit = self.jit_cache.read();
                 let jit_fn = jit.values().find_map(|entry| {
                     entry
                         .library
@@ -281,11 +274,7 @@ impl KernelRegistry {
 
         // 6. Cache it (write lock)
         {
-            let mut cache = self
-                .pipelines
-                .write()
-                .map_err(|_| KernelError::Internal("pipeline cache lock poisoned".into()))?;
-            cache.insert(key, pipeline.clone());
+            self.pipelines.write().insert(key, pipeline.clone());
         }
 
         Ok(pipeline)
@@ -345,10 +334,7 @@ impl KernelRegistry {
         }
 
         // Try JIT cache.
-        let jit = self
-            .jit_cache
-            .read()
-            .map_err(|_| KernelError::Internal("JIT cache lock poisoned".into()))?;
+        let jit = self.jit_cache.read();
 
         for entry in jit.values() {
             match try_library(&entry.library, fcv) {
@@ -399,10 +385,7 @@ impl KernelRegistry {
 
         // 1b. Check in-memory pipeline cache (read lock)
         {
-            let cache = self
-                .pipelines
-                .read()
-                .map_err(|_| KernelError::Internal("pipeline cache lock poisoned".into()))?;
+            let cache = self.pipelines.read();
             if let Some(pipeline) = cache.get(&lookup_key) {
                 return Ok(pipeline.clone());
             }
@@ -420,9 +403,7 @@ impl KernelRegistry {
             let disk_constants = Self::to_disk_constants(constants);
             if let Some(source) = self.find_jit_source_for_kernel(kernel_name) {
                 if let Ok(pso) = disk.get_or_compile(&source, kernel_name, &disk_constants) {
-                    if let Ok(mut cache) = self.pipelines.write() {
-                        cache.insert(key, pso.clone());
-                    }
+                    self.pipelines.write().insert(key, pso.clone());
                     return Ok(pso);
                 }
             }
@@ -483,11 +464,7 @@ impl KernelRegistry {
 
         // 6. Cache it (write lock)
         {
-            let mut cache = self
-                .pipelines
-                .write()
-                .map_err(|_| KernelError::Internal("pipeline cache lock poisoned".into()))?;
-            cache.insert(key, pipeline.clone());
+            self.pipelines.write().insert(key, pipeline.clone());
         }
 
         Ok(pipeline)
@@ -504,10 +481,7 @@ impl KernelRegistry {
             .newLibraryWithSource_options_error(&NSString::from_str(source), Some(&options))
             .map_err(|e| KernelError::CompilationFailed(format!("{name}: {e}")))?;
 
-        let mut cache = self
-            .jit_cache
-            .write()
-            .map_err(|_| KernelError::Internal("JIT cache lock poisoned".into()))?;
+        let mut cache = self.jit_cache.write();
         cache.insert(
             name.to_string(),
             JitEntry {
@@ -525,10 +499,7 @@ impl KernelRegistry {
         source: &str,
     ) -> Result<(), KernelError> {
         {
-            let cache = self
-                .jit_cache
-                .read()
-                .map_err(|_| KernelError::Internal("JIT cache lock poisoned".into()))?;
+            let cache = self.jit_cache.read();
             if cache.contains_key(name) {
                 return Ok(());
             }
@@ -547,21 +518,13 @@ impl KernelRegistry {
     }
 
     /// Number of cached pipeline states.
-    pub fn cached_pipeline_count(&self) -> Result<usize, KernelError> {
-        let cache = self
-            .pipelines
-            .read()
-            .map_err(|_| KernelError::Internal("pipeline cache lock poisoned".into()))?;
-        Ok(cache.len())
+    pub fn cached_pipeline_count(&self) -> usize {
+        self.pipelines.read().len()
     }
 
     /// Number of JIT-compiled libraries.
-    pub fn jit_library_count(&self) -> Result<usize, KernelError> {
-        let cache = self
-            .jit_cache
-            .read()
-            .map_err(|_| KernelError::Internal("JIT cache lock poisoned".into()))?;
-        Ok(cache.len())
+    pub fn jit_library_count(&self) -> usize {
+        self.jit_cache.read().len()
     }
 
     /// Register a kernel source with compile-time constant specialization.
@@ -652,11 +615,7 @@ impl KernelRegistry {
             }
         }
 
-        let mut cache = self
-            .pipelines
-            .write()
-            .map_err(|_| KernelError::Internal("pipeline cache lock poisoned".into()))?;
-        cache.clear();
+        self.pipelines.write().clear();
         Ok(())
     }
 
@@ -677,12 +636,7 @@ impl KernelRegistry {
     /// still be found via the `RwLock` fallback; call `freeze()` again to
     /// capture them in the snapshot.
     pub fn freeze(&self) {
-        let snap = Box::new(
-            self.pipelines
-                .read()
-                .expect("pipeline cache lock poisoned during freeze")
-                .clone(),
-        );
+        let snap = Box::new(self.pipelines.read().clone());
         let old = self
             .frozen_pipelines
             .swap(Box::into_raw(snap), Ordering::AcqRel);
@@ -723,7 +677,7 @@ impl KernelRegistry {
     /// Returns the source of the first JIT entry whose compiled library
     /// contains a function named `kernel_name`.
     fn find_jit_source_for_kernel(&self, kernel_name: &str) -> Option<String> {
-        let jit = self.jit_cache.read().ok()?;
+        let jit = self.jit_cache.read();
         for entry in jit.values() {
             if entry
                 .library
@@ -858,9 +812,7 @@ kernel void test_plain_kernel(
         );
 
         // 5. Pipeline cache should contain 2 entries (two distinct specializations).
-        let count = registry
-            .cached_pipeline_count()
-            .expect("should read pipeline count");
+        let count = registry.cached_pipeline_count();
         assert_eq!(count, 2, "expected 2 cached pipelines");
     }
 

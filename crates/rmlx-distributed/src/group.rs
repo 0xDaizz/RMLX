@@ -7,33 +7,24 @@ use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLDevice;
 
 /// Error type for distributed operations.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum DistributedError {
     /// Arrays must be materialized (data resident in GPU buffer) before collective ops.
+    #[error("not materialized: {0}")]
     NotMaterialized(String),
     /// RDMA transport error (wraps rmlx_rdma::RdmaError description).
+    #[error("transport error: {0}")]
     Transport(String),
     /// Wire protocol or data format error (e.g., byte slice conversion failure).
+    #[error("protocol error: {0}")]
     Protocol(String),
     /// Configuration error (missing env vars, invalid configuration values).
+    #[error("config error: {0}")]
     Config(String),
     /// Backend unavailable (RDMA hardware not found, backend not available).
+    #[error("backend unavailable: {0}")]
     BackendUnavailable(String),
 }
-
-impl fmt::Display for DistributedError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NotMaterialized(msg) => write!(f, "not materialized: {msg}"),
-            Self::Transport(msg) => write!(f, "transport error: {msg}"),
-            Self::Protocol(msg) => write!(f, "protocol error: {msg}"),
-            Self::Config(msg) => write!(f, "config error: {msg}"),
-            Self::BackendUnavailable(msg) => write!(f, "backend unavailable: {msg}"),
-        }
-    }
-}
-
-impl std::error::Error for DistributedError {}
 
 /// Verify all arrays are materialized before a collective operation.
 ///

@@ -17,10 +17,11 @@
 //! on pipeline miss the registry delegates to `DiskPipelineCache` before
 //! falling back to runtime MSL compilation.
 
-use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::RwLock;
+
+use parking_lot::RwLock;
+use rustc_hash::FxHashMap;
 
 use objc2::runtime::{NSObjectProtocol, ProtocolObject};
 use objc2::sel;
@@ -83,8 +84,8 @@ impl MtlLibrarySerializeExt for ProtocolObject<dyn MTLLibrary> {
 pub struct DiskPipelineCache {
     device: MtlDevice,
     cache_dir: PathBuf,
-    /// In-memory cache: cache-key -> (Library, HashMap<function_name, PSO>)
-    memory: RwLock<HashMap<String, CacheEntry>>,
+    /// In-memory cache: cache-key -> (Library, FxHashMap<function_name, PSO>)
+    memory: RwLock<FxHashMap<String, CacheEntry>>,
     /// Metal 4 async compiler, lazily initialized on first Metal 4 call.
     #[cfg(feature = "metal4")]
     mtl4_compiler: OnceLock<AsyncCompiler>,
@@ -95,7 +96,7 @@ struct CacheEntry {
     /// PSOs that reference them.
     #[allow(dead_code)]
     library: MtlLibrary,
-    pipelines: HashMap<String, MtlPipeline>,
+    pipelines: FxHashMap<String, MtlPipeline>,
 }
 
 impl DiskPipelineCache {
@@ -108,7 +109,7 @@ impl DiskPipelineCache {
         Self {
             device: retain_proto(device),
             cache_dir,
-            memory: RwLock::new(HashMap::new()),
+            memory: RwLock::new(FxHashMap::default()),
             #[cfg(feature = "metal4")]
             mtl4_compiler: OnceLock::new(),
         }
@@ -121,7 +122,7 @@ impl DiskPipelineCache {
         Self {
             device: retain_proto(device),
             cache_dir,
-            memory: RwLock::new(HashMap::new()),
+            memory: RwLock::new(FxHashMap::default()),
             #[cfg(feature = "metal4")]
             mtl4_compiler: OnceLock::new(),
         }
@@ -149,9 +150,7 @@ impl DiskPipelineCache {
 
         // --- In-memory fast path (read lock) ---
         {
-            let mem = self.memory.read().map_err(|_| {
-                MetalError::PipelineCreate("disk pipeline cache lock poisoned".to_string())
-            })?;
+            let mem = self.memory.read();
             if let Some(entry) = mem.get(&cache_key) {
                 if let Some(pso) = entry.pipelines.get(function_name) {
                     return Ok(retain_proto(&**pso));
@@ -160,9 +159,7 @@ impl DiskPipelineCache {
         }
 
         // --- Disk / compile path (write lock) ---
-        let mut mem = self.memory.write().map_err(|_| {
-            MetalError::PipelineCreate("disk pipeline cache lock poisoned".to_string())
-        })?;
+        let mut mem = self.memory.write();
 
         // Double-check after acquiring write lock.
         if let Some(entry) = mem.get(&cache_key) {
@@ -190,7 +187,7 @@ impl DiskPipelineCache {
         let cloned = retain_proto(&*pso);
         let entry = mem.entry(cache_key).or_insert_with(|| CacheEntry {
             library,
-            pipelines: HashMap::new(),
+            pipelines: FxHashMap::default(),
         });
         entry.pipelines.insert(function_name.to_string(), pso);
 
@@ -199,7 +196,7 @@ impl DiskPipelineCache {
 
     /// Number of in-memory cache entries.
     pub fn len(&self) -> usize {
-        self.memory.read().map(|m| m.len()).unwrap_or(0)
+        self.memory.read().len()
     }
 
     /// Whether the in-memory cache is empty.
@@ -209,9 +206,7 @@ impl DiskPipelineCache {
 
     /// Clear in-memory cache (does not remove disk files).
     pub fn clear_memory(&self) {
-        if let Ok(mut mem) = self.memory.write() {
-            mem.clear();
-        }
+        self.memory.write().clear();
     }
 
     // -----------------------------------------------------------------------
@@ -344,11 +339,12 @@ impl DiskPipelineCache {
         }
 
         // Store in memory cache.
-        if let Ok(mut mem) = self.memory.write() {
+        {
+            let mut mem = self.memory.write();
             let pso_clone = retain_proto(&*pso);
             let entry = mem.entry(cache_key).or_insert_with(|| CacheEntry {
                 library,
-                pipelines: HashMap::new(),
+                pipelines: FxHashMap::default(),
             });
             entry.pipelines.insert(fn_name.to_string(), pso_clone);
         }
@@ -377,9 +373,7 @@ impl DiskPipelineCache {
 
         // --- In-memory fast path (read lock) ---
         {
-            let mem = self.memory.read().map_err(|_| {
-                MetalError::PipelineCreate("disk pipeline cache lock poisoned".to_string())
-            })?;
+            let mem = self.memory.read();
             if let Some(entry) = mem.get(&cache_key) {
                 if let Some(pso) = entry.pipelines.get(fn_name) {
                     return Ok(retain_proto(&**pso));
@@ -388,9 +382,7 @@ impl DiskPipelineCache {
         }
 
         // --- Disk / compile path (write lock) ---
-        let mut mem = self.memory.write().map_err(|_| {
-            MetalError::PipelineCreate("disk pipeline cache lock poisoned".to_string())
-        })?;
+        let mut mem = self.memory.write();
 
         // Double-check after acquiring write lock.
         if let Some(entry) = mem.get(&cache_key) {
@@ -425,7 +417,7 @@ impl DiskPipelineCache {
         let cloned = retain_proto(&*pso);
         let entry = mem.entry(cache_key).or_insert_with(|| CacheEntry {
             library,
-            pipelines: HashMap::new(),
+            pipelines: FxHashMap::default(),
         });
         entry.pipelines.insert(fn_name.to_string(), pso);
 
@@ -481,7 +473,14 @@ fn compute_cache_key(
 
     let hash = hasher.finalize();
     // Hex-encode the hash.
-    hash.iter().map(|b| format!("{b:02x}")).collect()
+    {
+        let mut s = String::with_capacity(64);
+        for b in hash.iter() {
+            use std::fmt::Write;
+            write!(s, "{b:02x}").unwrap();
+        }
+        s
+    }
 }
 
 // ---------------------------------------------------------------------------

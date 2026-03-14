@@ -1,7 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::sync::Mutex;
+
+use parking_lot::Mutex;
+use rustc_hash::FxHashSet;
 
 use objc2_metal::{MTLBuffer as _, MTLDevice as _, MTLResource as _};
 use rmlx_metal::device::GpuDevice;
@@ -46,7 +48,7 @@ pub struct MetalAllocator {
     allocated_bytes: AtomicUsize,
     /// Set of GPU addresses for buffers currently owned by this allocator
     /// (PR 4.2). Used to detect double-free and freeing unowned buffers.
-    owned_ptrs: Mutex<HashSet<u64>>,
+    owned_ptrs: Mutex<FxHashSet<u64>>,
     /// Small-buffer pool for allocations <= 256 bytes (PR 4.3).
     /// Recycles fixed-size Metal buffers to reduce runtime overhead for
     /// tiny allocations.
@@ -115,7 +117,7 @@ impl MetalAllocator {
             gc_limit: DEFAULT_GC_LIMIT,
             memory_limit: AtomicUsize::new(0),
             allocated_bytes: AtomicUsize::new(0),
-            owned_ptrs: Mutex::new(HashSet::new()),
+            owned_ptrs: Mutex::new(FxHashSet::default()),
             small_pool,
             small_allocs: Mutex::new(HashMap::new()),
             leak_detector: LeakDetector::new(),
@@ -157,14 +159,12 @@ impl MetalAllocator {
     /// Set the maximum cache size (A12). Adjusts the underlying `BufferCache`
     /// limit and evicts excess if necessary.
     pub fn set_cache_limit(&self, limit: usize) {
-        if let Ok(mut cache) = self.cache.lock() {
-            cache.set_max_cache_size(limit);
-        }
+        self.cache.lock().set_max_cache_size(limit);
     }
 
     /// Get the current cache limit.
     pub fn cache_limit(&self) -> usize {
-        self.cache.lock().map(|c| c.max_cache_size()).unwrap_or(0)
+        self.cache.lock().max_cache_size()
     }
 
     /// Reset peak memory to current active memory (A12).
@@ -223,9 +223,7 @@ impl MetalAllocator {
 
     /// Track a buffer's GPU address in the ownership set (PR 4.2).
     fn track_buffer(&self, buf: &rmlx_metal::MtlBuffer) {
-        if let Ok(mut set) = self.owned_ptrs.lock() {
-            set.insert(buf.gpuAddress());
-        }
+        self.owned_ptrs.lock().insert(buf.gpuAddress());
     }
 
     /// Get the current atomically-tracked allocated bytes (PR 4.1).
@@ -277,15 +275,18 @@ impl MetalAllocator {
                 // for sub-allocation — all slots share the same address).
                 self.track_buffer(&buf);
                 // Register with residency manager if available.
-                if let Ok(mut guard) = self.residency.lock() {
-                    if let Some(ref mut mgr) = *guard {
+                {
+                    let mut rguard = self.residency.lock();
+                    if let Some(ref mut mgr) = *rguard {
                         mgr.add_buffer(&buf);
                     }
                 }
                 // Track the SmallAllocation so free() can return the slot.
-                if let Ok(mut map) = self.small_allocs.lock() {
-                    map.entry(addr).or_default().push(small);
-                }
+                self.small_allocs
+                    .lock()
+                    .entry(addr)
+                    .or_default()
+                    .push(small);
                 guard.defuse();
                 return Ok((buf, sub_offset));
             }
@@ -296,11 +297,7 @@ impl MetalAllocator {
         let guard = ReservationGuard::new(self, size);
 
         // Try cache first.
-        let cached = self
-            .cache
-            .lock()
-            .map_err(|_| AllocError::MutexPoisoned)?
-            .acquire(size);
+        let cached = self.cache.lock().acquire(size);
         if let Some(buf) = cached {
             let actual = buf.length();
             // Adjust reservation if the cached buffer differs in size.
@@ -318,8 +315,9 @@ impl MetalAllocator {
             self.leak_detector.record_alloc(actual as u64);
             self.track_buffer(&buf);
             // Register with residency manager if available.
-            if let Ok(mut guard) = self.residency.lock() {
-                if let Some(ref mut mgr) = *guard {
+            {
+                let mut rguard = self.residency.lock();
+                if let Some(ref mut mgr) = *rguard {
                     mgr.add_buffer(&buf);
                 }
             }
@@ -331,7 +329,7 @@ impl MetalAllocator {
         // before falling through to a device allocation.
         self.stats.record_cache_miss();
         if self.gc_limit > 0 {
-            let mut cache = self.cache.lock().map_err(|_| AllocError::MutexPoisoned)?;
+            let mut cache = self.cache.lock();
             let pressure = self
                 .stats
                 .active()
@@ -364,8 +362,9 @@ impl MetalAllocator {
         self.leak_detector.record_alloc(alloc_size as u64);
         self.track_buffer(&buf);
         // Register with residency manager if available.
-        if let Ok(mut guard) = self.residency.lock() {
-            if let Some(ref mut mgr) = *guard {
+        {
+            let mut rguard = self.residency.lock();
+            if let Some(ref mut mgr) = *rguard {
                 mgr.add_buffer(&buf);
             }
         }
@@ -373,12 +372,11 @@ impl MetalAllocator {
         // A11: Post-allocation cache trimming. If total memory (active + cache)
         // exceeds the GC limit after a large allocation, trim the cache.
         if self.gc_limit > 0 {
-            if let Ok(mut cache) = self.cache.lock() {
-                let total = self.stats.active().saturating_add(cache.cache_size());
-                if total > self.gc_limit {
-                    let overshoot = total - self.gc_limit;
-                    cache.evict(overshoot);
-                }
+            let mut cache = self.cache.lock();
+            let total = self.stats.active().saturating_add(cache.cache_size());
+            if total > self.gc_limit {
+                let overshoot = total - self.gc_limit;
+                cache.evict(overshoot);
             }
         }
 
@@ -410,15 +408,18 @@ impl MetalAllocator {
         // Check if this buffer came from the small-buffer pool FIRST (P7-10).
         // With sub-allocation all small allocs share the same gpu_address, so
         // we must check before owned_ptrs (which uses a HashSet).
-        let small = self.small_allocs.lock().ok().and_then(|mut map| {
-            let vec = map.get_mut(&addr)?;
-            let item = vec.pop();
-            // Remove the key entirely if the vec is now empty.
-            if vec.is_empty() {
-                map.remove(&addr);
+        let small = {
+            let mut map = self.small_allocs.lock();
+            if let Some(vec) = map.get_mut(&addr) {
+                let item = vec.pop();
+                if vec.is_empty() {
+                    map.remove(&addr);
+                }
+                item
+            } else {
+                None
             }
-            item
-        });
+        };
 
         if let Some(mut small_alloc) = small {
             let slot_size = self.small_pool.slot_size();
@@ -426,23 +427,18 @@ impl MetalAllocator {
             self.leak_detector.record_free(slot_size as u64);
 
             // Remove from residency manager if present.
-            if let Ok(mut guard) = self.residency.lock() {
-                if let Some(ref mut mgr) = *guard {
+            {
+                let mut rguard = self.residency.lock();
+                if let Some(ref mut mgr) = *rguard {
                     mgr.remove_buffer(&buffer);
                 }
             }
 
             // Only remove from owned_ptrs when no more small allocs remain
             // for this backing buffer address.
-            let no_more_small = self
-                .small_allocs
-                .lock()
-                .map(|map| !map.contains_key(&addr))
-                .unwrap_or(false);
+            let no_more_small = !self.small_allocs.lock().contains_key(&addr);
             if no_more_small {
-                if let Ok(mut set) = self.owned_ptrs.lock() {
-                    set.remove(&addr);
-                }
+                self.owned_ptrs.lock().remove(&addr);
             }
 
             // Return the slot to the small-buffer pool.
@@ -459,10 +455,7 @@ impl MetalAllocator {
 
         // Ownership check (PR 4.2): only free buffers we actually own.
         {
-            let mut set = self
-                .owned_ptrs
-                .lock()
-                .map_err(|_| AllocError::MutexPoisoned)?;
+            let mut set = self.owned_ptrs.lock();
             if !set.remove(&addr) {
                 return Err(AllocError::InvalidFreeBuffer(buffer));
             }
@@ -472,17 +465,15 @@ impl MetalAllocator {
         self.leak_detector.record_free(size as u64);
 
         // Remove from residency manager if present.
-        if let Ok(mut guard) = self.residency.lock() {
-            if let Some(ref mut mgr) = *guard {
+        {
+            let mut rguard = self.residency.lock();
+            if let Some(ref mut mgr) = *rguard {
                 mgr.remove_buffer(&buffer);
             }
         }
 
         self.release_reserved(size);
-        if let Ok(mut cache) = self.cache.lock() {
-            cache.release(buffer);
-        }
-        // If mutex is poisoned, the buffer is simply dropped (freed).
+        self.cache.lock().release(buffer);
         Ok(())
     }
 
@@ -493,9 +484,7 @@ impl MetalAllocator {
 
     /// Clear the buffer cache, freeing all cached buffers.
     pub fn clear_cache(&self) {
-        if let Ok(mut cache) = self.cache.lock() {
-            cache.clear();
-        }
+        self.cache.lock().clear();
     }
 
     /// Get the leak detector (PR 4.3).
@@ -510,19 +499,15 @@ impl MetalAllocator {
 
     /// Returns `true` if a Metal 3 residency manager is active (PR 4.3).
     pub fn has_residency_manager(&self) -> bool {
-        self.residency
-            .lock()
-            .map(|guard| guard.is_some())
-            .unwrap_or(false)
+        self.residency.lock().is_some()
     }
 
     /// Commit pending residency set changes if a residency manager is
     /// active (PR 4.3). No-op if Metal 3 is not available.
     pub fn commit_residency(&self) {
-        if let Ok(mut guard) = self.residency.lock() {
-            if let Some(ref mut mgr) = *guard {
-                mgr.commit();
-            }
+        let mut rguard = self.residency.lock();
+        if let Some(ref mut mgr) = *rguard {
+            mgr.commit();
         }
     }
 }
@@ -773,36 +758,6 @@ mod tests {
         allocator_b
             .free(returned_buf)
             .expect("allocator B should free returned buffer");
-    }
-
-    #[test]
-    fn test_reservation_released_on_cache_poison() {
-        let allocator = match make_allocator(0) {
-            Some(a) => a,
-            None => {
-                eprintln!("skipping test: no Metal device");
-                return;
-            }
-        };
-
-        let poison_target = SendAllocator(Arc::clone(&allocator));
-        let handle = std::thread::spawn(move || {
-            let pt = poison_target; // capture whole SendAllocator (Send+Sync)
-            let _guard = pt.0.cache.lock().expect("lock cache for poisoning");
-            panic!("poison cache mutex");
-        });
-        let _ = handle.join();
-
-        let result = allocator.alloc(4096);
-        assert!(
-            matches!(result, Err(AllocError::MutexPoisoned)),
-            "alloc should fail with MutexPoisoned after cache poison, got {result:?}"
-        );
-        assert_eq!(
-            allocator.allocated_bytes(),
-            0,
-            "reserved bytes should be released on cache poison"
-        );
     }
 
     /// Stats must not underflow even if record_free is called with a large

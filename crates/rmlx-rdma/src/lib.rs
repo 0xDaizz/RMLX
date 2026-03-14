@@ -53,66 +53,55 @@ pub use progress::{
 pub use qp::{CompletionQueue, QpInfo, QueuePair};
 pub use rdma_metrics::{RdmaMetrics, RdmaMetricsSnapshot};
 
-use std::fmt;
-
 /// Errors from RDMA operations
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum RdmaError {
     /// librdma.dylib not found or failed to load
+    #[error("RDMA library not found: {0}")]
     LibraryNotFound(String),
     /// No RDMA devices found
+    #[error("no RDMA devices found")]
     NoDevices,
     /// Failed to open device
+    #[error("failed to open RDMA device: {0}")]
     DeviceOpen(String),
     /// Failed to allocate protection domain
+    #[error("failed to allocate protection domain")]
     PdAlloc,
     /// Failed to register memory region
+    #[error("memory region registration failed: {0}")]
     MrReg(String),
     /// Failed to create completion queue
+    #[error("failed to create completion queue")]
     CqCreate,
     /// Failed to create queue pair
+    #[error("queue pair creation failed: {0}")]
     QpCreate(String),
     /// Failed to modify queue pair state
+    #[error("queue pair state transition failed: {0}")]
     QpModify(String),
     /// Work request posting failed
+    #[error("work request post failed: {0}")]
     PostFailed(String),
     /// Completion queue poll error
+    #[error("completion queue poll error: {0}")]
     CqPoll(String),
     /// Connection setup failed
+    #[error("connection failed: {0}")]
     ConnectionFailed(String),
     /// CQ poll timed out waiting for completion
+    #[error("CQ poll timeout: {0}")]
     Timeout(String),
     /// Feature not available (RDMA hardware missing)
+    #[error("RDMA unavailable: {0}")]
     Unavailable(String),
     /// Invalid argument (e.g. SGE out of bounds)
+    #[error("invalid argument: {0}")]
     InvalidArgument(String),
     /// Data corruption detected (CRC32 mismatch on UC transport)
+    #[error("data corruption detected: {0}")]
     DataCorruption(String),
 }
-
-impl fmt::Display for RdmaError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::LibraryNotFound(e) => write!(f, "RDMA library not found: {e}"),
-            Self::NoDevices => write!(f, "no RDMA devices found"),
-            Self::DeviceOpen(e) => write!(f, "failed to open RDMA device: {e}"),
-            Self::PdAlloc => write!(f, "failed to allocate protection domain"),
-            Self::MrReg(e) => write!(f, "memory region registration failed: {e}"),
-            Self::CqCreate => write!(f, "failed to create completion queue"),
-            Self::QpCreate(e) => write!(f, "queue pair creation failed: {e}"),
-            Self::QpModify(e) => write!(f, "queue pair state transition failed: {e}"),
-            Self::PostFailed(e) => write!(f, "work request post failed: {e}"),
-            Self::CqPoll(e) => write!(f, "completion queue poll error: {e}"),
-            Self::ConnectionFailed(e) => write!(f, "connection failed: {e}"),
-            Self::Timeout(e) => write!(f, "CQ poll timeout: {e}"),
-            Self::Unavailable(e) => write!(f, "RDMA unavailable: {e}"),
-            Self::InvalidArgument(e) => write!(f, "invalid argument: {e}"),
-            Self::DataCorruption(e) => write!(f, "data corruption detected: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for RdmaError {}
 
 /// Check if RDMA is available on this system.
 pub fn is_available() -> bool {

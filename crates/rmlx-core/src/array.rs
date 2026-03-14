@@ -6,8 +6,8 @@ use rmlx_metal::{MTLResourceOptions, MtlBuffer};
 
 use rmlx_alloc::MetalAllocator;
 
+use rustc_hash::FxHashMap;
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::fmt;
 use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
@@ -38,7 +38,7 @@ thread_local! {
 /// Eliminates ~3ms/iter of `device.new_buffer()` overhead during forward passes.
 struct ArrayPool {
     /// Free buffers keyed by allocation size (bytes).
-    free: HashMap<usize, Vec<MtlBuffer>>,
+    free: FxHashMap<usize, Vec<MtlBuffer>>,
     enabled: bool,
     /// Stats
     hits: u64,
@@ -48,7 +48,7 @@ struct ArrayPool {
 impl ArrayPool {
     fn new() -> Self {
         Self {
-            free: HashMap::new(),
+            free: FxHashMap::default(),
             enabled: false,
             hits: 0,
             misses: 0,

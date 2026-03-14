@@ -1015,9 +1015,7 @@ impl MoeDispatchExchange {
             MoeBackend::Rdma => {
                 if let Some(ctx) = &self.runtime_ctx {
                     // Async zero-copy path: use runtime context's SharedBufferPool
-                    let mut pool_guard = ctx.shared_pool().lock().map_err(|e| {
-                        DistributedError::Transport(format!("shared pool lock poisoned: {e}"))
-                    })?;
+                    let mut pool_guard = ctx.shared_pool().lock();
                     let result = self.route_rdma_zero_copy(
                         token_data,
                         expert_indices,

@@ -35,3 +35,6 @@ dirs = "5"
 tracing = "0.1"
 smallvec = { version = "1", features = ["const_generics"] }
 bumpalo = "3"
+parking_lot = "0.12"
+rustc-hash = "2"
+thiserror = "2"

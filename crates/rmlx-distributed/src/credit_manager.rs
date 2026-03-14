@@ -5,7 +5,7 @@
 //! `CreditManager` maintains a per-(peer, tag) window of pre-posted recv
 //! credits so that incoming sends always find a matching recv.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use rmlx_rdma::exchange_tag::ExchangeTag;
 
@@ -31,7 +31,7 @@ struct CreditSlot {
 /// replenish consumed credits.
 pub struct CreditManager {
     /// (peer_id, tag) -> Vec<CreditSlot>
-    credits: HashMap<CreditKey, Vec<CreditSlot>>,
+    credits: FxHashMap<CreditKey, Vec<CreditSlot>>,
     /// Minimum credits to maintain per (peer, tag) pair.
     min_credits: usize,
     /// Buffer size for each recv credit (bytes).
@@ -45,7 +45,7 @@ impl CreditManager {
     /// - `buf_size`: buffer size in bytes for each recv credit
     pub fn new(min_credits: usize, buf_size: usize) -> Self {
         Self {
-            credits: HashMap::new(),
+            credits: FxHashMap::default(),
             min_credits,
             buf_size,
         }
