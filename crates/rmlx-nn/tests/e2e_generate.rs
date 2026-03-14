@@ -35,12 +35,12 @@ const VOCAB: usize = 256;
 const INTERMEDIATE: usize = 128;
 const MAX_SEQ: usize = 64;
 
-fn setup() -> (KernelRegistry, MtlQueue) {
-    let gpu = GpuDevice::system_default().expect("need Metal GPU");
+fn setup() -> Option<(KernelRegistry, MtlQueue)> {
+    let gpu = GpuDevice::system_default().ok()?;
     let queue = gpu.new_command_queue();
     let registry = KernelRegistry::new(gpu);
     ops::register_all(&registry).expect("register ops");
-    (registry, queue)
+    Some((registry, queue))
 }
 
 /// Create a random-ish f32 array on the Metal device.
@@ -239,7 +239,10 @@ fn build_tiny_model(device: &ProtocolObject<dyn objc2_metal::MTLDevice>) -> Tran
 
 #[test]
 fn e2e_forward_produces_valid_logits_shape() {
-    let (registry, queue) = setup();
+    let Some((registry, queue)) = setup() else {
+        eprintln!("Skipping: no Metal GPU");
+        return;
+    };
     let device = registry.device().raw();
     let mut model = build_tiny_model(device);
 
@@ -259,7 +262,10 @@ fn e2e_forward_produces_valid_logits_shape() {
 
 #[test]
 fn e2e_forward_then_sample_produces_valid_token() {
-    let (registry, queue) = setup();
+    let Some((registry, queue)) = setup() else {
+        eprintln!("Skipping: no Metal GPU");
+        return;
+    };
     let device = registry.device().raw();
     let mut model = build_tiny_model(device);
 
@@ -293,7 +299,10 @@ fn e2e_forward_then_sample_produces_valid_token() {
 
 #[test]
 fn e2e_greedy_decode_multi_step() {
-    let (registry, queue) = setup();
+    let Some((registry, queue)) = setup() else {
+        eprintln!("Skipping: no Metal GPU");
+        return;
+    };
     let device = registry.device().raw();
     let mut model = build_tiny_model(device);
 
@@ -353,7 +362,10 @@ fn e2e_greedy_decode_multi_step() {
 
 #[test]
 fn e2e_stochastic_sample_tokens_in_range() {
-    let (registry, queue) = setup();
+    let Some((registry, queue)) = setup() else {
+        eprintln!("Skipping: no Metal GPU");
+        return;
+    };
     let device = registry.device().raw();
     let mut model = build_tiny_model(device);
 
@@ -387,7 +399,10 @@ fn e2e_stochastic_sample_tokens_in_range() {
 
 #[test]
 fn e2e_model_config_accessible() {
-    let (registry, _queue) = setup();
+    let Some((registry, _queue)) = setup() else {
+        eprintln!("Skipping: no Metal GPU");
+        return;
+    };
     let device = registry.device().raw();
     let model = build_tiny_model(device);
 
