@@ -782,9 +782,22 @@ mod tests {
     use crate::linear::{Linear, LinearConfig};
     use crate::moe::Expert;
 
+    use std::sync::OnceLock;
+
+    fn test_device() -> &'static rmlx_metal::MtlDevice {
+        static DEVICE: OnceLock<rmlx_metal::MtlDevice> = OnceLock::new();
+        DEVICE.get_or_init(|| {
+            objc2_metal::MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests")
+        })
+    }
+
     /// Create a test `KernelRegistry` with all kernels registered.
-    fn test_registry() -> (rmlx_metal::MtlDevice, rmlx_metal::MtlQueue, KernelRegistry) {
-        let device = objc2_metal::MTLCreateSystemDefaultDevice().expect("Metal device required");
+    fn test_registry() -> (
+        &'static rmlx_metal::MtlDevice,
+        rmlx_metal::MtlQueue,
+        KernelRegistry,
+    ) {
+        let device = test_device();
         let gpu = rmlx_metal::device::GpuDevice::system_default().expect("GPU device required");
         let queue = gpu.new_command_queue();
         let registry = KernelRegistry::new(gpu);
@@ -855,16 +868,16 @@ mod tests {
 
     #[test]
     fn test_pipeline_creation() {
-        let device = objc2_metal::MTLCreateSystemDefaultDevice().expect("Metal device required");
-        let pipeline = MoePipeline::with_defaults(&device);
+        let device = test_device();
+        let pipeline = MoePipeline::with_defaults(device);
         assert_eq!(pipeline.num_batches(), 1);
         assert!(pipeline.sbo_enabled());
     }
 
     #[test]
     fn test_pipeline_custom_config() {
-        let device = objc2_metal::MTLCreateSystemDefaultDevice().expect("Metal device required");
-        let event = Arc::new(GpuEvent::new(&device));
+        let device = test_device();
+        let event = Arc::new(GpuEvent::new(device));
         let config = MoePipelineConfig {
             num_tbo_batches: 4,
             enable_sbo: false,
@@ -887,11 +900,11 @@ mod tests {
 
         // Create routed experts.
         let experts: Vec<Expert> = (0..num_experts)
-            .map(|i| make_expert(&device, hidden_dim, intermediate_dim, 0.1 * (i + 1) as f32))
+            .map(|i| make_expert(device, hidden_dim, intermediate_dim, 0.1 * (i + 1) as f32))
             .collect();
 
         // Create shared expert with distinct weights.
-        let shared_expert = make_expert(&device, hidden_dim, intermediate_dim, 0.5);
+        let shared_expert = make_expert(device, hidden_dim, intermediate_dim, 0.5);
 
         // Build expert group for grouped forward.
         let expert_group = ExpertGroup::from_experts(&experts, &registry, &queue).unwrap();
@@ -900,7 +913,7 @@ mod tests {
         let x_data: Vec<f32> = (0..seq_len * hidden_dim)
             .map(|i| (i as f32) * 0.01 + 0.1)
             .collect();
-        let x = Array::from_slice(&device, &x_data, vec![seq_len, hidden_dim]);
+        let x = Array::from_slice(device, &x_data, vec![seq_len, hidden_dim]);
 
         // Create gate logits: [seq_len, num_experts]
         #[rustfmt::skip]
@@ -910,7 +923,7 @@ mod tests {
             1.0, 0.5, 5.0, 1.0,  // token 2: expert 2 strong
             1.0, 1.0, 0.5, 5.0,  // token 3: expert 3 strong
         ];
-        let gate_logits = Array::from_slice(&device, &gate_data, vec![seq_len, num_experts]);
+        let gate_logits = Array::from_slice(device, &gate_data, vec![seq_len, num_experts]);
 
         // -- Compute reference output: sequential shared + routed --
         let shared_ref = shared_expert.forward(&x, &registry, &queue).unwrap();
@@ -918,7 +931,7 @@ mod tests {
         let route_result =
             ops::topk_route::gpu_topk_route(&registry, &gate_logits, top_k, None, &queue).unwrap();
 
-        let pipeline = MoePipeline::with_defaults(&device);
+        let pipeline = MoePipeline::with_defaults(device);
         let routed_ref = pipeline
             .run_routed_experts(
                 &x,
@@ -936,7 +949,7 @@ mod tests {
 
         // -- Compute SBO output via forward_overlapped --
         let pipeline_sbo = MoePipeline::new(
-            Arc::new(GpuEvent::new(&device)),
+            Arc::new(GpuEvent::new(device)),
             MoePipelineConfig {
                 num_tbo_batches: 1,
                 enable_sbo: true,
@@ -984,19 +997,19 @@ mod tests {
         let seq_len = 2;
 
         let experts: Vec<Expert> = (0..num_experts)
-            .map(|i| make_expert(&device, hidden_dim, intermediate_dim, 0.1 * (i + 1) as f32))
+            .map(|i| make_expert(device, hidden_dim, intermediate_dim, 0.1 * (i + 1) as f32))
             .collect();
-        let shared_expert = make_expert(&device, hidden_dim, intermediate_dim, 0.3);
+        let shared_expert = make_expert(device, hidden_dim, intermediate_dim, 0.3);
         let expert_group = ExpertGroup::from_experts(&experts, &registry, &queue).unwrap();
 
         let x_data: Vec<f32> = vec![1.0; seq_len * hidden_dim];
-        let x = Array::from_slice(&device, &x_data, vec![seq_len, hidden_dim]);
+        let x = Array::from_slice(device, &x_data, vec![seq_len, hidden_dim]);
 
         let gate_data: Vec<f32> = vec![5.0, 1.0, 1.0, 5.0];
-        let gate_logits = Array::from_slice(&device, &gate_data, vec![seq_len, num_experts]);
+        let gate_logits = Array::from_slice(device, &gate_data, vec![seq_len, num_experts]);
 
         let pipeline = MoePipeline::new(
-            Arc::new(GpuEvent::new(&device)),
+            Arc::new(GpuEvent::new(device)),
             MoePipelineConfig {
                 num_tbo_batches: 1,
                 enable_sbo: true,
@@ -1034,17 +1047,17 @@ mod tests {
         let hidden_dim = 8;
         let intermediate_dim = 4;
 
-        let shared_expert = make_expert(&device, hidden_dim, intermediate_dim, 0.2);
+        let shared_expert = make_expert(device, hidden_dim, intermediate_dim, 0.2);
 
         let x_data: Vec<f32> = vec![1.0; 2 * hidden_dim];
-        let x = Array::from_slice(&device, &x_data, vec![2, hidden_dim]);
+        let x = Array::from_slice(device, &x_data, vec![2, hidden_dim]);
 
-        let pipeline = MoePipeline::with_defaults(&device);
+        let pipeline = MoePipeline::with_defaults(device);
 
         // Compute reference: shared_expert(x) + constant routed output
         let shared_ref = shared_expert.forward(&x, &registry, &queue).unwrap();
         let routed_ref =
-            Array::from_slice(&device, &vec![0.5f32; 2 * hidden_dim], vec![2, hidden_dim]);
+            Array::from_slice(device, &vec![0.5f32; 2 * hidden_dim], vec![2, hidden_dim]);
         let ref_output = ops::binary::add(&registry, &shared_ref, &routed_ref, &queue).unwrap();
         let ref_vals: Vec<f32> = ref_output.to_vec_checked();
 
@@ -1055,7 +1068,7 @@ mod tests {
                 &shared_expert,
                 |_x| {
                     Ok(Array::from_slice(
-                        &device,
+                        device,
                         &vec![0.5f32; 2 * hidden_dim],
                         vec![2, hidden_dim],
                     ))
@@ -1090,18 +1103,18 @@ mod tests {
         let seq_len = 2;
 
         let experts: Vec<Expert> = (0..num_experts)
-            .map(|i| make_expert(&device, hidden_dim, intermediate_dim, 0.1 * (i + 1) as f32))
+            .map(|i| make_expert(device, hidden_dim, intermediate_dim, 0.1 * (i + 1) as f32))
             .collect();
         let expert_group = ExpertGroup::from_experts(&experts, &registry, &queue).unwrap();
 
         let x_data: Vec<f32> = vec![1.0; seq_len * hidden_dim];
-        let x = Array::from_slice(&device, &x_data, vec![seq_len, hidden_dim]);
+        let x = Array::from_slice(device, &x_data, vec![seq_len, hidden_dim]);
 
         let gate_data: Vec<f32> = vec![5.0, 1.0, 1.0, 5.0];
-        let gate_logits = Array::from_slice(&device, &gate_data, vec![seq_len, num_experts]);
+        let gate_logits = Array::from_slice(device, &gate_data, vec![seq_len, num_experts]);
 
         let pipeline = MoePipeline::new(
-            Arc::new(GpuEvent::new(&device)),
+            Arc::new(GpuEvent::new(device)),
             MoePipelineConfig {
                 num_tbo_batches: 1,
                 enable_sbo: false,
@@ -1143,14 +1156,14 @@ mod tests {
         let seq_len = 4;
 
         let experts: Vec<Expert> = (0..num_experts)
-            .map(|i| make_expert(&device, hidden_dim, intermediate_dim, 0.1 * (i + 1) as f32))
+            .map(|i| make_expert(device, hidden_dim, intermediate_dim, 0.1 * (i + 1) as f32))
             .collect();
         let expert_group = ExpertGroup::from_experts(&experts, &registry, &queue).unwrap();
 
         let x_data: Vec<f32> = (0..seq_len * hidden_dim)
             .map(|i| (i as f32) * 0.01 + 0.1)
             .collect();
-        let x = Array::from_slice(&device, &x_data, vec![seq_len, hidden_dim]);
+        let x = Array::from_slice(device, &x_data, vec![seq_len, hidden_dim]);
 
         let gate_data: Vec<f32> = vec![
             5.0, 1.0, // token 0
@@ -1158,11 +1171,11 @@ mod tests {
             5.0, 1.0, // token 2
             1.0, 5.0, // token 3
         ];
-        let gate_logits = Array::from_slice(&device, &gate_data, vec![seq_len, num_experts]);
+        let gate_logits = Array::from_slice(device, &gate_data, vec![seq_len, num_experts]);
 
         // Reference: sequential (1 batch).
         let pipeline_seq = MoePipeline::new(
-            Arc::new(GpuEvent::new(&device)),
+            Arc::new(GpuEvent::new(device)),
             MoePipelineConfig {
                 num_tbo_batches: 1,
                 enable_sbo: false,
@@ -1186,7 +1199,7 @@ mod tests {
 
         // TBO: 2 batches.
         let pipeline_tbo = MoePipeline::new(
-            Arc::new(GpuEvent::new(&device)),
+            Arc::new(GpuEvent::new(device)),
             MoePipelineConfig {
                 num_tbo_batches: 2,
                 enable_sbo: false,
@@ -1233,17 +1246,17 @@ mod tests {
         let seq_len = 2;
 
         let experts: Vec<Expert> = (0..num_experts)
-            .map(|i| make_expert(&device, hidden_dim, intermediate_dim, 0.1 * (i + 1) as f32))
+            .map(|i| make_expert(device, hidden_dim, intermediate_dim, 0.1 * (i + 1) as f32))
             .collect();
         let expert_group = ExpertGroup::from_experts(&experts, &registry, &queue).unwrap();
 
         let x_data: Vec<f32> = vec![1.0; seq_len * hidden_dim];
-        let x = Array::from_slice(&device, &x_data, vec![seq_len, hidden_dim]);
+        let x = Array::from_slice(device, &x_data, vec![seq_len, hidden_dim]);
         let gate_data: Vec<f32> = vec![5.0, 1.0, 1.0, 5.0];
-        let gate_logits = Array::from_slice(&device, &gate_data, vec![seq_len, num_experts]);
+        let gate_logits = Array::from_slice(device, &gate_data, vec![seq_len, num_experts]);
 
         let pipeline = MoePipeline::new(
-            Arc::new(GpuEvent::new(&device)),
+            Arc::new(GpuEvent::new(device)),
             MoePipelineConfig {
                 num_tbo_batches: 1,
                 enable_sbo: false,

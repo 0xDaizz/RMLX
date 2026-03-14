@@ -1,0 +1,2085 @@
+warning: rmlx-core@0.1.0: Metal compiler not found (requires Xcode, not just Command Line Tools). Skipping shader AOT compilation. GPU kernels will not be available at runtime.
+warning: unused import: `objc2::rc::Retained`
+  --> crates/rmlx-metal/src/command.rs:10:5
+   |
+10 | use objc2::rc::Retained;
+   |     ^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `crate::types::*`
+  --> crates/rmlx-metal/src/icb_sparse.rs:31:5
+   |
+31 | use crate::types::*;
+   |     ^^^^^^^^^^^^^^^
+
+warning: unnecessary `unsafe` block
+   --> crates/rmlx-metal/src/capture.rs:116:23
+    |
+116 |             let url = unsafe { NSURL::fileURLWithPath(&ns_path) };
+    |                       ^^^^^^ unnecessary `unsafe` block
+    |
+    = note: `#[warn(unused_unsafe)]` (part of `#[warn(unused)]`) on by default
+
+warning: unnecessary `unsafe` block
+   --> crates/rmlx-metal/src/capture.rs:117:13
+    |
+117 |             unsafe { descriptor.setOutputURL(Some(&url)) };
+    |             ^^^^^^ unnecessary `unsafe` block
+
+warning: unnecessary `unsafe` block
+   --> crates/rmlx-metal/src/capture.rs:121:5
+    |
+121 |     unsafe {
+    |     ^^^^^^ unnecessary `unsafe` block
+
+warning: unnecessary `unsafe` block
+   --> crates/rmlx-metal/src/device.rs:276:22
+    |
+276 |         let device = unsafe { MTLCreateSystemDefaultDevice() }.ok_or(MetalError::NoDevice)?;
+    |                      ^^^^^^ unnecessary `unsafe` block
+
+warning: unnecessary `unsafe` block
+   --> crates/rmlx-metal/src/event.rs:117:9
+    |
+117 |         unsafe { self.event.setSignaledValue(0) };
+    |         ^^^^^^ unnecessary `unsafe` block
+
+warning: unnecessary `unsafe` block
+   --> crates/rmlx-metal/src/fence.rs:118:9
+    |
+118 |         unsafe { self.event.setSignaledValue(0) };
+    |         ^^^^^^ unnecessary `unsafe` block
+
+warning: unnecessary `unsafe` block
+   --> crates/rmlx-metal/src/pipeline.rs:228:24
+    |
+228 |         let function = unsafe {
+    |                        ^^^^^^ unnecessary `unsafe` block
+
+warning: unnecessary `unsafe` block
+   --> crates/rmlx-metal/src/pipeline_cache.rs:307:13
+    |
+307 |             unsafe {
+    |             ^^^^^^ unnecessary `unsafe` block
+
+warning: unnecessary `unsafe` block
+  --> crates/rmlx-metal/src/self_check.rs:57:5
+   |
+57 |     unsafe { MTLCreateSystemDefaultDevice() }.is_some()
+   |     ^^^^^^ unnecessary `unsafe` block
+
+warning: unnecessary `unsafe` block
+  --> crates/rmlx-metal/src/self_check.rs:62:11
+   |
+62 |     match unsafe { MTLCreateSystemDefaultDevice() } {
+   |           ^^^^^^ unnecessary `unsafe` block
+
+warning: unnecessary `unsafe` block
+  --> crates/rmlx-metal/src/self_check.rs:74:11
+   |
+74 |     match unsafe { MTLCreateSystemDefaultDevice() } {
+   |           ^^^^^^ unnecessary `unsafe` block
+
+warning: `rmlx-metal` (lib) generated 13 warnings (run `cargo fix --lib -p rmlx-metal` to apply 2 suggestions)
+    Checking rmlx-core v0.1.0 (/Users/hw/rmlx/crates/rmlx-core)
+error: expected one of `.`, `;`, `?`, `else`, or an operator, found `}`
+   --> crates/rmlx-core/src/ops/binary.rs:511:259
+    |
+511 | ...ceOptions::StorageModeShared).unwrap() };
+    |                                           ^ expected one of `.`, `;`, `?`, `else`, or an operator
+
+error: expected one of `.`, `;`, `?`, `else`, or an operator, found `}`
+   --> crates/rmlx-core/src/ops/binary.rs:622:255
+    |
+622 | ...ceOptions::StorageModeShared).unwrap() };
+    |                                           ^ expected one of `.`, `;`, `?`, `else`, or an operator
+
+error: expected one of `.`, `;`, `?`, `else`, or an operator, found `}`
+    --> crates/rmlx-core/src/ops/gemv.rs:1120:179
+     |
+1120 | ...).unwrap(), 4 as usize, opts).unwrap() };
+     |                                           ^ expected one of `.`, `;`, `?`, `else`, or an operator
+
+error: expected one of `.`, `;`, `?`, `else`, or an operator, found `}`
+    --> crates/rmlx-core/src/ops/gemv.rs:1612:179
+     |
+1612 | ...).unwrap(), 4 as usize, opts).unwrap() };
+     |                                           ^ expected one of `.`, `;`, `?`, `else`, or an operator
+
+error: expected one of `.`, `;`, `?`, `else`, or an operator, found `}`
+    --> crates/rmlx-core/src/ops/gemv.rs:1714:183
+     |
+1714 | ...).unwrap(), 4 as usize, opts).unwrap() };
+     |                                           ^ expected one of `.`, `;`, `?`, `else`, or an operator
+
+error: expected one of `.`, `;`, `?`, `else`, or an operator, found `}`
+    --> crates/rmlx-core/src/ops/matmul.rs:8692:227
+     |
+8692 | ...) * 4) as u64 as usize, opts).unwrap() };
+     |                                           ^ expected one of `.`, `;`, `?`, `else`, or an operator
+
+error: expected one of `.`, `;`, `?`, `else`, or an operator, found `}`
+    --> crates/rmlx-core/src/ops/matmul.rs:8810:227
+     |
+8810 | ...) * 4) as u64 as usize, opts).unwrap() };
+     |                                           ^ expected one of `.`, `;`, `?`, `else`, or an operator
+
+error: expected one of `.`, `;`, `?`, `else`, or an operator, found `}`
+     --> crates/rmlx-core/src/ops/quantized.rs:11366:216
+      |
+11366 | ...s * 2) as u64 as usize, opts).unwrap() };
+      |                                           ^ expected one of `.`, `;`, `?`, `else`, or an operator
+
+error: expected one of `.`, `;`, `?`, `else`, or an operator, found `}`
+    --> crates/rmlx-core/src/ops/reduce.rs:1410:260
+     |
+1410 | ...ceOptions::StorageModeShared).unwrap() };
+     |                                           ^ expected one of `.`, `;`, `?`, `else`, or an operator
+
+error: expected one of `.`, `;`, `?`, `else`, or an operator, found `}`
+    --> crates/rmlx-core/src/ops/reduce.rs:1542:257
+     |
+1542 | ...ceOptions::StorageModeShared).unwrap() };
+     |                                           ^ expected one of `.`, `;`, `?`, `else`, or an operator
+
+error: expected one of `.`, `;`, `?`, `else`, or an operator, found `}`
+   --> crates/rmlx-core/src/ops/sdpa_backward.rs:266:219
+    |
+266 | ...f32>() as u64 as usize, opts).unwrap() };
+    |                                           ^ expected one of `.`, `;`, `?`, `else`, or an operator
+
+error[E0425]: cannot find value `params_buf` in this scope
+   --> crates/rmlx-core/src/fusion/compiler.rs:119:49
+    |
+119 |     unsafe { enc.setBuffer_offset_atIndex(Some(&params_buf), 0, params_idx); }
+    |                                                 ^^^^^^^^^^ help: a local variable with a similar name exists: `params_idx`
+
+error[E0425]: cannot find value `params_buf` in this scope
+   --> crates/rmlx-core/src/fusion/compiler.rs:178:49
+    |
+178 |     unsafe { enc.setBuffer_offset_atIndex(Some(&params_buf), 0, params_idx); }
+    |                                                 ^^^^^^^^^^ help: a local variable with a similar name exists: `params_idx`
+
+error[E0425]: cannot find value `a_stride_buf` in this scope
+   --> crates/rmlx-core/src/ops/binary.rs:517:61
+    |
+517 |             unsafe { encoder.setBuffer_offset_atIndex(Some(&a_stride_buf), 0, 4); }
+    |                                                             ^^^^^^^^^^^^ help: a local variable with a similar name exists: `b_stride_buf`
+
+error[E0425]: cannot find value `a_stride_buf` in this scope
+   --> crates/rmlx-core/src/ops/binary.rs:628:57
+    |
+628 |         unsafe { encoder.setBuffer_offset_atIndex(Some(&a_stride_buf), 0, 4); }
+    |                                                         ^^^^^^^^^^^^ help: a local variable with a similar name exists: `b_stride_buf`
+
+error[E0425]: cannot find value `k_buf` in this scope
+    --> crates/rmlx-core/src/ops/gemv.rs:1129:53
+     |
+1129 |     unsafe { encoder.setBuffer_offset_atIndex(Some(&k_buf), 0, 4); }
+     |                                                     ^^^^^ help: a local variable with a similar name exists: `m_buf`
+
+error[E0425]: cannot find value `k_buf` in this scope
+    --> crates/rmlx-core/src/ops/gemv.rs:1621:53
+     |
+1621 |     unsafe { encoder.setBuffer_offset_atIndex(Some(&k_buf), 0, 4); }
+     |                                                     ^^^^^ help: a local variable with a similar name exists: `m_buf`
+
+error[E0425]: cannot find value `k_buf` in this scope
+    --> crates/rmlx-core/src/ops/gemv.rs:1724:53
+     |
+1724 |     unsafe { encoder.setBuffer_offset_atIndex(Some(&k_buf), 0, 4); }
+     |                                                     ^^^^^ help: a local variable with a similar name exists: `n_buf`
+
+error[E0425]: cannot find value `tile_map_buf` in this scope
+    --> crates/rmlx-core/src/ops/matmul.rs:8706:49
+     |
+8706 |     unsafe { enc.setBuffer_offset_atIndex(Some(&tile_map_buf), 0, grouped_gemm::TILE_MAP); }
+     |                                                 ^^^^^^^^^^^^ help: a local variable with a similar name exists: `tile_off_buf`
+
+error[E0425]: cannot find value `tile_map_buf` in this scope
+    --> crates/rmlx-core/src/ops/matmul.rs:8828:53
+     |
+8828 |         unsafe { enc.setBuffer_offset_atIndex(Some(&tile_map_buf), 0, grouped_splitk::TILE_MAP); }
+     |                                                     ^^^^^^^^^^^^ help: a local variable with a similar name exists: `tile_off_buf`
+
+error[E0425]: cannot find value `chunk_buf` in this scope
+    --> crates/rmlx-core/src/ops/reduce.rs:1419:50
+     |
+1419 |     unsafe { enc1.setBuffer_offset_atIndex(Some(&chunk_buf), 0, 3); }
+     |                                                  ^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find value `cols_buf` in this scope
+    --> crates/rmlx-core/src/ops/reduce.rs:1550:53
+     |
+1550 |     unsafe { encoder.setBuffer_offset_atIndex(Some(&cols_buf), 0, 3); }
+     |                                                     ^^^^^^^^ help: a local variable with a similar name exists: `rows_buf`
+
+error[E0425]: cannot find value `scale_buf` in this scope
+   --> crates/rmlx-core/src/ops/sdpa_backward.rs:279:49
+    |
+279 |     unsafe { enc.setBuffer_offset_atIndex(Some(&scale_buf), 0, 8); }
+    |                                                 ^^^^^^^^^ not found in this scope
+
+warning: unused import: `objc2_metal::MTLBuffer as _`
+  --> crates/rmlx-core/src/ops/fp8.rs:42:5
+   |
+42 | use objc2_metal::MTLBuffer as _;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+error[E0308]: mismatched types
+  --> crates/rmlx-core/src/array.rs:77:29
+   |
+77 |             self.free.entry(size).or_default().push(buf);
+   |                       ----- ^^^^ expected `u64`, found `usize`
+   |                       |
+   |                       arguments to this method are incorrect
+   |
+help: the return type of this call is `usize` due to the type of the argument passed
+  --> crates/rmlx-core/src/array.rs:77:13
+   |
+77 |             self.free.entry(size).or_default().push(buf);
+   |             ^^^^^^^^^^^^^^^^----^
+   |                             |
+   |                             this argument influences the return type of `entry`
+note: method defined here
+  --> /rustc/01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf/library/std/src/collections/hash/map.rs:887:12
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+   |
+77 |             self.free.entry(size.try_into().unwrap()).or_default().push(buf);
+   |                                 ++++++++++++++++++++
+
+error[E0308]: mismatched types
+   --> crates/rmlx-core/src/array.rs:243:73
+    |
+243 |         let buffer = ARRAY_POOL.with(|p| p.borrow_mut().acquire(device, alloc_size));
+    |                                                         -------         ^^^^^^^^^^ expected `u64`, found `usize`
+    |                                                         |
+    |                                                         arguments to this method are incorrect
+    |
+note: method defined here
+   --> crates/rmlx-core/src/array.rs:59:8
+    |
+ 59 |     fn acquire(&mut self, device: &ProtocolObject<dyn objc2_metal::MTLDevice>, size: u64) -> MtlBuffer {
+    |        ^^^^^^^                                                                 ---------
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+    |
+243 |         let buffer = ARRAY_POOL.with(|p| p.borrow_mut().acquire(device, alloc_size.try_into().unwrap()));
+    |                                                                                   ++++++++++++++++++++
+
+error[E0308]: mismatched types
+   --> crates/rmlx-core/src/array.rs:279:73
+    |
+279 |         let buffer = ARRAY_POOL.with(|p| p.borrow_mut().acquire(device, alloc_size));
+    |                                                         -------         ^^^^^^^^^^ expected `u64`, found `usize`
+    |                                                         |
+    |                                                         arguments to this method are incorrect
+    |
+note: method defined here
+   --> crates/rmlx-core/src/array.rs:59:8
+    |
+ 59 |     fn acquire(&mut self, device: &ProtocolObject<dyn objc2_metal::MTLDevice>, size: u64) -> MtlBuffer {
+    |        ^^^^^^^                                                                 ---------
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+    |
+279 |         let buffer = ARRAY_POOL.with(|p| p.borrow_mut().acquire(device, alloc_size.try_into().unwrap()));
+    |                                                                                   ++++++++++++++++++++
+
+error[E0308]: mismatched types
+   --> crates/rmlx-core/src/formats/gguf.rs:433:44
+    |
+433 |         let n_blocks = n_elements.div_ceil(block_size);
+    |                                   -------- ^^^^^^^^^^ expected `u64`, found `usize`
+    |                                   |
+    |                                   arguments to this method are incorrect
+    |
+note: method defined here
+   --> /rustc/01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf/library/core/src/num/mod.rs:1160:5
+    = note: this error originates in the macro `uint_impl` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+    |
+433 |         let n_blocks = n_elements.div_ceil(block_size.try_into().unwrap());
+    |                                                      ++++++++++++++++++++
+
+error[E0308]: mismatched types
+   --> crates/rmlx-core/src/formats/gguf.rs:436:30
+    |
+436 |                 .checked_mul(type_size)
+    |                  ----------- ^^^^^^^^^ expected `u64`, found `usize`
+    |                  |
+    |                  arguments to this method are incorrect
+    |
+note: method defined here
+   --> /rustc/01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf/library/core/src/num/mod.rs:1160:5
+    = note: this error originates in the macro `uint_impl` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+    |
+436 |                 .checked_mul(type_size.try_into().unwrap())
+    |                                       ++++++++++++++++++++
+
+error[E0308]: mismatched types
+  --> crates/rmlx-core/src/logging.rs:74:13
+   |
+74 |             timestamp_ms,
+   |             ^^^^^^^^^^^^ expected `u64`, found `usize`
+   |
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+   |
+74 |             timestamp_ms: timestamp_ms.try_into().unwrap(),
+   |             +++++++++++++             ++++++++++++++++++++
+
+error[E0308]: mismatched types
+   --> crates/rmlx-core/src/ops/binary.rs:852:60
+    |
+852 |     let result = binary_op_encode_impl(registry, a, b, op, encoder)?;
+    |                  ---------------------                     ^^^^^^^ expected `&ProtocolObject<...>`, found `Retained<ProtocolObject<...>>`
+    |                  |
+    |                  arguments to this function are incorrect
+    |
+    = note: expected reference `&ProtocolObject<(dyn MTLComputeCommandEncoder + 'static)>`
+                  found struct `Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>`
+note: function defined here
+   --> crates/rmlx-core/src/ops/binary.rs:756:4
+    |
+756 | fn binary_op_encode_impl(
+    |    ^^^^^^^^^^^^^^^^^^^^^
+...
+761 |     encoder: &ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
+    |     -------------------------------------------------------------------
+help: consider borrowing here
+    |
+852 |     let result = binary_op_encode_impl(registry, a, b, op, &encoder)?;
+    |                                                            +
+
+error[E0308]: mismatched types
+   --> crates/rmlx-core/src/ops/copy.rs:850:39
+    |
+850 |         encode_strided(registry, src, encoder, &out)?
+    |         --------------                ^^^^^^^ expected `&ProtocolObject<...>`, found `Retained<ProtocolObject<...>>`
+    |         |
+    |         arguments to this function are incorrect
+    |
+    = note: expected reference `&ProtocolObject<(dyn MTLComputeCommandEncoder + 'static)>`
+                  found struct `Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>`
+note: function defined here
+   --> crates/rmlx-core/src/ops/copy.rs:713:4
+    |
+713 | fn encode_strided(
+    |    ^^^^^^^^^^^^^^
+...
+716 |     encoder: &ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
+    |     -------------------------------------------------------------------
+help: consider borrowing here
+    |
+850 |         encode_strided(registry, src, &encoder, &out)?
+    |                                       +
+
+error[E0308]: mismatched types
+   --> crates/rmlx-core/src/ops/copy.rs:856:35
+    |
+856 |         (numel as usize).div_ceil(w)
+    |                          -------- ^ expected `usize`, found `u64`
+    |                          |
+    |                          arguments to this method are incorrect
+    |
+note: method defined here
+   --> /rustc/01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf/library/core/src/num/mod.rs:1269:5
+    = note: this error originates in the macro `uint_impl` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: you can convert a `u64` to a `usize` and panic if the converted value doesn't fit
+    |
+856 |         (numel as usize).div_ceil(w.try_into().unwrap())
+    |                                    ++++++++++++++++++++
+
+error[E0308]: mismatched types
+   --> crates/rmlx-core/src/ops/copy.rs:897:39
+    |
+897 |         encode_strided(registry, src, encoder, &out)?
+    |         --------------                ^^^^^^^ expected `&ProtocolObject<...>`, found `Retained<ProtocolObject<...>>`
+    |         |
+    |         arguments to this function are incorrect
+    |
+    = note: expected reference `&ProtocolObject<(dyn MTLComputeCommandEncoder + 'static)>`
+                  found struct `Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>`
+note: function defined here
+   --> crates/rmlx-core/src/ops/copy.rs:713:4
+    |
+713 | fn encode_strided(
+    |    ^^^^^^^^^^^^^^
+...
+716 |     encoder: &ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
+    |     -------------------------------------------------------------------
+help: consider borrowing here
+    |
+897 |         encode_strided(registry, src, &encoder, &out)?
+    |                                       +
+
+error[E0308]: mismatched types
+   --> crates/rmlx-core/src/ops/copy.rs:902:35
+    |
+902 |         (numel as usize).div_ceil(w)
+    |                          -------- ^ expected `usize`, found `u64`
+    |                          |
+    |                          arguments to this method are incorrect
+    |
+note: method defined here
+   --> /rustc/01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf/library/core/src/num/mod.rs:1269:5
+    = note: this error originates in the macro `uint_impl` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: you can convert a `u64` to a `usize` and panic if the converted value doesn't fit
+    |
+902 |         (numel as usize).div_ceil(w.try_into().unwrap())
+    |                                    ++++++++++++++++++++
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/copy.rs:1127:39
+     |
+1127 |         encode_strided(registry, src, encoder, &out)?
+     |         --------------                ^^^^^^^ expected `&ProtocolObject<...>`, found `Retained<ProtocolObject<...>>`
+     |         |
+     |         arguments to this function are incorrect
+     |
+     = note: expected reference `&ProtocolObject<(dyn MTLComputeCommandEncoder + 'static)>`
+                   found struct `Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>`
+note: function defined here
+    --> crates/rmlx-core/src/ops/copy.rs:713:4
+     |
+ 713 | fn encode_strided(
+     |    ^^^^^^^^^^^^^^
+...
+ 716 |     encoder: &ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
+     |     -------------------------------------------------------------------
+help: consider borrowing here
+     |
+1127 |         encode_strided(registry, src, &encoder, &out)?
+     |                                       +
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/copy.rs:1132:35
+     |
+1132 |         (numel as usize).div_ceil(w)
+     |                          -------- ^ expected `usize`, found `u64`
+     |                          |
+     |                          arguments to this method are incorrect
+     |
+note: method defined here
+    --> /rustc/01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf/library/core/src/num/mod.rs:1269:5
+     = note: this error originates in the macro `uint_impl` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: you can convert a `u64` to a `usize` and panic if the converted value doesn't fit
+     |
+1132 |         (numel as usize).div_ceil(w.try_into().unwrap())
+     |                                    ++++++++++++++++++++
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/copy.rs:1282:35
+     |
+1282 |         (numel as usize).div_ceil(w)
+     |                          -------- ^ expected `usize`, found `u64`
+     |                          |
+     |                          arguments to this method are incorrect
+     |
+note: method defined here
+    --> /rustc/01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf/library/core/src/num/mod.rs:1269:5
+     = note: this error originates in the macro `uint_impl` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: you can convert a `u64` to a `usize` and panic if the converted value doesn't fit
+     |
+1282 |         (numel as usize).div_ceil(w.try_into().unwrap())
+     |                                    ++++++++++++++++++++
+
+error[E0308]: mismatched types
+   --> crates/rmlx-core/src/ops/fused.rs:358:47
+    |
+358 |     let grid_x = (gate_dim as usize).div_ceil(elems_per_thread);
+    |                                      -------- ^^^^^^^^^^^^^^^^ expected `usize`, found `u64`
+    |                                      |
+    |                                      arguments to this method are incorrect
+    |
+note: method defined here
+   --> /rustc/01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf/library/core/src/num/mod.rs:1269:5
+    = note: this error originates in the macro `uint_impl` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: you can convert a `u64` to a `usize` and panic if the converted value doesn't fit
+    |
+358 |     let grid_x = (gate_dim as usize).div_ceil(elems_per_thread.try_into().unwrap());
+    |                                                               ++++++++++++++++++++
+
+error[E0308]: mismatched types
+   --> crates/rmlx-core/src/ops/fused.rs:582:47
+    |
+582 |     let grid_x = (gate_dim as usize).div_ceil(elems_per_thread);
+    |                                      -------- ^^^^^^^^^^^^^^^^ expected `usize`, found `u64`
+    |                                      |
+    |                                      arguments to this method are incorrect
+    |
+note: method defined here
+   --> /rustc/01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf/library/core/src/num/mod.rs:1269:5
+    = note: this error originates in the macro `uint_impl` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: you can convert a `u64` to a `usize` and panic if the converted value doesn't fit
+    |
+582 |     let grid_x = (gate_dim as usize).div_ceil(elems_per_thread.try_into().unwrap());
+    |                                                               ++++++++++++++++++++
+
+error[E0308]: mismatched types
+   --> crates/rmlx-core/src/ops/fused.rs:757:31
+    |
+757 |     let tg = MTLSize { width: tg_threads, height: 1, depth: 1 };
+    |                               ^^^^^^^^^^ expected `usize`, found `u64`
+
+error[E0308]: arguments to this function are incorrect
+    --> crates/rmlx-core/src/ops/fused.rs:1275:9
+     |
+1275 |         fused_ceil_div(m as usize, FUSED_BM8_ROWS)
+     |         ^^^^^^^^^^^^^^ ----------  -------------- expected `u64`, found `usize`
+     |                        |
+     |                        expected `u64`, found `usize`
+     |
+note: function defined here
+    --> crates/rmlx-core/src/ops/fused.rs:1336:4
+     |
+1336 | fn fused_ceil_div(a: u64, b: u64) -> u64 {
+     |    ^^^^^^^^^^^^^^ ------  ------
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+     |
+1275 |         fused_ceil_div((m as usize).try_into().unwrap(), FUSED_BM8_ROWS)
+     |                        +          +++++++++++++++++++++
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+     |
+1275 |         fused_ceil_div(m as usize, FUSED_BM8_ROWS.try_into().unwrap())
+     |                                                  ++++++++++++++++++++
+
+error[E0308]: arguments to this function are incorrect
+    --> crates/rmlx-core/src/ops/fused.rs:1277:9
+     |
+1277 |         fused_ceil_div(m as usize, FUSED_TM)
+     |         ^^^^^^^^^^^^^^ ----------  -------- expected `u64`, found `usize`
+     |                        |
+     |                        expected `u64`, found `usize`
+     |
+note: function defined here
+    --> crates/rmlx-core/src/ops/fused.rs:1336:4
+     |
+1336 | fn fused_ceil_div(a: u64, b: u64) -> u64 {
+     |    ^^^^^^^^^^^^^^ ------  ------
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+     |
+1277 |         fused_ceil_div((m as usize).try_into().unwrap(), FUSED_TM)
+     |                        +          +++++++++++++++++++++
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+     |
+1277 |         fused_ceil_div(m as usize, FUSED_TM.try_into().unwrap())
+     |                                            ++++++++++++++++++++
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/fused.rs:1288:23
+     |
+1288 |     (MTLSize { width: num_threadgroups, height: 1, depth: 1 }, tg_dim)
+     |                       ^^^^^^^^^^^^^^^^ expected `usize`, found `u64`
+
+error[E0308]: arguments to this function are incorrect
+    --> crates/rmlx-core/src/ops/fused.rs:2008:9
+     |
+2008 |         fused_ceil_div(m as usize, FUSED_BM8_ROWS)
+     |         ^^^^^^^^^^^^^^ ----------  -------------- expected `u64`, found `usize`
+     |                        |
+     |                        expected `u64`, found `usize`
+     |
+note: function defined here
+    --> crates/rmlx-core/src/ops/fused.rs:1336:4
+     |
+1336 | fn fused_ceil_div(a: u64, b: u64) -> u64 {
+     |    ^^^^^^^^^^^^^^ ------  ------
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+     |
+2008 |         fused_ceil_div((m as usize).try_into().unwrap(), FUSED_BM8_ROWS)
+     |                        +          +++++++++++++++++++++
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+     |
+2008 |         fused_ceil_div(m as usize, FUSED_BM8_ROWS.try_into().unwrap())
+     |                                                  ++++++++++++++++++++
+
+error[E0308]: arguments to this function are incorrect
+    --> crates/rmlx-core/src/ops/fused.rs:2010:9
+     |
+2010 |         fused_ceil_div(m as usize, FUSED_TM)
+     |         ^^^^^^^^^^^^^^ ----------  -------- expected `u64`, found `usize`
+     |                        |
+     |                        expected `u64`, found `usize`
+     |
+note: function defined here
+    --> crates/rmlx-core/src/ops/fused.rs:1336:4
+     |
+1336 | fn fused_ceil_div(a: u64, b: u64) -> u64 {
+     |    ^^^^^^^^^^^^^^ ------  ------
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+     |
+2010 |         fused_ceil_div((m as usize).try_into().unwrap(), FUSED_TM)
+     |                        +          +++++++++++++++++++++
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+     |
+2010 |         fused_ceil_div(m as usize, FUSED_TM.try_into().unwrap())
+     |                                            ++++++++++++++++++++
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/fused.rs:2021:23
+     |
+2021 |     (MTLSize { width: num_threadgroups, height: 1, depth: 1 }, tg_dim)
+     |                       ^^^^^^^^^^^^^^^^ expected `usize`, found `u64`
+
+error[E0308]: mismatched types
+   --> crates/rmlx-core/src/ops/gelu.rs:273:50
+    |
+273 |     let grid_threads = (numel as usize).div_ceil(elems_per_thread);
+    |                                         -------- ^^^^^^^^^^^^^^^^ expected `usize`, found `u64`
+    |                                         |
+    |                                         arguments to this method are incorrect
+    |
+note: method defined here
+   --> /rustc/01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf/library/core/src/num/mod.rs:1269:5
+    = note: this error originates in the macro `uint_impl` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: you can convert a `u64` to a `usize` and panic if the converted value doesn't fit
+    |
+273 |     let grid_threads = (numel as usize).div_ceil(elems_per_thread.try_into().unwrap());
+    |                                                                  ++++++++++++++++++++
+
+error[E0308]: mismatched types
+   --> crates/rmlx-core/src/ops/gelu.rs:307:50
+    |
+307 |     let grid_threads = (numel as usize).div_ceil(elems_per_thread);
+    |                                         -------- ^^^^^^^^^^^^^^^^ expected `usize`, found `u64`
+    |                                         |
+    |                                         arguments to this method are incorrect
+    |
+note: method defined here
+   --> /rustc/01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf/library/core/src/num/mod.rs:1269:5
+    = note: this error originates in the macro `uint_impl` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: you can convert a `u64` to a `usize` and panic if the converted value doesn't fit
+    |
+307 |     let grid_threads = (numel as usize).div_ceil(elems_per_thread.try_into().unwrap());
+    |                                                                  ++++++++++++++++++++
+
+error[E0308]: arguments to this function are incorrect
+    --> crates/rmlx-core/src/ops/gemv.rs:1135:9
+     |
+1135 |         ceil_div(m as usize, BM8_ROWS)
+     |         ^^^^^^^^ ----------  -------- expected `u64`, found `usize`
+     |                  |
+     |                  expected `u64`, found `usize`
+     |
+note: function defined here
+    --> crates/rmlx-core/src/ops/gemv.rs:1045:4
+     |
+1045 | fn ceil_div(a: u64, b: u64) -> u64 {
+     |    ^^^^^^^^ ------  ------
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+     |
+1135 |         ceil_div((m as usize).try_into().unwrap(), BM8_ROWS)
+     |                  +          +++++++++++++++++++++
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+     |
+1135 |         ceil_div(m as usize, BM8_ROWS.try_into().unwrap())
+     |                                      ++++++++++++++++++++
+
+error[E0308]: arguments to this function are incorrect
+    --> crates/rmlx-core/src/ops/gemv.rs:1137:9
+     |
+1137 |         ceil_div(m as usize, TM)
+     |         ^^^^^^^^ ----------  -- expected `u64`, found `usize`
+     |                  |
+     |                  expected `u64`, found `usize`
+     |
+note: function defined here
+    --> crates/rmlx-core/src/ops/gemv.rs:1045:4
+     |
+1045 | fn ceil_div(a: u64, b: u64) -> u64 {
+     |    ^^^^^^^^ ------  ------
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+     |
+1137 |         ceil_div((m as usize).try_into().unwrap(), TM)
+     |                  +          +++++++++++++++++++++
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+     |
+1137 |         ceil_div(m as usize, TM.try_into().unwrap())
+     |                                ++++++++++++++++++++
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/gemv.rs:1144:73
+     |
+1144 |     encoder.dispatchThreadgroups_threadsPerThreadgroup(MTLSize { width: num_threadgroups, height: 1, depth: 1 }, tg_dim);
+     |                                                                         ^^^^^^^^^^^^^^^^ expected `usize`, found `u64`
+
+error[E0308]: arguments to this function are incorrect
+    --> crates/rmlx-core/src/ops/gemv.rs:1214:9
+     |
+1214 |         ceil_div(m as usize, BM8_ROWS)
+     |         ^^^^^^^^ ----------  -------- expected `u64`, found `usize`
+     |                  |
+     |                  expected `u64`, found `usize`
+     |
+note: function defined here
+    --> crates/rmlx-core/src/ops/gemv.rs:1045:4
+     |
+1045 | fn ceil_div(a: u64, b: u64) -> u64 {
+     |    ^^^^^^^^ ------  ------
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+     |
+1214 |         ceil_div((m as usize).try_into().unwrap(), BM8_ROWS)
+     |                  +          +++++++++++++++++++++
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+     |
+1214 |         ceil_div(m as usize, BM8_ROWS.try_into().unwrap())
+     |                                      ++++++++++++++++++++
+
+error[E0308]: arguments to this function are incorrect
+    --> crates/rmlx-core/src/ops/gemv.rs:1216:9
+     |
+1216 |         ceil_div(m as usize, TM)
+     |         ^^^^^^^^ ----------  -- expected `u64`, found `usize`
+     |                  |
+     |                  expected `u64`, found `usize`
+     |
+note: function defined here
+    --> crates/rmlx-core/src/ops/gemv.rs:1045:4
+     |
+1045 | fn ceil_div(a: u64, b: u64) -> u64 {
+     |    ^^^^^^^^ ------  ------
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+     |
+1216 |         ceil_div((m as usize).try_into().unwrap(), TM)
+     |                  +          +++++++++++++++++++++
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+     |
+1216 |         ceil_div(m as usize, TM.try_into().unwrap())
+     |                                ++++++++++++++++++++
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/gemv.rs:1223:73
+     |
+1223 |     encoder.dispatchThreadgroups_threadsPerThreadgroup(MTLSize { width: num_threadgroups, height: 1, depth: 1 }, tg_dim);
+     |                                                                         ^^^^^^^^^^^^^^^^ expected `usize`, found `u64`
+
+error[E0308]: arguments to this function are incorrect
+    --> crates/rmlx-core/src/ops/gemv.rs:1292:9
+     |
+1292 |         ceil_div(m as usize, BM8_ROWS)
+     |         ^^^^^^^^ ----------  -------- expected `u64`, found `usize`
+     |                  |
+     |                  expected `u64`, found `usize`
+     |
+note: function defined here
+    --> crates/rmlx-core/src/ops/gemv.rs:1045:4
+     |
+1045 | fn ceil_div(a: u64, b: u64) -> u64 {
+     |    ^^^^^^^^ ------  ------
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+     |
+1292 |         ceil_div((m as usize).try_into().unwrap(), BM8_ROWS)
+     |                  +          +++++++++++++++++++++
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+     |
+1292 |         ceil_div(m as usize, BM8_ROWS.try_into().unwrap())
+     |                                      ++++++++++++++++++++
+
+error[E0308]: arguments to this function are incorrect
+    --> crates/rmlx-core/src/ops/gemv.rs:1294:9
+     |
+1294 |         ceil_div(m as usize, TM)
+     |         ^^^^^^^^ ----------  -- expected `u64`, found `usize`
+     |                  |
+     |                  expected `u64`, found `usize`
+     |
+note: function defined here
+    --> crates/rmlx-core/src/ops/gemv.rs:1045:4
+     |
+1045 | fn ceil_div(a: u64, b: u64) -> u64 {
+     |    ^^^^^^^^ ------  ------
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+     |
+1294 |         ceil_div((m as usize).try_into().unwrap(), TM)
+     |                  +          +++++++++++++++++++++
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+     |
+1294 |         ceil_div(m as usize, TM.try_into().unwrap())
+     |                                ++++++++++++++++++++
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/gemv.rs:1301:73
+     |
+1301 |     encoder.dispatchThreadgroups_threadsPerThreadgroup(MTLSize { width: num_threadgroups, height: 1, depth: 1 }, tg_dim);
+     |                                                                         ^^^^^^^^^^^^^^^^ expected `usize`, found `u64`
+
+error[E0308]: arguments to this function are incorrect
+    --> crates/rmlx-core/src/ops/gemv.rs:1399:9
+     |
+1399 |         ceil_div(m as usize, BM8_ROWS)
+     |         ^^^^^^^^ ----------  -------- expected `u64`, found `usize`
+     |                  |
+     |                  expected `u64`, found `usize`
+     |
+note: function defined here
+    --> crates/rmlx-core/src/ops/gemv.rs:1045:4
+     |
+1045 | fn ceil_div(a: u64, b: u64) -> u64 {
+     |    ^^^^^^^^ ------  ------
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+     |
+1399 |         ceil_div((m as usize).try_into().unwrap(), BM8_ROWS)
+     |                  +          +++++++++++++++++++++
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+     |
+1399 |         ceil_div(m as usize, BM8_ROWS.try_into().unwrap())
+     |                                      ++++++++++++++++++++
+
+error[E0308]: arguments to this function are incorrect
+    --> crates/rmlx-core/src/ops/gemv.rs:1401:9
+     |
+1401 |         ceil_div(m as usize, TM)
+     |         ^^^^^^^^ ----------  -- expected `u64`, found `usize`
+     |                  |
+     |                  expected `u64`, found `usize`
+     |
+note: function defined here
+    --> crates/rmlx-core/src/ops/gemv.rs:1045:4
+     |
+1045 | fn ceil_div(a: u64, b: u64) -> u64 {
+     |    ^^^^^^^^ ------  ------
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+     |
+1401 |         ceil_div((m as usize).try_into().unwrap(), TM)
+     |                  +          +++++++++++++++++++++
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+     |
+1401 |         ceil_div(m as usize, TM.try_into().unwrap())
+     |                                ++++++++++++++++++++
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/gemv.rs:1408:73
+     |
+1408 |     encoder.dispatchThreadgroups_threadsPerThreadgroup(MTLSize { width: num_threadgroups, height: 1, depth: 1 }, tg_dim);
+     |                                                                         ^^^^^^^^^^^^^^^^ expected `usize`, found `u64`
+
+error[E0308]: arguments to this function are incorrect
+    --> crates/rmlx-core/src/ops/gemv.rs:1506:9
+     |
+1506 |         ceil_div(m as usize, BM8_ROWS)
+     |         ^^^^^^^^ ----------  -------- expected `u64`, found `usize`
+     |                  |
+     |                  expected `u64`, found `usize`
+     |
+note: function defined here
+    --> crates/rmlx-core/src/ops/gemv.rs:1045:4
+     |
+1045 | fn ceil_div(a: u64, b: u64) -> u64 {
+     |    ^^^^^^^^ ------  ------
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+     |
+1506 |         ceil_div((m as usize).try_into().unwrap(), BM8_ROWS)
+     |                  +          +++++++++++++++++++++
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+     |
+1506 |         ceil_div(m as usize, BM8_ROWS.try_into().unwrap())
+     |                                      ++++++++++++++++++++
+
+error[E0308]: arguments to this function are incorrect
+    --> crates/rmlx-core/src/ops/gemv.rs:1508:9
+     |
+1508 |         ceil_div(m as usize, TM)
+     |         ^^^^^^^^ ----------  -- expected `u64`, found `usize`
+     |                  |
+     |                  expected `u64`, found `usize`
+     |
+note: function defined here
+    --> crates/rmlx-core/src/ops/gemv.rs:1045:4
+     |
+1045 | fn ceil_div(a: u64, b: u64) -> u64 {
+     |    ^^^^^^^^ ------  ------
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+     |
+1508 |         ceil_div((m as usize).try_into().unwrap(), TM)
+     |                  +          +++++++++++++++++++++
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+     |
+1508 |         ceil_div(m as usize, TM.try_into().unwrap())
+     |                                ++++++++++++++++++++
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/gemv.rs:1515:73
+     |
+1515 |     encoder.dispatchThreadgroups_threadsPerThreadgroup(MTLSize { width: num_threadgroups, height: 1, depth: 1 }, tg_dim);
+     |                                                                         ^^^^^^^^^^^^^^^^ expected `usize`, found `u64`
+
+error[E0308]: arguments to this function are incorrect
+    --> crates/rmlx-core/src/ops/gemv.rs:1628:9
+     |
+1628 |         ceil_div(m as usize, BM8_ROWS)
+     |         ^^^^^^^^ ----------  -------- expected `u64`, found `usize`
+     |                  |
+     |                  expected `u64`, found `usize`
+     |
+note: function defined here
+    --> crates/rmlx-core/src/ops/gemv.rs:1045:4
+     |
+1045 | fn ceil_div(a: u64, b: u64) -> u64 {
+     |    ^^^^^^^^ ------  ------
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+     |
+1628 |         ceil_div((m as usize).try_into().unwrap(), BM8_ROWS)
+     |                  +          +++++++++++++++++++++
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+     |
+1628 |         ceil_div(m as usize, BM8_ROWS.try_into().unwrap())
+     |                                      ++++++++++++++++++++
+
+error[E0308]: arguments to this function are incorrect
+    --> crates/rmlx-core/src/ops/gemv.rs:1630:9
+     |
+1630 |         ceil_div(m as usize, TM)
+     |         ^^^^^^^^ ----------  -- expected `u64`, found `usize`
+     |                  |
+     |                  expected `u64`, found `usize`
+     |
+note: function defined here
+    --> crates/rmlx-core/src/ops/gemv.rs:1045:4
+     |
+1045 | fn ceil_div(a: u64, b: u64) -> u64 {
+     |    ^^^^^^^^ ------  ------
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+     |
+1630 |         ceil_div((m as usize).try_into().unwrap(), TM)
+     |                  +          +++++++++++++++++++++
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+     |
+1630 |         ceil_div(m as usize, TM.try_into().unwrap())
+     |                                ++++++++++++++++++++
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/gemv.rs:1637:73
+     |
+1637 |     encoder.dispatchThreadgroups_threadsPerThreadgroup(MTLSize { width: num_threadgroups, height: 1, depth: 1 }, tg_dim);
+     |                                                                         ^^^^^^^^^^^^^^^^ expected `usize`, found `u64`
+
+error[E0308]: arguments to this function are incorrect
+    --> crates/rmlx-core/src/ops/gemv.rs:1730:28
+     |
+1730 |     let num_threadgroups = ceil_div(n_out as usize, TM);
+     |                            ^^^^^^^^ --------------  -- expected `u64`, found `usize`
+     |                                     |
+     |                                     expected `u64`, found `usize`
+     |
+note: function defined here
+    --> crates/rmlx-core/src/ops/gemv.rs:1045:4
+     |
+1045 | fn ceil_div(a: u64, b: u64) -> u64 {
+     |    ^^^^^^^^ ------  ------
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+     |
+1730 |     let num_threadgroups = ceil_div((n_out as usize).try_into().unwrap(), TM);
+     |                                     +              +++++++++++++++++++++
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+     |
+1730 |     let num_threadgroups = ceil_div(n_out as usize, TM.try_into().unwrap());
+     |                                                       ++++++++++++++++++++
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/gemv.rs:1732:26
+     |
+1732 |         MTLSize { width: num_threadgroups, height: 1, depth: 1 },
+     |                          ^^^^^^^^^^^^^^^^ expected `usize`, found `u64`
+
+error[E0308]: arguments to this function are incorrect
+    --> crates/rmlx-core/src/ops/gemv.rs:1813:28
+     |
+1813 |     let num_threadgroups = ceil_div(n_out as usize, TM);
+     |                            ^^^^^^^^ --------------  -- expected `u64`, found `usize`
+     |                                     |
+     |                                     expected `u64`, found `usize`
+     |
+note: function defined here
+    --> crates/rmlx-core/src/ops/gemv.rs:1045:4
+     |
+1045 | fn ceil_div(a: u64, b: u64) -> u64 {
+     |    ^^^^^^^^ ------  ------
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+     |
+1813 |     let num_threadgroups = ceil_div((n_out as usize).try_into().unwrap(), TM);
+     |                                     +              +++++++++++++++++++++
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+     |
+1813 |     let num_threadgroups = ceil_div(n_out as usize, TM.try_into().unwrap());
+     |                                                       ++++++++++++++++++++
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/gemv.rs:1815:26
+     |
+1815 |         MTLSize { width: num_threadgroups, height: 1, depth: 1 },
+     |                          ^^^^^^^^^^^^^^^^ expected `usize`, found `u64`
+
+error[E0308]: arguments to this function are incorrect
+    --> crates/rmlx-core/src/ops/gemv.rs:1895:9
+     |
+1895 |         ceil_div(m as usize, BM8_ROWS)
+     |         ^^^^^^^^ ----------  -------- expected `u64`, found `usize`
+     |                  |
+     |                  expected `u64`, found `usize`
+     |
+note: function defined here
+    --> crates/rmlx-core/src/ops/gemv.rs:1045:4
+     |
+1045 | fn ceil_div(a: u64, b: u64) -> u64 {
+     |    ^^^^^^^^ ------  ------
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+     |
+1895 |         ceil_div((m as usize).try_into().unwrap(), BM8_ROWS)
+     |                  +          +++++++++++++++++++++
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+     |
+1895 |         ceil_div(m as usize, BM8_ROWS.try_into().unwrap())
+     |                                      ++++++++++++++++++++
+
+error[E0308]: arguments to this function are incorrect
+    --> crates/rmlx-core/src/ops/gemv.rs:1897:9
+     |
+1897 |         ceil_div(m as usize, TM)
+     |         ^^^^^^^^ ----------  -- expected `u64`, found `usize`
+     |                  |
+     |                  expected `u64`, found `usize`
+     |
+note: function defined here
+    --> crates/rmlx-core/src/ops/gemv.rs:1045:4
+     |
+1045 | fn ceil_div(a: u64, b: u64) -> u64 {
+     |    ^^^^^^^^ ------  ------
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+     |
+1897 |         ceil_div((m as usize).try_into().unwrap(), TM)
+     |                  +          +++++++++++++++++++++
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+     |
+1897 |         ceil_div(m as usize, TM.try_into().unwrap())
+     |                                ++++++++++++++++++++
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/gemv.rs:1908:23
+     |
+1908 |     (MTLSize { width: num_threadgroups, height: 1, depth: 1 }, tg_dim)
+     |                       ^^^^^^^^^^^^^^^^ expected `usize`, found `u64`
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/matmul.rs:7036:9
+     |
+7035 |     set_u32(
+     |     ------- arguments to this function are incorrect
+7036 |         enc,
+     |         ^^^ expected `&ProtocolObject<...>`, found `Retained<ProtocolObject<...>>`
+     |
+     = note: expected reference `&ProtocolObject<(dyn MTLComputeCommandEncoder + 'static)>`
+                   found struct `Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>`
+note: function defined here
+    --> crates/rmlx-core/src/ops/matmul.rs:6716:4
+     |
+6716 | fn set_u32(enc: &ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>, index: usize, val: u32) {
+     |    ^^^^^^^ ---------------------------------------------------------------
+help: consider borrowing here
+     |
+7036 |         &enc,
+     |         +
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/matmul.rs:7041:9
+     |
+7040 |     set_u32(
+     |     ------- arguments to this function are incorrect
+7041 |         enc,
+     |         ^^^ expected `&ProtocolObject<...>`, found `Retained<ProtocolObject<...>>`
+     |
+     = note: expected reference `&ProtocolObject<(dyn MTLComputeCommandEncoder + 'static)>`
+                   found struct `Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>`
+note: function defined here
+    --> crates/rmlx-core/src/ops/matmul.rs:6716:4
+     |
+6716 | fn set_u32(enc: &ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>, index: usize, val: u32) {
+     |    ^^^^^^^ ---------------------------------------------------------------
+help: consider borrowing here
+     |
+7041 |         &enc,
+     |         +
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/matmul.rs:7046:9
+     |
+7045 |     set_u32(
+     |     ------- arguments to this function are incorrect
+7046 |         enc,
+     |         ^^^ expected `&ProtocolObject<...>`, found `Retained<ProtocolObject<...>>`
+     |
+     = note: expected reference `&ProtocolObject<(dyn MTLComputeCommandEncoder + 'static)>`
+                   found struct `Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>`
+note: function defined here
+    --> crates/rmlx-core/src/ops/matmul.rs:6716:4
+     |
+6716 | fn set_u32(enc: &ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>, index: usize, val: u32) {
+     |    ^^^^^^^ ---------------------------------------------------------------
+help: consider borrowing here
+     |
+7046 |         &enc,
+     |         +
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/matmul.rs:7070:31
+     |
+7070 |     let tg = MTLSize { width: tile.variant.threads_per_tg(), height: 1, depth: 1 };
+     |                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `usize`, found `u64`
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/matmul.rs:7140:123
+     |
+7140 | ...groups, height: 1, depth: 1 }, MTLSize { width: tg_size, height: 1, depth: 1 });
+     |                                                    ^^^^^^^ expected `usize`, found `u64`
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/matmul.rs:7246:123
+     |
+7246 | ...groups, height: 1, depth: 1 }, MTLSize { width: tg_size, height: 1, depth: 1 });
+     |                                                    ^^^^^^^ expected `usize`, found `u64`
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/matmul.rs:7325:123
+     |
+7325 | ...groups, height: 1, depth: 1 }, MTLSize { width: tg_size, height: 1, depth: 1 });
+     |                                                    ^^^^^^^ expected `usize`, found `u64`
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/matmul.rs:7404:123
+     |
+7404 | ...groups, height: 1, depth: 1 }, MTLSize { width: tg_size, height: 1, depth: 1 });
+     |                                                    ^^^^^^^ expected `usize`, found `u64`
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/matmul.rs:7593:9
+     |
+7592 |     encode_gemm_core(
+     |     ---------------- arguments to this function are incorrect
+7593 |         enc,
+     |         ^^^ expected `&ProtocolObject<...>`, found `Retained<ProtocolObject<...>>`
+     |
+     = note: expected reference `&ProtocolObject<(dyn MTLComputeCommandEncoder + 'static)>`
+                   found struct `Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>`
+note: function defined here
+    --> crates/rmlx-core/src/ops/matmul.rs:7617:4
+     |
+7617 | fn encode_gemm_core(
+     |    ^^^^^^^^^^^^^^^^
+7618 |     enc: &ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
+     |     ---------------------------------------------------------------
+help: consider borrowing here
+     |
+7593 |         &enc,
+     |         +
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/matmul.rs:7663:31
+     |
+7663 |     let tg = MTLSize { width: tile.variant.threads_per_tg(), height: 1, depth: 1 };
+     |                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `usize`, found `u64`
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/matmul.rs:8014:9
+     |
+8013 |     set_u32(
+     |     ------- arguments to this function are incorrect
+8014 |         enc,
+     |         ^^^ expected `&ProtocolObject<...>`, found `Retained<ProtocolObject<...>>`
+     |
+     = note: expected reference `&ProtocolObject<(dyn MTLComputeCommandEncoder + 'static)>`
+                   found struct `Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>`
+note: function defined here
+    --> crates/rmlx-core/src/ops/matmul.rs:6716:4
+     |
+6716 | fn set_u32(enc: &ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>, index: usize, val: u32) {
+     |    ^^^^^^^ ---------------------------------------------------------------
+help: consider borrowing here
+     |
+8014 |         &enc,
+     |         +
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/matmul.rs:8019:9
+     |
+8018 |     set_u32(
+     |     ------- arguments to this function are incorrect
+8019 |         enc,
+     |         ^^^ expected `&ProtocolObject<...>`, found `Retained<ProtocolObject<...>>`
+     |
+     = note: expected reference `&ProtocolObject<(dyn MTLComputeCommandEncoder + 'static)>`
+                   found struct `Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>`
+note: function defined here
+    --> crates/rmlx-core/src/ops/matmul.rs:6716:4
+     |
+6716 | fn set_u32(enc: &ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>, index: usize, val: u32) {
+     |    ^^^^^^^ ---------------------------------------------------------------
+help: consider borrowing here
+     |
+8019 |         &enc,
+     |         +
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/matmul.rs:8024:9
+     |
+8023 |     set_u32(
+     |     ------- arguments to this function are incorrect
+8024 |         enc,
+     |         ^^^ expected `&ProtocolObject<...>`, found `Retained<ProtocolObject<...>>`
+     |
+     = note: expected reference `&ProtocolObject<(dyn MTLComputeCommandEncoder + 'static)>`
+                   found struct `Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>`
+note: function defined here
+    --> crates/rmlx-core/src/ops/matmul.rs:6716:4
+     |
+6716 | fn set_u32(enc: &ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>, index: usize, val: u32) {
+     |    ^^^^^^^ ---------------------------------------------------------------
+help: consider borrowing here
+     |
+8024 |         &enc,
+     |         +
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/matmul.rs:8036:31
+     |
+8036 |     let tg = MTLSize { width: tile.variant.threads_per_tg(), height: 1, depth: 1 };
+     |                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `usize`, found `u64`
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/matmul.rs:8222:31
+     |
+8222 |     let tg = MTLSize { width: tile.variant.threads_per_tg(), height: 1, depth: 1 };
+     |                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `usize`, found `u64`
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/matmul.rs:8347:9
+     |
+8346 |     set_u32(
+     |     ------- arguments to this function are incorrect
+8347 |         enc,
+     |         ^^^ expected `&ProtocolObject<...>`, found `Retained<ProtocolObject<...>>`
+     |
+     = note: expected reference `&ProtocolObject<(dyn MTLComputeCommandEncoder + 'static)>`
+                   found struct `Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>`
+note: function defined here
+    --> crates/rmlx-core/src/ops/matmul.rs:6716:4
+     |
+6716 | fn set_u32(enc: &ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>, index: usize, val: u32) {
+     |    ^^^^^^^ ---------------------------------------------------------------
+help: consider borrowing here
+     |
+8347 |         &enc,
+     |         +
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/matmul.rs:8352:9
+     |
+8351 |     set_u32(
+     |     ------- arguments to this function are incorrect
+8352 |         enc,
+     |         ^^^ expected `&ProtocolObject<...>`, found `Retained<ProtocolObject<...>>`
+     |
+     = note: expected reference `&ProtocolObject<(dyn MTLComputeCommandEncoder + 'static)>`
+                   found struct `Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>`
+note: function defined here
+    --> crates/rmlx-core/src/ops/matmul.rs:6716:4
+     |
+6716 | fn set_u32(enc: &ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>, index: usize, val: u32) {
+     |    ^^^^^^^ ---------------------------------------------------------------
+help: consider borrowing here
+     |
+8352 |         &enc,
+     |         +
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/matmul.rs:8357:9
+     |
+8356 |     set_u32(
+     |     ------- arguments to this function are incorrect
+8357 |         enc,
+     |         ^^^ expected `&ProtocolObject<...>`, found `Retained<ProtocolObject<...>>`
+     |
+     = note: expected reference `&ProtocolObject<(dyn MTLComputeCommandEncoder + 'static)>`
+                   found struct `Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>`
+note: function defined here
+    --> crates/rmlx-core/src/ops/matmul.rs:6716:4
+     |
+6716 | fn set_u32(enc: &ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>, index: usize, val: u32) {
+     |    ^^^^^^^ ---------------------------------------------------------------
+help: consider borrowing here
+     |
+8357 |         &enc,
+     |         +
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/matmul.rs:8374:31
+     |
+8374 |     let tg = MTLSize { width: tile.variant.threads_per_tg(), height: 1, depth: 1 };
+     |                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `usize`, found `u64`
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/matmul.rs:8519:31
+     |
+8519 |     let tg = MTLSize { width: tile.variant.threads_per_tg(), height: 1, depth: 1 };
+     |                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `usize`, found `u64`
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/matmul.rs:8610:9
+     |
+8609 |     set_u32(
+     |     ------- arguments to this function are incorrect
+8610 |         enc,
+     |         ^^^ expected `&ProtocolObject<...>`, found `Retained<ProtocolObject<...>>`
+     |
+     = note: expected reference `&ProtocolObject<(dyn MTLComputeCommandEncoder + 'static)>`
+                   found struct `Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>`
+note: function defined here
+    --> crates/rmlx-core/src/ops/matmul.rs:6716:4
+     |
+6716 | fn set_u32(enc: &ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>, index: usize, val: u32) {
+     |    ^^^^^^^ ---------------------------------------------------------------
+help: consider borrowing here
+     |
+8610 |         &enc,
+     |         +
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/matmul.rs:8615:9
+     |
+8614 |     set_u32(
+     |     ------- arguments to this function are incorrect
+8615 |         enc,
+     |         ^^^ expected `&ProtocolObject<...>`, found `Retained<ProtocolObject<...>>`
+     |
+     = note: expected reference `&ProtocolObject<(dyn MTLComputeCommandEncoder + 'static)>`
+                   found struct `Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>`
+note: function defined here
+    --> crates/rmlx-core/src/ops/matmul.rs:6716:4
+     |
+6716 | fn set_u32(enc: &ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>, index: usize, val: u32) {
+     |    ^^^^^^^ ---------------------------------------------------------------
+help: consider borrowing here
+     |
+8615 |         &enc,
+     |         +
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/matmul.rs:8620:9
+     |
+8619 |     set_u32(
+     |     ------- arguments to this function are incorrect
+8620 |         enc,
+     |         ^^^ expected `&ProtocolObject<...>`, found `Retained<ProtocolObject<...>>`
+     |
+     = note: expected reference `&ProtocolObject<(dyn MTLComputeCommandEncoder + 'static)>`
+                   found struct `Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>`
+note: function defined here
+    --> crates/rmlx-core/src/ops/matmul.rs:6716:4
+     |
+6716 | fn set_u32(enc: &ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>, index: usize, val: u32) {
+     |    ^^^^^^^ ---------------------------------------------------------------
+help: consider borrowing here
+     |
+8620 |         &enc,
+     |         +
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/matmul.rs:8632:31
+     |
+8632 |     let tg = MTLSize { width: tile.variant.threads_per_tg(), height: 1, depth: 1 };
+     |                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `usize`, found `u64`
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/matmul.rs:8857:123
+     |
+8857 | ...groups, height: 1, depth: 1 }, MTLSize { width: tg_size, height: 1, depth: 1 });
+     |                                                    ^^^^^^^ expected `usize`, found `u64`
+
+error[E0308]: mismatched types
+   --> crates/rmlx-core/src/ops/moe_kernels.rs:343:14
+    |
+343 | ... { device.newBufferWithBytes_length_options(std::ptr::NonNull::new(&val as *const u32 as *const _ as *mut std::ffi::c_void).unwrap(), 4 as usize, opts).unwrap() }
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `()`, found `Retained<ProtocolObject<dyn MTLBuffer>>`
+    |
+    = note: expected unit type `()`
+                  found struct `Retained<ProtocolObject<dyn MTLBuffer>>`
+help: consider using a semicolon here
+    |
+343 |     unsafe { device.newBufferWithBytes_length_options(std::ptr::NonNull::new(&val as *const u32 as *const _ as *mut std::ffi::c_void).unwrap(), 4 as usize, opts).unwrap(); }
+    |                                                                                                                                                                           +
+help: you might have meant to return this value
+    |
+343 |     unsafe { return device.newBufferWithBytes_length_options(std::ptr::NonNull::new(&val as *const u32 as *const _ as *mut std::ffi::c_void).unwrap(), 4 as usize, opts).unwrap(); }
+    |              ++++++                                                                                                                                                              +
+
+error[E0308]: mismatched types
+   --> crates/rmlx-core/src/ops/moe_kernels.rs:341:83
+    |
+341 | fn make_u32_buf(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, val: u32) -> rmlx_metal::MtlBuffer {
+    |    ------------                                                                   ^^^^^^^^^^^^^^^^^^^^^ expected `Retained<ProtocolObject<dyn MTLBuffer>>`, found `()`
+    |    |
+    |    implicitly returns `()` as its body has no tail or `return` expression
+    |
+    = note: expected struct `Retained<ProtocolObject<(dyn MTLBuffer + 'static)>>`
+            found unit type `()`
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/quantized.rs:1381:57
+     |
+1381 |     let num_tgs_y = (qw.out_features as usize).div_ceil(rows_per_tg);
+     |                                                -------- ^^^^^^^^^^^ expected `usize`, found `u64`
+     |                                                |
+     |                                                arguments to this method are incorrect
+     |
+note: method defined here
+    --> /rustc/01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf/library/core/src/num/mod.rs:1269:5
+     = note: this error originates in the macro `uint_impl` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: you can convert a `u64` to a `usize` and panic if the converted value doesn't fit
+     |
+1381 |     let num_tgs_y = (qw.out_features as usize).div_ceil(rows_per_tg.try_into().unwrap());
+     |                                                                    ++++++++++++++++++++
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/quantized.rs:1489:43
+     |
+1489 |     let num_tgs_y = (n as usize).div_ceil(rows_per_tg);
+     |                                  -------- ^^^^^^^^^^^ expected `usize`, found `u64`
+     |                                  |
+     |                                  arguments to this method are incorrect
+     |
+note: method defined here
+    --> /rustc/01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf/library/core/src/num/mod.rs:1269:5
+     = note: this error originates in the macro `uint_impl` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: you can convert a `u64` to a `usize` and panic if the converted value doesn't fit
+     |
+1489 |     let num_tgs_y = (n as usize).div_ceil(rows_per_tg.try_into().unwrap());
+     |                                                      ++++++++++++++++++++
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/quantized.rs:1605:57
+     |
+1605 |     let num_tgs_y = (qw.out_features as usize).div_ceil(rows_per_tg);
+     |                                                -------- ^^^^^^^^^^^ expected `usize`, found `u64`
+     |                                                |
+     |                                                arguments to this method are incorrect
+     |
+note: method defined here
+    --> /rustc/01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf/library/core/src/num/mod.rs:1269:5
+     = note: this error originates in the macro `uint_impl` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: you can convert a `u64` to a `usize` and panic if the converted value doesn't fit
+     |
+1605 |     let num_tgs_y = (qw.out_features as usize).div_ceil(rows_per_tg.try_into().unwrap());
+     |                                                                    ++++++++++++++++++++
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/quantized.rs:1703:43
+     |
+1703 |     let num_tgs_y = (n as usize).div_ceil(rows_per_tg);
+     |                                  -------- ^^^^^^^^^^^ expected `usize`, found `u64`
+     |                                  |
+     |                                  arguments to this method are incorrect
+     |
+note: method defined here
+    --> /rustc/01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf/library/core/src/num/mod.rs:1269:5
+     = note: this error originates in the macro `uint_impl` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: you can convert a `u64` to a `usize` and panic if the converted value doesn't fit
+     |
+1703 |     let num_tgs_y = (n as usize).div_ceil(rows_per_tg.try_into().unwrap());
+     |                                                      ++++++++++++++++++++
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/quantized.rs:1829:43
+     |
+1829 |     let num_tgs_y = (n as usize).div_ceil(rows_per_tg);
+     |                                  -------- ^^^^^^^^^^^ expected `usize`, found `u64`
+     |                                  |
+     |                                  arguments to this method are incorrect
+     |
+note: method defined here
+    --> /rustc/01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf/library/core/src/num/mod.rs:1269:5
+     = note: this error originates in the macro `uint_impl` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: you can convert a `u64` to a `usize` and panic if the converted value doesn't fit
+     |
+1829 |     let num_tgs_y = (n as usize).div_ceil(rows_per_tg.try_into().unwrap());
+     |                                                      ++++++++++++++++++++
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/quantized.rs:1955:43
+     |
+1955 |     let num_tgs_y = (n as usize).div_ceil(rows_per_tg);
+     |                                  -------- ^^^^^^^^^^^ expected `usize`, found `u64`
+     |                                  |
+     |                                  arguments to this method are incorrect
+     |
+note: method defined here
+    --> /rustc/01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf/library/core/src/num/mod.rs:1269:5
+     = note: this error originates in the macro `uint_impl` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: you can convert a `u64` to a `usize` and panic if the converted value doesn't fit
+     |
+1955 |     let num_tgs_y = (n as usize).div_ceil(rows_per_tg.try_into().unwrap());
+     |                                                      ++++++++++++++++++++
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/quantized.rs:2066:43
+     |
+2066 |     let num_tgs_y = (n as usize).div_ceil(rows_per_tg);
+     |                                  -------- ^^^^^^^^^^^ expected `usize`, found `u64`
+     |                                  |
+     |                                  arguments to this method are incorrect
+     |
+note: method defined here
+    --> /rustc/01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf/library/core/src/num/mod.rs:1269:5
+     = note: this error originates in the macro `uint_impl` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: you can convert a `u64` to a `usize` and panic if the converted value doesn't fit
+     |
+2066 |     let num_tgs_y = (n as usize).div_ceil(rows_per_tg.try_into().unwrap());
+     |                                                      ++++++++++++++++++++
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/quantized.rs:7337:65
+     |
+7337 |             let num_tgs_y = (qw.out_features as usize).div_ceil(rows_per_tg);
+     |                                                        -------- ^^^^^^^^^^^ expected `usize`, found `u64`
+     |                                                        |
+     |                                                        arguments to this method are incorrect
+     |
+note: method defined here
+    --> /rustc/01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf/library/core/src/num/mod.rs:1269:5
+     = note: this error originates in the macro `uint_impl` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: you can convert a `u64` to a `usize` and panic if the converted value doesn't fit
+     |
+7337 |             let num_tgs_y = (qw.out_features as usize).div_ceil(rows_per_tg.try_into().unwrap());
+     |                                                                            ++++++++++++++++++++
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/quantized.rs:7366:51
+     |
+7366 |             let num_tgs_y = (n as usize).div_ceil(rows_per_tg);
+     |                                          -------- ^^^^^^^^^^^ expected `usize`, found `u64`
+     |                                          |
+     |                                          arguments to this method are incorrect
+     |
+note: method defined here
+    --> /rustc/01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf/library/core/src/num/mod.rs:1269:5
+     = note: this error originates in the macro `uint_impl` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: you can convert a `u64` to a `usize` and panic if the converted value doesn't fit
+     |
+7366 |             let num_tgs_y = (n as usize).div_ceil(rows_per_tg.try_into().unwrap());
+     |                                                              ++++++++++++++++++++
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/reduce.rs:1283:41
+     |
+1283 |     let tg_size = std::cmp::min(256u64, pipeline.maxTotalThreadsPerThreadgroup());
+     |                   -------------         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `u64`, found `usize`
+     |                   |
+     |                   arguments to this function are incorrect
+     |
+help: the return type of this call is `usize` due to the type of the argument passed
+    --> crates/rmlx-core/src/ops/reduce.rs:1283:19
+     |
+1283 |     let tg_size = std::cmp::min(256u64, pipeline.maxTotalThreadsPerThreadgroup());
+     |                   ^^^^^^^^^^^^^^^^^^^^^^----------------------------------------^
+     |                                         |
+     |                                         this argument influences the return type of `min`
+note: function defined here
+    --> /rustc/01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf/library/core/src/cmp.rs:1562:14
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+     |
+1283 |     let tg_size = std::cmp::min(256u64, pipeline.maxTotalThreadsPerThreadgroup().try_into().unwrap());
+     |                                                                                 ++++++++++++++++++++
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/reduce.rs:1284:31
+     |
+1284 |     let grid = numel.div_ceil(tg_size);
+     |                      -------- ^^^^^^^ expected `usize`, found `u64`
+     |                      |
+     |                      arguments to this method are incorrect
+     |
+note: method defined here
+    --> /rustc/01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf/library/core/src/num/mod.rs:1269:5
+     = note: this error originates in the macro `uint_impl` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: you can convert a `u64` to a `usize` and panic if the converted value doesn't fit
+     |
+1284 |     let grid = numel.div_ceil(tg_size.try_into().unwrap());
+     |                                      ++++++++++++++++++++
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/reduce.rs:1285:119
+     |
+1285 | ...: grid, height: 1, depth: 1 }, MTLSize { width: tg_size, height: 1, depth: 1 });
+     |                                                    ^^^^^^^ expected `usize`, found `u64`
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/reduce.rs:1392:42
+     |
+1392 |     let tg_size = std::cmp::min(1024u64, pass1_pipeline.maxTotalThreadsPerThreadgroup());
+     |                   -------------          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `u64`, found `usize`
+     |                   |
+     |                   arguments to this function are incorrect
+     |
+help: the return type of this call is `usize` due to the type of the argument passed
+    --> crates/rmlx-core/src/ops/reduce.rs:1392:19
+     |
+1392 |     let tg_size = std::cmp::min(1024u64, pass1_pipeline.maxTotalThreadsPerThreadgroup());
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^----------------------------------------------^
+     |                                          |
+     |                                          this argument influences the return type of `min`
+note: function defined here
+    --> /rustc/01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf/library/core/src/cmp.rs:1562:14
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+     |
+1392 |     let tg_size = std::cmp::min(1024u64, pass1_pipeline.maxTotalThreadsPerThreadgroup().try_into().unwrap());
+     |                                                                                        ++++++++++++++++++++
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/reduce.rs:1396:50
+     |
+1396 |     let raw_tg_count = (numel as usize).div_ceil(tg_size).min(256);
+     |                                         -------- ^^^^^^^ expected `usize`, found `u64`
+     |                                         |
+     |                                         arguments to this method are incorrect
+     |
+note: method defined here
+    --> /rustc/01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf/library/core/src/num/mod.rs:1269:5
+     = note: this error originates in the macro `uint_impl` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: you can convert a `u64` to a `usize` and panic if the converted value doesn't fit
+     |
+1396 |     let raw_tg_count = (numel as usize).div_ceil(tg_size.try_into().unwrap()).min(256);
+     |                                                         ++++++++++++++++++++
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/reduce.rs:1422:26
+     |
+1422 |         MTLSize { width: tg_size, height: 1, depth: 1 },
+     |                          ^^^^^^^ expected `usize`, found `u64`
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/rms_norm.rs:1192:73
+     |
+1192 |     encoder.dispatchThreadgroups_threadsPerThreadgroup(MTLSize { width: rows, height: 1, depth: 1 }, MTLSize { width: tg_size, height: 1,...
+     |                                                                         ^^^^ expected `usize`, found `u64`
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/rope.rs:1605:85
+     |
+1605 |     let grid = MTLSize { width: half_dim as usize, height: seq_len as usize, depth: n_batch };
+     |                                                                                     ^^^^^^^ expected `usize`, found `u64`
+
+error[E0308]: mismatched types
+    --> crates/rmlx-core/src/ops/sdpa.rs:3767:67
+     |
+3767 |     let result = sdpa_encode_impl(registry, q, k, v, mask, scale, encoder);
+     |                  ----------------                                 ^^^^^^^ expected `&ProtocolObject<...>`, found `Retained<ProtocolObject<...>>`
+     |                  |
+     |                  arguments to this function are incorrect
+     |
+     = note: expected reference `&ProtocolObject<(dyn MTLComputeCommandEncoder + 'static)>`
+                   found struct `Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>`
+note: function defined here
+    --> crates/rmlx-core/src/ops/sdpa.rs:3606:4
+     |
+3606 | fn sdpa_encode_impl(
+     |    ^^^^^^^^^^^^^^^^
+...
+3613 |     encoder: &ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
+     |     -------------------------------------------------------------------
+help: consider borrowing here
+     |
+3767 |     let result = sdpa_encode_impl(registry, q, k, v, mask, scale, &encoder);
+     |                                                                   +
+
+error[E0308]: mismatched types
+   --> crates/rmlx-core/src/ops/silu.rs:367:50
+    |
+367 |     let grid_threads = (numel as usize).div_ceil(elems_per_thread);
+    |                                         -------- ^^^^^^^^^^^^^^^^ expected `usize`, found `u64`
+    |                                         |
+    |                                         arguments to this method are incorrect
+    |
+note: method defined here
+   --> /rustc/01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf/library/core/src/num/mod.rs:1269:5
+    = note: this error originates in the macro `uint_impl` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: you can convert a `u64` to a `usize` and panic if the converted value doesn't fit
+    |
+367 |     let grid_threads = (numel as usize).div_ceil(elems_per_thread.try_into().unwrap());
+    |                                                                  ++++++++++++++++++++
+
+error[E0308]: mismatched types
+   --> crates/rmlx-core/src/ops/silu.rs:421:50
+    |
+421 |     let grid_threads = (numel as usize).div_ceil(elems_per_thread);
+    |                                         -------- ^^^^^^^^^^^^^^^^ expected `usize`, found `u64`
+    |                                         |
+    |                                         arguments to this method are incorrect
+    |
+note: method defined here
+   --> /rustc/01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf/library/core/src/num/mod.rs:1269:5
+    = note: this error originates in the macro `uint_impl` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: you can convert a `u64` to a `usize` and panic if the converted value doesn't fit
+    |
+421 |     let grid_threads = (numel as usize).div_ceil(elems_per_thread.try_into().unwrap());
+    |                                                                  ++++++++++++++++++++
+
+error[E0308]: mismatched types
+   --> crates/rmlx-core/src/ops/silu.rs:448:50
+    |
+448 |     let grid_threads = (numel as usize).div_ceil(elems_per_thread);
+    |                                         -------- ^^^^^^^^^^^^^^^^ expected `usize`, found `u64`
+    |                                         |
+    |                                         arguments to this method are incorrect
+    |
+note: method defined here
+   --> /rustc/01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf/library/core/src/num/mod.rs:1269:5
+    = note: this error originates in the macro `uint_impl` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: you can convert a `u64` to a `usize` and panic if the converted value doesn't fit
+    |
+448 |     let grid_threads = (numel as usize).div_ceil(elems_per_thread.try_into().unwrap());
+    |                                                                  ++++++++++++++++++++
+
+error[E0308]: mismatched types
+   --> crates/rmlx-core/src/ops/silu.rs:469:52
+    |
+469 |     let result = silu_encode_impl(registry, input, encoder)?;
+    |                  ----------------                  ^^^^^^^ expected `&ProtocolObject<...>`, found `Retained<ProtocolObject<...>>`
+    |                  |
+    |                  arguments to this function are incorrect
+    |
+    = note: expected reference `&ProtocolObject<(dyn MTLComputeCommandEncoder + 'static)>`
+                  found struct `Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>`
+note: function defined here
+   --> crates/rmlx-core/src/ops/silu.rs:436:4
+    |
+436 | fn silu_encode_impl(
+    |    ^^^^^^^^^^^^^^^^
+...
+439 |     encoder: &ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
+    |     -------------------------------------------------------------------
+help: consider borrowing here
+    |
+469 |     let result = silu_encode_impl(registry, input, &encoder)?;
+    |                                                    +
+
+error[E0308]: mismatched types
+   --> crates/rmlx-core/src/ops/softmax.rs:770:47
+    |
+770 |     let tg_size = std::cmp::min(tg_size_hint, pipeline.maxTotalThreadsPerThreadgroup());
+    |                   -------------               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `u64`, found `usize`
+    |                   |
+    |                   arguments to this function are incorrect
+    |
+help: the return type of this call is `usize` due to the type of the argument passed
+   --> crates/rmlx-core/src/ops/softmax.rs:770:19
+    |
+770 |     let tg_size = std::cmp::min(tg_size_hint, pipeline.maxTotalThreadsPerThreadgroup());
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^----------------------------------------^
+    |                                               |
+    |                                               this argument influences the return type of `min`
+note: function defined here
+   --> /rustc/01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf/library/core/src/cmp.rs:1562:14
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+    |
+770 |     let tg_size = std::cmp::min(tg_size_hint, pipeline.maxTotalThreadsPerThreadgroup().try_into().unwrap());
+    |                                                                                       ++++++++++++++++++++
+
+error[E0308]: mismatched types
+   --> crates/rmlx-core/src/ops/softmax.rs:773:26
+    |
+773 |         MTLSize { width: tg_size, height: 1, depth: 1 },
+    |                          ^^^^^^^ expected `usize`, found `u64`
+
+error[E0308]: mismatched types
+   --> crates/rmlx-core/src/ops/unary.rs:197:41
+    |
+197 |     let tg_size = std::cmp::min(256u64, pipeline.maxTotalThreadsPerThreadgroup());
+    |                   -------------         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `u64`, found `usize`
+    |                   |
+    |                   arguments to this function are incorrect
+    |
+help: the return type of this call is `usize` due to the type of the argument passed
+   --> crates/rmlx-core/src/ops/unary.rs:197:19
+    |
+197 |     let tg_size = std::cmp::min(256u64, pipeline.maxTotalThreadsPerThreadgroup());
+    |                   ^^^^^^^^^^^^^^^^^^^^^^----------------------------------------^
+    |                                         |
+    |                                         this argument influences the return type of `min`
+note: function defined here
+   --> /rustc/01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf/library/core/src/cmp.rs:1562:14
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+    |
+197 |     let tg_size = std::cmp::min(256u64, pipeline.maxTotalThreadsPerThreadgroup().try_into().unwrap());
+    |                                                                                 ++++++++++++++++++++
+
+error[E0308]: mismatched types
+   --> crates/rmlx-core/src/ops/unary.rs:198:50
+    |
+198 |     let n_groups = (n_threads as usize).div_ceil(tg_size);
+    |                                         -------- ^^^^^^^ expected `usize`, found `u64`
+    |                                         |
+    |                                         arguments to this method are incorrect
+    |
+note: method defined here
+   --> /rustc/01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf/library/core/src/num/mod.rs:1269:5
+    = note: this error originates in the macro `uint_impl` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: you can convert a `u64` to a `usize` and panic if the converted value doesn't fit
+    |
+198 |     let n_groups = (n_threads as usize).div_ceil(tg_size.try_into().unwrap());
+    |                                                         ++++++++++++++++++++
+
+error[E0308]: mismatched types
+   --> crates/rmlx-core/src/ops/unary.rs:200:119
+    |
+200 | ...groups, height: 1, depth: 1 }, MTLSize { width: tg_size, height: 1, depth: 1 });
+    |                                                    ^^^^^^^ expected `usize`, found `u64`
+
+error[E0308]: mismatched types
+   --> crates/rmlx-core/src/ops/random.rs:203:36
+    |
+203 |     let tg = std::cmp::min(256u64, pipeline.maxTotalThreadsPerThreadgroup());
+    |              -------------         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `u64`, found `usize`
+    |              |
+    |              arguments to this function are incorrect
+    |
+help: the return type of this call is `usize` due to the type of the argument passed
+   --> crates/rmlx-core/src/ops/random.rs:203:14
+    |
+203 |     let tg = std::cmp::min(256u64, pipeline.maxTotalThreadsPerThreadgroup());
+    |              ^^^^^^^^^^^^^^^^^^^^^^----------------------------------------^
+    |                                    |
+    |                                    this argument influences the return type of `min`
+note: function defined here
+   --> /rustc/01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf/library/core/src/cmp.rs:1562:14
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+    |
+203 |     let tg = std::cmp::min(256u64, pipeline.maxTotalThreadsPerThreadgroup().try_into().unwrap());
+    |                                                                            ++++++++++++++++++++
+
+error[E0308]: mismatched types
+   --> crates/rmlx-core/src/ops/random.rs:204:115
+    |
+204 | ...n_threads, height: 1, depth: 1 }, MTLSize { width: tg, height: 1, depth: 1 });
+    |                                                       ^^ expected `usize`, found `u64`
+
+error[E0308]: mismatched types
+   --> crates/rmlx-core/src/ops/random.rs:257:36
+    |
+257 |     let tg = std::cmp::min(256u64, pipeline.maxTotalThreadsPerThreadgroup());
+    |              -------------         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `u64`, found `usize`
+    |              |
+    |              arguments to this function are incorrect
+    |
+help: the return type of this call is `usize` due to the type of the argument passed
+   --> crates/rmlx-core/src/ops/random.rs:257:14
+    |
+257 |     let tg = std::cmp::min(256u64, pipeline.maxTotalThreadsPerThreadgroup());
+    |              ^^^^^^^^^^^^^^^^^^^^^^----------------------------------------^
+    |                                    |
+    |                                    this argument influences the return type of `min`
+note: function defined here
+   --> /rustc/01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf/library/core/src/cmp.rs:1562:14
+help: you can convert a `usize` to a `u64` and panic if the converted value doesn't fit
+    |
+257 |     let tg = std::cmp::min(256u64, pipeline.maxTotalThreadsPerThreadgroup().try_into().unwrap());
+    |                                                                            ++++++++++++++++++++
+
+error[E0308]: mismatched types
+   --> crates/rmlx-core/src/ops/random.rs:258:115
+    |
+258 | ...n_threads, height: 1, depth: 1 }, MTLSize { width: tg, height: 1, depth: 1 });
+    |                                                       ^^ expected `usize`, found `u64`
+
+error[E0308]: mismatched types
+   --> crates/rmlx-core/src/ops/random.rs:270:14
+    |
+270 | ... { device.newBufferWithBytes_length_options(std::ptr::NonNull::new(val as *const T as *const std::ffi::c_void as *mut std::ffi::c_void).unwrap(), std::mem::size_of::<T>() as u64 as usize, MTLResourceOptions::StorageModeShared).unwrap() }
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `()`, found `Retained<ProtocolObject<dyn MTLBuffer>>`
+    |
+    = note: expected unit type `()`
+                  found struct `Retained<ProtocolObject<dyn MTLBuffer>>`
+help: consider using a semicolon here
+    |
+270 |     unsafe { device.newBufferWithBytes_length_options(std::ptr::NonNull::new(val as *const T as *const std::ffi::c_void as *mut std::ffi::c_void).unwrap(), std::mem::size_of::<T>() as u64 as usize, MTLResourceOptions::StorageModeShared).unwrap(); }
+    |                                                                                                                                                                                                                                                      +
+help: you might have meant to return this value
+    |
+270 |     unsafe { return device.newBufferWithBytes_length_options(std::ptr::NonNull::new(val as *const T as *const std::ffi::c_void as *mut std::ffi::c_void).unwrap(), std::mem::size_of::<T>() as u64 as usize, MTLResourceOptions::StorageModeShared).unwrap(); }
+    |              ++++++                                                                                                                                                                                                                                         +
+
+error[E0308]: mismatched types
+   --> crates/rmlx-core/src/ops/random.rs:269:88
+    |
+269 | fn make_scalar_buf<T>(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, val: &T) -> rmlx_metal::MtlBuffer {
+    |    ---------------                                                                     ^^^^^^^^^^^^^^^^^^^^^ expected `Retained<ProtocolObject<dyn MTLBuffer>>`, found `()`
+    |    |
+    |    implicitly returns `()` as its body has no tail or `return` expression
+    |
+    = note: expected struct `Retained<ProtocolObject<(dyn MTLBuffer + 'static)>>`
+            found unit type `()`
+
+error[E0308]: mismatched types
+   --> crates/rmlx-core/src/ops/slice.rs:278:45
+    |
+278 |     let tg = MTLSize { width: std::cmp::min(256u64, pipeline.maxTotalThreadsPerThreadgroup()), height: 1, depth: 1 };
+    |                               ------------- ^^^^^^ expected `usize`, found `u64`
+    |                               |
+    |                               arguments to this function are incorrect
+    |
+help: the return type of this call is `u64` due to the type of the argument passed
+   --> crates/rmlx-core/src/ops/slice.rs:278:31
+    |
+278 |     let tg = MTLSize { width: std::cmp::min(256u64, pipeline.maxTotalThreadsPerThreadgroup()), height: 1, depth: 1 };
+    |                               ^^^^^^^^^^^^^^------^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |                                             |
+    |                                             this argument influences the return type of `min`
+note: function defined here
+   --> /rustc/01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf/library/core/src/cmp.rs:1562:14
+help: change the type of the numeric literal from `u64` to `usize`
+    |
+278 -     let tg = MTLSize { width: std::cmp::min(256u64, pipeline.maxTotalThreadsPerThreadgroup()), height: 1, depth: 1 };
+278 +     let tg = MTLSize { width: std::cmp::min(256usize, pipeline.maxTotalThreadsPerThreadgroup()), height: 1, depth: 1 };
+    |
+
+error[E0277]: `dyn MTLCommandBuffer` cannot be shared between threads safely
+   --> crates/rmlx-core/src/ops/mod.rs:198:32
+    |
+198 |               std::thread::spawn(move || {
+    |  _____________------------------_^
+    | |             |
+    | |             required by a bound introduced by this call
+199 | |                 owned_cb.waitUntilCompleted();
+200 | |                 flag.store(true, Ordering::Release);
+201 | |             });
+    | |_____________^ `dyn MTLCommandBuffer` cannot be shared between threads safely
+    |
+    = help: the trait `Sync` is not implemented for `dyn MTLCommandBuffer`
+    = note: required for `ProtocolObject<dyn MTLCommandBuffer>` to implement `Sync`
+    = note: required for `&ProtocolObject<dyn MTLCommandBuffer>` to implement `Send`
+note: required because it's used within this closure
+   --> crates/rmlx-core/src/ops/mod.rs:198:32
+    |
+198 |             std::thread::spawn(move || {
+    |                                ^^^^^^^
+note: required by a bound in `spawn`
+   --> /rustc/01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf/library/std/src/thread/functions.rs:125:1
+
+warning: unused import: `objc2_metal::MTLResource`
+ --> crates/rmlx-core/src/array.rs:5:5
+  |
+5 | use objc2_metal::MTLResource as _;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `objc2_metal::MTLLibrary`
+  --> crates/rmlx-core/src/kernels/mod.rs:20:5
+   |
+20 | use objc2_metal::MTLLibrary as _;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `objc2_metal::MTLResource`
+  --> crates/rmlx-core/src/ops/quantized.rs:26:5
+   |
+26 | use objc2_metal::MTLResource as _;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unnecessary `unsafe` block
+   --> crates/rmlx-core/src/kernels/mod.rs:327:21
+    |
+327 |                     unsafe {
+    |                     ^^^^^^ unnecessary `unsafe` block
+    |
+    = note: `#[warn(unused_unsafe)]` (part of `#[warn(unused)]`) on by default
+
+error[E0133]: call to unsafe function `objc2_metal::MTLComputeCommandEncoder::setBuffer_offset_atIndex` is unsafe and requires unsafe block
+    --> crates/rmlx-core/src/ops/quantized.rs:7609:5
+     |
+7609 |     enc.setBuffer_offset_atIndex(Some(&dummy_buf), 0, qmm_mma::NORM_WEIGHT); // norm_weight (unused)
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+     |
+     = note: consult the function's documentation for information on how to avoid undefined behavior
+
+error[E0133]: call to unsafe function `objc2_metal::MTLComputeCommandEncoder::setBuffer_offset_atIndex` is unsafe and requires unsafe block
+    --> crates/rmlx-core/src/ops/quantized.rs:7610:5
+     |
+7610 |     enc.setBuffer_offset_atIndex(Some(&dummy_buf), 0, qmm_mma::INV_RMS); // inv_rms (unused)
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+     |
+     = note: consult the function's documentation for information on how to avoid undefined behavior
+
+error[E0133]: call to unsafe function `objc2_metal::MTLComputeCommandEncoder::setBuffer_offset_atIndex` is unsafe and requires unsafe block
+    --> crates/rmlx-core/src/ops/quantized.rs:7612:5
+     |
+7612 |     enc.setBuffer_offset_atIndex(Some(&dummy_buf), 0, qmm_mma::GATE_RESULT); // gate_result (unused)
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+     |
+     = note: consult the function's documentation for information on how to avoid undefined behavior
+
+error[E0133]: call to unsafe function `objc2_metal::MTLComputeCommandEncoder::setBuffer_offset_atIndex` is unsafe and requires unsafe block
+    --> crates/rmlx-core/src/ops/quantized.rs:7689:5
+     |
+7689 |     enc.setBuffer_offset_atIndex(Some(&dummy_buf), 0, qmm_mma::NORM_WEIGHT); // norm_weight (unused)
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+     |
+     = note: consult the function's documentation for information on how to avoid undefined behavior
+
+error[E0133]: call to unsafe function `objc2_metal::MTLComputeCommandEncoder::setBuffer_offset_atIndex` is unsafe and requires unsafe block
+    --> crates/rmlx-core/src/ops/quantized.rs:7690:5
+     |
+7690 |     enc.setBuffer_offset_atIndex(Some(&dummy_buf), 0, qmm_mma::INV_RMS); // inv_rms (unused)
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+     |
+     = note: consult the function's documentation for information on how to avoid undefined behavior
+
+error[E0133]: call to unsafe function `objc2_metal::MTLComputeCommandEncoder::setBuffer_offset_atIndex` is unsafe and requires unsafe block
+    --> crates/rmlx-core/src/ops/quantized.rs:7691:5
+     |
+7691 |     enc.setBuffer_offset_atIndex(Some(&dummy_buf), 0, qmm_mma::RESIDUAL); // residual (unused)
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+     |
+     = note: consult the function's documentation for information on how to avoid undefined behavior
+
+error[E0133]: call to unsafe function `objc2_metal::MTLComputeCommandEncoder::setBuffer_offset_atIndex` is unsafe and requires unsafe block
+    --> crates/rmlx-core/src/ops/quantized.rs:8080:5
+     |
+8080 |     enc.setBuffer_offset_atIndex(Some(&dummy_buf), 0, qmm_steel::RESIDUAL); // residual (unused)
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+     |
+     = note: consult the function's documentation for information on how to avoid undefined behavior
+
+error[E0133]: call to unsafe function `objc2_metal::MTLComputeCommandEncoder::setBuffer_offset_atIndex` is unsafe and requires unsafe block
+    --> crates/rmlx-core/src/ops/quantized.rs:8081:5
+     |
+8081 |     enc.setBuffer_offset_atIndex(Some(&dummy_buf), 0, qmm_steel::GATE_RESULT); // gate_result (unused)
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+     |
+     = note: consult the function's documentation for information on how to avoid undefined behavior
+
+error[E0133]: call to unsafe function `objc2_metal::MTLComputeCommandEncoder::setBuffer_offset_atIndex` is unsafe and requires unsafe block
+    --> crates/rmlx-core/src/ops/quantized.rs:8182:5
+     |
+8182 |     enc.setBuffer_offset_atIndex(Some(&dummy_buf), 0, qmm_steel::RESIDUAL); // residual (unused)
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+     |
+     = note: consult the function's documentation for information on how to avoid undefined behavior
+
+error[E0133]: call to unsafe function `objc2_metal::MTLComputeCommandEncoder::setBuffer_offset_atIndex` is unsafe and requires unsafe block
+    --> crates/rmlx-core/src/ops/quantized.rs:8183:5
+     |
+8183 |     enc.setBuffer_offset_atIndex(Some(&dummy_buf), 0, qmm_steel::GATE_RESULT); // gate_result (unused)
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+     |
+     = note: consult the function's documentation for information on how to avoid undefined behavior
+
+error[E0133]: call to unsafe function `objc2_metal::MTLComputeCommandEncoder::setBuffer_offset_atIndex` is unsafe and requires unsafe block
+    --> crates/rmlx-core/src/ops/quantized.rs:8293:5
+     |
+8293 |     enc.setBuffer_offset_atIndex(Some(&dummy_buf), 0, qmm_steel::RESIDUAL); // residual (unused)
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+     |
+     = note: consult the function's documentation for information on how to avoid undefined behavior
+
+Some errors have detailed explanations: E0133, E0277, E0308, E0425.
+For more information about an error, try `rustc --explain E0133`.
+warning: `rmlx-core` (lib) generated 5 warnings
+warning: rmlx-core@0.1.0: Metal compiler not found (requires Xcode, not just Command Line Tools). Skipping shader AOT compilation. GPU kernels will not be available at runtime.
+error: could not compile `rmlx-core` (lib) due to 146 previous errors; 5 warnings emitted

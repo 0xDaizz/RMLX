@@ -430,6 +430,12 @@ impl Default for IcbCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::OnceLock;
+
+    fn test_device() -> &'static MtlDevice {
+        static DEVICE: OnceLock<MtlDevice> = OnceLock::new();
+        DEVICE.get_or_init(|| MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests"))
+    }
 
     #[test]
     fn icb_builder_empty() {
@@ -463,7 +469,7 @@ mod tests {
 
     #[test]
     fn icb_replay_empty() {
-        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
+        let device = test_device();
         let queue = device.newCommandQueue().unwrap();
 
         let replay = IcbReplay {
@@ -478,7 +484,7 @@ mod tests {
 
     #[test]
     fn test_icb_concurrent_replay_empty() {
-        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
+        let device = test_device();
         let queue = device.newCommandQueue().unwrap();
         let cb = queue.commandBuffer().unwrap();
 
@@ -496,7 +502,7 @@ mod tests {
 
     #[test]
     fn test_icb_validity() {
-        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
+        let device = test_device();
         let buf_k = device
             .newBufferWithLength_options(4096, MTLResourceOptions::StorageModeShared)
             .unwrap();
@@ -516,7 +522,7 @@ mod tests {
 
     #[test]
     fn test_icb_replay_decode_empty() {
-        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
+        let device = test_device();
         let queue = device.newCommandQueue().unwrap();
         let cb = queue.commandBuffer().unwrap();
 
@@ -534,7 +540,7 @@ mod tests {
 
     #[test]
     fn test_icb_cache_get_valid() {
-        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
+        let device = test_device();
         let buf_k = device
             .newBufferWithLength_options(4096, MTLResourceOptions::StorageModeShared)
             .unwrap();

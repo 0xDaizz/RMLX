@@ -117,9 +117,21 @@ impl RMSNorm {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::OnceLock;
 
-    fn setup() -> (rmlx_metal::MtlDevice, KernelRegistry, rmlx_metal::MtlQueue) {
-        let device = objc2_metal::MTLCreateSystemDefaultDevice().expect("no Metal device");
+    fn test_device() -> &'static rmlx_metal::MtlDevice {
+        static DEVICE: OnceLock<rmlx_metal::MtlDevice> = OnceLock::new();
+        DEVICE.get_or_init(|| {
+            objc2_metal::MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests")
+        })
+    }
+
+    fn setup() -> (
+        &'static rmlx_metal::MtlDevice,
+        KernelRegistry,
+        rmlx_metal::MtlQueue,
+    ) {
+        let device = test_device();
         let gpu = rmlx_metal::device::GpuDevice::system_default().expect("no GpuDevice");
         let queue = gpu.new_command_queue();
         let registry = KernelRegistry::new(gpu);
@@ -129,10 +141,10 @@ mod tests {
 
     #[test]
     fn test_rms_norm_construction() {
-        let device = objc2_metal::MTLCreateSystemDefaultDevice().expect("no Metal device");
+        let device = test_device();
         let config = RMSNormConfig::new(64);
 
-        let norm = RMSNorm::new(&config, &device, DType::Float32);
+        let norm = RMSNorm::new(&config, device, DType::Float32);
 
         assert_eq!(norm.normalized_shape(), 64);
         assert_eq!(norm.eps(), 1e-5);
@@ -144,9 +156,9 @@ mod tests {
     fn test_rms_norm_forward_shape() {
         let (device, registry, queue) = setup();
         let config = RMSNormConfig::new(8);
-        let norm = RMSNorm::new(&config, &device, DType::Float32);
+        let norm = RMSNorm::new(&config, device, DType::Float32);
 
-        let input = Array::ones(&device, &[2, 8]);
+        let input = Array::ones(device, &[2, 8]);
 
         let output = norm
             .forward(&registry, &input, &queue)

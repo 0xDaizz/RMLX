@@ -680,15 +680,19 @@ impl std::error::Error for PagedKvError {}
 mod tests {
     use super::*;
 
-    fn test_device() -> MtlDevice {
-        objc2_metal::MTLCreateSystemDefaultDevice().expect("no Metal device available")
+    use std::sync::OnceLock;
+
+    fn test_device() -> &'static MtlDevice {
+        static DEVICE: OnceLock<MtlDevice> = OnceLock::new();
+        DEVICE.get_or_init(|| {
+            objc2_metal::MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests")
+        })
     }
 
     // Helper: create a block manager with small parameters for testing.
     fn test_block_manager(num_blocks: usize) -> BlockManager {
-        let device = test_device();
         BlockManager::new(
-            &device,
+            test_device(),
             num_blocks,
             4, // block_size: 4 tokens per block
             2, // num_layers
@@ -739,12 +743,12 @@ mod tests {
     #[test]
     fn test_append_and_retrieve() {
         let device = test_device();
-        let bm = BlockManager::new(&device, 8, 4, 2, 2, 4, DType::Float32);
+        let bm = BlockManager::new(device, 8, 4, 2, 2, 4, DType::Float32);
         let mut cache = PagedKvCache::new(bm);
 
         let seq_id = 1;
-        let key = test_array(&device, 3, 1.0);
-        let value = test_array(&device, 3, 100.0);
+        let key = test_array(device, 3, 1.0);
+        let value = test_array(device, 3, 100.0);
 
         cache.append(0, seq_id, &key, &value).unwrap();
 
@@ -769,13 +773,13 @@ mod tests {
     fn test_append_across_block_boundary() {
         let device = test_device();
         // block_size=4, so 6 tokens should span 2 blocks.
-        let bm = BlockManager::new(&device, 8, 4, 2, 2, 4, DType::Float32);
+        let bm = BlockManager::new(device, 8, 4, 2, 2, 4, DType::Float32);
         let mut cache = PagedKvCache::new(bm);
 
         let seq_id = 1;
         // Append 6 tokens (spans 2 blocks of size 4).
-        let key = test_array(&device, 6, 1.0);
-        let value = test_array(&device, 6, 100.0);
+        let key = test_array(device, 6, 1.0);
+        let value = test_array(device, 6, 100.0);
         cache.append(0, seq_id, &key, &value).unwrap();
 
         assert_eq!(cache.seq_len(seq_id), 6);
@@ -790,19 +794,19 @@ mod tests {
     #[test]
     fn test_incremental_append() {
         let device = test_device();
-        let bm = BlockManager::new(&device, 8, 4, 2, 2, 4, DType::Float32);
+        let bm = BlockManager::new(device, 8, 4, 2, 2, 4, DType::Float32);
         let mut cache = PagedKvCache::new(bm);
 
         let seq_id = 1;
 
         // First append: 3 tokens.
-        let key1 = test_array(&device, 3, 1.0);
-        let val1 = test_array(&device, 3, 100.0);
+        let key1 = test_array(device, 3, 1.0);
+        let val1 = test_array(device, 3, 100.0);
         cache.append(0, seq_id, &key1, &val1).unwrap();
 
         // Second append: 2 more tokens (should cross block boundary since block_size=4).
-        let key2 = test_array(&device, 2, 50.0);
-        let val2 = test_array(&device, 2, 200.0);
+        let key2 = test_array(device, 2, 50.0);
+        let val2 = test_array(device, 2, 200.0);
         cache.append(0, seq_id, &key2, &val2).unwrap();
 
         assert_eq!(cache.seq_len(seq_id), 5);
@@ -820,17 +824,17 @@ mod tests {
     #[test]
     fn test_multiple_sequences() {
         let device = test_device();
-        let bm = BlockManager::new(&device, 16, 4, 2, 2, 4, DType::Float32);
+        let bm = BlockManager::new(device, 16, 4, 2, 2, 4, DType::Float32);
         let mut cache = PagedKvCache::new(bm);
 
         // Sequence 1: 3 tokens.
-        let key1 = test_array(&device, 3, 1.0);
-        let val1 = test_array(&device, 3, 100.0);
+        let key1 = test_array(device, 3, 1.0);
+        let val1 = test_array(device, 3, 100.0);
         cache.append(0, 1, &key1, &val1).unwrap();
 
         // Sequence 2: 5 tokens.
-        let key2 = test_array(&device, 5, 50.0);
-        let val2 = test_array(&device, 5, 200.0);
+        let key2 = test_array(device, 5, 50.0);
+        let val2 = test_array(device, 5, 200.0);
         cache.append(0, 2, &key2, &val2).unwrap();
 
         assert_eq!(cache.seq_len(1), 3);
@@ -849,16 +853,16 @@ mod tests {
     #[test]
     fn test_multiple_layers() {
         let device = test_device();
-        let bm = BlockManager::new(&device, 8, 4, 2, 2, 4, DType::Float32);
+        let bm = BlockManager::new(device, 8, 4, 2, 2, 4, DType::Float32);
         let mut cache = PagedKvCache::new(bm);
 
         let seq_id = 1;
 
         // Write different data to layer 0 and layer 1.
-        let key_l0 = test_array(&device, 2, 1.0);
-        let val_l0 = test_array(&device, 2, 100.0);
-        let key_l1 = test_array(&device, 2, 500.0);
-        let val_l1 = test_array(&device, 2, 600.0);
+        let key_l0 = test_array(device, 2, 1.0);
+        let val_l0 = test_array(device, 2, 100.0);
+        let key_l1 = test_array(device, 2, 500.0);
+        let val_l1 = test_array(device, 2, 600.0);
 
         cache.append(0, seq_id, &key_l0, &val_l0).unwrap();
         cache.append(1, seq_id, &key_l1, &val_l1).unwrap();
@@ -877,15 +881,15 @@ mod tests {
     #[test]
     fn test_fork_cow() {
         let device = test_device();
-        let bm = BlockManager::new(&device, 16, 4, 2, 2, 4, DType::Float32);
+        let bm = BlockManager::new(device, 16, 4, 2, 2, 4, DType::Float32);
         let mut cache = PagedKvCache::new(bm);
 
         let src_seq = 1;
         let dst_seq = 2;
 
         // Populate source sequence.
-        let key = test_array(&device, 3, 1.0);
-        let val = test_array(&device, 3, 100.0);
+        let key = test_array(device, 3, 1.0);
+        let val = test_array(device, 3, 100.0);
         cache.append(0, src_seq, &key, &val).unwrap();
 
         // Fork.
@@ -902,8 +906,8 @@ mod tests {
         assert_eq!(src_table, dst_table);
 
         // Append to dst_seq should trigger CoW.
-        let new_key = test_array(&device, 1, 999.0);
-        let new_val = test_array(&device, 1, 888.0);
+        let new_key = test_array(device, 1, 999.0);
+        let new_val = test_array(device, 1, 888.0);
         cache.append(0, dst_seq, &new_key, &new_val).unwrap();
 
         // Source should be unaffected.
@@ -943,12 +947,12 @@ mod tests {
     fn test_trim_partial() {
         let device = test_device();
         // block_size=4, so 6 tokens spans 2 blocks.
-        let bm = BlockManager::new(&device, 8, 4, 2, 2, 4, DType::Float32);
+        let bm = BlockManager::new(device, 8, 4, 2, 2, 4, DType::Float32);
         let mut cache = PagedKvCache::new(bm);
 
         let seq_id = 1;
-        let key = test_array(&device, 6, 1.0);
-        let value = test_array(&device, 6, 100.0);
+        let key = test_array(device, 6, 1.0);
+        let value = test_array(device, 6, 100.0);
         cache.append(0, seq_id, &key, &value).unwrap();
         cache.append(1, seq_id, &key, &value).unwrap();
         assert_eq!(cache.seq_len(seq_id), 6);
@@ -966,12 +970,12 @@ mod tests {
     fn test_trim_frees_block() {
         let device = test_device();
         // block_size=4, so 6 tokens spans 2 blocks.
-        let bm = BlockManager::new(&device, 8, 4, 2, 2, 4, DType::Float32);
+        let bm = BlockManager::new(device, 8, 4, 2, 2, 4, DType::Float32);
         let mut cache = PagedKvCache::new(bm);
 
         let seq_id = 1;
-        let key = test_array(&device, 6, 1.0);
-        let value = test_array(&device, 6, 100.0);
+        let key = test_array(device, 6, 1.0);
+        let value = test_array(device, 6, 100.0);
         cache.append(0, seq_id, &key, &value).unwrap();
         assert_eq!(cache.block_manager().block_table(seq_id).len(), 2);
         let free_before = cache.block_manager().num_free_blocks();
@@ -990,12 +994,12 @@ mod tests {
     #[test]
     fn test_trim_to_zero() {
         let device = test_device();
-        let bm = BlockManager::new(&device, 8, 4, 2, 2, 4, DType::Float32);
+        let bm = BlockManager::new(device, 8, 4, 2, 2, 4, DType::Float32);
         let mut cache = PagedKvCache::new(bm);
 
         let seq_id = 1;
-        let key = test_array(&device, 3, 1.0);
-        let value = test_array(&device, 3, 100.0);
+        let key = test_array(device, 3, 1.0);
+        let value = test_array(device, 3, 100.0);
         cache.append(0, seq_id, &key, &value).unwrap();
         let free_before_append = cache.block_manager().num_free_blocks();
 
@@ -1014,7 +1018,7 @@ mod tests {
     #[test]
     fn test_trim_nonexistent_sequence() {
         let device = test_device();
-        let bm = BlockManager::new(&device, 8, 4, 2, 2, 4, DType::Float32);
+        let bm = BlockManager::new(device, 8, 4, 2, 2, 4, DType::Float32);
         let mut cache = PagedKvCache::new(bm);
 
         match cache.trim(999, 1) {

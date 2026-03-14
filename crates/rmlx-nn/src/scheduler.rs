@@ -398,15 +398,19 @@ mod tests {
     use rmlx_core::dtype::DType;
     use rmlx_metal::MtlDevice;
 
-    fn test_device() -> MtlDevice {
-        objc2_metal::MTLCreateSystemDefaultDevice().expect("no Metal device available")
+    use std::sync::OnceLock;
+
+    fn test_device() -> &'static MtlDevice {
+        static DEVICE: OnceLock<MtlDevice> = OnceLock::new();
+        DEVICE.get_or_init(|| {
+            objc2_metal::MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests")
+        })
     }
 
     /// Helper: create a BlockManager with small parameters for testing.
     fn test_block_manager(num_blocks: usize) -> BlockManager {
-        let device = test_device();
         BlockManager::new(
-            &device,
+            test_device(),
             num_blocks,
             4, // block_size: 4 tokens per block
             2, // num_layers

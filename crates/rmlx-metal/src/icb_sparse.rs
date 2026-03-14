@@ -624,6 +624,12 @@ impl Default for SparseExpertCache {
 mod tests {
     use super::*;
     use crate::{MtlBuffer, MtlPipeline};
+    use std::sync::OnceLock;
+
+    fn test_device() -> &'static crate::MtlDevice {
+        static DEVICE: OnceLock<crate::MtlDevice> = OnceLock::new();
+        DEVICE.get_or_init(|| MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests"))
+    }
 
     // ── Cache tests (no GPU needed) ──────────────────────────────────────
 
@@ -642,10 +648,10 @@ mod tests {
 
     #[test]
     fn cache_insert_and_get() {
-        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
+        let device = test_device();
         let _queue = device.newCommandQueue().unwrap();
 
-        let (plan, _bufs) = build_test_plan(&device, 4, 64, 128);
+        let (plan, _bufs) = build_test_plan(device, 4, 64, 128);
         let key = SparseExpertKey {
             num_experts: 4,
             hidden_dim: 64,
@@ -672,10 +678,10 @@ mod tests {
 
     #[test]
     fn cache_clear() {
-        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
+        let device = test_device();
         let _queue = device.newCommandQueue().unwrap();
 
-        let (plan, _bufs) = build_test_plan(&device, 4, 64, 128);
+        let (plan, _bufs) = build_test_plan(device, 4, 64, 128);
         let key = SparseExpertKey {
             num_experts: 4,
             hidden_dim: 64,
@@ -693,7 +699,7 @@ mod tests {
 
     #[test]
     fn cache_overwrite() {
-        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
+        let device = test_device();
         let _queue = device.newCommandQueue().unwrap();
 
         let key = SparseExpertKey {
@@ -702,8 +708,8 @@ mod tests {
             intermediate_dim: 128,
         };
 
-        let (plan1, _bufs1) = build_test_plan(&device, 4, 64, 128);
-        let (plan2, _bufs2) = build_test_plan(&device, 4, 64, 128);
+        let (plan1, _bufs1) = build_test_plan(device, 4, 64, 128);
+        let (plan2, _bufs2) = build_test_plan(device, 4, 64, 128);
 
         let mut cache = SparseExpertCache::new();
         cache.insert(key.clone(), plan1);
@@ -717,10 +723,10 @@ mod tests {
 
     #[test]
     fn plan_build_basic() {
-        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
+        let device = test_device();
         let _queue = device.newCommandQueue().unwrap();
 
-        let (plan, _bufs) = build_test_plan(&device, 8, 64, 128);
+        let (plan, _bufs) = build_test_plan(device, 8, 64, 128);
 
         assert_eq!(plan.num_experts(), 8);
         for i in 0..8 {
@@ -731,10 +737,10 @@ mod tests {
 
     #[test]
     fn plan_build_single_expert() {
-        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
+        let device = test_device();
         let _queue = device.newCommandQueue().unwrap();
 
-        let (plan, _bufs) = build_test_plan(&device, 1, 32, 64);
+        let (plan, _bufs) = build_test_plan(device, 1, 32, 64);
         assert_eq!(plan.num_experts(), 1);
         assert!(plan.has_expert(0));
         assert!(!plan.has_expert(1));
@@ -742,10 +748,10 @@ mod tests {
 
     #[test]
     fn plan_config_accessible() {
-        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
+        let device = test_device();
         let _queue = device.newCommandQueue().unwrap();
 
-        let (plan, _bufs) = build_test_plan(&device, 4, 128, 256);
+        let (plan, _bufs) = build_test_plan(device, 4, 128, 256);
         let cfg = plan.config();
         assert_eq!(cfg.max_experts, 4);
         assert_eq!(cfg.hidden_dim, 128);
@@ -756,10 +762,10 @@ mod tests {
 
     #[test]
     fn replay_sparse_all_empty() {
-        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
+        let device = test_device();
         let queue = device.newCommandQueue().unwrap();
 
-        let (plan, _bufs) = build_test_plan(&device, 4, 64, 128);
+        let (plan, _bufs) = build_test_plan(device, 4, 64, 128);
 
         let expert_counts = [0u32; 4];
         let dispatch_offsets = [0u32; 5]; // E+1
@@ -789,10 +795,10 @@ mod tests {
 
     #[test]
     fn replay_sparse_skips_empty() {
-        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
+        let device = test_device();
         let queue = device.newCommandQueue().unwrap();
 
-        let (plan, _bufs) = build_test_plan(&device, 4, 64, 128);
+        let (plan, _bufs) = build_test_plan(device, 4, 64, 128);
 
         // Experts 0 and 2 have tokens; 1 and 3 are empty.
         let expert_counts = [3u32, 0, 5, 0];
@@ -827,10 +833,10 @@ mod tests {
 
     #[test]
     fn replay_sparse_all_active() {
-        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
+        let device = test_device();
         let queue = device.newCommandQueue().unwrap();
 
-        let (plan, _bufs) = build_test_plan(&device, 4, 64, 128);
+        let (plan, _bufs) = build_test_plan(device, 4, 64, 128);
 
         let expert_counts = [2u32, 3, 1, 4];
         let dispatch_offsets = [0u32, 2, 5, 6, 10];
@@ -864,11 +870,11 @@ mod tests {
 
     #[test]
     fn replay_sparse_subset_of_experts() {
-        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
+        let device = test_device();
         let queue = device.newCommandQueue().unwrap();
 
         // Build plan for 8 experts, but only provide counts for 4.
-        let (plan, _bufs) = build_test_plan(&device, 8, 64, 128);
+        let (plan, _bufs) = build_test_plan(device, 8, 64, 128);
 
         let expert_counts = [1u32, 0, 2, 0];
         let dispatch_offsets = [0u32, 1, 1, 3, 3];
@@ -903,10 +909,10 @@ mod tests {
     #[test]
     #[should_panic(expected = "expert_counts length")]
     fn replay_sparse_panics_on_too_many_experts() {
-        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
+        let device = test_device();
         let _queue = device.newCommandQueue().unwrap();
 
-        let (plan, _bufs) = build_test_plan(&device, 2, 64, 128);
+        let (plan, _bufs) = build_test_plan(device, 2, 64, 128);
 
         // 3 expert counts but plan only has 2.
         let expert_counts = [1u32, 2, 3];
@@ -932,10 +938,10 @@ mod tests {
     #[test]
     #[should_panic(expected = "dispatch_offsets must have length E+1")]
     fn replay_sparse_panics_on_bad_offsets() {
-        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
+        let device = test_device();
         let _queue = device.newCommandQueue().unwrap();
 
-        let (plan, _bufs) = build_test_plan(&device, 4, 64, 128);
+        let (plan, _bufs) = build_test_plan(device, 4, 64, 128);
 
         let expert_counts = [1u32, 0, 2, 0];
         // Wrong length: should be 5 (E+1), but is 4.
@@ -962,10 +968,10 @@ mod tests {
 
     #[test]
     fn swiglu_dispatch_uses_2d_grid() {
-        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
+        let device = test_device();
         let _queue = device.newCommandQueue().unwrap();
 
-        let (plan, _bufs) = build_test_plan(&device, 2, 64, 128);
+        let (plan, _bufs) = build_test_plan(device, 2, 64, 128);
 
         // Access the SwiGLU dispatch for expert 0.
         let group = plan.expert_dispatches[0].as_ref().unwrap();
@@ -985,11 +991,11 @@ mod tests {
 
     #[test]
     fn swiglu_replay_preserves_intermediate_dim() {
-        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
+        let device = test_device();
         let queue = device.newCommandQueue().unwrap();
 
         let intermediate_dim = 256usize;
-        let (plan, _bufs) = build_test_plan(&device, 4, 64, intermediate_dim);
+        let (plan, _bufs) = build_test_plan(device, 4, 64, intermediate_dim);
 
         // Replay with fewer tokens than max_capacity.
         // The key check: SwiGLU grid height (intermediate_dim) must be preserved
@@ -1078,10 +1084,10 @@ mod tests {
 
     #[test]
     fn grouped_forward_icb_skips_empty_experts() {
-        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
+        let device = test_device();
         let queue = device.newCommandQueue().unwrap();
 
-        let (plan, _bufs) = build_test_plan(&device, 4, 64, 128);
+        let (plan, _bufs) = build_test_plan(device, 4, 64, 128);
 
         // Experts 0 and 2 active, 1 and 3 empty
         let expert_counts = [3u32, 0, 5, 0];
@@ -1114,10 +1120,10 @@ mod tests {
 
     #[test]
     fn grouped_forward_icb_all_empty() {
-        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
+        let device = test_device();
         let queue = device.newCommandQueue().unwrap();
 
-        let (plan, _bufs) = build_test_plan(&device, 4, 64, 128);
+        let (plan, _bufs) = build_test_plan(device, 4, 64, 128);
 
         let expert_counts = [0u32; 4];
         let dispatch_offsets = [0u32; 5];

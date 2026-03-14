@@ -418,6 +418,12 @@ fn detect_architecture(name: &str) -> Architecture {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::OnceLock;
+
+    fn test_device() -> &'static MtlDevice {
+        static DEVICE: OnceLock<MtlDevice> = OnceLock::new();
+        DEVICE.get_or_init(|| MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests"))
+    }
 
     #[test]
     fn test_detect_architecture() {
@@ -488,8 +494,8 @@ mod tests {
 
     #[test]
     fn test_chip_tuning_for_device_runs() {
-        let device = MTLCreateSystemDefaultDevice().unwrap();
-        let tuning = ChipTuning::for_device(&device);
+        let device = test_device();
+        let tuning = ChipTuning::for_device(device);
         // On any Apple Silicon these should hold:
         assert!(tuning.max_threadgroup_memory >= 16 * 1024);
         assert!(tuning.max_threads_per_threadgroup >= 512);
@@ -528,7 +534,7 @@ mod tests {
     #[test]
     fn test_create_command_buffer_both_paths() {
         // Verify that both the unretained and retained paths produce valid CBs.
-        let device = MTLCreateSystemDefaultDevice().unwrap();
+        let device = test_device();
         let queue = device.newCommandQueue().unwrap();
 
         // Retained path (standard)

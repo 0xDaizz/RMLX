@@ -148,11 +148,17 @@ impl std::error::Error for FenceError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::OnceLock;
+
+    fn test_device() -> &'static MtlDevice {
+        static DEVICE: OnceLock<MtlDevice> = OnceLock::new();
+        DEVICE.get_or_init(|| MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests"))
+    }
 
     #[test]
     fn test_fence_counter_monotonic() {
-        let device = MTLCreateSystemDefaultDevice().unwrap();
-        let fence = GpuFence::new(&device);
+        let device = test_device();
+        let fence = GpuFence::new(device);
 
         assert_eq!(fence.current_value(), 0);
         assert_eq!(fence.next_value(), 1);
@@ -163,8 +169,8 @@ mod tests {
 
     #[test]
     fn test_fence_reset() {
-        let device = MTLCreateSystemDefaultDevice().unwrap();
-        let fence = GpuFence::new(&device);
+        let device = test_device();
+        let fence = GpuFence::new(device);
 
         fence.next_value();
         fence.next_value();
@@ -177,9 +183,9 @@ mod tests {
 
     #[test]
     fn test_fence_signal_wait_roundtrip() {
-        let device = MTLCreateSystemDefaultDevice().unwrap();
+        let device = test_device();
         let queue = device.newCommandQueue().unwrap();
-        let fence = GpuFence::new(&device);
+        let fence = GpuFence::new(device);
 
         let value = fence.next_value();
 
@@ -197,8 +203,8 @@ mod tests {
 
     #[test]
     fn test_fence_cpu_wait_already_signaled() {
-        let device = MTLCreateSystemDefaultDevice().unwrap();
-        let fence = GpuFence::new(&device);
+        let device = test_device();
+        let fence = GpuFence::new(device);
 
         // Value 0 is the initial signaled value, so waiting for 0 should return immediately.
         let result = fence.cpu_wait(0, Duration::from_millis(10));

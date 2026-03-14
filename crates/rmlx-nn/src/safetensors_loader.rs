@@ -634,6 +634,14 @@ fn repack_mlx_weight(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::OnceLock;
+
+    fn test_device() -> &'static rmlx_metal::MtlDevice {
+        static DEVICE: OnceLock<rmlx_metal::MtlDevice> = OnceLock::new();
+        DEVICE.get_or_init(|| {
+            objc2_metal::MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests")
+        })
+    }
 
     // -------------------------------------------------------------------
     // HF name mapping
@@ -919,10 +927,9 @@ mod tests {
         let path = dir.join("model.safetensors");
         std::fs::write(&path, &serialized).unwrap();
 
-        let device =
-            objc2_metal::MTLCreateSystemDefaultDevice().expect("system_default Metal device");
+        let device = test_device();
 
-        let wmap = load_safetensors_weights(&device, &path, None).unwrap();
+        let wmap = load_safetensors_weights(device, &path, None).unwrap();
         assert_eq!(wmap.len(), 1);
         assert!(wmap.contains("test_weight"));
 
@@ -950,10 +957,9 @@ mod tests {
         let path = dir.join("model.safetensors");
         std::fs::write(&path, &serialized).unwrap();
 
-        let device =
-            objc2_metal::MTLCreateSystemDefaultDevice().expect("system_default Metal device");
+        let device = test_device();
 
-        let wmap = load_safetensors_weights(&device, &path, None).unwrap();
+        let wmap = load_safetensors_weights(device, &path, None).unwrap();
         let arr = wmap.get("embed").unwrap();
         assert_eq!(arr.shape(), &[2, 2]);
         assert_eq!(arr.dtype(), DType::Float16);
@@ -1009,14 +1015,13 @@ mod tests {
         let path = dir.join("model.safetensors");
         std::fs::write(&path, &serialized).unwrap();
 
-        let device =
-            objc2_metal::MTLCreateSystemDefaultDevice().expect("system_default Metal device");
+        let device = test_device();
 
         let qc = QuantizationConfig {
             bits: 4,
             group_size: 32,
         };
-        let wmap = load_safetensors_weights(&device, &path, Some(&qc)).unwrap();
+        let wmap = load_safetensors_weights(device, &path, Some(&qc)).unwrap();
 
         // Should have 0 regular tensors and 1 quantized layer
         assert_eq!(wmap.len(), 0);

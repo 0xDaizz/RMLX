@@ -127,19 +127,25 @@ fn hash_source(source: &str) -> u64 {
 mod tests {
     use super::*;
     use objc2_metal::MTLCreateSystemDefaultDevice;
+    use std::sync::OnceLock;
+
+    fn test_device() -> &'static MtlDevice {
+        static DEVICE: OnceLock<MtlDevice> = OnceLock::new();
+        DEVICE.get_or_init(|| MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests"))
+    }
 
     #[test]
     fn test_library_cache_new_empty() {
-        let device = MTLCreateSystemDefaultDevice().unwrap();
-        let cache = LibraryCache::new(&device);
+        let device = test_device();
+        let cache = LibraryCache::new(device);
         assert!(cache.is_empty());
         assert_eq!(cache.len(), 0);
     }
 
     #[test]
     fn test_library_cache_compile_and_retrieve() {
-        let device = MTLCreateSystemDefaultDevice().unwrap();
-        let cache = LibraryCache::new(&device);
+        let device = test_device();
+        let cache = LibraryCache::new(device);
 
         let source = r#"
             #include <metal_stdlib>
@@ -169,8 +175,8 @@ mod tests {
 
     #[test]
     fn test_library_cache_different_sources() {
-        let device = MTLCreateSystemDefaultDevice().unwrap();
-        let cache = LibraryCache::new(&device);
+        let device = test_device();
+        let cache = LibraryCache::new(device);
 
         let source1 = r#"
             #include <metal_stdlib>
@@ -194,8 +200,8 @@ mod tests {
 
     #[test]
     fn test_library_cache_invalid_source() {
-        let device = MTLCreateSystemDefaultDevice().unwrap();
-        let cache = LibraryCache::new(&device);
+        let device = test_device();
+        let cache = LibraryCache::new(device);
 
         let result = cache.get_or_compile("this is not valid MSL");
         assert!(result.is_err());
@@ -204,8 +210,8 @@ mod tests {
 
     #[test]
     fn test_library_cache_clear() {
-        let device = MTLCreateSystemDefaultDevice().unwrap();
-        let cache = LibraryCache::new(&device);
+        let device = test_device();
+        let cache = LibraryCache::new(device);
 
         let source = r#"
             #include <metal_stdlib>

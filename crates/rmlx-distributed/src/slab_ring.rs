@@ -489,15 +489,18 @@ mod tests {
         }
     }
 
-    /// Helper: get the default Metal device, skip test if unavailable.
-    fn require_device() -> rmlx_metal::MtlDevice {
-        match objc2_metal::MTLCreateSystemDefaultDevice() {
-            Some(d) => d,
-            None => {
-                eprintln!("skipping test: no Metal device available");
-                std::process::exit(0);
-            }
-        }
+    use std::sync::OnceLock;
+
+    fn test_device() -> &'static rmlx_metal::MtlDevice {
+        static DEVICE: OnceLock<rmlx_metal::MtlDevice> = OnceLock::new();
+        DEVICE.get_or_init(|| {
+            objc2_metal::MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests")
+        })
+    }
+
+    /// Helper: get the default Metal device.
+    fn require_device() -> &'static rmlx_metal::MtlDevice {
+        test_device()
     }
 
     #[test]
@@ -514,7 +517,7 @@ mod tests {
             depth: 3,
             slab_size: 1024,
         };
-        let ring = SlabRing::new(&device, config);
+        let ring = SlabRing::new(device, config);
 
         assert!(ring.is_empty());
         assert!(!ring.is_full());
@@ -532,7 +535,7 @@ mod tests {
             depth: 2,
             slab_size: 4096,
         };
-        let ring = SlabRing::new(&device, config);
+        let ring = SlabRing::new(device, config);
 
         let slab0 = ring.slab(0);
         assert_eq!(slab0.index, 0);
@@ -551,7 +554,7 @@ mod tests {
             depth: 2,
             slab_size: 1024,
         };
-        let ring = SlabRing::new(&device, config);
+        let ring = SlabRing::new(device, config);
         let _ = ring.slab(2);
     }
 
@@ -562,7 +565,7 @@ mod tests {
             depth: 3,
             slab_size: 1024,
         };
-        let ring = SlabRing::new(&device, config);
+        let ring = SlabRing::new(device, config);
 
         // First acquire should return slab 0 (producer_pos=0 => index 0).
         let slab = ring.acquire_for_write().unwrap();
@@ -576,7 +579,7 @@ mod tests {
             depth: 2,
             slab_size: 1024,
         };
-        let ring = SlabRing::new(&device, config);
+        let ring = SlabRing::new(device, config);
 
         // Nothing produced yet, try_consume should return None.
         assert!(ring.try_consume().is_none());
@@ -589,7 +592,7 @@ mod tests {
             depth: 2,
             slab_size: 1024,
         };
-        let ring = SlabRing::new(&device, config);
+        let ring = SlabRing::new(device, config);
 
         // Simulate producing 2 slabs by manually advancing producer_pos.
         // We cannot call produce() without a real command buffer, so we advance
@@ -614,7 +617,7 @@ mod tests {
             depth: 3,
             slab_size: 1024,
         };
-        let ring = SlabRing::new(&device, config);
+        let ring = SlabRing::new(device, config);
 
         // Phase 1: acquire slab 0 for write (CAS advances producer_pos to 1).
         let slab = ring.acquire_for_write().unwrap();
@@ -654,7 +657,7 @@ mod tests {
             depth: 2,
             slab_size: 1024,
         };
-        let ring = SlabRing::new(&device, config);
+        let ring = SlabRing::new(device, config);
 
         // Fill and drain the ring twice to test wrap-around.
         // acquire_for_write now advances producer_pos via CAS, and
@@ -685,7 +688,7 @@ mod tests {
             depth: 2,
             slab_size: 1024,
         };
-        let ring = SlabRing::new(&device, config);
+        let ring = SlabRing::new(device, config);
 
         // Blocking consume on empty ring should time out.
         let result = ring.consume(Duration::from_millis(50));
@@ -701,7 +704,7 @@ mod tests {
             depth: 2,
             slab_size: 1024,
         };
-        let ring = SlabRing::new(&device, config);
+        let ring = SlabRing::new(device, config);
 
         // Acquire slab 0 for writing.
         let slab = ring.acquire_for_write().unwrap();
@@ -731,7 +734,7 @@ mod tests {
             depth: 3,
             slab_size: 512,
         };
-        let ring = SlabRing::new(&device, config);
+        let ring = SlabRing::new(device, config);
 
         // Produce slab 0.
         let _ = ring.acquire_for_write().unwrap();
@@ -784,7 +787,7 @@ mod tests {
             depth: 1,
             slab_size: 256,
         };
-        let ring = SlabRing::new(&device, config);
+        let ring = SlabRing::new(device, config);
 
         let slab = ring.slab(0);
         let ptr = slab.metal_buffer.contents().as_ptr() as *mut u8;
@@ -808,7 +811,7 @@ mod tests {
             depth: 8,
             slab_size: 256,
         };
-        let ring = Arc::new(SlabRing::new(&device, config));
+        let ring = Arc::new(SlabRing::new(device, config));
 
         let iterations = 100;
         let num_producers = 4;
@@ -883,7 +886,7 @@ mod tests {
             depth: 2,
             slab_size: 256,
         };
-        let ring = Arc::new(SlabRing::new(&device, config));
+        let ring = Arc::new(SlabRing::new(device, config));
 
         // Fill the ring (depth=2).
         let _s0 = ring.acquire_for_write().unwrap();
@@ -927,7 +930,7 @@ mod tests {
             depth: 1,
             slab_size: 256,
         };
-        let ring = SlabRing::new(&device, config);
+        let ring = SlabRing::new(device, config);
 
         // Fill the ring.
         let _s = ring.acquire_for_write().unwrap();
@@ -949,7 +952,7 @@ mod tests {
             depth: 1,
             slab_size: 256,
         };
-        let ring = Arc::new(SlabRing::new(&device, config));
+        let ring = Arc::new(SlabRing::new(device, config));
 
         // Fill the ring.
         let _s = ring.acquire_for_write().unwrap();
@@ -978,7 +981,7 @@ mod tests {
             depth: 1,
             slab_size: 256,
         };
-        let ring = Arc::new(SlabRing::new(&device, config));
+        let ring = Arc::new(SlabRing::new(device, config));
 
         assert_eq!(ring.ring_full_count(), 0);
 
@@ -1008,7 +1011,7 @@ mod tests {
             depth: 2,
             slab_size: 256,
         };
-        let ring = Arc::new(SlabRing::new(&device, config));
+        let ring = Arc::new(SlabRing::new(device, config));
         let total_items = 20u64;
 
         let ring_prod = SendRing(Arc::clone(&ring));
@@ -1062,7 +1065,7 @@ mod tests {
             depth: 1, // Minimal ring — maximum contention.
             slab_size: 64,
         };
-        let ring = Arc::new(SlabRing::new(&device, config));
+        let ring = Arc::new(SlabRing::new(device, config));
         let total_per_producer = 50u64;
         let num_producers = 4;
         let total_items = total_per_producer * num_producers as u64;

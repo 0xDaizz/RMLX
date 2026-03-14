@@ -681,10 +681,22 @@ fn simple_random_f32() -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::OnceLock;
 
-    fn setup() -> (rmlx_metal::MtlDevice, rmlx_metal::MtlQueue, KernelRegistry) {
+    fn test_device() -> &'static rmlx_metal::MtlDevice {
+        static DEVICE: OnceLock<rmlx_metal::MtlDevice> = OnceLock::new();
+        DEVICE.get_or_init(|| {
+            objc2_metal::MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests")
+        })
+    }
+
+    fn setup() -> (
+        &'static rmlx_metal::MtlDevice,
+        rmlx_metal::MtlQueue,
+        KernelRegistry,
+    ) {
         let gpu = rmlx_metal::device::GpuDevice::system_default().expect("GPU device");
-        let device = objc2_metal::MTLCreateSystemDefaultDevice().unwrap();
+        let device = test_device();
         let queue = gpu.new_command_queue();
         let registry = KernelRegistry::new(gpu);
         ops::softmax::register(&registry).expect("register softmax");
@@ -697,7 +709,7 @@ mod tests {
         let (device, queue, registry) = setup();
 
         // logits: token 3 has the highest value
-        let logits = Array::from_slice(&device, &[1.0f32, 0.5, 2.0, 10.0, 0.1], vec![5]);
+        let logits = Array::from_slice(device, &[1.0f32, 0.5, 2.0, 10.0, 0.1], vec![5]);
 
         let config = SamplerConfig {
             temperature: 0.0,
@@ -714,7 +726,7 @@ mod tests {
         let (device, queue, registry) = setup();
 
         // logits: token 2 has the highest value
-        let logits = Array::from_slice(&device, &[1.0f32, 0.5, 10.0, 2.0, 0.1], vec![5]);
+        let logits = Array::from_slice(device, &[1.0f32, 0.5, 10.0, 2.0, 0.1], vec![5]);
 
         let config = SamplerConfig {
             temperature: 1.0,
@@ -735,7 +747,7 @@ mod tests {
 
         let vocab_size = 100;
         let logits_data: Vec<f32> = (0..vocab_size).map(|i| (i as f32) * 0.01).collect();
-        let logits = Array::from_slice(&device, &logits_data, vec![vocab_size]);
+        let logits = Array::from_slice(device, &logits_data, vec![vocab_size]);
 
         let config = SamplerConfig {
             temperature: 1.0,
@@ -759,8 +771,8 @@ mod tests {
     fn test_temperature_scaling() {
         let (device, _queue, _registry) = setup();
 
-        let logits = Array::from_slice(&device, &[2.0f32, 4.0, 6.0], vec![3]);
-        let scaled = temperature(&logits, 2.0, &device).expect("temperature");
+        let logits = Array::from_slice(device, &[2.0f32, 4.0, 6.0], vec![3]);
+        let scaled = temperature(&logits, 2.0, device).expect("temperature");
         let data = scaled.to_vec_checked::<f32>();
         assert!((data[0] - 1.0).abs() < 1e-6);
         assert!((data[1] - 2.0).abs() < 1e-6);
@@ -771,8 +783,8 @@ mod tests {
     fn test_top_k_masking() {
         let (device, _queue, _registry) = setup();
 
-        let logits = Array::from_slice(&device, &[1.0f32, 5.0, 3.0, 2.0, 4.0], vec![5]);
-        let masked = top_k(&logits, 2, &device).expect("top_k");
+        let logits = Array::from_slice(device, &[1.0f32, 5.0, 3.0, 2.0, 4.0], vec![5]);
+        let masked = top_k(&logits, 2, device).expect("top_k");
         let data = masked.to_vec_checked::<f32>();
 
         // Top-2 values are 5.0 (index 1) and 4.0 (index 4)
@@ -787,9 +799,9 @@ mod tests {
     fn test_repetition_penalty_positive_logits() {
         let (device, _queue, _registry) = setup();
 
-        let logits = Array::from_slice(&device, &[2.0f32, 4.0, 6.0, 1.0], vec![4]);
+        let logits = Array::from_slice(device, &[2.0f32, 4.0, 6.0, 1.0], vec![4]);
         let penalized =
-            repetition_penalty(&logits, &[1, 2], 2.0, &device).expect("repetition_penalty");
+            repetition_penalty(&logits, &[1, 2], 2.0, device).expect("repetition_penalty");
         let data = penalized.to_vec_checked::<f32>();
 
         // Token 0 and 3: unchanged
@@ -805,9 +817,9 @@ mod tests {
     fn test_repetition_penalty_negative_logits() {
         let (device, _queue, _registry) = setup();
 
-        let logits = Array::from_slice(&device, &[-2.0f32, -4.0, 1.0], vec![3]);
+        let logits = Array::from_slice(device, &[-2.0f32, -4.0, 1.0], vec![3]);
         let penalized =
-            repetition_penalty(&logits, &[0, 1], 2.0, &device).expect("repetition_penalty");
+            repetition_penalty(&logits, &[0, 1], 2.0, device).expect("repetition_penalty");
         let data = penalized.to_vec_checked::<f32>();
 
         // Token 0 (negative, -2.0): multiplied by 2.0 -> -4.0
@@ -840,7 +852,7 @@ mod tests {
             0.1, 10.0, 0.2, 0.3, 0.1, // pos 3 (bonus): token 3 is max
             0.1, 0.2, 0.3, 10.0, 0.1,
         ];
-        let target_logits = Array::from_slice(&device, &logits_data, vec![4, 5]);
+        let target_logits = Array::from_slice(device, &logits_data, vec![4, 5]);
         let draft_tokens = vec![2u32, 0, 1];
 
         let result = greedy_verify(&target_logits, &draft_tokens).expect("greedy_verify");
@@ -861,7 +873,7 @@ mod tests {
             0.1, 10.0, 0.2, 0.3, 0.1, // pos 3: doesn't matter
             0.1, 0.2, 0.3, 10.0, 0.1,
         ];
-        let target_logits = Array::from_slice(&device, &logits_data, vec![4, 5]);
+        let target_logits = Array::from_slice(device, &logits_data, vec![4, 5]);
         let draft_tokens = vec![2u32, 0, 1];
 
         let result = greedy_verify(&target_logits, &draft_tokens).expect("greedy_verify");
@@ -879,7 +891,7 @@ mod tests {
             0.1, 0.2, 0.1, 0.3, 10.0, // pos 1 (bonus): doesn't matter
             10.0, 0.2, 0.3, 0.1, 0.1,
         ];
-        let target_logits = Array::from_slice(&device, &logits_data, vec![2, 5]);
+        let target_logits = Array::from_slice(device, &logits_data, vec![2, 5]);
         let draft_tokens = vec![0u32];
 
         let result = greedy_verify(&target_logits, &draft_tokens).expect("greedy_verify");

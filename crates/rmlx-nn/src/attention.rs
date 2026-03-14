@@ -5408,14 +5408,20 @@ impl Attention {
 mod tests {
     use super::*;
     use objc2_metal::MTLCreateSystemDefaultDevice;
+    use std::sync::OnceLock;
+
+    fn test_device() -> &'static rmlx_metal::MtlDevice {
+        static DEVICE: OnceLock<rmlx_metal::MtlDevice> = OnceLock::new();
+        DEVICE.get_or_init(|| MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests"))
+    }
 
     #[allow(clippy::type_complexity)]
     fn setup() -> (
-        objc2::rc::Retained<ProtocolObject<dyn MTLDevice>>,
+        &'static rmlx_metal::MtlDevice,
         KernelRegistry,
         objc2::rc::Retained<ProtocolObject<dyn MTLCommandQueue>>,
     ) {
-        let device = MTLCreateSystemDefaultDevice().expect("no Metal device");
+        let device = test_device();
         let gpu = rmlx_metal::device::GpuDevice::system_default().expect("no GpuDevice");
         let queue = device.newCommandQueue().unwrap();
         let registry = KernelRegistry::new(gpu);
@@ -5441,13 +5447,11 @@ mod tests {
 
     #[test]
     fn test_kv_cache_dtype_mismatch() {
-        if MTLCreateSystemDefaultDevice().is_none() {
-            return;
-        }
+        let _ = test_device(); // ensure Metal device is available
         let (device, registry, queue) = setup();
-        let mut cache = LayerKvCache::preallocated(&device, 1, 4, 8, DType::Float32);
-        let bad_k = Array::zeros(&device, &[1, 4], DType::Float16);
-        let good_v = Array::zeros(&device, &[1, 4], DType::Float32);
+        let mut cache = LayerKvCache::preallocated(device, 1, 4, 8, DType::Float32);
+        let bad_k = Array::zeros(device, &[1, 4], DType::Float16);
+        let good_v = Array::zeros(device, &[1, 4], DType::Float32);
         let result = cache.append(vec![bad_k], vec![good_v], 1, &registry, &queue);
         assert!(result.is_err());
         assert!(format!("{:?}", result.unwrap_err()).contains("dtype"));
@@ -5455,13 +5459,11 @@ mod tests {
 
     #[test]
     fn test_kv_cache_head_dim_mismatch() {
-        if MTLCreateSystemDefaultDevice().is_none() {
-            return;
-        }
+        let _ = test_device(); // ensure Metal device is available
         let (device, registry, queue) = setup();
-        let mut cache = LayerKvCache::preallocated(&device, 1, 4, 8, DType::Float32);
-        let bad_k = Array::zeros(&device, &[1, 8], DType::Float32);
-        let good_v = Array::zeros(&device, &[1, 4], DType::Float32);
+        let mut cache = LayerKvCache::preallocated(device, 1, 4, 8, DType::Float32);
+        let bad_k = Array::zeros(device, &[1, 8], DType::Float32);
+        let good_v = Array::zeros(device, &[1, 4], DType::Float32);
         let result = cache.append(vec![bad_k], vec![good_v], 1, &registry, &queue);
         assert!(result.is_err());
         assert!(format!("{:?}", result.unwrap_err()).contains("head_dim"));
@@ -5469,13 +5471,11 @@ mod tests {
 
     #[test]
     fn test_kv_cache_seq_dim_mismatch() {
-        if MTLCreateSystemDefaultDevice().is_none() {
-            return;
-        }
+        let _ = test_device(); // ensure Metal device is available
         let (device, registry, queue) = setup();
-        let mut cache = LayerKvCache::preallocated(&device, 1, 4, 8, DType::Float32);
-        let bad_k = Array::zeros(&device, &[2, 4], DType::Float32);
-        let bad_v = Array::zeros(&device, &[2, 4], DType::Float32);
+        let mut cache = LayerKvCache::preallocated(device, 1, 4, 8, DType::Float32);
+        let bad_k = Array::zeros(device, &[2, 4], DType::Float32);
+        let bad_v = Array::zeros(device, &[2, 4], DType::Float32);
         let result = cache.append(vec![bad_k], vec![bad_v], 1, &registry, &queue);
         assert!(result.is_err());
         assert!(format!("{:?}", result.unwrap_err()).contains("seq"));
@@ -5497,15 +5497,13 @@ mod tests {
 
     #[test]
     fn test_quantized_kv_cache_head_out_of_bounds() {
-        if MTLCreateSystemDefaultDevice().is_none() {
-            return;
-        }
+        let _ = test_device(); // ensure Metal device is available
         let (device, registry, queue) = setup();
         let mut cache = QuantizedKvCache::new(2, 2, 128, 64, 8);
-        let k0 = Array::zeros(&device, &[1, 128], DType::Float32);
-        let k1 = Array::zeros(&device, &[1, 128], DType::Float32);
-        let v0 = Array::zeros(&device, &[1, 128], DType::Float32);
-        let v1 = Array::zeros(&device, &[1, 128], DType::Float32);
+        let k0 = Array::zeros(device, &[1, 128], DType::Float32);
+        let k1 = Array::zeros(device, &[1, 128], DType::Float32);
+        let v0 = Array::zeros(device, &[1, 128], DType::Float32);
+        let v1 = Array::zeros(device, &[1, 128], DType::Float32);
         cache
             .append(0, vec![k0, k1], vec![v0, v1], 1, &registry, &queue)
             .unwrap();
@@ -5519,10 +5517,10 @@ mod tests {
     fn test_legacy_first_append_dtype_mismatch() {
         let (device, registry, queue) = setup();
         let mut cache = LayerKvCache::new(2);
-        let k0 = Array::zeros(&device, &[1, 4], DType::Float32);
-        let k1 = Array::zeros(&device, &[1, 4], DType::Float16);
-        let v0 = Array::zeros(&device, &[1, 4], DType::Float32);
-        let v1 = Array::zeros(&device, &[1, 4], DType::Float32);
+        let k0 = Array::zeros(device, &[1, 4], DType::Float32);
+        let k1 = Array::zeros(device, &[1, 4], DType::Float16);
+        let v0 = Array::zeros(device, &[1, 4], DType::Float32);
+        let v1 = Array::zeros(device, &[1, 4], DType::Float32);
         let result = cache.append(vec![k0, k1], vec![v0, v1], 1, &registry, &queue);
         assert!(result.is_err());
         assert!(format!("{:?}", result.unwrap_err()).contains("dtype"));
@@ -5532,10 +5530,10 @@ mod tests {
     fn test_legacy_first_append_head_dim_mismatch() {
         let (device, registry, queue) = setup();
         let mut cache = LayerKvCache::new(2);
-        let k0 = Array::zeros(&device, &[1, 4], DType::Float32);
-        let k1 = Array::zeros(&device, &[1, 8], DType::Float32);
-        let v0 = Array::zeros(&device, &[1, 4], DType::Float32);
-        let v1 = Array::zeros(&device, &[1, 4], DType::Float32);
+        let k0 = Array::zeros(device, &[1, 4], DType::Float32);
+        let k1 = Array::zeros(device, &[1, 8], DType::Float32);
+        let v0 = Array::zeros(device, &[1, 4], DType::Float32);
+        let v1 = Array::zeros(device, &[1, 4], DType::Float32);
         let result = cache.append(vec![k0, k1], vec![v0, v1], 1, &registry, &queue);
         assert!(result.is_err());
         assert!(format!("{:?}", result.unwrap_err()).contains("head_dim"));
@@ -5545,8 +5543,8 @@ mod tests {
     fn test_legacy_first_append_not_2d() {
         let (device, registry, queue) = setup();
         let mut cache = LayerKvCache::new(1);
-        let k = Array::from_slice(&device, &[1.0f32, 2.0, 3.0, 4.0], vec![4]);
-        let v = Array::zeros(&device, &[1, 4], DType::Float32);
+        let k = Array::from_slice(device, &[1.0f32, 2.0, 3.0, 4.0], vec![4]);
+        let v = Array::zeros(device, &[1, 4], DType::Float32);
         let result = cache.append(vec![k], vec![v], 1, &registry, &queue);
         assert!(result.is_err());
         assert!(format!("{:?}", result.unwrap_err()).contains("2D"));
@@ -5556,8 +5554,8 @@ mod tests {
     fn test_legacy_first_append_seq_mismatch() {
         let (device, registry, queue) = setup();
         let mut cache = LayerKvCache::new(1);
-        let k = Array::zeros(&device, &[3, 4], DType::Float32);
-        let v = Array::zeros(&device, &[3, 4], DType::Float32);
+        let k = Array::zeros(device, &[3, 4], DType::Float32);
+        let v = Array::zeros(device, &[3, 4], DType::Float32);
         let result = cache.append(vec![k], vec![v], 1, &registry, &queue);
         assert!(result.is_err());
         assert!(format!("{:?}", result.unwrap_err()).contains("seq"));
@@ -5567,14 +5565,12 @@ mod tests {
 
     #[test]
     fn test_quantized_kv_cache_head_dim_mismatch() {
-        if MTLCreateSystemDefaultDevice().is_none() {
-            return;
-        }
+        let _ = test_device(); // ensure Metal device is available
         let (device, registry, queue) = setup();
         let mut cache = QuantizedKvCache::new(2, 1, 128, 64, 8);
         // Wrong head_dim: 64 instead of 128
-        let k = Array::zeros(&device, &[1, 64], DType::Float32);
-        let v = Array::zeros(&device, &[1, 128], DType::Float32);
+        let k = Array::zeros(device, &[1, 64], DType::Float32);
+        let v = Array::zeros(device, &[1, 128], DType::Float32);
         let result = cache.append(0, vec![k], vec![v], 1, &registry, &queue);
         assert!(result.is_err());
         assert!(format!("{:?}", result.unwrap_err()).contains("head_dim"));
@@ -5582,13 +5578,11 @@ mod tests {
 
     #[test]
     fn test_quantized_kv_cache_not_2d() {
-        if MTLCreateSystemDefaultDevice().is_none() {
-            return;
-        }
+        let _ = test_device(); // ensure Metal device is available
         let (device, registry, queue) = setup();
         let mut cache = QuantizedKvCache::new(2, 1, 128, 64, 8);
-        let k = Array::from_slice(&device, &vec![0.0f32; 128], vec![128]);
-        let v = Array::zeros(&device, &[1, 128], DType::Float32);
+        let k = Array::from_slice(device, &vec![0.0f32; 128], vec![128]);
+        let v = Array::zeros(device, &[1, 128], DType::Float32);
         let result = cache.append(0, vec![k], vec![v], 1, &registry, &queue);
         assert!(result.is_err());
         assert!(format!("{:?}", result.unwrap_err()).contains("2D"));
@@ -5596,14 +5590,12 @@ mod tests {
 
     #[test]
     fn test_quantized_kv_cache_seq_mismatch() {
-        if MTLCreateSystemDefaultDevice().is_none() {
-            return;
-        }
+        let _ = test_device(); // ensure Metal device is available
         let (device, registry, queue) = setup();
         let mut cache = QuantizedKvCache::new(2, 1, 128, 64, 8);
         // Say 3 tokens but array has 2 rows
-        let k = Array::zeros(&device, &[2, 128], DType::Float32);
-        let v = Array::zeros(&device, &[2, 128], DType::Float32);
+        let k = Array::zeros(device, &[2, 128], DType::Float32);
+        let v = Array::zeros(device, &[2, 128], DType::Float32);
         let result = cache.append(0, vec![k], vec![v], 3, &registry, &queue);
         assert!(result.is_err());
         assert!(format!("{:?}", result.unwrap_err()).contains("seq"));
@@ -5619,7 +5611,7 @@ mod tests {
         let num_kv_heads = 1;
 
         let mut cache = RotatingKvCache::new(
-            &device,
+            device,
             num_kv_heads,
             head_dim,
             max_size,
@@ -5634,8 +5626,8 @@ mod tests {
             let token_data: Vec<f32> = vec![val; head_dim];
             all_tokens.push(token_data.clone());
 
-            let k_arr = make_array(&device, &token_data, 1, head_dim);
-            let v_arr = make_array(&device, &token_data, 1, head_dim);
+            let k_arr = make_array(device, &token_data, 1, head_dim);
+            let v_arr = make_array(device, &token_data, 1, head_dim);
             cache
                 .append(vec![k_arr], vec![v_arr], 1, &registry, &queue)
                 .expect("append failed");
@@ -5795,12 +5787,12 @@ mod tests {
         let (device, registry, queue) = setup();
         let max_size = 8;
         let head_dim = 4;
-        let mut cache = RotatingKvCache::new(&device, 1, head_dim, max_size, 0, DType::Float32);
+        let mut cache = RotatingKvCache::new(device, 1, head_dim, max_size, 0, DType::Float32);
 
         // Append 3 tokens at once
         let data: Vec<f32> = (1..=12).map(|x| x as f32).collect();
-        let k = make_array(&device, &data, 3, head_dim);
-        let v = make_array(&device, &data, 3, head_dim);
+        let k = make_array(device, &data, 3, head_dim);
+        let v = make_array(device, &data, 3, head_dim);
         cache
             .append(vec![k], vec![v], 3, &registry, &queue)
             .expect("append failed");
@@ -5818,14 +5810,14 @@ mod tests {
         let (device, registry, queue) = setup();
         let max_size = 4;
         let head_dim = 2;
-        let mut cache = RotatingKvCache::new(&device, 1, head_dim, max_size, 0, DType::Float32);
+        let mut cache = RotatingKvCache::new(device, 1, head_dim, max_size, 0, DType::Float32);
 
         // Fill to capacity with single tokens
         for t in 0..4 {
             let val = (t + 1) as f32;
             let data = vec![val; head_dim];
-            let k = make_array(&device, &data, 1, head_dim);
-            let v = make_array(&device, &data, 1, head_dim);
+            let k = make_array(device, &data, 1, head_dim);
+            let v = make_array(device, &data, 1, head_dim);
             cache
                 .append(vec![k], vec![v], 1, &registry, &queue)
                 .expect("append failed");
@@ -5833,8 +5825,8 @@ mod tests {
 
         // Now append 3 more tokens (wraps via linearize_and_append)
         let new_data: Vec<f32> = vec![5.0, 5.0, 6.0, 6.0, 7.0, 7.0];
-        let k = make_array(&device, &new_data, 3, head_dim);
-        let v = make_array(&device, &new_data, 3, head_dim);
+        let k = make_array(device, &new_data, 3, head_dim);
+        let v = make_array(device, &new_data, 3, head_dim);
         cache
             .append(vec![k], vec![v], 3, &registry, &queue)
             .expect("append failed");
@@ -5852,12 +5844,12 @@ mod tests {
     #[test]
     fn test_rotating_cache_offset_monotonic() {
         let (device, registry, queue) = setup();
-        let mut cache = RotatingKvCache::new(&device, 1, 2, 4, 0, DType::Float32);
+        let mut cache = RotatingKvCache::new(device, 1, 2, 4, 0, DType::Float32);
 
         for t in 0..10 {
             let data = vec![(t + 1) as f32; 2];
-            let k = make_array(&device, &data, 1, 2);
-            let v = make_array(&device, &data, 1, 2);
+            let k = make_array(device, &data, 1, 2);
+            let v = make_array(device, &data, 1, 2);
             cache
                 .append(vec![k], vec![v], 1, &registry, &queue)
                 .expect("append failed");
@@ -5868,12 +5860,12 @@ mod tests {
     #[test]
     fn test_rotating_cache_current_len() {
         let (device, registry, queue) = setup();
-        let mut cache = RotatingKvCache::new(&device, 1, 2, 4, 0, DType::Float32);
+        let mut cache = RotatingKvCache::new(device, 1, 2, 4, 0, DType::Float32);
 
         for t in 0..10 {
             let data = vec![(t + 1) as f32; 2];
-            let k = make_array(&device, &data, 1, 2);
-            let v = make_array(&device, &data, 1, 2);
+            let k = make_array(device, &data, 1, 2);
+            let v = make_array(device, &data, 1, 2);
             cache
                 .append(vec![k], vec![v], 1, &registry, &queue)
                 .expect("append failed");
@@ -5883,11 +5875,9 @@ mod tests {
 
     #[test]
     fn test_layer_kv_cache_trim() {
-        if MTLCreateSystemDefaultDevice().is_none() {
-            return;
-        }
-        let device = MTLCreateSystemDefaultDevice().unwrap();
-        let mut cache = LayerKvCache::preallocated(&device, 2, 4, 32, DType::Float32);
+        let _ = test_device(); // ensure Metal device is available
+        let device = test_device();
+        let mut cache = LayerKvCache::preallocated(device, 2, 4, 32, DType::Float32);
 
         // Simulate appending 10 tokens by setting seq_len directly.
         cache.seq_len = 10;

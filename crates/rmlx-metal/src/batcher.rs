@@ -295,10 +295,16 @@ impl BatcherStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::OnceLock;
+
+    fn test_device() -> &'static MtlDevice {
+        static DEVICE: OnceLock<MtlDevice> = OnceLock::new();
+        DEVICE.get_or_init(|| MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests"))
+    }
 
     #[test]
     fn batcher_stats_tracking() {
-        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
+        let device = test_device();
         let queue = device.newCommandQueue().unwrap();
         let batcher = CommandBatcher::new(&queue, 32);
         assert_eq!(batcher.stats_cbs(), 0);
@@ -308,7 +314,7 @@ mod tests {
 
     #[test]
     fn batcher_creates_cb_on_first_encoder() {
-        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
+        let device = test_device();
         let queue = device.newCommandQueue().unwrap();
         let mut batcher = CommandBatcher::new(&queue, 32);
 
@@ -325,7 +331,7 @@ mod tests {
 
     #[test]
     fn batcher_multiple_encoders_same_cb() {
-        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
+        let device = test_device();
         let queue = device.newCommandQueue().unwrap();
         let mut batcher = CommandBatcher::new(&queue, 32);
 
@@ -342,7 +348,7 @@ mod tests {
 
     #[test]
     fn batcher_flush_resets() {
-        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
+        let device = test_device();
         let queue = device.newCommandQueue().unwrap();
         let mut batcher = CommandBatcher::new(&queue, 32);
 
@@ -358,7 +364,7 @@ mod tests {
 
     #[test]
     fn batcher_flush_async_returns_cb() {
-        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
+        let device = test_device();
         let queue = device.newCommandQueue().unwrap();
         let mut batcher = CommandBatcher::new(&queue, 32);
 
@@ -376,7 +382,7 @@ mod tests {
 
     #[test]
     fn batcher_should_flush_at_max() {
-        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
+        let device = test_device();
         let queue = device.newCommandQueue().unwrap();
         let mut batcher = CommandBatcher::new(&queue, 3);
 
@@ -391,7 +397,7 @@ mod tests {
 
     #[test]
     fn batcher_stats_snapshot() {
-        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
+        let device = test_device();
         let queue = device.newCommandQueue().unwrap();
         let mut batcher = CommandBatcher::new(&queue, 32);
 
@@ -420,7 +426,7 @@ mod tests {
         let before_cbs = total_cbs_created();
         let before_encs = total_encoders_created();
 
-        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
+        let device = test_device();
         let queue = device.newCommandQueue().unwrap();
         let mut batcher = CommandBatcher::new(&queue, 32);
 

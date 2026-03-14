@@ -555,8 +555,15 @@ pub fn probe_concurrent_dispatch(device: &ProtocolObject<dyn MTLDevice>) -> bool
 mod tests {
     use super::*;
 
-    fn system_device() -> Option<MtlDevice> {
-        MTLCreateSystemDefaultDevice()
+    use std::sync::OnceLock;
+
+    fn test_device() -> &'static MtlDevice {
+        static DEVICE: OnceLock<MtlDevice> = OnceLock::new();
+        DEVICE.get_or_init(|| MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests"))
+    }
+
+    fn system_device() -> Option<&'static MtlDevice> {
+        Some(test_device())
     }
 
     #[test]
@@ -764,7 +771,7 @@ mod tests {
 
     #[test]
     fn test_command_buffer_manager_thresholds() {
-        let device = MTLCreateSystemDefaultDevice().unwrap();
+        let device = test_device();
         let queue = device.newCommandQueue().unwrap();
         let mut mgr = CommandBufferManager::new(&queue);
 
@@ -785,7 +792,7 @@ mod tests {
 
     #[test]
     fn test_command_buffer_manager_auto_commit_ops() {
-        let device = MTLCreateSystemDefaultDevice().unwrap();
+        let device = test_device();
         let queue = device.newCommandQueue().unwrap();
         let mut mgr = CommandBufferManager::new(&queue);
 
@@ -803,7 +810,7 @@ mod tests {
 
     #[test]
     fn test_command_buffer_manager_auto_commit_bytes() {
-        let device = MTLCreateSystemDefaultDevice().unwrap();
+        let device = test_device();
         let queue = device.newCommandQueue().unwrap();
         let mut mgr = CommandBufferManager::new(&queue);
 
@@ -816,7 +823,7 @@ mod tests {
 
     #[test]
     fn test_command_buffer_manager_completion_handler() {
-        let device = MTLCreateSystemDefaultDevice().unwrap();
+        let device = test_device();
         let queue = device.newCommandQueue().unwrap();
         let mut mgr = CommandBufferManager::new(&queue);
 
@@ -840,8 +847,8 @@ mod tests {
 
     #[test]
     fn test_probe_concurrent_dispatch() {
-        let device = MTLCreateSystemDefaultDevice().unwrap();
-        let supported = probe_concurrent_dispatch(&device);
+        let device = test_device();
+        let supported = probe_concurrent_dispatch(device);
         // Apple Silicon always supports concurrent dispatch
         assert!(
             supported,
@@ -851,7 +858,7 @@ mod tests {
 
     #[test]
     fn test_concurrent_encoder_creation() {
-        let device = MTLCreateSystemDefaultDevice().unwrap();
+        let device = test_device();
         let queue = device.newCommandQueue().unwrap();
         let cb = queue.commandBuffer().unwrap();
 
@@ -864,7 +871,7 @@ mod tests {
 
     #[test]
     fn test_memory_barrier_scope() {
-        let device = MTLCreateSystemDefaultDevice().unwrap();
+        let device = test_device();
         let queue = device.newCommandQueue().unwrap();
         let cb = queue.commandBuffer().unwrap();
 
@@ -878,7 +885,7 @@ mod tests {
 
     #[test]
     fn test_barrier_tracker_concurrent_mode() {
-        let device = MTLCreateSystemDefaultDevice().unwrap();
+        let device = test_device();
         let a = device
             .newBufferWithLength_options(256, MTLResourceOptions::StorageModeShared)
             .unwrap();

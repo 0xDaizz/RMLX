@@ -1149,7 +1149,14 @@ impl RdmaTransport for RdmaConnectionTransport {
 #[cfg(test)]
 mod tests {
     use crate::group::{DistributedError, Group, RdmaTransport};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    fn test_device() -> &'static rmlx_metal::MtlDevice {
+        static DEVICE: OnceLock<rmlx_metal::MtlDevice> = OnceLock::new();
+        DEVICE.get_or_init(|| {
+            objc2_metal::MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests")
+        })
+    }
 
     /// A mock transport that records calls for testing.
     struct MockTransport {
@@ -1284,11 +1291,8 @@ mod tests {
         use rmlx_rdma::progress::ProgressEngine;
         use rmlx_rdma::shared_buffer::SharedBuffer;
 
-        let device = match objc2_metal::MTLCreateSystemDefaultDevice() {
-            Some(d) => d,
-            None => return, // skip on headless CI without Metal
-        };
-        let buf = match SharedBuffer::new(&device, 4096, 0) {
+        let device = test_device();
+        let buf = match SharedBuffer::new(device, 4096, 0) {
             Ok(b) => b,
             Err(_) => return, // skip if alloc fails
         };
@@ -1327,11 +1331,8 @@ mod tests {
         use rmlx_rdma::progress::ProgressEngine;
         use rmlx_rdma::shared_buffer::SharedBuffer;
 
-        let device = match objc2_metal::MTLCreateSystemDefaultDevice() {
-            Some(d) => d,
-            None => return,
-        };
-        let buf = match SharedBuffer::new(&device, 4096, 0) {
+        let device = test_device();
+        let buf = match SharedBuffer::new(device, 4096, 0) {
             Ok(b) => b,
             Err(_) => return,
         };

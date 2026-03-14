@@ -900,8 +900,13 @@ impl KQuantConfig {
 mod tests {
     use super::*;
 
-    fn test_device() -> rmlx_metal::MtlDevice {
-        objc2_metal::MTLCreateSystemDefaultDevice().expect("system_default Metal device")
+    use std::sync::OnceLock;
+
+    fn test_device() -> &'static rmlx_metal::MtlDevice {
+        static DEVICE: OnceLock<rmlx_metal::MtlDevice> = OnceLock::new();
+        DEVICE.get_or_init(|| {
+            objc2_metal::MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests")
+        })
     }
 
     fn invalid_shape_message(err: KernelError) -> String {
@@ -1046,7 +1051,7 @@ mod tests {
     fn test_awq_normalize_input_rejects_non_f32() {
         let awq = AwqLinear::new(vec![0u32; 64], vec![1.0; 8], vec![0.0; 8], 64, 8, 64).unwrap();
         let device = test_device();
-        let x = Array::zeros(&device, &[1, 64], DType::Float16);
+        let x = Array::zeros(device, &[1, 64], DType::Float16);
 
         let err = awq.normalize_input(&x).unwrap_err();
         assert_eq!(
@@ -1059,7 +1064,7 @@ mod tests {
     fn test_gptq_normalize_input_rejects_non_f32() {
         let gptq = GptqLinear::new(vec![0u32; 64], vec![1.0; 8], vec![0.0; 8], 64, 8, 64).unwrap();
         let device = test_device();
-        let x = Array::zeros(&device, &[1, 64], DType::Float16);
+        let x = Array::zeros(device, &[1, 64], DType::Float16);
 
         let err = gptq.normalize_input(&x).unwrap_err();
         assert_eq!(

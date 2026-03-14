@@ -221,6 +221,17 @@ impl Default for FusionCodegen {
 mod tests {
     use super::*;
     use crate::fusion::graph::{FusableOp, FusionGraph};
+    use objc2::rc::Retained;
+    use objc2::runtime::ProtocolObject;
+    use objc2_metal::MTLDevice;
+    use std::sync::OnceLock;
+
+    fn test_device() -> &'static ProtocolObject<dyn MTLDevice> {
+        static DEVICE: OnceLock<Retained<ProtocolObject<dyn MTLDevice>>> = OnceLock::new();
+        DEVICE.get_or_init(|| {
+            objc2_metal::MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests")
+        })
+    }
 
     #[test]
     fn test_codegen_simple_add() {
@@ -397,13 +408,7 @@ mod tests {
     fn test_codegen_compiles() {
         use objc2_metal::MTLDevice as _;
         // Verify the generated source actually compiles with Metal
-        let device = match objc2_metal::MTLCreateSystemDefaultDevice() {
-            Some(d) => d,
-            None => {
-                eprintln!("skipping test: no Metal device");
-                return;
-            }
-        };
+        let device = test_device();
 
         let mut g = FusionGraph::new(2);
         g.add_op(FusableOp::Add, vec![0, 1]);

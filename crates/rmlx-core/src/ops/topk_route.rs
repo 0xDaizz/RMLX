@@ -652,9 +652,17 @@ pub fn gpu_topk_route_into_cb(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::OnceLock;
+
+    fn test_device() -> &'static rmlx_metal::MtlDevice {
+        static DEVICE: OnceLock<rmlx_metal::MtlDevice> = OnceLock::new();
+        DEVICE.get_or_init(|| {
+            objc2_metal::MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests")
+        })
+    }
 
     fn setup() -> (rmlx_metal::MtlDevice, rmlx_metal::MtlQueue, KernelRegistry) {
-        let device = objc2_metal::MTLCreateSystemDefaultDevice().expect("Metal device");
+        let device: rmlx_metal::MtlDevice = test_device().clone();
         let gpu = rmlx_metal::device::GpuDevice::system_default().expect("GPU device");
         let queue = gpu.new_command_queue();
         let registry = KernelRegistry::new(gpu);

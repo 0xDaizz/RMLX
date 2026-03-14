@@ -353,11 +353,18 @@ impl Drop for EpRuntimeContext {
 mod tests {
     use super::*;
     use rmlx_rdma::shared_buffer::SharedBufferPool;
+    use std::sync::OnceLock;
 
-    /// Helper: create a pool with the given tier sizes. Skips if no Metal device.
+    fn test_device() -> &'static rmlx_metal::MtlDevice {
+        static DEVICE: OnceLock<rmlx_metal::MtlDevice> = OnceLock::new();
+        DEVICE.get_or_init(|| {
+            objc2_metal::MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests")
+        })
+    }
+
+    /// Helper: create a pool with the given tier sizes.
     fn make_pool(tier_sizes: &[usize]) -> Option<SharedBufferPool> {
-        let device = objc2_metal::MTLCreateSystemDefaultDevice()?;
-        SharedBufferPool::new(&device, tier_sizes).ok()
+        SharedBufferPool::new(test_device(), tier_sizes).ok()
     }
 
     #[test]
@@ -367,11 +374,11 @@ mod tests {
             None => return, // skip on CI without Metal
         };
         let pool = Arc::new(Mutex::new(pool));
-        let device = objc2_metal::MTLCreateSystemDefaultDevice().unwrap();
+        let device = test_device();
         let progress = Arc::new(rmlx_rdma::progress::ProgressEngine::new());
         let transport = Arc::new(crate::transport::RdmaConnectionTransport::new(vec![], 0));
 
-        let ctx = EpRuntimeContext::new(transport, progress, pool, vec![], &device);
+        let ctx = EpRuntimeContext::new(transport, progress, pool, vec![], device);
 
         let world_size = 3;
         let local_rank = 1;
@@ -420,11 +427,11 @@ mod tests {
             None => return,
         };
         let pool = Arc::new(Mutex::new(pool));
-        let device = objc2_metal::MTLCreateSystemDefaultDevice().unwrap();
+        let device = test_device();
         let progress = Arc::new(rmlx_rdma::progress::ProgressEngine::new());
         let transport = Arc::new(crate::transport::RdmaConnectionTransport::new(vec![], 0));
 
-        let ctx = EpRuntimeContext::new(transport, progress, Arc::clone(&pool), vec![], &device);
+        let ctx = EpRuntimeContext::new(transport, progress, Arc::clone(&pool), vec![], device);
 
         // world_size=2, local_rank=0 => only peer rank 1 needs buffers (1 send + 1 recv = 2).
         // PIPELINE=2, so the pool has exactly 2 buffers in the 4096 tier.
@@ -464,11 +471,11 @@ mod tests {
             None => return,
         };
         let pool = Arc::new(Mutex::new(pool));
-        let device = objc2_metal::MTLCreateSystemDefaultDevice().unwrap();
+        let device = test_device();
         let progress = Arc::new(rmlx_rdma::progress::ProgressEngine::new());
         let transport = Arc::new(crate::transport::RdmaConnectionTransport::new(vec![], 0));
 
-        let ctx = EpRuntimeContext::new(transport, progress, pool, vec![], &device);
+        let ctx = EpRuntimeContext::new(transport, progress, pool, vec![], device);
 
         let (send_bufs, recv_bufs) = ctx
             .acquire_send_recv_buffers(0, 4, 0)
@@ -488,11 +495,11 @@ mod tests {
             None => return,
         };
         let pool = Arc::new(Mutex::new(pool));
-        let device = objc2_metal::MTLCreateSystemDefaultDevice().unwrap();
+        let device = test_device();
         let progress = Arc::new(rmlx_rdma::progress::ProgressEngine::new());
         let transport = Arc::new(crate::transport::RdmaConnectionTransport::new(vec![], 0));
 
-        let ctx = EpRuntimeContext::new(transport, progress, pool, vec![], &device);
+        let ctx = EpRuntimeContext::new(transport, progress, pool, vec![], device);
 
         let (mut send_bufs, recv_bufs) = ctx
             .acquire_send_recv_buffers(4096, 2, 0)

@@ -273,6 +273,12 @@ pub(crate) fn apply_function_constants(
 mod tests {
     use super::*;
     use objc2_metal::MTLCreateSystemDefaultDevice;
+    use std::sync::OnceLock;
+
+    fn test_device() -> &'static MtlDevice {
+        static DEVICE: OnceLock<MtlDevice> = OnceLock::new();
+        DEVICE.get_or_init(|| MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests"))
+    }
 
     #[test]
     fn test_function_constant_hash_equality() {
@@ -331,8 +337,8 @@ mod tests {
 
     #[test]
     fn test_pipeline_cache_new_empty() {
-        let device = MTLCreateSystemDefaultDevice().unwrap();
-        let cache = PipelineCache::new(&device);
+        let device = test_device();
+        let cache = PipelineCache::new(device);
         assert!(cache.is_empty());
         assert_eq!(cache.len(), 0);
     }

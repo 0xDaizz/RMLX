@@ -731,9 +731,22 @@ mod tests {
     use crate::linear::{Linear, LinearConfig};
     use crate::moe::Expert;
 
+    use std::sync::OnceLock;
+
+    fn test_device() -> &'static rmlx_metal::MtlDevice {
+        static DEVICE: OnceLock<rmlx_metal::MtlDevice> = OnceLock::new();
+        DEVICE.get_or_init(|| {
+            objc2_metal::MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests")
+        })
+    }
+
     /// Create a test `KernelRegistry` with all kernels registered.
-    fn test_registry() -> (rmlx_metal::MtlDevice, rmlx_metal::MtlQueue, KernelRegistry) {
-        let device = objc2_metal::MTLCreateSystemDefaultDevice().expect("Metal device required");
+    fn test_registry() -> (
+        &'static rmlx_metal::MtlDevice,
+        rmlx_metal::MtlQueue,
+        KernelRegistry,
+    ) {
+        let device = test_device();
         let gpu = rmlx_metal::device::GpuDevice::system_default().expect("GPU device required");
         let queue = gpu.new_command_queue();
         let registry = KernelRegistry::new(gpu);
@@ -804,8 +817,8 @@ mod tests {
         let intermediate_dim = 4;
 
         let experts = vec![
-            make_expert(&device, hidden_dim, intermediate_dim, 0.1),
-            make_expert(&device, hidden_dim, intermediate_dim, 0.2),
+            make_expert(device, hidden_dim, intermediate_dim, 0.1),
+            make_expert(device, hidden_dim, intermediate_dim, 0.2),
         ];
 
         let group = ExpertGroup::from_experts(&experts, &registry, &queue);
@@ -838,8 +851,8 @@ mod tests {
     fn test_grouped_forward_empty_inputs() {
         let (device, queue, registry) = test_registry();
         let experts = vec![
-            make_expert(&device, 8, 4, 0.1),
-            make_expert(&device, 8, 4, 0.2),
+            make_expert(device, 8, 4, 0.1),
+            make_expert(device, 8, 4, 0.2),
         ];
         let group = ExpertGroup::from_experts(&experts, &registry, &queue).unwrap();
 
@@ -855,13 +868,13 @@ mod tests {
         let intermediate_dim = 4;
 
         let experts = vec![
-            make_expert(&device, hidden_dim, intermediate_dim, 0.1),
-            make_expert(&device, hidden_dim, intermediate_dim, 0.2),
+            make_expert(device, hidden_dim, intermediate_dim, 0.1),
+            make_expert(device, hidden_dim, intermediate_dim, 0.2),
         ];
         let group = ExpertGroup::from_experts(&experts, &registry, &queue).unwrap();
 
         // Single token to expert 0
-        let input = Array::from_slice(&device, &vec![1.0f32; hidden_dim], vec![1, hidden_dim]);
+        let input = Array::from_slice(device, &vec![1.0f32; hidden_dim], vec![1, hidden_dim]);
 
         let result = group.grouped_forward(&[(0, &input)], &registry, &queue);
         assert!(result.is_ok(), "grouped_forward failed: {:?}", result.err());
@@ -878,15 +891,15 @@ mod tests {
         let intermediate_dim = 4;
 
         let experts = vec![
-            make_expert(&device, hidden_dim, intermediate_dim, 0.1),
-            make_expert(&device, hidden_dim, intermediate_dim, 0.2),
-            make_expert(&device, hidden_dim, intermediate_dim, 0.3),
+            make_expert(device, hidden_dim, intermediate_dim, 0.1),
+            make_expert(device, hidden_dim, intermediate_dim, 0.2),
+            make_expert(device, hidden_dim, intermediate_dim, 0.3),
         ];
         let group = ExpertGroup::from_experts(&experts, &registry, &queue).unwrap();
 
         // Different batch sizes per expert
-        let input0 = Array::from_slice(&device, &vec![1.0f32; 2 * hidden_dim], vec![2, hidden_dim]);
-        let input2 = Array::from_slice(&device, &vec![0.5f32; 3 * hidden_dim], vec![3, hidden_dim]);
+        let input0 = Array::from_slice(device, &vec![1.0f32; 2 * hidden_dim], vec![2, hidden_dim]);
+        let input2 = Array::from_slice(device, &vec![0.5f32; 3 * hidden_dim], vec![3, hidden_dim]);
 
         let expert_inputs: Vec<(usize, &Array)> = vec![(0, &input0), (2, &input2)];
         let result = group.grouped_forward(&expert_inputs, &registry, &queue);
@@ -907,12 +920,12 @@ mod tests {
         let intermediate_dim = 4;
 
         let experts = vec![
-            make_expert(&device, hidden_dim, intermediate_dim, 0.1),
-            make_expert(&device, hidden_dim, intermediate_dim, 0.2),
+            make_expert(device, hidden_dim, intermediate_dim, 0.1),
+            make_expert(device, hidden_dim, intermediate_dim, 0.2),
         ];
 
         // Run individual expert forward for reference
-        let input = Array::from_slice(&device, &vec![1.0f32; hidden_dim], vec![1, hidden_dim]);
+        let input = Array::from_slice(device, &vec![1.0f32; hidden_dim], vec![1, hidden_dim]);
         let ref_out_0 = experts[0].forward(&input, &registry, &queue).unwrap();
         let ref_out_1 = experts[1].forward(&input, &registry, &queue).unwrap();
         let ref_vals_0: Vec<f32> = ref_out_0.to_vec_checked();
@@ -950,10 +963,10 @@ mod tests {
     #[test]
     fn test_grouped_forward_invalid_expert_idx() {
         let (device, queue, registry) = test_registry();
-        let experts = vec![make_expert(&device, 8, 4, 0.1)];
+        let experts = vec![make_expert(device, 8, 4, 0.1)];
         let group = ExpertGroup::from_experts(&experts, &registry, &queue).unwrap();
 
-        let input = Array::from_slice(&device, &[1.0f32; 8], vec![1, 8]);
+        let input = Array::from_slice(device, &[1.0f32; 8], vec![1, 8]);
         // Expert index 5 is out of range (only 1 expert)
         let result = group.grouped_forward(&[(5, &input)], &registry, &queue);
         assert!(result.is_err());
@@ -962,11 +975,11 @@ mod tests {
     #[test]
     fn test_grouped_forward_dimension_mismatch() {
         let (device, queue, registry) = test_registry();
-        let experts = vec![make_expert(&device, 8, 4, 0.1)];
+        let experts = vec![make_expert(device, 8, 4, 0.1)];
         let group = ExpertGroup::from_experts(&experts, &registry, &queue).unwrap();
 
         // Wrong hidden dim (16 instead of 8)
-        let input = Array::from_slice(&device, &[1.0f32; 16], vec![1, 16]);
+        let input = Array::from_slice(device, &[1.0f32; 16], vec![1, 16]);
         let result = group.grouped_forward(&[(0, &input)], &registry, &queue);
         assert!(result.is_err());
     }
@@ -979,8 +992,8 @@ mod tests {
 
         // Expert 0: all weights = 0.1, Expert 1: all weights = 0.5
         let experts = vec![
-            make_expert(&device, hidden_dim, intermediate_dim, 0.1),
-            make_expert(&device, hidden_dim, intermediate_dim, 0.5),
+            make_expert(device, hidden_dim, intermediate_dim, 0.1),
+            make_expert(device, hidden_dim, intermediate_dim, 0.5),
         ];
 
         let group = ExpertGroup::from_experts(&experts, &registry, &queue).unwrap();

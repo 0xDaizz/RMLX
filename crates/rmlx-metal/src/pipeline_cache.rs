@@ -492,6 +492,12 @@ fn compute_cache_key(
 mod tests {
     use super::*;
     use objc2_metal::MTLCreateSystemDefaultDevice;
+    use std::sync::OnceLock;
+
+    fn test_device() -> &'static MtlDevice {
+        static DEVICE: OnceLock<MtlDevice> = OnceLock::new();
+        DEVICE.get_or_init(|| MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests"))
+    }
 
     const TEST_KERNEL_SOURCE: &str = r#"
         #include <metal_stdlib>
@@ -543,22 +549,22 @@ mod tests {
 
     #[test]
     fn test_new_cache_is_empty() {
-        let device = MTLCreateSystemDefaultDevice().unwrap();
-        let cache = DiskPipelineCache::new(&device);
+        let device = test_device();
+        let cache = DiskPipelineCache::new(device);
         assert!(cache.is_empty());
         assert_eq!(cache.len(), 0);
     }
 
     #[test]
     fn test_cache_dir_creation() {
-        let device = MTLCreateSystemDefaultDevice().unwrap();
+        let device = test_device();
         let tmp = std::env::temp_dir().join(format!("rmlx_test_{}", std::process::id()));
         let cache_dir = tmp.join("rmlx_test_pipelines");
 
         // Directory should not exist yet.
         assert!(!cache_dir.exists());
 
-        let cache = DiskPipelineCache::with_cache_dir(&device, cache_dir.clone());
+        let cache = DiskPipelineCache::with_cache_dir(device, cache_dir.clone());
 
         // Compile a kernel — this should create the cache directory.
         let result = cache.get_or_compile(TEST_KERNEL_SOURCE, "test_add", &[]);
@@ -571,10 +577,10 @@ mod tests {
 
     #[test]
     fn test_cold_miss_compiles_and_stores() {
-        let device = MTLCreateSystemDefaultDevice().unwrap();
+        let device = test_device();
         let tmp = std::env::temp_dir().join(format!("rmlx_cold_{}", std::process::id()));
         let cache_dir = tmp.join("pipelines");
-        let cache = DiskPipelineCache::with_cache_dir(&device, cache_dir.clone());
+        let cache = DiskPipelineCache::with_cache_dir(device, cache_dir.clone());
 
         // Cold miss: compile and persist.
         let pso = cache
@@ -602,14 +608,14 @@ mod tests {
 
     #[test]
     fn test_warm_hit_loads_from_disk() {
-        let device = MTLCreateSystemDefaultDevice().unwrap();
+        let device = test_device();
         let tmp = std::env::temp_dir().join(format!("rmlx_warm_{}", std::process::id()));
         let cache_dir = tmp.join("pipelines");
 
         // First cache: cold miss, writes to disk.
         let disk_file_exists;
         {
-            let cache = DiskPipelineCache::with_cache_dir(&device, cache_dir.clone());
+            let cache = DiskPipelineCache::with_cache_dir(device, cache_dir.clone());
             cache
                 .get_or_compile(TEST_KERNEL_SOURCE, "test_add", &[])
                 .unwrap();
@@ -625,7 +631,7 @@ mod tests {
 
         // Second cache (new instance, empty in-memory): should load from disk.
         {
-            let cache = DiskPipelineCache::with_cache_dir(&device, cache_dir.clone());
+            let cache = DiskPipelineCache::with_cache_dir(device, cache_dir.clone());
             assert!(cache.is_empty(), "in-memory cache should be empty");
 
             let pso = cache
@@ -641,10 +647,10 @@ mod tests {
 
     #[test]
     fn test_in_memory_hit() {
-        let device = MTLCreateSystemDefaultDevice().unwrap();
+        let device = test_device();
         let tmp = std::env::temp_dir().join(format!("rmlx_mem_{}", std::process::id()));
         let cache_dir = tmp.join("pipelines");
-        let cache = DiskPipelineCache::with_cache_dir(&device, cache_dir);
+        let cache = DiskPipelineCache::with_cache_dir(device, cache_dir);
 
         // First call: cold miss.
         cache
@@ -664,9 +670,9 @@ mod tests {
 
     #[test]
     fn test_clear_memory() {
-        let device = MTLCreateSystemDefaultDevice().unwrap();
+        let device = test_device();
         let tmp = std::env::temp_dir().join(format!("rmlx_clr_{}", std::process::id()));
-        let cache = DiskPipelineCache::with_cache_dir(&device, tmp.join("p"));
+        let cache = DiskPipelineCache::with_cache_dir(device, tmp.join("p"));
 
         cache
             .get_or_compile(TEST_KERNEL_SOURCE, "test_add", &[])
@@ -682,9 +688,9 @@ mod tests {
 
     #[test]
     fn test_invalid_source_returns_error() {
-        let device = MTLCreateSystemDefaultDevice().unwrap();
+        let device = test_device();
         let tmp = std::env::temp_dir().join(format!("rmlx_inv_{}", std::process::id()));
-        let cache = DiskPipelineCache::with_cache_dir(&device, tmp.join("p"));
+        let cache = DiskPipelineCache::with_cache_dir(device, tmp.join("p"));
 
         let result = cache.get_or_compile("not valid MSL", "nope", &[]);
         assert!(result.is_err());

@@ -16,6 +16,14 @@ use rmlx_nn::rope::*;
 use rmlx_nn::sliding_window::*;
 use rmlx_nn::transformer::*;
 
+fn test_device() -> &'static rmlx_metal::MtlDevice {
+    use std::sync::OnceLock;
+    static DEVICE: OnceLock<rmlx_metal::MtlDevice> = OnceLock::new();
+    DEVICE.get_or_init(|| {
+        objc2_metal::MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests")
+    })
+}
+
 #[test]
 fn test_linear_config() {
     let l = Linear::new(LinearConfig {
@@ -2760,7 +2768,7 @@ fn test_chunked_prefill_splits_long_prompt() {
     use rmlx_nn::scheduler::*;
     use std::collections::HashMap;
 
-    let device = objc2_metal::MTLCreateSystemDefaultDevice().expect("no Metal device available");
+    let device = test_device();
 
     let config = SchedulerConfig {
         max_batch_size: 4,
@@ -2769,7 +2777,7 @@ fn test_chunked_prefill_splits_long_prompt() {
         max_prefill_chunk: 512,
     };
     let mut scheduler = Scheduler::new(config);
-    let mut bm = BlockManager::new(&device, 1024, 4, 2, 2, 4, rmlx_core::dtype::DType::Float32);
+    let mut bm = BlockManager::new(device, 1024, 4, 2, 2, 4, rmlx_core::dtype::DType::Float32);
 
     scheduler.add_request(GenerationRequest {
         seq_id: 1,
@@ -2806,7 +2814,7 @@ fn test_chunked_prefill_interleaves_decode() {
     use rmlx_nn::scheduler::*;
     use std::collections::HashMap;
 
-    let device = objc2_metal::MTLCreateSystemDefaultDevice().expect("no Metal device available");
+    let device = test_device();
 
     let config = SchedulerConfig {
         max_batch_size: 4,
@@ -2815,7 +2823,7 @@ fn test_chunked_prefill_interleaves_decode() {
         max_prefill_chunk: 512,
     };
     let mut scheduler = Scheduler::new(config);
-    let mut bm = BlockManager::new(&device, 1024, 4, 2, 2, 4, rmlx_core::dtype::DType::Float32);
+    let mut bm = BlockManager::new(device, 1024, 4, 2, 2, 4, rmlx_core::dtype::DType::Float32);
 
     // Add and fully prefill a short sequence.
     scheduler.add_request(GenerationRequest {
@@ -2855,7 +2863,7 @@ fn test_short_prompt_not_chunked() {
     use rmlx_nn::scheduler::*;
     use std::collections::HashMap;
 
-    let device = objc2_metal::MTLCreateSystemDefaultDevice().expect("no Metal device available");
+    let device = test_device();
 
     let config = SchedulerConfig {
         max_batch_size: 4,
@@ -2864,7 +2872,7 @@ fn test_short_prompt_not_chunked() {
         max_prefill_chunk: 512,
     };
     let mut scheduler = Scheduler::new(config);
-    let mut bm = BlockManager::new(&device, 256, 4, 2, 2, 4, rmlx_core::dtype::DType::Float32);
+    let mut bm = BlockManager::new(device, 256, 4, 2, 2, 4, rmlx_core::dtype::DType::Float32);
 
     scheduler.add_request(GenerationRequest {
         seq_id: 1,

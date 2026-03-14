@@ -384,10 +384,16 @@ impl CommandQueue4 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::OnceLock;
+
+    fn test_device() -> &'static MtlDevice {
+        static DEVICE: OnceLock<MtlDevice> = OnceLock::new();
+        DEVICE.get_or_init(|| MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests"))
+    }
 
     #[test]
     fn command_allocator_creation() {
-        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
+        let device = test_device();
         // Metal 4 may not be available on all hardware; skip gracefully.
         let Some(alloc) = CommandAllocator::new(&device) else {
             eprintln!("skipping: Metal 4 command allocator not supported on this device");
@@ -399,7 +405,7 @@ mod tests {
 
     #[test]
     fn command_allocator_reset_idempotent() {
-        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
+        let device = test_device();
         let Some(alloc) = CommandAllocator::new(&device) else {
             return;
         };
@@ -411,7 +417,7 @@ mod tests {
 
     #[test]
     fn command_buffer_lifecycle() {
-        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
+        let device = test_device();
         let Some(alloc) = CommandAllocator::new(&device) else {
             return;
         };
@@ -431,7 +437,7 @@ mod tests {
 
     #[test]
     fn command_queue4_creation() {
-        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
+        let device = test_device();
         let Some(_queue) = CommandQueue4::new(&device) else {
             eprintln!("skipping: Metal 4 command queue not supported on this device");
             return;
@@ -440,7 +446,7 @@ mod tests {
 
     #[test]
     fn batch_commit_single_cb() {
-        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
+        let device = test_device();
         let Some(alloc) = CommandAllocator::new(&device) else {
             return;
         };
@@ -462,7 +468,7 @@ mod tests {
 
     #[test]
     fn batch_commit_multiple_cbs() {
-        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
+        let device = test_device();
         let Some(alloc) = CommandAllocator::new(&device) else {
             return;
         };
@@ -495,7 +501,7 @@ mod tests {
 
     #[test]
     fn allocator_reset_between_iterations() {
-        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
+        let device = test_device();
         let Some(alloc) = CommandAllocator::new(&device) else {
             return;
         };
@@ -524,7 +530,7 @@ mod tests {
 
     #[test]
     fn debug_group_push_pop() {
-        let device = MTLCreateSystemDefaultDevice().expect("Metal device required");
+        let device = test_device();
         let Some(alloc) = CommandAllocator::new(&device) else {
             return;
         };

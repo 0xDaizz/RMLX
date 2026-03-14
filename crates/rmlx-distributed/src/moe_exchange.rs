@@ -3603,13 +3603,18 @@ impl AsyncCombineHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::OnceLock;
+
+    fn test_device() -> &'static rmlx_metal::MtlDevice {
+        static DEVICE: OnceLock<rmlx_metal::MtlDevice> = OnceLock::new();
+        DEVICE.get_or_init(|| {
+            objc2_metal::MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests")
+        })
+    }
 
     #[test]
     fn read_buffer_bytes_oob_returns_error() {
-        let device = match objc2_metal::MTLCreateSystemDefaultDevice() {
-            Some(d) => d,
-            None => return, // skip on CI without Metal
-        };
+        let device = test_device();
         let buf = device
             .newBufferWithLength_options(64, rmlx_metal::MTLResourceOptions::StorageModeShared)
             .unwrap();
@@ -3625,10 +3630,7 @@ mod tests {
 
     #[test]
     fn read_buffer_bytes_exact_len_succeeds() {
-        let device = match objc2_metal::MTLCreateSystemDefaultDevice() {
-            Some(d) => d,
-            None => return,
-        };
+        let device = test_device();
         let buf = device
             .newBufferWithLength_options(64, rmlx_metal::MTLResourceOptions::StorageModeShared)
             .unwrap();
@@ -3640,10 +3642,7 @@ mod tests {
 
     #[test]
     fn read_buffer_f32_oob_returns_error() {
-        let device = match objc2_metal::MTLCreateSystemDefaultDevice() {
-            Some(d) => d,
-            None => return,
-        };
+        let device = test_device();
         // 16 bytes = 4 f32 elements
         let buf = device
             .newBufferWithLength_options(16, rmlx_metal::MTLResourceOptions::StorageModeShared)
@@ -3660,10 +3659,7 @@ mod tests {
 
     #[test]
     fn read_buffer_f32_exact_len_succeeds() {
-        let device = match objc2_metal::MTLCreateSystemDefaultDevice() {
-            Some(d) => d,
-            None => return,
-        };
+        let device = test_device();
         // 16 bytes = 4 f32 elements
         let buf = device
             .newBufferWithLength_options(16, rmlx_metal::MTLResourceOptions::StorageModeShared)
@@ -3675,11 +3671,8 @@ mod tests {
 
     #[test]
     fn read_shared_buffer_bytes_oob_returns_error() {
-        let device = match objc2_metal::MTLCreateSystemDefaultDevice() {
-            Some(d) => d,
-            None => return,
-        };
-        let shared_buf = match SharedBuffer::new(&device, 64, 0) {
+        let device = test_device();
+        let shared_buf = match SharedBuffer::new(device, 64, 0) {
             Ok(b) => b,
             Err(_) => return, // skip if SharedBuffer allocation fails
         };

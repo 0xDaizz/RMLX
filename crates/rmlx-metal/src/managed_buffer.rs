@@ -132,8 +132,14 @@ impl std::ops::Deref for ManagedBuffer {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::OnceLock;
 
     use crate::types::MtlDevice;
+
+    fn test_device() -> &'static MtlDevice {
+        static DEVICE: OnceLock<MtlDevice> = OnceLock::new();
+        DEVICE.get_or_init(|| MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests"))
+    }
 
     /// A simple test allocator that tracks alloc/free counts.
     struct TestAllocator {
@@ -168,8 +174,7 @@ mod tests {
 
     #[test]
     fn test_managed_buffer_returns_on_drop() {
-        let device = MTLCreateSystemDefaultDevice().unwrap();
-        let allocator = Arc::new(TestAllocator::new(device));
+        let allocator = Arc::new(TestAllocator::new(test_device().clone()));
 
         {
             let buf = ManagedBuffer::alloc(
@@ -188,8 +193,7 @@ mod tests {
 
     #[test]
     fn test_managed_buffer_take_prevents_free() {
-        let device = MTLCreateSystemDefaultDevice().unwrap();
-        let allocator = Arc::new(TestAllocator::new(device));
+        let allocator = Arc::new(TestAllocator::new(test_device().clone()));
 
         let buf = ManagedBuffer::alloc(
             Arc::clone(&allocator) as Arc<dyn BufferAllocator>,
@@ -205,8 +209,7 @@ mod tests {
 
     #[test]
     fn test_managed_buffer_untracked() {
-        let device = MTLCreateSystemDefaultDevice().unwrap();
-        let allocator = Arc::new(TestAllocator::new(device));
+        let allocator = Arc::new(TestAllocator::new(test_device().clone()));
 
         let buf =
             ManagedBuffer::alloc_untracked(Arc::clone(&allocator) as Arc<dyn BufferAllocator>, 256)
@@ -218,8 +221,7 @@ mod tests {
 
     #[test]
     fn test_managed_buffer_deref() {
-        let device = MTLCreateSystemDefaultDevice().unwrap();
-        let allocator = Arc::new(TestAllocator::new(device));
+        let allocator = Arc::new(TestAllocator::new(test_device().clone()));
 
         let buf = ManagedBuffer::alloc(
             Arc::clone(&allocator) as Arc<dyn BufferAllocator>,

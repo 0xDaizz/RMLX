@@ -936,6 +936,17 @@ pub fn broadcast_shape(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use objc2::rc::Retained;
+    use objc2::runtime::ProtocolObject;
+    use objc2_metal::MTLDevice;
+    use std::sync::OnceLock;
+
+    fn test_device() -> &'static ProtocolObject<dyn MTLDevice> {
+        static DEVICE: OnceLock<Retained<ProtocolObject<dyn MTLDevice>>> = OnceLock::new();
+        DEVICE.get_or_init(|| {
+            objc2_metal::MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests")
+        })
+    }
 
     #[test]
     fn test_contiguous_strides() {
@@ -986,8 +997,7 @@ mod tests {
         // Simulate a [3, 4] array with contiguous strides [4, 1]
         let arr = Array {
             buffer: ManuallyDrop::new(
-                objc2_metal::MTLCreateSystemDefaultDevice()
-                    .unwrap()
+                test_device()
                     .newBufferWithLength_options(48, MTLResourceOptions::StorageModeShared)
                     .unwrap(),
             ),
@@ -1005,8 +1015,7 @@ mod tests {
     fn test_transpose_3d() {
         let arr = Array {
             buffer: ManuallyDrop::new(
-                objc2_metal::MTLCreateSystemDefaultDevice()
-                    .unwrap()
+                test_device()
                     .newBufferWithLength_options(96, MTLResourceOptions::StorageModeShared)
                     .unwrap(),
             ),
@@ -1024,8 +1033,7 @@ mod tests {
     fn test_transpose_same_dim_is_noop() {
         let arr = Array {
             buffer: ManuallyDrop::new(
-                objc2_metal::MTLCreateSystemDefaultDevice()
-                    .unwrap()
+                test_device()
                     .newBufferWithLength_options(48, MTLResourceOptions::StorageModeShared)
                     .unwrap(),
             ),
@@ -1043,8 +1051,7 @@ mod tests {
     fn test_transpose_out_of_range() {
         let arr = Array {
             buffer: ManuallyDrop::new(
-                objc2_metal::MTLCreateSystemDefaultDevice()
-                    .unwrap()
+                test_device()
                     .newBufferWithLength_options(48, MTLResourceOptions::StorageModeShared)
                     .unwrap(),
             ),
@@ -1061,8 +1068,7 @@ mod tests {
     fn test_squeeze_dim() {
         let arr = Array {
             buffer: ManuallyDrop::new(
-                objc2_metal::MTLCreateSystemDefaultDevice()
-                    .unwrap()
+                test_device()
                     .newBufferWithLength_options(48, MTLResourceOptions::StorageModeShared)
                     .unwrap(),
             ),
@@ -1080,8 +1086,7 @@ mod tests {
     fn test_squeeze_dim_middle() {
         let arr = Array {
             buffer: ManuallyDrop::new(
-                objc2_metal::MTLCreateSystemDefaultDevice()
-                    .unwrap()
+                test_device()
                     .newBufferWithLength_options(48, MTLResourceOptions::StorageModeShared)
                     .unwrap(),
             ),
@@ -1099,8 +1104,7 @@ mod tests {
     fn test_squeeze_dim_non_one_fails() {
         let arr = Array {
             buffer: ManuallyDrop::new(
-                objc2_metal::MTLCreateSystemDefaultDevice()
-                    .unwrap()
+                test_device()
                     .newBufferWithLength_options(48, MTLResourceOptions::StorageModeShared)
                     .unwrap(),
             ),
@@ -1115,8 +1119,8 @@ mod tests {
     #[test]
     fn test_view_ops_zero_copy() {
         // All view operations should share the same buffer
-        let dev = objc2_metal::MTLCreateSystemDefaultDevice().unwrap();
-        let arr = Array::from_slice(&dev, &[1.0f32; 12], vec![3, 4]);
+        let dev = test_device();
+        let arr = Array::from_slice(dev, &[1.0f32; 12], vec![3, 4]);
 
         let reshaped = arr.reshape(vec![4, 3]).unwrap();
         assert_eq!(
