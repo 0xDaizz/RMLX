@@ -218,6 +218,9 @@ fn build_transformer_block(
         down_proj,
         gate_up_merged_weight: None,
         gate_up_merged_weight_t: None,
+        gate_proj_quantized: None,
+        up_proj_quantized: None,
+        down_proj_quantized: None,
     };
 
     let norm1_weight = {

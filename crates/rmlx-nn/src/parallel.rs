@@ -775,6 +775,10 @@ impl QuantizedRowParallelLinear {
 
         // x is [batch, full_in_features], slice columns [start..end]
         let x_shard = x.slice_columns(start, end);
+        // QMM kernels assume contiguous input — slice_columns produces a strided
+        // view (strides [full_in, 1]) which is non-contiguous for batch > 1.
+        let x_shard = ops::copy::copy(registry, &x_shard, queue)
+            .map_err(|e| TpError(format!("contiguous copy failed: {e}")))?;
 
         // 2. Local QMV/QMM on sharded input
         let local_out = self
@@ -1803,7 +1807,7 @@ mod tests {
     fn test_shard_quantized_column_not_divisible() {
         // out_features not divisible by world_size
         let in_f = 64;
-        let out_f = 48; // not divisible by 4
+        let out_f = 48; // not divisible by 5
         let group_size = 32;
         let packed_per_row = in_f / 2;
         let groups_per_row = in_f / group_size;
@@ -1819,7 +1823,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = super::shard_quantized_column(&ql, 0, 4);
+        let result = super::shard_quantized_column(&ql, 0, 5);
         assert!(result.is_err());
         assert!(result.unwrap_err().0.contains("divisible by world_size"));
     }
@@ -1925,8 +1929,8 @@ mod tests {
         )
         .unwrap();
 
-        // segment 48 not divisible by world_size 4
-        let result = super::shard_quantized_column_segments(&ql, 0, 4, &[48, 24, 24]);
+        // segment 48 not divisible by world_size 5
+        let result = super::shard_quantized_column_segments(&ql, 0, 5, &[48, 24, 24]);
         assert!(result.is_err());
         assert!(result.unwrap_err().0.contains("divisible by world_size"));
     }
