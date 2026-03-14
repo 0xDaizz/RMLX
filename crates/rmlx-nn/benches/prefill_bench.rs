@@ -23,9 +23,9 @@ use rmlx_core::dtype::DType;
 use rmlx_core::kernels::KernelRegistry;
 use rmlx_core::ops;
 use rmlx_metal::autoreleasepool;
+use rmlx_metal::compute_pass::ComputePass;
 use rmlx_metal::device::GpuDevice;
 use rmlx_metal::event::GpuEvent;
-use rmlx_metal::compute_pass::ComputePass;
 use rmlx_metal::exec_graph::ExecGraph;
 use rmlx_nn::{
     Attention, AttentionConfig, FeedForward, LayerKvCache, Linear, LinearConfig, TransformerBlock,
