@@ -7,10 +7,11 @@
 //! This is complementary to [`PipelineCache`](crate::pipeline::PipelineCache),
 //! which caches individual pipeline states within a library.
 
+use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use parking_lot::RwLock;
-use rustc_hash::{FxHashMap, FxHasher};
+use rustc_hash::FxHashMap;
 
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
@@ -104,7 +105,7 @@ impl LibraryCache {
 
 /// Hash MSL source string to a 64-bit key.
 fn hash_source(source: &str) -> u64 {
-    let mut hasher = FxHasher::default();
+    let mut hasher = DefaultHasher::new();
     source.hash(&mut hasher);
     hasher.finish()
 }
