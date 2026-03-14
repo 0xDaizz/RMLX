@@ -8,7 +8,7 @@
 //! All three views share the same physical memory on UMA, enabling
 //! zero-copy data flow between GPU compute and RDMA transfer.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::ffi::c_void;
 use std::ptr::NonNull;
 
@@ -40,7 +40,7 @@ pub struct SharedBuffer {
     size: usize,
     slot_index: u8,
     metal_buffer: MtlBuffer,
-    rdma_registrations: HashMap<ConnectionId, MemoryRegion>,
+    rdma_registrations: FxHashMap<ConnectionId, MemoryRegion>,
     ticket: Option<CompletionTicket>,
 }
 
@@ -99,7 +99,7 @@ impl SharedBuffer {
             size: aligned_size,
             slot_index,
             metal_buffer,
-            rdma_registrations: HashMap::new(),
+            rdma_registrations: FxHashMap::default(),
             ticket: None,
         })
     }

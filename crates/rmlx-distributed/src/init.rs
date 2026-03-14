@@ -580,7 +580,7 @@ pub fn init(config: InitConfig) -> Result<DistributedContext, DistributedError> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use parking_lot::Mutex;
 
     /// Serialize tests that mutate environment variables to avoid races.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -608,7 +608,7 @@ mod tests {
 
     #[test]
     fn test_init_single_process() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock();
         clear_init_env_vars();
         // No env vars -> defaults to loopback (rank=0, world=1)
         let ctx = init(InitConfig::default()).unwrap();
@@ -619,7 +619,7 @@ mod tests {
 
     #[test]
     fn test_init_loopback_explicit() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock();
         clear_init_env_vars();
         let config = InitConfig {
             backend: BackendHint::Loopback,
@@ -636,7 +636,7 @@ mod tests {
 
     #[test]
     fn test_init_strict_no_rdma() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock();
         clear_init_env_vars();
         // strict=true, Rdma backend, no hardware -> should error
         let config = InitConfig {
@@ -652,7 +652,7 @@ mod tests {
 
     #[test]
     fn test_init_auto_fallback() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock();
         clear_init_env_vars();
         // Auto backend, world_size > 1, no RDMA hardware -> falls back to loopback
         let config = InitConfig {
@@ -668,7 +668,7 @@ mod tests {
 
     #[test]
     fn test_init_config_overrides_env() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock();
         clear_init_env_vars();
         // Config rank/world_size take precedence
         std::env::set_var("RMLX_RANK", "5");
@@ -686,7 +686,7 @@ mod tests {
 
     #[test]
     fn test_init_compat_env() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock();
         clear_init_env_vars();
         // MPI compat env vars should work
         std::env::set_var("OMPI_COMM_WORLD_RANK", "3");
@@ -702,7 +702,7 @@ mod tests {
 
     #[test]
     fn test_rank_validation() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock();
         clear_init_env_vars();
         // rank >= world_size should fail
         let config = InitConfig {
@@ -723,7 +723,7 @@ mod tests {
 
     #[test]
     fn test_rank_validation_overflow() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock();
         clear_init_env_vars();
         // rank > world_size should also fail
         let config = InitConfig {
@@ -737,7 +737,7 @@ mod tests {
 
     #[test]
     fn test_unknown_backend_errors() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock();
         clear_init_env_vars();
         std::env::set_var("RMLX_BACKEND", "ring");
         let result = resolve_backend(&InitConfig::default());
@@ -756,7 +756,7 @@ mod tests {
 
     #[test]
     fn test_known_backends_resolve() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock();
         clear_init_env_vars();
 
         std::env::set_var("RMLX_BACKEND", "rdma");

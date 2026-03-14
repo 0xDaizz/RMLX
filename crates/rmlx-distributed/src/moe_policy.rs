@@ -12,8 +12,8 @@
 //! making `MoePolicy` `Send + Sync`. Read-heavy paths (`select`) acquire a
 //! read lock; mutation paths (`switch_backend`, setters) acquire a write lock.
 
+use parking_lot::RwLock;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 /// Cooldown duration threshold (matches MLX).
@@ -140,7 +140,7 @@ impl MoePolicy {
     pub fn with_thresholds(cpu_max: u32, gpu_min: u32, byte_threshold: usize) -> Self {
         let base = Self::new();
         {
-            let mut inner = base.inner.write().unwrap();
+            let mut inner = base.inner.write();
             inner.cpu_max = cpu_max;
             inner.gpu_min = gpu_min;
             inner.byte_threshold = byte_threshold;
@@ -150,23 +150,23 @@ impl MoePolicy {
 
     /// Set world size (enables RDMA zone when > 1).
     pub fn set_world_size(&self, world_size: u32) {
-        self.inner.write().unwrap().world_size = world_size;
+        self.inner.write().world_size = world_size;
     }
 
     /// Current world size.
     pub fn world_size(&self) -> u32 {
-        self.inner.read().unwrap().world_size
+        self.inner.read().world_size
     }
 
     /// Set hysteresis band.
     pub fn set_hysteresis_band(&self, band: u32) {
-        self.inner.write().unwrap().hysteresis_band = band;
+        self.inner.write().hysteresis_band = band;
     }
 
     /// Force a specific backend, bypassing all threshold logic.
     /// Pass `None` to clear the override and resume normal selection.
     pub fn force_backend(&self, backend: Option<MoeBackend>) {
-        self.inner.write().unwrap().forced_backend = backend;
+        self.inner.write().forced_backend = backend;
     }
 
     /// Select dispatch backend for a given element count and byte size.
@@ -180,7 +180,7 @@ impl MoePolicy {
     /// is adjusted by ±hysteresis_band to prevent oscillation at zone boundaries.
     pub fn select(&self, n_elements: u32, byte_size: usize) -> MoeBackend {
         // Acquire read lock for the inner state.
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
 
         // If a backend is forced, return it unconditionally
         if let Some(forced) = inner.forced_backend {
@@ -208,7 +208,7 @@ impl MoePolicy {
             // lock before clearing it, so concurrent selectors cannot race the
             // cooldown transition.
             drop(inner);
-            let mut w = self.inner.write().unwrap();
+            let mut w = self.inner.write();
             if w.cooldown_active {
                 w.cooldown_active = false;
             }
@@ -277,7 +277,7 @@ impl MoePolicy {
     /// D7: resets both time and call counters. Cooldown expires when EITHER
     /// 5000ms elapsed OR 1000 calls have been made to `select()`.
     pub fn switch_backend(&self, new_backend: MoeBackend) {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write();
         if new_backend != inner.current_backend {
             inner.current_backend = new_backend;
             inner.last_switch_time = Some(Instant::now());
@@ -298,12 +298,12 @@ impl MoePolicy {
 
     /// Current backend.
     pub fn current_backend(&self) -> MoeBackend {
-        self.inner.read().unwrap().current_backend
+        self.inner.read().current_backend
     }
 
     /// Whether cooldown is currently active.
     pub fn cooldown_active(&self) -> bool {
-        self.inner.read().unwrap().cooldown_active
+        self.inner.read().cooldown_active
     }
 
     /// Calls since the last backend switch.
@@ -313,32 +313,32 @@ impl MoePolicy {
 
     /// CPU max threshold.
     pub fn cpu_max(&self) -> u32 {
-        self.inner.read().unwrap().cpu_max
+        self.inner.read().cpu_max
     }
 
     /// GPU min threshold.
     pub fn gpu_min(&self) -> u32 {
-        self.inner.read().unwrap().gpu_min
+        self.inner.read().gpu_min
     }
 
     /// Byte threshold.
     pub fn byte_threshold(&self) -> usize {
-        self.inner.read().unwrap().byte_threshold
+        self.inner.read().byte_threshold
     }
 
     /// Whether Metal is available on this system.
     pub fn metal_available(&self) -> bool {
-        self.inner.read().unwrap().metal_available
+        self.inner.read().metal_available
     }
 
     /// Set CPU max threshold (used by calibration).
     pub fn set_cpu_max(&self, v: u32) {
-        self.inner.write().unwrap().cpu_max = v;
+        self.inner.write().cpu_max = v;
     }
 
     /// Set GPU min threshold (used by calibration).
     pub fn set_gpu_min(&self, v: u32) {
-        self.inner.write().unwrap().gpu_min = v;
+        self.inner.write().gpu_min = v;
     }
 }
 

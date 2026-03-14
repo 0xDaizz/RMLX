@@ -1,7 +1,7 @@
 //! Metal source code generation for fused element-wise kernels.
 
-use std::collections::HashMap;
-use std::sync::RwLock;
+use parking_lot::RwLock;
+use rustc_hash::FxHashMap;
 
 use super::graph::{FusableOp, FusionGraph};
 use crate::dtype::DType;
@@ -12,14 +12,14 @@ use crate::dtype::DType;
 /// source by graph hash.
 pub struct FusionCodegen {
     /// Cache: graph hash -> generated Metal source.
-    cache: RwLock<HashMap<u64, String>>,
+    cache: RwLock<FxHashMap<u64, String>>,
 }
 
 impl FusionCodegen {
     /// Create a new codegen engine.
     pub fn new() -> Self {
         Self {
-            cache: RwLock::new(HashMap::new()),
+            cache: RwLock::new(FxHashMap::default()),
         }
     }
 
@@ -38,7 +38,8 @@ impl FusionCodegen {
         let key = Self::cache_key_with_dtype(graph, dtype);
 
         // Check cache
-        if let Ok(cache) = self.cache.read() {
+        {
+            let cache = self.cache.read();
             if let Some(source) = cache.get(&key) {
                 return Ok(source.clone());
             }
@@ -48,9 +49,7 @@ impl FusionCodegen {
         let source = Self::emit_kernel_named(graph, "fused_elementwise", dtype);
 
         // Cache
-        if let Ok(mut cache) = self.cache.write() {
-            cache.insert(key, source.clone());
-        }
+        self.cache.write().insert(key, source.clone());
 
         Ok(source)
     }
@@ -69,7 +68,8 @@ impl FusionCodegen {
 
         let key = Self::cache_key_with_dtype(graph, dtype);
 
-        if let Ok(cache) = self.cache.read() {
+        {
+            let cache = self.cache.read();
             if let Some(source) = cache.get(&key) {
                 return Ok(source.clone());
             }
@@ -77,23 +77,19 @@ impl FusionCodegen {
 
         let source = Self::emit_kernel_named(graph, name, dtype);
 
-        if let Ok(mut cache) = self.cache.write() {
-            cache.insert(key, source.clone());
-        }
+        self.cache.write().insert(key, source.clone());
 
         Ok(source)
     }
 
     /// Number of cached kernels.
     pub fn cache_size(&self) -> usize {
-        self.cache.read().map(|c| c.len()).unwrap_or(0)
+        self.cache.read().len()
     }
 
     /// Clear the codegen cache.
     pub fn clear_cache(&self) {
-        if let Ok(mut cache) = self.cache.write() {
-            cache.clear();
-        }
+        self.cache.write().clear();
     }
 
     /// Validate that the dtype is supported by the fusion codegen.

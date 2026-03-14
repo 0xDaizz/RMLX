@@ -4,8 +4,8 @@
 //! via `Arc<PipelineCache>`.  Supports both plain kernel functions and
 //! functions specialized with Metal function constants.
 
-use std::collections::HashMap;
-use std::sync::RwLock;
+use parking_lot::RwLock;
+use rustc_hash::FxHashMap;
 
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
@@ -61,15 +61,15 @@ struct SpecializedKey {
 /// Thread-safe cache for compiled compute pipeline states, keyed by kernel
 /// function name (and optionally function constant values).
 ///
-/// Uses a `RwLock<HashMap<...>>` internally so that cache hits (the common
+/// Uses a `RwLock<FxHashMap<...>>` internally so that cache hits (the common
 /// case) only take a read lock, while cache misses take a write lock.
 ///
 /// All public methods take `&self`, making it safe to share across threads
 /// via `Arc<PipelineCache>`.
 pub struct PipelineCache {
     device: MtlDevice,
-    cache: RwLock<HashMap<String, MtlPipeline>>,
-    specialized_cache: RwLock<HashMap<SpecializedKey, MtlPipeline>>,
+    cache: RwLock<FxHashMap<String, MtlPipeline>>,
+    specialized_cache: RwLock<FxHashMap<SpecializedKey, MtlPipeline>>,
 }
 
 impl PipelineCache {
@@ -77,8 +77,8 @@ impl PipelineCache {
     pub fn new(device: &ProtocolObject<dyn MTLDevice>) -> Self {
         Self {
             device: retain_proto(device),
-            cache: RwLock::new(HashMap::new()),
-            specialized_cache: RwLock::new(HashMap::new()),
+            cache: RwLock::new(FxHashMap::default()),
+            specialized_cache: RwLock::new(FxHashMap::default()),
         }
     }
 
@@ -96,19 +96,14 @@ impl PipelineCache {
     ) -> Result<MtlPipeline, MetalError> {
         // Fast path: read lock for cache hit.
         {
-            let cache = self.cache.read().map_err(|_| {
-                MetalError::PipelineCreate("pipeline cache lock poisoned".to_string())
-            })?;
+            let cache = self.cache.read();
             if let Some(pipeline) = cache.get(name) {
                 return Ok(retain_proto(&**pipeline));
             }
         }
 
         // Slow path: write lock for cache miss.
-        let mut cache = self
-            .cache
-            .write()
-            .map_err(|_| MetalError::PipelineCreate("pipeline cache lock poisoned".to_string()))?;
+        let mut cache = self.cache.write();
 
         // Double-check: another thread may have inserted while we waited.
         if let Some(pipeline) = cache.get(name) {
@@ -155,18 +150,14 @@ impl PipelineCache {
 
         // Fast path: read lock for cache hit.
         {
-            let cache = self.specialized_cache.read().map_err(|_| {
-                MetalError::PipelineCreate("specialized cache lock poisoned".to_string())
-            })?;
+            let cache = self.specialized_cache.read();
             if let Some(pipeline) = cache.get(&key) {
                 return Ok(retain_proto(&**pipeline));
             }
         }
 
         // Slow path: build the specialized function.
-        let mut cache = self.specialized_cache.write().map_err(|_| {
-            MetalError::PipelineCreate("specialized cache lock poisoned".to_string())
-        })?;
+        let mut cache = self.specialized_cache.write();
 
         // Double-check after acquiring write lock.
         if let Some(pipeline) = cache.get(&key) {
@@ -192,16 +183,13 @@ impl PipelineCache {
 
     /// Check whether a pipeline for `name` is already cached (plain cache only).
     pub fn contains(&self, name: &str) -> bool {
-        self.cache
-            .read()
-            .map(|c| c.contains_key(name))
-            .unwrap_or(false)
+        self.cache.read().contains_key(name)
     }
 
     /// Number of cached pipelines (plain + specialized).
     pub fn len(&self) -> usize {
-        let plain = self.cache.read().map(|c| c.len()).unwrap_or(0);
-        let specialized = self.specialized_cache.read().map(|c| c.len()).unwrap_or(0);
+        let plain = self.cache.read().len();
+        let specialized = self.specialized_cache.read().len();
         plain + specialized
     }
 
@@ -284,11 +272,11 @@ mod tests {
 
     #[test]
     fn test_function_constant_hash_equality() {
-        use std::collections::hash_map::DefaultHasher;
+        use rustc_hash::FxHasher;
         use std::hash::{Hash, Hasher};
 
         fn hash_of(c: &FunctionConstant) -> u64 {
-            let mut h = DefaultHasher::new();
+            let mut h = FxHasher::default();
             c.hash(&mut h);
             h.finish()
         }

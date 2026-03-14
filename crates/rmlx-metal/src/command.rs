@@ -4,7 +4,7 @@
 //! single command buffer, and [`BarrierTracker`] for inserting memory barriers
 //! between dependent kernel dispatches.
 
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 use std::ptr::NonNull;
 
 use objc2::runtime::ProtocolObject;
@@ -129,24 +129,24 @@ impl Drop for CommandBufferManager<'_> {
 /// the tracker signals that a memory barrier is required.
 pub struct BarrierTracker {
     /// Buffers that were bound as *output* (write) in the previous dispatch.
-    previous_outputs: HashSet<u64>,
+    previous_outputs: FxHashSet<u64>,
     /// Buffers that were bound as *input* (read) in the previous dispatch(es).
     /// Used by `check_concurrent` to detect WAR (write-after-read) hazards.
-    previous_inputs: HashSet<u64>,
+    previous_inputs: FxHashSet<u64>,
     /// Buffers marked as temporary — exempted from barrier checks.
     /// These are intermediate buffers that are only used within a single
     /// encoder scope (e.g., `normed`, `qkv`, `gate_up`, `hidden` in
     /// the 9-dispatch decode path).
-    temporaries: HashSet<u64>,
+    temporaries: FxHashSet<u64>,
 }
 
 impl BarrierTracker {
     /// Create an empty tracker.
     pub fn new() -> Self {
         Self {
-            previous_outputs: HashSet::new(),
-            previous_inputs: HashSet::new(),
-            temporaries: HashSet::new(),
+            previous_outputs: FxHashSet::default(),
+            previous_inputs: FxHashSet::default(),
+            temporaries: FxHashSet::default(),
         }
     }
 
@@ -323,7 +323,7 @@ impl Default for BarrierTracker {
 /// Thread-safe store for GPU execution errors reported asynchronously via
 /// Metal completion handlers.
 pub struct GpuErrorStore {
-    errors: std::sync::Mutex<Vec<GpuError>>,
+    errors: parking_lot::Mutex<Vec<GpuError>>,
 }
 
 /// A GPU execution error captured from a completed command buffer.
@@ -349,31 +349,23 @@ impl GpuErrorStore {
     /// Create an empty error store.
     pub fn new() -> Self {
         Self {
-            errors: std::sync::Mutex::new(Vec::new()),
+            errors: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
     /// Push a new error (called from completion handler).
     pub fn push(&self, error: GpuError) {
-        if let Ok(mut errors) = self.errors.lock() {
-            errors.push(error);
-        }
+        self.errors.lock().push(error);
     }
 
     /// Drain and return all recorded errors.
     pub fn take_errors(&self) -> Vec<GpuError> {
-        match self.errors.lock() {
-            Ok(mut errors) => std::mem::take(&mut *errors),
-            Err(_) => Vec::new(),
-        }
+        std::mem::take(&mut *self.errors.lock())
     }
 
     /// Check if any errors have been recorded.
     pub fn has_errors(&self) -> bool {
-        match self.errors.lock() {
-            Ok(errors) => !errors.is_empty(),
-            Err(_) => false,
-        }
+        !self.errors.lock().is_empty()
     }
 }
 

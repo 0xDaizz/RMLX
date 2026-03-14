@@ -8,7 +8,9 @@
 //! layered on top in a future pass.
 
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use crate::array::Array;
 use crate::dtype::DType;
@@ -115,7 +117,7 @@ impl LazyGraph {
 
     /// Number of nodes currently in the graph.
     pub fn len(&self) -> usize {
-        self.inner.lock().unwrap().len()
+        self.inner.lock().len()
     }
 
     /// Whether the graph is empty.
@@ -125,7 +127,7 @@ impl LazyGraph {
 
     /// Add an already-materialized array as a leaf node. Returns its [`NodeId`].
     pub fn add_value(&self, array: Array) -> NodeId {
-        let mut nodes = self.inner.lock().unwrap();
+        let mut nodes = self.inner.lock();
         let id = NodeId(nodes.len());
         nodes.push(LazyNode {
             op: None,
@@ -141,7 +143,7 @@ impl LazyGraph {
     /// `shape` and `dtype` describe the expected output and are stored for
     /// downstream validation without requiring eager computation.
     pub fn add_op(&self, op: LazyOp, shape: Vec<usize>, dtype: DType) -> NodeId {
-        let mut nodes = self.inner.lock().unwrap();
+        let mut nodes = self.inner.lock();
         let id = NodeId(nodes.len());
         nodes.push(LazyNode {
             op: Some(op),
@@ -154,19 +156,19 @@ impl LazyGraph {
 
     /// Check if a node has already been materialized.
     pub fn is_materialized(&self, id: NodeId) -> bool {
-        let nodes = self.inner.lock().unwrap();
+        let nodes = self.inner.lock();
         nodes.get(id.0).is_some_and(|n| n.value.is_some())
     }
 
     /// Get the shape of a node.
     pub fn shape(&self, id: NodeId) -> Option<Vec<usize>> {
-        let nodes = self.inner.lock().unwrap();
+        let nodes = self.inner.lock();
         nodes.get(id.0).map(|n| n.shape.clone())
     }
 
     /// Get the dtype of a node.
     pub fn dtype(&self, id: NodeId) -> Option<DType> {
-        let nodes = self.inner.lock().unwrap();
+        let nodes = self.inner.lock();
         nodes.get(id.0).map(|n| n.dtype)
     }
 }
@@ -377,7 +379,7 @@ impl LazyArray {
         F: Fn(&LazyOp, Vec<&Array>) -> Result<Array, LazyEvalError>,
     {
         let order = self.topo_sort()?;
-        let mut nodes = self.graph.inner.lock().unwrap();
+        let mut nodes = self.graph.inner.lock();
 
         for nid in order {
             if nodes[nid.0].value.is_some() {
@@ -437,7 +439,7 @@ impl LazyArray {
         F: Fn(&LazyOp, Vec<&Array>, &mut EvalContext<'_, '_, '_>) -> Result<Array, LazyEvalError>,
     {
         let order = self.topo_sort()?;
-        let mut nodes = self.graph.inner.lock().unwrap();
+        let mut nodes = self.graph.inner.lock();
 
         // Build topo_ops list (only non-materialized nodes)
         let topo_ops: Vec<(NodeId, LazyOp)> = order
@@ -582,7 +584,7 @@ impl LazyArray {
     ///
     /// Returns `None` if the node has not been evaluated yet.
     pub fn try_get(&self) -> Option<ArrayRef> {
-        let nodes = self.graph.inner.lock().unwrap();
+        let nodes = self.graph.inner.lock();
         if nodes[self.node.0].value.is_some() {
             Some(ArrayRef {
                 graph: self.graph.clone(),
@@ -598,7 +600,7 @@ impl LazyArray {
     /// Compute a topological ordering of all nodes reachable from this
     /// node that still need evaluation.
     fn topo_sort(&self) -> Result<Vec<NodeId>, LazyEvalError> {
-        let nodes = self.graph.inner.lock().unwrap();
+        let nodes = self.graph.inner.lock();
         let n = nodes.len();
         if self.node.0 >= n {
             return Err(LazyEvalError::InvalidNode(self.node));
@@ -668,7 +670,7 @@ impl ArrayRef {
     ///
     /// The closure receives an immutable reference to the `Array`.
     pub fn with<R, F: FnOnce(&Array) -> R>(&self, f: F) -> R {
-        let nodes = self.graph.inner.lock().unwrap();
+        let nodes = self.graph.inner.lock();
         let arr = nodes[self.node.0]
             .value
             .as_ref()

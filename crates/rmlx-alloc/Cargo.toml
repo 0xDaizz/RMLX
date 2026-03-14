@@ -18,4 +18,6 @@ rmlx-metal = { path = "../rmlx-metal" }
 libc = { workspace = true }
 objc2 = { workspace = true }
 objc2-metal = { workspace = true, features = ["MTLAllocation", "MTLResidencySet"] }
+parking_lot = { workspace = true }
+rustc-hash = { workspace = true }
 tracing = { workspace = true }

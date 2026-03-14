@@ -3,9 +3,9 @@
 //! Manages QP creation, TCP-based QP info exchange, state transitions,
 //! and warmup protocol for all peers.
 
+use parking_lot::Mutex;
 use std::ffi::c_void;
 use std::marker::PhantomData;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::context::{ProtectionDomain, RdmaContext};
@@ -509,7 +509,7 @@ impl RdmaConnection {
 
         // Check backlog first for any previously stashed completions
         {
-            let mut backlog = self.completion_backlog.lock().unwrap();
+            let mut backlog = self.completion_backlog.lock();
             let mut backlog_error: Option<RdmaError> = None;
             remaining.retain(|&wr_id| {
                 if let Some(pos) = backlog.iter().position(|wc| wc.wr_id == wr_id) {
@@ -543,7 +543,7 @@ impl RdmaConnection {
                     remaining.swap_remove(pos);
                 } else {
                     // Unexpected wr_id — stash in backlog
-                    self.completion_backlog.lock().unwrap().push(*wc);
+                    self.completion_backlog.lock().push(*wc);
                 }
             }
             if !remaining.is_empty() && Instant::now() >= deadline {
@@ -561,7 +561,7 @@ impl RdmaConnection {
 
     /// Drain any stashed backlog completions (wr_ids not matched by prior waits).
     pub fn drain_backlog(&self) -> Vec<IbvWc> {
-        self.completion_backlog.lock().unwrap().drain(..).collect()
+        self.completion_backlog.lock().drain(..).collect()
     }
 
     /// Create a new CompletionTracker for fine-grained wr_id-based matching.

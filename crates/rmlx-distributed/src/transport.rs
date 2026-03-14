@@ -2,7 +2,9 @@
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use rmlx_rdma::connection::RdmaConnection;
 use rmlx_rdma::exchange_tag::{encode_wr_id, try_decode_wr_id, ExchangeTag};
@@ -272,9 +274,7 @@ impl RdmaConnectionTransport {
         // Send secondary chunks: use secondary connection if available, else primary
         let sec_conn_guard;
         let sec_conn: &RdmaConnection = if let Some(ref sec_conns) = self.secondary_connections {
-            sec_conn_guard = sec_conns[dst_rank as usize].lock().map_err(|e| {
-                DistributedError::Transport(format!("secondary lock poisoned: {e}"))
-            })?;
+            sec_conn_guard = sec_conns[dst_rank as usize].lock();
             &sec_conn_guard
         } else {
             conn
@@ -363,9 +363,7 @@ impl RdmaConnectionTransport {
         // --- Secondary chunks: use secondary connection if available ---
         let sec_conn_guard;
         let sec_conn: &RdmaConnection = if let Some(ref sec_conns) = self.secondary_connections {
-            sec_conn_guard = sec_conns[src_rank as usize].lock().map_err(|e| {
-                DistributedError::Transport(format!("secondary lock poisoned: {e}"))
-            })?;
+            sec_conn_guard = sec_conns[src_rank as usize].lock();
             &sec_conn_guard
         } else {
             conn
@@ -448,9 +446,7 @@ impl RdmaConnectionTransport {
             DistributedError::Transport("send_async: no progress engine attached".into())
         })?;
 
-        let conn = self.connections[dst_rank as usize]
-            .lock()
-            .map_err(|e| DistributedError::Transport(format!("lock poisoned: {e}")))?;
+        let conn = self.connections[dst_rank as usize].lock();
 
         let wr_id = self.next_wr_id(dst_rank, ExchangeTag::Data, 0);
         let pending = engine.register_op(wr_id);
@@ -494,9 +490,7 @@ impl RdmaConnectionTransport {
             DistributedError::Transport("recv_async: no progress engine attached".into())
         })?;
 
-        let conn = self.connections[src_rank as usize]
-            .lock()
-            .map_err(|e| DistributedError::Transport(format!("lock poisoned: {e}")))?;
+        let conn = self.connections[src_rank as usize].lock();
 
         let wr_id = self.next_wr_id(src_rank, ExchangeTag::Data, 0);
         let pending = engine.register_op(wr_id);
@@ -573,9 +567,7 @@ impl RdmaConnectionTransport {
             DistributedError::Transport("pre_post_recv_credits: no progress engine attached".into())
         })?;
 
-        let conn = self.connections[src_rank as usize]
-            .lock()
-            .map_err(|e| DistributedError::Transport(format!("lock poisoned: {e}")))?;
+        let conn = self.connections[src_rank as usize].lock();
 
         let mut credits = Vec::with_capacity(count);
 
@@ -639,9 +631,7 @@ impl RdmaConnectionTransport {
             )
         })?;
 
-        let conn = self.connections[src_rank as usize]
-            .lock()
-            .map_err(|e| DistributedError::Transport(format!("lock poisoned: {e}")))?;
+        let conn = self.connections[src_rank as usize].lock();
 
         let mr = buf.rdma_mr(conn_id).ok_or_else(|| {
             DistributedError::Transport(format!(
@@ -717,9 +707,7 @@ impl RdmaConnectionTransport {
             ))
         })?;
 
-        let conn = self.connections[peer_id as usize].lock().map_err(|e| {
-            DistributedError::Transport(format!("lock poisoned peer={peer_id}: {e}"))
-        })?;
+        let conn = self.connections[peer_id as usize].lock();
 
         // Register with progress engine if available
         if let Some(ref engine) = self.progress_engine {
@@ -771,9 +759,7 @@ impl RdmaConnectionTransport {
         dst_rank: u32,
         len: u32,
     ) -> Result<(), DistributedError> {
-        let conn = self.connections[dst_rank as usize]
-            .lock()
-            .map_err(|e| DistributedError::Transport(format!("lock poisoned: {e}")))?;
+        let conn = self.connections[dst_rank as usize].lock();
 
         let mr = buf.rdma_mr(conn_id).ok_or_else(|| {
             DistributedError::Transport(format!(
@@ -809,9 +795,7 @@ impl RdmaConnectionTransport {
         src_rank: u32,
         len: u32,
     ) -> Result<(), DistributedError> {
-        let conn = self.connections[src_rank as usize]
-            .lock()
-            .map_err(|e| DistributedError::Transport(format!("lock poisoned: {e}")))?;
+        let conn = self.connections[src_rank as usize].lock();
 
         let mr = buf.rdma_mr(conn_id).ok_or_else(|| {
             DistributedError::Transport(format!(
@@ -853,9 +837,7 @@ impl RdmaConnectionTransport {
             DistributedError::Transport("send_zero_copy_async: no progress engine attached".into())
         })?;
 
-        let conn = self.connections[dst_rank as usize]
-            .lock()
-            .map_err(|e| DistributedError::Transport(format!("lock poisoned: {e}")))?;
+        let conn = self.connections[dst_rank as usize].lock();
 
         let mr = buf.rdma_mr(conn_id).ok_or_else(|| {
             DistributedError::Transport(format!(
@@ -893,9 +875,7 @@ impl RdmaConnectionTransport {
             DistributedError::Transport("recv_zero_copy_async: no progress engine attached".into())
         })?;
 
-        let conn = self.connections[src_rank as usize]
-            .lock()
-            .map_err(|e| DistributedError::Transport(format!("lock poisoned: {e}")))?;
+        let conn = self.connections[src_rank as usize].lock();
 
         let mr = buf.rdma_mr(conn_id).ok_or_else(|| {
             DistributedError::Transport(format!(
@@ -937,9 +917,7 @@ fn rdma_to_distributed_enhanced(e: RdmaError, wr_id: u64) -> DistributedError {
 impl RdmaTransport for RdmaConnectionTransport {
     fn send(&self, data: &[u8], dst_rank: u32) -> Result<(), DistributedError> {
         global_counters().record_fallback();
-        let conn = self.connections[dst_rank as usize]
-            .lock()
-            .map_err(|e| DistributedError::Transport(format!("lock poisoned: {e}")))?;
+        let conn = self.connections[dst_rank as usize].lock();
 
         // Use striped send for large payloads when stripe engine is configured
         if self.should_stripe(data.len()) {
@@ -972,9 +950,7 @@ impl RdmaTransport for RdmaConnectionTransport {
 
     fn recv(&self, src_rank: u32, len: usize) -> Result<Vec<u8>, DistributedError> {
         global_counters().record_fallback();
-        let conn = self.connections[src_rank as usize]
-            .lock()
-            .map_err(|e| DistributedError::Transport(format!("lock poisoned: {e}")))?;
+        let conn = self.connections[src_rank as usize].lock();
 
         // Use striped recv for large payloads when stripe engine is configured
         if self.should_stripe(len) {
@@ -1021,9 +997,7 @@ impl RdmaTransport for RdmaConnectionTransport {
         // When dst_rank == src_rank, use the same connection lock for both ops
         // to avoid deadlock (lock ordering).
         if dst_rank == src_rank {
-            let conn = self.connections[dst_rank as usize]
-                .lock()
-                .map_err(|e| DistributedError::Transport(format!("lock poisoned: {e}")))?;
+            let conn = self.connections[dst_rank as usize].lock();
 
             // Prepare recv buffer and MR
             let mut recv_buf = vec![0u8; recv_len];
@@ -1081,12 +1055,8 @@ impl RdmaTransport for RdmaConnectionTransport {
             } else {
                 (src_rank, dst_rank)
             };
-            let first_conn = self.connections[first_rank as usize]
-                .lock()
-                .map_err(|e| DistributedError::Transport(format!("lock poisoned: {e}")))?;
-            let second_conn = self.connections[second_rank as usize]
-                .lock()
-                .map_err(|e| DistributedError::Transport(format!("lock poisoned: {e}")))?;
+            let first_conn = self.connections[first_rank as usize].lock();
+            let second_conn = self.connections[second_rank as usize].lock();
 
             let (dst_conn, src_conn) = if dst_rank < src_rank {
                 (&*first_conn, &*second_conn)
@@ -1149,7 +1119,8 @@ impl RdmaTransport for RdmaConnectionTransport {
 #[cfg(test)]
 mod tests {
     use crate::group::{DistributedError, Group, RdmaTransport};
-    use std::sync::{Arc, Mutex, OnceLock};
+    use parking_lot::Mutex;
+    use std::sync::{Arc, OnceLock};
 
     fn test_device() -> Option<&'static rmlx_metal::MtlDevice> {
         static DEVICE: OnceLock<Option<rmlx_metal::MtlDevice>> = OnceLock::new();
@@ -1177,12 +1148,12 @@ mod tests {
 
     impl RdmaTransport for MockTransport {
         fn send(&self, data: &[u8], dst_rank: u32) -> Result<(), DistributedError> {
-            self.sent.lock().unwrap().push((data.to_vec(), dst_rank));
+            self.sent.lock().push((data.to_vec(), dst_rank));
             Ok(())
         }
 
         fn recv(&self, _src_rank: u32, len: usize) -> Result<Vec<u8>, DistributedError> {
-            let data = self.recv_data.lock().unwrap();
+            let data = self.recv_data.lock();
             Ok(data[..len].to_vec())
         }
 
@@ -1204,7 +1175,7 @@ mod tests {
         let mock = MockTransport::new(payload.clone());
 
         mock.send(&payload, 1).unwrap();
-        let sent = mock.sent.lock().unwrap();
+        let sent = mock.sent.lock();
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].0, payload);
         assert_eq!(sent[0].1, 1);
@@ -1224,7 +1195,7 @@ mod tests {
         assert_eq!(result, data);
 
         // Root should have sent to 2 peers
-        let sent = mock.sent.lock().unwrap();
+        let sent = mock.sent.lock();
         assert_eq!(sent.len(), 2);
     }
 
@@ -1278,7 +1249,7 @@ mod tests {
         let group = Group::with_transport(vec![0, 1], 0, 2, mock.clone()).unwrap();
 
         group.send(&data, 1).unwrap();
-        let sent = mock.sent.lock().unwrap();
+        let sent = mock.sent.lock();
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].1, 1);
         drop(sent);

@@ -8,7 +8,7 @@
 //! into fixed-size slots. Requests up to `MAX_SMALL_ALLOC` (256 bytes)
 //! are served from this pool via offset-based sub-allocation.
 
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 use rmlx_metal::device::GpuDevice;
 use rmlx_metal::MtlBuffer;
@@ -96,7 +96,7 @@ impl SmallBufferPool {
             return None;
         }
 
-        let mut inner = self.inner.lock().ok()?;
+        let mut inner = self.inner.lock();
         let slot = inner.free_list.pop()?;
 
         Some(SmallAllocation {
@@ -115,20 +115,17 @@ impl SmallBufferPool {
         if alloc.slot >= self.num_slots {
             return false;
         }
-        if let Ok(mut inner) = self.inner.lock() {
-            // Guard: check if slot is already free (double-free detection).
-            // All small allocations share one gpu_address (sub-allocated from
-            // a single backing buffer), so the allocator's free() path could
-            // pop an arbitrary SmallAllocation from the tracking vec. If that
-            // allocation was already returned, we'd corrupt a live slot.
-            if inner.free_list.contains(&alloc.slot) {
-                return false;
-            }
-            inner.free_list.push(alloc.slot);
-            true
-        } else {
-            false
+        let mut inner = self.inner.lock();
+        // Guard: check if slot is already free (double-free detection).
+        // All small allocations share one gpu_address (sub-allocated from
+        // a single backing buffer), so the allocator's free() path could
+        // pop an arbitrary SmallAllocation from the tracking vec. If that
+        // allocation was already returned, we'd corrupt a live slot.
+        if inner.free_list.contains(&alloc.slot) {
+            return false;
         }
+        inner.free_list.push(alloc.slot);
+        true
     }
 
     /// The single backing Metal buffer.
@@ -148,10 +145,7 @@ impl SmallBufferPool {
 
     /// Number of currently free slots.
     pub fn free_count(&self) -> usize {
-        self.inner
-            .lock()
-            .map(|inner| inner.free_list.len())
-            .unwrap_or(0)
+        self.inner.lock().free_list.len()
     }
 
     /// Number of currently allocated slots.
