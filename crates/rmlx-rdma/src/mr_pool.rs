@@ -9,6 +9,8 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use crossbeam_utils::CachePadded;
+
 use crate::context::ProtectionDomain;
 use crate::mr::MemoryRegion;
 use crate::RdmaError;
@@ -33,7 +35,7 @@ struct MrSlotInner {
     mr: std::mem::ManuallyDrop<MemoryRegion>,
     buffer: NonNull<u8>,
     size: usize,
-    in_use: AtomicBool,
+    in_use: CachePadded<AtomicBool>,
 }
 
 // SAFETY: MrSlotInner's buffer pointer is heap-allocated via posix_memalign and
@@ -133,7 +135,7 @@ impl MrPool {
                     mr: std::mem::ManuallyDrop::new(mr),
                     buffer,
                     size: tier_size,
-                    in_use: AtomicBool::new(false),
+                    in_use: CachePadded::new(AtomicBool::new(false)),
                 }));
             }
             tiers.push(MrTier {

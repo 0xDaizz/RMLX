@@ -3,6 +3,7 @@
 //! Since macOS TB5 RDMA drivers provide librdma.dylib rather than standard
 //! libibverbs headers, we load functions at runtime using libloading.
 
+use bytemuck::{Pod, Zeroable};
 use libloading::{Library, Symbol};
 use std::ffi::{c_char, c_int, c_void};
 use std::sync::OnceLock;
@@ -288,7 +289,7 @@ pub struct IbvPortAttr {
 
 /// Work completion
 #[repr(C)]
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Pod, Zeroable)]
 pub struct IbvWc {
     pub wr_id: u64,
     pub status: u32, // ibv_wc_status
@@ -303,6 +304,9 @@ pub struct IbvWc {
     pub slid: u16,
     pub sl: u8,
     pub dlid_path_bits: u8,
+    /// Explicit padding to fill the trailing 2 bytes (struct aligns to 8 for u64 field).
+    /// Required for bytemuck::Pod — no implicit padding allowed.
+    _pad: [u8; 2],
 }
 
 /// Send work request — matches C ibv_send_wr layout (~80 bytes).

@@ -10,7 +10,7 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
-use crate::qp::QpInfo;
+use crate::qp::{QpInfo, QP_INFO_WIRE_SIZE};
 use crate::RdmaError;
 
 /// Default port for QP info exchange (matches PoC)
@@ -40,30 +40,6 @@ impl Default for ExchangeConfig {
             connect_timeout_ms: 5000,
         }
     }
-}
-
-/// Serialized QPInfo wire size: lid(2) + qpn(4) + psn(4) + gid(16) = 26 bytes.
-/// Fixed size avoids padding/alignment issues across platforms.
-const QP_INFO_WIRE_SIZE: usize = 2 + 4 + 4 + 16;
-
-/// Serialize QpInfo to a fixed 26-byte little-endian wire format.
-fn serialize_qp_info(info: &QpInfo) -> [u8; QP_INFO_WIRE_SIZE] {
-    let mut buf = [0u8; QP_INFO_WIRE_SIZE];
-    buf[0..2].copy_from_slice(&info.lid.to_le_bytes());
-    buf[2..6].copy_from_slice(&info.qpn.to_le_bytes());
-    buf[6..10].copy_from_slice(&info.psn.to_le_bytes());
-    buf[10..26].copy_from_slice(&info.gid);
-    buf
-}
-
-/// Deserialize QpInfo from the 26-byte wire format.
-fn deserialize_qp_info(buf: &[u8; QP_INFO_WIRE_SIZE]) -> QpInfo {
-    let lid = u16::from_le_bytes([buf[0], buf[1]]);
-    let qpn = u32::from_le_bytes([buf[2], buf[3], buf[4], buf[5]]);
-    let psn = u32::from_le_bytes([buf[6], buf[7], buf[8], buf[9]]);
-    let mut gid = [0u8; 16];
-    gid.copy_from_slice(&buf[10..26]);
-    QpInfo { lid, qpn, psn, gid }
 }
 
 /// Exchange QP info as rank 0 (server/listener).
@@ -145,11 +121,11 @@ fn server_exchange_on_stream(stream: &mut TcpStream, local: &QpInfo) -> Result<Q
     let mut recv_buf = [0u8; QP_INFO_WIRE_SIZE];
     stream.read_exact(&mut recv_buf)?;
 
-    let send_buf = serialize_qp_info(local);
+    let send_buf = local.to_wire();
     stream.write_all(&send_buf)?;
     stream.flush()?;
 
-    Ok(deserialize_qp_info(&recv_buf))
+    Ok(QpInfo::from_wire(recv_buf))
 }
 
 /// Exchange QP info as rank 1+ (client).
@@ -224,14 +200,14 @@ pub fn exchange_client(
 
 /// Perform the client-side exchange on an already-connected stream.
 fn client_exchange_on_stream(stream: &mut TcpStream, local: &QpInfo) -> Result<QpInfo, io::Error> {
-    let send_buf = serialize_qp_info(local);
+    let send_buf = local.to_wire();
     stream.write_all(&send_buf)?;
     stream.flush()?;
 
     let mut recv_buf = [0u8; QP_INFO_WIRE_SIZE];
     stream.read_exact(&mut recv_buf)?;
 
-    Ok(deserialize_qp_info(&recv_buf))
+    Ok(QpInfo::from_wire(recv_buf))
 }
 
 /// Connect to `addr` with up to 30 sub-retries (500ms apart).
@@ -406,8 +382,8 @@ mod tests {
             psn: 0x5678,
             gid: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
         };
-        let buf = serialize_qp_info(&info);
-        let out = deserialize_qp_info(&buf);
+        let buf = info.to_wire();
+        let out = QpInfo::from_wire(buf);
         assert_eq!(out.lid, info.lid);
         assert_eq!(out.qpn, info.qpn);
         assert_eq!(out.psn, info.psn);
@@ -448,9 +424,9 @@ mod tests {
             // Read client's QPInfo
             let mut recv_buf = [0u8; QP_INFO_WIRE_SIZE];
             stream2.read_exact(&mut recv_buf).expect("server read");
-            let received = deserialize_qp_info(&recv_buf);
+            let received = QpInfo::from_wire(recv_buf);
             // Send server's QPInfo
-            let send_buf = serialize_qp_info(&server_info_clone);
+            let send_buf = server_info_clone.to_wire();
             stream2.write_all(&send_buf).expect("server write");
             stream2.flush().ok();
 

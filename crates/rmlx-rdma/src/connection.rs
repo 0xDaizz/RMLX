@@ -3,6 +3,7 @@
 //! Manages QP creation, TCP-based QP info exchange, state transitions,
 //! and warmup protocol for all peers.
 
+use bytemuck::Zeroable as _;
 use parking_lot::Mutex;
 use std::ffi::c_void;
 use std::marker::PhantomData;
@@ -130,7 +131,7 @@ impl CompletionTracker {
 
         // Poll CQ with timeout
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-        let mut wc_buf: [IbvWc; 16] = core::array::from_fn(|_| unsafe { std::mem::zeroed() });
+        let mut wc_buf: [IbvWc; 16] = core::array::from_fn(|_| IbvWc::zeroed());
 
         loop {
             let count = cq.poll(&mut wc_buf)?;
@@ -184,7 +185,7 @@ impl Default for CompletionTracker {
 /// timeout expires.
 pub fn poll_with_timeout(cq: &CompletionQueue, timeout_ms: u64) -> Result<Vec<IbvWc>, RdmaError> {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-    let mut wc_buf: [IbvWc; 16] = core::array::from_fn(|_| unsafe { std::mem::zeroed() });
+    let mut wc_buf: [IbvWc; 16] = core::array::from_fn(|_| IbvWc::zeroed());
 
     loop {
         let count = cq.poll(&mut wc_buf)?;
@@ -505,7 +506,7 @@ impl RdmaConnection {
     ) -> Result<(), RdmaError> {
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         let mut remaining: Vec<u64> = expected_wr_ids.to_vec();
-        let mut wc_buf: [IbvWc; 16] = core::array::from_fn(|_| unsafe { std::mem::zeroed() });
+        let mut wc_buf: [IbvWc; 16] = core::array::from_fn(|_| IbvWc::zeroed());
 
         // Check backlog first for any previously stashed completions
         {
