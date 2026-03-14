@@ -97,6 +97,31 @@ pub struct QpInfo {
     pub gid: [u8; 16],
 }
 
+/// Wire format size: lid(2) + qpn(4) + psn(4) + gid(16) = 26 bytes.
+pub const QP_INFO_WIRE_SIZE: usize = 2 + 4 + 4 + 16;
+
+impl QpInfo {
+    /// Serialize QpInfo to a 26-byte little-endian wire format.
+    pub fn to_wire(&self) -> [u8; QP_INFO_WIRE_SIZE] {
+        let mut buf = [0u8; QP_INFO_WIRE_SIZE];
+        buf[0..2].copy_from_slice(&self.lid.to_le_bytes());
+        buf[2..6].copy_from_slice(&self.qpn.to_le_bytes());
+        buf[6..10].copy_from_slice(&self.psn.to_le_bytes());
+        buf[10..26].copy_from_slice(&self.gid);
+        buf
+    }
+
+    /// Deserialize QpInfo from a 26-byte little-endian wire format.
+    pub fn from_wire(buf: [u8; QP_INFO_WIRE_SIZE]) -> Self {
+        let lid = u16::from_le_bytes([buf[0], buf[1]]);
+        let qpn = u32::from_le_bytes([buf[2], buf[3], buf[4], buf[5]]);
+        let psn = u32::from_le_bytes([buf[6], buf[7], buf[8], buf[9]]);
+        let mut gid = [0u8; 16];
+        gid.copy_from_slice(&buf[10..26]);
+        Self { lid, qpn, psn, gid }
+    }
+}
+
 /// UC Queue Pair for TB5 RDMA.
 ///
 /// Manages the full lifecycle: creation in RESET state, state transitions

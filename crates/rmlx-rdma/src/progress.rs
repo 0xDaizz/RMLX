@@ -18,6 +18,7 @@ use crate::exchange_tag::{try_decode_wr_id, WrIdFields};
 use crate::ffi::{wc_status, wc_status_str, IbvWc};
 use crate::mr::MemoryRegion;
 use crate::qp::CompletionQueue;
+use bytemuck::Zeroable as _;
 
 // ─── Op states (AtomicU8) ───
 
@@ -282,7 +283,7 @@ impl ProgressEngine {
     /// lock is only held briefly to look up and remove completed entries.
     pub fn drive_progress(&self, cq: &CompletionQueue, budget: usize) -> usize {
         let poll_size = budget.min(64);
-        let mut wc_buf: Vec<IbvWc> = vec![unsafe { std::mem::zeroed() }; poll_size];
+        let mut wc_buf: Vec<IbvWc> = vec![IbvWc::zeroed(); poll_size];
         let mut total = 0;
 
         // Poll CQ — no lock held here
@@ -344,7 +345,7 @@ impl ProgressEngine {
             .name("rmlx-cq-progress".into())
             .spawn(move || {
                 let budget = config.poll_budget.min(64);
-                let mut wc_buf: Vec<IbvWc> = vec![unsafe { std::mem::zeroed() }; budget];
+                let mut wc_buf: Vec<IbvWc> = vec![IbvWc::zeroed(); budget];
 
                 while !shutdown.load(Ordering::Acquire) {
                     let count = match cq.poll(&mut wc_buf) {
