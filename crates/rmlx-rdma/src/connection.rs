@@ -3,9 +3,10 @@
 //! Manages QP creation, TCP-based QP info exchange, state transitions,
 //! and warmup protocol for all peers.
 
+use bytemuck::Zeroable as _;
+use parking_lot::Mutex;
 use std::ffi::c_void;
 use std::marker::PhantomData;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::context::{ProtectionDomain, RdmaContext};
@@ -130,7 +131,7 @@ impl CompletionTracker {
 
         // Poll CQ with timeout
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-        let mut wc_buf: [IbvWc; 16] = core::array::from_fn(|_| unsafe { std::mem::zeroed() });
+        let mut wc_buf: [IbvWc; 16] = core::array::from_fn(|_| IbvWc::zeroed());
 
         loop {
             let count = cq.poll(&mut wc_buf)?;
@@ -184,7 +185,7 @@ impl Default for CompletionTracker {
 /// timeout expires.
 pub fn poll_with_timeout(cq: &CompletionQueue, timeout_ms: u64) -> Result<Vec<IbvWc>, RdmaError> {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-    let mut wc_buf: [IbvWc; 16] = core::array::from_fn(|_| unsafe { std::mem::zeroed() });
+    let mut wc_buf: [IbvWc; 16] = core::array::from_fn(|_| IbvWc::zeroed());
 
     loop {
         let count = cq.poll(&mut wc_buf)?;
@@ -505,11 +506,11 @@ impl RdmaConnection {
     ) -> Result<(), RdmaError> {
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         let mut remaining: Vec<u64> = expected_wr_ids.to_vec();
-        let mut wc_buf: [IbvWc; 16] = core::array::from_fn(|_| unsafe { std::mem::zeroed() });
+        let mut wc_buf: [IbvWc; 16] = core::array::from_fn(|_| IbvWc::zeroed());
 
         // Check backlog first for any previously stashed completions
         {
-            let mut backlog = self.completion_backlog.lock().unwrap();
+            let mut backlog = self.completion_backlog.lock();
             let mut backlog_error: Option<RdmaError> = None;
             remaining.retain(|&wr_id| {
                 if let Some(pos) = backlog.iter().position(|wc| wc.wr_id == wr_id) {
@@ -543,7 +544,7 @@ impl RdmaConnection {
                     remaining.swap_remove(pos);
                 } else {
                     // Unexpected wr_id — stash in backlog
-                    self.completion_backlog.lock().unwrap().push(*wc);
+                    self.completion_backlog.lock().push(*wc);
                 }
             }
             if !remaining.is_empty() && Instant::now() >= deadline {
@@ -561,7 +562,7 @@ impl RdmaConnection {
 
     /// Drain any stashed backlog completions (wr_ids not matched by prior waits).
     pub fn drain_backlog(&self) -> Vec<IbvWc> {
-        self.completion_backlog.lock().unwrap().drain(..).collect()
+        self.completion_backlog.lock().drain(..).collect()
     }
 
     /// Create a new CompletionTracker for fine-grained wr_id-based matching.

@@ -8,9 +8,10 @@
 //! which caches individual pipeline states within a library.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::sync::RwLock;
+
+use parking_lot::RwLock;
+use rustc_hash::FxHashMap;
 
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
@@ -25,7 +26,7 @@ use crate::MetalError;
 /// Uses `RwLock<HashMap>` so concurrent cache hits only take a read lock.
 pub struct LibraryCache {
     device: MtlDevice,
-    cache: RwLock<HashMap<u64, MtlLibrary>>,
+    cache: RwLock<FxHashMap<u64, MtlLibrary>>,
 }
 
 impl LibraryCache {
@@ -33,7 +34,7 @@ impl LibraryCache {
     pub fn new(device: &ProtocolObject<dyn MTLDevice>) -> Self {
         Self {
             device: retain_proto(device),
-            cache: RwLock::new(HashMap::new()),
+            cache: RwLock::new(FxHashMap::default()),
         }
     }
 
@@ -47,20 +48,14 @@ impl LibraryCache {
 
         // Fast path: read lock for cache hit.
         {
-            let cache = self
-                .cache
-                .read()
-                .map_err(|_| MetalError::LibraryLoad("library cache lock poisoned".to_string()))?;
+            let cache = self.cache.read();
             if let Some(lib) = cache.get(&key) {
                 return Ok(retain_proto(&**lib));
             }
         }
 
         // Slow path: compile and insert under write lock.
-        let mut cache = self
-            .cache
-            .write()
-            .map_err(|_| MetalError::LibraryLoad("library cache lock poisoned".to_string()))?;
+        let mut cache = self.cache.write();
 
         // Double-check after acquiring write lock.
         if let Some(lib) = cache.get(&key) {
@@ -83,24 +78,18 @@ impl LibraryCache {
     /// Returns `None` if the source has not been compiled yet.
     pub fn get(&self, source: &str) -> Option<MtlLibrary> {
         let key = hash_source(source);
-        self.cache
-            .read()
-            .ok()
-            .and_then(|c| c.get(&key).map(|lib| retain_proto(&**lib)))
+        self.cache.read().get(&key).map(|lib| retain_proto(&**lib))
     }
 
     /// Whether a library for the given source is cached.
     pub fn contains(&self, source: &str) -> bool {
         let key = hash_source(source);
-        self.cache
-            .read()
-            .map(|c| c.contains_key(&key))
-            .unwrap_or(false)
+        self.cache.read().contains_key(&key)
     }
 
     /// Number of cached libraries.
     pub fn len(&self) -> usize {
-        self.cache.read().map(|c| c.len()).unwrap_or(0)
+        self.cache.read().len()
     }
 
     /// Whether the cache is empty.
@@ -110,9 +99,7 @@ impl LibraryCache {
 
     /// Clear all cached libraries.
     pub fn clear(&self) {
-        if let Ok(mut cache) = self.cache.write() {
-            cache.clear();
-        }
+        self.cache.write().clear();
     }
 }
 

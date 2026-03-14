@@ -20,3 +20,8 @@ libloading = { workspace = true }
 crc32fast = { workspace = true }
 half = { workspace = true }
 tracing = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+rustc-hash = { workspace = true }
+crossbeam-utils = { workspace = true }
+bytemuck = { workspace = true }

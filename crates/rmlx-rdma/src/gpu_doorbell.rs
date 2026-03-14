@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytemuck::{Pod, Zeroable};
 use objc2_metal::MTLSharedEvent as _;
 use rmlx_metal::event::GpuEvent;
 
@@ -63,7 +64,7 @@ impl RdmaOp {
 /// - length (4B): transfer size in bytes
 /// - _reserved (52B): padding to 64 bytes
 #[repr(C, align(64))]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 pub struct RdmaDescriptor {
     pub op: u8,
     pub peer_id: u8,
@@ -71,7 +72,10 @@ pub struct RdmaDescriptor {
     pub buf_slot: u8,
     pub offset: u32,
     pub length: u32,
-    pub _reserved: [u8; 52],
+    /// Padding split into Pod-compatible array sizes (32 + 16 + 4 = 52 bytes).
+    pub _reserved0: [u8; 32],
+    pub _reserved1: [u8; 16],
+    pub _reserved2: [u8; 4],
 }
 
 const _: () = {
@@ -96,7 +100,9 @@ impl RdmaDescriptor {
             buf_slot,
             offset,
             length,
-            _reserved: [0u8; 52],
+            _reserved0: [0u8; 32],
+            _reserved1: [0u8; 16],
+            _reserved2: [0u8; 4],
         }
     }
 
@@ -231,10 +237,12 @@ impl DescriptorRing {
             return None;
         }
         let idx = (self.tail as usize) % self.capacity;
-        let desc = unsafe {
-            let base = self.ring.as_ptr() as *const RdmaDescriptor;
-            std::ptr::read(base.add(idx))
-        };
+        let offset = idx * std::mem::size_of::<RdmaDescriptor>();
+        let end = offset + std::mem::size_of::<RdmaDescriptor>();
+        // SAFETY: SharedEvent signal/wait guarantees the GPU has finished writing
+        // before we read. The ring buffer is large enough (checked in DescriptorRing::new).
+        let slice = unsafe { std::slice::from_raw_parts(self.ring.as_ptr(), self.ring.size()) };
+        let desc = *bytemuck::from_bytes::<RdmaDescriptor>(&slice[offset..end]);
         self.tail = self.tail.wrapping_add(1);
         Some(desc)
     }

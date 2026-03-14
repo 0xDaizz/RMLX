@@ -15,7 +15,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
-use crate::qp::QpInfo;
+use crate::qp::{QpInfo, QP_INFO_WIRE_SIZE};
 use crate::RdmaError;
 
 /// Default port for the coordinator side-channel.
@@ -49,27 +49,6 @@ impl Default for CoordinatorConfig {
             io_timeout_secs: 60,
         }
     }
-}
-
-/// Serialized QpInfo wire size: lid(2) + qpn(4) + psn(4) + gid(16) = 26 bytes.
-const QP_INFO_WIRE_SIZE: usize = 2 + 4 + 4 + 16;
-
-fn serialize_qp_info(info: &QpInfo) -> [u8; QP_INFO_WIRE_SIZE] {
-    let mut buf = [0u8; QP_INFO_WIRE_SIZE];
-    buf[0..2].copy_from_slice(&info.lid.to_le_bytes());
-    buf[2..6].copy_from_slice(&info.qpn.to_le_bytes());
-    buf[6..10].copy_from_slice(&info.psn.to_le_bytes());
-    buf[10..26].copy_from_slice(&info.gid);
-    buf
-}
-
-fn deserialize_qp_info(buf: &[u8; QP_INFO_WIRE_SIZE]) -> QpInfo {
-    let lid = u16::from_le_bytes([buf[0], buf[1]]);
-    let qpn = u32::from_le_bytes([buf[2], buf[3], buf[4], buf[5]]);
-    let psn = u32::from_le_bytes([buf[6], buf[7], buf[8], buf[9]]);
-    let mut gid = [0u8; 16];
-    gid.copy_from_slice(&buf[10..26]);
-    QpInfo { lid, qpn, psn, gid }
 }
 
 /// Perform an all-gather of QpInfo across N ranks using rank 0 as hub.
@@ -166,7 +145,7 @@ fn hub_all_gather(
         stream.read_exact(&mut info_buf).map_err(|e| {
             RdmaError::ConnectionFailed(format!("coordinator read QpInfo from rank {r}: {e}"))
         })?;
-        let info = deserialize_qp_info(&info_buf);
+        let info = QpInfo::from_wire(info_buf);
 
         if (r as usize) >= gathered.len() {
             return Err(RdmaError::InvalidArgument(format!(
@@ -227,7 +206,7 @@ fn spoke_all_gather(
         .map_err(|e| RdmaError::ConnectionFailed(format!("spoke rank {rank} send rank: {e}")))?;
 
     // Send QpInfo
-    let info_buf = serialize_qp_info(local_info);
+    let info_buf = local_info.to_wire();
     stream
         .write_all(&info_buf)
         .map_err(|e| RdmaError::ConnectionFailed(format!("spoke rank {rank} send QpInfo: {e}")))?;
@@ -247,7 +226,7 @@ fn spoke_all_gather(
         stream.read_exact(&mut buf).map_err(|e| {
             RdmaError::ConnectionFailed(format!("spoke rank {rank} read QpInfo[{i}]: {e}"))
         })?;
-        result.push(deserialize_qp_info(&buf));
+        result.push(QpInfo::from_wire(buf));
     }
 
     Ok(result)
@@ -259,7 +238,7 @@ fn serialize_qp_info_vec(infos: &[QpInfo]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(4 + infos.len() * QP_INFO_WIRE_SIZE);
     buf.extend_from_slice(&count.to_le_bytes());
     for info in infos {
-        buf.extend_from_slice(&serialize_qp_info(info));
+        buf.extend_from_slice(&info.to_wire());
     }
     buf
 }
@@ -523,8 +502,8 @@ mod tests {
             psn: 0x5678,
             gid: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
         };
-        let buf = serialize_qp_info(&info);
-        let out = deserialize_qp_info(&buf);
+        let buf = info.to_wire();
+        let out = QpInfo::from_wire(buf);
         assert_eq!(out.lid, info.lid);
         assert_eq!(out.qpn, info.qpn);
         assert_eq!(out.psn, info.psn);

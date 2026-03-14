@@ -25,7 +25,9 @@
 //! from GPU compute output to RDMA wire transfer involves zero CPU copies.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
+
+use parking_lot::{Condvar, Mutex};
 use std::time::Duration;
 
 use objc2::runtime::ProtocolObject;
@@ -86,27 +88,18 @@ impl Default for SlabRingConfig {
 // ── SlabRingError ──
 
 /// Errors from slab ring operations.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum SlabRingError {
     /// Ring is full — all slabs are in use.
+    #[error("slab ring is full")]
     Full,
     /// Timeout waiting for a slab to become available.
+    #[error("slab ring timed out waiting for available slab")]
     Timeout,
     /// GPU event wait failed.
+    #[error("slab ring event error: {0}")]
     EventError(String),
 }
-
-impl std::fmt::Display for SlabRingError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Full => write!(f, "slab ring is full"),
-            Self::Timeout => write!(f, "slab ring timed out waiting for available slab"),
-            Self::EventError(e) => write!(f, "slab ring event error: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for SlabRingError {}
 
 impl From<EventError> for SlabRingError {
     fn from(e: EventError) -> Self {
@@ -253,13 +246,14 @@ impl SlabRing {
 
         // Slow path: ring is full, block on Condvar.
         self.ring_full_count.fetch_add(1, Ordering::Relaxed);
-        let guard = self.backpressure_lock.lock().unwrap();
+        let mut guard = self.backpressure_lock.lock();
         // Use wait_while with a predicate: stay blocked while the ring is full.
         // The mutex is held across both the fullness check and the wait, and
         // consumers acquire the same mutex before calling notify_one, so
         // notifications are never lost.
-        let _guard = self.not_full.wait_while(guard, |_| self.is_full()).unwrap();
+        self.not_full.wait_while(&mut guard, |_| self.is_full());
         // Ring is no longer full; claim a slot.
+        drop(guard);
         self.try_acquire_for_write()
     }
 
@@ -279,15 +273,14 @@ impl SlabRing {
 
         // Slow path: ring is full, block on Condvar with timeout.
         self.ring_full_count.fetch_add(1, Ordering::Relaxed);
-        let guard = self.backpressure_lock.lock().unwrap();
-        // Use wait_timeout_while with a predicate: stay blocked while full.
+        let mut guard = self.backpressure_lock.lock();
+        // Use wait_for with a predicate: stay blocked while full.
         // The mutex is held across both the fullness check and the wait, and
         // consumers acquire the same mutex before calling notify_one, so
         // notifications are never lost.
-        let (guard, wait_result) = self
+        let wait_result = self
             .not_full
-            .wait_timeout_while(guard, timeout, |_| self.is_full())
-            .unwrap();
+            .wait_while_for(&mut guard, |_| self.is_full(), timeout);
         drop(guard);
         if wait_result.timed_out() && self.is_full() {
             return Err(SlabRingError::Timeout);
@@ -348,7 +341,7 @@ impl SlabRing {
                     // would be lost. Holding the lock ensures the producer
                     // either (a) sees the updated consumer_pos before waiting,
                     // or (b) is already in wait() and receives the notification.
-                    let _guard = self.backpressure_lock.lock().unwrap();
+                    let _guard = self.backpressure_lock.lock();
                     self.not_full.notify_one();
                     return Some(&self.slabs[idx]);
                 }
@@ -382,7 +375,7 @@ impl SlabRing {
                     // Wake any blocked producer now that a slot is free.
                     // Hold backpressure_lock to prevent lost wakeups (see
                     // try_consume for detailed rationale).
-                    let _guard = self.backpressure_lock.lock().unwrap();
+                    let _guard = self.backpressure_lock.lock();
                     self.not_full.notify_one();
                     return Ok(&self.slabs[idx]);
                 }
@@ -402,7 +395,7 @@ impl SlabRing {
         // Wake any blocked producer as an extra safety net — the primary
         // notification happens inside try_consume/consume, but legacy callers
         // may expect release() to unblock producers.
-        let _guard = self.backpressure_lock.lock().unwrap();
+        let _guard = self.backpressure_lock.lock();
         self.not_full.notify_one();
     }
 

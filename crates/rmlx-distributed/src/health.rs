@@ -1,5 +1,7 @@
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use rustc_hash::FxHashMap;
+use std::sync::Arc;
+
+use parking_lot::RwLock;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
@@ -21,7 +23,7 @@ impl Default for HeartbeatConfig {
 
 #[derive(Debug)]
 struct HealthState {
-    last_seen: HashMap<u32, Instant>,
+    last_seen: FxHashMap<u32, Instant>,
     config: HeartbeatConfig,
 }
 
@@ -34,19 +36,19 @@ impl HealthMonitor {
     pub fn new(config: HeartbeatConfig) -> Self {
         Self {
             inner: Arc::new(RwLock::new(HealthState {
-                last_seen: HashMap::new(),
+                last_seen: FxHashMap::default(),
                 config,
             })),
         }
     }
 
     pub fn record_heartbeat(&self, peer_rank: u32) {
-        let mut state = self.inner.write().expect("health monitor lock poisoned");
+        let mut state = self.inner.write();
         state.last_seen.insert(peer_rank, Instant::now());
     }
 
     pub fn check_health(&self) -> Vec<u32> {
-        let state = self.inner.read().expect("health monitor lock poisoned");
+        let state = self.inner.read();
         let timeout = state.config.timeout;
         let now = Instant::now();
         let mut unhealthy: Vec<u32> = state
@@ -61,7 +63,7 @@ impl HealthMonitor {
     }
 
     pub fn is_healthy(&self, peer_rank: u32) -> bool {
-        let state = self.inner.read().expect("health monitor lock poisoned");
+        let state = self.inner.read();
         state
             .last_seen
             .get(&peer_rank)

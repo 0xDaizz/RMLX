@@ -1,6 +1,8 @@
 //! EP Runtime Context — unified hub connecting all async/zero-copy infrastructure.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLDevice;
@@ -290,11 +292,7 @@ impl EpRuntimeContext {
             return Ok((empty, empty2));
         }
 
-        let mut pool = self.shared_pool.lock().map_err(|e| {
-            crate::group::DistributedError::Transport(format!(
-                "failed to lock SharedBufferPool: {e}"
-            ))
-        })?;
+        let mut pool = self.shared_pool.lock();
 
         let mut send_bufs: Vec<Option<AcquiredBuffer>> = (0..world_size).map(|_| None).collect();
         let mut recv_bufs: Vec<Option<AcquiredBuffer>> = (0..world_size).map(|_| None).collect();
@@ -450,7 +448,7 @@ mod tests {
 
             // Both buffers are now in use.
             {
-                let mut locked = pool.lock().unwrap();
+                let mut locked = pool.lock();
                 assert!(
                     locked.acquire(4096).is_none(),
                     "pool should be exhausted while buffers are held"
@@ -464,7 +462,7 @@ mod tests {
 
         // After drop, buffers should be available again.
         {
-            let mut locked = pool.lock().unwrap();
+            let mut locked = pool.lock();
             assert!(
                 locked.acquire(4096).is_some(),
                 "pool should have buffers available after release"

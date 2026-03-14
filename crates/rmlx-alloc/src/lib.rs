@@ -38,7 +38,6 @@ pub enum AllocError {
         available: usize,
     },
     PoolExhausted,
-    MutexPoisoned,
     ZeroSize,
     /// A dtype-related error (e.g. quantized block misalignment).
     DType(String),
@@ -67,7 +66,6 @@ impl fmt::Display for AllocError {
                 )
             }
             Self::PoolExhausted => write!(f, "buffer pool exhausted"),
-            Self::MutexPoisoned => write!(f, "allocator mutex poisoned"),
             Self::ZeroSize => write!(f, "zero-size allocation is not allowed"),
             Self::DType(msg) => write!(f, "dtype error: {msg}"),
             Self::InvalidFree => write!(f, "attempted to free an unowned or already-freed buffer"),

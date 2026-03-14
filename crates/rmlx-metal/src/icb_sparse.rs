@@ -19,8 +19,9 @@
 //! using the maximum capacity. During replay, only experts with non-zero
 //! counts are encoded into the command buffer.
 
-use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+
+use rustc_hash::FxHashMap;
 
 use objc2::runtime::ProtocolObject;
 use objc2_metal::*;
@@ -387,7 +388,7 @@ pub struct SparseDispatchResult {
 /// Two invocations with the same set of active experts (same sparsity pattern)
 /// will produce the same hash, enabling ICB replay without re-encoding.
 fn compute_sparsity_hash(expert_counts: &[u32]) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut hasher = rustc_hash::FxHasher::default();
     for (i, &count) in expert_counts.iter().enumerate() {
         // Hash only the active/inactive status, not the exact count,
         // so that different token counts but same active set share a key.
@@ -465,7 +466,7 @@ pub fn grouped_forward_icb(
 /// share a cache entry.
 pub struct IcbReplayCache {
     /// Map from sparsity pattern hash -> cached dispatch result metadata.
-    cache: HashMap<u64, CachedSparsityPattern>,
+    cache: FxHashMap<u64, CachedSparsityPattern>,
     /// Maximum number of entries before eviction.
     max_entries: usize,
 }
@@ -485,7 +486,7 @@ impl IcbReplayCache {
     /// Create a new cache with the given maximum entry count.
     pub fn new(max_entries: usize) -> Self {
         Self {
-            cache: HashMap::new(),
+            cache: FxHashMap::default(),
             max_entries,
         }
     }
@@ -572,14 +573,14 @@ pub struct SparseExpertKey {
 /// Different MoE layers may share the same expert geometry (E, D, inter_dim).
 /// This cache avoids redundant plan building for layers with identical shapes.
 pub struct SparseExpertCache {
-    cache: HashMap<SparseExpertKey, SparseExpertPlan>,
+    cache: FxHashMap<SparseExpertKey, SparseExpertPlan>,
 }
 
 impl SparseExpertCache {
     /// Create an empty cache.
     pub fn new() -> Self {
         Self {
-            cache: HashMap::new(),
+            cache: FxHashMap::default(),
         }
     }
 
@@ -1107,7 +1108,7 @@ mod tests {
 
     #[test]
     fn sparse_expert_key_hash_consistency() {
-        use std::collections::hash_map::DefaultHasher;
+        use rustc_hash::FxHasher;
         use std::hash::{Hash, Hasher};
 
         let k1 = SparseExpertKey {
@@ -1117,8 +1118,8 @@ mod tests {
         };
         let k2 = k1.clone();
 
-        let mut h1 = DefaultHasher::new();
-        let mut h2 = DefaultHasher::new();
+        let mut h1 = FxHasher::default();
+        let mut h2 = FxHasher::default();
         k1.hash(&mut h1);
         k2.hash(&mut h2);
         assert_eq!(h1.finish(), h2.finish());

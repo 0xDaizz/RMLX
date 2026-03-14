@@ -441,7 +441,8 @@ pub fn blocking_exchange_v3(
     }
 
     // Build a lookup from dst_rank -> packet index for O(1) access
-    let mut packet_by_rank = std::collections::HashMap::with_capacity(send_packets.len());
+    let mut packet_by_rank =
+        rustc_hash::FxHashMap::with_capacity_and_hasher(send_packets.len(), Default::default());
     for (i, pkt) in send_packets.iter().enumerate() {
         packet_by_rank.insert(pkt.dst_rank, i);
     }
@@ -503,11 +504,12 @@ pub fn blocking_exchange_v3(
 mod tests {
     use super::*;
     use crate::group::RdmaTransport;
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
+    use parking_lot::Mutex;
+    use rustc_hash::FxHashMap;
+    use std::sync::Arc;
 
     /// Channel map type: (src_rank, dst_rank) -> queue of messages.
-    type ChannelMap = HashMap<(u32, u32), Vec<Vec<u8>>>;
+    type ChannelMap = FxHashMap<(u32, u32), Vec<Vec<u8>>>;
 
     /// A channel-based mock transport for testing pairwise exchange.
     ///
@@ -521,7 +523,7 @@ mod tests {
 
     impl MockTransport {
         fn new_pair(rank0: u32, rank1: u32) -> (Arc<Self>, Arc<Self>) {
-            let channels = Arc::new(Mutex::new(HashMap::new()));
+            let channels = Arc::new(Mutex::new(FxHashMap::default()));
             let t0 = Arc::new(Self {
                 rank: rank0,
                 channels: Arc::clone(&channels),
@@ -536,7 +538,7 @@ mod tests {
 
     impl RdmaTransport for MockTransport {
         fn send(&self, data: &[u8], dst_rank: u32) -> Result<(), DistributedError> {
-            let mut ch = self.channels.lock().unwrap();
+            let mut ch = self.channels.lock();
             ch.entry((self.rank, dst_rank))
                 .or_default()
                 .push(data.to_vec());
@@ -547,7 +549,7 @@ mod tests {
             // Spin-wait for data (with bounded retries for tests).
             for _ in 0..100_000 {
                 {
-                    let mut ch = self.channels.lock().unwrap();
+                    let mut ch = self.channels.lock();
                     let queue = ch.entry((src_rank, self.rank)).or_default();
                     if !queue.is_empty() {
                         let data = queue.remove(0);
