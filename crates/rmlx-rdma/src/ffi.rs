@@ -4,6 +4,7 @@
 //! libibverbs headers, we load functions at runtime using libloading.
 
 use bytemuck::{Pod, Zeroable};
+use libloading::os::unix::{Library as UnixLibrary, RTLD_GLOBAL, RTLD_NOW};
 use libloading::{Library, Symbol};
 use std::ffi::{c_char, c_int, c_void};
 use std::sync::OnceLock;
@@ -554,14 +555,21 @@ impl IbverbsLib {
             // Try short name first (works when librdma.dylib is on DYLD_LIBRARY_PATH or
             // in the dyld shared cache). Fall back to absolute path for macOS Big Sur+
             // where /usr/lib dylibs only exist in the shared cache.
-            let lib = Library::new("librdma.dylib")
+            // Use RTLD_NOW | RTLD_GLOBAL to match MLX/JACCL behavior.
+            // RTLD_LAZY | RTLD_LOCAL (libloading default) causes ibv_get_device_name()
+            // to hang on non-first devices on macOS.
+            let flags = RTLD_NOW | RTLD_GLOBAL;
+            let lib: Library = UnixLibrary::open(Some("librdma.dylib"), flags)
+                .map(Library::from)
                 .or_else(|e1| {
                     eprintln!("[rmlx-rdma] dlopen(librdma.dylib) failed: {e1}, trying /usr/lib/librdma.dylib");
-                    Library::new("/usr/lib/librdma.dylib")
+                    UnixLibrary::open(Some("/usr/lib/librdma.dylib"), flags)
+                        .map(Library::from)
                 })
                 .or_else(|e2| {
                     eprintln!("[rmlx-rdma] dlopen(/usr/lib/librdma.dylib) failed: {e2}, trying /usr/lib/rdma/libibverbs.dylib");
-                    Library::new("/usr/lib/rdma/libibverbs.dylib")
+                    UnixLibrary::open(Some("/usr/lib/rdma/libibverbs.dylib"), flags)
+                        .map(Library::from)
                 })?;
 
             // Helper macro to load a symbol with an explicit type
