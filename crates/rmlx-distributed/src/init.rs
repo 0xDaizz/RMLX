@@ -546,15 +546,17 @@ fn try_rdma_init(
             // data is silently dropped.  Barrier uses ring sendrecv internally,
             // ensuring every peer pair exchanges at least one message.
             || {
-                // Single barrier round to verify all QP paths are hot.
-                // In UC mode, barrier uses ring sendrecv internally,
-                // ensuring every peer pair exchanges at least one message.
-                // Kept minimal to reduce MR register/deregister churn.
-                eprintln!("[rdma-init] barrier warmup...");
-                group.barrier().map_err(|e| {
-                    format!("RDMA warmup barrier failed: {e}")
-                })?;
-                eprintln!("[rdma-init] barrier warmup OK");
+                // Multiple barrier rounds to synchronize rank timing (JACCL warmup pattern).
+                // UC mode drops packets if recv WR isn't posted before send arrives;
+                // repeated barriers ensure both sides converge to synchronized timing.
+                const WARMUP_ROUNDS: usize = 5;
+                for round in 0..WARMUP_ROUNDS {
+                    eprintln!("[rdma-init] warmup barrier round {round}/{WARMUP_ROUNDS}...");
+                    group.barrier().map_err(|e| {
+                        format!("RDMA warmup barrier round {round} failed: {e}")
+                    })?;
+                }
+                eprintln!("[rdma-init] warmup barriers done");
                 Ok(())
             },
             // JIT warmup: no-op (kernel registry is not available at init time;

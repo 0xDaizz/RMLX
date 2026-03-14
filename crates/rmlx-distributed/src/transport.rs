@@ -280,16 +280,14 @@ impl RdmaConnectionTransport {
                 rdma_to_distributed_enhanced(e, wr_id)
             })?;
             global_counters().record_rdma_transfer(chunk.len() as u64);
-            let op = conn
+            let _op = conn
                 .post_send(reg.mr(), 0, chunk.len() as u32, wr_id)
                 .map_err(|e| {
                     self.metrics.record_send_error();
                     rdma_to_distributed_enhanced(e, wr_id)
                 })?;
-            conn.wait_posted(&[op]).map_err(|e| {
-                self.metrics.record_send_error();
-                rdma_to_distributed_enhanced(e, wr_id)
-            })?;
+            // macOS TB5 RDMA driver bug: skip CQ polling.
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
 
         // Send secondary chunks: use secondary connection if available, else primary
@@ -309,16 +307,14 @@ impl RdmaConnectionTransport {
                 rdma_to_distributed_enhanced(e, wr_id)
             })?;
             global_counters().record_rdma_transfer(chunk.len() as u64);
-            let op = sec_conn
+            let _op = sec_conn
                 .post_send(reg.mr(), 0, chunk.len() as u32, wr_id)
                 .map_err(|e| {
                     self.metrics.record_send_error();
                     rdma_to_distributed_enhanced(e, wr_id)
                 })?;
-            sec_conn.wait_posted(&[op]).map_err(|e| {
-                self.metrics.record_send_error();
-                rdma_to_distributed_enhanced(e, wr_id)
-            })?;
+            // macOS TB5 RDMA driver bug: skip CQ polling.
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
 
         self.metrics.record_send(data.len() as u64);
@@ -423,19 +419,11 @@ impl RdmaConnectionTransport {
             secondary_ops.push(op);
         }
 
-        // Wait for all posted recvs on their respective connections
-        conn.wait_posted(&primary_ops).map_err(|e| {
-            self.metrics.record_recv_error();
-            rdma_to_distributed(e)
-        })?;
-        if self.secondary_connections.is_some() && !secondary_ops.is_empty() {
-            sec_conn.wait_posted(&secondary_ops).map_err(|e| {
-                self.metrics.record_recv_error();
-                rdma_to_distributed(e)
-            })?;
-        }
+        // macOS TB5 RDMA driver bug: ibv_poll_cq corrupts RQ state.
+        // Skip completion polling — sleep to let remote data arrive.
+        std::thread::sleep(std::time::Duration::from_millis(1));
 
-        // Drop ops and MRs now that all recvs completed
+        // Drop ops and MRs
         drop(primary_ops);
         drop(primary_mrs);
         drop(secondary_ops);
@@ -791,14 +779,12 @@ impl RdmaConnectionTransport {
 
         let wr_id = self.next_wr_id(dst_rank, ExchangeTag::Data, buf.slot_index());
         global_counters().record_rdma_transfer(len as u64);
-        let op = conn.post_send(mr, 0, len, wr_id).map_err(|e| {
+        let _op = conn.post_send(mr, 0, len, wr_id).map_err(|e| {
             self.metrics.record_send_error();
             rdma_to_distributed_enhanced(e, wr_id)
         })?;
-        conn.wait_posted(&[op]).map_err(|e| {
-            self.metrics.record_send_error();
-            rdma_to_distributed_enhanced(e, wr_id)
-        })?;
+        // macOS TB5 RDMA driver bug: skip CQ polling.
+        std::thread::sleep(std::time::Duration::from_millis(1));
 
         self.metrics.record_send(len as u64);
         Ok(())
@@ -827,14 +813,12 @@ impl RdmaConnectionTransport {
 
         let wr_id = self.next_wr_id(src_rank, ExchangeTag::Data, buf.slot_index());
         global_counters().record_rdma_transfer(len as u64);
-        let op = conn.post_recv(mr, 0, len, wr_id).map_err(|e| {
+        let _op = conn.post_recv(mr, 0, len, wr_id).map_err(|e| {
             self.metrics.record_recv_error();
             rdma_to_distributed_enhanced(e, wr_id)
         })?;
-        conn.wait_posted(&[op]).map_err(|e| {
-            self.metrics.record_recv_error();
-            rdma_to_distributed_enhanced(e, wr_id)
-        })?;
+        // macOS TB5 RDMA driver bug: skip CQ polling.
+        std::thread::sleep(std::time::Duration::from_millis(1));
 
         self.metrics.record_recv(len as u64);
         Ok(())
@@ -947,20 +931,9 @@ impl RdmaTransport for RdmaConnectionTransport {
 
         let wr_id = self.next_wr_id(dst_rank, ExchangeTag::Data, 0);
 
-        global_counters().record_mr_reg();
-        let reg = conn.register_send_slice(data).map_err(|e| {
-            self.metrics.record_send_error();
-            rdma_to_distributed_enhanced(e, wr_id)
-        })?;
-
+        // Use pre-registered buffer (no ibv_reg_mr on hot path)
         global_counters().record_rdma_transfer(data.len() as u64);
-        let op = conn
-            .post_send(reg.mr(), 0, data.len() as u32, wr_id)
-            .map_err(|e| {
-                self.metrics.record_send_error();
-                rdma_to_distributed_enhanced(e, wr_id)
-            })?;
-        conn.wait_posted(&[op]).map_err(|e| {
+        conn.send_buffered(data, wr_id).map_err(|e| {
             self.metrics.record_send_error();
             rdma_to_distributed_enhanced(e, wr_id)
         })?;
@@ -980,28 +953,19 @@ impl RdmaTransport for RdmaConnectionTransport {
 
         let wr_id = self.next_wr_id(src_rank, ExchangeTag::Data, 0);
 
-        let mut buf = vec![0u8; len];
-
-        global_counters().record_mr_reg();
-        let reg = conn.register_recv_slice(&mut buf).map_err(|e| {
-            self.metrics.record_recv_error();
-            rdma_to_distributed_enhanced(e, wr_id)
-        })?;
-
+        // Use pre-registered buffer (no ibv_reg_mr on hot path)
         global_counters().record_rdma_transfer(len as u64);
-        let op = conn
-            .post_recv(reg.mr(), 0, len as u32, wr_id)
-            .map_err(|e| {
-                self.metrics.record_recv_error();
-                rdma_to_distributed_enhanced(e, wr_id)
-            })?;
-        conn.wait_posted(&[op]).map_err(|e| {
+        conn.recv_buffered(len, wr_id).map_err(|e| {
             self.metrics.record_recv_error();
             rdma_to_distributed_enhanced(e, wr_id)
         })?;
+        // UC mode on macOS TB5: do NOT poll recv completion.
+        // Polling recv CQ corrupts the RQ, causing subsequent post_recv to block forever.
+        // Data arrives in the recv buffer regardless of completion status.
+        // We sleep briefly to allow the remote send to land.
+        std::thread::sleep(std::time::Duration::from_millis(1));
 
-        // Copy received data from aligned MR buffer back to recv buffer
-        reg.copy_back();
+        let buf = conn.read_recv_buf(len);
 
         self.metrics.record_recv(len as u64);
         Ok(buf)
@@ -1018,68 +982,54 @@ impl RdmaTransport for RdmaConnectionTransport {
         // UC mode requires recv to be posted before the matching send arrives,
         // otherwise data is silently dropped. Pattern: post_recv → post_send → wait(both).
         //
+        // Uses pre-registered send/recv buffers (JACCL SharedBuffer pattern)
+        // to avoid ibv_reg_mr / ibv_dereg_mr on every transfer.
+        //
         // When dst_rank == src_rank, use the same connection lock for both ops
         // to avoid deadlock (lock ordering).
         if dst_rank == src_rank {
             let conn = self.conn(dst_rank as usize);
-
-            // Prepare recv buffer and MR
-            let mut recv_buf = vec![0u8; recv_len];
             let recv_wr_id = self.next_wr_id(src_rank, ExchangeTag::Data, 0);
-            global_counters().record_mr_reg();
-            eprintln!("[sendrecv] rank={} registering recv MR...", self.local_rank);
-            let recv_reg = conn.register_recv_slice(&mut recv_buf).map_err(|e| {
+            let send_wr_id = self.next_wr_id(dst_rank, ExchangeTag::Data, 0);
+
+            // Post recv FIRST using pre-registered buffer (UC mode)
+            eprintln!(
+                "[sendrecv-buf] rank={} posting recv (wr_id={:#x})",
+                self.local_rank, recv_wr_id
+            );
+            global_counters().record_rdma_transfer(recv_len as u64);
+            conn.recv_buffered(recv_len, recv_wr_id).map_err(|e| {
                 self.metrics.record_recv_error();
                 rdma_to_distributed_enhanced(e, recv_wr_id)
             })?;
+            eprintln!("[sendrecv-buf] rank={} recv_buffered OK, proceeding to send", self.local_rank);
 
-            // Post recv FIRST (UC mode: must be ready before remote send)
-            global_counters().record_rdma_transfer(recv_len as u64);
-            eprintln!("[sendrecv] rank={} posting recv (wr_id={})...", self.local_rank, recv_wr_id);
-            let recv_op = conn
-                .post_recv(recv_reg.mr(), 0, recv_len as u32, recv_wr_id)
-                .map_err(|e| {
-                    self.metrics.record_recv_error();
-                    rdma_to_distributed_enhanced(e, recv_wr_id)
-                })?;
-            eprintln!("[sendrecv] rank={} recv posted, registering send MR...", self.local_rank);
-
-            // Prepare send MR
-            let send_wr_id = self.next_wr_id(dst_rank, ExchangeTag::Data, 0);
-            global_counters().record_mr_reg();
-            let send_reg = conn.register_send_slice(send_data).map_err(|e| {
+            // Post send using pre-registered buffer
+            eprintln!(
+                "[sendrecv-buf] rank={} posting send (wr_id={:#x}, len={})",
+                self.local_rank, send_wr_id, send_data.len()
+            );
+            global_counters().record_rdma_transfer(send_data.len() as u64);
+            conn.send_buffered(send_data, send_wr_id).map_err(|e| {
                 self.metrics.record_send_error();
                 rdma_to_distributed_enhanced(e, send_wr_id)
             })?;
 
-            // Post send
-            global_counters().record_rdma_transfer(send_data.len() as u64);
-            eprintln!("[sendrecv] rank={} posting send (wr_id={})...", self.local_rank, send_wr_id);
-            let send_op = conn
-                .post_send(send_reg.mr(), 0, send_data.len() as u32, send_wr_id)
-                .map_err(|e| {
-                    self.metrics.record_send_error();
-                    rdma_to_distributed_enhanced(e, send_wr_id)
-                })?;
-            eprintln!("[sendrecv] rank={} send posted, waiting completions...", self.local_rank);
-
-            // Wait for both completions
-            conn.wait_posted(&[recv_op, send_op]).map_err(|e| {
-                self.metrics.record_send_error();
-                self.metrics.record_recv_error();
-                rdma_to_distributed(e)
+            conn.wait_completions(&[send_wr_id, recv_wr_id]).map_err(|e| {
+                rdma_to_distributed_enhanced(e, send_wr_id)
             })?;
-            eprintln!("[sendrecv] rank={} completions done!", self.local_rank);
+            eprintln!(
+                "[sendrecv-buf] rank={} completions done",
+                self.local_rank
+            );
 
-            // Copy received data from aligned MR buffer back to recv buffer
-            recv_reg.copy_back();
-
-            // Drop registrations before moving recv_buf
-            drop(recv_reg);
-            drop(send_reg);
-
-            eprintln!("[sendrecv] rank={} recv data ({} bytes): {:02x?}",
-                self.local_rank, recv_buf.len().min(16), &recv_buf[..recv_buf.len().min(16)]);
+            let recv_buf = conn.read_recv_buf(recv_len);
+            eprintln!(
+                "[sendrecv-buf] rank={} recv data ({} bytes): {:02x?}",
+                self.local_rank,
+                recv_buf.len(),
+                &recv_buf[..recv_buf.len().min(64)]
+            );
 
             self.metrics.record_send(send_data.len() as u64);
             self.metrics.record_recv(recv_len as u64);
@@ -1100,56 +1050,49 @@ impl RdmaTransport for RdmaConnectionTransport {
                 (&*second_conn, &*first_conn)
             };
 
-            // Post recv FIRST on src connection
-            let mut recv_buf = vec![0u8; recv_len];
             let recv_wr_id = self.next_wr_id(src_rank, ExchangeTag::Data, 0);
-            global_counters().record_mr_reg();
-            let recv_reg = src_conn.register_recv_slice(&mut recv_buf).map_err(|e| {
-                self.metrics.record_recv_error();
-                rdma_to_distributed_enhanced(e, recv_wr_id)
-            })?;
-            global_counters().record_rdma_transfer(recv_len as u64);
-            let recv_op = src_conn
-                .post_recv(recv_reg.mr(), 0, recv_len as u32, recv_wr_id)
-                .map_err(|e| {
-                    self.metrics.record_recv_error();
-                    rdma_to_distributed_enhanced(e, recv_wr_id)
-                })?;
-
-            // Post send on dst connection
             let send_wr_id = self.next_wr_id(dst_rank, ExchangeTag::Data, 0);
-            global_counters().record_mr_reg();
-            let send_reg = dst_conn.register_send_slice(send_data).map_err(|e| {
-                self.metrics.record_send_error();
-                rdma_to_distributed_enhanced(e, send_wr_id)
-            })?;
-            global_counters().record_rdma_transfer(send_data.len() as u64);
-            let send_op = dst_conn
-                .post_send(send_reg.mr(), 0, send_data.len() as u32, send_wr_id)
-                .map_err(|e| {
-                    self.metrics.record_send_error();
-                    rdma_to_distributed_enhanced(e, send_wr_id)
-                })?;
 
-            // Wait for both completions on their respective connections
-            src_conn.wait_posted(&[recv_op]).map_err(|e| {
+            // Post recv FIRST on src connection using pre-registered buffer
+            eprintln!(
+                "[sendrecv-buf] rank={} posting recv (wr_id={:#x})",
+                self.local_rank, recv_wr_id
+            );
+            global_counters().record_rdma_transfer(recv_len as u64);
+            src_conn.recv_buffered(recv_len, recv_wr_id).map_err(|e| {
                 self.metrics.record_recv_error();
                 rdma_to_distributed_enhanced(e, recv_wr_id)
             })?;
-            dst_conn.wait_posted(&[send_op]).map_err(|e| {
+
+            // Post send on dst connection using pre-registered buffer
+            eprintln!(
+                "[sendrecv-buf] rank={} posting send (wr_id={:#x}, len={})",
+                self.local_rank, send_wr_id, send_data.len()
+            );
+            global_counters().record_rdma_transfer(send_data.len() as u64);
+            dst_conn.send_buffered(send_data, send_wr_id).map_err(|e| {
                 self.metrics.record_send_error();
                 rdma_to_distributed_enhanced(e, send_wr_id)
             })?;
 
-            // Copy received data from aligned MR buffer back to recv buffer
-            recv_reg.copy_back();
+            dst_conn.wait_completions(&[send_wr_id]).map_err(|e| {
+                rdma_to_distributed_enhanced(e, send_wr_id)
+            })?;
+            src_conn.wait_completions(&[recv_wr_id]).map_err(|e| {
+                rdma_to_distributed_enhanced(e, recv_wr_id)
+            })?;
+            eprintln!(
+                "[sendrecv-buf] rank={} completions done",
+                self.local_rank
+            );
 
-            // Drop registrations before moving recv_buf
-            drop(recv_reg);
-            drop(send_reg);
-
-            eprintln!("[sendrecv] rank={} recv data ({} bytes): {:02x?}",
-                self.local_rank, recv_buf.len().min(16), &recv_buf[..recv_buf.len().min(16)]);
+            let recv_buf = src_conn.read_recv_buf(recv_len);
+            eprintln!(
+                "[sendrecv-buf] rank={} recv data ({} bytes): {:02x?}",
+                self.local_rank,
+                recv_buf.len(),
+                &recv_buf[..recv_buf.len().min(64)]
+            );
 
             self.metrics.record_send(send_data.len() as u64);
             self.metrics.record_recv(recv_len as u64);

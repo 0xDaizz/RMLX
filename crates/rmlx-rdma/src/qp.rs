@@ -217,9 +217,9 @@ impl QueuePair {
     /// Query local port attributes and GID, populating local_info.
     ///
     /// Must be called before exchanging QP info with the remote peer.
-    /// PSN is computed as `rank * 1000 + 42` per TB5 convention.
+    /// PSN is fixed to 7 for JACCL compatibility.
     /// Uses probed GID index if available, otherwise falls back to `DEFAULT_GID_INDEX`.
-    pub fn query_local_info(&mut self, ctx: &RdmaContext, rank: u32) -> Result<(), RdmaError> {
+    pub fn query_local_info(&mut self, ctx: &RdmaContext, _rank: u32) -> Result<(), RdmaError> {
         let lib = self.lib;
         let gid_index = ctx
             .probe()
@@ -250,7 +250,8 @@ impl QueuePair {
         }
 
         self.local_info.lid = port_attr.lid;
-        self.local_info.psn = rank * 1000 + 42;
+        // JACCL compatible: all ranks use PSN=7
+        self.local_info.psn = 7;
         // SAFETY: IbvGid union's raw field is always valid to read.
         self.local_info.gid = unsafe { gid.raw };
         eprintln!("[qp] query_local_info: gid_index={gid_index}, lid={}, psn={}, qpn={}, gid={:02x?}", self.local_info.lid, self.local_info.psn, self.local_info.qpn, &self.local_info.gid);

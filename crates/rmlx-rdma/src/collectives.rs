@@ -290,8 +290,10 @@ pub fn ring_allreduce_typed<T: ReduceElement>(
             let send_op =
                 right.post_send(send_reg.mr(), 0, (send_len * elem_size) as u32, wr_id_send)?;
 
-            right.wait_posted(&[send_op])?;
-            left.wait_posted(&[recv_op])?;
+            // macOS TB5 RDMA driver bug: skip CQ polling.
+            drop(send_op);
+            drop(recv_op);
+            std::thread::sleep(std::time::Duration::from_millis(1));
 
             apply_reduce_op_typed(
                 &mut data[recv_offset..recv_offset + recv_len],
@@ -343,8 +345,10 @@ pub fn ring_allreduce_typed<T: ReduceElement>(
             let send_op =
                 right.post_send(send_reg.mr(), 0, (send_len * elem_size) as u32, wr_id_send)?;
 
-            right.wait_posted(&[send_op])?;
-            left.wait_posted(&[recv_op])?;
+            // macOS TB5 RDMA driver bug: skip CQ polling.
+            drop(send_op);
+            drop(recv_op);
+            std::thread::sleep(std::time::Duration::from_millis(1));
 
             data[recv_offset..recv_offset + recv_len]
                 .copy_from_slice(&recv_buf[recv_offset..recv_offset + recv_len]);
@@ -414,8 +418,10 @@ pub fn ring_allgather(
             let recv_op = left.post_recv(recv_reg.mr(), 0, local_chunk.len() as u32, wr_id_recv)?;
             let send_op = right.post_send(send_reg.mr(), 0, send_data.len() as u32, wr_id_send)?;
 
-            right.wait_posted(&[send_op])?;
-            left.wait_posted(&[recv_op])?;
+            // macOS TB5 RDMA driver bug: skip CQ polling.
+            drop(send_op);
+            drop(recv_op);
+            std::thread::sleep(std::time::Duration::from_millis(1));
 
             chunks[recv_idx] = recv_data;
         }
@@ -513,8 +519,10 @@ pub fn ring_reduce_scatter_typed<T: ReduceElement>(
             let send_op =
                 right.post_send(send_reg.mr(), 0, (send_len * elem_size) as u32, wr_id_send)?;
 
-            right.wait_posted(&[send_op])?;
-            left.wait_posted(&[recv_op])?;
+            // macOS TB5 RDMA driver bug: skip CQ polling.
+            drop(send_op);
+            drop(recv_op);
+            std::thread::sleep(std::time::Duration::from_millis(1));
 
             apply_reduce_op_typed(
                 &mut data[recv_offset..recv_offset + recv_len],
