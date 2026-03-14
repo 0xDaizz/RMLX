@@ -255,415 +255,9 @@ kernel void moe_gather_scatter(
 }
 "#;
 
-// ─── D14: Additional Metal compute kernels for MoE operations ───
-// These kernel sources are compiled at runtime via Metal JIT. They are
-// referenced by name in the Metal library, not directly called from Rust.
-
-/// Metal kernel: dispatch tokens to local experts only (no remote handling).
-///
-/// Simpler variant of moe_gather_scatter that skips the local_start/local_end
-/// check — all tokens are assumed to target local experts. Useful when the
-/// routing layer has already filtered to local-only tokens.
-#[allow(dead_code)]
-const METAL_DISPATCH_LOCAL_KERNEL: &str = r#"
-#include <metal_stdlib>
-using namespace metal;
-
-struct DispatchLocalParams {
-    uint batch_size;
-    uint top_k;
-    uint token_stride;
-    uint num_experts;
-    uint capacity_per_expert;
-};
-
-kernel void dispatch_local(
-    device const uchar*      token_data      [[buffer(0)]],
-    device const uint*        expert_indices  [[buffer(1)]],
-    device uchar*             output          [[buffer(2)]],
-    device atomic_uint*       cursors         [[buffer(3)]],
-    constant DispatchLocalParams& params      [[buffer(4)]],
-    uint2                     tid             [[thread_position_in_grid]])
-{
-    uint d = tid.x;
-    uint nk = tid.y;
-    if (d >= params.token_stride || nk >= params.batch_size * params.top_k) return;
-
-    uint batch_idx = nk / params.top_k;
-    uint k = nk % params.top_k;
-    uint flat_idx = batch_idx * params.top_k + k;
-    uint expert = expert_indices[flat_idx];
-    if (expert >= params.num_experts) return;
-
-    uint cursor = atomic_fetch_add_explicit(&cursors[expert], 1, memory_order_relaxed);
-    if (cursor >= params.capacity_per_expert) return;
-
-    uint src_offset = batch_idx * params.token_stride + d;
-    uint dst_offset = (expert * params.capacity_per_expert + cursor) * params.token_stride + d;
-    output[dst_offset] = token_data[src_offset];
-}
-"#;
-
-/// Metal kernel: scatter tokens destined for remote experts into per-peer buffers.
-///
-/// Each thread handles one byte of one token. Tokens targeting experts outside
-/// the local range [local_start, local_end) are scattered into peer-rank buffers
-/// using atomic cursors per destination rank.
-#[allow(dead_code)]
-const METAL_DISPATCH_SCATTER_REMOTE_KERNEL: &str = r#"
-#include <metal_stdlib>
-using namespace metal;
-
-struct ScatterRemoteParams {
-    uint batch_size;
-    uint top_k;
-    uint token_stride;
-    uint local_start;
-    uint local_end;
-    uint experts_per_rank;
-    uint world_size;
-    uint capacity_per_peer;
-};
-
-kernel void dispatch_scatter_remote(
-    device const uchar*      token_data       [[buffer(0)]],
-    device const uint*        expert_indices   [[buffer(1)]],
-    device uchar*             remote_output    [[buffer(2)]],
-    device atomic_uint*       peer_cursors     [[buffer(3)]],
-    constant ScatterRemoteParams& params       [[buffer(4)]],
-    uint2                     tid              [[thread_position_in_grid]])
-{
-    uint d = tid.x;
-    uint nk = tid.y;
-    if (d >= params.token_stride || nk >= params.batch_size * params.top_k) return;
-
-    uint batch_idx = nk / params.top_k;
-    uint k = nk % params.top_k;
-    uint flat_idx = batch_idx * params.top_k + k;
-    uint expert = expert_indices[flat_idx];
-
-    // Only handle remote experts
-    if (expert >= params.local_start && expert < params.local_end) return;
-
-    uint target_rank = expert / params.experts_per_rank;
-    if (target_rank >= params.world_size) return;
-
-    uint cursor = atomic_fetch_add_explicit(&peer_cursors[target_rank], 1, memory_order_relaxed);
-    if (cursor >= params.capacity_per_peer) return;
-
-    uint src_offset = batch_idx * params.token_stride + d;
-    uint dst_offset = (target_rank * params.capacity_per_peer + cursor) * params.token_stride + d;
-    remote_output[dst_offset] = token_data[src_offset];
-}
-"#;
-
-/// Metal kernel: gather remote expert results back into local buffer positions.
-///
-/// After RDMA receive, remote expert outputs are in per-peer receive buffers.
-/// This kernel gathers them into the correct positions in the combined output.
-#[allow(dead_code)]
-const METAL_COMBINE_GATHER_REMOTE_KERNEL: &str = r#"
-#include <metal_stdlib>
-using namespace metal;
-
-struct GatherRemoteParams {
-    uint batch_size;
-    uint top_k;
-    uint hidden_dim;
-    uint local_start;
-    uint local_end;
-    uint experts_per_rank;
-    uint world_size;
-    uint capacity_per_peer;
-};
-
-kernel void combine_gather_remote(
-    device const float*       remote_data      [[buffer(0)]],
-    device const uint*         expert_indices   [[buffer(1)]],
-    device const float*        weights          [[buffer(2)]],
-    device float*              output           [[buffer(3)]],
-    constant GatherRemoteParams& params         [[buffer(4)]],
-    uint2                      tid              [[thread_position_in_grid]])
-{
-    uint h = tid.x;
-    uint nk = tid.y;
-    if (h >= params.hidden_dim || nk >= params.batch_size * params.top_k) return;
-
-    uint batch_idx = nk / params.top_k;
-    uint k = nk % params.top_k;
-    uint flat_idx = batch_idx * params.top_k + k;
-    uint expert = expert_indices[flat_idx];
-
-    if (expert >= params.local_start && expert < params.local_end) return;
-
-    uint target_rank = expert / params.experts_per_rank;
-    if (target_rank >= params.world_size) return;
-
-    float w = weights[flat_idx];
-    // Read from remote receive buffer at the peer's segment
-    uint remote_offset = (target_rank * params.capacity_per_peer + batch_idx) * params.hidden_dim + h;
-    uint out_offset = batch_idx * params.hidden_dim + h;
-    output[out_offset] += w * remote_data[remote_offset];
-}
-"#;
-
-/// Metal kernel (D16): dual-source weighted combine in a single pass.
-///
-/// Combines results from two sources (local expert output + remote expert output)
-/// in one kernel dispatch, eliminating the O(N*D) intermediate copy that would
-/// be needed if local and remote were combined separately.
-#[allow(dead_code)]
-const METAL_COMBINE_WEIGHTED_SUM_DUAL_SRC_KERNEL: &str = r#"
-#include <metal_stdlib>
-using namespace metal;
-
-struct DualSrcCombineParams {
-    uint batch_size;
-    uint top_k;
-    uint hidden_dim;
-    uint num_experts;
-    uint local_start;
-    uint local_end;
-    uint local_expert_stride;
-    uint remote_expert_stride;
-};
-
-kernel void combine_weighted_sum_dual_src(
-    device const float*       local_data    [[buffer(0)]],
-    device const float*       remote_data   [[buffer(1)]],
-    device const float*       weights       [[buffer(2)]],
-    device const uint*         indices       [[buffer(3)]],
-    device float*              output        [[buffer(4)]],
-    constant DualSrcCombineParams& params    [[buffer(5)]],
-    uint2                      tid           [[thread_position_in_grid]])
-{
-    uint h = tid.x;
-    uint batch_idx = tid.y;
-    if (h >= params.hidden_dim || batch_idx >= params.batch_size) return;
-
-    float sum = 0.0f;
-    for (uint k = 0; k < params.top_k; k++) {
-        uint flat_idx = batch_idx * params.top_k + k;
-        uint expert = indices[flat_idx];
-        float w = weights[flat_idx];
-
-        if (expert >= params.local_start && expert < params.local_end) {
-            // Local source
-            uint local_expert = expert - params.local_start;
-            uint offset = local_expert * params.local_expert_stride + batch_idx * params.hidden_dim + h;
-            sum += w * local_data[offset];
-        } else if (expert < params.num_experts) {
-            // Remote source
-            uint offset = expert * params.remote_expert_stride + batch_idx * params.hidden_dim + h;
-            sum += w * remote_data[offset];
-        }
-    }
-    output[batch_idx * params.hidden_dim + h] = sum;
-}
-"#;
-
-/// Metal kernel: packet gather for RDMA-style batched token collection.
-///
-/// Gathers non-contiguous tokens into a contiguous packet buffer for
-/// efficient RDMA transfer. Each thread copies one byte.
-#[allow(dead_code)]
-const METAL_PACKET_GATHER_KERNEL: &str = r#"
-#include <metal_stdlib>
-using namespace metal;
-
-struct PacketGatherParams {
-    uint num_tokens;
-    uint token_stride;
-};
-
-kernel void packet_gather(
-    device const uchar*      src_data        [[buffer(0)]],
-    device const uint*        token_offsets   [[buffer(1)]],
-    device uchar*             packet_out      [[buffer(2)]],
-    constant PacketGatherParams& params       [[buffer(3)]],
-    uint2                     tid             [[thread_position_in_grid]])
-{
-    uint d = tid.x;
-    uint token_idx = tid.y;
-    if (d >= params.token_stride || token_idx >= params.num_tokens) return;
-
-    uint src_offset = token_offsets[token_idx] * params.token_stride + d;
-    uint dst_offset = token_idx * params.token_stride + d;
-    packet_out[dst_offset] = src_data[src_offset];
-}
-"#;
-
-/// Metal kernel: packet scatter for RDMA-style batched token placement.
-///
-/// Scatters tokens from a contiguous packet buffer into non-contiguous
-/// destination positions. Inverse of packet_gather.
-#[allow(dead_code)]
-const METAL_PACKET_SCATTER_KERNEL: &str = r#"
-#include <metal_stdlib>
-using namespace metal;
-
-struct PacketScatterParams {
-    uint num_tokens;
-    uint token_stride;
-};
-
-kernel void packet_scatter(
-    device const uchar*      packet_in       [[buffer(0)]],
-    device const uint*        token_offsets   [[buffer(1)]],
-    device uchar*             dst_data        [[buffer(2)]],
-    constant PacketScatterParams& params      [[buffer(3)]],
-    uint2                     tid             [[thread_position_in_grid]])
-{
-    uint d = tid.x;
-    uint token_idx = tid.y;
-    if (d >= params.token_stride || token_idx >= params.num_tokens) return;
-
-    uint src_offset = token_idx * params.token_stride + d;
-    uint dst_offset = token_offsets[token_idx] * params.token_stride + d;
-    dst_data[dst_offset] = packet_in[src_offset];
-}
-"#;
-
-// ─── D15: Multi-dtype MoE Metal kernels (f16/bf16 with f32 accumulation) ───
-
-/// Metal kernel: multi-dtype MoE gather/scatter with f16/bf16/f32 support.
-///
-/// Uses a type selector parameter to choose between f32, f16, and bf16.
-/// Half-precision types are accumulated in f32 for numerical stability.
-/// dtype_selector: 0 = f32, 1 = f16, 2 = bf16
-#[allow(dead_code)]
-const METAL_MULTI_DTYPE_GATHER_SCATTER_KERNEL: &str = r#"
-#include <metal_stdlib>
-using namespace metal;
-
-struct MultiDtypeRouteParams {
-    uint batch_size;
-    uint top_k;
-    uint hidden_dim;
-    uint local_start;
-    uint local_end;
-    uint capacity_per_expert;
-    uint local_expert_count;
-    uint world_size;
-    uint src_rank;
-    uint dtype_selector;  // 0=f32, 1=f16, 2=bf16
-};
-
-kernel void moe_gather_scatter_multi_dtype(
-    device const uchar*           token_data      [[buffer(0)]],
-    device const uint*             expert_indices  [[buffer(1)]],
-    device uchar*                  output          [[buffer(2)]],
-    device atomic_uint*            cursors         [[buffer(3)]],
-    constant MultiDtypeRouteParams& params         [[buffer(4)]],
-    uint2                          tid             [[thread_position_in_grid]])
-{
-    uint d = tid.x;
-    uint nk = tid.y;
-
-    uint bytes_per_elem = (params.dtype_selector == 0) ? 4 : 2;
-    uint token_stride = params.hidden_dim * bytes_per_elem;
-
-    if (d >= token_stride || nk >= params.batch_size * params.top_k) return;
-
-    uint batch_idx = nk / params.top_k;
-    uint k = nk % params.top_k;
-    uint flat_idx = batch_idx * params.top_k + k;
-    uint expert = expert_indices[flat_idx];
-
-    if (expert < params.local_start || expert >= params.local_end) return;
-
-    uint local_expert = expert - params.local_start;
-    uint cursor_idx = local_expert * params.world_size + params.src_rank;
-    uint cursor = atomic_fetch_add_explicit(&cursors[cursor_idx], 1, memory_order_relaxed);
-    if (cursor >= params.capacity_per_expert) return;
-
-    uint rank_cap = params.world_size * params.capacity_per_expert;
-    uint src_offset = batch_idx * token_stride + d;
-    uint flat_slot = local_expert * rank_cap + params.src_rank * params.capacity_per_expert + cursor;
-    uint dst_offset = flat_slot * token_stride + d;
-    output[dst_offset] = token_data[src_offset];
-}
-"#;
-
-/// Metal kernel: multi-dtype combine with f32 accumulation for half types.
-///
-/// For f16/bf16 expert outputs, promotes to f32 for weighted accumulation,
-/// then converts back to the target dtype. This ensures numerical precision
-/// even with many top-k contributions.
-#[allow(dead_code)]
-const METAL_MULTI_DTYPE_COMBINE_KERNEL: &str = r#"
-#include <metal_stdlib>
-using namespace metal;
-
-struct MultiDtypeCombineParams {
-    uint batch_size;
-    uint top_k;
-    uint hidden_dim;
-    uint num_experts;
-    uint expert_stride;
-    uint dtype_selector;  // 0=f32, 1=f16, 2=bf16
-};
-
-// bf16 helpers (Metal 3 natively supports bfloat, but for compatibility we use bit tricks)
-float bf16_to_float(ushort bits) {
-    uint fbits = uint(bits) << 16;
-    return as_type<float>(fbits);
-}
-
-ushort float_to_bf16(float val) {
-    uint fbits = as_type<uint>(val);
-    return ushort(fbits >> 16);
-}
-
-kernel void moe_combine_multi_dtype(
-    device const uchar*          expert_data   [[buffer(0)]],
-    device const float*          weights       [[buffer(1)]],
-    device const uint*            indices       [[buffer(2)]],
-    device uchar*                 output        [[buffer(3)]],
-    constant MultiDtypeCombineParams& params    [[buffer(4)]],
-    uint2                         tid           [[thread_position_in_grid]])
-{
-    uint h = tid.x;
-    uint batch_idx = tid.y;
-    if (h >= params.hidden_dim || batch_idx >= params.batch_size) return;
-
-    float sum = 0.0f;
-
-    for (uint k = 0; k < params.top_k; k++) {
-        uint flat_idx = batch_idx * params.top_k + k;
-        uint expert_idx = indices[flat_idx];
-        float w = weights[flat_idx];
-
-        if (expert_idx < params.num_experts) {
-            uint elem_offset = expert_idx * params.expert_stride + batch_idx * params.hidden_dim + h;
-
-            float val = 0.0f;
-            if (params.dtype_selector == 0) {
-                // f32
-                val = reinterpret_cast<device const float*>(expert_data)[elem_offset];
-            } else if (params.dtype_selector == 1) {
-                // f16
-                val = float(reinterpret_cast<device const half*>(expert_data)[elem_offset]);
-            } else {
-                // bf16
-                ushort bits = reinterpret_cast<device const ushort*>(expert_data)[elem_offset];
-                val = bf16_to_float(bits);
-            }
-            sum += w * val;
-        }
-    }
-
-    // Write back in target dtype
-    uint out_offset = batch_idx * params.hidden_dim + h;
-    if (params.dtype_selector == 0) {
-        reinterpret_cast<device float*>(output)[out_offset] = sum;
-    } else if (params.dtype_selector == 1) {
-        reinterpret_cast<device half*>(output)[out_offset] = half(sum);
-    } else {
-        reinterpret_cast<device ushort*>(output)[out_offset] = float_to_bf16(sum);
-    }
-}
-"#;
+// D14/D15/D16 Metal compute kernel sources were removed — they were never
+// referenced from Rust code. If needed in the future, they can be restored
+// from git history (commit that added this comment).
 
 /// Dtype selector for Metal multi-dtype kernels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1316,6 +910,8 @@ impl MoeDispatchExchange {
 
         // Create buffers using cached device
         let shared = rmlx_metal::MTLResourceOptions::StorageModeShared;
+        // SAFETY: token_data is a valid &[u8] slice; Metal copies bytes into
+        // the buffer, so the pointer does not need to outlive this call.
         let token_buf = unsafe {
             cached.device.newBufferWithBytes_length_options(
                 std::ptr::NonNull::new(token_data.as_ptr() as *mut std::ffi::c_void).unwrap(),
@@ -1324,6 +920,7 @@ impl MoeDispatchExchange {
             )
         }
         .unwrap();
+        // SAFETY: expert_indices is a valid &[u32] slice; same copy semantics.
         let indices_buf = unsafe {
             cached.device.newBufferWithBytes_length_options(
                 std::ptr::NonNull::new(expert_indices.as_ptr() as *mut std::ffi::c_void).unwrap(),
@@ -1338,11 +935,15 @@ impl MoeDispatchExchange {
             .unwrap();
         // Per-rank cursors: local_expert_count * world_size
         let cursor_count = local_expert_count * world_size;
+        let cursor_buf_byte_len = cursor_count.checked_mul(4).ok_or_else(|| {
+            DistributedError::Protocol(format!("cursor buffer size overflow: {cursor_count} * 4"))
+        })?;
         let cursor_data = vec![0u32; cursor_count];
+        // SAFETY: cursor_data is a valid Vec<u32>; Metal copies bytes.
         let cursor_buf = unsafe {
             cached.device.newBufferWithBytes_length_options(
                 std::ptr::NonNull::new(cursor_data.as_ptr() as *mut std::ffi::c_void).unwrap(),
-                (cursor_count * 4).max(4),
+                cursor_buf_byte_len.max(4),
                 shared,
             )
         }
@@ -1371,9 +972,11 @@ impl MoeDispatchExchange {
             world_size: world_size as u32,
             src_rank: src_rank as u32,
         };
+        // SAFETY: params is a valid #[repr(C)] struct on the stack; Metal copies
+        // the bytes before returning.
         let params_buf = unsafe {
             cached.device.newBufferWithBytes_length_options(
-                std::ptr::NonNull::new(&params as *const RouteParams as *mut std::ffi::c_void)
+                std::ptr::NonNull::new(std::ptr::addr_of!(params) as *mut std::ffi::c_void)
                     .unwrap(),
                 std::mem::size_of::<RouteParams>(),
                 shared,
@@ -1385,6 +988,8 @@ impl MoeDispatchExchange {
         let cmd_buf = cached.queue.commandBuffer().unwrap();
         let encoder = cmd_buf.computeCommandEncoder().unwrap();
         encoder.setComputePipelineState(&cached.pipeline);
+        // SAFETY: all buffers are valid MTLBuffers created above with matching
+        // sizes and types expected by the moe_gather_scatter Metal kernel.
         unsafe {
             encoder.setBuffer_offset_atIndex(Some(&token_buf), 0, 0);
             encoder.setBuffer_offset_atIndex(Some(&indices_buf), 0, 1);

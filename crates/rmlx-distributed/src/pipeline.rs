@@ -496,7 +496,9 @@ impl LayerPipeline {
                         true
                     } else if let Some(ref event) = self.transfer_event {
                         // Check if previous layer signaled transfer_event.
-                        // The signaled value >= layer means layer-1's transfer is done.
+                        // transfer_event uses monotonic next_value() signaling:
+                        // completing layer N signals value N+1 (via next_value()),
+                        // so signaledValue >= layer means layer-1's transfer is done.
                         event.raw().signaledValue() >= layer as u64
                     } else {
                         // No event chain — allow immediate start
@@ -541,9 +543,11 @@ impl LayerPipeline {
                         if let Some(ref ticket) = self.tickets[layer] {
                             ticket.mark_rdma_complete();
                         }
-                        // Signal transfer_event so the next layer can start
+                        // Signal transfer_event so the next layer can start.
+                        // Uses next_value() for monotonic signaling, consistent
+                        // with complete_async() and drive_pipeline_progress().
                         if let Some(ref event) = self.transfer_event {
-                            let val = (layer + 1) as u64;
+                            let val = event.next_value();
                             event.raw().setSignaledValue(val);
                         }
                         self.transfer_states[layer] = None;

@@ -15,6 +15,8 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
+use tracing::warn;
+
 use crate::qp::{QpInfo, QP_INFO_WIRE_SIZE};
 use crate::RdmaError;
 
@@ -174,7 +176,9 @@ fn hub_all_gather(
         stream
             .write_all(&full_payload)
             .map_err(|e| RdmaError::ConnectionFailed(format!("coordinator send gathered: {e}")))?;
-        stream.flush().ok();
+        if let Err(e) = stream.flush() {
+            warn!("TCP flush failed: {e}");
+        }
     }
 
     Ok(result)
@@ -364,7 +368,9 @@ fn hub_all_gather_bytes(
         stream.write_all(&full_payload).map_err(|e| {
             RdmaError::ConnectionFailed(format!("coordinator send gathered bytes: {e}"))
         })?;
-        stream.flush().ok();
+        if let Err(e) = stream.flush() {
+            warn!("TCP flush failed: {e}");
+        }
     }
 
     Ok(result)

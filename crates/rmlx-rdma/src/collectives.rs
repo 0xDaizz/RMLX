@@ -13,11 +13,13 @@
 //! CPU buffers and provide a simulated path for testing. When real RDMA
 //! connections are present, they use the RDMA send/recv path.
 
+#[allow(deprecated)]
 use crate::connection_manager::ConnectionManager;
 use crate::RdmaError;
 use half::{bf16, f16};
 
 /// Data types supported by the collective operations.
+#[deprecated(note = "use rmlx_distributed::group instead")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CollectiveDType {
     /// 32-bit floating point.
@@ -28,6 +30,7 @@ pub enum CollectiveDType {
     Bfloat16,
 }
 
+#[allow(deprecated)]
 impl CollectiveDType {
     /// Size of one element in bytes.
     pub fn element_size(&self) -> usize {
@@ -40,6 +43,7 @@ impl CollectiveDType {
 }
 
 /// Supported reduction operations for allreduce and reduce_scatter.
+#[deprecated(note = "use rmlx_distributed::group instead")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReduceOp {
     /// Element-wise sum.
@@ -60,6 +64,8 @@ pub enum ReduceOp {
 /// # Safety
 /// Implementors must be plain-old-data types with no padding bytes,
 /// valid for all bit patterns, and have size matching `CollectiveDType::element_size()`.
+#[deprecated(note = "use rmlx_distributed::group instead")]
+#[allow(deprecated)]
 pub unsafe trait ReduceElement: Copy + Default {
     /// The collective dtype tag for this type.
     const DTYPE: CollectiveDType;
@@ -73,6 +79,7 @@ pub unsafe trait ReduceElement: Copy + Default {
 
 // SAFETY: f32 is a primitive POD type with no padding, valid for all bit patterns,
 // and its size (4) matches CollectiveDType::Float32::element_size().
+#[allow(deprecated)]
 unsafe impl ReduceElement for f32 {
     const DTYPE: CollectiveDType = CollectiveDType::Float32;
 
@@ -89,6 +96,7 @@ unsafe impl ReduceElement for f32 {
 
 // SAFETY: f16 is a 2-byte POD type with no padding, valid for all bit patterns,
 // and its size (2) matches CollectiveDType::Float16::element_size().
+#[allow(deprecated)]
 unsafe impl ReduceElement for f16 {
     const DTYPE: CollectiveDType = CollectiveDType::Float16;
 
@@ -105,6 +113,7 @@ unsafe impl ReduceElement for f16 {
 
 // SAFETY: bf16 is a 2-byte POD type with no padding, valid for all bit patterns,
 // and its size (2) matches CollectiveDType::Bfloat16::element_size().
+#[allow(deprecated)]
 unsafe impl ReduceElement for bf16 {
     const DTYPE: CollectiveDType = CollectiveDType::Bfloat16;
 
@@ -122,6 +131,8 @@ unsafe impl ReduceElement for bf16 {
 /// Apply a reduction operation element-wise: `dst[i] = op(dst[i], src[i])`.
 ///
 /// Both slices must have the same length. Operates on `f32` elements.
+#[deprecated(note = "use rmlx_distributed::group instead")]
+#[allow(deprecated)]
 pub fn apply_reduce_op(dst: &mut [f32], src: &[f32], op: ReduceOp) {
     apply_reduce_op_typed(dst, src, op);
 }
@@ -131,6 +142,8 @@ pub fn apply_reduce_op(dst: &mut [f32], src: &[f32], op: ReduceOp) {
 /// Reduction is performed by converting to f32, applying the operation,
 /// and converting back. For f32 this is a no-op conversion. For f16/bf16
 /// this avoids precision issues with direct half-precision arithmetic.
+#[deprecated(note = "use rmlx_distributed::group instead")]
+#[allow(deprecated)]
 pub fn apply_reduce_op_typed<T: ReduceElement>(dst: &mut [T], src: &[T], op: ReduceOp) {
     debug_assert_eq!(dst.len(), src.len());
     match op {
@@ -161,6 +174,7 @@ pub fn apply_reduce_op_typed<T: ReduceElement>(dst: &mut [T], src: &[T], op: Red
 ///
 /// Returns a vector of (offset, length) pairs for each rank,
 /// where lengths differ by at most 1 element to handle non-divisible sizes.
+#[deprecated(note = "use rmlx_distributed::group instead")]
 pub fn chunk_boundaries(total_elements: usize, world_size: u32) -> Vec<(usize, usize)> {
     let n = world_size as usize;
     if n == 0 {
@@ -200,6 +214,8 @@ pub fn chunk_boundaries(total_elements: usize, world_size: u32) -> Vec<(usize, u
 /// # Returns
 /// The allreduced data as a new `Vec<f32>`. The input `data` is also
 /// modified in-place.
+#[deprecated(note = "use rmlx_distributed::group instead")]
+#[allow(deprecated)]
 pub fn ring_allreduce(
     mgr: &ConnectionManager,
     data: &mut [f32],
@@ -212,6 +228,8 @@ pub fn ring_allreduce(
 ///
 /// Works with f32, f16, and bf16. See [`ring_allreduce`] for the f32-specific
 /// convenience wrapper.
+#[deprecated(note = "use rmlx_distributed::group instead")]
+#[allow(deprecated)]
 pub fn ring_allreduce_typed<T: ReduceElement>(
     mgr: &ConnectionManager,
     data: &mut [T],
@@ -344,6 +362,8 @@ pub fn ring_allreduce_typed<T: ReduceElement>(
 ///
 /// The `local_chunk` is placed at position `rank` in the output.
 /// Returns a vector of all chunks, indexed by rank.
+#[deprecated(note = "use rmlx_distributed::group instead")]
+#[allow(deprecated)]
 pub fn ring_allgather(
     mgr: &ConnectionManager,
     local_chunk: &[u8],
@@ -419,6 +439,8 @@ pub fn ring_allgather(
 ///
 /// # Returns
 /// The reduced chunk assigned to this rank (a slice of the full reduced data).
+#[deprecated(note = "use rmlx_distributed::group instead")]
+#[allow(deprecated)]
 pub fn ring_reduce_scatter(
     mgr: &ConnectionManager,
     data: &mut [f32],
@@ -431,6 +453,8 @@ pub fn ring_reduce_scatter(
 ///
 /// Works with f32, f16, and bf16. See [`ring_reduce_scatter`] for the
 /// f32-specific convenience wrapper.
+#[deprecated(note = "use rmlx_distributed::group instead")]
+#[allow(deprecated)]
 pub fn ring_reduce_scatter_typed<T: ReduceElement>(
     mgr: &ConnectionManager,
     data: &mut [T],
@@ -506,6 +530,7 @@ pub fn ring_reduce_scatter_typed<T: ReduceElement>(
 }
 
 /// State of a pipelined ring buffer slot.
+#[deprecated(note = "use rmlx_distributed::group instead")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotState {
     /// Slot is available for use.
@@ -526,12 +551,15 @@ pub enum SlotState {
 /// This enables pipelining: while one chunk is being sent over RDMA,
 /// another can be reduced locally, and a third can be received — all
 /// using different buffer slots to avoid data hazards.
+#[deprecated(note = "use rmlx_distributed::group instead")]
+#[allow(deprecated)]
 pub struct PipelinedRingBuffer {
     slots: Vec<Vec<u8>>,
     states: Vec<SlotState>,
     slot_size: usize,
 }
 
+#[allow(deprecated)]
 impl PipelinedRingBuffer {
     /// Create a pipelined ring buffer with `n_slots` slots of `slot_size` bytes each.
     pub fn new(n_slots: usize, slot_size: usize) -> Self {
@@ -616,6 +644,10 @@ impl PipelinedRingBuffer {
 
 /// Pipelined ring allreduce that overlaps communication with reduction.
 ///
+/// NOTE: This function contains unique pipelining logic (PipelinedRingBuffer slot
+/// management for overlapping send/recv/reduce) not present in rmlx_distributed::group.
+/// If migrating, the pipeline slot machinery should be ported.
+///
 /// Splits the input data into pipeline-sized chunks and uses a
 /// [`PipelinedRingBuffer`] to manage buffer slots. This allows
 /// overlapping send, receive, and reduce operations across different
@@ -625,6 +657,8 @@ impl PipelinedRingBuffer {
 /// When no RDMA connections are present, performs local-only reduction
 /// using the pipelined buffer management (useful for testing the
 /// pipeline logic without hardware).
+#[deprecated(note = "use rmlx_distributed::group instead")]
+#[allow(deprecated)]
 pub fn pipelined_ring_allreduce(
     mgr: &ConnectionManager,
     data: &mut [f32],
@@ -647,9 +681,11 @@ pub fn pipelined_ring_allreduce(
     if mgr.left_connection().is_none() || mgr.right_connection().is_none() {
         let mut result = data.to_vec();
         for (chunk_idx, chunk) in data.chunks(chunk_size).enumerate() {
-            let (slot_id, recv_slot) = ring_buffer
-                .acquire_recv_slot()
-                .expect("pipelined_ring_allreduce: expected a free recv slot");
+            let (slot_id, recv_slot) = ring_buffer.acquire_recv_slot().ok_or_else(|| {
+                RdmaError::InvalidArgument(
+                    "pipelined_ring_allreduce: no free recv slot available".into(),
+                )
+            })?;
 
             for (i, value) in chunk.iter().enumerate() {
                 let byte_offset = i * std::mem::size_of::<f32>();
@@ -668,7 +704,11 @@ pub fn pipelined_ring_allreduce(
                     let byte_offset = i * std::mem::size_of::<f32>();
                     let bytes: [u8; 4] = reducing_slot[byte_offset..byte_offset + 4]
                         .try_into()
-                        .expect("reducing slot should contain full f32 bytes");
+                        .map_err(|_| {
+                            RdmaError::InvalidArgument(
+                                "reducing slot too short for f32 bytes".into(),
+                            )
+                        })?;
                     *out = f32::from_le_bytes(bytes);
                 }
             }
@@ -685,9 +725,11 @@ pub fn pipelined_ring_allreduce(
     // existing validated ring allreduce communication flow.
     let mut output = vec![0.0f32; data.len()];
     for (chunk_idx, chunk) in data.chunks(chunk_size).enumerate() {
-        let (slot_id, recv_slot) = ring_buffer
-            .acquire_recv_slot()
-            .expect("pipelined_ring_allreduce: expected a free recv slot");
+        let (slot_id, recv_slot) = ring_buffer.acquire_recv_slot().ok_or_else(|| {
+            RdmaError::InvalidArgument(
+                "pipelined_ring_allreduce: no free recv slot available".into(),
+            )
+        })?;
 
         for (i, value) in chunk.iter().enumerate() {
             let byte_offset = i * std::mem::size_of::<f32>();
@@ -703,7 +745,9 @@ pub fn pipelined_ring_allreduce(
                 let byte_offset = i * std::mem::size_of::<f32>();
                 let bytes: [u8; 4] = reducing_slot[byte_offset..byte_offset + 4]
                     .try_into()
-                    .expect("reducing slot should contain full f32 bytes");
+                    .map_err(|_| {
+                        RdmaError::InvalidArgument("reducing slot too short for f32 bytes".into())
+                    })?;
                 staged.push(f32::from_le_bytes(bytes));
             }
         }
@@ -720,6 +764,7 @@ pub fn pipelined_ring_allreduce(
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::multi_port::Topology;

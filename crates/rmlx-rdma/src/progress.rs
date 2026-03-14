@@ -86,7 +86,18 @@ impl PendingOp {
             return None;
         }
         // Result must be set before state transitions from PENDING.
-        Some(self.slot.result.get().expect("result must be set").clone())
+        // If state transitioned but result is not yet visible (should not happen
+        // due to Release/Acquire ordering), report an internal error rather than
+        // panicking.
+        match self.slot.result.get() {
+            Some(r) => Some(r.clone()),
+            None => Some(Err(OpError {
+                wr_id: self.wr_id,
+                status: u32::MAX,
+                status_str: "INTERNAL_ERROR",
+                vendor_err: 0,
+            })),
+        }
     }
 
     /// Returns true if the operation is still pending.
