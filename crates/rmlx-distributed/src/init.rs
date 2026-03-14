@@ -262,33 +262,15 @@ fn try_rdma_init(
         .unwrap_or(rmlx_rdma::coordinator::COORDINATOR_PORT);
 
     // Load device file for per-peer device selection.
-    // If no device file is provided, attempt automatic TB discovery and network setup.
     let device_map = load_device_map(config);
     eprintln!("[rdma-init] device_map loaded: {}", device_map.is_some());
-    let device_map = if device_map.is_none() {
-        eprintln!("[rdma-init] No device file — attempting auto_setup...");
-        match rmlx_rdma::auto_setup::try_auto_setup(rank, world_size, &coordinator_addr) {
-            Ok(dm) => {
-                eprintln!("[rdma-init] auto_setup OK — device map generated");
-                tracing::info!(
-                    target: "rmlx_distributed",
-                    "RDMA auto-setup completed — device map generated from TB discovery",
-                );
-                Some(dm)
-            }
-            Err(e) => {
-                eprintln!("[rdma-init] auto_setup FAILED: {e}");
-                tracing::warn!(
-                    target: "rmlx_distributed",
-                    %e,
-                    "RDMA auto-setup failed, continuing without device map",
-                );
-                None
-            }
-        }
-    } else {
-        device_map
-    };
+    if device_map.is_none() {
+        return Err(DistributedError::Config(
+            "RDMA device file required but not found. \
+             Run rdma_setup.py first, then set RMLX_IBV_DEVICES=<path>."
+                .to_string(),
+        ));
+    }
     if let Some(ref dm) = device_map {
         if dm.world_size() != world_size as usize {
             return Err(DistributedError::Config(format!(

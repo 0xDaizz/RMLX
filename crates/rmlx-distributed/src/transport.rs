@@ -959,11 +959,16 @@ impl RdmaTransport for RdmaConnectionTransport {
             self.metrics.record_recv_error();
             rdma_to_distributed_enhanced(e, wr_id)
         })?;
-        // UC mode on macOS TB5: do NOT poll recv completion.
-        // Polling recv CQ corrupts the RQ, causing subsequent post_recv to block forever.
-        // Data arrives in the recv buffer regardless of completion status.
-        // We sleep briefly to allow the remote send to land.
-        std::thread::sleep(std::time::Duration::from_millis(1));
+
+        // Wait for recv completion via CQ polling.
+        // Previously we skipped CQ polling due to a macOS TB5 driver bug where
+        // recv completions returned status=4 (LOC_PROT_ERR), corrupting the RQ.
+        // Root causes have since been fixed (MaybeUninit WR, MR registration in
+        // RESET state — commit 084bdce), and recv completions now return status=0.
+        // sendrecv() already polls CQ successfully for barrier/allgather.
+        conn.wait_completions(&[wr_id]).map_err(|e| {
+            rdma_to_distributed_enhanced(e, wr_id)
+        })?;
 
         let buf = conn.read_recv_buf(len);
 
