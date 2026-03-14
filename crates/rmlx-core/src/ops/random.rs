@@ -312,7 +312,7 @@ mod tests {
     use super::*;
 
     fn setup() -> (KernelRegistry, rmlx_metal::MtlQueue) {
-        let device = rmlx_metal::device::GpuDevice::system_default().expect("Metal device");
+        let device = crate::test_utils::test_gpu();
         let queue = device.raw().newCommandQueue().unwrap();
         let registry = KernelRegistry::new(device);
         register(&registry).expect("register random kernels");

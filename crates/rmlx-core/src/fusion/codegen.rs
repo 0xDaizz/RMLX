@@ -228,9 +228,7 @@ mod tests {
 
     fn test_device() -> &'static ProtocolObject<dyn MTLDevice> {
         static DEVICE: OnceLock<Retained<ProtocolObject<dyn MTLDevice>>> = OnceLock::new();
-        DEVICE.get_or_init(|| {
-            objc2_metal::MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests")
-        })
+        DEVICE.get_or_init(|| crate::test_utils::shared_metal_device())
     }
 
     #[test]

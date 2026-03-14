@@ -291,6 +291,28 @@ impl GpuDevice {
         })
     }
 
+    /// Create a `GpuDevice` wrapper from an already-obtained Metal device.
+    ///
+    /// This is useful in test code where a single `MTLCreateSystemDefaultDevice()`
+    /// result is shared via `OnceLock` to avoid concurrent device creation failures.
+    pub fn from_raw_device(device: MtlDevice) -> Self {
+        let device_name = device.name().to_string();
+        let arch = detect_architecture(&device_name);
+        let tuning = ChipTuning::for_device(&device);
+        let stream_manager = crate::stream::StreamManager::new(&device);
+        let max_buffer_length = device.maxBufferLength() as u64;
+        let max_threadgroup_memory = device.maxThreadgroupMemoryLength() as u64;
+
+        Self {
+            device,
+            arch,
+            tuning,
+            max_buffer_length,
+            max_threadgroup_memory,
+            stream_manager,
+        }
+    }
+
     /// Access the underlying Metal device.
     pub fn raw(&self) -> &ProtocolObject<dyn MTLDevice> {
         &self.device

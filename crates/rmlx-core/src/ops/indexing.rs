@@ -786,7 +786,7 @@ mod tests {
 
     /// Helper: set up device, queue, and kernel registry for tests.
     fn setup() -> (KernelRegistry, rmlx_metal::MtlQueue) {
-        let device = rmlx_metal::device::GpuDevice::system_default().expect("Metal device");
+        let device = crate::test_utils::test_gpu();
         let queue = device.new_command_queue();
         let registry = KernelRegistry::new(device);
         register(&registry).expect("register indexing kernels");

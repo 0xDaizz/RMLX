@@ -804,9 +804,9 @@ kernel void test_plain_kernel(
 }
 "#;
 
-    /// Helper: create a GpuDevice, returning None if Metal is unavailable.
+    /// Helper: create a GpuDevice from the shared Metal device.
     fn try_gpu_device() -> Option<GpuDevice> {
-        GpuDevice::system_default().ok()
+        Some(crate::test_utils::test_gpu())
     }
 
     #[test]

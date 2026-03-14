@@ -11013,7 +11013,7 @@ mod tests {
         Array,
         rmlx_metal::MtlQueue,
     ) {
-        let gpu_dev = rmlx_metal::device::GpuDevice::system_default().unwrap();
+        let gpu_dev = crate::test_utils::test_gpu();
         let queue = gpu_dev.new_command_queue();
         let registry = KernelRegistry::new(gpu_dev);
         register_gather_qmm(&registry).unwrap();
@@ -12316,13 +12316,7 @@ mod tests {
     #[test]
     fn test_nax_vs_cpu_reference_gpu_correctness() {
         // Skip if no GPU available
-        let gpu = match rmlx_metal::device::GpuDevice::system_default() {
-            Ok(g) => g,
-            Err(_) => {
-                eprintln!("Skipping test_nax_vs_cpu_reference_gpu_correctness: no GPU");
-                return;
-            }
-        };
+        let gpu = crate::test_utils::test_gpu();
         let registry = KernelRegistry::new(gpu);
         crate::ops::register_all(&registry).expect("register_all");
         let device = registry.device().raw();

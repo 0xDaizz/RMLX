@@ -36,3 +36,31 @@ pub use vjp::{AddGrad, GradFn, MatMulGrad, MulGrad, Operation, Tape, TapedValue,
 /// Set by build.rs at compile time.
 /// Empty string if Metal compiler was not available during build.
 pub const METALLIB_PATH: &str = env!("RMLX_METALLIB_PATH");
+
+/// Shared test utilities — provides a single Metal device via `OnceLock`
+/// to prevent concurrent `MTLCreateSystemDefaultDevice()` failures.
+#[cfg(test)]
+pub(crate) mod test_utils {
+    use rmlx_metal::device::GpuDevice;
+    use rmlx_metal::MtlDevice;
+    use std::sync::OnceLock;
+
+    /// Returns a shared raw Metal device, created exactly once across all tests.
+    pub fn shared_metal_device() -> MtlDevice {
+        static DEVICE: OnceLock<MtlDevice> = OnceLock::new();
+        DEVICE
+            .get_or_init(|| {
+                objc2_metal::MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests")
+            })
+            .clone()
+    }
+
+    /// Returns a fresh `GpuDevice` wrapper backed by the shared Metal device.
+    ///
+    /// Each call creates a new `GpuDevice` (with its own `StreamManager` etc.)
+    /// but they all share the same underlying `MTLDevice`, avoiding the
+    /// concurrent-creation crash.
+    pub fn test_gpu() -> GpuDevice {
+        GpuDevice::from_raw_device(shared_metal_device())
+    }
+}

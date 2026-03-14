@@ -389,7 +389,7 @@ mod tests {
     use super::*;
 
     fn setup() -> (KernelRegistry, rmlx_metal::MtlQueue) {
-        let gpu_dev = rmlx_metal::device::GpuDevice::system_default().unwrap();
+        let gpu_dev = crate::test_utils::test_gpu();
         let queue = gpu_dev.new_command_queue();
         let registry = KernelRegistry::new(gpu_dev);
         register(&registry).unwrap();
