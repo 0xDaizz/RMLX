@@ -16,6 +16,11 @@ use rmlx_core::ops;
 #[cfg(feature = "distributed")]
 use rmlx_distributed::group::{DistributedError, Group};
 
+#[cfg(feature = "distributed")]
+use objc2::runtime::ProtocolObject;
+#[cfg(feature = "distributed")]
+use objc2_metal::{MTLBuffer, MTLCommandQueue, MTLDevice, MTLResource, MTLResourceOptions};
+
 use crate::quantized_linear::{QuantBits, QuantizedLinear};
 
 /// Column-parallel linear layer (Megatron-LM style).
@@ -455,7 +460,7 @@ impl ColumnParallelLinear {
 
         // Reconstruct Array from interleaved bytes
         let result = array_from_raw_bytes(
-            input.metal_buffer().device(),
+            &*input.metal_buffer().device(),
             &interleaved,
             vec![batch, self.out_features],
             dtype,
@@ -616,16 +621,41 @@ impl RowParallelLinear {
         let local_out_arr = ops::matmul::matmul(registry, input, &w_t, queue)
             .map_err(|e| DistributedError::Protocol(format!("GPU matmul failed: {e}")))?;
 
-        let local_bytes = local_out_arr.to_bytes().to_vec();
+        // allreduce operates on f32 internally (add_f32_inplace) — cast f16→f32 if needed
+        // to avoid misinterpreting two f16 values as one f32.
+        let (local_for_reduce, reduce_dtype) = if dtype == DType::Float16 {
+            let f32_out = ops::copy::copy_cast(registry, &local_out_arr, DType::Float32, queue)
+                .map_err(|e| {
+                    DistributedError::Protocol(format!("f16→f32 cast for allreduce: {e}"))
+                })?;
+            (f32_out.to_bytes().to_vec(), DType::Float32)
+        } else {
+            (local_out_arr.to_bytes().to_vec(), dtype)
+        };
 
         // Allreduce sum across ranks → [batch, out_features]
-        let mut reduced = group.allreduce(&local_bytes)?;
+        let mut reduced = group.allreduce(&local_for_reduce)?;
 
         // Add bias after allreduce (all ranks have the same summed result)
+        // Bias is always added in the reduce dtype (f32 if we cast).
         if let Some(ref bias) = self.bias {
             let bias_data = bias.to_bytes();
-            match dtype {
-                DType::Float32 => add_bias_f32(&mut reduced, bias_data, batch, n),
+            match reduce_dtype {
+                DType::Float32 => {
+                    // If original was f16, bias is f16 — convert bias to f32 for addition
+                    if dtype == DType::Float16 {
+                        let bias_f32: Vec<u8> = bias_data
+                            .chunks_exact(2)
+                            .flat_map(|chunk| {
+                                let bits = u16::from_ne_bytes([chunk[0], chunk[1]]);
+                                f16_to_f32(bits).to_ne_bytes()
+                            })
+                            .collect();
+                        add_bias_f32(&mut reduced, &bias_f32, batch, n);
+                    } else {
+                        add_bias_f32(&mut reduced, bias_data, batch, n);
+                    }
+                }
                 DType::Float16 => add_bias_f16(&mut reduced, bias_data, batch, n),
                 _ => unreachable!(),
             }
@@ -633,12 +663,20 @@ impl RowParallelLinear {
 
         // Reconstruct Array from reduced bytes
         let result = array_from_raw_bytes(
-            input.metal_buffer().device(),
+            &*input.metal_buffer().device(),
             &reduced,
             vec![batch, n],
-            dtype,
+            reduce_dtype,
         );
-        Ok(result)
+
+        // Cast back to f16 if needed
+        if dtype == DType::Float16 && reduce_dtype == DType::Float32 {
+            ops::copy::copy_cast(registry, &result, DType::Float16, queue).map_err(|e| {
+                DistributedError::Protocol(format!("f32→f16 cast after allreduce: {e}"))
+            })
+        } else {
+            Ok(result)
+        }
     }
 }
 
@@ -740,7 +778,7 @@ impl QuantizedColumnParallelLinear {
         }
 
         let result = array_from_raw_bytes(
-            x.metal_buffer().device(),
+            &*x.metal_buffer().device(),
             &interleaved,
             vec![batch, full_out],
             dtype,
@@ -787,21 +825,37 @@ impl QuantizedRowParallelLinear {
             .map_err(|e| TpError(format!("quantized forward failed: {e}")))?;
 
         // 3. Allreduce sum across ranks
-        let local_bytes = local_out.to_bytes().to_vec();
-        let reduced = group
-            .allreduce(&local_bytes)
-            .map_err(|e| TpError(format!("allreduce failed: {e}")))?;
-
+        // allreduce operates on f32 internally (add_f32_inplace) — cast f16→f32 if needed
+        // to avoid misinterpreting two f16 values as one f32.
         let dtype = local_out.dtype();
         let batch = local_out.shape()[0];
         let out_features = self.ql.out_features();
+
+        let (local_for_reduce, reduce_dtype) = if dtype == DType::Float16 {
+            let f32_out = ops::copy::copy_cast(registry, &local_out, DType::Float32, queue)
+                .map_err(|e| TpError(format!("f16→f32 cast for allreduce: {e}")))?;
+            (f32_out.to_bytes().to_vec(), DType::Float32)
+        } else {
+            (local_out.to_bytes().to_vec(), dtype)
+        };
+
+        let reduced = group
+            .allreduce(&local_for_reduce)
+            .map_err(|e| TpError(format!("allreduce failed: {e}")))?;
+
+        // Reconstruct and cast back to f16 if needed
         let result = array_from_raw_bytes(
-            x.metal_buffer().device(),
+            &*x.metal_buffer().device(),
             &reduced,
             vec![batch, out_features],
-            dtype,
+            reduce_dtype,
         );
-        Ok(result)
+        if dtype == DType::Float16 && reduce_dtype == DType::Float32 {
+            ops::copy::copy_cast(registry, &result, DType::Float16, queue)
+                .map_err(|e| TpError(format!("f32→f16 cast after allreduce: {e}")))
+        } else {
+            Ok(result)
+        }
     }
 }
 
