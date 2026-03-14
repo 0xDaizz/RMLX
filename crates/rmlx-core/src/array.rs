@@ -936,12 +936,8 @@ pub fn broadcast_shape(
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn test_device() -> &'static objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice> {
-        use std::sync::OnceLock;
-        static DEVICE: OnceLock<rmlx_metal::MtlDevice> = OnceLock::new();
-        DEVICE.get_or_init(|| {
-            crate::test_utils::shared_metal_device().expect("Metal GPU required for tests")
-        })
+    fn test_device() -> Option<rmlx_metal::MtlDevice> {
+        crate::test_utils::shared_metal_device()
     }
 
     #[test]
@@ -990,11 +986,14 @@ mod tests {
 
     #[test]
     fn test_transpose_2d() {
+        let Some(dev) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         // Simulate a [3, 4] array with contiguous strides [4, 1]
         let arr = Array {
             buffer: ManuallyDrop::new(
-                test_device()
-                    .newBufferWithLength_options(48, MTLResourceOptions::StorageModeShared)
+                dev.newBufferWithLength_options(48, MTLResourceOptions::StorageModeShared)
                     .unwrap(),
             ),
             shape: vec![3, 4],
@@ -1009,10 +1008,13 @@ mod tests {
 
     #[test]
     fn test_transpose_3d() {
+        let Some(dev) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let arr = Array {
             buffer: ManuallyDrop::new(
-                test_device()
-                    .newBufferWithLength_options(96, MTLResourceOptions::StorageModeShared)
+                dev.newBufferWithLength_options(96, MTLResourceOptions::StorageModeShared)
                     .unwrap(),
             ),
             shape: vec![2, 3, 4],
@@ -1027,10 +1029,13 @@ mod tests {
 
     #[test]
     fn test_transpose_same_dim_is_noop() {
+        let Some(dev) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let arr = Array {
             buffer: ManuallyDrop::new(
-                test_device()
-                    .newBufferWithLength_options(48, MTLResourceOptions::StorageModeShared)
+                dev.newBufferWithLength_options(48, MTLResourceOptions::StorageModeShared)
                     .unwrap(),
             ),
             shape: vec![3, 4],
@@ -1045,10 +1050,13 @@ mod tests {
 
     #[test]
     fn test_transpose_out_of_range() {
+        let Some(dev) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let arr = Array {
             buffer: ManuallyDrop::new(
-                test_device()
-                    .newBufferWithLength_options(48, MTLResourceOptions::StorageModeShared)
+                dev.newBufferWithLength_options(48, MTLResourceOptions::StorageModeShared)
                     .unwrap(),
             ),
             shape: vec![3, 4],
@@ -1062,10 +1070,13 @@ mod tests {
 
     #[test]
     fn test_squeeze_dim() {
+        let Some(dev) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let arr = Array {
             buffer: ManuallyDrop::new(
-                test_device()
-                    .newBufferWithLength_options(48, MTLResourceOptions::StorageModeShared)
+                dev.newBufferWithLength_options(48, MTLResourceOptions::StorageModeShared)
                     .unwrap(),
             ),
             shape: vec![1, 3, 4],
@@ -1080,10 +1091,13 @@ mod tests {
 
     #[test]
     fn test_squeeze_dim_middle() {
+        let Some(dev) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let arr = Array {
             buffer: ManuallyDrop::new(
-                test_device()
-                    .newBufferWithLength_options(48, MTLResourceOptions::StorageModeShared)
+                dev.newBufferWithLength_options(48, MTLResourceOptions::StorageModeShared)
                     .unwrap(),
             ),
             shape: vec![3, 1, 4],
@@ -1098,10 +1112,13 @@ mod tests {
 
     #[test]
     fn test_squeeze_dim_non_one_fails() {
+        let Some(dev) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let arr = Array {
             buffer: ManuallyDrop::new(
-                test_device()
-                    .newBufferWithLength_options(48, MTLResourceOptions::StorageModeShared)
+                dev.newBufferWithLength_options(48, MTLResourceOptions::StorageModeShared)
                     .unwrap(),
             ),
             shape: vec![3, 4],
@@ -1114,9 +1131,12 @@ mod tests {
 
     #[test]
     fn test_view_ops_zero_copy() {
+        let Some(dev) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         // All view operations should share the same buffer
-        let dev = test_device();
-        let arr = Array::from_slice(dev, &[1.0f32; 12], vec![3, 4]);
+        let arr = Array::from_slice(&dev, &[1.0f32; 12], vec![3, 4]);
 
         let reshaped = arr.reshape(vec![4, 3]).unwrap();
         assert_eq!(

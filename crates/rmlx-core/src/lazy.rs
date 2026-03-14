@@ -893,23 +893,16 @@ pub fn topo_sort_bfs_width_limited(
 mod tests {
     use super::*;
     use crate::dtype::DType;
-    use objc2::rc::Retained;
-    use objc2::runtime::ProtocolObject;
-    use objc2_metal::MTLDevice;
-    use std::sync::OnceLock;
 
-    fn test_device() -> &'static ProtocolObject<dyn MTLDevice> {
-        static DEVICE: OnceLock<Retained<ProtocolObject<dyn MTLDevice>>> = OnceLock::new();
-        DEVICE.get_or_init(|| {
-            crate::test_utils::shared_metal_device().expect("Metal GPU required for tests")
-        })
+    fn test_device() -> Option<rmlx_metal::MtlDevice> {
+        crate::test_utils::shared_metal_device()
     }
 
     /// Minimal eval function for testing: uses Metal device to create output
     /// arrays of the correct shape. For Add/Mul/Sub it creates a zeros array
     /// (we only test the graph machinery, not GPU correctness).
     fn test_eval_fn(op: &LazyOp, inputs: Vec<&Array>) -> Result<Array, LazyEvalError> {
-        let dev = test_device();
+        let dev = test_device().ok_or_else(|| LazyEvalError::EvalFailed("no Metal GPU".into()))?;
 
         match op {
             LazyOp::Add(_, _) | LazyOp::Mul(_, _) | LazyOp::Sub(_, _) => {
@@ -917,14 +910,14 @@ mod tests {
                 let b = inputs[1];
                 let out_shape = crate::array::broadcast_shape(a.shape(), b.shape())
                     .map_err(|e| LazyEvalError::EvalFailed(e.to_string()))?;
-                Ok(Array::zeros(dev, &out_shape, a.dtype()))
+                Ok(Array::zeros(&dev, &out_shape, a.dtype()))
             }
             LazyOp::MatMul(_, _) => {
                 let a = inputs[0];
                 let b = inputs[1];
                 let m = a.shape()[a.ndim() - 2];
                 let n = b.shape()[b.ndim() - 1];
-                Ok(Array::zeros(dev, &[m, n], a.dtype()))
+                Ok(Array::zeros(&dev, &[m, n], a.dtype()))
             }
             LazyOp::Neg(_)
             | LazyOp::Softmax(_)
@@ -932,7 +925,7 @@ mod tests {
             | LazyOp::Copy(_)
             | LazyOp::RmsNorm(_) => {
                 let a = inputs[0];
-                Ok(Array::zeros(dev, a.shape(), a.dtype()))
+                Ok(Array::zeros(&dev, a.shape(), a.dtype()))
             }
             LazyOp::Custom(_, _) => Err(LazyEvalError::EvalFailed(
                 "custom op not supported in test".into(),
@@ -942,9 +935,12 @@ mod tests {
 
     #[test]
     fn test_materialized_leaf() {
-        let dev = test_device();
+        let Some(dev) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let graph = LazyGraph::new();
-        let arr = Array::zeros(dev, &[2, 3], DType::Float32);
+        let arr = Array::zeros(&dev, &[2, 3], DType::Float32);
         let lazy = LazyArray::from_array(&graph, arr);
 
         assert!(lazy.is_materialized());
@@ -958,11 +954,14 @@ mod tests {
 
     #[test]
     fn test_lazy_add_eval() {
-        let dev = test_device();
+        let Some(dev) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let graph = LazyGraph::new();
 
-        let a = LazyArray::from_array(&graph, Array::zeros(dev, &[4], DType::Float32));
-        let b = LazyArray::from_array(&graph, Array::zeros(dev, &[4], DType::Float32));
+        let a = LazyArray::from_array(&graph, Array::zeros(&dev, &[4], DType::Float32));
+        let b = LazyArray::from_array(&graph, Array::zeros(&dev, &[4], DType::Float32));
         let c = a.add(&b).unwrap();
 
         assert!(!c.is_materialized());
@@ -979,14 +978,17 @@ mod tests {
     #[test]
     fn test_chained_operations() {
         // a + b -> c, c * d -> e, eval(e) should materialize everything
-        let dev = test_device();
+        let Some(dev) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let graph = LazyGraph::new();
 
-        let a = LazyArray::from_array(&graph, Array::zeros(dev, &[3], DType::Float32));
-        let b = LazyArray::from_array(&graph, Array::zeros(dev, &[3], DType::Float32));
+        let a = LazyArray::from_array(&graph, Array::zeros(&dev, &[3], DType::Float32));
+        let b = LazyArray::from_array(&graph, Array::zeros(&dev, &[3], DType::Float32));
         let c = a.add(&b).unwrap();
 
-        let d = LazyArray::from_array(&graph, Array::zeros(dev, &[3], DType::Float32));
+        let d = LazyArray::from_array(&graph, Array::zeros(&dev, &[3], DType::Float32));
         let e = c.mul(&d).unwrap();
 
         assert!(!c.is_materialized());
@@ -1003,10 +1005,13 @@ mod tests {
     fn test_diamond_dag() {
         // a -> b = neg(a), c = neg(a), d = b + c
         // Tests that shared inputs are evaluated only once.
-        let dev = test_device();
+        let Some(dev) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let graph = LazyGraph::new();
 
-        let a = LazyArray::from_array(&graph, Array::zeros(dev, &[5], DType::Float32));
+        let a = LazyArray::from_array(&graph, Array::zeros(&dev, &[5], DType::Float32));
         let b = a.neg();
         let c = a.neg();
         let d = b.add(&c).unwrap();
@@ -1019,9 +1024,12 @@ mod tests {
 
     #[test]
     fn test_already_materialized_passthrough() {
-        let dev = test_device();
+        let Some(dev) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let graph = LazyGraph::new();
-        let arr = Array::zeros(dev, &[2, 2], DType::Float32);
+        let arr = Array::zeros(&dev, &[2, 2], DType::Float32);
         let lazy = LazyArray::from_array(&graph, arr);
 
         // eval_fn should never be called for a leaf
@@ -1033,11 +1041,14 @@ mod tests {
 
     #[test]
     fn test_shape_mismatch_error() {
-        let dev = test_device();
+        let Some(dev) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let graph = LazyGraph::new();
 
-        let a = LazyArray::from_array(&graph, Array::zeros(dev, &[3], DType::Float32));
-        let b = LazyArray::from_array(&graph, Array::zeros(dev, &[5], DType::Float32));
+        let a = LazyArray::from_array(&graph, Array::zeros(&dev, &[3], DType::Float32));
+        let b = LazyArray::from_array(&graph, Array::zeros(&dev, &[5], DType::Float32));
 
         let result = a.add(&b);
         assert!(result.is_err());
@@ -1049,29 +1060,35 @@ mod tests {
 
     #[test]
     fn test_matmul_shape_validation() {
-        let dev = test_device();
+        let Some(dev) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let graph = LazyGraph::new();
 
-        let a = LazyArray::from_array(&graph, Array::zeros(dev, &[2, 3], DType::Float32));
-        let b = LazyArray::from_array(&graph, Array::zeros(dev, &[3, 4], DType::Float32));
+        let a = LazyArray::from_array(&graph, Array::zeros(&dev, &[2, 3], DType::Float32));
+        let b = LazyArray::from_array(&graph, Array::zeros(&dev, &[3, 4], DType::Float32));
         let c = a.matmul(&b).unwrap();
         assert_eq!(c.shape(), vec![2, 4]);
 
         // Incompatible inner dims
-        let d = LazyArray::from_array(&graph, Array::zeros(dev, &[5, 4], DType::Float32));
+        let d = LazyArray::from_array(&graph, Array::zeros(&dev, &[5, 4], DType::Float32));
         assert!(a.matmul(&d).is_err());
 
         // 1D arrays should fail
-        let e = LazyArray::from_array(&graph, Array::zeros(dev, &[3], DType::Float32));
+        let e = LazyArray::from_array(&graph, Array::zeros(&dev, &[3], DType::Float32));
         assert!(a.matmul(&e).is_err());
     }
 
     #[test]
     fn test_eval_error_propagation() {
-        let dev = test_device();
+        let Some(dev) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let graph = LazyGraph::new();
 
-        let a = LazyArray::from_array(&graph, Array::zeros(dev, &[4], DType::Float32));
+        let a = LazyArray::from_array(&graph, Array::zeros(&dev, &[4], DType::Float32));
         let b = a.neg();
 
         let failing_fn = |_: &LazyOp, _: Vec<&Array>| -> Result<Array, LazyEvalError> {
@@ -1090,16 +1107,19 @@ mod tests {
 
     #[test]
     fn test_graph_node_count() {
-        let dev = test_device();
+        let Some(dev) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let graph = LazyGraph::new();
 
         assert!(graph.is_empty());
         assert_eq!(graph.len(), 0);
 
-        let a = LazyArray::from_array(&graph, Array::zeros(dev, &[4], DType::Float32));
+        let a = LazyArray::from_array(&graph, Array::zeros(&dev, &[4], DType::Float32));
         assert_eq!(graph.len(), 1);
 
-        let b = LazyArray::from_array(&graph, Array::zeros(dev, &[4], DType::Float32));
+        let b = LazyArray::from_array(&graph, Array::zeros(&dev, &[4], DType::Float32));
         assert_eq!(graph.len(), 2);
 
         let _c = a.add(&b).unwrap();
@@ -1108,9 +1128,12 @@ mod tests {
 
     #[test]
     fn test_debug_format() {
-        let dev = test_device();
+        let Some(dev) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let graph = LazyGraph::new();
-        let lazy = LazyArray::from_array(&graph, Array::zeros(dev, &[2], DType::Float32));
+        let lazy = LazyArray::from_array(&graph, Array::zeros(&dev, &[2], DType::Float32));
         let dbg = format!("{:?}", lazy);
         assert!(dbg.contains("LazyArray"));
         assert!(dbg.contains("materialized"));
