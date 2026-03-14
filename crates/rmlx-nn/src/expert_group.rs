@@ -733,27 +733,27 @@ mod tests {
 
     use std::sync::OnceLock;
 
-    fn test_device() -> &'static rmlx_metal::MtlDevice {
-        static DEVICE: OnceLock<rmlx_metal::MtlDevice> = OnceLock::new();
-        DEVICE.get_or_init(|| {
-            objc2::rc::autoreleasepool(|_| {
-                objc2_metal::MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests")
+    fn test_device() -> Option<&'static rmlx_metal::MtlDevice> {
+        static DEVICE: OnceLock<Option<rmlx_metal::MtlDevice>> = OnceLock::new();
+        DEVICE
+            .get_or_init(|| {
+                objc2::rc::autoreleasepool(|_| objc2_metal::MTLCreateSystemDefaultDevice())
             })
-        })
+            .as_ref()
     }
 
     /// Create a test `KernelRegistry` with all kernels registered.
-    fn test_registry() -> (
+    fn test_registry() -> Option<(
         &'static rmlx_metal::MtlDevice,
         rmlx_metal::MtlQueue,
         KernelRegistry,
-    ) {
-        let device = test_device();
-        let gpu = rmlx_metal::device::GpuDevice::system_default().expect("GPU device required");
+    )> {
+        let device = test_device()?;
+        let gpu = rmlx_metal::device::GpuDevice::system_default().ok()?;
         let queue = gpu.new_command_queue();
         let registry = KernelRegistry::new(gpu);
         rmlx_core::ops::register_all(&registry).expect("register kernels");
-        (device, queue, registry)
+        Some((device, queue, registry))
     }
 
     /// Create a test expert with known weight values.
@@ -814,7 +814,10 @@ mod tests {
 
     #[test]
     fn test_from_experts_basic() {
-        let (device, queue, registry) = test_registry();
+        let Some((device, queue, registry)) = test_registry() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let hidden_dim = 8;
         let intermediate_dim = 4;
 
@@ -843,7 +846,10 @@ mod tests {
 
     #[test]
     fn test_from_experts_empty() {
-        let (_device, queue, registry) = test_registry();
+        let Some((_device, queue, registry)) = test_registry() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let experts: Vec<Expert> = vec![];
         let result = ExpertGroup::from_experts(&experts, &registry, &queue);
         assert!(result.is_err());
@@ -851,7 +857,10 @@ mod tests {
 
     #[test]
     fn test_grouped_forward_empty_inputs() {
-        let (device, queue, registry) = test_registry();
+        let Some((device, queue, registry)) = test_registry() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let experts = vec![
             make_expert(device, 8, 4, 0.1),
             make_expert(device, 8, 4, 0.2),
@@ -865,7 +874,10 @@ mod tests {
 
     #[test]
     fn test_grouped_forward_single_expert() {
-        let (device, queue, registry) = test_registry();
+        let Some((device, queue, registry)) = test_registry() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let hidden_dim = 8;
         let intermediate_dim = 4;
 
@@ -888,7 +900,10 @@ mod tests {
 
     #[test]
     fn test_grouped_forward_multiple_experts() {
-        let (device, queue, registry) = test_registry();
+        let Some((device, queue, registry)) = test_registry() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let hidden_dim = 8;
         let intermediate_dim = 4;
 
@@ -917,7 +932,10 @@ mod tests {
 
     #[test]
     fn test_grouped_forward_matches_individual() {
-        let (device, queue, registry) = test_registry();
+        let Some((device, queue, registry)) = test_registry() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let hidden_dim = 8;
         let intermediate_dim = 4;
 
@@ -964,7 +982,10 @@ mod tests {
 
     #[test]
     fn test_grouped_forward_invalid_expert_idx() {
-        let (device, queue, registry) = test_registry();
+        let Some((device, queue, registry)) = test_registry() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let experts = vec![make_expert(device, 8, 4, 0.1)];
         let group = ExpertGroup::from_experts(&experts, &registry, &queue).unwrap();
 
@@ -976,7 +997,10 @@ mod tests {
 
     #[test]
     fn test_grouped_forward_dimension_mismatch() {
-        let (device, queue, registry) = test_registry();
+        let Some((device, queue, registry)) = test_registry() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let experts = vec![make_expert(device, 8, 4, 0.1)];
         let group = ExpertGroup::from_experts(&experts, &registry, &queue).unwrap();
 
@@ -988,7 +1012,10 @@ mod tests {
 
     #[test]
     fn test_weight_stacking_values() {
-        let (device, queue, registry) = test_registry();
+        let Some((device, queue, registry)) = test_registry() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let hidden_dim = 4;
         let intermediate_dim = 2;
 

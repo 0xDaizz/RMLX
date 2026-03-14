@@ -1151,13 +1151,13 @@ mod tests {
     use crate::group::{DistributedError, Group, RdmaTransport};
     use std::sync::{Arc, Mutex, OnceLock};
 
-    fn test_device() -> &'static rmlx_metal::MtlDevice {
-        static DEVICE: OnceLock<rmlx_metal::MtlDevice> = OnceLock::new();
-        DEVICE.get_or_init(|| {
-            objc2::rc::autoreleasepool(|_| {
-                objc2_metal::MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests")
+    fn test_device() -> Option<&'static rmlx_metal::MtlDevice> {
+        static DEVICE: OnceLock<Option<rmlx_metal::MtlDevice>> = OnceLock::new();
+        DEVICE
+            .get_or_init(|| {
+                objc2::rc::autoreleasepool(|_| objc2_metal::MTLCreateSystemDefaultDevice())
             })
-        })
+            .as_ref()
     }
 
     /// A mock transport that records calls for testing.
@@ -1293,7 +1293,10 @@ mod tests {
         use rmlx_rdma::progress::ProgressEngine;
         use rmlx_rdma::shared_buffer::SharedBuffer;
 
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let buf = match SharedBuffer::new(device, 4096, 0) {
             Ok(b) => b,
             Err(_) => return, // skip if alloc fails
@@ -1333,7 +1336,10 @@ mod tests {
         use rmlx_rdma::progress::ProgressEngine;
         use rmlx_rdma::shared_buffer::SharedBuffer;
 
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let buf = match SharedBuffer::new(device, 4096, 0) {
             Ok(b) => b,
             Err(_) => return,

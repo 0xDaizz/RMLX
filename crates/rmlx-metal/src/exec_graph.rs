@@ -715,18 +715,19 @@ mod tests {
     use super::*;
     use std::sync::OnceLock;
 
-    fn test_device() -> &'static MtlDevice {
-        static DEVICE: OnceLock<MtlDevice> = OnceLock::new();
-        DEVICE.get_or_init(|| {
-            objc2::rc::autoreleasepool(|_| {
-                MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests")
-            })
-        })
+    fn test_device() -> Option<&'static MtlDevice> {
+        static DEVICE: OnceLock<Option<MtlDevice>> = OnceLock::new();
+        DEVICE
+            .get_or_init(|| objc2::rc::autoreleasepool(|_| MTLCreateSystemDefaultDevice()))
+            .as_ref()
     }
 
     #[test]
     fn exec_graph_basic_lifecycle() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let queue = device.newCommandQueue().unwrap();
         let event = GpuEvent::new(device);
         let graph = ExecGraph::new(&queue, &event, 32);
@@ -737,7 +738,10 @@ mod tests {
 
     #[test]
     fn exec_graph_submit_batch() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let queue = device.newCommandQueue().unwrap();
         let event = GpuEvent::new(device);
         let mut graph = ExecGraph::new(&queue, &event, 32);
@@ -755,7 +759,10 @@ mod tests {
 
     #[test]
     fn exec_graph_chained_batches() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let queue = device.newCommandQueue().unwrap();
         let event = GpuEvent::new(device);
         let mut graph = ExecGraph::new(&queue, &event, 32);
@@ -789,7 +796,10 @@ mod tests {
 
     #[test]
     fn exec_graph_sync_and_reset() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let queue = device.newCommandQueue().unwrap();
         let event = GpuEvent::new(device);
         let mut graph = ExecGraph::new(&queue, &event, 32);
@@ -806,7 +816,10 @@ mod tests {
 
     #[test]
     fn exec_graph_sync_empty() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let queue = device.newCommandQueue().unwrap();
         let event = GpuEvent::new(device);
         let mut graph = ExecGraph::new(&queue, &event, 32);
@@ -818,7 +831,10 @@ mod tests {
 
     #[test]
     fn submit_batch_no_pending_returns_previous_token() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let queue = device.newCommandQueue().unwrap();
         let event = GpuEvent::new(device);
         let mut graph = ExecGraph::new(&queue, &event, 32);
@@ -847,7 +863,10 @@ mod tests {
 
     #[test]
     fn wait_for_empty_submit_completes_immediately() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let queue = device.newCommandQueue().unwrap();
         let event = GpuEvent::new(device);
         let mut graph = ExecGraph::new(&queue, &event, 32);
@@ -863,7 +882,10 @@ mod tests {
 
     #[test]
     fn exec_graph_stats() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let queue = device.newCommandQueue().unwrap();
         let event = GpuEvent::new(device);
         let mut graph = ExecGraph::new(&queue, &event, 32);
@@ -893,7 +915,10 @@ mod tests {
 
     #[test]
     fn chunked_pipeline_defers_submit() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let queue = device.newCommandQueue().unwrap();
         let event = GpuEvent::new(device);
         // Set max_ops_per_batch to 20 — submit_batch() won't commit until 20 ops
@@ -927,7 +952,10 @@ mod tests {
 
     #[test]
     fn chunked_pipeline_force_submit_ignores_threshold() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let queue = device.newCommandQueue().unwrap();
         let event = GpuEvent::new(device);
         let mut graph = ExecGraph::new(&queue, &event, 64).with_max_ops_per_batch(50);
@@ -951,7 +979,10 @@ mod tests {
 
     #[test]
     fn chunked_pipeline_sync_flushes_remaining() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let queue = device.newCommandQueue().unwrap();
         let event = GpuEvent::new(device);
         let mut graph = ExecGraph::new(&queue, &event, 64).with_max_ops_per_batch(100);

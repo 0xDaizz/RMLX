@@ -136,13 +136,11 @@ mod tests {
 
     use crate::types::MtlDevice;
 
-    fn test_device() -> &'static MtlDevice {
-        static DEVICE: OnceLock<MtlDevice> = OnceLock::new();
-        DEVICE.get_or_init(|| {
-            objc2::rc::autoreleasepool(|_| {
-                MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests")
-            })
-        })
+    fn test_device() -> Option<&'static MtlDevice> {
+        static DEVICE: OnceLock<Option<MtlDevice>> = OnceLock::new();
+        DEVICE
+            .get_or_init(|| objc2::rc::autoreleasepool(|_| MTLCreateSystemDefaultDevice()))
+            .as_ref()
     }
 
     /// A simple test allocator that tracks alloc/free counts.
@@ -178,7 +176,11 @@ mod tests {
 
     #[test]
     fn test_managed_buffer_returns_on_drop() {
-        let allocator = Arc::new(TestAllocator::new(test_device().clone()));
+        let Some(dev) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let allocator = Arc::new(TestAllocator::new(dev.clone()));
 
         {
             let buf = ManagedBuffer::alloc(
@@ -197,7 +199,11 @@ mod tests {
 
     #[test]
     fn test_managed_buffer_take_prevents_free() {
-        let allocator = Arc::new(TestAllocator::new(test_device().clone()));
+        let Some(dev) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let allocator = Arc::new(TestAllocator::new(dev.clone()));
 
         let buf = ManagedBuffer::alloc(
             Arc::clone(&allocator) as Arc<dyn BufferAllocator>,
@@ -213,7 +219,11 @@ mod tests {
 
     #[test]
     fn test_managed_buffer_untracked() {
-        let allocator = Arc::new(TestAllocator::new(test_device().clone()));
+        let Some(dev) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let allocator = Arc::new(TestAllocator::new(dev.clone()));
 
         let buf =
             ManagedBuffer::alloc_untracked(Arc::clone(&allocator) as Arc<dyn BufferAllocator>, 256)
@@ -225,7 +235,11 @@ mod tests {
 
     #[test]
     fn test_managed_buffer_deref() {
-        let allocator = Arc::new(TestAllocator::new(test_device().clone()));
+        let Some(dev) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
+        let allocator = Arc::new(TestAllocator::new(dev.clone()));
 
         let buf = ManagedBuffer::alloc(
             Arc::clone(&allocator) as Arc<dyn BufferAllocator>,

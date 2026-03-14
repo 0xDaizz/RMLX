@@ -386,18 +386,19 @@ mod tests {
     use super::*;
     use std::sync::OnceLock;
 
-    fn test_device() -> &'static MtlDevice {
-        static DEVICE: OnceLock<MtlDevice> = OnceLock::new();
-        DEVICE.get_or_init(|| {
-            objc2::rc::autoreleasepool(|_| {
-                MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests")
-            })
-        })
+    fn test_device() -> Option<&'static MtlDevice> {
+        static DEVICE: OnceLock<Option<MtlDevice>> = OnceLock::new();
+        DEVICE
+            .get_or_init(|| objc2::rc::autoreleasepool(|_| MTLCreateSystemDefaultDevice()))
+            .as_ref()
     }
 
     #[test]
     fn command_allocator_creation() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         // Metal 4 may not be available on all hardware; skip gracefully.
         let Some(alloc) = CommandAllocator::new(&device) else {
             eprintln!("skipping: Metal 4 command allocator not supported on this device");
@@ -409,7 +410,10 @@ mod tests {
 
     #[test]
     fn command_allocator_reset_idempotent() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let Some(alloc) = CommandAllocator::new(&device) else {
             return;
         };
@@ -421,7 +425,10 @@ mod tests {
 
     #[test]
     fn command_buffer_lifecycle() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let Some(alloc) = CommandAllocator::new(&device) else {
             return;
         };
@@ -441,7 +448,10 @@ mod tests {
 
     #[test]
     fn command_queue4_creation() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let Some(_queue) = CommandQueue4::new(&device) else {
             eprintln!("skipping: Metal 4 command queue not supported on this device");
             return;
@@ -450,7 +460,10 @@ mod tests {
 
     #[test]
     fn batch_commit_single_cb() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let Some(alloc) = CommandAllocator::new(&device) else {
             return;
         };
@@ -472,7 +485,10 @@ mod tests {
 
     #[test]
     fn batch_commit_multiple_cbs() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let Some(alloc) = CommandAllocator::new(&device) else {
             return;
         };
@@ -505,7 +521,10 @@ mod tests {
 
     #[test]
     fn allocator_reset_between_iterations() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let Some(alloc) = CommandAllocator::new(&device) else {
             return;
         };
@@ -534,7 +553,10 @@ mod tests {
 
     #[test]
     fn debug_group_push_pop() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let Some(alloc) = CommandAllocator::new(&device) else {
             return;
         };

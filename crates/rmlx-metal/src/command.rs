@@ -557,17 +557,15 @@ mod tests {
 
     use std::sync::OnceLock;
 
-    fn test_device() -> &'static MtlDevice {
-        static DEVICE: OnceLock<MtlDevice> = OnceLock::new();
-        DEVICE.get_or_init(|| {
-            objc2::rc::autoreleasepool(|_| {
-                MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests")
-            })
-        })
+    fn test_device() -> Option<&'static MtlDevice> {
+        static DEVICE: OnceLock<Option<MtlDevice>> = OnceLock::new();
+        DEVICE
+            .get_or_init(|| objc2::rc::autoreleasepool(|_| MTLCreateSystemDefaultDevice()))
+            .as_ref()
     }
 
     fn system_device() -> Option<&'static MtlDevice> {
-        Some(test_device())
+        test_device()
     }
 
     #[test]
@@ -775,7 +773,10 @@ mod tests {
 
     #[test]
     fn test_command_buffer_manager_thresholds() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let queue = device.newCommandQueue().unwrap();
         let mut mgr = CommandBufferManager::new(&queue);
 
@@ -796,7 +797,10 @@ mod tests {
 
     #[test]
     fn test_command_buffer_manager_auto_commit_ops() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let queue = device.newCommandQueue().unwrap();
         let mut mgr = CommandBufferManager::new(&queue);
 
@@ -814,7 +818,10 @@ mod tests {
 
     #[test]
     fn test_command_buffer_manager_auto_commit_bytes() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let queue = device.newCommandQueue().unwrap();
         let mut mgr = CommandBufferManager::new(&queue);
 
@@ -827,7 +834,10 @@ mod tests {
 
     #[test]
     fn test_command_buffer_manager_completion_handler() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let queue = device.newCommandQueue().unwrap();
         let mut mgr = CommandBufferManager::new(&queue);
 
@@ -851,7 +861,10 @@ mod tests {
 
     #[test]
     fn test_probe_concurrent_dispatch() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let supported = probe_concurrent_dispatch(device);
         // Apple Silicon always supports concurrent dispatch
         assert!(
@@ -862,7 +875,10 @@ mod tests {
 
     #[test]
     fn test_concurrent_encoder_creation() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let queue = device.newCommandQueue().unwrap();
         let cb = queue.commandBuffer().unwrap();
 
@@ -875,7 +891,10 @@ mod tests {
 
     #[test]
     fn test_memory_barrier_scope() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let queue = device.newCommandQueue().unwrap();
         let cb = queue.commandBuffer().unwrap();
 
@@ -889,7 +908,10 @@ mod tests {
 
     #[test]
     fn test_barrier_tracker_concurrent_mode() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let a = device
             .newBufferWithLength_options(256, MTLResourceOptions::StorageModeShared)
             .unwrap();

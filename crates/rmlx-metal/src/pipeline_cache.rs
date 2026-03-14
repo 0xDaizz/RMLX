@@ -494,13 +494,11 @@ mod tests {
     use objc2_metal::MTLCreateSystemDefaultDevice;
     use std::sync::OnceLock;
 
-    fn test_device() -> &'static MtlDevice {
-        static DEVICE: OnceLock<MtlDevice> = OnceLock::new();
-        DEVICE.get_or_init(|| {
-            objc2::rc::autoreleasepool(|_| {
-                MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests")
-            })
-        })
+    fn test_device() -> Option<&'static MtlDevice> {
+        static DEVICE: OnceLock<Option<MtlDevice>> = OnceLock::new();
+        DEVICE
+            .get_or_init(|| objc2::rc::autoreleasepool(|_| MTLCreateSystemDefaultDevice()))
+            .as_ref()
     }
 
     const TEST_KERNEL_SOURCE: &str = r#"
@@ -553,7 +551,10 @@ mod tests {
 
     #[test]
     fn test_new_cache_is_empty() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let cache = DiskPipelineCache::new(device);
         assert!(cache.is_empty());
         assert_eq!(cache.len(), 0);
@@ -561,7 +562,10 @@ mod tests {
 
     #[test]
     fn test_cache_dir_creation() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let tmp = std::env::temp_dir().join(format!("rmlx_test_{}", std::process::id()));
         let cache_dir = tmp.join("rmlx_test_pipelines");
 
@@ -581,7 +585,10 @@ mod tests {
 
     #[test]
     fn test_cold_miss_compiles_and_stores() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let tmp = std::env::temp_dir().join(format!("rmlx_cold_{}", std::process::id()));
         let cache_dir = tmp.join("pipelines");
         let cache = DiskPipelineCache::with_cache_dir(device, cache_dir.clone());
@@ -612,7 +619,10 @@ mod tests {
 
     #[test]
     fn test_warm_hit_loads_from_disk() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let tmp = std::env::temp_dir().join(format!("rmlx_warm_{}", std::process::id()));
         let cache_dir = tmp.join("pipelines");
 
@@ -651,7 +661,10 @@ mod tests {
 
     #[test]
     fn test_in_memory_hit() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let tmp = std::env::temp_dir().join(format!("rmlx_mem_{}", std::process::id()));
         let cache_dir = tmp.join("pipelines");
         let cache = DiskPipelineCache::with_cache_dir(device, cache_dir);
@@ -674,7 +687,10 @@ mod tests {
 
     #[test]
     fn test_clear_memory() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let tmp = std::env::temp_dir().join(format!("rmlx_clr_{}", std::process::id()));
         let cache = DiskPipelineCache::with_cache_dir(device, tmp.join("p"));
 
@@ -692,7 +708,10 @@ mod tests {
 
     #[test]
     fn test_invalid_source_returns_error() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let tmp = std::env::temp_dir().join(format!("rmlx_inv_{}", std::process::id()));
         let cache = DiskPipelineCache::with_cache_dir(device, tmp.join("p"));
 

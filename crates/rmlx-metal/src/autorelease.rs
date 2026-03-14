@@ -50,19 +50,21 @@ mod tests {
     fn test_autoreleasepool_with_metal_objects() {
         // Create Metal objects inside a pool to verify no crash.
         use std::sync::OnceLock;
-        fn test_device() -> &'static crate::types::MtlDevice {
-            static DEVICE: OnceLock<crate::types::MtlDevice> = OnceLock::new();
-            DEVICE.get_or_init(|| {
-                objc2::rc::autoreleasepool(|_| {
-                    objc2_metal::MTLCreateSystemDefaultDevice()
-                        .expect("Metal GPU required for tests")
+        fn test_device() -> Option<&'static crate::types::MtlDevice> {
+            static DEVICE: OnceLock<Option<crate::types::MtlDevice>> = OnceLock::new();
+            DEVICE
+                .get_or_init(|| {
+                    objc2::rc::autoreleasepool(|_| objc2_metal::MTLCreateSystemDefaultDevice())
                 })
-            })
+                .as_ref()
         }
+        let Some(dev) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         autoreleasepool(|_| {
-            let device = test_device();
-            let _queue = device.newCommandQueue().unwrap();
-            let _buf = device
+            let _queue = dev.newCommandQueue().unwrap();
+            let _buf = dev
                 .newBufferWithLength_options(
                     256,
                     objc2_metal::MTLResourceOptions::StorageModeShared,

@@ -442,13 +442,11 @@ mod tests {
     use super::*;
     use std::sync::OnceLock;
 
-    fn test_device() -> &'static MtlDevice {
-        static DEVICE: OnceLock<MtlDevice> = OnceLock::new();
-        DEVICE.get_or_init(|| {
-            objc2::rc::autoreleasepool(|_| {
-                MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests")
-            })
-        })
+    fn test_device() -> Option<&'static MtlDevice> {
+        static DEVICE: OnceLock<Option<MtlDevice>> = OnceLock::new();
+        DEVICE
+            .get_or_init(|| objc2::rc::autoreleasepool(|_| MTLCreateSystemDefaultDevice()))
+            .as_ref()
     }
 
     #[test]
@@ -520,7 +518,10 @@ mod tests {
 
     #[test]
     fn test_chip_tuning_for_device_runs() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let tuning = ChipTuning::for_device(device);
         // On any Apple Silicon these should hold:
         assert!(tuning.max_threadgroup_memory >= 16 * 1024);
@@ -560,7 +561,10 @@ mod tests {
     #[test]
     fn test_create_command_buffer_both_paths() {
         // Verify that both the unretained and retained paths produce valid CBs.
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let queue = device.newCommandQueue().unwrap();
 
         // Retained path (standard)

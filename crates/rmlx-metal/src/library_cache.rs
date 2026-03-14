@@ -129,18 +129,19 @@ mod tests {
     use objc2_metal::MTLCreateSystemDefaultDevice;
     use std::sync::OnceLock;
 
-    fn test_device() -> &'static MtlDevice {
-        static DEVICE: OnceLock<MtlDevice> = OnceLock::new();
-        DEVICE.get_or_init(|| {
-            objc2::rc::autoreleasepool(|_| {
-                MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests")
-            })
-        })
+    fn test_device() -> Option<&'static MtlDevice> {
+        static DEVICE: OnceLock<Option<MtlDevice>> = OnceLock::new();
+        DEVICE
+            .get_or_init(|| objc2::rc::autoreleasepool(|_| MTLCreateSystemDefaultDevice()))
+            .as_ref()
     }
 
     #[test]
     fn test_library_cache_new_empty() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let cache = LibraryCache::new(device);
         assert!(cache.is_empty());
         assert_eq!(cache.len(), 0);
@@ -148,7 +149,10 @@ mod tests {
 
     #[test]
     fn test_library_cache_compile_and_retrieve() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let cache = LibraryCache::new(device);
 
         let source = r#"
@@ -179,7 +183,10 @@ mod tests {
 
     #[test]
     fn test_library_cache_different_sources() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let cache = LibraryCache::new(device);
 
         let source1 = r#"
@@ -204,7 +211,10 @@ mod tests {
 
     #[test]
     fn test_library_cache_invalid_source() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let cache = LibraryCache::new(device);
 
         let result = cache.get_or_compile("this is not valid MSL");
@@ -214,7 +224,10 @@ mod tests {
 
     #[test]
     fn test_library_cache_clear() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let cache = LibraryCache::new(device);
 
         let source = r#"

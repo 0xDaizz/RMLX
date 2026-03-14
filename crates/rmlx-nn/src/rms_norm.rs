@@ -119,31 +119,34 @@ mod tests {
     use super::*;
     use std::sync::OnceLock;
 
-    fn test_device() -> &'static rmlx_metal::MtlDevice {
-        static DEVICE: OnceLock<rmlx_metal::MtlDevice> = OnceLock::new();
-        DEVICE.get_or_init(|| {
-            objc2::rc::autoreleasepool(|_| {
-                objc2_metal::MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests")
+    fn test_device() -> Option<&'static rmlx_metal::MtlDevice> {
+        static DEVICE: OnceLock<Option<rmlx_metal::MtlDevice>> = OnceLock::new();
+        DEVICE
+            .get_or_init(|| {
+                objc2::rc::autoreleasepool(|_| objc2_metal::MTLCreateSystemDefaultDevice())
             })
-        })
+            .as_ref()
     }
 
-    fn setup() -> (
+    fn setup() -> Option<(
         &'static rmlx_metal::MtlDevice,
         KernelRegistry,
         rmlx_metal::MtlQueue,
-    ) {
-        let device = test_device();
-        let gpu = rmlx_metal::device::GpuDevice::system_default().expect("no GpuDevice");
+    )> {
+        let device = test_device()?;
+        let gpu = rmlx_metal::device::GpuDevice::system_default().ok()?;
         let queue = gpu.new_command_queue();
         let registry = KernelRegistry::new(gpu);
         ops::rms_norm::register(&registry).expect("failed to register rms_norm kernels");
-        (device, registry, queue)
+        Some((device, registry, queue))
     }
 
     #[test]
     fn test_rms_norm_construction() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let config = RMSNormConfig::new(64);
 
         let norm = RMSNorm::new(&config, device, DType::Float32);
@@ -156,7 +159,10 @@ mod tests {
 
     #[test]
     fn test_rms_norm_forward_shape() {
-        let (device, registry, queue) = setup();
+        let Some((device, registry, queue)) = setup() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let config = RMSNormConfig::new(8);
         let norm = RMSNorm::new(&config, device, DType::Float32);
 

@@ -784,27 +784,27 @@ mod tests {
 
     use std::sync::OnceLock;
 
-    fn test_device() -> &'static rmlx_metal::MtlDevice {
-        static DEVICE: OnceLock<rmlx_metal::MtlDevice> = OnceLock::new();
-        DEVICE.get_or_init(|| {
-            objc2::rc::autoreleasepool(|_| {
-                objc2_metal::MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests")
+    fn test_device() -> Option<&'static rmlx_metal::MtlDevice> {
+        static DEVICE: OnceLock<Option<rmlx_metal::MtlDevice>> = OnceLock::new();
+        DEVICE
+            .get_or_init(|| {
+                objc2::rc::autoreleasepool(|_| objc2_metal::MTLCreateSystemDefaultDevice())
             })
-        })
+            .as_ref()
     }
 
     /// Create a test `KernelRegistry` with all kernels registered.
-    fn test_registry() -> (
+    fn test_registry() -> Option<(
         &'static rmlx_metal::MtlDevice,
         rmlx_metal::MtlQueue,
         KernelRegistry,
-    ) {
-        let device = test_device();
-        let gpu = rmlx_metal::device::GpuDevice::system_default().expect("GPU device required");
+    )> {
+        let device = test_device()?;
+        let gpu = rmlx_metal::device::GpuDevice::system_default().ok()?;
         let queue = gpu.new_command_queue();
         let registry = KernelRegistry::new(gpu);
         rmlx_core::ops::register_all(&registry).expect("register kernels");
-        (device, queue, registry)
+        Some((device, queue, registry))
     }
 
     /// Create a test expert with known weight values.
@@ -870,7 +870,10 @@ mod tests {
 
     #[test]
     fn test_pipeline_creation() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let pipeline = MoePipeline::with_defaults(device);
         assert_eq!(pipeline.num_batches(), 1);
         assert!(pipeline.sbo_enabled());
@@ -878,7 +881,10 @@ mod tests {
 
     #[test]
     fn test_pipeline_custom_config() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let event = Arc::new(GpuEvent::new(device));
         let config = MoePipelineConfig {
             num_tbo_batches: 4,
@@ -893,7 +899,10 @@ mod tests {
     #[test]
     fn test_sbo_shared_plus_routed_output() {
         // Verify that SBO produces output = shared_expert(x) + routed_experts(x).
-        let (device, queue, registry) = test_registry();
+        let Some((device, queue, registry)) = test_registry() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let hidden_dim = 8;
         let intermediate_dim = 4;
         let num_experts = 4;
@@ -991,7 +1000,10 @@ mod tests {
     #[test]
     fn test_sbo_output_nonzero() {
         // Verify that SBO output is not all zeros (sanity check).
-        let (device, queue, registry) = test_registry();
+        let Some((device, queue, registry)) = test_registry() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let hidden_dim = 8;
         let intermediate_dim = 4;
         let num_experts = 2;
@@ -1045,7 +1057,10 @@ mod tests {
     #[test]
     fn test_forward_sbo_standalone() {
         // Test the standalone forward_sbo method directly.
-        let (device, queue, registry) = test_registry();
+        let Some((device, queue, registry)) = test_registry() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let hidden_dim = 8;
         let intermediate_dim = 4;
 
@@ -1097,7 +1112,10 @@ mod tests {
     #[test]
     fn test_sequential_fallback() {
         // Test with SBO disabled and TBO batches=1 -> sequential path.
-        let (device, queue, registry) = test_registry();
+        let Some((device, queue, registry)) = test_registry() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let hidden_dim = 8;
         let intermediate_dim = 4;
         let num_experts = 2;
@@ -1150,7 +1168,10 @@ mod tests {
     #[test]
     fn test_tbo_two_batches() {
         // Test TBO with 2 batches and verify it matches sequential output.
-        let (device, queue, registry) = test_registry();
+        let Some((device, queue, registry)) = test_registry() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let hidden_dim = 8;
         let intermediate_dim = 4;
         let num_experts = 2;
@@ -1240,7 +1261,10 @@ mod tests {
     #[test]
     fn test_event_reuse_across_calls() {
         // Verify that the pipeline can be called multiple times with event reset.
-        let (device, queue, registry) = test_registry();
+        let Some((device, queue, registry)) = test_registry() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let hidden_dim = 8;
         let intermediate_dim = 4;
         let num_experts = 2;

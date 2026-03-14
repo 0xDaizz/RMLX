@@ -3605,18 +3605,21 @@ mod tests {
     use super::*;
     use std::sync::OnceLock;
 
-    fn test_device() -> &'static rmlx_metal::MtlDevice {
-        static DEVICE: OnceLock<rmlx_metal::MtlDevice> = OnceLock::new();
-        DEVICE.get_or_init(|| {
-            objc2::rc::autoreleasepool(|_| {
-                objc2_metal::MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests")
+    fn test_device() -> Option<&'static rmlx_metal::MtlDevice> {
+        static DEVICE: OnceLock<Option<rmlx_metal::MtlDevice>> = OnceLock::new();
+        DEVICE
+            .get_or_init(|| {
+                objc2::rc::autoreleasepool(|_| objc2_metal::MTLCreateSystemDefaultDevice())
             })
-        })
+            .as_ref()
     }
 
     #[test]
     fn read_buffer_bytes_oob_returns_error() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let buf = device
             .newBufferWithLength_options(64, rmlx_metal::MTLResourceOptions::StorageModeShared)
             .unwrap();
@@ -3632,7 +3635,10 @@ mod tests {
 
     #[test]
     fn read_buffer_bytes_exact_len_succeeds() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let buf = device
             .newBufferWithLength_options(64, rmlx_metal::MTLResourceOptions::StorageModeShared)
             .unwrap();
@@ -3644,7 +3650,10 @@ mod tests {
 
     #[test]
     fn read_buffer_f32_oob_returns_error() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         // 16 bytes = 4 f32 elements
         let buf = device
             .newBufferWithLength_options(16, rmlx_metal::MTLResourceOptions::StorageModeShared)
@@ -3661,7 +3670,10 @@ mod tests {
 
     #[test]
     fn read_buffer_f32_exact_len_succeeds() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         // 16 bytes = 4 f32 elements
         let buf = device
             .newBufferWithLength_options(16, rmlx_metal::MTLResourceOptions::StorageModeShared)
@@ -3673,7 +3685,10 @@ mod tests {
 
     #[test]
     fn read_shared_buffer_bytes_oob_returns_error() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let shared_buf = match SharedBuffer::new(device, 64, 0) {
             Ok(b) => b,
             Err(_) => return, // skip if SharedBuffer allocation fails

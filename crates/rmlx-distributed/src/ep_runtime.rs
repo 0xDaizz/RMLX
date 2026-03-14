@@ -355,18 +355,18 @@ mod tests {
     use rmlx_rdma::shared_buffer::SharedBufferPool;
     use std::sync::OnceLock;
 
-    fn test_device() -> &'static rmlx_metal::MtlDevice {
-        static DEVICE: OnceLock<rmlx_metal::MtlDevice> = OnceLock::new();
-        DEVICE.get_or_init(|| {
-            objc2::rc::autoreleasepool(|_| {
-                objc2_metal::MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests")
+    fn test_device() -> Option<&'static rmlx_metal::MtlDevice> {
+        static DEVICE: OnceLock<Option<rmlx_metal::MtlDevice>> = OnceLock::new();
+        DEVICE
+            .get_or_init(|| {
+                objc2::rc::autoreleasepool(|_| objc2_metal::MTLCreateSystemDefaultDevice())
             })
-        })
+            .as_ref()
     }
 
     /// Helper: create a pool with the given tier sizes.
     fn make_pool(tier_sizes: &[usize]) -> Option<SharedBufferPool> {
-        SharedBufferPool::new(test_device(), tier_sizes).ok()
+        SharedBufferPool::new(test_device()?, tier_sizes).ok()
     }
 
     #[test]
@@ -376,7 +376,10 @@ mod tests {
             None => return, // skip on CI without Metal
         };
         let pool = Arc::new(Mutex::new(pool));
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let progress = Arc::new(rmlx_rdma::progress::ProgressEngine::new());
         let transport = Arc::new(crate::transport::RdmaConnectionTransport::new(vec![], 0));
 
@@ -429,7 +432,10 @@ mod tests {
             None => return,
         };
         let pool = Arc::new(Mutex::new(pool));
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let progress = Arc::new(rmlx_rdma::progress::ProgressEngine::new());
         let transport = Arc::new(crate::transport::RdmaConnectionTransport::new(vec![], 0));
 
@@ -473,7 +479,10 @@ mod tests {
             None => return,
         };
         let pool = Arc::new(Mutex::new(pool));
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let progress = Arc::new(rmlx_rdma::progress::ProgressEngine::new());
         let transport = Arc::new(crate::transport::RdmaConnectionTransport::new(vec![], 0));
 
@@ -497,7 +506,10 @@ mod tests {
             None => return,
         };
         let pool = Arc::new(Mutex::new(pool));
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let progress = Arc::new(rmlx_rdma::progress::ProgressEngine::new());
         let transport = Arc::new(crate::transport::RdmaConnectionTransport::new(vec![], 0));
 

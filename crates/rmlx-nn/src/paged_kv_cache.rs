@@ -682,26 +682,26 @@ mod tests {
 
     use std::sync::OnceLock;
 
-    fn test_device() -> &'static MtlDevice {
-        static DEVICE: OnceLock<MtlDevice> = OnceLock::new();
-        DEVICE.get_or_init(|| {
-            objc2::rc::autoreleasepool(|_| {
-                objc2_metal::MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests")
+    fn test_device() -> Option<&'static MtlDevice> {
+        static DEVICE: OnceLock<Option<MtlDevice>> = OnceLock::new();
+        DEVICE
+            .get_or_init(|| {
+                objc2::rc::autoreleasepool(|_| objc2_metal::MTLCreateSystemDefaultDevice())
             })
-        })
+            .as_ref()
     }
 
     // Helper: create a block manager with small parameters for testing.
-    fn test_block_manager(num_blocks: usize) -> BlockManager {
-        BlockManager::new(
-            test_device(),
+    fn test_block_manager(num_blocks: usize) -> Option<BlockManager> {
+        Some(BlockManager::new(
+            test_device()?,
             num_blocks,
             4, // block_size: 4 tokens per block
             2, // num_layers
             2, // num_kv_heads
             4, // head_dim
             DType::Float32,
-        )
+        ))
     }
 
     // Helper: create a test array of shape [num_tokens, 2, 4] with sequential f32 values.
@@ -715,7 +715,10 @@ mod tests {
 
     #[test]
     fn test_allocate_free_blocks() {
-        let mut bm = test_block_manager(8);
+        let Some(mut bm) = test_block_manager(8) else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         assert_eq!(bm.num_free_blocks(), 8);
 
         let b0 = bm.allocate().unwrap();
@@ -732,7 +735,10 @@ mod tests {
 
     #[test]
     fn test_out_of_blocks() {
-        let mut bm = test_block_manager(2);
+        let Some(mut bm) = test_block_manager(2) else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let _b0 = bm.allocate().unwrap();
         let _b1 = bm.allocate().unwrap();
 
@@ -744,7 +750,10 @@ mod tests {
 
     #[test]
     fn test_append_and_retrieve() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let bm = BlockManager::new(device, 8, 4, 2, 2, 4, DType::Float32);
         let mut cache = PagedKvCache::new(bm);
 
@@ -773,7 +782,10 @@ mod tests {
 
     #[test]
     fn test_append_across_block_boundary() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         // block_size=4, so 6 tokens should span 2 blocks.
         let bm = BlockManager::new(device, 8, 4, 2, 2, 4, DType::Float32);
         let mut cache = PagedKvCache::new(bm);
@@ -795,7 +807,10 @@ mod tests {
 
     #[test]
     fn test_incremental_append() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let bm = BlockManager::new(device, 8, 4, 2, 2, 4, DType::Float32);
         let mut cache = PagedKvCache::new(bm);
 
@@ -825,7 +840,10 @@ mod tests {
 
     #[test]
     fn test_multiple_sequences() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let bm = BlockManager::new(device, 16, 4, 2, 2, 4, DType::Float32);
         let mut cache = PagedKvCache::new(bm);
 
@@ -854,7 +872,10 @@ mod tests {
 
     #[test]
     fn test_multiple_layers() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let bm = BlockManager::new(device, 8, 4, 2, 2, 4, DType::Float32);
         let mut cache = PagedKvCache::new(bm);
 
@@ -882,7 +903,10 @@ mod tests {
 
     #[test]
     fn test_fork_cow() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let bm = BlockManager::new(device, 16, 4, 2, 2, 4, DType::Float32);
         let mut cache = PagedKvCache::new(bm);
 
@@ -933,7 +957,10 @@ mod tests {
 
     #[test]
     fn test_free_sequence() {
-        let mut bm = test_block_manager(8);
+        let Some(mut bm) = test_block_manager(8) else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let initial_free = bm.num_free_blocks();
 
         bm.append_block(1).unwrap();
@@ -947,7 +974,10 @@ mod tests {
 
     #[test]
     fn test_trim_partial() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         // block_size=4, so 6 tokens spans 2 blocks.
         let bm = BlockManager::new(device, 8, 4, 2, 2, 4, DType::Float32);
         let mut cache = PagedKvCache::new(bm);
@@ -970,7 +1000,10 @@ mod tests {
 
     #[test]
     fn test_trim_frees_block() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         // block_size=4, so 6 tokens spans 2 blocks.
         let bm = BlockManager::new(device, 8, 4, 2, 2, 4, DType::Float32);
         let mut cache = PagedKvCache::new(bm);
@@ -995,7 +1028,10 @@ mod tests {
 
     #[test]
     fn test_trim_to_zero() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let bm = BlockManager::new(device, 8, 4, 2, 2, 4, DType::Float32);
         let mut cache = PagedKvCache::new(bm);
 
@@ -1019,7 +1055,10 @@ mod tests {
 
     #[test]
     fn test_trim_nonexistent_sequence() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let bm = BlockManager::new(device, 8, 4, 2, 2, 4, DType::Float32);
         let mut cache = PagedKvCache::new(bm);
 

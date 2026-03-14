@@ -636,13 +636,13 @@ mod tests {
     use super::*;
     use std::sync::OnceLock;
 
-    fn test_device() -> &'static rmlx_metal::MtlDevice {
-        static DEVICE: OnceLock<rmlx_metal::MtlDevice> = OnceLock::new();
-        DEVICE.get_or_init(|| {
-            objc2::rc::autoreleasepool(|_| {
-                objc2_metal::MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests")
+    fn test_device() -> Option<&'static rmlx_metal::MtlDevice> {
+        static DEVICE: OnceLock<Option<rmlx_metal::MtlDevice>> = OnceLock::new();
+        DEVICE
+            .get_or_init(|| {
+                objc2::rc::autoreleasepool(|_| objc2_metal::MTLCreateSystemDefaultDevice())
             })
-        })
+            .as_ref()
     }
 
     // -------------------------------------------------------------------
@@ -929,7 +929,10 @@ mod tests {
         let path = dir.join("model.safetensors");
         std::fs::write(&path, &serialized).unwrap();
 
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
 
         let wmap = load_safetensors_weights(device, &path, None).unwrap();
         assert_eq!(wmap.len(), 1);
@@ -959,7 +962,10 @@ mod tests {
         let path = dir.join("model.safetensors");
         std::fs::write(&path, &serialized).unwrap();
 
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
 
         let wmap = load_safetensors_weights(device, &path, None).unwrap();
         let arr = wmap.get("embed").unwrap();
@@ -1017,7 +1023,10 @@ mod tests {
         let path = dir.join("model.safetensors");
         std::fs::write(&path, &serialized).unwrap();
 
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
 
         let qc = QuantizationConfig {
             bits: 4,

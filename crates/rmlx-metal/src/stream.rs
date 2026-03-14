@@ -330,18 +330,19 @@ mod tests {
     use super::*;
     use std::sync::OnceLock;
 
-    fn test_device() -> &'static MtlDevice {
-        static DEVICE: OnceLock<MtlDevice> = OnceLock::new();
-        DEVICE.get_or_init(|| {
-            objc2::rc::autoreleasepool(|_| {
-                MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests")
-            })
-        })
+    fn test_device() -> Option<&'static MtlDevice> {
+        static DEVICE: OnceLock<Option<MtlDevice>> = OnceLock::new();
+        DEVICE
+            .get_or_init(|| objc2::rc::autoreleasepool(|_| MTLCreateSystemDefaultDevice()))
+            .as_ref()
     }
 
     #[test]
     fn test_predefined_streams_created() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let mgr = StreamManager::new(device);
 
         assert!(mgr.has_stream(STREAM_DEFAULT));
@@ -352,7 +353,10 @@ mod tests {
 
     #[test]
     fn test_get_or_create_new_stream() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let mut mgr = StreamManager::new(device);
 
         assert!(!mgr.has_stream(42));
@@ -363,7 +367,10 @@ mod tests {
 
     #[test]
     fn test_get_or_create_existing_stream() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let mut mgr = StreamManager::new(device);
 
         let _ = mgr.get_or_create_stream(STREAM_COMPUTE);
@@ -373,7 +380,10 @@ mod tests {
 
     #[test]
     fn test_command_buffer_creation() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let mgr = StreamManager::new(device);
 
         // Should not fail for predefined streams.
@@ -384,7 +394,10 @@ mod tests {
 
     #[test]
     fn test_synchronize_returns_monotonic_values() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let mgr = StreamManager::new(device);
 
         let cb1 = mgr.compute_command_buffer().unwrap();
@@ -401,7 +414,10 @@ mod tests {
 
     #[test]
     fn test_convenience_sync_methods() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let mgr = StreamManager::new(device);
 
         let compute_cb = mgr.compute_command_buffer().unwrap();
@@ -413,7 +429,10 @@ mod tests {
 
     #[test]
     fn test_compute_copy_queue_independence() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let mgr = StreamManager::new(device);
 
         // Compute and copy queues should be distinct objects.
@@ -439,7 +458,10 @@ mod tests {
 
     #[test]
     fn test_stream_sync_signal_wait() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let mgr = StreamManager::new(device);
         let sync = super::StreamSync::new(device);
 
@@ -478,7 +500,10 @@ mod tests {
 
     #[test]
     fn test_command_buffer_nonexistent_stream_fails() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let mgr = StreamManager::new(device);
 
         // Stream 999 was never created.
@@ -488,7 +513,10 @@ mod tests {
 
     #[test]
     fn test_queue_returns_none_for_missing_stream() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let mgr = StreamManager::new(device);
 
         assert!(mgr.queue(999).is_none());
@@ -504,7 +532,10 @@ mod tests {
 
     #[test]
     fn test_create_buffer_manager_success() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let mgr = StreamManager::new(device);
 
         let _bm = mgr.create_buffer_manager(STREAM_COMPUTE).unwrap();
@@ -513,7 +544,10 @@ mod tests {
 
     #[test]
     fn test_create_buffer_manager_nonexistent_stream() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let mgr = StreamManager::new(device);
 
         let result = mgr.create_buffer_manager(999);
@@ -522,7 +556,10 @@ mod tests {
 
     #[test]
     fn test_sync_fence_accessible() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let mgr = StreamManager::new(device);
 
         let fence = mgr.sync_fence();
@@ -532,7 +569,10 @@ mod tests {
 
     #[test]
     fn test_stream_sync_fence_accessor() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let sync = StreamSync::new(device);
         let fence = sync.fence();
         assert_eq!(fence.signaled_value(), 0);

@@ -638,13 +638,13 @@ mod tests {
 
     use std::sync::OnceLock;
 
-    fn test_device() -> &'static rmlx_metal::MtlDevice {
-        static DEVICE: OnceLock<rmlx_metal::MtlDevice> = OnceLock::new();
-        DEVICE.get_or_init(|| {
-            objc2::rc::autoreleasepool(|_| {
-                objc2_metal::MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests")
+    fn test_device() -> Option<&'static rmlx_metal::MtlDevice> {
+        static DEVICE: OnceLock<Option<rmlx_metal::MtlDevice>> = OnceLock::new();
+        DEVICE
+            .get_or_init(|| {
+                objc2::rc::autoreleasepool(|_| objc2_metal::MTLCreateSystemDefaultDevice())
             })
-        })
+            .as_ref()
     }
 
     #[cfg(feature = "distributed")]
@@ -660,7 +660,10 @@ mod tests {
 
     #[test]
     fn test_column_parallel_shard_weight_shapes() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         // Full weight: [8, 4] (out_features=8, in_features=4)
         let data: Vec<f32> = (0..32).map(|i| i as f32).collect();
         let full_weight = Array::from_slice(device, &data, vec![8, 4]);
@@ -682,7 +685,10 @@ mod tests {
 
     #[test]
     fn test_column_parallel_shard_weight_data() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         // Full weight: [4, 2] = [[0,1],[2,3],[4,5],[6,7]]
         let data: Vec<f32> = (0..8).map(|i| i as f32).collect();
         let full_weight = Array::from_slice(device, &data, vec![4, 2]);
@@ -701,7 +707,10 @@ mod tests {
 
     #[test]
     fn test_row_parallel_shard_weight_shapes() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         // Full weight: [4, 8] (out_features=4, in_features=8)
         let data: Vec<f32> = (0..32).map(|i| i as f32).collect();
         let full_weight = Array::from_slice(device, &data, vec![4, 8]);
@@ -723,7 +732,10 @@ mod tests {
 
     #[test]
     fn test_column_parallel_new() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let data: Vec<f32> = vec![0.0; 16];
         let weight = Array::from_slice(device, &data, vec![4, 4]);
 
@@ -735,7 +747,10 @@ mod tests {
 
     #[test]
     fn test_row_parallel_new() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let data: Vec<f32> = vec![0.0; 16];
         let weight = Array::from_slice(device, &data, vec![4, 4]);
 
@@ -747,7 +762,10 @@ mod tests {
 
     #[test]
     fn test_to_bytes_from_bytes_roundtrip() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         let arr = Array::from_slice(device, &data, vec![2, 3]);
 
@@ -761,7 +779,10 @@ mod tests {
 
     #[test]
     fn test_slice_columns() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         // [2, 4] = [[0,1,2,3],[4,5,6,7]]
         let data: Vec<f32> = (0..8).map(|i| i as f32).collect();
         let arr = Array::from_slice(device, &data, vec![2, 4]);
@@ -790,7 +811,10 @@ mod tests {
     #[cfg(feature = "distributed")]
     #[test]
     fn test_read_f32_strided_non_contiguous() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         // [2, 4] = [[0,1,2,3],[4,5,6,7]]
         let data: Vec<f32> = (0..8).map(|i| i as f32).collect();
         let arr = Array::from_slice(device, &data, vec![2, 4]);
@@ -806,7 +830,10 @@ mod tests {
     fn test_column_parallel_forward_single_rank() {
         use rmlx_distributed::group::Group;
 
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let (registry, queue) = setup_registry_and_queue(device);
 
         // weight: [2, 3] = [[1,0,0],[0,1,0]]  (identity-like, out=2, in=3)
@@ -837,7 +864,10 @@ mod tests {
     fn test_column_parallel_forward_with_bias() {
         use rmlx_distributed::group::Group;
 
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let (registry, queue) = setup_registry_and_queue(device);
 
         // weight: [2, 2] = [[1,0],[0,1]] (identity)
@@ -870,7 +900,10 @@ mod tests {
     fn test_row_parallel_forward_single_rank() {
         use rmlx_distributed::group::Group;
 
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let (registry, queue) = setup_registry_and_queue(device);
 
         // weight: [2, 3] = [[1,2,3],[4,5,6]]  (out=2, in=3)
@@ -900,7 +933,10 @@ mod tests {
     fn test_row_parallel_forward_with_bias() {
         use rmlx_distributed::group::Group;
 
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let (registry, queue) = setup_registry_and_queue(device);
 
         // weight: [2, 2] = [[1,0],[0,1]] (identity)
@@ -934,7 +970,10 @@ mod tests {
         // Simulate 2-rank TP by computing each rank's local output separately
         // then verifying the concatenation matches full matmul.
 
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let (registry, queue) = setup_registry_and_queue(device);
 
         // Full weight: [4, 2] = [[1,0],[0,1],[2,0],[0,2]]
@@ -981,7 +1020,10 @@ mod tests {
         // Simulate 2-rank TP for RowParallelLinear.
         // Full output = sum of per-rank partial matmul results.
 
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let (registry, queue) = setup_registry_and_queue(device);
 
         // Full weight: [2, 4] = [[1,2,3,4],[5,6,7,8]]
@@ -1037,7 +1079,10 @@ mod tests {
     fn test_column_parallel_forward_multibatch_single_rank() {
         use rmlx_distributed::group::Group;
 
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let (registry, queue) = setup_registry_and_queue(device);
 
         // weight: [2, 3] = [[1,0,0],[0,1,0]]  (out=2, in=3)
@@ -1072,7 +1117,10 @@ mod tests {
 
     #[test]
     fn test_column_parallel_rejects_zero_world_size() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let weight = Array::from_slice(device, &[0.0f32; 4], vec![2, 2]);
         let result = ColumnParallelLinear::new(weight, None, 2, 2, 0, 0);
         assert!(result.is_err());
@@ -1081,7 +1129,10 @@ mod tests {
 
     #[test]
     fn test_column_parallel_rejects_indivisible_out_features() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         // out_features=3, world_size=2 -> not divisible
         let weight = Array::from_slice(device, &[0.0f32; 4], vec![2, 2]);
         let result = ColumnParallelLinear::new(weight, None, 3, 2, 0, 2);
@@ -1091,7 +1142,10 @@ mod tests {
 
     #[test]
     fn test_column_parallel_rejects_mismatched_weight_rows() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         // out_features=4, world_size=2 -> expected rows=2, but weight is [3, 2]
         let weight = Array::from_slice(device, &[0.0f32; 6], vec![3, 2]);
         let result = ColumnParallelLinear::new(weight, None, 4, 2, 0, 2);
@@ -1101,7 +1155,10 @@ mod tests {
 
     #[test]
     fn test_column_parallel_rejects_mismatched_weight_cols() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         // weight [2, 3] but in_features=4
         let weight = Array::from_slice(device, &[0.0f32; 6], vec![2, 3]);
         let result = ColumnParallelLinear::new(weight, None, 2, 4, 0, 1);
@@ -1111,7 +1168,10 @@ mod tests {
 
     #[test]
     fn test_row_parallel_rejects_zero_world_size() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let weight = Array::from_slice(device, &[0.0f32; 4], vec![2, 2]);
         let result = RowParallelLinear::new(weight, None, 2, 2, 0, 0);
         assert!(result.is_err());
@@ -1120,7 +1180,10 @@ mod tests {
 
     #[test]
     fn test_row_parallel_rejects_indivisible_in_features() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         // in_features=3, world_size=2 -> not divisible
         let weight = Array::from_slice(device, &[0.0f32; 4], vec![2, 2]);
         let result = RowParallelLinear::new(weight, None, 2, 3, 0, 2);
@@ -1130,7 +1193,10 @@ mod tests {
 
     #[test]
     fn test_row_parallel_rejects_mismatched_weight_rows() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         // out_features=2 but weight is [3, 2]
         let weight = Array::from_slice(device, &[0.0f32; 6], vec![3, 2]);
         let result = RowParallelLinear::new(weight, None, 2, 2, 0, 1);
@@ -1140,7 +1206,10 @@ mod tests {
 
     #[test]
     fn test_row_parallel_rejects_mismatched_weight_cols() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         // in_features=4, world_size=2 -> expected cols=2, but weight is [2, 3]
         let weight = Array::from_slice(device, &[0.0f32; 6], vec![2, 3]);
         let result = RowParallelLinear::new(weight, None, 2, 4, 0, 2);

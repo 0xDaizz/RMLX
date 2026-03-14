@@ -626,13 +626,11 @@ mod tests {
     use crate::{MtlBuffer, MtlPipeline};
     use std::sync::OnceLock;
 
-    fn test_device() -> &'static crate::MtlDevice {
-        static DEVICE: OnceLock<crate::MtlDevice> = OnceLock::new();
-        DEVICE.get_or_init(|| {
-            objc2::rc::autoreleasepool(|_| {
-                MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests")
-            })
-        })
+    fn test_device() -> Option<&'static crate::MtlDevice> {
+        static DEVICE: OnceLock<Option<crate::MtlDevice>> = OnceLock::new();
+        DEVICE
+            .get_or_init(|| objc2::rc::autoreleasepool(|_| MTLCreateSystemDefaultDevice()))
+            .as_ref()
     }
 
     // ── Cache tests (no GPU needed) ──────────────────────────────────────
@@ -652,7 +650,10 @@ mod tests {
 
     #[test]
     fn cache_insert_and_get() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let _queue = device.newCommandQueue().unwrap();
 
         let (plan, _bufs) = build_test_plan(device, 4, 64, 128);
@@ -682,7 +683,10 @@ mod tests {
 
     #[test]
     fn cache_clear() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let _queue = device.newCommandQueue().unwrap();
 
         let (plan, _bufs) = build_test_plan(device, 4, 64, 128);
@@ -703,7 +707,10 @@ mod tests {
 
     #[test]
     fn cache_overwrite() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let _queue = device.newCommandQueue().unwrap();
 
         let key = SparseExpertKey {
@@ -727,7 +734,10 @@ mod tests {
 
     #[test]
     fn plan_build_basic() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let _queue = device.newCommandQueue().unwrap();
 
         let (plan, _bufs) = build_test_plan(device, 8, 64, 128);
@@ -741,7 +751,10 @@ mod tests {
 
     #[test]
     fn plan_build_single_expert() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let _queue = device.newCommandQueue().unwrap();
 
         let (plan, _bufs) = build_test_plan(device, 1, 32, 64);
@@ -752,7 +765,10 @@ mod tests {
 
     #[test]
     fn plan_config_accessible() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let _queue = device.newCommandQueue().unwrap();
 
         let (plan, _bufs) = build_test_plan(device, 4, 128, 256);
@@ -766,7 +782,10 @@ mod tests {
 
     #[test]
     fn replay_sparse_all_empty() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let queue = device.newCommandQueue().unwrap();
 
         let (plan, _bufs) = build_test_plan(device, 4, 64, 128);
@@ -799,7 +818,10 @@ mod tests {
 
     #[test]
     fn replay_sparse_skips_empty() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let queue = device.newCommandQueue().unwrap();
 
         let (plan, _bufs) = build_test_plan(device, 4, 64, 128);
@@ -837,7 +859,10 @@ mod tests {
 
     #[test]
     fn replay_sparse_all_active() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let queue = device.newCommandQueue().unwrap();
 
         let (plan, _bufs) = build_test_plan(device, 4, 64, 128);
@@ -874,7 +899,10 @@ mod tests {
 
     #[test]
     fn replay_sparse_subset_of_experts() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let queue = device.newCommandQueue().unwrap();
 
         // Build plan for 8 experts, but only provide counts for 4.
@@ -913,7 +941,10 @@ mod tests {
     #[test]
     #[should_panic(expected = "expert_counts length")]
     fn replay_sparse_panics_on_too_many_experts() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let _queue = device.newCommandQueue().unwrap();
 
         let (plan, _bufs) = build_test_plan(device, 2, 64, 128);
@@ -942,7 +973,10 @@ mod tests {
     #[test]
     #[should_panic(expected = "dispatch_offsets must have length E+1")]
     fn replay_sparse_panics_on_bad_offsets() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let _queue = device.newCommandQueue().unwrap();
 
         let (plan, _bufs) = build_test_plan(device, 4, 64, 128);
@@ -972,7 +1006,10 @@ mod tests {
 
     #[test]
     fn swiglu_dispatch_uses_2d_grid() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let _queue = device.newCommandQueue().unwrap();
 
         let (plan, _bufs) = build_test_plan(device, 2, 64, 128);
@@ -995,7 +1032,10 @@ mod tests {
 
     #[test]
     fn swiglu_replay_preserves_intermediate_dim() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let queue = device.newCommandQueue().unwrap();
 
         let intermediate_dim = 256usize;
@@ -1088,7 +1128,10 @@ mod tests {
 
     #[test]
     fn grouped_forward_icb_skips_empty_experts() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let queue = device.newCommandQueue().unwrap();
 
         let (plan, _bufs) = build_test_plan(device, 4, 64, 128);
@@ -1124,7 +1167,10 @@ mod tests {
 
     #[test]
     fn grouped_forward_icb_all_empty() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let queue = device.newCommandQueue().unwrap();
 
         let (plan, _bufs) = build_test_plan(device, 4, 64, 128);

@@ -150,18 +150,19 @@ mod tests {
     use super::*;
     use std::sync::OnceLock;
 
-    fn test_device() -> &'static MtlDevice {
-        static DEVICE: OnceLock<MtlDevice> = OnceLock::new();
-        DEVICE.get_or_init(|| {
-            objc2::rc::autoreleasepool(|_| {
-                MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests")
-            })
-        })
+    fn test_device() -> Option<&'static MtlDevice> {
+        static DEVICE: OnceLock<Option<MtlDevice>> = OnceLock::new();
+        DEVICE
+            .get_or_init(|| objc2::rc::autoreleasepool(|_| MTLCreateSystemDefaultDevice()))
+            .as_ref()
     }
 
     #[test]
     fn test_fence_counter_monotonic() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let fence = GpuFence::new(device);
 
         assert_eq!(fence.current_value(), 0);
@@ -173,7 +174,10 @@ mod tests {
 
     #[test]
     fn test_fence_reset() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let fence = GpuFence::new(device);
 
         fence.next_value();
@@ -187,7 +191,10 @@ mod tests {
 
     #[test]
     fn test_fence_signal_wait_roundtrip() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let queue = device.newCommandQueue().unwrap();
         let fence = GpuFence::new(device);
 
@@ -207,7 +214,10 @@ mod tests {
 
     #[test]
     fn test_fence_cpu_wait_already_signaled() {
-        let device = test_device();
+        let Some(device) = test_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let fence = GpuFence::new(device);
 
         // Value 0 is the initial signaled value, so waiting for 0 should return immediately.

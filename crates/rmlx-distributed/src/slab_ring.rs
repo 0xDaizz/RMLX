@@ -491,17 +491,17 @@ mod tests {
 
     use std::sync::OnceLock;
 
-    fn test_device() -> &'static rmlx_metal::MtlDevice {
-        static DEVICE: OnceLock<rmlx_metal::MtlDevice> = OnceLock::new();
-        DEVICE.get_or_init(|| {
-            objc2::rc::autoreleasepool(|_| {
-                objc2_metal::MTLCreateSystemDefaultDevice().expect("Metal GPU required for tests")
+    fn test_device() -> Option<&'static rmlx_metal::MtlDevice> {
+        static DEVICE: OnceLock<Option<rmlx_metal::MtlDevice>> = OnceLock::new();
+        DEVICE
+            .get_or_init(|| {
+                objc2::rc::autoreleasepool(|_| objc2_metal::MTLCreateSystemDefaultDevice())
             })
-        })
+            .as_ref()
     }
 
     /// Helper: get the default Metal device.
-    fn require_device() -> &'static rmlx_metal::MtlDevice {
+    fn require_device() -> Option<&'static rmlx_metal::MtlDevice> {
         test_device()
     }
 
@@ -514,7 +514,10 @@ mod tests {
 
     #[test]
     fn test_new_ring_is_empty() {
-        let device = require_device();
+        let Some(device) = require_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let config = SlabRingConfig {
             depth: 3,
             slab_size: 1024,
@@ -532,7 +535,10 @@ mod tests {
 
     #[test]
     fn test_slab_access() {
-        let device = require_device();
+        let Some(device) = require_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let config = SlabRingConfig {
             depth: 2,
             slab_size: 4096,
@@ -551,7 +557,10 @@ mod tests {
     #[test]
     #[should_panic(expected = "index out of bounds")]
     fn test_slab_out_of_bounds() {
-        let device = require_device();
+        let Some(device) = require_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let config = SlabRingConfig {
             depth: 2,
             slab_size: 1024,
@@ -562,7 +571,10 @@ mod tests {
 
     #[test]
     fn test_acquire_write_returns_correct_slab() {
-        let device = require_device();
+        let Some(device) = require_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let config = SlabRingConfig {
             depth: 3,
             slab_size: 1024,
@@ -576,7 +588,10 @@ mod tests {
 
     #[test]
     fn test_try_consume_empty_ring() {
-        let device = require_device();
+        let Some(device) = require_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let config = SlabRingConfig {
             depth: 2,
             slab_size: 1024,
@@ -589,7 +604,10 @@ mod tests {
 
     #[test]
     fn test_full_ring_try_acquire_fails() {
-        let device = require_device();
+        let Some(device) = require_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let config = SlabRingConfig {
             depth: 2,
             slab_size: 1024,
@@ -614,7 +632,10 @@ mod tests {
         // Test the full lifecycle: acquire -> try_consume -> acquire -> try_consume.
         // acquire_for_write now advances producer_pos via CAS, and try_consume
         // advances consumer_pos via CAS, so no manual position management needed.
-        let device = require_device();
+        let Some(device) = require_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let config = SlabRingConfig {
             depth: 3,
             slab_size: 1024,
@@ -654,7 +675,10 @@ mod tests {
 
     #[test]
     fn test_ring_wraps_around() {
-        let device = require_device();
+        let Some(device) = require_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let config = SlabRingConfig {
             depth: 2,
             slab_size: 1024,
@@ -685,7 +709,10 @@ mod tests {
 
     #[test]
     fn test_consume_timeout_on_empty_ring() {
-        let device = require_device();
+        let Some(device) = require_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let config = SlabRingConfig {
             depth: 2,
             slab_size: 1024,
@@ -700,7 +727,10 @@ mod tests {
     #[test]
     fn test_produce_and_blocking_consume() {
         // Test the real produce() + consume() path with a Metal command buffer.
-        let device = require_device();
+        let Some(device) = require_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let queue = device.newCommandQueue().unwrap();
         let config = SlabRingConfig {
             depth: 2,
@@ -730,7 +760,10 @@ mod tests {
     fn test_multi_step_pipeline() {
         // Simulates a 3-deep pipeline: produce slab 0, produce slab 1,
         // consume slab 0, produce slab 2, consume slab 1, consume slab 2.
-        let device = require_device();
+        let Some(device) = require_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let queue = device.newCommandQueue().unwrap();
         let config = SlabRingConfig {
             depth: 3,
@@ -784,7 +817,10 @@ mod tests {
     #[test]
     fn test_slab_metal_buffer_is_accessible() {
         // Verify that we can actually write to and read from the slab's Metal buffer.
-        let device = require_device();
+        let Some(device) = require_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let config = SlabRingConfig {
             depth: 1,
             slab_size: 256,
@@ -808,7 +844,10 @@ mod tests {
     fn test_concurrent_acquire_release() {
         // Test that multiple threads can concurrently acquire and consume
         // without TOCTOU races causing double-assignment of the same slab.
-        let device = require_device();
+        let Some(device) = require_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let config = SlabRingConfig {
             depth: 8,
             slab_size: 256,
@@ -883,7 +922,10 @@ mod tests {
     fn test_backpressure_producer_blocks_and_resumes() {
         // Verify that a producer blocks when the ring is full and resumes
         // when the consumer makes progress.
-        let device = require_device();
+        let Some(device) = require_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let config = SlabRingConfig {
             depth: 2,
             slab_size: 256,
@@ -927,7 +969,10 @@ mod tests {
     fn test_backpressure_timeout() {
         // Verify that acquire_for_write_timeout returns Timeout when the
         // ring is full and no consumer frees a slot within the timeout.
-        let device = require_device();
+        let Some(device) = require_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let config = SlabRingConfig {
             depth: 1,
             slab_size: 256,
@@ -949,7 +994,10 @@ mod tests {
     fn test_backpressure_timeout_succeeds_when_freed() {
         // Verify that acquire_for_write_timeout succeeds if a slot is freed
         // before the timeout expires.
-        let device = require_device();
+        let Some(device) = require_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let config = SlabRingConfig {
             depth: 1,
             slab_size: 256,
@@ -978,7 +1026,10 @@ mod tests {
     #[test]
     fn test_ring_full_count_increments() {
         // Verify that ring_full_count increments each time a producer blocks.
-        let device = require_device();
+        let Some(device) = require_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let config = SlabRingConfig {
             depth: 1,
             slab_size: 256,
@@ -1008,7 +1059,10 @@ mod tests {
     fn test_backpressure_no_data_loss() {
         // Spin up a fast producer and slow consumer, verify all data is
         // transferred without loss.
-        let device = require_device();
+        let Some(device) = require_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let config = SlabRingConfig {
             depth: 2,
             slab_size: 256,
@@ -1062,7 +1116,10 @@ mod tests {
         // the race between consumer notify_one and producer wait. Before
         // the fix (holding backpressure_lock during notify), producers
         // could miss wakeups and deadlock.
-        let device = require_device();
+        let Some(device) = require_device() else {
+            eprintln!("Skipping: no Metal GPU");
+            return;
+        };
         let config = SlabRingConfig {
             depth: 1, // Minimal ring — maximum contention.
             slab_size: 64,
