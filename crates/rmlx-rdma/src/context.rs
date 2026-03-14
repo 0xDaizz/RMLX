@@ -1,6 +1,6 @@
 //! RDMA device context and protection domain management
 
-use std::ffi::CStr;
+use std::ffi::{c_int, CStr};
 
 use crate::ffi::{IbvContext, IbvDeviceAttr, IbvPd, IbvPortAttr, IbverbsLib};
 use crate::RdmaError;
@@ -16,13 +16,19 @@ pub struct RdmaContext {
 
 impl RdmaContext {
     /// Open the first available RDMA device.
+    ///
+    /// If `RMLX_RDMA_DEVICE` is set, opens that device by name instead.
     pub fn open_default() -> Result<Self, RdmaError> {
+        if let Ok(name) = std::env::var("RMLX_RDMA_DEVICE") {
+            return Self::open_by_name(&name);
+        }
+
         let lib = IbverbsLib::load()?;
 
         // SAFETY: ibv_get_device_list returns a null-terminated array.
         // We check for null and num_devices > 0.
         unsafe {
-            let mut num_devices: std::ffi::c_int = 0;
+            let mut num_devices: c_int = 0;
             let dev_list = (lib.get_device_list)(&mut num_devices);
             if dev_list.is_null() || num_devices == 0 {
                 if !dev_list.is_null() {
@@ -108,15 +114,20 @@ impl RdmaContext {
 
     /// Open a specific RDMA device by name (e.g., "mlx5_0").
     ///
-    /// Iterates through all available RDMA devices and opens the one whose
-    /// name matches `name`. Returns an error if no device with that name exists.
+    /// Uses `ibv_devices` CLI to discover the device index, then opens it
+    /// directly — avoiding `ibv_get_device_name()` which can hang on
+    /// PORT_DOWN devices on macOS.
     pub fn open_by_name(name: &str) -> Result<Self, RdmaError> {
+        // Step 1: Find device index via `ibv_devices` CLI output (safe, no hang)
+        let index = find_device_index_by_cli(name)?;
+
+        // Step 2: Open the device directly by index (no iteration needed)
         let lib = IbverbsLib::load()?;
 
         // SAFETY: ibv_get_device_list returns a null-terminated array.
-        // We check for null and num_devices > 0.
+        // We access by the index discovered from CLI, skipping ibv_get_device_name.
         unsafe {
-            let mut num_devices: std::ffi::c_int = 0;
+            let mut num_devices: c_int = 0;
             let dev_list = (lib.get_device_list)(&mut num_devices);
             if dev_list.is_null() || num_devices == 0 {
                 if !dev_list.is_null() {
@@ -125,30 +136,16 @@ impl RdmaContext {
                 return Err(RdmaError::NoDevices);
             }
 
-            // Iterate through the device list to find the named device.
-            let mut found_device = std::ptr::null_mut();
-            for i in 0..num_devices as isize {
-                let device = *dev_list.offset(i);
-                if device.is_null() {
-                    break;
-                }
-                let name_ptr = (lib.get_device_name)(device);
-                if !name_ptr.is_null() {
-                    let dev_name = CStr::from_ptr(name_ptr).to_string_lossy();
-                    if dev_name == name {
-                        found_device = device;
-                        break;
-                    }
-                }
-            }
-
-            if found_device.is_null() {
+            if index >= num_devices as usize {
                 (lib.free_device_list)(dev_list);
-                return Err(RdmaError::DeviceOpen(format!("device '{name}' not found")));
+                return Err(RdmaError::DeviceOpen(format!(
+                    "device '{name}' index {index} out of range ({num_devices} devices)"
+                )));
             }
 
+            let device = *dev_list.offset(index as isize);
             let device_name = name.to_string();
-            let ctx = (lib.open_device)(found_device);
+            let ctx = (lib.open_device)(device);
             (lib.free_device_list)(dev_list);
 
             if ctx.is_null() {
@@ -418,4 +415,49 @@ impl RdmaDeviceProbe {
             "no valid GID index found".to_string(),
         ))
     }
+}
+
+/// Find the index of a device in the `ibv_devices` CLI output.
+///
+/// This avoids calling `ibv_get_device_name()` via the C API, which can hang
+/// on PORT_DOWN devices on macOS. The CLI lists devices in the same order as
+/// `ibv_get_device_list()`, so the positional index is stable.
+fn find_device_index_by_cli(name: &str) -> Result<usize, RdmaError> {
+    let output = std::process::Command::new("ibv_devices")
+        .output()
+        .map_err(|e| RdmaError::DeviceOpen(format!("ibv_devices failed: {e}")))?;
+
+    if !output.status.success() {
+        return Err(RdmaError::DeviceOpen(
+            "ibv_devices returned non-zero".into(),
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Parse output like:
+    //     device              node GUID
+    //     ------          ----------------
+    //     rdma_en2        b003616e7ef2ac05
+    //     rdma_en3        b103616e7ef2ac05
+    //     rdma_en5        b303616e7ef2ac05
+
+    let mut index = 0usize;
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("device")
+            || trimmed.starts_with("------")
+            || trimmed.is_empty()
+        {
+            continue;
+        }
+        let dev_name = trimmed.split_whitespace().next().unwrap_or("");
+        if dev_name == name {
+            return Ok(index);
+        }
+        index += 1;
+    }
+
+    Err(RdmaError::DeviceOpen(format!(
+        "device '{name}' not found in ibv_devices output"
+    )))
 }

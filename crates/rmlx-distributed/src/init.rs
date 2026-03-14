@@ -361,6 +361,13 @@ fn try_rdma_init(
     ];
 
     for peer in 0..world_size {
+        if peer == rank {
+            // Self-slot: no RDMA context needed.  Opening the same RDMA device
+            // twice in one process causes ibv_open_device() to hang on macOS.
+            // local_infos[rank] stays zeroed; slots[rank] stays None.
+            continue;
+        }
+
         let ctx = open_ctx(peer)?;
         let pd = ctx
             .alloc_pd()
@@ -370,13 +377,10 @@ fn try_rdma_init(
         let mut qp = QueuePair::create_uc(&pd, &cq, &ctx)
             .map_err(|e| DistributedError::Transport(e.to_string()))?;
 
-        if peer != rank {
-            // Query local info so we have (lid, qpn, psn, gid) to share.
-            qp.query_local_info(&ctx, rank)
-                .map_err(|e| DistributedError::Transport(e.to_string()))?;
-            local_infos[peer as usize] = qp.local_info().clone();
-        }
-        // Self-slot: local_infos[rank] stays zeroed (never used by peers).
+        // Query local info so we have (lid, qpn, psn, gid) to share.
+        qp.query_local_info(&ctx, rank)
+            .map_err(|e| DistributedError::Transport(e.to_string()))?;
+        local_infos[peer as usize] = qp.local_info().clone();
 
         slots[peer as usize] = Some(QpSlot { ctx, pd, cq, qp });
     }
@@ -446,19 +450,21 @@ fn try_rdma_init(
     let mut connections: Vec<Option<RdmaConnection>> = (0..world_size).map(|_| None).collect();
 
     for peer in 0..world_size {
+        if peer == rank {
+            // Self-slot stays None — no RDMA connection to self.
+            continue;
+        }
+
         let slot = slots[peer as usize]
             .take()
             .expect("QP slot should be populated");
 
-        if peer != rank {
-            // Connect this QP to the peer's QP that was created for us.
-            slot.qp
-                .connect(&remote_for_me[peer as usize])
-                .map_err(|e| {
-                    DistributedError::Transport(format!("QP connect to rank {peer} failed: {e}"))
-                })?;
-        }
-        // Self-slot: leave unconnected (placeholder for transport indexing).
+        // Connect this QP to the peer's QP that was created for us.
+        slot.qp
+            .connect(&remote_for_me[peer as usize])
+            .map_err(|e| {
+                DistributedError::Transport(format!("QP connect to rank {peer} failed: {e}"))
+            })?;
 
         let peer_config = RdmaConfig {
             rank,
@@ -482,15 +488,7 @@ fn try_rdma_init(
         ));
     }
 
-    // Unwrap all Options — every slot should be populated now.
-    let connections: Vec<RdmaConnection> = connections
-        .into_iter()
-        .enumerate()
-        .map(|(i, c)| {
-            c.ok_or_else(|| DistributedError::Transport(format!("missing connection for rank {i}")))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
+    // connections[rank] is None (self-slot); all others are Some.
     let transport = RdmaConnectionTransport::new(connections, rank);
     let all_ranks: Vec<u32> = (0..world_size).collect();
     let group = Group::with_transport(all_ranks, rank, world_size, Arc::new(transport))?;

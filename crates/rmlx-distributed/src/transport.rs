@@ -101,14 +101,15 @@ impl Drop for ZeroCopyPendingOp {
 /// peer connection.
 ///
 /// `connections[i]` is the connection to peer rank `i`.
-/// The slot at `connections[local_rank]` is unused (no self-connection).
+/// The slot at `connections[local_rank]` is `None` (no self-connection;
+/// opening the same RDMA device twice in one process hangs on macOS).
 ///
 /// wr_id encoding uses `encode_wr_id(seq, tag, buf_slot, peer_id)` from
 /// `rmlx_rdma::exchange_tag` — a structured 64-bit layout with:
 /// - [63..24] seq (40 bits), [23..16] tag (8 bits),
 /// - [15..8] buf_slot (8 bits), [7..0] peer_id (8 bits).
 pub struct RdmaConnectionTransport {
-    connections: Vec<Mutex<RdmaConnection>>,
+    connections: Vec<Option<Mutex<RdmaConnection>>>,
     local_rank: u32,
     metrics: Arc<RdmaMetrics>,
     stripe_engine: Option<StripeEngine>,
@@ -129,13 +130,16 @@ impl RdmaConnectionTransport {
     /// Create a new transport from a set of peer connections.
     ///
     /// `connections` must contain one entry per rank in the world.
-    /// The entry at index `local_rank` is never used for I/O but must be present
-    /// to keep indexing simple (it can be a dummy/unconnected instance).
-    pub fn new(connections: Vec<RdmaConnection>, local_rank: u32) -> Self {
+    /// The entry at index `local_rank` must be `None` (no self-connection).
+    /// All other entries must be `Some`.
+    pub fn new(connections: Vec<Option<RdmaConnection>>, local_rank: u32) -> Self {
         let world_size = connections.len();
         let wr_id_seqs: Vec<AtomicU64> = (0..world_size).map(|_| AtomicU64::new(0)).collect();
         Self {
-            connections: connections.into_iter().map(Mutex::new).collect(),
+            connections: connections
+                .into_iter()
+                .map(|c| c.map(Mutex::new))
+                .collect(),
             local_rank,
             metrics: Arc::new(RdmaMetrics::new()),
             stripe_engine: None,
@@ -143,6 +147,23 @@ impl RdmaConnectionTransport {
             progress_engine: None,
             wr_id_seqs,
         }
+    }
+
+    /// Get a lock on the connection for the given peer rank.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `rank` is the local rank (self-slot is `None`).
+    fn conn(&self, rank: usize) -> parking_lot::MutexGuard<'_, RdmaConnection> {
+        self.connections[rank]
+            .as_ref()
+            .unwrap_or_else(|| {
+                panic!(
+                    "attempted RDMA I/O on self-rank slot (rank {rank}); \
+                     self-connections are not created"
+                )
+            })
+            .lock()
     }
 
     /// Attach a StripeEngine for dual-port TB5 striping.
@@ -446,7 +467,7 @@ impl RdmaConnectionTransport {
             DistributedError::Transport("send_async: no progress engine attached".into())
         })?;
 
-        let conn = self.connections[dst_rank as usize].lock();
+        let conn = self.conn(dst_rank as usize);
 
         let wr_id = self.next_wr_id(dst_rank, ExchangeTag::Data, 0);
         let pending = engine.register_op(wr_id);
@@ -490,7 +511,7 @@ impl RdmaConnectionTransport {
             DistributedError::Transport("recv_async: no progress engine attached".into())
         })?;
 
-        let conn = self.connections[src_rank as usize].lock();
+        let conn = self.conn(src_rank as usize);
 
         let wr_id = self.next_wr_id(src_rank, ExchangeTag::Data, 0);
         let pending = engine.register_op(wr_id);
@@ -567,7 +588,7 @@ impl RdmaConnectionTransport {
             DistributedError::Transport("pre_post_recv_credits: no progress engine attached".into())
         })?;
 
-        let conn = self.connections[src_rank as usize].lock();
+        let conn = self.conn(src_rank as usize);
 
         let mut credits = Vec::with_capacity(count);
 
@@ -631,7 +652,7 @@ impl RdmaConnectionTransport {
             )
         })?;
 
-        let conn = self.connections[src_rank as usize].lock();
+        let conn = self.conn(src_rank as usize);
 
         let mr = buf.rdma_mr(conn_id).ok_or_else(|| {
             DistributedError::Transport(format!(
@@ -707,7 +728,7 @@ impl RdmaConnectionTransport {
             ))
         })?;
 
-        let conn = self.connections[peer_id as usize].lock();
+        let conn = self.conn(peer_id as usize);
 
         // Register with progress engine if available
         if let Some(ref engine) = self.progress_engine {
@@ -759,7 +780,7 @@ impl RdmaConnectionTransport {
         dst_rank: u32,
         len: u32,
     ) -> Result<(), DistributedError> {
-        let conn = self.connections[dst_rank as usize].lock();
+        let conn = self.conn(dst_rank as usize);
 
         let mr = buf.rdma_mr(conn_id).ok_or_else(|| {
             DistributedError::Transport(format!(
@@ -795,7 +816,7 @@ impl RdmaConnectionTransport {
         src_rank: u32,
         len: u32,
     ) -> Result<(), DistributedError> {
-        let conn = self.connections[src_rank as usize].lock();
+        let conn = self.conn(src_rank as usize);
 
         let mr = buf.rdma_mr(conn_id).ok_or_else(|| {
             DistributedError::Transport(format!(
@@ -837,7 +858,7 @@ impl RdmaConnectionTransport {
             DistributedError::Transport("send_zero_copy_async: no progress engine attached".into())
         })?;
 
-        let conn = self.connections[dst_rank as usize].lock();
+        let conn = self.conn(dst_rank as usize);
 
         let mr = buf.rdma_mr(conn_id).ok_or_else(|| {
             DistributedError::Transport(format!(
@@ -875,7 +896,7 @@ impl RdmaConnectionTransport {
             DistributedError::Transport("recv_zero_copy_async: no progress engine attached".into())
         })?;
 
-        let conn = self.connections[src_rank as usize].lock();
+        let conn = self.conn(src_rank as usize);
 
         let mr = buf.rdma_mr(conn_id).ok_or_else(|| {
             DistributedError::Transport(format!(
@@ -917,7 +938,7 @@ fn rdma_to_distributed_enhanced(e: RdmaError, wr_id: u64) -> DistributedError {
 impl RdmaTransport for RdmaConnectionTransport {
     fn send(&self, data: &[u8], dst_rank: u32) -> Result<(), DistributedError> {
         global_counters().record_fallback();
-        let conn = self.connections[dst_rank as usize].lock();
+        let conn = self.conn(dst_rank as usize);
 
         // Use striped send for large payloads when stripe engine is configured
         if self.should_stripe(data.len()) {
@@ -950,7 +971,7 @@ impl RdmaTransport for RdmaConnectionTransport {
 
     fn recv(&self, src_rank: u32, len: usize) -> Result<Vec<u8>, DistributedError> {
         global_counters().record_fallback();
-        let conn = self.connections[src_rank as usize].lock();
+        let conn = self.conn(src_rank as usize);
 
         // Use striped recv for large payloads when stripe engine is configured
         if self.should_stripe(len) {
@@ -997,7 +1018,7 @@ impl RdmaTransport for RdmaConnectionTransport {
         // When dst_rank == src_rank, use the same connection lock for both ops
         // to avoid deadlock (lock ordering).
         if dst_rank == src_rank {
-            let conn = self.connections[dst_rank as usize].lock();
+            let conn = self.conn(dst_rank as usize);
 
             // Prepare recv buffer and MR
             let mut recv_buf = vec![0u8; recv_len];
@@ -1055,8 +1076,8 @@ impl RdmaTransport for RdmaConnectionTransport {
             } else {
                 (src_rank, dst_rank)
             };
-            let first_conn = self.connections[first_rank as usize].lock();
-            let second_conn = self.connections[second_rank as usize].lock();
+            let first_conn = self.conn(first_rank as usize);
+            let second_conn = self.conn(second_rank as usize);
 
             let (dst_conn, src_conn) = if dst_rank < src_rank {
                 (&*first_conn, &*second_conn)
