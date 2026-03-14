@@ -276,7 +276,10 @@ pub fn wire_bytes(num_tokens: usize, hidden_dim: usize, dtype: DType) -> (usize,
 
 /// Create a constant `uint` buffer on the device.
 fn make_u32_buf(device: &ProtocolObject<dyn MTLDevice>, val: u32) -> MtlBuffer {
-    let ptr = std::ptr::NonNull::new(&val as *const u32 as *mut std::ffi::c_void).unwrap();
+    // SAFETY: addr_of! produces a valid, aligned pointer to `val` which lives
+    // for the duration of this function. The Metal API copies the bytes into the
+    // buffer before returning, so the pointer does not need to outlive this call.
+    let ptr = std::ptr::NonNull::new(std::ptr::addr_of!(val) as *mut std::ffi::c_void).unwrap();
     unsafe {
         device.newBufferWithBytes_length_options(ptr, 4, MTLResourceOptions::StorageModeShared)
     }
@@ -376,6 +379,8 @@ pub fn dequant_scatter_fp8e4m3(
     let command_buffer = queue.commandBuffer().unwrap();
     let encoder = command_buffer.computeCommandEncoder().unwrap();
     encoder.setComputePipelineState(&pipeline);
+    // SAFETY: all buffers are valid MTLBuffers with sizes validated above.
+    // Buffer indices match the dequant_scatter_fp8e4m3 Metal kernel signature.
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(packet_data.metal_buffer()), packet_data.offset(), 0);
         encoder.setBuffer_offset_atIndex(Some(scales.metal_buffer()), scales.offset(), 1);

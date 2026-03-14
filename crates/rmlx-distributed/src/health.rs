@@ -24,6 +24,8 @@ impl Default for HeartbeatConfig {
 #[derive(Debug)]
 struct HealthState {
     last_seen: FxHashMap<u32, Instant>,
+    /// Number of consecutive missed heartbeat intervals per peer.
+    missed_counts: FxHashMap<u32, u32>,
     config: HeartbeatConfig,
 }
 
@@ -37,6 +39,7 @@ impl HealthMonitor {
         Self {
             inner: Arc::new(RwLock::new(HealthState {
                 last_seen: FxHashMap::default(),
+                missed_counts: FxHashMap::default(),
                 config,
             })),
         }
@@ -45,19 +48,40 @@ impl HealthMonitor {
     pub fn record_heartbeat(&self, peer_rank: u32) {
         let mut state = self.inner.write();
         state.last_seen.insert(peer_rank, Instant::now());
+        // Reset the missed count on successful heartbeat.
+        state.missed_counts.insert(peer_rank, 0);
     }
 
+    /// Returns the list of unhealthy peer ranks.
+    ///
+    /// A peer is unhealthy if it has exceeded the configured timeout AND
+    /// its missed heartbeat count has reached `max_missed`. On each call,
+    /// the missed count is incremented for timed-out peers (and reset by
+    /// `record_heartbeat`).
     pub fn check_health(&self) -> Vec<u32> {
-        let state = self.inner.read();
+        let mut state = self.inner.write();
         let timeout = state.config.timeout;
+        let max_missed = state.config.max_missed;
         let now = Instant::now();
-        let mut unhealthy: Vec<u32> = state
+
+        // Collect timed-out peers and update missed counts.
+        let timed_out: Vec<u32> = state
             .last_seen
             .iter()
             .filter_map(|(&peer_rank, &last_seen)| {
                 (now.duration_since(last_seen) > timeout).then_some(peer_rank)
             })
             .collect();
+
+        let mut unhealthy = Vec::new();
+        for peer_rank in timed_out {
+            let count = state.missed_counts.entry(peer_rank).or_insert(0);
+            *count = count.saturating_add(1);
+            if *count >= max_missed {
+                unhealthy.push(peer_rank);
+            }
+        }
+
         unhealthy.sort_unstable();
         unhealthy
     }
@@ -131,12 +155,20 @@ mod tests {
         thread::sleep(Duration::from_millis(250));
 
         assert!(!monitor.is_healthy(11));
-        assert_eq!(monitor.check_health(), vec![11]);
+        // max_missed=3: peer is only reported unhealthy after 3 consecutive checks.
+        assert!(monitor.check_health().is_empty()); // missed=1
+        assert!(monitor.check_health().is_empty()); // missed=2
+        assert_eq!(monitor.check_health(), vec![11]); // missed=3
     }
 
     #[test]
     fn test_multiple_peers() {
-        let monitor = HealthMonitor::new(test_config());
+        let config = HeartbeatConfig {
+            interval: Duration::from_millis(10),
+            timeout: Duration::from_millis(200),
+            max_missed: 1, // Report unhealthy after a single missed check.
+        };
+        let monitor = HealthMonitor::new(config);
 
         monitor.record_heartbeat(1);
         monitor.record_heartbeat(2);
@@ -231,7 +263,12 @@ mod tests {
 
     #[test]
     fn test_check_health_sorted_output() {
-        let monitor = HealthMonitor::new(test_config());
+        let config = HeartbeatConfig {
+            interval: Duration::from_millis(10),
+            timeout: Duration::from_millis(200),
+            max_missed: 1, // Report unhealthy after a single missed check.
+        };
+        let monitor = HealthMonitor::new(config);
 
         // Register peers in non-sorted order.
         monitor.record_heartbeat(10);
