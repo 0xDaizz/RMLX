@@ -1078,6 +1078,9 @@ impl RdmaTransport for RdmaConnectionTransport {
             drop(recv_reg);
             drop(send_reg);
 
+            eprintln!("[sendrecv] rank={} recv data ({} bytes): {:02x?}",
+                self.local_rank, recv_buf.len().min(16), &recv_buf[..recv_buf.len().min(16)]);
+
             self.metrics.record_send(send_data.len() as u64);
             self.metrics.record_recv(recv_len as u64);
             Ok(recv_buf)
@@ -1144,6 +1147,9 @@ impl RdmaTransport for RdmaConnectionTransport {
             // Drop registrations before moving recv_buf
             drop(recv_reg);
             drop(send_reg);
+
+            eprintln!("[sendrecv] rank={} recv data ({} bytes): {:02x?}",
+                self.local_rank, recv_buf.len().min(16), &recv_buf[..recv_buf.len().min(16)]);
 
             self.metrics.record_send(send_data.len() as u64);
             self.metrics.record_recv(recv_len as u64);

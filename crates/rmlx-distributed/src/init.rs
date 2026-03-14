@@ -546,27 +546,15 @@ fn try_rdma_init(
             // data is silently dropped.  Barrier uses ring sendrecv internally,
             // ensuring every peer pair exchanges at least one message.
             || {
-                const WARMUP_ROUNDS: usize = 3;
-                for round in 0..WARMUP_ROUNDS {
-                    eprintln!("[rdma-init] barrier round {round}...");
-                    group.barrier().map_err(|e| {
-                        format!("RDMA warmup barrier round {round} failed: {e}")
-                    })?;
-                    eprintln!("[rdma-init] barrier round {round} OK");
-                }
-                eprintln!("[rdma-init] warmup barriers done, testing larger sendrecv...");
-                // Test with progressively larger payloads
-                for size in [1, 2, 4, 8, 16] {
-                    let test_data = vec![0xABu8; size];
-                    match group.allgather(&test_data) {
-                        Ok(result) => eprintln!("[rdma-init] sendrecv {}B OK (got {}B)", size, result.len()),
-                        Err(e) => {
-                            eprintln!("[rdma-init] sendrecv {}B FAILED: {}", size, e);
-                            return Err(format!("warmup sendrecv {size}B failed: {e}"));
-                        }
-                    }
-                }
-                eprintln!("[rdma-init] all warmup sizes passed!");
+                // Single barrier round to verify all QP paths are hot.
+                // In UC mode, barrier uses ring sendrecv internally,
+                // ensuring every peer pair exchanges at least one message.
+                // Kept minimal to reduce MR register/deregister churn.
+                eprintln!("[rdma-init] barrier warmup...");
+                group.barrier().map_err(|e| {
+                    format!("RDMA warmup barrier failed: {e}")
+                })?;
+                eprintln!("[rdma-init] barrier warmup OK");
                 Ok(())
             },
             // JIT warmup: no-op (kernel registry is not available at init time;

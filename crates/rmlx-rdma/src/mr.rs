@@ -124,10 +124,14 @@ impl MemoryRegion {
 
 impl Drop for MemoryRegion {
     fn drop(&mut self) {
-        // SAFETY: mr was obtained from ibv_reg_mr and is valid.
-        // aligned_buf was obtained from posix_memalign and must be freed.
         unsafe {
-            (self.lib.dereg_mr)(self.mr);
+            let ret = (self.lib.dereg_mr)(self.mr);
+            if ret != 0 {
+                // MR deregister failed — leak the buffer to avoid kernel state corruption.
+                // IOConnectUnmapMemory failure + free would leave a dangling IOMMU mapping.
+                eprintln!("[mr] WARNING: ibv_dereg_mr returned {ret}, leaking aligned_buf");
+                return;
+            }
             libc::free(self.aligned_buf);
         }
     }

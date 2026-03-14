@@ -412,9 +412,18 @@ impl QueuePair {
 
 impl Drop for QueuePair {
     fn drop(&mut self) {
-        // SAFETY: self.qp was obtained from ibv_create_qp and is valid.
         unsafe {
-            (self.lib.destroy_qp)(self.qp);
+            // Transition QP to RESET to release hardware resources before destroy.
+            // This ensures in-flight operations are aborted and the QP's hardware
+            // state is cleaned up, preventing EBUSY on subsequent device opens.
+            let mut attr: IbvQpAttr = std::mem::zeroed();
+            attr.qp_state = qp_state::RESET;
+            let _ = (self.lib.modify_qp)(self.qp, &mut attr, qp_attr_mask::STATE);
+
+            let ret = (self.lib.destroy_qp)(self.qp);
+            if ret != 0 {
+                eprintln!("[qp] WARNING: ibv_destroy_qp returned {ret}");
+            }
         }
     }
 }

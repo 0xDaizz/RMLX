@@ -253,17 +253,29 @@ impl<'a> RegisteredRecv<'a> {
 ///
 /// Wraps the full RDMA stack: context, protection domain, completion queue,
 /// and queue pair. Individual components handle their own cleanup via Drop.
+///
+/// **Field order matters**: Rust drops fields in declaration order, so we
+/// declare dependent resources first (dropped early) and foundational
+/// resources last (dropped late):
+///
+/// Drop order (top to bottom):
+/// 1. completion_backlog, config — plain data (no RDMA teardown)
+/// 2. mr_pool — MR deregister
+/// 3. qp — QP destroy
+/// 4. cq — CQ destroy
+/// 5. pd — PD dealloc
+/// 6. ctx — context close (must be last)
 pub struct RdmaConnection {
-    ctx: RdmaContext,
-    pd: ProtectionDomain,
-    cq: CompletionQueue,
-    qp: QueuePair,
     config: RdmaConfig,
     /// Backlog of CQ completions with unexpected wr_ids, for later retrieval.
     /// Protected by a Mutex for thread-safe access (IbvWc is Copy + Send).
     completion_backlog: Mutex<Vec<IbvWc>>,
     /// Pre-registered MR pool (lazily initialized via `init_mr_pool`).
     mr_pool: Option<MrPool>,
+    qp: QueuePair,
+    cq: CompletionQueue,
+    pd: ProtectionDomain,
+    ctx: RdmaContext,
 }
 
 impl RdmaConnection {
@@ -289,13 +301,13 @@ impl RdmaConnection {
         config: RdmaConfig,
     ) -> Self {
         Self {
-            ctx,
-            pd,
-            cq,
-            qp,
             config,
             completion_backlog: Mutex::new(Vec::new()),
             mr_pool: None,
+            qp,
+            cq,
+            pd,
+            ctx,
         }
     }
 
@@ -339,13 +351,13 @@ impl RdmaConnection {
         qp.connect(&remote_info)?;
 
         Ok(Self {
-            ctx,
-            pd,
-            cq,
-            qp,
             config,
             completion_backlog: Mutex::new(Vec::new()),
             mr_pool: None,
+            qp,
+            cq,
+            pd,
+            ctx,
         })
     }
 
