@@ -25,6 +25,7 @@ use rmlx_core::ops;
 use rmlx_metal::autoreleasepool;
 use rmlx_metal::device::GpuDevice;
 use rmlx_metal::event::GpuEvent;
+use rmlx_metal::compute_pass::ComputePass;
 use rmlx_metal::exec_graph::ExecGraph;
 use rmlx_nn::{
     Attention, AttentionConfig, FeedForward, LayerKvCache, Linear, LinearConfig, TransformerBlock,
@@ -255,10 +256,14 @@ fn build_causal_mask(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, seq_le
 
 fn assert_cb_ok(cb: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>, context: &str) {
     let status = cb.status();
-    assert!(
-        status != objc2_metal::MTLCommandBufferStatus::Error,
-        "GPU command buffer error in {context}: status={status:?}"
-    );
+    if status == objc2_metal::MTLCommandBufferStatus::Error {
+        let err_msg = if let Some(err) = cb.error() {
+            format!("{}", err.localizedDescription())
+        } else {
+            "no error details".to_string()
+        };
+        panic!("GPU command buffer error in {context}: status={status:?}, error={err_msg}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -422,7 +427,7 @@ fn main() {
                 autoreleasepool(|_| {
                     for _ in 0..WARMUP_ITERS {
                         cache_cb.seq_len = 0;
-                        let cb = queue_cb.commandBufferWithUnretainedReferences().unwrap();
+                        let cb = queue_cb.commandBuffer().unwrap();
                         let out = block_cb
                             .forward_prefill_into_cb(
                                 &input,
@@ -459,7 +464,7 @@ fn main() {
                 autoreleasepool(|_| {
                     for _ in 0..BENCH_ITERS {
                         cache_cb.seq_len = 0;
-                        let cb = queue_cb.commandBufferWithUnretainedReferences().unwrap();
+                        let cb = queue_cb.commandBuffer().unwrap();
                         let start = Instant::now();
                         let _ = block_cb
                             .forward_prefill_into_cb(
@@ -604,7 +609,7 @@ fn main() {
                 autoreleasepool(|_| {
                     for _ in 0..WARMUP_ITERS {
                         cache_enc.seq_len = 0;
-                        let cb = queue_enc.commandBufferWithUnretainedReferences().unwrap();
+                        let cb = queue_enc.commandBuffer().unwrap();
                         let encoder = cb.computeCommandEncoder().unwrap();
                         let out = block_enc
                             .forward_prefill_into_encoder(
@@ -614,7 +619,7 @@ fn main() {
                                 None,
                                 &mut cache_enc,
                                 &registry,
-                                &encoder,
+                                ComputePass::new(&encoder),
                             )
                             .expect("single_encoder warmup failed");
                         encoder.endEncoding();
@@ -643,7 +648,7 @@ fn main() {
                 autoreleasepool(|_| {
                     for _ in 0..BENCH_ITERS {
                         cache_enc.seq_len = 0;
-                        let cb = queue_enc.commandBufferWithUnretainedReferences().unwrap();
+                        let cb = queue_enc.commandBuffer().unwrap();
                         let encoder = cb.computeCommandEncoder().unwrap();
                         let start = Instant::now();
                         let _ = block_enc
@@ -654,7 +659,7 @@ fn main() {
                                 None,
                                 &mut cache_enc,
                                 &registry,
-                                &encoder,
+                                ComputePass::new(&encoder),
                             )
                             .expect("forward_prefill_into_encoder failed");
                         encoder.endEncoding();
@@ -859,7 +864,7 @@ fn bench_dispatch_breakdown(
                         MAX_SEQ_LEN,
                         DType::Float16,
                     );
-                    let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+                    let cb = queue.commandBuffer().unwrap();
                     let start = Instant::now();
                     let _ = block
                         .forward_prefill_into_cb(
@@ -1024,7 +1029,7 @@ fn bench_cumulative_breakdown(
                     MAX_SEQ_LEN,
                     DType::Float16,
                 );
-                let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+                let cb = queue.commandBuffer().unwrap();
                 let encoder = cb.computeCommandEncoder().unwrap();
                 let _ = block
                     .forward_prefill_into_encoder(
@@ -1034,7 +1039,7 @@ fn bench_cumulative_breakdown(
                         None,
                         &mut cache,
                         registry,
-                        &encoder,
+                        ComputePass::new(&encoder),
                     )
                     .expect("single_encoder warmup failed");
                 encoder.endEncoding();
@@ -1050,7 +1055,7 @@ fn bench_cumulative_breakdown(
                     MAX_SEQ_LEN,
                     DType::Float16,
                 );
-                let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+                let cb = queue.commandBuffer().unwrap();
                 let encoder = cb.computeCommandEncoder().unwrap();
                 let start = std::time::Instant::now();
                 let _ = block
@@ -1061,7 +1066,7 @@ fn bench_cumulative_breakdown(
                         None,
                         &mut cache,
                         registry,
-                        &encoder,
+                        ComputePass::new(&encoder),
                     )
                     .expect("single_encoder bench failed");
                 encoder.endEncoding();

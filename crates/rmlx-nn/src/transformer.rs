@@ -3260,7 +3260,7 @@ impl TransformerBlock {
                         sin_freqs,
                         &mut cache,
                         registry,
-                        &*encoder,
+                        encoder,
                         attn_stop,
                     )?;
 
@@ -3272,7 +3272,7 @@ impl TransformerBlock {
                             x,
                             norm2_w,
                             self.rms_norm_eps,
-                            &*encoder,
+                            encoder,
                         )?;
 
                         if group >= 7 {
@@ -3296,13 +3296,13 @@ impl TransformerBlock {
                                     // Dispatch 9: Down Proj + Residual
                                     if hidden.shape()[0] >= 33 {
                                         let _ = down_proj.forward_with_residual_into_encoder(
-                                            &hidden, &h, registry, &*encoder,
+                                            &hidden, &h, registry, encoder,
                                         )?;
                                     } else {
                                         let ffn_out = down_proj
-                                            .forward_into_encoder(&hidden, registry, &*encoder)?;
+                                            .forward_into_encoder(&hidden, registry, encoder)?;
                                         let _ = ops::binary::add_encode(
-                                            registry, &h, &ffn_out, &*encoder,
+                                            registry, &h, &ffn_out, encoder,
                                         )?;
                                     }
                                 }
@@ -3342,7 +3342,7 @@ impl TransformerBlock {
                         sin_freqs,
                         &mut cache,
                         registry,
-                        &*encoder,
+                        encoder,
                         attn_stop,
                     )?;
 
@@ -3353,7 +3353,7 @@ impl TransformerBlock {
                             x,
                             norm2_w,
                             self.rms_norm_eps,
-                            &*encoder,
+                            encoder,
                         )?;
 
                         if group >= 7 {
@@ -3374,13 +3374,13 @@ impl TransformerBlock {
                                 if group >= 9 {
                                     if hidden.shape()[0] >= 33 {
                                         let _ = down_proj.forward_with_residual_into_encoder(
-                                            &hidden, &h, registry, &*encoder,
+                                            &hidden, &h, registry, encoder,
                                         )?;
                                     } else {
                                         let ffn_out = down_proj
-                                            .forward_into_encoder(&hidden, registry, &*encoder)?;
+                                            .forward_into_encoder(&hidden, registry, encoder)?;
                                         let _ = ops::binary::add_encode(
-                                            registry, &h, &ffn_out, &*encoder,
+                                            registry, &h, &ffn_out, encoder,
                                         )?;
                                     }
                                 }
