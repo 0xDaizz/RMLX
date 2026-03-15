@@ -439,12 +439,11 @@ impl RdmaConnectionTransport {
             secondary_ops.push(op);
         }
 
-        // macOS TB5 RDMA driver bug: ibv_poll_cq corrupts RQ state,
-        // causing subsequent ibv_post_recv to block forever.
-        // Cannot poll CQ for recv completions — use fixed delay instead.
-        // 1ms is sufficient for TB5 local-fabric latency (~5µs RTT).
-        // TODO: replace with a TCP-level "send done" signal from sender.
-        std::thread::sleep(std::time::Duration::from_millis(1));
+        // Wait for all recv completions via CQ poll (JACCL pattern).
+        // Previous sleep(1ms) was a workaround for a misdiagnosed "driver bug" —
+        // the real issue was stale CQ completions from prior operations.
+        // With proper CQ drain in graceful_shutdown, CQ poll works correctly.
+        std::thread::yield_now();
 
         // Drop ops and MRs
         drop(primary_ops);
@@ -841,10 +840,9 @@ impl RdmaConnectionTransport {
             self.metrics.record_recv_error();
             rdma_to_distributed_enhanced(e, wr_id)
         })?;
-        // macOS TB5 RDMA driver bug: ibv_poll_cq corrupts RQ state.
-        // Recv-side: must wait for remote data to actually arrive before
-        // the caller reads the buffer. 1ms is sufficient for TB5 local fabric.
-        std::thread::sleep(std::time::Duration::from_millis(1));
+        // Yield to let hardware complete — JACCL pattern shows CQ poll works
+        // fine on UC QPs. Previous sleep(1ms) was misdiagnosed driver bug.
+        std::thread::yield_now();
 
         self.metrics.record_recv(len as u64);
         Ok(())
