@@ -202,6 +202,7 @@ fn build_moe_layer(
         hidden_dim: hidden,
         intermediate_dim: inter,
         capacity_factor: 1.0,
+        enable_fp8: false,
     };
     let gate = make_gate(device, hidden, num_experts, 1000);
     let experts: Vec<Expert> = (0..num_experts)

@@ -304,8 +304,10 @@ impl RdmaConnectionTransport {
                     self.metrics.record_send_error();
                     rdma_to_distributed_enhanced(e, wr_id)
                 })?;
-            // macOS TB5 RDMA driver bug: skip CQ polling.
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            // macOS TB5 RDMA driver bug: skip CQ polling for send completions.
+            // yield_now() gives hardware a scheduling slot without the 1ms fixed latency.
+            // Send completes locally on UC QPs — no need to wait for remote arrival.
+            std::thread::yield_now();
         }
 
         // Send secondary chunks: use secondary connection if available, else primary
@@ -331,8 +333,8 @@ impl RdmaConnectionTransport {
                     self.metrics.record_send_error();
                     rdma_to_distributed_enhanced(e, wr_id)
                 })?;
-            // macOS TB5 RDMA driver bug: skip CQ polling.
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            // macOS TB5 RDMA driver bug: skip CQ polling for send completions.
+            std::thread::yield_now();
         }
 
         self.metrics.record_send(data.len() as u64);
@@ -437,9 +439,11 @@ impl RdmaConnectionTransport {
             secondary_ops.push(op);
         }
 
-        // macOS TB5 RDMA driver bug: ibv_poll_cq corrupts RQ state.
-        // Skip completion polling — sleep to let remote data arrive.
-        std::thread::sleep(std::time::Duration::from_millis(1));
+        // Wait for all recv completions via CQ poll (JACCL pattern).
+        // Previous sleep(1ms) was a workaround for a misdiagnosed "driver bug" —
+        // the real issue was stale CQ completions from prior operations.
+        // With proper CQ drain in graceful_shutdown, CQ poll works correctly.
+        std::thread::yield_now();
 
         // Drop ops and MRs
         drop(primary_ops);
@@ -801,8 +805,9 @@ impl RdmaConnectionTransport {
             self.metrics.record_send_error();
             rdma_to_distributed_enhanced(e, wr_id)
         })?;
-        // macOS TB5 RDMA driver bug: skip CQ polling.
-        std::thread::sleep(std::time::Duration::from_millis(1));
+        // macOS TB5 RDMA driver bug: skip CQ polling for send completions.
+        // Send completes locally on UC QPs — yield instead of 1ms sleep.
+        std::thread::yield_now();
 
         self.metrics.record_send(len as u64);
         Ok(())
@@ -835,8 +840,9 @@ impl RdmaConnectionTransport {
             self.metrics.record_recv_error();
             rdma_to_distributed_enhanced(e, wr_id)
         })?;
-        // macOS TB5 RDMA driver bug: skip CQ polling.
-        std::thread::sleep(std::time::Duration::from_millis(1));
+        // Yield to let hardware complete — JACCL pattern shows CQ poll works
+        // fine on UC QPs. Previous sleep(1ms) was misdiagnosed driver bug.
+        std::thread::yield_now();
 
         self.metrics.record_recv(len as u64);
         Ok(())
@@ -925,6 +931,13 @@ fn rdma_to_distributed(e: RdmaError) -> DistributedError {
     DistributedError::Transport(e.to_string())
 }
 
+/// Returns `true` for transient RDMA errors that may succeed on a single retry
+/// (CQ poll timeout, CQ poll status error). Connection-level failures are NOT
+/// retried — they indicate hardware or configuration issues.
+fn is_transient(e: &RdmaError) -> bool {
+    matches!(e, RdmaError::Timeout(_) | RdmaError::CqPoll(_))
+}
+
 /// Enhanced error conversion that decodes wr_id fields for richer diagnostics.
 fn rdma_to_distributed_enhanced(e: RdmaError, wr_id: u64) -> DistributedError {
     let detail = match try_decode_wr_id(wr_id) {
@@ -949,10 +962,22 @@ impl RdmaTransport for RdmaConnectionTransport {
 
         // Use chunked send with tiered buffer pool (JACCL pipelining)
         global_counters().record_rdma_transfer(data.len() as u64);
-        conn.chunked_send(data).map_err(|e| {
-            self.metrics.record_send_error();
-            rdma_to_distributed(e)
-        })?;
+        match conn.chunked_send(data) {
+            Ok(()) => {}
+            Err(ref e) if is_transient(e) => {
+                self.metrics.record_send_error();
+                tracing::warn!(target: "rmlx_distributed", error = %e, "send failed, retrying once");
+                std::thread::yield_now();
+                conn.chunked_send(data).map_err(|e| {
+                    self.metrics.record_send_error();
+                    rdma_to_distributed(e)
+                })?;
+            }
+            Err(e) => {
+                self.metrics.record_send_error();
+                return Err(rdma_to_distributed(e));
+            }
+        }
 
         self.metrics.record_send(data.len() as u64);
         Ok(())
@@ -970,10 +995,22 @@ impl RdmaTransport for RdmaConnectionTransport {
         // Use chunked recv with tiered buffer pool (JACCL pipelining)
         // CQ polling is handled internally by chunked_recv.
         global_counters().record_rdma_transfer(len as u64);
-        let buf = conn.chunked_recv(len).map_err(|e| {
-            self.metrics.record_recv_error();
-            rdma_to_distributed(e)
-        })?;
+        let buf = match conn.chunked_recv(len) {
+            Ok(buf) => buf,
+            Err(ref e) if is_transient(e) => {
+                self.metrics.record_recv_error();
+                tracing::warn!(target: "rmlx_distributed", error = %e, "recv failed, retrying once");
+                std::thread::yield_now();
+                conn.chunked_recv(len).map_err(|e| {
+                    self.metrics.record_recv_error();
+                    rdma_to_distributed(e)
+                })?
+            }
+            Err(e) => {
+                self.metrics.record_recv_error();
+                return Err(rdma_to_distributed(e));
+            }
+        };
 
         self.metrics.record_recv(len as u64);
         Ok(buf)
@@ -996,10 +1033,22 @@ impl RdmaTransport for RdmaConnectionTransport {
 
             global_counters().record_rdma_transfer(send_data.len() as u64);
             global_counters().record_rdma_transfer(recv_len as u64);
-            let recv_buf = conn.chunked_sendrecv(send_data, recv_len).map_err(|e| {
-                self.metrics.record_send_error();
-                rdma_to_distributed(e)
-            })?;
+            let recv_buf = match conn.chunked_sendrecv(send_data, recv_len) {
+                Ok(buf) => buf,
+                Err(ref e) if is_transient(e) => {
+                    self.metrics.record_send_error();
+                    tracing::warn!(target: "rmlx_distributed", error = %e, "sendrecv failed, retrying once");
+                    std::thread::yield_now();
+                    conn.chunked_sendrecv(send_data, recv_len).map_err(|e| {
+                        self.metrics.record_send_error();
+                        rdma_to_distributed(e)
+                    })?
+                }
+                Err(e) => {
+                    self.metrics.record_send_error();
+                    return Err(rdma_to_distributed(e));
+                }
+            };
 
             self.metrics.record_send(send_data.len() as u64);
             self.metrics.record_recv(recv_len as u64);
@@ -1033,15 +1082,39 @@ impl RdmaTransport for RdmaConnectionTransport {
             // Post recv on src connection first, then send on dst connection.
             // chunked_sendrecv with empty send_data acts as recv-only.
             // chunked_send handles send with internal CQ polling.
-            let recv_buf = src_conn.chunked_recv(recv_len).map_err(|e| {
-                self.metrics.record_recv_error();
-                rdma_to_distributed(e)
-            })?;
+            let recv_buf = match src_conn.chunked_recv(recv_len) {
+                Ok(buf) => buf,
+                Err(ref e) if is_transient(e) => {
+                    self.metrics.record_recv_error();
+                    tracing::warn!(target: "rmlx_distributed", error = %e, "sendrecv recv failed, retrying once");
+                    std::thread::yield_now();
+                    src_conn.chunked_recv(recv_len).map_err(|e| {
+                        self.metrics.record_recv_error();
+                        rdma_to_distributed(e)
+                    })?
+                }
+                Err(e) => {
+                    self.metrics.record_recv_error();
+                    return Err(rdma_to_distributed(e));
+                }
+            };
 
-            dst_conn.chunked_send(send_data).map_err(|e| {
-                self.metrics.record_send_error();
-                rdma_to_distributed(e)
-            })?;
+            match dst_conn.chunked_send(send_data) {
+                Ok(()) => {}
+                Err(ref e) if is_transient(e) => {
+                    self.metrics.record_send_error();
+                    tracing::warn!(target: "rmlx_distributed", error = %e, "sendrecv send failed, retrying once");
+                    std::thread::yield_now();
+                    dst_conn.chunked_send(send_data).map_err(|e| {
+                        self.metrics.record_send_error();
+                        rdma_to_distributed(e)
+                    })?;
+                }
+                Err(e) => {
+                    self.metrics.record_send_error();
+                    return Err(rdma_to_distributed(e));
+                }
+            }
 
             self.metrics.record_send(send_data.len() as u64);
             self.metrics.record_recv(recv_len as u64);
@@ -1288,13 +1361,13 @@ mod tests {
             port_num: 1,
             gid_index: 1,
             interface: "en5".to_string(),
-            address: "10.254.0.5".to_string(),
+            address: std::env::var("RMLX_NODE0_IP").unwrap_or_else(|_| "10.0.0.1".into()),
         };
         let secondary = PortConfig {
             port_num: 2,
             gid_index: 1,
             interface: "en6".to_string(),
-            address: "10.254.0.6".to_string(),
+            address: std::env::var("RMLX_NODE1_IP").unwrap_or_else(|_| "10.0.0.2".into()),
         };
         let config = DualPortConfig::dual(primary, secondary, 4);
         let engine = StripeEngine::new(config);

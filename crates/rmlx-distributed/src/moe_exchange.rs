@@ -1413,6 +1413,26 @@ impl MoeDispatchExchange {
         self.config.group.size()
     }
 
+    /// Reference to the communication group (includes transport if available).
+    pub fn group(&self) -> &Group {
+        &self.config.group
+    }
+
+    /// Whether an EP runtime context is attached (enables async dispatch/combine).
+    pub fn has_runtime_ctx(&self) -> bool {
+        self.runtime_ctx.is_some()
+    }
+
+    /// Reference to the EP runtime context, if attached.
+    pub fn runtime_ctx(&self) -> Option<&Arc<EpRuntimeContext>> {
+        self.runtime_ctx.as_ref()
+    }
+
+    /// Whether FP8 exchange is enabled in config.
+    pub fn is_fp8_enabled(&self) -> bool {
+        self.config.enable_fp8
+    }
+
     /// Compute the local expert index range `[start, end)` for this rank.
     ///
     /// Experts are evenly partitioned across ranks: rank `r` owns experts
@@ -1768,7 +1788,7 @@ impl MoeDispatchExchange {
 
         // Copy from SharedBuffer to return Vec (the SharedBuffer's Metal view
         // is now ready for GPU compute without additional copies)
-        let result = read_shared_buffer_bytes(shared_buf, local_buf_size.min(shared_buf.size()))?;
+        let result = read_shared_buffer_bytes(&shared_buf, local_buf_size.min(shared_buf.size()))?;
         let _ = expert_counts;
         Ok(RouteOutput {
             data: result,

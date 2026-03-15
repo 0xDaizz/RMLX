@@ -950,6 +950,16 @@ Wraps `TransformerModel` with tensor-parallel forward pass using Megatron-LM sty
 
 The near-linear scaling is achieved through the Megatron-LM pattern: column-parallel for attention/FFN projections that split along the output dimension, and row-parallel for output/down projections that split along the input dimension, with a single allreduce per transformer block.
 
+### Split-CB TP Path (Phase 7)
+
+`TransformerBlock::forward_with_group_split_cb()` batches attention ops into CB1 and FFN ops into CB2, with allreduce between. This reduces per-layer dispatch from 12 per-op dispatches to 2 command buffers + 2 allreduce syncs, yielding a 46x improvement (18,193 us to 392 us).
+
+| Method | Description |
+|--------|-------------|
+| `forward_with_group_split_cb()` | Split-CB tensor-parallel forward (attn CB1, allreduce, FFN CB2, allreduce) |
+| `forward_attn_into_cb()` | Encode attention ops (norm, QKV, RoPE, SDPA, O-proj, residual) into a single CB |
+| `forward_ffn_into_cb()` | Encode FFN ops (norm, gate/up, SiLU, down, residual) into a single CB |
+
 ---
 
 ## parallel.rs — Tensor-Parallel Layers

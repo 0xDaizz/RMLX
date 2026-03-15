@@ -2,8 +2,8 @@
 //! on the same device works correctly (tests RMLX wrapper Drop behavior).
 //!
 //! Usage:
-//!   RANK=0 PEER_IP=10.254.0.6 cargo run --release -p rmlx-rdma --example qp_reuse_test
-//!   RANK=1 PEER_IP=10.254.0.5 cargo run --release -p rmlx-rdma --example qp_reuse_test
+//!   RANK=0 PEER_IP=<node1-ip> cargo run --release -p rmlx-rdma --example qp_reuse_test
+//!   RANK=1 PEER_IP=<node0-ip> cargo run --release -p rmlx-rdma --example qp_reuse_test
 
 use std::io::{Read, Write};
 use std::mem::MaybeUninit;

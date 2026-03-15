@@ -9,21 +9,21 @@ and verifies RDMA connectivity between nodes via SSH.
 Usage:
     # Basic two-node setup
     python scripts/rdma_setup.py \\
-      --node hwstudio1:en5:10.254.0.5 \\
-      --node hwstudio2:en5:10.254.0.6 \\
+      --node node0:en5:10.0.0.1 \\
+      --node node1:en5:10.0.0.2 \\
       --netmask 30
 
-    # With SSH proxy (hwstudio2 reached via hwstudio1)
+    # With SSH proxy (node1 reached via node0)
     python scripts/rdma_setup.py \\
-      --node hwstudio1:en5:10.254.0.5 \\
-      --node hwstudio2:en5:10.254.0.6 \\
+      --node node0:en5:10.0.0.1 \\
+      --node node1:en5:10.0.0.2 \\
       --netmask 30 \\
-      --proxy hwstudio1:hwstudio2
+      --proxy node0:node1
 
     # Dry-run mode (print commands without executing)
     python scripts/rdma_setup.py \\
-      --node hwstudio1:en5:10.254.0.5 \\
-      --node hwstudio2:en5:10.254.0.6 \\
+      --node node0:en5:10.0.0.1 \\
+      --node node1:en5:10.0.0.2 \\
       --netmask 30 \\
       --dry-run
 """
@@ -185,10 +185,33 @@ def ssh_run(
 
 
 def step_remove_from_bridge(node: NodeConfig, netmask_bits: int, dry_run: bool) -> None:
-    """Check if the interface is in any bridge and remove it."""
+    """Remove interface from bridges AND kill Thunderbolt Bridge network service.
+
+    macOS recreates Thunderbolt Bridge on every reboot. Even if the interface
+    isn't visibly in a bridge (ifconfig bridge0 doesn't show it as member),
+    the network service can still override static IP assignments via configd.
+    """
     iface = node.interface
 
-    # Scan bridge0 through bridge9
+    # Step 1: Kill "Thunderbolt Bridge" network service (macOS Tahoe+)
+    # This is the most reliable way — networksetup level, not ifconfig level.
+    tb_result = ssh_run(
+        node.ssh_host,
+        'sudo networksetup -deletenetworkservice "Thunderbolt Bridge" 2>&1',
+        proxy=node.proxy,
+        dry_run=dry_run,
+    )
+    if dry_run:
+        pass
+    elif tb_result.returncode == 0:
+        print(f"  {OK} Deleted 'Thunderbolt Bridge' network service")
+    elif "not a recognized" in tb_result.stderr.lower() or "not exist" in tb_result.stdout.lower():
+        pass  # Already deleted, fine
+    else:
+        # Not fatal — might not exist on this OS version
+        pass
+
+    # Step 2: Also scan bridge0-bridge9 as fallback
     for i in range(10):
         bridge = f"bridge{i}"
         result = ssh_run(
@@ -204,7 +227,6 @@ def step_remove_from_bridge(node: NodeConfig, netmask_bits: int, dry_run: bool) 
             continue  # bridge doesn't exist
 
         # Check if our interface is a member
-        # macOS ifconfig shows: "member: en5 ..."
         if re.search(rf"\bmember:\s*{re.escape(iface)}\b", result.stdout):
             print(f"    Removing {iface} from {bridge}...")
             rm_result = ssh_run(
@@ -245,13 +267,49 @@ def step_set_static_ip(node: NodeConfig, netmask_bits: int, dry_run: bool) -> No
         node.ip_set = True
         return
 
-    if result.returncode == 0:
+    if result.returncode != 0:
+        print(f"  {FAIL} Failed to set IP: {result.stderr.strip()}")
+        return
+
+    # Verify IP actually stuck (macOS configd can override it)
+    import time
+    time.sleep(1)
+    verify = ssh_run(
+        node.ssh_host,
+        f"ifconfig {node.interface} 2>/dev/null",
+        proxy=node.proxy,
+        dry_run=dry_run,
+    )
+    if dry_run:
         node.ip_set = True
-        print(f"  {OK} Static IP set: {node.rdma_ip}/{netmask_bits}")
+        print(f"  {OK} (dry-run) Static IP: {node.rdma_ip}/{netmask_bits}")
+        return
+
+    if node.rdma_ip in verify.stdout:
+        node.ip_set = True
+        print(f"  {OK} Static IP verified: {node.rdma_ip}/{netmask_bits}")
     else:
-        print(
-            f"  {FAIL} Failed to set IP: {result.stderr.strip()}"
+        # IP was overridden — try again after deleting any remaining TB services
+        print(f"  {WARN} IP was overridden by macOS! Retrying...")
+        ssh_run(
+            node.ssh_host,
+            'sudo networksetup -deletenetworkservice "Thunderbolt Bridge" 2>/dev/null; '
+            f"sudo ifconfig {node.interface} {node.rdma_ip} netmask {mask}",
+            proxy=node.proxy,
+            dry_run=dry_run,
         )
+        time.sleep(1)
+        verify2 = ssh_run(
+            node.ssh_host,
+            f"ifconfig {node.interface} 2>/dev/null",
+            proxy=node.proxy,
+            dry_run=dry_run,
+        )
+        if node.rdma_ip in verify2.stdout:
+            node.ip_set = True
+            print(f"  {OK} Static IP verified (retry): {node.rdma_ip}/{netmask_bits}")
+        else:
+            print(f"  {FAIL} Static IP NOT holding — macOS keeps overriding")
 
 
 def step_check_rdma(node: NodeConfig, dry_run: bool) -> None:
@@ -423,9 +481,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 examples:
-  %(prog)s --node hwstudio1:en5:10.254.0.5 --node hwstudio2:en5:10.254.0.6
-  %(prog)s --node hwstudio1:en5:10.254.0.5 --node hwstudio2:en5:10.254.0.6 --proxy hwstudio1:hwstudio2
-  %(prog)s --node hwstudio1:en5:10.254.0.5 --node hwstudio2:en5:10.254.0.6 --dry-run
+  %(prog)s --node node0:en5:10.0.0.1 --node node1:en5:10.0.0.2
+  %(prog)s --node node0:en5:10.0.0.1 --node node1:en5:10.0.0.2 --proxy node0:node1
+  %(prog)s --node node0:en5:10.0.0.1 --node node1:en5:10.0.0.2 --dry-run
 """,
     )
     parser.add_argument(

@@ -59,6 +59,9 @@ impl RdmaContext {
                 CStr::from_ptr(name_ptr).to_string_lossy().into_owned()
             };
 
+            eprintln!(
+                "[rdma] open_default: opening device '{device_name}' (RMLX_RDMA_DEVICE not set)"
+            );
             let ctx = (lib.open_device)(device);
             (lib.free_device_list)(dev_list);
 
@@ -286,8 +289,10 @@ impl RdmaContext {
         // SAFETY: ctx is a valid ibv_context pointer.
         let pd = unsafe { (self.lib.alloc_pd)(self.ctx) };
         if pd.is_null() {
+            eprintln!("[rdma] alloc_pd FAILED on device '{}'", self.device_name);
             return Err(RdmaError::PdAlloc);
         }
+        eprintln!("[rdma] alloc_pd OK on device '{}'", self.device_name);
         Ok(ProtectionDomain { pd, lib: self.lib })
     }
 }
@@ -338,14 +343,12 @@ impl Drop for ProtectionDomain {
                     std::thread::sleep(std::time::Duration::from_millis(10));
                     ret = (self.lib.dealloc_pd)(self.pd);
                     if ret == 0 {
-                        eprintln!("[pd] ibv_dealloc_pd succeeded on retry {attempt}");
+                        tracing::info!(target: "rmlx_rdma", attempt, "ibv_dealloc_pd succeeded on retry");
                         break;
                     }
                 }
                 if ret != 0 {
-                    eprintln!(
-                        "[pd] WARNING: ibv_dealloc_pd returned {ret} after 3 retries — PD leaked"
-                    );
+                    tracing::warn!(target: "rmlx_rdma", ret, "ibv_dealloc_pd failed after 3 retries — PD leaked");
                 }
             }
         }
@@ -484,9 +487,11 @@ impl RdmaDeviceProbe {
                 continue;
             }
             // Found a non-link-local IPv4 GID
-            eprintln!(
-                "[rdma] probe_gid_index: selected index {idx} (IP={}.{}.{}.{})",
-                raw[12], raw[13], raw[14], raw[15]
+            tracing::info!(
+                target: "rmlx_rdma",
+                gid_index = idx,
+                ip = %format!("{}.{}.{}.{}", raw[12], raw[13], raw[14], raw[15]),
+                "probe_gid_index: selected non-link-local IPv4 GID",
             );
             return Ok(idx);
         }
@@ -498,7 +503,7 @@ impl RdmaDeviceProbe {
             if ret == 0 {
                 let raw = unsafe { gid.raw };
                 if raw.iter().any(|&b| b != 0) {
-                    eprintln!("[rdma] probe_gid_index: fallback to index 1");
+                    tracing::info!(target: "rmlx_rdma", "probe_gid_index: fallback to index 1");
                     return Ok(1);
                 }
             }
@@ -509,7 +514,7 @@ impl RdmaDeviceProbe {
             let mut gid: crate::ffi::IbvGid = unsafe { std::mem::zeroed() };
             let ret = unsafe { (lib.query_gid)(ctx.raw(), port, 0, &mut gid) };
             if ret == 0 {
-                eprintln!("[rdma] probe_gid_index: fallback to index 0");
+                tracing::info!(target: "rmlx_rdma", "probe_gid_index: fallback to index 0");
                 return Ok(0);
             }
         }

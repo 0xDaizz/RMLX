@@ -6,7 +6,7 @@ fn test_single_port_config() {
         port_num: 1,
         gid_index: 1,
         interface: "en5".into(),
-        address: "10.254.0.5".into(),
+        address: "10.0.0.1".into(),
     };
     let config = DualPortConfig::single(port);
     assert!(!config.has_dual());
@@ -18,13 +18,13 @@ fn test_dual_port_config() {
         port_num: 1,
         gid_index: 1,
         interface: "en5".into(),
-        address: "10.254.0.5".into(),
+        address: "10.0.0.1".into(),
     };
     let p2 = PortConfig {
         port_num: 2,
         gid_index: 1,
         interface: "en6".into(),
-        address: "10.254.0.7".into(),
+        address: "10.0.0.2".into(),
     };
     let config = DualPortConfig::dual(p1, p2, 8);
     assert!(config.has_dual());
@@ -36,7 +36,7 @@ fn test_stripe_plan_single_port() {
         port_num: 1,
         gid_index: 1,
         interface: "en5".into(),
-        address: "10.254.0.5".into(),
+        address: "10.0.0.1".into(),
     };
     let engine = StripeEngine::new(DualPortConfig::single(port));
     let plan = engine.plan(1024, 256);
@@ -51,13 +51,13 @@ fn test_stripe_plan_dual_port() {
         port_num: 1,
         gid_index: 1,
         interface: "en5".into(),
-        address: "10.254.0.5".into(),
+        address: "10.0.0.1".into(),
     };
     let p2 = PortConfig {
         port_num: 2,
         gid_index: 1,
         interface: "en6".into(),
-        address: "10.254.0.7".into(),
+        address: "10.0.0.2".into(),
     };
     let engine = StripeEngine::new(DualPortConfig::dual(p1, p2, 4));
     // 16KB / 1KB chunks = 16 chunks >= threshold 4
@@ -79,13 +79,13 @@ fn test_stripe_below_threshold() {
         port_num: 1,
         gid_index: 1,
         interface: "en5".into(),
-        address: "10.254.0.5".into(),
+        address: "10.0.0.1".into(),
     };
     let p2 = PortConfig {
         port_num: 2,
         gid_index: 1,
         interface: "en6".into(),
-        address: "10.254.0.7".into(),
+        address: "10.0.0.2".into(),
     };
     let engine = StripeEngine::new(DualPortConfig::dual(p1, p2, 8));
     // 4 chunks < threshold 8 => all on primary
@@ -145,13 +145,13 @@ fn test_chunk_ordering() {
         port_num: 1,
         gid_index: 1,
         interface: "en5".into(),
-        address: "10.254.0.5".into(),
+        address: "10.0.0.1".into(),
     };
     let p2 = PortConfig {
         port_num: 2,
         gid_index: 1,
         interface: "en6".into(),
-        address: "10.254.0.7".into(),
+        address: "10.0.0.2".into(),
     };
     let engine = StripeEngine::new(DualPortConfig::dual(p1, p2, 4));
     let plan = engine.plan(8192, 1024);
@@ -172,13 +172,13 @@ fn test_split_reassemble_roundtrip_dual_port() {
         port_num: 1,
         gid_index: 1,
         interface: "en5".into(),
-        address: "10.254.0.5".into(),
+        address: "10.0.0.1".into(),
     };
     let p2 = PortConfig {
         port_num: 2,
         gid_index: 1,
         interface: "en6".into(),
-        address: "10.254.0.7".into(),
+        address: "10.0.0.2".into(),
     };
     let engine = StripeEngine::new(DualPortConfig::dual(p1, p2, 4));
 
@@ -212,7 +212,7 @@ fn test_split_reassemble_roundtrip_single_port() {
         port_num: 1,
         gid_index: 1,
         interface: "en5".into(),
-        address: "10.254.0.5".into(),
+        address: "10.0.0.1".into(),
     };
     let engine = StripeEngine::new(DualPortConfig::single(port));
 
@@ -243,13 +243,13 @@ fn test_split_reassemble_uneven_chunks() {
         port_num: 1,
         gid_index: 1,
         interface: "en5".into(),
-        address: "10.254.0.5".into(),
+        address: "10.0.0.1".into(),
     };
     let p2 = PortConfig {
         port_num: 2,
         gid_index: 1,
         interface: "en6".into(),
-        address: "10.254.0.7".into(),
+        address: "10.0.0.2".into(),
     };
     let engine = StripeEngine::new(DualPortConfig::dual(p1, p2, 2));
 

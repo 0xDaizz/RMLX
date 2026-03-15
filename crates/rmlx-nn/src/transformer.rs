@@ -4408,6 +4408,194 @@ impl TransformerModel {
 
 #[cfg(feature = "distributed")]
 impl TransformerBlock {
+    /// Attention half of a transformer block, encoded into a single command buffer.
+    ///
+    /// Returns the attention partial output (before allreduce).
+    /// Used by Split-CB TP path to batch attention ops into one CB.
+    ///
+    /// Does NOT commit or wait — the caller manages the CB lifecycle.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_attn_into_cb(
+        &self,
+        x: &Array,
+        cos_freqs: Option<&Array>,
+        sin_freqs: Option<&Array>,
+        mask: Option<&Array>,
+        cache: Option<&mut LayerKvCache>,
+        registry: &KernelRegistry,
+        cb: &ProtocolObject<dyn MTLCommandBuffer>,
+    ) -> Result<Array, KernelError> {
+        let norm1_w = self.norm1_weight.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape("TransformerBlock: norm1_weight not loaded".into())
+        })?;
+
+        // Attention: norm + QKV + RoPE + cache + SDPA + O_proj
+        // Returns partial sum (each TP rank's portion before allreduce)
+        self.attention.forward_decode_single_cb(
+            x,
+            norm1_w,
+            self.rms_norm_eps,
+            cos_freqs,
+            sin_freqs,
+            mask,
+            cache,
+            registry,
+            cb,
+        )
+    }
+
+    /// FFN half of a transformer block, encoded into a single command buffer.
+    ///
+    /// Takes the original input `x` and the **allreduced** attention output.
+    /// Computes:
+    /// 1. Residual: `h = x + attn_out`
+    /// 2. RMSNorm + gate/up GEMM + SiLU*mul + down GEMM (NO residual epilogue)
+    ///
+    /// Returns `(h, ffn_partial)` where:
+    /// - `h` is the post-attention residual (needed for the final residual add)
+    /// - `ffn_partial` is the raw down-projection output (before allreduce)
+    ///
+    /// Does NOT commit or wait — the caller manages the CB lifecycle.
+    pub fn forward_ffn_into_cb(
+        &self,
+        x: &Array,
+        attn_out: &Array,
+        registry: &KernelRegistry,
+        cb: &ProtocolObject<dyn MTLCommandBuffer>,
+    ) -> Result<(Array, Array), KernelError> {
+        let norm2_w = self.norm2_weight.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape("TransformerBlock: norm2_weight not loaded".into())
+        })?;
+
+        // Residual connection 1: h = x + attn_out (attn_out is already allreduced)
+        let h = ops::binary::add_into_cb(registry, x, attn_out, cb)?;
+
+        // FFN: norm + gate/up + SiLU*mul + down — WITHOUT residual epilogue
+        // (We need the raw partial sum for allreduce before adding the residual)
+        let ffn_partial = match &self.ffn {
+            FeedForward::Gated {
+                gate_proj,
+                up_proj,
+                down_proj,
+                gate_up_merged_weight_t,
+                ..
+            } => {
+                let h_2d = if h.ndim() == 1 {
+                    h.reshape(vec![1, h.shape()[0]])?
+                } else {
+                    h.reshape(vec![h.shape()[0], h.shape()[1]])?
+                };
+
+                let hidden = if let Some(ref guw_t) = gate_up_merged_weight_t {
+                    // Fused RMSNorm + merged gate+up GEMM
+                    let merged = ops::matmul::matmul_norm_gemm_into_cb(
+                        registry,
+                        &h_2d,
+                        guw_t,
+                        norm2_w,
+                        self.rms_norm_eps,
+                        cb,
+                    )?;
+                    let gate_dim = guw_t.shape()[1] / 2;
+                    ops::fused::fused_silu_mul_strided_into_cb(registry, &merged, gate_dim, cb)?
+                } else {
+                    // Fallback: separate norm + 2 GEMMs
+                    let normed = ops::rms_norm::rms_norm_into_cb(
+                        registry,
+                        &h_2d,
+                        Some(norm2_w),
+                        self.rms_norm_eps,
+                        cb,
+                    )?;
+                    let wgate_t = gate_proj.weight_transposed_contiguous()?;
+                    let wup_t = up_proj.weight_transposed_contiguous()?;
+                    let (gate_out, up_out) = ops::fused::batched_gate_up_into_cb(
+                        registry, &normed, &wgate_t, &wup_t, cb,
+                    )?;
+                    ops::fused::fused_silu_mul_into_cb(registry, &gate_out, &up_out, cb)?
+                };
+
+                // Down projection WITHOUT residual (raw partial sum for TP allreduce)
+                down_proj.forward_into_cb(&hidden, registry, cb)?
+            }
+            _ => {
+                return Err(KernelError::InvalidShape(
+                    "forward_ffn_into_cb only supports Gated FFN".into(),
+                ));
+            }
+        };
+
+        Ok((h, ffn_partial))
+    }
+
+    /// TP forward using Split-CB: 2 command buffers + 2 allreduce syncs per layer.
+    ///
+    /// Reduces per-op dispatch overhead vs current `forward_with_group` (many
+    /// individual dispatches → 2 batched CBs).
+    ///
+    /// Flow:
+    /// 1. **CB1**: attention (norm + QKV + RoPE + SDPA + O_proj) → `attn_partial`
+    /// 2. **Allreduce** `attn_partial` → `attn_full`
+    /// 3. **CB2**: residual + FFN (norm + gate/up + SiLU + down) → `(h, ffn_partial)`
+    /// 4. **Allreduce** `ffn_partial` → `ffn_full`
+    /// 5. **CB3**: final residual `h + ffn_full` → output
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_group_split_cb(
+        &self,
+        x: &Array,
+        cos_freqs: Option<&Array>,
+        sin_freqs: Option<&Array>,
+        mask: Option<&Array>,
+        cache: Option<&mut LayerKvCache>,
+        group: &rmlx_distributed::group::Group,
+        device: &ProtocolObject<dyn MTLDevice>,
+        registry: &KernelRegistry,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
+    ) -> Result<Array, KernelError> {
+        // ── CB1: Attention block (all ops in one command buffer) ──
+        let cb1 = queue
+            .commandBufferWithUnretainedReferences()
+            .ok_or_else(|| {
+                KernelError::Internal("Failed to create command buffer for attention CB".into())
+            })?;
+        let attn_partial =
+            self.forward_attn_into_cb(x, cos_freqs, sin_freqs, mask, cache, registry, &cb1)?;
+        cb1.commit();
+        cb1.waitUntilCompleted();
+
+        // ── Allreduce attention output across TP ranks ──
+        let attn_out = group.allreduce_sum(&attn_partial, device).map_err(|e| {
+            KernelError::Internal(format!("TP allreduce after attention failed: {e}"))
+        })?;
+
+        // ── CB2: FFN block (residual + norm + gate/up + SiLU + down) ──
+        let cb2 = queue
+            .commandBufferWithUnretainedReferences()
+            .ok_or_else(|| {
+                KernelError::Internal("Failed to create command buffer for FFN CB".into())
+            })?;
+        let (h, ffn_partial) = self.forward_ffn_into_cb(x, &attn_out, registry, &cb2)?;
+        cb2.commit();
+        cb2.waitUntilCompleted();
+
+        // ── Allreduce FFN output across TP ranks ──
+        let ffn_out = group
+            .allreduce_sum(&ffn_partial, device)
+            .map_err(|e| KernelError::Internal(format!("TP allreduce after FFN failed: {e}")))?;
+
+        // ── CB3: Final residual connection (h + ffn_full) ──
+        let cb3 = queue
+            .commandBufferWithUnretainedReferences()
+            .ok_or_else(|| {
+                KernelError::Internal("Failed to create command buffer for residual CB".into())
+            })?;
+        let output = ops::binary::add_into_cb(registry, &h, &ffn_out, &cb3)?;
+        cb3.commit();
+        cb3.waitUntilCompleted();
+
+        Ok(output)
+    }
+
     /// TP-aware forward pass for one transformer block.
     ///
     /// Assumes weights are **pre-sharded** across ranks (Megatron-LM pattern):

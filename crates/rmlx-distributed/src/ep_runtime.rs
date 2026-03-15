@@ -10,7 +10,7 @@ use rmlx_alloc::zero_copy::CompletionTicket;
 use rmlx_metal::event::GpuEvent;
 use rmlx_rdma::gpu_doorbell::{DescriptorProxy, DescriptorRing};
 use rmlx_rdma::progress::ProgressEngine;
-use rmlx_rdma::shared_buffer::{ConnectionId, SharedBufferPool};
+use rmlx_rdma::shared_buffer::{ConnectionId, SharedBuffer, SharedBufferPool};
 
 use crate::credit_manager::CreditManager;
 use crate::perf_counters::global_counters;
@@ -35,6 +35,8 @@ pub struct AcquiredBuffer {
     _pool: Arc<Mutex<SharedBufferPool>>,
     /// Whether the caller actually wrote data into this buffer.
     used: bool,
+    /// Direct reference to the underlying SharedBuffer for async RDMA ops.
+    shared_buf: Arc<SharedBuffer>,
 }
 
 // SAFETY: AcquiredBuffer owns a raw pointer into SharedBuffer storage managed
@@ -59,6 +61,11 @@ impl AcquiredBuffer {
     /// Whether this buffer has been marked as written to.
     pub fn is_used(&self) -> bool {
         self.used
+    }
+
+    /// Access the underlying SharedBuffer for async RDMA operations.
+    pub fn shared_buffer(&self) -> &Arc<SharedBuffer> {
+        &self.shared_buf
     }
 
     /// Release this buffer back to the pool by marking the ticket complete.
@@ -268,6 +275,33 @@ impl EpRuntimeContext {
         &self.transfer_event
     }
 
+    /// Acquire a single SharedBuffer from the pool.
+    ///
+    /// Returns an `AcquiredBuffer` handle that holds the buffer in-use.
+    /// Dropping the handle (or calling `.release()`) returns the buffer to the pool.
+    pub fn acquire_buffer(
+        &self,
+        size: usize,
+    ) -> Result<AcquiredBuffer, crate::group::DistributedError> {
+        let mut pool = self.shared_pool.lock();
+        let buf = pool.acquire(size).ok_or_else(|| {
+            crate::group::DistributedError::Transport(format!(
+                "no buffer available (need {size} bytes)"
+            ))
+        })?;
+        let ticket = CompletionTicket::new();
+        buf.set_ticket(ticket.clone());
+        Ok(AcquiredBuffer {
+            ptr: buf.as_ptr(),
+            size: buf.size(),
+            slot_index: buf.slot_index(),
+            ticket,
+            _pool: Arc::clone(&self.shared_pool),
+            used: false,
+            shared_buf: buf,
+        })
+    }
+
     /// Acquire paired send/recv SharedBuffers from the pool for each peer.
     ///
     /// Returns two vectors indexed by rank:
@@ -317,6 +351,7 @@ impl EpRuntimeContext {
                 ticket: send_ticket,
                 _pool: Arc::clone(&self.shared_pool),
                 used: false,
+                shared_buf: Arc::clone(&send),
             });
 
             // Acquire recv buffer and attach a ticket to mark it in-use.
@@ -334,6 +369,7 @@ impl EpRuntimeContext {
                 ticket: recv_ticket,
                 _pool: Arc::clone(&self.shared_pool),
                 used: false,
+                shared_buf: Arc::clone(&recv),
             });
         }
 

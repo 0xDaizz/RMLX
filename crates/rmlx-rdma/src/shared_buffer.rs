@@ -11,6 +11,7 @@
 use rustc_hash::FxHashMap;
 use std::ffi::c_void;
 use std::ptr::NonNull;
+use std::sync::Arc;
 
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLDevice;
@@ -41,7 +42,7 @@ pub struct SharedBuffer {
     slot_index: u8,
     metal_buffer: MtlBuffer,
     rdma_registrations: FxHashMap<ConnectionId, MemoryRegion>,
-    ticket: Option<CompletionTicket>,
+    ticket: parking_lot::Mutex<Option<CompletionTicket>>,
 }
 
 // SAFETY: SharedBuffer owns its allocation. The raw pointer is heap-allocated
@@ -49,6 +50,10 @@ pub struct SharedBuffer {
 // (CPU+GPU coherent on UMA). MemoryRegion is Send. HashMap is Send when
 // key/value are Send.
 unsafe impl Send for SharedBuffer {}
+// SAFETY: Interior mutability for `ticket` is guarded by parking_lot::Mutex.
+// All other fields are either read-only after construction (raw_ptr, size,
+// slot_index, metal_buffer) or accessed through &mut self (rdma_registrations).
+unsafe impl Sync for SharedBuffer {}
 
 impl SharedBuffer {
     /// Allocate a new SharedBuffer with CPU + Metal views.
@@ -100,7 +105,7 @@ impl SharedBuffer {
             slot_index,
             metal_buffer,
             rdma_registrations: FxHashMap::default(),
-            ticket: None,
+            ticket: parking_lot::Mutex::new(None),
         })
     }
 
@@ -150,8 +155,10 @@ impl SharedBuffer {
     }
 
     /// Attach a completion ticket for GPU/RDMA lifecycle tracking.
-    pub fn set_ticket(&mut self, ticket: CompletionTicket) {
-        self.ticket = Some(ticket);
+    ///
+    /// Uses interior mutability so this works through `Arc<SharedBuffer>`.
+    pub fn set_ticket(&self, ticket: CompletionTicket) {
+        *self.ticket.lock() = Some(ticket);
     }
 
     /// Returns true if the buffer is available for reuse.
@@ -159,7 +166,7 @@ impl SharedBuffer {
     /// A buffer is available if no completion ticket is attached, or if the
     /// attached ticket indicates both GPU and RDMA operations have completed.
     pub fn is_available(&self) -> bool {
-        match &self.ticket {
+        match &*self.ticket.lock() {
             Some(t) => t.is_safe_to_free(),
             None => true,
         }
@@ -179,7 +186,7 @@ impl Drop for SharedBuffer {
 /// A tier of identically-sized SharedBuffers.
 pub struct SharedBufferTier {
     size: usize,
-    buffers: Vec<SharedBuffer>,
+    buffers: Vec<Arc<SharedBuffer>>,
 }
 
 /// Pool of SharedBuffers organized by size tier.
@@ -202,7 +209,7 @@ impl SharedBufferPool {
             for slot in 0..PIPELINE {
                 let slot_index = (tier_idx * PIPELINE + slot) as u8;
                 let buf = SharedBuffer::new(device, size, slot_index)?;
-                buffers.push(buf);
+                buffers.push(Arc::new(buf));
             }
             tiers.push(SharedBufferTier { size, buffers });
         }
@@ -210,14 +217,20 @@ impl SharedBufferPool {
     }
 
     /// Register all buffers on the given connections.
+    ///
+    /// Must be called before any `acquire()` — at this point each `Arc` has
+    /// exactly one strong reference (held by the pool), so `Arc::get_mut`
+    /// succeeds.
     pub fn register_all(
         &mut self,
         connections: &[(ConnectionId, &ProtectionDomain)],
     ) -> Result<(), RdmaError> {
         for tier in &mut self.tiers {
             for buf in &mut tier.buffers {
+                let buf_mut = Arc::get_mut(buf)
+                    .expect("SharedBuffer has multiple owners during registration");
                 for &(conn_id, pd) in connections {
-                    buf.register_on(conn_id, pd)?;
+                    buf_mut.register_on(conn_id, pd)?;
                 }
             }
         }
@@ -226,14 +239,14 @@ impl SharedBufferPool {
 
     /// Acquire an available buffer of at least `needed_bytes`.
     ///
-    /// Finds the smallest tier that fits and returns a mutable reference
-    /// to the first available buffer. Returns `None` if all are in use.
-    pub fn acquire(&mut self, needed_bytes: usize) -> Option<&mut SharedBuffer> {
+    /// Finds the smallest tier that fits and returns a cloned `Arc` to the
+    /// first available buffer. Returns `None` if all are in use.
+    pub fn acquire(&mut self, needed_bytes: usize) -> Option<Arc<SharedBuffer>> {
         for tier in &mut self.tiers {
             if tier.size >= needed_bytes {
-                for buf in &mut tier.buffers {
+                for buf in &tier.buffers {
                     if buf.is_available() {
-                        return Some(buf);
+                        return Some(Arc::clone(buf));
                     }
                 }
             }

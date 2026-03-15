@@ -5,6 +5,7 @@
 
 use bytemuck::Zeroable as _;
 use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::time::{Duration, Instant};
@@ -445,6 +446,10 @@ pub struct RdmaConnection {
     pool: Option<RdmaBufferPool>,
     /// Pre-registered MR pool (lazily initialized via `init_mr_pool`).
     mr_pool: Option<MrPool>,
+    /// Cache of nocopy MR registrations keyed by (ptr, len).
+    /// Metal buffers on UMA have stable addresses for their lifetime,
+    /// so reusing the MR avoids ~10-50µs per-transfer ibv_reg_mr overhead.
+    mr_cache: Mutex<HashMap<(usize, usize), Arc<MemoryRegion>>>,
     qp: QueuePair,
     cq: CompletionQueue,
     pd: Arc<ProtectionDomain>,
@@ -479,6 +484,7 @@ impl RdmaConnection {
             completion_backlog: Mutex::new(Vec::new()),
             pool,
             mr_pool: None,
+            mr_cache: Mutex::new(HashMap::new()),
             qp,
             cq,
             pd,
@@ -535,6 +541,7 @@ impl RdmaConnection {
             completion_backlog: Mutex::new(Vec::new()),
             pool,
             mr_pool: None,
+            mr_cache: Mutex::new(HashMap::new()),
             qp,
             cq,
             pd,
@@ -835,13 +842,10 @@ impl RdmaConnection {
                     self.config.accept_timeout_secs,
                     10,
                 )?;
-                // macOS TB5 RDMA driver bug: ibv_poll_cq corrupts RQ state,
-                // causing subsequent ibv_post_recv to block forever.
-                // Skip completion polling entirely — data arrives regardless.
-                std::thread::sleep(Duration::from_millis(1));
+                self.wait_completions(&[recv_wr_id])?;
 
                 let _send_op = self.post_send(&mr, 0, WARMUP_SIZE as u32, send_wr_id)?;
-                std::thread::sleep(Duration::from_millis(1));
+                self.wait_completions(&[send_wr_id])?;
             } else {
                 // Rank 1: send then recv
                 let _recv_op = self.post_recv(&mr, 0, WARMUP_SIZE as u32, recv_wr_id)?;
@@ -855,8 +859,7 @@ impl RdmaConnection {
                 )?;
 
                 let _send_op = self.post_send(&mr, 0, WARMUP_SIZE as u32, send_wr_id)?;
-                // macOS TB5 RDMA driver bug: skip CQ polling.
-                std::thread::sleep(Duration::from_millis(1));
+                self.wait_completions(&[recv_wr_id, send_wr_id])?;
             }
         }
 
@@ -953,15 +956,33 @@ impl RdmaConnection {
     /// device-visible memory.  Falls back (returns `Err`) if MR registration
     /// fails (e.g., TB5 driver limitation).
     fn try_nocopy_send(&self, data: &[u8]) -> Result<(), RdmaError> {
-        // SAFETY: data.as_ptr() is page-aligned and valid for data.len() bytes
-        // (checked by caller). The slice stays alive until this function returns
-        // and the MR is dropped.
-        let mr = unsafe {
-            MemoryRegion::register_nocopy(
-                &self.pd,
-                data.as_ptr() as *mut std::ffi::c_void,
-                data.len(),
-            )?
+        let key = (data.as_ptr() as usize, data.len());
+
+        // Check MR cache first — reuse existing registration if available
+        let mr = {
+            let cache = self.mr_cache.lock();
+            cache.get(&key).cloned()
+        };
+
+        let mr = match mr {
+            Some(mr) => mr,
+            None => {
+                // SAFETY: data.as_ptr() is page-aligned and valid for data.len() bytes
+                // (checked by caller). The MR is cached and lives for the connection
+                // lifetime — the caller must ensure the underlying Metal buffer outlives
+                // the connection (true for UMA inference buffers).
+                let new_mr = unsafe {
+                    MemoryRegion::register_nocopy(
+                        &self.pd,
+                        data.as_ptr() as *mut std::ffi::c_void,
+                        data.len(),
+                    )?
+                };
+                #[allow(clippy::arc_with_non_send_sync)]
+                let new_mr = Arc::new(new_mr);
+                self.mr_cache.lock().insert(key, Arc::clone(&new_mr));
+                new_mr
+            }
         };
 
         let mut sge = IbvSge {
@@ -996,18 +1017,17 @@ impl RdmaConnection {
                 break;
             }
             if Instant::now() >= deadline {
-                // HW may still be accessing the buffer — leak the MR to prevent
-                // use-after-deregister. The MR will never be freed, but this is
-                // better than a potential crash.
-                std::mem::forget(mr);
+                // MR is cached (Arc'd) — no need to leak. The cache holds a reference,
+                // so the MR stays registered even after we return an error.
                 return Err(RdmaError::Timeout(
-                    "try_nocopy_send: timeout waiting for completion (MR leaked for safety)".into(),
+                    "try_nocopy_send: timeout waiting for completion".into(),
                 ));
             }
             std::thread::yield_now();
         }
 
-        // MR dropped here — deregisters the nocopy region
+        // MR Arc ref dropped here — the cache still holds a reference,
+        // keeping the MR registered for future reuse.
         Ok(())
     }
 
@@ -1015,8 +1035,13 @@ impl RdmaConnection {
     /// Handles arbitrary message sizes by streaming through pre-registered buffers.
     pub fn chunked_send(&self, data: &[u8]) -> Result<(), RdmaError> {
         // Fast path: try nocopy for page-aligned, large-enough buffers (UMA optimization)
+        // Only valid for single-chunk messages — multi-chunk payloads must use the
+        // chunked path so each send matches the receiver's per-chunk recv buffer size.
         const PAGE_SIZE: usize = 16384; // macOS page size
-        if data.len() >= PAGE_SIZE
+        let (_tier, chunk_size) = buffer_size_from_message(data.len());
+        let single_chunk = data.len() <= chunk_size;
+        if single_chunk
+            && data.len() >= PAGE_SIZE
             && (data.as_ptr() as usize) % PAGE_SIZE == 0
             && data.len() <= crate::mr::DEFAULT_MAX_MR_SIZE
         {
@@ -1198,13 +1223,14 @@ impl RdmaConnection {
                     recv_offset += chunk_size;
                 }
 
-                // Post next recv if more data expected
+                // Post next recv if more data expected AND current in-flight
+                // recvs aren't sufficient to cover remaining chunks.
                 let remaining_recvs = if recv_total > recv_offset {
                     (recv_total - recv_offset).div_ceil(chunk_size)
                 } else {
                     0
                 };
-                if remaining_recvs > 0 {
+                if remaining_recvs > in_flight as usize {
                     let rbuf = &pool.recv[tier][buf_idx];
                     let mut sge = IbvSge {
                         addr: rbuf.addr(),
@@ -1258,6 +1284,12 @@ impl RdmaConnection {
         let recv_total = recv_len;
 
         let mut in_flight: u32 = 0;
+        let recv_chunks_needed = if recv_len > 0 {
+            recv_len.div_ceil(chunk_size)
+        } else {
+            0
+        };
+        let mut recvs_posted: usize = 0;
         let mut wc_buf: [IbvWc; 4] = core::array::from_fn(|_| IbvWc::zeroed());
 
         // Encode wr_id: (type << 16) | (buf_idx << 8) — JACCL pattern
@@ -1285,6 +1317,7 @@ impl RdmaConnection {
                 };
                 self.qp.post_recv(&mut wr)?;
                 in_flight += 1;
+                recvs_posted += 1;
                 buf_idx += 1;
             }
         }
@@ -1313,7 +1346,7 @@ impl RdmaConnection {
 
                 self.qp.post_send(&mut wr)?;
                 in_flight += 1;
-                send_offset += chunk_size;
+                send_offset += chunk;
                 buf_idx += 1;
             }
         }
@@ -1366,7 +1399,7 @@ impl RdmaConnection {
 
                         self.qp.post_send(&mut wr)?;
                         in_flight += 1;
-                        send_offset += chunk_size;
+                        send_offset += chunk;
                     }
                 } else if work_type == RECV_WR {
                     // Recv completed — copy data out and post next recv if needed
@@ -1375,15 +1408,10 @@ impl RdmaConnection {
                         let rbuf = &pool.recv[tier][buf_idx];
                         let src = rbuf.read(chunk);
                         recv_result[recv_offset..recv_offset + chunk].copy_from_slice(&src);
-                        recv_offset += chunk_size;
+                        recv_offset += chunk;
                     }
                     // Post next recv if more data expected
-                    let remaining_recvs = if recv_total > recv_offset {
-                        (recv_total - recv_offset).div_ceil(chunk_size)
-                    } else {
-                        0
-                    };
-                    if remaining_recvs > 0 {
+                    if recvs_posted < recv_chunks_needed {
                         let rbuf = &pool.recv[tier][buf_idx];
                         let mut sge = IbvSge {
                             addr: rbuf.addr(),
@@ -1399,6 +1427,7 @@ impl RdmaConnection {
                         };
                         self.qp.post_recv(&mut wr)?;
                         in_flight += 1;
+                        recvs_posted += 1;
                     }
                 }
             }

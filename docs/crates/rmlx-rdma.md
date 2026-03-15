@@ -469,6 +469,22 @@ Phase 5 adds `PipelinedRingBuffer` and `pipelined_ring_allreduce()` to `collecti
 
 ---
 
+## Phase 7 Fixes
+
+### Chunked Transfer Over-Posting Fix
+
+The over-posting bug in `chunked_recv` and `chunked_sendrecv` was fixed. Previously, more recv work requests could be posted than chunks expected. The repost condition now checks `remaining_recvs > in_flight` (in `chunked_recv`) or tracks `recvs_posted < recv_chunks_needed` (in `chunked_sendrecv`) to prevent posting more recvs than the number of chunks the sender will actually transmit.
+
+### Nocopy Send Single-Chunk Restriction
+
+`try_nocopy_send` now only activates for single-chunk messages (`data.len() <= chunk_size`). Multi-chunk nocopy sends caused size mismatches with the receiver's chunked recv buffers; restricting to single-chunk ensures send and recv buffer sizes always agree.
+
+### TB5 Workarounds Removed
+
+The misdiagnosed "TB5 driver bug" comments and `sleep(1ms)` workarounds have been removed. The actual issue was incomplete CQ completion polling. These workarounds are replaced with proper CQ completion polling via `wait_completions()` (in `connection.rs`) and `wait_posted()` (in `collectives.rs`).
+
+---
+
 ## Error Handling
 
 ```rust

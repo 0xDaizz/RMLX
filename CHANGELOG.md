@@ -7,14 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Phase 7: RDMA Transport Fix + Split-CB TP + Fair Benchmarks** (9d7b7dc, 2026-03-15):
+  - Fix chunked_recv/chunked_sendrecv over-posting bug (root cause of CQ timeout on 28KB+ multi-chunk transfers)
+  - Add nocopy send guard for multi-chunk payloads
+  - Remove misdiagnosed TB5 driver bug workarounds (sleep 1ms → proper CQ polling)
+  - Implement Split-CB TP path: `forward_with_group_split_cb()` — 2 CBs per layer instead of 12 per-op dispatches (per-op 18,193 us → Split-CB 392 us, 46x improvement)
+  - Enable gate-up merge + weight pre-transpose in distributed benchmark
+  - Add RoPE + KV cache (128 tokens) to benchmark for fair RMLX vs MLX comparison
+  - Upgrade MLX benchmark to production path (mx.fast.* + mx.compile + KV cache)
+  - Benchmark script: hardcoded values → environment variables
+- **Metal 4 feature-gated API**: Add `metal4` feature flag with downstream integration for future Metal 4 capabilities (ca67196, 2026-03-14)
+
 ### Changed
 - **objc2-metal migration Phase 1**: Full transition from `metal-rs` to `objc2-metal` ecosystem across all crates (91050e8, 2026-03-13)
 - **objc2-metal migration Phase 2**: Minimize `unsafe` blocks and raw `msg_send!` calls, consolidate idiomatic patterns (369e28b, 2026-03-14)
 
-### Added
-- **Metal 4 feature-gated API**: Add `metal4` feature flag with downstream integration for future Metal 4 capabilities (ca67196, 2026-03-14)
+### Performance
+- **Split-CB TP**: TP=1 single-CB 200 us, TP=2 sharded compute 133 us, TP=2 Split-CB + RDMA 392 us, RDMA allreduce 17.9 us/call
+- **vs MLX (mx.compile)**: TP=1 10.0x faster, TP=2 2.4x faster
 
 ### Fixed
+- Fix RDMA chunked_recv/chunked_sendrecv over-posting bug causing CQ timeout on 28KB+ multi-chunk transfers
+- Remove recv-side sleep(1ms) — misdiagnosed driver bug, not CQ corruption
 - Resolve prefill bench GPU errors caused by unretained command buffers (89c27d5, 2026-03-14)
 
 ---

@@ -24,6 +24,7 @@ use rmlx_rdma::context::RdmaContext;
 use rmlx_rdma::coordinator::CoordinatorConfig;
 use rmlx_rdma::device_file::DeviceMap;
 use rmlx_rdma::multi_port::Topology;
+use rmlx_rdma::progress::ProgressEngine;
 use rmlx_rdma::qp::{CompletionQueue, QpInfo, QueuePair};
 
 use crate::group::{DistributedError, Group};
@@ -263,7 +264,7 @@ fn try_rdma_init(
 
     // Load device file for per-peer device selection.
     let device_map = load_device_map(config);
-    eprintln!("[rdma-init] device_map loaded: {}", device_map.is_some());
+    tracing::info!(target: "rmlx_distributed", loaded = device_map.is_some(), "device_map status");
     if device_map.is_none() {
         return Err(DistributedError::Config(
             "RDMA device file required but not found. \
@@ -347,7 +348,7 @@ fn try_rdma_init(
         world_size as usize
     ];
 
-    eprintln!("[rdma-init] Phase 1a: creating QPs...");
+    tracing::info!(target: "rmlx_distributed", "Phase 1a: creating QPs");
     for peer in 0..world_size {
         if peer == rank {
             // Self-slot: no RDMA context needed.  Opening the same RDMA device
@@ -376,7 +377,7 @@ fn try_rdma_init(
         // JACCL pattern: register MR before QP connect (QP is in RESET state)
         let pool = RdmaBufferPool::new(&pd)
             .inspect_err(|e| {
-                eprintln!("[rdma-init] WARNING: buffer pool alloc failed for peer={peer}: {e}")
+                tracing::warn!(target: "rmlx_distributed", peer, %e, "buffer pool alloc failed")
             })
             .ok();
 
@@ -388,7 +389,7 @@ fn try_rdma_init(
             pool,
         });
     }
-    eprintln!("[rdma-init] Phase 1a complete, starting coordinator exchange...");
+    tracing::info!(target: "rmlx_distributed", "Phase 1a complete, starting coordinator exchange");
 
     // Phase 1b: Pack local QP infos and all_gather via coordinator.
     // Wire format: world_size * 26 bytes (lid:2 + qpn:4 + psn:4 + gid:16).
@@ -498,7 +499,7 @@ fn try_rdma_init(
     // (RESET → INIT → RTR → RTS) before any RDMA operation. Without this,
     // rank 0 may send before rank 1's QP is in RTS, causing UC silent drop.
     // JACCL does this with side_channel.all_gather<int>(0) after QP connect.
-    eprintln!("[rdma-init] Post-connect barrier via coordinator...");
+    tracing::info!(target: "rmlx_distributed", "Post-connect barrier via coordinator");
     let barrier_buf = vec![rank as u8; 1];
     let hub_host_barrier = if rank == 0 { "" } else { &coordinator_addr };
     let _barrier_result = rmlx_rdma::coordinator::all_gather_bytes(
@@ -509,12 +510,32 @@ fn try_rdma_init(
         &coord_cfg,
     )
     .map_err(|e| DistributedError::Transport(format!("post-connect barrier failed: {e}")))?;
-    eprintln!("[rdma-init] Post-connect barrier OK");
+    tracing::info!(target: "rmlx_distributed", "Post-connect barrier OK");
 
     // connections[rank] is None (self-slot); all others are Some.
     let transport = RdmaConnectionTransport::new(connections, rank);
+    // Auto-attach progress engine so async (non-blocking) send/recv works by default.
+    let transport = transport.with_progress_engine(Arc::new(ProgressEngine::new()));
     let all_ranks: Vec<u32> = (0..world_size).collect();
     let group = Group::with_transport(all_ranks, rank, world_size, Arc::new(transport))?;
+
+    // TODO: Integrate HealthMonitor + HeartbeatSender here.
+    //
+    // After QP connect and before returning the Group, this is the right place
+    // to wire up health monitoring:
+    //
+    //   1. Create a `HealthMonitor` with `HeartbeatConfig::default()` (1s interval,
+    //      5s timeout, 3 max_missed).
+    //   2. Create a `HeartbeatSender` per peer, with a `send_fn` that sends a
+    //      small heartbeat message over the peer's `RdmaConnection`.
+    //   3. Spawn a background thread (or integrate with `ProgressEngine`) that:
+    //      a. Periodically calls `HeartbeatSender::send_heartbeat()` for each peer.
+    //      b. Calls `HealthMonitor::check_health()` and logs/handles unhealthy peers.
+    //   4. Store the `HealthMonitor` handle in `Group` or `DistributedContext` so
+    //      callers can query peer health via `monitor.is_healthy(peer_rank)`.
+    //
+    // This requires adding a heartbeat message type to the RDMA transport protocol
+    // and a background polling loop, so it is deferred to a dedicated PR.
 
     tracing::info!(
         target: "rmlx_distributed",

@@ -22,6 +22,7 @@ _tmp_*
 
 # Generated hostfiles (may contain IPs/hostnames)
 *-hosts.json
+rmlx-hosts.json
 hostfile*.json
 
 # Python

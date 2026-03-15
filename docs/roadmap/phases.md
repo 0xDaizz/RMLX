@@ -1,4 +1,4 @@
-# Implementation Roadmap — Phases 0-9B + S1-S5 + Audit Remediation + Phase 3 + Phase 4 + Phase 5 Complete + Phase KO + Phase 8c + Phase 9 + Phase 10 + Phase 11 + Phase A + Phase B + Phase C + Phase D + Phase F + Phase G + Phase H + Phase I + Phase J
+# Implementation Roadmap — Phases 0-9B + S1-S5 + Audit Remediation + Phase 3 + Phase 4 + Phase 5 Complete + Phase KO + Phase 8c + Phase 9 + Phase 10 + Phase 11 + Phase A + Phase B + Phase C + Phase D + Phase F + Phase G + Phase H + Phase I + Phase J + Phase 7 (RDMA)
 
 The rmlx project implementation roadmap. All phases through 9B-opt and serving support phases S1-S5 are complete. A full-crate audit (Phases 0, 1, 2) has been completed with 76 remediation items resolved across all 6 crates. Phase 3 adds FlashAttention-2 Metal kernel, paged KV cache, continuous batching scheduler, centralized CB commit, f16/bf16 RDMA collectives, ring allreduce chunk rounding fix, MoePolicy thread safety, and CLI signal forwarding. Phase 4 adds performance and allocator improvements: atomic CAS allocation limits, pointer ownership validation, SmallBufferPool/LeakDetector/ResidencyManager wiring, ChipTuning per-generation GPU tuning, DiskPipelineCache with sha2 hashing, HazardTrackingModeUntracked, fused RMSNorm+residual add kernel, gather_mm batched MoE strategy, SlabRing condvar backpressure, ProgressEngine EP dispatch wiring, ICB sparse expert dispatch, and BFC-style allocator. Phase 5 (Feature Breadth) adds 5 new core ops (slice, sort, scan, argreduce, random), 11 new activations (16 total), full MLA and SlidingWindowAttention forward implementations, AWQ/GPTQ/K-quant quantization layers, prefix cache, chunked prefill, 3 full model architectures (Qwen2Model, DeepSeekV3Model, MixtralModel), tree allreduce with auto selection, pipelined ring buffer, and topology-aware CLI backend selection. Current test count: 1,142+. Phase 8c adds CachedDecode with pre-resolved PSOs and pre-allocated scratch buffers, 2-encoder decode path, `_preresolved_into_encoder` pattern, and GEMV BM8 optimizations (barrier removal + widened f32 loads), achieving 714 us/layer at 60L depth (f16, 6x lower variance). Phase 10 (Kernel Fusion) adds fused_rms_gemv and fused_swiglu_down kernels, reducing the decode pipeline from 9 to 7 dispatches, achieving 699.3 us/layer. Phase 11 (GEMV Kernel Optimization Experiments) concluded that all kernel-level optimization attempts failed (col-major +84%, interleaved +2.2%, SRAM+f16+funcconst +3.6%); row-major BM8 GEMV with f32 accumulation at 705 us/layer is the practical floor for f16 decode on Apple Silicon (73.6% bandwidth efficiency). Phase A (Prefill Optimization) adds single-CB prefill pipeline (54 sync points to 1), GQA slab SDPA (32 per-head dispatches to 1), GEMM threadgroup swizzle, new ops matmul_into_cb and silu_into_cb, achieving 3.5-7.3x speedup over baseline with MLX parity within 1.2-3.4x. Current test count: 1,298. Phase B (GEMM Config Sweep) systematically tests 27 kernel variants across 3 sweeps, confirming bk32_2x4 (BM=64, BN=64, BK=32, SG=2x4, 256 threads) as optimal — 21.54T TFLOPS vs MLX 23.97T (-10.1% gap). Phase C (GEMM Kernel-Level Optimization) applies wide_load and SG=2x4 layout to production kernels, reaching 21.21T (-11.5% gap). Phase D2 (MLX-Architecture Kernel) achieves **24.05T TFLOPS** (MLX parity surpassed: +0.3%) via BK=16, 2 SG, 64 threads, single buffer, 4xhalf4 wide loads, direct store, serpentine MMA. PR#77-79 further optimize prefill SDPA parity (QMM Q4 M=512: 17.43T, +28% vs MLX), NAX GEMM, and Rust dispatch overhead, culminating in FP16 GEMM 24.05T and decode 699.3 us/layer. PR#80 adds speculative decoding framework primitives. The objc2-metal migration (M-1) replaces metal-rs with the objc2-metal ecosystem, and Metal 4 API integration (M-2) adds feature-gated Metal 4 support. Phase F (Infrastructure Optimization) adds dispatch overhead benchmark (176us/CB, 12.4%), DiskPipelineCache wiring, and GatherMM MMA upgrade (4-12x for MoE). Phase G (Quantized Kernel Optimization) upgrades QMM to MMA (Q4/Q8), QMV to qdot pattern, and removes CPU fallback. Phase H-2 (GEMM+Residual Epilogue Fusion) achieves 5-12% improvement for large N via function constant 202. Phase I-1 (Distributed TP) adds DistributedTransformerModel with forward_with_group and shard_for_tp, achieving 1.94x estimated speedup at TP=2. Phase J (Quantized Parity + Infrastructure) closes QMM gap from 4.78x to 2.55x (+73%), QMV gap to 1.15x (+37%), removes 32 ExecGraph inter-layer stalls, adds FusionCompiler (lazy.rs -> FusionAnalyzer -> codegen -> Metal JIT), RMSNorm+GEMM fusion (function constant 203, -40.5%), Split-K QMM, MoE fused kernels, and forward_auto() for eager+lazy hybrid dispatch.
 
@@ -80,6 +80,7 @@ The rmlx project implementation roadmap. All phases through 9B-opt and serving s
 | PR#80 | Speculative Decoding Primitives | Draft/verify/accept framework, tree attention, multi-candidate scoring | PR#79 | ✅ Complete |
 | M-1 | objc2-metal Migration | Migrate rmlx-metal from metal-rs to objc2-metal ecosystem, minimize unsafe/msg_send | PR#80 | ✅ Complete |
 | M-2 | Metal 4 API Integration | Feature-gated Metal 4 API (`metal4` feature flag), mesh shaders, raytracing stubs | M-1 | ✅ Complete |
+| RDMA-7 | RDMA Transport Fix + Split-CB TP + Fair Benchmarks | CQ over-posting fix, Split-CB TP (46x), fair RMLX vs MLX bench (TP=1 10x, TP=2 2.4x) | M-2 | ✅ Complete |
 | KO-2 | Decode Scratch Allocator | Pre-allocated workspace, bump alloc, StorageModePrivate | KO | Planned |
 | KO-3 | ICB Decode Replay | Record/replay 9-dispatch via Metal ICB, dynamic setBytes | KO + KO-2 | Planned |
 | EP-7 | ICB Full Metal Indirect Dispatch | Wire SparseExpertPlan into ExpertGroup GEMM encoding via Metal ICB indirect dispatch; skip empty experts at GPU command level | EP-6 | Planned |
@@ -174,6 +175,7 @@ The rmlx project implementation roadmap. All phases through 9B-opt and serving s
 | PR#80: Speculative Decoding Framework Primitives | main (PR #80) | 1,298+ tests | ✅ Complete |
 | M-1: objc2-metal Migration (metal-rs → objc2-metal ecosystem) | feat/objc2-metal-migration | 1,298+ tests | ✅ Complete |
 | M-2: Metal 4 API Integration (feature-gated) | feat/objc2-metal-migration | 1,298+ tests | ✅ Complete |
+| Phase 7: RDMA Transport Fix + Split-CB TP + Fair Benchmarks | 9d7b7dc | 1,298+ tests | ✅ Complete |
 | Phase KO-2: Decode Scratch Allocator | -- | -- | Planned |
 | Phase KO-3: ICB Decode Replay | -- | -- | Planned |
 | EP-7: ICB Full Metal Indirect Dispatch | -- | -- | Planned |
@@ -1518,6 +1520,46 @@ During MoE prefill (M=512, E=64~384, top_k=1~8), per-expert effective M drops to
 - [ ] Implement micro-batch pipeline in TransformerModel (forward_pipelined_dual_queue)
 - [ ] Measure end-to-end overlap effect across real 32-layer transformer
 - [ ] Search for optimal micro-batch count (MB size reduction vs pipeline fill rate trade-off)
+
+---
+
+## Phase 7: RDMA Transport Fix + Split-CB TP + Fair Benchmarks — ✅ Complete (9d7b7dc, 2026-03-15)
+
+### Goal
+
+Fix RDMA multi-chunk transport bugs, implement Split-CB tensor-parallel path for production-viable TP latency, and establish fair RMLX vs MLX benchmarks with production-equivalent configurations.
+
+### Key Changes
+
+1. **Fix chunked_recv/chunked_sendrecv over-posting bug** — root cause of CQ timeout on 28KB+ multi-chunk transfers
+2. **Add nocopy send guard for multi-chunk payloads**
+3. **Remove misdiagnosed TB5 driver bug workarounds** — sleep(1ms) replaced with proper CQ polling
+4. **Implement Split-CB TP path: `forward_with_group_split_cb()`** — batches attention and FFN into 2 CBs per layer instead of 12 per-op dispatches. Result: per-op 18,193 us → Split-CB 392 us (46x improvement)
+5. **Enable gate-up merge + weight pre-transpose in distributed benchmark**
+6. **Add RoPE + KV cache (128 tokens) to benchmark** for fair RMLX vs MLX comparison
+7. **Upgrade MLX benchmark to production path** — mx.fast.* + mx.compile + KV cache
+8. **Benchmark script**: hardcoded values → environment variables
+
+### Results
+
+| Metric | Value |
+|--------|------:|
+| TP=1 single-CB (gate-up merge, RoPE, KV cache) | 200 us |
+| TP=2 sharded compute | 133 us |
+| TP=2 Split-CB + RDMA | 392 us (vs per-op 18,193 us) |
+| RDMA allreduce | 17.9 us/call |
+| vs MLX (mx.compile) TP=1 | 10.0x |
+| vs MLX (mx.compile) TP=2 | 2.4x |
+
+### Completion Criteria (DoD)
+
+- [x] chunked_recv/chunked_sendrecv over-posting bug fixed
+- [x] nocopy send guard for multi-chunk payloads
+- [x] TB5 driver workaround (sleep 1ms) removed
+- [x] Split-CB TP path implemented (forward_with_group_split_cb)
+- [x] Fair benchmark with RoPE + KV cache + gate-up merge
+- [x] MLX benchmark upgraded to production path (mx.fast/mx.compile)
+- [x] Benchmark script environment-variable driven
 
 ---
 

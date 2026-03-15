@@ -65,6 +65,31 @@ pub fn ensure_materialized(shapes: &[(usize, usize)]) -> Result<(), DistributedE
 /// Wraps the underlying RDMA connection to provide send/recv primitives
 /// that the Group collectives can use. Implementations are expected to
 /// handle memory registration, work request posting, and completion polling.
+///
+/// # Design note: no async send/recv methods
+///
+/// `RdmaConnectionTransport` exposes low-level `send_async()` / `recv_async()`
+/// that return `OwnedPendingOp` handles for non-blocking RDMA operations.
+/// These are intentionally **not** part of this trait because:
+///
+/// 1. **Type coupling** — `OwnedPendingOp` / `ZeroCopyPendingOp` live in
+///    `rmlx_rdma`; pulling them into the generic trait would force every
+///    backend (including test mocks) to depend on RDMA-specific types.
+///
+/// 2. **`sendrecv` already overlaps** — the primary latency-hiding pattern
+///    needed by ring collectives is overlapped send+recv to different peers.
+///    `sendrecv()` / `sendrecv_into()` already provide this: the concrete
+///    `RdmaConnectionTransport` implementation posts recv before send and
+///    uses chunked pipelining internally.
+///
+/// 3. **Downcast escape hatch** — collectives that need fine-grained async
+///    control can downcast `&dyn RdmaTransport` to `&RdmaConnectionTransport`
+///    and call `send_async()` / `recv_async()` directly, falling back to
+///    blocking methods when the concrete type is unavailable.
+///
+/// If future collectives (e.g. pipelined allgather with compute overlap)
+/// require trait-level async, consider a separate `AsyncRdmaTransport`
+/// extension trait with an associated `PendingOp` type.
 pub trait RdmaTransport: Send + Sync {
     /// Send `data` to the peer at `dst_rank`.
     fn send(&self, data: &[u8], dst_rank: u32) -> Result<(), DistributedError>;
@@ -1241,6 +1266,43 @@ fn mesh_allreduce_op_f32(
     Ok(buf)
 }
 
+/// Mesh allreduce with native dtype support (f16/bf16/f32 without expansion).
+fn mesh_allreduce_op_native(
+    data: &[u8],
+    ranks: &[u32],
+    local_rank: u32,
+    transport: &Arc<dyn RdmaTransport>,
+    op: ReduceOp,
+    dtype: ReduceDtype,
+) -> Result<Vec<u8>, DistributedError> {
+    let my_idx = ranks.iter().position(|&r| r == local_rank).ok_or_else(|| {
+        DistributedError::Transport(format!(
+            "local_rank {} not found in ranks {:?}",
+            local_rank, ranks
+        ))
+    })?;
+
+    let elem_size = match dtype {
+        ReduceDtype::F32 => 4,
+        ReduceDtype::F16 | ReduceDtype::Bf16 => 2,
+    };
+    let align_mask = elem_size - 1;
+    let aligned_len = (data.len() + align_mask) & !align_mask;
+    let mut buf = data.to_vec();
+    buf.resize(aligned_len, 0);
+
+    for (peer_idx, &peer_rank) in ranks.iter().enumerate() {
+        if peer_idx == my_idx {
+            continue;
+        }
+        let received = transport.sendrecv(&buf, peer_rank, aligned_len, peer_rank)?;
+        reduce_inplace(&mut buf, &received, op, dtype);
+    }
+
+    buf.truncate(data.len());
+    Ok(buf)
+}
+
 /// Mesh allreduce with configurable ReduceOp and dtype support.
 fn mesh_allreduce_op(
     data: &[u8],
@@ -1259,26 +1321,7 @@ fn mesh_allreduce_op(
                     data.len()
                 )));
             }
-            let n_elems = data.len() / 2;
-            let mut f32_data = vec![0u8; n_elems * 4];
-            for i in 0..n_elems {
-                let bits = u16::from_ne_bytes([data[i * 2], data[i * 2 + 1]]);
-                let val = f16_to_f32(bits);
-                f32_data[i * 4..i * 4 + 4].copy_from_slice(&val.to_ne_bytes());
-            }
-            let result = mesh_allreduce_op_f32(&f32_data, ranks, local_rank, transport, op)?;
-            let mut out = vec![0u8; n_elems * 2];
-            for i in 0..n_elems {
-                let val = f32::from_ne_bytes([
-                    result[i * 4],
-                    result[i * 4 + 1],
-                    result[i * 4 + 2],
-                    result[i * 4 + 3],
-                ]);
-                let bits = f32_to_f16(val);
-                out[i * 2..i * 2 + 2].copy_from_slice(&bits.to_ne_bytes());
-            }
-            Ok(out)
+            mesh_allreduce_op_native(data, ranks, local_rank, transport, op, dtype)
         }
         ReduceDtype::Bf16 => {
             if data.len() % 2 != 0 {
@@ -1287,26 +1330,7 @@ fn mesh_allreduce_op(
                     data.len()
                 )));
             }
-            let n_elems = data.len() / 2;
-            let mut f32_data = vec![0u8; n_elems * 4];
-            for i in 0..n_elems {
-                let bits = u16::from_ne_bytes([data[i * 2], data[i * 2 + 1]]);
-                let val = bf16_to_f32(bits);
-                f32_data[i * 4..i * 4 + 4].copy_from_slice(&val.to_ne_bytes());
-            }
-            let result = mesh_allreduce_op_f32(&f32_data, ranks, local_rank, transport, op)?;
-            let mut out = vec![0u8; n_elems * 2];
-            for i in 0..n_elems {
-                let val = f32::from_ne_bytes([
-                    result[i * 4],
-                    result[i * 4 + 1],
-                    result[i * 4 + 2],
-                    result[i * 4 + 3],
-                ]);
-                let bits = f32_to_bf16(val);
-                out[i * 2..i * 2 + 2].copy_from_slice(&bits.to_ne_bytes());
-            }
-            Ok(out)
+            mesh_allreduce_op_native(data, ranks, local_rank, transport, op, dtype)
         }
     }
 }
@@ -1817,6 +1841,20 @@ pub enum AllreduceAlgorithm {
 }
 
 // ─── Topology-aware ring ordering ───
+//
+// NOTE: TopologyRing is currently **not connected** to any collective algorithm.
+// Ring collectives (ring_allreduce, ring_allreduce_op, ring_allreduce_op_native)
+// use `&self.ranks` directly, which is sorted numerically — not by network proximity.
+//
+// Future integration path:
+//   1. In `Group::allreduce_op()` (and similar), call `TopologyRing::from_env(&self.ranks)`
+//      to obtain a topology-ordered rank slice.
+//   2. Pass the reordered slice to `ring_allreduce_op()` instead of `&self.ranks`.
+//   3. This requires no algorithm changes — the ring collectives already use the
+//      `ranks` parameter to derive left/right neighbors, so reordering the input
+//      is sufficient to make them topology-aware.
+//
+// Blocked on: real multi-hop topology (current 2-node setup has no hop variance).
 
 /// Topology-aware ring that reorders ranks based on inter-node hop counts.
 ///

@@ -162,6 +162,7 @@ mod tests {
                     hidden_dim: 64,
                     intermediate_dim: 128,
                     capacity_factor: 1.0,
+                    enable_fp8: false,
                 },
             },
         };
