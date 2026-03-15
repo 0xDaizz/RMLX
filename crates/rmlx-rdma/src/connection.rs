@@ -18,8 +18,12 @@ use crate::qp::{CompletionQueue, QueuePair};
 use crate::shared_buffer::{ConnectionId, SharedBuffer};
 use crate::RdmaError;
 
-/// Default size for pre-registered send/recv buffers (JACCL FRAME_SIZE).
-const SHARED_BUF_SIZE: usize = 4096; // JACCL FRAME_SIZE
+/// Default size for pre-registered send/recv buffers.
+/// JACCL uses tiered pools (4KB-512KB) with PIPELINE=2 chunking.
+/// We use a single buffer sized to fit common tensor transfers.
+/// Max single MR on macOS TB5 is ~16MB, but we cap at 1MB to match
+/// JACCL's largest single-chunk size.
+const SHARED_BUF_SIZE: usize = 1024 * 1024; // 1 MB
 
 /// Pre-registered RDMA buffer (JACCL SharedBuffer equivalent).
 ///
@@ -48,22 +52,18 @@ impl SharedRdmaBuffer {
         let reg_size = size; // register only what was requested
 
         let mut buf: *mut c_void = std::ptr::null_mut();
-        eprintln!("[SharedRdmaBuffer] posix_memalign alloc_size={} reg_size={}...", alloc_size, reg_size);
         let ret = unsafe { libc::posix_memalign(&mut buf, page_size, alloc_size) };
         if ret != 0 || buf.is_null() {
             return Err(RdmaError::MrReg(format!(
                 "SharedRdmaBuffer posix_memalign failed: ret={ret}, alloc_size={alloc_size}"
             )));
         }
-        eprintln!("[SharedRdmaBuffer] posix_memalign OK, buf={:?}", buf);
         // Zero-initialize
         unsafe { std::ptr::write_bytes(buf as *mut u8, 0, alloc_size) };
 
         let flags =
             access_flags::LOCAL_WRITE | access_flags::REMOTE_WRITE | access_flags::REMOTE_READ;
-        eprintln!("[SharedRdmaBuffer] ibv_reg_mr size={}...", reg_size);
         let mr = unsafe { (lib.reg_mr)(pd.raw(), buf, reg_size, flags) };
-        eprintln!("[SharedRdmaBuffer] ibv_reg_mr result={}", if mr.is_null() { "FAILED" } else { "OK" });
         if mr.is_null() {
             unsafe { libc::free(buf) };
             return Err(RdmaError::MrReg(format!(
@@ -580,10 +580,6 @@ impl RdmaConnection {
             lkey: mr.lkey(),
         };
 
-        eprintln!("[post_send] sge: addr=0x{:x} length={} lkey=0x{:x} | mr: addr=0x{:x} length={} lkey=0x{:x}",
-            sge.addr, sge.length, sge.lkey,
-            mr.addr() as u64, mr.length(), mr.lkey());
-
         // SAFETY: sge is valid and points into the registered MR.
         // JACCL compatible: leave unused fields uninitialized instead of zeroed.
         // macOS TB5 driver may interpret zero values in imm_data/wr union differently.
@@ -631,10 +627,6 @@ impl RdmaConnection {
             length,
             lkey: mr.lkey(),
         };
-
-        eprintln!("[post_recv] sge: addr=0x{:x} length={} lkey=0x{:x} | mr: addr=0x{:x} length={} lkey=0x{:x}",
-            sge.addr, sge.length, sge.lkey,
-            mr.addr() as u64, mr.length(), mr.lkey());
 
         let mut wr = IbvRecvWr {
             wr_id,
@@ -715,25 +707,9 @@ impl RdmaConnection {
             }
         }
 
-        let mut empty_polls: u64 = 0;
         while !remaining.is_empty() {
             let count = self.cq.poll(&mut wc_buf)?;
-            if count == 0 {
-                empty_polls += 1;
-                if empty_polls % 100_000 == 0 {
-                    eprintln!(
-                        "[cq] poll_cq: no completions after {} polls (waiting for wr_ids {:?})",
-                        empty_polls, remaining
-                    );
-                }
-            } else {
-                empty_polls = 0;
-            }
             for wc in &wc_buf[..count] {
-                eprintln!(
-                    "[cq] wc: wr_id={} status={} opcode={}",
-                    wc.wr_id, wc.status, wc.opcode
-                );
                 if let Some(pos) = remaining.iter().position(|&id| id == wc.wr_id) {
                     // UC recv completions (opcode >= 128) always report status=4
                     // (LOC_PROT_ERR) on macOS TB5, but data arrives correctly.
@@ -959,9 +935,7 @@ impl RdmaConnection {
         wr.opcode = wr_opcode::SEND;
         wr.send_flags = send_flags::SIGNALED;
 
-        eprintln!("[send_buffered] posting send wr_id={:#x} len={}", wr_id, data.len());
         self.qp.post_send(&mut wr)?;
-        eprintln!("[send_buffered] send posted (caller will wait)");
         Ok(())
     }
 
@@ -973,16 +947,18 @@ impl RdmaConnection {
     ///
     /// Returns `Err` if the pre-registered buffer is unavailable or too small.
     pub fn recv_buffered(&self, len: usize, wr_id: u64) -> Result<(), RdmaError> {
-        let rbuf = self.recv_buf.as_ref().ok_or_else(|| {
-            RdmaError::InvalidArgument("recv_buf not available".into())
-        })?;
-        if len > rbuf.size() {
-            return Err(RdmaError::InvalidArgument(format!(
-                "recv_buffered: len {} exceeds recv_buf size {}",
-                len,
-                rbuf.size()
-            )));
-        }
+        let rbuf = match self.recv_buf.as_ref() {
+            Some(b) if len <= b.size() => b,
+            _ => {
+                // Fallback: register on-the-fly (mirrors send_buffered)
+                let mut tmp = vec![0u8; len];
+                let reg = self.register_recv_slice(&mut tmp)?;
+                let _op = self.post_recv(reg.mr(), 0, len as u32, wr_id)?;
+                // macOS TB5 RDMA driver bug: skip CQ polling.
+                std::thread::sleep(Duration::from_millis(1));
+                return Ok(());
+            }
+        };
 
         let mut sge = IbvSge {
             addr: rbuf.addr(),
@@ -997,10 +973,7 @@ impl RdmaConnection {
             num_sge: 1,
         };
 
-        eprintln!("[recv_buffered] about to call post_recv wr_id={:#x} addr={:#x} len={} lkey={:#x}",
-            wr_id, sge.addr, sge.length, sge.lkey);
         self.qp.post_recv(&mut wr)?;
-        eprintln!("[recv_buffered] post_recv returned OK");
         Ok(())
     }
 

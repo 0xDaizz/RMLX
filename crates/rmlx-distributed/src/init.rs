@@ -318,7 +318,6 @@ fn try_rdma_init(
         let device_name = device_map
             .as_ref()
             .and_then(|dm| dm.device_for(rank as usize, peer as usize));
-        eprintln!("[rdma-init] open_ctx peer={peer}: device_name={device_name:?}");
         let ctx = match device_name {
             Some(name) => RdmaContext::open_by_name(name),
             None => RdmaContext::open_default(),
@@ -349,14 +348,6 @@ fn try_rdma_init(
         world_size as usize
     ];
 
-    eprintln!("[rdma-init] sizeof: IbvSendWr={} IbvRecvWr={} IbvWc={} IbvSge={} IbvContextOps={} IbvContext={}",
-        std::mem::size_of::<rmlx_rdma::ffi::IbvSendWr>(),
-        std::mem::size_of::<rmlx_rdma::ffi::IbvRecvWr>(),
-        std::mem::size_of::<rmlx_rdma::ffi::IbvWc>(),
-        std::mem::size_of::<rmlx_rdma::ffi::IbvSge>(),
-        std::mem::size_of::<rmlx_rdma::ffi::IbvContextOps>(),
-        std::mem::size_of::<rmlx_rdma::ffi::IbvContext>(),
-    );
     eprintln!("[rdma-init] Phase 1a: creating QPs...");
     for peer in 0..world_size {
         if peer == rank {
@@ -366,16 +357,12 @@ fn try_rdma_init(
             continue;
         }
 
-        eprintln!("[rdma-init] peer={peer}: opening context...");
         let ctx = open_ctx(peer)?;
-        eprintln!("[rdma-init] peer={peer}: context opened, allocating PD...");
         let pd = ctx
             .alloc_pd()
             .map_err(|e| DistributedError::Transport(e.to_string()))?;
-        eprintln!("[rdma-init] peer={peer}: PD allocated, creating CQ...");
         let cq =
             CompletionQueue::new(&ctx).map_err(|e| DistributedError::Transport(e.to_string()))?;
-        eprintln!("[rdma-init] peer={peer}: CQ created, creating QP...");
         let mut qp = QueuePair::create_uc(&pd, &cq, &ctx)
             .map_err(|e| DistributedError::Transport(e.to_string()))?;
 
@@ -385,17 +372,14 @@ fn try_rdma_init(
         local_infos[peer as usize] = qp.local_info().clone();
 
         // JACCL pattern: register MR before QP connect (QP is in RESET state)
-        eprintln!("[rdma-init] peer={peer}: registering SharedRdmaBuffers...");
         let send_buf = SharedRdmaBuffer::new(&pd, 4096)
-            .inspect_err(|e| eprintln!("[rdma-init] send_buf failed: {e}"))
+            .inspect_err(|e| eprintln!("[rdma-init] WARNING: send_buf alloc failed for peer={peer}: {e}"))
             .ok();
         let recv_buf = SharedRdmaBuffer::new(&pd, 4096)
-            .inspect_err(|e| eprintln!("[rdma-init] recv_buf failed: {e}"))
+            .inspect_err(|e| eprintln!("[rdma-init] WARNING: recv_buf alloc failed for peer={peer}: {e}"))
             .ok();
-        eprintln!("[rdma-init] peer={peer}: send_buf={} recv_buf={}", send_buf.is_some(), recv_buf.is_some());
 
         slots[peer as usize] = Some(QpSlot { ctx, pd, cq, qp, send_buf, recv_buf });
-        eprintln!("[rdma-init] peer={peer}: QP created");
     }
     eprintln!("[rdma-init] Phase 1a complete, starting coordinator exchange...");
 
@@ -411,7 +395,6 @@ fn try_rdma_init(
         local_buf[off + 10..off + 26].copy_from_slice(&info.gid);
     }
 
-    eprintln!("[rdma-init] Phase 1b: coordinator exchange...");
     let hub_host = if rank == 0 { "" } else { &coordinator_addr };
     let gathered_bytes = rmlx_rdma::coordinator::all_gather_bytes(
         rank, world_size, &local_buf, hub_host, &coord_cfg,
@@ -503,15 +486,6 @@ fn try_rdma_init(
             slot.send_buf,
             slot.recv_buf,
         ));
-    }
-
-    // Debug: dump QP info before/after connect
-    for peer in 0..world_size {
-        if peer == rank { continue; }
-        let local = &local_infos[peer as usize];
-        let remote = &remote_for_me[peer as usize];
-        eprintln!("[rdma-init] peer={peer}: local QP qpn={} psn={} gid={:02x?}", local.qpn, local.psn, &local.gid);
-        eprintln!("[rdma-init] peer={peer}: remote QP qpn={} psn={} gid={:02x?}", remote.qpn, remote.psn, &remote.gid);
     }
 
     // Post-connect barrier: ensure all ranks have completed QP state transitions

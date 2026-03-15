@@ -998,22 +998,13 @@ impl RdmaTransport for RdmaConnectionTransport {
             let send_wr_id = self.next_wr_id(dst_rank, ExchangeTag::Data, 0);
 
             // Post recv FIRST using pre-registered buffer (UC mode)
-            eprintln!(
-                "[sendrecv-buf] rank={} posting recv (wr_id={:#x})",
-                self.local_rank, recv_wr_id
-            );
             global_counters().record_rdma_transfer(recv_len as u64);
             conn.recv_buffered(recv_len, recv_wr_id).map_err(|e| {
                 self.metrics.record_recv_error();
                 rdma_to_distributed_enhanced(e, recv_wr_id)
             })?;
-            eprintln!("[sendrecv-buf] rank={} recv_buffered OK, proceeding to send", self.local_rank);
 
             // Post send using pre-registered buffer
-            eprintln!(
-                "[sendrecv-buf] rank={} posting send (wr_id={:#x}, len={})",
-                self.local_rank, send_wr_id, send_data.len()
-            );
             global_counters().record_rdma_transfer(send_data.len() as u64);
             conn.send_buffered(send_data, send_wr_id).map_err(|e| {
                 self.metrics.record_send_error();
@@ -1023,18 +1014,8 @@ impl RdmaTransport for RdmaConnectionTransport {
             conn.wait_completions(&[send_wr_id, recv_wr_id]).map_err(|e| {
                 rdma_to_distributed_enhanced(e, send_wr_id)
             })?;
-            eprintln!(
-                "[sendrecv-buf] rank={} completions done",
-                self.local_rank
-            );
 
             let recv_buf = conn.read_recv_buf(recv_len);
-            eprintln!(
-                "[sendrecv-buf] rank={} recv data ({} bytes): {:02x?}",
-                self.local_rank,
-                recv_buf.len(),
-                &recv_buf[..recv_buf.len().min(64)]
-            );
 
             self.metrics.record_send(send_data.len() as u64);
             self.metrics.record_recv(recv_len as u64);
@@ -1059,10 +1040,6 @@ impl RdmaTransport for RdmaConnectionTransport {
             let send_wr_id = self.next_wr_id(dst_rank, ExchangeTag::Data, 0);
 
             // Post recv FIRST on src connection using pre-registered buffer
-            eprintln!(
-                "[sendrecv-buf] rank={} posting recv (wr_id={:#x})",
-                self.local_rank, recv_wr_id
-            );
             global_counters().record_rdma_transfer(recv_len as u64);
             src_conn.recv_buffered(recv_len, recv_wr_id).map_err(|e| {
                 self.metrics.record_recv_error();
@@ -1070,10 +1047,6 @@ impl RdmaTransport for RdmaConnectionTransport {
             })?;
 
             // Post send on dst connection using pre-registered buffer
-            eprintln!(
-                "[sendrecv-buf] rank={} posting send (wr_id={:#x}, len={})",
-                self.local_rank, send_wr_id, send_data.len()
-            );
             global_counters().record_rdma_transfer(send_data.len() as u64);
             dst_conn.send_buffered(send_data, send_wr_id).map_err(|e| {
                 self.metrics.record_send_error();
@@ -1086,18 +1059,8 @@ impl RdmaTransport for RdmaConnectionTransport {
             src_conn.wait_completions(&[recv_wr_id]).map_err(|e| {
                 rdma_to_distributed_enhanced(e, recv_wr_id)
             })?;
-            eprintln!(
-                "[sendrecv-buf] rank={} completions done",
-                self.local_rank
-            );
 
             let recv_buf = src_conn.read_recv_buf(recv_len);
-            eprintln!(
-                "[sendrecv-buf] rank={} recv data ({} bytes): {:02x?}",
-                self.local_rank,
-                recv_buf.len(),
-                &recv_buf[..recv_buf.len().min(64)]
-            );
 
             self.metrics.record_send(send_data.len() as u64);
             self.metrics.record_recv(recv_len as u64);

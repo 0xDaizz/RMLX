@@ -260,7 +260,6 @@ impl QueuePair {
         self.local_info.psn = 7;
         // SAFETY: IbvGid union's raw field is always valid to read.
         self.local_info.gid = unsafe { gid.raw };
-        eprintln!("[qp] query_local_info: gid_index={gid_index}, lid={}, psn={}, qpn={}, gid={:02x?}", self.local_info.lid, self.local_info.psn, self.local_info.qpn, &self.local_info.gid);
 
         Ok(())
     }
@@ -274,18 +273,8 @@ impl QueuePair {
     /// RESET → INIT → RTR → RTS.
     pub fn connect(&self, remote: &QpInfo) -> Result<(), RdmaError> {
         self.modify_to_init()?;
-        eprintln!("[qp] connect: RESET→INIT OK");
         self.modify_to_rtr(remote)?;
-        eprintln!(
-            "[qp] connect: INIT→RTR OK (remote qpn={}, psn={}, gid={:02x?})",
-            remote.qpn, remote.psn, &remote.gid[..4]
-        );
-        eprintln!("[qp] connect: calling modify_to_rts...");
         self.modify_to_rts()?;
-        eprintln!(
-            "[qp] connect: RTR→RTS OK (local psn={})",
-            self.local_info.psn
-        );
         Ok(())
     }
 
@@ -352,13 +341,7 @@ impl QueuePair {
             | qp_attr_mask::RQ_PSN;
 
         // SAFETY: self.qp is valid, attr is fully initialized for RTR transition.
-        eprintln!("[qp] modify_to_rtr: sizeof(IbvQpAttr)={}, calling modify_qp (qp={:?}, mask=0x{:x})...",
-            std::mem::size_of::<IbvQpAttr>(), self.qp, mask);
-        let dgid_bytes = unsafe { attr.ah_attr.grh.dgid.raw };
-        eprintln!("[qp] modify_to_rtr: dest_qpn={}, rq_psn={}, path_mtu={}, is_global={}, gid_index={}, dgid={:02x?}",
-            attr.dest_qp_num, attr.rq_psn, attr.path_mtu, attr.ah_attr.is_global, attr.ah_attr.grh.sgid_index, &dgid_bytes);
         let ret = unsafe { (self.lib.modify_qp)(self.qp, &mut attr, mask) };
-        eprintln!("[qp] modify_to_rtr: modify_qp returned {ret}");
         if ret != 0 {
             return Err(RdmaError::QpModify(format!("INIT→RTR failed: {ret}")));
         }
@@ -375,9 +358,7 @@ impl QueuePair {
         let mask = qp_attr_mask::STATE | qp_attr_mask::SQ_PSN;
 
         // SAFETY: self.qp is valid, attr is set for RTS transition.
-        eprintln!("[qp] modify_to_rts: calling modify_qp (sq_psn={})...", self.local_info.psn);
         let ret = unsafe { (self.lib.modify_qp)(self.qp, &mut attr, mask) };
-        eprintln!("[qp] modify_to_rts: modify_qp returned {ret}");
         if ret != 0 {
             return Err(RdmaError::QpModify(format!("RTR→RTS failed: {ret}")));
         }
