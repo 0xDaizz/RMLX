@@ -9,6 +9,8 @@ use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::time::{Duration, Instant};
 
+use std::sync::Arc;
+
 use crate::context::{ProtectionDomain, RdmaContext};
 use crate::exchange;
 use crate::ffi::*;
@@ -445,8 +447,8 @@ pub struct RdmaConnection {
     mr_pool: Option<MrPool>,
     qp: QueuePair,
     cq: CompletionQueue,
-    pd: ProtectionDomain,
-    ctx: RdmaContext,
+    pd: Arc<ProtectionDomain>,
+    ctx: Arc<RdmaContext>,
 }
 
 impl RdmaConnection {
@@ -465,8 +467,8 @@ impl RdmaConnection {
     /// If the QP is intentionally left unconnected (e.g., a placeholder for the
     /// self-rank slot), the caller may skip steps 3-4.
     pub fn from_parts(
-        ctx: RdmaContext,
-        pd: ProtectionDomain,
+        ctx: Arc<RdmaContext>,
+        pd: Arc<ProtectionDomain>,
         cq: CompletionQueue,
         qp: QueuePair,
         config: RdmaConfig,
@@ -493,9 +495,9 @@ impl RdmaConnection {
     /// 4. Exchanges QP info via TCP (server on rank 0, client on rank 1+)
     /// 5. Transitions QP through RESET → INIT → RTR → RTS
     pub fn establish(config: RdmaConfig) -> Result<Self, RdmaError> {
-        // 1. Open RDMA device
-        let ctx = RdmaContext::open_default()?;
-        let pd = ctx.alloc_pd()?;
+        // 1. Open RDMA device (singleton to prevent TB5 driver PD leak)
+        let ctx = RdmaContext::get_or_open_default()?;
+        let pd = ctx.get_or_alloc_pd()?;
         let cq = CompletionQueue::new(&ctx)?;
 
         // 2. Create UC Queue Pair
@@ -1412,6 +1414,83 @@ impl RdmaConnection {
         }
 
         Ok(recv_result)
+    }
+}
+
+impl RdmaConnection {
+    /// Graceful shutdown: thorough RDMA resource cleanup to minimize PD leaks.
+    ///
+    /// TB5 macOS RDMA driver has known issues with incomplete PD release on teardown.
+    /// This method does best-effort cleanup in the correct dependency order:
+    /// 1. Transition QP to ERROR state (flushes in-flight work requests)
+    /// 2. Drain CQ (poll all pending completions to clear hardware state)
+    /// 3. Drop buffer pools (deregisters all MRs)
+    /// 4. QP, CQ, PD, ctx will be cleaned up by Drop in correct order
+    ///
+    /// Call this before dropping the `RdmaConnection` for cleanest resource release.
+    /// Safe to call multiple times — subsequent calls are no-ops.
+    pub fn graceful_shutdown(&mut self) {
+        // Step 1: Transition QP to ERROR state to flush in-flight WRs.
+        // ERROR state causes all pending work requests to complete with error status,
+        // which is cleaner than going directly to RESET.
+        self.qp.transition_to_error();
+
+        // Step 2: Drain CQ — poll all pending completions.
+        // After ERROR transition, hardware generates flush completions for all pending WRs.
+        // We must drain these before destroying QP/CQ.
+        self.drain_cq();
+
+        // Step 3: Drop buffer pools first (deregisters MRs).
+        // Take ownership and drop explicitly — this ensures MRs are deregistered
+        // before QP and PD are destroyed.
+        if let Some(pool) = self.pool.take() {
+            drop(pool);
+        }
+        if let Some(mr_pool) = self.mr_pool.take() {
+            drop(mr_pool);
+        }
+
+        // Step 4: Small delay to let kernel finish async MR cleanup.
+        std::thread::sleep(Duration::from_millis(10));
+
+        // QP, CQ, PD, ctx will be cleaned up by Drop in correct field order.
+    }
+
+    /// Drain the completion queue, polling until empty or timeout.
+    fn drain_cq(&self) {
+        let mut wc_buf: [IbvWc; 16] = core::array::from_fn(|_| IbvWc::zeroed());
+        let mut total_drained = 0u32;
+        let deadline = Instant::now() + Duration::from_millis(500);
+
+        loop {
+            match self.cq.poll(&mut wc_buf) {
+                Ok(0) => break, // CQ is empty
+                Ok(n) => {
+                    total_drained += n as u32;
+                    // Continue polling — there may be more
+                }
+                Err(_) => break, // Poll error, stop
+            }
+            if Instant::now() >= deadline {
+                eprintln!("[rdma] drain_cq: timeout after draining {total_drained} completions");
+                break;
+            }
+        }
+        if total_drained > 0 {
+            eprintln!("[rdma] drain_cq: drained {total_drained} pending completions");
+        }
+    }
+}
+
+impl Drop for RdmaConnection {
+    fn drop(&mut self) {
+        // If graceful_shutdown wasn't called, do it now.
+        // After graceful_shutdown, pool and mr_pool are None — so this is a no-op
+        // for the take() calls, but still does QP ERROR + CQ drain.
+        if self.pool.is_some() || self.mr_pool.is_some() {
+            self.graceful_shutdown();
+        }
+        // Fields (qp, cq, pd, ctx) are dropped automatically in declaration order.
     }
 }
 

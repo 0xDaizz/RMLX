@@ -1,9 +1,23 @@
 //! RDMA device context and protection domain management
 
 use std::ffi::{c_int, CStr};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::ffi::{IbvContext, IbvDeviceAttr, IbvPd, IbvPortAttr, IbverbsLib};
 use crate::RdmaError;
+
+/// Process-lifetime singleton for the default RDMA context.
+/// Never deallocated — prevents TB5 driver PD leak on macOS.
+///
+/// Uses `OnceLock<Arc<T>>` with a `Mutex` guard for fallible initialization
+/// (stable Rust lacks `OnceLock::get_or_try_init`).
+static GLOBAL_CTX: OnceLock<Arc<RdmaContext>> = OnceLock::new();
+static GLOBAL_CTX_INIT: Mutex<()> = Mutex::new(());
+
+/// Process-lifetime singleton for the default protection domain.
+/// Never deallocated — prevents TB5 driver PD leak on macOS.
+static GLOBAL_PD: OnceLock<Arc<ProtectionDomain>> = OnceLock::new();
+static GLOBAL_PD_INIT: Mutex<()> = Mutex::new(());
 
 /// RDMA device context — wraps ibv_context.
 /// Owns the context and closes it on drop.
@@ -212,6 +226,41 @@ impl RdmaContext {
         }
     }
 
+    /// Get the global singleton RDMA context, opening the default device if needed.
+    ///
+    /// The context is kept alive for the entire process lifetime to prevent
+    /// TB5 driver PD leak on repeated open/close cycles.
+    pub fn get_or_open_default() -> Result<Arc<Self>, RdmaError> {
+        if let Some(ctx) = GLOBAL_CTX.get() {
+            return Ok(Arc::clone(ctx));
+        }
+        // Serialize fallible initialization — only one thread attempts open_default.
+        let _guard = GLOBAL_CTX_INIT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ctx) = GLOBAL_CTX.get() {
+            return Ok(Arc::clone(ctx));
+        }
+        let ctx = Arc::new(Self::open_default()?);
+        let _ = GLOBAL_CTX.set(Arc::clone(&ctx));
+        Ok(ctx)
+    }
+
+    /// Get the global singleton PD, allocating from this context if needed.
+    ///
+    /// The PD is never deallocated — the `OnceLock` holds an `Arc` reference
+    /// forever, so the `Drop` impl never runs. This prevents TB5 driver PD leak.
+    pub fn get_or_alloc_pd(self: &Arc<Self>) -> Result<Arc<ProtectionDomain>, RdmaError> {
+        if let Some(pd) = GLOBAL_PD.get() {
+            return Ok(Arc::clone(pd));
+        }
+        let _guard = GLOBAL_PD_INIT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pd) = GLOBAL_PD.get() {
+            return Ok(Arc::clone(pd));
+        }
+        let pd = Arc::new(self.alloc_pd()?);
+        let _ = GLOBAL_PD.set(Arc::clone(&pd));
+        Ok(pd)
+    }
+
     /// Device name (e.g., "mlx5_0" or TB5 device name).
     pub fn device_name(&self) -> &str {
         &self.device_name
@@ -255,6 +304,9 @@ impl Drop for RdmaContext {
 // SAFETY: RdmaContext holds a raw pointer to a thread-safe ibverbs context.
 // ibverbs contexts are safe to share across threads.
 unsafe impl Send for RdmaContext {}
+// SAFETY: RdmaContext's public API is &self-only (no interior mutation of the
+// raw pointer).  The ibverbs context handle itself is thread-safe.
+unsafe impl Sync for RdmaContext {}
 
 /// Protection domain — wraps ibv_pd.
 pub struct ProtectionDomain {
@@ -277,14 +329,34 @@ impl ProtectionDomain {
 impl Drop for ProtectionDomain {
     fn drop(&mut self) {
         // SAFETY: pd was obtained from ibv_alloc_pd and is valid.
+        // Retry up to 3 times — TB5 macOS driver has known PD leak issues where
+        // dealloc can transiently fail if MR cleanup hasn't fully propagated.
         unsafe {
-            (self.lib.dealloc_pd)(self.pd);
+            let mut ret = (self.lib.dealloc_pd)(self.pd);
+            if ret != 0 {
+                for attempt in 1..=3 {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    ret = (self.lib.dealloc_pd)(self.pd);
+                    if ret == 0 {
+                        eprintln!("[pd] ibv_dealloc_pd succeeded on retry {attempt}");
+                        break;
+                    }
+                }
+                if ret != 0 {
+                    eprintln!(
+                        "[pd] WARNING: ibv_dealloc_pd returned {ret} after 3 retries — PD leaked"
+                    );
+                }
+            }
         }
     }
 }
 
 // SAFETY: PD is an opaque handle safe to share across threads.
 unsafe impl Send for ProtectionDomain {}
+// SAFETY: ProtectionDomain's public API is &self-only (no interior mutation).
+// The ibverbs PD handle itself is thread-safe.
+unsafe impl Sync for ProtectionDomain {}
 
 /// Runtime-probed RDMA device capabilities.
 ///

@@ -204,11 +204,26 @@ impl MemoryRegion {
 impl Drop for MemoryRegion {
     fn drop(&mut self) {
         unsafe {
-            let ret = (self.lib.dereg_mr)(self.mr);
+            // Retry MR deregistration up to 3 times — TB5 macOS driver can transiently
+            // fail dereg when kernel async cleanup hasn't finished yet.
+            let mut ret = (self.lib.dereg_mr)(self.mr);
             if ret != 0 {
-                // MR deregister failed — leak the buffer to avoid kernel state corruption.
-                // IOConnectUnmapMemory failure + free would leave a dangling IOMMU mapping.
-                eprintln!("[mr] WARNING: ibv_dereg_mr returned {ret}, leaking aligned_buf");
+                for attempt in 1..=3 {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    ret = (self.lib.dereg_mr)(self.mr);
+                    if ret == 0 {
+                        eprintln!("[mr] ibv_dereg_mr succeeded on retry {attempt}");
+                        break;
+                    }
+                }
+            }
+            if ret != 0 {
+                // MR deregister failed after retries — leak the buffer to avoid
+                // kernel state corruption. IOConnectUnmapMemory failure + free
+                // would leave a dangling IOMMU mapping.
+                eprintln!(
+                    "[mr] WARNING: ibv_dereg_mr returned {ret} after retries, leaking aligned_buf"
+                );
                 return;
             }
             // nocopy MRs have null aligned_buf — caller owns the memory, skip free.

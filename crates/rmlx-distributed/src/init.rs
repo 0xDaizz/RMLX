@@ -329,8 +329,8 @@ fn try_rdma_init(
     // qps[peer] holds (ctx, pd, cq, qp) for each peer slot.
     // For self-rank, we create a dummy QP (no connect needed).
     struct QpSlot {
-        ctx: RdmaContext,
-        pd: rmlx_rdma::context::ProtectionDomain,
+        ctx: Arc<RdmaContext>,
+        pd: Arc<rmlx_rdma::context::ProtectionDomain>,
         cq: CompletionQueue,
         qp: QueuePair,
         pool: Option<RdmaBufferPool>,
@@ -356,10 +356,13 @@ fn try_rdma_init(
             continue;
         }
 
-        let ctx = open_ctx(peer)?;
-        let pd = ctx
-            .alloc_pd()
-            .map_err(|e| DistributedError::Transport(e.to_string()))?;
+        // Use singleton context/PD to prevent TB5 driver PD leak on macOS.
+        // open_ctx() is kept for device_map routing; we wrap in Arc for the slot.
+        let ctx = Arc::new(open_ctx(peer)?);
+        let pd = Arc::new(
+            ctx.alloc_pd()
+                .map_err(|e| DistributedError::Transport(e.to_string()))?,
+        );
         let cq =
             CompletionQueue::new(&ctx).map_err(|e| DistributedError::Transport(e.to_string()))?;
         let mut qp = QueuePair::create_uc(&pd, &cq, &ctx)

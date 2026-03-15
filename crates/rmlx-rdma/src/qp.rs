@@ -395,6 +395,22 @@ impl QueuePair {
         Ok(())
     }
 
+    /// Transition QP to ERROR state, flushing all pending work requests.
+    ///
+    /// This causes the hardware to generate error completions for all outstanding WRs,
+    /// allowing clean CQ drain before QP destruction. Cleaner than going directly to
+    /// RESET, which silently discards in-flight WRs.
+    pub fn transition_to_error(&self) {
+        unsafe {
+            let mut attr: IbvQpAttr = std::mem::zeroed();
+            attr.qp_state = qp_state::ERR;
+            let ret = (self.lib.modify_qp)(self.qp, &mut attr, qp_attr_mask::STATE);
+            if ret != 0 {
+                eprintln!("[qp] WARNING: transition to ERROR state failed: {ret}");
+            }
+        }
+    }
+
     /// Raw QP pointer (for advanced operations).
     #[allow(dead_code)]
     pub(crate) fn raw(&self) -> *mut IbvQp {
