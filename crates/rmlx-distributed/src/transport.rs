@@ -79,17 +79,38 @@ impl Drop for ZeroCopyPendingOp {
     fn drop(&mut self) {
         let start = std::time::Instant::now();
         let mut warned = false;
+        let mut sleep_ms = 1u64;
+        const MAX_SLEEP_MS: u64 = 50;
+        const WARN_SECS: u64 = 5;
+        const TIMEOUT_SECS: u64 = 30;
+
         while self.pending.is_pending() {
-            if !warned && start.elapsed() > std::time::Duration::from_secs(5) {
+            let elapsed = start.elapsed();
+
+            if elapsed > std::time::Duration::from_secs(TIMEOUT_SECS) {
+                tracing::error!(
+                    target: "rmlx_distributed",
+                    wr_id = self.pending.wr_id(),
+                    elapsed_secs = elapsed.as_secs(),
+                    "ZeroCopyPendingOp timed out after {}s — releasing buffer (potential use-after-free risk)",
+                    TIMEOUT_SECS,
+                );
+                break;
+            }
+
+            if !warned && elapsed > std::time::Duration::from_secs(WARN_SECS) {
                 tracing::warn!(
                     target: "rmlx_distributed",
-                    "ZeroCopyPendingOp still pending after 5s, blocking until complete",
+                    wr_id = self.pending.wr_id(),
+                    "ZeroCopyPendingOp still pending after {}s, blocking until complete or timeout",
+                    WARN_SECS,
                 );
                 warned = true;
             }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+
+            std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+            sleep_ms = (sleep_ms * 2).min(MAX_SLEEP_MS);
         }
-        // Now safe to drop Arc<SharedBuffer>
     }
 }
 

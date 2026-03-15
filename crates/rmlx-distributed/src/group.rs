@@ -82,6 +82,36 @@ pub trait RdmaTransport: Send + Sync {
         recv_len: usize,
         src_rank: u32,
     ) -> Result<Vec<u8>, DistributedError>;
+
+    /// Send data from a borrowed slice (zero-copy friendly path).
+    /// Default: delegates to `send()`.
+    fn send_ref(&self, data: &[u8], dst_rank: u32) -> Result<(), DistributedError> {
+        self.send(data, dst_rank)
+    }
+
+    /// Receive data directly into a caller-provided mutable slice.
+    /// Default: delegates to `recv()` and copies into the buffer.
+    fn recv_into(&self, buf: &mut [u8], src_rank: u32) -> Result<(), DistributedError> {
+        let data = self.recv(src_rank, buf.len())?;
+        let copy_len = data.len().min(buf.len());
+        buf[..copy_len].copy_from_slice(&data[..copy_len]);
+        Ok(())
+    }
+
+    /// Send-then-receive with a caller-provided mutable recv buffer.
+    /// Default: delegates to `sendrecv()` and copies result into recv_buf.
+    fn sendrecv_into(
+        &self,
+        send_data: &[u8],
+        dst_rank: u32,
+        recv_buf: &mut [u8],
+        src_rank: u32,
+    ) -> Result<(), DistributedError> {
+        let data = self.sendrecv(send_data, dst_rank, recv_buf.len(), src_rank)?;
+        let copy_len = data.len().min(recv_buf.len());
+        recv_buf[..copy_len].copy_from_slice(&data[..copy_len]);
+        Ok(())
+    }
 }
 
 /// Reduction operation for allreduce.
@@ -327,6 +357,125 @@ impl Group {
         } else {
             mesh_allreduce_op(data, &self.ranks, self.local_rank, transport, op, dtype)
         }
+    }
+
+    /// Allreduce with explicit dtype (f16/bf16/f32).
+    /// Data is transmitted in its native format — no f32 expansion.
+    pub fn allreduce_typed(
+        &self,
+        data: &[u8],
+        dtype: ReduceDtype,
+    ) -> Result<Vec<u8>, DistributedError> {
+        Self::check_materialized_dtype("allreduce_typed", data, dtype)?;
+        if self.ranks.len() <= 1 {
+            return Ok(data.to_vec());
+        }
+        let transport = self.require_transport("allreduce_typed")?;
+        ring_allreduce_op_native(
+            data,
+            &self.ranks,
+            self.local_rank,
+            transport,
+            ReduceOp::Sum,
+            dtype,
+        )
+    }
+
+    /// In-place allreduce: reduces data across all ranks directly in the provided buffer.
+    ///
+    /// Uses ring allreduce with slice-based sendrecv for zero-copy operation.
+    /// The buffer is modified in-place with the reduced result.
+    pub fn allreduce_in_place(
+        &self,
+        data: &mut [u8],
+        dtype: ReduceDtype,
+    ) -> Result<(), DistributedError> {
+        let len = data.len();
+        if len == 0 {
+            return Ok(());
+        }
+        let elem_size = match dtype {
+            ReduceDtype::F32 => 4,
+            ReduceDtype::F16 | ReduceDtype::Bf16 => 2,
+        };
+        if len % elem_size != 0 {
+            return Err(DistributedError::Protocol(format!(
+                "allreduce_in_place: data length ({len}) must be a multiple of {elem_size} for {:?}",
+                dtype
+            )));
+        }
+        if self.ranks.len() <= 1 {
+            return Ok(());
+        }
+        let transport = self.require_transport("allreduce_in_place")?;
+        let n = self.ranks.len();
+        let total_elems = len / elem_size;
+        let elems_per_chunk = (total_elems + n - 1) / n;
+        let chunk_size = elems_per_chunk * elem_size;
+
+        // Find our position in the ring
+        let my_pos = self
+            .ranks
+            .iter()
+            .position(|&r| r == self.local_rank)
+            .unwrap();
+        let left = self.ranks[(my_pos + n - 1) % n];
+        let right = self.ranks[(my_pos + 1) % n];
+
+        let mut staging = vec![0u8; chunk_size];
+
+        // Phase 1: reduce-scatter
+        for step in 0..(n - 1) {
+            let send_idx = (my_pos + n - step) % n;
+            let recv_idx = (my_pos + n - step - 1) % n;
+
+            let send_offset = send_idx * chunk_size;
+            let recv_offset = recv_idx * chunk_size;
+            let send_len = chunk_size.min(len.saturating_sub(send_offset));
+            let recv_len = chunk_size.min(len.saturating_sub(recv_offset));
+
+            if send_len == 0 || recv_len == 0 {
+                continue;
+            }
+
+            // Send our chunk, recv peer's chunk into staging
+            let send_slice = &data[send_offset..send_offset + send_len];
+            transport.sendrecv_into(send_slice, right, &mut staging[..recv_len], left)?;
+
+            // Add staging into local recv chunk (element-wise by dtype)
+            reduce_inplace(
+                &mut data[recv_offset..recv_offset + recv_len],
+                &staging[..recv_len],
+                ReduceOp::Sum,
+                dtype,
+            );
+        }
+
+        // Phase 2: allgather
+        for step in 0..(n - 1) {
+            let send_idx = (my_pos + n - step + 1) % n;
+            let recv_idx = (my_pos + n - step) % n;
+
+            let send_offset = send_idx * chunk_size;
+            let recv_offset = recv_idx * chunk_size;
+            let send_len = chunk_size.min(len.saturating_sub(send_offset));
+            let recv_len = chunk_size.min(len.saturating_sub(recv_offset));
+
+            if send_len == 0 || recv_len == 0 {
+                continue;
+            }
+
+            // Copy send chunk to staging to avoid borrow conflict
+            staging[..send_len].copy_from_slice(&data[send_offset..send_offset + send_len]);
+            transport.sendrecv_into(
+                &staging[..send_len],
+                right,
+                &mut data[recv_offset..recv_offset + recv_len],
+                left,
+            )?;
+        }
+
+        Ok(())
     }
 
     /// All-gather: gather data from all ranks into every rank.
@@ -915,6 +1064,78 @@ fn reduce_f32_inplace(dst: &mut [u8], src: &[u8], op: ReduceOp) {
     }
 }
 
+/// Element-wise f16 addition in-place: dst[i] += src[i].
+/// Converts each pair to f32 for the addition, then stores back as f16.
+fn add_f16_inplace(dst: &mut [u8], src: &[u8]) {
+    let count = dst.len().min(src.len()) / 2;
+    for i in 0..count {
+        let offset = i * 2;
+        let a = f16_to_f32(u16::from_ne_bytes([dst[offset], dst[offset + 1]]));
+        let b = f16_to_f32(u16::from_ne_bytes([src[offset], src[offset + 1]]));
+        let sum = f32_to_f16(a + b);
+        dst[offset..offset + 2].copy_from_slice(&sum.to_ne_bytes());
+    }
+}
+
+/// Element-wise bf16 addition in-place: dst[i] += src[i].
+fn add_bf16_inplace(dst: &mut [u8], src: &[u8]) {
+    let count = dst.len().min(src.len()) / 2;
+    for i in 0..count {
+        let offset = i * 2;
+        let a = bf16_to_f32(u16::from_ne_bytes([dst[offset], dst[offset + 1]]));
+        let b = bf16_to_f32(u16::from_ne_bytes([src[offset], src[offset + 1]]));
+        let sum = f32_to_bf16(a + b);
+        dst[offset..offset + 2].copy_from_slice(&sum.to_ne_bytes());
+    }
+}
+
+/// Dispatch element-wise reduction by dtype.
+fn reduce_inplace(dst: &mut [u8], src: &[u8], op: ReduceOp, dtype: ReduceDtype) {
+    match dtype {
+        ReduceDtype::F32 => reduce_f32_inplace(dst, src, op),
+        ReduceDtype::F16 => match op {
+            ReduceOp::Sum => add_f16_inplace(dst, src),
+            _ => reduce_f16_inplace(dst, src, op),
+        },
+        ReduceDtype::Bf16 => match op {
+            ReduceOp::Sum => add_bf16_inplace(dst, src),
+            _ => reduce_bf16_inplace(dst, src, op),
+        },
+    }
+}
+
+fn reduce_f16_inplace(dst: &mut [u8], src: &[u8], op: ReduceOp) {
+    let count = dst.len().min(src.len()) / 2;
+    for i in 0..count {
+        let offset = i * 2;
+        let a = f16_to_f32(u16::from_ne_bytes([dst[offset], dst[offset + 1]]));
+        let b = f16_to_f32(u16::from_ne_bytes([src[offset], src[offset + 1]]));
+        let result = match op {
+            ReduceOp::Sum => a + b,
+            ReduceOp::Max => a.max(b),
+            ReduceOp::Min => a.min(b),
+        };
+        let bits = f32_to_f16(result);
+        dst[offset..offset + 2].copy_from_slice(&bits.to_ne_bytes());
+    }
+}
+
+fn reduce_bf16_inplace(dst: &mut [u8], src: &[u8], op: ReduceOp) {
+    let count = dst.len().min(src.len()) / 2;
+    for i in 0..count {
+        let offset = i * 2;
+        let a = bf16_to_f32(u16::from_ne_bytes([dst[offset], dst[offset + 1]]));
+        let b = bf16_to_f32(u16::from_ne_bytes([src[offset], src[offset + 1]]));
+        let result = match op {
+            ReduceOp::Sum => a + b,
+            ReduceOp::Max => a.max(b),
+            ReduceOp::Min => a.min(b),
+        };
+        let bits = f32_to_bf16(result);
+        dst[offset..offset + 2].copy_from_slice(&bits.to_ne_bytes());
+    }
+}
+
 /// Ring reduce-scatter: reduce and scatter data across all ranks.
 fn ring_reduce_scatter(
     data: &[u8],
@@ -1178,26 +1399,7 @@ fn ring_allreduce_op(
                     data.len()
                 )));
             }
-            let n_elems = data.len() / 2;
-            let mut f32_data = vec![0u8; n_elems * 4];
-            for i in 0..n_elems {
-                let bits = u16::from_ne_bytes([data[i * 2], data[i * 2 + 1]]);
-                let val = f16_to_f32(bits);
-                f32_data[i * 4..i * 4 + 4].copy_from_slice(&val.to_ne_bytes());
-            }
-            let result = ring_allreduce_op_f32(&f32_data, ranks, local_rank, transport, op)?;
-            let mut out = vec![0u8; n_elems * 2];
-            for i in 0..n_elems {
-                let val = f32::from_ne_bytes([
-                    result[i * 4],
-                    result[i * 4 + 1],
-                    result[i * 4 + 2],
-                    result[i * 4 + 3],
-                ]);
-                let bits = f32_to_f16(val);
-                out[i * 2..i * 2 + 2].copy_from_slice(&bits.to_ne_bytes());
-            }
-            Ok(out)
+            ring_allreduce_op_native(data, ranks, local_rank, transport, op, dtype)
         }
         ReduceDtype::Bf16 => {
             if data.len() % 2 != 0 {
@@ -1206,26 +1408,7 @@ fn ring_allreduce_op(
                     data.len()
                 )));
             }
-            let n_elems = data.len() / 2;
-            let mut f32_data = vec![0u8; n_elems * 4];
-            for i in 0..n_elems {
-                let bits = u16::from_ne_bytes([data[i * 2], data[i * 2 + 1]]);
-                let val = bf16_to_f32(bits);
-                f32_data[i * 4..i * 4 + 4].copy_from_slice(&val.to_ne_bytes());
-            }
-            let result = ring_allreduce_op_f32(&f32_data, ranks, local_rank, transport, op)?;
-            let mut out = vec![0u8; n_elems * 2];
-            for i in 0..n_elems {
-                let val = f32::from_ne_bytes([
-                    result[i * 4],
-                    result[i * 4 + 1],
-                    result[i * 4 + 2],
-                    result[i * 4 + 3],
-                ]);
-                let bits = f32_to_bf16(val);
-                out[i * 2..i * 2 + 2].copy_from_slice(&bits.to_ne_bytes());
-            }
-            Ok(out)
+            ring_allreduce_op_native(data, ranks, local_rank, transport, op, dtype)
         }
     }
 }
@@ -1270,6 +1453,80 @@ fn ring_allreduce_op_f32(
         reduce_f32_inplace(&mut buf[recv_start..recv_start + chunk_size], &received, op);
     }
 
+    for round in 0..(n - 1) {
+        let send_chunk_idx = (my_idx + 1 + n - round) % n;
+        let recv_chunk_idx = (my_idx + n - round) % n;
+        let send_start = send_chunk_idx * chunk_size;
+        let send_end = send_start + chunk_size;
+
+        let received = transport.sendrecv(&buf[send_start..send_end], right, chunk_size, left)?;
+
+        let recv_start = recv_chunk_idx * chunk_size;
+        buf[recv_start..recv_start + chunk_size].copy_from_slice(&received);
+    }
+
+    buf.truncate(data.len());
+    Ok(buf)
+}
+
+/// Ring allreduce on native-dtype data (f16/bf16/f32) with configurable reduce op.
+/// Sends data in its native format over RDMA — no f32 expansion.
+fn ring_allreduce_op_native(
+    data: &[u8],
+    ranks: &[u32],
+    local_rank: u32,
+    transport: &Arc<dyn RdmaTransport>,
+    op: ReduceOp,
+    dtype: ReduceDtype,
+) -> Result<Vec<u8>, DistributedError> {
+    let n = ranks.len();
+    if n <= 1 {
+        return Ok(data.to_vec());
+    }
+
+    let elem_size = match dtype {
+        ReduceDtype::F32 => 4,
+        ReduceDtype::F16 | ReduceDtype::Bf16 => 2,
+    };
+
+    let my_idx = ranks.iter().position(|&r| r == local_rank).ok_or_else(|| {
+        DistributedError::Transport(format!(
+            "local_rank {local_rank} not found in ranks {:?}",
+            ranks
+        ))
+    })?;
+    let right = ranks[(my_idx + 1) % n];
+    let left = ranks[(my_idx + n - 1) % n];
+
+    // Chunk size must be aligned to element size
+    let total_elems = data.len() / elem_size;
+    let elems_per_chunk = (total_elems + n - 1) / n;
+    let chunk_size = elems_per_chunk * elem_size;
+
+    // Pad data to be evenly divisible
+    let padded_len = chunk_size * n;
+    let mut buf = vec![0u8; padded_len];
+    buf[..data.len()].copy_from_slice(data);
+
+    // Phase 1: Reduce-scatter
+    for round in 0..(n - 1) {
+        let send_chunk_idx = (my_idx + n - round) % n;
+        let recv_chunk_idx = (my_idx + n - round - 1) % n;
+        let send_start = send_chunk_idx * chunk_size;
+        let send_end = send_start + chunk_size;
+
+        let received = transport.sendrecv(&buf[send_start..send_end], right, chunk_size, left)?;
+
+        let recv_start = recv_chunk_idx * chunk_size;
+        reduce_inplace(
+            &mut buf[recv_start..recv_start + chunk_size],
+            &received,
+            op,
+            dtype,
+        );
+    }
+
+    // Phase 2: Allgather
     for round in 0..(n - 1) {
         let send_chunk_idx = (my_idx + 1 + n - round) % n;
         let recv_chunk_idx = (my_idx + n - round) % n;

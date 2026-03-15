@@ -10,7 +10,8 @@ use crate::RdmaError;
 pub const DEFAULT_MAX_MR_SIZE: usize = 16 * 1024 * 1024;
 
 /// RDMA memory region — wraps ibv_mr.
-/// Deregisters the MR on drop and frees the page-aligned buffer.
+/// Deregisters the MR on drop and frees the page-aligned buffer (if owned).
+/// For nocopy MRs, the caller owns the buffer and Drop only deregisters.
 pub struct MemoryRegion {
     mr: *mut IbvMr,
     lib: &'static IbverbsLib,
@@ -99,6 +100,77 @@ impl MemoryRegion {
         })
     }
 
+    /// Register an externally-owned buffer directly (no copy, no allocation).
+    ///
+    /// Designed for UMA architectures (Apple Silicon) where Metal `SharedBuffer`
+    /// pointers can be registered directly with RDMA.  The caller retains
+    /// ownership of the buffer and must keep it alive until this MR is dropped.
+    ///
+    /// # Safety
+    /// - `ptr` must be page-aligned and valid for `size` bytes
+    /// - The memory must remain valid until this MR is dropped
+    pub unsafe fn register_nocopy(
+        pd: &ProtectionDomain,
+        ptr: *mut c_void,
+        size: usize,
+    ) -> Result<Self, RdmaError> {
+        // SAFETY: caller guarantees ptr validity and alignment (see fn-level doc).
+        unsafe { Self::register_nocopy_with_limit(pd, ptr, size, DEFAULT_MAX_MR_SIZE) }
+    }
+
+    /// Register an externally-owned buffer directly with a specific max_mr_size limit.
+    ///
+    /// # Safety
+    /// - `ptr` must be page-aligned and valid for `size` bytes
+    /// - The memory must remain valid until this MR is dropped
+    pub unsafe fn register_nocopy_with_limit(
+        pd: &ProtectionDomain,
+        ptr: *mut c_void,
+        size: usize,
+        max_mr_size: usize,
+    ) -> Result<Self, RdmaError> {
+        if size > max_mr_size {
+            return Err(RdmaError::MrReg(format!(
+                "size {size} exceeds max_mr_size ({max_mr_size})"
+            )));
+        }
+
+        if ptr.is_null() {
+            return Err(RdmaError::MrReg("ptr is null".into()));
+        }
+
+        // Verify page alignment of the caller-provided pointer.
+        let ps = page_size();
+        if (ptr as usize) % ps != 0 {
+            return Err(RdmaError::MrReg(format!(
+                "ptr {ptr:?} is not page-aligned (page_size={ps})"
+            )));
+        }
+
+        let flags =
+            access_flags::LOCAL_WRITE | access_flags::REMOTE_WRITE | access_flags::REMOTE_READ;
+        // SAFETY: pd.raw() is valid, ptr is page-aligned and valid for size bytes
+        // (caller guarantee).
+        let mr = unsafe { (pd.lib().reg_mr)(pd.raw(), ptr, size, flags) };
+        if mr.is_null() {
+            return Err(RdmaError::MrReg(format!(
+                "ibv_reg_mr failed for nocopy ptr={ptr:?}, size={size}"
+            )));
+        }
+        Ok(Self {
+            mr,
+            lib: pd.lib(),
+            // null signals "not owned" — Drop will skip libc::free.
+            aligned_buf: std::ptr::null_mut(),
+            aligned_size: size,
+        })
+    }
+
+    /// Returns `true` if this MR was created via `register_nocopy` (caller owns the buffer).
+    pub fn is_nocopy(&self) -> bool {
+        self.aligned_buf.is_null()
+    }
+
     /// Local key for this memory region.
     pub fn lkey(&self) -> u32 {
         // SAFETY: mr is a valid ibv_mr pointer.
@@ -112,8 +184,15 @@ impl MemoryRegion {
     }
 
     /// Registered address (page-aligned buffer used for ibv_reg_mr).
+    /// For nocopy MRs, returns the address stored in the ibv_mr struct.
     pub fn addr(&self) -> *mut c_void {
-        self.aligned_buf
+        if self.aligned_buf.is_null() {
+            // nocopy: read from ibv_mr
+            // SAFETY: mr is a valid ibv_mr pointer.
+            unsafe { (*self.mr).addr }
+        } else {
+            self.aligned_buf
+        }
     }
 
     /// Registered length (page-aligned size).
@@ -132,7 +211,11 @@ impl Drop for MemoryRegion {
                 eprintln!("[mr] WARNING: ibv_dereg_mr returned {ret}, leaking aligned_buf");
                 return;
             }
-            libc::free(self.aligned_buf);
+            // nocopy MRs have null aligned_buf — caller owns the memory, skip free.
+            if !self.aligned_buf.is_null() {
+                // SAFETY: aligned_buf was allocated by posix_memalign in register_with_limit.
+                libc::free(self.aligned_buf);
+            }
         }
     }
 }

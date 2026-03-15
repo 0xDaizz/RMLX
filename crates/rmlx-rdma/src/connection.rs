@@ -625,12 +625,9 @@ impl RdmaConnection {
         };
 
         // SAFETY: sge is valid and points into the registered MR.
-        // JACCL compatible: leave unused fields uninitialized instead of zeroed.
-        // macOS TB5 driver may interpret zero values in imm_data/wr union differently.
         // All fields read by ibv_post_send (wr_id, next, sg_list, num_sge, opcode,
         // send_flags) are set immediately below; remaining fields are don't-care for SEND.
-        #[allow(invalid_value)]
-        let mut wr: IbvSendWr = unsafe { std::mem::MaybeUninit::uninit().assume_init() };
+        let mut wr: IbvSendWr = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
         wr.wr_id = wr_id;
         wr.next = std::ptr::null_mut();
         wr.sg_list = &mut sge;
@@ -948,9 +945,87 @@ impl RdmaConnection {
         self.pool.is_some()
     }
 
+    /// Attempt zero-copy send by registering the caller's buffer directly.
+    ///
+    /// Only works on UMA (Apple Silicon) where the pointer is already in
+    /// device-visible memory.  Falls back (returns `Err`) if MR registration
+    /// fails (e.g., TB5 driver limitation).
+    fn try_nocopy_send(&self, data: &[u8]) -> Result<(), RdmaError> {
+        // SAFETY: data.as_ptr() is page-aligned and valid for data.len() bytes
+        // (checked by caller). The slice stays alive until this function returns
+        // and the MR is dropped.
+        let mr = unsafe {
+            MemoryRegion::register_nocopy(
+                &self.pd,
+                data.as_ptr() as *mut std::ffi::c_void,
+                data.len(),
+            )?
+        };
+
+        let mut sge = IbvSge {
+            addr: mr.addr() as u64,
+            length: data.len() as u32,
+            lkey: mr.lkey(),
+        };
+
+        let mut wr: IbvSendWr = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
+        wr.wr_id = 0x4E00; // nocopy marker
+        wr.next = std::ptr::null_mut();
+        wr.sg_list = &mut sge;
+        wr.num_sge = 1;
+        wr.opcode = wr_opcode::SEND;
+        wr.send_flags = send_flags::SIGNALED;
+
+        self.qp.post_send(&mut wr)?;
+
+        // Poll CQ for completion (same 5-second timeout pattern as chunked_send)
+        let mut wc_buf: [IbvWc; 1] = [IbvWc::zeroed()];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let count = self.cq.poll(&mut wc_buf)?;
+            if count > 0 {
+                if wc_buf[0].status != wc_status::SUCCESS {
+                    return Err(RdmaError::CqPoll(format!(
+                        "try_nocopy_send: wc status={} ({})",
+                        wc_buf[0].status,
+                        wc_status_str(wc_buf[0].status)
+                    )));
+                }
+                break;
+            }
+            if Instant::now() >= deadline {
+                // HW may still be accessing the buffer — leak the MR to prevent
+                // use-after-deregister. The MR will never be freed, but this is
+                // better than a potential crash.
+                std::mem::forget(mr);
+                return Err(RdmaError::Timeout(
+                    "try_nocopy_send: timeout waiting for completion (MR leaked for safety)".into(),
+                ));
+            }
+            std::thread::yield_now();
+        }
+
+        // MR dropped here — deregisters the nocopy region
+        Ok(())
+    }
+
     /// Chunked send using PIPELINE=2 pipelining through tiered buffer pool.
     /// Handles arbitrary message sizes by streaming through pre-registered buffers.
     pub fn chunked_send(&self, data: &[u8]) -> Result<(), RdmaError> {
+        // Fast path: try nocopy for page-aligned, large-enough buffers (UMA optimization)
+        const PAGE_SIZE: usize = 16384; // macOS page size
+        if data.len() >= PAGE_SIZE
+            && (data.as_ptr() as usize) % PAGE_SIZE == 0
+            && data.len() <= crate::mr::DEFAULT_MAX_MR_SIZE
+        {
+            match self.try_nocopy_send(data) {
+                Ok(()) => return Ok(()),
+                Err(_) => {
+                    // Nocopy registration failed (e.g., TB5 driver limitation) — fall through
+                }
+            }
+        }
+
         let pool = self
             .pool
             .as_ref()
@@ -981,8 +1056,7 @@ impl RdmaConnection {
                 lkey: sbuf.lkey(),
             };
             let wr_id = (SEND_WR << 16) | (buf_idx as u64) << 8;
-            #[allow(invalid_value)]
-            let mut wr: IbvSendWr = unsafe { std::mem::MaybeUninit::uninit().assume_init() };
+            let mut wr: IbvSendWr = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
             wr.wr_id = wr_id;
             wr.next = std::ptr::null_mut();
             wr.sg_list = &mut sge;
@@ -1029,9 +1103,8 @@ impl RdmaConnection {
                         lkey: sbuf.lkey(),
                     };
                     let wr_id = (SEND_WR << 16) | (buf_idx as u64) << 8;
-                    #[allow(invalid_value)]
                     let mut wr: IbvSendWr =
-                        unsafe { std::mem::MaybeUninit::uninit().assume_init() };
+                        unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
                     wr.wr_id = wr_id;
                     wr.next = std::ptr::null_mut();
                     wr.sg_list = &mut sge;
@@ -1228,8 +1301,7 @@ impl RdmaConnection {
                     lkey: sbuf.lkey(),
                 };
                 let wr_id = (SEND_WR << 16) | (buf_idx as u64) << 8;
-                #[allow(invalid_value)]
-                let mut wr: IbvSendWr = unsafe { std::mem::MaybeUninit::uninit().assume_init() };
+                let mut wr: IbvSendWr = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
                 wr.wr_id = wr_id;
                 wr.next = std::ptr::null_mut();
                 wr.sg_list = &mut sge;
@@ -1281,9 +1353,8 @@ impl RdmaConnection {
                             lkey: sbuf.lkey(),
                         };
                         let wr_id = (SEND_WR << 16) | (buf_idx as u64) << 8;
-                        #[allow(invalid_value)]
                         let mut wr: IbvSendWr =
-                            unsafe { std::mem::MaybeUninit::uninit().assume_init() };
+                            unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
                         wr.wr_id = wr_id;
                         wr.next = std::ptr::null_mut();
                         wr.sg_list = &mut sge;

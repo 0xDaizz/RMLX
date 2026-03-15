@@ -14,7 +14,7 @@ use rmlx_core::kernels::KernelRegistry;
 use rmlx_core::ops;
 
 #[cfg(feature = "distributed")]
-use rmlx_distributed::group::{DistributedError, Group};
+use rmlx_distributed::group::{DistributedError, Group, ReduceDtype, ReduceOp};
 
 #[cfg(feature = "distributed")]
 use objc2::runtime::ProtocolObject;
@@ -431,11 +431,11 @@ impl ColumnParallelLinear {
         };
 
         // Read result bytes for allgather
-        let local_bytes = local_out_arr.to_bytes().to_vec();
+        let local_bytes = local_out_arr.to_bytes();
 
         // Allgather across ranks → rank-major: [rank0_all_rows][rank1_all_rows]...
         // We need batch-major: [row0_rank0_shard ++ row0_rank1_shard ++ ...][row1_...]
-        let gathered = group.allgather(&local_bytes)?;
+        let gathered = group.allgather(local_bytes)?;
         assert_eq!(
             self.world_size as usize,
             group.size(),
@@ -621,62 +621,34 @@ impl RowParallelLinear {
         let local_out_arr = ops::matmul::matmul(registry, input, &w_t, queue)
             .map_err(|e| DistributedError::Protocol(format!("GPU matmul failed: {e}")))?;
 
-        // allreduce operates on f32 internally (add_f32_inplace) — cast f16→f32 if needed
-        // to avoid misinterpreting two f16 values as one f32.
-        let (local_for_reduce, reduce_dtype) = if dtype == DType::Float16 {
-            let f32_out = ops::copy::copy_cast(registry, &local_out_arr, DType::Float32, queue)
-                .map_err(|e| {
-                    DistributedError::Protocol(format!("f16→f32 cast for allreduce: {e}"))
-                })?;
-            (f32_out.to_bytes().to_vec(), DType::Float32)
-        } else {
-            (local_out_arr.to_bytes().to_vec(), dtype)
+        // Use dtype-native allreduce — f16 data is sent directly over RDMA (no f32 expansion).
+        let reduce_dtype = match dtype {
+            DType::Float16 => ReduceDtype::F16,
+            DType::Float32 => ReduceDtype::F32,
+            _ => ReduceDtype::F32,
         };
+        let local_bytes = local_out_arr.to_bytes();
+        let mut reduced = group.allreduce_op(local_bytes, ReduceOp::Sum, reduce_dtype)?;
 
-        // Allreduce sum across ranks → [batch, out_features]
-        let mut reduced = group.allreduce(&local_for_reduce)?;
-
-        // Add bias after allreduce (all ranks have the same summed result)
-        // Bias is always added in the reduce dtype (f32 if we cast).
+        // Add bias after allreduce (all ranks have the same result)
         if let Some(ref bias) = self.bias {
             let bias_data = bias.to_bytes();
-            match reduce_dtype {
-                DType::Float32 => {
-                    // If original was f16, bias is f16 — convert bias to f32 for addition
-                    if dtype == DType::Float16 {
-                        let bias_f32: Vec<u8> = bias_data
-                            .chunks_exact(2)
-                            .flat_map(|chunk| {
-                                let bits = u16::from_ne_bytes([chunk[0], chunk[1]]);
-                                f16_to_f32(bits).to_ne_bytes()
-                            })
-                            .collect();
-                        add_bias_f32(&mut reduced, &bias_f32, batch, n);
-                    } else {
-                        add_bias_f32(&mut reduced, bias_data, batch, n);
-                    }
-                }
+            match dtype {
                 DType::Float16 => add_bias_f16(&mut reduced, bias_data, batch, n),
-                _ => unreachable!(),
+                DType::Float32 => add_bias_f32(&mut reduced, bias_data, batch, n),
+                _ => {}
             }
         }
 
-        // Reconstruct Array from reduced bytes
+        // Reconstruct Array from reduced bytes (same dtype as input — no cast needed)
         let result = array_from_raw_bytes(
             &*input.metal_buffer().device(),
             &reduced,
             vec![batch, n],
-            reduce_dtype,
+            dtype,
         );
 
-        // Cast back to f16 if needed
-        if dtype == DType::Float16 && reduce_dtype == DType::Float32 {
-            ops::copy::copy_cast(registry, &result, DType::Float16, queue).map_err(|e| {
-                DistributedError::Protocol(format!("f32→f16 cast after allreduce: {e}"))
-            })
-        } else {
-            Ok(result)
-        }
+        Ok(result)
     }
 }
 
@@ -751,9 +723,9 @@ impl QuantizedColumnParallelLinear {
             .map_err(|e| TpError(format!("quantized forward failed: {e}")))?;
 
         // 2. Allgather output across ranks
-        let local_bytes = local_out.to_bytes().to_vec();
+        let local_bytes = local_out.to_bytes();
         let gathered = group
-            .allgather(&local_bytes)
+            .allgather(local_bytes)
             .map_err(|e| TpError(format!("allgather failed: {e}")))?;
 
         let dtype = local_out.dtype();
@@ -824,38 +796,29 @@ impl QuantizedRowParallelLinear {
             .forward(&x_shard, registry, queue)
             .map_err(|e| TpError(format!("quantized forward failed: {e}")))?;
 
-        // 3. Allreduce sum across ranks
-        // allreduce operates on f32 internally (add_f32_inplace) — cast f16→f32 if needed
-        // to avoid misinterpreting two f16 values as one f32.
+        // 3. Allreduce sum across ranks — dtype-native (no f32 expansion)
         let dtype = local_out.dtype();
         let batch = local_out.shape()[0];
         let out_features = self.ql.out_features();
 
-        let (local_for_reduce, reduce_dtype) = if dtype == DType::Float16 {
-            let f32_out = ops::copy::copy_cast(registry, &local_out, DType::Float32, queue)
-                .map_err(|e| TpError(format!("f16→f32 cast for allreduce: {e}")))?;
-            (f32_out.to_bytes().to_vec(), DType::Float32)
-        } else {
-            (local_out.to_bytes().to_vec(), dtype)
+        let reduce_dtype = match dtype {
+            DType::Float16 => ReduceDtype::F16,
+            DType::Float32 => ReduceDtype::F32,
+            _ => ReduceDtype::F32,
         };
-
+        let local_bytes = local_out.to_bytes();
         let reduced = group
-            .allreduce(&local_for_reduce)
+            .allreduce_op(local_bytes, ReduceOp::Sum, reduce_dtype)
             .map_err(|e| TpError(format!("allreduce failed: {e}")))?;
 
-        // Reconstruct and cast back to f16 if needed
+        // Reconstruct Array from reduced bytes (same dtype as output — no cast needed)
         let result = array_from_raw_bytes(
             &*x.metal_buffer().device(),
             &reduced,
             vec![batch, out_features],
-            reduce_dtype,
+            dtype,
         );
-        if dtype == DType::Float16 && reduce_dtype == DType::Float32 {
-            ops::copy::copy_cast(registry, &result, DType::Float16, queue)
-                .map_err(|e| TpError(format!("f32→f16 cast after allreduce: {e}")))
-        } else {
-            Ok(result)
-        }
+        Ok(result)
     }
 }
 
