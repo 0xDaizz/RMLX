@@ -122,6 +122,10 @@ Phase 5 adds a binary tree allreduce algorithm to `group.rs`. Unlike ring allred
 
 `TopologyRing` constructs an optimized ring ordering from a hop-count matrix between nodes. It uses a greedy nearest-unvisited heuristic to minimize total inter-node hops, which is important for multi-node ring allreduce performance. The topology can be overridden via the `RMLX_TOPOLOGY` environment variable.
 
+### Split-CB TP Optimization (Phase 7)
+
+The Split-CB tensor-parallel path (`forward_with_group_split_cb()` in `rmlx-nn`) batches all attention and FFN ops into two command buffers with allreduce calls between them, reducing TP per-layer overhead from 18,193 us to 392 us. The allreduce calls use the `Group` from this crate. See `rmlx-nn` docs for details.
+
 ---
 
 ## moe_exchange.rs — MoE Dispatch/Combine Exchange
