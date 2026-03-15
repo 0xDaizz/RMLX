@@ -59,6 +59,9 @@ impl RdmaContext {
                 CStr::from_ptr(name_ptr).to_string_lossy().into_owned()
             };
 
+            eprintln!(
+                "[rdma] open_default: opening device '{device_name}' (RMLX_RDMA_DEVICE not set)"
+            );
             let ctx = (lib.open_device)(device);
             (lib.free_device_list)(dev_list);
 
@@ -286,8 +289,10 @@ impl RdmaContext {
         // SAFETY: ctx is a valid ibv_context pointer.
         let pd = unsafe { (self.lib.alloc_pd)(self.ctx) };
         if pd.is_null() {
+            eprintln!("[rdma] alloc_pd FAILED on device '{}'", self.device_name);
             return Err(RdmaError::PdAlloc);
         }
+        eprintln!("[rdma] alloc_pd OK on device '{}'", self.device_name);
         Ok(ProtectionDomain { pd, lib: self.lib })
     }
 }

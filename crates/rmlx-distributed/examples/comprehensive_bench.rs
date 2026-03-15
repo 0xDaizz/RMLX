@@ -412,7 +412,7 @@ fn main() {
         peer_host,
         exchange_port: port,
         sync_port: port + 1,
-        accept_timeout_secs: 10,
+        accept_timeout_secs: 30,
         connect_timeout_ms: 5000,
         ..Default::default()
     };
