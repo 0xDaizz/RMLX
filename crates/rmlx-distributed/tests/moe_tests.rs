@@ -1796,19 +1796,21 @@ impl RdmaTransport for SendrecvTrackingTransport {
 }
 
 /// Verify allreduce uses sendrecv instead of separate send+recv.
+///
+/// With 2 ranks, allreduce_auto dispatches to tree (< 1MB) or mesh (>= 1MB).
+/// We use >= 1MB data to hit the mesh path which uses sendrecv.
 #[test]
 fn test_allreduce_uses_sendrecv() {
-    // 8 bytes of f32 data (2 elements): must be 4-byte aligned
-    let data = vec![0u8; 8];
-    let mock = Arc::new(SendrecvTrackingTransport::new(vec![0u8; 8]));
+    // 1MB of f32 data: hits mesh path which uses sendrecv
+    let size = 1024 * 1024;
+    let data = vec![0u8; size];
+    let mock = Arc::new(SendrecvTrackingTransport::new(vec![0u8; size]));
     let group = Group::with_transport(vec![0, 1], 0, 2, mock.clone()).unwrap();
 
     let _ = group.allreduce(&data);
 
-    // With 2 ranks, ring allreduce has:
-    // Phase 1 (reduce-scatter): N-1=1 round
-    // Phase 2 (allgather): N-1=1 round
-    // Total: 2 sendrecv calls, 0 separate send/recv
+    // With 2 ranks and >= 1MB data, mesh allreduce is used.
+    // Mesh exchanges with every peer: 1 sendrecv call, 0 separate send/recv
     assert!(
         mock.sendrecv_count() > 0,
         "allreduce should use sendrecv, got count={}",

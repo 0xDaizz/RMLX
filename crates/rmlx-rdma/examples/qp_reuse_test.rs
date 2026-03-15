@@ -170,8 +170,7 @@ fn run_round(ctx: &RdmaContext, rank: u32, peer_ip: &str, round: u32) {
         }
 
         let n = cq.poll(&mut wc).expect("CQ poll error");
-        for i in 0..n {
-            let wc_entry = &wc[i];
+        for wc_entry in &wc[..n] {
             if wc_entry.status != ffi::wc_status::SUCCESS {
                 eprintln!(
                     "[rank {rank}] round {round}: FAILURE — wr_id={}, status={} ({})",

@@ -410,7 +410,7 @@ impl Group {
         let transport = self.require_transport("allreduce_in_place")?;
         let n = self.ranks.len();
         let total_elems = len / elem_size;
-        let elems_per_chunk = (total_elems + n - 1) / n;
+        let elems_per_chunk = total_elems.div_ceil(n);
         let chunk_size = elems_per_chunk * elem_size;
 
         // Find our position in the ring
@@ -1500,7 +1500,7 @@ fn ring_allreduce_op_native(
 
     // Chunk size must be aligned to element size
     let total_elems = data.len() / elem_size;
-    let elems_per_chunk = (total_elems + n - 1) / n;
+    let elems_per_chunk = total_elems.div_ceil(n);
     let chunk_size = elems_per_chunk * elem_size;
 
     // Pad data to be evenly divisible
