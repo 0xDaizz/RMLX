@@ -30,9 +30,9 @@ use rmlx_metal::{ComputePass, MTLSize};
 // use rmlx_metal::icb_sparse::grouped_forward_icb;
 
 #[cfg(feature = "distributed")]
+use rmlx_distributed::{AsyncCombineHandle, AsyncDispatchResult};
+#[cfg(feature = "distributed")]
 use rmlx_distributed::{DispatchResult, MoeCombineExchange, MoeDispatchExchange};
-// TODO(Phase 3a/3b): Import when full async wiring is ready:
-// use rmlx_distributed::{AsyncCombineHandle, AsyncDispatchResult};
 
 use crate::expert_group::ExpertGroup;
 use crate::linear::Linear;
@@ -779,14 +779,8 @@ impl MoeLayer {
     /// - Phase 3 (combine): Uses `combine_with_layout()` with `runtime_ctx` attached
     ///   to the combiner, enabling the zero-copy combine path.
     ///
-    /// TODO(Phase 3a full async): Wire `dispatch_async()` directly once
-    /// `ExchangeBuffers` exposes `Arc<SharedBuffer>` references compatible with
-    /// `dispatch_async`'s signature. Currently `AcquiredBuffer` wraps raw pointers
-    /// rather than `Arc<SharedBuffer>`, creating an impedance mismatch.
-    ///
-    /// TODO(Phase 3b async combine): Wire `combine_async_start()` +
-    /// `combine_async_finish()` to overlap combine RDMA with the next layer's
-    /// dispatch. Requires buffer lifecycle management across layer boundaries.
+    /// Phase 3a/3b: `dispatch_async()` + `combine_async_start/finish` are now
+    /// fully wired via `AcquiredBuffer::shared_buffer()` accessor.
     #[cfg(feature = "distributed")]
     #[allow(clippy::too_many_arguments)]
     fn exchange_and_compute_async(
@@ -807,38 +801,115 @@ impl MoeLayer {
     ) -> Result<Array, KernelError> {
         use std::sync::Arc;
 
-        // ── Phase 1: Dispatch (blocking, zero-copy when runtime_ctx is set) ──
-        // The blocking dispatch() already uses route_rdma_zero_copy internally
-        // when runtime_ctx is attached, giving us SharedBuffer-backed RDMA.
-        let dispatch_result: DispatchResult = {
-            let mut guard =
-                self.exchange.as_ref().unwrap().lock().map_err(|e| {
-                    KernelError::InvalidShape(format!("exchange lock poisoned: {e}"))
-                })?;
-            guard
-                .dispatch(seq_len, indices_vec, weights_vec, token_bytes)
-                .map_err(|e| KernelError::InvalidShape(format!("EP dispatch failed: {e}")))?
-        };
-
-        let layout = &dispatch_result.layout;
-        let (local_start, local_end) = layout.local_expert_range;
-        let local_expert_count = local_end - local_start;
-        let tokens_per_expert = layout.tokens_per_expert;
-
-        // ── Phase 2: Local expert compute ──
-        let routed_data = &dispatch_result.routed_data;
         let token_stride = if seq_len > 0 {
             token_bytes.len() / seq_len
         } else {
             hidden_dim * elem_size
         };
 
+        // ── Extract runtime context and group from exchange guard ──
+        let (runtime_ctx, group, progress_tracker) = {
+            let guard =
+                self.exchange.as_ref().unwrap().lock().map_err(|e| {
+                    KernelError::InvalidShape(format!("exchange lock poisoned: {e}"))
+                })?;
+            let ctx = guard.runtime_ctx().cloned().ok_or_else(|| {
+                KernelError::InvalidShape("exchange_and_compute_async requires runtime_ctx".into())
+            })?;
+            let grp = guard.group().clone();
+            let pt = guard.progress_tracker().cloned();
+            (ctx, grp, pt)
+        };
+
+        let world_size = group.size();
+        let local_rank = group.local_rank() as usize;
+
+        // ── Phase 1: Acquire buffers and call dispatch_async ──
+        // Estimate buffer size: worst case all tokens for local experts
+        let experts_per_rank = num_experts / world_size;
+        let local_expert_count = experts_per_rank;
+        let capacity_per_expert = (seq_len as f32 * top_k as f32 / num_experts as f32 * 2.0) // 2x capacity factor for safety
+            .ceil() as usize;
+        let rank_cap = world_size * capacity_per_expert;
+        let local_buf_size = local_expert_count * rank_cap * token_stride;
+        // Peer buffer size: each peer may receive all our remote-expert tokens
+        let wire_stride = 4 + token_stride; // expert_id prefix + token data
+        let peer_buf_size = experts_per_rank * capacity_per_expert * wire_stride;
+
+        // Acquire local buffer for routing local expert tokens
+        let local_buf = runtime_ctx
+            .acquire_buffer(local_buf_size)
+            .map_err(|e| KernelError::InvalidShape(format!("acquire local_buf failed: {e}")))?;
+
+        // Acquire per-peer send/recv buffers
+        let (send_bufs, recv_bufs) = runtime_ctx
+            .acquire_send_recv_buffers(peer_buf_size, world_size, local_rank)
+            .map_err(|e| {
+                KernelError::InvalidShape(format!("acquire send/recv buffers failed: {e}"))
+            })?;
+
+        // Build conn_ids indexed by rank (None for local_rank)
+        let conn_id_slice = runtime_ctx.conn_ids();
+        let conn_ids_opt: Vec<Option<&rmlx_distributed::ConnectionId>> = (0..world_size)
+            .map(|r| {
+                if r == local_rank {
+                    None
+                } else if r < conn_id_slice.len() {
+                    Some(&conn_id_slice[r])
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Build Arc<SharedBuffer> slices for dispatch_async
+        let peer_send_arcs: Vec<Option<Arc<rmlx_distributed::SharedBuffer>>> = send_bufs
+            .iter()
+            .map(|opt| opt.as_ref().map(|ab| Arc::clone(ab.shared_buffer())))
+            .collect();
+        let peer_recv_arcs: Vec<Option<Arc<rmlx_distributed::SharedBuffer>>> = recv_bufs
+            .iter()
+            .map(|opt| opt.as_ref().map(|ab| Arc::clone(ab.shared_buffer())))
+            .collect();
+
+        // Call dispatch_async: scatters local tokens into local_buf + posts RDMA
+        let async_dispatch: AsyncDispatchResult = {
+            let mut guard =
+                self.exchange.as_ref().unwrap().lock().map_err(|e| {
+                    KernelError::InvalidShape(format!("exchange lock poisoned: {e}"))
+                })?;
+            guard
+                .dispatch_async(
+                    seq_len,
+                    indices_vec,
+                    weights_vec,
+                    token_bytes,
+                    local_buf.shared_buffer(),
+                    &peer_send_arcs,
+                    &peer_recv_arcs,
+                    &conn_ids_opt,
+                    runtime_ctx.transport(),
+                )
+                .map_err(|e| KernelError::InvalidShape(format!("dispatch_async failed: {e}")))?
+        };
+
+        let layout = &async_dispatch.layout;
+        let (local_start, local_end) = layout.local_expert_range;
+        let local_expert_count_actual = local_end - local_start;
+        let tokens_per_expert = layout.tokens_per_expert;
+
+        // ── Phase 2: Compute local experts while RDMA is in flight ──
+        // Read routed data from local_buf (local-rank tokens already scattered)
+        let routed_data = unsafe {
+            std::slice::from_raw_parts(local_buf.ptr, local_buf_size.min(local_buf.size))
+        };
+
         let expert_outputs = self.compute_local_experts(
             x,
             routed_data,
-            &dispatch_result.expert_counts,
+            &layout.expert_counts,
             local_start,
-            local_expert_count,
+            local_expert_count_actual,
             tokens_per_expert,
             token_stride,
             hidden_dim,
@@ -847,24 +918,65 @@ impl MoeLayer {
             queue,
         )?;
 
-        // ── Phase 3: Combine (with runtime_ctx for zero-copy) ──
-        let exchange_guard = self
-            .exchange
-            .as_ref()
-            .unwrap()
-            .lock()
-            .map_err(|e| KernelError::InvalidShape(format!("exchange lock poisoned: {e}")))?;
-        let group = exchange_guard.group().clone();
-        let ctx = exchange_guard.runtime_ctx().cloned();
-        drop(exchange_guard);
+        // ── Phase 2b: Wait for dispatch RDMA ops to complete ──
+        if let Some(ref tracker) = progress_tracker {
+            async_dispatch
+                .wait_tracked(tracker, std::time::Duration::from_secs(5))
+                .map_err(|e| {
+                    KernelError::InvalidShape(format!("dispatch RDMA wait failed: {e}"))
+                })?;
+        }
 
-        let combiner = if let Some(ref runtime_ctx) = ctx {
-            MoeCombineExchange::new(group).with_runtime_context(Arc::clone(runtime_ctx))
+        // ── Phase 3: Async combine ──
+        // Acquire fresh send/recv buffers for the combine phase
+        let combine_buf_size = experts_per_rank * tokens_per_expert * hidden_dim * 4; // f32
+        let (combine_send_bufs, combine_recv_bufs) = runtime_ctx
+            .acquire_send_recv_buffers(combine_buf_size, world_size, local_rank)
+            .map_err(|e| {
+                KernelError::InvalidShape(format!("acquire combine send/recv buffers failed: {e}"))
+            })?;
+
+        let combine_send_arcs: Vec<Option<Arc<rmlx_distributed::SharedBuffer>>> = combine_send_bufs
+            .iter()
+            .map(|opt| opt.as_ref().map(|ab| Arc::clone(ab.shared_buffer())))
+            .collect();
+        let combine_recv_arcs: Vec<Option<Arc<rmlx_distributed::SharedBuffer>>> = combine_recv_bufs
+            .iter()
+            .map(|opt| opt.as_ref().map(|ab| Arc::clone(ab.shared_buffer())))
+            .collect();
+
+        let combiner =
+            MoeCombineExchange::new(group.clone()).with_runtime_context(Arc::clone(&runtime_ctx));
+        let combiner = if let Some(ref pt) = progress_tracker {
+            combiner.with_progress_tracker(Arc::clone(pt))
         } else {
-            MoeCombineExchange::new(group)
+            combiner
         };
+
+        // Start async combine: posts RDMA sends/recvs for expert outputs
+        let combine_handle: AsyncCombineHandle = combiner
+            .combine_async_start(
+                &expert_outputs,
+                layout,
+                seq_len,
+                hidden_dim,
+                &combine_send_arcs,
+                &combine_recv_arcs,
+                &conn_ids_opt,
+                runtime_ctx.transport(),
+            )
+            .map_err(|e| KernelError::InvalidShape(format!("combine_async_start failed: {e}")))?;
+
+        // Wait for combine RDMA ops
+        if let Some(ref tracker) = progress_tracker {
+            combine_handle
+                .wait_tracked(tracker, std::time::Duration::from_secs(5))
+                .map_err(|e| KernelError::InvalidShape(format!("combine RDMA wait failed: {e}")))?;
+        }
+
+        // Finalize combine: unpack received data + weighted scatter-add
         let combined_f32 = combiner
-            .combine_with_layout(
+            .combine_async_finish(
                 &expert_outputs,
                 weights_vec,
                 indices_vec,
@@ -872,9 +984,10 @@ impl MoeLayer {
                 top_k,
                 hidden_dim,
                 num_experts,
-                &dispatch_result.layout,
+                layout,
+                &combine_recv_arcs,
             )
-            .map_err(|e| KernelError::InvalidShape(format!("EP combine failed: {e}")))?;
+            .map_err(|e| KernelError::InvalidShape(format!("combine_async_finish failed: {e}")))?;
 
         // Convert combined f32 output back to Array
         let output = Array::from_slice(dev, &combined_f32, vec![seq_len, hidden_dim]);

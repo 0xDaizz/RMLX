@@ -43,6 +43,7 @@ pub use pipeline::{
     LayerPipeline, LayerTransferState, PipelineConfig, PipelineStage, PipelineStats,
 };
 pub use progress_tracker::ProgressTracker;
+pub use rmlx_rdma::shared_buffer::{ConnectionId, SharedBuffer};
 pub use slab_ring::{Slab, SlabRing, SlabRingConfig, SlabRingError};
 pub use sparse_guard::{GuardAction, SparseGuard};
 pub use transport::{RdmaConnectionTransport, RecvCredit};

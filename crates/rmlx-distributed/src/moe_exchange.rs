@@ -1788,7 +1788,7 @@ impl MoeDispatchExchange {
 
         // Copy from SharedBuffer to return Vec (the SharedBuffer's Metal view
         // is now ready for GPU compute without additional copies)
-        let result = read_shared_buffer_bytes(shared_buf, local_buf_size.min(shared_buf.size()))?;
+        let result = read_shared_buffer_bytes(&shared_buf, local_buf_size.min(shared_buf.size()))?;
         let _ = expert_counts;
         Ok(RouteOutput {
             data: result,

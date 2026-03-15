@@ -735,6 +735,64 @@ fn subtest_reduce_scatter(group: &Group, rank: u32) {
     eprintln!("  subtest_reduce_scatter: rank={rank} PASSED");
 }
 
+fn subtest_ep_exchange(group: &Group, rank: u32) {
+    // Simulate EP dispatch: each rank sends different-sized payloads to the other
+    // This tests the sendrecv pattern that EP uses internally
+    //
+    // Rank 0 sends 1KB to rank 1, expects 2KB back
+    // Rank 1 sends 2KB to rank 0, expects 1KB back
+    let send_size = if rank == 0 { 1024 } else { 2048 };
+    let recv_size = if rank == 0 { 2048 } else { 1024 };
+
+    let send_data: Vec<u8> = (0..send_size)
+        .map(|i| ((i + rank as usize * 100) % 251) as u8)
+        .collect();
+    let peer_rank = 1 - rank;
+
+    let received = group
+        .sendrecv(&send_data, peer_rank, recv_size, peer_rank)
+        .expect("EP exchange sendrecv");
+
+    assert_eq!(received.len(), recv_size);
+    // Verify received data matches what the peer sent
+    for (i, &byte) in received.iter().enumerate() {
+        let expected = ((i + (1 - rank as usize) * 100) % 251) as u8;
+        assert_eq!(byte, expected, "EP exchange mismatch at {i}");
+    }
+    eprintln!("  EP exchange: rank={rank} sent {send_size}B, received {recv_size}B OK");
+}
+
+fn subtest_ep_async_pattern(group: &Group, rank: u32) {
+    // Test the overlap pattern: post send, do "compute", then recv
+    // This mimics what async EP does: dispatch tokens, compute locally, combine results
+
+    let data: Vec<u8> = vec![rank as u8 + 1; 4096]; // 4KB per rank
+
+    // Phase 1: Exchange (simulates dispatch)
+    let peer = 1 - rank;
+    let received = group
+        .sendrecv(&data, peer, 4096, peer)
+        .expect("async pattern sendrecv");
+
+    // Phase 2: "Compute" on received data (simulate expert forward)
+    let computed: Vec<u8> = received.iter().map(|&b| b.wrapping_add(10)).collect();
+
+    // Phase 3: Exchange back (simulates combine)
+    let final_result = group
+        .sendrecv(&computed, peer, 4096, peer)
+        .expect("async pattern combine");
+
+    // Verify: our data went to peer, peer added 10, came back
+    let expected_val = (rank as u8 + 1).wrapping_add(10);
+    assert!(
+        final_result.iter().all(|&b| b == expected_val),
+        "async pattern: expected all {expected_val}, got {:?}",
+        &final_result[..4]
+    );
+
+    eprintln!("  EP async pattern: rank={rank} dispatch→compute→combine OK");
+}
+
 fn subtest_large_allreduce(group: &Group, rank: u32) {
     // 1MB of f16 data = 524288 elements
     let num_elements: usize = 524288;
@@ -812,6 +870,12 @@ fn test_2node_full_suite() {
 
     eprintln!("=== Phase 7: reduce_scatter ===");
     subtest_reduce_scatter(&group, rank);
+
+    eprintln!("=== Phase 8: EP-style all-to-all exchange ===");
+    subtest_ep_exchange(&group, rank);
+
+    eprintln!("=== Phase 9: EP async dispatch→compute→combine ===");
+    subtest_ep_async_pattern(&group, rank);
 
     // Exit barrier: ensure both ranks complete before dropping connection
     let _ = group.allreduce(&[0u8; 4]);
