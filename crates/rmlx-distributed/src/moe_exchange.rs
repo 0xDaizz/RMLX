@@ -1418,6 +1418,21 @@ impl MoeDispatchExchange {
         &self.config.group
     }
 
+    /// Whether an EP runtime context is attached (enables async dispatch/combine).
+    pub fn has_runtime_ctx(&self) -> bool {
+        self.runtime_ctx.is_some()
+    }
+
+    /// Reference to the EP runtime context, if attached.
+    pub fn runtime_ctx(&self) -> Option<&Arc<EpRuntimeContext>> {
+        self.runtime_ctx.as_ref()
+    }
+
+    /// Whether FP8 exchange is enabled in config.
+    pub fn is_fp8_enabled(&self) -> bool {
+        self.config.enable_fp8
+    }
+
     /// Compute the local expert index range `[start, end)` for this rank.
     ///
     /// Experts are evenly partitioned across ranks: rank `r` owns experts

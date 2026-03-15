@@ -36,6 +36,7 @@ pub fn mixtral_8x7b() -> TransformerConfig {
                 hidden_dim: 4096,
                 intermediate_dim: 14336,
                 capacity_factor: 1.0,
+                enable_fp8: false,
             },
         },
     }
@@ -399,6 +400,7 @@ mod tests {
                         hidden_dim: 128,
                         intermediate_dim: 256,
                         capacity_factor: 1.0,
+                        enable_fp8: false,
                     },
                 },
             },
@@ -430,6 +432,7 @@ mod tests {
                         hidden_dim: 128,
                         intermediate_dim: 256,
                         capacity_factor: 1.0,
+                        enable_fp8: false,
                     },
                 },
             },

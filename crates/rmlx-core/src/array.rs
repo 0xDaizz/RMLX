@@ -568,6 +568,32 @@ impl Array {
         unsafe { std::slice::from_raw_parts(base.add(self.offset), len) }
     }
 
+    /// Returns a mutable slice over this array's Metal buffer contents.
+    ///
+    /// # Safety contract (upheld by caller)
+    /// - All GPU command buffers writing to this buffer **must** have completed
+    ///   before calling (e.g. `waitUntilCompleted`). On Apple UMA the CPU and
+    ///   GPU share the same physical memory; writing while the GPU is still
+    ///   reading/writing causes a data race.
+    /// - No other references (shared or mutable) to the same byte range may
+    ///   exist while the returned slice is alive.
+    /// - The buffer must be `StorageModeShared` (CPU-accessible).
+    pub fn to_bytes_mut(&mut self) -> &mut [u8] {
+        let len = self.byte_size();
+        assert!(
+            self.offset + len <= self.buffer.length(),
+            "to_bytes_mut: offset({}) + len({}) exceeds buffer({})",
+            self.offset,
+            len,
+            self.buffer.length()
+        );
+        let base = self.buffer.contents().as_ptr() as *mut u8;
+        // SAFETY: bounds checked above; contents() returns valid CPU-accessible
+        // pointer for StorageModeShared buffers. Caller guarantees exclusive
+        // access and GPU completion.
+        unsafe { std::slice::from_raw_parts_mut(base.add(self.offset), len) }
+    }
+
     /// Create an Array from raw bytes, allocating a new Metal buffer.
     ///
     /// `bytes.len()` must equal the exact buffer size for the given shape and dtype.

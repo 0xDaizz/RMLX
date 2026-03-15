@@ -5,6 +5,7 @@
 
 use bytemuck::Zeroable as _;
 use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::time::{Duration, Instant};
@@ -445,6 +446,10 @@ pub struct RdmaConnection {
     pool: Option<RdmaBufferPool>,
     /// Pre-registered MR pool (lazily initialized via `init_mr_pool`).
     mr_pool: Option<MrPool>,
+    /// Cache of nocopy MR registrations keyed by (ptr, len).
+    /// Metal buffers on UMA have stable addresses for their lifetime,
+    /// so reusing the MR avoids ~10-50µs per-transfer ibv_reg_mr overhead.
+    mr_cache: Mutex<HashMap<(usize, usize), Arc<MemoryRegion>>>,
     qp: QueuePair,
     cq: CompletionQueue,
     pd: Arc<ProtectionDomain>,
@@ -479,6 +484,7 @@ impl RdmaConnection {
             completion_backlog: Mutex::new(Vec::new()),
             pool,
             mr_pool: None,
+            mr_cache: Mutex::new(HashMap::new()),
             qp,
             cq,
             pd,
@@ -535,6 +541,7 @@ impl RdmaConnection {
             completion_backlog: Mutex::new(Vec::new()),
             pool,
             mr_pool: None,
+            mr_cache: Mutex::new(HashMap::new()),
             qp,
             cq,
             pd,
@@ -953,15 +960,32 @@ impl RdmaConnection {
     /// device-visible memory.  Falls back (returns `Err`) if MR registration
     /// fails (e.g., TB5 driver limitation).
     fn try_nocopy_send(&self, data: &[u8]) -> Result<(), RdmaError> {
-        // SAFETY: data.as_ptr() is page-aligned and valid for data.len() bytes
-        // (checked by caller). The slice stays alive until this function returns
-        // and the MR is dropped.
-        let mr = unsafe {
-            MemoryRegion::register_nocopy(
-                &self.pd,
-                data.as_ptr() as *mut std::ffi::c_void,
-                data.len(),
-            )?
+        let key = (data.as_ptr() as usize, data.len());
+
+        // Check MR cache first — reuse existing registration if available
+        let mr = {
+            let cache = self.mr_cache.lock();
+            cache.get(&key).cloned()
+        };
+
+        let mr = match mr {
+            Some(mr) => mr,
+            None => {
+                // SAFETY: data.as_ptr() is page-aligned and valid for data.len() bytes
+                // (checked by caller). The MR is cached and lives for the connection
+                // lifetime — the caller must ensure the underlying Metal buffer outlives
+                // the connection (true for UMA inference buffers).
+                let new_mr = unsafe {
+                    MemoryRegion::register_nocopy(
+                        &self.pd,
+                        data.as_ptr() as *mut std::ffi::c_void,
+                        data.len(),
+                    )?
+                };
+                let new_mr = Arc::new(new_mr);
+                self.mr_cache.lock().insert(key, Arc::clone(&new_mr));
+                new_mr
+            }
         };
 
         let mut sge = IbvSge {
@@ -996,18 +1020,17 @@ impl RdmaConnection {
                 break;
             }
             if Instant::now() >= deadline {
-                // HW may still be accessing the buffer — leak the MR to prevent
-                // use-after-deregister. The MR will never be freed, but this is
-                // better than a potential crash.
-                std::mem::forget(mr);
+                // MR is cached (Arc'd) — no need to leak. The cache holds a reference,
+                // so the MR stays registered even after we return an error.
                 return Err(RdmaError::Timeout(
-                    "try_nocopy_send: timeout waiting for completion (MR leaked for safety)".into(),
+                    "try_nocopy_send: timeout waiting for completion".into(),
                 ));
             }
             std::thread::yield_now();
         }
 
-        // MR dropped here — deregisters the nocopy region
+        // MR Arc ref dropped here — the cache still holds a reference,
+        // keeping the MR registered for future reuse.
         Ok(())
     }
 

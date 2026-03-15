@@ -31,6 +31,8 @@ use rmlx_metal::{ComputePass, MTLSize};
 
 #[cfg(feature = "distributed")]
 use rmlx_distributed::{DispatchResult, MoeCombineExchange, MoeDispatchExchange};
+// TODO(Phase 3a/3b): Import when full async wiring is ready:
+// use rmlx_distributed::{AsyncCombineHandle, AsyncDispatchResult};
 
 use crate::expert_group::ExpertGroup;
 use crate::linear::Linear;
@@ -118,6 +120,15 @@ pub struct MoeConfig {
     /// Links to SharedBufferPool tier selection in distributed mode.
     /// Default: 1.0
     pub capacity_factor: f32,
+    /// Enable FP8 (E4M3) quantization for RDMA token exchange (Phase 6b).
+    ///
+    /// When true, tokens are quantized to FP8 before dispatch and dequantized
+    /// after combine, halving RDMA bandwidth usage (f16→fp8 = 2x reduction).
+    /// Requires `distributed` feature and `MoeDispatchConfig::enable_fp8` to
+    /// also be set on the underlying exchange.
+    ///
+    /// Default: false
+    pub enable_fp8: bool,
 }
 
 impl MoeConfig {
@@ -565,8 +576,9 @@ impl MoeLayer {
     /// correctly routed through the dispatch layout, ensuring the code path
     /// is exercised even in single-process testing.
     ///
-    /// TODO: Wire the full RDMA async path (dispatch_async + combine_async)
-    /// for production multi-node inference.
+    /// Phase 3a/3b: When `runtime_ctx` is attached to the dispatch exchange,
+    /// uses the async dispatch/combine path for compute-RDMA overlap.
+    /// Falls back to blocking dispatch/combine when `runtime_ctx` is `None`.
     #[cfg(feature = "distributed")]
     fn exchange_and_compute(
         &self,
@@ -592,10 +604,33 @@ impl MoeLayer {
         // The exchange operates on raw byte buffers regardless of dtype.
         let token_bytes: &[u8] = x.to_bytes();
 
-        // ── Phase 1: Dispatch ──
-        // Lock the exchange and call dispatch to route tokens.
-        let dispatch_result: DispatchResult = {
-            let mut guard = self
+        // TODO(Phase 6b — FP8 exchange): When `self.config.enable_fp8` is true,
+        // quantize tokens to FP8 before dispatch and dequantize after combine:
+        //
+        //   1. Pre-dispatch:  fp8_payload = fp8_exchange::quantize_for_dispatch(registry, x, queue)
+        //   2. Dispatch:      guard.dispatch_fp8(seq_len, &indices_vec, &weights_vec, x, registry, queue)
+        //                     — returns DispatchResult with FP8-encoded routed_data
+        //   3. Post-dispatch: fp8_exchange::unpack_from_wire(&routed_data, count, hidden_dim)
+        //                     → (fp8_bytes, scale_bytes)
+        //   4. Dequantize:    fp8_exchange::dequantize_received(registry, &fp8_arr, &scales, hidden_dim, queue)
+        //                     → Float16 expert inputs for compute
+        //   5. Combine:       Same as non-FP8 path (expert outputs are f32)
+        //
+        // Blocked on: need to split the dispatch result's routed_data per-expert and
+        // dequantize each expert's tokens separately before feeding to expert.forward().
+        // The wire format uses interleaved [fp8_token | scale] per token, requiring
+        // unpack_from_wire before dequantize_received.
+        if self.config.enable_fp8 {
+            return Err(KernelError::InvalidShape(
+                "FP8 exchange (Phase 6b) is not yet wired in exchange_and_compute. \
+                 Set enable_fp8 = false or implement the quantize→dispatch→dequantize pipeline."
+                    .into(),
+            ));
+        }
+
+        // Check if async path is available (runtime_ctx attached)
+        let use_async = {
+            let guard = self
                 .exchange
                 .as_ref()
                 .ok_or_else(|| {
@@ -603,8 +638,73 @@ impl MoeLayer {
                 })?
                 .lock()
                 .map_err(|e| KernelError::InvalidShape(format!("exchange lock poisoned: {e}")))?;
+            guard.has_runtime_ctx()
+        };
+
+        if use_async {
+            self.exchange_and_compute_async(
+                x,
+                &indices_vec,
+                &weights_vec,
+                token_bytes,
+                seq_len,
+                hidden_dim,
+                top_k,
+                num_experts,
+                elem_size,
+                input_dtype,
+                dev,
+                registry,
+                queue,
+            )
+        } else {
+            self.exchange_and_compute_blocking(
+                x,
+                &indices_vec,
+                &weights_vec,
+                token_bytes,
+                seq_len,
+                hidden_dim,
+                top_k,
+                num_experts,
+                elem_size,
+                input_dtype,
+                dev,
+                registry,
+                queue,
+            )
+        }
+    }
+
+    /// Blocking dispatch/combine path (original implementation).
+    ///
+    /// Used when `runtime_ctx` is not attached to the dispatch exchange.
+    #[cfg(feature = "distributed")]
+    #[allow(clippy::too_many_arguments)]
+    fn exchange_and_compute_blocking(
+        &self,
+        x: &Array,
+        indices_vec: &[u32],
+        weights_vec: &[f32],
+        token_bytes: &[u8],
+        seq_len: usize,
+        hidden_dim: usize,
+        top_k: usize,
+        num_experts: usize,
+        elem_size: usize,
+        input_dtype: DType,
+        dev: &ProtocolObject<dyn MTLDevice>,
+        registry: &KernelRegistry,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
+    ) -> Result<Array, KernelError> {
+        // ── Phase 1: Dispatch (blocking) ──
+        let dispatch_result: DispatchResult = {
+            let mut guard =
+                self.exchange.as_ref().unwrap().lock().map_err(|e| {
+                    KernelError::InvalidShape(format!("exchange lock poisoned: {e}"))
+                })?;
             guard
-                .dispatch(seq_len, &indices_vec, &weights_vec, token_bytes)
+                .dispatch(seq_len, indices_vec, weights_vec, token_bytes)
                 .map_err(|e| KernelError::InvalidShape(format!("EP dispatch failed: {e}")))?
         };
 
@@ -613,10 +713,7 @@ impl MoeLayer {
         let local_expert_count = local_end - local_start;
         let tokens_per_expert = layout.tokens_per_expert;
 
-        // ── Phase 2: Local expert compute on dispatched tokens ──
-        // The dispatch result contains routed_data: tokens packed by local expert.
-        // We need to unpack per-expert token batches, run each expert's forward,
-        // and collect outputs.
+        // ── Phase 2: Local expert compute ──
         let routed_data = &dispatch_result.routed_data;
         let token_stride = if seq_len > 0 {
             token_bytes.len() / seq_len
@@ -624,43 +721,217 @@ impl MoeLayer {
             hidden_dim * elem_size
         };
 
-        // Build per-expert output buffers from the dispatched tokens.
-        // expert_outputs[i] contains the f32 output for local expert i.
+        let expert_outputs = self.compute_local_experts(
+            x,
+            routed_data,
+            &dispatch_result.expert_counts,
+            local_start,
+            local_expert_count,
+            tokens_per_expert,
+            token_stride,
+            hidden_dim,
+            dev,
+            registry,
+            queue,
+        )?;
+
+        // ── Phase 3: Combine (blocking) ──
+        let exchange_guard = self
+            .exchange
+            .as_ref()
+            .unwrap()
+            .lock()
+            .map_err(|e| KernelError::InvalidShape(format!("exchange lock poisoned: {e}")))?;
+        let group = exchange_guard.group().clone();
+        drop(exchange_guard);
+
+        let combiner = MoeCombineExchange::new(group);
+        let combined_f32 = combiner
+            .combine_with_layout(
+                &expert_outputs,
+                weights_vec,
+                indices_vec,
+                seq_len,
+                top_k,
+                hidden_dim,
+                num_experts,
+                &dispatch_result.layout,
+            )
+            .map_err(|e| KernelError::InvalidShape(format!("EP combine failed: {e}")))?;
+
+        // Convert combined f32 output back to Array
+        let output = Array::from_slice(dev, &combined_f32, vec![seq_len, hidden_dim]);
+        let output = if input_dtype != DType::Float32 {
+            ops::copy::copy_cast(registry, &output, input_dtype, queue)?
+        } else {
+            output
+        };
+
+        Ok(output)
+    }
+
+    /// Async-aware dispatch/combine path (Phase 3a/3b).
+    ///
+    /// Current implementation:
+    /// - Phase 1 (dispatch): Uses blocking `dispatch()` which already delegates to
+    ///   zero-copy RDMA internally when `runtime_ctx` is attached.
+    /// - Phase 2 (compute): Runs local expert forward passes on dispatched tokens.
+    /// - Phase 3 (combine): Uses `combine_with_layout()` with `runtime_ctx` attached
+    ///   to the combiner, enabling the zero-copy combine path.
+    ///
+    /// TODO(Phase 3a full async): Wire `dispatch_async()` directly once
+    /// `ExchangeBuffers` exposes `Arc<SharedBuffer>` references compatible with
+    /// `dispatch_async`'s signature. Currently `AcquiredBuffer` wraps raw pointers
+    /// rather than `Arc<SharedBuffer>`, creating an impedance mismatch.
+    ///
+    /// TODO(Phase 3b async combine): Wire `combine_async_start()` +
+    /// `combine_async_finish()` to overlap combine RDMA with the next layer's
+    /// dispatch. Requires buffer lifecycle management across layer boundaries.
+    #[cfg(feature = "distributed")]
+    #[allow(clippy::too_many_arguments)]
+    fn exchange_and_compute_async(
+        &self,
+        x: &Array,
+        indices_vec: &[u32],
+        weights_vec: &[f32],
+        token_bytes: &[u8],
+        seq_len: usize,
+        hidden_dim: usize,
+        top_k: usize,
+        num_experts: usize,
+        elem_size: usize,
+        input_dtype: DType,
+        dev: &ProtocolObject<dyn MTLDevice>,
+        registry: &KernelRegistry,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
+    ) -> Result<Array, KernelError> {
+        use std::sync::Arc;
+
+        // ── Phase 1: Dispatch (blocking, zero-copy when runtime_ctx is set) ──
+        // The blocking dispatch() already uses route_rdma_zero_copy internally
+        // when runtime_ctx is attached, giving us SharedBuffer-backed RDMA.
+        let dispatch_result: DispatchResult = {
+            let mut guard =
+                self.exchange.as_ref().unwrap().lock().map_err(|e| {
+                    KernelError::InvalidShape(format!("exchange lock poisoned: {e}"))
+                })?;
+            guard
+                .dispatch(seq_len, indices_vec, weights_vec, token_bytes)
+                .map_err(|e| KernelError::InvalidShape(format!("EP dispatch failed: {e}")))?
+        };
+
+        let layout = &dispatch_result.layout;
+        let (local_start, local_end) = layout.local_expert_range;
+        let local_expert_count = local_end - local_start;
+        let tokens_per_expert = layout.tokens_per_expert;
+
+        // ── Phase 2: Local expert compute ──
+        let routed_data = &dispatch_result.routed_data;
+        let token_stride = if seq_len > 0 {
+            token_bytes.len() / seq_len
+        } else {
+            hidden_dim * elem_size
+        };
+
+        let expert_outputs = self.compute_local_experts(
+            x,
+            routed_data,
+            &dispatch_result.expert_counts,
+            local_start,
+            local_expert_count,
+            tokens_per_expert,
+            token_stride,
+            hidden_dim,
+            dev,
+            registry,
+            queue,
+        )?;
+
+        // ── Phase 3: Combine (with runtime_ctx for zero-copy) ──
+        let exchange_guard = self
+            .exchange
+            .as_ref()
+            .unwrap()
+            .lock()
+            .map_err(|e| KernelError::InvalidShape(format!("exchange lock poisoned: {e}")))?;
+        let group = exchange_guard.group().clone();
+        let ctx = exchange_guard.runtime_ctx().cloned();
+        drop(exchange_guard);
+
+        let combiner = if let Some(ref runtime_ctx) = ctx {
+            MoeCombineExchange::new(group).with_runtime_context(Arc::clone(runtime_ctx))
+        } else {
+            MoeCombineExchange::new(group)
+        };
+        let combined_f32 = combiner
+            .combine_with_layout(
+                &expert_outputs,
+                weights_vec,
+                indices_vec,
+                seq_len,
+                top_k,
+                hidden_dim,
+                num_experts,
+                &dispatch_result.layout,
+            )
+            .map_err(|e| KernelError::InvalidShape(format!("EP combine failed: {e}")))?;
+
+        // Convert combined f32 output back to Array
+        let output = Array::from_slice(dev, &combined_f32, vec![seq_len, hidden_dim]);
+        let output = if input_dtype != DType::Float32 {
+            ops::copy::copy_cast(registry, &output, input_dtype, queue)?
+        } else {
+            output
+        };
+
+        Ok(output)
+    }
+
+    /// Run local expert forward passes on dispatched token data.
+    ///
+    /// Shared between blocking and async paths. Takes pre-routed byte data
+    /// packed contiguously per expert.
+    #[cfg(feature = "distributed")]
+    #[allow(clippy::too_many_arguments)]
+    fn compute_local_experts(
+        &self,
+        x: &Array,
+        routed_data: &[u8],
+        expert_counts: &[usize],
+        local_start: usize,
+        local_expert_count: usize,
+        tokens_per_expert: usize,
+        token_stride: usize,
+        hidden_dim: usize,
+        dev: &ProtocolObject<dyn MTLDevice>,
+        registry: &KernelRegistry,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
+    ) -> Result<Vec<Vec<f32>>, KernelError> {
         let mut expert_outputs: Vec<Vec<f32>> = Vec::with_capacity(local_expert_count);
 
         for local_idx in 0..local_expert_count {
             let expert_idx = local_start + local_idx;
-            let count = dispatch_result.expert_counts[expert_idx];
+            let count = expert_counts[expert_idx];
 
             if count == 0 {
                 expert_outputs.push(Vec::new());
                 continue;
             }
 
-            // Compute the byte range for this expert in routed_data.
-            // Tokens are packed contiguously per expert: expert 0's tokens first,
-            // then expert 1's, etc. Each expert has up to tokens_per_expert slots.
             let expert_byte_offset = local_idx * tokens_per_expert * token_stride;
             let expert_byte_end = expert_byte_offset + count * token_stride;
 
             if expert_byte_end > routed_data.len() {
-                // Insufficient data — skip this expert (defensive)
                 expert_outputs.push(Vec::new());
                 continue;
             }
 
             let expert_token_bytes = &routed_data[expert_byte_offset..expert_byte_end];
-
-            // Reconstruct Array from bytes for expert forward pass
             let expert_input =
                 Array::from_bytes(dev, expert_token_bytes, vec![count, hidden_dim], x.dtype());
 
-            // Run expert forward
             let expert_out = self.experts[expert_idx].forward(&expert_input, registry, queue)?;
 
-            // Read expert output back to CPU f32 for combine.
-            // The combine exchange operates on Vec<f32> per expert.
-            // For non-f32 dtypes, cast to f32 on GPU before readback.
             let expert_out_f32 = if expert_out.dtype() != DType::Float32 {
                 ops::copy::copy_cast(registry, &expert_out, DType::Float32, queue)?
             } else {
@@ -670,49 +941,7 @@ impl MoeLayer {
             expert_outputs.push(out_f32);
         }
 
-        // ── Phase 3: Combine ──
-        // Use combine_with_layout to scatter expert outputs back to original
-        // token positions with routing weights applied.
-        let exchange_guard = self
-            .exchange
-            .as_ref()
-            .unwrap()
-            .lock()
-            .map_err(|e| KernelError::InvalidShape(format!("exchange lock poisoned: {e}")))?;
-        let ws = exchange_guard.world_size();
-        let local_range = exchange_guard.local_expert_range();
-        let local_rank = if ws > 0 {
-            local_range.0 as u32 / (num_experts as u32 / ws as u32)
-        } else {
-            0
-        };
-        // Clone the transport-backed group so combine can use RDMA.
-        let group = exchange_guard.group().clone();
-        drop(exchange_guard);
-
-        let combiner = MoeCombineExchange::new(group);
-        let combined_f32 = combiner
-            .combine_with_layout(
-                &expert_outputs,
-                &weights_vec,
-                &indices_vec,
-                seq_len,
-                top_k,
-                hidden_dim,
-                num_experts,
-                &dispatch_result.layout,
-            )
-            .map_err(|e| KernelError::InvalidShape(format!("EP combine failed: {e}")))?;
-
-        // Convert combined f32 output back to Array, casting to input dtype if needed
-        let output = Array::from_slice(dev, &combined_f32, vec![seq_len, hidden_dim]);
-        let output = if input_dtype != DType::Float32 {
-            ops::copy::copy_cast(registry, &output, input_dtype, queue)?
-        } else {
-            output
-        };
-
-        Ok(output)
+        Ok(expert_outputs)
     }
 
     /// Original per-expert loop: one gather + forward + scatter per active expert.

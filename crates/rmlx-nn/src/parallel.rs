@@ -14,7 +14,7 @@ use rmlx_core::kernels::KernelRegistry;
 use rmlx_core::ops;
 
 #[cfg(feature = "distributed")]
-use rmlx_distributed::group::{DistributedError, Group, ReduceDtype, ReduceOp};
+use rmlx_distributed::group::{DistributedError, Group, ReduceDtype};
 
 #[cfg(feature = "distributed")]
 use objc2::runtime::ProtocolObject;
@@ -122,6 +122,7 @@ fn cpu_matmul_f32(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32
 /// This avoids the `&Device` vs `&DeviceRef` mismatch when the device is
 /// obtained from `buffer.device()`.
 #[cfg(feature = "distributed")]
+#[allow(dead_code)] // retained for future use; RowParallel now uses in-place allreduce
 fn array_from_raw_bytes(
     device: &ProtocolObject<dyn MTLDevice>,
     bytes: &[u8],
@@ -655,7 +656,7 @@ impl RowParallelLinear {
             .view(vec![shard_in, n], vec![1, shard_in], self.weight.offset());
 
         // GPU matmul: [batch, shard_in] @ [shard_in, out] -> [batch, out]
-        let local_out_arr = ops::matmul::matmul(registry, input, &w_t, queue)
+        let mut local_out_arr = ops::matmul::matmul(registry, input, &w_t, queue)
             .map_err(|e| DistributedError::Protocol(format!("GPU matmul failed: {e}")))?;
 
         // Use dtype-native allreduce — f16 data is sent directly over RDMA (no f32 expansion).
@@ -664,28 +665,31 @@ impl RowParallelLinear {
             DType::Float32 => ReduceDtype::F32,
             _ => ReduceDtype::F32,
         };
-        let local_bytes = local_out_arr.to_bytes();
-        let mut reduced = group.allreduce_op(local_bytes, ReduceOp::Sum, reduce_dtype)?;
+
+        // In-place allreduce: mutate the Metal buffer directly, avoiding a
+        // second buffer allocation + memcpy. Safe because:
+        // 1. `matmul` uses ExecMode::Sync (waitUntilCompleted) — GPU is done.
+        // 2. `local_out_arr` is a fresh buffer owned solely by this stack frame.
+        // 3. Apple UMA: StorageModeShared buffers are CPU-accessible.
+        {
+            let reduce_buf = local_out_arr.to_bytes_mut();
+            group.allreduce_in_place(reduce_buf, reduce_dtype)?;
+        }
 
         // Add bias after allreduce (all ranks have the same result)
         if let Some(ref bias) = self.bias {
             let bias_data = bias.to_bytes();
+            let buf = local_out_arr.to_bytes_mut();
             match dtype {
-                DType::Float16 => add_bias_f16(&mut reduced, bias_data, batch, n),
-                DType::Float32 => add_bias_f32(&mut reduced, bias_data, batch, n),
+                DType::Float16 => add_bias_f16(buf, bias_data, batch, n),
+                DType::Float32 => add_bias_f32(buf, bias_data, batch, n),
                 _ => {}
             }
         }
 
-        // Reconstruct Array from reduced bytes (same dtype as input — no cast needed)
-        let result = array_from_raw_bytes(
-            &*input.metal_buffer().device(),
-            &reduced,
-            vec![batch, n],
-            dtype,
-        );
-
-        Ok(result)
+        // Return the original Array — its Metal buffer now holds the reduced
+        // (and bias-added) result. No new allocation needed.
+        Ok(local_out_arr)
     }
 }
 
@@ -818,34 +822,32 @@ impl QuantizedRowParallelLinear {
             .map_err(|e| TpError(format!("contiguous copy failed: {e}")))?;
 
         // 2. Local QMV/QMM on sharded input
-        let local_out = self
+        let mut local_out = self
             .ql
             .forward(&x_shard, registry, queue)
             .map_err(|e| TpError(format!("quantized forward failed: {e}")))?;
 
         // 3. Allreduce sum across ranks — dtype-native (no f32 expansion)
+        // In-place allreduce: mutate the Metal buffer directly, avoiding a
+        // second buffer allocation + memcpy. Safe because:
+        // 1. QMM forward uses ExecMode::Sync (waitUntilCompleted) — GPU is done.
+        // 2. `local_out` is a fresh buffer owned solely by this stack frame.
+        // 3. Apple UMA: StorageModeShared buffers are CPU-accessible.
         let dtype = local_out.dtype();
-        let batch = local_out.shape()[0];
-        let out_features = self.ql.out_features();
-
         let reduce_dtype = match dtype {
             DType::Float16 => ReduceDtype::F16,
             DType::Float32 => ReduceDtype::F32,
             _ => ReduceDtype::F32,
         };
-        let local_bytes = local_out.to_bytes();
-        let reduced = group
-            .allreduce_op(local_bytes, ReduceOp::Sum, reduce_dtype)
-            .map_err(|e| TpError(format!("allreduce failed: {e}")))?;
+        {
+            let reduce_buf = local_out.to_bytes_mut();
+            group
+                .allreduce_in_place(reduce_buf, reduce_dtype)
+                .map_err(|e| TpError(format!("allreduce failed: {e}")))?;
+        }
 
-        // Reconstruct Array from reduced bytes (same dtype as output — no cast needed)
-        let result = array_from_raw_bytes(
-            &*x.metal_buffer().device(),
-            &reduced,
-            vec![batch, out_features],
-            dtype,
-        );
-        Ok(result)
+        // Return the original Array — its Metal buffer now holds the reduced result.
+        Ok(local_out)
     }
 }
 

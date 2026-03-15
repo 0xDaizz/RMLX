@@ -931,6 +931,13 @@ fn rdma_to_distributed(e: RdmaError) -> DistributedError {
     DistributedError::Transport(e.to_string())
 }
 
+/// Returns `true` for transient RDMA errors that may succeed on a single retry
+/// (CQ poll timeout, CQ poll status error). Connection-level failures are NOT
+/// retried — they indicate hardware or configuration issues.
+fn is_transient(e: &RdmaError) -> bool {
+    matches!(e, RdmaError::Timeout(_) | RdmaError::CqPoll(_))
+}
+
 /// Enhanced error conversion that decodes wr_id fields for richer diagnostics.
 fn rdma_to_distributed_enhanced(e: RdmaError, wr_id: u64) -> DistributedError {
     let detail = match try_decode_wr_id(wr_id) {
@@ -955,10 +962,22 @@ impl RdmaTransport for RdmaConnectionTransport {
 
         // Use chunked send with tiered buffer pool (JACCL pipelining)
         global_counters().record_rdma_transfer(data.len() as u64);
-        conn.chunked_send(data).map_err(|e| {
-            self.metrics.record_send_error();
-            rdma_to_distributed(e)
-        })?;
+        match conn.chunked_send(data) {
+            Ok(()) => {}
+            Err(ref e) if is_transient(e) => {
+                self.metrics.record_send_error();
+                tracing::warn!(target: "rmlx_distributed", error = %e, "send failed, retrying once");
+                std::thread::yield_now();
+                conn.chunked_send(data).map_err(|e| {
+                    self.metrics.record_send_error();
+                    rdma_to_distributed(e)
+                })?;
+            }
+            Err(e) => {
+                self.metrics.record_send_error();
+                return Err(rdma_to_distributed(e));
+            }
+        }
 
         self.metrics.record_send(data.len() as u64);
         Ok(())
@@ -976,10 +995,22 @@ impl RdmaTransport for RdmaConnectionTransport {
         // Use chunked recv with tiered buffer pool (JACCL pipelining)
         // CQ polling is handled internally by chunked_recv.
         global_counters().record_rdma_transfer(len as u64);
-        let buf = conn.chunked_recv(len).map_err(|e| {
-            self.metrics.record_recv_error();
-            rdma_to_distributed(e)
-        })?;
+        let buf = match conn.chunked_recv(len) {
+            Ok(buf) => buf,
+            Err(ref e) if is_transient(e) => {
+                self.metrics.record_recv_error();
+                tracing::warn!(target: "rmlx_distributed", error = %e, "recv failed, retrying once");
+                std::thread::yield_now();
+                conn.chunked_recv(len).map_err(|e| {
+                    self.metrics.record_recv_error();
+                    rdma_to_distributed(e)
+                })?
+            }
+            Err(e) => {
+                self.metrics.record_recv_error();
+                return Err(rdma_to_distributed(e));
+            }
+        };
 
         self.metrics.record_recv(len as u64);
         Ok(buf)
@@ -1002,10 +1033,22 @@ impl RdmaTransport for RdmaConnectionTransport {
 
             global_counters().record_rdma_transfer(send_data.len() as u64);
             global_counters().record_rdma_transfer(recv_len as u64);
-            let recv_buf = conn.chunked_sendrecv(send_data, recv_len).map_err(|e| {
-                self.metrics.record_send_error();
-                rdma_to_distributed(e)
-            })?;
+            let recv_buf = match conn.chunked_sendrecv(send_data, recv_len) {
+                Ok(buf) => buf,
+                Err(ref e) if is_transient(e) => {
+                    self.metrics.record_send_error();
+                    tracing::warn!(target: "rmlx_distributed", error = %e, "sendrecv failed, retrying once");
+                    std::thread::yield_now();
+                    conn.chunked_sendrecv(send_data, recv_len).map_err(|e| {
+                        self.metrics.record_send_error();
+                        rdma_to_distributed(e)
+                    })?
+                }
+                Err(e) => {
+                    self.metrics.record_send_error();
+                    return Err(rdma_to_distributed(e));
+                }
+            };
 
             self.metrics.record_send(send_data.len() as u64);
             self.metrics.record_recv(recv_len as u64);
@@ -1039,15 +1082,39 @@ impl RdmaTransport for RdmaConnectionTransport {
             // Post recv on src connection first, then send on dst connection.
             // chunked_sendrecv with empty send_data acts as recv-only.
             // chunked_send handles send with internal CQ polling.
-            let recv_buf = src_conn.chunked_recv(recv_len).map_err(|e| {
-                self.metrics.record_recv_error();
-                rdma_to_distributed(e)
-            })?;
+            let recv_buf = match src_conn.chunked_recv(recv_len) {
+                Ok(buf) => buf,
+                Err(ref e) if is_transient(e) => {
+                    self.metrics.record_recv_error();
+                    tracing::warn!(target: "rmlx_distributed", error = %e, "sendrecv recv failed, retrying once");
+                    std::thread::yield_now();
+                    src_conn.chunked_recv(recv_len).map_err(|e| {
+                        self.metrics.record_recv_error();
+                        rdma_to_distributed(e)
+                    })?
+                }
+                Err(e) => {
+                    self.metrics.record_recv_error();
+                    return Err(rdma_to_distributed(e));
+                }
+            };
 
-            dst_conn.chunked_send(send_data).map_err(|e| {
-                self.metrics.record_send_error();
-                rdma_to_distributed(e)
-            })?;
+            match dst_conn.chunked_send(send_data) {
+                Ok(()) => {}
+                Err(ref e) if is_transient(e) => {
+                    self.metrics.record_send_error();
+                    tracing::warn!(target: "rmlx_distributed", error = %e, "sendrecv send failed, retrying once");
+                    std::thread::yield_now();
+                    dst_conn.chunked_send(send_data).map_err(|e| {
+                        self.metrics.record_send_error();
+                        rdma_to_distributed(e)
+                    })?;
+                }
+                Err(e) => {
+                    self.metrics.record_send_error();
+                    return Err(rdma_to_distributed(e));
+                }
+            }
 
             self.metrics.record_send(send_data.len() as u64);
             self.metrics.record_recv(recv_len as u64);

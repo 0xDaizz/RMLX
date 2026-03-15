@@ -68,6 +68,7 @@ fn test_moe_layer() {
         hidden_dim: 4096,
         intermediate_dim: 14336,
         capacity_factor: 1.0,
+        enable_fp8: false,
     })
     .expect("MoeLayer::new failed");
     assert_eq!(moe.num_experts(), 8);
@@ -716,6 +717,7 @@ fn test_moe_forward() {
             hidden_dim,
             intermediate_dim,
             capacity_factor: 1.0,
+            enable_fp8: false,
         },
         gate,
         vec![expert0, expert1],
@@ -752,6 +754,7 @@ fn test_moe_no_weights_errors() {
         hidden_dim: 4,
         intermediate_dim: 8,
         capacity_factor: 1.0,
+        enable_fp8: false,
     })
     .expect("MoeLayer::new failed");
     let input = Array::from_slice(dev, &[1.0f32, 2.0, 3.0, 4.0], vec![1, 4]);
@@ -999,6 +1002,7 @@ fn test_moe_config_zero_experts() {
         hidden_dim: 256,
         intermediate_dim: 512,
         capacity_factor: 1.0,
+        enable_fp8: false,
     });
     assert!(result.is_err(), "num_experts=0 should fail");
 }
@@ -1011,6 +1015,7 @@ fn test_moe_config_zero_experts_per_token() {
         hidden_dim: 256,
         intermediate_dim: 512,
         capacity_factor: 1.0,
+        enable_fp8: false,
     });
     assert!(result.is_err(), "num_experts_per_token=0 should fail");
 }
@@ -1023,6 +1028,7 @@ fn test_moe_config_top_k_exceeds_experts() {
         hidden_dim: 256,
         intermediate_dim: 512,
         capacity_factor: 1.0,
+        enable_fp8: false,
     });
     assert!(
         result.is_err(),
@@ -1038,6 +1044,7 @@ fn test_moe_config_zero_hidden_dim() {
         hidden_dim: 0,
         intermediate_dim: 512,
         capacity_factor: 1.0,
+        enable_fp8: false,
     });
     assert!(result.is_err(), "hidden_dim=0 should fail");
 }
@@ -1284,6 +1291,7 @@ fn test_moe_layer_compute_load_balance_loss() {
         hidden_dim: 16,
         intermediate_dim: 32,
         capacity_factor: 1.0,
+        enable_fp8: false,
     })
     .expect("MoeLayer::new failed");
 
@@ -1355,6 +1363,7 @@ fn test_moe_with_shared_expert() {
             hidden_dim,
             intermediate_dim,
             capacity_factor: 1.0,
+            enable_fp8: false,
         },
         gate,
         vec![expert0, expert1],
@@ -1398,6 +1407,7 @@ fn test_moe_without_shared_expert_unchanged() {
         hidden_dim: 256,
         intermediate_dim: 512,
         capacity_factor: 1.0,
+        enable_fp8: false,
     })
     .expect("MoeLayer::new failed");
 
@@ -1788,6 +1798,7 @@ fn test_moe_gather_mm_matches_per_expert() {
             hidden_dim,
             intermediate_dim,
             capacity_factor: 1.0,
+            enable_fp8: false,
         },
         gate,
         experts_per_expert,
@@ -1802,6 +1813,7 @@ fn test_moe_gather_mm_matches_per_expert() {
             hidden_dim,
             intermediate_dim,
             capacity_factor: 1.0,
+            enable_fp8: false,
         },
         gate2,
         experts_gather,
@@ -1900,6 +1912,7 @@ fn test_moe_sparse_icb_available() {
         hidden_dim: 256,
         intermediate_dim: 512,
         capacity_factor: 1.0,
+        enable_fp8: false,
     })
     .expect("MoeLayer::new failed");
 
@@ -2014,6 +2027,7 @@ fn test_moe_grouped_forward_skips_empty_experts() {
             hidden_dim,
             intermediate_dim,
             capacity_factor: 1.0,
+            enable_fp8: false,
         },
         gate,
         experts,
