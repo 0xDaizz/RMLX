@@ -89,37 +89,51 @@ def bench_send_recv(group, rank, warmup, iters, sizes):
     if ws < 2:
         return results
 
+    peer = 1 - rank
+
     for size in sizes:
         nelems = size // 4  # float32 = 4 bytes
         data = mx.ones(nelems, dtype=mx.float32)
         mx.eval(data)
         barrier(group)
 
-        # Warmup
+        # Warmup — bidirectional: both ranks send AND recv
         for _ in range(warmup):
             if rank == 0:
-                out = mx.distributed.send(data, dst=1, group=group, stream=mx.cpu)
+                out = mx.distributed.send(data, dst=peer, group=group, stream=mx.cpu)
                 mx.eval(out)
-            else:
-                out = mx.distributed.recv(
-                    data.shape, data.dtype, src=0, group=group, stream=mx.cpu
+                result = mx.distributed.recv(
+                    data.shape, data.dtype, src=peer, group=group, stream=mx.cpu
                 )
+                mx.eval(result)
+            else:
+                result = mx.distributed.recv(
+                    data.shape, data.dtype, src=peer, group=group, stream=mx.cpu
+                )
+                mx.eval(result)
+                out = mx.distributed.send(data, dst=peer, group=group, stream=mx.cpu)
                 mx.eval(out)
             mx.synchronize()
             barrier(group)
 
-        # Timed
+        # Timed — bidirectional send+recv
         times = []
         for _ in range(iters):
             barrier(group)
             t0 = time.perf_counter()
             if rank == 0:
-                out = mx.distributed.send(data, dst=1, group=group, stream=mx.cpu)
+                out = mx.distributed.send(data, dst=peer, group=group, stream=mx.cpu)
                 mx.eval(out)
-            else:
-                out = mx.distributed.recv(
-                    data.shape, data.dtype, src=0, group=group, stream=mx.cpu
+                result = mx.distributed.recv(
+                    data.shape, data.dtype, src=peer, group=group, stream=mx.cpu
                 )
+                mx.eval(result)
+            else:
+                result = mx.distributed.recv(
+                    data.shape, data.dtype, src=peer, group=group, stream=mx.cpu
+                )
+                mx.eval(result)
+                out = mx.distributed.send(data, dst=peer, group=group, stream=mx.cpu)
                 mx.eval(out)
             mx.synchronize()
             times.append((time.perf_counter() - t0) * 1e3)

@@ -97,26 +97,18 @@ fn bench_send_recv(group: &Group) -> Vec<serde_json::Value> {
         eprintln!("  send_recv: size={size}");
         let data = vec![0xABu8; size];
 
-        // Warmup
+        // Warmup — bidirectional: both ranks send AND recv simultaneously
         for _ in 0..WARMUP_ITERS {
             group.barrier().unwrap();
-            if rank == 0 {
-                group.send(&data, peer).unwrap();
-            } else {
-                let _ = group.recv(peer, size).unwrap();
-            }
+            let _ = group.sendrecv(&data, peer, size, peer).unwrap();
         }
 
-        // Timed
+        // Timed — bidirectional sendrecv
         let mut times = Vec::with_capacity(TIMED_ITERS);
         for _ in 0..TIMED_ITERS {
             group.barrier().unwrap();
             let start = Instant::now();
-            if rank == 0 {
-                group.send(&data, peer).unwrap();
-            } else {
-                let _ = group.recv(peer, size).unwrap();
-            }
+            let _ = group.sendrecv(&data, peer, size, peer).unwrap();
             times.push(start.elapsed().as_secs_f64() * 1e3);
         }
 
@@ -188,11 +180,14 @@ fn bench_allreduce_f16(group: &Group) -> Vec<serde_json::Value> {
 }
 
 fn bench_allgather(group: &Group) -> Vec<serde_json::Value> {
+    let world_size = group.ranks().len();
     let mut results = Vec::new();
 
     for &size in SIZES {
-        eprintln!("  allgather: size={size}");
-        let data = vec![0u8; size];
+        // Each rank contributes size/world_size bytes so total gathered = size
+        let per_rank = size / world_size;
+        eprintln!("  allgather: per_rank={per_rank}, total={size}");
+        let data = vec![0u8; per_rank];
 
         // Warmup
         group.barrier().unwrap();
@@ -303,24 +298,23 @@ fn bench_all_to_all(group: &Group) -> Vec<serde_json::Value> {
 }
 
 fn bench_ep_exchange(group: &Group) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
-    let rank = group.local_rank();
-    let peer = if rank == 0 { 1 } else { 0 };
+    let world_size = group.ranks().len();
     let mut dispatch_results = Vec::new();
     let mut combine_results = Vec::new();
 
     for &(n_tokens, hidden_dim) in EP_CONFIGS {
         let payload_size = n_tokens * hidden_dim * 2; // f16
+                                                      // Align to world_size for all_to_all
+        let aligned_size = payload_size.div_ceil(world_size) * world_size;
         eprintln!(
-            "  ep_exchange: n_tokens={n_tokens}, hidden_dim={hidden_dim}, payload={payload_size}"
+            "  ep_exchange: n_tokens={n_tokens}, hidden_dim={hidden_dim}, payload={aligned_size}"
         );
-        let send_data = vec![rank as u8; payload_size];
+        let data = vec![0u8; aligned_size];
 
         // --- Dispatch phase ---
         // Warmup
         for _ in 0..WARMUP_ITERS {
-            let _ = group
-                .sendrecv(&send_data, peer, payload_size, peer)
-                .unwrap();
+            let _ = group.all_to_all(&data).unwrap();
         }
 
         // Timed
@@ -328,9 +322,7 @@ fn bench_ep_exchange(group: &Group) -> (Vec<serde_json::Value>, Vec<serde_json::
         for _ in 0..TIMED_ITERS {
             group.barrier().unwrap();
             let start = Instant::now();
-            let _ = group
-                .sendrecv(&send_data, peer, payload_size, peer)
-                .unwrap();
+            let _ = group.all_to_all(&data).unwrap();
             times_dispatch.push(start.elapsed().as_secs_f64() * 1e3);
         }
 
@@ -338,15 +330,13 @@ fn bench_ep_exchange(group: &Group) -> (Vec<serde_json::Value>, Vec<serde_json::
             &mut times_dispatch,
             n_tokens,
             hidden_dim,
-            payload_size,
+            aligned_size,
         ));
 
         // --- Combine phase ---
         // Warmup
         for _ in 0..WARMUP_ITERS {
-            let _ = group
-                .sendrecv(&send_data, peer, payload_size, peer)
-                .unwrap();
+            let _ = group.all_to_all(&data).unwrap();
         }
 
         // Timed
@@ -354,9 +344,7 @@ fn bench_ep_exchange(group: &Group) -> (Vec<serde_json::Value>, Vec<serde_json::
         for _ in 0..TIMED_ITERS {
             group.barrier().unwrap();
             let start = Instant::now();
-            let _ = group
-                .sendrecv(&send_data, peer, payload_size, peer)
-                .unwrap();
+            let _ = group.all_to_all(&data).unwrap();
             times_combine.push(start.elapsed().as_secs_f64() * 1e3);
         }
 
@@ -364,7 +352,7 @@ fn bench_ep_exchange(group: &Group) -> (Vec<serde_json::Value>, Vec<serde_json::
             &mut times_combine,
             n_tokens,
             hidden_dim,
-            payload_size,
+            aligned_size,
         ));
     }
 
