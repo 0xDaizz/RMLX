@@ -76,22 +76,25 @@ fn run_round(ctx: &RdmaContext, rank: u32, peer_ip: &str, round: u32) {
         remote_info.qpn, remote_info.psn, remote_info.lid, &remote_info.gid
     );
 
-    // Step 4: Register MR (4096-byte posix_memalign buffer)
-    // Allocate a source buffer; MemoryRegion::register copies it to a page-aligned buffer
-    let mut src_buf = vec![0u8; BUF_SIZE];
-    // Fill with a pattern: rank-specific so we can verify on recv
+    // Step 4: Register separate send and recv MRs
+    let mut send_buf = vec![0u8; BUF_SIZE];
     let fill_byte = if rank == 0 { 0xAA } else { 0xBB };
-    src_buf.iter_mut().for_each(|b| *b = fill_byte);
+    send_buf.iter_mut().for_each(|b| *b = fill_byte);
 
-    let mr = unsafe {
-        MemoryRegion::register(&pd, src_buf.as_mut_ptr() as *mut std::ffi::c_void, BUF_SIZE)
+    let send_mr = unsafe {
+        MemoryRegion::register(&pd, send_buf.as_mut_ptr() as *mut std::ffi::c_void, BUF_SIZE)
     }
-    .expect("failed to register MR");
+    .expect("failed to register send MR");
+
+    let mut recv_buf = vec![0u8; BUF_SIZE];
+    let recv_mr = unsafe {
+        MemoryRegion::register(&pd, recv_buf.as_mut_ptr() as *mut std::ffi::c_void, BUF_SIZE)
+    }
+    .expect("failed to register recv MR");
+
     eprintln!(
-        "[rank {rank}] round {round}: MR registered (addr={:?}, len={}, lkey={})",
-        mr.addr(),
-        mr.length(),
-        mr.lkey()
+        "[rank {rank}] round {round}: send MR (lkey={}), recv MR (lkey={})",
+        send_mr.lkey(), recv_mr.lkey()
     );
 
     // Step 5: Connect QP (RESET -> INIT -> RTR -> RTS)
@@ -102,9 +105,9 @@ fn run_round(ctx: &RdmaContext, rank: u32, peer_ip: &str, round: u32) {
     // Step 6: Bidirectional sendrecv
     // 6a: Post recv
     let mut recv_sge = IbvSge {
-        addr: mr.addr() as u64,
+        addr: recv_mr.addr() as u64,
         length: BUF_SIZE as u32,
-        lkey: mr.lkey(),
+        lkey: recv_mr.lkey(),
     };
     let mut recv_wr = IbvRecvWr {
         wr_id: 1000 + round as u64,
@@ -122,9 +125,9 @@ fn run_round(ctx: &RdmaContext, rank: u32, peer_ip: &str, round: u32) {
 
     // 6c: Post send (using MaybeUninit matching JACCL pattern)
     let mut send_sge = IbvSge {
-        addr: mr.addr() as u64,
+        addr: send_mr.addr() as u64,
         length: BUF_SIZE as u32,
-        lkey: mr.lkey(),
+        lkey: send_mr.lkey(),
     };
 
     // MaybeUninit for IbvSendWr (matching JACCL)
@@ -186,8 +189,8 @@ fn run_round(ctx: &RdmaContext, rank: u32, peer_ip: &str, round: u32) {
 
     // Step 7: Verify received data
     let expected_byte: u8 = if rank == 0 { 0xBB } else { 0xAA };
-    let recv_buf = unsafe { std::slice::from_raw_parts(mr.addr() as *const u8, BUF_SIZE) };
-    let correct = recv_buf.iter().all(|&b| b == expected_byte);
+    let recv_data = unsafe { std::slice::from_raw_parts(recv_mr.addr() as *const u8, BUF_SIZE) };
+    let correct = recv_data.iter().all(|&b| b == expected_byte);
     if correct {
         eprintln!(
             "[rank {rank}] round {round}: Data verification PASSED (all bytes = 0x{expected_byte:02X})"
@@ -196,7 +199,7 @@ fn run_round(ctx: &RdmaContext, rank: u32, peer_ip: &str, round: u32) {
         // Show first few bytes for debugging
         eprintln!(
             "[rank {rank}] round {round}: Data verification FAILED — first 16 bytes: {:02x?}",
-            &recv_buf[..16]
+            &recv_data[..16]
         );
         std::process::exit(1);
     }
@@ -205,7 +208,8 @@ fn run_round(ctx: &RdmaContext, rank: u32, peer_ip: &str, round: u32) {
     // QueuePair::drop will transition QP to RESET before ibv_destroy_qp.
     // This is the key behavior we're testing — does Round 2 work after this?
     eprintln!("[rank {rank}] round {round}: dropping MR, QP, CQ, PD...");
-    drop(mr);
+    drop(send_mr);
+    drop(recv_mr);
     drop(qp);
     drop(cq);
     drop(pd);

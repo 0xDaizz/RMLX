@@ -514,6 +514,19 @@ fn try_rdma_init(
         eprintln!("[rdma-init] peer={peer}: remote QP qpn={} psn={} gid={:02x?}", remote.qpn, remote.psn, &remote.gid);
     }
 
+    // Post-connect barrier: ensure all ranks have completed QP state transitions
+    // (RESET → INIT → RTR → RTS) before any RDMA operation. Without this,
+    // rank 0 may send before rank 1's QP is in RTS, causing UC silent drop.
+    // JACCL does this with side_channel.all_gather<int>(0) after QP connect.
+    eprintln!("[rdma-init] Post-connect barrier via coordinator...");
+    let barrier_buf = vec![rank as u8; 1];
+    let hub_host_barrier = if rank == 0 { "" } else { &coordinator_addr };
+    let _barrier_result = rmlx_rdma::coordinator::all_gather_bytes(
+        rank, world_size, &barrier_buf, hub_host_barrier, &coord_cfg,
+    )
+    .map_err(|e| DistributedError::Transport(format!("post-connect barrier failed: {e}")))?;
+    eprintln!("[rdma-init] Post-connect barrier OK");
+
     // connections[rank] is None (self-slot); all others are Some.
     let transport = RdmaConnectionTransport::new(connections, rank);
     let all_ranks: Vec<u32> = (0..world_size).collect();
@@ -529,8 +542,6 @@ fn try_rdma_init(
         "connected to peers",
     );
 
-    // No additional warmup needed — QP exchange already synchronized both ranks.
-    // JACCL pattern: TCP all_gather for QP info exchange serves as the barrier.
     let warmup_result: Option<WarmupResult> = None;
 
     Ok(DistributedContext {
