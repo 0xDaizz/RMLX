@@ -388,7 +388,18 @@ fn test_allreduce_f16_vs_f32_accuracy() {
 
     // Use values that have representable f16 forms
     let f32_vals = vec![
-        1.0f32, 0.5, 0.25, 0.125, 2.0, 4.0, 8.0, 16.0, 0.333, 0.667, 1.5, 3.14,
+        1.0f32,
+        0.5,
+        0.25,
+        0.125,
+        2.0,
+        4.0,
+        8.0,
+        16.0,
+        0.333,
+        0.667,
+        1.5,
+        std::f32::consts::PI,
     ];
 
     // f16 path

@@ -157,7 +157,7 @@ impl RdmaContext {
                 )));
             }
 
-            let device = *dev_list.offset(index as isize);
+            let device = *dev_list.add(index);
             let device_name = name.to_string();
             let ctx = (lib.open_device)(device);
             (lib.free_device_list)(dev_list);

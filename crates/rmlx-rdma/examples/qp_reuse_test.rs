@@ -136,19 +136,22 @@ fn run_round(ctx: &RdmaContext, rank: u32, peer_ip: &str, round: u32) {
     };
 
     // MaybeUninit for IbvSendWr (matching JACCL)
-    #[allow(invalid_value)]
-    let mut send_wr: IbvSendWr = unsafe { MaybeUninit::uninit().assume_init() };
-    send_wr.wr_id = 2000 + round as u64;
-    send_wr.next = std::ptr::null_mut();
-    send_wr.sg_list = &mut send_sge;
-    send_wr.num_sge = 1;
-    send_wr.opcode = ffi::wr_opcode::SEND;
-    send_wr.send_flags = ffi::send_flags::SIGNALED;
-    send_wr.imm_data = 0;
-    // Zero the wr union fields we don't use
-    send_wr.wr.ah = std::ptr::null_mut();
-    send_wr.wr.remote_addr = 0;
-    send_wr.wr.rkey = 0;
+    let mut send_wr_uninit = MaybeUninit::<IbvSendWr>::uninit();
+    let send_wr_ptr = send_wr_uninit.as_mut_ptr();
+    unsafe {
+        (*send_wr_ptr).wr_id = 2000 + round as u64;
+        (*send_wr_ptr).next = std::ptr::null_mut();
+        (*send_wr_ptr).sg_list = &mut send_sge;
+        (*send_wr_ptr).num_sge = 1;
+        (*send_wr_ptr).opcode = ffi::wr_opcode::SEND;
+        (*send_wr_ptr).send_flags = ffi::send_flags::SIGNALED;
+        (*send_wr_ptr).imm_data = 0;
+        // Zero the wr union fields we don't use
+        (*send_wr_ptr).wr.ah = std::ptr::null_mut();
+        (*send_wr_ptr).wr.remote_addr = 0;
+        (*send_wr_ptr).wr.rkey = 0;
+    }
+    let mut send_wr = unsafe { send_wr_uninit.assume_init() };
 
     qp.post_send(&mut send_wr).expect("failed to post send");
     eprintln!("[rank {rank}] round {round}: send posted");

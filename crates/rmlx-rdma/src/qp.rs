@@ -164,23 +164,29 @@ impl QueuePair {
             DEFAULT_MAX_RECV_WR
         });
 
-        // JACCL compatible: leave unused fields uninitialized instead of zeroed.
+        // JACCL compatible: use MaybeUninit to avoid zeroing unused fields.
         // macOS TB5 driver may interpret zero values in unused fields as unintended
         // flags (same pattern as IbvSendWr — commit 084bdce).
-        #[allow(invalid_value)]
-        let mut init_attr: IbvQpInitAttr = unsafe { std::mem::MaybeUninit::uninit().assume_init() };
-        init_attr.qp_context = ctx.raw() as *mut std::ffi::c_void;
-        init_attr.send_cq = cq.raw();
-        init_attr.recv_cq = cq.raw();
-        init_attr.srq = std::ptr::null_mut();
-        init_attr.qp_type = qp_type::UC;
-        // JACCL 호환 — 각 WR에서 개별적으로 SIGNALED 설정
-        init_attr.sq_sig_all = 0;
-        init_attr.cap.max_send_wr = max_send_wr;
-        init_attr.cap.max_recv_wr = max_recv_wr;
-        init_attr.cap.max_send_sge = MAX_SEND_SGE;
-        init_attr.cap.max_recv_sge = MAX_RECV_SGE;
-        init_attr.cap.max_inline_data = 0;
+        let mut init_attr_uninit = std::mem::MaybeUninit::<IbvQpInitAttr>::uninit();
+        let init_attr_ptr = init_attr_uninit.as_mut_ptr();
+        // SAFETY: Writing to individual fields of the MaybeUninit allocation via raw pointer.
+        // All fields are initialized before assume_init() is called below.
+        unsafe {
+            (*init_attr_ptr).qp_context = ctx.raw() as *mut std::ffi::c_void;
+            (*init_attr_ptr).send_cq = cq.raw();
+            (*init_attr_ptr).recv_cq = cq.raw();
+            (*init_attr_ptr).srq = std::ptr::null_mut();
+            (*init_attr_ptr).qp_type = qp_type::UC;
+            // JACCL 호환 — 각 WR에서 개별적으로 SIGNALED 설정
+            (*init_attr_ptr).sq_sig_all = 0;
+            (*init_attr_ptr).cap.max_send_wr = max_send_wr;
+            (*init_attr_ptr).cap.max_recv_wr = max_recv_wr;
+            (*init_attr_ptr).cap.max_send_sge = MAX_SEND_SGE;
+            (*init_attr_ptr).cap.max_recv_sge = MAX_RECV_SGE;
+            (*init_attr_ptr).cap.max_inline_data = 0;
+        }
+        // SAFETY: All fields have been initialized above.
+        let mut init_attr = unsafe { init_attr_uninit.assume_init() };
 
         // SAFETY: pd.raw() is a valid ibv_pd pointer, init_attr is fully initialized.
         let qp = unsafe { (lib.create_qp)(pd.raw(), &mut init_attr) };
