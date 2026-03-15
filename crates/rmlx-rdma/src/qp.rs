@@ -164,10 +164,15 @@ impl QueuePair {
             DEFAULT_MAX_RECV_WR
         });
 
-        // SAFETY: We zero-initialize the struct and fill in all required fields.
-        let mut init_attr: IbvQpInitAttr = unsafe { std::mem::zeroed() };
+        // JACCL compatible: leave unused fields uninitialized instead of zeroed.
+        // macOS TB5 driver may interpret zero values in unused fields as unintended
+        // flags (same pattern as IbvSendWr — commit 084bdce).
+        #[allow(invalid_value)]
+        let mut init_attr: IbvQpInitAttr = unsafe { std::mem::MaybeUninit::uninit().assume_init() };
+        init_attr.qp_context = ctx.raw() as *mut std::ffi::c_void;
         init_attr.send_cq = cq.raw();
         init_attr.recv_cq = cq.raw();
+        init_attr.srq = std::ptr::null_mut();
         init_attr.qp_type = qp_type::UC;
         // JACCL 호환 — 각 WR에서 개별적으로 SIGNALED 설정
         init_attr.sq_sig_all = 0;
@@ -175,6 +180,7 @@ impl QueuePair {
         init_attr.cap.max_recv_wr = max_recv_wr;
         init_attr.cap.max_send_sge = MAX_SEND_SGE;
         init_attr.cap.max_recv_sge = MAX_RECV_SGE;
+        init_attr.cap.max_inline_data = 0;
 
         // SAFETY: pd.raw() is a valid ibv_pd pointer, init_attr is fully initialized.
         let qp = unsafe { (lib.create_qp)(pd.raw(), &mut init_attr) };
@@ -348,8 +354,9 @@ impl QueuePair {
         // SAFETY: self.qp is valid, attr is fully initialized for RTR transition.
         eprintln!("[qp] modify_to_rtr: sizeof(IbvQpAttr)={}, calling modify_qp (qp={:?}, mask=0x{:x})...",
             std::mem::size_of::<IbvQpAttr>(), self.qp, mask);
-        eprintln!("[qp] modify_to_rtr: dest_qpn={}, rq_psn={}, path_mtu={}, is_global={}, gid_index={}",
-            attr.dest_qp_num, attr.rq_psn, attr.path_mtu, attr.ah_attr.is_global, attr.ah_attr.grh.sgid_index);
+        let dgid_bytes = unsafe { attr.ah_attr.grh.dgid.raw };
+        eprintln!("[qp] modify_to_rtr: dest_qpn={}, rq_psn={}, path_mtu={}, is_global={}, gid_index={}, dgid={:02x?}",
+            attr.dest_qp_num, attr.rq_psn, attr.path_mtu, attr.ah_attr.is_global, attr.ah_attr.grh.sgid_index, &dgid_bytes);
         let ret = unsafe { (self.lib.modify_qp)(self.qp, &mut attr, mask) };
         eprintln!("[qp] modify_to_rtr: modify_qp returned {ret}");
         if ret != 0 {

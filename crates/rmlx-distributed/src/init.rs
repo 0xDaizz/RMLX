@@ -510,8 +510,8 @@ fn try_rdma_init(
         if peer == rank { continue; }
         let local = &local_infos[peer as usize];
         let remote = &remote_for_me[peer as usize];
-        eprintln!("[rdma-init] peer={peer}: local QP qpn={} psn={} gid={:02x?}", local.qpn, local.psn, &local.gid[..4]);
-        eprintln!("[rdma-init] peer={peer}: remote QP qpn={} psn={} gid={:02x?}", remote.qpn, remote.psn, &remote.gid[..4]);
+        eprintln!("[rdma-init] peer={peer}: local QP qpn={} psn={} gid={:02x?}", local.qpn, local.psn, &local.gid);
+        eprintln!("[rdma-init] peer={peer}: remote QP qpn={} psn={} gid={:02x?}", remote.qpn, remote.psn, &remote.gid);
     }
 
     // connections[rank] is None (self-slot); all others are Some.
