@@ -1413,6 +1413,11 @@ impl MoeDispatchExchange {
         self.config.group.size()
     }
 
+    /// Reference to the communication group (includes transport if available).
+    pub fn group(&self) -> &Group {
+        &self.config.group
+    }
+
     /// Compute the local expert index range `[start, end)` for this rank.
     ///
     /// Experts are evenly partitioned across ranks: rank `r` owns experts

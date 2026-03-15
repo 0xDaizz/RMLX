@@ -293,6 +293,12 @@ impl MoeLayer {
     /// When set and the exchange group has world_size > 1, `forward()` will
     /// dispatch tokens to expert-owning ranks instead of running all experts
     /// locally. The flow becomes: gate -> dispatch -> expert forward -> combine.
+    ///
+    /// For RDMA-backed EP, the [`Group`] inside `MoeDispatchConfig` must be
+    /// created with a transport (`Group::with_transport`). The dispatch path
+    /// uses `group.sendrecv()` for token exchange, and the combine path clones
+    /// the same transport-backed group into `MoeCombineExchange`. If the group
+    /// has no transport, the RDMA backend falls back to local Metal routing.
     #[cfg(feature = "distributed")]
     pub fn with_exchange(mut self, exchange: MoeDispatchExchange) -> Self {
         self.exchange = Some(Mutex::new(exchange));
@@ -680,11 +686,9 @@ impl MoeLayer {
         } else {
             0
         };
+        // Clone the transport-backed group so combine can use RDMA.
+        let group = exchange_guard.group().clone();
         drop(exchange_guard);
-
-        let group =
-            rmlx_distributed::Group::new((0..ws as u32).collect(), local_rank, ws as u32)
-                .map_err(|e| KernelError::InvalidShape(format!("Group creation failed: {e}")))?;
 
         let combiner = MoeCombineExchange::new(group);
         let combined_f32 = combiner
