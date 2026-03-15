@@ -304,8 +304,10 @@ impl RdmaConnectionTransport {
                     self.metrics.record_send_error();
                     rdma_to_distributed_enhanced(e, wr_id)
                 })?;
-            // macOS TB5 RDMA driver bug: skip CQ polling.
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            // macOS TB5 RDMA driver bug: skip CQ polling for send completions.
+            // yield_now() gives hardware a scheduling slot without the 1ms fixed latency.
+            // Send completes locally on UC QPs — no need to wait for remote arrival.
+            std::thread::yield_now();
         }
 
         // Send secondary chunks: use secondary connection if available, else primary
@@ -331,8 +333,8 @@ impl RdmaConnectionTransport {
                     self.metrics.record_send_error();
                     rdma_to_distributed_enhanced(e, wr_id)
                 })?;
-            // macOS TB5 RDMA driver bug: skip CQ polling.
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            // macOS TB5 RDMA driver bug: skip CQ polling for send completions.
+            std::thread::yield_now();
         }
 
         self.metrics.record_send(data.len() as u64);
@@ -437,8 +439,11 @@ impl RdmaConnectionTransport {
             secondary_ops.push(op);
         }
 
-        // macOS TB5 RDMA driver bug: ibv_poll_cq corrupts RQ state.
-        // Skip completion polling — sleep to let remote data arrive.
+        // macOS TB5 RDMA driver bug: ibv_poll_cq corrupts RQ state,
+        // causing subsequent ibv_post_recv to block forever.
+        // Cannot poll CQ for recv completions — use fixed delay instead.
+        // 1ms is sufficient for TB5 local-fabric latency (~5µs RTT).
+        // TODO: replace with a TCP-level "send done" signal from sender.
         std::thread::sleep(std::time::Duration::from_millis(1));
 
         // Drop ops and MRs
@@ -801,8 +806,9 @@ impl RdmaConnectionTransport {
             self.metrics.record_send_error();
             rdma_to_distributed_enhanced(e, wr_id)
         })?;
-        // macOS TB5 RDMA driver bug: skip CQ polling.
-        std::thread::sleep(std::time::Duration::from_millis(1));
+        // macOS TB5 RDMA driver bug: skip CQ polling for send completions.
+        // Send completes locally on UC QPs — yield instead of 1ms sleep.
+        std::thread::yield_now();
 
         self.metrics.record_send(len as u64);
         Ok(())
@@ -835,7 +841,9 @@ impl RdmaConnectionTransport {
             self.metrics.record_recv_error();
             rdma_to_distributed_enhanced(e, wr_id)
         })?;
-        // macOS TB5 RDMA driver bug: skip CQ polling.
+        // macOS TB5 RDMA driver bug: ibv_poll_cq corrupts RQ state.
+        // Recv-side: must wait for remote data to actually arrive before
+        // the caller reads the buffer. 1ms is sufficient for TB5 local fabric.
         std::thread::sleep(std::time::Duration::from_millis(1));
 
         self.metrics.record_recv(len as u64);
