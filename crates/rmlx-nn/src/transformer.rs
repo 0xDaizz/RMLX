@@ -4596,6 +4596,89 @@ impl TransformerBlock {
         Ok(output)
     }
 
+    /// TP prefill forward using Split-CB: 3 command buffers + 2 allreduce syncs.
+    ///
+    /// Same structure as [`forward_with_group_split_cb()`] but uses the prefill
+    /// attention path that supports `seq_len > 1`.
+    ///
+    /// ## Flow
+    ///
+    /// 1. **CB1**: prefill attention (norm + QKV + RoPE + cache + SDPA + O_proj) → `attn_partial`
+    /// 2. **Allreduce** `attn_partial` → `attn_full`
+    /// 3. **CB2**: residual + FFN (norm + gate/up + SiLU + down) → `(h, ffn_partial)`
+    /// 4. **Allreduce** `ffn_partial` → `ffn_full`
+    /// 5. **CB3**: final residual `h + ffn_full` → output
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_prefill_with_group_split_cb(
+        &self,
+        x: &Array,
+        cos_freqs: Option<&Array>,
+        sin_freqs: Option<&Array>,
+        mask: Option<&Array>,
+        cache: &mut LayerKvCache,
+        group: &rmlx_distributed::group::Group,
+        device: &ProtocolObject<dyn MTLDevice>,
+        registry: &KernelRegistry,
+        queue: &ProtocolObject<dyn MTLCommandQueue>,
+    ) -> Result<Array, KernelError> {
+        // ── CB1: Prefill attention block (all ops in one command buffer) ──
+        let cb1 = queue
+            .commandBufferWithUnretainedReferences()
+            .ok_or_else(|| {
+                KernelError::Internal(
+                    "Failed to create command buffer for prefill attention CB".into(),
+                )
+            })?;
+        let norm1_w = self.norm1_weight.as_ref().ok_or_else(|| {
+            KernelError::InvalidShape("TransformerBlock: norm1_weight not loaded".into())
+        })?;
+        let attn_partial = self.attention.forward_prefill_into_cb(
+            x,
+            norm1_w,
+            self.rms_norm_eps,
+            cos_freqs,
+            sin_freqs,
+            mask,
+            cache,
+            registry,
+            &cb1,
+        )?;
+        cb1.commit();
+        cb1.waitUntilCompleted();
+
+        // ── Allreduce attention output across TP ranks ──
+        let attn_out = group.allreduce_sum(&attn_partial, device).map_err(|e| {
+            KernelError::Internal(format!("TP allreduce after attention failed: {e}"))
+        })?;
+
+        // ── CB2: FFN block (residual + norm + gate/up + SiLU + down) ──
+        let cb2 = queue
+            .commandBufferWithUnretainedReferences()
+            .ok_or_else(|| {
+                KernelError::Internal("Failed to create command buffer for FFN CB".into())
+            })?;
+        let (h, ffn_partial) = self.forward_ffn_into_cb(x, &attn_out, registry, &cb2)?;
+        cb2.commit();
+        cb2.waitUntilCompleted();
+
+        // ── Allreduce FFN output across TP ranks ──
+        let ffn_out = group
+            .allreduce_sum(&ffn_partial, device)
+            .map_err(|e| KernelError::Internal(format!("TP allreduce after FFN failed: {e}")))?;
+
+        // ── CB3: Final residual connection (h + ffn_full) ──
+        let cb3 = queue
+            .commandBufferWithUnretainedReferences()
+            .ok_or_else(|| {
+                KernelError::Internal("Failed to create command buffer for residual CB".into())
+            })?;
+        let output = ops::binary::add_into_cb(registry, &h, &ffn_out, &cb3)?;
+        cb3.commit();
+        cb3.waitUntilCompleted();
+
+        Ok(output)
+    }
+
     /// TP-aware forward pass for one transformer block.
     ///
     /// Assumes weights are **pre-sharded** across ranks (Megatron-LM pattern):
